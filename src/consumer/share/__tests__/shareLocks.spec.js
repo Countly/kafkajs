@@ -962,6 +962,10 @@ describe('public share lock contract', () => {
 
   test('keeps successful renewals nonterminal', async () => {
     await start()
+    const confirming = h.hold({
+      api: 'ShareFetch',
+      match: ({ fields }) => fields.shareSessionEpoch === 3,
+    })
     h.script('ShareFetch', [lock(1000, ['a'])])
     h.script('ShareAcknowledge', [
       ackAnswer([{ partition: 0 }], { acquisitionLockTimeoutMs: 2000 }),
@@ -976,6 +980,9 @@ describe('public share lock contract', () => {
         acknowledge('accept')
       },
     })
+    await confirming.arrived()
+    expect(h.consumer.acquisitionLockTimeoutMs()).toBe(3000)
+    confirming.release()
     await until(() => h.events.acks.length === 3, 'two renewals and the terminal accept')
     expect(seen).toEqual([2000, 3000, 1])
     expect(outcomes(h.events.acks)).toEqual([
@@ -986,7 +993,7 @@ describe('public share lock contract', () => {
     expect(h.frames(79).map(batchesOf)).toEqual([[batch(0, 0, [4])], [batch(0, 0, [4])]])
     expect(h.frames(79).map(({ fields }) => fields.isRenewAck)).toEqual([true, true])
     expect(batchesOf(h.frames(78)[1])).toEqual([batch(0, 0, [1])])
-    expect(h.consumer.acquisitionLockTimeoutMs()).toBe(3000)
+    expect(h.consumer.acquisitionLockTimeoutMs()).toBe(15000)
     expect(() => saved()).toThrow('Handler call is no longer current')
   })
 
@@ -1043,6 +1050,7 @@ describe('public share lock contract', () => {
   ])('renews the whole call when %s omits the selector', async (handlerName, expectedBatches) => {
     await start()
     h.script('ShareFetch', [lock(1000, ['a', 'b'])])
+    h.script('ShareAcknowledge', [ackAnswer([{ partition: 0 }], { acquisitionLockTimeoutMs: 0 })])
     const renewed = []
     await h.consumer.run({
       [handlerName]: async ({ renew }) => {

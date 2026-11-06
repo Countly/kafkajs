@@ -192,6 +192,7 @@ const deferred = () => {
  * Call `restore` in guaranteed cleanup.
  */
 class ShareClock {
+  /** @returns {ShareClock} An uninstalled clock with no timer or spy ownership. */
   constructor() {
     this.skewMs = 0
     this.origin = 0

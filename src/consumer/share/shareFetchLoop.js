@@ -325,8 +325,8 @@ class ShareFetchLoop {
    * @param {(reply: Cohort[]) => Promise<void>} handlers Resolves after every delivered or dropped record.
    * @returns {Promise<object>} The exchange result, after the handlers, the answer's metadata
    *   effects and the owned pacing delay. A reset or final answer skips the handlers. When a data
-   *   session reset or its socket was lost while the handlers ran, the old open's effects are
-   *   discarded and the round still ends with its pacing delay, so the next round reopens.
+   *   session reset or its socket was lost during handlers or awaited metadata, the old open's
+   *   effects are discarded and the round still ends with its pacing delay, so the next round reopens.
    * @throws {Error} The original request, handler or operation failure; a node whose operation was
    *   retired, a closed or retired session, or an open that ended before the handlers started
    *   rejects with its "no longer current" refusal.
@@ -341,8 +341,13 @@ class ShareFetchLoop {
         if (refused) throw refused
         await handlers(result.reply)
         const afterHandlers = this.session.refusal(token)
-        if (!afterHandlers) await this.runEffects(result, token)
-        else if (!this.reopenable(token)) throw afterHandlers
+        if (!afterHandlers) {
+          try {
+            await this.runEffects(result, token)
+          } catch (error) {
+            if (!this.reopenable(token)) throw error
+          }
+        } else if (!this.reopenable(token)) throw afterHandlers
       }
       await this.pace(result)
       return result
@@ -1226,8 +1231,11 @@ class ShareFetchLoop {
    */
   async runEffects(result, open) {
     const effects = result.effects || []
-    for (const effect of effects) await effect()
-    if (effects.length) this.recheck(open)
+    for (const effect of effects) {
+      this.recheck(open)
+      await effect()
+      this.recheck(open)
+    }
   }
 
   /**

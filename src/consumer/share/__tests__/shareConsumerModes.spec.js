@@ -1041,7 +1041,7 @@ describe('public share handler contract', () => {
     ])
     const third = h.hold({
       api: 'ShareFetch',
-      match: ({ fields }) => fields.shareSessionEpoch === 2,
+      match: ({ fields }) => fields.shareSessionEpoch === 3,
     })
     const gate = h.hold({ api: 'ShareAcknowledge' })
     const renewals = []

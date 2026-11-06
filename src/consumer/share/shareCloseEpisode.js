@@ -1,7 +1,9 @@
 const { KafkaJSNonRetriableError } = require('../../errors')
+const { ConsumerOperation } = require('../groupProtocol/interface')
 
 /**
- * Records one captured close's authority and absolute budgets; it owns no transport or timer.
+ * Records one captured close's authority, absolute budgets and operation-owned deadline wake.
+ * It owns no transport.
  *
  * With `t0` the first valid disconnect call, `T` its timeout, `R = min(1000, floor(T / 4))` and
  * `D = t0 + T`, handlers are awaited until `H = D - R`. After that boundary every final and the
@@ -31,6 +33,8 @@ class ShareCloseEpisode {
     this.leaveClaimed = false
     this.nodes = new Map()
     this.operation = null
+    this.deadlineOperation = null
+    this.releaseDeadline = null
   }
 
   /**
@@ -49,18 +53,48 @@ class ShareCloseEpisode {
       }
     }
     if (timeout === 0) this.revoke()
+    else this.armDeadline()
   }
 
   /**
    * Gives the episode the one bounded operation that owns its finals and leave, so a revocation
    * can wake their waits at once instead of at the original deadline. An episode that is already
-   * revoked retires it immediately.
+   * revoked retires it immediately; an earlier disconnect deadline also owns a wake.
    * @param {import('../groupProtocol/interface').ConsumerOperation} operation The traffic's operation.
    * @returns {void}
    */
   attach(operation) {
     this.operation = operation
-    if (this.revoked) operation.retire(this.guard())
+    this.armDeadline()
+  }
+
+  /**
+   * Wakes attached traffic at a newly supplied earlier deadline. The traffic operation retains
+   * its original cap; this owned wake can only shorten its wait, and checks actual time even
+   * when timer delivery is delayed. Later disconnects cannot replace the first deadline.
+   * @private
+   * @returns {void}
+   */
+  armDeadline() {
+    const operation = this.operation
+    if (!operation) return
+    const refused = this.guard()
+    if (refused) {
+      operation.retire(refused)
+      return
+    }
+    const deadlineAt = Math.min(this.deadlineAt, this.finalDeadline)
+    if (deadlineAt >= operation.deadlineAt || this.deadlineOperation) return
+    const wake = new ConsumerOperation({
+      deadlineAt,
+      now: this.now,
+      onTimeout: () => {
+        this.revoke()
+        return this.guard()
+      },
+    })
+    this.deadlineOperation = wake
+    this.releaseDeadline = operation.register(() => wake.finish())
   }
 
   /**
@@ -139,6 +173,10 @@ class ShareCloseEpisode {
   finish() {
     this.revoked = true
     this.nodes.clear()
+    this.releaseDeadline?.()
+    this.deadlineOperation?.finish()
+    this.deadlineOperation = null
+    this.releaseDeadline = null
     this.operation = null
     this.run = null
   }

@@ -15,12 +15,14 @@ const {
 class Rig {
   /**
    * @param {object} [options] Rig options.
+   * @param {boolean} [options.enforce=false] Whether request timeouts are enforced.
    * @param {number} [options.interval=600000] The `heartbeatIntervalMs` the coordinator answers.
    */
-  constructor({ interval = 600000 } = {}) {
+  constructor({ interval = 600000, enforce = false } = {}) {
     this.clock = new ShareClock().install()
     this.runs = []
     this.calls = []
+    this.handlers = []
     this.acks = []
     this.crashes = []
     this.gate = deferred()
@@ -32,7 +34,7 @@ class Rig {
     })
     this.h = shareClient({
       interval,
-      kafka: { requestTimeout: 1000, enforceRequestTimeout: false },
+      kafka: { requestTimeout: 1000, enforceRequestTimeout: enforce },
     })
     const { events, on } = this.h.consumer
     on(events.CRASH, ({ payload }) => this.crashes.push(payload))
@@ -59,13 +61,25 @@ class Rig {
     await this.h.consumer.subscribe({ topics: ['topic-a'] })
     this.h.script('ShareFetch', fetches ?? [fetchAnswer([acquire(0, 0, ['a'])])])
     await this.h.consumer.run({
-      eachMessage: async ({ message, acknowledge, renew, isRunning }) => {
-        this.calls.push({ offset: message.offset, acknowledge, renew, isRunning })
-        if (decide) acknowledge(decide)
-        await this.gate.promise
+      eachMessage: (payload) => {
+        const handled = this.handle(payload, decide)
+        this.handlers.push(handled)
+        return handled
       },
     })
     await until(() => this.calls.length > 0, 'a held handler')
+  }
+
+  /**
+   * Records and optionally decides one invocation before holding its return.
+   * @param {object} payload The public message payload.
+   * @param {'accept'|'release'|'reject'|undefined} decide The optional provisional decision.
+   * @returns {Promise<void>} The handler continuation, awaited during cleanup.
+   */
+  async handle({ message, acknowledge, renew, isRunning }, decide) {
+    this.calls.push({ offset: message.offset, acknowledge, renew, isRunning })
+    if (decide) acknowledge(decide)
+    await this.gate.promise
   }
 
   /** @returns {object[]} Every final frame (ShareAcknowledge at epoch -1). */
@@ -96,6 +110,7 @@ class Rig {
   /** @returns {Promise<void>} Releases every hold, restores timers and mocks, and closes the client. */
   async end() {
     this.gate.resolve()
+    await Promise.all(this.handlers)
     jest.restoreAllMocks()
     this.clock.restore()
     await this.h.close()
@@ -173,6 +188,50 @@ describe('a zero timeout during a running close', () => {
   )
 })
 
+describe('a disconnect deadline added during a stop', () => {
+  let rig
+  afterEach(async () => {
+    await rig?.end()
+    rig = undefined
+  })
+
+  test.each([true, false])(
+    'retires a written final at the first disconnect deadline with request enforcement %s',
+    async (enforce) => {
+      rig = new Rig({ enforce })
+      await rig.begin({ decide: 'accept' })
+      const final = rig.h.hold({
+        api: 'ShareAcknowledge',
+        match: ({ fields }) => fields.shareSessionEpoch === -1,
+      })
+      const stopping = track(rig.h.consumer.stop())
+      rig.gate.resolve()
+      await final.arrived()
+      await rig.clock.advance(100)
+      const disconnecting = track(rig.h.consumer.disconnect({ timeout: 100 }))
+      const later = track(rig.h.consumer.disconnect({ timeout: 5000 }))
+      await rig.clock.advance(99)
+      expect(stopping.settled).toBe(false)
+      expect(disconnecting.settled).toBe(false)
+      expect(later.settled).toBe(false)
+      await rig.clock.advance(1)
+      await until(
+        () => stopping.settled && disconnecting.settled && later.settled,
+        'the first deadline'
+      )
+      expect(performance.now()).toBe(200)
+      expect([stopping.error, disconnecting.error, later.error]).toEqual([null, null, null])
+      expect(rig.acks).toEqual([[0, '0', '0', 'accept', 'session-lost']])
+      expect(rig.socketOf(rig.finals()[0]).destroyed).toBe(true)
+      expect(rig.leaves()).toHaveLength(0)
+      final.release()
+      await rig.clock.advance(1000)
+      expect(rig.finals()).toHaveLength(1)
+      expect(rig.acks).toEqual([[0, '0', '0', 'accept', 'session-lost']])
+    }
+  )
+})
+
 describe('a fenced run that is waiting for its final', () => {
   let rig
   afterEach(async () => {
@@ -242,7 +301,7 @@ describe('a handler that outlives the loss of its data socket', () => {
       fetches: [fetchAnswer([acquire(0, 0, ['a'])]), fetchAnswer([acquire(0, 0, ['a'])])],
     })
     const [first] = rig.h.frames(78)
-    rig.socketOf(first).destroy()
+    rig.socketOf(first).emit('end')
     rig.gate.resolve()
     for (let step = 0; step < 10 && rig.calls.length < 2; step++) await rig.clock.advance(60)
 

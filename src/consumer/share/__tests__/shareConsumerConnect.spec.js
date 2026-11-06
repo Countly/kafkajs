@@ -1,4 +1,5 @@
 const Cluster = require('../../../cluster')
+const BrokerPool = require('../../../cluster/brokerPool')
 const { ShareRun } = require('../shareRun')
 const {
   A,
@@ -210,25 +211,28 @@ describe('public share connection contract', () => {
     })
     h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a'])])])
     const seen = observe(h)
-    const crashed = deferred()
-    h.consumer.on(h.consumer.events.CRASH, () => crashed.resolve())
+    jest.spyOn(BrokerPool.prototype, 'withBroker').mockImplementation(async function (
+      callback,
+      { fence } = {}
+    ) {
+      const broker = await this.findBroker({ nodeId: 0, fence })
+      return callback({ nodeId: '0', broker })
+    })
     await subscribe(h)
     const gate = h.hold({ api: 'ApiVersions', node: 1 })
-    const delivered = deferred()
     const handled = []
     await run(h, {
       eachMessage: async ({ partition, message }) => {
         handled.push([partition, message.offset])
-        delivered.resolve()
       },
     })
-    await gate.arrived()
-    await delivered.promise
+    await until(() => gate.call !== null, 'the new leader capability gate')
+    await until(() => handled.length === 1, 'the supported sibling delivery')
     expect(handled).toEqual([[0, '0']])
     expect(seen.crashes).toHaveLength(0)
     expect(h.frames(78, 79).filter(({ node }) => node === 1)).toHaveLength(0)
     gate.release()
-    await crashed.promise
+    await until(() => seen.crashes.length === 1, 'the unsupported leader crash')
     expect(seen.crashes).toHaveLength(1)
     expect(seen.crashes[0].error).toBeInstanceOf(KafkaJSShareGroupsNotSupportedError)
     expect(seen.crashes[0].error).toMatchObject({ reason: 'api-not-advertised', apiKey: 78 })

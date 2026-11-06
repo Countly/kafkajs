@@ -367,6 +367,10 @@ describe('public share range contract', () => {
 
   test('distinguishes repeated renewal outcomes from terminal outcomes', async () => {
     await start()
+    const confirming = h.hold({
+      api: 'ShareFetch',
+      match: ({ fields }) => fields.shareSessionEpoch === 3,
+    })
     h.script('ShareFetch', [
       fetchAnswer([
         part({
@@ -387,6 +391,9 @@ describe('public share range contract', () => {
         durations.push(await renew())
       },
     })
+    await confirming.arrived()
+    expect(h.consumer.acquisitionLockTimeoutMs()).toBe(3000)
+    confirming.release()
     await until(() => h.seen.acks.length === 4, 'two renewals and two terminal outcomes')
     expect(durations).toEqual([2000, 3000])
     expect(outcomes()).toEqual([
@@ -406,7 +413,7 @@ describe('public share range contract', () => {
       { firstOffset: '0', lastOffset: '0', acknowledgeTypes: [1] },
       { firstOffset: '1', lastOffset: '1000000', acknowledgeTypes: [0] },
     ])
-    expect(h.consumer.acquisitionLockTimeoutMs()).toBe(3000)
+    expect(h.consumer.acquisitionLockTimeoutMs()).toBe(15000)
   })
 
   describe('a forced close', () => {

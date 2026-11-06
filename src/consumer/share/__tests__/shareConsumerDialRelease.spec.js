@@ -41,6 +41,7 @@ class DialRig {
     })
     this.gate = deferred()
     this.calls = []
+    this.handlers = []
     this.acks = []
     this.crashes = []
     this.joins = []
@@ -84,7 +85,7 @@ class DialRig {
     h.cluster
       .sockets()
       .filter(({ endpoint }) => endpoint.host === 'node0')
-      [h.frames(78)[0].generation - 1].destroy()
+      [h.frames(78)[0].generation - 1].emit('end')
     h.cluster.blackhole(0)
     this.gate.resolve()
     await this.advanceUntil(() => h.cluster.heldDialsTo(0) === 1, 'the held data dial')
@@ -93,11 +94,22 @@ class DialRig {
   /** @returns {object} A `run` argument whose handlers record their callbacks; only the first one waits. */
   handler() {
     return {
-      eachMessage: async ({ message, acknowledge, renew }) => {
-        this.calls.push({ offset: message.offset, acknowledge, renew })
-        if (this.calls.length === 1) await this.gate.promise
+      eachMessage: (payload) => {
+        const handled = this.handle(payload)
+        this.handlers.push(handled)
+        return handled
       },
     }
+  }
+
+  /**
+   * Records one invocation and holds only the first handler until the test releases it.
+   * @param {object} payload The public message payload.
+   * @returns {Promise<void>} The handler continuation, awaited during cleanup.
+   */
+  async handle({ message, acknowledge, renew }) {
+    this.calls.push({ offset: message.offset, acknowledge, renew })
+    if (this.calls.length === 1) await this.gate.promise
   }
 
   /**
@@ -132,6 +144,7 @@ class DialRig {
   /** @returns {Promise<void>} Releases every hold, restores timers and mocks, and closes the client. */
   async end() {
     this.gate.resolve()
+    await Promise.all(this.handlers)
     jest.restoreAllMocks()
     this.clock.restore()
     await this.h.close()

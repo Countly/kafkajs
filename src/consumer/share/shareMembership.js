@@ -478,14 +478,13 @@ class SharePollView {
   }
 
   /**
-   * Captures a per-node handler invocation; identity never repeats, even for the same node.
-   * @param {number} nodeId Leader node.
-   * @returns {object|null} Opaque call token, null after `stop()`.
+   * Tracks an existing handler invocation with its independent monotonic start time.
+   * @param {import('./shareHandlerCall').ShareHandlerCall} call Original invocation identity.
+   * @returns {object|null} The same invocation, or null after `stop()`.
    */
-  begin(nodeId) {
+  begin(call) {
     if (this.stopped) return null
-    const call = { nodeId, startedAt: performance.now() }
-    this.calls.set(call, call.startedAt)
+    this.calls.set(call, performance.now())
     return call
   }
 

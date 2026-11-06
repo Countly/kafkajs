@@ -815,7 +815,7 @@ class ShareRun {
    * @throws {Error} The explicit-omission verdict.
    */
   async invoke(node, cohort, call, payload) {
-    const pollCall = this.poll.begin(node.id)
+    const pollCall = this.poll.begin(call)
     let failed = false
     let thrown
     try {
@@ -1163,7 +1163,8 @@ class ShareRun {
   }
 
   /**
-   * Sends the captured finals and the leave under one shared cap, each at most once.
+   * Sends the captured finals and the leave under one shared cap, each at most once. Reads the
+   * clock again on completion so expiry revokes the episode before its captured sockets detach.
    * @private
    * @param {ShareCloseEpisode} episode The frozen episode.
    * @returns {Promise<void>}
@@ -1190,6 +1191,7 @@ class ShareRun {
       this.options.logger.debug('Share close traffic ended early', { error: error.message })
     } finally {
       await (sent ?? finals()).catch(() => {})
+      episode.guard()
       operation.finish()
     }
   }

@@ -296,35 +296,47 @@ describe('public share token contract', () => {
     await start()
     h.script('ShareFetch', [oneRecord(), oneRecord()])
     h.script('ShareAcknowledge', [ackAnswer([], { errorCode: 122 })])
+    const replacement = deferred()
+    holds.push({ release: () => replacement.resolve() })
+    const returned = deferred()
     const calls = []
     const during = {}
-    await run({
-      eachMessage: async ({ acknowledge, renew, isRunning }) => {
-        calls.push(true)
-        if (calls.length > 1) return
-        during.renewal = await renew().then(
-          () => null,
-          (error) => error
-        )
-        during.running = isRunning()
-        try {
-          acknowledge('reject')
-        } catch (error) {
-          during.late = error.message
-        }
-      },
-    })
-    await until(() => calls.length === 2 || h.seen.crashes.length > 0, 'the replacement delivery')
-    expect(h.seen.crashes).toEqual([])
-    expect(calls).toHaveLength(2)
-    expect(during.renewal).toMatchObject({
-      name: 'KafkaJSShareAcknowledgementError',
-      reason: 'session-lost',
-      ranges: [{ firstOffset: '0', lastOffset: '0' }],
-    })
-    expect(during.running).toBe(true)
-    expect(during.late).toBe('Handler call is no longer current')
-    expect(h.frames(78).map(({ fields }) => fields.shareSessionEpoch)).toEqual([0, 0])
+    try {
+      await run({
+        eachMessage: async ({ acknowledge, renew, isRunning }) => {
+          calls.push(true)
+          if (calls.length > 1) {
+            await replacement.promise
+            returned.resolve()
+            return
+          }
+          during.renewal = await renew().then(
+            () => null,
+            (error) => error
+          )
+          during.running = isRunning()
+          try {
+            acknowledge('reject')
+          } catch (error) {
+            during.late = error.message
+          }
+        },
+      })
+      await until(() => calls.length === 2 || h.seen.crashes.length > 0, 'the replacement delivery')
+      expect(h.seen.crashes).toEqual([])
+      expect(calls).toHaveLength(2)
+      expect(during.renewal).toMatchObject({
+        name: 'KafkaJSShareAcknowledgementError',
+        reason: 'session-lost',
+        ranges: [{ firstOffset: '0', lastOffset: '0' }],
+      })
+      expect(during.running).toBe(true)
+      expect(during.late).toBe('Handler call is no longer current')
+      expect(h.frames(78).map(({ fields }) => fields.shareSessionEpoch)).toEqual([0, 0])
+    } finally {
+      replacement.resolve()
+      if (calls.length > 1) await returned.promise
+    }
   })
 
   test('sends no heartbeat from a coordinator lookup held across a stop', async () => {
@@ -531,7 +543,7 @@ describe('public share token contract', () => {
     await run({ eachMessage: async () => {} })
     await held.arrived()
     const [join] = h.frames(76)
-    h.cluster.sockets()[join.generation - 1].destroy()
+    h.cluster.sockets()[join.generation - 1].emit('end')
     await beat(50, 2)
     expect(h.frames(76)[1].generation).toBeGreaterThan(join.generation)
     held.release()
@@ -561,7 +573,7 @@ describe('public share token contract', () => {
       },
     })
     await held.arrived()
-    h.cluster.sockets()[held.call.generation - 1].destroy()
+    h.cluster.sockets()[held.call.generation - 1].emit('end')
     await until(() => h.seen.acks.length === 1, 'the lost settlement')
     expect(outcomes()).toEqual([['accept', '0', '0', 'session-lost']])
     expect(h.seen.resets).toEqual([{ nodeId: 0, reason: 'connection', recordsDropped: 1 }])
@@ -872,7 +884,7 @@ describe('public share token contract', () => {
 
     test('settles a renewal lost once and ignores its late answer after the data session resets', async () => {
       const { held, results } = await startRenewing([oneRecord(), oneRecord()])
-      h.cluster.sockets()[held.call.generation - 1].destroy()
+      h.cluster.sockets()[held.call.generation - 1].emit('end')
       await until(() => h.seen.acks.length === 2, 'the lost outcomes')
       expect(outcomes()).toEqual(
         expect.arrayContaining([

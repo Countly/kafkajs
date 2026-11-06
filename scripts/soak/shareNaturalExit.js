@@ -101,15 +101,30 @@ const begin = async (h, hold) => {
 
 /** One close outcome each: the client is driven to it, and every hold is released afterwards. */
 const OUTCOMES = {
+  /**
+   * Completes a natural stop after a normal handler return.
+   * @param {object} h The scripted share client and its trigger.
+   * @returns {Promise<void>} Resolves when this outcome completes and its holds are released.
+   */
   async success(h) {
     await begin(h, false)
     await h.consumer.stop()
   },
+  /**
+   * Abandons a held handler through an immediate disconnect.
+   * @param {object} h The scripted share client and its trigger.
+   * @returns {Promise<void>} Resolves when this outcome completes and its holds are released.
+   */
   async zero(h) {
     const { gate } = await begin(h, true)
     await h.consumer.disconnect({ timeout: 0 })
     gate.resolve()
   },
+  /**
+   * Expires a bounded disconnect with an unanswered final.
+   * @param {object} h The scripted share client and its trigger.
+   * @returns {Promise<void>} Resolves when this outcome completes and its holds are released.
+   */
   async forced(h) {
     const { gate } = await begin(h, true)
     const final = h.hold({ api: 'ShareAcknowledge', match: isFinal })
@@ -119,6 +134,11 @@ const OUTCOMES = {
     gate.resolve()
     final.release()
   },
+  /**
+   * Completes a stop after its captured final fails on the wire.
+   * @param {object} h The scripted share client and its trigger.
+   * @returns {Promise<void>} Resolves when this outcome completes and its holds are released.
+   */
   async failed(h) {
     await begin(h, false)
     const final = h.hold({ api: 'ShareAcknowledge', match: isFinal })
@@ -127,6 +147,11 @@ const OUTCOMES = {
     final.fail(new Error('the final failed on the wire'))
     await closing
   },
+  /**
+   * Completes terminal membership supervision with a held handler.
+   * @param {object} h The scripted share client and its trigger.
+   * @returns {Promise<void>} Resolves when this outcome completes and its holds are released.
+   */
   async crash(h) {
     const { gate, onCrash } = await begin(h, true)
     h.trigger.code = 30

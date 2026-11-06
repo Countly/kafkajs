@@ -4,6 +4,8 @@ describe('handler call construction', () => {
   const FRAME_KEYS = ['authority', 'batch', 'ledger', 'mode', 'records']
   /** The constructor arguments of every call the run built, in order. */
   const constructed = []
+  const instances = []
+  const polled = []
   let harness
   let h
 
@@ -17,20 +19,31 @@ describe('handler call construction', () => {
             constructor(...args) {
               super(...args)
               constructed.push(args)
+              instances.push(this)
             }
           },
         }
+      })
+      const { SharePollView } = require('../shareMembership')
+      const begin = SharePollView.prototype.begin
+      jest.spyOn(SharePollView.prototype, 'begin').mockImplementation(function (call) {
+        const tracked = begin.call(this, call)
+        polled.push([call, tracked])
+        return tracked
       })
       harness = require('../../../../testHelpers/shareHarness')
     })
   })
 
   afterAll(() => {
+    jest.restoreAllMocks()
     jest.dontMock('../shareHandlerCall')
   })
 
   beforeEach(() => {
     constructed.length = 0
+    instances.length = 0
+    polled.length = 0
   })
 
   afterEach(async () => {
@@ -73,6 +86,11 @@ describe('handler call construction', () => {
     expect(Object.keys(frame).sort()).toEqual(FRAME_KEYS)
     expect(frame.batch).toBe(false)
     expect(offsets).toEqual(['0', '1', '2'])
+    expect(polled).toHaveLength(3)
+    for (let i = 0; i < instances.length; i++) {
+      expect(polled[i][0]).toBe(instances[i])
+      expect(polled[i][1]).toBe(instances[i])
+    }
   })
 
   test('builds one eachBatch call per acquisition from the frame itself', async () => {
@@ -92,6 +110,9 @@ describe('handler call construction', () => {
     expect(Object.keys(frame).sort()).toEqual(FRAME_KEYS)
     expect(frame.batch).toBe(true)
     expect(sizes).toEqual([3])
+    expect(polled).toHaveLength(1)
+    expect(polled[0][0]).toBe(instances[0])
+    expect(polled[0][1]).toBe(instances[0])
   })
 
   test('reads start and end from the frame unless they are passed, and never changes the frame', () => {
