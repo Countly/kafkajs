@@ -351,7 +351,9 @@ class ShareMembership {
   /**
    * Retires ordinary authority at once, then sends one best-effort leave under the caller's
    * captured closing authority. The promise is latched before any notification, so a re-entrant
-   * or repeated call shares it; a lost or refused leave is logged and never retried here.
+   * or repeated call shares it and never upgrades the episode: only the first call's `stale`
+   * counts, and ending a stale episode for good takes `stop()`. A lost or refused leave is logged
+   * and never retried here.
    *
    * The leave goes through the cached coordinator only: no lookup and no new connection. A
    * refusal of the closing guard before the write sends nothing. A reply that arrives after the
@@ -413,8 +415,10 @@ class ShareMembership {
 
   /**
    * Rejoins at epoch zero after a poll-expiry leave, once the runner shows that every captured
-   * expired call finished or was abandoned. Does nothing in any other state, after `stop()` or
-   * `leave()` without `stale`, or while a captured call is still running.
+   * expired call finished or was abandoned. Does nothing in any other state, after `stop()`, after
+   * a `leave()` without `stale` that began its own episode, or while a captured call is still
+   * running. A `leave()` made while a stale episode's promise is still latched only shares it and
+   * does not make the episode terminal, so only `stop()` ends recovery for good there.
    * @param {SharePollView} poll The run's own poll view.
    * @param {object[]} captured The expired call identities `poll.captureExpired()` returned.
    * @returns {void}

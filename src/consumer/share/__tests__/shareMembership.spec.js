@@ -9,13 +9,36 @@ const { createScriptedCluster } = require('../../../../testHelpers/scriptedClust
 const { Schedule } = require('../../../../testHelpers/schedule')
 const A = '00112233-4455-6677-8899-aabbccddeeff'
 const B = '10112233-4455-6677-8899-aabbccddeeff'
+const C = '20112233-4455-6677-8899-aabbccddeeff'
 
 /** Selects the one leave frame (member epoch -1) a test holds on the wire. */
 const LEAVE = { api: 'ShareGroupHeartbeat', match: ({ fields }) => fields.memberEpoch === -1 }
 
+/**
+ * @param {{memberId:string}} member Membership whose leave frame to select.
+ * @returns {object} Selector for that member's own leave frame, so two leaves can be held apart.
+ */
+const leaveOf = (member) => ({
+  api: 'ShareGroupHeartbeat',
+  match: ({ fields }) => fields.memberEpoch === -1 && fields.memberId === member.memberId,
+})
+
 /** @returns {Promise<void>} Drains the bounded metadata continuations without a clock sleep. */
 const settled = async () => {
   for (let i = 0; i < 12; i++) await Promise.resolve()
+}
+
+/**
+ * @param {Promise<*>} promise An operation expected to reject.
+ * @returns {Promise<Error>} Its rejection; the test fails when it resolves instead.
+ */
+const rejected = async (promise) => {
+  try {
+    await promise
+  } catch (error) {
+    return error
+  }
+  throw new Error('expected the promise to reject')
 }
 
 /**
@@ -275,29 +298,44 @@ describe('share membership', () => {
       })
     }
   )
-  test.each([35, 30, 29, 81, 42])(
-    'makes code %s terminal with no later heartbeat',
-    async (code) => {
-      f = await fixture()
-      f.response.errorCode = code
-      await expect(f.member.heartbeat()).rejects.toMatchObject({
-        retriable: false,
-      })
-      expect(f.member.state).toBe('FATAL')
-      expect(f.onFatal).toHaveBeenCalledTimes(1)
-      await f.member.heartbeat()
-      expect(f.frames()).toHaveLength(1)
-    }
-  )
+  test.each([30, 29, 81, 42])('makes code %s terminal with no later heartbeat', async (code) => {
+    f = await fixture()
+    f.response.errorCode = code
+    const error = await rejected(f.member.heartbeat())
+    expect(error).toMatchObject({ code, retriable: false })
+    expect(error.cause).toMatchObject({ code, message: createErrorFromCode(code).message })
+    expect(f.member.state).toBe('FATAL')
+    expect(f.onFatal).toHaveBeenCalledTimes(1)
+    expect(f.onFatal.mock.calls[0][0]).toBe(error)
+    await f.member.heartbeat()
+    expect(f.frames()).toHaveLength(1)
+  })
+  test('makes code 35 terminal with no later heartbeat', async () => {
+    f = await fixture()
+    f.response.errorCode = 35
+    const error = await rejected(f.member.heartbeat())
+    expect(error).toMatchObject({
+      code: 35,
+      retriable: false,
+      message: createErrorFromCode(35).message,
+    })
+    expect(f.member.state).toBe('FATAL')
+    expect(f.onFatal).toHaveBeenCalledTimes(1)
+    expect(f.onFatal.mock.calls[0][0]).toBe(error)
+    await f.member.heartbeat()
+    expect(f.frames()).toHaveLength(1)
+  })
   test('names the refused API when the broker answers code 35 at runtime', async () => {
     f = await fixture()
     f.response.errorCode = 35
     await expect(f.member.heartbeat()).rejects.toMatchObject({
+      code: 35,
       reason: 'refused-by-broker',
       apiKey: 76,
       apiName: 'ShareGroupHeartbeat',
     })
     expect(f.onFatal.mock.calls[0][0]).toMatchObject({
+      code: 35,
       reason: 'refused-by-broker',
       apiKey: 76,
       apiName: 'ShareGroupHeartbeat',
@@ -334,12 +372,14 @@ describe('share membership', () => {
     expect(f.frames()).toHaveLength(2)
   })
   test('completes a poll-expiry leave answered with code 69 and rejoins with the same member ID', async () => {
-    f = await fixture()
+    const logger = { error: jest.fn() }
+    f = await fixture({ logger })
     await f.member.heartbeat()
     const id = f.member.memberId
     f.response.errorCode = 69
     await f.member.leave({ stale: true })
     expect(f.member.state).toBe('STALE')
+    expect(logger.error).not.toHaveBeenCalled()
     expect(f.onFatal).not.toHaveBeenCalled()
     f.response.errorCode = 0
     f.member.rejoinAfterPoll(new SharePollView({ maxPollInterval: 1000 }), [])
@@ -355,11 +395,17 @@ describe('share membership', () => {
     f = await fixture()
     await f.member.heartbeat()
     await f.member.leave()
-    const { token, state } = f.member.snapshot()
-    expect(state).toBe('UNSUBSCRIBED')
-    expect(f.member.onMembershipError(createErrorFromCode(69), token)).toBeNull()
+    const unsubscribed = f.member.snapshot()
+    expect(unsubscribed.state).toBe('UNSUBSCRIBED')
+    expect(f.member.onMembershipError(createErrorFromCode(69), unsubscribed.token)).toBeNull()
     await f.member.heartbeat()
-    expect(f.member.snapshot()).toMatchObject({ state: 'UNSUBSCRIBED', token })
+    expect(f.member.snapshot()).toEqual(unsubscribed)
+    const poll = new SharePollView({ maxPollInterval: 1000 })
+    const captured = poll.captureExpired()
+    expect(poll.drained(captured)).toBe(true)
+    f.member.rejoinAfterPoll(poll, captured)
+    await f.member.heartbeat()
+    expect(f.member.snapshot()).toEqual(unsubscribed)
     expect(f.onFatal).not.toHaveBeenCalled()
     expect(f.frames()).toHaveLength(2)
   })
@@ -401,7 +447,8 @@ describe('share membership', () => {
     expect(f.member.state).toBe('STABLE')
   })
   test('a late code 69 answer to a retired run leave cannot touch its replacement run', async () => {
-    f = await fixture()
+    const logger = { error: jest.fn() }
+    f = await fixture({ logger })
     await f.member.heartbeat()
     const onFatal = jest.fn()
     const replacement = new ShareMembership({
@@ -413,19 +460,36 @@ describe('share membership', () => {
       onFatal,
     })
     await replacement.heartbeat()
-    const { token } = replacement.snapshot()
-    const gate = f.schedule.hold(LEAVE)
-    const leaving = f.member.leave()
-    await gate.arrived()
-    gate.release({ ...f.response, errorCode: 69 })
-    await leaving
+    const originalGate = f.schedule.hold(leaveOf(f.member))
+    const replacementGate = f.schedule.hold(leaveOf(replacement))
+    let retired = false
+    const originalLeave = f.member.leave({
+      guard: () => (retired ? new Error('closing episode retired') : null),
+    })
+    await originalGate.arrived()
+    retired = true
+    let replacementSettled = false
+    const replacementLeave = replacement.leave().then(() => {
+      replacementSettled = true
+    })
+    await replacementGate.arrived()
+    const held = replacement.snapshot()
+    expect(held.state).toBe('LEAVING')
+    originalGate.release({ ...f.response, errorCode: 69 })
+    await originalLeave
+    await settled()
+    expect(f.member.state).toBe('UNSUBSCRIBED')
+    expect(logger.error).not.toHaveBeenCalled()
     expect(f.onFatal).not.toHaveBeenCalled()
     expect(onFatal).not.toHaveBeenCalled()
-    expect(replacement.snapshot()).toMatchObject({ state: 'STABLE', token })
-    await replacement.heartbeat()
+    expect(replacementSettled).toBe(false)
+    expect(replacement.snapshot()).toEqual(held)
+    replacementGate.release({ ...f.response })
+    await replacementLeave
+    expect(replacementSettled).toBe(true)
+    expect(replacement.state).toBe('UNSUBSCRIBED')
     const own = f.frames().filter((x) => x.memberId === replacement.memberId)
-    expect(own.map((x) => x.memberEpoch)).toEqual([0, 1])
-    replacement.stop()
+    expect(own.map((x) => x.memberEpoch)).toEqual([0, -1])
   })
   test('does not act on the reply to a leave whose closing guard refused in flight', async () => {
     const logger = { error: jest.fn() }
@@ -622,6 +686,57 @@ describe('share membership', () => {
     await settled()
     expect(f.member.snapshot().assignment.map((x) => x.topicId)).toEqual([A])
     expect(f.member.snapshot().unresolved).toEqual([])
+  })
+  test('a retired metadata flight finishing cannot free the new target flight for a duplicate', async () => {
+    f = await fixture()
+    const flights = []
+    f.cluster.refreshMetadataForTopicIds.mockImplementation(
+      (ids, { isCurrent }) =>
+        new Promise((resolve) => {
+          flights.push({ ids, isCurrent, resolve })
+        })
+    )
+    f.response.assignment = { topicPartitions: [{ topicId: B, partitions: [1] }] }
+    await f.member.heartbeat()
+    f.response.assignment = { topicPartitions: [{ topicId: C, partitions: [1] }] }
+    await f.member.heartbeat()
+    expect(flights.map((x) => x.ids)).toEqual([[B], [C]])
+    expect(flights.map((x) => x.isCurrent())).toEqual([false, true])
+    flights[0].resolve({ resolved: [], unresolved: [B] })
+    await settled()
+    f.response.assignment = null
+    await f.member.heartbeat()
+    await settled()
+    expect(flights).toHaveLength(2)
+    expect(flights[1].isCurrent()).toBe(true)
+    expect(f.member.snapshot().unresolved).toEqual([C])
+    flights[1].resolve({ resolved: [], unresolved: [C] })
+    await settled()
+  })
+  test('rejected current metadata attempts arm a growing backoff that blocks earlier heartbeats', async () => {
+    f = await fixture({ retry: { initialRetryTime: 100, multiplier: 2, factor: 0 } })
+    let now = 0
+    jest.spyOn(performance, 'now').mockImplementation(() => now)
+    f.cluster.refreshMetadataForTopicIds
+      .mockRejectedValueOnce(new Error('metadata down'))
+      .mockRejectedValueOnce(new Error('metadata down'))
+    f.response.assignment = { topicPartitions: [{ topicId: B, partitions: [1] }] }
+    const beat = async (at) => {
+      now = at
+      await f.member.heartbeat()
+      await settled()
+    }
+    await beat(0)
+    f.response.assignment = null
+    expect(f.cluster.refreshMetadataForTopicIds).toHaveBeenCalledTimes(1)
+    await beat(99)
+    expect(f.cluster.refreshMetadataForTopicIds).toHaveBeenCalledTimes(1)
+    await beat(100)
+    expect(f.cluster.refreshMetadataForTopicIds).toHaveBeenCalledTimes(2)
+    await beat(299)
+    expect(f.cluster.refreshMetadataForTopicIds).toHaveBeenCalledTimes(2)
+    await beat(300)
+    expect(f.cluster.refreshMetadataForTopicIds).toHaveBeenCalledTimes(3)
   })
   test('coalesces concurrent heartbeats and rejects a captured write after stop', async () => {
     f = await fixture()

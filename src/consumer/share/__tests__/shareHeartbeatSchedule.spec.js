@@ -109,6 +109,22 @@ describe('share heartbeat scheduling', () => {
     for (let i = 0; i < 10; i++) backoff.onFailedAttempt(0)
     expect(backoff.remaining(0)).toBe(1000)
   })
+  test('a failed heartbeat sends nothing before its backoff deadline and exactly one at it', async () => {
+    f = fixture()
+    f.broker.shareGroupHeartbeat.mockRejectedValueOnce(new Error('first'))
+    await expect(f.member.heartbeat()).rejects.toThrow('first')
+    expect(f.broker.shareGroupHeartbeat).toHaveBeenCalledTimes(1)
+    await f.member.heartbeat()
+    expect(f.broker.shareGroupHeartbeat).toHaveBeenCalledTimes(1)
+    await jest.advanceTimersByTimeAsync(99)
+    await f.member.heartbeat()
+    expect(f.broker.shareGroupHeartbeat).toHaveBeenCalledTimes(1)
+    expect(f.member.heartbeatInterval()).toBe(1)
+    await jest.advanceTimersByTimeAsync(1)
+    await f.member.heartbeat()
+    expect(f.broker.shareGroupHeartbeat).toHaveBeenCalledTimes(2)
+    expect(f.member.heartbeatInterval()).toBe(1000)
+  })
   test('terminal shutdown cannot arm through either entrypoint or a held completion', async () => {
     f = fixture()
     let release
