@@ -89,6 +89,15 @@ describe('Share guide API boundaries', () => {
     }
   })
 
+  test('keeps the Admin offset-reset recipe identical to the exercised share guide', () => {
+    const recipes = ['docs/ShareConsumer.md', 'docs/Admin.md'].map((file) => {
+      const match = read(file).match(/^async function resetShareOffsets\([\s\S]*?^\}/m)
+      expect(match).not.toBeNull()
+      return match[0]
+    })
+    expect(recipes[1]).toBe(recipes[0])
+  })
+
   test('documents compact terminal outcomes and nonterminal renewal', () => {
     const text = read('docs/ShareConsumer.md')
     for (const phrase of [

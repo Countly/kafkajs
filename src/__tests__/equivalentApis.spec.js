@@ -25,6 +25,7 @@ const adminFactory = require('../admin')
 const apiKeys = require('../protocol/requests/apiKeys')
 const expectedWire = require('../../testHelpers/wire/expected')
 const { createGroupApiBroker } = require('../broker/__tests__/fixtures/groupApiHarness')
+const { ShareAckLedger } = require('../consumer/share/shareAckLedger')
 const {
   A,
   B,
@@ -1613,6 +1614,73 @@ it('R1§E:ackCallback', async () => {
   ])
   expect(coveredOffsets(mixed.acks)).toEqual(['0', '1', '2'])
 
+  const partial = await startShare()
+  let now = 100
+  const clock = jest.spyOn(performance, 'now').mockImplementation(() => now)
+  const completions = jest.spyOn(ShareAckLedger.prototype, 'completeRange')
+  const invalidations = jest.spyOn(ShareAckLedger.prototype, 'invalidate')
+  try {
+    partial.h.script('ShareFetch', [
+      fetchAnswer([acquire(0, 0, ['a', 'b', 'c'])], { acquisitionLockTimeoutMs: 1000 }),
+    ])
+    const unanswered = partial.h.hold({
+      api: 'ShareAcknowledge',
+      match: ({ fields }) => batchesOf({ fields }).some(({ firstOffset }) => firstOffset === '1'),
+    })
+    const finish = handlerGate()
+    const delivered = []
+    await partial.h.consumer.run({
+      eachMessage: async ({ message }) => {
+        delivered.push(message.offset)
+        if (message.offset === '0') now = 700
+        else if (message.offset === '1') {
+          await reach(() => partial.acks.length === 1, 'the confirmed acquisition subset')
+        } else await finish.promise
+      },
+    })
+    await reach(() => unanswered.call !== null, 'the written remainder acknowledgement')
+    expect(outcomes(partial.acks)).toEqual([['0', '0', 'accept', null]])
+    expect(partial.h.frames(78)).toHaveLength(1)
+    expect(partial.h.frames(79).map(batchesOf)).toEqual([
+      [{ firstOffset: '0', lastOffset: '0', acknowledgeTypes: [1] }],
+      [{ firstOffset: '1', lastOffset: '1', acknowledgeTypes: [1] }],
+    ])
+    finish.resolve()
+    await reach(() => completions.mock.calls.length === 3, 'all completed handler decisions')
+    expect(delivered).toEqual(['0', '1', '2'])
+    const sent = [...partial.h.frames(78, 79)]
+    await partial.h.consumer.disconnect({ timeout: 0 })
+    await reach(() => partial.acks.length === 2, 'the lost acquisition remainder')
+    expect(outcomes(partial.acks)).toEqual([
+      ['0', '0', 'accept', null],
+      ['1', '2', 'accept', 'membership-lost'],
+    ])
+    expect(partial.acks[1].error).toBeInstanceOf(KafkaJSShareAcknowledgementError)
+    expect(partial.acks[1].error.ranges).toEqual([{ firstOffset: '1', lastOffset: '2' }])
+    expect(coveredOffsets(partial.acks)).toEqual(['0', '1', '2'])
+    expect(new Set(coveredOffsets(partial.acks)).size).toBe(3)
+    expect(invalidations.mock.contexts).toHaveLength(1)
+    const [ledger] = invalidations.mock.contexts
+    for (const completed of completions.mock.contexts) expect(completed).toBe(ledger)
+    expect(ledger.size).toBe(0)
+    const settled = [...partial.acks]
+    unanswered.release(ackAnswer([{ partition: 0 }]))
+    await flush()
+    expect(ledger.invalidate('membership-lost')).toEqual([])
+    await partial.h.consumer.disconnect({ timeout: 0 })
+    await flush()
+    expect(partial.acks).toEqual(settled)
+    expect(partial.h.frames(78, 79)).toEqual(sent)
+  } finally {
+    try {
+      await partial.h.close()
+    } finally {
+      invalidations.mockRestore()
+      completions.mockRestore()
+      clock.mockRestore()
+    }
+  }
+
   const renewed = await startShare()
   renewed.h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a'])])])
   renewed.h.script('ShareAcknowledge', [
@@ -1780,7 +1848,7 @@ it('R1§E:reset-offsets', async () => {
   expect(sent(raced)).toHaveLength(1)
 })
 
-it('R1§C:deleteShareGroups', async () => {
+it('maps synthetic DeleteGroups v3 outcomes through Admin and Broker for a share group id', async () => {
   const GROUP = 'equivalent-share-empty'
   const notEmpty = 'The group is not empty.'
   /**
