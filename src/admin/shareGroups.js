@@ -108,15 +108,25 @@ const selection = (topics, kind) => {
 }
 
 /**
+ * @param {Error} error failure of one describe attempt
+ * @returns {number|undefined} the protocol code on the error or its cause
+ */
+const codeOf = (error) => error.code ?? error.cause?.code
+
+/**
+ * @param {number|undefined} code protocol code
+ * @returns {boolean} whether it says the coordinator moved (15 or 16)
+ */
+const isMoved = (code) => code === COORDINATOR_NOT_AVAILABLE || code === NOT_COORDINATOR
+
+/**
  * Whether a thrown error rejects the whole describe call; a coordinator-moved or loading error
  * is instead retried and, once the budget is spent, kept as that group's own row.
  * @param {Error} error failure of one describe attempt
  * @returns {boolean} false only for protocol codes 14, 15 and 16
  */
 const isCallFailure = (error) =>
-  ![COORDINATOR_LOAD_IN_PROGRESS, COORDINATOR_NOT_AVAILABLE, NOT_COORDINATOR].includes(
-    error.code ?? error.cause?.code
-  )
+  codeOf(error) !== COORDINATOR_LOAD_IN_PROGRESS && !isMoved(codeOf(error))
 
 /**
  * Finds a typed refusal or invariant failure on an error's cause chain.
@@ -152,8 +162,9 @@ class ShareGroups {
    * Describes share groups, one request per coordinator, and returns rows in caller order.
    * Groups are looked up and batched by coordinator node. A repeated id shares one lookup and one
    * relocation allowance and comes back as a fresh row per repetition. Loading (14) is retried in
-   * place under the retry budget; a moved coordinator (15/16) is looked up again once per id, after
-   * which the broker's code stays on that group's row. Settled rows are never resent. A lookup or
+   * place under the retry budget; a moved coordinator (15/16), answered or thrown by a request, is
+   * looked up again once per id, after which the broker's code stays on that group's row (a thrown
+   * one is retried on the same route under the budget). Settled rows are never resent. A lookup or
    * request that fails with 14/15/16 is retried for the groups it affected only; once the budget is
    * spent those groups carry `errorCode: -1` with the failure's message and every other group keeps
    * its own answer.
@@ -413,9 +424,10 @@ class ShareGroups {
 
   /**
    * Runs one describe attempt over the still-pending ids, one request per coordinator node.
-   * Rows asking to be retried carry `retryCoordinator`; a first 15/16 also drops that id's route.
-   * A lookup or request that fails with 14/15/16 leaves only its own ids unresolved: every other
-   * group's row, from any batch, is returned so it is never resent.
+   * Rows asking to be retried carry `retryCoordinator`; a first 15/16, answered or thrown by a
+   * request, also drops that id's route. A lookup or request that fails with 14/15/16 leaves only
+   * its own ids unresolved: every other group's row, from any batch, is returned so it is never
+   * resent.
    * @param {Array<{groupId: string}>} pending ids not yet settled
    * @param {object} context call-local state
    * @param {boolean} context.includeAuthorizedOperations wire flag
@@ -453,12 +465,30 @@ class ShareGroups {
             })
             return this.#correlate(answer, groupIds, { routes, relocated })
           } catch (error) {
-            return this.#unresolved(groupIds, error)
+            const rows = this.#unresolved(groupIds, error)
+            if (isMoved(codeOf(error)))
+              for (const groupId of groupIds) this.#relocate(groupId, routes, relocated)
+            return rows
           }
         })
       )
     )
     return [...unresolved, ...checked(answers).flat()]
+  }
+
+  /**
+   * Spends an id's one relocation: drops its cached route so the next attempt looks the
+   * coordinator up again. An id that already relocated keeps its route.
+   * @param {string} groupId id whose coordinator was reported moved
+   * @param {Map<string, object>} routes coordinator per id
+   * @param {Set<string>} relocated ids that already used their one relocation
+   * @returns {boolean} whether the relocation was spent now
+   */
+  #relocate(groupId, routes, relocated) {
+    if (relocated.has(groupId)) return false
+    relocated.add(groupId)
+    routes.delete(groupId)
+    return true
   }
 
   /**
@@ -480,15 +510,9 @@ class ShareGroups {
         throw new KafkaJSInvariantViolation('Invalid share group result identity')
       seen.add(row.groupId)
       this.#refused(DESCRIBE_KEY, row.errorCode)
-      let retryCoordinator = row.errorCode === COORDINATOR_LOAD_IN_PROGRESS
-      if (
-        [COORDINATOR_NOT_AVAILABLE, NOT_COORDINATOR].includes(row.errorCode) &&
-        !relocated.has(row.groupId)
-      ) {
-        relocated.add(row.groupId)
-        routes.delete(row.groupId)
-        retryCoordinator = true
-      }
+      const retryCoordinator =
+        row.errorCode === COORDINATOR_LOAD_IN_PROGRESS ||
+        (isMoved(row.errorCode) && this.#relocate(row.groupId, routes, relocated))
       return { ...row, retryCoordinator }
     })
     if (seen.size !== wanted.size) throw new KafkaJSInvariantViolation('Missing share group result')

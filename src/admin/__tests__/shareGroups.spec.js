@@ -436,6 +436,77 @@ describe('share administration', () => {
       expect(second.shareGroupDescribe).toHaveBeenCalledTimes(retry.retries + 1)
     })
 
+    test.each([[15], [16]])(
+      'relocates a group whose batch request throws %s to its new coordinator beside a settled sibling',
+      async (code) => {
+        const first = coordinator(0)
+        const second = coordinator(1)
+        const third = coordinator(2)
+        first.shareGroupDescribe.mockRejectedValue(createErrorFromCode(code))
+        const lookups = new Map()
+        f = fixture([first, second, third], (id) => {
+          const n = lookups.get(id) || 0
+          lookups.set(id, n + 1)
+          if (id === 'b') return third
+          return n ? second : first
+        })
+        const result = await f.admin.describeShareGroups(['a', 'b'])
+        expect(result.groups.map((g) => [g.groupId, g.errorCode])).toEqual([
+          ['a', 0],
+          ['b', 0],
+        ])
+        expect(first.shareGroupDescribe.mock.calls.map(([request]) => request.groupIds)).toEqual([
+          ['a'],
+        ])
+        expect(second.shareGroupDescribe.mock.calls.map(([request]) => request.groupIds)).toEqual([
+          ['a'],
+        ])
+        expect(third.shareGroupDescribe.mock.calls.map(([request]) => request.groupIds)).toEqual([
+          ['b'],
+        ])
+        expect([...lookups]).toEqual([
+          ['a', 2],
+          ['b', 1],
+        ])
+      }
+    )
+
+    test('relocates a group once for a thrown NOT_COORDINATOR and keeps the new route when it throws again', async () => {
+      const first = coordinator(0)
+      const second = coordinator(1)
+      first.shareGroupDescribe.mockRejectedValue(createErrorFromCode(16))
+      second.shareGroupDescribe.mockRejectedValue(createErrorFromCode(16))
+      let lookups = 0
+      f = fixture([first, second], () => (lookups++ ? second : first))
+      const result = await f.admin.describeShareGroups(['a'])
+      expect(result.groups.map((g) => [g.groupId, g.errorCode, g.errorMessage])).toEqual([
+        ['a', -1, createErrorFromCode(16).message],
+      ])
+      expect(f.cluster.findGroupCoordinator).toHaveBeenCalledTimes(2)
+      expect(first.shareGroupDescribe).toHaveBeenCalledTimes(1)
+      expect(second.shareGroupDescribe).toHaveBeenCalledTimes(retry.retries)
+    })
+
+    test('keeps the route for a thrown COORDINATOR_LOAD_IN_PROGRESS and still allows the later relocation', async () => {
+      const first = coordinator(0)
+      const second = coordinator(1)
+      first.shareGroupDescribe
+        .mockRejectedValueOnce(createErrorFromCode(14))
+        .mockRejectedValueOnce(createErrorFromCode(16))
+      let lookups = 0
+      f = fixture([first, second], () => (lookups++ ? second : first))
+      const result = await f.admin.describeShareGroups(['a'])
+      expect(result.groups.map((g) => [g.groupId, g.errorCode])).toEqual([['a', 0]])
+      expect(first.shareGroupDescribe.mock.calls.map(([request]) => request.groupIds)).toEqual([
+        ['a'],
+        ['a'],
+      ])
+      expect(second.shareGroupDescribe.mock.calls.map(([request]) => request.groupIds)).toEqual([
+        ['a'],
+      ])
+      expect(f.cluster.findGroupCoordinator).toHaveBeenCalledTimes(2)
+    })
+
     test.each([['lookup'], ['request']])(
       'rejects the whole call with the identical transport error from a failing %s',
       async (stage) => {
