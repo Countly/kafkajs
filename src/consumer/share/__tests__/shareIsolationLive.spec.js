@@ -1,3 +1,7 @@
+const {
+  acknowledgementResults,
+  pollSharePosition,
+} = require('../../../../testHelpers/shareLiveDiagnostics')
 const { isDeepStrictEqual } = require('util')
 const { Kafka, logLevel } = require('../../../../index')
 const { readLog } = require('../../../../testHelpers/rawLog')
@@ -222,6 +226,7 @@ class Member {
     this.client = kafka.shareConsumer({ groupId, maxRecords: 100, maxWaitTimeInMs: 250, ...config })
     /** @type {Array<{identity: string, deliveryCount: number, offset: string, at: number}>} */
     this.entries = []
+    this.handled = 0
     this.acks = []
     this.requests = []
     this.assignments = []
@@ -264,6 +269,7 @@ class Member {
             offset: message.offset,
             at: Date.now(),
           })
+          this.handled++
         },
       })
     )
@@ -415,6 +421,10 @@ class IsolationCase {
       ...this.kafkaOptions,
       clientId: `share-isolation-admin-${this.nonce}`,
     }).admin()
+    this.adminRequests = []
+    this.removeAdminRequests = this.admin.on(this.admin.events.REQUEST, ({ payload }) =>
+      this.adminRequests.push(payload)
+    )
     this.stack = new CleanupStack()
     this.expected = { R: [], C: [] }
     this.log = []
@@ -436,8 +446,23 @@ class IsolationCase {
       scenario: this.nonce,
       groups: this.groups,
       budgets: { caseMs: CASE_BUDGET_MS, stepMs: STEP_MS, deliveryMs: DELIVERY_MS },
+      wireVersions: wireVersionsOf([
+        ...this.adminRequests,
+        ...Object.values(this.members ?? {}).flatMap(({ requests }) => requests),
+      ]),
       ...fields,
     })
+  }
+
+  /** @returns {object[]} Per-member handler progress and public acknowledgement outcomes. */
+  progress() {
+    return Object.values(this.members ?? {}).map(({ label, groupId, entries, handled, acks }) => ({
+      label,
+      groupId,
+      delivered: entries.length,
+      handled,
+      acknowledgements: acknowledgementResults(acks),
+    }))
   }
 
   /**
@@ -449,6 +474,7 @@ class IsolationCase {
    */
   async run(scope) {
     const outer = new CleanupStack()
+    outer.add('remove admin request listener', () => this.removeAdminRequests())
     outer.add('release resource gauge', () => this.gauge.uninstall())
     outer.add('disconnect admin', () => this.admin.disconnect())
     let pre
@@ -488,7 +514,11 @@ class IsolationCase {
       await this.settleProcess(scope, pre)
       this.complete(probeBase, after)
     } catch (error) {
-      this.row('case-failed', { status: 'failed', error: describeError(error) })
+      this.row('case-failed', {
+        status: 'failed',
+        error: describeError(error),
+        members: this.progress(),
+      })
       throw error
     }
   }
@@ -830,16 +860,20 @@ class IsolationCase {
    */
   async awaitStart(scope, end) {
     for (const group of Object.values(this.groups)) {
-      await pollUntil(
+      const last = { named: null, all: null, error: null }
+      await pollSharePosition(
         scope,
         DELIVERY_MS,
         async () => {
           try {
-            const [named] = await this.admin.listShareGroupOffsets({
+            last.named = await this.admin.listShareGroupOffsets({
               groupId: group,
               topics: [{ topic: this.topic, partitions: [0] }],
             })
-            const [every] = await this.admin.listShareGroupOffsets({ groupId: group })
+            last.all = await this.admin.listShareGroupOffsets({ groupId: group })
+            const [named] = last.named
+            const [every] = last.all
+            last.error = null
             const [row] = named.partitions
             expect(every.partitions[0].startOffset).toBe(row.startOffset)
             return (
@@ -848,11 +882,17 @@ class IsolationCase {
               (row.lag === '0' || row.lag === null)
             )
           } catch (error) {
+            last.error = describeError(error)
             if (moving(error)) return false
             throw error
           }
         },
-        { delayMs: 250, label: `${group} reaching start offset ${end}` }
+        {
+          delayMs: 250,
+          label: `${group} reaching start offset ${end}`,
+          snapshot: () => ({ groupId: group, topic: this.topic, end, ...last }),
+          record: (fields) => this.row('broker-position', { ...fields, members: this.progress() }),
+        }
       )
     }
   }
@@ -981,7 +1021,7 @@ class IsolationCase {
         topicsAbsent: true,
         completedAt: Number(process.hrtime.bigint() / 1000000n),
       },
-      wireVersions: wireVersionsOf(requests),
+      wireVersions: wireVersionsOf([...this.adminRequests, ...requests]),
       config: {
         clients: { maxRecords: 100, maxWaitTimeInMs: 250, acknowledgementMode: 'implicit' },
         groups: {

@@ -1,3 +1,8 @@
+const {
+  acknowledgementResults,
+  acknowledgementRequests,
+  pollSharePosition,
+} = require('../../../../testHelpers/shareLiveDiagnostics')
 const net = require('net')
 const { EventEmitter } = require('events')
 const {
@@ -417,8 +422,26 @@ class AckTypesCase {
       scenario: this.nonce,
       groups: { ack: this.group },
       budgets: { caseMs: BUDGET_MS, cleanupMs: CLEANUP_MS },
+      wireVersions: wireVersionsOf(this.requests),
       ...fields,
     })
+  }
+
+  /** @returns {object} Handler progress and public outcomes before cleanup can change them. */
+  progress() {
+    return {
+      members: (this.member ? [this.member] : []).map(
+        ({ label, memberId, delivered, handled, acks, crashes }) => ({
+          label,
+          memberId,
+          delivered,
+          handled,
+          acknowledgements: acknowledgementResults(acks),
+          crashes: crashes.map((error) => describeError(error)),
+        })
+      ),
+      acknowledgementRequests: acknowledgementRequests(this.tap.frames),
+    }
   }
 
   /**
@@ -440,7 +463,7 @@ class AckTypesCase {
       )
       await this.complete(scope)
     } catch (error) {
-      this.row('case-failed', { error: describeError(error) })
+      this.row('case-failed', { error: describeError(error), ...this.progress() })
       throw error
     }
   }
@@ -581,7 +604,16 @@ class AckTypesCase {
    */
   async startMember(scope) {
     const consumer = this.client('A').shareConsumer({ groupId: this.group, ...this.clientConfig })
-    const member = { consumer, memberId: null, assignment: [], acks: [], crashes: [] }
+    const member = {
+      label: 'A',
+      consumer,
+      memberId: null,
+      assignment: [],
+      acks: [],
+      crashes: [],
+      delivered: 0,
+      handled: 0,
+    }
     this.member = member
     const { events } = consumer
     const removers = [
@@ -602,6 +634,7 @@ class AckTypesCase {
     await bounded(scope, 20000, () =>
       consumer.run({
         eachMessage: async ({ topic, partition, message, acknowledge }) => {
+          member.delivered++
           const identity = shareRecordIdentity({ ...message, topic, partition })
           const seen = this.deliveries.get(identity) ?? []
           seen.push(message.deliveryCount)
@@ -614,6 +647,7 @@ class AckTypesCase {
           } finally {
             this.openHandlers--
           }
+          member.handled++
         },
       })
     )
@@ -824,25 +858,26 @@ class AckTypesCase {
    */
   async awaitBrokerEnd(scope) {
     let row
-    await pollUntil(
+    const last = { named: null, all: null }
+    await pollSharePosition(
       scope,
       20000,
       async (poll) => {
-        const named = await bounded(poll, 10000, () =>
+        last.named = await bounded(poll, 10000, () =>
           this.admin.listShareGroupOffsets({
             groupId: this.group,
             topics: [{ topic: this.topic, partitions: [0] }],
             apiTimeout: 8000,
           })
         )
-        const all = await bounded(poll, 10000, () =>
+        last.all = await bounded(poll, 10000, () =>
           this.admin.listShareGroupOffsets({ groupId: this.group, apiTimeout: 8000 })
         )
         const pick = (listing) =>
           listing
             .find(({ topic }) => topic === this.topic)
             ?.partitions.find((p) => p.partition === 0)
-        const first = pick(named)
+        const first = pick(last.named)
         row = {
           groupId: this.group,
           topic: this.topic,
@@ -856,10 +891,14 @@ class AckTypesCase {
           row.errorCode === 0 &&
           row.startOffset === row.logEnd &&
           (row.lag === '0' || row.lag === null) &&
-          JSON.stringify(pick(all)) === JSON.stringify(first)
+          JSON.stringify(pick(last.all)) === JSON.stringify(first)
         )
       },
-      { label: 'The broker share offsets' }
+      {
+        label: 'The broker share offsets',
+        snapshot: () => ({ groupId: this.group, topic: this.topic, row, ...last }),
+        record: (fields) => this.row('broker-position', { ...fields, ...this.progress() }),
+      }
     )
     return [row]
   }

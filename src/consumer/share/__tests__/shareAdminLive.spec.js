@@ -1,4 +1,8 @@
 const {
+  acknowledgementResults,
+  pollSharePosition,
+} = require('../../../../testHelpers/shareLiveDiagnostics')
+const {
   Kafka,
   KafkaJSDeleteGroupsError,
   KafkaJSNonRetriableError,
@@ -383,6 +387,8 @@ class Member {
     this.memberId = null
     this.assignment = []
     this.delivered = []
+    this.handled = 0
+    this.acks = []
     this.crashes = []
     this.requests = []
     this.queueSizes = new Map()
@@ -396,6 +402,9 @@ class Member {
       this.listen(events.ASSIGNMENT_CHANGED, ({ payload }) => {
         this.assignment = payload.assignment
       })
+    }
+    if (events.ACKNOWLEDGE) {
+      this.listen(events.ACKNOWLEDGE, ({ payload }) => this.acks.push(payload))
     }
     this.listen(events.CRASH, ({ payload }) => this.crashes.push(payload))
     this.listen(events.REQUEST, ({ payload }) => this.requests.push(payload))
@@ -481,8 +490,25 @@ class AdminCase {
       nonce: this.id,
       groups: { share: GROUP_ALIAS, legacy: 'legacy-group', ordinary: 'ordinary-group' },
       budgets: { caseMs: CASE_BUDGET_MS, apiTimeoutMs: API_TIMEOUT_MS },
+      wireVersions: wireVersionsOf([
+        ...this.adminRequests,
+        ...this.members.flatMap(({ requests }) => requests),
+      ]),
       ...fields,
     })
+  }
+
+  /** @returns {object[]} Share handler progress and actual acknowledgement outcomes. */
+  progress() {
+    return this.members
+      .filter(({ consumer }) => consumer.events.ACKNOWLEDGE)
+      .map(({ label, memberId, delivered, handled, acks }) => ({
+        label,
+        memberId,
+        delivered: delivered.length,
+        handled,
+        acknowledgements: acknowledgementResults(acks),
+      }))
   }
 
   /**
@@ -508,7 +534,10 @@ class AdminCase {
         { budgetMs: CLEANUP_BUDGET_MS }
       )
     } catch (error) {
-      this.note('case-failed', { error: String(error?.stack ?? error).slice(0, 4000) })
+      this.note('case-failed', {
+        error: String(error?.stack ?? error).slice(0, 4000),
+        members: this.progress(),
+      })
       throw error
     } finally {
       this.ledgers.restore()
@@ -769,6 +798,7 @@ class AdminCase {
             identity: shareRecordIdentity({ ...message, topic: name, partition }),
             deliveryCount: message.deliveryCount,
           })
+          member.handled++
         },
       })
     )
@@ -856,15 +886,22 @@ class AdminCase {
   async reachesEnd(scope, group) {
     const topic = this.topics.share
     let position
-    await pollUntil(
+    let rows = null
+    await pollSharePosition(
       scope,
       STEP_MS,
       async () => {
-        const [row] = await this.listOffsets(scope, group, [{ topic, partitions: [0] }])
+        rows = await this.listOffsets(scope, group, [{ topic, partitions: [0] }])
+        const [row] = rows
         position = row.partitions[0]
         return position.startOffset === String(RECORDS) && position.lag === '0'
       },
-      { delayMs: 200, label: 'The settled share position' }
+      {
+        delayMs: 200,
+        label: 'The settled share position',
+        snapshot: () => ({ groupId: group, topic, rows }),
+        record: (fields) => this.note('broker-position', { ...fields, members: this.progress() }),
+      }
     )
     const [logEnd] = [
       ...(

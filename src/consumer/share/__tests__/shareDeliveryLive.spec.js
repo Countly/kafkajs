@@ -1,3 +1,8 @@
+const {
+  acknowledgementResults,
+  acknowledgementRequests,
+  pollSharePosition,
+} = require('../../../../testHelpers/shareLiveDiagnostics')
 const net = require('net')
 const { EventEmitter } = require('events')
 const {
@@ -362,8 +367,26 @@ class DeliveryCase {
       scenario: this.nonce,
       groups: { delivery: this.group },
       budgets: { caseMs: BUDGET_MS, cleanupMs: CLEANUP_MS },
+      wireVersions: wireVersionsOf(this.requests),
       ...fields,
     })
+  }
+
+  /** @returns {object} Handler progress and public outcomes before cleanup can change them. */
+  progress() {
+    return {
+      members: [...this.members.values()].map(
+        ({ label, memberId, delivered, handled, acks, crashes }) => ({
+          label,
+          memberId,
+          delivered,
+          handled,
+          acknowledgements: acknowledgementResults(acks),
+          crashes: crashes.map((error) => describeError(error)),
+        })
+      ),
+      acknowledgementRequests: acknowledgementRequests(this.tap.frames),
+    }
   }
 
   /**
@@ -385,7 +408,7 @@ class DeliveryCase {
       )
       await this.complete(scope)
     } catch (error) {
-      this.row('case-failed', { error: describeError(error) })
+      this.row('case-failed', { error: describeError(error), ...this.progress() })
       throw error
     }
   }
@@ -444,7 +467,16 @@ class DeliveryCase {
    */
   async startMember(scope, label) {
     const consumer = this.client(label).shareConsumer({ groupId: this.group, ...this.clientConfig })
-    const member = { label, consumer, memberId: null, assignment: [], acks: [], crashes: [] }
+    const member = {
+      label,
+      consumer,
+      memberId: null,
+      assignment: [],
+      acks: [],
+      crashes: [],
+      delivered: 0,
+      handled: 0,
+    }
     this.members.set(label, member)
     const { events } = consumer
     const removers = [
@@ -466,6 +498,7 @@ class DeliveryCase {
     await bounded(scope, 20000, () =>
       consumer.run({
         eachMessage: async ({ topic, partition, message }) => {
+          member.delivered++
           this.entries.push({
             member: label,
             identity: shareRecordIdentity({ ...message, topic, partition }),
@@ -477,6 +510,7 @@ class DeliveryCase {
           } finally {
             this.openHandlers--
           }
+          member.handled++
         },
       })
     )
@@ -672,24 +706,25 @@ class DeliveryCase {
   async awaitBrokerEnd(scope) {
     const partitions = [...this.log.keys()]
     let rows = []
-    await pollUntil(
+    const last = { named: null, all: null }
+    await pollSharePosition(
       scope,
       20000,
       async (poll) => {
-        const named = await bounded(poll, 10000, () =>
+        last.named = await bounded(poll, 10000, () =>
           this.admin.listShareGroupOffsets({
             groupId: this.group,
             topics: [{ topic: this.topic, partitions }],
             apiTimeout: 8000,
           })
         )
-        const all = await bounded(poll, 10000, () =>
+        last.all = await bounded(poll, 10000, () =>
           this.admin.listShareGroupOffsets({ groupId: this.group, apiTimeout: 8000 })
         )
         const pick = (listing) =>
           listing.find(({ topic }) => topic === this.topic)?.partitions ?? []
         rows = partitions.map((partition) => {
-          const forms = [pick(named), pick(all)].map((list) =>
+          const forms = [pick(last.named), pick(last.all)].map((list) =>
             list.find((p) => p.partition === partition)
           )
           const [first] = forms
@@ -708,7 +743,11 @@ class DeliveryCase {
           (r) => r.errorCode === 0 && r.startOffset === r.logEnd && r.lag === '0' && r.agree
         )
       },
-      { label: 'The broker share offsets' }
+      {
+        label: 'The broker share offsets',
+        snapshot: () => ({ groupId: this.group, topic: this.topic, rows, ...last }),
+        record: (fields) => this.row('broker-position', { ...fields, ...this.progress() }),
+      }
     )
     return rows.map(({ agree: _agree, ...row }) => row)
   }
