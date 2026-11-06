@@ -196,6 +196,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Fixes
 
+- `admin.describeReplicaLogDirs` tolerates repeated replica locations during a directory move instead of throwing `KafkaJSInvariantViolation`. As in Java, the last partition entry within each directory is projected; repeated current or future locations replace that location and its lag in response order. The result fields are unchanged.
+
 - SASL GSSAPI follows the native `kerberos` 7.0.0 contract. Its step answers `null` when it has no output token, which the adapter failed to encode; it now responds with no data, as RFC 4752 asks. Its wrap takes a boolean `protect` and the authorization identity as `user`, where the adapter passed a number and put the identity in the data.
 - A failed GSSAPI exchange names its step (`stage=exchange:1`, `exchange:2`, `exchange:final`) and, for a library or built-in programming error, its class, with a protocol error's `type` and `code`; the failure's text is still never published.
 - `admin.deleteGroups` names the group id it refuses (`Invalid groupId name: 1`); it printed `true`.
