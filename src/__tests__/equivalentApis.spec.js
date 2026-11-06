@@ -20,6 +20,7 @@ const fs = require('fs')
 const path = require('path')
 const vm = require('vm')
 const Broker = require('../broker')
+const Cluster = require('../cluster')
 const ConnectionPool = require('../network/connectionPool')
 const adminFactory = require('../admin')
 const apiKeys = require('../protocol/requests/apiKeys')
@@ -1222,14 +1223,20 @@ const MIGRATION_GUIDE = fs.readFileSync(
  * Starts a public share consumer over the scripted share cluster, subscribed, with every
  * acknowledgement event collected; the client closes after the test.
  * @param {object} [options] Case options.
+ * @param {number} [options.nodes=1] Number of broker nodes in the scripted cluster.
  * @param {object} [options.topics] Metadata the cluster serves, by topic name.
  * @param {string[]|null} [options.subscribe] Topic names to subscribe to, every served topic by default; null subscribes to none.
  * @param {object} [options.share] Overrides of the shareConsumer options.
  * @returns {Promise<{h: object, acks: object[]}>} The harness client and the collected payloads.
  * @throws {Error} When the subscription fails.
  */
-const startShare = async ({ topics = ORDERS, subscribe = Object.keys(topics), share } = {}) => {
-  const h = shareClient({ topics, ...(share && { share }) })
+const startShare = async ({
+  nodes = 1,
+  topics = ORDERS,
+  subscribe = Object.keys(topics),
+  share,
+} = {}) => {
+  const h = shareClient({ nodes, topics, ...(share && { share }) })
   use({ disconnect: () => h.close() }, {})
   const acks = []
   h.consumer.on(h.consumer.events.ACKNOWLEDGE, ({ payload }) => acks.push(payload))
@@ -1614,19 +1621,32 @@ it('R1§E:ackCallback', async () => {
   ])
   expect(coveredOffsets(mixed.acks)).toEqual(['0', '1', '2'])
 
-  const partial = await startShare()
+  const partial = await startShare({
+    nodes: 2,
+    topics: { orders: { topicId: A, partitions: [LEADER, LEADER] } },
+  })
   let now = 100
   const clock = jest.spyOn(performance, 'now').mockImplementation(() => now)
   const completions = jest.spyOn(ShareAckLedger.prototype, 'completeRange')
   const invalidations = jest.spyOn(ShareAckLedger.prototype, 'invalidate')
+  const settlements = jest.spyOn(ShareAckLedger.prototype, 'settle')
+  const routing = jest.spyOn(Cluster.prototype, 'onRoutingChange')
   try {
     partial.h.script('ShareFetch', [
-      fetchAnswer([acquire(0, 0, ['a', 'b', 'c'])], { acquisitionLockTimeoutMs: 1000 }),
+      fetchAnswer([acquire(0, 0, ['a', 'b', 'c']), part({ partition: 1 })], {
+        acquisitionLockTimeoutMs: 1000,
+      }),
     ])
     const unanswered = partial.h.hold({
       api: 'ShareAcknowledge',
       match: ({ fields }) => batchesOf({ fields }).some(({ firstOffset }) => firstOffset === '1'),
     })
+    const nextFetch = partial.h.hold({
+      api: 'ShareFetch',
+      node: 0,
+      match: ({ fields }) => fields.shareSessionEpoch > 0,
+    })
+    const replacement = partial.h.hold({ api: 'ShareFetch', node: 1 })
     const finish = handlerGate()
     const delivered = []
     await partial.h.consumer.run({
@@ -1649,11 +1669,16 @@ it('R1§E:ackCallback', async () => {
     await reach(() => completions.mock.calls.length === 3, 'all completed handler decisions')
     expect(delivered).toEqual(['0', '1', '2'])
     const sent = [...partial.h.frames(78, 79)]
-    await partial.h.consumer.disconnect({ timeout: 0 })
+    expect(routing.mock.contexts).toHaveLength(1)
+    const [cluster] = routing.mock.contexts
+    await expect(
+      cluster.applyLeaderHint({ topic: 'orders', partition: 0, leaderId: 1, leaderEpoch: 2 })
+    ).resolves.toBe(true)
+    expect(cluster.cachedLeader('orders', 0)).toBe(1)
     await reach(() => partial.acks.length === 2, 'the lost acquisition remainder')
     expect(outcomes(partial.acks)).toEqual([
       ['0', '0', 'accept', null],
-      ['1', '2', 'accept', 'membership-lost'],
+      ['1', '2', 'accept', 'session-lost'],
     ])
     expect(partial.acks[1].error).toBeInstanceOf(KafkaJSShareAcknowledgementError)
     expect(partial.acks[1].error.ranges).toEqual([{ firstOffset: '1', lastOffset: '2' }])
@@ -1663,18 +1688,46 @@ it('R1§E:ackCallback', async () => {
     const [ledger] = invalidations.mock.contexts
     for (const completed of completions.mock.contexts) expect(completed).toBe(ledger)
     expect(ledger.size).toBe(0)
+    const socket = partial.h.cluster.sockets().filter(({ endpoint }) => endpoint.host === 'node0')[
+      unanswered.call.generation - 1
+    ]
+    expect(socket.destroyed).toBe(false)
+    expect(settlements).toHaveBeenCalledTimes(1)
     const settled = [...partial.acks]
     unanswered.release(ackAnswer([{ partition: 0 }]))
+    await reach(() => settlements.mock.calls.length >= 2, 'the late reply reaching its ledger')
+    expect(settlements).toHaveBeenCalledTimes(2)
+    for (const settlement of settlements.mock.contexts) expect(settlement).toBe(ledger)
+    expect(settlements.mock.calls[1][0].acknowledgementBatches).toEqual([
+      { firstOffset: '1', lastOffset: '1', acknowledgeTypes: [1] },
+    ])
+    expect(settlements.mock.results[1]).toEqual({ type: 'return', value: [] })
+    expect(sent.at(-1).answeredOrder).toBeGreaterThan(sent.at(-1).order)
+    await reach(
+      () => nextFetch.call !== null && replacement.call !== null,
+      'the old-node forget and replacement-node opening fetches'
+    )
+    expect(nextFetch.call.generation).toBe(unanswered.call.generation)
+    expect(nextFetch.call.fields.forgottenTopicsData).toEqual([{ topicId: A, partitions: [0] }])
+    expect(replacement.call.fields.shareSessionEpoch).toBe(0)
     await flush()
-    expect(ledger.invalidate('membership-lost')).toEqual([])
+    expect(socket.destroyed).toBe(false)
+    expect(partial.acks).toEqual(settled)
+    expect(partial.h.frames(78)).toHaveLength(3)
+    expect(partial.h.frames(79)).toEqual(sent.filter(({ apiKey }) => apiKey === 79))
+    expect(partial.h.frames(78, 79).flatMap(batchesOf)).toEqual(sent.flatMap(batchesOf))
+    const afterReply = partial.h.frames(78, 79)
+    expect(ledger.invalidate('session-lost')).toEqual([])
     await partial.h.consumer.disconnect({ timeout: 0 })
     await flush()
     expect(partial.acks).toEqual(settled)
-    expect(partial.h.frames(78, 79)).toEqual(sent)
+    expect(partial.h.frames(78, 79)).toEqual(afterReply)
   } finally {
     try {
       await partial.h.close()
     } finally {
+      routing.mockRestore()
+      settlements.mockRestore()
       invalidations.mockRestore()
       completions.mockRestore()
       clock.mockRestore()
