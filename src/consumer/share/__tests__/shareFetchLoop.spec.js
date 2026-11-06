@@ -1545,7 +1545,13 @@ describe('share node socket integration', () => {
   })
 
   describe('unawaited renewal', () => {
-    /** One acquisition whose handler starts a renewal, decides the record and returns without awaiting it. */
+    /**
+     * One acquisition whose handler starts a renewal, decides the record and returns without
+     * awaiting it. Captures flush eligibility at renewal settlement, before the queued terminal
+     * preparation clears the ledger's unsent-decision marker.
+     * @param {object} answer The held renewal's response.
+     * @returns {Promise<object>} The run, captured renewal state, queued fetch and prepare spy.
+     */
     const renewing = async (answer) => {
       h = await harness()
       const [m] = h.members
@@ -1554,6 +1560,12 @@ describe('share node socket integration', () => {
       const gate = h.hold({ api: 'ShareAcknowledge' })
       const prepare = jest.spyOn(ShareAckLedger.prototype, 'prepare')
       const captured = {}
+      const onResults = m.loop.onResults
+      m.loop.onResults = (results, row) => {
+        if (results.some(({ type }) => type === 'renew'))
+          captured.needsFlush = row.ledger.needsFlush(9000)
+        onResults(results, row)
+      }
       m.dispatch = async (rows) => {
         captured.row = rows[0]
         captured.renewal = settled(
@@ -1578,7 +1590,7 @@ describe('share node socket integration', () => {
       )
       expect((await captured.renewal).value).toMatchObject({ lockDuration: 20000 })
       expect(m.results.filter((outcome) => outcome.type === 'accept')).toEqual([])
-      expect(captured.row.ledger.needsFlush(9000)).toBe(false)
+      expect(captured.needsFlush).toBe(false)
       expect(captured.row.walk.deliver.deliveryCounts[0]).toBe(1)
       await next
       expect(prepare).toHaveBeenCalledTimes(2)
@@ -1594,7 +1606,7 @@ describe('share node socket integration', () => {
       expect(failure).toBeInstanceOf(KafkaJSShareAcknowledgementError)
       expect(failure.reason).toBe('rejected-by-broker')
       expect(failure.cause).toMatchObject({ code: 121 })
-      expect(captured.row.ledger.needsFlush(9000)).toBe(true)
+      expect(captured.needsFlush).toBe(true)
       await next
       expect(
         m.results.filter((outcome) => outcome.type === 'accept' && !outcome.error)
@@ -2090,14 +2102,18 @@ describe('share node socket integration', () => {
     test('removes a pending backoff timer when the node is disposed', async () => {
       jest.useFakeTimers({ doNotFake: ['setImmediate', 'queueMicrotask', 'nextTick', 'hrtime'] })
       try {
-        h = await harness()
+        h = await harness({ loop: { retry: NO_DELAY } })
         const [m] = h.members
         m.want = [A0]
         m.operation.sleep.mockRestore()
+        const sleep = jest.spyOn(m.operation, 'sleep')
         h.script('ShareFetch', [topError(-1)])
         const round = settled(m.loop.poll())
-        await until(() => m.operation.disposers.size === 1, 'the backoff timer to be registered')
+        await until(() => sleep.mock.calls.length === 1, 'the backoff sleep to start')
+        expect(sleep).toHaveBeenCalledWith(50)
+        expect(m.operation.disposers.size).toBe(1)
         const sleeping = jest.getTimerCount()
+        expect(sleeping).toBeGreaterThanOrEqual(1)
         m.loop.dispose(new Error('node closed'))
         expect((await round).error.message).toBe('node closed')
         expect(jest.getTimerCount()).toBe(sleeping - 1)
