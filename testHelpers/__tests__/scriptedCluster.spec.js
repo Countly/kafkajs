@@ -472,7 +472,7 @@ describe('ScriptedCluster', () => {
       expect(cluster.sockets().every((socket) => socket.destroyed)).toBe(true)
     })
 
-    test.each(Object.keys(PROFILES).filter((profile) => profile !== 'share'))(
+    test.each(Object.keys(PROFILES))(
       'every pair the %s profile advertises has a wire pair, so no request of it is refused for want of one',
       (profile) => {
         for (const [api, version] of PROFILES[profile]) {
@@ -2052,26 +2052,13 @@ describe('share profile', () => {
     cluster.assertClean()
   })
 
-  test('requires a concrete builder before accepting an advertised admin request', () => {
-    const { existsSync } = require('fs')
-    const path = require('path')
+  test('requires all seven concrete share builders without a missing-pair escape', () => {
     const cluster = createScriptedCluster({ nodes: NODES, profile: 'share' })
+    const shareApis = PROFILES.share.filter(([api]) => api.includes('Share'))
 
-    for (const [api, version] of [
-      ['ShareGroupDescribe', 1],
-      ['DescribeShareGroupOffsets', 1],
-      ['AlterShareGroupOffsets', 0],
-      ['DeleteShareGroupOffsets', 0],
-    ]) {
-      const file = `${api[0].toLowerCase()}${api.slice(1)}V${version}.js`
-
-      if (existsSync(path.join(__dirname, '..', 'wire', file))) {
-        expect(cluster.pairFor(api, version).api).toBe(api)
-      } else {
-        expect(() => cluster.pairFor(api, version)).toThrow(
-          `no response builder for ${api} v${version}`
-        )
-      }
+    expect(shareApis).toHaveLength(7)
+    for (const [api, version] of shareApis) {
+      expect(cluster.pairFor(api, version)).toMatchObject({ api, version })
     }
     cluster.assertClean()
   })

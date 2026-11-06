@@ -999,6 +999,8 @@ retry.maxTotalTime adds a public-entry deadline only to consumer commitOffsets, 
 
 ### Admin
 
+Share administration is additive. Each new method accepts `apiTimeout` under the existing admin deadline. Per-item errors remain data; offset-method group errors throw. Use `deleteGroups` for an empty share group and `describeShareGroups` for share membership.
+
 - **Admin lifecycle.** Admin operations after disconnect reject without dialing until an explicit connect opens a new lifecycle. Call `await admin.connect()` to resume; legacy implicit reconnection after close is no longer supported. Concurrent closes share cleanup and cannot affect the replacement lifecycle. `disconnect({ timeout })` accepts an integer from 0 through 2147483647 milliseconds; omitted timeout drains naturally, zero forces close immediately, and invalid object options reject before mutation. Non-object signal-handler arguments remain ignored. A forced close cannot undo a mutation already transmitted; inspect broker state before repeating it.
 
 - **Token-admin diagnostics.** Token-admin response data and failure payloads are filtered before logging, including when buffer diagnostics are enabled. Use the stable error class, type/code and broker fields for diagnosis. The authorized caller still receives the token HMAC as a Buffer; do not depend on raw diagnostic payloads.

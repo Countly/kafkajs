@@ -36,6 +36,7 @@ const {
 const { staleMetadata, staleLeaderEpoch, createErrorFromCode } = require('../protocol/error')
 const { GROUP_TYPES } = require('../protocol/groupTypes')
 const { createGroupDescriptions } = require('./groupDescriptions')
+const { createShareGroups } = require('./shareGroups')
 const { AggregateOutcome, isPerItemFailure } = require('./aggregateOutcome')
 const {
   readTopicPages,
@@ -433,6 +434,7 @@ module.exports = ({
   apiTimeout = validateApiTimeout(apiTimeout)
   const logger = rootLogger.namespace('Admin')
   const instrumentationEmitter = rootInstrumentationEmitter || new InstrumentationEventEmitter()
+  const shareGroups = createShareGroups({ cluster, retry })
 
   const lifecycle = new AdminLifecycle({
     cluster,
@@ -2795,6 +2797,10 @@ module.exports = ({
       logger: getLogger,
       listGroups,
       describeGroups,
+      describeShareGroups: shareGroups.describeShareGroups.bind(shareGroups),
+      listShareGroupOffsets: shareGroups.listShareGroupOffsets.bind(shareGroups),
+      alterShareGroupOffsets: shareGroups.alterShareGroupOffsets.bind(shareGroups),
+      deleteShareGroupOffsets: shareGroups.deleteShareGroupOffsets.bind(shareGroups),
       deleteGroups,
       removeMembersFromConsumerGroup,
       describeAcls,
@@ -2853,6 +2859,10 @@ module.exports = ({
       fetchTopicOffsets: 1,
       fetchTopicOffsetsByTimestamp: 2,
       describeGroups: 1,
+      describeShareGroups: 1,
+      listShareGroupOffsets: 0,
+      alterShareGroupOffsets: 0,
+      deleteShareGroupOffsets: 0,
       deleteGroups: 1,
     },
     apiTimeout,

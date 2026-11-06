@@ -272,6 +272,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - Route `ShareFetch` and `ShareAcknowledge` over a connection pool's data socket, each API counted by its own socket's generation, and add the seven share-group `Broker` methods. Add `KafkaJSShareGroupsNotSupportedError`, a `KafkaJSServerDoesNotSupportApiKey` subclass whose `reason` (`api-not-advertised`, `api-version-range`, `feature-disabled` or `refused-by-broker`) and `shareVersion` say why a cluster cannot run share groups. A capability check judges a broker by its advertised ranges and its finalized `share.version` (level 1 or above, including level 2 on Kafka 4.4). No public share API uses them yet.
 
+- Add `admin.describeShareGroups`, `listShareGroupOffsets`, `alterShareGroupOffsets` and `deleteShareGroupOffsets` for Kafka 4.2+ share groups, each taking the admin `apiTimeout`. Every call goes to the group coordinator. `describeShareGroups` sends one request per coordinator, relocates a moved group once and returns one row per requested id in caller order, with the raw signed `authorizedOperations` mask. The offset methods return exact decimal-string offsets and lag (unknown lag is `null`), check every offset to alter before any request, and keep a partition's or topic's error as data while a group-level error throws. A coordinator that cannot run the API rejects with `KafkaJSShareGroupsNotSupportedError`. Share-group deletion stays `admin.deleteGroups`; no `deleteShareGroups` is added, and against Kafka 4.4 `deleteGroups` negotiates DeleteGroups v3, so each result carries the broker's `errorMessage`.
+
 #### Fixes
 
 - Unimplemented request slots throw `KafkaJSNotImplemented` with a diagnostic message instead of a `TypeError`.
@@ -283,6 +285,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - The Java message-vector generator writes 46 share-group vectors (24 requests, 22 responses), including Records bytes, unknown tagged fields at every nesting and Java's own acknowledgement batching; they need `KAFKA_CLIENTS_VERSION=4.4.0`.
 - Add share-group fixtures, finalized feature captures and configuration-readback checks.
 - Add independent wire pairs for ShareGroupHeartbeat v1, ShareFetch v2 and ShareAcknowledge v2, a `share` scripted-cluster profile and literal-row `shareScript`, checked against the Java message vectors.
+- Add independent wire pairs for ShareGroupDescribe v1, DescribeShareGroupOffsets v1, AlterShareGroupOffsets v0 and DeleteShareGroupOffsets v0, checked against the Java message vectors, so every pair the `share` scripted-cluster profile advertises has one. Share administration is covered over real Brokers on that profile, including the complete frame and connection slot of all seven share requests.
 
 ### Phase 9B — Producer parity: delivery deadline, memory bound, request size, partitioner, codecs, lifecycle
 
