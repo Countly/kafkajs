@@ -4,6 +4,7 @@ const { readRequestHeader } = require('../../../../testHelpers/fakeSocket')
 const {
   acknowledgementResults,
   acknowledgementRequests,
+  pollSharePosition,
   awaitTerminalSharePosition,
   assertQuietTerminalGroup,
 } = require('../../../../testHelpers/shareLiveDiagnostics')
@@ -271,6 +272,9 @@ client.on(events.ASSIGNMENT_CHANGED, ({ payload }) =>
     memberEpoch: payload.memberEpoch,
     assignment: payload.assignment,
   })
+)
+client.on(events.HEARTBEAT, ({ payload }) =>
+  report({ event: 'heartbeat', ...payload, assignment: client.assignment(), subscription: client.subscription() })
 )
 client.on(events.ACKNOWLEDGE, ({ payload }) =>
   report({
@@ -981,6 +985,7 @@ class MembershipCase {
       })),
       wireAcknowledgements: this.sockets.acknowledgements.snapshot(),
       childWireAcknowledgements: this.members.C?.wireAcknowledgements ?? [],
+      membershipObservation: this.membershipObservation,
     }
   }
 
@@ -1354,15 +1359,44 @@ class MembershipCase {
    */
   async converge(scope, labels, stage) {
     let seen
-    await pollUntil(
+    const last = {
+      stage,
+      expectedClients: Object.fromEntries(labels.map((label) => [label, this.clientIds[label]])),
+      description: null,
+      members: {},
+      error: null,
+    }
+    this.membershipObservation = last
+    await pollSharePosition(
       scope,
       STAGE_MS,
       async () => {
         this.assertHealthy()
         let members
+        last.error = null
+        last.members = Object.fromEntries(
+          labels.map((label) => {
+            const member = this.members[label]
+            return [
+              label,
+              {
+                join:
+                  member instanceof ChildMember
+                    ? member.of('group_join').at(-1)
+                    : member.joins.at(-1),
+                event: member.assignments.at(-1),
+                publicAssignment: member.client?.assignment(),
+                heartbeat:
+                  member instanceof ChildMember ? member.of('heartbeat').at(-1) : undefined,
+              },
+            ]
+          })
+        )
         try {
-          members = (await this.admin.describeShareGroups([this.group])).groups[0].members
+          last.description = await this.admin.describeShareGroups([this.group])
+          members = last.description.groups[0].members
         } catch (error) {
+          last.error = describeError(error)
           if (moving(error)) return false
           throw error
         }
@@ -1392,7 +1426,12 @@ class MembershipCase {
         seen = result
         return owned.size === PARTITIONS
       },
-      { delayMs: 250, label: `Admin and events agreeing on ${labels.join('+')}` }
+      {
+        delayMs: 250,
+        label: `Admin and events agreeing on ${labels.join('+')}`,
+        snapshot: () => last,
+        record: (fields) => this.row('membership-observation', fields),
+      }
     )
     this.row('assignment', { stage, members: seen })
     return seen
