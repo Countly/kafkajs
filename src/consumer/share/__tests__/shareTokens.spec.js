@@ -549,7 +549,7 @@ describe('public share token contract', () => {
     held.release()
     await until(() => h.seen.acks.length === 1, 'the confirmed settlement')
     expect(outcomes()).toEqual([['accept', '0', '0', null]])
-    await advance(50)
+    // The reconnect tick already covered pacing; another tick can send a fourth fetch.
     await until(() => h.frames(78).length === 3, 'the next fetch')
     expect(h.frames(78).map(({ fields }) => fields.shareSessionEpoch)).toEqual([0, 1, 2])
     expect(new Set(h.frames(78).map(({ generation }) => generation)).size).toBe(1)
