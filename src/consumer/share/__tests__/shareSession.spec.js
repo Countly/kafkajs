@@ -695,6 +695,69 @@ describe('share session socket integration', () => {
     expect(m.session.binding.pool).toBe(replacement)
   })
 
+  test('a same-generation pool replacement discards its held answer and reopens after backoff', async () => {
+    h = await harness({
+      loop: { retry: { initialRetryTime: 0, factor: 0, multiplier: 1, maxRetryTime: 0 } },
+    })
+    const [m] = h.members
+    m.want = [{ topicId: A, partition: 0 }]
+    h.script('ShareFetch', [fetchAnswer([acquire(0, 10, ['old'])])])
+    await m.loop.poll()
+    const open = m.session.token
+    const binding = m.session.binding
+    const gate = h.hold({ api: 'ShareFetch' })
+    const answer = settled(m.loop.poll())
+    await gate.arrived()
+    const replacement = h.newPool(m.node)
+    await replacement.pool[1].connect()
+    expect(replacement.generationFor(78)).toBe(binding.generation)
+    m.broker.connectionPool = replacement
+    expect(m.broker.connectionPool.generationFor(78)).toBe(binding.generation)
+    expect(binding.connection.isConnected()).toBe(true)
+    gate.release(fetchAnswer([acquire(0, 20, ['stale'])]))
+    expect(await answer).toMatchObject({ value: { reset: true, backoff: true, reply: [] } })
+    expect(m.sleeps).toEqual([50])
+    expect(m.operation.guard()).toBeNull()
+    expect(m.session.closed).toBe(false)
+    expect(m.session.token).not.toBe(open)
+    expect(m.session.epoch).toBe(0)
+    expect([...m.session.model]).toEqual([])
+    expect(m.handled.map(({ value }) => value)).toEqual(['old'])
+    expect(m.results).toEqual([
+      expect.objectContaining({
+        firstOffset: '10',
+        lastOffset: '10',
+        type: 'accept',
+        error: expect.objectContaining({ reason: 'session-lost' }),
+      }),
+    ])
+    expect(m.resets.map(({ reason }) => reason)).toEqual(['connection'])
+    expect(m.fatals).toEqual([])
+
+    h.script('ShareFetch', [fetchAnswer([acquire(0, 10, ['fresh'])])])
+    await m.loop.poll()
+    expect(m.session.binding.pool).toBe(replacement)
+    expect(frames(h.cluster, 78).at(-1).fields).toMatchObject({
+      shareSessionEpoch: 0,
+      topics: [{ topicId: A, partitions: [{ partitionIndex: 0, acknowledgementBatches: [] }] }],
+    })
+    await m.loop.poll()
+    expect(m.handled.map(({ value }) => value)).toEqual(['old', 'fresh'])
+    expect(m.results.filter((result) => !result.error)).toEqual([
+      expect.objectContaining({ firstOffset: '10', lastOffset: '10', type: 'accept' }),
+    ])
+    expect(m.results.filter((result) => result.error)).toHaveLength(1)
+    expect(m.resets).toHaveLength(1)
+    expect(m.loop.exchanges.size).toBe(0)
+
+    const unrelated = new Error('Share session connection was lost')
+    jest.spyOn(m.session, 'apply').mockImplementationOnce(() => {
+      throw unrelated
+    })
+    await expect(m.loop.poll()).rejects.toBe(unrelated)
+    expect(m.resets).toHaveLength(1)
+  })
+
   describe('delayed old callbacks', () => {
     const hint = (leaderId, leaderEpoch) => ({ leaderId, leaderEpoch })
 

@@ -33,6 +33,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Fixes
 
+- A share answer that arrives from a replaced connection pool is discarded and the session reopens on the next round, instead of ending the run and losing unrelated acquisitions.
 - A failed share heartbeat preserves the healthy data socket and its acquisitions while the coordinator reconnects.
 
 - Prepared share renewals retain their own compact acknowledgement error when a routing change or shutdown retires their wait; callers retired before preparing a ticket receive a local refusal.

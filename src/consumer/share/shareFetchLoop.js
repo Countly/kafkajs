@@ -9,7 +9,7 @@ const {
 } = require('../../errors')
 const { ShareAckLedger, validateAcknowledgements } = require('./shareAckLedger')
 const { ShareRecordWalk } = require('./shareRecordWalk')
-const { ShareSession } = require('./shareSession')
+const { ShareSession, ShareSessionStaleError } = require('./shareSession')
 const shareCapability = require('./shareCapability')
 const {
   sessionAction,
@@ -326,11 +326,10 @@ class ShareFetchLoop {
    * @param {(reply: Cohort[]) => Promise<void>} handlers Resolves after every delivered or dropped record.
    * @returns {Promise<object>} The exchange result, after the handlers, the answer's metadata
    *   effects and the owned pacing delay. A reset or final answer skips the handlers. When a data
-   *   session reset or its socket was lost during handlers or awaited metadata, the old open's
-   *   effects are discarded and the round still ends with its pacing delay, so the next round reopens.
+   *   session reset or its socket was lost before or during handlers or awaited metadata, the old
+   *   open's effects are discarded and the round still ends with its pacing delay, so the next round reopens.
    * @throws {Error} The original request, handler or operation failure; a node whose operation was
-   *   retired, a closed or retired session, or an open that ended before the handlers started
-   *   rejects with its "no longer current" refusal.
+   *   retired, or a closed or retired session, rejects with its original refusal.
    */
   round(fetch, handlers) {
     if (this.running) return this.running
@@ -339,16 +338,17 @@ class ShareFetchLoop {
       const result = await this.session.enqueue(fetch)
       if (!result.reset && !result.closed) {
         const refused = this.session.refusal(token)
-        if (refused) throw refused
-        await handlers(result.reply)
-        const afterHandlers = this.session.refusal(token)
-        if (!afterHandlers) {
-          try {
-            await this.runEffects(result, token)
-          } catch (error) {
-            if (!this.reopenable(token)) throw error
-          }
-        } else if (!this.reopenable(token)) throw afterHandlers
+        if (!refused) {
+          await handlers(result.reply)
+          const afterHandlers = this.session.refusal(token)
+          if (!afterHandlers) {
+            try {
+              await this.runEffects(result, token)
+            } catch (error) {
+              if (!(error instanceof ShareSessionStaleError) || !this.reopenable(token)) throw error
+            }
+          } else if (!this.reopenable(token)) throw afterHandlers
+        } else if (!this.reopenable(token)) throw refused
       }
       await this.pace(result)
       return result
@@ -458,8 +458,9 @@ class ShareFetchLoop {
    * @param {symbol} open The open identity captured when the request was queued.
    * @returns {Promise<object>} `{reply, sentAt, answeredAt, empty, backoff, minDelay, reset, closed,
    *   results, lockDuration, effects, error}`. A transport failure or a reset answer resolves with
-   *   `reset` and a backoff; a stale, retired or terminal one rejects.
-   * @throws {Error} The refusal of a retired or stale session, or a terminal failure.
+   *   `reset` and a backoff; a retired open or binding discards its answer and follows that same
+   *   recovery path without resetting a newer open.
+   * @throws {Error} The refusal of a retired node or closed session, or a terminal failure.
    */
   async exchange(options, open) {
     const { apiKey, kind } = options
@@ -467,12 +468,7 @@ class ShareFetchLoop {
     if (kind === 'fetch' && this.finishing)
       throw new KafkaJSNonRetriableError('Share node is closing')
     const refused = session.refusal(open)
-    if (refused) {
-      if (!session.connectionLost(open)) throw refused
-      if (kind === 'final')
-        return this.resultOf(undefined, this.now(), { closed: true, error: refused })
-      return this.loseConnection(undefined, refused)
-    }
+    if (refused) return this.failExchange(this.newExchange(options, open), refused)
     if (apiKey === apiKeys.ShareAcknowledge && session.epoch === 0) {
       if (kind === 'final') return this.idleResult()
       throw new KafkaJSNonRetriableError('Share acknowledgements require an established session')
@@ -496,7 +492,12 @@ class ShareFetchLoop {
     } catch (error) {
       return this.failExchange(exchange, error)
     }
-    return this.complete(exchange, response)
+    try {
+      return this.complete(exchange, response)
+    } catch (error) {
+      if (!(error instanceof ShareSessionStaleError)) throw error
+      return this.failExchange(exchange, error)
+    }
   }
 
   /**
@@ -598,10 +599,10 @@ class ShareFetchLoop {
   /**
    * @private
    * @param {object} pool The pool the request started on.
-   * @returns {Error} A refusal for a broker whose pool was replaced while connecting.
+   * @returns {ShareSessionStaleError} A refusal for a pool replaced while connecting.
    */
   replaced(pool) {
-    return new KafkaJSNonRetriableError(`Broker pool of ${pool.brokerAddress} was replaced`)
+    return new ShareSessionStaleError(`Broker pool of ${pool.brokerAddress} was replaced`)
   }
 
   /**
@@ -774,26 +775,26 @@ class ShareFetchLoop {
   }
 
   /**
-   * Classifies a request that threw. A retired or stale session discards it without a reset. A
-   * request the guard saw written, or whose bound socket was lost, is an unknown outcome: the
+   * Classifies a request that threw. A typed open or binding refusal is recoverable while the
+   * node and session remain usable: reset only the originating open, never its replacement.
+   * A request the guard saw written, or whose bound socket was lost, is an unknown outcome: the
    * session resets and its acquisitions settle session-lost, never accepted or resent. A request
-   * that never reached the wire settles its tickets not sent.
+   * that never reached the wire settles its tickets not sent. Finals never reopen.
    * @private
    * @param {Exchange} exchange The request.
-   * @param {Error} error What the build or the transport threw.
-   * @returns {object} A paced reset result for a transport loss or a retriable pre-write failure.
-   * @throws {Error} For retirement, a stale session or any non-retriable failure.
+   * @param {Error} error What building, transport or answer authorization threw.
+   * @returns {object} A paced result for a retired open, transport loss or retriable pre-write failure.
+   * @throws {Error} For node retirement, a closed session or any other non-retriable failure.
    */
   failExchange(exchange, error) {
     this.exchanges.delete(exchange)
     const { session } = this
-    if (
-      exchange.stale ||
-      session.operation.guard() ||
-      session.closed ||
-      session.token !== exchange.open
-    )
-      throw error
+    if (session.operation.guard() || session.closed) throw error
+    if (exchange.kind !== 'final' && error instanceof ShareSessionStaleError) {
+      if (session.token === exchange.open) return this.loseConnection(exchange, error)
+      return this.resultOf(exchange, this.now(), { reset: true, backoff: true, error })
+    }
+    if (exchange.stale || session.token !== exchange.open) throw error
     const written = exchange.sentAt !== undefined
     if (exchange.kind === 'final') {
       this.settleAll(exchange.prepared, written ? 'session-lost' : 'not-sent', error)
@@ -836,7 +837,10 @@ class ShareFetchLoop {
   complete(exchange, response) {
     const answeredAt = this.now()
     if (!this.exchanges.delete(exchange) || exchange.stale)
-      throw new KafkaJSNonRetriableError('Share exchange is no longer current')
+      throw (
+        this.session.refusal(exchange.open) ||
+        new KafkaJSNonRetriableError('Share exchange is no longer current')
+      )
     const policy = this.session.apply(exchange.descriptor, response)
     const result = this.resultOf(exchange, answeredAt)
     if (policy.action === 'reset') {
