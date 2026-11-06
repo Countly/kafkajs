@@ -85,13 +85,20 @@ describe('share connection routing', () => {
     try {
       await old.getConnection(0)
       await old.getConnection(1)
+      const baseline = old.generation
       ;({ pool } = fixture())
-      pool.continueGenerationFrom(old.generation)
+      pool.continueGenerationFrom(baseline)
       pool.continueGenerationFrom(0)
       await pool.getConnection(0)
       await pool.getConnection(1)
-      expect(pool.generationFor(76)).toBeGreaterThan(old.generationFor(76))
-      expect(pool.generationFor(78)).toBeGreaterThan(old.generationFor(78))
+      for (const [apiKey, slot] of [
+        [76, 0],
+        [78, 1],
+      ]) {
+        const established = pool.generationFor(apiKey)
+        expect(established).toBeGreaterThan(baseline)
+        expect(established).toBe(baseline + pool.pool[slot].generation)
+      }
     } finally {
       await old.destroy({ drainTimeout: 0 })
     }

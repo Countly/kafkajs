@@ -51,6 +51,23 @@ const input = (overrides = {}) => ({
 })
 
 /**
+ * Loads `shareCapability` in a fresh module registry whose `selectVersion` is a spy that runs the
+ * real selector unless told otherwise, so the registry's real errors stay the ones it recognizes.
+ * @param {(real: Function) => Function} [behavior] Builds the selector's behavior from the real one.
+ * @returns {{ capability: Function, selectVersion: jest.Mock }} The isolated function and its spy.
+ */
+const loadWithSelectorSpy = (behavior = (real) => real) => {
+  let loaded
+  jest.isolateModules(() => {
+    const actual = jest.requireActual('../../../protocol/requests')
+    const selectVersion = jest.fn(behavior(actual.selectVersion))
+    jest.doMock('../../../protocol/requests', () => ({ ...actual, selectVersion }))
+    loaded = { capability: require('../shareCapability'), selectVersion }
+  })
+  return loaded
+}
+
+/**
  * What a consumer must be told about a broker, derived from its capture alone: the numeric ranges
  * the broker advertised and the finalized level it reported, never from the committed tables or
  * from the code under test.
@@ -210,6 +227,43 @@ describe('share capability', () => {
       apiKey: 78,
       brokerRange: [3, 4],
       clientRange: [2, 2],
+    })
+  })
+
+  describe('through an isolated selector spy', () => {
+    afterEach(() => jest.dontMock('../../../protocol/requests'))
+
+    test('asks the inherited selector once per required key with the supplied versions and definition', () => {
+      const { capability, selectVersion } = loadWithSelectorSpy()
+      const value = input()
+
+      expect(capability(value)).toEqual({ ok: true })
+
+      expect(selectVersion).toHaveBeenCalledTimes(3)
+      selectVersion.mock.calls.forEach((call, index) => {
+        const [versions, apiKey, definition] = call
+        expect(call).toHaveLength(3)
+        expect(versions).toBe(value.versions)
+        expect(apiKey).toBe(value.required[index])
+        expect(definition).toBe(value.implemented[apiKey])
+      })
+    })
+
+    test('lets an unexpected selector error propagate instead of refusing', () => {
+      const failure = new TypeError('selector failed')
+      const { capability, selectVersion } = loadWithSelectorSpy(() => () => {
+        throw failure
+      })
+      let thrown
+
+      try {
+        capability(input())
+      } catch (error) {
+        thrown = error
+      }
+
+      expect(thrown).toBe(failure)
+      expect(selectVersion).toHaveBeenCalledTimes(1)
     })
   })
 

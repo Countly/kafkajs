@@ -13,6 +13,22 @@ const APIS = [
   ['shareAcknowledge', 'ShareAcknowledge', 79, 2],
 ]
 
+/** Broker method, API name, API key and the one released version, for all seven share APIs. */
+const ALL = [
+  ['shareGroupHeartbeat', 'ShareGroupHeartbeat', 76, 1],
+  ['shareGroupDescribe', 'ShareGroupDescribe', 77, 1],
+  ['shareFetch', 'ShareFetch', 78, 2],
+  ['shareAcknowledge', 'ShareAcknowledge', 79, 2],
+  ['describeShareGroupOffsets', 'DescribeShareGroupOffsets', 90, 1],
+  ['alterShareGroupOffsets', 'AlterShareGroupOffsets', 91, 0],
+  ['deleteShareGroupOffsets', 'DeleteShareGroupOffsets', 92, 0],
+]
+
+/** The Broker's private common sender, which every share method calls. */
+const SEND_REQUEST = Object.getOwnPropertySymbols(Broker.prototype).find((symbol) =>
+  String(symbol).includes('sendRequest')
+)
+
 /**
  * @param {object} [options] Pool overrides.
  * @returns {Promise<object>} A connected Broker and its Pool on in-process sockets, with the
@@ -155,37 +171,80 @@ describe('share broker requests', () => {
     }
   )
 
-  test.each(APIS)(
-    '%s refuses an invalid guard before lookup and encoding',
-    async (method, api, key, version) => {
+  test.each(ALL)('%s refuses an invalid guard before lookup and encoding', async (method) => {
+    f = await fixture()
+    const refusal = new Error('expired operation')
+    const before = f.cluster.requests().length
+    const lookup = jest.spyOn(f.broker, 'lookupRequest')
+    await expect(f.broker[method]({}, { guard: () => refusal })).rejects.toBe(refusal)
+    expect(lookup).not.toHaveBeenCalled()
+    expect(f.cluster.requests()).toHaveLength(before)
+  })
+
+  test.each(ALL)(
+    '%s returns an expired guard refusal before it reads its request',
+    async (method) => {
       f = await fixture()
       const refusal = new Error('expired operation')
-      const before = f.cluster.requests().length
-      const lookup = jest.spyOn(f.broker, 'lookupRequest')
-      await expect(
-        f.broker[method](literal[method + 'V' + version].request, { guard: () => refusal })
-      ).rejects.toBe(refusal)
-      expect(lookup).not.toHaveBeenCalled()
-      expect(f.cluster.requests()).toHaveLength(before)
+      const reads = jest.fn()
+      const observed = {}
+      for (const name of ['checkCrcs', 'groupId']) {
+        Object.defineProperty(observed, name, { enumerable: true, get: reads })
+      }
+      for (const request of [null, observed]) {
+        await expect(f.broker[method](request, { guard: () => refusal })).rejects.toBe(refusal)
+      }
+      expect(reads).not.toHaveBeenCalled()
+    }
+  )
+
+  test.each(APIS)(
+    '%s writes its frame when the guard allows the operation',
+    async (method, api, key, version) => {
+      f = await fixture()
       await f.broker[method](literal[method + 'V' + version].request, { guard: () => null })
-      expect(f.cluster.requests().some((record) => record.api === api)).toBe(true)
+      expect(f.cluster.requests().filter((record) => record.api === api)).toHaveLength(1)
+    }
+  )
+
+  test.each(ALL)(
+    '%s forwards its guard unchanged to the common sender and returns the sender answer',
+    async (method, api, key, version) => {
+      f = await fixture()
+      const guard = () => null
+      const answer = { errorCode: 0 }
+      const send = jest.fn().mockResolvedValue(answer)
+      f.broker[SEND_REQUEST] = send
+      await expect(f.broker[method]({}, { guard })).resolves.toBe(answer)
+      expect(send).toHaveBeenCalledTimes(1)
+      const [protocolRequest, forwarded] = send.mock.calls[0]
+      expect(forwarded).toBe(guard)
+      expect(protocolRequest.request).toMatchObject({ apiKey: key, apiVersion: version })
+      expect(f.cluster.requests().filter((record) => record.api === api)).toHaveLength(0)
     }
   )
 
   test('refuses a guard invalidated during a data socket reconnect', async () => {
     f = await fixture()
+    const shareFetches = () => f.cluster.requests().filter(({ apiKey }) => apiKey === 78).length
+    await f.broker.shareFetch(literal.shareFetchV2.request)
+    const connection = f.pool.pool[1]
+    await connection.disconnect({ drainTimeout: 0 })
+    expect(connection.isConnected()).toBe(false)
+    expect(shareFetches()).toBe(1)
+
     const refusal = new Error('closed during connect')
     let current = true
-    const connection = f.pool.pool[1]
     const connect = connection.connect.bind(connection)
-    jest.spyOn(connection, 'connect').mockImplementation(async (...args) => {
+    const reconnect = jest.spyOn(connection, 'connect').mockImplementation(async (...args) => {
       await connect(...args)
       current = false
     })
     await expect(
       f.broker.shareFetch(literal.shareFetchV2.request, { guard: () => (current ? null : refusal) })
     ).rejects.toBe(refusal)
-    expect(f.cluster.requests().filter(({ apiKey }) => apiKey === 78)).toHaveLength(0)
+    expect(reconnect).toHaveBeenCalledTimes(1)
+    expect(shareFetches()).toBe(1)
   })
 
   test('refuses a guard invalidated while encoding', async () => {
@@ -261,7 +320,40 @@ describe('share broker requests', () => {
       errorCode: 6,
       acknowledgeErrorCode: 121,
     })
+    expect(result.responses[0].partitions[0].currentLeader).toEqual({
+      leaderId: 2,
+      leaderEpoch: 2147483647,
+    })
+    expect(result.responses[0].partitions[1].currentLeader).toEqual({
+      leaderId: 3,
+      leaderEpoch: 12,
+    })
     expect(result.nodeEndpoints).toEqual(literal.shareFetchV2.response.nodeEndpoints)
+  })
+
+  test('decodes with checksums checked and no size ceiling when the call names no decode options', async () => {
+    f = await fixture()
+    const decode = jest.spyOn(requests.ShareFetch.protocol({ version: 2 })().response, 'decode')
+    await f.broker.shareFetch(literal.shareFetchV2.request)
+    expect(decode).toHaveBeenCalledTimes(1)
+    const [bytes, options] = decode.mock.calls[0]
+    expect(bytes).toBeInstanceOf(Buffer)
+    expect(options.checkCrcs).toBe(true)
+    expect(options.maxDecompressedBatchBytes).toBeUndefined()
+  })
+
+  test('keeps the decode options of one call out of the next call', async () => {
+    f = await fixture()
+    const decode = jest.spyOn(requests.ShareFetch.protocol({ version: 2 })().response, 'decode')
+    const request = literal.shareFetchV2.request
+    await f.broker.shareFetch({ ...request, checkCrcs: false, maxDecompressedBatchBytes: 5120 })
+    await f.broker.shareFetch(request)
+    await f.broker.shareFetch({ ...request, checkCrcs: false })
+    expect(decode.mock.calls.map(([, options]) => options)).toEqual([
+      { checkCrcs: false, maxDecompressedBatchBytes: 5120 },
+      { checkCrcs: true },
+      { checkCrcs: false },
+    ])
   })
 
   test('refuses preview ShareFetch before a share frame is written', async () => {

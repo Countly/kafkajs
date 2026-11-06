@@ -1221,8 +1221,9 @@ module.exports = class Broker {
    * @returns {Promise<object>} The decoded response, with acquired ranges, hints and endpoints intact.
    * @throws {Error} The guard's refusal, an unsupported version, or an encoding or transport failure.
    */
-  async shareFetch({ checkCrcs = true, maxDecompressedBatchBytes, ...fields }, { guard } = {}) {
+  async shareFetch(request, { guard } = {}) {
     this.throwIfRefused(guard)
+    const { checkCrcs = true, maxDecompressedBatchBytes, ...fields } = request
     const build = this.lookupRequest(apiKeys.ShareFetch, requests.ShareFetch)
     const built = build(fields)
     const response = built.response
