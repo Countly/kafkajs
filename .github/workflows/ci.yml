@@ -67,7 +67,8 @@ jobs:
         with: { node-version: '${{ matrix.node }}', cache: npm }
       - run: npm ci
       - run: docker compose version
-      - run: ./scripts/testWithKafka.sh "npm run test:group:${{ matrix.group }} -- --ci --maxWorkers=4"
+      # Share lanes run serially (--runInBand in their scripts), and Jest rejects --maxWorkers with it.
+      - run: ./scripts/testWithKafka.sh "npm run test:group:${{ matrix.group }} -- --ci${{ !startsWith(matrix.group, 'share') && ' --maxWorkers=4' || '' }}"
       - if: always() && startsWith(matrix.group, 'share')
         uses: actions/upload-artifact@v4
         with:
