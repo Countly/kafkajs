@@ -14,7 +14,6 @@ const Broker = require('../../../broker')
 const apiKeys = require('../../../protocol/requests/apiKeys')
 const { requests, selectVersion } = require('../../../protocol/requests')
 const CONFIG_RESOURCE_TYPES = require('../../../protocol/configResourceTypes')
-const CONFIG_SOURCE = require('../../../protocol/configSource')
 const ALTER_CONFIG_OP_TYPES = require('../../../protocol/alterConfigOpTypes')
 const defaultSocketFactory = require('../../../network/socketFactory')
 const { ShareAckLedger } = require('../shareAckLedger')
@@ -32,6 +31,7 @@ const {
   captureShareCleanupBaseline,
   createShareTopic,
   setShareGroupConfigs,
+  resetShareGroupConfigs,
   shareRecordIdentity,
 } = require('../../../../testHelpers/shareFixtures')
 const { CleanupStack } = require('../../../producer/__tests__/fixtures/liveProbe')
@@ -1400,24 +1400,7 @@ class AdminCase {
       { delayMs: 200, label: 'The group deletion' }
     )
     for (const group of this.configured) {
-      const resource = { type: CONFIG_RESOURCE_TYPES.GROUP, name: group }
-      await this.admin.incrementalAlterConfigs({
-        resources: [
-          {
-            ...resource,
-            configEntries: [
-              { name: 'share.auto.offset.reset', operation: ALTER_CONFIG_OP_TYPES.DELETE },
-            ],
-          },
-        ],
-      })
-      const { resources } = await this.admin.describeConfigs({
-        resources: [{ ...resource, configNames: ['share.auto.offset.reset'] }],
-      })
-      const left = (resources[0]?.configEntries ?? []).filter(
-        ({ configSource }) => configSource === CONFIG_SOURCE.GROUP_CONFIG
-      )
-      if (left.length > 0) throw new Error(`Group config override remains on ${group}`)
+      await resetShareGroupConfigs(this.admin, group, ['share.auto.offset.reset'], { signal })
     }
   }
 }

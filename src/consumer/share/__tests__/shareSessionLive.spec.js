@@ -22,6 +22,7 @@ const {
   SHARE_TOPIC_PREFIX,
   shareTopicName,
   setShareGroupConfigs,
+  resetShareGroupConfigs,
   shareRecordIdentity,
   assertShareCleanup,
   captureShareCleanupBaseline,
@@ -36,9 +37,7 @@ const {
 } = require('testHelpers')
 const defaultSocketFactory = require('../../../network/socketFactory')
 const RequestQueue = require('../../../network/requestQueue')
-const ALTER_CONFIG_OP_TYPES = require('../../../protocol/alterConfigOpTypes')
 const CONFIG_RESOURCE_TYPES = require('../../../protocol/configResourceTypes')
-const CONFIG_SOURCE = require('../../../protocol/configSource')
 const shareFetchResponse = require('../../../protocol/requests/shareFetch/v2/response')
 const { ShareAckLedger } = require('../shareAckLedger')
 const { ShareFetchLoop } = require('../shareFetchLoop')
@@ -1195,37 +1194,6 @@ const dropGroup = (scope, admin, group) =>
   )
 
 /**
- * Removes the dynamic GROUP configs a case set and verifies none is left.
- * @param {AbortSignal} scope
- * @param {object} admin a connected admin client
- * @param {string} group
- * @param {string[]} names the owned config keys
- * @returns {Promise<void>}
- * @throws {Error} a refused change, or an owned override still present
- */
-const resetGroupConfig = async (scope, admin, group, names) => {
-  const resource = { type: CONFIG_RESOURCE_TYPES.GROUP, name: group }
-  const configEntries = names.map((name) => ({ name, operation: ALTER_CONFIG_OP_TYPES.DELETE }))
-  const { resources } = await bounded(scope, STEP_MS, () =>
-    admin.incrementalAlterConfigs({ resources: [{ ...resource, configEntries }] })
-  )
-  if (resources[0].errorCode !== 0) {
-    throw new Error(`Group ${group} refused a config reset: error ${resources[0].errorCode}`)
-  }
-  await pollUntil(
-    scope,
-    STEP_MS,
-    async () => {
-      const read = await admin.describeConfigs({ resources: [{ ...resource, configNames: names }] })
-      return read.resources[0].configEntries.every(
-        ({ configSource }) => configSource !== CONFIG_SOURCE.GROUP_CONFIG
-      )
-    },
-    { delayMs: 500, label: `Resetting ${group}` }
-  )
-}
-
-/**
  * Runs the blocking leader-election helpers in a short-lived child process, so this process's
  * event loop (and the share client living in it) keeps running while they work.
  * @param {AbortSignal} scope the case scope; the child is killed when it aborts
@@ -2091,7 +2059,9 @@ class SessionCase {
     const { stack, admin } = this
     this.groups[alias] = id
     stack.add(`delete group ${id}`, (signal) => dropGroup(signal, admin, id))
-    stack.add(`reset config of ${id}`, (signal) => resetGroupConfig(signal, admin, id, GROUP_KEYS))
+    stack.add(`reset config of ${id}`, (signal) =>
+      resetShareGroupConfigs(admin, id, GROUP_KEYS, { signal })
+    )
     const configs = {
       'share.auto.offset.reset': 'earliest',
       'share.record.lock.duration.ms': LOCK_MS,
