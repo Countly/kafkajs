@@ -1503,8 +1503,16 @@ class AdminLedgerScenario {
    * Topic DESCRIBE dependencies settle on every broker because the reused client retains metadata
    * targets even when the next operation authorizes a different resource or operation.
    * ListTransactions proves successful filtering; mutations run once after a proven safe probe.
-   * Every ID deletion wait preserves its last observation in evidence and failure diagnostics.
+   * ID deletion denies cluster DELETE throughout, preventing ControllerApis from bypassing topic
+   * ACLs under allow.everyone.if.no.acl.found. Cluster DESCRIBE is granted explicitly because any
+   * resource ACL disables that default for other operations. The brokers' masks and controller's
+   * validate-only ALTER denial observe that restriction before either deletion phase. DELETE is
+   * absent from the supported cluster mask, so its unset bit alone cannot prove propagation.
+   * Deletion probes and cleanup waits preserve their last observation in evidence and diagnostics.
    * This also runs cold in the ACL profile.
+   * @see https://raw.githubusercontent.com/apache/kafka/4.3/metadata/src/main/java/org/apache/kafka/metadata/authorizer/StandardAuthorizerData.java
+   * @see https://raw.githubusercontent.com/apache/kafka/4.3/server/src/main/java/org/apache/kafka/security/authorizer/AclEntry.java
+   * @see https://raw.githubusercontent.com/apache/kafka/4.3/core/src/main/scala/kafka/server/ControllerApis.scala
    * @returns {Promise<void>}
    * @throws {Error} missing positive control, wrong failure level or cleanup failure
    */
@@ -2006,7 +2014,11 @@ class AdminLedgerScenario {
       })
       const dependencies = []
       if (check.name === 'ID deletion')
-        dependencies.push({ resourceType: 2, resourceName: deletionTopic, operation: 8 })
+        dependencies.push(
+          { resourceType: 2, resourceName: deletionTopic, operation: 8 },
+          { resourceType: 4, resourceName: 'kafka-cluster', operation: 8 },
+          { resourceType: 4, resourceName: 'kafka-cluster', operation: 6, permissionType: 2 }
+        )
       if (['offset deletion'].includes(check.name))
         dependencies.push({ resourceType: 2, resourceName: topic, operation: 3 })
       if (
@@ -2049,6 +2061,14 @@ class AdminLedgerScenario {
             ])
           }
         }
+      }
+      if (check.name === 'ID deletion') {
+        await this.permissionMaskSettled(
+          permissionSources,
+          { resourceType: 4, operation: 7 },
+          false
+        )
+        await controllerAlterDenied()
       }
       expect(await p.invoke(() => root.createAcls({ acl: [acl] }))).toBe(true)
       const positive = await this.permissionAllowed(check)
@@ -2156,7 +2176,7 @@ class AdminLedgerScenario {
           dependency,
           [dependency],
           check.name === 'ID deletion'
-            ? `ID deletion DESCRIBE ACL removal for ${dependency.resourceName}`
+            ? `ID deletion dependency ACL removal for ${dependency.resourceName} operation ${dependency.operation}`
             : undefined
         )
       p.record(`permission ${check.name}`, {
@@ -2165,6 +2185,13 @@ class AdminLedgerScenario {
           ? { outcomeId: 'success with transaction filtered', transactionAbsent: true }
           : { authorizationCode: check.code }),
         dependencyCount: dependencyAcls.length,
+        ...(check.name === 'ID deletion'
+          ? {
+              clusterAclIds: dependencyAcls
+                .filter(({ resourceType }) => resourceType === 4)
+                .map((entry) => JSON.stringify(aclIdentity(entry))),
+            }
+          : {}),
         positivePresent: true,
       })
     }
