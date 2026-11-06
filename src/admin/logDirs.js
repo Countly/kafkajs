@@ -102,11 +102,12 @@ const refusal = (error) => {
   return null
 }
 
-/** Checks identities supplied by a directory response; absent requested replicas remain valid.
+/** Checks directory and topic identities and requested partitions; absent replicas remain valid.
+ * Partition entries may repeat while the broker swaps current and future logs.
  * @param {object} row broker response
  * @param {object[]|null} selected explicit filter or all
  * @returns {void}
- * @throws {KafkaJSInvariantViolation} duplicate or unrequested response identity
+ * @throws {KafkaJSInvariantViolation} invalid, unrequested or duplicate directory/topic identity
  */
 const validateAnswer = (row, selected) => {
   const expected =
@@ -121,15 +122,9 @@ const validateAnswer = (row, selected) => {
       if (!name(t.topic) || topics.has(t.topic) || (expected && !expected.has(t.topic)))
         throw new KafkaJSInvariantViolation('Invalid directory topic identity')
       topics.add(t.topic)
-      const partitions = new Set()
       for (const p of t.partitions) {
-        if (
-          !id(p.partition) ||
-          partitions.has(p.partition) ||
-          (expected && !expected.get(t.topic).has(p.partition))
-        )
+        if (!id(p.partition) || (expected && !expected.get(t.topic).has(p.partition)))
           throw new KafkaJSInvariantViolation('Invalid directory partition identity')
-        partitions.add(p.partition)
       }
     }
   }
@@ -305,12 +300,14 @@ class LogDirectoryAdmin {
   }
 
   /** Projects one directory read per broker into current/future replica locations.
+   * Like Java, keeps the last partition entry per directory before projecting its location.
+   * Repeated current/future locations replace that location and lag in response order.
    *
    * @param {object} options unique replicas to locate
    *
    * @returns {Promise<object[]>} caller-ordered locations and source errors; absent replicas have null locations
    *
-   * @throws {Error} validation, deadline or malformed duplicate current/future identity
+   * @throws {Error} validation, deadline, malformed directory/topic identity or capability/auth refusal
    */
   async describeReplicaLogDirs(options) {
     const replicas = replicasOf(options, false)
@@ -328,7 +325,7 @@ class LogDirectoryAdmin {
       const source = broker.logDirs.find((dir) => dir.errorCode !== 0)
       for (const dir of broker.logDirs)
         for (const t of dir.topics)
-          for (const p of t.partitions) {
+          for (const p of new Map(t.partitions.map((p) => [p.partition, p])).values()) {
             const key = JSON.stringify([t.topic, p.partition])
             const location = p.isFuture ? 'future' : 'current'
             if (!cells.has(key))
@@ -339,8 +336,6 @@ class LogDirectoryAdmin {
                 futureOffsetLag: null,
               })
             const cell = cells.get(key)
-            if (cell[`${location}LogDir`] !== null)
-              throw new KafkaJSInvariantViolation('Duplicate replica directory identity')
             cell[`${location}LogDir`] = dir.path
             cell[`${location}OffsetLag`] = p.offsetLag
           }

@@ -5,6 +5,130 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 ## Unreleased — 3.0.0
 
+### Phase 9E — Share groups
+
+#### Behavior changes
+
+- No existing public API, option default, event or runtime behaviour changes in this phase.
+
+#### Additions
+
+- Implement the seven released share-group wire codecs: ShareGroupHeartbeat v1, ShareGroupDescribe v1, ShareFetch v2, ShareAcknowledge v2, DescribeShareGroupOffsets v1, AlterShareGroupOffsets v0 and DeleteShareGroupOffsets v0. Each is flexible with nested tag buffers, keeps int64 offsets and lag as exact decimal strings and passes broker error codes through as data. They are checked against independent Apache Kafka message vectors and are not yet used by a connection or a public API.
+
+- Route `ShareFetch` and `ShareAcknowledge` over a connection pool's data socket, each API counted by its own socket's generation, and add the seven share-group `Broker` methods. Add `KafkaJSShareGroupsNotSupportedError`, a `KafkaJSServerDoesNotSupportApiKey` subclass whose `reason` (`api-not-advertised`, `api-version-range`, `feature-disabled` or `refused-by-broker`) and `shareVersion` say why a cluster cannot run share groups. A capability check judges a broker by its advertised ranges and its finalized `share.version` (level 1 or above, including level 2 on Kafka 4.4). No public share API uses them yet.
+
+- Add the share-group membership: one generated member ID per run, heartbeats that send only changed fields, topic-ID assignments applied at once with unknown topic names resolved under a guarded retry, and the existing heartbeat manager reused for scheduling. Coordinator errors keep the membership, fenced members rejoin with the same ID, and `GROUP_ID_NOT_FOUND` (69) ends a membership as non-retriable unless it answers that member's own leave. The consumer-protocol heartbeat backoff moved to its own module without changing. No public share API uses the membership yet.
+
+- Add exact record-range walking and compact acknowledgement outcomes with `KafkaJSShareAcknowledgementError`. Acquired records are classified through exact int64 offsets without expanding ranges; control and missing offsets become gaps, and the undecoded remainder after a decode failure is released rather than rejected. Per-partition acknowledgement ledgers keep automatic ranges compact, hold each decision until its handler completes, check a request against the broker's batch rules before a frame is built, and settle every outcome once. Lock deadlines count from the time the fetch was written; no timer is added. Only the error class is exported; the walk and ledger are internal and no public API uses them yet. An internal-API benchmark compares the walk with a per-offset expansion control.
+
+#### Fixes
+
+- Unimplemented request slots throw `KafkaJSNotImplemented` with a diagnostic message instead of a `TypeError`.
+
+#### Tooling
+
+- Track the seven released share-group APIs (keys 76–79 and 90–92) in the Kafka 4.4.0 and 4.3.1 message snapshots and regenerate their protocol compatibility inventory. Source inventory alone does not add share-group support.
+- Add a Java share-consumer interoperability member and classpath probe.
+- The Java message-vector generator writes 46 share-group vectors (24 requests, 22 responses), including Records bytes, unknown tagged fields at every nesting and Java's own acknowledgement batching; they need `KAFKA_CLIENTS_VERSION=4.4.0`.
+- Add share-group fixtures, finalized feature captures and configuration-readback checks.
+- Add independent wire pairs for ShareGroupHeartbeat v1, ShareFetch v2 and ShareAcknowledge v2, a `share` scripted-cluster profile and literal-row `shareScript`, checked against the Java message vectors.
+
+### Phase 9D — Client, security and admin breadth
+
+#### Behavior changes
+
+- SASL failures and token-admin diagnostics omit credentials and sensitive broker payloads. Error classes and fixed message prefixes remain stable. Built-in SASL exchange wrappers preserve fixed, library-authored SCRAM validation reasons; other failures use the canonical protocol-code description or `Error` instead of broker or supplier text.
+
+- Admin operations after disconnect reject without dialing until an explicit connect opens a new lifecycle.
+
+- A `GROUP_ID_NOT_FOUND` answer to a transactional offset commit makes the transaction abortable, like `STALE_MEMBER_EPOCH`, where it was a producer-fatal `applicationRecoverable` error; on every other request it keeps its category. A broker that answers `UNKNOWN_TOPIC_ID` to a v6 commit makes the producer refresh its metadata before the existing bounded retry; that refresh never asks the broker to create a topic and adds no topic to the producer's targets. A v6 answer that cannot be matched to its request (a duplicate, foreign or missing topic or partition) makes the transaction abortable, so the producer survives, and stages nothing.
+
+- **Idle connections are closed after 9 minutes** (540 000 ms, Java's `connections.max.idle.ms`; 2.2.4 never closed them) and reopened by the next request, with one more ApiVersions round trip: "Connections idle for 9 minutes are closed by default; the next request reconnects. This is below the default broker idle timeout but does not guarantee close ordering or eliminate races. `connectionsMaxIdle: 0` keeps connections open as before."
+
+- Admin calls take an `apiTimeout` (default 60 000 ms) and reject with `KafkaJSTimeout` when it passes; a mutation may have been applied. Retries are unchanged, unlike Java's unbounded retries inside the deadline. Existing broker-side `timeout` keeps its meaning.
+
+- `connectionTimeout` defaults to 10 000 ms and grows per node, with jitter, up to `connectionTimeoutMax` (30 000 ms) while a node keeps failing; it resets when the node is ready. A value you set stays flat. Java's `socket.connection.setup.timeout.ms` (KIP-601).
+- A broker must be ready (TCP, TLS, ApiVersions, SASL) within the setup timeout; a stalled ApiVersions or SASL exchange no longer waits for `requestTimeout`.
+- `authenticationTimeout` now bounds the SASL exchange (it only sized the blackout before). A token callback slower than 10 s needs a larger value.
+- Pool replacement during API-version renegotiation retains `KafkaJSConnectionClosedError` and does not advance reconnect backoff.
+- Reauthentication on an established, negotiated connection uses this SASL cap without restarting the connection setup timeout, preserving non-retriable provider failures.
+- Reconnects to a node whose connection failed wait 50 ms, growing to 1 000 ms; `reconnectBackoff` and `reconnectBackoffMax` tune it.
+- Timeouts now require positive integral values. Some legacy authentication values and fractional connection values could work. Invalid values throw `KafkaJSInvalidConfigurationError`; existing numeric strings remain accepted.
+
+- SCRAM authentication refuses a non-extending nonce, a non-integer or above-1 048 576 iteration count, and compares the server signature in constant time.
+
+- Against Kafka 4.4 brokers ApiVersions v5 checks the cluster and node ids (KIP-1242); `metadataRecoveryStrategy: 'none'` turns it off.
+
+#### Fixes
+
+- Preserve concurrent admin/producer/consumer connects over a shared cluster and decimal-string timestamps from consumed messages in `fetchTopicOffsetsByTimestamp`.
+
+- `admin.describeReplicaLogDirs` tolerates repeated replica locations during a directory move instead of throwing `KafkaJSInvariantViolation`. As in Java, the last partition entry within each directory is projected; repeated current or future locations replace that location and its lag in response order. The result fields are unchanged.
+
+- SASL GSSAPI follows the native `kerberos` 7.0.0 contract. Its step answers `null` when it has no output token, which the adapter failed to encode; it now responds with no data, as RFC 4752 asks. Its wrap takes a boolean `protect` and the authorization identity as `user`, where the adapter passed a number and put the identity in the data.
+- A failed GSSAPI exchange names its step (`stage=exchange:1`, `exchange:2`, `exchange:final`) and, for a library or built-in programming error, its class, with a protocol error's `type` and `code`; the failure's text is still never published.
+- `admin.deleteGroups` names the group id it refuses (`Invalid groupId name: 1`); it printed `true`.
+- `KafkaJSNumberOfRetriesExceeded` names itself on the first line of its stack. It printed `KafkaJSNonRetriableError` there, its parent class, because the name was assigned after the stack was built (also in kafkajs 2.2.4).
+- A commit the broker refuses names the refused partition: the error carries `topic` and `partition`, as a refused Produce does.
+- `admin.deleteGroups` no longer sends a group again that a coordinator already answered. When one coordinator's request failed with a stale-coordinator error, 2.2.4 threw the other coordinators' answers away and resent every group, so a group it had deleted could come back as `GROUP_ID_NOT_FOUND`. Every coordinator request now settles before the retry, the retry sends only the groups no coordinator has answered, and each row is kept for the result.
+
+#### Additions
+
+- `admin.disconnect({ timeout })` closes by the deadline.
+
+- `admin.describeLogDirs`, `alterReplicaLogDirs`, `describeReplicaLogDirs`; `fetchTopicOffsetsByTimestamp` accepts `'maxTimestamp'`, `'earliestLocal'`, `'latestTiered'` and `'earliestPendingUpload'`; `alterPartitionReassignments` accepts `allowReplicationFactorChange`.
+
+- `admin.describeClientQuotas`, `alterClientQuotas`, `describeUserScramCredentials`, `alterUserScramCredentials` and the four delegation-token methods.
+
+- Admin clients can delete committed group offsets with deleteOffsets and read several groups with fetchOffsetsForGroups. fetchOffsets accepts requireStable; its default remains false.
+
+- `admin.describeProducers`, `describeTransactions`, `listTransactions` (with the KIP-1152 `transactionalIdPattern` filter, a RE2 string evaluated by the broker), `abortTransaction` and `fenceProducers`; `forceTerminateTransaction` is `fenceProducers({ transactionalIds: [id] })`.
+
+- `connectionsMaxIdle`.
+
+- `AdminConfig.apiTimeout` and a per-call `apiTimeout`; `includeAuthorizedOperations` on group descriptions and `includeTopicAuthorizedOperations` on topic metadata. Requested supported masks retain the raw signed INT32 value; an absent, unsupported or unrequested mask is `null`.
+
+- New client options `connectionTimeoutMax`, `reconnectBackoff` and `reconnectBackoffMax`; `authenticationTimeout` is now enforced.
+- `oauthBearer.clientCredentials`, `jwtBearer`, `fileToken` and `signAssertion` build the existing `oauthBearerProvider` callback with a single-flight token cache; recipes for discovery, token exchange, mTLS and KMS-held keys are in `docs/OAuth.md`.
+
+- Admin topic-offset reads accept an optional isolationLevel, defaulting to read_committed; read_uncommitted reads the high watermark. Legacy alterConfigs errors and KafkaJSCreateTopicError expose broker errorMessage separately from their stable messages.
+
+- `admin.electLeaders`, `describeFeatures`, `updateFeatures`, `listConfigResources`; `describeCluster` gains `includeAuthorizedOperations` and `includeFencedBrokers` and uses DescribeCluster when asked.
+
+- `sasl: { mechanism: 'gssapi' }` over the optional peer `kerberos` 7.0.0, loaded on first use; credentials come from the process environment, with no `kinit` and no subprocess.
+
+- `kerberos` is declared an optional peer dependency pinned to 7.0.0 and is never installed with the package.
+
+- DeleteGroups v3 returns `errorMessage` per group; the error table gains `GROUP_DELETION_FAILED`, `STREAMS_TOPOLOGY_DESCRIPTION_UPDATE_FAILED` and `CONTROLLER_ID_NOT_REGISTERED`; the compatibility baseline moves to Kafka 4.4.x
+
+- `rackId` and `rackAware` producer options (KIP-1123): with `rackAware: true` and a non-empty `rackId`, the built-in partitioners (the default `UniformStickyPartitioner`, `DefaultPartitioner` and its alias, `LegacyPartitioner`) prefer the partitions whose leader is in that rack for records without a key, and fall back to every partition with a leader when none is. A record with a `partition` or a key keeps its partition, and a custom `createPartitioner` is given the same arguments as before. Without the opt-in nothing changes.
+
+- TxnOffsetCommit v6 uses cached topic IDs on capable brokers (KIP-1319), with the existing named-topic fallback and commit-only offset publication. A topic with no partition is left out of the v6 request and of the answer it expects, as the broker answers only the topics it forwards.
+
+#### Tooling
+
+- Compose variants for delegation tokens, two log directories and tiered storage; the admin ledger table.
+
+- The exit gate runs the GSSAPI, TLS negative, OAuth helper, idle-reaping and admin live arms (ledger, lifecycle, quota, delegation tokens, log directories, tiered storage) as jobs of their own. A gate check can name its broker release with `kafkaVersion`. The admin live scenarios and the GSSAPI KDC fixture use the job's Compose cluster when no cluster guard is configured, and the base Compose cluster exposes broker JMX on a container-local port for the quota scenario's byte counter.
+
+- The Kerberos broker logs the Kafka security and network `Selector` loggers at DEBUG, so a failed GSSAPI exchange reaches the compose log.
+- The admin ledger and floor fence cases assert `INVALID_PRODUCER_EPOCH` (47), the answer a partition leader gives a Produce from a fenced producer, and that the refused send was a Produce with no request to the transaction coordinator, where they asserted `PRODUCER_FENCED` (90).
+- Live scenarios for the connection setup budget and idle reaping; the soak's idle profile asserts that sockets are reaped and reopened.
+
+- The request-queue stamp benchmark.
+
+- `blackhole(id)` in the scripted cluster and the connection-setup benchmark.
+- Track the nineteen admin-ledger APIs in the compatibility snapshot, the tracked list and the generated matrix, with named broker ranges.
+- Tests pin the SCRAM client checks, the TLS negatives, secret hygiene across the SASL mechanisms and the DNS behaviour.
+- `npm run compat:fetch -- --source-root <dir>` imports the message snapshot and the error snapshot from an unpacked Apache Kafka source release (its `gradle.properties` must hold the pinned version) instead of the network, and refuses an absolute path, a `..` segment or a link that leaves the root. The snapshot is Kafka 4.4.0; the 4.3.1 snapshots stay beside it.
+- `scripts/protocol/javaVectorSources.json` records, for each Java vector, the `kafka-clients` jar that wrote it, that jar's SHA-256 (null only for the 4.3.1 jar of the older vectors) and the fixture's own SHA-256; `npm run protocol:generate` and `protocol:check` refuse a missing, extra, duplicate (a key written twice, found by its decoded text whatever the file's layout) or stale record and copy the records into `scripts/protocol/provenance.json`, where an API whose vectors came from two jars records no single jar.
+- The Java message-vector generator targets the Kafka 4.4 client API, and `test:e2e:delete-groups-v3` runs `deleteGroupsV3Live.spec.js` (`DELETE_GROUPS_V3_E2E`) against the broker version under test.
+- The Java message-vector generator writes the TxnOffsetCommit v6 vectors with the 4.4.0 jar, and `test:e2e:txn-offset-commit-v6` runs `txnOffsetCommitV6Live.spec.js` (`TXN_OFFSET_COMMIT_V6_E2E`) against the broker version under test.
+- The 4.0 floor set covers the admin ledger, connection, OAuth, GSSAPI and delegation-token capabilities and asserts the unsupported results.
+- `test:e2e:rack-aware-producer` runs `rackAwareProducerLive.spec.js` (`RACK_AWARE_PRODUCER_E2E`) on `docker-compose.racks.yml`; the consumer's `test:e2e:rack-aware` is a separate script and flag.
+- `test:floor:conditional` runs `floorConditionalLive.spec.js` (`FLOOR_CONDITIONAL_E2E`) on `docker-compose.racks.yml` against Kafka 4.0.2: ApiVersions, TxnOffsetCommit and DeleteGroups keep the versions the floor's ranges offer and the producer's rack preference falls back, each by the range oracle and never by a version string.
+- The scripted cluster answers a client's ApiVersions v5 request as a Kafka 4.3 broker does, with a v0-shaped UNSUPPORTED_VERSION, so the inherited scenarios negotiate v4 as they did. It leaves out of `requests()` only one refusal per negotiation, a socket's first request or the renegotiation after the client opened another socket to the node; a second negotiation on an unchanged connection stays visible. `apiVersionTrace()` lists every one, and `test:e2e:api-identity` runs `apiVersionsIdentityLive.spec.js` (`API_IDENTITY_E2E`) against the broker version under test.
+
 ### Phase 9C — Consumer parity
 
 #### Behavior changes
@@ -165,128 +289,6 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Add replayable consumer fault schedules, generated manual, rebalance-hook, forced-close and fetch-session lifecycle cases, and the `soak:consumer-churn` profile with independent log, broker-offset and handler checks, resource baselines and delivery-gap samples; named-topic soak subscriptions retry transient metadata propagation for up to five seconds.
 - The lifecycle matrix and consumer schedule specs fake the imported and the global monotonic clock together, so they pass late in a long-lived Jest worker; forced-close cells now exercise a real zero-timeout force. No library behaviour changed.
 - The `soak:producer-churn` durability check keys its duplicate detection on each record's raw identity (partition, producer id, epoch, sequence) in a fixed table sized from the offered-record bound, instead of at most 64 producer identities, so a run with many legitimate epoch bumps is checked in full rather than failing on table capacity.
-
-### Phase 9D — Client, security and admin breadth
-
-- Preserve concurrent admin/producer/consumer connects over a shared cluster and decimal-string timestamps from consumed messages in `fetchTopicOffsetsByTimestamp`.
-
-#### Behavior changes
-
-- SASL failures and token-admin diagnostics omit credentials and sensitive broker payloads. Error classes and fixed message prefixes remain stable. Built-in SASL exchange wrappers preserve fixed, library-authored SCRAM validation reasons; other failures use the canonical protocol-code description or `Error` instead of broker or supplier text.
-
-- Admin operations after disconnect reject without dialing until an explicit connect opens a new lifecycle.
-
-- A `GROUP_ID_NOT_FOUND` answer to a transactional offset commit makes the transaction abortable, like `STALE_MEMBER_EPOCH`, where it was a producer-fatal `applicationRecoverable` error; on every other request it keeps its category. A broker that answers `UNKNOWN_TOPIC_ID` to a v6 commit makes the producer refresh its metadata before the existing bounded retry; that refresh never asks the broker to create a topic and adds no topic to the producer's targets. A v6 answer that cannot be matched to its request (a duplicate, foreign or missing topic or partition) makes the transaction abortable, so the producer survives, and stages nothing.
-
-- **Idle connections are closed after 9 minutes** (540 000 ms, Java's `connections.max.idle.ms`; 2.2.4 never closed them) and reopened by the next request, with one more ApiVersions round trip: "Connections idle for 9 minutes are closed by default; the next request reconnects. This is below the default broker idle timeout but does not guarantee close ordering or eliminate races. `connectionsMaxIdle: 0` keeps connections open as before."
-
-- Admin calls take an `apiTimeout` (default 60 000 ms) and reject with `KafkaJSTimeout` when it passes; a mutation may have been applied. Retries are unchanged, unlike Java's unbounded retries inside the deadline. Existing broker-side `timeout` keeps its meaning.
-
-- `connectionTimeout` defaults to 10 000 ms and grows per node, with jitter, up to `connectionTimeoutMax` (30 000 ms) while a node keeps failing; it resets when the node is ready. A value you set stays flat. Java's `socket.connection.setup.timeout.ms` (KIP-601).
-- A broker must be ready (TCP, TLS, ApiVersions, SASL) within the setup timeout; a stalled ApiVersions or SASL exchange no longer waits for `requestTimeout`.
-- `authenticationTimeout` now bounds the SASL exchange (it only sized the blackout before). A token callback slower than 10 s needs a larger value.
-- Pool replacement during API-version renegotiation retains `KafkaJSConnectionClosedError` and does not advance reconnect backoff.
-- Reauthentication on an established, negotiated connection uses this SASL cap without restarting the connection setup timeout, preserving non-retriable provider failures.
-- Reconnects to a node whose connection failed wait 50 ms, growing to 1 000 ms; `reconnectBackoff` and `reconnectBackoffMax` tune it.
-- Timeouts now require positive integral values. Some legacy authentication values and fractional connection values could work. Invalid values throw `KafkaJSInvalidConfigurationError`; existing numeric strings remain accepted.
-
-- SCRAM authentication refuses a non-extending nonce, a non-integer or above-1 048 576 iteration count, and compares the server signature in constant time.
-
-- Against Kafka 4.4 brokers ApiVersions v5 checks the cluster and node ids (KIP-1242); `metadataRecoveryStrategy: 'none'` turns it off.
-
-#### Fixes
-
-- SASL GSSAPI follows the native `kerberos` 7.0.0 contract. Its step answers `null` when it has no output token, which the adapter failed to encode; it now responds with no data, as RFC 4752 asks. Its wrap takes a boolean `protect` and the authorization identity as `user`, where the adapter passed a number and put the identity in the data.
-- A failed GSSAPI exchange names its step (`stage=exchange:1`, `exchange:2`, `exchange:final`) and, for a library or built-in programming error, its class, with a protocol error's `type` and `code`; the failure's text is still never published.
-- `admin.deleteGroups` names the group id it refuses (`Invalid groupId name: 1`); it printed `true`.
-- `KafkaJSNumberOfRetriesExceeded` names itself on the first line of its stack. It printed `KafkaJSNonRetriableError` there, its parent class, because the name was assigned after the stack was built (also in kafkajs 2.2.4).
-- A commit the broker refuses names the refused partition: the error carries `topic` and `partition`, as a refused Produce does.
-- `admin.deleteGroups` no longer sends a group again that a coordinator already answered. When one coordinator's request failed with a stale-coordinator error, 2.2.4 threw the other coordinators' answers away and resent every group, so a group it had deleted could come back as `GROUP_ID_NOT_FOUND`. Every coordinator request now settles before the retry, the retry sends only the groups no coordinator has answered, and each row is kept for the result.
-
-#### Additions
-
-- `admin.disconnect({ timeout })` closes by the deadline.
-
-- `admin.describeLogDirs`, `alterReplicaLogDirs`, `describeReplicaLogDirs`; `fetchTopicOffsetsByTimestamp` accepts `'maxTimestamp'`, `'earliestLocal'`, `'latestTiered'` and `'earliestPendingUpload'`; `alterPartitionReassignments` accepts `allowReplicationFactorChange`.
-
-- `admin.describeClientQuotas`, `alterClientQuotas`, `describeUserScramCredentials`, `alterUserScramCredentials` and the four delegation-token methods.
-
-- Admin clients can delete committed group offsets with deleteOffsets and read several groups with fetchOffsetsForGroups. fetchOffsets accepts requireStable; its default remains false.
-
-- `admin.describeProducers`, `describeTransactions`, `listTransactions` (with the KIP-1152 `transactionalIdPattern` filter, a RE2 string evaluated by the broker), `abortTransaction` and `fenceProducers`; `forceTerminateTransaction` is `fenceProducers({ transactionalIds: [id] })`.
-
-- `connectionsMaxIdle`.
-
-- `AdminConfig.apiTimeout` and a per-call `apiTimeout`; `includeAuthorizedOperations` on group descriptions and `includeTopicAuthorizedOperations` on topic metadata. Requested supported masks retain the raw signed INT32 value; an absent, unsupported or unrequested mask is `null`.
-
-- New client options `connectionTimeoutMax`, `reconnectBackoff` and `reconnectBackoffMax`; `authenticationTimeout` is now enforced.
-- `oauthBearer.clientCredentials`, `jwtBearer`, `fileToken` and `signAssertion` build the existing `oauthBearerProvider` callback with a single-flight token cache; recipes for discovery, token exchange, mTLS and KMS-held keys are in `docs/OAuth.md`.
-
-- Admin topic-offset reads accept an optional isolationLevel, defaulting to read_committed; read_uncommitted reads the high watermark. Legacy alterConfigs errors and KafkaJSCreateTopicError expose broker errorMessage separately from their stable messages.
-
-- `admin.electLeaders`, `describeFeatures`, `updateFeatures`, `listConfigResources`; `describeCluster` gains `includeAuthorizedOperations` and `includeFencedBrokers` and uses DescribeCluster when asked.
-
-- `sasl: { mechanism: 'gssapi' }` over the optional peer `kerberos` 7.0.0, loaded on first use; credentials come from the process environment, with no `kinit` and no subprocess.
-
-- `kerberos` is declared an optional peer dependency pinned to 7.0.0 and is never installed with the package.
-
-- DeleteGroups v3 returns `errorMessage` per group; the error table gains `GROUP_DELETION_FAILED`, `STREAMS_TOPOLOGY_DESCRIPTION_UPDATE_FAILED` and `CONTROLLER_ID_NOT_REGISTERED`; the compatibility baseline moves to Kafka 4.4.x
-
-- `rackId` and `rackAware` producer options (KIP-1123): with `rackAware: true` and a non-empty `rackId`, the built-in partitioners (the default `UniformStickyPartitioner`, `DefaultPartitioner` and its alias, `LegacyPartitioner`) prefer the partitions whose leader is in that rack for records without a key, and fall back to every partition with a leader when none is. A record with a `partition` or a key keeps its partition, and a custom `createPartitioner` is given the same arguments as before. Without the opt-in nothing changes.
-
-- TxnOffsetCommit v6 uses cached topic IDs on capable brokers (KIP-1319), with the existing named-topic fallback and commit-only offset publication. A topic with no partition is left out of the v6 request and of the answer it expects, as the broker answers only the topics it forwards.
-
-#### Tooling
-
-- Compose variants for delegation tokens, two log directories and tiered storage; the admin ledger table.
-
-- The exit gate runs the GSSAPI, TLS negative, OAuth helper, idle-reaping and admin live arms (ledger, lifecycle, quota, delegation tokens, log directories, tiered storage) as jobs of their own. A gate check can name its broker release with `kafkaVersion`. The admin live scenarios and the GSSAPI KDC fixture use the job's Compose cluster when no cluster guard is configured, and the base Compose cluster exposes broker JMX on a container-local port for the quota scenario's byte counter.
-
-- The Kerberos broker logs the Kafka security and network `Selector` loggers at DEBUG, so a failed GSSAPI exchange reaches the compose log.
-- The admin ledger and floor fence cases assert `INVALID_PRODUCER_EPOCH` (47), the answer a partition leader gives a Produce from a fenced producer, and that the refused send was a Produce with no request to the transaction coordinator, where they asserted `PRODUCER_FENCED` (90).
-- Live scenarios for the connection setup budget and idle reaping; the soak's idle profile asserts that sockets are reaped and reopened.
-
-- The request-queue stamp benchmark.
-
-- `blackhole(id)` in the scripted cluster and the connection-setup benchmark.
-- Track the nineteen admin-ledger APIs in the compatibility snapshot, the tracked list and the generated matrix, with named broker ranges.
-- Tests pin the SCRAM client checks, the TLS negatives, secret hygiene across the SASL mechanisms and the DNS behaviour.
-- `npm run compat:fetch -- --source-root <dir>` imports the message snapshot and the error snapshot from an unpacked Apache Kafka source release (its `gradle.properties` must hold the pinned version) instead of the network, and refuses an absolute path, a `..` segment or a link that leaves the root. The snapshot is Kafka 4.4.0; the 4.3.1 snapshots stay beside it.
-- `scripts/protocol/javaVectorSources.json` records, for each Java vector, the `kafka-clients` jar that wrote it, that jar's SHA-256 (null only for the 4.3.1 jar of the older vectors) and the fixture's own SHA-256; `npm run protocol:generate` and `protocol:check` refuse a missing, extra, duplicate (a key written twice, found by its decoded text whatever the file's layout) or stale record and copy the records into `scripts/protocol/provenance.json`, where an API whose vectors came from two jars records no single jar.
-- The Java message-vector generator targets the Kafka 4.4 client API, and `test:e2e:delete-groups-v3` runs `deleteGroupsV3Live.spec.js` (`DELETE_GROUPS_V3_E2E`) against the broker version under test.
-- The Java message-vector generator writes the TxnOffsetCommit v6 vectors with the 4.4.0 jar, and `test:e2e:txn-offset-commit-v6` runs `txnOffsetCommitV6Live.spec.js` (`TXN_OFFSET_COMMIT_V6_E2E`) against the broker version under test.
-- The 4.0 floor set covers the admin ledger, connection, OAuth, GSSAPI and delegation-token capabilities and asserts the unsupported results.
-- `test:e2e:rack-aware-producer` runs `rackAwareProducerLive.spec.js` (`RACK_AWARE_PRODUCER_E2E`) on `docker-compose.racks.yml`; the consumer's `test:e2e:rack-aware` is a separate script and flag.
-- `test:floor:conditional` runs `floorConditionalLive.spec.js` (`FLOOR_CONDITIONAL_E2E`) on `docker-compose.racks.yml` against Kafka 4.0.2: ApiVersions, TxnOffsetCommit and DeleteGroups keep the versions the floor's ranges offer and the producer's rack preference falls back, each by the range oracle and never by a version string.
-- The scripted cluster answers a client's ApiVersions v5 request as a Kafka 4.3 broker does, with a v0-shaped UNSUPPORTED_VERSION, so the inherited scenarios negotiate v4 as they did. It leaves out of `requests()` only one refusal per negotiation, a socket's first request or the renegotiation after the client opened another socket to the node; a second negotiation on an unchanged connection stays visible. `apiVersionTrace()` lists every one, and `test:e2e:api-identity` runs `apiVersionsIdentityLive.spec.js` (`API_IDENTITY_E2E`) against the broker version under test.
-
-### Phase 9E — Share groups
-
-#### Behavior changes
-
-- No existing public API, option default, event or runtime behaviour changes in this phase.
-
-#### Additions
-
-- Implement the seven released share-group wire codecs: ShareGroupHeartbeat v1, ShareGroupDescribe v1, ShareFetch v2, ShareAcknowledge v2, DescribeShareGroupOffsets v1, AlterShareGroupOffsets v0 and DeleteShareGroupOffsets v0. Each is flexible with nested tag buffers, keeps int64 offsets and lag as exact decimal strings and passes broker error codes through as data. They are checked against independent Apache Kafka message vectors and are not yet used by a connection or a public API.
-
-- Route `ShareFetch` and `ShareAcknowledge` over a connection pool's data socket, each API counted by its own socket's generation, and add the seven share-group `Broker` methods. Add `KafkaJSShareGroupsNotSupportedError`, a `KafkaJSServerDoesNotSupportApiKey` subclass whose `reason` (`api-not-advertised`, `api-version-range`, `feature-disabled` or `refused-by-broker`) and `shareVersion` say why a cluster cannot run share groups. A capability check judges a broker by its advertised ranges and its finalized `share.version` (level 1 or above, including level 2 on Kafka 4.4). No public share API uses them yet.
-
-- Add the share-group membership: one generated member ID per run, heartbeats that send only changed fields, topic-ID assignments applied at once with unknown topic names resolved under a guarded retry, and the existing heartbeat manager reused for scheduling. Coordinator errors keep the membership, fenced members rejoin with the same ID, and `GROUP_ID_NOT_FOUND` (69) ends a membership as non-retriable unless it answers that member's own leave. The consumer-protocol heartbeat backoff moved to its own module without changing. No public share API uses the membership yet.
-
-- Add exact record-range walking and compact acknowledgement outcomes with `KafkaJSShareAcknowledgementError`. Acquired records are classified through exact int64 offsets without expanding ranges; control and missing offsets become gaps, and the undecoded remainder after a decode failure is released rather than rejected. Per-partition acknowledgement ledgers keep automatic ranges compact, hold each decision until its handler completes, check a request against the broker's batch rules before a frame is built, and settle every outcome once. Lock deadlines count from the time the fetch was written; no timer is added. Only the error class is exported; the walk and ledger are internal and no public API uses them yet. An internal-API benchmark compares the walk with a per-offset expansion control.
-
-#### Fixes
-
-- Unimplemented request slots throw `KafkaJSNotImplemented` with a diagnostic message instead of a `TypeError`.
-
-#### Tooling
-
-- Track the seven released share-group APIs (keys 76–79 and 90–92) in the Kafka 4.4.0 and 4.3.1 message snapshots and regenerate their protocol compatibility inventory. Source inventory alone does not add share-group support.
-- Add a Java share-consumer interoperability member and classpath probe.
-- The Java message-vector generator writes 46 share-group vectors (24 requests, 22 responses), including Records bytes, unknown tagged fields at every nesting and Java's own acknowledgement batching; they need `KAFKA_CLIENTS_VERSION=4.4.0`.
-- Add share-group fixtures, finalized feature captures and configuration-readback checks.
-- Add independent wire pairs for ShareGroupHeartbeat v1, ShareFetch v2 and ShareAcknowledge v2, a `share` scripted-cluster profile and literal-row `shareScript`, checked against the Java message vectors.
 
 ### Phase 9B — Producer parity: delivery deadline, memory bound, request size, partitioner, codecs, lifecycle
 

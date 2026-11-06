@@ -403,14 +403,13 @@ describe('directory peer capability refusal', () => {
 })
 
 describe('directory response and input boundaries', () => {
-  it.each(['path', 'topic', 'partition', 'foreign topic', 'foreign partition'])(
+  it.each(['path', 'topic', 'foreign topic', 'foreign partition'])(
     'rejects directory identity contamination: %s',
     async (kind) => {
       const dir = directory()
       const dirs = [dir]
       if (kind === 'path') dirs.push(directory())
       if (kind === 'topic') dir.topics.push({ ...dir.topics[0] })
-      if (kind === 'partition') dir.topics[0].partitions.push({ ...dir.topics[0].partitions[0] })
       if (kind === 'foreign topic') dir.topics[0].topic = 'other'
       if (kind === 'foreign partition') dir.topics[0].partitions[0].partition = 1
       const { admin } = fixture(
@@ -421,24 +420,138 @@ describe('directory response and input boundaries', () => {
       ).rejects.toBeInstanceOf(KafkaJSInvariantViolation)
     }
   )
-  it.each([false, true])('rejects duplicate replica locations, future=%s', async (future) => {
-    const { admin } = fixture(
-      new Map([
-        [
-          1,
-          {
-            describeLogDirs: async () => ({
-              errorCode: 0,
-              logDirs: [directory(future), directory(future, '/data/b')],
-            }),
-          },
-        ],
+  it.each([
+    [
+      'current',
+      false,
+      {
+        currentLogDir: '/data/b',
+        currentOffsetLag: '7',
+        futureLogDir: '/data/c',
+        futureOffsetLag: '2',
+      },
+    ],
+    [
+      'future',
+      true,
+      {
+        currentLogDir: '/data/c',
+        currentOffsetLag: '0',
+        futureLogDir: '/data/b',
+        futureOffsetLag: '7',
+      },
+    ],
+  ])(
+    'keeps the last %s location and lag without changing other locations or brokers',
+    async (location, future, expected) => {
+      const first = directory(future)
+      first.topics[0].partitions[0].offsetLag = '11'
+      const last = directory(future, '/data/b')
+      last.topics[0].partitions[0].offsetLag = '7'
+      const { admin } = fixture(
+        new Map([
+          [
+            1,
+            {
+              describeLogDirs: async () => ({
+                errorCode: 0,
+                logDirs: [first, directory(!future, '/data/c'), last],
+              }),
+            },
+          ],
+          [
+            2,
+            {
+              describeLogDirs: async () => ({
+                errorCode: 0,
+                logDirs: [directory(false, '/data/peer')],
+              }),
+            },
+          ],
+        ])
+      )
+      expect(await admin.describeReplicaLogDirs({ replicas: [replica(0, 2), replica()] })).toEqual([
+        {
+          topic: 't',
+          partition: 0,
+          brokerId: 2,
+          currentLogDir: '/data/peer',
+          currentOffsetLag: '0',
+          futureLogDir: null,
+          futureOffsetLag: null,
+          errorCode: 0,
+          error: null,
+          errorMessage: null,
+        },
+        {
+          topic: 't',
+          partition: 0,
+          brokerId: 1,
+          ...expected,
+          errorCode: 0,
+          error: null,
+          errorMessage: null,
+        },
       ])
-    )
-    await expect(admin.describeReplicaLogDirs({ replicas: [replica()] })).rejects.toBeInstanceOf(
-      KafkaJSInvariantViolation
-    )
-  })
+    }
+  )
+  it.each([
+    ['current then current', false, false, '/data/a', null, '7', null],
+    ['future then future', true, true, null, '/data/a', null, '7'],
+    ['current then future', false, true, null, '/data/a', null, '7'],
+    ['future then current', true, false, '/data/a', null, '7', null],
+  ])(
+    'projects only the last partition entry in one directory: %s',
+    async (
+      shape,
+      firstFuture,
+      lastFuture,
+      currentLogDir,
+      futureLogDir,
+      currentOffsetLag,
+      futureOffsetLag
+    ) => {
+      const dir = directory(firstFuture)
+      dir.topics[0].partitions.push({
+        partition: 0,
+        size: '9007199254740995',
+        offsetLag: '7',
+        isFuture: lastFuture,
+      })
+      const { admin } = fixture(
+        new Map([[1, { describeLogDirs: async () => ({ errorCode: 0, logDirs: [dir] }) }]])
+      )
+      const raw = await admin.describeLogDirs({
+        brokers: [1],
+        topicPartitions: [{ topic: 't', partitions: [0] }],
+      })
+      expect(raw).toHaveLength(1)
+      expect(raw[0].errorCode).toBe(0)
+      expect(raw[0].logDirs[0].topics[0].partitions).toEqual([
+        {
+          partition: 0,
+          size: '9007199254740993',
+          offsetLag: firstFuture ? '2' : '0',
+          isFuture: firstFuture,
+        },
+        { partition: 0, size: '9007199254740995', offsetLag: '7', isFuture: lastFuture },
+      ])
+      expect(await admin.describeReplicaLogDirs({ replicas: [replica()] })).toEqual([
+        {
+          topic: 't',
+          partition: 0,
+          brokerId: 1,
+          currentLogDir,
+          futureLogDir,
+          currentOffsetLag,
+          futureOffsetLag,
+          errorCode: 0,
+          error: null,
+          errorMessage: null,
+        },
+      ])
+    }
+  )
   it('retains successful broker while a replacement route fails', async () => {
     const failure = new Error('route unavailable')
     const a = { describeLogDirs: jest.fn(async () => ({ errorCode: 0, logDirs: [] })) }

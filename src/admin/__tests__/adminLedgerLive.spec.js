@@ -1,5 +1,6 @@
 const { randomBytes, pbkdf2Sync } = require('crypto')
 const { Kafka, AlterConfigOpTypes } = require('../../../index')
+const { KafkaJSConnectionError } = require('../../errors')
 const { inspect, isDeepStrictEqual } = require('util')
 const { AdminLiveProbe } = require('./fixtures/liveAdmin')
 const Broker = require('../../broker')
@@ -111,11 +112,13 @@ class AdminLedgerScenario {
    * ControllerApis.deleteTopics removes the ID from its deletion set on either denial or the
    * cross-reference duplicate. ALLOW returns one (name, ID, 42) row; DENY with DESCRIBE returns
    * two (name, ID or zero UUID, 29) rows. The zero UUID decodes as null; response order is shuffled.
+   * KafkaApis forwards the original request buffer in an envelope without validating references.
    * @see https://raw.githubusercontent.com/apache/kafka/4.3/core/src/main/scala/kafka/server/ControllerApis.scala (lines 290-356)
+   * @see https://raw.githubusercontent.com/apache/kafka/4.3/core/src/main/scala/kafka/server/ForwardingManager.scala
    * @param {Broker} broker connected source using the permission principal
    * @param {string} topic existing topic name, which must still map to topicId
    * @param {string} topicId current ID of that same topic
-   * @returns {Promise<object[]>} every response identity and error code, without per-topic throws
+   * @returns {Promise<object[]>} every response identity, error code and message, without per-topic throws
    * @throws {Error} encoding, transport or decoding failure
    */
   async deletionProbe(broker, topic, topicId) {
@@ -139,12 +142,50 @@ class AdminLedgerScenario {
         /**
          * Retains error codes as observations rather than passing them to the throwing parser.
          * @param {object} data decoded v6 response
-         * @returns {Promise<object[]>} identities and codes, including every failed entry
+         * @returns {Promise<object[]>} identities, codes and messages, including every failed entry
          */
         parse: async ({ topicErrors }) =>
-          topicErrors.map(({ topic, topicId, errorCode }) => ({ topic, topicId, errorCode })),
+          topicErrors.map(({ topic, topicId, errorCode, errorMessage }) => ({
+            topic,
+            topicId,
+            errorCode,
+            errorMessage,
+          })),
       },
     })
+  }
+
+  /**
+   * Polls under the work deadline and, when labelled, records its final observation on either
+   * success or failure. Failure evidence and the rethrown error contain the same snapshot, even
+   * when the outer operation deadline wins the race with the inner poll's timeout.
+   * @param {string|undefined} label diagnostic phase; undefined keeps other checks unchanged
+   * @param {() => Promise<boolean>} predicate existing bounded observation and settlement condition
+   * @param {() => any} last explicit nonsecret result or error fields from the latest observation
+   * @returns {Promise<void>} after the predicate holds
+   * @throws {Error} original failure, or a labelled failure with its last observation and cause
+   */
+  async observedPoll(label, predicate, last) {
+    const p = this.probe
+    try {
+      await p.poll(predicate)
+    } catch (error) {
+      if (!label) throw error
+      const observationLast = JSON.stringify({
+        observation: last(),
+        failure: { name: error.name, message: error.message, code: error.code },
+      })
+      p.record('ID deletion wait', { phaseId: label, observationLast, settledPresent: false })
+      throw new Error(`${label}: ${error.message}; last observation: ${observationLast}`, {
+        cause: error,
+      })
+    }
+    if (label)
+      p.record('ID deletion wait', {
+        phaseId: label,
+        observationLast: JSON.stringify({ observation: last() }),
+        settledPresent: true,
+      })
   }
 
   /**
@@ -153,16 +194,23 @@ class AdminLedgerScenario {
    * @param {object} client admin that owns the ACLs
    * @param {object} filter complete delete filter, also used to describe what remains
    * @param {object[]} expected the ACLs the filter must delete, whatever order they come back in
+   * @param {string} [waitLabel] phase to include with the last DescribeAcls observation
    * @returns {Promise<void>}
    * @throws {Error} a failed answer, other ACLs deleted, or an ACL that remains until the budget ends
    */
-  async removeAcls(client, filter, expected) {
+  async removeAcls(client, filter, expected, waitLabel) {
     const p = this.probe
     const order = (rows) => rows.map((row) => JSON.stringify(aclIdentity(row))).sort()
     const deleted = deletedAcls(await p.invoke(() => client.deleteAcls({ filters: [filter] })))
     expect(order(deleted)).toEqual(order(expected))
-    await p.poll(
-      async () => (await p.invoke(() => client.describeAcls(filter))).resources.length === 0
+    let resources = null
+    await this.observedPoll(
+      waitLabel,
+      async () => {
+        ;({ resources } = await p.invoke(() => client.describeAcls(filter)))
+        return resources.length === 0
+      },
+      () => resources
     )
   }
 
@@ -176,6 +224,7 @@ class AdminLedgerScenario {
    * @param {Function} [check.item] item selector shared by positive and denied controls
    * @param {Function} [check.positiveItem] item selector for a call-level denial
    * @param {Function} [check.allowed] optional successful-result predicate for filtered reads
+   * @param {string} [check.waitLabel] phase to record with the last result or authorization failure
    * @returns {Promise<any>} first authorized result satisfying the optional read predicate
    * @throws {Error} another call failure, abort or the probe's work deadline
    */
@@ -183,25 +232,32 @@ class AdminLedgerScenario {
     const p = this.probe
     const authorizationCodes = [29, 30, 31, 53]
     let result
-    await p.poll(async () => {
-      try {
-        result = await p.invoke(check.call)
-      } catch (error) {
-        if (authorizationCodes.includes(error.code)) return false
-        if (error.name === 'KafkaJSGroupCoordinatorNotFound') return false
-        throw error
-      }
-      const selected = (check.item || check.positiveItem)?.(result)
-      const items = [selected, ...(Array.isArray(result) ? result : [])]
-      return (
-        items.every(
-          (item) =>
-            !authorizationCodes.includes(item?.errorCode) &&
-            !(item?.errorCode === -1 && item.error?.name === 'KafkaJSGroupCoordinatorNotFound')
-        ) &&
-        (!check.allowed || check.allowed(result))
-      )
-    })
+    let observation = { responsePresent: false }
+    await this.observedPoll(
+      check.waitLabel,
+      async () => {
+        try {
+          result = await p.invoke(check.call)
+          observation = { responsePresent: true, result }
+        } catch (error) {
+          observation = { error: { name: error.name, message: error.message, code: error.code } }
+          if (authorizationCodes.includes(error.code)) return false
+          if (error.name === 'KafkaJSGroupCoordinatorNotFound') return false
+          throw error
+        }
+        const selected = (check.item || check.positiveItem)?.(result)
+        const items = [selected, ...(Array.isArray(result) ? result : [])]
+        return (
+          items.every(
+            (item) =>
+              !authorizationCodes.includes(item?.errorCode) &&
+              !(item?.errorCode === -1 && item.error?.name === 'KafkaJSGroupCoordinatorNotFound')
+          ) &&
+          (!check.allowed || check.allowed(result))
+        )
+      },
+      () => observation
+    )
     return result
   }
 
@@ -843,6 +899,9 @@ class AdminLedgerScenario {
 
   /**
    * Restores a fenced node, validates features and removes a real metrics subscription.
+   * Only restart readbacks tolerate connection failures, under the existing work deadline.
+   * The restarted node must answer ApiVersions before cluster restoration is accepted.
+   * @see https://raw.githubusercontent.com/apache/kafka/4.3/core/src/main/scala/kafka/server/BrokerServer.scala
    * @returns {Promise<void>}
    * @throws {Error} broker health, election, feature or resource mismatch
    */
@@ -863,20 +922,55 @@ class AdminLedgerScenario {
     const thirdId = Number((await p.host('kafka3', ['printenv', 'KAFKA_NODE_ID'])).trim())
     const third = before.brokers.find(({ nodeId }) => nodeId === thirdId)
     expect(third).toBeDefined()
+    /**
+     * Treats a restart's transport failure as an incomplete observation, retaining its identity.
+     * @param {string} operationId readback API and phase
+     * @param {() => Promise<object>} read one readback without broker mutations
+     * @returns {Promise<object|null>} response, or null while a connection is unavailable
+     * @throws {Error} any failure whose cause is not a connection failure
+     */
+    const restartRead = async (operationId, read) => {
+      try {
+        return await p.invoke(read)
+      } catch (error) {
+        let cause = error
+        while (cause.cause) cause = cause.cause
+        if (!(cause instanceof KafkaJSConnectionError)) throw error
+        p.record('broker restart read failure', {
+          operationId,
+          destination: cause.broker || 'unknown',
+          errorCode: cause.code || cause.name,
+        })
+        return null
+      }
+    }
     await p.control('stop', 'kafka3')
     let fencedBroker
     await p.poll(async () => {
-      const observation = await p.invoke(() =>
+      const observation = await restartRead('DescribeCluster while fenced', () =>
         admin.describeCluster({ includeFencedBrokers: true })
       )
+      if (!observation) return false
       fencedBroker = observation.brokers.find(({ nodeId }) => nodeId === third.nodeId)
       return fencedBroker?.fenced === true
     })
     expect(fencedBroker.fenced).toBe(true)
     await p.control('start', 'kafka3')
+    // An unfenced metadata entry can precede the restarted node's client listener readiness.
+    await p.poll(async () =>
+      Boolean(
+        await restartRead('ApiVersions after restart', () => this.raw(third.host, third.port))
+      )
+    )
     await p.poll(async () => {
-      const all = await p.invoke(() => admin.describeCluster({ includeFencedBrokers: true }))
-      const metadata = await p.invoke(() => admin.fetchTopicMetadata({ topics: [this.topic] }))
+      const all = await restartRead('DescribeCluster after restart', () =>
+        admin.describeCluster({ includeFencedBrokers: true })
+      )
+      if (!all) return false
+      const metadata = await restartRead('Metadata after restart', () =>
+        admin.fetchTopicMetadata({ topics: [this.topic] })
+      )
+      if (!metadata) return false
       return (
         all.brokers.length === 3 &&
         all.brokers.every(({ fenced }) => !fenced) &&
@@ -992,6 +1086,7 @@ class AdminLedgerScenario {
 
   /**
    * Exercises legacy returns, validation-only state, reassignment and canonical ID deletion.
+   * Restores reassignment rate overrides and waits for every broker's exact baseline readback.
    * @returns {Promise<void>}
    * @throws {Error} changed legacy contract or failed readback
    */
@@ -1139,24 +1234,39 @@ class AdminLedgerScenario {
       admin.describeConfigs({ resources: throttleResources })
     )
     p.items(originalThrottles.resources)
-    p.effects.add('restore reassignment rate overrides', async () => {
+    /**
+     * Restores both throttle keys, including those absent from the original broker config.
+     * Polls every broker's readback under the cleanup signal and inclusive scenario deadline.
+     * @param {AbortSignal} signal cleanup cancellation
+     * @returns {Promise<void>} after every broker reports its exact original configuration
+     * @throws {Error} mutation or read failure, cancellation, deadline or mismatched readback
+     */
+    const restoreThrottles = async (signal) => {
       const restored = await admin.incrementalAlterConfigs({
         resources: originalThrottles.resources.map((row) => ({
           type: row.resourceType,
           name: row.resourceName,
-          configEntries: row.configEntries.map((entry) => ({
-            name: entry.configName,
-            operation:
-              entry.configSource === 2 ? AlterConfigOpTypes.SET : AlterConfigOpTypes.DELETE,
-            value: entry.configSource === 2 ? entry.configValue : null,
-          })),
+          configEntries: throttleKeys.map((name) => {
+            const entry = row.configEntries.find(({ configName }) => configName === name)
+            return {
+              name,
+              operation:
+                entry?.configSource === 2 ? AlterConfigOpTypes.SET : AlterConfigOpTypes.DELETE,
+              value: entry?.configSource === 2 ? entry.configValue : null,
+            }
+          }),
         })),
       })
       p.items(restored.resources)
-      const readback = await admin.describeConfigs({ resources: throttleResources })
-      p.items(readback.resources)
+      let readback
+      await pollUntil(signal, p.remaining(), async () => {
+        readback = await admin.describeConfigs({ resources: throttleResources })
+        p.items(readback.resources)
+        return isDeepStrictEqual(readback.resources, originalThrottles.resources)
+      })
       expect(readback.resources).toEqual(originalThrottles.resources)
-    })
+    }
+    p.effects.add('restore reassignment rate overrides', restoreThrottles)
     p.effects.add('remove topic reassignment throttles', async () => {
       const removed = await admin.incrementalAlterConfigs({
         resources: [
@@ -1409,7 +1519,16 @@ class AdminLedgerScenario {
    * Topic DESCRIBE dependencies settle on every broker because the reused client retains metadata
    * targets even when the next operation authorizes a different resource or operation.
    * ListTransactions proves successful filtering; mutations run once after a proven safe probe.
+   * ID deletion denies cluster DELETE throughout, preventing ControllerApis from bypassing topic
+   * ACLs under allow.everyone.if.no.acl.found. Cluster DESCRIBE is granted explicitly because any
+   * resource ACL disables that default for other operations. The brokers' masks and controller's
+   * validate-only ALTER denial observe that restriction before either deletion phase. DELETE is
+   * absent from the supported cluster mask, so its unset bit alone cannot prove propagation.
+   * Deletion probes and cleanup waits preserve their last observation in evidence and diagnostics.
    * This also runs cold in the ACL profile.
+   * @see https://raw.githubusercontent.com/apache/kafka/4.3/metadata/src/main/java/org/apache/kafka/metadata/authorizer/StandardAuthorizerData.java
+   * @see https://raw.githubusercontent.com/apache/kafka/4.3/server/src/main/java/org/apache/kafka/security/authorizer/AclEntry.java
+   * @see https://raw.githubusercontent.com/apache/kafka/4.3/core/src/main/scala/kafka/server/ControllerApis.scala
    * @returns {Promise<void>}
    * @throws {Error} missing positive control, wrong failure level or cleanup failure
    */
@@ -1548,40 +1667,67 @@ class AdminLedgerScenario {
     /**
      * Waits for the duplicate-reference DeleteTopics probe's exact ALLOW or DENY response.
      * Both phases use the recreated topic's current ID and prove it survives via metadata by ID.
+     * Each wait records its phase, requested identity and last response, including error messages.
      * @param {boolean} denied whether both references must report authorization failure
      * @returns {Promise<void>} after the controller observation and topic existence readback
      * @throws {Error} unexpected code, response identity, transport failure or work deadline
      */
     const deletionSettled = async (denied) => {
+      const phase = `ID deletion ${denied ? 'DENY' : 'ALLOW'}`
       const expected = denied
         ? [
-            { topic: deletionTopic, topicId: deletionId, errorCode: 29 },
-            { topic: deletionTopic, topicId: null, errorCode: 29 },
+            {
+              topic: deletionTopic,
+              topicId: deletionId,
+              errorCode: 29,
+              errorMessage: 'Topic authorization failed.',
+            },
+            {
+              topic: deletionTopic,
+              topicId: null,
+              errorCode: 29,
+              errorMessage: 'Topic authorization failed.',
+            },
           ]
-        : [{ topic: deletionTopic, topicId: deletionId, errorCode: 42 }]
-      let rows
-      await p.poll(async () => {
-        rows = await p.invoke(() => this.deletionProbe(maskRaw, deletionTopic, deletionId))
-        for (const { errorCode } of rows) expect([29, 42]).toContain(errorCode)
-        return (
-          rows.length === expected.length &&
-          expected.every((row) => rows.some((result) => isDeepStrictEqual(result, row)))
-        )
-      })
+        : [
+            {
+              topic: deletionTopic,
+              topicId: deletionId,
+              errorCode: 42,
+              errorMessage: 'The provided topic name maps to an ID that was already supplied.',
+            },
+          ]
+      let rows = null
+      await this.observedPoll(
+        `${phase} controller probe`,
+        async () => {
+          rows = await p.invoke(() => this.deletionProbe(maskRaw, deletionTopic, deletionId))
+          for (const { errorCode } of rows) expect([29, 42]).toContain(errorCode)
+          return (
+            rows.length === expected.length &&
+            expected.every((row) => rows.some((result) => isDeepStrictEqual(result, row)))
+          )
+        },
+        () => ({ topic: deletionTopic, topicId: deletionId, expected, rows })
+      )
       expect(rows).toHaveLength(expected.length)
       expect(rows).toEqual(expect.arrayContaining(expected))
-      let topicMetadata
-      await p.poll(async () => {
-        ;({ topicMetadata } = await p.invoke(() =>
-          this.seed.metadata([{ topicId: deletionId }], {
-            allowAutoTopicCreation: false,
-            lenient: true,
-          })
-        ))
-        expect(topicMetadata).toHaveLength(1)
-        expect([0, 100]).toContain(topicMetadata[0].topicErrorCode)
-        return topicMetadata[0].topicErrorCode === 0
-      })
+      let topicMetadata = null
+      await this.observedPoll(
+        `${phase} survival by ID`,
+        async () => {
+          ;({ topicMetadata } = await p.invoke(() =>
+            this.seed.metadata([{ topicId: deletionId }], {
+              allowAutoTopicCreation: false,
+              lenient: true,
+            })
+          ))
+          expect(topicMetadata).toHaveLength(1)
+          expect([0, 100]).toContain(topicMetadata[0].topicErrorCode)
+          return topicMetadata[0].topicErrorCode === 0
+        },
+        () => ({ topic: deletionTopic, topicId: deletionId, topicMetadata })
+      )
       expect(topicMetadata).toMatchObject([
         { topic: deletionTopic, topicId: deletionId, topicErrorCode: 0 },
       ])
@@ -1825,6 +1971,7 @@ class AdminLedgerScenario {
       },
       {
         name: 'ID deletion',
+        waitLabel: 'ID deletion positive public call',
         mutating: true,
         allowedProbe: () => deletionSettled(false),
         deniedProbe: () => deletionSettled(true),
@@ -1883,7 +2030,11 @@ class AdminLedgerScenario {
       })
       const dependencies = []
       if (check.name === 'ID deletion')
-        dependencies.push({ resourceType: 2, resourceName: deletionTopic, operation: 8 })
+        dependencies.push(
+          { resourceType: 2, resourceName: deletionTopic, operation: 8 },
+          { resourceType: 4, resourceName: 'kafka-cluster', operation: 8 },
+          { resourceType: 4, resourceName: 'kafka-cluster', operation: 6, permissionType: 2 }
+        )
       if (['offset deletion'].includes(check.name))
         dependencies.push({ resourceType: 2, resourceName: topic, operation: 3 })
       if (
@@ -1915,6 +2066,10 @@ class AdminLedgerScenario {
         if (dependency.resourceType === 2 && dependency.operation === 8) {
           for (const broker of permissionSources) {
             const metadata = await this.permissionAllowed({
+              waitLabel:
+                check.name === 'ID deletion'
+                  ? `ID deletion DESCRIBE ${dependency.resourceName} at ${broker.connectionPool.host}:${broker.connectionPool.port}`
+                  : undefined,
               call: () => broker.metadata([dependency.resourceName]),
             })
             expect(metadata.topicMetadata).toMatchObject([
@@ -1922,6 +2077,14 @@ class AdminLedgerScenario {
             ])
           }
         }
+      }
+      if (check.name === 'ID deletion') {
+        await this.permissionMaskSettled(
+          permissionSources,
+          { resourceType: 4, operation: 7 },
+          false
+        )
+        await controllerAlterDenied()
       }
       expect(await p.invoke(() => root.createAcls({ acl: [acl] }))).toBe(true)
       const positive = await this.permissionAllowed(check)
@@ -1934,7 +2097,15 @@ class AdminLedgerScenario {
           expect.objectContaining({ transactionalId: txId })
         )
       if (check.destructive) {
-        await p.poll(async () => !(await p.invoke(() => root.listTopics())).includes(deletionTopic))
+        let topics = null
+        await this.observedPoll(
+          'ID deletion positive disappearance',
+          async () => {
+            topics = await p.invoke(() => root.listTopics())
+            return !topics.includes(deletionTopic)
+          },
+          () => ({ topic: deletionTopic, topicId: deletionId, topics })
+        )
         expect(
           await p.invoke(() =>
             root.createTopics({
@@ -2009,17 +2180,34 @@ class AdminLedgerScenario {
         }
       }
       if (!check.filtered) observedCodes.push(check.code)
-      await this.removeAcls(root, { ...acl, permissionType: 1 }, [
-        acl,
-        { ...acl, permissionType: 2 },
-      ])
-      for (const dependency of dependencyAcls) await this.removeAcls(root, dependency, [dependency])
+      await this.removeAcls(
+        root,
+        { ...acl, permissionType: 1 },
+        [acl, { ...acl, permissionType: 2 }],
+        check.name === 'ID deletion' ? 'ID deletion DELETE ACL removal' : undefined
+      )
+      for (const dependency of dependencyAcls)
+        await this.removeAcls(
+          root,
+          dependency,
+          [dependency],
+          check.name === 'ID deletion'
+            ? `ID deletion dependency ACL removal for ${dependency.resourceName} operation ${dependency.operation}`
+            : undefined
+        )
       p.record(`permission ${check.name}`, {
         operationId: check.name,
         ...(check.filtered
           ? { outcomeId: 'success with transaction filtered', transactionAbsent: true }
           : { authorizationCode: check.code }),
         dependencyCount: dependencyAcls.length,
+        ...(check.name === 'ID deletion'
+          ? {
+              clusterAclIds: dependencyAcls
+                .filter(({ resourceType }) => resourceType === 4)
+                .map((entry) => JSON.stringify(aclIdentity(entry))),
+            }
+          : {}),
         positivePresent: true,
       })
     }

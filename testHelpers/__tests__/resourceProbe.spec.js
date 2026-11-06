@@ -148,15 +148,18 @@ describe('createResourceProbe', () => {
       expect(() => createResourceProbe({ heap: true, gc: null })).toThrow('--expose-gc')
     })
 
+    /**
+     * Keeps distinct JS objects observable across collection by reading every value after sampling.
+     * @returns {Promise<void>}
+     */
     test('sees memory that is retained and that is released, after a real collection', async () => {
       const probe = createResourceProbe({ heap: true, gc: realGc(), pause: async () => {} })
       const { heapUsed: before } = await probe.snapshot()
 
-      // A packed array of doubles costs 8 bytes per element on every V8 version (16 MB here);
-      // small objects vary with the engine's object layout and measured under 10 MB on Node 22.
-      let retained = new Array(2_000_000).fill(0.5)
+      let retained = Array.from({ length: 2_000_000 }, (_, index) => ({ index }))
       const { heapUsed: during } = await probe.snapshot()
       expect(retained).toHaveLength(2_000_000)
+      expect(retained.reduce((sum, entry) => sum + entry.index, 0)).toBe(1_999_999_000_000)
       retained = null
       const { heapUsed: after } = await probe.snapshot()
 
