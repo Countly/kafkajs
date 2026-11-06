@@ -272,6 +272,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - Route `ShareFetch` and `ShareAcknowledge` over a connection pool's data socket, each API counted by its own socket's generation, and add the seven share-group `Broker` methods. Add `KafkaJSShareGroupsNotSupportedError`, a `KafkaJSServerDoesNotSupportApiKey` subclass whose `reason` (`api-not-advertised`, `api-version-range`, `feature-disabled` or `refused-by-broker`) and `shareVersion` say why a cluster cannot run share groups. A capability check judges a broker by its advertised ranges and its finalized `share.version` (level 1 or above, including level 2 on Kafka 4.4). No public share API uses them yet.
 
+- Add the share-group membership: one generated member ID per run, heartbeats that send only changed fields, topic-ID assignments applied at once with unknown topic names resolved under a guarded retry, and the existing heartbeat manager reused for scheduling. Coordinator errors keep the membership, fenced members rejoin with the same ID, and `GROUP_ID_NOT_FOUND` (69) ends a membership as non-retriable unless it answers that member's own leave. The consumer-protocol heartbeat backoff moved to its own module without changing. No public share API uses the membership yet.
+
 #### Fixes
 
 - Unimplemented request slots throw `KafkaJSNotImplemented` with a diagnostic message instead of a `TypeError`.

@@ -17,6 +17,8 @@ The share-group codec tests compare requests and responses with independently ge
 
 Share broker tests use in-process sockets to verify request routing, connection generations, pre-write guards and capability refusals. The ShareGroupHeartbeat v1, ShareFetch v2 and ShareAcknowledge v2 wire pairs are compared in both directions with the independent Java vectors, and the capability check is judged against the committed broker captures of every recorded line. The broker-free `shareConnectionPool` suite is separate from the broker integration suite; admin request frames and public connection refusal tests have separate acceptance cases.
 
+Share membership tests use scripted sockets for heartbeat fields, membership errors, assignments and guarded topic-ID discovery. Fake-clock scheduling tests reuse HeartbeatManager and the shared heartbeat backoff, and track the oldest active handler call across nodes. A GROUP_ID_NOT_FOUND answer ends a current membership but completes a leave, and a late answer from a retired membership is discarded. Ordinary consumer backoff cases stay unchanged; public share shutdown, restart and parallel-handler integration have separate acceptance cases.
+
 ## Integration tests
 
 Most of the test suite talks to a real Kafka cluster. `npm test` runs `npm run lint`, `npm run compat:check` and `npm run protocol:check`, boots the cluster, runs everything, and tears the cluster down again — it's a convenient local shortcut, but it is not what CI runs.
