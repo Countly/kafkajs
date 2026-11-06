@@ -8,7 +8,12 @@ const {
   pollSharePosition,
 } = require('../../../../testHelpers/shareLiveDiagnostics')
 const { EventEmitter } = require('events')
-const { Kafka, KafkaJSNonRetriableError, logLevel } = require('../../../../index')
+const {
+  Kafka,
+  KafkaJSNonRetriableError,
+  KafkaJSShareAcknowledgementError,
+  logLevel,
+} = require('../../../../index')
 const CONFIG_RESOURCE_TYPES = require('../../../protocol/configResourceTypes')
 const CONFIG_SOURCE = require('../../../protocol/configSource')
 const ALTER_CONFIG_OP_TYPES = require('../../../protocol/alterConfigOpTypes')
@@ -978,6 +983,35 @@ class ShutdownCase {
   }
 
   /**
+   * Checks each original held offset once, before any range projection can hide duplicates.
+   * @param {ShareMember} member Holder of the original ten-record acquisition.
+   * @returns {boolean} Whether four Accepts succeeded and six undecided records lost authority.
+   */
+  forcedOutcomesMatch(member) {
+    const outcomes = Array.from({ length: 10 }, () => [])
+    for (const event of member.acknowledged) {
+      const { topic, partition, firstOffset, lastOffset } = event
+      if (topic !== this.topic || partition !== 0) return false
+      const first = BigInt(firstOffset)
+      const last = BigInt(lastOffset)
+      if (first < 0n || last > 9n || first > last) return false
+      for (let offset = first; offset <= last; offset++) outcomes[Number(offset)].push(event)
+    }
+    return outcomes.every((events, offset) => {
+      if (events.length !== 1) return false
+      const { type, error } = events[0]
+      return offset < 4
+        ? type === 'accept' && error === null
+        : type === 'release' &&
+            error instanceof KafkaJSShareAcknowledgementError &&
+            error.reason === 'membership-lost' &&
+            error.retriable === false &&
+            error.topic === this.topic &&
+            error.partition === 0
+    })
+  }
+
+  /**
    * Observes the accepted prefix and released suffix while B continues fetching.
    * @param {AbortSignal} scope Case scope.
    * @param {string} title Case title.
@@ -1033,7 +1067,8 @@ class ShutdownCase {
         /** @param {unknown} value Broker offset or lag. @returns {boolean} Whether it is a canonical decimal string. */
         const canonical = (value) => typeof value === 'string' && /^(0|[1-9][0-9]*)$/.test(value)
         return (
-          this.decisionsSucceeded(a, settledDecisions(4, 10)) &&
+          this.forcedOutcomesMatch(a) &&
+          this.decisionsSucceeded(a, settledDecisions(4, 4)) &&
           left.length === 1 &&
           right.length === 1 &&
           ['startOffset', 'lag', 'errorCode', 'leaderEpoch'].every(
@@ -1074,7 +1109,14 @@ class ShutdownCase {
     expect(this.logEnd).toBe(String(end))
     const [a, b] = this.members
     const prefix = this.name === 'zero' ? 0 : 4
-    if (prefix) expect(this.decisionsSucceeded(a, settledDecisions(prefix, end))).toBe(true)
+    if (this.name === 'forced') {
+      expect(this.forcedOutcomesMatch(a)).toBe(true)
+      expect(this.decisionsSucceeded(a, settledDecisions(4, 4))).toBe(true)
+    } else if (this.name === 'stop') {
+      expect(this.decisionsSucceeded(a, settledDecisions(4, 50))).toBe(true)
+    } else {
+      expect(a.acknowledged.filter(({ error }) => error === null)).toEqual([])
+    }
     const suffix = Object.fromEntries(
       Array.from({ length: end - prefix }, (_, n) => [String(n + prefix), 'accept'])
     )
@@ -1303,7 +1345,8 @@ class ShutdownCase {
 
   /**
    * Forced disconnect: after four accepted decisions the holder is shut down with a 5 s bound and
-   * the product must send one captured final (four accepts, six releases) and then leave.
+   * the product must send one captured final with four Accepts and then leave. The six undecided
+   * records settle locally as release/membership-lost; B must independently acquire them again.
    * @param {AbortSignal} scope
    * @returns {Promise<void>}
    */
@@ -1336,6 +1379,7 @@ class ShutdownCase {
     b.tap.release()
 
     const aFrames = a.tap.frames.length
+    const originalMemberId = a.memberId
     const calledAt = performance.now()
     if (calledAt - prewrite > 1000) {
       throw new Error(`The fixture took ${calledAt - prewrite} ms from acquisition to disconnect`)
@@ -1352,29 +1396,65 @@ class ShutdownCase {
     expect(final).toBeDefined()
     expect(extra).toEqual([])
     expect(final.decodeError).toBeUndefined()
-    expect(typesByOffset(final.fields)).toEqual(wireDecisions(4, 10))
+    expect(final.fields).toMatchObject({
+      groupId: this.group,
+      memberId: originalMemberId,
+      isRenewAck: false,
+    })
+    expect(final.fields.topics).toHaveLength(1)
+    expect(final.fields.topics[0].topicId).toBe(this.topicId)
+    expect(final.fields.topics[0].partitions).toHaveLength(1)
+    expect(final.fields.topics[0].partitions[0].partitionIndex).toBe(0)
+    expect(typesByOffset(final.fields)).toEqual(wireDecisions(4, 4))
     const leave = a.tap
       .shareFrames(aFrames)
       .find(({ apiKey, fields }) => apiKey === API.heartbeat && fields?.memberEpoch === -1)
     expect(leave).toBeDefined()
     expect(leave.at).toBeGreaterThanOrEqual(final.at)
+    expect(final.at - calledAt).toBeGreaterThanOrEqual(DISCONNECT_MS - 1000)
     expect(final.at - calledAt).toBeLessThanOrEqual(DISCONNECT_MS)
     expect(settledAt - calledAt).toBeLessThanOrEqual(DISCONNECT_MS + 2000)
 
-    const settled = a.acknowledged.filter(({ type }) => type === 'accept' || type === 'release')
-    expect(settled.every(({ error }) => error === null)).toBe(true)
-    expect(settledByOffset(settled)).toEqual(settledDecisions(4, 10))
-    const resultAt = Math.max(...settled.map(({ at }) => at))
+    await a.tap.acknowledgements.join()
+    const finalFacts = a.tap.acknowledgements.frames.filter(
+      ({ apiKey, correlationId, request }) =>
+        apiKey === API.acknowledge &&
+        correlationId === final.correlationId &&
+        request.memberId === originalMemberId &&
+        request.shareSessionEpoch === -1
+    )
+    expect(finalFacts).toHaveLength(1)
+    const [finalFact] = finalFacts
+    expect(finalFact.decodeError).toBeUndefined()
+    expect(finalFact.response?.errorCode).toBe(0)
+    expect(finalFact.response.topics).toEqual([
+      {
+        topicId: this.topicId,
+        partitions: [expect.objectContaining({ partitionIndex: 0, errorCode: 0 })],
+      },
+    ])
+    expect(this.forcedOutcomesMatch(a)).toBe(true)
+    expect(this.decisionsSucceeded(a, settledDecisions(4, 4))).toBe(true)
+    const accepts = a.acknowledged.filter(({ type }) => type === 'accept')
+    expect(settledByOffset(accepts)).toEqual(settledDecisions(4, 4))
+    const resultAt = Math.max(finalFact.response.at, ...accepts.map(({ at }) => at))
+    const suffixLossAt = Math.max(
+      ...a.acknowledged.filter(({ type }) => type === 'release').map(({ at }) => at)
+    )
+    expect(resultAt - calledAt - 4000).toBeLessThanOrEqual(2000)
     expect(resultAt - prewrite).toBeLessThanOrEqual(FINAL_ALLOWANCE_MS)
     this.note(title, 'frame', {
       prewriteToCall: calledAt - prewrite,
       callToFinalWrite: final.at - calledAt,
       finalWriteToResult: resultAt - final.at,
       callToSettled: settledAt - calledAt,
-      finalDecisions: wireDecisions(4, 10),
+      finalDecisions: wireDecisions(4, 4),
+      resultAt,
+      finalResponseAt: finalFact.response.at,
+      suffixLossAt,
       leaveAfterFinal: leave.at - final.at,
     })
-    this.note(title, 'acknowledgement', { events: settled })
+    this.note(title, 'acknowledgement', { events: a.acknowledged })
 
     await this.prefixSettled(scope, title, a, b)
     await pollUntil(scope, RELEASE_ALLOWANCE_MS + 2000, () => b.delivered.length >= 6, {
