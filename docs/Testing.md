@@ -17,6 +17,8 @@ The share-group codec tests compare requests and responses with independently ge
 
 Share broker tests use in-process sockets to verify request routing, connection generations, pre-write guards and capability refusals. The ShareGroupHeartbeat v1, ShareFetch v2 and ShareAcknowledge v2 wire pairs are compared in both directions with the independent Java vectors, and the capability check is judged against the committed broker captures of every recorded line. The broker-free `shareConnectionPool` suite is separate from the broker integration suite; admin request frames and public connection refusal tests have separate acceptance cases.
 
+Share record-walk tests check exact acquired ranges, control-record gaps and compact release of the undecoded remainder after every decode halt. Ledger and lock tests check compact acknowledgement encoding, local wire validation, single-use outcomes and pre-write lock deadlines. Fixed property seeds cover boundary offsets and overlapping, adjacent and gapped ranges. The internal walk benchmark checks independent identities and work-skipping controls; timing and memory acceptance require a quiet host. Public share-session, renewal and range-event behavior has separate integration acceptance.
+
 ## Integration tests
 
 Most of the test suite talks to a real Kafka cluster. `npm test` runs `npm run lint`, `npm run compat:check` and `npm run protocol:check`, boots the cluster, runs everything, and tears the cluster down again — it's a convenient local shortcut, but it is not what CI runs.

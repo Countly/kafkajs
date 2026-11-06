@@ -234,3 +234,24 @@ test('share capability errors keep the unsupported API class across entry points
   assert.equal(error.apiName, 'ShareFetch')
   assert.equal(error.reason, 'api-version-range')
 })
+
+test('the compact acknowledgement error has one constructor in both packed entry points', async () => {
+  const cjs = require(PKG),
+    esm = await import(PKG)
+  assert.equal(typeof cjs.KafkaJSShareAcknowledgementError, 'function')
+  assert.equal(esm.KafkaJSShareAcknowledgementError, cjs.KafkaJSShareAcknowledgementError)
+  const cause = new Error('lost acknowledgement answer')
+  const error = new esm.KafkaJSShareAcknowledgementError('not confirmed', {
+    reason: 'session-lost',
+    topic: 'topic',
+    partition: 0,
+    ranges: [{ firstOffset: '9007199254740993', lastOffset: '9223372036854775807' }],
+    cause,
+  })
+  assert(error instanceof cjs.KafkaJSError)
+  assert.equal(error.retriable, false)
+  assert.equal(error.cause, cause)
+  assert.deepEqual(error.ranges, [
+    { firstOffset: '9007199254740993', lastOffset: '9223372036854775807' },
+  ])
+})

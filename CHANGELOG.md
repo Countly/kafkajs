@@ -272,6 +272,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - Route `ShareFetch` and `ShareAcknowledge` over a connection pool's data socket, each API counted by its own socket's generation, and add the seven share-group `Broker` methods. Add `KafkaJSShareGroupsNotSupportedError`, a `KafkaJSServerDoesNotSupportApiKey` subclass whose `reason` (`api-not-advertised`, `api-version-range`, `feature-disabled` or `refused-by-broker`) and `shareVersion` say why a cluster cannot run share groups. A capability check judges a broker by its advertised ranges and its finalized `share.version` (level 1 or above, including level 2 on Kafka 4.4). No public share API uses them yet.
 
+- Add exact record-range walking and compact acknowledgement outcomes with `KafkaJSShareAcknowledgementError`. Acquired records are classified through exact int64 offsets without expanding ranges; control and missing offsets become gaps, and the undecoded remainder after a decode failure is released rather than rejected. Per-partition acknowledgement ledgers keep automatic ranges compact, hold each decision until its handler completes, check a request against the broker's batch rules before a frame is built, and settle every outcome once. Lock deadlines count from the time the fetch was written; no timer is added. Only the error class is exported; the walk and ledger are internal and no public API uses them yet. An internal-API benchmark compares the walk with a per-offset expansion control.
+
 #### Fixes
 
 - Unimplemented request slots throw `KafkaJSNotImplemented` with a diagnostic message instead of a `TypeError`.
