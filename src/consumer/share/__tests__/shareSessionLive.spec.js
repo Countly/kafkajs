@@ -1,3 +1,11 @@
+const fetchAcknowledgementResponse = require('../../../protocol/requests/shareFetch/v2/response')
+const acknowledgeResponse = require('../../../protocol/requests/shareAcknowledge/v2/response')
+const {
+  acknowledgementResults,
+  acknowledgementRequests,
+  awaitTerminalSharePosition,
+  assertQuietTerminalGroup,
+} = require('../../../../testHelpers/shareLiveDiagnostics')
 const path = require('path')
 const { spawn } = require('child_process')
 const { isDeepStrictEqual } = require('util')
@@ -5,7 +13,7 @@ const { Kafka, logLevel } = require('../../../../index')
 const { createChaosSocketFactory } = require('../../../../testHelpers/chaosSocket')
 const { readRequestHeader } = require('../../../../testHelpers/fakeSocket')
 const { waitForFullIsr } = require('../../../../testHelpers/leaderElection')
-const { readLog } = require('../../../../testHelpers/rawLog')
+const { readLog, endOffsets } = require('../../../../testHelpers/rawLog')
 const shareFetchWire = require('../../../../testHelpers/wire/shareFetchV2')
 const shareAcknowledgeWire = require('../../../../testHelpers/wire/shareAcknowledgeV2')
 const {
@@ -13,7 +21,6 @@ const {
   shareTopicName,
   setShareGroupConfigs,
   shareRecordIdentity,
-  verifierMember,
   assertShareCleanup,
 } = require('../../../../testHelpers/shareFixtures')
 const {
@@ -85,6 +92,151 @@ const LEDGER_METHODS = [
   'invalidate',
 ]
 
+/** Records original acknowledgement requests with their same-socket broker responses. */
+class AcknowledgementTrace {
+  /** @param {Function} [record] Receives completed request/response facts. */
+  constructor(record = () => {}) {
+    this.frames = []
+    this.sockets = 0
+    this.record = record
+  }
+
+  /**
+   * Observes bytes without changing write results, callbacks or ordering.
+   * @param {object} socket Original socket.
+   * @param {string} label Owning member.
+   * @returns {object} The same socket.
+   */
+  wrap(socket, label) {
+    const pending = new Map()
+    const ordinal = ++this.sockets
+    const buffers = { request: Buffer.alloc(0), response: Buffer.alloc(0) }
+    /** @param {string} kind Stream direction. @param {Buffer} chunk Original bytes. @returns {Buffer[]} Complete frames. */
+    const split = (kind, chunk) => {
+      let bytes = Buffer.concat([buffers[kind], chunk])
+      const frames = []
+      while (bytes.length >= 4 && bytes.length >= bytes.readInt32BE(0) + 4) {
+        const size = bytes.readInt32BE(0) + 4
+        if (size < 4) throw new Error('Invalid Kafka diagnostic frame size')
+        frames.push(Buffer.from(bytes.subarray(0, size)))
+        bytes = bytes.subarray(size)
+      }
+      buffers[kind] = bytes
+      return frames
+    }
+    const write = socket.write.bind(socket)
+    socket.write = (chunk, ...rest) => {
+      for (const bytes of split('request', Buffer.from(chunk))) {
+        const header = readRequestHeader(bytes)
+        if (![78, 79].includes(header.apiKey)) continue
+        const fact = {
+          ...header,
+          label,
+          socket: ordinal,
+          bytes,
+          headerBytes: header.byteLength,
+          at: performance.now(),
+        }
+        const [request] = acknowledgementRequests([fact])
+        if (!request) continue
+        fact.request = request
+        this.frames.push(fact)
+        pending.set(header.correlationId, fact)
+      }
+      return write(chunk, ...rest)
+    }
+    socket.on('data', (chunk) => {
+      for (const bytes of split('response', chunk)) {
+        const fact = pending.get(bytes.readInt32BE(4))
+        if (!fact) continue
+        pending.delete(fact.correlationId)
+        const decoder = fact.apiKey === 78 ? fetchAcknowledgementResponse : acknowledgeResponse
+        fact.decoding = Promise.resolve()
+          .then(() => {
+            if (bytes[8] !== 0) throw new Error('Unexpected response header tags')
+            return decoder.decode(bytes.subarray(9))
+          })
+          .then(({ errorCode, responses }) => {
+            fact.response = {
+              errorCode,
+              at: performance.now(),
+              topics: responses.map(({ topicId, partitions }) => ({
+                topicId,
+                partitions: partitions.map(
+                  ({ partitionIndex, errorCode, acknowledgeErrorCode, currentLeader }) => ({
+                    partitionIndex,
+                    errorCode,
+                    acknowledgeErrorCode,
+                    currentLeader,
+                  })
+                ),
+              })),
+            }
+          })
+          .then(() => this.record({ ...fact.request, at: fact.at, response: fact.response }))
+          .catch((error) => {
+            fact.decodeError = describeError(error)
+          })
+      }
+    })
+    return socket
+  }
+
+  /** @returns {Promise<void>} Joins every response decoder before its owning clients leave. */
+  async join() {
+    await Promise.all(this.frames.map(({ decoding }) => decoding))
+  }
+
+  /** @returns {object[]} Original requests and correlated partition outcomes, without byte buffers. */
+  snapshot() {
+    return this.frames.map(({ request, at, response, decodeError }) => ({
+      ...request,
+      at,
+      response: response ?? null,
+      decodeError,
+    }))
+  }
+
+  /**
+   * Returns only offsets whose original requested decision succeeded at group and partition level.
+   * @param {string} group Group id.
+   * @param {string} topicId Original topic UUID.
+   * @param {number} partition Partition index.
+   * @param {number} [type=1] Required wire acknowledgement type.
+   * @returns {Set<string>} Confirmed decimal offsets.
+   */
+  confirmed(group, topicId, partition, type = 1) {
+    const offsets = new Set()
+    for (const { request, response } of this.frames) {
+      if (request.groupId !== group || request.isRenewAck || response?.errorCode !== 0) continue
+      const replies = response.topics
+        .filter((topic) => topic.topicId === topicId)
+        .flatMap((topic) => topic.partitions)
+        .filter((row) => row.partitionIndex === partition)
+      if (replies.length !== 1) continue
+      const code = request.apiKey === 78 ? replies[0].acknowledgeErrorCode : replies[0].errorCode
+      if (code !== 0) continue
+      for (const topic of request.topics ?? []) {
+        if (topic.topicId !== topicId) continue
+        for (const row of topic.partitions) {
+          if (row.partitionIndex !== partition) continue
+          for (const { firstOffset, lastOffset, acknowledgeTypes } of row.acknowledgementBatches) {
+            for (let offset = BigInt(firstOffset); offset <= BigInt(lastOffset); offset++) {
+              if (
+                (acknowledgeTypes.length === 1
+                  ? acknowledgeTypes[0]
+                  : acknowledgeTypes[Number(offset - BigInt(firstOffset))]) === type
+              )
+                offsets.add(String(offset))
+            }
+          }
+        }
+      }
+    }
+    return offsets
+  }
+}
+
 /** Runs the blocking leader-election helpers away from this process's event loop. */
 const HELPER_SOURCE = `
 const helpers = require(process.env.SHARE_LIVE_ROOT + '/testHelpers/leaderElection')
@@ -97,12 +249,6 @@ helpers.waitForReassignmentToComplete(45000)
     process.exitCode = 1
   })
 `
-
-/**
- * @param {Error} error a failed admin call
- * @returns {boolean} whether it only says the group coordinator is loading or moving (14, 15, 16)
- */
-const moving = (error) => [14, 15, 16].includes(error?.code ?? error?.cause?.code)
 
 /**
  * @param {number} index
@@ -297,17 +443,19 @@ class SocketCounter {
   constructor() {
     /** @type {import('net').Socket[]} */
     this.sockets = []
+    this.acknowledgements = new AcknowledgementTrace()
   }
 
   /**
+   * @param {string} [label='client'] Owning member label.
    * @returns {Function} a socket factory that remembers every socket it creates
    */
-  factory() {
+  factory(label = 'client') {
     const create = defaultSocketFactory()
     return (options) => {
       const socket = create(options)
       this.sockets.push(socket)
-      return socket
+      return this.acknowledgements.wrap(socket, label)
     }
   }
 
@@ -692,8 +840,36 @@ class SessionCase {
       scenario: this.nonce,
       groups: this.groups,
       budgets: { caseMs: this.budget, stepMs: STEP_MS, deliveryMs: DELIVERY_MS },
+      wireVersions: wireVersionsOf(Object.values(this.members).flatMap(({ requests }) => requests)),
       ...fields,
     })
+  }
+
+  /** @returns {object} Per-member deliveries, completions and original acknowledgement requests. */
+  progress() {
+    return {
+      members: Object.values(this.members).map(
+        ({ label, groupId, entries, finished, acks, crashes, resets }) => ({
+          label,
+          groupId,
+          delivered: entries.length,
+          handled: finished,
+          acknowledgements: acknowledgementResults(acks),
+          crashes: crashes.map(({ error }) => describeError(error)),
+          resets,
+        })
+      ),
+      wireAcknowledgements: this.sockets.acknowledgements.snapshot(),
+      acknowledgementRequests: acknowledgementRequests(
+        this.tap.frames
+          .filter(({ kind }) => kind === 'request')
+          .map(({ frame, byteLength, ...fact }) => ({
+            ...fact,
+            bytes: frame,
+            headerBytes: byteLength,
+          }))
+      ),
+    }
   }
 
   /**
@@ -722,7 +898,17 @@ class SessionCase {
           })
           base = await this.sample(scope)
           this.row('resource-baseline', { resources: summarize(base) })
-          await this.stack.run(() => this[this.action](scope), { budgetMs: CLEANUP_MS })
+          await this.stack.run(
+            async () => {
+              try {
+                await this[this.action](scope)
+              } catch (error) {
+                this.row('work-failed', { error: describeError(error), ...this.progress() })
+                throw error
+              }
+            },
+            { budgetMs: CLEANUP_MS }
+          )
           after = await assertShareCleanup(
             this.admin,
             Object.values(this.groups),
@@ -737,7 +923,7 @@ class SessionCase {
       await this.settleProcess(scope, pre)
       this.complete(base, after)
     } catch (error) {
-      this.row('case-failed', { status: 'failed', error: describeError(error) })
+      this.row('case-failed', { status: 'failed', error: describeError(error), ...this.progress() })
       throw error
     }
   }
@@ -784,7 +970,7 @@ class SessionCase {
    * @returns {Kafka}
    */
   kafka(label, options = {}) {
-    const observed = this.tap.wrap(this.sockets.factory(), label)
+    const observed = this.tap.wrap(this.sockets.factory(label), label)
     const chaos = createChaosSocketFactory(observed, { seed: 932 })
     this.chaos.push(chaos)
     this.stack.add(`stop fault injection of ${label}`, () => {
@@ -940,44 +1126,56 @@ class SessionCase {
   }
 
   /**
-   * Waits until the group's share-partition start offset equals the log end and records the broker
-   * oracle row; a known lag must be 0.
-   * @param {AbortSignal} scope
-   * @param {string} group
-   * @returns {Promise<object>} the oracle row
+   * Checks successful Accept coverage for this group without combining independent groups.
+   * @param {string} group Group being observed.
+   * @returns {boolean} Whether the group's successful results cover all 300 identities.
+   */
+  acceptedGroup(group) {
+    const accepted = new Set()
+    for (const { groupId, acks } of Object.values(this.members)) {
+      if (groupId !== group) continue
+      for (const { topic, partition, type, error, firstOffset, lastOffset } of acks) {
+        if (topic !== this.topic || partition !== 0 || type !== 'accept' || error !== null) continue
+        for (const offset of offsetsOf([{ firstOffset, lastOffset }])) accepted.add(offset)
+      }
+    }
+    const wire = this.sockets.acknowledgements.confirmed(group, this.topicId, 0)
+    return this.expected.every(
+      (identity) => accepted.has(JSON.parse(identity)[2]) && wire.has(JSON.parse(identity)[2])
+    )
+  }
+
+  /**
+   * Polls successful settlement and terminal positions against the independent raw-log end.
+   * @param {AbortSignal} scope Case scope.
+   * @param {string} group Group being observed.
+   * @returns {Promise<object>} Terminal partition row.
    */
   async awaitStart(scope, group) {
-    let row
-    await pollUntil(
+    return bounded(
       scope,
       DELIVERY_MS,
-      async () => {
-        try {
-          const [named] = await this.admin.listShareGroupOffsets({
+      async (poll) => {
+        await pollUntil(poll, DELIVERY_MS, () => this.acceptedGroup(group), {
+          label: `${group} successful Accept coverage`,
+        })
+        const { rows } = await awaitTerminalSharePosition(
+          this.admin,
+          {
             groupId: group,
-            topics: [{ topic: this.topic, partitions: [0] }],
-          })
-          const [every] = await this.admin.listShareGroupOffsets({ groupId: group })
-          row = named.partitions[0]
-          expect(every.partitions[0].startOffset).toBe(row.startOffset)
-          return row.errorCode === 0 && row.startOffset === String(RECORDS)
-        } catch (error) {
-          if (moving(error)) return false
-          throw error
-        }
+            topic: this.topic,
+            partitions: [{ partition: 0, floor: '0', end: this.logEnd }],
+          },
+          {
+            signal: poll,
+            timeoutMs: DELIVERY_MS,
+            record: (fields) => this.row('broker-position', { ...fields, ...this.progress() }),
+          }
+        )
+        return rows[0]
       },
-      { delayMs: 250, label: `${group} reaching start offset ${RECORDS}` }
+      { label: `${group} terminal settlement` }
     )
-    expect(row.lag === null || row.lag === '0').toBe(true)
-    return {
-      groupId: group,
-      topic: this.topic,
-      partition: 0,
-      errorCode: row.errorCode,
-      startOffset: row.startOffset,
-      logEnd: String(RECORDS),
-      lag: row.lag,
-    }
   }
 
   /**
@@ -992,6 +1190,11 @@ class SessionCase {
     )
     const { endOffset, records } = log.get(0)
     expect(endOffset).toBe(String(RECORDS))
+    this.logEnd = endOffset
+    const { topics } = await bounded(scope, STEP_MS, () =>
+      this.admin.fetchTopicMetadata({ topics: [this.topic], useDescribeTopicPartitions: true })
+    )
+    this.topicId = topics.find(({ name }) => name === this.topic).topicId
     expect(records.filter(({ batchContext }) => batchContext.isControlBatch)).toEqual([])
     const actual = records.map(({ offset, key, value }) =>
       shareRecordIdentity({ topic: this.topic, partition: 0, offset, key, value })
@@ -1008,14 +1211,30 @@ class SessionCase {
    * @throws {Error} a delivery to a verifier
    */
   async verifyQuiet(scope, groups) {
-    for (const group of groups) {
-      const delivered = await verifierMember(group, this.topic, {
-        kafka: this.kafka('V'),
-        signal: scope,
-      })
-      expect(delivered).toEqual([])
+    for (const member of Object.values(this.members)) {
+      await bounded(scope, STEP_MS, () => member.client.disconnect({ timeout: 5000 }))
     }
-    this.row('cleanup', { verifier: 'quiet for 5000 ms', groups })
+    await this.sockets.acknowledgements.join()
+    this.quiet = []
+    this.broker = []
+    for (const group of groups) {
+      const verified = await assertQuietTerminalGroup({
+        kafka: this.kafka('V'),
+        admin: this.admin,
+        groupId: group,
+        topic: this.topic,
+        partitions: [{ partition: 0, floor: '0', end: this.logEnd }],
+        signal: scope,
+        timeoutMs: DELIVERY_MS,
+        record: (fields) => this.row('quiet-verifier', { groupId: group, ...fields }),
+      })
+      this.quiet.push({ groupId: group, ...verified })
+      this.broker.push(...verified.position.rows)
+    }
+    const ends = await bounded(scope, STEP_MS, () =>
+      endOffsets({ brokers: plainTextBrokers(), topic: this.topic })
+    )
+    expect(ends.get(0)).toBe(this.logEnd)
   }
 
   /**
@@ -1092,6 +1311,7 @@ class SessionCase {
     })
 
     await this.awaitDelivered(scope, member, RECORDS)
+    await this.verifyLog(scope)
     const record = await this.awaitStart(scope, group)
     const closedAt = dropped.ref.closedAt
     this.assertRecovery(member, { dropped, carried, droppedOffsets, droppedIdentities, closedAt })
@@ -1105,7 +1325,6 @@ class SessionCase {
     this.handlerExpected = expected
     this.handlers = { A: member.identities() }
     this.broker = [record]
-    await this.verifyLog(scope)
     await bounded(scope, STEP_MS, () => member.client.disconnect({ timeout: 5000 }))
     await this.verifyQuiet(scope, [group])
   }
@@ -1315,8 +1534,8 @@ class SessionCase {
       replacementOpening: { socket: opening.socket, endpoint: newNode, epoch: openingFields.epoch },
     })
     this.handlers = { A: member.identities() }
-    this.broker = [await this.awaitStart(scope, group)]
     await this.verifyLog(scope)
+    this.broker = [await this.awaitStart(scope, group)]
     await bounded(scope, STEP_MS, () => member.client.disconnect({ timeout: 5000 }))
     await this.verifyQuiet(scope, [group])
   }
@@ -1389,6 +1608,7 @@ class SessionCase {
     expect(accepted.at).toBeGreaterThan(limitedAt + BACKOFF_WINDOW_MS)
     this.row('frame', { freed: accepted })
 
+    await this.verifyLog(scope)
     this.broker = []
     for (const alias of ['g1', 'g2', 'g3']) {
       this.broker.push(await this.awaitStart(scope, groups[alias]))
@@ -1403,7 +1623,6 @@ class SessionCase {
       G2: second.identities(),
       G3: third.identities(),
     }
-    await this.verifyLog(scope)
     for (const member of [second, third]) {
       await bounded(scope, STEP_MS, () => member.client.disconnect({ timeout: 5000 }))
     }
@@ -1534,6 +1753,8 @@ class SessionCase {
           Object.entries(this.handlers).map(([label, actual]) => [label, { actual }])
         ),
         broker: this.broker,
+        acknowledgements: this.progress(),
+        quiet: this.quiet,
       },
       resources: { before: summarize(before), after: summarize(after) },
       cleanup: {

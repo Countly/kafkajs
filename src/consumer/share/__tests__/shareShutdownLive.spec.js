@@ -1,3 +1,12 @@
+const fetchAcknowledgementResponse = require('../../../protocol/requests/shareFetch/v2/response')
+const acknowledgeResponse = require('../../../protocol/requests/shareAcknowledge/v2/response')
+const {
+  acknowledgementResults,
+  acknowledgementRequests,
+  awaitTerminalSharePosition,
+  assertQuietTerminalGroup,
+  pollSharePosition,
+} = require('../../../../testHelpers/shareLiveDiagnostics')
 const { EventEmitter } = require('events')
 const { Kafka, KafkaJSNonRetriableError, logLevel } = require('../../../../index')
 const CONFIG_RESOURCE_TYPES = require('../../../protocol/configResourceTypes')
@@ -17,9 +26,8 @@ const {
   createShareTopic,
   setShareGroupConfigs,
   shareRecordIdentity,
-  verifierMember,
 } = require('../../../../testHelpers/shareFixtures')
-const { CleanupStack } = require('../../../producer/__tests__/fixtures/liveProbe')
+const { CleanupStack, describeError } = require('../../../producer/__tests__/fixtures/liveProbe')
 const {
   NEVER,
   bounded,
@@ -55,6 +63,151 @@ const ACK_TYPES = { accept: 1, release: 2 }
 const READERS = new Map(
   [heartbeatWire, fetchWire, acknowledgeWire].map((pair) => [pair.apiKey, pair])
 )
+
+/** Records original acknowledgement requests with their same-socket broker responses. */
+class AcknowledgementTrace {
+  /** @param {Function} [record] Receives completed request/response facts. */
+  constructor(record = () => {}) {
+    this.frames = []
+    this.sockets = 0
+    this.record = record
+  }
+
+  /**
+   * Observes bytes without changing write results, callbacks or ordering.
+   * @param {object} socket Original socket.
+   * @param {string} label Owning member.
+   * @returns {object} The same socket.
+   */
+  wrap(socket, label) {
+    const pending = new Map()
+    const ordinal = ++this.sockets
+    const buffers = { request: Buffer.alloc(0), response: Buffer.alloc(0) }
+    /** @param {string} kind Stream direction. @param {Buffer} chunk Original bytes. @returns {Buffer[]} Complete frames. */
+    const split = (kind, chunk) => {
+      let bytes = Buffer.concat([buffers[kind], chunk])
+      const frames = []
+      while (bytes.length >= 4 && bytes.length >= bytes.readInt32BE(0) + 4) {
+        const size = bytes.readInt32BE(0) + 4
+        if (size < 4) throw new Error('Invalid Kafka diagnostic frame size')
+        frames.push(Buffer.from(bytes.subarray(0, size)))
+        bytes = bytes.subarray(size)
+      }
+      buffers[kind] = bytes
+      return frames
+    }
+    const write = socket.write.bind(socket)
+    socket.write = (chunk, ...rest) => {
+      for (const bytes of split('request', Buffer.from(chunk))) {
+        const header = readRequestHeader(bytes)
+        if (![78, 79].includes(header.apiKey)) continue
+        const fact = {
+          ...header,
+          label,
+          socket: ordinal,
+          bytes,
+          headerBytes: header.byteLength,
+          at: performance.now(),
+        }
+        const [request] = acknowledgementRequests([fact])
+        if (!request) continue
+        fact.request = request
+        this.frames.push(fact)
+        pending.set(header.correlationId, fact)
+      }
+      return write(chunk, ...rest)
+    }
+    socket.on('data', (chunk) => {
+      for (const bytes of split('response', chunk)) {
+        const fact = pending.get(bytes.readInt32BE(4))
+        if (!fact) continue
+        pending.delete(fact.correlationId)
+        const decoder = fact.apiKey === 78 ? fetchAcknowledgementResponse : acknowledgeResponse
+        fact.decoding = Promise.resolve()
+          .then(() => {
+            if (bytes[8] !== 0) throw new Error('Unexpected response header tags')
+            return decoder.decode(bytes.subarray(9))
+          })
+          .then(({ errorCode, responses }) => {
+            fact.response = {
+              errorCode,
+              at: performance.now(),
+              topics: responses.map(({ topicId, partitions }) => ({
+                topicId,
+                partitions: partitions.map(
+                  ({ partitionIndex, errorCode, acknowledgeErrorCode, currentLeader }) => ({
+                    partitionIndex,
+                    errorCode,
+                    acknowledgeErrorCode,
+                    currentLeader,
+                  })
+                ),
+              })),
+            }
+          })
+          .then(() => this.record({ ...fact.request, at: fact.at, response: fact.response }))
+          .catch((error) => {
+            fact.decodeError = describeError(error)
+          })
+      }
+    })
+    return socket
+  }
+
+  /** @returns {Promise<void>} Joins every response decoder before its owning clients leave. */
+  async join() {
+    await Promise.all(this.frames.map(({ decoding }) => decoding))
+  }
+
+  /** @returns {object[]} Original requests and correlated partition outcomes, without byte buffers. */
+  snapshot() {
+    return this.frames.map(({ request, at, response, decodeError }) => ({
+      ...request,
+      at,
+      response: response ?? null,
+      decodeError,
+    }))
+  }
+
+  /**
+   * Returns only offsets whose original requested decision succeeded at group and partition level.
+   * @param {string} group Group id.
+   * @param {string} topicId Original topic UUID.
+   * @param {number} partition Partition index.
+   * @param {number} [type=1] Required wire acknowledgement type.
+   * @returns {Set<string>} Confirmed decimal offsets.
+   */
+  confirmed(group, topicId, partition, type = 1) {
+    const offsets = new Set()
+    for (const { request, response } of this.frames) {
+      if (request.groupId !== group || request.isRenewAck || response?.errorCode !== 0) continue
+      const replies = response.topics
+        .filter((topic) => topic.topicId === topicId)
+        .flatMap((topic) => topic.partitions)
+        .filter((row) => row.partitionIndex === partition)
+      if (replies.length !== 1) continue
+      const code = request.apiKey === 78 ? replies[0].acknowledgeErrorCode : replies[0].errorCode
+      if (code !== 0) continue
+      for (const topic of request.topics ?? []) {
+        if (topic.topicId !== topicId) continue
+        for (const row of topic.partitions) {
+          if (row.partitionIndex !== partition) continue
+          for (const { firstOffset, lastOffset, acknowledgeTypes } of row.acknowledgementBatches) {
+            for (let offset = BigInt(firstOffset); offset <= BigInt(lastOffset); offset++) {
+              if (
+                (acknowledgeTypes.length === 1
+                  ? acknowledgeTypes[0]
+                  : acknowledgeTypes[Number(offset - BigInt(firstOffset))]) === type
+              )
+                offsets.add(String(offset))
+            }
+          }
+        }
+      }
+    }
+    return offsets
+  }
+}
 
 /**
  * Splits a byte stream of size-prefixed Kafka frames into whole frames, across any chunk boundary.
@@ -101,6 +254,7 @@ class ShareWireTap {
     this.destroyed = 0
     this.armed = false
     this.queue = []
+    this.acknowledgements = new AcknowledgementTrace()
   }
 
   /**
@@ -108,7 +262,7 @@ class ShareWireTap {
    */
   socketFactory() {
     const inner = defaultSocketFactory()
-    return (options) => this.wrap(inner(options))
+    return (options) => this.wrap(this.acknowledgements.wrap(inner(options), this.label))
   }
 
   /**
@@ -399,7 +553,9 @@ class ShareMember {
     this.assigned = deferred()
     this.entered = deferred()
     this.delivered = []
+    this.handled = 0
     this.acknowledged = []
+    this.fetches = []
     this.requests = []
     this.problems = []
     this.queueSizes = new Map()
@@ -419,6 +575,9 @@ class ShareMember {
     this.listen(this.consumer.events.ACKNOWLEDGE, ({ payload }) => {
       this.acknowledged.push({ at: performance.now(), ...payload })
     })
+    this.listen(this.consumer.events.FETCH, ({ payload }) =>
+      this.fetches.push({ at: performance.now(), ...payload })
+    )
     this.listen(this.consumer.events.REQUEST, ({ payload }) => this.requests.push(payload))
     this.listen(this.consumer.events.REQUEST_QUEUE_SIZE, ({ payload }) =>
       this.queueSizes.set(payload.broker, payload.queueSize)
@@ -485,6 +644,7 @@ class ShareMember {
           identity: shareRecordIdentity({ ...message, topic, partition }),
           deliveryCount: message.deliveryCount,
         })
+        this.handled++
       },
     }
   }
@@ -537,10 +697,43 @@ class ShutdownCase {
       case: title,
       profile: PROFILE,
       nonce: this.id,
-      groups: { share: 'share-group' },
+      groups: { share: this.group },
+      wireVersions: wireVersionsOf(this.members.flatMap(({ requests }) => requests)),
       budgets: { lockMs: LOCK_MS, finalAllowanceMs: FINAL_ALLOWANCE_MS },
       ...fields,
     })
+  }
+
+  /** @returns {object} Delivered and handled counts, public results, sessions and wire decisions. */
+  progress() {
+    return {
+      members: this.members.map(
+        ({
+          label,
+          memberId,
+          delivered,
+          handled,
+          processed,
+          acknowledged,
+          fetches,
+          problems,
+          tap,
+        }) => ({
+          label,
+          memberId,
+          delivered: delivered.length,
+          handled,
+          processed,
+          fetches,
+          identities: delivered,
+          acknowledgements: acknowledgementResults(acknowledged),
+          problems,
+          shareRequests: tap.shareFrames(),
+          wireAcknowledgements: tap.acknowledgements.snapshot(),
+        })
+      ),
+      position: this.lastPosition,
+    }
   }
 
   /**
@@ -556,13 +749,21 @@ class ShutdownCase {
     try {
       await this.cleanup.run(
         async () => {
-          await this.setup(scope, title)
-          await act(scope)
+          try {
+            await this.setup(scope, title)
+            await act(scope)
+          } catch (error) {
+            this.note(title, 'work-failed', { error: describeError(error), ...this.progress() })
+            throw error
+          }
         },
         { budgetMs: CLEANUP_BUDGET_MS }
       )
     } catch (error) {
-      this.note(title, 'case-failed', { error: String(error?.stack ?? error).slice(0, 4000) })
+      this.note(title, 'case-failed', {
+        error: String(error?.stack ?? error).slice(0, 4000),
+        ...this.progress(),
+      })
       throw error
     } finally {
       this.ledgers.restore()
@@ -664,6 +865,9 @@ class ShutdownCase {
       async () => {
         const { groups } = await this.admin.describeShareGroups([this.group], { apiTimeout: 5000 })
         seen = groups[0].members
+        this.topicId = seen
+          .flatMap(({ assignment }) => assignment)
+          .find(({ topic }) => topic === this.topic)?.topicId
         const held = seen.every(({ assignment }) =>
           assignment.some(({ topic, partitions }) => topic === this.topic && partitions.includes(0))
         )
@@ -733,6 +937,10 @@ class ShutdownCase {
     const log = await bounded(scope, 15000, () =>
       readLog({ brokers: plainTextBrokers(), topic: this.topic })
     )
+    expect([...log.keys()]).toEqual([0])
+    expect(log.get(0).endOffset).toBe(String(this.expected.length))
+    expect(log.get(0).records.filter(({ batchContext }) => batchContext.isControlBatch)).toEqual([])
+    this.logEnd = log.get(0).endOffset
     const actual = log
       .get(0)
       .records.filter(({ isControlRecord }) => !isControlRecord)
@@ -753,74 +961,152 @@ class ShutdownCase {
   }
 
   /**
-   * Reads the broker's position for the group: where the share-partition starts and its lag.
-   * @param {AbortSignal} scope
-   * @returns {Promise<{ startOffset: string, lag: string|null, errorCode: number }>}
+   * Checks public decisions against their successful original request and partition response.
+   * @param {ShareMember} member Member whose results are being checked.
+   * @param {Record<string, string>} expected Exact required offset decisions.
+   * @returns {boolean} Whether every expected decision succeeded.
    */
-  async position(scope) {
-    const [{ partitions }] = await bounded(scope, 10000, () =>
-      this.admin.listShareGroupOffsets({
-        groupId: this.group,
-        topics: [{ topic: this.topic, partitions: [0] }],
-        apiTimeout: 5000,
-      })
+  decisionsSucceeded(member, expected) {
+    const publicResults = settledByOffset(member.acknowledged.filter(({ error }) => error === null))
+    return Object.entries(expected).every(
+      ([offset, type]) =>
+        publicResults[offset] === type &&
+        member.tap.acknowledgements
+          .confirmed(this.group, this.topicId, 0, ACK_TYPES[type])
+          .has(offset)
     )
-    return partitions[0]
   }
 
   /**
-   * Waits for the share-partition's start offset to reach at least `offset`.
-   * @param {AbortSignal} scope
-   * @param {number} offset
-   * @param {number} [ms=8000]
-   * @returns {Promise<void>}
+   * Observes the accepted prefix and released suffix while B continues fetching.
+   * @param {AbortSignal} scope Case scope.
+   * @param {string} title Case title.
+   * @param {ShareMember} a Original holder.
+   * @param {ShareMember} b Redelivery member.
+   * @returns {Promise<void>} After both listings agree with actual successful suffix progress.
    */
-  async startReaches(scope, offset, ms = 8000) {
-    await pollUntil(
+  async prefixSettled(scope, title, a, b) {
+    await this.verifyLog(scope)
+    /** @returns {string[]} Suffix offsets with both public and wire-confirmed Accepts. */
+    const accepted = () =>
+      Object.keys(
+        settledByOffset(
+          b.acknowledged.filter(({ type, error }) => type === 'accept' && error === null)
+        )
+      ).filter(
+        (offset) =>
+          BigInt(offset) >= 4n &&
+          BigInt(offset) < 10n &&
+          b.tap.acknowledgements.confirmed(this.group, this.topicId, 0).has(offset)
+      )
+    await pollSharePosition(
       scope,
-      ms,
-      async () => {
-        const { startOffset, errorCode } = await this.position(scope)
-        return errorCode === 0 && BigInt(startOffset) >= BigInt(offset)
+      8000,
+      async (poll) => {
+        const before = accepted()
+        const named = await bounded(poll, 10000, () =>
+          this.admin.listShareGroupOffsets({
+            groupId: this.group,
+            topics: [{ topic: this.topic, partitions: [0] }],
+            apiTimeout: 5000,
+          })
+        )
+        const all = await bounded(poll, 10000, () =>
+          this.admin.listShareGroupOffsets({ groupId: this.group, apiTimeout: 5000 })
+        )
+        const after = accepted()
+        /** @param {object[]} listing Actual broker listing. @returns {object[]} Owned partition rows. */
+        const pick = (listing) =>
+          listing
+            .filter(({ topic, topicId }) => topic === this.topic && topicId === this.topicId)
+            .flatMap(({ partitions }) => partitions)
+            .filter(({ partition }) => partition === 0)
+        const [left, right] = [pick(named), pick(all)]
+        const row = left[0]
+        this.lastPosition = {
+          named,
+          all,
+          logEnd: this.logEnd,
+          acceptedBefore: before,
+          acceptedAfter: after,
+        }
+        /** @param {unknown} value Broker offset or lag. @returns {boolean} Whether it is a canonical decimal string. */
+        const canonical = (value) => typeof value === 'string' && /^(0|[1-9][0-9]*)$/.test(value)
+        return (
+          this.decisionsSucceeded(a, settledDecisions(4, 10)) &&
+          left.length === 1 &&
+          right.length === 1 &&
+          ['startOffset', 'lag', 'errorCode', 'leaderEpoch'].every(
+            (key) => row[key] === right[0][key]
+          ) &&
+          row.errorCode === 0 &&
+          canonical(row.startOffset) &&
+          BigInt(row.startOffset) <= 10n &&
+          canonical(row.lag) &&
+          BigInt(row.lag) >= BigInt(6 - after.length) &&
+          BigInt(row.lag) <= BigInt(6 - before.length)
+        )
       },
-      { delayMs: 100, label: `The share start offset ${offset}` }
+      {
+        delayMs: 100,
+        label: 'The accepted prefix and released suffix',
+        snapshot: () => this.lastPosition,
+        record: (fields) => this.note(title, 'broker-position', { ...fields, ...this.progress() }),
+      }
     )
   }
 
   /**
-   * Records the broker's terminal position, requires start equal to the log end and a known lag
-   * of zero, then proves a fresh member of the same group receives nothing.
-   * @param {AbortSignal} scope
-   * @param {string} title
-   * @param {number} end the expected log end
-   * @returns {Promise<void>}
+   * Requires complete successful settlement, terminal listings and a quiet same-group verifier.
+   * @param {AbortSignal} scope Case scope.
+   * @param {string} title Case title.
+   * @param {number} end Fixed corpus end.
+   * @returns {Promise<void>} After final verification, before state deletion.
    */
   async quiescent(scope, title, end) {
+    for (const { consumer } of this.members) {
+      await bounded(scope, DISCONNECT_MS + 2000, () =>
+        consumer.disconnect({ timeout: DISCONNECT_MS })
+      )
+    }
+    await Promise.all(this.members.map(({ tap }) => tap.acknowledgements.join()))
     await this.verifyLog(scope)
-    await this.startReaches(scope, end)
-    const [logEnd] = [
-      ...(
-        await bounded(scope, 10000, () =>
-          endOffsets({ brokers: plainTextBrokers(), topic: this.topic })
-        )
-      ).values(),
-    ]
-    const { startOffset, lag, errorCode } = await this.position(scope)
-    expect({ errorCode, startOffset, lag, logEnd }).toEqual({
-      errorCode: 0,
-      startOffset: String(end),
-      lag: '0',
-      logEnd: String(end),
-    })
-    this.facts.oracles.broker = [
-      { groupId: this.group, topic: this.topic, partition: 0, errorCode, startOffset, logEnd, lag },
-    ]
-    this.note(title, 'broker-position', { startOffset, lag, logEnd })
-    const received = await verifierMember(this.group, this.topic, {
+    expect(this.logEnd).toBe(String(end))
+    const [a, b] = this.members
+    const prefix = this.name === 'zero' ? 0 : 4
+    if (prefix) expect(this.decisionsSucceeded(a, settledDecisions(prefix, end))).toBe(true)
+    const suffix = Object.fromEntries(
+      Array.from({ length: end - prefix }, (_, n) => [String(n + prefix), 'accept'])
+    )
+    expect(this.decisionsSucceeded(b, suffix)).toBe(true)
+    const partitions = [{ partition: 0, floor: '0', end: this.logEnd }]
+    await awaitTerminalSharePosition(
+      this.admin,
+      { groupId: this.group, topic: this.topic, partitions },
+      {
+        signal: scope,
+        timeoutMs: 8000,
+        record: (fields) => this.note(title, 'broker-position', { ...fields, ...this.progress() }),
+      }
+    )
+    const quiet = await assertQuietTerminalGroup({
+      kafka: this.kafka,
+      admin: this.admin,
+      groupId: this.group,
+      topic: this.topic,
+      partitions,
       signal: scope,
       windowMs: QUIET_WINDOW_MS,
+      timeoutMs: 8000,
+      record: (fields) => this.note(title, 'quiet-verifier', fields),
     })
-    expect(received).toEqual([])
+    this.facts.oracles.broker = quiet.position.rows
+    this.facts.oracles.quiet = quiet
+    this.facts.oracles.acknowledgements = this.progress()
+    const ends = await bounded(scope, 10000, () =>
+      endOffsets({ brokers: plainTextBrokers(), topic: this.topic })
+    )
+    expect(ends.get(0)).toBe(this.logEnd)
   }
 
   /**
@@ -960,6 +1246,20 @@ class ShutdownCase {
   }
 
   /**
+   * Confirms the holder actually acquired the complete fixed batch before shutdown starts.
+   * @param {string} title Case title.
+   * @param {ShareMember} member Original holder.
+   * @param {number} count Required acquisition size.
+   * @returns {void}
+   */
+  checkAcquisition(title, member, count) {
+    this.note(title, 'acquisition', { batchSize: member.batchSize, ...this.progress() })
+    expect(member.batchSize).toBe(count)
+    expect(member.delivered.map(({ identity }) => identity)).toEqual(this.identities(0, count - 1))
+    expect(member.delivered.map(({ deliveryCount }) => deliveryCount)).toEqual(Array(count).fill(1))
+  }
+
+  /**
    * The write time of the fetch that gave `member` its acquisition: the last fetch frame written
    * before its handler was entered.
    * @param {ShareMember} member
@@ -996,6 +1296,7 @@ class ShutdownCase {
         a.entered.resolve()
         await gate.promise
         await after?.(payload)
+        a.handled = decided
       },
     }
   }
@@ -1031,6 +1332,7 @@ class ShutdownCase {
     await bounded(scope, 8000, () => a.entered.promise, { label: 'The holder acquisition' })
     const prewrite = this.acquisitionPrewrite(a, a.enteredAt)
     expect(a.consumer.acquisitionLockTimeoutMs()).toBe(LOCK_MS)
+    this.checkAcquisition(title, a, 10)
     b.tap.release()
 
     const aFrames = a.tap.frames.length
@@ -1074,7 +1376,7 @@ class ShutdownCase {
     })
     this.note(title, 'acknowledgement', { events: settled })
 
-    await this.startReaches(scope, 4)
+    await this.prefixSettled(scope, title, a, b)
     await pollUntil(scope, RELEASE_ALLOWANCE_MS + 2000, () => b.delivered.length >= 6, {
       delayMs: 50,
       label: 'The released records',
@@ -1141,6 +1443,7 @@ class ShutdownCase {
     await bounded(scope, 8000, () => a.entered.promise, { label: 'The holder acquisition' })
     const prewrite = this.acquisitionPrewrite(a, a.enteredAt)
     expect(a.consumer.acquisitionLockTimeoutMs()).toBe(LOCK_MS)
+    this.checkAcquisition(title, a, 10)
     b.tap.release()
 
     const mark = a.tap.frames.length
@@ -1214,6 +1517,7 @@ class ShutdownCase {
     await this.assignmentBarrier(scope, title, [a, b])
     await this.produce(scope, title, 50)
     await bounded(scope, 8000, () => a.entered.promise, { label: 'The holder acquisition' })
+    this.checkAcquisition(title, a, 50)
     b.tap.release()
 
     const aFrames = a.tap.frames.length

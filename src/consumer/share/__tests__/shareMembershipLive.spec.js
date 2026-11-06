@@ -1,3 +1,12 @@
+const fetchAcknowledgementResponse = require('../../../protocol/requests/shareFetch/v2/response')
+const acknowledgeResponse = require('../../../protocol/requests/shareAcknowledge/v2/response')
+const { readRequestHeader } = require('../../../../testHelpers/fakeSocket')
+const {
+  acknowledgementResults,
+  acknowledgementRequests,
+  awaitTerminalSharePosition,
+  assertQuietTerminalGroup,
+} = require('../../../../testHelpers/shareLiveDiagnostics')
 const fs = require('fs')
 const os = require('os')
 const path = require('path')
@@ -5,14 +14,13 @@ const crypto = require('crypto')
 const { spawn } = require('child_process')
 const { isDeepStrictEqual } = require('util')
 const { Kafka, logLevel } = require('../../../../index')
-const { readLog } = require('../../../../testHelpers/rawLog')
+const { readLog, endOffsets } = require('../../../../testHelpers/rawLog')
 const {
   SHARE_TOPIC_PREFIX,
   ShareHandlerLog,
   shareTopicName,
   setShareGroupConfigs,
   shareRecordIdentity,
-  verifierMember,
   assertShareCleanup,
 } = require('../../../../testHelpers/shareFixtures')
 const {
@@ -76,12 +84,164 @@ const LEDGER_METHODS = [
   'invalidate',
 ]
 
+/** Records original acknowledgement requests with their same-socket broker responses. */
+class AcknowledgementTrace {
+  /** @param {Function} [record] Receives completed request/response facts. */
+  constructor(record = () => {}) {
+    this.frames = []
+    this.sockets = 0
+    this.record = record
+  }
+
+  /**
+   * Observes bytes without changing write results, callbacks or ordering.
+   * @param {object} socket Original socket.
+   * @param {string} label Owning member.
+   * @returns {object} The same socket.
+   */
+  wrap(socket, label) {
+    const pending = new Map()
+    const ordinal = ++this.sockets
+    const buffers = { request: Buffer.alloc(0), response: Buffer.alloc(0) }
+    /** @param {string} kind Stream direction. @param {Buffer} chunk Original bytes. @returns {Buffer[]} Complete frames. */
+    const split = (kind, chunk) => {
+      let bytes = Buffer.concat([buffers[kind], chunk])
+      const frames = []
+      while (bytes.length >= 4 && bytes.length >= bytes.readInt32BE(0) + 4) {
+        const size = bytes.readInt32BE(0) + 4
+        if (size < 4) throw new Error('Invalid Kafka diagnostic frame size')
+        frames.push(Buffer.from(bytes.subarray(0, size)))
+        bytes = bytes.subarray(size)
+      }
+      buffers[kind] = bytes
+      return frames
+    }
+    const write = socket.write.bind(socket)
+    socket.write = (chunk, ...rest) => {
+      for (const bytes of split('request', Buffer.from(chunk))) {
+        const header = readRequestHeader(bytes)
+        if (![78, 79].includes(header.apiKey)) continue
+        const fact = {
+          ...header,
+          label,
+          socket: ordinal,
+          bytes,
+          headerBytes: header.byteLength,
+          at: performance.now(),
+        }
+        const [request] = acknowledgementRequests([fact])
+        if (!request) continue
+        fact.request = request
+        this.frames.push(fact)
+        pending.set(header.correlationId, fact)
+      }
+      return write(chunk, ...rest)
+    }
+    socket.on('data', (chunk) => {
+      for (const bytes of split('response', chunk)) {
+        const fact = pending.get(bytes.readInt32BE(4))
+        if (!fact) continue
+        pending.delete(fact.correlationId)
+        const decoder = fact.apiKey === 78 ? fetchAcknowledgementResponse : acknowledgeResponse
+        fact.decoding = Promise.resolve()
+          .then(() => {
+            if (bytes[8] !== 0) throw new Error('Unexpected response header tags')
+            return decoder.decode(bytes.subarray(9))
+          })
+          .then(({ errorCode, responses }) => {
+            fact.response = {
+              errorCode,
+              at: performance.now(),
+              topics: responses.map(({ topicId, partitions }) => ({
+                topicId,
+                partitions: partitions.map(
+                  ({ partitionIndex, errorCode, acknowledgeErrorCode, currentLeader }) => ({
+                    partitionIndex,
+                    errorCode,
+                    acknowledgeErrorCode,
+                    currentLeader,
+                  })
+                ),
+              })),
+            }
+          })
+          .then(() => this.record({ ...fact.request, at: fact.at, response: fact.response }))
+          .catch((error) => {
+            fact.decodeError = describeError(error)
+          })
+      }
+    })
+    return socket
+  }
+
+  /** @returns {Promise<void>} Joins every response decoder before its owning clients leave. */
+  async join() {
+    await Promise.all(this.frames.map(({ decoding }) => decoding))
+  }
+
+  /** @returns {object[]} Original requests and correlated partition outcomes, without byte buffers. */
+  snapshot() {
+    return this.frames.map(({ request, at, response, decodeError }) => ({
+      ...request,
+      at,
+      response: response ?? null,
+      decodeError,
+    }))
+  }
+
+  /**
+   * Returns only offsets whose original requested decision succeeded at group and partition level.
+   * @param {string} group Group id.
+   * @param {string} topicId Original topic UUID.
+   * @param {number} partition Partition index.
+   * @param {number} [type=1] Required wire acknowledgement type.
+   * @returns {Set<string>} Confirmed decimal offsets.
+   */
+  confirmed(group, topicId, partition, type = 1) {
+    const offsets = new Set()
+    for (const { request, response } of this.frames) {
+      if (request.groupId !== group || request.isRenewAck || response?.errorCode !== 0) continue
+      const replies = response.topics
+        .filter((topic) => topic.topicId === topicId)
+        .flatMap((topic) => topic.partitions)
+        .filter((row) => row.partitionIndex === partition)
+      if (replies.length !== 1) continue
+      const code = request.apiKey === 78 ? replies[0].acknowledgeErrorCode : replies[0].errorCode
+      if (code !== 0) continue
+      for (const topic of request.topics ?? []) {
+        if (topic.topicId !== topicId) continue
+        for (const row of topic.partitions) {
+          if (row.partitionIndex !== partition) continue
+          for (const { firstOffset, lastOffset, acknowledgeTypes } of row.acknowledgementBatches) {
+            for (let offset = BigInt(firstOffset); offset <= BigInt(lastOffset); offset++) {
+              if (
+                (acknowledgeTypes.length === 1
+                  ? acknowledgeTypes[0]
+                  : acknowledgeTypes[Number(offset - BigInt(firstOffset))]) === type
+              )
+                offsets.add(String(offset))
+            }
+          }
+        }
+      }
+    }
+    return offsets
+  }
+}
+
 /**
  * The child member's whole program. It writes each invocation's start to a synchronous journal
  * before it can block or be killed, reports over IPC only after that, and keeps each held
  * invocation's continuation bound to the invocation itself.
  */
 const CHILD_SOURCE = `
+const { acknowledgementRequests } = require(process.env.SHARE_LIVE_ROOT + '/testHelpers/shareLiveDiagnostics')
+const { readRequestHeader } = require(process.env.SHARE_LIVE_ROOT + '/testHelpers/fakeSocket')
+const { describeError } = require(process.env.SHARE_LIVE_ROOT + '/src/producer/__tests__/fixtures/liveProbe')
+const fetchAcknowledgementResponse = require(process.env.SHARE_LIVE_ROOT + '/src/protocol/requests/shareFetch/v2/response')
+const acknowledgeResponse = require(process.env.SHARE_LIVE_ROOT + '/src/protocol/requests/shareAcknowledge/v2/response')
+const defaultSocketFactory = require(process.env.SHARE_LIVE_ROOT + '/src/network/socketFactory')
+const AcknowledgementTrace = ${AcknowledgementTrace.toString()}
 const { Kafka, logLevel } = require(process.env.SHARE_LIVE_ROOT + '/index')
 const { ShareHandlerLog, shareRecordIdentity } = require(process.env.SHARE_LIVE_ROOT + '/testHelpers/shareFixtures')
 const config = JSON.parse(process.env.SHARE_LIVE_CHILD)
@@ -89,7 +249,11 @@ const journal = new ShareHandlerLog(config.journal, config.clientId)
 const report = (message) => process.send(message)
 let hold = null
 let current = null
-const kafka = new Kafka({ brokers: config.brokers, clientId: config.clientId, logLevel: logLevel.NOTHING })
+const trace = new AcknowledgementTrace((row) => report({ event: 'wire', row }))
+const socketFactory = defaultSocketFactory()
+const kafka = new Kafka({ brokers: config.brokers, clientId: config.clientId, logLevel: logLevel.NOTHING,
+  socketFactory: (options) => trace.wrap(socketFactory(options), 'C'),
+})
 const client = kafka.shareConsumer({
   groupId: config.groupId,
   acknowledgementMode: 'implicit',
@@ -111,6 +275,9 @@ client.on(events.ASSIGNMENT_CHANGED, ({ payload }) =>
 client.on(events.ACKNOWLEDGE, ({ payload }) =>
   report({
     event: 'acknowledge',
+    topic: payload.topic,
+    partition: payload.partition,
+    error: payload.error ? { name: payload.error.name, reason: payload.error.reason, code: payload.error.code, cause: payload.error.cause && { code: payload.error.cause.code } } : null,
     type: payload.type,
     firstOffset: payload.firstOffset,
     lastOffset: payload.lastOffset,
@@ -153,6 +320,7 @@ const stop = async () => {
   try {
     if (current) current.release()
     await client.disconnect({ timeout: 3000 })
+    await trace.join()
   } finally {
     journal.close()
     report({ event: 'stopped' })
@@ -208,17 +376,19 @@ class SocketCounter {
   constructor() {
     /** @type {import('net').Socket[]} */
     this.sockets = []
+    this.acknowledgements = new AcknowledgementTrace()
   }
 
   /**
+   * @param {string} [label='client'] Owning member label.
    * @returns {Function} a socket factory that remembers every socket it creates
    */
-  factory() {
+  factory(label = 'client') {
     const create = defaultSocketFactory()
     return (options) => {
       const socket = create(options)
       this.sockets.push(socket)
-      return socket
+      return this.acknowledgements.wrap(socket, label)
     }
   }
 
@@ -348,6 +518,7 @@ class Member {
     /** @type {Array<{identity: string, deliveryCount: number, offset: string, at: number}>} */
     this.entries = []
     this.inflightEntries = new Set()
+    this.handled = 0
     this.gates = []
     this.hold = null
     this.held = null
@@ -432,6 +603,7 @@ class Member {
       } else {
         await new Promise((resolve) => setTimeout(resolve, this.workMs))
       }
+      this.handled++
     } finally {
       this.inflightEntries.delete(entry)
     }
@@ -487,6 +659,7 @@ class ChildMember {
     this.starts = []
     this.assignments = []
     this.acks = []
+    this.wireAcknowledgements = []
     this.failure = null
     this.exit = null
     this.child = null
@@ -509,7 +682,12 @@ class ChildMember {
       nonce: this.nonce,
     }
     const child = spawn(process.execPath, ['-e', CHILD_SOURCE], {
-      env: { ...process.env, SHARE_LIVE_ROOT: ROOT, SHARE_LIVE_CHILD: JSON.stringify(config) },
+      env: {
+        ...process.env,
+        NODE_PATH: [ROOT, process.env.NODE_PATH].filter(Boolean).join(path.delimiter),
+        SHARE_LIVE_ROOT: ROOT,
+        SHARE_LIVE_CHILD: JSON.stringify(config),
+      },
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     })
     this.child = child
@@ -549,6 +727,8 @@ class ChildMember {
       this.unfinished.delete(message.invocation)
     } else if (message.event === 'assignment') {
       this.assignments.push(fact)
+    } else if (message.event === 'wire') {
+      this.wireAcknowledgements.push(message.row)
     } else if (message.event === 'acknowledge') {
       this.acks.push(fact)
     } else if (message.event === 'failed' || message.event === 'crash') {
@@ -782,8 +962,26 @@ class MembershipCase {
       scenario: this.nonce,
       groups: this.groups,
       budgets: { caseMs: CASE_BUDGET_MS, stepMs: STEP_MS, stageMs: STAGE_MS },
+      wireVersions: wireVersionsOf(
+        Object.values(this.members).flatMap(({ requests }) => requests ?? [])
+      ),
       ...fields,
     })
+  }
+
+  /** @returns {object} Per-member handler progress and broker acknowledgement outcomes. */
+  progress() {
+    return {
+      members: Object.values(this.members).map((member) => ({
+        label: member.label,
+        delivered: member.entries?.length ?? member.starts.length,
+        handled: member.entries ? member.handled : member.of('finish').length,
+        acknowledgements: acknowledgementResults(member.acks),
+        crashes: member.crashes?.map(({ error }) => describeError(error)),
+      })),
+      wireAcknowledgements: this.sockets.acknowledgements.snapshot(),
+      childWireAcknowledgements: this.members.C?.wireAcknowledgements ?? [],
+    }
   }
 
   /**
@@ -814,9 +1012,14 @@ class MembershipCase {
           this.row('resource-baseline', { resources: summarize(base) })
           await this.stack.run(
             async () => {
-              await this.setup(scope)
-              await this.membership(scope)
-              await this.finish(scope)
+              try {
+                await this.setup(scope)
+                await this.membership(scope)
+                await this.finish(scope)
+              } catch (error) {
+                this.row('work-failed', { error: describeError(error), ...this.progress() })
+                throw error
+              }
             },
             { budgetMs: CLEANUP_MS }
           )
@@ -834,7 +1037,7 @@ class MembershipCase {
       await this.settleProcess(scope, pre)
       this.complete(base, after)
     } catch (error) {
-      this.row('case-failed', { status: 'failed', error: describeError(error) })
+      this.row('case-failed', { status: 'failed', error: describeError(error), ...this.progress() })
       throw error
     }
   }
@@ -958,7 +1161,7 @@ class MembershipCase {
       brokers: plainTextBrokers(),
       logLevel: logLevel.NOTHING,
       clientId: this.clientIdOf(label),
-      socketFactory: this.sockets.factory(),
+      socketFactory: this.sockets.factory(label),
     })
     const member = new Member({ kafka, label, groupId: this.group, workMs })
     this.members[label] = member
@@ -1031,45 +1234,97 @@ class MembershipCase {
   }
 
   /**
-   * The broker's view of the group's start offset on every partition.
-   * @param {AbortSignal} scope
-   * @returns {Promise<Array<{partition: number, startOffset: string, lag: string|null, errorCode: number}>>}
+   * Requires successful Accept coverage for every identity in the completed append prefix.
+   * @returns {boolean} Whether every produced identity has a successful broker outcome.
    */
-  async positions(scope) {
-    const named = await bounded(scope, STEP_MS, () =>
-      this.admin.listShareGroupOffsets({
-        groupId: this.group,
-        topics: [{ topic: this.topic, partitions: [0, 1, 2] }],
-      })
+  acceptedPrefix() {
+    const accepted = new Set()
+    for (const { acks } of Object.values(this.members)) {
+      for (const { topic, partition, firstOffset, lastOffset, type, error } of acks) {
+        if (topic !== this.topic || type !== 'accept' || error !== null) continue
+        for (let offset = BigInt(firstOffset); offset <= BigInt(lastOffset); offset++) {
+          accepted.add(JSON.stringify([partition, String(offset)]))
+        }
+      }
+    }
+    const child = new AcknowledgementTrace()
+    child.frames = (this.members.C?.wireAcknowledgements ?? []).map(({ response, ...request }) => ({
+      request,
+      response,
+    }))
+    const confirmed = new Map(
+      Array.from({ length: PARTITIONS }, (_, partition) => [
+        partition,
+        new Set([
+          ...this.sockets.acknowledgements.confirmed(this.group, this.topicId, partition),
+          ...child.confirmed(this.group, this.topicId, partition),
+        ]),
+      ])
     )
-    return named[0].partitions
+    return this.expected.every((identity) => {
+      const [, partition, offset] = JSON.parse(identity)
+      return (
+        accepted.has(JSON.stringify([partition, offset])) && confirmed.get(partition).has(offset)
+      )
+    })
   }
 
   /**
-   * Waits until every partition's start offset equals `end`: every record up to it reached a
-   * terminal acknowledgement.
-   * @param {AbortSignal} scope
-   * @param {number} end records per partition
-   * @returns {Promise<void>}
-   * @throws {Error} a start offset that never gets there
+   * Checks the completed raw-log prefix and successful Accepts before polling terminal positions.
+   * @param {AbortSignal} scope Case scope.
+   * @param {number} end Completed records per partition.
+   * @returns {Promise<void>} After every partition has known zero lag in both listings.
    */
-  settled(scope, end) {
-    return pollUntil(
+  async settled(scope, end) {
+    await bounded(
       scope,
       STAGE_MS,
-      async () => {
+      async (stage) => {
         this.assertHealthy()
-        try {
-          const rows = await this.positions(scope)
-          return rows.every(
-            ({ errorCode, startOffset }) => errorCode === 0 && startOffset === String(end)
+        const log = await bounded(stage, STEP_MS, () =>
+          readLog({ brokers: plainTextBrokers(), topic: this.topic })
+        )
+        const raw = []
+        expect([...log.keys()].sort()).toEqual([0, 1, 2])
+        for (const [partition, { endOffset, records }] of log) {
+          expect(endOffset).toBe(String(end))
+          expect(records.filter(({ batchContext }) => batchContext.isControlBatch)).toEqual([])
+          raw.push(
+            ...records.map(({ offset, key, value }) =>
+              shareRecordIdentity({ topic: this.topic, partition, offset, key, value })
+            )
           )
-        } catch (error) {
-          if (moving(error)) return false
-          throw error
         }
+        expect(raw.sort()).toEqual([...this.expected].sort())
+        await pollUntil(
+          stage,
+          STAGE_MS,
+          () => {
+            this.assertHealthy()
+            return this.acceptedPrefix()
+          },
+          { label: 'Successful prefix Accept coverage' }
+        )
+        const position = await awaitTerminalSharePosition(
+          this.admin,
+          {
+            groupId: this.group,
+            topic: this.topic,
+            partitions: [...log].map(([partition, { endOffset }]) => ({
+              partition,
+              floor: '0',
+              end: endOffset,
+            })),
+          },
+          {
+            signal: stage,
+            timeoutMs: STAGE_MS,
+            record: (fields) => this.row('broker-position', { ...fields, ...this.progress() }),
+          }
+        )
+        this.broker = position.rows
       },
-      { delayMs: 250, label: `Every partition settling at ${end}` }
+      { label: `Every partition settling through ${end}` }
     )
   }
 
@@ -1410,19 +1665,6 @@ class MembershipCase {
       duplicated,
     })
 
-    const positions = await this.positions(scope)
-    this.broker = positions.map(({ partition, errorCode, startOffset, lag }) => {
-      expect(lag === null || lag === '0').toBe(true)
-      return {
-        groupId: this.group,
-        topic: this.topic,
-        partition,
-        errorCode,
-        startOffset,
-        logEnd: String(STAGES * PER_PARTITION),
-        lag,
-      }
-    })
     this.row('acknowledgement', {
       A: a.acks
         .filter(({ error }) => error !== null)
@@ -1442,9 +1684,28 @@ class MembershipCase {
     })
 
     await bounded(scope, STEP_MS, () => a.client.disconnect({ timeout: 5000 }))
-    const quiet = await verifierMember(this.group, this.topic, { kafka: this.kafka, signal: scope })
-    expect(quiet).toEqual([])
-    this.row('cleanup', { verifier: 'quiet for 5000 ms' })
+    await bounded(scope, STEP_MS, () => b.client.disconnect({ timeout: 5000 }))
+    await bounded(scope, STEP_MS, () => c.end())
+    await this.sockets.acknowledgements.join()
+    this.quiet = await assertQuietTerminalGroup({
+      kafka: this.kafka,
+      admin: this.admin,
+      groupId: this.group,
+      topic: this.topic,
+      partitions: [...log].map(([partition, { endOffset }]) => ({
+        partition,
+        floor: '0',
+        end: endOffset,
+      })),
+      signal: scope,
+      timeoutMs: STAGE_MS,
+      record: (fields) => this.row('quiet-verifier', fields),
+    })
+    this.broker = this.quiet.position.rows
+    const ends = await bounded(scope, STEP_MS, () =>
+      endOffsets({ brokers: plainTextBrokers(), topic: this.topic })
+    )
+    expect([...ends]).toEqual([...log].map(([partition, { endOffset }]) => [partition, endOffset]))
   }
 
   /**
@@ -1462,6 +1723,8 @@ class MembershipCase {
         log: { expected: this.expected, actual: this.log },
         handler: { expected: this.handlerExpected, actual: this.handlerActual },
         broker: this.broker,
+        acknowledgements: this.progress(),
+        quiet: this.quiet,
       },
       resources: { before: summarize(before), after: summarize(after) },
       cleanup: {
