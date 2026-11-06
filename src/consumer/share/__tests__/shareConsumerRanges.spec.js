@@ -161,7 +161,8 @@ describe('public share range contract', () => {
       ],
     ]
 
-    test.each(HALTS)(
+    // Keep every row at callback arity so Jest cannot pass `done` as the optional byte limit.
+    test.each(HALTS.map(([title, build, byteLimit]) => [title, build, byteLimit]))(
       'releases a halted undecoded remainder compactly after %s',
       async (_, build, byteLimit) => {
         const logs = []

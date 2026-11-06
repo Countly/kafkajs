@@ -825,9 +825,11 @@ describe('captured share close', () => {
         expect(current.isRunning()).toBe(true)
         await expect(current.renew()).resolves.toBe(15000)
         current.acknowledge('accept')
-        const stopping = rig.h.consumer.stop()
+        const stopping = track(rig.h.consumer.stop())
         for (const gate of rig.gates.values()) gate.resolve()
-        await stopping
+        // A natural stop also waits for the sibling's empty-fetch pacing timer.
+        await rig.advanceUntil(() => stopping.settled, 'the replacement stop')
+        expect(stopping.error).toBeNull()
         expect(rig.acks.filter(([partition]) => partition === 0)).toEqual([
           [0, '0', '0', type, 'membership-lost'],
           [0, '0', '0', 'renew', null],

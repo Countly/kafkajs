@@ -455,7 +455,8 @@ describe('public share token contract', () => {
       expect(heartbeatEpochs()).toEqual([0, 1, 0])
       expect(new Set(joins().map(({ fields }) => fields.memberId)).size).toBe(1)
       await beat(50, 4)
-      expect(heartbeatEpochs()).toEqual([0, 1, 0, 1])
+      expect(heartbeatEpochs()).toEqual([0, 1, 0, 2])
+      expect(h.frames(76)[3].fields.memberId).toBe(joins()[0].fields.memberId)
       expect(h.seen.crashes).toEqual([])
     })
 
