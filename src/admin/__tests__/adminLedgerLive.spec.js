@@ -1086,6 +1086,7 @@ class AdminLedgerScenario {
 
   /**
    * Exercises legacy returns, validation-only state, reassignment and canonical ID deletion.
+   * Restores reassignment rate overrides and waits for every broker's exact baseline readback.
    * @returns {Promise<void>}
    * @throws {Error} changed legacy contract or failed readback
    */
@@ -1233,24 +1234,39 @@ class AdminLedgerScenario {
       admin.describeConfigs({ resources: throttleResources })
     )
     p.items(originalThrottles.resources)
-    p.effects.add('restore reassignment rate overrides', async () => {
+    /**
+     * Restores both throttle keys, including those absent from the original broker config.
+     * Polls every broker's readback under the cleanup signal and inclusive scenario deadline.
+     * @param {AbortSignal} signal cleanup cancellation
+     * @returns {Promise<void>} after every broker reports its exact original configuration
+     * @throws {Error} mutation or read failure, cancellation, deadline or mismatched readback
+     */
+    const restoreThrottles = async (signal) => {
       const restored = await admin.incrementalAlterConfigs({
         resources: originalThrottles.resources.map((row) => ({
           type: row.resourceType,
           name: row.resourceName,
-          configEntries: row.configEntries.map((entry) => ({
-            name: entry.configName,
-            operation:
-              entry.configSource === 2 ? AlterConfigOpTypes.SET : AlterConfigOpTypes.DELETE,
-            value: entry.configSource === 2 ? entry.configValue : null,
-          })),
+          configEntries: throttleKeys.map((name) => {
+            const entry = row.configEntries.find(({ configName }) => configName === name)
+            return {
+              name,
+              operation:
+                entry?.configSource === 2 ? AlterConfigOpTypes.SET : AlterConfigOpTypes.DELETE,
+              value: entry?.configSource === 2 ? entry.configValue : null,
+            }
+          }),
         })),
       })
       p.items(restored.resources)
-      const readback = await admin.describeConfigs({ resources: throttleResources })
-      p.items(readback.resources)
+      let readback
+      await pollUntil(signal, p.remaining(), async () => {
+        readback = await admin.describeConfigs({ resources: throttleResources })
+        p.items(readback.resources)
+        return isDeepStrictEqual(readback.resources, originalThrottles.resources)
+      })
       expect(readback.resources).toEqual(originalThrottles.resources)
-    })
+    }
+    p.effects.add('restore reassignment rate overrides', restoreThrottles)
     p.effects.add('remove topic reassignment throttles', async () => {
       const removed = await admin.incrementalAlterConfigs({
         resources: [
