@@ -236,8 +236,8 @@ test('share capability errors keep the unsupported API class across entry points
 })
 
 test('the compact acknowledgement error has one constructor in both packed entry points', async () => {
-  const cjs = require(PKG),
-    esm = await import(PKG)
+  const cjs = require(PKG)
+  const esm = await import(PKG)
   assert.equal(typeof cjs.KafkaJSShareAcknowledgementError, 'function')
   assert.equal(esm.KafkaJSShareAcknowledgementError, cjs.KafkaJSShareAcknowledgementError)
   const cause = new Error('lost acknowledgement answer')
