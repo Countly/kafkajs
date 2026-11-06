@@ -153,7 +153,10 @@ class ShareGroups {
    * Groups are looked up and batched by coordinator node. A repeated id shares one lookup and one
    * relocation allowance and comes back as a fresh row per repetition. Loading (14) is retried in
    * place under the retry budget; a moved coordinator (15/16) is looked up again once per id, after
-   * which the broker's code stays on that group's row. Settled rows are never resent.
+   * which the broker's code stays on that group's row. Settled rows are never resent. A lookup or
+   * request that fails with 14/15/16 is retried for the groups it affected only; once the budget is
+   * spent those groups carry `errorCode: -1` with the failure's message and every other group keeps
+   * its own answer.
    * @param {string[]} groupIds nonempty string ids
    * @param {object} [options] public options; `apiTimeout` is consumed by the admin wrapper
    * @param {boolean} [options.includeAuthorizedOperations=false] request the raw signed mask
@@ -390,8 +393,29 @@ class ShareGroups {
   }
 
   /**
+   * Turns a coordinator-loading or coordinator-moved failure (14/15/16) of a lookup or a request
+   * into retriable local-failure rows for exactly the ids it affected.
+   * @param {string[]} groupIds ids whose lookup or request failed
+   * @param {Error} error what the lookup or request threw
+   * @returns {object[]} one `errorCode: -1` row per id, carrying `error` and its message
+   * @throws {Error} the error itself when it ends the whole call (capability, transport, deadline)
+   */
+  #unresolved(groupIds, error) {
+    if (isCallFailure(error)) throw error
+    return groupIds.map((groupId) => ({
+      groupId,
+      errorCode: -1,
+      error,
+      errorMessage: error.message,
+      retryCoordinator: true,
+    }))
+  }
+
+  /**
    * Runs one describe attempt over the still-pending ids, one request per coordinator node.
    * Rows asking to be retried carry `retryCoordinator`; a first 15/16 also drops that id's route.
+   * A lookup or request that fails with 14/15/16 leaves only its own ids unresolved: every other
+   * group's row, from any batch, is returned so it is never resent.
    * @param {Array<{groupId: string}>} pending ids not yet settled
    * @param {object} context call-local state
    * @param {boolean} context.includeAuthorizedOperations wire flag
@@ -402,11 +426,17 @@ class ShareGroups {
    * @throws {Error} capability, transport or deadline failure
    */
   async #describeAttempt(pending, { includeAuthorizedOperations, routes, relocated }) {
+    const unresolved = []
     const batches = new Map()
     for (const { groupId } of pending) {
       let broker = routes.get(groupId)
       if (!broker) {
-        broker = await this.#locate(groupId, DESCRIBE_KEY)
+        try {
+          broker = await this.#locate(groupId, DESCRIBE_KEY)
+        } catch (error) {
+          unresolved.push(...this.#unresolved([groupId], error))
+          continue
+        }
         routes.set(groupId, broker)
       }
       const batch = batches.get(broker.nodeId) || { broker, groupIds: [] }
@@ -416,15 +446,19 @@ class ShareGroups {
     const answers = await waitOf(() =>
       Promise.all(
         [...batches.values()].map(async ({ broker, groupIds }) => {
-          const answer = await this.#send(broker, 'shareGroupDescribe', {
-            groupIds,
-            includeAuthorizedOperations,
-          })
-          return this.#correlate(answer, groupIds, { routes, relocated })
+          try {
+            const answer = await this.#send(broker, 'shareGroupDescribe', {
+              groupIds,
+              includeAuthorizedOperations,
+            })
+            return this.#correlate(answer, groupIds, { routes, relocated })
+          } catch (error) {
+            return this.#unresolved(groupIds, error)
+          }
         })
       )
     )
-    return checked(answers).flat()
+    return [...unresolved, ...checked(answers).flat()]
   }
 
   /**

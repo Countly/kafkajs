@@ -15,6 +15,8 @@ const {
   KafkaJSTimeout,
   KafkaJSInvariantViolation,
   KafkaJSDeleteGroupsError,
+  KafkaJSConnectionError,
+  KafkaJSShareGroupsNotSupportedError,
 } = require('../../errors')
 const { createGroupApiBroker } = require('../../broker/__tests__/fixtures/groupApiHarness')
 
@@ -129,6 +131,11 @@ const settle = (promise) =>
 const until = async (condition) => {
   for (let turn = 0; turn < 200 && !condition(); turn++) await new Promise(setImmediate)
   expect(condition()).toBe(true)
+}
+
+/** Lets pending promise continuations run; timers stay under the test's control. */
+const flush = async () => {
+  for (let turn = 0; turn < 30; turn++) await Promise.resolve()
 }
 
 /**
@@ -249,27 +256,39 @@ describe('share administration', () => {
 
     test('batches on two coordinators and preserves a bad group beside its sibling', async () => {
       f = await seam()
+      const held = gate()
       f.cluster.findGroupCoordinator.mockImplementation(
         async ({ groupId }) => f.brokers[groupId === 'a' ? 0 : 1]
       )
-      f.scripted.answer('ShareGroupDescribe', ({ groupIds }) => ({
-        throttleTime: 0,
-        groups: groupIds.map((id) => group(id, id === 'b' ? 69 : 0)),
-      }))
-      const result = await f.admin.describeShareGroups(['a', 'b'])
+      f.scripted.answer('ShareGroupDescribe', async ({ groupIds }) => {
+        await held.promise
+        return { throttleTime: 0, groups: groupIds.map((id) => group(id, id === 'b' ? 69 : 0)) }
+      })
+      const frames = () => f.scripted.requests().filter((r) => r.api === 'ShareGroupDescribe')
+      let finished = false
+      const pending = settle(f.admin.describeShareGroups(['a', 'b'])).then((outcome) => {
+        finished = true
+        return outcome
+      })
+      try {
+        await until(() => frames().length === 2)
+        expect(finished).toBe(false)
+        expect(
+          frames()
+            .map((r) => [r.node, r.fields.groupIds])
+            .sort(([x], [y]) => x - y)
+        ).toEqual([
+          [0, ['a']],
+          [1, ['b']],
+        ])
+      } finally {
+        held.resolve()
+      }
+      const { value: result, error } = await pending
+      expect(error).toBeUndefined()
       expect(result.groups.map((g) => [g.groupId, g.errorCode])).toEqual([
         ['a', 0],
         ['b', 69],
-      ])
-      expect(
-        f.scripted
-          .requests()
-          .filter((r) => r.api === 'ShareGroupDescribe')
-          .map((r) => [r.node, r.fields.groupIds])
-          .sort(([x], [y]) => x - y)
-      ).toEqual([
-        [0, ['a']],
-        [1, ['b']],
       ])
     })
 
@@ -344,6 +363,99 @@ describe('share administration', () => {
       expect(f.cluster.findGroupCoordinator).toHaveBeenCalledTimes(retry.retries + 1)
       expect(f.brokers[0].shareGroupDescribe).not.toHaveBeenCalled()
     })
+
+    test('keeps a healthy group beside one whose coordinator never resolves', async () => {
+      const broker = coordinator()
+      f = fixture([broker])
+      f.cluster.findGroupCoordinator.mockImplementation(async ({ groupId }) => {
+        if (groupId === 'bad') throw createErrorFromCode(15)
+        return broker
+      })
+      const result = await f.admin.describeShareGroups(['good', 'bad'])
+      expect(result.groups.map((g) => [g.groupId, g.errorCode, g.errorMessage])).toEqual([
+        ['good', 0, null],
+        ['bad', -1, createErrorFromCode(15).message],
+      ])
+      expect(broker.shareGroupDescribe.mock.calls.map(([request]) => request.groupIds)).toEqual([
+        ['good'],
+      ])
+      expect(f.cluster.findGroupCoordinator.mock.calls.map(([options]) => options.groupId)).toEqual(
+        ['good', 'bad', 'bad', 'bad']
+      )
+    })
+
+    test('resends only the group whose coordinator lookup failed once', async () => {
+      const broker = coordinator()
+      f = fixture([broker])
+      let failures = 1
+      f.cluster.findGroupCoordinator.mockImplementation(async ({ groupId }) => {
+        if (groupId === 'b' && failures-- > 0) throw createErrorFromCode(16)
+        return broker
+      })
+      const result = await f.admin.describeShareGroups(['a', 'b'])
+      expect(result.groups.map((g) => [g.groupId, g.errorCode])).toEqual([
+        ['a', 0],
+        ['b', 0],
+      ])
+      expect(broker.shareGroupDescribe.mock.calls.map(([request]) => request.groupIds)).toEqual([
+        ['a'],
+        ['b'],
+      ])
+    })
+
+    test('keeps a coordinator batch that answered when another batch throws a retriable error', async () => {
+      const first = coordinator(0)
+      const second = coordinator(1)
+      second.shareGroupDescribe.mockRejectedValueOnce(createErrorFromCode(14))
+      f = fixture([first, second], (id) => (id === 'a' ? first : second))
+      const result = await f.admin.describeShareGroups(['a', 'b'])
+      expect(result.groups.map((g) => [g.groupId, g.errorCode])).toEqual([
+        ['a', 0],
+        ['b', 0],
+      ])
+      expect(first.shareGroupDescribe.mock.calls.map(([request]) => request.groupIds)).toEqual([
+        ['a'],
+      ])
+      expect(second.shareGroupDescribe.mock.calls.map(([request]) => request.groupIds)).toEqual([
+        ['b'],
+        ['b'],
+      ])
+    })
+
+    test('keeps a batch that keeps throwing as its own error rows beside the settled batch', async () => {
+      const first = coordinator(0)
+      const second = coordinator(1)
+      second.shareGroupDescribe.mockRejectedValue(createErrorFromCode(14))
+      f = fixture([first, second], (id) => (id === 'a' ? first : second))
+      const result = await f.admin.describeShareGroups(['a', 'b'])
+      expect(result.groups.map((g) => [g.groupId, g.errorCode, g.errorMessage])).toEqual([
+        ['a', 0, null],
+        ['b', -1, createErrorFromCode(14).message],
+      ])
+      expect(first.shareGroupDescribe).toHaveBeenCalledTimes(1)
+      expect(second.shareGroupDescribe).toHaveBeenCalledTimes(retry.retries + 1)
+    })
+
+    test.each([['lookup'], ['request']])(
+      'rejects the whole call with the identical transport error from a failing %s',
+      async (stage) => {
+        const transport = new KafkaJSConnectionError('socket closed')
+        const first = coordinator(0)
+        const second = coordinator(1)
+        f = fixture([first, second], (id) => (id === 'a' ? first : second))
+        if (stage === 'lookup') {
+          f.cluster.findGroupCoordinator.mockImplementation(async ({ groupId }) => {
+            if (groupId === 'b') throw transport
+            return first
+          })
+        } else {
+          second.shareGroupDescribe.mockRejectedValue(transport)
+        }
+        await expect(f.admin.describeShareGroups(['a', 'b'])).rejects.toBe(transport)
+        expect(f.cluster.findGroupCoordinator).toHaveBeenCalledTimes(2)
+        expect(second.shareGroupDescribe).toHaveBeenCalledTimes(stage === 'request' ? 1 : 0)
+      }
+    )
 
     test('describes no groups without discovery or a request', async () => {
       f = fixture()
@@ -554,6 +666,19 @@ describe('share administration', () => {
       }
     )
 
+    test.each(OFFSET_CALLS)(
+      '%s rethrows a Broker-rejected protocol error as the same object after one attempt',
+      async (method, options) => {
+        const sentinel = createErrorFromCode(30)
+        const broker = coordinator()
+        const wire = brokerMethodOf(method)
+        broker[wire].mockRejectedValue(sentinel)
+        f = fixture([broker])
+        await expect(f.admin[method](options)).rejects.toBe(sentinel)
+        expect(broker[wire]).toHaveBeenCalledTimes(1)
+      }
+    )
+
     test.each(OFFSET_CALLS)('%s relocates once to the new coordinator', async (method, options) => {
       const first = coordinator(0)
       const second = coordinator(1)
@@ -608,20 +733,83 @@ describe('share administration', () => {
       const [method] = call
       const broker = coordinator()
       const wire = brokerMethodOf(method)
+      const [, apiName, apiKey] = APIS.find(([name]) => name === wire)
       broker[wire].mockResolvedValueOnce(
         method === 'describeShareGroups' || method === 'listShareGroupOffsets'
           ? { groups: [{ ...group('share-group'), errorCode: 35 }] }
           : { errorCode: 35, responses: [] }
       )
       f = fixture([broker])
-      await expect(callWith(f.admin, call)).rejects.toMatchObject({
+      const error = await callWith(f.admin, call).catch((e) => e)
+      expect(error).toBeInstanceOf(KafkaJSShareGroupsNotSupportedError)
+      expect(error).toMatchObject({
         name: 'KafkaJSShareGroupsNotSupportedError',
         reason: 'refused-by-broker',
         retriable: false,
-        apiName: expect.any(String),
+        apiKey,
+        apiName,
       })
       expect(broker[wire]).toHaveBeenCalledTimes(1)
     })
+
+    /** Answers whose group envelope is fine but whose last partition or topic row says UNSUPPORTED_VERSION. */
+    const itemRefusals = () => {
+      const withLast = (rows, patch) => [...rows.slice(0, -1), { ...rows.at(-1), ...patch }]
+      const listed = expected.describeShareGroupOffsetsV1.response.groups[0]
+      const altered = expected.alterShareGroupOffsetsV0.response
+      const deleted = expected.deleteShareGroupOffsetsV0.response
+      return {
+        listShareGroupOffsets: {
+          groups: [
+            {
+              ...listed,
+              topics: [
+                {
+                  ...listed.topics[0],
+                  partitions: withLast(listed.topics[0].partitions, { errorCode: 35 }),
+                },
+              ],
+            },
+          ],
+        },
+        alterShareGroupOffsets: {
+          ...altered,
+          responses: [
+            {
+              ...altered.responses[0],
+              partitions: withLast(altered.responses[0].partitions, { errorCode: 35 }),
+            },
+          ],
+        },
+        deleteShareGroupOffsets: {
+          ...deleted,
+          responses: withLast(deleted.responses, { errorCode: 35 }),
+        },
+      }
+    }
+
+    test.each(OFFSET_CALLS)(
+      '%s converts an item-level runtime 35 to a typed capability refusal',
+      async (method, options) => {
+        const broker = coordinator()
+        const wire = brokerMethodOf(method)
+        const [, apiName, apiKey] = APIS.find(([name]) => name === wire)
+        broker[wire].mockResolvedValueOnce(itemRefusals()[method])
+        f = fixture([broker])
+        const error = await f.admin[method](options).catch((e) => e)
+        expect(error).toBeInstanceOf(KafkaJSShareGroupsNotSupportedError)
+        expect(error).toMatchObject({
+          name: 'KafkaJSShareGroupsNotSupportedError',
+          reason: 'refused-by-broker',
+          retriable: false,
+          shareVersion: null,
+          apiKey,
+          apiName,
+        })
+        expect(broker[wire]).toHaveBeenCalledTimes(1)
+        expect(f.cluster.findGroupCoordinator).toHaveBeenCalledTimes(1)
+      }
+    )
 
     test.each([
       ['missing', 'api-not-advertised'],
@@ -729,6 +917,82 @@ describe('share administration', () => {
       expect(f.cluster.findGroupCoordinator).not.toHaveBeenCalled()
     })
 
+    test.each([
+      [
+        'list refuses a valid partition followed by a negative one',
+        'listShareGroupOffsets',
+        [{ topic: 'alpha', partitions: [0, -1] }],
+      ],
+      [
+        'list refuses a valid topic followed by one with an invalid partition',
+        'listShareGroupOffsets',
+        [
+          { topic: 'alpha', partitions: [0] },
+          { topic: 'beta', partitions: [1.5] },
+        ],
+      ],
+      [
+        'list refuses a valid topic followed by an empty topic name',
+        'listShareGroupOffsets',
+        [
+          { topic: 'alpha', partitions: [0] },
+          { topic: '', partitions: [0] },
+        ],
+      ],
+      [
+        'alter refuses a valid partition followed by an invalid offset',
+        'alterShareGroupOffsets',
+        [
+          {
+            topic: 'alpha',
+            partitions: [
+              { partition: 0, offset: '1' },
+              { partition: 1, offset: '-1' },
+            ],
+          },
+        ],
+      ],
+      [
+        'alter refuses a valid topic followed by one with a duplicate partition',
+        'alterShareGroupOffsets',
+        [
+          { topic: 'alpha', partitions: [{ partition: 0, offset: '1' }] },
+          {
+            topic: 'beta',
+            partitions: [
+              { partition: 0, offset: '1' },
+              { partition: 0, offset: '2' },
+            ],
+          },
+        ],
+      ],
+      [
+        'alter refuses a valid topic followed by an empty topic name',
+        'alterShareGroupOffsets',
+        [
+          { topic: 'alpha', partitions: [{ partition: 0, offset: '1' }] },
+          { topic: '', partitions: [{ partition: 0, offset: '1' }] },
+        ],
+      ],
+      [
+        'delete refuses a valid topic followed by an empty name',
+        'deleteShareGroupOffsets',
+        ['alpha', ''],
+      ],
+      [
+        'delete refuses a valid topic followed by a repeated name',
+        'deleteShareGroupOffsets',
+        ['alpha', 'beta', 'alpha'],
+      ],
+    ])('%s before discovery or any frame', async (title, method, topics) => {
+      f = fixture()
+      await expect(f.admin[method]({ groupId: 'share-group', topics })).rejects.toBeInstanceOf(
+        KafkaJSInvalidConfigurationError
+      )
+      expect(f.cluster.findGroupCoordinator).not.toHaveBeenCalled()
+      for (const wire of WIRE_METHODS) expect(f.brokers[0][wire]).not.toHaveBeenCalled()
+    })
+
     test('snapshots caller selections before delayed discovery', async () => {
       const broker = coordinator()
       const held = gate()
@@ -767,16 +1031,29 @@ describe('share administration', () => {
     test.each(CALLS)(
       '%s rejects held discovery without publishing or sending late work',
       async (...call) => {
+        jest.useFakeTimers()
         const broker = coordinator()
         const held = gate()
+        const entered = gate()
         f = fixture([broker])
-        f.cluster.findGroupCoordinator.mockImplementation(() => held.promise)
-        await expect(callWith(f.admin, call, { apiTimeout: 5 })).rejects.toBeInstanceOf(
-          KafkaJSTimeout
-        )
+        f.cluster.findGroupCoordinator.mockImplementation(() => {
+          entered.resolve()
+          return held.promise
+        })
+        let outcome
+        const pending = settle(callWith(f.admin, call, { apiTimeout: 5 })).then((result) => {
+          outcome = result
+        })
+        await entered.promise
+        await jest.advanceTimersByTimeAsync(4)
+        expect(outcome).toBeUndefined()
+        await jest.advanceTimersByTimeAsync(1)
+        await pending
+        expect(outcome.error).toBeInstanceOf(KafkaJSTimeout)
         held.resolve(broker)
-        await new Promise(setImmediate)
+        await flush()
         for (const wire of WIRE_METHODS) expect(broker[wire]).not.toHaveBeenCalled()
+        expect(f.cluster.findGroupCoordinator).toHaveBeenCalledTimes(1)
       }
     )
 
