@@ -552,7 +552,7 @@ const OBSERVATIONS = {
     settlements: [
       ['A', 1, 'HJ', 'accept', null, null],
       ['A', 2, 'HJ', 'accept', null, null],
-      ['A', 1, 'HJ', 'accept', 'session-lost', 25],
+      ['A', 1, 'HJ', 'accept', 'rejected-by-broker', 25],
       ['A', 0, 'HJ', 'accept', null, null],
       ['A', 0, 'H', 'release', 'membership-lost', null],
       ['A', 0, 'J', 'release', null, null],
@@ -722,25 +722,25 @@ const OBSERVATIONS = {
   },
   ackLost6: {
     handlers: [
-      ['A', 0, 'H'],
+      ['A', 0, 'HJ'],
       ['A', 1, 'HJ'],
       ['A', 2, 'HJ'],
-      ['A', 0, 'HJ'],
     ],
     mutations: [
+      ['A', 0, 'HJ', [1]],
       ['A', 1, 'HJ', [1]],
       ['A', 2, 'HJ', [1]],
       ['A', 0, 'H', [4]],
       ['A', 0, 'H', [4]],
-      ['A', 0, 'HJ', [1]],
+      ['A', 0, 'H', [4]],
     ],
     settlements: [
+      ['A', 0, 'HJ', 'accept', null, null],
       ['A', 1, 'HJ', 'accept', null, null],
       ['A', 2, 'HJ', 'accept', null, null],
       ['A', 0, 'H', 'renew', null, null],
       ['A', 0, 'H', 'renew', 'session-lost', 6],
-      ['A', 0, 'HJ', 'release', 'session-lost', 6],
-      ['A', 0, 'HJ', 'accept', null, null],
+      ['A', 0, 'H', 'renew', null, null],
     ],
   },
   ackLost35: {
@@ -807,7 +807,7 @@ const OBSERVATIONS = {
       ['A', 1, 'HJ', 'accept', null, null],
       ['A', 2, 'HJ', 'accept', null, null],
       ['A', 0, 'H', 'renew', null, null],
-      ['A', 0, 'H', 'renew', 'session-lost', 25],
+      ['A', 0, 'H', 'renew', 'rejected-by-broker', 25],
       ['A', 0, 'HJ', 'release', 'membership-lost', null],
       ['A', 0, 'HJ', 'accept', null, null],
     ],
@@ -993,13 +993,15 @@ const OBSERVATIONS = {
       ['A', 1, 'HJ'],
     ],
     mutations: [
-      ['A', 0, 'HJ', [1]],
+      ['A', 0, 'H', [1]],
+      ['A', 0, 'J', [1]],
       ['A', 1, 'H', [1]],
       ['A', 1, 'J', [1]],
       ['A', 2, 'HJ', [2]],
     ],
     settlements: [
-      ['A', 0, 'HJ', 'accept', null, null],
+      ['A', 0, 'H', 'accept', null, null],
+      ['A', 0, 'J', 'accept', null, null],
       ['A', 1, 'H', 'accept', null, null],
       ['A', 1, 'J', 'accept', null, null],
       ['A', 2, 'HJ', 'release', null, null],
@@ -1491,7 +1493,7 @@ const rows = [
       rounds: 8,
       nextEpoch: 0,
       held: 'membership-lost',
-      request: 'session-lost',
+      request: 'rejected-by-broker',
       backoff: 'none',
       sameOpen: false,
       oldAckResends: 0,
@@ -1625,7 +1627,7 @@ const rows = [
       state: 'STABLE',
       rounds: 8,
       nextEpoch: 3,
-      held: 'session-lost',
+      held: 'current',
       request: 'session-lost',
       backoff: 'none',
       sameOpen: true,
@@ -1671,7 +1673,7 @@ const rows = [
       rounds: 8,
       nextEpoch: 0,
       held: 'membership-lost',
-      request: 'session-lost',
+      request: 'rejected-by-broker',
       backoff: 'none',
       sameOpen: false,
       oldAckResends: 0,
@@ -2766,12 +2768,15 @@ class SessionFaultCase extends DataFaultCase {
         assert.equal(this.oldCohorts.has(row), false, 'old acknowledgements are never resent')
   }
 
-  /** @returns {Promise<void>} A plain error: the same open, epoch advanced, retried under backoff. */
+  /**
+   * @returns {Promise<void>} An advanced epoch on the same open; current renewal work remains
+   *   usable, while stale held work is reacquired under the row's policy.
+   */
   async verifyAdvance() {
     const { expected, step } = this.row
     await flush()
     assert.equal(this.seen.resets.length, this.resetsBefore, 'no session reset')
-    if (step === 'acknowledgement only' && expected.action === 'session-lost') {
+    if (step === 'acknowledgement only' && expected.held === 'session-lost') {
       const held = this.callOf(A0_H)
       assert.throws(() => held.acknowledge('accept'), { message: STALE_CALL })
       this.supplyOnce('A:0')
@@ -2793,6 +2798,17 @@ class SessionFaultCase extends DataFaultCase {
         .some(({ fields }) => fields.shareSessionEpoch === 0),
       false
     )
+    if (step === 'acknowledgement only' && expected.action === 'session-lost') {
+      assert.equal(next.apiKey, 79)
+      assert.equal(next.fields.isRenewAck, true)
+      assert.deepEqual(batchesOf(next), [{ firstOffset: H, lastOffset: H, acknowledgeTypes: [4] }])
+      await until(() => this.renewalAfter.settled, 'the subsequent successful renewal')
+      assert.equal(this.renewalAfter.error, null)
+      assert.equal(this.renewal.error.cause.code, 6)
+      const held = this.callOf(A0_H)
+      assert.equal(held.isRunning(), true)
+      assert.doesNotThrow(() => held.acknowledge('accept'))
+    }
   }
 
   /** @returns {Promise<void>} A leader move: the partition opens a new session on the hinted node. */

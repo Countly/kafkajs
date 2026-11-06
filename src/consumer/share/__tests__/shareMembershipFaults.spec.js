@@ -3272,6 +3272,7 @@ class MembershipFaultCase extends FaultCase {
   /**
    * Proves completed unresolved misses arm metadata backoff independently of healthy heartbeats.
    * Repeated identical targets preserve the original revision and due time; A remains usable.
+   * Delivers the due heartbeat at the exact deadline without advancing past its async reply.
    * @param {boolean} same Repeat the identical assignment at every heartbeat.
    * @returns {Promise<void>}
    */
@@ -3329,7 +3330,8 @@ class MembershipFaultCase extends FaultCase {
     }
     await this.pump(Math.max(0, due - performance.now() - 1))
     assert.equal(hold.call, null, 'no metadata retry before due time')
-    await this.advanceUntil(() => hold.call !== null, 'the due metadata retry')
+    await this.pump(1)
+    await this.arrival(hold, 'the due metadata retry')
     assert.equal(
       this.metadataCalls.filter(({ method }) => method === 'refreshMetadataForTopicIds').length,
       2
