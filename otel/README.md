@@ -84,6 +84,7 @@ message's `headers` (the caller's message object), and the consumer reads it bac
 
 ## Differences from `@opentelemetry/instrumentation-kafkajs` 0.32.0
 
+- ShareConsumer emits instrumentation events and diagnostics channels; this package does not create share-consumer spans.
 - **No `messaging.kafka.cluster.id`.** Upstream reads it from the client's internal modules
   (`src/producer/index.js`, `src/consumer/index.js`); this package patches the public API only.
 - **Module names and range:** `@countly/kafkajs` and `kafkajs`, both `>=3.0.0-0 <4`, instead of

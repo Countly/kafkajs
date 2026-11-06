@@ -27,6 +27,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - Add `Kafka.shareConsumer` with implicit or explicit acknowledgements, handler-driven renewal and bounded disconnect. Share isolation defaults to read_uncommitted and is configured per group; share groups require Kafka 4.2+.
 
+- Document share-consumer boundaries and offset-reset recipes, including compact acknowledgement events and the share-span boundary.
+
 - Add deterministic share membership, session and acknowledgement fault matrices, with captured shutdown authority, exact record outcomes and resource cleanup checks.
 
 #### Fixes
