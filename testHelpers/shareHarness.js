@@ -249,11 +249,11 @@ const acquire = (partition, base, values, extra = {}) => {
 
 /**
  * A scripted cluster with one Broker, pool, operation, session and loop per node. Answers come
- * from `script`, falling back to the quiet broker. The loop's clock `clock.time` moves only when a
- * pacing sleep or the test moves it. A run's pacing sleeps are waits of its operation, as in
- * production, but their timers are the test's: call `run.holdSleeps()` and every later sleep waits
- * in `run.timers` until the test releases it, so the test decides when "timer delivery" happens
- * and what the clock says by then.
+ * from `script`, falling back to the quiet broker even when no script is installed. The loop's
+ * clock `clock.time` moves only when a pacing sleep or the test moves it. A run's pacing sleeps
+ * are waits of its operation, as in production, but their timers are the test's: call
+ * `run.holdSleeps()` and every later sleep waits in `run.timers` until the test releases it, so
+ * the test decides when "timer delivery" happens and what the clock says by then.
  * @param {object} [options] Harness options.
  * @param {number} [options.nodes=1] Node count, at most three.
  * @param {object} [options.loop] Overrides of the loop's options.
@@ -274,6 +274,8 @@ const harness = async ({
   const schedule = new Schedule()
   const topology = [0, 1, 2].slice(0, nodes).map((id) => ({ id, host: `node${id}`, port: 9092 }))
   const cluster = createScriptedCluster({ nodes: topology, profile: 'share', schedule })
+  for (const api of ['ShareFetch', 'ShareAcknowledge'])
+    cluster.answer(api, (fields) => echo(api, fields))
   const clock = { time: 1000 }
   const gates = []
   const pools = []

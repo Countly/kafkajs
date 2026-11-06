@@ -681,7 +681,7 @@ describe('share session socket integration', () => {
         ['10', { owner: 'replacement' }],
         ['11', { owner: 'replacement' }],
       ],
-      results: [['10', '11', 'accept', undefined]],
+      results: [['10', '11', 'accept', null]],
     }
 
     /** @returns {{handled: Array<[string, object]>, results: Array<Array<*>>}} The public record of a run: what it handled with which acquisition identity, and every settlement with its failure. */
