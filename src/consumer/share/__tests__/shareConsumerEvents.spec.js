@@ -49,7 +49,7 @@ describe('Share consumer observer containment', () => {
     expect(() => c.runner.on('consumer.fetch', () => {})).toThrow(KafkaJSNonRetriableError)
     expect(() => c.runner.on('unknown', () => {})).toThrow(KafkaJSNonRetriableError)
   })
-  test('publishes a million-offset settlement as one range despite reentrant stop intent', () => {
+  test('publishes a million-offset settlement as one range and contains a throwing reentrant observer', () => {
     const c = setup()
     const token = Symbol('acquisition')
     const received = []
@@ -71,7 +71,6 @@ describe('Share consumer observer containment', () => {
     expect(prepared.ticket.acknowledgementBatches).toHaveLength(1)
     c.runner.on(events.ACKNOWLEDGE, ({ payload }) => {
       received.push(payload)
-      c.runner.stopGeneration++
       ledger.invalidate('membership-lost')
       throw new Error('observer')
     })
@@ -127,113 +126,101 @@ describe('public share event contract', () => {
     }
     return seen
   }
-  /** @param {object} flow Handler overrides. @returns {Promise<string[]>} The delivered offsets after a stop. */
-  const flow = async () => {
-    h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a', 'b'])])])
-    const delivered = []
-    await h.consumer.subscribe({ topics: ['topic-a'] })
-    await h.consumer.run({
-      eachMessage: async ({ message }) => {
-        delivered.push(message.offset)
-        if (message.offset === '0') throw new Error('first fails')
-      },
+  /** @param {object} frame A recorded share frame. @returns {object[]} Its acknowledgement batches. */
+  const batchesOf = ({ fields }) =>
+    fields.topics.flatMap((t) => t.partitions.flatMap((p) => p.acknowledgementBatches))
+
+  test('hands each listener fresh assignment copies that cannot reach the client state', async () => {
+    h = shareClient({ interval: 5 })
+    const seen = []
+    h.consumer.on(h.consumer.events.ASSIGNMENT_CHANGED, ({ payload }) => {
+      seen.push(JSON.parse(JSON.stringify(payload)))
+      if (payload.assignment[0]) payload.assignment[0].partitions.push(99)
+      payload.assignment.push({ topic: 'extra', partitions: [] })
+      if (payload.added[0]) payload.added[0].topic = 'mutated'
     })
-    await until(() => delivered.length === 2, 'both deliveries')
-    await until(() => h.frames(78).length >= 3, 'the acknowledgements')
-    await h.consumer.stop()
-    return delivered
-  }
-
-  test('contains sync and rejected observers at every real emit site', async () => {
-    const names = [
-      'CONNECT',
-      'HEARTBEAT',
-      'GROUP_JOIN',
-      'ASSIGNMENT_CHANGED',
-      'FETCH',
-      'ACKNOWLEDGE',
-      'HANDLER_ERROR',
-      'STOP',
-    ]
-    h = shareClient()
-    const errors = jest.spyOn(h.consumer.logger(), 'error')
-    let invoked = 0
-    for (const name of names) {
-      h.consumer.on(h.consumer.events[name], () => {
-        invoked++
-        throw new Error(`sync ${name}`)
-      })
-      h.consumer.on(h.consumer.events[name], () => {
-        invoked++
-        return Promise.reject(new Error(`async ${name}`))
-      })
-    }
-    const control = []
-    h.consumer.on(h.consumer.events.ACKNOWLEDGE, ({ payload }) => control.push(payload))
-    const delivered = await flow()
-    expect(delivered).toEqual(['0', '1'])
-    await until(
-      () =>
-        errors.mock.calls.filter(([message]) => message.startsWith('Failed to execute listener'))
-          .length === invoked,
-      'one log per failing listener call'
-    )
-    expect(invoked).toBeGreaterThanOrEqual(names.length * 2)
-    expect(control.length).toBeGreaterThan(0)
-    expect(h.frames(79).filter(({ fields }) => fields.shareSessionEpoch === -1)).toHaveLength(1)
-    expect(h.frames(76).filter(({ fields }) => fields.memberEpoch === -1)).toHaveLength(1)
+    await h.consumer.subscribe({ topics: ['topic-a'] })
+    await h.consumer.run({ eachMessage: async () => {} })
+    expect(seen).toHaveLength(1)
+    expect(h.consumer.assignment()).toEqual([{ topic: 'topic-a', partitions: [0] }])
+    const beat = h.hold({
+      api: 'ShareGroupHeartbeat',
+      match: ({ fields }) => fields.memberEpoch > 0,
+    })
+    const call = await beat.arrived()
+    beat.release({
+      errorCode: 0,
+      errorMessage: null,
+      memberId: call.fields.memberId,
+      memberEpoch: 2,
+      heartbeatIntervalMs: 5,
+      assignment: { topicPartitions: [] },
+    })
+    await until(() => seen.length === 2, 'the revocation event')
+    expect(seen[1]).toMatchObject({
+      memberEpoch: 2,
+      assignment: [],
+      added: [],
+      removed: [{ topic: 'topic-a', partitions: [0] }],
+    })
+    expect(h.consumer.assignment()).toEqual([])
   })
 
-  test('publishes the exact payload of each runtime event', async () => {
-    h = shareClient()
-    const seen = record([
-      'CONNECT',
-      'GROUP_JOIN',
-      'ASSIGNMENT_CHANGED',
-      'FETCH',
-      'HANDLER_ERROR',
-      'STOP',
-      'DISCONNECT',
-    ])
-    await flow()
-    await h.consumer.disconnect()
-    const [assignment] = seen.ASSIGNMENT_CHANGED
-    expect(Object.keys(assignment.payload).sort()).toEqual([
-      'added',
-      'assignment',
-      'groupId',
-      'memberEpoch',
-      'memberId',
-      'removed',
-    ])
-    expect(assignment.type).toBe('share_consumer.assignment_changed')
-    expect(assignment.payload.added).toEqual([{ topic: 'topic-a', partitions: [0] }])
-    expect(assignment.payload.removed).toEqual([])
-    assignment.payload.assignment[0].partitions.push(99)
-    const withRecords = seen.FETCH.find(({ payload }) => payload.numberOfRecords > 0)
-    expect(Object.keys(withRecords.payload).sort()).toEqual([
-      'acknowledgementsPiggybacked',
-      'duration',
-      'nodeId',
-      'numberOfGaps',
-      'numberOfRecords',
-      'sessionEpoch',
-    ])
-    expect(withRecords.payload).toMatchObject({ nodeId: 0, numberOfRecords: 2, numberOfGaps: 0 })
-    expect(seen.HANDLER_ERROR).toHaveLength(1)
-    expect(Object.keys(seen.HANDLER_ERROR[0].payload).sort()).toEqual([
-      'error',
-      'offsets',
-      'partition',
-      'topic',
-    ])
-    expect(seen.HANDLER_ERROR[0].payload.error.message).toBe('first fails')
-    for (const name of ['CONNECT', 'STOP', 'DISCONNECT']) {
-      expect(seen[name]).toHaveLength(1)
-      expect(seen[name][0].payload).toBeUndefined()
+  test.each(['stop', 'disconnect'])(
+    'publishes every range of one settlement once when an acknowledge listener calls %s',
+    async (closeCall) => {
+      h = shareClient()
+      const { consumer } = h
+      const acks = []
+      const stops = []
+      const disconnects = []
+      let closing
+      consumer.on(consumer.events.STOP, () => stops.push(1))
+      consumer.on(consumer.events.DISCONNECT, () => disconnects.push(1))
+      consumer.on(consumer.events.ACKNOWLEDGE, ({ payload }) => {
+        acks.push(payload)
+        if (acks.length === 1) {
+          closing = closeCall === 'stop' ? consumer.stop() : consumer.disconnect({ timeout: 0 })
+        }
+      })
+      h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a', 'b', 'c'])])])
+      await consumer.subscribe({ topics: ['topic-a'] })
+      await consumer.run({
+        eachBatch: async ({ batch, acknowledge }) => {
+          acknowledge(batch.messages[0])
+          acknowledge(batch.messages[1], 'reject')
+          acknowledge(batch.messages[2])
+        },
+      })
+      await until(() => closing !== undefined, 'the reentrant close')
+      await closing
+      const rows = () =>
+        acks.map(({ firstOffset, lastOffset, type, error }) => [
+          firstOffset,
+          lastOffset,
+          type,
+          error,
+        ])
+      expect(rows()).toEqual([
+        ['0', '0', 'accept', null],
+        ['1', '1', 'reject', null],
+        ['2', '2', 'accept', null],
+      ])
+      expect(stops).toHaveLength(1)
+      expect(disconnects).toHaveLength(closeCall === 'disconnect' ? 1 : 0)
+      expect(consumer.assignment()).toEqual([])
+      expect(h.frames(79).flatMap(batchesOf)).toEqual([])
+
+      if (closeCall === 'disconnect') await consumer.subscribe({ topics: ['topic-a'] })
+      h.script('ShareFetch', [fetchAnswer([acquire(0, 10, ['x'])])])
+      const delivered = []
+      await consumer.run({ eachMessage: async ({ message }) => delivered.push(message.offset) })
+      await until(() => rows().length === 4, 'the acknowledgement of the new run')
+      expect(delivered).toEqual(['10'])
+      expect(rows()[3]).toEqual(['10', '10', 'accept', null])
+      expect(acks).toHaveLength(4)
     }
-    expect(seen.GROUP_JOIN).toHaveLength(1)
-  })
+  )
 
   test('publishes one membership session reset counting only the discarded delivered records', async () => {
     h = shareClient()

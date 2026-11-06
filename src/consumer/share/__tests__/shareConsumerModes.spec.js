@@ -258,9 +258,12 @@ describe('Share consumer handler decisions', () => {
 
 describe('public share handler contract', () => {
   const {
+    A,
     acquire,
     acquired,
     ackAnswer,
+    deferred,
+    echo,
     fetchAnswer,
     flush,
     part,
@@ -268,32 +271,100 @@ describe('public share handler contract', () => {
     shareClient,
     until,
   } = require('../../../../testHelpers/shareHarness')
+  const {
+    batch: batchBytes,
+    record: recordBytes,
+    controlBatch,
+  } = require('../../../protocol/requests/fetch/__tests__/fixtures/recordBatchBytes')
+  const FAKE_TIMERS = { doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'] }
+  const PACED = { retry: { initialRetryTime: 300, multiplier: 2, maxRetryTime: 1200, factor: 0 } }
   let h
   afterEach(async () => {
     await h?.close()
     h = undefined
+    jest.useRealTimers()
     jest.restoreAllMocks()
   })
-  /** @param {object} [options] `shareClient` options. @returns {Promise<object>} Subscribed client with observers. */
+  /**
+   * @param {object} [options] `shareClient` options.
+   * @returns {Promise<object>} A subscribed client; `acks`, `errors` and `crashes` hold its
+   *   acknowledge, handler_error and crash payloads, `timeline` their names in publication order
+   *   and `crashed` settles at the first crash event.
+   */
   const start = async (options) => {
     h = shareClient(options)
     h.acks = []
     h.errors = []
     h.crashes = []
-    h.consumer.on(h.consumer.events.ACKNOWLEDGE, ({ payload }) => h.acks.push(payload))
-    h.consumer.on(h.consumer.events.HANDLER_ERROR, ({ payload }) => h.errors.push(payload))
-    h.consumer.on(h.consumer.events.CRASH, ({ payload }) => h.crashes.push(payload))
-    await h.consumer.subscribe({ topics: ['topic-a'] })
+    h.timeline = []
+    h.crashed = deferred()
+    const { consumer } = h
+    consumer.on(consumer.events.ACKNOWLEDGE, ({ payload }) => {
+      h.acks.push(payload)
+      h.timeline.push('acknowledge')
+    })
+    consumer.on(consumer.events.HANDLER_ERROR, ({ payload }) => {
+      h.errors.push(payload)
+      h.timeline.push('handler_error')
+    })
+    consumer.on(consumer.events.CRASH, ({ payload }) => {
+      h.crashes.push(payload)
+      h.timeline.push('crash')
+      h.crashed.resolve()
+    })
+    await consumer.subscribe({ topics: ['topic-a'] })
     return h
   }
   /** @returns {object[]} The acknowledgement batches each ShareFetch carried, in order. */
-  const batches = () =>
-    h
-      .frames(78)
-      .map(({ fields }) =>
-        fields.topics.flatMap((t) => t.partitions.flatMap((p) => p.acknowledgementBatches))
-      )
+  const batches = () => h.frames(78).map(batchesOf)
+  /** @param {object} frame A recorded share frame. @returns {object[]} Its acknowledgement batches. */
+  const batchesOf = ({ fields }) =>
+    fields.topics.flatMap((t) => t.partitions.flatMap((p) => p.acknowledgementBatches))
+  /** @returns {object} One wire acknowledgement batch. */
+  const wire = (first, last, types) => ({
+    firstOffset: String(first),
+    lastOffset: String(last),
+    acknowledgeTypes: types,
+  })
+  /** @param {object[]} acks Acknowledge payloads. @returns {Array<Array>} Range, type and error reason of each. */
+  const outcomes = (acks) =>
+    acks.map(({ firstOffset, lastOffset, type, error }) => [
+      firstOffset,
+      lastOffset,
+      type,
+      error ? error.reason : null,
+    ])
   const answer = (values, base = 0) => fetchAnswer([acquire(0, base, values)])
+  /**
+   * Answers the next steady heartbeat with the given fields.
+   * @param {object} fields Fields laid over a successful answer.
+   * @returns {Promise<void>}
+   */
+  const answerNextBeat = async (fields) => {
+    const beat = h.hold({ api: 'ShareGroupHeartbeat', match: ({ fields: f }) => f.memberEpoch > 0 })
+    const call = await beat.arrived()
+    beat.release({
+      errorCode: 0,
+      errorMessage: null,
+      memberId: call.fields.memberId,
+      memberEpoch: 2,
+      heartbeatIntervalMs: 5,
+      assignment: null,
+      ...fields,
+    })
+  }
+  /**
+   * Moves the fake clock in steps of at most 50 ms and lets the scripted sockets answer after each,
+   * so a timer that one step fires can finish its work before the next step.
+   * @param {number} ms Fake milliseconds.
+   * @returns {Promise<void>}
+   */
+  const tick = async (ms) => {
+    for (let left = ms; left > 0; left -= 50) {
+      await jest.advanceTimersByTimeAsync(Math.min(50, left))
+      await flush()
+    }
+  }
 
   test('accepts implicit message and batch normal returns', async () => {
     for (const handler of ['eachMessage', 'eachBatch']) {
@@ -309,9 +380,7 @@ describe('public share handler contract', () => {
       })
       await until(() => batches().some((b) => b.length > 0), 'a piggybacked acknowledgement')
       expect(handled).toEqual(['0', '1'])
-      expect(batches().find((b) => b.length > 0)).toEqual([
-        { firstOffset: '0', lastOffset: '1', acknowledgeTypes: [1] },
-      ])
+      expect(batches().find((b) => b.length > 0)).toEqual([wire(0, 1, [1])])
       await until(() => h.acks.length === 1, 'the settled acknowledgement')
       expect(h.acks[0]).toMatchObject({ type: 'accept', error: null })
       expect(h.frames(79)).toHaveLength(0)
@@ -324,22 +393,37 @@ describe('public share handler contract', () => {
 
   test('keeps explicit choices in implicit mode', async () => {
     await start()
-    h.script('ShareFetch', [answer(['a'])])
+    h.script('ShareFetch', [answer(['a', 'b'])])
+    const held = deferred()
+    const handled = []
     await h.consumer.run({
-      eachMessage: async ({ acknowledge }) => {
-        acknowledge('reject')
-        acknowledge('release')
-        acknowledge('reject')
+      eachMessage: async ({ message, acknowledge }) => {
+        handled.push(message.offset)
+        if (message.offset === '0') {
+          acknowledge('accept')
+          acknowledge('reject')
+          acknowledge('release')
+          acknowledge('reject')
+          await held.promise
+        } else {
+          acknowledge('release')
+        }
       },
     })
-    await until(() => batches().some((b) => b.length > 0), 'a piggybacked acknowledgement')
-    expect(batches().find((b) => b.length > 0)).toEqual([
-      { firstOffset: '0', lastOffset: '0', acknowledgeTypes: [3] },
-    ])
+    await until(() => handled.length === 1, 'the first handler')
+    await flush()
+    expect(h.frames(79)).toHaveLength(0)
+    expect(h.frames(78)).toHaveLength(1)
+    held.resolve()
+    await until(() => h.frames(78).length === 2, 'the next fetch')
+    expect(handled).toEqual(['0', '1'])
+    expect(batchesOf(h.frames(78)[1])).toEqual([wire(0, 1, [3, 2])])
+    expect(h.crashes).toHaveLength(0)
   })
 
-  test('releases undecided records after a throw', async () => {
-    for (const acknowledgementMode of ['implicit', 'explicit']) {
+  test.each(['implicit', 'explicit'])(
+    'releases undecided records after a throw in %s mode',
+    async (acknowledgementMode) => {
       await start({ share: { acknowledgementMode } })
       h.script('ShareFetch', [answer(['a', 'b'])])
       const failure = new Error('handler failed')
@@ -349,20 +433,23 @@ describe('public share handler contract', () => {
           throw failure
         },
       })
-      await until(
-        () => h.frames(79).length + batches().filter((b) => b.length).length > 0,
-        'the release flush'
-      )
-      await until(() => h.errors.length === 1, 'the handler error')
+      await until(() => h.frames(79).length === 1 && h.acks.length === 2, 'the release flush')
+      expect(h.errors).toHaveLength(1)
       expect(h.errors[0].error).toBe(failure)
-      expect(h.errors[0]).toMatchObject({ topic: 'topic-a', partition: 0, offsets: ['0', '1'] })
-      const flush79 = h.frames(79)[0]?.fields.topics[0].partitions[0].acknowledgementBatches
-      const sent = flush79 ?? batches().find((b) => b.length > 0)
-      expect(sent).toEqual([{ firstOffset: '0', lastOffset: '1', acknowledgeTypes: [3, 2] }])
-      await h.close()
-      h = undefined
+      expect(h.errors[0]).toEqual({
+        topic: 'topic-a',
+        partition: 0,
+        offsets: ['0', '1'],
+        error: failure,
+      })
+      expect(h.frames(79).map(batchesOf)).toEqual([[wire(0, 1, [3, 2])]])
+      expect(outcomes(h.acks)).toEqual([
+        ['0', '0', 'reject', null],
+        ['1', '1', 'release', null],
+      ])
+      expect(h.crashes).toHaveLength(0)
     }
-  })
+  )
 
   test('releases omission then crashes explicit mode without restart', async () => {
     const restartOnFailure = jest.fn(async () => true)
@@ -371,18 +458,26 @@ describe('public share handler contract', () => {
     await h.consumer.run({
       eachBatch: async ({ batch, acknowledge }) => acknowledge(batch.messages[0]),
     })
-    await until(() => h.crashes.length === 1, 'the crash event')
-    const { error, restart } = h.crashes[0]
+    await h.crashed.promise
+    expect(h.crashes).toHaveLength(1)
+    const { error, restart, groupId } = h.crashes[0]
     expect(error).toMatchObject({
       name: 'KafkaJSShareAcknowledgementError',
       reason: 'unacknowledged',
+      topic: 'topic-a',
+      partition: 0,
       ranges: [{ firstOffset: '1', lastOffset: '1' }],
     })
-    expect(restart).toBe(false)
+    expect({ restart, groupId }).toEqual({ restart: false, groupId: 'group' })
     expect(restartOnFailure).toHaveBeenCalledTimes(1)
+    expect(restartOnFailure.mock.calls[0][0]).toBe(error)
     expect(h.errors).toHaveLength(0)
-    const sent = h.frames(79)[0]?.fields.topics[0].partitions[0].acknowledgementBatches
-    expect(sent).toEqual([{ firstOffset: '0', lastOffset: '1', acknowledgeTypes: [1, 2] }])
+    expect(h.frames(79).map(batchesOf)).toEqual([[wire(0, 1, [1, 2])]])
+    expect(outcomes(h.acks)).toEqual([
+      ['0', '0', 'accept', null],
+      ['1', '1', 'release', null],
+    ])
+    expect(h.timeline).toEqual(['acknowledge', 'acknowledge', 'crash'])
   })
 
   test('settles a fully acknowledged explicit batch without a crash', async () => {
@@ -406,23 +501,127 @@ describe('public share handler contract', () => {
     await until(() => h.frames(78).length >= 3, 'the node keeps fetching')
   })
 
-  test('rejects late and foreign acknowledgements', async () => {
-    await start()
-    h.script('ShareFetch', [answer(['a'])])
-    const saved = []
+  test('rejects late, foreign and invalid acknowledgements', async () => {
+    await start({ share: { acknowledgementMode: 'explicit' } })
+    const both = (deliveryCount) =>
+      fetchAnswer([
+        part({
+          partition: 0,
+          acquire: [acquired(0, 1, deliveryCount)],
+          records: recordsHex(0, ['a', 'b']),
+        }),
+      ])
+    h.script('ShareFetch', [both(1), both(2)])
+    const attempt = (call) => {
+      try {
+        call()
+        return 'accepted'
+      } catch (error) {
+        return `${error.name}: ${error.message}`
+      }
+    }
+    const seen = { first: [], second: [] }
+    let first
     await h.consumer.run({
-      eachMessage: async ({ message, acknowledge, renew }) => {
-        saved.push({ acknowledge, renew })
-        expect(() => acknowledge('renew')).toThrow()
-        expect(message.deliveryCount).toBe(1)
+      eachBatch: async ({ batch, acknowledge, renew }) => {
+        const [m0, m1] = batch.messages
+        if (!first) {
+          first = { acknowledge, renew, messages: batch.messages }
+          seen.first.push(
+            attempt(() => acknowledge({ ...m0 })),
+            attempt(() => acknowledge(m0, 'renew')),
+            attempt(() => acknowledge({ offset: '9' })),
+            attempt(() => acknowledge({ offset: '1' }, 'reject'))
+          )
+          acknowledge(m0)
+        } else {
+          seen.second.push(
+            attempt(() => first.acknowledge(m0)),
+            attempt(() => first.renew()),
+            attempt(() => acknowledge(first.messages[0])),
+            attempt(() => acknowledge({ offset: '0' }))
+          )
+          acknowledge(m1)
+        }
       },
     })
-    await until(() => saved.length === 1 && batches().some((b) => b.length > 0), 'the return')
-    expect(() => saved[0].acknowledge('reject')).toThrow('no longer current')
-    expect(() => saved[0].renew()).toThrow('no longer current')
-    expect(batches().find((b) => b.length > 0)).toEqual([
-      { firstOffset: '0', lastOffset: '0', acknowledgeTypes: [1] },
+    await until(() => seen.second.length === 4 && h.frames(78).length >= 3, 'both calls')
+    expect(seen.first).toEqual([
+      'KafkaJSNonRetriableError: Message does not belong to this handler call',
+      'KafkaJSNonRetriableError: Invalid terminal acknowledgement',
+      'KafkaJSNonRetriableError: Message does not belong to this handler call',
+      'accepted',
     ])
+    expect(seen.second).toEqual([
+      'KafkaJSNonRetriableError: Handler call is no longer current',
+      'KafkaJSNonRetriableError: Handler call is no longer current',
+      'KafkaJSNonRetriableError: Message does not belong to this handler call',
+      'accepted',
+    ])
+    expect(batches().slice(1, 3)).toEqual([[wire(0, 1, [1, 3])], [wire(0, 1, [1])]])
+    expect(h.frames(79)).toHaveLength(0)
+    expect(h.crashes).toHaveLength(0)
+  })
+
+  test('preserves last decisions until the handler returns', async () => {
+    await start()
+    h.script('ShareFetch', [answer(['a'])])
+    h.script('ShareAcknowledge', [
+      ackAnswer([{ partition: 0 }], { acquisitionLockTimeoutMs: 2000 }),
+    ])
+    const held = deferred()
+    const renewed = []
+    await h.consumer.run({
+      eachMessage: async ({ acknowledge, renew }) => {
+        acknowledge('accept')
+        acknowledge('release')
+        acknowledge('reject')
+        renewed.push(await renew())
+        await held.promise
+      },
+    })
+    await until(() => renewed.length === 1, 'the renewal')
+    const beat = h.hold({
+      api: 'ShareGroupHeartbeat',
+      match: ({ fields }) => fields.memberEpoch > 0,
+    })
+    await beat.arrived()
+    beat.release()
+    await flush()
+    expect(h.frames(79).map(({ fields }) => fields.isRenewAck)).toEqual([true])
+    expect(h.frames(78)).toHaveLength(1)
+    expect(h.acks.filter(({ type }) => type !== 'renew')).toEqual([])
+    held.resolve()
+    await until(() => h.frames(78).length === 2, 'the next fetch')
+    expect(batchesOf(h.frames(78)[1])).toEqual([wire(0, 0, [3])])
+  })
+
+  test('lets a crash capture the last provisional choice through the closing authority', async () => {
+    await start({ share: { acknowledgementMode: 'explicit' } })
+    h.script('ShareFetch', [answer(['a'])])
+    const held = deferred()
+    const decided = deferred()
+    await h.consumer.run({
+      eachMessage: async ({ acknowledge }) => {
+        acknowledge('accept')
+        acknowledge('reject')
+        decided.resolve()
+        await held.promise
+      },
+    })
+    await decided.promise
+    await answerNextBeat({ errorCode: 30, memberEpoch: -1, heartbeatIntervalMs: 0 })
+    await h.crashed.promise
+    expect(h.crashes[0].restart).toBe(false)
+    expect(h.frames(78)).toHaveLength(1)
+    const finals = h.frames(79).filter(({ fields }) => fields.shareSessionEpoch === -1)
+    expect(finals).toHaveLength(1)
+    expect(batchesOf(finals[0])).toEqual([wire(0, 0, [3])])
+    expect(h.frames(79)).toHaveLength(1)
+    held.resolve()
+    await flush()
+    expect(h.frames(79)).toHaveLength(1)
+    expect(h.errors).toHaveLength(0)
   })
 
   test('releases an early stopped batch in either mode', async () => {
@@ -441,13 +640,184 @@ describe('public share handler contract', () => {
       await stopping
       expect(h.crashes).toHaveLength(0)
       const final = h.frames(79)[0]?.fields.topics[0].partitions[0].acknowledgementBatches
-      expect(final).toEqual([{ firstOffset: '0', lastOffset: '2', acknowledgeTypes: [3, 2, 2] }])
+      expect(final).toEqual([wire(0, 2, [3, 2, 2])])
       await h.close()
       h = undefined
     }
   })
 
-  test('does not expose gaps or control records to handlers', async () => {
+  test.each([
+    ['a normal return', false],
+    ['a throw', true],
+  ])('ignores %s of a handler that was fenced before it returned', async (_, throws) => {
+    await start()
+    h.script('ShareFetch', [answer(['a']), answer(['b'], 5)])
+    const held = deferred()
+    const handled = []
+    let saved
+    await h.consumer.run({
+      eachMessage: async ({ message, acknowledge }) => {
+        handled.push(message.offset)
+        if (message.offset !== '0') return
+        saved = acknowledge
+        await held.promise
+        if (throws) throw new Error('late failure')
+      },
+    })
+    await until(() => handled.length === 1, 'the first handler')
+    const rejoin = h.hold({
+      api: 'ShareGroupHeartbeat',
+      match: ({ fields }) => fields.memberEpoch === 0,
+    })
+    await answerNextBeat({ errorCode: 110, memberEpoch: -1, heartbeatIntervalMs: 0 })
+    await rejoin.arrived()
+    rejoin.release()
+    await until(() => handled.length === 2, 'the replacement handler')
+    const old = () => h.acks.filter(({ firstOffset }) => firstOffset === '0')
+    expect(outcomes(old())).toEqual([['0', '0', 'release', 'membership-lost']])
+    const frames79 = h.frames(79).length
+    held.resolve()
+    await flush()
+    expect(outcomes(old())).toEqual([['0', '0', 'release', 'membership-lost']])
+    expect(h.errors).toEqual([])
+    expect(h.frames(79)).toHaveLength(frames79)
+    expect(() => saved('reject')).toThrow('Handler call is no longer current')
+    await until(
+      () => h.acks.some(({ firstOffset, error }) => firstOffset === '5' && error === null),
+      'the replacement acknowledgement'
+    )
+    expect(handled).toEqual(['0', '5'])
+  })
+
+  test('paces consecutive handler failures and resets on success', async () => {
+    jest.useFakeTimers(FAKE_TIMERS)
+    await start({ share: PACED })
+    const stamps = []
+    const reader = (values, base) => () => {
+      stamps.push(performance.now())
+      return values ? answer(values, base) : undefined
+    }
+    h.script('ShareFetch', [
+      reader(['a'], 0),
+      reader(['b'], 1),
+      reader(['c'], 2),
+      reader(['d'], 3),
+      reader(),
+    ])
+    let calls = 0
+    await h.consumer.run({
+      eachMessage: async () => {
+        calls++
+        if (calls !== 3) throw new Error('fail')
+      },
+    })
+    await until(() => h.errors.length === 1, 'the first failure')
+    const since = () => stamps.map((stamp) => stamp - stamps[0])
+    await tick(299)
+    expect(since()).toEqual([0])
+    await tick(1)
+    await until(() => h.errors.length === 2, 'the second failure')
+    expect(since()).toEqual([0, 300])
+    await tick(599)
+    expect(since()).toEqual([0, 300])
+    await tick(1)
+    await until(() => h.errors.length === 3, 'the failure after the reset')
+    expect(since()).toEqual([0, 300, 900, 900])
+    await tick(299)
+    expect(since()).toEqual([0, 300, 900, 900])
+    await tick(1)
+    await until(() => stamps.length === 5, 'the fifth fetching request')
+    expect(since()).toEqual([0, 300, 900, 900, 1200])
+    expect(h.errors).toHaveLength(3)
+  })
+
+  test('does not let progress on another node reset a failing node backoff', async () => {
+    jest.useFakeTimers(FAKE_TIMERS)
+    await start({
+      nodes: 2,
+      topics: {
+        'topic-a': {
+          topicId: A,
+          partitions: [
+            { leader: 0, epoch: 1 },
+            { leader: 1, epoch: 1 },
+          ],
+        },
+      },
+      share: PACED,
+    })
+    const stamps = []
+    const calls = [0, 0]
+    const successes = []
+    h.cluster.answer('ShareFetch', (fields, call) => {
+      const nth = calls[call.node]++
+      if (call.node === 0) {
+        stamps.push(performance.now())
+        return nth < 3 ? answer(['x'], nth) : echo('ShareFetch', fields)
+      }
+      return [1, 3].includes(nth)
+        ? fetchAnswer([acquire(1, nth, ['y'])])
+        : echo('ShareFetch', fields)
+    })
+    await h.consumer.run({
+      eachMessage: async ({ partition, message }) => {
+        if (partition === 0) throw new Error('fail')
+        successes.push(message.offset)
+      },
+    })
+    await until(() => h.errors.length === 1, 'the first failure of the failing node')
+    const since = () => stamps.map((stamp) => stamp - stamps[0])
+    await tick(299)
+    await until(() => successes.length === 2, 'the progress of the other node')
+    expect(successes).toEqual(['1', '3'])
+    expect(since()).toEqual([0])
+    await tick(1)
+    await until(() => h.errors.length === 2, 'the second failure')
+    expect(since()).toEqual([0, 300])
+    await tick(599)
+    expect(since()).toEqual([0, 300])
+    await tick(1)
+    await until(() => stamps.length === 3, 'the third fetching request')
+    expect(since()).toEqual([0, 300, 900])
+  })
+
+  test('cancels the owned pacing wait when the run stops', async () => {
+    jest.useFakeTimers(FAKE_TIMERS)
+    await start({ share: PACED })
+    h.script('ShareFetch', [answer(['a'])])
+    await h.consumer.run({
+      eachMessage: async () => {
+        throw new Error('fail')
+      },
+    })
+    await until(() => h.errors.length === 1, 'the failure')
+    const stopped = performance.now()
+    await h.consumer.stop()
+    expect(performance.now()).toBe(stopped)
+    expect(h.frames(78)).toHaveLength(1)
+    expect(h.crashes).toHaveLength(0)
+  })
+
+  test('does not expose control records to handlers and acknowledges them as gaps', async () => {
+    await start()
+    const records = Buffer.concat([
+      batchBytes({
+        baseOffset: 0n,
+        records: [recordBytes({ offsetDelta: 0, key: 'k0', value: 'data' })],
+      }),
+      controlBatch({ baseOffset: 1n }),
+    ]).toString('hex')
+    h.script('ShareFetch', [
+      fetchAnswer([part({ partition: 0, acquire: [acquired(0, 2)], records })]),
+    ])
+    const handled = []
+    await h.consumer.run({ eachMessage: async ({ message }) => handled.push(message.offset) })
+    await until(() => batches().some((b) => b.length > 0), 'a piggybacked acknowledgement')
+    expect(handled).toEqual(['0'])
+    expect(batches().find((b) => b.length > 0)).toEqual([wire(0, 0, [1]), wire(1, 2, [0])])
+  })
+
+  test('does not expose gaps to handlers', async () => {
     await start()
     const records = recordsHex(0, ['data'])
     h.script('ShareFetch', [
@@ -457,10 +827,57 @@ describe('public share handler contract', () => {
     await h.consumer.run({ eachMessage: async ({ message }) => handled.push(message.offset) })
     await until(() => batches().some((b) => b.length > 0), 'a piggybacked acknowledgement')
     expect(handled).toEqual(['0'])
-    expect(batches().find((b) => b.length > 0)).toEqual([
-      { firstOffset: '0', lastOffset: '0', acknowledgeTypes: [1] },
-      { firstOffset: '1', lastOffset: '2', acknowledgeTypes: [0] },
+    expect(batches().find((b) => b.length > 0)).toEqual([wire(0, 0, [1]), wire(1, 2, [0])])
+  })
+
+  test('keeps the prefix of a halted acquisition and releases the remainder compactly', async () => {
+    await start()
+    const good = batchBytes({
+      baseOffset: 0n,
+      records: [
+        recordBytes({ offsetDelta: 0, key: 'k0', value: 'p' }),
+        recordBytes({ offsetDelta: 1, key: 'k1', value: 'q' }),
+      ],
+    })
+    const bad = batchBytes({
+      baseOffset: 2n,
+      records: [recordBytes({ offsetDelta: 0, key: 'k2', value: 'x' })],
+      crc: 1,
+    })
+    h.script('ShareFetch', [
+      fetchAnswer([
+        part({
+          partition: 0,
+          acquire: [acquired(0, 999999)],
+          records: Buffer.concat([good, bad]).toString('hex'),
+        }),
+      ]),
     ])
+    const handled = []
+    await h.consumer.run({
+      eachMessage: async ({ message }) => handled.push(message.value.toString()),
+    })
+    await until(() => batches().some((b) => b.length > 0), 'a piggybacked acknowledgement')
+    expect(handled).toEqual(['p', 'q'])
+    expect(batches().find((b) => b.length > 0)).toEqual([wire(0, 1, [1]), wire(2, 999999, [2])])
+    expect(h.crashes).toHaveLength(0)
+  })
+
+  test('acknowledges an incomplete trailing batch as one gap and starts no handler', async () => {
+    await start()
+    const incomplete = Buffer.alloc(13)
+    incomplete.writeBigInt64BE(0n, 0)
+    incomplete.writeInt32BE(100, 8)
+    h.script('ShareFetch', [
+      fetchAnswer([
+        part({ partition: 0, acquire: [acquired(0, 0)], records: incomplete.toString('hex') }),
+      ]),
+    ])
+    const handled = []
+    await h.consumer.run({ eachMessage: async ({ message }) => handled.push(message.offset) })
+    await until(() => batches().some((b) => b.length > 0), 'a piggybacked acknowledgement')
+    expect(handled).toEqual([])
+    expect(batches().find((b) => b.length > 0)).toEqual([wire(0, 0, [0])])
   })
 
   test.each([
@@ -482,35 +899,45 @@ describe('public share handler contract', () => {
     expect(h.acks[0]).toMatchObject({ type: 'release', error: null })
   })
 
-  test('paces consecutive handler failures and resets on success', async () => {
-    await start({
-      share: { retry: { initialRetryTime: 300, multiplier: 2, maxRetryTime: 1200, factor: 0 } },
-    })
-    const stamps = []
-    const reader = (values, base) => () => {
-      stamps.push(performance.now())
-      return values ? answer(values, base) : undefined
-    }
-    h.script('ShareFetch', [
-      reader(['a'], 0),
-      reader(['b'], 1),
-      reader(['c'], 2),
-      reader(['d'], 3),
-      reader(),
-    ])
-    let calls = 0
+  test('keeps the original error and settles a release the broker refused with 121', async () => {
+    await start()
+    h.script('ShareFetch', [answer(['a'])])
+    h.script('ShareAcknowledge', [ackAnswer([{ partition: 0, code: 121 }])])
+    const failure = new Error('handler failed')
     await h.consumer.run({
       eachMessage: async () => {
-        calls++
-        if (calls !== 3) throw new Error('fail')
+        throw failure
       },
     })
-    await until(() => stamps.length === 5, 'five fetching requests')
-    expect(h.errors).toHaveLength(3)
-    expect(stamps[1] - stamps[0]).toBeGreaterThanOrEqual(299)
-    expect(stamps[2] - stamps[1]).toBeGreaterThanOrEqual(599)
-    expect(stamps[4] - stamps[3]).toBeGreaterThanOrEqual(299)
-    expect(stamps[4] - stamps[3]).toBeLessThan(599)
+    await until(() => h.acks.length === 1, 'the refused release')
+    await flush()
+    expect(h.errors).toHaveLength(1)
+    expect(h.errors[0].error).toBe(failure)
+    expect(outcomes(h.acks)).toEqual([['0', '0', 'release', 'rejected-by-broker']])
+    expect(h.acks[0].error).not.toBe(failure)
+    expect(h.frames(79)).toHaveLength(1)
+    expect(h.acks.some(({ type }) => type === 'accept')).toBe(false)
+    expect(h.crashes).toHaveLength(0)
+  })
+
+  test('keeps the original error and settles a release whose answer was lost', async () => {
+    await start()
+    h.script('ShareFetch', [answer(['a'])])
+    const gate = h.hold({ api: 'ShareAcknowledge' })
+    const failure = new Error('handler failed')
+    await h.consumer.run({
+      eachMessage: async () => {
+        throw failure
+      },
+    })
+    await gate.arrived()
+    gate.fail(new Error('connection lost'))
+    await until(() => h.acks.length === 1, 'the lost release')
+    expect(h.errors).toHaveLength(1)
+    expect(h.errors[0].error).toBe(failure)
+    expect(outcomes(h.acks)).toEqual([['0', '0', 'release', 'session-lost']])
+    expect(h.frames(79)).toHaveLength(1)
+    expect(h.acks.some(({ type }) => type === 'accept')).toBe(false)
   })
 
   test('does not fetch while a returned handler renewal is pending and then resolves it', async () => {
@@ -537,9 +964,17 @@ describe('public share handler contract', () => {
     expect(settled).toBe(false)
     expect(h.frames(78)).toHaveLength(fetches)
     expect(h.frames(79)).toHaveLength(1)
+    expect(h.frames(79)[0].fields.isRenewAck).toBe(true)
     gate.release()
     await expect(renewals[0]).resolves.toBe(2000)
     await until(() => h.frames(78).length > fetches, 'the next fetch after the renewal settled')
+    expect(batchesOf(h.frames(78)[fetches])).toEqual([wire(0, 0, [1])])
+    await until(() => h.acks.some(({ type }) => type === 'accept'), 'the one terminal decision')
+    expect(outcomes(h.acks)).toEqual([
+      ['0', '0', 'renew', null],
+      ['0', '0', 'accept', null],
+    ])
+    expect(h.consumer.acquisitionLockTimeoutMs()).toBe(2000)
   })
 
   test('does not fetch while a returned handler renewal is pending and then rejects its refusal', async () => {
@@ -564,6 +999,8 @@ describe('public share handler contract', () => {
     expect(settled).toBe(false)
     expect(h.frames(78)).toHaveLength(fetches)
     gate.release()
+    await until(() => settled, 'the refused renewal')
+    await flush()
     await expect(renewals[0]).rejects.toMatchObject({
       name: 'KafkaJSShareAcknowledgementError',
       reason: 'rejected-by-broker',
@@ -571,6 +1008,12 @@ describe('public share handler contract', () => {
     })
     expect(h.consumer.acquisitionLockTimeoutMs()).toBe(15000)
     await until(() => h.frames(78).length > fetches, 'the next fetch after the refusal settled')
+    expect(batchesOf(h.frames(78)[fetches])).toEqual([wire(0, 0, [1])])
+    await until(() => h.acks.some(({ type }) => type === 'accept'), 'the one terminal decision')
+    expect(outcomes(h.acks)).toEqual([
+      ['0', '0', 'renew', 'rejected-by-broker'],
+      ['0', '0', 'accept', null],
+    ])
   })
 
   test('builds no offset array for a successful call in either handler form', async () => {

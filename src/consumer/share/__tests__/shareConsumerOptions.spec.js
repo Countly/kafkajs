@@ -182,15 +182,32 @@ describe('public share option contract', () => {
     expect(typeof root.Kafka.prototype.shareConsumer).toBe('function')
   })
 
-  test('returns idempotent listener removers and rejects unknown names synchronously', () => {
+  test('returns an idempotent remover for every public event name', () => {
     const share = build()
-    const remove = share.on(share.events.CONNECT, () => {})
-    expect(typeof remove).toBe('function')
-    remove()
-    expect(() => remove()).not.toThrow()
-    for (const name of ['unknown', 'consumer.fetch', 'share_consumer.missing']) {
-      expect(() => share.on(name, () => {})).toThrow(KafkaJSNonRetriableError)
+    for (const name of Object.values(share.events)) {
+      const remove = share.on(name, () => {})
+      expect(typeof remove).toBe('function')
+      remove()
+      expect(() => remove()).not.toThrow()
     }
+  })
+
+  test.each([
+    'unknown',
+    'share_consumer.missing',
+    'consumer.connect',
+    'consumer.fetch',
+    'consumer.heartbeat',
+    'consumer.crash',
+    'producer.connect',
+    'network.request',
+  ])('refuses the event name %p synchronously', (name) => {
+    const share = build()
+    let returned
+    expect(() => {
+      returned = share.on(name, () => {})
+    }).toThrow(KafkaJSNonRetriableError)
+    expect(returned).toBeUndefined()
   })
 
   test.each([
@@ -203,6 +220,11 @@ describe('public share option contract', () => {
     [{ topics: ['a'], regex: /a/ }, 'a regex key'],
     [{ topics: ['a'], fromBeginning: false }, 'fromBeginning false'],
     [{ topics: ['a'], offsetReset: 'earliest' }, 'an offset reset'],
+    [{ topics: 'a' }, 'a bare string'],
+    [{ topics: null }, 'a null list'],
+    [{ topics: [null] }, 'a null name'],
+    [{ topics: ['a', 'b', 'a'] }, 'a later duplicate'],
+    [[], 'an array instead of an object'],
     [undefined, 'no argument'],
   ])('rejects %p (%s) before any state or request', async (input) => {
     const share = build()
@@ -210,6 +232,7 @@ describe('public share option contract', () => {
     expect(share.subscription()).toEqual([])
     expect(Cluster).toHaveBeenCalledTimes(1)
     expect(Cluster.mock.instances[0].connect).not.toHaveBeenCalled()
+    expect(Cluster.mock.instances[0].addMultipleTargetTopics).not.toHaveBeenCalled()
   })
 
   test('names the group configuration for the rejected subscription keys', async () => {

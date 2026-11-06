@@ -17,6 +17,41 @@ const {
 
 const FATAL_JOIN_CODES = [30, 29, 81, 42, 35]
 
+/** Fake timers over a zero-based monotonic clock; no timer runs until `advance` delivers it. */
+class Clock {
+  /** @returns {void} Installs fake timers and a `performance.now` that starts at zero. */
+  install() {
+    jest.useFakeTimers({
+      now: 1000000,
+      doNotFake: ['setImmediate', 'queueMicrotask', 'nextTick', 'hrtime', 'performance'],
+    })
+    const origin = Date.now()
+    jest.spyOn(performance, 'now').mockImplementation(() => Date.now() - origin)
+  }
+
+  /**
+   * @param {number} ms Milliseconds of fake time to deliver, timer by timer.
+   * @returns {Promise<void>} Resolves once the scripted sockets answered what the timers started.
+   */
+  async advance(ms) {
+    await jest.advanceTimersByTimeAsync(ms)
+    await flush()
+  }
+
+  /**
+   * @param {() => boolean} predicate The reached-stage condition.
+   * @param {string} what What is awaited, named by the failure.
+   * @param {{step?: number, limit?: number}} [options] Fake milliseconds per check (100) and the
+   *   most checks (40).
+   * @returns {Promise<void>}
+   * @throws {Error} When the condition does not hold after `limit` steps.
+   */
+  async advanceUntil(predicate, what, { step = 100, limit = 40 } = {}) {
+    for (let turn = 0; turn < limit && !predicate(); turn++) await this.advance(step)
+    if (!predicate()) throw new Error(`${what} did not happen`)
+  }
+}
+
 describe('public share connection contract', () => {
   let clients = []
   /** @param {object} [options] Options of `shareClient`. @returns {object} A tracked client. */
@@ -44,8 +79,9 @@ describe('public share connection contract', () => {
   afterEach(async () => {
     const closing = clients
     clients = []
-    for (const h of closing) await h.close()
     jest.restoreAllMocks()
+    jest.useRealTimers()
+    for (const h of closing) await h.close()
   })
 
   test('refuses missing share APIs before sending a share frame', async () => {
@@ -196,6 +232,42 @@ describe('public share connection contract', () => {
     expect(h.consumer.seek).toBeUndefined()
   })
 
+  test('keeps share and ordinary clients on separate clusters, emitters and listeners', async () => {
+    const clusters = []
+    const connect = Cluster.prototype.connect
+    jest.spyOn(Cluster.prototype, 'connect').mockImplementation(function (...args) {
+      clusters.push(this)
+      return connect.apply(this, args)
+    })
+    const h = open()
+    const ordinary = h.client.consumer({ groupId: 'ordinary' })
+    const admin = h.client.admin()
+    const shareConnects = jest.fn()
+    const ordinaryConnects = jest.fn()
+    const removeShare = h.consumer.on(h.consumer.events.CONNECT, shareConnects)
+    ordinary.on(ordinary.events.CONNECT, ordinaryConnects)
+    await h.consumer.connect()
+    expect([shareConnects.mock.calls.length, ordinaryConnects.mock.calls.length]).toEqual([1, 0])
+    await ordinary.connect()
+    await admin.connect()
+    expect([shareConnects.mock.calls.length, ordinaryConnects.mock.calls.length]).toEqual([1, 1])
+    const distinct = [...new Set(clusters)]
+    expect(distinct).toHaveLength(3)
+    expect(new Set(distinct.map(({ instrumentationEmitter }) => instrumentationEmitter)).size).toBe(
+      3
+    )
+    expect(distinct.slice(0, 2).map(({ isolationLevel }) => isolationLevel)).toEqual([0, 1])
+    removeShare()
+    removeShare()
+    await h.consumer.disconnect()
+    await h.consumer.connect()
+    await ordinary.disconnect()
+    await ordinary.connect()
+    expect([shareConnects.mock.calls.length, ordinaryConnects.mock.calls.length]).toEqual([1, 2])
+    await ordinary.disconnect()
+    await admin.disconnect()
+  })
+
   test('cleans up a failed connection without leaving a ready client', async () => {
     const h = open()
     const seen = observe(h)
@@ -273,6 +345,8 @@ describe('public share connection contract', () => {
   })
 
   test('keeps a retriable join pending until stop settles it', async () => {
+    const clock = new Clock()
+    clock.install()
     const h = open()
     await subscribe(h)
     h.script(
@@ -283,13 +357,12 @@ describe('public share connection contract', () => {
     const running = run(h).then(() => {
       settled = true
     })
-    await until(() => h.frames(76).length >= 3, 'repeated join attempts')
+    await clock.advanceUntil(() => h.frames(76).length >= 3, 'repeated join attempts')
     expect(settled).toBe(false)
     await h.consumer.stop()
     await running
     const sent = h.frames(76).length
-    await flush()
-    await new Promise((resolve) => setTimeout(resolve, 200))
+    await clock.advance(5000)
     expect(h.frames(76)).toHaveLength(sent)
     expect(h.frames(76).every(({ fields }) => fields.memberEpoch === 0)).toBe(true)
   })
@@ -328,31 +401,68 @@ describe('public share connection contract', () => {
   })
 
   test('restarts with a fresh member only after bounded cleanup', async () => {
-    const h = open({ share: { retry: { retries: 1 } } })
+    const clock = new Clock()
+    clock.install()
+    const h = open({
+      kafka: { enforceRequestTimeout: false },
+      share: { retry: { retries: 1 } },
+      topics: {
+        'topic-a': {
+          topicId: A,
+          partitions: [
+            { leader: 0, epoch: 1 },
+            { leader: 5, epoch: 1 },
+          ],
+        },
+      },
+    })
     const seen = observe(h)
-    h.table.set('topic-a', { topicId: A, partitions: [{ leader: 5, epoch: 1 }] })
-    await subscribe(h)
+    h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a'])])])
+    const final = h.hold({ api: 'ShareAcknowledge' })
+    const started = deferred()
+    const gate = deferred()
     h.consumer.on(h.consumer.events.CRASH, () => {
       h.table.set('topic-a', { topicId: A, partitions: [{ leader: 0, epoch: 1 }] })
     })
-    await run(h)
+    await subscribe(h)
+    await run(h, {
+      eachMessage: async ({ acknowledge }) => {
+        acknowledge()
+        started.resolve()
+        await gate.promise
+      },
+    })
+    await started.promise
+    const finals = () => h.frames(79).filter(({ fields }) => fields.shareSessionEpoch === -1)
+    await clock.advanceUntil(() => finals().length === 1, 'the crash close to write its final', {
+      step: 1,
+      limit: 400,
+    })
+    await final.arrived()
+    expect(finals()[0].answeredOrder).toBeUndefined()
+    await clock.advance(4998)
+    expect(seen.crashes).toHaveLength(0)
+    expect(h.frames(76).filter(({ fields }) => fields.memberEpoch === 0)).toHaveLength(1)
+    await clock.advance(2)
     await until(() => seen.crashes.length === 1, 'the crash event')
     expect(seen.crashes[0].restart).toBe(true)
-    await until(() => seen.joins.length === 2, 'the restarted join')
+    await clock.advanceUntil(() => seen.joins.length === 2, 'the restarted join', { step: 50 })
     const joins = h.frames(76).filter(({ fields }) => fields.memberEpoch === 0)
     expect(new Set(joins.map(({ fields }) => fields.memberId)).size).toBe(2)
     expect(h.consumer.subscription()).toEqual(['topic-a'])
     expect(seen.joins[0].memberId).not.toBe(seen.joins[1].memberId)
+    expect(finals()).toHaveLength(1)
+    expect(finals()[0].order).toBeLessThan(joins[1].order)
   })
 
   test('does not restart after stop while the callback is pending', async () => {
-    const decision = deferred()
+    const clock = new Clock()
+    clock.install()
     let verdict
     const restartOnFailure = jest.fn(
       () =>
         new Promise((resolve) => {
           verdict = resolve
-          decision.resolve()
         })
     )
     const h = open({ share: { retry: { retries: 1, restartOnFailure } } })
@@ -360,14 +470,14 @@ describe('public share connection contract', () => {
     h.table.set('topic-a', { topicId: A, partitions: [{ leader: 5, epoch: 1 }] })
     await subscribe(h)
     await run(h)
-    await decision.promise
+    await clock.advanceUntil(() => verdict !== undefined, 'the restart callback')
     await h.consumer.stop()
     verdict(true)
     await until(() => seen.crashes.length === 1, 'the crash event')
     expect(seen.crashes[0].restart).toBe(false)
     const joins = h.frames(76).length
     await flush()
-    await new Promise((resolve) => setTimeout(resolve, 200))
+    await clock.advance(5000)
     expect(h.frames(76)).toHaveLength(joins)
     expect(seen.joins).toHaveLength(1)
   })

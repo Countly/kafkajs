@@ -1,5 +1,17 @@
 const { ShareCloseEpisode } = require('../shareCloseEpisode')
 const { ShareRun } = require('../shareRun')
+const { KafkaJSNonRetriableError } = require('../../../errors')
+const { A } = require('../../../../testHelpers/shareHarness')
+
+const TWO_NODES = {
+  'topic-a': {
+    topicId: A,
+    partitions: [
+      { leader: 0, epoch: 1 },
+      { leader: 1, epoch: 1 },
+    ],
+  },
+}
 
 /** @param {object} options Case overrides. @returns {object} Episode and controlled actual clock. */
 const setup = ({ timeout, requestTimeout = 1000 } = {}) => {
@@ -132,9 +144,19 @@ describe('public share shutdown contract', () => {
   const start = async (options) => {
     h = shareClient(options)
     h.order = []
+    h.acks = []
     const { events, on } = h.consumer
     for (const name of ['STOP', 'DISCONNECT', 'CRASH'])
       on(events[name], () => h.order.push(name.toLowerCase()))
+    on(events.ACKNOWLEDGE, ({ payload }) =>
+      h.acks.push([
+        payload.partition,
+        payload.firstOffset,
+        payload.lastOffset,
+        payload.type,
+        payload.error ? payload.error.reason : null,
+      ])
+    )
     await h.consumer.subscribe({ topics: ['topic-a'] })
     return h
   }
@@ -142,35 +164,69 @@ describe('public share shutdown contract', () => {
   const leaves = () => h.frames(76).filter(({ fields }) => fields.memberEpoch === -1)
   /** @returns {object[]} The final frames (ShareAcknowledge at epoch -1). */
   const finals = () => h.frames(79).filter(({ fields }) => fields.shareSessionEpoch === -1)
+  /**
+   * @param {{node: number, generation: number}} record A recorded request.
+   * @returns {object} The fake socket the request travelled on.
+   */
+  const socketOf = ({ node, generation }) =>
+    h.cluster.sockets().filter(({ endpoint }) => endpoint.host === `node${node}`)[generation - 1]
+  /**
+   * @param {() => *} call A handler callback that must refuse.
+   * @returns {void}
+   */
+  const expectStale = (call) => {
+    let thrown = null
+    try {
+      call()
+    } catch (error) {
+      thrown = error
+    }
+    expect(thrown).toBeInstanceOf(KafkaJSNonRetriableError)
+    expect(thrown.message).toBe('Handler call is no longer current')
+  }
 
-  test('finishes handlers before captured finals and leave', async () => {
-    await start()
-    h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a'])])])
-    const gate = deferred()
-    let started = false
+  test('finishes every node handler before captured finals and one leave', async () => {
+    await start({ nodes: 2, topics: TWO_NODES })
+    const answer = (fields, call) => fetchAnswer([acquire(call.node, 0, [`v${call.node}`])])
+    h.script('ShareFetch', [answer, answer])
+    const gates = [deferred(), deferred()]
+    const started = new Set()
     await h.consumer.run({
-      eachMessage: async () => {
-        started = true
-        await gate.promise
+      eachMessage: async ({ partition }) => {
+        started.add(partition)
+        await gates[partition].promise
       },
     })
-    await until(() => started, 'the running handler')
+    await until(() => started.size === 2, 'both handlers')
     const stopping = h.consumer.stop()
     const fetches = h.frames(78).length
     await flush()
-    expect(h.frames(78)).toHaveLength(fetches)
     expect(finals()).toHaveLength(0)
     expect(leaves()).toHaveLength(0)
-    gate.resolve()
+    gates[0].resolve()
+    await flush()
+    expect(finals()).toHaveLength(0)
+    expect(leaves()).toHaveLength(0)
+    gates[1].resolve()
     await stopping
-    expect(finals()).toHaveLength(1)
-    expect(finals()[0].fields.topics[0].partitions[0].acknowledgementBatches).toEqual([
-      { firstOffset: '0', lastOffset: '0', acknowledgeTypes: [1] },
-    ])
+    expect(
+      finals()
+        .map(({ node }) => node)
+        .sort()
+    ).toEqual([0, 1])
+    for (const final of finals()) {
+      expect(final.fields.topics[0].partitions[0].acknowledgementBatches).toEqual([
+        { firstOffset: '0', lastOffset: '0', acknowledgeTypes: [1] },
+      ])
+    }
     expect(leaves()).toHaveLength(1)
-    expect(finals()[0].order).toBeLessThan(leaves()[0].order)
+    for (const final of finals()) expect(final.answeredOrder).toBeLessThan(leaves()[0].order)
     expect(h.order).toEqual(['stop'])
     expect(h.frames(78)).toHaveLength(fetches)
+    expect(finals().map((final) => socketOf(final).destroyed)).toEqual([false, false])
+    await h.consumer.disconnect()
+    expect(h.order).toEqual(['stop', 'disconnect'])
+    expect(finals().map((final) => socketOf(final).destroyed)).toEqual([true, true])
   })
 
   test('skips finals for unopened sessions and still leaves', async () => {
@@ -187,32 +243,24 @@ describe('public share shutdown contract', () => {
   test('treats timeout zero as a synchronous traffic fence', async () => {
     await start()
     h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a'])])])
-    await h.consumer.run({ eachMessage: async () => {} })
-    await until(() => h.frames(78).length >= 2, 'an established session')
-    await h.consumer.disconnect({ timeout: 0 })
-    expect(finals()).toHaveLength(0)
-    expect(leaves()).toHaveLength(0)
-    expect(h.consumer.assignment()).toEqual([])
-  })
-
-  test('abandons a held handler at the reserved boundary', async () => {
-    await start()
-    h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a'])])])
     const saved = []
+    const gate = deferred()
     await h.consumer.run({
-      eachMessage: async ({ acknowledge, isRunning }) => {
-        saved.push({ acknowledge, isRunning })
-        await new Promise(() => {})
+      eachMessage: async ({ acknowledge, renew }) => {
+        saved.push({ acknowledge, renew })
+        acknowledge()
+        await gate.promise
       },
     })
     await until(() => saved.length === 1, 'the held handler')
-    const began = performance.now()
-    await h.consumer.disconnect({ timeout: 400 })
-    const elapsed = performance.now() - began
-    expect(elapsed).toBeGreaterThanOrEqual(299)
-    expect(elapsed).toBeLessThan(3000)
-    expect(() => saved[0].acknowledge('reject')).toThrow('no longer current')
-    expect(saved[0].isRunning()).toBe(false)
+    const closing = h.consumer.disconnect({ timeout: 0 })
+    expectStale(() => saved[0].acknowledge('reject'))
+    expectStale(() => saved[0].renew())
+    await closing
+    expect(h.frames(79)).toHaveLength(0)
+    expect(leaves()).toHaveLength(0)
+    expect(h.consumer.assignment()).toEqual([])
+    expect(h.acks).toEqual([[0, '0', '0', 'accept', 'not-sent']])
     expect(h.order).toEqual(['stop', 'disconnect'])
   })
 
