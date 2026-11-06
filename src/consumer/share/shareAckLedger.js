@@ -260,11 +260,38 @@ class ShareAckLedger {
     if (!['accept', 'release'].includes(defaultType))
       throw new KafkaJSNonRetriableError('Invalid default acknowledgement')
     const entries = [...new Set(offsets)].map((offset) => this.#held(offset))
-    for (const entry of entries) {
-      entry.type = entry.type ?? TYPES[defaultType]
-      entry.state = 'decided'
-      this.#trackFlush(entry)
-    }
+    for (const entry of entries) this.#promote(entry, defaultType)
+  }
+
+  /**
+   * Same promotion as {@link ShareAckLedger#complete} for the delivered records
+   * `records[start, end)`, read in place, so a caller on a hot path builds neither an offset array
+   * nor a `Set`. It is not allocation-free: every record lookup still parses its offset and
+   * stringifies the entry key.
+   * @param {Array<{offset: string}>} records The acquisition's delivered records, ascending.
+   * @param {number} start First record of the selection.
+   * @param {number} end One past the last record of the selection.
+   * @param {'accept'|'release'} defaultType Runner-selected outcome for undecided records.
+   * @returns {void} Validates the whole selection before any entry changes.
+   * @throws {KafkaJSNonRetriableError} For an invalid default or a foreign, retired or
+   *   already-completed record.
+   */
+  completeRange(records, start, end, defaultType) {
+    if (defaultType !== 'accept' && defaultType !== 'release')
+      throw new KafkaJSNonRetriableError('Invalid default acknowledgement')
+    for (let i = start; i < end; i++) this.#held(records[i].offset)
+    for (let i = start; i < end; i++) this.#promote(this.#held(records[i].offset), defaultType)
+  }
+
+  /**
+   * @param {object} entry A held delivered entry.
+   * @param {'accept'|'release'} defaultType Outcome used when the entry has no local choice.
+   * @returns {void} Makes the entry eligible for a terminal request.
+   */
+  #promote(entry, defaultType) {
+    entry.type = entry.type ?? TYPES[defaultType]
+    entry.state = 'decided'
+    this.#trackFlush(entry)
   }
 
   /**

@@ -1,5 +1,6 @@
 const HeartbeatManager = require('../../heartbeatManager')
 const HeartbeatBackoff = require('../../groupProtocol/heartbeatBackoff')
+const { ShareHandlerCall } = require('../shareHandlerCall')
 const { ShareMembership, SharePollView } = require('../shareMembership')
 const { newLogger } = require('testHelpers')
 
@@ -88,6 +89,21 @@ describe('share heartbeat scheduling', () => {
     await jest.advanceTimersByTimeAsync(1)
     expect(f.broker.shareGroupHeartbeat).toHaveBeenCalledTimes(2)
   })
+  test('starts the chain at the initial second and then follows the broker interval', async () => {
+    f = fixture()
+    f.response.heartbeatIntervalMs = 250
+    expect(f.member.heartbeatInterval()).toBe(1000)
+    f.manager.ensureStarted()
+    await jest.advanceTimersByTimeAsync(999)
+    expect(f.broker.shareGroupHeartbeat).not.toHaveBeenCalled()
+    await jest.advanceTimersByTimeAsync(1)
+    expect(f.broker.shareGroupHeartbeat).toHaveBeenCalledTimes(1)
+    expect(f.member.heartbeatInterval()).toBe(250)
+    await jest.advanceTimersByTimeAsync(249)
+    expect(f.broker.shareGroupHeartbeat).toHaveBeenCalledTimes(1)
+    await jest.advanceTimersByTimeAsync(1)
+    expect(f.broker.shareGroupHeartbeat).toHaveBeenCalledTimes(2)
+  })
   test('grows retry delay and resets it on success using the shared backoff', async () => {
     f = fixture()
     f.broker.shareGroupHeartbeat
@@ -154,16 +170,35 @@ describe('share heartbeat scheduling', () => {
     expect(f.onPollExpired).not.toHaveBeenCalled()
     expect(f.poll.elapsed()).toBe(0)
   })
+  test('tracks handler identities without a separate call object and keeps independent start times', async () => {
+    f = fixture()
+    const frame = { records: [], authority: {} }
+    const old = new ShareHandlerCall(frame)
+    const current = new ShareHandlerCall(frame)
+    expect(f.poll.begin(old)).toBe(old)
+    await jest.advanceTimersByTimeAsync(1000)
+    expect(f.poll.begin(current)).toBe(current)
+    await jest.advanceTimersByTimeAsync(1001)
+    expect(f.poll.captureExpired()).toEqual([old])
+    f.poll.finish(old)
+    f.poll.finish(old)
+    expect(f.poll.elapsed()).toBe(1001)
+    expect(f.poll.drained([current])).toBe(false)
+    expect(f.poll.expired()).toBe(false)
+    f.poll.finish(current)
+    expect(f.poll.elapsed()).toBe(0)
+    expect(f.poll.drained([current])).toBe(true)
+  })
   test('progress at another node cannot reset a held call deadline', async () => {
     f = fixture()
-    const held = f.poll.begin(1)
+    const held = f.poll.begin({ nodeId: 1 })
     await jest.advanceTimersByTimeAsync(1000)
     for (let i = 0; i < 4; i++) {
-      const fast = f.poll.begin(2)
+      const fast = f.poll.begin({ nodeId: 2 })
       await jest.advanceTimersByTimeAsync(300)
       f.poll.finish(fast)
     }
-    f.poll.begin(2)
+    f.poll.begin({ nodeId: 2 })
     expect(f.poll.elapsed()).toBe(2200)
     expect(f.poll.expired()).toBe(true)
     expect(f.poll.captureExpired()).toEqual([held])
@@ -173,8 +208,8 @@ describe('share heartbeat scheduling', () => {
   test('captures simultaneous overruns and waits for each identity before rejoin', async () => {
     f = fixture()
     await f.member.heartbeat()
-    const one = f.poll.begin(1)
-    const two = f.poll.begin(2)
+    const one = f.poll.begin({ nodeId: 1 })
+    const two = f.poll.begin({ nodeId: 2 })
     let captured
     f.manager.onPollExpired = async () => {
       captured = f.poll.captureExpired()
@@ -237,12 +272,12 @@ describe('share heartbeat scheduling', () => {
   })
   test('old returns cannot reset another run and exact boundary is not expired', async () => {
     f = fixture()
-    const old = f.poll.begin(1)
+    const old = f.poll.begin({ nodeId: 1 })
     await jest.advanceTimersByTimeAsync(2000)
     expect(f.poll.expired()).toBe(false)
     f.poll.stop()
     const next = new SharePollView({ maxPollInterval: 2000 })
-    next.begin(1)
+    next.begin({ nodeId: 1 })
     await jest.advanceTimersByTimeAsync(2001)
     next.finish(old)
     expect(next.expired()).toBe(true)
@@ -251,9 +286,9 @@ describe('share heartbeat scheduling', () => {
   })
   test('a stopped poll view admits no call, reports no age and keeps its deadline', () => {
     f = fixture()
-    const call = f.poll.begin(1)
+    const call = f.poll.begin({ nodeId: 1 })
     f.poll.stop()
-    expect(f.poll.begin(1)).toBeNull()
+    expect(f.poll.begin({ nodeId: 1 })).toBeNull()
     expect(f.poll.elapsed()).toBe(0)
     expect(f.poll.expired()).toBe(false)
     expect(f.poll.drained([call])).toBe(true)

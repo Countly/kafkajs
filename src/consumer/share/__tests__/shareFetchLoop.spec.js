@@ -1057,7 +1057,11 @@ describe('share node socket integration', () => {
       h.scriptNodes('ShareFetch', {
         0: [
           fetchAnswer(
-            [part({ partition: 0, code: 6, leader: hint(2, 8) }), acquire(1, 20, ['b'])],
+            [
+              part({ partition: 0, code: 6, leader: hint(2, 8) }),
+              acquire(1, 20, ['b']),
+              part({ partition: 2, code: 6, leader: hint(1, 9) }),
+            ],
             {
               nodeEndpoints: endpoints,
             }
@@ -1078,19 +1082,36 @@ describe('share node socket integration', () => {
         captured.rows = rows
       }
       const round = settled(n0.loop.poll())
-      await entered.promise
-      const renewal = await settled(
-        n0.loop.acknowledge({ renew: [{ cohort: captured.rows[0], offsets: ['20'] }] })
-      )
-      expect(renewal.error).toBeInstanceOf(KafkaJSShareAcknowledgementError)
-      expect(renewal.error.reason).toBe('session-lost')
-      expect(n0.resets).toHaveLength(1)
-      release.resolve()
-      expect((await round).error.message).toBe('Share session is no longer current')
-      expect(real.cluster.cachedLeader('topic-a', 0)).toBe(0)
-      expect(real.cluster.leaderEpoch('topic-a', 0)).toBe(5)
-      expect(n0.moves).toEqual([])
-      expect(real.refreshes()).toBe(0)
+      try {
+        await entered.promise
+        const renewal = await settled(
+          n0.loop.acknowledge({ renew: [{ cohort: captured.rows[0], offsets: ['20'] }] })
+        )
+        expect(renewal.error).toBeInstanceOf(KafkaJSShareAcknowledgementError)
+        expect(renewal.error.reason).toBe('session-lost')
+        expect(n0.resets).toHaveLength(1)
+        release.resolve()
+        expect(await round).toMatchObject({
+          value: { reset: false, closed: false, backoff: true },
+        })
+        expect(real.cluster.cachedLeader('topic-a', 0)).toBe(0)
+        expect(real.cluster.leaderEpoch('topic-a', 0)).toBe(5)
+        expect(n0.moves).toEqual([])
+        expect(real.refreshes()).toBe(0)
+        expect(real.cluster.applyLeaderHint).toHaveBeenCalledTimes(1)
+        expect(n0.sleeps[0]).toBeGreaterThanOrEqual(50)
+        await n0.loop.poll()
+        const reopened = fetchFrames(h)[1]
+        expect(reopened.fields.shareSessionEpoch).toBe(0)
+        expect(
+          reopened.fields.topics
+            .flatMap((topic) => topic.partitions)
+            .every(({ acknowledgementBatches }) => acknowledgementBatches.length === 0)
+        ).toBe(true)
+      } finally {
+        release.resolve()
+        await round
+      }
     })
   })
 

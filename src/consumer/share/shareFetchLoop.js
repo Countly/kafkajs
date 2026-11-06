@@ -207,7 +207,8 @@ class ShareFetchLoop {
     this.retryTime = null
     this.cohorts = new Map()
     this.exchanges = new Set()
-    this.collected = null
+    this.renewals = new Set()
+    this.collectingRenewal = null
     this.running = null
     this.finishing = false
     this.finishPromise = null
@@ -324,9 +325,12 @@ class ShareFetchLoop {
    *   after the acknowledgements it carried were settled.
    * @param {(reply: Cohort[]) => Promise<void>} handlers Resolves after every delivered or dropped record.
    * @returns {Promise<object>} The exchange result, after the handlers, the answer's metadata
-   *   effects and the owned pacing delay. A reset or final answer skips the handlers.
-   * @throws {Error} The original request, handler or operation failure; a session that reset or
-   *   retired while handlers ran rejects with its "no longer current" refusal.
+   *   effects and the owned pacing delay. A reset or final answer skips the handlers. When a data
+   *   session reset or its socket was lost during handlers or awaited metadata, the old open's
+   *   effects are discarded and the round still ends with its pacing delay, so the next round reopens.
+   * @throws {Error} The original request, handler or operation failure; a node whose operation was
+   *   retired, a closed or retired session, or an open that ended before the handlers started
+   *   rejects with its "no longer current" refusal.
    */
   round(fetch, handlers) {
     if (this.running) return this.running
@@ -338,8 +342,13 @@ class ShareFetchLoop {
         if (refused) throw refused
         await handlers(result.reply)
         const afterHandlers = this.session.refusal(token)
-        if (afterHandlers) throw afterHandlers
-        await this.runEffects(result, token)
+        if (!afterHandlers) {
+          try {
+            await this.runEffects(result, token)
+          } catch (error) {
+            if (!this.reopenable(token)) throw error
+          }
+        } else if (!this.reopenable(token)) throw afterHandlers
       }
       await this.pace(result)
       return result
@@ -349,6 +358,21 @@ class ShareFetchLoop {
     })
     this.running.catch(() => {})
     return this.running
+  }
+
+  /**
+   * Tells a recoverable end of a round's open from a terminal one. A reset replaced the open, or
+   * only its data socket was lost, while the node operation and the session are intact: the next
+   * exchange reopens or resets under backoff. Anything else (a retired operation, a closed or
+   * retired session) is a terminal failure and is never recovered here.
+   * @private
+   * @param {symbol} open The open identity the round captured.
+   * @returns {boolean} Whether the node can simply continue with a fresh round.
+   */
+  reopenable(open) {
+    const { session } = this
+    if (session.closed || session.operation.guard() !== null) return false
+    return open !== session.token || session.connectionLost(open)
   }
 
   /**
@@ -671,6 +695,7 @@ class ShareFetchLoop {
   }
 
   /**
+   * Prepares selected renewals and records ticket ownership for the active FIFO caller.
    * @private
    * @param {Array<{cohort: Cohort, offsets: string[]}>} [renew] Held offsets per acquisition.
    * @returns {Array<{ledger: ShareAckLedger, ticket: object, row: Cohort}>} Prepared renewal tickets.
@@ -688,7 +713,10 @@ class ShareFetchLoop {
           renewOffsets: offsets,
         })
         this.emit(results, cohort)
-        if (ticket) prepared.push({ ledger: cohort.ledger, ticket, row: cohort })
+        if (ticket) {
+          prepared.push({ ledger: cohort.ledger, ticket, row: cohort })
+          this.collectingRenewal?.prepared.add(cohort)
+        }
       }
     } catch (error) {
       this.settleAll(prepared, 'not-sent', error)
@@ -1208,8 +1236,11 @@ class ShareFetchLoop {
    */
   async runEffects(result, open) {
     const effects = result.effects || []
-    for (const effect of effects) await effect()
-    if (effects.length) this.recheck(open)
+    for (const effect of effects) {
+      this.recheck(open)
+      await effect()
+      this.recheck(open)
+    }
   }
 
   /**
@@ -1236,27 +1267,44 @@ class ShareFetchLoop {
    * @returns {Promise<object>} The exchange result; for a renewal `lockDuration` is the new
    *   duration, or undefined when the answer kept the previous one.
    * @throws {KafkaJSShareAcknowledgementError} A failed renewal, from the ledger's compact result.
+   *   Each caller retains only the outcomes of tickets it prepared, including when retirement
+   *   first rejects the queue's outer wait. Partition retirement rejects without waiting for
+   *   the answer, while the FIFO still waits
+   *   for that request. A renewal retired before preparation has no ticket and rejects locally.
    * @throws {Error} Any other failure of the request, or the node operation's refusal while it waits.
    */
   acknowledge({ cohorts, renew } = {}) {
-    return this.session.enqueue(async (open) => {
-      const collected = []
-      this.collected = collected
-      const failure = () => collected.find((outcome) => outcome.type === 'renew' && outcome.error)
-      try {
-        const result = await this.exchange(
-          { apiKey: apiKeys.ShareAcknowledge, kind: renew ? 'renew' : 'flush', cohorts, renew },
-          open
-        )
-        if (result.backoff) await this.pace(result)
-        if (renew && failure()) throw failure().error
-        return result
-      } catch (error) {
-        throw (renew && failure()?.error) || error
-      } finally {
-        this.collected = null
+    let pending
+    const outcome = new Promise((resolve, reject) => {
+      if (renew) {
+        pending = { renew, reject, prepared: new Set(), error: null }
+        this.renewals.add(pending)
       }
+      const request = this.session.enqueue(async (open) => {
+        this.collectingRenewal = pending
+        try {
+          const result = await this.exchange(
+            { apiKey: apiKeys.ShareAcknowledge, kind: renew ? 'renew' : 'flush', cohorts, renew },
+            open
+          )
+          if (result.backoff) await this.pace(result)
+          return result
+        } finally {
+          if (this.collectingRenewal === pending) this.collectingRenewal = null
+        }
+      })
+      request.then(
+        (result) => {
+          const error = pending?.error
+          if (error) reject(error)
+          else resolve(result)
+        },
+        (error) => reject(pending?.error || error)
+      )
     })
+    const cleanup = () => this.renewals.delete(pending)
+    outcome.then(cleanup, cleanup)
+    return outcome
   }
 
   /**
@@ -1527,12 +1575,28 @@ class ShareFetchLoop {
    * @private
    * @param {string} key A partition key.
    * @param {'session-lost'|'membership-lost'|'not-sent'} reason Outcome for its acquisitions.
-   * @returns {void} Retires and forgets every acquisition this node holds for that partition.
+   * @returns {void} Retires every acquisition this node holds for that partition and rejects its
+   *   pending renewal callers with their own compact error, or a local refusal before preparation.
+   *   The session model stays until the next fetch forgets it or a final closes it; a late answer
+   *   cannot settle the invalidated tickets again.
    */
   retireKey(key, reason) {
     const rows = this.cohorts.get(key) || []
     this.cohorts.delete(key)
-    for (const row of rows) this.emit(row.ledger.invalidate(reason), row)
+    for (const row of rows) {
+      const results = row.ledger.invalidate(reason)
+      for (const pending of this.renewals) {
+        if (!pending.renew.some(({ cohort }) => cohort === row)) continue
+        pending.error =
+          pending.error ||
+          (pending.prepared.has(row) &&
+            results.find((outcome) => outcome.type === 'renew')?.error) ||
+          new KafkaJSNonRetriableError('Renewal targets a retired acquisition')
+        pending.reject(pending.error)
+        this.renewals.delete(pending)
+      }
+      this.emit(results, row)
+    }
   }
 
   /**
@@ -1565,7 +1629,8 @@ class ShareFetchLoop {
   }
 
   /**
-   * Gives each compact result to `onResults` once and to an active renewal's collector.
+   * Gives each compact result to `onResults` once and retains a renewal failure only for the
+   * active caller that prepared its ticket. A queued caller owns no ticket or compact outcome.
    * @private
    * @param {object[]} results Ledger results.
    * @param {Cohort} row Their acquisition.
@@ -1573,7 +1638,9 @@ class ShareFetchLoop {
    */
   emit(results, row) {
     if (!results.length) return
-    if (this.collected) this.collected.push(...results)
+    const pending = this.collectingRenewal
+    if (pending?.prepared.has(row) && !pending.error)
+      pending.error = results.find((outcome) => outcome.type === 'renew' && outcome.error)?.error
     this.notify(this.onResults, results, row)
   }
 

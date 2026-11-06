@@ -25,7 +25,13 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - Add the share-group node loop: one serialized request queue and one non-prefetching fetch loop per leader node, so a node sends no second fetch until every handler of its previous answer has returned. Acknowledgements piggyback on the next fetch; ShareAcknowledge carries only flushes, renewals and the final close. A partition is forgotten in the same frame as its last acknowledgement, or in the first fetch after a flush or renewal, and a partition that still holds undelivered records is never forgotten. Session resets (122, 123, and 133 on fetch) never replay an old acknowledgement, a request written without an answer is never resent, and fetch and acknowledgement errors are classified separately, with leader hints, metadata refreshes and a fatal path for authorization and corrupt records. Empty rounds are paced at 50 ms and `record_limit` is bounded per node. Internal only: no public share API uses the loop yet.
 
+- Add `Kafka.shareConsumer` with implicit or explicit acknowledgements, handler-driven renewal and bounded disconnect. Share isolation defaults to read_uncommitted and is configured per group; share groups require Kafka 4.2+.
+
 #### Fixes
+
+- Prepared share renewals retain their own compact acknowledgement error when a routing change or shutdown retires their wait; callers retired before preparing a ticket receive a local refusal.
+
+- Share-consumer closes honor a disconnect deadline supplied during a stop and detach captured sockets when their shared close budget expires.
 
 - Unimplemented request slots throw `KafkaJSNotImplemented` with a diagnostic message instead of a `TypeError`.
 
