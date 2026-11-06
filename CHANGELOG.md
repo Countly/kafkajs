@@ -274,6 +274,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - Add the share-group membership: one generated member ID per run, heartbeats that send only changed fields, topic-ID assignments applied at once with unknown topic names resolved under a guarded retry, and the existing heartbeat manager reused for scheduling. Coordinator errors keep the membership, fenced members rejoin with the same ID, and `GROUP_ID_NOT_FOUND` (69) ends a membership as non-retriable unless it answers that member's own leave. The consumer-protocol heartbeat backoff moved to its own module without changing. No public share API uses the membership yet.
 
+- Add exact record-range walking and compact acknowledgement outcomes with `KafkaJSShareAcknowledgementError`. Acquired records are classified through exact int64 offsets without expanding ranges; control and missing offsets become gaps, and the undecoded remainder after a decode failure is released rather than rejected. Per-partition acknowledgement ledgers keep automatic ranges compact, hold each decision until its handler completes, check a request against the broker's batch rules before a frame is built, and settle every outcome once. Lock deadlines count from the time the fetch was written; no timer is added. Only the error class is exported; the walk and ledger are internal and no public API uses them yet. An internal-API benchmark compares the walk with a per-offset expansion control.
+
 #### Fixes
 
 - Unimplemented request slots throw `KafkaJSNotImplemented` with a diagnostic message instead of a `TypeError`.

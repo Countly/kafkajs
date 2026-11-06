@@ -322,6 +322,10 @@ describe('the five category classes', () => {
 describe('every error class this package exports carries an own, enumerable category', () => {
   // Constructor arguments for the classes that need more than a message.
   const ARGUMENTS = {
+    KafkaJSShareAcknowledgementError: () => [
+      'not confirmed',
+      { reason: 'session-lost', topic: 'topic', partition: 0, ranges: [] },
+    ],
     KafkaJSShareGroupsNotSupportedError: () => [
       'unsupported',
       { apiKey: 78, apiName: 'ShareFetch', reason: 'api-version-range' },
@@ -1040,5 +1044,59 @@ describe('share capability errors', () => {
         reason: 'api-not-advertised',
       }).shareVersion
     ).toBeNull()
+  })
+})
+
+describe('compact share acknowledgement errors', () => {
+  test.each([
+    'unacknowledged',
+    'session-lost',
+    'membership-lost',
+    'not-sent',
+    'rejected-by-broker',
+  ])('preserves exact compact failure metadata for %s', (reason) => {
+    const cause = createErrorFromCode(121)
+    const ranges = [{ firstOffset: '9007199254740993', lastOffset: '9223372036854775807' }]
+    const error = new errors.KafkaJSShareAcknowledgementError('not confirmed', {
+      reason,
+      topic: '__proto__',
+      partition: 1,
+      ranges,
+      cause,
+    })
+    expect(error).toBeInstanceOf(KafkaJSError)
+    expect(error).not.toBeInstanceOf(KafkaJSProtocolError)
+    expect(error).toMatchObject({
+      name: 'KafkaJSShareAcknowledgementError',
+      reason,
+      retriable: false,
+      topic: '__proto__',
+      partition: 1,
+      ranges,
+    })
+    expect(error.cause).toBe(cause)
+    expect(error.category).toBe(cause.category)
+    expect(Object.prototype.propertyIsEnumerable.call(error, 'category')).toBe(true)
+    expect(error.ranges).not.toBe(ranges)
+    expect(error.ranges[0]).not.toBe(ranges[0])
+    expect(packageEntry.KafkaJSShareAcknowledgementError).toBe(
+      errors.KafkaJSShareAcknowledgementError
+    )
+    expect(JSON.stringify(error).length).toBeLessThan(1000)
+  })
+  test('copies Error diagnostics and compact ranges without enumerating the interval', () => {
+    const source = new Error('lost response')
+    const ranges = [{ firstOffset: '0', lastOffset: '999999' }]
+    const error = new errors.KafkaJSShareAcknowledgementError(source, {
+      reason: 'session-lost',
+      topic: 'topic',
+      partition: 0,
+      ranges,
+    })
+    ranges[0].firstOffset = '1'
+    expect(error.message).toBe('lost response')
+    expect(error.ranges).toEqual([{ firstOffset: '0', lastOffset: '999999' }])
+    expect(error.retriable).toBe(false)
+    expect(error.category).toBe('applicationRecoverable')
   })
 })

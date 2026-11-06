@@ -2834,6 +2834,31 @@ export class KafkaJSShareGroupsNotSupportedError extends KafkaJSServerDoesNotSup
   )
 }
 
+/** Acknowledgements without confirmed success; a lost answer can leave the remote outcome unknown. For `unacknowledged`, thrown. */
+export class KafkaJSShareAcknowledgementError extends KafkaJSError {
+  readonly reason:
+    | 'unacknowledged'
+    | 'session-lost'
+    | 'membership-lost'
+    | 'not-sent'
+    | 'rejected-by-broker'
+  readonly topic: string
+  readonly partition: number
+  readonly ranges: Array<{ firstOffset: string; lastOffset: string }>
+  /** For `rejected-by-broker`, the protocol error (usually `INVALID_RECORD_STATE`). */
+  readonly cause?: Error
+  constructor(
+    e: Error | string,
+    options: {
+      reason: KafkaJSShareAcknowledgementError['reason']
+      topic: string
+      partition: number
+      ranges: Array<{ firstOffset: string; lastOffset: string }>
+      cause?: Error
+    }
+  )
+}
+
 export class KafkaJSBrokerNotFound extends KafkaJSError {
   constructor()
 }

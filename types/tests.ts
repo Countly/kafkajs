@@ -1832,3 +1832,25 @@ import { KafkaJSShareGroupsNotSupportedError, ShareGroupsNotSupportedReason } fr
   // @ts-expect-error the stage is read-only
   shareUnsupported.reason = 'feature-disabled'
 }
+
+import { KafkaJSShareAcknowledgementError as CompactAckError } from './index'
+const compactAckCause = new Error('broker refusal')
+const compactAckError = new CompactAckError('not confirmed', {
+  reason: 'rejected-by-broker', topic: 'topic', partition: 0,
+  ranges: [{ firstOffset: '9007199254740993', lastOffset: '9223372036854775807' }],
+  cause: compactAckCause,
+})
+const compactAckReason: 'unacknowledged' | 'session-lost' | 'membership-lost' | 'not-sent' | 'rejected-by-broker' = compactAckError.reason
+const compactAckRanges: Array<{ firstOffset: string; lastOffset: string }> = compactAckError.ranges
+const compactAckOptionalCause: Error | undefined = compactAckError.cause
+void [compactAckReason, compactAckRanges, compactAckOptionalCause]
+// @ts-expect-error reason is readonly
+compactAckError.reason = 'session-lost'
+// @ts-expect-error ranges is readonly
+compactAckError.ranges = []
+// @ts-expect-error acknowledgement outcomes do not introduce a retry reason
+new CompactAckError('bad', { reason: 'retry', topic: 'topic', partition: 0, ranges: [] })
+// @ts-expect-error offsets are exact decimal strings
+new CompactAckError('bad', { reason: 'not-sent', topic: 'topic', partition: 0, ranges: [{ firstOffset: 1, lastOffset: '2' }] })
+// @ts-expect-error constructor never exposes a retry option
+new CompactAckError('bad', { reason: 'not-sent', topic: 'topic', partition: 0, ranges: [], retriable: true })

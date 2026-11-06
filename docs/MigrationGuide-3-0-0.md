@@ -446,6 +446,8 @@ Share-group capability failures use `KafkaJSShareGroupsNotSupportedError`, a `Ka
 
 Share-group membership applies topic-ID assignments immediately and resolves unknown topic names asynchronously. Heartbeats follow the coordinator's interval, and obsolete metadata work cannot change the active assignment.
 
+Acknowledgement errors carry compact firstOffset/lastOffset ranges. A failed or unanswered mutation is not confirmed accepted and is never resent.
+
 - **Unsubscribed-topic instrumentation is classic-only.** With `groupProtocol: 'consumer'`, assignments outside the round subscription are still filtered, but no longer emit `RECEIVED_UNSUBSCRIBED_TOPICS` or its warning. *What to do:* update event-count assertions and monitoring that expect this signal under the consumer protocol; debug logs record the filtered names. Classic consumers keep the event and warning.
 
 - **An uncommitted offset has null metadata.** `consumer.committed()` now returns `metadata: null` whenever `offset` is null; committed offsets still preserve stored metadata, including the empty string. *What to do:* use `offset === null` to detect the absence of a commit and update assertions that expected empty or synthetic metadata there.
