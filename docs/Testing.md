@@ -27,6 +27,8 @@ Share consumer tests check factory validation, first-join readiness, implicit an
 
 Share-consumer API comparisons cover handler delivery, automatic acknowledgement sending, compact homogeneous settlement events and offset-reset method composition. Separate boundary cases cover the absence of a callable synchronous flush, retained subscription after stop and the stopped subscription-replacement sequence. A synthetic DeleteGroups v3 case checks Admin-to-Broker plumbing and success/error mapping for a share group id at the codec level; it does not establish broker behavior for empty or active share groups. Documentation checks preserve the isolation recipe, exact offsets and the boundary between share events and OpenTelemetry spans.
 
+The share fault matrices run without a broker in `shareMembershipFaults.spec.js`, `shareSessionFaults.spec.js` and `shareAckFaults.spec.js`. Their literal fault, phase and expected-outcome tables drive the public share consumer through the scripted cluster. Each case checks record identities, current and captured closing authority, replacement progress, compact acknowledgement outcomes and resource cleanup. These seam cases supplement the real-cluster session and shutdown scenarios; an unanswered mutation is never reported as broker-accepted.
+
 ## Integration tests
 
 Most of the test suite talks to a real Kafka cluster. `npm test` runs `npm run lint`, `npm run compat:check` and `npm run protocol:check`, boots the cluster, runs everything, and tears the cluster down again — it's a convenient local shortcut, but it is not what CI runs.

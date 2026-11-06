@@ -9,7 +9,7 @@ const {
 } = require('../../errors')
 const { ShareAckLedger, validateAcknowledgements } = require('./shareAckLedger')
 const { ShareRecordWalk } = require('./shareRecordWalk')
-const { ShareSession } = require('./shareSession')
+const { ShareSession, ShareSessionStaleError } = require('./shareSession')
 const shareCapability = require('./shareCapability')
 const {
   sessionAction,
@@ -326,11 +326,10 @@ class ShareFetchLoop {
    * @param {(reply: Cohort[]) => Promise<void>} handlers Resolves after every delivered or dropped record.
    * @returns {Promise<object>} The exchange result, after the handlers, the answer's metadata
    *   effects and the owned pacing delay. A reset or final answer skips the handlers. When a data
-   *   session reset or its socket was lost during handlers or awaited metadata, the old open's
-   *   effects are discarded and the round still ends with its pacing delay, so the next round reopens.
+   *   session reset or its socket was lost before or during handlers or awaited metadata, the old
+   *   open's effects are discarded and the round still ends with its pacing delay, so the next round reopens.
    * @throws {Error} The original request, handler or operation failure; a node whose operation was
-   *   retired, a closed or retired session, or an open that ended before the handlers started
-   *   rejects with its "no longer current" refusal.
+   *   retired, or a closed or retired session, rejects with its original refusal.
    */
   round(fetch, handlers) {
     if (this.running) return this.running
@@ -339,16 +338,17 @@ class ShareFetchLoop {
       const result = await this.session.enqueue(fetch)
       if (!result.reset && !result.closed) {
         const refused = this.session.refusal(token)
-        if (refused) throw refused
-        await handlers(result.reply)
-        const afterHandlers = this.session.refusal(token)
-        if (!afterHandlers) {
-          try {
-            await this.runEffects(result, token)
-          } catch (error) {
-            if (!this.reopenable(token)) throw error
-          }
-        } else if (!this.reopenable(token)) throw afterHandlers
+        if (!refused) {
+          await handlers(result.reply)
+          const afterHandlers = this.session.refusal(token)
+          if (!afterHandlers) {
+            try {
+              await this.runEffects(result, token)
+            } catch (error) {
+              if (!(error instanceof ShareSessionStaleError) || !this.reopenable(token)) throw error
+            }
+          } else if (!this.reopenable(token)) throw afterHandlers
+        } else if (!this.reopenable(token)) throw refused
       }
       await this.pace(result)
       return result
@@ -458,8 +458,9 @@ class ShareFetchLoop {
    * @param {symbol} open The open identity captured when the request was queued.
    * @returns {Promise<object>} `{reply, sentAt, answeredAt, empty, backoff, minDelay, reset, closed,
    *   results, lockDuration, effects, error}`. A transport failure or a reset answer resolves with
-   *   `reset` and a backoff; a stale, retired or terminal one rejects.
-   * @throws {Error} The refusal of a retired or stale session, or a terminal failure.
+   *   `reset` and a backoff; a retired open or binding discards its answer and follows that same
+   *   recovery path without resetting a newer open.
+   * @throws {Error} The refusal of a retired node or closed session, or a terminal failure.
    */
   async exchange(options, open) {
     const { apiKey, kind } = options
@@ -467,12 +468,7 @@ class ShareFetchLoop {
     if (kind === 'fetch' && this.finishing)
       throw new KafkaJSNonRetriableError('Share node is closing')
     const refused = session.refusal(open)
-    if (refused) {
-      if (!session.connectionLost(open)) throw refused
-      if (kind === 'final')
-        return this.resultOf(undefined, this.now(), { closed: true, error: refused })
-      return this.loseConnection(undefined, refused)
-    }
+    if (refused) return this.failExchange(this.newExchange(options, open), refused)
     if (apiKey === apiKeys.ShareAcknowledge && session.epoch === 0) {
       if (kind === 'final') return this.idleResult()
       throw new KafkaJSNonRetriableError('Share acknowledgements require an established session')
@@ -496,7 +492,12 @@ class ShareFetchLoop {
     } catch (error) {
       return this.failExchange(exchange, error)
     }
-    return this.complete(exchange, response)
+    try {
+      return this.complete(exchange, response)
+    } catch (error) {
+      if (!(error instanceof ShareSessionStaleError)) throw error
+      return this.failExchange(exchange, error)
+    }
   }
 
   /**
@@ -598,10 +599,10 @@ class ShareFetchLoop {
   /**
    * @private
    * @param {object} pool The pool the request started on.
-   * @returns {Error} A refusal for a broker whose pool was replaced while connecting.
+   * @returns {ShareSessionStaleError} A refusal for a pool replaced while connecting.
    */
   replaced(pool) {
-    return new KafkaJSNonRetriableError(`Broker pool of ${pool.brokerAddress} was replaced`)
+    return new ShareSessionStaleError(`Broker pool of ${pool.brokerAddress} was replaced`)
   }
 
   /**
@@ -774,26 +775,26 @@ class ShareFetchLoop {
   }
 
   /**
-   * Classifies a request that threw. A retired or stale session discards it without a reset. A
-   * request the guard saw written, or whose bound socket was lost, is an unknown outcome: the
+   * Classifies a request that threw. A typed open or binding refusal is recoverable while the
+   * node and session remain usable: reset only the originating open, never its replacement.
+   * A request the guard saw written, or whose bound socket was lost, is an unknown outcome: the
    * session resets and its acquisitions settle session-lost, never accepted or resent. A request
-   * that never reached the wire settles its tickets not sent.
+   * that never reached the wire settles its tickets not sent. Finals never reopen.
    * @private
    * @param {Exchange} exchange The request.
-   * @param {Error} error What the build or the transport threw.
-   * @returns {object} A paced reset result for a transport loss or a retriable pre-write failure.
-   * @throws {Error} For retirement, a stale session or any non-retriable failure.
+   * @param {Error} error What building, transport or answer authorization threw.
+   * @returns {object} A paced result for a retired open, transport loss or retriable pre-write failure.
+   * @throws {Error} For node retirement, a closed session or any other non-retriable failure.
    */
   failExchange(exchange, error) {
     this.exchanges.delete(exchange)
     const { session } = this
-    if (
-      exchange.stale ||
-      session.operation.guard() ||
-      session.closed ||
-      session.token !== exchange.open
-    )
-      throw error
+    if (session.operation.guard() || session.closed) throw error
+    if (exchange.kind !== 'final' && error instanceof ShareSessionStaleError) {
+      if (session.token === exchange.open) return this.loseConnection(exchange, error)
+      return this.resultOf(exchange, this.now(), { reset: true, backoff: true, error })
+    }
+    if (exchange.stale || session.token !== exchange.open) throw error
     const written = exchange.sentAt !== undefined
     if (exchange.kind === 'final') {
       this.settleAll(exchange.prepared, written ? 'session-lost' : 'not-sent', error)
@@ -836,7 +837,10 @@ class ShareFetchLoop {
   complete(exchange, response) {
     const answeredAt = this.now()
     if (!this.exchanges.delete(exchange) || exchange.stale)
-      throw new KafkaJSNonRetriableError('Share exchange is no longer current')
+      throw (
+        this.session.refusal(exchange.open) ||
+        new KafkaJSNonRetriableError('Share exchange is no longer current')
+      )
     const policy = this.session.apply(exchange.descriptor, response)
     const result = this.resultOf(exchange, answeredAt)
     if (policy.action === 'reset') {
@@ -1026,8 +1030,9 @@ class ShareFetchLoop {
         work = true
         result.backoff = true
         if (action === 'fatal') fatal = fatal || error
-        else if (action === 'move') this.planMove(result, open, topic.topicId, partition, response)
-        else if (action === 'refresh') this.planRefresh(result, open, topic.topicId, index)
+        else if (action === 'move')
+          this.planMove(result, open, topic.topicId, partition, response, error)
+        else if (action === 'refresh') this.planRefresh(result, open, topic.topicId, index, error)
         else
           this.logger.error('Share fetch partition failed', {
             partition: index,
@@ -1109,11 +1114,12 @@ class ShareFetchLoop {
    * @param {string} topicId Topic UUID.
    * @param {object} partition The decoded partition with its `currentLeader`.
    * @param {object} response The answer, for its node endpoints.
+   * @param {Error} [cause] Original fetch failure retained by retired acquisitions.
    * @returns {void}
    */
-  planMove(result, open, topicId, partition, response) {
+  planMove(result, open, topicId, partition, response, cause) {
     const index = partition.partitionIndex
-    this.retireKey(keyOf(topicId, index), 'session-lost')
+    this.retireKey(keyOf(topicId, index), 'session-lost', cause)
     const leader = partition.currentLeader
     const fence = this.fenceFor(result, open)
     result.effects.push(() => this.relocate(fence, topicId, index, leader, response.nodeEndpoints))
@@ -1125,11 +1131,12 @@ class ShareFetchLoop {
    * @param {symbol} open The request's open identity.
    * @param {string} topicId Topic UUID the answer named.
    * @param {number} index Partition index.
+   * @param {Error} [cause] Original fetch failure retained if metadata retires the topic.
    * @returns {void}
    */
-  planRefresh(result, open, topicId, index) {
+  planRefresh(result, open, topicId, index, cause) {
     const fence = this.fenceFor(result, open)
-    result.effects.push(() => this.refreshTopic(fence, topicId))
+    result.effects.push(() => this.refreshTopic(fence, topicId, cause))
   }
 
   /**
@@ -1194,17 +1201,18 @@ class ShareFetchLoop {
    * @private
    * @param {OpenFence} fence The original open's fence.
    * @param {string} topicId The topic id the broker answered about.
+   * @param {Error} [cause] Original fetch failure retained if the topic was recreated.
    * @returns {Promise<void>}
    * @throws {Error} The refusal of the open or of the node operation.
    */
-  async refreshTopic(fence, topicId) {
+  async refreshTopic(fence, topicId, cause) {
     const name = this.cluster.topicName(topicId)
     await this.refreshMetadata(fence)
     fence.check()
     const current = name === undefined ? undefined : this.cluster.topicId(name)
     if (current !== undefined && current !== topicId) {
       for (const key of [...this.cohorts.keys()])
-        if (key.startsWith(`${topicId}:`)) this.retireKey(key, 'session-lost')
+        if (key.startsWith(`${topicId}:`)) this.retireKey(key, 'session-lost', cause)
     }
   }
 
@@ -1507,7 +1515,7 @@ class ShareFetchLoop {
    * unanswered, but only while that socket is still the one it was written on. A replacement
    * socket or the membership socket is never touched. A captured final that is written after
    * this call is not tracked here: {@link ShareFetchLoop#finishNode} tears it down itself.
-   * @param {Error} [cause] Why the node ends.
+   * @param {Error} [cause] Why the node ends, retained by unsettled acquisition errors.
    * @param {object} [options] Disposal options.
    * @param {'session-lost'|'membership-lost'|'not-sent'} [options.reason='session-lost'] The
    *   outcome of acquisitions that are not settled.
@@ -1523,7 +1531,7 @@ class ShareFetchLoop {
     for (const { sentAt, binding, settled } of this.exchanges)
       if (sentAt !== undefined && !settled && binding && !ShareSession.bindingLost(binding))
         unanswered.add(binding.connection)
-    this.invalidateAll(reason, preserve)
+    this.invalidateAll(reason, preserve, cause)
     this.session.retire(cause || new KafkaJSNonRetriableError('Share node was disposed'))
     for (const connection of unanswered) this.closeSocket(connection, drainTimeout)
   }
@@ -1546,11 +1554,11 @@ class ShareFetchLoop {
    * @private
    * @param {symbol} oldOpen The open that ended.
    * @param {string} reason Reset reason.
-   * @param {Error} [cause] Original failure.
+   * @param {Error} [cause] Original failure retained by every retired acquisition error.
    * @returns {void}
    */
   onSessionReset(oldOpen, reason, cause) {
-    this.invalidateAll('session-lost')
+    this.invalidateAll('session-lost', null, cause)
     this.notify(this.onReset, oldOpen, reason, cause)
   }
 
@@ -1558,16 +1566,17 @@ class ShareFetchLoop {
    * @private
    * @param {'session-lost'|'membership-lost'|'not-sent'} reason Outcome for unsettled work.
    * @param {{prepared: object[]}|null} [preserve] A captured final whose tickets stay settleable.
+   * @param {Error} [cause] Original failure retained by every non-preserved outcome error.
    * @returns {void}
    */
-  invalidateAll(reason, preserve = null) {
+  invalidateAll(reason, preserve = null, cause) {
     for (const exchange of this.exchanges) exchange.stale = true
     this.exchanges.clear()
     const rows = [...this.cohorts.values()].flat()
     this.cohorts.clear()
     for (const row of rows) {
       const kept = preserve?.prepared.find((entry) => entry.ledger === row.ledger)
-      this.emit(row.ledger.invalidate(reason, kept ? kept.ticket : null), row)
+      this.emit(row.ledger.invalidate(reason, kept ? kept.ticket : null, cause), row)
     }
   }
 
@@ -1575,16 +1584,17 @@ class ShareFetchLoop {
    * @private
    * @param {string} key A partition key.
    * @param {'session-lost'|'membership-lost'|'not-sent'} reason Outcome for its acquisitions.
+   * @param {Error} [cause] Original failure retained by renewal and terminal outcome errors.
    * @returns {void} Retires every acquisition this node holds for that partition and rejects its
    *   pending renewal callers with their own compact error, or a local refusal before preparation.
    *   The session model stays until the next fetch forgets it or a final closes it; a late answer
    *   cannot settle the invalidated tickets again.
    */
-  retireKey(key, reason) {
+  retireKey(key, reason, cause) {
     const rows = this.cohorts.get(key) || []
     this.cohorts.delete(key)
     for (const row of rows) {
-      const results = row.ledger.invalidate(reason)
+      const results = row.ledger.invalidate(reason, null, cause)
       for (const pending of this.renewals) {
         if (!pending.renew.some(({ cohort }) => cohort === row)) continue
         pending.error =

@@ -4,6 +4,15 @@ const { sessionAction } = require('./shareErrorContract')
 const MAX_EPOCH = 2147483647
 const RESET_REASONS = { 122: 'session-not-found', 123: 'invalid-epoch' }
 
+/** A refusal of a retired open or data binding, without retiring the node or membership. */
+class ShareSessionStaleError extends KafkaJSNonRetriableError {
+  /** @param {string} message The open or binding that no longer authorizes work. */
+  constructor(message) {
+    super(message)
+    this.name = 'ShareSessionStaleError'
+  }
+}
+
 /**
  * Serializes one node's ShareFetch and ShareAcknowledge requests and owns the node's wire epoch,
  * its opaque open identity and its partition model.
@@ -100,16 +109,17 @@ class ShareSession {
    * Reads the current refusal. Connection loss is a refusal before any generation counter moves.
    * It never connects, resets or adopts newer authority.
    * @param {symbol} token Captured open identity.
-   * @returns {Error|null} The operation's refusal, a "no longer current" error, a "connection was
-   *   lost" error, or null.
+   * @returns {Error|null} The operation's refusal, a terminal closed-session refusal, a
+   *   ShareSessionStaleError for a retired open or binding, or null. Retirement takes precedence.
    */
   refusal(token) {
     const refused = this.operation.guard()
     if (refused) return refused
-    if (this.closed || token !== this.token)
-      return new KafkaJSNonRetriableError('Share session is no longer current')
+    if (this.closed) return new KafkaJSNonRetriableError('Share session is no longer current')
+    if (token !== this.token)
+      return new ShareSessionStaleError('Share session is no longer current')
     if (this.binding && ShareSession.bindingLost(this.binding))
-      return new KafkaJSNonRetriableError('Share session connection was lost')
+      return new ShareSessionStaleError('Share session connection was lost')
     return null
   }
 
@@ -140,7 +150,7 @@ class ShareSession {
     const error = this.refusal(token)
     if (error) throw error
     if (this.binding && this.binding.connection !== binding.connection)
-      throw new KafkaJSNonRetriableError('Share session connection was replaced')
+      throw new ShareSessionStaleError('Share session connection was replaced')
     this.binding = binding
   }
 
@@ -234,4 +244,4 @@ class ShareSession {
   }
 }
 
-module.exports = { ShareSession }
+module.exports = { ShareSession, ShareSessionStaleError }

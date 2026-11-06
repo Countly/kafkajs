@@ -2792,7 +2792,8 @@ module.exports = class Broker {
    * A failure notes on the error which broker sent the request and the pool generation it went out
    * on (`attachFailureSource`), so the code that drops a failed broker from a table can tell a
    * stale failure from a current one. When the failure is a connection closed under the request,
-   * the pool's other connection is closed in the background (`retireSibling`).
+   * the pool's other connection is closed in the background (`retireSibling`), except for a share
+   * heartbeat: its coordinator socket can reconnect without retiring a healthy data session.
    *
    * @private
    * @param {{ request: { apiKey: number } }} protocolRequest a built request, as produced by
@@ -2837,7 +2838,8 @@ module.exports = class Broker {
     } catch (e) {
       currentDeadline()?.check()
       attachFailureSource(e, { broker: this, generation })
-      this.retireSibling(e, generation, pool)
+      if (protocolRequest.request.apiKey !== apiKeys.ShareGroupHeartbeat)
+        this.retireSibling(e, generation, pool)
 
       throw e
     }
