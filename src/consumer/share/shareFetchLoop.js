@@ -1,7 +1,9 @@
 const createRetry = require('../../retry')
 const apiKeys = require('../../protocol/requests/apiKeys')
 const { requests } = require('../../protocol/requests')
+const { withConsumerOperation } = require('../../admin/deadline')
 const { KafkaJSNonRetriableError, KafkaJSShareGroupsNotSupportedError } = require('../../errors')
+const { ConsumerOperation } = require('../groupProtocol/interface')
 const { ShareAckLedger, validateAcknowledgements } = require('./shareAckLedger')
 const { ShareRecordWalk } = require('./shareRecordWalk')
 const { ShareSession } = require('./shareSession')
@@ -60,7 +62,48 @@ const keyOf = (topicId, partition) => `${topicId}:${partition}`
  * @property {Error|null} refused The last refusal the guard returned.
  * @property {boolean} stale True once a reset or disposal took the request over.
  * @property {(frameLength?: number) => Error|null} guard Original-authority pre-write check.
+ * @property {{connection: object}|null} binding The data socket the request was bound to.
+ * @property {boolean} [settled] Final only: true once the transport call itself ended, whatever
+ *   its owner's wait did, so `dispose` closes the socket of an unanswered request and no other.
  */
+
+/**
+ * The fence of metadata work that one session open started. It is the node operation's own fence
+ * plus the open itself, so a provider that asks `check`, `closed` or `guard` after a session reset
+ * installs nothing, even though the node operation survives the reset.
+ */
+class OpenFence {
+  /**
+   * @param {ShareSession} session The node's session.
+   * @param {symbol} open The open identity the work started under.
+   */
+  constructor(session, open) {
+    this.session = session
+    this.guard = () => session.refusal(open)
+  }
+
+  /** @returns {boolean} Whether the open or the node operation can no longer authorize work. */
+  get closed() {
+    return this.guard() !== null
+  }
+
+  /**
+   * @returns {void}
+   * @throws {Error} The refusal of the open or of the node operation.
+   */
+  check() {
+    const refused = this.guard()
+    if (refused) throw refused
+  }
+
+  /**
+   * @param {(error: Error) => void} cancel Local cleanup, run when the node operation retires.
+   * @returns {() => void} Unregisters it without running it.
+   */
+  register(cancel) {
+    return this.session.operation.register(cancel)
+  }
+}
 
 /**
  * Plans, sends and settles the share traffic of one leader node. Request order is the node
@@ -411,6 +454,7 @@ class ShareFetchLoop {
     this.exchanges.add(exchange)
     try {
       if (!session.binding) await this.establish(exchange)
+      exchange.binding = session.binding
       this.build(exchange, options)
     } catch (error) {
       return this.failExchange(exchange, error)
@@ -445,6 +489,7 @@ class ShareFetchLoop {
       sentAt: undefined,
       refused: null,
       stale: false,
+      binding: null,
     }
     exchange.guard = (frameLength) => {
       const refused = this.session.refusal(open)
@@ -671,26 +716,30 @@ class ShareFetchLoop {
   }
 
   /**
-   * Sends only through the Broker's guarded share methods. The guard returns the original
-   * refusal and, when it sees a frame length, records the transmission time; it never supplies
-   * current tokens or changes the epoch or the model.
+   * Sends only through the Broker's guarded share methods, inside the node operation's scope, so
+   * the network request queue registers its cancellation there: retiring the node removes a
+   * request that is still queued (throttled or behind the in-flight limit) with its timer. The
+   * guard returns the original refusal and, when it sees a frame length, records the transmission
+   * time; it never supplies current tokens or changes the epoch or the model.
    * @private
    * @param {Exchange} exchange The request.
    * @returns {Promise<object>} The decoded answer.
    */
   send(exchange) {
     const { guard, fields } = exchange
-    if (exchange.apiKey === apiKeys.ShareAcknowledge)
-      return this.broker.shareAcknowledge(fields, { guard })
-    const { checkCrcs, maxDecompressedBatchBytes } = this.decode
-    return this.broker.shareFetch(
-      {
-        ...fields,
-        ...(checkCrcs !== undefined && { checkCrcs }),
-        ...(maxDecompressedBatchBytes !== undefined && { maxDecompressedBatchBytes }),
-      },
-      { guard }
-    )
+    return withConsumerOperation(this.operation, () => {
+      if (exchange.apiKey === apiKeys.ShareAcknowledge)
+        return this.broker.shareAcknowledge(fields, { guard })
+      const { checkCrcs, maxDecompressedBatchBytes } = this.decode
+      return this.broker.shareFetch(
+        {
+          ...fields,
+          ...(checkCrcs !== undefined && { checkCrcs }),
+          ...(maxDecompressedBatchBytes !== undefined && { maxDecompressedBatchBytes }),
+        },
+        { guard }
+      )
+    })
   }
 
   /**
@@ -1035,7 +1084,8 @@ class ShareFetchLoop {
     const index = partition.partitionIndex
     this.retireKey(keyOf(topicId, index), 'session-lost')
     const leader = partition.currentLeader
-    result.effects.push(() => this.relocate(open, topicId, index, leader, response.nodeEndpoints))
+    const fence = this.fenceFor(result, open)
+    result.effects.push(() => this.relocate(fence, topicId, index, leader, response.nodeEndpoints))
   }
 
   /**
@@ -1047,22 +1097,35 @@ class ShareFetchLoop {
    * @returns {void}
    */
   planRefresh(result, open, topicId, index) {
-    result.effects.push(() => this.refreshTopic(open, topicId, index))
+    const fence = this.fenceFor(result, open)
+    result.effects.push(() => this.refreshTopic(fence, topicId))
   }
 
   /**
-   * Applies a usable leader hint, else refreshes metadata, then reports the move. Every await is
-   * followed by a recheck of the original authority, so a late result routes nothing new.
    * @private
-   * @param {symbol} open Original open identity.
+   * @param {object} result The result being built.
+   * @param {symbol} open The request's open identity.
+   * @returns {OpenFence} The one fence every metadata effect of this answer carries.
+   */
+  fenceFor(result, open) {
+    result.fence ??= new OpenFence(this.session, open)
+    return result.fence
+  }
+
+  /**
+   * Applies a usable leader hint, else refreshes metadata, then reports the move. The fence of
+   * the original open goes into the provider, so a reset that happens while it awaits keeps it
+   * from installing anything, and every await is followed by a check of that same fence.
+   * @private
+   * @param {OpenFence} fence The original open's fence.
    * @param {string} topicId Topic UUID.
    * @param {number} index Partition index.
    * @param {{leaderId: number, leaderEpoch: number}|undefined} leader The answer's hint.
    * @param {object[]|undefined} nodeEndpoints The answer's endpoints.
    * @returns {Promise<void>}
-   * @throws {Error} The original refusal if the node retired meanwhile.
+   * @throws {Error} The refusal of the open or of the node operation.
    */
-  async relocate(open, topicId, index, leader, nodeEndpoints) {
+  async relocate(fence, topicId, index, leader, nodeEndpoints) {
     const { cluster, operation } = this
     const topic = cluster.topicName(topicId)
     const known =
@@ -1081,14 +1144,14 @@ class ShareFetchLoop {
             leaderEpoch: leader.leaderEpoch,
             nodeEndpoints: nodeEndpoints?.length ? nodeEndpoints : undefined,
           },
-          { fence: operation }
+          { fence }
         )
       )
-      this.recheck(open)
+      fence.check()
     }
     if (!applied) {
-      await this.refreshMetadata()
-      this.recheck(open)
+      await this.refreshMetadata(fence)
+      fence.check()
     }
     const leaderId = cluster.cachedLeader(topic, index)
     this.notify(this.onMove, { topic, topicId, partition: index, leaderId, reason: 'leader-moved' })
@@ -1098,16 +1161,15 @@ class ShareFetchLoop {
    * Reloads metadata after a retriable partition error. A topic that now has another id was
    * recreated: acquisitions under the old id are retired and never reused under the new one.
    * @private
-   * @param {symbol} open Original open identity.
+   * @param {OpenFence} fence The original open's fence.
    * @param {string} topicId The topic id the broker answered about.
-   * @param {number} index Partition index.
    * @returns {Promise<void>}
-   * @throws {Error} The original refusal if the node retired meanwhile.
+   * @throws {Error} The refusal of the open or of the node operation.
    */
-  async refreshTopic(open, topicId, index) {
+  async refreshTopic(fence, topicId) {
     const name = this.cluster.topicName(topicId)
-    await this.refreshMetadata()
-    this.recheck(open)
+    await this.refreshMetadata(fence)
+    fence.check()
     const current = name === undefined ? undefined : this.cluster.topicId(name)
     if (current !== undefined && current !== topicId) {
       for (const key of [...this.cohorts.keys()])
@@ -1117,18 +1179,18 @@ class ShareFetchLoop {
 
   /**
    * @private
-   * @returns {Promise<void>} One metadata refresh bound to the node operation; a failure is
-   *   logged, because the round's backoff already paces the retry.
-   * @throws {Error} The operation's refusal.
+   * @param {OpenFence} fence The original open's fence.
+   * @returns {Promise<void>} One metadata refresh fenced by the original open and bound to the
+   *   node operation; a failure is logged, because the round's backoff already paces the retry.
+   * @throws {Error} The refusal of the open or of the node operation.
    */
-  async refreshMetadata() {
-    const { operation } = this
+  async refreshMetadata(fence) {
     try {
-      await operation.wait(() =>
-        this.cluster.refreshMetadata({ fence: operation, allowLeaderless: true })
+      await this.operation.wait(() =>
+        this.cluster.refreshMetadata({ fence, allowLeaderless: true })
       )
     } catch (error) {
-      operation.check()
+      fence.check()
       this.logger.error('Share metadata refresh failed', { error: error.message })
     }
   }
@@ -1161,14 +1223,17 @@ class ShareFetchLoop {
   /**
    * Flushes terminal decisions or renews held offsets through one queued ShareAcknowledge. A
    * renewal consumes a normal wire epoch and settles before any later terminal preparation,
-   * because the FIFO keeps its order even when its caller does not await it.
+   * because the FIFO keeps its order even when its caller does not await it. An answer that owes
+   * a backoff (code 133, an unknown error, a delayed reset, a lost connection) is paced here, still
+   * inside the FIFO, so the next request of the node cannot be written before the delay ends; the
+   * caller, or its failure, is released after that delay.
    * @param {object} [options] What to send.
    * @param {Cohort[]} [options.cohorts] Restricts a flush to these acquisitions; all by default.
    * @param {Array<{cohort: Cohort, offsets: string[]}>} [options.renew] Renews these held offsets.
    * @returns {Promise<object>} The exchange result; for a renewal `lockDuration` is the new
    *   duration, or undefined when the answer kept the previous one.
    * @throws {KafkaJSShareAcknowledgementError} A failed renewal, from the ledger's compact result.
-   * @throws {Error} Any other failure of the request.
+   * @throws {Error} Any other failure of the request, or the node operation's refusal while it waits.
    */
   acknowledge({ cohorts, renew } = {}) {
     return this.session.enqueue(async (open) => {
@@ -1180,6 +1245,7 @@ class ShareFetchLoop {
           { apiKey: apiKeys.ShareAcknowledge, kind: renew ? 'renew' : 'flush', cohorts, renew },
           open
         )
+        if (result.backoff) await this.pace(result)
         if (renew && failure()) throw failure().error
         return result
       } catch (error) {
@@ -1197,9 +1263,12 @@ class ShareFetchLoop {
    * closing sends only its preserved terminal subset under its own predicate. Repeated calls share
    * the first.
    * @param {object} [options] Closing context.
-   * @param {{guard: () => Error|null, captured: object}} [options.closing] A captured close:
-   *   `captured` comes from {@link ShareFetchLoop#captureFinal} and `guard` is the immutable
-   *   closing predicate of the closing episode.
+   * @param {{guard: () => Error|null, captured: object, operation?: ConsumerOperation}} [options.closing]
+   *   A captured close: `captured` comes from {@link ShareFetchLoop#captureFinal}, `guard` is the
+   *   immutable closing predicate of the closing episode and `operation` is the episode's own
+   *   operation. The final's wait and its queue registration belong to that operation, so its
+   *   expiry settles an unanswered final; an episode that can expire must supply it, because a
+   *   predicate alone cannot wake a waiting request.
    * @returns {Promise<void>} Resolves when the node is disposed.
    * @throws {Error} The final's failure; the node is disposed regardless.
    */
@@ -1266,15 +1335,45 @@ class ShareFetchLoop {
 
   /**
    * Writes a captured final once, after ordinary retirement, under the closing predicate and the
-   * captured binding alone. The predicate is checked again after the answer, and an answer that
-   * arrives after it refused is not published as acceptance.
+   * captured binding alone. The final is an active exchange of this node, so a final that was
+   * written and never answered is found and its transport closed by `dispose`, and its wait belongs
+   * to the closing operation, so the episode's expiry settles it session-lost. The predicate is
+   * checked again after the answer, and an answer that arrives after it refused is not published
+   * as acceptance.
    * @private
-   * @param {{guard: (frameLength?: number) => Error|null, captured: object}} closing The closing context.
+   * @param {{guard: (frameLength?: number) => Error|null, captured: object, operation?: ConsumerOperation}} closing
+   *   The closing context. Without an operation, a private one without a deadline owns the wait.
    * @returns {Promise<void>}
    */
-  async sendFinal({ guard, captured }) {
+  async sendFinal({ guard, captured, operation }) {
+    const owned = operation ?? new ConsumerOperation({ guard, now: this.now })
+    try {
+      await this.writeFinal(owned, guard, captured)
+    } finally {
+      if (!operation) owned.finish()
+    }
+  }
+
+  /**
+   * @private
+   * @param {ConsumerOperation} operation Owns the final's wait and its queue registration.
+   * @param {(frameLength?: number) => Error|null} guard The closing predicate.
+   * @param {{binding: object, prepared: object[], fields: object, descriptor: object}} captured
+   *   What {@link ShareFetchLoop#captureFinal} froze.
+   * @returns {Promise<void>}
+   */
+  async writeFinal(operation, guard, captured) {
     const { binding, prepared, fields, descriptor } = captured
-    const exchange = { apiKey: 79, kind: 'final', prepared, captured: true, sentAt: undefined }
+    const exchange = {
+      apiKey: 79,
+      kind: 'final',
+      prepared,
+      captured: true,
+      sentAt: undefined,
+      stale: false,
+      binding,
+      settled: false,
+    }
     const check = (frameLength) => {
       const refused =
         guard(frameLength) ||
@@ -1289,13 +1388,26 @@ class ShareFetchLoop {
       this.settleAll(prepared, 'not-sent', early)
       return
     }
+    this.exchanges.add(exchange)
     let response
     try {
-      response = await binding.broker.shareAcknowledge(fields, { guard: check })
+      response = await operation.wait(() =>
+        withConsumerOperation(operation, () => {
+          const call = binding.broker.shareAcknowledge(fields, { guard: check })
+          const done = () => {
+            exchange.settled = true
+          }
+          call.then(done, done)
+          return call
+        })
+      )
     } catch (error) {
-      this.settleAll(prepared, exchange.sentAt === undefined ? 'not-sent' : 'session-lost', error)
+      const written = exchange.sentAt !== undefined
+      if (!written || exchange.settled) this.exchanges.delete(exchange)
+      this.settleAll(prepared, written ? 'session-lost' : 'not-sent', error)
       return
     }
+    this.exchanges.delete(exchange)
     const late = guard()
     if (late) {
       this.settleAll(prepared, 'session-lost', late)
@@ -1329,9 +1441,10 @@ class ShareFetchLoop {
 
   /**
    * Disposes the node once: revokes admissions, settles every acquisition, retires the session
-   * (queued requests reject, the operation's waits and timers are removed) and, only when a
-   * written request is still unanswered and the bound socket is still the one it was written on,
-   * closes that data socket. A replacement socket or the membership socket is never touched.
+   * (queued requests reject, the operation's waits, timers and still-queued network requests are
+   * removed) and closes the data socket of every request that was written and is still
+   * unanswered, ordinary or final, but only while that socket is still the one it was written on.
+   * A replacement socket or the membership socket is never touched.
    * @param {Error} [cause] Why the node ends.
    * @param {object} [options] Disposal options.
    * @param {'session-lost'|'membership-lost'|'not-sent'} [options.reason='session-lost'] The
@@ -1344,13 +1457,14 @@ class ShareFetchLoop {
     if (this.disposed) return
     this.disposed = true
     this.finishing = true
-    const { binding } = this.session
-    const written = [...this.exchanges].some((exchange) => exchange.sentAt !== undefined)
-    const live = binding && !ShareSession.bindingLost(binding)
+    const unanswered = new Set()
+    for (const { sentAt, binding, settled } of this.exchanges)
+      if (sentAt !== undefined && !settled && binding && !ShareSession.bindingLost(binding))
+        unanswered.add(binding.connection)
     this.invalidateAll(reason, preserve)
     this.session.retire(cause || new KafkaJSNonRetriableError('Share node was disposed'))
-    if (written && live)
-      binding.connection.disconnect({ drainTimeout }).catch((error) => {
+    for (const connection of unanswered)
+      connection.disconnect({ drainTimeout }).catch((error) => {
         this.logger.error('Share data connection close failed', { error: error.message })
       })
   }

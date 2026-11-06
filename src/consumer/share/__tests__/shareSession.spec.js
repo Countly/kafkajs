@@ -1,18 +1,20 @@
-const Broker = require('../../../broker')
-const ConnectionPool = require('../../../network/connectionPool')
-const { newLogger } = require('testHelpers')
-const { createScriptedCluster } = require('../../../../testHelpers/scriptedCluster')
 const { Schedule } = require('../../../../testHelpers/schedule')
 const {
-  batch,
-  record,
-} = require('../../../protocol/requests/fetch/__tests__/fixtures/recordBatchBytes')
+  A,
+  acquire,
+  acquired,
+  ackAnswer,
+  deferred,
+  fetchAnswer,
+  flush,
+  frames,
+  harness,
+  part,
+  topError,
+} = require('../../../../testHelpers/shareHarness')
 const { ConsumerOperation } = require('../../groupProtocol/interface')
 const { KafkaJSShareAcknowledgementError } = require('../../../errors')
 const { ShareSession } = require('../shareSession')
-const { ShareFetchLoop } = require('../shareFetchLoop')
-
-const A = '00112233-4455-6677-8899-aabbccddeeff'
 
 /** @returns {{session: ShareSession, onReset: jest.Mock, operation: ConsumerOperation}} A session on a real operation. */
 const unit = () => {
@@ -29,6 +31,13 @@ const request = (session, apiKey = 78, extra = {}) => ({
   topics: [],
   ...extra,
 })
+
+/** @param {Promise<*>} promise A promise. @returns {Promise<{value?: *, error?: Error}>} What it settled with. */
+const settled = (promise) =>
+  promise.then(
+    (value) => ({ value }),
+    (error) => ({ error })
+  )
 
 describe('serialized share session object', () => {
   test('opens at zero advances only on answers wraps and closes', () => {
@@ -276,274 +285,6 @@ describe('serialized share session object', () => {
   })
 })
 
-/** Offsets of the records one answer acquires, with the wire pair's literal base. */
-const acquired = (first, last, deliveryCount = 1) => ({
-  firstOffset: String(first),
-  lastOffset: String(last),
-  deliveryCount,
-})
-
-/** @returns {string} Hex of one valid record batch whose records carry the given values. */
-const recordsHex = (base, values) =>
-  batch({
-    baseOffset: BigInt(base),
-    records: values.map((value, i) => record({ offsetDelta: i, key: `k${i}`, value })),
-  }).toString('hex')
-
-/** @returns {object} A complete ShareFetch partition answer. */
-const part = ({
-  topicId = A,
-  partition,
-  code = 0,
-  ack = 0,
-  leader = { leaderId: -1, leaderEpoch: -1 },
-  acquire = [],
-  records = '',
-}) => ({
-  topicId,
-  partitionIndex: partition,
-  errorCode: code,
-  errorMessage: null,
-  acknowledgeErrorCode: ack,
-  acknowledgeErrorMessage: null,
-  currentLeader: leader,
-  acquiredRecords: acquire,
-  records,
-})
-
-/** @returns {object[]} Rows grouped by topic id the way the wire answer lists them. */
-const group = (rows) => {
-  const topics = new Map()
-  for (const { topicId, ...partition } of rows) {
-    if (!topics.has(topicId)) topics.set(topicId, { topicId, partitions: [] })
-    topics.get(topicId).partitions.push(partition)
-  }
-  return [...topics.values()]
-}
-
-/** @returns {object} A ShareFetch answer; `rows` are complete partition answers. */
-const fetchAnswer = (rows, extra = {}) => ({
-  errorCode: 0,
-  errorMessage: null,
-  throttleTime: 0,
-  acquisitionLockTimeoutMs: 15000,
-  nodeEndpoints: [],
-  responses: group(rows),
-  ...extra,
-})
-
-/** @returns {object} A ShareAcknowledge answer; `rows` are `{topicId, partition, code}`. */
-const ackAnswer = (rows, extra = {}) => ({
-  errorCode: 0,
-  errorMessage: null,
-  throttleTime: 0,
-  acquisitionLockTimeoutMs: 15000,
-  nodeEndpoints: [],
-  responses: group(
-    rows.map(({ topicId = A, partition, code = 0 }) => ({
-      topicId,
-      partitionIndex: partition,
-      errorCode: code,
-      errorMessage: null,
-      currentLeader: { leaderId: -1, leaderEpoch: -1 },
-    }))
-  ),
-  ...extra,
-})
-
-/** @returns {object} A top-level failure answer with no partitions. */
-const topError = (code) => fetchAnswer([], { errorCode: code })
-
-/** @returns {object} The answer a quiet broker gives: every listed partition confirmed, no records. */
-const echo = (api, fields) => {
-  const listed = fields.topics.flatMap((topic) =>
-    topic.partitions.map((partition) => ({
-      topicId: topic.topicId,
-      partition: partition.partitionIndex,
-    }))
-  )
-  return api === 'ShareFetch'
-    ? fetchAnswer(listed.map(({ topicId, partition }) => part({ topicId, partition })))
-    : ackAnswer(listed)
-}
-
-/** @param {object} cluster Scripted cluster. @param {...number} keys API keys. @returns {object[]} Share frames the client wrote, oldest first. */
-const frames = (cluster, ...keys) =>
-  cluster
-    .requests()
-    .filter(({ apiKey }) => (keys.length ? keys.includes(apiKey) : apiKey >= 78 && apiKey <= 79))
-
-/** @returns {Promise<void>} Lets queued socket and promise work run without any timer. */
-const flush = async () => {
-  for (let turn = 0; turn < 20; turn++) await new Promise(setImmediate)
-}
-
-/**
- * A scripted cluster with one Broker, pool and loop per node. Answers come from `script`, falling
- * back to the quiet broker. The clock moves only when a pacing sleep or an answer moves it.
- * @param {object} [options] `nodes` count, `loop` option overrides, `pool` option overrides.
- * @returns {Promise<object>} The harness.
- */
-const harness = async ({
-  nodes = 1,
-  loop = {},
-  pool: poolOptions = {},
-  names = new Map([[A, 'topic-a']]),
-} = {}) => {
-  const schedule = new Schedule()
-  const topology = [0, 1, 2].slice(0, nodes).map((id) => ({ id, host: `node${id}`, port: 9092 }))
-  const cluster = createScriptedCluster({ nodes: topology, profile: 'share', schedule })
-  const clock = { time: 1000 }
-  const gates = []
-  const pools = []
-  const metadata = {
-    topicName: jest.fn((id) => names.get(id)),
-    topicId: jest.fn((name) => [...names].find(([, candidate]) => candidate === name)?.[0]),
-    hasNode: jest.fn(() => true),
-    cachedLeader: jest.fn(() => 0),
-    applyLeaderHint: jest.fn(async () => true),
-    refreshMetadata: jest.fn(async () => {}),
-  }
-  const newPool = (node) => {
-    const created = new ConnectionPool({
-      host: node.host,
-      port: node.port,
-      clientId: 'test-client',
-      socketFactory: cluster.socketFactory,
-      logger: newLogger(),
-      connectionTimeout: 1000,
-      requestTimeout: 1000,
-      enforceRequestTimeout: false,
-      connectionsMaxIdle: 0,
-      ...poolOptions,
-    })
-    pools.push(created)
-    return created
-  }
-  /** One run on a node: its own operation, session and loop and observers, over the node's broker. */
-  const runOn = ({ node, pool, broker }) => {
-    const run = {
-      node,
-      pool,
-      broker,
-      want: [],
-      handled: [],
-      results: [],
-      moves: [],
-      fatals: [],
-      resets: [],
-      sleeps: [],
-    }
-    run.operation = new ConsumerOperation()
-    jest.spyOn(run.operation, 'sleep').mockImplementation(async (delay) => {
-      run.sleeps.push(delay)
-      clock.time += delay
-    })
-    run.session = new ShareSession({ operation: run.operation })
-    run.dispatch = async (rows) => {
-      for (const row of rows) {
-        const offsets = []
-        row.walk.deliver.records.forEach((message, i) => {
-          run.handled.push({
-            partition: row.partition,
-            topicId: row.topicId,
-            offset: message.offset,
-            value: message.value.toString(),
-            deliveryCount: row.walk.deliver.deliveryCounts[i],
-          })
-          offsets.push(message.offset)
-        })
-        if (offsets.length) row.ledger.complete(offsets, 'accept')
-      }
-    }
-    runs.push(run)
-    run.loop = new ShareFetchLoop({
-      session: run.session,
-      groupId: 'group',
-      memberId: 'member',
-      minBytes: 1,
-      maxBytes: 1048576,
-      maxRecords: 500,
-      acquireMode: 'record_limit',
-      broker,
-      cluster: metadata,
-      logger: newLogger(),
-      now: () => clock.time,
-      wanted: () => run.want,
-      onResults: (results, row) =>
-        run.results.push(
-          ...results.map((outcome) => ({
-            ...outcome,
-            partition: row.partition,
-            topicId: row.topicId,
-          }))
-        ),
-      onMove: (move) => run.moves.push(move),
-      onFatal: (error) => run.fatals.push(error),
-      onReset: (open, reason, cause) => run.resets.push({ reason, cause }),
-      dispatch: (rows) => run.dispatch(rows),
-      ...loop,
-    })
-    return run
-  }
-  const members = []
-  const runs = []
-  for (const node of topology) {
-    const pool = newPool(node)
-    const broker = new Broker({ connectionPool: pool, logger: newLogger() })
-    await broker.connect()
-    members.push(runOn({ node, pool, broker }))
-  }
-  return {
-    cluster,
-    schedule,
-    clock,
-    metadata,
-    members,
-    pools,
-    newPool,
-    runOn,
-    gates,
-    hold(selector) {
-      const gate = schedule.hold(selector)
-      gates.push(gate)
-      return gate
-    },
-    script(api, steps = []) {
-      const queue = [...steps]
-      cluster.answer(api, (fields, call) => {
-        const step = queue.shift()
-        const answer = typeof step === 'function' ? step(fields, call) : step
-        return answer ?? echo(api, fields)
-      })
-    },
-    scriptNodes(api, byNode) {
-      cluster.answer(api, (fields, call) => {
-        const step = byNode[call.node]?.shift()
-        const answer = typeof step === 'function' ? step(fields, call) : step
-        return answer ?? echo(api, fields)
-      })
-    },
-    async close() {
-      for (const gate of gates) if (gate.settle) gate.release()
-      for (const run of runs) run.loop.dispose()
-      await Promise.all(pools.map((created) => created.destroy({ drainTimeout: 0 })))
-      cluster.assertClean()
-    },
-  }
-}
-
-/** The answer of an opening fetch that acquires `values` of partition `partition` from `base`. */
-const acquire = (partition, base, values, extra = {}) => {
-  const first = BigInt(base)
-  return part({
-    partition,
-    acquire: [acquired(first, first + BigInt(values.length - 1))],
-    records: recordsHex(first, values),
-    ...extra,
-  })
-}
-
 describe('share session socket integration', () => {
   let h
   afterEach(async () => {
@@ -583,6 +324,77 @@ describe('share session socket integration', () => {
     const last = frames(h.cluster).at(-1)
     expect(last).toMatchObject({ apiKey: 79, fields: { shareSessionEpoch: -1, isRenewAck: false } })
   })
+
+  /** Registers an acquisition of partition 0 without a broker answer: one record, decided when `decide`. */
+  const adopted = (m, offset, decide) => {
+    const row = m.loop.adopt(
+      { open: m.session.token, sentAt: h.clock.time },
+      A,
+      {
+        partitionIndex: 0,
+        acquiredRecords: [acquired(offset, offset)],
+        messages: [{ offset: String(offset), value: Buffer.from('v') }],
+      },
+      15000
+    )
+    if (decide) row.ledger.complete([String(offset)], 'accept')
+    row.pendingHandlers = false
+    return row
+  }
+
+  test.each([
+    ['flush', 1],
+    ['renewal', 4],
+  ])(
+    'serializes a queued %s behind a held fetch with five requests allowed in flight',
+    async (kind, acknowledgeType) => {
+      h = await harness({ pool: { maxInFlightRequests: 5 } })
+      const [m] = h.members
+      m.want = [{ topicId: A, partition: 0 }]
+      const queue = m.pool.pool[1].requestQueue
+      expect(queue.maxInFlightRequests).toBe(5)
+      const inflightAtAnswer = []
+      const watch = (api) => () => {
+        inflightAtAnswer.push([api, queue.inflight.size])
+      }
+      h.script('ShareFetch', [watch('ShareFetch'), watch('ShareFetch')])
+      h.script('ShareAcknowledge', [watch('ShareAcknowledge')])
+      const gate = h.hold({ api: 'ShareFetch' })
+      const fetch = () =>
+        m.session.enqueue((open) => m.loop.exchange({ apiKey: 78, kind: 'fetch' }, open))
+      const first = fetch()
+      await gate.arrived()
+      const row = adopted(m, 77, kind === 'flush')
+      const second =
+        kind === 'flush'
+          ? m.loop.acknowledge()
+          : m.loop.acknowledge({ renew: [{ cohort: row, offsets: ['77'] }] })
+      const third = fetch()
+      await flush()
+      const order = () =>
+        frames(h.cluster).map(({ apiKey, fields }) => [apiKey, fields.shareSessionEpoch])
+      expect(order()).toEqual([[78, 0]])
+      expect(m.session.queue).toHaveLength(2)
+      expect(queue.pending).toHaveLength(0)
+      gate.release()
+      await Promise.all([first, second, third])
+      expect(order()).toEqual([
+        [78, 0],
+        [79, 1],
+        [78, 2],
+      ])
+      const [acknowledgement] = frames(h.cluster, 79)
+      expect(acknowledgement.fields).toMatchObject({ isRenewAck: kind === 'renewal' })
+      expect(acknowledgement.fields.topics[0].partitions[0].acknowledgementBatches).toEqual([
+        { firstOffset: '77', lastOffset: '77', acknowledgeTypes: [acknowledgeType] },
+      ])
+      expect(inflightAtAnswer).toEqual([
+        ['ShareFetch', 1],
+        ['ShareAcknowledge', 1],
+        ['ShareFetch', 1],
+      ])
+    }
+  )
 
   describe('session errors', () => {
     const retry = { initialRetryTime: 0, factor: 0, multiplier: 1, maxRetryTime: 0 }
@@ -732,36 +544,69 @@ describe('share session socket integration', () => {
   })
 
   describe('written but unanswered mutations', () => {
-    test('drops a written unanswered mutation instead of resending it', async () => {
-      h = await harness({ pool: { requestTimeout: 100, enforceRequestTimeout: true } })
+    test.each([
+      ['an acknowledgement request timeout', 79, 'timeout'],
+      ['a piggybacked fetch request timeout', 78, 'timeout'],
+      ['an acknowledgement in-flight disconnect', 79, 'disconnect'],
+    ])('drops %s instead of resending it', async (label, apiKey, failure) => {
+      h = await harness()
       const [m] = h.members
       m.want = [{ topicId: A, partition: 0 }]
-      h.script('ShareFetch', [fetchAnswer([acquire(0, 10, ['a', 'b'])])])
+      h.script('ShareFetch', [
+        fetchAnswer([acquire(0, 10, ['a', 'b'])]),
+        fetchAnswer([acquire(0, 10, ['a', 'b'])]),
+      ])
       await m.loop.poll()
-      const gate = h.hold({
-        api: 'ShareFetch',
-        match: (call) => call.fields.shareSessionEpoch === 1,
-      })
-      const result = await m.loop.poll()
-      const written = frames(h.cluster, 78)
-      expect(written.map(({ fields }) => fields.shareSessionEpoch)).toEqual([0, 1])
-      expect(written[1].fields.topics[0].partitions[0].acknowledgementBatches).toEqual([
+      const open = m.session.token
+      const generation = m.pool.generationFor(78)
+      const gate = h.hold({ api: apiKey === 79 ? 'ShareAcknowledge' : 'ShareFetch' })
+      const call = settled(apiKey === 79 ? m.loop.acknowledge() : m.loop.poll())
+      await gate.arrived()
+      const written = frames(h.cluster, apiKey).at(-1)
+      expect(written.fields.shareSessionEpoch).toBe(1)
+      expect(written.fields.topics[0].partitions[0].acknowledgementBatches).toEqual([
         { firstOffset: '10', lastOffset: '11', acknowledgeTypes: [1] },
       ])
-      expect(result).toMatchObject({ reset: true, backoff: true })
+      const connection = m.pool.pool[1]
+      if (failure === 'timeout') [...connection.requestQueue.inflight.values()][0].timeoutRequest()
+      else await connection.disconnect({ drainTimeout: 0 })
+      expect((await call).value).toMatchObject({ reset: true, backoff: true })
+      expect(m.session.refusal(open)).toBeInstanceOf(Error)
+      expect(m.pool.generationFor(78)).toBe(generation)
       expect(m.resets.map(({ reason }) => reason)).toEqual(['connection'])
-      const failures = m.results.filter((outcome) => outcome.error)
-      expect(failures.map((outcome) => outcome.error.reason)).toEqual(['session-lost'])
+      const failed = m.results.filter((outcome) => outcome.error)
+      expect(failed).toHaveLength(1)
+      expect(failed[0]).toMatchObject({ firstOffset: '10', lastOffset: '11', type: 'accept' })
+      expect(failed[0].error.reason).toBe('session-lost')
       expect(m.results.filter((outcome) => !outcome.error)).toEqual([])
+
       await m.loop.poll()
       const reopened = frames(h.cluster, 78).at(-1).fields
       expect(reopened.shareSessionEpoch).toBe(0)
       expect(reopened.topics[0].partitions[0].acknowledgementBatches).toEqual([])
-      const settled = m.results.length
-      gate.release(fetchAnswer([part({ partition: 0 })]))
+      expect(m.pool.generationFor(78)).toBeGreaterThan(generation)
+      const replacement = m.session.token
+      expect(replacement).not.toBe(open)
+      expect(m.handled.map(({ offset }) => offset)).toEqual(['10', '11', '10', '11'])
+
+      const settledBefore = m.results.length
+      const modelBefore = [...m.session.model.keys()]
+      const writtenBefore = frames(h.cluster).length
+      gate.release(
+        apiKey === 79 ? ackAnswer([{ partition: 0 }]) : fetchAnswer([part({ partition: 0 })])
+      )
       await flush()
-      expect(m.results).toHaveLength(settled)
+      expect(m.results).toHaveLength(settledBefore)
+      expect(m.session.token).toBe(replacement)
       expect(m.session.epoch).toBe(1)
+      expect([...m.session.model.keys()]).toEqual(modelBefore)
+      expect(frames(h.cluster)).toHaveLength(writtenBefore)
+
+      await m.loop.poll()
+      expect(m.results.filter((outcome) => !outcome.error)).toEqual([
+        expect.objectContaining({ firstOffset: '10', lastOffset: '11', type: 'accept' }),
+      ])
+      expect(m.results.filter((outcome) => outcome.error)).toHaveLength(1)
     })
 
     test('a disconnect before the generation counter moves refuses at once and resets', async () => {
@@ -820,148 +665,170 @@ describe('share session socket integration', () => {
   })
 
   describe('delayed old callbacks', () => {
-    /** Starts a replacement run on the same broker with equal member and wanted data. */
+    const hint = (leaderId, leaderEpoch) => ({ leaderId, leaderEpoch })
+
+    /** Starts a replacement run on the same broker with the same member and wanted data and a fresh acquisition identity. */
     const replace = (m) => {
       const next = h.runOn({ node: m.node, pool: m.pool, broker: m.broker })
       next.want = [...m.want]
+      next.loop.authority = { acquire: () => ({ owner: 'replacement' }) }
       return next
+    }
+
+    /** What a run holds and has shown, so "nothing changed" is one comparison. */
+    const state = (run) => ({
+      results: run.results.length,
+      handled: run.handled.length,
+      moves: run.moves.length,
+      epoch: run.session.epoch,
+      token: run.session.token,
+      model: [...run.session.model.keys()],
+      sleeps: run.sleeps.length,
+      waiters: run.operation.waiters.size,
+      disposers: run.operation.disposers.size,
+      timer: run.operation.timer,
+      queued: run.session.queue.length,
+      exchanges: run.loop.exchanges.size,
+      cohorts: [...run.loop.cohorts.keys()],
+      frames: frames(h.cluster).length,
+    })
+
+    /**
+     * Retires `old` while its await is held, runs a replacement through the same offsets with its
+     * own handler and ticket until its decisions are acknowledged, and returns it with its state.
+     */
+    const replaced = async (old) => {
+      old.loop.authority = { acquire: () => ({ owner: 'old' }) }
+      old.operation.retire(new Error('run closed'))
+      const next = replace(old)
+      await next.loop.poll()
+      await next.loop.poll()
+      expect(next.handled.map(({ offset }) => offset)).toEqual(['10', '11'])
+      expect(next.handled[0].token).toEqual({ owner: 'replacement' })
+      expect(next.results.filter((outcome) => !outcome.error)).toEqual([
+        expect.objectContaining({ firstOffset: '10', lastOffset: '11', type: 'accept' }),
+      ])
+      expect(next.results.filter((outcome) => outcome.error)).toEqual([])
+      return next
+    }
+
+    /** An answer that acquires offsets 10 and 11: what the replacement receives, and what a stale answer would carry again. */
+    const acquiresTen = () => fetchAnswer([acquire(0, 10, ['x', 'y'])])
+
+    /** Asserts the released old await changed nothing anywhere. */
+    const unchanged = async (old, next, before, staleOutcome) => {
+      expect((await staleOutcome).error.message).toBe('run closed')
+      await flush()
+      expect(state(next)).toEqual(before)
+      expect(old.handled).toEqual([])
+      expect(old.results).toEqual([])
+      expect([...old.session.model.keys()]).toEqual([])
+      expect(old.operation.waiters.size).toBe(0)
+      expect(old.operation.disposers.size).toBe(0)
+      expect(old.loop.exchanges.size).toBe(0)
+      expect(old.loop.cohorts.size).toBe(0)
     }
 
     test('an old connection acquisition cannot touch a replacement run', async () => {
       h = await harness()
       const [old] = h.members
       old.want = [{ topicId: A, partition: 0 }]
+      h.script('ShareFetch', [acquiresTen()])
       const original = old.pool.getConnectionByRequest.bind(old.pool)
-      let entered
-      const arrived = new Promise((resolve) => {
-        entered = resolve
-      })
-      let release
-      const held = new Promise((resolve) => {
-        release = resolve
-      })
+      const entered = deferred()
+      const held = deferred()
       jest.spyOn(old.pool, 'getConnectionByRequest').mockImplementationOnce(async (...args) => {
-        entered()
-        await held
+        entered.resolve()
+        await held.promise
         return original(...args)
       })
-      const stale = old.loop.poll()
-      const staleOutcome = stale.then(
-        () => 'resolved',
-        (error) => error.message
-      )
-      await arrived
-      old.operation.retire(new Error('run closed'))
-      const next = replace(old)
-      await next.loop.poll()
-      expect(frames(h.cluster, 78)).toHaveLength(1)
-      release()
-      expect(await staleOutcome).toBe('run closed')
-      await flush()
-      expect(frames(h.cluster, 78)).toHaveLength(1)
-      expect([...old.session.model.keys()]).toEqual([])
-      expect([...next.session.model.keys()]).toEqual([`${A}:0`])
-      expect(old.results).toEqual([])
-      expect(next.session.epoch).toBe(1)
+      const stale = settled(old.loop.poll())
+      await entered.promise
+      const next = await replaced(old)
+      const before = state(next)
+      held.resolve()
+      await unchanged(old, next, before, stale)
     })
 
     test('an old transmission is refused at the socket after its run retired', async () => {
       h = await harness()
       const [old] = h.members
       old.want = [{ topicId: A, partition: 0 }]
+      h.script('ShareFetch', [acquiresTen()])
       const original = old.pool.send.bind(old.pool)
-      let entered
-      const arrived = new Promise((resolve) => {
-        entered = resolve
-      })
-      let release
-      const held = new Promise((resolve) => {
-        release = resolve
-      })
+      const entered = deferred()
+      const held = deferred()
       jest.spyOn(old.pool, 'send').mockImplementationOnce(async (...args) => {
-        entered()
-        await held
+        entered.resolve()
+        await held.promise
         return original(...args)
       })
-      const stale = old.loop.poll()
-      const staleOutcome = stale.then(
-        () => 'resolved',
-        (error) => error.message
-      )
-      await arrived
-      old.operation.retire(new Error('run closed'))
-      const next = replace(old)
-      await next.loop.poll()
-      release()
-      expect(await staleOutcome).toBe('run closed')
-      await flush()
-      expect(frames(h.cluster, 78)).toHaveLength(1)
-      expect(old.session.epoch).toBe(0)
-      expect(next.session.epoch).toBe(1)
-      expect(old.results).toEqual([])
+      const stale = settled(old.loop.poll())
+      await entered.promise
+      const next = await replaced(old)
+      const before = state(next)
+      held.resolve()
+      await unchanged(old, next, before, stale)
     })
 
     test('an old answer applies nothing to a replacement run', async () => {
       h = await harness()
       const [old] = h.members
       old.want = [{ topicId: A, partition: 0 }]
+      h.script('ShareFetch', [acquiresTen()])
       const gate = h.hold({ api: 'ShareFetch' })
-      const stale = old.loop.poll()
-      const staleOutcome = stale.then(
-        () => 'resolved',
-        (error) => error.message
-      )
+      const stale = settled(old.loop.poll())
       await gate.arrived()
-      old.operation.retire(new Error('run closed'))
-      const next = replace(old)
-      await next.loop.poll()
-      expect(frames(h.cluster, 78)).toHaveLength(2)
-      gate.release(fetchAnswer([acquire(0, 10, ['stale'])]))
-      expect(await staleOutcome).toBe('run closed')
-      await flush()
-      expect(old.handled).toEqual([])
-      expect(next.handled).toEqual([])
-      expect([...old.session.model.keys()]).toEqual([])
-      expect(next.session.epoch).toBe(1)
-      expect(frames(h.cluster, 78)).toHaveLength(2)
+      const next = await replaced(old)
+      const before = state(next)
+      gate.release(acquiresTen())
+      await unchanged(old, next, before, stale)
     })
 
-    test('an old leader-hint lookup routes nothing after its run retired', async () => {
-      h = await harness()
+    test('an old leader-hint lookup installs no routing after its run retired', async () => {
+      h = await harness({ nodes: 3 })
       const [old] = h.members
       old.want = [{ topicId: A, partition: 0 }]
-      h.script('ShareFetch', [
-        fetchAnswer([part({ partition: 0, code: 6, leader: { leaderId: 2, leaderEpoch: 8 } })]),
-      ])
-      let entered
-      const arrived = new Promise((resolve) => {
-        entered = resolve
+      const real = await h.realCluster({
+        'topic-a': { topicId: A, partitions: [{ leader: 0, epoch: 5 }] },
       })
-      let release
-      const held = new Promise((resolve) => {
-        release = resolve
+      h.scriptNodes('ShareFetch', {
+        0: [
+          fetchAnswer([part({ partition: 0, code: 6, leader: hint(1, 9) })], {
+            nodeEndpoints: [{ nodeId: 1, host: 'node1', port: 9092, rack: null }],
+          }),
+          fetchAnswer([part({ partition: 0, code: 6, leader: hint(2, 8) })], {
+            nodeEndpoints: [{ nodeId: 2, host: 'node2', port: 9092, rack: null }],
+          }),
+        ],
       })
-      h.metadata.applyLeaderHint.mockImplementationOnce(async () => {
-        entered()
-        await held
-        return true
+      const original = real.cluster.applyLeaderHint.bind(real.cluster)
+      const entered = deferred()
+      const held = deferred()
+      jest.spyOn(real.cluster, 'applyLeaderHint').mockImplementationOnce(async (...args) => {
+        entered.resolve()
+        await held.promise
+        return original(...args)
       })
-      const stale = old.loop.poll()
-      const staleOutcome = stale.then(
-        () => 'resolved',
-        (error) => error.message
-      )
-      await arrived
+      const stale = settled(old.loop.poll())
+      await entered.promise
       old.operation.retire(new Error('run closed'))
       const next = replace(old)
       await next.loop.poll()
-      release()
-      expect(await staleOutcome).toBe('run closed')
+      expect(real.cluster.cachedLeader('topic-a', 0)).toBe(2)
+      expect(real.cluster.leaderEpoch('topic-a', 0)).toBe(8)
+      expect(next.moves).toEqual([
+        { topic: 'topic-a', topicId: A, partition: 0, leaderId: 2, reason: 'leader-moved' },
+      ])
+      const before = state(next)
+      held.resolve()
+      expect((await stale).error.message).toBe('run closed')
       await flush()
+      expect(real.cluster.cachedLeader('topic-a', 0)).toBe(2)
+      expect(real.cluster.leaderEpoch('topic-a', 0)).toBe(8)
       expect(old.moves).toEqual([])
-      expect(next.moves).toEqual([])
-      expect(h.metadata.refreshMetadata).not.toHaveBeenCalled()
-      expect(frames(h.cluster, 78)).toHaveLength(2)
+      expect(state(next)).toEqual(before)
+      expect(real.refreshes()).toBe(0)
     })
   })
 })
