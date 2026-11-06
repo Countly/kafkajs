@@ -211,7 +211,10 @@ describe('Admin > describeGroups on a share group > captured legacy outcomes', (
 })
 
 describe('Admin > describeGroups on a share group > replay controls', () => {
-  /** A capture of the classic fallback after a broker without ConsumerGroupDescribe, for the controls only. */
+  /**
+   * Models an unsupported ConsumerGroupDescribe call followed by DescribeGroups v6 for controls.
+   * @returns {object[]} the call trace; an unsupported API has no negotiated wire version
+   */
   const controlTrace = () => [
     {
       method: 'consumerGroupDescribe',
@@ -222,6 +225,8 @@ describe('Admin > describeGroups on a share group > replay controls', () => {
         error: {
           name: 'KafkaJSServerDoesNotSupportApiKey',
           message: 'The Kafka server does not support the requested API version',
+          retriable: false,
+          category: 'applicationRecoverable',
           apiKey: 69,
           apiName: 'ConsumerGroupDescribe',
         },
@@ -276,9 +281,7 @@ describe('Admin > describeGroups on a share group > replay controls', () => {
     capture.trace[1].outcome.value.groups[0].errorCode = GROUP_ALIAS
     const attempt = verifyReplay(capture)
 
-    await expect(attempt).rejects.toThrow(
-      /The public outcome differs from the capture|Unrecorded call/
-    )
+    await expect(attempt).rejects.toThrow('The public outcome differs from the capture')
   })
 
   it('fails on an unrecorded call when a trace entry is missing', async () => {
