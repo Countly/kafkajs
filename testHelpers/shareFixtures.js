@@ -138,45 +138,62 @@ const setShareGroupConfigs = async (admin, group, kv, { timeout = 10000, interva
  * @param {string[]} names Config names to restore to defaults.
  * @param {{ signal?: AbortSignal }} [options] Enclosing cleanup scope.
  * @returns {Promise<void>} Once every override is absent from the GROUP resource.
- * @throws {Error} On refusal, missing readback or an override remaining at the deadline.
+ * @throws {Error} On refusal, missing readback or an override remaining at the deadline, naming
+ *   every remaining config.
  */
 const resetShareGroupConfigs = async (admin, group, names, { signal } = {}) => {
   const { NEVER, bounded, pollUntil } = require('../src/producer/__tests__/fixtures/bounded')
-  await bounded(signal || NEVER, 8000, async (scope) => {
-    const resource = { type: CONFIG_RESOURCE_TYPES.GROUP, name: group }
-    const { resources } = await bounded(scope, Infinity, () =>
-      admin.incrementalAlterConfigs({
-        resources: [
-          {
-            ...resource,
-            configEntries: names.map((name) => ({ name, operation: ALTER_CONFIG_OP_TYPES.DELETE })),
-          },
-        ],
-      })
-    )
-    if (resources[0].errorCode !== 0) {
-      throw new Error(`Config reset refused: ${resources[0].errorCode}`)
-    }
-    await pollUntil(
-      scope,
-      Infinity,
-      async () => {
-        const read = await admin.describeConfigs({
-          resources: [{ ...resource, configNames: names }],
+  let remaining = []
+  try {
+    await bounded(signal || NEVER, 8000, async (scope) => {
+      const resource = { type: CONFIG_RESOURCE_TYPES.GROUP, name: group }
+      const { resources } = await bounded(scope, Infinity, () =>
+        admin.incrementalAlterConfigs({
+          resources: [
+            {
+              ...resource,
+              configEntries: names.map((name) => ({
+                name,
+                operation: ALTER_CONFIG_OP_TYPES.DELETE,
+              })),
+            },
+          ],
         })
-        const row = read.resources.find(
-          ({ resourceType, resourceName }) =>
-            resourceType === resource.type && resourceName === group
-        )
-        if (!row || row.errorCode !== 0) throw new Error('Missing successful group config readback')
-        return !row.configEntries.some(
-          ({ configName, configSource }) =>
-            names.includes(configName) && configSource === CONFIG_SOURCE.GROUP_CONFIG
-        )
-      },
-      { delayMs: 100, label: 'Group config overrides disappearing' }
-    )
-  })
+      )
+      if (resources[0].errorCode !== 0) {
+        throw new Error(`Config reset refused: ${resources[0].errorCode}`)
+      }
+      await pollUntil(
+        scope,
+        Infinity,
+        async () => {
+          const read = await admin.describeConfigs({
+            resources: [{ ...resource, configNames: names }],
+          })
+          const row = read.resources.find(
+            ({ resourceType, resourceName }) =>
+              resourceType === resource.type && resourceName === group
+          )
+          if (!row || row.errorCode !== 0) {
+            throw new Error('Missing successful group config readback')
+          }
+          remaining = row.configEntries
+            .filter(
+              ({ configName, configSource }) =>
+                names.includes(configName) && configSource === CONFIG_SOURCE.GROUP_CONFIG
+            )
+            .map(({ configName }) => configName)
+          return remaining.length === 0
+        },
+        { delayMs: 100, label: 'Group config overrides disappearing' }
+      )
+    })
+  } catch (error) {
+    if (remaining.length > 0) {
+      error.message += `; Group ${group} config overrides remain: ${remaining.join(', ')}`
+    }
+    throw error
+  }
 }
 
 /**

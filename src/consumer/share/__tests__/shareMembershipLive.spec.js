@@ -14,6 +14,7 @@ const path = require('path')
 const crypto = require('crypto')
 const { spawn } = require('child_process')
 const { isDeepStrictEqual } = require('util')
+const { runInNewContext } = require('vm')
 const { Kafka, logLevel } = require('../../../../index')
 const { readLog, endOffsets } = require('../../../../testHelpers/rawLog')
 const {
@@ -21,6 +22,7 @@ const {
   ShareHandlerLog,
   shareTopicName,
   setShareGroupConfigs,
+  resetShareGroupConfigs,
   shareRecordIdentity,
   assertShareCleanup,
   captureShareCleanupBaseline,
@@ -35,9 +37,7 @@ const {
 } = require('testHelpers')
 const defaultSocketFactory = require('../../../network/socketFactory')
 const RequestQueue = require('../../../network/requestQueue')
-const ALTER_CONFIG_OP_TYPES = require('../../../protocol/alterConfigOpTypes')
 const CONFIG_RESOURCE_TYPES = require('../../../protocol/configResourceTypes')
-const CONFIG_SOURCE = require('../../../protocol/configSource')
 const { ShareAckLedger } = require('../shareAckLedger')
 const {
   NEVER,
@@ -494,11 +494,11 @@ const summarize = (snapshot) => ({
 
 /**
  * @param {Array<{topic: string, partitions: number[]}>} assignment
- * @returns {Array<{topic: string, partitions: number[]}>} the same assignment with sorted
- *   partitions and sorted topics, so two sources compare by value
+ * @returns {Array<{topic: string, partitions: number[]}>} Local arrays with sorted partitions
+ *   and topics, so IPC and in-process sources compare by value across realms.
  */
 const normalize = (assignment) =>
-  assignment
+  [...assignment]
     .map(({ topic, partitions }) => ({ topic, partitions: [...partitions].sort((a, b) => a - b) }))
     .sort((a, b) => a.topic.localeCompare(b.topic))
 
@@ -618,7 +618,14 @@ class Member {
       if (hold) {
         this.hold = null
         this.held = entry
-        const timer = setInterval(() => payload.renew().catch(() => {}), RENEW_MS)
+        const timer = setInterval(() => {
+          try {
+            payload.renew().catch(() => {})
+          } catch {
+            // A revoked call refuses renewal synchronously; there is nothing left to renew.
+            clearInterval(timer)
+          }
+        }, RENEW_MS)
         try {
           await hold.promise
         } finally {
@@ -900,37 +907,6 @@ const dropGroup = (scope, admin, group) =>
   )
 
 /**
- * Removes the dynamic GROUP configs a case set and verifies none is left.
- * @param {AbortSignal} scope
- * @param {object} admin a connected admin client
- * @param {string} group
- * @param {string[]} names the owned config keys
- * @returns {Promise<void>}
- * @throws {Error} a refused change, or an owned override still present
- */
-const resetGroupConfig = async (scope, admin, group, names) => {
-  const resource = { type: CONFIG_RESOURCE_TYPES.GROUP, name: group }
-  const configEntries = names.map((name) => ({ name, operation: ALTER_CONFIG_OP_TYPES.DELETE }))
-  const { resources } = await bounded(scope, STEP_MS, () =>
-    admin.incrementalAlterConfigs({ resources: [{ ...resource, configEntries }] })
-  )
-  if (resources[0].errorCode !== 0) {
-    throw new Error(`Group ${group} refused a config reset: error ${resources[0].errorCode}`)
-  }
-  await pollUntil(
-    scope,
-    STEP_MS,
-    async () => {
-      const read = await admin.describeConfigs({ resources: [{ ...resource, configNames: names }] })
-      return read.resources[0].configEntries.every(
-        ({ configSource }) => configSource !== CONFIG_SOURCE.GROUP_CONFIG
-      )
-    },
-    { delayMs: 500, label: `Resetting ${group}` }
-  )
-}
-
-/**
  * The live case: three members over three partitions with a join, a clean leave while a record is
  * held, and the death of a real child process while it holds one, across 1800 unique records.
  */
@@ -1117,7 +1093,7 @@ class MembershipCase {
     stack.add('delete topic', (signal) => dropTopic(signal, admin, topic))
     stack.add(`delete group ${group}`, (signal) => dropGroup(signal, admin, group))
     stack.add(`reset config of ${group}`, (signal) =>
-      resetGroupConfig(signal, admin, group, GROUP_KEYS)
+      resetShareGroupConfigs(admin, group, GROUP_KEYS, { signal })
     )
     this.dir = fs.mkdtempSync(path.join(os.tmpdir(), 'share-membership-'))
     stack.add('remove the journal directory', () =>
@@ -1408,7 +1384,10 @@ class MembershipCase {
                     ? member.of('group_join').at(-1)
                     : member.joins.at(-1),
                 event: member.assignments.at(-1),
-                publicAssignment: member.client?.assignment(),
+                publicAssignment:
+                  member instanceof ChildMember
+                    ? member.of('heartbeat').at(-1)?.assignment
+                    : member.client.assignment(),
                 heartbeat:
                   member instanceof ChildMember ? member.of('heartbeat').at(-1) : undefined,
               },
@@ -1836,6 +1815,19 @@ describe('membership assignment observation', () => {
   it('accepts an unchanged assignment whose last event precedes the admin epoch', () => {
     expect(assignmentAgrees(member(), event(), 'original-topic')).toBe(true)
     expect(assignmentAgrees(member(), { ...event(), memberEpoch: 5 }, 'original-topic')).toBe(true)
+  })
+
+  it('compares child IPC assignments by value across realms', () => {
+    const child = new ChildMember({ label: 'C' })
+    const message = runInNewContext('JSON.parse(input)', {
+      input: JSON.stringify({ ...event(), event: 'assignment' }),
+    })
+    child.receive(message)
+    const observed = child.assignments.at(-1)
+
+    expect(assignmentAgrees(member(), observed, 'original-topic')).toBe(true)
+    observed.assignment[0].partitions = [0]
+    expect(assignmentAgrees(member(), observed, 'original-topic')).toBe(false)
   })
 
   it.each([

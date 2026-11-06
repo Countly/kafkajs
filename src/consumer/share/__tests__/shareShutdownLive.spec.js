@@ -15,7 +15,6 @@ const {
   logLevel,
 } = require('../../../../index')
 const CONFIG_RESOURCE_TYPES = require('../../../protocol/configResourceTypes')
-const CONFIG_SOURCE = require('../../../protocol/configSource')
 const ALTER_CONFIG_OP_TYPES = require('../../../protocol/alterConfigOpTypes')
 const defaultSocketFactory = require('../../../network/socketFactory')
 const { ShareAckLedger } = require('../shareAckLedger')
@@ -31,6 +30,7 @@ const {
   captureShareCleanupBaseline,
   createShareTopic,
   setShareGroupConfigs,
+  resetShareGroupConfigs,
   shareRecordIdentity,
 } = require('../../../../testHelpers/shareFixtures')
 const { CleanupStack, describeError } = require('../../../producer/__tests__/fixtures/liveProbe')
@@ -1231,26 +1231,7 @@ class ShutdownCase {
       { delayMs: 200, label: 'The group deletion' }
     )
     if (!this.configKeys) return
-    const resource = { type: CONFIG_RESOURCE_TYPES.GROUP, name: this.group }
-    await this.admin.incrementalAlterConfigs({
-      resources: [
-        {
-          ...resource,
-          configEntries: this.configKeys.map((name) => ({
-            name,
-            operation: ALTER_CONFIG_OP_TYPES.DELETE,
-          })),
-        },
-      ],
-    })
-    const { resources } = await this.admin.describeConfigs({
-      resources: [{ ...resource, configNames: this.configKeys }],
-    })
-    const left = (resources[0]?.configEntries ?? []).filter(
-      ({ configSource }) => configSource === CONFIG_SOURCE.GROUP_CONFIG
-    )
-    if (left.length > 0)
-      throw new Error(`Group config override remains: ${left.map((e) => e.configName)}`)
+    await resetShareGroupConfigs(this.admin, this.group, this.configKeys, { signal })
   }
 
   /**
