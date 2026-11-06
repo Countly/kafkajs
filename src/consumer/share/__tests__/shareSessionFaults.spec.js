@@ -1,14 +1,10 @@
 const assert = require('node:assert/strict')
 const {
-  acquired,
   ackAnswer,
   deferred,
   fetchAnswer,
   flush,
-  heartbeatAnswer,
   part,
-  recordsHex,
-  shareClient,
   topError,
   until,
 } = require('../../../../testHelpers/shareHarness')
@@ -17,684 +13,21 @@ const RequestQueue = require('../../../network/requestQueue')
 const { requests } = require('../../../protocol/requests')
 const { ShareSession } = require('../shareSession')
 
-/**
- * Checks observations without answering a request or making a client decision.
- * The scenario supplies issuance identities captured from real calls, not wire counters.
- */
-class FaultAudit {
-  /** @returns {FaultAudit} An empty observer with compact interval storage. */
-  constructor() {
-    this.finals = new Map()
-    this.forgotten = new Map()
-    this.settled = new Map()
-    this.handlers = new Map()
-  }
-
-  /**
-   * Validates a compact range without converting absolute offsets to Number.
-   * @param {string} first Inclusive decimal first offset.
-   * @param {string} last Inclusive decimal last offset.
-   * @returns {[bigint,bigint]} Exact bounds.
-   * @throws {Error} For noncanonical or out-of-domain offsets.
-   */
-  range(first, last) {
-    for (const value of [first, last]) {
-      assert.equal(typeof value, 'string')
-      assert.match(value, /^(0|[1-9][0-9]*)$/)
-      assert(BigInt(value) <= 9223372036854775807n)
-    }
-    assert(BigInt(first) <= BigInt(last))
-    return [BigInt(first), BigInt(last)]
-  }
-
-  /**
-   * Reads one independently decoded frame under the scenario's captured authority.
-   * This model records only listed and forgotten partitions; it creates no responses.
-   * @param {object} record Actual ScriptedCluster RequestRecord.
-   * @param {object} authority Test-owned identity, currentness and wanted-set observations.
-   * @returns {void} Same-frame last acknowledgements and forget are legal.
-   * @throws {Error} For stale writes, malformed requests or later forgotten-partition reuse.
-   */
-  frame(record, authority) {
-    const { apiKey, fields } = record
-    assert(authority.allowed, 'unauthorized frame')
-    if (apiKey !== 78 && apiKey !== 79) return
-    const batches = (fields.topics || []).flatMap((topic) =>
-      topic.partitions.flatMap((partition) => partition.acknowledgementBatches)
-    )
-    for (const batch of batches) this.range(batch.firstOffset, batch.lastOffset)
-    if (fields.shareSessionEpoch === 0) {
-      assert.equal(apiKey, 78)
-      assert.equal(batches.length, 0, 'opening acknowledgements')
-    }
-    if (fields.shareSessionEpoch === -1) {
-      assert.equal(apiKey, 79)
-      assert.equal(authority.kind, 'closing')
-      assert(authority.episode && ['symbol', 'object'].includes(typeof authority.episode))
-      const nodes = this.finals.get(authority.episode) || new Set()
-      assert(!nodes.has(record.node), 'duplicate final')
-      nodes.add(record.node)
-      this.finals.set(authority.episode, nodes)
-    }
-    if (fields.isRenewAck) assert.equal(apiKey, 79)
-    if (apiKey === 79) {
-      for (const name of [
-        'maxWaitMs',
-        'minBytes',
-        'maxBytes',
-        'maxRecords',
-        'batchSize',
-        'forgottenTopicsData',
-      ])
-        assert.equal(Object.prototype.hasOwnProperty.call(fields, name), false)
-      return
-    }
-    assert(fields.maxBytes > 0 && fields.maxRecords > 0)
-    let forgotten = this.forgotten.get(authority.open)
-    if (!forgotten) {
-      forgotten = new Set()
-      this.forgotten.set(authority.open, forgotten)
-    }
-    for (const topic of fields.topics) {
-      for (const partition of topic.partitions) {
-        const key = `${topic.topicId}:${partition.partitionIndex}`
-        assert(!forgotten.has(key) || authority.wanted.has(key), 'forgotten partition listed again')
-        if (authority.wanted.has(key)) forgotten.delete(key)
-      }
-    }
-    for (const topic of fields.forgottenTopicsData) {
-      for (const partition of topic.partitions) forgotten.add(`${topic.topicId}:${partition}`)
-    }
-  }
-
-  /**
-   * Checks disjoint terminal results within one original acquisition and partition.
-   * Renew results are nonterminal and may repeat under distinct invocation identities.
-   * @param {object|symbol} acquisition Original opaque acquisition identity from the real owner.
-   * @param {object} event Compact result including firstOffset, lastOffset and type.
-   * @returns {void} Storage scales with result intervals, never their numeric width.
-   * @throws {Error} For a duplicate or overlapping terminal result.
-   */
-  settlement(acquisition, event) {
-    const [first, last] = this.range(event.firstOffset, event.lastOffset)
-    if (event.type === 'renew') return
-    let partitions = this.settled.get(acquisition)
-    if (!partitions) {
-      partitions = new Map()
-      this.settled.set(acquisition, partitions)
-    }
-    const key = `${event.topicId}:${event.partition}`
-    const prior = partitions.get(key) || []
-    for (const interval of prior)
-      assert(last < interval[0] || first > interval[1], 'terminal result overlap')
-    prior.push([first, last])
-    partitions.set(key, prior)
-  }
-
-  /**
-   * Records starts and finishes of actual application invocations for one stable record identity.
-   * @param {string} identity Topic UUID, partition and exact offset.
-   * @param {object|symbol} call Original application invocation.
-   * @param {boolean} start True for entry; false for its finally boundary.
-   * @returns {void} A replacement cannot share an active record with its predecessor.
-   * @throws {Error} For concurrent delivery or a foreign completion.
-   */
-  handler(identity, call, start) {
-    if (start) {
-      assert(!this.handlers.has(identity), 'concurrent record handler')
-      this.handlers.set(identity, call)
-    } else {
-      assert.equal(this.handlers.get(identity), call)
-      this.handlers.delete(identity)
-    }
-  }
-}
-
-/** Every timer the client owns is faked; socket answers still travel on real macrotasks. */
-const FAKE = { doNotFake: ['setImmediate', 'queueMicrotask', 'nextTick', 'hrtime'] }
-const NAME = '__proto__'
-const IDS = {
-  A: '01020304-0506-0708-090a-0b0c0d0e0f10',
-  B: '11121314-1516-1718-191a-1b1c1d1e1f20',
-  U: '21222324-2526-2728-292a-2b2c2d2e2f30',
-}
-const ALIAS = new Map(Object.entries(IDS).map(([alias, id]) => [id, alias]))
-const H = '9007199254740993'
-const J = '9007199254740994'
-const LEADERS = [0, 1, 1]
-const STALE_CALL = 'Handler call is no longer current'
-
-/**
- * @param {number} ms Fake milliseconds.
- * @returns {Promise<void>} Moves the fake clock and runs the client timers that fall due.
- */
-const advance = (ms) => jest.advanceTimersByTimeAsync(ms)
-
-/**
- * @returns {object} The metadata the wire serves: topic A named `__proto__` with partitions 0, 1, 2
- *   led by nodes 0, 1, 1. The name is a computed key so it is an own property, not a prototype.
- */
-const topicTable = () => ({
-  [NAME]: { topicId: IDS.A, partitions: LEADERS.map((leader) => ({ leader, epoch: 1 })) },
-})
-
-/**
- * @param {number} partition Partition index.
- * @param {object} [options] Answer options.
- * @param {string} [options.topicId] Topic UUID of the partition.
- * @param {number} [options.count=2] Delivery count of the acquired range.
- * @returns {object} A ShareFetch partition answer acquiring the exact records H and J.
- */
-const dataPart = (partition, { topicId = IDS.A, count = 2 } = {}) =>
-  part({
-    topicId,
-    partition,
-    acquire: [acquired(H, J, count)],
-    records: recordsHex(H, ['value-h', 'value-j']),
-  })
-
-/**
- * @param {Error} error A failure, possibly wrapping the original protocol error.
- * @returns {Array<number|string>} Every `code` along its cause chain, outermost first.
- */
-const codesOf = (error) => {
-  const codes = []
-  for (let cursor = error; cursor; cursor = cursor.cause) {
-    if (cursor.code !== undefined) codes.push(cursor.code)
-  }
-  return codes
-}
-
-/**
- * @param {Promise<*>} promise A promise the test does not await yet.
- * @returns {{settled: boolean, error: Error|null}} Its live state, so "still pending" is observable.
- */
-const track = (promise) => {
-  const state = { settled: false, error: null }
-  promise.then(
-    () => {
-      state.settled = true
-    },
-    (error) => {
-      state.settled = true
-      state.error = error
-    }
-  )
-  return state
-}
-
-/**
- * @param {Array<{firstOffset: string, lastOffset: string}>} ranges Result ranges.
- * @param {string} offset Exact decimal offset.
- * @returns {boolean} Whether a range covers the offset, compared without Number conversion.
- */
-const covers = (ranges, offset) =>
-  ranges.some(
-    (range) =>
-      BigInt(range.firstOffset) <= BigInt(offset) && BigInt(offset) <= BigInt(range.lastOffset)
-  )
-
-/**
- * The shared driver of every fault case: one real `Kafka` share consumer over the scripted share
- * cluster, call-through observation of its handlers and public events, test-owned gates released
- * in guaranteed cleanup, and the strict baseline. It scripts answers and observes frames; every
- * production transition stays with the client.
- */
-class FaultCase {
-  /**
-   * @param {object} row The literal oracle row; never mutated.
-   * @returns {FaultCase} A case holding no socket, timer or promise yet.
-   */
-  constructor(row) {
-    this.row = row
-    this.audit = new FaultAudit()
-    this.h = null
-    this.rounds = row.expected.rounds
-    this.seen = {
-      acks: [],
-      joins: [],
-      beats: [],
-      crashes: [],
-      resets: [],
-      stops: [],
-      assigned: [],
-      fetches: [],
-    }
-    this.handlers = []
-    this.calls = []
-    this.holds = new Map()
-    this.heldGates = []
-    this.auditFailures = []
-    this.gates = []
-    this.tracked = []
-    this.removers = []
-    this.restartErrors = []
-    this.supply = new Map()
-    this.epochs = new Map()
-    this.unhandled = []
-    this.baseline = null
-    this.interval = 50
-    this.beatFault = null
-    this.beatShape = null
-    this.runState = null
-    this.onUnhandled = (reason) => this.unhandled.push(reason)
-  }
-
-  /** @returns {object} The scripted cluster, available once `start` ran. */
-  get cluster() {
-    return this.h?.cluster
-  }
-
-  /**
-   * Creates the client, its scripted cluster and observers. Fake timers are installed first and the
-   * resource baseline is read before the client exists.
-   * @param {object} [options] Client options.
-   * @param {number} [options.requestTimeout=30000] The Kafka request timeout.
-   * @param {boolean} [options.enforce=true] The Kafka `enforceRequestTimeout` option.
-   * @param {object} [options.share] Overrides of the shareConsumer options.
-   * @param {object} [options.retry] Overrides of the share retry policy.
-   * @returns {Promise<void>}
-   */
-  async start({ requestTimeout = 30000, enforce = true, share = {}, retry = {} } = {}) {
-    process.on('unhandledRejection', this.onUnhandled)
-    jest.useFakeTimers(FAKE)
-    await advance(1000)
-    this.baseline = { timers: jest.getTimerCount() }
-    this.h = shareClient({
-      nodes: 3,
-      interval: this.interval,
-      topics: topicTable(),
-      kafka: { requestTimeout, enforceRequestTimeout: enforce },
-      share: {
-        rackId: 'rack-a',
-        ...share,
-        retry: {
-          restartOnFailure: async (error) => {
-            this.restartErrors.push(error)
-            return true
-          },
-          ...retry,
-        },
-      },
-    })
-    const { events, on } = this.h.consumer
-    const watch = (name, sink, pick = ({ payload }) => payload) =>
-      this.removers.push(on(events[name], (event) => sink.push(pick(event))))
-    watch('ACKNOWLEDGE', this.seen.acks)
-    watch('GROUP_JOIN', this.seen.joins)
-    watch('HEARTBEAT', this.seen.beats)
-    watch('CRASH', this.seen.crashes)
-    watch('SESSION_RESET', this.seen.resets)
-    watch('STOP', this.seen.stops, () => true)
-    watch('ASSIGNMENT_CHANGED', this.seen.assigned)
-    watch('FETCH', this.seen.fetches)
-    this.removers.push(on(events.ACKNOWLEDGE, ({ payload }) => this.observeResult(payload)))
-    this.cluster.answer('ShareFetch', (fields) => this.fetchAnswerFor(fields))
-    this.cluster.answer('ShareGroupHeartbeat', (fields) => this.beatAnswerFor(fields))
-    await this.h.consumer.subscribe({ topics: [NAME] })
-  }
-
-  /**
-   * @param {object} fields A decoded ShareFetch request.
-   * @returns {object} Records H and J for every listed partition that still has supply, else quiet.
-   */
-  fetchAnswerFor(fields) {
-    const rows = []
-    for (const topic of fields.topics || []) {
-      for (const { partitionIndex } of topic.partitions) {
-        const key = `${ALIAS.get(topic.topicId)}:${partitionIndex}`
-        const left = this.supply.get(key) ?? 0
-        if (left > 0) {
-          this.supply.set(key, left - 1)
-          rows.push(dataPart(partitionIndex, { topicId: topic.topicId }))
-        } else rows.push(part({ topicId: topic.topicId, partition: partitionIndex }))
-      }
-    }
-    return fetchAnswer(rows)
-  }
-
-  /**
-   * @param {object} fields A decoded ShareGroupHeartbeat request.
-   * @returns {object} The armed fault when it applies, else the quiet coordinator's answer.
-   */
-  beatAnswerFor(fields) {
-    const fault = this.beatFault?.(fields)
-    if (fault) return fault
-    const base = heartbeatAnswer(fields, {
-      interval: this.interval,
-      epochs: this.epochs,
-      topics: this.h.table,
-    })
-    return this.beatShape ? this.beatShape(fields, base) : base
-  }
-
-  /**
-   * Gives each partition one acquisition of H and J.
-   * @param {string[]} keys Partition keys such as `A:0`.
-   * @returns {void}
-   */
-  supplyOnce(...keys) {
-    for (const key of keys) this.supply.set(key, 1)
-  }
-
-  /**
-   * Holds the handler of one exact record until released; cleanup releases whatever remains.
-   * @param {string} identity Alias, partition and exact offset such as `A:0@9007199254740993`.
-   * @returns {{promise: Promise<void>, resolve: () => void}} The gate.
-   */
-  hold(identity) {
-    const gate = deferred()
-    this.holds.set(identity, gate)
-    this.heldGates.push({ identity, gate })
-    return gate
-  }
-
-  /**
-   * @param {string} identity An identity given to {@link FaultCase#hold}.
-   * @returns {void} Lets the handler held on that record return.
-   */
-  release(identity) {
-    this.heldGates.findLast((held) => held.identity === identity).gate.resolve()
-  }
-
-  /**
-   * Runs an audit check from a callback whose exceptions the client would contain and log.
-   * @param {() => void} check The audit call.
-   * @returns {void} A failure is kept in `auditFailures` and thrown by `assertInvariants`.
-   */
-  audited(check) {
-    try {
-      check()
-    } catch (error) {
-      this.auditFailures.push(error)
-    }
-  }
-
-  /**
-   * Holds the wire answer of one request until the test decides how it ends.
-   * @param {object} selector A schedule selector.
-   * @returns {object} The schedule's gate, released at cleanup when still unsettled.
-   */
-  holdWire(selector) {
-    const gate = this.h.hold(selector)
-    this.gates.push(gate)
-    return gate
-  }
-
-  /**
-   * The one eachMessage handler of every run: it records its identity, holds the record the test
-   * named, and tells the audit when it started and ended.
-   * @param {object} payload The eachMessage payload.
-   * @returns {Promise<void>}
-   */
-  async handle({ partition, message, acknowledge, renew, isRunning, topic }) {
-    const alias = ALIAS.get(this.h.table.get(topic)?.topicId) ?? '?'
-    const identity = `${alias}:${partition}@${message.offset}`
-    const call = {
-      identity,
-      alias,
-      partition,
-      offset: message.offset,
-      deliveryCount: message.deliveryCount,
-      value: message.value.toString(),
-      acknowledge,
-      renew,
-      isRunning,
-      abandoned: false,
-      token: Symbol(identity),
-    }
-    this.calls.push(call)
-    this.audited(() => this.audit.handler(identity, call, true))
-    const gate = this.holds.get(identity)
-    this.holds.delete(identity)
-    try {
-      await this.onStart?.(call)
-      await gate?.promise
-      await this.onHandled?.(call)
-    } finally {
-      if (!call.abandoned) this.audited(() => this.audit.handler(identity, call, false))
-    }
-  }
-
-  /**
-   * Starts a run whose handler is {@link FaultCase#handle}; the returned promise is observed at once.
-   * @returns {Promise<void>} The run promise, which settles after the first accepted join.
-   */
-  run() {
-    const promise = this.h.consumer.run({
-      eachMessage: (payload) => {
-        const pending = this.handle(payload)
-        this.handlers.push(pending)
-        return pending
-      },
-    })
-    this.runState = track(promise)
-    this.tracked.push(promise)
-    return promise
-  }
-
-  /** @returns {Promise<void>} Runs the client and lets the join and its first fetches settle. */
-  async join() {
-    await this.run()
-    await flush()
-  }
-
-  /**
-   * Records a terminal result in the audit and retires the authority of a handler whose range was
-   * lost, so a later acquisition of the same record is not reported as an overlap.
-   * @param {object} event A public acknowledge payload.
-   * @returns {void}
-   */
-  observeResult(event) {
-    this.audited(() => this.recordResult(event))
-  }
-
-  /**
-   * @private
-   * @param {object} event A public acknowledge payload.
-   * @returns {void}
-   */
-  recordResult(event) {
-    const alias = ALIAS.get(this.h.table.get(event.topic)?.topicId) ?? '?'
-    const holder = this.calls.findLast(
-      (call) =>
-        call.partition === event.partition &&
-        call.alias === alias &&
-        covers([event], call.offset) &&
-        !call.abandoned
-    )
-    this.audit.settlement(holder ? holder.token : `${alias}:${event.partition}`, {
-      ...event,
-      topicId: IDS[alias],
-    })
-    const lost = ['session-lost', 'membership-lost'].includes(event.error?.reason)
-    if (!lost || event.type === 'renew') return
-    for (const call of this.calls) {
-      if (call.partition !== event.partition || call.alias !== alias || call.abandoned) continue
-      if (!covers([event], call.offset) || !this.audit.handlers.has(call.identity)) continue
-      if (this.audit.handlers.get(call.identity) !== call) continue
-      call.abandoned = true
-      this.audit.handler(call.identity, call, false)
-    }
-  }
-
-  /**
-   * @param {...number} keys API keys.
-   * @returns {object[]} The recorded frames of those APIs, oldest first.
-   */
-  frames(...keys) {
-    return this.h.frames(...keys)
-  }
-
-  /** @returns {object[]} Every ShareAcknowledge final frame (epoch -1). */
-  finals() {
-    return this.frames(79).filter(({ fields }) => fields.shareSessionEpoch === -1)
-  }
-
-  /** @returns {object[]} Every group-leave frame (epoch -1). */
-  leaves() {
-    return this.frames(76).filter(({ fields }) => fields.memberEpoch === -1)
-  }
-
-  /** @returns {object[]} Every join frame (epoch 0). */
-  joins() {
-    return this.frames(76).filter(({ fields }) => fields.memberEpoch === 0)
-  }
-
-  /** @returns {number[]} The member epoch of every heartbeat frame, in wire order. */
-  heartbeatEpochs() {
-    return this.frames(76).map(({ fields }) => fields.memberEpoch)
-  }
-
-  /** @returns {number} How many FindCoordinator requests the client wrote. */
-  lookups() {
-    return this.cluster.requests().filter(({ api }) => api === 'FindCoordinator').length
-  }
-
-  /** @returns {string} A compact transcript of every share and heartbeat frame for failures. */
-  transcript() {
-    return JSON.stringify(
-      this.frames(76, 78, 79).map(({ api, node, generation, fields }) => [
-        api,
-        node,
-        generation,
-        fields.memberEpoch ?? fields.shareSessionEpoch,
-      ])
-    )
-  }
-
-  /**
-   * @param {number} [ms=50] Fake milliseconds.
-   * @returns {Promise<void>} Moves the clock and lets the scripted sockets answer.
-   */
-  async pump(ms = 50) {
-    await advance(ms)
-    await flush()
-  }
-
-  /**
-   * Moves the fake clock in 50 ms rounds until the condition holds, within the row's round bound.
-   * @param {() => boolean} predicate The reached-stage condition.
-   * @param {string} what What is awaited, named by the failure.
-   * @param {number} [limit] Rounds allowed; the row's bound by default.
-   * @returns {Promise<void>}
-   * @throws {Error} With the frame transcript when the condition does not hold in time.
-   */
-  async advanceUntil(predicate, what, limit = this.rounds) {
-    for (let step = 0; step < limit && !predicate(); step++) await this.pump()
-    if (!predicate())
-      throw new Error(`${what} did not happen in ${limit} rounds ${this.transcript()}`)
-  }
-
-  /**
-   * @param {object} gate A gate from {@link FaultCase#holdWire}.
-   * @param {string} [what] What is awaited, named by the failure.
-   * @returns {Promise<object>} The held call, once it arrived within the real-time bound.
-   * @throws {Error} When no call arrives.
-   */
-  async arrival(gate, what = 'the held frame') {
-    await until(() => gate.call !== null, what)
-    return gate.call
-  }
-
-  /**
-   * @param {object} selector A schedule selector for the frame to disturb.
-   * @returns {object} The held gate; `fireTransport` ends it with a transport failure.
-   */
-  armTransport(selector) {
-    this.transportGate = this.holdWire(selector)
-    return this.transportGate
-  }
-
-  /**
-   * Ends the armed frame with a typed transport failure: a peer end on its own socket, or the
-   * request timeout of the fake clock. The held answer is released late and must change nothing.
-   * @param {'disconnect'|'timeout'} kind The failure.
-   * @param {number} [requestTimeout=1000] The configured request timeout in fake milliseconds.
-   * @returns {Promise<object>} The frame that was disturbed.
-   */
-  async fireTransport(kind, requestTimeout = 1000) {
-    const call = await this.arrival(this.transportGate)
-    if (kind === 'disconnect') this.cluster.sockets()[call.generation - 1].emit('end')
-    else await this.pump(requestTimeout + 1)
-    await flush()
-    return call
-  }
-
-  /**
-   * Replays every frame, handler and result through the shared audit with its issuance identity.
-   * @param {(record: object) => Set<string>} [wantedFor] The wanted partition keys at a frame.
-   * @returns {void}
-   * @throws {Error} For any frame, result or handler the audit refuses.
-   */
-  replay(wantedFor = () => new Set([0, 1, 2].map((index) => `${IDS.A}:${index}`))) {
-    const opens = new Map()
-    const episodes = new Map()
-    let membership = 0
-    for (const record of this.frames(76, 78, 79)) {
-      const { apiKey, fields } = record
-      if (apiKey === 76 && fields.memberEpoch === 0) membership++
-      const closing = fields.shareSessionEpoch === -1
-      if (apiKey === 78 && fields.shareSessionEpoch === 0)
-        opens.set(record.node, (opens.get(record.node) ?? 0) + 1)
-      if (closing && !episodes.has(membership)) episodes.set(membership, {})
-      this.audit.frame(record, {
-        allowed: true,
-        kind: closing ? 'closing' : 'ordinary',
-        episode: closing ? episodes.get(membership) : undefined,
-        open: `${record.node}#${opens.get(record.node) ?? 0}`,
-        wanted: wantedFor(record),
-      })
-    }
-  }
-
-  /**
-   * Ends the case: releases every gate once, closes the client with a zero deadline, observes
-   * every pending handler and tracked promise, and removes the case's own listeners. Every failure
-   * is kept and rethrown together.
-   * @returns {Promise<void>}
-   * @throws {AggregateError} Every cleanup failure.
-   */
-  async dispose() {
-    if (this.disposed) return
-    this.disposed = true
-    const failures = []
-    const attempt = async (work) => {
-      try {
-        await work()
-      } catch (error) {
-        failures.push(error)
-      }
-    }
-    for (const { gate } of this.heldGates) gate.resolve()
-    for (const gate of this.gates) if (gate.settle) gate.release()
-    if (this.h) await attempt(() => this.h.consumer.disconnect({ timeout: 0 }))
-    await flush()
-    const settled = await Promise.allSettled([...this.handlers, ...this.tracked])
-    for (const remove of this.removers.splice(0)) remove()
-    process.off('unhandledRejection', this.onUnhandled)
-    const rejected = settled.filter(({ status }) => status === 'rejected')
-    this.lateRejections = rejected.map(({ reason }) => reason)
-    if (failures.length) throw new AggregateError(failures, 'Share fault cleanup failed')
-  }
-
-  /**
-   * Compares the actual resources with the baseline read before the client existed.
-   * @returns {void}
-   * @throws {Error} For an open socket, a surviving timer, a failed cluster or an unhandled rejection.
-   */
-  assertBaseline() {
-    assert.deepEqual(this.unhandled, [], 'unhandled rejections')
-    if (!this.h) return
-    assert.deepEqual(this.cluster.failures(), [], 'scripted cluster failures')
-    const open = this.cluster.sockets().filter((socket) => !socket.destroyed).length
-    assert.equal(open, 0, 'open sockets')
-    assert(
-      jest.getTimerCount() <= this.baseline.timers,
-      `timers ${jest.getTimerCount()} above baseline ${this.baseline.timers}`
-    )
-  }
-}
+const {
+  FaultAudit,
+  FaultCase,
+  NAME,
+  IDS,
+  ALIAS,
+  H,
+  J,
+  STALE_CALL,
+  advance,
+  dataPart,
+  codesOf,
+  track,
+  covers,
+} = require('../../../../testHelpers/shareFaultAudit')
 
 /**
  * @param {{fields: object}} frame A recorded ShareFetch or ShareAcknowledge frame.
@@ -2483,11 +1816,7 @@ class SessionFaultCase extends DataFaultCase {
     await flush()
     assert.equal(this.seen.resets.length, this.resetsBefore, 'no session reset')
     if (step === 'acknowledgement only') {
-      this.renewalAfter = track(
-        this.callOf(A0_H)
-          .renew()
-          .catch(() => {})
-      )
+      this.renewalAfter = track(this.callOf(A0_H).renew())
       await until(() => this.frameLog(0).length > this.before, 'the next frame of node 0')
     }
     const next = await this.nextFrameOnNode()
@@ -2975,9 +2304,21 @@ const MECHANICS = {
       await this.begin({ expectCalls: 1 })
       this.held = this.callOf(A0_H)
       this.gate = this.holdFrame(79, ({ node }) => node === 0)
-      this.first = track(this.held.renew())
+      this.first = track(
+        this.expectRejection(this.held.renew(), {
+          name: 'KafkaJSShareAcknowledgementError',
+          message: 'Acknowledgement was not confirmed',
+          reason: 'session-lost',
+        })
+      )
       await this.arrival(this.gate)
-      this.second = track(this.held.renew())
+      this.second = track(
+        this.expectRejection(this.held.renew(), {
+          name: 'KafkaJSShareAcknowledgementError',
+          message: 'Acknowledgement was not confirmed',
+          reason: 'session-lost',
+        })
+      )
       await flush()
     },
     async inject() {
@@ -3155,7 +2496,13 @@ const MECHANICS = {
     async inject() {
       this.supplyOnce('A:0')
       const gate = this.holdFrame(79, ({ node }) => node === 0)
-      this.renewalTwo = track(this.old.renew().catch(() => {}))
+      this.renewalTwo = track(
+        this.expectRejection(this.old.renew(), {
+          name: 'KafkaJSShareAcknowledgementError',
+          message: 'Acknowledgement was not confirmed',
+          reason: 'session-lost',
+        })
+      )
       await this.arrival(gate)
       gate.release(ackAnswer([], { errorCode: 122 }))
       await flush()
@@ -3278,11 +2625,18 @@ const MECHANICS = {
           step: 'closing',
           expected: { ...this.row.expected, rounds: 8 },
         })
+        const failures = []
         try {
           await scenario.finalWith(code)
-        } finally {
-          await scenario.dispose()
+        } catch (error) {
+          failures.push(error)
         }
+        try {
+          await scenario.dispose()
+        } catch (error) {
+          failures.push(error)
+        }
+        if (failures.length) throw new AggregateError(failures, 'Final fault subcase failed')
       }
     },
   },
