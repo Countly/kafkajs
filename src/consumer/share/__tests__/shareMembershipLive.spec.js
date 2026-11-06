@@ -251,6 +251,7 @@ const journal = new ShareHandlerLog(config.journal, config.clientId)
 const report = (message) => process.send(message)
 let hold = null
 let current = null
+let frozen = null
 const trace = new AcknowledgementTrace((row) => report({ event: 'wire', row }))
 const socketFactory = defaultSocketFactory()
 const kafka = new Kafka({ brokers: config.brokers, clientId: config.clientId, logLevel: logLevel.NOTHING,
@@ -315,14 +316,16 @@ const handle = async ({ topic, partition, message, renew }) => {
     })
     clearInterval(timer)
     current = null
-  } else {
+  } else if (!frozen) {
     await new Promise((resolve) => setTimeout(resolve, 5))
   }
+  if (frozen) await frozen.promise
   journal.finish(invocation)
   report({ event: 'finish', invocation })
 }
 const stop = async () => {
   try {
+    if (frozen) frozen.release()
     if (current) current.release()
     await client.disconnect({ timeout: 3000 })
     await trace.join()
@@ -335,7 +338,12 @@ const stop = async () => {
 process.on('message', (message) => {
   if (message.cmd === 'hold') hold = { renew: Boolean(message.renew) }
   else if (message.cmd === 'release' && current) current.release()
-  else if (message.cmd === 'stop') stop()
+  else if (message.cmd === 'freeze' && !frozen) {
+    let release
+    const promise = new Promise((resolve) => { release = resolve })
+    frozen = { promise, release }
+    report({ event: 'frozen' })
+  } else if (message.cmd === 'stop') stop()
 })
 report({ event: 'ready', nonce: config.nonce, pid: process.pid, clientId: config.clientId })
 ;(async () => {
@@ -1568,9 +1576,9 @@ class MembershipCase {
   }
 
   /**
-   * Freezes what the child holds from its durable journal once it agrees with the child's own
-   * reports, kills that exact child process once, then reads the journal again: what a dead child
-   * held is what its journal says, and it must include what was frozen.
+   * Blocks every child handler's completion before snapshotting its durable journal once it
+   * agrees with the child's reports. Kills that exact process once, then reads the journal again:
+   * what a dead child held is what its journal says, and it must include what was frozen.
    * @param {AbortSignal} scope
    * @param {Member} a the survivor
    * @param {ChildMember} c the child
@@ -1580,6 +1588,8 @@ class MembershipCase {
    *   die by SIGKILL
    */
   async killChild(scope, a, c) {
+    c.command({ cmd: 'freeze' })
+    await c.waitFor(scope, () => c.of('frozen').length === 1, 'The child freezing its handler work')
     let frozen
     await pollUntil(
       scope,
