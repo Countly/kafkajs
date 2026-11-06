@@ -207,6 +207,7 @@ class ShareFetchLoop {
     this.retryTime = null
     this.cohorts = new Map()
     this.exchanges = new Set()
+    this.renewals = new Set()
     this.collected = null
     this.running = null
     this.finishing = false
@@ -1263,7 +1264,8 @@ class ShareFetchLoop {
    *   duration, or undefined when the answer kept the previous one.
    * @throws {KafkaJSShareAcknowledgementError} A failed renewal, from the ledger's compact result.
    *   A retirement returns that same error even when it first rejects the queue's outer wait;
-   *   a renewal retired before preparation keeps the original queue refusal.
+   *   partition retirement rejects without waiting for the answer, while the FIFO still waits
+   *   for that request. A renewal retired before preparation has no ticket and rejects locally.
    * @throws {Error} Any other failure of the request, or the node operation's refusal while it waits.
    */
   acknowledge({ cohorts, renew } = {}) {
@@ -1283,17 +1285,23 @@ class ShareFetchLoop {
     })
     const failure = () =>
       renew && collected.find((outcome) => outcome.type === 'renew' && outcome.error)?.error
-    const outcome = request.then(
-      (result) => {
-        const error = failure()
-        if (error) throw error
-        return result
-      },
-      (error) => {
-        throw failure() || error
+    let pending
+    const outcome = new Promise((resolve, reject) => {
+      if (renew) {
+        pending = { renew, reject }
+        this.renewals.add(pending)
       }
-    )
-    outcome.catch(() => {})
+      request.then(
+        (result) => {
+          const error = failure()
+          if (error) reject(error)
+          else resolve(result)
+        },
+        (error) => reject(failure() || error)
+      )
+    })
+    const cleanup = () => this.renewals.delete(pending)
+    outcome.then(cleanup, cleanup)
     return outcome
   }
 
@@ -1565,12 +1573,25 @@ class ShareFetchLoop {
    * @private
    * @param {string} key A partition key.
    * @param {'session-lost'|'membership-lost'|'not-sent'} reason Outcome for its acquisitions.
-   * @returns {void} Retires and forgets every acquisition this node holds for that partition.
+   * @returns {void} Retires every acquisition this node holds for that partition and rejects its
+   *   pending renewal callers. The session model stays until the next fetch forgets it or a final
+   *   closes it; a late answer cannot settle the invalidated tickets again.
    */
   retireKey(key, reason) {
     const rows = this.cohorts.get(key) || []
     this.cohorts.delete(key)
-    for (const row of rows) this.emit(row.ledger.invalidate(reason), row)
+    for (const row of rows) {
+      const results = row.ledger.invalidate(reason)
+      for (const pending of this.renewals) {
+        if (!pending.renew.some(({ cohort }) => cohort === row)) continue
+        const error =
+          results.find((outcome) => outcome.type === 'renew')?.error ||
+          new KafkaJSNonRetriableError('Renewal targets a retired acquisition')
+        pending.reject(error)
+        this.renewals.delete(pending)
+      }
+      this.emit(results, row)
+    }
   }
 
   /**

@@ -388,7 +388,9 @@ class ShareRun {
 
   /**
    * Routes the assignment to leader nodes: new nodes start their loop, existing nodes get their
-   * current wanted sets, and a node with nothing left ends. Never runs while a close owns the run.
+   * current wanted sets, and a node with nothing left ends. Moved partitions lose their old-node
+   * acquisitions synchronously; revoked partitions keep their handler completion/release policy.
+   * Never runs while a close owns the run.
    * @private
    * @returns {void}
    */
@@ -396,28 +398,32 @@ class ShareRun {
     if (!this.admitting || this.retired || this.closing || this.stopRequested) return
     const { cluster } = this.options
     const wanted = new Map()
+    const routed = new Set()
     for (const [topicId, { topic, partitions }] of this.assignment) {
       for (const partition of partitions) {
         const leader = cluster.cachedLeader(topic, partition)
         if (leader < 0) continue
         if (!wanted.has(leader)) wanted.set(leader, [])
         wanted.get(leader).push({ topicId, topic, partition })
+        routed.add(`${topicId}:${partition}`)
       }
     }
+    const moved = []
+    for (const [nodeId, node] of this.nodes) {
+      if (node.ended) continue
+      const rows = wanted.get(nodeId) || []
+      const keys = new Set(rows.map((row) => `${row.topicId}:${row.partition}`))
+      for (const key of node.keys) if (!keys.has(key) && routed.has(key)) moved.push({ node, key })
+      node.wanted = rows
+      node.keys = keys
+      node.ended = rows.length === 0
+    }
+    for (const { node, key } of moved) node.loop?.retireKey(key, 'session-lost')
+    if (!this.admitting || this.retired || this.closing || this.stopRequested) return
     for (const [nodeId, rows] of wanted) {
       const node = this.nodes.get(nodeId)
       if (node?.ended) this.nodes.delete(nodeId)
-      if (node && !node.ended) {
-        node.wanted = rows
-        node.keys = new Set(rows.map((row) => `${row.topicId}:${row.partition}`))
-      } else this.startNode(nodeId, rows)
-    }
-    for (const [nodeId, node] of this.nodes) {
-      if (!wanted.has(nodeId) && !node.ended) {
-        node.wanted = []
-        node.keys = new Set()
-        node.ended = true
-      }
+      if (!node || node.ended) this.startNode(nodeId, rows)
     }
   }
 
