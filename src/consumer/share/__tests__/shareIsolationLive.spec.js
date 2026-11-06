@@ -1,6 +1,8 @@
 const {
   acknowledgementResults,
-  pollSharePosition,
+  awaitTerminalSharePosition,
+  assertQuietTerminalGroup,
+  ShareAcknowledgementObserver,
 } = require('../../../../testHelpers/shareLiveDiagnostics')
 const { isDeepStrictEqual } = require('util')
 const { Kafka, logLevel } = require('../../../../index')
@@ -10,7 +12,6 @@ const {
   shareTopicName,
   setShareGroupConfigs,
   shareRecordIdentity,
-  verifierMember,
   assertShareCleanup,
 } = require('../../../../testHelpers/shareFixtures')
 const {
@@ -401,6 +402,7 @@ class IsolationCase {
     }
     this.sockets = new SocketCounter()
     this.gauge = new ResourceGauge()
+    this.acknowledgements = new ShareAcknowledgementObserver()
     this.probe = createResourceProbe({
       emitters: { process },
       sockets: () => this.sockets.counts(),
@@ -462,6 +464,8 @@ class IsolationCase {
       delivered: entries.length,
       handled,
       acknowledgements: acknowledgementResults(acks),
+      acknowledgementResponses: this.acknowledgements.evidence(groupId),
+      acquisitions: this.acknowledgements.acquisitions.filter((row) => row.groupId === groupId),
     }))
   }
 
@@ -474,6 +478,8 @@ class IsolationCase {
    */
   async run(scope) {
     const outer = new CleanupStack()
+    this.acknowledgements.install()
+    outer.add('restore acknowledgement observer', () => this.acknowledgements.restore())
     outer.add('remove admin request listener', () => this.removeAdminRequests())
     outer.add('release resource gauge', () => this.gauge.uninstall())
     outer.add('disconnect admin', () => this.admin.disconnect())
@@ -610,6 +616,10 @@ class IsolationCase {
       configs: { R: { 'share.isolation.level': this.defaultIsolation } },
     })
 
+    const metadata = await bounded(scope, Infinity, () =>
+      admin.fetchTopicMetadata({ topics: [topic] })
+    )
+    this.topicId = metadata.topics.find(({ name }) => name === topic).topicId
     this.members = {
       R: new Member({ kafka: this.kafka, label: 'R', groupId: this.groups.R }),
       C: new Member({ kafka: this.kafka, label: 'C', groupId: this.groups.C }),
@@ -742,8 +752,8 @@ class IsolationCase {
     expect([...initialLog.data].sort()).toEqual([...initialR].sort())
     expect([...this.members.R.identities()].sort()).toEqual([...initialR].sort())
     expect([...this.members.C.identities()].sort()).toEqual([...initialC].sort())
-    await this.awaitStart(scope, '32')
-    await this.awaitGaps(scope, ['10', '21'])
+    await this.awaitGaps(scope, ['10', '21'], { R: initialR, C: initialC })
+    await this.awaitStart(scope, initialLog.end)
 
     const opening = await bounded(scope, STEP_MS, () => transactional.transaction())
     stack.add('abort an open transaction', async () => {
@@ -832,14 +842,17 @@ class IsolationCase {
    * acknowledgement either member reported failed.
    * @param {AbortSignal} scope
    * @param {string[]} markers decimal marker offsets
+   * @param {{R:string[], C:string[]}} expected Fixed checkpoint visibility.
    * @returns {Promise<void>}
    * @throws {Error} a marker never acknowledged as a gap, or a failed acknowledgement
    */
-  async awaitGaps(scope, markers) {
+  async awaitGaps(scope, markers, expected) {
     await pollUntil(
       scope,
       STEP_MS,
-      () => markers.every((m) => this.members.R.gapOffsets().has(m)),
+      () =>
+        markers.every((m) => this.members.R.gapOffsets().has(m)) &&
+        this.settlementMatches(expected, markers),
       {
         delayMs: 100,
         label: 'R acknowledging the control markers as gaps',
@@ -851,50 +864,56 @@ class IsolationCase {
   }
 
   /**
-   * Waits until both groups' share-partition start offset equals `end`, as the named and the
-   * all-topics listings agree, with error 0 and a lag that is 0 or explicitly unknown (`null`).
-   * @param {AbortSignal} scope
-   * @param {string} end decimal log end
-   * @returns {Promise<void>}
-   * @throws {Error} a start offset that never reaches `end`, or disagreeing listings
+   * Requires each visible data identity's original successful Accept and each acquired marker's Gap.
+   * @param {{R:string[], C:string[]}} expected Fixed visible identities at this checkpoint.
+   * @param {string[]} markers Raw control offsets.
+   * @returns {boolean} Complete per-group successful settlement, with no fabricated aborted accepts.
+   */
+  settlementMatches(expected, markers) {
+    return Object.entries(this.members).every(([label, member]) => {
+      const types = this.acknowledgements.types(member.groupId, this.topicId, 0)
+      const offsets = new Set(expected[label].map((identity) => JSON.parse(identity)[2]))
+      if ([...offsets].some((offset) => JSON.stringify(types.get(offset)) !== '[1]')) return false
+      const acquired = this.acknowledgements.acquiredOffsets(member.groupId, this.topicId, 0)
+      if (
+        markers.some(
+          (offset) =>
+            (label === 'R' || acquired.has(offset)) && JSON.stringify(types.get(offset)) !== '[0]'
+        )
+      )
+        return false
+      return [...types].every(
+        ([offset, decisions]) =>
+          offsets.has(offset) || (markers.includes(offset) && JSON.stringify(decisions) === '[0]')
+      )
+    })
+  }
+
+  /**
+   * Polls both groups independently for known zero lag and agreeing bounded persisted starts.
+   * @param {AbortSignal} scope Case scope.
+   * @param {string} end Independently checked fixed checkpoint end.
+   * @returns {Promise<object[]>} Actual terminal rows, separately identified by group.
    */
   async awaitStart(scope, end) {
-    for (const group of Object.values(this.groups)) {
-      const last = { named: null, all: null, error: null }
-      await pollSharePosition(
-        scope,
-        DELIVERY_MS,
-        async () => {
-          try {
-            last.named = await this.admin.listShareGroupOffsets({
-              groupId: group,
-              topics: [{ topic: this.topic, partitions: [0] }],
-            })
-            last.all = await this.admin.listShareGroupOffsets({ groupId: group })
-            const [named] = last.named
-            const [every] = last.all
-            last.error = null
-            const [row] = named.partitions
-            expect(every.partitions[0].startOffset).toBe(row.startOffset)
-            return (
-              row.errorCode === 0 &&
-              row.startOffset === end &&
-              (row.lag === '0' || row.lag === null)
-            )
-          } catch (error) {
-            last.error = describeError(error)
-            if (moving(error)) return false
-            throw error
-          }
+    const rows = []
+    for (const groupId of Object.values(this.groups)) {
+      const position = await awaitTerminalSharePosition(
+        this.admin,
+        {
+          groupId,
+          topic: this.topic,
+          partitions: [{ partition: 0, floor: '0', end }],
         },
         {
-          delayMs: 250,
-          label: `${group} reaching start offset ${end}`,
-          snapshot: () => ({ groupId: group, topic: this.topic, end, ...last }),
+          signal: scope,
+          timeoutMs: DELIVERY_MS,
           record: (fields) => this.row('broker-position', { ...fields, members: this.progress() }),
         }
       )
+      rows.push(...position.rows)
     }
+    return rows
   }
 
   /**
@@ -946,27 +965,8 @@ class IsolationCase {
       expect(new Set(identities).size).toBe(identities.length)
       expect(this.members[label].crashes).toEqual([])
     }
-    await this.awaitStart(scope, '43')
-    await this.awaitGaps(scope, ['10', '21', '42'])
-    this.broker = []
-    for (const group of Object.values(this.groups)) {
-      const [named] = await bounded(scope, STEP_MS, () =>
-        this.admin.listShareGroupOffsets({
-          groupId: group,
-          topics: [{ topic: this.topic, partitions: [0] }],
-        })
-      )
-      const [row] = named.partitions
-      this.broker.push({
-        groupId: group,
-        topic: this.topic,
-        partition: 0,
-        errorCode: row.errorCode,
-        startOffset: row.startOffset,
-        logEnd: log.end,
-        lag: row.lag,
-      })
-    }
+    await this.awaitGaps(scope, ['10', '21', '42'], this.expected)
+    this.broker = await this.awaitStart(scope, log.end)
     this.row('acknowledgement', {
       gaps: Object.fromEntries(
         Object.entries(this.members).map(([label, member]) => [
@@ -985,11 +985,27 @@ class IsolationCase {
     for (const member of Object.values(this.members)) {
       await bounded(scope, STEP_MS, () => member.client.disconnect({ timeout: 5000 }))
     }
-    for (const group of Object.values(this.groups)) {
-      const quiet = await verifierMember(group, this.topic, { kafka: this.kafka, signal: scope })
-      expect(quiet).toEqual([])
+    this.quiet = []
+    this.broker = []
+    for (const groupId of Object.values(this.groups)) {
+      const quiet = await assertQuietTerminalGroup({
+        kafka: this.kafka,
+        admin: this.admin,
+        groupId,
+        topic: this.topic,
+        partitions: [{ partition: 0, floor: '0', end: log.end }],
+        signal: scope,
+        timeoutMs: DELIVERY_MS,
+        record: (fields) => this.row('quiet-verifier', fields),
+      })
+      expect(quiet.delivered).toEqual([])
+      this.quiet.push({ groupId, ...quiet })
+      this.broker.push(...quiet.position.rows)
     }
-    this.row('cleanup', { verifier: 'quiet for 5000 ms in both groups' })
+    expect(this.settlementMatches(this.expected, ['10', '21', '42'])).toBe(true)
+    expect(this.members.R.identities()).toHaveLength(40)
+    expect(this.members.C.identities()).toHaveLength(30)
+    this.row('cleanup', { verifier: this.quiet })
   }
 
   /**
@@ -1014,6 +1030,14 @@ class IsolationCase {
           C: { expected: this.expected.C, actual: this.members.C.identities() },
         },
         broker: this.broker,
+        acknowledgements: Object.fromEntries(
+          Object.values(this.groups).map((groupId) => [
+            groupId,
+            this.acknowledgements.evidence(groupId),
+          ])
+        ),
+        acquisitions: this.acknowledgements.acquisitions,
+        quiet: this.quiet,
       },
       resources: { before: summarize(before), after: summarize(after) },
       cleanup: {

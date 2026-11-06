@@ -275,7 +275,7 @@ class ShareHandlerLog {
 }
 
 /**
- * Runs a fresh member in an existing group, starting its observation window only after join.
+ * Runs a fresh member in an existing group, starting its observation window only after assignment.
  * It does not set configs, reset offsets, produce data or invent acquisition state. Every await
  * is bounded by the inherited harness. Abort/expiry or failed cleanup taints that spec's run;
  * work ignoring abort may finish later and is contained by the sole guard.
@@ -289,13 +289,18 @@ class ShareHandlerLog {
  * @throws {Error} on join, crash, bound or cleanup failure
  */
 const verifierMember = async (group, topic, { kafka, signal, windowMs = 5000 } = {}) => {
-  const { NEVER, bounded, delay } = require('../src/producer/__tests__/fixtures/bounded')
+  const { NEVER, bounded, delay, pollUntil } = require('../src/producer/__tests__/fixtures/bounded')
   const { CleanupStack } = require('../src/producer/__tests__/fixtures/liveProbe')
   const { Kafka, logLevel } = require('../index')
   const owner = signal || NEVER
   const client = (
     kafka || new Kafka({ brokers: helpers.plainTextBrokers(), logLevel: logLevel.NOTHING })
-  ).shareConsumer({ groupId: group, maxRecords: 100, acknowledgementMode: 'implicit' })
+  ).shareConsumer({
+    groupId: group,
+    maxRecords: 100,
+    maxWaitTimeInMs: 250,
+    acknowledgementMode: 'implicit',
+  })
   const cleanup = new CleanupStack()
   const delivered = []
   const crashes = []
@@ -303,13 +308,20 @@ const verifierMember = async (group, topic, { kafka, signal, windowMs = 5000 } =
     crashes.push(payload.error)
   })
   cleanup.add('remove verifier listener', () => remove())
+  const fetches = []
+  if (client.events.REQUEST) {
+    const removeRequests = client.on(client.events.REQUEST, ({ payload }) => {
+      if (payload.apiName === 'ShareFetch') fetches.push(payload)
+    })
+    cleanup.add('remove verifier request listener', () => removeRequests())
+  }
   cleanup.add('disconnect verifier', () => client.disconnect({ timeout: 2000 }))
   return cleanup.run(
     async () => {
       await bounded(owner, 10000, () => client.connect())
       await bounded(owner, 10000, () => client.subscribe({ topics: [topic] }))
-      await bounded(owner, 10000, () =>
-        client.run({
+      await bounded(owner, 10000, async (scope) => {
+        await client.run({
           eachMessage: async ({ topic: name, partition, message }) => {
             delivered.push({
               identity: shareRecordIdentity({ ...message, topic: name, partition }),
@@ -317,9 +329,34 @@ const verifierMember = async (group, topic, { kafka, signal, windowMs = 5000 } =
             })
           },
         })
-      )
+        await pollUntil(
+          scope,
+          Infinity,
+          () => {
+            if (crashes.length) throw crashes[0]
+            return (
+              delivered.length > 0 ||
+              (client
+                .assignment?.()
+                .some((entry) => entry.topic === topic && entry.partitions.length > 0) &&
+                (!client.events.REQUEST || fetches.length > 0))
+            )
+          },
+          { label: 'The verifier assignment' }
+        )
+      })
+      const startedAt = Date.now()
       await delay(owner, windowMs)
       if (crashes.length) throw crashes[0]
+      if (client.events.REQUEST && !fetches.some(({ sentAt }) => sentAt >= startedAt)) {
+        throw new Error('The assigned verifier completed no active fetch in its observation window')
+      }
+      if (
+        delivered.length === 0 &&
+        !client.assignment?.().some((entry) => entry.topic === topic && entry.partitions.length > 0)
+      ) {
+        throw new Error('The verifier lost its assignment during the observation window')
+      }
       return delivered
     },
     { budgetMs: 3000 }

@@ -1,6 +1,8 @@
 const {
   acknowledgementResults,
-  pollSharePosition,
+  awaitTerminalSharePosition,
+  assertQuietTerminalGroup,
+  ShareAcknowledgementObserver,
 } = require('../../../../testHelpers/shareLiveDiagnostics')
 const {
   Kafka,
@@ -519,6 +521,8 @@ class AdminCase {
    * @throws {Error} the failure of a stage, or of the cleanup
    */
   async run(scope) {
+    this.acknowledgements = new ShareAcknowledgementObserver()
+    this.acknowledgements.install()
     try {
       await this.cleanup.run(
         async () => {
@@ -541,6 +545,7 @@ class AdminCase {
       throw error
     } finally {
       this.ledgers.restore()
+      this.acknowledgements.restore()
     }
     this.note('case-complete', {
       status: 'passed',
@@ -676,6 +681,12 @@ class AdminCase {
       )
     expect(actual).toEqual(this.expected)
     expect(base).toBe('0')
+    expect(log.get(0).endOffset).toBe(String(RECORDS))
+    expect(log.get(0).records.filter(({ batchContext }) => batchContext.isControlBatch)).toEqual([])
+    const metadata = await bounded(scope, Infinity, () =>
+      this.admin.fetchTopicMetadata({ topics: [this.topics.share] })
+    )
+    this.topicId = metadata.topics.find(({ name }) => name === this.topics.share).topicId
     this.oracles.log = { expected: this.expected, actual }
     this.note('produced', { baseOffset: base, count: RECORDS })
   }
@@ -811,7 +822,7 @@ class AdminCase {
 
   /**
    * Alters a never-used empty group to start at offset 8, lists it in both forms, then consumes
-   * the twelve remaining records exactly once and requires the broker to reach the log end.
+   * the twelve remaining records exactly once and requires terminal broker settlement.
    * @param {AbortSignal} scope
    * @returns {Promise<void>}
    */
@@ -854,9 +865,40 @@ class AdminCase {
       scope,
       STEP_MS,
       async () => {
-        const [row] = await this.listOffsets(scope, group, [{ topic, partitions: [0] }])
-        lag = row.partitions[0].lag
-        return lag === String(RECORDS - ALTERED_START)
+        const named = await this.listOffsets(scope, group, [{ topic, partitions: [0] }])
+        const all = await this.listOffsets(scope, group)
+        const pick = (listing) => listing.filter((row) => row.topic === topic)
+        const forms = [named, all].map(pick)
+        if (
+          forms.some(
+            (rows) =>
+              rows.length !== 1 ||
+              rows[0].topicId !== this.topicId ||
+              rows[0].partitions.length !== 1
+          )
+        )
+          return false
+        const [first, second] = forms.map(([row]) => row.partitions[0])
+        lag = first.lag
+        this.note('broker-position', {
+          stage: 'reset',
+          groupId: group,
+          topic,
+          named,
+          all,
+          logEnd: String(RECORDS),
+        })
+        return (
+          first.partition === 0 &&
+          first.errorCode === 0 &&
+          first.startOffset === String(ALTERED_START) &&
+          lag === String(RECORDS - ALTERED_START) &&
+          second.partition === first.partition &&
+          second.errorCode === first.errorCode &&
+          second.startOffset === first.startOffset &&
+          second.lag === first.lag &&
+          second.leaderEpoch === first.leaderEpoch
+        )
       },
       { delayMs: 200, label: 'The known lag of 12' }
     )
@@ -876,51 +918,61 @@ class AdminCase {
     await this.reachesEnd(scope, group)
   }
 
+  /** @returns {boolean} Exactly the twelve fixed suffix identities have successful original Accepts. */
+  successfulAccepts() {
+    const types = this.acknowledgements.types(this.groups.share, this.topicId, 0)
+    return (
+      types.size === RECORDS - ALTERED_START &&
+      this.expected
+        .slice(ALTERED_START)
+        .every((identity) => JSON.stringify(types.get(JSON.parse(identity)[2])) === '[1]')
+    )
+  }
+
   /**
-   * Waits for the broker position of the share topic to reach the log end with a known lag of
-   * zero, and records it as the broker oracle before any destructive call.
-   * @param {AbortSignal} scope
-   * @param {string} group
-   * @returns {Promise<void>}
+   * Requires successful suffix Accepts, then agreeing terminal listings within the existing poll bound.
+   * @param {AbortSignal} scope Case scope.
+   * @param {string} group Workload group.
+   * @returns {Promise<void>} Records actual broker and acknowledgement provenance before deletion.
    */
   async reachesEnd(scope, group) {
-    const topic = this.topics.share
-    let position
-    let rows = null
-    await pollSharePosition(
-      scope,
-      STEP_MS,
-      async () => {
-        rows = await this.listOffsets(scope, group, [{ topic, partitions: [0] }])
-        const [row] = rows
-        position = row.partitions[0]
-        return position.startOffset === String(RECORDS) && position.lag === '0'
-      },
-      {
-        delayMs: 200,
-        label: 'The settled share position',
-        snapshot: () => ({ groupId: group, topic, rows }),
-        record: (fields) => this.note('broker-position', { ...fields, members: this.progress() }),
-      }
-    )
-    const [logEnd] = [
-      ...(
-        await bounded(scope, 10000, () => endOffsets({ brokers: plainTextBrokers(), topic }))
-      ).values(),
-    ]
-    expect(logEnd).toBe(String(RECORDS))
-    this.oracles.broker = [
-      {
-        groupId: group,
-        topic,
-        partition: 0,
-        errorCode: position.errorCode,
-        startOffset: position.startOffset,
-        logEnd,
-        lag: position.lag,
-      },
-    ]
-    expect(position.errorCode).toBe(0)
+    await bounded(scope, STEP_MS, async (inner) => {
+      await pollUntil(inner, Infinity, () => this.successfulAccepts(), {
+        label: 'The twelve broker Accepts',
+      })
+      expect(this.share.acks.filter(({ error }) => error !== null)).toEqual([])
+      const position = await awaitTerminalSharePosition(
+        this.admin,
+        {
+          groupId: group,
+          topic: this.topics.share,
+          partitions: [{ partition: 0, floor: String(ALTERED_START), end: String(RECORDS) }],
+        },
+        {
+          signal: inner,
+          timeoutMs: STEP_MS,
+          record: (fields) =>
+            this.note('broker-position', {
+              ...fields,
+              members: this.progress(),
+              acknowledgements: this.acknowledgements.evidence(group),
+            }),
+        }
+      )
+      const [logEnd] = [
+        ...(
+          await bounded(inner, 10000, () =>
+            endOffsets({
+              brokers: plainTextBrokers(),
+              topic: this.topics.share,
+            })
+          )
+        ).values(),
+      ]
+      expect(logEnd).toBe(String(RECORDS))
+      this.oracles.broker = position.rows
+      this.oracles.acknowledgements = this.acknowledgements.evidence(group)
+    })
   }
 
   /**
@@ -1057,6 +1109,24 @@ class AdminCase {
     const group = this.groups.share
     const topic = this.topics.share
     await bounded(scope, 10000, () => this.share.consumer.disconnect({ timeout: 5000 }))
+    const quiet = await assertQuietTerminalGroup({
+      kafka: this.kafka,
+      admin: this.admin,
+      groupId: group,
+      topic,
+      partitions: [{ partition: 0, floor: String(ALTERED_START), end: String(RECORDS) }],
+      signal: scope,
+      timeoutMs: STEP_MS,
+      record: (fields) => this.note('quiet-verifier', fields),
+    })
+    expect(quiet.delivered).toEqual([])
+    expect(this.successfulAccepts()).toBe(true)
+    expect(this.share.delivered.map(({ identity }) => identity)).toEqual(
+      this.expected.slice(ALTERED_START)
+    )
+    this.oracles.broker = quiet.position.rows
+    this.oracles.quiet = quiet
+    this.oracles.acknowledgements = this.acknowledgements.evidence(group)
     await this.untilEmpty(scope, group)
     const removed = await bounded(scope, STEP_MS, () =>
       this.admin.deleteShareGroupOffsets({
