@@ -1,4 +1,5 @@
 const { plain } = require('../../../__tests__/fixtures/fuzzResponseVectors')
+const { expectRefusal } = require('../../../__tests__/fixtures/shareSpecKit')
 const fs = require('fs')
 const path = require('path')
 const codec = require('./response')
@@ -65,13 +66,15 @@ describe('independent Java response bytes', () => {
       )
     }
   })
-  test('rejects a trailing byte after a valid response', async () => {
+  test.each(files)('rejects a trailing byte after %s', async (name) => {
     const vector = JSON.parse(
-      fs.readFileSync(path.join(__dirname, '../fixtures/java', files[0]), 'utf8')
+      fs.readFileSync(path.join(__dirname, '../fixtures/java', name), 'utf8')
     )
-    await expect(
-      codec.decode(Buffer.concat([Buffer.from(vector.hex, 'hex'), Buffer.from([0])]))
-    ).rejects.toBeInstanceOf(KafkaJSPartialMessageError)
+    await expectRefusal(
+      codec.decode(Buffer.concat([Buffer.from(vector.hex, 'hex'), Buffer.from([0])])),
+      KafkaJSPartialMessageError,
+      'Trailing share response bytes'
+    )
   })
 })
 
@@ -81,7 +84,7 @@ test('rejects null for a required array', async () => {
     'hex'
   )
   bytes[11] = 0
-  await expect(codec.decode(bytes)).rejects.toBeInstanceOf(KafkaJSPartialMessageError)
+  await expectRefusal(codec.decode(bytes), KafkaJSPartialMessageError, 'Null required array')
 })
 
 test('rejects a compact length beyond unsigned int32', async () => {
@@ -94,7 +97,11 @@ test('rejects a compact length beyond unsigned int32', async () => {
     Buffer.from('ffffffff1f', 'hex'),
     bytes.subarray(12),
   ])
-  await expect(codec.decode(malformed)).rejects.toBeInstanceOf(KafkaJSInvalidVarIntError)
+  await expectRefusal(
+    codec.decode(malformed),
+    KafkaJSInvalidVarIntError,
+    'Unsigned VarInt exceeds int32'
+  )
 })
 
 test('refuses a negative acquired offset', async () => {
@@ -103,7 +110,7 @@ test('refuses a negative acquired offset', async () => {
     'hex'
   )
   Buffer.from('ffffffffffffffff', 'hex').copy(bytes, 120)
-  await expect(codec.decode(bytes)).rejects.toBeInstanceOf(KafkaJSPartialMessageError)
+  await expectRefusal(codec.decode(bytes), KafkaJSPartialMessageError, 'Invalid offset or lag')
 })
 
 test('refuses a reversed acquired range', async () => {
@@ -112,23 +119,29 @@ test('refuses a reversed acquired range', async () => {
     'hex'
   )
   Buffer.from('0020000000000000', 'hex').copy(bytes, 128)
-  await expect(codec.decode(bytes)).rejects.toBeInstanceOf(KafkaJSPartialMessageError)
+  await expectRefusal(codec.decode(bytes), KafkaJSPartialMessageError, 'Reversed acquired range')
 })
 
-test('refuses a compact Records length larger than its envelope', async () => {
-  const vector = require('../fixtures/java/shareFetchResponse-v2-recordsAndErrors.json')
-  // Bytes 48 and 191 hold the two partitions' Records lengths.
-  for (const [offset, length] of [
-    [191, '7f'],
-    [48, 'ffffffff0f'],
-  ]) {
+// Bytes 48 and 191 hold the two partitions' Records lengths; the refusal reports the bytes the
+// length asks for, one less than the length, and where the read starts, one byte after it.
+test.each([
+  [191, '7f', 126, 192],
+  [48, 'ffffffff0f', 4294967294, 53],
+])(
+  'refuses a compact Records length at byte %d larger than its envelope',
+  async (at, length, asked, readAt) => {
+    const vector = require('../fixtures/java/shareFetchResponse-v2-recordsAndErrors.json')
     const bytes = Buffer.from(vector.hex, 'hex')
-    Buffer.from(length, 'hex').copy(bytes, offset)
-    const error = await codec.decode(bytes).catch((caught) => caught)
-    expect(error).toBeInstanceOf(KafkaJSPartialMessageError)
-    expect(error.message).toContain('compact Records')
+    Buffer.from(length, 'hex').copy(bytes, at)
+    await expectRefusal(
+      codec.decode(bytes),
+      KafkaJSPartialMessageError,
+      `Tried to read ${asked} byte(s) with compact Records at offset ${readAt}, but only ${
+        bytes.length - readAt
+      } byte(s) remain`
+    )
   }
-})
+)
 
 test('preserves the inherited typed valid-prefix marker', async () => {
   const vector = require('../fixtures/java/shareFetchResponse-v2-recordsAndErrors.json')
@@ -181,5 +194,5 @@ test('refuses null for required Records', async () => {
   const vector = require('../fixtures/java/shareFetchResponse-v2-recordsAndErrors.json')
   const bytes = Buffer.from(vector.hex, 'hex')
   bytes[48] = 0
-  await expect(codec.decode(bytes)).rejects.toBeInstanceOf(KafkaJSPartialMessageError)
+  await expectRefusal(codec.decode(bytes), KafkaJSPartialMessageError, 'Null required Records')
 })

@@ -1,4 +1,5 @@
 const { plain } = require('../../../__tests__/fixtures/fuzzResponseVectors')
+const { expectRefusal } = require('../../../__tests__/fixtures/shareSpecKit')
 const fs = require('fs')
 const path = require('path')
 const codec = require('./response')
@@ -34,13 +35,15 @@ describe('independent Java response bytes', () => {
       )
     }
   })
-  test('rejects a trailing byte after a valid response', async () => {
+  test.each(files)('rejects a trailing byte after %s', async (name) => {
     const vector = JSON.parse(
-      fs.readFileSync(path.join(__dirname, '../fixtures/java', files[0]), 'utf8')
+      fs.readFileSync(path.join(__dirname, '../fixtures/java', name), 'utf8')
     )
-    await expect(
-      codec.decode(Buffer.concat([Buffer.from(vector.hex, 'hex'), Buffer.from([0])]))
-    ).rejects.toBeInstanceOf(KafkaJSPartialMessageError)
+    await expectRefusal(
+      codec.decode(Buffer.concat([Buffer.from(vector.hex, 'hex'), Buffer.from([0])])),
+      KafkaJSPartialMessageError,
+      'Trailing share response bytes'
+    )
   })
 })
 
@@ -50,7 +53,7 @@ test('rejects null for a required array', async () => {
     'hex'
   )
   bytes[7] = 0
-  await expect(codec.decode(bytes)).rejects.toBeInstanceOf(KafkaJSPartialMessageError)
+  await expectRefusal(codec.decode(bytes), KafkaJSPartialMessageError, 'Null required array')
 })
 
 test('rejects a compact length beyond unsigned int32', async () => {
@@ -63,5 +66,9 @@ test('rejects a compact length beyond unsigned int32', async () => {
     Buffer.from('ffffffff1f', 'hex'),
     bytes.subarray(8),
   ])
-  await expect(codec.decode(malformed)).rejects.toBeInstanceOf(KafkaJSInvalidVarIntError)
+  await expectRefusal(
+    codec.decode(malformed),
+    KafkaJSInvalidVarIntError,
+    'Unsigned VarInt exceeds int32'
+  )
 })

@@ -2,6 +2,7 @@ const fs = require('fs')
 const path = require('path')
 const codec = require('./request')
 const { KafkaJSNonRetriableError } = require('../../../../errors')
+const { expectRefusal } = require('../../../__tests__/fixtures/shareSpecKit')
 
 const files = [
   'shareAcknowledgeRequest-v2-renew.json',
@@ -60,4 +61,20 @@ describe('exact offset domains', () => {
       await expect(codec(fields).encode()).rejects.toBeInstanceOf(KafkaJSNonRetriableError)
     }
   )
+})
+
+describe('topic IDs', () => {
+  test.each([
+    ['missing', undefined],
+    ['null', null],
+    ['malformed', 'not-a-uuid'],
+    ['unhyphenated', '0102030405060708090a0b0c0d0e0f10'],
+    ['numeric', 1],
+  ])('refuses a %s topic ID', async (_, topicId) => {
+    await expectRefusal(
+      codec({ topics: [{ topicId, partitions: [] }] }).encode(),
+      KafkaJSNonRetriableError,
+      'Expected canonical UUID string'
+    )
+  })
 })

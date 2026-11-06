@@ -1,4 +1,5 @@
 const { plain } = require('../../../__tests__/fixtures/fuzzResponseVectors')
+const { expectRefusal } = require('../../../__tests__/fixtures/shareSpecKit')
 const fs = require('fs')
 const path = require('path')
 const codec = require('./response')
@@ -36,13 +37,15 @@ describe('independent Java response bytes', () => {
       )
     }
   })
-  test('rejects a trailing byte after a valid response', async () => {
+  test.each(files)('rejects a trailing byte after %s', async (name) => {
     const vector = JSON.parse(
-      fs.readFileSync(path.join(__dirname, '../fixtures/java', files[0]), 'utf8')
+      fs.readFileSync(path.join(__dirname, '../fixtures/java', name), 'utf8')
     )
-    await expect(
-      codec.decode(Buffer.concat([Buffer.from(vector.hex, 'hex'), Buffer.from([0])]))
-    ).rejects.toBeInstanceOf(KafkaJSPartialMessageError)
+    await expectRefusal(
+      codec.decode(Buffer.concat([Buffer.from(vector.hex, 'hex'), Buffer.from([0])])),
+      KafkaJSPartialMessageError,
+      'Trailing share response bytes'
+    )
   })
 })
 
@@ -50,5 +53,9 @@ test.each([-2, 0, 2])('refuses invalid assignment presence %s', async (marker) =
   const source = require('../fixtures/java/shareGroupHeartbeatResponse-v1-assigned.json')
   const bytes = Buffer.from(source.hex, 'hex')
   bytes.writeInt8(marker, 28)
-  await expect(codec.decode(bytes)).rejects.toBeInstanceOf(KafkaJSPartialMessageError)
+  await expectRefusal(
+    codec.decode(bytes),
+    KafkaJSPartialMessageError,
+    'Invalid nullable structure marker'
+  )
 })

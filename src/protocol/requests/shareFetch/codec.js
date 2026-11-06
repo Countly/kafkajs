@@ -6,11 +6,20 @@ const {
   KafkaJSInvalidVarIntError,
 } = require('../../../errors')
 
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
 /**
  * Encoder for the released share message bodies. Validation occurs at encode time so a
  * descriptor can be inspected before its required fields are supplied.
  */
 class ShareEncoder extends Encoder {
+  /** @param {string} value @returns {ShareEncoder} @throws {KafkaJSNonRetriableError} unless a canonical UUID string; a missing value is never written as the zero UUID */
+  writeUuid(value) {
+    if (typeof value !== 'string' || !UUID.test(value))
+      throw new KafkaJSNonRetriableError('Expected canonical UUID string')
+    return super.writeUuid(value)
+  }
+
   /** @param {number} value @returns {ShareEncoder} @throws {KafkaJSNonRetriableError} outside int8 */
   writeInt8(value) {
     return this.writeInteger(value, 8)

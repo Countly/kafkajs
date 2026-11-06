@@ -1,4 +1,5 @@
 const { plain } = require('../../../__tests__/fixtures/fuzzResponseVectors')
+const { expectRefusal } = require('../../../__tests__/fixtures/shareSpecKit')
 const fs = require('fs')
 const path = require('path')
 const codec = require('./response')
@@ -42,13 +43,15 @@ describe('independent Java response bytes', () => {
       )
     }
   })
-  test('rejects a trailing byte after a valid response', async () => {
+  test.each(files)('rejects a trailing byte after %s', async (name) => {
     const vector = JSON.parse(
-      fs.readFileSync(path.join(__dirname, '../fixtures/java', files[0]), 'utf8')
+      fs.readFileSync(path.join(__dirname, '../fixtures/java', name), 'utf8')
     )
-    await expect(
-      codec.decode(Buffer.concat([Buffer.from(vector.hex, 'hex'), Buffer.from([0])]))
-    ).rejects.toBeInstanceOf(KafkaJSPartialMessageError)
+    await expectRefusal(
+      codec.decode(Buffer.concat([Buffer.from(vector.hex, 'hex'), Buffer.from([0])])),
+      KafkaJSPartialMessageError,
+      'Trailing share response bytes'
+    )
   })
 })
 
@@ -58,7 +61,7 @@ test('rejects null for a required array', async () => {
     'hex'
   )
   bytes[4] = 0
-  await expect(codec.decode(bytes)).rejects.toBeInstanceOf(KafkaJSPartialMessageError)
+  await expectRefusal(codec.decode(bytes), KafkaJSPartialMessageError, 'Null required array')
 })
 
 test('rejects a compact length beyond unsigned int32', async () => {
@@ -71,5 +74,41 @@ test('rejects a compact length beyond unsigned int32', async () => {
     Buffer.from('ffffffff1f', 'hex'),
     bytes.subarray(5),
   ])
-  await expect(codec.decode(malformed)).rejects.toBeInstanceOf(KafkaJSInvalidVarIntError)
+  await expectRefusal(
+    codec.decode(malformed),
+    KafkaJSInvalidVarIntError,
+    'Unsigned VarInt exceeds int32'
+  )
+})
+
+describe('the unknown -1 and the offset domain', () => {
+  const vector = require('../fixtures/java/describeShareGroupOffsetsResponse-v1-knownAndUnknownLag.json')
+  // Partition 0 of the Java body: its StartOffset int64 starts at byte 45 and its Lag int64 at 57.
+  const FIELDS = [
+    ['startOffset', 45, 9007199254740993n],
+    ['lag', 57, 9223372036854775807n],
+  ]
+
+  /** The Java body with one partition-0 int64 overwritten, after proving what it held. */
+  const patched = (at, was, value) => {
+    const bytes = Buffer.from(vector.hex, 'hex')
+    expect(bytes.readBigInt64BE(at)).toBe(was)
+    bytes.writeBigInt64BE(value, at)
+    return bytes
+  }
+
+  test.each(FIELDS)('keeps -1 in %s as the exact decimal string', async (field, at, was) => {
+    const expected = structuredClone(vector.fields)
+    expected.groups[0].topics[0].partitions[0][field] = '-1'
+    const decoded = await codec.decode(patched(at, was, -1n))
+    expect(plain(decoded)).toEqual(expected)
+  })
+
+  test.each(FIELDS)('refuses -2 in %s as an invalid offset', async (_, at, was) => {
+    await expectRefusal(
+      codec.decode(patched(at, was, -2n)),
+      KafkaJSPartialMessageError,
+      'Invalid offset or lag'
+    )
+  })
 })

@@ -10,7 +10,7 @@ const { ShareAcknowledge: apiKey } = require('../../apiKeys')
  * @param {number} [options.shareSessionEpoch=0] The current share session epoch: 0 to open a share session; -1 to close it; otherwise increments for consecutive requests.
  * @param {boolean} [options.isRenewAck=false] Whether Renew type acknowledgements present in AcknowledgementBatches.
  * @param {object[]} [options.topics=[]] The topics containing records to acknowledge.
- * @param {string} options.topics[].topicId The unique topic ID.
+ * @param {string} options.topics[].topicId The unique topic ID, a canonical UUID string; a missing or malformed one is refused rather than written as the zero UUID.
  * @param {object[]} options.topics[].partitions The partitions containing records to acknowledge.
  * @param {number} options.topics[].partitions[].partitionIndex The partition index.
  * @param {object[]} options.topics[].partitions[].acknowledgementBatches Record batches to acknowledge.

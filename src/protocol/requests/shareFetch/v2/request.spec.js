@@ -2,6 +2,7 @@ const fs = require('fs')
 const path = require('path')
 const codec = require('./request')
 const { KafkaJSNonRetriableError } = require('../../../../errors')
+const { expectRefusal } = require('../../../__tests__/fixtures/shareSpecKit')
 
 const files = [
   'shareFetchRequest-v2-open.json',
@@ -80,16 +81,54 @@ test.each([-129, 128, 1.5, '1'])('refuses invalid acquire mode %j', async (share
   ).rejects.toBeInstanceOf(KafkaJSNonRetriableError)
 })
 
-test('accepts exact bigint and safe numeric offsets', async () => {
+describe('bigint and numeric offsets', () => {
   const source = require('../fixtures/java/shareFetchRequest-v2-incremental.json')
-  const fields = structuredClone(source.fields)
-  fields.topics[0].partitions[0].acknowledgementBatches[0].firstOffset = 9007199254740993n
-  const expected = await codec(source.fields).encode()
-  expect((await codec(fields).encode()).buffer).toEqual(expected.buffer)
-  const batch = fields.topics[0].partitions[0].acknowledgementBatches[0]
-  batch.firstOffset = 1
-  batch.lastOffset = '1'
-  const numeric = await codec(fields).encode()
-  batch.firstOffset = '1'
-  expect((await codec(fields).encode()).buffer).toEqual(numeric.buffer)
+  // The first acknowledgement batch's FirstOffset int64 inside the Java body.
+  const FIRST_OFFSET_AT = 74
+
+  const encodeWithFirstOffset = async (firstOffset) => {
+    const fields = structuredClone(source.fields)
+    fields.topics[0].partitions[0].acknowledgementBatches[0].firstOffset = firstOffset
+    return (await codec(fields).encode()).buffer.toString('hex')
+  }
+
+  test('encodes an exact bigint offset to the Java bytes', async () => {
+    expect(await encodeWithFirstOffset(9007199254740993n)).toBe(source.hex)
+  })
+
+  test.each([1, Number.MAX_SAFE_INTEGER])(
+    'encodes the safe number %s as the Java bytes with that int64 patched in',
+    async (offset) => {
+      const bytes = Buffer.from(source.hex, 'hex')
+      expect(bytes.readBigInt64BE(FIRST_OFFSET_AT)).toBe(9007199254740993n)
+      bytes.writeBigInt64BE(BigInt(offset), FIRST_OFFSET_AT)
+      expect(await encodeWithFirstOffset(offset)).toBe(bytes.toString('hex'))
+    }
+  )
+})
+
+describe('topic IDs', () => {
+  const INVALID = [
+    ['missing', undefined],
+    ['null', null],
+    ['malformed', 'not-a-uuid'],
+    ['unhyphenated', '0102030405060708090a0b0c0d0e0f10'],
+    ['numeric', 1],
+  ]
+
+  test.each(INVALID)('refuses a %s topic ID in topics', async (_, topicId) => {
+    await expectRefusal(
+      codec({ topics: [{ topicId, partitions: [] }] }).encode(),
+      KafkaJSNonRetriableError,
+      'Expected canonical UUID string'
+    )
+  })
+
+  test.each(INVALID)('refuses a %s topic ID in forgottenTopicsData', async (_, topicId) => {
+    await expectRefusal(
+      codec({ forgottenTopicsData: [{ topicId, partitions: [] }] }).encode(),
+      KafkaJSNonRetriableError,
+      'Expected canonical UUID string'
+    )
+  })
 })

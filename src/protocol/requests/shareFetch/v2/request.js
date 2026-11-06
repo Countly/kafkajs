@@ -16,7 +16,7 @@ const { ShareFetch: apiKey } = require('../../apiKeys')
  * @param {number} [options.shareAcquireMode=0] The acquire mode to control the fetch behavior - 0:batch-optimized,1:record-limit.
  * @param {boolean} [options.isRenewAck=false] Whether Renew type acknowledgements present in AcknowledgementBatches.
  * @param {object[]} [options.topics=[]] The topics to fetch.
- * @param {string} options.topics[].topicId The unique topic ID.
+ * @param {string} options.topics[].topicId The unique topic ID, a canonical UUID string; a missing or malformed one is refused rather than written as the zero UUID.
  * @param {object[]} options.topics[].partitions The partitions to fetch.
  * @param {number} options.topics[].partitions[].partitionIndex The partition index.
  * @param {object[]} options.topics[].partitions[].acknowledgementBatches Record batches to acknowledge.
@@ -24,7 +24,7 @@ const { ShareFetch: apiKey } = require('../../apiKeys')
  * @param {string|bigint|number} options.topics[].partitions[].acknowledgementBatches[].lastOffset Last offset (inclusive) of batch of records to acknowledge.
  * @param {number[]} options.topics[].partitions[].acknowledgementBatches[].acknowledgeTypes Array of acknowledge types - 0:Gap,1:Accept,2:Release,3:Reject,4:Renew.
  * @param {object[]} [options.forgottenTopicsData=[]] The partitions to remove from this share session.
- * @param {string} options.forgottenTopicsData[].topicId The unique topic ID.
+ * @param {string} options.forgottenTopicsData[].topicId The unique topic ID, a canonical UUID string; a missing or malformed one is refused.
  * @param {number[]} options.forgottenTopicsData[].partitions The partitions indexes to forget.
  * @returns {object} Descriptor with asynchronous encode().
  * @throws {KafkaJSNonRetriableError} from encode() for invalid field values.
