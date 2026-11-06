@@ -12,8 +12,12 @@ const {
   setShareGroupConfigs,
   shareRecordIdentity,
   shareTopicName,
-  verifierMember,
 } = require('../../../testHelpers/shareFixtures')
+const {
+  awaitTerminalSharePosition,
+  assertQuietTerminalGroup,
+  ShareAcknowledgementObserver,
+} = require('../../../testHelpers/shareLiveDiagnostics')
 const { readLog } = require('../../../testHelpers/rawLog')
 const { createResourceProbe } = require('../../../testHelpers/resourceProbe')
 const {
@@ -22,7 +26,6 @@ const {
   caseTimeout,
   liveCase,
   liveRun,
-  pollTolerating,
   pollUntil,
 } = require('../../producer/__tests__/fixtures/bounded')
 const { CleanupStack, describeError } = require('../../producer/__tests__/fixtures/liveProbe')
@@ -412,6 +415,7 @@ class ShareDiagnosticsCase {
     this.group = `e2e-p9e-diagnostics-group-${this.nonce}`
     this.stack = new CleanupStack()
     this.ledger = new SocketLedger()
+    this.acknowledgements = new ShareAcknowledgementObserver()
     this.openHandlers = 0
     this.probe = createResourceProbe({
       emitters: { process },
@@ -495,6 +499,7 @@ class ShareDiagnosticsCase {
    * @throws {Error} the first assertion or fixture failure, with cleanup failures attached
    */
   async run(scope) {
+    this.acknowledgements.install()
     try {
       await this.stack.run(
         async () => {
@@ -510,9 +515,12 @@ class ShareDiagnosticsCase {
       this.row('case-failed', {
         error: describeError(error),
         channels: this.channelFacts(),
+        acknowledgements: this.acknowledgements.evidence(this.group),
         crashes: this.crashes.map((crash) => describeError(crash)),
       })
       throw error
+    } finally {
+      this.acknowledgements.restore()
     }
   }
 
@@ -582,6 +590,10 @@ class ShareDiagnosticsCase {
         ],
       })
     )
+    const metadata = await bounded(scope, 10000, () =>
+      this.admin.fetchTopicMetadata({ topics: [this.topic] })
+    )
+    this.topicId = metadata.topics.find(({ name }) => name === this.topic).topicId
     await bounded(scope, 15000, () =>
       setShareGroupConfigs(this.admin, this.group, SHARE_GROUP_CONFIG)
     )
@@ -668,9 +680,12 @@ class ShareDiagnosticsCase {
     await pollUntil(scope, 20000, () => this.entries.length >= SHARE_RECORDS, {
       label: 'All deliveries',
     })
-    await pollUntil(scope, 15000, () => this.acceptedOffsets() >= BigInt(SHARE_RECORDS), {
-      label: 'All terminal accepts',
-    })
+    await pollUntil(
+      scope,
+      15000,
+      () => this.acceptedOffsets() >= BigInt(SHARE_RECORDS) && this.successfulAccepts(),
+      { label: 'All terminal accepts' }
+    )
     expect(consumer.acquisitionLockTimeoutMs()).toBe(30000)
   }
 
@@ -707,60 +722,42 @@ class ShareDiagnosticsCase {
     )
     expect(this.raw).toEqual(this.expected)
     expect([...this.entries].sort()).toEqual([...this.expected].sort())
+    expect(this.successfulAccepts()).toBe(true)
     this.broker = await this.awaitBrokerEnd(scope, endOffset)
   }
 
+  /** @returns {boolean} Every fixed offset has exactly one successful original Accept. */
+  successfulAccepts() {
+    const types = this.acknowledgements.types(this.group, this.topicId, 0)
+    if (types.size !== SHARE_RECORDS) return false
+    for (let offset = 0; offset < SHARE_RECORDS; offset++) {
+      if (JSON.stringify(types.get(String(offset))) !== '[1]') return false
+    }
+    return true
+  }
+
   /**
-   * Waits until the share start offset of the partition equals the log end with known lag zero,
-   * in both the named and the all-topics listing.
-   * @param {AbortSignal} scope the case scope
-   * @param {string} logEnd the independently read log end offset
-   * @returns {Promise<object[]>} the terminal row of the partition
+   * Requires agreeing terminal listings, known zero lag and the independent fixed log end.
+   * @param {AbortSignal} scope Case scope.
+   * @param {string} logEnd Independently read log end.
+   * @returns {Promise<object[]>} Actual persisted rows.
    */
   async awaitBrokerEnd(scope, logEnd) {
-    let rows = []
-    const pick = (listing) =>
-      listing.find(({ topic }) => topic === this.topic)?.partitions.find((p) => p.partition === 0)
-    await pollTolerating(
-      scope,
-      20000,
-      async (poll) => {
-        const named = await bounded(poll, 10000, () =>
-          this.admin.listShareGroupOffsets({
-            groupId: this.group,
-            topics: [{ topic: this.topic, partitions: [0] }],
-            apiTimeout: 8000,
-          })
-        )
-        const all = await bounded(poll, 10000, () =>
-          this.admin.listShareGroupOffsets({ groupId: this.group, apiTimeout: 8000 })
-        )
-        const [first, second] = [pick(named), pick(all)]
-        rows = [
-          {
-            groupId: this.group,
-            topic: this.topic,
-            partition: 0,
-            errorCode: first?.errorCode,
-            startOffset: first?.startOffset,
-            logEnd,
-            lag: first?.lag,
-          },
-        ]
-        const [row] = rows
-        if (
-          !(row.errorCode === 0 && row.startOffset === logEnd && row.lag === '0') ||
-          !isDeepStrictEqual(first, second)
-        ) {
-          throw new Error(
-            `Share position is not at the log end: ${JSON.stringify({ first, second })}`
-          )
-        }
-        return true
-      },
-      { label: 'The broker share offset' }
+    this.terminalPartitions = [{ partition: 0, floor: '0', end: logEnd }]
+    const position = await awaitTerminalSharePosition(
+      this.admin,
+      { groupId: this.group, topic: this.topic, partitions: this.terminalPartitions },
+      {
+        signal: scope,
+        timeoutMs: 20000,
+        record: (fields) =>
+          this.row('broker-position', {
+            ...fields,
+            acknowledgements: this.acknowledgements.evidence(this.group),
+          }),
+      }
     )
-    return rows
+    return position.rows
   }
 
   /**
@@ -773,10 +770,21 @@ class ShareDiagnosticsCase {
     await bounded(scope, 10000, () => this.consumer.stop())
     await bounded(scope, 10000, () => this.consumer.disconnect({ timeout: 5000 }))
     this.verifyChannels()
-    const verified = await bounded(scope, 30000, (inner) =>
-      verifierMember(this.group, this.topic, { kafka: this.client('verifier'), signal: inner })
-    )
-    expect(verified).toEqual([])
+    this.quiet = await assertQuietTerminalGroup({
+      kafka: this.client('verifier'),
+      admin: this.admin,
+      groupId: this.group,
+      topic: this.topic,
+      partitions: this.terminalPartitions,
+      signal: scope,
+      timeoutMs: 30000,
+      record: (fields) => this.row('quiet-verifier', fields),
+    })
+    this.broker = this.quiet.position.rows
+    expect(this.quiet.delivered).toEqual([])
+    this.acceptedOffsets()
+    expect([...this.entries].sort()).toEqual([...this.expected].sort())
+    expect(this.successfulAccepts()).toBe(true)
   }
 
   /**
@@ -970,6 +978,8 @@ class ShareDiagnosticsCase {
           actual: [...this.entries].sort().map((identity) => [identity, 1]),
         },
         broker: this.broker,
+        acknowledgements: this.acknowledgements.evidence(this.group),
+        quiet: this.quiet,
       },
       channels: this.channelFacts(),
       resources: { before: resourceSummary(this.baseline), after: resourceSummary(this.after) },

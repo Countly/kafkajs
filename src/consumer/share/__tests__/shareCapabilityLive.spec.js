@@ -24,8 +24,12 @@ const {
   setShareGroupConfigs,
   shareRecordIdentity,
   shareTopicName,
-  verifierMember,
 } = require('../../../../testHelpers/shareFixtures')
+const {
+  awaitTerminalSharePosition,
+  assertQuietTerminalGroup,
+  ShareAcknowledgementObserver,
+} = require('../../../../testHelpers/shareLiveDiagnostics')
 const { readLog } = require('../../../../testHelpers/rawLog')
 const { createResourceProbe } = require('../../../../testHelpers/resourceProbe')
 const {
@@ -333,6 +337,7 @@ class CapabilityCase {
     this.budgetMs = null
     this.stack = new CleanupStack()
     this.ledger = new SocketLedger()
+    this.acknowledgements = new ShareAcknowledgementObserver()
     this.probe = createResourceProbe({
       emitters: { process },
       sockets: () => this.ledger.counts(),
@@ -390,7 +395,9 @@ class CapabilityCase {
   /** @returns {object} the facts kept when a case fails, before cleanup can change them */
   progress() {
     return {
+      phase: this.phase,
       connectAttempts: this.connectAttempts,
+      acknowledgements: this.acknowledgements.evidence(this.group),
       shareFrames: this.ledger.shareFrames(),
       crashes: this.crashes.map((error) => describeError(error)),
       feature: this.feature,
@@ -492,6 +499,7 @@ class CapabilityCase {
   async default(scope) {
     this.title = TITLE_DEFAULT
     this.budgetMs = DEFAULT_BUDGET_MS
+    this.acknowledgements.install()
     try {
       const expected = expectedOutcome(this.line)
       if (!expected) throw new Error(`No share capability expectation for broker line ${this.line}`)
@@ -500,6 +508,8 @@ class CapabilityCase {
     } catch (error) {
       this.row('case-failed', { error: describeError(error), ...this.progress() })
       throw error
+    } finally {
+      this.acknowledgements.restore()
     }
   }
 
@@ -768,12 +778,19 @@ class CapabilityCase {
   async roundTrip(scope, expected) {
     await this.stack.run(
       async () => {
+        this.phase = 'setup'
         await this.setup(scope)
+        this.phase = 'capture-before'
         this.before = await this.capture(scope)
+        this.phase = 'delivery'
         await this.connectAndReceive(scope)
+        this.phase = 'capture-after'
         this.afterCapture = await this.capture(scope)
+        this.phase = 'observation'
         await this.observe(scope, expected)
+        this.phase = 'verification'
         await this.finish(scope)
+        this.phase = 'cleanup'
       },
       { budgetMs: CLEANUP_MS }
     )
@@ -805,6 +822,10 @@ class CapabilityCase {
         ],
       })
     )
+    const metadata = await bounded(scope, 10000, () =>
+      this.admin.fetchTopicMetadata({ topics: [this.topic] })
+    )
+    this.topicId = metadata.topics.find(({ name }) => name === this.topic).topicId
     this.sentinelCreated = true
     await bounded(scope, 10000, () =>
       this.admin.setOffsets({
@@ -878,7 +899,7 @@ class CapabilityCase {
       value: message.value,
     })
     await pollUntil(scope, 15000, () => this.entries.length >= 1, { label: 'The delivery' })
-    await pollUntil(scope, 10000, () => this.acks.some(({ type }) => type === 'accept'), {
+    await pollUntil(scope, 10000, () => this.successfulAccepts(), {
       label: 'The terminal accept',
     })
   }
@@ -915,8 +936,8 @@ class CapabilityCase {
     expect(this.rawIdentities).toEqual([this.expected])
     expect(this.entries.map(({ identity }) => identity)).toEqual([this.expected])
     expect(this.entries[0].deliveryCount).toBe(1)
+    expect(this.successfulAccepts()).toBe(true)
     this.broker = await this.awaitBrokerEnd(scope, endOffset)
-
     const accepts = this.acks.filter(({ type }) => type !== 'renew')
     expect(accepts.map(({ type, error }) => [type, error])).toEqual([['accept', null]])
     const frames = this.ledger.shareFrames()
@@ -928,57 +949,34 @@ class CapabilityCase {
     expect(versions(79).filter((version) => version !== 2)).toEqual([])
   }
 
+  /** @returns {boolean} The one fixed identity has a successful original Accept receipt. */
+  successfulAccepts() {
+    if (
+      this.acks.some(({ type, error }) => type !== 'renew' && (type !== 'accept' || error !== null))
+    )
+      return false
+    const types = this.acknowledgements.types(this.group, this.topicId, 0)
+    return types.size === 1 && JSON.stringify(types.get('0')) === '[1]'
+  }
+
   /**
-   * Waits until the share start offset of the partition equals the log end with known lag zero,
-   * in both the named and the all-topics listing.
-   * @param {AbortSignal} scope the case scope
-   * @param {string} logEnd the independently read log end offset
-   * @returns {Promise<object[]>} the terminal row of the partition
+   * Requires agreeing terminal listings, known zero lag and the independent fixed log end.
+   * @param {AbortSignal} scope Case scope.
+   * @param {string} logEnd Independently read log end.
+   * @returns {Promise<object[]>} Actual persisted rows.
    */
   async awaitBrokerEnd(scope, logEnd) {
-    let rows = []
-    const pick = (listing) =>
-      listing.find(({ topic }) => topic === this.topic)?.partitions.find((p) => p.partition === 0)
-    await pollTolerating(
-      scope,
-      20000,
-      async (poll) => {
-        const named = await bounded(poll, 10000, () =>
-          this.admin.listShareGroupOffsets({
-            groupId: this.group,
-            topics: [{ topic: this.topic, partitions: [0] }],
-            apiTimeout: 8000,
-          })
-        )
-        const all = await bounded(poll, 10000, () =>
-          this.admin.listShareGroupOffsets({ groupId: this.group, apiTimeout: 8000 })
-        )
-        const [first, second] = [pick(named), pick(all)]
-        rows = [
-          {
-            groupId: this.group,
-            topic: this.topic,
-            partition: 0,
-            errorCode: first?.errorCode,
-            startOffset: first?.startOffset,
-            logEnd,
-            lag: first?.lag,
-          },
-        ]
-        const [row] = rows
-        if (
-          !(row.errorCode === 0 && row.startOffset === logEnd && row.lag === '0') ||
-          !isDeepStrictEqual(first, second)
-        ) {
-          throw new Error(
-            `Share position is not at the log end: ${JSON.stringify({ first, second })}`
-          )
-        }
-        return true
-      },
-      { label: 'The broker share offset' }
+    this.terminalPartitions = [{ partition: 0, floor: '0', end: logEnd }]
+    const position = await awaitTerminalSharePosition(
+      this.admin,
+      { groupId: this.group, topic: this.topic, partitions: this.terminalPartitions },
+      {
+        signal: scope,
+        timeoutMs: 20000,
+        record: (fields) => this.row('broker-position', { ...fields, ...this.progress() }),
+      }
     )
-    return rows
+    return position.rows
   }
 
   /**
@@ -989,10 +987,20 @@ class CapabilityCase {
   async finish(scope) {
     await bounded(scope, 10000, () => this.consumer.disconnect({ timeout: 5000 }))
     expect(this.disconnects).toBe(1)
-    const verified = await bounded(scope, 30000, (inner) =>
-      verifierMember(this.group, this.topic, { kafka: this.client('verifier'), signal: inner })
-    )
-    expect(verified).toEqual([])
+    this.quiet = await assertQuietTerminalGroup({
+      kafka: this.client('verifier'),
+      admin: this.admin,
+      groupId: this.group,
+      topic: this.topic,
+      partitions: this.terminalPartitions,
+      signal: scope,
+      timeoutMs: 30000,
+      record: (fields) => this.row('quiet-verifier', fields),
+    })
+    this.broker = this.quiet.position.rows
+    expect(this.quiet.delivered).toEqual([])
+    expect(this.entries.map(({ identity }) => identity)).toEqual([this.expected])
+    expect(this.successfulAccepts()).toBe(true)
     expect(this.crashes.map((error) => error.message)).toEqual([])
   }
 
@@ -1155,6 +1163,8 @@ class CapabilityCase {
           actual: [[this.entries[0].identity, this.entries.length]],
         },
         broker: this.broker,
+        acknowledgements: this.acknowledgements.evidence(this.group),
+        quiet: this.quiet,
       },
       resources: { before: resourceSummary(this.baseline), after: resourceSummary(this.after) },
       cleanup: {

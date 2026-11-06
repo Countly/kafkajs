@@ -27,13 +27,16 @@ const {
   setShareGroupConfigs,
   shareRecordIdentity,
   shareTopicName,
-  verifierMember,
 } = require('../../../../testHelpers/shareFixtures')
 const shareAcknowledge = require('../../../../testHelpers/wire/shareAcknowledgeV2')
 const shareGroupHeartbeat = require('../../../../testHelpers/wire/shareGroupHeartbeatV1')
 const { readLog } = require('../../../../testHelpers/rawLog')
 const { createResourceProbe } = require('../../../../testHelpers/resourceProbe')
-const { pollSharePosition } = require('../../../../testHelpers/shareLiveDiagnostics')
+const {
+  awaitTerminalSharePosition,
+  assertQuietTerminalGroup,
+  ShareAcknowledgementObserver,
+} = require('../../../../testHelpers/shareLiveDiagnostics')
 const {
   NEVER,
   bounded,
@@ -657,6 +660,7 @@ class ShareInteropCase {
     this.dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kafkajs-share-interop-case-'))
     this.stack = new CleanupStack()
     this.tap = new ShareWireTap()
+    this.acknowledgements = new ShareAcknowledgementObserver()
     this.openHandlers = 0
     this.probe = createResourceProbe({
       emitters: { process },
@@ -726,7 +730,8 @@ class ShareInteropCase {
       javaExit: this.javaMember?.exit,
       javaStderr: this.javaMember?.stderr,
       javaProblem: this.javaMember?.journal.problem,
-      acknowledgements: this.js.acks.filter(({ error }) => error !== null).length,
+      acknowledgements: this.js.acks.map((row) => ({ ...row, error: describeError(row.error) })),
+      acknowledgementResponses: this.acknowledgements.evidence(this.group),
       crashes: this.js.crashes.map((error) => describeError(error)),
       facts: this.facts,
     }
@@ -739,6 +744,7 @@ class ShareInteropCase {
    * @throws {Error} the first assertion or fixture failure, with cleanup failures attached
    */
   async run(scope) {
+    this.acknowledgements.install()
     try {
       await this.stack.run(
         async () => {
@@ -753,6 +759,8 @@ class ShareInteropCase {
     } catch (error) {
       this.row('case-failed', { error: describeError(error), ...this.progress() })
       throw error
+    } finally {
+      this.acknowledgements.restore()
     }
   }
 
@@ -782,6 +790,10 @@ class ShareInteropCase {
         ],
       })
     )
+    const metadata = await bounded(scope, 10000, () =>
+      this.admin.fetchTopicMetadata({ topics: [this.topic] })
+    )
+    this.topicId = metadata.topics.find(({ name }) => name === this.topic).topicId
     await bounded(scope, 15000, () => setShareGroupConfigs(this.admin, this.group, GROUP_CONFIG))
     this.baseline = await bounded(scope, 60000, () =>
       bounded(scope, 10000, () => this.probe.snapshot())
@@ -1016,60 +1028,63 @@ class ShareInteropCase {
   }
 
   /**
-   * Waits until every partition's share start offset equals `ends`, in both the named and the
-   * all-topics listing, and returns the rows it read.
-   * @param {AbortSignal} scope the case scope
-   * @param {Map<number, string>} ends the decimal position expected for each partition
-   * @param {string} lag the lag every partition must report
-   * @returns {Promise<object[]>} one terminal row per partition
+   * Requires one successful JS Accept or one committed Java poll receipt per corpus identity.
+   * Releases and uncommitted polls do not settle identities; unknown outcomes never qualify.
+   * @returns {boolean} Complete, disjoint successful coverage of the current append prefix.
    */
-  async awaitPositions(scope, ends, lag) {
-    const partitions = [...ends.keys()]
-    let rows = []
-    const last = { named: null, all: null }
-    await pollSharePosition(
-      scope,
-      20000,
-      async (poll) => {
-        last.named = await bounded(poll, 10000, () =>
-          this.admin.listShareGroupOffsets({
-            groupId: this.group,
-            topics: [{ topic: this.topic, partitions }],
-            apiTimeout: 8000,
-          })
-        )
-        last.all = await bounded(poll, 10000, () =>
-          this.admin.listShareGroupOffsets({ groupId: this.group, apiTimeout: 8000 })
-        )
-        const pick = (listing) =>
-          listing.find(({ topic }) => topic === this.topic)?.partitions ?? []
-        rows = partitions.map((partition) => {
-          const forms = [pick(last.named), pick(last.all)].map((list) =>
-            list.find((p) => p.partition === partition)
-          )
-          const [first] = forms
-          return {
-            groupId: this.group,
-            topic: this.topic,
-            partition,
-            errorCode: first?.errorCode,
-            startOffset: first?.startOffset,
-            logEnd: ends.get(partition),
-            lag: first?.lag,
-            agree: forms.every((form) => JSON.stringify(form) === JSON.stringify(first)),
-          }
-        })
-        return rows.every(
-          (r) => r.errorCode === 0 && r.startOffset === r.logEnd && r.lag === lag && r.agree
-        )
+  successfulAccepts() {
+    const journal = this.javaMember?.journal
+    const committed = new Set(journal?.committed ?? [])
+    if (this.kind === 'halt' && committed.size) return false
+    const java = tally(
+      (journal?.polls ?? [])
+        .filter(({ pollId }) => committed.has(pollId))
+        .flatMap(({ records }) => records.map(({ identity }) => identity))
+    )
+    if ([...java.keys()].some((identity) => !this.expected.includes(identity))) return false
+    if (journal && this.kind !== 'halt') {
+      if (journal.polls.some(({ pollId }) => !committed.has(pollId))) return false
+    }
+    const jsHandled = tally(this.jsEntries.map(({ identity }) => identity))
+    const javaHandled = tally((journal?.entries ?? []).map(({ identity }) => identity))
+    for (const [partition, records] of this.corpus) {
+      const types = this.acknowledgements.types(this.group, this.topicId, partition)
+      if ([...types.keys()].some((offset) => !records.some((r) => r.offset === offset)))
+        return false
+      for (const { offset, identity } of records) {
+        const decisions = types.get(offset) ?? []
+        if (decisions.some((type) => type !== 1 && type !== 2)) return false
+        const jsAccepts = decisions.filter((type) => type === 1).length
+        const javaAccepts = java.get(identity) ?? 0
+        if (jsAccepts + javaAccepts !== 1) return false
+        if (jsAccepts && jsHandled.get(identity) !== 1) return false
+        if (javaAccepts && javaHandled.get(identity) !== 1) return false
+      }
+    }
+    return this.expected.length > 0
+  }
+
+  /**
+   * Requires agreeing terminal listings, known zero lag and independent fixed log ends.
+   * @param {AbortSignal} scope Case scope.
+   * @param {Map<number, string>} ends Independently read log ends.
+   * @returns {Promise<object[]>} Actual persisted rows.
+   */
+  async awaitPositions(scope, ends) {
+    const position = await awaitTerminalSharePosition(
+      this.admin,
+      {
+        groupId: this.group,
+        topic: this.topic,
+        partitions: [...ends].map(([partition, end]) => ({ partition, floor: '0', end })),
       },
       {
-        label: 'The broker share offsets',
-        snapshot: () => ({ groupId: this.group, topic: this.topic, rows, ...last }),
+        signal: scope,
+        timeoutMs: 20000,
         record: (fields) => this.row('broker-position', { ...fields, ...this.progress() }),
       }
     )
-    return rows.map(({ agree: _agree, ...row }) => row)
+    return position.rows
   }
 
   /**
@@ -1103,13 +1118,15 @@ class ShareInteropCase {
     await pollUntil(
       scope,
       20000,
-      () => this.jsEntries.length >= 120 && this.acceptedOffsets() >= 120n,
+      () =>
+        this.jsEntries.length >= 120 && this.acceptedOffsets() >= 120n && this.successfulAccepts(),
       { label: 'The JavaScript member accepting its first records' }
     )
+    const prefix = await this.observeLog(scope)
+    this.facts.firstLog = { expected: [...this.expected], actual: [...this.rawIdentities] }
     this.facts.firstPositions = await this.awaitPositions(
       scope,
-      new Map([...this.corpus].map(([partition, list]) => [partition, String(list.length)])),
-      '0'
+      new Map([...prefix].map(([partition, { endOffset }]) => [partition, endOffset]))
     )
     this.startJava()
     await this.awaitMembers(scope)
@@ -1230,6 +1247,7 @@ class ShareInteropCase {
     await bounded(scope, 25000, () => this.javaMember.closed, { label: 'The Java member halting' })
     const member = this.javaMember
     member.assertClean()
+    expect(member.journal.polls).toHaveLength(1)
     const [poll] = member.journal.polls
     const haltedAt = member.exit.at
     expect(member.exit.code).toBe(137)
@@ -1242,12 +1260,16 @@ class ShareInteropCase {
     expect(Number.isSafeInteger(poll.lockTimeoutMs)).toBe(true)
     expect(member.journal.entries.length).toBeGreaterThanOrEqual(1)
     const held = poll.records.map(({ identity }) => identity)
+    expect(new Set(held).size).toBe(held.length)
+    expect(held.every((identity) => this.expected.includes(identity))).toBe(true)
+    expect(member.journal.entries).toHaveLength(1)
+    expect(member.journal.entries[0].identity).toBe(held[0])
 
     const deadline = haltedAt + poll.lockTimeoutMs + RECOVERY_SLACK_MS
     await pollUntil(
       scope,
       Math.max(1000, deadline - performance.now()),
-      () => held.every((identity) => this.jsFirst.has(identity)),
+      () => this.haltRecovered(poll, haltedAt),
       { delayMs: 100, label: 'The halted poll recovering in the surviving member' }
     )
     const recoveredAt = Math.max(...held.map((identity) => this.jsFirst.get(identity)))
@@ -1269,20 +1291,35 @@ class ShareInteropCase {
   }
 
   /**
-   * Checks the three independent oracles: raw log, broker offsets and handler entries.
-   * @param {AbortSignal} scope the case scope
-   * @returns {Promise<void>}
+   * Checks recovery of the complete original poll, including records Java never printed.
+   * @param {object} poll Original Java poll and actual lock timeout.
+   * @param {number} haltedAt Observed halt time on the case clock.
+   * @returns {boolean} Every acquired identity reached JS within the recovery bound.
    */
-  async observe(scope) {
+  haltRecovered(poll, haltedAt) {
+    const deadline = haltedAt + poll.lockTimeoutMs + RECOVERY_SLACK_MS
+    return poll.records.every(({ identity }) => {
+      const at = this.jsFirst.get(identity)
+      return at >= haltedAt && at <= deadline
+    })
+  }
+
+  /**
+   * Checks the durable data identities, control projection and ends of the current append prefix.
+   * @param {AbortSignal} scope Case scope.
+   * @returns {Promise<Map>} Independently read partitions, records and ends.
+   */
+  async observeLog(scope) {
     const log = await bounded(scope, 20000, () =>
       readLog({ brokers: plainTextBrokers(), topic: this.topic })
     )
+    expect([...log.keys()].sort()).toEqual([...this.corpus.keys()].sort())
     const raw = []
     for (const [partition, { endOffset, records }] of log) {
-      expect(endOffset).toBe(String(PER_PARTITION))
+      expect(endOffset).toBe(String(this.corpus.get(partition).length))
       expect(records.filter(({ batchContext }) => batchContext.isControlBatch)).toEqual([])
       expect(records.map(({ offset }) => String(offset))).toEqual(
-        Array.from({ length: PER_PARTITION }, (_, n) => String(n))
+        Array.from({ length: this.corpus.get(partition).length }, (_, n) => String(n))
       )
       for (const record of records) {
         raw.push(
@@ -1303,6 +1340,16 @@ class ShareInteropCase {
       count: [],
     })
 
+    return log
+  }
+
+  /**
+   * Checks the three independent oracles: raw log, broker offsets and handler entries.
+   * @param {AbortSignal} scope the case scope
+   * @returns {Promise<void>}
+   */
+  async observe(scope) {
+    const log = await this.observeLog(scope)
     const javaEntries = this.javaMember.journal.entries
     const journal = ShareHandlerLog.read(path.join(this.dir, 'js-handler.jsonl'))
     const started = journal.rows.filter(({ event }) => event === 'start').map((r) => r.identity)
@@ -1323,11 +1370,28 @@ class ShareInteropCase {
       const javaSet = new Set(javaEntries.map(({ identity }) => identity))
       expect(this.jsEntries.filter(({ identity }) => javaSet.has(identity))).toEqual([])
     }
-    this.broker = await this.awaitPositions(
-      scope,
-      new Map([...log].map(([partition, { endOffset }]) => [partition, endOffset])),
-      '0'
-    )
+    this.terminalPartitions = [...log].map(([partition, { endOffset }]) => ({
+      partition,
+      floor: '0',
+      end: endOffset,
+    }))
+    expect(this.terminalPartitions).toHaveLength(PARTITIONS)
+    expect(this.terminalPartitions.every(({ end }) => end === String(PER_PARTITION))).toBe(true)
+    this.broker = await bounded(scope, 20000, async (inner) => {
+      await pollUntil(
+        inner,
+        Infinity,
+        () => {
+          this.acceptedOffsets()
+          return this.successfulAccepts()
+        },
+        { label: 'Every identity successfully accepted' }
+      )
+      return this.awaitPositions(
+        inner,
+        new Map([...log].map(([partition, { endOffset }]) => [partition, endOffset]))
+      )
+    })
   }
 
   /**
@@ -1340,10 +1404,29 @@ class ShareInteropCase {
     await bounded(scope, 10000, () => this.consumer.disconnect({ timeout: 5000 }))
     await bounded(scope, 30000, () => this.javaMember.closed)
     this.javaMember.assertClean()
-    const verified = await bounded(scope, 30000, (inner) =>
-      verifierMember(this.group, this.topic, { kafka: this.client('verifier'), signal: inner })
-    )
-    expect(verified).toEqual([])
+    this.quiet = await assertQuietTerminalGroup({
+      kafka: this.client('verifier'),
+      admin: this.admin,
+      groupId: this.group,
+      topic: this.topic,
+      partitions: this.terminalPartitions,
+      signal: scope,
+      timeoutMs: 30000,
+      record: (fields) => this.row('quiet-verifier', fields),
+    })
+    this.broker = this.quiet.position.rows
+    expect(this.quiet.delivered).toEqual([])
+    this.acceptedOffsets()
+    expect(this.successfulAccepts()).toBe(true)
+    expect(
+      multisetProblems(
+        this.expectedHandled,
+        tally([
+          ...this.jsEntries.map(({ identity }) => identity),
+          ...this.javaMember.journal.entries.map(({ identity }) => identity),
+        ])
+      )
+    ).toEqual({ missing: [], extra: [], count: [] })
     expect(this.js.crashes.map((error) => error.message)).toEqual([])
     this.handlerLog.close()
   }
@@ -1536,6 +1619,8 @@ class ShareInteropCase {
           actual: sortedEntries(this.handled),
         },
         broker: this.broker,
+        acknowledgements: this.acknowledgements.evidence(this.group),
+        quiet: this.quiet,
       },
       resources: {
         before: this.resourceSummary(this.baseline),
@@ -1713,6 +1798,88 @@ describe('share interop Java journal', () => {
       '--halt-after',
       '1',
     ])
+  })
+})
+
+describe('share interop halted-poll proof', () => {
+  /** @returns {object} Independent corpus, original Java poll and successful JS broker exchange. */
+  const haltedState = () => {
+    const records = ['0', '1'].map((offset) => ({
+      offset,
+      identity: shareRecordIdentity({ topic: 't', partition: 0, offset, key: null, value: null }),
+    }))
+    const acknowledgements = new ShareAcknowledgementObserver()
+    acknowledgements.exchanges.push({
+      apiKey: 79,
+      request: {
+        groupId: 'g',
+        topics: [
+          {
+            topicId: 'id',
+            partitions: [
+              {
+                partitionIndex: 0,
+                acknowledgementBatches: [
+                  { firstOffset: '0', lastOffset: '1', acknowledgeTypes: [1] },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+      response: {
+        errorCode: 0,
+        responses: [{ topicId: 'id', partitions: [{ partitionIndex: 0, errorCode: 0 }] }],
+      },
+    })
+    const poll = { pollId: '1', lockTimeoutMs: LOCK_MS, records }
+    return {
+      kind: 'halt',
+      group: 'g',
+      topicId: 'id',
+      corpus: new Map([[0, records]]),
+      expected: records.map(({ identity }) => identity),
+      jsEntries: records.map(({ identity }) => ({ identity })),
+      jsFirst: new Map(records.map(({ identity }) => [identity, 200])),
+      acknowledgements,
+      javaMember: { journal: { polls: [poll], entries: [records[0]], committed: [] } },
+    }
+  }
+
+  it('requires recovery of unprinted poll records within the actual lock bound', () => {
+    const state = haltedState()
+    const [poll] = state.javaMember.journal.polls
+    const recovered = () => ShareInteropCase.prototype.haltRecovered.call(state, poll, 100)
+    expect(recovered()).toBe(true)
+    state.jsFirst.delete(poll.records[1].identity)
+    expect(recovered()).toBe(false)
+    state.jsFirst.set(poll.records[1].identity, 100 + LOCK_MS + RECOVERY_SLACK_MS + 1)
+    expect(recovered()).toBe(false)
+  })
+
+  it('requires real JS Accepts for printed and unprinted records of an uncommitted poll', () => {
+    const state = haltedState()
+    const settled = () => ShareInteropCase.prototype.successfulAccepts.call(state)
+    expect(settled()).toBe(true)
+    const [exchange] = state.acknowledgements.exchanges
+    const [partition] = exchange.request.topics[0].partitions
+    partition.acknowledgementBatches[0].lastOffset = '0'
+    expect(settled()).toBe(false)
+    partition.acknowledgementBatches[0].lastOffset = '1'
+    delete exchange.response
+    exchange.error = { name: 'KafkaJSShareAcknowledgementError', reason: 'session-lost' }
+    expect(settled()).toBe(false)
+  })
+
+  it('rejects an invented Java commit or handler replay outside the printed set', () => {
+    const state = haltedState()
+    const settled = () => ShareInteropCase.prototype.successfulAccepts.call(state)
+    expect(settled()).toBe(true)
+    state.javaMember.journal.committed.push('1')
+    expect(settled()).toBe(false)
+    state.javaMember.journal.committed = []
+    state.jsEntries.push(state.jsEntries[1])
+    expect(settled()).toBe(false)
   })
 })
 
