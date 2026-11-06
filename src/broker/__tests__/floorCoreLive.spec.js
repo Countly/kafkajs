@@ -56,6 +56,13 @@ const {
   waitForCondition,
   withTimeout,
 } = require('../../consumer/__tests__/fixtures/liveScenario')
+const net = require('net')
+const { isDeepStrictEqual } = require('util')
+const { KafkaJSShareGroupsNotSupportedError } = require('../../../index')
+const { createResourceProbe } = require('../../../testHelpers/resourceProbe')
+const { FrameLog } = require('../../producer/__tests__/fixtures/liveWire')
+const { CleanupStack, describeError } = require('../../producer/__tests__/fixtures/liveProbe')
+const live = require('../../producer/__tests__/fixtures/bounded')
 
 /**
  * The 4.0 floor core: the client's core paths against the oldest supported broker line, run with
@@ -1407,6 +1414,327 @@ describeFloor('Administration and connection capabilities on the floor', () => {
     }
 
     expect(lines.map(({ case: name }) => name).sort()).toEqual(CASES)
+    for (const line of lines) expect(problemsOf(line, verified)).toEqual([])
+  })
+})
+
+const SHARE_FLOOR_TITLE = 'F23 share groups are refused on the broker floor'
+const SHARE_FLOOR_BUDGET_MS = 30000
+const SHARE_FLOOR_CLEANUP_MS = 8000
+const SHARE_FLOOR_HOOK_MS = 10000
+const SHARE_API_KEYS = [76, 78, 79]
+
+/** What the public client must throw on a floor broker that does not advertise share groups. */
+const SHARE_FLOOR_REFUSAL = {
+  reason: 'api-not-advertised',
+  apiKey: 76,
+  apiName: 'ShareGroupHeartbeat',
+  shareVersion: 0,
+}
+
+/**
+ * Logs every request frame the clients of one case write and counts their sockets and unanswered
+ * requests from the bytes actually written and read. Every byte passes through untouched.
+ */
+class FloorSocketLedger {
+  /** Starts with no sockets. */
+  constructor() {
+    this.entries = []
+    this.log = new FrameLog()
+  }
+
+  /** @returns {Function} a Kafka `socketFactory` whose sockets this ledger observes */
+  factory() {
+    return this.log.observe(({ host, port, onConnect }) => this.open(host, port, onConnect))
+  }
+
+  /**
+   * @param {string} host the broker host
+   * @param {number} port the broker port
+   * @param {Function} onConnect the client's connect callback
+   * @returns {import('net').Socket} a plaintext socket, counted
+   */
+  open(host, port, onConnect) {
+    const socket = net.connect({ host, port }, onConnect)
+    const entry = { socket, answered: 0, carry: Buffer.alloc(0) }
+    socket.on('data', (chunk) => this.read(entry, chunk))
+    this.entries.push(entry)
+    return socket
+  }
+
+  /**
+   * @param {{ answered: number, carry: Buffer }} entry the socket's bookkeeping
+   * @param {Buffer} chunk the next bytes the broker sent on it
+   * @returns {void} counts the response frames the chunk completed
+   */
+  read(entry, chunk) {
+    let bytes = Buffer.concat([entry.carry, chunk])
+    while (bytes.length >= 4 && bytes.length >= 4 + bytes.readInt32BE(0)) {
+      bytes = bytes.subarray(4 + bytes.readInt32BE(0))
+      entry.answered++
+    }
+    entry.carry = bytes
+  }
+
+  /** @returns {{ created: number, destroyed: number }} sockets opened and since destroyed */
+  counts() {
+    return {
+      created: this.entries.length,
+      destroyed: this.entries.filter(({ socket }) => socket.destroyed).length,
+    }
+  }
+
+  /** @returns {number} requests written on live sockets that have no response yet */
+  pending() {
+    return this.entries.reduce(
+      (total, { socket, answered }, index) =>
+        socket.destroyed
+          ? total
+          : total +
+            this.log.frames.filter(({ connection }) => connection === index + 1).length -
+            answered,
+      0
+    )
+  }
+
+  /** @returns {object[]} every share request frame written, with its header facts */
+  shareFrames() {
+    return this.log.frames
+      .filter(({ apiKey }) => SHARE_API_KEYS.includes(apiKey))
+      .map(({ apiKey, apiVersion, correlationId, connection }) => ({
+        apiKey,
+        version: apiVersion,
+        correlationId,
+        socketId: connection,
+      }))
+  }
+}
+
+/**
+ * @param {{ sockets: { open: number }, activeResources: Record<string, number>, listeners: Record<string, number>, queueDepth: number, ledgerSize: number }} snapshot a measurement
+ * @returns {object} the evidence form of the measurement
+ */
+const shareFloorResources = (snapshot) => ({
+  openSockets: snapshot.sockets.open,
+  timers: snapshot.activeResources.Timeout ?? 0,
+  listeners: Object.values(snapshot.listeners).reduce((sum, n) => sum + n, 0),
+  queueDepth: snapshot.queueDepth,
+  ledgerSize: snapshot.ledgerSize,
+})
+
+/**
+ * The share refusal of the floor: a public share client connects once to the 4.0.2 broker, which
+ * does not advertise the share APIs, and must be refused before it writes any share frame. It
+ * creates no topic, group or record, and leaves every measured resource where it found it.
+ */
+class FloorShareCase {
+  /** Builds a case with fresh names; nothing is created until `run`. */
+  constructor() {
+    this.nonce = secureRandom(6)
+    this.group = `floor-share-${this.nonce}`
+    this.stack = new CleanupStack()
+    this.ledger = new FloorSocketLedger()
+    this.requests = []
+    this.connects = 0
+    this.openHandlers = 0
+    this.baseline = null
+    this.after = null
+    this.probe = createResourceProbe({
+      emitters: { process },
+      sockets: () => this.ledger.counts(),
+      queueDepth: () => this.ledger.pending(),
+      ledgerSize: () => this.openHandlers,
+      activeResources: true,
+    })
+  }
+
+  /**
+   * Makes the one public connect and records the refusal, then proves the resources are back.
+   * @param {AbortSignal} scope the case scope
+   * @returns {Promise<void>}
+   * @throws {Error} the first assertion or fixture failure, with cleanup failures attached
+   */
+  async run(scope) {
+    try {
+      expect(process.env.KAFKA_VERSION).toBe('4.0.2')
+      this.baseline = await live.bounded(scope, 10000, () => this.probe.snapshot())
+      let error
+      await this.stack.run(
+        async () => {
+          error = await this.attempt(scope)
+          this.expectRefusal(error)
+        },
+        { budgetMs: SHARE_FLOOR_CLEANUP_MS }
+      )
+      await this.settle(scope)
+      this.record(error)
+    } catch (failure) {
+      writeEvidence(EVIDENCE, {
+        event: 'case-failed',
+        case: SHARE_FLOOR_TITLE,
+        scenario: this.nonce,
+        error: describeError(failure),
+        shareFrames: this.ledger.shareFrames(),
+      })
+      throw failure
+    }
+  }
+
+  /**
+   * Builds the share consumer and connects it once, capturing what connect throws before anything
+   * is asserted. Its listeners and disconnect are registered before the connect starts.
+   * @param {AbortSignal} scope the case scope
+   * @returns {Promise<Error|null>} what connect threw, or null when it resolved
+   */
+  async attempt(scope) {
+    const consumer = new Kafka({
+      clientId: `floor-share-${this.nonce}`,
+      brokers: plainTextBrokers(),
+      logLevel: logLevel.NOTHING,
+      socketFactory: this.ledger.factory(),
+    }).shareConsumer({ groupId: this.group })
+    const removers = [
+      consumer.on(consumer.events.REQUEST, ({ payload }) => this.requests.push(payload)),
+      consumer.on(consumer.events.CONNECT, () => this.connects++),
+    ]
+    this.stack.add('remove share listeners', () => removers.forEach((remove) => remove()))
+    this.stack.add('disconnect share consumer', () => consumer.disconnect({ timeout: 2000 }))
+    try {
+      await live.bounded(scope, 10000, () => consumer.connect())
+      return null
+    } catch (error) {
+      return error
+    }
+  }
+
+  /**
+   * @param {Error|null} error what connect threw
+   * @returns {void}
+   * @throws {Error} on the first property that is not the expected refusal
+   */
+  expectRefusal(error) {
+    if (error === null) {
+      throw new Error('connect resolved on a broker that does not advertise share groups')
+    }
+    expect(error).toBeInstanceOf(KafkaJSShareGroupsNotSupportedError)
+    expect(error).toBeInstanceOf(KafkaJSServerDoesNotSupportApiKey)
+    expect(error).toMatchObject({ ...SHARE_FLOOR_REFUSAL, retriable: false })
+    expect(error.message).toContain(SHARE_FLOOR_REFUSAL.reason)
+    expect(this.ledger.shareFrames()).toEqual([])
+    expect(this.connects).toBe(0)
+  }
+
+  /**
+   * Waits for the sockets and event-loop resources to be back at the baseline.
+   * @param {AbortSignal} scope the case scope
+   * @returns {Promise<void>}
+   * @throws {Error} naming the last measurement when they are not back at the deadline
+   */
+  async settle(scope) {
+    await live.pollTolerating(
+      scope,
+      8000,
+      async () => {
+        this.after = await this.probe.snapshot()
+        const same = ['sockets', 'queueDepth', 'ledgerSize', 'listeners', 'activeResources'].every(
+          (key) =>
+            isDeepStrictEqual(
+              key === 'sockets' ? this.baseline.sockets.open : this.baseline[key],
+              key === 'sockets' ? this.after.sockets.open : this.after[key]
+            )
+        )
+        if (!same) {
+          throw new Error(
+            `Resources differ: ${JSON.stringify(shareFloorResources(this.baseline))} -> ${JSON.stringify(shareFloorResources(this.after))}`
+          )
+        }
+        return true
+      },
+      { delayMs: 50, label: 'The resources returning to baseline' }
+    )
+  }
+
+  /**
+   * Writes the observation row and the single completion row of the case.
+   * @param {Error} error the refusal connect threw
+   * @returns {void}
+   */
+  record(error) {
+    const outcome = {
+      kind: 'unsupported',
+      className: error.name,
+      reason: error.reason,
+      apiKey: error.apiKey,
+      apiName: error.apiName,
+      shareVersion: error.shareVersion,
+      retriable: error.retriable,
+      message: error.message,
+    }
+    const wireVersions = wireVersionsOf(this.requests)
+    writeEvidence(EVIDENCE, { case: 'F23', outcome, shareFrames: [], wireVersions })
+    writeEvidence(EVIDENCE, {
+      event: 'case-complete',
+      case: SHARE_FLOOR_TITLE,
+      profile: 'tv2',
+      scenario: this.nonce,
+      groups: { floor: this.group },
+      budgets: { caseMs: SHARE_FLOOR_BUDGET_MS, cleanupMs: SHARE_FLOOR_CLEANUP_MS },
+      status: 'passed',
+      tainted: false,
+      connectAttempted: true,
+      outcome,
+      shareFrames: [],
+      oracles: {
+        log: { expected: [], actual: [] },
+        handler: { expected: [], actual: [] },
+        broker: [],
+      },
+      resources: {
+        before: shareFloorResources(this.baseline),
+        after: shareFloorResources(this.after),
+      },
+      cleanup: {
+        groupsAbsent: true,
+        topicsAbsent: true,
+        completedAt: Number(process.hrtime.bigint() / 1000000n),
+      },
+      wireVersions,
+      config: { line: process.env.KAFKA_VERSION },
+    })
+  }
+}
+
+describeFloor('Share groups on the broker floor', () => {
+  beforeAll(
+    () =>
+      live.bounded(live.NEVER, SHARE_FLOOR_HOOK_MS - 2000, () => {
+        live.liveRun.assertClean()
+      }),
+    SHARE_FLOOR_HOOK_MS
+  )
+
+  test(
+    SHARE_FLOOR_TITLE,
+    live.liveCase(SHARE_FLOOR_BUDGET_MS, (scope) => new FloorShareCase().run(scope)),
+    caseTimeout(SHARE_FLOOR_BUDGET_MS)
+  )
+
+  afterEach(() => {
+    if (!live.liveRun.takeAdmission()) return
+    live.liveRun.assertClean()
+  })
+
+  test('the share refusal evidence of this run carries the stamps a verifier checks', () => {
+    const lines = evidenceLines(EVIDENCE)
+      .slice(linesBefore)
+      .filter(({ case: name }) => name === 'F23' || name === SHARE_FLOOR_TITLE)
+    const verified = {
+      tree: process.env.KAFKAJS_TREE || 'unfrozen',
+      node: process.version,
+      brokerVersion: process.env.KAFKA_VERSION,
+    }
+
+    expect(lines.map(({ case: name }) => name).sort()).toEqual(['F23', SHARE_FLOOR_TITLE].sort())
     for (const line of lines) expect(problemsOf(line, verified)).toEqual([])
   })
 })
