@@ -1081,6 +1081,95 @@ describe('public share token contract', () => {
       expect(h.seen.crashes).toEqual([])
     })
 
+    test('rejects each renewal with its own outcome when routing retires a prepared caller and a queued caller', async () => {
+      let cluster
+      const routing = Cluster.prototype.onRoutingChange
+      jest.spyOn(Cluster.prototype, 'onRoutingChange').mockImplementation(function (listener) {
+        cluster = this
+        return routing.call(this, listener)
+      })
+      await start({ nodes: 2 })
+      const opened = new Set()
+      h.cluster.answer('ShareFetch', (fields, call) => {
+        if (fields.shareSessionEpoch !== 0 || opened.has(call.node))
+          return echo('ShareFetch', fields)
+        opened.add(call.node)
+        return fetchAnswer([
+          part({ partition: 0, acquire: [acquired(0, 1)], records: recordsHex(0, ['a', 'b']) }),
+        ])
+      })
+      const old = h.hold({ api: 'ShareAcknowledge', node: 0 })
+      const deliveries = []
+      const results = [[], []]
+      await run({
+        eachBatch: async ({ batch: { messages }, renew, acknowledge }) => {
+          deliveries.push(messages.map(({ offset }) => offset))
+          if (deliveries.length > 1) {
+            for (const message of messages) acknowledge(message, 'reject')
+            return
+          }
+          await Promise.all(
+            messages.map((message, index) =>
+              renew([message]).then(
+                (duration) => results[index].push(duration),
+                (error) => results[index].push(error)
+              )
+            )
+          )
+        },
+      })
+      await old.arrived()
+      expect(deliveries).toEqual([['0', '1']])
+      expect(results).toEqual([[], []])
+      expect(h.frames(79)).toHaveLength(1)
+      expect(old.call.fields.isRenewAck).toBe(true)
+      expect(batchesOf(old.call)).toEqual([
+        { firstOffset: '0', lastOffset: '0', acknowledgeTypes: [4] },
+      ])
+      await expect(
+        cluster.applyLeaderHint({ topic: 'topic-a', partition: 0, leaderId: 1, leaderEpoch: 2 })
+      ).resolves.toBe(true)
+      expect(cluster.cachedLeader('topic-a', 0)).toBe(1)
+      await until(
+        () => results.every((settled) => settled.length === 1) && h.seen.acks.length === 3,
+        'both retired callers and the new leader terminal settlement'
+      )
+      expect(results[0][0]).toMatchObject({
+        name: 'KafkaJSShareAcknowledgementError',
+        reason: 'session-lost',
+        topic: 'topic-a',
+        partition: 0,
+        ranges: [{ firstOffset: '0', lastOffset: '0' }],
+      })
+      expect(results[0][0]).toBe(h.seen.acks[0].error)
+      expect(results[1][0]).toMatchObject({
+        name: 'KafkaJSNonRetriableError',
+        message: 'Renewal targets a retired acquisition',
+      })
+      expect(deliveries).toEqual([
+        ['0', '1'],
+        ['0', '1'],
+      ])
+      expect(outcomes()).toEqual([
+        ['renew', '0', '0', 'session-lost'],
+        ['release', '0', '1', 'session-lost'],
+        ['reject', '0', '1', null],
+      ])
+      const beforeLateAnswer = [...h.seen.acks]
+      old.release(ackAnswer([{ partition: 0 }], { acquisitionLockTimeoutMs: 7777 }))
+      await flush()
+      expect(results.map((settled) => settled.length)).toEqual([1, 1])
+      expect(h.seen.acks).toEqual(beforeLateAnswer)
+      expect(h.consumer.acquisitionLockTimeoutMs()).toBe(15000)
+      expect(
+        h
+          .frames(79)
+          .filter(({ fields }) => fields.isRenewAck)
+          .map(({ node }) => node)
+      ).toEqual([0])
+      expect(h.seen.crashes).toEqual([])
+    })
+
     test('settles a renewal lost once at the disconnect deadline and ignores its late answer', async () => {
       const { held, results } = await startRenewing([oneRecord()])
       const closing = track(h.consumer.disconnect({ timeout: 400 }))

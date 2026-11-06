@@ -208,7 +208,7 @@ class ShareFetchLoop {
     this.cohorts = new Map()
     this.exchanges = new Set()
     this.renewals = new Set()
-    this.collected = null
+    this.collectingRenewal = null
     this.running = null
     this.finishing = false
     this.finishPromise = null
@@ -695,6 +695,7 @@ class ShareFetchLoop {
   }
 
   /**
+   * Prepares selected renewals and records ticket ownership for the active FIFO caller.
    * @private
    * @param {Array<{cohort: Cohort, offsets: string[]}>} [renew] Held offsets per acquisition.
    * @returns {Array<{ledger: ShareAckLedger, ticket: object, row: Cohort}>} Prepared renewal tickets.
@@ -712,7 +713,10 @@ class ShareFetchLoop {
           renewOffsets: offsets,
         })
         this.emit(results, cohort)
-        if (ticket) prepared.push({ ledger: cohort.ledger, ticket, row: cohort })
+        if (ticket) {
+          prepared.push({ ledger: cohort.ledger, ticket, row: cohort })
+          this.collectingRenewal?.prepared.add(cohort)
+        }
       }
     } catch (error) {
       this.settleAll(prepared, 'not-sent', error)
@@ -1263,41 +1267,39 @@ class ShareFetchLoop {
    * @returns {Promise<object>} The exchange result; for a renewal `lockDuration` is the new
    *   duration, or undefined when the answer kept the previous one.
    * @throws {KafkaJSShareAcknowledgementError} A failed renewal, from the ledger's compact result.
-   *   A retirement returns that same error even when it first rejects the queue's outer wait;
-   *   partition retirement rejects without waiting for the answer, while the FIFO still waits
+   *   Each caller retains only the outcomes of tickets it prepared, including when retirement
+   *   first rejects the queue's outer wait. Partition retirement rejects without waiting for
+   *   the answer, while the FIFO still waits
    *   for that request. A renewal retired before preparation has no ticket and rejects locally.
    * @throws {Error} Any other failure of the request, or the node operation's refusal while it waits.
    */
   acknowledge({ cohorts, renew } = {}) {
-    const collected = []
-    const request = this.session.enqueue(async (open) => {
-      this.collected = collected
-      try {
-        const result = await this.exchange(
-          { apiKey: apiKeys.ShareAcknowledge, kind: renew ? 'renew' : 'flush', cohorts, renew },
-          open
-        )
-        if (result.backoff) await this.pace(result)
-        return result
-      } finally {
-        if (this.collected === collected) this.collected = null
-      }
-    })
-    const failure = () =>
-      renew && collected.find((outcome) => outcome.type === 'renew' && outcome.error)?.error
     let pending
     const outcome = new Promise((resolve, reject) => {
       if (renew) {
-        pending = { renew, reject }
+        pending = { renew, reject, prepared: new Set(), error: null }
         this.renewals.add(pending)
       }
+      const request = this.session.enqueue(async (open) => {
+        this.collectingRenewal = pending
+        try {
+          const result = await this.exchange(
+            { apiKey: apiKeys.ShareAcknowledge, kind: renew ? 'renew' : 'flush', cohorts, renew },
+            open
+          )
+          if (result.backoff) await this.pace(result)
+          return result
+        } finally {
+          if (this.collectingRenewal === pending) this.collectingRenewal = null
+        }
+      })
       request.then(
         (result) => {
-          const error = failure()
+          const error = pending?.error
           if (error) reject(error)
           else resolve(result)
         },
-        (error) => reject(failure() || error)
+        (error) => reject(pending?.error || error)
       )
     })
     const cleanup = () => this.renewals.delete(pending)
@@ -1574,8 +1576,9 @@ class ShareFetchLoop {
    * @param {string} key A partition key.
    * @param {'session-lost'|'membership-lost'|'not-sent'} reason Outcome for its acquisitions.
    * @returns {void} Retires every acquisition this node holds for that partition and rejects its
-   *   pending renewal callers. The session model stays until the next fetch forgets it or a final
-   *   closes it; a late answer cannot settle the invalidated tickets again.
+   *   pending renewal callers with their own compact error, or a local refusal before preparation.
+   *   The session model stays until the next fetch forgets it or a final closes it; a late answer
+   *   cannot settle the invalidated tickets again.
    */
   retireKey(key, reason) {
     const rows = this.cohorts.get(key) || []
@@ -1584,10 +1587,12 @@ class ShareFetchLoop {
       const results = row.ledger.invalidate(reason)
       for (const pending of this.renewals) {
         if (!pending.renew.some(({ cohort }) => cohort === row)) continue
-        const error =
-          results.find((outcome) => outcome.type === 'renew')?.error ||
+        pending.error =
+          pending.error ||
+          (pending.prepared.has(row) &&
+            results.find((outcome) => outcome.type === 'renew')?.error) ||
           new KafkaJSNonRetriableError('Renewal targets a retired acquisition')
-        pending.reject(error)
+        pending.reject(pending.error)
         this.renewals.delete(pending)
       }
       this.emit(results, row)
@@ -1624,7 +1629,8 @@ class ShareFetchLoop {
   }
 
   /**
-   * Gives each compact result to `onResults` once and to an active renewal's collector.
+   * Gives each compact result to `onResults` once and retains a renewal failure only for the
+   * active caller that prepared its ticket. A queued caller owns no ticket or compact outcome.
    * @private
    * @param {object[]} results Ledger results.
    * @param {Cohort} row Their acquisition.
@@ -1632,7 +1638,9 @@ class ShareFetchLoop {
    */
   emit(results, row) {
     if (!results.length) return
-    if (this.collected) this.collected.push(...results)
+    const pending = this.collectingRenewal
+    if (pending?.prepared.has(row) && !pending.error)
+      pending.error = results.find((outcome) => outcome.type === 'renew' && outcome.error)?.error
     this.notify(this.onResults, results, row)
   }
 
