@@ -3320,6 +3320,7 @@ const lostAcceptFixture = (
 
 /**
  * Builds independent corpus, acquisition and outcome streams at the replay/unknown boundaries.
+ * Each original socket loss retains all requests outstanding on that socket.
  * @param {number} count Distinct identities to exercise.
  * @param {number} perEpisode Frozen identities in each sequential episode.
  * @param {boolean} unknown Whether to script lost Accepts instead of higher-count replays.
@@ -3405,7 +3406,11 @@ const budgetFixture = (count, perEpisode, unknown) => {
       event.socket += 2 * episode
       event.at += shift
       event.outstanding = event.outstanding.map((id) => id + 1000 * index)
-      combined.evidence.owner.tap.socketEvents.push(event)
+      const loss = combined.evidence.owner.tap.socketEvents.find(
+        ({ socket, at }) => socket === event.socket && at === event.at
+      )
+      if (loss) loss.outstanding.push(...event.outstanding)
+      else combined.evidence.owner.tap.socketEvents.push(event)
     }
     if (!combined.bounces[episode])
       combined.bounces[episode] = { ...frozen, held: new Set(), obligations: [], inFlight: [] }
@@ -3911,6 +3916,25 @@ describe('share bounce acquisition and settlement sensitivity', () => {
     }
   })
 
+  it('matches every outstanding Accept to the first shared socket loss', () => {
+    const fixture = budgetFixture(2, 2, true)
+    /** @returns {object} Candidates recomputed from the original loss and request evidence. */
+    const classify = () =>
+      settlementCandidates(
+        fixture.entries,
+        new Set(fixture.corpus),
+        fixture.bounces,
+        fixture.evidence
+      )
+    expect(classify().problems).toEqual([])
+    expect(classify().unknown.map(({ identity }) => identity)).toEqual(fixture.corpus)
+    expect(fixture.evidence.owner.tap.socketEvents).toHaveLength(1)
+    const loss = fixture.evidence.owner.tap.socketEvents[0]
+    expect(loss.outstanding).toHaveLength(2)
+    loss.outstanding.pop()
+    expect(classify().missing).toEqual([fixture.corpus[1]])
+  })
+
   it('retains carried retired unknowns without granting a new pool or episode charge', () => {
     const fixture = budgetFixture(301, 300, true)
     const result = settlementCandidates(
@@ -3920,7 +3944,7 @@ describe('share bounce acquisition and settlement sensitivity', () => {
       fixture.evidence
     )
     expect(result.perBounce).toEqual([300, 1])
-    expect(result.problems.length).toBeGreaterThan(0)
+    expect(result.problems).toContain('bounce 1 unresolved history exceeds its allowance')
     expect(fixture.bounces[1].held.size).toBe(301)
     expect(effectiveObligations(fixture.bounces[1]).size).toBe(301)
     expect(fixture.bounces[1].interruptions[0].carried).toHaveLength(300)
