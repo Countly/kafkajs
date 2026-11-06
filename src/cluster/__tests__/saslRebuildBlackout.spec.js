@@ -67,7 +67,7 @@ describe('Cluster > BrokerPool > an ILLEGAL_SASL_STATE rebuild inside an authent
     handshake.release({ errorCode: 34, enabledMechanisms: [] })
 
     await expect(connecting).rejects.toThrow(
-      /SASL authentication recently failed for node-0:9092 \(bad credentials\)/
+      'SASL authentication recently failed for node-0:9092 (SASL PLAIN authentication failed: broker=node-0:9092 stage=exchange)'
     )
     expect(node.connectionPool).not.toBe(firstPool)
     expect(node.connectionPool.authenticationBlackout).toBe(brokerPool.authenticationBlackout)

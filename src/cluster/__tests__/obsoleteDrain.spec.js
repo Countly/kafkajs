@@ -122,7 +122,10 @@ const holdBuilds = (builder) => {
 const overlap = async ({ pool, seed, builder }, older, newer) => {
   const builds = holdBuilds(builder)
   seed.metadata.mockResolvedValueOnce(older).mockResolvedValueOnce(newer)
-  const refreshing = Promise.all([pool.refreshMetadata([]), pool.refreshMetadata([])])
+  const refreshing = Promise.all([
+    pool.refreshMetadata([], { isCurrent: () => true }),
+    pool.refreshMetadata([], { isCurrent: () => true }),
+  ])
   await settled()
   expect(builds).toHaveLength(2)
   builds[0].release()
@@ -552,7 +555,10 @@ describe('Overlapping metadata refreshes', () => {
     try {
       await cluster.connect()
       gates = [seam.schedule.hold({ api: 'Metadata' }), seam.schedule.hold({ api: 'Metadata' })]
-      const refreshing = Promise.all([cluster.metadata(), cluster.metadata()])
+      const refreshing = Promise.all([
+        cluster.brokerPool.refreshMetadata([], { isCurrent: () => true }),
+        cluster.brokerPool.refreshMetadata([], { isCurrent: () => true }),
+      ])
       const records = await Promise.all(gates.map((gate) => gate.arrived()))
       const frames = []
       records.forEach(({ correlationId }, index) => {

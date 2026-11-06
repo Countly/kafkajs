@@ -1,3 +1,4 @@
+const setupPool = require('../../../testHelpers/setupPool')
 const Broker = require('../index')
 const apiKeys = require('../../protocol/requests/apiKeys')
 const { requests, lookup, selectVersion } = require('../../protocol/requests')
@@ -45,7 +46,11 @@ const createBroker = (brokerVersions = versions) => {
     setVersions: () => {},
     destroy: async () => {},
   }
-  const broker = new Broker({ connectionPool, logger: newLogger(), versions: brokerVersions })
+  const broker = new Broker({
+    connectionPool: setupPool(connectionPool),
+    logger: newLogger(),
+    versions: brokerVersions,
+  })
   broker.lookupRequest = lookup(brokerVersions)
   broker.versionsGeneration = 0
   return broker
@@ -183,18 +188,20 @@ describe('Broker > capped lookup and negotiated version', () => {
       const broker = createBroker()
       const capped = broker.lookupRequestWithMax(apiKeys.Fetch, wideFetchLikeDefinition, 12)
 
-      broker.replaceConnectionPool({
-        host: '127.0.0.1',
-        port: 9092,
-        sasl: null,
-        generation: 0,
-        connectionTimeout: 1000,
-        continueGenerationFrom: () => {},
-        isConnected: () => true,
-        isAuthenticated: () => true,
-        setVersions: () => {},
-        destroy: async () => {},
-      })
+      broker.replaceConnectionPool(
+        setupPool({
+          host: '127.0.0.1',
+          port: 9092,
+          sasl: null,
+          generation: 0,
+          connectionTimeout: 1000,
+          continueGenerationFrom: () => {},
+          isConnected: () => true,
+          isAuthenticated: () => true,
+          setVersions: () => {},
+          destroy: async () => {},
+        })
+      )
 
       // A different table, as a re-negotiation would produce.
       broker.versions = { [apiKeys.Fetch]: { minVersion: 4, maxVersion: 11 } }
@@ -238,7 +245,11 @@ describe('Broker > capped lookup and negotiated version', () => {
         },
       }
 
-      const broker = new Broker({ connectionPool, logger: newLogger(), versions })
+      const broker = new Broker({
+        connectionPool: setupPool(connectionPool),
+        logger: newLogger(),
+        versions,
+      })
       broker.lookupRequest = lookup(versions)
       broker.versionsGeneration = 0
       return { broker, sentVersions }

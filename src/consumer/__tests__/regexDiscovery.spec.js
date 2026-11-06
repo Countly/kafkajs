@@ -213,7 +213,10 @@ describe('subscription matching and metadata scope', () => {
     const scope = new Subscription()
     scope.add({ topics: [/orders/], policy: { kind: 'latest' } })
     await cluster.brokerPool.refreshMetadata(['stale-match'], { metadataScope: scope })
-    expect(broker.metadata).toHaveBeenCalledWith([], { allowAutoTopicCreation: false })
+    expect(broker.metadata).toHaveBeenCalledWith([], {
+      allowAutoTopicCreation: false,
+      guard: expect.any(Function),
+    })
     expect(scope.evaluate(response).names).toEqual([])
   })
 
@@ -293,6 +296,7 @@ describe('subscription matching and metadata scope', () => {
       await cluster.brokerPool.refreshMetadata(['old'])
       expect(cluster.brokerPool.seedBroker.metadata).toHaveBeenLastCalledWith([], {
         allowAutoTopicCreation: false,
+        guard: expect.any(Function),
       })
       expect(cluster.brokerPool.metadata).toBe(current)
       cluster.releaseConsumerMetadataScope({})

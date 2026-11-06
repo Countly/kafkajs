@@ -1,0 +1,7 @@
+{
+  "message": "DescribeClientQuotasRequest",
+  "version": 0,
+  "case": "security",
+  "hex": "00000001000475736572000009746573742d7573657200",
+  "fields": {"components":[{"entityType":"user","matchType":0,"match":"test-user"}],"strict":false}
+}

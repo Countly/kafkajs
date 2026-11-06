@@ -5,6 +5,21 @@ const apiKeys = require('../src/protocol/requests/apiKeys')
 const { logLevel } = require('../index')
 const { TOPIC, TOPIC_ID } = require('../src/consumer/__tests__/fixtures/fetchHarness')
 const { MemberAssignment } = require('../src/consumer/assignerProtocol')
+const { requests: clientRequests } = require('../src/protocol/requests')
+
+/**
+ * The ApiVersions version the client asks first: the highest it implements. A cluster that offers
+ * a lower one answers it as a broker of that version does, with a v0-shaped UNSUPPORTED_VERSION.
+ */
+const DISCOVERY_VERSION = Math.max(...clientRequests.ApiVersions.versions.map(Number))
+
+/**
+ * The fake milliseconds a connect to a profile that offers ApiVersions v4 needs before its
+ * negotiation is answered, for a test that advances fake timers: the refused v5 request and the
+ * v4 request are each answered on a later turn, and a turn scheduled while a tick runs falls one
+ * fake millisecond after the one before. The dial itself is not counted.
+ */
+const NEGOTIATION_MS = 2
 
 /**
  * The pairs the bootstrap and the classic group protocol use: the one version of each that has a
@@ -41,10 +56,44 @@ const DEFAULT = [...CLASSIC, ...PRODUCER]
  * client's own caps allow under that transaction version: a transactional Produce, EndTxn and
  * TxnOffsetCommit at v11, v4 and v4 under transaction version 1, and at v12, v5 and v5 under 2,
  * which also sends no AddPartitionsToTxn and no AddOffsetsToTxn.
- * @type {Record<'default'|'sasl'|'consumer'|'tv1'|'tv2', Array<[string, number]>>}
+ * @type {Record<'default'|'sasl'|'consumer'|'tv1'|'tv2'|'offsets'|'transactions'|'storage'|'securityAdmin'|'clusterAdmin', Array<[string, number]>>}
  */
 const PROFILES = {
+  storage: [
+    ...DEFAULT.filter(([api]) => api !== 'ListOffsets'),
+    ['ListOffsets', 11],
+    ['DescribeLogDirs', 5],
+    ['AlterReplicaLogDirs', 2],
+    ['AlterPartitionReassignments', 1],
+    ['DeleteTopics', 6],
+  ],
+  offsets: [...DEFAULT, ['OffsetDelete', 0]],
+  transactions: [
+    ...DEFAULT,
+    ['DescribeProducers', 0],
+    ['DescribeTransactions', 0],
+    ['ListTransactions', 2],
+    ['WriteTxnMarkers', 2],
+  ],
   default: DEFAULT,
+  securityAdmin: [
+    ...DEFAULT,
+    ['DescribeClientQuotas', 1],
+    ['AlterClientQuotas', 1],
+    ['DescribeUserScramCredentials', 0],
+    ['AlterUserScramCredentials', 0],
+    ['CreateDelegationToken', 3],
+    ['RenewDelegationToken', 2],
+    ['ExpireDelegationToken', 2],
+    ['DescribeDelegationToken', 3],
+  ],
+  clusterAdmin: [
+    ...DEFAULT,
+    ['ElectLeaders', 2],
+    ['UpdateFeatures', 2],
+    ['DescribeCluster', 2],
+    ['ListConfigResources', 1],
+  ],
   sasl: [...DEFAULT, ['SaslHandshake', 1], ['SaslAuthenticate', 2]],
   consumer: [
     ...DEFAULT.filter(([api]) => api !== 'OffsetFetch' && api !== 'OffsetCommit'),
@@ -86,6 +135,7 @@ const TRANSACTION_V2_FEATURES = [
  * @property {object|null} fields what the wire pair read from it; null when it could not be read
  * @property {number} order where it was written among the requests, answers and marks of the cluster
  * @property {number} [answeredOrder] where its answer was written, once it was
+ * @property {true} [discovery] set on the refused ApiVersions request `requests()` leaves out
  */
 
 /**
@@ -139,7 +189,9 @@ const reading = (what, read) => {
   try {
     return read()
   } catch (error) {
-    throw new Error(`ScriptedCluster: cannot read ${what}: ${error.message}`, { cause: error })
+    throw new Error(`ScriptedCluster: cannot read ${what}: ${error.message}`, {
+      cause: error,
+    })
   }
 }
 
@@ -178,13 +230,28 @@ const targetOf = (fields) => {
   const topic = entry.topic ?? entry.name
   const partitions = entry.partitions ?? []
   return partitions.length === 1
-    ? { topic, partition: partitions[0].partition ?? partitions[0].partitionIndex }
+    ? {
+        topic,
+        partition: partitions[0].partition ?? partitions[0].partitionIndex,
+      }
     : { topic }
 }
 
 /**
  * A cluster that exists only as sockets: the real client connects to it through its public
  * `socketFactory` option, and every request it writes is answered in process.
+ *
+ * ApiVersions discovery: the client's ApiVersions request is at the highest version it implements.
+ * When the profile offers a lower one, that request is read by the pair of the client's version
+ * and answered at once with the v0-shaped UNSUPPORTED_VERSION body of a broker that offers
+ * ApiVersions up to the profile's version; the client then asks again at that version, and that
+ * request is the one logged, scheduled and answered as any other. `requests()`, `timeline()` and
+ * the schedule leave out one such refusal per negotiation, so they see one ApiVersions request per
+ * negotiation, as they do for a broker that offers the client's version: the first request of a
+ * socket, and the one that negotiates it again after the client opened another socket to the node,
+ * which is what it does when its pool's generation changes. Any other, a second negotiation on a
+ * connection that has not changed, is answered the same way but `requests()` and `timeline()` list
+ * it. Neither kind is scheduled, and `apiVersionTrace()` lists both.
  *
  * It owns the node endpoints, the ApiVersions table of its profile, routing of each request through
  * a `Schedule` (so a test can hold, answer or fail any of them), and the log of requests. It owns
@@ -205,7 +272,7 @@ class ScriptedCluster {
    * @param {Array<{ id: number, host: string, port: number }>} options.nodes the endpoints the
    *   client may dial; a dial to any other endpoint fails
    * @param {Schedule} [options.schedule] routes the calls; one is made when omitted
-   * @param {'default'|'sasl'|'consumer'} [options.profile='default'] what the cluster advertises
+   * @param {'default'|'sasl'|'consumer'|'tv1'|'tv2'|'offsets'|'transactions'|'storage'|'securityAdmin'|'clusterAdmin'} [options.profile='default'] what the cluster advertises
    * @param {Record<string, [number, number]>} [options.advertise] `[version, version]` per API
    *   name, over the profile's: how a test makes the client negotiate another single version, the
    *   only one the cluster then accepts; a non-singleton range is rejected
@@ -220,11 +287,14 @@ class ScriptedCluster {
     this.profile = profile
     this.fake = createFakeSocketFactory()
     this.log = []
+    /** @type {Map<string, number>} sockets opened to a node when the socket last negotiated, by socket */
+    this.negotiatedAt = new Map()
     this.marks = []
     this.clock = 0
     this.errors = []
     this.answerers = new Map()
     this.downNodes = new Set()
+    this.blackholedNodes = new Set()
     this.advertised = new Map(PROFILES[profile].map(([api, version]) => [api, [version, version]]))
     for (const [api, range] of Object.entries(advertise)) {
       if (
@@ -262,6 +332,7 @@ class ScriptedCluster {
    * @returns {ScriptedCluster} this
    */
   down(id) {
+    this.blackholedNodes.delete(id)
     this.downNodes.add(id)
     return this
   }
@@ -270,8 +341,20 @@ class ScriptedCluster {
    * @param {number} id the id of a node taken down with `down`
    * @returns {ScriptedCluster} this
    */
+  /** Holds future dials without connecting; up restores them, existing sockets stay unchanged.
+   * @param {number} id node id
+   * @returns {ScriptedCluster} this
+   */
+  blackhole(id) {
+    this.downNodes.delete(id)
+    this.blackholedNodes.add(id)
+    return this
+  }
+
+  /** Restores future dials; a held old dial remains held. @param {number} id node id @returns {ScriptedCluster} this */
   up(id) {
     this.downNodes.delete(id)
+    this.blackholedNodes.delete(id)
     return this
   }
 
@@ -295,7 +378,10 @@ class ScriptedCluster {
    */
   apiVersionsAnswer() {
     return this.profile === 'tv2'
-      ? { apiKeys: this.apiVersionsTable(), finalizedFeatures: TRANSACTION_V2_FEATURES }
+      ? {
+          apiKeys: this.apiVersionsTable(),
+          finalizedFeatures: TRANSACTION_V2_FEATURES,
+        }
       : { apiKeys: this.apiVersionsTable() }
   }
 
@@ -304,9 +390,22 @@ class ScriptedCluster {
     return [...this.fake.state.sockets]
   }
 
-  /** @returns {RequestRecord[]} every request the client wrote, oldest first */
+  /**
+   * @returns {RequestRecord[]} every request the client wrote, oldest first, without the one
+   *   ApiVersions discovery request each negotiation is kept apart from (see `apiVersionTrace`)
+   */
   requests() {
-    return [...this.log]
+    return this.log.filter(({ discovery }) => !discovery)
+  }
+
+  /**
+   * @returns {RequestRecord[]} every ApiVersions request the client wrote, oldest first, the
+   *   discovery requests a lower-versioned profile refused with UNSUPPORTED_VERSION included:
+   *   `[5, 4]` per negotiation against a profile that offers v4, `[5]` against one that offers v5.
+   *   A refusal `requests()` does not list is marked `discovery: true`.
+   */
+  apiVersionTrace() {
+    return this.log.filter(({ apiKey }) => apiKey === apiKeys.ApiVersions)
   }
 
   /**
@@ -325,10 +424,29 @@ class ScriptedCluster {
    *   number, node?: number, correlationId?: number, generation?: number, label?: string }>}
    */
   timeline() {
-    const events = this.marks.map(({ order, label }) => ({ order, kind: 'mark', label }))
-    for (const { order, answeredOrder, api, version, node, correlationId, generation } of this
-      .log) {
-      events.push({ order, kind: 'request', api, version, node, correlationId, generation })
+    const events = this.marks.map(({ order, label }) => ({
+      order,
+      kind: 'mark',
+      label,
+    }))
+    for (const {
+      order,
+      answeredOrder,
+      api,
+      version,
+      node,
+      correlationId,
+      generation,
+    } of this.requests()) {
+      events.push({
+        order,
+        kind: 'request',
+        api,
+        version,
+        node,
+        correlationId,
+        generation,
+      })
       if (answeredOrder !== undefined) {
         events.push({
           order: answeredOrder,
@@ -362,6 +480,8 @@ class ScriptedCluster {
 
   /**
    * The options for `new Kafka(...)` that connect it to this cluster.
+   * Setup defaults to two minutes to tolerate coverage runner delays; Jest still bounds a hung
+   * test, and timeout tests can override this budget explicitly.
    * @param {object} [overrides]
    * @returns {object}
    */
@@ -371,8 +491,9 @@ class ScriptedCluster {
       brokers: this.nodes.map(({ host, port }) => `${host}:${port}`),
       socketFactory: this.socketFactory,
       logLevel: logLevel.NOTHING,
-      connectionTimeout: 1000,
+      connectionTimeout: 120000,
       requestTimeout: 5000,
+      connectionsMaxIdle: 0,
       ...overrides,
     }
   }
@@ -397,17 +518,20 @@ class ScriptedCluster {
       setImmediate(() => {
         refused.emit(
           'error',
-          Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' })
+          Object.assign(new Error('connect ECONNREFUSED'), {
+            code: 'ECONNREFUSED',
+          })
         )
         refused.destroy()
       })
       return refused
     }
 
+    if (this.blackholedNodes.has(node.id))
+      return this.fake.factory({ host, port, onConnect: () => {} })
+
     const socket = this.fake.factory({ host, port, onConnect })
-    const generation = this.fake.state.sockets.filter(
-      (other) => other.endpoint.host === host && other.endpoint.port === port
-    ).length
+    const generation = this.socketsOpenedTo(node)
     const write = socket.write
     socket.write = (buffer, ...rest) => {
       const result = write(buffer, ...rest)
@@ -419,18 +543,33 @@ class ScriptedCluster {
   }
 
   /**
+   * @private
+   * @param {{ host: string, port: number }} node
+   * @returns {number} how many sockets the client has opened to the node, refused dials included;
+   *   the last one's number is its `generation`
+   */
+  socketsOpenedTo({ host, port }) {
+    return this.fake.state.sockets.filter(
+      (other) => other.endpoint.host === host && other.endpoint.port === port
+    ).length
+  }
+
+  /**
    * Reads one request frame and logs it, before the request is answered or refused.
    * @private
-   * @param {{ id: number }} node the node the frame was written to
+   * @param {{ id: number, host: string, port: number }} node the node the frame was written to
    * @param {number} generation which connection of the node it came in on, counting from 1
    * @param {Buffer} frame one request, size prefix included
-   * @returns {{ record: RequestRecord, pair: WirePair }}
+   * @returns {{ record: RequestRecord, pair: WirePair, refused: boolean }} `refused` when a broker
+   *   of the profile answers it with UNSUPPORTED_VERSION
    * @throws {Error} when the frame is not one whole request the cluster advertises and has a pair
    *   for; a request whose header was read is logged with `fields: null` first
    */
   accept(node, generation, frame) {
     const header = headerOf(frame)
     const api = apiNameOf(header.apiKey)
+    const refused = this.isRefusedApiVersions(header)
+    const discovery = refused && this.opensNegotiation(node, generation)
     const record = {
       node: node.id,
       api,
@@ -439,15 +578,91 @@ class ScriptedCluster {
       correlationId: header.correlationId,
       generation,
       fields: null,
-      order: this.clock++,
+      order: discovery ? this.clock : this.clock++,
+      ...(discovery && { discovery: true }),
     }
     this.log.push(record)
 
-    const pair = this.pairFor(api, header.apiVersion)
+    const pair = refused ? pairOf(api, header.apiVersion) : this.pairFor(api, header.apiVersion)
+    if (!pair) {
+      throw new Error(`ScriptedCluster: no response builder for ${api} v${header.apiVersion}`)
+    }
+
     record.fields = reading(`the ${api} v${header.apiVersion} request`, () =>
       pair.readRequest(frame.subarray(header.byteLength))
     )
-    return { record, pair }
+    return { record, pair, refused }
+  }
+
+  /**
+   * @private
+   * @param {{ apiKey: number, apiVersion: number }} header
+   * @returns {boolean} whether the request is an ApiVersions request at the highest version the
+   *   client implements, to a profile that offers a lower one
+   */
+  isRefusedApiVersions({ apiKey, apiVersion }) {
+    const offered = this.advertised.get('ApiVersions')?.[0]
+    return (
+      apiKey === apiKeys.ApiVersions &&
+      apiVersion === DISCOVERY_VERSION &&
+      offered !== undefined &&
+      offered < DISCOVERY_VERSION
+    )
+  }
+
+  /**
+   * Whether a refused ApiVersions request is the one a negotiation is kept apart from: the first
+   * request of its socket, or the one that negotiates the socket again after another socket to the
+   * node was opened. It remembers that the socket negotiated, so a second one with nothing opened
+   * in between is not. Call it once per request, before the request is logged.
+   * @private
+   * @param {{ id: number, host: string, port: number }} node
+   * @param {number} generation which connection of the node the socket is, counting from 1
+   * @returns {boolean}
+   */
+  opensNegotiation(node, generation) {
+    const socket = `${node.id}/${generation}`
+    const opened = this.socketsOpenedTo(node)
+    const negotiatedAt = this.negotiatedAt.get(socket)
+    const opens =
+      negotiatedAt === undefined
+        ? !this.log.some((other) => other.node === node.id && other.generation === generation)
+        : negotiatedAt < opened
+    if (opens) this.negotiatedAt.set(socket, opened)
+    return opens
+  }
+
+  /**
+   * Answers a refused ApiVersions request as a broker that offers ApiVersions up to the profile's
+   * version does: UNSUPPORTED_VERSION with a v0-shaped body naming that range, on a later turn of
+   * the event loop and not at all on a socket destroyed by then. It is not scheduled and not
+   * answered by a scripted answerer: the request the client asks next is. One that `requests()`
+   * lists is marked answered, so `timeline()` shows its response.
+   * @private
+   * @param {import('events').EventEmitter} socket the socket the request came in on
+   * @param {RequestRecord} record the logged request
+   * @param {WirePair} pair the pair of the version it asked, which builds the body
+   * @returns {void}
+   */
+  refuseApiVersions(socket, record, pair) {
+    setImmediate(() => {
+      if (socket.destroyed) return
+      if (!record.discovery) record.answeredOrder = this.clock++
+      respondWithFrame(
+        { socket },
+        record.correlationId,
+        responseHeaderVersion(record.apiKey, record.version),
+        pair.buildUnsupportedVersionResponse({
+          apiKeys: [
+            {
+              apiKey: apiKeys.ApiVersions,
+              minVersion: 0,
+              maxVersion: this.advertised.get('ApiVersions')[0],
+            },
+          ],
+        })
+      )
+    })
   }
 
   /**
@@ -481,7 +696,7 @@ class ScriptedCluster {
    * loop, and not at all on a socket destroyed by then.
    * @private
    * @param {import('events').EventEmitter} socket the socket the frame came in on
-   * @param {{ id: number }} node the node it was written to
+   * @param {{ id: number, host: string, port: number }} node the node it was written to
    * @param {number} generation which connection of the node the socket is, counting from 1
    * @param {Buffer} frame exactly one request, size prefix included
    * @returns {void}
@@ -495,7 +710,12 @@ class ScriptedCluster {
       return
     }
 
-    const { record, pair } = accepted
+    const { record, pair, refused } = accepted
+    if (refused) {
+      this.refuseApiVersions(socket, record, pair)
+      return
+    }
+
     this.schedule
       .run({ ...record, ...targetOf(record.fields) }, () => this.defaultAnswer(pair, record))
       .then((answer) => (answer === undefined ? this.defaultAnswer(pair, record) : answer))
@@ -540,7 +760,12 @@ class ScriptedCluster {
         return this.apiVersionsAnswer()
       case 'Metadata':
         return {
-          brokers: this.nodes.map(({ id, host, port }) => ({ nodeId: id, host, port, rack: null })),
+          brokers: this.nodes.map(({ id, host, port }) => ({
+            nodeId: id,
+            host,
+            port,
+            rack: null,
+          })),
           controllerId: this.nodes[0].id,
           topics: [],
         }
@@ -584,7 +809,12 @@ const answerMetadata = (cluster, { topic, partitions }) => {
   const partitionIds = Array.from({ length: partitions }, (_, partition) => partition)
 
   return cluster.answer('Metadata', () => ({
-    brokers: cluster.nodes.map(({ id, host, port }) => ({ nodeId: id, host, port, rack: null })),
+    brokers: cluster.nodes.map(({ id, host, port }) => ({
+      nodeId: id,
+      host,
+      port,
+      rack: null,
+    })),
     controllerId: leader.id,
     topics: [
       {
@@ -726,7 +956,10 @@ const groupScript = (
     .answer('OffsetCommit', ({ topics }) => ({
       topics: topics.map((entry) => ({
         topic: entry.topic,
-        partitions: entry.partitions.map(({ partition }) => ({ partition, errorCode: 0 })),
+        partitions: entry.partitions.map(({ partition }) => ({
+          partition,
+          errorCode: 0,
+        })),
       })),
     }))
     .answer('LeaveGroup', ({ members }) => ({
@@ -770,14 +1003,19 @@ const consumerProtocolScript = (cluster, options = {}) => {
       heartbeatIntervalMs,
       assignment:
         memberEpoch === 0
-          ? { topicPartitions: [{ topicId: TOPIC_ID, partitions: partitionIds }] }
+          ? {
+              topicPartitions: [{ topicId: TOPIC_ID, partitions: partitionIds }],
+            }
           : null,
     }))
     .answer('OffsetFetch', ({ groupId, topics }) => ({
       groupId,
       topics: positions(
         topics ?? [
-          { topicId: TOPIC_ID, partitions: partitionIds.map((partition) => ({ partition })) },
+          {
+            topicId: TOPIC_ID,
+            partitions: partitionIds.map((partition) => ({ partition })),
+          },
         ]
       ),
     }))
@@ -822,13 +1060,19 @@ const producerScript = (cluster, { topic = TOPIC, partitions = 1 } = {}) =>
     .answer('AddPartitionsToTxn', ({ topics }) => ({
       errors: topics.map((entry) => ({
         topic: entry.topic,
-        partitionErrors: entry.partitions.map((partition) => ({ partition, errorCode: 0 })),
+        partitionErrors: entry.partitions.map((partition) => ({
+          partition,
+          errorCode: 0,
+        })),
       })),
     }))
     .answer('TxnOffsetCommit', ({ topics }) => ({
       topics: topics.map((entry) => ({
         topic: entry.topic,
-        partitions: entry.partitions.map(({ partition }) => ({ partition, errorCode: 0 })),
+        partitions: entry.partitions.map(({ partition }) => ({
+          partition,
+          errorCode: 0,
+        })),
       })),
     }))
 
@@ -845,4 +1089,5 @@ module.exports = {
   consumerProtocolScript,
   producerScript,
   PROFILES,
+  NEGOTIATION_MS,
 }

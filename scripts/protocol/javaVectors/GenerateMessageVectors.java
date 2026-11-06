@@ -1,3 +1,11 @@
+import org.apache.kafka.common.message.WriteTxnMarkersResponseData;
+import org.apache.kafka.common.message.WriteTxnMarkersRequestData;
+import org.apache.kafka.common.message.ListTransactionsResponseData;
+import org.apache.kafka.common.message.ListTransactionsRequestData;
+import org.apache.kafka.common.message.DescribeTransactionsResponseData;
+import org.apache.kafka.common.message.DescribeTransactionsRequestData;
+import org.apache.kafka.common.message.DescribeProducersResponseData;
+import org.apache.kafka.common.message.DescribeProducersRequestData;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
@@ -12,6 +20,14 @@ import java.util.UUID;
 import java.util.function.Function;
 
 import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.message.ElectLeadersRequestData;
+import org.apache.kafka.common.message.ElectLeadersResponseData;
+import org.apache.kafka.common.message.UpdateFeaturesRequestData;
+import org.apache.kafka.common.message.UpdateFeaturesResponseData;
+import org.apache.kafka.common.message.DescribeClusterRequestData;
+import org.apache.kafka.common.message.DescribeClusterResponseData;
+import org.apache.kafka.common.message.ListConfigResourcesRequestData;
+import org.apache.kafka.common.message.ListConfigResourcesResponseData;
 import org.apache.kafka.common.message.FetchRequestData;
 import org.apache.kafka.common.message.FetchResponseData;
 import org.apache.kafka.common.message.AddOffsetsToTxnRequestData;
@@ -20,6 +36,8 @@ import org.apache.kafka.common.message.AddPartitionsToTxnRequestData;
 import org.apache.kafka.common.message.AddPartitionsToTxnResponseData;
 import org.apache.kafka.common.message.AlterConfigsRequestData;
 import org.apache.kafka.common.message.AlterConfigsResponseData;
+import org.apache.kafka.common.message.ApiVersionsRequestData;
+import org.apache.kafka.common.message.ApiVersionsResponseData;
 import org.apache.kafka.common.message.ConsumerGroupDescribeRequestData;
 import org.apache.kafka.common.message.ConsumerGroupDescribeResponseData;
 import org.apache.kafka.common.message.ConsumerGroupHeartbeatRequestData;
@@ -61,6 +79,8 @@ import org.apache.kafka.common.message.ListGroupsRequestData;
 import org.apache.kafka.common.message.ListGroupsResponseData;
 import org.apache.kafka.common.message.OffsetCommitRequestData;
 import org.apache.kafka.common.message.OffsetCommitResponseData;
+import org.apache.kafka.common.message.OffsetDeleteRequestData;
+import org.apache.kafka.common.message.OffsetDeleteResponseData;
 import org.apache.kafka.common.message.OffsetFetchRequestData;
 import org.apache.kafka.common.message.OffsetFetchResponseData;
 import org.apache.kafka.common.message.SyncGroupRequestData;
@@ -70,6 +90,7 @@ import org.apache.kafka.common.message.TxnOffsetCommitResponseData;
 import org.apache.kafka.common.protocol.ByteBufferAccessor;
 import org.apache.kafka.common.protocol.Message;
 import org.apache.kafka.common.protocol.ObjectSerializationCache;
+import org.apache.kafka.common.protocol.types.RawTaggedField;
 
 /**
  * Generates golden byte vectors for the APIs the KIP-848 consumer protocol and its admin surface,
@@ -93,7 +114,7 @@ import org.apache.kafka.common.protocol.ObjectSerializationCache;
  * {@code Assignment} struct.
  *
  * <p>The transaction vectors cover the versions a client sends: AddPartitionsToTxn v2-v3 (the
- * schema reserves v4+ for brokers), AddOffsetsToTxn v2-v4, EndTxn v2-v5, TxnOffsetCommit v2-v5,
+ * schema reserves v4+ for brokers), AddOffsetsToTxn v2-v4, EndTxn v2-v5, TxnOffsetCommit v2-v6,
  * InitProducerId v3-v5 and OffsetFetch v7-v9. A field the schema gives no wire presence in a
  * version ({@code 5+}, {@code 3+}) is left out of that vector's {@code fields}: the writer drops an
  * {@code ignorable} one silently (the EndTxn response's ProducerId and ProducerEpoch below v5) and
@@ -206,6 +227,15 @@ public final class GenerateMessageVectors {
   private static final short INVALID_REQUEST = 42;
   private static final short NON_EMPTY_GROUP = 68;
   private static final short TOPIC_DELETION_DISABLED = 73;
+  private static final short GROUP_DELETION_FAILED = 134;
+
+  /** A group id and a message that are not ASCII: "gruppe-é-日本" and "résumé ✓ failed". */
+  private static final String NON_ASCII_GROUP_ID = "gruppe-\u00e9-\u65e5\u672c";
+  private static final String NON_ASCII_MESSAGE = "r\u00e9sum\u00e9 \u2713 failed";
+
+  /** The unknown tagged field the {@code unknownTags} DeleteGroups vector writes into every struct. */
+  private static final int UNKNOWN_TAG = 7;
+  private static final byte[] UNKNOWN_TAG_DATA = {(byte) 0xaa, (byte) 0xbb};
 
   /** The ACL the {@code basic} cases carry, and the same on a {@code USER} resource (v3). */
   private static final Acl TOPIC_ACL =
@@ -221,6 +251,13 @@ public final class GenerateMessageVectors {
   private static final short REBALANCE_IN_PROGRESS = 27;
   private static final short MEMBER_ID_REQUIRED = 79;
   private static final short UNKNOWN_TOPIC_ID = 100;
+  private static final short STALE_MEMBER_EPOCH = 113;
+
+  /** The first integer a double cannot tell from its neighbour: 2^53 + 1. */
+  private static final long BEYOND_SAFE_INTEGER = 9007199254740993L;
+
+  /** A committed metadata string that is not ASCII: "méta ✓ 日本". */
+  private static final String NON_ASCII_METADATA = "méta ✓ 日本";
 
   private GenerateMessageVectors() {}
 
@@ -277,6 +314,7 @@ public final class GenerateMessageVectors {
       written++;
     }
 
+    scramHiVectors(outputDir);
     System.out.println("vectors: " + written);
   }
 
@@ -331,9 +369,430 @@ public final class GenerateMessageVectors {
     }
   }
 
+  /** Generates transaction administration bodies with Apache codecs.
+   * @return vectors; all int64 fixture fields stay decimal strings
+   */
+  private static List<Vector> transactionAdmin() {
+    List<Vector> vectors = new ArrayList<>();
+vectors.add(new Vector("describeProducers", "DescribeProducersRequest", (short) 0, "basic",
+new DescribeProducersRequestData()
+.setTopics(new DescribeProducersRequestData.TopicRequestCollection(Arrays.asList(new DescribeProducersRequestData.TopicRequest()
+.setName("orders")
+.setPartitionIndexes(Arrays.asList(0, 2))).iterator())),
+"{\"topics\":[{\"topic\":\"orders\",\"partitions\":[0,2]}]}"));
+vectors.add(new Vector("describeProducers", "DescribeProducersResponse", (short) 0, "ok",
+new DescribeProducersResponseData()
+.setThrottleTimeMs(17)
+.setTopics(Arrays.asList(new DescribeProducersResponseData.TopicResponse()
+.setName("orders")
+.setPartitions(Arrays.asList(new DescribeProducersResponseData.PartitionResponse()
+.setPartitionIndex(0)
+.setErrorCode((short) 0)
+.setErrorMessage(null)
+.setActiveProducers(Arrays.asList(new DescribeProducersResponseData.ProducerState()
+.setProducerId(9007199254740993L)
+.setProducerEpoch(65537)
+.setLastSequence(23)
+.setLastTimestamp(9007199254740994L)
+.setCoordinatorEpoch(9)
+.setCurrentTxnStartOffset(-1L))), new DescribeProducersResponseData.PartitionResponse()
+.setPartitionIndex(2)
+.setErrorCode((short) 6)
+.setErrorMessage("moved")
+.setActiveProducers(Collections.emptyList()))))),
+"{\"throttleTime\":17,\"topics\":[{\"topic\":\"orders\",\"partitions\":[{\"partition\":0,\"errorCode\":0,\"errorMessage\":null,\"activeProducers\":[{\"producerId\":\"9007199254740993\",\"producerEpoch\":65537,\"lastSequence\":23,\"lastTimestamp\":\"9007199254740994\",\"coordinatorEpoch\":9,\"currentTxnStartOffset\":\"-1\"}]},{\"partition\":2,\"errorCode\":6,\"errorMessage\":\"moved\",\"activeProducers\":[]}]}]}"));
+vectors.add(new Vector("describeTransactions", "DescribeTransactionsRequest", (short) 0, "basic",
+new DescribeTransactionsRequestData()
+.setTransactionalIds(Arrays.asList("tx-a", "tx-b")),
+"{\"transactionalIds\":[\"tx-a\",\"tx-b\"]}"));
+vectors.add(new Vector("describeTransactions", "DescribeTransactionsResponse", (short) 0, "ok",
+new DescribeTransactionsResponseData()
+.setThrottleTimeMs(17)
+.setTransactionStates(Arrays.asList(new DescribeTransactionsResponseData.TransactionState()
+.setErrorCode((short) 0)
+.setTransactionalId("tx-a")
+.setTransactionState("Ongoing")
+.setTransactionTimeoutMs(60000)
+.setTransactionStartTimeMs(9007199254740994L)
+.setProducerId(9007199254740993L)
+.setProducerEpoch((short) 7)
+.setTopics(new DescribeTransactionsResponseData.TopicDataCollection(Arrays.asList(new DescribeTransactionsResponseData.TopicData()
+.setTopic("orders")
+.setPartitions(Arrays.asList(0, 2))).iterator())), new DescribeTransactionsResponseData.TransactionState()
+.setErrorCode((short) 53)
+.setTransactionalId("tx-b")
+.setTransactionState("Unknown")
+.setTransactionTimeoutMs(0)
+.setTransactionStartTimeMs(-1L)
+.setProducerId(-1L)
+.setProducerEpoch((short) -1)
+.setTopics(new DescribeTransactionsResponseData.TopicDataCollection()))),
+"{\"throttleTime\":17,\"transactions\":[{\"errorCode\":0,\"transactionalId\":\"tx-a\",\"state\":\"Ongoing\",\"timeoutMs\":60000,\"startTimeMs\":\"9007199254740994\",\"producerId\":\"9007199254740993\",\"producerEpoch\":7,\"topics\":[{\"topic\":\"orders\",\"partitions\":[0,2]}]},{\"errorCode\":53,\"transactionalId\":\"tx-b\",\"state\":\"Unknown\",\"timeoutMs\":0,\"startTimeMs\":\"-1\",\"producerId\":\"-1\",\"producerEpoch\":-1,\"topics\":[]}]}"));
+vectors.add(new Vector("listTransactions", "ListTransactionsRequest", (short) 0, "basic",
+new ListTransactionsRequestData()
+.setStateFilters(Arrays.asList("Ongoing", "FutureState"))
+.setProducerIdFilters(Arrays.asList(9007199254740993L)),
+"{\"states\":[\"Ongoing\",\"FutureState\"],\"producerIds\":[\"9007199254740993\"]}"));
+vectors.add(new Vector("listTransactions", "ListTransactionsResponse", (short) 0, "ok",
+new ListTransactionsResponseData()
+.setThrottleTimeMs(17)
+.setErrorCode((short) 0)
+.setUnknownStateFilters(Arrays.asList("FutureState"))
+.setTransactionStates(Arrays.asList(new ListTransactionsResponseData.TransactionState()
+.setTransactionalId("tx-a")
+.setProducerId(9007199254740993L)
+.setTransactionState("Ongoing"))),
+"{\"throttleTime\":17,\"errorCode\":0,\"unknownStateFilters\":[\"FutureState\"],\"transactions\":[{\"transactionalId\":\"tx-a\",\"producerId\":\"9007199254740993\",\"state\":\"Ongoing\"}]}"));
+vectors.add(new Vector("listTransactions", "ListTransactionsRequest", (short) 1, "basic",
+new ListTransactionsRequestData()
+.setStateFilters(Arrays.asList("Ongoing", "FutureState"))
+.setProducerIdFilters(Arrays.asList(9007199254740993L))
+.setDurationFilter(250L),
+"{\"states\":[\"Ongoing\",\"FutureState\"],\"producerIds\":[\"9007199254740993\"],\"durationFilter\":\"250\"}"));
+vectors.add(new Vector("listTransactions", "ListTransactionsResponse", (short) 1, "ok",
+new ListTransactionsResponseData()
+.setThrottleTimeMs(17)
+.setErrorCode((short) 0)
+.setUnknownStateFilters(Arrays.asList("FutureState"))
+.setTransactionStates(Arrays.asList(new ListTransactionsResponseData.TransactionState()
+.setTransactionalId("tx-a")
+.setProducerId(9007199254740993L)
+.setTransactionState("Ongoing"))),
+"{\"throttleTime\":17,\"errorCode\":0,\"unknownStateFilters\":[\"FutureState\"],\"transactions\":[{\"transactionalId\":\"tx-a\",\"producerId\":\"9007199254740993\",\"state\":\"Ongoing\"}]}"));
+vectors.add(new Vector("listTransactions", "ListTransactionsRequest", (short) 2, "basic",
+new ListTransactionsRequestData()
+.setStateFilters(Arrays.asList("Ongoing", "FutureState"))
+.setProducerIdFilters(Arrays.asList(9007199254740993L))
+.setDurationFilter(250L)
+.setTransactionalIdPattern("^tx-.*$"),
+"{\"states\":[\"Ongoing\",\"FutureState\"],\"producerIds\":[\"9007199254740993\"],\"durationFilter\":\"250\",\"transactionalIdPattern\":\"^tx-.*$\"}"));
+vectors.add(new Vector("listTransactions", "ListTransactionsResponse", (short) 2, "ok",
+new ListTransactionsResponseData()
+.setThrottleTimeMs(17)
+.setErrorCode((short) 0)
+.setUnknownStateFilters(Arrays.asList("FutureState"))
+.setTransactionStates(Arrays.asList(new ListTransactionsResponseData.TransactionState()
+.setTransactionalId("tx-a")
+.setProducerId(9007199254740993L)
+.setTransactionState("Ongoing"))),
+"{\"throttleTime\":17,\"errorCode\":0,\"unknownStateFilters\":[\"FutureState\"],\"transactions\":[{\"transactionalId\":\"tx-a\",\"producerId\":\"9007199254740993\",\"state\":\"Ongoing\"}]}"));
+vectors.add(new Vector("writeTxnMarkers", "WriteTxnMarkersRequest", (short) 1, "basic",
+new WriteTxnMarkersRequestData()
+.setMarkers(Arrays.asList(new WriteTxnMarkersRequestData.WritableTxnMarker()
+.setProducerId(9007199254740993L)
+.setProducerEpoch((short) 7)
+.setTransactionResult(false)
+.setTopics(Arrays.asList(new WriteTxnMarkersRequestData.WritableTxnMarkerTopic()
+.setName("orders")
+.setPartitionIndexes(Arrays.asList(2))))
+.setCoordinatorEpoch(9))),
+"{\"markers\":[{\"producerId\":\"9007199254740993\",\"producerEpoch\":7,\"transactionResult\":false,\"topics\":[{\"topic\":\"orders\",\"partitions\":[2]}],\"coordinatorEpoch\":9}]}"));
+vectors.add(new Vector("writeTxnMarkers", "WriteTxnMarkersResponse", (short) 1, "ok",
+new WriteTxnMarkersResponseData()
+.setMarkers(Arrays.asList(new WriteTxnMarkersResponseData.WritableTxnMarkerResult()
+.setProducerId(9007199254740993L)
+.setTopics(Arrays.asList(new WriteTxnMarkersResponseData.WritableTxnMarkerTopicResult()
+.setName("orders")
+.setPartitions(Arrays.asList(new WriteTxnMarkersResponseData.WritableTxnMarkerPartitionResult()
+.setPartitionIndex(2)
+.setErrorCode((short) 0))))))),
+"{\"markers\":[{\"producerId\":\"9007199254740993\",\"topics\":[{\"topic\":\"orders\",\"partitions\":[{\"partition\":2,\"errorCode\":0}]}]}]}"));
+vectors.add(new Vector("writeTxnMarkers", "WriteTxnMarkersRequest", (short) 2, "basic",
+new WriteTxnMarkersRequestData()
+.setMarkers(Arrays.asList(new WriteTxnMarkersRequestData.WritableTxnMarker()
+.setProducerId(9007199254740993L)
+.setProducerEpoch((short) 7)
+.setTransactionResult(false)
+.setTopics(Arrays.asList(new WriteTxnMarkersRequestData.WritableTxnMarkerTopic()
+.setName("orders")
+.setPartitionIndexes(Arrays.asList(2))))
+.setCoordinatorEpoch(9)
+.setTransactionVersion((byte) 0))),
+"{\"markers\":[{\"producerId\":\"9007199254740993\",\"producerEpoch\":7,\"transactionResult\":false,\"topics\":[{\"topic\":\"orders\",\"partitions\":[2]}],\"coordinatorEpoch\":9,\"transactionVersion\":0}]}"));
+vectors.add(new Vector("writeTxnMarkers", "WriteTxnMarkersResponse", (short) 2, "ok",
+new WriteTxnMarkersResponseData()
+.setMarkers(Arrays.asList(new WriteTxnMarkersResponseData.WritableTxnMarkerResult()
+.setProducerId(9007199254740993L)
+.setTopics(Arrays.asList(new WriteTxnMarkersResponseData.WritableTxnMarkerTopicResult()
+.setName("orders")
+.setPartitions(Arrays.asList(new WriteTxnMarkersResponseData.WritableTxnMarkerPartitionResult()
+.setPartitionIndex(2)
+.setErrorCode((short) 0))))))),
+"{\"markers\":[{\"producerId\":\"9007199254740993\",\"topics\":[{\"topic\":\"orders\",\"partitions\":[{\"partition\":2,\"errorCode\":0}]}]}]}"));
+vectors.add(new Vector("writeTxnMarkers", "WriteTxnMarkersRequest", (short) 2, "transactionVersionTwo",
+new WriteTxnMarkersRequestData()
+.setMarkers(Arrays.asList(new WriteTxnMarkersRequestData.WritableTxnMarker()
+.setProducerId(9007199254740993L)
+.setProducerEpoch((short) 7)
+.setTransactionResult(false)
+.setTopics(Arrays.asList(new WriteTxnMarkersRequestData.WritableTxnMarkerTopic()
+.setName("orders")
+.setPartitionIndexes(Arrays.asList(2))))
+.setCoordinatorEpoch(9)
+.setTransactionVersion((byte) 2))),
+"{\"markers\":[{\"producerId\":\"9007199254740993\",\"producerEpoch\":7,\"transactionResult\":false,\"topics\":[{\"topic\":\"orders\",\"partitions\":[2]}],\"coordinatorEpoch\":9,\"transactionVersion\":2}]}"));
+vectors.add(new Vector("writeTxnMarkers", "WriteTxnMarkersResponse", (short) 2, "error47",
+new WriteTxnMarkersResponseData()
+.setMarkers(Arrays.asList(new WriteTxnMarkersResponseData.WritableTxnMarkerResult()
+.setProducerId(9007199254740993L)
+.setTopics(Arrays.asList(new WriteTxnMarkersResponseData.WritableTxnMarkerTopicResult()
+.setName("orders")
+.setPartitions(Arrays.asList(new WriteTxnMarkersResponseData.WritableTxnMarkerPartitionResult()
+.setPartitionIndex(2)
+.setErrorCode((short) 47))))))),
+"{\"markers\":[{\"producerId\":\"9007199254740993\",\"topics\":[{\"topic\":\"orders\",\"partitions\":[{\"partition\":2,\"errorCode\":47}]}]}]}"));
+vectors.add(new Vector("writeTxnMarkers", "WriteTxnMarkersResponse", (short) 2, "error52",
+new WriteTxnMarkersResponseData()
+.setMarkers(Arrays.asList(new WriteTxnMarkersResponseData.WritableTxnMarkerResult()
+.setProducerId(9007199254740993L)
+.setTopics(Arrays.asList(new WriteTxnMarkersResponseData.WritableTxnMarkerTopicResult()
+.setName("orders")
+.setPartitions(Arrays.asList(new WriteTxnMarkersResponseData.WritableTxnMarkerPartitionResult()
+.setPartitionIndex(2)
+.setErrorCode((short) 52))))))),
+"{\"markers\":[{\"producerId\":\"9007199254740993\",\"topics\":[{\"topic\":\"orders\",\"partitions\":[{\"partition\":2,\"errorCode\":52}]}]}]}"));
+vectors.add(new Vector("writeTxnMarkers", "WriteTxnMarkersResponse", (short) 2, "error31",
+new WriteTxnMarkersResponseData()
+.setMarkers(Arrays.asList(new WriteTxnMarkersResponseData.WritableTxnMarkerResult()
+.setProducerId(9007199254740993L)
+.setTopics(Arrays.asList(new WriteTxnMarkersResponseData.WritableTxnMarkerTopicResult()
+.setName("orders")
+.setPartitions(Arrays.asList(new WriteTxnMarkersResponseData.WritableTxnMarkerPartitionResult()
+.setPartitionIndex(2)
+.setErrorCode((short) 31))))))),
+"{\"markers\":[{\"producerId\":\"9007199254740993\",\"topics\":[{\"topic\":\"orders\",\"partitions\":[{\"partition\":2,\"errorCode\":31}]}]}]}"));
+return vectors;
+}
+
+  /** Generates cluster/config bodies using Apache codecs before registry wiring.
+   * @return independent bodies; the expected fields are explicit literals
+   */
+  private static List<Vector> clusterResources() {
+    List<Vector> vectors=new ArrayList<>();
+vectors.add(new Vector("electLeaders","ElectLeadersRequest",(short) 0,"basic",
+new ElectLeadersRequestData()
+.setTopicPartitions(new ElectLeadersRequestData.TopicPartitionsCollection(Arrays.asList(new ElectLeadersRequestData.TopicPartitions()
+.setTopic("orders")
+.setPartitions(Arrays.asList(0, 2))).iterator()))
+.setTimeoutMs(60000),
+"{\"topicPartitions\":[{\"topic\":\"orders\",\"partitions\":[0,2]}],\"timeoutMs\":60000}"));
+vectors.add(new Vector("electLeaders","ElectLeadersResponse",(short) 0,"mixed",
+new ElectLeadersResponseData()
+.setThrottleTimeMs(17)
+.setReplicaElectionResults(Arrays.asList(new ElectLeadersResponseData.ReplicaElectionResult()
+.setTopic("orders")
+.setPartitionResult(Arrays.asList(new ElectLeadersResponseData.PartitionResult()
+.setPartitionId(0)
+.setErrorCode((short) 84)
+.setErrorMessage(null), new ElectLeadersResponseData.PartitionResult()
+.setPartitionId(2)
+.setErrorCode((short) 80)
+.setErrorMessage("no replica"))))),
+"{\"throttleTimeMs\":17,\"replicaElectionResults\":[{\"topic\":\"orders\",\"partitionResult\":[{\"partitionId\":0,\"errorCode\":84,\"errorMessage\":null},{\"partitionId\":2,\"errorCode\":80,\"errorMessage\":\"no replica\"}]}]}"));
+vectors.add(new Vector("electLeaders","ElectLeadersRequest",(short) 0,"all",
+new ElectLeadersRequestData()
+.setTopicPartitions(null)
+.setTimeoutMs(60000),
+"{\"topicPartitions\":null,\"timeoutMs\":60000}"));
+vectors.add(new Vector("electLeaders","ElectLeadersRequest",(short) 1,"basic",
+new ElectLeadersRequestData()
+.setElectionType((byte) 1)
+.setTopicPartitions(new ElectLeadersRequestData.TopicPartitionsCollection(Arrays.asList(new ElectLeadersRequestData.TopicPartitions()
+.setTopic("orders")
+.setPartitions(Arrays.asList(0, 2))).iterator()))
+.setTimeoutMs(60000),
+"{\"electionType\":1,\"topicPartitions\":[{\"topic\":\"orders\",\"partitions\":[0,2]}],\"timeoutMs\":60000}"));
+vectors.add(new Vector("electLeaders","ElectLeadersResponse",(short) 1,"mixed",
+new ElectLeadersResponseData()
+.setThrottleTimeMs(17)
+.setErrorCode((short) 0)
+.setReplicaElectionResults(Arrays.asList(new ElectLeadersResponseData.ReplicaElectionResult()
+.setTopic("orders")
+.setPartitionResult(Arrays.asList(new ElectLeadersResponseData.PartitionResult()
+.setPartitionId(0)
+.setErrorCode((short) 84)
+.setErrorMessage(null), new ElectLeadersResponseData.PartitionResult()
+.setPartitionId(2)
+.setErrorCode((short) 80)
+.setErrorMessage("no replica"))))),
+"{\"throttleTimeMs\":17,\"errorCode\":0,\"replicaElectionResults\":[{\"topic\":\"orders\",\"partitionResult\":[{\"partitionId\":0,\"errorCode\":84,\"errorMessage\":null},{\"partitionId\":2,\"errorCode\":80,\"errorMessage\":\"no replica\"}]}]}"));
+vectors.add(new Vector("electLeaders","ElectLeadersRequest",(short) 1,"all",
+new ElectLeadersRequestData()
+.setElectionType((byte) 1)
+.setTopicPartitions(null)
+.setTimeoutMs(60000),
+"{\"electionType\":1,\"topicPartitions\":null,\"timeoutMs\":60000}"));
+vectors.add(new Vector("electLeaders","ElectLeadersRequest",(short) 2,"basic",
+new ElectLeadersRequestData()
+.setElectionType((byte) 1)
+.setTopicPartitions(new ElectLeadersRequestData.TopicPartitionsCollection(Arrays.asList(new ElectLeadersRequestData.TopicPartitions()
+.setTopic("orders")
+.setPartitions(Arrays.asList(0, 2))).iterator()))
+.setTimeoutMs(60000),
+"{\"electionType\":1,\"topicPartitions\":[{\"topic\":\"orders\",\"partitions\":[0,2]}],\"timeoutMs\":60000}"));
+vectors.add(new Vector("electLeaders","ElectLeadersResponse",(short) 2,"mixed",
+new ElectLeadersResponseData()
+.setThrottleTimeMs(17)
+.setErrorCode((short) 0)
+.setReplicaElectionResults(Arrays.asList(new ElectLeadersResponseData.ReplicaElectionResult()
+.setTopic("orders")
+.setPartitionResult(Arrays.asList(new ElectLeadersResponseData.PartitionResult()
+.setPartitionId(0)
+.setErrorCode((short) 84)
+.setErrorMessage(null), new ElectLeadersResponseData.PartitionResult()
+.setPartitionId(2)
+.setErrorCode((short) 80)
+.setErrorMessage("no replica"))))),
+"{\"throttleTimeMs\":17,\"errorCode\":0,\"replicaElectionResults\":[{\"topic\":\"orders\",\"partitionResult\":[{\"partitionId\":0,\"errorCode\":84,\"errorMessage\":null},{\"partitionId\":2,\"errorCode\":80,\"errorMessage\":\"no replica\"}]}]}"));
+vectors.add(new Vector("electLeaders","ElectLeadersRequest",(short) 2,"all",
+new ElectLeadersRequestData()
+.setElectionType((byte) 1)
+.setTopicPartitions(null)
+.setTimeoutMs(60000),
+"{\"electionType\":1,\"topicPartitions\":null,\"timeoutMs\":60000}"));
+vectors.add(new Vector("updateFeatures","UpdateFeaturesRequest",(short) 0,"basic",
+new UpdateFeaturesRequestData()
+.setTimeoutMs(60000)
+.setFeatureUpdates(new UpdateFeaturesRequestData.FeatureUpdateKeyCollection(Arrays.asList(new UpdateFeaturesRequestData.FeatureUpdateKey()
+.setFeature("metadata.version")
+.setMaxVersionLevel((short) 25)
+.setAllowDowngrade(false)).iterator())),
+"{\"timeoutMs\":60000,\"featureUpdates\":[{\"feature\":\"metadata.version\",\"maxVersionLevel\":25,\"allowDowngrade\":false}]}"));
+vectors.add(new Vector("updateFeatures","UpdateFeaturesResponse",(short) 0,"mixed",
+new UpdateFeaturesResponseData()
+.setThrottleTimeMs(17)
+.setErrorCode((short) 0)
+.setErrorMessage(null)
+.setResults(new UpdateFeaturesResponseData.UpdatableFeatureResultCollection(Arrays.asList(new UpdateFeaturesResponseData.UpdatableFeatureResult()
+.setFeature("metadata.version")
+.setErrorCode((short) 42)
+.setErrorMessage("invalid feature")).iterator())),
+"{\"throttleTimeMs\":17,\"errorCode\":0,\"errorMessage\":null,\"results\":[{\"feature\":\"metadata.version\",\"errorCode\":42,\"errorMessage\":\"invalid feature\"}]}"));
+vectors.add(new Vector("updateFeatures","UpdateFeaturesRequest",(short) 1,"basic",
+new UpdateFeaturesRequestData()
+.setTimeoutMs(60000)
+.setFeatureUpdates(new UpdateFeaturesRequestData.FeatureUpdateKeyCollection(Arrays.asList(new UpdateFeaturesRequestData.FeatureUpdateKey()
+.setFeature("metadata.version")
+.setMaxVersionLevel((short) 25)
+.setUpgradeType((byte) 2)).iterator()))
+.setValidateOnly(true),
+"{\"timeoutMs\":60000,\"featureUpdates\":[{\"feature\":\"metadata.version\",\"maxVersionLevel\":25,\"upgradeType\":2}],\"validateOnly\":true}"));
+vectors.add(new Vector("updateFeatures","UpdateFeaturesResponse",(short) 1,"mixed",
+new UpdateFeaturesResponseData()
+.setThrottleTimeMs(17)
+.setErrorCode((short) 0)
+.setErrorMessage(null)
+.setResults(new UpdateFeaturesResponseData.UpdatableFeatureResultCollection(Arrays.asList(new UpdateFeaturesResponseData.UpdatableFeatureResult()
+.setFeature("metadata.version")
+.setErrorCode((short) 42)
+.setErrorMessage("invalid feature")).iterator())),
+"{\"throttleTimeMs\":17,\"errorCode\":0,\"errorMessage\":null,\"results\":[{\"feature\":\"metadata.version\",\"errorCode\":42,\"errorMessage\":\"invalid feature\"}]}"));
+vectors.add(new Vector("updateFeatures","UpdateFeaturesRequest",(short) 2,"basic",
+new UpdateFeaturesRequestData()
+.setTimeoutMs(60000)
+.setFeatureUpdates(new UpdateFeaturesRequestData.FeatureUpdateKeyCollection(Arrays.asList(new UpdateFeaturesRequestData.FeatureUpdateKey()
+.setFeature("metadata.version")
+.setMaxVersionLevel((short) 25)
+.setUpgradeType((byte) 2)).iterator()))
+.setValidateOnly(true),
+"{\"timeoutMs\":60000,\"featureUpdates\":[{\"feature\":\"metadata.version\",\"maxVersionLevel\":25,\"upgradeType\":2}],\"validateOnly\":true}"));
+vectors.add(new Vector("updateFeatures","UpdateFeaturesResponse",(short) 2,"mixed",
+new UpdateFeaturesResponseData()
+.setThrottleTimeMs(17)
+.setErrorCode((short) 0)
+.setErrorMessage(null),
+"{\"throttleTimeMs\":17,\"errorCode\":0,\"errorMessage\":null}"));
+vectors.add(new Vector("describeCluster","DescribeClusterRequest",(short) 0,"basic",
+new DescribeClusterRequestData()
+.setIncludeClusterAuthorizedOperations(true),
+"{\"includeClusterAuthorizedOperations\":true}"));
+vectors.add(new Vector("describeCluster","DescribeClusterResponse",(short) 0,"mixed",
+new DescribeClusterResponseData()
+.setThrottleTimeMs(17)
+.setErrorCode((short) 0)
+.setErrorMessage(null)
+.setClusterId("cluster-a")
+.setControllerId(-1)
+.setBrokers(new DescribeClusterResponseData.DescribeClusterBrokerCollection(Arrays.asList(new DescribeClusterResponseData.DescribeClusterBroker()
+.setBrokerId(1)
+.setHost("localhost")
+.setPort(9092)
+.setRack(null)).iterator()))
+.setClusterAuthorizedOperations(-2147483648),
+"{\"throttleTimeMs\":17,\"errorCode\":0,\"errorMessage\":null,\"clusterId\":\"cluster-a\",\"controllerId\":-1,\"brokers\":[{\"brokerId\":1,\"host\":\"localhost\",\"port\":9092,\"rack\":null}],\"clusterAuthorizedOperations\":-2147483648}"));
+vectors.add(new Vector("describeCluster","DescribeClusterRequest",(short) 1,"basic",
+new DescribeClusterRequestData()
+.setIncludeClusterAuthorizedOperations(true)
+.setEndpointType((byte) 1),
+"{\"includeClusterAuthorizedOperations\":true,\"endpointType\":1}"));
+vectors.add(new Vector("describeCluster","DescribeClusterResponse",(short) 1,"mixed",
+new DescribeClusterResponseData()
+.setThrottleTimeMs(17)
+.setErrorCode((short) 0)
+.setErrorMessage(null)
+.setEndpointType((byte) 1)
+.setClusterId("cluster-a")
+.setControllerId(-1)
+.setBrokers(new DescribeClusterResponseData.DescribeClusterBrokerCollection(Arrays.asList(new DescribeClusterResponseData.DescribeClusterBroker()
+.setBrokerId(1)
+.setHost("localhost")
+.setPort(9092)
+.setRack(null)).iterator()))
+.setClusterAuthorizedOperations(-2147483648),
+"{\"throttleTimeMs\":17,\"errorCode\":0,\"errorMessage\":null,\"endpointType\":1,\"clusterId\":\"cluster-a\",\"controllerId\":-1,\"brokers\":[{\"brokerId\":1,\"host\":\"localhost\",\"port\":9092,\"rack\":null}],\"clusterAuthorizedOperations\":-2147483648}"));
+vectors.add(new Vector("describeCluster","DescribeClusterRequest",(short) 2,"basic",
+new DescribeClusterRequestData()
+.setIncludeClusterAuthorizedOperations(true)
+.setEndpointType((byte) 1)
+.setIncludeFencedBrokers(true),
+"{\"includeClusterAuthorizedOperations\":true,\"endpointType\":1,\"includeFencedBrokers\":true}"));
+vectors.add(new Vector("describeCluster","DescribeClusterResponse",(short) 2,"mixed",
+new DescribeClusterResponseData()
+.setThrottleTimeMs(17)
+.setErrorCode((short) 0)
+.setErrorMessage(null)
+.setEndpointType((byte) 1)
+.setClusterId("cluster-a")
+.setControllerId(-1)
+.setBrokers(new DescribeClusterResponseData.DescribeClusterBrokerCollection(Arrays.asList(new DescribeClusterResponseData.DescribeClusterBroker()
+.setBrokerId(1)
+.setHost("localhost")
+.setPort(9092)
+.setRack(null)
+.setIsFenced(true)).iterator()))
+.setClusterAuthorizedOperations(-2147483648),
+"{\"throttleTimeMs\":17,\"errorCode\":0,\"errorMessage\":null,\"endpointType\":1,\"clusterId\":\"cluster-a\",\"controllerId\":-1,\"brokers\":[{\"brokerId\":1,\"host\":\"localhost\",\"port\":9092,\"rack\":null,\"isFenced\":true}],\"clusterAuthorizedOperations\":-2147483648}"));
+vectors.add(new Vector("listConfigResources","ListConfigResourcesRequest",(short) 0,"basic",
+new ListConfigResourcesRequestData(),
+"{}"));
+vectors.add(new Vector("listConfigResources","ListConfigResourcesResponse",(short) 0,"mixed",
+new ListConfigResourcesResponseData()
+.setThrottleTimeMs(17)
+.setErrorCode((short) 0)
+.setConfigResources(Arrays.asList(new ListConfigResourcesResponseData.ConfigResource()
+.setResourceName("subscription"))),
+"{\"throttleTimeMs\":17,\"errorCode\":0,\"configResources\":[{\"resourceName\":\"subscription\"}]}"));
+vectors.add(new Vector("listConfigResources","ListConfigResourcesRequest",(short) 1,"basic",
+new ListConfigResourcesRequestData()
+.setResourceTypes(Arrays.asList((byte) 16, (byte) 32)),
+"{\"resourceTypes\":[16,32]}"));
+vectors.add(new Vector("listConfigResources","ListConfigResourcesResponse",(short) 1,"mixed",
+new ListConfigResourcesResponseData()
+.setThrottleTimeMs(17)
+.setErrorCode((short) 0)
+.setConfigResources(Arrays.asList(new ListConfigResourcesResponseData.ConfigResource()
+.setResourceName("subscription")
+.setResourceType((byte) 16))),
+"{\"throttleTimeMs\":17,\"errorCode\":0,\"configResources\":[{\"resourceName\":\"subscription\",\"resourceType\":16}]}"));
+    return vectors;
+  }
+
   /** @return every vector this generator emits, in file order per API */
   private static List<Vector> vectors() {
+    List<Vector> transactionVectors = transactionAdmin();
     List<Vector> vectors = new ArrayList<>();
+    vectors.addAll(transactionVectors);
+    vectors.addAll(clusterResources());
     vectors.addAll(consumerGroupHeartbeat());
     vectors.addAll(consumerGroupDescribe());
     vectors.addAll(listGroups());
@@ -341,6 +800,8 @@ public final class GenerateMessageVectors {
     vectors.addAll(offsetCommit());
     vectors.addAll(fetchSessions());
     vectors.addAll(offsetFetch());
+    vectors.addAll(offsetAdmin());
+    vectors.addAll(storageAdmin());
     vectors.addAll(offsetFetchRequireStable());
     vectors.addAll(offsetFetchIdentity());
     vectors.addAll(initProducerId());
@@ -348,6 +809,7 @@ public final class GenerateMessageVectors {
     vectors.addAll(addOffsetsToTxn());
     vectors.addAll(endTxn());
     vectors.addAll(txnOffsetCommit());
+    vectors.addAll(txnOffsetCommitByTopicId());
     vectors.addAll(incrementalAlterConfigs());
     vectors.addAll(describeConfigs());
     vectors.addAll(alterConfigs());
@@ -356,12 +818,15 @@ public final class GenerateMessageVectors {
     vectors.addAll(createPartitions());
     vectors.addAll(deleteRecords());
     vectors.addAll(deleteGroups());
+    vectors.addAll(apiVersions());
     vectors.addAll(acls());
     vectors.addAll(describeTopicPartitions());
     vectors.addAll(joinGroup());
     vectors.addAll(syncGroup());
     vectors.addAll(heartbeat());
     vectors.addAll(leaveGroup());
+    vectors.addAll(quotaScramAdmin());
+    vectors.addAll(delegationTokenAdmin());
     vectors.addAll(offsetCommitByTopicId());
     vectors.addAll(offsetFetchByTopicId());
     return vectors;
@@ -1443,6 +1908,113 @@ public final class GenerateMessageVectors {
                                 kv("errorCode", "0"))))))));
   }
 
+
+  /** Builds an upstream generated message from fixed setter names, adapting generated collections.
+   * @param name generated class suffix
+   * @param fields setter suffix/value pairs
+   * @return independent generated Message, never a client codec
+   */
+  private static Message storageData(String name, Object[][] fields) {
+    try {
+      Class<?> type = Class.forName("org.apache.kafka.common.message." + name);
+      Object data = type.getDeclaredConstructor().newInstance();
+      for (Object[] field : fields) {
+        java.lang.reflect.Method setter = Arrays.stream(type.getMethods())
+            .filter(m -> m.getName().equals("set" + field[0]) && m.getParameterCount() == 1)
+            .findFirst().orElseThrow();
+        Class<?> target = setter.getParameterTypes()[0];
+        Object value = field[1];
+        if (value instanceof Number number) {
+          if (target == short.class) value = number.shortValue();
+          else if (target == byte.class) value = number.byteValue();
+          else if (target == int.class) value = number.intValue();
+          else if (target == long.class) value = number.longValue();
+        }
+        if (value instanceof List<?> list && !target.isInstance(value)) {
+          @SuppressWarnings("unchecked")
+          java.util.Collection<Object> collection = (java.util.Collection<Object>) target.getDeclaredConstructor().newInstance();
+          collection.addAll(list); value = collection;
+        }
+        setter.invoke(data, value);
+      }
+      return (Message) data;
+    } catch (ReflectiveOperationException error) { throw new IllegalStateException(name, error); }
+  }
+
+  /** @return fixed storage-admin vectors for every implemented new version, in both directions */
+  private static List<Vector> storageAdmin() {
+    List<Vector> out = new ArrayList<>();
+    out.add(new Vector("describeLogDirs", "DescribeLogDirsRequest", (short)1, "storage", storageData("DescribeLogDirsRequestData", new Object[][]{{"Topics",List.of(storageData("DescribeLogDirsRequestData$DescribableLogDirTopic", new Object[][]{{"Topic","t"},{"Partitions",List.of(0)}}))}}), "{\"topics\":[{\"topic\":\"t\",\"partitions\":[0]}]}"));
+    out.add(new Vector("describeLogDirs", "DescribeLogDirsResponse", (short)1, "storage", storageData("DescribeLogDirsResponseData", new Object[][]{{"ThrottleTimeMs",17},{"Results",List.of(storageData("DescribeLogDirsResponseData$DescribeLogDirsResult", new Object[][]{{"ErrorCode",0},{"LogDir","/data/a"},{"Topics",List.of(storageData("DescribeLogDirsResponseData$DescribeLogDirsTopic", new Object[][]{{"Name","t"},{"Partitions",List.of(storageData("DescribeLogDirsResponseData$DescribeLogDirsPartition", new Object[][]{{"PartitionIndex",0},{"PartitionSize",9007199254740993L},{"OffsetLag",2L},{"IsFutureKey",true}}))}}))}}))}}), "{\"throttleTime\":17,\"errorCode\":0,\"logDirs\":[{\"errorCode\":0,\"path\":\"/data/a\",\"topics\":[{\"topic\":\"t\",\"partitions\":[{\"partition\":0,\"size\":\"9007199254740993\",\"offsetLag\":\"2\",\"isFuture\":true}]}]}]}"));
+    out.add(new Vector("describeLogDirs", "DescribeLogDirsRequest", (short)2, "storage", storageData("DescribeLogDirsRequestData", new Object[][]{{"Topics",List.of(storageData("DescribeLogDirsRequestData$DescribableLogDirTopic", new Object[][]{{"Topic","t"},{"Partitions",List.of(0)}}))}}), "{\"topics\":[{\"topic\":\"t\",\"partitions\":[0]}]}"));
+    out.add(new Vector("describeLogDirs", "DescribeLogDirsResponse", (short)2, "storage", storageData("DescribeLogDirsResponseData", new Object[][]{{"ThrottleTimeMs",17},{"Results",List.of(storageData("DescribeLogDirsResponseData$DescribeLogDirsResult", new Object[][]{{"ErrorCode",0},{"LogDir","/data/a"},{"Topics",List.of(storageData("DescribeLogDirsResponseData$DescribeLogDirsTopic", new Object[][]{{"Name","t"},{"Partitions",List.of(storageData("DescribeLogDirsResponseData$DescribeLogDirsPartition", new Object[][]{{"PartitionIndex",0},{"PartitionSize",9007199254740993L},{"OffsetLag",2L},{"IsFutureKey",true}}))}}))}}))}}), "{\"throttleTime\":17,\"errorCode\":0,\"logDirs\":[{\"errorCode\":0,\"path\":\"/data/a\",\"topics\":[{\"topic\":\"t\",\"partitions\":[{\"partition\":0,\"size\":\"9007199254740993\",\"offsetLag\":\"2\",\"isFuture\":true}]}]}]}"));
+    out.add(new Vector("describeLogDirs", "DescribeLogDirsRequest", (short)3, "storage", storageData("DescribeLogDirsRequestData", new Object[][]{{"Topics",List.of(storageData("DescribeLogDirsRequestData$DescribableLogDirTopic", new Object[][]{{"Topic","t"},{"Partitions",List.of(0)}}))}}), "{\"topics\":[{\"topic\":\"t\",\"partitions\":[0]}]}"));
+    out.add(new Vector("describeLogDirs", "DescribeLogDirsResponse", (short)3, "storage", storageData("DescribeLogDirsResponseData", new Object[][]{{"ThrottleTimeMs",17},{"ErrorCode",0},{"Results",List.of(storageData("DescribeLogDirsResponseData$DescribeLogDirsResult", new Object[][]{{"ErrorCode",0},{"LogDir","/data/a"},{"Topics",List.of(storageData("DescribeLogDirsResponseData$DescribeLogDirsTopic", new Object[][]{{"Name","t"},{"Partitions",List.of(storageData("DescribeLogDirsResponseData$DescribeLogDirsPartition", new Object[][]{{"PartitionIndex",0},{"PartitionSize",9007199254740993L},{"OffsetLag",2L},{"IsFutureKey",true}}))}}))}}))}}), "{\"throttleTime\":17,\"errorCode\":0,\"logDirs\":[{\"errorCode\":0,\"path\":\"/data/a\",\"topics\":[{\"topic\":\"t\",\"partitions\":[{\"partition\":0,\"size\":\"9007199254740993\",\"offsetLag\":\"2\",\"isFuture\":true}]}]}]}"));
+    out.add(new Vector("describeLogDirs", "DescribeLogDirsRequest", (short)4, "storage", storageData("DescribeLogDirsRequestData", new Object[][]{{"Topics",List.of(storageData("DescribeLogDirsRequestData$DescribableLogDirTopic", new Object[][]{{"Topic","t"},{"Partitions",List.of(0)}}))}}), "{\"topics\":[{\"topic\":\"t\",\"partitions\":[0]}]}"));
+    out.add(new Vector("describeLogDirs", "DescribeLogDirsResponse", (short)4, "storage", storageData("DescribeLogDirsResponseData", new Object[][]{{"ThrottleTimeMs",17},{"ErrorCode",0},{"Results",List.of(storageData("DescribeLogDirsResponseData$DescribeLogDirsResult", new Object[][]{{"ErrorCode",0},{"LogDir","/data/a"},{"Topics",List.of(storageData("DescribeLogDirsResponseData$DescribeLogDirsTopic", new Object[][]{{"Name","t"},{"Partitions",List.of(storageData("DescribeLogDirsResponseData$DescribeLogDirsPartition", new Object[][]{{"PartitionIndex",0},{"PartitionSize",9007199254740993L},{"OffsetLag",2L},{"IsFutureKey",true}}))}}))},{"TotalBytes",9007199254740995L},{"UsableBytes",9007199254740994L}}))}}), "{\"throttleTime\":17,\"errorCode\":0,\"logDirs\":[{\"errorCode\":0,\"path\":\"/data/a\",\"topics\":[{\"topic\":\"t\",\"partitions\":[{\"partition\":0,\"size\":\"9007199254740993\",\"offsetLag\":\"2\",\"isFuture\":true}]}],\"totalBytes\":\"9007199254740995\",\"usableBytes\":\"9007199254740994\"}]}"));
+    out.add(new Vector("describeLogDirs", "DescribeLogDirsRequest", (short)5, "storage", storageData("DescribeLogDirsRequestData", new Object[][]{{"Topics",List.of(storageData("DescribeLogDirsRequestData$DescribableLogDirTopic", new Object[][]{{"Topic","t"},{"Partitions",List.of(0)}}))}}), "{\"topics\":[{\"topic\":\"t\",\"partitions\":[0]}]}"));
+    out.add(new Vector("describeLogDirs", "DescribeLogDirsResponse", (short)5, "storage", storageData("DescribeLogDirsResponseData", new Object[][]{{"ThrottleTimeMs",17},{"ErrorCode",0},{"Results",List.of(storageData("DescribeLogDirsResponseData$DescribeLogDirsResult", new Object[][]{{"ErrorCode",0},{"LogDir","/data/a"},{"Topics",List.of(storageData("DescribeLogDirsResponseData$DescribeLogDirsTopic", new Object[][]{{"Name","t"},{"Partitions",List.of(storageData("DescribeLogDirsResponseData$DescribeLogDirsPartition", new Object[][]{{"PartitionIndex",0},{"PartitionSize",9007199254740993L},{"OffsetLag",2L},{"IsFutureKey",true}}))}}))},{"TotalBytes",9007199254740995L},{"UsableBytes",9007199254740994L},{"IsCordoned",true}}))}}), "{\"throttleTime\":17,\"errorCode\":0,\"logDirs\":[{\"errorCode\":0,\"path\":\"/data/a\",\"topics\":[{\"topic\":\"t\",\"partitions\":[{\"partition\":0,\"size\":\"9007199254740993\",\"offsetLag\":\"2\",\"isFuture\":true}]}],\"totalBytes\":\"9007199254740995\",\"usableBytes\":\"9007199254740994\",\"isCordoned\":true}]}"));
+    out.add(new Vector("alterReplicaLogDirs", "AlterReplicaLogDirsRequest", (short)1, "storage", storageData("AlterReplicaLogDirsRequestData", new Object[][]{{"Dirs",List.of(storageData("AlterReplicaLogDirsRequestData$AlterReplicaLogDir", new Object[][]{{"Path","/data/b"},{"Topics",List.of(storageData("AlterReplicaLogDirsRequestData$AlterReplicaLogDirTopic", new Object[][]{{"Name","t"},{"Partitions",List.of(0)}}))}}))}}), "{\"dirs\":[{\"path\":\"/data/b\",\"topics\":[{\"topic\":\"t\",\"partitions\":[0]}]}]}"));
+    out.add(new Vector("alterReplicaLogDirs", "AlterReplicaLogDirsResponse", (short)1, "storage", storageData("AlterReplicaLogDirsResponseData", new Object[][]{{"ThrottleTimeMs",17},{"Results",List.of(storageData("AlterReplicaLogDirsResponseData$AlterReplicaLogDirTopicResult", new Object[][]{{"TopicName","t"},{"Partitions",List.of(storageData("AlterReplicaLogDirsResponseData$AlterReplicaLogDirPartitionResult", new Object[][]{{"PartitionIndex",0},{"ErrorCode",57}}))}}))}}), "{\"throttleTime\":17,\"topics\":[{\"topic\":\"t\",\"partitions\":[{\"partition\":0,\"errorCode\":57}]}]}"));
+    out.add(new Vector("alterReplicaLogDirs", "AlterReplicaLogDirsRequest", (short)2, "storage", storageData("AlterReplicaLogDirsRequestData", new Object[][]{{"Dirs",List.of(storageData("AlterReplicaLogDirsRequestData$AlterReplicaLogDir", new Object[][]{{"Path","/data/b"},{"Topics",List.of(storageData("AlterReplicaLogDirsRequestData$AlterReplicaLogDirTopic", new Object[][]{{"Name","t"},{"Partitions",List.of(0)}}))}}))}}), "{\"dirs\":[{\"path\":\"/data/b\",\"topics\":[{\"topic\":\"t\",\"partitions\":[0]}]}]}"));
+    out.add(new Vector("alterReplicaLogDirs", "AlterReplicaLogDirsResponse", (short)2, "storage", storageData("AlterReplicaLogDirsResponseData", new Object[][]{{"ThrottleTimeMs",17},{"Results",List.of(storageData("AlterReplicaLogDirsResponseData$AlterReplicaLogDirTopicResult", new Object[][]{{"TopicName","t"},{"Partitions",List.of(storageData("AlterReplicaLogDirsResponseData$AlterReplicaLogDirPartitionResult", new Object[][]{{"PartitionIndex",0},{"ErrorCode",57}}))}}))}}), "{\"throttleTime\":17,\"topics\":[{\"topic\":\"t\",\"partitions\":[{\"partition\":0,\"errorCode\":57}]}]}"));
+    out.add(new Vector("listOffsets", "ListOffsetsRequest", (short)10, "storage", storageData("ListOffsetsRequestData", new Object[][]{{"ReplicaId",-1},{"IsolationLevel",1},{"Topics",List.of(storageData("ListOffsetsRequestData$ListOffsetsTopic", new Object[][]{{"Name","t"},{"Partitions",List.of(storageData("ListOffsetsRequestData$ListOffsetsPartition", new Object[][]{{"PartitionIndex",0},{"CurrentLeaderEpoch",-1},{"Timestamp",-5L}}))}}))},{"TimeoutMs",5000}}), "{\"replicaId\":-1,\"isolationLevel\":1,\"topics\":[{\"topic\":\"t\",\"partitions\":[{\"partition\":0,\"currentLeaderEpoch\":-1,\"timestamp\":\"-5\"}]}],\"timeout\":5000}"));
+    out.add(new Vector("listOffsets", "ListOffsetsResponse", (short)10, "storage", storageData("ListOffsetsResponseData", new Object[][]{{"ThrottleTimeMs",17},{"Topics",List.of(storageData("ListOffsetsResponseData$ListOffsetsTopicResponse", new Object[][]{{"Name","t"},{"Partitions",List.of(storageData("ListOffsetsResponseData$ListOffsetsPartitionResponse", new Object[][]{{"PartitionIndex",0},{"ErrorCode",0},{"Timestamp",-1L},{"Offset",-1L},{"LeaderEpoch",-1}}))}}))}}), "{\"throttleTime\":17,\"responses\":[{\"topic\":\"t\",\"partitions\":[{\"partition\":0,\"errorCode\":0,\"timestamp\":\"-1\",\"offset\":\"-1\",\"leaderEpoch\":-1}]}]}"));
+    out.add(new Vector("listOffsets", "ListOffsetsRequest", (short)11, "storage", storageData("ListOffsetsRequestData", new Object[][]{{"ReplicaId",-1},{"IsolationLevel",1},{"Topics",List.of(storageData("ListOffsetsRequestData$ListOffsetsTopic", new Object[][]{{"Name","t"},{"Partitions",List.of(storageData("ListOffsetsRequestData$ListOffsetsPartition", new Object[][]{{"PartitionIndex",0},{"CurrentLeaderEpoch",-1},{"Timestamp",-6L}}))}}))},{"TimeoutMs",5000}}), "{\"replicaId\":-1,\"isolationLevel\":1,\"topics\":[{\"topic\":\"t\",\"partitions\":[{\"partition\":0,\"currentLeaderEpoch\":-1,\"timestamp\":\"-6\"}]}],\"timeout\":5000}"));
+    out.add(new Vector("listOffsets", "ListOffsetsResponse", (short)11, "storage", storageData("ListOffsetsResponseData", new Object[][]{{"ThrottleTimeMs",17},{"Topics",List.of(storageData("ListOffsetsResponseData$ListOffsetsTopicResponse", new Object[][]{{"Name","t"},{"Partitions",List.of(storageData("ListOffsetsResponseData$ListOffsetsPartitionResponse", new Object[][]{{"PartitionIndex",0},{"ErrorCode",0},{"Timestamp",-1L},{"Offset",-1L},{"LeaderEpoch",-1}}))}}))}}), "{\"throttleTime\":17,\"responses\":[{\"topic\":\"t\",\"partitions\":[{\"partition\":0,\"errorCode\":0,\"timestamp\":\"-1\",\"offset\":\"-1\",\"leaderEpoch\":-1}]}]}"));
+    out.add(new Vector("alterPartitionReassignments", "AlterPartitionReassignmentsRequest", (short)1, "storage", storageData("AlterPartitionReassignmentsRequestData", new Object[][]{{"TimeoutMs",5000},{"AllowReplicationFactorChange",false},{"Topics",List.of(storageData("AlterPartitionReassignmentsRequestData$ReassignableTopic", new Object[][]{{"Name","t"},{"Partitions",List.of(storageData("AlterPartitionReassignmentsRequestData$ReassignablePartition", new Object[][]{{"PartitionIndex",0},{"Replicas",List.of(1,2)}}))}}))}}), "{\"timeout\":5000,\"allowReplicationFactorChange\":false,\"topics\":[{\"topic\":\"t\",\"partitionAssignment\":[{\"partition\":0,\"replicas\":[1,2]}]}]}"));
+    out.add(new Vector("alterPartitionReassignments", "AlterPartitionReassignmentsResponse", (short)1, "storage", storageData("AlterPartitionReassignmentsResponseData", new Object[][]{{"ThrottleTimeMs",17},{"AllowReplicationFactorChange",false},{"ErrorCode",0},{"ErrorMessage",null},{"Responses",List.of(storageData("AlterPartitionReassignmentsResponseData$ReassignableTopicResponse", new Object[][]{{"Name","t"},{"Partitions",List.of(storageData("AlterPartitionReassignmentsResponseData$ReassignablePartitionResponse", new Object[][]{{"PartitionIndex",0},{"ErrorCode",0},{"ErrorMessage",null}}))}}))}}), "{\"throttleTime\":17,\"allowReplicationFactorChange\":false,\"errorCode\":0,\"errorMessage\":null,\"responses\":[{\"topic\":\"t\",\"partitions\":[{\"partition\":0,\"errorCode\":0,\"errorMessage\":null}]}]}"));
+    out.add(new Vector("deleteTopics", "DeleteTopicsRequest", (short)6, "storage", storageData("DeleteTopicsRequestData", new Object[][]{{"Topics",List.of(storageData("DeleteTopicsRequestData$DeleteTopicState", new Object[][]{{"Name",null},{"TopicId",new Uuid(4822678189205111L,-8603657889541918977L)}}))},{"TimeoutMs",5000}}), "{\"topics\":[{\"topic\":null,\"topicId\":\"00112233-4455-6677-8899-aabbccddeeff\"}],\"timeout\":5000}"));
+    out.add(new Vector("deleteTopics", "DeleteTopicsResponse", (short)6, "storage", storageData("DeleteTopicsResponseData", new Object[][]{{"ThrottleTimeMs",17},{"Responses",List.of(storageData("DeleteTopicsResponseData$DeletableTopicResult", new Object[][]{{"Name",null},{"TopicId",new Uuid(4822678189205111L,-8603657889541918977L)},{"ErrorCode",89},{"ErrorMessage","quota"}}))}}), "{\"throttleTime\":17,\"topicErrors\":[{\"topic\":null,\"topicId\":\"00112233-4455-6677-8899-aabbccddeeff\",\"errorCode\":89,\"errorMessage\":\"quota\"}]}"));
+    return out;
+  }
+
+  /** Produces classic deletion and several-group offset vectors from Apache message classes.
+   * @return independent bytes and literal source fields; no client codec participates
+   */
+  private static List<Vector> offsetAdmin() {
+    List<Vector> out = new ArrayList<>();
+    var requestedTopics = new OffsetDeleteRequestData.OffsetDeleteRequestTopicCollection();
+    requestedTopics.add(new OffsetDeleteRequestData.OffsetDeleteRequestTopic().setName("test-topic")
+        .setPartitions(Arrays.asList(
+            new OffsetDeleteRequestData.OffsetDeleteRequestPartition().setPartitionIndex(0),
+            new OffsetDeleteRequestData.OffsetDeleteRequestPartition().setPartitionIndex(1))));
+    var deleting = new OffsetDeleteRequestData().setGroupId("test-group").setTopics(requestedTopics);
+    var deletedPartitions = new OffsetDeleteResponseData.OffsetDeleteResponsePartitionCollection();
+    deletedPartitions.add(new OffsetDeleteResponseData.OffsetDeleteResponsePartition().setPartitionIndex(0).setErrorCode((short) 0));
+    deletedPartitions.add(new OffsetDeleteResponseData.OffsetDeleteResponsePartition().setPartitionIndex(1).setErrorCode((short) 3));
+    var deletedTopics = new OffsetDeleteResponseData.OffsetDeleteResponseTopicCollection();
+    deletedTopics.add(new OffsetDeleteResponseData.OffsetDeleteResponseTopic().setName("test-topic").setPartitions(deletedPartitions));
+    var deleted = new OffsetDeleteResponseData().setErrorCode((short) 0).setThrottleTimeMs(17).setTopics(deletedTopics);
+    out.add(new Vector("offsetDelete", "OffsetDeleteRequest", (short) 0, "basic", deleting, "{\"groupId\":\"test-group\",\"topics\":[{\"topic\":\"test-topic\",\"partitions\":[{\"partition\":0},{\"partition\":1}]}]}"));
+    out.add(new Vector("offsetDelete", "OffsetDeleteResponse", (short) 0, "mixed", deleted, "{\"errorCode\":0,\"throttleTime\":17,\"topics\":[{\"topic\":\"test-topic\",\"partitions\":[{\"partition\":0,\"errorCode\":0},{\"partition\":1,\"errorCode\":3}]}]}"));
+    for (short version : new short[] {8, 9}) {
+      List<OffsetFetchRequestData.OffsetFetchRequestGroup> requested = new ArrayList<>();
+      List<OffsetFetchResponseData.OffsetFetchResponseGroup> answered = new ArrayList<>();
+      for (String id : Arrays.asList("a", "b")) {
+        requested.add(new OffsetFetchRequestData.OffsetFetchRequestGroup().setGroupId(id)
+            .setMemberId(null).setMemberEpoch(-1).setTopics(Collections.singletonList(
+                new OffsetFetchRequestData.OffsetFetchRequestTopics().setName("t")
+                    .setPartitionIndexes(Collections.singletonList(0)))));
+        answered.add(new OffsetFetchResponseData.OffsetFetchResponseGroup().setGroupId(id).setErrorCode((short) 0)
+            .setTopics(Collections.singletonList(new OffsetFetchResponseData.OffsetFetchResponseTopics()
+                .setName("t").setPartitions(Collections.singletonList(new OffsetFetchResponseData.OffsetFetchResponsePartitions()
+                    .setPartitionIndex(0).setCommittedOffset(10L).setCommittedLeaderEpoch(3).setMetadata(null).setErrorCode((short) 0))))));
+      }
+      out.add(new Vector("offsetFetch", "OffsetFetchRequest", version, "severalGroups",
+          new OffsetFetchRequestData().setGroups(requested).setRequireStable(true), version == 9 ? "{\"groups\":[{\"groupId\":\"a\",\"topics\":[{\"topic\":\"t\",\"partitions\":[{\"partition\":0}]}],\"memberId\":null,\"memberEpoch\":-1},{\"groupId\":\"b\",\"topics\":[{\"topic\":\"t\",\"partitions\":[{\"partition\":0}]}],\"memberId\":null,\"memberEpoch\":-1}],\"requireStable\":true}" : "{\"groups\":[{\"groupId\":\"a\",\"topics\":[{\"topic\":\"t\",\"partitions\":[{\"partition\":0}]}]},{\"groupId\":\"b\",\"topics\":[{\"topic\":\"t\",\"partitions\":[{\"partition\":0}]}]}],\"requireStable\":true}"));
+      out.add(new Vector("offsetFetch", "OffsetFetchResponse", version, "severalGroups",
+          new OffsetFetchResponseData().setThrottleTimeMs(17).setGroups(answered), "{\"throttleTime\":17,\"groups\":[{\"groupId\":\"a\",\"errorCode\":0,\"topics\":[{\"topic\":\"t\",\"partitions\":[{\"partition\":0,\"offset\":\"10\",\"leaderEpoch\":3,\"metadata\":null,\"errorCode\":0}]}]},{\"groupId\":\"b\",\"errorCode\":0,\"topics\":[{\"topic\":\"t\",\"partitions\":[{\"partition\":0,\"offset\":\"10\",\"leaderEpoch\":3,\"metadata\":null,\"errorCode\":0}]}]}]}"));
+    }
+    var legacy = new OffsetFetchResponseData().setThrottleTimeMs(17).setErrorCode((short) 0)
+        .setTopics(Collections.singletonList(new OffsetFetchResponseData.OffsetFetchResponseTopic().setName("test-topic")
+            .setPartitions(Collections.singletonList(new OffsetFetchResponseData.OffsetFetchResponsePartition()
+                .setPartitionIndex(0).setCommittedOffset(10L).setCommittedLeaderEpoch(3).setMetadata(null).setErrorCode((short) 0)))));
+    out.add(new Vector("offsetFetch", "OffsetFetchResponse", (short) 7, "stable", legacy, "{\"throttleTime\":17,\"errorCode\":0,\"topics\":[{\"topic\":\"test-topic\",\"partitions\":[{\"partition\":0,\"offset\":\"10\",\"leaderEpoch\":3,\"metadata\":null,\"errorCode\":0}]}]}"));
+    return out;
+  }
+
+
   /**
    * OffsetFetch (9) v7-v9 requests, once with RequireStable and once without (KIP-447). The two
    * of a version differ in that one boolean, the last byte before the request's tag buffer. v7
@@ -1839,7 +2411,7 @@ public final class GenerateMessageVectors {
             .setGroupId(GROUP_ID)
             .setProducerId(PRODUCER_ID)
             .setProducerEpoch(PRODUCER_EPOCH)
-            .setGenerationId(generationId)
+            .setGenerationIdOrMemberEpoch(generationId)
             .setMemberId(memberId)
             .setGroupInstanceId(groupInstanceId)
             .setTopics(
@@ -1910,6 +2482,221 @@ public final class GenerateMessageVectors {
                                 obj(
                                     kv("partition", String.valueOf(PARTITION_INDEX)),
                                     kv("errorCode", String.valueOf(errorCode))))))))));
+  }
+
+  /** One partition a TxnOffsetCommit v6 request commits. */
+  private record Committed(int partition, long offset, int leaderEpoch, String metadata) {}
+
+  /** One topic, named by id, a TxnOffsetCommit v6 request commits. */
+  private record CommittedTopic(String topicId, List<Committed> partitions) {}
+
+  /** One partition result of a TxnOffsetCommit v6 response. */
+  private record Answered(int partition, short code) {}
+
+  /** One topic, named by id, a TxnOffsetCommit v6 response answers. */
+  private record AnsweredTopic(String topicId, List<Answered> partitions) {}
+
+  /**
+   * TxnOffsetCommit (28) v6, request and response (KIP-1319): {@code TopicId} replaces {@code Name}
+   * in both. Every request commits the same two topics, so one id is read where the name was: three
+   * partitions between them, one offset beyond 2^53, one {@code null}, one empty and one non-ASCII
+   * metadata string. {@code defaultMetadata} carries the group metadata a bare {@code consumerGroupId}
+   * sends and {@code groupMetadata} a full membership. The responses answer the same topics: every
+   * partition committed ({@code ok}), then each of the three codes v6 adds to the response -
+   * GROUP_ID_NOT_FOUND (69), STALE_MEMBER_EPOCH (113) and UNKNOWN_TOPIC_ID (100) - on every
+   * partition they can name, {@code mixedOutcomes} with each of them beside a success, {@code
+   * unknownTags} with one unknown tagged field at the partition, topic and top level, and {@code
+   * noTopics}.
+   *
+   * @see <a href="https://github.com/apache/kafka/blob/4.4.0/clients/src/main/resources/common/message/TxnOffsetCommitRequest.json">TxnOffsetCommitRequest.json</a>
+   * @see <a href="https://github.com/apache/kafka/blob/4.4.0/clients/src/main/resources/common/message/TxnOffsetCommitResponse.json">TxnOffsetCommitResponse.json</a>
+   * @return the key-28 v6 vectors
+   */
+  private static List<Vector> txnOffsetCommitByTopicId() {
+    List<Vector> vectors = new ArrayList<>();
+    String api = "txnOffsetCommit";
+
+    vectors.add(txnOffsetCommitByTopicIdRequest(api, "defaultMetadata", -1, "", null));
+    vectors.add(
+        txnOffsetCommitByTopicIdRequest(
+            api, "groupMetadata", GENERATION_ID, MEMBER_ID, GROUP_INSTANCE_ID));
+
+    AnsweredTopic okA =
+        answeredTopic(TOPIC_ID, new Answered(0, (short) 0), new Answered(1, (short) 0));
+    AnsweredTopic okB = answeredTopic(OTHER_TOPIC_ID, new Answered(0, (short) 0));
+    vectors.add(txnOffsetCommitByTopicIdResponse(api, "ok", false, okA, okB));
+    vectors.add(
+        txnOffsetCommitByTopicIdResponse(
+            api, "groupIdNotFound", false,
+            answeredTopic(TOPIC_ID, new Answered(0, GROUP_ID_NOT_FOUND),
+                new Answered(1, GROUP_ID_NOT_FOUND)),
+            answeredTopic(OTHER_TOPIC_ID, new Answered(0, GROUP_ID_NOT_FOUND))));
+    vectors.add(
+        txnOffsetCommitByTopicIdResponse(
+            api, "staleMemberEpoch", false,
+            answeredTopic(TOPIC_ID, new Answered(0, STALE_MEMBER_EPOCH),
+                new Answered(1, STALE_MEMBER_EPOCH)),
+            answeredTopic(OTHER_TOPIC_ID, new Answered(0, STALE_MEMBER_EPOCH))));
+    vectors.add(
+        txnOffsetCommitByTopicIdResponse(
+            api, "unknownTopicId", false,
+            answeredTopic(TOPIC_ID, new Answered(0, UNKNOWN_TOPIC_ID),
+                new Answered(1, UNKNOWN_TOPIC_ID)),
+            okB));
+    vectors.add(
+        txnOffsetCommitByTopicIdResponse(
+            api, "mixedOutcomes", false,
+            answeredTopic(TOPIC_ID, new Answered(0, (short) 0), new Answered(1, UNKNOWN_TOPIC_ID)),
+            answeredTopic(OTHER_TOPIC_ID, new Answered(0, STALE_MEMBER_EPOCH))));
+    vectors.add(txnOffsetCommitByTopicIdResponse(api, "unknownTags", true, okA, okB));
+    vectors.add(txnOffsetCommitByTopicIdResponse(api, "noTopics", false));
+
+    return vectors;
+  }
+
+  /**
+   * @param topicId the topic's id in canonical form
+   * @param partitions its results, in order
+   * @return one answered topic
+   */
+  private static AnsweredTopic answeredTopic(String topicId, Answered... partitions) {
+    return new AnsweredTopic(topicId, List.of(partitions));
+  }
+
+  /**
+   * One TxnOffsetCommit v6 request for the two topics described on {@link
+   * #txnOffsetCommitByTopicId()}.
+   *
+   * @param api the fixtures directory name
+   * @param caseId the case name, which is also the file name's last part
+   * @param generationId the consumer group generation, -1 when the producer sends no group metadata
+   * @param memberId the consumer group member id, empty when there is no group metadata
+   * @param groupInstanceId the static member id, or null
+   * @return the vector
+   */
+  private static Vector txnOffsetCommitByTopicIdRequest(
+      String api, String caseId, int generationId, String memberId, String groupInstanceId) {
+    List<CommittedTopic> topics =
+        List.of(
+            new CommittedTopic(
+                TOPIC_ID,
+                List.of(
+                    new Committed(0, BEYOND_SAFE_INTEGER, COMMITTED_LEADER_EPOCH, null),
+                    new Committed(1, COMMITTED_OFFSET, -1, ""))),
+            new CommittedTopic(
+                OTHER_TOPIC_ID,
+                List.of(new Committed(0, Long.MAX_VALUE, 7, NON_ASCII_METADATA))));
+
+    List<TxnOffsetCommitRequestData.TxnOffsetCommitRequestTopic> built = new ArrayList<>();
+    List<String> restated = new ArrayList<>();
+    for (CommittedTopic topic : topics) {
+      List<TxnOffsetCommitRequestData.TxnOffsetCommitRequestPartition> partitions =
+          new ArrayList<>();
+      List<String> partitionsRestated = new ArrayList<>();
+      for (Committed committed : topic.partitions()) {
+        partitions.add(
+            new TxnOffsetCommitRequestData.TxnOffsetCommitRequestPartition()
+                .setPartitionIndex(committed.partition())
+                .setCommittedOffset(committed.offset())
+                .setCommittedLeaderEpoch(committed.leaderEpoch())
+                .setCommittedMetadata(committed.metadata()));
+        partitionsRestated.add(
+            obj(
+                kv("partition", num(committed.partition())),
+                kv("offset", str(String.valueOf(committed.offset()))),
+                kv("leaderEpoch", num(committed.leaderEpoch())),
+                kv("metadata", str(committed.metadata()))));
+      }
+      built.add(
+          new TxnOffsetCommitRequestData.TxnOffsetCommitRequestTopic()
+              .setTopicId(uuid(topic.topicId()))
+              .setPartitions(partitions));
+      restated.add(
+          obj(
+              kv("topicId", str(topic.topicId())),
+              kv("partitions", array(partitionsRestated.toArray(new String[0])))));
+    }
+
+    return new Vector(api, "TxnOffsetCommitRequest", (short) 6, caseId,
+        new TxnOffsetCommitRequestData()
+            .setTransactionalId(TRANSACTIONAL_ID)
+            .setGroupId(GROUP_ID)
+            .setProducerId(PRODUCER_ID)
+            .setProducerEpoch(PRODUCER_EPOCH)
+            .setGenerationIdOrMemberEpoch(generationId)
+            .setMemberId(memberId)
+            .setGroupInstanceId(groupInstanceId)
+            .setTopics(built),
+        obj(
+            kv("transactionalId", str(TRANSACTIONAL_ID)),
+            kv("groupId", str(GROUP_ID)),
+            kv("producerId", str(String.valueOf(PRODUCER_ID))),
+            kv("producerEpoch", String.valueOf(PRODUCER_EPOCH)),
+            kv("generationId", num(generationId)),
+            kv("memberId", str(memberId)),
+            kv("groupInstanceId", str(groupInstanceId)),
+            kv("topics", array(restated.toArray(new String[0])))));
+  }
+
+  /**
+   * One TxnOffsetCommit v6 response.
+   *
+   * @param api the fixtures directory name
+   * @param caseId the case name, which is also the file name's last part
+   * @param unknownTags whether the response, each topic and each partition also carry one unknown
+   *     tagged field
+   * @param topics the per-topic results, in order
+   * @return the vector, whose fixture restates the results
+   */
+  private static Vector txnOffsetCommitByTopicIdResponse(
+      String api, String caseId, boolean unknownTags, AnsweredTopic... topics) {
+    List<TxnOffsetCommitResponseData.TxnOffsetCommitResponseTopic> built = new ArrayList<>();
+    List<String> restated = new ArrayList<>();
+    for (AnsweredTopic topic : topics) {
+      List<TxnOffsetCommitResponseData.TxnOffsetCommitResponsePartition> partitions =
+          new ArrayList<>();
+      List<String> partitionsRestated = new ArrayList<>();
+      for (Answered answered : topic.partitions()) {
+        TxnOffsetCommitResponseData.TxnOffsetCommitResponsePartition partition =
+            new TxnOffsetCommitResponseData.TxnOffsetCommitResponsePartition()
+                .setPartitionIndex(answered.partition())
+                .setErrorCode(answered.code());
+        if (unknownTags) {
+          partition.unknownTaggedFields().add(new RawTaggedField(UNKNOWN_TAG, UNKNOWN_TAG_DATA));
+        }
+        partitions.add(partition);
+        partitionsRestated.add(
+            obj(kv("partition", num(answered.partition())), kv("errorCode", num(answered.code()))));
+      }
+      TxnOffsetCommitResponseData.TxnOffsetCommitResponseTopic entry =
+          new TxnOffsetCommitResponseData.TxnOffsetCommitResponseTopic()
+              .setTopicId(uuid(topic.topicId()))
+              .setPartitions(partitions);
+      if (unknownTags) {
+        entry.unknownTaggedFields().add(new RawTaggedField(UNKNOWN_TAG, UNKNOWN_TAG_DATA));
+      }
+      built.add(entry);
+      restated.add(
+          obj(
+              kv("topicId", str(topic.topicId())),
+              kv("partitions", array(partitionsRestated.toArray(new String[0])))));
+    }
+
+    TxnOffsetCommitResponseData response =
+        new TxnOffsetCommitResponseData().setThrottleTimeMs(TXN_THROTTLE_TIME_MS).setTopics(built);
+    List<String> fields =
+        new ArrayList<>(
+            List.of(
+                kv("throttleTime", num(TXN_THROTTLE_TIME_MS)),
+                kv("topics", array(restated.toArray(new String[0])))));
+    if (unknownTags) {
+      response.unknownTaggedFields().add(new RawTaggedField(UNKNOWN_TAG, UNKNOWN_TAG_DATA));
+      fields.add(kv("unknownTag", num(UNKNOWN_TAG)));
+      fields.add(kv("unknownTagBytes", intArray(List.of(0xaa, 0xbb))));
+    }
+
+    return new Vector(api, "TxnOffsetCommitResponse", (short) 6, caseId, response,
+        obj(fields.toArray(new String[0])));
   }
 
   /** @param value any number @return its JSON literal */
@@ -2830,9 +3617,12 @@ public final class GenerateMessageVectors {
   }
 
   /**
-   * DeleteGroups (42) v2, request and response: v1's body in flexible framing. Two groups are
-   * deleted; the answer is both deleted ({@code ok}) or one refused as non-empty and one unknown
-   * ({@code error}).
+   * DeleteGroups (42) v2 and v3, request and response. v2 is v1's body in flexible framing: two
+   * groups are deleted; the answer is both deleted ({@code ok}) or one refused as non-empty and one
+   * unknown ({@code error}). v3 keeps the request body and gives each result a nullable
+   * {@code ErrorMessage} after its error code: the cases pin a null, an empty and a non-empty
+   * message apart, a success beside one failure of each kind, non-ASCII text, an empty list, and
+   * one unknown tagged field in every struct.
    *
    * @return the key-42 vectors
    */
@@ -2863,7 +3653,90 @@ public final class GenerateMessageVectors {
               obj(kv("throttleTime", num(THROTTLE_TIME_MS)), kv("results", results))));
     }
 
+    for (Object[] request : new Object[][] {
+        {"basic", List.of(GROUP_ID, OTHER_GROUP_ID)},
+        {"empty", List.<String>of()},
+        {"nonAscii", List.of(NON_ASCII_GROUP_ID, "")}}) {
+      @SuppressWarnings("unchecked")
+      List<String> groupIds = (List<String>) request[1];
+      vectors.add(
+          new Vector(api, "DeleteGroupsRequest", (short) 3, (String) request[0],
+              new DeleteGroupsRequestData().setGroupsNames(groupIds),
+              obj(kv("groupIds", strArray(groupIds)))));
+    }
+
+    vectors.add(
+        deletedV3("ok", false,
+            new Deleted(GROUP_ID, (short) 0, null), new Deleted(OTHER_GROUP_ID, (short) 0, null)));
+    vectors.add(
+        deletedV3("error", false,
+            new Deleted(GROUP_ID, NON_EMPTY_GROUP, "The group is not empty."),
+            new Deleted(OTHER_GROUP_ID, GROUP_ID_NOT_FOUND, "Group other-group not found.")));
+    vectors.add(
+        deletedV3("nullEmptyNonempty", false,
+            new Deleted(GROUP_ID, (short) 0, null),
+            new Deleted(OTHER_GROUP_ID, GROUP_DELETION_FAILED, ""),
+            new Deleted("third-group", GROUP_DELETION_FAILED, "cleanup failed")));
+    vectors.add(
+        deletedV3("mixedOutcomes", false,
+            new Deleted(GROUP_ID, (short) 0, null),
+            new Deleted(OTHER_GROUP_ID, GROUP_DELETION_FAILED, null),
+            new Deleted("third-group", GROUP_DELETION_FAILED, ""),
+            new Deleted("fourth-group", GROUP_DELETION_FAILED, "cleanup failed")));
+    vectors.add(
+        deletedV3("nonAscii", false,
+            new Deleted(NON_ASCII_GROUP_ID, GROUP_DELETION_FAILED, NON_ASCII_MESSAGE),
+            new Deleted("", (short) 0, null)));
+    vectors.add(deletedV3("noResults", false));
+    vectors.add(
+        deletedV3("unknownTags", true,
+            new Deleted(GROUP_ID, (short) 0, null),
+            new Deleted(OTHER_GROUP_ID, GROUP_DELETION_FAILED, "cleanup failed")));
+
     return vectors;
+  }
+
+  /** One DeleteGroups v3 result: its group, error code and message ({@code null} when none). */
+  private record Deleted(String groupId, short code, String message) {}
+
+  /**
+   * @param caseId the vector's case
+   * @param unknownTags whether the response and each result also carry one unknown tagged field
+   * @param results the per-group results, in order
+   * @return a DeleteGroups v3 response vector whose fixture restates the results
+   */
+  private static Vector deletedV3(String caseId, boolean unknownTags, Deleted... results) {
+    List<DeleteGroupsResponseData.DeletableGroupResult> built = new ArrayList<>();
+    List<String> restated = new ArrayList<>();
+    for (Deleted result : results) {
+      DeleteGroupsResponseData.DeletableGroupResult group =
+          deleted(result.groupId(), result.code()).setErrorMessage(result.message());
+      if (unknownTags) {
+        group.unknownTaggedFields().add(new RawTaggedField(UNKNOWN_TAG, UNKNOWN_TAG_DATA));
+      }
+      built.add(group);
+      restated.add(
+          obj(kv("groupId", str(result.groupId())), kv("errorCode", num(result.code())),
+              kv("errorMessage", str(result.message()))));
+    }
+
+    DeleteGroupsResponseData response =
+        new DeleteGroupsResponseData()
+            .setThrottleTimeMs(THROTTLE_TIME_MS)
+            .setResults(new DeleteGroupsResponseData.DeletableGroupResultCollection(built.iterator()));
+    List<String> fields =
+        new ArrayList<>(
+            List.of(
+                kv("throttleTime", num(THROTTLE_TIME_MS)),
+                kv("results", array(restated.toArray(new String[0])))));
+    if (unknownTags) {
+      response.unknownTaggedFields().add(new RawTaggedField(UNKNOWN_TAG, UNKNOWN_TAG_DATA));
+      fields.add(kv("unknownTag", num(UNKNOWN_TAG)));
+      fields.add(kv("unknownTagBytes", intArray(List.of(0xaa, 0xbb))));
+    }
+
+    return new Vector("deleteGroups", "DeleteGroupsResponse", (short) 3, caseId, response,
+        obj(fields.toArray(new String[0])));
   }
 
   /**
@@ -2876,6 +3749,197 @@ public final class GenerateMessageVectors {
     return new DeleteGroupsResponseData.DeletableGroupResult()
         .setGroupId(groupId)
         .setErrorCode(code);
+  }
+
+  /** The client identity every ApiVersions request vector carries. */
+  private static final String SOFTWARE_NAME = "countly-kafkajs";
+  private static final String SOFTWARE_VERSION = "3.0.0-alpha.4";
+
+  /** The cluster id and node the {@code known} ApiVersions request names. */
+  private static final String CLUSTER_ID = "test-cluster-id";
+  private static final int KNOWN_NODE_ID = 2;
+
+  /** REBOOTSTRAP_REQUIRED and UNSUPPORTED_VERSION, the two ApiVersions answers the client acts on. */
+  private static final short REBOOTSTRAP_REQUIRED = 129;
+  private static final short UNSUPPORTED_VERSION = 35;
+
+  /** One ApiVersions entry: the API key and the versions the broker offers for it. */
+  private record Offered(int apiKey, int minVersion, int maxVersion) {}
+
+  /** One supported feature: its name and the version range the broker supports. */
+  private record Supported(String name, int minVersion, int maxVersion) {}
+
+  /** One finalized feature: its name and the cluster-wide level range. */
+  private record Finalized(String name, int minVersionLevel, int maxVersionLevel) {}
+
+  /**
+   * ApiVersions (18) v5 (KIP-1242): the request adds a nullable {@code ClusterId} and an
+   * {@code NodeId} (default -1) after the client software; the response keeps v4's body and adds
+   * the {@code REBOOTSTRAP_REQUIRED} answer. The request cases pin the defaults apart from a known
+   * pair, and node 0 from the -1 default; the response cases are a full answer with no throttle,
+   * one whose features support version 0 (KAFKA-17011), the 129 answer a broker sends for a wrong
+   * cluster or node, and one unknown tagged field in every struct. The cases other than the full
+   * answer carry a throttle, so a decoder that skips it fails.
+   *
+   * <p>The last vector is the v0-shaped UNSUPPORTED_VERSION answer a broker that offers ApiVersions
+   * up to v4 gives to a v5 request: the error code and one classic array holding the broker's own
+   * ApiVersions range.
+   *
+   * @return the key-18 vectors
+   */
+  private static List<Vector> apiVersions() {
+    List<Vector> vectors = new ArrayList<>();
+
+    vectors.add(apiVersionsRequest("defaults", SOFTWARE_NAME, SOFTWARE_VERSION, null, -1));
+    vectors.add(
+        apiVersionsRequest("known", SOFTWARE_NAME, SOFTWARE_VERSION, CLUSTER_ID, KNOWN_NODE_ID));
+    vectors.add(
+        apiVersionsRequest(
+            "nonAscii", "kafkajs-é", "3.0.0-日本", "cluster-é-日本", 0));
+
+    List<Offered> offered = List.of(new Offered(0, 3, 13), new Offered(18, 0, 5));
+    List<Supported> supported = List.of(new Supported("metadata.version", 1, 25));
+    List<Finalized> finalized = List.of(new Finalized("metadata.version", 1, 25));
+    vectors.add(apiVersionsResponse("ok", (short) 0, 0, offered, supported, 7L, finalized, false));
+    vectors.add(
+        apiVersionsResponse(
+            "features0",
+            (short) 0,
+            THROTTLE_TIME_MS,
+            offered,
+            List.of(new Supported("metadata.version", 1, 25), new Supported("transaction.version", 0, 2)),
+            7L,
+            List.of(new Finalized("metadata.version", 25, 25), new Finalized("transaction.version", 2, 2)),
+            false));
+    vectors.add(
+        apiVersionsResponse(
+            "rebootstrapRequired", REBOOTSTRAP_REQUIRED, THROTTLE_TIME_MS, List.of(), List.of(), -1L,
+            List.of(), false));
+    vectors.add(
+        apiVersionsResponse(
+            "unknownTags", (short) 0, THROTTLE_TIME_MS, offered, supported, 7L, finalized, true));
+
+    ApiVersionsResponseData.ApiVersionCollection unsupportedKeys =
+        new ApiVersionsResponseData.ApiVersionCollection();
+    unsupportedKeys.add(
+        new ApiVersionsResponseData.ApiVersion().setApiKey((short) 18).setMinVersion((short) 0).setMaxVersion((short) 4));
+    vectors.add(
+        new Vector("apiVersions", "ApiVersionsResponse", (short) 0, "unsupportedVersion",
+            new ApiVersionsResponseData().setErrorCode(UNSUPPORTED_VERSION).setApiKeys(unsupportedKeys),
+            obj(
+                kv("errorCode", num(UNSUPPORTED_VERSION)),
+                kv("apiKeys", array(obj(kv("apiKey", num(18)), kv("minVersion", num(0)), kv("maxVersion", num(4))))))));
+
+    return vectors;
+  }
+
+  /**
+   * @param caseId the vector's case
+   * @param softwareName the client software name
+   * @param softwareVersion the client software version
+   * @param clusterId the cluster the client intends to reach, or {@code null}
+   * @param nodeId the node it intends to reach, or -1
+   * @return an ApiVersions v5 request vector
+   */
+  private static Vector apiVersionsRequest(
+      String caseId, String softwareName, String softwareVersion, String clusterId, int nodeId) {
+    return new Vector("apiVersions", "ApiVersionsRequest", (short) 5, caseId,
+        new ApiVersionsRequestData()
+            .setClientSoftwareName(softwareName)
+            .setClientSoftwareVersion(softwareVersion)
+            .setClusterId(clusterId)
+            .setNodeId(nodeId),
+        obj(
+            kv("clientSoftwareName", str(softwareName)),
+            kv("clientSoftwareVersion", str(softwareVersion)),
+            kv("clusterId", str(clusterId)),
+            kv("nodeId", num(nodeId))));
+  }
+
+  /**
+   * @param caseId the vector's case
+   * @param errorCode the top-level error
+   * @param throttle the throttle time the broker reports, in milliseconds
+   * @param offered the APIs the broker offers
+   * @param supported the features it supports
+   * @param epoch the finalized features epoch, -1 for none
+   * @param finalized the finalized features
+   * @param unknownTags whether the response and every struct also carry one unknown tagged field
+   * @return an ApiVersions v5 response vector whose fixture restates its fields
+   */
+  private static Vector apiVersionsResponse(
+      String caseId, short errorCode, int throttle, List<Offered> offered,
+      List<Supported> supported, long epoch, List<Finalized> finalized, boolean unknownTags) {
+    ApiVersionsResponseData response =
+        new ApiVersionsResponseData()
+            .setErrorCode(errorCode)
+            .setThrottleTimeMs(throttle)
+            .setFinalizedFeaturesEpoch(epoch);
+    List<String> offeredJson = new ArrayList<>();
+    for (Offered entry : offered) {
+      ApiVersionsResponseData.ApiVersion apiVersion =
+          new ApiVersionsResponseData.ApiVersion()
+              .setApiKey((short) entry.apiKey())
+              .setMinVersion((short) entry.minVersion())
+              .setMaxVersion((short) entry.maxVersion());
+      if (unknownTags) {
+        apiVersion.unknownTaggedFields().add(new RawTaggedField(UNKNOWN_TAG, UNKNOWN_TAG_DATA));
+      }
+      response.apiKeys().add(apiVersion);
+      offeredJson.add(
+          obj(kv("apiKey", num(entry.apiKey())), kv("minVersion", num(entry.minVersion())),
+              kv("maxVersion", num(entry.maxVersion()))));
+    }
+
+    List<String> supportedJson = new ArrayList<>();
+    for (Supported entry : supported) {
+      ApiVersionsResponseData.SupportedFeatureKey feature =
+          new ApiVersionsResponseData.SupportedFeatureKey()
+              .setName(entry.name())
+              .setMinVersion((short) entry.minVersion())
+              .setMaxVersion((short) entry.maxVersion());
+      if (unknownTags) {
+        feature.unknownTaggedFields().add(new RawTaggedField(UNKNOWN_TAG, UNKNOWN_TAG_DATA));
+      }
+      response.supportedFeatures().add(feature);
+      supportedJson.add(
+          obj(kv("name", str(entry.name())), kv("minVersion", num(entry.minVersion())),
+              kv("maxVersion", num(entry.maxVersion()))));
+    }
+
+    List<String> finalizedJson = new ArrayList<>();
+    for (Finalized entry : finalized) {
+      ApiVersionsResponseData.FinalizedFeatureKey feature =
+          new ApiVersionsResponseData.FinalizedFeatureKey()
+              .setName(entry.name())
+              .setMinVersionLevel((short) entry.minVersionLevel())
+              .setMaxVersionLevel((short) entry.maxVersionLevel());
+      if (unknownTags) {
+        feature.unknownTaggedFields().add(new RawTaggedField(UNKNOWN_TAG, UNKNOWN_TAG_DATA));
+      }
+      response.finalizedFeatures().add(feature);
+      finalizedJson.add(
+          obj(kv("name", str(entry.name())), kv("minVersionLevel", num(entry.minVersionLevel())),
+              kv("maxVersionLevel", num(entry.maxVersionLevel()))));
+    }
+
+    List<String> fields =
+        new ArrayList<>(
+            List.of(
+                kv("errorCode", num(errorCode)),
+                kv("apiKeys", array(offeredJson.toArray(new String[0]))),
+                kv("throttleTime", num(throttle)),
+                kv("supportedFeatures", array(supportedJson.toArray(new String[0]))),
+                kv("finalizedFeaturesEpoch", str(String.valueOf(epoch))),
+                kv("finalizedFeatures", array(finalizedJson.toArray(new String[0])))));
+    if (unknownTags) {
+      response.unknownTaggedFields().add(new RawTaggedField(UNKNOWN_TAG, UNKNOWN_TAG_DATA));
+      fields.add(kv("unknownTag", num(UNKNOWN_TAG)));
+      fields.add(kv("unknownTagBytes", intArray(List.of(0xaa, 0xbb))));
+    }
+
+    return new Vector("apiVersions", "ApiVersionsResponse", (short) 5, caseId, response,
+        obj(fields.toArray(new String[0])));
   }
 
   /** One ACL (or ACL filter): the seven values the three ACL APIs share. */
@@ -4022,4 +5086,348 @@ public final class GenerateMessageVectors {
   private static String array(String... values) {
     return "[" + String.join(", ", values) + "]";
   }
+  /** Fixed synthetic vectors serialized by Apache Kafka.
+   * @return one request and response per implemented version
+   */
+  private static List<Vector> quotaScramAdmin() {
+    List<Vector> vectors = new ArrayList<>();
+    vectors.add(new Vector("describeClientQuotas", "DescribeClientQuotasRequest", (short) 0, "security",
+      new org.apache.kafka.common.message.DescribeClientQuotasRequestData()
+        .setComponents(List.of(new org.apache.kafka.common.message.DescribeClientQuotasRequestData.ComponentData()
+        .setEntityType("user")
+        .setMatchType((byte) 0)
+        .setMatch("test-user")))
+        .setStrict(false),
+      "{\"components\":[{\"entityType\":\"user\",\"matchType\":0,\"match\":\"test-user\"}],\"strict\":false}"));
+    vectors.add(new Vector("describeClientQuotas", "DescribeClientQuotasResponse", (short) 0, "security",
+      new org.apache.kafka.common.message.DescribeClientQuotasResponseData()
+        .setThrottleTimeMs(0)
+        .setErrorCode((short) 0)
+        .setErrorMessage(null)
+        .setEntries(List.of(new org.apache.kafka.common.message.DescribeClientQuotasResponseData.EntryData()
+        .setEntity(List.of(new org.apache.kafka.common.message.DescribeClientQuotasResponseData.EntityData()
+        .setEntityType("user")
+        .setEntityName(null)))
+        .setValues(List.of(new org.apache.kafka.common.message.DescribeClientQuotasResponseData.ValueData()
+        .setKey("producer_byte_rate")
+        .setValue(1234.5d))))),
+      "{\"throttleTimeMs\":0,\"errorCode\":0,\"errorMessage\":null,\"entries\":[{\"entity\":[{\"entityType\":\"user\",\"entityName\":null}],\"values\":[{\"key\":\"producer_byte_rate\",\"value\":1234.5}]}]}"));
+    vectors.add(new Vector("describeClientQuotas", "DescribeClientQuotasRequest", (short) 1, "security",
+      new org.apache.kafka.common.message.DescribeClientQuotasRequestData()
+        .setComponents(List.of(new org.apache.kafka.common.message.DescribeClientQuotasRequestData.ComponentData()
+        .setEntityType("user")
+        .setMatchType((byte) 0)
+        .setMatch("test-user")))
+        .setStrict(false),
+      "{\"components\":[{\"entityType\":\"user\",\"matchType\":0,\"match\":\"test-user\"}],\"strict\":false}"));
+    vectors.add(new Vector("describeClientQuotas", "DescribeClientQuotasResponse", (short) 1, "security",
+      new org.apache.kafka.common.message.DescribeClientQuotasResponseData()
+        .setThrottleTimeMs(0)
+        .setErrorCode((short) 0)
+        .setErrorMessage(null)
+        .setEntries(List.of(new org.apache.kafka.common.message.DescribeClientQuotasResponseData.EntryData()
+        .setEntity(List.of(new org.apache.kafka.common.message.DescribeClientQuotasResponseData.EntityData()
+        .setEntityType("user")
+        .setEntityName(null)))
+        .setValues(List.of(new org.apache.kafka.common.message.DescribeClientQuotasResponseData.ValueData()
+        .setKey("producer_byte_rate")
+        .setValue(1234.5d))))),
+      "{\"throttleTimeMs\":0,\"errorCode\":0,\"errorMessage\":null,\"entries\":[{\"entity\":[{\"entityType\":\"user\",\"entityName\":null}],\"values\":[{\"key\":\"producer_byte_rate\",\"value\":1234.5}]}]}"));
+    vectors.add(new Vector("alterClientQuotas", "AlterClientQuotasRequest", (short) 0, "security",
+      new org.apache.kafka.common.message.AlterClientQuotasRequestData()
+        .setEntries(List.of(new org.apache.kafka.common.message.AlterClientQuotasRequestData.EntryData()
+        .setEntity(List.of(new org.apache.kafka.common.message.AlterClientQuotasRequestData.EntityData()
+        .setEntityType("user")
+        .setEntityName(null)))
+        .setOps(List.of(new org.apache.kafka.common.message.AlterClientQuotasRequestData.OpData()
+        .setKey("producer_byte_rate")
+        .setValue(1234.5d)
+        .setRemove(false)))))
+        .setValidateOnly(true),
+      "{\"entries\":[{\"entity\":[{\"entityType\":\"user\",\"entityName\":null}],\"ops\":[{\"key\":\"producer_byte_rate\",\"value\":1234.5,\"remove\":false}]}],\"validateOnly\":true}"));
+    vectors.add(new Vector("alterClientQuotas", "AlterClientQuotasResponse", (short) 0, "security",
+      new org.apache.kafka.common.message.AlterClientQuotasResponseData()
+        .setThrottleTimeMs(0)
+        .setEntries(List.of(new org.apache.kafka.common.message.AlterClientQuotasResponseData.EntryData()
+        .setErrorCode((short) 0)
+        .setErrorMessage(null)
+        .setEntity(List.of(new org.apache.kafka.common.message.AlterClientQuotasResponseData.EntityData()
+        .setEntityType("user")
+        .setEntityName(null))))),
+      "{\"throttleTimeMs\":0,\"entries\":[{\"errorCode\":0,\"errorMessage\":null,\"entity\":[{\"entityType\":\"user\",\"entityName\":null}]}]}"));
+    vectors.add(new Vector("alterClientQuotas", "AlterClientQuotasRequest", (short) 1, "security",
+      new org.apache.kafka.common.message.AlterClientQuotasRequestData()
+        .setEntries(List.of(new org.apache.kafka.common.message.AlterClientQuotasRequestData.EntryData()
+        .setEntity(List.of(new org.apache.kafka.common.message.AlterClientQuotasRequestData.EntityData()
+        .setEntityType("user")
+        .setEntityName(null)))
+        .setOps(List.of(new org.apache.kafka.common.message.AlterClientQuotasRequestData.OpData()
+        .setKey("producer_byte_rate")
+        .setValue(1234.5d)
+        .setRemove(false)))))
+        .setValidateOnly(true),
+      "{\"entries\":[{\"entity\":[{\"entityType\":\"user\",\"entityName\":null}],\"ops\":[{\"key\":\"producer_byte_rate\",\"value\":1234.5,\"remove\":false}]}],\"validateOnly\":true}"));
+    vectors.add(new Vector("alterClientQuotas", "AlterClientQuotasResponse", (short) 1, "security",
+      new org.apache.kafka.common.message.AlterClientQuotasResponseData()
+        .setThrottleTimeMs(0)
+        .setEntries(List.of(new org.apache.kafka.common.message.AlterClientQuotasResponseData.EntryData()
+        .setErrorCode((short) 0)
+        .setErrorMessage(null)
+        .setEntity(List.of(new org.apache.kafka.common.message.AlterClientQuotasResponseData.EntityData()
+        .setEntityType("user")
+        .setEntityName(null))))),
+      "{\"throttleTimeMs\":0,\"entries\":[{\"errorCode\":0,\"errorMessage\":null,\"entity\":[{\"entityType\":\"user\",\"entityName\":null}]}]}"));
+    vectors.add(new Vector("describeUserScramCredentials", "DescribeUserScramCredentialsRequest", (short) 0, "security",
+      new org.apache.kafka.common.message.DescribeUserScramCredentialsRequestData()
+        .setUsers(List.of(new org.apache.kafka.common.message.DescribeUserScramCredentialsRequestData.UserName()
+        .setName("test-user"))),
+      "{\"users\":[{\"name\":\"test-user\"}]}"));
+    vectors.add(new Vector("describeUserScramCredentials", "DescribeUserScramCredentialsResponse", (short) 0, "security",
+      new org.apache.kafka.common.message.DescribeUserScramCredentialsResponseData()
+        .setThrottleTimeMs(0)
+        .setErrorCode((short) 0)
+        .setErrorMessage(null)
+        .setResults(List.of(new org.apache.kafka.common.message.DescribeUserScramCredentialsResponseData.DescribeUserScramCredentialsResult()
+        .setUser("test-user")
+        .setErrorCode((short) 0)
+        .setErrorMessage(null)
+        .setCredentialInfos(List.of(new org.apache.kafka.common.message.DescribeUserScramCredentialsResponseData.CredentialInfo()
+        .setMechanism((byte) 1)
+        .setIterations(4096))))),
+      "{\"throttleTimeMs\":0,\"errorCode\":0,\"errorMessage\":null,\"results\":[{\"user\":\"test-user\",\"errorCode\":0,\"errorMessage\":null,\"credentialInfos\":[{\"mechanism\":1,\"iterations\":4096}]}]}"));
+    vectors.add(new Vector("alterUserScramCredentials", "AlterUserScramCredentialsRequest", (short) 0, "security",
+      new org.apache.kafka.common.message.AlterUserScramCredentialsRequestData()
+        .setDeletions(List.of(new org.apache.kafka.common.message.AlterUserScramCredentialsRequestData.ScramCredentialDeletion()
+        .setName("test-user")
+        .setMechanism((byte) 1)))
+        .setUpsertions(List.of(new org.apache.kafka.common.message.AlterUserScramCredentialsRequestData.ScramCredentialUpsertion()
+        .setName("test-user")
+        .setMechanism((byte) 1)
+        .setIterations(4096)
+        .setSalt(java.util.HexFormat.of().parseHex("73616c742d6d61726b65722d6f6e6c792d74657374"))
+        .setSaltedPassword(java.util.HexFormat.of().parseHex("646572697665642d6d61726b65722d6f6e6c792d74657374")))),
+      "{\"deletions\":[{\"name\":\"test-user\",\"mechanism\":1}],\"upsertions\":[{\"name\":\"test-user\",\"mechanism\":1,\"iterations\":4096,\"salt\":{\"$bytes\":\"73616c742d6d61726b65722d6f6e6c792d74657374\"},\"saltedPassword\":{\"$bytes\":\"646572697665642d6d61726b65722d6f6e6c792d74657374\"}}]}"));
+    vectors.add(new Vector("alterUserScramCredentials", "AlterUserScramCredentialsResponse", (short) 0, "security",
+      new org.apache.kafka.common.message.AlterUserScramCredentialsResponseData()
+        .setThrottleTimeMs(0)
+        .setResults(List.of(new org.apache.kafka.common.message.AlterUserScramCredentialsResponseData.AlterUserScramCredentialsResult()
+        .setUser("test-user")
+        .setErrorCode((short) 0)
+        .setErrorMessage(null))),
+      "{\"throttleTimeMs\":0,\"results\":[{\"user\":\"test-user\",\"errorCode\":0,\"errorMessage\":null}]}"));
+    return vectors;
+  }
+
+  /** Fixed synthetic vectors serialized by Apache Kafka.
+   * @return one request and response per implemented version
+   */
+  private static List<Vector> delegationTokenAdmin() {
+    List<Vector> vectors = new ArrayList<>();
+    vectors.add(new Vector("createDelegationToken", "CreateDelegationTokenRequest", (short) 1, "security",
+      new org.apache.kafka.common.message.CreateDelegationTokenRequestData()
+        .setRenewers(List.of(new org.apache.kafka.common.message.CreateDelegationTokenRequestData.CreatableRenewers()
+        .setPrincipalType("User")
+        .setPrincipalName("test-owner")))
+        .setMaxLifetimeMs(-1L),
+      "{\"renewers\":[{\"principalType\":\"User\",\"principalName\":\"test-owner\"}],\"maxLifetimeMs\":\"-1\"}"));
+    vectors.add(new Vector("createDelegationToken", "CreateDelegationTokenResponse", (short) 1, "security",
+      new org.apache.kafka.common.message.CreateDelegationTokenResponseData()
+        .setErrorCode((short) 0)
+        .setPrincipalType("User")
+        .setPrincipalName("test-owner")
+        .setIssueTimestampMs(9007199254740993L)
+        .setExpiryTimestampMs(9007199254740993L)
+        .setMaxTimestampMs(9007199254740993L)
+        .setTokenId("token-id")
+        .setHmac(java.util.HexFormat.of().parseHex("686d61632d6d61726b65722d6f6e6c792d74657374"))
+        .setThrottleTimeMs(0),
+      "{\"errorCode\":0,\"principalType\":\"User\",\"principalName\":\"test-owner\",\"issueTimestampMs\":\"9007199254740993\",\"expiryTimestampMs\":\"9007199254740993\",\"maxTimestampMs\":\"9007199254740993\",\"tokenId\":\"token-id\",\"hmac\":{\"$bytes\":\"686d61632d6d61726b65722d6f6e6c792d74657374\"},\"throttleTimeMs\":0}"));
+    vectors.add(new Vector("createDelegationToken", "CreateDelegationTokenRequest", (short) 2, "security",
+      new org.apache.kafka.common.message.CreateDelegationTokenRequestData()
+        .setRenewers(List.of(new org.apache.kafka.common.message.CreateDelegationTokenRequestData.CreatableRenewers()
+        .setPrincipalType("User")
+        .setPrincipalName("test-owner")))
+        .setMaxLifetimeMs(-1L),
+      "{\"renewers\":[{\"principalType\":\"User\",\"principalName\":\"test-owner\"}],\"maxLifetimeMs\":\"-1\"}"));
+    vectors.add(new Vector("createDelegationToken", "CreateDelegationTokenResponse", (short) 2, "security",
+      new org.apache.kafka.common.message.CreateDelegationTokenResponseData()
+        .setErrorCode((short) 0)
+        .setPrincipalType("User")
+        .setPrincipalName("test-owner")
+        .setIssueTimestampMs(9007199254740993L)
+        .setExpiryTimestampMs(9007199254740993L)
+        .setMaxTimestampMs(9007199254740993L)
+        .setTokenId("token-id")
+        .setHmac(java.util.HexFormat.of().parseHex("686d61632d6d61726b65722d6f6e6c792d74657374"))
+        .setThrottleTimeMs(0),
+      "{\"errorCode\":0,\"principalType\":\"User\",\"principalName\":\"test-owner\",\"issueTimestampMs\":\"9007199254740993\",\"expiryTimestampMs\":\"9007199254740993\",\"maxTimestampMs\":\"9007199254740993\",\"tokenId\":\"token-id\",\"hmac\":{\"$bytes\":\"686d61632d6d61726b65722d6f6e6c792d74657374\"},\"throttleTimeMs\":0}"));
+    vectors.add(new Vector("createDelegationToken", "CreateDelegationTokenRequest", (short) 3, "security",
+      new org.apache.kafka.common.message.CreateDelegationTokenRequestData()
+        .setOwnerPrincipalType("User")
+        .setOwnerPrincipalName("test-owner")
+        .setRenewers(List.of(new org.apache.kafka.common.message.CreateDelegationTokenRequestData.CreatableRenewers()
+        .setPrincipalType("User")
+        .setPrincipalName("test-owner")))
+        .setMaxLifetimeMs(-1L),
+      "{\"ownerPrincipalType\":\"User\",\"ownerPrincipalName\":\"test-owner\",\"renewers\":[{\"principalType\":\"User\",\"principalName\":\"test-owner\"}],\"maxLifetimeMs\":\"-1\"}"));
+    vectors.add(new Vector("createDelegationToken", "CreateDelegationTokenResponse", (short) 3, "security",
+      new org.apache.kafka.common.message.CreateDelegationTokenResponseData()
+        .setErrorCode((short) 0)
+        .setPrincipalType("User")
+        .setPrincipalName("test-owner")
+        .setTokenRequesterPrincipalType("User")
+        .setTokenRequesterPrincipalName("test-owner")
+        .setIssueTimestampMs(9007199254740993L)
+        .setExpiryTimestampMs(9007199254740993L)
+        .setMaxTimestampMs(9007199254740993L)
+        .setTokenId("token-id")
+        .setHmac(java.util.HexFormat.of().parseHex("686d61632d6d61726b65722d6f6e6c792d74657374"))
+        .setThrottleTimeMs(0),
+      "{\"errorCode\":0,\"principalType\":\"User\",\"principalName\":\"test-owner\",\"tokenRequesterPrincipalType\":\"User\",\"tokenRequesterPrincipalName\":\"test-owner\",\"issueTimestampMs\":\"9007199254740993\",\"expiryTimestampMs\":\"9007199254740993\",\"maxTimestampMs\":\"9007199254740993\",\"tokenId\":\"token-id\",\"hmac\":{\"$bytes\":\"686d61632d6d61726b65722d6f6e6c792d74657374\"},\"throttleTimeMs\":0}"));
+    vectors.add(new Vector("renewDelegationToken", "RenewDelegationTokenRequest", (short) 1, "security",
+      new org.apache.kafka.common.message.RenewDelegationTokenRequestData()
+        .setHmac(java.util.HexFormat.of().parseHex("686d61632d6d61726b65722d6f6e6c792d74657374"))
+        .setRenewPeriodMs(-1L),
+      "{\"hmac\":{\"$bytes\":\"686d61632d6d61726b65722d6f6e6c792d74657374\"},\"renewPeriodMs\":\"-1\"}"));
+    vectors.add(new Vector("renewDelegationToken", "RenewDelegationTokenResponse", (short) 1, "security",
+      new org.apache.kafka.common.message.RenewDelegationTokenResponseData()
+        .setErrorCode((short) 0)
+        .setExpiryTimestampMs(9007199254740993L)
+        .setThrottleTimeMs(0),
+      "{\"errorCode\":0,\"expiryTimestampMs\":\"9007199254740993\",\"throttleTimeMs\":0}"));
+    vectors.add(new Vector("renewDelegationToken", "RenewDelegationTokenRequest", (short) 2, "security",
+      new org.apache.kafka.common.message.RenewDelegationTokenRequestData()
+        .setHmac(java.util.HexFormat.of().parseHex("686d61632d6d61726b65722d6f6e6c792d74657374"))
+        .setRenewPeriodMs(-1L),
+      "{\"hmac\":{\"$bytes\":\"686d61632d6d61726b65722d6f6e6c792d74657374\"},\"renewPeriodMs\":\"-1\"}"));
+    vectors.add(new Vector("renewDelegationToken", "RenewDelegationTokenResponse", (short) 2, "security",
+      new org.apache.kafka.common.message.RenewDelegationTokenResponseData()
+        .setErrorCode((short) 0)
+        .setExpiryTimestampMs(9007199254740993L)
+        .setThrottleTimeMs(0),
+      "{\"errorCode\":0,\"expiryTimestampMs\":\"9007199254740993\",\"throttleTimeMs\":0}"));
+    vectors.add(new Vector("expireDelegationToken", "ExpireDelegationTokenRequest", (short) 1, "security",
+      new org.apache.kafka.common.message.ExpireDelegationTokenRequestData()
+        .setHmac(java.util.HexFormat.of().parseHex("686d61632d6d61726b65722d6f6e6c792d74657374"))
+        .setExpiryTimePeriodMs(-1L),
+      "{\"hmac\":{\"$bytes\":\"686d61632d6d61726b65722d6f6e6c792d74657374\"},\"expiryTimePeriodMs\":\"-1\"}"));
+    vectors.add(new Vector("expireDelegationToken", "ExpireDelegationTokenResponse", (short) 1, "security",
+      new org.apache.kafka.common.message.ExpireDelegationTokenResponseData()
+        .setErrorCode((short) 0)
+        .setExpiryTimestampMs(9007199254740993L)
+        .setThrottleTimeMs(0),
+      "{\"errorCode\":0,\"expiryTimestampMs\":\"9007199254740993\",\"throttleTimeMs\":0}"));
+    vectors.add(new Vector("expireDelegationToken", "ExpireDelegationTokenRequest", (short) 2, "security",
+      new org.apache.kafka.common.message.ExpireDelegationTokenRequestData()
+        .setHmac(java.util.HexFormat.of().parseHex("686d61632d6d61726b65722d6f6e6c792d74657374"))
+        .setExpiryTimePeriodMs(-1L),
+      "{\"hmac\":{\"$bytes\":\"686d61632d6d61726b65722d6f6e6c792d74657374\"},\"expiryTimePeriodMs\":\"-1\"}"));
+    vectors.add(new Vector("expireDelegationToken", "ExpireDelegationTokenResponse", (short) 2, "security",
+      new org.apache.kafka.common.message.ExpireDelegationTokenResponseData()
+        .setErrorCode((short) 0)
+        .setExpiryTimestampMs(9007199254740993L)
+        .setThrottleTimeMs(0),
+      "{\"errorCode\":0,\"expiryTimestampMs\":\"9007199254740993\",\"throttleTimeMs\":0}"));
+    vectors.add(new Vector("describeDelegationToken", "DescribeDelegationTokenRequest", (short) 1, "security",
+      new org.apache.kafka.common.message.DescribeDelegationTokenRequestData()
+        .setOwners(List.of(new org.apache.kafka.common.message.DescribeDelegationTokenRequestData.DescribeDelegationTokenOwner()
+        .setPrincipalType("User")
+        .setPrincipalName("test-owner"))),
+      "{\"owners\":[{\"principalType\":\"User\",\"principalName\":\"test-owner\"}]}"));
+    vectors.add(new Vector("describeDelegationToken", "DescribeDelegationTokenResponse", (short) 1, "security",
+      new org.apache.kafka.common.message.DescribeDelegationTokenResponseData()
+        .setErrorCode((short) 0)
+        .setTokens(List.of(new org.apache.kafka.common.message.DescribeDelegationTokenResponseData.DescribedDelegationToken()
+        .setPrincipalType("User")
+        .setPrincipalName("test-owner")
+        .setIssueTimestamp(9007199254740993L)
+        .setExpiryTimestamp(9007199254740993L)
+        .setMaxTimestamp(9007199254740993L)
+        .setTokenId("token-id")
+        .setHmac(java.util.HexFormat.of().parseHex("686d61632d6d61726b65722d6f6e6c792d74657374"))
+        .setRenewers(List.of(new org.apache.kafka.common.message.DescribeDelegationTokenResponseData.DescribedDelegationTokenRenewer()
+        .setPrincipalType("User")
+        .setPrincipalName("test-owner")))))
+        .setThrottleTimeMs(0),
+      "{\"errorCode\":0,\"tokens\":[{\"principalType\":\"User\",\"principalName\":\"test-owner\",\"issueTimestamp\":\"9007199254740993\",\"expiryTimestamp\":\"9007199254740993\",\"maxTimestamp\":\"9007199254740993\",\"tokenId\":\"token-id\",\"hmac\":{\"$bytes\":\"686d61632d6d61726b65722d6f6e6c792d74657374\"},\"renewers\":[{\"principalType\":\"User\",\"principalName\":\"test-owner\"}]}],\"throttleTimeMs\":0}"));
+    vectors.add(new Vector("describeDelegationToken", "DescribeDelegationTokenRequest", (short) 2, "security",
+      new org.apache.kafka.common.message.DescribeDelegationTokenRequestData()
+        .setOwners(List.of(new org.apache.kafka.common.message.DescribeDelegationTokenRequestData.DescribeDelegationTokenOwner()
+        .setPrincipalType("User")
+        .setPrincipalName("test-owner"))),
+      "{\"owners\":[{\"principalType\":\"User\",\"principalName\":\"test-owner\"}]}"));
+    vectors.add(new Vector("describeDelegationToken", "DescribeDelegationTokenResponse", (short) 2, "security",
+      new org.apache.kafka.common.message.DescribeDelegationTokenResponseData()
+        .setErrorCode((short) 0)
+        .setTokens(List.of(new org.apache.kafka.common.message.DescribeDelegationTokenResponseData.DescribedDelegationToken()
+        .setPrincipalType("User")
+        .setPrincipalName("test-owner")
+        .setIssueTimestamp(9007199254740993L)
+        .setExpiryTimestamp(9007199254740993L)
+        .setMaxTimestamp(9007199254740993L)
+        .setTokenId("token-id")
+        .setHmac(java.util.HexFormat.of().parseHex("686d61632d6d61726b65722d6f6e6c792d74657374"))
+        .setRenewers(List.of(new org.apache.kafka.common.message.DescribeDelegationTokenResponseData.DescribedDelegationTokenRenewer()
+        .setPrincipalType("User")
+        .setPrincipalName("test-owner")))))
+        .setThrottleTimeMs(0),
+      "{\"errorCode\":0,\"tokens\":[{\"principalType\":\"User\",\"principalName\":\"test-owner\",\"issueTimestamp\":\"9007199254740993\",\"expiryTimestamp\":\"9007199254740993\",\"maxTimestamp\":\"9007199254740993\",\"tokenId\":\"token-id\",\"hmac\":{\"$bytes\":\"686d61632d6d61726b65722d6f6e6c792d74657374\"},\"renewers\":[{\"principalType\":\"User\",\"principalName\":\"test-owner\"}]}],\"throttleTimeMs\":0}"));
+    vectors.add(new Vector("describeDelegationToken", "DescribeDelegationTokenRequest", (short) 3, "security",
+      new org.apache.kafka.common.message.DescribeDelegationTokenRequestData()
+        .setOwners(List.of(new org.apache.kafka.common.message.DescribeDelegationTokenRequestData.DescribeDelegationTokenOwner()
+        .setPrincipalType("User")
+        .setPrincipalName("test-owner"))),
+      "{\"owners\":[{\"principalType\":\"User\",\"principalName\":\"test-owner\"}]}"));
+    vectors.add(new Vector("describeDelegationToken", "DescribeDelegationTokenResponse", (short) 3, "security",
+      new org.apache.kafka.common.message.DescribeDelegationTokenResponseData()
+        .setErrorCode((short) 0)
+        .setTokens(List.of(new org.apache.kafka.common.message.DescribeDelegationTokenResponseData.DescribedDelegationToken()
+        .setPrincipalType("User")
+        .setPrincipalName("test-owner")
+        .setTokenRequesterPrincipalType("User")
+        .setTokenRequesterPrincipalName("test-owner")
+        .setIssueTimestamp(9007199254740993L)
+        .setExpiryTimestamp(9007199254740993L)
+        .setMaxTimestamp(9007199254740993L)
+        .setTokenId("token-id")
+        .setHmac(java.util.HexFormat.of().parseHex("686d61632d6d61726b65722d6f6e6c792d74657374"))
+        .setRenewers(List.of(new org.apache.kafka.common.message.DescribeDelegationTokenResponseData.DescribedDelegationTokenRenewer()
+        .setPrincipalType("User")
+        .setPrincipalName("test-owner")))))
+        .setThrottleTimeMs(0),
+      "{\"errorCode\":0,\"tokens\":[{\"principalType\":\"User\",\"principalName\":\"test-owner\",\"tokenRequesterPrincipalType\":\"User\",\"tokenRequesterPrincipalName\":\"test-owner\",\"issueTimestamp\":\"9007199254740993\",\"expiryTimestamp\":\"9007199254740993\",\"maxTimestamp\":\"9007199254740993\",\"tokenId\":\"token-id\",\"hmac\":{\"$bytes\":\"686d61632d6d61726b65722d6f6e6c792d74657374\"},\"renewers\":[{\"principalType\":\"User\",\"principalName\":\"test-owner\"}]}],\"throttleTimeMs\":0}"));
+    return vectors;
+  }
+
+  /**
+   * Computes SCRAM Hi using Java's PBKDF2 implementation over synthetic fixed inputs.
+   * @param root repository receiving the independently computed credential fixtures
+   * @throws IOException derivation or write failure
+   */
+  private static void scramHiVectors(Path root) throws IOException {
+    Path dir = root.resolve("src/protocol/requests/alterUserScramCredentials/fixtures/java");
+    Files.createDirectories(dir);
+    for (String digest : List.of("SHA256", "SHA512")) {
+      char[] password = "password-marker-only-test".toCharArray();
+      byte[] salt = "salt-marker-only-test".getBytes(StandardCharsets.UTF_8);
+      javax.crypto.spec.PBEKeySpec spec = new javax.crypto.spec.PBEKeySpec(password, salt, 4096,
+          digest.equals("SHA256") ? 256 : 512);
+      try {
+        byte[] derived = javax.crypto.SecretKeyFactory.getInstance("PBKDF2WithHmac" + digest)
+            .generateSecret(spec).getEncoded();
+        String document = obj(kv("password", str("password-marker-only-test")),
+            kv("saltHex", str(java.util.HexFormat.of().formatHex(salt))),
+            kv("iterations", "4096"),
+            kv("hex", str(java.util.HexFormat.of().formatHex(derived))));
+        Files.writeString(dir.resolve("scramHi-" + digest.toLowerCase() + ".json"), document,
+            StandardCharsets.UTF_8);
+        Arrays.fill(derived, (byte) 0);
+      } catch (java.security.GeneralSecurityException error) {
+        throw new IOException("SCRAM vector derivation failed", error);
+      } finally {
+        spec.clearPassword(); Arrays.fill(password, '\0'); Arrays.fill(salt, (byte) 0);
+      }
+    }
+  }
+
 }

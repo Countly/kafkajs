@@ -372,7 +372,9 @@ class RecordingCluster {
     const id = Number(nodeId)
     if (!this.brokers.has(id)) {
       const broker = new RecordingBroker({
-        connectionPool: new RecordingConnectionPool({ nodeId: id, requests: this.requests }),
+        connectionPool: require('../setupPool')(
+          new RecordingConnectionPool({ nodeId: id, requests: this.requests })
+        ),
         logger: silentLogger(),
         nodeId: id,
       })

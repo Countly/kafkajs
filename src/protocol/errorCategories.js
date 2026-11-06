@@ -36,10 +36,11 @@ const ANY = null
  *
  * The refresh-retriable rows are the Java client's `RefreshRetriableException` subclasses. One
  * group differs from KIP-1050's own table on purpose: ILLEGAL_GENERATION, UNKNOWN_MEMBER_ID,
- * FENCED_INSTANCE_ID and STALE_MEMBER_EPOCH from TxnOffsetCommit are abortable — the application
- * aborts, the consumer rejoins and the batch is reprocessed — where KIP-1050 would have the
- * producer re-created on every rebalance race. (The Java 4.3 client has no branch for
- * STALE_MEMBER_EPOCH there at all.)
+ * FENCED_INSTANCE_ID, STALE_MEMBER_EPOCH and, from TxnOffsetCommit v6, GROUP_ID_NOT_FOUND are
+ * abortable — the application aborts, the consumer rejoins and the batch is reprocessed — where
+ * KIP-1050 would have the producer re-created on every rebalance race. (The Java 4.3 client has no
+ * branch for STALE_MEMBER_EPOCH there at all.) GROUP_ID_NOT_FOUND is abortable on that surface
+ * only: it keeps the category its flag gives it everywhere else.
  *
  * Two codes hold on more than the request one would expect. GROUP_AUTHORIZATION_FAILED is a
  * configuration error on every surface: FindCoordinator, AddOffsetsToTxn and TxnOffsetCommit all
@@ -74,7 +75,7 @@ const ROWS = [
     surfaces: ['txn'],
     category: { transactional: 'abortable', idempotent: 'applicationRecoverable' },
   },
-  { codes: [22, 25, 82, 113], surfaces: ['offsets'], category: 'abortable' },
+  { codes: [22, 25, 69, 82, 113], surfaces: ['offsets'], category: 'abortable' },
   { codes: [47, 49, 90], surfaces: ANY, category: 'applicationRecoverable' },
   { codes: [48], surfaces: ['txn', 'offsets'], category: 'applicationRecoverable' },
   { codes: [22, 25, 82], surfaces: ['produce', 'txn'], category: 'applicationRecoverable' },

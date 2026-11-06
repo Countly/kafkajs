@@ -1,0 +1,7 @@
+{
+  "message": "ElectLeadersRequest",
+  "version": 1,
+  "case": "basic",
+  "hex": "010000000100066f72646572730000000200000000000000020000ea60",
+  "fields": {"electionType":1,"topicPartitions":[{"topic":"orders","partitions":[0,2]}],"timeoutMs":60000}
+}

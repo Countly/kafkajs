@@ -172,23 +172,23 @@
       0,
       0
     ],
-    "ApiKey47": [
+    "OffsetDelete": [
       0,
       0
     ],
-    "ApiKey48": [
+    "DescribeClientQuotas": [
       0,
       1
     ],
-    "ApiKey49": [
+    "AlterClientQuotas": [
       0,
       1
     ],
-    "ApiKey50": [
+    "DescribeUserScramCredentials": [
       0,
       0
     ],
-    "ApiKey51": [
+    "AlterUserScramCredentials": [
       0,
       0
     ],
@@ -196,15 +196,15 @@
       0,
       2
     ],
-    "ApiKey57": [
+    "UpdateFeatures": [
       0,
       2
     ],
-    "ApiKey60": [
+    "DescribeCluster": [
       0,
       2
     ],
-    "ApiKey61": [
+    "DescribeProducers": [
       0,
       0
     ],
@@ -212,11 +212,11 @@
       0,
       0
     ],
-    "ApiKey65": [
+    "DescribeTransactions": [
       0,
       0
     ],
-    "ApiKey66": [
+    "ListTransactions": [
       0,
       1
     ],
@@ -228,7 +228,7 @@
       0,
       1
     ],
-    "ApiKey74": [
+    "ListConfigResources": [
       0,
       0
     ],
@@ -418,23 +418,23 @@
       0,
       0
     ],
-    "ApiKey47": [
+    "OffsetDelete": [
       0,
       0
     ],
-    "ApiKey48": [
+    "DescribeClientQuotas": [
       0,
       1
     ],
-    "ApiKey49": [
+    "AlterClientQuotas": [
       0,
       1
     ],
-    "ApiKey50": [
+    "DescribeUserScramCredentials": [
       0,
       0
     ],
-    "ApiKey51": [
+    "AlterUserScramCredentials": [
       0,
       0
     ],
@@ -442,15 +442,15 @@
       0,
       2
     ],
-    "ApiKey57": [
+    "UpdateFeatures": [
       0,
       2
     ],
-    "ApiKey60": [
+    "DescribeCluster": [
       0,
       2
     ],
-    "ApiKey61": [
+    "DescribeProducers": [
       0,
       0
     ],
@@ -458,11 +458,11 @@
       0,
       0
     ],
-    "ApiKey65": [
+    "DescribeTransactions": [
       0,
       0
     ],
-    "ApiKey66": [
+    "ListTransactions": [
       0,
       2
     ],
@@ -474,7 +474,7 @@
       0,
       1
     ],
-    "ApiKey74": [
+    "ListConfigResources": [
       0,
       1
     ],
@@ -712,23 +712,23 @@
       0,
       0
     ],
-    "ApiKey47": [
+    "OffsetDelete": [
       0,
       0
     ],
-    "ApiKey48": [
+    "DescribeClientQuotas": [
       0,
       1
     ],
-    "ApiKey49": [
+    "AlterClientQuotas": [
       0,
       1
     ],
-    "ApiKey50": [
+    "DescribeUserScramCredentials": [
       0,
       0
     ],
-    "ApiKey51": [
+    "AlterUserScramCredentials": [
       0,
       0
     ],
@@ -736,15 +736,15 @@
       0,
       2
     ],
-    "ApiKey57": [
+    "UpdateFeatures": [
       0,
       2
     ],
-    "ApiKey60": [
+    "DescribeCluster": [
       0,
       2
     ],
-    "ApiKey61": [
+    "DescribeProducers": [
       0,
       0
     ],
@@ -752,11 +752,11 @@
       0,
       0
     ],
-    "ApiKey65": [
+    "DescribeTransactions": [
       0,
       0
     ],
-    "ApiKey66": [
+    "ListTransactions": [
       0,
       2
     ],
@@ -768,7 +768,7 @@
       0,
       1
     ],
-    "ApiKey74": [
+    "ListConfigResources": [
       0,
       1
     ],
@@ -1014,23 +1014,23 @@
       0,
       0
     ],
-    "ApiKey47": [
+    "OffsetDelete": [
       0,
       0
     ],
-    "ApiKey48": [
+    "DescribeClientQuotas": [
       0,
       1
     ],
-    "ApiKey49": [
+    "AlterClientQuotas": [
       0,
       1
     ],
-    "ApiKey50": [
+    "DescribeUserScramCredentials": [
       0,
       0
     ],
-    "ApiKey51": [
+    "AlterUserScramCredentials": [
       0,
       0
     ],
@@ -1038,15 +1038,15 @@
       0,
       2
     ],
-    "ApiKey57": [
+    "UpdateFeatures": [
       0,
       2
     ],
-    "ApiKey60": [
+    "DescribeCluster": [
       0,
       2
     ],
-    "ApiKey61": [
+    "DescribeProducers": [
       0,
       0
     ],
@@ -1054,11 +1054,11 @@
       0,
       0
     ],
-    "ApiKey65": [
+    "DescribeTransactions": [
       0,
       0
     ],
-    "ApiKey66": [
+    "ListTransactions": [
       0,
       2
     ],
@@ -1070,7 +1070,7 @@
       0,
       1
     ],
-    "ApiKey74": [
+    "ListConfigResources": [
       0,
       1
     ],

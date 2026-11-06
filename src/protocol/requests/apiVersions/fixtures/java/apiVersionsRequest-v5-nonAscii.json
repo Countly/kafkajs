@@ -1,0 +1,7 @@
+{
+  "message": "ApiVersionsRequest",
+  "version": 5,
+  "case": "nonAscii",
+  "hex": "0b6b61666b616a732dc3a90d332e302e302de697a5e69cac12636c75737465722dc3a92de697a5e69cac0000000000",
+  "fields": { "clientSoftwareName": "kafkajs-é", "clientSoftwareVersion": "3.0.0-日本", "clusterId": "cluster-é-日本", "nodeId": 0 }
+}

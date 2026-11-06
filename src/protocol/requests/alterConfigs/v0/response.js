@@ -32,7 +32,10 @@ const decode = async (rawData) => {
 const parse = async (data) => {
   const resourcesWithError = data.resources.filter(({ errorCode }) => failure(errorCode))
   if (resourcesWithError.length > 0) {
-    throw createErrorFromCode(resourcesWithError[0].errorCode)
+    const resource = resourcesWithError[0]
+    const error = createErrorFromCode(resource.errorCode)
+    error.errorMessage = resource.errorMessage ?? null
+    throw error
   }
 
   return data

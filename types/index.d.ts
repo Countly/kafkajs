@@ -52,7 +52,21 @@ export interface KafkaConfig {
   ssl?: tls.ConnectionOptions | boolean
   sasl?: SASLOptions | Mechanism
   clientId?: string
+  /** Whole ready budget in ms; omitted 10000 growing to 30000, explicit base alone stays flat. */
   connectionTimeout?: number
+  /** Integer 1..2147483647, at least the explicit base. Max alone clamps the default base. */
+  connectionTimeoutMax?: number
+  /** Integer 0..2147483647; initial retry wait, default 50; base alone stays flat. */
+  reconnectBackoff?: number
+  /** Retry wait ceiling, default 1000; at least its base. */
+  reconnectBackoffMax?: number
+  /**
+   * Idle milliseconds before an empty connection is closed. Default 540000; 0 disables.
+   * Must be an integer 0..2147483647. The next request reconnects and renegotiates versions.
+   * Preparation, queued requests and in-flight requests prevent reaping.
+   */
+  connectionsMaxIdle?: number
+  /** Whole SASL exchange cap in ms, including supplier work; default 10000. */
   authenticationTimeout?: number
   reauthenticationThreshold?: number
   requestTimeout?: number
@@ -82,9 +96,103 @@ export type ISocketFactory = (args: ISocketFactoryArgs) => net.Socket
 
 export interface OauthbearerProviderResponse {
   value: string
+  /** SASL extensions sent with the token (RFC 7628 §3.1). */
+  extensions?: Record<string, string>
+}
+
+/**
+ * An `oauthBearerProvider` callback built by an `oauthBearer` helper. It shares one token
+ * retrieval among concurrent authentications and refreshes the token ahead of its expiry.
+ */
+export interface OAuthBearerTokenProvider {
+  (): Promise<OauthbearerProviderResponse>
+  /** Aborts an in-flight request, clears the timers and rejects later calls. Idempotent. */
+  close(): void
+}
+
+/** Options every `oauthBearer` provider factory accepts; each is optional. */
+export interface OAuthBearerHelperOptions {
+  /** One HTTP attempt in ms, headers and body included, clamped to the remaining budget. Default 5000. */
+  timeout?: number
+  /** Backoff between attempts in ms, doubling from `initial` up to `max`. Default 100 and 10000. */
+  retry?: { initial?: number; max?: number }
+  /** One retrieval in ms: supplier, file and key work, every attempt and backoff. Default 8000. */
+  maxRetryTime?: number
+  /** Fraction of the token lifetime after which it is refreshed. Default 0.8. */
+  refreshWindow?: number
+  /** Random spread around `refreshWindow`, as a fraction. Default 0.05. */
+  refreshJitter?: number
+  /** Earliest proactive refresh after a fetch, in ms. Default 60000. */
+  minRefreshPeriod?: number
+  /** Refresh at least this many ms before expiry where `minRefreshPeriod` allows. Default 300000. */
+  refreshBuffer?: number
+  /** A token counts as expired this many ms before its expiry. Default 30000. */
+  clockSkew?: number
+  /** SASL extensions copied into every response. */
+  extensions?: Record<string, string>
+  /** Accept an `http:` endpoint on a literal loopback host, for tests only. Default false. */
+  allowInsecure?: boolean
+  /** The transport, for a proxy or a private certificate authority. Default the global `fetch`. */
+  fetch?: typeof fetch
+}
+
+/** Returns a signed JWT assertion; called once per token request. */
+export type AssertionSupplier = () => string | Promise<string>
+
+/** Builders of the existing `oauthBearerProvider` callback, and a local assertion signer. */
+export const oauthBearer: {
+  /** The client-credentials grant, authenticated with a client secret or a client assertion. */
+  clientCredentials(
+    options: OAuthBearerHelperOptions & { tokenEndpointUrl: string; scope?: string; clientId: string } & (
+        | { clientSecret: string; clientAssertion?: never }
+        | { clientAssertion: AssertionSupplier; clientSecret?: never }
+      )
+  ): OAuthBearerTokenProvider
+  /** The JWT-bearer grant: the supplied assertion is the grant. */
+  jwtBearer(
+    options: OAuthBearerHelperOptions & {
+      tokenEndpointUrl: string
+      assertion: AssertionSupplier
+      scope?: string
+    }
+  ): OAuthBearerTokenProvider
+  /** A token file, read again when it changes or its token nears expiry. */
+  fileToken(options: OAuthBearerHelperOptions & { path: string }): OAuthBearerTokenProvider
+  /** A supplier of locally signed JWT assertions; not a token provider. */
+  signAssertion(options: {
+    /** PEM text, a PEM Buffer, a private key object, or a file read again when it changes. */
+    privateKey: string | Buffer | import('crypto').KeyObject | { file: string }
+    /** Default RS256. ECDSA signatures use the JOSE encoding. */
+    algorithm?: 'RS256' | 'RS384' | 'RS512' | 'ES256' | 'ES384' | 'ES512'
+    /** Claims added to every assertion; `iat`, `nbf`, `exp` and `jti` come only from the options below. */
+    claims?: { iss?: string; sub?: string; aud?: string | string[] } & Record<string, unknown>
+    /** Seconds from `iat` to `exp`. Default 300. */
+    expiresIn?: number
+    /** Seconds `nbf` precedes `iat`. Default 60. */
+    notBefore?: number
+    /** Add a random UUID `jti`. Default false. */
+    jti?: boolean
+    /** The header's `kid`. */
+    keyId?: string
+    /** Decrypts an encrypted PEM key. */
+    passphrase?: string
+  }): AssertionSupplier
+}
+
+/** Environment-backed Kerberos authentication through the optional native peer.
+ * Authentication creates a new context and never manages or renews tickets.
+ */
+export interface GssapiSaslOptions {
+  /** Built-in mechanism name; custom Mechanism providers retain precedence. */
+  mechanism: 'gssapi'
+  /** Service component without @, slash or NUL; defaults to kafka. */
+  serviceName?: string
+  /** Credential principal and authorization identity; defaults to native credentials. */
+  principal?: string
 }
 
 type SASLMechanismOptionsMap = {
+  gssapi: Omit<GssapiSaslOptions, 'mechanism'>
   plain: { username: string; password: string }
   'scram-sha-256': { username: string; password: string }
   'scram-sha-512': { username: string; password: string }
@@ -109,6 +217,18 @@ export interface ProducerConfig {
    */
   compressionLevels?: { gzip?: number; zstd?: number }
   createPartitioner?: ICustomPartitioner
+  /**
+   * The producer's rack (KIP-1123): the `broker.rack` it runs in. It changes nothing unless
+   * `rackAware` is true. Defaults to `''`; not a string is rejected.
+   */
+  rackId?: string
+  /**
+   * With a non-empty `rackId`, the built-in partitioners prefer the partitions whose leader is in
+   * that rack for records without a key, and use every partition with a leader when none is.
+   * Records with a partition or a key keep their partition, and a custom `createPartitioner` is
+   * not affected. Defaults to `false`; true with an empty `rackId`, or not a boolean, is rejected.
+   */
+  rackAware?: boolean
   retry?: RetryOptions
   metadataMaxAge?: number
   allowAutoTopicCreation?: boolean
@@ -475,7 +595,27 @@ export interface RetryOptions {
 
 export interface AdminConfig {
   retry?: RetryOptions
+  /** Default end-to-end call budget, integer 1..2147483647 ms; default 60000. */
+  apiTimeout?: number
 }
+
+/** Additive per-call budget; a transmitted mutation may already have been applied on timeout. */
+export interface ApiTimeoutOption {
+  apiTimeout?: number
+}
+
+/** Named broker timestamp specifications; unsupported versions reject before transmission. */
+export type OffsetSpecName = 'maxTimestamp' | 'earliestLocal' | 'latestTiered' | 'earliestPendingUpload'
+
+/** Per-item result for the additive admin families; legacy void/aggregate contracts stay intact. */
+export interface AdminItemResult {
+  errorCode: number
+  error: KafkaJSError | null
+  errorMessage: string | null
+}
+
+/** Topics with their partition numbers; shared by the admin APIs that select partitions. */
+export type TopicPartitionList = Array<{ topic: string; partitions: number[] }>
 
 export interface ITopicConfig {
   topic: string
@@ -492,6 +632,8 @@ export interface ITopicPartitionConfig {
 }
 
 export interface ITopicMetadata {
+  /** Raw signed INT32 mask; null if not requested, unsupported, absent or -2147483648. */
+  authorizedOperations?: number | null
   name: string
   partitions: PartitionMetadata[]
   /** The topic's id (KIP-516); `null` when the broker sends none, absent below Metadata v10. */
@@ -833,81 +975,277 @@ export interface OngoingPartitionReassignment {
   removingReplicas?: number[]
 }
 
+/** Producer state observed on a partition replica; int64 fields are decimal strings. */
+export interface TransactionProducerState {
+  producerId: string
+  producerEpoch: number
+  lastSequence: number
+  lastTimestamp: string
+  coordinatorEpoch: number
+  currentTxnStartOffset: string
+}
+/** One transaction coordinator's description, including broker sentinels on failed items. */
+export interface TransactionDescription extends AdminItemResult {
+  transactionalId: string
+  state: string
+  timeoutMs: number
+  startTimeMs: string
+  producerId: string
+  producerEpoch: number
+  topics: TopicPartitionList
+}
+
 export type Admin = {
+  /** Describes partition leaders or one named replica; errors are partition data.
+   * @param options unique topicPartitions and optional brokerId
+   * @returns topic results with lossless int64 producer state
+   * @throws invalid input, capability, malformed identity or apiTimeout
+   */
+  describeProducers(options: { topicPartitions: TopicPartitionList; brokerId?: number } & ApiTimeoutOption): Promise<Array<{
+    topic: string
+    partitions: Array<{ partition: number; activeProducers: TransactionProducerState[] } & AdminItemResult>
+  }>>
+  /** Describes ids batched per transaction coordinator; completed items are never retried.
+   * @param options unique nonempty transactionalIds
+   * @returns caller-ordered descriptions with per-id errors
+   * @throws invalid input, capability, malformed identity or apiTimeout
+   */
+  describeTransactions(options: { transactionalIds: string[] } & ApiTimeoutOption): Promise<TransactionDescription[]>
+  /** Lists every broker sequentially, failing the whole call if a broker fails.
+   * @param options optional filters; pattern is a broker RE2 string, meaningful pattern needs v2
+   * @returns combined transactions and unknown state names
+   * @throws invalid filter, unavailable capability, broker error or apiTimeout
+   */
+  listTransactions(options?: {
+    states?: string[]
+    producerIds?: Array<string | number>
+    durationFilter?: number
+    transactionalIdPattern?: string
+  } & ApiTimeoutOption): Promise<{ transactions: Array<{ transactionalId: string; producerId: string; state: string }>; unknownStateFilters: string[] }>
+  /** Writes one abort marker to the leader; an expired call can have applied remotely.
+   * @param options exact producer/topic/partition identity and epochs
+   * @returns completion without an item-result object
+   * @throws invalid input, capability, marker identity, terminal protocol or apiTimeout
+   */
+  abortTransaction(options: { topic: string; partition: number; producerId: string | number; producerEpoch: number; coordinatorEpoch: number } & ApiTimeoutOption): Promise<void>
+  /** Fences ids with InitProducerId's minus-one sentinels; existing producer objects are independent.
+   * @param options ids and transactionTimeout integer ms, default 60000
+   * @returns per-id producerId/epoch, or null on unresolved local failure
+   * @throws invalid input, capability or apiTimeout
+   */
+  fenceProducers(options: { transactionalIds: string[]; transactionTimeout?: number } & ApiTimeoutOption): Promise<Array<{ transactionalId: string; producerId: string | null; producerEpoch: number | null } & AdminItemResult>>
+
   connect(): Promise<void>
+  /**
+   * Drains admitted calls naturally, or forces their captured lifecycle closed at the deadline.
+   * Concurrent calls share the first valid deadline and cleanup. Invalid object timeouts reject
+   * before mutation; legacy non-object callback arguments are ignored at runtime.
+   * @param options timeout in milliseconds, an integer from 0 through 2147483647
+   * @returns shared cleanup; call connect() explicitly to resume operations afterwards
+   * @throws KafkaJSInvalidConfigurationError for an invalid object timeout
+   * @throws Error when natural transport cleanup fails
+   */
+  disconnect(options?: { timeout?: number }): Promise<void>
   disconnect(): Promise<void>
-  listTopics(): Promise<string[]>
-  createTopics(options: {
+  listTopics(options?: ApiTimeoutOption): Promise<string[]>
+listTopics(): Promise<string[]>
+  createTopics(options: ({
     validateOnly?: boolean
     waitForLeaders?: boolean
     timeout?: number
     topics: ITopicConfig[]
-  }): Promise<boolean>
-  deleteTopics(options: { topics: string[]; timeout?: number }): Promise<void>
-  createPartitions(options: {
+  }) & ApiTimeoutOption): Promise<boolean>
+  deleteTopics(options: ({ topics: string[]; topicIds?: never } | { topicIds: string[]; topics?: never }) & { timeout?: number } & ApiTimeoutOption): Promise<void>
+  createPartitions(options: ({
     validateOnly?: boolean
     timeout?: number
     topicPartitions: ITopicPartitionConfig[]
-  }): Promise<boolean>
+  }) & ApiTimeoutOption): Promise<boolean>
   /**
    * With `useDescribeTopicPartitions` and at least one topic the topics are read through
    * DescribeTopicPartitions (KIP-966); without topics, or on a broker that lacks the API, through
    * Metadata, which lists every topic when none is named.
    */
-  fetchTopicMetadata(options?: {
+  fetchTopicMetadata(options?: ({
     topics?: string[]
     useDescribeTopicPartitions?: boolean
-  }): Promise<{ topics: Array<ITopicMetadata> }>
-  fetchOffsets(options: {
+    includeTopicAuthorizedOperations?: boolean
+  }) & ApiTimeoutOption): Promise<{ topics: Array<ITopicMetadata> }>
+  deleteOffsets(options: { groupId: string; topics: Array<{topic: string; partitions: number[]}> } & ApiTimeoutOption): Promise<{
+    topics: Array<{topic: string; partitions: Array<{partition: number} & AdminItemResult>}>
+  }>
+  fetchOffsetsForGroups(options: {
+    groups: Array<{groupId: string; topics?: Array<{topic: string; partitions?: number[]}>}>
+    requireStable?: boolean
+  } & ApiTimeoutOption): Promise<Array<{
+    groupId: string
+    topics: Array<{topic: string; partitions: Array<{partition: number; offset: string; metadata: string | null; leaderEpoch: number | null} & AdminItemResult>}>
+  } & AdminItemResult>>
+  fetchOffsets(options: ({
     groupId: string
     topics?: string[]
     resolveOffsets?: boolean
-  }): Promise<Array<{ topic: string; partitions: FetchOffsetsPartition[] }>>
-  fetchTopicOffsets(topic: string): Promise<Array<SeekEntry & { high: string; low: string }>>
-  fetchTopicOffsetsByTimestamp(topic: string, timestamp?: number): Promise<Array<SeekEntry>>
-  describeCluster(): Promise<{
+    requireStable?: boolean
+  }) & ApiTimeoutOption): Promise<Array<{ topic: string; partitions: FetchOffsetsPartition[] }>>
+  describeLogDirs(options?: { brokers?: number[]; topicPartitions?: Array<{topic:string;partitions:number[]}> | null } & ApiTimeoutOption): Promise<Array<{
+    brokerId:number; errorCode:number; error:KafkaJSError|null; errorMessage:string|null
+    logDirs:Array<{path:string;totalBytes:string|null;usableBytes:string|null;isCordoned:boolean|null;topics:Array<{topic:string;partitions:Array<{partition:number;size:string;offsetLag:string;isFuture:boolean}>}>} & AdminItemResult>
+  }>>
+  alterReplicaLogDirs(options:{replicas:Array<{topic:string;partition:number;brokerId:number;logDir:string}>} & ApiTimeoutOption):Promise<Array<{topic:string;partition:number;brokerId:number} & AdminItemResult>>
+  describeReplicaLogDirs(options:{replicas:Array<{topic:string;partition:number;brokerId:number}>} & ApiTimeoutOption):Promise<Array<{topic:string;partition:number;brokerId:number;currentLogDir:string|null;futureLogDir:string|null;currentOffsetLag:string|null;futureOffsetLag:string|null} & AdminItemResult>>
+  fetchTopicOffsets(topic: string, options?: ApiTimeoutOption & { isolationLevel?: 'read_committed' | 'read_uncommitted' }): Promise<Array<SeekEntry & { high: string; low: string }>>
+fetchTopicOffsets(topic: string): Promise<Array<SeekEntry & { high: string; low: string }>>
+  fetchTopicOffsetsByTimestamp(topic: string, timestamp?: number | OffsetSpecName, options?: ApiTimeoutOption & { isolationLevel?: 'read_committed' | 'read_uncommitted' }): Promise<Array<SeekEntry>>
+fetchTopicOffsetsByTimestamp(topic: string, timestamp?: number): Promise<Array<SeekEntry>>
+  /** Elects preferred or unclean leaders; retries only unresolved partitions. */
+  electLeaders(
+    options: {
+      electionType?: 'preferred' | 'unclean'
+      topicPartitions?: TopicPartitionList | null
+    } & ApiTimeoutOption,
+  ): Promise<Array<{ topic: string; partitions: Array<{ partition: number } & AdminItemResult> }>>
+  /** Reads fresh supported/finalized features, preserving the epoch as a decimal string. */
+  describeFeatures(options?: { brokerId?: number } & ApiTimeoutOption): Promise<{
+    supportedFeatures: Record<string, { minVersion: number; maxVersion: number }>
+    finalizedFeatures: Record<string, { minVersionLevel: number; maxVersionLevel: number }>
+    finalizedFeaturesEpoch: string | null
+  }>
+  /** Updates or validates features. Errors on individual features remain data. */
+  updateFeatures(
+    options: {
+      features: Array<{
+        name: string
+        maxVersionLevel: number
+        upgradeType?: 'upgrade' | 'safe-downgrade' | 'unsafe-downgrade'
+      }>
+      validateOnly?: boolean
+    } & ApiTimeoutOption,
+  ): Promise<Array<{ feature: string } & AdminItemResult>>
+  /** Lists resource identities; exactly CLIENT_METRICS is an explicit v0 filter equivalent. */
+  listConfigResources(
+    options?: { resourceTypes?: ConfigResourceTypes[] } & ApiTimeoutOption,
+  ): Promise<{ resources: Array<{ type: ConfigResourceTypes; name: string }> }>
+  /** Flags opt into DescribeCluster; no flag keeps the legacy Metadata request. */
+  describeCluster(
+    options?: {
+      includeAuthorizedOperations?: boolean
+      includeFencedBrokers?: boolean
+    } & ApiTimeoutOption,
+  ): Promise<{
+    brokers: Array<{ nodeId: number; host: string; port: number; fenced?: boolean }>
+    controller: number | null
+    clusterId: string
+    authorizedOperations?: number | null
+  }>
+  describeCluster(options?: ApiTimeoutOption): Promise<{
     brokers: Array<{ nodeId: number; host: string; port: number }>
     controller: number | null
     clusterId: string
   }>
-  setOffsets(options: { groupId: string; topic: string; partitions: SeekEntry[] }): Promise<void>
-  resetOffsets(options: { groupId: string; topic: string; earliest: boolean }): Promise<void>
-  describeConfigs(configs: {
+describeCluster(): Promise<{
+    brokers: Array<{ nodeId: number; host: string; port: number }>
+    controller: number | null
+    clusterId: string
+  }>
+  setOffsets(options: ({ groupId: string; topic: string; partitions: SeekEntry[] }) & ApiTimeoutOption): Promise<void>
+  resetOffsets(options: ({ groupId: string; topic: string; earliest: boolean }) & ApiTimeoutOption): Promise<void>
+  describeConfigs(configs: ({
     resources: ResourceConfigQuery[]
     includeSynonyms: boolean
     /** Ask for each entry's `documentation`; sent from DescribeConfigs v3. */
     includeDocumentation?: boolean
-  }): Promise<DescribeConfigResponse>
-  alterConfigs(configs: { validateOnly: boolean; resources: IResourceConfig[] }): Promise<any>
+  }) & ApiTimeoutOption): Promise<DescribeConfigResponse>
+  alterConfigs(configs: ({ validateOnly: boolean; resources: IResourceConfig[] }) & ApiTimeoutOption): Promise<{
+    resources: Array<{ resourceType: number; resourceName: string; errorCode: number; errorMessage: string | null }>
+  }>
   /**
    * A failed resource is a result with its own `errorCode`, not an error; `NOT_CONTROLLER` is
    * retried. An invalid argument throws `KafkaJSNonRetriableError` before anything is sent.
    */
-  incrementalAlterConfigs(configs: {
+  incrementalAlterConfigs(configs: ({
     validateOnly?: boolean
     resources: IncrementalResourceConfig[]
-  }): Promise<IncrementalAlterConfigsResult>
-  listGroups(options?: ListGroupsOptions): Promise<{ groups: GroupOverview[] }>
-  deleteGroups(groupIds: string[]): Promise<DeleteGroupsResult[]>
+  }) & ApiTimeoutOption): Promise<IncrementalAlterConfigsResult>
+  listGroups(options?: (ListGroupsOptions) & ApiTimeoutOption): Promise<{ groups: GroupOverview[] }>
+  deleteGroups(groupIds: string[], options?: ApiTimeoutOption): Promise<DeleteGroupsResult[]>
+deleteGroups(groupIds: string[]): Promise<DeleteGroupsResult[]>
   /** Without `members`, removes every member `describeGroups` reports. */
-  removeMembersFromConsumerGroup(options: {
+  removeMembersFromConsumerGroup(options: ({
     groupId: string
     members?: Array<{ groupInstanceId: string }>
     reason?: string | null
-  }): Promise<RemoveMembersResult>
-  describeGroups(groupIds: string[]): Promise<GroupDescriptions>
-  describeAcls(options: AclFilter): Promise<DescribeAclResponse>
-  deleteAcls(options: { filters: AclFilter[] }): Promise<DeleteAclResponse>
-  createAcls(options: { acl: AclEntry[] }): Promise<boolean>
-  deleteTopicRecords(options: { topic: string; partitions: SeekEntry[] }): Promise<void>
-  alterPartitionReassignments(request: {
+  }) & ApiTimeoutOption): Promise<RemoveMembersResult>
+  describeGroups(groupIds: string[], options?: ApiTimeoutOption & { includeAuthorizedOperations?: boolean }): Promise<GroupDescriptions>
+describeGroups(groupIds: string[]): Promise<GroupDescriptions>
+  describeAcls(options: (AclFilter) & ApiTimeoutOption): Promise<DescribeAclResponse>
+  deleteAcls(options: ({ filters: AclFilter[] }) & ApiTimeoutOption): Promise<DeleteAclResponse>
+  createAcls(options: ({ acl: AclEntry[] }) & ApiTimeoutOption): Promise<boolean>
+  deleteTopicRecords(options: ({ topic: string; partitions: SeekEntry[] }) & ApiTimeoutOption): Promise<void>
+  alterPartitionReassignments(request: ({
     topics: PartitionReassignment[]
     timeout?: number
-  }): Promise<void>
-  listPartitionReassignments(request: {
+    allowReplicationFactorChange?: boolean
+  }) & ApiTimeoutOption): Promise<void>
+  listPartitionReassignments(request: ({
     topics?: TopicPartitions[]
     timeout?: number
-  }): Promise<ListPartitionReassignmentsResponse>
+  }) & ApiTimeoutOption): Promise<ListPartitionReassignmentsResponse>
+  /** Security administration; apiTimeout inherits the original call budget.
+   * @param options validated filters or mutation inputs; credentials are never logged
+   * @returns the documented token, item results or quota entities
+   * @throws typed validation, capability, call-level broker or deadline error
+   */
+  describeClientQuotas(options: { components: Array<{ entityType: 'user' | 'client-id' | 'ip'; matchType: 'exact' | 'default' | 'any'; match?: string }>; strict?: boolean } & ApiTimeoutOption): Promise<Array<{
+    entity: Array<{ entityType: string; entityName: string | null }>; values: Record<string, number>
+  }>>
+  /** Security administration; apiTimeout inherits the original call budget.
+   * @param options validated filters or mutation inputs; credentials are never logged
+   * @returns the documented token, item results or quota entities
+   * @throws typed validation, capability, call-level broker or deadline error
+   */
+  alterClientQuotas(options: {
+    entries: Array<{ entity: Array<{ entityType: 'user' | 'client-id' | 'ip'; entityName: string | null }>; ops: QuotaOperation[] }>
+    validateOnly?: boolean
+  } & ApiTimeoutOption): Promise<Array<{ entity: Array<{ entityType: string; entityName: string | null }> } & AdminItemResult>>
+  /** Security administration; apiTimeout inherits the original call budget.
+   * @param options validated filters or mutation inputs; credentials are never logged
+   * @returns the documented token, item results or quota entities
+   * @throws typed validation, capability, call-level broker or deadline error
+   */
+  describeUserScramCredentials(options?: { users?: string[] | null } & ApiTimeoutOption): Promise<Array<{ user: string; credentials: Array<{ mechanism: 'SCRAM-SHA-256' | 'SCRAM-SHA-512'; iterations: number }> } & AdminItemResult>>
+  /** Security administration; apiTimeout inherits the original call budget.
+   * @param options validated filters or mutation inputs; credentials are never logged
+   * @returns the documented token, item results or quota entities
+   * @throws typed validation, capability, call-level broker or deadline error
+   */
+  alterUserScramCredentials(options: {
+    upsertions?: Array<{ user: string; mechanism: 'SCRAM-SHA-256' | 'SCRAM-SHA-512'; iterations: number; password: string; salt?: Buffer }>
+    deletions?: Array<{ user: string; mechanism: 'SCRAM-SHA-256' | 'SCRAM-SHA-512' }>
+  } & ApiTimeoutOption): Promise<Array<{ user: string } & AdminItemResult>>
+  /** Security administration; apiTimeout inherits the original call budget.
+   * @param options validated filters or mutation inputs; credentials are never logged
+   * @returns the documented token, item results or quota entities
+   * @throws typed validation, capability, call-level broker or deadline error
+   */
+  createDelegationToken(options?: { renewers?: Array<{ principalType: string; principalName: string }>; maxLifetimeMs?: number | string; owner?: { principalType: string; principalName: string } } & ApiTimeoutOption): Promise<DelegationToken>
+  /** Security administration; apiTimeout inherits the original call budget.
+   * @param options validated filters or mutation inputs; credentials are never logged
+   * @returns the documented token, item results or quota entities
+   * @throws typed validation, capability, call-level broker or deadline error
+   */
+  renewDelegationToken(options: { hmac: Buffer; renewPeriodMs?: number | string } & ApiTimeoutOption): Promise<{ expiryTimestampMs: string }>
+  /** Security administration; apiTimeout inherits the original call budget.
+   * @param options validated filters or mutation inputs; credentials are never logged
+   * @returns the documented token, item results or quota entities
+   * @throws typed validation, capability, call-level broker or deadline error
+   */
+  expireDelegationToken(options: { hmac: Buffer; expiryTimePeriodMs?: number | string } & ApiTimeoutOption): Promise<{ expiryTimestampMs: string }>
+  /** Security administration; apiTimeout inherits the original call budget.
+   * @param options validated filters or mutation inputs; credentials are never logged
+   * @returns the documented token, item results or quota entities
+   * @throws typed validation, capability, call-level broker or deadline error
+   */
+  describeDelegationToken(options?: { owners?: Array<{ principalType: string; principalName: string }> } & ApiTimeoutOption): Promise<DelegationToken[]>
   logger(): Logger
   on(
     eventName: AdminEvents['CONNECT'],
@@ -1082,6 +1420,26 @@ export type LeaveGroupMember = {
 }
 
 export type Broker = {
+  /** Sends compact producer diagnostics to this replica. @param options wire topics @returns partition rows @throws capability, wire or deadline failure. */
+  describeProducers(options: { topics: TopicPartitionList }): Promise<{
+    throttleTime: number; clientSideThrottleTime: number
+    topics: Array<{ topic: string; partitions: Array<{ partition: number; errorCode: number; errorMessage: string | null; activeProducers: TransactionProducerState[] }> }>
+  }>
+  /** Describes transaction ids on this coordinator. @param options ids @returns raw rows @throws wire or capability failure. */
+  describeTransactions(options: { transactionalIds: string[] }): Promise<{
+    throttleTime: number; clientSideThrottleTime: number
+    transactions: Array<Omit<TransactionDescription, 'error' | 'errorMessage'>>
+  }>
+  /** Lists this broker, refusing unsupported meaningful filters. @param options filters @returns raw aggregate @throws broker or capability failure. */
+  listTransactions(options: { states: string[]; producerIds: string[]; durationFilter: string; transactionalIdPattern: string | null }): Promise<{
+    throttleTime: number; clientSideThrottleTime: number; errorCode: number
+    transactions: Array<{ transactionalId: string; producerId: string; state: string }>; unknownStateFilters: string[]
+  }>
+  /** Writes explicit markers to this broker. @param options marker fields @returns raw marker rows @throws capability or wire failure. */
+  writeTxnMarkers(options: { markers: Array<{ producerId: string; producerEpoch: number; transactionResult: boolean; topics: TopicPartitionList; coordinatorEpoch: number; transactionVersion?: number }> }): Promise<{
+    markers: Array<{ producerId: string; topics: Array<{ topic: string; partitions: Array<{ partition: number; errorCode: number }> }> }>
+  }>
+
   /**
    * The finalized features of the ApiVersions response the broker's current versions came from;
    * `{}` before the first negotiation.
@@ -1201,6 +1559,7 @@ export type Broker = {
   alterPartitionReassignments(request: {
     topics: PartitionReassignment[]
     timeout?: number
+    allowReplicationFactorChange?: boolean
   }): Promise<any>
   listPartitionReassignments(request: {
     topics?: TopicPartitions[]
@@ -1600,6 +1959,8 @@ export type DeleteGroupsResult = {
   groupId: string
   errorCode?: number
   error?: KafkaJSProtocolError
+  /** The broker's message for the group: DeleteGroups v3 and later; `null` when it sent none. */
+  errorMessage?: string | null
 }
 
 export type ConsumerEvents = {
@@ -2367,7 +2728,8 @@ export class KafkaJSAlterPartitionReassignmentsError extends KafkaJSProtocolErro
  */
 export class KafkaJSCreateTopicError extends KafkaJSProtocolError {
   readonly topic?: string
-  constructor(e: Error | string, topicName?: string)
+  readonly errorMessage: string | null
+  constructor(e: Error | string, topicName?: string, errorMessage?: string | null)
 }
 
 export class KafkaJSNumberOfRetriesExceeded extends KafkaJSNonRetriableError {
@@ -2456,7 +2818,7 @@ export class KafkaJSNoBrokerAvailableError extends KafkaJSError {
   constructor()
 }
 
-export class KafkaJSPartialMessageError extends KafkaJSError {
+export class KafkaJSPartialMessageError extends KafkaJSNonRetriableError {
   constructor()
   /**
    * @deprecated The Fetch decoder no longer sets it: a record-batch CRC32C mismatch (see
@@ -2465,27 +2827,27 @@ export class KafkaJSPartialMessageError extends KafkaJSError {
   crcMismatch?: boolean
 }
 
-export class KafkaJSSASLAuthenticationError extends KafkaJSError {
+export class KafkaJSSASLAuthenticationError extends KafkaJSNonRetriableError {
   constructor()
 }
 
-export class KafkaJSGroupCoordinatorNotFound extends KafkaJSError {
+export class KafkaJSGroupCoordinatorNotFound extends KafkaJSNonRetriableError {
   constructor()
 }
 
-export class KafkaJSNotImplemented extends KafkaJSError {
+export class KafkaJSNotImplemented extends KafkaJSNonRetriableError {
   constructor()
 }
 
-export class KafkaJSTimeout extends KafkaJSError {
+export class KafkaJSTimeout extends KafkaJSNonRetriableError {
   constructor()
 }
 
-export class KafkaJSLockTimeout extends KafkaJSError {
+export class KafkaJSLockTimeout extends KafkaJSTimeout {
   constructor()
 }
 
-export class KafkaJSUnsupportedMagicByteInMessageSet extends KafkaJSError {
+export class KafkaJSUnsupportedMagicByteInMessageSet extends KafkaJSNonRetriableError {
   constructor()
 }
 
@@ -2560,4 +2922,15 @@ export interface KafkaJSStaleTopicMetadataAssignmentMetadata {
 export interface KafkaJSServerDoesNotSupportApiKeyMetadata {
   apiKey: number
   apiName: string
+}
+
+/** One quota mutation; removal and assignment are exclusive. */
+export type QuotaOperation = { key: string } & ({ remove: true; value?: never } | { value: number; remove?: false })
+
+/** A caller-owned delegation token. HMAC is sensitive and never appears in diagnostics. */
+export interface DelegationToken {
+  tokenId: string; hmac: Buffer
+  owner: { principalType: string; principalName: string }
+  renewers: Array<{ principalType: string; principalName: string }>
+  issueTimestampMs: string; expiryTimestampMs: string; maxTimestampMs: string
 }

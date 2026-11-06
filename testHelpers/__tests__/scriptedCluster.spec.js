@@ -8,12 +8,17 @@ const {
   groupScript,
   producerScript,
   PROFILES,
+  NEGOTIATION_MS,
 } = require('../scriptedCluster')
+const Broker = require('../../src/broker')
+const ConnectionPool = require('../../src/network/connectionPool')
+const { createLogger } = require('../../src/loggers')
 const { lanes } = require('../lane')
 const { Schedule } = require('../schedule')
 const metadataV13 = require('../wire/metadataV13')
 const { metadataV13: literal } = require('../wire/expected')
 const apiVersionsV4 = require('../wire/apiVersionsV4')
+const apiVersionsV5 = require('../wire/apiVersionsV5')
 const {
   prepareRecordBatches,
   TOPIC,
@@ -182,10 +187,10 @@ describe('ScriptedCluster', () => {
       cluster.assertClean()
     })
 
-    /** The Metadata request that answers `listTopics`: the second, after the one refreshing the cache. */
+    /** The single fresh Metadata request that answers `listTopics`. */
     const answeringListTopics = (cluster) => ({
       api: 'Metadata',
-      match: () => cluster.requests().filter(({ api }) => api === 'Metadata').length === 2,
+      match: () => cluster.requests().filter(({ api }) => api === 'Metadata').length === 1,
     })
     const topicNamed = (name) => ({ ...literal.response.topics[0], name })
 
@@ -351,6 +356,13 @@ describe('ScriptedCluster', () => {
       ).toThrow('ScriptedCluster: no node at elsewhere:1')
     })
 
+    test('disables idle reaping by default and preserves explicit idle limits', () => {
+      const cluster = createScriptedCluster({ nodes: NODES })
+
+      expect(cluster.kafkaOptions().connectionsMaxIdle).toBe(0)
+      expect(cluster.kafkaOptions({ connectionsMaxIdle: 25 }).connectionsMaxIdle).toBe(25)
+    })
+
     test('hands Kafka the endpoints, its own socket factory and the overrides given', () => {
       const cluster = createScriptedCluster({ nodes: NODES })
 
@@ -498,7 +510,7 @@ describe('ScriptedCluster', () => {
       await admin.connect()
       const gate = cluster.schedule.hold({
         api: 'Metadata',
-        match: () => cluster.requests().filter(({ api }) => api === 'Metadata').length === 2,
+        match: () => cluster.requests().filter(({ api }) => api === 'Metadata').length === 1,
       })
 
       const listing = admin.listTopics()
@@ -723,6 +735,196 @@ describe('ScriptedCluster', () => {
       expect(socket.destroyed).toBe(true)
       expect(cluster.failures()).toHaveLength(1)
       expect(() => cluster.assertClean()).toThrow(message)
+    })
+  })
+
+  describe('ApiVersions discovery', () => {
+    /** The body of an ApiVersions v5 request: software, cluster id, node id, no tags. */
+    const v5Body = (clusterId, nodeId) =>
+      new Encoder()
+        .writeUVarIntString('raw')
+        .writeUVarIntString('1')
+        .writeUVarIntString(clusterId)
+        .writeInt32(nodeId)
+        .writeTaggedFields().buffer
+
+    /** The body of an ApiVersions v4 request: software and no tags. */
+    const v4Body = new Encoder()
+      .writeUVarIntString('raw')
+      .writeUVarIntString('1')
+      .writeTaggedFields().buffer
+
+    /** What a broker that offers ApiVersions up to v4 answers a v5 request, framed for correlation id 1. */
+    const UNSUPPORTED_FRAME =
+      '00000010' + // size: the correlation id and the 12 bytes of the body
+      '00000001' + // correlation id
+      '0023' + // UNSUPPORTED_VERSION
+      '00000001' + // one entry, in a classic array
+      '0012' +
+      '0000' +
+      '0004' // ApiVersions, 0 to 4
+
+    test('answers the first v5 request of a profile that offers v4 as a v4 broker does, and logs it in the trace only', async () => {
+      const cluster = createScriptedCluster({ nodes: NODES })
+
+      const { frames } = await exchange(cluster, frameOf(apiKeys.ApiVersions, 5, v5Body('c', 2)))
+
+      expect(frames.map((frame) => frame.toString('hex'))).toEqual([UNSUPPORTED_FRAME])
+      expect(cluster.apiVersionTrace()).toMatchObject([
+        { version: 5, discovery: true, fields: { clusterId: 'c', nodeId: 2 } },
+      ])
+      expect(cluster.requests()).toEqual([])
+      expect(cluster.timeline()).toEqual([])
+      cluster.assertClean()
+    })
+
+    test('answers a v5 request like any other when the profile offers v5', async () => {
+      const cluster = createScriptedCluster({ nodes: NODES, advertise: { ApiVersions: [5, 5] } })
+
+      const { frames } = await exchange(cluster, frameOf(apiKeys.ApiVersions, 5, v5Body(null, -1)))
+
+      // One frame: the size, correlation id 1 and no header tags (the ApiVersions response header
+      // is v0), then the profile's table as a v5 answer, with the range it advertises for ApiVersions.
+      const body = apiVersionsV5.buildResponse(cluster.apiVersionsAnswer())
+      expect(frames.map((frame) => frame.toString('hex'))).toEqual([
+        sized(Buffer.concat([Buffer.from('00000001', 'hex'), body])).toString('hex'),
+      ])
+      expect(body.toString('hex')).toContain('0012' + '0005' + '0005' + '00')
+      expect(cluster.requests()).toMatchObject([
+        { api: 'ApiVersions', version: 5, fields: { clusterId: null, nodeId: -1 } },
+      ])
+      expect(cluster.requests()[0]).not.toHaveProperty('discovery')
+      expect(cluster.apiVersionTrace()).toEqual(cluster.requests())
+      cluster.assertClean()
+    })
+
+    test('lists a second negotiation on a connection that has not changed and refuses it as a v4 broker does', async () => {
+      const cluster = createScriptedCluster({ nodes: NODES })
+      const { socket, frames } = dial(cluster)
+
+      for (const [version, body] of [
+        [5, v5Body('c', 2)],
+        [4, v4Body],
+        [5, v5Body('c', 2)],
+      ]) {
+        socket.write(frameOf(apiKeys.ApiVersions, version, body))
+        await settle()
+      }
+
+      expect(
+        cluster.apiVersionTrace().map(({ version, discovery }) => [version, discovery === true])
+      ).toEqual([
+        [5, true],
+        [4, false],
+        [5, false],
+      ])
+      expect(cluster.requests().map(({ version }) => version)).toEqual([4, 5])
+      expect(frames).toHaveLength(3)
+      expect(frames[2].toString('hex')).toBe(UNSUPPORTED_FRAME)
+      expect(cluster.timeline().map(({ kind, version }) => [kind, version])).toEqual([
+        ['request', 4],
+        ['response', 4],
+        ['request', 5],
+        ['response', 5],
+      ])
+      cluster.assertClean()
+    })
+
+    test('keeps one renegotiation per socket opened to the node out of requests(), and lists the next', async () => {
+      const cluster = createScriptedCluster({ nodes: NODES })
+      const { socket } = dial(cluster)
+      const negotiate = async () => {
+        for (const [version, body] of [
+          [5, v5Body('c', 2)],
+          [4, v4Body],
+        ]) {
+          socket.write(frameOf(apiKeys.ApiVersions, version, body))
+          await settle()
+        }
+      }
+
+      await negotiate()
+      dial(cluster)
+      await negotiate()
+      await negotiate()
+
+      expect(
+        cluster.apiVersionTrace().map(({ version, discovery }) => [version, discovery === true])
+      ).toEqual([
+        [5, true],
+        [4, false],
+        [5, true],
+        [4, false],
+        [5, false],
+        [4, false],
+      ])
+      expect(cluster.requests().map(({ version }) => version)).toEqual([4, 4, 5, 4])
+      cluster.assertClean()
+    })
+
+    test('lists a v5 request that follows an application request', async () => {
+      const cluster = createScriptedCluster({ nodes: NODES })
+      const { socket } = dial(cluster)
+
+      socket.write(frameOf(apiKeys.Metadata, 13, METADATA_REQUEST))
+      await settle()
+      socket.write(frameOf(apiKeys.ApiVersions, 5, v5Body('c', 2)))
+      await settle()
+
+      expect(cluster.requests().map(({ api, version }) => [api, version])).toEqual([
+        ['Metadata', 13],
+        ['ApiVersions', 5],
+      ])
+      expect(cluster.apiVersionTrace()).toHaveLength(1)
+      expect(cluster.apiVersionTrace()[0]).not.toHaveProperty('discovery')
+      cluster.assertClean()
+    })
+
+    test('a client of a profile that offers v4 asks v5 and then v4, and the schedule sees only the second', async () => {
+      const cluster = createScriptedCluster({ nodes: NODES })
+      const admin = track(clientOf(cluster).admin())
+      const gate = cluster.schedule.hold({ api: 'ApiVersions' })
+
+      const connecting = admin.connect()
+      const call = await within(gate.arrived(), 5000, 'the held ApiVersions call')
+
+      expect(call).toMatchObject({ api: 'ApiVersions', version: 4 })
+      expect(cluster.apiVersionTrace().map(({ version }) => version)).toEqual([5, 4])
+      gate.release()
+      await connecting
+      expect(cluster.requests().map(({ version }) => version)).toEqual([4])
+      cluster.assertClean()
+    })
+
+    test('does not hand a discovery request to a scripted answer', async () => {
+      const cluster = createScriptedCluster({ nodes: NODES })
+      const seen = []
+      cluster.answer('ApiVersions', (_fields, { version }) => {
+        seen.push(version)
+        return cluster.apiVersionsAnswer()
+      })
+      const admin = track(clientOf(cluster).admin())
+
+      await admin.connect()
+
+      expect(seen).toEqual([4])
+      cluster.assertClean()
+    })
+
+    test('refuses a discovery request with a byte after its tag buffer, answers nothing and fails the test', async () => {
+      const cluster = createScriptedCluster({ nodes: NODES })
+      const frame = frameOf(apiKeys.ApiVersions, 5, v5Body('c', 2))
+
+      const { frames, socket } = await exchange(
+        cluster,
+        sized(Buffer.concat([frame.subarray(4), Buffer.from([0xff])]))
+      )
+
+      expect(frames).toHaveLength(0)
+      expect(socket.destroyed).toBe(true)
+      expect(() => cluster.assertClean()).toThrow(
+        /cannot read the ApiVersions v5 request: .*after its tag buffer/
+      )
     })
   })
 
@@ -1724,4 +1926,61 @@ describe('ScriptedCluster Fetch session deltas', () => {
       socket.destroy()
     }
   })
+})
+
+test('a blackholed dial never connects and up only restores future dials', async () => {
+  jest.useFakeTimers()
+  const cluster = createScriptedCluster({ nodes: NODES })
+  const firstConnect = jest.fn()
+  const nextConnect = jest.fn()
+  const old = cluster.blackhole(0).socketFactory({ ...NODES[0], onConnect: firstConnect })
+  try {
+    await jest.advanceTimersByTimeAsync(10)
+    expect(firstConnect).not.toHaveBeenCalled()
+    cluster.up(0)
+    const next = cluster.socketFactory({ ...NODES[0], onConnect: nextConnect })
+    await jest.advanceTimersByTimeAsync(10)
+    expect(firstConnect).not.toHaveBeenCalled()
+    expect(nextConnect).toHaveBeenCalledTimes(1)
+    expect(() => cluster.pairFor('Produce', 0)).toThrow('advertises')
+    next.destroy()
+    cluster.assertClean()
+  } finally {
+    old.destroy()
+    jest.useRealTimers()
+  }
+})
+
+test('a connect to a profile that offers ApiVersions v4 takes exactly NEGOTIATION_MS fake milliseconds', async () => {
+  jest.useFakeTimers()
+  const cluster = createScriptedCluster({ nodes: NODES })
+  const logger = createLogger({ level: 0, logCreator: () => () => {} })
+  const broker = new Broker({
+    connectionPool: new ConnectionPool({
+      host: NODES[0].host,
+      port: NODES[0].port,
+      logger,
+      socketFactory: cluster.socketFactory,
+      connectionTimeout: 300,
+      requestTimeout: 1500,
+    }),
+    logger,
+  })
+  try {
+    let ready = false
+    const connecting = broker.connect().then(() => {
+      ready = true
+    })
+    await jest.advanceTimersByTimeAsync(NEGOTIATION_MS - 1)
+    expect(ready).toBe(false)
+    expect(cluster.apiVersionTrace().map(({ version }) => version)).toEqual([5, 4])
+    await jest.advanceTimersByTimeAsync(1)
+    await connecting
+    expect(ready).toBe(true)
+  } finally {
+    await broker.disconnect({ drainTimeout: 0 })
+    await jest.advanceTimersByTimeAsync(1)
+    cluster.assertClean()
+    jest.useRealTimers()
+  }
 })

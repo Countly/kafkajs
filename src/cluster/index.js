@@ -1,3 +1,4 @@
+const { checked, waitOf, shareMetadata, retrierOf } = require('../admin/deadline')
 const CommittedOffsetRevisions = require('./committedOffsetRevisions')
 const describeThrown = require('../network/describeThrown')
 const BrokerPool = require('./brokerPool')
@@ -6,7 +7,6 @@ const { joinDeadlineError } = require('../consumer/rebalanceErrorContract')
 const { CLUSTER_TOPIC_RECREATED } = require('./instrumentationEvents')
 const Lock = require('../utils/lock')
 const { isConnectionFailure } = require('../network/connectionFailure')
-const sharedPromiseTo = require('../utils/sharedPromiseTo')
 const createRetry = require('../retry')
 const connectionPoolBuilder = require('./connectionPoolBuilder')
 const GroupRegistry = require('./groupRegistry')
@@ -33,9 +33,7 @@ const { keys } = Object
 const LEADER_NOT_AVAILABLE = 5
 
 const mergeTopics = (obj, { topic, partitions }) =>
-  Object.assign(dictionary(), obj, {
-    [topic]: [...(obj[topic] || []), ...partitions],
-  })
+  Object.assign(dictionary(), obj, { [topic]: [...(obj[topic] || []), ...partitions] })
 
 /**
  * Metadata error codes that describe ONE topic rather than the request: the response carries them
@@ -98,6 +96,7 @@ module.exports = class Cluster {
    * @param {string} options.clientId
    * @param {number} options.connectionTimeout - in milliseconds
    * @param {number} options.authenticationTimeout - in milliseconds
+   * @param {number} [options.connectionsMaxIdle] Idle milliseconds carried unchanged to each socket
    * @param {number} options.reauthenticationThreshold - in milliseconds
    * @param {number} [options.requestTimeout=30000] - in milliseconds
    * @param {boolean} [options.enforceRequestTimeout]
@@ -132,7 +131,12 @@ module.exports = class Cluster {
     sasl,
     clientId,
     connectionTimeout,
+    connectionTimeoutMax,
+    reconnectBackoff,
+    reconnectBackoffMax,
+    setupPolicy,
     authenticationTimeout,
+    connectionsMaxIdle,
     reauthenticationThreshold,
     requestTimeout = 30000,
     enforceRequestTimeout,
@@ -152,7 +156,7 @@ module.exports = class Cluster {
     this.rootLogger = rootLogger
     this.logger = rootLogger.namespace('Cluster')
     this.retryOptions = { ...retry }
-    this.retrier = createRetry(this.retryOptions)
+    this.retrier = (action) => retrierOf(this.retryOptions)(action)
     this.connectionPoolBuilder = connectionPoolBuilder({
       logger: rootLogger,
       instrumentationEmitter,
@@ -162,6 +166,12 @@ module.exports = class Cluster {
       sasl,
       clientId,
       connectionTimeout,
+      connectionTimeoutMax,
+      reconnectBackoff,
+      reconnectBackoffMax,
+      setupPolicy,
+      authenticationTimeout,
+      connectionsMaxIdle,
       requestTimeout,
       drainTimeout: requestTimeout,
       enforceRequestTimeout,
@@ -187,10 +197,7 @@ module.exports = class Cluster {
     // retrying, rather than a real "no such topic".
     this.allowAutoTopicCreation = allowAutoTopicCreation
     this.instrumentationEmitter = instrumentationEmitter
-    this.metadataCache = new MetadataCache({
-      logger: rootLogger,
-      instrumentationEmitter,
-    })
+    this.metadataCache = new MetadataCache({ logger: rootLogger, instrumentationEmitter })
     this.brokerPool = new BrokerPool({
       connectionPoolBuilder: this.connectionPoolBuilder,
       logger: this.rootLogger,
@@ -215,7 +222,7 @@ module.exports = class Cluster {
     // A producer lifecycle's call shares nothing with another lifecycle's: each is scoped by its fence.
     const fenceOf = ({ fence } = {}) => fence
 
-    this[PRIVATE.CONNECT] = sharedPromiseTo(async ({ fence } = {}) => {
+    this[PRIVATE.CONNECT] = shareMetadata(async ({ fence } = {}) => {
       return await this.brokerPool.connect(...fenceArgs(fence))
     }, fenceOf)
 
@@ -228,8 +235,9 @@ module.exports = class Cluster {
       this.brokerPool.consumerMetadataGeneration ??
       0
 
-    this[PRIVATE.REFRESH_METADATA] = sharedPromiseTo(async ({ fence, ...scope } = {}) => {
+    this[PRIVATE.REFRESH_METADATA] = shareMetadata(async ({ fence, ...scope } = {}) => {
       fence?.check()
+      checked(null)
       this.pruneTargetTopics()
       if (this.targetTopicState !== null && this.targetTopics.size === 0) return
       return await this.brokerPool.refreshMetadata(
@@ -238,9 +246,10 @@ module.exports = class Cluster {
       )
     }, shareScopeOf)
 
-    this[PRIVATE.REFRESH_METADATA_IF_NECESSARY] = sharedPromiseTo(
+    this[PRIVATE.REFRESH_METADATA_IF_NECESSARY] = shareMetadata(
       async ({ fence, ...scope } = {}) => {
         fence?.check()
+        checked(null)
         this.pruneTargetTopics()
         if (this.targetTopicState !== null && this.targetTopics.size === 0) return
         return await this.brokerPool.refreshMetadataIfNecessary(
@@ -251,7 +260,7 @@ module.exports = class Cluster {
       shareScopeOf
     )
 
-    this[PRIVATE.FIND_CONTROLLER_BROKER] = sharedPromiseTo(async () => {
+    this[PRIVATE.FIND_CONTROLLER_BROKER] = shareMetadata(async () => {
       const { metadata } = this.brokerPool
 
       if (!metadata || metadata.controllerId == null) {
@@ -581,7 +590,8 @@ module.exports = class Cluster {
 
   /**
    * The cluster's metadata for `topics` (every topic when empty), as a broker answers it now. In
-   * three stages:
+   * three stages for named topics. An all-topics snapshot skips the cache refresh and uses
+   * the connected seed if no broker inventory exists, so listing sends one Metadata request.
    * 1. The refresh pre-step, `refreshMetadataIfNecessary`, which writes the metadata cache and
    *    emits `TOPIC_RECREATED` as any other route does, but only when the cache is missing,
    *    expired or lacks a named topic. The refresh retries `LEADER_NOT_AVAILABLE` on its own
@@ -603,7 +613,7 @@ module.exports = class Cluster {
    * The answer is a snapshot: it is never merged into the metadata cache, never emits
    * `TOPIC_RECREATED` and never changes the target topics.
    * @public
-   * @param {{ topics?: string[] }} [options]
+   * @param {{ topics?: string[], includeTopicAuthorizedOperations?: boolean }} [options]
    * @returns {Promise<import("../../types").BrokerMetadata>}
    * @throws {Error} the last broker error, once every broker is connected to and has failed; or a
    *   refresh error other than `LEADER_NOT_AVAILABLE`, as it is
@@ -614,10 +624,16 @@ module.exports = class Cluster {
    * @throws {import("../errors").KafkaJSNonRetriableError} when the refresh spent its budget on
    *   `LEADER_NOT_AVAILABLE`, or broker selection fails in a way that cannot succeed
    */
-  async metadata({ topics = [] } = {}) {
+  async metadata({ topics = [], includeTopicAuthorizedOperations = false } = {}) {
     return this.retrier(async (bail, retryCount, retryTime) => {
       try {
-        await this.brokerPool.refreshMetadataIfNecessary(topics)
+        if (topics.length === 0 && this.brokerPool.getNodeIds().length === 0) {
+          const broker = checked(await waitOf(() => this.findConnectedBroker()))
+          return checked(
+            await waitOf(() => broker.metadata(topics, { includeTopicAuthorizedOperations }))
+          )
+        }
+        if (topics.length > 0) await this.brokerPool.refreshMetadataIfNecessary(topics)
       } catch (e) {
         if (e.type === 'LEADER_NOT_AVAILABLE') {
           throw e
@@ -629,7 +645,7 @@ module.exports = class Cluster {
       let lastError
       const metadata = await this.brokerPool.withBroker(async ({ broker }) => {
         try {
-          return await broker.metadata(topics)
+          return await broker.metadata(topics, { includeTopicAuthorizedOperations })
         } catch (e) {
           lastError = e
           throw e
@@ -706,10 +722,13 @@ module.exports = class Cluster {
    */
   async addMultipleTargetTopics(topics, { fence } = {}) {
     fence?.check()
+    checked(null)
     await this.mutatingTargetTopics.acquire()
 
     try {
+      checked(null)
       fence?.check()
+      checked(null)
       const previousSize = this.targetTopics.size
       const previousTopics = new Set(this.targetTopics)
       for (const topic of topics) {
@@ -724,6 +743,7 @@ module.exports = class Cluster {
           await this.refreshMetadata(...fenceArgs(fence))
         } catch (e) {
           fence?.check()
+          checked(null)
           if (
             e.type === 'INVALID_TOPIC_EXCEPTION' ||
             e.type === 'UNKNOWN_TOPIC_OR_PARTITION' ||
@@ -926,6 +946,7 @@ module.exports = class Cluster {
       return await this.brokerPool.findBroker({ nodeId, fence })
     } catch (e) {
       fence?.check()
+      checked(null)
       // The client probably has stale metadata
       if (
         describeThrown(e, 'name') === 'KafkaJSBrokerNotFound' ||
@@ -1124,6 +1145,7 @@ module.exports = class Cluster {
     { fence } = {}
   ) {
     fence?.check()
+    checked(null)
     // Mirrors MetadataCache#applyLeaderHint's own no-hint-offered guard, so this pre-check can
     // never itself pay for the endpoint work below on the broker's `{ -1, -1 }` default.
     if (leaderId === -1) {
@@ -1138,7 +1160,11 @@ module.exports = class Cluster {
 
     await this.brokerPool.applyNodeEndpoints(nodeEndpoints, ...fenceArgs(fence))
     fence?.check()
-    return this.metadataCache.applyLeaderHint(topic, partition, { leaderId, leaderEpoch })
+    checked(null)
+    return this.metadataCache.applyLeaderHint(topic, partition, {
+      leaderId,
+      leaderEpoch,
+    })
   }
 
   /**
@@ -1188,11 +1214,7 @@ module.exports = class Cluster {
       }
 
       if (metadata.leader === null || metadata.leader === undefined) {
-        throw new KafkaJSError('Invalid partition metadata', {
-          topic,
-          partitionId,
-          metadata,
-        })
+        throw new KafkaJSError('Invalid partition metadata', { topic, partitionId, metadata })
       }
 
       if (metadata.leader < 0) {
@@ -1229,6 +1251,7 @@ module.exports = class Cluster {
           fence,
         })
         fence?.check()
+        checked(null)
 
         if (!this.brokerPool.hasNode(coordinator.nodeId)) {
           await this.brokerPool.applyNodeEndpoints(
@@ -1236,11 +1259,13 @@ module.exports = class Cluster {
             ...fenceArgs(fence)
           )
           fence?.check()
+          checked(null)
         }
 
         return await this.findBroker({ nodeId: coordinator.nodeId, fence })
       } catch (e) {
         fence?.check()
+        checked(null)
         // A new broker can join the cluster before we have the chance
         // to refresh metadata
         if (e.name === 'KafkaJSBrokerNotFound' || e.type === 'GROUP_COORDINATOR_NOT_AVAILABLE') {
@@ -1286,12 +1311,14 @@ module.exports = class Cluster {
       return await this.retryFor(fence)(async (bail, retryCount, retryTime) => {
         try {
           fence?.check()
+          checked(null)
           const brokerMetadata = await broker.findGroupCoordinator({
             groupId,
             coordinatorType,
             ...(fence ? { guard: fence.guard } : {}),
           })
           fence?.check()
+          checked(null)
           this.logger.debug('Found group coordinator', {
             broker: brokerMetadata.host,
             nodeId: brokerMetadata.coordinator.nodeId,
@@ -1299,6 +1326,7 @@ module.exports = class Cluster {
           return brokerMetadata
         } catch (e) {
           fence?.check()
+          checked(null)
           this.logger.debug('Tried to find group coordinator', {
             nodeId,
             groupId,
@@ -1325,8 +1353,12 @@ module.exports = class Cluster {
       brokerMetadata = await this.brokerPool.withBroker(findCoordinator, ...fenceArgs(fence))
     } else {
       const broker = await this.brokerPool.findConnectedBroker(...fenceArgs(fence))
-      brokerMetadata = await findCoordinator({ nodeId: broker.nodeId, broker }).catch((e) => {
+      brokerMetadata = await findCoordinator({
+        nodeId: broker.nodeId,
+        broker,
+      }).catch((e) => {
         fence?.check()
+        checked(null)
         if (e instanceof KafkaJSConnectionError || e instanceof KafkaJSRequestTimeoutError) {
           const message = `FindCoordinator failed on the seed broker: ${e.message}`
           throw new KafkaJSBrokerNotFound(message, { cause: e })
@@ -1385,15 +1417,22 @@ module.exports = class Cluster {
    * failing refresh must not replace the retriable error the caller is about to retry on.
    *
    * @param {object[]} topics see above
-   * @param {object} [options] private, for a consumer's preparation round
+   * @param {object} [options] per-call isolation and private consumer preparation guards
+   * @param {number} [options.isolationLevel=this.isolationLevel] wire isolation byte; leaves the default unchanged
    * @param {import('../producer/generation')} [options.fence] the caller's terminal fence, for the broker lookups
    *   and the metadata refresh a stale leader epoch starts
    * @param {() => Error|null} [options.guard] the caller's immutable identity: checked before each
    *   request is written and before any side effect of a failure, so a refused caller causes none
+   * @param {number} [options.minVersion] named specification capability floor
+   * @param {number} [options.maxVersion] explicit named-read ceiling; omitted keeps broker default v9
+   * @param {number} [options.timeout] remote-read broker timeout
    * @returns {Promise<object[]>} the offsets per topic
    * @throws {Error} the guard's refusal, when it refuses
    */
-  async fetchTopicsOffset(topics, { fence, guard } = {}) {
+  async fetchTopicsOffset(
+    topics,
+    { fence, guard, isolationLevel = this.isolationLevel, minVersion, maxVersion, timeout } = {}
+  ) {
     const partitionsPerBroker = {}
     const topicConfigurations = dictionary()
 
@@ -1432,8 +1471,11 @@ module.exports = class Cluster {
       const partitions = partitionsPerBroker[nodeId]
 
       const { responses: topicOffsets } = await broker.listOffsets({
+        minVersion,
+        maxVersion,
+        timeout,
         guard,
-        isolationLevel: this.isolationLevel,
+        isolationLevel,
         topics: keys(partitions).map((topic) => ({
           topic,
           partitions: partitions[topic].map(addDefaultOffset(topic)),

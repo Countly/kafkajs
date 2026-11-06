@@ -1172,7 +1172,10 @@ describe('describeGroup under a consumer operation', () => {
     operation.finish()
     coordinator.describeGroups.mockClear()
     await describer(cluster).describe(['g'])
-    expect(coordinator.describeGroups).toHaveBeenCalledWith({ groupIds: ['g'] })
+    expect(coordinator.describeGroups).toHaveBeenCalledWith({
+      groupIds: ['g'],
+      includeAuthorizedOperations: false,
+    })
     expect(cluster.findGroupCoordinator).toHaveBeenLastCalledWith({ groupId: 'g' })
   })
 })

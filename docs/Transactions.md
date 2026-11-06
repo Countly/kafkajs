@@ -89,7 +89,9 @@ await transaction.sendOffsets({
 }]
 ```
 
-If the offset commit is refused because the consumer is no longer the member it was — `ILLEGAL_GENERATION` or `UNKNOWN_MEMBER_ID` under the classic protocol, `STALE_MEMBER_EPOCH` under `groupProtocol: 'consumer'`, or `FENCED_INSTANCE_ID` — `sendOffsets` rejects and the transaction can only be aborted: abort it, let the consumer rejoin, and process the records again from the committed offsets.
+If the offset commit is refused because the consumer is no longer the member it was — `ILLEGAL_GENERATION` or `UNKNOWN_MEMBER_ID` under the classic protocol, `STALE_MEMBER_EPOCH` under `groupProtocol: 'consumer'`, or `FENCED_INSTANCE_ID` — `sendOffsets` rejects and the transaction can only be aborted: abort it, let the consumer rejoin, and process the records again from the committed offsets. A `GROUP_ID_NOT_FOUND` from `TxnOffsetCommit` v6 (a group the coordinator does not know) is handled the same way.
+
+Transactional offset commits use topic IDs when every requested topic has a known ID and the broker supports `TxnOffsetCommit` v6 (Kafka 4.4, KIP-1319). If any ID is unavailable, the whole request stays at v5 or below; transaction-version constraints may require an older version. Group metadata is preserved. Offsets become published only after a confirmed transaction commit. Group metadata mismatch errors require aborting the transaction. An unknown topic ID refreshes the producer's metadata, without creating a topic or adding one to the producer's targets, and uses the existing bounded retry. At v6, a topic with no partition is left out of the request. An answer that cannot be matched to the request rejects `sendOffsets` with an abortable error: the producer stays usable, and the caller aborts the transaction.
 
 `sendOffsets` snapshots its topics, partitions, offsets, leader epochs and metadata when called. Calls on one transaction run one at a time in call order, including retries. The last successful call for a partition selects its value, even when offsets move backward.
 
@@ -98,6 +100,14 @@ Offsets enter the committed-offset cache shared by clients from one `Kafka` inst
 An unconfirmed commit keeps its offsets staged for a confirmed retry. A commit confirmed during a graceful `producer.disconnect()` publishes those offsets once, after the EndTxn response. A forced close forfeits all unconfirmed local publication and releases the offset tickets; a late answer or a later reconnect cannot publish those forfeited offsets. The broker may still have committed an unknown EndTxn: read broker offsets separately, for example with a fresh `admin.fetchOffsets`. An open or abortable transaction is aborted during graceful close; a transaction already committing is never aborted by close.
 
 ## <a name="errors"></a> When something fails
+
+Use admin transaction diagnostics to inspect a stuck transaction from outside the producer: `describeTransactions({ transactionalIds })`, `describeProducers({ topicPartitions })` and `listTransactions({ states: ['Ongoing'] })`. Administrative recovery is separate from a producer's own transaction object. `abortTransaction` writes an abort marker for the specified producer epoch and partition; physical records remain, while `read_committed` hides aborted records. `fenceProducers` starts a new producer epoch through the transaction coordinator. The equivalent of Java's `forceTerminateTransaction(id)` is:
+
+```javascript
+await admin.fenceProducers({ transactionalIds: [id] })
+```
+
+The existing producer becomes unusable when it observes its fencing failure; create a new producer. An admin `apiTimeout` does not prove an already-sent abort or fence failed remotely. Check the returned per-id errors and re-read diagnostics before repeating recovery.
 
 Every error carries a `category` saying what to do about it:
 

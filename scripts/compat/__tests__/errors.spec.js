@@ -161,9 +161,95 @@ describe('scripts/compat/errors', () => {
       ])
     })
 
-    it('covers every error code Kafka defines, codes 90-133 included', () => {
-      expect(result.counts).toEqual({ kafka: 134, fork: 134 })
+    it('covers every error code Kafka defines, codes 90-136 included', () => {
+      expect(result.counts).toEqual({ kafka: 137, fork: 137 })
       expect(result.missingInFork).toEqual([])
+    })
+  })
+
+  describe('the committed 4.4.0 snapshot, written from the release Errors.java', () => {
+    const NEW_IN_4_4_0 = [
+      {
+        code: 134,
+        type: 'GROUP_DELETION_FAILED',
+        exception: 'GroupDeletionFailedException',
+        message:
+          'DeleteGroups could not complete; see the error message on the per-group result for details.',
+      },
+      {
+        code: 135,
+        type: 'STREAMS_TOPOLOGY_DESCRIPTION_UPDATE_FAILED',
+        exception: 'StreamsTopologyDescriptionUpdateFailedException',
+        message:
+          'The broker could not process the topology description update; see the error message for details.',
+      },
+      {
+        code: 136,
+        type: 'CONTROLLER_ID_NOT_REGISTERED',
+        exception: 'ControllerIdNotRegisteredException',
+        message: 'The given controller ID was not registered.',
+      },
+    ]
+    const released = readSnapshot('4.4.0')
+    const retained = readSnapshot('4.3.1')
+
+    it('is labelled with the tag it was taken at, the one this tool pins', () => {
+      expect(released.kafkaTag).toBe('4.4.0')
+      expect(released.kafkaTag).toBe(config.kafkaTag)
+      expect(retained.kafkaTag).toBe('4.3.1')
+    })
+
+    it('holds every code from -1 to 136 once, each with its own type', () => {
+      const codes = released.errors.map((error) => error.code)
+
+      expect(codes).toEqual(Array.from({ length: 138 }, (_, at) => at - 1))
+      expect(new Set(released.errors.map((error) => error.type)).size).toBe(138)
+    })
+
+    it('adds codes 134, 135 and 136 to the retained codes, exactly as the release words them, none retriable', () => {
+      const added = released.errors.filter((error) => error.code >= 134)
+
+      expect(added).toEqual(NEW_IN_4_4_0.map((error) => ({ ...error, retriable: false })))
+    })
+
+    it('derives retriable from the exception chain, so a retriable family stays retriable', () => {
+      const flag = (code) => released.errors.find((error) => error.code === code).retriable
+
+      expect([flag(3), flag(5), flag(14), flag(15), flag(100)]).toEqual([
+        true,
+        true,
+        true,
+        true,
+        true,
+      ])
+      expect([flag(1), flag(29), flag(90), flag(129), flag(134)]).toEqual([
+        false,
+        false,
+        false,
+        false,
+        false,
+      ])
+    })
+
+    it('keeps every retained code, with its type and retriable flag', () => {
+      const byCode = new Map(released.errors.map((error) => [error.code, error]))
+
+      for (const { code, type, retriable } of retained.errors) {
+        expect(byCode.get(code)).toMatchObject({ type, retriable })
+      }
+    })
+
+    it('is the table the runtime table is compared with, so a removed runtime code is reported', () => {
+      const without = errorCodes.filter(({ code }) => code !== 135)
+      const result = compareErrorTables({
+        snapshot: released,
+        forkErrorCodes: without,
+        aliases: notes.errorAliases,
+      })
+
+      expect(result.missingInFork).toEqual([
+        { code: 135, type: 'STREAMS_TOPOLOGY_DESCRIPTION_UPDATE_FAILED' },
+      ])
     })
   })
 })

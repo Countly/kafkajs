@@ -238,7 +238,8 @@ const privateOf = (kafka, name) => {
  * @param {object} [readings]
  * @param {boolean} [readings.activeResources=true] count the event loop's resources by type; a run
  *   that shares its process with others, as a spec does, leaves it off
- * @returns {{ kafka: object, probe: ReturnType<typeof createResourceProbe>,
+ * @param {boolean} [readings.socketIdentities=false] attach creation IDs and endpoint inventory
+ * @returns {{ kafka: object, probe: { snapshot: () => Promise<object> },
  *   socketFactory: Function, listeners: () => Record<string, Record<string, number>> }}
  *   `socketFactory` is the counted factory the client was given: a connection made through it,
  *   such as a raw reader's, is measured like the client's own. `listeners` names the listeners of
@@ -246,14 +247,16 @@ const privateOf = (kafka, name) => {
  */
 const instrument = (
   { socketFactory = defaultSocketFactory(), ...options },
-  { activeResources = true } = {}
+  { activeResources = true, socketIdentities = false } = {}
 ) => {
   const open = new Set()
+  const identities = socketIdentities ? new WeakMap() : null
   let created = 0
   const clusters = new Set()
   const counted = (args) => {
     const socket = socketFactory(args)
     created += 1
+    if (identities) identities.set(socket, { id: created, node: `${args.host}:${args.port}` })
     open.add(socket)
     return socket
   }
@@ -313,6 +316,29 @@ const instrument = (
     heap: typeof globalThis.gc === 'function',
   })
 
+  if (identities) {
+    const snapshot = probe.snapshot.bind(probe)
+    /** Reads counters and identities in one turn before heap sampling can await.
+     * Closed sockets are not retained by the identity map.
+     * @returns {Promise<object>} a fresh, serializable observation; no socket references
+     */
+    probe.snapshot = async () => {
+      const live = openSockets().map((socket) => identities.get(socket))
+      const nodes = liveClusters().flatMap(({ brokerPool }) => [
+        ...(brokerPool.metadata?.brokers || []).map(({ host, port }) => `${host}:${port}`),
+        ...[brokerPool.seedBroker]
+          .filter(Boolean)
+          .map(({ connectionPool }) => connectionPool.brokerAddress),
+      ])
+      const row = await snapshot()
+      return {
+        ...row,
+        sockets: { ...row.sockets, live },
+        socketNodes: unique(nodes),
+      }
+    }
+  }
+
   const named = (emitter) =>
     Object.fromEntries(
       emitter.eventNames().map((name) => [String(name), emitter.listenerCount(name)])
@@ -326,10 +352,124 @@ const instrument = (
 }
 
 /**
+ * Verifies idle reaping on a producer whose sockets are counted separately from
+ * the polling consumer and admin. Checks precede explicit disconnect, so shutdown
+ * cannot impersonate reaping. No time or memory slope is inferred from a cycle.
+ */
+class IdleSocketCheck {
+  /**
+   * @param {object} options owned producer, probe and evidence ports
+   * @param {object} options.producer connected public producer
+   * @param {object} options.probe independent resource probe for that producer
+   * @param {string} options.topic one stable topic
+   * @param {Function} [options.nap] bounded foreground delay
+   * @param {Function} [options.record] stamped evidence writer supplied by the soak
+   * @returns {IdleSocketCheck} reusable cycle owner
+   */
+  constructor({
+    producer,
+    probe,
+    topic,
+    nap = sleep,
+    record = (row) => writeEvidence('soak', row),
+  }) {
+    this.producer = producer
+    this.probe = probe
+    this.topic = topic
+    this.nap = nap
+    this.record = record
+    this.sequence = 0
+  }
+
+  /**
+   * Checks a positive population against the current bootstrap/metadata node inventory.
+   * The isolated producer uses one primary socket per endpoint. Metadata can select
+   * another endpoint at any send; endpoint populations need not match between sends.
+   * @param {object} row observed counters, live identities and current node inventory
+   * @param {number} [after=0] all live IDs must have been created after this counter
+   * @returns {void}
+   * @throws {Error} a missing, stale, unknown or duplicate socket, or inconsistent counters
+   */
+  population(row, after = 0) {
+    const { sockets, socketNodes } = row
+    const live = sockets.live
+    if (
+      !Number.isInteger(sockets.created) ||
+      !Number.isInteger(sockets.destroyed) ||
+      sockets.destroyed < 0 ||
+      sockets.open < 1 ||
+      sockets.created - sockets.destroyed !== sockets.open ||
+      !Array.isArray(live) ||
+      live.length !== sockets.open ||
+      !Array.isArray(socketNodes) ||
+      !socketNodes.length ||
+      new Set(live.map(({ node }) => node)).size !== live.length ||
+      new Set(live.map(({ id }) => id)).size !== live.length ||
+      live.some(
+        ({ id, node }) =>
+          !Number.isInteger(id) ||
+          id <= after ||
+          id > sockets.created ||
+          !socketNodes.includes(node)
+      )
+    )
+      throw new Error('Idle producer did not reopen fresh bounded node sockets')
+  }
+
+  /**
+   * Verifies that every tracked transport and request was reaped without an explicit close.
+   * @param {object} row observed producer resources
+   * @returns {void}
+   * @throws {Error} any socket identity, open counter or request survives
+   */
+  reaped(row) {
+    if (
+      row.sockets.open !== 0 ||
+      row.sockets.created !== row.sockets.destroyed ||
+      !Array.isArray(row.sockets.live) ||
+      row.sockets.live.length !== 0 ||
+      row.queueDepth !== 0
+    )
+      throw new Error('Idle producer socket was not reaped')
+  }
+
+  /**
+   * Reaps cold bootstrap work, then checks fresh per-node identities across another
+   * idle interval. An expired metadata cache may add healthy sockets on any send.
+   * @returns {Promise<void>}
+   * @throws {Error} surviving resources or stale, unknown or duplicate reopened sockets
+   */
+  async cycle() {
+    const send = () =>
+      this.producer.send({
+        topic: this.topic,
+        messages: [{ partition: 0, value: String(this.sequence++) }],
+      })
+    await send()
+    const warmup = await this.probe.snapshot()
+    this.population(warmup)
+    await this.nap(6000)
+    const warmIdle = await this.probe.snapshot()
+    this.reaped(warmIdle)
+    await send()
+    const before = await this.probe.snapshot()
+    this.population(before, warmIdle.sockets.created)
+    await this.nap(6000)
+    const idle = await this.probe.snapshot()
+    this.reaped(idle)
+    await send()
+    const reopened = await this.probe.snapshot()
+    this.population(reopened, idle.sockets.created)
+    this.record({ kind: 'idle-cycle', warmup, warmIdle, before, idle, reopened })
+  }
+}
+
+/**
  * What a workload is handed.
  * @typedef {object} WorkloadContext
  * @property {object} kafka the `Kafka` the clients are built from
  * @property {string} topic the topic of the run
+ * @property {IdleSocketCheck} [idleSocketCheck] separately counted idle producer checks
  * @property {string} groupId the consumer group of the run
  * @property {ProducerChurn} [producerChurn] the owner of the producer-churn phases
  * @property {{ runPhase: (name: string, ms: number) => Promise<void> }} [consumerChurn] the owner of the
@@ -395,17 +535,21 @@ const WORKLOADS = {
    * @throws {Error} the failure of a connect, subscribe, run or send, after the clients are
    *   disconnected; when only a disconnect fails, that failure
    */
-  async idle({ kafka, topic, groupId }, ms) {
+  async idle({ kafka, topic, groupId, idleSocketCheck }, ms) {
     await Clients.use(kafka, async (clients) => {
-      const producer = clients.producer()
+      const producer = idleSocketCheck ? null : clients.producer()
       const consumer = clients.consumer({ groupId })
-      await producer.connect()
+      if (producer) await producer.connect()
       await consumer.connect()
       await subscribeNamedTopic(consumer, { topic, fromBeginning: false })
       await consumer.run({ eachMessage: async () => {} })
 
       const deadline = Date.now() + ms
       for (let key = 0; Date.now() < deadline; key++) {
+        if (idleSocketCheck) {
+          await idleSocketCheck.cycle()
+          continue
+        }
         await producer.send({ topic, messages: [{ key: String(key % PARTITIONS), value: 'x' }] })
         await sleep(1000)
       }
@@ -2206,7 +2350,44 @@ const main = async (
     context: { kafka, topic, groupId: `${topic}-group` },
     ...(smoke && { sampleMs: Math.max(1000, (phaseSeconds * 1000) / 6), warmupMs: 0 }),
   })
-  return soak.run()
+  if (profile !== 'idle') return soak.run()
+  const counted = instrument(
+    {
+      clientId: 'soak-idle-producer',
+      brokers,
+      connectionsMaxIdle: 5000,
+      logLevel: logLevel.NOTHING,
+    },
+    { socketIdentities: true }
+  )
+  const producer = counted.kafka.producer({ idempotent: true })
+  const wireVersions = {}
+  const off = producer.on(producer.events.REQUEST, ({ payload }) => {
+    wireVersions[payload.apiName] = Math.max(
+      wireVersions[payload.apiName] ?? payload.apiVersion,
+      payload.apiVersion
+    )
+  })
+  soak.context.idleSocketCheck = new IdleSocketCheck({
+    producer,
+    probe: counted.probe,
+    topic,
+    record: (row) =>
+      writeEvidence('soak', { ...row, wireVersions, config: { connectionsMaxIdle: 5000 } }),
+  })
+  let verdict
+  let closed
+  try {
+    await producer.connect()
+    verdict = await soak.run()
+  } finally {
+    off()
+    await producer.disconnect()
+    closed = await counted.probe.snapshot()
+  }
+  if (closed.sockets.open !== 0 || closed.queueDepth !== 0)
+    throw new Error('Idle producer shutdown retained resources')
+  return verdict
 }
 
 if (require.main === module) {
@@ -2231,6 +2412,7 @@ module.exports = {
   forgettingDestroyed,
   PROFILES,
   WORKLOADS,
+  IdleSocketCheck,
   ProducerChurn,
   RawProducerReader,
   Soak,

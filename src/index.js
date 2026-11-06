@@ -1,3 +1,4 @@
+const { validateApiTimeout } = require('./admin/deadline')
 const { inspect } = require('util')
 const {
   createLogger,
@@ -9,7 +10,9 @@ const InstrumentationEventEmitter = require('./instrumentation/emitter')
 const channels = require('./instrumentation/channels')
 const LoggerConsole = require('./loggers/console')
 const Cluster = require('./cluster')
+const { ConnectionSetupPolicy } = require('./network/connectionSetup')
 const createProducer = require('./producer')
+const RackPreference = require('./producer/partitioners/rackPreference')
 const { minimumRequestSize } = require('./producer/state/recordSize')
 const { MAX_DELAY } = require('./producer/deadline')
 const createConsumer = require('./consumer')
@@ -325,8 +328,10 @@ module.exports = class Client {
    * @param {Object} options.ssl
    * @param {Object} options.sasl
    * @param {string} options.clientId
-   * @param {number} [options.connectionTimeout=1000] - in milliseconds
+   * @param {number} [options.connectionTimeout] Setup milliseconds; omitted base 10000 grows to 30000.
    * @param {number} options.authenticationTimeout - in milliseconds
+   * @param {number} [options.connectionsMaxIdle=540000] Idle milliseconds; 0 disables.
+   *   Must be an integer from 0 to 2147483647 or construction throws.
    * @param {number} options.reauthenticationThreshold - in milliseconds
    * @param {number} [options.requestTimeout=30000] - in milliseconds
    * @param {boolean} [options.enforceRequestTimeout]
@@ -337,7 +342,9 @@ module.exports = class Client {
    * @param {import("../types").ISocketFactory} [options.socketFactory]
    * @param {'rebootstrap'|'none'} [options.metadataRecoveryStrategy='rebootstrap'] KIP-899/1102:
    *   `'rebootstrap'` rebuilds the client's connections and metadata from the configured broker
-   *   list when metadata is unreachable; `'none'` restores pre-3.0 behavior.
+   *   list when metadata is unreachable or a broker answers `REBOOTSTRAP_REQUIRED`, including to
+   *   an ApiVersions v5 request that names the intended cluster and node (KIP-1242); `'none'`
+   *   names no identity in ApiVersions and restores pre-3.0 behavior.
    * @param {number} [options.metadataRecoveryRebootstrapTriggerMs=300000] how long metadata must
    *   fail *continuously* before a rebootstrap is triggered. Must be an integer >= 1.
    * @throws {KafkaJSInvalidConfigurationError} for an invalid `maxResponseSize`
@@ -347,8 +354,12 @@ module.exports = class Client {
     ssl,
     sasl,
     clientId,
-    connectionTimeout = 1000,
+    connectionTimeout,
+    connectionTimeoutMax,
+    reconnectBackoff,
+    reconnectBackoffMax,
     authenticationTimeout,
+    connectionsMaxIdle,
     reauthenticationThreshold,
     requestTimeout,
     enforceRequestTimeout = true,
@@ -367,7 +378,29 @@ module.exports = class Client {
     this[PRIVATE.REQUEST_TIMEOUT] = requestTimeout ?? DEFAULT_REQUEST_TIMEOUT
     this[PRIVATE.CLIENT_ID] = clientId
 
+    const setupPolicy = ConnectionSetupPolicy.resolve({
+      connectionTimeout,
+      connectionTimeoutMax,
+      reconnectBackoff,
+      reconnectBackoffMax,
+      authenticationTimeout,
+    })
+    connectionTimeout = setupPolicy.timeoutBase
+    connectionTimeoutMax = setupPolicy.timeoutCeiling
+    reconnectBackoff = setupPolicy.waitBase
+    reconnectBackoffMax = setupPolicy.waitCeiling
+    authenticationTimeout = setupPolicy.authenticationTimeout
     const validatedMaxResponseSize = validateMaxResponseSize(maxResponseSize)
+    if (
+      connectionsMaxIdle !== undefined &&
+      (!Number.isInteger(connectionsMaxIdle) ||
+        connectionsMaxIdle < 0 ||
+        connectionsMaxIdle > INT_32_MAX_VALUE)
+    ) {
+      throw new KafkaJSInvalidConfigurationError(
+        `connectionsMaxIdle must be an integer from 0 to ${INT_32_MAX_VALUE}`
+      )
+    }
     this[PRIVATE.MAX_RESPONSE_SIZE] = validatedMaxResponseSize
     const validatedMetadataRecoveryStrategy =
       validateMetadataRecoveryStrategy(metadataRecoveryStrategy)
@@ -397,7 +430,12 @@ module.exports = class Client {
         sasl,
         clientId,
         connectionTimeout,
+        connectionTimeoutMax,
+        reconnectBackoff,
+        reconnectBackoffMax,
+        setupPolicy,
         authenticationTimeout,
+        connectionsMaxIdle,
         reauthenticationThreshold,
         requestTimeout,
         enforceRequestTimeout,
@@ -430,9 +468,17 @@ module.exports = class Client {
    * @param {number} [options.bufferMemory=33554432] bytes the producer's sends may hold at once
    * @param {number} [options.maxBlockMs=60000] ms a send waits for room in that buffer
    * @param {number} [options.metadataMaxIdle=300000] idle unpinned topic lifetime, 5000..2147483647 ms
+   * @param {string} [options.rackId=''] the producer's rack (KIP-1123), the broker's `broker.rack`
+   *   it is in
+   * @param {boolean} [options.rackAware=false] with a non-empty `rackId`, the built-in
+   *   partitioners prefer the partitions whose leader is in that rack for records without a key,
+   *   and use all partitions when none is; a record with a partition or a key and a custom
+   *   partitioner are unaffected
    * @returns {import("../types").Producer} the producer and its transaction factory
    * @throws {KafkaJSInvalidConfigurationError} for a setting idempotence asked for explicitly
-   *   does not allow, and for invalid delivery, buffer, request-size or compression-level options
+   *   does not allow, for invalid delivery, buffer, request-size or compression-level options, for
+   *   a `rackId` that is not a string or a `rackAware` that is not a boolean, and for `rackAware`
+   *   with an empty `rackId`
    */
   producer({
     createPartitioner,
@@ -451,6 +497,8 @@ module.exports = class Client {
     bufferMemory,
     maxBlockMs,
     maxRequestSize,
+    rackId = '',
+    rackAware = false,
   } = {}) {
     if (!(
       Number.isInteger(metadataMaxIdle) &&
@@ -461,6 +509,7 @@ module.exports = class Client {
         `metadataMaxIdle must be an integer >= 5000 and <= ${MAX_DELAY}, got ${inspect(metadataMaxIdle)}`
       )
     }
+    RackPreference.validate({ rackId, rackAware })
     const levels = resolveCompressionLevels(compressionLevels)
     validateBuffer({ bufferMemory, maxBlockMs })
     validateMaxRequestSize(maxRequestSize, this[PRIVATE.CLIENT_ID], transactionalId)
@@ -518,6 +567,8 @@ module.exports = class Client {
       clientId: this[PRIVATE.CLIENT_ID],
       maxRequestSize,
       instrumentationEmitter,
+      rackId,
+      rackAware,
     })
   }
 
@@ -593,7 +644,9 @@ module.exports = class Client {
         )
     }
 
-    const instrumentationEmitter = new InstrumentationEventEmitter({ channels: channels.consumer })
+    const instrumentationEmitter = new InstrumentationEventEmitter({
+      channels: channels.consumer,
+    })
     const cluster = this[PRIVATE.CREATE_CLUSTER]({
       metadataMaxAge,
       allowAutoTopicCreation,
@@ -633,16 +686,26 @@ module.exports = class Client {
   }
 
   /**
+   * Creates an admin client with a validated default call budget.
    * @public
+   * @param {object} [options] admin configuration
+   * @param {object} [options.retry] retry limits and backoff, unchanged by the API cap
+   * @param {number} [options.apiTimeout=60000] end-to-end call budget in milliseconds
+   * @returns {import('../types').Admin} admin client
+   * @throws {KafkaJSInvalidConfigurationError} for an invalid API budget before cluster creation
    */
-  admin({ retry } = {}) {
-    const instrumentationEmitter = new InstrumentationEventEmitter({ channels: channels.admin })
+  admin({ retry, apiTimeout } = {}) {
+    apiTimeout = validateApiTimeout(apiTimeout)
+    const instrumentationEmitter = new InstrumentationEventEmitter({
+      channels: channels.admin,
+    })
     const cluster = this[PRIVATE.CREATE_CLUSTER]({
       allowAutoTopicCreation: false,
       instrumentationEmitter,
     })
 
     return createAdmin({
+      apiTimeout,
       retry: { ...this[PRIVATE.CLUSTER_RETRY], ...retry },
       logger: this[PRIVATE.LOGGER],
       instrumentationEmitter,

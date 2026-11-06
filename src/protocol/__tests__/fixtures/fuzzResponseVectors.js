@@ -104,6 +104,32 @@ const NAMED = {
  * @type {Record<string, { decoded?: Function, fields?: Function, options?: Function }>}
  */
 const PROJECTIONS = {
+  alterPartitionReassignments: {
+    fields: ({ errorMessage, ...fields }, version) =>
+      version === 1
+        ? {
+            ...fields,
+            responses: fields.responses.map((topic) => ({
+              ...topic,
+              partitions: topic.partitions.map(({ errorMessage, ...partition }) => partition),
+            })),
+          }
+        : fields,
+  },
+  createDelegationToken: {
+    fields: ({ hmac, ...fields }) => ({ ...fields, hmac: hmac.$bytes }),
+  },
+  // the two keys that describe the unknown tagged field every struct of one vector carries are
+  // not values a decoder returns
+  deleteGroups: {
+    fields: ({ unknownTag, unknownTagBytes, ...fields }) => fields,
+  },
+  describeDelegationToken: {
+    fields: (fields) => ({
+      ...fields,
+      tokens: fields.tokens.map(({ hmac, ...token }) => ({ ...token, hmac: hmac.$bytes })),
+    }),
+  },
   // a broker and a partition are the values of their fields, in order: a broker is [nodeId, host,
   // port, rack]; a partition is [partitionErrorCode, partitionId, leader, leaderEpoch (v7 and
   // later), replicas, isr, offlineReplicas (v5 and later)]
@@ -117,10 +143,15 @@ const PROJECTIONS = {
       })),
     }),
   },
-  // every API a broker offers is a triple of numbers
+  // every API a broker offers is a triple of numbers; a vector names its list `apiKeys`, and the
+  // two keys that describe an unknown tagged field are not values a decoder returns
   apiVersions: {
     decoded: (value) =>
       value.apiVersions ? { ...value, apiVersions: triples(value.apiVersions) } : value,
+    fields: ({ apiKeys, unknownTag, unknownTagBytes, ...fields }) => ({
+      ...fields,
+      apiVersions: triples(apiKeys),
+    }),
   },
   // the decoder sorts topics by name, the wire lists them as sent
   deleteTopics: {
@@ -134,6 +165,24 @@ const PROJECTIONS = {
       version >= 9
         ? { throttleTime: value.throttleTime, topics: topicsOf(value.responses, version) }
         : value,
+  },
+  // from v6 a topic is named from the request's map and was sent as an id, and the two keys that
+  // describe the unknown tagged field every struct of one vector carries are not values a decoder
+  // returns; an id the map does not hold stays an id with a null name
+  txnOffsetCommit: {
+    options: (version) => (version >= 6 ? { topicNames: TOPIC_NAMES } : undefined),
+    decoded: (value, version) => {
+      if (version < 6) return value
+      const idOf = Object.fromEntries([...TOPIC_NAMES].map(([id, name]) => [name, id]))
+      return {
+        throttleTime: value.throttleTime,
+        topics: value.topics.map(({ topic, topicId, partitions }) => ({
+          topicId: topicId ?? idOf[topic],
+          partitions,
+        })),
+      }
+    },
+    fields: ({ unknownTag, unknownTagBytes, ...fields }) => fields,
   },
   offsetFetch: {
     options: (version) => (version >= 10 ? { topicNames: TOPIC_NAMES } : undefined),
@@ -156,6 +205,18 @@ const PROJECTIONS = {
       }
       const { groupId, ...rest } = fields
       if (version >= 9) return rest
+      if (version === 7 && fields.topics)
+        return {
+          throttleTime: fields.throttleTime,
+          errorCode: fields.errorCode,
+          responses: fields.topics.map(({ topic, partitions }) => ({
+            topic,
+            partitions: partitions.map(({ leaderEpoch, ...partition }) => ({
+              ...partition,
+              committedLeaderEpoch: leaderEpoch,
+            })),
+          })),
+        }
       if (version < 8) return fields
       return {
         throttleTime: fields.throttleTime,

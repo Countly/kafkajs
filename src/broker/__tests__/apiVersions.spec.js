@@ -28,13 +28,16 @@ describe('Broker > ApiVersions', () => {
     await expect(broker.apiVersions()).resolves.toBeTruthy()
   })
 
-  test('negotiates the highest implemented version', async () => {
+  test('negotiates the highest implemented version the broker offers', async () => {
     jest.spyOn(requests.ApiVersions, 'protocol')
 
-    await broker.apiVersions()
+    const versions = await broker.apiVersions()
 
-    expect(requests.ApiVersions.protocol).toHaveBeenCalledTimes(1)
-    expect(requests.ApiVersions.protocol).toHaveBeenCalledWith({ version: 4 })
+    // A broker below Kafka 4.4 answers the first v5 request with UNSUPPORTED_VERSION and its own
+    // maximum, which is the one retry; a 4.4 broker accepts v5.
+    const { maxVersion } = versions[apiKeys.ApiVersions]
+    const asked = requests.ApiVersions.protocol.mock.calls.map(([{ version }]) => version)
+    expect(asked).toEqual(maxVersion >= 5 ? [5] : [5, maxVersion])
   })
 
   test('retries once at the version the broker hints (KIP-511)', async () => {
@@ -45,7 +48,7 @@ describe('Broker > ApiVersions', () => {
     })
 
     await expect(broker.apiVersions()).resolves.toBeTruthy()
-    expect(requests.ApiVersions.protocol).toHaveBeenCalledWith({ version: 4 })
+    expect(requests.ApiVersions.protocol).toHaveBeenCalledWith({ version: 5 })
     expect(requests.ApiVersions.protocol).toHaveBeenCalledWith({ version: 1 })
     expect(requests.ApiVersions.protocol).not.toHaveBeenCalledWith({ version: 2 })
   })

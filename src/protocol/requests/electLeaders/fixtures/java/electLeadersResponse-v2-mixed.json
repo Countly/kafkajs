@@ -1,0 +1,7 @@
+{
+  "message": "ElectLeadersResponse",
+  "version": 2,
+  "case": "mixed",
+  "hex": "00000011000002076f72646572730300000000005400000000000200500b6e6f207265706c696361000000",
+  "fields": {"throttleTimeMs":17,"errorCode":0,"replicaElectionResults":[{"topic":"orders","partitionResult":[{"partitionId":0,"errorCode":84,"errorMessage":null},{"partitionId":2,"errorCode":80,"errorMessage":"no replica"}]}]}
+}

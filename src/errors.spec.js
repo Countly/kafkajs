@@ -151,6 +151,15 @@ describe('error wrapping preserves the protocol type', () => {
     expect(exceeded.cause).toBe(protocolError)
   })
 
+  it('KafkaJSNumberOfRetriesExceeded names itself in its stack header', () => {
+    const exceeded = new KafkaJSNumberOfRetriesExceeded(protocolError, {
+      retryCount: 1,
+      retryTime: 153,
+    })
+    expect(exceeded.stack.split('\n')[0]).toBe('KafkaJSNumberOfRetriesExceeded')
+    expect(exceeded.cause).toBe(protocolError)
+  })
+
   it('KafkaJSNumberOfRetriesExceeded digs through a chain of wrappers', () => {
     const exceeded = new KafkaJSNumberOfRetriesExceeded(new KafkaJSError(protocolError), {
       retryCount: 5,
@@ -982,4 +991,13 @@ describe('rebalance listener failure identity', () => {
     expect(errors.KafkaJSRebalanceListenerError).toBeDefined()
     expect(packageEntry.KafkaJSRebalanceListenerError).toBe(errors.KafkaJSRebalanceListenerError)
   })
+})
+
+test('create-topic detail does not replace the protocol message', () => {
+  const { KafkaJSCreateTopicError } = require('./errors')
+  const source = require('./protocol/error').createErrorFromCode(36)
+  const error = new KafkaJSCreateTopicError(source, 't', 'broker detail')
+  expect(error.message).toBe(source.message)
+  expect(error.errorMessage).toBe('broker detail')
+  expect(new KafkaJSCreateTopicError(source, 't').errorMessage).toBeNull()
 })

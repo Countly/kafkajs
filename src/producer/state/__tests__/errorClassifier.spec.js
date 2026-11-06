@@ -65,6 +65,7 @@ const TABLE = [
   { type: 'TRANSACTION_ABORTABLE', code: 120, surfaces: SURFACES, category: 'abortable' },
   { type: 'INVALID_TXN_STATE', code: 48, surfaces: ['produce'], category: 'abortable' },
   { type: 'STALE_MEMBER_EPOCH', code: 113, surfaces: ['offsets'], category: 'abortable' },
+  { type: 'GROUP_ID_NOT_FOUND', code: 69, surfaces: ['offsets'], category: 'abortable' },
   { type: 'ILLEGAL_GENERATION', code: 22, surfaces: ['offsets'], category: 'abortable' },
   { type: 'UNKNOWN_MEMBER_ID', code: 25, surfaces: ['offsets'], category: 'abortable' },
   { type: 'FENCED_INSTANCE_ID', code: 82, surfaces: ['offsets'], category: 'abortable' },
@@ -333,7 +334,7 @@ describe('classify > a code the table does not name', () => {
 })
 
 describe('classify > a stale member on a transactional offset commit', () => {
-  test.each([22, 25, 82, 113])(
+  test.each([22, 25, 69, 82, 113])(
     'code %i is abortable from TxnOffsetCommit, applicationRecoverable from Produce, and unchanged elsewhere',
     (code) => {
       expect(classify(createErrorFromCode(code), 'offsets', { transactional: true })).toEqual({
@@ -580,6 +581,7 @@ describe('transactionStateFor', () => {
     ['an abortable code', () => classified(120, 'txn')],
     ['a stale generation on TxnOffsetCommit', () => classified(22, 'offsets')],
     ['a stale member epoch on TxnOffsetCommit', () => classified(113, 'offsets')],
+    ['a missing group on TxnOffsetCommit', () => classified(69, 'offsets')],
     ['a retriable error that ended a send', () => classified(6, 'produce')],
     [
       'a retriable error the retrier gave up on',

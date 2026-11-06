@@ -203,7 +203,7 @@ describe('Admin > fetchTopicMetadata through DescribeTopicPartitions > one deadl
 
     expect(result.error).toBeInstanceOf(KafkaJSTimeout)
     expect(result.error.message).toBe(
-      `DescribeTopicPartitions did not complete within ${DEADLINE_MS} ms`
+      `fetchTopicMetadata did not complete within ${DEADLINE_MS} ms; outcome is unknown; a mutation may have been applied`
     )
     expect(jest.getTimerCount()).toBe(baseline)
     last.release(page([1], { more: true }))

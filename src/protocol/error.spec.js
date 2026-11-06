@@ -76,6 +76,55 @@ describe('error codes 90-133 (Kafka 4.3.1 Errors.java)', () => {
   })
 })
 
+describe('error codes 134-136 (Kafka 4.4.0 Errors.java)', () => {
+  const RELEASED = [
+    [
+      134,
+      'GROUP_DELETION_FAILED',
+      'DeleteGroups could not complete; see the error message on the per-group result for details.',
+    ],
+    [
+      135,
+      'STREAMS_TOPOLOGY_DESCRIPTION_UPDATE_FAILED',
+      'The broker could not process the topology description update; see the error message for details.',
+    ],
+    [136, 'CONTROLLER_ID_NOT_REGISTERED', 'The given controller ID was not registered.'],
+  ]
+
+  test('every code from -1 to 136 that Kafka 4.4.0 defines is known', () => {
+    const snapshot = require('../../scripts/compat/errors/4.4.0.json')
+    const known = new Set(errorCodes.map((entry) => entry.code))
+    const missing = snapshot.errors
+      .filter((entry) => entry.code !== 0)
+      .map((entry) => entry.code)
+      .filter((code) => !known.has(code))
+
+    expect(missing).toEqual([])
+  })
+
+  test('codes 134 through 136 match the released error table', () => {
+    const snapshot = require('../../scripts/compat/errors/4.4.0.json')
+
+    for (const [code, type, message] of RELEASED) {
+      expect(errorCodes.filter((entry) => entry.code === code)).toEqual([
+        { type, code, retriable: false, message },
+      ])
+      expect(snapshot.errors.find((entry) => entry.code === code)).toMatchObject({
+        type,
+        message,
+        retriable: false,
+      })
+      expect(createErrorFromCode(code)).toMatchObject({
+        type,
+        code,
+        message,
+        retriable: false,
+      })
+    }
+    expect(errorCodes.filter((entry) => entry.code > 133)).toHaveLength(3)
+  })
+})
+
 describe('#staleMetadata', () => {
   test.each([
     [100, 'UNKNOWN_TOPIC_ID'],

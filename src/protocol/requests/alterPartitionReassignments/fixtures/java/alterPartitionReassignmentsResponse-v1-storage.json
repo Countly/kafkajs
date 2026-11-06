@@ -1,0 +1,7 @@
+{
+  "message": "AlterPartitionReassignmentsResponse",
+  "version": 1,
+  "case": "storage",
+  "hex": "00000011000000000202740200000000000000000000",
+  "fields": {"throttleTime":17,"allowReplicationFactorChange":false,"errorCode":0,"errorMessage":null,"responses":[{"topic":"t","partitions":[{"partition":0,"errorCode":0,"errorMessage":null}]}]}
+}

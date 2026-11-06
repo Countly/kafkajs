@@ -1,0 +1,7 @@
+{
+  "message": "CreateDelegationTokenRequest",
+  "version": 3,
+  "case": "security",
+  "hex": "05557365720b746573742d6f776e65720205557365720b746573742d6f776e657200ffffffffffffffff00",
+  "fields": {"ownerPrincipalType":"User","ownerPrincipalName":"test-owner","renewers":[{"principalType":"User","principalName":"test-owner"}],"maxLifetimeMs":"-1"}
+}

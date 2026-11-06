@@ -31,9 +31,14 @@ describe('Protocol > Requests > SaslAuthenticate > v1', () => {
 
   describe('parse', () => {
     const SASL_AUTHENTICATION_FAILED = 58
-    it('uses the custom message when errorCode SASL_AUTHENTICATION_FAILED', async () => {
+    it('throws the fixed text of SASL_AUTHENTICATION_FAILED, not the broker message', async () => {
       const data = { errorCode: SASL_AUTHENTICATION_FAILED, errorMessage: 'Auth failed' }
-      await expect(parse(data)).rejects.toThrow(/Auth failed/)
+      await expect(parse(data)).rejects.toMatchObject({
+        name: 'KafkaJSProtocolError',
+        type: 'SASL_AUTHENTICATION_FAILED',
+        code: SASL_AUTHENTICATION_FAILED,
+        message: 'SASL Authentication failed',
+      })
     })
   })
 })

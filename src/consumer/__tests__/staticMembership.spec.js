@@ -1,3 +1,4 @@
+const setupPool = require('../../../testHelpers/setupPool')
 const ConsumerGroup = require('../consumerGroup')
 const Runner = require('../runner')
 const Broker = require('../../broker')
@@ -169,7 +170,7 @@ describe('Consumer > static membership (KIP-345)', () => {
         versions: coordinatorVersions,
         negotiatedVersion: (apiKey, definition) =>
           new Broker({
-            connectionPool: brokerStubPool(),
+            connectionPool: setupPool(brokerStubPool()),
             logger: newLogger(),
             versions: coordinatorVersions,
           }).negotiatedVersion(apiKey, definition),

@@ -1,0 +1,7 @@
+{
+  "message": "AlterClientQuotasRequest",
+  "version": 1,
+  "case": "security",
+  "hex": "020205757365720000021370726f64756365725f627974655f7261746540934a00000000000000000100",
+  "fields": {"entries":[{"entity":[{"entityType":"user","entityName":null}],"ops":[{"key":"producer_byte_rate","value":1234.5,"remove":false}]}],"validateOnly":true}
+}

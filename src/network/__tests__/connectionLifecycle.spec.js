@@ -2,6 +2,7 @@ const { requests, lookup } = require('../../protocol/requests')
 const Cluster = require('../../cluster')
 const ConnectionPool = require('../connectionPool')
 const Broker = require('../../broker')
+const setupPool = require('../../../testHelpers/setupPool')
 const BrokerPool = require('../../cluster/brokerPool')
 const { failureSourceOf, attachFailureSource } = require('../../broker/failureSource')
 const { isConnectionFailure } = require('../connectionFailure')
@@ -194,7 +195,7 @@ describe('Connection and Broker lifecycle on the scripted cluster', () => {
 
   /** A broker over a fake pool whose `send` fails as the test says. */
   const brokerOver = (send) => {
-    const pool = {
+    const pool = setupPool({
       connectionTimeout: 1000,
       host: 'h',
       port: 1,
@@ -205,7 +206,7 @@ describe('Connection and Broker lifecycle on the scripted cluster', () => {
       getConnectionByRequest: async () => ({ isConnected: () => true }),
       destroy: jest.fn(() => new Promise(() => {})),
       send: jest.fn(async () => send(pool)),
-    }
+    })
     const broker = new Broker({ connectionPool: pool, logger: newLogger() })
     broker.versions = { 3: { minVersion: 0, maxVersion: 13 } }
     broker.lookupRequest = lookup(broker.versions)
@@ -706,6 +707,9 @@ describe('Connection and Broker lifecycle on the scripted cluster', () => {
       expect(writtenBySocket(cluster)).toEqual(expected.written)
       expect(cluster.sockets().map((socket) => socket.destroyed)).toEqual(expected.destroyed)
       expect(replacement.isConnected()).toBe(expected.replacementConnected)
+      if (_name === 'during the version renegotiation') {
+        expect(old.setupStates.state(old.brokerAddress, 0).failures).toBe(0)
+      }
       const api = expected.api ?? 'Metadata'
       const through = ['old', 'replacement'].filter((pool) => sentOn[pool].includes(api))
       expect(through).toEqual(expected.through ? [expected.through] : [])

@@ -15,7 +15,7 @@ describe('Protocol > Requests > DeleteGroups > v2', () => {
     const { hex, fields } = vector()
     const { request } = protocol({ version: 2 })(fields.groupIds)
 
-    expect(versions).toEqual(['0', '1', '2'])
+    expect(versions).toEqual(['0', '1', '2', '3'])
     expect(request).toMatchObject({ apiKey: 42, apiVersion: 2, apiName: 'DeleteGroups' })
     expect((await request.encode()).buffer.toString('hex')).toEqual(hex)
   })

@@ -1,0 +1,7 @@
+{
+  "message": "RenewDelegationTokenResponse",
+  "version": 1,
+  "case": "security",
+  "hex": "0000002000000000000100000000",
+  "fields": {"errorCode":0,"expiryTimestampMs":"9007199254740993","throttleTimeMs":0}
+}

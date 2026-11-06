@@ -1,3 +1,4 @@
+const { currentDeadline, sharedSetup } = require('../admin/deadline')
 const { isNativeError } = require('util').types
 const describeThrown = require('./describeThrown')
 const createSocket = require('./socket')
@@ -17,7 +18,9 @@ const RequestQueue = require('./requestQueue')
 const { CONNECTION_STATUS, CONNECTED_STATUS } = require('./connectionStatus')
 const sharedPromiseTo = require('../utils/sharedPromiseTo')
 const Long = require('../utils/long')
+const { ConnectionSetupPolicy, SetupAttempt } = require('./connectionSetup')
 const SASLAuthenticator = require('../broker/saslAuthenticator')
+const { attachResponseSource } = require('../broker/failureSource')
 const apiKeys = require('../protocol/requests/apiKeys')
 const { responseHeaderVersion, RESPONSE_HEADER_V1 } = require('../protocol/headers')
 
@@ -60,6 +63,17 @@ const isAuthenticatedRequest = (request) => {
   )
 }
 
+/** APIs whose broker payloads can contain credentials, including echoed error text. */
+const SENSITIVE_API_KEYS = new Set([
+  apiKeys.SaslAuthenticate,
+  apiKeys.CreateDelegationToken,
+  apiKeys.RenewDelegationToken,
+  apiKeys.ExpireDelegationToken,
+  apiKeys.DescribeDelegationToken,
+  apiKeys.DescribeUserScramCredentials,
+  apiKeys.AlterUserScramCredentials,
+])
+
 const PRIVATE = {
   SHOULD_REAUTHENTICATE: Symbol('private:Connection:shouldReauthenticate'),
   AUTHENTICATE: Symbol('private:Connection:authenticate'),
@@ -89,7 +103,15 @@ module.exports = class Connection {
    *                             key "mechanism". Connection is not actively using the SASL attributes
    *                             but acting as a data object for this information
    * @param {number} [options.reauthenticationThreshold=10000]
-   * @param {number} options.connectionTimeout The connection timeout, in milliseconds
+   * @param {number} options.connectionTimeout Resolved base in milliseconds
+   * @param {number} [options.connectionTimeoutMax] Resolved setup ceiling
+   * @param {number} [options.reconnectBackoff] Resolved retry wait base
+   * @param {number} [options.reconnectBackoffMax] Resolved retry wait ceiling
+   * @param {number} [options.authenticationTimeout] Whole-SASL cap in milliseconds
+   * @param {number} [options.connectionsMaxIdle=540000] Idle milliseconds; 0 disables.
+   *   Preparation, queued work and in-flight work prevent deliberate reaping.
+   * @param {ConnectionSetupPolicy} [options.setupPolicy] Policy resolved before downstream defaults
+   * @param {() => SetupAttempt} [options.beginSetup] Current shared node owner callback
    * @param {boolean} [options.enforceRequestTimeout]
    * @param {number} [options.maxResponseSize=104857600] The largest response body accepted, in bytes,
    *                                            the 4-byte length prefix excluded. A larger, negative or
@@ -100,11 +122,11 @@ module.exports = class Connection {
    *                                            max.in.flight.requests.per.connection default).
    *                                            Pass null for unbounded (the pre-3.0 behavior).
    * @param {import("../instrumentation/emitter")} [options.instrumentationEmitter=null]
-   * @param {(errorMessage: string) => void} [options.onAuthenticationFailure=null] Called with the
-   *                                            broker's error message when it rejects
-   *                                            SaslAuthenticate (code 58), after the
-   *                                            NETWORK_AUTHENTICATION_FAILURE event is emitted.
-   *                                            Used by ConnectionPool to blackout the broker.
+   * @param {(errorMessage: string) => void} [options.onAuthenticationFailure=null] Called with a
+   *                                            sanitized description (mechanism, broker, stage)
+   *                                            when the broker rejects SaslAuthenticate (code 58),
+   *                                            after the NETWORK_AUTHENTICATION_FAILURE event is
+   *                                            emitted. Used by ConnectionPool to blackout the broker.
    */
   constructor({
     host,
@@ -118,6 +140,13 @@ module.exports = class Connection {
     sasl = null,
     clientId = 'kafkajs',
     connectionTimeout,
+    authenticationTimeout,
+    connectionsMaxIdle = 540000,
+    connectionTimeoutMax,
+    reconnectBackoff,
+    reconnectBackoffMax,
+    setupPolicy,
+    beginSetup,
     enforceRequestTimeout = true,
     maxResponseSize = DEFAULT_MAX_RESPONSE_SIZE,
     maxInFlightRequests = 5,
@@ -137,6 +166,28 @@ module.exports = class Connection {
 
     this.requestTimeout = requestTimeout
     this.connectionTimeout = connectionTimeout
+    this.connectionsMaxIdle = connectionsMaxIdle
+    this.preparing = 0
+    this.idleTimer = null
+    this.idleReadyAttempt = null
+    this.setupPolicy =
+      setupPolicy ||
+      ConnectionSetupPolicy.resolve({
+        connectionTimeout,
+        connectionTimeoutMax,
+        reconnectBackoff,
+        reconnectBackoffMax,
+        authenticationTimeout,
+      })
+    this.connectionTimeout = this.setupPolicy.timeoutBase
+    this.connectionTimeoutMax = connectionTimeoutMax ?? this.setupPolicy.timeoutCeiling
+    this.reconnectBackoff = reconnectBackoff ?? this.setupPolicy.waitBase
+    this.reconnectBackoffMax = reconnectBackoffMax ?? this.setupPolicy.waitCeiling
+    this.authenticationTimeout = this.setupPolicy.authenticationTimeout
+    this.beginSetup =
+      beginSetup || (() => new SetupAttempt({ address: this.broker, policy: this.setupPolicy }))
+    this.setupAttempt = null
+    this.authEpisode = null
     this.reauthenticationThreshold = reauthenticationThreshold
     this.instrumentationEmitter = instrumentationEmitter
     this.onAuthenticationFailure = onAuthenticationFailure
@@ -188,13 +239,14 @@ module.exports = class Connection {
       broker: this.broker,
       logger: logger.namespace('RequestQueue'),
       isConnected: () => this.isConnected(),
-      onRequestTimeout: () =>
-        this.closeGeneration(
-          new KafkaJSConnectionClosedError('Closed connection', {
-            host: this.host,
-            port: this.port,
-          })
-        ),
+      onRequestTimeout: () => {
+        const error = new KafkaJSConnectionClosedError('Closed connection', {
+          host: this.host,
+          port: this.port,
+        })
+        this.setupAttempt?.fail(error)
+        this.closeGeneration(error)
+      },
     })
 
     this.versions = null
@@ -207,6 +259,7 @@ module.exports = class Connection {
       }
 
     this.logDebug = log('debug')
+    this.logWarn = log('warn')
     this.logError = log('error')
 
     const env = getEnv()
@@ -228,21 +281,30 @@ module.exports = class Connection {
      * @private
      * @returns {Promise}
      */
-    this[PRIVATE.AUTHENTICATE] = sharedPromiseTo(async () => {
-      if (this.sasl && !this.isAuthenticated()) {
-        const authenticator = new SASLAuthenticator(this, this.logger, this.versions)
+    this[PRIVATE.AUTHENTICATE] = () => this.authenticate()
 
-        await authenticator.authenticate()
-        this.authenticatedAt = process.hrtime()
-        this.sessionLifetime = Long.fromValue(authenticator.sessionLifetime)
+    this[PRIVATE.CONNECT] = sharedPromiseTo(async (supplied) => {
+      if (!supplied && this.connectionStatus === CONNECTION_STATUS.CONNECTED) return true
+      const attempt = supplied || this.beginSetup()
+      this.setupAttempt = attempt
+      try {
+        if (attempt.waitMs() > 0) await attempt.wait()
+        else attempt.assertCurrent()
+        attempt.arm((error) => {
+          if (this.setupAttempt === attempt) this.failGeneration(error)
+        })
+        await attempt.guard(this[PRIVATE.CONNECT_ATTEMPT](), {
+          phase: 'TCP/TLS',
+        })
+        if (!supplied && !attempt.brokerManaged) {
+          this.finishSetup(attempt)
+        }
+        return true
+      } catch (error) {
+        attempt.fail(error)
+        throw error
       }
     })
-
-    /**
-     * @private
-     * @returns {Promise}
-     */
-    this[PRIVATE.CONNECT] = sharedPromiseTo(() => this[PRIVATE.CONNECT_ATTEMPT]())
   }
 
   setVersions(versions) {
@@ -260,10 +322,14 @@ module.exports = class Connection {
    * time for this connection.
    *
    * @public
-   * @returns {Promise}
+   * @param {{ attempt?: SetupAttempt }} [options] externally managed broker readiness budget
+   * @returns {Promise<boolean>} socket established within its original budget
+   * @throws {KafkaJSConnectionError} on cancellation, expiry or transport failure
    */
-  connect() {
-    return this[PRIVATE.CONNECT]()
+  connect({ attempt } = {}) {
+    const operation = currentDeadline()
+    if (operation) return operation.wait(() => sharedSetup(() => this[PRIVATE.CONNECT](attempt)))
+    return this[PRIVATE.CONNECT](attempt)
   }
 
   /**
@@ -298,13 +364,11 @@ module.exports = class Connection {
 
       this.authenticatedAt = null
 
-      let timeoutId
       const attempt = ++this.connectAttempt
       this[PRIVATE.QUEUED] = Promise.resolve()
       const isCurrentAttempt = () => this.connectAttempt === attempt
 
       const abort = (error) => {
-        clearTimeout(timeoutId)
         this[PRIVATE.ABORT_CONNECT] = null
         reject(error)
       }
@@ -312,7 +376,6 @@ module.exports = class Connection {
 
       const onConnect = () => {
         if (!isCurrentAttempt()) return
-        clearTimeout(timeoutId)
         this[PRIVATE.ABORT_CONNECT] = null
         this.frames.reset()
         this.connectionStatus = CONNECTION_STATUS.CONNECTED
@@ -353,7 +416,9 @@ module.exports = class Connection {
           : new KafkaJSConnectionError('Connection closed while connecting', {
               broker: this.broker,
             })
+        const beforeHandshake = this.ssl && !this.isConnected()
         this.failGeneration(error)
+        if (beforeHandshake) this.warnPlaintextPeer()
       }
 
       const onError = (e) => {
@@ -362,10 +427,12 @@ module.exports = class Connection {
           broker: this.broker,
           code: e.code,
         })
+        const beforeHandshake = this.ssl && !this.isConnected() && e.code === 'ECONNRESET'
         this.failGeneration(error)
         try {
           this.logError(error.message, { stack: e.stack })
         } catch {}
+        if (beforeHandshake) this.warnPlaintextPeer()
       }
 
       const onTimeout = () => {
@@ -384,15 +451,18 @@ module.exports = class Connection {
       } catch (error) {
         const native = isNativeError(error)
         this.failGeneration(
-          native ? error : new KafkaJSNonRetriableError('Failed to connect', { cause: error }),
+          native
+            ? error
+            : new KafkaJSNonRetriableError('Failed to connect', {
+                cause: error,
+              }),
           native ? null : 'Failed to connect: '
         )
         return
       }
 
       try {
-        timeoutId = setTimeout(onTimeout, this.connectionTimeout)
-        this.socket = createSocket({
+        const socket = createSocket({
           socketFactory: this.socketFactory,
           host: this.host,
           port: this.port,
@@ -403,6 +473,11 @@ module.exports = class Connection {
           onError,
           onTimeout,
         })
+        if (!isCurrentAttempt()) {
+          socket.destroy()
+        } else {
+          this.socket = socket
+        }
       } catch (e) {
         this.failGeneration(
           new KafkaJSConnectionError('Failed to connect', {
@@ -438,6 +513,9 @@ module.exports = class Connection {
    * @returns {Promise<true>}
    */
   async disconnect({ drainTimeout } = {}) {
+    this.cancelSetup(
+      new KafkaJSConnectionError('Connection closed while connecting', { broker: this.broker })
+    )
     this.authenticatedAt = null
     this.connectionStatus = CONNECTION_STATUS.DISCONNECTING
     const abortConnect = this[PRIVATE.ABORT_CONNECT]
@@ -470,7 +548,10 @@ module.exports = class Connection {
     }
 
     this.closeGeneration(
-      new KafkaJSConnectionClosedError('Closed connection', { host: this.host, port: this.port }),
+      new KafkaJSConnectionClosedError('Closed connection', {
+        host: this.host,
+        port: this.port,
+      }),
       socket || this.socket
     )
     if (drainFailed) {
@@ -504,6 +585,7 @@ module.exports = class Connection {
    * @returns {void}
    */
   failGeneration(error, messagePrefix = null) {
+    this.setupAttempt?.fail(error)
     if (
       !this.socket &&
       !this[PRIVATE.ABORT_CONNECT] &&
@@ -533,6 +615,11 @@ module.exports = class Connection {
    * @returns {void}
    */
   closeGeneration(error, socket = this.socket) {
+    clearTimeout(this.idleTimer)
+    this.idleTimer = null
+    this.idleReadyAttempt = null
+    this.preparing = 0
+    this.cancelSetup(error)
     const abortConnect = this[PRIVATE.ABORT_CONNECT]
     this[PRIVATE.ABORT_CONNECT] = null
     this.connectAttempt += 1
@@ -560,6 +647,71 @@ module.exports = class Connection {
     this.frames.reset()
     this.requestQueue.settleAll(error)
     this.requestQueue.destroy()
+  }
+
+  /**
+   * Starts idle accounting once this socket has reached its setup-ready boundary.
+   * Repeated ready notifications do not extend an existing idle period. The broker's
+   * primary socket is ready after versions and authentication; the dedicated Fetch
+   * socket uses the setup owner's transport-ready boundary.
+   * @private
+   * @returns {void}
+   */
+  markReady() {
+    if (!this.isConnected() || this.idleReadyAttempt === this.connectAttempt) return
+    this.idleReadyAttempt = this.connectAttempt
+    this.requestQueue.lastActivityAt = Date.now()
+    if (this.connectionsMaxIdle > 0) this.armIdle(this.connectionsMaxIdle)
+  }
+
+  /**
+   * Arms the one lazy idle deadline of the current socket. A cancelled callback is
+   * inert even when it is delivered after a replacement socket or timer exists.
+   * @private
+   * @param {number} afterMs milliseconds until the next eligibility check
+   * @returns {void}
+   */
+  armIdle(afterMs) {
+    clearTimeout(this.idleTimer)
+    const attempt = this.connectAttempt
+    const socket = this.socket
+    const timer = setTimeout(() => {
+      if (attempt !== this.connectAttempt || socket !== this.socket || this.idleTimer !== timer)
+        return
+      this.idleTimer = null
+      this.checkIdle()
+    }, afterMs)
+    this.idleTimer = timer
+    timer.unref()
+  }
+
+  /**
+   * Reaps only a ready, empty socket with no preparation in progress. Busy sockets
+   * wait a full period; recent activity waits only the remaining part. Deliberate
+   * reaping uses normal teardown and contributes no setup failure or new event.
+   * @private
+   * @returns {void}
+   */
+  checkIdle() {
+    if (!this.isConnected() || this.connectionsMaxIdle === 0) return
+    if (this.preparing > 0 || !this.requestQueue.isIdle()) {
+      this.armIdle(this.connectionsMaxIdle)
+      return
+    }
+    const idleFor = Date.now() - this.requestQueue.lastActivityAt
+    if (idleFor < this.connectionsMaxIdle) {
+      this.armIdle(this.connectionsMaxIdle - idleFor)
+      return
+    }
+    const closing = this.disconnect()
+    closing.catch((error) => {
+      try {
+        this.logError('Failed to close idle connection', { error })
+      } catch {}
+    })
+    try {
+      this.logDebug('Closing idle connection', { idleFor })
+    } catch {}
   }
 
   /**
@@ -615,9 +767,101 @@ module.exports = class Connection {
     return reauthenticateAt.greaterThanOrEqual(this.sessionLifetime)
   }
 
-  /** @public */
-  async authenticate() {
-    await this[PRIVATE.AUTHENTICATE]()
+  /** Completes readiness once; idle tracking extends this single boundary.
+   * @param {SetupAttempt} attempt original ready attempt
+   * @returns {void}
+   * @throws {KafkaJSConnectionError} if the original budget ended
+   */
+  finishSetup(attempt) {
+    attempt.ready()
+    if (this.setupAttempt === attempt) this.setupAttempt = null
+    this.markReady()
+  }
+
+  /**
+   * Cancels setup and detaches any shared authentication episode before teardown awaits.
+   * @param {Error} [error] close reason
+   * @returns {void}
+   */
+  cancelSetup(error) {
+    this.setupAttempt?.cancel(error)
+    this.setupAttempt = null
+    this.authEpisode?.budget.cancel(error)
+    this.authEpisode = null
+  }
+
+  /**
+   * Shares one bounded SASL episode on this socket; never adopts a replacement token.
+   * Holds idle preparation once per episode, including token-provider work. An old
+   * episode cannot decrement preparation on the replacement connection.
+   * @param {{ attempt?: SetupAttempt }} [options] Broker setup budget when applicable
+   * @returns {Promise<void>}
+   * @throws {KafkaJSConnectionError} when the whole SASL phase expires
+   */
+  authenticate({ attempt = this.setupAttempt } = {}) {
+    const operation = currentDeadline()
+    if (operation) return operation.wait(() => sharedSetup(() => this.authenticate({ attempt })))
+    if (!this.sasl || this.isAuthenticated()) return Promise.resolve()
+    if (this.authEpisode) return this.authEpisode.promise
+    const epoch = this.connectAttempt
+    const socket = this.socket
+    const budget =
+      attempt ||
+      new SetupAttempt({
+        address: this.broker,
+        policy: this.setupPolicy,
+        timeoutMs: this.authenticationTimeout,
+      })
+    const guard = () =>
+      budget.refusal() ||
+      (this.connectAttempt !== epoch || this.socket !== socket
+        ? new KafkaJSConnectionError('Authentication connection was replaced', {
+            broker: this.broker,
+          })
+        : null)
+    const episode = { budget, promise: null }
+    this.authEpisode = episode
+    this.preparing += 1
+    if (!attempt)
+      budget.arm((error) => {
+        if (this.connectAttempt === epoch && this.socket === socket) this.failGeneration(error)
+      })
+    episode.promise = (async () => {
+      try {
+        const authenticator = new SASLAuthenticator(this, this.logger, this.versions, guard)
+        await budget.guard(authenticator.authenticate(), {
+          phase: 'SASL',
+          cap: this.authenticationTimeout,
+        })
+        const refusal = guard()
+        if (refusal) throw refusal
+        this.authenticatedAt = process.hrtime()
+        this.sessionLifetime = Long.fromValue(authenticator.sessionLifetime)
+        if (!attempt) budget.ready()
+      } catch (error) {
+        budget.fail(error)
+        throw error
+      } finally {
+        if (epoch === this.connectAttempt) this.preparing -= 1
+        if (this.authEpisode === episode) this.authEpisode = null
+      }
+    })()
+    return episode.promise
+  }
+
+  /**
+   * Logs one warning for a TLS socket the peer closed before the handshake finished, which is
+   * what a plaintext listener does with a TLS client hello. The connection error itself keeps its
+   * class and message.
+   * @private
+   * @returns {void}
+   */
+  warnPlaintextPeer() {
+    try {
+      this.logWarn(
+        'The connection closed before the TLS handshake finished: is this a TLS client on a plaintext port?'
+      )
+    } catch {}
   }
 
   /**
@@ -626,7 +870,8 @@ module.exports = class Connection {
    * (SASL_AUTHENTICATION_FAILED, code 58): emits NETWORK_AUTHENTICATION_FAILURE and lets
    * the owning ConnectionPool blackout this broker before the next connection attempt.
    * @param {string} mechanism
-   * @param {string} errorMessage
+   * @param {string} errorMessage a sanitized description built from stable fields; never the
+   *   broker's own text
    */
   reportAuthenticationFailure(mechanism, errorMessage) {
     if (this.instrumentationEmitter) {
@@ -672,28 +917,45 @@ module.exports = class Connection {
    *                         encoded and again at the instant of transmission; an error it returns
    *                         rejects this one request, which is then written nowhere, takes no
    *                         in-flight slot and leaves the connection open.
+   * @param {(() => Error|null)|null} [protocol.responseGuard=null] original setup/authentication
+   *                         guard, checked after decode and parse before publishing side effects
    * @returns {Promise<data>} where data is the return of "response#parse"
    */
-  async send({ request, response, requestTimeout = null, logResponseError = true, guard = null }) {
+  async send({
+    request,
+    response,
+    requestTimeout = null,
+    logResponseError = true,
+    guard = null,
+    responseGuard = null,
+  }) {
+    const sensitiveResponse = SENSITIVE_API_KEYS.has(request.apiKey)
     const attempt = this.connectAttempt
-    const expectResponse = !request.expectResponse || request.expectResponse()
-    const prepared = this[PRIVATE.PREPARE]({ request, expectResponse, guard })
-    const enqueue = (encoded) => this[PRIVATE.ENQUEUE](encoded, requestTimeout, attempt, guard)
+    this.preparing += 1
+    let answered
+    let expectResponse
+    try {
+      expectResponse = !request.expectResponse || request.expectResponse()
+      const prepared = this[PRIVATE.PREPARE]({ request, expectResponse, guard })
+      const enqueue = (encoded) => this[PRIVATE.ENQUEUE](encoded, requestTimeout, attempt, guard)
 
-    let queued
-    if (isAuthenticatedRequest(request)) {
-      // It may reject before the chain reaches it; marked handled so Node does not report it.
-      prepared.catch(() => {})
-      queued = this[PRIVATE.QUEUED].then(() => prepared).then(enqueue)
-      this[PRIVATE.QUEUED] = queued.then(
-        () => {},
-        () => {}
-      )
-    } else {
-      queued = prepared.then(enqueue)
+      let queued
+      if (isAuthenticatedRequest(request)) {
+        // It may reject before the chain reaches it; marked handled so Node does not report it.
+        prepared.catch(() => {})
+        queued = this[PRIVATE.QUEUED].then(() => prepared).then(enqueue)
+        this[PRIVATE.QUEUED] = queued.then(
+          () => {},
+          () => {}
+        )
+      } else {
+        queued = prepared.then(enqueue)
+      }
+
+      ;({ answered } = await queued)
+    } finally {
+      if (attempt === this.connectAttempt) this.preparing -= 1
     }
-
-    const { answered } = await queued
     const { correlationId, size, entry, payload } = await answered
 
     if (!expectResponse) {
@@ -702,6 +964,8 @@ module.exports = class Connection {
 
     try {
       const payloadDecoded = await response.decode(responseBody(entry, payload))
+      const decodedRefusal = responseGuard && responseGuard()
+      if (decodedRefusal) throw decodedRefusal
 
       /**
        * @see KIP-219
@@ -710,18 +974,21 @@ module.exports = class Connection {
       this.requestQueue.maybeThrottle(payloadDecoded.clientSideThrottleTime)
 
       const data = await response.parse(payloadDecoded)
+      const parsedRefusal = responseGuard && responseGuard()
+      if (parsedRefusal) throw parsedRefusal
       const isFetchApi = entry.apiName === 'Fetch'
       this.logDebug(`Response ${requestInfo(entry)}`, {
         correlationId,
         size,
-        data: isFetchApi && !this.shouldLogFetchBuffer ? '[filtered]' : data,
+        data: sensitiveResponse || (isFetchApi && !this.shouldLogFetchBuffer) ? '[filtered]' : data,
       })
 
       return data
     } catch (e) {
+      attachResponseSource(e, request.apiKey)
       if (logResponseError) {
         this.logError(`Response ${requestInfo(entry)}`, {
-          error: e.message,
+          error: sensitiveResponse ? 'Sensitive response failed' : e.message,
           correlationId,
           size,
         })
@@ -729,10 +996,13 @@ module.exports = class Connection {
 
       const isBuffer = Buffer.isBuffer(payload)
       this.logDebug(`Response ${requestInfo(entry)}`, {
-        error: e.message,
+        error: sensitiveResponse ? 'Sensitive response failed' : e.message,
         correlationId,
-        payload:
-          isBuffer && !this.shouldLogBuffers ? { type: 'Buffer', data: '[filtered]' } : payload,
+        payload: sensitiveResponse
+          ? '[filtered]'
+          : isBuffer && !this.shouldLogBuffers
+            ? { type: 'Buffer', data: '[filtered]' }
+            : payload,
       })
 
       throw e
@@ -748,15 +1018,21 @@ module.exports = class Connection {
    * @throws {Error} the error the guard returns, once the request is authenticated and encoded
    */
   async [PRIVATE.PREPARE]({ request, expectResponse, guard }) {
+    currentDeadline()?.check()
     if (!this.isAuthenticated() && isAuthenticatedRequest(request)) {
       await this[PRIVATE.AUTHENTICATE]()
     }
 
+    currentDeadline()?.check()
     this.failIfNotConnected()
 
     const { clientId } = this
     const correlationId = this.nextCorrelationId()
-    const requestPayload = await createRequest({ request, correlationId, clientId })
+    const requestPayload = await createRequest({
+      request,
+      correlationId,
+      clientId,
+    })
     this.logDebug(`Request ${requestInfo(request)}`, {
       correlationId,
       expectResponse,
@@ -794,7 +1070,14 @@ module.exports = class Connection {
     const answered = new Promise((resolve, reject) => {
       try {
         this.failIfNotConnected(attempt)
-        const entry = { apiKey, apiName, apiVersion, correlationId, resolve, reject }
+        const entry = {
+          apiKey,
+          apiName,
+          apiVersion,
+          correlationId,
+          resolve,
+          reject,
+        }
 
         this.requestQueue.push({
           entry,

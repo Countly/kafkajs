@@ -1,3 +1,4 @@
+const setupPool = require('../../../testHelpers/setupPool')
 const createSendMessages = require('../sendMessages')
 const createEosManager = require('../eosManager')
 const createProducer = require('../index')
@@ -267,7 +268,7 @@ const createDroppingBroker = (log) => {
     destroy: async () => connection.disconnect(),
     retire: () => {},
   }
-  const broker = new Broker({ connectionPool: pool, logger: newLogger(), versions })
+  const broker = new Broker({ connectionPool: setupPool(pool), logger: newLogger(), versions })
   broker.lookupRequest = lookup(versions)
   broker.versionsGeneration = pool.generation
   let processed = 0

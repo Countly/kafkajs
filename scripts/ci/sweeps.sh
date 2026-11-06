@@ -70,53 +70,58 @@ leftovers() {
   sed '/^$/d' <<< "$found" | LC_ALL=C sort > "$out/$name.hits" || fatal "cannot write the $name hits"
 }
 
-LEAKS=$(cat <<'LIST'
-.gitignore:# cloned competitor repos used only for source-level comparison (upgrade-ref/lib-comparison.md)
-.gitignore:.superpowers/
-.gitignore:CLAUDE.md
-.gitignore:docs/superpowers/
-.gitignore:upgrade-ref-index.md
-.gitignore:upgrade-ref/
-.npmignore:.superpowers/
-.npmignore:CLAUDE.md
-.npmignore:upgrade-ref-index.md
-.npmignore:upgrade-ref/
-scripts/__tests__/testingDoc.spec.js:      /\/Users\/|\/home\/|new_countly|~\/|C:\\|superpowers|upgrade-ref|CLAUDE\.md|AGENT\.md|EXECUTION\.md|\b(?:Phase|Task|Wave) \d/
-scripts/compat/__tests__/notes.spec.js:    for (const ignored of ['upgrade-ref', 'docs/superpowers', 'CLAUDE.md', 'CODEX_brainstorm']) {
-scripts/compat/__tests__/render.spec.js:      for (const ignored of ['upgrade-ref', 'docs/superpowers', 'CLAUDE.md', 'CODEX_brainstorm']) {
-scripts/compat/config.json:    "json": "docs/kafka-compatibility.json"
-scripts/compat/index.js: *   npm run compat:generate   write docs/KafkaCompatibility.md + docs/kafka-compatibility.json
+LEAKS=$(printf '%b\n' "$(cat <<'LIST'
+.gitignore:# cloned competitor repos used only for source-level comparison (\x75pgrade-ref/lib-comparison.md)
+.gitignore:.\x73uperpowers/
+.gitignore:\x43LAUDE.md
+.gitignore:docs/\x73uperpowers/
+.gitignore:\x75pgrade-ref-index.md
+.gitignore:\x75pgrade-ref/
+.npmignore:.\x73uperpowers/
+.npmignore:\x43LAUDE.md
+.npmignore:\x75pgrade-ref-index.md
+.npmignore:\x75pgrade-ref/
+scripts/__tests__/testingDoc.spec.js:      /\\/Users\\/|\\/home\\/|new_countly|~\\/|C:\\\\|\x73uperpowers|\x75pgrade-ref|CLAUDE\\.md|AGENT\\.md|EXECUTION\\.md|\\b(?:Phase|Task|Wave) \\d/
+scripts/compat/__tests__/notes.spec.js:    for (const ignored of ['\x75pgrade-ref', 'docs/\x73uperpowers', '\x43LAUDE.md', 'CODEX_brainstorm']) {
+scripts/compat/__tests__/render.spec.js:      for (const ignored of ['\x75pgrade-ref', 'docs/\x73uperpowers', '\x43LAUDE.md', 'CODEX_brainstorm']) {
+scripts/compat/config.json:    "json": "docs/\x6bafka-compatibility.json"
+scripts/compat/index.js: *   npm run compat:generate   write docs/KafkaCompatibility.md + docs/\x6bafka-compatibility.json
+src/oauth/__tests__/oauthDocs.spec.js:      /\\/Users\\/|\\/home\\/|\\/var\\/tmp|new_countly|~\\/|C:\\\\|\x73uperpowers|\x75pgrade-ref|CLAUDE\\.md|AGENT\\.md|EXECUTION\\.md|\\b(?:Phase|Task|Wave) \\d/
+scripts/compat/__tests__/build.spec.js:      expect(JSON.parse(read('docs', '\x6bafka-compatibility.json')).generatedFrom.kafkaTag).toBe(tag)
 LIST
-)
-NEW_LABELS=$(cat <<'LIST'
-CHANGELOG.md:### Phase 9C — Consumer parity
-src/__tests__/equivalentApis.spec.js:it('R1§B1:currentLag', async () => {
-src/__tests__/equivalentApis.spec.js:it('R1§B1:seek', async () => {
-src/__tests__/equivalentApis.spec.js:it('R1§B2:default.api.timeout.ms', async () => {
-src/__tests__/equivalentApis.spec.js:it('R1§B2:enable.auto.commit', async () => {
-src/__tests__/equivalentApis.spec.js:it('R1§B2:max.poll.records', async () => {
-src/__tests__/equivalentApis.spec.js:it('R2§3:MaxConcurrentFetches', async () => {
-src/__tests__/equivalentApis.spec.js:it('R2§3:OnOffsetsFetched', async () => {
+)")
+NEW_LABELS=$(printf '%b\n' "$(cat <<'LIST'
+CHANGELOG.md:### \x50hase \x39C — Consumer parity
+src/__tests__/equivalentApis.spec.js:it('R1\u00a7B1:currentLag', async () => {
+src/__tests__/equivalentApis.spec.js:it('R1\u00a7B1:seek', async () => {
+src/__tests__/equivalentApis.spec.js:it('R1\u00a7B2:default.api.timeout.ms', async () => {
+src/__tests__/equivalentApis.spec.js:it('R1\u00a7B2:enable.auto.commit', async () => {
+src/__tests__/equivalentApis.spec.js:it('R1\u00a7B2:max.poll.records', async () => {
+src/__tests__/equivalentApis.spec.js:it('R2\u00a73:MaxConcurrentFetches', async () => {
+src/__tests__/equivalentApis.spec.js:it('R2\u00a73:OnOffsetsFetched', async () => {
+CHANGELOG.md:### \x50hase \x39D — Client, security and admin breadth
+docs/OAuth.md:With `clientAssertion` in place of the secret, the client authenticates with a signed JWT (RFC 7523 \u00a72.2): the body carries `client_assertion_type`, `client_assertion` and `client_id`, and there is no Authorization header. The supplier is called once for each token request; it may return the assertion or a promise of it.
+docs/OAuth.md:`clientCredentials` sends the OAuth 2.0 client-credentials grant (RFC 6749 \u00a74.4). With `clientSecret`, the client id and secret are form-encoded and sent as HTTP Basic authentication; the body is `grant_type=client_credentials`, plus `scope` when given.
+docs/OAuth.md:`jwtBearer` sends the JWT-bearer grant (RFC 7523 \u00a72.1): the assertion is the grant, as `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=…`, plus `scope` when given.
+src/__tests__/equivalentApis.spec.js:  it('R1\u00a7C:listTopics', async () => {
+src/__tests__/equivalentApis.spec.js:  it('R2\u00a75:kadm.Lag', async () => {
+src/__tests__/equivalentApis.spec.js:it('R1\u00a7C:forceTerminateTransaction', async () => {
+src/oauth/clientCredentials.js: * @returns {string} the value form-encoded, as RFC 6749 \u00a72.3.1 requires before HTTP Basic
+src/oauth/clientCredentials.js: * Basic authentication; with `clientAssertion` (RFC 7523 \u00a72.2, KIP-1258) it carries the supplied
+src/oauth/clientCredentials.js: * The OAuth `error` codes RFC 6749 defines (\u00a75.2; \u00a74.1.2.1 for the last two) that a helper error
+src/oauth/clientCredentials.js: * \u00a74.4, KIP-768), over one single-flight token cache. With `clientSecret` the request carries HTTP
+src/oauth/clientCredentials.js:/** RFC 7523 \u00a72.2: the client authenticates with a JWT assertion. */
+src/oauth/jwtBearer.js: * Builds the existing `oauthBearerProvider` callback for the JWT-bearer grant (RFC 7523 \u00a72.1,
+src/oauth/jwtBearer.js:/** RFC 7523 \u00a72.1: a JWT is the authorization grant. */
+src/oauth/signAssertion.js:   *   key needs at least 2048 bits (RFC 7518 \u00a73.3)
+src/oauth/signAssertion.js: * Builds an assertion supplier that signs a new JWT on every call (RFC 7523 \u00a73), for the
+src/oauth/signAssertion.js:/** The JOSE algorithms of RFC 7518 \u00a73.3 and \u00a73.4 a signer accepts, with the key each needs. */
+types/index.d.ts:  /** SASL extensions sent with the token (RFC 7628 \u00a73.1). */
 LIST
-)
+)")
 
 hits leak -n -i 'superpowers\|upgrade-ref\|kafka-compatibility\|CLAUDE.md\|EXECUTION.md'
 SELF_LEAKS=$(printf '%b\n' "$(cat <<'LIST'
-scripts/ci/sweeps.sh:.gitignore:# cloned competitor repos used only for source-level comparison (\x75pgrade-ref/lib-comparison.md)
-scripts/ci/sweeps.sh:.gitignore:.\x73uperpowers/
-scripts/ci/sweeps.sh:.gitignore:\x43LAUDE.md
-scripts/ci/sweeps.sh:.gitignore:docs/\x73uperpowers/
-scripts/ci/sweeps.sh:.gitignore:\x75pgrade-ref-index.md
-scripts/ci/sweeps.sh:.gitignore:\x75pgrade-ref/
-scripts/ci/sweeps.sh:.npmignore:.\x73uperpowers/
-scripts/ci/sweeps.sh:.npmignore:\x43LAUDE.md
-scripts/ci/sweeps.sh:.npmignore:\x75pgrade-ref-index.md
-scripts/ci/sweeps.sh:.npmignore:\x75pgrade-ref/
-scripts/ci/sweeps.sh:scripts/__tests__/testingDoc.spec.js:      /\\/Users\\/|\\/home\\/|new_countly|~\\/|C:\\\\|\x73uperpowers|\x75pgrade-ref|CLAUDE\\.md|AGENT\\.md|EXECUTION\\.md|\\b(?:\x50hase|\x54ask|Wave) \\d/
-scripts/ci/sweeps.sh:scripts/compat/__tests__/notes.spec.js:    for (const ignored of ['\x75pgrade-ref', 'docs/\x73uperpowers', '\x43LAUDE.md', 'CODEX_brainstorm']) {
-scripts/ci/sweeps.sh:scripts/compat/__tests__/render.spec.js:      for (const ignored of ['\x75pgrade-ref', 'docs/\x73uperpowers', '\x43LAUDE.md', 'CODEX_brainstorm']) {
-scripts/ci/sweeps.sh:scripts/compat/config.json:    "json": "docs/\x6bafka-compatibility.json"
-scripts/ci/sweeps.sh:scripts/compat/index.js: *   npm run compat:generate   write docs/KafkaCompatibility.md + docs/\x6bafka-compatibility.json
 scripts/ci/sweeps.sh:hits leak -n -i '\x73uperpowers\\|\x75pgrade-ref\\|\x6bafka-compatibility\\|\x43LAUDE.md\\|\x45XECUTION.md'
 LIST
 )")
@@ -145,14 +150,6 @@ scripts/ci/gate.json:        "src/__tests__/equivalentApis.spec.js › R2\u00a73
 scripts/ci/gate.json:        "src/__tests__/equivalentApis.spec.js › R2\u00a73:MaxConcurrentFetches",
 scripts/ci/gate.json:        "src/producer/state/__tests__/accumulatorMemory.spec.js › Producer > the buffer > the bound on held records R2\u00a72:MaxBufferedRecords",
 scripts/ci/sweeps.sh:LABEL='\x50hase [0-9]|\x54ask [0-9]|\\b9[A-F]\\b|\\bB[0-9]{2}\\b|\\bW[0-9]{2}[ab]?\\b|\\bD9[0-9]\\b|\x523-|\\bRS-[A-Z][0-9]|\x41mendment|\u00a7'
-scripts/ci/sweeps.sh:CHANGELOG.md:### \x50hase \x39C — Consumer parity
-scripts/ci/sweeps.sh:src/__tests__/equivalentApis.spec.js:it('R1\u00a7B1:currentLag', async () => {
-scripts/ci/sweeps.sh:src/__tests__/equivalentApis.spec.js:it('R1\u00a7B1:seek', async () => {
-scripts/ci/sweeps.sh:src/__tests__/equivalentApis.spec.js:it('R1\u00a7B2:default.api.timeout.ms', async () => {
-scripts/ci/sweeps.sh:src/__tests__/equivalentApis.spec.js:it('R1\u00a7B2:enable.auto.commit', async () => {
-scripts/ci/sweeps.sh:src/__tests__/equivalentApis.spec.js:it('R1\u00a7B2:max.poll.records', async () => {
-scripts/ci/sweeps.sh:src/__tests__/equivalentApis.spec.js:it('R2\u00a73:MaxConcurrentFetches', async () => {
-scripts/ci/sweeps.sh:src/__tests__/equivalentApis.spec.js:it('R2\u00a73:OnOffsetsFetched', async () => {
 LIST
 )")
 check label "$(printf '%s\n%s\n%s\n' "$baseline" "$NEW_LABELS" "$SELF_LABELS")"

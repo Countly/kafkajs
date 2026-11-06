@@ -43,6 +43,23 @@ const createBrokerRun = (GUARD_MS) => {
 }
 
 /**
+ * Creates the action that brings a broker back whether a scenario paused or stopped it: `unpause`,
+ * then `start`. `unpause` fails on a broker that is not paused, which is expected and ignored; the
+ * `start` that follows must succeed, and does nothing to a running container, so a broker that
+ * stays paused still fails the action.
+ * @param {ReturnType<typeof createBrokerRun>} run a runner with `unpause` and `start` budgets
+ * @returns {(service: string, options?: {signal?: AbortSignal}) => Promise<void>} the action
+ * @throws {Error} as the returned function: a missing budget or an incomplete ownership
+ *   environment, or the failure of `start`
+ */
+const createBrokerResume =
+  (run) =>
+  async (service, { signal } = {}) => {
+    await run('unpause', service, { signal }).catch(() => {})
+    await run('start', service, { signal })
+  }
+
+/**
  * Selects the state fixture controller without changing guarded operands.
  * @param {string} action gate action
  * @param {string} groupId exact group
@@ -59,4 +76,4 @@ const gateCommand = (action, groupId, nonce) => {
   return [guard, 'gate', manifest, action, groupId, nonce]
 }
 
-module.exports = { createBrokerRun, gateCommand }
+module.exports = { createBrokerResume, createBrokerRun, gateCommand }

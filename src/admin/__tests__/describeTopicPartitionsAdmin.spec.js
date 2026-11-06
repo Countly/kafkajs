@@ -320,6 +320,7 @@ describe('Admin > fetchTopicMetadata > DescribeTopicPartitions', () => {
       expect(topics).toEqual([
         {
           name: 'a',
+          authorizedOperations: null,
           topicId: '00000000-0000-0000-0000-000000000001',
           isInternal: true,
           partitions: [
@@ -439,11 +440,18 @@ describe('Admin > fetchTopicMetadata > DescribeTopicPartitions', () => {
       topics: [
         {
           name: 'm',
+          authorizedOperations: null,
           topicId: '01020304-0506-0708-090a-0b0c0d0e0f10',
           isInternal: false,
           partitions: [{ partitionId: 0, leader: 1 }],
         },
-        { name: 'zero', topicId: null, isInternal: true, partitions: [] },
+        {
+          name: 'zero',
+          authorizedOperations: null,
+          topicId: null,
+          isInternal: true,
+          partitions: [],
+        },
       ],
     }
 
@@ -454,7 +462,10 @@ describe('Admin > fetchTopicMetadata > DescribeTopicPartitions', () => {
         metadataResult
       )
 
-      expect(cluster.metadata).toHaveBeenCalledWith({ topics: ['m', 'zero'] })
+      expect(cluster.metadata).toHaveBeenCalledWith({
+        topics: ['m', 'zero'],
+        includeTopicAuthorizedOperations: false,
+      })
       expect(broker.describeTopicPartitions).not.toHaveBeenCalled()
     })
 
@@ -463,7 +474,10 @@ describe('Admin > fetchTopicMetadata > DescribeTopicPartitions', () => {
 
       await expect(admin.fetchTopicMetadata()).resolves.toEqual(metadataResult)
 
-      expect(cluster.metadata).toHaveBeenCalledWith({ topics: [] })
+      expect(cluster.metadata).toHaveBeenCalledWith({
+        topics: [],
+        includeTopicAuthorizedOperations: false,
+      })
     })
 
     test.each([[undefined], [null], [[]]])(
@@ -607,6 +621,7 @@ describe('Admin > fetchTopicMetadata > DescribeTopicPartitions', () => {
       expect(topics).toEqual([
         {
           name: 'test-topic',
+          authorizedOperations: null,
           topicId: '01020304-0506-0708-090a-0b0c0d0e0f10',
           isInternal: false,
           partitions: [

@@ -5,10 +5,12 @@ const scram256AuthenticatorProvider = require('./scram256')
 const scram512AuthenticatorProvider = require('./scram512')
 const awsIAMAuthenticatorProvider = require('./awsIam')
 const oauthBearerAuthenticatorProvider = require('./oauthBearer')
+const gssapiAuthenticatorProvider = require('./gssapi')
 const { KafkaJSSASLAuthenticationError } = require('../../errors')
 
 const BUILT_IN_AUTHENTICATION_PROVIDERS = {
   AWS: awsIAMAuthenticatorProvider,
+  GSSAPI: gssapiAuthenticatorProvider,
   PLAIN: plainAuthenticatorProvider,
   OAUTHBEARER: oauthBearerAuthenticatorProvider,
   'SCRAM-SHA-256': scram256AuthenticatorProvider,
@@ -20,8 +22,16 @@ const UNLIMITED_SESSION_LIFETIME = '0'
 // src/protocol/error.js: SASL_AUTHENTICATION_FAILED
 const SASL_AUTHENTICATION_FAILED_CODE = 58
 
+/** Drives one SASL invocation; the captured guard prevents old continuations from writing. */
 module.exports = class SASLAuthenticator {
-  constructor(connection, logger, versions) {
+  /**
+   * @param {import('../../network/connection')} connection original physical connection
+   * @param {import('../../../types').Logger} logger diagnostics sink
+   * @param {object} versions negotiated API ranges
+   * @param {() => Error|null} [guard] original invocation refusal, including its deadline
+   */
+  constructor(connection, logger, versions, guard = () => null) {
+    this.guard = guard
     this.connection = connection
     this.logger = logger
     this.sessionLifetime = UNLIMITED_SESSION_LIFETIME
@@ -33,9 +43,26 @@ module.exports = class SASLAuthenticator {
     this.protocolAuthentication = lookupRequest(apiKeys.SaslAuthenticate, requests.SaslAuthenticate)
   }
 
+  /** Throws before any stale continuation can write or publish. @returns {void} @throws {Error} refusal */
+  check() {
+    const error = this.guard()
+    if (error) throw error
+  }
+
+  /**
+   * Negotiates and runs one mechanism under its original connection guard.
+   * @returns {Promise<void>} mechanism completed before publication by Connection
+   * @throws {Error} original protocol/provider error or invocation refusal
+   */
   async authenticate() {
     const mechanism = this.connection.sasl.mechanism.toUpperCase()
-    const handshake = await this.connection.send(this.saslHandshake({ mechanism }))
+    this.check()
+    const handshake = await this.connection.send({
+      ...this.saslHandshake({ mechanism }),
+      guard: this.guard,
+      responseGuard: this.guard,
+    })
+    this.check()
     if (!handshake.enabledMechanisms.includes(mechanism)) {
       throw new KafkaJSSASLAuthenticationError(
         `SASL ${mechanism} mechanism is not supported by the server`
@@ -43,26 +70,36 @@ module.exports = class SASLAuthenticator {
     }
 
     const saslAuthenticate = async ({ request, response }) => {
+      this.check()
       const requestAuthBytes = await request.encode()
+      this.check()
 
       let authResponse
       try {
-        authResponse = await this.connection.send(
-          this.protocolAuthentication({ authBytes: requestAuthBytes, mechanism })
-        )
+        authResponse = await this.connection.send({
+          ...this.protocolAuthentication({
+            authBytes: requestAuthBytes,
+            mechanism,
+          }),
+          guard: this.guard,
+          responseGuard: this.guard,
+        })
       } catch (e) {
-        // Only the raw protocol error carries the broker's own error_message and code;
-        // built-in mechanisms (plain/scram/oauthBearer/awsIam) re-wrap it into
-        // KafkaJSSASLAuthenticationError with a plain string, losing both. Report here,
-        // before that happens, then re-throw unchanged so the thrown class is unaffected.
+        // Only the raw protocol error still carries the code; mechanisms re-wrap it. The
+        // published text is built from stable fields alone, never from the error's message.
+        this.check()
         if (e.code === SASL_AUTHENTICATION_FAILED_CODE) {
-          this.connection.reportAuthenticationFailure(mechanism, e.message)
+          this.connection.reportAuthenticationFailure(
+            mechanism,
+            `SASL ${mechanism} authentication failed: broker=${this.connection.host}:${this.connection.port} stage=exchange`
+          )
         }
         throw e
       }
 
       // `0` is a string because `sessionLifetimeMs` is an int64 encoded as string.
       // This is not present in SaslAuthenticateV0, so we default to `"0"`
+      this.check()
       this.sessionLifetime = authResponse.sessionLifetimeMs || UNLIMITED_SESSION_LIFETIME
 
       if (!response) {
@@ -71,7 +108,10 @@ module.exports = class SASLAuthenticator {
 
       const { authBytes: responseAuthBytes } = authResponse
       const payloadDecoded = await response.decode(responseAuthBytes)
-      return response.parse(payloadDecoded)
+      this.check()
+      const parsed = await response.parse(payloadDecoded)
+      this.check()
+      return parsed
     }
 
     if (
@@ -82,13 +122,15 @@ module.exports = class SASLAuthenticator {
         this.connection.sasl
       )
     }
-    await this.connection.sasl
-      .authenticationProvider({
-        host: this.connection.host,
-        port: this.connection.port,
-        logger: this.logger.namespace(`SaslAuthenticator-${mechanism}`),
-        saslAuthenticate,
-      })
-      .authenticate()
+    this.check()
+    const provider = this.connection.sasl.authenticationProvider({
+      host: this.connection.host,
+      port: this.connection.port,
+      logger: this.logger.namespace(`SaslAuthenticator-${mechanism}`),
+      saslAuthenticate,
+    })
+    this.check()
+    await provider.authenticate()
+    this.check()
   }
 }

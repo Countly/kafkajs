@@ -1,6 +1,8 @@
 /**
  * The fields of the wire vectors that carry bytes only (`{ type: 'Buffer', data }`), written out
  * as literals from the Java generator that produced them, never obtained by decoding the bytes.
+ * The metadataV7 construction literals are schema-derived until their separately required
+ * Java serialization/provenance comparison succeeds; its source entry identifies that gate.
  * Each entry names its source; the structured vectors (`hex` and `fields`) need no entry because
  * the vector holds its own fields.
  *
@@ -16,6 +18,415 @@
  * numbers below are that file's.
  */
 module.exports = {
+  describeProducersV0: {
+    source: 'Apache Kafka 4.3.1 message layout; Java verification required',
+    request: {
+      topics: [
+        {
+          topic: 'orders',
+          partitions: [0, 2],
+        },
+      ],
+    },
+    response: {
+      throttleTime: 17,
+      topics: [
+        {
+          topic: 'orders',
+          partitions: [
+            {
+              partition: 0,
+              errorCode: 0,
+              errorMessage: null,
+              activeProducers: [
+                {
+                  producerId: '9007199254740993',
+                  producerEpoch: 65537,
+                  lastSequence: 23,
+                  lastTimestamp: '9007199254740994',
+                  coordinatorEpoch: 9,
+                  currentTxnStartOffset: '-1',
+                },
+              ],
+            },
+            {
+              partition: 2,
+              errorCode: 6,
+              errorMessage: 'moved',
+              activeProducers: [],
+            },
+          ],
+        },
+      ],
+    },
+  },
+  describeTransactionsV0: {
+    source: 'Apache Kafka 4.3.1 message layout; Java verification required',
+    request: {
+      transactionalIds: ['tx-a', 'tx-b'],
+    },
+    response: {
+      throttleTime: 17,
+      transactions: [
+        {
+          errorCode: 0,
+          transactionalId: 'tx-a',
+          state: 'Ongoing',
+          timeoutMs: 60000,
+          startTimeMs: '9007199254740994',
+          producerId: '9007199254740993',
+          producerEpoch: 7,
+          topics: [
+            {
+              topic: 'orders',
+              partitions: [0, 2],
+            },
+          ],
+        },
+        {
+          errorCode: 53,
+          transactionalId: 'tx-b',
+          state: 'Unknown',
+          timeoutMs: 0,
+          startTimeMs: '-1',
+          producerId: '-1',
+          producerEpoch: -1,
+          topics: [],
+        },
+      ],
+    },
+  },
+  listTransactionsV0: {
+    source: 'Apache Kafka 4.3.1 message layout; Java verification required',
+    request: {
+      states: ['Ongoing', 'FutureState'],
+      producerIds: ['9007199254740993'],
+    },
+    response: {
+      throttleTime: 17,
+      errorCode: 0,
+      unknownStateFilters: ['FutureState'],
+      transactions: [
+        {
+          transactionalId: 'tx-a',
+          producerId: '9007199254740993',
+          state: 'Ongoing',
+        },
+      ],
+    },
+  },
+  listTransactionsV1: {
+    source: 'Apache Kafka 4.3.1 message layout; Java verification required',
+    request: {
+      states: ['Ongoing', 'FutureState'],
+      producerIds: ['9007199254740993'],
+      durationFilter: '250',
+    },
+    response: {
+      throttleTime: 17,
+      errorCode: 0,
+      unknownStateFilters: ['FutureState'],
+      transactions: [
+        {
+          transactionalId: 'tx-a',
+          producerId: '9007199254740993',
+          state: 'Ongoing',
+        },
+      ],
+    },
+  },
+  listTransactionsV2: {
+    source: 'Apache Kafka 4.3.1 message layout; Java verification required',
+    request: {
+      states: ['Ongoing', 'FutureState'],
+      producerIds: ['9007199254740993'],
+      durationFilter: '250',
+      transactionalIdPattern: '^tx-.*$',
+    },
+    response: {
+      throttleTime: 17,
+      errorCode: 0,
+      unknownStateFilters: ['FutureState'],
+      transactions: [
+        {
+          transactionalId: 'tx-a',
+          producerId: '9007199254740993',
+          state: 'Ongoing',
+        },
+      ],
+    },
+  },
+  writeTxnMarkersV1: {
+    source: 'Apache Kafka 4.3.1 message layout; Java verification required',
+    request: {
+      markers: [
+        {
+          producerId: '9007199254740993',
+          producerEpoch: 7,
+          transactionResult: false,
+          topics: [
+            {
+              topic: 'orders',
+              partitions: [2],
+            },
+          ],
+          coordinatorEpoch: 9,
+        },
+      ],
+    },
+    response: {
+      markers: [
+        {
+          producerId: '9007199254740993',
+          topics: [
+            {
+              topic: 'orders',
+              partitions: [
+                {
+                  partition: 2,
+                  errorCode: 0,
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+  },
+  writeTxnMarkersV2: {
+    source: 'Apache Kafka 4.3.1 message layout; Java verification required',
+    request: {
+      markers: [
+        {
+          producerId: '9007199254740993',
+          producerEpoch: 7,
+          transactionResult: false,
+          topics: [
+            {
+              topic: 'orders',
+              partitions: [2],
+            },
+          ],
+          coordinatorEpoch: 9,
+          transactionVersion: 0,
+        },
+      ],
+    },
+    response: {
+      markers: [
+        {
+          producerId: '9007199254740993',
+          topics: [
+            {
+              topic: 'orders',
+              partitions: [
+                {
+                  partition: 2,
+                  errorCode: 0,
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+  },
+  listConfigResourcesV1: {
+    source: 'GenerateMessageVectors.java clusterResources',
+    request: { resourceTypes: [16, 32] },
+    response: {
+      throttleTimeMs: 17,
+      errorCode: 0,
+      configResources: [{ resourceName: 'subscription', resourceType: 16 }],
+    },
+  },
+  listConfigResourcesV0: {
+    source: 'GenerateMessageVectors.java clusterResources',
+    request: {},
+    response: {
+      throttleTimeMs: 17,
+      errorCode: 0,
+      configResources: [{ resourceName: 'subscription' }],
+    },
+  },
+  describeClusterV2: {
+    source: 'GenerateMessageVectors.java clusterResources',
+    request: {
+      includeClusterAuthorizedOperations: true,
+      endpointType: 1,
+      includeFencedBrokers: true,
+    },
+    response: {
+      throttleTimeMs: 17,
+      errorCode: 0,
+      errorMessage: null,
+      endpointType: 1,
+      clusterId: 'cluster-a',
+      controllerId: -1,
+      brokers: [{ brokerId: 1, host: 'localhost', port: 9092, rack: null, isFenced: true }],
+      clusterAuthorizedOperations: -2147483648,
+    },
+  },
+  describeClusterV1: {
+    source: 'GenerateMessageVectors.java clusterResources',
+    request: { includeClusterAuthorizedOperations: true, endpointType: 1 },
+    response: {
+      throttleTimeMs: 17,
+      errorCode: 0,
+      errorMessage: null,
+      endpointType: 1,
+      clusterId: 'cluster-a',
+      controllerId: -1,
+      brokers: [{ brokerId: 1, host: 'localhost', port: 9092, rack: null }],
+      clusterAuthorizedOperations: -2147483648,
+    },
+  },
+  describeClusterV0: {
+    source: 'GenerateMessageVectors.java clusterResources',
+    request: { includeClusterAuthorizedOperations: true },
+    response: {
+      throttleTimeMs: 17,
+      errorCode: 0,
+      errorMessage: null,
+      clusterId: 'cluster-a',
+      controllerId: -1,
+      brokers: [{ brokerId: 1, host: 'localhost', port: 9092, rack: null }],
+      clusterAuthorizedOperations: -2147483648,
+    },
+  },
+  updateFeaturesV2: {
+    source: 'GenerateMessageVectors.java clusterResources',
+    request: {
+      timeoutMs: 60000,
+      featureUpdates: [{ feature: 'metadata.version', maxVersionLevel: 25, upgradeType: 2 }],
+      validateOnly: true,
+    },
+    response: { throttleTimeMs: 17, errorCode: 0, errorMessage: null },
+  },
+  updateFeaturesV1: {
+    source: 'GenerateMessageVectors.java clusterResources',
+    request: {
+      timeoutMs: 60000,
+      featureUpdates: [{ feature: 'metadata.version', maxVersionLevel: 25, upgradeType: 2 }],
+      validateOnly: true,
+    },
+    response: {
+      throttleTimeMs: 17,
+      errorCode: 0,
+      errorMessage: null,
+      results: [{ feature: 'metadata.version', errorCode: 42, errorMessage: 'invalid feature' }],
+    },
+  },
+  updateFeaturesV0: {
+    source: 'GenerateMessageVectors.java clusterResources',
+    request: {
+      timeoutMs: 60000,
+      featureUpdates: [{ feature: 'metadata.version', maxVersionLevel: 25, allowDowngrade: false }],
+    },
+    response: {
+      throttleTimeMs: 17,
+      errorCode: 0,
+      errorMessage: null,
+      results: [{ feature: 'metadata.version', errorCode: 42, errorMessage: 'invalid feature' }],
+    },
+  },
+  electLeadersV2: {
+    source: 'GenerateMessageVectors.java clusterResources',
+    request: {
+      electionType: 1,
+      topicPartitions: [{ topic: 'orders', partitions: [0, 2] }],
+      timeoutMs: 60000,
+    },
+    response: {
+      throttleTimeMs: 17,
+      errorCode: 0,
+      replicaElectionResults: [
+        {
+          topic: 'orders',
+          partitionResult: [
+            { partitionId: 0, errorCode: 84, errorMessage: null },
+            { partitionId: 2, errorCode: 80, errorMessage: 'no replica' },
+          ],
+        },
+      ],
+    },
+  },
+  electLeadersV1: {
+    source: 'GenerateMessageVectors.java clusterResources',
+    request: {
+      electionType: 1,
+      topicPartitions: [{ topic: 'orders', partitions: [0, 2] }],
+      timeoutMs: 60000,
+    },
+    response: {
+      throttleTimeMs: 17,
+      errorCode: 0,
+      replicaElectionResults: [
+        {
+          topic: 'orders',
+          partitionResult: [
+            { partitionId: 0, errorCode: 84, errorMessage: null },
+            { partitionId: 2, errorCode: 80, errorMessage: 'no replica' },
+          ],
+        },
+      ],
+    },
+  },
+  electLeadersV0: {
+    source: 'GenerateMessageVectors.java clusterResources',
+    request: { topicPartitions: [{ topic: 'orders', partitions: [0, 2] }], timeoutMs: 60000 },
+    response: {
+      throttleTimeMs: 17,
+      replicaElectionResults: [
+        {
+          topic: 'orders',
+          partitionResult: [
+            { partitionId: 0, errorCode: 84, errorMessage: null },
+            { partitionId: 2, errorCode: 80, errorMessage: 'no replica' },
+          ],
+        },
+      ],
+    },
+  },
+  metadataV7: {
+    source:
+      'MetadataRequest/Response 4.3.1 v7 field literals; independent Java v7 serialization acceptance required',
+    request: {
+      topics: ['test-topic'],
+      allowAutoTopicCreation: true,
+    },
+    response: {
+      throttleTime: 0,
+      brokers: [
+        {
+          nodeId: 0,
+          host: '127.0.0.1',
+          port: 9092,
+          rack: null,
+        },
+      ],
+      clusterId: 'test-cluster-id',
+      controllerId: 0,
+      topics: [
+        {
+          errorCode: 0,
+          name: 'test-topic',
+          isInternal: false,
+          partitions: [
+            {
+              errorCode: 0,
+              partitionIndex: 0,
+              leaderId: 1,
+              leaderEpoch: 5,
+              replicas: [1],
+              isr: [1],
+              offlineReplicas: [],
+            },
+          ],
+        },
+      ],
+    },
+  },
   apiVersionsV4: {
     source:
       'buildApiVersionsRequest l.262 (client software l.59-60), buildApiVersionsResponse l.275',
@@ -30,6 +441,31 @@ module.exports = {
       supportedFeatures: [{ name: 'metadata.version', minVersion: 1, maxVersion: 25 }],
       finalizedFeaturesEpoch: 7,
       finalizedFeatures: [{ name: 'metadata.version', minVersionLevel: 1, maxVersionLevel: 25 }],
+    },
+  },
+  apiVersionsV5: {
+    source:
+      'apiVersions() in GenerateMessageVectors.java (kafka-clients 4.4.0); the structured vectors apiVersionsRequest-v5-* and apiVersionsResponse-v5-*',
+    request: {
+      clientSoftwareName: 'countly-kafkajs',
+      clientSoftwareVersion: '3.0.0-alpha.4',
+      clusterId: null,
+      nodeId: -1,
+    },
+    response: {
+      errorCode: 0,
+      apiKeys: [
+        { apiKey: 0, minVersion: 3, maxVersion: 13 },
+        { apiKey: 18, minVersion: 0, maxVersion: 5 },
+      ],
+      throttleTime: 0,
+      supportedFeatures: [{ name: 'metadata.version', minVersion: 1, maxVersion: 25 }],
+      finalizedFeaturesEpoch: '7',
+      finalizedFeatures: [{ name: 'metadata.version', minVersionLevel: 1, maxVersionLevel: 25 }],
+    },
+    unsupportedVersion: {
+      errorCode: 35,
+      apiKeys: [{ apiKey: 18, minVersion: 0, maxVersion: 4 }],
     },
   },
 
@@ -626,5 +1062,757 @@ module.exports = {
       finalizedFeaturesEpoch: 7,
       finalizedFeatures: [{ name: 'transaction.version', minVersionLevel: 2, maxVersionLevel: 2 }],
     },
+  },
+}
+
+module.exports.offsetDeleteV0 = {
+  source:
+    'OffsetDeleteRequestData and OffsetDeleteResponseData; generated vector acceptance required',
+  request: {
+    groupId: 'test-group',
+    topics: [{ topic: 'test-topic', partitions: [{ partition: 0 }, { partition: 1 }] }],
+  },
+  response: {
+    errorCode: 0,
+    throttleTime: 17,
+    topics: [
+      {
+        topic: 'test-topic',
+        partitions: [
+          { partition: 0, errorCode: 0 },
+          { partition: 1, errorCode: 3 },
+        ],
+      },
+    ],
+  },
+}
+module.exports.offsetFetchV7 = {
+  source:
+    'OffsetFetchRequestData and OffsetFetchResponseData v7; generated vector acceptance required',
+  request: {
+    groupId: 'test-group',
+    topics: [{ topic: 'test-topic', partitions: [{ partition: 0 }] }],
+    requireStable: true,
+  },
+  response: {
+    errorCode: 0,
+    throttleTime: 17,
+    topics: [
+      {
+        topic: 'test-topic',
+        partitions: [{ partition: 0, offset: '10', leaderEpoch: 3, metadata: null, errorCode: 0 }],
+      },
+    ],
+  },
+}
+
+module.exports.describeLogDirsV1 = {
+  source: 'Kafka 4.3.1 schema literals; Java comparison required',
+  request: {
+    topics: [
+      {
+        topic: 't',
+        partitions: [0],
+      },
+    ],
+  },
+  response: {
+    throttleTime: 17,
+    errorCode: 0,
+    logDirs: [
+      {
+        errorCode: 0,
+        path: '/data/a',
+        topics: [
+          {
+            topic: 't',
+            partitions: [
+              {
+                partition: 0,
+                size: '9007199254740993',
+                offsetLag: '2',
+                isFuture: true,
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  },
+}
+module.exports.describeLogDirsV2 = {
+  source: 'Kafka 4.3.1 schema literals; Java comparison required',
+  request: {
+    topics: [
+      {
+        topic: 't',
+        partitions: [0],
+      },
+    ],
+  },
+  response: {
+    throttleTime: 17,
+    errorCode: 0,
+    logDirs: [
+      {
+        errorCode: 0,
+        path: '/data/a',
+        topics: [
+          {
+            topic: 't',
+            partitions: [
+              {
+                partition: 0,
+                size: '9007199254740993',
+                offsetLag: '2',
+                isFuture: true,
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  },
+}
+module.exports.describeLogDirsV3 = {
+  source: 'Kafka 4.3.1 schema literals; Java comparison required',
+  request: {
+    topics: [
+      {
+        topic: 't',
+        partitions: [0],
+      },
+    ],
+  },
+  response: {
+    throttleTime: 17,
+    errorCode: 0,
+    logDirs: [
+      {
+        errorCode: 0,
+        path: '/data/a',
+        topics: [
+          {
+            topic: 't',
+            partitions: [
+              {
+                partition: 0,
+                size: '9007199254740993',
+                offsetLag: '2',
+                isFuture: true,
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  },
+}
+module.exports.describeLogDirsV4 = {
+  source: 'Kafka 4.3.1 schema literals; Java comparison required',
+  request: {
+    topics: [
+      {
+        topic: 't',
+        partitions: [0],
+      },
+    ],
+  },
+  response: {
+    throttleTime: 17,
+    errorCode: 0,
+    logDirs: [
+      {
+        errorCode: 0,
+        path: '/data/a',
+        topics: [
+          {
+            topic: 't',
+            partitions: [
+              {
+                partition: 0,
+                size: '9007199254740993',
+                offsetLag: '2',
+                isFuture: true,
+              },
+            ],
+          },
+        ],
+        totalBytes: '9007199254740995',
+        usableBytes: '9007199254740994',
+      },
+    ],
+  },
+}
+module.exports.describeLogDirsV5 = {
+  source: 'Kafka 4.3.1 schema literals; Java comparison required',
+  request: {
+    topics: [
+      {
+        topic: 't',
+        partitions: [0],
+      },
+    ],
+  },
+  response: {
+    throttleTime: 17,
+    errorCode: 0,
+    logDirs: [
+      {
+        errorCode: 0,
+        path: '/data/a',
+        topics: [
+          {
+            topic: 't',
+            partitions: [
+              {
+                partition: 0,
+                size: '9007199254740993',
+                offsetLag: '2',
+                isFuture: true,
+              },
+            ],
+          },
+        ],
+        totalBytes: '9007199254740995',
+        usableBytes: '9007199254740994',
+        isCordoned: true,
+      },
+    ],
+  },
+}
+module.exports.alterReplicaLogDirsV1 = {
+  source: 'Kafka 4.3.1 schema literals; Java comparison required',
+  request: {
+    dirs: [
+      {
+        path: '/data/b',
+        topics: [
+          {
+            topic: 't',
+            partitions: [0],
+          },
+        ],
+      },
+    ],
+  },
+  response: {
+    throttleTime: 17,
+    topics: [
+      {
+        topic: 't',
+        partitions: [
+          {
+            partition: 0,
+            errorCode: 57,
+          },
+        ],
+      },
+    ],
+  },
+}
+module.exports.alterReplicaLogDirsV2 = {
+  source: 'Kafka 4.3.1 schema literals; Java comparison required',
+  request: {
+    dirs: [
+      {
+        path: '/data/b',
+        topics: [
+          {
+            topic: 't',
+            partitions: [0],
+          },
+        ],
+      },
+    ],
+  },
+  response: {
+    throttleTime: 17,
+    topics: [
+      {
+        topic: 't',
+        partitions: [
+          {
+            partition: 0,
+            errorCode: 57,
+          },
+        ],
+      },
+    ],
+  },
+}
+module.exports.listOffsetsV10 = {
+  source: 'Kafka 4.3.1 schema literals; Java comparison required',
+  request: {
+    replicaId: -1,
+    isolationLevel: 1,
+    topics: [
+      {
+        topic: 't',
+        partitions: [
+          {
+            partition: 0,
+            currentLeaderEpoch: -1,
+            timestamp: '-5',
+          },
+        ],
+      },
+    ],
+    timeout: 5000,
+  },
+  response: {
+    throttleTime: 17,
+    responses: [
+      {
+        topic: 't',
+        partitions: [
+          {
+            partition: 0,
+            errorCode: 0,
+            timestamp: '-1',
+            offset: '-1',
+            leaderEpoch: -1,
+          },
+        ],
+      },
+    ],
+  },
+}
+module.exports.listOffsetsV11 = {
+  source: 'Kafka 4.3.1 schema literals; Java comparison required',
+  request: {
+    replicaId: -1,
+    isolationLevel: 1,
+    topics: [
+      {
+        topic: 't',
+        partitions: [
+          {
+            partition: 0,
+            currentLeaderEpoch: -1,
+            timestamp: '-6',
+          },
+        ],
+      },
+    ],
+    timeout: 5000,
+  },
+  response: {
+    throttleTime: 17,
+    responses: [
+      {
+        topic: 't',
+        partitions: [
+          {
+            partition: 0,
+            errorCode: 0,
+            timestamp: '-1',
+            offset: '-1',
+            leaderEpoch: -1,
+          },
+        ],
+      },
+    ],
+  },
+}
+module.exports.alterPartitionReassignmentsV1 = {
+  source: 'Kafka 4.3.1 schema literals; Java comparison required',
+  request: {
+    timeout: 5000,
+    allowReplicationFactorChange: false,
+    topics: [
+      {
+        topic: 't',
+        partitionAssignment: [
+          {
+            partition: 0,
+            replicas: [1, 2],
+          },
+        ],
+      },
+    ],
+  },
+  response: {
+    throttleTime: 17,
+    allowReplicationFactorChange: false,
+    errorCode: 0,
+    errorMessage: null,
+    responses: [
+      {
+        topic: 't',
+        partitions: [
+          {
+            partition: 0,
+            errorCode: 0,
+            errorMessage: null,
+          },
+        ],
+      },
+    ],
+  },
+}
+module.exports.deleteTopicsV6 = {
+  source: 'Kafka 4.3.1 schema literals; Java comparison required',
+  request: {
+    topics: [
+      {
+        topic: null,
+        topicId: '00112233-4455-6677-8899-aabbccddeeff',
+      },
+    ],
+    timeout: 5000,
+  },
+  response: {
+    throttleTime: 17,
+    topicErrors: [
+      {
+        topic: null,
+        topicId: '00112233-4455-6677-8899-aabbccddeeff',
+        errorCode: 89,
+        errorMessage: 'quota',
+      },
+    ],
+  },
+}
+
+Object.assign(module.exports.describeLogDirsV1, {
+  requestHex: '000000010001740000000100000000',
+  responseHex:
+    '0000001100000001000000072f646174612f610000000100017400000001000000000020000000000001000000000000000201',
+})
+Object.assign(module.exports.describeLogDirsV2, {
+  requestHex: '02027402000000000000',
+  responseHex:
+    '00000011020000082f646174612f610202740200000000002000000000000100000000000000020100000000',
+})
+Object.assign(module.exports.describeLogDirsV3, {
+  requestHex: '02027402000000000000',
+  responseHex:
+    '000000110000020000082f646174612f610202740200000000002000000000000100000000000000020100000000',
+})
+Object.assign(module.exports.describeLogDirsV4, {
+  requestHex: '02027402000000000000',
+  responseHex:
+    '000000110000020000082f646174612f61020274020000000000200000000000010000000000000002010000002000000000000300200000000000020000',
+})
+Object.assign(module.exports.describeLogDirsV5, {
+  requestHex: '02027402000000000000',
+  responseHex:
+    '000000110000020000082f646174612f6102027402000000000020000000000001000000000000000201000000200000000000030020000000000002010000',
+})
+Object.assign(module.exports.alterReplicaLogDirsV1, {
+  requestHex: '0000000100072f646174612f62000000010001740000000100000000',
+  responseHex: '000000110000000100017400000001000000000039',
+})
+Object.assign(module.exports.alterReplicaLogDirsV2, {
+  requestHex: '02082f646174612f620202740200000000000000',
+  responseHex: '0000001102027402000000000039000000',
+})
+Object.assign(module.exports.listOffsetsV10, {
+  requestHex: 'ffffffff010202740200000000fffffffffffffffffffffffb00000000138800',
+  responseHex: '0000001102027402000000000000ffffffffffffffffffffffffffffffffffffffff000000',
+})
+Object.assign(module.exports.listOffsetsV11, {
+  requestHex: 'ffffffff010202740200000000fffffffffffffffffffffffa00000000138800',
+  responseHex: '0000001102027402000000000000ffffffffffffffffffffffffffffffffffffffff000000',
+})
+Object.assign(module.exports.alterPartitionReassignmentsV1, {
+  requestHex: '00001388000202740200000000030000000100000002000000',
+  responseHex: '00000011000000000202740200000000000000000000',
+})
+Object.assign(module.exports.deleteTopicsV6, {
+  requestHex: '020000112233445566778899aabbccddeeff000000138800',
+  responseHex: '00000011020000112233445566778899aabbccddeeff00590671756f74610000',
+})
+
+/** Schema-derived literals; Java generation and comparison remain mandatory. */
+module.exports.securityAdmin = {
+  describeClientQuotasV0: {
+    request: {
+      components: [{ entityType: 'user', matchType: 0, match: 'test-user' }],
+      strict: false,
+    },
+    response: {
+      throttleTimeMs: 0,
+      errorCode: 0,
+      errorMessage: null,
+      entries: [
+        {
+          entity: [{ entityType: 'user', entityName: null }],
+          values: [{ key: 'producer_byte_rate', value: 1234.5 }],
+        },
+      ],
+    },
+    requestHex: '00000001000475736572000009746573742d7573657200',
+    responseHex:
+      '000000000000ffff0000000100000001000475736572ffff00000001001270726f64756365725f627974655f7261746540934a0000000000',
+  },
+  describeClientQuotasV1: {
+    request: {
+      components: [{ entityType: 'user', matchType: 0, match: 'test-user' }],
+      strict: false,
+    },
+    response: {
+      throttleTimeMs: 0,
+      errorCode: 0,
+      errorMessage: null,
+      entries: [
+        {
+          entity: [{ entityType: 'user', entityName: null }],
+          values: [{ key: 'producer_byte_rate', value: 1234.5 }],
+        },
+      ],
+    },
+    requestHex: '020575736572000a746573742d75736572000000',
+    responseHex:
+      '00000000000000020205757365720000021370726f64756365725f627974655f7261746540934a0000000000000000',
+  },
+  alterClientQuotasV0: {
+    request: {
+      entries: [
+        {
+          entity: [{ entityType: 'user', entityName: null }],
+          ops: [{ key: 'producer_byte_rate', value: 1234.5, remove: false }],
+        },
+      ],
+      validateOnly: true,
+    },
+    response: {
+      throttleTimeMs: 0,
+      entries: [
+        { errorCode: 0, errorMessage: null, entity: [{ entityType: 'user', entityName: null }] },
+      ],
+    },
+    requestHex:
+      '0000000100000001000475736572ffff00000001001270726f64756365725f627974655f7261746540934a00000000000001',
+    responseHex: '00000000000000010000ffff00000001000475736572ffff',
+  },
+  alterClientQuotasV1: {
+    request: {
+      entries: [
+        {
+          entity: [{ entityType: 'user', entityName: null }],
+          ops: [{ key: 'producer_byte_rate', value: 1234.5, remove: false }],
+        },
+      ],
+      validateOnly: true,
+    },
+    response: {
+      throttleTimeMs: 0,
+      entries: [
+        { errorCode: 0, errorMessage: null, entity: [{ entityType: 'user', entityName: null }] },
+      ],
+    },
+    requestHex:
+      '020205757365720000021370726f64756365725f627974655f7261746540934a00000000000000000100',
+    responseHex: '000000000200000002057573657200000000',
+  },
+  describeUserScramCredentialsV0: {
+    request: { users: [{ name: 'test-user' }] },
+    response: {
+      throttleTimeMs: 0,
+      errorCode: 0,
+      errorMessage: null,
+      results: [
+        {
+          user: 'test-user',
+          errorCode: 0,
+          errorMessage: null,
+          credentialInfos: [{ mechanism: 1, iterations: 4096 }],
+        },
+      ],
+    },
+    requestHex: '020a746573742d757365720000',
+    responseHex: '00000000000000020a746573742d75736572000000020100001000000000',
+  },
+  alterUserScramCredentialsV0: {
+    request: {
+      deletions: [{ name: 'test-user', mechanism: 1 }],
+      upsertions: [
+        {
+          name: 'test-user',
+          mechanism: 1,
+          iterations: 4096,
+          salt: Buffer.from('73616c742d6d61726b65722d6f6e6c792d74657374', 'hex'),
+          saltedPassword: Buffer.from('646572697665642d6d61726b65722d6f6e6c792d74657374', 'hex'),
+        },
+      ],
+    },
+    response: {
+      throttleTimeMs: 0,
+      results: [{ user: 'test-user', errorCode: 0, errorMessage: null }],
+    },
+    requestHex:
+      '020a746573742d757365720100020a746573742d7573657201000010001673616c742d6d61726b65722d6f6e6c792d7465737419646572697665642d6d61726b65722d6f6e6c792d746573740000',
+    responseHex: '00000000020a746573742d757365720000000000',
+  },
+  createDelegationTokenV1: {
+    request: {
+      renewers: [{ principalType: 'User', principalName: 'test-owner' }],
+      maxLifetimeMs: '-1',
+    },
+    response: {
+      errorCode: 0,
+      principalType: 'User',
+      principalName: 'test-owner',
+      issueTimestampMs: '9007199254740993',
+      expiryTimestampMs: '9007199254740993',
+      maxTimestampMs: '9007199254740993',
+      tokenId: 'token-id',
+      hmac: Buffer.from('686d61632d6d61726b65722d6f6e6c792d74657374', 'hex'),
+      throttleTimeMs: 0,
+    },
+    requestHex: '00000001000455736572000a746573742d6f776e6572ffffffffffffffff',
+    responseHex:
+      '0000000455736572000a746573742d6f776e65720020000000000001002000000000000100200000000000010008746f6b656e2d696400000015686d61632d6d61726b65722d6f6e6c792d7465737400000000',
+  },
+  createDelegationTokenV2: {
+    request: {
+      renewers: [{ principalType: 'User', principalName: 'test-owner' }],
+      maxLifetimeMs: '-1',
+    },
+    response: {
+      errorCode: 0,
+      principalType: 'User',
+      principalName: 'test-owner',
+      issueTimestampMs: '9007199254740993',
+      expiryTimestampMs: '9007199254740993',
+      maxTimestampMs: '9007199254740993',
+      tokenId: 'token-id',
+      hmac: Buffer.from('686d61632d6d61726b65722d6f6e6c792d74657374', 'hex'),
+      throttleTimeMs: 0,
+    },
+    requestHex: '0205557365720b746573742d6f776e657200ffffffffffffffff00',
+    responseHex:
+      '000005557365720b746573742d6f776e657200200000000000010020000000000001002000000000000109746f6b656e2d696416686d61632d6d61726b65722d6f6e6c792d746573740000000000',
+  },
+  createDelegationTokenV3: {
+    request: {
+      ownerPrincipalType: 'User',
+      ownerPrincipalName: 'test-owner',
+      renewers: [{ principalType: 'User', principalName: 'test-owner' }],
+      maxLifetimeMs: '-1',
+    },
+    response: {
+      errorCode: 0,
+      principalType: 'User',
+      principalName: 'test-owner',
+      tokenRequesterPrincipalType: 'User',
+      tokenRequesterPrincipalName: 'test-owner',
+      issueTimestampMs: '9007199254740993',
+      expiryTimestampMs: '9007199254740993',
+      maxTimestampMs: '9007199254740993',
+      tokenId: 'token-id',
+      hmac: Buffer.from('686d61632d6d61726b65722d6f6e6c792d74657374', 'hex'),
+      throttleTimeMs: 0,
+    },
+    requestHex:
+      '05557365720b746573742d6f776e65720205557365720b746573742d6f776e657200ffffffffffffffff00',
+    responseHex:
+      '000005557365720b746573742d6f776e657205557365720b746573742d6f776e657200200000000000010020000000000001002000000000000109746f6b656e2d696416686d61632d6d61726b65722d6f6e6c792d746573740000000000',
+  },
+  renewDelegationTokenV1: {
+    request: {
+      hmac: Buffer.from('686d61632d6d61726b65722d6f6e6c792d74657374', 'hex'),
+      renewPeriodMs: '-1',
+    },
+    response: { errorCode: 0, expiryTimestampMs: '9007199254740993', throttleTimeMs: 0 },
+    requestHex: '00000015686d61632d6d61726b65722d6f6e6c792d74657374ffffffffffffffff',
+    responseHex: '0000002000000000000100000000',
+  },
+  renewDelegationTokenV2: {
+    request: {
+      hmac: Buffer.from('686d61632d6d61726b65722d6f6e6c792d74657374', 'hex'),
+      renewPeriodMs: '-1',
+    },
+    response: { errorCode: 0, expiryTimestampMs: '9007199254740993', throttleTimeMs: 0 },
+    requestHex: '16686d61632d6d61726b65722d6f6e6c792d74657374ffffffffffffffff00',
+    responseHex: '000000200000000000010000000000',
+  },
+  expireDelegationTokenV1: {
+    request: {
+      hmac: Buffer.from('686d61632d6d61726b65722d6f6e6c792d74657374', 'hex'),
+      expiryTimePeriodMs: '-1',
+    },
+    response: { errorCode: 0, expiryTimestampMs: '9007199254740993', throttleTimeMs: 0 },
+    requestHex: '00000015686d61632d6d61726b65722d6f6e6c792d74657374ffffffffffffffff',
+    responseHex: '0000002000000000000100000000',
+  },
+  expireDelegationTokenV2: {
+    request: {
+      hmac: Buffer.from('686d61632d6d61726b65722d6f6e6c792d74657374', 'hex'),
+      expiryTimePeriodMs: '-1',
+    },
+    response: { errorCode: 0, expiryTimestampMs: '9007199254740993', throttleTimeMs: 0 },
+    requestHex: '16686d61632d6d61726b65722d6f6e6c792d74657374ffffffffffffffff00',
+    responseHex: '000000200000000000010000000000',
+  },
+  describeDelegationTokenV1: {
+    request: { owners: [{ principalType: 'User', principalName: 'test-owner' }] },
+    response: {
+      errorCode: 0,
+      tokens: [
+        {
+          principalType: 'User',
+          principalName: 'test-owner',
+          issueTimestamp: '9007199254740993',
+          expiryTimestamp: '9007199254740993',
+          maxTimestamp: '9007199254740993',
+          tokenId: 'token-id',
+          hmac: Buffer.from('686d61632d6d61726b65722d6f6e6c792d74657374', 'hex'),
+          renewers: [{ principalType: 'User', principalName: 'test-owner' }],
+        },
+      ],
+      throttleTimeMs: 0,
+    },
+    requestHex: '00000001000455736572000a746573742d6f776e6572',
+    responseHex:
+      '000000000001000455736572000a746573742d6f776e65720020000000000001002000000000000100200000000000010008746f6b656e2d696400000015686d61632d6d61726b65722d6f6e6c792d7465737400000001000455736572000a746573742d6f776e657200000000',
+  },
+  describeDelegationTokenV2: {
+    request: { owners: [{ principalType: 'User', principalName: 'test-owner' }] },
+    response: {
+      errorCode: 0,
+      tokens: [
+        {
+          principalType: 'User',
+          principalName: 'test-owner',
+          issueTimestamp: '9007199254740993',
+          expiryTimestamp: '9007199254740993',
+          maxTimestamp: '9007199254740993',
+          tokenId: 'token-id',
+          hmac: Buffer.from('686d61632d6d61726b65722d6f6e6c792d74657374', 'hex'),
+          renewers: [{ principalType: 'User', principalName: 'test-owner' }],
+        },
+      ],
+      throttleTimeMs: 0,
+    },
+    requestHex: '0205557365720b746573742d6f776e65720000',
+    responseHex:
+      '00000205557365720b746573742d6f776e657200200000000000010020000000000001002000000000000109746f6b656e2d696416686d61632d6d61726b65722d6f6e6c792d746573740205557365720b746573742d6f776e657200000000000000',
+  },
+  describeDelegationTokenV3: {
+    request: { owners: [{ principalType: 'User', principalName: 'test-owner' }] },
+    response: {
+      errorCode: 0,
+      tokens: [
+        {
+          principalType: 'User',
+          principalName: 'test-owner',
+          tokenRequesterPrincipalType: 'User',
+          tokenRequesterPrincipalName: 'test-owner',
+          issueTimestamp: '9007199254740993',
+          expiryTimestamp: '9007199254740993',
+          maxTimestamp: '9007199254740993',
+          tokenId: 'token-id',
+          hmac: Buffer.from('686d61632d6d61726b65722d6f6e6c792d74657374', 'hex'),
+          renewers: [{ principalType: 'User', principalName: 'test-owner' }],
+        },
+      ],
+      throttleTimeMs: 0,
+    },
+    requestHex: '0205557365720b746573742d6f776e65720000',
+    responseHex:
+      '00000205557365720b746573742d6f776e657205557365720b746573742d6f776e657200200000000000010020000000000001002000000000000109746f6b656e2d696416686d61632d6d61726b65722d6f6e6c792d746573740205557365720b746573742d6f776e657200000000000000',
   },
 }

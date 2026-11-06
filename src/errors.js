@@ -170,10 +170,10 @@ class KafkaJSMemberIdRequired extends KafkaJSProtocolError {
 class KafkaJSNumberOfRetriesExceeded extends KafkaJSNonRetriableError {
   constructor(e, { retryCount, retryTime }) {
     super(e, { cause: e })
+    this.name = 'KafkaJSNumberOfRetriesExceeded'
     this.stack = `${this.name}\n  Caused by: ${e.stack}`
     this.retryCount = retryCount
     this.retryTime = retryTime
-    this.name = 'KafkaJSNumberOfRetriesExceeded'
 
     // The wrapped error may itself be a wrapper (KafkaJSError around a protocol error), so
     // walk the chain for the first typed link.
@@ -366,11 +366,20 @@ class KafkaJSInvalidLongError extends KafkaJSNonRetriableError {
   }
 }
 
+/** A topic refusal with broker detail separate from the stable protocol message. */
 class KafkaJSCreateTopicError extends KafkaJSProtocolError {
-  constructor(e, topicName) {
+  /**
+   * @param {object|Error} e existing protocol error
+   * @param {string} [topicName] requested topic
+   * @param {string|null} [errorMessage=null] broker detail, never substituted into message
+   * @returns {KafkaJSCreateTopicError} compatible error with additive detail
+   * @throws Never.
+   */
+  constructor(e, topicName, errorMessage = null) {
     super(e)
     this.topic = topicName
     this.name = 'KafkaJSCreateTopicError'
+    this.errorMessage = errorMessage ?? null
   }
 }
 

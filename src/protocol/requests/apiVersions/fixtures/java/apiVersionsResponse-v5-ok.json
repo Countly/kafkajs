@@ -1,0 +1,7 @@
+{
+  "message": "ApiVersionsResponse",
+  "version": 5,
+  "case": "ok",
+  "hex": "00000300000003000d00001200000005000000000003001702116d657461646174612e76657273696f6e000100190001080000000000000007021702116d657461646174612e76657273696f6e0019000100",
+  "fields": { "errorCode": 0, "apiKeys": [{ "apiKey": 0, "minVersion": 3, "maxVersion": 13 }, { "apiKey": 18, "minVersion": 0, "maxVersion": 5 }], "throttleTime": 0, "supportedFeatures": [{ "name": "metadata.version", "minVersion": 1, "maxVersion": 25 }], "finalizedFeaturesEpoch": "7", "finalizedFeatures": [{ "name": "metadata.version", "minVersionLevel": 1, "maxVersionLevel": 25 }] }
+}

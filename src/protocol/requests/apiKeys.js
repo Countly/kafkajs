@@ -46,7 +46,18 @@ module.exports = {
   IncrementalAlterConfigs: 44,
   AlterPartitionReassignments: 45,
   ListPartitionReassignments: 46,
+  OffsetDelete: 47,
+  DescribeClientQuotas: 48,
+  AlterClientQuotas: 49,
+  DescribeUserScramCredentials: 50,
+  AlterUserScramCredentials: 51,
+  UpdateFeatures: 57,
+  DescribeCluster: 60,
+  DescribeProducers: 61,
+  DescribeTransactions: 65,
+  ListTransactions: 66,
   ConsumerGroupHeartbeat: 68, // KIP-848; the whole membership protocol is this one API
   ConsumerGroupDescribe: 69, // KIP-848 admin counterpart
+  ListConfigResources: 74,
   DescribeTopicPartitions: 75, // KIP-966 admin describe, paginated
 }

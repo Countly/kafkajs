@@ -1026,3 +1026,146 @@ it('R2§3:MaxConcurrentFetches', async () => {
   const [, second] = cluster.requests().filter(({ api, node }) => api === 'Fetch' && node === 1)
   expect(second.fields.topics[0].partitions[0]).toMatchObject({ partition: 1, fetchOffset: '1' })
 })
+
+/** Computes committed lag from fresh broker observations, using lossless decimal arithmetic.
+ * @param {object} admin connected admin client
+ * @param {string} groupId group to observe
+ * @param {string} topic topic to observe
+ * @returns {Promise<object[]>} partition, hasCommit and decimal lag
+ * @throws {Error} broker refusal or an omitted requested partition
+ */
+async function committedLagFor(admin, groupId, topic) {
+  const fetched = await admin.fetchOffsets({ groupId, topics: [topic], resolveOffsets: false })
+  const bounds = await admin.fetchTopicOffsets(topic, { isolationLevel: 'read_uncommitted' })
+  const offsets = fetched.find((row) => row.topic === topic)?.partitions ?? []
+  return bounds.map(({ partition, high, low }) => {
+    const raw = offsets.find((row) => row.partition === partition)
+    if (!raw) throw new Error('The broker omitted a requested partition')
+    const hasCommit = raw.offset !== '-1'
+    return {
+      partition,
+      hasCommit,
+      lag: (BigInt(high) - BigInt(hasCommit ? raw.offset : low)).toString(),
+    }
+  })
+}
+
+describe('admin detail and lag equivalents', () => {
+  it('R1§C:listTopics', async () => {
+    const scripted = createScriptedCluster({ nodes })
+    const topicId = '01020304-0506-0708-090a-0b0c0d0e0f10'
+    scripted.answer('Metadata', () => ({
+      brokers: nodes.map(({ id, host, port }) => ({ nodeId: id, host, port, rack: null })),
+      topics: [
+        {
+          name: 'detail',
+          topicId,
+          errorCode: 0,
+          isInternal: false,
+          partitions: [],
+          topicAuthorizedOperations: -2147483648,
+        },
+      ],
+    }))
+    const admin = new Kafka(scripted.kafkaOptions({ retry })).admin()
+    try {
+      await admin.connect()
+      const start = scripted.requests().length
+      expect(await admin.listTopics()).toEqual(['detail'])
+      const middle = scripted.requests().length
+      const { topics } = await admin.fetchTopicMetadata()
+      expect(topics).toEqual([
+        expect.objectContaining({ name: 'detail', isInternal: false, topicId }),
+      ])
+      const first = scripted
+        .requests()
+        .slice(start, middle)
+        .filter((r) => r.api === 'Metadata')
+      const second = scripted
+        .requests()
+        .slice(middle)
+        .filter((r) => r.api === 'Metadata')
+      expect(first).toHaveLength(1)
+      expect(second).toHaveLength(1)
+      expect(first[0].fields.topics).toEqual(second[0].fields.topics)
+    } finally {
+      await admin.disconnect()
+      scripted.assertClean()
+    }
+  })
+  it('R2§5:kadm.Lag', async () => {
+    const createAdmin = require('../admin')
+    let committed = '0'
+    const coordinator = {
+      offsetFetch: jest.fn(async () => ({
+        responses: [{ topic: 't', partitions: [{ partition: 0, offset: committed }] }],
+      })),
+    }
+    const cluster = {
+      findGroupCoordinator: async () => coordinator,
+      addTargetTopic: async () => {},
+      refreshMetadataIfNecessary: async () => {},
+      findTopicPartitionMetadata: () => [{ partitionId: 0 }],
+      fetchTopicsOffset: jest.fn(async (topics, options) => {
+        expect(options.isolationLevel).toBe(0)
+        return [
+          {
+            topic: 't',
+            partitions: [{ partition: 0, offset: topics[0].fromBeginning ? '7' : '100' }],
+          },
+        ]
+      }),
+    }
+    const admin = createAdmin({ cluster, logger: logger(), retry })
+    const observed = []
+    for (committed of ['0', '20', '50']) {
+      const [observedLag] = await committedLagFor(admin, 'g', 't')
+      observed.push(observedLag.lag)
+    }
+    expect(observed).toEqual(['100', '80', '50'])
+    expect((100n - (19n + 1n)).toString()).toBe('80')
+    committed = '-1'
+    expect(await committedLagFor(admin, 'g', 't')).toEqual([
+      { partition: 0, hasCommit: false, lag: '93' },
+    ])
+    const huge = {
+      fetchOffsets: jest.fn(async () => [
+        { topic: 't', partitions: [{ partition: 0, offset: '9007199254740993' }] },
+      ]),
+      fetchTopicOffsets: async () => [{ partition: 0, high: '9007199254741093', low: '7' }],
+    }
+    expect((await committedLagFor(huge, 'g', 't'))[0].lag).toBe('100')
+    expect(huge.fetchOffsets).toHaveBeenCalledWith({
+      groupId: 'g',
+      topics: ['t'],
+      resolveOffsets: false,
+    })
+    expect(coordinator.offsetFetch).toHaveBeenCalledTimes(4)
+  })
+})
+
+it('R1§C:forceTerminateTransaction', async () => {
+  const createAdmin = require('../admin')
+  const request = require('../protocol/requests/initProducerId/v5/request')
+  const bodies = []
+  const broker = {
+    initProducerId: async (options) => {
+      bodies.push((await request(options).encode()).buffer.toString('hex'))
+      return { producerId: '9007199254740993', producerEpoch: 8 }
+    },
+  }
+  const cluster = {
+    findGroupCoordinator: async ({ coordinatorType }) => {
+      expect(coordinatorType).toBe(1)
+      return broker
+    },
+  }
+  const admin = createAdmin({ cluster, logger: logger(), retry })
+  const forceTerminateEquivalent = (id) => admin.fenceProducers({ transactionalIds: [id] })
+  const equivalent = await forceTerminateEquivalent('tx-a')
+  const direct = await admin.fenceProducers({ transactionalIds: ['tx-a'] })
+  expect(equivalent).toEqual(direct)
+  expect(bodies).toHaveLength(2)
+  expect(bodies[0]).toBe(bodies[1])
+  expect(admin.forceTerminateTransaction).toBeUndefined()
+})

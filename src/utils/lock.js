@@ -73,7 +73,13 @@ module.exports = class Lock {
       }
 
       this[PRIVATE.WAITING].add(tryToAcquire)
-      timeoutId = setTimeout(() => {
+      const deadline = Number(process.hrtime.bigint()) / 1e6 + this[PRIVATE.TIMEOUT]
+      const onTimeout = () => {
+        const remaining = deadline - Number(process.hrtime.bigint()) / 1e6
+        if (remaining > 0) {
+          timeoutId = setTimeout(onTimeout, Math.min(2147483647, Math.ceil(remaining)))
+          return
+        }
         // waitingCount includes this waiter itself, since it's still in WAITING at this point;
         // both the error message and the event payload below read the same count.
         const waitingCount = this[PRIVATE.WAITING].size
@@ -93,7 +99,8 @@ module.exports = class Lock {
         }
 
         reject(error)
-      }, this[PRIVATE.TIMEOUT])
+      }
+      timeoutId = setTimeout(onTimeout, Math.min(2147483647, this[PRIVATE.TIMEOUT]))
     })
   }
 

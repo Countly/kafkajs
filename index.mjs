@@ -2,6 +2,7 @@ import cjs from './index.js'
 
 export const {
   Kafka,
+  oauthBearer,
   PartitionAssigners,
   AssignerProtocol,
   Partitioners,

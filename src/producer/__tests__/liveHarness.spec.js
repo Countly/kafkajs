@@ -56,6 +56,7 @@ const {
   delay,
   liveCase,
   liveRun,
+  pollTolerating,
   pollUntil,
 } = require('./fixtures/bounded')
 const { bufferedProducer, deferred, watch } = require('./fixtures/bufferHarness')
@@ -2334,6 +2335,108 @@ describe('Producer > the live scenarios harness', () => {
           throw new Error('drifted')
         })
       ).rejects.toThrow('drifted')
+    })
+
+    test('pollTolerating treats what a check throws as not yet and polls on until the check is true', async () => {
+      let checks = 0
+      const polling = watch(
+        pollTolerating(
+          NEVER,
+          10000,
+          () => {
+            if ((checks += 1) < 3) throw new Error(`not yet ${checks}`)
+            return true
+          },
+          { delayMs: 250 }
+        )
+      )
+
+      await jest.advanceTimersByTimeAsync(0)
+      expect(checks).toBe(1)
+      expect(polling.state).toBe('pending')
+      await jest.advanceTimersByTimeAsync(250)
+      expect(checks).toBe(2)
+      expect(polling.state).toBe('pending')
+      await jest.advanceTimersByTimeAsync(250)
+
+      expect(polling.state).toBe('fulfilled')
+      expect(checks).toBe(3)
+    })
+
+    test('pollTolerating names the last failure its checks threw in its time-out message and keeps it as the cause', async () => {
+      let checks = 0
+      const thrown = []
+      const polling = watch(
+        pollTolerating(
+          NEVER,
+          1000,
+          () => {
+            checks += 1
+            const error = new Error(`refused ${checks}`)
+            thrown.push(error)
+            throw error
+          },
+          { delayMs: 300, label: 'Broker 3' }
+        )
+      )
+
+      await jest.advanceTimersByTimeAsync(1000 + STOP_GRACE_MS)
+
+      expect(polling.state).toBe('rejected')
+      expect(checks).toBe(4)
+      expect(polling.value.message).toBe(
+        'Broker 3 did not settle within 1000 ms; last error: Error: refused 4'
+      )
+      expect(polling.value.cause).toBe(thrown[3])
+    })
+
+    test('pollTolerating cuts a long last failure message to 150 characters', async () => {
+      const polling = watch(
+        pollTolerating(
+          NEVER,
+          1000,
+          () => {
+            throw new Error('x'.repeat(400))
+          },
+          { delayMs: 300, label: 'Broker 3' }
+        )
+      )
+
+      await jest.advanceTimersByTimeAsync(1000 + STOP_GRACE_MS)
+
+      expect(polling.state).toBe('rejected')
+      expect(polling.value.message).toBe(
+        `Broker 3 did not settle within 1000 ms; last error: Error: ${'x'.repeat(150)}`
+      )
+    })
+
+    test('pollTolerating adds no last failure to the time-out of checks that only answered false', async () => {
+      const polling = watch(pollTolerating(NEVER, 1000, () => false, { delayMs: 300 }))
+
+      await jest.advanceTimersByTimeAsync(1000 + STOP_GRACE_MS)
+
+      expect(polling.state).toBe('rejected')
+      expect(polling.value.message).toBe('The wait did not settle within 1000 ms')
+      expect(polling.value.cause).toBeUndefined()
+    })
+
+    test('pollTolerating does not take the abort that ended a check for a failure of that check', async () => {
+      const polling = watch(
+        pollTolerating(
+          NEVER,
+          1000,
+          (scope) =>
+            new Promise((resolve, reject) =>
+              scope.addEventListener('abort', () => reject(scope.reason), { once: true })
+            )
+        )
+      )
+
+      await jest.advanceTimersByTimeAsync(1000 + STOP_GRACE_MS)
+
+      expect(polling.state).toBe('rejected')
+      expect(polling.value.message).toBe('The wait did not settle within 1000 ms')
+      expect(polling.value.cause).toBeUndefined()
     })
 
     test('isrIsFull reads the workload and the internal topics and tells whether every ISR is whole', async () => {

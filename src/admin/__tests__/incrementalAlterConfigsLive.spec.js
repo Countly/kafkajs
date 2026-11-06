@@ -387,7 +387,8 @@ describeConfigAdmin('Admin > incrementalAlterConfigs and the config routing (liv
       const afterReplace = await settled(
         'cluster-default-replace',
         clusterDefault,
-        (entries) => entries['background.threads'].configValue === '12'
+        // A broker that has not applied the change yet may still lack the entry.
+        (entries) => entries['background.threads']?.configValue === '12'
       )
       expect(afterReplace).toMatchObject({ held: true })
       for (const { name, value } of kept) {

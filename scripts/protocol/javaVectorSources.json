@@ -1,0 +1,2802 @@
+{
+  "src/protocol/requests/addOffsetsToTxn/fixtures/java/addOffsetsToTxnRequest-v2-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "d6f8214352ebbb3e0761ab32f1073f62988aff4cca83ad0c5bb5983009dac38b"
+  },
+  "src/protocol/requests/addOffsetsToTxn/fixtures/java/addOffsetsToTxnRequest-v3-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "aa0ce0c7de559975b6a19fb5b91d67cb0fd45337224fbe4ee0b835cc57cb2485"
+  },
+  "src/protocol/requests/addOffsetsToTxn/fixtures/java/addOffsetsToTxnRequest-v4-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "6c6e373a02a3562f95d44f09bc9edea9500e941758a8cd96673a0d65125cff4e"
+  },
+  "src/protocol/requests/addOffsetsToTxn/fixtures/java/addOffsetsToTxnResponse-v2-error.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "9117b27f476d38dc231ecb6cc61fd429e896286436397199c9db7520e0d80c6f"
+  },
+  "src/protocol/requests/addOffsetsToTxn/fixtures/java/addOffsetsToTxnResponse-v2-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "bdafac86958e52faa61e5f078fbcf83d54e73359fe08f4feb3ce85e25e121716"
+  },
+  "src/protocol/requests/addOffsetsToTxn/fixtures/java/addOffsetsToTxnResponse-v3-error.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "6e8ea0dd7dfbeff90c7499bedcba2e81621a42ae0b397bdaa11d7f67727dc929"
+  },
+  "src/protocol/requests/addOffsetsToTxn/fixtures/java/addOffsetsToTxnResponse-v3-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "de8c6599878911566d6551c12d992ddea37fda9dfee4d219c047f5f66256d7b9"
+  },
+  "src/protocol/requests/addOffsetsToTxn/fixtures/java/addOffsetsToTxnResponse-v4-error.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "0e9189609a8d6902c5971d50907526dd67b8777f4f2a7735fb5edaa32ae7952c"
+  },
+  "src/protocol/requests/addOffsetsToTxn/fixtures/java/addOffsetsToTxnResponse-v4-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "66e08b88bd43490020bc47e0f4977376dbf3d71cd5fb91b5843a4f1c8ef25310"
+  },
+  "src/protocol/requests/addPartitionsToTxn/fixtures/java/addPartitionsToTxnRequest-v2-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "987dadff049f1b3a2510da68eaa60de52eff367ddf66b13a4749518f8d14f597"
+  },
+  "src/protocol/requests/addPartitionsToTxn/fixtures/java/addPartitionsToTxnRequest-v3-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "fd61841ba91338207f164ddb7d964da90a84af90d8c32f48ccc998dc5adc3038"
+  },
+  "src/protocol/requests/addPartitionsToTxn/fixtures/java/addPartitionsToTxnResponse-v2-error.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "41139858d4f4eccb9dcdf611eb3ae23f369259434c188ef3e87e09ffa43c48ad"
+  },
+  "src/protocol/requests/addPartitionsToTxn/fixtures/java/addPartitionsToTxnResponse-v2-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "06b01e77db93b0a661da8f075eb145bf09b79caf5b44abdb62e8c059ccc0f6a7"
+  },
+  "src/protocol/requests/addPartitionsToTxn/fixtures/java/addPartitionsToTxnResponse-v3-error.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "2b1b60244199c9c647ea51d049e4f760bb0dd043445b8943fb343081be6535ff"
+  },
+  "src/protocol/requests/addPartitionsToTxn/fixtures/java/addPartitionsToTxnResponse-v3-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "622348b8f6be39f5776555490bfd1aba005f2f07a97a6d1b7133c2ea8f1f47c7"
+  },
+  "src/protocol/requests/alterClientQuotas/fixtures/java/alterClientQuotasRequest-v0-security.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "5e88292d143d5528d14c00d0065a7c8284b1e413c943f0523bca9f1320da789e"
+  },
+  "src/protocol/requests/alterClientQuotas/fixtures/java/alterClientQuotasRequest-v1-security.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "00afcdcb683380a304568b5175cc0a4f6a2937c8b2b8aaabd8c86524b95f8116"
+  },
+  "src/protocol/requests/alterClientQuotas/fixtures/java/alterClientQuotasResponse-v0-security.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "7ddec260bd0ae265ca027166b452d6947f09ca34c6f0cd1de835418ab0e0c614"
+  },
+  "src/protocol/requests/alterClientQuotas/fixtures/java/alterClientQuotasResponse-v1-security.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "1ea08fbe07080b0164bb22502effd802742432b0adb0da2a437db63436612560"
+  },
+  "src/protocol/requests/alterConfigs/fixtures/java/alterConfigsRequest-v2-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "c3b1e911617b643997355038946dc744638776ae59cca521b2345fdbd0718c38"
+  },
+  "src/protocol/requests/alterConfigs/fixtures/java/alterConfigsRequest-v2-validateOnly.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "9753f348a5372a1941fa5e275188fc3822e6aafc4dd5b1b57418340697df70d2"
+  },
+  "src/protocol/requests/alterConfigs/fixtures/java/alterConfigsResponse-v2-error.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "37dbbe224adba3d7326f6d449ce0bdf831c6a332488681ae66af0107a54e11a0"
+  },
+  "src/protocol/requests/alterConfigs/fixtures/java/alterConfigsResponse-v2-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "ea4f2f15ba0e2b02099058c375551a0eb36d9822d948546a5571955ab6a8c373"
+  },
+  "src/protocol/requests/alterPartitionReassignments/fixtures/java/alterPartitionReassignmentsRequest-v1-storage.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "6d8c5665d958792c3b45e7fad7e41959dc160b179f734f2729dddbc8cd4ce1a0"
+  },
+  "src/protocol/requests/alterPartitionReassignments/fixtures/java/alterPartitionReassignmentsResponse-v1-storage.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "6e16b17af4076b1d5396e4c8fbaf802a4e0fe602350d167a48c29731f53a3263"
+  },
+  "src/protocol/requests/alterReplicaLogDirs/fixtures/java/alterReplicaLogDirsRequest-v1-storage.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "7aef20b418dc1605ccd4207a96711599a3e27eb194d947becbd3786b43535d46"
+  },
+  "src/protocol/requests/alterReplicaLogDirs/fixtures/java/alterReplicaLogDirsRequest-v2-storage.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "2e38c5c74f843aabc6af16118fbf58a9ed7011d4f12c98a37a9e0d53623340b2"
+  },
+  "src/protocol/requests/alterReplicaLogDirs/fixtures/java/alterReplicaLogDirsResponse-v1-storage.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "487e863791ce94f369bd4b1a3b7bb92c37f4dc11411a1da6862c240e98953fab"
+  },
+  "src/protocol/requests/alterReplicaLogDirs/fixtures/java/alterReplicaLogDirsResponse-v2-storage.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "0ebd8e17bf21258269f0fe6c057c061af88ef56d3b8a62954095dfdea3c46e4e"
+  },
+  "src/protocol/requests/alterUserScramCredentials/fixtures/java/alterUserScramCredentialsRequest-v0-security.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "de4538734c6b311e4ff0560353861716a9db18acc8ef9e5ee1abcc110842882c"
+  },
+  "src/protocol/requests/alterUserScramCredentials/fixtures/java/alterUserScramCredentialsResponse-v0-security.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "064661b0f67791ae553aabef5769be43c4479222563c880425713301c1a3568d"
+  },
+  "src/protocol/requests/alterUserScramCredentials/fixtures/java/scramHi-sha256.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "66773142e4715181efd9f6e773d8da1a2ac8d3a60be9956155079a972063f06d"
+  },
+  "src/protocol/requests/alterUserScramCredentials/fixtures/java/scramHi-sha512.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "12817636b3ad41d5098904ca837a55ce74f02aeaeadb2f60e39fc1a235383334"
+  },
+  "src/protocol/requests/apiVersions/fixtures/java/apiVersionsRequest-v5-defaults.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "bc5c1cd121f325dc633422a71c0eeff2679aee33ee7f2dd151be9a4f9df62eab"
+  },
+  "src/protocol/requests/apiVersions/fixtures/java/apiVersionsRequest-v5-known.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "b6b915d7575bcf0a2ea9391c3f0a281d5182458903235511ed28269a8b72b2e0"
+  },
+  "src/protocol/requests/apiVersions/fixtures/java/apiVersionsRequest-v5-nonAscii.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "49d56f9674cbd818efc21655649ed23e6e8e73800a96af863e5acdbd2dc97a55"
+  },
+  "src/protocol/requests/apiVersions/fixtures/java/apiVersionsResponse-v0-unsupportedVersion.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "4f8fe0b76992258cf0f3dc0a2c9105f5b4e1c9644c754ee7db6144a876a55584"
+  },
+  "src/protocol/requests/apiVersions/fixtures/java/apiVersionsResponse-v5-features0.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "3137d53bc55dec024ab5d721c8142793832c02475067e25e185eda9aadb484bf"
+  },
+  "src/protocol/requests/apiVersions/fixtures/java/apiVersionsResponse-v5-ok.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "36bf620d0821c060454e1339dbedae3629166b1292f9a524e70e0ee5f7b7d6f8"
+  },
+  "src/protocol/requests/apiVersions/fixtures/java/apiVersionsResponse-v5-rebootstrapRequired.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "624177c609095f44e8a726f8400f1aab872c34bf2f1e7f7642dacabc5c0a2b3f"
+  },
+  "src/protocol/requests/apiVersions/fixtures/java/apiVersionsResponse-v5-unknownTags.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "8bc35ef4cbb5c03351d12578a49cfb34227fce09c847a5f0b4d6c3ef6ba14484"
+  },
+  "src/protocol/requests/apiVersions/fixtures/v3_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "7456e7e377682b98a1b7b9a8dd7b097a492c959966355a68dd161d0aca3e48df"
+  },
+  "src/protocol/requests/apiVersions/fixtures/v3_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "aa7420a3d4de6785bef496b473759b03bdb6e45c1cc6af9209c5dd472182f1fb"
+  },
+  "src/protocol/requests/apiVersions/fixtures/v4_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "7456e7e377682b98a1b7b9a8dd7b097a492c959966355a68dd161d0aca3e48df"
+  },
+  "src/protocol/requests/apiVersions/fixtures/v4_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "aa7420a3d4de6785bef496b473759b03bdb6e45c1cc6af9209c5dd472182f1fb"
+  },
+  "src/protocol/requests/consumerGroupDescribe/fixtures/java/consumerGroupDescribeRequest-v0-twoGroups.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "622d723700a7163d8b6d5ddabf3d0d439bac59b2d3ebf4b347c8b675fb74d187"
+  },
+  "src/protocol/requests/consumerGroupDescribe/fixtures/java/consumerGroupDescribeRequest-v1-authorizedOperations.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "e1e399d4c898086286397246c7c1aacb6590caacbe0c9b8bf098886ee3c5836e"
+  },
+  "src/protocol/requests/consumerGroupDescribe/fixtures/java/consumerGroupDescribeResponse-v0-describedGroup.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "07b8839f90a4d4c4ff2c0967e5dba02c4a7eb26b3c08cf2880bc95d9620bb7e2"
+  },
+  "src/protocol/requests/consumerGroupDescribe/fixtures/java/consumerGroupDescribeResponse-v0-groupIdNotFound.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "d059b4ec5af32769b825d9632ea24b2240066298ce50e41e69f3d07c85b6c895"
+  },
+  "src/protocol/requests/consumerGroupDescribe/fixtures/java/consumerGroupDescribeResponse-v0-mixedErrors.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "eca4ffe661e85b6874af8d572ec82a9dc11e6fb4bd6cd78e75908bdff4afcba3"
+  },
+  "src/protocol/requests/consumerGroupDescribe/fixtures/java/consumerGroupDescribeResponse-v1-memberType.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "eb9815c427733c0cdb143adcbea2acbba51a817bbb2894da6afb4848fc1fb1e4"
+  },
+  "src/protocol/requests/consumerGroupHeartbeat/fixtures/java/consumerGroupHeartbeatRequest-v0-join.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "43d0b54bef3d6df092a6e398f72b042f6d19868944030f643b6a93683de6785b"
+  },
+  "src/protocol/requests/consumerGroupHeartbeat/fixtures/java/consumerGroupHeartbeatRequest-v0-leaveDynamic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "1d1ae06051ad827372377f01d0de8dfb33741817cb7b6bacb38b3a1709efcf30"
+  },
+  "src/protocol/requests/consumerGroupHeartbeat/fixtures/java/consumerGroupHeartbeatRequest-v0-leaveStatic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "8bd7b53aea886b31aa6a941da062f71e5b645d8a85d0b9172d0f4c89658558c8"
+  },
+  "src/protocol/requests/consumerGroupHeartbeat/fixtures/java/consumerGroupHeartbeatRequest-v0-ownedPartitions.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "ee16bc63cb16f80698e509b894c2fc4f8bbf5a971acd59f51e89b3a77dd95a9e"
+  },
+  "src/protocol/requests/consumerGroupHeartbeat/fixtures/java/consumerGroupHeartbeatRequest-v0-stableMinimal.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "95bb284ee8d0fb369102a84f7d50ffb7c3fbba3aa728bea7c4164c2489ba7cd0"
+  },
+  "src/protocol/requests/consumerGroupHeartbeat/fixtures/java/consumerGroupHeartbeatRequest-v0-staticJoinWithAssignor.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "e6ccf84f220b807f0a55915ca8e125e0269688d3c8a71ccf589d75e3e5257cf4"
+  },
+  "src/protocol/requests/consumerGroupHeartbeat/fixtures/java/consumerGroupHeartbeatRequest-v1-join.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "28cbadf68a93870d4eaa0605f2adbc3e2b08cd586db64e42c0eee85b66e5c792"
+  },
+  "src/protocol/requests/consumerGroupHeartbeat/fixtures/java/consumerGroupHeartbeatRequest-v1-regexClear.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "15f25b3072930eaa8cb1949a6f18818e6735099a99e3190b796f17ae5e266097"
+  },
+  "src/protocol/requests/consumerGroupHeartbeat/fixtures/java/consumerGroupHeartbeatRequest-v1-regexSubscription.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "e85ffc12bb8614ca1f51a10cc51640f0bc8ff5406da05006eb77a500922fe1eb"
+  },
+  "src/protocol/requests/consumerGroupHeartbeat/fixtures/java/consumerGroupHeartbeatResponse-v0-assignment.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "3255035953b870ae3b9d04edbc8521cf9e9a1d6601f9d3e91dbf122b8cfe863b"
+  },
+  "src/protocol/requests/consumerGroupHeartbeat/fixtures/java/consumerGroupHeartbeatResponse-v0-emptyAssignment.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "94332769b0f35edf0e255319bd0c37cc8a1d9dcdd29e1e4f71484f2aa9c63c9e"
+  },
+  "src/protocol/requests/consumerGroupHeartbeat/fixtures/java/consumerGroupHeartbeatResponse-v0-fencedError.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "39083fb8320a2ff22105a77aea32d6e41380d856d92217b76c2b26761f3b8f32"
+  },
+  "src/protocol/requests/consumerGroupHeartbeat/fixtures/java/consumerGroupHeartbeatResponse-v0-nullAssignment.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "29164083abae5360fcd8046525cfe9619eb4c794117bae30eb8498d70c4b7674"
+  },
+  "src/protocol/requests/consumerGroupHeartbeat/fixtures/java/consumerGroupHeartbeatResponse-v1-assignment.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "4ec6e7dc722cb033fa5f14c1df4fd46c78e9be691fc516bdbcee79d06cf0d45d"
+  },
+  "src/protocol/requests/consumerGroupHeartbeat/fixtures/java/consumerGroupHeartbeatResponse-v1-emptyAssignment.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "232ce361d4455ae97f5e16eefa4316b65f70bfdd22656f20e99dc6b240b9d426"
+  },
+  "src/protocol/requests/consumerGroupHeartbeat/fixtures/java/consumerGroupHeartbeatResponse-v1-fencedError.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "9678803b391cce3028f41a36b04e2ccbd3386315dd01764a3e53b9c6846a737b"
+  },
+  "src/protocol/requests/consumerGroupHeartbeat/fixtures/java/consumerGroupHeartbeatResponse-v1-nullAssignment.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "33a31471d9b51a69e522f7bfb662bb0a344c799831b2d3073bd9576d748e0923"
+  },
+  "src/protocol/requests/createAcls/fixtures/java/createAclsRequest-v2-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "f57b6186c8092e97cebb5f7e6ec2527cca1cc8a5a202be185db5df0f771e6191"
+  },
+  "src/protocol/requests/createAcls/fixtures/java/createAclsRequest-v3-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "74949463ee7dd44fbaca2537e222549eacd4bc8be2ae695e127ec7635cf1cfa4"
+  },
+  "src/protocol/requests/createAcls/fixtures/java/createAclsRequest-v3-userResource.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "fcc31e4762fcef7b8462d7afc258d4ae0eb77948bf9aa0f3397a02ceca3cf158"
+  },
+  "src/protocol/requests/createAcls/fixtures/java/createAclsResponse-v2-error.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "e2f33f1f24f37bf73b1e57a395255d4559b75588b9ca1209c1dd487fcd4bfebf"
+  },
+  "src/protocol/requests/createAcls/fixtures/java/createAclsResponse-v2-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "130e230eea000773f057d760525e0c4ad6b0b1f7b8112e45e0f28e1bb91d5fa3"
+  },
+  "src/protocol/requests/createAcls/fixtures/java/createAclsResponse-v3-error.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "c7954efea361917917b2b624b82f753dee4e17713eb5a2e8f05ed9c8e7bdd576"
+  },
+  "src/protocol/requests/createAcls/fixtures/java/createAclsResponse-v3-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "4887a20f9a1ccda9acd36c02c953cfcf6d5817f62c0ae8ebcf12bf0e41cd586d"
+  },
+  "src/protocol/requests/createDelegationToken/fixtures/java/createDelegationTokenRequest-v1-security.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "ec7fe57a9b3c2848df56f8ad9ece61b93f0cbbde9dc6922ceaff35975bbc158a"
+  },
+  "src/protocol/requests/createDelegationToken/fixtures/java/createDelegationTokenRequest-v2-security.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "7e52069d5396a14d6fdefff1862056bd43840924370af59722d6bde1792f6cbb"
+  },
+  "src/protocol/requests/createDelegationToken/fixtures/java/createDelegationTokenRequest-v3-security.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "4ff2ffa78067010129a401811332e870da59e458ca9bb2b440a6bf885eeabfcc"
+  },
+  "src/protocol/requests/createDelegationToken/fixtures/java/createDelegationTokenResponse-v1-security.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "49c5e376fe568c759e477621f62ad634fa12355fdb564a1bf59211a2af25c6dd"
+  },
+  "src/protocol/requests/createDelegationToken/fixtures/java/createDelegationTokenResponse-v2-security.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "62cbedefc6ab6d666d8ab3c130762e64bc641c253e93a6062d6ed511a7408cd7"
+  },
+  "src/protocol/requests/createDelegationToken/fixtures/java/createDelegationTokenResponse-v3-security.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "21e4ef84b770c13729253502216f66583cd3ebe04ce4a6493cfa59cb2957ba69"
+  },
+  "src/protocol/requests/createPartitions/fixtures/java/createPartitionsRequest-v2-assignments.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "fb0f875a4ac6e06660670fa361161c8f105e48e40238a8b88bebcd473080a97e"
+  },
+  "src/protocol/requests/createPartitions/fixtures/java/createPartitionsRequest-v2-explicitEmptyAssignments.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "9577c2693ba783afbcc133f842116299487ab9d22e8c5e60b03abea3782e688b"
+  },
+  "src/protocol/requests/createPartitions/fixtures/java/createPartitionsRequest-v2-noAssignments.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "babc804c3ccc66889ea13187aba3e34b165e601b5d15e33fe6aca839a176907f"
+  },
+  "src/protocol/requests/createPartitions/fixtures/java/createPartitionsRequest-v3-assignments.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "6e37198a84b04d27ec22176571898a448ce082945da11cf9924d5bcd5f78b197"
+  },
+  "src/protocol/requests/createPartitions/fixtures/java/createPartitionsRequest-v3-explicitEmptyAssignments.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "0aaaffb9076894168d4fd06b090beee593cfe92dc28e04e81a7bfbc7f5ecf6e8"
+  },
+  "src/protocol/requests/createPartitions/fixtures/java/createPartitionsRequest-v3-noAssignments.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "e85250d2f0679ccb4d92ea84b877e405a2b669cf9542a58d64f0b1ba78e14457"
+  },
+  "src/protocol/requests/createPartitions/fixtures/java/createPartitionsResponse-v2-error.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "a5fdf83c01fb6ed366c0fd1cda3e4785304aee828e47c547142a8170a29e79a3"
+  },
+  "src/protocol/requests/createPartitions/fixtures/java/createPartitionsResponse-v2-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "a39fadfa0124ee304c551f6fcc50ab9d23486b33304abf778b3bc2539cb1b8c3"
+  },
+  "src/protocol/requests/createPartitions/fixtures/java/createPartitionsResponse-v3-error.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "b2fa4e577dcb6a90854bbb554ba8a7d39cbe6ddff4f76405541a389f37da688d"
+  },
+  "src/protocol/requests/createPartitions/fixtures/java/createPartitionsResponse-v3-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "5f396f970045b69bad70c7f5090894d00a0b0b317b81a38deb28b6375dbd31bb"
+  },
+  "src/protocol/requests/createTopics/fixtures/java/createTopicsRequest-v4-assigned.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "e7146ab0634db4c61c8f4714d6b3cd4406013efd0aa51c03d1262c4f1701ef3b"
+  },
+  "src/protocol/requests/createTopics/fixtures/java/createTopicsRequest-v4-defaults.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "d5863c3236f74dbc2a4f1a0b245bb7272555cdb9b330a7e45e12efde7c6876bf"
+  },
+  "src/protocol/requests/createTopics/fixtures/java/createTopicsRequest-v4-explicit.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "74234fc1e43dd264bfc9970b5052d2673808a188ecc7c71da518dfe750c2351b"
+  },
+  "src/protocol/requests/createTopics/fixtures/java/createTopicsRequest-v5-assigned.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "c48f74798dcc5d3c50e7c09eb23e076344cad955151ef4eca4ea47ea811e785d"
+  },
+  "src/protocol/requests/createTopics/fixtures/java/createTopicsRequest-v5-defaults.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "21a01eb16b7999e21b2a83754ed13e031d5a79526062c762b95f0f0bbc60b0e9"
+  },
+  "src/protocol/requests/createTopics/fixtures/java/createTopicsRequest-v5-explicit.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "2bcc74795e9ff5529aeb146ef633c0bbe06a505915328c5703df20a4aed7f07f"
+  },
+  "src/protocol/requests/createTopics/fixtures/java/createTopicsRequest-v6-assigned.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "6fa4fbe26679a7a0a9f86109ae4417f6fbed6cc317898dde9d2cce94d641984a"
+  },
+  "src/protocol/requests/createTopics/fixtures/java/createTopicsRequest-v6-defaults.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "5836ea1c8d2b695c81740d17c8a69e00681c3e44c8d53aaab3c33aeafc2b97e8"
+  },
+  "src/protocol/requests/createTopics/fixtures/java/createTopicsRequest-v6-explicit.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "91e58a20a31dd89f00ce63132090c88e07daf6c9372df73aefbeab8f5c5fef19"
+  },
+  "src/protocol/requests/createTopics/fixtures/java/createTopicsRequest-v7-assigned.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "71c2ae856f8bb706187fc40920286a36035705e3db9599b85eb88e6d06a7f01b"
+  },
+  "src/protocol/requests/createTopics/fixtures/java/createTopicsRequest-v7-defaults.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "8bf5f46a6a43f67e4a3d4898f5bb1feb6017d3889f6c20553dbe4823d46c6a2e"
+  },
+  "src/protocol/requests/createTopics/fixtures/java/createTopicsRequest-v7-explicit.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "e95d34501c4630c3bededb9cf8eed6681fa64b3f6a76c1bde7388870fa6d3515"
+  },
+  "src/protocol/requests/createTopics/fixtures/java/createTopicsResponse-v4-error.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "a4379f9390a013ecd63aa164c5821b19cb85869a917881c0fdae33f7209f98cd"
+  },
+  "src/protocol/requests/createTopics/fixtures/java/createTopicsResponse-v4-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "3a3e7771d0aaa2e855a50a4f96e7252a1244727d3f23deb5de212e26e372eafb"
+  },
+  "src/protocol/requests/createTopics/fixtures/java/createTopicsResponse-v5-error.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "9b33fb62ded08bab51693f1a00a7c82cde9ae18690ec6db93f216adbba20d52a"
+  },
+  "src/protocol/requests/createTopics/fixtures/java/createTopicsResponse-v5-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "86cd2dbd4b552fc23ae1d31c6e20cc3f147682d128b0894a8f0f841e3368b513"
+  },
+  "src/protocol/requests/createTopics/fixtures/java/createTopicsResponse-v5-topicConfigError.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "c84ff5ba90d4b956e12e0a61d0d8b21b062990c3eeef107ccb3c0ff8fa183edc"
+  },
+  "src/protocol/requests/createTopics/fixtures/java/createTopicsResponse-v6-error.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "e3340a8ff6568da0d21046d19344e006e319acef15d16f49c38fb9f86ce06adc"
+  },
+  "src/protocol/requests/createTopics/fixtures/java/createTopicsResponse-v6-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "d1a7946521f31390889010879d862b980347cc333ebd0ceba5dac228151c9f3d"
+  },
+  "src/protocol/requests/createTopics/fixtures/java/createTopicsResponse-v6-topicConfigError.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "8ca20179f9a8738a86e4049811d17d57097bc622c91ac759eaa13521db98aaf7"
+  },
+  "src/protocol/requests/createTopics/fixtures/java/createTopicsResponse-v7-error.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "981d001cc41293fc777b9db179ee07221cc644e8a356a02c11a0fd0307e808d2"
+  },
+  "src/protocol/requests/createTopics/fixtures/java/createTopicsResponse-v7-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "c91c96c5abdd888f00126393254df45eaa3ffae52b46f43c13e4db2073281b45"
+  },
+  "src/protocol/requests/createTopics/fixtures/java/createTopicsResponse-v7-topicConfigError.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "5b9e4074e6cf281ea71dd396377b865d72ef2d19c2e78c9cf01a217b9d0b22b7"
+  },
+  "src/protocol/requests/deleteAcls/fixtures/java/deleteAclsRequest-v2-anyFilter.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "1df4d11b4fae95696334365508f028aa3006de9a61ede6d432ba14fc3103d0df"
+  },
+  "src/protocol/requests/deleteAcls/fixtures/java/deleteAclsRequest-v2-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "206f0f839bd1fc55cf5b7d33cb2a680f8fbedaabe6b22673adda88e59c50b41a"
+  },
+  "src/protocol/requests/deleteAcls/fixtures/java/deleteAclsRequest-v3-anyFilter.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "426ded6bfb593df6d33c262e39f62f09e97f5919adeb860062e897b0fdf7cadc"
+  },
+  "src/protocol/requests/deleteAcls/fixtures/java/deleteAclsRequest-v3-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "c07ca2462b2cf172f752f9101d41b681afbc82b97675937dfef1b9e18bdca7da"
+  },
+  "src/protocol/requests/deleteAcls/fixtures/java/deleteAclsRequest-v3-userResource.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "1ff64a0d73db057a925ff5538b7eecb5a898985b6c02485f8d9968a26dc5211b"
+  },
+  "src/protocol/requests/deleteAcls/fixtures/java/deleteAclsResponse-v2-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "5fbf8d6a5971320737a35f24a92d0a15b92728b36791310e46f8b011331b7e62"
+  },
+  "src/protocol/requests/deleteAcls/fixtures/java/deleteAclsResponse-v3-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "c51fd96b964e79794a3f8b14910559016bdef61502b355e74545b5fcafa45567"
+  },
+  "src/protocol/requests/deleteAcls/fixtures/java/deleteAclsResponse-v3-userResource.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "859873f64429f2c75ca8f10c476e57f7a1a20fe7a635299acee892011e460b6f"
+  },
+  "src/protocol/requests/deleteGroups/fixtures/java/deleteGroupsRequest-v2-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "10319da04719b06ca3985ed0b904d60b1467af4646d5f35f0be6582af9189994"
+  },
+  "src/protocol/requests/deleteGroups/fixtures/java/deleteGroupsRequest-v3-basic.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "33cf874517a0b5a8219a17bd1fb2313446ab9047fcad3bf01034db81ec079ba9"
+  },
+  "src/protocol/requests/deleteGroups/fixtures/java/deleteGroupsRequest-v3-empty.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "72e93eb8fbe47f14189136a4f932bd8bfe0b9cfe5edde01692cae0f6c350a4cb"
+  },
+  "src/protocol/requests/deleteGroups/fixtures/java/deleteGroupsRequest-v3-nonAscii.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "3b78a0700f3a341f772a4abcf0210c5652c6ba366db5050e3f816202faa55ae7"
+  },
+  "src/protocol/requests/deleteGroups/fixtures/java/deleteGroupsResponse-v2-error.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "a36a191749dc68dd04143b0b745a7508e3972f84b8473194c4a09f5d44a3883b"
+  },
+  "src/protocol/requests/deleteGroups/fixtures/java/deleteGroupsResponse-v2-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "43c423ee93a0193d387d55847976c595be77ec5030a633e7605f73afbb8d0288"
+  },
+  "src/protocol/requests/deleteGroups/fixtures/java/deleteGroupsResponse-v3-error.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "8e666266d447ff10f000eee7834621409f26c225faac2d65eeba890272b6739a"
+  },
+  "src/protocol/requests/deleteGroups/fixtures/java/deleteGroupsResponse-v3-mixedOutcomes.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "24e7cd0d788f232fa0d95e64d5836dc5f5da962c35c765060ff17522ba5d5dcc"
+  },
+  "src/protocol/requests/deleteGroups/fixtures/java/deleteGroupsResponse-v3-noResults.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "044b7d633a04badd3f3576bcab72e9c5baf6c672b1ee2bfbe50b57747b88f801"
+  },
+  "src/protocol/requests/deleteGroups/fixtures/java/deleteGroupsResponse-v3-nonAscii.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "1507d345f5d69719a98e3cc3606c93f79df40fe31d180a22d99ccd768c489491"
+  },
+  "src/protocol/requests/deleteGroups/fixtures/java/deleteGroupsResponse-v3-nullEmptyNonempty.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "3e1aba61b142368553e9e61a612edd5c8fcbb800545f1d95bb066ab9c83ee087"
+  },
+  "src/protocol/requests/deleteGroups/fixtures/java/deleteGroupsResponse-v3-ok.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "18f4b3ff89db77443818fa3c002be479652303fc20fafec76808658afc1c3806"
+  },
+  "src/protocol/requests/deleteGroups/fixtures/java/deleteGroupsResponse-v3-unknownTags.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "3d982fda2a29d77d93f2c34c8b70249f28fe2282354f7d58da0da44ad7faaffb"
+  },
+  "src/protocol/requests/deleteRecords/fixtures/java/deleteRecordsRequest-v2-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "6a4cf496239d4ccaba71b126440fef1685d7f0ea472d7b188ff74d1d56dcdc66"
+  },
+  "src/protocol/requests/deleteRecords/fixtures/java/deleteRecordsResponse-v2-error.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "52142163e0d74d4293f519d5c8cc93502f06c6061708d4f15c5f965a9aeda62a"
+  },
+  "src/protocol/requests/deleteRecords/fixtures/java/deleteRecordsResponse-v2-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "a998fd4a332035d0132dafb1e64c36a725031dae2526081d8e6eb49b7f99f6bf"
+  },
+  "src/protocol/requests/deleteTopics/fixtures/java/deleteTopicsRequest-v2-names.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "451a937d967bd43dd5f4a96c55bf18fd4f7938d50e4e1ebd04c5441ec969faf7"
+  },
+  "src/protocol/requests/deleteTopics/fixtures/java/deleteTopicsRequest-v3-names.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "dac559994746c2bdca712c090dc7835bb09ccc5b88b6bd5d3e4fab7a5cf1c1af"
+  },
+  "src/protocol/requests/deleteTopics/fixtures/java/deleteTopicsRequest-v4-names.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "97c9c4beb91b5dbb606b20cca757330439af7e2364691c3441fdfde9a14bdc83"
+  },
+  "src/protocol/requests/deleteTopics/fixtures/java/deleteTopicsRequest-v5-names.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "23d76252a279389391cedaf305c6f71dfa1fc24e295f781cf706e513d8a50fbe"
+  },
+  "src/protocol/requests/deleteTopics/fixtures/java/deleteTopicsRequest-v6-byName.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "f746e47b24ee595a6c1821ce3e56dc428337f78081643c7ebfaa6f19812a6844"
+  },
+  "src/protocol/requests/deleteTopics/fixtures/java/deleteTopicsRequest-v6-storage.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "833c3a92c64251d9aae1c40c5b70a7719b075cc31da64f035f77ad8ba4d2b432"
+  },
+  "src/protocol/requests/deleteTopics/fixtures/java/deleteTopicsResponse-v2-error.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "1277a7f0fcd0f6ed5526646a419fb9af40bf56bbdaa817704826b428051bf7a0"
+  },
+  "src/protocol/requests/deleteTopics/fixtures/java/deleteTopicsResponse-v2-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "3451565cc06e4a5e1396632c4a86904fe6a45362e093a0b61ce11c1554516742"
+  },
+  "src/protocol/requests/deleteTopics/fixtures/java/deleteTopicsResponse-v3-deletionDisabled.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "c2a8bf933dff3989ea96dbea5f16e28a7a5b0c483d3e984c73e6dea093cfdec4"
+  },
+  "src/protocol/requests/deleteTopics/fixtures/java/deleteTopicsResponse-v3-error.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "eaf9ab1198d82e0b3902c5f482463b2ad71aa89fe2329c1e7fa98dce51294ba0"
+  },
+  "src/protocol/requests/deleteTopics/fixtures/java/deleteTopicsResponse-v3-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "191e9ebce1df1dd973a4fb366870c5309bc0bcad8b9630075bc1ecc5504b50ac"
+  },
+  "src/protocol/requests/deleteTopics/fixtures/java/deleteTopicsResponse-v4-deletionDisabled.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "718104e8ae3ce8cb5e73a8e3d0b1365ac72179561bfe336e2b45b731f0256cd1"
+  },
+  "src/protocol/requests/deleteTopics/fixtures/java/deleteTopicsResponse-v4-error.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "2a963712ca38b6c67a82cd9223cd0b087fb9e486d352ac12a880d3709a085b00"
+  },
+  "src/protocol/requests/deleteTopics/fixtures/java/deleteTopicsResponse-v4-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "fb47522d9a2f8b973041ed0770ce7988f93e5e26c1c347ac327e394cc0440a62"
+  },
+  "src/protocol/requests/deleteTopics/fixtures/java/deleteTopicsResponse-v5-deletionDisabled.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "1b272fcff98c95fb87dd514f666a8fb069e8bd6bebfdf9e5a1e42e81467c802c"
+  },
+  "src/protocol/requests/deleteTopics/fixtures/java/deleteTopicsResponse-v5-error.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "560e7475a4ee8a6d4d0e20a7c39e1470adefabf31ac5dbe00bb3c02e888711d9"
+  },
+  "src/protocol/requests/deleteTopics/fixtures/java/deleteTopicsResponse-v5-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "ffdf618e19c0d00f5f39f533c5adc910ecfdd1993238ea3fdb6202f45841e7c7"
+  },
+  "src/protocol/requests/deleteTopics/fixtures/java/deleteTopicsResponse-v6-deletionDisabled.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "a17f12fbdf8e306dac5cf8eb7f2c58c3f1de402e9fe3854d5f0b892863f9b06b"
+  },
+  "src/protocol/requests/deleteTopics/fixtures/java/deleteTopicsResponse-v6-error.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "b43392a0941357a01df929e84635ab52aadf0e7d13c12a78d1f567d61d315bd4"
+  },
+  "src/protocol/requests/deleteTopics/fixtures/java/deleteTopicsResponse-v6-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "2cf411104f57559bdaf4b508c40fecf6e7f5ff4192136398691d43b9d177e045"
+  },
+  "src/protocol/requests/deleteTopics/fixtures/java/deleteTopicsResponse-v6-storage.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "0149961c1c120b5de9a0c57789b89d479af5f14576085a9b71e4be2bbda9f77d"
+  },
+  "src/protocol/requests/describeAcls/fixtures/java/describeAclsRequest-v2-anyFilter.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "9de6398ef7e64a984aa748ae433cd49170359f7571e457c412c884a359dc09b8"
+  },
+  "src/protocol/requests/describeAcls/fixtures/java/describeAclsRequest-v2-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "a4e89455a0aaa5a6ee1c83476c9929f9e07d62ad58416ac865ea7caceb7a6cfc"
+  },
+  "src/protocol/requests/describeAcls/fixtures/java/describeAclsRequest-v3-anyFilter.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "a531c78be77e1a4b506398ef25f8927a1c17b07fb268e5ac645af4903fbc019b"
+  },
+  "src/protocol/requests/describeAcls/fixtures/java/describeAclsRequest-v3-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "adfa6869fcfef44fd917498da270fb7cd76bdb5d7b934f74444123031b839b88"
+  },
+  "src/protocol/requests/describeAcls/fixtures/java/describeAclsRequest-v3-userResource.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "830899132ee6b4889dfc61a362354cef8bae50419b61ed6177eb9a6bdf3ad665"
+  },
+  "src/protocol/requests/describeAcls/fixtures/java/describeAclsResponse-v2-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "74cd0dd7fdf25cdbf96618b0f9e994ce50ff9d3ca1f7ad74187dc8640f13cbf2"
+  },
+  "src/protocol/requests/describeAcls/fixtures/java/describeAclsResponse-v3-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "2597b441954e86e7a0d5380783e4d5aaf41b4ba05d0b91c10c14655ac2ac92a0"
+  },
+  "src/protocol/requests/describeAcls/fixtures/java/describeAclsResponse-v3-userResource.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "07e0b824066b5c7e73fb8f5ee458f71319be54c21f421b118c2ecccce8286792"
+  },
+  "src/protocol/requests/describeClientQuotas/fixtures/java/describeClientQuotasRequest-v0-security.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "8cf58a3a2c33ea81fa257482ed85585f0b98c7473c82e7e22e3a42506ab96bb3"
+  },
+  "src/protocol/requests/describeClientQuotas/fixtures/java/describeClientQuotasRequest-v1-security.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "e690a27ed13d84fc4406b4e34a5b1d61ccc9198e09abd8bfca51b4ed337f9cfd"
+  },
+  "src/protocol/requests/describeClientQuotas/fixtures/java/describeClientQuotasResponse-v0-security.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "94136313e90755bdc920be44449941adc9eff5325d0ac1154e6fc2a0c042de81"
+  },
+  "src/protocol/requests/describeClientQuotas/fixtures/java/describeClientQuotasResponse-v1-security.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "c70e68c911dcb365062f93e022248fc9c92b5bd81187916706ddd34458cbd554"
+  },
+  "src/protocol/requests/describeCluster/fixtures/java/describeClusterRequest-v0-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "0a05c85d0449c4c7e74b870ee0fc637eef71f47390135bff03346093a2c02325"
+  },
+  "src/protocol/requests/describeCluster/fixtures/java/describeClusterRequest-v1-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "ff53f3c2a90f2187fb57556a2371f5f9a23268528d34fb1108179915c773f1e1"
+  },
+  "src/protocol/requests/describeCluster/fixtures/java/describeClusterRequest-v2-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "83d961b74c790175505defd96b7ed4c6018e292d0bd8a08f85cd3917a1a14f29"
+  },
+  "src/protocol/requests/describeCluster/fixtures/java/describeClusterResponse-v0-mixed.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "801dd48c89701f2b2b67a778c5955b1e3d00ba4a68dedb32c7fa0062f5354d7b"
+  },
+  "src/protocol/requests/describeCluster/fixtures/java/describeClusterResponse-v1-mixed.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "6b7bc3df2426478b7e7003f821bee9f862ba3103297909b9980b9e8052d97780"
+  },
+  "src/protocol/requests/describeCluster/fixtures/java/describeClusterResponse-v2-mixed.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "2e28fe72ee3e71a1c6ca89d2fbdabbab7ec5097dc05caa7ad003a9145c3eeb8f"
+  },
+  "src/protocol/requests/describeConfigs/fixtures/java/describeConfigsRequest-v3-allKeys.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "c5a4915727acec22186d9cf160645e29c6e557c8a1307cf789c729a75ffa285f"
+  },
+  "src/protocol/requests/describeConfigs/fixtures/java/describeConfigsRequest-v3-includeDocumentation.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "3175ac5c223170f52d58f596ae9303202e54bfbac32a410c53800cf48db1a85b"
+  },
+  "src/protocol/requests/describeConfigs/fixtures/java/describeConfigsRequest-v3-keys.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "a3e383ed69b6d394a4e7526b61de3e6bf4efcd2c7d413a7b7d0f47fb588c67f7"
+  },
+  "src/protocol/requests/describeConfigs/fixtures/java/describeConfigsRequest-v3-noSynonyms.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "8492e7c9e39096457c04af97b9ea12984cf488f827923150387065f5a4840150"
+  },
+  "src/protocol/requests/describeConfigs/fixtures/java/describeConfigsRequest-v4-allKeys.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "ad6029f659d1b1f6cfcae18722092d4284450391b9bfa8c273c0b8de1b1cff5f"
+  },
+  "src/protocol/requests/describeConfigs/fixtures/java/describeConfigsRequest-v4-includeDocumentation.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "3925b69b76877bfc0e941960fb50ac1a2da88f51ae4adcb778d46721bdf8f651"
+  },
+  "src/protocol/requests/describeConfigs/fixtures/java/describeConfigsRequest-v4-keys.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "d98c06bd67d26cedddeb1b16cd1d77f3ec31b7c0833016d8b352edacd298cadc"
+  },
+  "src/protocol/requests/describeConfigs/fixtures/java/describeConfigsRequest-v4-noSynonyms.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "56e235e2ac7cb933cb9b003723629e149ff307d8307d0d23e72586802a1dd5f2"
+  },
+  "src/protocol/requests/describeConfigs/fixtures/java/describeConfigsResponse-v3-entries.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "7a33f9598f9d40552554b0ca0724a6e29f3a585e7debe964b9535c7c93072d6c"
+  },
+  "src/protocol/requests/describeConfigs/fixtures/java/describeConfigsResponse-v4-entries.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "82b1aaa2a6a974c53d0357e3c974467367b7cb0097405c08e4625e6494216d86"
+  },
+  "src/protocol/requests/describeDelegationToken/fixtures/java/describeDelegationTokenRequest-v1-security.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "43fa8d57f69efe81f132342978b0958741e036172311de91527af1b857b06784"
+  },
+  "src/protocol/requests/describeDelegationToken/fixtures/java/describeDelegationTokenRequest-v2-security.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "ebfe5700687a5e124115f19a5d4d79dd991685cd233c8f4fdf4d5e4a266b1fc9"
+  },
+  "src/protocol/requests/describeDelegationToken/fixtures/java/describeDelegationTokenRequest-v3-security.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "60ad66e47665e50feeedd419aff4084a1d887a7587aa52e49ce4ce5b9f9c4d03"
+  },
+  "src/protocol/requests/describeDelegationToken/fixtures/java/describeDelegationTokenResponse-v1-security.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "c751f0df13d92bf04bdc210a2fa1d4470142ea8d4b07a6ac6633f5a4d8ebc39b"
+  },
+  "src/protocol/requests/describeDelegationToken/fixtures/java/describeDelegationTokenResponse-v2-security.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "f53420659ff5727ea2ae3d0143841b6363d2d846528344cb8810d18feab34dba"
+  },
+  "src/protocol/requests/describeDelegationToken/fixtures/java/describeDelegationTokenResponse-v3-security.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "4b97b414d8d2680d55f7e6adab39f179433f1b949cff57075295ad8afdae01cc"
+  },
+  "src/protocol/requests/describeGroups/fixtures/java/describeGroupsRequest-v3-oneGroup.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "86be56373335daf84b1218239c148d8f63167c7fb35b7e5f8fca3a9d1757bd07"
+  },
+  "src/protocol/requests/describeGroups/fixtures/java/describeGroupsRequest-v4-oneGroup.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "84ffc2232dac4376cb77e2dff8babaf64ecf14717b731d0536558dc75ddc48df"
+  },
+  "src/protocol/requests/describeGroups/fixtures/java/describeGroupsRequest-v5-oneGroup.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "873437ff50d68cc699469d9fde483f2bea092874a185bba856b527575be10b0b"
+  },
+  "src/protocol/requests/describeGroups/fixtures/java/describeGroupsRequest-v6-oneGroup.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "b60300deeebe7c23a6c20e929d647740e581177f6170c2646c347d01eb04dd47"
+  },
+  "src/protocol/requests/describeGroups/fixtures/java/describeGroupsResponse-v3-describedGroup.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "6b1e2ce5ef68793672ea2d539becbbae98c399ac167a94e907394526245419f5"
+  },
+  "src/protocol/requests/describeGroups/fixtures/java/describeGroupsResponse-v4-describedGroup.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "36fd36a1a5b9068d1a89ef8a8462aedb2a54077413810bd94eeff52330510641"
+  },
+  "src/protocol/requests/describeGroups/fixtures/java/describeGroupsResponse-v5-describedGroup.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "edce2772b49f5ef8db1a4c516877b1f38e94096bc32050b6872c40cd8543b018"
+  },
+  "src/protocol/requests/describeGroups/fixtures/java/describeGroupsResponse-v6-describedGroup.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "83ec71e9aadc3a2379fed9a9ebeebbecfc9235c85e29546af2aa399bb8026d60"
+  },
+  "src/protocol/requests/describeGroups/fixtures/java/describeGroupsResponse-v6-groupIdNotFound.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "103de1d7fe8492ecce9a9b7423ef3090db607fcb97d30e5b9ac91529761ff5fb"
+  },
+  "src/protocol/requests/describeLogDirs/fixtures/java/describeLogDirsRequest-v1-storage.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "6adc415e5857338e998d281aa7e80dcb00d54c70b50da3cf407e49268094d481"
+  },
+  "src/protocol/requests/describeLogDirs/fixtures/java/describeLogDirsRequest-v2-storage.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "e25215a79cdbc2812083724f00dfb862d6c09c7cacc1dd3e70d7baa539fa566e"
+  },
+  "src/protocol/requests/describeLogDirs/fixtures/java/describeLogDirsRequest-v3-storage.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "4eab322f4f1b43d1e9371f09ad5184d3ed6e70d4252b8ddbcbb41f0d4ab522e7"
+  },
+  "src/protocol/requests/describeLogDirs/fixtures/java/describeLogDirsRequest-v4-storage.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "366fb7a36e407237c078b8d7302edae438221606045e0caca558a65c62b335d3"
+  },
+  "src/protocol/requests/describeLogDirs/fixtures/java/describeLogDirsRequest-v5-storage.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "103737e1bd3359c508823531cd3b5d391bdd8f7f386ad4bb98d0f3876c0dd67b"
+  },
+  "src/protocol/requests/describeLogDirs/fixtures/java/describeLogDirsResponse-v1-storage.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "052f241b5852e83ab5f0f8a935be2cca49c15277d46340d259c3fc43d6f2246c"
+  },
+  "src/protocol/requests/describeLogDirs/fixtures/java/describeLogDirsResponse-v2-storage.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "959c55453ebb06a3cb01fa2a1c0b0b98ad816f0c248123c08883063332b38615"
+  },
+  "src/protocol/requests/describeLogDirs/fixtures/java/describeLogDirsResponse-v3-storage.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "9aa001cbdf9d3d6f2f03593ca3fa7ac734aca0a2464c70f5cd7e765799e2f793"
+  },
+  "src/protocol/requests/describeLogDirs/fixtures/java/describeLogDirsResponse-v4-storage.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "020e902894cfc1252a3697fba401d135b84f1bcf53c6269427faa7f63eed9ee6"
+  },
+  "src/protocol/requests/describeLogDirs/fixtures/java/describeLogDirsResponse-v5-storage.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "9c63247f50d7126f3134dc8325e6395ef64218940c482f82ed8bd1c2a7640af0"
+  },
+  "src/protocol/requests/describeProducers/fixtures/java/describeProducersRequest-v0-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "39bd3a29677228228f7bd7a6d489808984d3ede3821ef8872d1f3d8c182871de"
+  },
+  "src/protocol/requests/describeProducers/fixtures/java/describeProducersResponse-v0-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "d989c80f8a0b19630060fa924e60b8771e1a013bb45c493e172a30b2c4c3411b"
+  },
+  "src/protocol/requests/describeTopicPartitions/fixtures/java/describeTopicPartitionsRequest-v0-cursor.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "404be23a140f86b6617004d4f33f0261823c15a3145846aa6b86d3aa04cde3ed"
+  },
+  "src/protocol/requests/describeTopicPartitions/fixtures/java/describeTopicPartitionsRequest-v0-noCursor.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "a9f11a9599fa9bd5607c062f608eb4f628a055c64da4b6e97260f9da4b09f2c7"
+  },
+  "src/protocol/requests/describeTopicPartitions/fixtures/java/describeTopicPartitionsResponse-v0-elrEmpty.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "b4f3406dfe179fa695eaa4192697218c6f495ed72da63cb6bfa40a0d26db1b2f"
+  },
+  "src/protocol/requests/describeTopicPartitions/fixtures/java/describeTopicPartitionsResponse-v0-elrNull.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "3b730d19bfef13d0b7a2b9ae949c500fd999f38e9cfa09da253f506b2ef01a45"
+  },
+  "src/protocol/requests/describeTopicPartitions/fixtures/java/describeTopicPartitionsResponse-v0-elrPopulated.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "9e12c297e291528ea96b58ac480a5363dcc4fb4ad656ef5f73b567e6bdf53dfe"
+  },
+  "src/protocol/requests/describeTopicPartitions/fixtures/java/describeTopicPartitionsResponse-v0-nextCursor.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "b14aac328a14da15f17dbae861c3ade09eb193f70d73181c02d189d9c35fec7f"
+  },
+  "src/protocol/requests/describeTopicPartitions/fixtures/java/describeTopicPartitionsResponse-v0-noNextCursor.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "97a342d776ac45ddf365b3416c3eb6be62d4982bd3d0d97b5fc4f4a56c4da6de"
+  },
+  "src/protocol/requests/describeTopicPartitions/fixtures/java/describeTopicPartitionsResponse-v0-unauthorizedZeroId.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "7059c3bc8d91499552f2f8a288a329876122a2a01e255ef5ce14d633ed2c6235"
+  },
+  "src/protocol/requests/describeTransactions/fixtures/java/describeTransactionsRequest-v0-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "e9e92fa5ac54bb067d59baf286f14d932ce04716a408a8367e62837ace65bc50"
+  },
+  "src/protocol/requests/describeTransactions/fixtures/java/describeTransactionsResponse-v0-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "9d24c9f26ec43d6b39c5b569e766ebda32a28ef501a0c4fc9f424088658a74cf"
+  },
+  "src/protocol/requests/describeUserScramCredentials/fixtures/java/describeUserScramCredentialsRequest-v0-security.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "0e0c5911f61182a210b12bc45e8835493a482887516f7262f85acf7bf783df1b"
+  },
+  "src/protocol/requests/describeUserScramCredentials/fixtures/java/describeUserScramCredentialsResponse-v0-security.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "d1d9c3db1b99cd2722db33688566672fbfbffb8a5d9e2200b219f9b405444c85"
+  },
+  "src/protocol/requests/electLeaders/fixtures/java/electLeadersRequest-v0-all.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "a661113846d8da1d44057eab40e732f7b32ac7e92019c9960b7af8370922ae48"
+  },
+  "src/protocol/requests/electLeaders/fixtures/java/electLeadersRequest-v0-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "47d3d7b70432245565f4d389b0c40e1fb16a4f74fe77d043dea91c91a6822836"
+  },
+  "src/protocol/requests/electLeaders/fixtures/java/electLeadersRequest-v1-all.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "3fb22869c3f9ccd8577e84c4e98a6f6269845e87e28d6c7c299225ed92dbf119"
+  },
+  "src/protocol/requests/electLeaders/fixtures/java/electLeadersRequest-v1-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "0d805812d85afc8baa529a2c1e4232baad4e19c91e0082c3f24909533d581081"
+  },
+  "src/protocol/requests/electLeaders/fixtures/java/electLeadersRequest-v2-all.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "b3cbfe9cc54a544c22b5af5f24a36520b4abb2417c315b2fd3575b7415a0fe3d"
+  },
+  "src/protocol/requests/electLeaders/fixtures/java/electLeadersRequest-v2-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "443e3d20644d7047b51bc283fb7ac280e8f438d1d1c83c9c5f3ddff8f9c1be01"
+  },
+  "src/protocol/requests/electLeaders/fixtures/java/electLeadersResponse-v0-mixed.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "cdd90328fdc13228ab69f6de0a52678cec68205ddac03387e7187b4800f9a8e1"
+  },
+  "src/protocol/requests/electLeaders/fixtures/java/electLeadersResponse-v1-mixed.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "fb922d713f21fcda63ac99dbf73b0e4e505e1a769d3b09bb47dfc35ea62fd708"
+  },
+  "src/protocol/requests/electLeaders/fixtures/java/electLeadersResponse-v2-mixed.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "a3c8e59ccdf60230af2ae1333887b0aecbcadf53255cc3ab34bee633bb4768f1"
+  },
+  "src/protocol/requests/endTxn/fixtures/java/endTxnRequest-v2-abort.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "f3171ae1768a6170e8381ac0262a02c37b17b110c02f53de472783b47ce9eb6f"
+  },
+  "src/protocol/requests/endTxn/fixtures/java/endTxnRequest-v2-commit.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "6b37000195345b4c09f8ccd924110bc5abf49b9fdcc25916af6628f5dadf82d3"
+  },
+  "src/protocol/requests/endTxn/fixtures/java/endTxnRequest-v3-abort.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "aa2566ea5c2cc1d8f85aa94af1572694806990003a2a6615a1b46200d600377b"
+  },
+  "src/protocol/requests/endTxn/fixtures/java/endTxnRequest-v3-commit.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "4650793ba86f53102e0242618a8f8e0357fb74e85133b43e2263fadd5db6925a"
+  },
+  "src/protocol/requests/endTxn/fixtures/java/endTxnRequest-v4-abort.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "91d4b7fe068d99ba4c37ad63535cb2f724d71350d5988eff3a013a868ff342ab"
+  },
+  "src/protocol/requests/endTxn/fixtures/java/endTxnRequest-v4-commit.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "418326289a457022a9edaa61f7178757ef8940e3ed0bc8b8d0c54a34e4eed575"
+  },
+  "src/protocol/requests/endTxn/fixtures/java/endTxnRequest-v5-abort.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "70779ba5acc570df4a49e237fc1d9d20e709dc4ec1f0a0a4101e9ab47ff75055"
+  },
+  "src/protocol/requests/endTxn/fixtures/java/endTxnRequest-v5-commit.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "a7e8318577fa4d9a04db58d24ded8c56cc1a4a805a4ecf3c9b5d4321e5567330"
+  },
+  "src/protocol/requests/endTxn/fixtures/java/endTxnResponse-v2-error.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "526e9d1c3fdc647e1f2e9ee18a63899f7d98f8a18de8bc96bf2611d0b78bb209"
+  },
+  "src/protocol/requests/endTxn/fixtures/java/endTxnResponse-v2-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "ab2aac856dfe193ead94ad063c09f0400824f4ea09c6cdd5a5b39c02b0a7bdbb"
+  },
+  "src/protocol/requests/endTxn/fixtures/java/endTxnResponse-v3-error.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "b68a89aeb0f5ef22806a381cb93e13c61a7e62fb70f735d90b4c03ea0b693495"
+  },
+  "src/protocol/requests/endTxn/fixtures/java/endTxnResponse-v3-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "70a1c83dcff838c435c0979d807e89b297d8d89f5a314ea1ed6c9854caa88061"
+  },
+  "src/protocol/requests/endTxn/fixtures/java/endTxnResponse-v4-error.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "c5858fedc872c79d60f2e70f8ba89d12c11cf9d698e7df4e08c9cb2daf94cfa7"
+  },
+  "src/protocol/requests/endTxn/fixtures/java/endTxnResponse-v4-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "5aea6178309b284bbbed1b745b8c5530fff21fb39db6d9e6581be149801b4f4a"
+  },
+  "src/protocol/requests/endTxn/fixtures/java/endTxnResponse-v5-defaults.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "d4ce8456cd4e7cbe1e121bb579bc214767d3096df4c73a2d07d1d1159cef9d88"
+  },
+  "src/protocol/requests/endTxn/fixtures/java/endTxnResponse-v5-error.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "abf894a21f7a038054d4296dc43fa47295f3f39c7b5ba76415141637c81bdede"
+  },
+  "src/protocol/requests/endTxn/fixtures/java/endTxnResponse-v5-producerIdAndEpoch.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "4b5ab94fc74b5a17038fd7ff37c5d7c3487bdc801f9789dd8e4d98f39346a0e8"
+  },
+  "src/protocol/requests/expireDelegationToken/fixtures/java/expireDelegationTokenRequest-v1-security.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "c1b2a137da618eff286001dc5e022fb24e047d6dfef2c92cde957240b37b753e"
+  },
+  "src/protocol/requests/expireDelegationToken/fixtures/java/expireDelegationTokenRequest-v2-security.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "f8b73abf3b805f0647abb65d31a2b57d4d6debba9bf9f559ed28c0d62c32700b"
+  },
+  "src/protocol/requests/expireDelegationToken/fixtures/java/expireDelegationTokenResponse-v1-security.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "234d9d435b949423238d3e593e94db9f7709fdd9433626f67247e47b99112280"
+  },
+  "src/protocol/requests/expireDelegationToken/fixtures/java/expireDelegationTokenResponse-v2-security.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "337f16308060cca221e3998880eb2f436741aaf0136add43af193ea4548c711a"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchRequest-v12-sessionClose.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "b2d063c2fa45c86cea7b0c866d89650b388aaffc9b848b7042b25cfc5d407306"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchRequest-v12-sessionForgotten.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "ed3df3315ff076615f3e2916791276364873d9f37d68aafe3f118f2d8d02f82e"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchRequest-v12-sessionFull.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "6adfde672d4974b7c473b02eca7d4102491b634e2e13e3cfbf7120cf3f7c6ef5"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchRequest-v12-sessionIncremental.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "591bc87fd4b4dad9304857f57831141279350db0799e037ff7ad007b864f6037"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchRequest-v13-sessionClose.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "ef5da6639dd46feb8f60649a87249dd63a92f86bc1755f3a24415b6a0d542f5a"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchRequest-v13-sessionForgotten.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "32988c34a22ee9916ec4d586533ee63fda77619610d055ec72541b999aaeedcd"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchRequest-v13-sessionFull.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "23330a3c1426214ebc7b83e993992bda15c2024b058f66c386ae2d2353156291"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchRequest-v13-sessionIncremental.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "7f156f99e90061c171d711ae1e51048afe4025c17c9401de985439fa1166ec7a"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchRequest-v14-sessionClose.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "e6668b809b3b0e21dde23e8a83ca3ead6acebfa8272c4631eab3409109311a55"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchRequest-v14-sessionForgotten.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "a6d695e3ea05aad8024a7dd7b0fe9e155f4797d53cabdfb85314269190e7bba4"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchRequest-v14-sessionFull.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "aad40b85ac4877e82ef4042b27a614729dc5e656c0d2ee59219957048315dbf9"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchRequest-v14-sessionIncremental.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "39f2f5729698ae3421c1ffff952141ac9a4cee86f616da373a5e1c9abf26a820"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchRequest-v15-sessionClose.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "cc5dc5762edc012bed84e9713b1a7afa97140b754012c032879d8c3651c3da90"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchRequest-v15-sessionForgotten.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "2b922c360879ec7f388adb052259a7bc2c0a714466e1d7a8fa17925146a2829a"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchRequest-v15-sessionFull.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "8c0b686b68a306d1e573ce76237268e6256c3454c1a912d737fc4664319cb38a"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchRequest-v15-sessionIncremental.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "1274af0dfb4f81f2a7dc28de01526c3ff11f4b825f4f6547f61f5292f867b809"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchRequest-v16-sessionClose.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "a62f46cb02d1c3572f263937a305e103f2c3261a56ba68d2e5ce95a9de2f58b2"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchRequest-v16-sessionForgotten.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "7d19a255426c0a7261ba5e267c53f4743c2a43540c8a45c901a5b59cb50cf38e"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchRequest-v16-sessionFull.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "0181147b5e3609d352501eccd51e1871c0a2a4d99148c3f782590a6187fac0b4"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchRequest-v16-sessionIncremental.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "e229acc3a2eae64d8fecbbf204ad0d92d7a65bc06ba1853842c194520c63132e"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchRequest-v17-sessionClose.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "a71293c69ce7c6ffe5bc122377b100d04d595c3c491643599bb87cf9cd405c4b"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchRequest-v17-sessionForgotten.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "eb731d256e488270238793c9cc461b92c5fab62cf17060b96ec29cbead69266a"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchRequest-v17-sessionFull.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "6b6d20a2b8c18c60cff2a0cc55dd447dd91087e79a901e1f16cd3c545c89ef87"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchRequest-v17-sessionIncremental.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "75a3447ac2119feaa260e7c7c7bb1d146d5591c80a14a289b3c83d108488e125"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchRequest-v18-sessionClose.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "362d542f32d0b6a7b60ea7f2afb837ade273e2e5a0d2d71c1c9bfd14cfd03736"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchRequest-v18-sessionForgotten.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "1a934fb711c0906299005bf0df0270eb405af0ee4f0ba08cd15b9ae86e047d67"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchRequest-v18-sessionFull.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "c6b96ac4167d36ac9fdfd689ee3482fa87f3c6ccac54c3d58ac209b3ecb8edcb"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchRequest-v18-sessionIncremental.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "444f9d977dc049509040459df22060a3f5da0d4f828d60d208cbf5166421eb97"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchResponse-v12-sessionError106.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "9b55c451659f0e83347f2f739c6c600407df1bfbc0fe0a543de975adbadb7409"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchResponse-v12-sessionError70.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "6568413c1c0a10bdc738673542c4a41c5aad094818bb261f7dcca2a3b9794e23"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchResponse-v12-sessionError71.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "f53abdb8ccbe11c791af3a46e0a55cf4869b7c292d2b06e68e1dff698edda88b"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchResponse-v12-sessionFull.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "622c3a41f936878aee4ad0b25d60ffd6ea79b908099430fd97347f9dccb3f073"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchResponse-v12-sessionSparse.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "b11e48067ae3ffc0dd8a64938ed63e94014b75ac6ba0c6f5643c23a95155d574"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchResponse-v13-sessionError106.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "2895687bd3340643f9b1d5ca378a5df3624124538a3e2d188427037e77c11beb"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchResponse-v13-sessionError70.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "012d43b48c0d98d6a6eb1716fad71e4e0676ec9c49e4932c1c0b8449f6922b0e"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchResponse-v13-sessionError71.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "92a88021e2c65046de2af6e5d6eff69084de66dfb08c75452a5b60ba2c971688"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchResponse-v13-sessionFull.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "65c370cfdf1436b7c71fbebc19db80e6527eac758494962201516168a1ac9215"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchResponse-v13-sessionSparse.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "38b452895e1e7fbbace63ad7af86af5903d1838d5079a87400263b68293e1f2a"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchResponse-v14-sessionError106.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "c4d5e5d61811c9405a13a7c500c27798edf750ad9e71121b3d5da98c7289e8a1"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchResponse-v14-sessionError70.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "9d1d382b735a1eb11d41a81877f80b745d17bf89c8ee3bb27d6ca5872666ede5"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchResponse-v14-sessionError71.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "d78ac574c783264a93aa4a66f46aad07feaa80dfecc3a1dcd5589efc422f579c"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchResponse-v14-sessionFull.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "deb176d9c56a16506803760b6a69b523409b57205b31d1f5125b7f9010d30aa6"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchResponse-v14-sessionSparse.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "6dcd003fb5dbd7f181ffd14ea2e5779f133f65175c42cb13cf9f8053a2dac476"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchResponse-v15-sessionError106.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "f21ff0de217e0cf492092ad9c2d3f0d53de277ba6b731fa7c6e7e1784cab90eb"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchResponse-v15-sessionError70.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "7f85fd8e310a1ee0b932a0f0595155c02652773e6dfc28715c72f639103ec163"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchResponse-v15-sessionError71.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "75161090ce3d92ebd32c964411ddb955a3281c42f0cf5e14c5c7551bd131da1f"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchResponse-v15-sessionFull.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "8be084557b1134c08371197c7b9211f6f63d2f7f416fc7652bfc81f59944fc32"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchResponse-v15-sessionSparse.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "6559f5f52d6de65a42b4a48ae2cadd596c26a3cf1f30d81fc44ba27d1cd5b93d"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchResponse-v16-sessionError106.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "74431537068064515b8ea9c60f79ae65e97c023a7e11484289e55592cd829a5f"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchResponse-v16-sessionError70.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "c3f4e9c901e311681da071eccf591984319cd6e02018709a9a11720cb01786e7"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchResponse-v16-sessionError71.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "455649816ab79dc0f489b9af0ce99a8df6704cdb98f7a370f3e2f3a7f2400723"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchResponse-v16-sessionFull.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "66e3464d6d764b4654f1e0655093cbcb0896063de104ffd9075a73444e87d7b8"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchResponse-v16-sessionSparse.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "1ae55fd9c89fbbf383fd389db11bbc1979edfb3a72b5ddbfb89e6591c47577e6"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchResponse-v17-sessionError106.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "b061728a9de07adc5aabe26858e0048957c6dcfea27841c589b56ec2aa5599f7"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchResponse-v17-sessionError70.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "2bcd686aa918f5e6987b4a432927710bc90dcc7849196905ca839aef63ca0bf4"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchResponse-v17-sessionError71.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "570cf7e5ce012b68df19fe6b36ba2adfc87c1b1205f9ec9606db2611f007156a"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchResponse-v17-sessionFull.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "2e56e1b80b4958ced36994e7c08f456f7a6a4cd216b39b0b9bef45b7cf8e29ed"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchResponse-v17-sessionSparse.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "64534d818b14e6ed19ed10ea332f5dcf727583bf10e777be972f70719d9cffe2"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchResponse-v18-sessionError106.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "ab72c62c97dd8092963e650b1566297660523edb221663cf41b45c6c2f5f92a8"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchResponse-v18-sessionError70.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "8a196e5b31bda05c25718663ef9355bf17c9ea9d6d4334c71bec405c91f5c2d8"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchResponse-v18-sessionError71.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "d97ae45449f171eeaa4d52ea91a6d0025593d408acc8278a102f5e53e7976e10"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchResponse-v18-sessionFull.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "d6cfd8d9457011da0e5f815e2441f903401fa016f1848d89dac467b16042d4b0"
+  },
+  "src/protocol/requests/fetch/fixtures/java/fetchResponse-v18-sessionSparse.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "cfead8b21ec8fc633f284e7dae897e4dbb83af74542ddb6635ff923aaf308e75"
+  },
+  "src/protocol/requests/fetch/fixtures/v12_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "30bed78a12fbbb33a31c65d773a81ebf52b17d75b483a12e09af7b93bef7d2b4"
+  },
+  "src/protocol/requests/fetch/fixtures/v12_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "4b6b385fb2559e98e37bb9a6d8c118846ca72783b116d788359865795dddf932"
+  },
+  "src/protocol/requests/fetch/fixtures/v13_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "830e2311d0b061753fc45cf0272363aa9a64786305fe76b9810fe639685d45a2"
+  },
+  "src/protocol/requests/fetch/fixtures/v13_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "d22c9dc12937b8148ecfa8fa9c922590ac0796235f36c582d24fcc34d903f8ce"
+  },
+  "src/protocol/requests/fetch/fixtures/v14_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "830e2311d0b061753fc45cf0272363aa9a64786305fe76b9810fe639685d45a2"
+  },
+  "src/protocol/requests/fetch/fixtures/v14_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "d22c9dc12937b8148ecfa8fa9c922590ac0796235f36c582d24fcc34d903f8ce"
+  },
+  "src/protocol/requests/fetch/fixtures/v15_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "8c20d4c640dcbee5a1f08043a741cc2742b96f64b011bedadfa7d5fd0c47d29a"
+  },
+  "src/protocol/requests/fetch/fixtures/v15_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "d22c9dc12937b8148ecfa8fa9c922590ac0796235f36c582d24fcc34d903f8ce"
+  },
+  "src/protocol/requests/fetch/fixtures/v16_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "8c20d4c640dcbee5a1f08043a741cc2742b96f64b011bedadfa7d5fd0c47d29a"
+  },
+  "src/protocol/requests/fetch/fixtures/v16_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "5e1cdf16bc4a094edf53a2ab135751bdcf07ab6765d65e142b804978d0d188aa"
+  },
+  "src/protocol/requests/fetch/fixtures/v17_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "8c20d4c640dcbee5a1f08043a741cc2742b96f64b011bedadfa7d5fd0c47d29a"
+  },
+  "src/protocol/requests/fetch/fixtures/v17_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "5e1cdf16bc4a094edf53a2ab135751bdcf07ab6765d65e142b804978d0d188aa"
+  },
+  "src/protocol/requests/fetch/fixtures/v18_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "8c20d4c640dcbee5a1f08043a741cc2742b96f64b011bedadfa7d5fd0c47d29a"
+  },
+  "src/protocol/requests/fetch/fixtures/v18_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "5e1cdf16bc4a094edf53a2ab135751bdcf07ab6765d65e142b804978d0d188aa"
+  },
+  "src/protocol/requests/findCoordinator/fixtures/v3_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "f6ce850c0e497c4fbddaedd2e4545bf467914fd1476e23ce0a5f9e846a206231"
+  },
+  "src/protocol/requests/findCoordinator/fixtures/v3_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "8771767b7e65922f54f797e12613a8c4b75abde4ba791dd714f6d94aa783eb29"
+  },
+  "src/protocol/requests/findCoordinator/fixtures/v4_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "bd47dee954129c9c20be67428419472c413b4ee038870c82d84eb3baba430be8"
+  },
+  "src/protocol/requests/findCoordinator/fixtures/v4_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "66b64e1562648baf4e09f56bf428203857bb80f466383d47746f8a6ebc7266eb"
+  },
+  "src/protocol/requests/findCoordinator/fixtures/v5_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "bd47dee954129c9c20be67428419472c413b4ee038870c82d84eb3baba430be8"
+  },
+  "src/protocol/requests/findCoordinator/fixtures/v5_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "66b64e1562648baf4e09f56bf428203857bb80f466383d47746f8a6ebc7266eb"
+  },
+  "src/protocol/requests/findCoordinator/fixtures/v6_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "bd47dee954129c9c20be67428419472c413b4ee038870c82d84eb3baba430be8"
+  },
+  "src/protocol/requests/findCoordinator/fixtures/v6_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "66b64e1562648baf4e09f56bf428203857bb80f466383d47746f8a6ebc7266eb"
+  },
+  "src/protocol/requests/heartbeat/fixtures/java/heartbeatRequest-v4-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "53a0a9aae7f5ab0ef0473ac065d2cd317d78f22ccdf5ca2928d1db37fa0a4bec"
+  },
+  "src/protocol/requests/heartbeat/fixtures/java/heartbeatResponse-v4-error.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "cbd442fd19ca57759f6036fafa0da04ed58da209c822828f7201e02779b265d1"
+  },
+  "src/protocol/requests/heartbeat/fixtures/java/heartbeatResponse-v4-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "56e18dcf642e6b18f3c18da0e5987baa017471dd3f1adc7f33f37ba52e6608b0"
+  },
+  "src/protocol/requests/incrementalAlterConfigs/fixtures/java/incrementalAlterConfigsRequest-v0-append.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "9127ff90798a1429b79c645b597a07c4c2bc0e3e1f487b598dbdaf4e9c608e64"
+  },
+  "src/protocol/requests/incrementalAlterConfigs/fixtures/java/incrementalAlterConfigsRequest-v0-delete.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "7a4e326afc4a9e6c415d12c08456faa0d16924af99edff7ab49ee3e0db8c0c30"
+  },
+  "src/protocol/requests/incrementalAlterConfigs/fixtures/java/incrementalAlterConfigsRequest-v0-set.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "fe3d766eb210a2068a8a98d2c4fb20efce97656486c09368b495c476beee2f8f"
+  },
+  "src/protocol/requests/incrementalAlterConfigs/fixtures/java/incrementalAlterConfigsRequest-v0-subtract.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "410d79bb4cb43fe4c0692438cdc8bf465c6dc2bc77fee38766c4b8b18ea3e439"
+  },
+  "src/protocol/requests/incrementalAlterConfigs/fixtures/java/incrementalAlterConfigsRequest-v0-twoResources.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "f02d48095346b1430c52649d05463c75ab08a27c4006cf66c3a07c392df98786"
+  },
+  "src/protocol/requests/incrementalAlterConfigs/fixtures/java/incrementalAlterConfigsRequest-v0-validateOnly.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "2b8b00c2a6532640c6427efc647872704acd6a79ccec0d6c22120ed92c342f30"
+  },
+  "src/protocol/requests/incrementalAlterConfigs/fixtures/java/incrementalAlterConfigsRequest-v1-append.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "e7877155a710b35f8e8d2cf532849559a0d30213195d54e74bb25ec46ec9c5e5"
+  },
+  "src/protocol/requests/incrementalAlterConfigs/fixtures/java/incrementalAlterConfigsRequest-v1-delete.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "55ee1be0e6fe74c5d081fb8025fe5aa88aa87befaf1a82c506de510d9658f5eb"
+  },
+  "src/protocol/requests/incrementalAlterConfigs/fixtures/java/incrementalAlterConfigsRequest-v1-set.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "691ecb5286868dff444d6ac5047541939ffca5700e759bb0e6a8ed6c121a698f"
+  },
+  "src/protocol/requests/incrementalAlterConfigs/fixtures/java/incrementalAlterConfigsRequest-v1-subtract.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "e8eb15fbbedb798a92ebe1548823782039260f8d4cdfc2b48abcd9f4cd79632e"
+  },
+  "src/protocol/requests/incrementalAlterConfigs/fixtures/java/incrementalAlterConfigsRequest-v1-twoResources.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "ce6f074c7071019294c437b2cf20f01d5672e02e4bfcd94b6097fafaef2845c8"
+  },
+  "src/protocol/requests/incrementalAlterConfigs/fixtures/java/incrementalAlterConfigsRequest-v1-validateOnly.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "e2958bc527515617adffb6a5e7de141d17d6d6f504ecb09a45c6bf581e00b341"
+  },
+  "src/protocol/requests/incrementalAlterConfigs/fixtures/java/incrementalAlterConfigsResponse-v0-error.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "b3c8feb4383290a6b391eef833d75c269a89fdff541da45d53119274456d9cad"
+  },
+  "src/protocol/requests/incrementalAlterConfigs/fixtures/java/incrementalAlterConfigsResponse-v0-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "9b64bd3217238b363cfda42a9eafa5b741c671301a9a6882f5f4ee31314e5290"
+  },
+  "src/protocol/requests/incrementalAlterConfigs/fixtures/java/incrementalAlterConfigsResponse-v1-error.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "7672982febba557eb7496f311d621d7c2048b53d9fa133e7d3273771d1407cad"
+  },
+  "src/protocol/requests/incrementalAlterConfigs/fixtures/java/incrementalAlterConfigsResponse-v1-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "82d75045f3983f6878a846269ffba3249528e54e1124bb44ab0bfbc792d469ad"
+  },
+  "src/protocol/requests/initProducerId/fixtures/java/initProducerIdRequest-v3-firstInit.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "2da3955229c0caf28894effff24f1f8b11da9165c813c12a606f5cb10513092b"
+  },
+  "src/protocol/requests/initProducerId/fixtures/java/initProducerIdRequest-v3-nullTransactionalId.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "ca1512ef6bc45b7f910721b29473504742c7f201c3c502d7bf21399a5bec8d34"
+  },
+  "src/protocol/requests/initProducerId/fixtures/java/initProducerIdRequest-v3-reinit.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "19771e14c96ffa56b372881bdb50e99cd03ab28e1b969b4787198f964ee921a5"
+  },
+  "src/protocol/requests/initProducerId/fixtures/java/initProducerIdRequest-v4-firstInit.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "cbef04ef7e2b4965c2ebe69a61e487e3beb98acc9d6dd297c42b664466184123"
+  },
+  "src/protocol/requests/initProducerId/fixtures/java/initProducerIdRequest-v4-nullTransactionalId.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "bcf1474a87364e947a853a4e9dd4a011293e3e2994dfedacf1ef876bbbb10407"
+  },
+  "src/protocol/requests/initProducerId/fixtures/java/initProducerIdRequest-v4-reinit.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "379f9a8a2f80398dafa3bba80cffa4341cf420aaa54702b5d6e855782ea98363"
+  },
+  "src/protocol/requests/initProducerId/fixtures/java/initProducerIdRequest-v5-firstInit.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "af477b4d96525be6c8b80e756d45268226bd03786d4fe8c49940d2699ef99d52"
+  },
+  "src/protocol/requests/initProducerId/fixtures/java/initProducerIdRequest-v5-nullTransactionalId.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "e454eb0b70a8c4ce4379c25ff138775bf917bca386d043fff8642b931ae56582"
+  },
+  "src/protocol/requests/initProducerId/fixtures/java/initProducerIdRequest-v5-reinit.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "0974a8de237d6770ac911922516298540677524ee882756b87ce68e3093cfff0"
+  },
+  "src/protocol/requests/initProducerId/fixtures/v2_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "b674ba17a77b2afc943c22e65aa18264a9e133bb86b9bc8ef0ceff3bb897d69c"
+  },
+  "src/protocol/requests/initProducerId/fixtures/v2_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "7f937cc21ac90b4e02cb2b5f5ef666ecd2f717dd408aa8e77e72ced7dc61c8b2"
+  },
+  "src/protocol/requests/initProducerId/fixtures/v3_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "d6063f99f3e6fefea99a42ba9ec4de381e7456fd52c35a83f5e3c13c4e1cab0e"
+  },
+  "src/protocol/requests/initProducerId/fixtures/v3_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "7f937cc21ac90b4e02cb2b5f5ef666ecd2f717dd408aa8e77e72ced7dc61c8b2"
+  },
+  "src/protocol/requests/initProducerId/fixtures/v4_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "d6063f99f3e6fefea99a42ba9ec4de381e7456fd52c35a83f5e3c13c4e1cab0e"
+  },
+  "src/protocol/requests/initProducerId/fixtures/v4_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "7f937cc21ac90b4e02cb2b5f5ef666ecd2f717dd408aa8e77e72ced7dc61c8b2"
+  },
+  "src/protocol/requests/initProducerId/fixtures/v5_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "d6063f99f3e6fefea99a42ba9ec4de381e7456fd52c35a83f5e3c13c4e1cab0e"
+  },
+  "src/protocol/requests/initProducerId/fixtures/v5_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "7f937cc21ac90b4e02cb2b5f5ef666ecd2f717dd408aa8e77e72ced7dc61c8b2"
+  },
+  "src/protocol/requests/joinGroup/fixtures/java/joinGroupRequest-v6-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "082ba5928b5e0aa4636e1ce31a472e7916ee0b7d977ff13cd4d9c9bd94ccc584"
+  },
+  "src/protocol/requests/joinGroup/fixtures/java/joinGroupRequest-v6-staticMember.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "19eb56c2842f285bb268567a50e9abef06bd30994d89210b23770e1b64bc3acb"
+  },
+  "src/protocol/requests/joinGroup/fixtures/java/joinGroupRequest-v7-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "5ab796b0afe1bdbb90a977993d57e22622eab1a892655438f63d2fbca1c74432"
+  },
+  "src/protocol/requests/joinGroup/fixtures/java/joinGroupRequest-v7-staticMember.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "810a0eb8fb92ce327b8dcf80e6a99e1c766727c876fdb612516dcc7eee69335a"
+  },
+  "src/protocol/requests/joinGroup/fixtures/java/joinGroupRequest-v8-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "e4992423ce7084db8a2580cd2bf86cd6aa6483c7dda8e3c0a8dcbfd4aa8441c9"
+  },
+  "src/protocol/requests/joinGroup/fixtures/java/joinGroupRequest-v8-staticMember.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "0356fb2dc6996ac09c467436b58514f84ee88f1462a535a1cb8872832cfcb914"
+  },
+  "src/protocol/requests/joinGroup/fixtures/java/joinGroupRequest-v8-withReason.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "7bf629b021923b9f7b809a45f2d9460a738bc26ecb82bf1048fc4827886e5973"
+  },
+  "src/protocol/requests/joinGroup/fixtures/java/joinGroupResponse-v6-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "6c48fb41019f33acfd39cbf0bd92afa8e0afce00f08c6b5a54e71ec54a3ececb"
+  },
+  "src/protocol/requests/joinGroup/fixtures/java/joinGroupResponse-v7-nullProtocolName.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "6cca5f597c075e8ce32cd5b80566b8618265ee4fe42946519b22dc6cdc3d6c94"
+  },
+  "src/protocol/requests/joinGroup/fixtures/java/joinGroupResponse-v7-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "a97c04bf4fe0eecbcf38cb7e54c4c4694273f2d49353e4ff73329f14a8e06838"
+  },
+  "src/protocol/requests/joinGroup/fixtures/java/joinGroupResponse-v7-protocolType.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "c7df513156e6f442897fcabcf7d30f9252ae89c4a820d929a90dbffaf3fbf68c"
+  },
+  "src/protocol/requests/joinGroup/fixtures/java/joinGroupResponse-v8-nullProtocolName.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "50323ccc992bb7b5cbedb92641bcd1efe51898cbc04a0193af8c1c0d4b412f0b"
+  },
+  "src/protocol/requests/joinGroup/fixtures/java/joinGroupResponse-v8-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "45ff064a6848e46ee08bf029e3ec3491c558faf2da39d9ad7a06a684eee28ea5"
+  },
+  "src/protocol/requests/joinGroup/fixtures/java/joinGroupResponse-v8-protocolType.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "f6fee07d17a9351f92677382407cd7f1e323527e07b5df3c48b738427c072025"
+  },
+  "src/protocol/requests/leaveGroup/fixtures/java/leaveGroupRequest-v4-oneMember.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "4e6370acfc14e3d2ddb899444e17dd0a3c23c3b79d3f0cb8592409d97e973d7c"
+  },
+  "src/protocol/requests/leaveGroup/fixtures/java/leaveGroupRequest-v4-twoMembers.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "d4bc02f44af0c8cf19c767a8e091313bc85e123863d6731710d271a11b5f7f14"
+  },
+  "src/protocol/requests/leaveGroup/fixtures/java/leaveGroupRequest-v5-oneMember.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "9012f4995288d799e594415cd1328f987cfc198add6c98c4f37566bc0d19269c"
+  },
+  "src/protocol/requests/leaveGroup/fixtures/java/leaveGroupRequest-v5-twoMembers.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "93e4938a345931a498fe040163d259487f3c99ea7788b4243ebed9a6d6c36043"
+  },
+  "src/protocol/requests/leaveGroup/fixtures/java/leaveGroupRequest-v5-withReason.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "e6f3d27e9a8833a1af697560cf229f29cc180bcd0fe7d82a84475e47b74f0406"
+  },
+  "src/protocol/requests/leaveGroup/fixtures/java/leaveGroupResponse-v4-memberError.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "54cc7620165f06df8e9e03e874f2602b83bd57cae40617cd205f4825543e0b25"
+  },
+  "src/protocol/requests/leaveGroup/fixtures/java/leaveGroupResponse-v4-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "204b5fe02d7535be31293ca8c6e00f0b7908c73ef033b2e92a4e62fcef4b16e9"
+  },
+  "src/protocol/requests/leaveGroup/fixtures/java/leaveGroupResponse-v5-memberError.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "30f392e214d31314036e16a656a20434aa8abc2e942685e9fa3fe72de1189479"
+  },
+  "src/protocol/requests/leaveGroup/fixtures/java/leaveGroupResponse-v5-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "3bacd5e28dde7bf2f03195a566498a04d8816cc2936a2610e329f3888777b41f"
+  },
+  "src/protocol/requests/listConfigResources/fixtures/java/listConfigResourcesRequest-v0-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "238f15641b0d1ec198fc1a198a7431298e5b8041a2a7a8a787327c9c6b5bc0e6"
+  },
+  "src/protocol/requests/listConfigResources/fixtures/java/listConfigResourcesRequest-v1-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "f0aa18360b9d871a90e165851a7bfa2b1e44e6c9d21a942faed4e746100dfdd5"
+  },
+  "src/protocol/requests/listConfigResources/fixtures/java/listConfigResourcesResponse-v0-mixed.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "0c64aa89952d5f09ba71f2c102e3629b8c1435bc8b4b8647ce424c636b7956d2"
+  },
+  "src/protocol/requests/listConfigResources/fixtures/java/listConfigResourcesResponse-v1-mixed.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "a0ab169eaff6207554052dabf926548bd47a10e02ebc52e66ba19e6efe818a3d"
+  },
+  "src/protocol/requests/listGroups/fixtures/java/listGroupsRequest-v3-noFilters.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "f01a7171d9d85f0f026c72948010c1b2efbb6dc2421bc50706bf8c4b5c3884cf"
+  },
+  "src/protocol/requests/listGroups/fixtures/java/listGroupsRequest-v4-noFilters.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "7a692b785fcac6a129eca96ab7f487fcc8fdc877609955b591ae808a0fae698e"
+  },
+  "src/protocol/requests/listGroups/fixtures/java/listGroupsRequest-v4-statesFilter.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "6bd01c17f406194de9eca2002135998514efda9d9af2f7fe350e1f5b42f350c8"
+  },
+  "src/protocol/requests/listGroups/fixtures/java/listGroupsRequest-v5-noFilters.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "199da46e6a2a404f5c7a09fe9bb49528b45f94690eabb0b5943f9aa55f9b00dc"
+  },
+  "src/protocol/requests/listGroups/fixtures/java/listGroupsRequest-v5-statesAndTypes.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "d19f14d4567f244906e3471cf3131cd6f4cfdc3f21934c7ed9231030cbe12f87"
+  },
+  "src/protocol/requests/listGroups/fixtures/java/listGroupsResponse-v3-groups.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "13fbb7af8a33da1da28bf29567b93f0c94da9a187b6ee8b138ca848e3bd61a3f"
+  },
+  "src/protocol/requests/listGroups/fixtures/java/listGroupsResponse-v4-groups.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "b1e05c75f5df0ecab3bba0de91990301e2ad7fb43e508cf375dc30a4e6204a70"
+  },
+  "src/protocol/requests/listGroups/fixtures/java/listGroupsResponse-v5-groups.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "70dabf0b42197538b8160267fb9ef5e1111cdc811c2c43cf896aa619ad094af3"
+  },
+  "src/protocol/requests/listOffsets/fixtures/java/listOffsetsRequest-v10-storage.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "9c040558d3b27585b9386cfd2313b5afed217cec87886b4688d8af25df3945ef"
+  },
+  "src/protocol/requests/listOffsets/fixtures/java/listOffsetsRequest-v11-storage.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "cecf4154995392335ceb6bc1d52a3a4f5c2d05ca708aea8bd98d90d70807db0c"
+  },
+  "src/protocol/requests/listOffsets/fixtures/java/listOffsetsResponse-v10-storage.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "3341176f460b6641f493a6fb79ca257989f615761384182f6b2ec4d34c834cef"
+  },
+  "src/protocol/requests/listOffsets/fixtures/java/listOffsetsResponse-v11-storage.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "19def5da5e813dd2123e478b75d019d44ec9d8db53732b2486f7754094c52e6f"
+  },
+  "src/protocol/requests/listOffsets/fixtures/v4_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "8e7b4087216a9f8420f72f29421e8c53ac005ee5999467c38f1967cb173af2e9"
+  },
+  "src/protocol/requests/listOffsets/fixtures/v4_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "fcf83b97acc92de8f28325898de4865851bb566a351b4301b8ba98caadfff19d"
+  },
+  "src/protocol/requests/listOffsets/fixtures/v5_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "8e7b4087216a9f8420f72f29421e8c53ac005ee5999467c38f1967cb173af2e9"
+  },
+  "src/protocol/requests/listOffsets/fixtures/v5_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "fcf83b97acc92de8f28325898de4865851bb566a351b4301b8ba98caadfff19d"
+  },
+  "src/protocol/requests/listOffsets/fixtures/v6_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "ce33be2db802251f7d44c11f34392612a229379c8a2bf0ecb207f6135c49b610"
+  },
+  "src/protocol/requests/listOffsets/fixtures/v6_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "17d2aded5a4584ef65cea1d7f183f05cea586abbe5ce2124cd4cda06fdcc30db"
+  },
+  "src/protocol/requests/listOffsets/fixtures/v7_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "ce33be2db802251f7d44c11f34392612a229379c8a2bf0ecb207f6135c49b610"
+  },
+  "src/protocol/requests/listOffsets/fixtures/v7_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "17d2aded5a4584ef65cea1d7f183f05cea586abbe5ce2124cd4cda06fdcc30db"
+  },
+  "src/protocol/requests/listOffsets/fixtures/v8_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "ce33be2db802251f7d44c11f34392612a229379c8a2bf0ecb207f6135c49b610"
+  },
+  "src/protocol/requests/listOffsets/fixtures/v8_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "17d2aded5a4584ef65cea1d7f183f05cea586abbe5ce2124cd4cda06fdcc30db"
+  },
+  "src/protocol/requests/listOffsets/fixtures/v9_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "ce33be2db802251f7d44c11f34392612a229379c8a2bf0ecb207f6135c49b610"
+  },
+  "src/protocol/requests/listOffsets/fixtures/v9_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "17d2aded5a4584ef65cea1d7f183f05cea586abbe5ce2124cd4cda06fdcc30db"
+  },
+  "src/protocol/requests/listTransactions/fixtures/java/listTransactionsRequest-v0-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "3929ec6982aaa2ac79b6d21c26e4a579f82b696019783d24b4bed1f0e979e4aa"
+  },
+  "src/protocol/requests/listTransactions/fixtures/java/listTransactionsRequest-v1-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "9ac905fc92194080180f7b3098a6860aceeb31f789488807837ba6d02c7d8e59"
+  },
+  "src/protocol/requests/listTransactions/fixtures/java/listTransactionsRequest-v2-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "2752733900830c982cb03c1cb9aa494d1d7ab3c25c941246939148a5a3ac14c5"
+  },
+  "src/protocol/requests/listTransactions/fixtures/java/listTransactionsResponse-v0-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "40cb712be7fff9dab7871a608be8669f5cae77b1cc62fc70793bf81d2b066de7"
+  },
+  "src/protocol/requests/listTransactions/fixtures/java/listTransactionsResponse-v1-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "1c633cb7556a2e1b0aeb7e058c3066df21cd82a2b57711a1904a3e8beb5231a5"
+  },
+  "src/protocol/requests/listTransactions/fixtures/java/listTransactionsResponse-v2-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "81f103f7978deaf7fe8497dd6dbdc01883b7d8959a6845b366c2378e62f1abbc"
+  },
+  "src/protocol/requests/metadata/fixtures/v10_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "485c31b07c5a140ae33cf766acadb6e5095544f7c5e2c7ec5096ccfeba83af91"
+  },
+  "src/protocol/requests/metadata/fixtures/v10_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "cfa25272acb56ca30c701e5f5e789beab8f7aabe0ee16db17f1eb29dd7a475c5"
+  },
+  "src/protocol/requests/metadata/fixtures/v11_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "e624ae946a719339f8551c51e3cabf2c54e04b3467e17a61c000432c957ba6ff"
+  },
+  "src/protocol/requests/metadata/fixtures/v11_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "3d79224644a39628c6dc117f74a734002eec6cff5e4da8362a02db120d8ad9fc"
+  },
+  "src/protocol/requests/metadata/fixtures/v12_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "e624ae946a719339f8551c51e3cabf2c54e04b3467e17a61c000432c957ba6ff"
+  },
+  "src/protocol/requests/metadata/fixtures/v12_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "3d79224644a39628c6dc117f74a734002eec6cff5e4da8362a02db120d8ad9fc"
+  },
+  "src/protocol/requests/metadata/fixtures/v13_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "e624ae946a719339f8551c51e3cabf2c54e04b3467e17a61c000432c957ba6ff"
+  },
+  "src/protocol/requests/metadata/fixtures/v13_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "6ab701137fb9d62f0c0d9af012d73332ec67468bb4a01e188207eb0c12b87c62"
+  },
+  "src/protocol/requests/metadata/fixtures/v9_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "7108a0f63cb6fbf1346ccf7679958da04333c7b53175d0d95b583b03cce7f00c"
+  },
+  "src/protocol/requests/metadata/fixtures/v9_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "6c5490f59941d3f3482d385398ea22fc6a521d611935846ab6f85f163b8ea75b"
+  },
+  "src/protocol/requests/offsetCommit/fixtures/java/offsetCommitRequest-v10-byTopicId.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "37554502f9917494de14a34c942fb5d71538dcfbb70921e340a98aff331491e4"
+  },
+  "src/protocol/requests/offsetCommit/fixtures/java/offsetCommitRequest-v9-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "7e7c703ac9abff00998bf434d5768be12133bdb58f66ab834b5e610d7a4e4be2"
+  },
+  "src/protocol/requests/offsetCommit/fixtures/java/offsetCommitResponse-v10-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "6fa3cf11bd3144f555c2dc9d0b2679265c968857fcb2ddd28764fb27a7c25398"
+  },
+  "src/protocol/requests/offsetCommit/fixtures/java/offsetCommitResponse-v10-unknownTopicId.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "62d374cc1dc7cdbe5b064f6928665b760e4c0e96073d9e75105d67c61cfa24f5"
+  },
+  "src/protocol/requests/offsetCommit/fixtures/java/offsetCommitResponse-v9-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "e96650017aff512847d920821de223fc70f8aa81806209a1fc7742ddb282321f"
+  },
+  "src/protocol/requests/offsetCommit/fixtures/v6_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "51bd43ceed29122efb2e00cf66db07ed6fe3f0dad3983cbb1d23b9f7bd086c32"
+  },
+  "src/protocol/requests/offsetCommit/fixtures/v6_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "cfeca2199f605ca9c8267ded2b8844cd5f76caf9d12673ba62df93289413dd96"
+  },
+  "src/protocol/requests/offsetCommit/fixtures/v7_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "c9e004c944c241fc794f07bcb875ad0bf83fb62ecea9108c534f6568bd38a0bb"
+  },
+  "src/protocol/requests/offsetCommit/fixtures/v7_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "cfeca2199f605ca9c8267ded2b8844cd5f76caf9d12673ba62df93289413dd96"
+  },
+  "src/protocol/requests/offsetCommit/fixtures/v8_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "45b7db2109835f868920a44d61063f7aaeca56766521ab92cc3afac8db3ce36b"
+  },
+  "src/protocol/requests/offsetCommit/fixtures/v8_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "07afcf6ff9243b9e69ef5d09038a8d35dd2194b4cb2b18fb90cf79913f0704c9"
+  },
+  "src/protocol/requests/offsetDelete/fixtures/java/offsetDeleteRequest-v0-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "e8bceac17358ddf4806e41dce867fc3bc4350e83a33cd8ccd39c437f0eea5dd0"
+  },
+  "src/protocol/requests/offsetDelete/fixtures/java/offsetDeleteResponse-v0-mixed.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "7404b8cf117baa6482b6625200976bf2692b5d775dbf3ed63b89763cde11dba9"
+  },
+  "src/protocol/requests/offsetFetch/fixtures/java/offsetFetchRequest-v10-allTopics.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "91b11eb5a026c1baba419b47d9fe7da30143f9de52ec5b08e97452cf74abbd5f"
+  },
+  "src/protocol/requests/offsetFetch/fixtures/java/offsetFetchRequest-v10-byTopicId.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "88c091333c11be73d493282621d0f6107c124980da2efc567545a221a313212b"
+  },
+  "src/protocol/requests/offsetFetch/fixtures/java/offsetFetchRequest-v7-notRequireStable.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "d64a5e4641a4569d4355166a49dd338021acc9f2f53eb7f9a765cdc36845f7b0"
+  },
+  "src/protocol/requests/offsetFetch/fixtures/java/offsetFetchRequest-v7-requireStable.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "2edc442764aa31acfb6f2aa6059522d352da5dc27534d2fbf1a1edafb85860ec"
+  },
+  "src/protocol/requests/offsetFetch/fixtures/java/offsetFetchRequest-v8-notRequireStable.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "7d316666a02d1b71d7d2d660ca275fdbcabd5c8c0df00dee824ff808605d2cbe"
+  },
+  "src/protocol/requests/offsetFetch/fixtures/java/offsetFetchRequest-v8-requireStable.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "37735d4ebe059fe4d55a17368250d0e74d35e5dcf5722cf0a8e358cebc1bb5fb"
+  },
+  "src/protocol/requests/offsetFetch/fixtures/java/offsetFetchRequest-v8-severalGroups.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "b08bb528ea50e4ffa35f2e9f4f9a9c4bf2566785b8dac340b96cb9cee756ad35"
+  },
+  "src/protocol/requests/offsetFetch/fixtures/java/offsetFetchRequest-v9-memberFields.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "efc9ae1ae3bfb3e40a69ad887bd738c5d5e0989bceae50a7cf552aca77c38d59"
+  },
+  "src/protocol/requests/offsetFetch/fixtures/java/offsetFetchRequest-v9-notRequireStable.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "b3f6a4f1cd9dbc35f2cfaf22e73dcba1a8bcda26ae935b6472aa53256d73aa15"
+  },
+  "src/protocol/requests/offsetFetch/fixtures/java/offsetFetchRequest-v9-nullMember.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "e153988ece4ae9a90e789f3867360d745e9b865128b75a2493439e9aee53dbe9"
+  },
+  "src/protocol/requests/offsetFetch/fixtures/java/offsetFetchRequest-v9-requireStable.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "4c481933c9dee340e94cf764a4bda1044b06500343db930a9517fdc3d2f12687"
+  },
+  "src/protocol/requests/offsetFetch/fixtures/java/offsetFetchRequest-v9-severalGroups.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "9116e32c8a59347601fffa732f0d887725d389773379a4a1ec59fbcd79cd0b23"
+  },
+  "src/protocol/requests/offsetFetch/fixtures/java/offsetFetchResponse-v10-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "91cbab747947e11f0b6bb130434a1bf7d696ffc7a04b3cae4f69bf4bc067409d"
+  },
+  "src/protocol/requests/offsetFetch/fixtures/java/offsetFetchResponse-v10-unknownTopicId.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "1db54c10f0f3d1841aacf280d84fdcea394453e9da076385f4689fc686eec260"
+  },
+  "src/protocol/requests/offsetFetch/fixtures/java/offsetFetchResponse-v7-stable.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "9cdd2dc80f420ca31165c97fef1e9cfb8c803c0c9aeca38735451b99d1591742"
+  },
+  "src/protocol/requests/offsetFetch/fixtures/java/offsetFetchResponse-v8-groupMatch.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "77717b102d3237bdc42dd0782533d6f47a398d58e3923f167028327f43b3d14d"
+  },
+  "src/protocol/requests/offsetFetch/fixtures/java/offsetFetchResponse-v8-groupMismatch.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "22db2f97a03601c4315911999a492115105b2466bfeb8cadcf0eb4ca3e8c038a"
+  },
+  "src/protocol/requests/offsetFetch/fixtures/java/offsetFetchResponse-v8-noGroups.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "72e0f923e8f46d9fa283adcf6e8e42d406c44e47bec865bc84aab3b5ffe992ce"
+  },
+  "src/protocol/requests/offsetFetch/fixtures/java/offsetFetchResponse-v8-severalGroups.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "4533f6966c12883c5ee49f7f369f2c5c635ba2a09cabd1a4da9321475df45ba0"
+  },
+  "src/protocol/requests/offsetFetch/fixtures/java/offsetFetchResponse-v8-twoGroups.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "2783b15f92eb8243ae694f6c0aec2518b959b998dc0a5b0bb2aa614c638d8785"
+  },
+  "src/protocol/requests/offsetFetch/fixtures/java/offsetFetchResponse-v9-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "4d8cbdd797061e0a9be5fbadf5823f73771ae0d57ea138ad4095046b70d7c329"
+  },
+  "src/protocol/requests/offsetFetch/fixtures/java/offsetFetchResponse-v9-groupMatch.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "b512a4322cb5262b757efba9246f7b21558630bdd352b49e65b9a76188812e4f"
+  },
+  "src/protocol/requests/offsetFetch/fixtures/java/offsetFetchResponse-v9-groupMismatch.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "a87d860c961ed66253cb23c5d79e57a875a7b41e6ba25d1c37a9537bfc7a3732"
+  },
+  "src/protocol/requests/offsetFetch/fixtures/java/offsetFetchResponse-v9-noGroups.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "ad1db319425ff11bec2a9baa6a5477319f3ccf6194e76cf0840366d5472834ab"
+  },
+  "src/protocol/requests/offsetFetch/fixtures/java/offsetFetchResponse-v9-severalGroups.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "9d87ae0650410aad9595155670f4b6d7110a10b2aaec097073bc305a8c58cc9f"
+  },
+  "src/protocol/requests/offsetFetch/fixtures/java/offsetFetchResponse-v9-twoGroups.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "c16dc045b2f6220b0b8c64c018c93c33b746fe6629fed782774ded8f0166352c"
+  },
+  "src/protocol/requests/offsetFetch/fixtures/v5_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "20549dc59b294baf7bf3a4c8da34717bafe5e603129ad13f15533681f74c0616"
+  },
+  "src/protocol/requests/offsetFetch/fixtures/v5_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "e86e4a4cd84d1057a518894ff8bf1d476273d4be3759510b9fc0c0c36f60c204"
+  },
+  "src/protocol/requests/offsetFetch/fixtures/v6_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "5b015fb686566bb50686f12b5096e90ecf4640b2edd91bae015961fd16b52a11"
+  },
+  "src/protocol/requests/offsetFetch/fixtures/v6_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "6556272f7dd1362140e5d8c91af2f37433bbc2c508d8f71832eecbfc1e85f7a1"
+  },
+  "src/protocol/requests/offsetFetch/fixtures/v7_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "5351a8185aa9f5a3803b391906a87255cfb217a6e692c3c6000be5220b94fadb"
+  },
+  "src/protocol/requests/offsetFetch/fixtures/v7_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "6556272f7dd1362140e5d8c91af2f37433bbc2c508d8f71832eecbfc1e85f7a1"
+  },
+  "src/protocol/requests/offsetFetch/fixtures/v8_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "363784bad734893b1833b86b2e14da6a42a23e4c15ab2ffb917a1913a6103968"
+  },
+  "src/protocol/requests/offsetFetch/fixtures/v8_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "fa7d71bf74d5d10cefd81964a11547f2621cca60cd0b4f74b81742f53a7907d0"
+  },
+  "src/protocol/requests/offsetForLeaderEpoch/fixtures/v3_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "29567b75771ac8071db99c5ca46a7f78c086a18bc95d5703e4dc26ef72db505a"
+  },
+  "src/protocol/requests/offsetForLeaderEpoch/fixtures/v3_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "5a5c9e7018b8996d6d555201b56aeaeb5b152ef3d00a4dfd44b3b3705ffa682f"
+  },
+  "src/protocol/requests/offsetForLeaderEpoch/fixtures/v4_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "8ab3c73ca0c9d165066fca01e35c7e8e8d7978c37218e17390579c4b780ff03a"
+  },
+  "src/protocol/requests/offsetForLeaderEpoch/fixtures/v4_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "dd494b54f5c9d32c191c9b19bff12774c3f48e9995a3d460e6bfc306810ede12"
+  },
+  "src/protocol/requests/produce/fixtures/java/produceRequest-v11-records.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "b22e2919de7d554b556871fe83727ad2877452536281fc0c360cb13f9495f4ce"
+  },
+  "src/protocol/requests/produce/fixtures/java/produceRequest-v12-records.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "b22e2919de7d554b556871fe83727ad2877452536281fc0c360cb13f9495f4ce"
+  },
+  "src/protocol/requests/produce/fixtures/v10_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "412886a8d390cbb694560b57138a2ae8183c5686fee46a5981f751580e504387"
+  },
+  "src/protocol/requests/produce/fixtures/v10_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "04faab3e5cda914fc4b44fe0d976016730d52e622b79693ea3d630afaa0a64cd"
+  },
+  "src/protocol/requests/produce/fixtures/v11_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "412886a8d390cbb694560b57138a2ae8183c5686fee46a5981f751580e504387"
+  },
+  "src/protocol/requests/produce/fixtures/v11_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "04faab3e5cda914fc4b44fe0d976016730d52e622b79693ea3d630afaa0a64cd"
+  },
+  "src/protocol/requests/produce/fixtures/v12_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "412886a8d390cbb694560b57138a2ae8183c5686fee46a5981f751580e504387"
+  },
+  "src/protocol/requests/produce/fixtures/v12_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "04faab3e5cda914fc4b44fe0d976016730d52e622b79693ea3d630afaa0a64cd"
+  },
+  "src/protocol/requests/produce/fixtures/v13_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "83a868aea598d29a643e949bba93a96e6e4bfba0281e0c331928f400f60a0b86"
+  },
+  "src/protocol/requests/produce/fixtures/v13_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "2b1b6e28a597fc7d58156baf629f70f36d48d848127e1be9a7c1f21f41e20577"
+  },
+  "src/protocol/requests/produce/fixtures/v8_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "c0238375f763a1d32ba1efd00dd13de0bc96c5e05a2d0adef9187b0dda81174b"
+  },
+  "src/protocol/requests/produce/fixtures/v8_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "934b5de37650be0fd4e2d6a0ae64426781094ee3bf9a4b3205cd8491cfa156bd"
+  },
+  "src/protocol/requests/produce/fixtures/v9_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "412886a8d390cbb694560b57138a2ae8183c5686fee46a5981f751580e504387"
+  },
+  "src/protocol/requests/produce/fixtures/v9_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "fba26a650048d0a1941ae8e1c80139803f2ff68b5abbc5043586266f0fdd8ba8"
+  },
+  "src/protocol/requests/renewDelegationToken/fixtures/java/renewDelegationTokenRequest-v1-security.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "fc38c125ac8278399a9d15b895669e309c4d2dfb42088fdecabc71f5e143cb31"
+  },
+  "src/protocol/requests/renewDelegationToken/fixtures/java/renewDelegationTokenRequest-v2-security.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "1855ef80b8bcb4e09da124af5d7122875dd5f769da24a9a2c2401ac9f94f9092"
+  },
+  "src/protocol/requests/renewDelegationToken/fixtures/java/renewDelegationTokenResponse-v1-security.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "c91bba07dcb45b25448f58a77a8976d02f58cc720e6df8758828b9796613836c"
+  },
+  "src/protocol/requests/renewDelegationToken/fixtures/java/renewDelegationTokenResponse-v2-security.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "8f2bc20da8c0b38d7dd8cc10e05b6de1e81fbf8fb344598a81c7f5bcfa256b22"
+  },
+  "src/protocol/requests/saslAuthenticate/fixtures/v2_request_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "3650023f2aa3d92587b35985c3a0dc671e31776232fb71a576cb264cf485914a"
+  },
+  "src/protocol/requests/saslAuthenticate/fixtures/v2_response_java.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "a70e5abbde5fda12a983ccfa9b48f328c0ce5c1f18c08079348c708fc05962d8"
+  },
+  "src/protocol/requests/syncGroup/fixtures/java/syncGroupRequest-v4-assignment.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "89747f0101025607f8afbd3003af577085876ac034b20f73674ec03cb87f0418"
+  },
+  "src/protocol/requests/syncGroup/fixtures/java/syncGroupRequest-v5-assignment.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "4a4e560130b1201bc48f0bb947d1d4678b8f4093c44dfe2e735e0f8b6ba27b36"
+  },
+  "src/protocol/requests/syncGroup/fixtures/java/syncGroupRequest-v5-withProtocol.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "1888cf9ad650f43e6a7e5e1c33c12b9e4888c9b189cd83ac4a0ab0d534ed9621"
+  },
+  "src/protocol/requests/syncGroup/fixtures/java/syncGroupResponse-v4-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "e2b8c817a37d302c1f14828f0a7ad48ed7fd13f62c0bd6c88ab355e9d38a0123"
+  },
+  "src/protocol/requests/syncGroup/fixtures/java/syncGroupResponse-v5-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "bd05dcce0d78e78ba700c9af5a4e05a59c4c3b9aa97050e7333ff393f43c2627"
+  },
+  "src/protocol/requests/syncGroup/fixtures/java/syncGroupResponse-v5-protocol.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "f8a670d35fe8f911c3ed5af293675be0979ea381e1b7f4a5b988fe495ca7e544"
+  },
+  "src/protocol/requests/txnOffsetCommit/fixtures/java/txnOffsetCommitRequest-v2-leaderEpoch.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "a1a0c7105231798b29780bee5d6e282970db18b5e28d23e8cacab65fae5899e5"
+  },
+  "src/protocol/requests/txnOffsetCommit/fixtures/java/txnOffsetCommitRequest-v2-legacy.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "60d9b6a7cdaca7ff7df8dea2cc19268629fb863b657e104e1e7f1a918b21c39c"
+  },
+  "src/protocol/requests/txnOffsetCommit/fixtures/java/txnOffsetCommitRequest-v3-groupMetadata.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "dc62dd11d7b48a12df8e1663f855938551cc0301a5160aef93e943d029e9972b"
+  },
+  "src/protocol/requests/txnOffsetCommit/fixtures/java/txnOffsetCommitRequest-v3-legacy.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "708f570776f1ec3cc5bed46f2c8127fbf5a34e0ccf313c8494531634a8b880f0"
+  },
+  "src/protocol/requests/txnOffsetCommit/fixtures/java/txnOffsetCommitRequest-v4-groupMetadata.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "813943fd35faedd561a2a5ec67ee6e7d7d151fd7a3b33a15c1682aab62855703"
+  },
+  "src/protocol/requests/txnOffsetCommit/fixtures/java/txnOffsetCommitRequest-v4-legacy.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "712e2bc6571a76686f9aa3758fb0b07f1ee71a004a235bb8284afad04492e4c2"
+  },
+  "src/protocol/requests/txnOffsetCommit/fixtures/java/txnOffsetCommitRequest-v5-groupMetadata.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "47ab979cac002e91d781c2f92deb1efbee67d895126d7ca507802f16f3106eb5"
+  },
+  "src/protocol/requests/txnOffsetCommit/fixtures/java/txnOffsetCommitRequest-v5-legacy.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "efc52cbd9862dedbba5b78964f7858206b654257a6befa29462b832b4e671891"
+  },
+  "src/protocol/requests/txnOffsetCommit/fixtures/java/txnOffsetCommitRequest-v6-defaultMetadata.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "6aea9507181ac19b4098ecca42dfbfc7ab2d8f25e4f5e5ddd7febffbc04c950d"
+  },
+  "src/protocol/requests/txnOffsetCommit/fixtures/java/txnOffsetCommitRequest-v6-groupMetadata.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "63f423173e5b13d30b6b6b0328b536b205f7745405057cfe4bb57a6c1735f074"
+  },
+  "src/protocol/requests/txnOffsetCommit/fixtures/java/txnOffsetCommitResponse-v2-error.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "5a274b1cbb52952405b9fd682e44d8484bc1f13cf0d3d943eea9dcc39720ef40"
+  },
+  "src/protocol/requests/txnOffsetCommit/fixtures/java/txnOffsetCommitResponse-v2-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "daed4f23165f40ebdab5168a149685eb363f2e7f85a169765b57ce66fc5f4a07"
+  },
+  "src/protocol/requests/txnOffsetCommit/fixtures/java/txnOffsetCommitResponse-v3-error.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "4cc136d784df7732ab2e42a6278938d55775dee20b0b26cddbd944e2fa7c0231"
+  },
+  "src/protocol/requests/txnOffsetCommit/fixtures/java/txnOffsetCommitResponse-v3-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "a51407b7247445c3a601689c9d06d9ef3537f8a74cb793eb438bc1406e03f791"
+  },
+  "src/protocol/requests/txnOffsetCommit/fixtures/java/txnOffsetCommitResponse-v4-error.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "ea2a7bfe8e1f0ea644b599a81dd482c28707dd19e79d3542e383406804665569"
+  },
+  "src/protocol/requests/txnOffsetCommit/fixtures/java/txnOffsetCommitResponse-v4-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "ffa43fcb8fdf054a86654c5ab0cd249915bc3135d9d927d50c9639247bc09405"
+  },
+  "src/protocol/requests/txnOffsetCommit/fixtures/java/txnOffsetCommitResponse-v5-error.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "2b1da8ed7f378d2bb6c194a394ce89aea768626ebc345570b60450824f690038"
+  },
+  "src/protocol/requests/txnOffsetCommit/fixtures/java/txnOffsetCommitResponse-v5-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "b9fb496b0d2419a63722e0d89ca06555664cc0bd0baf9c3743e5663a7dfbeafb"
+  },
+  "src/protocol/requests/txnOffsetCommit/fixtures/java/txnOffsetCommitResponse-v6-groupIdNotFound.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "118ee5f65043b2477dfaf4ea4b2949c057bcfdec719bf4f72fcf35c57425d4be"
+  },
+  "src/protocol/requests/txnOffsetCommit/fixtures/java/txnOffsetCommitResponse-v6-mixedOutcomes.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "0c806bc64b65294ba75c40a27fade4882aead6b595393f9d0af4ce047eb3a180"
+  },
+  "src/protocol/requests/txnOffsetCommit/fixtures/java/txnOffsetCommitResponse-v6-noTopics.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "0e54223e33f37240d8c44f10d142dbde9e6e6a6689a422f268f87597ace17ce8"
+  },
+  "src/protocol/requests/txnOffsetCommit/fixtures/java/txnOffsetCommitResponse-v6-ok.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "72ada9427872ebe6050b4bad6ce7691089952e71d5551476270b1798defde33f"
+  },
+  "src/protocol/requests/txnOffsetCommit/fixtures/java/txnOffsetCommitResponse-v6-staleMemberEpoch.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "bcfe17b92281b256a716d677df5af0df58bbec0a66429c781860c28542313eeb"
+  },
+  "src/protocol/requests/txnOffsetCommit/fixtures/java/txnOffsetCommitResponse-v6-unknownTags.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "79fb86cba7becdb4a9f5c924736662e13fc16ae140a17be7af449582c6438989"
+  },
+  "src/protocol/requests/txnOffsetCommit/fixtures/java/txnOffsetCommitResponse-v6-unknownTopicId.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "6b0de018be84b9d9469509ffd3c5612616fa1afc5b3a0c414df6a72192710b1f"
+  },
+  "src/protocol/requests/updateFeatures/fixtures/java/updateFeaturesRequest-v0-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "81b74262502b74ec106e07a63318f3e6624a298e0666bf28cf4b7335d8eecae7"
+  },
+  "src/protocol/requests/updateFeatures/fixtures/java/updateFeaturesRequest-v1-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "4399b3d30b9157cd5a48cfaa434057728d5729d1a577cf449eb26957507197de"
+  },
+  "src/protocol/requests/updateFeatures/fixtures/java/updateFeaturesRequest-v2-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "a13f951cf1fa7e475a12a0a1c9b937c524e3b3ac42b5103d0d1f944586a3f431"
+  },
+  "src/protocol/requests/updateFeatures/fixtures/java/updateFeaturesResponse-v0-mixed.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "071ed776ca32140e36afaca5f6a61445e8d625294243aecbcbf08c5c5b4821f0"
+  },
+  "src/protocol/requests/updateFeatures/fixtures/java/updateFeaturesResponse-v1-mixed.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "c63ee6db38e1aedea3e98b612cf47b929987cd63b2ef28c3bc617f033f897e1f"
+  },
+  "src/protocol/requests/updateFeatures/fixtures/java/updateFeaturesResponse-v2-mixed.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "f0ed1c8678a061d542caa991b92085fde41a560c5cca317f0f0ad7a9a26cc815"
+  },
+  "src/protocol/requests/writeTxnMarkers/fixtures/java/writeTxnMarkersRequest-v1-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "71bcb180b66a0db36f9b4f1020deed73d3c92822c2b46a2bc3cb44cab4e317f0"
+  },
+  "src/protocol/requests/writeTxnMarkers/fixtures/java/writeTxnMarkersRequest-v2-basic.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "c2a4639091081d1153e2265ad3d393caa2e558229a3903791fc9f2494f3f464c"
+  },
+  "src/protocol/requests/writeTxnMarkers/fixtures/java/writeTxnMarkersRequest-v2-transactionVersionTwo.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "c0cf0e6b344c9089734646ff6ac26fece3e67bde76a8e4df7b7875d50a08131d"
+  },
+  "src/protocol/requests/writeTxnMarkers/fixtures/java/writeTxnMarkersResponse-v1-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "5b7c8e4adf6d8fa88c80607bc9cf6802ae5617b11e2cf97534dbbcb403ce50c0"
+  },
+  "src/protocol/requests/writeTxnMarkers/fixtures/java/writeTxnMarkersResponse-v2-error31.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "edd6f77b7bc8dd8c5d3cb87b206f1ad1bc00d23a4786c8bfe74c8c8a2c33dd4c"
+  },
+  "src/protocol/requests/writeTxnMarkers/fixtures/java/writeTxnMarkersResponse-v2-error47.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "57033bc8ba695503a440255c0eb398218edb167a1b2a7bbfc13dee45cda54333"
+  },
+  "src/protocol/requests/writeTxnMarkers/fixtures/java/writeTxnMarkersResponse-v2-error52.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "d39ef594f16a2aded85595ef09ece62e8d8fe03c8e63e9add7dcedc11bb6d327"
+  },
+  "src/protocol/requests/writeTxnMarkers/fixtures/java/writeTxnMarkersResponse-v2-ok.json": {
+    "javaClientsJar": "4.3.1",
+    "javaClientsJarSha256": null,
+    "fixtureSha256": "804d49628b74067a0e809d08b5a730c2564723c274fb282847e2dd7697379dfc"
+  }
+}

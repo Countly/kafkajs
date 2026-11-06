@@ -2,13 +2,14 @@
 
 const fs = require('fs')
 const { kafkaTag, collect, render, OUTPUT } = require('../table')
+const trackedApis = require('../../compat/tracked-apis.json')
 
 describe('scripts/protocol > flexible-versions table', () => {
   const tag = kafkaTag()
   const rows = collect(tag)
 
   test('covers every API in the committed snapshot', () => {
-    expect(rows.length).toBe(40)
+    expect(rows.length).toBe(trackedApis.tracked.length)
     expect(rows[0]).toEqual({ apiKey: 0, apiName: 'Produce', flexibleFrom: 9 })
     expect(rows.find((row) => row.apiKey === 17)).toEqual({
       apiKey: 17,

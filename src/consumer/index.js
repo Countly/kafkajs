@@ -220,6 +220,8 @@ const parseDisconnectOptions = (options) => {
  *                                82); the fenced consumer crashes without restarting rather than
  *                                loop against a fencing broker.
  * @param {InstrumentationEventEmitter} [params.instrumentationEmitter]
+ * @param {boolean} [params.ownsCluster=true] private factory ownership; borrowed consumers never
+ *                                disconnect shared transport or restart after a crash
  * @param {number} params.metadataMaxAge
  * @param {'classic'|'consumer'} [params.groupProtocol='classic'] The group membership protocol.
  *                                `'consumer'` (KIP-848) lets the coordinator compute the
@@ -243,6 +245,7 @@ module.exports = (params) => {
   const {
     cluster,
     groupId,
+    ownsCluster = true,
     retry,
     logger: rootLogger,
     partitionAssigners = [roundRobin],
@@ -635,12 +638,16 @@ module.exports = (params) => {
    * A user disconnect ends the consumer, so its reset obligations are emptied. A crash restart
    * unlinks them and keeps them: the topics still owe those resets to the group it builds next.
    * @param {{ leaveGroup?: boolean }} [stopOptions]
-   * @param {{ keepResets?: boolean }} [shutDownOptions] `true` for the crash handler
+   * @param {{ keepResets?: boolean, preserveSetupState?: boolean }} [shutDownOptions] `true` for the crash handler
    * @param {ConsumerOperation} [operation] the close that bounds this shutdown; absent, it waits
    *   naturally
    * @returns {Promise<void>}
    */
-  const shutDown = async (stopOptions, { keepResets = false } = {}, operation) => {
+  const shutDown = async (
+    stopOptions,
+    { keepResets = false, preserveSetupState = false } = {},
+    operation
+  ) => {
     noteStop()
     const owned = life
 
@@ -650,7 +657,8 @@ module.exports = (params) => {
       } else {
         await stopShared(stopOptions)
         logger.debug('consumer has stopped, disconnecting', { groupId })
-        await cluster.disconnect()
+        if (ownsCluster)
+          await cluster.disconnect(...(preserveSetupState ? [{ preserveSetupState }] : []))
       }
       instrumentationEmitter.emit(DISCONNECT)
     } catch (e) {
@@ -682,9 +690,9 @@ module.exports = (params) => {
     let disconnecting = null
     /** Starts the close's one cluster disconnect; later calls share it. */
     const disconnectCluster = (drainTimeout) =>
-      (disconnecting ??= cluster.disconnect(
-        ...(drainTimeout === undefined ? [] : [{ drainTimeout }])
-      ))
+      (disconnecting ??= ownsCluster
+        ? cluster.disconnect(...(drainTimeout === undefined ? [] : [{ drainTimeout }]))
+        : Promise.resolve())
     let forced = false
     let forcedDone
     const forcedSettled = new Promise((resolve) => {
@@ -1213,7 +1221,7 @@ module.exports = (params) => {
       // further to log here; just make sure it cannot stop the CRASH event from firing.
       const crashStopGeneration = stopGeneration + 1
       try {
-        await shutDown(undefined, { keepResets: true })
+        await shutDown(undefined, { keepResets: true, preserveSetupState: true })
       } catch {}
 
       const isErrorRetriable =
@@ -1247,6 +1255,8 @@ module.exports = (params) => {
         // with the verdict that produced it.
         shouldRestart = false
       }
+
+      if (!ownsCluster) shouldRestart = false
 
       if (shouldRestart && (stopGeneration !== crashStopGeneration || owned.fence.closed)) {
         // The user called disconnect()/stop() during the crash cleanup or while restartOnFailure

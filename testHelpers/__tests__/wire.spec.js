@@ -31,10 +31,31 @@ const structured = (folder, version, direction) => {
  * `expected`, whose fields come from the Java generator's constructors.
  */
 const STRUCTURED = [
+  ['apiVersionsV5', 'apiVersions', 'ApiVersions', 5],
+  ['describeProducersV0', 'describeProducers', 'DescribeProducers', 0],
+  ['describeTransactionsV0', 'describeTransactions', 'DescribeTransactions', 0],
+  ['listTransactionsV0', 'listTransactions', 'ListTransactions', 0],
+  ['listTransactionsV1', 'listTransactions', 'ListTransactions', 1],
+  ['listTransactionsV2', 'listTransactions', 'ListTransactions', 2],
+  ['writeTxnMarkersV1', 'writeTxnMarkers', 'WriteTxnMarkers', 1],
+  ['writeTxnMarkersV2', 'writeTxnMarkers', 'WriteTxnMarkers', 2],
+  ['electLeadersV0', 'electLeaders', 'ElectLeaders', 0, 'mixed'],
+  ['electLeadersV1', 'electLeaders', 'ElectLeaders', 1, 'mixed'],
+  ['electLeadersV2', 'electLeaders', 'ElectLeaders', 2, 'mixed'],
+  ['updateFeaturesV0', 'updateFeatures', 'UpdateFeatures', 0, 'mixed'],
+  ['updateFeaturesV1', 'updateFeatures', 'UpdateFeatures', 1, 'mixed'],
+  ['updateFeaturesV2', 'updateFeatures', 'UpdateFeatures', 2, 'mixed'],
+  ['describeClusterV0', 'describeCluster', 'DescribeCluster', 0, 'mixed'],
+  ['describeClusterV1', 'describeCluster', 'DescribeCluster', 1, 'mixed'],
+  ['describeClusterV2', 'describeCluster', 'DescribeCluster', 2, 'mixed'],
+  ['listConfigResourcesV0', 'listConfigResources', 'ListConfigResources', 0, 'mixed'],
+  ['listConfigResourcesV1', 'listConfigResources', 'ListConfigResources', 1, 'mixed'],
   ['joinGroupV8', 'joinGroup', 'JoinGroup', 8],
   ['syncGroupV5', 'syncGroup', 'SyncGroup', 5],
   ['heartbeatV4', 'heartbeat', 'Heartbeat', 4],
   ['leaveGroupV5', 'leaveGroup', 'LeaveGroup', 5],
+  ['offsetDeleteV0', 'offsetDelete', 'OffsetDelete', 0, 'mixed'],
+  ['offsetFetchV7', 'offsetFetch', 'OffsetFetch', 7, 'stable'],
   ['offsetFetchV9', 'offsetFetch', 'OffsetFetch', 9],
   ['offsetCommitV9', 'offsetCommit', 'OffsetCommit', 9],
   ['addPartitionsToTxnV3', 'addPartitionsToTxn', 'AddPartitionsToTxn', 3],
@@ -106,7 +127,7 @@ describe('wire pairs checked against structured Java vectors', () => {
       (_case, vector) => {
         const bytes = Buffer.concat([bytesOf(vector), Buffer.from([0xff])])
 
-        expect(() => pair.readRequest(bytes)).toThrow('its tag buffer')
+        expect(() => pair.readRequest(bytes)).toThrow(/its tag buffer|trailing bytes/)
       }
     )
 
@@ -273,6 +294,12 @@ describe('wire pairs with bytes fields', () => {
  * the vector's values and wrong for any other (a swapped pair of equal strings, a fixed width).
  */
 const VARIED = [
+  [
+    'apiVersionsV5',
+    'apiVersions/v5/response',
+    { apiKeys: [{ apiKey: 3, minVersion: 12, maxVersion: 12 }], throttleTime: 7 },
+    { apiVersions: [{ apiKey: 3, minVersion: 12, maxVersion: 12 }], clientSideThrottleTime: 7 },
+  ],
   [
     'apiVersionsV4',
     'apiVersions/v4/response',
@@ -654,6 +681,45 @@ const VARIED = [
     { errorCode: 58, errorMessage: 'bad', sessionLifetimeMs: '7' },
   ],
 ]
+
+describe('ApiVersions v5 pair', () => {
+  const pair = require('../wire/apiVersionsV5')
+  const unsupported = load(
+    'apiVersions/fixtures/java/apiVersionsResponse-v0-unsupportedVersion.json'
+  )
+
+  test('builds the bytes of the v0-shaped UNSUPPORTED_VERSION answer Java writes at version 0', () => {
+    expect(pair.buildUnsupportedVersionResponse(unsupported.fields).toString('hex')).toBe(
+      unsupported.hex
+    )
+    expect(pair.buildUnsupportedVersionResponse().toString('hex')).toBe(unsupported.hex)
+  })
+
+  test('answers an older broker’s range, not a fixed one', () => {
+    const body = pair.buildUnsupportedVersionResponse({
+      apiKeys: [{ apiKey: 18, minVersion: 0, maxVersion: 3 }],
+    })
+
+    expect(body.toString('hex')).toBe(
+      '0023' + // UNSUPPORTED_VERSION
+        '00000001' + // one entry, in a classic array
+        '0012' +
+        '0000' +
+        '0003' // ApiVersions, 0 to 3
+    )
+  })
+
+  test('reads the cluster id and node id of a request, which a v4 request does not carry', () => {
+    const request = load('apiVersions/fixtures/java/apiVersionsRequest-v5-known.json')
+
+    expect(pair.readRequest(bytesOf(request))).toEqual({
+      clientSoftwareName: 'countly-kafkajs',
+      clientSoftwareVersion: '3.0.0-alpha.4',
+      clusterId: 'test-cluster-id',
+      nodeId: 2,
+    })
+  })
+})
 
 describe('builders agree with the client’s decoder on fields the vectors do not hold', () => {
   test.each(VARIED)('%s', async (name, decoder, fields, decoded) => {
@@ -1307,4 +1373,234 @@ describe('independent record-containing Produce requests', () => {
       })
     ).toEqual({ version: 2, bumpRequired: false })
   })
+})
+
+describe('Metadata v7 pair', () => {
+  const pair = require('../wire/metadataV7')
+  test('reads independent classic request literals', () => {
+    expect(pair.readRequest(Buffer.from('00000001000a746573742d746f70696301', 'hex'))).toEqual({
+      topics: ['test-topic'],
+      allowAutoTopicCreation: true,
+    })
+    expect(pair.readRequest(Buffer.from('ffffffff00', 'hex'))).toEqual({
+      topics: null,
+      allowAutoTopicCreation: false,
+    })
+  })
+  test('matches the independent classic response layout literals', async () => {
+    const hex =
+      '00000000000000010000000000093132372e302e302e3100002384ffff000f746573742d636c75737465722d696400000000000000010000000a746573742d746f706963000000000100000000000000000001000000050000000100000001000000010000000100000000'
+    expect(pair.buildResponse().toString('hex')).toBe(hex)
+    const result = await require('../../src/protocol/requests/metadata/v7/response').decode(
+      Buffer.from(hex, 'hex')
+    )
+    expect(result.topicMetadata[0]).toMatchObject({
+      topic: 'test-topic',
+      partitionMetadata: [
+        {
+          partitionId: 0,
+          leader: 1,
+          leaderEpoch: 5,
+          replicas: [1],
+          isr: [1],
+          offlineReplicas: [],
+          partitionErrorCode: 0,
+        },
+      ],
+    })
+    expect(result.topicMetadata[0].topicAuthorizedOperations).toBeUndefined()
+  })
+  test('rejects a cut request and trailing bytes', () => {
+    expect(() => pair.readRequest(Buffer.from('00000001000a74', 'hex'))).toThrow()
+    expect(() =>
+      pair.readRequest(Buffer.from('00000001000a746573742d746f7069630100', 'hex'))
+    ).toThrow()
+  })
+})
+
+describe('offset admin wire layouts', () => {
+  test('OffsetDelete has classic headers and independent field order', async () => {
+    const { requestHeaderVersion, responseHeaderVersion } = require('../../src/protocol/headers')
+    const pair = require('../wire/offsetDeleteV0')
+    const build = require('../../src/protocol/requests/offsetDelete/v0/request')
+    const expected = require('../wire/expected').offsetDeleteV0
+    expect(requestHeaderVersion(47, 0)).toBe(1)
+    expect(responseHeaderVersion(47, 0)).toBe(0)
+    const body = (await build(expected.request).encode()).buffer
+    expect(body.toString('hex')).toBe(
+      '000a746573742d67726f757000000001000a746573742d746f706963000000020000000000000001'
+    )
+    expect(pair.readRequest(body)).toEqual(expected.request)
+    expect(() => pair.readRequest(Buffer.concat([body, Buffer.from([0])]))).toThrow(/trailing/)
+    const answer = pair.buildResponse()
+    expect(answer.subarray(0, 6).toString('hex')).toBe('000000000011')
+    expect(
+      await require('../../src/protocol/requests/offsetDelete/v0/response').decode(answer)
+    ).toMatchObject({ errorCode: 0, clientSideThrottleTime: 17, topics: expected.response.topics })
+  })
+  test('v7 reader agrees with the existing independent Java request', () => {
+    const pair = require('../wire/offsetFetchV7')
+    const vector = require('../../src/protocol/requests/offsetFetch/fixtures/java/offsetFetchRequest-v7-requireStable.json')
+    expect(pair.readRequest(Buffer.from(vector.hex, 'hex'))).toEqual(vector.fields)
+  })
+  test('v9 preserves its single-group Java response and reads several groups', async () => {
+    const pair = require('../wire/offsetFetchV9')
+    const vector = require('../../src/protocol/requests/offsetFetch/fixtures/java/offsetFetchResponse-v9-basic.json')
+    expect(pair.buildResponse(vector.fields).toString('hex')).toBe(vector.hex)
+    const groups = ['a', 'b'].map((groupId) => ({
+      groupId,
+      topics: [{ topic: 't', partitions: [{ partition: 0 }] }],
+    }))
+    const request = require('../../src/protocol/requests/offsetFetch').protocol({ version: 9 })({
+      groups,
+      requireStable: true,
+    })
+    const fields = pair.readRequest((await request.request.encode()).buffer)
+    expect(fields).toEqual({
+      groups: groups.map((g) => ({ ...g, memberId: null, memberEpoch: -1 })),
+      requireStable: true,
+    })
+  })
+  test.each([8, 9])(
+    'v%i refuses duplicate missing and foreign groups before error parsing',
+    async (version) => {
+      const build = require('../../src/protocol/requests/offsetFetch').protocol({ version })
+      const groups = ['a', 'b'].map((groupId) => ({ groupId, topics: [] }))
+      for (const ids of [['a', 'a'], ['a'], ['a', 'foreign']]) {
+        const response = require('../wire/offsetFetchV9').buildResponse({
+          groups: ids.map((groupId) => ({ groupId, topics: [], errorCode: 30 })),
+        })
+        await expect(build({ groups }).response.decode(response)).rejects.toMatchObject({
+          name: 'KafkaJSInvariantViolation',
+        })
+      }
+    }
+  )
+})
+
+describe('storage layouts from independent literals', () => {
+  const cases = [
+    'describeLogDirsV1',
+    'describeLogDirsV2',
+    'describeLogDirsV3',
+    'describeLogDirsV4',
+    'describeLogDirsV5',
+    'alterReplicaLogDirsV1',
+    'alterReplicaLogDirsV2',
+    'listOffsetsV10',
+    'listOffsetsV11',
+    'alterPartitionReassignmentsV1',
+    'deleteTopicsV6',
+  ]
+  test.each(cases)('%s matches every request and response byte', async (name) => {
+    const expected = require('../wire/expected')[name]
+    const pair = require(`../wire/${name}`)
+    const folder = pair.api[0].toLowerCase() + pair.api.slice(1)
+    const requestFields =
+      pair.api === 'DeleteTopics'
+        ? {
+            topicIds: expected.request.topics.map((t) => t.topicId),
+            timeout: expected.request.timeout,
+          }
+        : expected.request
+    const request = require(`../../src/protocol/requests/${folder}/v${pair.version}/request`)(
+      requestFields
+    )
+    const bytes = (await request.encode()).buffer
+    expect(bytes.toString('hex')).toBe(expected.requestHex)
+    expect(pair.readRequest(Buffer.from(expected.requestHex, 'hex'))).toEqual(expected.request)
+    expect(pair.buildResponse().toString('hex')).toBe(expected.responseHex)
+    const codec = require(`../../src/protocol/requests/${folder}/v${pair.version}/response`)
+    const decoded = await codec.decode(Buffer.from(expected.responseHex, 'hex'))
+    if (pair.api === 'DescribeLogDirs') {
+      expect(decoded.logDirs).toEqual(
+        expected.response.logDirs.map((d) => ({
+          ...d,
+          totalBytes: d.totalBytes ?? null,
+          usableBytes: d.usableBytes ?? null,
+          isCordoned: d.isCordoned ?? null,
+        }))
+      )
+      expect(decoded.errorCode).toBe(0)
+    } else
+      for (const key of ['topics', 'responses', 'topicErrors'])
+        if (expected.response[key]) {
+          // Reassignment's frozen parser intentionally discards broker error text.
+          const data =
+            pair.api === 'AlterPartitionReassignments'
+              ? expected.response[key].map((t) => ({
+                  ...t,
+                  partitions: t.partitions.map(({ errorMessage, ...p }) => p),
+                }))
+              : expected.response[key]
+          expect(decoded[key]).toEqual(data)
+        }
+    expect(decoded.clientSideThrottleTime ?? decoded.throttleTime).toBe(17)
+    const { requestHeaderVersion, responseHeaderVersion } = require('../../src/protocol/headers')
+    const flexible = !(
+      pair.version === 1 && ['DescribeLogDirs', 'AlterReplicaLogDirs'].includes(pair.api)
+    )
+    expect(requestHeaderVersion(pair.apiKey, pair.version)).toBe(flexible ? 2 : 1)
+    expect(responseHeaderVersion(pair.apiKey, pair.version)).toBe(flexible ? 1 : 0)
+  })
+  test.each(cases)('%s independent reader rejects truncation and surplus', (name) => {
+    const expected = require('../wire/expected')[name]
+    const pair = require(`../wire/${name}`)
+    const body = Buffer.from(expected.requestHex, 'hex')
+    expect(() => pair.readRequest(body.subarray(0, -1))).toThrow()
+    expect(() => pair.readRequest(Buffer.concat([body, Buffer.from([0])]))).toThrow()
+  })
+  test.each([1, 2, 3, 4, 5])(
+    'directory v%i preserves all-topic null and explicit empty',
+    async (version) => {
+      const request = require(`../../src/protocol/requests/describeLogDirs/v${version}/request`)
+      const pair = require(`../wire/describeLogDirsV${version}`)
+      for (const topics of [null, []])
+        expect(pair.readRequest((await request({ topics }).encode()).buffer)).toEqual({ topics })
+    }
+  )
+})
+
+/** Requires genuine Java outputs; this suite is a mandatory generation gate, never auto-skipped. */
+describe('storage Java vectors', () => {
+  test.each([
+    'describeLogDirsV1',
+    'describeLogDirsV2',
+    'describeLogDirsV3',
+    'describeLogDirsV4',
+    'describeLogDirsV5',
+    'alterReplicaLogDirsV1',
+    'alterReplicaLogDirsV2',
+    'listOffsetsV10',
+    'listOffsetsV11',
+    'alterPartitionReassignmentsV1',
+    'deleteTopicsV6',
+  ])('%s compares both independently generated directions', async (name) => {
+    const e = require('../wire/expected')[name]
+    const pair = require(`../wire/${name}`)
+    const folder = pair.api[0].toLowerCase() + pair.api.slice(1)
+    for (const direction of ['Request', 'Response']) {
+      const filename = `${folder}${direction}-v${pair.version}-storage.json`
+      const vector = require(`../../src/protocol/requests/${folder}/fixtures/java/${filename}`)
+      expect(vector.hex).toBe(direction === 'Request' ? e.requestHex : e.responseHex)
+      expect(vector.fields).toEqual(direction === 'Request' ? e.request : e.response)
+    }
+  })
+})
+
+describe('security admin pairs', () => {
+  test.each(Object.entries(expected.securityAdmin))(
+    '%s matches independent literals in both directions',
+    (name, vector) => {
+      const pair = require('../wire/' + name)
+      expect(pair.readRequest(Buffer.from(vector.requestHex, 'hex'))).toEqual(vector.request)
+      expect(pair.buildResponse()).toEqual(Buffer.from(vector.responseHex, 'hex'))
+      expect(() =>
+        pair.readRequest(Buffer.concat([Buffer.from(vector.requestHex, 'hex'), Buffer.from([0])]))
+      ).toThrow()
+      expect(() =>
+        pair.readRequest(Buffer.from(vector.requestHex, 'hex').subarray(0, -1))
+      ).toThrow()
+    }
+  )
 })

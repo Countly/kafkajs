@@ -1,0 +1,7 @@
+{
+  "message": "AlterPartitionReassignmentsRequest",
+  "version": 1,
+  "case": "storage",
+  "hex": "00001388000202740200000000030000000100000002000000",
+  "fields": {"timeout":5000,"allowReplicationFactorChange":false,"topics":[{"topic":"t","partitionAssignment":[{"partition":0,"replicas":[1,2]}]}]}
+}

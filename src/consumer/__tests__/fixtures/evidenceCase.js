@@ -1,7 +1,9 @@
 /**
  * Runs a live case's body under its cleanup stack and writes the case's evidence row between the
  * two, however the body ended, so the row is written before any cleanup runs. A failed write never
- * replaces the body's own failure; with none, it is thrown, so a lost row is not read as a pass.
+ * replaces the body's own failure, which carries it as `evidenceError` so that a lost row is not
+ * lost silently; with no body failure, the failed write is thrown, so a lost row is not read as a
+ * pass.
  * @param {import('../../../producer/__tests__/fixtures/liveProbe').CleanupStack} cleanup
  * @param {(failure: Error|null) => Promise<Error|null>} write writes the row from what the case
  *   retained; it returns its own failure and never throws
@@ -22,6 +24,9 @@ const runWithEvidence = (cleanup, write, body, cleanupBudgetMs) =>
         throw error
       } finally {
         reporting = await write(failure)
+        if (reporting && failure !== null && typeof failure === 'object') {
+          failure.evidenceError = reporting
+        }
       }
       if (reporting) throw reporting
     },

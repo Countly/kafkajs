@@ -24,23 +24,30 @@ const { OffsetFetch: apiKey } = require('../../apiKeys')
  * @see clients/src/main/resources/common/message/OffsetFetchRequest.json (Apache Kafka 4.3.1)
  *
  * @param {object} options
+ * @param {object[]} [options.groups] explicit multi-group request; absent retains legacy shape
  * @param {string} options.groupId
  * @param {{topic: string, partitions: {partition: number}[]}[]} options.topics
  * @param {boolean} [options.requireStable=false] ask for stable offsets only (KIP-447, see v7)
  * @returns {object} the protocol request
  */
-module.exports = ({ groupId, topics, requireStable = false }) => ({
+module.exports = ({ groupId, topics, groups, requireStable = false }) => ({
   apiKey,
   apiVersion: 8,
   apiName: 'OffsetFetch',
   encode: async () =>
     new Encoder()
-      .writeUVarIntArray([
-        new Encoder()
-          .writeUVarIntString(groupId)
-          .writeUVarIntArray(topics == null || topics.length === 0 ? null : topics.map(encodeTopic))
-          .writeTaggedFields(),
-      ])
+      .writeUVarIntArray(
+        (groups ?? [{ groupId, topics }]).map((group) =>
+          new Encoder()
+            .writeUVarIntString(group.groupId)
+            .writeUVarIntArray(
+              group.topics == null || (groups === undefined && group.topics.length === 0)
+                ? null
+                : group.topics.map(encodeTopic)
+            )
+            .writeTaggedFields()
+        )
+      )
       .writeBoolean(requireStable)
       .writeTaggedFields(),
 })

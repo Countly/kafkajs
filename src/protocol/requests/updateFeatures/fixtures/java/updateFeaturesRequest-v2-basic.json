@@ -1,0 +1,7 @@
+{
+  "message": "UpdateFeaturesRequest",
+  "version": 2,
+  "case": "basic",
+  "hex": "0000ea6002116d657461646174612e76657273696f6e001902000100",
+  "fields": {"timeoutMs":60000,"featureUpdates":[{"feature":"metadata.version","maxVersionLevel":25,"upgradeType":2}],"validateOnly":true}
+}

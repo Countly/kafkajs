@@ -1,6 +1,6 @@
 {
   "generatedFrom": {
-    "kafkaTag": "4.3.1",
+    "kafkaTag": "4.4.0",
     "tool": "scripts/compat",
     "schemaVersion": 1
   },
@@ -93,12 +93,14 @@
         6,
         7,
         8,
-        9
+        9,
+        10,
+        11
       ],
-      "gap": "behind:2",
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
-      "notes": "v4 leader epoch (KIP-320), v6 flexible, v7 max-timestamp (KIP-734), v8 earliest-local offset (KIP-405), v9 last-tiered offset (KIP-1005). v10 (async remote list offsets, KIP-1075) and v11 (earliest pending upload offset, KIP-1023) are deliberate gaps, not a waiver: both are tiered-storage features this client does not use."
+      "notes": "v4 leader epoch (KIP-320), v6 flexible, v7 max-timestamp (KIP-734), v8 earliest-local offset (KIP-405), v9 last-tiered offset (KIP-1005), v10 asynchronous remote offset reads with TimeoutMs (KIP-1075), v11 earliest pending upload offset (KIP-1023). Named admin specs return raw broker offsets; consumer and numeric timestamp requests retain their version ceiling."
     },
     {
       "kafkaName": "Metadata",
@@ -409,7 +411,7 @@
       "planned": "done",
       "validVersions": [
         0,
-        4
+        5
       ],
       "flexibleFrom": 3,
       "deprecatedVersions": null,
@@ -419,12 +421,13 @@
         1,
         2,
         3,
-        4
+        4,
+        5
       ],
       "gap": "current",
       "onFloor": false,
       "belowFloor": [],
-      "notes": "v0-v3 omit every SupportedFeatures entry whose MinVersion is 0 (KAFKA-17011, fixed in v4 / Kafka 3.9), so a v3-only client sees a truncated feature list. The client asks for v4 first; a broker that does not support it answers UNSUPPORTED_VERSION with the versions it has, and the client asks again at the highest one both sides implement (only a broker below 3.9 does this, and the 4.0 floor excludes them)."
+      "notes": "v0-v3 omit every SupportedFeatures entry whose MinVersion is 0 (KAFKA-17011, fixed in v4 / Kafka 3.9), so a v3-only client sees a truncated feature list. v5 (Kafka 4.4, KIP-1242) adds the intended ClusterId and NodeId to the request and the REBOOTSTRAP_REQUIRED answer. The client asks for v5 first and names the identity only once it knows both the cluster and the node; a broker that does not support v5 answers UNSUPPORTED_VERSION with the versions it has, and the client asks again at the highest one both sides implement (every broker below 4.4 does this and completes v4)."
     },
     {
       "kafkaName": "CreateTopics",
@@ -625,6 +628,28 @@
       "notes": "v2 PRODUCER_FENCED, v3 flexible, v4 TRANSACTION_ABORTABLE, v5 returns the producer id and epoch the coordinator bumped to (KIP-890 part 2). A transaction stays at v4 or below unless its coordinator finalizes transaction.version at level 2 or above in ApiVersions v3+; v5 being advertised is not the signal."
     },
     {
+      "kafkaName": "WriteTxnMarkers",
+      "apiKey": 27,
+      "forkName": "writeTxnMarkers",
+      "apiKeysName": "WriteTxnMarkers",
+      "planned": "done",
+      "validVersions": [
+        1,
+        2
+      ],
+      "flexibleFrom": 1,
+      "deprecatedVersions": null,
+      "latestVersionUnstable": false,
+      "forkVersions": [
+        1,
+        2
+      ],
+      "gap": "current",
+      "onFloor": false,
+      "belowFloor": [],
+      "notes": "Written by a transaction coordinator to the leaders of the partitions in a transaction, and also sent by `abortTransaction`. v1 is the 4.0 baseline and flexible; v2 adds TransactionVersion (KIP-1228). Not yet implemented."
+    },
+    {
       "kafkaName": "TxnOffsetCommit",
       "apiKey": 28,
       "forkName": "txnOffsetCommit",
@@ -632,7 +657,7 @@
       "planned": "done",
       "validVersions": [
         0,
-        5
+        6
       ],
       "flexibleFrom": 3,
       "deprecatedVersions": null,
@@ -643,12 +668,13 @@
         2,
         3,
         4,
-        5
+        5,
+        6
       ],
       "gap": "current",
       "onFloor": false,
       "belowFloor": [],
-      "notes": "v2 committed leader epoch, v3 flexible with KIP-447 group metadata (generation, member id, group instance id), v4 TRANSACTION_ABORTABLE, v5 adds the offsets to the transaction itself under transaction version 2, so no AddOffsetsToTxn precedes it. A transaction stays at v4 or below unless its coordinator finalizes transaction.version at level 2 or above."
+      "notes": "v2 committed leader epoch, v3 flexible with KIP-447 group metadata (generation, member id, group instance id), v4 TRANSACTION_ABORTABLE, v5 adds the offsets to the transaction itself under transaction version 2, so no AddOffsetsToTxn precedes it, v6 topic IDs (KIP-1319, Kafka 4.4): a transaction sends it when its coordinator finalizes transaction.version at level 2 or above and the cache holds the id of every topic in the request; one unknown id keeps the whole request at v5, and a transaction at transaction version 1 stays at v4 or below whatever ids it has. v6 can answer GROUP_ID_NOT_FOUND, STALE_MEMBER_EPOCH and UNKNOWN_TOPIC_ID."
     },
     {
       "kafkaName": "DescribeAcls",
@@ -767,6 +793,53 @@
       "notes": "Replaces the resource's whole dynamic config: an entry left out is deleted. IncrementalAlterConfigs (key 44) changes only the entries it names."
     },
     {
+      "kafkaName": "AlterReplicaLogDirs",
+      "apiKey": 34,
+      "forkName": "alterReplicaLogDirs",
+      "apiKeysName": "AlterReplicaLogDirs",
+      "planned": "done",
+      "validVersions": [
+        1,
+        2
+      ],
+      "flexibleFrom": 2,
+      "deprecatedVersions": null,
+      "latestVersionUnstable": false,
+      "forkVersions": [
+        1,
+        2
+      ],
+      "gap": "current",
+      "onFloor": false,
+      "belowFloor": [],
+      "notes": ""
+    },
+    {
+      "kafkaName": "DescribeLogDirs",
+      "apiKey": 35,
+      "forkName": "describeLogDirs",
+      "apiKeysName": "DescribeLogDirs",
+      "planned": "done",
+      "validVersions": [
+        1,
+        5
+      ],
+      "flexibleFrom": 2,
+      "deprecatedVersions": null,
+      "latestVersionUnstable": false,
+      "forkVersions": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "gap": "current",
+      "onFloor": false,
+      "belowFloor": [],
+      "notes": ""
+    },
+    {
       "kafkaName": "SaslAuthenticate",
       "apiKey": 36,
       "forkName": "saslAuthenticate",
@@ -814,10 +887,124 @@
       "notes": ""
     },
     {
+      "kafkaName": "CreateDelegationToken",
+      "apiKey": 38,
+      "forkName": "createDelegationToken",
+      "apiKeysName": "CreateDelegationToken",
+      "planned": "done",
+      "validVersions": [
+        1,
+        3
+      ],
+      "flexibleFrom": 2,
+      "deprecatedVersions": null,
+      "latestVersionUnstable": false,
+      "forkVersions": [
+        1,
+        2,
+        3
+      ],
+      "gap": "current",
+      "onFloor": false,
+      "belowFloor": [],
+      "notes": ""
+    },
+    {
+      "kafkaName": "RenewDelegationToken",
+      "apiKey": 39,
+      "forkName": "renewDelegationToken",
+      "apiKeysName": "RenewDelegationToken",
+      "planned": "done",
+      "validVersions": [
+        1,
+        2
+      ],
+      "flexibleFrom": 2,
+      "deprecatedVersions": null,
+      "latestVersionUnstable": false,
+      "forkVersions": [
+        1,
+        2
+      ],
+      "gap": "current",
+      "onFloor": false,
+      "belowFloor": [],
+      "notes": ""
+    },
+    {
+      "kafkaName": "ExpireDelegationToken",
+      "apiKey": 40,
+      "forkName": "expireDelegationToken",
+      "apiKeysName": "ExpireDelegationToken",
+      "planned": "done",
+      "validVersions": [
+        1,
+        2
+      ],
+      "flexibleFrom": 2,
+      "deprecatedVersions": null,
+      "latestVersionUnstable": false,
+      "forkVersions": [
+        1,
+        2
+      ],
+      "gap": "current",
+      "onFloor": false,
+      "belowFloor": [],
+      "notes": ""
+    },
+    {
+      "kafkaName": "DescribeDelegationToken",
+      "apiKey": 41,
+      "forkName": "describeDelegationToken",
+      "apiKeysName": "DescribeDelegationToken",
+      "planned": "done",
+      "validVersions": [
+        1,
+        3
+      ],
+      "flexibleFrom": 2,
+      "deprecatedVersions": null,
+      "latestVersionUnstable": false,
+      "forkVersions": [
+        1,
+        2,
+        3
+      ],
+      "gap": "current",
+      "onFloor": false,
+      "belowFloor": [],
+      "notes": ""
+    },
+    {
       "kafkaName": "DeleteGroups",
       "apiKey": 42,
       "forkName": "deleteGroups",
       "apiKeysName": "DeleteGroups",
+      "planned": "done",
+      "validVersions": [
+        0,
+        3
+      ],
+      "flexibleFrom": 2,
+      "deprecatedVersions": null,
+      "latestVersionUnstable": false,
+      "forkVersions": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "gap": "current",
+      "onFloor": false,
+      "belowFloor": [],
+      "notes": ""
+    },
+    {
+      "kafkaName": "ElectLeaders",
+      "apiKey": 43,
+      "forkName": "electLeaders",
+      "apiKeysName": "ElectLeaders",
       "planned": "done",
       "validVersions": [
         0,
@@ -872,12 +1059,13 @@
       "deprecatedVersions": null,
       "latestVersionUnstable": false,
       "forkVersions": [
-        0
+        0,
+        1
       ],
-      "gap": "behind:1",
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
-      "notes": "v0 is flexible (KIP-455): the codec writes its own body tag buffer, like every flexible codec, and the request header is chosen by the flexible framing. v1 adds AllowReplicationFactorChange (KIP-860), which defaults to true, the behavior v0 has; it is not implemented because nothing here asks to forbid a replication-factor change, so behind:1 is this API's steady state until something does."
+      "notes": "v0 is flexible (KIP-455). v1 implements AllowReplicationFactorChange (KIP-860), which defaults to true, preserving v0 behavior. Setting allowReplicationFactorChange to false requires v1 and rejects before sending on a v0-only broker."
     },
     {
       "kafkaName": "ListPartitionReassignments",
@@ -899,6 +1087,224 @@
       "onFloor": false,
       "belowFloor": [],
       "notes": "Kafka defines only v0 (KIP-455), a flexible version, so the fork is current."
+    },
+    {
+      "kafkaName": "OffsetDelete",
+      "apiKey": 47,
+      "forkName": "offsetDelete",
+      "apiKeysName": "OffsetDelete",
+      "planned": "done",
+      "validVersions": [
+        0,
+        0
+      ],
+      "flexibleFrom": null,
+      "deprecatedVersions": null,
+      "latestVersionUnstable": false,
+      "forkVersions": [
+        0
+      ],
+      "gap": "current",
+      "onFloor": false,
+      "belowFloor": [],
+      "notes": ""
+    },
+    {
+      "kafkaName": "DescribeClientQuotas",
+      "apiKey": 48,
+      "forkName": "describeClientQuotas",
+      "apiKeysName": "DescribeClientQuotas",
+      "planned": "done",
+      "validVersions": [
+        0,
+        1
+      ],
+      "flexibleFrom": 1,
+      "deprecatedVersions": null,
+      "latestVersionUnstable": false,
+      "forkVersions": [
+        0,
+        1
+      ],
+      "gap": "current",
+      "onFloor": false,
+      "belowFloor": [],
+      "notes": ""
+    },
+    {
+      "kafkaName": "AlterClientQuotas",
+      "apiKey": 49,
+      "forkName": "alterClientQuotas",
+      "apiKeysName": "AlterClientQuotas",
+      "planned": "done",
+      "validVersions": [
+        0,
+        1
+      ],
+      "flexibleFrom": 1,
+      "deprecatedVersions": null,
+      "latestVersionUnstable": false,
+      "forkVersions": [
+        0,
+        1
+      ],
+      "gap": "current",
+      "onFloor": false,
+      "belowFloor": [],
+      "notes": ""
+    },
+    {
+      "kafkaName": "DescribeUserScramCredentials",
+      "apiKey": 50,
+      "forkName": "describeUserScramCredentials",
+      "apiKeysName": "DescribeUserScramCredentials",
+      "planned": "done",
+      "validVersions": [
+        0,
+        0
+      ],
+      "flexibleFrom": 0,
+      "deprecatedVersions": null,
+      "latestVersionUnstable": false,
+      "forkVersions": [
+        0
+      ],
+      "gap": "current",
+      "onFloor": false,
+      "belowFloor": [],
+      "notes": ""
+    },
+    {
+      "kafkaName": "AlterUserScramCredentials",
+      "apiKey": 51,
+      "forkName": "alterUserScramCredentials",
+      "apiKeysName": "AlterUserScramCredentials",
+      "planned": "done",
+      "validVersions": [
+        0,
+        0
+      ],
+      "flexibleFrom": 0,
+      "deprecatedVersions": null,
+      "latestVersionUnstable": false,
+      "forkVersions": [
+        0
+      ],
+      "gap": "current",
+      "onFloor": false,
+      "belowFloor": [],
+      "notes": ""
+    },
+    {
+      "kafkaName": "UpdateFeatures",
+      "apiKey": 57,
+      "forkName": "updateFeatures",
+      "apiKeysName": "UpdateFeatures",
+      "planned": "done",
+      "validVersions": [
+        0,
+        2
+      ],
+      "flexibleFrom": 0,
+      "deprecatedVersions": null,
+      "latestVersionUnstable": false,
+      "forkVersions": [
+        0,
+        1,
+        2
+      ],
+      "gap": "current",
+      "onFloor": false,
+      "belowFloor": [],
+      "notes": ""
+    },
+    {
+      "kafkaName": "DescribeCluster",
+      "apiKey": 60,
+      "forkName": "describeCluster",
+      "apiKeysName": "DescribeCluster",
+      "planned": "done",
+      "validVersions": [
+        0,
+        2
+      ],
+      "flexibleFrom": 0,
+      "deprecatedVersions": null,
+      "latestVersionUnstable": false,
+      "forkVersions": [
+        0,
+        1,
+        2
+      ],
+      "gap": "current",
+      "onFloor": false,
+      "belowFloor": [],
+      "notes": ""
+    },
+    {
+      "kafkaName": "DescribeProducers",
+      "apiKey": 61,
+      "forkName": "describeProducers",
+      "apiKeysName": "DescribeProducers",
+      "planned": "done",
+      "validVersions": [
+        0,
+        0
+      ],
+      "flexibleFrom": 0,
+      "deprecatedVersions": null,
+      "latestVersionUnstable": false,
+      "forkVersions": [
+        0
+      ],
+      "gap": "current",
+      "onFloor": false,
+      "belowFloor": [],
+      "notes": ""
+    },
+    {
+      "kafkaName": "DescribeTransactions",
+      "apiKey": 65,
+      "forkName": "describeTransactions",
+      "apiKeysName": "DescribeTransactions",
+      "planned": "done",
+      "validVersions": [
+        0,
+        0
+      ],
+      "flexibleFrom": 0,
+      "deprecatedVersions": null,
+      "latestVersionUnstable": false,
+      "forkVersions": [
+        0
+      ],
+      "gap": "current",
+      "onFloor": false,
+      "belowFloor": [],
+      "notes": ""
+    },
+    {
+      "kafkaName": "ListTransactions",
+      "apiKey": 66,
+      "forkName": "listTransactions",
+      "apiKeysName": "ListTransactions",
+      "planned": "done",
+      "validVersions": [
+        0,
+        2
+      ],
+      "flexibleFrom": 0,
+      "deprecatedVersions": null,
+      "latestVersionUnstable": false,
+      "forkVersions": [
+        0,
+        1,
+        2
+      ],
+      "gap": "current",
+      "onFloor": false,
+      "belowFloor": [],
+      "notes": ""
     },
     {
       "kafkaName": "ConsumerGroupHeartbeat",
@@ -983,6 +1389,28 @@
       "notes": "Client telemetry (KIP-714); deferred."
     },
     {
+      "kafkaName": "ListConfigResources",
+      "apiKey": 74,
+      "forkName": "listConfigResources",
+      "apiKeysName": "ListConfigResources",
+      "planned": "done",
+      "validVersions": [
+        0,
+        1
+      ],
+      "flexibleFrom": 0,
+      "deprecatedVersions": null,
+      "latestVersionUnstable": false,
+      "forkVersions": [
+        0,
+        1
+      ],
+      "gap": "current",
+      "onFloor": false,
+      "belowFloor": [],
+      "notes": "v0 is the old ListClientMetricsResources and lists only client-metrics resources; v1 adds a ResourceTypes filter (KIP-1142)."
+    },
+    {
       "kafkaName": "DescribeTopicPartitions",
       "apiKey": 75,
       "forkName": "describeTopicPartitions",
@@ -1015,8 +1443,8 @@
   ],
   "errors": {
     "counts": {
-      "kafka": 134,
-      "fork": 134
+      "kafka": 137,
+      "fork": 137
     },
     "missingInFork": [],
     "unknownToKafka": [],
@@ -1084,62 +1512,6 @@
       "forkName": null,
       "apiKeysName": "ControlledShutdown",
       "reason": "Broker shutdown handshake, not a client API. Stub in requests/index.js."
-    },
-    {
-      "kafkaName": "WriteTxnMarkers",
-      "apiKey": 27,
-      "forkName": null,
-      "apiKeysName": "WriteTxnMarkers",
-      "reason": "Transaction-coordinator to broker only. Stub in requests/index.js."
-    },
-    {
-      "kafkaName": "AlterReplicaLogDirs",
-      "apiKey": 34,
-      "forkName": null,
-      "apiKeysName": "AlterReplicaLogDirs",
-      "reason": "Log-directory administration; not planned. Stub in requests/index.js."
-    },
-    {
-      "kafkaName": "DescribeLogDirs",
-      "apiKey": 35,
-      "forkName": null,
-      "apiKeysName": "DescribeLogDirs",
-      "reason": "Log-directory administration; not planned. Stub in requests/index.js."
-    },
-    {
-      "kafkaName": "CreateDelegationToken",
-      "apiKey": 38,
-      "forkName": null,
-      "apiKeysName": "CreateDelegationToken",
-      "reason": "Delegation tokens (KIP-48); not planned. Stub in requests/index.js."
-    },
-    {
-      "kafkaName": "RenewDelegationToken",
-      "apiKey": 39,
-      "forkName": null,
-      "apiKeysName": "RenewDelegationToken",
-      "reason": "Delegation tokens (KIP-48); not planned. Stub in requests/index.js."
-    },
-    {
-      "kafkaName": "ExpireDelegationToken",
-      "apiKey": 40,
-      "forkName": null,
-      "apiKeysName": "ExpireDelegationToken",
-      "reason": "Delegation tokens (KIP-48); not planned. Stub in requests/index.js."
-    },
-    {
-      "kafkaName": "DescribeDelegationToken",
-      "apiKey": 41,
-      "forkName": null,
-      "apiKeysName": "DescribeDelegationToken",
-      "reason": "Delegation tokens (KIP-48); not planned. Stub in requests/index.js."
-    },
-    {
-      "kafkaName": "ElectLeaders",
-      "apiKey": 43,
-      "forkName": null,
-      "apiKeysName": "ElectLeaders",
-      "reason": "Leader election; not planned. Stub in requests/index.js."
     }
   ]
 }

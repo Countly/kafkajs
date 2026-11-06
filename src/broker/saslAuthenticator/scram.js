@@ -1,6 +1,7 @@
 const crypto = require('crypto')
 const scram = require('../../protocol/sasl/scram')
 const { KafkaJSSASLAuthenticationError, KafkaJSNonRetriableError } = require('../../errors')
+const { failureDetail, trustedError } = require('./failure')
 
 const GS2_HEADER = 'n,,'
 
@@ -10,6 +11,13 @@ const COMMA_SIGN_REGEX = /,/g
 const URLSAFE_BASE64_PLUS_REGEX = /\+/g
 const URLSAFE_BASE64_SLASH_REGEX = /\//g
 const URLSAFE_BASE64_TRAILING_EQUAL_REGEX = /=+$/
+
+/**
+ * The largest iteration count a server may ask for. Kafka's own limit for a stored credential is
+ * 16384; the margin keeps other servers working while a hostile count cannot stall the client.
+ */
+const MAX_ITERATIONS = 1048576
+const ITERATIONS_REGEX = /^[0-9]+$/
 
 const HMAC_CLIENT_KEY = 'Client Key'
 const HMAC_SERVER_KEY = 'Server Key'
@@ -96,7 +104,7 @@ class SCRAM {
     const length = Buffer.byteLength(bufferA)
 
     if (length !== Buffer.byteLength(bufferB)) {
-      throw new KafkaJSNonRetriableError('Buffers must be of the same length')
+      throw trustedError(KafkaJSNonRetriableError, 'Buffers must be of the same length')
     }
 
     const result = []
@@ -127,6 +135,14 @@ class SCRAM {
     this.currentNonce = SCRAM.nonce()
   }
 
+  /**
+   * Runs the exchange (RFC 5802): the client-first message, then the client-final message once
+   * the server-first message passed its checks, then the server signature, compared in constant
+   * time. Every failure is one `KafkaJSSASLAuthenticationError` with this mechanism's prefix and
+   * library-written text only.
+   * @returns {Promise<void>}
+   * @throws {KafkaJSSASLAuthenticationError}
+   */
   async authenticate() {
     const { PREFIX } = this
     const broker = `${this.host}:${this.port}`
@@ -142,20 +158,33 @@ class SCRAM {
       this.logger.debug('Sending final message', { broker })
       const finalResponse = await this.sendClientFinalMessage(clientMessageResponse)
 
-      if (finalResponse.e) {
-        throw new Error(finalResponse.e)
+      if (finalResponse.e !== undefined) {
+        throw trustedError(
+          KafkaJSSASLAuthenticationError,
+          'The server final message reports an error'
+        )
       }
 
       const serverKey = await this.serverKey(clientMessageResponse)
-      const serverSignature = this.serverSignature(serverKey, clientMessageResponse)
+      const expected = this.serverSignature(serverKey, clientMessageResponse)
+      const verifier = finalResponse.v
+      const received = Buffer.from(typeof verifier === 'string' ? verifier : '', 'base64')
 
-      if (finalResponse.v !== serverSignature) {
-        throw new Error('Invalid server signature in server final message')
+      if (
+        typeof verifier !== 'string' ||
+        received.toString('base64') !== verifier ||
+        received.length !== expected.length ||
+        !crypto.timingSafeEqual(received, expected)
+      ) {
+        throw trustedError(
+          KafkaJSSASLAuthenticationError,
+          'Invalid server signature in server final message'
+        )
       }
 
       this.logger.debug(`${PREFIX} successful`, { broker })
     } catch (e) {
-      const error = new KafkaJSSASLAuthenticationError(`${PREFIX} failed: ${e.message}`)
+      const error = new KafkaJSSASLAuthenticationError(`${PREFIX} failed: ${failureDetail(e)}`)
       this.logger.error(error.message, { broker })
       throw error
     }
@@ -176,25 +205,87 @@ class SCRAM {
   }
 
   /**
+   * Checks the server-first message before any key is derived from it: the server nonce must
+   * extend the client nonce with a part of its own, the salt must be present and the iteration
+   * count must be an integer between the digest's minimum and 1048576. A server error attribute
+   * fails the exchange. Messages name the check, never the received text.
+   * @private
+   * @param {{ r?: string, s?: string, i?: string, e?: string }} serverFirst the parsed message
+   * @returns {{ nonce: string, salt: Buffer, iterations: number }}
+   * @throws {KafkaJSSASLAuthenticationError} when a check fails
+   */
+  serverFirst({ r: nonce, s: salt, i, e }) {
+    if (e !== undefined) {
+      throw trustedError(
+        KafkaJSSASLAuthenticationError,
+        'The server first message reports an error'
+      )
+    }
+
+    if (typeof nonce !== 'string' || !nonce.startsWith(this.currentNonce)) {
+      throw trustedError(
+        KafkaJSSASLAuthenticationError,
+        'Invalid server nonce, it does not start with the client nonce'
+      )
+    }
+
+    if (nonce.length === this.currentNonce.length) {
+      throw trustedError(
+        KafkaJSSASLAuthenticationError,
+        'Invalid server nonce, it adds no server part'
+      )
+    }
+
+    if (!salt) {
+      throw trustedError(KafkaJSSASLAuthenticationError, 'Missing salt in the server first message')
+    }
+
+    const decodedSalt = Buffer.from(salt, 'base64')
+    if (decodedSalt.length === 0 || decodedSalt.toString('base64') !== salt) {
+      throw trustedError(KafkaJSSASLAuthenticationError, 'Invalid salt in the server first message')
+    }
+
+    return { nonce, salt: decodedSalt, iterations: this.iterationCount(i) }
+  }
+
+  /**
+   * @private
+   * @param {string} [value] the iteration count the server asked for
+   * @returns {number} the count, an integer between the digest's minimum and 1048576
+   * @throws {KafkaJSSASLAuthenticationError} for any other value
+   */
+  iterationCount(value) {
+    const { minIterations } = this.digestDefinition
+    if (typeof value !== 'string' || !ITERATIONS_REGEX.test(value)) {
+      throw trustedError(
+        KafkaJSSASLAuthenticationError,
+        'Invalid iteration count in the server first message'
+      )
+    }
+
+    const iterations = Number(value)
+    if (iterations < minIterations) {
+      throw trustedError(
+        KafkaJSSASLAuthenticationError,
+        `Requested iterations ${iterations} is less than the minimum ${minIterations}`
+      )
+    }
+
+    if (iterations > MAX_ITERATIONS) {
+      throw trustedError(
+        KafkaJSSASLAuthenticationError,
+        `Requested iterations ${iterations} is more than the maximum ${MAX_ITERATIONS}`
+      )
+    }
+
+    return iterations
+  }
+
+  /**
    * @private
    */
   async sendClientFinalMessage(clientMessageResponse) {
-    const { PREFIX } = this
-    const iterations = parseInt(clientMessageResponse.i, 10)
-    const { minIterations } = this.digestDefinition
-
-    if (!clientMessageResponse.r.startsWith(this.currentNonce)) {
-      throw new KafkaJSSASLAuthenticationError(
-        `${PREFIX} failed: Invalid server nonce, it does not start with the client nonce`
-      )
-    }
-
-    if (iterations < minIterations) {
-      throw new KafkaJSSASLAuthenticationError(
-        `${PREFIX} failed: Requested iterations ${iterations} is less than the minimum ${minIterations}`
-      )
-    }
-
+    this.serverFirst(clientMessageResponse)
     const finalMessageWithoutProof = this.finalMessageWithoutProof(clientMessageResponse)
     const clientProof = await this.clientProof(clientMessageResponse)
     const finalMessage = `${finalMessageWithoutProof},p=${clientProof}`
@@ -244,7 +335,7 @@ class SCRAM {
    * @private
    */
   serverSignature(serverKey, clientMessageResponse) {
-    return encode64(this.HMAC(serverKey, this.authMessage(clientMessageResponse)))
+    return this.HMAC(serverKey, this.authMessage(clientMessageResponse))
   }
 
   /**
@@ -263,7 +354,7 @@ class SCRAM {
    */
   async saltPassword(clientMessageResponse) {
     const salt = Buffer.from(clientMessageResponse.s, 'base64')
-    const iterations = parseInt(clientMessageResponse.i, 10)
+    const iterations = this.iterationCount(clientMessageResponse.i)
     return SCRAM.hi(this.encodedPassword(), salt, iterations, this.digestDefinition)
   }
 

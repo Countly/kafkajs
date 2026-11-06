@@ -1,3 +1,4 @@
+import { KafkaJSPartialMessageError, KafkaJSSASLAuthenticationError, KafkaJSGroupCoordinatorNotFound, KafkaJSNotImplemented, KafkaJSTimeout, KafkaJSUnsupportedMagicByteInMessageSet, Admin } from './index'
 import * as fs from 'fs'
 
 import * as kafkajs from './index'
@@ -74,6 +75,10 @@ import {
   KafkaJSCreateTopicError,
   KafkaJSNoBrokerAvailableError,
   Cluster,
+  oauthBearer,
+  OAuthBearerHelperOptions,
+  OAuthBearerTokenProvider,
+  AssertionSupplier,
 } from './index'
 
 const { roundRobin } = PartitionAssigners
@@ -625,6 +630,14 @@ kafka.producer({ createPartitioner: Partitioners.UniformStickyPartitioner({ adap
 // @ts-expect-error adaptive is a boolean
 Partitioners.UniformStickyPartitioner({ adaptive: 'yes' })
 kafka.producer({ createPartitioner: Partitioners.DefaultPartitioner })
+
+// KIP-1123: the producer's rack and the opt-in to prefer the partitions led in it.
+kafka.producer({ rackId: 'rack-a', rackAware: true })
+kafka.producer({ rackId: 'rack-a' })
+// @ts-expect-error rackId is a string
+kafka.producer({ rackId: 7 })
+// @ts-expect-error rackAware is a boolean
+kafka.producer({ rackAware: 'yes' })
 
 // groupMetadata() and the two sendOffsets shapes.
 const runTransaction = async () => {
@@ -1267,6 +1280,7 @@ new KafkaJSRecordTooLargeError('x', { reason: 'frame', scope: 'record', size: 1,
 void [tooLargeReason]
 
 
+
 // Producer lifecycle calls preserve the signal handler and no-argument parameter tuple.
 const lifecycleProducer = new Kafka({ brokers: ['localhost:9092'] }).producer({ metadataMaxIdle: 5000 })
 void lifecycleProducer.flush()
@@ -1534,3 +1548,269 @@ void useBoundedDisconnect
   // @ts-expect-error fetchSessions accepts only booleans
   kafka.consumer({ groupId: 'sessions', fetchSessions: 'true' })
 }
+
+const setupOptions: kafkajs.KafkaConfig = {
+  brokers: ['localhost:9092'],
+  connectionTimeout: 1000,
+  connectionTimeoutMax: 30000,
+  reconnectBackoff: 50,
+  reconnectBackoffMax: 1000,
+  authenticationTimeout: 10000,
+}
+const setupConstructor: ConstructorParameters<typeof Kafka> = [setupOptions]
+new Kafka(...setupConstructor)
+// @ts-expect-error New timeout maximum accepts numbers only.
+const invalidSetupMaximum: kafkajs.KafkaConfig = { brokers: [], connectionTimeoutMax: '30000' }
+// @ts-expect-error Backoff options accept numbers only.
+const invalidSetupBackoff: kafkajs.KafkaConfig = { brokers: [], reconnectBackoff: null }
+
+// OAUTH BEARER HELPERS
+const helperOptions: OAuthBearerHelperOptions = {
+  timeout: 5000,
+  maxRetryTime: 8000,
+  retry: { initial: 100, max: 10000 },
+  refreshWindow: 0.8,
+  refreshJitter: 0.05,
+  minRefreshPeriod: 60000,
+  refreshBuffer: 300000,
+  clockSkew: 30000,
+  extensions: { trace: 'one' },
+  allowInsecure: false,
+  fetch,
+}
+const helperProvider: OAuthBearerTokenProvider = oauthBearer.clientCredentials({
+  ...helperOptions,
+  tokenEndpointUrl: 'https://issuer.example/token',
+  clientId: 'id',
+  clientSecret: 'secret',
+  scope: 'read',
+})
+const bareCallback: () => Promise<kafkajs.OauthbearerProviderResponse> = helperProvider
+const signedAssertion: AssertionSupplier = oauthBearer.signAssertion({
+  privateKey: Buffer.from('pem'),
+  algorithm: 'ES256',
+  claims: { iss: 'id', sub: 'id', aud: ['issuer'], tenant: { region: 'eu' } },
+  expiresIn: 300,
+  notBefore: 60,
+  jti: true,
+  keyId: 'key-one',
+  passphrase: 'phrase',
+})
+declare const keyObject: import('crypto').KeyObject
+const fileKeyAssertion: AssertionSupplier = oauthBearer.signAssertion({ privateKey: { file: 'key.pem' } })
+const objectKeyAssertion: kafkajs.AssertionSupplier = kafkajs.oauthBearer.signAssertion({ privateKey: keyObject })
+const asyncAssertion: AssertionSupplier = async () => 'header.payload.signature'
+oauthBearer.clientCredentials({ tokenEndpointUrl: 'https://issuer.example/token', clientId: 'id', clientAssertion: signedAssertion })
+oauthBearer.jwtBearer({ ...helperOptions, tokenEndpointUrl: 'https://issuer.example/token', assertion: asyncAssertion })
+const fileProvider: kafkajs.OAuthBearerTokenProvider = kafkajs.oauthBearer.fileToken({ path: 'access.jwt', clockSkew: 1000 })
+const closeResult: void = fileProvider.close()
+const helperResponse: Promise<kafkajs.OauthbearerProviderResponse> = helperProvider()
+const extensionValue: Promise<string | undefined> = helperResponse.then((response) => response.extensions?.trace)
+const legacyCallback: kafkajs.SASLOptions = {
+  mechanism: 'oauthbearer',
+  oauthBearerProvider: async () => ({ value: 'token', extensions: { trace: 'one' } }),
+}
+const helperCallback: kafkajs.SASLOptions = { mechanism: 'oauthbearer', oauthBearerProvider: helperProvider }
+// @ts-expect-error secret and assertion are exclusive
+oauthBearer.clientCredentials({ tokenEndpointUrl: 'https://issuer.example/token', clientId: 'id', clientSecret: 'secret', clientAssertion: signedAssertion })
+// @ts-expect-error one credential form is required
+oauthBearer.clientCredentials({ tokenEndpointUrl: 'https://issuer.example/token', clientId: 'id' })
+// @ts-expect-error a bare callback has no helper lifecycle
+bareCallback.close()
+// @ts-expect-error the algorithm is a closed union
+oauthBearer.signAssertion({ privateKey: 'pem', algorithm: 'HS256' })
+// @ts-expect-error extension values are strings
+oauthBearer.fileToken({ path: 'access.jwt', extensions: { trace: 1 } })
+void fileKeyAssertion
+void objectKeyAssertion
+void closeResult
+void extensionValue
+void legacyCallback
+void helperCallback
+
+// Idle connection configuration remains optional in constructor inference.
+const idleConnectionConfig: ConstructorParameters<typeof Kafka>[0] = { brokers: ['localhost:9092'], connectionsMaxIdle: 0 }
+new Kafka(idleConnectionConfig)
+const idleConnectionArgs: ConstructorParameters<typeof Kafka> = [idleConnectionConfig]
+new Kafka(...idleConnectionArgs)
+new Kafka({ brokers: ['localhost:9092'], connectionsMaxIdle: 2147483647 })
+// @ts-expect-error new idle durations do not accept numeric strings
+new Kafka({ brokers: ['localhost:9092'], connectionsMaxIdle: '1000' })
+
+
+// Admin option overloads preserve the original tuple-based wrappers.
+type AdminTupleEqual<A, B> = (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B ? 1 : 2) ? true : false
+type AdminTupleAssert<T extends true> = T
+type AdminListTuple = AdminTupleAssert<AdminTupleEqual<Parameters<kafkajs.Admin['listTopics']>, []>>
+type AdminGroupTuple = AdminTupleAssert<AdminTupleEqual<Parameters<kafkajs.Admin['describeGroups']>, [groupIds: string[]]>>
+type AdminDeleteGroupTuple = AdminTupleAssert<AdminTupleEqual<Parameters<kafkajs.Admin['deleteGroups']>, [groupIds: string[]]>>
+type AdminOffsetsTuple = AdminTupleAssert<AdminTupleEqual<Parameters<kafkajs.Admin['fetchTopicOffsets']>, [topic: string]>>
+type AdminTimestampTuple = AdminTupleAssert<AdminTupleEqual<Parameters<kafkajs.Admin['fetchTopicOffsetsByTimestamp']>, [topic: string, timestamp?: number]>>
+type AdminClusterTuple = AdminTupleAssert<AdminTupleEqual<Parameters<kafkajs.Admin['describeCluster']>, []>>
+type AdminDisconnectTuple = AdminTupleAssert<AdminTupleEqual<Parameters<kafkajs.Admin['disconnect']>, []>>
+declare const deadlineAdmin: kafkajs.Admin
+const adminDeadlineConfig: kafkajs.AdminConfig = { apiTimeout: 2147483647 }
+const adminCallBudget: kafkajs.ApiTimeoutOption = { apiTimeout: 1 }
+deadlineAdmin.listTopics(adminCallBudget)
+deadlineAdmin.describeGroups(['g'], { apiTimeout: 5, includeAuthorizedOperations: true })
+deadlineAdmin.deleteGroups(['g'], adminCallBudget)
+deadlineAdmin.fetchTopicOffsets('t', adminCallBudget)
+deadlineAdmin.fetchTopicOffsetsByTimestamp('t', 1, adminCallBudget)
+deadlineAdmin.describeCluster(adminCallBudget)
+deadlineAdmin.fetchTopicMetadata({ topics: ['t'], includeTopicAuthorizedOperations: true, apiTimeout: 10 })
+deadlineAdmin.createTopics({ topics: [{ topic: 't' }], timeout: 30000, apiTimeout: 5000 })
+
+// DeleteGroups v3 answers a message per group: text, null, or absent from an older broker; never a number.
+const deleteGroupsWithText: kafkajs.DeleteGroupsResult = { groupId: 'g', errorCode: 134, errorMessage: 'cleanup failed' }
+const deleteGroupsWithNull: kafkajs.DeleteGroupsResult = { groupId: 'g', errorCode: 0, errorMessage: null }
+const deleteGroupsWithoutMessage: kafkajs.DeleteGroupsResult = { groupId: 'g', errorCode: 0 }
+// @ts-expect-error the broker's message is text, never a number
+const deleteGroupsWithNumber: kafkajs.DeleteGroupsResult = { groupId: 'g', errorCode: 134, errorMessage: 7 }
+declare const deleteGroupsFailure: kafkajs.KafkaJSDeleteGroupsError
+const failedGroupMessage: string | null | undefined = deleteGroupsFailure.groups[0].errorMessage
+process.on('SIGTERM', deadlineAdmin.disconnect)
+const oldAdminTupleWrapper = (...args: Parameters<kafkajs.Admin['describeGroups']>) => deadlineAdmin.describeGroups(...args)
+oldAdminTupleWrapper(['g'])
+// @ts-expect-error tuple wrapper retains one argument
+oldAdminTupleWrapper(['g'], adminCallBudget)
+// @ts-expect-error budgets have number type
+deadlineAdmin.listTopics({ apiTimeout: '10' })
+// @ts-expect-error flags have boolean type
+deadlineAdmin.describeGroups(['g'], { includeAuthorizedOperations: 1 })
+// @ts-expect-error topic flags have boolean type
+deadlineAdmin.fetchTopicMetadata({ includeTopicAuthorizedOperations: 'true' })
+void adminDeadlineConfig
+
+const inheritedNonRetriableErrors: KafkaJSNonRetriableError[] = [
+  new KafkaJSPartialMessageError(), new KafkaJSSASLAuthenticationError(),
+  new KafkaJSGroupCoordinatorNotFound(), new KafkaJSNotImplemented(),
+  new KafkaJSTimeout(), new KafkaJSUnsupportedMagicByteInMessageSet(),
+]
+const inheritedLockTimeout: KafkaJSTimeout = new KafkaJSLockTimeout()
+const createTopicDetail: string | null = new KafkaJSCreateTopicError(new Error('stable'), 't', 'detail').errorMessage
+async function offsetIsolationOptions(admin: Admin) {
+  await admin.fetchTopicOffsets('t', {isolationLevel: 'read_uncommitted', apiTimeout: 10})
+  await admin.fetchTopicOffsetsByTimestamp('t', 123, {isolationLevel: 'read_committed'})
+  // @ts-expect-error isolation is an exact lower-case value
+  await admin.fetchTopicOffsets('t', {isolationLevel: 'READ_COMMITTED'})
+  const deleting: () => Promise<void> = () => admin.deleteTopicRecords({topic: 't', partitions: [{partition: 0, offset: '1'}]})
+  return deleting
+}
+
+async function groupOffsetMethods(admin: import('./index').Admin) {
+  const deleted = await admin.deleteOffsets({groupId:'g',topics:[{topic:'t',partitions:[0]}],apiTimeout:20})
+  const code: number = deleted.topics[0].partitions[0].errorCode
+  const fetched = await admin.fetchOffsetsForGroups({groups:[{groupId:'g',topics:[{topic:'t',partitions:[0]}]}],requireStable:true})
+  const offset: string = fetched[0].topics[0].partitions[0].offset
+  const metadata: string | null = fetched[0].topics[0].partitions[0].metadata
+  const epoch: number | null = fetched[0].topics[0].partitions[0].leaderEpoch
+  await admin.fetchOffsets({groupId:'g',resolveOffsets:false,requireStable:true})
+  // @ts-expect-error partitions are numbers, not wire objects
+  await admin.deleteOffsets({groupId:'g',topics:[{topic:'t',partitions:[{partition:0}]}]})
+  // @ts-expect-error requireStable is a boolean
+  await admin.fetchOffsetsForGroups({groups:[{groupId:'g'}],requireStable:'yes'})
+  return {code,offset,metadata,epoch}
+}
+
+const transactionDescription: Promise<kafkajs.TransactionDescription[]> = admin.describeTransactions({ transactionalIds: ['tx'], apiTimeout: 10 })
+const transactionProducers = admin.describeProducers({ topicPartitions: [{ topic: 'orders', partitions: [0] }], brokerId: 0 })
+const transactionList = admin.listTransactions({ producerIds: ['9007199254740993', 1], durationFilter: 0, transactionalIdPattern: 'tx.*' })
+const transactionAbort: Promise<void> = admin.abortTransaction({ topic: 'orders', partition: 0, producerId: '9007199254740993', producerEpoch: 7, coordinatorEpoch: 9 })
+const transactionFence = admin.fenceProducers({ transactionalIds: ['tx'], transactionTimeout: 60000 })
+transactionProducers.then((rows) => { const id: string = rows[0].partitions[0].activeProducers[0].producerId; void id })
+transactionFence.then((rows) => { const id: string | null = rows[0].producerId; const error: kafkajs.KafkaJSError | null = rows[0].error; void id; void error })
+// @ts-expect-error broker RE2 filters are strings
+admin.listTransactions({ transactionalIdPattern: /tx/ })
+// @ts-expect-error transaction timeout is a number
+admin.fenceProducers({ transactionalIds: ['tx'], transactionTimeout: '60000' })
+// @ts-expect-error abort has no item result
+const transactionAbortItems: Promise<kafkajs.AdminItemResult[]> = admin.abortTransaction({ topic: 'orders', partition: 0, producerId: 1, producerEpoch: 0, coordinatorEpoch: 0 })
+// @ts-expect-error force termination is an equivalent invocation, not a new method
+admin.forceTerminateTransaction('tx')
+void transactionDescription; void transactionList; void transactionAbort; void transactionAbortItems
+
+
+const directoryRows = admin.describeLogDirs({brokers:[1],topicPartitions:[{topic:'orders',partitions:[0]}],apiTimeout:1000})
+void directoryRows.then(rows=>{const capacity:string|null=rows[0].logDirs[0].totalBytes;const size:string=rows[0].logDirs[0].topics[0].partitions[0].size;void capacity;void size})
+void admin.describeReplicaLogDirs({replicas:[{topic:'orders',partition:0,brokerId:1}]})
+void admin.alterReplicaLogDirs({replicas:[{topic:'orders',partition:0,brokerId:1,logDir:'/data/b'}]})
+const deletingById:Promise<void>=admin.deleteTopics({topicIds:['00112233-4455-6677-8899-aabbccddeeff'],timeout:1000,apiTimeout:2000})
+void deletingById
+// @ts-expect-error names and ids are exclusive
+void admin.deleteTopics({topics:['orders'],topicIds:['00112233-4455-6677-8899-aabbccddeeff']})
+// @ts-expect-error one deletion identity form is required
+void admin.deleteTopics({})
+void admin.fetchTopicOffsetsByTimestamp('orders','maxTimestamp')
+void admin.fetchTopicOffsetsByTimestamp('orders','earliestLocal',{isolationLevel:'read_uncommitted'})
+void admin.fetchTopicOffsetsByTimestamp('orders','latestTiered')
+void admin.fetchTopicOffsetsByTimestamp('orders','earliestPendingUpload',{apiTimeout:1000})
+// @ts-expect-error named offset specs use exact spelling
+void admin.fetchTopicOffsetsByTimestamp('orders','maximumTimestamp')
+void admin.alterPartitionReassignments({topics:[{topic:'orders',partitionAssignment:[{partition:0,replicas:[1,2]}]}],allowReplicationFactorChange:false})
+
+
+async function quotaAndCredentialAdministration(admin: import('./index').Admin) {
+  const quotas = await admin.describeClientQuotas({components:[{entityType:'user',matchType:'default'}],strict:true,apiTimeout:10})
+  const values: Record<string,number> = quotas[0].values
+  const changed = await admin.alterClientQuotas({entries:[{entity:[{entityType:'user',entityName:null}],ops:[{key:'producer_byte_rate',value:1},{key:'consumer_byte_rate',remove:true}]}],validateOnly:true})
+  const credentials = await admin.describeUserScramCredentials({users:null})
+  const users = await admin.alterUserScramCredentials({upsertions:[{user:'test-user',mechanism:'SCRAM-SHA-256',iterations:4096,password:'password-marker-only-test',salt:Buffer.alloc(32)}],deletions:[{user:'other-user',mechanism:'SCRAM-SHA-512'}]})
+  // @ts-expect-error quota assignment and removal are exclusive
+  const invalidQuota: import('./index').QuotaOperation = {key:'k',value:1,remove:true}
+  // @ts-expect-error only SCRAM mechanisms can be administered
+  await admin.alterUserScramCredentials({deletions:[{user:'test-user',mechanism:'PLAIN'}]})
+  void [values,changed,credentials,users,invalidQuota]
+}
+void quotaAndCredentialAdministration
+
+async function tokenAdministration(admin: import('./index').Admin) {
+  const token: import('./index').DelegationToken = await admin.createDelegationToken({owner:{principalType:'User',principalName:'owner'},maxLifetimeMs:'9223372036854775807'})
+  const bytes: Buffer = token.hmac
+  const expiry: string = (await admin.renewDelegationToken({hmac:bytes,renewPeriodMs:-1})).expiryTimestampMs
+  await admin.expireDelegationToken({hmac:bytes,expiryTimePeriodMs:0})
+  const tokens: import('./index').DelegationToken[] = await admin.describeDelegationToken()
+  // @ts-expect-error token HMACs are buffers
+  await admin.renewDelegationToken({hmac:'test-hmac'})
+  void [expiry,tokens]
+}
+void tokenAdministration
+
+admin.electLeaders({topicPartitions:null,apiTimeout:10,electionType:'unclean'}).then(rows=>{const p:number=rows[0].partitions[0].partition;const e:KafkaJSError|null=rows[0].partitions[0].error;void p;void e})
+admin.describeFeatures({brokerId:0}).then(r=>{const epoch:string|null=r.finalizedFeaturesEpoch;void epoch})
+admin.updateFeatures({features:[{name:'metadata.version',maxVersionLevel:0,upgradeType:'safe-downgrade'}],validateOnly:true}).then(rows=>{const f:string=rows[0].feature;void f})
+admin.listConfigResources({resourceTypes:[ConfigResourceTypes.CLIENT_METRICS]}).then(r=>{const t:ConfigResourceTypes=r.resources[0].type;void t})
+admin.describeCluster({includeAuthorizedOperations:true,includeFencedBrokers:true}).then(r=>{const f:boolean|undefined=r.brokers[0].fenced;const m:number|null|undefined=r.authorizedOperations;void f;void m})
+// @ts-expect-error election type is a declared enum
+admin.electLeaders({electionType:'random'})
+// @ts-expect-error upgrade type is a declared enum
+admin.updateFeatures({features:[{name:'a',maxVersionLevel:1,upgradeType:'random'}]})
+// @ts-expect-error cluster flags are boolean
+admin.describeCluster({includeFencedBrokers:'true'})
+// @ts-expect-error resource types are numeric enum members
+admin.listConfigResources({resourceTypes:['CLIENT_METRICS']})
+
+// GSSAPI
+const gssapiOptions: import('./index').GssapiSaslOptions = { mechanism: 'gssapi' }
+new Kafka({ brokers: ['localhost:9192'], sasl: gssapiOptions })
+new Kafka({ brokers: ['localhost:9192'], sasl: { mechanism: 'gssapi', serviceName: 'kafka', principal: 'client@KAFKAJS.TEST' } })
+const invalidGssapiService: import('./index').GssapiSaslOptions = {
+  mechanism: 'gssapi',
+  // @ts-expect-error service names are strings
+  serviceName: 42,
+}
+const invalidGssapiPassword: import('./index').GssapiSaslOptions = {
+  mechanism: 'gssapi',
+  // @ts-expect-error credentials come from the environment
+  password: 'unsupported',
+}
+void [invalidGssapiService, invalidGssapiPassword]
+
+// The final overload retains signal-handler and parameter-tuple compatibility.
+const adminCloseOptions: Promise<void> = admin.disconnect({ timeout: 0 })
+const adminCloseNatural: Promise<void> = admin.disconnect()
+type AdminDisconnectParameters = AdminTupleAssert<AdminTupleEqual<Parameters<kafkajs.Admin['disconnect']>, []>>
+process.once('SIGTERM', admin.disconnect)
+// @ts-expect-error timeout is numeric
+admin.disconnect({ timeout: '1' })
+// @ts-expect-error public options are an object
+admin.disconnect('SIGTERM')

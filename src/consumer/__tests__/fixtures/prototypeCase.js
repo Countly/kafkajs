@@ -7,7 +7,7 @@ const {
 } = require('../../../../testHelpers/scriptedCluster')
 const { prepareRecordBatches, TOPIC_ID } = require('./fetchHarness')
 const Encoder = require('../../../protocol/encoder')
-const { plainTextBrokers } = require('testHelpers')
+const { plainTextBrokers, waitForTopicPropagation } = require('testHelpers')
 const { withDeadline, disconnectAll } = require('./boundedCleanup')
 
 /** The names an ordinary object inherits or treats specially. */
@@ -130,7 +130,8 @@ class PrototypeCase {
   }
 
   /**
-   * Prepares a fresh single-partition topic before producing its seed record on the live lane.
+   * Prepares a fresh single-partition topic before producing its seed record on the live lane,
+   * once every broker serves its metadata, since the clients that follow connect to any of them.
    * @returns {Promise<Kafka>} a client of the lane's cluster
    * @throws {Error} on retirement, setup failure or unexpected partition metadata
    */
@@ -188,6 +189,7 @@ class PrototypeCase {
         topics: [{ topic: this.name, numPartitions: 1, replicationFactor: 1 }],
       })
     )
+    await this.stage('topic propagation', () => waitForTopicPropagation(this.name, 1))
     await this.stage('verify one partition', async () => {
       const { topics } = await admin.fetchTopicMetadata({ topics: [this.name] })
       const topic = topics.find(({ name }) => name === this.name)

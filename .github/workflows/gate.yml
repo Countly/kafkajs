@@ -1,7 +1,9 @@
 # needs flags: java (JDK + cached client/codec jars), lz4 (native binding),
-# consumerGroupStates (patched coordinator image), kerberos (KDC image/state),
-# tls-required (tracked TLS fixtures), tokens, logdirs (compose-only), tiered (test jar/remote dir).
-# Future guarded live specs must also supply their reservation through check.env.
+# consumerGroupStates (patched coordinator image), kerberos (KDC image/state, Kerberos binding),
+# tls-required (tracked TLS fixtures), tokens (per-run delegation-token key), logdirs (compose-only),
+# tiered (test jar/remote dir).
+# A check may set kafkaVersion (major.minor.patch) to run on another broker release; absent means
+# DEFAULT_KAFKA_VERSION below. The live specs run against the job's own Compose cluster, without a guard.
 name: Exit gate
 on:
   workflow_dispatch:
@@ -20,10 +22,13 @@ concurrency:
   group: gate-${{ github.ref }}-${{ github.event.pull_request.draft == true }}
   cancel-in-progress: true
 env:
-  KAFKA_VERSION: 4.3.1
-  # Required before enabling the corresponding future arm; no digest is assumed.
-  KDC_BASE_IMAGE: ''
-  TIERED_JAR_SHA256: ''
+  # The broker release of every check that sets no kafkaVersion; the Read check step exports it as KAFKA_VERSION.
+  DEFAULT_KAFKA_VERSION: 4.3.1
+  # Ubuntu 24.04 (docker.io/library/ubuntu index digest, read from the registry 2026-11-05). The KDC
+  # Dockerfile installs the MIT Kerberos packages onto it when the base lacks them.
+  KDC_BASE_IMAGE: ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852
+  # Maven Central's kafka-storage-4.3.1-test.jar.sha256, read 2026-11-05 and matched to the jar's own digest.
+  TIERED_JAR_SHA256: f3236936854c13815ffaa7f35a3f2d6861c125616cba5395b538b8680dded886
 jobs:
   plan:
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
@@ -56,6 +61,11 @@ jobs:
               }
               return { id, capMinutes }
             })
+          for (const check of gate.checks) {
+            if (check.kafkaVersion !== undefined && !/^\d+\.\d+\.\d+$/.test(check.kafkaVersion)) {
+              throw new Error(`Invalid kafkaVersion: ${check.id}`)
+            }
+          }
           if (!include.length) throw new Error('No checks selected')
           fs.appendFileSync(process.env.GITHUB_OUTPUT, `matrix=${JSON.stringify({ include })}\n`)
           NODE
@@ -93,9 +103,13 @@ jobs:
           for (const key of Object.keys(check.needs || {})) {
             if (!supported.includes(key)) throw new Error(`Unsupported needs flag: ${key}`)
           }
+          if (check.kafkaVersion !== undefined && !/^\d+\.\d+\.\d+$/.test(check.kafkaVersion)) {
+            throw new Error(`Invalid kafkaVersion: ${check.kafkaVersion}`)
+          }
           fs.writeFileSync(`${process.env.RUNNER_TEMP}/check.json`, JSON.stringify(check))
           fs.appendFileSync(process.env.GITHUB_OUTPUT, `check=${JSON.stringify(check)}\n`)
           fs.appendFileSync(process.env.GITHUB_ENV, `COMPOSE_FILE=${check.compose || 'docker-compose.yml'}\n`)
+          fs.appendFileSync(process.env.GITHUB_ENV, `KAFKA_VERSION=${check.kafkaVersion || process.env.DEFAULT_KAFKA_VERSION}\n`)
           NODE
       - uses: actions/setup-java@v4
         if: fromJSON(steps.entry.outputs.check).needs.java || fromJSON(steps.entry.outputs.check).needs.consumerGroupStates || fromJSON(steps.entry.outputs.check).compose == 'testHelpers/consumerGroupStates/compose.yml'
@@ -111,19 +125,20 @@ jobs:
         if: fromJSON(steps.entry.outputs.check).needs.java
         run: |
           mkdir -p "$RUNNER_TEMP/gate-java"
-          while read -r coordinate; do
+          while read -r coordinate digest; do
             jar="$RUNNER_TEMP/gate-java/${coordinate##*/}"
             url="https://repo.maven.apache.org/maven2/$coordinate"
-            if [ ! -s "$jar" ]; then curl --fail --location --retry 3 --max-time 120 "$url" -o "$jar"; fi
-            digest="$(curl --fail --location --retry 3 --max-time 120 "$url.sha1")"
-            [[ "$digest" =~ ^[[:xdigit:]]{40}$ ]]
-            printf '%s  %s\n' "$digest" "$jar" | sha1sum --check -
+            if [ ! -s "$jar" ]; then
+              curl --fail --location --retry 5 --retry-all-errors --retry-delay 10 --max-time 120 "$url" -o "$jar"
+            fi
+            [[ "$digest" =~ ^[[:xdigit:]]{64}$ ]]
+            printf '%s  %s\n' "$digest" "$jar" | sha256sum --check -
           done <<'JARS'
-          org/apache/kafka/kafka-clients/4.3.1/kafka-clients-4.3.1.jar
-          org/slf4j/slf4j-api/1.7.36/slf4j-api-1.7.36.jar
-          org/xerial/snappy/snappy-java/1.1.10.7/snappy-java-1.1.10.7.jar
-          org/lz4/lz4-java/1.8.0/lz4-java-1.8.0.jar
-          com/github/luben/zstd-jni/1.5.6-10/zstd-jni-1.5.6-10.jar
+          org/apache/kafka/kafka-clients/4.3.1/kafka-clients-4.3.1.jar 52501b7b47510c66f898871adaf6d2968ab7246561d44ced43643a8a587f0b36
+          org/slf4j/slf4j-api/1.7.36/slf4j-api-1.7.36.jar d3ef575e3e4979678dc01bf1dcce51021493b4d11fb7f1be8ad982877c16a1c0
+          org/xerial/snappy/snappy-java/1.1.10.7/snappy-java-1.1.10.7.jar 4c766cb3f855415ee734b2392949a0b6f12a60879334a74518deaf6270d32e36
+          org/lz4/lz4-java/1.8.0/lz4-java-1.8.0.jar d74a3334fb35195009b338a951f918203d6bbca3d1d359033dc33edd1cadc9ef
+          com/github/luben/zstd-jni/1.5.6-10/zstd-jni-1.5.6-10.jar b6c3237e24b8252a5a9c3a0e1ae30ef8f323412e74bd358548b7a9e527d676df
           JARS
           echo "JAVA_E2E_WORK_DIR=$RUNNER_TEMP/gate-java" >> "$GITHUB_ENV"
           echo "JAVA_VECTORS_WORK_DIR=$RUNNER_TEMP/gate-java" >> "$GITHUB_ENV"
@@ -132,10 +147,23 @@ jobs:
       - name: Require native LZ4
         if: fromJSON(steps.entry.outputs.check).needs.lz4
         run: node -e "require('lz4-napi')"
+      # The patched coordinator jar is built from the Kafka source tarball with Gradle; a cache hit
+      # skips the downloads, and a miss retries them.
+      - uses: actions/cache@v4
+        if: fromJSON(steps.entry.outputs.check).needs.consumerGroupStates || fromJSON(steps.entry.outputs.check).compose == 'testHelpers/consumerGroupStates/compose.yml'
+        with:
+          path: testHelpers/consumerGroupStates/build
+          key: coordinator-v1-${{ env.KAFKA_VERSION }}-${{ hashFiles('testHelpers/consumerGroupStates/build.sh', 'testHelpers/consumerGroupStates/prepare.py', 'testHelpers/consumerGroupStates/*.patch') }}
       - name: Build coordinator fixture
         if: fromJSON(steps.entry.outputs.check).needs.consumerGroupStates || fromJSON(steps.entry.outputs.check).compose == 'testHelpers/consumerGroupStates/compose.yml'
         run: |
-          bash ./testHelpers/consumerGroupStates/build.sh "$KAFKA_VERSION" "$RUNNER_TEMP/coordinator-build"
+          jar="testHelpers/consumerGroupStates/build/$KAFKA_VERSION/kafka-group-coordinator-$KAFKA_VERSION.jar"
+          for attempt in 1 2 3; do
+            [ -s "$jar" ] && break
+            rm -rf "$RUNNER_TEMP/coordinator-build"
+            bash ./testHelpers/consumerGroupStates/build.sh "$KAFKA_VERSION" "$RUNNER_TEMP/coordinator-build" || { [ "$attempt" = 3 ] && exit 1; sleep 30; }
+          done
+          test -s "$jar"
           mkdir -p testHelpers/consumerGroupStates/runtime
           chmod 777 testHelpers/consumerGroupStates/runtime
           docker build --build-arg KAFKA_VERSION="$KAFKA_VERSION" -t "consumer-group-states:$KAFKA_VERSION" testHelpers/consumerGroupStates
@@ -157,6 +185,34 @@ jobs:
           echo "KERBEROS_FIXTURE_DIR=$RUNNER_TEMP/kerberos" >> "$GITHUB_ENV"
           echo 'WAIT_FOR_KAFKA_NODES=kafka1' >> "$GITHUB_ENV"
           echo 'SKIP_SCRAM=1' >> "$GITHUB_ENV"
+      - name: Install the Kerberos client binding
+        if: fromJSON(steps.entry.outputs.check).needs.kerberos
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libkrb5-dev
+          # kerberos is an optional peer, so the project install leaves it out; npm 11 also skips
+          # install scripts it was not told to allow, and the binding is built by one.
+          peer="$RUNNER_TEMP/kerberos-peer"
+          version="$(node -p "require('./package.json').peerDependencies.kerberos")"
+          # npm refuses --allow-scripts for a project install, so the prefix gets its own manifest.
+          mkdir -p "$peer"
+          printf '{"private":true,"allowScripts":{"kerberos":true}}\n' > "$peer/package.json"
+          npm install --prefix "$peer" --no-package-lock --no-audit --no-fund "kerberos@$version"
+          node -e "require(process.argv[1] + '/node_modules/kerberos')" "$peer"
+          cp -Rn "$peer/node_modules/." node_modules/
+          node -e "require('kerberos'); console.log('kerberos', require('kerberos/package.json').version)"
+      - name: Generate the delegation-token key
+        if: fromJSON(steps.entry.outputs.check).needs.tokens
+        run: |
+          key="$(openssl rand -base64 48 | tr -d '\n')"
+          echo "::add-mask::$key"
+          echo "KAFKA_DELEGATION_TOKEN_SECRET_KEY=$key" >> "$GITHUB_ENV"
+      - name: Restore tiered storage jar
+        uses: actions/cache@v4
+        if: fromJSON(steps.entry.outputs.check).needs.tiered
+        with:
+          path: testHelpers/kafka/plugins/kafka-storage-4.3.1-test.jar
+          key: tiered-jar-${{ env.TIERED_JAR_SHA256 }}
       - name: Prepare tiered storage
         if: fromJSON(steps.entry.outputs.check).needs.tiered
         run: |
@@ -164,7 +220,8 @@ jobs:
           mkdir -p testHelpers/kafka/plugins "$RUNNER_TEMP/tiered-remote"
           chmod 777 "$RUNNER_TEMP/tiered-remote"
           jar=testHelpers/kafka/plugins/kafka-storage-4.3.1-test.jar
-          curl --fail --location --retry 3 --max-time 120 https://repo.maven.apache.org/maven2/org/apache/kafka/kafka-storage/4.3.1/kafka-storage-4.3.1-test.jar -o "$jar"
+          # Maven Central answers runners with a transient 403 at times, which plain --retry skips.
+          [ -s "$jar" ] || curl --fail --location --retry 5 --retry-all-errors --retry-delay 10 --max-time 120 https://repo.maven.apache.org/maven2/org/apache/kafka/kafka-storage/4.3.1/kafka-storage-4.3.1-test.jar -o "$jar"
           printf '%s  %s\n' "$TIERED_JAR_SHA256" "$jar" | sha256sum --check -
           echo "TIERED_REMOTE_DIR=$RUNNER_TEMP/tiered-remote" >> "$GITHUB_ENV"
       - name: Run check

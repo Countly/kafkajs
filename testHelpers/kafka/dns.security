@@ -1,0 +1,3 @@
+# A stopped container's name leaves Docker's DNS, and the JDK's default 10 s cache of that failed
+# lookup keeps the other brokers from reaching it for that long after it restarts.
+networkaddress.cache.negative.ttl=0

@@ -55,6 +55,20 @@ What to change to install the package and run it on a Kafka 4.x cluster.
 - **A closed connection's socket is destroyed, not ended.** A connection that closes (a timeout, a replaced or retired broker, `disconnect()`) now calls `socket.destroy()` where 2.2.4 called `socket.end()`. The default socket factory is unaffected. *What to do:* if you pass a custom `socketFactory` that returns a partial `net.Socket`, give it a `destroy()` method.
 - **Write IPv6 bootstrap hosts in brackets.** `brokers: ['[::1]:9092']` now works; `'::1:9092'` and an address without a valid port (1 to 65535) fail the first connect with `KafkaJSNonRetriableError` naming the address. *What to do:* bracket IPv6 literals and check the port of every entry of `brokers`, because every entry is now checked, not only the one in use.
 
+- **Connection readiness timeout.** An omitted `connectionTimeout` now starts at 10000 ms and grows after consecutive physical setup failures at that address, with ±20% jitter, to `connectionTimeoutMax` (30000 ms). A successful ready resets it. A blackholed node therefore takes about 10, 20, 30, 30 and 30 seconds across five attempts, plus reconnect waits, about two minutes in total. A refused or reset connection still fails immediately. *What to do:* set `connectionTimeout: 1000` to restore exactly the old flat timeout value, or set an explicit base alone to another flat value. Setting `connectionTimeoutMax` opts into growth. The wider readiness boundary still applies.
+- **The readiness boundary.** The setup timeout covers TCP, TLS, ApiVersions and SASL. A stalled ApiVersions or SASL phase can now fail before `requestTimeout`, and the retriable connection error identifies the phase and node timeout. A directly opened Fetch socket's setup budget ends at TCP/TLS; its authentication uses the SASL cap. *What to do:* raise `connectionTimeout` or `connectionTimeoutMax` when successful readiness legitimately needs more time.
+- **Reconnect waits.** Failed physical setup at one address delays its next attempt, starting at 50 ms and growing to 1000 ms with ±20% jitter. Other addresses remain independent. *What to do:* use `reconnectBackoff` and `reconnectBackoffMax` to tune this; `reconnectBackoff: 0` disables the wait, and a base alone is flat.
+- **Timeout validation.** `connectionTimeout` and `authenticationTimeout` require integral values from 1 to 2147483647; legacy numeric strings are still accepted and converted. Zero, negative, fractional, non-finite, null and invalid types now throw `KafkaJSInvalidConfigurationError` at construction. The new maximum and backoff options accept numbers only; backoff permits zero. Some legacy authentication values and fractional connection values could work before. *What to do:* supply valid integers and a maximum at least its explicit base.
+- **`authenticationTimeout`.** The whole SASL exchange, including a token callback or IAM signer, now has a default 10000 ms cap. During broker setup it also fits within the remaining readiness budget. It previously sized the lock and credential blackout without enforcing this cap. *What to do:* raise `authenticationTimeout` for a slower callback or signer; OAuth helpers refresh ahead of time. Expiry is a retriable connection error; a broker credential rejection remains a non-retriable authentication error.
+
+- Connections idle for 9 minutes are closed by default; the next request reconnects. This is below the default broker idle timeout but does not guarantee close ordering or eliminate races. `connectionsMaxIdle: 0` keeps connections open as before.
+
+To use GSSAPI, install `kerberos@7.0.0` yourself. The client loads this optional peer at the first GSSAPI authentication. Provide credentials through `KRB5CCNAME` and `KRB5_CONFIG`; a client keytab through `KRB5_CLIENT_KTNAME` depends on the platform's Kerberos implementation. Ticket acquisition and renewal are the deployment's job. The client runs no `kinit` or subprocess and has no Linux or macOS password option. Existing custom authentication providers retain precedence.
+
+- **SCRAM server checks.** SCRAM authentication now refuses, before deriving any key, a server-first message whose nonce does not extend the client's (an equal nonce included), whose iteration count is not an integer or is above 1 048 576, or that has a mandatory-extension, unknown or repeated attribute; it compares the server signature in constant time, and a server error attribute fails the exchange without its text. *What to do:* nothing for a Kafka broker, whose credentials allow at most 16 384 iterations. A server that asks for more needs the credential's iteration count lowered; there is no option to relax the checks.
+
+- **ApiVersions v5 checks the cluster and node ids (KIP-1242).** Against Kafka 4.4 brokers, ApiVersions v5 sends the intended cluster and node ids once both are known. A broker reporting `REBOOTSTRAP_REQUIRED` invokes the existing rebootstrap recovery. `metadataRecoveryStrategy: 'none'` disables identity checking and this recovery trigger. Older brokers retain the v4 path: on Kafka 4.0 to 4.3 they refuse the v5 request and the client completes ApiVersions v4, so each new connection, an idle reconnect included, costs one extra round trip. *What to do:* nothing for a cluster whose advertised addresses reach the brokers they name. A deployment that routes a node's advertised address to a different broker now sees `REBOOTSTRAP_REQUIRED` on Kafka 4.4: the client rebootstraps and the operation that opened the connection fails, and a routing that stays wrong rebootstraps again on each later attempt. Fix the routing, or set `metadataRecoveryStrategy: 'none'`.
+
 ### Producer
 
 - Remove the `kafkajs-snappy` registration to use the built-in codec, or keep it: yours wins. The built-in codec runs on the main thread (no native module), in short slices that yield to the event loop: about 100 MiB/s to decode, 40 MiB/s to encode
@@ -983,6 +997,12 @@ retry.maxTotalTime adds a public-entry deadline only to consumer commitOffsets, 
 
 ### Admin
 
+- **Admin lifecycle.** Admin operations after disconnect reject without dialing until an explicit connect opens a new lifecycle. Call `await admin.connect()` to resume; legacy implicit reconnection after close is no longer supported. Concurrent closes share cleanup and cannot affect the replacement lifecycle. `disconnect({ timeout })` accepts an integer from 0 through 2147483647 milliseconds; omitted timeout drains naturally, zero forces close immediately, and invalid object options reject before mutation. Non-object signal-handler arguments remain ignored. A forced close cannot undo a mutation already transmitted; inspect broker state before repeating it.
+
+- **Token-admin diagnostics.** Token-admin response data and failure payloads are filtered before logging, including when buffer diagnostics are enabled. Use the stable error class, type/code and broker fields for diagnosis. The authorized caller still receives the token HMAC as a Buffer; do not depend on raw diagnostic payloads.
+
+deleteOffsets returns partition errorCode/error results; group-level refusals reject. fetchOffsetsForGroups returns each group's own result and batches by coordinator, falling back to single-group requests below OffsetFetch v8. requireStable defaults to false; an explicit stable read requires v7 or later. A call deadline does not recall a deletion already transmitted.
+
 Group visibility and the admin client.
 
 - **`admin.listGroups()` rejects with the retrier's error class.** Every per-broker call now runs
@@ -1129,6 +1149,18 @@ Group visibility and the admin client.
   them); `retry: { retries: 0 }` makes a single attempt.
 - **A DescribeTopicPartitions read has one 60 s deadline.** `fetchTopicMetadata({ topics, useDescribeTopicPartitions: true })` rejects with `KafkaJSTimeout` when the read, every page and retry included, is not done within 60 s, and a topic recreated between two pages is read again from the start. *What to do:* nothing, unless your cluster pages that slowly; then use the default Metadata path (`useDescribeTopicPartitions: false`).
 
+Admin calls take an `apiTimeout` (default 60 000 ms) and reject with `KafkaJSTimeout` when it passes; a mutation may have been applied. Retries are unchanged, unlike Java's unbounded retries inside the deadline. Configure the default with `kafka.admin({ apiTimeout })`, or override one call. Values must be integers from 1 to 2147483647. A broker-side `timeout` remains independent and is not shortened on the wire.
+
+Describe calls can request the optional raw authorized-operations mask; an unsupported field returns null. The mask stays an optional `number | null`, with the signed INT32 value preserved. No mask-type migration is required.
+
+Topic-offset reads accept isolationLevel: 'read_committed' (the unchanged default) or 'read_uncommitted'. During an open transaction, the default high is the last stable offset; use read_uncommitted for high-watermark committed lag and a raw fetchOffsets read with resolveOffsets: false. Missing commits are distinct from zero. Broker errorMessage is separate from stable protocol messages. deleteTopicRecords still returns Promise<void>; inspect the existing error/cause chain for its failing partitions and read low watermarks with fetchTopicOffsets. listTopics remains string[]; fetchTopicMetadata() provides topicId and isInternal from the same fresh Metadata snapshot.
+
+Transaction diagnostics and recovery are available through `describeProducers`, `describeTransactions`, `listTransactions`, `abortTransaction` and `fenceProducers`. The Java `forceTerminateTransaction(id)` equivalent is `admin.fenceProducers({ transactionalIds: [id] })`; there is no separate method. Producer IDs and other 64-bit results are decimal strings. Diagnostic and fence calls return per-item errors, while `abortTransaction` resolves without a value or throws and `listTransactions` fails as a whole if a broker fails. All five calls use the admin `apiTimeout`; expiry cannot recall an abort or fence already sent. Existing producer transaction methods keep their behavior.
+
+| Behavior | Configuration | Default | Migration | Area |
+| --- | --- | --- | --- | --- |
+| `deleteTopics` accepts `topicIds` as an exclusive alternative to `topics` (types and runtime: giving both or neither throws) | none needed | none | `deleteTopics({ topicIds })` deletes by topic id; `topics` and `topicIds` are exclusive. | Admin |
+
 ### Errors and events
 
 Error classes and categories, new instrumentation events and the payload keys they gain, and what is
@@ -1255,6 +1287,8 @@ now logged.
 - **A forced producer close reports `KafkaJSProducerClosedError` with transmission evidence.** `outcome` is `'unsent'` for work that was never written and `'unknown'` for anything written at least once, which may still have been applied by the broker. The error is non-retriable and its `category` is `abortable`. A class without an `outcome`, or the absence of an error, proves nothing about delivery.
 
 - Switches handling partition-halted reasons keep the two reset reasons added with offsetReset. No-group CRASH/halt groupId is null. Existing corrupt/decode offset stays decimal and decode metadata fields remain available. TypeScript ≥4.1 remains required for the duration template-literal type.
+
+- **SASL diagnostics.** A broker's SASL error message, its authentication bytes, a SCRAM server error and what a token endpoint answered no longer reach error messages, causes, log lines, the `AUTHENTICATION_FAILURE` event or the reconnect blackout. Error classes and prefixes such as `SASL PLAIN authentication failed:` are unchanged; the text after the prefix preserves fixed, library-authored SCRAM validation reasons, uses the canonical description for a protocol error code (for example `SASL Authentication failed`), and is `Error` for other broker or supplier failures, the protocol error keeps its `type` and `code`, and the event's `errorMessage` reads `SASL <MECHANISM> authentication failed: broker=<host:port> stage=exchange`. *What to do:* diagnose from the error class, the protocol error's `type` and `code`, and the event's `broker` and `mechanism`; read the broker's own log for its message. Nothing restores the broker text.
 
 ### Protocol
 
@@ -1439,3 +1473,5 @@ The runtime is unchanged by these; they can fail `tsc` on an existing codebase.
   table, which are strings; the declaration said `number[]`. Under `strict` a comparison such as
   `ids[0] === 1` is `TS2367` and `ids.includes(1)` is `TS2345`. Compare with `String(id)` or
   convert the element with `Number(id)`. The runtime is unchanged.
+The declared bases of KafkaJSPartialMessageError, KafkaJSSASLAuthenticationError, KafkaJSGroupCoordinatorNotFound, KafkaJSNotImplemented, KafkaJSTimeout and KafkaJSUnsupportedMagicByteInMessageSet now match KafkaJSNonRetriableError. KafkaJSLockTimeout extends KafkaJSTimeout. Runtime inheritance is unchanged.
+

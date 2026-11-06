@@ -1,0 +1,7 @@
+{
+  "message": "UpdateFeaturesResponse",
+  "version": 2,
+  "case": "mixed",
+  "hex": "0000001100000000",
+  "fields": {"throttleTimeMs":17,"errorCode":0,"errorMessage":null}
+}

@@ -25,6 +25,7 @@ const { OffsetFetch: apiKey } = require('../../apiKeys')
  * @see clients/src/main/resources/common/message/OffsetFetchRequest.json (Apache Kafka 4.3.1)
  *
  * @param {object} options
+ * @param {object[]} [options.groups] explicit multi-group request; absent retains legacy shape
  * @param {string} options.groupId
  * @param {{topic: string, partitions: {partition: number}[]}[]} options.topics an empty or
  *   absent list asks for every topic in the group, as at every earlier version
@@ -36,6 +37,7 @@ const { OffsetFetch: apiKey } = require('../../apiKeys')
 module.exports = ({
   groupId,
   topics,
+  groups,
   memberId = null,
   memberEpoch = -1,
   requireStable = false,
@@ -45,14 +47,20 @@ module.exports = ({
   apiName: 'OffsetFetch',
   encode: async () =>
     new Encoder()
-      .writeUVarIntArray([
-        new Encoder()
-          .writeUVarIntString(groupId)
-          .writeUVarIntString(memberId)
-          .writeInt32(memberEpoch)
-          .writeUVarIntArray(topics == null || topics.length === 0 ? null : topics.map(encodeTopic))
-          .writeTaggedFields(),
-      ])
+      .writeUVarIntArray(
+        (groups ?? [{ groupId, topics, memberId, memberEpoch }]).map((group) =>
+          new Encoder()
+            .writeUVarIntString(group.groupId)
+            .writeUVarIntString(group.memberId ?? null)
+            .writeInt32(group.memberEpoch ?? -1)
+            .writeUVarIntArray(
+              group.topics == null || (groups === undefined && group.topics.length === 0)
+                ? null
+                : group.topics.map(encodeTopic)
+            )
+            .writeTaggedFields()
+        )
+      )
       .writeBoolean(requireStable)
       .writeTaggedFields(),
 })

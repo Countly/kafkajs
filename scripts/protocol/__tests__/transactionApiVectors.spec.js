@@ -31,6 +31,20 @@ const MANIFEST = {
     ...stems('txnOffsetCommitRequest', [2], ['legacy', 'leaderEpoch']),
     ...stems('txnOffsetCommitRequest', [3, 4, 5], ['legacy', 'groupMetadata']),
     ...stems('txnOffsetCommitResponse', [2, 3, 4, 5], ['ok', 'error']),
+    ...stems('txnOffsetCommitRequest', [6], ['defaultMetadata', 'groupMetadata']),
+    ...stems(
+      'txnOffsetCommitResponse',
+      [6],
+      [
+        'ok',
+        'groupIdNotFound',
+        'staleMemberEpoch',
+        'unknownTopicId',
+        'mixedOutcomes',
+        'unknownTags',
+        'noTopics',
+      ]
+    ),
   ],
   initProducerId: stems(
     'initProducerIdRequest',
@@ -121,6 +135,9 @@ const NO_ERROR = int(0, 2)
 const CONCURRENT_TRANSACTIONS = int(51, 2) // 0x0033
 const PRODUCER_FENCED = int(90, 2) // 0x005a
 const ILLEGAL_GENERATION = int(22, 2) // 0x0016
+const STALE_MEMBER_EPOCH = int(113, 2) // 0x0071
+const TOPIC_ID_A = '0102030405060708090a0b0c0d0e0f10' // TopicId UUID, 16 bytes
+const TOPIC_ID_B = '1112131415161718191a1b1c1d1e1f20'
 const DEFAULT_PRODUCER_PAIR = 'ff'.repeat(10) // ProducerId -1, ProducerEpoch -1
 
 /** Full expected bodies of the short vectors, as `[api, file stem, hex]`. */
@@ -196,11 +213,28 @@ const PINNED = [
       TAGS +
       TAGS,
   ]),
+  ['txnOffsetCommit', 'txnOffsetCommitResponse-v6-noTopics', THROTTLE + count(0) + TAGS],
+  [
+    'txnOffsetCommit',
+    'txnOffsetCommitResponse-v6-staleMemberEpoch',
+    THROTTLE +
+      count(2) +
+      TOPIC_ID_A +
+      count(2) +
+      (int(0, 4) + STALE_MEMBER_EPOCH + TAGS) +
+      (int(1, 4) + STALE_MEMBER_EPOCH + TAGS) +
+      TAGS +
+      TOPIC_ID_B +
+      count(1) +
+      (int(0, 4) + STALE_MEMBER_EPOCH + TAGS) +
+      TAGS +
+      TAGS,
+  ],
 ]
 
 describe('Java message vectors > transaction APIs', () => {
-  test('the manifest names sixty-three vectors', () => {
-    expect(ENTRIES).toHaveLength(63)
+  test('the manifest names seventy-two vectors', () => {
+    expect(ENTRIES).toHaveLength(72)
   })
 
   test.each(ENTRIES)('$name is on disk and is what its name says', ({ api, name }) => {

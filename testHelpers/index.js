@@ -314,7 +314,9 @@ const getPropagationBrokers = () => {
     propagationBrokers = plainTextBrokers().map((address) => {
       const [host, port] = address.split(':')
       return new Broker({
-        connectionPool: createConnectionPool({ host, port: Number(port) }),
+        // No idle reaper: these sockets live for the whole file, and its re-armed timer would
+        // count against a case that tracks the timers it leaves behind.
+        connectionPool: createConnectionPool({ host, port: Number(port), connectionsMaxIdle: 0 }),
         logger: newLogger(),
         allowAutoTopicCreation: false,
       })

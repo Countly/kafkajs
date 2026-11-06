@@ -12,6 +12,7 @@ test('require and import resolve to the same module instance', async () => {
   assert.equal(esm.Kafka, cjs.Kafka)
   assert.equal(esm.default, cjs)
   assert.equal(esm.CompressionCodecs, cjs.CompressionCodecs)
+  assert.equal(esm.oauthBearer, cjs.oauthBearer)
 })
 
 test('the ESM wrapper re-exports every named export of index.js', async () => {
@@ -65,6 +66,21 @@ test('deep paths under src are not exported', () => {
 
 test('package.json stays reachable', () => {
   assert.equal(require(`${PKG}/package.json`).name, PKG)
+})
+
+test('OAuth helpers share their namespace across require and import', async () => {
+  const cjs = require(PKG)
+  const esm = await import(PKG)
+  assert.equal(esm.oauthBearer, cjs.oauthBearer)
+  assert.deepEqual(Object.keys(cjs.oauthBearer).sort(), ['clientCredentials', 'fileToken', 'jwtBearer', 'signAssertion'])
+  for (const name of Object.keys(cjs.oauthBearer)) assert.equal(typeof cjs.oauthBearer[name], 'function')
+  const provider = cjs.oauthBearer.clientCredentials({ tokenEndpointUrl: 'https://issuer.example/token', clientId: 'client', clientSecret: 'inert-secret' })
+  assert.equal(typeof provider, 'function')
+  assert.equal(typeof provider.close, 'function')
+  assert.equal(provider.close(), undefined)
+  provider.close()
+  await assert.rejects(provider(), cjs.KafkaJSSASLAuthenticationError)
+  assert.throws(() => require(`${PKG}/src/oauth`), { code: 'ERR_PACKAGE_PATH_NOT_EXPORTED' })
 })
 
 
@@ -131,4 +147,77 @@ test('the packed consumer has the manual-assignment methods and validates its gr
   assert.throws(() => kafka.consumer({ groupId: 'g', rackAwareAssignment: 'yes' }), KafkaJSNonRetriableError)
   await assert.rejects(direct.subscribe({ topic: 't' }), KafkaJSNonRetriableError)
   await assert.rejects(direct.committed([]), KafkaJSNonRetriableError)
+})
+
+test('Kerberos stays an optional exact peer and deep imports stay closed', () => {
+  const pkg = require(`${PKG}/package.json`)
+  assert.equal(pkg.peerDependencies.kerberos, '7.0.0')
+  assert.equal(pkg.peerDependenciesMeta.kerberos.optional, true)
+  assert.equal(pkg.dependencies?.kerberos, undefined)
+  assert.equal(pkg.optionalDependencies?.kerberos, undefined)
+  assert.throws(() => require(`${PKG}/src/broker/saslAuthenticator/gssapi`), {
+    code: 'ERR_PACKAGE_PATH_NOT_EXPORTED',
+  })
+})
+
+test('the packed client authenticates with PLAIN and reports the absent GSSAPI peer', async () => {
+  const { createServer } = await import('node:net')
+  const { once } = await import('node:events')
+  assert.throws(() => require.resolve('kerberos'), { code: 'MODULE_NOT_FOUND' })
+  const { Kafka, KafkaJSNotImplemented } = require(PKG)
+  const mechanisms = []
+  const sockets = new Set()
+  const server = createServer(socket => {
+    sockets.add(socket)
+    socket.on('close', () => sockets.delete(socket))
+    let buffered = Buffer.alloc(0)
+    socket.on('data', data => {
+      buffered = Buffer.concat([buffered, data])
+      while (buffered.length >= 4 && buffered.length >= buffered.readInt32BE(0) + 4) {
+        const size = buffered.readInt32BE(0)
+        const frame = buffered.subarray(4, size + 4)
+        buffered = buffered.subarray(size + 4)
+        const key = frame.readInt16BE(0)
+        const correlation = frame.subarray(4, 8)
+        let body
+        if (key === 18) {
+          // ErrorCode, compact ApiKeys, throttle and tags; ApiVersions keeps header v0.
+          body = Buffer.from('0000040012000000040000110001000100002400020002000000000000', 'hex')
+        } else if (key === 17) {
+          const offset = 10 + frame.readInt16BE(8)
+          mechanisms.push(frame.subarray(offset + 2, offset + 2 + frame.readInt16BE(offset)).toString())
+          // No error; two classic strings: PLAIN, GSSAPI.
+          body = Buffer.from('0000000000020005504c41494e0006475353415049', 'hex')
+        } else if (key === 36) {
+          // Flexible response header tags; code, null message, empty bytes, zero lifetime, tags.
+          body = Buffer.from('0000000001000000000000000000', 'hex')
+        } else {
+          socket.destroy(new Error('Unexpected request in packed authentication fixture'))
+          return
+        }
+        const length = Buffer.alloc(4)
+        length.writeInt32BE(correlation.length + body.length)
+        socket.write(Buffer.concat([length, correlation, body]))
+      }
+    })
+  })
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  const brokers = [`127.0.0.1:${server.address().port}`]
+  const config = { brokers, retry: { retries: 0 }, connectionTimeout: 1000, logLevel: 0 }
+  const plain = new Kafka({ ...config, sasl: { mechanism: 'plain', username: 'fixture', password: 'fixture' } }).admin()
+  const gssapi = new Kafka({ ...config, sasl: { mechanism: 'gssapi' } }).admin()
+  try {
+    await plain.connect()
+    await assert.rejects(gssapi.connect(), error => {
+      assert.ok(error instanceof KafkaJSNotImplemented)
+      assert.match(error.message, /npm install kerberos@7\.0\.0/)
+      return true
+    })
+    assert.deepEqual(mechanisms, ['PLAIN', 'GSSAPI'])
+  } finally {
+    await Promise.allSettled([plain.disconnect(), gssapi.disconnect()])
+    for (const socket of sockets) socket.destroy()
+    await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
+  }
 })

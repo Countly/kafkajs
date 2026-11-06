@@ -63,6 +63,41 @@ const kafka = new Kafka({
 Note that this discovery mechanism is only used to get the initial set of brokers (i.e. the seed brokers). After successfully connecting to
 a broker in this list, Kafka has its own mechanism for discovering the rest of the cluster.
 
+### Resolving broker addresses
+
+Each new connection resolves the broker's host name again and, with Node's default `autoSelectFamily`, tries every address the lookup returns, in turn, within the connection setup timeout. This is what Java's `client.dns.lookup=use_all_dns_ips` does, so there is no option for it. Each attempt but the last waits at most `net.getDefaultAutoSelectFamilyAttemptTimeout()` ms (250 ms on Node 22 and 24, 500 ms on Node 26). A custom `socketFactory` decides its own dialing.
+
+Java's `resolve_canonical_bootstrap_servers_only` replaces each bootstrap host by the canonical names of its addresses, for example so that a Kerberos service principal names the real host. Pass `brokers` as an async function that does the same; it runs again whenever the client rebuilds its bootstrap list:
+
+```javascript
+const { promises: dns } = require('dns')
+
+async function canonicalBrokers(bootstrap) {
+  const resolved = await Promise.all(
+    bootstrap.map(async (entry) => {
+      const separator = entry.lastIndexOf(':')
+      const host = entry.slice(0, separator)
+      const port = entry.slice(separator + 1)
+      const addresses = await dns.lookup(host, { all: true })
+      return Promise.all(
+        addresses.map(async ({ address }) => {
+          const [name] = await dns.reverse(address).catch(() => [address])
+          return `${name}:${port}`
+        })
+      )
+    })
+  )
+  return resolved.flat()
+}
+
+const kafka = new Kafka({
+  clientId: 'my-app',
+  brokers: () => canonicalBrokers(['kafka.example.com:9093']),
+})
+```
+
+An address without a reverse name stays an address, as in Java.
+
 ## SSL
 
 The `ssl` option can be used to configure the TLS sockets. The options are passed directly to [`tls.connect`](https://nodejs.org/api/tls.html#tls_tls_connect_options_callback) and used to create the TLS Secure Context, all options are accepted.
@@ -94,7 +129,7 @@ Note that the broker may be configured to reject your authentication attempt if 
 
 | option                    | description                                                                                                                                                                             | default |
 | ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
-| authenticationTimeout     | Timeout in ms for authentication requests                                                                                                                                               | `10000`  |
+| authenticationTimeout | Whole SASL exchange cap in ms, including a token callback or signer; integer 1..2147483647, legacy numeric string accepted. During setup the remaining readiness budget also applies. | `10000` |
 | reauthenticationThreshold | When periodic reauthentication (`connections.max.reauth.ms`) is configured on the broker side, reauthenticate when `reauthenticationThreshold` milliseconds remain of session lifetime. | `10000` |
 
 ### PLAIN/SCRAM Example
@@ -115,6 +150,8 @@ new Kafka({
 ```
 
 ### OAUTHBEARER Example
+
+Use `oauthBearer.clientCredentials`, `oauthBearer.jwtBearer` or `oauthBearer.fileToken` to build the existing callback with shared retrieval and refresh. `oauthBearer.signAssertion` supplies locally signed assertions. See [OAuth helpers and recipes](OAuth.md) for options, lifecycle, discovery, token exchange, mTLS and remote signing. The helper's default `maxRetryTime` is 8000 ms; keep the retrieval budget below `authenticationTimeout`, or raise the SASL timeout for a slower callback. Disconnect clients before closing a provider they share.
 
 ```javascript
 new Kafka({
@@ -265,6 +302,31 @@ A complete breakdown can be found in the IAM User Guide's
 It is **highly recommended** that you use SSL for encryption when using `PLAIN` or `AWS`,
 otherwise credentials will be transmitted in cleartext!
 
+The client verifies the broker certificate by default (`rejectUnauthorized` stays `true` unless you set it), and checks it against the broker's host name, which it also sends as the TLS server name (SNI). An IP address is checked against the IP addresses the certificate lists. Set `ssl.servername` when the certificate names another host. TLS failures are a `KafkaJSConnectionError` whose `code` is Node's, for example `DEPTH_ZERO_SELF_SIGNED_CERT` or `ERR_TLS_CERT_ALTNAME_INVALID`.
+
+A listener that requires a client certificate refuses a client without one. With TLS 1.3 the handshake may complete first and the refusal arrive with the first read: the connection then fails with a `KafkaJSConnectionError` whose `code` ends in `CERTIFICATE_REQUIRED`.
+
+A plaintext client that reaches a TLS listener receives a TLS alert. The client refuses it as an oversized response frame, with a message that says the bytes look like a TLS alert. A TLS client that reaches a plaintext listener fails with its usual connection error, and the client logs one warning: "is this a TLS client on a plaintext port?".
+
+### GSSAPI (Kerberos)
+
+Install the optional peer with `npm install kerberos@7.0.0`. Ordinary imports and other mechanisms do not load it. If it is absent or the installed version differs from 7.0.0, the first GSSAPI authentication throws `KafkaJSNotImplemented` with this installation command. Version validation occurs before native initialization.
+
+```javascript
+const kafka = new Kafka({
+  brokers: async () => ['broker.example.com:9192'],
+  sasl: { mechanism: 'gssapi', serviceName: 'kafka', principal: 'client@EXAMPLE.COM' },
+})
+```
+
+`serviceName` defaults to `kafka` and must be nonempty with no `@`, slash or NUL. `principal` is optional and must be nonempty without NUL when supplied. The service is `serviceName@connectedHost`. Return the broker's canonical principal hostname from an async brokers resolver; an IP literal may not identify that principal. The client does not rewrite DNS or the advertised broker addresses, so advertised names must also match their service principals.
+
+Credentials come from the process environment: `KRB5_CONFIG` and a usable `KRB5CCNAME`, or a platform-supported client keytab through `KRB5_CLIENT_KTNAME`. No client password path is provided. Each authentication and reauthentication creates a fresh native context so renewed credentials can be used. Acquisition, context and exchange failures become sanitized `KafkaJSSASLAuthenticationError` messages with the mechanism, broker and stable stage: `exchange:<n>` names the nth context exchange and `exchange:final` the one that carries the layer reply. A failure that is a library error or a built-in programming error (`TypeError`, `RangeError`, `ReferenceError`, `SyntaxError`) adds ` cause=<class>`, and a protocol error also its `type` and `code`; no message text, token or broker string is added.
+
+Arrange ticket renewal outside this library. In Kubernetes, mount the realm configuration and a shared ticket-cache volume into the application and a renewal sidecar; give the sidecar its own keytab secret and renewal policy, and give the application access to the resulting cache. Set KRB5_CONFIG/KRB5CCNAME before starting the client. The client runs no subprocess or renewal timer. Initial client-keytab acquisition is platform dependent; verify it in the deployment before relying on an empty or expired cache.
+
+A custom `authenticationProvider` with mechanism `GSSAPI` overrides the built-in provider. The adapter negotiates authentication without a SASL security layer; use TLS for transport encryption when required.
+
 ### Custom Authentication Mechanisms
 
 If an authentication mechanism is not supported out of the box in KafkaJS, a custom authentication
@@ -294,15 +356,37 @@ authentication mechanism.
 
 ## Connection Timeout
 
-Time in milliseconds to wait for a successful connection. The default value is: `1000`.
+A broker must become ready within one setup timeout, covering TCP, TLS, ApiVersions and SASL. With no explicit timeout, the base is 10000 ms and grows per address on consecutive physical setup failures, with ±20% jitter, up to `connectionTimeoutMax` (30000 ms). Any successful ready at that address resets the policy. A refused/reset connection still fails immediately; a blackholed node can take about 10, 20 and 30 seconds on successive attempts.
 
-```javascript
-new Kafka({
+An explicit `connectionTimeout` without `connectionTimeoutMax` is flat with no jitter: `connectionTimeout: 1000` restores exactly the legacy flat timeout value. Setting a maximum opts into growth. A maximum alone uses base `Math.min(10000, connectionTimeoutMax)`. A directly opened Fetch socket's setup budget ends at TCP/TLS; authentication has its own whole-SASL cap.
+
+| Option | Range and behavior | Default |
+|---|---|---|
+| connectionTimeout | Integer 1..2147483647 ms; legacy numeric string accepted. An explicit base alone stays flat. | 10000, growing |
+| connectionTimeoutMax | Integer 1..2147483647 ms, at least an explicit base; number only. | 30000 unless a base alone is set |
+| reconnectBackoff | Integer 0..2147483647 ms, number only; base alone is flat, 0 disables waits. | 50 |
+| reconnectBackoffMax | Integer 0..2147483647 ms, at least its base; number only. | 1000 unless a base alone is set |
+
+Reconnect waits are counted from a physical setup failure at that address, grow exponentially with ±20% jitter, and reset at ready. Explicit disconnect, retirement, idle close, caller timeout and credential rejection do not grow setup failure state. A caller's deadline can stop waiting while a shared physical setup continues to its own budget.
+
+```js
+const kafka = new Kafka({
   clientId: 'my-app',
   brokers: ['kafka1:9092', 'kafka2:9092'],
-  connectionTimeout: 3000
+  connectionTimeout: 3000,
+  connectionTimeoutMax: 30000,
+  reconnectBackoff: 50,
+  reconnectBackoffMax: 1000,
 })
 ```
+
+Invalid timeout/backoff values fail at construction with `KafkaJSInvalidConfigurationError` naming the option. The two legacy timeout options accept numeric strings; new options require numbers.
+
+`connectionsMaxIdle` closes a connection after 540000 ms of inactivity by default. Set it to `0` to keep idle connections open as before. It accepts integers from 0 to 2147483647; `undefined` uses the default. Numeric strings, `null`, fractions and non-finite values are rejected at construction with `KafkaJSInvalidConfigurationError`. A request being authenticated or encoded, a queued request and an in-flight request prevent reaping, including a long-poll Fetch. The next request reconnects and renegotiates ApiVersions. The client keeps TCP keepalive. The default is below the default broker idle timeout; it does not guarantee which side closes first or eliminate close races.
+
+## Admin
+
+`kafka.admin({ apiTimeout })` sets the default end-to-end budget of admin operations, in milliseconds (default 60000). Each admin operation can override it. It must be an integer from 1 to 2147483647. See [Admin call deadlines](Admin.md#call-deadlines) for unknown mutation outcomes, unchanged retry limits and the distinction from broker-side `timeout`.
 
 ## Request Timeout
 
@@ -405,6 +489,13 @@ new Kafka({
 
   With `'none'`, none of the above happen: a `REBOOTSTRAP_REQUIRED` response surfaces as the
   non-retriable `KafkaJSProtocolError` it already is, restoring the pre-3.0 behavior.
+
+  The second trigger also covers ApiVersions v5, which Kafka 4.4 brokers offer (KIP-1242): once
+  the client knows the cluster and a node, its ApiVersions request names the intended cluster id
+  and node id together, and a broker that is not that node answers `REBOOTSTRAP_REQUIRED`.
+  Bootstrap requests use no identity. `'none'` sends neither id and disables rebootstrap on
+  `REBOOTSTRAP_REQUIRED`; a returned protocol error still fails the request. Older brokers answer
+  the first request with `UNSUPPORTED_VERSION` and complete ApiVersions v4 negotiation.
 - `metadataRecoveryRebootstrapTriggerMs`: how long metadata must fail continuously before trigger
   1 above fires. Defaults to `300000` (5 minutes, matching the Java client). Must be an integer
   **≥ 1** — `0` is rejected rather than meaning "rebootstrap immediately": at `0` the trigger would

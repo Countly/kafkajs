@@ -24,10 +24,34 @@ const versions = {
     const response = require('./v5/response')
     return { request: request({ topics, timeout }), response }
   },
-  6: ({ topics, timeout }) => {
+  6: ({ topics, topicIds, timeout }) => {
     const request = require('./v6/request')
     const response = require('./v6/response')
-    return { request: request({ topics, timeout }), response }
+    if (topicIds === undefined) return { request: request({ topics, timeout }), response }
+    const { KafkaJSInvariantViolation } = require('../../../errors')
+    const expected = new Set(topicIds)
+    return {
+      request: request({ topics, topicIds, timeout }),
+      response: {
+        ...response,
+        /** Validates the complete attempted ID set before the legacy parser filters failures.
+         * @param {object} data all decoded success and failure rows
+         * @returns {Promise<object>} legacy parsed response
+         * @throws {KafkaJSInvariantViolation} missing, foreign or duplicate result identity
+         */
+        parse: async (data) => {
+          const seen = new Set()
+          for (const row of data.topicErrors) {
+            if (!expected.has(row.topicId) || seen.has(row.topicId))
+              throw new KafkaJSInvariantViolation('Invalid deletion response identity')
+            seen.add(row.topicId)
+          }
+          if (seen.size !== expected.size)
+            throw new KafkaJSInvariantViolation('Incomplete deletion response identities')
+          return response.parse(data)
+        },
+      },
+    }
   },
 }
 

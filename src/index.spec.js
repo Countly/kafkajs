@@ -52,6 +52,52 @@ describe('Client', () => {
     expect(other).not.toBe(producer)
   })
 
+  it('producer rack options reach the producer factory', () => {
+    const client = new Client({ brokers: [] })
+    const options = [
+      undefined,
+      {},
+      { rackId: undefined, rackAware: undefined },
+      { rackId: 'rack-b' },
+      { rackId: 'rack-b', rackAware: false },
+      { rackId: 'rack-b', rackAware: true },
+    ]
+
+    options.forEach((producerOptions) => client.producer(producerOptions))
+
+    expect(
+      createProducer.mock.calls.map(([{ rackId, rackAware }]) => ({ rackId, rackAware }))
+    ).toEqual([
+      { rackId: '', rackAware: false },
+      { rackId: '', rackAware: false },
+      { rackId: '', rackAware: false },
+      { rackId: 'rack-b', rackAware: false },
+      { rackId: 'rack-b', rackAware: false },
+      { rackId: 'rack-b', rackAware: true },
+    ])
+  })
+
+  it('invalid producer rack options reject before cluster construction', () => {
+    const client = new Client({ brokers: [] })
+    const invalid = [
+      [{ rackId: null }, /rackId must be a string, got null/],
+      [{ rackId: 7 }, /rackId must be a string, got 7/],
+      [{ rackAware: null }, /rackAware must be a boolean, got null/],
+      [{ rackAware: 'true' }, /rackAware must be a boolean, got 'true'/],
+      [{ rackAware: 1 }, /rackAware must be a boolean, got 1/],
+      [{ rackAware: true }, /rackAware requires a non-empty rackId/],
+      [{ rackAware: true, rackId: '' }, /rackAware requires a non-empty rackId/],
+    ]
+
+    for (const [options, message] of invalid) {
+      expect(() => client.producer(options)).toThrow(KafkaJSInvalidConfigurationError)
+      expect(() => client.producer(options)).toThrow(message)
+    }
+
+    expect(Cluster).not.toHaveBeenCalled()
+    expect(createProducer).not.toHaveBeenCalled()
+  })
+
   describe('maxInFlightRequests', () => {
     it.each([
       ['producer', (client, maxInFlightRequests) => client.producer({ maxInFlightRequests })],
@@ -176,6 +222,8 @@ describe('Client', () => {
       linger: 5,
       batchSize: 16384,
       deliveryTimeout: 120000,
+      rackId: '',
+      rackAware: false,
     })
   })
 

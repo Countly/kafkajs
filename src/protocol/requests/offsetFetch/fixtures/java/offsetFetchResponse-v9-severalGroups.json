@@ -1,0 +1,7 @@
+{
+  "message": "OffsetFetchResponse",
+  "version": 9,
+  "case": "severalGroups",
+  "hex": "000000110302610202740200000000000000000000000a00000003000000000000000002620202740200000000000000000000000a00000003000000000000000000",
+  "fields": {"throttleTime":17,"groups":[{"groupId":"a","errorCode":0,"topics":[{"topic":"t","partitions":[{"partition":0,"offset":"10","leaderEpoch":3,"metadata":null,"errorCode":0}]}]},{"groupId":"b","errorCode":0,"topics":[{"topic":"t","partitions":[{"partition":0,"offset":"10","leaderEpoch":3,"metadata":null,"errorCode":0}]}]}]}
+}

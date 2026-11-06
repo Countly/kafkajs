@@ -1,0 +1,52 @@
+[
+  {
+    "message": "ListConfigResourcesRequest",
+    "version": 0,
+    "case": "basic",
+    "fields": {},
+    "hex": "00"
+  },
+  {
+    "message": "ListConfigResourcesResponse",
+    "version": 0,
+    "case": "mixed",
+    "fields": {
+      "throttleTimeMs": 17,
+      "errorCode": 0,
+      "configResources": [
+        {
+          "resourceName": "subscription"
+        }
+      ]
+    },
+    "hex": "000000110000020d737562736372697074696f6e0000"
+  },
+  {
+    "message": "ListConfigResourcesRequest",
+    "version": 1,
+    "case": "basic",
+    "fields": {
+      "resourceTypes": [
+        16,
+        32
+      ]
+    },
+    "hex": "03102000"
+  },
+  {
+    "message": "ListConfigResourcesResponse",
+    "version": 1,
+    "case": "mixed",
+    "fields": {
+      "throttleTimeMs": 17,
+      "errorCode": 0,
+      "configResources": [
+        {
+          "resourceName": "subscription",
+          "resourceType": 16
+        }
+      ]
+    },
+    "hex": "000000110000020d737562736372697074696f6e100000"
+  }
+]

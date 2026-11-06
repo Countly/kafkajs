@@ -486,4 +486,48 @@ describe('Admin > deleteTopicRecords', () => {
       },
     ])
   })
+  test('keeps successful brokers out of retries and reports only the refused partition', async () => {
+    const calls = new Map()
+    jest.spyOn(cluster, 'fetchTopicsOffset').mockImplementation(async () => [
+      {
+        topic: topicName,
+        partitions: [
+          { partition: 0, offset: '0' },
+          { partition: 1, offset: '0' },
+        ],
+      },
+    ])
+    jest.spyOn(cluster, 'findLeaderForPartitions').mockReturnValue({ 0: [0], 1: [1] })
+    const brokers = [0, 1].map((nodeId) => ({
+      deleteRecords: jest.fn(async () => {
+        calls.set(nodeId, (calls.get(nodeId) || 0) + 1)
+        if (nodeId === 1)
+          throw new KafkaJSDeleteTopicRecordsError({
+            topic: topicName,
+            partitions: [
+              { partition: 1, offset: '5', error: createErrorFromCode(calls.get(1) === 1 ? 6 : 1) },
+            ],
+          })
+      }),
+    }))
+    jest
+      .spyOn(cluster, 'findBroker')
+      .mockImplementation(async ({ nodeId }) => brokers[Number(nodeId)])
+    const error = await admin
+      .deleteTopicRecords({
+        topic: topicName,
+        partitions: [
+          { partition: 0, offset: '5' },
+          { partition: 1, offset: '5' },
+        ],
+      })
+      .catch((e) => e)
+    expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
+    expect(error.cause).toBeInstanceOf(KafkaJSDeleteTopicRecordsError)
+    expect(error.cause.partitions).toEqual([
+      { partition: 1, offset: '5', error: expect.objectContaining({ code: 1 }) },
+    ])
+    expect(calls.get(0)).toBe(1)
+    expect(calls.get(1)).toBeGreaterThan(1)
+  })
 })

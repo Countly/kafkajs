@@ -1,9 +1,10 @@
+const { currentDeadline, checked, withAdminGuard, sharedSetup } = require('../admin/deadline')
 const Lock = require('../utils/lock')
 const describeThrown = require('../network/describeThrown')
 const { Types: Compression } = require('../protocol/message/compression')
 const { requests, lookup, selectVersion } = require('../protocol/requests')
 const { partitionResults } = require('../protocol/requests/produce/partitionResults')
-const { NO_TOPIC_ID } = require('../protocol/requests/topicIds')
+const { NO_TOPIC_ID, usableTopicIds } = require('../protocol/requests/topicIds')
 const { assertSameProtocol } = require('../protocol/requests/groupProtocolCheck')
 const {
   KafkaJSConnectionClosedError,
@@ -83,6 +84,29 @@ const TRANSACTION_V1_MAX_VERSIONS = {
 const transactionVersionCap = (apiKey, transactionVersion) =>
   transactionVersion === 2 ? undefined : TRANSACTION_V1_MAX_VERSIONS[apiKey]
 
+// The last TxnOffsetCommit version keyed by topic name. A request whose topics do not all have a
+// usable id cannot be sent above it, whatever the broker advertises.
+// @see clients/src/main/resources/common/message/TxnOffsetCommitRequest.json (Apache Kafka 4.4.0)
+const TXN_OFFSET_COMMIT_TOPIC_NAMES_MAX_VERSION = 5
+
+/**
+ * The highest TxnOffsetCommit version one request may negotiate: the lower of its transaction
+ * version's ceiling and its topic ids'. A transaction under version 1 stays at v4 or below even
+ * when every topic has an id, because v5 and up carry the second part of KIP-890; a request
+ * keyed by name stays at v5 or below. Only transaction version 2 with every topic's id lifts both.
+ * @param {1|2} transactionVersion only 2 means transaction version 2
+ * @param {Map<string, string>|undefined} topicIds the ids of every topic, when all of them have one
+ * @returns {number|undefined} undefined when nothing caps the request
+ */
+const txnOffsetCommitCeiling = (transactionVersion, topicIds) => {
+  const ceilings = [
+    transactionVersionCap(apiKeys.TxnOffsetCommit, transactionVersion),
+    topicIds === undefined ? TXN_OFFSET_COMMIT_TOPIC_NAMES_MAX_VERSION : undefined,
+  ].filter((ceiling) => ceiling !== undefined)
+
+  return ceilings.length === 0 ? undefined : Math.min(...ceilings)
+}
+
 // A transactional Produce under transaction version 2 is sent at exactly this version: v13 keys
 // topics by id, while a transaction tracks its partitions by name.
 // @see clients/src/main/resources/common/message/ProduceRequest.json (Apache Kafka 4.3.1)
@@ -115,6 +139,8 @@ const PRIVATE = {
   API_VERSIONS_AT: Symbol('private:Broker:apiVersionsAt'),
   NEGOTIATE_API_VERSIONS_VERSION: Symbol('private:Broker:negotiateApiVersionsVersion'),
   NEGOTIATE: Symbol('private:Broker:negotiate'),
+  IDENTITY: Symbol('private:Broker:apiVersionsIdentity'),
+  RECOVER: Symbol('private:Broker:recoverFromApiVersions'),
   CAPPED_LOOKUPS: Symbol('private:Broker:cappedLookups'),
 }
 
@@ -189,6 +215,15 @@ module.exports = class Broker {
    * @param {boolean} [options.allowAutoTopicCreation=true] If this and the broker config 'auto.create.topics.enable'
    *                                                are true, topics that don't exist will be created when
    *                                                fetching metadata.
+   * @param {() => {clusterId: string|null, nodeId: number}} [options.metadataIdentity] private
+   *   getter of the cluster and node this broker is meant to be (KIP-1242), read when each
+   *   ApiVersions request is built and never cached; without one the requests name no identity
+   * @param {'rebootstrap'|'none'} [options.metadataRecoveryStrategy='rebootstrap'] `'none'` sends no
+   *   identity and ignores `REBOOTSTRAP_REQUIRED` as a recovery trigger
+   * @param {(error: Error, source: {broker: Broker, pool: object, guard?: (frameLength?: number) => Error|null}) => Promise<void>} [options.onApiVersionsFailure]
+   *   private observer of a `REBOOTSTRAP_REQUIRED` answer to this broker's ApiVersions request,
+   *   awaited before the error is thrown; it must not reject. `guard` is the lifecycle check the
+   *   failed `connect()` was called with, so recovery can stop when that lifecycle closes
    */
   constructor({
     connectionPool,
@@ -197,6 +232,9 @@ module.exports = class Broker {
     versions = null,
     authenticationTimeout = 10000,
     allowAutoTopicCreation = true,
+    metadataIdentity = null,
+    metadataRecoveryStrategy = 'rebootstrap',
+    onApiVersionsFailure = null,
   }) {
     this.connectionPool = connectionPool
 
@@ -236,14 +274,20 @@ module.exports = class Broker {
     this.versionsGeneration = null
     this.authenticationTimeout = authenticationTimeout
     this.allowAutoTopicCreation = allowAutoTopicCreation
+    this.metadataIdentity = metadataIdentity
+    this.metadataRecoveryStrategy = metadataRecoveryStrategy
+    this.onApiVersionsFailure = onApiVersionsFailure
 
-    // ConnectionPool doesn't otherwise know the client's authenticationTimeout; it needs it
-    // to size the post-SASL-failure blackout window (see ConnectionPool#recordAuthenticationFailure).
+    // Standalone and replacement pools must honor the Broker's legacy authenticationTimeout.
     this.connectionPool.authenticationTimeout = authenticationTimeout
+    for (const connection of this.connectionPool.pool) {
+      connection.authenticationTimeout = authenticationTimeout
+    }
 
-    // The lock timeout has twice the connectionTimeout because the same timeout is used
-    // for the first apiVersions call
-    const lockTimeout = 2 * this.connectionPool.connectionTimeout + this.authenticationTimeout
+    // A queued caller must outlast one complete setup and its maximum reconnect wait.
+    const lockTimeout =
+      this.connectionPool.setupPolicy.timeoutCeiling +
+      Math.ceil(1.2 * this.connectionPool.setupPolicy.waitCeiling)
     this.brokerAddress = `${this.connectionPool.host}:${this.connectionPool.port}`
 
     this.lock = new Lock({
@@ -282,6 +326,9 @@ module.exports = class Broker {
     connectionPool.continueGenerationFrom(this.connectionPool.generation)
     this.connectionPool = connectionPool
     this.connectionPool.authenticationTimeout = this.authenticationTimeout
+    for (const connection of this.connectionPool.pool) {
+      connection.authenticationTimeout = this.authenticationTimeout
+    }
     this.versionsGeneration = null
     this[PRIVATE.CAPPED_LOOKUPS].clear()
     return true
@@ -335,6 +382,10 @@ module.exports = class Broker {
    * table is shared by both pooled sockets. The same negotiation also retains the broker's
    * finalized features (`finalizedFeatures`, `finalizedFeaturesEpoch`).
    *
+   * An established, negotiated connection reauthenticates under the SASL cap without starting
+   * another physical setup budget or changing the node's setup failure state. A replaced pool
+   * cancels its setup without recording a physical failure.
+   *
    * @public
    * @param {object} [options]
    * @param {(frameLength?: number) => Error|null} [options.guard] a producer's private check of its
@@ -342,9 +393,12 @@ module.exports = class Broker {
    *   after each: an error it returns is thrown, so a closed producer goes no further
    * @returns {Promise}
    * @throws {KafkaJSConnectionError} when this broker was retired
+   * @throws {KafkaJSConnectionClosedError} when its pool was replaced while connecting
    * @throws {Error} the error the guard returned
    */
   async connect({ guard } = {}) {
+    const operation = currentDeadline()
+    if (operation) return operation.wait(() => sharedSetup(() => this.connect({ guard })))
     this.throwIfRetired()
     this.throwIfRefused(guard)
     await this.lock.acquire()
@@ -355,34 +409,82 @@ module.exports = class Broker {
         return
       }
 
-      const connection = await (guard
-        ? this.connectionPool.getConnection(0, { guard })
-        : this.connectionPool.getConnection())
-      this.throwIfRefused(guard)
-
-      // Read once: this is the generation the negotiated table below is learned at, not
-      // whatever the pool happens to report after the round trip (a concurrent socket coming
-      // up mid-negotiation must not be attributed to this table).
-      const generation = this.connectionPool.generation
-      if (this.versionsGeneration !== generation) {
-        const response = await this[PRIVATE.NEGOTIATE](guard)
-        this.throwIfRefused(guard)
-        const { finalizedFeatures, finalizedFeaturesEpoch } = toFinalizedFeatures(response)
-        this.versions = toVersionMap(response)
-        this.finalizedFeatures = finalizedFeatures
-        this.finalizedFeaturesEpoch = finalizedFeaturesEpoch
-        this.versionsGeneration = generation
+      const pool = this.connectionPool
+      const blackout = pool.authenticationBlackoutEntry()
+      if (
+        blackout &&
+        (!pool.pool[0].isConnected() || (pool.sasl && !pool.pool[0].isAuthenticated()))
+      ) {
+        await pool.getConnection()
       }
+      const connection = pool.pool[0]
+      if (
+        connection.isConnected() &&
+        !connection.setupAttempt &&
+        this.versionsGeneration === pool.generation
+      ) {
+        const generation = pool.generation
+        try {
+          await connection.authenticate()
+          this.throwIfRefused(guard)
+          this.throwIfRetired()
+          this.throwIfReplaced(pool)
+        } catch (error) {
+          attachFailureSource(error, { broker: this, generation })
+          throw error
+        }
+        return
+      }
+      const attempt =
+        connection.setupAttempt?.status === 'active' ? connection.setupAttempt : pool.beginSetup()
+      attempt.brokerManaged = true
+      let setupGeneration = pool.generation
+      const originalPool = () => {
+        attempt.assertCurrent()
+        this.throwIfRefused(guard)
+        this.throwIfRetired()
+        this.throwIfReplaced(pool)
+      }
+      try {
+        await connection.connect({ attempt })
+        originalPool()
 
-      this.throwIfRetired()
-      this.connectionPool.setVersions(this.versions)
-      this.lookupRequest = lookup(this.versions)
-      this[PRIVATE.CAPPED_LOOKUPS].clear()
+        // Read once: this is the generation the negotiated table below is learned at, not
+        // whatever the pool happens to report after the round trip (a concurrent socket coming
+        // up mid-negotiation must not be attributed to this table).
+        const generation = this.connectionPool.generation
+        setupGeneration = generation
+        if (this.versionsGeneration !== generation) {
+          const response = await attempt.guard(
+            this[PRIVATE.NEGOTIATE](() => attempt.refusal() || (guard && guard()), connection),
+            { phase: 'ApiVersions' }
+          )
+          originalPool()
+          const { finalizedFeatures, finalizedFeaturesEpoch } = toFinalizedFeatures(response)
+          this.versions = toVersionMap(response)
+          this.finalizedFeatures = finalizedFeatures
+          this.finalizedFeaturesEpoch = finalizedFeaturesEpoch
+          this.versionsGeneration = generation
+        }
 
-      this.throwIfRefused(guard)
-      await connection.authenticate()
-      this.throwIfRetired()
-      this.throwIfRefused(guard)
+        this.throwIfRetired()
+        this.connectionPool.setVersions(this.versions)
+        this.lookupRequest = lookup(this.versions)
+        this[PRIVATE.CAPPED_LOOKUPS].clear()
+
+        await connection.authenticate({ attempt })
+        originalPool()
+        connection.finishSetup(attempt)
+      } catch (error) {
+        if (this.connectionPool !== pool) {
+          attempt.cancel(error)
+        } else {
+          attempt.fail(error)
+        }
+        attachFailureSource(error, { broker: this, generation: setupGeneration })
+        await this[PRIVATE.RECOVER](error, pool, guard)
+        throw error
+      }
     } finally {
       await this.lock.release()
     }
@@ -434,17 +536,38 @@ module.exports = class Broker {
    * The client asks for the highest ApiVersions version it implements. A broker that does not
    * support it answers UNSUPPORTED_VERSION (35) with a **v0-shaped body** that still carries the
    * `api_keys` entry for ApiVersions itself, so the retry can pick the exact best version in one
-   * step. An empty array means a pre-2.4 broker: fall back to v0. INVALID_REQUEST (42) means the
-   * broker rejected the client software name or version and is fatal for this connection; it is
-   * only handled on the first attempt, since the retried version is always ≤ v2 and sends no
-   * client software identity for a broker to reject.
+   * step; a broker below Kafka 4.4 therefore completes the negotiation at v4 after a first v5
+   * request that named no identity it could check. An empty array means a pre-2.4 broker: fall
+   * back to v0. INVALID_REQUEST (42) means the broker rejected the client software name or version
+   * and is fatal for this connection; it is only handled on the first attempt, since the retried
+   * version is always ≤ v4 and sends no identity for a broker to reject.
+   *
+   * A v5 request names the cluster and node this broker is meant to be once both are known
+   * (KIP-1242). A broker that disagrees answers REBOOTSTRAP_REQUIRED (129), which this throws as
+   * the typed error; its two callers, `connect()` and `apiVersions()`, hand it to the pool's
+   * observer before they throw it on. Under `metadataRecoveryStrategy: 'none'` no identity is
+   * sent and the observer is never asked.
    * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-511%3A+Collect+and+Expose+Client%27s+Name+and+Version+in+the+Brokers
+   * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-1242%3A+Rebootstrap+on+cluster+or+node+mismatch
    *
    * @public
-   * @returns {Promise<import("../../types").ApiVersions>}
+   * @param {object} [options] internal fresh-response selection
+   * @param {boolean} [options.includeFeatures=false] return the complete fresh response
+   * @returns {Promise<import("../../types").ApiVersions>} version map by default, the complete
+   *   decoded response when `includeFeatures` is set
+   * @throws {Error} negotiation, protocol, lifecycle or deadline failure
    */
-  async apiVersions() {
-    return toVersionMap(await this[PRIVATE.NEGOTIATE]())
+  async apiVersions({ includeFeatures = false } = {}) {
+    const pool = this.connectionPool
+    let response
+    try {
+      response = await this[PRIVATE.NEGOTIATE]()
+    } catch (error) {
+      await this[PRIVATE.RECOVER](error, pool)
+      throw error
+    }
+
+    return includeFeatures ? response : toVersionMap(response)
   }
 
   /**
@@ -455,12 +578,13 @@ module.exports = class Broker {
    * @returns {Promise<object>} the decoded ApiVersions response
    * @throws {KafkaJSNonRetriableError} when the broker rejects this client's software identity
    */
-  async [PRIVATE.NEGOTIATE](guard) {
+  async [PRIVATE.NEGOTIATE](guard, connection = null) {
     const bestImplementedVersion = Math.max(...requests.ApiVersions.versions.map(Number))
 
     try {
-      return await this[PRIVATE.API_VERSIONS_AT](bestImplementedVersion, guard)
+      return await this[PRIVATE.API_VERSIONS_AT](bestImplementedVersion, guard, connection)
     } catch (e) {
+      this.throwIfRefused(guard)
       if (e.type === 'INVALID_REQUEST') {
         await this.disconnect()
         throw new KafkaJSNonRetriableError(
@@ -482,7 +606,7 @@ module.exports = class Broker {
         bestImplementedVersion
       )
 
-      return await this[PRIVATE.API_VERSIONS_AT](retryVersion, guard)
+      return await this[PRIVATE.API_VERSIONS_AT](retryVersion, guard, connection)
     }
   }
 
@@ -560,15 +684,58 @@ module.exports = class Broker {
    * @param {number} version
    * @param {(frameLength?: number) => Error|null} [guard] a producer's private pre-write check
    */
-  async [PRIVATE.API_VERSIONS_AT](version, guard) {
-    const apiVersions = requests.ApiVersions.protocol({ version })
+  async [PRIVATE.API_VERSIONS_AT](version, guard, connection = null) {
+    this.throwIfRefused(guard)
+    const apiVersions = requests.ApiVersions.protocol({ version })(this[PRIVATE.IDENTITY]())
+    if (connection) return connection.send({ ...apiVersions, guard, responseGuard: guard })
     return await this[PRIVATE.SEND_REQUEST](
       {
-        ...apiVersions(),
+        ...apiVersions,
         requestTimeout: this.connectionPool.connectionTimeout,
       },
       guard
     )
+  }
+
+  /**
+   * The identity a v5 ApiVersions request names, read now and never cached, so a cluster the pool
+   * has since learned or replaced is the one a later request names. Versions below 5 take no
+   * identity, so what this returns never reaches their bytes.
+   * @private
+   * @returns {{clusterId: string|null, nodeId: number}|undefined} undefined under the `none`
+   *   strategy and for a broker built without a getter, which name no identity
+   */
+  [PRIVATE.IDENTITY]() {
+    if (this.metadataRecoveryStrategy === 'none' || !this.metadataIdentity) return undefined
+    return this.metadataIdentity()
+  }
+
+  /**
+   * Hands a REBOOTSTRAP_REQUIRED answer to the pool's observer, unless this broker no longer owns
+   * the pool the request went out on or the strategy is `none`; any other error is left alone. It
+   * runs only after the caller has finished with its own state (`connect()` has recorded the
+   * failed attempt), because recovery retires this broker and cancels what is still set up on it.
+   * The caller throws the answer either way: the round trip that got it never succeeds or
+   * publishes anything.
+   * @private
+   * @param {Error} error what the negotiation failed with
+   * @param {import("../network/connectionPool")} pool the pool the negotiation started on
+   * @param {(frameLength?: number) => Error|null} [guard] the lifecycle check of the `connect()`
+   *   that negotiated, handed on so the recovery it starts stops when that lifecycle closes
+   * @returns {Promise<void>} settles once the observer has; the observer does not reject
+   */
+  async [PRIVATE.RECOVER](error, pool, guard) {
+    if (
+      error?.type !== 'REBOOTSTRAP_REQUIRED' ||
+      this.metadataRecoveryStrategy !== 'rebootstrap' ||
+      !this.onApiVersionsFailure ||
+      this.retired ||
+      this.connectionPool !== pool
+    ) {
+      return
+    }
+
+    await this.onApiVersionsFailure(error, { broker: this, pool, guard })
   }
 
   /**
@@ -603,6 +770,9 @@ module.exports = class Broker {
    * @param {(frameLength?: number) => Error|null} [options.guard] a producer's private pre-write
    *   check; it never reaches the request
    * @param {boolean} [options.allowAutoTopicCreation] overrides only this request
+   * @param {boolean} [options.includeTopicAuthorizedOperations=false] requests raw topic masks from v8
+   * @param {boolean} [options.includeClusterAuthorizedOperations=false] requests the raw cluster mask
+   *   on Metadata v8-v10, capping the version at 10 when the broker offers one
    * @param {boolean} [options.lenient=false] retains per-topic/partition errors in data
    * @param {boolean} [options.allowLeaderless=false] keeps a partition without a leader in data;
    *   other errors still throw
@@ -614,13 +784,28 @@ module.exports = class Broker {
       guard,
       lenient = false,
       allowLeaderless = false,
+      includeTopicAuthorizedOperations = false,
+      includeClusterAuthorizedOperations = false,
       allowAutoTopicCreation = this.allowAutoTopicCreation,
     } = options
     this.throwIfRefused(guard)
-    const metadata = this.lookupRequest(apiKeys.Metadata, requests.Metadata)
+    const cap =
+      includeClusterAuthorizedOperations &&
+      this.negotiatedVersion(apiKeys.Metadata, requests.Metadata, { [apiKeys.Metadata]: 10 }) !==
+        null
+        ? 10
+        : undefined
+    const metadata = this.lookupRequestWithMax(apiKeys.Metadata, requests.Metadata, cap)
     const shuffledTopics = shuffle(topics)
     return await this[PRIVATE.SEND_REQUEST](
-      metadata({ topics: shuffledTopics, allowAutoTopicCreation, lenient, allowLeaderless }),
+      metadata({
+        topics: shuffledTopics,
+        allowAutoTopicCreation,
+        lenient,
+        allowLeaderless,
+        includeTopicAuthorizedOperations,
+        includeClusterAuthorizedOperations,
+      }),
       guard
     )
   }
@@ -1272,13 +1457,38 @@ module.exports = class Broker {
    * @param {(frameLength?: number) => Error|null} [request.guard] private pre-write check of the
    *   consumer's preparation round; an error it returns rejects this one request before it is written
    *
+   * @param {number} [request.minVersion=1] named specification capability floor
+   * @param {number} [request.maxVersion=9] explicit opt-in ceiling; ordinary reads retain v9
+   * @param {number} [request.timeout] remote-read broker timeout on v10+
    * @returns {Promise}
    */
-  async listOffsets({ replicaId, isolationLevel, topics, guard }) {
+  async listOffsets({
+    replicaId,
+    isolationLevel,
+    topics,
+    guard,
+    timeout,
+    minVersion = 1,
+    maxVersion = 9,
+  }) {
+    if (minVersion > 1)
+      this.requireStorageVersion(
+        apiKeys.ListOffsets,
+        requests.ListOffsets,
+        minVersion,
+        maxVersion,
+        { 7: 'maxTimestamp', 8: 'earliestLocal', 9: 'latestTiered', 11: 'earliestPendingUpload' }[
+          minVersion
+        ]
+      )
     this.throwIfRefused(guard)
-    const listOffsets = this.lookupRequest(apiKeys.ListOffsets, requests.ListOffsets)
+    const listOffsets = this.lookupRequestWithMax(
+      apiKeys.ListOffsets,
+      requests.ListOffsets,
+      maxVersion
+    )
     const result = await this[PRIVATE.SEND_REQUEST](
-      listOffsets({ replicaId, isolationLevel, topics }),
+      listOffsets({ replicaId, isolationLevel, topics, timeout }),
       guard
     )
 
@@ -1397,6 +1607,8 @@ module.exports = class Broker {
    *                  validates it together with the epoch from OffsetFetch v9 upward. A classic
    *                  member and an admin client pass nothing, which sends the field's own "no
    *                  membership" defaults; every version below 9 drops both fields.
+   * @param {object[]} [request.groups] explicit multi-group name-based input
+   * @param {boolean} [request.returnErrors=false] internal admin data-result mode
    * @param {number} [request.memberEpoch=-1] the consumer-protocol member epoch
    * @param {boolean} [request.requireStable=false] ask the coordinator to hold back the offset of a
    *   partition that has a transactional offset commit pending, answering it with the retriable
@@ -1409,13 +1621,15 @@ module.exports = class Broker {
   async offsetFetch({
     groupId,
     topics,
+    groups,
+    returnErrors = false,
     memberId = null,
     memberEpoch = -1,
     requireStable = false,
     guard,
   }) {
     this.throwIfRefused(guard)
-    const topicIds = offsetsTopicIds(topics)
+    const topicIds = groups === undefined ? offsetsTopicIds(topics) : undefined
     const offsetFetch = this.lookupRequestWithMax(
       apiKeys.OffsetFetch,
       requests.OffsetFetch,
@@ -1424,13 +1638,25 @@ module.exports = class Broker {
     const protocolRequest = offsetFetch({
       groupId,
       topics,
+      groups,
       topicIds,
       memberId,
       memberEpoch,
       requireStable,
     })
     const { apiVersion } = protocolRequest.request
-    if (apiVersion === 8 || apiVersion === 9) {
+    if (
+      (groups !== undefined && apiVersion < 8) ||
+      (requireStable && apiVersion < 7) ||
+      (topics == null && groups === undefined && apiVersion < 2)
+    ) {
+      const range = this.versions[apiKeys.OffsetFetch]
+      throw new KafkaJSServerDoesNotSupportApiKey(
+        `OffsetFetch client v1-v10; broker supports v${range.minVersion}-v${range.maxVersion}; groups require v8-v9 and stable reads require v7+; all-topic reads require v2+`,
+        { apiKey: apiKeys.OffsetFetch, apiName: 'OffsetFetch' }
+      )
+    }
+    if (groups === undefined && apiVersion <= 9) {
       const response = protocolRequest.response
       protocolRequest.response = {
         ...response,
@@ -1442,16 +1668,39 @@ module.exports = class Broker {
          * @throws {Error} for an ordinary matching-group protocol failure
          */
         parse: async (data) => {
-          if (data.groupId !== groupId) {
+          if (apiVersion >= 8 && data.groupId !== groupId) {
             throw new KafkaJSInvariantViolation(
               `OffsetFetch requested group "${groupId}" but received group "${data.groupId}"`
             )
           }
-          return response.parse(data)
+          if (returnErrors)
+            require('../protocol/requests/offsetFetch/responseIdentity').validateTopics(
+              { errorCode: data.errorCode ?? 0, topics: data.responses },
+              topics?.length ? topics : null
+            )
+          return returnErrors ? data : response.parse(data)
         },
       }
     }
     return await this[PRIVATE.SEND_REQUEST](protocolRequest, guard)
+  }
+
+  /** Deletes committed offsets through a group's coordinator, retaining all result codes.
+   * @param {object} options groupId and topics with partition objects
+   * @returns {Promise<object>} classic response and group/partition errors as data
+   * @throws {Error} transport, deadline or unsupported broker range
+   */
+  async offsetDelete({ groupId, topics }) {
+    const range = this.versions?.[apiKeys.OffsetDelete]
+    if (!range || range.minVersion > 0 || range.maxVersion < 0) {
+      const offered = range ? `v${range.minVersion}-v${range.maxVersion}` : 'absent'
+      throw new KafkaJSServerDoesNotSupportApiKey(
+        `OffsetDelete client implements v0-v0; broker supports ${offered}`,
+        { apiKey: apiKeys.OffsetDelete, apiName: 'OffsetDelete' }
+      )
+    }
+    const build = this.lookupRequest(apiKeys.OffsetDelete, requests.OffsetDelete)
+    return this[PRIVATE.SEND_REQUEST](build({ groupId, topics }))
   }
 
   /**
@@ -1565,9 +1814,17 @@ module.exports = class Broker {
    *                                controller node.
    * @returns {Promise}
    */
-  async deleteTopics({ topics, timeout = 5000 }) {
+  async deleteTopics({ topics, topicIds, timeout = 5000 }) {
+    if (topicIds !== undefined)
+      this.requireStorageVersion(
+        apiKeys.DeleteTopics,
+        requests.DeleteTopics,
+        6,
+        undefined,
+        'topicIds'
+      )
     const deleteTopics = this.lookupRequest(apiKeys.DeleteTopics, requests.DeleteTopics)
-    return await this[PRIVATE.SEND_REQUEST](deleteTopics({ topics, timeout }))
+    return await this[PRIVATE.SEND_REQUEST](deleteTopics({ topics, topicIds, timeout }))
   }
 
   /**
@@ -1635,6 +1892,163 @@ module.exports = class Broker {
     return await this[PRIVATE.SEND_REQUEST](incrementalAlterConfigs({ resources, validateOnly }))
   }
 
+  /** Sends DescribeProducers to this selected broker, retaining item codes.
+   * @param {object} options wire fields @returns {Promise<object>} decoded fields
+   * @throws {Error} capability, protocol, lifecycle or deadline failure
+   */
+  async describeProducers(options) {
+    const build = this.transactionRequest(apiKeys.DescribeProducers, requests.DescribeProducers)
+    return this[PRIVATE.SEND_REQUEST](build(options))
+  }
+
+  /** Sends DescribeTransactions to this selected broker, retaining item codes.
+   * @param {object} options wire fields @returns {Promise<object>} decoded fields
+   * @throws {Error} capability, protocol, lifecycle or deadline failure
+   */
+  async describeTransactions(options) {
+    const build = this.transactionRequest(
+      apiKeys.DescribeTransactions,
+      requests.DescribeTransactions
+    )
+    return this[PRIVATE.SEND_REQUEST](build(options))
+  }
+
+  /** Sends WriteTxnMarkers to this selected broker, retaining item codes.
+   * @param {object} options wire fields @returns {Promise<object>} decoded fields
+   * @throws {Error} capability, protocol, lifecycle or deadline failure
+   */
+  async writeTxnMarkers(options) {
+    const build = this.transactionRequest(apiKeys.WriteTxnMarkers, requests.WriteTxnMarkers)
+    return this[PRIVATE.SEND_REQUEST](build(options))
+  }
+
+  /** Builds an admin transaction request with an explicit capability range diagnostic.
+   * @param {number} apiKey protocol key @param {object} definition implemented family
+   * @param {number} [required=0] minimum for requested filters
+   * @param {string} [option] requested option that needs the minimum, named in the diagnostic
+   * @returns {Function} negotiated builder @throws {KafkaJSServerDoesNotSupportApiKey} insufficient overlap
+   */
+  transactionRequest(apiKey, definition, required = 0, option) {
+    const version = this.negotiatedVersion(apiKey, definition)
+    if (version === null || version < required) {
+      const offered = this.versions?.[apiKey]
+      const name = Object.keys(apiKeys).find((name) => apiKeys[name] === apiKey)
+      throw new KafkaJSServerDoesNotSupportApiKey(
+        `${name}${option ? ` option ${option}` : ''} needs v${required} or newer; client implements v${definition.versions[0]}-v${definition.versions.at(-1)}; broker offers ${offered ? `v${offered.minVersion ?? 0}-v${offered.maxVersion}` : 'no range'}`,
+        { apiKey, apiName: name }
+      )
+    }
+    return this.lookupRequest(apiKey, definition)
+  }
+
+  /** Lists this broker's transactions with version-gated filters.
+   * @param {object} options wire filters @returns {Promise<object>} aggregate broker response
+   * @throws {Error} unsupported meaningful filter, named with its version, protocol or deadline failure
+   */
+  async listTransactions(options) {
+    const pattern = options.transactionalIdPattern
+    const [required, option] =
+      pattern !== null && pattern !== undefined && pattern !== ''
+        ? [2, 'transactionalIdPattern']
+        : options.durationFilter !== undefined && String(options.durationFilter) !== '-1'
+          ? [1, 'durationFilter']
+          : [0]
+    const build = this.transactionRequest(
+      apiKeys.ListTransactions,
+      requests.ListTransactions,
+      required,
+      option
+    )
+    return this[PRIVATE.SEND_REQUEST](build(options))
+  }
+
+  /**
+   * Selects a cluster API, refusing unavailable options before building or sending a request.
+   * @param {number} apiKey API key
+   * @param {object} definition API family with its implemented versions
+   * @param {number} [required=0] minimum version needed by the requested option
+   * @param {string} [option='operation'] option named in a capability refusal
+   * @returns {Function} builder for the highest mutually supported version
+   * @throws {KafkaJSServerDoesNotSupportApiKey} with both ranges when the option is unavailable
+   * @throws {Error} original selection failure, without wrapping or replacing its cause
+   */
+  clusterRequest(apiKey, definition, required = 0, option = 'operation') {
+    const version = this.negotiatedVersion(apiKey, definition)
+    if (version === null || version < required) {
+      const offered = this.versions?.[apiKey]
+      const apiName = Object.keys(apiKeys).find((n) => apiKeys[n] === apiKey)
+      const implemented = definition.versions.map(Number)
+      throw new KafkaJSServerDoesNotSupportApiKey(
+        `${option} requires ${apiName} v${required}+; ` +
+          `client implements v${Math.min(...implemented)}-v${Math.max(...implemented)}, ` +
+          `broker supports ${offered ? `v${offered.minVersion ?? 0}-v${offered.maxVersion}` : 'no range'}`,
+        { apiKey, apiName }
+      )
+    }
+    return this.lookupRequest(apiKey, definition)
+  }
+
+  /** Sends leader elections with the exact preferred-v0 equivalence. @param {object} options selection @returns {Promise<object>} raw item rows @throws {Error} capability, protocol or deadline failure */
+  async electLeaders({ electionType = 'preferred', topicPartitions = null }) {
+    const build = this.clusterRequest(
+      apiKeys.ElectLeaders,
+      requests.ElectLeaders,
+      electionType === 'unclean' ? 1 : 0,
+      'electionType'
+    )
+    return this[PRIVATE.SEND_REQUEST](
+      build({ electionType: electionType === 'unclean' ? 1 : 0, topicPartitions, timeoutMs: 60000 })
+    )
+  }
+
+  /** Sends feature updates, retaining the v2 aggregate-success marker. @param {object} options updates @returns {Promise<object>} results null only for v2 @throws {Error} capability, protocol or deadline failure */
+  async updateFeatures({ featureUpdates, validateOnly = false }) {
+    const required = validateOnly || featureUpdates.some((f) => f.upgradeType !== 'upgrade') ? 1 : 0
+    const build = this.clusterRequest(
+      apiKeys.UpdateFeatures,
+      requests.UpdateFeatures,
+      required,
+      'validateOnly or upgradeType'
+    )
+    const codes = { upgrade: 1, 'safe-downgrade': 2, 'unsafe-downgrade': 3 }
+    const request = build({
+      timeoutMs: 60000,
+      validateOnly,
+      featureUpdates: featureUpdates.map((f) => ({
+        feature: f.feature,
+        maxVersionLevel: f.maxVersionLevel,
+        upgradeType: codes[f.upgradeType],
+        allowDowngrade: false,
+      })),
+    })
+    const response = await this[PRIVATE.SEND_REQUEST](request)
+    return { ...response, results: request.request.apiVersion === 2 ? null : response.results }
+  }
+
+  /** Describes broker endpoints; fenced listing requires v2. @param {object} options flags @returns {Promise<object>} raw cluster body @throws {Error} capability, protocol or deadline failure */
+  async describeCluster(options) {
+    const build = this.clusterRequest(
+      apiKeys.DescribeCluster,
+      requests.DescribeCluster,
+      options.includeFencedBrokers ? 2 : 0,
+      'includeFencedBrokers'
+    )
+    return this[PRIVATE.SEND_REQUEST](build({ ...options, endpointType: 1 }))
+  }
+
+  /** Lists config resources; v0 permits only an absent filter or exactly CLIENT_METRICS. @param {object} options resourceTypes @returns {Promise<object>} resource identities @throws {Error} capability, protocol or deadline failure */
+  async listConfigResources({ resourceTypes = [] }) {
+    const required =
+      resourceTypes.length && !(resourceTypes.length === 1 && resourceTypes[0] === 16) ? 1 : 0
+    const build = this.clusterRequest(
+      apiKeys.ListConfigResources,
+      requests.ListConfigResources,
+      required,
+      'resourceTypes'
+    )
+    return this[PRIVATE.SEND_REQUEST](build({ resourceTypes }))
+  }
+
   /**
    * Send an `InitProducerId` request to fetch a PID and bump the producer epoch.
    *
@@ -1662,7 +2076,12 @@ module.exports = class Broker {
     this.throwIfRefused(guard)
     const initProducerId = this.lookupRequest(apiKeys.InitProducerId, requests.InitProducerId)
     return await this[PRIVATE.SEND_REQUEST](
-      initProducerId({ transactionalId, transactionTimeout, producerId, producerEpoch }),
+      initProducerId({
+        transactionalId,
+        transactionTimeout,
+        producerId,
+        producerEpoch,
+      }),
       guard
     )
   }
@@ -1694,7 +2113,12 @@ module.exports = class Broker {
       requests.AddPartitionsToTxn
     )
     return await this[PRIVATE.SEND_REQUEST](
-      addPartitionsToTxn({ transactionalId, producerId, producerEpoch, topics }),
+      addPartitionsToTxn({
+        transactionalId,
+        producerId,
+        producerEpoch,
+        topics,
+      }),
       guard
     )
   }
@@ -1740,7 +2164,13 @@ module.exports = class Broker {
    * @param {string|null} [request.groupInstanceId=null] the consumer's static instance id
    * @param {1|2} [request.transactionVersion=1] the transaction version in force for this
    *   transaction: 1 keeps the request at v4 or below; 2 allows v5, which also adds the offsets to
-   *   the transaction (KIP-890)
+   *   the transaction (KIP-890), and v6 when every topic has an id
+   * @param {Map<string, string>} [request.topicIds] private: topic name to topic id, for the
+   *   topics that have one. Only when every topic in `topics` has a usable one (not missing, null
+   *   or the all-zero id) is the request keyed by id (v6, KIP-1319); otherwise, and on a broker
+   *   that offers v5 at most, it is keyed by name. The ids are read once, so the answer is
+   *   bound to the topics this request named even if the cluster's metadata changes meanwhile;
+   *   it is never given to a caller.
    * @param {(frameLength?: number) => Error|null} [request.guard] a producer's private pre-write
    *   check; it never reaches the request
    *
@@ -1768,13 +2198,18 @@ module.exports = class Broker {
     memberId = '',
     groupInstanceId = null,
     transactionVersion = 1,
+    topicIds,
     guard,
   }) {
     this.throwIfRefused(guard)
+    const idsOf = usableTopicIds(
+      topics.map(({ topic }) => topic),
+      (name) => topicIds?.get(name)
+    )
     const txnOffsetCommit = this.lookupRequestWithMax(
       apiKeys.TxnOffsetCommit,
       requests.TxnOffsetCommit,
-      transactionVersionCap(apiKeys.TxnOffsetCommit, transactionVersion)
+      txnOffsetCommitCeiling(transactionVersion, idsOf)
     )
     return await this[PRIVATE.SEND_REQUEST](
       txnOffsetCommit({
@@ -1786,6 +2221,7 @@ module.exports = class Broker {
         generationId,
         memberId,
         groupInstanceId,
+        topicIds: idsOf,
       }),
       guard
     )
@@ -1888,10 +2324,14 @@ module.exports = class Broker {
   }
 
   /**
-   * Send request to delete groups
+   * Send request to delete groups, at the highest DeleteGroups version both sides offer.
+   *
+   * Each result carries `groupId` and `errorCode`, and `error` when the code is a failure. From v3
+   * it also carries the broker's `errorMessage` (`null` when it sent none); older versions omit it.
    * @param {string[]} groupIds
    * @public
-   * @returns {Promise}
+   * @returns {Promise<{ throttleTimeMs: number, clientSideThrottleTime?: number,
+   *   results: { groupId: string, errorCode: number, errorMessage?: string|null, error?: Error }[] }>}
    */
   async deleteGroups(groupIds) {
     const deleteGroups = this.lookupRequest(apiKeys.DeleteGroups, requests.DeleteGroups)
@@ -2007,12 +2447,22 @@ module.exports = class Broker {
    * @param {number} [request.timeout]
    * @returns {Promise}
    */
-  async alterPartitionReassignments({ topics, timeout }) {
+  async alterPartitionReassignments({ topics, timeout, allowReplicationFactorChange = true }) {
+    if (!allowReplicationFactorChange)
+      this.requireStorageVersion(
+        apiKeys.AlterPartitionReassignments,
+        requests.AlterPartitionReassignments,
+        1,
+        undefined,
+        'allowReplicationFactorChange=false'
+      )
     const alterPartitionReassignments = this.lookupRequest(
       apiKeys.AlterPartitionReassignments,
       requests.AlterPartitionReassignments
     )
-    return await this[PRIVATE.SEND_REQUEST](alterPartitionReassignments({ topics, timeout }))
+    return await this[PRIVATE.SEND_REQUEST](
+      alterPartitionReassignments({ topics, timeout, allowReplicationFactorChange })
+    )
   }
 
   /**
@@ -2028,6 +2478,162 @@ module.exports = class Broker {
       requests.ListPartitionReassignments
     )
     return await this[PRIVATE.SEND_REQUEST](listPartitionReassignments({ topics, timeout }))
+  }
+
+  /** Refuses storage options that the negotiated version cannot encode.
+   * @param {number} apiKey protocol key
+   * @param {object} definition versioned builders
+   * @param {number} minimum option minimum
+   * @param {number} [maximum] internal ceiling
+   * @param {string} [option] unrepresentable option name
+   * @returns {void}
+   * @throws {KafkaJSServerDoesNotSupportApiKey} both client and broker ranges are reported
+   */
+  requireStorageVersion(apiKey, definition, minimum, maximum, option) {
+    const v = this.negotiatedVersion(
+      apiKey,
+      definition,
+      maximum === undefined ? undefined : { [apiKey]: maximum }
+    )
+    if (v !== null && v >= minimum) return
+    const range = this.versions?.[apiKey]
+    const versions = definition.versions.map(Number)
+    const apiName = Object.keys(apiKeys).find((name) => apiKeys[name] === apiKey)
+    throw new KafkaJSServerDoesNotSupportApiKey(
+      `${apiName} ${option ?? 'API'} requires v${minimum}; client implements v${Math.min(...versions)}-v${Math.max(...versions)}, broker supports ${range ? `v${range.minVersion}-v${range.maxVersion}` : 'absent'}`,
+      { apiKey, apiName }
+    )
+  }
+
+  /** Reads broker-local log directories; protocol errors remain data.
+   * @param {object} options nullable topics filter
+   * @returns {Promise<object>} decoded directory results
+   * @throws {Error} capability, transport or malformed frame
+   */
+  async describeLogDirs(options) {
+    this.requireStorageVersion(apiKeys.DescribeLogDirs, requests.DescribeLogDirs, 1)
+    return this[PRIVATE.SEND_REQUEST](
+      this.lookupRequest(apiKeys.DescribeLogDirs, requests.DescribeLogDirs)(options)
+    )
+  }
+
+  /** Moves replica logs on this broker; per-replica errors remain data.
+   * @param {object} options grouped directory selections
+   * @returns {Promise<object>} decoded replica outcomes
+   * @throws {Error} capability, transport or malformed frame
+   */
+  async alterReplicaLogDirs(options) {
+    this.requireStorageVersion(apiKeys.AlterReplicaLogDirs, requests.AlterReplicaLogDirs, 1)
+    return this[PRIVATE.SEND_REQUEST](
+      this.lookupRequest(apiKeys.AlterReplicaLogDirs, requests.AlterReplicaLogDirs)(options)
+    )
+  }
+
+  /**
+   * Sends DescribeClientQuotas to this broker using its current negotiated capability.
+   * @param {object} fields normalized wire inputs
+   * @returns {Promise<object>} parsed response; item errors remain data
+   * @throws {Error} unsupported capability, transport or top-level protocol error
+   */
+  async describeClientQuotas(fields) {
+    const build = this.lookupRequest(apiKeys.DescribeClientQuotas, requests.DescribeClientQuotas)
+    return this[PRIVATE.SEND_REQUEST](build(fields))
+  }
+
+  /**
+   * Sends AlterClientQuotas to this broker using its current negotiated capability.
+   * @param {object} fields normalized wire inputs
+   * @returns {Promise<object>} parsed response; item errors remain data
+   * @throws {Error} unsupported capability, transport or top-level protocol error
+   */
+  async alterClientQuotas(fields) {
+    const build = this.lookupRequest(apiKeys.AlterClientQuotas, requests.AlterClientQuotas)
+    return this[PRIVATE.SEND_REQUEST](build(fields))
+  }
+
+  /**
+   * Sends DescribeUserScramCredentials to this broker using its current negotiated capability.
+   * @param {object} fields normalized wire inputs
+   * @returns {Promise<object>} parsed response; item errors remain data
+   * @throws {Error} unsupported capability, transport or top-level protocol error
+   */
+  async describeUserScramCredentials(fields) {
+    const build = this.lookupRequest(
+      apiKeys.DescribeUserScramCredentials,
+      requests.DescribeUserScramCredentials
+    )
+    return this[PRIVATE.SEND_REQUEST](build(fields))
+  }
+
+  /**
+   * Sends AlterUserScramCredentials to this broker using its current negotiated capability.
+   * @param {object} fields normalized wire inputs
+   * @returns {Promise<object>} parsed response; item errors remain data
+   * @throws {Error} unsupported capability, transport or top-level protocol error
+   */
+  async alterUserScramCredentials(fields) {
+    const build = this.lookupRequest(
+      apiKeys.AlterUserScramCredentials,
+      requests.AlterUserScramCredentials
+    )
+    return this[PRIVATE.SEND_REQUEST](build(fields))
+  }
+
+  /**
+   * Sends CreateDelegationToken to this broker using its current negotiated capability.
+   * @param {object} fields normalized wire inputs
+   * @returns {Promise<object>} parsed response; item errors remain data
+   * @throws {Error} unsupported capability, transport or top-level protocol error
+   */
+  async createDelegationToken(fields) {
+    const version = this.negotiatedVersion(
+      apiKeys.CreateDelegationToken,
+      requests.CreateDelegationToken
+    )
+    if (fields.ownerPrincipalType != null && version !== null && version < 3) {
+      throw new KafkaJSServerDoesNotSupportApiKey(
+        `CreateDelegationToken owner requires v3; broker supports v${version}`,
+        { apiKey: apiKeys.CreateDelegationToken, apiName: 'CreateDelegationToken' }
+      )
+    }
+    const build = this.lookupRequest(apiKeys.CreateDelegationToken, requests.CreateDelegationToken)
+    return this[PRIVATE.SEND_REQUEST](build(fields))
+  }
+
+  /**
+   * Sends RenewDelegationToken to this broker using its current negotiated capability.
+   * @param {object} fields normalized wire inputs
+   * @returns {Promise<object>} parsed response; item errors remain data
+   * @throws {Error} unsupported capability, transport or top-level protocol error
+   */
+  async renewDelegationToken(fields) {
+    const build = this.lookupRequest(apiKeys.RenewDelegationToken, requests.RenewDelegationToken)
+    return this[PRIVATE.SEND_REQUEST](build(fields))
+  }
+
+  /**
+   * Sends ExpireDelegationToken to this broker using its current negotiated capability.
+   * @param {object} fields normalized wire inputs
+   * @returns {Promise<object>} parsed response; item errors remain data
+   * @throws {Error} unsupported capability, transport or top-level protocol error
+   */
+  async expireDelegationToken(fields) {
+    const build = this.lookupRequest(apiKeys.ExpireDelegationToken, requests.ExpireDelegationToken)
+    return this[PRIVATE.SEND_REQUEST](build(fields))
+  }
+
+  /**
+   * Sends DescribeDelegationToken to this broker using its current negotiated capability.
+   * @param {object} fields normalized wire inputs
+   * @returns {Promise<object>} parsed response; item errors remain data
+   * @throws {Error} unsupported capability, transport or top-level protocol error
+   */
+  async describeDelegationToken(fields) {
+    const build = this.lookupRequest(
+      apiKeys.DescribeDelegationToken,
+      requests.DescribeDelegationToken
+    )
+    return this[PRIVATE.SEND_REQUEST](build(fields))
   }
 
   /**
@@ -2067,6 +2673,9 @@ module.exports = class Broker {
    * @throws {Error} the error of the failed request, or the one the guard returned
    */
   async [PRIVATE.SEND_REQUEST](protocolRequest, guard) {
+    const setupGuard = guard
+    guard = withAdminGuard(guard)
+    currentDeadline()?.check()
     const pool = this.connectionPool
     let generation = pool.generation
     try {
@@ -2074,13 +2683,15 @@ module.exports = class Broker {
         ? pool.getConnectionByRequest(protocolRequest, { guard })
         : pool.getConnectionByRequest(protocolRequest))
       this.throwIfReplaced(pool)
+      currentDeadline()?.check()
 
       if (
         protocolRequest.request.apiKey !== apiKeys.ApiVersions &&
         this.versionsGeneration !== pool.generation
       ) {
-        await (guard ? this.connect({ guard }) : this.connect())
+        await (setupGuard ? this.connect({ guard: setupGuard }) : this.connect())
         this.throwIfReplaced(pool)
+        currentDeadline()?.check()
       }
 
       if (!connection.isConnected()) {
@@ -2088,12 +2699,14 @@ module.exports = class Broker {
           ? pool.getConnectionByRequest(protocolRequest, { guard })
           : pool.getConnectionByRequest(protocolRequest))
         this.throwIfReplaced(pool)
+        currentDeadline()?.check()
       }
 
       this.throwIfRefused(guard)
       generation = pool.generation
-      return await pool.send(protocolRequest, connection, guard ? { guard } : null, true)
+      return checked(await pool.send(protocolRequest, connection, guard ? { guard } : null, true))
     } catch (e) {
+      currentDeadline()?.check()
       attachFailureSource(e, { broker: this, generation })
       this.retireSibling(e, generation, pool)
 
