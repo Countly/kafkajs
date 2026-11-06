@@ -299,20 +299,21 @@ const OBSERVATIONS = {
   },
   recreated: {
     handlers: [
-      ['A', 0, 'HJ'],
+      ['A', 0, 'H'],
       ['A', 1, 'HJ'],
       ['A', 2, 'HJ'],
       ['A', 2, 'HJ'],
       ['B', 0, 'H'],
     ],
     mutations: [
-      ['A', 0, 'HJ', [1]],
+      ['A', 0, 'HJ', [1, 2]],
       ['A', 1, 'HJ', [1]],
       ['A', 2, 'HJ', [1]],
       ['B', 0, 'H', [1]],
     ],
     settlements: [
-      ['A', 0, 'HJ', 'accept', null, null],
+      ['A', 0, 'H', 'accept', null, null],
+      ['A', 0, 'J', 'release', null, null],
       ['A', 1, 'HJ', 'accept', null, null],
       ['A', 2, 'HJ', 'accept', null, null],
       ['A', 2, 'HJ', 'accept', 'session-lost', 103],
@@ -321,7 +322,7 @@ const OBSERVATIONS = {
   },
   incrementalRecreated: {
     handlers: [
-      ['A', 0, 'HJ'],
+      ['A', 0, 'H'],
       ['A', 1, 'HJ'],
       ['A', 1, 'HJ'],
       ['A', 2, 'HJ'],
@@ -329,14 +330,15 @@ const OBSERVATIONS = {
       ['B', 0, 'H'],
     ],
     mutations: [
-      ['A', 0, 'HJ', [1]],
+      ['A', 0, 'HJ', [1, 2]],
       ['A', 1, 'HJ', [1]],
       ['A', 1, 'HJ', [1]],
       ['A', 2, 'HJ', [1]],
       ['B', 0, 'H', [1]],
     ],
     settlements: [
-      ['A', 0, 'HJ', 'accept', null, null],
+      ['A', 0, 'H', 'accept', null, null],
+      ['A', 0, 'J', 'release', null, null],
       ['A', 1, 'HJ', 'accept', null, null],
       ['A', 1, 'HJ', 'accept', null, null],
       ['A', 2, 'HJ', 'accept', null, null],
@@ -3019,6 +3021,10 @@ class SessionFaultCase extends DataFaultCase {
     )
     assert(this.recreatedLoop, 'the original fault session was captured')
     this.recreatedOpen = written.authority.open
+    this.siblingLoop = [...this.observer.loops.keys()].find((loop) =>
+      loop.session.model.has(`${IDS.A}:0`)
+    )
+    assert(this.siblingLoop, 'the original sibling session was captured')
     this.realCluster = this.recreatedLoop.cluster
     this.recreations = []
     this.removers.push(
@@ -3244,15 +3250,26 @@ class SessionFaultCase extends DataFaultCase {
         false
       )
     }
-    const forget = this.frames(78).find(
-      ({ fields }) =>
-        listed(fields).some(({ topicId }) => topicId === IDS.B) &&
-        fields.forgottenTopicsData.some(({ topicId }) => topicId === IDS.A)
+    for (const loop of [this.recreatedLoop, this.siblingLoop]) {
+      assert.equal(loop.session.closed, true, 'the old A session ended')
+      const finals = this.observer.writes.filter(
+        ({ apiKey, fields, authority }) =>
+          apiKey === 79 && fields.shareSessionEpoch === -1 && authority.open === loop.session.token
+      )
+      assert.equal(finals.length, 1, 'the old A session sent exactly one final')
+    }
+    const opening = this.frames(78).find(({ fields }) =>
+      listed(fields).some(({ topicId }) => topicId === IDS.B)
     )
-    assert(forget, 'the B fetch forgets the original A model')
-    assert.deepEqual(forget.fields.forgottenTopicsData, [{ topicId: IDS.A, partitions: [0] }])
-    assert.deepEqual(listed(forget.fields), [{ topicId: IDS.B, partition: 0 }])
-    const writes = this.observer.writes.slice(this.wireIndex(forget))
+    assert(opening, 'B opens its own session')
+    assert.equal(opening.fields.shareSessionEpoch, 0)
+    assert.deepEqual(opening.fields.forgottenTopicsData, [])
+    assert.deepEqual(batchesOf(opening), [])
+    assert.deepEqual(listed(opening.fields), [{ topicId: IDS.B, partition: 0 }])
+    const writes = this.observer.writes.slice(this.wireIndex(opening))
+    assert.equal(writes[0].authority.open, current.session.token)
+    assert.notEqual(current.session.token, this.siblingLoop.session.token)
+    assert.notEqual(current.session.token, this.recreatedOpen)
     assert.equal(
       writes.some(({ prepared }) => prepared.some(({ row }) => row === this.retiringCohort)),
       false,
