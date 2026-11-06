@@ -1,3 +1,11 @@
+const fetchAcknowledgementResponse = require('../../../protocol/requests/shareFetch/v2/response')
+const acknowledgeResponse = require('../../../protocol/requests/shareAcknowledge/v2/response')
+const {
+  acknowledgementResults,
+  acknowledgementRequests,
+  awaitTerminalSharePosition,
+  assertQuietTerminalGroup,
+} = require('../../../../testHelpers/shareLiveDiagnostics')
 const net = require('net')
 const { EventEmitter } = require('events')
 const {
@@ -20,9 +28,8 @@ const {
   setShareGroupConfigs,
   shareRecordIdentity,
   shareTopicName,
-  verifierMember,
 } = require('../../../../testHelpers/shareFixtures')
-const { readLog } = require('../../../../testHelpers/rawLog')
+const { readLog, endOffsets } = require('../../../../testHelpers/rawLog')
 const { createResourceProbe } = require('../../../../testHelpers/resourceProbe')
 const shareFetchV2 = require('../../../../testHelpers/wire/shareFetchV2')
 const shareAcknowledgeV2 = require('../../../../testHelpers/wire/shareAcknowledgeV2')
@@ -104,6 +111,151 @@ const SCENARIOS = {
     maxRecords: 50,
     group: BASE_GROUP,
   },
+}
+
+/** Records original acknowledgement requests with their same-socket broker responses. */
+class AcknowledgementTrace {
+  /** @param {Function} [record] Receives completed request/response facts. */
+  constructor(record = () => {}) {
+    this.frames = []
+    this.sockets = 0
+    this.record = record
+  }
+
+  /**
+   * Observes bytes without changing write results, callbacks or ordering.
+   * @param {object} socket Original socket.
+   * @param {string} label Owning member.
+   * @returns {object} The same socket.
+   */
+  wrap(socket, label) {
+    const pending = new Map()
+    const ordinal = ++this.sockets
+    const buffers = { request: Buffer.alloc(0), response: Buffer.alloc(0) }
+    /** @param {string} kind Stream direction. @param {Buffer} chunk Original bytes. @returns {Buffer[]} Complete frames. */
+    const split = (kind, chunk) => {
+      let bytes = Buffer.concat([buffers[kind], chunk])
+      const frames = []
+      while (bytes.length >= 4 && bytes.length >= bytes.readInt32BE(0) + 4) {
+        const size = bytes.readInt32BE(0) + 4
+        if (size < 4) throw new Error('Invalid Kafka diagnostic frame size')
+        frames.push(Buffer.from(bytes.subarray(0, size)))
+        bytes = bytes.subarray(size)
+      }
+      buffers[kind] = bytes
+      return frames
+    }
+    const write = socket.write.bind(socket)
+    socket.write = (chunk, ...rest) => {
+      for (const bytes of split('request', Buffer.from(chunk))) {
+        const header = readRequestHeader(bytes)
+        if (![78, 79].includes(header.apiKey)) continue
+        const fact = {
+          ...header,
+          label,
+          socket: ordinal,
+          bytes,
+          headerBytes: header.byteLength,
+          at: performance.now(),
+        }
+        const [request] = acknowledgementRequests([fact])
+        if (!request) continue
+        fact.request = request
+        this.frames.push(fact)
+        pending.set(header.correlationId, fact)
+      }
+      return write(chunk, ...rest)
+    }
+    socket.on('data', (chunk) => {
+      for (const bytes of split('response', chunk)) {
+        const fact = pending.get(bytes.readInt32BE(4))
+        if (!fact) continue
+        pending.delete(fact.correlationId)
+        const decoder = fact.apiKey === 78 ? fetchAcknowledgementResponse : acknowledgeResponse
+        fact.decoding = Promise.resolve()
+          .then(() => {
+            if (bytes[8] !== 0) throw new Error('Unexpected response header tags')
+            return decoder.decode(bytes.subarray(9))
+          })
+          .then(({ errorCode, responses }) => {
+            fact.response = {
+              errorCode,
+              at: performance.now(),
+              topics: responses.map(({ topicId, partitions }) => ({
+                topicId,
+                partitions: partitions.map(
+                  ({ partitionIndex, errorCode, acknowledgeErrorCode, currentLeader }) => ({
+                    partitionIndex,
+                    errorCode,
+                    acknowledgeErrorCode,
+                    currentLeader,
+                  })
+                ),
+              })),
+            }
+          })
+          .then(() => this.record({ ...fact.request, at: fact.at, response: fact.response }))
+          .catch((error) => {
+            fact.decodeError = describeError(error)
+          })
+      }
+    })
+    return socket
+  }
+
+  /** @returns {Promise<void>} Joins every response decoder before its owning clients leave. */
+  async join() {
+    await Promise.all(this.frames.map(({ decoding }) => decoding))
+  }
+
+  /** @returns {object[]} Original requests and correlated partition outcomes, without byte buffers. */
+  snapshot() {
+    return this.frames.map(({ request, at, response, decodeError }) => ({
+      ...request,
+      at,
+      response: response ?? null,
+      decodeError,
+    }))
+  }
+
+  /**
+   * Returns only offsets whose original requested decision succeeded at group and partition level.
+   * @param {string} group Group id.
+   * @param {string} topicId Original topic UUID.
+   * @param {number} partition Partition index.
+   * @param {number} [type=1] Required wire acknowledgement type.
+   * @returns {Set<string>} Confirmed decimal offsets.
+   */
+  confirmed(group, topicId, partition, type = 1) {
+    const offsets = new Set()
+    for (const { request, response } of this.frames) {
+      if (request.groupId !== group || request.isRenewAck || response?.errorCode !== 0) continue
+      const replies = response.topics
+        .filter((topic) => topic.topicId === topicId)
+        .flatMap((topic) => topic.partitions)
+        .filter((row) => row.partitionIndex === partition)
+      if (replies.length !== 1) continue
+      const code = request.apiKey === 78 ? replies[0].acknowledgeErrorCode : replies[0].errorCode
+      if (code !== 0) continue
+      for (const topic of request.topics ?? []) {
+        if (topic.topicId !== topicId) continue
+        for (const row of topic.partitions) {
+          if (row.partitionIndex !== partition) continue
+          for (const { firstOffset, lastOffset, acknowledgeTypes } of row.acknowledgementBatches) {
+            for (let offset = BigInt(firstOffset); offset <= BigInt(lastOffset); offset++) {
+              if (
+                (acknowledgeTypes.length === 1
+                  ? acknowledgeTypes[0]
+                  : acknowledgeTypes[Number(offset - BigInt(firstOffset))]) === type
+              )
+                offsets.add(String(offset))
+            }
+          }
+        }
+      }
+    }
+    return offsets
+  }
 }
 
 let fileStart = 0
@@ -193,6 +345,7 @@ class ShareWireTap {
     this.sockets = []
     this.frames = []
     this.holds = []
+    this.acknowledgements = new AcknowledgementTrace()
   }
 
   /**
@@ -203,7 +356,7 @@ class ShareWireTap {
     return (options) => {
       const socket = this.connect(options)
       socket.setKeepAlive?.(true, 60000)
-      return this.wrap(label, socket)
+      return this.wrap(label, this.acknowledgements.wrap(socket, label))
     }
   }
 
@@ -407,6 +560,8 @@ class LockCase {
     this.members = new Map()
     this.entries = []
     this.openHandlers = 0
+    this.handlerWork = new Set()
+    this.startedAt = performance.now()
     this.requests = []
     this.corpus = []
     this.expected = []
@@ -452,8 +607,33 @@ class LockCase {
       scenario: this.nonce,
       groups: { lock: this.group },
       budgets: { caseMs: this.scenario.budgetMs, fileMs: FILE_MS, cleanupMs: CLEANUP_MS },
+      elapsedMs: performance.now() - this.startedAt,
+      wireVersions: wireVersionsOf(this.requests),
       ...fields,
     })
+  }
+
+  /** @returns {object} Handler counts, actual outcomes and original wire acknowledgements. */
+  progress() {
+    return {
+      members: [...this.members.values()].map(({ label, memberId, acks, crashes, expired }) => ({
+        label,
+        memberId,
+        delivered: this.entriesOf(label).length,
+        handled: this.entriesOf(label).filter(({ handled }) => handled).length,
+        acknowledgements: acknowledgementResults(acks),
+        crashes: crashes.map((error) => describeError(error)),
+        expired,
+      })),
+      entries: this.entries,
+      renewals: this.renewals,
+      renewOutcome: this.renewOutcome && {
+        ...this.renewOutcome,
+        error: describeError(this.renewOutcome.error),
+      },
+      acknowledgementRequests: acknowledgementRequests(this.tap.frames),
+      wireAcknowledgements: this.tap.acknowledgements.snapshot(),
+    }
   }
 
   /**
@@ -469,16 +649,30 @@ class LockCase {
         throw new Error(`Only ${Math.round(left)} ms of the file deadline remain for this case`)
       }
       await this.stack.run(
-        async () => {
-          await this.setup(scope)
-          await this[this.kind](scope)
-          await this.finish(scope)
-        },
+        () =>
+          bounded(
+            scope,
+            this.scenario.budgetMs - CLEANUP_MS - JOIN_MS,
+            async (work) => {
+              try {
+                this.row('phase', { phase: 'setup' })
+                await this.setup(work)
+                this.row('phase', { phase: this.kind })
+                await this[this.kind](work)
+                this.row('phase', { phase: 'finish' })
+                await this.finish(work)
+              } catch (error) {
+                this.row('work-failed', { error: describeError(error), ...this.progress() })
+                throw error
+              }
+            },
+            { label: 'The lock workload and verification' }
+          ),
         { budgetMs: CLEANUP_MS }
       )
       await this.complete(scope)
     } catch (error) {
-      this.row('case-failed', { error: describeError(error) })
+      this.row('case-failed', { error: describeError(error), ...this.progress() })
       throw error
     }
   }
@@ -512,9 +706,7 @@ class LockCase {
       setShareGroupConfigs(this.admin, this.group, this.groupConfig)
     )
     await bounded(scope, 10000, () => this.admin.listGroups())
-    this.baseline = await bounded(scope, 60000, () =>
-      bounded(scope, 10000, () => this.probe.snapshot())
-    )
+    this.baseline = await bounded(scope, 10000, () => this.probe.snapshot())
     this.row('config-readback', { group: this.groupConfig, client: this.clientConfig })
     this.row('resource-baseline', { snapshot: this.baseline })
 
@@ -563,7 +755,12 @@ class LockCase {
       consumer.on(events.FETCH, ({ payload }) => this.onFetch(member, payload)),
     ]
     this.stack.add(`remove ${label} listeners`, () => removers.forEach((remove) => remove()))
-    this.stack.add(`disconnect ${label}`, () => consumer.disconnect({ timeout: 2000 }))
+    this.stack.add(`disconnect and join ${label}`, async () => {
+      this.tap.discardHolds()
+      await consumer.disconnect({ timeout: 2000 })
+      await Promise.allSettled([...this.handlerWork])
+      await this.tap.acknowledgements.join()
+    })
     await bounded(scope, 10000, () => consumer.connect())
     await bounded(scope, 10000, () => consumer.subscribe({ topics: [this.topic] }))
     await bounded(scope, 15000, () => consumer.run({ eachMessage: this.handler(label, scope) }))
@@ -588,23 +785,42 @@ class LockCase {
    * @returns {Function} the member's eachMessage handler, which records every entry at once
    */
   handler(label, scope) {
-    return async (payload) => {
-      const { topic, partition, message } = payload
-      const entry = {
-        member: label,
-        identity: shareRecordIdentity({ ...message, topic, partition }),
-        deliveryCount: message.deliveryCount,
-        at: performance.now(),
-        returnedAt: null,
-      }
-      this.entries.push(entry)
-      this.openHandlers++
-      try {
-        await this.behave(entry, payload, scope)
-      } finally {
-        entry.returnedAt = performance.now()
-        this.openHandlers--
-      }
+    return (payload) => {
+      const work = this.handle(label, payload, scope)
+      this.handlerWork.add(work)
+      work.then(
+        () => this.handlerWork.delete(work),
+        () => this.handlerWork.delete(work)
+      )
+      return work
+    }
+  }
+
+  /**
+   * Records and joins one handler invocation under the workload scope.
+   * @param {string} label Member label.
+   * @param {object} payload Handler payload.
+   * @param {AbortSignal} scope Workload scope.
+   * @returns {Promise<void>} When the invocation returns.
+   */
+  async handle(label, payload, scope) {
+    const { topic, partition, message } = payload
+    const entry = {
+      member: label,
+      identity: shareRecordIdentity({ ...message, topic, partition }),
+      deliveryCount: message.deliveryCount,
+      at: performance.now(),
+      returnedAt: null,
+      handled: false,
+    }
+    this.entries.push(entry)
+    this.openHandlers++
+    try {
+      await this.behave(entry, payload, scope)
+      entry.handled = true
+    } finally {
+      entry.returnedAt = performance.now()
+      this.openHandlers--
     }
   }
 
@@ -643,6 +859,7 @@ class LockCase {
       this.renewOutcome = await settle(payload.renew())
     }
     await wait(LATE_ACCEPT_AT_MS[this.kind])
+    entry.decidedAt = performance.now()
     payload.acknowledge('accept')
   }
 
@@ -663,6 +880,9 @@ class LockCase {
           this.admin.describeShareGroups([this.group], { apiTimeout: 6000 })
         )
         const described = groups[0].members
+        this.topicId = described
+          .flatMap(({ assignment }) => assignment)
+          .find(({ topic }) => topic === this.topic)?.topicId
         return (
           described.length === members.length &&
           members.every((member) => {
@@ -772,7 +992,7 @@ class LockCase {
 
   /**
    * A's lock expires while its handler is still held: B receives the same record at delivery count
-   * two, and A's late accept is refused by the broker without crashing A.
+   * two, and A's late Accept records the broker verdict without crashing A.
    * @param {AbortSignal} scope the case scope
    * @returns {Promise<void>}
    */
@@ -785,9 +1005,7 @@ class LockCase {
     const a = this.members.get('A')
     await this.observe(scope, 'The late accept result', 15000, () => this.accepts(a).length > 0)
     const [late] = this.accepts(a)
-    expect(late.error).not.toBeNull()
-    expect(late.error.reason).toBe('rejected-by-broker')
-    expect(causeCodes(late.error)).toContain(INVALID_RECORD_STATE)
+    this.checkLateAccept(late)
     expect(a.crashes).toEqual([])
     expect(a.consumer.assignment()).not.toEqual([])
     this.expectedHandled = new Map([[first.identity, 2]])
@@ -837,7 +1055,7 @@ class LockCase {
 
   /**
    * With renewal disabled for the group, A's renew is refused and does not extend the lock: B
-   * receives the record at count two, and the broker accepts only one terminal decision for it.
+   * receives and accepts the record at count two; a skipped late Accept is recorded separately.
    * @param {AbortSignal} scope the case scope
    * @returns {Promise<void>}
    */
@@ -854,10 +1072,7 @@ class LockCase {
     expect(second.identity).toBe(first.identity)
     const a = this.members.get('A')
     await this.observe(scope, 'The late accept result', 15000, () => this.accepts(a).length > 0)
-    const confirmed = [...this.members.values()].flatMap((member) =>
-      this.accepts(member).filter(({ error: failure }) => failure === null)
-    )
-    expect(confirmed).toHaveLength(1)
+    this.checkLateAccept(this.accepts(a)[0])
     expect(a.crashes).toEqual([])
     this.expectedHandled = new Map([[first.identity, 2]])
     this.recordAcknowledgements()
@@ -874,7 +1089,6 @@ class LockCase {
     await this.produce(scope)
     await this.observe(scope, 'The first acquisition', 15000, () => this.fetched !== null)
     expect(this.fetched).toBe(this.scenario.records)
-    await this.awaitBrokerEnd(scope)
     await this.observe(scope, 'Every record delivered and A idle', 25000, () => {
       const delivered = new Set(this.entries.map(({ identity }) => identity))
       return (
@@ -1047,50 +1261,108 @@ class LockCase {
   }
 
   /**
-   * Waits until the share start offset equals the log end in both the named and the all-topics
-   * listing; the lag is recorded as the broker reports it.
-   * @param {AbortSignal} scope the case scope
-   * @returns {Promise<object[]>} one terminal row for the partition
+   * Requires the late broker verdict, allowing a successful skip only after B settled the record.
+   * @param {object} late A's actual late Accept outcome.
+   * @returns {void}
+   */
+  checkLateAccept(late) {
+    this.recordAcknowledgements()
+    const successful = this.accepts(this.members.get('B')).filter(({ error }) => error === null)
+    expect(successful).toHaveLength(1)
+    expect(successful[0]).toMatchObject({
+      topic: this.topic,
+      partition: 0,
+      firstOffset: '0',
+      lastOffset: '0',
+    })
+    const trace = this.tap.acknowledgements
+    const b = new AcknowledgementTrace()
+    b.frames = trace.frames.filter(({ request }) => request.label === 'B')
+    expect(b.confirmed(this.group, this.topicId, 0).has('0')).toBe(true)
+    const a = trace.frames.filter(({ request }) => request.label === 'A' && !request.isRenewAck)
+    expect(a).toHaveLength(1)
+    expect(a[0].request.topics).toEqual([
+      {
+        topicId: this.topicId,
+        partitions: [
+          {
+            partitionIndex: 0,
+            acknowledgementBatches: [
+              { firstOffset: '0', lastOffset: '0', acknowledgeTypes: [ACCEPT] },
+            ],
+          },
+        ],
+      },
+    ])
+    expect(a[0].response?.errorCode).toBe(0)
+    expect(a[0].response.topics).toHaveLength(1)
+    const [reply] = a[0].response.topics
+    expect(reply.topicId).toBe(this.topicId)
+    expect(reply.partitions).toHaveLength(1)
+    const code =
+      a[0].request.apiKey === SHARE_FETCH
+        ? reply.partitions[0].acknowledgeErrorCode
+        : reply.partitions[0].errorCode
+    expect(code).toBe(late.error === null ? 0 : INVALID_RECORD_STATE)
+    if (late.error === null) {
+      expect(successful[0].at).toBeLessThan(this.entriesOf('A')[0].decidedAt)
+      this.row('late-accept', {
+        verdict: 'success-after-prior-accept',
+        priorAccept: acknowledgementResults(successful),
+        ...this.progress(),
+      })
+    } else {
+      expect(late.error.reason).toBe('rejected-by-broker')
+      expect(causeCodes(late.error)).toContain(INVALID_RECORD_STATE)
+    }
+  }
+
+  /** @returns {boolean} Whether successful Accept results cover the immutable corpus. */
+  acceptedCorpus() {
+    const accepted = new Set(
+      [...this.members.values()].flatMap(({ acks }) =>
+        acks
+          .filter(
+            ({ topic, partition, type, error }) =>
+              topic === this.topic && partition === 0 && type === 'accept' && error === null
+          )
+          .flatMap(({ firstOffset, lastOffset }) => offsetsOf(firstOffset, lastOffset))
+      )
+    )
+    const wire = this.tap.acknowledgements.confirmed(this.group, this.topicId, 0)
+    return this.corpus.every(({ offset }) => accepted.has(offset) && wire.has(offset))
+  }
+
+  /**
+   * Polls agreeing listings with known zero lag against the independently read log end.
+   * @param {AbortSignal} scope Workload scope.
+   * @returns {Promise<object[]>} Terminal partition rows.
    */
   async awaitBrokerEnd(scope) {
-    let row
-    await pollUntil(
+    return bounded(
       scope,
       20000,
       async (poll) => {
-        const named = await bounded(poll, 10000, () =>
-          this.admin.listShareGroupOffsets({
+        await pollUntil(poll, Infinity, () => this.acceptedCorpus(), {
+          label: 'Successful Accept coverage',
+        })
+        const { rows } = await awaitTerminalSharePosition(
+          this.admin,
+          {
             groupId: this.group,
-            topics: [{ topic: this.topic, partitions: [0] }],
-            apiTimeout: 8000,
-          })
+            topic: this.topic,
+            partitions: [{ partition: 0, floor: '0', end: this.log.get(0).endOffset }],
+          },
+          {
+            signal: poll,
+            timeoutMs: 20000,
+            record: (fields) => this.row('broker-position', { ...fields, ...this.progress() }),
+          }
         )
-        const all = await bounded(poll, 10000, () =>
-          this.admin.listShareGroupOffsets({ groupId: this.group, apiTimeout: 8000 })
-        )
-        const pick = (listing) =>
-          listing
-            .find(({ topic }) => topic === this.topic)
-            ?.partitions.find((p) => p.partition === 0)
-        const first = pick(named)
-        row = {
-          groupId: this.group,
-          topic: this.topic,
-          partition: 0,
-          errorCode: first?.errorCode,
-          startOffset: first?.startOffset,
-          logEnd: this.log.get(0).endOffset,
-          lag: first?.lag,
-        }
-        return (
-          row.errorCode === 0 &&
-          row.startOffset === row.logEnd &&
-          JSON.stringify(pick(all)) === JSON.stringify(first)
-        )
+        return rows
       },
-      { label: 'The broker share offsets' }
+      { label: 'The terminal broker share position' }
     )
-    return [row]
   }
 
   /**
@@ -1106,10 +1378,23 @@ class LockCase {
         bounded(scope, 10000, () => consumer.disconnect({ timeout: 2000 }))
       )
     )
-    const verified = await bounded(scope, 30000, (inner) =>
-      verifierMember(this.group, this.topic, { kafka: this.client('verifier'), signal: inner })
+    await Promise.allSettled([...this.handlerWork])
+    const verified = await assertQuietTerminalGroup({
+      kafka: this.client('verifier'),
+      admin: this.admin,
+      groupId: this.group,
+      topic: this.topic,
+      partitions: [{ partition: 0, floor: '0', end: this.log.get(0).endOffset }],
+      signal: scope,
+      timeoutMs: 20000,
+      record: (fields) => this.row('quiet-verifier', fields),
+    })
+    this.broker = verified.position.rows
+    this.quiet = verified
+    const ends = await bounded(scope, 20000, () =>
+      endOffsets({ brokers: plainTextBrokers(), topic: this.topic })
     )
-    expect(verified).toEqual([])
+    expect(ends.get(0)).toBe(this.log.get(0).endOffset)
     this.handled = tally(this.entries.map(({ identity }) => identity))
     expect(multisetProblems(this.expectedHandled, this.handled)).toEqual({
       missing: [],
@@ -1141,6 +1426,7 @@ class LockCase {
             label: 'The sockets closing',
           }
         )
+        signal.throwIfAborted()
         this.after = await assertShareCleanup(
           this.admin,
           [this.group],
@@ -1279,6 +1565,8 @@ class LockCase {
           actual: sortedEntries(this.handled),
         },
         broker: this.broker,
+        acknowledgements: this.progress(),
+        quiet: this.quiet,
       },
       resources: {
         before: this.resourceSummary(this.baseline),
