@@ -1097,6 +1097,68 @@ const deleted = await admin.deleteShareGroupOffsets({
 
 The group must no longer subscribe to the named topics. Results are arrays of `{ topic, topicId, errorCode, error? }`; topic failures are data and group failures throw. No `deleteShareGroups` method exists: delete a share group with [`deleteGroups`](#delete-groups). On a broker that offers DeleteGroups v3, each result carries the broker's `errorMessage`.
 
+## <a name="reset-share-group-offsets"></a> Reset an empty share group's offsets
+
+Stop every group member before altering offsets. Compose `fetchTopicOffsets` with `alterShareGroupOffsets` for earliest/latest, or `fetchTopicOffsetsByTimestamp` with `alterShareGroupOffsets` for a timestamp. The existing timestamp lookup falls back to the partition's latest offset when the requested timestamp has no match. Offsets remain decimal strings, including values above Number.MAX_SAFE_INTEGER. This is an application recipe, not a new admin method, seek operation or atomic reset across calls. A member can rejoin between inspection and mutation; the broker's refusal remains authoritative. Group errors reject; inspect per-partition errors before treating a reset as successful. Do not automatically retry an unanswered mutation to infer its outcome.
+
+```javascript
+/**
+ * Resets one empty share group's selected topic using exact broker offsets.
+ * Stop all its members before calling; the broker enforces emptiness at mutation time.
+ * Each public call has its own admin deadline; this sequence is not atomic.
+ * @param {import('@countly/kafkajs').Admin} admin Connected admin client.
+ * @param {string} groupId Empty share group identifier.
+ * @param {string} topic Topic name.
+ * @param {'earliest'|'latest'|number} position Boundary or nonnegative epoch milliseconds.
+ * @returns {Promise<import('@countly/kafkajs').ShareGroupAlterOffsetsResult[]>} Per-partition results.
+ * @throws {Error} For invalid input, nonempty/missing group, invalid lookup or broker failure.
+ */
+async function resetShareOffsets(admin, groupId, topic, position) {
+  if (position !== 'earliest' && position !== 'latest' &&
+      (!Number.isSafeInteger(position) || position < 0)) {
+    throw new Error('Use earliest, latest or nonnegative epoch milliseconds')
+  }
+  const { groups } = await admin.describeShareGroups([groupId])
+  if (groups.length !== 1 || groups[0].groupId !== groupId ||
+      groups[0].errorCode !== 0 || groups[0].members.length !== 0) {
+    throw new Error('The share group must exist and have no members')
+  }
+  const rows = typeof position === 'number'
+    ? await admin.fetchTopicOffsetsByTimestamp(topic, position)
+    : await admin.fetchTopicOffsets(topic)
+  const partitions = rows.map((row) => {
+    const offset = position === 'earliest' ? row.low :
+      position === 'latest' ? row.high : row.offset
+    if (typeof offset !== 'string' || !/^(0|[1-9][0-9]*)$/.test(offset) ||
+        BigInt(offset) > 9223372036854775807n) {
+      throw new Error('The offset lookup must return a nonnegative signed int64 string')
+    }
+    return { partition: row.partition, offset }
+  })
+  if (partitions.length === 0) throw new Error('The lookup returned no partitions')
+  const results = await admin.alterShareGroupOffsets({
+    groupId,
+    topics: [{ topic, partitions }],
+  })
+  for (const result of results) {
+    for (const partition of result.partitions) {
+      if (partition.errorCode !== 0) {
+        throw partition.error || new Error('The broker refused a partition reset')
+      }
+    }
+  }
+  return results
+}
+
+await resetShareOffsets(admin, 'orders-workers', 'orders', 'earliest')
+await resetShareOffsets(admin, 'orders-workers', 'orders', 'latest')
+await resetShareOffsets(admin, 'orders-workers', 'orders', 1700000000000)
+```
+
+## <a name="delete-share-group"></a> Delete an empty share group
+
+Use `await admin.deleteGroups(['orders-workers'])`; no `deleteShareGroups` alias is added. Stop all members first and inspect the real result. The offset deletion method has a different precondition: the group must no longer subscribe to the named topics. Use `describeShareGroups` for membership and share assignment fields.
+
 ## <a name="remove-members"></a> Remove members from a consumer group
 
 Remove members from a group that no longer has the instances behind them, for example a static member whose pod is gone and whose slot would otherwise hold its partitions until `sessionTimeout` passes. It is not a way to stop a consumer: a member that is still running rejoins on its next heartbeat.

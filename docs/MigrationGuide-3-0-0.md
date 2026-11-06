@@ -452,6 +452,8 @@ Share groups (Kafka 4.2+): use kafka.shareConsumer and run with eachMessage or e
 
 The readUncommitted option is rejected; configure share.isolation.level for the GROUP resource.
 
+The following limits belong to the share consumer. There is no callable synchronous flush-and-wait, no clear-subscription method and no subscription replacement while running. stop retains the subscribed names; use stop → subscribe → run to replace them. Automatic acknowledgement sending reports each homogeneous terminal range once; renew results are nonterminal. This sequence does not preserve running-replacement semantics.
+
 - **Unsubscribed-topic instrumentation is classic-only.** With `groupProtocol: 'consumer'`, assignments outside the round subscription are still filtered, but no longer emit `RECEIVED_UNSUBSCRIBED_TOPICS` or its warning. *What to do:* update event-count assertions and monitoring that expect this signal under the consumer protocol; debug logs record the filtered names. Classic consumers keep the event and warning.
 
 - **An uncommitted offset has null metadata.** `consumer.committed()` now returns `metadata: null` whenever `offset` is null; committed offsets still preserve stored metadata, including the empty string. *What to do:* use `offset === null` to detect the absence of a commit and update assertions that expected empty or synthetic metadata there.
@@ -1007,7 +1009,7 @@ retry.maxTotalTime adds a public-entry deadline only to consumer commitOffsets, 
 
 ### Admin
 
-Share administration is additive. Each new method accepts `apiTimeout` under the existing admin deadline. Per-item errors remain data; offset-method group errors throw. Use `deleteGroups` for an empty share group and `describeShareGroups` for share membership.
+Share administration is additive. Each new method accepts `apiTimeout` under the existing admin deadline. Per-item errors remain data; offset-method group errors throw. Use `deleteGroups` for an empty share group and `describeShareGroups` for share membership. For an empty share group, compose fetchTopicOffsets or fetchTopicOffsetsByTimestamp with alterShareGroupOffsets to reset offsets.
 
 - **Admin lifecycle.** Admin operations after disconnect reject without dialing until an explicit connect opens a new lifecycle. Call `await admin.connect()` to resume; legacy implicit reconnection after close is no longer supported. Concurrent closes share cleanup and cannot affect the replacement lifecycle. `disconnect({ timeout })` accepts an integer from 0 through 2147483647 milliseconds; omitted timeout drains naturally, zero forces close immediately, and invalid object options reject before mutation. Non-object signal-handler arguments remain ignored. A forced close cannot undo a mutation already transmitted; inspect broker state before repeating it.
 

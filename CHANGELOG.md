@@ -27,6 +27,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - Add `Kafka.shareConsumer` with implicit or explicit acknowledgements, handler-driven renewal and bounded disconnect. Share isolation defaults to read_uncommitted and is configured per group; share groups require Kafka 4.2+.
 
+- Document share-consumer boundaries and offset-reset recipes, including compact acknowledgement events and the share-span boundary.
+
 #### Fixes
 
 - Prepared share renewals retain their own compact acknowledgement error when a routing change or shutdown retires their wait; callers retired before preparing a ticket receive a local refusal.
