@@ -299,3 +299,20 @@ void useBoundedDisconnect
   // @ts-expect-error fetchSessions accepts only booleans
   kafka.consumer({ groupId: 'sessions', fetchSessions: 'true' })
 }
+
+import {
+  KafkaJSShareGroupsNotSupportedError,
+  KafkaJSServerDoesNotSupportApiKey,
+  ShareGroupsNotSupportedReason,
+} from '@countly/kafkajs'
+{
+  const shareUnsupported = new KafkaJSShareGroupsNotSupportedError('ShareFetch requires v2', {
+    apiKey: 78, apiName: 'ShareFetch', reason: 'api-version-range', shareVersion: 0,
+  })
+  const base: KafkaJSServerDoesNotSupportApiKey = shareUnsupported
+  const reason: ShareGroupsNotSupportedReason = shareUnsupported.reason
+  const level: number | null = shareUnsupported.shareVersion
+  void [base, reason, level]
+  // @ts-expect-error the refusal stage is required
+  new KafkaJSShareGroupsNotSupportedError('x', { apiKey: 78, apiName: 'ShareFetch' })
+}

@@ -15,6 +15,8 @@ The protocol inventory tests pin the released share-group message sources, API n
 
 The share-group codec tests compare requests and responses with independently generated Apache Kafka 4.4.0 message vectors. They cover compact fields, nested tagged fields, exact integer domains, nullable topics and malformed envelopes. Regenerate the message vectors with `KAFKA_CLIENTS_VERSION=4.4.0 scripts/protocol/javaVectors/runAssignors.sh messages` using a JDK 17 or newer.
 
+Share broker tests use in-process sockets to verify request routing, connection generations, pre-write guards and capability refusals. The ShareGroupHeartbeat v1, ShareFetch v2 and ShareAcknowledge v2 wire pairs are compared in both directions with the independent Java vectors, and the capability check is judged against the committed broker captures of every recorded line. The broker-free `shareConnectionPool` suite is separate from the broker integration suite; admin request frames and public connection refusal tests have separate acceptance cases.
+
 ## Integration tests
 
 Most of the test suite talks to a real Kafka cluster. `npm test` runs `npm run lint`, `npm run compat:check` and `npm run protocol:check`, boots the cluster, runs everything, and tears the cluster down again — it's a convenient local shortcut, but it is not what CI runs.

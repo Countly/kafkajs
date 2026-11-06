@@ -39,6 +39,7 @@ export const {
   KafkaJSTimeout,
   KafkaJSLockTimeout,
   KafkaJSServerDoesNotSupportApiKey,
+  KafkaJSShareGroupsNotSupportedError,
   KafkaJSUnsupportedMagicByteInMessageSet,
   KafkaJSDeleteTopicRecordsError,
   KafkaJSInvariantViolation,

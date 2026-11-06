@@ -1814,3 +1814,21 @@ process.once('SIGTERM', admin.disconnect)
 admin.disconnect({ timeout: '1' })
 // @ts-expect-error public options are an object
 admin.disconnect('SIGTERM')
+
+import { KafkaJSShareGroupsNotSupportedError, ShareGroupsNotSupportedReason } from './index'
+{
+  const shareUnsupported = new KafkaJSShareGroupsNotSupportedError('ShareFetch requires v2', {
+    apiKey: 78, apiName: 'ShareFetch', reason: 'api-version-range', shareVersion: 0,
+  })
+  const base: KafkaJSServerDoesNotSupportApiKey = shareUnsupported
+  const reason: ShareGroupsNotSupportedReason = shareUnsupported.reason
+  const level: number | null = shareUnsupported.shareVersion
+  const retained: KafkaJSServerDoesNotSupportApiKey = new KafkaJSShareGroupsNotSupportedError('absent', { apiKey: 76, apiName: 'ShareGroupHeartbeat', reason: 'api-not-advertised' })
+  void [base, reason, level, retained]
+  // @ts-expect-error the refusal stage is required
+  new KafkaJSShareGroupsNotSupportedError('x', { apiKey: 78, apiName: 'ShareFetch' })
+  // @ts-expect-error the stage is one of the four refusal stages
+  new KafkaJSShareGroupsNotSupportedError('x', { apiKey: 78, apiName: 'ShareFetch', reason: 'unknown' })
+  // @ts-expect-error the stage is read-only
+  shareUnsupported.reason = 'feature-disabled'
+}

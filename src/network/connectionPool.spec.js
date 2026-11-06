@@ -63,7 +63,9 @@ describe('ConnectionPool structural invariant', () => {
     const get = jest.spyOn(pool, 'getConnection').mockResolvedValue({})
     for (const apiKey of [...Object.values(apiKeys), -1, 1000]) {
       await pool.getConnectionByRequest({ request: { apiKey } })
-      expect(get.mock.calls.at(-1)[0]).toBe(apiKey === apiKeys.Fetch ? 1 : 0)
+      expect(get.mock.calls.at(-1)[0]).toBe(
+        [apiKeys.Fetch, apiKeys.ShareFetch, apiKeys.ShareAcknowledge].includes(apiKey) ? 1 : 0
+      )
     }
     expect(get.mock.calls.every(([index]) => index >= 0 && index < pool.pool.length)).toBe(true)
   })

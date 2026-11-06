@@ -7,6 +7,7 @@ const {
   consumerProtocolScript,
   groupScript,
   producerScript,
+  shareScript,
   PROFILES,
   NEGOTIATION_MS,
 } = require('../scriptedCluster')
@@ -471,7 +472,7 @@ describe('ScriptedCluster', () => {
       expect(cluster.sockets().every((socket) => socket.destroyed)).toBe(true)
     })
 
-    test.each(Object.keys(PROFILES))(
+    test.each(Object.keys(PROFILES).filter((profile) => profile !== 'share'))(
       'every pair the %s profile advertises has a wire pair, so no request of it is refused for want of one',
       (profile) => {
         for (const [api, version] of PROFILES[profile]) {
@@ -1983,4 +1984,95 @@ test('a connect to a profile that offers ApiVersions v4 takes exactly NEGOTIATIO
     cluster.assertClean()
     jest.useRealTimers()
   }
+})
+
+describe('share profile', () => {
+  test('installs literal rows without simulating group state', () => {
+    const cluster = createScriptedCluster({ nodes: NODES, profile: 'share' })
+    const response = Object.freeze({ memberEpoch: 7, assignment: null })
+
+    expect(shareScript(cluster, [{ api: 'ShareGroupHeartbeat', response }])).toBe(cluster)
+    expect(cluster.answerers.get('ShareGroupHeartbeat')({ memberEpoch: 0 })).toBe(response)
+    expect(cluster.answerers.get('ShareGroupHeartbeat')({ memberEpoch: -1 })).toBe(response)
+    expect(cluster.requests()).toEqual([])
+  })
+
+  test('replaces an earlier answer of the same API with the later row', () => {
+    const cluster = createScriptedCluster({ nodes: NODES, profile: 'share' })
+    const first = { memberEpoch: 1 }
+    const second = { memberEpoch: 2 }
+
+    shareScript(cluster, [
+      { api: 'ShareGroupHeartbeat', response: first },
+      { api: 'ShareGroupHeartbeat', response: second },
+    ])
+
+    expect(cluster.answerers.get('ShareGroupHeartbeat')({})).toBe(second)
+  })
+
+  test('advertises only bootstrap and the seven released share versions', () => {
+    expect(PROFILES.share).toEqual([
+      ['ApiVersions', 4],
+      ['Metadata', 13],
+      ['FindCoordinator', 6],
+      ['ShareGroupHeartbeat', 1],
+      ['ShareGroupDescribe', 1],
+      ['ShareFetch', 2],
+      ['ShareAcknowledge', 2],
+      ['DescribeShareGroupOffsets', 1],
+      ['AlterShareGroupOffsets', 0],
+      ['DeleteShareGroupOffsets', 0],
+    ])
+    const cluster = createScriptedCluster({ nodes: NODES, profile: 'share' })
+
+    expect(cluster.apiVersionsTable()).toHaveLength(10)
+    expect(cluster.apiVersionsAnswer()).toMatchObject({
+      finalizedFeaturesEpoch: 7,
+      finalizedFeatures: [{ name: 'share.version', minVersionLevel: 1, maxVersionLevel: 1 }],
+    })
+    for (const [api, version] of PROFILES.share) {
+      expect(cluster.apiVersionsTable()).toContainEqual({
+        apiKey: api === 'FindCoordinator' ? 10 : apiKeys[api],
+        minVersion: version,
+        maxVersion: version,
+      })
+    }
+    for (const api of [
+      'ApiVersions',
+      'Metadata',
+      'FindCoordinator',
+      'ShareGroupHeartbeat',
+      'ShareFetch',
+      'ShareAcknowledge',
+    ]) {
+      const version = Object.fromEntries(PROFILES.share)[api]
+
+      expect(cluster.pairFor(api, version)).toMatchObject({ version })
+    }
+    cluster.assertClean()
+  })
+
+  test('requires a concrete builder before accepting an advertised admin request', () => {
+    const { existsSync } = require('fs')
+    const path = require('path')
+    const cluster = createScriptedCluster({ nodes: NODES, profile: 'share' })
+
+    for (const [api, version] of [
+      ['ShareGroupDescribe', 1],
+      ['DescribeShareGroupOffsets', 1],
+      ['AlterShareGroupOffsets', 0],
+      ['DeleteShareGroupOffsets', 0],
+    ]) {
+      const file = `${api[0].toLowerCase()}${api.slice(1)}V${version}.js`
+
+      if (existsSync(path.join(__dirname, '..', 'wire', file))) {
+        expect(cluster.pairFor(api, version).api).toBe(api)
+      } else {
+        expect(() => cluster.pairFor(api, version)).toThrow(
+          `no response builder for ${api} v${version}`
+        )
+      }
+    }
+    cluster.assertClean()
+  })
 })

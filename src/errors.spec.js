@@ -322,6 +322,10 @@ describe('the five category classes', () => {
 describe('every error class this package exports carries an own, enumerable category', () => {
   // Constructor arguments for the classes that need more than a message.
   const ARGUMENTS = {
+    KafkaJSShareGroupsNotSupportedError: () => [
+      'unsupported',
+      { apiKey: 78, apiName: 'ShareFetch', reason: 'api-version-range' },
+    ],
     KafkaJSOffsetOutOfRange: () => [createErrorFromCode(1), { topic: 'topic', partition: 0 }],
     KafkaJSMemberIdRequired: () => [createErrorFromCode(79), { memberId: 'member' }],
     KafkaJSNumberOfRetriesExceeded: () => [
@@ -1000,4 +1004,41 @@ test('create-topic detail does not replace the protocol message', () => {
   expect(error.message).toBe(source.message)
   expect(error.errorMessage).toBe('broker detail')
   expect(new KafkaJSCreateTopicError(source, 't').errorMessage).toBeNull()
+})
+
+describe('share capability errors', () => {
+  test.each(['api-not-advertised', 'api-version-range', 'feature-disabled', 'refused-by-broker'])(
+    'preserves the unsupported API contract for %s',
+    (reason) => {
+      const error = new errors.KafkaJSShareGroupsNotSupportedError(
+        'ShareFetch client [2,2], broker [1,1]',
+        { apiKey: 78, apiName: 'ShareFetch', reason, shareVersion: 0 }
+      )
+
+      expect(error).toBeInstanceOf(errors.KafkaJSServerDoesNotSupportApiKey)
+      expect(error).toBeInstanceOf(errors.KafkaJSNonRetriableError)
+      expect(error).toMatchObject({
+        name: 'KafkaJSShareGroupsNotSupportedError',
+        reason,
+        apiKey: 78,
+        apiName: 'ShareFetch',
+        shareVersion: 0,
+        retriable: false,
+      })
+      expect(error.message).toContain('client [2,2], broker [1,1]')
+      expect(packageEntry.KafkaJSShareGroupsNotSupportedError).toBe(
+        errors.KafkaJSShareGroupsNotSupportedError
+      )
+    }
+  )
+
+  test('retains null when no feature level was reported', () => {
+    expect(
+      new errors.KafkaJSShareGroupsNotSupportedError('unsupported', {
+        apiKey: 76,
+        apiName: 'ShareGroupHeartbeat',
+        reason: 'api-not-advertised',
+      }).shareVersion
+    ).toBeNull()
+  })
 })
