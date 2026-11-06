@@ -9,6 +9,7 @@ const range = (first, last, deliveryCount = 1) => ({
 const failure = (Class, message) => expect.objectContaining({ name: Class.name, message })
 const record = (offset, isControlRecord = false) => ({ offset: String(offset), isControlRecord })
 const span = (first, last) => ({ firstOffset: String(first), lastOffset: String(last) })
+const EMPTY_DELIVERY = () => ({ records: [], deliveryCounts: new Uint16Array(0) })
 
 const checkProperty = (acquiredRecords, messages, corruption) => {
   const owned = new Map()
@@ -38,7 +39,16 @@ const checkProperty = (acquiredRecords, messages, corruption) => {
     expect(actual.has(offset)).toBe(false)
     actual.set(offset, type)
   }
-  for (const item of output.deliver) put(item.record.offset, `deliver:${item.deliveryCount}`)
+  const { records, deliveryCounts } = output.deliver
+  expect(deliveryCounts).toBeInstanceOf(Uint16Array)
+  expect(deliveryCounts).toHaveLength(records.length)
+  expect(deliveryCounts.buffer.byteLength).toBe(deliveryCounts.byteLength)
+  let delivered = -1n
+  records.forEach((item, i) => {
+    expect(BigInt(item.offset) > delivered).toBe(true)
+    delivered = BigInt(item.offset)
+    put(item.offset, `deliver:${deliveryCounts[i]}`)
+  })
   for (const [key, type] of [
     ['gaps', 'gap'],
     ['release', 'release'],
@@ -65,21 +75,47 @@ describe('deterministic acquired record walk', () => {
       record(20),
       record(21),
     ]
+    const before = structuredClone(messages)
     const output = ShareRecordWalk.walk({
       acquiredRecords: [range(10, 14), range(20, 21, 2)],
       messages,
     })
-    expect(output.deliver.map((e) => [e.record.offset, e.deliveryCount])).toEqual([
-      ['10', 1],
-      ['11', 1],
-      ['13', 1],
-      ['20', 2],
-      ['21', 2],
-    ])
-    expect(output.deliver[0].record).toBe(messages[0])
+    expect(output.deliver.records.map((e) => e.offset)).toEqual(['10', '11', '13', '20', '21'])
+    expect(output.deliver.deliveryCounts).toEqual(new Uint16Array([1, 1, 1, 2, 2]))
+    const delivered = [0, 1, 2, 5, 6].map((source) => messages[source])
+    delivered.forEach((original, i) => expect(output.deliver.records[i]).toBe(original))
+    expect(messages).toEqual(before)
     expect(output.gaps).toEqual([span(12, 12), span(14, 14)])
     expect(output.release).toEqual([])
   })
+  test('pairs each count with its record at the 1 and 32767 count boundaries', () => {
+    const messages = [record(1), record(2), record(3)]
+    const { deliver } = ShareRecordWalk.walk({
+      acquiredRecords: [range(1, 1, 1), range(2, 2, 32767), range(3, 3, 1)],
+      messages,
+    })
+    expect(deliver.records).toHaveLength(3)
+    deliver.records.forEach((item, i) => expect(item).toBe(messages[i]))
+    expect(deliver.deliveryCounts).toEqual(new Uint16Array([1, 32767, 1]))
+  })
+  test.each([
+    ['all records delivered', [1, 2, 3], [range(1, 3)], 3],
+    ['fewer deliveries than decoded records', [1, 2, 3], [range(2, 2)], 1],
+    ['no delivery from decoded records', [1, 2, 3], [], 0],
+    ['a repeated decoded offset', [1, 1], [range(1, 1)], 1],
+  ])(
+    'retains an exactly sized counts buffer when %s',
+    (_label, offsets, acquiredRecords, count) => {
+      const { deliver } = ShareRecordWalk.walk({
+        acquiredRecords,
+        messages: offsets.map((offset) => record(offset)),
+      })
+      expect(deliver.records).toHaveLength(count)
+      expect(deliver.deliveryCounts).toHaveLength(count)
+      expect(deliver.deliveryCounts.byteOffset).toBe(0)
+      expect(deliver.deliveryCounts.buffer.byteLength).toBe(2 * count)
+    }
+  )
   test('logs the original typed decode failure without deriving a failed interval', () => {
     const error = new (require('../../../errors').KafkaJSCorruptRecordError)('checksum failed', {
       reason: 'checksum',
@@ -111,7 +147,9 @@ describe('deterministic acquired record walk', () => {
     (reason) => {
       for (const messages of [[], [record(10), record(12, true)]]) {
         const expected = {
-          deliver: messages.length ? [{ record: messages[0], deliveryCount: 1 }] : [],
+          deliver: messages.length
+            ? { records: [messages[0]], deliveryCounts: new Uint16Array([1]) }
+            : EMPTY_DELIVERY(),
           gaps: messages.length ? [span(11, 12)] : [],
           release: messages.length ? [span(13, 1000009)] : [span(10, 1000009)],
           reject: [],
@@ -154,7 +192,7 @@ describe('deterministic acquired record walk', () => {
     expect(decoder.offset).toBe(compactRecords.length)
     expect(decoded).toEqual({ messages: [] })
     expect(ShareRecordWalk.walk({ ...decoded, acquiredRecords: [range(0, 0, 1)] })).toEqual({
-      deliver: [],
+      deliver: EMPTY_DELIVERY(),
       gaps: [span(0, 0)],
       release: [],
       reject: [],
@@ -163,7 +201,7 @@ describe('deterministic acquired record walk', () => {
   test('complete empty decode is one million-offset gap, halted empty decode is one release', () => {
     const input = { acquiredRecords: [range(0, 999999)], messages: [] }
     expect(ShareRecordWalk.walk(input)).toEqual({
-      deliver: [],
+      deliver: EMPTY_DELIVERY(),
       gaps: [span(0, 999999)],
       release: [],
       reject: [],
@@ -173,7 +211,7 @@ describe('deterministic acquired record walk', () => {
         ...input,
         corruption: { reason: 'checksum', offset: '0', error: new Error() },
       })
-    ).toEqual({ deliver: [], gaps: [], release: [span(0, 999999)], reject: [] })
+    ).toEqual({ deliver: EMPTY_DELIVERY(), gaps: [], release: [span(0, 999999)], reject: [] })
   })
   test.each(['9007199254740993', '9223372036854775807'])(
     'retains exact boundary offset %s',
@@ -182,7 +220,7 @@ describe('deterministic acquired record walk', () => {
       expect(
         ShareRecordWalk.walk({ acquiredRecords: [range(offset, offset, 32767)], messages: [item] })
       ).toEqual({
-        deliver: [{ record: item, deliveryCount: 32767 }],
+        deliver: { records: [item], deliveryCounts: new Uint16Array([32767]) },
         gaps: [],
         release: [],
         reject: [],
@@ -210,6 +248,29 @@ describe('deterministic acquired record walk', () => {
     expect(() =>
       ShareRecordWalk.walk({ acquiredRecords: [range(1, 2)], messages: [record(2), record(1)] })
     ).toThrow(failure(KafkaJSNonRetriableError, 'Record offsets must be ascending'))
+  })
+  test.each([[0], [-1], [32768], [65537], [1.5], [NaN], ['1']])(
+    'refuses delivery count %p before it can reach the typed counts array',
+    (deliveryCount) => {
+      const input = {
+        acquiredRecords: [range(1, 1, 1), { ...range(3, 3), deliveryCount }],
+        messages: [record(1), record(3)],
+      }
+      expect(() => ShareRecordWalk.walk(input)).toThrow(
+        failure(KafkaJSNonRetriableError, 'Invalid acquired range or delivery count')
+      )
+    }
+  )
+  test('refuses a coercible delivery count without converting it', () => {
+    const convert = jest.fn(() => 1)
+    const input = {
+      acquiredRecords: [{ ...range(1, 1), deliveryCount: { valueOf: convert } }],
+      messages: [record(1)],
+    }
+    expect(() => ShareRecordWalk.walk(input)).toThrow(
+      failure(KafkaJSNonRetriableError, 'Invalid acquired range or delivery count')
+    )
+    expect(convert).not.toHaveBeenCalled()
   })
   test.each([
     [
@@ -252,14 +313,15 @@ describe('deterministic acquired record walk', () => {
     expect(calls - messages.length).toBeLessThan(10)
   })
   test('deduplicates repeated decoded offsets and handles more than the argument limit', () => {
-    expect(
-      ShareRecordWalk.walk({ acquiredRecords: [range(1, 1)], messages: [record(1), record(1)] })
-        .deliver
-    ).toHaveLength(1)
+    const repeated = [record(1), record(1)]
+    const single = ShareRecordWalk.walk({ acquiredRecords: [range(1, 1)], messages: repeated })
+    expect(single.deliver.records).toHaveLength(1)
+    expect(single.deliver.records[0]).toBe(repeated[0])
+    expect(single.deliver.deliveryCounts).toEqual(new Uint16Array([1]))
     const messages = Array.from({ length: 130000 }, (_, i) => record(i))
-    expect(
-      ShareRecordWalk.walk({ acquiredRecords: [range(0, 129999)], messages }).deliver
-    ).toHaveLength(130000)
+    const { deliver } = ShareRecordWalk.walk({ acquiredRecords: [range(0, 129999)], messages })
+    expect(deliver.records).toHaveLength(130000)
+    expect(deliver.deliveryCounts).toHaveLength(130000)
   })
   test.each(['0', '9007199254740993', '9223372036854775798'])(
     'exact small-set properties at base %s',

@@ -185,12 +185,21 @@ class ShareRecordWalk {
    * Walks normalized ranges and ascending records once; delivery references original records.
    * With a halt, only offsets through the last decoded record are classified. Failed-batch
    * coordinates cannot supply a boundary; remaining acquired offsets are released, never rejected.
+   *
+   * Deliveries are two parallel arrays of equal length, ascending and once-only: index i pairs the
+   * original record reference (never cloned or mutated) with its acquisition count. The counts are
+   * written to a `Uint16Array` only after `normalize` has accepted every integer in 1–32767, so no
+   * conversion, truncation or wrapping can alter one. The counts buffer is allocated for at most
+   * one delivery per decoded record and, when fewer are delivered, copied to an exactly sized buffer
+   * so no unused backing capacity is retained. The `records` array keeps only its ordinary
+   * growth slack.
    * @param {object} input Decoded partition fields.
    * @param {object[]} input.acquiredRecords Raw acquisition ranges.
    * @param {object[]} input.messages Complete decoded prefix, including flagged control records.
    * @param {object} [input.corruption] Existing reason/offset/error marker; presence means halted.
    * @param {object} [logger] Existing logger with warn().
-   * @returns {{deliver:object[],gaps:object[],release:object[],reject:object[]}} Compact classification.
+   * @returns {{deliver:{records:object[],deliveryCounts:Uint16Array},gaps:object[],release:object[],reject:object[]}}
+   * Compact classification; no delivery is `{records:[],deliveryCounts:new Uint16Array(0)}`.
    * @throws {KafkaJSNonRetriableError} For malformed acquisitions or malformed or descending record
    * offsets, including records past the last acquired range; each offset is parsed once.
    */
@@ -204,7 +213,9 @@ class ShareRecordWalk {
         ? parseOffset(messages[messages.length - 1].offset)
         : -1n
     const records = new RecordCursor(messages)
-    const output = { deliver: [], gaps: [], release: [], reject: [] }
+    const delivered = []
+    const counts = new Uint16Array(messages.length)
+    const output = { gaps: [], release: [], reject: [] }
     for (const range of ranges) {
       const first = BigInt(range.firstOffset)
       const last = BigInt(range.lastOffset)
@@ -217,14 +228,19 @@ class ShareRecordWalk {
         if (at < cursor) continue
         appendRange(output.gaps, cursor, at - 1n)
         if (record.isControlRecord) appendRange(output.gaps, at, at)
-        else output.deliver.push({ record, deliveryCount: range.deliveryCount })
+        else {
+          counts[delivered.length] = range.deliveryCount
+          delivered.push(record)
+        }
         cursor = at + 1n
       }
       appendRange(output.gaps, cursor, end)
       appendRange(output.release, end < first ? first : end + 1n, last)
     }
     while (!records.done) records.advance()
-    return output
+    const deliveryCounts =
+      delivered.length === counts.length ? counts : counts.slice(0, delivered.length)
+    return { deliver: { records: delivered, deliveryCounts }, ...output }
   }
 }
 

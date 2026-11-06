@@ -163,7 +163,8 @@ class ShareAckLedger {
    * @param {object|symbol} options.token Original opaque acquisition identity, compared by reference.
    * @param {number} options.sentAt Pre-write fetch time.
    * @param {number} options.lockDuration Response AcquisitionLockTimeoutMs.
-   * @param {object} options.walk ShareRecordWalk output; original record references are retained only while held.
+   * @param {object} options.walk ShareRecordWalk output; `deliver.records[i]` pairs with `deliver.deliveryCounts[i]`,
+   * and original record references are retained only while held.
    * @returns {ShareAckLedger} Ledger with held deliveries and already-decided automatic ranges.
    * @throws {KafkaJSNonRetriableError} For invalid locks, overlapping decisions or absent token.
    */
@@ -176,13 +177,15 @@ class ShareAckLedger {
     this.#token = token
     const deadline = lockDeadline(sentAt, lockDuration)
     const entries = []
-    for (const { record, deliveryCount } of walk.deliver) {
+    const { records, deliveryCounts } = walk.deliver
+    for (let i = 0; i < records.length; i++) {
+      const record = records[i]
       const first = parseOffset(record.offset)
       entries.push({
         first,
         last: first,
         record,
-        deliveryCount,
+        deliveryCount: deliveryCounts[i],
         automatic: false,
         state: 'held',
         type: null,

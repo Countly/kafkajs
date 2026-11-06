@@ -63,7 +63,7 @@ describe('deterministic acquisition locks', () => {
     expect(ticket.isRenewAck).toBe(true)
     expect(ticket.acknowledgementBatches[0].acknowledgeTypes).toEqual([4])
     expect(ledger.settle(ticket, { token, sentAt: 900, lockDuration: 2000 })[0].type).toBe('renew')
-    expect(walk.deliver.map((item) => item.deliveryCount)).toEqual([4, 4, 4])
+    expect(walk.deliver.deliveryCounts).toEqual(new Uint16Array([4, 4, 4]))
     expect(ledger.canStart('1', 1100)).toBe(true)
     expect(ledger.canStart('2', 1100)).toBe(false)
     expect(ledger.canStart('1', 2899)).toBe(true)

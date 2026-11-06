@@ -181,7 +181,7 @@ describe('deterministic compact acknowledgement ledger', () => {
   })
   test('a million-offset absent remainder stays compact through failure and error serialization', () => {
     const walk = {
-      deliver: [],
+      deliver: { records: [], deliveryCounts: new Uint16Array(0) },
       gaps: [],
       reject: [],
       release: [{ firstOffset: '9007199254740993', lastOffset: '9007199255740992' }],
@@ -198,6 +198,28 @@ describe('deterministic compact acknowledgement ledger', () => {
     expect(result[0].error.ranges).toEqual(walk.release)
     expect(JSON.stringify(result).length).toBeLessThan(1000)
     expect(ledger.size).toBe(0)
+  })
+  test('holds every delivery from the compact arrays, including the last, without consuming them', () => {
+    const records = ['10', '11', '20', '21'].map((offset) => ({ offset }))
+    const deliveryCounts = new Uint16Array([1, 2, 3, 32767])
+    const walk = {
+      deliver: { records, deliveryCounts },
+      gaps: [],
+      release: [],
+      reject: [],
+    }
+    const { ledger, token } = make({ walk })
+    expect(ledger.size).toBe(4)
+    ledger.decide('21', 'reject')
+    ledger.complete(['10', '11', '20', '21'], 'accept')
+    const { ticket } = ledger.prepare({ token })
+    expect(ticket.acknowledgementBatches).toEqual([
+      { firstOffset: '10', lastOffset: '11', acknowledgeTypes: [1] },
+      { firstOffset: '20', lastOffset: '21', acknowledgeTypes: [1, 3] },
+    ])
+    expect(walk.deliver.records).toBe(records)
+    expect(records.map((item) => item.offset)).toEqual(['10', '11', '20', '21'])
+    expect(deliveryCounts).toEqual(new Uint16Array([1, 2, 3, 32767]))
   })
 })
 
@@ -218,7 +240,8 @@ describe('mixed delivery, gap, hole and release acquisition above 2^53', () => {
       messages: [record(0), record(1), record(3, true), record(6), record(7)],
       corruption: { reason: 'checksum', offset: at(8), error: new Error('decode halted') },
     })
-    expect(walk.deliver.map((item) => item.record.offset)).toEqual([at(0), at(1), at(6), at(7)])
+    expect(walk.deliver.records.map((item) => item.offset)).toEqual([at(0), at(1), at(6), at(7)])
+    expect(walk.deliver.deliveryCounts).toEqual(new Uint16Array([2, 2, 3, 3]))
     expect(walk.gaps).toEqual([span(2, 3)])
     expect(walk.release).toEqual([span(8, 9)])
     return make({ walk })
