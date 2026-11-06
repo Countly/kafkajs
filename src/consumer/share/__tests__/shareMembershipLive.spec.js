@@ -23,6 +23,7 @@ const {
   setShareGroupConfigs,
   shareRecordIdentity,
   assertShareCleanup,
+  captureShareCleanupBaseline,
 } = require('../../../../testHelpers/shareFixtures')
 const {
   createResourceProbe,
@@ -500,6 +501,25 @@ const normalize = (assignment) =>
   assignment
     .map(({ topic, partitions }) => ({ topic, partitions: [...partitions].sort((a, b) => a - b) }))
     .sort((a, b) => a.topic.localeCompare(b.topic))
+
+/** Compares change-only assignment events with a current admin member description.
+ * @param {object} described Current admin member.
+ * @param {object} event Last actual assignment-change event.
+ * @param {string} topicId Owned topic UUID.
+ * @returns {boolean} Exact member/assignment equality with a nonfuture event epoch.
+ */
+const assignmentAgrees = (described, event, topicId) =>
+  Boolean(
+    described &&
+    event &&
+    described.memberId === event.memberId &&
+    Number.isInteger(event.memberEpoch) &&
+    event.memberEpoch > 0 &&
+    Number.isInteger(described.memberEpoch) &&
+    event.memberEpoch <= described.memberEpoch &&
+    described.assignment.every((row) => row.topicId === topicId) &&
+    isDeepStrictEqual(normalize(event.assignment), normalize(described.assignment))
+  )
 
 /**
  * One in-process share member with everything it observed. Its handler does a little work, or, once
@@ -1007,13 +1027,16 @@ class MembershipCase {
       await outer.run(
         async () => {
           this.gauge.install()
-          pre = await this.sample(scope)
+          pre = await captureShareCleanupBaseline(this.probe, {
+            signal: scope,
+            cleanupStack: false,
+          })
           await bounded(scope, STEP_MS, () => this.admin.connect())
           await bounded(scope, STEP_MS, async () => {
             await this.admin.describeCluster()
             await this.admin.listGroups()
           })
-          base = await this.sample(scope)
+          base = pre
           this.row('resource-baseline', { resources: summarize(base) })
           await this.stack.run(
             async () => {
@@ -1034,7 +1057,7 @@ class MembershipCase {
             [this.topic],
             base,
             this.probe,
-            { signal: scope }
+            { signal: scope, disconnectAdmin: true }
           )
         },
         { budgetMs: PROOF_MS }
@@ -1350,7 +1373,7 @@ class MembershipCase {
   /**
    * Waits until the admin description and every live member's own events name the same members
    * and the same assignments, then records them. Assignments are compared per member and may
-   * overlap.
+   * overlap. Assignment events occur only when the resolved set changes, so their epochs may lag.
    * @param {AbortSignal} scope
    * @param {string[]} labels the members that must be in the group, and only those
    * @param {string} stage what this convergence is for
@@ -1406,15 +1429,12 @@ class MembershipCase {
         for (const label of labels) {
           const described = byClient.get(this.clientIds[label])
           const event = this.members[label].assignments.at(-1)
-          if (!described || !event || event.memberId !== described.memberId) return false
-          const fromAdmin = normalize(
-            described.assignment.map(({ topic, partitions }) => ({ topic, partitions }))
-          )
-          if (!isDeepStrictEqual(normalize(event.assignment), fromAdmin)) return false
-          if (described.assignment.some(({ topicId }) => topicId !== this.topicId)) return false
+          if (!assignmentAgrees(described, event, this.topicId)) return false
+          const fromAdmin = normalize(described.assignment)
           result[label] = {
             memberId: described.memberId,
-            epoch: event.memberEpoch,
+            epoch: described.memberEpoch,
+            assignmentEventEpoch: event.memberEpoch,
             assignment: fromAdmin,
           }
         }
@@ -1798,5 +1818,58 @@ enabled('share membership on a live broker', () => {
   afterEach(() => {
     if (!liveRun.takeAdmission()) return
     liveRun.assertClean()
+  })
+})
+
+describe('membership assignment observation', () => {
+  const member = () => ({
+    memberId: 'original-member',
+    memberEpoch: 5,
+    assignment: [{ topic: 'records', topicId: 'original-topic', partitions: [2] }],
+  })
+  const event = () => ({
+    memberId: 'original-member',
+    memberEpoch: 4,
+    assignment: [{ topic: 'records', partitions: [2] }],
+  })
+
+  it('accepts an unchanged assignment whose last event precedes the admin epoch', () => {
+    expect(assignmentAgrees(member(), event(), 'original-topic')).toBe(true)
+    expect(assignmentAgrees(member(), { ...event(), memberEpoch: 5 }, 'original-topic')).toBe(true)
+  })
+
+  it.each([
+    [
+      'future epoch',
+      (row) => {
+        row.memberEpoch = 6
+      },
+    ],
+    [
+      'missing epoch',
+      (row) => {
+        delete row.memberEpoch
+      },
+    ],
+    [
+      'different member',
+      (row) => {
+        row.memberId = 'replacement-member'
+      },
+    ],
+    [
+      'different assignment',
+      (row) => {
+        row.assignment[0].partitions = [0]
+      },
+    ],
+  ])('rejects %s', (name, mutate) => {
+    const observed = event()
+    mutate(observed)
+    expect(assignmentAgrees(member(), observed, 'original-topic')).toBe(false)
+  })
+
+  it('rejects a foreign topic UUID', () => {
+    expect(assignmentAgrees(member(), event(), 'foreign-topic')).toBe(false)
   })
 })

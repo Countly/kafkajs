@@ -24,6 +24,7 @@ const {
 } = require('testHelpers')
 const {
   assertShareCleanup,
+  captureShareCleanupBaseline,
   setShareGroupConfigs,
   shareRecordIdentity,
   shareTopicName,
@@ -426,7 +427,8 @@ class DeliveryCase {
    * @returns {Promise<void>}
    */
   async setup(scope) {
-    this.beforeAdmin = await this.probe.snapshot()
+    this.beforeAdmin = await captureShareCleanupBaseline(this.probe, { signal: scope })
+    this.baseline = this.beforeAdmin
     const kafka = this.client('admin')
     this.admin = kafka.admin()
     this.admin.on(this.admin.events.REQUEST, ({ payload }) => this.requests.push(payload))
@@ -449,9 +451,6 @@ class DeliveryCase {
       setShareGroupConfigs(this.admin, this.group, this.groupConfig)
     )
     await bounded(scope, 10000, () => this.admin.listGroups())
-    this.baseline = await bounded(scope, 60000, () =>
-      bounded(scope, 10000, () => this.probe.snapshot())
-    )
     const metadata = await bounded(scope, Infinity, () =>
       this.admin.fetchTopicMetadata({ topics: [this.topic] })
     )
@@ -793,24 +792,13 @@ class DeliveryCase {
   async cleanup(signal) {
     try {
       if (this.baseline) {
-        await pollUntil(
-          signal,
-          3000,
-          () =>
-            this.tap.socketCounts().created - this.tap.socketCounts().destroyed <=
-            this.baseline.sockets.open,
-          {
-            delayMs: 50,
-            label: 'The sockets closing',
-          }
-        )
         this.after = await assertShareCleanup(
           this.admin,
           [this.group],
           [this.topic],
           this.baseline,
           this.probe,
-          { signal }
+          { signal, disconnectAdmin: true }
         )
       }
     } finally {

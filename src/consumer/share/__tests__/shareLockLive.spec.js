@@ -25,6 +25,7 @@ const {
 } = require('testHelpers')
 const {
   assertShareCleanup,
+  captureShareCleanupBaseline,
   setShareGroupConfigs,
   shareRecordIdentity,
   shareTopicName,
@@ -648,6 +649,8 @@ class LockCase {
       if (left < this.scenario.budgetMs + JOIN_MS) {
         throw new Error(`Only ${Math.round(left)} ms of the file deadline remain for this case`)
       }
+      this.beforeAdmin = await captureShareCleanupBaseline(this.probe, { signal: scope })
+      this.baseline = this.beforeAdmin
       await this.stack.run(
         () =>
           bounded(
@@ -684,7 +687,6 @@ class LockCase {
    * @returns {Promise<void>}
    */
   async setup(scope) {
-    this.beforeAdmin = await this.probe.snapshot()
     this.admin = this.client('admin').admin()
     this.admin.on(this.admin.events.REQUEST, ({ payload }) => this.requests.push(payload))
     this.stack.add('prove cleanup and disconnect admin', (signal) => this.cleanup(signal))
@@ -706,7 +708,6 @@ class LockCase {
       setShareGroupConfigs(this.admin, this.group, this.groupConfig)
     )
     await bounded(scope, 10000, () => this.admin.listGroups())
-    this.baseline = await bounded(scope, 10000, () => this.probe.snapshot())
     this.row('config-readback', { group: this.groupConfig, client: this.clientConfig })
     this.row('resource-baseline', { snapshot: this.baseline })
 
@@ -1415,17 +1416,6 @@ class LockCase {
   async cleanup(signal) {
     try {
       if (this.baseline) {
-        await pollUntil(
-          signal,
-          3000,
-          () =>
-            this.tap.socketCounts().created - this.tap.socketCounts().destroyed <=
-            this.baseline.sockets.open,
-          {
-            delayMs: 50,
-            label: 'The sockets closing',
-          }
-        )
         signal.throwIfAborted()
         this.after = await assertShareCleanup(
           this.admin,
@@ -1433,7 +1423,7 @@ class LockCase {
           [this.topic],
           this.baseline,
           this.probe,
-          { signal }
+          { signal, disconnectAdmin: true }
         )
       }
     } finally {

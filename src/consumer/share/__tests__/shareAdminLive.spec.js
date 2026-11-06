@@ -29,6 +29,7 @@ const { readLog, endOffsets } = require('../../../../testHelpers/rawLog')
 const { createResourceProbe } = require('../../../../testHelpers/resourceProbe')
 const {
   assertShareCleanup,
+  captureShareCleanupBaseline,
   createShareTopic,
   setShareGroupConfigs,
   shareRecordIdentity,
@@ -573,10 +574,7 @@ class AdminCase {
    */
   async setup(scope) {
     liveRun.assertClean()
-    // The final proof has one CleanupStack deadline and one assertShareCleanup deadline.
-    this.baseline = await bounded(scope, 10000, () =>
-      bounded(scope, 10000, () => this.probe.snapshot())
-    )
+    this.baseline = await captureShareCleanupBaseline(this.probe, { signal: scope })
     const common = { brokers: plainTextBrokers(), logLevel: logLevel.NOTHING, retry: { factor: 0 } }
     this.adminKafka = new Kafka({ ...common, clientId: `e2e-p9e-admin-${this.id}` })
     this.kafka = new Kafka({

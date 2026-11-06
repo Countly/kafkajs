@@ -5,10 +5,12 @@ const {
   acknowledgementRequests,
   awaitTerminalSharePosition,
   assertQuietTerminalGroup,
+  terminalSharePosition,
 } = require('../../../../testHelpers/shareLiveDiagnostics')
 const path = require('path')
 const { spawn } = require('child_process')
 const { isDeepStrictEqual } = require('util')
+const { AsyncLocalStorage } = require('async_hooks')
 const { Kafka, logLevel } = require('../../../../index')
 const { createChaosSocketFactory } = require('../../../../testHelpers/chaosSocket')
 const { readRequestHeader } = require('../../../../testHelpers/fakeSocket')
@@ -22,6 +24,7 @@ const {
   setShareGroupConfigs,
   shareRecordIdentity,
   assertShareCleanup,
+  captureShareCleanupBaseline,
 } = require('../../../../testHelpers/shareFixtures')
 const {
   createResourceProbe,
@@ -38,6 +41,10 @@ const CONFIG_RESOURCE_TYPES = require('../../../protocol/configResourceTypes')
 const CONFIG_SOURCE = require('../../../protocol/configSource')
 const shareFetchResponse = require('../../../protocol/requests/shareFetch/v2/response')
 const { ShareAckLedger } = require('../shareAckLedger')
+const { ShareFetchLoop } = require('../shareFetchLoop')
+const { ShareRun } = require('../shareRun')
+const { ShareRunner } = require('../shareRunner')
+const { KafkaJSShareAcknowledgementError, KafkaJSRequestTimeoutError } = require('../../../errors')
 const {
   NEVER,
   bounded,
@@ -361,8 +368,8 @@ class ShareWireTap {
       ref: meta,
     }
     if (kind === 'request') {
-      const { apiKey, apiVersion, correlationId, byteLength } = readRequestHeader(frame)
-      Object.assign(fact, { apiKey, apiVersion, correlationId, byteLength })
+      const { apiKey, apiVersion, correlationId, clientId, byteLength } = readRequestHeader(frame)
+      Object.assign(fact, { apiKey, apiVersion, correlationId, clientId, byteLength })
     } else {
       fact.correlationId = frame.readInt32BE(4)
     }
@@ -433,6 +440,404 @@ class ShareWireTap {
       (fact) => fact.kind === 'request' && fact.label === label && fact.apiKey === apiKey
     )
   }
+}
+
+/** Expands a validated acknowledgement projection without losing duplicate offset charges.
+ * @param {object[]} batches Original acknowledgement batches.
+ * @param {number} type Required wire type.
+ * @returns {string[]} Decimal offsets, including multiplicity.
+ */
+const decisionOffsets = (batches, type) => {
+  const offsets = []
+  for (const { firstOffset, lastOffset, acknowledgeTypes } of batches) {
+    if (![firstOffset, lastOffset].every((value) => /^(0|[1-9][0-9]*)$/.test(value)))
+      throw new Error('Noncanonical acknowledgement offset')
+    const size = BigInt(lastOffset) - BigInt(firstOffset) + 1n
+    if (size < 1n || size > BigInt(RECORDS)) throw new Error('Invalid acknowledgement width')
+    if (acknowledgeTypes.length !== 1 && BigInt(acknowledgeTypes.length) !== size)
+      throw new Error('Incomplete acknowledgement types')
+    for (let index = 0; BigInt(index) < size; index++) {
+      const decision = acknowledgeTypes.length === 1 ? acknowledgeTypes[0] : acknowledgeTypes[index]
+      if (![0, 1, 2, 3, 4].includes(decision)) throw new Error('Invalid acknowledgement type')
+      if (decision === type) offsets.push(String(BigInt(firstOffset) + BigInt(index)))
+    }
+  }
+  if (new Set(offsets).size !== offsets.length) throw new Error('Duplicate acknowledgement offset')
+  return offsets
+}
+
+/** Observes original authority and public results; every wrapper calls the original unchanged. */
+class SettlementCapture {
+  /** @param {SessionCase} owner Owning isolated arm. */
+  constructor(owner) {
+    this.owner = owner
+    this.context = new AsyncLocalStorage()
+    this.labels = new Map()
+    this.restores = []
+    this.handlers = []
+    this.loops = new Map()
+    this.assignments = []
+    this.decisions = []
+    this.outcomes = []
+    this.public = []
+    this.writes = []
+    this.acquisitions = []
+    this.losses = []
+    this.faults = []
+    this.sequence = 0
+  }
+
+  /** @param {*} original Original object or token. @returns {string|null} Stable local label. */
+  id(original) {
+    if (original == null) return null
+    if (!this.labels.has(original)) this.labels.set(original, `original-${this.labels.size + 1}`)
+    return this.labels.get(original)
+  }
+
+  /** @returns {object} Ordered observation time, independent of millisecond ties. */
+  stamp() {
+    return { sequence: ++this.sequence, at: Date.now(), monotonic: performance.now() }
+  }
+
+  /** @param {object} target Original provider. @param {string} name Method. @param {Function} observe Call-through observer. */
+  watch(target, name, observe) {
+    const original = target[name]
+    target[name] = function (...args) {
+      return observe(this, args, () => original.apply(this, args))
+    }
+    this.restores.push(() => {
+      target[name] = original
+    })
+  }
+
+  /** @returns {void} Installs observations before any workload client starts. */
+  install() {
+    this.watch(ShareRun.prototype, 'createLoop', (run, [node], next) => {
+      const loop = next()
+      this.loops.set(loop, { run, node })
+      return loop
+    })
+    this.watch(ShareRun.prototype, 'assignmentChanged', (run, [snapshot], next) => {
+      const result = next()
+      this.assignments.push({
+        run,
+        groupId: run.options.groupId,
+        snapshot: {
+          ...snapshot,
+          token: this.id(snapshot.token),
+          targetRevision: this.id(snapshot.targetRevision),
+          assignment: structuredClone(snapshot.assignment),
+          unresolved: [...snapshot.unresolved],
+        },
+        ...this.stamp(),
+      })
+      return result
+    })
+    this.watch(ShareFetchLoop.prototype, 'send', (loop, [exchange], next) =>
+      this.context.run({ loop, exchange }, next)
+    )
+    this.watch(ShareFetchLoop.prototype, 'writeFinal', (loop, [operation, guard, captured], next) =>
+      this.context.run({ loop, captured }, next)
+    )
+    this.watch(ShareFetchLoop.prototype, 'adopt', (loop, [exchange], next) => {
+      const cohort = next()
+      if (Object.values(this.owner.groups).includes(loop.groupId))
+        this.acquisitions.push({ cohort, exchange, ...this.stamp() })
+      return cohort
+    })
+    this.watch(ShareRun.prototype, 'invoke', (run, [node, cohort, call], next) =>
+      this.context.run({ run, node, cohort, call }, next)
+    )
+    this.watch(ShareRunner.prototype, 'newRun', (runner, args, next) => {
+      const run = next()
+      if (!Object.values(this.owner.groups).includes(run.options.groupId)) return run
+      const handler = run.handler
+      run.handler = (payload) => {
+        const context = this.context.getStore()
+        const { topic, partition, message } = payload
+        this.handlers.push({
+          ...context,
+          groupId: run.options.groupId,
+          clientId: run.options.clientId,
+          memberId: run.membership.memberId,
+          identity: shareRecordIdentity({ ...message, topic, partition }),
+          offset: message.offset,
+          deliveryCount: message.deliveryCount,
+          ...this.stamp(),
+        })
+        return handler.call(run, payload)
+      }
+      this.restores.push(() => {
+        run.handler = handler
+      })
+      return run
+    })
+    for (const method of ['decide', 'complete', 'completeRange']) {
+      this.watch(ShareAckLedger.prototype, method, (ledger, args, next) => {
+        const result = next()
+        const offsets =
+          method === 'decide'
+            ? [args[0]]
+            : method === 'complete'
+              ? args[0]
+              : args[0].slice(args[1], args[2]).map(({ offset }) => offset)
+        const type = method === 'completeRange' ? args[3] : (args[1] ?? 'accept')
+        for (const offset of offsets)
+          this.decisions.push({ ledger, offset, type, method, ...this.stamp() })
+        return result
+      })
+    }
+    this.watch(ShareRunner.prototype, 'publishResults', (runner, [cohort, results], next) => {
+      if (Object.values(this.owner.groups).includes(runner.options.groupId))
+        for (const result of results)
+          this.outcomes.push({ cohort, result, groupId: runner.options.groupId, ...this.stamp() })
+      return next()
+    })
+    this.watch(ShareFetchLoop.prototype, 'failExchange', (loop, [exchange, cause], next) => {
+      for (const write of this.writes.filter((write) => write.exchange === exchange))
+        write.failure = cause
+      return next()
+    })
+    this.watch(ShareFetchLoop.prototype, 'onSessionReset', (loop, [open, reason, cause], next) => {
+      this.losses.push({ loop, open, reason, cause, ...this.stamp() })
+      return next()
+    })
+    const hook = (fact) => this.frame(fact)
+    this.owner.tap.hooks.add(hook)
+    this.restores.push(() => this.owner.tap.hooks.delete(hook))
+  }
+
+  /** @param {object} fact Complete original frame below the fault layer. @returns {void} */
+  frame(fact) {
+    Object.assign(fact, this.stamp())
+    if (fact.kind !== 'request' || ![78, 79].includes(fact.apiKey)) return
+    const context = this.context.getStore()
+    if (!context?.loop) throw new Error('Share frame has no original exchange')
+    const { loop, captured } = context
+    const exchange =
+      context.exchange ??
+      [...loop.exchanges].find(
+        (entry) =>
+          entry.captured &&
+          entry.prepared === captured.prepared &&
+          entry.binding === captured.binding
+      )
+    if (!exchange) throw new Error('Missing original captured final exchange')
+    const descriptor = captured?.descriptor ?? exchange.descriptor
+    const binding = exchange.binding
+    const socket = binding.connection.socket
+    if ((socket.inner ?? socket) !== fact.ref.socket) throw new Error('Foreign exchange socket')
+    const reader = fact.apiKey === 78 ? shareFetchWire : shareAcknowledgeWire
+    const fields = reader.readRequest(fact.frame.subarray(fact.byteLength))
+    expect(fields.groupId).toBe(loop.groupId)
+    expect(fields.memberId).toBe(loop.memberId)
+    expect(fields.shareSessionEpoch).toBe(descriptor.epoch)
+    expect(fields.topics).toEqual((captured?.fields ?? exchange.fields).topics)
+    const write = {
+      loop,
+      ...this.loops.get(loop),
+      exchange,
+      descriptor,
+      fact,
+      fields,
+      binding: { ...binding },
+      socket,
+      open: captured?.descriptor.token ?? exchange.open,
+      membership: loop.authority.membershipToken,
+      prepared: exchange.prepared.map((entry) => ({ ...entry })),
+      ...this.stamp(),
+    }
+    fact.write = write
+    this.writes.push(write)
+  }
+
+  /** @param {Member} member Owning public listener. @param {object} payload Actual event. @returns {void} */
+  publicResult(member, payload) {
+    const match = this.outcomes.find(
+      (outcome) =>
+        outcome.groupId === member.groupId &&
+        !this.public.some((row) => row.outcome === outcome) &&
+        ['type', 'firstOffset', 'lastOffset', 'error'].every(
+          (key) => outcome.result[key] === payload[key]
+        ) &&
+        outcome.cohort.topic === payload.topic &&
+        outcome.cohort.partition === payload.partition
+    )
+    this.public.push({ outcome: match, payload, label: member.label, ...this.stamp() })
+  }
+
+  /** Freezes unresolved actual handler attempts and the exact in-flight written exchanges.
+   * @param {string} kind Prescribed interruption.
+   * @param {object[]} writes Original affected requests, never a later offset-derived pool.
+   * @returns {object} Immutable fault eligibility observations.
+   */
+  freeze(kind, writes) {
+    const handlers = this.handlers.filter(
+      (handler) =>
+        !this.outcomes.some(
+          ({ cohort, result }) =>
+            cohort === handler.cohort &&
+            result.type !== 'renew' &&
+            offsetsOf([result]).includes(handler.offset)
+        )
+    )
+    const fault = { kind, handlers: [...handlers], writes: [...writes], ...this.stamp() }
+    this.faults.push(fault)
+    return fault
+  }
+
+  /** @returns {Promise<void>} Decodes every complete original answer, including swallowed acquisitions. */
+  async refresh() {
+    for (const write of this.writes) {
+      const response = this.owner.tap.responseTo(write.fact)
+      if (!response || write.answer) continue
+      const decoder = write.fact.apiKey === 78 ? fetchAcknowledgementResponse : acknowledgeResponse
+      if (response.frame[8] !== 0) throw new Error('Unexpected response header tags')
+      write.response = response
+      write.answer = await decoder.decode(response.frame.subarray(9))
+    }
+  }
+
+  /** @returns {void} Restores every original provider after clients have joined. */
+  restore() {
+    for (const restore of this.restores.splice(0).reverse()) restore()
+  }
+}
+
+/** Returns the independent acknowledgement verdict; fetch status cannot replace it.
+ * @param {object} write Original request, prepared ticket and response.
+ * @param {object} cohort Original acquisition.
+ * @returns {number|undefined} Known broker code, or absent when no answer exists.
+ */
+const acknowledgementCode = (write, cohort) => {
+  if (!write.answer) return undefined
+  if (!Number.isInteger(write.answer.errorCode))
+    throw new Error('Missing top-level acknowledgement result')
+  if (write.answer.errorCode !== 0) return write.answer.errorCode
+  const topics = write.answer.responses.filter(({ topicId }) => topicId === cohort.topicId)
+  if (topics.length !== 1) throw new Error('Missing or duplicate acknowledgement topic')
+  const partitions = topics[0].partitions.filter(
+    ({ partitionIndex }) => partitionIndex === cohort.partition
+  )
+  if (partitions.length !== 1) throw new Error('Missing or duplicate acknowledgement partition')
+  const code =
+    write.fact.apiKey === 78 ? partitions[0].acknowledgeErrorCode : partitions[0].errorCode
+  if (!Number.isInteger(code)) throw new Error('Missing acknowledgement partition result')
+  return code
+}
+
+/** Validates the full physical request against its original ticket and authority.
+ * @param {object} write Captured transmitted exchange.
+ * @param {object} prepared Original prepared cohort/ledger/ticket link.
+ * @param {object} handler Actual handler attempt.
+ * @returns {boolean} Whether that exact written request carried this Accept.
+ */
+const writtenAccept = (write, prepared, handler) => {
+  const { cohort, offset, groupId } = handler
+  const { fact } = write
+  if (
+    !Buffer.isBuffer(fact.frame) ||
+    fact.frame.length < 12 ||
+    fact.frame.length !== fact.frame.readInt32BE(0) + 4 ||
+    ![78, 79].includes(fact.apiKey) ||
+    fact.apiVersion !== 2 ||
+    !write.prepared.includes(prepared) ||
+    prepared.row !== cohort ||
+    prepared.ledger !== cohort.ledger ||
+    (write.socket.inner ?? write.socket) !== fact.ref.socket ||
+    (write.exchange.open ?? write.descriptor.token) !== write.open ||
+    write.exchange.binding.connection !== write.binding.connection ||
+    write.exchange.sentAt === undefined ||
+    write.fields.groupId !== groupId ||
+    write.fields.memberId !== write.loop.memberId ||
+    prepared.ticket.isRenewAck ||
+    write.fields.isRenewAck
+  )
+    return false
+  const header = readRequestHeader(fact.frame)
+  if (
+    header.apiKey !== fact.apiKey ||
+    header.apiVersion !== fact.apiVersion ||
+    header.correlationId !== fact.correlationId ||
+    header.byteLength !== fact.byteLength
+  )
+    return false
+  const reader = fact.apiKey === 78 ? shareFetchWire : shareAcknowledgeWire
+  const decoded = reader.readRequest(fact.frame.subarray(header.byteLength))
+  if (
+    !isDeepStrictEqual(decoded, write.fields) ||
+    decoded.shareSessionEpoch !== write.descriptor.epoch
+  )
+    return false
+  if (
+    decoded.topics.length !== 1 ||
+    decoded.topics[0].topicId !== cohort.topicId ||
+    decoded.topics[0].partitions.length !== 1
+  )
+    return false
+  const [partition] = decoded.topics[0].partitions
+  return (
+    partition.partitionIndex === cohort.partition &&
+    isDeepStrictEqual(partition.acknowledgementBatches, prepared.ticket.acknowledgementBatches) &&
+    decisionOffsets(partition.acknowledgementBatches, 1).includes(offset)
+  )
+}
+
+/** Checks the original written-Accept chain without converting an unknown outcome to success.
+ * @param {object} attempt Original handler, decision, ticket, write, fault and public outcome.
+ * @param {object[]} handlers Entire workload/verifier handler journal.
+ * @returns {boolean} Provisional eligibility only; terminal proof remains independent.
+ */
+const qualifyingUnknown = (
+  { handler, decision, prepared, write, outcome, publication, fault, loss },
+  handlers
+) => {
+  if (!handler || !decision || !prepared || !write || !outcome || !publication || !fault || !loss)
+    return false
+  const { cohort, offset } = handler
+  const error = outcome.result.error
+  return (
+    writtenAccept(write, prepared, handler) &&
+    fault.handlers.includes(handler) &&
+    fault.writes.includes(write) &&
+    loss.loop === write.loop &&
+    loss.open === write.open &&
+    loss.cause === write.failure &&
+    loss.reason === 'connection' &&
+    loss.sequence > fault.sequence &&
+    loss.sequence < outcome.sequence &&
+    decision.ledger === cohort.ledger &&
+    decision.offset === offset &&
+    decision.type === 'accept' &&
+    decision.method !== 'decide' &&
+    decision.sequence < write.sequence &&
+    write.membership === write.loop.authority.membershipToken &&
+    handler.sequence < fault.sequence &&
+    write.sequence < fault.sequence &&
+    outcome.sequence > fault.sequence &&
+    outcome.cohort === cohort &&
+    publication.outcome === outcome &&
+    outcome.result.type === 'accept' &&
+    offsetsOf([outcome.result]).includes(offset) &&
+    error instanceof KafkaJSShareAcknowledgementError &&
+    error.reason === 'session-lost' &&
+    error.cause === write.failure &&
+    write.failure !== undefined &&
+    fault.kind === 'lost-response' &&
+    (!write.response || write.response.sequence > fault.sequence) &&
+    write.fact.apiKey === 78 &&
+    write.failure instanceof KafkaJSRequestTimeoutError &&
+    write.failure.correlationId === write.fact.correlationId &&
+    write.failure.broker === `${write.fact.host}:${write.fact.port}` &&
+    (acknowledgementCode(write, cohort) === undefined ||
+      acknowledgementCode(write, cohort) === 0) &&
+    !handlers.some(
+      (later) =>
+        later.groupId === handler.groupId &&
+        later.identity === handler.identity &&
+        later.sequence > handler.sequence
+    )
+  )
 }
 
 /**
@@ -596,7 +1001,12 @@ class Member {
       this.removers.push(
         this.client.on(events[name], ({ payload }) => list.push({ ...payload, at: Date.now() }))
       )
-    keep('ACKNOWLEDGE', this.acks)
+    this.removers.push(
+      this.client.on(events.ACKNOWLEDGE, ({ payload }) => {
+        this.capture?.publicResult(this, payload)
+        this.acks.push({ ...payload, at: Date.now() })
+      })
+    )
     keep('REQUEST', this.requests)
     keep('REQUEST_TIMEOUT', this.timeouts)
     keep('SESSION_RESET', this.resets)
@@ -804,6 +1214,7 @@ class SessionCase {
     this.tap = new ShareWireTap()
     this.chaos = []
     this.gauge = new ResourceGauge()
+    this.capture = new SettlementCapture(this)
     this.probe = createResourceProbe({
       emitters: { process },
       sockets: () => this.sockets.counts(),
@@ -869,6 +1280,9 @@ class SessionCase {
             headerBytes: byteLength,
           }))
       ),
+      faultSettlement: this.settlement,
+      archival: this.archival,
+      capture: this.captureEvidence(),
       settlement: Object.values(this.groups).map((groupId) => ({
         groupId,
         ...this.missingAccepts(groupId),
@@ -886,6 +1300,7 @@ class SessionCase {
   async run(scope) {
     const outer = new CleanupStack()
     outer.add('release resource gauge', () => this.gauge.uninstall())
+    outer.add('release settlement observers', () => this.capture.restore())
     outer.add('disconnect admin', () => this.admin.disconnect())
     let pre
     let base
@@ -894,14 +1309,16 @@ class SessionCase {
       await outer.run(
         async () => {
           this.gauge.install()
-          pre = await this.sample(scope)
+          this.capture.install()
+          pre = await captureShareCleanupBaseline(this.probe, {
+            signal: scope,
+            cleanupStack: false,
+          })
           await bounded(scope, STEP_MS, () => this.admin.connect())
           await bounded(scope, STEP_MS, async () => {
             await this.admin.describeCluster()
             await this.admin.listGroups()
           })
-          // assertShareCleanup closes admin before sampling, matching this pre-client point
-          // and sample()'s single proof deadline even after lazy admin connections have grown.
           base = pre
           this.row('resource-baseline', { resources: summarize(base) })
           await this.stack.run(
@@ -1104,6 +1521,7 @@ class SessionCase {
    */
   async launch(scope, member) {
     this.members[member.label] = member
+    member.capture = this.capture
     member.listen()
     this.stack.add(`remove ${member.label} listeners`, () => member.unlisten())
     this.stack.add(`disconnect ${member.label}`, () => member.client.disconnect({ timeout: 5000 }))
@@ -1129,6 +1547,415 @@ class SessionCase {
       },
       { delayMs: 100, label: `${member.label} receiving ${count} deliveries` }
     )
+  }
+
+  /** Reads the effective delivery limit on every broker without changing it.
+   * @param {AbortSignal} scope Case scope.
+   * @returns {Promise<void>} Retained archival-exclusion configuration.
+   */
+  async deliveryLimits(scope) {
+    const { brokers } = await bounded(scope, STEP_MS, () => this.admin.describeCluster())
+    this.limits = []
+    for (const { nodeId } of brokers) {
+      const name = 'group.share.delivery.count.limit'
+      const response = await bounded(scope, STEP_MS, () =>
+        this.admin.describeConfigs({
+          resources: [
+            { type: CONFIG_RESOURCE_TYPES.BROKER, name: String(nodeId), configNames: [name] },
+          ],
+        })
+      )
+      expect(response.resources).toHaveLength(1)
+      expect(response.resources[0].errorCode).toBe(0)
+      const entries = response.resources[0].configEntries.filter(
+        ({ configName }) => configName === name
+      )
+      expect(entries).toHaveLength(1)
+      expect(entries[0].configValue).toMatch(/^[1-9][0-9]*$/)
+      this.limits.push({ nodeId, response, limit: Number(entries[0].configValue) })
+    }
+    expect(this.limits.length).toBeGreaterThan(0)
+    this.row('config-readback', { deliveryLimits: this.limits })
+  }
+
+  /** Requires one matching original acquisition before using a handler in a settlement proof.
+   * @param {object} handler Actual handler entry.
+   * @returns {void} Fails on a fabricated cohort or response-only acquisition.
+   */
+  assertAcquisition(handler) {
+    const { cohort, offset } = handler
+    const adopted = this.capture.acquisitions.filter((row) => row.cohort === cohort)
+    expect(adopted).toHaveLength(1)
+    const writes = this.capture.writes.filter(({ exchange }) => exchange === adopted[0].exchange)
+    expect(writes).toHaveLength(1)
+    const write = writes[0]
+    expect(write.fields.groupId).toBe(handler.groupId)
+    expect(write.answer?.errorCode).toBe(0)
+    const topics = write.answer.responses.filter(({ topicId }) => topicId === this.topicId)
+    expect(topics).toHaveLength(1)
+    const partitions = topics[0].partitions.filter(({ partitionIndex }) => partitionIndex === 0)
+    expect(partitions).toHaveLength(1)
+    expect(partitions[0].errorCode).toBe(0)
+    const ranges = partitions[0].acquiredRecords.filter(
+      ({ firstOffset, lastOffset }) =>
+        BigInt(firstOffset) <= BigInt(offset) && BigInt(offset) <= BigInt(lastOffset)
+    )
+    expect(ranges).toHaveLength(1)
+    expect(ranges[0].deliveryCount).toBe(handler.deliveryCount)
+    expect(cohort.topicId).toBe(this.topicId)
+    expect(cohort.partition).toBe(0)
+    const original = cohort.walk.deliver.records.filter((record) => record.offset === offset)
+    expect(original).toHaveLength(1)
+    expect(
+      shareRecordIdentity({ ...original[0], topic: cohort.topic, partition: cohort.partition })
+    ).toBe(handler.identity)
+    expect(write.response.sequence).toBeLessThan(adopted[0].sequence)
+    expect(adopted[0].sequence).toBeLessThan(handler.sequence)
+  }
+
+  /** Computes disjoint real-success and provisional-unknown classes from original observations.
+   * @param {string} group Original workload group.
+   * @returns {object} Exact corpus, attempts, classifications and ineligible identities.
+   */
+  partitionSettlement(group) {
+    const { capture } = this
+    const successful = []
+    const candidates = []
+    const missing = []
+    const identityOf = (identity) => ({ groupId: group, topicId: this.topicId, identity })
+    const handlers = capture.handlers.filter(({ groupId }) => groupId === group)
+    expect(handlers.every(({ identity }) => this.expected.includes(identity))).toBe(true)
+    expect(capture.public.every(({ outcome }) => outcome !== undefined)).toBe(true)
+    const faults = capture.faults.filter(({ kind }) => kind === 'lost-response')
+    expect(faults).toHaveLength(1)
+    const [fault] = faults
+    expect(fault.writes).toHaveLength(1)
+    const [dropped] = fault.writes
+    const written = dropped.prepared.flatMap(({ ticket }) =>
+      decisionOffsets(ticket.acknowledgementBatches, 1)
+    )
+    expect(written.length).toBeLessThanOrEqual(PREFIX)
+    expect(written.every((offset) => BigInt(offset) < BigInt(PREFIX))).toBe(true)
+    for (const identity of this.expected) {
+      const entries = handlers.filter((handler) => handler.identity === identity)
+      expect(entries.length).toBeLessThanOrEqual(1)
+      const handler = entries[0]
+      if (!handler) {
+        missing.push({ ...identityOf(identity), reason: 'missing-handler' })
+        continue
+      }
+      this.assertAcquisition(handler)
+      const terminal = capture.outcomes.filter(
+        ({ cohort, result }) =>
+          cohort === handler.cohort &&
+          result.type !== 'renew' &&
+          offsetsOf([result]).includes(handler.offset)
+      )
+      if (!terminal.length) {
+        missing.push({ ...identityOf(identity), reason: 'missing-outcome' })
+        continue
+      }
+      expect(terminal).toHaveLength(1)
+      const [outcome] = terminal
+      const publications = capture.public.filter((row) => row.outcome === outcome)
+      expect(publications.length).toBeLessThanOrEqual(1)
+      const decisions = capture.decisions.filter(
+        (row) =>
+          row.ledger === handler.cohort.ledger &&
+          row.offset === handler.offset &&
+          row.method !== 'decide' &&
+          row.sequence < outcome.sequence
+      )
+      const decision = decisions.at(-1)
+      const attempts = capture.writes.flatMap((write) =>
+        write.prepared
+          .filter(
+            ({ row, ticket }) =>
+              row === handler.cohort &&
+              !ticket.isRenewAck &&
+              decisionOffsets(ticket.acknowledgementBatches, 1).includes(handler.offset)
+          )
+          .map((prepared) => ({ write, prepared }))
+      )
+      expect(attempts.length).toBeLessThanOrEqual(1)
+      const attempt = attempts[0]
+      const evidence = {
+        ...identityOf(identity),
+        handler: capture.id(handler),
+        cohort: capture.id(handler.cohort),
+        ledger: capture.id(handler.cohort.ledger),
+        ticket: capture.id(attempt?.prepared.ticket),
+        exchange: capture.id(attempt?.write.exchange),
+        outcome: capture.id(outcome),
+        fault: capture.id(fault),
+      }
+      if (!attempt || !decision || publications.length !== 1) {
+        missing.push({ ...evidence, reason: 'missing-original-written-attempt-or-public-outcome' })
+        continue
+      }
+      const { write, prepared } = attempt
+      expect(writtenAccept(write, prepared, handler)).toBe(true)
+      expect(write.fields.topics).toHaveLength(1)
+      expect(write.fields.topics[0].topicId).toBe(this.topicId)
+      expect(write.fields.topics[0].partitions).toHaveLength(1)
+      expect(write.fields.topics[0].partitions[0]).toEqual({
+        partitionIndex: 0,
+        acknowledgementBatches: prepared.ticket.acknowledgementBatches,
+      })
+      const reused = capture.writes
+        .flatMap((entry) => entry.prepared)
+        .filter(({ ticket }) => ticket === prepared.ticket)
+      expect(reused).toHaveLength(1)
+      if (
+        outcome.result.type === 'accept' &&
+        outcome.result.error === null &&
+        acknowledgementCode(write, handler.cohort) === 0 &&
+        decision.type === 'accept' &&
+        decision.sequence < write.sequence &&
+        write.response.sequence < outcome.sequence
+      ) {
+        successful.push(evidence)
+      } else if (
+        qualifyingUnknown(
+          {
+            handler,
+            decision,
+            prepared,
+            write,
+            outcome,
+            publication: publications[0],
+            fault,
+            loss: capture.losses.find(
+              (loss) =>
+                loss.loop === write.loop && loss.open === write.open && loss.cause === write.failure
+            ),
+          },
+          handlers
+        )
+      ) {
+        candidates.push(evidence)
+      } else missing.push({ ...evidence, reason: 'ineligible-outcome' })
+    }
+    expect(candidates.length).toBeLessThanOrEqual(written.length)
+    if (!missing.length) expect(successful.length).toBeGreaterThanOrEqual(RECORDS - PREFIX)
+    return {
+      groupId: group,
+      successful,
+      provisional: candidates,
+      unknown: [],
+      missing,
+      written: written.map((offset) => identityOf(this.expected[Number(offset)])),
+    }
+  }
+
+  /** Excludes archive paths using every acquisition, including conservatively unanswered fetches.
+   * @param {object} settlement Current candidate partition.
+   * @returns {object[]} Per-candidate acquisition bounds and actual delivery limits.
+   */
+  excludeArchival(settlement) {
+    const limit = Math.min(...this.limits.map(({ limit }) => limit))
+    const bounds = []
+    for (const candidate of settlement.provisional) {
+      const offset = JSON.parse(candidate.identity)[2]
+      let upper = 0
+      for (const write of this.capture.writes.filter(
+        ({ fields }) => fields.groupId === settlement.groupId
+      )) {
+        if (write.fact.apiKey === 78) {
+          if (!write.answer) upper += 1
+          else {
+            for (const topic of write.answer.responses) {
+              if (topic.topicId !== this.topicId) continue
+              for (const partition of topic.partitions) {
+                if (partition.partitionIndex !== 0) continue
+                for (const acquired of partition.acquiredRecords ?? [])
+                  if (
+                    BigInt(acquired.firstOffset) <= BigInt(offset) &&
+                    BigInt(offset) <= BigInt(acquired.lastOffset)
+                  ) {
+                    expect(Number.isInteger(acquired.deliveryCount)).toBe(true)
+                    expect(acquired.deliveryCount).toBeGreaterThan(0)
+                    upper += acquired.deliveryCount
+                  }
+              }
+            }
+          }
+        }
+        for (const topic of write.fields.topics) {
+          if (topic.topicId !== this.topicId) continue
+          for (const partition of topic.partitions) {
+            if (partition.partitionIndex !== 0) continue
+            for (const type of [0, 3])
+              expect(decisionOffsets(partition.acknowledgementBatches, type)).not.toContain(offset)
+          }
+        }
+      }
+      expect(upper).toBeGreaterThan(0)
+      expect(upper).toBeLessThan(limit)
+      expect(
+        this.capture.decisions.some(
+          (decision) =>
+            decision.ledger.topicId === this.topicId &&
+            decision.offset === offset &&
+            decision.type === 'reject'
+        )
+      ).toBe(false)
+      bounds.push({ ...candidate, acquisitionUpperBound: upper, deliveryLimit: limit })
+    }
+    return bounds
+  }
+
+  /** Requires independent terminal and active-verifier evidence before promoting candidates.
+   * @param {object} settlement Recomputed provisional partition.
+   * @returns {void} Q alone can never complete the case.
+   */
+  assertUnknownTerminal(settlement) {
+    expect(settlement.missing).toEqual([])
+    expect(
+      [...settlement.successful, ...settlement.provisional].map(({ identity }) => identity).sort()
+    ).toEqual([...this.expected].sort())
+    expect(this.log).toEqual(this.expected)
+    expect(this.logEnd).toBe(String(RECORDS))
+    expect(this.recovery).toBeDefined()
+    expect(this.recovery.sequence).toBeLessThan(this.admission.sequence)
+    expect(this.quiet).toHaveLength(1)
+    const [quiet] = this.quiet
+    expect(quiet.groupId).toBe(settlement.groupId)
+    expect(quiet.delivered).toEqual([])
+    expect(quiet.activeFetches.length).toBeGreaterThan(1)
+    expect(
+      quiet.assignmentObservations.some(
+        ({ groupId, snapshot }) =>
+          groupId === settlement.groupId &&
+          snapshot.assignment.some(
+            ({ topicId, partitions }) => topicId === this.topicId && partitions.includes(0)
+          )
+      )
+    ).toBe(true)
+    expect(
+      this.quietObservations.filter(
+        (row) =>
+          row.groupId === settlement.groupId &&
+          row.status === 'quiet' &&
+          row.windowMs === 5000 &&
+          row.delivered.length === 0
+      )
+    ).toHaveLength(1)
+    const target = {
+      groupId: settlement.groupId,
+      topic: this.topic,
+      partitions: [{ partition: 0, floor: '0', end: String(RECORDS) }],
+    }
+    for (const position of [this.terminalBefore, quiet.position]) {
+      expect(position).toBeDefined()
+      expect(
+        terminalSharePosition(target, {
+          ...position,
+          topicId: this.topicId,
+          ends: [{ partition: 0, high: this.logEnd }],
+        }).settled
+      ).toBe(true)
+    }
+    expect(this.archival.map(({ identity }) => identity).sort()).toEqual(
+      settlement.provisional.map(({ identity }) => identity).sort()
+    )
+    for (const { acquisitionUpperBound, deliveryLimit } of this.archival) {
+      expect(acquisitionUpperBound).toBeGreaterThan(0)
+      expect(acquisitionUpperBound).toBeLessThan(deliveryLimit)
+    }
+  }
+
+  /** Archives primitive observations and stable labels of original objects, never replacement authority.
+   * @returns {object} Lossless frame references and complete acquisition/handler/decision/outcome journals.
+   */
+  captureEvidence() {
+    const capture = this.capture
+    const id = (value) => capture.id(value)
+    const authority = (write) => ({
+      exchange: id(write.exchange),
+      loop: id(write.loop),
+      run: id(write.run),
+      nodeId: write.node?.id,
+      open: id(write.open),
+      membership: id(write.membership),
+      pool: id(write.binding.pool),
+      generation: write.binding.generation,
+      connection: id(write.binding.connection),
+      prepared: write.prepared.map(({ ledger, ticket, row }) => ({
+        ledger: id(ledger),
+        ticket: id(ticket),
+        cohort: id(row),
+        acquisition: id(row.token),
+        batches: ticket.acknowledgementBatches,
+        isRenewAck: ticket.isRenewAck,
+      })),
+    })
+    return {
+      frames: this.tap.frames.map(({ kind, frame, ref: _ref, write, ...fact }) => ({
+        ...fact,
+        kind,
+        bytes: frame.toString('base64'),
+        ...(write && {
+          ...authority(write),
+          fields: write.fields,
+          failure: describeError(write.failure),
+          cause: id(write.failure),
+        }),
+      })),
+      assignments: capture.assignments.map(({ run, ...fact }) => ({ ...fact, run: id(run) })),
+      acquisitions: capture.acquisitions.map(({ cohort, exchange, ...fact }) => ({
+        ...fact,
+        cohort: id(cohort),
+        acquisition: id(cohort.token),
+        ledger: id(cohort.ledger),
+        exchange: id(exchange),
+        topicId: cohort.topicId,
+        partition: cohort.partition,
+        groupId: capture.writes.find((write) => write.exchange === exchange)?.fields.groupId,
+        records: cohort.walk.deliver.records.map(({ offset, key, value }) => ({
+          offset,
+          key: key?.toString('base64'),
+          value: value?.toString('base64'),
+        })),
+        deliveryCounts: cohort.walk.deliver.deliveryCounts,
+      })),
+      handlers: capture.handlers.map(({ run, node, cohort, call, ...fact }) => ({
+        ...fact,
+        handler: id(capture.handlers.find((entry) => entry.sequence === fact.sequence)),
+        run: id(run),
+        node: node.id,
+        cohort: id(cohort),
+        call: id(call),
+        ledger: id(cohort.ledger),
+      })),
+      decisions: capture.decisions.map(({ ledger, ...fact }) => ({ ...fact, ledger: id(ledger) })),
+      outcomes: capture.outcomes.map((outcome) => ({
+        outcome: id(outcome),
+        cohort: id(outcome.cohort),
+        groupId: outcome.groupId,
+        sequence: outcome.sequence,
+        at: outcome.at,
+        ...outcome.result,
+        error: describeError(outcome.result.error),
+        cause: id(outcome.result.error?.cause),
+        public: capture.public
+          .filter((entry) => entry.outcome === outcome)
+          .map(({ payload: _payload, outcome: _outcome, ...entry }) => entry),
+      })),
+      losses: capture.losses.map(({ loop, open, cause, ...fact }) => ({
+        ...fact,
+        loop: id(loop),
+        open: id(open),
+        cause: id(cause),
+        error: describeError(cause),
+      })),
+      faults: capture.faults.map(({ handlers, writes, ...fact }) => ({
+        ...fact,
+        fault: id(capture.faults.find((entry) => entry.sequence === fact.sequence)),
+        handlers: handlers.map(id),
+        exchanges: writes.map(({ exchange }) => id(exchange)),
+      })),
+    }
   }
 
   /**
@@ -1168,17 +1995,41 @@ class SessionCase {
    * Polls successful settlement and terminal positions against the independent raw-log end.
    * @param {AbortSignal} scope Case scope.
    * @param {string} group Group being observed.
+   * @param {boolean} [faultSettlement=false] Admit only evidenced written-Accept candidates.
    * @returns {Promise<object>} Terminal partition row.
    */
-  async awaitStart(scope, group) {
+  async awaitStart(scope, group, faultSettlement = false) {
+    if (faultSettlement) {
+      expect(this.recovery).toBeDefined()
+      this.admission = this.capture.stamp()
+      expect(this.recovery.sequence).toBeLessThan(this.admission.sequence)
+    }
     return bounded(
       scope,
       DELIVERY_MS,
       async (poll) => {
-        await pollUntil(poll, DELIVERY_MS, () => this.acceptedGroup(group), {
-          label: `${group} successful Accept coverage`,
-        })
-        const { rows } = await awaitTerminalSharePosition(
+        await pollUntil(
+          poll,
+          DELIVERY_MS,
+          async () => {
+            if (!faultSettlement) return this.acceptedGroup(group)
+            await this.capture.refresh()
+            this.settlement = this.partitionSettlement(group)
+            return this.settlement.missing.length === 0
+          },
+          {
+            label: `${group} terminal Accept eligibility`,
+          }
+        )
+        if (faultSettlement) {
+          this.archival = this.excludeArchival(this.settlement)
+          this.row('settlement-candidates', {
+            settlement: this.settlement,
+            archival: this.archival,
+            capture: this.captureEvidence(),
+          })
+        }
+        const position = await awaitTerminalSharePosition(
           this.admin,
           {
             groupId: group,
@@ -1191,7 +2042,8 @@ class SessionCase {
             record: (fields) => this.row('broker-position', { ...fields, ...this.progress() }),
           }
         )
-        return rows[0]
+        if (faultSettlement) this.terminalBefore = position
+        return position.rows[0]
       },
       { label: `${group} terminal settlement` }
     )
@@ -1213,7 +2065,9 @@ class SessionCase {
     const { topics } = await bounded(scope, STEP_MS, () =>
       this.admin.fetchTopicMetadata({ topics: [this.topic], useDescribeTopicPartitions: true })
     )
-    this.topicId = topics.find(({ name }) => name === this.topic).topicId
+    const topicId = topics.find(({ name }) => name === this.topic).topicId
+    if (this.topicId !== undefined) expect(topicId).toBe(this.topicId)
+    this.topicId = topicId
     expect(records.filter(({ batchContext }) => batchContext.isControlBatch)).toEqual([])
     const actual = records.map(({ offset, key, value }) =>
       shareRecordIdentity({ topic: this.topic, partition: 0, offset, key, value })
@@ -1236,6 +2090,7 @@ class SessionCase {
     await this.sockets.acknowledgements.join()
     this.quiet = []
     this.broker = []
+    this.quietObservations = []
     for (const group of groups) {
       const verified = await assertQuietTerminalGroup({
         kafka: this.kafka('V'),
@@ -1245,15 +2100,56 @@ class SessionCase {
         partitions: [{ partition: 0, floor: '0', end: this.logEnd }],
         signal: scope,
         timeoutMs: DELIVERY_MS,
-        record: (fields) => this.row('quiet-verifier', { groupId: group, ...fields }),
+        record: (fields) => {
+          this.quietObservations.push({ groupId: group, ...fields })
+          this.row('quiet-verifier', { groupId: group, ...fields })
+        },
       })
-      this.quiet.push({ groupId: group, ...verified })
+      const active = this.tap
+        .requestsOf('V', API_SHARE_FETCH)
+        .filter(({ write }) => write.fields.groupId === group)
+      expect(active.length).toBeGreaterThan(1)
+      const completed = active.filter((request) => this.tap.responseTo(request))
+      expect(completed.length).toBeGreaterThan(1)
+      const assignments = this.capture.assignments.filter(({ run }) => run === active[0].write.run)
+      expect(
+        assignments.some(({ snapshot }) =>
+          snapshot.assignment.some(
+            ({ topicId, partitions }) => topicId === this.topicId && partitions.includes(0)
+          )
+        )
+      ).toBe(true)
+      this.quiet.push({
+        assignmentObservations: assignments.map(({ run: _run, ...fact }) => fact),
+        groupId: group,
+        ...verified,
+        activeFetches: completed.map(({ socket, correlationId, at }) => ({
+          socket,
+          correlationId,
+          at,
+        })),
+      })
       this.broker.push(...verified.position.rows)
     }
     const ends = await bounded(scope, STEP_MS, () =>
       endOffsets({ brokers: plainTextBrokers(), topic: this.topic })
     )
     expect(ends.get(0)).toBe(this.logEnd)
+    if (this.action === 'timeout') {
+      await this.verifyLog(scope)
+      await this.capture.refresh()
+      const final = this.partitionSettlement(groups[0])
+      expect(final.missing).toEqual([])
+      this.archival = this.excludeArchival(final)
+      this.assertUnknownTerminal(final)
+      this.settlement = { ...final, unknown: final.provisional, provisional: [] }
+      this.row('settlement-terminal', {
+        settlement: this.settlement,
+        archival: this.archival,
+        capture: this.captureEvidence(),
+        quiet: this.quiet,
+      })
+    }
   }
 
   /**
@@ -1269,7 +2165,9 @@ class SessionCase {
     await this.createTopic(scope)
     const group = await this.group(scope, 'main')
     const expected = await this.produce(scope)
-    const { endpoint } = await this.leadership(scope)
+    const { endpoint, topicId } = await this.leadership(scope)
+    this.topicId = topicId
+    await this.deliveryLimits(scope)
 
     const member = new Member({
       kafka: this.kafka('A', { requestTimeout: REQUEST_TIMEOUT_MS }),
@@ -1289,6 +2187,7 @@ class SessionCase {
         return
       }
       dropped = fact
+      this.capture.freeze('lost-response', [fact.write])
       this.chaos
         .flatMap(({ sockets }) => sockets)
         .find(({ inner }) => inner === fact.ref.socket)
@@ -1302,7 +2201,7 @@ class SessionCase {
       delayMs: 50,
       label: 'The next fetch after the first hundred records',
     })
-    const startedHeld = member.entries.slice(member.finished).map(({ identity }) => identity)
+    const startedHeld = this.capture.faults[0].handlers.map(({ identity }) => identity)
     const carried = this.tap.decodeRequest(dropped)
     expect(carried.epoch).toBeGreaterThan(0)
     await pollUntil(scope, STEP_MS, () => this.tap.responseTo(dropped) !== undefined, {
@@ -1316,7 +2215,18 @@ class SessionCase {
       partitions.flatMap(({ acquiredRecords }) => acquiredRecords ?? [])
     )
     const droppedOffsets = offsetsOf(acquired)
-    expect(droppedOffsets.length).toBeGreaterThan(0)
+    expect(droppedOffsets).toEqual(
+      Array.from({ length: PREFIX }, (_, index) => String(PREFIX + index))
+    )
+    expect(member.entries.some(({ offset }) => droppedOffsets.includes(offset))).toBe(false)
+    expect(answer.responses).toHaveLength(1)
+    expect(answer.responses[0].topicId).toBe(topicId)
+    expect(answer.responses[0].partitions).toHaveLength(1)
+    expect(answer.responses[0].partitions[0]).toMatchObject({
+      partitionIndex: 0,
+      errorCode: 0,
+      acknowledgeErrorCode: 0,
+    })
     const droppedIdentities = droppedOffsets.map((offset) => expected[Number(offset)])
     this.row('frame', {
       swallowed: {
@@ -1340,7 +2250,7 @@ class SessionCase {
       startedHeldAtFault: startedHeld,
       acquiredNeverDelivered: droppedIdentities,
     })
-    const record = await this.awaitStart(scope, group)
+    const record = await this.awaitStart(scope, group, true)
     this.handlerExpected = expected
     this.handlers = { A: member.identities() }
     this.broker = [record]
@@ -1361,15 +2271,29 @@ class SessionCase {
    * @throws {Error} an oracle that does not hold
    */
   assertRecovery(member, { dropped, carried, droppedOffsets, droppedIdentities, closedAt }) {
+    const write = dropped.write
     const timedOut = member.timeouts.filter(
-      ({ apiName, correlationId }) =>
-        apiName === 'ShareFetch' && correlationId === dropped.correlationId
+      ({ apiName, correlationId, broker, sentAt }) =>
+        apiName === 'ShareFetch' &&
+        correlationId === dropped.correlationId &&
+        broker === `${dropped.host}:${dropped.port}` &&
+        sentAt === write.failure?.sentAt
     )
     expect(timedOut).toHaveLength(1)
+    expect(write.failure).toBeInstanceOf(KafkaJSRequestTimeoutError)
+    expect(timedOut[0].at - timedOut[0].sentAt).toBeGreaterThanOrEqual(REQUEST_TIMEOUT_MS)
     expect(dropped.ref.socket.destroyed).toBe(true)
     expect(closedAt).not.toBeNull()
-    const reset = member.resets.find(({ reason }) => reason === 'connection')
+    const reset = member.resets.find(
+      ({ reason, at }) => reason === 'connection' && at >= dropped.at
+    )
     expect(reset).toBeDefined()
+    const originalLoss = this.capture.losses.filter(
+      ({ loop, open, cause }) =>
+        loop === write.loop && open === write.open && cause === write.failure
+    )
+    expect(originalLoss).toHaveLength(1)
+    expect(originalLoss[0].reason).toBe('connection')
 
     const lost = offsetsOf(carried.acks)
     const outcomes = new Map()
@@ -1384,6 +2308,11 @@ class SessionCase {
     const later = this.tap
       .requestsOf('A', API_SHARE_FETCH)
       .filter(({ at, socket }) => at > dropped.at && socket !== dropped.socket)
+    expect(later.length).toBeGreaterThanOrEqual(2)
+    const replacement = later[0].write
+    expect(replacement.binding.pool).toBe(write.binding.pool)
+    expect(replacement.binding.generation).not.toBe(write.binding.generation)
+    expect(replacement.open).not.toBe(write.open)
     const [opening, next] = later.map((fact) => this.tap.decodeRequest(fact))
     expect(opening.epoch).toBe(0)
     expect(opening.acks).toEqual([])
@@ -1394,6 +2323,11 @@ class SessionCase {
     for (const fact of this.tap.frames) {
       if (fact.kind !== 'request' || fact.label !== 'A' || fact.at <= closedAt) continue
       if (![API_SHARE_FETCH, API_SHARE_ACKNOWLEDGE].includes(fact.apiKey)) continue
+      expect(
+        fact.write.prepared.some(({ ticket }) =>
+          write.prepared.some((old) => old.ticket === ticket)
+        )
+      ).toBe(false)
       for (const offset of offsetsOf(this.tap.decodeRequest(fact).acks)) {
         expect(redelivered.has(offset)).toBe(true)
       }
@@ -1406,7 +2340,16 @@ class SessionCase {
     for (const identity of droppedIdentities) expect(counts.get(identity)).toEqual([2])
     const firstSecond = member.entries.find(({ deliveryCount }) => deliveryCount === 2)
     expect(firstSecond.at - closedAt).toBeLessThanOrEqual(LOCK_MS + 2000)
+    this.recovery = {
+      socket: dropped.socket,
+      exchange: this.capture.id(write.exchange),
+      timeout: timedOut[0],
+      closedAt,
+      loss: this.capture.id(originalLoss[0]),
+      ...this.capture.stamp(),
+    }
     this.row('fault', {
+      recovery: this.recovery,
       timeoutEvent: timedOut[0].correlationId,
       closedAt,
       reset: { reason: reset.reason, recordsDropped: reset.recordsDropped },
@@ -1485,6 +2428,16 @@ class SessionCase {
       await schedule.catch(() => {})
     })
 
+    const moving = this.capture.writes.filter(
+      ({ loop, exchange }) =>
+        loop.groupId === group && loop.exchanges.has(exchange) && exchange.prepared.length > 0
+    )
+    const moveFault = this.capture.freeze('leader-move', moving)
+    expect(
+      moveFault.writes.flatMap(({ prepared }) =>
+        prepared.flatMap(({ ticket }) => decisionOffsets(ticket.acknowledgementBatches, 1))
+      )
+    ).toEqual([])
     moved.done = true
     await moveLeadership(scope, [this.topic, before.replicas, target])
     let after
@@ -1535,7 +2488,8 @@ class SessionCase {
     for (const { identity, deliveryCount } of member.entries) {
       counts.set(identity, [...(counts.get(identity) ?? []), deliveryCount])
     }
-    expect(counts.get(heldIdentity).length).toBeGreaterThanOrEqual(2)
+    expect(counts.get(heldIdentity)).toHaveLength(2)
+    expect(counts.get(heldIdentity)[1]).toBe(counts.get(heldIdentity)[0] + 1)
     for (const identity of expected.filter((id) => id !== heldIdentity)) {
       expect(counts.get(identity)).toHaveLength(1)
     }
@@ -1758,6 +2712,17 @@ class SessionCase {
    * @returns {void}
    */
   complete(before, after) {
+    if (this.action === 'timeout') {
+      expect(this.settlement.provisional).toEqual([])
+      expect(this.settlement.missing).toEqual([])
+      expect(this.settlement.successful.length + this.settlement.unknown.length).toBe(RECORDS)
+      const final = this.partitionSettlement(this.groups.main)
+      this.assertUnknownTerminal(final)
+      expect(final.successful).toEqual(this.settlement.successful)
+      expect(final.provisional).toEqual(this.settlement.unknown)
+      expect(this.quiet).toHaveLength(1)
+      expect(this.recovery).toBeDefined()
+    }
     const requests = Object.values(this.members).flatMap(({ requests: list }) => list)
     this.row('case-complete', {
       status: 'passed',
@@ -1866,5 +2831,610 @@ describe('share wire tap framing', () => {
     const negative = Buffer.alloc(4)
     negative.writeInt32BE(-1)
     expect(() => new FrameReader().push(negative)).toThrow('negative size')
+  })
+})
+
+/** Builds original-authority doubles with real ledger decisions and complete scripted frames.
+ * @returns {Promise<SessionCase>} Applied Accepts with a diagnostic answer and typed public unknowns.
+ */
+const scriptedSettlement = async () => {
+  const Encoder = require('../../../protocol/encoder')
+  const encodeFetch = require('../../../protocol/requests/shareFetch/v2/request')
+  const owner = Object.create(SessionCase.prototype)
+  Object.assign(owner, {
+    topic: 'records',
+    topicId: '12345678-1234-1234-1234-123456789abc',
+    action: 'timeout',
+    groups: { main: 'original-group' },
+    expected: [],
+    logEnd: '300',
+    limits: [{ nodeId: 1, limit: 5 }],
+    tap: { frames: [] },
+    recovery: { socket: 1, sequence: 1 },
+    admission: { sequence: 2 },
+  })
+  const capture = new SettlementCapture(owner)
+  owner.capture = capture
+  const records = Array.from({ length: RECORDS }, (_, index) => ({
+    offset: String(index),
+    key: Buffer.from(`key-${index}`),
+    value: Buffer.from(`value-${index}`),
+  }))
+  owner.expected = records.map((record) =>
+    shareRecordIdentity({ ...record, topic: owner.topic, partition: 0 })
+  )
+  owner.log = [...owner.expected]
+  const loop = { memberId: 'original-member', authority: { membershipToken: Symbol('membership') } }
+  const socket = {}
+  const binding = { connection: {}, generation: 1, pool: {} }
+  let correlationId = 0
+  /** @param {object[]} prepared Original ticket links. @param {object[]} acquiredRecords Scripted acquisitions. @returns {Promise<object>} Complete original exchange. */
+  const write = async (prepared, acquiredRecords) => {
+    const fields = shareFetchWire.readRequest(
+      (
+        await encodeFetch({
+          groupId: owner.groups.main,
+          memberId: loop.memberId,
+          shareSessionEpoch: ++correlationId,
+          maxRecords: PREFIX,
+          topics: [
+            {
+              topicId: owner.topicId,
+              partitions: [
+                {
+                  partitionIndex: 0,
+                  acknowledgementBatches: prepared[0]?.ticket.acknowledgementBatches ?? [],
+                },
+              ],
+            },
+          ],
+        }).encode()
+      ).buffer
+    )
+    const body = (await encodeFetch(fields).encode()).buffer
+    const header = new Encoder()
+      .writeInt16(78)
+      .writeInt16(2)
+      .writeInt32(correlationId)
+      .writeString('original-client')
+      .writeTaggedFields().buffer
+    const bytes = Buffer.concat([header, body])
+    const frame = new Encoder().writeInt32(bytes.length).writeBuffer(bytes).buffer
+    const fact = {
+      ...readRequestHeader(frame),
+      frame,
+      ref: { socket },
+      kind: 'request',
+      socket: 1,
+      host: 'broker',
+      port: 9092,
+      ...capture.stamp(),
+    }
+    const open = Symbol('open')
+    const exchange = {
+      open,
+      binding,
+      sentAt: fact.at,
+      descriptor: { epoch: fields.shareSessionEpoch },
+    }
+    const result = {
+      fields,
+      fact,
+      socket,
+      loop,
+      open,
+      binding,
+      exchange,
+      descriptor: exchange.descriptor,
+      prepared,
+      membership: loop.authority.membershipToken,
+      ...capture.stamp(),
+      answer: {
+        errorCode: 0,
+        responses: [
+          {
+            topicId: owner.topicId,
+            partitions: [
+              { partitionIndex: 0, errorCode: 0, acknowledgeErrorCode: 0, acquiredRecords },
+            ],
+          },
+        ],
+      },
+    }
+    result.response = { ...capture.stamp() }
+    fact.write = result
+    capture.writes.push(result)
+    owner.tap.frames.push(fact)
+    return result
+  }
+  owner.scriptedWrite = write
+  for (let first = 0; first < RECORDS; first += PREFIX) {
+    const selected = records.slice(first, first + PREFIX)
+    const source = await write(
+      [],
+      [
+        {
+          firstOffset: String(first),
+          lastOffset: String(first + PREFIX - 1),
+          deliveryCount: first === PREFIX ? 2 : 1,
+        },
+      ]
+    )
+    const token = Symbol('acquisition')
+    const walk = {
+      deliver: {
+        records: selected,
+        deliveryCounts: selected.map(() => (first === PREFIX ? 2 : 1)),
+      },
+      gaps: [],
+      release: [],
+      reject: [],
+    }
+    const ledger = new ShareAckLedger({
+      topic: owner.topic,
+      topicId: owner.topicId,
+      partition: 0,
+      token,
+      sentAt: 0,
+      lockDuration: LOCK_MS,
+      walk,
+    })
+    const cohort = { topic: owner.topic, topicId: owner.topicId, partition: 0, ledger, token, walk }
+    capture.acquisitions.push({ cohort, exchange: source.exchange, ...capture.stamp() })
+    for (const record of selected) {
+      capture.handlers.push({
+        cohort,
+        groupId: owner.groups.main,
+        identity: owner.expected[Number(record.offset)],
+        offset: record.offset,
+        deliveryCount: first === PREFIX ? 2 : 1,
+        ...capture.stamp(),
+      })
+    }
+    ledger.complete(
+      selected.map(({ offset }) => offset),
+      'accept'
+    )
+    for (const { offset } of selected)
+      capture.decisions.push({
+        ledger,
+        offset,
+        type: 'accept',
+        method: 'complete',
+        ...capture.stamp(),
+      })
+    const { ticket } = ledger.prepare({ token })
+    const prepared = { row: cohort, ledger, ticket }
+    const sent = await write(
+      [prepared],
+      first === 0 ? [{ firstOffset: '100', lastOffset: '199', deliveryCount: 1 }] : []
+    )
+    let results
+    if (first === 0) {
+      const fault = capture.freeze('lost-response', [sent])
+      sent.response = { ...capture.stamp() }
+      const cause = new KafkaJSRequestTimeoutError('ShareFetch timed out', {
+        broker: 'broker:9092',
+        correlationId: sent.fact.correlationId,
+        sentAt: sent.fact.at,
+      })
+      sent.failure = cause
+      capture.losses.push({
+        loop,
+        open: sent.open,
+        reason: 'connection',
+        cause,
+        ...capture.stamp(),
+      })
+      results = ledger.invalidate('session-lost', null, cause)
+      expect(ledger.invalidate('session-lost', null, cause)).toEqual([])
+      owner.scriptedFault = fault
+    } else results = ledger.settle(ticket, { token })
+    for (const result of results) {
+      const outcome = { cohort, result, groupId: owner.groups.main, ...capture.stamp() }
+      capture.outcomes.push(outcome)
+      capture.public.push({ outcome, payload: { ...result }, ...capture.stamp() })
+    }
+  }
+  const listing = () => [
+    {
+      topic: owner.topic,
+      topicId: owner.topicId,
+      partitions: [{ partition: 0, errorCode: 0, lag: '0', startOffset: '100', leaderEpoch: 1 }],
+    },
+  ]
+  owner.terminalBefore = { named: listing(), all: listing() }
+  owner.quiet = [
+    {
+      groupId: owner.groups.main,
+      delivered: [],
+      activeFetches: [{ at: 0 }, { at: 5000 }],
+      assignmentObservations: [
+        {
+          groupId: owner.groups.main,
+          snapshot: {
+            assignment: [{ topicId: owner.topicId, partitions: [0] }],
+          },
+        },
+      ],
+      position: { named: listing(), all: listing() },
+    },
+  ]
+  owner.quietObservations = [
+    { groupId: owner.groups.main, status: 'quiet', windowMs: 5000, delivered: [] },
+  ]
+  return owner
+}
+
+describe('written Accept settlement sensitivity', () => {
+  it('keeps diagnostic broker success separate from public unknown and admits only a provisional partition', async () => {
+    const owner = await scriptedSettlement()
+    const partition = owner.partitionSettlement(owner.groups.main)
+    expect(partition.successful).toHaveLength(200)
+    expect(partition.provisional).toHaveLength(100)
+    expect(partition.unknown).toEqual([])
+    expect(partition.missing).toEqual([])
+    const failed = owner.capture.outcomes.filter(({ result }) => result.error !== null)
+    expect(failed).toHaveLength(1)
+    expect(failed[0].result.error).toBeInstanceOf(KafkaJSShareAcknowledgementError)
+    expect(
+      owner.capture.outcomes
+        .filter(({ result }) => result.type === 'accept' && result.error === null)
+        .flatMap(({ result }) => offsetsOf([result]))
+    ).toHaveLength(200)
+    expect(
+      owner.capture.writes.find(({ failure }) => failure).answer.responses[0].partitions[0]
+        .acknowledgeErrorCode
+    ).toBe(0)
+    owner.archival = owner.excludeArchival(partition)
+    expect(() => owner.assertUnknownTerminal(partition)).not.toThrow()
+  })
+
+  it.each([
+    [
+      'plain error without the typed outcome',
+      (owner) => {
+        owner.capture.outcomes[0].result.error = { reason: 'session-lost' }
+      },
+    ],
+    [
+      'duplicate fault charge',
+      (owner) => {
+        owner.capture.faults.push(owner.scriptedFault)
+      },
+    ],
+    [
+      'recovery after settlement admission',
+      (owner) => {
+        owner.recovery.sequence = owner.admission.sequence + 1
+      },
+    ],
+    [
+      'lost prefix beyond the actual request bound',
+      (owner) => {
+        owner.scriptedFault.writes[0].prepared[0].ticket = {
+          isRenewAck: false,
+          acknowledgementBatches: [{ firstOffset: '0', lastOffset: '100', acknowledgeTypes: [1] }],
+        }
+      },
+    ],
+    [
+      'swallowed acquisition used as written Accepts',
+      (owner) => {
+        owner.scriptedFault.writes[0].prepared[0].ticket = {
+          isRenewAck: false,
+          acknowledgementBatches: [
+            { firstOffset: '100', lastOffset: '199', acknowledgeTypes: [1] },
+          ],
+        }
+      },
+    ],
+    [
+      'last-count-only archival exclusion',
+      async (owner) => {
+        for (let index = 0; index < 5; index++) {
+          const unanswered = await owner.scriptedWrite([], [])
+          unanswered.answer = undefined
+        }
+      },
+    ],
+    [
+      'foreign terminal UUID',
+      (owner) => {
+        owner.quiet[0].position.named[0].topicId = 'foreign'
+      },
+    ],
+    [
+      'terminal partition error',
+      (owner) => {
+        owner.quiet[0].position.named[0].partitions[0].errorCode = 6
+      },
+    ],
+    [
+      'no write',
+      (owner) => {
+        owner.scriptedFault.writes[0].exchange.sentAt = undefined
+      },
+    ],
+    [
+      'queued ticket',
+      (owner) => {
+        owner.scriptedFault.writes = []
+      },
+    ],
+    [
+      'held before decision',
+      (owner) => {
+        owner.capture.decisions = []
+      },
+    ],
+    [
+      'missing handler',
+      (owner) => {
+        owner.capture.handlers.shift()
+      },
+    ],
+    [
+      'missing typed outcome',
+      (owner) => {
+        owner.capture.outcomes.shift()
+      },
+    ],
+    [
+      'foreign group',
+      (owner) => {
+        owner.capture.handlers[0].groupId = 'foreign'
+      },
+    ],
+    [
+      'foreign UUID',
+      (owner) => {
+        owner.capture.handlers[0].cohort.topicId = 'foreign'
+      },
+    ],
+    [
+      'changed bytes',
+      (owner) => {
+        owner.capture.handlers[0].identity = 'changed'
+      },
+    ],
+    [
+      'replacement ticket',
+      (owner) => {
+        owner.scriptedFault.writes[0].prepared[0].ticket = { acknowledgementBatches: [] }
+      },
+    ],
+    [
+      'replacement cohort',
+      (owner) => {
+        owner.scriptedFault.writes[0].prepared[0].row = {}
+      },
+    ],
+    [
+      'wrong socket',
+      (owner) => {
+        owner.scriptedFault.writes[0].fact.ref.socket = {}
+      },
+    ],
+    [
+      'reused correlation',
+      (owner) => {
+        owner.scriptedFault.writes[0].fact.correlationId += 1
+      },
+    ],
+    [
+      'incomplete frame',
+      (owner) => {
+        owner.scriptedFault.writes[0].fact.frame = Buffer.alloc(0)
+      },
+    ],
+    [
+      'unrelated fault',
+      (owner) => {
+        owner.scriptedFault.kind = 'unrelated'
+      },
+    ],
+    [
+      'unrelated timeout',
+      (owner) => {
+        owner.scriptedFault.writes[0].failure = new KafkaJSRequestTimeoutError('other')
+      },
+    ],
+    [
+      'known rejection',
+      (owner) => {
+        owner.scriptedFault.writes[0].answer.responses[0].partitions[0].acknowledgeErrorCode = 6
+      },
+    ],
+    [
+      'duplicate public outcome',
+      (owner) => {
+        owner.capture.public.push({ ...owner.capture.public[0] })
+      },
+    ],
+    [
+      'duplicate compact outcome',
+      (owner) => {
+        owner.capture.outcomes.push({ ...owner.capture.outcomes[0] })
+      },
+    ],
+    [
+      'stale ticket resend',
+      (owner) => {
+        owner.capture.writes.push({ ...owner.scriptedFault.writes[0] })
+      },
+    ],
+    [
+      'unknown outside H',
+      (owner) => {
+        owner.scriptedFault.handlers.shift()
+      },
+    ],
+    [
+      'later workload entry',
+      (owner) => {
+        owner.capture.handlers.push({ ...owner.capture.handlers[0], ...owner.capture.stamp() })
+      },
+    ],
+    [
+      'missing recovery',
+      (owner) => {
+        owner.recovery = undefined
+      },
+    ],
+    [
+      'missing post-verifier T',
+      (owner) => {
+        owner.quiet[0].position = undefined
+      },
+    ],
+    [
+      'inactive verifier',
+      (owner) => {
+        owner.quiet[0].activeFetches = []
+      },
+    ],
+    [
+      'verifier delivery',
+      (owner) => {
+        owner.quiet[0].delivered = [owner.expected[0]]
+      },
+    ],
+    [
+      'archival exhaustion',
+      (owner) => {
+        owner.limits[0].limit = 1
+      },
+    ],
+    [
+      'changed raw corpus',
+      (owner) => {
+        owner.log.pop()
+      },
+    ],
+    [
+      'changed end',
+      (owner) => {
+        owner.logEnd = '301'
+      },
+    ],
+    [
+      'positive lag',
+      (owner) => {
+        owner.quiet[0].position.named[0].partitions[0].lag = '1'
+      },
+    ],
+    [
+      'null lag',
+      (owner) => {
+        owner.quiet[0].position.named[0].partitions[0].lag = null
+      },
+    ],
+    [
+      'missing lag',
+      (owner) => {
+        delete owner.quiet[0].position.named[0].partitions[0].lag
+      },
+    ],
+    [
+      'listing disagreement',
+      (owner) => {
+        owner.quiet[0].position.all[0].partitions[0].startOffset = '0'
+      },
+    ],
+    [
+      'invalid start',
+      (owner) => {
+        owner.quiet[0].position.named[0].partitions[0].startOffset = '-1'
+      },
+    ],
+    [
+      'missing partition',
+      (owner) => {
+        owner.quiet[0].position.named[0].partitions = []
+      },
+    ],
+  ])('rejects %s with the independent corpus and other evidence retained', async (name, mutate) => {
+    const owner = await scriptedSettlement()
+    await mutate(owner)
+    expect(() => {
+      const partition = owner.partitionSettlement(owner.groups.main)
+      expect(partition.missing).toEqual([])
+      owner.archival = owner.excludeArchival(partition)
+      owner.assertUnknownTerminal(partition)
+    }).toThrow()
+  })
+
+  it('cannot promote a written but unapplied Accept while the broker still has work', async () => {
+    const owner = await scriptedSettlement()
+    owner.scriptedFault.writes[0].answer = undefined
+    const partition = owner.partitionSettlement(owner.groups.main)
+    expect(partition.provisional).toHaveLength(100)
+    owner.archival = owner.excludeArchival(partition)
+    for (const position of [owner.terminalBefore, owner.quiet[0].position]) {
+      position.named[0].partitions[0].lag = '100'
+      position.all[0].partitions[0].lag = '100'
+    }
+    expect(() => owner.assertUnknownTerminal(partition)).toThrow()
+    expect(owner.capture.outcomes[0].result.error.reason).toBe('session-lost')
+  })
+
+  it.each(['renew', 'release', 'reject', 'gap'])(
+    'cannot replace a terminal Accept with %s',
+    async (type) => {
+      const owner = await scriptedSettlement()
+      owner.capture.outcomes[0].result.type = type
+      expect(owner.partitionSettlement(owner.groups.main).missing.length).toBeGreaterThan(0)
+    }
+  )
+
+  it.each(['not-sent', 'membership-lost', 'rejected-by-broker'])(
+    'rejects typed %s even with terminal evidence',
+    async (reason) => {
+      const owner = await scriptedSettlement()
+      owner.capture.outcomes[0].result.error.reason = reason
+      expect(owner.partitionSettlement(owner.groups.main).missing.length).toBeGreaterThan(0)
+    }
+  )
+
+  it('does not inherit the unknown exception in the held-only leader or normal arms', async () => {
+    const owner = await scriptedSettlement()
+    owner.scriptedFault.kind = 'leader-move'
+    expect(() => owner.partitionSettlement(owner.groups.main)).toThrow()
+    owner.members = {
+      A: {
+        groupId: owner.groups.main,
+        acks: owner.capture.outcomes.map(({ result }) => ({
+          ...result,
+          topic: owner.topic,
+          partition: 0,
+        })),
+      },
+    }
+    owner.sockets = {
+      acknowledgements: {
+        confirmed: () => new Set(Array.from({ length: RECORDS }, (_, index) => String(index))),
+      },
+    }
+    expect(owner.acceptedGroup(owner.groups.main)).toBe(false)
+  })
+
+  it('keeps fetch and acknowledgement errors independent', () => {
+    const cohort = { topicId: 'uuid', partition: 0 }
+    const write = {
+      fact: { apiKey: 78 },
+      answer: {
+        errorCode: 0,
+        responses: [
+          {
+            topicId: 'uuid',
+            partitions: [{ partitionIndex: 0, errorCode: 6, acknowledgeErrorCode: 0 }],
+          },
+        ],
+      },
+    }
+    expect(acknowledgementCode(write, cohort)).toBe(0)
+    write.fact.apiKey = 79
+    expect(acknowledgementCode(write, cohort)).toBe(6)
   })
 })

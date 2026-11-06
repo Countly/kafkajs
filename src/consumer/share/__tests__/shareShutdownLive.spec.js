@@ -28,6 +28,7 @@ const fetchWire = require('../../../../testHelpers/wire/shareFetchV2')
 const acknowledgeWire = require('../../../../testHelpers/wire/shareAcknowledgeV2')
 const {
   assertShareCleanup,
+  captureShareCleanupBaseline,
   createShareTopic,
   setShareGroupConfigs,
   shareRecordIdentity,
@@ -797,6 +798,7 @@ class ShutdownCase {
    */
   async setup(scope, title) {
     liveRun.assertClean()
+    this.baseline = await captureShareCleanupBaseline(this.probe, { signal: scope })
     const kafka = new Kafka({
       clientId: `e2e-p9e-shutdown-admin-${this.id}`,
       brokers: plainTextBrokers(),
@@ -835,9 +837,6 @@ class ShutdownCase {
     this.note(title, 'config-readback', { groupConfigs: configs })
     await bounded(scope, 10000, () => this.admin.listGroups())
     this.ledgers.install()
-    this.baseline = await bounded(scope, 10000, () =>
-      bounded(scope, 10000, () => this.probe.snapshot())
-    )
     this.note(title, 'resource-baseline', { snapshot: this.baseline })
   }
 
@@ -1181,6 +1180,7 @@ class ShutdownCase {
         this.probe,
         {
           signal,
+          disconnectAdmin: true,
         }
       ),
     }
