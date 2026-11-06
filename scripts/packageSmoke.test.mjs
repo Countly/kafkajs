@@ -255,3 +255,26 @@ test('the compact acknowledgement error has one constructor in both packed entry
     { firstOffset: '9007199254740993', lastOffset: '9223372036854775807' },
   ])
 })
+
+test('the share consumer is additive in CommonJS and ESM', async () => {
+  const cjs = require(PKG)
+  const esm = await import(PKG)
+  const kafka = new cjs.Kafka({ brokers: [] })
+  const share = kafka.shareConsumer({ groupId: 'pack-share' })
+  assert.equal(typeof esm.Kafka.prototype.shareConsumer, 'function')
+  assert.equal(typeof share.connect, 'function')
+  assert.equal(typeof share.disconnect, 'function')
+  assert.equal(typeof share.run, 'function')
+  assert.equal(typeof share.on, 'function')
+  assert.deepEqual(share.subscription(), [])
+  assert.deepEqual(share.assignment(), [])
+  assert.equal(share.acquisitionLockTimeoutMs(), null)
+  assert.equal(Object.keys(share.events).length, 18)
+  assert.throws(
+    () => kafka.shareConsumer({ groupId: 'pack-share', readUncommitted: true }),
+    cjs.KafkaJSInvalidConfigurationError
+  )
+  assert.throws(() => require(`${PKG}/src/consumer/share`), {
+    code: 'ERR_PACKAGE_PATH_NOT_EXPORTED',
+  })
+})

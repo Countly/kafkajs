@@ -197,3 +197,219 @@ describe('deterministic acquisition locks', () => {
     )
   )
 })
+
+describe('public share renewal contract', () => {
+  const {
+    acquire,
+    ackAnswer,
+    deferred,
+    fetchAnswer,
+    flush,
+    shareClient,
+    until,
+  } = require('../../../../testHelpers/shareHarness')
+  let h
+  let skew
+  const real = performance.now.bind(performance)
+  beforeEach(() => {
+    skew = 0
+    jest.spyOn(performance, 'now').mockImplementation(() => real() + skew)
+  })
+  afterEach(async () => {
+    await h?.close()
+    h = undefined
+    jest.restoreAllMocks()
+  })
+  /** @param {object} [options] `shareClient` options. @returns {Promise<object>} A subscribed client. */
+  const start = async (options) => {
+    h = shareClient(options)
+    h.events = { acks: [], locks: [] }
+    h.consumer.on(h.consumer.events.ACKNOWLEDGE, ({ payload }) => h.events.acks.push(payload))
+    h.consumer.on(h.consumer.events.LOCK_EXPIRED, ({ payload }) => h.events.locks.push(payload))
+    await h.consumer.subscribe({ topics: ['topic-a'] })
+    return h
+  }
+  const lock = (ms, values) =>
+    fetchAnswer([acquire(0, 0, values)], { acquisitionLockTimeoutMs: ms })
+
+  test('starts just before a deadline and drops at the deadline', async () => {
+    await start()
+    h.script('ShareFetch', [lock(1000, ['a', 'b'])])
+    const gate = deferred()
+    const handled = []
+    await h.consumer.run({
+      eachMessage: async ({ message }) => {
+        handled.push(message.offset)
+        await gate.promise
+      },
+    })
+    await until(() => handled.length === 1, 'the first handler')
+    skew = 5000
+    gate.resolve()
+    await until(() => h.events.locks.some(({ stage }) => stage === 'before-handler'), 'the drop')
+    await flush()
+    expect(handled).toEqual(['0'])
+    expect(h.events.locks.find(({ stage }) => stage === 'before-handler')).toEqual({
+      topic: 'topic-a',
+      partition: 0,
+      offsets: ['1'],
+      stage: 'before-handler',
+    })
+    await until(
+      () =>
+        h
+          .frames(78)
+          .some(({ fields }) =>
+            fields.topics.some((t) => t.partitions.some((p) => p.acknowledgementBatches.length))
+          ),
+      'the acknowledgement of the started record'
+    )
+    const sent = h
+      .frames(78)
+      .flatMap(({ fields }) =>
+        fields.topics.flatMap((t) => t.partitions.flatMap((p) => p.acknowledgementBatches))
+      )
+    expect(sent).toEqual([{ firstOffset: '0', lastOffset: '0', acknowledgeTypes: [1] }])
+  })
+
+  test('still sends a current handler decision after the lock deadline', async () => {
+    await start()
+    h.script('ShareFetch', [lock(1000, ['a'])])
+    await h.consumer.run({
+      eachMessage: async () => {
+        skew = 5000
+      },
+    })
+    await until(() => h.events.locks.length === 1, 'the late return event')
+    expect(h.events.locks[0]).toEqual({
+      topic: 'topic-a',
+      partition: 0,
+      offsets: ['0'],
+      stage: 'after-handler',
+    })
+    await until(() => h.events.acks.length === 1, 'the settled acknowledgement')
+    expect(h.events.acks[0]).toMatchObject({ type: 'accept', error: null })
+  })
+
+  test.each([
+    [400, 0],
+    [600, 1],
+  ])(
+    'flushes at handler boundaries below half the remaining duration (+%p ms, %p frames)',
+    async (jump, frames) => {
+      await start()
+      h.script('ShareFetch', [lock(1000, ['a', 'b'])])
+      const second = deferred()
+      let calls = 0
+      await h.consumer.run({
+        eachMessage: async () => {
+          calls++
+          if (calls === 1) skew = jump
+          else await second.promise
+        },
+      })
+      await until(() => calls === 2, 'the second handler')
+      await flush()
+      expect(h.frames(79)).toHaveLength(frames)
+      if (frames) {
+        expect(h.frames(79)[0].fields.topics[0].partitions[0].acknowledgementBatches).toEqual([
+          { firstOffset: '0', lastOffset: '0', acknowledgeTypes: [1] },
+        ])
+      }
+      second.resolve()
+    }
+  )
+
+  test('renews only the selected subset through the session queue', async () => {
+    await start()
+    h.script('ShareFetch', [lock(1000, ['a', 'b', 'c'])])
+    h.script('ShareAcknowledge', [
+      ackAnswer([{ partition: 0 }], { acquisitionLockTimeoutMs: 2000 }),
+    ])
+    const durations = []
+    await h.consumer.run({
+      eachBatch: async ({ batch, renew }) => {
+        durations.push(await renew([batch.messages[0], { offset: '2' }]))
+      },
+    })
+    await until(() => durations.length === 1, 'the renewal')
+    expect(durations).toEqual([2000])
+    const [renewal] = h.frames(79)
+    expect(renewal.fields.isRenewAck).toBe(true)
+    expect(renewal.fields.topics[0].partitions[0].acknowledgementBatches).toEqual([
+      { firstOffset: '0', lastOffset: '0', acknowledgeTypes: [4] },
+      { firstOffset: '2', lastOffset: '2', acknowledgeTypes: [4] },
+    ])
+    expect(h.consumer.acquisitionLockTimeoutMs()).toBe(2000)
+    const renewed = h.events.acks.filter(({ type }) => type === 'renew')
+    expect(renewed.map(({ firstOffset, lastOffset }) => [firstOffset, lastOffset])).toEqual([
+      ['0', '0'],
+      ['2', '2'],
+    ])
+    expect(renewed.every(({ error }) => error === null)).toBe(true)
+  })
+
+  test('leaves every deadline unchanged after a renewal refusal', async () => {
+    await start()
+    h.script('ShareFetch', [lock(1000, ['a'])])
+    h.script('ShareAcknowledge', [ackAnswer([{ partition: 0, code: 121 }])])
+    const failures = []
+    await h.consumer.run({
+      eachMessage: async ({ renew }) => {
+        await renew().catch((error) => failures.push(error))
+      },
+    })
+    await until(() => failures.length === 1, 'the refused renewal')
+    expect(failures[0]).toMatchObject({
+      name: 'KafkaJSShareAcknowledgementError',
+      reason: 'rejected-by-broker',
+      ranges: [{ firstOffset: '0', lastOffset: '0' }],
+    })
+    const renewed = h.events.acks.filter(({ type }) => type === 'renew')
+    expect(renewed).toHaveLength(1)
+    expect(renewed[0].error).toBe(failures[0])
+    expect(h.consumer.acquisitionLockTimeoutMs()).toBe(1000)
+  })
+
+  test('keeps successful renewals nonterminal', async () => {
+    await start()
+    h.script('ShareFetch', [lock(1000, ['a'])])
+    h.script('ShareAcknowledge', [
+      ackAnswer([{ partition: 0 }], { acquisitionLockTimeoutMs: 2000 }),
+      ackAnswer([{ partition: 0 }], { acquisitionLockTimeoutMs: 3000 }),
+    ])
+    const seen = []
+    await h.consumer.run({
+      eachMessage: async ({ message, renew }) => {
+        seen.push(await renew(), await renew(), message.deliveryCount)
+      },
+    })
+    await until(() => seen.length === 3, 'two renewals')
+    expect(seen).toEqual([2000, 3000, 1])
+    await until(() => h.events.acks.some(({ type }) => type === 'accept'), 'the terminal accept')
+    expect(h.events.acks.filter(({ type }) => type === 'renew')).toHaveLength(2)
+    expect(h.events.acks.filter(({ type }) => type === 'accept')).toHaveLength(1)
+  })
+
+  test('rejects invalid batch renewal selectors without traffic', async () => {
+    await start()
+    h.script('ShareFetch', [lock(1000, ['a', 'b'])])
+    const outcomes = []
+    await h.consumer.run({
+      eachBatch: async ({ batch, renew }) => {
+        const [first] = batch.messages
+        for (const selector of [[], null, 'a', [first, first], [{ ...first }], [{ offset: '9' }]]) {
+          try {
+            await renew(selector)
+            outcomes.push('accepted')
+          } catch (error) {
+            outcomes.push(error.name)
+          }
+        }
+      },
+    })
+    await until(() => outcomes.length === 6, 'six selector checks')
+    expect(outcomes).toEqual(Array(6).fill('KafkaJSNonRetriableError'))
+    expect(h.frames(79).filter(({ fields }) => fields.isRenewAck)).toHaveLength(0)
+  })
+})

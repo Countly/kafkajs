@@ -10,6 +10,7 @@ export class Kafka {
   constructor(config: KafkaConfig)
   producer(config?: ProducerConfig): Producer
   consumer(config: ConsumerConfig | DirectConsumerConfig): Consumer
+  shareConsumer(config: ShareConsumerConfig): ShareConsumer
   admin(config?: AdminConfig): Admin
   logger(): Logger
 }
@@ -2496,6 +2497,289 @@ export type Consumer = {
   ): RemoveInstrumentationEventListener<typeof eventName>
   logger(): Logger
   readonly events: ConsumerEvents
+}
+
+/** `implicit`: a handler that returns accepts what it did not acknowledge. `explicit`: it must acknowledge every message. */
+export type ShareAcknowledgementMode = 'implicit' | 'explicit'
+
+/** How many records the broker may acquire for one fetch: at most `maxRecords`, or whole batches (which may exceed it). */
+export type ShareAcquireMode = 'batch_optimized' | 'record_limit'
+
+/** `accept`: done. `release`: deliver again, to anyone. `reject`: never deliver again. */
+export type ShareAcknowledgeType = 'accept' | 'release' | 'reject'
+
+export interface ShareConsumerConfig {
+  groupId: string
+  /** Default `'implicit'`. */
+  acknowledgementMode?: ShareAcknowledgementMode
+  /** Default `'record_limit'`: a record the broker acquired and nobody started still spends one of its delivery attempts. */
+  acquireMode?: ShareAcquireMode
+  /** Most records one fetch may acquire, an integer from 1 to 2147483647. Default 500. */
+  maxRecords?: number
+  /** Default 1. */
+  minBytes?: number
+  /** A response target, not a memory ceiling. Default 10485760. */
+  maxBytes?: number
+  /** How long a fetch waits for records, from 0 to 2147483647 ms. Default 500. */
+  maxWaitTimeInMs?: number
+  metadataMaxAge?: number
+  /** The longest a handler may run before the member leaves the group, in ms. Default 300000. */
+  maxPollInterval?: number
+  rackId?: string
+  retry?: RetryOptions & { restartOnFailure?: (err: Error) => Promise<boolean> }
+  allowAutoTopicCreation?: boolean
+  maxInFlightRequests?: number | null
+  /** Default `true`. On checksum failure, preserve the valid prefix, release the undecoded acquired remainder and report the error. */
+  checkCrcs?: boolean
+  /** Not accepted: a share group has no client-side offsets, assigners, sessions or isolation. */
+  fromBeginning?: never
+  readUncommitted?: never
+  groupInstanceId?: never
+  partitionAssigners?: never
+  sessionTimeout?: never
+  rebalanceTimeout?: never
+  heartbeatInterval?: never
+  groupProtocol?: never
+  groupRemoteAssignor?: never
+  maxBytesPerPartition?: never
+  maxPrefetchBatches?: never
+}
+
+/** A delivered record: the usual record fields plus how many times the broker has handed it out. */
+export interface ShareMessage {
+  key: Buffer | null
+  value: Buffer | null
+  timestamp: string
+  attributes: number
+  offset: string
+  headers: IHeaders
+  /** 1 on the first delivery; a release or an expired lock makes the next one 2, and so on. */
+  deliveryCount: number
+}
+
+export interface ShareBatch {
+  topic: string
+  partition: number
+  messages: ShareMessage[]
+  /** How long the broker holds these records for this member after the fetch, in ms. */
+  acquisitionLockTimeoutMs: number
+}
+
+export interface EachShareMessagePayload {
+  topic: string
+  partition: number
+  message: ShareMessage
+  /** The last call before the handler returns decides; a call after it returned throws. Without a type: `'accept'`. */
+  acknowledge(type?: ShareAcknowledgeType): void
+  /** Extends the lock; resolves with the lock duration the broker applied, in ms. Needs Kafka 4.2+. */
+  renew(): Promise<number>
+  isRunning(): boolean
+}
+
+export interface EachShareBatchPayload {
+  batch: ShareBatch
+  /** The last call per message before the handler returns decides; a message of another batch throws. */
+  acknowledge(message: ShareMessage | { offset: string }, type?: ShareAcknowledgeType): void
+  renew(messages?: Array<ShareMessage | { offset: string }>): Promise<number>
+  isRunning(): boolean
+}
+
+export type EachShareMessageHandler = (payload: EachShareMessagePayload) => Promise<void>
+export type EachShareBatchHandler = (payload: EachShareBatchPayload) => Promise<void>
+
+/** Exactly one of the two handlers. */
+export type ShareConsumerRunConfig = {
+  eachMessage?: EachShareMessageHandler
+  eachBatch?: EachShareBatchHandler
+}
+
+export type ShareSubscribeTopics = {
+  topics: string[]
+  topic?: never
+  regex?: never
+  fromBeginning?: never
+  offsetReset?: never
+}
+
+export type ShareConsumerEvents = {
+  HEARTBEAT: 'share_consumer.heartbeat'
+  GROUP_JOIN: 'share_consumer.group_join'
+  ASSIGNMENT_CHANGED: 'share_consumer.assignment_changed'
+  FETCH: 'share_consumer.fetch'
+  ACKNOWLEDGE: 'share_consumer.acknowledge'
+  SESSION_RESET: 'share_consumer.session_reset'
+  LOCK_EXPIRED: 'share_consumer.lock_expired'
+  HANDLER_ERROR: 'share_consumer.handler_error'
+  CONNECT: 'share_consumer.connect'
+  DISCONNECT: 'share_consumer.disconnect'
+  STOP: 'share_consumer.stop'
+  CRASH: 'share_consumer.crash'
+  REQUEST: 'share_consumer.network.request'
+  REQUEST_TIMEOUT: 'share_consumer.network.request_timeout'
+  REQUEST_QUEUE_SIZE: 'share_consumer.network.request_queue_size'
+  AUTHENTICATION_FAILURE: 'share_consumer.network.authentication_failure'
+  TOPIC_RECREATED: 'share_consumer.cluster.topic_recreated'
+  REBOOTSTRAP: 'share_consumer.cluster.rebootstrap'
+}
+
+export type ShareConsumerHeartbeatEvent = InstrumentationEvent<{
+  groupId: string
+  memberId: string
+  memberEpoch: number
+  heartbeatIntervalMs: number
+}>
+export type ShareConsumerGroupJoinEvent = InstrumentationEvent<{
+  groupId: string
+  memberId: string
+  memberEpoch: number
+}>
+export type ShareConsumerAssignmentChangedEvent = InstrumentationEvent<{
+  groupId: string
+  memberId: string
+  memberEpoch: number
+  assignment: TopicPartitions[]
+  added: TopicPartitions[]
+  removed: TopicPartitions[]
+}>
+export type ShareConsumerFetchEvent = InstrumentationEvent<{
+  nodeId: number
+  sessionEpoch: number
+  /** Acquired records handed to handlers, gaps and corrupt batches excluded. */
+  numberOfRecords: number
+  numberOfGaps: number
+  acknowledgementsPiggybacked: number
+  duration: number
+}>
+export type ShareConsumerAcknowledgeEvent = InstrumentationEvent<{
+  topic: string
+  partition: number
+  /** Inclusive exact INT64 range. Terminal offsets settle once; renew results are nonterminal. */
+  firstOffset: string
+  lastOffset: string
+  type: ShareAcknowledgeType | 'renew' | 'gap'
+  /** `null` when the broker accepted it; otherwise failure or loss of confirmation, with remote outcome possibly unknown. */
+  error: KafkaJSShareAcknowledgementError | null
+}>
+export type ShareConsumerSessionResetEvent = InstrumentationEvent<{
+  nodeId: number
+  reason: 'session-not-found' | 'invalid-epoch' | 'session-limit' | 'connection' | 'leader-moved' | 'membership'
+  recordsDropped: number
+}>
+export type ShareConsumerLockExpiredEvent = InstrumentationEvent<{
+  topic: string
+  partition: number
+  offsets: string[]
+  stage: 'before-handler' | 'after-handler'
+}>
+export type ShareConsumerHandlerErrorEvent = InstrumentationEvent<{
+  topic: string
+  partition: number
+  offsets: string[]
+  error: Error
+}>
+export type ShareConsumerCrashEvent = InstrumentationEvent<{
+  error: Error
+  groupId: string
+  restart: boolean
+}>
+
+export type ShareConsumer = {
+  /** Rejects with `KafkaJSShareGroupsNotSupportedError` when the cluster cannot run share groups. */
+  connect(): Promise<void>
+  /**
+   * `timeout` bounds the whole shutdown, in ms (an integer from 0 to 2147483647); an argument
+   * that is not an options object is ignored, so `process.on('SIGTERM', consumer.disconnect)`
+   * compiles. The signature without parameters comes last so `Parameters<ShareConsumer['disconnect']>` is `[]`.
+   */
+  disconnect(options?: { timeout?: number }): Promise<void>
+  disconnect(): Promise<void>
+  /** Replaces the subscription; only before `run()`. */
+  subscribe(subscription: ShareSubscribeTopics): Promise<void>
+  subscription(): string[]
+  /** What the broker has assigned this member now; `[]` before the first join and after `stop()`. */
+  assignment(): TopicPartitions[]
+  run(config: ShareConsumerRunConfig): Promise<void>
+  stop(): Promise<void>
+  /** The lock duration of the latest fetch, in ms; `null` before the first one. */
+  acquisitionLockTimeoutMs(): number | null
+  on(
+    eventName: ShareConsumerEvents['HEARTBEAT'],
+    listener: (event: ShareConsumerHeartbeatEvent) => void
+  ): RemoveInstrumentationEventListener<typeof eventName>
+  on(
+    eventName: ShareConsumerEvents['GROUP_JOIN'],
+    listener: (event: ShareConsumerGroupJoinEvent) => void
+  ): RemoveInstrumentationEventListener<typeof eventName>
+  on(
+    eventName: ShareConsumerEvents['ASSIGNMENT_CHANGED'],
+    listener: (event: ShareConsumerAssignmentChangedEvent) => void
+  ): RemoveInstrumentationEventListener<typeof eventName>
+  on(
+    eventName: ShareConsumerEvents['FETCH'],
+    listener: (event: ShareConsumerFetchEvent) => void
+  ): RemoveInstrumentationEventListener<typeof eventName>
+  on(
+    eventName: ShareConsumerEvents['ACKNOWLEDGE'],
+    listener: (event: ShareConsumerAcknowledgeEvent) => void
+  ): RemoveInstrumentationEventListener<typeof eventName>
+  on(
+    eventName: ShareConsumerEvents['SESSION_RESET'],
+    listener: (event: ShareConsumerSessionResetEvent) => void
+  ): RemoveInstrumentationEventListener<typeof eventName>
+  on(
+    eventName: ShareConsumerEvents['LOCK_EXPIRED'],
+    listener: (event: ShareConsumerLockExpiredEvent) => void
+  ): RemoveInstrumentationEventListener<typeof eventName>
+  on(
+    eventName: ShareConsumerEvents['HANDLER_ERROR'],
+    listener: (event: ShareConsumerHandlerErrorEvent) => void
+  ): RemoveInstrumentationEventListener<typeof eventName>
+  on(
+    eventName: ShareConsumerEvents['CONNECT'],
+    listener: (event: ConnectEvent) => void
+  ): RemoveInstrumentationEventListener<typeof eventName>
+  on(
+    eventName: ShareConsumerEvents['DISCONNECT'],
+    listener: (event: DisconnectEvent) => void
+  ): RemoveInstrumentationEventListener<typeof eventName>
+  on(
+    eventName: ShareConsumerEvents['STOP'],
+    listener: (event: InstrumentationEvent<null>) => void
+  ): RemoveInstrumentationEventListener<typeof eventName>
+  on(
+    eventName: ShareConsumerEvents['CRASH'],
+    listener: (event: ShareConsumerCrashEvent) => void
+  ): RemoveInstrumentationEventListener<typeof eventName>
+  on(
+    eventName: ShareConsumerEvents['REQUEST'],
+    listener: (event: RequestEvent) => void
+  ): RemoveInstrumentationEventListener<typeof eventName>
+  on(
+    eventName: ShareConsumerEvents['REQUEST_TIMEOUT'],
+    listener: (event: RequestTimeoutEvent) => void
+  ): RemoveInstrumentationEventListener<typeof eventName>
+  on(
+    eventName: ShareConsumerEvents['REQUEST_QUEUE_SIZE'],
+    listener: (event: RequestQueueSizeEvent) => void
+  ): RemoveInstrumentationEventListener<typeof eventName>
+  on(
+    eventName: ShareConsumerEvents['AUTHENTICATION_FAILURE'],
+    listener: (event: AuthenticationFailureEvent) => void
+  ): RemoveInstrumentationEventListener<typeof eventName>
+  on(
+    eventName: ShareConsumerEvents['TOPIC_RECREATED'],
+    listener: (event: TopicRecreatedEvent) => void
+  ): RemoveInstrumentationEventListener<typeof eventName>
+  on(
+    eventName: ShareConsumerEvents['REBOOTSTRAP'],
+    listener: (event: RebootstrapEvent) => void
+  ): RemoveInstrumentationEventListener<typeof eventName>
+  on(
+    eventName: ValueOf<ShareConsumerEvents>,
+    listener: (event: InstrumentationEvent<any>) => void
+  ): RemoveInstrumentationEventListener<typeof eventName>
+  logger(): Logger
+  readonly events: ShareConsumerEvents
 }
 
 export enum CompressionTypes {

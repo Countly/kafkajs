@@ -448,6 +448,10 @@ Share-group membership applies topic-ID assignments immediately and resolves unk
 
 Acknowledgement errors carry compact firstOffset/lastOffset ranges. A failed or unanswered mutation is not confirmed accepted and is never resent.
 
+Share groups (Kafka 4.2+): use kafka.shareConsumer and run with eachMessage or eachBatch. Share delivery has no ordering across consumers. Share isolation defaults to read_uncommitted, unlike consumer's read_committed; set share.isolation.level=read_committed on the GROUP resource and wait for describeConfigs readback before joining. An open transaction blocks a read_committed group's delivery. No seek, commit, pause, resume, regex or static membership is offered. record_limit bounds maxRecords per node; batch_optimized may exceed it. Size maxRecords × handler time below the lock duration and use renew for long handlers. Releases at the delivery limit archive records. disconnect({ timeout: 0 }) sends no final traffic; failed or lost closing results remain unknown. Hand-written Kafka/Admin test doubles need the added members.
+
+The readUncommitted option is rejected; configure share.isolation.level for the GROUP resource.
+
 - **Unsubscribed-topic instrumentation is classic-only.** With `groupProtocol: 'consumer'`, assignments outside the round subscription are still filtered, but no longer emit `RECEIVED_UNSUBSCRIBED_TOPICS` or its warning. *What to do:* update event-count assertions and monitoring that expect this signal under the consumer protocol; debug logs record the filtered names. Classic consumers keep the event and warning.
 
 - **An uncommitted offset has null metadata.** `consumer.committed()` now returns `metadata: null` whenever `offset` is null; committed offsets still preserve stored metadata, including the empty string. *What to do:* use `offset === null` to detect the absence of a commit and update assertions that expected empty or synthetic metadata there.

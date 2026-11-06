@@ -365,3 +365,68 @@ async function shareAdminTypes(admin: ShareAdmin) {
   await admin.describeShareGroups(['share'], { apiTimeout: '1000' })
   return { mask, lag, changed, deleted }
 }
+
+import * as ShareSurface from '@countly/kafkajs'
+
+namespace ShareConsumerSurface {
+  const kafka = new ShareSurface.Kafka({ brokers: [] })
+  const share = kafka.shareConsumer({ groupId: 'g' })
+  const full = kafka.shareConsumer({ groupId: 'g', acknowledgementMode: 'explicit', acquireMode: 'batch_optimized', maxRecords: 500, minBytes: 0, maxBytes: 10485760, maxWaitTimeInMs: 0, metadataMaxAge: 300000, maxPollInterval: 300000, rackId: '', checkCrcs: true, allowAutoTopicCreation: false, maxInFlightRequests: null, retry: { retries: 5, restartOnFailure: async (error) => error instanceof Error } })
+  share.run({ eachMessage: async ({ topic, partition, message, acknowledge, renew, isRunning }) => {
+    const count: number = message.deliveryCount; const offset: string = message.offset
+    const value: Buffer | null = message.value; const key: Buffer | null = message.key
+    acknowledge(); acknowledge('release'); const duration: number = await renew()
+    const running: boolean = isRunning(); void [topic, partition, count, offset, value, key, duration, running]
+  } })
+  full.run({ eachBatch: async ({ batch, acknowledge, renew, isRunning }) => {
+    acknowledge(batch.messages[0], 'reject'); acknowledge({ offset: batch.messages[0].offset })
+    const duration: number = await renew([batch.messages[0], { offset: batch.messages[0].offset }])
+    await renew(); const running: boolean = isRunning(); void [duration, running, batch.acquisitionLockTimeoutMs]
+  } })
+  share.on(share.events.ACKNOWLEDGE, ({ payload }) => {
+    const first: string = payload.firstOffset; const last: string = payload.lastOffset
+    const error: ShareSurface.KafkaJSShareAcknowledgementError | null = payload.error; void [first, last, error]
+  })
+  share.on(share.events.REQUEST, ({ payload }) => { void payload })
+  const event: ShareSurface.ShareConsumerEvents[keyof ShareSurface.ShareConsumerEvents] = share.events.FETCH
+  share.on(event, (record) => { void record.type })
+  process.on('SIGTERM', share.disconnect)
+  const parameters: Parameters<ShareSurface.ShareConsumer['disconnect']> = []
+  const duration: number | null = share.acquisitionLockTimeoutMs()
+  void [parameters, duration, share.subscription(), share.assignment(), share.logger(), share.stop(), share.disconnect({ timeout: 0 })]
+  const admin = kafka.admin()
+  void [admin.describeShareGroups(['g']), admin.listShareGroupOffsets({ groupId: 'g' }), admin.alterShareGroupOffsets({ groupId: 'g', topics: [{ topic: 't', partitions: [{ partition: 0, offset: '9007199254740993' }] }] }), admin.deleteShareGroupOffsets({ groupId: 'g', topics: ['t'] }), admin.deleteGroups(['g'])]
+  const error: Error = new ShareSurface.KafkaJSShareGroupsNotSupportedError('unsupported', { apiKey: 78, apiName: 'shareFetch', reason: 'api-version-range' })
+  if (error instanceof ShareSurface.KafkaJSShareGroupsNotSupportedError) {
+    const base: ShareSurface.KafkaJSServerDoesNotSupportApiKey = error; void [base, error.reason]
+  }
+  // @ts-expect-error Group isolation is configured on the broker.
+  kafka.shareConsumer({ groupId: 'g', readUncommitted: true })
+  // @ts-expect-error Offset reset is configured on the broker.
+  kafka.shareConsumer({ groupId: 'g', fromBeginning: true })
+  // @ts-expect-error Share groups have no static membership.
+  kafka.shareConsumer({ groupId: 'g', groupInstanceId: 'member' })
+  // @ts-expect-error Only implicit and explicit modes exist.
+  kafka.shareConsumer({ groupId: 'g', acknowledgementMode: 'manual' })
+  // @ts-expect-error Only the two documented acquisition modes exist.
+  kafka.shareConsumer({ groupId: 'g', acquireMode: 'strict' })
+  // @ts-expect-error A group id is required.
+  kafka.shareConsumer({})
+  // @ts-expect-error Topics are strings.
+  share.subscribe({ topics: [/topic/] })
+  // @ts-expect-error Regex subscription is unavailable.
+  share.subscribe({ topics: ['t'], regex: /topic/ })
+  // @ts-expect-error Offset reset is a group configuration.
+  share.subscribe({ topics: ['t'], offsetReset: 'earliest' })
+  // @ts-expect-error Renew is a separate operation.
+  const terminalType: ShareSurface.ShareAcknowledgeType = 'renew'
+  // @ts-expect-error Numeric disconnect arguments are accepted only at runtime for signals.
+  share.disconnect(5)
+  // @ts-expect-error A handler receives the share payload.
+  share.run({ eachMessage: async (payload: string) => { void payload } })
+  // @ts-expect-error Only share event names are accepted.
+  share.on('share_consumer.missing', () => {})
+  // @ts-expect-error Lock duration is a number or null.
+  const stringDuration: string = share.acquisitionLockTimeoutMs()
+  void [terminalType, stringDuration]
+}

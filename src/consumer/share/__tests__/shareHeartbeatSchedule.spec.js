@@ -271,3 +271,95 @@ describe('share heartbeat scheduling', () => {
     expect(f.broker.shareGroupHeartbeat).toHaveBeenCalledTimes(2)
   })
 })
+
+describe('public parallel share handlers', () => {
+  const {
+    A,
+    acquire,
+    echo,
+    fetchAnswer,
+    shareClient,
+    until,
+  } = require('../../../../testHelpers/shareHarness')
+  let h
+  afterEach(async () => {
+    await h?.close()
+    h = undefined
+  })
+  const TWO_NODES = {
+    'topic-a': {
+      topicId: A,
+      partitions: [
+        { leader: 0, epoch: 1 },
+        { leader: 1, epoch: 1 },
+      ],
+    },
+  }
+  /** @returns {object[]} The leave frames (ShareGroupHeartbeat at epoch -1). */
+  const leaves = () => h.frames(76).filter(({ fields }) => fields.memberEpoch === -1)
+  /** @param {number} ms Real milliseconds. @returns {Promise<void>} */
+  const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+  test('expires the oldest active node handler while another progresses', async () => {
+    h = shareClient({ nodes: 2, topics: TWO_NODES, share: { maxPollInterval: 300 } })
+    let held = false
+    let next = 0
+    h.cluster.answer('ShareFetch', async (fields, call) => {
+      if (call.node === 0 && !held) {
+        held = true
+        return fetchAnswer([acquire(0, 0, ['a'])])
+      }
+      if (call.node === 1) {
+        await wait(30)
+        return fetchAnswer([acquire(1, next++, ['b'])])
+      }
+      return echo('ShareFetch', fields)
+    })
+    await h.consumer.subscribe({ topics: ['topic-a'] })
+    const handled = { a: 0, b: 0 }
+    await h.consumer.run({
+      eachMessage: async ({ message, partition }) => {
+        if (partition === 0) {
+          handled.a++
+          await new Promise(() => {})
+        } else {
+          handled.b = Number(message.offset) + 1
+        }
+      },
+    })
+    await until(() => leaves().length === 1, 'the poll-expiry leave')
+    expect(handled.a).toBe(1)
+    expect(handled.b).toBeGreaterThan(3)
+    await wait(300)
+    expect(leaves()).toHaveLength(1)
+  })
+
+  test('keeps an idle member healthy', async () => {
+    h = shareClient({ share: { maxPollInterval: 100 } })
+    const crashes = []
+    h.consumer.on(h.consumer.events.CRASH, ({ payload }) => crashes.push(payload))
+    await h.consumer.subscribe({ topics: ['topic-a'] })
+    const handled = []
+    await h.consumer.run({ eachMessage: async ({ message }) => handled.push(message.offset) })
+    await wait(450)
+    expect(leaves()).toHaveLength(0)
+    expect(crashes).toHaveLength(0)
+    expect(h.frames(76).filter(({ fields }) => fields.memberEpoch === 0)).toHaveLength(1)
+    h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a'])])])
+    await until(() => handled.length === 1, 'a normal delivery after the idle period')
+  })
+
+  test('uses one completion-rearmed heartbeat chain', async () => {
+    h = shareClient()
+    await h.consumer.subscribe({ topics: ['topic-a'] })
+    await h.consumer.run({ eachMessage: async () => {} })
+    const gate = h.hold({ api: 'ShareGroupHeartbeat' })
+    await gate.arrived()
+    const sent = h.frames(76).length
+    await wait(300)
+    expect(h.frames(76)).toHaveLength(sent)
+    gate.release()
+    await until(() => h.frames(76).length > sent, 'the next beat after the answer')
+    expect(h.frames(76).at(-1).fields.memberEpoch).toBeGreaterThan(0)
+  })
+})

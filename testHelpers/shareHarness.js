@@ -12,6 +12,7 @@ const {
 const { newLogger } = require('./index')
 const { createScriptedCluster } = require('./scriptedCluster')
 const { Schedule } = require('./schedule')
+const Kafka = require('../src')
 
 /** Two topic ids the share specs use as topics A and B. */
 const A = '00112233-4455-6677-8899-aabbccddeeff'
@@ -489,6 +490,169 @@ const harness = async ({
   }
 }
 
+/**
+ * The coordinator's answer to a share heartbeat: the member joins at epoch 1 with every partition
+ * of its subscribed topics, steady beats repeat the epoch with no assignment, a leave echoes -1.
+ * @param {object} fields The decoded request.
+ * @param {{interval: number, epochs: Map<string, number>, topics: Map<string, object>}} context The
+ *   client's scripted state.
+ * @returns {object} A ShareGroupHeartbeat answer.
+ */
+const heartbeatAnswer = (fields, { interval, epochs, topics }) => {
+  if (fields.memberEpoch === -1) {
+    return {
+      errorCode: 0,
+      memberId: fields.memberId,
+      memberEpoch: -1,
+      heartbeatIntervalMs: 0,
+      assignment: null,
+    }
+  }
+  const joining = fields.memberEpoch === 0
+  if (joining) epochs.set(fields.memberId, (epochs.get(fields.memberId) ?? 0) + 1)
+  return {
+    errorCode: 0,
+    errorMessage: null,
+    memberId: fields.memberId,
+    memberEpoch: epochs.get(fields.memberId) ?? 1,
+    heartbeatIntervalMs: interval,
+    assignment: joining
+      ? {
+          topicPartitions: (fields.subscribedTopicNames ?? [])
+            .filter((name) => topics.has(name))
+            .map((name) => ({
+              topicId: topics.get(name).topicId,
+              partitions: topics.get(name).partitions.map((_, index) => index),
+            })),
+        }
+      : null,
+  }
+}
+
+/**
+ * A real `Kafka` client and share consumer over the scripted share cluster: Metadata serves
+ * `topics`, the coordinator is node 0, and heartbeats, fetches and acknowledgements answer like a
+ * quiet broker until a test scripts them. Real timers drive it; wait for a stage with `until`.
+ * @param {object} [options] Client options.
+ * @param {number} [options.nodes=1] Node count, at most three.
+ * @param {string} [options.profile='share'] The scripted cluster profile.
+ * @param {Record<string, [number, number]>} [options.advertise] Single-version overrides.
+ * @param {object} [options.kafka] Overrides of the Kafka options.
+ * @param {object} [options.share] Overrides of the shareConsumer options.
+ * @param {number} [options.interval=50] The `heartbeatIntervalMs` the coordinator answers.
+ * @param {Record<string, {topicId: string, partitions: Array<{leader: number, epoch: number}>}>} [options.topics]
+ *   The metadata the wire serves, by topic name; the test edits the returned `table` to change it.
+ * @returns {object} `{ client, consumer, cluster, schedule, table, script, hold, frames, close }`.
+ */
+const shareClient = ({
+  nodes = 1,
+  profile = 'share',
+  advertise,
+  kafka = {},
+  share = {},
+  interval = 50,
+  topics = { 'topic-a': { topicId: A, partitions: [{ leader: 0, epoch: 1 }] } },
+} = {}) => {
+  const schedule = new Schedule()
+  const topology = [0, 1, 2].slice(0, nodes).map((id) => ({ id, host: `node${id}`, port: 9092 }))
+  const cluster = createScriptedCluster({
+    nodes: topology,
+    profile,
+    schedule,
+    ...(advertise && { advertise }),
+  })
+  const table = new Map(Object.entries(topics))
+  const epochs = new Map()
+  const queues = new Map()
+  const gates = []
+  const nameOf = (id) => [...table].find(([, entry]) => entry.topicId === id)?.[0]
+  cluster.answer('Metadata', (fields) => ({
+    brokers: topology.map(({ id, host, port }) => ({ nodeId: id, host, port, rack: null })),
+    controllerId: 0,
+    topics: (fields.topics ?? [...table.keys()].map((name) => ({ name }))).map((request) => {
+      const name = request.name ?? nameOf(request.topicId)
+      const entry = table.get(name)
+      return {
+        errorCode: entry ? 0 : 3,
+        name,
+        topicId: entry ? entry.topicId : '00000000-0000-0000-0000-000000000000',
+        isInternal: false,
+        topicAuthorizedOperations: -2147483648,
+        partitions: (entry ? entry.partitions : []).map(({ leader, epoch }, partitionIndex) => ({
+          errorCode: 0,
+          partitionIndex,
+          leaderId: leader,
+          leaderEpoch: epoch,
+          replicas: [leader],
+          isr: [leader],
+          offlineReplicas: [],
+        })),
+      }
+    }),
+  }))
+  const fallback = {
+    ShareGroupHeartbeat: (fields) => heartbeatAnswer(fields, { interval, epochs, topics: table }),
+    ShareFetch: (fields) => echo('ShareFetch', fields),
+    ShareAcknowledge: (fields) => echo('ShareAcknowledge', fields),
+  }
+  for (const [api, answer] of Object.entries(fallback)) {
+    cluster.answer(api, (fields, call) => {
+      const step = queues.get(api)?.shift()
+      const result = typeof step === 'function' ? step(fields, call) : step
+      return result ?? answer(fields, call)
+    })
+  }
+  const retry = { initialRetryTime: 50, maxRetryTime: 100, retries: 2, factor: 0 }
+  const client = new Kafka(cluster.kafkaOptions({ retry, ...kafka }))
+  const consumer = client.shareConsumer({
+    groupId: 'group',
+    ...share,
+    retry: { ...retry, ...share.retry },
+  })
+  return {
+    client,
+    consumer,
+    cluster,
+    schedule,
+    table,
+    /**
+     * Answers the next calls of `api` from `steps` in order; a call past the end, or a step that
+     * gives nothing, gets the quiet answer.
+     * @param {'ShareGroupHeartbeat'|'ShareFetch'|'ShareAcknowledge'} api The request's API name.
+     * @param {Array<object|((fields: object, call: object) => object|undefined)>} steps The answers.
+     * @returns {void}
+     */
+    script(api, steps) {
+      queues.set(api, [...steps])
+    },
+    /**
+     * Holds every call that matches `selector` at the wire until the test releases it.
+     * @param {object} selector Which calls to hold, for example `{ api: 'ShareFetch' }`.
+     * @returns {object} The schedule's gate.
+     */
+    hold(selector) {
+      const gate = schedule.hold(selector)
+      gates.push(gate)
+      return gate
+    },
+    /**
+     * @param {...number} keys API keys; both share APIs when none is given.
+     * @returns {object[]} The share frames the client wrote, oldest first.
+     */
+    frames: (...keys) => frames(cluster, ...keys),
+    /**
+     * Releases every unsettled gate, disconnects without waiting and reports the scripted
+     * cluster's first recorded failure.
+     * @returns {Promise<void>}
+     */
+    async close() {
+      for (const gate of gates) if (gate.settle) gate.release()
+      await consumer.disconnect({ timeout: 0 })
+      cluster.assertClean()
+    },
+  }
+}
+
 module.exports = {
   A,
   B,
@@ -506,4 +670,6 @@ module.exports = {
   deferred,
   acquire,
   harness,
+  heartbeatAnswer,
+  shareClient,
 }

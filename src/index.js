@@ -16,6 +16,7 @@ const RackPreference = require('./producer/partitioners/rackPreference')
 const { minimumRequestSize } = require('./producer/state/recordSize')
 const { MAX_DELAY } = require('./producer/deadline')
 const createConsumer = require('./consumer')
+const { createShareConsumer, validateShareConsumerOptions } = require('./consumer/share')
 const createAdmin = require('./admin')
 const ISOLATION_LEVEL = require('./protocol/isolationLevel')
 const defaultSocketFactory = require('./network/socketFactory')
@@ -682,6 +683,48 @@ module.exports = class Client {
       maxPrefetchBatches,
       fetchSessions,
       requestTimeout: this[PRIVATE.REQUEST_TIMEOUT],
+    })
+  }
+
+  /**
+   * Creates an independent share-group client with no ordinary-consumer state. Options are
+   * validated before a Cluster or an emitter exists, so an invalid configuration leaves nothing
+   * behind. Share groups need Kafka 4.2 or later; `connect()` checks that.
+   * @public
+   * @param {import('../types').ShareConsumerConfig} config Required group and share options.
+   * @returns {import('../types').ShareConsumer} The additive run-based share client.
+   * @throws {KafkaJSInvalidConfigurationError} Before client state, for invalid share options or a
+   *   root `requestTimeout` that is not an integer from 1 to 2147483647.
+   * @throws {KafkaJSNonRetriableError} For invalid `maxInFlightRequests`, as for `consumer()`.
+   */
+  shareConsumer(config) {
+    const options = validateShareConsumerOptions(config, this[PRIVATE.CLUSTER_RETRY])
+    const requestTimeout = this[PRIVATE.REQUEST_TIMEOUT]
+    if (!(
+      Number.isInteger(requestTimeout) &&
+      requestTimeout >= 1 &&
+      requestTimeout <= INT_32_MAX_VALUE
+    )) {
+      throw new KafkaJSInvalidConfigurationError(
+        'requestTimeout must be an integer from 1 to 2147483647 for shareConsumer'
+      )
+    }
+    const instrumentationEmitter = new InstrumentationEventEmitter({
+      channels: channels.shareConsumer,
+    })
+    const cluster = this[PRIVATE.CREATE_CLUSTER]({
+      metadataMaxAge: options.metadataMaxAge,
+      allowAutoTopicCreation: options.allowAutoTopicCreation,
+      maxInFlightRequests: options.maxInFlightRequests,
+      isolationLevel: ISOLATION_LEVEL.READ_UNCOMMITTED,
+      instrumentationEmitter,
+    })
+    return createShareConsumer({
+      ...options,
+      requestTimeout,
+      cluster,
+      instrumentationEmitter,
+      logger: this[PRIVATE.LOGGER],
     })
   }
 

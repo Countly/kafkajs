@@ -23,6 +23,8 @@ Share record-walk tests check exact acquired ranges, control-record gaps and com
 
 Share session and node-loop tests check serialized request epochs, piggybacked acknowledgements and the first eligible forgotten-partition frame. Scripted socket cases check renewal and flush ordering, independent fetch and acknowledgement errors, leader hints and empty-round pacing. Per-node record limits and cleanup have separate assertions. Public shutdown and session fault matrices provide the later integration acceptance.
 
+Share consumer tests check factory validation, first-join readiness, implicit and explicit handler decisions, handler-driven renewal and fresh subscription/assignment snapshots. Scripted socket cases hold ordinary and captured-final work at connect, encode, queue and response boundaries. Actual-clock deadlines, parallel-handler poll expiry, crash/restart supervision and listener failures have separate assertions. Compact range results stay compact through real acknowledgement bytes, events and errors. The guide and tarball guard check group-level isolation and inclusion of the public share guide. Broker regressions and throughput measurements run through the reserved controller guard; later share live scenarios supply the named broker proofs.
+
 ## Integration tests
 
 Most of the test suite talks to a real Kafka cluster. `npm test` runs `npm run lint`, `npm run compat:check` and `npm run protocol:check`, boots the cluster, runs everything, and tears the cluster down again — it's a convenient local shortcut, but it is not what CI runs.
