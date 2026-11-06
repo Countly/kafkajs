@@ -2104,6 +2104,42 @@ test('a connect to a profile that offers ApiVersions v4 takes exactly NEGOTIATIO
 })
 
 describe('share profile', () => {
+  test.each(PROFILES.share.filter(([api]) => api.includes('Share')))(
+    'defaults %s v%i answers to zero throttle and preserves explicit throttles and buffers',
+    async (api, version) => {
+      const cluster = createScriptedCluster({ nodes: NODES, profile: 'share' })
+      const pair = cluster.pairFor(api, version)
+      const literal =
+        require('../wire/expected')[`${api[0].toLowerCase()}${api.slice(1)}V${version}`]
+      const request = frameOf(apiKeys[api], version, Buffer.from(literal.requestHex, 'hex'))
+      const { socket, frames } = dial(cluster)
+      try {
+        socket.write(request)
+        await settle()
+        cluster.answer(api, () => ({ throttleTime: 43 }))
+        socket.write(request)
+        await settle()
+        const gate = cluster.schedule.hold({ api })
+        socket.write(request)
+        await within(gate.arrived(), 5000, 'the held share response')
+        expect(frames).toHaveLength(2)
+        gate.release({})
+        await settle()
+        const raw = pair.buildResponse({ throttleTime: 71 })
+        cluster.schedule.once({ api }, raw)
+        socket.write(request)
+        await settle()
+
+        expect(frames).toHaveLength(4)
+        expect(frames.map((frame) => frame.readInt32BE(9))).toEqual([0, 43, 0, 71])
+        expect(frames[3].subarray(9)).toEqual(raw)
+        cluster.assertClean()
+      } finally {
+        socket.destroy()
+      }
+    }
+  )
+
   test('installs literal rows without simulating group state', () => {
     const cluster = createScriptedCluster({ nodes: NODES, profile: 'share' })
     const response = Object.freeze({ memberEpoch: 7, assignment: null })

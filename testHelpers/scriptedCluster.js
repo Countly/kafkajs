@@ -790,7 +790,9 @@ class ScriptedCluster {
 
   /**
    * Answers one request frame, or refuses it. The answer goes out on a later turn of the event
-   * loop, and not at all on a socket destroyed by then.
+   * loop, and not at all on a socket destroyed by then. The share profile defaults object answers
+   * to zero throttle instead of inheriting the wire vectors' quota examples; explicit throttles
+   * and raw response buffers are preserved, including answers released through a schedule gate.
    * @private
    * @param {import('events').EventEmitter} socket the socket the frame came in on
    * @param {{ id: number, host: string, port: number }} node the node it was written to
@@ -823,7 +825,12 @@ class ScriptedCluster {
           // answers must not be able to starve the timers behind a chain of microtasks.
           setImmediate(() => {
             if (!socket.destroyed) {
-              const body = Buffer.isBuffer(answer) ? answer : pair.buildResponse(answer)
+              const body = Buffer.isBuffer(answer)
+                ? answer
+                : pair.buildResponse({
+                    ...(this.profile === 'share' && { throttleTime: 0 }),
+                    ...answer,
+                  })
               record.answeredOrder = this.clock++
               respondWithFrame(
                 { socket },

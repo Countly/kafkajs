@@ -6,7 +6,6 @@ const {
   A,
   B,
   acquire,
-  deferred,
   fetchAnswer,
   flush,
   shareClient,
@@ -105,7 +104,7 @@ const SCENARIOS = [
     expected: () => [undefined],
     drive: async ({ h, done, seen }) => {
       await h.consumer.connect()
-      await done
+      await done()
       await h.consumer.connect()
       return { frames: h.frames().length, events: seen.length }
     },
@@ -118,7 +117,7 @@ const SCENARIOS = [
     drive: async ({ h, done }) => {
       await h.consumer.connect()
       await h.consumer.disconnect()
-      await done
+      await done()
       return { assignment: h.consumer.assignment() }
     },
     outcome: { assignment: [] },
@@ -131,7 +130,7 @@ const SCENARIOS = [
       await subscribeAndRun(h, { eachMessage: async () => {} })
       await until(() => h.consumer.acquisitionLockTimeoutMs() !== null, 'the opened session')
       await h.consumer.stop()
-      await done
+      await done()
       return {
         finals: h.frames(79).filter(({ fields }) => fields.shareSessionEpoch === -1).length,
         leaves: h.frames(76).filter(({ fields }) => fields.memberEpoch === -1).length,
@@ -151,7 +150,7 @@ const SCENARIOS = [
     drive: async ({ h, done }) => {
       await subscribeAndRun(h, { eachMessage: async () => {} })
       await tick(100)
-      await done
+      await done()
       return { epochs: h.frames(76).map(({ fields }) => fields.memberEpoch) }
     },
     outcome: { epochs: [0, 1] },
@@ -164,7 +163,7 @@ const SCENARIOS = [
     expected: ({ h }) => [joinPayload({ h })],
     drive: async ({ h, done, seen }) => {
       await subscribeAndRun(h, { eachMessage: async () => {} })
-      await done
+      await done()
       await tick(100)
       await until(() => h.frames(76).length === 2, 'the steady heartbeat')
       return { joins: seen.length, epochs: h.frames(76).map(({ fields }) => fields.memberEpoch) }
@@ -184,7 +183,7 @@ const SCENARIOS = [
     ],
     drive: async ({ h, done }) => {
       await subscribeAndRun(h, { eachMessage: async () => {} })
-      await done
+      await done()
       return { assignment: h.consumer.assignment() }
     },
     outcome: { assignment: [{ topic: 'topic-a', partitions: [0] }] },
@@ -220,8 +219,8 @@ const SCENARIOS = [
       await subscribeAndRun(h, {
         eachMessage: async ({ message }) => delivered.push(message.offset),
       })
-      await done
-      await third.arrived()
+      await done()
+      await until(() => third.call !== null, 'the third fetch')
       return { delivered, piggybacked: batchesOf(h.frames(78)[1]) }
     },
     outcome: { delivered: ['0', '1'], piggybacked: [wire(0, 1, [1])] },
@@ -246,8 +245,8 @@ const SCENARIOS = [
         match: ({ fields }) => fields.shareSessionEpoch === 2,
       })
       await subscribeAndRun(h, { eachMessage: async () => {} })
-      await done
-      await third.arrived()
+      await done()
+      await until(() => third.call !== null, 'the third fetch')
       return { piggybacked: batchesOf(h.frames(78)[1]), flushes: h.frames(79).length }
     },
     outcome: { piggybacked: [wire(0, 1, [1])], flushes: 0 },
@@ -260,7 +259,7 @@ const SCENARIOS = [
       await subscribeAndRun(h, { eachMessage: async () => {} })
       await until(() => h.consumer.acquisitionLockTimeoutMs() !== null, 'the opened session')
       await h.consumer.disconnect({ timeout: 0 })
-      await done
+      await done()
       return { assignment: h.consumer.assignment() }
     },
     outcome: { assignment: [] },
@@ -280,7 +279,7 @@ const SCENARIOS = [
           now = 1200
         },
       })
-      await done
+      await done()
       await until(() => h.frames(79).length === 1, 'the flush of the late return')
       return { flushed: h.frames(79).map(batchesOf) }
     },
@@ -297,7 +296,7 @@ const SCENARIOS = [
           throw failure
         },
       })
-      await done
+      await done()
       await until(() => h.frames(79).length === 1, 'the release flush')
       return { released: h.frames(79).map(batchesOf) }
     },
@@ -325,10 +324,13 @@ const SCENARIOS = [
       await subscribeAndRun(h, {
         eachBatch: async ({ batch, acknowledge }) => acknowledge(batch.messages[0]),
       })
-      await done
-      return { flushed: h.frames(79).map(batchesOf) }
+      await done()
+      return {
+        flushed: h.frames(79).map(batchesOf),
+        epochs: h.frames(79).map(({ fields }) => fields.shareSessionEpoch),
+      }
     },
-    outcome: { flushed: [[wire(0, 1, [1, 2])]] },
+    outcome: { flushed: [[wire(0, 1, [1, 2])], []], epochs: [1, -1] },
   },
   {
     name: 'REQUEST',
@@ -369,8 +371,8 @@ const SCENARIOS = [
     drive: async ({ h, done }) => {
       const held = h.hold({ api: 'ShareFetch' })
       await subscribeAndRun(h, { eachMessage: async () => {} })
-      await held.arrived()
-      await done
+      await until(() => held.call !== null, 'the held fetch')
+      await done()
       return { assignment: h.consumer.assignment() }
     },
     outcome: { assignment: [{ topic: 'topic-a', partitions: [0] }] },
@@ -398,7 +400,7 @@ const SCENARIOS = [
         authBytes: Buffer.alloc(0),
       }))
       const rejection = await h.consumer.connect().catch((error) => error)
-      await done
+      await done()
       return { rejection: rejection.name }
     },
     outcome: { rejection: 'KafkaJSSASLAuthenticationError' },
@@ -410,10 +412,9 @@ const SCENARIOS = [
     options: { interval: 100 },
     expected: () => [{ topic: 'topic-a', previousTopicId: A, topicId: B }],
     drive: async ({ h, done }) => {
-      const reassigned = deferred()
-      let changes = 0
-      h.consumer.on(h.consumer.events.ASSIGNMENT_CHANGED, () => {
-        if (++changes === 2) reassigned.resolve()
+      let reassigned = false
+      h.consumer.on(h.consumer.events.ASSIGNMENT_CHANGED, ({ payload }) => {
+        reassigned = payload.memberEpoch === 2 && payload.assignment.length === 1
       })
       await subscribeAndRun(h, { eachMessage: async () => {} })
       h.table.set('topic-a', { topicId: B, partitions: [{ leader: 0, epoch: 1 }] })
@@ -422,7 +423,8 @@ const SCENARIOS = [
         match: ({ fields }) => fields.memberEpoch > 0,
       })
       await tick(100)
-      const call = await beat.arrived()
+      await until(() => beat.call !== null, 'the held heartbeat')
+      const call = beat.call
       beat.release({
         errorCode: 0,
         errorMessage: null,
@@ -431,8 +433,8 @@ const SCENARIOS = [
         heartbeatIntervalMs: 100,
         assignment: { topicPartitions: [{ topicId: B, partitions: [0] }] },
       })
-      await done
-      await reassigned.promise
+      await done()
+      await until(() => reassigned, 'the recreated assignment')
       return { assignment: h.consumer.assignment() }
     },
     outcome: { assignment: [{ topic: 'topic-a', partitions: [0] }] },
@@ -441,11 +443,16 @@ const SCENARIOS = [
 
 describe('share consumer event matrix', () => {
   let h
+  const subscriptions = new Set()
   afterEach(async () => {
-    await h?.close()
-    h = undefined
-    jest.useRealTimers()
-    jest.restoreAllMocks()
+    for (const remove of subscriptions) remove()
+    try {
+      await h?.close()
+    } finally {
+      h = undefined
+      jest.useRealTimers()
+      jest.restoreAllMocks()
+    }
   })
 
   /**
@@ -475,10 +482,18 @@ describe('share consumer event matrix', () => {
     const publications = []
     const onPublish = (_, channelName) => publications.push(channelName)
     const watched = [...ORDINARY, ...SHARE_CHANNELS]
-    for (const channelName of watched) diagnostics.subscribe(channelName, onPublish)
+    const removers = watched.map((channelName) => {
+      const remove = () => {
+        diagnostics.unsubscribe(channelName, onPublish)
+        subscriptions.delete(remove)
+      }
+      subscriptions.add(remove)
+      diagnostics.subscribe(channelName, onPublish)
+      return remove
+    })
     const seen = []
     const trace = []
-    const done = deferred()
+    const done = () => until(() => seen.length >= count, `the ${name} event`)
     if (kind !== 'none') {
       consumer.on(consumer.events[name], () => {
         trace.push('listener')
@@ -489,10 +504,9 @@ describe('share consumer event matrix', () => {
     consumer.on(consumer.events[name], (event) => {
       trace.push('observer')
       seen.push({ type: event.type, payload: event.payload })
-      if (count !== null && seen.length >= count) done.resolve()
     })
     try {
-      const outcome = await drive({ h, done: done.promise, seen, failure, emitted })
+      const outcome = await drive({ h, done, seen, failure, emitted })
       await flush()
       const logs = logged.mock.calls
         .filter(([message]) => message.startsWith('Failed to execute listener'))
@@ -512,7 +526,7 @@ describe('share consumer event matrix', () => {
         context: { h, failure, emitted },
       }
     } finally {
-      for (const channelName of watched) diagnostics.unsubscribe(channelName, onPublish)
+      for (const remove of removers) remove()
     }
   }
 

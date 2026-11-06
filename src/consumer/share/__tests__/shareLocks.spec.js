@@ -872,6 +872,9 @@ describe('public share lock contract', () => {
       reason: 'membership-lost',
       ranges: [{ firstOffset: '0', lastOffset: '0' }],
     })
+    const renewal = h.events.acks.filter(({ type }) => type === 'renew')
+    expect(renewal).toHaveLength(1)
+    await expect(queued[0]).rejects.toBe(renewal[0].error)
     await expect(queued[1]).rejects.toMatchObject({
       name: 'KafkaJSNonRetriableError',
       message: 'Share run closed',
@@ -928,6 +931,9 @@ describe('public share lock contract', () => {
           reason: 'membership-lost',
           ranges: [{ firstOffset: '0', lastOffset: '0' }],
         })
+        const renewal = h.events.acks.filter(({ type }) => type === 'renew')
+        expect(renewal).toHaveLength(1)
+        expect(await renewals[0]).toBe(renewal[0].error)
         await flush()
         expect(h.frames(79)).toEqual([])
         expect(h.consumer.acquisitionLockTimeoutMs()).toBe(1000)

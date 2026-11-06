@@ -193,6 +193,10 @@ describe('public share subscription and run lifecycle', () => {
     h.script('ShareAcknowledge', [
       ackAnswer([{ partition: 0 }], { acquisitionLockTimeoutMs: 2000 }),
     ])
+    const afterRenewal = h.hold({
+      api: 'ShareFetch',
+      match: ({ fields }) => fields.shareSessionEpoch === 2,
+    })
     const durations = []
     await consumer.run({
       eachMessage: async ({ renew }) => {
@@ -200,6 +204,7 @@ describe('public share subscription and run lifecycle', () => {
       },
     })
     await until(() => durations.length === 2, 'the renewal')
+    await until(() => afterRenewal.call !== null, 'the fetch after the renewal')
     expect(durations).toEqual([1000, 2000])
     expect(consumer.acquisitionLockTimeoutMs()).toBe(2000)
     const snapshot = consumer.assignment()
@@ -213,11 +218,14 @@ describe('public share subscription and run lifecycle', () => {
     await consumer.stop()
     expect(consumer.assignment()).toEqual([])
     expect(consumer.acquisitionLockTimeoutMs()).toBe(2000)
+    afterRenewal.release()
+    await flush()
 
     h.script('ShareFetch', [
       fetchAnswer([acquire(0, 0, ['b'])], { acquisitionLockTimeoutMs: 3000 }),
     ])
     const fetch = h.hold({ api: 'ShareFetch' })
+    h.hold({ api: 'ShareFetch', match: ({ fields }) => fields.shareSessionEpoch === 1 })
     await consumer.run({ eachMessage: async () => {} })
     await fetch.arrived()
     expect(consumer.acquisitionLockTimeoutMs()).toBeNull()

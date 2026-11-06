@@ -504,20 +504,16 @@ describe('share session socket integration', () => {
       m.want = [{ topicId: A, partition: 0 }]
       h.script('ShareFetch', [fetchAnswer([acquire(0, 10, ['a', 'b'])])])
       h.script('ShareAcknowledge', [topError(122)])
+      const open = m.session.token
+      const dispatch = m.dispatch
+      const started = deferred()
+      const held = deferred()
       let rows
-      let started
-      const running = new Promise((resolve) => {
-        started = resolve
-      })
-      let proceed
-      const held = new Promise((resolve) => {
-        proceed = resolve
-      })
       let late
       m.dispatch = async (cohorts) => {
         rows = cohorts
-        started()
-        await held
+        started.resolve()
+        await held.promise
         try {
           rows[0].ledger.complete(['10', '11'], 'accept')
         } catch (error) {
@@ -525,21 +521,56 @@ describe('share session socket integration', () => {
         }
       }
       const round = m.loop.poll()
-      const outcome = round.then(
-        (value) => ({ value }),
-        (error) => ({ error })
-      )
-      await running
-      await expect(
-        m.loop.acknowledge({ renew: [{ cohort: rows[0], offsets: ['10', '11'] }] })
-      ).rejects.toBeInstanceOf(KafkaJSShareAcknowledgementError)
-      expect(m.resets).toHaveLength(1)
-      const before = frames(h.cluster).length
-      proceed()
-      expect((await outcome).error).toBeInstanceOf(Error)
-      expect(late.message).toMatch(/outside its active handler acquisition/)
-      expect(frames(h.cluster)).toHaveLength(before)
-      expect(m.results.filter((result) => !result.error)).toEqual([])
+      const outcome = settled(round)
+      try {
+        await started.promise
+        await expect(
+          m.loop.acknowledge({ renew: [{ cohort: rows[0], offsets: ['10', '11'] }] })
+        ).rejects.toBeInstanceOf(KafkaJSShareAcknowledgementError)
+        expect(m.resets).toHaveLength(1)
+        expect(m.session.token).not.toBe(open)
+        expect(m.operation.guard()).toBeNull()
+        expect(m.loop.poll()).toBe(round)
+        const lost = [...m.results]
+        expect(
+          lost.map(({ firstOffset, lastOffset, type, error }) => [
+            firstOffset,
+            lastOffset,
+            type,
+            error.reason,
+          ])
+        ).toEqual([
+          ['10', '11', 'renew', 'session-lost'],
+          ['10', '11', 'release', 'session-lost'],
+        ])
+        const before = frames(h.cluster).length
+        held.resolve()
+        expect(await outcome).toEqual({
+          value: expect.objectContaining({ reset: false, closed: false, empty: false }),
+        })
+        expect(late).toBeInstanceOf(Error)
+        expect(late.message).toMatch(/outside its active handler acquisition/)
+        expect(frames(h.cluster)).toHaveLength(before)
+        expect(m.results).toEqual(lost)
+
+        m.dispatch = dispatch
+        h.script('ShareFetch', [fetchAnswer([acquire(0, 10, ['fresh'])])])
+        await m.loop.poll()
+        expect(frames(h.cluster, 78).at(-1).fields).toMatchObject({
+          shareSessionEpoch: 0,
+          topics: [{ topicId: A, partitions: [{ partitionIndex: 0, acknowledgementBatches: [] }] }],
+        })
+        expect(m.handled.map(({ value }) => value)).toEqual(['fresh'])
+        await m.loop.poll()
+        expect(m.results.filter((result) => !result.error)).toEqual([
+          expect.objectContaining({ firstOffset: '10', lastOffset: '10', type: 'accept' }),
+        ])
+        expect(m.results.filter((result) => result.error)).toEqual(lost)
+      } finally {
+        held.resolve()
+        await outcome
+        m.dispatch = dispatch
+      }
     })
   })
 

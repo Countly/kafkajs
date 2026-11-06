@@ -1254,27 +1254,39 @@ class ShareFetchLoop {
    * @returns {Promise<object>} The exchange result; for a renewal `lockDuration` is the new
    *   duration, or undefined when the answer kept the previous one.
    * @throws {KafkaJSShareAcknowledgementError} A failed renewal, from the ledger's compact result.
+   *   A retirement returns that same error even when it first rejects the queue's outer wait;
+   *   a renewal retired before preparation keeps the original queue refusal.
    * @throws {Error} Any other failure of the request, or the node operation's refusal while it waits.
    */
   acknowledge({ cohorts, renew } = {}) {
-    return this.session.enqueue(async (open) => {
-      const collected = []
+    const collected = []
+    const request = this.session.enqueue(async (open) => {
       this.collected = collected
-      const failure = () => collected.find((outcome) => outcome.type === 'renew' && outcome.error)
       try {
         const result = await this.exchange(
           { apiKey: apiKeys.ShareAcknowledge, kind: renew ? 'renew' : 'flush', cohorts, renew },
           open
         )
         if (result.backoff) await this.pace(result)
-        if (renew && failure()) throw failure().error
         return result
-      } catch (error) {
-        throw (renew && failure()?.error) || error
       } finally {
-        this.collected = null
+        if (this.collected === collected) this.collected = null
       }
     })
+    const failure = () =>
+      renew && collected.find((outcome) => outcome.type === 'renew' && outcome.error)?.error
+    const outcome = request.then(
+      (result) => {
+        const error = failure()
+        if (error) throw error
+        return result
+      },
+      (error) => {
+        throw failure() || error
+      }
+    )
+    outcome.catch(() => {})
+    return outcome
   }
 
   /**

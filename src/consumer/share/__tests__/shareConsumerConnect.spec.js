@@ -124,10 +124,18 @@ describe('public share connection contract', () => {
     expect(error).toMatchObject({
       reason: 'api-version-range',
       apiKey: 78,
-      brokerRange: [1, 1],
-      clientRange: [2, 2],
+      apiName: 'ShareFetch',
+      shareVersion: 1,
+      retriable: false,
+    })
+    expect(h.cluster.apiVersionsTable()).toContainEqual({
+      apiKey: 78,
+      minVersion: 1,
+      maxVersion: 1,
     })
     expect(h.frames(76, 78, 79)).toHaveLength(0)
+    const released = open({ advertise: { ShareFetch: [2, 2] } })
+    await expect(released.consumer.connect()).resolves.toBeUndefined()
   })
 
   test('checks finalized share support after API versions', async () => {

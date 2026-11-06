@@ -472,7 +472,8 @@ describe('public share handler contract', () => {
     expect(restartOnFailure).toHaveBeenCalledTimes(1)
     expect(restartOnFailure.mock.calls[0][0]).toBe(error)
     expect(h.errors).toHaveLength(0)
-    expect(h.frames(79).map(batchesOf)).toEqual([[wire(0, 1, [1, 2])]])
+    expect(h.frames(79).map(({ fields }) => fields.shareSessionEpoch)).toEqual([1, -1])
+    expect(h.frames(79).map(batchesOf)).toEqual([[wire(0, 1, [1, 2])], []])
     expect(outcomes(h.acks)).toEqual([
       ['0', '0', 'accept', null],
       ['1', '1', 'release', null],
@@ -1031,10 +1032,17 @@ describe('public share handler contract', () => {
 
   test('does not fetch while a returned handler renewal is pending and then resolves it', async () => {
     await start()
-    h.script('ShareFetch', [answer(['a'])])
+    h.script('ShareFetch', [
+      answer(['a']),
+      fetchAnswer([part({ partition: 0 })], { acquisitionLockTimeoutMs: 3000 }),
+    ])
     h.script('ShareAcknowledge', [
       ackAnswer([{ partition: 0 }], { acquisitionLockTimeoutMs: 2000 }),
     ])
+    const third = h.hold({
+      api: 'ShareFetch',
+      match: ({ fields }) => fields.shareSessionEpoch === 2,
+    })
     const gate = h.hold({ api: 'ShareAcknowledge' })
     const renewals = []
     await h.consumer.run({
@@ -1059,11 +1067,12 @@ describe('public share handler contract', () => {
     await until(() => h.frames(78).length > fetches, 'the next fetch after the renewal settled')
     expect(batchesOf(h.frames(78)[fetches])).toEqual([wire(0, 0, [1])])
     await until(() => h.acks.some(({ type }) => type === 'accept'), 'the one terminal decision')
+    await until(() => third.call !== null, 'the fetch after the duration update')
     expect(outcomes(h.acks)).toEqual([
       ['0', '0', 'renew', null],
       ['0', '0', 'accept', null],
     ])
-    expect(h.consumer.acquisitionLockTimeoutMs()).toBe(2000)
+    expect(h.consumer.acquisitionLockTimeoutMs()).toBe(3000)
   })
 
   test('does not fetch while a returned handler renewal is pending and then rejects its refusal', async () => {

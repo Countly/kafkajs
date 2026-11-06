@@ -13,6 +13,8 @@ const { newLogger } = require('./index')
 const { createScriptedCluster } = require('./scriptedCluster')
 const { Schedule } = require('./schedule')
 const Kafka = require('../src')
+const { performance: monotonicClock } = require('node:perf_hooks')
+const monotonicNow = monotonicClock.now.bind(monotonicClock)
 
 /** Two topic ids the share specs use as topics A and B. */
 const A = '00112233-4455-6677-8899-aabbccddeeff'
@@ -160,14 +162,17 @@ const flush = async () => {
 }
 
 /**
- * Waits for a condition without a timer: one macrotask turn per check.
+ * Waits for a condition without a timer: one macrotask turn per check. The bound uses the original
+ * monotonic clock so fake application clocks stay under the test's control; real pacing and retry
+ * timers still get time to run regardless of how quickly Node processes immediate callbacks.
  * @param {() => boolean} predicate The reached-stage condition.
  * @param {string} what What is awaited, named by the failure.
  * @returns {Promise<void>}
- * @throws {Error} When the condition does not hold after 400 turns.
+ * @throws {Error} When the condition does not hold within two real seconds.
  */
 const until = async (predicate, what) => {
-  for (let turn = 0; turn < 400 && !predicate(); turn++) await new Promise(setImmediate)
+  const deadline = monotonicNow() + 2000
+  while (!predicate() && monotonicNow() < deadline) await new Promise(setImmediate)
   if (!predicate()) throw new Error(`${what} did not happen`)
 }
 
