@@ -246,6 +246,15 @@ class AcknowledgementTrace {
 
 /** Runs the blocking leader-election helpers away from this process's event loop. */
 const HELPER_SOURCE = `
+if (process.env.SHARE_MOVE_TRACE === '1') {
+  const childProcess = require('child_process')
+  const execute = childProcess.execFileSync
+  childProcess.execFileSync = (file, args, options) => {
+    const output = execute(file, args, options)
+    process.send({ file, args, input: options?.input ?? null, stdout: output.toString(), status: 0 })
+    return output
+  }
+}
 const helpers = require(process.env.SHARE_LIVE_ROOT + '/testHelpers/leaderElection')
 const [topic, replicas, leader] = JSON.parse(process.argv[1])
 helpers.reassignPreferredReplica(topic, replicas, leader)
@@ -484,6 +493,7 @@ class SettlementCapture {
     this.acquisitions = []
     this.losses = []
     this.faults = []
+    this.rounds = []
     this.sequence = 0
   }
 
@@ -541,10 +551,37 @@ class SettlementCapture {
     )
     this.watch(ShareFetchLoop.prototype, 'adopt', (loop, [exchange], next) => {
       const cohort = next()
-      if (Object.values(this.owner.groups).includes(loop.groupId))
-        this.acquisitions.push({ cohort, exchange, ...this.stamp() })
+      if (Object.values(this.owner.groups).includes(loop.groupId)) {
+        this.acquisitions.push({
+          cohort,
+          exchange,
+          ...(this.owner.action === 'leader' && {
+            original: {
+              ledger: this.id(cohort.ledger),
+              token: this.id(cohort.token),
+              cohort: this.id(cohort),
+              exchange: this.id(exchange),
+              open: this.id(exchange.open),
+              records: cohort.walk.deliver.records.map(({ offset, key, value }) => ({
+                offset,
+                key: key?.toString('base64'),
+                value: value?.toString('base64'),
+              })),
+              deliveryCounts: [...cohort.walk.deliver.deliveryCounts],
+            },
+          }),
+          ...this.stamp(),
+        })
+      }
       return cohort
     })
+    if (this.owner.action === 'leader')
+      this.watch(ShareRun.prototype, 'pollNode', async (run, [node], next) => {
+        const start = this.stamp()
+        const result = await next()
+        this.rounds.push({ run, loop: node.loop, start, end: this.stamp() })
+        return result
+      })
     this.watch(ShareRun.prototype, 'invoke', (run, [node, cohort, call], next) =>
       this.context.run({ run, node, cohort, call }, next)
     )
@@ -558,11 +595,19 @@ class SettlementCapture {
         this.handlers.push({
           ...context,
           groupId: run.options.groupId,
-          clientId: run.options.clientId,
+          clientId:
+            this.owner.action === 'leader'
+              ? context.node.loop.session.binding.connection.clientId
+              : run.options.clientId,
           memberId: run.membership.memberId,
           identity: shareRecordIdentity({ ...message, topic, partition }),
           offset: message.offset,
           deliveryCount: message.deliveryCount,
+          ...(this.owner.action === 'leader' && {
+            originalLedger: this.id(context.call.ledger),
+            originalToken: this.id(context.cohort.token),
+            originalMembership: this.id(context.node.issued),
+          }),
           ...this.stamp(),
         })
         return handler.call(run, payload)
@@ -681,7 +726,26 @@ class SettlementCapture {
             offsetsOf([result]).includes(handler.offset)
         )
     )
-    const fault = { kind, handlers: [...handlers], writes: [...writes], ...this.stamp() }
+    const fault = {
+      kind,
+      handlers: [...handlers],
+      writes: [...writes],
+      ...(kind === 'leader-move' && {
+        held: Object.freeze(
+          handlers.map((handler) =>
+            Object.freeze({
+              handler: this.id(handler),
+              groupId: handler.groupId,
+              topicId: handler.cohort.topicId,
+              partition: handler.cohort.partition,
+              offset: handler.offset,
+              identity: handler.identity,
+            })
+          )
+        ),
+      }),
+      ...this.stamp(),
+    }
     this.faults.push(fault)
     return fault
   }
@@ -1166,32 +1230,636 @@ const resetGroupConfig = async (scope, admin, group, names) => {
  * event loop (and the share client living in it) keeps running while they work.
  * @param {AbortSignal} scope the case scope; the child is killed when it aborts
  * @param {[string, number[], number]} args topic, the partition's replicas and the wanted leader
+ * @param {Function} [observe] Parent-process move observations and original command results.
  * @returns {Promise<void>}
  * @throws {Error} a non-zero exit, with the end of the child's error output
  */
-const moveLeadership = (scope, args) =>
+const moveLeadership = (scope, args, observe) =>
   bounded(
     scope,
     MOVE_MS,
     (inner) =>
       new Promise((resolve, reject) => {
+        observe?.('start')
         const child = spawn(process.execPath, ['-e', HELPER_SOURCE, JSON.stringify(args)], {
-          env: { ...process.env, SHARE_LIVE_ROOT: ROOT },
-          stdio: ['ignore', 'ignore', 'pipe'],
+          env: { ...process.env, SHARE_LIVE_ROOT: ROOT, SHARE_MOVE_TRACE: observe ? '1' : '0' },
+          stdio: observe ? ['ignore', 'ignore', 'pipe', 'ipc'] : ['ignore', 'ignore', 'pipe'],
         })
+        if (observe) child.on('message', (command) => observe('command', command))
         let errors = ''
         child.stderr.on('data', (chunk) => {
           errors += chunk
         })
         child.once('error', reject)
-        child.once('close', (code, signal) =>
-          code === 0
-            ? resolve()
-            : reject(new Error(`Leadership helper ended ${code ?? signal}: ${errors.slice(-600)}`))
-        )
+        child.once('close', (code, signal) => {
+          observe?.('complete', { code, signal, stderr: errors })
+          if (code === 0) resolve()
+          else reject(new Error(`Leadership helper ended ${code ?? signal}: ${errors.slice(-600)}`))
+        })
         inner.addEventListener('abort', () => child.kill('SIGKILL'), { once: true })
       })
   )
+
+/** Requires a causal order on one parent-process clock, resolving timestamp ties by sequence.
+ * @param {...object} observations Original stamped observations.
+ * @returns {void} Missing or reordered observations fail closed.
+ */
+const assertLeaderOrder = (...observations) => {
+  for (const observation of observations) {
+    expect(Number.isInteger(observation?.sequence)).toBe(true)
+    expect(Number.isFinite(observation?.monotonic)).toBe(true)
+  }
+  for (let index = 1; index < observations.length; index++) {
+    expect(observations[index - 1].sequence).toBeLessThan(observations[index].sequence)
+    expect(observations[index - 1].monotonic).toBeLessThanOrEqual(observations[index].monotonic)
+  }
+}
+
+/** Checks the bounded count policy only after original acquisition and move validation.
+ * @param {object} previous Original held handler.
+ * @param {object} replay Original second handler.
+ * @returns {void} Counts remain the original broker observations.
+ */
+const assertLeaderCounts = (previous, replay) => {
+  for (const count of [previous.deliveryCount, replay.deliveryCount]) {
+    expect(Number.isInteger(count) && count >= 1 && count <= 32767).toBe(true)
+  }
+  expect(replay.deliveryCount).toBeGreaterThanOrEqual(previous.deliveryCount)
+}
+
+/** Decodes archived original frames with socket-scoped correlation and exchange boundaries.
+ * @param {object} capture Archived original objects and frames.
+ * @returns {Promise<object[]>} Requests with their independently decoded complete responses.
+ */
+const leaderExchanges = async (capture) => {
+  const frames = capture.frames.map((fact) => {
+    const frame = Buffer.from(fact.bytes, 'base64')
+    expect(frame.length).toBeGreaterThanOrEqual(8)
+    expect(frame.readInt32BE(0)).toBe(frame.length - 4)
+    expect(Number.isInteger(fact.socket) && fact.socket > 0).toBe(true)
+    if (fact.kind === 'request') {
+      const header = readRequestHeader(frame)
+      for (const key of ['apiKey', 'apiVersion', 'correlationId', 'clientId', 'byteLength'])
+        expect(fact[key]).toBe(header[key])
+    } else expect(fact.correlationId).toBe(frame.readInt32BE(4))
+    return { ...fact, frame }
+  })
+  expect(new Set(frames.map(({ sequence }) => sequence)).size).toBe(frames.length)
+  const requests = frames.filter(({ kind }) => kind === 'request')
+  const result = []
+  for (const request of requests.filter(({ apiKey }) => [75, 60, 78, 79].includes(apiKey))) {
+    const following = requests.find(
+      (other) =>
+        other.socket === request.socket &&
+        other.correlationId === request.correlationId &&
+        other.sequence > request.sequence
+    )
+    const responses = frames.filter(
+      (response) =>
+        response.kind === 'response' &&
+        response.socket === request.socket &&
+        response.correlationId === request.correlationId &&
+        response.sequence > request.sequence &&
+        (!following || response.sequence < following.sequence)
+    )
+    expect(responses.length).toBeLessThanOrEqual(1)
+    const response = responses[0]
+    let answer
+    if (response) {
+      assertLeaderOrder(request, response)
+      expect(response.frame[8]).toBe(0)
+      expect(response.host).toBe(request.host)
+      expect(response.port).toBe(request.port)
+      const decoder =
+        request.apiKey === 75
+          ? require('../../../protocol/requests/describeTopicPartitions/v0/response')
+          : request.apiKey === 60
+            ? require('../../../protocol/requests/describeCluster').protocol({
+                version: request.apiVersion,
+              })({}).response
+            : request.apiKey === 78
+              ? fetchAcknowledgementResponse
+              : acknowledgeResponse
+      if (request.apiKey === 75) expect(request.apiVersion).toBe(0)
+      if ([78, 79].includes(request.apiKey)) expect(request.apiVersion).toBe(2)
+      answer = await decoder.decode(response.frame.subarray(9))
+    }
+    const reader = request.apiKey === 78 ? shareFetchWire : shareAcknowledgeWire
+    const fields = [78, 79].includes(request.apiKey)
+      ? reader.readRequest(request.frame.subarray(request.byteLength))
+      : null
+    if (fields) expect(fields).toEqual(request.fields)
+    result.push({ ...request, fields, response, answer })
+  }
+  return result
+}
+
+/** Validates a leadership sample against its actual metadata and cluster source frames.
+ * @param {object} sample Observed projection and source interval.
+ * @param {object} evidence Original topic identity.
+ * @param {object[]} exchanges Decoded original exchanges.
+ * @param {boolean} [fullIsr=true] Require every replica in ISR at a barrier.
+ * @returns {object} Raw partition row and endpoint mapping.
+ */
+const leaderSample = (sample, { topic, topicId }, exchanges, fullIsr = true) => {
+  const sources = sample.sources.map((sequence) =>
+    exchanges.find((row) => row.sequence === sequence)
+  )
+  expect(sources).toHaveLength(2)
+  expect(sources.filter((source) => source?.apiKey === 75)).toHaveLength(1)
+  expect(sources.filter((source) => source?.apiKey === 60)).toHaveLength(1)
+  const metadata = sources.find(({ apiKey }) => apiKey === 75)
+  const cluster = sources.find(({ apiKey }) => apiKey === 60)
+  for (const source of sources) assertLeaderOrder(sample.start, source, source.response, sample.end)
+  const reader = require('../../../../testHelpers/wire/describeTopicPartitionsV0')
+  expect(reader.readRequest(metadata.frame.subarray(metadata.byteLength)).topics).toEqual([topic])
+  expect(metadata.answer.nextCursor).toBeNull()
+  expect(metadata.answer.topics).toHaveLength(1)
+  const [row] = metadata.answer.topics
+  expect(row.errorCode).toBe(0)
+  expect(row.name).toBe(topic)
+  expect(row.topicId).toBe(topicId)
+  expect(row.partitions).toHaveLength(1)
+  const [partition] = row.partitions
+  expect(partition.partitionIndex).toBe(0)
+  expect(partition.errorCode).toBe(0)
+  expect(Number.isInteger(partition.leaderEpoch) && partition.leaderEpoch >= 0).toBe(true)
+  expect(partition.replicaNodes).toHaveLength(3)
+  expect(new Set(partition.replicaNodes).size).toBe(3)
+  expect(partition.replicaNodes.every((id) => Number.isInteger(id) && id >= 0)).toBe(true)
+  expect(partition.replicaNodes).toContain(partition.leaderId)
+  expect(new Set(partition.isrNodes).size).toBe(partition.isrNodes.length)
+  expect(partition.isrNodes.every((id) => partition.replicaNodes.includes(id))).toBe(true)
+  if (fullIsr) expect([...partition.isrNodes].sort()).toEqual([...partition.replicaNodes].sort())
+  expect(cluster.answer.errorCode).toBe(0)
+  const brokers = cluster.answer.brokers
+  expect(new Set(brokers.map(({ brokerId }) => brokerId)).size).toBe(brokers.length)
+  for (const source of sources) {
+    expect(
+      brokers.filter(({ host, port }) => host === source.host && port === source.port)
+    ).toHaveLength(1)
+  }
+  expect(brokers.filter(({ brokerId }) => brokerId === partition.leaderId)).toHaveLength(1)
+  const leader = brokers.find(({ brokerId }) => brokerId === partition.leaderId)
+  expect(sample).toMatchObject({
+    topicId,
+    leader: partition.leaderId,
+    leaderEpoch: partition.leaderEpoch,
+    replicas: partition.replicaNodes,
+    isr: partition.isrNodes,
+    endpoint: `${leader.host}:${leader.port}`,
+  })
+  return { partition, brokers }
+}
+
+/** Reconstructs the deliberate-move predicate from lossless archived evidence.
+ * @param {object} evidence Original frames, authorities, handlers and move barriers.
+ * @param {boolean} [terminal=false] Require later successful Accepts and independent terminal proof.
+ * @returns {Promise<void>} No summary boolean can substitute for a missing witness.
+ */
+const assertLeaderReplayEvidence = async (evidence, terminal = false) => {
+  const { action, groupId, topic, topicId, expected, capture, move } = evidence
+  expect(action).toBe('leader')
+  expect(evidence.diagnosticErrors).toEqual([])
+  expect(typeof evidence.scenario).toBe('string')
+  expect(expected).toHaveLength(RECORDS)
+  expect(new Set(expected).size).toBe(RECORDS)
+  const exchanges = await leaderExchanges(capture)
+  const writes = exchanges.filter(({ fields }) => fields?.groupId === groupId)
+  const fetches = writes.filter(({ apiKey }) => apiKey === 78)
+  const faults = capture.faults.filter(({ kind }) => kind === 'leader-move')
+  expect(faults).toHaveLength(1)
+  const [fault] = faults
+  expect(fault.held).toHaveLength(1)
+  const [held] = fault.held
+  expect(held.groupId).toBe(groupId)
+  expect(held.topicId).toBe(topicId)
+  expect(held.partition).toBe(0)
+  expect(expected).toContain(held.identity)
+  expect(fault.handlers).toEqual([held.handler])
+  const handlers = capture.handlers.filter((handler) => handler.groupId === groupId)
+  expect(handlers.map(({ identity }) => identity).sort()).toEqual(
+    [...expected, held.identity].sort()
+  )
+  const seen = new Set()
+  const acquired = new Map()
+  for (const handler of handlers) {
+    expect(handler.offset).toMatch(/^(0|[1-9][0-9]*)$/)
+    const adoptions = capture.acquisitions.filter(({ cohort }) => cohort === handler.cohort)
+    expect(adoptions).toHaveLength(1)
+    const [adoption] = adoptions
+    const originals = fetches.filter(({ exchange }) => exchange === adoption.exchange)
+    expect(originals).toHaveLength(1)
+    const [write] = originals
+    // An original response/offset can authorize only one dispatch, regardless of cohort labels.
+    const key = JSON.stringify([write.exchange, groupId, topicId, 0, handler.offset])
+    expect(seen.has(key)).toBe(false)
+    seen.add(key)
+    for (const label of [
+      'exchange',
+      'run',
+      'loop',
+      'open',
+      'membership',
+      'pool',
+      'connection',
+      'socketInstance',
+    ])
+      expect(typeof write[label]).toBe('string')
+    expect(Number.isInteger(write.generation) && write.generation >= 0).toBe(true)
+    expect(write.run).toBe(handler.run)
+    expect(write.membership).toBe(handler.originalMembership)
+    expect(write.nodeId).toBe(handler.node)
+    expect(write.fields.memberId).toBe(handler.memberId)
+    expect(write.clientId).toBe(handler.clientId)
+    expect(write.fields.maxRecords).toBe(1)
+    expect(write.answer?.errorCode).toBe(0)
+    const topics = write.answer.responses.filter((row) => row.topicId === topicId)
+    expect(topics).toHaveLength(1)
+    const partitions = topics[0].partitions.filter(({ partitionIndex }) => partitionIndex === 0)
+    expect(partitions).toHaveLength(1)
+    const [partition] = partitions
+    expect(partition.errorCode).toBe(0)
+    const ranges = partition.acquiredRecords.filter(
+      ({ firstOffset, lastOffset }) =>
+        BigInt(firstOffset) <= BigInt(handler.offset) &&
+        BigInt(handler.offset) <= BigInt(lastOffset)
+    )
+    expect(ranges).toHaveLength(1)
+    expect(ranges[0].deliveryCount).toBe(handler.deliveryCount)
+    const records = partition.messages.filter(({ offset }) => offset === handler.offset)
+    expect(records).toHaveLength(1)
+    expect(shareRecordIdentity({ ...records[0], topic, partition: 0 })).toBe(handler.identity)
+    expect(adoption.groupId).toBe(groupId)
+    expect(adoption.topicId).toBe(topicId)
+    expect(adoption.partition).toBe(0)
+    expect(adoption.original.exchange).toBe(write.exchange)
+    expect(adoption.original.open).toBe(write.open)
+    expect(adoption.original.cohort).toBe(handler.cohort)
+    expect(adoption.original.ledger).toBe(handler.originalLedger)
+    expect(adoption.original.token).toBe(handler.originalToken)
+    expect(adoption.ledger).toBe(handler.originalLedger)
+    expect(adoption.acquisition).toBe(handler.originalToken)
+    expect(handler.ledger).toBe(handler.originalLedger)
+    expect(handler.acquisition).toBe(handler.originalToken)
+    expect(adoption.records).toEqual(adoption.original.records)
+    expect(adoption.deliveryCounts).toEqual(adoption.original.deliveryCounts)
+    const index = adoption.records.findIndex(({ offset }) => offset === handler.offset)
+    expect(index).toBeGreaterThanOrEqual(0)
+    expect(adoption.records[index]).toEqual({
+      offset: handler.offset,
+      key: records[0].key?.toString('base64'),
+      value: records[0].value?.toString('base64'),
+    })
+    expect(adoption.deliveryCounts[index]).toBe(handler.deliveryCount)
+    assertLeaderOrder(write, write.response, adoption, handler)
+    acquired.set(handler.handler, write)
+  }
+  const pair = handlers.filter(({ identity }) => identity === held.identity)
+  expect(pair).toHaveLength(2)
+  const [previous, replay] = pair
+  expect(previous.handler).toBe(held.handler)
+  expect(previous.offset).toBe(held.offset)
+  const original = acquired.get(previous.handler)
+  const replacement = acquired.get(replay.handler)
+  expect(original.exchange).not.toBe(replacement.exchange)
+  const samples = []
+  expect(move.samples[0]).toEqual(move.old)
+  expect(move.samples.at(-1)).toEqual(move.next)
+  expect(move.samples.length).toBeGreaterThanOrEqual(2)
+  for (const sample of move.samples) {
+    samples.push(
+      leaderSample(
+        sample,
+        evidence,
+        exchanges,
+        sample === move.samples[0] || sample === move.samples.at(-1)
+      )
+    )
+  }
+  const old = samples[0].partition
+  const next = samples.at(-1).partition
+  expect(move.topic).toBe(topic)
+  expect(move.partition).toBe(0)
+  expect(move.replicas).toEqual(old.replicaNodes)
+  expect(move.target).toBe(Math.min(...old.replicaNodes.filter((id) => id !== old.leaderId)))
+  expect(move.target).not.toBe(old.leaderId)
+  expect(next.leaderId).toBe(move.target)
+  expect(next.leaderEpoch).toBeGreaterThan(old.leaderEpoch)
+  expect(next.replicaNodes).toEqual([
+    move.target,
+    ...move.replicas.filter((id) => id !== move.target),
+  ])
+  for (const [write, sample, nodeId] of [
+    [original, samples[0], old.leaderId],
+    [replacement, samples.at(-1), move.target],
+  ]) {
+    expect(write.nodeId).toBe(nodeId)
+    const brokers = sample.brokers.filter(
+      ({ host, port }) => host === write.host && port === write.port
+    )
+    expect(brokers).toHaveLength(1)
+    expect(brokers[0].brokerId).toBe(nodeId)
+  }
+  let reachedTarget = false
+  for (const { partition } of samples) {
+    expect([...partition.replicaNodes].sort()).toEqual([...old.replicaNodes].sort())
+    if (partition.leaderId === old.leaderId) {
+      expect(reachedTarget).toBe(false)
+      expect(partition.leaderEpoch).toBe(old.leaderEpoch)
+    } else {
+      expect(partition.leaderId).toBe(next.leaderId)
+      expect(partition.leaderEpoch).toBe(next.leaderEpoch)
+      reachedTarget = true
+    }
+  }
+  const starts = move.events.filter(({ kind }) => kind === 'start')
+  const completions = move.events.filter(({ kind }) => kind === 'complete')
+  expect(starts).toHaveLength(1)
+  expect(completions).toHaveLength(1)
+  const [start] = starts
+  const [complete] = completions
+  expect(complete.result).toMatchObject({ code: 0, signal: null })
+  const commands = move.events.filter(({ kind }) => kind === 'command')
+  expect(commands.length).toBeGreaterThanOrEqual(4)
+  assertLeaderOrder(start, ...commands, complete)
+  for (const command of commands) expect(command.result.status).toBe(0)
+  const plan = commands.filter(({ result }) => result.input !== null)
+  expect(plan).toHaveLength(1)
+  expect(JSON.parse(plan[0].result.input)).toEqual({
+    version: 1,
+    partitions: [{ topic, partition: 0, replicas: next.replicaNodes }],
+  })
+  const executions = commands.filter(({ result }) => result.args.includes('--execute'))
+  const verifications = commands.filter(({ result }) => result.args.includes('--verify'))
+  const elections = commands.filter(({ result }) =>
+    result.args.some((arg) => arg.endsWith('/kafka-leader-election.sh'))
+  )
+  expect(executions).toHaveLength(1)
+  expect(verifications.length).toBeGreaterThan(0)
+  expect(verifications.at(-1).result.stdout.toLowerCase()).toContain(
+    `reassignment of partition ${topic}-0 is completed`
+  )
+  expect(elections).toHaveLength(1)
+  expect(elections[0].result.args.slice(-6)).toEqual([
+    '--election-type',
+    'PREFERRED',
+    '--topic',
+    topic,
+    '--partition',
+    '0',
+  ])
+  expect(elections[0].result.stdout).toContain('Successfully completed leader election')
+  expect(elections[0].result.stdout).toContain(`${topic}-0`)
+  assertLeaderOrder(plan[0], executions[0], verifications.at(-1), elections[0])
+  for (let index = 1; index < move.samples.length; index++) {
+    assertLeaderOrder(complete, move.samples[index].start, move.samples[index].end, move.gate)
+    assertLeaderOrder(move.samples[index - 1].end, move.samples[index].start)
+  }
+  assertLeaderOrder(
+    original.response,
+    previous,
+    move.old.start,
+    move.old.end,
+    fault,
+    start,
+    complete,
+    move.next.start,
+    move.next.end,
+    move.renewalStart,
+    move.renewalEnd,
+    move.gate,
+    move.release
+  )
+  const rounds = capture.rounds.filter(
+    ({ loop, start: began }) => loop === original.loop && began.sequence < original.sequence
+  )
+  const round = rounds.find(({ end }) => end.sequence > previous.sequence)
+  expect(round).toBeDefined()
+  assertLeaderOrder(move.release, round.end, replacement, replacement.response, replay)
+  for (const fetch of fetches.filter(({ sequence }) => sequence > original.sequence)) {
+    assertLeaderOrder(round.end, fetch)
+  }
+  for (const fetch of fetches.filter(({ sequence }) => sequence < original.sequence)) {
+    assertLeaderOrder(fetch, fetch.response, previous)
+  }
+  const renewals = writes.filter(
+    ({ apiKey, sequence }) =>
+      apiKey === 79 && sequence > move.renewalStart.sequence && sequence < move.renewalEnd.sequence
+  )
+  expect(renewals).toHaveLength(1)
+  const [renewal] = renewals
+  expect(renewal.nodeId).toBe(old.leaderId)
+  expect(renewal.open).toBe(original.open)
+  expect(renewal.membership).toBe(original.membership)
+  expect(renewal.pool).toBe(original.pool)
+  expect(renewal.generation).toBe(original.generation)
+  expect(renewal.fields.isRenewAck).toBe(true)
+  expect(renewal.prepared).toHaveLength(1)
+  expect(renewal.prepared[0]).toMatchObject({
+    cohort: previous.cohort,
+    ledger: previous.ledger,
+    acquisition: previous.acquisition,
+    isRenewAck: true,
+  })
+  expect(renewal.fields.topics).toHaveLength(1)
+  expect(renewal.fields.topics[0].topicId).toBe(topicId)
+  expect(renewal.fields.topics[0].partitions).toHaveLength(1)
+  const [renewed] = renewal.fields.topics[0].partitions
+  expect(renewed.partitionIndex).toBe(0)
+  expect(decisionOffsets(renewed.acknowledgementBatches, 4)).toEqual([held.offset])
+  assertLeaderOrder(move.renewalStart, renewal, renewal.response, move.renewalEnd)
+  expect(renewal.answer.errorCode).toBe(0)
+  const renewedTopics = renewal.answer.responses.filter((row) => row.topicId === topicId)
+  expect(renewedTopics).toHaveLength(1)
+  const renewedPartitions = renewedTopics[0].partitions.filter(
+    ({ partitionIndex }) => partitionIndex === 0
+  )
+  expect(renewedPartitions).toHaveLength(1)
+  if (renewedPartitions[0].errorCode !== 0)
+    expect(move.finalRenewal.error?.name).toBe('KafkaJSShareAcknowledgementError')
+  else if (!move.finalRenewal.error) expect(move.finalRenewal.lockMs).toBeGreaterThan(0)
+  const renewalOutcomes = capture.outcomes.filter(
+    (row) =>
+      row.cohort === previous.cohort &&
+      row.type === 'renew' &&
+      row.sequence > renewal.response.sequence &&
+      row.sequence < move.renewalEnd.sequence &&
+      offsetsOf([row]).includes(held.offset)
+  )
+  expect(renewalOutcomes).toHaveLength(1)
+  expect(renewalOutcomes[0].error).toEqual(move.finalRenewal.error ?? null)
+  expect(renewalOutcomes[0].public).toHaveLength(1)
+  if (move.release.decision !== 'release') {
+    expect(move.release.lost?.name).toBe('KafkaJSNonRetriableError')
+    expect(move.release.lost.retriable).toBe(false)
+  }
+  const opening = fetches.find(
+    ({ host, port, sequence }) =>
+      `${host}:${port}` === move.next.endpoint && sequence > move.gate.sequence
+  )
+  expect(opening).toBeDefined()
+  expect(opening.fields.shareSessionEpoch).toBe(0)
+  expect(
+    opening.fields.topics.flatMap(({ partitions }) =>
+      partitions.flatMap(({ acknowledgementBatches }) => acknowledgementBatches)
+    )
+  ).toEqual([])
+  expect(opening.sequence).toBeLessThanOrEqual(replacement.sequence)
+  for (const exchange of fault.exchanges) {
+    const affected = writes.filter((write) => write.exchange === exchange)
+    expect(affected).toHaveLength(1)
+    expect(affected[0].prepared.flatMap(({ batches }) => decisionOffsets(batches, 1))).toEqual([])
+  }
+  const heldOutcomes = capture.outcomes.filter(
+    (row) =>
+      row.cohort === previous.cohort &&
+      row.type !== 'renew' &&
+      offsetsOf([row]).includes(held.offset)
+  )
+  expect(heldOutcomes).toHaveLength(1)
+  expect(heldOutcomes[0].type).toBe('release')
+  if (heldOutcomes[0].error)
+    expect(heldOutcomes[0].error.name).toBe('KafkaJSShareAcknowledgementError')
+  expect(heldOutcomes[0].public).toHaveLength(1)
+  for (const outcome of capture.outcomes.filter(({ groupId: group }) => group === groupId)) {
+    expect(outcome.public).toHaveLength(1)
+    const { payload } = outcome.public[0]
+    for (const key of ['type', 'firstOffset', 'lastOffset', 'error'])
+      expect(payload[key]).toEqual(outcome[key])
+  }
+  expect(capture.publications).toHaveLength(capture.outcomes.length)
+  for (const publication of capture.publications) {
+    const matches = capture.outcomes.filter(({ outcome }) => outcome === publication.outcome)
+    expect(matches).toHaveLength(1)
+    expect(matches[0].public[0].sequence).toBe(publication.sequence)
+    expect(matches[0].public[0].payload).toEqual(publication.payload)
+  }
+  const tickets = writes.flatMap(({ prepared }) => prepared.map(({ ticket }) => ticket))
+  expect(new Set(tickets).size).toBe(tickets.length)
+  assertLeaderCounts(previous, replay)
+  if (!terminal) return
+  const restoration = evidence.restoration
+  const restored = leaderSample(restoration.sample, evidence, exchanges).partition
+  expect(restored.leaderId).toBe(old.leaderId)
+  expect(restored.leaderEpoch).toBeGreaterThan(next.leaderEpoch)
+  expect(restored.replicaNodes).toEqual([
+    old.leaderId,
+    ...move.replicas.filter((id) => id !== old.leaderId),
+  ])
+  const restoredStart = restoration.events.filter(({ kind }) => kind === 'start')
+  const restoredComplete = restoration.events.filter(({ kind }) => kind === 'complete')
+  expect(restoredStart).toHaveLength(1)
+  expect(restoredComplete).toHaveLength(1)
+  expect(restoredComplete[0].result).toMatchObject({ code: 0, signal: null })
+  assertLeaderOrder(
+    replay,
+    restoration.start,
+    restoredStart[0],
+    restoredComplete[0],
+    restoration.sample.start,
+    restoration.sample.end,
+    restoration.end
+  )
+  expect(evidence.log).toEqual(expected)
+  expect(evidence.logEnd).toBe(String(RECORDS))
+  for (const identity of expected) {
+    const handler = handlers.filter((row) => row.identity === identity).at(-1)
+    const outcomes = capture.outcomes.filter(
+      (row) =>
+        row.cohort === handler.cohort &&
+        row.type !== 'renew' &&
+        offsetsOf([row]).includes(handler.offset)
+    )
+    expect(outcomes).toHaveLength(1)
+    const [outcome] = outcomes
+    expect(outcome.type).toBe('accept')
+    expect(outcome.error).toBeNull()
+    expect(outcome.public).toHaveLength(1)
+    const attempts = writes.flatMap((write) =>
+      write.prepared
+        .filter(
+          (ticket) =>
+            ticket.cohort === handler.cohort &&
+            !ticket.isRenewAck &&
+            decisionOffsets(ticket.batches, 1).includes(handler.offset)
+        )
+        .map((ticket) => ({ write, ticket }))
+    )
+    expect(attempts).toHaveLength(1)
+    const [{ write, ticket }] = attempts
+    expect(ticket.ledger).toBe(handler.ledger)
+    expect(ticket.acquisition).toBe(handler.acquisition)
+    expect(
+      writes.flatMap(({ prepared }) => prepared).filter((row) => row.ticket === ticket.ticket)
+    ).toHaveLength(1)
+    expect(write.answer?.errorCode).toBe(0)
+    const topics = write.answer.responses.filter((row) => row.topicId === topicId)
+    expect(topics).toHaveLength(1)
+    const partitions = topics[0].partitions.filter(({ partitionIndex }) => partitionIndex === 0)
+    expect(partitions).toHaveLength(1)
+    expect(write.apiKey === 78 ? partitions[0].acknowledgeErrorCode : partitions[0].errorCode).toBe(
+      0
+    )
+    expect(
+      write.fields.topics.flatMap((row) =>
+        row.topicId === topicId
+          ? row.partitions
+              .filter(({ partitionIndex }) => partitionIndex === 0)
+              .flatMap(({ acknowledgementBatches }) => decisionOffsets(acknowledgementBatches, 1))
+          : []
+      )
+    ).toContain(handler.offset)
+    const decisions = capture.decisions.filter(
+      (decision) =>
+        decision.ledger === handler.ledger &&
+        decision.offset === handler.offset &&
+        decision.method === 'decide'
+    )
+    expect(decisions).toHaveLength(1)
+    expect(decisions[0].type).toBe('accept')
+    const completed = capture.decisions.filter(
+      (decision) =>
+        decision.ledger === handler.ledger &&
+        decision.offset === handler.offset &&
+        decision.method !== 'decide'
+    )
+    expect(completed).toHaveLength(1)
+    assertLeaderOrder(handler, decisions[0], completed[0], write)
+    assertLeaderOrder(handler, write, write.response, outcome, outcome.public[0])
+  }
+  expect(evidence.quiet).toHaveLength(1)
+  const [quiet] = evidence.quiet
+  expect(quiet.groupId).toBe(groupId)
+  expect(quiet.delivered).toEqual([])
+  expect(quiet.activeFetches.length).toBeGreaterThan(1)
+  expect(
+    quiet.assignmentObservations.some(
+      (row) =>
+        row.groupId === groupId &&
+        row.snapshot.assignment.some(
+          (entry) => entry.topicId === topicId && entry.partitions.includes(0)
+        )
+    )
+  ).toBe(true)
+  expect(
+    evidence.quietObservations.filter(
+      (row) =>
+        row.groupId === groupId &&
+        row.status === 'quiet' &&
+        row.windowMs === 5000 &&
+        row.delivered.length === 0
+    )
+  ).toHaveLength(1)
+  for (const position of [evidence.terminalBefore, quiet.position]) {
+    expect(
+      terminalSharePosition(
+        { groupId, topic, partitions: [{ partition: 0, floor: '0', end: String(RECORDS) }] },
+        { ...position, topicId, ends: [{ partition: 0, high: evidence.logEnd }] }
+      ).settled
+    ).toBe(true)
+  }
+}
 
 /**
  * The live cases of one session scenario family: lost fetch response, leader move and the session
@@ -1226,6 +1894,9 @@ class SessionCase {
       brokers: plainTextBrokers(),
       logLevel: logLevel.NOTHING,
       clientId: `share-session-admin-${this.nonce}`,
+      ...(action === 'leader' && {
+        socketFactory: this.tap.wrap(defaultSocketFactory, 'admin'),
+      }),
     }).admin()
     this.stack = new CleanupStack()
     this.members = {}
@@ -1344,7 +2015,7 @@ class SessionCase {
         { budgetMs: PROOF_MS }
       )
       await this.settleProcess(scope, pre)
-      this.complete(base, after)
+      await this.complete(base, after)
     } catch (error) {
       this.row('case-failed', { status: 'failed', error: describeError(error), ...this.progress() })
       throw error
@@ -1501,7 +2172,11 @@ class SessionCase {
     )
     const [{ topicId, partitions }] = topics
     const [{ leader, leaderEpoch, replicas, isr }] = partitions
-    const { brokers } = await bounded(scope, STEP_MS, () => this.admin.describeCluster())
+    const { brokers } = await bounded(scope, STEP_MS, () =>
+      this.admin.describeCluster(
+        this.action === 'leader' ? { includeAuthorizedOperations: true } : {}
+      )
+    )
     const node = brokers.find(({ nodeId }) => nodeId === leader)
     return {
       topicId,
@@ -1881,6 +2556,7 @@ class SessionCase {
       pool: id(write.binding.pool),
       generation: write.binding.generation,
       connection: id(write.binding.connection),
+      socketInstance: id(write.socket),
       prepared: write.prepared.map(({ ledger, ticket, row }) => ({
         ledger: id(ledger),
         ticket: id(ticket),
@@ -1927,6 +2603,12 @@ class SessionCase {
         cohort: id(cohort),
         call: id(call),
         ledger: id(cohort.ledger),
+        acquisition: id(cohort.token),
+      })),
+      rounds: capture.rounds.map(({ run, loop, ...fact }) => ({
+        ...fact,
+        run: id(run),
+        loop: id(loop),
       })),
       decisions: capture.decisions.map(({ ledger, ...fact }) => ({ ...fact, ledger: id(ledger) })),
       outcomes: capture.outcomes.map((outcome) => ({
@@ -1935,13 +2617,26 @@ class SessionCase {
         groupId: outcome.groupId,
         sequence: outcome.sequence,
         at: outcome.at,
+        monotonic: outcome.monotonic,
         ...outcome.result,
         error: describeError(outcome.result.error),
         cause: id(outcome.result.error?.cause),
         public: capture.public
           .filter((entry) => entry.outcome === outcome)
-          .map(({ payload: _payload, outcome: _outcome, ...entry }) => entry),
+          .map(({ payload, outcome: _outcome, ...entry }) => ({
+            ...entry,
+            ...(this.action === 'leader' && {
+              payload: { ...payload, error: describeError(payload.error) },
+            }),
+          })),
       })),
+      ...(this.action === 'leader' && {
+        publications: capture.public.map(({ outcome, payload, ...fact }) => ({
+          ...fact,
+          outcome: id(outcome),
+          payload: { ...payload, error: describeError(payload.error) },
+        })),
+      }),
       losses: capture.losses.map(({ loop, open, cause, ...fact }) => ({
         ...fact,
         loop: id(loop),
@@ -2042,7 +2737,7 @@ class SessionCase {
             record: (fields) => this.row('broker-position', { ...fields, ...this.progress() }),
           }
         )
-        if (faultSettlement) this.terminalBefore = position
+        if (faultSettlement || this.action === 'leader') this.terminalBefore = position
         return position.rows[0]
       },
       { label: `${group} terminal settlement` }
@@ -2360,6 +3055,69 @@ class SessionCase {
     })
   }
 
+  /** Retains the actual API75/API60 exchanges inside one ordered leadership sample.
+   * @param {AbortSignal} scope Case scope.
+   * @returns {Promise<object>} Leadership projection and its original source interval.
+   */
+  async observeLeadership(scope) {
+    const start = this.capture.stamp()
+    let value
+    try {
+      value = await this.leadership(scope)
+    } catch (error) {
+      ;(this.leadershipErrors ??= []).push({
+        start,
+        end: this.capture.stamp(),
+        error: describeError(error),
+      })
+      throw error
+    }
+    const end = this.capture.stamp()
+    return {
+      ...value,
+      start,
+      end,
+      sources: this.tap.frames
+        .filter(
+          (frame) =>
+            frame.kind === 'request' &&
+            frame.label === 'admin' &&
+            [75, 60].includes(frame.apiKey) &&
+            frame.sequence > start.sequence &&
+            frame.sequence < end.sequence
+        )
+        .map(({ sequence }) => sequence),
+    }
+  }
+
+  /** Validates the replay from archived original facts before settlement and at finalization.
+   * @param {boolean} [terminal=false] Also require original successful Accepts and terminal evidence.
+   * @returns {Promise<void>} Missing evidence rejects the case.
+   */
+  async assertLeaderReplay(terminal = false) {
+    await this.capture.refresh()
+    this.leaderEvidence = {
+      action: this.action,
+      scenario: this.nonce,
+      groupId: this.groups.main,
+      topic: this.topic,
+      topicId: this.topicId,
+      expected: this.expected,
+      move: this.leaderMove,
+      capture: this.captureEvidence(),
+      diagnosticErrors: this.leadershipErrors ?? [],
+      restoration: this.leaderRestoration,
+      ...(terminal && {
+        log: this.log,
+        logEnd: this.logEnd,
+        terminalBefore: this.terminalBefore,
+        quiet: this.quiet,
+        quietObservations: this.quietObservations,
+      }),
+    }
+    await assertLeaderReplayEvidence(this.leaderEvidence, terminal)
+  }
+
   /**
    * A leader move under a held acquisition. The partition's leadership is moved with the guarded
    * helpers while the held record is renewed; then the handler is released and the client must
@@ -2373,13 +3131,19 @@ class SessionCase {
     const group = await this.group(scope, 'main')
     const expected = await this.produce(scope)
     const before = await this.leadership(scope)
+    this.topicId = before.topicId
     expect(before.isr).toHaveLength(3)
     const target = Math.min(...before.replicas.filter((id) => id !== before.leader))
     const moved = { done: false }
     this.stack.add('restore the preferred leader', async (signal) => {
       if (!moved.done) return
-      await moveLeadership(signal, [this.topic, before.replicas, before.leader])
+      this.leaderRestoration = { start: this.capture.stamp(), events: [] }
+      await moveLeadership(signal, [this.topic, before.replicas, before.leader], (kind, result) => {
+        this.leaderRestoration.events.push({ kind, result, ...this.capture.stamp() })
+      })
       await waitForFullIsr(this.admin, [this.topic], { budgetMs: 30000 })
+      this.leaderRestoration.sample = await this.observeLeadership(signal)
+      this.leaderRestoration.end = this.capture.stamp()
     })
 
     const hold = gate()
@@ -2400,8 +3164,11 @@ class SessionCase {
           payload.acknowledge('release')
           held.outcome = { decision: 'release' }
         } catch (error) {
+          expect(error.name).toBe('KafkaJSNonRetriableError')
+          expect(error.retriable).toBe(false)
           held.outcome = { lost: describeError(error) }
         }
+        this.leaderMove.release = { ...this.capture.stamp(), ...held.outcome }
       },
     })
     await this.launch(scope, member)
@@ -2428,32 +3195,52 @@ class SessionCase {
       await schedule.catch(() => {})
     })
 
+    const old = await this.observeLeadership(scope)
+    expect(old.leader).toBe(before.leader)
+    expect(old.leaderEpoch).toBe(before.leaderEpoch)
     const moving = this.capture.writes.filter(
       ({ loop, exchange }) =>
         loop.groupId === group && loop.exchanges.has(exchange) && exchange.prepared.length > 0
     )
     const moveFault = this.capture.freeze('leader-move', moving)
+    this.leaderMove = {
+      old,
+      samples: [old],
+      target,
+      topic: this.topic,
+      partition: 0,
+      replicas: [...before.replicas],
+      events: [],
+    }
     expect(
       moveFault.writes.flatMap(({ prepared }) =>
         prepared.flatMap(({ ticket }) => decisionOffsets(ticket.acknowledgementBatches, 1))
       )
     ).toEqual([])
     moved.done = true
-    await moveLeadership(scope, [this.topic, before.replicas, target])
+    await moveLeadership(scope, [this.topic, before.replicas, target], (kind, result) => {
+      this.leaderMove.events.push({ kind, result, ...this.capture.stamp() })
+    })
     let after
     await pollTolerating(
       scope,
       STEP_MS,
       async () => {
-        after = await this.leadership(scope)
+        after = await this.observeLeadership(scope)
+        this.leaderMove.samples.push(after)
         return after.leader === target && after.isr.length === 3
       },
       { delayMs: 500, label: 'The new leader with a full ISR' }
     )
-    expect(after.leaderEpoch).toBeGreaterThan(before.leaderEpoch)
+    expect(after.leaderEpoch).toBeGreaterThan(old.leaderEpoch)
+    this.leaderMove.next = after
     renewing.on = false
     await schedule
+    this.leaderMove.renewalStart = this.capture.stamp()
     const finalRenewal = await this.renewal(held.payload)
+    this.leaderMove.renewalEnd = this.capture.stamp()
+    this.leaderMove.finalRenewal = finalRenewal
+    this.leaderMove.scheduleRenewals = renewals
     this.row('fault', {
       before,
       after,
@@ -2465,6 +3252,7 @@ class SessionCase {
 
     const fetchesBefore = this.tap.requestsOf('A', API_SHARE_FETCH).length
     held.releasedAt = Date.now()
+    this.leaderMove.gate = this.capture.stamp()
     hold.open()
     await this.awaitDelivered(scope, member, RECORDS + 1)
     expect(member.crashes).toEqual([])
@@ -2489,7 +3277,7 @@ class SessionCase {
       counts.set(identity, [...(counts.get(identity) ?? []), deliveryCount])
     }
     expect(counts.get(heldIdentity)).toHaveLength(2)
-    expect(counts.get(heldIdentity)[1]).toBe(counts.get(heldIdentity)[0] + 1)
+    await this.assertLeaderReplay()
     for (const identity of expected.filter((id) => id !== heldIdentity)) {
       expect(counts.get(identity)).toHaveLength(1)
     }
@@ -2709,9 +3497,9 @@ class SessionCase {
    * Writes the one completion row, only after every assertion and the strict cleanup passed.
    * @param {object} before the baseline snapshot
    * @param {object} after the snapshot after cleanup
-   * @returns {void}
+   * @returns {Promise<void>}
    */
-  complete(before, after) {
+  async complete(before, after) {
     if (this.action === 'timeout') {
       expect(this.settlement.provisional).toEqual([])
       expect(this.settlement.missing).toEqual([])
@@ -2723,6 +3511,7 @@ class SessionCase {
       expect(this.quiet).toHaveLength(1)
       expect(this.recovery).toBeDefined()
     }
+    if (this.action === 'leader') await this.assertLeaderReplay(true)
     const requests = Object.values(this.members).flatMap(({ requests: list }) => list)
     this.row('case-complete', {
       status: 'passed',
@@ -2737,6 +3526,7 @@ class SessionCase {
           Object.entries(this.handlers).map(([label, actual]) => [label, { actual }])
         ),
         broker: this.broker,
+        ...(this.action === 'leader' && { leaderMove: this.leaderEvidence }),
         acknowledgements: this.progress(),
         quiet: this.quiet,
       },
@@ -3065,6 +3855,1144 @@ const scriptedSettlement = async () => {
   ]
   return owner
 }
+
+/** Builds two original acquisitions and one controlled move without a broker or a timer.
+ * @param {number} count Replayed wire count.
+ * @returns {Promise<object>} Lossless evidence with an independent fixed corpus.
+ */
+const scriptedLeaderReplay = async (count) => {
+  const Encoder = require('../../../protocol/encoder')
+  const {
+    batch,
+    record,
+  } = require('../../../protocol/requests/fetch/__tests__/fixtures/recordBatchBytes')
+  const owner = Object.create(SessionCase.prototype)
+  Object.assign(owner, {
+    action: 'leader',
+    nonce: 'scripted-move',
+    topic: 'records',
+    topicId: '12345678-1234-1234-1234-123456789abc',
+    groups: { main: 'original-group' },
+    tap: new ShareWireTap(),
+  })
+  const capture = new SettlementCapture(owner)
+  const stamp = capture.stamp.bind(capture)
+  capture.stamp = () => {
+    const observation = stamp()
+    return { ...observation, sequence: observation.sequence * 10 }
+  }
+  owner.capture = capture
+  const records = Array.from({ length: RECORDS }, (_, offset) => ({
+    offset: String(offset),
+    key: Buffer.from(`key-${offset}`),
+    value: Buffer.from(`value-${offset}`),
+  }))
+  owner.expected = records.map((message) =>
+    shareRecordIdentity({ ...message, topic: owner.topic, partition: 0 })
+  )
+  const run = {}
+  const nodes = [1, 2, 3].map((id) => ({ id }))
+  const sockets = [{}, {}]
+  const loops = nodes
+    .slice(0, 2)
+    .map((node) => ({ groupId: owner.groups.main, memberId: 'original-member', node }))
+  const bindings = sockets.map((socket) => ({ pool: {}, connection: { socket }, generation: 1 }))
+  const opens = [Symbol('old-open'), Symbol('new-open')]
+  const membership = Symbol('membership')
+  let correlation = 0
+  /** @param {object} request Encoded protocol request. @param {Buffer} body Response body. @param {number} node Serving node. @param {object[]} [prepared] Original tickets. @returns {Promise<object>} Original write and response. */
+  const exchange = async (request, body, node, prepared = []) => {
+    const share = [78, 79].includes(request.apiKey)
+    const socket = share ? node : 10
+    const id = ++correlation
+    const header = new Encoder()
+      .writeInt16(request.apiKey)
+      .writeInt16(request.apiVersion)
+      .writeInt32(id)
+      .writeString('original-client')
+      .writeTaggedFields().buffer
+    const payload = Buffer.concat([header, (await request.encode()).buffer])
+    const frame = new Encoder().writeInt32(payload.length).writeBuffer(payload).buffer
+    const fact = {
+      ...readRequestHeader(frame),
+      kind: 'request',
+      frame,
+      socket,
+      host: `broker${node}`,
+      port: 9092,
+      label: share ? 'A' : 'admin',
+      ref: { socket: sockets[node - 1] },
+      ...capture.stamp(),
+    }
+    owner.tap.frames.push(fact)
+    let write
+    if (share) {
+      const fields = (request.apiKey === 78 ? shareFetchWire : shareAcknowledgeWire).readRequest(
+        frame.subarray(fact.byteLength)
+      )
+      const original = { open: opens[node - 1], binding: bindings[node - 1] }
+      write = {
+        exchange: original,
+        loop: loops[node - 1],
+        run,
+        node: nodes[node - 1],
+        open: original.open,
+        binding: original.binding,
+        membership,
+        socket: sockets[node - 1],
+        fact,
+        fields,
+        prepared,
+        ...capture.stamp(),
+      }
+      fact.write = write
+      capture.writes.push(write)
+    }
+    const response = {
+      kind: 'response',
+      socket,
+      correlationId: id,
+      host: fact.host,
+      port: fact.port,
+      label: fact.label,
+      frame: new Encoder()
+        .writeInt32(body.length + 5)
+        .writeInt32(id)
+        .writeInt8(0)
+        .writeBuffer(body).buffer,
+      ...capture.stamp(),
+    }
+    owner.tap.frames.push(response)
+    if (write) write.response = response
+    return { fact, write, response }
+  }
+  const partitions = (batches = []) => [{ partitionIndex: 0, acknowledgementBatches: batches }]
+  /** @param {number} node Serving node. @param {number} epoch Wire session epoch. @param {object[]} selected Original records. @param {number} deliveryCount Wire count. @returns {Promise<object>} Successful acquisition. */
+  const fetch = (node, epoch, selected, deliveryCount) => {
+    const first = selected[0]?.offset
+    return exchange(
+      require('../../../protocol/requests/shareFetch/v2/request')({
+        groupId: owner.groups.main,
+        memberId: 'original-member',
+        shareSessionEpoch: epoch,
+        maxRecords: 1,
+        topics: [{ topicId: owner.topicId, partitions: partitions() }],
+      }),
+      shareFetchWire.buildResponse({
+        responses: [
+          {
+            topicId: owner.topicId,
+            partitions: [
+              {
+                partitionIndex: 0,
+                errorCode: 0,
+                errorMessage: null,
+                acknowledgeErrorCode: 0,
+                acknowledgeErrorMessage: null,
+                currentLeader: { leaderId: -1, leaderEpoch: -1 },
+                records: selected.length
+                  ? batch({
+                      baseOffset: BigInt(first),
+                      records: selected.map((message) =>
+                        record({
+                          ...message,
+                          offsetDelta: Number(BigInt(message.offset) - BigInt(first)),
+                        })
+                      ),
+                    }).toString('hex')
+                  : '',
+                acquiredRecords: selected.length
+                  ? [{ firstOffset: first, lastOffset: selected.at(-1).offset, deliveryCount }]
+                  : [],
+              },
+            ],
+          },
+        ],
+      }),
+      node
+    )
+  }
+  /** @param {object} source Successful original exchange. @param {object} message Original record. @param {number} deliveryCount Original count. @returns {object} Original cohort and handler. */
+  const adopt = (source, message, deliveryCount) => {
+    const token = Symbol('acquisition')
+    const walk = {
+      deliver: { records: [message], deliveryCounts: [deliveryCount] },
+      gaps: [],
+      release: [],
+      reject: [],
+    }
+    const ledger = new ShareAckLedger({
+      topic: owner.topic,
+      topicId: owner.topicId,
+      partition: 0,
+      token,
+      sentAt: 0,
+      lockDuration: LOCK_MS,
+      walk,
+    })
+    const cohort = { topic: owner.topic, topicId: owner.topicId, partition: 0, ledger, token, walk }
+    capture.acquisitions.push({
+      cohort,
+      exchange: source.write.exchange,
+      original: {
+        ledger: capture.id(ledger),
+        token: capture.id(token),
+        cohort: capture.id(cohort),
+        exchange: capture.id(source.write.exchange),
+        open: capture.id(source.write.open),
+        records: [
+          {
+            offset: message.offset,
+            key: message.key.toString('base64'),
+            value: message.value.toString('base64'),
+          },
+        ],
+        deliveryCounts: [deliveryCount],
+      },
+      ...capture.stamp(),
+    })
+    const handler = {
+      run,
+      node: source.write.node,
+      call: {},
+      cohort,
+      groupId: owner.groups.main,
+      memberId: 'original-member',
+      clientId: 'original-client',
+      offset: message.offset,
+      identity: owner.expected[Number(message.offset)],
+      deliveryCount,
+      originalLedger: capture.id(ledger),
+      originalToken: capture.id(token),
+      originalMembership: capture.id(membership),
+      ...capture.stamp(),
+    }
+    capture.handlers.push(handler)
+    return { cohort, handler }
+  }
+  /** @param {object} cohort Original acquisition. @param {string} type Decision. @param {number} node Serving node. @returns {Promise<void>} Real ledger ticket and scripted response. */
+  const acknowledge = async (cohort, type, node) => {
+    const offset = cohort.walk.deliver.records[0].offset
+    const renew = type === 'renew'
+    if (!renew) {
+      cohort.ledger.decide(offset, type)
+      capture.decisions.push({
+        ledger: cohort.ledger,
+        offset,
+        type,
+        method: 'decide',
+        ...capture.stamp(),
+      })
+      cohort.ledger.complete([offset], type)
+      capture.decisions.push({
+        ledger: cohort.ledger,
+        offset,
+        type,
+        method: 'complete',
+        ...capture.stamp(),
+      })
+    }
+    const { ticket } = cohort.ledger.prepare({
+      token: cohort.token,
+      ...(renew && { renewOffsets: [offset] }),
+    })
+    const source = await exchange(
+      require('../../../protocol/requests/shareAcknowledge/v2/request')({
+        groupId: owner.groups.main,
+        memberId: 'original-member',
+        shareSessionEpoch: 1,
+        isRenewAck: renew,
+        topics: [{ topicId: owner.topicId, partitions: partitions(ticket.acknowledgementBatches) }],
+      }),
+      shareAcknowledgeWire.buildResponse({
+        responses: [
+          {
+            topicId: owner.topicId,
+            partitions: [
+              {
+                partitionIndex: 0,
+                errorCode: 0,
+                errorMessage: null,
+                currentLeader: { leaderId: -1, leaderEpoch: -1 },
+              },
+            ],
+          },
+        ],
+      }),
+      node,
+      [{ row: cohort, ledger: cohort.ledger, ticket }]
+    )
+    for (const result of cohort.ledger.settle(ticket, {
+      token: cohort.token,
+      ...(renew && { sentAt: source.fact.monotonic, lockDuration: LOCK_MS }),
+    })) {
+      const outcome = { cohort, groupId: owner.groups.main, result, ...capture.stamp() }
+      capture.outcomes.push(outcome)
+      capture.public.push({
+        outcome,
+        payload: { ...result, topic: owner.topic, partition: 0 },
+        ...capture.stamp(),
+      })
+    }
+    return source
+  }
+  /** @param {number} leader Serving node. @param {number} epoch Leader epoch. @param {number[]} replicas Replica order. @returns {Promise<object>} Primitive metadata and raw sources. */
+  const sample = async (leader, epoch, replicas) => {
+    const start = capture.stamp()
+    const metadata = await exchange(
+      require('../../../protocol/requests/describeTopicPartitions/v0/request')({
+        topics: [owner.topic],
+      }),
+      require('../../../../testHelpers/wire/describeTopicPartitionsV0').buildResponse({
+        topics: [
+          {
+            name: owner.topic,
+            topicId: owner.topicId,
+            errorCode: 0,
+            isInternal: false,
+            topicAuthorizedOperations: 0,
+            partitions: [
+              {
+                partitionIndex: 0,
+                errorCode: 0,
+                leaderId: leader,
+                leaderEpoch: epoch,
+                replicaNodes: replicas,
+                isrNodes: [1, 2, 3],
+                eligibleLeaderReplicas: null,
+                lastKnownElr: null,
+                offlineReplicas: [],
+              },
+            ],
+          },
+        ],
+        nextCursor: null,
+      }),
+      1
+    )
+    const cluster = await exchange(
+      require('../../../protocol/requests/describeCluster/v2/request')({}),
+      require('../../../../testHelpers/wire/describeClusterV2').buildResponse({
+        errorCode: 0,
+        brokers: nodes.map(({ id }) => ({
+          brokerId: id,
+          host: `broker${id}`,
+          port: 9092,
+          rack: null,
+          isFenced: false,
+        })),
+      }),
+      1
+    )
+    return {
+      topicId: owner.topicId,
+      leader,
+      leaderEpoch: epoch,
+      replicas,
+      isr: [1, 2, 3],
+      endpoint: `broker${leader}:9092`,
+      start,
+      end: capture.stamp(),
+      sources: [metadata.fact.sequence, cluster.fact.sequence],
+    }
+  }
+  const firstRound = capture.stamp()
+  const source = await fetch(1, 0, [records[0]], 1)
+  const previous = adopt(source, records[0], 1)
+  const old = await sample(1, 4, [1, 2, 3])
+  capture.freeze('leader-move', [])
+  const events = [{ kind: 'start', ...capture.stamp() }]
+  const commands = [
+    {
+      args: ['sh', '-c', 'cat > reassignment.json'],
+      input: JSON.stringify({
+        version: 1,
+        partitions: [{ topic: owner.topic, partition: 0, replicas: [2, 1, 3] }],
+      }),
+      stdout: '',
+    },
+    {
+      args: ['/bin/kafka-reassign-partitions.sh', '--execute'],
+      input: null,
+      stdout: 'Successfully started partition reassignments',
+    },
+    {
+      args: ['/bin/kafka-reassign-partitions.sh', '--verify'],
+      input: null,
+      stdout: `Reassignment of partition ${owner.topic}-0 is completed.`,
+    },
+    {
+      args: [
+        '/bin/kafka-leader-election.sh',
+        '--election-type',
+        'PREFERRED',
+        '--topic',
+        owner.topic,
+        '--partition',
+        '0',
+      ],
+      input: null,
+      stdout: `Successfully completed leader election (PREFERRED) for partitions ${owner.topic}-0`,
+    },
+  ]
+  for (const command of commands)
+    events.push({ kind: 'command', result: { ...command, status: 0 }, ...capture.stamp() })
+  events.push({ kind: 'complete', result: { code: 0, signal: null }, ...capture.stamp() })
+  const next = await sample(2, 7, [2, 1, 3])
+  const renewalStart = capture.stamp()
+  await acknowledge(previous.cohort, 'renew', 1)
+  const renewalEnd = capture.stamp()
+  const move = {
+    topic: owner.topic,
+    partition: 0,
+    replicas: [1, 2, 3],
+    target: 2,
+    old,
+    next,
+    samples: [old, next],
+    events,
+    renewalStart,
+    renewalEnd,
+    finalRenewal: { lockMs: LOCK_MS },
+    gate: capture.stamp(),
+  }
+  move.release = { decision: 'release', ...capture.stamp() }
+  await acknowledge(previous.cohort, 'release', 1)
+  capture.rounds.push({ run, loop: loops[0], start: firstRound, end: capture.stamp() })
+  for (const message of records) {
+    const start = capture.stamp()
+    const acquisition = await fetch(
+      2,
+      Number(message.offset),
+      [message],
+      message.offset === '0' ? count : 1
+    )
+    const { cohort } = adopt(acquisition, message, message.offset === '0' ? count : 1)
+    await acknowledge(cohort, 'accept', 2)
+    capture.rounds.push({ run, loop: loops[1], start, end: capture.stamp() })
+  }
+  const restoration = { start: capture.stamp(), events: [{ kind: 'start', ...capture.stamp() }] }
+  restoration.events.push({
+    kind: 'complete',
+    result: { code: 0, signal: null },
+    ...capture.stamp(),
+  })
+  restoration.sample = await sample(1, 9, [1, 2, 3])
+  restoration.end = capture.stamp()
+  await capture.refresh()
+  const listing = [
+    {
+      topic: owner.topic,
+      topicId: owner.topicId,
+      partitions: [{ partition: 0, errorCode: 0, lag: '0', startOffset: '100', leaderEpoch: 7 }],
+    },
+  ]
+  return {
+    action: owner.action,
+    scenario: owner.nonce,
+    groupId: owner.groups.main,
+    topic: owner.topic,
+    topicId: owner.topicId,
+    expected: owner.expected,
+    capture: owner.captureEvidence(),
+    diagnosticErrors: [],
+    restoration,
+    move,
+    log: [...owner.expected],
+    logEnd: '300',
+    terminalBefore: { named: listing, all: listing },
+    quiet: [
+      {
+        groupId: owner.groups.main,
+        delivered: [],
+        activeFetches: [{ at: 0 }, { at: 5000 }],
+        assignmentObservations: [
+          {
+            groupId: owner.groups.main,
+            snapshot: { assignment: [{ topicId: owner.topicId, partitions: [0] }] },
+          },
+        ],
+        position: { named: listing, all: listing },
+      },
+    ],
+    quietObservations: [
+      { groupId: owner.groups.main, status: 'quiet', windowMs: 5000, delivered: [] },
+    ],
+  }
+}
+
+/** Runs the live case entry point against an archived script without starting clients.
+ * @param {object} evidence Original scripted journal.
+ * @returns {Promise<void>} The same replay and finalization predicates as the live arm.
+ */
+const assertScriptedLeaderCase = async (evidence) => {
+  const owner = Object.assign(Object.create(SessionCase.prototype), {
+    action: evidence.action,
+    nonce: evidence.scenario,
+    groups: { main: evidence.groupId },
+    topic: evidence.topic,
+    topicId: evidence.topicId,
+    expected: evidence.expected,
+    leaderMove: evidence.move,
+    leadershipErrors: evidence.diagnosticErrors,
+    leaderRestoration: evidence.restoration,
+    capture: { refresh: async () => {} },
+    captureEvidence: () => evidence.capture,
+    log: evidence.log,
+    logEnd: evidence.logEnd,
+    terminalBefore: evidence.terminalBefore,
+    quiet: evidence.quiet,
+    quietObservations: evidence.quietObservations,
+  })
+  await owner.assertLeaderReplay(true)
+}
+
+/** Mutates a single decoded broker fact, then archives a complete independently encoded frame.
+ * @param {object} evidence Scripted evidence.
+ * @param {object} request Original request frame.
+ * @param {Function} mutate Changes one response field.
+ * @returns {Promise<void>} The surrounding journal and independent corpus stay fixed.
+ */
+const changeLeaderAnswer = async (evidence, request, mutate) => {
+  const Encoder = require('../../../protocol/encoder')
+  const {
+    batch,
+    record,
+  } = require('../../../protocol/requests/fetch/__tests__/fixtures/recordBatchBytes')
+  const exchanges = await leaderExchanges(evidence.capture)
+  const source = exchanges.find(({ sequence }) => sequence === request.sequence)
+  const answer = source.answer
+  mutate(answer)
+  let body
+  if (source.apiKey === 78) {
+    body = shareFetchWire.buildResponse({
+      ...answer,
+      responses: answer.responses.map((row) => ({
+        ...row,
+        partitions: row.partitions.map((partition) => ({
+          ...partition,
+          records: partition.messages.length
+            ? batch({
+                baseOffset: BigInt(partition.messages[0].offset),
+                records: partition.messages.map((message) =>
+                  record({
+                    ...message,
+                    offsetDelta: Number(
+                      BigInt(message.offset) - BigInt(partition.messages[0].offset)
+                    ),
+                  })
+                ),
+              }).toString('hex')
+            : '',
+        })),
+      })),
+    })
+  } else if (source.apiKey === 79) body = shareAcknowledgeWire.buildResponse(answer)
+  else if (source.apiKey === 75)
+    body = require('../../../../testHelpers/wire/describeTopicPartitionsV0').buildResponse(answer)
+  else body = require('../../../../testHelpers/wire/describeClusterV2').buildResponse(answer)
+  const original = evidence.capture.frames.find(
+    ({ sequence }) => sequence === source.response.sequence
+  )
+  original.bytes = new Encoder()
+    .writeInt32(body.length + 5)
+    .writeInt32(source.correlationId)
+    .writeInt8(0)
+    .writeBuffer(body)
+    .buffer.toString('base64')
+}
+
+/** Requires semantic rejection through the live entry point and archived evidence reconstruction.
+ * @param {object} evidence Mutated original journal.
+ * @returns {Promise<void>} Both validators must reject without a timeout.
+ */
+const rejectLeaderScript = async (evidence) => {
+  await expect(assertScriptedLeaderCase(evidence)).rejects.toThrow()
+  await expect(assertLeaderReplayEvidence(evidence, true)).rejects.toThrow()
+}
+
+describe('held leader-move replay sensitivity', () => {
+  it.each(['4.3.1', '4.4.0'])(
+    'accepts both witnessed original count histories under %s',
+    async (version) => {
+      for (const count of [1, 2]) {
+        const evidence = await scriptedLeaderReplay(count)
+        evidence.version = version
+        await assertScriptedLeaderCase(evidence)
+        await assertLeaderReplayEvidence(evidence, true)
+        const pair = evidence.capture.handlers.filter(
+          ({ identity }) => identity === evidence.expected[0]
+        )
+        if (count === 1)
+          expect(() => expect(pair[1].deliveryCount).toBe(pair[0].deliveryCount + 1)).toThrow()
+      }
+    }
+  )
+
+  it.each([1, 2])(
+    'rejects a cloned cohort re-dispatch of one original acquisition at count %s',
+    async (count) => {
+      const evidence = await scriptedLeaderReplay(count)
+      const [previous, replay] = evidence.capture.handlers.filter(
+        ({ identity }) => identity === evidence.expected[0]
+      )
+      const old = evidence.capture.acquisitions.find(({ cohort }) => cohort === previous.cohort)
+      const cloned = evidence.capture.acquisitions.find(({ cohort }) => cohort === replay.cohort)
+      cloned.exchange = old.exchange
+      await rejectLeaderScript(evidence)
+    }
+  )
+
+  const acquisitionCases = [
+    [
+      'missing original response',
+      (e, request) => {
+        const response = e.capture.frames.find(
+          (row) =>
+            row.kind === 'response' &&
+            row.socket === request.socket &&
+            row.correlationId === request.correlationId
+        )
+        e.capture.frames = e.capture.frames.filter((row) => row !== response)
+      },
+    ],
+    [
+      'missing original request frame',
+      (e, request) => {
+        e.capture.frames = e.capture.frames.filter((row) => row !== request)
+      },
+    ],
+    [
+      'discarded response without adoption',
+      (e) => {
+        e.capture.acquisitions.splice(1, 1)
+      },
+    ],
+    [
+      'replacement ledger',
+      (e) => {
+        e.capture.acquisitions[1].ledger = 'replacement-ledger'
+      },
+    ],
+    [
+      'replacement token',
+      (e) => {
+        e.capture.handlers[1].acquisition = 'replacement-token'
+      },
+    ],
+    [
+      'foreign group',
+      (e) => {
+        e.capture.handlers[1].groupId = 'foreign-group'
+      },
+    ],
+    [
+      'foreign UUID',
+      (e) => {
+        e.capture.acquisitions[1].topicId = 'foreign-topic'
+      },
+    ],
+    [
+      'foreign offset',
+      (e) => {
+        e.capture.handlers[1].offset = '1'
+      },
+    ],
+    [
+      'changed bytes',
+      (e) => {
+        e.capture.acquisitions[1].records[0].value = Buffer.from('changed').toString('base64')
+      },
+    ],
+    [
+      'failed fetch',
+      (e, request) =>
+        changeLeaderAnswer(e, request, (a) => {
+          a.responses[0].partitions[0].errorCode = 6
+        }),
+    ],
+    [
+      'failed group fetch',
+      (e, request) =>
+        changeLeaderAnswer(e, request, (a) => {
+          a.errorCode = 42
+        }),
+    ],
+    [
+      'empty acquired ranges',
+      (e, request) =>
+        changeLeaderAnswer(e, request, (a) => {
+          a.responses[0].partitions[0].acquiredRecords = []
+        }),
+    ],
+    [
+      'non-containing acquired range',
+      (e, request) =>
+        changeLeaderAnswer(e, request, (a) => {
+          a.responses[0].partitions[0].acquiredRecords[0].firstOffset = '1'
+          a.responses[0].partitions[0].acquiredRecords[0].lastOffset = '1'
+        }),
+    ],
+    [
+      'duplicate acquired range',
+      (e, request) =>
+        changeLeaderAnswer(e, request, (a) => {
+          const p = a.responses[0].partitions[0]
+          p.acquiredRecords.push({ ...p.acquiredRecords[0] })
+        }),
+    ],
+    [
+      'changed original wire count',
+      (e, request) =>
+        changeLeaderAnswer(e, request, (a) => {
+          a.responses[0].partitions[0].acquiredRecords[0].deliveryCount = 2
+        }),
+    ],
+    [
+      'foreign partition',
+      (e, request) =>
+        changeLeaderAnswer(e, request, (a) => {
+          a.responses[0].partitions[0].partitionIndex = 1
+        }),
+    ],
+  ]
+  it.each(acquisitionCases)('rejects acquisition provenance: %s', async (_name, mutate) => {
+    const evidence = await scriptedLeaderReplay(1)
+    const handler = evidence.capture.handlers[1]
+    const adoption = evidence.capture.acquisitions.find(({ cohort }) => cohort === handler.cohort)
+    const request = evidence.capture.frames.find((frame) => frame.exchange === adoption.exchange)
+    await mutate(evidence, request)
+    await rejectLeaderScript(evidence)
+  })
+
+  it('keeps correlation reuse scoped to its original socket and exchange', async () => {
+    const evidence = await scriptedLeaderReplay(1)
+    const fetches = evidence.capture.frames.filter(({ apiKey }) => apiKey === 78)
+    const [old, replay] = fetches
+    const response = evidence.capture.frames.find(
+      (row) =>
+        row.kind === 'response' &&
+        row.socket === replay.socket &&
+        row.correlationId === replay.correlationId
+    )
+    const rewriteCorrelation = (frame, value) => {
+      const bytes = Buffer.from(frame.bytes, 'base64')
+      bytes.writeInt32BE(value, frame.kind === 'request' ? 8 : 4)
+      frame.bytes = bytes.toString('base64')
+      frame.correlationId = value
+    }
+    rewriteCorrelation(replay, old.correlationId)
+    rewriteCorrelation(response, old.correlationId)
+    await assertScriptedLeaderCase(evidence)
+    replay.socket = old.socket
+    await rejectLeaderScript(evidence)
+  })
+
+  it.each([4, 3, -1])(
+    'rejects an unadvanced serving epoch %s despite distinct acquisitions',
+    async (epoch) => {
+      const evidence = await scriptedLeaderReplay(1)
+      const request = evidence.capture.frames.find(
+        ({ sequence }) => sequence === evidence.move.next.sources[0]
+      )
+      await changeLeaderAnswer(evidence, request, (answer) => {
+        answer.topics[0].partitions[0].leaderEpoch = epoch
+      })
+      evidence.move.next.leaderEpoch = epoch
+      await rejectLeaderScript(evidence)
+    }
+  )
+
+  const moveCases = [
+    [
+      'missing original decision link',
+      (e) => {
+        e.capture.decisions = e.capture.decisions.filter((row) => row.method !== 'decide')
+      },
+    ],
+
+    [
+      'retained diagnostic error',
+      (e) => {
+        e.diagnosticErrors.push({ error: { name: 'Error', message: 'inconsistent source' } })
+      },
+    ],
+    [
+      'missing epoch',
+      (e) => {
+        delete e.move.next.leaderEpoch
+      },
+    ],
+    [
+      'unknown leader',
+      (e) => {
+        e.move.next.leader = -1
+      },
+    ],
+    [
+      'same target',
+      (e) => {
+        e.move.target = 1
+      },
+    ],
+    [
+      'non-lowest target',
+      (e) => {
+        e.move.target = 3
+      },
+    ],
+    [
+      'failed helper',
+      (e) => {
+        e.move.events.at(-1).result.code = 1
+      },
+    ],
+    [
+      'incomplete helper',
+      (e) => {
+        e.move.events.pop()
+      },
+    ],
+    [
+      'no-op election',
+      (e) => {
+        e.move.events.at(-2).result.stdout = 'Election not needed'
+      },
+    ],
+    [
+      'missing target confirmation',
+      (e) => {
+        delete e.move.next
+      },
+    ],
+    [
+      'missing full ISR',
+      (e) => {
+        e.move.next.isr = [1, 2]
+      },
+    ],
+    [
+      'restoration-only advance',
+      (e) => {
+        e.move.events[0].kind = 'restoration'
+      },
+    ],
+    [
+      'missing metadata source',
+      (e) => {
+        e.move.old.sources = []
+      },
+    ],
+    [
+      'boolean epoch witness',
+      (e) => {
+        e.move.next = { leaderAdvanced: true }
+      },
+    ],
+    [
+      'coordinator/session/generation only',
+      (e) => {
+        e.move.next = { memberEpoch: 7, shareSessionEpoch: 7, generation: 2 }
+      },
+    ],
+    [
+      'only record-batch epoch or CurrentLeader',
+      (e) => {
+        e.move.next = { partitionLeaderEpoch: 7, currentLeader: { leaderId: 2, leaderEpoch: 7 } }
+      },
+    ],
+    [
+      'setup sample before acquisition',
+      (e) => {
+        e.move.old.start.sequence = 0
+        e.move.old.start.monotonic = 0
+      },
+    ],
+    [
+      'old response after move began',
+      (e) => {
+        const response = e.capture.frames.find((row) => row.kind === 'response')
+        response.sequence = e.move.events[0].sequence + 1
+      },
+    ],
+    [
+      'early new request write',
+      (e) => {
+        const request = e.capture.frames.filter(({ apiKey }) => apiKey === 78)[1]
+        request.sequence = e.move.next.start.sequence + 1
+      },
+    ],
+    [
+      'unaccounted held-interval fetch',
+      (e) => {
+        const request = e.capture.frames.filter(({ apiKey }) => apiKey === 78)[2]
+        request.sequence = e.move.old.end.sequence + 1
+      },
+    ],
+    [
+      'delayed old response relabelled new',
+      (e) => {
+        e.capture.acquisitions[1].sequence = e.move.events[0].sequence - 1
+      },
+    ],
+    [
+      'missing original round completion',
+      (e) => {
+        e.capture.rounds.shift()
+      },
+    ],
+    [
+      'missing gate event',
+      (e) => {
+        delete e.move.gate
+      },
+    ],
+    [
+      'missing final renewal result',
+      (e) => {
+        delete e.move.finalRenewal
+      },
+    ],
+    [
+      'missing Release or typed loss',
+      (e) => {
+        delete e.move.release.decision
+      },
+    ],
+    [
+      'missing h replay',
+      (e) => {
+        e.capture.handlers.splice(1, 1)
+      },
+    ],
+    [
+      'third h invocation',
+      (e) => {
+        e.capture.handlers.push({ ...e.capture.handlers[1], handler: 'third' })
+      },
+    ],
+    [
+      'duplicate non-held identity',
+      (e) => {
+        e.capture.handlers[2].identity = e.capture.handlers[3].identity
+      },
+    ],
+    [
+      'changed frozen H',
+      (e) => {
+        e.capture.faults[0].held = [{ ...e.capture.faults[0].held[0], identity: e.expected[1] }]
+      },
+    ],
+    [
+      'missing corpus identity',
+      (e) => {
+        e.capture.handlers.pop()
+      },
+    ],
+    [
+      'missing later successful Accept',
+      (e) => {
+        const cohort = e.capture.handlers[1].cohort
+        e.capture.outcomes = e.capture.outcomes.filter((row) => row.cohort !== cohort)
+      },
+    ],
+    [
+      'Release in place of later Accept',
+      (e) => {
+        const cohort = e.capture.handlers[1].cohort
+        e.capture.outcomes.find((row) => row.cohort === cohort).type = 'release'
+      },
+    ],
+    [
+      'held loss in place of later Accept',
+      (e) => {
+        const cohort = e.capture.handlers[1].cohort
+        e.capture.outcomes.find((row) => row.cohort === cohort).error = {
+          name: 'KafkaJSShareAcknowledgementError',
+          reason: 'session-lost',
+        }
+      },
+    ],
+    [
+      'missing joined restoration',
+      (e) => {
+        delete e.restoration
+      },
+    ],
+    [
+      'failed restoration',
+      (e) => {
+        e.restoration.events.at(-1).result.code = 1
+      },
+    ],
+    [
+      'missing terminal observation',
+      (e) => {
+        delete e.terminalBefore
+      },
+    ],
+    [
+      'missing verifier',
+      (e) => {
+        e.quiet = []
+      },
+    ],
+    [
+      'verifier delivery',
+      (e) => {
+        e.quiet[0].delivered = [e.expected[0]]
+      },
+    ],
+    [
+      'wrong independent end',
+      (e) => {
+        e.logEnd = '301'
+      },
+    ],
+  ]
+  it.each(moveCases)('rejects move or finalization evidence: %s', async (_name, mutate) => {
+    const evidence = await scriptedLeaderReplay(1)
+    mutate(evidence)
+    await rejectLeaderScript(evidence)
+  })
+
+  it('rejects another partition advance in the original metadata response', async () => {
+    const evidence = await scriptedLeaderReplay(1)
+    const request = evidence.capture.frames.find(
+      ({ sequence }) => sequence === evidence.move.next.sources[0]
+    )
+    await changeLeaderAnswer(evidence, request, (answer) => {
+      answer.topics[0].partitions[0].partitionIndex = 1
+    })
+    await rejectLeaderScript(evidence)
+  })
+
+  it.each([
+    [
+      'missing partition',
+      (answer) => {
+        answer.topics[0].partitions = []
+      },
+    ],
+    [
+      'duplicate partition',
+      (answer) => {
+        answer.topics[0].partitions.push({ ...answer.topics[0].partitions[0] })
+      },
+    ],
+    [
+      'foreign topic UUID',
+      (answer) => {
+        answer.topics[0].topicId = '12345678-1234-1234-1234-123456789abd'
+      },
+    ],
+    [
+      'partition error',
+      (answer) => {
+        answer.topics[0].partitions[0].errorCode = 6
+      },
+    ],
+    [
+      'topic error',
+      (answer) => {
+        answer.topics[0].errorCode = 3
+      },
+    ],
+    [
+      'incomplete ISR',
+      (answer) => {
+        answer.topics[0].partitions[0].isrNodes = [1, 2]
+      },
+    ],
+    [
+      'unknown leader',
+      (answer) => {
+        answer.topics[0].partitions[0].leaderId = -1
+      },
+    ],
+  ])('rejects original leadership metadata: %s', async (_name, mutate) => {
+    const evidence = await scriptedLeaderReplay(1)
+    const request = evidence.capture.frames.find(
+      ({ sequence }) => sequence === evidence.move.next.sources[0]
+    )
+    await changeLeaderAnswer(evidence, request, mutate)
+    await rejectLeaderScript(evidence)
+  })
+
+  it('requires the designated move even when the original count increases', async () => {
+    const evidence = await scriptedLeaderReplay(2)
+    evidence.move.events = []
+    await rejectLeaderScript(evidence)
+  })
+
+  it.each([0, -1, 1.5, undefined, 32768])(
+    'rejects invalid count %s independently of move evidence',
+    async (deliveryCount) => {
+      expect(() => assertLeaderCounts({ deliveryCount: 1 }, { deliveryCount })).toThrow()
+      expect(() => assertLeaderCounts({ deliveryCount }, { deliveryCount: 2 })).toThrow()
+      const evidence = await scriptedLeaderReplay(1)
+      evidence.capture.handlers[1].deliveryCount = deliveryCount
+      await rejectLeaderScript(evidence)
+    }
+  )
+
+  it.each([0, -1])(
+    'rejects invalid original wire count %s with otherwise matching provenance',
+    async (deliveryCount) => {
+      const evidence = await scriptedLeaderReplay(1)
+      evidence.capture.handlers[1].deliveryCount = deliveryCount
+      const adoption = evidence.capture.acquisitions[1]
+      adoption.deliveryCounts = [deliveryCount]
+      adoption.original.deliveryCounts = [deliveryCount]
+      const request = evidence.capture.frames.find(({ exchange }) => exchange === adoption.exchange)
+      await changeLeaderAnswer(evidence, request, (answer) => {
+        answer.responses[0].partitions[0].acquiredRecords[0].deliveryCount = deliveryCount
+      })
+      await rejectLeaderScript(evidence)
+    }
+  )
+
+  it('rejects a lower valid count with complete original acquisition evidence', async () => {
+    const evidence = await scriptedLeaderReplay(1)
+    evidence.capture.handlers[0].deliveryCount = 2
+    const adoption = evidence.capture.acquisitions[0]
+    adoption.deliveryCounts = [2]
+    adoption.original.deliveryCounts = [2]
+    const request = evidence.capture.frames.find(({ exchange }) => exchange === adoption.exchange)
+    await changeLeaderAnswer(evidence, request, (answer) => {
+      answer.responses[0].partitions[0].acquiredRecords[0].deliveryCount = 2
+    })
+    await rejectLeaderScript(evidence)
+  })
+
+  it('keeps fetch0/ack6 separate from acquisition success and requires the later real Accept', async () => {
+    const evidence = await scriptedLeaderReplay(1)
+    const request = evidence.capture.frames.filter(({ apiKey }) => apiKey === 78)[1]
+    await changeLeaderAnswer(evidence, request, (answer) => {
+      answer.responses[0].partitions[0].acknowledgeErrorCode = 6
+    })
+    await assertScriptedLeaderCase(evidence)
+    const cohort = evidence.capture.handlers[1].cohort
+    const terminal = evidence.capture.frames.find(
+      (row) =>
+        row.apiKey === 79 &&
+        row.prepared.some((ticket) => ticket.cohort === cohort && !ticket.isRenewAck)
+    )
+    await changeLeaderAnswer(evidence, terminal, (answer) => {
+      answer.responses[0].partitions[0].errorCode = 6
+    })
+    await rejectLeaderScript(evidence)
+  })
+
+  it.each(['timeout', 'limit'])(
+    'does not transfer equal-count eligibility to %s',
+    async (action) => {
+      const evidence = await scriptedLeaderReplay(1)
+      evidence.action = action
+      await rejectLeaderScript(evidence)
+    }
+  )
+})
 
 describe('written Accept settlement sensitivity', () => {
   it('keeps diagnostic broker success separate from public unknown and admits only a provisional partition', async () => {
