@@ -416,51 +416,51 @@
     {
       "kafkaName": "ShareGroupHeartbeat",
       "apiKey": 76,
-      "forkName": null,
+      "forkName": "shareGroupHeartbeat",
       "apiKeysName": "ShareGroupHeartbeat",
-      "planned": "yes"
+      "planned": "done"
     },
     {
       "kafkaName": "ShareGroupDescribe",
       "apiKey": 77,
-      "forkName": null,
+      "forkName": "shareGroupDescribe",
       "apiKeysName": "ShareGroupDescribe",
-      "planned": "yes"
+      "planned": "done"
     },
     {
       "kafkaName": "ShareFetch",
       "apiKey": 78,
-      "forkName": null,
+      "forkName": "shareFetch",
       "apiKeysName": "ShareFetch",
-      "planned": "yes"
+      "planned": "done"
     },
     {
       "kafkaName": "ShareAcknowledge",
       "apiKey": 79,
-      "forkName": null,
+      "forkName": "shareAcknowledge",
       "apiKeysName": "ShareAcknowledge",
-      "planned": "yes"
+      "planned": "done"
     },
     {
       "kafkaName": "DescribeShareGroupOffsets",
       "apiKey": 90,
-      "forkName": null,
+      "forkName": "describeShareGroupOffsets",
       "apiKeysName": "DescribeShareGroupOffsets",
-      "planned": "yes"
+      "planned": "done"
     },
     {
       "kafkaName": "AlterShareGroupOffsets",
       "apiKey": 91,
-      "forkName": null,
+      "forkName": "alterShareGroupOffsets",
       "apiKeysName": "AlterShareGroupOffsets",
-      "planned": "yes"
+      "planned": "done"
     },
     {
       "kafkaName": "DeleteShareGroupOffsets",
       "apiKey": 92,
-      "forkName": null,
+      "forkName": "deleteShareGroupOffsets",
       "apiKeysName": "DeleteShareGroupOffsets",
-      "planned": "yes"
+      "planned": "done"
     }
   ],
   "untracked": [

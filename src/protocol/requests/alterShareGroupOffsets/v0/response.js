@@ -1,0 +1,112 @@
+const { ShareDecoder: Decoder } = require('../../shareFetch/codec')
+
+/** @param {Decoder} decoder @param {object} [options] @returns {object} Decoded structure. */
+const decodePartitions = (decoder, options) => {
+  const value = {
+    partitionIndex: decoder.readInt32(),
+    errorCode: decoder.readInt16(),
+    errorMessage: decoder.readCompactString(true),
+  }
+  decoder.readTaggedFields()
+  return value
+}
+
+/** @param {Decoder} decoder @param {object} [options] @returns {object} Decoded structure. */
+const decodeResponses = (decoder, options) => {
+  const value = {
+    topicName: decoder.readCompactString(),
+    topicId: decoder.readUuid(),
+    partitions: decoder.readCompactArray((decoder) => decodePartitions(decoder, options)),
+  }
+  decoder.readTaggedFields()
+  return value
+}
+
+/** @param {Decoder} decoder @param {object} [options] @returns {object} Decoded structure. */
+const decodeBody = (decoder, options) => {
+  const value = {
+    throttleTimeMs: decoder.readInt32(),
+    errorCode: decoder.readInt16(),
+    errorMessage: decoder.readCompactString(true),
+    responses: decoder.readCompactArray((decoder) => decodeResponses(decoder, options)),
+  }
+  decoder.readTaggedFields()
+  return value
+}
+
+/**
+ * Decode a released flexible response without classifying broker errors.
+ * @param {Buffer} rawData Message body after the response header.
+ * @param {{checkCrcs?: boolean}} [options] Inherited record decoder options.
+ * @returns {Promise<object>} Exact field domains; int64 offsets/lag remain decimal strings.
+ * @throws {KafkaJSPartialMessageError} on malformed or truncated fields.
+ */
+const decode = async (rawData, options = {}) => {
+  const decoder = new Decoder(rawData)
+  const { throttleTimeMs, ...data } = await decodeBody(decoder, options)
+  decoder.finish()
+  return { throttleTime: 0, clientSideThrottleTime: throttleTimeMs, ...data }
+}
+/** @param {object} data @returns {Promise<object>} Broker error codes remain data for their owning classifier. */
+const parse = async (data) => data
+module.exports = { decode, parse }
+
+module.exports.schema = {
+  api: 'AlterShareGroupOffsets',
+  version: 0,
+  direction: 'response',
+  fields: [
+    {
+      name: 'ThrottleTimeMs',
+      type: 'int32',
+      versions: '0+',
+    },
+    {
+      name: 'ErrorCode',
+      type: 'int16',
+      versions: '0+',
+    },
+    {
+      name: 'ErrorMessage',
+      type: 'string',
+      versions: '0+',
+      nullable: true,
+    },
+    {
+      name: 'Responses',
+      type: '[]AlterShareGroupOffsetsResponseTopic',
+      versions: '0+',
+    },
+    {
+      name: 'Responses.TopicName',
+      type: 'string',
+      versions: '0+',
+    },
+    {
+      name: 'Responses.TopicId',
+      type: 'uuid',
+      versions: '0+',
+    },
+    {
+      name: 'Responses.Partitions',
+      type: '[]AlterShareGroupOffsetsResponsePartition',
+      versions: '0+',
+    },
+    {
+      name: 'Responses.Partitions.PartitionIndex',
+      type: 'int32',
+      versions: '0+',
+    },
+    {
+      name: 'Responses.Partitions.ErrorCode',
+      type: 'int16',
+      versions: '0+',
+    },
+    {
+      name: 'Responses.Partitions.ErrorMessage',
+      type: 'string',
+      versions: '0+',
+      nullable: true,
+    },
+  ],
+}

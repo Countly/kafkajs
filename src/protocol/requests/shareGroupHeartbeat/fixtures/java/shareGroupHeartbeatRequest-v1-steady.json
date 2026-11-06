@@ -1,0 +1,7 @@
+{
+  "message": "ShareGroupHeartbeatRequest",
+  "version": 1,
+  "case": "steady",
+  "hex": "0c73686172652d67726f75700d73686172652d6d656d62657200000007000000",
+  "fields": {"groupId":"share-group","memberId":"share-member","memberEpoch":7,"rackId":null,"subscribedTopicNames":null}
+}

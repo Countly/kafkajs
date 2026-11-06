@@ -1,0 +1,7 @@
+{
+  "message": "DescribeShareGroupOffsetsResponse",
+  "version": 1,
+  "case": "unknownTags",
+  "hex": "0000001f030c73686172652d67726f75700206616c7068610102030405060708090a0b0c0d0e0f10030000000000200000000000017fffffff7fffffffffffffff000000010a0161000000027fffffffffffffffffffffffffffffffffffffff001d0764656e696564010a0161010a0161000000010a016107616273656e74010045086d697373696e67010a0161010a0161",
+  "fields": {"throttleTime":31,"groups":[{"groupId":"share-group","topics":[{"topicName":"alpha","topicId":"01020304-0506-0708-090a-0b0c0d0e0f10","partitions":[{"partitionIndex":0,"startOffset":"9007199254740993","leaderEpoch":2147483647,"lag":"9223372036854775807","errorCode":0,"errorMessage":null},{"partitionIndex":2,"startOffset":"9223372036854775807","leaderEpoch":-1,"lag":"-1","errorCode":29,"errorMessage":"denied"}]}],"errorCode":0,"errorMessage":null},{"groupId":"absent","topics":[],"errorCode":69,"errorMessage":"missing"}]}
+}

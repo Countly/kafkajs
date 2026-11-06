@@ -1,0 +1,7 @@
+{
+  "message": "ShareFetchResponse",
+  "version": 2,
+  "case": "empty",
+  "hex": "0000000000000000003a98010100",
+  "fields": {"throttleTime":0,"errorCode":0,"errorMessage":null,"acquisitionLockTimeoutMs":15000,"responses":[],"nodeEndpoints":[]}
+}

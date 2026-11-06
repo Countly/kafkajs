@@ -93,13 +93,13 @@ const requests = {
   ConsumerGroupDescribe: require('./consumerGroupDescribe'),
   ListConfigResources: require('./listConfigResources'),
   DescribeTopicPartitions: require('./describeTopicPartitions'),
-  ShareGroupHeartbeat: noImplementedRequestDefinitions,
-  ShareGroupDescribe: noImplementedRequestDefinitions,
-  ShareFetch: noImplementedRequestDefinitions,
-  ShareAcknowledge: noImplementedRequestDefinitions,
-  DescribeShareGroupOffsets: noImplementedRequestDefinitions,
-  AlterShareGroupOffsets: noImplementedRequestDefinitions,
-  DeleteShareGroupOffsets: noImplementedRequestDefinitions,
+  ShareGroupHeartbeat: require('./shareGroupHeartbeat'),
+  ShareGroupDescribe: require('./shareGroupDescribe'),
+  ShareFetch: require('./shareFetch'),
+  ShareAcknowledge: require('./shareAcknowledge'),
+  DescribeShareGroupOffsets: require('./describeShareGroupOffsets'),
+  AlterShareGroupOffsets: require('./alterShareGroupOffsets'),
+  DeleteShareGroupOffsets: require('./deleteShareGroupOffsets'),
 }
 
 const names = Object.keys(apiKeys)

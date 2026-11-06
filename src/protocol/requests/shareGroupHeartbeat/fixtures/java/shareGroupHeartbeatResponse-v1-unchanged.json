@@ -1,0 +1,7 @@
+{
+  "message": "ShareGroupHeartbeatResponse",
+  "version": 1,
+  "case": "unchanged",
+  "hex": "000000000000000d73686172652d6d656d62657200000007000001f4ff00",
+  "fields": {"throttleTime":0,"errorCode":0,"errorMessage":null,"memberId":"share-member","memberEpoch":7,"heartbeatIntervalMs":500,"assignment":null}
+}

@@ -268,6 +268,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Additions
 
+- Implement the seven released share-group wire codecs: ShareGroupHeartbeat v1, ShareGroupDescribe v1, ShareFetch v2, ShareAcknowledge v2, DescribeShareGroupOffsets v1, AlterShareGroupOffsets v0 and DeleteShareGroupOffsets v0. Each is flexible with nested tag buffers, keeps int64 offsets and lag as exact decimal strings and passes broker error codes through as data. They are checked against independent Apache Kafka message vectors and are not yet used by a connection or a public API.
+
 #### Fixes
 
 - Unimplemented request slots throw `KafkaJSNotImplemented` with a diagnostic message instead of a `TypeError`.
@@ -276,6 +278,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - Track the seven released share-group APIs (keys 76–79 and 90–92) in the Kafka 4.4.0 and 4.3.1 message snapshots and regenerate their protocol compatibility inventory. Source inventory alone does not add share-group support.
 - Add a Java share-consumer interoperability member and classpath probe.
+- The Java message-vector generator writes 46 share-group vectors (24 requests, 22 responses), including Records bytes, unknown tagged fields at every nesting and Java's own acknowledgement batching; they need `KAFKA_CLIENTS_VERSION=4.4.0`.
 
 ### Phase 9B — Producer parity: delivery deadline, memory bound, request size, partitioner, codecs, lifecycle
 

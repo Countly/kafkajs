@@ -1,0 +1,7 @@
+{
+  "message": "ShareGroupDescribeResponse",
+  "version": 1,
+  "case": "mixed",
+  "hex": "00000013030000000c73686172652d67726f757007537461626c657fffffff000000090773696d706c65020d73686172652d6d656d626572000000000809636c69656e742d610b2f3132372e302e302e310306616c70686106ceb2657461020102030405060708090a0b0c0d0e0f1006616c70686103000000000000000200000080000001000045086d697373696e6707616273656e740100000000000000000101800000000000",
+  "fields": {"throttleTime":19,"groups":[{"errorCode":0,"errorMessage":null,"groupId":"share-group","groupState":"Stable","groupEpoch":2147483647,"assignmentEpoch":9,"assignorName":"simple","members":[{"memberId":"share-member","rackId":null,"memberEpoch":8,"clientId":"client-a","clientHost":"/127.0.0.1","subscribedTopicNames":["alpha","βeta"],"assignment":{"topicPartitions":[{"topicId":"01020304-0506-0708-090a-0b0c0d0e0f10","topicName":"alpha","partitions":[0,2]}]}}],"authorizedOperations":-2147483647},{"errorCode":69,"errorMessage":"missing","groupId":"absent","groupState":"","groupEpoch":0,"assignmentEpoch":0,"assignorName":"","members":[],"authorizedOperations":-2147483648}]}
+}
