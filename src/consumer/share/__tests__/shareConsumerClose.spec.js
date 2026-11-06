@@ -1,6 +1,7 @@
 const Broker = require('../../../broker')
 const Cluster = require('../../../cluster')
 const RequestQueue = require('../../../network/requestQueue')
+const Emitter = require('../../../instrumentation/emitter')
 const { requests } = require('../../../protocol/requests')
 const { KafkaJSNonRetriableError, KafkaJSShareAcknowledgementError } = require('../../../errors')
 const { ShareRun } = require('../shareRun')
@@ -149,6 +150,7 @@ class WireHold {
     this.gate = deferred()
     this.arrival = deferred()
     this.failure = null
+    this.pending = []
     const { gate, arrival } = this
     const hold = this
     const { method, codec } = WIRE[apiKey]
@@ -162,12 +164,16 @@ class WireHold {
     }
     if (stage === 'lookup') {
       const original = Broker.prototype[method]
-      jest.spyOn(Broker.prototype, method).mockImplementation(async function (request, options) {
+      jest.spyOn(Broker.prototype, method).mockImplementation(function (request, options) {
         if (!take(request)) return original.call(this, request, options)
-        arrival.resolve()
-        await gate.promise
-        if (hold.failure) throw hold.failure
-        return original.call(this, request, options)
+        const pending = (async () => {
+          arrival.resolve()
+          await gate.promise
+          if (hold.failure) throw hold.failure
+          return original.call(this, request, options)
+        })()
+        hold.pending.push(pending)
+        return pending
       })
     } else if (stage === 'encode') {
       const original = requests[codec].protocol
@@ -181,10 +187,14 @@ class WireHold {
             ...built,
             request: {
               ...built.request,
-              encode: async () => {
-                arrival.resolve()
-                await gate.promise
-                return encode()
+              encode: () => {
+                const pending = (async () => {
+                  arrival.resolve()
+                  await gate.promise
+                  return encode()
+                })()
+                hold.pending.push(pending)
+                return pending
               },
             },
           }
@@ -195,13 +205,15 @@ class WireHold {
       jest.spyOn(RequestQueue.prototype, 'push').mockImplementation(function (pushed) {
         if (pushed.entry.apiKey !== apiKey || !take()) return original.call(this, pushed)
         arrival.resolve()
-        gate.promise.then(() => {
-          try {
-            original.call(this, pushed)
-          } catch (error) {
-            pushed.entry.reject(error)
-          }
-        })
+        hold.pending.push(
+          gate.promise.then(() => {
+            try {
+              original.call(this, pushed)
+            } catch (error) {
+              pushed.entry.reject(error)
+            }
+          })
+        )
       })
     }
   }
@@ -301,6 +313,7 @@ class CloseRig {
    * @param {number[]} [options.hold=[0]] Partitions whose handler is observed.
    * @param {'accept'|'release'|'reject'} [options.decide] An explicit decision an observed handler makes first.
    * @param {'hold'|'return'|'throw'} [options.mode='hold'] Whether an observed handler waits, returns, or throws.
+   * @param {Record<number, string>} [options.modes] Per-partition overrides of `mode`.
    * @param {boolean} [options.separate=false] Whether each observed partition has a gate of its own.
    * @returns {Promise<void>} Resolves once an observed handler started.
    */
@@ -310,6 +323,7 @@ class CloseRig {
     hold = [0],
     decide,
     mode = 'hold',
+    modes = {},
     separate = false,
   } = {}) {
     await this.h.consumer.subscribe({ topics: ['topic-a'] })
@@ -317,7 +331,7 @@ class CloseRig {
     if (separate) for (const partition of hold) this.gates.set(partition, deferred())
     await this.h.consumer.run({
       eachMessage: (payload) => {
-        const handled = this.handle(payload, { hold, decide, mode, separate })
+        const handled = this.handle(payload, { hold, decide, mode, modes, separate })
         this.settling.push(handled)
         return handled
       },
@@ -333,13 +347,14 @@ class CloseRig {
    */
   async handle(
     { partition, message, acknowledge, renew, isRunning },
-    { hold, decide, mode, separate }
+    { hold, decide, mode, modes, separate }
   ) {
     if (!hold.includes(partition)) return
     this.calls.push({ partition, offset: message.offset, acknowledge, renew, isRunning })
     if (decide) acknowledge(decide)
-    if (mode === 'throw') throw new Error('handler failed')
-    if (mode === 'return') return
+    const completion = modes[partition] ?? mode
+    if (completion === 'throw') throw new Error('handler failed')
+    if (completion === 'return') return
     await (separate ? this.gates.get(partition) : this.gate).promise
   }
 
@@ -464,6 +479,7 @@ class CloseRig {
     for (const gate of this.gates.values()) gate.resolve()
     for (const hold of this.holds) hold.release()
     await Promise.allSettled(this.settling)
+    await Promise.all(this.holds.map((hold) => Promise.allSettled(hold.pending ?? [])))
     jest.restoreAllMocks()
     jest.useRealTimers()
     await this.h.close()
@@ -646,6 +662,177 @@ describe('captured share close', () => {
         expect(rig.leaves()).toHaveLength(timeout === 0 ? 0 : 1)
         expect(rig.acks).toEqual([[...ack, 'membership-lost']])
         expect(rig.order).toEqual(['stop', 'disconnect'])
+      }
+    )
+  })
+
+  describe('an ordinary lookup beside a held sibling handler', () => {
+    const KINDS = {
+      fetch: { apiKey: 78, mode: 'return', type: 'accept' },
+      flush: { apiKey: 79, mode: 'throw', type: 'release' },
+    }
+
+    /**
+     * Holds node 0's first mutation before its Broker call while node 1 has a live handler.
+     * @param {'fetch'|'flush'} kind The ordinary mutation to hold.
+     * @returns {Promise<{hold: WireHold, modes: object}>} The reached hold and mutable handler modes.
+     */
+    const beginHeld = async (kind) => {
+      const { apiKey, mode } = KINDS[kind]
+      rig = new CloseRig({
+        nodes: 2,
+        topics: TWO_NODES,
+        interval: 100,
+        share: { maxPollInterval: 1000 },
+      })
+      const hold = rig.holdWire(apiKey, 'lookup', {
+        fields: (fields) =>
+          fields.shareSessionEpoch === 1 &&
+          fields.topics.some(({ partitions }) =>
+            partitions.some(({ partitionIndex }) => partitionIndex === 0)
+          ),
+      })
+      const modes = { 0: mode }
+      const answer = (_fields, { node }) => fetchAnswer([acquire(node, 0, [`v${node}`])])
+      await rig.begin({ hold: [0, 1], modes, separate: true, fetches: [answer, answer] })
+      await until(() => rig.calls.length === 2, 'both node handlers')
+      await hold.arrived()
+      expect(rig.h.frames(apiKey).filter(({ node }) => node === 0)).toHaveLength(
+        kind === 'fetch' ? 1 : 0
+      )
+      expect(rig.acks).toEqual([])
+      const pending = track(hold.pending[0])
+      await flush()
+      expect(pending.settled).toBe(false)
+      return { hold, modes }
+    }
+
+    test.each(Object.keys(KINDS))(
+      'confirms a current ordinary %s after its lookup is released',
+      async (kind) => {
+        const { hold } = await beginHeld(kind)
+        hold.release()
+        await until(() => rig.acks.length === 1, 'the current mutation confirmation')
+        const { apiKey, type } = KINDS[kind]
+        const sent = rig.h
+          .frames(apiKey)
+          .filter(({ node }) => node === 0)
+          .at(-1)
+        expect(sent.fields.shareSessionEpoch).toBe(1)
+        expect(sent.fields.topics).toEqual([
+          {
+            topicId: A,
+            partitions: [
+              {
+                partitionIndex: 0,
+                acknowledgementBatches: [
+                  {
+                    firstOffset: '0',
+                    lastOffset: '0',
+                    acknowledgeTypes: [kind === 'fetch' ? 1 : 2],
+                  },
+                ],
+              },
+            ],
+          },
+        ])
+        expect(rig.acks).toEqual([[0, '0', '0', type, null]])
+      }
+    )
+
+    test.each(
+      Object.keys(KINDS).flatMap((kind) =>
+        [
+          'stop boundary',
+          'crash',
+          'unknown member',
+          'fenced epoch',
+          'poll expiry',
+          'replacement run',
+        ].map((transition) => [kind, transition])
+      )
+    )(
+      'retires an ordinary %s held at lookup across %s and confirms replacement work',
+      async (kind, transition) => {
+        const { hold, modes } = await beginHeld(kind)
+        const { type } = KINDS[kind]
+        const [oldRun] = rig.runs
+        const oldNode = oldRun.nodes.get(0)
+        const oldMember = rig.joins()[0].fields.memberId
+        modes[0] = 'hold'
+        const opening = rig.h.hold({
+          api: 'ShareFetch',
+          node: 0,
+          match: ({ fields }) => fields.shareSessionEpoch === 0,
+        })
+        if (transition === 'unknown member' || transition === 'fenced epoch') {
+          rig.h.script('ShareGroupHeartbeat', [
+            { errorCode: transition === 'unknown member' ? 25 : 110 },
+          ])
+          await rig.advanceUntil(() => rig.joins().length === 2, 'the replacement membership')
+        } else if (transition === 'poll expiry') {
+          await rig.advanceUntil(
+            () => oldNode.operation.error !== null,
+            'the sibling handler poll expiry'
+          )
+          expect(rig.joins()).toHaveLength(1)
+          rig.gates.get(1).resolve()
+          await rig.advanceUntil(() => rig.joins().length === 2, 'the post-expiry membership')
+        } else {
+          if (transition === 'crash') {
+            const failure = new Error('terminal lookup failure')
+            await oldRun.crash(failure)
+            expect(rig.order).toEqual(['crash'])
+          } else {
+            const stopping = track(rig.h.consumer.stop())
+            const disconnecting = track(rig.h.consumer.disconnect({ timeout: 400 }))
+            await rig.advance(300)
+            await until(() => stopping.settled && disconnecting.settled, 'the stop boundary')
+            expect([stopping.error, disconnecting.error]).toEqual([null, null])
+          }
+          if (transition !== 'replacement run') {
+            hold.release()
+            await flush()
+            expect(rig.h.frames(78).filter(({ node }) => node === 0)).toHaveLength(1)
+            expect(rig.h.frames(79).filter(({ node }) => node === 0)).toHaveLength(0)
+          }
+          await rig.h.consumer.run({
+            eachMessage: (payload) => {
+              const handled = rig.handle(payload, { hold: [0], modes, separate: true })
+              rig.settling.push(handled)
+              return handled
+            },
+          })
+        }
+        await until(() => opening.call !== null, 'the replacement opening fetch')
+        expect(rig.acks.filter(([partition]) => partition === 0)).toEqual([
+          [0, '0', '0', type, 'membership-lost'],
+        ])
+        expectStale(() => rig.calls.find(({ partition }) => partition === 0).acknowledge())
+        hold.release()
+        await flush()
+        const opens = rig.h.frames(78).filter(({ node }) => node === 0)
+        expect(opens.map(({ fields }) => fields.shareSessionEpoch)).toEqual([0, 0])
+        expect(rig.h.frames(79).filter(({ node }) => node === 0)).toHaveLength(0)
+        if (['stop boundary', 'crash', 'replacement run'].includes(transition))
+          expect(opens[1].fields.memberId).not.toBe(oldMember)
+        opening.release(fetchAnswer([acquire(0, 0, ['fresh'])]))
+        await until(
+          () => rig.calls.filter(({ partition }) => partition === 0).length === 2,
+          'the replacement handler'
+        )
+        const current = rig.calls.filter(({ partition }) => partition === 0)[1]
+        expect(current.isRunning()).toBe(true)
+        await expect(current.renew()).resolves.toBe(15000)
+        current.acknowledge('accept')
+        const stopping = rig.h.consumer.stop()
+        for (const gate of rig.gates.values()) gate.resolve()
+        await stopping
+        expect(rig.acks.filter(([partition]) => partition === 0)).toEqual([
+          [0, '0', '0', type, 'membership-lost'],
+          [0, '0', '0', 'renew', null],
+          [0, '0', '0', 'accept', null],
+        ])
       }
     )
   })
@@ -1355,12 +1542,19 @@ describe('captured share close', () => {
      * @returns {void} Asserts it holds no timer, waiter, lookup, node or captured reference.
      */
     const expectReleased = (run) => {
+      for (const operation of [
+        run.operation,
+        run.closing.operation,
+        run.closing.boundaryOperation,
+      ].filter(Boolean)) {
+        expect(operation.timer).toBeNull()
+        expect([operation.waiters.size, operation.disposers.size]).toEqual([0, 0])
+      }
       expect(run.retired).toBe(true)
       expect(run.closing.run).toBeNull()
       expect(run.closing.nodes.size).toBe(0)
       expect([run.nodes.size, run.waiters.size, run.lookups.size]).toEqual([0, 0, 0])
-      for (const { requestQueue } of run.coordinator.pool.pool)
-        expect([requestQueue.pending.length, requestQueue.inflight.size]).toEqual([0, 0])
+      expectPoolReleased(run.coordinator.pool)
     }
 
     /**
@@ -1373,9 +1567,27 @@ describe('captured share close', () => {
       )
       for (const operation of [node.operation, node.pacing])
         expect([operation.waiters.size, operation.disposers.size]).toEqual([0, 0])
-      for (const { requestQueue } of node.loop.broker.connectionPool.pool)
-        expect([requestQueue.pending.length, requestQueue.inflight.size]).toEqual([0, 0])
+      expectPoolReleased(node.loop.broker.connectionPool)
     }
+
+    /**
+     * @param {object} pool A real pool retained after its run ended.
+     * @returns {void} Asserts both slots have no requests or pool-drain listeners left.
+     */
+    const expectPoolReleased = (pool) => {
+      expect(pool.pool).toHaveLength(2)
+      for (const { requestQueue } of pool.pool) {
+        expect([requestQueue.pending.length, requestQueue.inflight.size]).toEqual([0, 0])
+        expect(requestQueue.eventNames()).toEqual([])
+      }
+    }
+
+    /**
+     * @param {object} emitter The client emitter, whose application listeners survive close.
+     * @returns {Map<string|symbol, Function[]>} Exact event names and listener identities.
+     */
+    const listenerSnapshot = (emitter) =>
+      new Map(emitter.eventNames().map((name) => [name, emitter.listeners(name)]))
 
     test.each(Object.keys(OUTCOMES))('returns to baseline after %s', async (outcome) => {
       const { act, share } = OUTCOMES[outcome]
@@ -1388,6 +1600,23 @@ describe('captured share close', () => {
         emitter.eventNames().reduce((total, name) => total + emitter.listenerCount(name), 0)
       const observers = userListeners()
       expect(observers).toBe(5)
+      const retained = listenerSnapshot(emitter)
+      const forwarding = new Set()
+      const add = Emitter.prototype.addListener
+      jest.spyOn(Emitter.prototype, 'addListener').mockImplementation(function (...args) {
+        const remove = add.apply(this, args)
+        const owned = { emitter: this, remove }
+        forwarding.add(owned)
+        return () => {
+          remove()
+          forwarding.delete(owned)
+        }
+      })
+      const baselinePools = new Set([
+        cluster.brokerPool.seedBroker.connectionPool,
+        ...Object.values(cluster.brokerPool.brokers).map((broker) => broker.connectionPool),
+      ])
+      for (const pool of baselinePools) expectPoolReleased(pool)
       await rig.begin({ decide: 'accept' })
       const routing = cluster.metadataCache.routingListeners
       const listeners = routing.size
@@ -1406,11 +1635,28 @@ describe('captured share close', () => {
       for (const node of rig.nodes) expectNodeReleased(node)
       expect(routing.size).toBe(listeners - 1)
       expect(userListeners()).toBe(observers)
+      expect(listenerSnapshot(emitter)).toEqual(retained)
+      expect(forwarding.size).toBe(0)
+      const pools = new Set([
+        ...baselinePools,
+        ...rig.runs.map((run) => run.coordinator.pool),
+        ...rig.nodes.map((node) => node.loop.broker.connectionPool),
+        ...Object.values(cluster.brokerPool.brokers).map((broker) => broker.connectionPool),
+      ])
+      for (const pool of pools) expectPoolReleased(pool)
       expect(jest.getTimerCount()).toBeLessThanOrEqual(timers)
       const closing = track(rig.h.consumer.disconnect())
       await rig.advanceUntil(() => closing.settled, 'the client-wide disconnect')
       expect(closing.error).toBeNull()
       expect(rig.h.cluster.sockets().every(({ destroyed }) => destroyed)).toBe(true)
+      for (const pool of pools) expectPoolReleased(pool)
+      for (const socket of rig.h.cluster.sockets()) {
+        expect(['data', 'end', 'timeout'].map((event) => socket.listenerCount(event))).toEqual([
+          0, 0, 0,
+        ])
+      }
+      expect(listenerSnapshot(emitter)).toEqual(retained)
+      expect(forwarding.size).toBe(0)
     })
   })
 

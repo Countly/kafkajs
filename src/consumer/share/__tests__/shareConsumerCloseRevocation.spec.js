@@ -258,10 +258,11 @@ describe('a fenced run that is waiting for its final', () => {
     })
     const started = deferred()
     await rig.h.consumer.run({
-      eachMessage: async ({ acknowledge }) => {
-        acknowledge()
+      eachMessage: (payload) => {
+        const handled = rig.handle(payload, 'accept')
+        rig.handlers.push(handled)
         started.resolve()
-        await rig.gate.promise
+        return handled
       },
     })
     await started.promise

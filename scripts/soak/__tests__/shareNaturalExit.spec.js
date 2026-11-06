@@ -4,7 +4,7 @@ const { execFile } = require('child_process')
 const ROOT = path.join(__dirname, '..', '..', '..')
 const PROBE = path.join(__dirname, '..', 'shareNaturalExit.js')
 const BOUND_MS = 60000
-const OUTCOMES = ['success', 'zero', 'forced', 'failed', 'crash']
+const OUTCOMES = ['success', 'zero', 'forced', 'failed', 'crash', 'restart']
 
 /**
  * @returns {Promise<{error: Error|null, stdout: string, stderr: string}>} The probe run as a
@@ -37,7 +37,14 @@ describe('share consumer natural exit', () => {
       expect(lines).toHaveLength(1)
       expect(JSON.parse(lines[0])).toEqual({
         event: 'share-natural-exit',
-        outcomes: OUTCOMES.map((outcome) => ({ outcome, leaked: {}, openSockets: 0 })),
+        outcomes: OUTCOMES.map((outcome) => ({
+          outcome,
+          leaked: {},
+          openSockets: 0,
+          ...(outcome === 'restart' && {
+            restart: { joins: 2, crashes: 1, deliveries: 1, confirmed: 1, restart: true },
+          }),
+        })),
       })
     },
     BOUND_MS + 15000

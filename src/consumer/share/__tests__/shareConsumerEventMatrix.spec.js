@@ -93,9 +93,9 @@ const TWO_RECORDS = () => fetchAnswer([acquire(0, 0, ['a', 'b'])])
 /**
  * One real operation per event name. `drive` performs it and returns the outcome the operation
  * must have whether or not a listener fails. `expected` lists the payloads of every event of that
- * name the bounded scenario publishes, in order; `count` is their number when it is known before
- * the operation ran, or null when the wire decides it. A `fake` scenario runs on a fake clock that
- * only `tick` moves, so no heartbeat, retry or timeout publishes behind the scenario's back.
+ * name the bounded scenario publishes, in order; `count` is their independently expected number.
+ * A `fake` scenario runs on a fake clock that only `tick` moves, so no heartbeat, retry or timeout
+ * publishes behind the scenario's back.
  */
 const SCENARIOS = [
   {
@@ -334,34 +334,37 @@ const SCENARIOS = [
   },
   {
     name: 'REQUEST',
-    count: null,
-    expected: ({ h }) =>
-      h.cluster.log.map(({ apiKey, version }) =>
+    count: 2,
+    expected: () =>
+      [5, 4].map((apiVersion) =>
         networkPayload({
           size: any(Number),
           duration: any(Number),
-          apiName: any(String),
-          apiKey,
-          apiVersion: version,
+          apiName: 'ApiVersions',
+          apiKey: 18,
+          apiVersion,
         })
       ),
     drive: async ({ h }) => {
       await h.consumer.connect()
-      return { firstApi: h.cluster.requests()[0].api }
+      await h.consumer.connect()
+      return { versions: h.cluster.apiVersionTrace().map(({ version }) => version) }
     },
-    outcome: { firstApi: 'ApiVersions' },
+    outcome: { versions: [5, 4] },
   },
   {
     name: 'REQUEST_QUEUE_SIZE',
-    count: null,
-    expected: ({ emitted }) =>
-      emitted.map(() => ({ broker: NODE, clientId: CLIENT, queueSize: 0 })),
+    count: 2,
+    expected: () => [
+      { broker: NODE, clientId: CLIENT, queueSize: 0 },
+      { broker: NODE, clientId: CLIENT, queueSize: 0 },
+    ],
     drive: async ({ h }) => {
       await h.consumer.connect()
       await h.consumer.disconnect()
-      return { assignment: h.consumer.assignment() }
+      return { assignment: h.consumer.assignment(), sockets: h.cluster.sockets().length }
     },
-    outcome: { assignment: [] },
+    outcome: { assignment: [], sockets: 1 },
   },
   {
     name: 'REQUEST_TIMEOUT',
@@ -506,7 +509,7 @@ describe('share consumer event matrix', () => {
       seen.push({ type: event.type, payload: event.payload })
     })
     try {
-      const outcome = await drive({ h, done, seen, failure, emitted })
+      const outcome = await drive({ h, done, seen, failure })
       await flush()
       const logs = logged.mock.calls
         .filter(([message]) => message.startsWith('Failed to execute listener'))
@@ -523,7 +526,7 @@ describe('share consumer event matrix', () => {
             (channelName) => channelName === `${channels.CHANNEL_PREFIX}${TYPES[name]}`
           ).length,
         },
-        context: { h, failure, emitted },
+        context: { h, failure },
       }
     } finally {
       for (const remove of removers) remove()
@@ -541,12 +544,11 @@ describe('share consumer event matrix', () => {
     const check = (result) => {
       const { seen, outcome: observed, context, emitted, census } = result
       const payloads = expected(context)
-      if (count === null) expect(payloads.length).toBeGreaterThan(0)
-      else expect(payloads).toHaveLength(count)
-      expect(seen.map((event) => event.type)).toEqual(Array(payloads.length).fill(TYPES[name]))
+      expect(payloads).toHaveLength(count)
+      expect(seen.map((event) => event.type)).toEqual(Array(count).fill(TYPES[name]))
       expect(seen.map((event) => event.payload)).toEqual(payloads)
-      expect(emitted).toHaveLength(payloads.length)
-      expect(census.own).toBe(payloads.length)
+      expect(emitted).toEqual(payloads)
+      expect(census.own).toBe(count)
       expect(census.ordinary).toEqual([])
       expect(observed).toEqual(outcome)
     }
@@ -555,7 +557,7 @@ describe('share consumer event matrix', () => {
       const result = await run(scenario, 'none')
       check(result)
       expect(result.logs).toEqual([])
-      expect(result.trace).toEqual(Array(result.seen.length).fill('observer'))
+      expect(result.trace).toEqual(Array(count).fill('observer'))
     })
 
     test.each([
@@ -567,14 +569,9 @@ describe('share consumer event matrix', () => {
         const result = await run(scenario, kind)
         check(result)
         expect(result.logs).toEqual(
-          Array(result.seen.length).fill([
-            `Failed to execute listener: ${word} ${name}`,
-            TYPES[name],
-          ])
+          Array(count).fill([`Failed to execute listener: ${word} ${name}`, TYPES[name]])
         )
-        expect(result.trace).toEqual(
-          Array(result.seen.length).fill(['listener', 'observer']).flat()
-        )
+        expect(result.trace).toEqual(Array(count).fill(['listener', 'observer']).flat())
       }
     )
   })

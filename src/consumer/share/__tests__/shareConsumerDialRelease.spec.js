@@ -1,8 +1,12 @@
+const Cluster = require('../../../cluster')
+const { ShareRun } = require('../shareRun')
 const {
+  A,
   ShareClock,
   acquire,
   deferred,
   fetchAnswer,
+  flush,
   shareClient,
   until,
 } = require('../../../../testHelpers/shareHarness')
@@ -33,30 +37,36 @@ const track = (promise) => {
  * returns, the session settles lost and the node's next opening request waits on a held dial.
  */
 class DialRig {
-  constructor() {
+  /**
+   * @param {object} [options] Overrides for the scripted client, including multi-node fixtures.
+   */
+  constructor(options = {}) {
     this.clock = new ShareClock().install()
     this.h = shareClient({
       interval: 100,
-      kafka: { requestTimeout: 1000, enforceRequestTimeout: false },
+      ...options,
+      kafka: { requestTimeout: 1000, enforceRequestTimeout: false, ...options.kafka },
     })
     this.gate = deferred()
     this.calls = []
     this.handlers = []
     this.acks = []
+    this.partitionAcks = []
     this.crashes = []
     this.joins = []
     this.trigger = null
     const { events, on } = this.h.consumer
     on(events.CRASH, ({ payload }) => this.crashes.push(payload))
     on(events.GROUP_JOIN, ({ payload }) => this.joins.push(payload))
-    on(events.ACKNOWLEDGE, ({ payload }) =>
+    on(events.ACKNOWLEDGE, ({ payload }) => {
+      this.partitionAcks.push([payload.partition, payload.type, payload.error?.reason ?? null])
       this.acks.push([
         payload.firstOffset,
         payload.lastOffset,
         payload.type,
         payload.error ? payload.error.reason : null,
       ])
-    )
+    })
   }
 
   /**
@@ -144,10 +154,17 @@ class DialRig {
   /** @returns {Promise<void>} Releases every hold, restores timers and mocks, and closes the client. */
   async end() {
     this.gate.resolve()
-    await Promise.all(this.handlers)
-    jest.restoreAllMocks()
-    this.clock.restore()
-    await this.h.close()
+    for (const node of [0, 1]) this.h.cluster.up(node).release(node)
+    try {
+      await this.h.close()
+    } finally {
+      try {
+        await Promise.all(this.handlers)
+      } finally {
+        jest.restoreAllMocks()
+        this.clock.restore()
+      }
+    }
   }
 }
 
@@ -248,6 +265,218 @@ describe('a data dial held after the session was lost', () => {
       expect(() => rig.calls[0].acknowledge('reject')).toThrow(STALE)
       expect(() => rig.calls[0].renew()).toThrow(STALE)
       expect(rig.h.frames(79)).toHaveLength(0)
+    }
+  )
+})
+
+/** Two live leaders let poll expiry remain reachable while the other node's first dial waits. */
+class InitialDialRig extends DialRig {
+  /** Creates an initial slot-one hold without blocking coordinator or metadata discovery. */
+  constructor() {
+    super({
+      nodes: 2,
+      topics: {
+        'topic-a': {
+          topicId: A,
+          partitions: [
+            { leader: 0, epoch: 1 },
+            { leader: 1, epoch: 1 },
+          ],
+        },
+      },
+      kafka: { connectionTimeout: 10000 },
+      share: { maxPollInterval: 1000 },
+    })
+    this.runs = []
+    const start = ShareRun.prototype.start
+    const { runs, h } = this
+    jest.spyOn(ShareRun.prototype, 'start').mockImplementation(function () {
+      runs.push(this)
+      return start.call(this)
+    })
+    const find = Cluster.prototype.findGroupCoordinator
+    let held = false
+    jest.spyOn(Cluster.prototype, 'findGroupCoordinator').mockImplementation(async function (
+      ...args
+    ) {
+      const coordinator = await find.apply(this, args)
+      if (!held) {
+        await this.findBroker({ nodeId: 1 })
+        h.cluster.blackhole(1)
+        held = true
+      }
+      return coordinator
+    })
+  }
+
+  /**
+   * Records a delivered callback and holds its return until the current gate is released.
+   * @param {object} payload The public handler payload.
+   * @returns {Promise<void>} The continuation owned by the parent rig's cleanup.
+   */
+  async handle({ partition, message, acknowledge, renew, isRunning }) {
+    this.calls.push({ partition, offset: message.offset, acknowledge, renew, isRunning })
+    await this.gate.promise
+  }
+
+  /** @returns {Promise<void>} Joins with node 0 handling and node 1 waiting on its first data dial. */
+  async begin() {
+    await this.h.consumer.subscribe({ topics: ['topic-a'] })
+    this.h.script(
+      'ShareFetch',
+      Array.from(
+        { length: 20 },
+        () =>
+          (fields, { node }) =>
+            fields.shareSessionEpoch === 0
+              ? fetchAnswer([acquire(node, 0, [`v${node}`])])
+              : undefined
+      )
+    )
+    await this.h.consumer.run(this.handler())
+    await until(
+      () => this.calls.length === 1 && this.h.cluster.heldDialsTo(1) === 1,
+      'the sibling handler and initial data dial'
+    )
+    expect(this.calls.map(({ partition, offset }) => [partition, offset])).toEqual([[0, '0']])
+    expect(this.h.frames(78).map(({ node }) => node)).toEqual([0])
+    expect(this.h.frames(79)).toHaveLength(0)
+    expect(this.acks).toEqual([])
+    const initial = this.runs[0].nodes.get(1)
+    expect(initial.session.binding).toBeNull()
+    expect(initial.operation.error).toBeNull()
+    const opening = track(initial.drive)
+    await flush()
+    expect(opening.settled).toBe(false)
+  }
+
+  /** @returns {Promise<void>} Releases the initial dial without moving the application clock. */
+  async releaseInitialDial() {
+    this.h.cluster.up(1).release(1)
+    await flush()
+  }
+}
+
+describe('an initial data dial beside an active sibling node', () => {
+  let rig
+  afterEach(async () => {
+    await rig?.end()
+    rig = undefined
+  })
+
+  test('delivers and confirms work when a current initial dial is released', async () => {
+    rig = new InitialDialRig()
+    await rig.begin()
+    await rig.releaseInitialDial()
+    await until(() => rig.calls.length === 2, 'the current initial delivery')
+    const current = rig.calls.find(({ partition }) => partition === 1)
+    expect(current.offset).toBe('0')
+    expect(current.isRunning()).toBe(true)
+    await expect(current.renew()).resolves.toBe(15000)
+    current.acknowledge('accept')
+    const stopping = rig.h.consumer.stop()
+    rig.gate.resolve()
+    await stopping
+    expect(rig.acks).toEqual([
+      ['0', '0', 'renew', null],
+      ['0', '0', 'accept', null],
+      ['0', '0', 'accept', null],
+    ])
+    expect(rig.h.frames(78).map(({ node, fields }) => [node, fields.shareSessionEpoch])).toEqual([
+      [0, 0],
+      [1, 0],
+    ])
+    expect(rig.crashes).toEqual([])
+    expect(rig.partitionAcks.filter(([partition]) => partition === 1)).toEqual([
+      [1, 'renew', null],
+      [1, 'accept', null],
+    ])
+  })
+
+  test.each([
+    'stop boundary',
+    'crash',
+    'unknown member',
+    'fenced epoch',
+    'poll expiry',
+    'replacement run',
+  ])(
+    'rejects the old initial dial across %s and confirms the current membership',
+    async (transition) => {
+      rig = new InitialDialRig()
+      await rig.begin()
+      const [oldRun] = rig.runs
+      const oldNode = oldRun.nodes.get(1)
+      const [oldCall] = rig.calls
+      const oldMember = rig.joins[0].memberId
+      const oldToken = oldRun.authorityToken
+      if (transition === 'unknown member' || transition === 'fenced epoch') {
+        rig.h.script('ShareGroupHeartbeat', [
+          { errorCode: transition === 'unknown member' ? 25 : 110 },
+        ])
+        await rig.advanceUntil(() => rig.joins.length === 2, 'the replacement join')
+      } else if (transition === 'poll expiry') {
+        await rig.advanceUntil(
+          () => oldNode.operation.error !== null,
+          'the active sibling poll expiry'
+        )
+        expect(rig.joins).toHaveLength(1)
+        rig.gate.resolve()
+        await Promise.all(rig.handlers)
+        rig.gate = deferred()
+        await rig.advanceUntil(() => rig.joins.length === 2, 'the drained sibling rejoin')
+      } else {
+        if (transition === 'crash') {
+          const failure = new Error('terminal initial-dial failure')
+          await oldRun.crash(failure)
+          expect(rig.crashes).toHaveLength(1)
+          expect(rig.crashes[0]).toMatchObject({ error: failure, restart: false })
+        } else {
+          const stopping = track(rig.h.consumer.stop())
+          const disconnecting = track(rig.h.consumer.disconnect({ timeout: 400 }))
+          await rig.clock.advance(300)
+          await until(() => stopping.settled && disconnecting.settled, 'the stop boundary')
+          expect([stopping.error, disconnecting.error]).toEqual([null, null])
+        }
+        if (transition !== 'replacement run') {
+          await rig.releaseInitialDial()
+          await oldNode.drive
+          expect(rig.h.frames(78).map(({ node }) => node)).toEqual([0])
+        }
+        await rig.h.consumer.run(rig.handler())
+      }
+      expect(() => oldCall.acknowledge()).toThrow(STALE)
+      expect(() => oldCall.renew()).toThrow(STALE)
+      expect(rig.acks).toEqual([['0', '0', 'release', 'membership-lost']])
+      await rig.releaseInitialDial()
+      await oldNode.drive
+      await rig.advanceUntil(
+        () => rig.calls.some(({ partition }) => partition === 1),
+        'the current node-one delivery'
+      )
+      const current = rig.calls.find(({ partition }) => partition === 1)
+      const run = rig.runs.at(-1)
+      expect(run.nodes.get(1)).not.toBe(oldNode)
+      expect(run.authorityToken).not.toBe(oldToken)
+      expect(current.isRunning()).toBe(true)
+      const nodeOne = rig.h.frames(78).filter(({ node }) => node === 1)
+      expect(nodeOne.map(({ fields }) => fields.shareSessionEpoch)).toEqual([0])
+      if (['stop boundary', 'crash', 'replacement run'].includes(transition))
+        expect(nodeOne[0].fields.memberId).not.toBe(oldMember)
+      await expect(current.renew()).resolves.toBe(15000)
+      current.acknowledge('accept')
+      const stopping = rig.h.consumer.stop()
+      rig.gate.resolve()
+      await stopping
+      expect(rig.acks.filter(([, , type]) => type === 'renew')).toEqual([['0', '0', 'renew', null]])
+      expect(rig.acks.filter(([, , , reason]) => reason !== null)).toEqual([
+        ['0', '0', 'release', 'membership-lost'],
+      ])
+      expect(rig.partitionAcks.filter(([partition]) => partition === 1)).toEqual([
+        [1, 'renew', null],
+        [1, 'accept', null],
+      ])
+      expect(() => oldCall.renew()).toThrow(STALE)
     }
   )
 })

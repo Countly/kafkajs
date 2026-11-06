@@ -20,6 +20,8 @@ const {
   compressedBatch,
 } = require('../../../protocol/message/compression/fixtures/compressedBatch')
 const { logLevel } = require('../../../../index')
+const { gzipSync } = require('zlib')
+const { ShareFetchLoop } = require('../shareFetchLoop')
 
 /** Every timer the client owns is faked; socket answers still travel on real macrotasks. */
 const FAKE = { doNotFake: ['setImmediate', 'queueMicrotask', 'nextTick', 'hrtime'] }
@@ -66,9 +68,13 @@ describe('public share range contract', () => {
     await advance(1000)
   })
   afterEach(async () => {
-    await h?.close()
-    h = undefined
-    jest.useRealTimers()
+    try {
+      await h?.close()
+    } finally {
+      h = undefined
+      jest.useRealTimers()
+      jest.restoreAllMocks()
+    }
   })
 
   /**
@@ -126,6 +132,23 @@ describe('public share range contract', () => {
       ['a length below the magic 2 header', () => failed({ baseOffset: 3n, length: 20 })],
       ['an unknown magic byte', () => failed({ baseOffset: 3n, magic: 3 })],
       ['a record count the bytes cannot hold', () => failed({ baseOffset: 3n, count: 50 })],
+      ...[
+        ['a gzip body above the decompressed byte ceiling', { baseOffset: 3n }],
+        [
+          'a gzip body above the byte ceiling with unrelated base and delta',
+          { baseOffset: 5000n, lastOffsetDelta: 900000 },
+        ],
+      ].map(([title, fields]) => [
+        title,
+        () =>
+          compressedBatch({
+            codec: 'gzip',
+            records: 1,
+            body: gzipSync(record({ key: 'k3', value: 'x'.repeat(1024) })),
+            ...fields,
+          }),
+        512,
+      ]),
       [
         'a gzip body that does not decompress',
         () =>
@@ -140,15 +163,22 @@ describe('public share range contract', () => {
 
     test.each(HALTS)(
       'releases a halted undecoded remainder compactly after %s',
-      async (_, build) => {
+      async (_, build, byteLimit) => {
         const logs = []
+        if (byteLimit !== undefined) {
+          const original = ShareFetchLoop.prototype.send
+          jest.spyOn(ShareFetchLoop.prototype, 'send').mockImplementation(function (exchange) {
+            this.decode.maxDecompressedBatchBytes = byteLimit
+            return original.call(this, exchange)
+          })
+        }
         await start({
           kafka: {
             logLevel: logLevel.ERROR,
             logCreator:
               () =>
               ({ log }) =>
-                logs.push(log.message),
+                logs.push(log),
           },
         })
         const records = Buffer.concat([FIRST, MARKER, await build()]).toString('hex')
@@ -169,7 +199,16 @@ describe('public share range contract', () => {
           ['gap', '1', '2', null],
           ['release', '3', '1000000', null],
         ])
-        expect(logs.filter((message) => message === 'Share fetch decoding halted')).toHaveLength(1)
+        const halts = logs.filter(({ message }) => message === 'Share fetch decoding halted')
+        expect(halts).toHaveLength(1)
+        if (byteLimit !== undefined) {
+          expect(halts[0].error).toMatchObject({
+            name: 'KafkaJSCorruptRecordError',
+            reason: 'decompressed-size',
+            codec: 'gzip',
+            limit: 512,
+          })
+        }
         expect(h.seen.crashes).toEqual([])
       }
     )

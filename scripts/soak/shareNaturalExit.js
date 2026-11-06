@@ -19,13 +19,16 @@
  * every held gate is released. Timers are counted with
  * `process.getActiveResourcesInfo()`, which lists only the ones that keep the event loop alive.
  * Outcomes: a clean stop, a zero-timeout disconnect, a disconnect that outlives its deadline with
- * a written final unanswered, a final that fails on the wire, and a terminal heartbeat failure. Each ends with a zero-timeout
+ * a written final unanswered, a final that fails on the wire, a terminal heartbeat failure,
+ * and a crash followed by a successful restarted delivery. Each ends with a zero-timeout
  * `disconnect()`, which closes every socket of the client and needs no gate.
  */
+const assert = require('node:assert/strict')
 const {
   acquire,
   deferred,
   fetchAnswer,
+  part,
   shareClient,
   until,
 } = require('../../testHelpers/shareHarness')
@@ -83,19 +86,24 @@ const leakedAfterSettling = async (baseline) => {
  */
 const begin = async (h, hold) => {
   const crashed = deferred()
-  h.consumer.on(h.consumer.events.CRASH, () => crashed.resolve())
+  h.cleanup.removers.push(h.consumer.on(h.consumer.events.CRASH, () => crashed.resolve()))
+  const gate = deferred()
+  h.cleanup.gates.push(gate)
   await h.consumer.subscribe({ topics: ['topic-a'] })
   h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a'])])])
-  const gate = deferred()
-  const started = deferred()
+  let started = false
   await h.consumer.run({
-    eachMessage: async ({ acknowledge }) => {
-      acknowledge()
-      started.resolve()
-      if (hold) await gate.promise
+    eachMessage: ({ acknowledge }) => {
+      const handled = (async () => {
+        acknowledge()
+        started = true
+        if (hold) await gate.promise
+      })()
+      h.cleanup.handlers.push(handled)
+      return handled
     },
   })
-  await started.promise
+  await until(() => started, 'the outcome handler')
   return { gate, onCrash: crashed.promise }
 }
 
@@ -158,16 +166,97 @@ const OUTCOMES = {
     await onCrash
     gate.resolve()
   },
+
+  /**
+   * Crashes a joined run on a partition error and proves the restarted run delivers and confirms.
+   * @param {object} h The scripted client with an affirmative restart verdict.
+   * @returns {Promise<void>} Resolves after the replacement handler and its clean stop complete.
+   */
+  async restart(h) {
+    const joins = []
+    const crashes = []
+    const confirmations = []
+    const deliveries = []
+    const gate = deferred()
+    h.cleanup.gates.push(gate)
+    const { consumer } = h
+    for (const [name, seen] of [
+      ['GROUP_JOIN', joins],
+      ['CRASH', crashes],
+      ['ACKNOWLEDGE', confirmations],
+    ])
+      h.cleanup.removers.push(
+        consumer.on(consumer.events[name], ({ payload }) => seen.push(payload))
+      )
+    await consumer.subscribe({ topics: ['topic-a'] })
+    h.script('ShareFetch', [
+      fetchAnswer([part({ partition: 0, code: 2 })]),
+      fetchAnswer([acquire(0, 0, ['restarted'])]),
+    ])
+    await consumer.run({
+      eachMessage: ({ message, acknowledge }) => {
+        const handled = (async () => {
+          deliveries.push(message.value.toString())
+          acknowledge('accept')
+          await gate.promise
+        })()
+        h.cleanup.handlers.push(handled)
+        return handled
+      },
+    })
+    await until(() => deliveries.length === 1 && joins.length === 2, 'the restarted delivery')
+    assert.equal(crashes.length, 1)
+    assert.equal(crashes[0].restart, true)
+    assert.equal(crashes[0].error.code, 2)
+    assert.deepEqual(h.restartErrors, [crashes[0].error])
+    assert.notEqual(joins[0].memberId, joins[1].memberId)
+    assert.deepEqual(deliveries, ['restarted'])
+    const stopping = consumer.stop()
+    gate.resolve()
+    await stopping
+    assert.deepEqual(
+      confirmations.map(({ partition, firstOffset, lastOffset, type, error }) => [
+        partition,
+        firstOffset,
+        lastOffset,
+        type,
+        error,
+      ]),
+      [[0, '0', '0', 'accept', null]]
+    )
+    h.restartOutcome = {
+      joins: joins.length,
+      crashes: crashes.length,
+      deliveries: deliveries.length,
+      confirmed: confirmations.length,
+      restart: crashes[0].restart,
+    }
+  },
 }
 
 /**
  * Drives one outcome on a fresh client, closes it for good and measures what it left behind.
  * @param {string} name The outcome's key in `OUTCOMES`.
  * @param {Record<string, number>} baseline The counts before any client existed.
- * @returns {Promise<{outcome: string, leaked: Record<string, number>, openSockets: number}>}
+ * @returns {Promise<object>} The resource census and, for a restart, the measured delivery counts.
  */
 const measure = async (name, baseline) => {
-  const h = shareClient({ interval: 25 })
+  const restartErrors = []
+  const h = shareClient({
+    interval: 25,
+    ...(name === 'restart' && {
+      share: {
+        retry: {
+          restartOnFailure: async (error) => {
+            restartErrors.push(error)
+            return true
+          },
+        },
+      },
+    }),
+  })
+  h.restartErrors = restartErrors
+  h.cleanup = { gates: [], handlers: [], removers: [] }
   h.trigger = { code: 0 }
   h.script(
     'ShareGroupHeartbeat',
@@ -181,11 +270,21 @@ const measure = async (name, baseline) => {
   try {
     await OUTCOMES[name](h)
   } finally {
-    await h.consumer.disconnect({ timeout: 0 })
+    for (const gate of h.cleanup.gates) gate.resolve()
+    try {
+      await h.close()
+    } finally {
+      try {
+        await Promise.all(h.cleanup.handlers)
+      } finally {
+        for (const remove of h.cleanup.removers) remove()
+      }
+    }
   }
   await until(() => h.cluster.sockets().every(({ destroyed }) => destroyed), 'every socket closed')
   return {
     outcome: name,
+    ...(name === 'restart' && { restart: h.restartOutcome }),
     leaked: await leakedAfterSettling(baseline),
     openSockets: h.cluster.sockets().filter(({ destroyed }) => !destroyed).length,
   }

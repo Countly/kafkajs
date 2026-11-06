@@ -17,6 +17,8 @@ const Broker = require('../../../broker')
 const Cluster = require('../../../cluster')
 const RequestQueue = require('../../../network/requestQueue')
 const { requests } = require('../../../protocol/requests')
+const { ShareFetchLoop } = require('../shareFetchLoop')
+const { ShareRunner } = require('../shareRunner')
 
 /** Every timer the client owns is faked; socket answers still travel on real macrotasks. */
 const FAKE = { doNotFake: ['setImmediate', 'queueMicrotask', 'nextTick', 'hrtime'] }
@@ -134,16 +136,34 @@ describe('public share token contract', () => {
   let h
   /** Test-owned gates, released before the client closes so no held continuation outlives a test. */
   const holds = []
+  const handlers = []
+  const continuations = []
+  /** @returns {object} A test gate released even when an assertion fails before its normal release. */
+  const heldGate = () => {
+    const gate = deferred()
+    holds.push({ release: () => gate.resolve() })
+    return gate
+  }
   beforeEach(async () => {
     jest.useFakeTimers(FAKE)
     await advance(1000)
   })
   afterEach(async () => {
-    for (const hold of holds.splice(0)) hold.release()
-    await h?.close()
-    h = undefined
-    jest.useRealTimers()
-    jest.restoreAllMocks()
+    let settled
+    try {
+      for (const hold of holds.splice(0)) hold.release()
+      await h?.close()
+    } finally {
+      try {
+        settled = await Promise.allSettled([...handlers.splice(0), ...continuations.splice(0)])
+      } finally {
+        h = undefined
+        jest.useRealTimers()
+        jest.restoreAllMocks()
+      }
+    }
+    const failed = settled.find(({ status }) => status === 'rejected')
+    if (failed) throw failed.reason
   })
 
   /**
@@ -170,7 +190,16 @@ describe('public share token contract', () => {
    * @returns {Promise<void>}
    */
   const run = async (config) => {
-    await h.consumer.run(config)
+    const key = config.eachMessage ? 'eachMessage' : 'eachBatch'
+    const handler = config[key]
+    await h.consumer.run({
+      ...config,
+      [key]: (payload) => {
+        const pending = handler(payload)
+        handlers.push(pending)
+        return pending
+      },
+    })
     await flush()
   }
   /**
@@ -296,8 +325,7 @@ describe('public share token contract', () => {
     await start()
     h.script('ShareFetch', [oneRecord(), oneRecord()])
     h.script('ShareAcknowledge', [ackAnswer([], { errorCode: 122 })])
-    const replacement = deferred()
-    holds.push({ release: () => replacement.resolve() })
+    const replacement = heldGate()
     const returned = deferred()
     const calls = []
     const during = {}
@@ -413,39 +441,79 @@ describe('public share token contract', () => {
     test('sends no frame from the held lookup of a fenced membership and the rejoin keeps its member', async () => {
       const { lookup, data } = await holdRejoinLookup(true)
       data.release(topError(25))
-      await flush()
-      lookup.release()
       await until(() => h.seen.assigned.length === 2, 'the fence')
-      await flush()
       expect(heartbeatEpochs()).toEqual([0, 1])
-      await advanceUntil(() => joins().length === 2, 'the rejoin')
+      openWith([oneRecord()])
+      await advanceUntil(
+        () => h.seen.acks.length === 1 && joins().length === 2,
+        'the rejoin and acquisition'
+      )
+      expect(heartbeatEpochs()).toEqual([0, 1, 0])
+      expect(outcomes()).toEqual([['accept', '0', '0', null]])
+      lookup.release()
+      await flush()
       expect(heartbeatEpochs()).toEqual([0, 1, 0])
       expect(new Set(joins().map(({ fields }) => fields.memberId)).size).toBe(1)
+      await beat(50, 4)
+      expect(heartbeatEpochs()).toEqual([0, 1, 0, 1])
       expect(h.seen.crashes).toEqual([])
     })
 
     test('sends no frame from the held lookup of a crashed run and a fresh run joins', async () => {
       const { lookup, data } = await holdRejoinLookup(true)
       data.release(fetchAnswer([part({ partition: 0, code: 2 })]))
-      await flush()
-      lookup.release()
       await until(() => h.seen.crashes.length === 1, 'the crash event')
       await flush()
       expect(h.seen.crashes[0]).toMatchObject({ restart: false, groupId: 'group' })
       expect(h.seen.crashes[0].error.code).toBe(2)
       expect(heartbeatEpochs()).toEqual([0, 1])
+      openWith([oneRecord()])
       await run({ eachMessage: async () => {} })
+      await until(() => h.seen.acks.length === 1, 'the fresh acquisition settlement')
+      expect(outcomes()).toEqual([['accept', '0', '0', null]])
+      lookup.release()
+      await flush()
       expect(heartbeatEpochs()).toEqual([0, 1, 0])
       expect(new Set(joins().map(({ fields }) => fields.memberId)).size).toBe(2)
+      await beat(50, 4)
+      expect(heartbeatEpochs()).toEqual([0, 1, 0, 1])
       expect(h.seen.crashes).toHaveLength(1)
     })
+  })
+
+  test('keeps a replacement run current when the stopped heartbeat lookup is released late', async () => {
+    await start()
+    h.script('ShareGroupHeartbeat', [undefined, { errorCode: 14 }])
+    await run({ eachMessage: async () => {} })
+    const lookup = h.hold({ api: 'FindCoordinator' })
+    await beat(50, 2)
+    await advance(50)
+    await lookup.arrived()
+    await stopIdle()
+    openWith([oneRecord()])
+    const delivered = []
+    await run({ eachMessage: async ({ message }) => delivered.push(message.offset) })
+    await until(() => h.seen.acks.length === 1, 'the replacement acquisition settlement')
+    const replacementId = joins()[1].fields.memberId
+    expect(heartbeatEpochs()).toEqual([0, 1, 0])
+    expect(delivered).toEqual(['0'])
+    expect(outcomes()).toEqual([['accept', '0', '0', null]])
+    lookup.release()
+    await flush()
+    expect(heartbeatEpochs()).toEqual([0, 1, 0])
+    expect(h.consumer.assignment()).toEqual([{ topic: 'topic-a', partitions: [0] }])
+    await beat(50, 4)
+    expect(heartbeatEpochs()).toEqual([0, 1, 0, 1])
+    expect(h.frames(76)[3].fields.memberId).toBe(replacementId)
+    expect(h.seen.joins).toHaveLength(2)
+    expect(h.seen.crashes).toEqual([])
   })
 
   test('keeps a running handler out of the next membership after a fence', async () => {
     await start()
     openWith([oneRecord(), oneRecord()])
     h.script('ShareGroupHeartbeat', [undefined, { errorCode: 25 }])
-    const gate = deferred()
+    const gate = heldGate()
     const returned = deferred()
     const saved = []
     const handled = []
@@ -488,7 +556,7 @@ describe('public share token contract', () => {
     openWith([oneRecord(), oneRecord()])
     h.script('ShareGroupHeartbeat', [undefined, FENCE])
     const held = holdAcknowledgingFetch()
-    const second = deferred()
+    const second = heldGate()
     const counts = []
     await run({
       eachMessage: async ({ message, acknowledge }) => {
@@ -562,7 +630,7 @@ describe('public share token contract', () => {
     await start()
     openWith([oneRecord(), oneRecord()])
     const held = holdAcknowledgingFetch()
-    const second = deferred()
+    const second = heldGate()
     const counts = []
     await run({
       eachMessage: async ({ message, acknowledge }) => {
@@ -611,7 +679,7 @@ describe('public share token contract', () => {
       ]),
     ])
     h.script('ShareGroupHeartbeat', [undefined, FENCE])
-    const gate = deferred()
+    const gate = heldGate()
     const decided = deferred()
     await run({
       eachBatch: async ({ batch, acknowledge }) => {
@@ -645,7 +713,7 @@ describe('public share token contract', () => {
     await start()
     openWith([fetchAnswer([acquire(0, 0, ['a', 'b', 'c', 'd', 'e', 'f', 'g'])])])
     h.script('ShareGroupHeartbeat', [undefined, FENCE])
-    const gate = deferred()
+    const gate = heldGate()
     const decided = deferred()
     const started = []
     await run({
@@ -675,7 +743,7 @@ describe('public share token contract', () => {
     // Same topic, partition, offset and open epoch; only the delivery count tells them apart.
     openWith([oneRecord(1), oneRecord(2)])
     const held = holdAcknowledgingFetch()
-    const second = deferred()
+    const second = heldGate()
     const counts = []
     await run({
       eachMessage: async ({ message, acknowledge }) => {
@@ -710,48 +778,75 @@ describe('public share token contract', () => {
   })
 
   test('ignores an old acquisition-bearing answer released after its replacement was delivered', async () => {
-    await start()
+    jest.spyOn(performance, 'now').mockReturnValue(1000)
+    const openings = []
+    const newExchange = ShareFetchLoop.prototype.newExchange
+    jest.spyOn(ShareFetchLoop.prototype, 'newExchange').mockImplementation(function (...args) {
+      const exchange = newExchange.apply(this, args)
+      if (exchange.kind === 'fetch' && this.session.epoch === 0) openings.push(exchange)
+      return exchange
+    })
+    // A frozen monotonic clock also needs a zero membership backoff for the rejoin to become due.
+    await start({ share: { retry: { initialRetryTime: 0, maxRetryTime: 0 } } })
     const stale = fetchAnswer(
       [part({ partition: 0, acquire: [acquired(0, 0, 7)], records: recordsHex(0, ['old']) })],
       { acquisitionLockTimeoutMs: 7777 }
     )
     openWith([stale, oneRecord(1)])
     h.script('ShareGroupHeartbeat', [undefined, FENCE])
-    // The answer is decoded and parked before the loop sees it, as one that outlives its node.
+    // Park the decoded answer so socket teardown cannot prevent its eventual delivery to the loop.
     const original = Broker.prototype.shareFetch
     const arrival = deferred()
-    const gate = deferred()
-    holds.push({ release: () => gate.resolve() })
+    const gate = heldGate()
+    const done = deferred()
     let taken = false
     jest.spyOn(Broker.prototype, 'shareFetch').mockImplementation(async function (...args) {
       const first = !taken
       taken = true
-      const response = await original.apply(this, args)
-      if (!first) return response
-      arrival.resolve()
-      await gate.promise
-      return response
+      if (!first) return original.apply(this, args)
+      continuations.push(done.promise)
+      try {
+        const response = await original.apply(this, args)
+        arrival.resolve()
+        await gate.promise
+        return response
+      } finally {
+        done.resolve()
+      }
     })
-    const counts = []
-    await run({
-      eachMessage: async ({ message }) => {
-        counts.push(message.deliveryCount)
+    const second = heldGate()
+    const delivered = []
+    const config = {
+      eachMessage: async ({ message, acknowledge }) => {
+        delivered.push([message.offset, message.deliveryCount, message.value.toString()])
+        await second.promise
+        acknowledge('reject')
       },
-    })
+    }
+    await run(config)
     await arrival.promise
-    expect(counts).toEqual([])
-    await beat(50, 2)
-    await until(() => h.seen.assigned.length === 2, 'the fence')
-    await flush()
-    await advanceUntil(() => counts.length === 1 && h.seen.joins.length === 2, 'the replacement')
-    expect(counts).toEqual([1])
+    expect(delivered).toEqual([])
+    await advanceUntil(() => delivered.length === 1 && h.seen.joins.length === 2, 'the replacement')
+    expect(openings).toHaveLength(2)
+    expect(openings.map(({ sentAt }) => sentAt)).toEqual([1000, 1000])
+    expect(openings[0].open).not.toBe(openings[1].open)
+    expect(h.frames(78).map(({ fields }) => fields.shareSessionEpoch)).toEqual([0, 0])
+    expect(delivered).toEqual([['0', 1, 'a']])
     expect(h.consumer.acquisitionLockTimeoutMs()).toBe(15000)
     gate.resolve()
+    await done.promise
     await flush()
-    expect(counts).toEqual([1])
+    expect(delivered).toEqual([['0', 1, 'a']])
     expect(h.consumer.acquisitionLockTimeoutMs()).toBe(15000)
-    await advanceUntil(() => h.seen.acks.length === 1, 'the replacement settlement')
-    expect(outcomes()).toEqual([['accept', '0', '0', null]])
+    expect(outcomes()).toEqual([])
+    second.resolve()
+    await until(() => h.seen.acks.length === 1, 'the replacement settlement')
+    expect(outcomes()).toEqual([['reject', '0', '0', null]])
+    expect(h.frames(78).map(batchesOf)).toEqual([
+      [],
+      [],
+      [{ firstOffset: '0', lastOffset: '0', acknowledgeTypes: [3] }],
+    ])
     expect(h.seen.crashes).toEqual([])
   })
 
@@ -910,6 +1005,81 @@ describe('public share token contract', () => {
       expect(h.seen.crashes).toEqual([])
     })
 
+    test('retires a written renewal when a routing update moves its partition and ignores its late answer', async () => {
+      let cluster
+      const routing = Cluster.prototype.onRoutingChange
+      jest.spyOn(Cluster.prototype, 'onRoutingChange').mockImplementation(function (listener) {
+        cluster = this
+        return routing.call(this, listener)
+      })
+      await start({ nodes: 2 })
+      const opened = new Set()
+      h.cluster.answer('ShareFetch', (fields, call) => {
+        if (fields.shareSessionEpoch !== 0 || opened.has(call.node))
+          return echo('ShareFetch', fields)
+        opened.add(call.node)
+        return oneRecord(call.node + 1)
+      })
+      const old = h.hold({ api: 'ShareAcknowledge', node: 0 })
+      const results = []
+      await run({
+        eachMessage: async ({ renew, acknowledge }) => {
+          const index = results.length
+          const result = { pending: true }
+          results.push(result)
+          result.value = await renew().then(
+            (duration) => duration,
+            (error) => error
+          )
+          result.pending = false
+          if (index === 1) acknowledge('reject')
+        },
+      })
+      await old.arrived()
+      expect(results).toEqual([{ pending: true }])
+      expect(old.call.fields.isRenewAck).toBe(true)
+      expect(batchesOf(old.call)).toEqual([
+        { firstOffset: '0', lastOffset: '0', acknowledgeTypes: [4] },
+      ])
+      await expect(
+        cluster.applyLeaderHint({ topic: 'topic-a', partition: 0, leaderId: 1, leaderEpoch: 2 })
+      ).resolves.toBe(true)
+      expect(cluster.cachedLeader('topic-a', 0)).toBe(1)
+      await until(
+        () =>
+          results.length === 2 &&
+          !results[1].pending &&
+          h.seen.acks.some(({ type }) => type === 'reject'),
+        'the new leader renewal and terminal settlement'
+      )
+      expect(results[1]).toEqual({ pending: false, value: 15000 })
+      const retiredBeforeAnswer = !results[0].pending
+      old.release(ackAnswer([{ partition: 0 }], { acquisitionLockTimeoutMs: 7777 }))
+      await until(() => !results[0].pending, 'the old renewal continuation')
+      await flush()
+      expect(retiredBeforeAnswer).toBe(true)
+      expect(results[0].value).toMatchObject({
+        name: 'KafkaJSShareAcknowledgementError',
+        reason: 'session-lost',
+        ranges: [{ firstOffset: '0', lastOffset: '0' }],
+      })
+      expect(outcomes()).toEqual([
+        ['renew', '0', '0', 'session-lost'],
+        ['release', '0', '0', 'session-lost'],
+        ['renew', '0', '0', null],
+        ['reject', '0', '0', null],
+      ])
+      expect(h.consumer.acquisitionLockTimeoutMs()).toBe(15000)
+      expect(outcomes()).toHaveLength(4)
+      expect(
+        h
+          .frames(79)
+          .filter(({ fields }) => fields.isRenewAck)
+          .map(({ node }) => node)
+      ).toEqual([0, 1])
+      expect(h.seen.crashes).toEqual([])
+    })
+
     test('settles a renewal lost once at the disconnect deadline and ignores its late answer', async () => {
       const { held, results } = await startRenewing([oneRecord()])
       const closing = track(h.consumer.disconnect({ timeout: 400 }))
@@ -958,8 +1128,8 @@ describe('public share token contract', () => {
         if (call.node === 1 && next < 6) return fetchAnswer([acquire(1, next++, ['b'])])
         return echo('ShareFetch', fields)
       })
-      const aGate = deferred()
-      const bGates = Array.from({ length: 6 }, () => deferred())
+      const aGate = heldGate()
+      const bGates = Array.from({ length: 6 }, () => heldGate())
       const started = { a: 0, b: 0 }
       await run({
         eachMessage: async ({ partition, message }) => {
@@ -1008,7 +1178,13 @@ describe('public share token contract', () => {
      *   answers a fatal partition error and whose restart verdict waits for the test.
      */
     const crashWithHeldVerdict = async () => {
-      const gate = deferred()
+      const gate = heldGate()
+      const original = ShareRunner.prototype.superviseCrash
+      jest.spyOn(ShareRunner.prototype, 'superviseCrash').mockImplementation(function (...args) {
+        const pending = original.apply(this, args)
+        continuations.push(pending)
+        return pending
+      })
       const restartOnFailure = jest.fn(() => gate.promise.then(() => true))
       await start({ share: { retry: { restartOnFailure } } })
       h.script('ShareFetch', [fetchAnswer([part({ partition: 0, code: 2 })])])
@@ -1067,10 +1243,75 @@ describe('public share token contract', () => {
     })
   })
 
+  test('discards initial node discovery released after a replacement run is serving records', async () => {
+    await start()
+    const gate = heldGate()
+    const arrived = deferred()
+    const done = deferred()
+    let taken = false
+    const findBroker = Cluster.prototype.findBroker
+    let cluster
+    h.consumer.on(h.consumer.events.GROUP_JOIN, () => {
+      if (taken) return
+      taken = true
+      let held = false
+      jest.spyOn(Cluster.prototype, 'findBroker').mockImplementation(async function (options) {
+        if (held) return findBroker.call(this, options)
+        held = true
+        cluster = this
+        continuations.push(done.promise)
+        try {
+          const broker = await findBroker.call(this, options)
+          arrived.resolve()
+          await gate.promise
+          return broker
+        } finally {
+          done.resolve()
+        }
+      })
+    })
+    await run({ eachMessage: async () => {} })
+    await arrived.promise
+    expect(h.frames(78)).toHaveLength(0)
+    await h.consumer.disconnect({ timeout: 0 })
+    openWith([oneRecord()])
+    const handled = []
+    await run({ eachMessage: async ({ message }) => handled.push(message.offset) })
+    await until(() => h.seen.acks.length === 1, 'the replacement delivery and settlement')
+    const replacementId = joins()[1].fields.memberId
+    const [replacement] = h.frames(78)
+    expect(handled).toEqual(['0'])
+    expect(outcomes()).toEqual([['accept', '0', '0', null]])
+    expect(h.frames(78).map(({ fields }) => fields.memberId)).toEqual([
+      replacementId,
+      replacementId,
+    ])
+    const socket = h.cluster.sockets()[replacement.generation - 1]
+    expect(socket.destroyed).toBe(false)
+    expect(cluster.metadataCache.routingListeners.size).toBe(1)
+    const timers = jest.getTimerCount()
+    gate.resolve()
+    await done.promise
+    await flush()
+    expect(jest.getTimerCount()).toBe(timers)
+    expect(cluster.metadataCache.routingListeners.size).toBe(1)
+    expect(socket.destroyed).toBe(false)
+    expect(handled).toEqual(['0'])
+    expect(h.frames(78)).toHaveLength(2)
+    expect(h.consumer.assignment()).toEqual([{ topic: 'topic-a', partitions: [0] }])
+    await beat(50, 3)
+    await until(() => h.frames(78).length === 3, 'a current fetch after the old discovery finished')
+    expect(h.frames(78)[2].fields).toMatchObject({ memberId: replacementId, shareSessionEpoch: 2 })
+    expect(h.frames(78)[2].generation).toBe(replacement.generation)
+    expect(joins()).toHaveLength(2)
+    expect(h.seen.crashes).toEqual([])
+  })
+
   describe('held metadata flights', () => {
     /**
      * Holds every by-id metadata flight inside the cluster helper until the test releases it.
-     * @returns {Array<{ids: string[], gate: object}>} The flights, oldest first.
+     * @returns {Array<{ids: string[], gate: object, done: object}>} The flights, oldest first;
+     *   each `done` resolves after the released provider continuation settles.
      */
     const holdFlights = () => {
       const flights = []
@@ -1078,9 +1319,18 @@ describe('public share token contract', () => {
       jest
         .spyOn(Cluster.prototype, 'refreshMetadataForTopicIds')
         .mockImplementation(function (ids, scope) {
-          const gate = deferred()
-          flights.push({ ids, gate })
-          return gate.promise.then(() => original.call(this, ids, scope))
+          const gate = heldGate()
+          const done = deferred()
+          continuations.push(done.promise)
+          flights.push({ ids, gate, done })
+          return (async () => {
+            try {
+              await gate.promise
+              return await original.call(this, ids, scope)
+            } finally {
+              done.resolve()
+            }
+          })()
         })
       return flights
     }

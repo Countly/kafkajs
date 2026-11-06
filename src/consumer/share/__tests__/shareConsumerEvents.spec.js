@@ -113,10 +113,15 @@ describe('public share event contract', () => {
     until,
   } = require('../../../../testHelpers/shareHarness')
   let h
+  const cleanups = []
   afterEach(async () => {
-    jest.restoreAllMocks()
-    await h?.close()
-    h = undefined
+    try {
+      await h?.close()
+    } finally {
+      for (const cleanup of cleanups.splice(0)) await cleanup()
+      h = undefined
+      jest.restoreAllMocks()
+    }
   })
   /** @param {string[]} names Event constants to observe. @returns {Record<string, object[]>} Events by name. */
   const record = (names) => {
@@ -183,7 +188,7 @@ describe('public share event contract', () => {
     })
     const seen = record(['ASSIGNMENT_CHANGED', 'HEARTBEAT'])
     const epochs = () => seen.HEARTBEAT.map(({ payload }) => payload.memberEpoch)
-    const beats = [0, 1, 2].map(() =>
+    const beats = [0, 1, 2, 3].map(() =>
       h.hold({ api: 'ShareGroupHeartbeat', match: ({ fields }) => fields.memberEpoch > 0 })
     )
     await h.consumer.subscribe({ topics: ['topic-a', 'topic-b'] })
@@ -225,6 +230,7 @@ describe('public share event contract', () => {
       expect(seen.ASSIGNMENT_CHANGED).toHaveLength(index === 2 ? 2 : 1)
     }
 
+    await until(() => beats[3].call !== null, 'the next held heartbeat')
     expect(epochs()).toEqual([1, 2, 3, 4])
     expect(
       seen.ASSIGNMENT_CHANGED.slice(1).map(({ payload }) => ({
@@ -321,11 +327,22 @@ describe('public share event contract', () => {
     })
     const second = deferred()
     const hold = deferred()
+    const returned = deferred()
+    let entered = false
+    cleanups.push(async () => {
+      hold.resolve()
+      if (entered) await returned.promise
+    })
     await h.consumer.run({
       eachMessage: async ({ message }) => {
         if (message.offset === '0') throw new Error('first fails')
+        entered = true
         second.resolve()
-        await hold.promise
+        try {
+          await hold.promise
+        } finally {
+          returned.resolve()
+        }
       },
     })
     await Promise.all([settled.promise, second.promise])
@@ -358,6 +375,7 @@ describe('public share event contract', () => {
       },
     ])
     hold.resolve()
+    await returned.promise
   })
 
   test('publishes one membership session reset for each discarded node session', async () => {

@@ -1,4 +1,5 @@
 const { ShareHandlerCall } = require('../shareRunner')
+const { ShareRun } = require('../shareRun')
 const { countWithin } = require('../shareHandlerCall')
 const { ShareAckLedger } = require('../shareAckLedger')
 const { KafkaJSNonRetriableError } = require('../../../errors')
@@ -279,12 +280,59 @@ describe('public share handler contract', () => {
   const FAKE_TIMERS = { doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'] }
   const PACED = { retry: { initialRetryTime: 300, multiplier: 2, maxRetryTime: 1200, factor: 0 } }
   let h
+  const handlerGates = []
   afterEach(async () => {
-    await h?.close()
-    h = undefined
-    jest.useRealTimers()
-    jest.restoreAllMocks()
+    const gates = handlerGates.splice(0)
+    for (const gate of gates) gate.resolve()
+    try {
+      await h?.close()
+    } finally {
+      await Promise.all(gates.flatMap((gate) => gate.completions))
+      h = undefined
+      jest.useRealTimers()
+      jest.restoreAllMocks()
+    }
   })
+  /**
+   * Registers a handler gate before invocation; cleanup releases it and awaits every wrapped call.
+   * @returns {object} A deferred gate and `wrap(handler)` that observes the full continuation.
+   */
+  const handlerGate = () => {
+    const gate = { ...deferred(), completions: [] }
+    gate.wrap = (handler) => async (payload) => {
+      const completed = deferred()
+      gate.completions.push(completed.promise)
+      try {
+        return await handler(payload)
+      } finally {
+        completed.resolve()
+      }
+    }
+    handlerGates.push(gate)
+    return gate
+  }
+  /**
+   * Observes when each node's real handler-backoff timer is armed, without replacing its sleep.
+   * @returns {Array<{nodeId: number, delay: number}>} Reached pacing stages.
+   */
+  const observePacing = () => {
+    const waits = []
+    const watched = new Set()
+    const afterFailure = ShareRun.prototype.afterFailure
+    jest.spyOn(ShareRun.prototype, 'afterFailure').mockImplementation(function (node, ...args) {
+      if (!watched.has(node.pacing)) {
+        watched.add(node.pacing)
+        const sleep = node.pacing.sleep
+        jest.spyOn(node.pacing, 'sleep').mockImplementation(function (delay) {
+          const promise = sleep.call(this, delay)
+          waits.push({ nodeId: node.id, delay })
+          return promise
+        })
+      }
+      return afterFailure.call(this, node, ...args)
+    })
+    return waits
+  }
   /**
    * @param {object} [options] `shareClient` options.
    * @returns {Promise<object>} A subscribed client; `acks`, `errors` and `crashes` hold its
@@ -394,10 +442,10 @@ describe('public share handler contract', () => {
   test('keeps explicit choices in implicit mode', async () => {
     await start()
     h.script('ShareFetch', [answer(['a', 'b'])])
-    const held = deferred()
+    const held = handlerGate()
     const handled = []
     await h.consumer.run({
-      eachMessage: async ({ message, acknowledge }) => {
+      eachMessage: held.wrap(async ({ message, acknowledge }) => {
         handled.push(message.offset)
         if (message.offset === '0') {
           acknowledge('accept')
@@ -408,7 +456,7 @@ describe('public share handler contract', () => {
         } else {
           acknowledge('release')
         }
-      },
+      }),
     })
     await until(() => handled.length === 1, 'the first handler')
     await flush()
@@ -570,16 +618,16 @@ describe('public share handler contract', () => {
     h.script('ShareAcknowledge', [
       ackAnswer([{ partition: 0 }], { acquisitionLockTimeoutMs: 2000 }),
     ])
-    const held = deferred()
+    const held = handlerGate()
     const renewed = []
     await h.consumer.run({
-      eachMessage: async ({ acknowledge, renew }) => {
+      eachMessage: held.wrap(async ({ acknowledge, renew }) => {
         acknowledge('accept')
         acknowledge('release')
         acknowledge('reject')
         renewed.push(await renew())
         await held.promise
-      },
+      }),
     })
     await until(() => renewed.length === 1, 'the renewal')
     const beat = h.hold({
@@ -600,15 +648,15 @@ describe('public share handler contract', () => {
   test('lets a crash capture the last provisional choice through the closing authority', async () => {
     await start({ share: { acknowledgementMode: 'explicit' } })
     h.script('ShareFetch', [answer(['a'])])
-    const held = deferred()
+    const held = handlerGate()
     const decided = deferred()
     await h.consumer.run({
-      eachMessage: async ({ acknowledge }) => {
+      eachMessage: held.wrap(async ({ acknowledge }) => {
         acknowledge('accept')
         acknowledge('reject')
         decided.resolve()
         await held.promise
-      },
+      }),
     })
     await decided.promise
     await answerNextBeat({ errorCode: 30, memberEpoch: -1, heartbeatIntervalMs: 0 })
@@ -653,17 +701,17 @@ describe('public share handler contract', () => {
   ])('ignores %s of a handler that was fenced before it returned', async (_, throws) => {
     await start()
     h.script('ShareFetch', [answer(['a']), answer(['b'], 5)])
-    const held = deferred()
+    const held = handlerGate()
     const handled = []
     let saved
     await h.consumer.run({
-      eachMessage: async ({ message, acknowledge }) => {
+      eachMessage: held.wrap(async ({ message, acknowledge }) => {
         handled.push(message.offset)
         if (message.offset !== '0') return
         saved = acknowledge
         await held.promise
         if (throws) throw new Error('late failure')
-      },
+      }),
     })
     await until(() => handled.length === 1, 'the first handler')
     const rejoin = h.hold({
@@ -697,13 +745,13 @@ describe('public share handler contract', () => {
     await start()
     h.script('ShareFetch', [answer(['a']), answer(['b'], 5)])
     h.script('ShareAcknowledge', [ackAnswer([], { errorCode: 122 })])
-    const held = deferred()
+    const held = handlerGate()
     const reset = deferred()
     const handled = []
     const during = {}
     let saved
     await h.consumer.run({
-      eachMessage: async ({ message, acknowledge, renew }) => {
+      eachMessage: held.wrap(async ({ message, acknowledge, renew }) => {
         handled.push(message.offset)
         if (message.offset !== '0') return
         saved = acknowledge
@@ -714,7 +762,7 @@ describe('public share handler contract', () => {
         reset.resolve()
         await held.promise
         if (throws) throw new Error('late failure')
-      },
+      }),
     })
     await reset.promise
     await flush()
@@ -751,6 +799,7 @@ describe('public share handler contract', () => {
   test('paces consecutive handler failures and resets on success', async () => {
     jest.useFakeTimers(FAKE_TIMERS)
     await start({ share: PACED })
+    const waits = observePacing()
     const stamps = []
     const reader = (values, base) => () => {
       stamps.push(performance.now())
@@ -770,17 +819,20 @@ describe('public share handler contract', () => {
         if (calls !== 3) throw new Error('fail')
       },
     })
-    await until(() => h.errors.length === 1, 'the first failure')
+    await until(() => waits.length === 1, 'the first armed handler backoff')
+    expect(waits.map(({ delay }) => delay)).toEqual([300])
     const since = () => stamps.map((stamp) => stamp - stamps[0])
     await tick(299)
     expect(since()).toEqual([0])
     await tick(1)
-    await until(() => h.errors.length === 2, 'the second failure')
+    await until(() => waits.length === 2, 'the second armed handler backoff')
+    expect(waits.map(({ delay }) => delay)).toEqual([300, 600])
     expect(since()).toEqual([0, 300])
     await tick(599)
     expect(since()).toEqual([0, 300])
     await tick(1)
-    await until(() => h.errors.length === 3, 'the failure after the reset')
+    await until(() => waits.length === 3, 'the armed handler backoff after success')
+    expect(waits.map(({ delay }) => delay)).toEqual([300, 600, 300])
     expect(since()).toEqual([0, 300, 900, 900])
     await tick(299)
     expect(since()).toEqual([0, 300, 900, 900])
@@ -805,6 +857,7 @@ describe('public share handler contract', () => {
       },
       share: PACED,
     })
+    const waits = observePacing()
     const stamps = []
     const calls = [0, 0]
     const successes = []
@@ -814,24 +867,40 @@ describe('public share handler contract', () => {
         stamps.push(performance.now())
         return nth < 3 ? answer(['x'], nth) : echo('ShareFetch', fields)
       }
-      return [1, 3].includes(nth)
-        ? fetchAnswer([acquire(1, nth, ['y'])])
-        : echo('ShareFetch', fields)
+      return nth < 2 ? fetchAnswer([acquire(1, nth * 2 + 1, ['y'])]) : echo('ShareFetch', fields)
     })
+    const sibling = [0, 1, 2].map(() => h.hold({ api: 'ShareFetch', node: 1 }))
     await h.consumer.run({
       eachMessage: async ({ partition, message }) => {
         if (partition === 0) throw new Error('fail')
         successes.push(message.offset)
       },
     })
-    await until(() => h.errors.length === 1, 'the first failure of the failing node')
+    await until(() => waits.length === 1, 'the first armed handler backoff')
+    expect(waits.map(({ nodeId, delay }) => [nodeId, delay])).toEqual([[0, 300]])
+    await until(() => sibling[0].call !== null, 'the first held sibling fetch')
     const since = () => stamps.map((stamp) => stamp - stamps[0])
-    await tick(299)
-    await until(() => successes.length === 2, 'the progress of the other node')
+    await tick(100)
+    sibling[0].release()
+    await until(
+      () => successes.length === 1 && sibling[1].call !== null,
+      'the first sibling progress'
+    )
+    await tick(100)
+    sibling[1].release()
+    await until(
+      () => successes.length === 2 && sibling[2].call !== null,
+      'the second sibling progress'
+    )
+    await tick(99)
     expect(successes).toEqual(['1', '3'])
     expect(since()).toEqual([0])
     await tick(1)
-    await until(() => h.errors.length === 2, 'the second failure')
+    await until(() => waits.length === 2, 'the second armed handler backoff')
+    expect(waits.map(({ nodeId, delay }) => [nodeId, delay])).toEqual([
+      [0, 300],
+      [0, 600],
+    ])
     expect(since()).toEqual([0, 300])
     await tick(599)
     expect(since()).toEqual([0, 300])
@@ -860,6 +929,8 @@ describe('public share handler contract', () => {
   test('cancels the owned pacing wait when a fence ends the run and paces the replacement from the initial delay', async () => {
     jest.useFakeTimers(FAKE_TIMERS)
     await start({ share: PACED, interval: 100 })
+    const waits = observePacing()
+    const closed = jest.spyOn(ShareRun.prototype, 'afterClose')
     const stamps = []
     const reader = (values, base) => () => {
       stamps.push(performance.now())
@@ -872,13 +943,20 @@ describe('public share handler contract', () => {
         throw new Error('fail')
       },
     })
-    await until(() => h.errors.length === 1, 'the first failure')
+    await until(() => waits.length === 1, 'the first armed handler backoff')
+    expect(waits.map(({ delay }) => delay)).toEqual([300])
     const since = () => stamps.map((stamp) => stamp - stamps[0])
-    await tick(399)
+    await tick(100)
+    await until(
+      () => closed.mock.calls.some(([episode]) => episode.kind === 'fence'),
+      'the completed fence close'
+    )
+    await tick(299)
     expect(since()).toEqual([0])
     expect(h.errors).toHaveLength(1)
     await tick(1)
-    await until(() => h.errors.length === 2, 'the failure of the replacement node')
+    await until(() => waits.length === 2, 'the armed handler backoff of the replacement node')
+    expect(waits.map(({ delay }) => delay)).toEqual([300, 300])
     expect(since()).toEqual([0, 400])
     await tick(299)
     expect(since()).toEqual([0, 400])

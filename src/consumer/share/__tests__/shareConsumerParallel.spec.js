@@ -1,3 +1,5 @@
+const HeartbeatManager = require('../../heartbeatManager')
+const { ShareRunner } = require('../shareRunner')
 const {
   A,
   acquire,
@@ -31,17 +33,30 @@ const advance = (ms) => jest.advanceTimersByTimeAsync(ms)
 
 describe('share handlers on parallel leader nodes', () => {
   let h
+  let manager
   /** Test-owned gates, released before the client closes so no held continuation outlives a test. */
   const holds = []
   beforeEach(async () => {
     jest.useFakeTimers(FAKE)
+    const schedule = HeartbeatManager.prototype.schedule
+    jest.spyOn(HeartbeatManager.prototype, 'schedule').mockImplementation(function () {
+      schedule.call(this)
+      manager = this
+    })
     await advance(1000)
   })
   afterEach(async () => {
-    for (const hold of holds.splice(0)) hold.release()
-    await h?.close()
-    h = undefined
-    jest.useRealTimers()
+    const released = holds.splice(0)
+    for (const hold of released) hold.release()
+    try {
+      await h?.close()
+    } finally {
+      await Promise.all(released.flatMap((hold) => hold.completions ?? []))
+      h = undefined
+      manager = undefined
+      jest.useRealTimers()
+      jest.restoreAllMocks()
+    }
   })
 
   /**
@@ -63,17 +78,29 @@ describe('share handlers on parallel leader nodes', () => {
    * @returns {Promise<void>} Resolves once joined, with the heartbeat chain armed.
    */
   const run = async (config) => {
+    const previous = manager
     await h.consumer.run(config)
-    await flush()
+    await until(() => manager && manager !== previous, 'the new heartbeat chain')
+    await heartbeatReady()
   }
+  /**
+   * Waits at a fixed clock until the current heartbeat answer has rearmed its timer.
+   * @returns {Promise<void>}
+   */
+  const heartbeatReady = () =>
+    until(
+      () => manager && manager.handle !== null && !manager.inFlight && !manager.stopped,
+      'the armed heartbeat timer'
+    )
   /**
    * @param {number} count Heartbeat frames expected once the next tick's request was written.
    * @returns {Promise<void>}
    */
   const beat = async (count) => {
+    await heartbeatReady()
     await advance(50)
     await until(() => h.frames(76).length === count, `heartbeat frame ${count}`)
-    await flush()
+    await heartbeatReady()
   }
   /**
    * Moves the clock `ms` in two steps, and proves the tick fires at the last millisecond and not
@@ -83,26 +110,13 @@ describe('share handlers on parallel leader nodes', () => {
    * @returns {Promise<void>}
    */
   const tickAt = async (ms, count) => {
+    await heartbeatReady()
     await advance(ms - 1)
     await flush()
     expect(h.frames(76)).toHaveLength(count - 1)
     await advance(1)
     await until(() => h.frames(76).length === count, `heartbeat frame ${count}`)
-    await flush()
-  }
-  /**
-   * Moves the fake clock in 50 ms steps until the condition holds.
-   * @param {() => boolean} predicate The reached-stage condition.
-   * @param {string} what What is awaited, named by the failure.
-   * @returns {Promise<void>}
-   * @throws {Error} When the condition does not hold after ten steps.
-   */
-  const advanceUntil = async (predicate, what) => {
-    for (let step = 0; step < 10 && !predicate(); step++) {
-      await advance(50)
-      await flush()
-    }
-    if (!predicate()) throw new Error(`${what} did not happen`)
+    await heartbeatReady()
   }
   /**
    * Stops while node loops may sit in their 50 ms idle pacing, which a clean stop waits for: the
@@ -155,16 +169,25 @@ describe('share handlers on parallel leader nodes', () => {
   const gatedHandler = () => {
     const gates = { a: deferred(), b: Array.from({ length: 8 }, () => deferred()) }
     const started = { a: 0, b: 0 }
+    const completions = []
     const handler = async ({ partition, message }) => {
-      if (partition === 0) {
-        started.a++
-        await gates.a.promise
-      } else {
-        started.b++
-        await gates.b[Number(message.offset)].promise
+      const completed = deferred()
+      completions.push(completed.promise)
+      try {
+        if (partition === 0) {
+          started.a++
+          await gates.a.promise
+        } else {
+          started.b++
+          await gates.b[Number(message.offset)].promise
+        }
+      } finally {
+        completed.resolve()
       }
     }
-    return { gates, started, handler }
+    const held = { gates, started, handler }
+    holds.push({ release: () => releaseAll(held), completions })
+    return held
   }
   /**
    * @param {{gates: {a: object, b: object[]}}} held A `gatedHandler` result.
@@ -355,6 +378,7 @@ describe('share handlers on parallel leader nodes', () => {
   })
 
   test('cannot rearm a crashed old run when its held handler returns after the restart', async () => {
+    const supervision = jest.spyOn(ShareRunner.prototype, 'superviseCrash')
     const restartOnFailure = jest.fn(async () => true)
     await start({ nodes: 2, topics: TWO_NODES, share: { retry: { restartOnFailure } } })
     const openings = [0, 0]
@@ -368,12 +392,21 @@ describe('share handlers on parallel leader nodes', () => {
     })
     const crashing = h.hold({ api: 'ShareFetch', node: 1 })
     const gate = deferred()
-    holds.push({ release: () => gate.resolve() })
+    const completed = deferred()
+    const completions = []
+    holds.push({ release: () => gate.resolve(), completions })
     const handled = []
     await run({
       eachMessage: async ({ message }) => {
         handled.push(message.offset)
-        if (handled.length === 1) await gate.promise
+        if (handled.length === 1) {
+          completions.push(completed.promise)
+          try {
+            await gate.promise
+          } finally {
+            completed.resolve()
+          }
+        }
       },
     })
     await until(() => handled.length === 1, 'the held handler')
@@ -383,7 +416,13 @@ describe('share handlers on parallel leader nodes', () => {
     expect(h.seen.crashes[0]).toMatchObject({ restart: true, groupId: 'group' })
     expect(h.seen.crashes[0].error.code).toBe(2)
     expect(handled).toEqual(['0'])
-    await advanceUntil(() => h.seen.joins.length === 2 && handled.length === 2, 'the restarted run')
+    await until(
+      () => supervision.mock.contexts[0]?.restartOperation != null,
+      'the armed restart delay'
+    )
+    await advance(50)
+    await until(() => h.seen.joins.length === 2 && handled.length === 2, 'the restarted run')
+    await heartbeatReady()
     await flush()
     const before = {
       beats: h.frames(76).length,
@@ -405,7 +444,7 @@ describe('share handlers on parallel leader nodes', () => {
     const [first, second] = joins().map(({ fields }) => fields.memberId)
     expect(joins()).toHaveLength(2)
     expect(first).not.toBe(second)
-    await advanceUntil(() => h.frames(76).length > before.beats, 'a beat of the restarted run')
+    await beat(before.beats + 1)
     const later = h.frames(76).slice(before.beats)
     expect(
       later.every(({ fields }) => fields.memberId === second && fields.memberEpoch === 1)
