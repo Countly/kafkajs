@@ -134,11 +134,17 @@ describe('share-group fixtures', () => {
     test('does not resolve on a default equal to the wanted value, or on half the configs', async () => {
       const lock = { 'share.record.lock.duration.ms': '30000', 'share.session.timeout.ms': 6000 }
       const admin = fakeAdmin([
-        answer([entry('share.record.lock.duration.ms', '30000', DEFAULT_CONFIG)]),
+        answer([
+          entry('share.record.lock.duration.ms', '30000', DEFAULT_CONFIG),
+          entry('share.session.timeout.ms', '6000', GROUP_CONFIG),
+        ]),
         answer([
           entry('share.record.lock.duration.ms', '30000', GROUP_CONFIG),
           entry('share.session.timeout.ms', '6000', STATIC_BROKER_CONFIG),
         ]),
+        answer([entry('share.record.lock.duration.ms', '30000', GROUP_CONFIG)]),
+        answer([entry('share.session.timeout.ms', '6000', GROUP_CONFIG)]),
+        answer([entry('share.record.lock.duration.ms', '30000', GROUP_CONFIG)]),
         answer([
           entry('share.record.lock.duration.ms', '30000', GROUP_CONFIG),
           entry('share.session.timeout.ms', '6000', GROUP_CONFIG),
@@ -154,8 +160,14 @@ describe('share-group fixtures', () => {
       await jest.advanceTimersByTimeAsync(100)
       expect(admin.describeConfigs).toHaveBeenCalledTimes(2)
       expect(state.settled).toBe(false)
+      for (const read of [3, 4, 5]) {
+        await jest.advanceTimersByTimeAsync(100)
+        expect(admin.describeConfigs).toHaveBeenCalledTimes(read)
+        expect(state.settled).toBe(false)
+      }
       await jest.advanceTimersByTimeAsync(100)
 
+      expect(admin.describeConfigs).toHaveBeenCalledTimes(6)
       expect(state.settled).toBe(true)
       await expect(call).resolves.toBeUndefined()
     })

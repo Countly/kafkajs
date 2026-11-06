@@ -560,6 +560,7 @@ describe('E2E tooling', () => {
 
           await main([`--record=${file}`, `--record-features=${features()}`], io)
 
+          expect(io.readApiVersions).toHaveBeenCalledTimes(1)
           expect(JSON.parse(fs.readFileSync(file, 'utf8'))).toEqual({
             '4.1.2': allVersionsOf(answer.apiVersions),
           })
@@ -712,34 +713,32 @@ describe('E2E tooling', () => {
       const ranges = () => JSON.parse(fs.readFileSync(RANGES, 'utf8'))
       const SHARE_API_KEYS = [76, 77, 78, 79, 90, 91, 92]
 
-      /**
-       * The `share.version` the capture of each recorded broker line showed: the finalized level,
-       * 0 for a broker that supports the feature without finalizing it, no key for one that does not
-       * support it. Add an entry, from the capture itself, when a line is recorded.
-       * @type {Record<string, { 'share.version'?: number }>}
-       */
-      const captured = {
-        '4.0.2': {},
-        '4.1.2': { 'share.version': 0 },
-        '4.2.2': { 'share.version': 1 },
-        '4.3.1': { 'share.version': 1 },
-      }
+      const { readBrokerCapture } = require('../../../testHelpers/brokerCapture')
 
-      test.each([...new Set([...Object.keys(features()), ...Object.keys(captured)])])(
+      test.each(Object.entries(features()))(
         '%s records the share.version its capture showed',
-        (line) => {
-          if (!Object.hasOwn(features(), line)) {
-            throw new Error(
-              `${line} has a captured expectation but brokerFeatures.json no longer records it`
-            )
-          }
-          if (!Object.hasOwn(captured, line)) {
-            throw new Error(
-              `brokerFeatures.json records ${line}, which has no captured expectation: add its share.version to \`captured\` from that capture`
-            )
+        (line, entry) => {
+          expect(line).toMatch(/^\d+\.\d+\.\d+$/)
+          expect(entry).toEqual(expect.any(Object))
+          expect(Array.isArray(entry)).toBe(false)
+          expect(Object.keys(entry).filter((name) => name !== SHARE_VERSION)).toEqual([])
+          if (Object.hasOwn(entry, SHARE_VERSION)) {
+            expect(Number.isInteger(entry[SHARE_VERSION])).toBe(true)
+            expect(entry[SHARE_VERSION]).toBeGreaterThanOrEqual(0)
           }
 
-          expect(features()[line]).toEqual(captured[line])
+          const { features: evidence } = readBrokerCapture(line)
+          const expected = {}
+          for (const feature of evidence.finalizedFeatures) {
+            if (feature.name === SHARE_VERSION) expected[SHARE_VERSION] = feature.maxVersionLevel
+          }
+          if (
+            !Object.hasOwn(expected, SHARE_VERSION) &&
+            evidence.supportedFeatures.some((feature) => feature.name === SHARE_VERSION)
+          ) {
+            expected[SHARE_VERSION] = 0
+          }
+          expect(entry).toEqual(expected)
         }
       )
 
