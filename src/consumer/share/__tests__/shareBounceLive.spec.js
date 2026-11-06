@@ -367,6 +367,9 @@ class BounceEvidence {
     this.commands = []
     this.epochs = []
     this.brokers = new Set()
+    this.epochAuthorities = new Map()
+    this.epochSamples = new Map()
+    this.epochSignal = null
     this.cohorts = new Map()
     this.originalExchanges = new Map()
     this.restores = []
@@ -412,6 +415,11 @@ class BounceEvidence {
       if (!owns(loop)) return original.call(loop, exchange)
       this.brokers.add(loop.broker)
       const binding = exchange.binding
+      const authority = `${this.label(binding?.pool)}:${binding?.generation}`
+      if (this.epochAuthorities.get(loop.broker) !== authority) {
+        this.epochAuthorities.set(loop.broker, authority)
+        this.sampleEpoch(loop.broker)
+      }
       const fact = {
         id: this.label(exchange),
         prepared: this.owner.tap.stamp(),
@@ -489,6 +497,7 @@ class BounceEvidence {
       }
       this.cohorts.set(row, fact)
       this.acquisitions.push(fact)
+      this.sampleEpoch(loop.broker)
       return row
     })
     this.wrap(ShareRun.prototype, 'invoke', (run, original, args) => {
@@ -611,22 +620,58 @@ class BounceEvidence {
   }
 
   /**
+   * Starts independent source-node sampling, coalescing another observation after a pending sample.
+   * Acquisition observers request a fresh upper bound without delaying the original dispatch.
+   * @param {object} broker Original workload broker.
+   * @returns {void}
+   */
+  sampleEpoch(broker) {
+    const signal = this.epochSignal
+    if (!signal || signal.aborted || this.owner.driveFinished) return
+    const pending = this.epochSamples.get(broker)
+    if (pending) {
+      pending.again = true
+      return
+    }
+    if (!broker.connectionPool.isConnected()) return
+    const sample = { again: false }
+    this.epochSamples.set(broker, sample)
+    sample.task = (async () => {
+      do {
+        sample.again = false
+        await bounded(signal, Infinity, (scope) =>
+          broker.metadata([this.owner.topic], {
+            guard: () => (scope.aborted ? scope.reason : null),
+          })
+        ).catch((error) => {
+          if (signal.aborted) throw error
+        })
+      } while (
+        sample.again &&
+        !this.owner.driveFinished &&
+        !signal.aborted &&
+        broker.connectionPool.isConnected()
+      )
+    })().finally(() => this.epochSamples.delete(broker))
+    sample.task.catch(() => {})
+  }
+
+  /**
    * Samples the existing workload brokers' own metadata, without installing it in the client cache.
    * @param {AbortSignal} signal Existing drive scope.
    * @returns {Promise<void>} Once drive finishes; every sample stays within that scope.
    */
   async sampleEpochs(signal) {
-    while (!this.owner.driveFinished) {
-      for (const broker of [...this.brokers]) {
+    this.epochSignal = signal
+    try {
+      while (!this.owner.driveFinished) {
         signal.throwIfAborted()
-        if (!broker.connectionPool.isConnected()) continue
-        await bounded(signal, Infinity, () => broker.metadata([this.owner.topic])).catch(
-          (error) => {
-            if (signal.aborted) throw error
-          }
-        )
+        for (const broker of this.brokers) this.sampleEpoch(broker)
+        await delay(signal, 100)
       }
-      if (!this.owner.driveFinished) await delay(signal, 100)
+    } finally {
+      this.epochSignal = null
+      await Promise.all([...this.epochSamples.values()].map(({ task }) => task))
     }
   }
 
@@ -1135,6 +1180,8 @@ const freezeProblems = (entries, bounces, evidence) => {
  * Proves disjoint serving-epoch bounds using source-node local epoch observations and down barriers.
  * A source must itself be the observed leader: a remote cache, batch epoch or CurrentLeader default
  * supplies no bound. Same-node epochs never decrease; samples bracket the original wire intervals.
+ * A post-command request and a completed down action bracket the old leader's service before a
+ * different leader's later lower bound. Other late samples still need the original transition trace.
  * @param {object} old Previous handler acquisition.
  * @param {object} next New handler acquisition.
  * @param {object} bounce Designated outage.
@@ -1143,6 +1190,7 @@ const freezeProblems = (entries, bounces, evidence) => {
  * @returns {object|null} Source references and proven epoch bounds, or no proof.
  */
 const epochAdvance = (old, next, bounce, samples, exchanges) => {
+  if (!Number.isFinite(bounce.downAt) || bounce.downAt <= bounce.at) return null
   const ownSamples = (entry) =>
     samples.flatMap((sample) => {
       const topics = sample.response.topicMetadata.filter(
@@ -1218,7 +1266,11 @@ const epochAdvance = (old, next, bounce, samples, exchanges) => {
                 rows[0].currentLeader.leaderEpoch <= after.row.leaderEpoch
               )
             })
-      if (before.frame.responseAt < bounce.at || transition)
+      const downBarrier =
+        ['stop', 'kill'].includes(bounce.kind) &&
+        bounce.at < old.acquisition.source.frames[0].at &&
+        before.row.leader !== after.row.leader
+      if (before.frame.responseAt < bounce.at || transition || downBarrier)
         return {
           upper: before.row.leaderEpoch,
           lower: after.row.leaderEpoch,
@@ -1226,6 +1278,7 @@ const epochAdvance = (old, next, bounce, samples, exchanges) => {
           after: after.frame.id,
           bounce: bounce.index,
           transition: transition?.frames[0].id,
+          downBarrier: downBarrier ? bounce.downAt : undefined,
         }
     }
   return null
@@ -2906,7 +2959,14 @@ const captureFreezes = (fixture) => {
     }
     const pending = unresolvedAt(entries, evidence, event)
     evidence.commands.push(
-      immutable({ index: event.index, at: event.at, order: event.order, nodeId: event.nodeId })
+      immutable({
+        index: event.index,
+        at: event.at,
+        order: event.order,
+        nodeId: event.nodeId,
+        kind: event.kind,
+        service: event.service,
+      })
     )
     event.carried = immutable(carriedAt(bounces, event, pending))
     event.held = new Set(pending.map(({ identity }) => identity))
@@ -3440,6 +3500,82 @@ const budgetFixture = (count, perEpisode, unknown) => {
 describe('share bounce acquisition and settlement sensitivity', () => {
   const audit = ({ entries, bounces, corpus, evidence }) =>
     auditReplay(entries, bounces, new Set(corpus), evidence)
+
+  it('samples sibling brokers independently and follows an overlapping sample with a fresh one', async () => {
+    let complete
+    const first = {
+      connectionPool: { isConnected: () => true },
+      metadata: jest
+        .fn()
+        .mockImplementationOnce(() => new Promise((resolve) => (complete = resolve)))
+        .mockResolvedValue({}),
+    }
+    const next = {
+      connectionPool: { isConnected: () => true },
+      metadata: jest.fn().mockResolvedValue({}),
+    }
+    const evidence = new BounceEvidence({ topic: 'sampling-control' })
+    evidence.epochSignal = NEVER
+    try {
+      evidence.sampleEpoch(first)
+      evidence.sampleEpoch(next)
+      expect(first.metadata).toHaveBeenCalledTimes(1)
+      expect(next.metadata).toHaveBeenCalledTimes(1)
+      evidence.sampleEpoch(first)
+      expect(first.metadata).toHaveBeenCalledTimes(1)
+      const pending = evidence.epochSamples.get(first).task
+      complete({})
+      await pending
+      expect(first.metadata).toHaveBeenCalledTimes(2)
+    } finally {
+      evidence.owner.driveFinished = true
+      complete?.({})
+      await Promise.all([...evidence.epochSamples.values()].map(({ task }) => task))
+    }
+  })
+
+  /** @returns {object} Distinct acquisitions bracketed by source epochs and a completed kill. */
+  const downBarrierFixture = () => {
+    const fixture = replayFixture()
+    Object.assign(fixture.bounces[0], { at: 0.5, kind: 'kill', service: 'kafka1' })
+    captureFreezes(fixture)
+    return fixture
+  }
+
+  it('proves late equal-count replay across a completed down action using disjoint epoch bounds', () => {
+    const fixture = downBarrierFixture()
+    expect(fixture.bounces[0].held.size).toBe(0)
+    expect(audit(fixture).problems).toEqual([])
+    expect(audit(fixture).extras[0].epochWitness).toMatchObject({
+      upper: 1,
+      lower: 2,
+      before: 10,
+      after: 11,
+      downBarrier: 9,
+    })
+  })
+
+  it.each([
+    ['missing upper bound', (f) => f.evidence.epochs.shift()],
+    ['missing lower bound', (f) => f.evidence.epochs.pop()],
+    ['unobserved down action', (f) => delete f.bounces[0].downAt],
+    ['unobserved command kind', (f) => delete f.bounces[0].kind],
+    ['request before command start', (f) => (f.bounces[0].at = 1.5)],
+    ['upper bound overlaps old response', (f) => (f.evidence.epochs[0].frames[0].at = 1.5)],
+    ['lower bound overlaps new request', (f) => (f.evidence.epochs[1].frames[0].responseAt = 21)],
+  ])('cannot use a down barrier with %s', (_name, mutate) => {
+    const fixture = downBarrierFixture()
+    mutate(fixture)
+    expect(
+      epochAdvance(
+        fixture.old,
+        fixture.next,
+        fixture.bounces[0],
+        fixture.evidence.epochs,
+        fixture.evidence.exchanges
+      )
+    ).toBeNull()
+  })
 
   it('discards old-open and duplicate completions before creating another cohort', () => {
     const { ConsumerOperation } = require('../../groupProtocol/interface')
