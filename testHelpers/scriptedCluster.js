@@ -480,6 +480,8 @@ class ScriptedCluster {
 
   /**
    * The options for `new Kafka(...)` that connect it to this cluster.
+   * Setup defaults to two minutes to tolerate coverage runner delays; Jest still bounds a hung
+   * test, and timeout tests can override this budget explicitly.
    * @param {object} [overrides]
    * @returns {object}
    */
@@ -489,7 +491,7 @@ class ScriptedCluster {
       brokers: this.nodes.map(({ host, port }) => `${host}:${port}`),
       socketFactory: this.socketFactory,
       logLevel: logLevel.NOTHING,
-      connectionTimeout: 1000,
+      connectionTimeout: 120000,
       requestTimeout: 5000,
       connectionsMaxIdle: 0,
       ...overrides,

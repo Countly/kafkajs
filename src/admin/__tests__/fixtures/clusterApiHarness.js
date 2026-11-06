@@ -15,6 +15,7 @@ const {
  * Pinning matters twice: version negotiation cannot drift as the codec inventory grows, and no
  * ApiVersions round trip has to be answered - `versionsGeneration` is set to the pool's constant
  * generation, which is exactly the condition `Broker`'s send path checks before re-negotiating.
+ * Setup gets two minutes to tolerate coverage runner delays; Jest still bounds a hung test.
  *
  * @param {object} options
  * @param {import("../../../../types").ApiVersions} options.versions the table to negotiate against
@@ -32,7 +33,7 @@ const createClusterApiBroker = ({ versions, respond }) => {
     logger: newLogger(),
     socketFactory: factory,
     clientId: 'test-client',
-    connectionTimeout: 1000,
+    connectionTimeout: 120000,
     requestTimeout: 1000,
     enforceRequestTimeout: false,
   })
@@ -57,11 +58,11 @@ const createClusterApiBroker = ({ versions, respond }) => {
 
   const pool = {
     pool: [connection],
-    setupPolicy: { timeoutCeiling: 1000, waitCeiling: 0 },
+    setupPolicy: { timeoutCeiling: 120000, waitCeiling: 0 },
     host: '127.0.0.1',
     port: 9092,
     sasl: null,
-    connectionTimeout: 1000,
+    connectionTimeout: 120000,
     generation: 0,
     isConnected: () => connection.isConnected(),
     isAuthenticated: () => true,

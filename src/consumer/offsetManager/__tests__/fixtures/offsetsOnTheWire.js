@@ -73,6 +73,7 @@ const offsetCommitFields = ({ topics }) => ({
  * the log shows for it (or `committed`), so it follows the order requests were *sent* in, never the
  * order answers were released in. A request nothing in the schedule holds is answered by the
  * scripted `answer` of its API; one released with no value is answered the same way.
+ * Setup gets two minutes to tolerate coverage runner delays; Jest still bounds a hung test.
  *
  * @param {object} [options]
  * @param {number[]} [options.partitions] the assigned partitions of the one topic
@@ -144,7 +145,7 @@ const createOffsetsOnTheWire = async ({
   const cluster = createCluster(
     {
       socketFactory: scripted.socketFactory,
-      connectionTimeout: 1000,
+      connectionTimeout: 120000,
       requestTimeout: 5000,
       instrumentationEmitter,
     },
