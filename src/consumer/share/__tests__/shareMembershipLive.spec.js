@@ -14,6 +14,7 @@ const path = require('path')
 const crypto = require('crypto')
 const { spawn } = require('child_process')
 const { isDeepStrictEqual } = require('util')
+const { runInNewContext } = require('vm')
 const { Kafka, logLevel } = require('../../../../index')
 const { readLog, endOffsets } = require('../../../../testHelpers/rawLog')
 const {
@@ -494,11 +495,11 @@ const summarize = (snapshot) => ({
 
 /**
  * @param {Array<{topic: string, partitions: number[]}>} assignment
- * @returns {Array<{topic: string, partitions: number[]}>} the same assignment with sorted
- *   partitions and sorted topics, so two sources compare by value
+ * @returns {Array<{topic: string, partitions: number[]}>} Local arrays with sorted partitions
+ *   and topics, so IPC and in-process sources compare by value across realms.
  */
 const normalize = (assignment) =>
-  assignment
+  [...assignment]
     .map(({ topic, partitions }) => ({ topic, partitions: [...partitions].sort((a, b) => a - b) }))
     .sort((a, b) => a.topic.localeCompare(b.topic))
 
@@ -1408,7 +1409,10 @@ class MembershipCase {
                     ? member.of('group_join').at(-1)
                     : member.joins.at(-1),
                 event: member.assignments.at(-1),
-                publicAssignment: member.client?.assignment(),
+                publicAssignment:
+                  member instanceof ChildMember
+                    ? member.of('heartbeat').at(-1)?.assignment
+                    : member.client.assignment(),
                 heartbeat:
                   member instanceof ChildMember ? member.of('heartbeat').at(-1) : undefined,
               },
@@ -1836,6 +1840,19 @@ describe('membership assignment observation', () => {
   it('accepts an unchanged assignment whose last event precedes the admin epoch', () => {
     expect(assignmentAgrees(member(), event(), 'original-topic')).toBe(true)
     expect(assignmentAgrees(member(), { ...event(), memberEpoch: 5 }, 'original-topic')).toBe(true)
+  })
+
+  it('compares child IPC assignments by value across realms', () => {
+    const child = new ChildMember({ label: 'C' })
+    const message = runInNewContext('JSON.parse(input)', {
+      input: JSON.stringify({ ...event(), event: 'assignment' }),
+    })
+    child.receive(message)
+    const observed = child.assignments.at(-1)
+
+    expect(assignmentAgrees(member(), observed, 'original-topic')).toBe(true)
+    observed.assignment[0].partitions = [0]
+    expect(assignmentAgrees(member(), observed, 'original-topic')).toBe(false)
   })
 
   it.each([
