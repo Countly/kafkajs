@@ -25,6 +25,7 @@ const {
 } = require('testHelpers')
 const {
   assertShareCleanup,
+  captureShareCleanupBaseline,
   setShareGroupConfigs,
   shareRecordIdentity,
   shareTopicName,
@@ -1247,7 +1248,8 @@ class ShareBounceCase {
    * @throws {Error} when the cluster does not match the scenario or the member never joins
    */
   async setup(scope) {
-    this.beforeAdmin = await this.probe.snapshot()
+    this.beforeAdmin = await captureShareCleanupBaseline(this.probe, { signal: scope })
+    this.baseline = this.beforeAdmin
     this.assertOwnership()
     await bounded(scope, 30000, () => this.bouncer.assertAllUp())
     this.admin = this.client('admin').admin()
@@ -1273,9 +1275,6 @@ class ShareBounceCase {
     await bounded(scope, 20000, (inner) => this.readReadiness(inner))
     await bounded(scope, 15000, () =>
       setShareGroupConfigs(this.admin, this.group, this.groupConfig)
-    )
-    this.baseline = await bounded(scope, 60000, () =>
-      bounded(scope, 10000, () => this.probe.snapshot())
     )
     this.row('config-readback', { group: this.groupConfig, client: this.clientConfig })
     this.row('resource-baseline', { snapshot: this.baseline })
@@ -2115,21 +2114,13 @@ class ShareBounceCase {
   async cleanup(signal) {
     try {
       if (this.baseline) {
-        await pollUntil(
-          signal,
-          3000,
-          () =>
-            this.tap.socketCounts().created - this.tap.socketCounts().destroyed <=
-            this.baseline.sockets.open,
-          { delayMs: 50, label: 'The sockets closing' }
-        )
         this.after = await assertShareCleanup(
           this.admin,
           [this.group],
           [this.topic],
           this.baseline,
           this.probe,
-          { signal }
+          { signal, disconnectAdmin: true }
         )
       }
     } finally {

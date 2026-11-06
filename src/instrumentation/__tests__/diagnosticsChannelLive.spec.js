@@ -9,6 +9,7 @@ const { AlterConfigOpTypes, ConfigResourceTypes, ConfigSource } = require('../..
 const { wireVersionsOf } = require('testHelpers')
 const {
   assertShareCleanup,
+  captureShareCleanupBaseline,
   setShareGroupConfigs,
   shareRecordIdentity,
   shareTopicName,
@@ -572,7 +573,8 @@ class ShareDiagnosticsCase {
    */
   async setup(scope) {
     this.subscribeChannels()
-    this.beforeAdmin = await this.probe.snapshot()
+    this.beforeAdmin = await captureShareCleanupBaseline(this.probe, { signal: scope })
+    this.baseline = this.beforeAdmin
     this.admin = this.client('admin').admin()
     this.admin.on(this.admin.events.REQUEST, ({ payload }) => this.requests.push(payload))
     this.stack.add('prove cleanup and disconnect admin', (signal) => this.cleanup(signal))
@@ -606,9 +608,6 @@ class ShareDiagnosticsCase {
     )
     this.lock = resources[0].configEntries.find(({ configName }) => configName === LOCK_CONFIG)
     expect(this.lock?.configValue).toBe('30000')
-    this.baseline = await bounded(scope, 60000, () =>
-      bounded(scope, 10000, () => this.probe.snapshot())
-    )
     this.row('config-readback', { group: SHARE_GROUP_CONFIG, lock: this.lock.configValue })
     this.row('resource-baseline', { snapshot: this.baseline })
 
@@ -841,22 +840,13 @@ class ShareDiagnosticsCase {
     }
     try {
       if (this.baseline) {
-        await pollUntil(
-          signal,
-          3000,
-          () => {
-            const { created, destroyed } = this.ledger.counts()
-            return created - destroyed <= this.baseline.sockets.open
-          },
-          { delayMs: 50, label: 'The sockets closing' }
-        )
         this.after = await assertShareCleanup(
           this.admin,
           [this.group],
           [this.topic],
           this.baseline,
           this.probe,
-          { signal }
+          { signal, disconnectAdmin: true }
         )
       }
     } catch (error) {

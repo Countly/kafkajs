@@ -24,6 +24,7 @@ const {
 const {
   ShareHandlerLog,
   assertShareCleanup,
+  captureShareCleanupBaseline,
   setShareGroupConfigs,
   shareRecordIdentity,
   shareTopicName,
@@ -771,7 +772,8 @@ class ShareInteropCase {
    * @returns {Promise<void>}
    */
   async setup(scope) {
-    this.beforeAdmin = await this.probe.snapshot()
+    this.beforeAdmin = await captureShareCleanupBaseline(this.probe, { signal: scope })
+    this.baseline = this.beforeAdmin
     this.admin = this.client('admin').admin()
     this.admin.on(this.admin.events.REQUEST, ({ payload }) => this.requests.push(payload))
     this.stack.add('prove cleanup and disconnect admin', (signal) => this.cleanup(signal))
@@ -795,9 +797,6 @@ class ShareInteropCase {
     )
     this.topicId = metadata.topics.find(({ name }) => name === this.topic).topicId
     await bounded(scope, 15000, () => setShareGroupConfigs(this.admin, this.group, GROUP_CONFIG))
-    this.baseline = await bounded(scope, 60000, () =>
-      bounded(scope, 10000, () => this.probe.snapshot())
-    )
     this.row('config-readback', { group: GROUP_CONFIG, client: CLIENT_CONFIG })
     this.row('resource-baseline', { snapshot: this.baseline })
 
@@ -1440,21 +1439,13 @@ class ShareInteropCase {
   async cleanup(signal) {
     try {
       if (this.baseline) {
-        await pollUntil(
-          signal,
-          3000,
-          () =>
-            this.tap.socketCounts().created - this.tap.socketCounts().destroyed <=
-            this.baseline.sockets.open,
-          { delayMs: 50, label: 'The sockets closing' }
-        )
         this.after = await assertShareCleanup(
           this.admin,
           [this.group],
           [this.topic],
           this.baseline,
           this.probe,
-          { signal }
+          { signal, disconnectAdmin: true }
         )
       }
     } finally {
