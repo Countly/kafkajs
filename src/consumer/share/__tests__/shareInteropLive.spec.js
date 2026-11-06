@@ -1448,53 +1448,106 @@ class ShareInteropCase {
   }
 
   /**
+   * Deletes the topic and observes its absence on every advertised broker. A listing from one
+   * broker can precede deletion propagation to the broker used by the final absence proof.
    * @param {AbortSignal} signal the cleanup scope
    * @returns {Promise<void>}
    * @throws {Error} when the topic is still listed after deletion
    */
   async deleteTopic(signal) {
-    await bounded(signal, 10000, () =>
-      this.admin.deleteTopics({ topics: [this.topic], timeout: 8000 })
-    ).catch((error) => {
-      if (error.type !== 'UNKNOWN_TOPIC_OR_PARTITION') throw error
+    await bounded(signal, 10000, async (scope) => {
+      const { brokers } = await bounded(scope, Infinity, () => this.admin.describeCluster())
+      const pending = new Set(brokers.map(({ host, port }) => `${host}:${port}`))
+      if (pending.size === 0) throw new Error('No brokers available to prove topic deletion')
+      await bounded(scope, Infinity, () =>
+        this.admin.deleteTopics({ topics: [this.topic], timeout: 8000 })
+      ).catch((error) => {
+        if (error.type !== 'UNKNOWN_TOPIC_OR_PARTITION') throw error
+      })
+      await pollUntil(
+        scope,
+        Infinity,
+        async (poll) => {
+          const from = this.requests.length
+          const topics = await bounded(poll, Infinity, () => this.admin.listTopics())
+          const request = this.requests
+            .slice(from)
+            .filter(({ apiName }) => apiName === 'Metadata')
+            .pop()
+          if (!request) throw new Error('Missing topic listing request evidence')
+          const present = topics.includes(this.topic)
+          if (present) pending.add(request.broker)
+          else pending.delete(request.broker)
+          this.row('topic-deletion', {
+            topic: this.topic,
+            broker: request.broker,
+            present,
+            pending: [...pending],
+          })
+          return pending.size === 0
+        },
+        { label: 'The topic disappearing on every broker' }
+      )
     })
-    await pollUntil(
-      signal,
-      10000,
-      async () => !(await this.admin.listTopics()).includes(this.topic),
-      { label: 'The topic disappearing' }
-    )
   }
 
   /**
+   * Waits for all workload and verifier members to leave, then deletes the group and proves it
+   * absent. The Java child and JavaScript clients have already been closed by the cleanup stack.
    * @param {AbortSignal} signal the cleanup scope
    * @returns {Promise<void>}
    * @throws {Error} when the group is still listed after deletion
    */
   async deleteGroup(signal) {
-    await pollUntil(
-      signal,
-      10000,
-      async () => {
-        try {
-          await this.admin.deleteGroups([this.group])
-          return true
-        } catch (error) {
-          const code = error.groups?.[0]?.error?.code
-          if (code === 69) return true
-          if (code === 68) return false
-          throw error
-        }
-      },
-      { label: 'The group deletion' }
-    )
-    await pollUntil(
-      signal,
-      10000,
-      async () =>
-        !(await this.admin.listGroups()).groups.some(({ groupId }) => groupId === this.group),
-      { label: 'The group disappearing' }
-    )
+    await bounded(signal, 10000, async (scope) => {
+      await pollUntil(
+        scope,
+        Infinity,
+        async (poll) => {
+          const { groups } = await bounded(poll, Infinity, () =>
+            this.admin.describeShareGroups([this.group], { apiTimeout: 6000 })
+          )
+          const [group] = groups
+          if (groups.length !== 1 || group.groupId !== this.group) {
+            throw new Error('Missing owned share group description during cleanup')
+          }
+          this.row('cleanup-members', { group })
+          if (group.errorCode === 69) return true
+          if (group.errorCode !== 0) {
+            throw new Error(`Share group cleanup description failed: ${group.errorCode}`)
+          }
+          return group.state === 'Empty' && group.members.length === 0
+        },
+        { label: 'Every share member leaving' }
+      )
+      await pollUntil(
+        scope,
+        Infinity,
+        async (poll) => {
+          try {
+            await bounded(poll, Infinity, () => this.admin.deleteGroups([this.group]))
+            return true
+          } catch (error) {
+            const code = error.groups?.[0]?.errorCode
+            if (code === 69) return true
+            if (code === 68) return false
+            throw error
+          }
+        },
+        { label: 'The group deletion' }
+      )
+      await pollUntil(
+        scope,
+        Infinity,
+        async (poll) => {
+          const { groups } = await bounded(poll, Infinity, () => this.admin.listGroups())
+          const remaining = groups.filter(({ groupId }) => groupId === this.group)
+          this.row('group-deletion', { remaining })
+          return remaining.length === 0
+        },
+        { label: 'The group disappearing' }
+      )
+    })
   }
 
   /**
