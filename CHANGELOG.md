@@ -30,6 +30,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Document share-consumer boundaries and offset-reset recipes, including compact acknowledgement events and the share-span boundary.
 
 - Add deterministic share membership, session and acknowledgement fault matrices, with captured shutdown authority, exact record outcomes and resource cleanup checks.
+- Verify share delivery, acknowledgement types, locks, isolation, membership, recovery, shutdown and administration against live brokers.
 
 #### Fixes
 
