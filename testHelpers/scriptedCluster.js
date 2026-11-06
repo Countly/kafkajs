@@ -57,7 +57,7 @@ const DEFAULT = [...CLASSIC, ...PRODUCER]
  * TxnOffsetCommit at v11, v4 and v4 under transaction version 1, and at v12, v5 and v5 under 2,
  * which also sends no AddPartitionsToTxn and no AddOffsetsToTxn. The `share` profile advertises the
  * bootstrap pairs and the seven released share-group APIs at their one implemented version each;
- * only the runtime pairs (ShareGroupHeartbeat, ShareFetch, ShareAcknowledge) have wire files yet.
+ * every one of them has a wire file.
  * @type {Record<'default'|'sasl'|'consumer'|'tv1'|'tv2'|'offsets'|'transactions'|'storage'|'securityAdmin'|'clusterAdmin'|'share', Array<[string, number]>>}
  */
 const PROFILES = {

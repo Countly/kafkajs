@@ -1854,3 +1854,30 @@ new CompactAckError('bad', { reason: 'retry', topic: 'topic', partition: 0, rang
 new CompactAckError('bad', { reason: 'not-sent', topic: 'topic', partition: 0, ranges: [{ firstOffset: 1, lastOffset: '2' }] })
 // @ts-expect-error constructor never exposes a retry option
 new CompactAckError('bad', { reason: 'not-sent', topic: 'topic', partition: 0, ranges: [], retriable: true })
+
+import type { Admin as ShareAdmin, ShareGroupDescription, ShareGroupTopicOffsets, ShareGroupAlterOffsetsResult, ShareGroupDeleteOffsetsResult } from './index'
+
+/** Compiles the additive administration surface and exact public result domains. */
+async function shareAdminTypes(admin: ShareAdmin) {
+  const described: { groups: ShareGroupDescription[] } = await admin.describeShareGroups(['share'], { includeAuthorizedOperations: true, apiTimeout: 1000 })
+  const mask: number | null = described.groups[0].authorizedOperations
+  const listed: ShareGroupTopicOffsets[] = await admin.listShareGroupOffsets({ groupId: 'share' })
+  const lag: string | null = listed[0].partitions[0].lag
+  const changed: ShareGroupAlterOffsetsResult[] = await admin.alterShareGroupOffsets({ groupId: 'share', topics: [{ topic: 'alpha', partitions: [{ partition: 0, offset: '9007199254740993' }] }], apiTimeout: 1000 })
+  const deleted: ShareGroupDeleteOffsetsResult[] = await admin.deleteShareGroupOffsets({ groupId: 'share', topics: ['alpha'], apiTimeout: 1000 })
+  await admin.listShareGroupOffsets({ groupId: 'share', topics: [] })
+  await admin.listShareGroupOffsets({ groupId: 'share', topics: [{ topic: 'alpha', partitions: [0] }] })
+  // @ts-expect-error Offsets must remain exact decimal strings.
+  await admin.alterShareGroupOffsets({ groupId: 'share', topics: [{ topic: 'alpha', partitions: [{ partition: 0, offset: 9007199254740994 }] }] })
+  // @ts-expect-error Authorization is a raw signed mask, never an array.
+  const operations: string[] = described.groups[0].authorizedOperations
+  // @ts-expect-error Unknown lag is null rather than a number.
+  const numericLag: number = listed[0].partitions[0].lag
+  // @ts-expect-error Delete selects topic names, not partition objects.
+  await admin.deleteShareGroupOffsets({ groupId: 'share', topics: [{ topic: 'alpha' }] })
+  // @ts-expect-error Share deletion uses the existing generic method.
+  await admin.deleteShareGroups(['share'])
+  // @ts-expect-error Timeout keeps the existing integer number domain.
+  await admin.describeShareGroups(['share'], { apiTimeout: '1000' })
+  return { mask, lag, changed, deleted }
+}

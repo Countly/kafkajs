@@ -17,7 +17,7 @@ A pure-JavaScript [Apache Kafka](https://kafka.apache.org/) client for Node.js, 
 - PLAINTEXT, SSL and SASL_SSL connections
 - SASL PLAIN, SCRAM-SHA-256, SCRAM-SHA-512, OAUTHBEARER, AWS IAM and GSSAPI (optional `kerberos` peer)
 - OAuth bearer token helpers and recipes ([OAuth.md](docs/OAuth.md))
-- Admin client
+- Admin client, including describeShareGroups, listShareGroupOffsets, alterShareGroupOffsets and deleteShareGroupOffsets for Kafka 4.2+; share-group deletion uses deleteGroups
 
 ## Getting started
 

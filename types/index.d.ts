@@ -1169,6 +1169,27 @@ describeCluster(): Promise<{
   listGroups(options?: (ListGroupsOptions) & ApiTimeoutOption): Promise<{ groups: GroupOverview[] }>
   deleteGroups(groupIds: string[], options?: ApiTimeoutOption): Promise<DeleteGroupsResult[]>
 deleteGroups(groupIds: string[]): Promise<DeleteGroupsResult[]>
+  /**
+   * Describes share groups, one request per group coordinator, rows in the order of `groupIds`.
+   * A group's own failure is its `errorCode`/`errorMessage`, never a throw; an unsupported API
+   * rejects with `KafkaJSShareGroupsNotSupportedError`.
+   */
+  describeShareGroups(groupIds: string[], options?: ApiTimeoutOption & { includeAuthorizedOperations?: boolean }): Promise<{ groups: ShareGroupDescription[] }>
+  /** Without `topics`, every topic the group has offsets for. A group-level error throws; a partition's error is data. */
+  listShareGroupOffsets(options: {
+    groupId: string
+    topics?: Array<{ topic: string; partitions: number[] }>
+  } & ApiTimeoutOption): Promise<ShareGroupTopicOffsets[]>
+  /** Only for a group with no members. Offsets are exact decimal strings. A group-level error throws; a partition's error is data. */
+  alterShareGroupOffsets(options: {
+    groupId: string
+    topics: Array<{ topic: string; partitions: Array<{ partition: number; offset: string }> }>
+  } & ApiTimeoutOption): Promise<ShareGroupAlterOffsetsResult[]>
+  /** The group must not be subscribed to the topics. A group-level error throws; a topic's error is data. */
+  deleteShareGroupOffsets(options: {
+    groupId: string
+    topics: string[]
+  } & ApiTimeoutOption): Promise<ShareGroupDeleteOffsetsResult[]>
   /** Without `members`, removes every member `describeGroups` reports. */
   removeMembersFromConsumerGroup(options: ({
     groupId: string
@@ -1961,6 +1982,61 @@ export type DeleteGroupsResult = {
   error?: KafkaJSProtocolError
   /** The broker's message for the group: DeleteGroups v3 and later; `null` when it sent none. */
   errorMessage?: string | null
+}
+
+export type ShareGroupMemberDescription = {
+  memberId: string
+  rackId: string | null
+  memberEpoch: number
+  clientId: string
+  clientHost: string
+  subscribedTopics: string[]
+  assignment: Array<{ topic: string; topicId: string; partitions: number[] }>
+}
+
+export type ShareGroupDescription = {
+  groupId: string
+  /** The broker's state name, e.g. `'Stable'` or `'Empty'`; `''` when it names none. */
+  state: string
+  groupEpoch: number
+  assignmentEpoch: number
+  assignorName: string
+  members: ShareGroupMemberDescription[]
+  /** Group-level error for this id; `0` when the description succeeded. */
+  errorCode: number
+  errorMessage: string | null
+  /** The raw signed INT32 mask (unknown bits kept); `null` when not requested or the broker sent the absent sentinel. As `GroupDescription`. */
+  authorizedOperations: number | null
+}
+
+export type ShareGroupPartitionOffset = {
+  partition: number
+  /** The first offset the group has not finished with, as an exact decimal string. */
+  startOffset: string
+  leaderEpoch: number
+  /** An exact decimal string; `null` when the broker reports the lag as unknown (−1). */
+  lag: string | null
+  errorCode: number
+  error?: KafkaJSProtocolError
+}
+
+export type ShareGroupTopicOffsets = {
+  topic: string
+  topicId: string
+  partitions: ShareGroupPartitionOffset[]
+}
+
+export type ShareGroupAlterOffsetsResult = {
+  topic: string
+  topicId: string
+  partitions: Array<{ partition: number; errorCode: number; error?: KafkaJSProtocolError }>
+}
+
+export type ShareGroupDeleteOffsetsResult = {
+  topic: string
+  topicId: string
+  errorCode: number
+  error?: KafkaJSProtocolError
 }
 
 export type ConsumerEvents = {
