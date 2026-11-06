@@ -3042,7 +3042,10 @@ class SessionFaultCase extends DataFaultCase {
       this.realCluster.metadataCache,
       'update',
       (cache, [metadata, scope], next) => {
-        this.recreationMetadata = structuredClone(metadata)
+        // structuredClone would return outer-realm arrays under Jest and break strict equality.
+        this.recreationMetadata = {
+          topicMetadata: metadata.topicMetadata.map(({ topic, topicId }) => ({ topic, topicId })),
+        }
         this.metadataWasCurrent = scope.isCurrent()
         return next()
       }
