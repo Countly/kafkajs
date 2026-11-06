@@ -130,6 +130,12 @@ class ShareWireTap {
     this.allFrames = []
     this.context = new AsyncLocalStorage()
     this.socketEvents = []
+    this.order = 0
+  }
+
+  /** @returns {object} A case-monotonic timestamp and a total observation order. */
+  stamp() {
+    return { at: performance.now(), order: this.order++ }
   }
 
   /**
@@ -162,14 +168,17 @@ class ShareWireTap {
     this.sockets.push(entry)
     for (const event of ['end', 'close', 'error'])
       socket.on(event, (error) => {
-        const at = performance.now()
-        this.socketEvents.push({
+        const fact = {
+          id: this.socketEvents.length,
           socket: this.sockets.indexOf(entry),
           event,
-          at,
+          ...this.stamp(),
+          outstanding: [...entry.outstanding.values()].map(({ id }) => id),
           error: error instanceof Error ? describeError(error) : null,
-        })
-        for (const frame of entry.outstanding.values()) frame.lostAt ??= at
+        }
+        this.socketEvents.push(fact)
+        for (const frame of entry.outstanding.values()) frame.lostAt ??= fact.at
+        this.onInterruption?.('socket', fact)
       })
     const write = socket.write.bind(socket)
     socket.write = (data, ...rest) => {
@@ -186,7 +195,9 @@ class ShareWireTap {
         const request = entry.outstanding.get(bytes.readInt32BE(4))
         if (!request) return
         request.responseBytes = bytes.toString('base64')
-        request.responseAt = performance.now()
+        const stamp = this.stamp()
+        request.responseAt = stamp.at
+        request.responseOrder = stamp.order
         entry.outstanding.delete(request.correlationId)
       })
     })
@@ -210,7 +221,7 @@ class ShareWireTap {
       apiVersion,
       correlationId,
       clientId,
-      at: performance.now(),
+      ...this.stamp(),
       bytes: frame.toString('base64'),
     }
     if ([78, 79].includes(apiKey) && apiVersion === 2) {
@@ -353,12 +364,14 @@ class BounceEvidence {
     this.outcomesByCohort = new Map()
     this.exchangesByCohort = new Map()
     this.retirements = []
+    this.commands = []
     this.epochs = []
     this.brokers = new Set()
     this.cohorts = new Map()
     this.originalExchanges = new Map()
     this.restores = []
     this.handlers = new AsyncLocalStorage()
+    if (owner.tap) owner.tap.onInterruption = (kind, event) => this.interrupt(kind, event)
   }
 
   /** @param {*} value Original object or symbol. @returns {number|null} Stable local label. */
@@ -401,6 +414,7 @@ class BounceEvidence {
       const binding = exchange.binding
       const fact = {
         id: this.label(exchange),
+        prepared: this.owner.tap.stamp(),
         apiKey: exchange.apiKey,
         open: this.label(exchange.open),
         pool: this.label(binding?.pool),
@@ -438,9 +452,12 @@ class BounceEvidence {
     this.wrap(ShareFetchLoop.prototype, 'failExchange', (loop, original, [exchange, error]) => {
       const fact = this.originalExchanges.get(exchange)
       if (fact) {
-        fact.failedAt = performance.now()
+        const stamp = this.owner.tap.stamp()
+        fact.failedAt = stamp.at
+        fact.failedOrder = stamp.order
         fact.error = describeError(error)
         fact.cause = this.label(error)
+        this.interrupt('failure', fact)
       }
       return original.call(loop, exchange, error)
     })
@@ -449,6 +466,7 @@ class BounceEvidence {
       if (!owns(loop)) return row
       const [exchange, topicId, partition] = args
       const source = this.originalExchanges.get(exchange)
+      const adoption = this.owner.tap.stamp()
       const fact = {
         id: this.label(row),
         token: this.label(row.token),
@@ -461,7 +479,8 @@ class BounceEvidence {
         open: source?.open,
         pool: source?.pool,
         generation: source?.generation,
-        adoptedAt: performance.now(),
+        adoptedAt: adoption.at,
+        adoptedOrder: adoption.order,
         topError: source?.response?.errorCode,
         fetchError: partition.errorCode,
         acknowledgeError: partition.acknowledgeErrorCode,
@@ -484,7 +503,7 @@ class BounceEvidence {
           const outcome = {
             ...result,
             cohort: this.label(row),
-            at: performance.now(),
+            ...this.owner.tap.stamp(),
             typed:
               result.error instanceof KafkaJSShareAcknowledgementError &&
               result.error.topic === row.topic &&
@@ -501,16 +520,22 @@ class BounceEvidence {
     })
     for (const method of ['onSessionReset', 'retireKey']) {
       this.wrap(ShareFetchLoop.prototype, method, (loop, original, args) => {
-        if (owns(loop))
-          this.retirements.push({
-            at: performance.now(),
+        if (owns(loop)) {
+          const loss = {
+            id: this.retirements.length,
+            ...this.owner.tap.stamp(),
             nodeId: loop.broker.nodeId,
+            groupId: loop.groupId,
+            memberId: loop.memberId,
             open: this.label(method === 'onSessionReset' ? args[0] : loop.session.token),
             key: method === 'retireKey' ? args[0] : null,
             reason: args[1],
             cause: this.label(args[2]),
             error: describeError(args[2]),
-          })
+          }
+          this.retirements.push(loss)
+          this.interrupt('retirement', loss)
+        }
         return original.apply(loop, args)
       })
     }
@@ -534,11 +559,55 @@ class BounceEvidence {
     })
   }
 
+  /**
+   * Captures original pending work before socket, exchange or ledger loss processing continues.
+   * @param {string} kind Primitive observation type.
+   * @param {object} event Original observation, retained in its independent journal.
+   * @returns {void}
+   */
+  interrupt(kind, event) {
+    const { entries, snapshots } = this.owner
+    const cut = interruptionEvent(kind, event)
+    const bounce = snapshots.findLast(
+      (episode) => precedes(episode, cut) && cut.at <= (episode.restoredAt ?? Infinity)
+    )
+    if (!bounce) return
+    const history = unresolvedAt(entries, this, cut)
+    const scopes = new Map()
+    for (const scope of interruptedScopes(entries, this, kind, event)) {
+      if (scope.nodeId === bounce.nodeId) scopes.set(JSON.stringify(scope), scope)
+    }
+    for (const scope of scopes.values()) {
+      if (bounce.interruptions.some((prior) => samePartition(prior.scope, scope))) continue
+      const obligations = history.filter((entry) => sameAuthority(authority(entry), scope))
+      const carried = carriedAt(snapshots, bounce, history)
+      bounce.interruptions.push(
+        immutable({
+          ...cut,
+          kind,
+          event: event.id,
+          scope,
+          obligations: obligations.map((entry) =>
+            obligation(entry, snapshots, bounce.index, this, cut)
+          ),
+          carried,
+          lateEntries: obligations.filter((entry) => precedes(bounce, entry)).map(({ id }) => id),
+          history: history.map(({ id }) => id),
+        })
+      )
+      if (new Set(history.map(({ identity }) => identity)).size > MAX_HELD)
+        this.owner.captureProblems.push('Interruption unresolved history exceeds its allowance')
+      if (effectiveObligations(bounce).size > MAX_HELD)
+        this.owner.captureProblems.push('Combined interruption history exceeds its allowance')
+    }
+  }
+
   /** @returns {void} Restores originals after all workload and verifier calls have joined. */
   restore() {
     for (const restore of this.restores.splice(0).reverse()) restore()
     this.handlers.disable()
     this.owner.tap.context.disable()
+    delete this.owner.tap.onInterruption
   }
 
   /**
@@ -581,9 +650,12 @@ class BounceEvidence {
   acceptsFor(entry, outcome) {
     return (this.exchangesByCohort.get(entry.acquisition.id) ?? []).filter(
       (exchange) =>
+        precedes(entry, exchange.prepared ?? exchange.frames[0] ?? { at: -Infinity }) &&
         exchange.tickets.some(
           (ticket) =>
             ticket.cohort === entry.acquisition.id &&
+            ticket.ledger === entry.acquisition.ledger &&
+            ticket.ticket !== undefined &&
             !ticket.isRenewAck &&
             ticket.batches.some((batch) => accepts(batch, entry.offset))
         ) &&
@@ -594,13 +666,15 @@ class BounceEvidence {
 
   /**
    * @param {object} entry Handler start.
+   * @param {object} [cut] Only receipts observed before this cut may resolve uncertainty.
    * @returns {boolean} Whether an actual null-error Accept has matching original request/response.
    */
-  successful(entry) {
+  successful(entry, cut = { at: Infinity }) {
     const success = this.results(entry).some(
       (outcome) =>
         outcome.type === 'accept' &&
         outcome.error === null &&
+        precedes(outcome, cut) &&
         this.acceptsFor(entry, outcome).some((exchange) => {
           const response = exchange.response
           if (
@@ -685,6 +759,10 @@ const validAcquisition = (entry) => {
     frame.at <= frame.responseAt &&
     frame.responseAt <= a.adoptedAt &&
     a.adoptedAt <= entry.at &&
+    a.open === source.open &&
+    a.pool === source.pool &&
+    a.generation === source.generation &&
+    a.exchange === source.id &&
     a.topic === entry.topic &&
     a.topicId === entry.topicId &&
     a.partition === entry.partition &&
@@ -693,24 +771,365 @@ const validAcquisition = (entry) => {
   )
 }
 
+/** @param {object} value Evidence projection. @returns {object} A detached, immutable snapshot. */
+const immutable = (value) => {
+  const copy = JSON.parse(JSON.stringify(value))
+  const freeze = (item) => {
+    if (item && typeof item === 'object') {
+      Object.values(item).forEach(freeze)
+      Object.freeze(item)
+    }
+    return item
+  }
+  return freeze(copy)
+}
+
 /**
- * @param {object} entry Original handler acquisition.
- * @param {object} bounce Frozen episode.
- * @param {object[]} retirements Original open/partition authority losses.
- * @param {number|false} [after=false] Requires the new request to follow the authority loss.
- * @returns {boolean} Whether this bounce retired the original authority before reacquisition.
+ * @param {object} first Earlier observation.
+ * @param {object} second Later observation.
+ * @returns {boolean} Strict observed order; equal clocks without journal order prove nothing.
  */
-const faultRetired = (entry, bounce, retirements, after = false) =>
-  retirements.some(
-    (loss) =>
-      loss.nodeId === bounce.nodeId &&
-      loss.open === entry.acquisition.open &&
-      loss.at >= bounce.at &&
-      loss.at <= bounce.restoredAt + MEMBERSHIP_QUIET_MS &&
-      (!loss.key || loss.key === `${entry.topicId}:${entry.partition}`) &&
-      ['connection', 'leader-moved', 'session-lost'].includes(loss.reason) &&
-      (!after || loss.at < after)
+const precedes = (first, second) =>
+  first.at < second.at ||
+  (first.at === second.at &&
+    Number.isInteger(first.order) &&
+    Number.isInteger(second.order) &&
+    first.order < second.order)
+
+/** @param {object} entry Original handler. @returns {object} Its complete original authority. */
+const authority = (entry) => ({
+  groupId: entry.groupId,
+  memberId: entry.memberId,
+  nodeId: entry.acquisition?.source?.nodeId,
+  endpoint: entry.acquisition?.source?.endpoint,
+  socket: entry.acquisition?.source?.frames[0]?.socket,
+  pool: entry.acquisition?.pool,
+  generation: entry.acquisition?.generation,
+  open: entry.acquisition?.open,
+  topicId: entry.topicId,
+  partition: entry.partition,
+})
+
+/** @param {object} a Authority. @param {object} b Authority. @returns {boolean} Exact scope match. */
+const sameAuthority = (a, b) => JSON.stringify(a) === JSON.stringify(b)
+
+/** @param {object} a Authority. @param {object} b Authority. @returns {boolean} Same group partition. */
+const samePartition = (a, b) =>
+  a.groupId === b.groupId && a.topicId === b.topicId && a.partition === b.partition
+
+/**
+ * @param {string} kind Primitive observation type.
+ * @param {object} event Original event.
+ * @returns {object} The event's original clock and order.
+ */
+const interruptionEvent = (kind, event) =>
+  kind === 'failure'
+    ? { at: event.failedAt, order: event.failedOrder }
+    : { at: event.at, order: event.order }
+
+/**
+ * @param {string} kind Primitive observation type.
+ * @param {object} event Original event.
+ * @param {object} scope Original workload authority.
+ * @returns {boolean} Whether the event interrupts that authority, rather than a replacement.
+ */
+const interrupts = (kind, event, scope) => {
+  if (kind === 'socket') return event.socket === scope.socket
+  if (
+    event.nodeId !== scope.nodeId ||
+    event.groupId !== scope.groupId ||
+    event.memberId !== scope.memberId ||
+    event.open !== scope.open ||
+    event.cause === null ||
+    event.cause === undefined
   )
+    return false
+  if (kind === 'retirement')
+    return (
+      (!event.key || event.key === `${scope.topicId}:${scope.partition}`) &&
+      ['connection', 'leader-moved', 'session-lost'].includes(event.reason)
+    )
+  return (
+    kind === 'failure' &&
+    event.pool === scope.pool &&
+    event.generation === scope.generation &&
+    event.endpoint === scope.endpoint &&
+    (!event.frames.length || event.frames[0].socket === scope.socket) &&
+    ['KafkaJSConnectionError', 'KafkaJSConnectionClosedError', 'ShareSessionStaleError'].includes(
+      event.error?.name
+    )
+  )
+}
+
+/**
+ * Finds the original authority still live immediately before a primitive loss.
+ * @param {object[]} entries Original handler journal.
+ * @param {BounceEvidence} evidence Original acquisitions and retirements.
+ * @param {string} kind Primitive observation type.
+ * @param {object} event Original primitive event.
+ * @returns {object[]} Affected authorities, newest open first for each partition.
+ */
+const interruptedScopes = (entries, evidence, kind, event) => {
+  const cut = interruptionEvent(kind, event)
+  const originals = [
+    ...entries.filter((entry) => precedes(entry, cut)),
+    ...evidence.acquisitions
+      .filter((acquisition) =>
+        precedes({ at: acquisition.adoptedAt, order: acquisition.adoptedOrder }, cut)
+      )
+      .map((acquisition) => ({
+        groupId: acquisition.source.groupId,
+        memberId: acquisition.source.memberId,
+        topicId: acquisition.topicId,
+        partition: acquisition.partition,
+        acquisition,
+      })),
+  ]
+    .filter((entry) => entry.acquisition?.source?.frames[0])
+    .sort((a, b) => b.acquisition.adoptedAt - a.acquisition.adoptedAt)
+  const scopes = new Map()
+  for (const entry of originals) {
+    const scope = authority(entry)
+    if (
+      !interrupts(kind, event, scope) ||
+      evidence.retirements.some(
+        (loss) => interrupts('retirement', loss, scope) && precedes(loss, cut)
+      ) ||
+      evidence.owner.tap.socketEvents.some(
+        (loss) => loss.socket === scope.socket && precedes(loss, cut)
+      )
+    )
+      continue
+    scopes.set(JSON.stringify(scope), scope)
+  }
+  return [...scopes.values()]
+}
+
+/**
+ * @param {object[]} entries Complete original handler journal, including retired ledgers.
+ * @param {BounceEvidence} evidence Original receipts.
+ * @param {object} cut Observation boundary.
+ * @returns {object[]} All handler-started attempts still unresolved immediately before the cut.
+ */
+const unresolvedAt = (entries, evidence, cut) => {
+  const started = entries.filter((entry) => precedes(entry, cut))
+  const lastSuccess = new Map()
+  for (const entry of started)
+    if (entry.acquisition && evidence.successful(entry, cut)) lastSuccess.set(entry.identity, entry)
+  return started.filter((entry) => {
+    const success = lastSuccess.get(entry.identity)
+    return !success || precedes(success, entry)
+  })
+}
+
+/** @param {object} bounce Frozen episode. @returns {Map} Its combined identity and attempt projections. */
+const effectiveObligations = (bounce) => {
+  const identities = new Map()
+  const snapshots = bounce.interruptions?.length
+    ? bounce.interruptions
+    : [{ obligations: [], carried: bounce.carried ?? [] }]
+  for (const cut of snapshots)
+    for (const held of [...cut.obligations, ...cut.carried]) {
+      if (!identities.has(held.identity)) identities.set(held.identity, [])
+      if (!identities.get(held.identity).some(({ entry }) => entry === held.entry))
+        identities.get(held.identity).push(held)
+    }
+  return identities
+}
+
+/**
+ * @param {object} entry Actual original handler.
+ * @param {object[]} bounces Earlier freezes.
+ * @param {number} index Episode recording this observation.
+ * @param {BounceEvidence} evidence Original ticket journal.
+ * @param {object} cut Observation boundary.
+ * @returns {object} Original attempt and tickets, retaining the first interruption attribution.
+ */
+const obligation = (entry, bounces, index, evidence, cut) => ({
+  identity: entry.identity,
+  entry: entry.id,
+  cohort: entry.acquisition?.id,
+  ledger: entry.acquisition?.ledger,
+  acquisition: entry.acquisition?.exchange,
+  authority: authority(entry),
+  tickets: evidence.exchanges.flatMap((exchange) =>
+    precedes(exchange.prepared ?? exchange.frames[0] ?? { at: Infinity }, cut)
+      ? exchange.tickets.filter(({ cohort }) => cohort === entry.acquisition?.id)
+      : []
+  ),
+  originatingEpisode:
+    bounces.find(
+      (episode) =>
+        episode.index < index &&
+        [...effectiveObligations(episode).values()].flat().some((held) => held.entry === entry.id)
+    )?.index ?? index,
+})
+
+/**
+ * @param {object[]} bounces Original episodes.
+ * @param {object} bounce Current episode.
+ * @param {object[]} history Unresolved attempts at this cut.
+ * @returns {object[]} Earlier obligations still unresolved, with their original charge unchanged.
+ */
+const carriedAt = (bounces, bounce, history) => {
+  const ids = new Set(history.map(({ id }) => id))
+  const carried = new Map()
+  for (const prior of bounces.filter(({ index }) => index < bounce.index))
+    for (const held of [...effectiveObligations(prior).values()].flat())
+      if (ids.has(held.entry) && !carried.has(held.entry)) carried.set(held.entry, held)
+  return [...carried.values()]
+}
+
+/**
+ * @param {BounceEvidence} evidence Primitive journals.
+ * @returns {object[]} Every socket loss, original exchange failure and authority retirement.
+ */
+const interruptionJournal = (evidence) => [
+  ...(evidence.owner.tap?.socketEvents ?? []).map((event) => ({ kind: 'socket', event })),
+  ...evidence.exchanges
+    .filter((event) => event.failedAt !== undefined)
+    .map((event) => ({ kind: 'failure', event })),
+  ...evidence.retirements.map((event) => ({ kind: 'retirement', event })),
+]
+
+/**
+ * @param {object} entry Original handler.
+ * @param {object} bounce Designated episode.
+ * @param {BounceEvidence} evidence Primitive observations.
+ * @param {number} [after] New request write, if auditing replay.
+ * @returns {object|null} Original immutable interruption with the independently matched retirement.
+ */
+const matchingInterruption = (entry, bounce, evidence, after = Infinity) => {
+  const scope = authority(entry)
+  if (scope.nodeId !== bounce.nodeId || !effectiveObligations(bounce).has(entry.identity))
+    return null
+  for (const cut of bounce.interruptions ?? []) {
+    if (
+      !sameAuthority(cut.scope, scope) ||
+      !precedes(entry, cut) ||
+      cut.at >= after ||
+      !cut.obligations.some(
+        (held) => held.entry === entry.id && held.originatingEpisode === bounce.index
+      )
+    )
+      continue
+    const loss = evidence.retirements.find(
+      (event) =>
+        interrupts('retirement', event, scope) &&
+        !precedes(event, cut) &&
+        event.at <= bounce.restoredAt + MEMBERSHIP_QUIET_MS &&
+        event.at < after
+    )
+    if (loss) return { cut, loss }
+  }
+  return null
+}
+
+/**
+ * Recomputes both freezes from independent journals; final settlement cannot rewrite membership.
+ * @param {object[]} entries All original handlers.
+ * @param {object[]} bounces Archived command and interruption snapshots.
+ * @param {BounceEvidence} evidence Primitive observations and actual receipts.
+ * @returns {string[]} Snapshot disagreement and shared-budget failures.
+ */
+const freezeProblems = (entries, bounces, evidence) => {
+  const problems = []
+  const union = new Set()
+  const journal = interruptionJournal(evidence)
+  const ids = (rows) => rows.map(({ id, entry }) => entry ?? id).sort((a, b) => a - b)
+  for (const bounce of bounces) {
+    const command = evidence.commands.find(({ index }) => index === bounce.index)
+    if (
+      !command ||
+      command.at !== bounce.at ||
+      command.order !== bounce.order ||
+      command.nodeId !== bounce.nodeId ||
+      command.kind !== bounce.kind ||
+      command.service !== bounce.service
+    )
+      problems.push(`bounce ${bounce.index} command observation changed`)
+    const early = unresolvedAt(entries, evidence, bounce)
+    if (
+      JSON.stringify(
+        early.map((entry) => obligation(entry, bounces, bounce.index, evidence, bounce))
+      ) !== JSON.stringify(bounce.obligations) ||
+      JSON.stringify([...new Set(early.map(({ identity }) => identity))].sort()) !==
+        JSON.stringify([...bounce.held].sort()) ||
+      JSON.stringify(carriedAt(bounces, bounce, early)) !== JSON.stringify(bounce.carried)
+    )
+      problems.push(`bounce ${bounce.index} command snapshot disagrees with the journal`)
+    const partitions = []
+    for (const cut of bounce.interruptions ?? []) {
+      const primitive = journal.find(
+        ({ kind, event }) => kind === cut.kind && event.id === cut.event
+      )
+      const relevant = journal
+        .filter(
+          ({ kind, event }) =>
+            interrupts(kind, event, cut.scope) && precedes(bounce, interruptionEvent(kind, event))
+        )
+        .sort((a, b) => {
+          const x = interruptionEvent(a.kind, a.event)
+          const y = interruptionEvent(b.kind, b.event)
+          return x.at - y.at || x.order - y.order
+        })
+      const first = relevant[0]
+      const ambiguous = relevant.some(
+        (other) =>
+          other !== first &&
+          !precedes(
+            interruptionEvent(first.kind, first.event),
+            interruptionEvent(other.kind, other.event)
+          ) &&
+          !precedes(
+            interruptionEvent(other.kind, other.event),
+            interruptionEvent(first.kind, first.event)
+          )
+      )
+      if (
+        !primitive ||
+        first !== primitive ||
+        ambiguous ||
+        !sameAuthority(interruptionEvent(cut.kind, primitive.event), {
+          at: cut.at,
+          order: cut.order,
+        }) ||
+        cut.scope.nodeId !== bounce.nodeId ||
+        (primitive &&
+          !sameAuthority(
+            interruptedScopes(entries, evidence, cut.kind, primitive.event).find((scope) =>
+              samePartition(scope, cut.scope)
+            ),
+            cut.scope
+          )) ||
+        cut.at > bounce.restoredAt + MEMBERSHIP_QUIET_MS ||
+        partitions.some((scope) => samePartition(scope, cut.scope))
+      )
+        problems.push(`bounce ${bounce.index} lacks its first original interruption`)
+      partitions.push(cut.scope)
+      const history = unresolvedAt(entries, evidence, cut)
+      const scoped = history.filter((entry) => sameAuthority(authority(entry), cut.scope))
+      if (
+        JSON.stringify(ids(history)) !== JSON.stringify([...cut.history].sort((a, b) => a - b)) ||
+        JSON.stringify(
+          scoped.map((entry) => obligation(entry, bounces, bounce.index, evidence, cut))
+        ) !== JSON.stringify(cut.obligations) ||
+        JSON.stringify(carriedAt(bounces, bounce, history)) !== JSON.stringify(cut.carried) ||
+        JSON.stringify(scoped.filter((entry) => precedes(bounce, entry)).map(({ id }) => id)) !==
+          JSON.stringify(cut.lateEntries)
+      )
+        problems.push(`bounce ${bounce.index} interruption snapshot disagrees with the journal`)
+      if (new Set(history.map(({ identity }) => identity)).size > MAX_HELD)
+        problems.push(`bounce ${bounce.index} unresolved history exceeds its allowance`)
+    }
+    const effective = effectiveObligations(bounce)
+    for (const identity of effective.keys()) union.add(identity)
+    if (bounce.held.size > MAX_HELD || effective.size > MAX_HELD)
+      problems.push(`bounce ${bounce.index} combined freeze exceeds its allowance`)
+  }
+  if (union.size > MAX_REPLAY) problems.push('Combined interruption union exceeds its allowance')
+  return problems
+}
 
 /**
  * Proves disjoint serving-epoch bounds using source-node local epoch observations and down barriers.
@@ -720,9 +1139,10 @@ const faultRetired = (entry, bounce, retirements, after = false) =>
  * @param {object} next New handler acquisition.
  * @param {object} bounce Designated outage.
  * @param {object[]} samples Original Metadata responses and their wire frames.
+ * @param {object[]} exchanges Original exchanges, including leadership-error answers.
  * @returns {object|null} Source references and proven epoch bounds, or no proof.
  */
-const epochAdvance = (old, next, bounce, samples) => {
+const epochAdvance = (old, next, bounce, samples, exchanges) => {
   const ownSamples = (entry) =>
     samples.flatMap((sample) => {
       const topics = sample.response.topicMetadata.filter(
@@ -748,19 +1168,64 @@ const epochAdvance = (old, next, bounce, samples) => {
   for (const before of ownSamples(old))
     for (const after of ownSamples(next)) {
       if (
-        old.acquisition.source.frames[0].responseAt < before.frame.at &&
-        before.frame.responseAt < bounce.at &&
-        bounce.downAt < after.frame.at &&
-        after.frame.responseAt < next.acquisition.source.frames[0].at &&
-        before.row.leader === bounce.nodeId &&
-        after.row.leaderEpoch > before.row.leaderEpoch
+        old.acquisition.source.frames[0].responseAt >= before.frame.at ||
+        before.frame.responseAt >= bounce.downAt ||
+        bounce.downAt >= after.frame.at ||
+        after.frame.responseAt >= next.acquisition.source.frames[0].at ||
+        before.row.leader !== bounce.nodeId ||
+        after.row.leaderEpoch <= before.row.leaderEpoch
       )
+        continue
+      const transition =
+        before.frame.responseAt < bounce.at
+          ? null
+          : exchanges.find((exchange) => {
+              const frame = exchange.frames[0]
+              const topics =
+                exchange.response?.responses.filter(({ topicId }) => topicId === old.topicId) ?? []
+              const rows =
+                topics.length === 1
+                  ? topics[0].partitions.filter(
+                      ({ partitionIndex }) => partitionIndex === old.partition
+                    )
+                  : []
+              return (
+                exchange.frames.length === 1 &&
+                frame.apiKey === 78 &&
+                frame.apiVersion === 2 &&
+                frame.responseBytes &&
+                exchange.response?.errorCode === 0 &&
+                exchange.groupId === old.groupId &&
+                exchange.memberId === old.memberId &&
+                frame.request?.groupId === old.groupId &&
+                frame.request?.memberId === old.memberId &&
+                frame.at < frame.responseAt &&
+                exchange.nodeId === bounce.nodeId &&
+                exchange.open === old.acquisition.open &&
+                exchange.pool === old.acquisition.pool &&
+                exchange.generation === old.acquisition.generation &&
+                frame.socket === old.acquisition.source.frames[0].socket &&
+                frame.endpoint === old.acquisition.source.endpoint &&
+                before.frame.responseAt < frame.at &&
+                bounce.at < frame.at &&
+                frame.responseAt < bounce.downAt &&
+                frame.responseAt < after.frame.at &&
+                rows.length === 1 &&
+                [6, 74].includes(rows[0].errorCode) &&
+                rows[0].currentLeader?.leaderId === after.row.leader &&
+                Number.isInteger(rows[0].currentLeader?.leaderEpoch) &&
+                rows[0].currentLeader.leaderEpoch > before.row.leaderEpoch &&
+                rows[0].currentLeader.leaderEpoch <= after.row.leaderEpoch
+              )
+            })
+      if (before.frame.responseAt < bounce.at || transition)
         return {
           upper: before.row.leaderEpoch,
           lower: after.row.leaderEpoch,
           before: before.frame.id,
           after: after.frame.id,
           bounce: bounce.index,
+          transition: transition?.frames[0].id,
         }
     }
   return null
@@ -777,7 +1242,7 @@ const epochAdvance = (old, next, bounce, samples) => {
 const auditReplay = (entries, bounces, corpus, evidence) => {
   const previous = new Map()
   const dispatched = new Set()
-  const problems = []
+  const problems = freezeProblems(entries, bounces, evidence)
   const extras = []
   for (const entry of entries) {
     const old = previous.get(entry.identity)
@@ -794,17 +1259,15 @@ const auditReplay = (entries, bounces, corpus, evidence) => {
     if (dispatched.has(key)) problems.push(`${entry.identity} dispatched one acquisition twice`)
     dispatched.add(key)
     if (old) {
-      const bounce = bounces.find(
-        (episode) =>
-          episode.held.has(entry.identity) &&
-          episode.obligations.some((held) => held.entry === old.id) &&
-          faultRetired(old, episode, evidence.retirements, entry.acquisition?.source?.frames[0]?.at)
+      const bounce = bounces.find((episode) =>
+        matchingInterruption(old, episode, evidence, entry.acquisition?.source?.frames[0]?.at)
       )
       const witness =
         bounce &&
         validAcquisition(old) &&
         validAcquisition(entry) &&
-        epochAdvance(old, entry, bounce, evidence.epochs)
+        entry.deliveryCount === old.deliveryCount &&
+        epochAdvance(old, entry, bounce, evidence.epochs, evidence.exchanges)
       if (!bounce) problems.push(`${entry.identity} has no original fault obligation`)
       else if (
         entry.deliveryCount < old.deliveryCount ||
@@ -845,7 +1308,7 @@ const auditReplay = (entries, bounces, corpus, evidence) => {
  * @returns {object} Disjoint successful/candidate identity sets and missing identities.
  */
 const settlementCandidates = (entries, corpus, bounces, evidence) => {
-  const problems = []
+  const problems = freezeProblems(entries, bounces, evidence)
   const successful = new Set()
   const last = new Map()
   for (const entry of entries) {
@@ -855,9 +1318,10 @@ const settlementCandidates = (entries, corpus, bounces, evidence) => {
       evidence.results(entry).filter(({ type }) => type !== 'renew').length > 1
     )
       problems.push(`${entry.identity} has duplicate terminal outcomes for one acquisition`)
+  }
+  for (const entry of last.values())
     if (corpus.has(entry.identity) && validAcquisition(entry) && evidence.successful(entry))
       successful.add(entry.identity)
-  }
   const unknown = []
   const missing = []
   const unresolved = []
@@ -889,31 +1353,46 @@ const settlementCandidates = (entries, corpus, bounces, evidence) => {
             ].includes(exchange.error.name)
           )
             continue
-          const bounce = bounces.find(
-            (episode) =>
-              episode.held.has(identity) &&
-              episode.obligations.some((held) => held.entry === entry.id) &&
-              (episode.inFlight.some(({ id }) => id === frame.id) ||
-                (frame.at >= episode.at && frame.at <= episode.downAt)) &&
+          const bounce = bounces.find((episode) => {
+            const match = matchingInterruption(entry, episode, evidence)
+            if (!match) return false
+            const { cut, loss } = match
+            return (
+              precedes(entry, frame) &&
+              precedes(frame, cut) &&
+              precedes(cut, outcome) &&
+              frame.at <= exchange.failedAt &&
+              cut.at <= exchange.failedAt &&
+              exchange.failedAt <= outcome.at &&
               exchange.nodeId === episode.nodeId &&
-              frame.lostAt >= episode.at &&
-              frame.lostAt <= exchange.failedAt &&
-              evidence.retirements.some(
-                (loss) => loss.open === entry.acquisition.open && loss.cause === outcome.cause
-              ) &&
-              exchange.failedAt >= episode.at &&
-              exchange.failedAt <= episode.restoredAt + MEMBERSHIP_QUIET_MS &&
-              faultRetired(entry, episode, evidence.retirements)
-          )
-          if (bounce)
+              exchange.cause === loss.cause &&
+              (cut.kind !== 'failure' || cut.event === exchange.id) &&
+              (cut.kind !== 'socket' ||
+                (frame.lostAt === cut.at &&
+                  evidence.owner.tap.socketEvents.some(
+                    (event) => event.id === cut.event && event.outstanding.includes(frame.id)
+                  )))
+            )
+          })
+          if (bounce) {
+            const { kind, event, at, order, scope } = matchingInterruption(
+              entry,
+              bounce,
+              evidence
+            ).cut
             candidate = {
               identity,
               entry: entry.id,
               bounce: bounce.index,
               exchange: exchange.id,
+              interruption: { kind, event, at, order, scope },
+              cohort: entry.acquisition.id,
+              ledger: entry.acquisition.ledger,
+              request: frame.id,
               error: outcome.error,
               outcomeAt: outcome.at,
             }
+          }
         }
       }
     if (candidate) unknown.push(candidate)
@@ -926,6 +1405,18 @@ const settlementCandidates = (entries, corpus, bounces, evidence) => {
         frozenEpisodes: bounces
           .filter((episode) => episode.obligations.some((held) => held.entry === entry?.id))
           .map(({ index, nodeId, at, downAt }) => ({ index, nodeId, at, downAt })),
+        interruptionEpisodes: bounces.flatMap((episode) =>
+          (episode.interruptions ?? [])
+            .filter((cut) => cut.obligations.some((held) => held.entry === entry?.id))
+            .map(({ at, order, scope, kind, event }) => ({
+              bounce: episode.index,
+              at,
+              order,
+              scope,
+              kind,
+              event,
+            }))
+        ),
         outcomes: entry?.acquisition ? evidence.results(entry) : [],
         accepts: entry?.acquisition
           ? evidence.results(entry).flatMap((outcome) =>
@@ -944,7 +1435,7 @@ const settlementCandidates = (entries, corpus, bounces, evidence) => {
   const perBounce = bounces.map(
     ({ index }) => unknown.filter(({ bounce }) => bounce === index).length
   )
-  const heldUnion = new Set(bounces.flatMap(({ held }) => [...held]))
+  const heldUnion = new Set(bounces.flatMap((bounce) => [...effectiveObligations(bounce).keys()]))
   if (
     perBounce.some((count) => count > MAX_HELD) ||
     unknown.length > MAX_REPLAY ||
@@ -1464,7 +1955,7 @@ class ShareBounceCase {
                 BigInt(range.firstOffset) <= BigInt(message.offset) &&
                 BigInt(range.lastOffset) >= BigInt(message.offset)
             ),
-            at: performance.now(),
+            ...this.tap.stamp(),
           })
           this.openHandlers--
         },
@@ -1593,38 +2084,28 @@ class ShareBounceCase {
    */
   freeze(kind, service) {
     const corpus = new Set(this.expected)
-    const successful = new Set(
-      this.entries
-        .filter((entry) => this.evidence.successful(entry))
-        .map(({ identity }) => identity)
-    )
-    const unresolved = this.entries.filter(({ identity }) => !successful.has(identity))
+    const cut = this.tap.stamp()
+    const unresolved = unresolvedAt(this.entries, this.evidence, cut)
     const held = new Set(unresolved.map(({ identity }) => identity))
-    const obligations = unresolved.map((entry) =>
-      Object.freeze({
-        identity: entry.identity,
-        entry: entry.id,
-        cohort: entry.acquisition?.id,
-        nodeId: entry.acquisition?.source?.nodeId,
-        tickets: this.evidence.exchanges.flatMap(({ tickets }) =>
-          tickets.filter(({ cohort }) => cohort === entry.acquisition?.id)
-        ),
-        originatingEpisode:
-          this.snapshots.find(({ held: prior }) => prior.has(entry.identity))?.index ??
-          this.snapshots.length,
-      })
+    const index = this.snapshots.length
+    this.evidence.commands.push(
+      immutable({ index, kind, service, nodeId: NODES[service].nodeId, ...cut })
     )
     this.snapshots.push({
-      index: this.snapshots.length,
+      index,
       service,
       nodeId: NODES[service].nodeId,
       kind,
-      at: performance.now(),
+      ...cut,
       held,
-      obligations: Object.freeze(obligations),
+      obligations: immutable(
+        unresolved.map((entry) => obligation(entry, this.snapshots, index, this.evidence, cut))
+      ),
       handlerEntries: this.entries.length,
       confirmedOffsets: this.confirmed.size,
-      inFlight: this.tap.inFlight().map((frame) => ({ ...frame })),
+      inFlight: immutable(this.tap.inFlight().map((frame) => ({ ...frame }))),
+      interruptions: [],
+      carried: immutable(carriedAt(this.snapshots, { index }, unresolved)),
     })
     if (held.size > MAX_HELD)
       throw new Error(`Frozen unresolved history has ${held.size} identities`)
@@ -2011,6 +2492,35 @@ class ShareBounceCase {
   }
 
   /**
+   * Observes verifier activity through a separate wrapper around the frozen public consumer.
+   * @param {object} consumer Original consumer, whose properties are never replaced.
+   * @returns {object} Forwarding interface with tracked, call-through disposal.
+   */
+  trackVerifier(consumer) {
+    const removers = ['GROUP_JOIN', 'ASSIGNMENT_CHANGED', 'REQUEST'].map((name) =>
+      consumer.on(consumer.events[name], ({ payload }) => {
+        const at = performance.now()
+        this.quiet.events.push({ name, at, payload })
+        if (
+          !this.quiet.activeAt &&
+          name === 'REQUEST' &&
+          payload.apiName === 'ShareFetch' &&
+          consumer.assignment().some(({ partitions }) => partitions.length)
+        )
+          this.quiet.activeAt = at
+      })
+    )
+    return {
+      ...consumer,
+      disconnect: (...args) => {
+        this.quiet.endedAt = performance.now()
+        this.quiet.assignment = consumer.assignment()
+        return consumer.disconnect(...args).finally(() => removers.forEach((remove) => remove()))
+      },
+    }
+  }
+
+  /**
    * Closes the workload, actively verifies the same group, then rechecks terminality and ends.
    * @param {AbortSignal} scope Case scope.
    * @returns {Promise<void>} Only after unknown candidates pass every independent proof.
@@ -2018,31 +2528,8 @@ class ShareBounceCase {
   async finish(scope) {
     await bounded(scope, 10000, () => this.consumer.disconnect({ timeout: 5000 }))
     this.quiet = { events: [], delivered: [], startedAt: performance.now() }
-    const kafka = this.client('verifier')
-    const create = kafka.shareConsumer.bind(kafka)
-    kafka.shareConsumer = (config) => {
-      const consumer = create(config)
-      const removers = ['GROUP_JOIN', 'ASSIGNMENT_CHANGED', 'REQUEST'].map((name) =>
-        consumer.on(consumer.events[name], ({ payload }) => {
-          const at = performance.now()
-          this.quiet.events.push({ name, at, payload })
-          if (
-            !this.quiet.activeAt &&
-            name === 'REQUEST' &&
-            payload.apiName === 'ShareFetch' &&
-            consumer.assignment().some(({ partitions }) => partitions.length)
-          )
-            this.quiet.activeAt = at
-        })
-      )
-      const disconnect = consumer.disconnect.bind(consumer)
-      consumer.disconnect = (...args) => {
-        this.quiet.endedAt = performance.now()
-        this.quiet.assignment = consumer.assignment()
-        return disconnect(...args).finally(() => removers.forEach((remove) => remove()))
-      }
-      return consumer
-    }
+    const client = this.client('verifier')
+    const kafka = { shareConsumer: (config) => this.trackVerifier(client.shareConsumer(config)) }
     this.verifier = await assertQuietTerminalGroup({
       kafka,
       admin: this.admin,
@@ -2103,13 +2590,21 @@ class ShareBounceCase {
       })),
       outcomes: this.evidence.outcomes,
       retirements: this.evidence.retirements,
+      commands: this.evidence.commands,
       epochSources: this.evidence.epochs.map(({ frames, ...source }) => ({
         ...source,
         frames: frames.map(({ id }) => id),
       })),
       socketEvents: this.tap.socketEvents,
+      provisionalUnknownCandidates: this.settlement?.unknown ?? [],
+      terminalUnknown: this.terminalVerified ? (this.settlement?.unknown ?? []) : [],
       wire: this.tap.allFrames.filter(({ apiKey }) => [3, 76, 78, 79].includes(apiKey)),
       frozen: this.snapshots.map(({ held, ...rest }) => ({ ...rest, held: [...held] })),
+      effective: this.snapshots.map((bounce) => ({
+        index: bounce.index,
+        identities: [...effectiveObligations(bounce).keys()],
+        obligations: [...effectiveObligations(bounce).values()].flat(),
+      })),
       deliveryLimits: this.deliveryLimits,
       position: this.beforeTerminal,
       verifier: this.verifier,
@@ -2382,6 +2877,114 @@ describe('share bounce wire tap', () => {
 })
 
 /**
+ * Drives the same live capture from independently scripted primitive journals.
+ * Call before the sensitivity mutation; final predicates never reconstruct missing snapshots.
+ * @param {object} fixture Scripted handlers, receipts, command boundaries and primitive losses.
+ * @returns {void}
+ */
+const captureFreezes = (fixture) => {
+  const { evidence, entries, bounces } = fixture
+  evidence.owner.entries = entries
+  evidence.owner.snapshots = bounces
+  evidence.commands = []
+  for (const bounce of bounces) {
+    bounce.interruptions = []
+    bounce.carried = []
+  }
+  const journal = [
+    ...interruptionJournal(evidence),
+    ...bounces.map((event) => ({ kind: 'command', event })),
+  ].sort((a, b) => {
+    const first = interruptionEvent(a.kind, a.event)
+    const second = interruptionEvent(b.kind, b.event)
+    return first.at - second.at || first.order - second.order
+  })
+  for (const { kind, event } of journal) {
+    if (kind !== 'command') {
+      evidence.interrupt(kind, event)
+      continue
+    }
+    const pending = unresolvedAt(entries, evidence, event)
+    evidence.commands.push(
+      immutable({ index: event.index, at: event.at, order: event.order, nodeId: event.nodeId })
+    )
+    event.carried = immutable(carriedAt(bounces, event, pending))
+    event.held = new Set(pending.map(({ identity }) => identity))
+    event.obligations = immutable(
+      pending.map((entry) => obligation(entry, bounces, event.index, evidence, event))
+    )
+  }
+}
+
+/**
+ * Adds an original correlated successful Accept, independently of any frozen membership.
+ * @param {BounceEvidence} evidence Original request and receipt journals.
+ * @param {object} entry Handler receiving the receipt.
+ * @param {number} at Complete write time.
+ * @returns {void}
+ */
+const successfulAcceptFixture = (evidence, entry, at) => {
+  const batch = { firstOffset: entry.offset, lastOffset: entry.offset, acknowledgeTypes: [1] }
+  const source = entry.acquisition.source
+  const exchange = {
+    id: 10000000 + entry.id,
+    apiKey: 79,
+    open: entry.acquisition.open,
+    pool: entry.acquisition.pool,
+    generation: entry.acquisition.generation,
+    frames: [
+      {
+        id: 10000000 + entry.id,
+        apiKey: 79,
+        apiVersion: 2,
+        at,
+        responseAt: at + 1,
+        socket: source.frames[0].socket,
+        endpoint: source.endpoint,
+        responseBytes: 'original-success',
+        request: {
+          groupId: entry.groupId,
+          memberId: entry.memberId,
+          topics: [
+            {
+              topicId: entry.topicId,
+              partitions: [{ partitionIndex: entry.partition, acknowledgementBatches: [batch] }],
+            },
+          ],
+        },
+      },
+    ],
+    response: {
+      errorCode: 0,
+      responses: [
+        { topicId: entry.topicId, partitions: [{ partitionIndex: entry.partition, errorCode: 0 }] },
+      ],
+    },
+    tickets: [
+      {
+        cohort: entry.acquisition.id,
+        ledger: entry.acquisition.ledger,
+        ticket: 10000000 + entry.id,
+        isRenewAck: false,
+        batches: [batch],
+      },
+    ],
+  }
+  const outcome = {
+    cohort: entry.acquisition.id,
+    type: 'accept',
+    firstOffset: entry.offset,
+    lastOffset: entry.offset,
+    error: null,
+    at: at + 1,
+  }
+  evidence.exchanges.push(exchange)
+  evidence.exchangesByCohort.set(entry.acquisition.id, [exchange])
+  evidence.outcomes.push(outcome)
+  evidence.outcomesByCohort.set(entry.acquisition.id, [outcome])
+}
+
+/**
  * Supplies independent primitive wire, authority and epoch observations for oracle sensitivity.
  * @param {{count?:number, sameLeader?:boolean, offset?:string}} [options] Count and leader identity of the replay.
  * @returns {object} Two acquisitions, one frozen episode and their original evidence streams.
@@ -2446,6 +3049,7 @@ const replayFixture = ({ count = 1, sameLeader = false, offset = '0' } = {}) => 
       token: id,
       ledger: id,
       responseIdentity: id,
+      exchange: source.id,
       source,
       open: id,
       pool: id,
@@ -2484,9 +3088,19 @@ const replayFixture = ({ count = 1, sameLeader = false, offset = '0' } = {}) => 
   }
   const old = makeEntry(0, 1, 1, 1)
   const next = makeEntry(1, sameLeader ? 1 : 2, 20, count)
-  const evidence = new BounceEvidence({})
+  const evidence = new BounceEvidence({ tap: { socketEvents: [] }, captureProblems: [] })
   evidence.exchanges.push(old.acquisition.source, next.acquisition.source)
-  evidence.retirements.push({ at: 8, nodeId: 1, open: 0, reason: 'connection', cause: 99 })
+  evidence.acquisitions.push(old.acquisition, next.acquisition)
+  evidence.retirements.push({
+    id: 0,
+    at: 8,
+    nodeId: 1,
+    groupId,
+    memberId,
+    open: 0,
+    reason: 'connection',
+    cause: 99,
+  })
   const epoch = (id, nodeId, leaderEpoch, at) => ({
     nodeId,
     pool: id === 10 ? old.acquisition.pool : next.acquisition.pool,
@@ -2527,7 +3141,7 @@ const replayFixture = ({ count = 1, sameLeader = false, offset = '0' } = {}) => 
     obligations: [{ identity: old.identity, entry: old.id }],
     inFlight: [],
   }
-  return {
+  const fixture = {
     old,
     next,
     entries: [old, next],
@@ -2536,17 +3150,26 @@ const replayFixture = ({ count = 1, sameLeader = false, offset = '0' } = {}) => 
     corpus: [old.identity],
     target: { groupId, topic, partitions: [{ partition: 0, floor: '0', end: '1' }] },
   }
+  captureFreezes(fixture)
+  return fixture
 }
 
 /**
  * Scripts one real ledger outcome for a written or unwritten terminal decision.
  * @param {object} fixture Independent replay fixture.
- * @param {{written?:boolean, applied?:boolean, type?:string, reason?:string}} [options] Fault script.
+ * @param {{written?:boolean, applied?:boolean, type?:string, reason?:string, writtenAt?:number, lostAt?:number}} [options] Fault script.
  * @returns {object} Complete independent terminal observations, with the actual outcome journal.
  */
 const lostAcceptFixture = (
   fixture,
-  { written = true, applied = true, type = 'accept', reason = 'session-lost' } = {}
+  {
+    written = true,
+    applied = true,
+    type = 'accept',
+    reason = 'session-lost',
+    writtenAt = 6,
+    lostAt = 8,
+  } = {}
 ) => {
   const { ShareAckLedger } = require('../shareAckLedger')
   const { ShareRecordWalk } = require('../shareRecordWalk')
@@ -2574,17 +3197,16 @@ const lostAcceptFixture = (
   cause.name = 'KafkaJSConnectionClosedError'
   const results = ledger.invalidate(reason, null, cause)
   expect(ledger.invalidate(reason, null, cause)).toEqual([])
-  fixture.evidence.outcomes.push(
-    ...results.map((outcome) => ({
-      ...outcome,
-      cohort: 0,
-      at: 8,
-      typed: outcome.error instanceof KafkaJSShareAcknowledgementError,
-      cause: 99,
-      error: describeError(outcome.error),
-    }))
-  )
-  fixture.evidence.outcomesByCohort.set(0, [...fixture.evidence.outcomes])
+  const outcomes = results.map((outcome) => ({
+    ...outcome,
+    cohort: entry.acquisition.id,
+    at: lostAt + 0.3,
+    typed: outcome.error instanceof KafkaJSShareAcknowledgementError,
+    cause: 99 + entry.id,
+    error: describeError(outcome.error),
+  }))
+  fixture.evidence.outcomes.push(...outcomes)
+  fixture.evidence.outcomesByCohort.set(entry.acquisition.id, outcomes)
   const request = {
     ...entry.acquisition.source.frames[0].request,
     topics: [
@@ -2604,43 +3226,59 @@ const lostAcceptFixture = (
     isRenewAck: ticket.isRenewAck,
   }
   const exchange = {
-    id: 100,
+    id: 100 + entry.id,
+    prepared: { at: (entry.at + writtenAt) / 2 },
     apiKey: 79,
-    nodeId: 1,
-    open: 0,
-    pool: 0,
-    generation: 0,
+    nodeId: entry.acquisition.source.nodeId,
+    groupId: entry.groupId,
+    memberId: entry.memberId,
+    endpoint: entry.acquisition.source.endpoint,
+    open: entry.acquisition.open,
+    pool: entry.acquisition.pool,
+    generation: entry.acquisition.generation,
     model: [],
     frames: written
       ? [
           {
-            id: 100,
+            id: 100 + entry.id,
             apiKey: 79,
             apiVersion: 2,
             request,
-            at: 6,
-            lostAt: 8,
+            at: writtenAt,
+            lostAt,
             socket: entry.acquisition.source.frames[0].socket,
             endpoint: entry.acquisition.source.endpoint,
           },
         ]
       : [],
-    failedAt: 8,
-    cause: 99,
+    failedAt: lostAt + 0.1,
+    cause: 99 + entry.id,
     error: describeError(cause),
     tickets: [
       {
-        cohort: 0,
-        ticket: 100,
-        ledger: 0,
+        cohort: entry.acquisition.id,
+        ticket: 100 + entry.id,
+        ledger: entry.acquisition.ledger,
         batches: ticket.acknowledgementBatches,
         isRenewAck: ticket.isRenewAck,
       },
     ],
   }
   fixture.evidence.exchanges.push(exchange)
-  fixture.evidence.exchangesByCohort.set(0, [exchange])
-  fixture.bounces[0].inFlight = exchange.frames.map((frame) => ({ ...frame }))
+  fixture.evidence.exchangesByCohort.set(entry.acquisition.id, [exchange])
+  fixture.evidence.owner.tap.socketEvents.push({
+    id: fixture.evidence.owner.tap.socketEvents.length,
+    socket: entry.acquisition.source.frames[0].socket,
+    at: lostAt,
+    event: 'end',
+    outstanding: exchange.frames.map(({ id }) => id),
+  })
+  const retirement = fixture.evidence.retirements.find(
+    ({ open }) => open === entry.acquisition.open
+  )
+  retirement.at = lostAt + 0.2
+  retirement.cause = 99 + entry.id
+  captureFreezes(fixture)
   const listing = [
     {
       topic: entry.topic,
@@ -2688,7 +3326,12 @@ const lostAcceptFixture = (
  * @returns {object} Combined evidence without deriving expected multiplicities from dispatches.
  */
 const budgetFixture = (count, perEpisode, unknown) => {
-  const combined = { entries: [], corpus: [], bounces: [], evidence: new BounceEvidence({}) }
+  const combined = {
+    entries: [],
+    corpus: [],
+    bounces: [],
+    evidence: new BounceEvidence({ tap: { socketEvents: [] }, captureProblems: [] }),
+  }
   for (let index = 0; index < count; index++) {
     const f = replayFixture({ count: 2, offset: String(index) })
     const proof = unknown ? lostAcceptFixture(f) : null
@@ -2700,6 +3343,12 @@ const budgetFixture = (count, perEpisode, unknown) => {
       entry.at += shift
       entry.acquisition.id = entry.id
       entry.acquisition.responseIdentity += 1000 * index
+      entry.acquisition.exchange += 1000 * index
+      entry.acquisition.token += 2 * index
+      entry.acquisition.ledger += 2 * index
+      entry.acquisition.open += 2 * episode
+      entry.acquisition.pool += 2 * episode
+      entry.acquisition.generation += 2 * episode
       entry.acquisition.adoptedAt += shift
       entry.acquisition.acquiredRecords[0].firstOffset = String(index)
       entry.acquisition.acquiredRecords[0].lastOffset = String(index)
@@ -2713,12 +3362,18 @@ const budgetFixture = (count, perEpisode, unknown) => {
     }
     for (const exchange of f.evidence.exchanges) {
       exchange.id += 1000 * index
+      exchange.open += 2 * episode
+      exchange.pool += 2 * episode
+      exchange.generation += 2 * episode
       if (exchange.failedAt !== undefined) exchange.failedAt += shift
+      if (exchange.prepared) exchange.prepared.at += shift
       for (const ticket of exchange.tickets) {
         ticket.cohort += 2 * index
+        ticket.ledger += 2 * index
       }
       for (const frame of exchange.frames) {
         frame.id += 1000 * index
+        frame.socket += 2 * episode
         frame.at += shift
         if (frame.responseAt !== undefined) frame.responseAt += shift
         if (frame.lostAt !== undefined) frame.lostAt += shift
@@ -2738,7 +3393,20 @@ const budgetFixture = (count, perEpisode, unknown) => {
     frozen.held = new Set([f.old.identity])
     frozen.obligations = [{ entry: f.old.id, identity: f.old.identity }]
     if (unknown) frozen.inFlight = f.evidence.exchanges.at(-1).frames.map((frame) => ({ ...frame }))
-    for (const retirement of f.evidence.retirements) retirement.at += shift
+    for (const retirement of f.evidence.retirements) {
+      retirement.id = index
+      retirement.order = index
+      retirement.open += 2 * episode
+      retirement.at += shift
+    }
+    for (const event of f.evidence.owner.tap.socketEvents) {
+      event.id = index
+      event.order = index
+      event.socket += 2 * episode
+      event.at += shift
+      event.outstanding = event.outstanding.map((id) => id + 1000 * index)
+      combined.evidence.owner.tap.socketEvents.push(event)
+    }
     if (!combined.bounces[episode])
       combined.bounces[episode] = { ...frozen, held: new Set(), obligations: [], inFlight: [] }
     const episodeProof = combined.bounces[episode]
@@ -2748,6 +3416,7 @@ const budgetFixture = (count, perEpisode, unknown) => {
     combined.corpus.push(f.old.identity)
     combined.entries.push(...(proof ? proof.entries : f.entries))
     combined.evidence.exchanges.push(...f.evidence.exchanges)
+    combined.evidence.acquisitions.push(...f.evidence.acquisitions)
     combined.evidence.outcomes.push(...f.evidence.outcomes)
     combined.evidence.retirements.push(...f.evidence.retirements)
     for (const outcome of f.evidence.outcomes)
@@ -2756,6 +3425,10 @@ const budgetFixture = (count, perEpisode, unknown) => {
       for (const ticket of exchange.tickets)
         combined.evidence.exchangesByCohort.set(ticket.cohort, [exchange])
   }
+  if (!unknown)
+    for (const entry of combined.entries.filter(({ id }) => id % 2 === 1))
+      successfulAcceptFixture(combined.evidence, entry, entry.at + 1)
+  captureFreezes(combined)
   return combined
 }
 
@@ -2951,41 +3624,45 @@ describe('share bounce acquisition and settlement sensitivity', () => {
     expect(audit(fixture).problems.length).toBeGreaterThan(0)
   })
 
-  it.each([false, true])('keeps the 300/1800 boundaries for unknown settlement %s', (unknown) => {
-    const boundary = budgetFixture(1800, 300, unknown)
-    const result = unknown
-      ? settlementCandidates(
-          boundary.entries,
-          new Set(boundary.corpus),
-          boundary.bounces,
-          boundary.evidence
-        )
-      : audit(boundary)
-    expect(result.problems).toEqual([])
-    expect(result.perBounce).toEqual([300, 300, 300, 300, 300, 300])
-    const overEpisode = budgetFixture(301, 301, unknown)
-    const episodeResult = unknown
-      ? settlementCandidates(
-          overEpisode.entries,
-          new Set(overEpisode.corpus),
-          overEpisode.bounces,
-          overEpisode.evidence
-        )
-      : audit(overEpisode)
-    expect(episodeResult.perBounce).toEqual([301])
-    expect(episodeResult.problems.length).toBeGreaterThan(0)
-    const overTotal = budgetFixture(1801, 300, unknown)
-    const totalResult = unknown
-      ? settlementCandidates(
-          overTotal.entries,
-          new Set(overTotal.corpus),
-          overTotal.bounces,
-          overTotal.evidence
-        )
-      : audit(overTotal)
-    expect(unknown ? totalResult.unknown.length : totalResult.extras.length).toBe(1801)
-    expect(totalResult.problems.length).toBeGreaterThan(0)
-  })
+  it.each([false, true])(
+    'enforces replay and unknown ceilings together with unresolved carry (%s)',
+    (unknown) => {
+      const boundary = budgetFixture(1800, 300, unknown)
+      const result = unknown
+        ? settlementCandidates(
+            boundary.entries,
+            new Set(boundary.corpus),
+            boundary.bounces,
+            boundary.evidence
+          )
+        : audit(boundary)
+      if (unknown) expect(result.problems.length).toBeGreaterThan(0)
+      else expect(result.problems).toEqual([])
+      expect(result.perBounce).toEqual([300, 300, 300, 300, 300, 300])
+      const overEpisode = budgetFixture(301, 301, unknown)
+      const episodeResult = unknown
+        ? settlementCandidates(
+            overEpisode.entries,
+            new Set(overEpisode.corpus),
+            overEpisode.bounces,
+            overEpisode.evidence
+          )
+        : audit(overEpisode)
+      expect(episodeResult.perBounce).toEqual([301])
+      expect(episodeResult.problems.length).toBeGreaterThan(0)
+      const overTotal = budgetFixture(1801, 300, unknown)
+      const totalResult = unknown
+        ? settlementCandidates(
+            overTotal.entries,
+            new Set(overTotal.corpus),
+            overTotal.bounces,
+            overTotal.evidence
+          )
+        : audit(overTotal)
+      expect(unknown ? totalResult.unknown.length : totalResult.extras.length).toBe(1801)
+      expect(totalResult.problems.length).toBeGreaterThan(0)
+    }
+  )
 
   it('admits an applied Accept with a lost answer only after independent terminal proof', () => {
     const proof = lostAcceptFixture(replayFixture())
@@ -3001,6 +3678,353 @@ describe('share bounce acquisition and settlement sensitivity', () => {
     expect(auditTerminal(proof).problems).toEqual([])
     expect(proof.evidence.outcomes[0].error.reason).toBe('session-lost')
     expect(proof.evidence.outcomes.filter(({ error }) => error === null)).toEqual([])
+  })
+
+  it('tracks a frozen verifier without replacing any public consumer method', async () => {
+    const instance = new ShareBounceCase()
+    const events = new EventEmitter()
+    const assignment = [{ topic: 'control', partitions: [0] }]
+    let disconnects = 0
+    const consumer = Object.freeze({
+      events: { GROUP_JOIN: 'join', ASSIGNMENT_CHANGED: 'assignment', REQUEST: 'request' },
+      on: (name, listener) => {
+        events.on(name, listener)
+        return () => events.off(name, listener)
+      },
+      assignment: () => assignment,
+      disconnect: async () => {
+        disconnects++
+      },
+    })
+    instance.quiet = { events: [] }
+    const wrapper = instance.trackVerifier(consumer)
+    events.emit('request', { payload: { apiName: 'ShareFetch' } })
+    expect(instance.quiet.activeAt).toBeGreaterThan(0)
+    await wrapper.disconnect({ timeout: 2000 })
+    expect(disconnects).toBe(1)
+    expect(instance.quiet.assignment).toEqual(assignment)
+    expect(instance.quiet.endedAt).toBeGreaterThanOrEqual(instance.quiet.activeAt)
+    expect(events.eventNames()).toEqual([])
+    expect(Object.isFrozen(consumer)).toBe(true)
+    expect(wrapper).not.toBe(consumer)
+  })
+
+  it('admits a late written Accept only through its original interruption snapshot', () => {
+    const fixture = replayFixture({ count: 2 })
+    const proof = lostAcceptFixture(fixture)
+    const bounce = fixture.bounces[0]
+    bounce.at = 3
+    const acquisition = fixture.old.acquisition
+    acquisition.source.frames[0].at = 3.1
+    acquisition.source.frames[0].responseAt = 3.2
+    acquisition.adoptedAt = 3.3
+    captureFreezes(fixture)
+    expect(bounce.held.size).toBe(0)
+    expect(bounce.obligations).toEqual([])
+    expect(bounce.interruptions).toHaveLength(1)
+    expect(bounce.interruptions[0]).toMatchObject({ at: 8, kind: 'socket', history: [0] })
+    expect([...effectiveObligations(bounce).keys()]).toEqual(proof.corpus)
+    const result = auditTerminal(proof)
+    expect(result.problems).toEqual([])
+    expect(result.settlement.successful).toEqual([])
+    expect(result.settlement.unknown.map(({ identity }) => identity)).toEqual(proof.corpus)
+    expect(proof.evidence.outcomes.every(({ error }) => error !== null)).toBe(true)
+    bounce.interruptions = []
+    expect(auditTerminal(proof).settlement.missing).toEqual(proof.corpus)
+  })
+
+  it.each([false, true])(
+    'retains late held work for replay without admitting an unwritten Accept (%s)',
+    (written) => {
+      const fixture = replayFixture({ count: 2 })
+      const proof = lostAcceptFixture(fixture, { written })
+      fixture.bounces[0].at = 3
+      if (written) fixture.evidence.exchanges.at(-1).frames[0].at = 8.05
+      captureFreezes(fixture)
+      expect([...effectiveObligations(fixture.bounces[0]).keys()]).toEqual(proof.corpus)
+      expect(audit(fixture).problems).toEqual([])
+      expect(auditTerminal(proof).settlement.missing).toEqual(proof.corpus)
+    }
+  )
+
+  it('does not move the first socket cut to the failure, reset or command return', () => {
+    const fixture = replayFixture({ count: 2 })
+    const proof = lostAcceptFixture(fixture)
+    fixture.bounces[0].at = 3
+    fixture.bounces[0].downAt = 18
+    fixture.evidence.exchanges.at(-1).failedAt = 10
+    fixture.evidence.retirements[0].at = 11
+    fixture.evidence.outcomes[0].at = 11.1
+    captureFreezes(fixture)
+    expect(fixture.bounces[0].interruptions[0].at).toBe(8)
+    expect(auditTerminal(proof).problems).toEqual([])
+    fixture.evidence.exchanges.at(-1).frames[0].at = 9
+    expect(auditTerminal(proof).settlement.missing).toEqual(proof.corpus)
+    fixture.old.at = 8.5
+    expect(audit(fixture).problems.length).toBeGreaterThan(0)
+  })
+
+  it('rejects a late extension when primitive event ordering is ambiguous', () => {
+    const fixture = replayFixture({ count: 2 })
+    const proof = lostAcceptFixture(fixture)
+    fixture.bounces[0].at = 3
+    captureFreezes(fixture)
+    fixture.evidence.exchanges.at(-1).failedAt = 8
+    expect(auditTerminal(proof).problems.length).toBeGreaterThan(0)
+  })
+
+  it.each([8.4, 9, 17])('keeps late eligibility independent of command return at %s', (downAt) => {
+    const fixture = replayFixture({ count: 2 })
+    const proof = lostAcceptFixture(fixture)
+    fixture.bounces[0].at = 3
+    captureFreezes(fixture)
+    fixture.bounces[0].downAt = downAt
+    expect(auditTerminal(proof).problems).toEqual([])
+    fixture.evidence.owner.tap.socketEvents = []
+    fixture.evidence.exchanges.at(-1).failedAt = undefined
+    fixture.evidence.retirements = []
+    expect(auditTerminal(proof).problems.length).toBeGreaterThan(0)
+  })
+
+  it.each([
+    'socket',
+    'nodeId',
+    'groupId',
+    'memberId',
+    'topicId',
+    'partition',
+    'pool',
+    'generation',
+    'open',
+  ])('rejects a late interruption with a changed %s authority', (field) => {
+    const fixture = replayFixture({ count: 2 })
+    const proof = lostAcceptFixture(fixture)
+    fixture.bounces[0].at = 3
+    captureFreezes(fixture)
+    const cut = fixture.bounces[0].interruptions[0]
+    const changed = typeof cut.scope[field] === 'number' ? cut.scope[field] + 1 : 'foreign'
+    fixture.bounces[0].interruptions[0] = { ...cut, scope: { ...cut.scope, [field]: changed } }
+    expect(auditTerminal(proof).problems.length).toBeGreaterThan(0)
+    expect(auditTerminal(proof).settlement.missing).toEqual(proof.corpus)
+  })
+
+  it.each(['cohort', 'ticket', 'cause', 'correlation'])(
+    'rejects late Accept evidence with a changed %s link',
+    (field) => {
+      const fixture = replayFixture({ count: 2 })
+      const proof = lostAcceptFixture(fixture)
+      fixture.bounces[0].at = 3
+      captureFreezes(fixture)
+      const exchange = fixture.evidence.exchanges.at(-1)
+      if (field === 'cause') exchange.cause++
+      else if (field === 'correlation') exchange.frames[0].socket++
+      else exchange.tickets[0][field]++
+      expect(auditTerminal(proof).problems.length).toBeGreaterThan(0)
+    }
+  )
+
+  it('uses an original exchange failure when no earlier relevant socket loss was observed', () => {
+    const fixture = replayFixture({ count: 2 })
+    const proof = lostAcceptFixture(fixture)
+    fixture.bounces[0].at = 3
+    fixture.evidence.owner.tap.socketEvents = []
+    delete fixture.evidence.exchanges.at(-1).frames[0].lostAt
+    captureFreezes(fixture)
+    expect(fixture.bounces[0].interruptions[0]).toMatchObject({
+      kind: 'failure',
+      event: 100,
+      at: 8.1,
+    })
+    expect(auditTerminal(proof).problems).toEqual([])
+    fixture.evidence.retirements[0].cause++
+    expect(auditTerminal(proof).settlement.missing).toEqual(proof.corpus)
+  })
+
+  it('does not reconstruct a missing pending attempt from final classifications', () => {
+    const fixture = replayFixture({ count: 2 })
+    const proof = lostAcceptFixture(fixture)
+    fixture.bounces[0].at = 3
+    captureFreezes(fixture)
+    const cut = fixture.bounces[0].interruptions[0]
+    fixture.bounces[0].interruptions[0] = { ...cut, obligations: [], history: [] }
+    proof.settled = true
+    proof.unknown = [...proof.corpus]
+    expect(auditTerminal(proof).problems).toContain(
+      'bounce 0 interruption snapshot disagrees with the journal'
+    )
+    expect(auditTerminal(proof).settlement.missing).toEqual(proof.corpus)
+  })
+
+  it('preserves 201 early identities while freezing only the 167 still unresolved at interruption', () => {
+    const fixture = budgetFixture(301, 301, false)
+    fixture.entries = fixture.entries.filter(({ id }) => id % 2 === 0)
+    fixture.evidence.acquisitions = fixture.entries.map(({ acquisition }) => acquisition)
+    fixture.bounces[0].at = 5
+    for (const entry of fixture.entries.slice(201)) entry.at = 7.2
+    for (const entry of fixture.entries.slice(0, 134))
+      successfulAcceptFixture(fixture.evidence, entry, 6)
+    captureFreezes(fixture)
+    const bounce = fixture.bounces[0]
+    expect(bounce.held.size).toBe(201)
+    expect(effectiveObligations(bounce).size).toBe(167)
+    expect(bounce.interruptions[0].history).toHaveLength(167)
+    expect(freezeProblems(fixture.entries, fixture.bounces, fixture.evidence)).toEqual([])
+    const receipt = fixture.evidence.outcomesByCohort.get(fixture.entries[0].acquisition.id)[0]
+    receipt.at = 8.1
+    expect(
+      freezeProblems(fixture.entries, fixture.bounces, fixture.evidence).length
+    ).toBeGreaterThan(0)
+    receipt.at = 7
+    bounce.at = 4.5
+    expect(
+      freezeProblems(fixture.entries, fixture.bounces, fixture.evidence).length
+    ).toBeGreaterThan(0)
+  })
+
+  it('uses one 300-identity ceiling across independent interruption scopes', () => {
+    for (const count of [300, 301]) {
+      const fixture = budgetFixture(count, count, false)
+      for (const entry of fixture.entries.filter(({ id }) => id % 2 === 0)) {
+        if (entry.id % 4) continue
+        entry.partition = 1
+        entry.acquisition.partition = 1
+        entry.acquisition.source.response.responses[0].partitions[0].partitionIndex = 1
+        entry.acquisition.source.frames[0].request.topics[0].partitions[0].partitionIndex = 1
+        entry.acquisition.source.model[0].partition = 1
+        entry.acquisition.open = 2
+        entry.acquisition.source.open = 2
+        entry.acquisition.source.frames[0].socket = 2
+        entry.identity = shareRecordIdentity({
+          topic: entry.topic,
+          partition: 1,
+          offset: entry.offset,
+          key: Buffer.from('k'),
+          value: Buffer.from('v'),
+        })
+      }
+      fixture.evidence.retirements.push({ ...fixture.evidence.retirements[0], id: count, open: 2 })
+      captureFreezes(fixture)
+      expect(fixture.bounces[0].interruptions).toHaveLength(2)
+      expect(freezeProblems(fixture.entries, fixture.bounces, fixture.evidence).length > 0).toBe(
+        count === 301
+      )
+    }
+  })
+
+  it('retains carried retired unknowns without granting a new pool or episode charge', () => {
+    const fixture = budgetFixture(301, 300, true)
+    const result = settlementCandidates(
+      fixture.entries,
+      new Set(fixture.corpus),
+      fixture.bounces,
+      fixture.evidence
+    )
+    expect(result.perBounce).toEqual([300, 1])
+    expect(result.problems.length).toBeGreaterThan(0)
+    expect(fixture.bounces[1].held.size).toBe(301)
+    expect(effectiveObligations(fixture.bounces[1]).size).toBe(301)
+    expect(fixture.bounces[1].interruptions[0].carried).toHaveLength(300)
+    expect(
+      fixture.bounces[1].interruptions[0].carried.every(
+        ({ originatingEpisode }) => originatingEpisode === 0
+      )
+    ).toBe(true)
+    const cut = fixture.bounces[1].interruptions[0]
+    fixture.bounces[1].interruptions[0] = { ...cut, carried: [] }
+    expect(
+      freezeProblems(fixture.entries, fixture.bounces, fixture.evidence).length
+    ).toBeGreaterThan(0)
+  })
+
+  it('permits late higher-count replay but requires an independent epoch bracket for equal counts', () => {
+    const fixture = replayFixture({ count: 2 })
+    fixture.bounces[0].at = 3
+    fixture.old.acquisition.source.frames[0].at = 3.1
+    fixture.old.acquisition.source.frames[0].responseAt = 3.2
+    fixture.old.acquisition.adoptedAt = 3.3
+    captureFreezes(fixture)
+    expect(audit(fixture).problems).toEqual([])
+    fixture.next.deliveryCount = 1
+    fixture.next.acquisition.acquiredRecords[0].deliveryCount = 1
+    expect(audit(fixture).problems).toContain(
+      `${fixture.old.identity} has no proved delivery-count progression`
+    )
+    const source = fixture.old.acquisition.source
+    const transition = {
+      ...source,
+      id: 50,
+      tickets: [],
+      frames: [{ ...source.frames[0], id: 50, at: 6.2, responseAt: 6.4 }],
+      response: {
+        errorCode: 0,
+        responses: [
+          {
+            topicId: fixture.old.topicId,
+            partitions: [
+              {
+                partitionIndex: 0,
+                errorCode: 6,
+                acknowledgeErrorCode: 0,
+                acquiredRecords: [],
+                currentLeader: { leaderId: 2, leaderEpoch: 2 },
+              },
+            ],
+          },
+        ],
+      },
+    }
+    fixture.evidence.exchanges.push(transition)
+    expect(audit(fixture).problems).toEqual([])
+    expect(audit(fixture).extras[0].epochWitness.transition).toBe(50)
+    transition.response.responses[0].partitions[0].currentLeader.leaderEpoch = 1
+    expect(audit(fixture).problems).toContain(
+      `${fixture.old.identity} has no proved delivery-count progression`
+    )
+  })
+
+  it.each([
+    ['unwritten', { written: false }],
+    ['Release', { type: 'release' }],
+    ['Reject', { type: 'reject' }],
+  ])('cannot turn a late %s decision into terminal success', (_name, options) => {
+    const fixture = replayFixture({ count: 2 })
+    const proof = lostAcceptFixture(fixture, options)
+    fixture.bounces[0].at = 3
+    captureFreezes(fixture)
+    proof.oraclePassed = true
+    proof.settled = true
+    expect(auditTerminal(proof).settlement.missing).toEqual(proof.corpus)
+    expect(proof.evidence.outcomes.filter(({ error }) => error === null)).toEqual([])
+  })
+
+  it('does not reopen a partition for a replacement generation after its first interruption', () => {
+    const fixture = replayFixture({ count: 2 })
+    const proof = lostAcceptFixture(fixture)
+    fixture.bounces[0].at = 3
+    fixture.bounces[0].downAt = 15
+    const replacement = fixture.next
+    replacement.acquisition.source.nodeId = 1
+    replacement.acquisition.source.endpoint = 'node-1'
+    replacement.acquisition.source.frames[0].endpoint = 'node-1'
+    replacement.acquisition.source.frames[0].at = 8.4
+    replacement.acquisition.source.frames[0].responseAt = 8.5
+    replacement.acquisition.adoptedAt = 8.6
+    replacement.at = 8.7
+    fixture.evidence.retirements.push({
+      ...fixture.evidence.retirements[0],
+      id: 1,
+      open: 1,
+      at: 9.2,
+    })
+    const original = fixture.old
+    fixture.old = replacement
+    lostAcceptFixture(fixture, { writtenAt: 8.8, lostAt: 9 })
+    fixture.old = original
+    expect(fixture.bounces[0].interruptions).toHaveLength(1)
+    expect(fixture.bounces[0].interruptions[0].history).toEqual([0])
+    proof.entries.push(replacement)
+    expect(auditTerminal(proof).settlement.missing).toEqual(proof.corpus)
+    expect(freezeProblems(proof.entries, proof.bounces, proof.evidence)).toEqual([])
   })
 
   it('retains the write chronology when an Accept is written during the down command', () => {
@@ -3024,6 +4048,7 @@ describe('share bounce acquisition and settlement sensitivity', () => {
     original.at = 3
     original.held = new Set()
     original.obligations = []
+    original.interruptions = []
     const settlement = auditTerminal(proof).settlement
     expect(settlement.unknown).toEqual([])
     expect(settlement.missing).toEqual(proof.corpus)
@@ -3031,13 +4056,16 @@ describe('share bounce acquisition and settlement sensitivity', () => {
       entry: 0,
       handlerAt: 4,
       frozenEpisodes: [{ index: 1, nodeId: 2, at: 19, downAt: 20 }],
-      accepts: [{ exchange: 100, nodeId: 1, writtenAt: 6, lostAt: 8, failedAt: 8 }],
+      accepts: [{ exchange: 100, nodeId: 1, writtenAt: 6, lostAt: 8, failedAt: 8.1 }],
     })
   })
 
   it('requires recovery when the lost Accept was not applied and retains its old unknown history', () => {
     const fixture = replayFixture({ count: 2 })
     const proof = lostAcceptFixture(fixture, { applied: false })
+    fixture.bounces[0].at = 3
+    captureFreezes(fixture)
+    expect(fixture.bounces[0].held.size).toBe(0)
     expect(auditTerminal(proof).problems).toContain('Incomplete terminal proof')
     proof.entries.push(fixture.next)
     expect(
@@ -3088,6 +4116,8 @@ describe('share bounce acquisition and settlement sensitivity', () => {
       tickets: [
         {
           cohort: 1,
+          ledger: 1,
+          ticket: 101,
           isRenewAck: false,
           batches: request.topics[0].partitions[0].acknowledgementBatches,
         },
