@@ -1,9 +1,17 @@
 jest.mock('../../fetch/v4/decodeMessages', () =>
   jest.fn(jest.requireActual('../../fetch/v4/decodeMessages'))
 )
-const decodeMessages = require('../../fetch/v4/decodeMessages')
-const codec = require('./response')
 const vector = require('../fixtures/java/shareFetchResponse-v2-recordsAndErrors.json')
+let decodeMessages
+let codec
+
+jest.isolateModules(
+  /** @returns {void} Reload the response after setup cached it with the real decoder. */
+  () => {
+    decodeMessages = require('../../fetch/v4/decodeMessages')
+    codec = require('./response')
+  }
+)
 
 describe('ShareFetch v2 Records options', () => {
   const bytes = Buffer.from(vector.hex, 'hex')
