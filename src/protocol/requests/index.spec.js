@@ -351,73 +351,14 @@ describe('released share source domains', () => {
     ['DeleteShareGroupOffsets', 92, '0'],
   ]
 
-  const SHARE_NAMES = rows.map(([name]) => name)
-  const INTERNAL_KEYS = ['ApiKey83', 'ApiKey84', 'ApiKey85', 'ApiKey86', 'ApiKey87']
-
-  /**
-   * What each release recorded in `brokerRanges.json` must hold: the ranges it captured for the
-   * share APIs, by name, and for the broker-internal keys 83-87, which stay numbered. A release
-   * from before the share APIs existed is `{ absent: true }`: none of those names or keys may be
-   * recorded. Add an entry, from the capture itself, when a release is recorded.
-   * @type {Record<string, { absent: true } | { named: Record<string, number[]>, internal: Record<string, number[]> }>}
-   */
-  const captured = {
-    '4.0.2': { absent: true },
-    '4.1.2': {
-      named: {
-        ShareGroupHeartbeat: [1, 1],
-        ShareGroupDescribe: [1, 1],
-        ShareFetch: [1, 1],
-        ShareAcknowledge: [1, 1],
-        DescribeShareGroupOffsets: [0, 0],
-        AlterShareGroupOffsets: [0, 0],
-        DeleteShareGroupOffsets: [0, 0],
-      },
-      internal: {
-        ApiKey83: [0, 0],
-        ApiKey84: [0, 0],
-        ApiKey85: [0, 0],
-        ApiKey86: [0, 0],
-        ApiKey87: [0, 0],
-      },
-    },
-    '4.2.2': {
-      named: {
-        ShareGroupHeartbeat: [1, 1],
-        ShareGroupDescribe: [1, 1],
-        ShareFetch: [1, 2],
-        ShareAcknowledge: [1, 2],
-        DescribeShareGroupOffsets: [0, 1],
-        AlterShareGroupOffsets: [0, 0],
-        DeleteShareGroupOffsets: [0, 0],
-      },
-      internal: {
-        ApiKey83: [0, 0],
-        ApiKey84: [0, 0],
-        ApiKey85: [0, 1],
-        ApiKey86: [0, 0],
-        ApiKey87: [0, 1],
-      },
-    },
-    '4.3.1': {
-      named: {
-        ShareGroupHeartbeat: [1, 1],
-        ShareGroupDescribe: [1, 1],
-        ShareFetch: [1, 2],
-        ShareAcknowledge: [1, 2],
-        DescribeShareGroupOffsets: [0, 1],
-        AlterShareGroupOffsets: [0, 0],
-        DeleteShareGroupOffsets: [0, 0],
-      },
-      internal: {
-        ApiKey83: [0, 0],
-        ApiKey84: [0, 0],
-        ApiKey85: [0, 1],
-        ApiKey86: [0, 0],
-        ApiKey87: [0, 1],
-      },
-    },
-  }
+  const { readBrokerCapture } = require('../../../testHelpers/brokerCapture')
+  const internal = [
+    ['InitializeShareGroupState', 83],
+    ['ReadShareGroupState', 84],
+    ['WriteShareGroupState', 85],
+    ['DeleteShareGroupState', 86],
+    ['ReadShareGroupStateSummary', 87],
+  ]
 
   test.each(rows)('%s pins the released source range', (name, key, validVersions) => {
     for (const tag of SNAPSHOT_TAGS) {
@@ -431,27 +372,28 @@ describe('released share source domains', () => {
     }
   })
 
-  test.each([...new Set([...Object.keys(ranges), ...Object.keys(captured)])])(
+  test.each(Object.entries(ranges))(
     '%s records the share ranges by name and the internal ones by key',
-    (line) => {
-      if (!Object.hasOwn(ranges, line)) {
-        throw new Error(
-          `${line} has a captured expectation but brokerRanges.json no longer records it`
-        )
+    (line, table) => {
+      expect(line).toMatch(/^\d+\.\d+\.\d+$/)
+      expect(table).toEqual(expect.any(Object))
+      expect(Array.isArray(table)).toBe(false)
+      for (const range of Object.values(table)) {
+        expect(range).toHaveLength(2)
+        expect(range.every((n) => Number.isInteger(n) && n >= 0)).toBe(true)
+        expect(range[0]).toBeLessThanOrEqual(range[1])
       }
-      if (!Object.hasOwn(captured, line)) {
-        throw new Error(
-          `brokerRanges.json records ${line}, which has no captured expectation: add its share ` +
-            'ranges and its ApiKey83-ApiKey87 ranges to `captured` from that capture'
-        )
+
+      const { apiRanges } = readBrokerCapture(line)
+      for (const [name, key] of rows) {
+        expect(Object.hasOwn(table, 'ApiKey' + key)).toBe(false)
+        expect(Object.hasOwn(table, name)).toBe(Object.hasOwn(apiRanges, key))
+        expect(table[name]).toEqual(apiRanges[key])
       }
-      const entry = captured[line]
-      const expected = entry.absent
-        ? Object.fromEntries([...SHARE_NAMES, ...INTERNAL_KEYS].map((name) => [name, undefined]))
-        : { ...entry.named, ...entry.internal }
-      expect(Object.keys(expected).sort()).toEqual([...SHARE_NAMES, ...INTERNAL_KEYS].sort())
-      for (const [name, range] of Object.entries(expected)) {
-        expect(ranges[line][name]).toEqual(range)
+      for (const [name, key] of internal) {
+        expect(Object.hasOwn(table, name)).toBe(false)
+        expect(Object.hasOwn(table, 'ApiKey' + key)).toBe(Object.hasOwn(apiRanges, key))
+        expect(table['ApiKey' + key]).toEqual(apiRanges[key])
       }
     }
   )

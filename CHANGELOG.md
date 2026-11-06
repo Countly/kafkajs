@@ -279,6 +279,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Track the seven released share-group APIs (keys 76–79 and 90–92) in the Kafka 4.4.0 and 4.3.1 message snapshots and regenerate their protocol compatibility inventory. Source inventory alone does not add share-group support.
 - Add a Java share-consumer interoperability member and classpath probe.
 - The Java message-vector generator writes 46 share-group vectors (24 requests, 22 responses), including Records bytes, unknown tagged fields at every nesting and Java's own acknowledgement batching; they need `KAFKA_CLIENTS_VERSION=4.4.0`.
+- Add share-group fixtures, finalized feature captures and configuration-readback checks.
 
 ### Phase 9B — Producer parity: delivery deadline, memory bound, request size, partitioner, codecs, lifecycle
 
