@@ -16,6 +16,33 @@ const RecordBatch = require('../protocol/recordBatch/v0')
 const Record = require('../protocol/recordBatch/record/v0')
 const Decoder = require('../protocol/decoder')
 const { readRequestHeader } = require('../../testHelpers/fakeSocket')
+const fs = require('fs')
+const path = require('path')
+const vm = require('vm')
+const Broker = require('../broker')
+const ConnectionPool = require('../network/connectionPool')
+const adminFactory = require('../admin')
+const apiKeys = require('../protocol/requests/apiKeys')
+const expectedWire = require('../../testHelpers/wire/expected')
+const { createGroupApiBroker } = require('../broker/__tests__/fixtures/groupApiHarness')
+const {
+  A,
+  B,
+  acquire,
+  ackAnswer,
+  acquired,
+  deferred,
+  fetchAnswer,
+  flush,
+  part,
+  shareClient,
+  until: reach,
+} = require('../../testHelpers/shareHarness')
+const {
+  KafkaJSDeleteGroupsError,
+  KafkaJSNonRetriableError,
+  KafkaJSShareAcknowledgementError,
+} = require('../errors')
 const nodes = [{ id: 0, host: 'node0', port: 9092 }]
 const retry = { retries: 0 }
 /** Creates a silent test logger. @returns {object} logger; @throws Never. */
@@ -1168,4 +1195,758 @@ it('R1§C:forceTerminateTransaction', async () => {
   expect(bodies).toHaveLength(2)
   expect(bodies[0]).toBe(bodies[1])
   expect(admin.forceTerminateTransaction).toBeUndefined()
+})
+
+const LEADER = { leader: 0, epoch: 1 }
+const C = '20112233-4455-6677-8899-aabbccddeeff'
+const ORDERS = { orders: { topicId: A, partitions: [LEADER] } }
+const TOPIC_PAIR = {
+  a: { topicId: A, partitions: [LEADER] },
+  b: { topicId: B, partitions: [LEADER] },
+}
+const TOPIC_TRIPLE = { ...TOPIC_PAIR, c: { topicId: C, partitions: [LEADER] } }
+const GROUP_UUID = '01020304-0506-0708-090a-0b0c0d0e0f10'
+const RESET_OFFSETS = {
+  low: { 0: '7', 1: '9007199254740993' },
+  high: { 0: '83', 1: '9223372036854775807' },
+  at: { 0: '11', 1: '9007199254740994' },
+}
+const SHARE_GUIDE = fs.readFileSync(path.join(__dirname, '../../docs/ShareConsumer.md'), 'utf8')
+const MIGRATION_GUIDE = fs.readFileSync(
+  path.join(__dirname, '../../docs/MigrationGuide-3-0-0.md'),
+  'utf8'
+)
+
+/**
+ * Starts a public share consumer over the scripted share cluster, subscribed, with every
+ * acknowledgement event collected; the client closes after the test.
+ * @param {object} [options] Case options.
+ * @param {object} [options.topics] Metadata the cluster serves, by topic name.
+ * @param {string[]|null} [options.subscribe] Topic names to subscribe to, every served topic by default; null subscribes to none.
+ * @param {object} [options.share] Overrides of the shareConsumer options.
+ * @returns {Promise<{h: object, acks: object[]}>} The harness client and the collected payloads.
+ * @throws {Error} When the subscription fails.
+ */
+const startShare = async ({ topics = ORDERS, subscribe = Object.keys(topics), share } = {}) => {
+  const h = shareClient({ topics, ...(share && { share }) })
+  use({ disconnect: () => h.close() }, {})
+  const acks = []
+  h.consumer.on(h.consumer.events.ACKNOWLEDGE, ({ payload }) => acks.push(payload))
+  if (subscribe) await h.consumer.subscribe({ topics: subscribe })
+  return { h, acks }
+}
+/** Holds the fetch of one session epoch. @param {object} h Share client. @param {number} epoch Session epoch. @returns {object} The gate. @throws Never. */
+const holdFetch = (h, epoch) =>
+  h.hold({ api: 'ShareFetch', match: ({ fields }) => fields.shareSessionEpoch === epoch })
+/** A handler gate released at teardown. @returns {{promise: Promise<void>, resolve: Function}} The gate. @throws Never. */
+const handlerGate = () => {
+  const gate = deferred()
+  releases.push(gate.resolve)
+  return gate
+}
+/** @param {object} frame A recorded share frame. @returns {object[]} Its acknowledgement batches, in wire order. @throws Never. */
+const batchesOf = ({ fields }) =>
+  fields.topics.flatMap((t) => t.partitions.flatMap((p) => p.acknowledgementBatches))
+/** @param {object[]} acks Acknowledge payloads. @returns {Array<Array>} Range, type and error reason of each, in event order. @throws Never. */
+const outcomes = (acks) =>
+  acks.map(({ firstOffset, lastOffset, type, error }) => [
+    firstOffset,
+    lastOffset,
+    type,
+    error ? error.reason : null,
+  ])
+/** @param {object[]} acks Payloads of small ranges. @returns {string[]} Every offset they cover, in event order. @throws Never. */
+const coveredOffsets = (acks) =>
+  acks.flatMap(({ firstOffset, lastOffset }) => {
+    const offsets = []
+    for (let offset = BigInt(firstOffset); offset <= BigInt(lastOffset); offset++)
+      offsets.push(String(offset))
+    return offsets
+  })
+/** @param {string} text Text. @returns {string} Its COMPACT_STRING bytes as hex. @throws Never. */
+const compactHex = (text) =>
+  (Buffer.byteLength(text) + 1).toString(16).padStart(2, '0') + Buffer.from(text).toString('hex')
+
+/**
+ * Compiles the offset-reset recipe printed in the share guide, in a context that shares this
+ * realm's intrinsics, so the tested function is the documented one.
+ * @returns {Function} The guide's `resetShareOffsets`.
+ * @throws {Error} When the guide no longer prints the recipe.
+ */
+const guideReset = () => {
+  const start = SHARE_GUIDE.indexOf('async function resetShareOffsets(')
+  expect(start).toBeGreaterThan(-1)
+  const source = SHARE_GUIDE.slice(start, SHARE_GUIDE.indexOf('\n}\n', start) + 2)
+  return vm.runInContext(`(${source})`, vm.createContext({ Error, Number, BigInt }))
+}
+
+/**
+ * Builds a real Admin whose share calls reach a real Broker over the scripted share cluster and
+ * whose offset lookups answer from `offsets`; every share frame is decoded by the independent wire pairs.
+ * @param {object} [options] Case options.
+ * @param {object[]} [options.members] Members the described group reports.
+ * @param {number} [options.describeCode] Group-level code of the description.
+ * @param {number} [options.alterCode] Group-level code of the offset alteration.
+ * @param {Record<number, number>} [options.partitionCodes] Error code of the alteration by partition.
+ * @param {number[]} [options.partitions] Partitions the topic has.
+ * @param {{low: object, high: object, at: object}} [options.offsets] Lookup answers by partition.
+ * @returns {Promise<{admin: object, lookups: object[], frames: Function}>} The admin, the offset lookups it made and a frame reader.
+ * @throws {Error} When the broker cannot connect.
+ */
+const resetRig = async ({
+  members = [],
+  describeCode = 0,
+  alterCode = 0,
+  partitionCodes = {},
+  partitions = [0, 1],
+  offsets = RESET_OFFSETS,
+} = {}) => {
+  const scripted = createScriptedCluster({ nodes, profile: 'share' })
+  scripted.answer('ShareGroupDescribe', ({ groupIds }) => ({
+    groups: groupIds.map((groupId) => ({
+      ...expectedWire.shareGroupDescribeV1.response.groups[0],
+      groupId,
+      groupState: 'Empty',
+      errorCode: describeCode,
+      errorMessage: describeCode ? 'group error' : null,
+      members,
+    })),
+  }))
+  scripted.answer('AlterShareGroupOffsets', ({ topics }) => ({
+    errorCode: alterCode,
+    errorMessage: alterCode ? 'group error' : null,
+    responses: topics.map(({ topicName, partitions: rows }) => ({
+      topicName,
+      topicId: GROUP_UUID,
+      partitions: rows.map(({ partitionIndex }) => ({
+        partitionIndex,
+        errorCode: partitionCodes[partitionIndex] ?? 0,
+        errorMessage: null,
+      })),
+    })),
+  }))
+  const pool = new ConnectionPool({
+    host: 'node0',
+    port: 9092,
+    clientId: 'reset-admin',
+    socketFactory: scripted.socketFactory,
+    logger: logger(),
+    connectionTimeout: 1000,
+    requestTimeout: 1000,
+    enforceRequestTimeout: false,
+    connectionsMaxIdle: 0,
+  })
+  use({ disconnect: () => pool.destroy({ drainTimeout: 0 }) }, scripted)
+  const broker = new Broker({ connectionPool: pool, logger: logger() })
+  broker.nodeId = 0
+  await broker.connect()
+  const lookups = []
+  const cluster = {
+    findGroupCoordinator: async () => broker,
+    refreshMetadata: async () => {},
+    addTargetTopic: async () => {},
+    refreshMetadataIfNecessary: async () => {},
+    findTopicPartitionMetadata: () => partitions.map((partitionId) => ({ partitionId })),
+    fetchTopicsOffset: async ([request]) => {
+      lookups.push(request)
+      const source =
+        request.fromTimestamp !== undefined
+          ? offsets.at
+          : request.fromBeginning
+            ? offsets.low
+            : offsets.high
+      return [
+        {
+          topic: request.topic,
+          partitions: request.partitions.map(({ partition }) => ({
+            partition,
+            offset: source[partition],
+          })),
+        },
+      ]
+    },
+  }
+  return {
+    admin: adminFactory({ cluster, retry, logger: logger() }),
+    lookups,
+    frames: (api) => scripted.requests().filter((request) => request.api === api),
+  }
+}
+
+it('R1§E:poll', async () => {
+  for (const kind of ['eachMessage', 'eachBatch']) {
+    const { h } = await startShare()
+    const { consumer } = h
+    expect(consumer.poll).toBeUndefined()
+    h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a', 'b', 'c'])])])
+    const join = h.hold({ api: 'ShareGroupHeartbeat' })
+    const piggyback = holdFetch(h, 1)
+    const seen = []
+    let callbackEntries = 0
+    const handler = async ({ topic, partition, message, batch }) => {
+      callbackEntries++
+      for (const delivered of batch ? batch.messages : [message]) {
+        seen.push([
+          batch ? batch.topic : topic,
+          batch ? batch.partition : partition,
+          delivered.offset,
+          delivered.value.toString(),
+          delivered.deliveryCount,
+        ])
+      }
+    }
+    let state = 'pending'
+    const running = consumer.run({ [kind]: handler }).then(
+      () => {
+        state = 'joined'
+      },
+      (error) => {
+        state = error
+      }
+    )
+    await join.arrived()
+    await flush()
+    expect(state).toBe('pending')
+    expect(callbackEntries).toBe(0)
+    expect(h.frames(78)).toHaveLength(0)
+    join.release()
+    await running
+    expect(state).toBe('joined')
+    await piggyback.arrived()
+    expect(seen).toEqual([
+      ['orders', 0, '0', 'a', 1],
+      ['orders', 0, '1', 'b', 1],
+      ['orders', 0, '2', 'c', 1],
+    ])
+    expect(callbackEntries).toBe(kind === 'eachBatch' ? 1 : 3)
+    expect(consumer.assignment()).toEqual([{ topic: 'orders', partitions: [0] }])
+    const entriesBeforeStop = callbackEntries
+    await consumer.stop()
+    piggyback.release(fetchAnswer([acquire(0, 3, ['late'])]))
+    await flush()
+    const postStopEntries = callbackEntries - entriesBeforeStop
+    expect(postStopEntries).toBe(0)
+    expect(consumer.assignment()).toEqual([])
+    expect(consumer.subscription()).toEqual(['orders'])
+  }
+})
+
+it('R1§E:commitAsync', async () => {
+  const delivered = ['0', '1', '2']
+  for (const acknowledgementMode of ['implicit', 'explicit']) {
+    const { h, acks } = await startShare({ share: { acknowledgementMode } })
+    expect(h.consumer.commitAsync).toBeUndefined()
+    h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a', 'b', 'c'])])])
+    const piggyback = holdFetch(h, 1)
+    const decided = deferred()
+    const finish = handlerGate()
+    await h.consumer.run({
+      eachBatch: async ({ batch, acknowledge }) => {
+        const [first, second, third] = batch.messages
+        acknowledge(first, 'release')
+        acknowledge(first, 'accept')
+        acknowledge(second, 'release')
+        acknowledge(third, 'reject')
+        decided.resolve()
+        await finish.promise
+      },
+    })
+    await decided.promise
+    await flush()
+    expect(h.frames(79)).toHaveLength(0)
+    expect(h.frames(78)).toHaveLength(1)
+    expect(acks).toEqual([])
+    finish.resolve()
+    const sent = await piggyback.arrived()
+    expect(batchesOf(sent)).toEqual([
+      { firstOffset: '0', lastOffset: '2', acknowledgeTypes: [1, 2, 3] },
+    ])
+    expect(acks).toEqual([])
+    piggyback.release(fetchAnswer([part({ partition: 0 })]))
+    await reach(() => acks.length === 3, 'the three settlements')
+    expect(outcomes(acks)).toEqual([
+      ['0', '0', 'accept', null],
+      ['1', '1', 'release', null],
+      ['2', '2', 'reject', null],
+    ])
+    expect(coveredOffsets(acks)).toEqual(delivered)
+    expect(new Set(coveredOffsets(acks)).size).toBe(delivered.length)
+    expect(h.frames(79)).toHaveLength(0)
+  }
+
+  const thrown = await startShare()
+  const failures = []
+  thrown.h.consumer.on(thrown.h.consumer.events.HANDLER_ERROR, ({ payload }) =>
+    failures.push(payload)
+  )
+  thrown.h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a', 'b', 'c'])])])
+  const failure = new Error('handler failed')
+  await thrown.h.consumer.run({
+    eachBatch: async ({ batch, acknowledge }) => {
+      acknowledge(batch.messages[0], 'accept')
+      throw failure
+    },
+  })
+  await reach(() => thrown.h.frames(79).length === 1 && thrown.acks.length === 2, 'the flush')
+  expect(failures).toHaveLength(1)
+  expect(failures[0].error).toBe(failure)
+  expect(thrown.h.frames(79).map(batchesOf)).toEqual([
+    [{ firstOffset: '0', lastOffset: '2', acknowledgeTypes: [1, 2, 2] }],
+  ])
+  expect(outcomes(thrown.acks)).toEqual([
+    ['0', '0', 'accept', null],
+    ['1', '2', 'release', null],
+  ])
+
+  const lost = await startShare()
+  lost.h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a'])])])
+  const unanswered = lost.h.hold({ api: 'ShareAcknowledge' })
+  await lost.h.consumer.run({
+    eachMessage: async () => {
+      throw new Error('handler failed')
+    },
+  })
+  await unanswered.arrived()
+  unanswered.fail(new Error('connection lost'))
+  await reach(() => lost.acks.length === 1, 'the lost settlement')
+  await flush()
+  expect(outcomes(lost.acks)).toEqual([['0', '0', 'release', 'session-lost']])
+  expect(lost.acks[0].error).toBeInstanceOf(KafkaJSShareAcknowledgementError)
+  expect(lost.h.frames(79)).toHaveLength(1)
+  expect(lost.h.frames(78, 79).flatMap(batchesOf)).toEqual([
+    { firstOffset: '0', lastOffset: '0', acknowledgeTypes: [2] },
+  ])
+
+  const omitted = await startShare({
+    topics: { orders: { topicId: A, partitions: [LEADER, LEADER] } },
+  })
+  omitted.h.script('ShareFetch', [
+    fetchAnswer([acquire(0, 0, ['a']), acquire(1, 0, ['b'])]),
+    () => fetchAnswer([part({ partition: 0 })]),
+    fetchAnswer([acquire(0, 1, ['c'])]),
+  ])
+  await omitted.h.consumer.run({ eachMessage: async () => {} })
+  await reach(() => omitted.acks.length === 3, 'the omission and the healthy acquisition')
+  const onZero = omitted.acks.filter(({ partition }) => partition === 0)
+  const onOne = omitted.acks.filter(({ partition }) => partition === 1)
+  expect(outcomes(onZero)).toEqual([
+    ['0', '0', 'accept', null],
+    ['1', '1', 'accept', null],
+  ])
+  expect(onOne).toHaveLength(1)
+  expect(onOne[0].error).toBeInstanceOf(KafkaJSShareAcknowledgementError)
+  expect(onOne[0].error.ranges).toEqual([{ firstOffset: '0', lastOffset: '0' }])
+  const sentForOne = omitted.h
+    .frames(78, 79)
+    .flatMap(({ fields }) => fields.topics.flatMap((t) => t.partitions))
+    .filter(
+      ({ partitionIndex, acknowledgementBatches }) =>
+        partitionIndex === 1 && acknowledgementBatches.length
+    )
+  expect(sentForOne).toHaveLength(1)
+})
+
+it('R1§E:ackCallback', async () => {
+  const FIRST = '9007199254740993'
+  const LAST = '9007199255740992'
+
+  const gap = await startShare()
+  const crashes = []
+  const removed = []
+  gap.h.consumer.on(gap.h.consumer.events.CRASH, ({ payload }) => crashes.push(payload))
+  gap.h.consumer.on(gap.h.consumer.events.ACKNOWLEDGE, () => {
+    throw new Error('synchronous observer failure')
+  })
+  gap.h.consumer.on(gap.h.consumer.events.ACKNOWLEDGE, async () => {
+    throw new Error('asynchronous observer failure')
+  })
+  const remove = gap.h.consumer.on(gap.h.consumer.events.ACKNOWLEDGE, ({ payload }) =>
+    removed.push(payload)
+  )
+  remove()
+  remove()
+  expect(gap.h.consumer.setAcknowledgementCommitCallback).toBeUndefined()
+  gap.h.script('ShareFetch', [
+    fetchAnswer([part({ partition: 0, acquire: [acquired(FIRST, LAST)] })]),
+  ])
+  await gap.h.consumer.run({ eachMessage: async () => {} })
+  await reach(() => gap.acks.length === 1, 'the settled gap')
+  const [gapEvent] = gap.acks
+  expect(Object.keys(gapEvent).sort()).toEqual([
+    'error',
+    'firstOffset',
+    'lastOffset',
+    'partition',
+    'topic',
+    'type',
+  ])
+  expect(gapEvent).toEqual({
+    topic: 'orders',
+    partition: 0,
+    firstOffset: FIRST,
+    lastOffset: LAST,
+    type: 'gap',
+    error: null,
+  })
+  expect(gapEvent.offsets).toBeUndefined()
+  expect(gap.h.frames(78).flatMap(batchesOf)).toEqual([
+    { firstOffset: FIRST, lastOffset: LAST, acknowledgeTypes: [0] },
+  ])
+  expect(removed).toEqual([])
+  expect(crashes).toEqual([])
+
+  const mixed = await startShare({ share: { acknowledgementMode: 'explicit' } })
+  mixed.h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a', 'b', 'c'])])])
+  await mixed.h.consumer.run({
+    eachBatch: async ({ batch, acknowledge }) => {
+      const [first, second, third] = batch.messages
+      acknowledge(first, 'accept')
+      acknowledge(second, 'release')
+      acknowledge(third, 'reject')
+    },
+  })
+  await reach(() => mixed.acks.length === 3, 'the three distinct settlements')
+  expect(outcomes(mixed.acks)).toEqual([
+    ['0', '0', 'accept', null],
+    ['1', '1', 'release', null],
+    ['2', '2', 'reject', null],
+  ])
+  expect(coveredOffsets(mixed.acks)).toEqual(['0', '1', '2'])
+
+  const renewed = await startShare()
+  renewed.h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a'])])])
+  renewed.h.script('ShareAcknowledge', [
+    ackAnswer([{ partition: 0 }], { acquisitionLockTimeoutMs: 2000 }),
+    ackAnswer([{ partition: 0, code: 121 }]),
+  ])
+  const renewals = []
+  await renewed.h.consumer.run({
+    eachMessage: async ({ renew }) => {
+      renewals.push(await renew())
+      renewals.push(
+        await renew().then(
+          () => 'applied',
+          (error) => error
+        )
+      )
+    },
+  })
+  await reach(() => renewed.acks.length === 3, 'two renewals and the terminal outcome')
+  expect(renewals[0]).toBe(2000)
+  expect(renewals[1]).toBeInstanceOf(KafkaJSShareAcknowledgementError)
+  expect(renewals[1]).toMatchObject({
+    reason: 'rejected-by-broker',
+    ranges: [{ firstOffset: '0', lastOffset: '0' }],
+  })
+  expect(outcomes(renewed.acks)).toEqual([
+    ['0', '0', 'renew', null],
+    ['0', '0', 'renew', 'rejected-by-broker'],
+    ['0', '0', 'accept', null],
+  ])
+  const terminalAfterRenew = renewed.acks.filter(({ type }) => type !== 'renew')
+  expect(terminalAfterRenew).toHaveLength(1)
+  expect(terminalAfterRenew[0].error).toBeNull()
+})
+
+it('R1§E:reset-offsets', async () => {
+  const resetShareOffsets = guideReset()
+  const GROUP = 'orders-workers'
+  /** @param {object} rig Reset rig. @returns {object[]} The alterations the broker received, in the guide's shape. @throws Never. */
+  const sent = (rig) =>
+    rig.frames('AlterShareGroupOffsets').map(({ fields }) => ({
+      groupId: fields.groupId,
+      topics: fields.topics.map(({ topicName, partitions }) => ({
+        topic: topicName,
+        partitions: partitions.map(({ partitionIndex, startOffset }) => ({
+          partition: partitionIndex,
+          offset: startOffset,
+        })),
+      })),
+    }))
+  const selected = [
+    [
+      'earliest',
+      [
+        { partition: 0, offset: '7' },
+        { partition: 1, offset: '9007199254740993' },
+      ],
+    ],
+    [
+      'latest',
+      [
+        { partition: 0, offset: '83' },
+        { partition: 1, offset: '9223372036854775807' },
+      ],
+    ],
+    [
+      1700000000000,
+      [
+        { partition: 0, offset: '11' },
+        { partition: 1, offset: '9007199254740994' },
+      ],
+    ],
+  ]
+  for (const [position, partitions] of selected) {
+    const rig = await resetRig()
+    const results = await resetShareOffsets(rig.admin, GROUP, 'orders', position)
+    expect(sent(rig)).toEqual([{ groupId: GROUP, topics: [{ topic: 'orders', partitions }] }])
+    expect(results).toEqual([
+      {
+        topic: 'orders',
+        topicId: GROUP_UUID,
+        partitions: [
+          { partition: 0, errorCode: 0 },
+          { partition: 1, errorCode: 0 },
+        ],
+      },
+    ])
+    expect(rig.frames('ShareGroupDescribe').map(({ fields }) => fields.groupIds)).toEqual([[GROUP]])
+    expect(
+      rig.lookups.map(({ fromTimestamp }) => fromTimestamp).filter((value) => value !== undefined)
+    ).toEqual(typeof position === 'number' ? [position] : [])
+  }
+
+  const unmatched = await resetRig({ offsets: { ...RESET_OFFSETS, at: { 0: '11', 1: '-1' } } })
+  await resetShareOffsets(unmatched.admin, GROUP, 'orders', 1700000000000)
+  expect(sent(unmatched)[0].topics[0].partitions).toEqual([
+    { partition: 0, offset: '11' },
+    { partition: 1, offset: '9223372036854775807' },
+  ])
+  const zero = await resetRig({ offsets: { ...RESET_OFFSETS, low: { 0: '0', 1: '0' } } })
+  await resetShareOffsets(zero.admin, GROUP, 'orders', 'earliest')
+  expect(sent(zero)[0].topics[0].partitions).toEqual([
+    { partition: 0, offset: '0' },
+    { partition: 1, offset: '0' },
+  ])
+
+  for (const position of [
+    -1,
+    1.5,
+    Number.MAX_SAFE_INTEGER + 1,
+    'middle',
+    '1700000000000',
+    null,
+    undefined,
+  ]) {
+    const rig = await resetRig()
+    await expect(resetShareOffsets(rig.admin, GROUP, 'orders', position)).rejects.toThrow(
+      'Use earliest, latest or nonnegative epoch milliseconds'
+    )
+    expect(rig.frames('ShareGroupDescribe')).toEqual([])
+    expect(rig.lookups).toEqual([])
+    expect(sent(rig)).toEqual([])
+  }
+  const memberMessage = 'The share group must exist and have no members'
+  const active = await resetRig({
+    members: expectedWire.shareGroupDescribeV1.response.groups[0].members,
+  })
+  await expect(resetShareOffsets(active.admin, GROUP, 'orders', 'earliest')).rejects.toThrow(
+    memberMessage
+  )
+  expect(active.frames('ShareGroupDescribe')).toHaveLength(1)
+  expect(active.lookups).toEqual([])
+  expect(sent(active)).toEqual([])
+  const missing = await resetRig({ describeCode: 69 })
+  await expect(resetShareOffsets(missing.admin, GROUP, 'orders', 'earliest')).rejects.toThrow(
+    memberMessage
+  )
+  expect(missing.lookups).toEqual([])
+  expect(sent(missing)).toEqual([])
+  for (const malformed of ['-5', '9223372036854775808', '007', '1.5', '', 'abc', 83]) {
+    const rig = await resetRig({ offsets: { ...RESET_OFFSETS, high: { 0: '83', 1: malformed } } })
+    await expect(resetShareOffsets(rig.admin, GROUP, 'orders', 'latest')).rejects.toThrow(
+      'The offset lookup must return a nonnegative signed int64 string'
+    )
+    expect(sent(rig)).toEqual([])
+  }
+  const empty = await resetRig({ partitions: [] })
+  await expect(resetShareOffsets(empty.admin, GROUP, 'orders', 'latest')).rejects.toThrow(
+    'The lookup returned no partitions'
+  )
+  expect(sent(empty)).toEqual([])
+
+  const refused = await resetRig({ partitionCodes: { 1: 29 } })
+  await expect(resetShareOffsets(refused.admin, GROUP, 'orders', 'latest')).rejects.toMatchObject({
+    code: 29,
+    type: 'TOPIC_AUTHORIZATION_FAILED',
+  })
+  expect(sent(refused)).toHaveLength(1)
+  const raced = await resetRig({ alterCode: 68 })
+  await expect(resetShareOffsets(raced.admin, GROUP, 'orders', 'latest')).rejects.toMatchObject({
+    code: 68,
+    type: 'NON_EMPTY_GROUP',
+  })
+  expect(raced.frames('ShareGroupDescribe')).toHaveLength(1)
+  expect(sent(raced)).toHaveLength(1)
+})
+
+it('R1§C:deleteShareGroups', async () => {
+  const GROUP = 'equivalent-share-empty'
+  const notEmpty = 'The group is not empty.'
+  /**
+   * @param {number} code Group-level error code.
+   * @param {string|null} message Broker message.
+   * @returns {Buffer} A DeleteGroups v3 answer for the one group.
+   * @throws Never.
+   */
+  const answerFor = (code, message) =>
+    Buffer.from(
+      `00000000${'02'}${compactHex(GROUP)}${code.toString(16).padStart(4, '0')}${
+        message === null ? '00' : compactHex(message)
+      }0000`,
+      'hex'
+    )
+  for (const [code, message] of [
+    [0, null],
+    [68, notEmpty],
+  ]) {
+    const harness = createGroupApiBroker({
+      versions: { [apiKeys.DeleteGroups]: { minVersion: 0, maxVersion: 3 } },
+      respond: () => answerFor(code, message),
+    })
+    use({ disconnect: () => harness.pool.destroy() }, {})
+    const lookups = []
+    const admin = adminFactory({
+      logger: logger(),
+      retry,
+      cluster: {
+        refreshMetadata: async () => {},
+        findGroupCoordinator: async (options) => {
+          lookups.push(options)
+          return harness.broker
+        },
+        targetTopics: new Set(),
+      },
+    })
+    expect(admin.deleteShareGroups).toBeUndefined()
+    if (code === 0) {
+      await expect(admin.deleteGroups([GROUP])).resolves.toEqual([
+        { groupId: GROUP, errorCode: 0, errorMessage: null },
+      ])
+    } else {
+      const failure = await admin.deleteGroups([GROUP]).catch((error) => error)
+      expect(failure).toBeInstanceOf(KafkaJSDeleteGroupsError)
+      expect(failure.groups).toEqual([
+        {
+          groupId: GROUP,
+          errorCode: 68,
+          error: expect.objectContaining({ code: 68, type: 'NON_EMPTY_GROUP' }),
+          errorMessage: notEmpty,
+        },
+      ])
+    }
+    expect(lookups).toEqual([{ groupId: GROUP }])
+    expect(harness.requests.map(({ apiKey, apiVersion }) => [apiKey, apiVersion])).toEqual([
+      [apiKeys.DeleteGroups, 3],
+    ])
+    expect(harness.requests[0].body.toString('hex')).toBe(`02${compactHex(GROUP)}00`)
+  }
+})
+
+it('R1§E:commitSync', async () => {
+  const { h, acks } = await startShare()
+  const { consumer } = h
+  for (const method of ['commitSync', 'commit', 'commitOffsets', 'commitAsync'])
+    expect(consumer[method]).toBeUndefined()
+  h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a', 'b'])])])
+  const piggyback = holdFetch(h, 1)
+  const decided = deferred()
+  const finish = handlerGate()
+  await consumer.run({
+    eachBatch: async ({ batch, acknowledge }) => {
+      for (const message of batch.messages) acknowledge(message, 'accept')
+      decided.resolve()
+      await finish.promise
+    },
+  })
+  await decided.promise
+  await flush()
+  const eventsWhileHandlerHeld = [...acks]
+  expect(eventsWhileHandlerHeld).toEqual([])
+  expect(h.frames(79)).toHaveLength(0)
+  expect(h.frames(78)).toHaveLength(1)
+  finish.resolve()
+  await piggyback.arrived()
+  const eventsWhileAnswerHeld = [...acks]
+  expect(eventsWhileAnswerHeld).toEqual([])
+  piggyback.release(fetchAnswer([part({ partition: 0 })]))
+  await reach(() => acks.length === 1, 'the automatic settlement')
+  expect(acks[0]).toEqual({
+    topic: 'orders',
+    partition: 0,
+    firstOffset: '0',
+    lastOffset: '1',
+    type: 'accept',
+    error: null,
+  })
+  expect(h.frames(79)).toHaveLength(0)
+  for (const guide of [SHARE_GUIDE, MIGRATION_GUIDE])
+    expect(guide).toContain('There is no callable synchronous flush-and-wait')
+})
+
+it('R1§E:unsubscribe', async () => {
+  const { h } = await startShare({ topics: TOPIC_PAIR, subscribe: null })
+  const { consumer } = h
+  expect(consumer.unsubscribe).toBeUndefined()
+  expect(consumer.subscription()).toEqual([])
+  await consumer.subscribe({ topics: ['a', 'b'] })
+  const previousSnapshot = consumer.subscription()
+  expect(previousSnapshot).toEqual(['a', 'b'])
+  previousSnapshot.push('mutated')
+  expect(consumer.subscription()).toEqual(['a', 'b'])
+  expect(consumer.subscription()).not.toBe(previousSnapshot)
+  const eachMessage = async () => {}
+  await consumer.run({ eachMessage })
+  await consumer.stop()
+  expect(consumer.assignment()).toEqual([])
+  expect(consumer.subscription()).toEqual(['a', 'b'])
+  await expect(consumer.subscribe({ topics: [] })).rejects.toThrow(KafkaJSNonRetriableError)
+  expect(consumer.subscription()).toEqual(['a', 'b'])
+  await consumer.run({ eachMessage })
+  const joins = h.frames(76).filter(({ fields }) => fields.memberEpoch === 0)
+  const secondJoinTopics = joins[1].fields.subscribedTopicNames
+  expect(joins).toHaveLength(2)
+  expect(secondJoinTopics).toEqual(['a', 'b'])
+  expect(joins[1].fields.memberId).not.toBe(joins[0].fields.memberId)
+  for (const guide of [SHARE_GUIDE, MIGRATION_GUIDE])
+    expect(guide).toContain('stop retains the subscribed names')
+})
+
+it('R1§E:resubscribe', async () => {
+  const { h } = await startShare({ topics: TOPIC_TRIPLE, subscribe: ['a', 'b'] })
+  const { consumer } = h
+  h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['first'])])])
+  const oldFetch = holdFetch(h, 1)
+  const handled = []
+  const eachMessage = async ({ topic, message }) => {
+    handled.push(`${topic}:${message.value.toString()}`)
+  }
+  await consumer.run({ eachMessage })
+  await oldFetch.arrived()
+  expect(handled).toEqual(['a:first'])
+  const joinsOf = () => h.frames(76).filter(({ fields }) => fields.memberEpoch === 0)
+  const oldMemberId = joinsOf()[0].fields.memberId
+  const heartbeatsBefore = h.frames(76).length
+  await expect(consumer.subscribe({ topics: ['c'] })).rejects.toThrow(KafkaJSNonRetriableError)
+  expect(consumer.subscription()).toEqual(['a', 'b'])
+  await reach(() => h.frames(76).length > heartbeatsBefore, 'a heartbeat after the rejected call')
+  const replacementHeartbeatsBeforeStop = h
+    .frames(76)
+    .filter(({ fields }) => (fields.subscribedTopicNames ?? []).includes('c'))
+  expect(replacementHeartbeatsBeforeStop).toEqual([])
+  await consumer.stop()
+  await consumer.subscribe({ topics: ['c'] })
+  await consumer.run({ eachMessage })
+  expect(consumer.subscription()).toEqual(['c'])
+  const joins = joinsOf()
+  expect(joins.map(({ fields }) => fields.subscribedTopicNames)).toEqual([['a', 'b'], ['c']])
+  const newMemberId = joins[1].fields.memberId
+  expect(newMemberId).not.toBe(oldMemberId)
+  oldFetch.release(fetchAnswer([acquire(0, 5, ['late'])]))
+  await flush()
+  expect(handled).toEqual(['a:first'])
+  expect(consumer.subscription()).toEqual(['c'])
+  expect(joinsOf()).toHaveLength(2)
+  for (const guide of [SHARE_GUIDE, MIGRATION_GUIDE])
+    expect(guide).toContain('This sequence does not preserve running-replacement semantics.')
 })

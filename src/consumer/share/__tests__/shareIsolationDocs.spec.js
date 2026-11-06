@@ -44,3 +44,106 @@ describe('Share isolation guide contract', () => {
     expect(ignore).not.toContain('!docs/')
   })
 })
+
+/**
+ * @param {string} file Repository-relative path of a shipped document.
+ * @returns {string} Its text.
+ * @throws {Error} When the file cannot be read.
+ */
+const read = (file) => fs.readFileSync(path.join(root, file), 'utf8')
+
+describe('Share guide API boundaries', () => {
+  const guides = ['docs/ShareConsumer.md', 'docs/MigrationGuide-3-0-0.md']
+
+  test.each([
+    [
+      'documents the absence of a synchronous flush operation',
+      'There is no callable synchronous flush-and-wait',
+    ],
+    ['documents retained names after stop', 'stop retains the subscribed names'],
+    ['documents the stopped replacement sequence', 'use stop → subscribe → run to replace them'],
+    [
+      'documents the limit of the stopped replacement sequence',
+      'This sequence does not preserve running-replacement semantics.',
+    ],
+  ])('%s in both guides', (title, sentence) => {
+    for (const file of guides) expect(read(file)).toContain(sentence)
+  })
+
+  test('documents exact offset reset composition in both guides', () => {
+    for (const file of ['docs/ShareConsumer.md', 'docs/Admin.md']) {
+      const text = read(file)
+      for (const word of [
+        'fetchTopicOffsets',
+        'fetchTopicOffsetsByTimestamp',
+        'alterShareGroupOffsets',
+        'earliest',
+        'latest',
+        '1700000000000',
+        '9223372036854775807n',
+        'per-partition errors',
+        'not a new admin method',
+      ]) {
+        expect(text).toContain(word)
+      }
+    }
+  })
+
+  test('documents compact terminal outcomes and nonterminal renewal', () => {
+    const text = read('docs/ShareConsumer.md')
+    for (const phrase of [
+      "`type: 'renew'`",
+      'is nonterminal',
+      'subsets are disjoint',
+      'each terminal offset is reported once',
+      'remote outcome unknown',
+      'missing partition',
+    ]) {
+      expect(text).toContain(phrase)
+    }
+    expect(read('docs/MigrationGuide-3-0-0.md')).toContain('renew results are nonterminal')
+  })
+
+  test('documents event instrumentation without offering share spans', () => {
+    const guide = read('docs/ShareConsumer.md')
+    const sentence =
+      'ShareConsumer emits instrumentation events and diagnostics channels; this package does not create share-consumer spans.'
+    expect(guide).toContain(sentence)
+    expect(read('otel/README.md')).toContain(sentence)
+    expect(guide).toContain('43 ordinary channels and 18 share channels')
+    expect(guide).toContain('no built-in metrics registry')
+    expect(guide).toContain(
+      'Client instance identity and metric subscription APIs are separate telemetry work'
+    )
+  })
+
+  test('documents the additive public surface and test doubles', () => {
+    const guide = read('docs/ShareConsumer.md')
+    for (const name of [
+      'KafkaJSShareGroupsNotSupportedError',
+      'KafkaJSShareAcknowledgementError',
+      'acquisitionLockTimeoutMs',
+      'assignment',
+      'subscription',
+      'events',
+    ]) {
+      expect(guide).toContain(name)
+    }
+    for (const file of guides)
+      expect(read(file)).toContain('Hand-written Kafka/Admin test doubles need the added members.')
+  })
+
+  test('names the share consumer in the migration limits', () => {
+    expect(read('docs/MigrationGuide-3-0-0.md')).toContain(
+      'The following limits belong to the share consumer. There is no callable synchronous flush-and-wait'
+    )
+  })
+
+  test('links the public guide with its share broker floor', () => {
+    const readme = read('README.md')
+    expect(readme).toContain('[Share groups (Kafka 4.2+)](docs/ShareConsumer.md)')
+    expect(readme).toContain(
+      'compact acknowledgement outcomes, offset-reset recipes and explicit API boundaries'
+    )
+  })
+})

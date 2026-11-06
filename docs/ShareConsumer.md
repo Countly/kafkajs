@@ -97,4 +97,113 @@ The broker applies isolation for the whole group. ShareFetch sends no client iso
 
 Every name is mirrored at `kafkajs.share_consumer.<name>` on `node:diagnostics_channel`. Node handles an exception from a diagnostics subscriber as an uncaught exception, as for existing clients. No event contains record values or keys. `acknowledge` contains exactly `topic`, `partition`, `firstOffset`, `lastOffset`, `type`, `error`. Its inclusive offsets and error `ranges` remain compact even for a million absent offsets. A null error confirms broker acceptance. A typed failure preserves a reason and, when available, protocol cause. Terminal offsets settle at most once; `renew` events are nonterminal and may repeat. `handler_error` and `lock_expired` offsets refer only to delivered records.
 
-The share-specific administration methods are `describeShareGroups`, `listShareGroupOffsets`, `alterShareGroupOffsets`, and `deleteShareGroupOffsets`; use existing `deleteGroups` to delete an empty share group. Administrative reset recipes, interoperability observations and tested equivalents are documented with their verified examples when available. Telemetry instance IDs and metric-registration extensions are outside this surface.
+## Java API equivalents and boundaries
+
+Use `run({ eachMessage })` or `run({ eachBatch })` for Java's polling role. The promise resolves after the first accepted join; messages arrive through handlers. There is no application `poll()` call. Handler return and the node loop send acknowledgements asynchronously; there is no `commitAsync()` call to trigger or a `commitSync()` call to wait for them. A local `acknowledge()` call records a decision and does not confirm broker acceptance.
+
+| Java `KafkaShareConsumer` | This client |
+|---|---|
+| `subscribe(Collection)`, `subscription()` | `subscribe({ topics })` while stopped; `subscription()` returns a fresh array |
+| `unsubscribe()` | none; `stop()` keeps the names |
+| `poll(Duration)` | `run({ eachMessage })` or `run({ eachBatch })` |
+| `acknowledge(...)` with `ACCEPT`, `RELEASE` or `REJECT` | `acknowledge(type?)` in `eachMessage`; `acknowledge(message \| { offset }, type?)` in `eachBatch` |
+| `AcknowledgeType.RENEW` | `renew()` in the handler payload |
+| `commitSync(...)`, `commitAsync()` | none; sending is automatic and settles through the `acknowledge` event |
+| `setAcknowledgementCommitCallback(...)` | `share.on(share.events.ACKNOWLEDGE, listener)` |
+| `acquisitionLockTimeoutMs()` | `acquisitionLockTimeoutMs()`, `null` until a broker answer carries it |
+| `close()`, `close(Duration)` | `disconnect()`, `disconnect({ timeout })` |
+| `wakeup()` | none; use `stop()` |
+| `metrics()`, `clientInstanceId(Duration)`, metric registration | none on this surface |
+
+There is no callable synchronous flush-and-wait, no clear-subscription method and no subscription replacement while running. stop retains the subscribed names; use stop → subscribe → run to replace them. Automatic acknowledgement sending reports each homogeneous terminal range once; renew results are nonterminal. This sequence does not preserve running-replacement semantics.
+
+For example, outside a handler:
+
+```js
+await share.stop()
+await share.subscribe({ topics: ['replacement-orders'] })
+await share.run({ eachMessage: async ({ message }) => handleOrder(message) })
+```
+
+`stop()` leaves the group and retains the subscription. `subscription()` returns a fresh array; changing it does not change the client. There is no `unsubscribe()` operation that clears names. Running `subscribe()` rejects before changing the stored names or sending a replacement heartbeat. This stopped sequence has a membership gap and cannot promise Java's running subscription replacement semantics. `wakeup()` has no separate role because an application thread is not blocked in `poll()`; use `stop()` to end the asynchronous loop.
+
+## Acknowledgement settlement
+
+```js
+const remove = share.on(share.events.ACKNOWLEDGE, ({ payload }) => {
+  const { topic, partition, firstOffset, lastOffset, type, error } = payload
+  recordAcknowledgement({ topic, partition, firstOffset, lastOffset, type, error })
+})
+```
+
+The payload has exactly `topic`, `partition`, `firstOffset`, `lastOffset`, `type`, `error`. Ranges are inclusive decimal strings; never expand a range into an array or convert offsets to Number. Different outcomes split ranges even when they came from one request. Successful, failed and unconfirmed terminal subsets are disjoint, and each terminal offset is reported once. `error: null` on a terminal acknowledgement confirms the broker result; it is not emitted merely because a handler chose a type. A lost response leaves the remote outcome unknown and must not become success or cause an acknowledgement resend. Renewal reports `type: 'renew'`, is nonterminal and can recur before a terminal decision. A missing partition in an answer is an unconfirmed failure, never inferred success. Invoke the returned `remove()` to stop this listener.
+
+There are 43 ordinary channels and 18 share channels. ShareConsumer emits instrumentation events and diagnostics channels; this package does not create share-consumer spans.
+
+There is no built-in metrics registry or `metrics()` method on this surface. Use the instrumentation events and their diagnostics channels for counters and timing; the event contract supplies observations without creating an OpenTelemetry span. Client instance identity and metric subscription APIs are separate telemetry work; no ShareConsumer telemetry method is added here.
+
+## Administration and resetting offsets
+
+The four share methods are `describeShareGroups`, `listShareGroupOffsets`, `alterShareGroupOffsets`, and `deleteShareGroupOffsets`. See [Admin](Admin.md) for their result shapes, raw authorization masks and per-call deadlines. Use `describeShareGroups` for share membership. `listGroups({ types: ['share'] })` selects share groups and returns lower-case `groupType: 'share'`. The generic `describeGroups` result is broker-defined; use the share-specific method when you need share fields.
+
+Stop every group member before altering offsets. Compose `fetchTopicOffsets` with `alterShareGroupOffsets` for earliest/latest, or `fetchTopicOffsetsByTimestamp` with `alterShareGroupOffsets` for a timestamp. The existing timestamp lookup falls back to the partition's latest offset when the requested timestamp has no match. Offsets remain decimal strings, including values above Number.MAX_SAFE_INTEGER. This is an application recipe, not a new admin method, seek operation or atomic reset across calls. A member can rejoin between inspection and mutation; the broker's refusal remains authoritative. Group errors reject; inspect per-partition errors before treating a reset as successful. Do not automatically retry an unanswered mutation to infer its outcome.
+
+```js
+/**
+ * Resets one empty share group's selected topic using exact broker offsets.
+ * Stop all its members before calling; the broker enforces emptiness at mutation time.
+ * Each public call has its own admin deadline; this sequence is not atomic.
+ * @param {import('@countly/kafkajs').Admin} admin Connected admin client.
+ * @param {string} groupId Empty share group identifier.
+ * @param {string} topic Topic name.
+ * @param {'earliest'|'latest'|number} position Boundary or nonnegative epoch milliseconds.
+ * @returns {Promise<import('@countly/kafkajs').ShareGroupAlterOffsetsResult[]>} Per-partition results.
+ * @throws {Error} For invalid input, nonempty/missing group, invalid lookup or broker failure.
+ */
+async function resetShareOffsets(admin, groupId, topic, position) {
+  if (position !== 'earliest' && position !== 'latest' &&
+      (!Number.isSafeInteger(position) || position < 0)) {
+    throw new Error('Use earliest, latest or nonnegative epoch milliseconds')
+  }
+  const { groups } = await admin.describeShareGroups([groupId])
+  if (groups.length !== 1 || groups[0].groupId !== groupId ||
+      groups[0].errorCode !== 0 || groups[0].members.length !== 0) {
+    throw new Error('The share group must exist and have no members')
+  }
+  const rows = typeof position === 'number'
+    ? await admin.fetchTopicOffsetsByTimestamp(topic, position)
+    : await admin.fetchTopicOffsets(topic)
+  const partitions = rows.map((row) => {
+    const offset = position === 'earliest' ? row.low :
+      position === 'latest' ? row.high : row.offset
+    if (typeof offset !== 'string' || !/^(0|[1-9][0-9]*)$/.test(offset) ||
+        BigInt(offset) > 9223372036854775807n) {
+      throw new Error('The offset lookup must return a nonnegative signed int64 string')
+    }
+    return { partition: row.partition, offset }
+  })
+  if (partitions.length === 0) throw new Error('The lookup returned no partitions')
+  const results = await admin.alterShareGroupOffsets({
+    groupId,
+    topics: [{ topic, partitions }],
+  })
+  for (const result of results) {
+    for (const partition of result.partitions) {
+      if (partition.errorCode !== 0) {
+        throw partition.error || new Error('The broker refused a partition reset')
+      }
+    }
+  }
+  return results
+}
+
+await resetShareOffsets(admin, 'orders-workers', 'orders', 'earliest')
+await resetShareOffsets(admin, 'orders-workers', 'orders', 'latest')
+await resetShareOffsets(admin, 'orders-workers', 'orders', 1700000000000)
+```
+
+Use `deleteGroups(['orders-workers'])` for an empty share group; no `deleteShareGroups` alias is added. A group with an active member cannot be treated as successfully deleted. `deleteShareGroupOffsets` instead deletes stored offsets for topics to which the group is no longer subscribed. Neither operation is an unsubscribe or a reset of an active member.
+
+## Public surface and test doubles
+
+`ShareConsumer` has `connect`, `disconnect`, `subscribe`, `subscription`, `assignment`, `run`, `stop`, `acquisitionLockTimeoutMs`, `on`, `logger`, and the `events` property. `ShareConsumer` is a TypeScript type and a factory-created client, not a named runtime constructor export. The root CommonJS and ESM packages export `KafkaJSShareGroupsNotSupportedError` and `KafkaJSShareAcknowledgementError`. Hand-written Kafka/Admin test doubles need the added members. Existing ordinary consumer methods, options and event contracts continue to apply to `consumer()`.
