@@ -101,12 +101,15 @@ describe('deterministic internal walk benchmark controls', () => {
 
 describe('benchmark memory reporting and gates', () => {
   const usage = (heapUsed, arrayBuffers) => ({ heapUsed, arrayBuffers })
+  let gc
   beforeEach(() => {
-    delete global.gc
+    gc = global.gc
+    // An own value masks the VM's exposed collector even when another spec enabled it.
+    global.gc = undefined
   })
   afterEach(() => {
     jest.restoreAllMocks()
-    delete global.gc
+    global.gc = gc
   })
   test('requires an explicit garbage collector', () => {
     expect(() => observe(generate(1000), ShareRecordWalk.walk)).toThrow(

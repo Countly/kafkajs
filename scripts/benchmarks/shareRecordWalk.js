@@ -100,13 +100,13 @@ const expansionControl = (input) => {
  * @param {object} output Arm result; arm-reported counters are never evidence.
  * @param {object} input Generator's independent expected identities/counts.
  * @returns {void} Rejects skipped, omitted, duplicate, misaligned or fabricated work before baseline admission.
- * @throws {AssertionError} For any semantic mismatch.
+ * @throws {AssertionError} For any semantic mismatch; named rejection reasons have exact messages.
  */
 const verify = (output, input) => {
   const { records, deliveryCounts } = output.deliver
   assert(Array.isArray(records), 'delivered records must be an array')
   assert(deliveryCounts instanceof Uint16Array, 'delivery counts must be a Uint16Array')
-  assert.equal(deliveryCounts.length, records.length, 'delivery arrays are misaligned')
+  assert.ok(deliveryCounts.length === records.length, 'delivery arrays are misaligned')
   assert(
     deliveryCounts.byteOffset === 0 &&
       deliveryCounts.buffer.byteLength === deliveryCounts.byteLength,
@@ -116,16 +116,15 @@ const verify = (output, input) => {
   records.forEach((record, i) => {
     const expected = input.expected.get(record.offset)
     assert(expected, 'delivered offset was not generated')
-    assert.equal(record, expected.record, 'delivered record is not the original')
-    assert.equal(
-      deliveryCounts[i],
-      expected.deliveryCount,
+    assert.ok(record === expected.record, 'delivered record is not the original')
+    assert.ok(
+      deliveryCounts[i] === expected.deliveryCount,
       'delivery count does not match its record'
     )
     assert(!actual.has(record.offset), 'delivered offset repeated')
     actual.add(record.offset)
   })
-  assert.equal(actual.size, input.delivered, 'delivered offsets differ from the generated corpus')
+  assert.ok(actual.size === input.delivered, 'delivered offsets differ from the generated corpus')
   let gapCount = 0n
   let prior = -1n
   for (const range of output.gaps) {
