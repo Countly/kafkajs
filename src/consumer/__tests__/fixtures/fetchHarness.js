@@ -384,6 +384,7 @@ const decodeOffsetForLeaderEpochRequests = (writes) =>
  * Builds a real `Broker` wired to a real `Connection` over the fake socket from `testHelpers`.
  * `answer` receives each outgoing request's header and returns the response body to play back;
  * each response is framed with the header version that request's api key and version imply.
+ * Setup gets two minutes to tolerate coverage runner delays; Jest still bounds a hung test.
  * @param {(header: { apiKey: number, apiVersion: number }) => Buffer} answer
  * @param {(frame: Buffer, header: object) => Buffer[]} [chunks] complete-frame transport chunks
  * @returns {{ broker: Broker, state: { writes: Buffer[] } }}
@@ -396,7 +397,7 @@ const createFakeBroker = (answer, chunks) => {
     logger: newLogger(),
     socketFactory: factory,
     clientId: 'test-client',
-    connectionTimeout: 1000,
+    connectionTimeout: 120000,
     requestTimeout: 1000,
     connectionsMaxIdle: 0,
     enforceRequestTimeout: false,
@@ -430,7 +431,7 @@ const createFakeBroker = (answer, chunks) => {
     port: 9092,
     sasl: null,
     generation: 0,
-    connectionTimeout: 1000,
+    connectionTimeout: 120000,
     isConnected: () => connection.isConnected(),
     throwIfRetired: () => {},
     isAuthenticated: () => true,

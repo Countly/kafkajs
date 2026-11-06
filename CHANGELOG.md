@@ -110,6 +110,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Tooling
 
+- The fake-socket test harnesses (`groupApiHarness`, `clusterApiHarness`, `fetchHarness`, `offsetsOnTheWire` and the scripted cluster's default client options) give connection setup 120 s instead of 1 s, so a slow coverage runner cannot expire a setup the fake socket completes; Jest's test timeout still bounds a hang, and timeout specs set their own value. No library behaviour changed.
 - Compose variants for delegation tokens, two log directories and tiered storage; the admin ledger table.
 
 - The exit gate runs the GSSAPI, TLS negative, OAuth helper, idle-reaping and admin live arms (ledger, lifecycle, quota, delegation tokens, log directories, tiered storage) as jobs of their own. A gate check can name its broker release with `kafkaVersion`. The admin live scenarios and the GSSAPI KDC fixture use the job's Compose cluster when no cluster guard is configured, and the base Compose cluster exposes broker JMX on a container-local port for the quota scenario's byte counter.
