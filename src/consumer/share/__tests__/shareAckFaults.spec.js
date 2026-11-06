@@ -11,7 +11,6 @@ const {
   until,
 } = require('../../../../testHelpers/shareHarness')
 const ConnectionPool = require('../../../network/connectionPool')
-const RequestQueue = require('../../../network/requestQueue')
 const { requests } = require('../../../protocol/requests')
 const { readRequestHeader } = require('../../../../testHelpers/fakeSocket')
 
@@ -5515,6 +5514,7 @@ class AcknowledgementFaultCase extends DataFaultCase {
       this.release(A1_H)
     }
     await until(() => this.pending.reached(), `the ${this.boundary} boundary`)
+    if (this.boundary === 'queue') this.pending.assertPending()
     if (this.capOnly)
       await until(
         () =>
@@ -5536,6 +5536,7 @@ class AcknowledgementFaultCase extends DataFaultCase {
    * @returns {{reached: () => boolean, release: () => void}} The hold.
    */
   boundaryHold(boundary, apiKey, epoch) {
+    if (boundary === 'queue') return this.holdQueuedRequest(apiKey, 'node1:9092')
     let reached = false
     if (boundary === 'response') {
       const wire = this.holdFrame(
@@ -5601,20 +5602,6 @@ class AcknowledgementFaultCase extends DataFaultCase {
           }
         }
       })
-    } else {
-      const owner = this
-      const original = RequestQueue.prototype.sendSocketRequest
-      jest
-        .spyOn(RequestQueue.prototype, 'sendSocketRequest')
-        .mockImplementation(function (request) {
-          if (request.entry.apiKey !== apiKey || this.broker !== 'node1:9092' || !take())
-            return original.call(this, request)
-          owner.observe(
-            gate.promise.then(() => original.call(this, request)),
-            'queue transmission'
-          )
-          return undefined
-        })
     }
     this.heldGates.push({ identity: `boundary:${boundary}`, gate })
     return { reached: () => reached, release: () => gate.resolve() }
@@ -5657,9 +5644,16 @@ class AcknowledgementFaultCase extends DataFaultCase {
     assert.equal(this.steadyAtHold - this.framesBefore, historical, 'historical frames at the hold')
     assert.equal(this.rawAckWrites(), this.countFrames(), 'original socket writes at the hold')
     const results = this.seen.acks.length
+    const cancelled = !this.captured || this.row.step === 'captured revoked'
+    if (this.boundary === 'queue') {
+      if (cancelled) this.pending.assertFinished({ attempts: 0, writes: 0 })
+      else this.pending.assertPending()
+    }
     this.pending.release()
     if (this.captured) await until(() => this.closing.settled, 'the captured close settles')
     else await flush()
+    if (this.boundary === 'queue')
+      this.pending.assertFinished({ attempts: cancelled ? 0 : 1, writes: expected.writes })
     assert.equal(this.countFrames() - this.framesBefore, expected.writes, 'permitted total writes')
     assert.equal(this.rawAckWrites(), this.countFrames(), 'original socket writes after release')
     const finals = this.finals().filter(({ node }) => node === 1).length

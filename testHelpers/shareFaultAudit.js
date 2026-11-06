@@ -4,6 +4,7 @@ const { performance: realClock } = require('node:perf_hooks')
 const realNow = realClock.now.bind(realClock)
 const Broker = require('../src/broker')
 const Connection = require('../src/network/connection')
+const RequestQueue = require('../src/network/requestQueue')
 const { ConsumerOperation } = require('../src/consumer/groupProtocol/interface')
 const { ShareRun } = require('../src/consumer/share/shareRun')
 const { ShareHandlerCall } = require('../src/consumer/share/shareHandlerCall')
@@ -1116,6 +1117,105 @@ class FaultCase {
     return this.cluster.requests().filter(({ api }) => api === 'FindCoordinator').length
   }
 
+  /**
+   * Holds one original request in its connection's real pending queue until release. All queue,
+   * transmission, cancellation and guard methods still execute their original implementations.
+   * @param {number} apiKey The API to enqueue.
+   * @param {string} broker The original connection address.
+   * @returns {object} Arrival, release and original-request ownership assertions.
+   */
+  holdQueuedRequest(apiKey, broker) {
+    const owner = this
+    const gate = deferred()
+    let queue = null
+    let request = null
+    let enqueued = false
+    let released = false
+    let attempts = 0
+    let rejections = 0
+    const push = RequestQueue.prototype.push
+    const create = RequestQueue.prototype.createSocketRequest
+    const canSend = RequestQueue.prototype.canSendSocketRequestImmediately
+    const send = RequestQueue.prototype.sendSocketRequest
+    jest
+      .spyOn(RequestQueue.prototype, 'canSendSocketRequestImmediately')
+      .mockImplementation(function () {
+        return this === queue && !released ? false : canSend.call(this)
+      })
+    jest.spyOn(RequestQueue.prototype, 'sendSocketRequest').mockImplementation(function (held) {
+      if (this === queue && held === request) attempts++
+      return send.call(this, held)
+    })
+    jest.spyOn(RequestQueue.prototype, 'createSocketRequest').mockImplementation(function (pushed) {
+      const created = create.call(this, pushed)
+      if (this === queue && request === null) {
+        request = created
+        const rejected = request.rejected
+        jest.spyOn(request, 'rejected').mockImplementation(function (error) {
+          rejections++
+          return rejected.call(this, error)
+        })
+      }
+      return created
+    })
+    const hold = {
+      reached: () => enqueued,
+      release: () => gate.resolve(),
+      /** @returns {void} The original request still owns exactly one pending slot. */
+      assertPending() {
+        assert(request, 'the original request was enqueued')
+        assert.equal(queue.pending.length, 1, 'exactly one pending request')
+        assert.equal(queue.pending[0], request, 'the original request owns the pending slot')
+        assert.equal(queue.inflight.has(request.correlationId), false, 'no in-flight ownership')
+        assert.equal(request.sentAt, null, 'the queued request has not been written')
+        assert.equal(attempts, 0, 'no transmission before release')
+        assert.equal(rejections, 0, 'the queued request is still live')
+      },
+      /**
+       * @param {object} expected Literal original transmission-attempt and write counts.
+       * @returns {void} The original request left the queue and settled exactly once.
+       */
+      assertFinished(expected) {
+        assert(request, 'the original request was enqueued')
+        assert.equal(queue.pending.includes(request), false, 'pending ownership was removed')
+        assert.equal(queue.inflight.has(request.correlationId), false, 'no in-flight ownership')
+        assert.equal(attempts, expected.attempts, 'original transmission attempts')
+        assert.equal(Number(request.sentAt !== null), expected.writes, 'original request writes')
+        assert.equal(rejections, expected.writes === 0 ? 1 : 0, 'original request rejection count')
+        if (expected.attempts === 0) {
+          assert.equal(queue.pending.length, 0, 'cancellation emptied the original queue')
+          assert.equal(queue.throttleCheckTimeoutId, null, 'cancellation cleared the queue wake')
+        }
+      },
+    }
+    jest.spyOn(RequestQueue.prototype, 'push').mockImplementation(function (pushed) {
+      if (queue || pushed.entry.apiKey !== apiKey || this.broker !== broker)
+        return push.call(this, pushed)
+      queue = this
+      const connection = [...owner.observer.connections].find((c) => c.requestQueue === queue)
+      assert(connection, 'the selected queue belongs to an original observed connection')
+      assert.equal(connection.broker, broker)
+      assert.equal(queue.pending.length, 0, 'the selected queue starts empty')
+      const result = push.call(this, pushed)
+      assert(request, 'the original push created the socket request')
+      assert.equal(request.correlationId, pushed.entry.correlationId)
+      assert.equal(request.entry.apiKey, apiKey)
+      assert.equal(request.guard, pushed.guard, 'the original transmission guard')
+      hold.assertPending()
+      enqueued = true
+      return result
+    })
+    this.observe(
+      gate.promise.then(() => {
+        released = true
+        queue?.checkPendingRequests()
+      }),
+      'queue release'
+    )
+    this.heldGates.push({ identity: 'queue', gate })
+    return hold
+  }
+
   /** @returns {string} A compact transcript of every share and heartbeat frame for failures. */
   transcript() {
     return JSON.stringify(
@@ -1254,7 +1354,7 @@ class FaultCase {
           ...batch,
         }))
       )
-      const canonical = (rows) => rows.map((row) => JSON.stringify(row)).sort()
+      const canonical = (rows) => rows.map(canonicalJson).sort()
       assert.deepEqual(
         canonical(mutationsOf(record.fields)),
         canonical(expected),

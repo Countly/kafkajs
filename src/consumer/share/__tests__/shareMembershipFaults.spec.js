@@ -7,7 +7,6 @@ const {
   until,
 } = require('../../../../testHelpers/shareHarness')
 const ConnectionPool = require('../../../network/connectionPool')
-const RequestQueue = require('../../../network/requestQueue')
 const Broker = require('../../../broker')
 const { shareFetchV2 } = require('../../../../testHelpers/wire/expected')
 const { requests } = require('../../../protocol/requests')
@@ -3466,6 +3465,7 @@ class MembershipFaultCase extends FaultCase {
     await this.pump(50)
     await until(() => this.pending.reached(), `the ${this.boundary} boundary`)
     await flush()
+    if (this.boundary === 'queue') this.pending.assertPending()
     if (this.row.step === 'fence') {
       this.supersession = 'fence'
       this.h.cluster.answer('ShareFetch', (fields) =>
@@ -3493,6 +3493,7 @@ class MembershipFaultCase extends FaultCase {
    * @returns {{reached: () => boolean, release: () => void}} The hold.
    */
   installBoundary(boundary) {
+    if (boundary === 'queue') return this.holdQueuedRequest(76, 'node0:9092')
     let reached = false
     if (boundary === 'response') {
       const wire = this.holdWire({ api: 'ShareGroupHeartbeat', match: STEADY })
@@ -3545,19 +3546,6 @@ class MembershipFaultCase extends FaultCase {
           }
         }
       })
-    } else {
-      const original = RequestQueue.prototype.sendSocketRequest
-      const scenario = this
-      jest
-        .spyOn(RequestQueue.prototype, 'sendSocketRequest')
-        .mockImplementation(function (request) {
-          if (request.entry.apiKey !== 76 || !take()) return original.call(this, request)
-          scenario.observe(
-            gate.promise.then(() => original.call(this, request)),
-            'held transmission'
-          )
-          return undefined
-        })
     }
     this.heldGates.push({ identity: `boundary:${boundary}`, gate })
     return { reached: () => reached, release: () => gate.resolve() }
@@ -3566,8 +3554,15 @@ class MembershipFaultCase extends FaultCase {
   /** @returns {Promise<void>} Write-boundary cells: old frames, closing frames, late effects. */
   async verify_guard() {
     const { expected } = this.row
+    const cancelled = this.row.step === 'disconnect zero'
+    if (this.boundary === 'queue') {
+      if (cancelled) this.pending.assertFinished({ attempts: 0, writes: 0 })
+      else this.pending.assertPending()
+    }
     this.pending.release()
     await flush()
+    if (this.boundary === 'queue')
+      this.pending.assertFinished({ attempts: cancelled ? 0 : 1, writes: 0 })
     assert.equal(
       this.steadyFrames() - this.steadyBefore,
       expected.oldWrites,
