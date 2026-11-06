@@ -25,6 +25,8 @@ Share session and node-loop tests check serialized request epochs, piggybacked a
 
 Share consumer tests check factory validation, first-join readiness, implicit and explicit handler decisions, handler-driven renewal and fresh subscription/assignment snapshots. Scripted socket cases hold ordinary and captured-final work at connect, encode, queue and response boundaries. Actual-clock deadlines, parallel-handler poll expiry, crash/restart supervision and listener failures have separate assertions. Compact range results stay compact through real acknowledgement bytes, events and errors. The guide and tarball guard check group-level isolation and inclusion of the public share guide. Broker regressions and throughput measurements run through the reserved controller guard; later share live scenarios supply the named broker proofs.
 
+The share fault matrices run without a broker in `shareMembershipFaults.spec.js`, `shareSessionFaults.spec.js` and `shareAckFaults.spec.js`. Their literal fault, phase and expected-outcome tables drive the public share consumer through the scripted cluster. Each case checks record identities, current and captured closing authority, replacement progress, compact acknowledgement outcomes and resource cleanup. These seam cases supplement the real-cluster session and shutdown scenarios; an unanswered mutation is never reported as broker-accepted.
+
 ## Integration tests
 
 Most of the test suite talks to a real Kafka cluster. `npm test` runs `npm run lint`, `npm run compat:check` and `npm run protocol:check`, boots the cluster, runs everything, and tears the cluster down again — it's a convenient local shortcut, but it is not what CI runs.
