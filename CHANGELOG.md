@@ -33,6 +33,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Fixes
 
+- A failed share heartbeat preserves the healthy data socket and its acquisitions while the coordinator reconnects.
+
 - Prepared share renewals retain their own compact acknowledgement error when a routing change or shutdown retires their wait; callers retired before preparing a ticket receive a local refusal.
 
 - Share-consumer closes honor a disconnect deadline supplied during a stop and detach captured sockets when their shared close budget expires.

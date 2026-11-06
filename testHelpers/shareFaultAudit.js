@@ -15,6 +15,13 @@ const { createResourceProbe } = require('./resourceProbe')
 const javaRecord = require('./wire/expected').shareFetchV2
 const errors = require('../src/errors')
 const observation = new AsyncLocalStorage()
+const requestReaders = new Map(
+  [
+    require('./wire/shareGroupHeartbeatV1'),
+    require('./wire/shareFetchV2'),
+    require('./wire/shareAcknowledgeV2'),
+  ].map((pair) => [pair.apiKey, pair])
+)
 const {
   acquired,
   deferred,
@@ -363,6 +370,7 @@ class FaultCapture {
 
   /**
    * Wraps one method without suppressing its result or failure; nested observers restore in LIFO order.
+   * An explicitly watched instance remains owned across continuations outside the async context.
    * @param {object} target Original prototype.
    * @param {string} name Method name.
    * @param {Function} observe Receives original receiver, arguments and a call-through thunk.
@@ -376,6 +384,7 @@ class FaultCapture {
       const next = () => original.apply(this, args)
       const context = observation.getStore()
       const owned =
+        target === this ||
         this === capture.runner ||
         capture.runs.has(this) ||
         capture.loops.has(this) ||
@@ -580,6 +589,24 @@ class FaultCapture {
     })
     this.watch(Connection.prototype, 'send', (connection, args, next) => {
       this.connections.add(connection)
+      const { wire } = observation.getStore()
+      const request = args[0].request
+      if (wire && requestReaders.has(request.apiKey)) {
+        const encode = request.encode
+        args[0] = {
+          ...args[0],
+          request: {
+            ...request,
+            encode: async () => {
+              const encoded = await encode.call(request)
+              wire.fields = requestReaders
+                .get(request.apiKey)
+                .readRequest(Buffer.from(encoded.buffer))
+              return encoded
+            },
+          },
+        }
+      }
       const socket = connection.socket
       if (socket && !this.sockets.has(socket)) {
         this.sockets.set(
@@ -601,6 +628,7 @@ class FaultCapture {
           ...observation.getStore(),
           pool,
           connection: pool.pool[pool.connectionIndexFor(apiKey)],
+          wire: {},
         }
         const guard = options?.guard
         assert.equal(typeof guard, 'function', 'share write must retain its original guard')
@@ -613,7 +641,7 @@ class FaultCapture {
             return refused
           },
         }
-        return next()
+        return observation.run(issued, next)
       })
     }
   }
@@ -651,16 +679,18 @@ class FaultCapture {
   }
 
   /**
-   * Records authority at the original transmission guard, immediately before socket.write.
+   * Records authority at the original transmission guard, immediately before socket.write,
+   * alongside every field independently decoded from that request's original encoded body.
    * @param {object} broker Original Broker.
    * @param {number} apiKey Original API.
    * @param {object} fields Original request fields.
-   * @param {object} issued Original issuance context captured before the first await.
+   * @param {object} issued Original issuance context and independently read encoded request.
    * @returns {void}
    * @throws {AssertionError} For a write without its original provider context.
    */
   write(broker, apiKey, fields, issued) {
     const { run, loop, open, membership, prepared = [] } = issued
+    assert(issued.wire.fields, 'the original request body was independently captured')
     const episode = issued.episode ?? (issued.exchange?.kind === 'final' ? issued.exchange : null)
     assert(run && this.runs.has(run), 'uncaptured run')
     const closing = fields.shareSessionEpoch === -1 || fields.memberEpoch === -1
@@ -674,8 +704,11 @@ class FaultCapture {
           loop.finishing &&
           loop.session.refusal(open) === null)
       : membership === run.membership.token &&
-        run.ordinaryRefusal(membership) === null &&
-        (!loop || (open === loop.session.token && loop.session.refusal(open) === null))
+        (apiKey === 76
+          ? !run.retired && !run.membership.closed && run.membership.state !== 'FATAL'
+          : run.ordinaryRefusal(membership) === null &&
+            open === loop.session.token &&
+            loop.session.refusal(open) === null)
     const authority = {
       allowed,
       run,
@@ -688,7 +721,7 @@ class FaultCapture {
     }
     this.writes.push({
       apiKey,
-      fields: structuredClone(fields),
+      fields: issued.wire.fields,
       authority,
       broker,
       pool,
@@ -1139,16 +1172,40 @@ class FaultCase {
   }
 
   /**
+   * Finds a schedule gate's copied call in the independently recorded transmission sequence.
+   * @param {object} record The original request or its schedule copy.
+   * @returns {number} Its exact node/socket/correlation index.
+   * @throws {AssertionError} If the request was not written.
+   */
+  wireIndex(record) {
+    const index = this.frames(76, 78, 79).findIndex(
+      (candidate) =>
+        candidate.node === record.node &&
+        candidate.generation === record.generation &&
+        candidate.correlationId === record.correlationId &&
+        candidate.apiKey === record.apiKey
+    )
+    assert(index >= 0, 'original wire record')
+    return index
+  }
+
+  /**
    * Ends the armed frame with a typed transport failure: a peer end on its own socket, or the
    * request timeout of the fake clock. The held answer is released late and must change nothing.
    * @param {'disconnect'|'timeout'} kind The failure.
-   * @param {number} [requestTimeout=1000] The configured request timeout in fake milliseconds.
    * @returns {Promise<object>} The frame that was disturbed.
    */
-  async fireTransport(kind, requestTimeout = 1000) {
+  async fireTransport(kind) {
     const call = await this.arrival(this.transportGate)
     if (kind === 'disconnect') this.socketFor(call).emit('end')
-    else await this.pump(requestTimeout + 1)
+    else {
+      const captured = this.observer.writes[this.wireIndex(call)]
+      const queue = captured.connection.requestQueue
+      const request = queue.inflight.get(call.correlationId)
+      assert(request, 'the original request is awaiting its timeout')
+      const remaining = request.sentAt + request.requestTimeout - Date.now()
+      await this.pump(Math.max(0, remaining) + Math.min(queue.requestTimeout, 100) + 1)
+    }
     await flush()
     return call
   }
@@ -1188,18 +1245,7 @@ class FaultCase {
       const captured = this.observer.writes[i]
       assert.equal(record.apiKey, captured.apiKey)
       assert.equal(this.socketFor(record), captured.socket, 'original socket ordinal')
-      for (const key of [
-        'groupId',
-        'memberId',
-        'memberEpoch',
-        'shareSessionEpoch',
-        'topics',
-        'forgottenTopicsData',
-        'isRenewAck',
-      ]) {
-        if (captured.fields[key] !== undefined)
-          assert.deepEqual(record.fields[key], captured.fields[key], key)
-      }
+      assert.deepEqual(record.fields, captured.fields, 'complete encoded request fields')
       audit.frame(record, captured.authority)
       const expected = captured.prepared.flatMap(({ row, ticket }) =>
         ticket.acknowledgementBatches.map((batch) => ({
@@ -1239,7 +1285,7 @@ class FaultCase {
   }
 
   /**
-   * Compares complete row-owned literal sets, retaining duplicates and wire/publication order.
+   * Compares complete row-owned literal multisets, retaining duplicates and every field.
    * @param {object} expected Literal handlers, mutations and settlements arrays supplied by a row.
    * @returns {void}
    * @throws {AssertionError} For any missing or extra identity/range, byte, count or outcome.

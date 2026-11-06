@@ -2945,7 +2945,6 @@ const rows = [
         [IDS.A, 0, J, J, [2]],
         [IDS.A, 0, H, J, [1]],
         [IDS.A, 1, H, H, [1]],
-        [IDS.A, 2, H, J, [2]],
       ],
       settlements: [
         [IDS.A, 0, H, H, 'release', 'membership-lost', null],
@@ -2953,7 +2952,7 @@ const rows = [
         [IDS.A, 0, H, J, 'accept', null, null],
         [IDS.A, 1, H, H, 'accept', 'rejected-by-broker', 35],
         [IDS.A, 1, J, J, 'release', 'membership-lost', null],
-        [IDS.A, 2, H, J, 'release', null, null],
+        [IDS.A, 2, H, J, 'release', 'membership-lost', null],
       ],
     },
   },
@@ -2982,7 +2981,6 @@ const rows = [
         [IDS.A, 0, J, J, [2]],
         [IDS.A, 0, H, J, [1]],
         [IDS.A, 1, H, H, [1]],
-        [IDS.A, 2, H, J, [2]],
       ],
       settlements: [
         [IDS.A, 0, H, H, 'release', 'membership-lost', null],
@@ -2990,7 +2988,7 @@ const rows = [
         [IDS.A, 0, H, J, 'accept', null, null],
         [IDS.A, 1, H, H, 'accept', 'rejected-by-broker', 30],
         [IDS.A, 1, J, J, 'release', 'membership-lost', null],
-        [IDS.A, 2, H, J, 'release', null, null],
+        [IDS.A, 2, H, J, 'release', 'membership-lost', null],
       ],
     },
   },
@@ -3590,8 +3588,6 @@ const rows = [
         [IDS.A, 0, J, J, [2]],
         [IDS.A, 0, H, J, [1]],
         [IDS.A, 1, H, H, [4]],
-        [IDS.A, 1, J, J, [2]],
-        [IDS.A, 2, H, J, [2]],
       ],
       settlements: [
         [IDS.A, 0, H, H, 'release', 'membership-lost', null],
@@ -3599,8 +3595,8 @@ const rows = [
         [IDS.A, 0, H, J, 'accept', null, null],
         [IDS.A, 1, H, H, 'renew', 'rejected-by-broker', 35],
         [IDS.A, 1, H, H, 'release', 'membership-lost', null],
-        [IDS.A, 1, J, J, 'release', null, null],
-        [IDS.A, 2, H, J, 'release', null, null],
+        [IDS.A, 1, J, J, 'release', 'membership-lost', null],
+        [IDS.A, 2, H, J, 'release', 'membership-lost', null],
       ],
     },
   },
@@ -3628,8 +3624,6 @@ const rows = [
         [IDS.A, 0, J, J, [2]],
         [IDS.A, 0, H, J, [1]],
         [IDS.A, 1, H, H, [4]],
-        [IDS.A, 1, J, J, [2]],
-        [IDS.A, 2, H, J, [2]],
       ],
       settlements: [
         [IDS.A, 0, H, H, 'release', 'membership-lost', null],
@@ -3637,8 +3631,8 @@ const rows = [
         [IDS.A, 0, H, J, 'accept', null, null],
         [IDS.A, 1, H, H, 'renew', 'rejected-by-broker', 30],
         [IDS.A, 1, H, H, 'release', 'membership-lost', null],
-        [IDS.A, 1, J, J, 'release', null, null],
-        [IDS.A, 2, H, J, 'release', null, null],
+        [IDS.A, 1, J, J, 'release', 'membership-lost', null],
+        [IDS.A, 2, H, J, 'release', 'membership-lost', null],
       ],
     },
   },
@@ -5328,13 +5322,19 @@ class AcknowledgementFaultCase extends DataFaultCase {
     await this.fire(this.gate, this.spec)
   }
 
-  /** @returns {Promise<void>} Kind rows: result, cause, reset, held handler and no resends. */
+  /** @returns {Promise<void>} Kind rows: exact outcomes, busy-node final exclusion and no resends. */
   async verify_kind() {
     const { expected } = this.row
     const fatal = expected.state === 'FATAL'
     if (fatal) {
       await until(() => this.seen.crashes.length === 1, 'the crash event')
       assert.equal(this.seen.crashes[0].restart, false)
+      if (this.kind === 'flush' || this.kind === 'renew')
+        assert.equal(
+          this.finals().filter(({ node }) => node === 1).length,
+          0,
+          'the faulting busy node sends no final'
+        )
       assert(
         expected.cause === 35
           ? this.seen.crashes[0].error.reason === 'refused-by-broker'
@@ -5409,7 +5409,10 @@ class AcknowledgementFaultCase extends DataFaultCase {
     assert(written.length <= 1, 'the acknowledgement of A1/H is written at most once')
   }
 
-  /** @returns {Promise<void>} The revoked A2 records: never started, result per the row. */
+  /**
+   * @returns {Promise<void>} Exact revoked A2 outcomes and permitted writes; a no-resend oracle
+   *   excludes its historical faulting frame, which remains in the complete literal multiset.
+   */
   async verifyRevoked() {
     const { expected } = this.row
     assert.equal(
@@ -5435,13 +5438,18 @@ class AcknowledgementFaultCase extends DataFaultCase {
           assert(codesOf(selected[0].error).includes(expected.cause), 'original revoked cause')
       }
     }
-    const mutations = this.frames(78, 79).flatMap(({ fields }) =>
-      (fields.topics || []).flatMap(({ topicId, partitions }) =>
-        partitions
-          .filter(({ partitionIndex }) => topicId === IDS.A && partitionIndex === 2)
-          .flatMap(({ acknowledgementBatches }) => acknowledgementBatches)
+    const frames = this.frames(76, 78, 79)
+    const relevant =
+      expected.revokedWire === 'none' ? frames.slice(this.wireIndex(this.gate.call) + 1) : frames
+    const mutations = relevant
+      .filter(({ apiKey }) => apiKey !== 76)
+      .flatMap(({ fields }) =>
+        (fields.topics || []).flatMap(({ topicId, partitions }) =>
+          partitions
+            .filter(({ partitionIndex }) => topicId === IDS.A && partitionIndex === 2)
+            .flatMap(({ acknowledgementBatches }) => acknowledgementBatches)
+        )
       )
-    )
     assert.deepEqual(
       mutations,
       expected.revokedWire === 'none'
@@ -5468,7 +5476,10 @@ class AcknowledgementFaultCase extends DataFaultCase {
     await this.advanceUntil(() => this.acceptedBoth(0), 'the current terminal acceptance')
   }
 
-  /** @returns {Promise<void>} Guard rows: an ack frame or captured final held at a write stage. */
+  /**
+   * @returns {Promise<void>} An ack frame or captured final held at a write stage. Cap-only expiry
+   *   rows first confirm the independent node-zero final before withholding deadline timers.
+   */
   async reach_guard() {
     this.enforce = this.row.expected.enforce
     this.boundary = this.row.fault.replace('held acknowledgement ', '')
@@ -5506,6 +5517,12 @@ class AcknowledgementFaultCase extends DataFaultCase {
       this.release(A1_H)
     }
     await until(() => this.pending.reached(), `the ${this.boundary} boundary`)
+    if (this.capOnly)
+      await until(
+        () =>
+          this.terminalFor(0, H).some(({ type, error }) => type === 'release' && error === null),
+        'the independent node-zero final is confirmed before expiry'
+      )
     this.steadyAtHold = this.countFrames()
   }
 

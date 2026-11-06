@@ -5,6 +5,8 @@ const { createScriptedCluster, shareScript } = require('../../../testHelpers/scr
 const { Schedule } = require('../../../testHelpers/schedule')
 const literal = require('../../../testHelpers/wire/expected')
 const { requests } = require('../../protocol/requests')
+const { KafkaJSConnectionClosedError } = require('../../errors')
+const { flush, until } = require('../../../testHelpers/shareHarness')
 
 /** Broker method, API name, API key and the one released version, for the three runtime pairs. */
 const APIS = [
@@ -223,6 +225,40 @@ describe('share broker requests', () => {
       expect(f.cluster.requests().filter((record) => record.api === api)).toHaveLength(0)
     }
   )
+
+  test('keeps the original data socket when a share heartbeat fails and reconnects', async () => {
+    f = await fixture()
+    await f.broker.shareFetch(literal.shareFetchV2.request)
+    const data = f.pool.pool[1]
+    const socket = data.socket
+    const generation = f.pool.generationFor(78)
+    const gate = f.schedule.hold({ api: 'ShareGroupHeartbeat' })
+    const heartbeat = f.broker.shareGroupHeartbeat(literal.shareGroupHeartbeatV1.request)
+    const observed = heartbeat.then(
+      (value) => ({ value }),
+      (error) => ({ error })
+    )
+    try {
+      await until(() => gate.call !== null, 'the written share heartbeat')
+      f.pool.pool[0].socket.emit('end')
+      const { error } = await observed
+      expect(error).toBeInstanceOf(KafkaJSConnectionClosedError)
+      expect(error.message).toBe('Closed connection')
+      await flush()
+      expect(data.socket).toBe(socket)
+      expect(socket.destroyed).toBe(false)
+      expect(f.pool.generationFor(78)).toBe(generation)
+      gate.release()
+      await f.broker.shareGroupHeartbeat(literal.shareGroupHeartbeatV1.request)
+      await f.broker.shareFetch(literal.shareFetchV2.request)
+      expect(data.socket).toBe(socket)
+      expect(f.pool.generationFor(78)).toBe(generation)
+      expect(f.cluster.requests().filter(({ apiKey }) => apiKey === 76)).toHaveLength(2)
+      expect(f.cluster.requests().filter(({ apiKey }) => apiKey === 78)).toHaveLength(2)
+    } finally {
+      if (gate.settle) gate.release()
+    }
+  })
 
   test('refuses a guard invalidated during a data socket reconnect', async () => {
     f = await fixture()

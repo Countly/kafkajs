@@ -144,6 +144,8 @@ class DataFaultCase extends FaultCase {
       if (frame.correlationId === record.correlationId) break
     }
     const topics = new Map()
+    for (const { topicId, partition } of listed(fields))
+      model.set(`${topicId}:${partition}`, { topicId, partition })
     for (const { topicId, partition } of model.values()) {
       if (!topics.has(topicId)) topics.set(topicId, { topicId, partitions: [] })
       topics.get(topicId).partitions.push({ partitionIndex: partition })
@@ -256,24 +258,6 @@ class DataFaultCase extends FaultCase {
     assert.equal(outcome.error.reason, result)
     if (typeof cause === 'number') assert(codesOf(outcome.error).includes(cause), 'cause code')
     return undefined
-  }
-
-  /**
-   * Finds a schedule gate's copied call in the independently recorded transmission sequence.
-   * @param {object} record The original request or its schedule copy.
-   * @returns {number} Its exact node/socket/correlation index.
-   * @throws {AssertionError} If the request was not written.
-   */
-  wireIndex(record) {
-    const index = this.frames(76, 78, 79).findIndex(
-      (candidate) =>
-        candidate.node === record.node &&
-        candidate.generation === record.generation &&
-        candidate.correlationId === record.correlationId &&
-        candidate.apiKey === record.apiKey
-    )
-    assert(index >= 0, 'original wire record')
-    return index
   }
 
   /**
@@ -2901,6 +2885,15 @@ class SessionFaultCase extends DataFaultCase {
     await this.begin({
       expectCalls: 1,
       supplyCounts: step === 'open fetch' ? {} : { 'A:1': 2 },
+      startOptions: {
+        retry: {
+          ...RETRY_250,
+          restartOnFailure: async (error) => {
+            this.restartErrors.push(error)
+            return false
+          },
+        },
+      },
     })
     await this.advanceUntil(() => this.gate.call !== null, 'the partition fault frame')
     if (step === 'incremental fetch') assert.equal(this.calls.length, 7)
@@ -2935,6 +2928,7 @@ class SessionFaultCase extends DataFaultCase {
       await until(() => this.seen.crashes.length === 1, 'the crash event')
       const [crash] = this.seen.crashes
       assert.equal(crash.restart, false)
+      assert.deepEqual(this.restartErrors, [crash.error])
       assert(codesOf(crash.error).includes(expected.cause))
       assert.equal(crash.error.retriable, false)
       if (expected.action === 'fatal protocol')
@@ -3068,7 +3062,7 @@ class SessionFaultCase extends DataFaultCase {
       api: 'ShareGroupHeartbeat',
       match: ({ fields }) => fields.memberEpoch > 0,
     })
-    await this.pump(50)
+    await this.advanceUntil(() => gate.call !== null, 'the steady heartbeat')
     await this.arrival(gate)
     await flush()
     return gate
@@ -3138,7 +3132,7 @@ class SessionFaultCase extends DataFaultCase {
           return this === queue && !released ? false : canSend.call(this)
         })
       jest.spyOn(RequestQueue.prototype, 'push').mockImplementation(function (request) {
-        if (request.entry.apiKey === 78 && this.broker === 'node1:9093' && take()) queue = this
+        if (request.entry.apiKey === 78 && this.broker === 'node1:9092' && take()) queue = this
         return push.call(this, request)
       })
       this.observe(
@@ -3156,8 +3150,8 @@ class SessionFaultCase extends DataFaultCase {
   /** @returns {number} Established-session ShareFetch frames written to node 1. */
   steadyFrames() {
     return this.observer.writes.filter(
-      ({ open, fields, socket }) =>
-        open === this.guardedOpen &&
+      ({ authority, fields, socket }) =>
+        authority.open === this.guardedOpen &&
         fields.shareSessionEpoch > 0 &&
         socket.endpoint.host === 'node1'
     ).length

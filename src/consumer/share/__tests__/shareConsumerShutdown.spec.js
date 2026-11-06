@@ -282,11 +282,16 @@ describe('public share shutdown contract', () => {
   })
 
   test('skips finals for unopened sessions and still leaves', async () => {
+    const clock = new Clock()
+    clock.install()
     await start()
     const gate = h.hold({ api: 'ShareFetch' })
     await h.consumer.run({ eachMessage: async () => {} })
     await gate.arrived()
-    await h.consumer.disconnect({ timeout: 400 })
+    const disconnecting = h.consumer.disconnect({ timeout: 400 })
+    await clock.advance(300)
+    await until(() => leaves().length === 1, 'the leave with an unopened data session')
+    await disconnecting
     gate.release()
     expect(h.frames(79)).toHaveLength(0)
     expect(leaves()).toHaveLength(1)
