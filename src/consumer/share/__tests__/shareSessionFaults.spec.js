@@ -297,6 +297,53 @@ const OBSERVATIONS = {
       ['A', 2, 'HJ', 'accept', null, null],
     ],
   },
+  recreated: {
+    handlers: [
+      ['A', 0, 'HJ'],
+      ['A', 1, 'HJ'],
+      ['A', 2, 'HJ'],
+      ['A', 2, 'HJ'],
+      ['B', 0, 'H'],
+    ],
+    mutations: [
+      ['A', 0, 'HJ', [1]],
+      ['A', 1, 'HJ', [1]],
+      ['A', 2, 'HJ', [1]],
+      ['B', 0, 'H', [1]],
+    ],
+    settlements: [
+      ['A', 0, 'HJ', 'accept', null, null],
+      ['A', 1, 'HJ', 'accept', null, null],
+      ['A', 2, 'HJ', 'accept', null, null],
+      ['A', 2, 'HJ', 'accept', 'session-lost', 103],
+      ['B', 0, 'H', 'accept', null, null],
+    ],
+  },
+  incrementalRecreated: {
+    handlers: [
+      ['A', 0, 'HJ'],
+      ['A', 1, 'HJ'],
+      ['A', 1, 'HJ'],
+      ['A', 2, 'HJ'],
+      ['A', 2, 'HJ'],
+      ['B', 0, 'H'],
+    ],
+    mutations: [
+      ['A', 0, 'HJ', [1]],
+      ['A', 1, 'HJ', [1]],
+      ['A', 1, 'HJ', [1]],
+      ['A', 2, 'HJ', [1]],
+      ['B', 0, 'H', [1]],
+    ],
+    settlements: [
+      ['A', 0, 'HJ', 'accept', null, null],
+      ['A', 1, 'HJ', 'accept', null, null],
+      ['A', 1, 'HJ', 'accept', null, null],
+      ['A', 2, 'HJ', 'accept', null, null],
+      ['A', 2, 'HJ', 'accept', 'session-lost', 103],
+      ['B', 0, 'H', 'accept', null, null],
+    ],
+  },
   empty: { handlers: [], mutations: [], settlements: [] },
   a0: {
     handlers: [['A', 0, 'HJ']],
@@ -1108,7 +1155,7 @@ const ROW_OBSERVATIONS = [
   OBSERVATIONS.accepted,
   OBSERVATIONS.accepted,
   OBSERVATIONS.accepted,
-  OBSERVATIONS.accepted,
+  OBSERVATIONS.recreated,
   OBSERVATIONS.accepted,
   OBSERVATIONS.accepted,
   OBSERVATIONS.accepted,
@@ -1120,7 +1167,7 @@ const ROW_OBSERVATIONS = [
   OBSERVATIONS.incrementalAccepted,
   OBSERVATIONS.incrementalAccepted,
   OBSERVATIONS.incrementalAccepted,
-  OBSERVATIONS.incrementalAccepted,
+  OBSERVATIONS.incrementalRecreated,
   OBSERVATIONS.incrementalAccepted,
   OBSERVATIONS.incrementalAccepted,
   OBSERVATIONS.incrementalAccepted,
@@ -2681,9 +2728,9 @@ class SessionFaultCase extends DataFaultCase {
     this.before = this.frameLog(this.node).length
     this.startedAt = Date.now()
     this.resetsBefore = this.seen.resets.length
-    this.oldCohorts = new Set(
-      this.observer.writes[this.wireIndex(this.gate.call)].prepared.map(({ row }) => row)
-    )
+    const written = this.observer.writes[this.wireIndex(this.gate.call)]
+    this.originalOpen = written.authority.open
+    this.oldCohorts = new Set(written.prepared.map(({ row }) => row))
     if (this.row.expected.action === 'fence') this.supplyOnce('A:0')
     await this.fire(this.gate, this.spec)
     this.faultAt = Date.now()
@@ -2791,7 +2838,8 @@ class SessionFaultCase extends DataFaultCase {
     }
     const next = await this.nextFrameOnNode()
     assert.equal(next.fields.shareSessionEpoch, expected.nextEpoch)
-    assert.equal(expected.sameOpen, true)
+    const written = this.observer.writes[this.wireIndex(next)]
+    assert.equal(written.authority.open === this.originalOpen, expected.sameOpen)
     assert.equal(
       this.frameLog(this.node)
         .slice(this.before)
@@ -2890,12 +2938,13 @@ class SessionFaultCase extends DataFaultCase {
 
   /** @returns {Promise<void>} Partition rows: node 1's frame is answered with a partition error. */
   async reach_partition() {
-    const { step } = this.row
+    const { step, expected } = this.row
+    const reopen = expected.action === 'recreate' && step === 'open fetch'
     this.armBeforeJoin = async () => {
       this.gate = this.holdFrame(
         78,
         ({ node, fields }) =>
-          node === 1 && fields.shareSessionEpoch === (step === 'open fetch' ? 0 : 2)
+          node === 1 && fields.shareSessionEpoch === (step === 'open fetch' && !reopen ? 0 : 2)
       )
     }
     await this.begin({
@@ -2913,6 +2962,24 @@ class SessionFaultCase extends DataFaultCase {
     })
     await this.advanceUntil(() => this.gate.call !== null, 'the partition fault frame')
     if (step === 'incremental fetch') assert.equal(this.calls.length, 7)
+    if (reopen) {
+      assert.equal(this.calls.length, 5)
+      assert(this.acceptedBoth(1) && this.acceptedBoth(2))
+      const old = await this.arrival(this.gate)
+      this.gate.release()
+      await flush()
+      this.gate = this.holdFrame(
+        78,
+        ({ node, fields }) => node === 1 && fields.shareSessionEpoch === 0
+      )
+      this.socketFor(old).emit('end')
+      await this.advanceUntil(() => this.gate.call !== null, 'the reopened partition fault frame')
+      assert.deepEqual(batchesOf(this.gate.call), [])
+      assert.deepEqual(listed(this.gate.call.fields), [
+        { topicId: IDS.A, partition: 1 },
+        { topicId: IDS.A, partition: 2 },
+      ])
+    }
     await this.arrival(this.gate)
   }
 
@@ -2922,6 +2989,10 @@ class SessionFaultCase extends DataFaultCase {
     this.metadataBefore = this.cluster.requests().filter(({ api }) => api === 'Metadata').length
     this.resetsBefore = this.seen.resets.length
     const spec = { partition: this.spec.partition }
+    if (this.row.expected.action === 'recreate') {
+      await this.injectRecreation()
+      return
+    }
     if (this.row.expected.settled) {
       const call = await this.arrival(this.gate)
       const rows = listed(call.fields).map(({ topicId, partition }) =>
@@ -2934,6 +3005,81 @@ class SessionFaultCase extends DataFaultCase {
       return
     }
     await this.fire(this.gate, spec)
+  }
+
+  /**
+   * Holds the actual guarded refresh while A still owns newly decided, unsent work, then serves B
+   * for the same topic name. All helper and cache transitions retain their original implementation.
+   * @returns {Promise<void>}
+   */
+  async injectRecreation() {
+    const written = this.observer.writes[this.wireIndex(this.gate.call)]
+    this.recreatedLoop = [...this.observer.loops.keys()].find(
+      (loop) => loop.session.token === written.authority.open
+    )
+    assert(this.recreatedLoop, 'the original fault session was captured')
+    this.recreatedOpen = written.authority.open
+    this.realCluster = this.recreatedLoop.cluster
+    this.recreations = []
+    this.removers.push(
+      this.h.consumer.on(this.h.consumer.events.TOPIC_RECREATED, ({ payload }) =>
+        this.recreations.push(payload)
+      )
+    )
+    this.observer.watch(this.realCluster, 'refreshMetadata', (receiver, [scope], next) => {
+      const refresh = { scope, settled: false }
+      this.recreationRefresh = refresh
+      return this.observe(
+        Promise.resolve(next()).then((result) => {
+          refresh.settled = true
+          refresh.topicId = receiver.topicId(NAME)
+          return result
+        }),
+        'recreation metadata'
+      )
+    })
+    this.observer.watch(
+      this.realCluster.metadataCache,
+      'update',
+      (cache, [metadata, scope], next) => {
+        this.recreationMetadata = structuredClone(metadata)
+        this.metadataWasCurrent = scope.isCurrent()
+        return next()
+      }
+    )
+    this.metadataGate = this.holdWire({ api: 'Metadata' })
+    this.gate.release(
+      fetchAnswer([
+        part({ topicId: IDS.A, partition: 1, code: 103 }),
+        dataPart(2, { topicId: IDS.A }),
+      ])
+    )
+    await this.arrival(this.metadataGate, 'the original guarded Metadata request')
+    const refresh = this.recreationRefresh
+    assert(refresh, 'the fault started the real Cluster refresh')
+    assert.equal(refresh.scope.fence.session, this.recreatedLoop.session)
+    assert.equal(refresh.scope.fence.guard(), null)
+    assert.equal(refresh.scope.allowLeaderless, true)
+    assert.equal(refresh.settled, false)
+    assert.equal(this.recreatedLoop.session.token, this.recreatedOpen)
+    assert.equal(this.realCluster.topicId(NAME), IDS.A)
+    assert.deepEqual(this.recreations, [])
+    const rows = this.recreatedLoop.cohorts.get(`${IDS.A}:2`)
+    assert.equal(rows.length, 1, 'A owns the successful sibling acquisition before Metadata')
+    this.retiringCohort = rows[0]
+    assert.equal(this.retiringCohort.ledger.size, 2, 'both decided records still owe settlement')
+    assert.equal(this.recreatedLoop.isLive(this.retiringCohort), true)
+    this.h.table.set(NAME, {
+      topicId: IDS.B,
+      partitions: [
+        { leader: 0, epoch: 1 },
+        { leader: 1, epoch: 1 },
+        { leader: 1, epoch: 1 },
+      ],
+    })
+    this.metadataGate.release()
+    await until(() => refresh.settled, 'the accepted guarded Metadata result')
+    await flush()
   }
 
   /** @returns {Promise<void>} Partition rows: move, refresh, retry or fatal, with the sibling intact. */
@@ -2962,7 +3108,9 @@ class SessionFaultCase extends DataFaultCase {
       }
       return
     }
-    if (expected.action === 'move') {
+    if (expected.action === 'recreate') {
+      await this.verifyRecreation()
+    } else if (expected.action === 'move') {
       await this.advanceUntil(
         () =>
           this.frames(78).some(
@@ -2991,6 +3139,46 @@ class SessionFaultCase extends DataFaultCase {
     assert.equal(this.seen.crashes.length, 0)
   }
 
+  /** @returns {Promise<void>} The guarded B result retires A's original unsent acquisition. */
+  async verifyRecreation() {
+    assert(
+      this.cluster.requests().filter(({ api }) => api === 'Metadata').length > this.metadataBefore
+    )
+    assert.equal(this.metadataWasCurrent, true)
+    assert.deepEqual(
+      this.recreationMetadata.topicMetadata.map(({ topic, topicId }) => ({ topic, topicId })),
+      [{ topic: NAME, topicId: IDS.B }]
+    )
+    assert.equal(this.recreationRefresh.topicId, IDS.B)
+    assert.equal(this.realCluster.topicId(NAME), IDS.B)
+    assert.equal(this.realCluster.topicName(IDS.A), undefined)
+    assert.deepEqual(
+      this.recreations.map(({ topic, previousTopicId, topicId }) => ({
+        topic,
+        previousTopicId,
+        topicId,
+      })),
+      [{ topic: NAME, previousTopicId: IDS.A, topicId: IDS.B }]
+    )
+    assert.equal(this.recreatedLoop.isLive(this.retiringCohort), false)
+    assert.equal(this.retiringCohort.ledger.size, 0)
+    const outcomes = this.observer.published.filter(({ cohort }) => cohort === this.retiringCohort)
+    assert.deepEqual(
+      outcomes.map(({ event }) => ({
+        firstOffset: event.firstOffset,
+        lastOffset: event.lastOffset,
+        type: event.type,
+        reason: event.error?.reason,
+        code: event.error?.cause?.code,
+      })),
+      [{ firstOffset: H, lastOffset: J, type: 'accept', reason: 'session-lost', code: 103 }]
+    )
+    await this.advanceUntil(
+      () => this.frameLog(this.row.expected.nextNode).length > this.before,
+      'the next frame after recreation'
+    )
+  }
+
   /** @returns {Promise<void>} Partition rows: the held sibling finishes under current authority. */
   async replacement_partition() {
     if (this.row.expected.action.startsWith('fatal')) {
@@ -3006,7 +3194,67 @@ class SessionFaultCase extends DataFaultCase {
     }
     this.release(A0_H)
     await this.advanceUntil(() => this.acceptedBoth(0), 'the sibling acceptance')
+    if (this.row.expected.action === 'recreate') await this.replaceRecreatedTopic()
     this.releaseAll()
+  }
+
+  /** @returns {Promise<void>} Installs B through a real heartbeat and delivers and accepts B0/H. */
+  async replaceRecreatedTopic() {
+    this.supplyOnce('B:0')
+    const gate = await this.holdBeatSteady()
+    gate.release({
+      errorCode: 0,
+      errorMessage: null,
+      memberId: gate.call.fields.memberId,
+      memberEpoch: gate.call.fields.memberEpoch,
+      heartbeatIntervalMs: 50,
+      assignment: { topicPartitions: [{ topicId: IDS.B, partitions: [0] }] },
+    })
+    await this.advanceUntil(
+      () => this.calls.some(({ identity }) => identity === `B:0@${H}`),
+      'the recreated B acquisition'
+    )
+    await this.advanceUntil(
+      () =>
+        this.observer.published.some(
+          ({ cohort, event }) => cohort.topicId === IDS.B && event.type === 'accept' && !event.error
+        ),
+      'the recreated B acceptance'
+    )
+    assert.equal(this.calls.filter(({ identity }) => identity === `B:0@${H}`).length, 1)
+    await this.advanceUntil(
+      () => this.recreatedLoop.session.model.size === 0,
+      'the old A node final clears its model'
+    )
+    const current = [...this.observer.loops.keys()].find((loop) =>
+      loop.session.model.has(`${IDS.B}:0`)
+    )
+    assert(current, 'B installed in its actual session model')
+    assert.deepEqual([...current.session.model.keys()], [`${IDS.B}:0`])
+    for (const loop of this.observer.loops.keys()) {
+      assert.equal(
+        [...loop.session.model.keys()].some((key) => key.startsWith(IDS.A)),
+        false
+      )
+      assert.equal(
+        [...loop.cohorts.keys()].some((key) => key.startsWith(IDS.A)),
+        false
+      )
+    }
+    const forget = this.frames(78).find(
+      ({ fields }) =>
+        listed(fields).some(({ topicId }) => topicId === IDS.B) &&
+        fields.forgottenTopicsData.some(({ topicId }) => topicId === IDS.A)
+    )
+    assert(forget, 'the B fetch forgets the original A model')
+    assert.deepEqual(forget.fields.forgottenTopicsData, [{ topicId: IDS.A, partitions: [0] }])
+    assert.deepEqual(listed(forget.fields), [{ topicId: IDS.B, partition: 0 }])
+    const writes = this.observer.writes.slice(this.wireIndex(forget))
+    assert.equal(
+      writes.some(({ prepared }) => prepared.some(({ row }) => row === this.retiringCohort)),
+      false,
+      'retired A acknowledgements are never transmitted under B'
+    )
   }
 
   /** @returns {Promise<void>} Mechanics rows: each has its own scenario. */
@@ -3552,12 +3800,10 @@ const MECHANICS = {
         this.stamps.slice(1, 6).map(([epoch]) => epoch),
         expected.epochs
       )
-      const gaps = [2, 3, 4].map((index) => this.stamps[index][1] - this.stamps[index - 1][1])
       assert.deepEqual(
-        [gaps[0] >= 250, gaps[1] >= 250, gaps[2] >= 250].map(Boolean).slice(0, 1),
-        [false].map(() => gaps[0] >= 250)
+        [2, 3, 5].map((index) => this.stamps[index][1] - this.stamps[index - 1][1] >= 250),
+        expected.backoff
       )
-      assert.deepEqual(expected.backoff.length, 3)
       assert.equal(
         this.stamps[2][1] - this.stamps[1][1] < 250,
         true,
