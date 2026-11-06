@@ -324,9 +324,12 @@ class ShareFetchLoop {
    *   after the acknowledgements it carried were settled.
    * @param {(reply: Cohort[]) => Promise<void>} handlers Resolves after every delivered or dropped record.
    * @returns {Promise<object>} The exchange result, after the handlers, the answer's metadata
-   *   effects and the owned pacing delay. A reset or final answer skips the handlers.
-   * @throws {Error} The original request, handler or operation failure; a session that reset or
-   *   retired while handlers ran rejects with its "no longer current" refusal.
+   *   effects and the owned pacing delay. A reset or final answer skips the handlers. When a data
+   *   session reset or its socket was lost while the handlers ran, the old open's effects are
+   *   discarded and the round still ends with its pacing delay, so the next round reopens.
+   * @throws {Error} The original request, handler or operation failure; a node whose operation was
+   *   retired, a closed or retired session, or an open that ended before the handlers started
+   *   rejects with its "no longer current" refusal.
    */
   round(fetch, handlers) {
     if (this.running) return this.running
@@ -338,8 +341,8 @@ class ShareFetchLoop {
         if (refused) throw refused
         await handlers(result.reply)
         const afterHandlers = this.session.refusal(token)
-        if (afterHandlers) throw afterHandlers
-        await this.runEffects(result, token)
+        if (!afterHandlers) await this.runEffects(result, token)
+        else if (!this.reopenable(token)) throw afterHandlers
       }
       await this.pace(result)
       return result
@@ -349,6 +352,21 @@ class ShareFetchLoop {
     })
     this.running.catch(() => {})
     return this.running
+  }
+
+  /**
+   * Tells a recoverable end of a round's open from a terminal one. A reset replaced the open, or
+   * only its data socket was lost, while the node operation and the session are intact: the next
+   * exchange reopens or resets under backoff. Anything else (a retired operation, a closed or
+   * retired session) is a terminal failure and is never recovered here.
+   * @private
+   * @param {symbol} open The open identity the round captured.
+   * @returns {boolean} Whether the node can simply continue with a fresh round.
+   */
+  reopenable(open) {
+    const { session } = this
+    if (session.closed || session.operation.guard() !== null) return false
+    return open !== session.token || session.connectionLost(open)
   }
 
   /**

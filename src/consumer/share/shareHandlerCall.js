@@ -46,31 +46,36 @@ const countWithin = (records, firstOffset, lastOffset) =>
  * ascending offset order, so a message is found by binary search and decisions live in one byte
  * each. No Map, per-call result array or linear lookup exists. The public callbacks are closures
  * of this one invocation: sharing them across invocations would let a late old call authorize a
- * new acquisition, so each record (`eachMessage`) or batch (`eachBatch`) gets its own set.
+ * new acquisition, so each record (`eachMessage`) or batch (`eachBatch`) gets its own set. Beyond
+ * the invocation, its public payload and those callbacks, a call allocates nothing per record: the
+ * acquisition's context is one frame that every call of the acquisition reads.
  */
 class ShareHandlerCall {
   /**
-   * @param {object} options Original invocation context, captured before invoking user code.
-   * @param {import('./shareAckLedger').ShareAckLedger} options.ledger Original acknowledgement ledger.
-   * @param {object[]} options.records The acquisition's delivered records, ascending by offset.
-   * @param {number} [options.start=0] First record of this call.
-   * @param {number} [options.end=records.length] One past the last record of this call.
-   * @param {'implicit'|'explicit'} options.mode Acknowledgement mode.
-   * @param {boolean} options.batch Whether this is `eachBatch`.
-   * @param {object} options.authority The acquisition's original authority, shared by its calls:
+   * @param {object} frame The acquisition's original context, captured before invoking user code
+   *   and shared, unmodified, by every call of that acquisition.
+   * @param {import('./shareAckLedger').ShareAckLedger} frame.ledger Original acknowledgement ledger.
+   * @param {object[]} frame.records The acquisition's delivered records, ascending by offset.
+   * @param {number} [frame.start=0] First record of this call, unless `start` is given.
+   * @param {number} [frame.end=records.length] One past the last record, unless `end` is given.
+   * @param {'implicit'|'explicit'} frame.mode Acknowledgement mode.
+   * @param {boolean} frame.batch Whether this is `eachBatch`.
+   * @param {object} frame.authority The acquisition's original authority, shared by its calls:
    *   `current()` (run, membership, session and acquisition), `running()` (run and membership,
    *   not stopped), `stopping()` (a clean stop was requested) and `renew(offsets)` (serialized
    *   renewal through the node FIFO, resolving with the lock duration).
+   * @param {number} [start] First record of this call; lets a per-record caller reuse one frame.
+   * @param {number} [end] One past the last record of this call.
    * @returns {ShareHandlerCall} A live invocation with no timers.
    */
-  constructor({ ledger, records, start = 0, end = records.length, mode, batch, authority }) {
-    this.ledger = ledger
-    this.records = records
+  constructor(frame, start = frame.start ?? 0, end = frame.end ?? frame.records.length) {
+    this.ledger = frame.ledger
+    this.records = frame.records
     this.start = start
     this.end = end
-    this.mode = mode
-    this.batch = batch
-    this.authority = authority
+    this.mode = frame.mode
+    this.batch = frame.batch
+    this.authority = frame.authority
     this.open = true
     this.marks = null
     this.decided = 0
@@ -222,7 +227,7 @@ class ShareHandlerCall {
   }
 
   /**
-   * Finds the messages of this call whose acquisition lock ended, without allocating when none did.
+   * Finds the messages of this call whose acquisition lock ended; builds no offset array when none did.
    * @param {number} now Monotonic milliseconds.
    * @returns {string[]|null} Their offsets, ascending, or null when every lock is still running.
    */

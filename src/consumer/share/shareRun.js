@@ -649,14 +649,20 @@ class ShareRun {
   async dispatchCohort(node, cohort) {
     const { records } = cohort.walk.deliver
     if (records.length === 0) return
-    const authority = this.authorityOf(node, cohort)
+    const frame = {
+      ledger: cohort.ledger,
+      records,
+      mode: this.options.acknowledgementMode,
+      batch: this.batch,
+      authority: this.authorityOf(node, cohort),
+    }
     cohort.key = `${cohort.topicId}:${cohort.partition}`
     cohort.lockDuration = node.lockDuration
     node.active = { cohort, records, next: 0, call: null }
-    if (this.batch) await this.dispatchBatch(node, cohort, authority)
+    if (this.batch) await this.dispatchBatch(node, cohort, frame)
     else {
       for (let i = 0; i < records.length; i++) {
-        if (!(await this.dispatchMessage(node, cohort, authority, i))) return
+        if (!(await this.dispatchMessage(node, cohort, frame, i))) return
       }
     }
   }
@@ -720,26 +726,18 @@ class ShareRun {
    * @private
    * @param {object} node The node record.
    * @param {object} cohort The acquisition.
-   * @param {object} authority The acquisition's authority.
+   * @param {object} frame The acquisition's call context, shared by all its calls.
    * @param {number} index Index of the record in the acquisition.
    * @returns {Promise<boolean>} False when no further record of this acquisition may start.
    */
-  async dispatchMessage(node, cohort, authority, index) {
+  async dispatchMessage(node, cohort, frame, index) {
     const { records, deliveryCounts } = cohort.walk.deliver
     const verdict = this.startGate(node, cohort, index, index + 1)
     if (verdict === 'stop') return false
     if (verdict === 'drop') return true
     records[index].deliveryCount = deliveryCounts[index]
     node.active.next = index + 1
-    const call = new ShareHandlerCall({
-      ledger: cohort.ledger,
-      records,
-      start: index,
-      end: index + 1,
-      authority,
-      mode: this.options.acknowledgementMode,
-      batch: false,
-    })
+    const call = new ShareHandlerCall(frame, index, index + 1)
     node.active.call = call
     await this.invoke(node, cohort, call, call.messagePayload(cohort.topic, cohort.partition))
     return this.ordinaryRefusal(node.issued) === null
@@ -749,10 +747,10 @@ class ShareRun {
    * @private
    * @param {object} node The node record.
    * @param {object} cohort The acquisition.
-   * @param {object} authority The acquisition's authority.
+   * @param {object} frame The acquisition's call context.
    * @returns {Promise<void>}
    */
-  async dispatchBatch(node, cohort, authority) {
+  async dispatchBatch(node, cohort, frame) {
     const { deliveryCounts } = cohort.walk.deliver
     let { records } = cohort.walk.deliver
     const verdict = this.startGate(node, cohort, 0, records.length)
@@ -764,13 +762,7 @@ class ShareRun {
     const delivered = cohort.walk.deliver.records
     for (let i = 0; i < delivered.length; i++) delivered[i].deliveryCount = deliveryCounts[i]
     node.active.next = delivered.length
-    const call = new ShareHandlerCall({
-      ledger: cohort.ledger,
-      records,
-      authority,
-      mode: this.options.acknowledgementMode,
-      batch: true,
-    })
+    const call = new ShareHandlerCall(records === frame.records ? frame : { ...frame, records })
     node.active.call = call
     const batch = {
       topic: cohort.topic,
@@ -993,7 +985,9 @@ class ShareRun {
    * request synchronously, so no handler starts after them, and wait naturally for running
    * handlers until the handler boundary. A stop or disconnect that arrives while a fence or poll
    * recovery is closing ends the run once that recovery cleanup is done. Later calls reuse the
-   * episode, so a disconnect never recaptures a replacement run.
+   * episode, so a disconnect never recaptures a replacement run. A zero timeout on a close in
+   * progress revokes the episode, which retires its traffic operation in the same tick: a final
+   * that was written and is unanswered settles lost and its exact socket closes at once.
    * @param {'stop'|'disconnect'|'crash'|'fence'|'poll'} kind Why the run closes.
    * @param {number} [timeout] Validated disconnect timeout, when this call supplies one.
    * @param {number} [startedAt] Original public entry time of that call.
@@ -1180,6 +1174,7 @@ class ShareRun {
       guard: () => episode.guard(),
       now: episode.now,
     })
+    episode.attach(operation)
     let sent = null
     const finals = () => (sent ??= this.sendFinals(episode, operation))
     try {

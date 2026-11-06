@@ -1,3 +1,5 @@
+const RequestQueue = require('../../../network/requestQueue')
+const { requests } = require('../../../protocol/requests')
 const { ShareRecordWalk } = require('../shareRecordWalk')
 const { ShareAckLedger, lockDeadline } = require('../shareAckLedger')
 const { KafkaJSNonRetriableError, KafkaJSShareAcknowledgementError } = require('../../../errors')
@@ -297,6 +299,70 @@ describe('public share lock contract', () => {
       heartbeatIntervalMs: 5,
       assignment,
     })
+  }
+
+  /**
+   * Holds the first renewal request of the client at one stage of its write path until the test
+   * lets it go, so a test can retire the run while the renewal is captured but not yet written.
+   */
+  class RenewHold {
+    /**
+     * @param {'encode'|'queue'} stage Where the renewal waits: inside its encoder, or just before
+     *   the request queue it would be queued in.
+     */
+    constructor(stage) {
+      this.gate = deferred()
+      this.arrival = deferred()
+      const { gate, arrival } = this
+      let taken = false
+      if (stage === 'encode') {
+        const original = requests.ShareAcknowledge.protocol
+        jest.spyOn(requests.ShareAcknowledge, 'protocol').mockImplementation((selection) => {
+          const factory = original(selection)
+          return (options) => {
+            const built = factory(options)
+            if (taken || options?.isRenewAck !== true) return built
+            taken = true
+            const { encode } = built.request
+            return {
+              ...built,
+              request: {
+                ...built.request,
+                encode: async () => {
+                  arrival.resolve()
+                  await gate.promise
+                  return encode()
+                },
+              },
+            }
+          }
+        })
+      } else {
+        const original = RequestQueue.prototype.push
+        jest.spyOn(RequestQueue.prototype, 'push').mockImplementation(function (pushed) {
+          if (taken || pushed.entry.apiKey !== 79) return original.call(this, pushed)
+          taken = true
+          arrival.resolve()
+          gate.promise.then(() => {
+            try {
+              original.call(this, pushed)
+            } catch (error) {
+              pushed.entry.reject(error)
+            }
+          })
+        })
+      }
+    }
+
+    /** @returns {Promise<void>} Resolves once the renewal reached the held stage. */
+    arrived() {
+      return this.arrival.promise
+    }
+
+    /** @returns {void} Lets the renewal continue from its stage. */
+    release() {
+      this.gate.resolve()
+    }
   }
 
   test('starts just before a deadline and drops at the deadline', async () => {
@@ -710,10 +776,18 @@ describe('public share lock contract', () => {
     const [one, two, three] = h.frames(79)
     expect(two.order).toBeGreaterThan(one.answeredOrder)
     expect(h.frames(78).filter(({ order }) => order > one.order && order < three.order)).toEqual([])
-    expect(outcomes(h.events.acks).slice(0, 2)).toEqual([
+    await until(() => h.events.acks.length === 3, 'the terminal result')
+    await flush()
+    expect(outcomes(h.events.acks)).toEqual([
       ['0', '1', 'renew', null],
       ['1', '2', 'renew', null],
+      ['0', '2', 'accept', null],
     ])
+    expect(
+      h.events.acks
+        .filter(({ type }) => type !== 'renew')
+        .map(({ firstOffset, lastOffset }) => [firstOffset, lastOffset])
+    ).toEqual([['0', '2']])
   })
 
   test('leaves every deadline unchanged after a renewal refusal', async () => {
@@ -824,6 +898,61 @@ describe('public share lock contract', () => {
     expect(renewals).toHaveLength(2)
     expect(batchesOf(renewals[1])).toEqual([batch(0, 0, [4])])
   })
+
+  test.each(['encode', 'queue'])(
+    'refuses a renewal retired at its %s stage without writing it, and a new run renews',
+    async (stage) => {
+      await start()
+      h.script('ShareFetch', [lock(1000, ['a'])])
+      const hold = new RenewHold(stage)
+      try {
+        const renewals = []
+        await h.consumer.run({
+          eachMessage: async ({ renew }) => {
+            renewals.push(
+              renew().then(
+                () => null,
+                (error) => error
+              )
+            )
+          },
+        })
+        await hold.arrived()
+        expect(h.frames(79)).toEqual([])
+        const closing = h.consumer.disconnect({ timeout: 0 })
+        await flush()
+        hold.release()
+        await closing
+        expect(await renewals[0]).toMatchObject({
+          name: 'KafkaJSShareAcknowledgementError',
+          reason: 'membership-lost',
+          ranges: [{ firstOffset: '0', lastOffset: '0' }],
+        })
+        await flush()
+        expect(h.frames(79)).toEqual([])
+        expect(h.consumer.acquisitionLockTimeoutMs()).toBe(1000)
+
+        await h.consumer.subscribe({ topics: ['topic-a'] })
+        h.script('ShareFetch', [lock(1000, ['c'])])
+        h.script('ShareAcknowledge', [
+          ackAnswer([{ partition: 0 }], { acquisitionLockTimeoutMs: 2000 }),
+        ])
+        const durations = []
+        await h.consumer.run({
+          eachMessage: async ({ renew }) => {
+            durations.push(await renew())
+          },
+        })
+        await until(() => durations.length === 1, 'the renewal of the new run')
+        expect(durations).toEqual([2000])
+        const written = h.frames(79).filter(({ fields }) => fields.isRenewAck)
+        expect(written).toHaveLength(1)
+        expect(batchesOf(written[0])).toEqual([batch(0, 0, [4])])
+      } finally {
+        hold.release()
+      }
+    }
+  )
 
   test('keeps successful renewals nonterminal', async () => {
     await start()

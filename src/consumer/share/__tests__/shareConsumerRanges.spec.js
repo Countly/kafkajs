@@ -16,6 +16,9 @@ const {
   controlBatch,
   record,
 } = require('../../../protocol/requests/fetch/__tests__/fixtures/recordBatchBytes')
+const {
+  compressedBatch,
+} = require('../../../protocol/message/compression/fixtures/compressedBatch')
 const { logLevel } = require('../../../../index')
 
 /** Every timer the client owns is faked; socket answers still travel on real macrotasks. */
@@ -115,19 +118,29 @@ describe('public share range contract', () => {
     const MARKER = controlBatch({ baseOffset: 2n })
     const failed = (forged) => batch({ records: [record({ key: 'k3', value: 'x' })], ...forged })
     const HALTS = [
-      ['a checksum mismatch at the next offset', { baseOffset: 3n, crc: 1 }],
+      ['a checksum mismatch at the next offset', () => failed({ baseOffset: 3n, crc: 1 })],
       [
         'a checksum mismatch with unrelated base and delta',
-        { baseOffset: 5000n, lastOffsetDelta: 900000, crc: 1 },
+        () => failed({ baseOffset: 5000n, lastOffsetDelta: 900000, crc: 1 }),
       ],
-      ['a length below the magic 2 header', { baseOffset: 3n, length: 20 }],
-      ['an unknown magic byte', { baseOffset: 3n, magic: 3 }],
-      ['a record count the bytes cannot hold', { baseOffset: 3n, count: 50 }],
+      ['a length below the magic 2 header', () => failed({ baseOffset: 3n, length: 20 })],
+      ['an unknown magic byte', () => failed({ baseOffset: 3n, magic: 3 })],
+      ['a record count the bytes cannot hold', () => failed({ baseOffset: 3n, count: 50 })],
+      [
+        'a gzip body that does not decompress',
+        () =>
+          compressedBatch({
+            codec: 'gzip',
+            records: 1,
+            baseOffset: 3n,
+            body: Buffer.from('not a gzip stream'),
+          }),
+      ],
     ]
 
     test.each(HALTS)(
       'releases a halted undecoded remainder compactly after %s',
-      async (_, forged) => {
+      async (_, build) => {
         const logs = []
         await start({
           kafka: {
@@ -138,7 +151,7 @@ describe('public share range contract', () => {
                 logs.push(log.message),
           },
         })
-        const records = Buffer.concat([FIRST, MARKER, failed(forged)]).toString('hex')
+        const records = Buffer.concat([FIRST, MARKER, await build()]).toString('hex')
         h.script('ShareFetch', [
           fetchAnswer([part({ partition: 0, acquire: [acquired(0, 1000000)], records })]),
         ])
@@ -298,6 +311,57 @@ describe('public share range contract', () => {
       await advance(50)
       await flush()
       expect(h.seen.acks).toHaveLength(3)
+    })
+
+    test('ignores a consumed reply that arrives again and settles a later equal-offset acquisition once', async () => {
+      await start()
+      const redelivery = (deliveryCount) =>
+        fetchAnswer([
+          part({
+            partition: 0,
+            acquire: [acquired(0, 0, deliveryCount)],
+            records: recordsHex(0, ['v']),
+          }),
+        ])
+      h.script('ShareFetch', [redelivery(1), redelivery(2)])
+      const second = h.hold({
+        api: 'ShareFetch',
+        match: ({ fields }) => fields.shareSessionEpoch === 1,
+      })
+      const third = h.hold({
+        api: 'ShareFetch',
+        match: ({ fields }) => fields.shareSessionEpoch === 2,
+      })
+      const counts = []
+      await run({ eachMessage: async ({ message }) => counts.push(message.deliveryCount) })
+      await second.arrived()
+      const socket = h.cluster.sockets()[second.call.generation - 1]
+      const replies = []
+      const deliver = socket.emit.bind(socket)
+      socket.emit = (name, ...args) => {
+        if (name === 'data') replies.push(Buffer.from(args[0]))
+        return deliver(name, ...args)
+      }
+      second.release()
+      await third.arrived()
+      expect(counts).toEqual([1, 2])
+      expect(batchesOf(third.call)).toEqual([
+        { firstOffset: '0', lastOffset: '0', acknowledgeTypes: [1] },
+      ])
+      expect(outcomes()).toEqual([['accept', '0', '0', null]])
+      expect(replies).toHaveLength(1)
+      socket.emit('data', replies[0])
+      await flush()
+      expect(outcomes()).toEqual([['accept', '0', '0', null]])
+      expect(h.frames(78)).toHaveLength(3)
+      third.release(fetchAnswer([part({ partition: 0, ack: 3 })]))
+      await until(() => h.seen.acks.length === 2, 'the answer to the second acknowledgement')
+      expect(outcomes()).toEqual([
+        ['accept', '0', '0', null],
+        ['accept', '0', '0', 'rejected-by-broker'],
+      ])
+      expect(counts).toEqual([1, 2])
+      expect(h.seen.crashes).toEqual([])
     })
   })
 

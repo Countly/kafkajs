@@ -30,6 +30,7 @@ class ShareCloseEpisode {
     this.revoked = false
     this.leaveClaimed = false
     this.nodes = new Map()
+    this.operation = null
   }
 
   /**
@@ -47,7 +48,30 @@ class ShareCloseEpisode {
         this.handlerBoundary = this.deadlineAt - Math.min(1000, Math.floor(timeout / 4))
       }
     }
-    if (timeout === 0) this.revoked = true
+    if (timeout === 0) this.revoke()
+  }
+
+  /**
+   * Gives the episode the one bounded operation that owns its finals and leave, so a revocation
+   * can wake their waits at once instead of at the original deadline. An episode that is already
+   * revoked retires it immediately.
+   * @param {import('../groupProtocol/interface').ConsumerOperation} operation The traffic's operation.
+   * @returns {void}
+   */
+  attach(operation) {
+    this.operation = operation
+    if (this.revoked) operation.retire(this.guard())
+  }
+
+  /**
+   * Revokes every unsent frame and retires the traffic operation in the same tick. A final that was
+   * already written and is unanswered settles lost through its own wait, which then closes the
+   * exact socket it was written on; nothing is resent.
+   * @returns {void}
+   */
+  revoke() {
+    this.revoked = true
+    this.operation?.retire(this.guard())
   }
 
   /**
@@ -115,6 +139,7 @@ class ShareCloseEpisode {
   finish() {
     this.revoked = true
     this.nodes.clear()
+    this.operation = null
     this.run = null
   }
 }

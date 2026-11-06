@@ -265,7 +265,9 @@ class ShareAckLedger {
 
   /**
    * Same promotion as {@link ShareAckLedger#complete} for the delivered records
-   * `records[start, end)`, read in place so a caller on a hot path builds no offset array.
+   * `records[start, end)`, read in place, so a caller on a hot path builds neither an offset array
+   * nor a `Set`. It is not allocation-free: every record lookup still parses its offset and
+   * stringifies the entry key.
    * @param {Array<{offset: string}>} records The acquisition's delivered records, ascending.
    * @param {number} start First record of the selection.
    * @param {number} end One past the last record of the selection.

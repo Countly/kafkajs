@@ -1,4 +1,5 @@
 const Cluster = require('../../../cluster')
+const { ShareRun } = require('../shareRun')
 const {
   A,
   acquire,
@@ -16,6 +17,8 @@ const {
 } = require('../../../errors')
 
 const FATAL_JOIN_CODES = [30, 29, 81, 42, 35]
+const RETRIABLE_JOIN_CODES = [14, 15, 16]
+const REQUEST_TIMEOUT = 5000
 
 /** Fake timers over a zero-based monotonic clock; no timer runs until `advance` delivers it. */
 class Clock {
@@ -54,6 +57,23 @@ class Clock {
 
 describe('public share connection contract', () => {
   let clients = []
+  const gates = []
+  const settling = []
+  /** @returns {{promise: Promise<void>, resolve: () => void}} A handler gate the cleanup releases. */
+  const hold = () => {
+    const gate = deferred()
+    gates.push(gate)
+    return gate
+  }
+  /**
+   * @param {Function} handler An `eachMessage` handler that may wait on a held gate.
+   * @returns {Function} The handler, whose promise the cleanup awaits once its gate is released.
+   */
+  const tracked = (handler) => (payload) => {
+    const handled = handler(payload)
+    settling.push(handled)
+    return handled
+  }
   /** @param {object} [options] Options of `shareClient`. @returns {object} A tracked client. */
   const open = (options) => {
     const h = shareClient(options)
@@ -79,6 +99,8 @@ describe('public share connection contract', () => {
   afterEach(async () => {
     const closing = clients
     clients = []
+    for (const gate of gates.splice(0)) gate.resolve()
+    await Promise.allSettled(settling.splice(0))
     jest.restoreAllMocks()
     jest.useRealTimers()
     for (const h of closing) await h.close()
@@ -344,28 +366,34 @@ describe('public share connection contract', () => {
     expect(second.joins).toHaveLength(1)
   })
 
-  test('keeps a retriable join pending until stop settles it', async () => {
-    const clock = new Clock()
-    clock.install()
-    const h = open()
-    await subscribe(h)
-    h.script(
-      'ShareGroupHeartbeat',
-      Array.from({ length: 50 }, () => ({ errorCode: 15 }))
-    )
-    let settled = false
-    const running = run(h).then(() => {
-      settled = true
-    })
-    await clock.advanceUntil(() => h.frames(76).length >= 3, 'repeated join attempts')
-    expect(settled).toBe(false)
-    await h.consumer.stop()
-    await running
-    const sent = h.frames(76).length
-    await clock.advance(5000)
-    expect(h.frames(76)).toHaveLength(sent)
-    expect(h.frames(76).every(({ fields }) => fields.memberEpoch === 0)).toBe(true)
-  })
+  test.each(RETRIABLE_JOIN_CODES)(
+    'keeps a retriable join pending until stop settles it (coordinator code %p)',
+    async (code) => {
+      const clock = new Clock()
+      clock.install()
+      const h = open()
+      const seen = observe(h)
+      await subscribe(h)
+      h.script(
+        'ShareGroupHeartbeat',
+        Array.from({ length: 50 }, () => ({ errorCode: code }))
+      )
+      let settled = false
+      const running = run(h).then(() => {
+        settled = true
+      })
+      await clock.advanceUntil(() => h.frames(76).length >= 3, 'repeated join attempts')
+      expect(settled).toBe(false)
+      expect(seen.crashes).toEqual([])
+      await h.consumer.stop()
+      await running
+      const sent = h.frames(76).length
+      await clock.advance(5000)
+      expect(h.frames(76)).toHaveLength(sent)
+      expect(h.frames(76).every(({ fields }) => fields.memberEpoch === 0)).toBe(true)
+      expect(seen.crashes).toEqual([])
+    }
+  )
 
   test.each(FATAL_JOIN_CODES)(
     'rejects fatal first joins and reports later terminal errors once (%p)',
@@ -417,20 +445,26 @@ describe('public share connection contract', () => {
       },
     })
     const seen = observe(h)
+    let frozenAt
+    const freeze = ShareRun.prototype.freeze
+    jest.spyOn(ShareRun.prototype, 'freeze').mockImplementation(function (episode) {
+      frozenAt ??= performance.now()
+      return freeze.call(this, episode)
+    })
     h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a'])])])
     const final = h.hold({ api: 'ShareAcknowledge' })
     const started = deferred()
-    const gate = deferred()
+    const gate = hold()
     h.consumer.on(h.consumer.events.CRASH, () => {
       h.table.set('topic-a', { topicId: A, partitions: [{ leader: 0, epoch: 1 }] })
     })
     await subscribe(h)
     await run(h, {
-      eachMessage: async ({ acknowledge }) => {
+      eachMessage: tracked(async ({ acknowledge }) => {
         acknowledge()
         started.resolve()
         await gate.promise
-      },
+      }),
     })
     await started.promise
     const finals = () => h.frames(79).filter(({ fields }) => fields.shareSessionEpoch === -1)
@@ -440,10 +474,11 @@ describe('public share connection contract', () => {
     })
     await final.arrived()
     expect(finals()[0].answeredOrder).toBeUndefined()
-    await clock.advance(4998)
+    await clock.advance(frozenAt + REQUEST_TIMEOUT - 1 - performance.now())
+    expect(performance.now()).toBe(frozenAt + REQUEST_TIMEOUT - 1)
     expect(seen.crashes).toHaveLength(0)
     expect(h.frames(76).filter(({ fields }) => fields.memberEpoch === 0)).toHaveLength(1)
-    await clock.advance(2)
+    await clock.advance(1)
     await until(() => seen.crashes.length === 1, 'the crash event')
     expect(seen.crashes[0].restart).toBe(true)
     await clock.advanceUntil(() => seen.joins.length === 2, 'the restarted join', { step: 50 })

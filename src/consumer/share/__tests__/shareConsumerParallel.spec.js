@@ -5,6 +5,7 @@ const {
   echo,
   fetchAnswer,
   flush,
+  part,
   shareClient,
   until,
 } = require('../../../../testHelpers/shareHarness')
@@ -30,11 +31,14 @@ const advance = (ms) => jest.advanceTimersByTimeAsync(ms)
 
 describe('share handlers on parallel leader nodes', () => {
   let h
+  /** Test-owned gates, released before the client closes so no held continuation outlives a test. */
+  const holds = []
   beforeEach(async () => {
     jest.useFakeTimers(FAKE)
     await advance(1000)
   })
   afterEach(async () => {
+    for (const hold of holds.splice(0)) hold.release()
     await h?.close()
     h = undefined
     jest.useRealTimers()
@@ -85,6 +89,20 @@ describe('share handlers on parallel leader nodes', () => {
     await advance(1)
     await until(() => h.frames(76).length === count, `heartbeat frame ${count}`)
     await flush()
+  }
+  /**
+   * Moves the fake clock in 50 ms steps until the condition holds.
+   * @param {() => boolean} predicate The reached-stage condition.
+   * @param {string} what What is awaited, named by the failure.
+   * @returns {Promise<void>}
+   * @throws {Error} When the condition does not hold after ten steps.
+   */
+  const advanceUntil = async (predicate, what) => {
+    for (let step = 0; step < 10 && !predicate(); step++) {
+      await advance(50)
+      await flush()
+    }
+    if (!predicate()) throw new Error(`${what} did not happen`)
   }
   /**
    * Stops while node loops may sit in their 50 ms idle pacing, which a clean stop waits for: the
@@ -334,5 +352,64 @@ describe('share handlers on parallel leader nodes', () => {
     expect(new Set(joins().map(({ fields }) => fields.memberId)).size).toBe(2)
     await beat(5)
     expect(leaves()).toHaveLength(1)
+  })
+
+  test('cannot rearm a crashed old run when its held handler returns after the restart', async () => {
+    const restartOnFailure = jest.fn(async () => true)
+    await start({ nodes: 2, topics: TWO_NODES, share: { retry: { restartOnFailure } } })
+    const openings = [0, 0]
+    h.cluster.answer('ShareFetch', (fields, call) => {
+      if (fields.shareSessionEpoch !== 0) return echo('ShareFetch', fields)
+      const opened = openings[call.node]++
+      if (call.node === 0) return fetchAnswer([acquire(0, 0, ['a'])])
+      return opened === 0
+        ? fetchAnswer([part({ partition: 1, code: 2 })])
+        : echo('ShareFetch', fields)
+    })
+    const crashing = h.hold({ api: 'ShareFetch', node: 1 })
+    const gate = deferred()
+    holds.push({ release: () => gate.resolve() })
+    const handled = []
+    await run({
+      eachMessage: async ({ message }) => {
+        handled.push(message.offset)
+        if (handled.length === 1) await gate.promise
+      },
+    })
+    await until(() => handled.length === 1, 'the held handler')
+    await crashing.arrived()
+    crashing.release()
+    await until(() => h.seen.crashes.length === 1, 'the crash event')
+    expect(h.seen.crashes[0]).toMatchObject({ restart: true, groupId: 'group' })
+    expect(h.seen.crashes[0].error.code).toBe(2)
+    expect(handled).toEqual(['0'])
+    await advanceUntil(() => h.seen.joins.length === 2 && handled.length === 2, 'the restarted run')
+    await flush()
+    const before = {
+      beats: h.frames(76).length,
+      fetches: h.frames(78).length,
+      acknowledgements: h.frames(79).length,
+      sockets: h.cluster.sockets().length,
+      timers: jest.getTimerCount(),
+    }
+    gate.resolve()
+    await flush()
+    expect(h.frames(76)).toHaveLength(before.beats)
+    expect(h.frames(78)).toHaveLength(before.fetches)
+    expect(h.frames(79)).toHaveLength(before.acknowledgements)
+    expect(h.cluster.sockets()).toHaveLength(before.sockets)
+    expect(jest.getTimerCount()).toBeLessThanOrEqual(before.timers)
+    expect(handled).toEqual(['0', '0'])
+    expect(h.seen.crashes).toHaveLength(1)
+    expect(h.seen.stops).toEqual([])
+    const [first, second] = joins().map(({ fields }) => fields.memberId)
+    expect(joins()).toHaveLength(2)
+    expect(first).not.toBe(second)
+    await advanceUntil(() => h.frames(76).length > before.beats, 'a beat of the restarted run')
+    const later = h.frames(76).slice(before.beats)
+    expect(
+      later.every(({ fields }) => fields.memberId === second && fields.memberEpoch === 1)
+    ).toBe(true)
+    expect(leaves().every(({ fields }) => fields.memberId === first)).toBe(true)
   })
 })

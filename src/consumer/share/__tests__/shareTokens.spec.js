@@ -13,7 +13,10 @@ const {
   topError,
   until,
 } = require('../../../../testHelpers/shareHarness')
+const Broker = require('../../../broker')
 const Cluster = require('../../../cluster')
+const RequestQueue = require('../../../network/requestQueue')
+const { requests } = require('../../../protocol/requests')
 
 /** Every timer the client owns is faked; socket answers still travel on real macrotasks. */
 const FAKE = { doNotFake: ['setImmediate', 'queueMicrotask', 'nextTick', 'hrtime'] }
@@ -48,13 +51,95 @@ const batchesOf = ({ fields }) =>
  */
 const reasonOf = (error) => error?.reason ?? null
 
+/**
+ * @param {Promise<*>} promise A promise the test does not await yet.
+ * @returns {{settled: boolean, error: Error|null}} Its live state, so "still pending" is observable.
+ */
+const track = (promise) => {
+  const state = { settled: false, error: null }
+  promise.then(
+    () => {
+      state.settled = true
+    },
+    (error) => {
+      state.settled = true
+      state.error = error
+    }
+  )
+  return state
+}
+
+/** Holds the next ordinary ShareAcknowledge (any epoch but -1) at one stage of its write path. */
+class OrdinaryAckHold {
+  /**
+   * @param {'encode'|'queue'} stage Where the request waits: inside its encoder, after the guard of
+   *   the prepare step passed and before it enters the request queue.
+   */
+  constructor(stage) {
+    this.gate = deferred()
+    this.arrival = deferred()
+    const { gate, arrival } = this
+    let taken = false
+    if (stage === 'encode') {
+      const original = requests.ShareAcknowledge.protocol
+      jest.spyOn(requests.ShareAcknowledge, 'protocol').mockImplementation((selection) => {
+        const factory = original(selection)
+        return (options) => {
+          const built = factory(options)
+          if (taken || options?.shareSessionEpoch === -1) return built
+          taken = true
+          const { encode } = built.request
+          return {
+            ...built,
+            request: {
+              ...built.request,
+              encode: async () => {
+                arrival.resolve()
+                await gate.promise
+                return encode()
+              },
+            },
+          }
+        }
+      })
+    } else {
+      const original = RequestQueue.prototype.push
+      jest.spyOn(RequestQueue.prototype, 'push').mockImplementation(function (pushed) {
+        if (taken || pushed.entry.apiKey !== 79) return original.call(this, pushed)
+        taken = true
+        arrival.resolve()
+        gate.promise.then(() => {
+          try {
+            original.call(this, pushed)
+          } catch (error) {
+            pushed.entry.reject(error)
+          }
+        })
+      })
+    }
+  }
+
+  /** @returns {Promise<void>} Resolves once the request reached the held stage. */
+  arrived() {
+    return this.arrival.promise
+  }
+
+  /** @returns {void} Lets the request continue from its stage. */
+  release() {
+    this.gate.resolve()
+  }
+}
+
 describe('public share token contract', () => {
   let h
+  /** Test-owned gates, released before the client closes so no held continuation outlives a test. */
+  const holds = []
   beforeEach(async () => {
     jest.useFakeTimers(FAKE)
     await advance(1000)
   })
   afterEach(async () => {
+    for (const hold of holds.splice(0)) hold.release()
     await h?.close()
     h = undefined
     jest.useRealTimers()
@@ -137,6 +222,32 @@ describe('public share token contract', () => {
   /** @returns {object} The held ShareFetch carrying acknowledgements of an established session. */
   const holdAcknowledgingFetch = () =>
     h.hold({ api: 'ShareFetch', match: ({ fields }) => fields.shareSessionEpoch === 1 })
+  /**
+   * Moves the fake clock in 50 ms steps until the condition holds.
+   * @param {() => boolean} predicate The reached-stage condition.
+   * @param {string} what What is awaited, named by the failure.
+   * @returns {Promise<void>}
+   * @throws {Error} When the condition does not hold after ten steps.
+   */
+  const advanceUntil = async (predicate, what) => {
+    for (let step = 0; step < 10 && !predicate(); step++) {
+      await advance(50)
+      await flush()
+    }
+    if (!predicate()) throw new Error(`${what} did not happen`)
+  }
+  /**
+   * Stops while node loops may sit in their 50 ms idle pacing, which a clean stop waits for.
+   * @returns {Promise<void>}
+   * @throws {Error} When the close did not end within ten steps.
+   */
+  const stopIdle = async () => {
+    const stopping = track(h.consumer.stop())
+    await advanceUntil(() => stopping.settled, 'the clean stop')
+    expect(stopping.error).toBeNull()
+  }
+  /** @returns {number[]} The member epoch of every heartbeat frame, in wire order. */
+  const heartbeatEpochs = () => h.frames(76).map(({ fields }) => fields.memberEpoch)
 
   test('an old callback throws while a replacement acquisition of the same offset works', async () => {
     await start()
@@ -232,6 +343,90 @@ describe('public share token contract', () => {
     await run({ eachMessage: async () => {} })
     expect(joins()).toHaveLength(1)
     expect(h.seen.joins).toHaveLength(1)
+  })
+
+  test('sends no frame from the old lookup when a replacement run joins while it is held', async () => {
+    await start()
+    const lookup = h.hold({ api: 'FindCoordinator' })
+    const first = h.consumer.run({ eachMessage: async () => {} })
+    await lookup.arrived()
+    await h.consumer.stop()
+    await first
+    await run({ eachMessage: async () => {} })
+    const [{ fields: replacement }] = joins()
+    expect(h.frames(76)).toHaveLength(1)
+    lookup.release()
+    await flush()
+    expect(h.frames(76)).toHaveLength(1)
+    expect(h.seen.joins).toEqual([
+      { groupId: 'group', memberId: replacement.memberId, memberEpoch: 1 },
+    ])
+    expect(h.consumer.assignment()).toEqual([{ topic: 'topic-a', partitions: [0] }])
+  })
+
+  describe('a normal heartbeat held at the coordinator lookup', () => {
+    /**
+     * Joins, answers the second beat with code 14 so the coordinator is forgotten, and holds the
+     * lookup the third beat then makes.
+     * @param {boolean} [withData=false] Also holds the node's second ShareFetch, so a data answer
+     *   can end the membership while the lookup waits.
+     * @returns {Promise<{lookup: object, data: object|null}>} The held lookup and data fetch.
+     */
+    const holdRejoinLookup = async (withData = false) => {
+      await start()
+      h.script('ShareGroupHeartbeat', [undefined, { errorCode: 14 }])
+      const data = withData ? holdAcknowledgingFetch() : null
+      await run({ eachMessage: async () => {} })
+      const lookup = h.hold({ api: 'FindCoordinator' })
+      await beat(50, 2)
+      await advance(50)
+      await lookup.arrived()
+      if (data) await data.arrived()
+      expect(heartbeatEpochs()).toEqual([0, 1])
+      return { lookup, data }
+    }
+
+    test('sends no frame from the held lookup of a stopped run and a fresh run joins', async () => {
+      const { lookup } = await holdRejoinLookup()
+      await stopIdle()
+      expect(heartbeatEpochs()).toEqual([0, 1])
+      lookup.release()
+      await flush()
+      expect(heartbeatEpochs()).toEqual([0, 1])
+      await run({ eachMessage: async () => {} })
+      expect(heartbeatEpochs()).toEqual([0, 1, 0])
+      expect(new Set(joins().map(({ fields }) => fields.memberId)).size).toBe(2)
+    })
+
+    test('sends no frame from the held lookup of a fenced membership and the rejoin keeps its member', async () => {
+      const { lookup, data } = await holdRejoinLookup(true)
+      data.release(topError(25))
+      await flush()
+      lookup.release()
+      await until(() => h.seen.assigned.length === 2, 'the fence')
+      await flush()
+      expect(heartbeatEpochs()).toEqual([0, 1])
+      await advanceUntil(() => joins().length === 2, 'the rejoin')
+      expect(heartbeatEpochs()).toEqual([0, 1, 0])
+      expect(new Set(joins().map(({ fields }) => fields.memberId)).size).toBe(1)
+      expect(h.seen.crashes).toEqual([])
+    })
+
+    test('sends no frame from the held lookup of a crashed run and a fresh run joins', async () => {
+      const { lookup, data } = await holdRejoinLookup(true)
+      data.release(fetchAnswer([part({ partition: 0, code: 2 })]))
+      await flush()
+      lookup.release()
+      await until(() => h.seen.crashes.length === 1, 'the crash event')
+      await flush()
+      expect(h.seen.crashes[0]).toMatchObject({ restart: false, groupId: 'group' })
+      expect(h.seen.crashes[0].error.code).toBe(2)
+      expect(heartbeatEpochs()).toEqual([0, 1])
+      await run({ eachMessage: async () => {} })
+      expect(heartbeatEpochs()).toEqual([0, 1, 0])
+      expect(new Set(joins().map(({ fields }) => fields.memberId)).size).toBe(2)
+      expect(h.seen.crashes).toHaveLength(1)
+    })
   })
 
   test('keeps a running handler out of the next membership after a fence', async () => {
@@ -502,6 +697,236 @@ describe('public share token contract', () => {
     expect(counts).toEqual([1, 2])
   })
 
+  test('ignores an old acquisition-bearing answer released after its replacement was delivered', async () => {
+    await start()
+    const stale = fetchAnswer(
+      [part({ partition: 0, acquire: [acquired(0, 0, 7)], records: recordsHex(0, ['old']) })],
+      { acquisitionLockTimeoutMs: 7777 }
+    )
+    openWith([stale, oneRecord(1)])
+    h.script('ShareGroupHeartbeat', [undefined, FENCE])
+    // The answer is decoded and parked before the loop sees it, as one that outlives its node.
+    const original = Broker.prototype.shareFetch
+    const arrival = deferred()
+    const gate = deferred()
+    holds.push({ release: () => gate.resolve() })
+    let taken = false
+    jest.spyOn(Broker.prototype, 'shareFetch').mockImplementation(async function (...args) {
+      const first = !taken
+      taken = true
+      const response = await original.apply(this, args)
+      if (!first) return response
+      arrival.resolve()
+      await gate.promise
+      return response
+    })
+    const counts = []
+    await run({
+      eachMessage: async ({ message }) => {
+        counts.push(message.deliveryCount)
+      },
+    })
+    await arrival.promise
+    expect(counts).toEqual([])
+    await beat(50, 2)
+    await until(() => h.seen.assigned.length === 2, 'the fence')
+    await flush()
+    await advanceUntil(() => counts.length === 1 && h.seen.joins.length === 2, 'the replacement')
+    expect(counts).toEqual([1])
+    expect(h.consumer.acquisitionLockTimeoutMs()).toBe(15000)
+    gate.resolve()
+    await flush()
+    expect(counts).toEqual([1])
+    expect(h.consumer.acquisitionLockTimeoutMs()).toBe(15000)
+    await advanceUntil(() => h.seen.acks.length === 1, 'the replacement settlement')
+    expect(outcomes()).toEqual([['accept', '0', '0', null]])
+    expect(h.seen.crashes).toEqual([])
+  })
+
+  test('an old callback of a returned handler throws while a redelivery of the same offset works', async () => {
+    await start()
+    // The clock never moves, so both acquisitions carry the same send time, offset, count and epoch.
+    h.script('ShareFetch', [oneRecord(), oneRecord()])
+    const calls = []
+    await run({
+      eachMessage: async ({ message, acknowledge, renew, isRunning }) => {
+        const call = { acknowledge, renew, isRunning, count: message.deliveryCount, thrown: [] }
+        calls.push(call)
+        if (calls.length < 2) return
+        for (const old of [() => calls[0].acknowledge('reject'), () => calls[0].renew()]) {
+          try {
+            old()
+            call.thrown.push(null)
+          } catch (error) {
+            call.thrown.push(error)
+          }
+        }
+        call.oldRunning = calls[0].isRunning()
+        acknowledge('reject')
+      },
+    })
+    await until(() => h.frames(78).length >= 3 && h.seen.acks.length === 2, 'both acquisitions')
+    expect(calls.map(({ count }) => count)).toEqual([1, 1])
+    expect(calls[1].thrown.map((error) => [error.name, error.message])).toEqual([
+      ['KafkaJSNonRetriableError', 'Handler call is no longer current'],
+      ['KafkaJSNonRetriableError', 'Handler call is no longer current'],
+    ])
+    expect(calls[1].oldRunning).toBe(true)
+    const rounds = h.frames(78).slice(0, 3)
+    expect(rounds.map(({ fields }) => fields.shareSessionEpoch)).toEqual([0, 1, 2])
+    expect(rounds.map(batchesOf)).toEqual([
+      [],
+      [{ firstOffset: '0', lastOffset: '0', acknowledgeTypes: [1] }],
+      [{ firstOffset: '0', lastOffset: '0', acknowledgeTypes: [3] }],
+    ])
+    expect(outcomes()).toEqual([
+      ['accept', '0', '0', null],
+      ['reject', '0', '0', null],
+    ])
+    expect(h.frames(79)).toHaveLength(0)
+  })
+
+  describe('an ordinary renewal held before the wire', () => {
+    test.each(['encode', 'queue'])(
+      'refuses an ordinary renewal held at the %s stage once the membership is fenced',
+      async (stage) => {
+        await start()
+        openWith([oneRecord(), oneRecord()])
+        h.script('ShareGroupHeartbeat', [undefined, FENCE])
+        let hold
+        const results = []
+        await run({
+          eachMessage: async ({ renew }) => {
+            if (results.length === 0) {
+              hold = new OrdinaryAckHold(stage)
+              holds.push(hold)
+            }
+            results.push(
+              await renew().then(
+                (duration) => duration,
+                (error) => error
+              )
+            )
+          },
+        })
+        await until(() => hold !== undefined, 'the renewing handler')
+        await hold.arrived()
+        expect(h.frames(79)).toHaveLength(0)
+        await beat(50, 2)
+        await until(() => results.length === 1, 'the refused renewal')
+        expect(results[0]).toMatchObject({
+          name: 'KafkaJSShareAcknowledgementError',
+          reason: 'membership-lost',
+          ranges: [{ firstOffset: '0', lastOffset: '0' }],
+        })
+        expect(outcomes()).toHaveLength(2)
+        expect(outcomes()).toEqual(
+          expect.arrayContaining([
+            ['renew', '0', '0', 'membership-lost'],
+            ['release', '0', '0', 'membership-lost'],
+          ])
+        )
+        hold.release()
+        await flush()
+        expect(h.frames(79)).toHaveLength(0)
+        await advanceUntil(() => results.length === 2, 'the replacement renewal')
+        expect(results[1]).toBe(15000)
+        expect(h.frames(79)).toHaveLength(1)
+        const [renewal] = h.frames(79)
+        expect(renewal.fields.isRenewAck).toBe(true)
+        expect(renewal.fields.shareSessionEpoch).toBe(1)
+        expect(batchesOf(renewal)).toEqual([
+          { firstOffset: '0', lastOffset: '0', acknowledgeTypes: [4] },
+        ])
+        expect(h.seen.crashes).toEqual([])
+      }
+    )
+  })
+
+  describe('a written renewal held at its response', () => {
+    /**
+     * Starts a run whose handler renews and records how the renewal ended.
+     * @param {Array<object>} openings The ShareFetch answers of each opening.
+     * @returns {Promise<{held: object, results: Array<number|Error>}>} The held renewal's gate
+     *   once its frame was written, and the renewal results.
+     */
+    const startRenewing = async (openings) => {
+      await start()
+      openWith(openings)
+      const held = h.hold({ api: 'ShareAcknowledge' })
+      const results = []
+      await run({
+        eachMessage: async ({ renew }) => {
+          results.push(
+            await renew().then(
+              (duration) => duration,
+              (error) => error
+            )
+          )
+        },
+      })
+      await held.arrived()
+      expect(results).toEqual([])
+      return { held, results }
+    }
+
+    test('settles a renewal lost once and ignores its late answer after the data session resets', async () => {
+      const { held, results } = await startRenewing([oneRecord(), oneRecord()])
+      h.cluster.sockets()[held.call.generation - 1].destroy()
+      await until(() => h.seen.acks.length === 2, 'the lost outcomes')
+      expect(outcomes()).toEqual(
+        expect.arrayContaining([
+          ['renew', '0', '0', 'session-lost'],
+          ['release', '0', '0', 'session-lost'],
+        ])
+      )
+      expect(h.seen.resets).toEqual([{ nodeId: 0, reason: 'connection', recordsDropped: 1 }])
+      await advanceUntil(() => results.length === 2, 'the replacement renewal')
+      expect(results[0]).toMatchObject({
+        name: 'KafkaJSShareAcknowledgementError',
+        reason: 'session-lost',
+        ranges: [{ firstOffset: '0', lastOffset: '0' }],
+      })
+      expect(results[1]).toBe(15000)
+      held.release()
+      await flush()
+      expect(outcomes().filter(([, , , reason]) => reason === 'session-lost')).toHaveLength(2)
+      const renewals = h.frames(79)
+      expect(renewals).toHaveLength(2)
+      expect(renewals.map(({ fields }) => fields.isRenewAck)).toEqual([true, true])
+      expect(renewals[1].generation).toBeGreaterThan(renewals[0].generation)
+      expect(h.seen.crashes).toEqual([])
+    })
+
+    test('settles a renewal lost once at the disconnect deadline and ignores its late answer', async () => {
+      const { held, results } = await startRenewing([oneRecord()])
+      const closing = track(h.consumer.disconnect({ timeout: 400 }))
+      await advance(299)
+      await flush()
+      expect(results).toEqual([])
+      expect(closing.settled).toBe(false)
+      await advance(1)
+      await until(() => closing.settled, 'the close')
+      expect(closing.error).toBeNull()
+      expect(results).toHaveLength(1)
+      expect(results[0]).toMatchObject({
+        name: 'KafkaJSShareAcknowledgementError',
+        reason: 'membership-lost',
+        ranges: [{ firstOffset: '0', lastOffset: '0' }],
+      })
+      const lost = [
+        ['renew', '0', '0', 'membership-lost'],
+        ['release', '0', '0', 'membership-lost'],
+      ]
+      expect(outcomes()).toHaveLength(2)
+      expect(outcomes()).toEqual(expect.arrayContaining(lost))
+      held.release()
+      await flush()
+      expect(outcomes()).toHaveLength(2)
+      expect(h.frames(79)).toHaveLength(1)
+    })
+  })
+
   describe('poll expiry over two leader nodes', () => {
     /**
      * Node 0 delivers one record to a handler that stays held; node 1 delivers a record per fetch
@@ -583,6 +1008,25 @@ describe('public share token contract', () => {
     test('ignores an old restart verdict released after a stop', async () => {
       const { restartOnFailure, gate } = await crashWithHeldVerdict()
       await h.consumer.stop()
+      const timers = jest.getTimerCount()
+      gate.resolve()
+      await until(() => h.seen.crashes.length === 1, 'the crash event')
+      await flush()
+      expect(h.seen.crashes[0]).toMatchObject({ restart: false, groupId: 'group' })
+      expect(h.seen.crashes[0].error.code).toBe(2)
+      expect(restartOnFailure).toHaveBeenCalledTimes(1)
+      expect(jest.getTimerCount()).toBeLessThanOrEqual(timers)
+      await advance(5000)
+      expect(joins()).toHaveLength(1)
+      await run({ eachMessage: async () => {} })
+      expect(joins()).toHaveLength(2)
+      expect(new Set(joins().map(({ fields }) => fields.memberId)).size).toBe(2)
+      expect(h.seen.crashes).toHaveLength(1)
+    })
+
+    test('ignores an old restart verdict released after a disconnect', async () => {
+      const { restartOnFailure, gate } = await crashWithHeldVerdict()
+      await h.consumer.disconnect({ timeout: 0 })
       const timers = jest.getTimerCount()
       gate.resolve()
       await until(() => h.seen.crashes.length === 1, 'the crash event')
@@ -686,6 +1130,25 @@ describe('public share token contract', () => {
       await until(() => h.seen.assigned.length === 1, 'the resolved assignment')
       expect(wireFlights().length).toBeGreaterThanOrEqual(1)
       expect(h.seen.assigned[0].added).toEqual([{ topic: 'topic-u1', partitions: [0] }])
+    })
+
+    test('discards the held flight of a stopped run once a replacement run is current', async () => {
+      const flights = holdFlights()
+      await start()
+      h.script('ShareGroupHeartbeat', [target(U1)])
+      await run({ eachMessage: async () => {} })
+      await until(() => flights.length === 1, 'the held flight')
+      await h.consumer.stop()
+      await run({ eachMessage: async () => {} })
+      expect(flights).toHaveLength(1)
+      expect(h.seen.assigned).toHaveLength(1)
+      expect(h.seen.assigned[0].added).toEqual([{ topic: 'topic-a', partitions: [0] }])
+      nameUnknownId()
+      flights[0].gate.resolve()
+      await flush()
+      expect(wireFlights()).toEqual([])
+      expect(h.seen.assigned).toHaveLength(1)
+      expect(h.consumer.assignment()).toEqual([{ topic: 'topic-a', partitions: [0] }])
     })
 
     test('discards the held flight of a replaced target revision with identical eventual ids', async () => {

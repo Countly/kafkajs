@@ -1952,6 +1952,123 @@ test('a blackholed dial never connects and up only restores future dials', async
   }
 })
 
+describe('held dials and outages', () => {
+  const TWO_NODES = [...NODES, { id: 1, host: 'node1', port: 9092 }]
+  const sockets = []
+  /** Dials a node of `cluster`, keeps the socket for cleanup and collects what it receives. */
+  const dialNode = (cluster, node, onConnect = () => {}) => {
+    const socket = cluster.socketFactory({ ...node, onConnect })
+    const frames = []
+    socket.on('data', (chunk) => frames.push(chunk))
+    socket.on('error', () => {})
+    sockets.push(socket)
+    return { socket, frames }
+  }
+  /** The top-level error code of a Metadata v13 response frame, which ends with it and a tag buffer. */
+  const topLevelCode = (frame) => frame.readInt16BE(frame.length - 3)
+  const metadataRequest = () => frameOf(apiKeys.Metadata, 13, METADATA_REQUEST)
+
+  afterEach(() => {
+    for (const socket of sockets.splice(0)) socket.destroy()
+  })
+
+  test('release connects a blackholed dial once, and the socket then answers requests', async () => {
+    const cluster = createScriptedCluster({ nodes: NODES })
+    const connected = jest.fn()
+    const { socket, frames } = dialNode(cluster.blackhole(0), NODES[0], connected)
+    await settle()
+    expect(connected).not.toHaveBeenCalled()
+    expect(cluster.heldDialsTo(0)).toBe(1)
+
+    expect(cluster.release(0)).toBe(cluster)
+    await settle()
+    expect(connected).toHaveBeenCalledTimes(1)
+    expect(cluster.heldDialsTo(0)).toBe(0)
+    socket.write(metadataRequest())
+    await settle()
+    expect(frames).toHaveLength(1)
+    expect(cluster.requests().map(({ api, generation }) => [api, generation])).toEqual([
+      ['Metadata', 1],
+    ])
+
+    cluster.release(0)
+    await settle()
+    expect(connected).toHaveBeenCalledTimes(1)
+    cluster.assertClean()
+  })
+
+  test('release skips a dial the client already destroyed and every dial of another node', async () => {
+    const cluster = createScriptedCluster({ nodes: TWO_NODES }).blackhole(0).blackhole(1)
+    const destroyed = jest.fn()
+    const alive = jest.fn()
+    const other = jest.fn()
+    const dead = dialNode(cluster, TWO_NODES[0], destroyed)
+    dialNode(cluster, TWO_NODES[0], alive)
+    dialNode(cluster, TWO_NODES[1], other)
+    dead.socket.destroy()
+    await settle()
+    expect(cluster.heldDialsTo(0)).toBe(1)
+    expect(cluster.heldDialsTo(1)).toBe(1)
+
+    cluster.release(0)
+    await settle()
+    expect(destroyed).not.toHaveBeenCalled()
+    expect(alive).toHaveBeenCalledTimes(1)
+    expect(other).not.toHaveBeenCalled()
+    expect(cluster.heldDialsTo(1)).toBe(1)
+  })
+
+  test('a released dial keeps the generation it was dialled with', async () => {
+    const cluster = createScriptedCluster({ nodes: NODES })
+    const held = dialNode(cluster.blackhole(0), NODES[0])
+    cluster.up(0)
+    const later = dialNode(cluster, NODES[0])
+    cluster.release(0)
+    await settle()
+    held.socket.write(metadataRequest())
+    later.socket.write(metadataRequest())
+    await settle()
+
+    expect(cluster.requests().map(({ generation }) => generation)).toEqual([1, 2])
+    cluster.assertClean()
+  })
+
+  test('an outage lays its fields over the answers of its API until recover', async () => {
+    const cluster = createScriptedCluster({ nodes: NODES })
+    const { socket, frames } = dialNode(cluster, NODES[0])
+    const ask = async () => {
+      socket.write(metadataRequest())
+      await settle()
+      return topLevelCode(frames[frames.length - 1])
+    }
+
+    const before = await ask()
+    expect(cluster.outage('Metadata', { errorCode: 129 })).toBe(cluster)
+    const during = await ask()
+    const duringAgain = await ask()
+    expect(cluster.recover('Metadata')).toBe(cluster)
+    const after = await ask()
+
+    expect([before, during, duringAgain, after]).toEqual([0, 129, 129, 0])
+    expect(frames).toHaveLength(4)
+    cluster.assertClean()
+  })
+
+  test('an outage leaves a Buffer answer released by the test as it is', async () => {
+    const cluster = createScriptedCluster({ nodes: NODES }).outage('Metadata', { errorCode: 129 })
+    const { socket, frames } = dialNode(cluster, NODES[0])
+    const gate = cluster.schedule.hold({ api: 'Metadata' })
+    socket.write(metadataRequest())
+    await within(gate.arrived(), 1000, 'the held Metadata call')
+    gate.release(metadataV13.buildResponse({ errorCode: 0 }))
+    await settle()
+
+    expect(frames).toHaveLength(1)
+    expect(topLevelCode(frames[0])).toBe(0)
+    cluster.assertClean()
+  })
+})
+
 test('a connect to a profile that offers ApiVersions v4 takes exactly NEGOTIATION_MS fake milliseconds', async () => {
   jest.useFakeTimers()
   const cluster = createScriptedCluster({ nodes: NODES })

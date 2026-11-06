@@ -689,6 +689,64 @@ describe('public share handler contract', () => {
     expect(handled).toEqual(['0', '5'])
   })
 
+  test.each([
+    ['a normal return', false],
+    ['a throw', true],
+  ])('ignores %s of a handler that outlived a data session reset', async (_, throws) => {
+    await start()
+    h.script('ShareFetch', [answer(['a']), answer(['b'], 5)])
+    h.script('ShareAcknowledge', [ackAnswer([], { errorCode: 122 })])
+    const held = deferred()
+    const reset = deferred()
+    const handled = []
+    const during = {}
+    let saved
+    await h.consumer.run({
+      eachMessage: async ({ message, acknowledge, renew }) => {
+        handled.push(message.offset)
+        if (message.offset !== '0') return
+        saved = acknowledge
+        during.renewal = await renew().then(
+          () => null,
+          (error) => error
+        )
+        reset.resolve()
+        await held.promise
+        if (throws) throw new Error('late failure')
+      },
+    })
+    await reset.promise
+    await flush()
+    expect(during.renewal).toMatchObject({
+      name: 'KafkaJSShareAcknowledgementError',
+      reason: 'session-lost',
+      ranges: [{ firstOffset: '0', lastOffset: '0' }],
+    })
+    const old = () => h.acks.filter(({ firstOffset }) => firstOffset === '0')
+    const settled = outcomes(old())
+    const frames79 = h.frames(79).length
+    expect(handled).toEqual(['0'])
+    held.resolve()
+    await until(() => handled.length === 2, 'the replacement handler')
+    await until(
+      () => h.acks.some(({ firstOffset, error }) => firstOffset === '5' && error === null),
+      'the replacement acknowledgement'
+    )
+    expect(outcomes(old())).toEqual(settled)
+    expect(h.errors).toEqual([])
+    expect(h.crashes).toEqual([])
+    expect(h.frames(79)).toHaveLength(frames79)
+    expect(
+      h
+        .frames(78)
+        .map(({ fields }) => fields.shareSessionEpoch)
+        .slice(0, 3)
+    ).toEqual([0, 0, 1])
+    expect(batches().slice(0, 2)).toEqual([[], []])
+    expect(() => saved('reject')).toThrow('Handler call is no longer current')
+    expect(handled).toEqual(['0', '5'])
+  })
+
   test('paces consecutive handler failures and resets on success', async () => {
     jest.useFakeTimers(FAKE_TIMERS)
     await start({ share: PACED })
@@ -796,6 +854,37 @@ describe('public share handler contract', () => {
     expect(performance.now()).toBe(stopped)
     expect(h.frames(78)).toHaveLength(1)
     expect(h.crashes).toHaveLength(0)
+  })
+
+  test('cancels the owned pacing wait when a fence ends the run and paces the replacement from the initial delay', async () => {
+    jest.useFakeTimers(FAKE_TIMERS)
+    await start({ share: PACED, interval: 100 })
+    const stamps = []
+    const reader = (values, base) => () => {
+      stamps.push(performance.now())
+      return values ? answer(values, base) : undefined
+    }
+    h.script('ShareFetch', [reader(['a'], 0), reader(['b'], 1), reader(['c'], 2), reader()])
+    h.script('ShareGroupHeartbeat', [undefined, { errorCode: 110 }])
+    await h.consumer.run({
+      eachMessage: async () => {
+        throw new Error('fail')
+      },
+    })
+    await until(() => h.errors.length === 1, 'the first failure')
+    const since = () => stamps.map((stamp) => stamp - stamps[0])
+    await tick(399)
+    expect(since()).toEqual([0])
+    expect(h.errors).toHaveLength(1)
+    await tick(1)
+    await until(() => h.errors.length === 2, 'the failure of the replacement node')
+    expect(since()).toEqual([0, 400])
+    await tick(299)
+    expect(since()).toEqual([0, 400])
+    await tick(1)
+    await until(() => stamps.length === 3, 'the third fetching request')
+    expect(since()).toEqual([0, 400, 700])
+    expect(h.crashes).toEqual([])
   })
 
   test('does not expose control records to handlers and acknowledges them as gaps', async () => {

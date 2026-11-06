@@ -181,6 +181,56 @@ const deferred = () => {
 }
 
 /**
+ * Fake timers plus a monotonic clock the test can move without delivering any timer. `setImmediate`
+ * and microtasks stay real; `performance.now` reads the fake `Date` since `install`, so a due timer
+ * reads the clock when it runs, and `skew` followed by a later `advance` models a delayed timer.
+ * Call `restore` in guaranteed cleanup.
+ */
+class ShareClock {
+  constructor() {
+    this.skewMs = 0
+    this.origin = 0
+    this.reading = null
+  }
+
+  /** @returns {ShareClock} This clock, with fake timers installed and `performance.now` at zero. */
+  install() {
+    jest.useFakeTimers({
+      now: 1000000,
+      doNotFake: ['setImmediate', 'queueMicrotask', 'nextTick', 'hrtime', 'performance'],
+    })
+    this.origin = Date.now()
+    this.reading = jest
+      .spyOn(performance, 'now')
+      .mockImplementation(() => Date.now() - this.origin + this.skewMs)
+    return this
+  }
+
+  /**
+   * @param {number} ms Milliseconds the clock jumps without any timer being delivered.
+   * @returns {void}
+   */
+  skew(ms) {
+    this.skewMs += ms
+  }
+
+  /**
+   * @param {number} ms Milliseconds of fake time to deliver, timer by timer.
+   * @returns {Promise<void>} Resolves once the scripted sockets answered what the timers started.
+   */
+  async advance(ms) {
+    await jest.advanceTimersByTimeAsync(ms)
+    await flush()
+  }
+
+  /** @returns {void} Restores real timers and the real `performance.now`. */
+  restore() {
+    this.reading?.mockRestore()
+    jest.useRealTimers()
+  }
+}
+
+/**
  * @param {number} partition Partition index.
  * @param {number|string|bigint} base First offset acquired.
  * @param {string[]} values One record value per offset.
@@ -668,6 +718,7 @@ module.exports = {
   flush,
   until,
   deferred,
+  ShareClock,
   acquire,
   harness,
   heartbeatAnswer,

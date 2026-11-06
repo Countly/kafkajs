@@ -1,7 +1,7 @@
 const { ShareCloseEpisode } = require('../shareCloseEpisode')
 const { ShareRun } = require('../shareRun')
 const { KafkaJSNonRetriableError } = require('../../../errors')
-const { A } = require('../../../../testHelpers/shareHarness')
+const { A, flush } = require('../../../../testHelpers/shareHarness')
 
 const TWO_NODES = {
   'topic-a': {
@@ -11,6 +11,39 @@ const TWO_NODES = {
       { leader: 1, epoch: 1 },
     ],
   },
+}
+
+/** Fake timers over a zero-based monotonic clock; no timer runs until `advance` delivers it. */
+class Clock {
+  /** @returns {void} Installs fake timers and a `performance.now` that starts at zero. */
+  install() {
+    jest.useFakeTimers({
+      now: 1000000,
+      doNotFake: ['setImmediate', 'queueMicrotask', 'nextTick', 'hrtime', 'performance'],
+    })
+    const origin = Date.now()
+    jest.spyOn(performance, 'now').mockImplementation(() => Date.now() - origin)
+  }
+
+  /**
+   * @param {number} ms Milliseconds of fake time to deliver, timer by timer.
+   * @returns {Promise<void>} Resolves once the scripted sockets answered what the timers started.
+   */
+  async advance(ms) {
+    await jest.advanceTimersByTimeAsync(ms)
+    await flush()
+  }
+
+  /**
+   * @param {() => boolean} predicate The reached-stage condition.
+   * @param {string} what What is awaited, named by the failure.
+   * @returns {Promise<void>}
+   * @throws {Error} When the condition does not hold after 40 steps of 100 fake milliseconds.
+   */
+  async advanceUntil(predicate, what) {
+    for (let turn = 0; turn < 40 && !predicate(); turn++) await this.advance(100)
+    if (!predicate()) throw new Error(`${what} did not happen`)
+  }
 }
 
 /** @param {object} options Case overrides. @returns {object} Episode and controlled actual clock. */
@@ -130,15 +163,34 @@ describe('public share shutdown contract', () => {
     acquire,
     deferred,
     fetchAnswer,
-    flush,
     shareClient,
     until,
   } = require('../../../../testHelpers/shareHarness')
   let h
+  const gates = []
+  const settling = []
+  /** @returns {{promise: Promise<void>, resolve: () => void}} A handler gate the cleanup releases. */
+  const hold = () => {
+    const gate = deferred()
+    gates.push(gate)
+    return gate
+  }
+  /**
+   * @param {Function} handler An `eachMessage` handler that may wait on a held gate.
+   * @returns {Function} The handler, whose promise the cleanup awaits once its gate is released.
+   */
+  const tracked = (handler) => (payload) => {
+    const handled = handler(payload)
+    settling.push(handled)
+    return handled
+  }
   afterEach(async () => {
+    for (const gate of gates.splice(0)) gate.resolve()
+    await Promise.allSettled(settling.splice(0))
+    jest.restoreAllMocks()
+    jest.useRealTimers()
     await h?.close()
     h = undefined
-    jest.restoreAllMocks()
   })
   /** @param {object} [options] `shareClient` options. @returns {Promise<object>} A subscribed client. */
   const start = async (options) => {
@@ -189,13 +241,13 @@ describe('public share shutdown contract', () => {
     await start({ nodes: 2, topics: TWO_NODES })
     const answer = (fields, call) => fetchAnswer([acquire(call.node, 0, [`v${call.node}`])])
     h.script('ShareFetch', [answer, answer])
-    const gates = [deferred(), deferred()]
+    const held = [hold(), hold()]
     const started = new Set()
     await h.consumer.run({
-      eachMessage: async ({ partition }) => {
+      eachMessage: tracked(async ({ partition }) => {
         started.add(partition)
-        await gates[partition].promise
-      },
+        await held[partition].promise
+      }),
     })
     await until(() => started.size === 2, 'both handlers')
     const stopping = h.consumer.stop()
@@ -203,11 +255,11 @@ describe('public share shutdown contract', () => {
     await flush()
     expect(finals()).toHaveLength(0)
     expect(leaves()).toHaveLength(0)
-    gates[0].resolve()
+    held[0].resolve()
     await flush()
     expect(finals()).toHaveLength(0)
     expect(leaves()).toHaveLength(0)
-    gates[1].resolve()
+    held[1].resolve()
     await stopping
     expect(
       finals()
@@ -244,13 +296,13 @@ describe('public share shutdown contract', () => {
     await start()
     h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a'])])])
     const saved = []
-    const gate = deferred()
+    const gate = hold()
     await h.consumer.run({
-      eachMessage: async ({ acknowledge, renew }) => {
+      eachMessage: tracked(async ({ acknowledge, renew }) => {
         saved.push({ acknowledge, renew })
         acknowledge()
         await gate.promise
-      },
+      }),
     })
     await until(() => saved.length === 1, 'the held handler')
     const closing = h.consumer.disconnect({ timeout: 0 })
@@ -267,17 +319,17 @@ describe('public share shutdown contract', () => {
   test('keeps invalid deadline calls from stopping the current handler', async () => {
     await start()
     h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a'])])])
-    const gate = deferred()
+    const gate = hold()
     const checks = []
     await h.consumer.run({
-      eachMessage: async ({ acknowledge, isRunning }) => {
+      eachMessage: tracked(async ({ acknowledge, isRunning }) => {
         for (const timeout of [-1, 1.5, NaN, '5', null, 2147483648]) {
           await h.consumer.disconnect({ timeout }).catch((error) => checks.push(error.name))
         }
         acknowledge('reject')
         checks.push(isRunning())
         await gate.promise
-      },
+      }),
     })
     await until(() => checks.length === 7, 'the invalid calls')
     expect(checks).toEqual([...Array(6).fill('KafkaJSInvalidConfigurationError'), true])
@@ -289,6 +341,7 @@ describe('public share shutdown contract', () => {
   })
 
   test('starts a fresh run after a clean stop', async () => {
+    const runs = captureRuns()
     await start()
     h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a'])])])
     const first = []
@@ -314,6 +367,13 @@ describe('public share shutdown contract', () => {
     const joins = h.frames(76).filter(({ fields }) => fields.memberEpoch === 0)
     expect(new Set(joins.map(({ fields }) => fields.memberId)).size).toBe(2)
     expect(h.consumer.assignment()).toEqual([{ topic: 'topic-a', partitions: [0] }])
+    expect(runs).toHaveLength(2)
+    for (const owned of ['poll', 'manager', 'membership', 'operation'])
+      expect(runs[1][owned]).not.toBe(runs[0][owned])
+    await h.consumer.stop()
+    expect(h.acks.at(-1)).toEqual([0, '0', '0', 'reject', null])
+    expect(h.acks).toHaveLength(2)
+    expect(h.consumer.assignment()).toEqual([])
   })
   /** @returns {object[]} Every run the client starts, oldest first: state a test cannot read publicly. */
   const captureRuns = () => {
@@ -327,9 +387,10 @@ describe('public share shutdown contract', () => {
   }
   /**
    * Fences the running member, with its handler held and its captured final held at the wire.
+   * @param {Clock} [clock] Controlled time; the member runs on real timers without it.
    * @returns {Promise<{final: object, gate: object}>} The held final request and the handler's gate.
    */
-  const fenceWithHeldFinal = async () => {
+  const fenceWithHeldFinal = async (clock) => {
     await start()
     h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a'])])])
     let fence = false
@@ -342,18 +403,24 @@ describe('public share shutdown contract', () => {
       })
     )
     const final = h.hold({ api: 'ShareAcknowledge' })
-    const gate = deferred()
+    const gate = hold()
     const started = deferred()
     await h.consumer.run({
-      eachMessage: async ({ acknowledge }) => {
+      eachMessage: tracked(async ({ acknowledge }) => {
         acknowledge()
         started.resolve()
         await gate.promise
-      },
+      }),
     })
     await started.promise
     fence = true
-    await final.arrived()
+    if (clock) {
+      let arrived = false
+      final.arrived().then(() => {
+        arrived = true
+      })
+      await clock.advanceUntil(() => arrived, 'the held final')
+    } else await final.arrived()
     return { final, gate }
   }
 
@@ -397,16 +464,24 @@ describe('public share shutdown contract', () => {
   })
 
   test('keeps the heartbeat chain suspended while a fenced run closes and resumes it after', async () => {
+    const clock = new Clock()
+    clock.install()
     const runs = captureRuns()
-    const { final, gate } = await fenceWithHeldFinal()
+    const { final, gate } = await fenceWithHeldFinal(clock)
     const [run] = runs
     const joinFrames = () => h.frames(76).filter(({ fields }) => fields.memberEpoch === 0)
     expect(run.manager.isRunning()).toBe(false)
     expect(joinFrames()).toHaveLength(1)
-    const rejoined = deferred()
-    h.consumer.on(h.consumer.events.GROUP_JOIN, () => rejoined.resolve())
+    const beats = h.frames(76).length
+    await clock.advance(4000)
+    expect(h.frames(76)).toHaveLength(beats)
+    expect(run.manager.isRunning()).toBe(false)
+    let rejoined = false
+    h.consumer.on(h.consumer.events.GROUP_JOIN, () => {
+      rejoined = true
+    })
     final.release()
-    await rejoined.promise
+    await clock.advanceUntil(() => rejoined, 'the rejoin')
     expect(run.manager.isRunning()).toBe(true)
     expect(joinFrames()).toHaveLength(2)
     gate.resolve()
@@ -416,15 +491,15 @@ describe('public share shutdown contract', () => {
     const runs = captureRuns()
     await start()
     h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a'])])])
-    const gate = deferred()
+    const gate = hold()
     const started = deferred()
     const saved = {}
     await h.consumer.run({
-      eachMessage: async ({ acknowledge, renew }) => {
+      eachMessage: tracked(async ({ acknowledge, renew }) => {
         Object.assign(saved, { acknowledge, renew })
         started.resolve()
         await gate.promise
-      },
+      }),
     })
     await started.promise
     const stopping = h.consumer.stop()

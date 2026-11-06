@@ -102,6 +102,7 @@ describe('Share consumer observer containment', () => {
 describe('public share event contract', () => {
   const {
     A,
+    B,
     acquire,
     acquired,
     deferred,
@@ -164,6 +165,89 @@ describe('public share event contract', () => {
       removed: [{ topic: 'topic-a', partitions: [0] }],
     })
     expect(h.consumer.assignment()).toEqual([])
+  })
+
+  test('publishes no assignment event for answers that repeat the assignment in another form', async () => {
+    h = shareClient({
+      interval: 5,
+      topics: {
+        'topic-a': {
+          topicId: A,
+          partitions: [
+            { leader: 0, epoch: 1 },
+            { leader: 0, epoch: 1 },
+          ],
+        },
+        'topic-b': { topicId: B, partitions: [{ leader: 0, epoch: 1 }] },
+      },
+    })
+    const seen = record(['ASSIGNMENT_CHANGED', 'HEARTBEAT'])
+    const epochs = () => seen.HEARTBEAT.map(({ payload }) => payload.memberEpoch)
+    const beats = [0, 1, 2].map(() =>
+      h.hold({ api: 'ShareGroupHeartbeat', match: ({ fields }) => fields.memberEpoch > 0 })
+    )
+    await h.consumer.subscribe({ topics: ['topic-a', 'topic-b'] })
+    await h.consumer.run({ eachMessage: async () => {} })
+    expect(epochs()).toEqual([1])
+    expect(seen.ASSIGNMENT_CHANGED.map(({ payload }) => payload.assignment)).toEqual([
+      [
+        { topic: 'topic-a', partitions: [0, 1] },
+        { topic: 'topic-b', partitions: [0] },
+      ],
+    ])
+
+    const answers = [
+      [
+        { topicId: B, partitions: [0] },
+        { topicId: A, partitions: [1, 0, 1] },
+      ],
+      [
+        { topicId: A, partitions: [0, 1] },
+        { topicId: B, partitions: [0] },
+      ],
+      [
+        { topicId: A, partitions: [1] },
+        { topicId: B, partitions: [0] },
+      ],
+    ]
+    for (const [index, topicPartitions] of answers.entries()) {
+      const epoch = index + 2
+      const call = await beats[index].arrived()
+      beats[index].release({
+        errorCode: 0,
+        errorMessage: null,
+        memberId: call.fields.memberId,
+        memberEpoch: epoch,
+        heartbeatIntervalMs: 5,
+        assignment: { topicPartitions },
+      })
+      await until(() => epochs().length === index + 2, `the heartbeat of epoch ${epoch}`)
+      expect(seen.ASSIGNMENT_CHANGED).toHaveLength(index === 2 ? 2 : 1)
+    }
+
+    expect(epochs()).toEqual([1, 2, 3, 4])
+    expect(
+      seen.ASSIGNMENT_CHANGED.slice(1).map(({ payload }) => ({
+        memberEpoch: payload.memberEpoch,
+        assignment: payload.assignment,
+        added: payload.added,
+        removed: payload.removed,
+      }))
+    ).toEqual([
+      {
+        memberEpoch: 4,
+        assignment: [
+          { topic: 'topic-a', partitions: [1] },
+          { topic: 'topic-b', partitions: [0] },
+        ],
+        added: [],
+        removed: [{ topic: 'topic-a', partitions: [0] }],
+      },
+    ])
+    expect(h.consumer.assignment()).toEqual([
+      { topic: 'topic-a', partitions: [1] },
+      { topic: 'topic-b', partitions: [0] },
+    ])
   })
 
   test.each(['stop', 'disconnect'])(

@@ -309,6 +309,10 @@ class ScriptedCluster {
     this.answerers = new Map()
     this.downNodes = new Set()
     this.blackholedNodes = new Set()
+    /** @type {Array<{node: object, socket: object, onConnect: () => void, generation: number}>} */
+    this.heldDials = []
+    /** @type {Map<string, object>} fields laid over every object answer of an API during its outage */
+    this.outages = new Map()
     this.advertised = new Map(PROFILES[profile].map(([api, version]) => [api, [version, version]]))
     for (const [api, range] of Object.entries(advertise)) {
       if (
@@ -352,11 +356,9 @@ class ScriptedCluster {
   }
 
   /**
-   * @param {number} id the id of a node taken down with `down`
-   * @returns {ScriptedCluster} this
-   */
-  /** Holds future dials without connecting; up restores them, existing sockets stay unchanged.
-   * @param {number} id node id
+   * Holds every later dial to a node: the socket exists but never connects, so a connect stays
+   * pending until `release`. Sockets the client already holds are unchanged.
+   * @param {number} id the node's id
    * @returns {ScriptedCluster} this
    */
   blackhole(id) {
@@ -365,10 +367,67 @@ class ScriptedCluster {
     return this
   }
 
-  /** Restores future dials; a held old dial remains held. @param {number} id node id @returns {ScriptedCluster} this */
+  /**
+   * Restores future dials of a node taken down or blackholed. A dial already held stays held until
+   * `release`.
+   * @param {number} id the node's id
+   * @returns {ScriptedCluster} this
+   */
   up(id) {
     this.downNodes.delete(id)
     this.blackholedNodes.delete(id)
+    return this
+  }
+
+  /**
+   * Connects every dial of a node that `blackhole` is holding, as if the network let it through
+   * now: each live held socket reports its connection on a later turn and answers requests from
+   * then on. A held socket the client already destroyed, for example on its connection timeout,
+   * stays dead. Callable whether or not the node is still blackholed.
+   * @param {number} id the node's id
+   * @returns {ScriptedCluster} this
+   */
+  release(id) {
+    const released = this.heldDials.filter(({ node }) => node.id === id)
+    this.heldDials = this.heldDials.filter(({ node }) => node.id !== id)
+    for (const { node, socket, onConnect, generation } of released) {
+      if (socket.destroyed) continue
+      this.answerOn(socket, node, generation)
+      setImmediate(onConnect)
+    }
+    return this
+  }
+
+  /**
+   * @param {number} id the node's id
+   * @returns {number} how many dials to the node are held and still alive, so a test can wait for
+   *   a dial to arrive before it releases it
+   */
+  heldDialsTo(id) {
+    return this.heldDials.filter(({ node, socket }) => node.id === id && !socket.destroyed).length
+  }
+
+  /**
+   * Starts an outage of one API: until `recover`, every later object answer of it carries `fields`
+   * over what it would have answered, so the broker stays reachable while the API fails. For
+   * Metadata, `{ errorCode: 129 }` is the top-level REBOOTSTRAP_REQUIRED answer. A Buffer answer
+   * released by a test is sent as it is.
+   * @param {string} api the API name, e.g. `Metadata`
+   * @param {object} fields the response fields that make it fail
+   * @returns {ScriptedCluster} this
+   */
+  outage(api, fields) {
+    this.outages.set(api, fields)
+    return this
+  }
+
+  /**
+   * Ends the outage of an API; its later answers are the ones nothing overrides.
+   * @param {string} api the API name
+   * @returns {ScriptedCluster} this
+   */
+  recover(api) {
+    this.outages.delete(api)
     return this
   }
 
@@ -551,19 +610,33 @@ class ScriptedCluster {
       return refused
     }
 
-    if (this.blackholedNodes.has(node.id))
-      return this.fake.factory({ host, port, onConnect: () => {} })
+    if (this.blackholedNodes.has(node.id)) {
+      const held = this.fake.factory({ host, port, onConnect: () => {} })
+      this.heldDials.push({ node, socket: held, onConnect, generation: this.socketsOpenedTo(node) })
+      return held
+    }
 
     const socket = this.fake.factory({ host, port, onConnect })
-    const generation = this.socketsOpenedTo(node)
+    this.answerOn(socket, node, this.socketsOpenedTo(node))
+
+    return socket
+  }
+
+  /**
+   * Makes a socket answer every request written to it.
+   * @private
+   * @param {import('events').EventEmitter} socket the socket of a connected dial
+   * @param {{ id: number, host: string, port: number }} node the node it dialled
+   * @param {number} generation which connection of the node it is, counting from 1
+   * @returns {void}
+   */
+  answerOn(socket, node, generation) {
     const write = socket.write
     socket.write = (buffer, ...rest) => {
       const result = write(buffer, ...rest)
       this.handle(socket, node, generation, Buffer.from(buffer))
       return result
     }
-
-    return socket
   }
 
   /**
@@ -743,6 +816,7 @@ class ScriptedCluster {
     this.schedule
       .run({ ...record, ...targetOf(record.fields) }, () => this.defaultAnswer(pair, record))
       .then((answer) => (answer === undefined ? this.defaultAnswer(pair, record) : answer))
+      .then((answer) => this.underOutage(record.api, answer))
       .then(
         (answer) =>
           // A macrotask, as the bytes of a real answer arrive: a client that loops on empty
@@ -761,6 +835,18 @@ class ScriptedCluster {
           }),
         (error) => socket.destroy(error)
       )
+  }
+
+  /**
+   * @private
+   * @param {string} api the API name
+   * @param {object|Buffer} answer what the call would be answered with
+   * @returns {object|Buffer} the answer with the API's outage fields over it, or the answer itself
+   *   when there is no outage or the answer is a Buffer
+   */
+  underOutage(api, answer) {
+    const outage = this.outages.get(api)
+    return outage && !Buffer.isBuffer(answer) ? { ...answer, ...outage } : answer
   }
 
   /**

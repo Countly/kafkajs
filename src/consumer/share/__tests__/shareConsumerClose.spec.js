@@ -2,7 +2,7 @@ const Broker = require('../../../broker')
 const Cluster = require('../../../cluster')
 const RequestQueue = require('../../../network/requestQueue')
 const { requests } = require('../../../protocol/requests')
-const { KafkaJSNonRetriableError } = require('../../../errors')
+const { KafkaJSNonRetriableError, KafkaJSShareAcknowledgementError } = require('../../../errors')
 const { ShareRun } = require('../shareRun')
 const {
   A,
@@ -96,33 +96,86 @@ const expectStale = (call) => {
   expect(thrown.message).toBe('Handler call is no longer current')
 }
 
-/** Holds the next captured final at one stage of its write path until the test lets it go. */
-class FinalHold {
-  /** @param {'lookup'|'encode'|'queue'} stage Where the final waits: before the transport call, in its encoder, or before the request queue. */
-  constructor(stage) {
+const WIRE = {
+  78: { method: 'shareFetch', codec: 'ShareFetch' },
+  79: { method: 'shareAcknowledge', codec: 'ShareAcknowledge' },
+}
+
+/**
+ * @param {object} fields Decoded fields of a ShareAcknowledge request.
+ * @returns {boolean} Whether it closes its share session, so a hold can let ordinary traffic pass.
+ */
+const isFinal = (fields) => fields.shareSessionEpoch === -1
+
+const PROBE_ACK = {
+  groupId: 'group',
+  memberId: 'probe',
+  shareSessionEpoch: 1,
+  isRenewAck: false,
+  topics: [],
+}
+const PROBE_BEAT = {
+  groupId: 'group',
+  memberId: 'probe',
+  memberEpoch: 3,
+  rackId: null,
+  subscribedTopicNames: null,
+}
+
+/**
+ * @param {object} connection A pooled connection, possibly replaced after a close captured it.
+ * @param {'ShareAcknowledge'|'ShareGroupHeartbeat'} api The probe request to send through it.
+ * @returns {Promise<object>} The decoded answer, which proves the connection carries traffic.
+ */
+const sendProbe = (connection, api) =>
+  connection.send(
+    api === 'ShareAcknowledge'
+      ? requests.ShareAcknowledge.protocol({ version: 2 })(PROBE_ACK)
+      : requests.ShareGroupHeartbeat.protocol({ version: 1 })(PROBE_BEAT)
+  )
+
+/** Holds one share request at one stage of its write path until the test lets it go. */
+class WireHold {
+  /**
+   * @param {78|79} apiKey The held request's API: ShareFetch or ShareAcknowledge.
+   * @param {'lookup'|'encode'|'queue'} stage Where the request waits: before the Broker call, in
+   *   its encoder, or before the request queue.
+   * @param {object} [options] Which request is held.
+   * @param {number} [options.skip=0] Matching requests let through first.
+   * @param {(fields: object) => boolean} [options.fields] Picks requests by their decoded fields;
+   *   the queue stage has no fields and counts every request of the API.
+   */
+  constructor(apiKey, stage, { skip = 0, fields = () => true } = {}) {
     this.gate = deferred()
     this.arrival = deferred()
     this.failure = null
     const { gate, arrival } = this
     const hold = this
+    const { method, codec } = WIRE[apiKey]
+    let seen = 0
+    let taken = false
+    const take = (candidate) => {
+      if (taken || (candidate !== undefined && !fields(candidate))) return false
+      if (seen++ < skip) return false
+      taken = true
+      return true
+    }
     if (stage === 'lookup') {
-      const original = Broker.prototype.shareAcknowledge
-      jest
-        .spyOn(Broker.prototype, 'shareAcknowledge')
-        .mockImplementation(async function (fields, options) {
-          if (fields.shareSessionEpoch !== -1) return original.call(this, fields, options)
-          arrival.resolve()
-          await gate.promise
-          if (hold.failure) throw hold.failure
-          return original.call(this, fields, options)
-        })
+      const original = Broker.prototype[method]
+      jest.spyOn(Broker.prototype, method).mockImplementation(async function (request, options) {
+        if (!take(request)) return original.call(this, request, options)
+        arrival.resolve()
+        await gate.promise
+        if (hold.failure) throw hold.failure
+        return original.call(this, request, options)
+      })
     } else if (stage === 'encode') {
-      const original = requests.ShareAcknowledge.protocol
-      jest.spyOn(requests.ShareAcknowledge, 'protocol').mockImplementation((selection) => {
+      const original = requests[codec].protocol
+      jest.spyOn(requests[codec], 'protocol').mockImplementation((selection) => {
         const factory = original(selection)
         return (options) => {
           const built = factory(options)
-          if (options?.shareSessionEpoch !== -1) return built
+          if (!take(options)) return built
           const { encode } = built.request
           return {
             ...built,
@@ -139,10 +192,8 @@ class FinalHold {
       })
     } else {
       const original = RequestQueue.prototype.push
-      let taken = false
       jest.spyOn(RequestQueue.prototype, 'push').mockImplementation(function (pushed) {
-        if (taken || pushed.entry.apiKey !== 79) return original.call(this, pushed)
-        taken = true
+        if (pushed.entry.apiKey !== apiKey || !take()) return original.call(this, pushed)
         arrival.resolve()
         gate.promise.then(() => {
           try {
@@ -155,12 +206,12 @@ class FinalHold {
     }
   }
 
-  /** @returns {Promise<void>} Resolves once the final reached the held stage. */
+  /** @returns {Promise<void>} Resolves once the request reached the held stage. */
   arrived() {
     return this.arrival.promise
   }
 
-  /** @returns {void} Lets the final continue from its stage. */
+  /** @returns {void} Lets the request continue from its stage. */
   release() {
     this.gate.resolve()
   }
@@ -192,17 +243,32 @@ class CloseRig {
     this.clock = new Clock()
     this.clock.install()
     this.runs = []
+    this.nodes = []
+    this.clusters = []
     this.holds = []
     this.calls = []
     this.order = []
     this.acks = []
     this.resets = []
+    this.settling = []
     this.gate = deferred()
-    const runs = this.runs
+    this.gates = new Map()
+    const { runs, clusters } = this
+    const started = this.nodes
     const start = ShareRun.prototype.start
     jest.spyOn(ShareRun.prototype, 'start').mockImplementation(function () {
       runs.push(this)
       return start.call(this)
+    })
+    const startNode = ShareRun.prototype.startNode
+    jest.spyOn(ShareRun.prototype, 'startNode').mockImplementation(function (nodeId, rows) {
+      startNode.call(this, nodeId, rows)
+      started.push(this.nodes.get(nodeId))
+    })
+    const connect = Cluster.prototype.connect
+    jest.spyOn(Cluster.prototype, 'connect').mockImplementation(function (...args) {
+      if (!clusters.includes(this)) clusters.push(this)
+      return connect.apply(this, args)
     })
     this.h = shareClient({
       nodes,
@@ -227,26 +293,54 @@ class CloseRig {
   }
 
   /**
-   * Subscribes, joins, and starts handlers; the handlers of `hold` partitions wait on `gate`.
+   * Subscribes, joins, and starts handlers. A handler of a `hold` partition records its call, then
+   * waits on its gate, returns, or throws, as `mode` says.
    * @param {object} [options] Start options.
    * @param {string[]} [options.records=['a']] Values the first fetch of partition 0 acquires.
    * @param {Array<object|Function>} [options.fetches] Scripted ShareFetch answers, in order.
-   * @param {number[]} [options.hold=[0]] Partitions whose handler waits.
-   * @param {'accept'|'release'|'reject'} [options.decide] An explicit decision a waiting handler makes first.
-   * @returns {Promise<void>} Resolves once a waiting handler started.
+   * @param {number[]} [options.hold=[0]] Partitions whose handler is observed.
+   * @param {'accept'|'release'|'reject'} [options.decide] An explicit decision an observed handler makes first.
+   * @param {'hold'|'return'|'throw'} [options.mode='hold'] Whether an observed handler waits, returns, or throws.
+   * @param {boolean} [options.separate=false] Whether each observed partition has a gate of its own.
+   * @returns {Promise<void>} Resolves once an observed handler started.
    */
-  async begin({ records = ['a'], fetches, hold = [0], decide } = {}) {
+  async begin({
+    records = ['a'],
+    fetches,
+    hold = [0],
+    decide,
+    mode = 'hold',
+    separate = false,
+  } = {}) {
     await this.h.consumer.subscribe({ topics: ['topic-a'] })
     this.h.script('ShareFetch', fetches ?? [fetchAnswer([acquire(0, 0, records)])])
+    if (separate) for (const partition of hold) this.gates.set(partition, deferred())
     await this.h.consumer.run({
-      eachMessage: async ({ partition, message, acknowledge, renew, isRunning }) => {
-        if (!hold.includes(partition)) return
-        this.calls.push({ partition, offset: message.offset, acknowledge, renew, isRunning })
-        if (decide) acknowledge(decide)
-        await this.gate.promise
+      eachMessage: (payload) => {
+        const handled = this.handle(payload, { hold, decide, mode, separate })
+        this.settling.push(handled)
+        return handled
       },
     })
     await until(() => this.calls.length > 0, 'a held handler')
+  }
+
+  /**
+   * @private
+   * @param {object} payload The `eachMessage` payload.
+   * @param {object} how The `begin` options that steer the handler.
+   * @returns {Promise<void>} The handler's own promise, which the rig awaits when it ends.
+   */
+  async handle(
+    { partition, message, acknowledge, renew, isRunning },
+    { hold, decide, mode, separate }
+  ) {
+    if (!hold.includes(partition)) return
+    this.calls.push({ partition, offset: message.offset, acknowledge, renew, isRunning })
+    if (decide) acknowledge(decide)
+    if (mode === 'throw') throw new Error('handler failed')
+    if (mode === 'return') return
+    await (separate ? this.gates.get(partition) : this.gate).promise
   }
 
   /** @returns {object[]} Every final frame (ShareAcknowledge at epoch -1). */
@@ -289,13 +383,65 @@ class CloseRig {
   }
 
   /**
-   * @param {'lookup'|'encode'|'queue'} stage Where the next final waits.
-   * @returns {FinalHold} The hold, installed before the close starts.
+   * @param {78|79} apiKey The API of the request to hold.
+   * @param {'lookup'|'encode'|'queue'} stage Where the request waits.
+   * @param {object} [options] Which request, as `WireHold` takes them.
+   * @returns {WireHold} The hold, installed before the request is made.
    */
-  holdFinal(stage) {
-    const hold = new FinalHold(stage)
+  holdWire(apiKey, stage, options) {
+    const hold = new WireHold(apiKey, stage, options)
     this.holds.push(hold)
     return hold
+  }
+
+  /**
+   * @param {() => boolean} predicate The reached-stage condition.
+   * @param {string} what What is awaited, named by the failure.
+   * @param {number} [step=50] Fake milliseconds delivered per check.
+   * @returns {Promise<void>}
+   * @throws {Error} When the condition does not hold after 100 checks.
+   */
+  async advanceUntil(predicate, what, step = 50) {
+    for (let turn = 0; turn < 100 && !predicate(); turn++) await this.advance(step)
+    if (!predicate()) throw new Error(`${what} did not happen`)
+  }
+
+  /**
+   * @param {'lookup'|'encode'|'queue'} stage Where the next final waits.
+   * @returns {WireHold} The hold, installed before the close starts.
+   */
+  holdFinal(stage) {
+    return this.holdWire(79, stage, { fields: isFinal })
+  }
+
+  /**
+   * Starts a close whose captured final is held, with the clock a known number of milliseconds
+   * short of the bound the test names.
+   * @param {'whole-call'|'final-cap'} bound The deadline the close runs against: a disconnect
+   *   deadline of 400 ms, or the cap of one request timeout after the handler boundary.
+   * @param {'lookup'|'encode'|'queue'|'response'} stage Where the final waits.
+   * @returns {Promise<{closing: object, hold: {arrived: Function, release: Function}, remaining: number}>}
+   *   The close, the hold on its final, and the milliseconds left until the bound.
+   */
+  async closeWithHeldFinal(bound, stage) {
+    const hold =
+      stage === 'response' ? this.h.hold({ api: 'ShareAcknowledge' }) : this.holdFinal(stage)
+    let closing
+    let remaining
+    if (bound === 'whole-call') {
+      await this.begin({ decide: 'accept' })
+      closing = track(this.h.consumer.disconnect({ timeout: 400 }))
+      await this.advance(300)
+      remaining = 100
+    } else {
+      await this.begin()
+      closing = track(this.h.consumer.stop())
+      await this.advance(250)
+      this.gate.resolve()
+      remaining = 1000
+    }
+    await hold.arrived()
+    return { closing, hold, remaining }
   }
 
   /** @returns {{arrived: () => Promise<void>, release: () => void}} A hold on the client's Cluster disconnect, so the state after the captured teardown is observable. */
@@ -312,10 +458,12 @@ class CloseRig {
     return { arrived: () => arrival.promise, release: () => gate.resolve() }
   }
 
-  /** @returns {Promise<void>} Releases every hold, restores timers and mocks, and closes the client. */
+  /** @returns {Promise<void>} Releases every handler gate and hold, awaits the handlers, restores timers and mocks, and closes the client. */
   async end() {
     this.gate.resolve()
+    for (const gate of this.gates.values()) gate.resolve()
     for (const hold of this.holds) hold.release()
+    await Promise.allSettled(this.settling)
     jest.restoreAllMocks()
     jest.useRealTimers()
     await this.h.close()
@@ -463,6 +611,45 @@ describe('captured share close', () => {
     })
   })
 
+  describe('an ordinary request held when a disconnect begins', () => {
+    const KINDS = {
+      fetch: { apiKey: 78, skip: 1, start: { mode: 'return' }, ack: [0, '0', '0', 'accept'] },
+      flush: { apiKey: 79, skip: 0, start: { mode: 'throw' }, ack: [0, '0', '0', 'release'] },
+    }
+    const ROWS = ['fetch', 'flush'].flatMap((kind) =>
+      ['lookup', 'encode', 'queue'].flatMap((stage) => [
+        [kind, stage, 0],
+        [kind, stage, 400],
+      ])
+    )
+
+    test.each(ROWS)(
+      'writes no ordinary %s request held at the %s stage when a disconnect with timeout %p begins',
+      async (kind, stage, timeout) => {
+        const { apiKey, skip, start, ack } = KINDS[kind]
+        rig = new CloseRig()
+        const hold = rig.holdWire(apiKey, stage, { skip })
+        await rig.begin(start)
+        await hold.arrived()
+        const written = { fetches: rig.h.frames(78).length, acks: rig.h.frames(79).length }
+        const closing = track(rig.h.consumer.disconnect({ timeout }))
+        if (timeout > 0) await rig.advance(300)
+        await until(() => rig.acks.length === 1, 'the retirement of the held request')
+        expect(rig.acks).toEqual([[...ack, 'membership-lost']])
+        hold.release()
+        await until(() => closing.settled, 'the close')
+        await flush()
+        expect(closing.error).toBeNull()
+        expect(rig.h.frames(78)).toHaveLength(written.fetches)
+        expect(rig.h.frames(79)).toHaveLength(written.acks)
+        expect(rig.finals()).toHaveLength(0)
+        expect(rig.leaves()).toHaveLength(timeout === 0 ? 0 : 1)
+        expect(rig.acks).toEqual([[...ack, 'membership-lost']])
+        expect(rig.order).toEqual(['stop', 'disconnect'])
+      }
+    )
+  })
+
   describe('finals of nodes that are not idle at the forced boundary', () => {
     test('skips the final of a busy node and never revives it', async () => {
       rig = new CloseRig({ nodes: 2, topics: TWO_NODES })
@@ -497,10 +684,15 @@ describe('captured share close', () => {
   })
 
   describe('timeout zero while a close is already running', () => {
-    test.each(['lookup', 'encode', 'queue'])(
-      'writes no final held at the %s stage when a zero timeout arrives',
-      async (stage) => {
-        rig = new CloseRig()
+    test.each(
+      ['lookup', 'encode', 'queue'].flatMap((stage) => [
+        [stage, false],
+        [stage, true],
+      ])
+    )(
+      'writes no final held at the %s stage when a zero timeout arrives (transport enforcement %p)',
+      async (stage, enforce) => {
+        rig = new CloseRig({ enforce })
         await rig.begin({ decide: 'accept' })
         const hold = rig.holdFinal(stage)
         const closing = track(rig.h.consumer.disconnect({ timeout: 400 }))
@@ -518,7 +710,27 @@ describe('captured share close', () => {
       }
     )
 
-    test('leaves a written final unconfirmed when a zero timeout arrives', async () => {
+    test.each([false, true])(
+      'leaves a written final unconfirmed when a zero timeout arrives (transport enforcement %p)',
+      async (enforce) => {
+        rig = new CloseRig({ enforce })
+        await rig.begin({ decide: 'accept' })
+        const final = rig.h.hold({ api: 'ShareAcknowledge' })
+        const closing = track(rig.h.consumer.disconnect({ timeout: 400 }))
+        await rig.advance(300)
+        await final.arrived()
+        const zero = track(rig.h.consumer.disconnect({ timeout: 0 }))
+        await rig.advance(100)
+        await until(() => closing.settled && zero.settled, 'the close')
+        expect(rig.finals()).toHaveLength(1)
+        expect(rig.finals()[0].answeredOrder).toBeUndefined()
+        expect(rig.leaves()).toHaveLength(0)
+        expect(rig.acks).toEqual([[0, '0', '0', 'accept', 'session-lost']])
+        expect(rig.socketOf(rig.finals()[0]).destroyed).toBe(true)
+      }
+    )
+
+    test('returns at once for a written final when a zero timeout arrives, without a timer', async () => {
       rig = new CloseRig()
       await rig.begin({ decide: 'accept' })
       const final = rig.h.hold({ api: 'ShareAcknowledge' })
@@ -526,13 +738,11 @@ describe('captured share close', () => {
       await rig.advance(300)
       await final.arrived()
       const zero = track(rig.h.consumer.disconnect({ timeout: 0 }))
-      await rig.advance(100)
-      await until(() => closing.settled && zero.settled, 'the close')
-      expect(rig.finals()).toHaveLength(1)
-      expect(rig.finals()[0].answeredOrder).toBeUndefined()
-      expect(rig.leaves()).toHaveLength(0)
+      await until(() => closing.settled && zero.settled, 'the close after the zero timeout')
+      expect([closing.error, zero.error]).toEqual([null, null])
       expect(rig.acks).toEqual([[0, '0', '0', 'accept', 'session-lost']])
       expect(rig.socketOf(rig.finals()[0]).destroyed).toBe(true)
+      expect(rig.leaves()).toHaveLength(0)
     })
   })
 
@@ -605,56 +815,66 @@ describe('captured share close', () => {
   })
 
   describe('actual time at every closing boundary', () => {
-    test.each([
-      ['lookup', 'the whole-call deadline'],
-      ['encode', 'the whole-call deadline'],
-      ['queue', 'the whole-call deadline'],
-      ['lookup', 'the shared final cap'],
-      ['encode', 'the shared final cap'],
-      ['queue', 'the shared final cap'],
-    ])('writes no final held at the %s stage once the clock reaches %s', async (stage, bound) => {
-      rig = new CloseRig()
-      let closing
-      if (bound === 'the whole-call deadline') {
-        await rig.begin({ decide: 'accept' })
-        const hold = rig.holdFinal(stage)
-        closing = track(rig.h.consumer.disconnect({ timeout: 400 }))
-        await rig.advance(300)
-        await hold.arrived()
-        rig.clock.skew(100)
-        hold.release()
-      } else {
-        await rig.begin()
-        const hold = rig.holdFinal(stage)
-        closing = track(rig.h.consumer.stop())
-        await rig.advance(250)
-        rig.gate.resolve()
-        await hold.arrived()
-        rig.clock.skew(1000)
-        hold.release()
-      }
-      await until(() => closing.settled, 'the refused close')
-      expect(closing.error).toBeNull()
-      expect(rig.h.frames(79)).toHaveLength(0)
-      expect(rig.leaves()).toHaveLength(0)
-      expect(rig.acks).toEqual([[0, '0', '0', 'accept', 'not-sent']])
-    })
+    const BOUNDS = ['whole-call', 'final-cap']
+    const rows = (stages) =>
+      stages.flatMap((stage) =>
+        BOUNDS.flatMap((bound) => [
+          [stage, bound, false],
+          [stage, bound, true],
+        ])
+      )
 
-    test('discards the answer of a written final that arrives after the deadline', async () => {
-      rig = new CloseRig()
-      await rig.begin({ decide: 'accept' })
-      const final = rig.h.hold({ api: 'ShareAcknowledge' })
-      const closing = track(rig.h.consumer.disconnect({ timeout: 400 }))
-      await rig.advance(300)
-      await final.arrived()
-      rig.clock.skew(100)
-      final.release()
-      await until(() => closing.settled, 'the late answer')
-      expect(rig.finals()).toHaveLength(1)
-      expect(rig.finals()[0].answeredOrder).toBeDefined()
-      expect(rig.leaves()).toHaveLength(0)
-      expect(rig.acks).toEqual([[0, '0', '0', 'accept', 'session-lost']])
-    })
+    test.each(rows(['lookup', 'encode', 'queue']))(
+      'writes no final held at the %s stage once the clock reaches the %s bound (transport enforcement %p)',
+      async (stage, bound, enforce) => {
+        rig = new CloseRig({ enforce })
+        const { closing, hold, remaining } = await rig.closeWithHeldFinal(bound, stage)
+        rig.clock.skew(remaining)
+        hold.release()
+        await until(() => closing.settled, 'the refused close')
+        expect(closing.error).toBeNull()
+        expect(rig.h.frames(79)).toHaveLength(0)
+        expect(rig.leaves()).toHaveLength(0)
+        expect(rig.acks).toEqual([[0, '0', '0', 'accept', 'not-sent']])
+      }
+    )
+
+    test.each(rows(['lookup', 'encode', 'queue', 'response']))(
+      'writes the final held at the %s stage when it is released a millisecond before the %s bound (transport enforcement %p)',
+      async (stage, bound, enforce) => {
+        rig = new CloseRig({ enforce })
+        const { closing, hold, remaining } = await rig.closeWithHeldFinal(bound, stage)
+        rig.clock.skew(remaining - 1)
+        hold.release()
+        await until(() => closing.settled, 'the control close')
+        expect(closing.error).toBeNull()
+        expect(rig.finals()).toHaveLength(1)
+        expect(rig.finals()[0].answeredOrder).toBeDefined()
+        expect(rig.leaves()).toHaveLength(1)
+        expect(rig.acks).toEqual([[0, '0', '0', 'accept', null]])
+      }
+    )
+
+    test.each(
+      BOUNDS.flatMap((bound) => [
+        [bound, false],
+        [bound, true],
+      ])
+    )(
+      'discards the answer of a written final released once the clock reaches the %s bound (transport enforcement %p)',
+      async (bound, enforce) => {
+        rig = new CloseRig({ enforce })
+        const { closing, hold, remaining } = await rig.closeWithHeldFinal(bound, 'response')
+        expect(rig.finals()).toHaveLength(1)
+        rig.clock.skew(remaining)
+        hold.release()
+        await until(() => closing.settled, 'the late answer')
+        expect(rig.finals()).toHaveLength(1)
+        expect(rig.finals()[0].answeredOrder).toBeDefined()
+        expect(rig.leaves()).toHaveLength(0)
+        expect(rig.acks).toEqual([[0, '0', '0', 'accept', 'session-lost']])
+      }
+    )
   })
 
   describe('captured authority after ordinary retirement', () => {
@@ -720,10 +940,37 @@ describe('captured share close', () => {
       expect(rig.resets).toEqual(['membership'])
       expect(rig.order).toEqual(['stop'])
     })
+
+    test.each([122, 123, 133, 35, -1])(
+      'delivers through a healthy replacement run after code %p',
+      async (code) => {
+        rig = new CloseRig()
+        await rig.begin()
+        rig.h.script('ShareAcknowledge', [ackAnswer([], { errorCode: code })])
+        const stopping = track(rig.h.consumer.stop())
+        rig.gate.resolve()
+        await until(() => stopping.settled, 'the stop')
+        expect(rig.h.frames(79)).toHaveLength(1)
+        const delivered = []
+        const fetchesBefore = rig.h.frames(78).length
+        rig.h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['b'])])])
+        await rig.h.consumer.run({
+          eachMessage: async ({ message }) => {
+            delivered.push(message.value.toString())
+          },
+        })
+        await until(() => delivered.length === 1, 'the replacement delivery')
+        expect(delivered).toEqual(['b'])
+        expect(new Set(rig.joins().map(({ fields }) => fields.memberId)).size).toBe(2)
+        expect(rig.h.frames(78)[fetchesBefore].fields.shareSessionEpoch).toBe(0)
+        expect(rig.h.frames(79)).toHaveLength(1)
+        expect(rig.leaves()).toHaveLength(1)
+      }
+    )
   })
 
   describe('captured connection generations', () => {
-    test('keeps a replaced data connection open when the leave is abandoned', async () => {
+    test('keeps a replaced data connection open and carrying traffic when the leave is abandoned', async () => {
       rig = new CloseRig()
       await rig.begin({ decide: 'accept' })
       const cluster = rig.holdClusterDisconnect()
@@ -744,12 +991,17 @@ describe('captured share close', () => {
       await cluster.arrived()
       expect(replacement.destroyed).toBe(false)
       expect(rig.socketOf(rig.leaves()[0]).destroyed).toBe(true)
+      const reply = await sendProbe(binding.connection, 'ShareAcknowledge')
+      expect(reply.errorCode).toBe(0)
+      const probe = rig.h.frames(79).at(-1)
+      expect(probe.fields.memberId).toBe('probe')
+      expect(rig.socketOf(probe)).toBe(replacement)
       cluster.release()
       await until(() => closing.settled, 'the close')
       expect(replacement.destroyed).toBe(true)
     })
 
-    test('keeps a replaced coordinator connection open when the final is abandoned', async () => {
+    test('keeps a replaced coordinator connection open and carrying traffic when the final is abandoned', async () => {
       rig = new CloseRig()
       await rig.begin({ decide: 'accept' })
       const cluster = rig.holdClusterDisconnect()
@@ -768,8 +1020,15 @@ describe('captured share close', () => {
       expect(replacement.destroyed).toBe(false)
       expect(rig.socketOf(rig.finals()[0]).destroyed).toBe(true)
       expect(rig.leaves()).toHaveLength(0)
+      const reply = await sendProbe(connection, 'ShareGroupHeartbeat')
+      expect(reply.errorCode).toBe(0)
+      expect(reply.memberId).toBe('probe')
+      const probe = rig.h.frames(76).at(-1)
+      expect(probe.fields.memberId).toBe('probe')
+      expect(rig.socketOf(probe)).toBe(replacement)
       cluster.release()
       await until(() => closing.settled, 'the close')
+      expect(replacement.destroyed).toBe(true)
     })
   })
 
@@ -839,6 +1098,30 @@ describe('captured share close', () => {
       ])
     })
 
+    test('settles a pending renewal and its undecided record membership-lost when the member crashes', async () => {
+      rig = new CloseRig()
+      const renewal = rig.h.hold({
+        api: 'ShareAcknowledge',
+        match: ({ fields }) => fields.isRenewAck === true,
+      })
+      await rig.begin()
+      const renewing = track(rig.calls[0].renew())
+      await renewal.arrived()
+      const crashed = track(rig.runs[0].crash(new Error('terminal')))
+      expectStale(() => rig.calls[0].acknowledge('accept'))
+      expectStale(() => rig.calls[0].renew())
+      await until(() => crashed.settled && renewing.settled, 'the crash and the renewal')
+      expect(renewing.error).toBeInstanceOf(KafkaJSShareAcknowledgementError)
+      expect(renewing.error.reason).toBe('membership-lost')
+      expect(rig.finals()).toHaveLength(0)
+      expect(rig.leaves()).toHaveLength(1)
+      expect(rig.acks).toEqual([
+        [0, '0', '0', 'renew', 'membership-lost'],
+        [0, '0', '0', 'release', 'membership-lost'],
+      ])
+      expect(rig.order).toEqual(['crash'])
+    })
+
     test('fences ordinary work when the member is removed and resumes after the capped close', async () => {
       rig = new CloseRig({ interval: 100 })
       await rig.begin({ decide: 'accept' })
@@ -876,64 +1159,82 @@ describe('captured share close', () => {
       'Failed to execute listener: stop listener',
     ]
 
-    test('contains each failure once without changing the close order', async () => {
-      rig = new CloseRig()
-      const { consumer } = rig.h
-      const logged = []
-      jest.spyOn(consumer.logger(), 'error').mockImplementation((message) => {
-        if (message.startsWith('Failed to execute listener')) logged.push(message)
-      })
-      const order = []
-      const { events, on } = consumer
-      for (const name of ['ACKNOWLEDGE', 'STOP', 'DISCONNECT'])
-        on(events[name], () => order.push(name.toLowerCase()))
-      const reentrant = []
-      on(events.HEARTBEAT, () => {
-        throw new Error('heartbeat listener')
-      })
-      on(events.ACKNOWLEDGE, () => {
-        reentrant.push(consumer.stop())
-        throw new Error('ack listener')
-      })
-      on(events.STOP, async () => {
-        reentrant.push(consumer.disconnect())
-        throw new Error('stop listener')
-      })
-      on(events.DISCONNECT, () => {
-        throw new Error('disconnect listener')
-      })
-      await rig.begin()
-      const stopping = track(consumer.stop())
-      rig.gate.resolve()
-      await until(() => stopping.settled, 'the stop')
-      await until(() => rig.order.includes('disconnect'), 'the reentrant disconnect')
-      await Promise.all(reentrant)
-      expect(order).toEqual(['acknowledge', 'stop', 'disconnect'])
-      expect(logged.sort()).toEqual(FAILURES)
-      expect(rig.finals()).toHaveLength(1)
-      expect(rig.leaves()).toHaveLength(1)
-      expect(rig.runs).toHaveLength(1)
-      expect(consumer.assignment()).toEqual([])
-    })
+    /**
+     * @param {'sync'|'async'} style Whether the listener throws or returns a rejected promise.
+     * @param {string} message The failure's message.
+     * @param {() => void} [before] Work the listener does before it fails.
+     * @returns {Function} A listener that fails in that style.
+     */
+    const failing = (style, message, before) =>
+      style === 'sync'
+        ? () => {
+            before?.()
+            throw new Error(message)
+          }
+        : async () => {
+            before?.()
+            throw new Error(message)
+          }
 
-    test('contains a failing crash listener and still finishes the supervised crash', async () => {
-      rig = new CloseRig()
-      const { consumer } = rig.h
-      const logged = []
-      jest.spyOn(consumer.logger(), 'error').mockImplementation((message) => {
-        if (message.startsWith('Failed to execute listener')) logged.push(message)
-      })
-      consumer.on(consumer.events.CRASH, async () => {
-        throw new Error('crash listener')
-      })
-      await rig.begin({ decide: 'accept' })
-      await rig.runs[0].crash(new Error('terminal'))
-      await flush()
-      expect(rig.order).toEqual(['crash'])
-      expect(logged).toEqual(['Failed to execute listener: crash listener'])
-      expect(rig.finals()).toHaveLength(1)
-      expect(rig.runs).toHaveLength(1)
-    })
+    test.each(['sync', 'async'])(
+      'contains each %s failure once without changing the close order',
+      async (style) => {
+        rig = new CloseRig()
+        const { consumer } = rig.h
+        const logged = []
+        jest.spyOn(consumer.logger(), 'error').mockImplementation((message) => {
+          if (message.startsWith('Failed to execute listener')) logged.push(message)
+        })
+        const order = []
+        const { events, on } = consumer
+        for (const name of ['ACKNOWLEDGE', 'STOP', 'DISCONNECT'])
+          on(events[name], () => order.push(name.toLowerCase()))
+        const reentrant = []
+        on(events.HEARTBEAT, failing(style, 'heartbeat listener'))
+        on(
+          events.ACKNOWLEDGE,
+          failing(style, 'ack listener', () => reentrant.push(consumer.stop()))
+        )
+        on(
+          events.STOP,
+          failing(style, 'stop listener', () => reentrant.push(consumer.disconnect()))
+        )
+        on(events.DISCONNECT, failing(style, 'disconnect listener'))
+        await rig.begin()
+        const stopping = track(consumer.stop())
+        rig.gate.resolve()
+        await until(() => stopping.settled, 'the stop')
+        await until(() => rig.order.includes('disconnect'), 'the reentrant disconnect')
+        await Promise.all(reentrant)
+        await flush()
+        expect(order).toEqual(['acknowledge', 'stop', 'disconnect'])
+        expect(logged.sort()).toEqual(FAILURES)
+        expect(rig.finals()).toHaveLength(1)
+        expect(rig.leaves()).toHaveLength(1)
+        expect(rig.runs).toHaveLength(1)
+        expect(consumer.assignment()).toEqual([])
+      }
+    )
+
+    test.each(['sync', 'async'])(
+      'contains a %s failing crash listener and still finishes the supervised crash',
+      async (style) => {
+        rig = new CloseRig()
+        const { consumer } = rig.h
+        const logged = []
+        jest.spyOn(consumer.logger(), 'error').mockImplementation((message) => {
+          if (message.startsWith('Failed to execute listener')) logged.push(message)
+        })
+        consumer.on(consumer.events.CRASH, failing(style, 'crash listener'))
+        await rig.begin({ decide: 'accept' })
+        await rig.runs[0].crash(new Error('terminal'))
+        await flush()
+        expect(rig.order).toEqual(['crash'])
+        expect(logged).toEqual(['Failed to execute listener: crash listener'])
+        expect(rig.finals()).toHaveLength(1)
+        expect(rig.runs).toHaveLength(1)
+      }
+    )
   })
 
   describe('a poll-interval overrun', () => {
@@ -965,75 +1266,151 @@ describe('captured share close', () => {
       expect(rig.order).toEqual([])
     })
 
-    test('does not rejoin when a stop arrives while the expired handler runs', async () => {
+    test('rejoins only after every expired handler of two nodes finished', async () => {
+      rig = new CloseRig({ ...POLL, nodes: 2, topics: TWO_NODES })
+      const answer = (fields, call) => fetchAnswer([acquire(call.node, 0, [`v${call.node}`])])
+      await rig.begin({ decide: 'accept', hold: [0, 1], fetches: [answer, answer], separate: true })
+      await until(() => rig.calls.length === 2, 'both handlers')
+      await rig.advance(1100)
+      await until(() => rig.finals().length === 2, 'the finals of both expired nodes')
+      await until(() => rig.runs[0].closing === null, 'the end of the close')
+      expect(
+        rig
+          .finals()
+          .map(({ node }) => node)
+          .sort()
+      ).toEqual([0, 1])
+      expect(rig.joins()).toHaveLength(1)
+      rig.gates.get(0).resolve()
+      await rig.advance(5000)
+      expect(rig.joins()).toHaveLength(1)
+      rig.gates.get(1).resolve()
+      await rig.advance(1)
+      await until(() => rig.joins().length === 2, 'the rejoin after both handlers')
+      expect(rig.order).toEqual([])
+    })
+
+    test.each([
+      ['stop', ['stop']],
+      ['disconnect', ['stop', 'disconnect']],
+    ])('does not rejoin when a %s abandons the expired handler', async (call, order) => {
       await overrun()
-      const stopping = track(rig.h.consumer.stop())
-      await until(() => stopping.settled, 'the stop')
+      const closing = track(rig.h.consumer[call]())
+      await until(() => closing.settled, `the ${call}`)
+      expect(closing.error).toBeNull()
       rig.gate.resolve()
       await rig.advance(5000)
       expect(rig.joins()).toHaveLength(1)
-      expect(rig.order).toEqual(['stop'])
+      expect(rig.order).toEqual(order)
       expect(rig.runs).toHaveLength(1)
     })
   })
 
   describe('resources after every close outcome', () => {
     const OUTCOMES = {
-      'a clean stop': async (r) => {
-        const stopping = r.h.consumer.stop()
-        r.gate.resolve()
-        await stopping
+      'a clean stop': {
+        act: async (r) => {
+          const stopping = r.h.consumer.stop()
+          r.gate.resolve()
+          await stopping
+        },
       },
-      'a failed final': async (r) => {
-        r.h.script('ShareAcknowledge', [ackAnswer([], { errorCode: 122 })])
-        const stopping = r.h.consumer.stop()
-        r.gate.resolve()
-        await stopping
+      'a failed final': {
+        act: async (r) => {
+          r.h.script('ShareAcknowledge', [ackAnswer([], { errorCode: 122 })])
+          const stopping = r.h.consumer.stop()
+          r.gate.resolve()
+          await stopping
+        },
       },
-      'a zero-timeout disconnect': (r) => r.h.consumer.disconnect({ timeout: 0 }),
-      'an unanswered final at the deadline': async (r) => {
-        const final = r.h.hold({ api: 'ShareAcknowledge' })
-        const closing = r.h.consumer.disconnect({ timeout: 400 })
-        await r.advance(300)
-        await final.arrived()
-        await r.advance(100)
-        await closing
-        final.release()
+      'a zero-timeout disconnect': { act: (r) => r.h.consumer.disconnect({ timeout: 0 }) },
+      'an unanswered final at the deadline': {
+        act: async (r) => {
+          const final = r.h.hold({ api: 'ShareAcknowledge' })
+          const closing = r.h.consumer.disconnect({ timeout: 400 })
+          await r.advance(300)
+          await final.arrived()
+          await r.advance(100)
+          await closing
+          final.release()
+        },
       },
-      'a crash': (r) => r.runs[0].crash(new Error('terminal')),
+      'a crash': { act: (r) => r.runs[0].crash(new Error('terminal')) },
+      'a crash and its restart': {
+        share: { retry: { restartOnFailure: async () => true } },
+        act: async (r) => {
+          const crashed = r.runs[0].crash(new Error('terminal'))
+          await r.advanceUntil(() => r.runs.length === 2, 'the restarted run')
+          await crashed
+          await r.advanceUntil(() => r.nodes.length === 2 && r.nodes[1].loop, 'the restarted node')
+          const stopping = track(r.h.consumer.stop())
+          await r.advanceUntil(() => stopping.settled, 'the stop of the restarted run')
+          expect(stopping.error).toBeNull()
+        },
+      },
     }
 
-    test.each(Object.keys(OUTCOMES))('returns to baseline after %s', async (outcome) => {
-      rig = new CloseRig()
-      await rig.h.consumer.connect()
-      const timers = jest.getTimerCount()
-      await rig.begin({ decide: 'accept' })
-      const [run] = rig.runs
-      const routing = run.options.cluster.metadataCache.routingListeners
-      const listeners = routing.size
-      const nodes = [...run.nodes.values()]
-      await OUTCOMES[outcome](rig)
-      await flush()
-      for (const hold of rig.holds) hold.release()
-      await flush()
+    /**
+     * @param {object} run A finished run.
+     * @returns {void} Asserts it holds no timer, waiter, lookup, node or captured reference.
+     */
+    const expectReleased = (run) => {
+      expect(run.retired).toBe(true)
       expect(run.closing.run).toBeNull()
       expect(run.closing.nodes.size).toBe(0)
       expect([run.nodes.size, run.waiters.size, run.lookups.size]).toEqual([0, 0, 0])
-      expect(run.retired).toBe(true)
+      for (const { requestQueue } of run.coordinator.pool.pool)
+        expect([requestQueue.pending.length, requestQueue.inflight.size]).toEqual([0, 0])
+    }
+
+    /**
+     * @param {object} node A node record of any run.
+     * @returns {void} Asserts its loop, FIFO, operations and request queues are empty.
+     */
+    const expectNodeReleased = (node) => {
+      expect([node.loop.cohorts.size, node.loop.exchanges.size, node.session.queue.length]).toEqual(
+        [0, 0, 0]
+      )
+      for (const operation of [node.operation, node.pacing])
+        expect([operation.waiters.size, operation.disposers.size]).toEqual([0, 0])
+      for (const { requestQueue } of node.loop.broker.connectionPool.pool)
+        expect([requestQueue.pending.length, requestQueue.inflight.size]).toEqual([0, 0])
+    }
+
+    test.each(Object.keys(OUTCOMES))('returns to baseline after %s', async (outcome) => {
+      const { act, share } = OUTCOMES[outcome]
+      rig = new CloseRig({ share })
+      await rig.h.consumer.connect()
+      const timers = jest.getTimerCount()
+      const [cluster] = rig.clusters
+      const { emitter } = cluster.instrumentationEmitter
+      const userListeners = () =>
+        emitter.eventNames().reduce((total, name) => total + emitter.listenerCount(name), 0)
+      const observers = userListeners()
+      expect(observers).toBe(5)
+      await rig.begin({ decide: 'accept' })
+      const routing = cluster.metadataCache.routingListeners
+      const listeners = routing.size
+      await act(rig)
+      await flush()
+      for (const hold of rig.holds) hold.release()
+      rig.gate.resolve()
+      await Promise.allSettled(rig.settling)
+      await flush()
+      const frames = rig.h.cluster.requests().length
+      await rig.advance(5000)
+      expect(rig.h.cluster.requests()).toHaveLength(frames)
+      expect(rig.runs).toHaveLength(outcome === 'a crash and its restart' ? 2 : 1)
+      for (const run of rig.runs) expectReleased(run)
+      expect(rig.nodes).toHaveLength(rig.runs.length)
+      for (const node of rig.nodes) expectNodeReleased(node)
       expect(routing.size).toBe(listeners - 1)
-      expect(nodes).toHaveLength(1)
-      for (const node of nodes) {
-        expect([
-          node.loop.cohorts.size,
-          node.loop.exchanges.size,
-          node.session.queue.length,
-        ]).toEqual([0, 0, 0])
-        for (const operation of [node.operation, node.pacing])
-          expect([operation.waiters.size, operation.disposers.size]).toEqual([0, 0])
-        for (const { requestQueue } of node.loop.broker.connectionPool.pool)
-          expect([requestQueue.pending.length, requestQueue.inflight.size]).toEqual([0, 0])
-      }
+      expect(userListeners()).toBe(observers)
       expect(jest.getTimerCount()).toBeLessThanOrEqual(timers)
+      const closing = track(rig.h.consumer.disconnect())
+      await rig.advanceUntil(() => closing.settled, 'the client-wide disconnect')
+      expect(closing.error).toBeNull()
+      expect(rig.h.cluster.sockets().every(({ destroyed }) => destroyed)).toBe(true)
     })
   })
 
