@@ -22,10 +22,16 @@
       "resource/v1/resource.proto": "e0a7cdc0ffcfeffaa2606e8611839735ebffaa2d6acdf33e9356f2c48ae692d3"
     },
     "generator": "scripts/protocol/javaVectors/GenerateTelemetryVectors.java",
-    "generatorSha256": "a79918257028544cf389b20dc120687a0f9356e1d8f6953469c632675dc67e2c",
+    "bindingsArtifact": "otlp-v1.9.0-bindings-unrelocated.jar",
+    "bindingsProvenance": "frozen SHA-256-pinned artifact",
     "bindingsSha256": "99676bd7a6eff2b8e068a1ab10fe30cadf27958e82914adc6516699c88e266e7",
+    "protobufJavaCoordinates": "com.google.protobuf:protobuf-java:3.25.5",
+    "protobufJavaSha1": "5ae5c9ec39930ae9b5a61b32b93288818ec05ec1",
+    "protobufJavaSha1Url": "https://repo1.maven.org/maven2/com/google/protobuf/protobuf-java/3.25.5/protobuf-java-3.25.5.jar.sha1",
     "protobufJavaSha256": "8540247fad9e06baefa8fb45eb313802d019f485f14300e0f9d6b556ed88e753",
+    "protocVersion": "25.5",
     "protocSha256": "d69b0a9ac8264bb3d464ae22742430943aa0a6cdf3734180af5a607c0bf8adaa",
-    "status": "field-by-field candidate; Java regeneration required"
+    "status": "generated with pinned Java bindings",
+    "generatorSha256": "22ff891184b466e89132cc743d5b2619630bdc27dd9f71caf8f3c828b7acb8e1"
   }
 }

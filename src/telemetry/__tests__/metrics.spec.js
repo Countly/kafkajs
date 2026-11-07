@@ -164,6 +164,29 @@ describe('metric names selectors and resources', () => {
     metrics.observeRequest(refs[10], 1)
     metrics.bindNode({ nodeId: 64, endpoint: '64', endpointRevision: 1 })
     metrics.observeRequest(refs[10], 100)
+    metrics.observeRequest(refs[0], 7)
+    const afterEviction = metrics.snapshot(s)
+    expect(tuples(afterEviction)).toEqual([
+      ['org.apache.kafka.producer.connection.creation.total', 'sum', '1', [], 0n],
+      [
+        'org.apache.kafka.producer.node.request.latency.avg',
+        'gauge',
+        'ms',
+        [{ key: 'node_id', value: '0' }],
+        7,
+      ],
+      [
+        'org.apache.kafka.producer.node.request.latency.max',
+        'gauge',
+        'ms',
+        [{ key: 'node_id', value: '0' }],
+        7,
+      ],
+    ])
+    metrics.written(
+      afterEviction,
+      afterEviction.points.map((p) => p.identity)
+    )
     for (let i = 65; i < 200; i++) {
       metrics.observeConnection({})
       metrics.observeRequest(

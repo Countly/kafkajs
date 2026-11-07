@@ -193,13 +193,23 @@ describe('numeric registration is atomic and bounded', () => {
   })
 
   test('capacity permits updates and refuses a new identity atomically', () => {
-    const metrics = new TelemetryMetrics({ kind: 'producer' })
+    const metrics = new TelemetryMetrics({
+      kind: 'producer',
+      clock: { wallMs: () => 1000, monotonicNs: () => 0n },
+    })
     for (let i = 0; i < 128; i++) metrics.register(gauge('com.example.' + i))
+    const beforeUpdate = sample(metrics).points.filter((p) => p.name.startsWith('com.'))
     metrics.register({ ...gauge('com.example.0'), value: -2.5 })
+    const afterUpdate = sample(metrics).points.filter((p) => p.name.startsWith('com.'))
+    expect(afterUpdate).toEqual(
+      beforeUpdate.map((p) => (p.name === 'com.example.0' ? { ...p, value: -2.5 } : p))
+    )
     expect(() => metrics.register(gauge('com.example.extra'))).toThrow(
       expect.objectContaining({ reason: 'limit' })
     )
-    expect(sample(metrics).points.filter((p) => p.name.startsWith('com.'))).toHaveLength(128)
+    const afterRefusal = sample(metrics).points.filter((p) => p.name.startsWith('com.'))
+    expect(afterRefusal).toHaveLength(128)
+    expect(afterRefusal).toEqual(afterUpdate)
     metrics.unregister(gauge('com.example.1'))
     metrics.register(gauge('com.example.extra'))
   })

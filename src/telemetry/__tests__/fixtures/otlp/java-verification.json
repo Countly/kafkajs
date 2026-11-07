@@ -1,0 +1,63 @@
+{
+  "command": "GenerateTelemetryVectors --verify candidate decoded",
+  "exitCode": 0,
+  "result": "All eight production bodies match independent Java semantics and bytes",
+  "javaVersion": "OpenJDK 21.0.13+9-1-deb13u2-Debian",
+  "javacRelease": 17,
+  "productionEncoder": "src/telemetry/otlp.js",
+  "productionEncoderSha256": "c775522ce6ee9ba9e466cff4991ce31526b55d14a706a5a1c5803bbc48cff5fb",
+  "candidateGenerator": "scripts/protocol/javaVectors/generateTelemetryBodies.js",
+  "candidateGeneratorSha256": "c84f98cc2f4aa2029ccad5940f4854f45683f49e757c851da5b7b6364665062a",
+  "generatorSha256": "22ff891184b466e89132cc743d5b2619630bdc27dd9f71caf8f3c828b7acb8e1",
+  "generationDeterministic": true,
+  "cases": [
+    {
+      "name": "cumulative",
+      "bytes": 91,
+      "productionBodySha256": "df2de2fbebc4b1362ef993d665ebb842d8e800f8de8513f09164f3c77ed47692",
+      "decodedSha256": "30145d1c987a457a680a29e0398155a0d8bc9508f7e07b432811f60a275cc5a7"
+    },
+    {
+      "name": "empty",
+      "bytes": 0,
+      "productionBodySha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "decodedSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "multibyte",
+      "bytes": 888,
+      "productionBodySha256": "5fa154ae4604f8e7ddaca74eed3ba765b0ba86a3a095ba901eb4f64ebc4cd19a",
+      "decodedSha256": "6fec60b6a5b44a1ea9738848593649ca6877fa8db4825e75535fd1a207485c08"
+    },
+    {
+      "name": "negative-zero",
+      "bytes": 78,
+      "productionBodySha256": "d06299a9bdd76031123b9bfcc37ebc9f5bb71014b75441710d91238956b488ae",
+      "decodedSha256": "d2a2da5c573c62a770cab3f362a93d286bb188acf3b20d0ac08ab4b2d9697fd3"
+    },
+    {
+      "name": "nested",
+      "bytes": 235,
+      "productionBodySha256": "3482754830efb31bb708c6f6b85aabe5ce20cb7604c1ed450a794139793775c6",
+      "decodedSha256": "8c7ed4a3af492c223738ca240d050e4d2432d884415349ad08dfefce74cd64b9"
+    },
+    {
+      "name": "signed-max",
+      "bytes": 70,
+      "productionBodySha256": "8b723b923d6ea3a243d74df7e0e7a2b9e1b4e6a02f5452712ad412f82e758ab9",
+      "decodedSha256": "5d5c553fc1d1bb55ea2ba2c240bba8731cf219499a85baae75f3a1660fab3557"
+    },
+    {
+      "name": "signed-min",
+      "bytes": 70,
+      "productionBodySha256": "36d25213208e6ac2928fdbdd1f0580d7e4d3299f390dd2a1ad44fef2b988aa4d",
+      "decodedSha256": "5c24831a856d7c9b7f9b59529155cfba3f5ea663ec1f4bac0cc5f2966e4722d1"
+    },
+    {
+      "name": "zero",
+      "bytes": 109,
+      "productionBodySha256": "0940c06a7064feefa78687f1385b25533fe22745ec70ab5bbe5dec42da65d21f",
+      "decodedSha256": "aebd5cdf500eef488674c8f6b17b4fac54cb90fe67d2f7e90389132065d71cc8"
+    }
+  ]
+}

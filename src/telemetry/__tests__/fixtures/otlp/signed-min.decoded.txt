@@ -1,0 +1,22 @@
+resource_metrics {
+  resource {
+  }
+  scope_metrics {
+    scope {
+      name: "countly-kafkajs"
+      version: "3.0.0"
+    }
+    metrics {
+      name: "primitive"
+      unit: "1"
+      gauge {
+        data_points {
+          time_unix_nano: 18446744073709551615
+          as_int: -9223372036854775808
+        }
+      }
+    }
+  }
+}
+resourceDropped=0
+primitive|AS_INT|0|18446744073709551615|-9223372036854775808

@@ -15,6 +15,10 @@ const names = [
   'multibyte',
 ]
 const fixture = (name) => JSON.parse(fs.readFileSync(path.join(directory, `${name}.json`), 'utf8'))
+const verification = fixture('java-verification')
+
+/** @param {Buffer} bytes retained source, body or decoded audit @returns {string} SHA-256 hex */
+const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex')
 
 /** Restores exact domains from literal fixture fields; expected bytes never use the writer. */
 const restore = (fields) => ({
@@ -69,6 +73,26 @@ const dataPoints = (metric) =>
   values(values(metric, fields(metric).some((f) => f.number === 7) ? 7 : 5)[0], 1)
 
 describe('independent metric protobuf vectors', () => {
+  test('independent Java verification covers the current encoder and all cases', () => {
+    expect(verification.command).toBe('GenerateTelemetryVectors --verify candidate decoded')
+    expect(verification.exitCode).toBe(0)
+    expect(verification.result).toBe(
+      'All eight production bodies match independent Java semantics and bytes'
+    )
+    expect(verification.generationDeterministic).toBe(true)
+    expect(verification.cases.map((entry) => entry.name).sort()).toEqual([...names].sort())
+    expect(verification.productionEncoderSha256).toBe(
+      sha256(fs.readFileSync(path.join(__dirname, '../otlp.js')))
+    )
+    expect(verification.candidateGeneratorSha256).toBe(
+      sha256(
+        fs.readFileSync(
+          path.join(__dirname, '../../../scripts/protocol/javaVectors/generateTelemetryBodies.js')
+        )
+      )
+    )
+  })
+
   test.each(names)('%s matches fixed bytes and exact length', (name) => {
     const vector = fixture(name)
     const snapshot = restore(vector.fields)
@@ -76,16 +100,31 @@ describe('independent metric protobuf vectors', () => {
     expect(bytes.toString('hex')).toBe(vector.hex)
     expect(measureMetricsData(snapshot)).toBe(vector.hex.length / 2)
     expect(bytes.length).toBe(vector.hex.length / 2)
+    expect(vector.provenance.status).toBe('generated with pinned Java bindings')
     expect(vector.provenance.protoTag).toBe('v1.9.0')
+    expect(vector.provenance.bindingsArtifact).toBe('otlp-v1.9.0-bindings-unrelocated.jar')
+    expect(vector.provenance.bindingsProvenance).toBe('frozen SHA-256-pinned artifact')
     expect(vector.provenance.bindingsSha256).toBe(
       '99676bd7a6eff2b8e068a1ab10fe30cadf27958e82914adc6516699c88e266e7'
+    )
+    expect(vector.provenance.protobufJavaCoordinates).toBe(
+      'com.google.protobuf:protobuf-java:3.25.5'
+    )
+    expect(vector.provenance.protobufJavaSha1).toBe('5ae5c9ec39930ae9b5a61b32b93288818ec05ec1')
+    expect(vector.provenance.protobufJavaSha256).toBe(
+      '8540247fad9e06baefa8fb45eb313802d019f485f14300e0f9d6b556ed88e753'
     )
     const source = fs.readFileSync(
       path.join(__dirname, '../../../scripts/protocol/javaVectors/GenerateTelemetryVectors.java')
     )
-    expect(vector.provenance.generatorSha256).toBe(
-      createHash('sha256').update(source).digest('hex')
-    )
+    expect(vector.provenance.generatorSha256).toBe(sha256(source))
+    expect(verification.generatorSha256).toBe(sha256(source))
+    expect(verification.cases.find((entry) => entry.name === name)).toEqual({
+      name,
+      bytes: bytes.length,
+      productionBodySha256: sha256(bytes),
+      decodedSha256: sha256(fs.readFileSync(path.join(directory, `${name}.decoded.txt`))),
+    })
   })
 
   test('zero-valued points retain their numeric oneof', () => {

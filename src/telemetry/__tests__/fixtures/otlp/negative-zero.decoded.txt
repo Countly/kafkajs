@@ -1,0 +1,22 @@
+resource_metrics {
+  resource {
+  }
+  scope_metrics {
+    scope {
+      name: "countly-kafkajs"
+      version: "3.0.0"
+    }
+    metrics {
+      name: "com.example.gauge"
+      unit: "1"
+      gauge {
+        data_points {
+          time_unix_nano: 1
+          as_double: -0.0
+        }
+      }
+    }
+  }
+}
+resourceDropped=0
+com.example.gauge|AS_DOUBLE|0|1|-0.0|8000000000000000
