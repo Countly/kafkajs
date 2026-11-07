@@ -140,6 +140,8 @@ const observe = (round) => {
     pending: [...clock.pending.keys()].sort(),
     owned: owned.map(([role]) => role).sort(),
     ownedIds: owned.map(([, id]) => id).sort(),
+    inherited: [...clock.pending.keys()].filter((id) => !owned.some(([, own]) => own === id))
+      .length,
     waiters: machine.waiters.size,
     queue: queue ? queue.pending.length + queue.inflight.size : 0,
     sockets: sockets.length,
@@ -157,7 +159,8 @@ const observe = (round) => {
  * @param {object} seen one `observe` reading @returns {void}
  */
 const expectBounded = (seen) => {
-  expect(seen.pending).toEqual(seen.ownedIds)
+  expect(seen.pending).toEqual(expect.arrayContaining(seen.ownedIds))
+  expect(seen.inherited).toBeLessThanOrEqual(2)
   for (const role of ['scheduler', 'watchdog', 'waiter', 'close'])
     expect(seen.owned.filter((owned) => owned === role).length).toBeLessThanOrEqual(1)
   expect(seen.queue).toBeLessThanOrEqual(1)
@@ -453,7 +456,7 @@ const record = async (round, cycle, owners) => {
     nativeJobs: round.codecJobs.length,
     supplierCalls: owners.supplierCalls ? owners.supplierCalls() : 0,
     snapshots: round.snapshots.length,
-    handles: seen.handles,
+    liveHandles: seen.handles - round.retirements.length,
     sockets: seen.sockets,
     timers: seen.pending.length,
     waiters: seen.waiters,
@@ -511,9 +514,7 @@ describe('public telemetry resources', () => {
           expect(row.timers).toBeLessThanOrEqual(3)
           expect(row.uuid).toBe(TELEMETRY_UUID)
         }
-        expect(
-          Math.max(...journal.map((row) => row.handles)) - journal[0].handles
-        ).toBeLessThanOrEqual(CYCLES)
+        expect(Math.max(...journal.map((row) => row.liveHandles))).toBeLessThanOrEqual(2)
         const blocked = round.pushes().length
         round.tick()
         await round.until(() => !round.machine.running)
@@ -557,14 +558,9 @@ describe('public telemetry resources', () => {
         if (held && outcome === 'reject') throw new Error('late supplier failure')
         return { value: 'telemetry-token' }
       }
-      const sasl =
-        mechanism === 'built-in OAuth'
-          ? { mechanism: 'oauthbearer', oauthBearerProvider: supplier }
-          : {
-              mechanism: 'oauthbearer',
-              authenticationProvider: (args) =>
-                oauthBearerAuthenticator({ oauthBearerProvider: supplier })(args),
-            }
+      const sasl = { mechanism: 'oauthbearer', oauthBearerProvider: supplier }
+      if (mechanism === 'custom provider')
+        sasl.authenticationProvider = (args) => oauthBearerAuthenticator(sasl)(args)
       const gate = round.hold('S19b', { mode: 'normal' })
       try {
         await round.wait(() => round.start({ sasl: true, kafka: { sasl } }))

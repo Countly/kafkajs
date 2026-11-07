@@ -648,6 +648,8 @@ class TelemetryProcesses {
       if (worker.error) throw worker.error
       const found = worker.messages.find((m) => m.type === type)
       if (found) return found
+      const failed = worker.messages.find((m) => m.type === 'failure')
+      if (failed) throw new Error(`Telemetry worker ${kind} failed: ${failed.message}`)
       if (worker.exit) throw new Error(`Telemetry worker ${kind} exited before ${type}`)
       const left = deadline - this.now()
       if (left <= 0) throw new Error(`Telemetry worker ${kind} sent no ${type} within ${ms} ms`)
@@ -982,8 +984,9 @@ class TelemetryChurn {
     let setupMs
     let epoch
     await this.fixture.inResource(async () => {
+      const setupLeft = () => Math.max(1, SETUP_MS - (this.clock.now() - t0))
       for (const kind of KINDS) this.processes.start(kind)
-      await Promise.all(KINDS.map((kind) => this.processes.message(kind, 'hello', SETUP_MS)))
+      await Promise.all(KINDS.map((kind) => this.processes.message(kind, 'hello', setupLeft())))
       for (const kind of KINDS)
         this.processes.workers.get(kind).child.send({
           type: 'config',
@@ -992,7 +995,7 @@ class TelemetryChurn {
           topic: this.fixture.topic(kind),
           group: this.fixture.group(kind),
         })
-      await Promise.all(KINDS.map((kind) => this.processes.message(kind, 'ready', SETUP_MS)))
+      await Promise.all(KINDS.map((kind) => this.processes.message(kind, 'ready', setupLeft())))
       setupMs = this.clock.now() - t0
       epoch = this.clock.now()
       for (const kind of KINDS) this.processes.workers.get(kind).child.send({ type: 'go' })
@@ -1269,13 +1272,16 @@ class TelemetryWorkerProcess {
           return { ...(await probe.snapshot()), registryDigest: registry.digest(uuid) }
         },
       }
+      const { warmupMs, measureMs } = soak.TELEMETRY
+      /** A reading belongs to the measurement only inside the fixed window, never after its end. */
+      const inWindow = ({ atMs }) => atMs >= warmupMs && atMs <= warmupMs + measureMs
       let readings
       const judge = (run) => {
         readings = run
         return soak.TelemetryResourceVerdict.evaluate({
           clientCount: 1,
           baseline: run.baseline,
-          samples: run.samples.filter((sample) => sample.atMs >= soak.TELEMETRY.warmupMs),
+          samples: run.samples.filter(inWindow),
           teardown: run.teardown,
           measurementMs: worker.timing.measurementMs,
           cleanupMs: worker.timing.cleanupMs,
@@ -1305,8 +1311,9 @@ class TelemetryWorkerProcess {
         verdict,
         input: {
           baseline: readings.baseline,
-          samples: readings.samples.filter((s) => s.atMs >= soak.TELEMETRY.warmupMs),
-          warmSamples: readings.samples.filter((s) => s.atMs < soak.TELEMETRY.warmupMs).length,
+          samples: readings.samples.filter(inWindow),
+          warmSamples: readings.samples.filter(({ atMs }) => atMs < warmupMs).length,
+          lateSamples: readings.samples.filter(({ atMs }) => atMs > warmupMs + measureMs).length,
           teardown: readings.teardown,
           measurementMs: worker.timing.measurementMs,
           cleanupMs: worker.timing.cleanupMs,

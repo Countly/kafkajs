@@ -96,6 +96,9 @@ const { ClosingProbe } = require('./closingProbe')
 const { ConsumerChurnOracle } = require('./consumerChurn')
 
 const PARTITIONS = 6
+/** The seed brokers of the CLI, and of the configured telemetry fixture, which publishes others. */
+const DEFAULT_BROKERS = Object.freeze(['localhost:9092', 'localhost:9095', 'localhost:9098'])
+const TELEMETRY_BROKERS = Object.freeze(['localhost:19092', 'localhost:19095', 'localhost:19098'])
 const MEMBER_CHURN_MS = 15000
 const OUTAGE_SERVICE = 'kafka3'
 const TOPIC_NAMES = 50
@@ -6513,7 +6516,7 @@ const buildShareSoak = ({ brokers, short = false, record, run }) => {
  *   evidence directory, and for a worker without its kind or IPC channel
  */
 const buildTelemetryChurn = ({
-  brokers,
+  brokers: requested,
   phases,
   record = (row) => writeEvidence('telemetry-churn', row),
 }) => {
@@ -6553,6 +6556,8 @@ const buildTelemetryChurn = ({
     throw new Error(
       'The telemetry profile needs the configured broker line, the telemetry compose file, its project and an absolute evidence directory'
     )
+  const brokers =
+    JSON.stringify(requested) === JSON.stringify(DEFAULT_BROKERS) ? TELEMETRY_BROKERS : requested
   const { withTelemetryResource } = require('../../testHelpers/telemetryFixtures')
   const stem = `telemetry-churn-${Date.now().toString(36)}`
   const kafka = new Kafka({ clientId: `parent-${stem}`, brokers, logLevel: logLevel.NOTHING })
@@ -6599,7 +6604,7 @@ const buildTelemetryChurn = ({
 const main = async (
   profile,
   {
-    brokers = ['localhost:9092', 'localhost:9095', 'localhost:9098'],
+    brokers = [...DEFAULT_BROKERS],
     phaseSeconds = null,
     churn = buildProducerChurn,
     consumerChurn = buildConsumerChurn,

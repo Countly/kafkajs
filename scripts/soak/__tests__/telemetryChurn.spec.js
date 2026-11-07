@@ -216,6 +216,10 @@ describe('telemetry profile routes and builds', () => {
     await expect(processes.message('consumer', 'hello', 500)).rejects.toThrow('Substituted')
     processes.start('admin')
     await expect(processes.message('admin', 'hello', 500)).rejects.toThrow('sent no hello')
+    processes.receive('producer', { type: 'failure', kind: 'producer', message: 'boom' })
+    await expect(processes.message('producer', 'result', 500)).rejects.toThrow(
+      'Telemetry worker producer failed: boom'
+    )
   })
 })
 
