@@ -338,6 +338,7 @@ describe('every error class this package exports carries an own, enumerable cate
     ],
     KafkaJSDeleteTopicRecordsError: () => [{ partitions: [] }],
     KafkaJSProducerClosedError: () => ['closed', { outcome: 'unsent' }],
+    KafkaJSTelemetryError: () => ['closed', { reason: 'closed' }],
     KafkaJSNoOffsetError: () => ['no offset', { topic: 't', partition: 0, reason: 'no-offset' }],
     KafkaJSAggregateError: () => ['two topics failed', []],
     KafkaJSRebalanceListenerError: () => [
@@ -1112,6 +1113,7 @@ describe('observational telemetry errors', () => {
     })
     expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
     expect(error.retriable).toBe(false)
+    expect(error.category).toBe('applicationRecoverable')
     expect(error.reason).toBe('stopped')
     expect(error.apiKey).toBe(72)
     expect(error.cause).toBe(cause)
@@ -1120,6 +1122,25 @@ describe('observational telemetry errors', () => {
     expect(error).not.toHaveProperty('outcome')
     expect(error).not.toHaveProperty('abortable')
   })
+
+  test.each([KafkaJSTransactionAbortableError, KafkaJSInvalidConfigurationError])(
+    'does not inherit the category of %p from its message or cause',
+    (ErrorClass) => {
+      const source = new ErrorClass('local failure')
+      const { KafkaJSTelemetryError } = errors
+      const wrapped = [
+        new KafkaJSTelemetryError(source, { reason: 'stopped' }),
+        new KafkaJSTelemetryError('Client telemetry stopped', { reason: 'stopped', cause: source }),
+      ]
+      for (const error of wrapped) {
+        expect(error.retriable).toBe(false)
+        expect(error.category).toBe('applicationRecoverable')
+        expect(Object.keys(error)).toContain('category')
+        expect(JSON.parse(JSON.stringify(error)).category).toBe('applicationRecoverable')
+      }
+      expect(wrapped[1].cause).toBe(source)
+    }
+  )
 
   test('the apiKey is optional and a missing options object is refused', () => {
     const { KafkaJSTelemetryError } = require('./errors')

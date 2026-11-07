@@ -1433,6 +1433,7 @@ describe('owner lifecycle joins', () => {
           connect: jest.fn(async () => {}),
           findConnectedBroker: jest.fn(async () => ({})),
           disconnect: jest.fn(async () => {}),
+          onRoutingChange: jest.fn(() => jest.fn()),
           ...cluster,
         },
         telemetry,

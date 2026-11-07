@@ -57,7 +57,9 @@ describe('numeric telemetry documentation', () => {
     expect(read('CHANGELOG.md')).toContain(
       'Verify normal physical connections and completed-request observations independently.'
     )
-    const exclusions = guide.split('### Optional standard templates excluded in this release')[1]
+    const exclusions = guide
+      .split('### Optional standard templates excluded in this release')[1]
+      .split(/\n#{1,3} /)[0]
     expect(exclusions.match(/^\| `/gm)).toHaveLength(15)
   })
   test.each(['test:unit', 'test:coverage:unit'])(

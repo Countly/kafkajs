@@ -58,6 +58,7 @@ describe('scripts/assertCleanTarball.sh', () => {
         'src/index.js',
         'types/index.d.ts',
         'docs/ShareConsumer.md',
+        'docs/ClientTelemetry.md',
       ])
     )
 
@@ -82,10 +83,24 @@ describe('scripts/assertCleanTarball.sh', () => {
 
   it('does not take a path that merely ends in otel for the sub-package', () => {
     const result = run(
-      pack(['src/hotel/index.js', 'src/otel/index.js', 'otel.js', 'docs/ShareConsumer.md'])
+      pack([
+        'src/hotel/index.js',
+        'src/otel/index.js',
+        'otel.js',
+        'docs/ShareConsumer.md',
+        'docs/ClientTelemetry.md',
+      ])
     )
 
     expect(result.status).toBe(0)
+  })
+
+  it.each(['ShareConsumer', 'ClientTelemetry'])('fails without the %s guide', (guide) => {
+    const otherGuide = guide === 'ShareConsumer' ? 'ClientTelemetry' : 'ShareConsumer'
+    const result = run(pack(['index.js', `docs/${otherGuide}.md`]))
+
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain(`tarball is missing the ${guide} guide`)
   })
 
   it.each([
