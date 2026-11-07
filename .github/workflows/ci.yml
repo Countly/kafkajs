@@ -88,80 +88,14 @@ jobs:
           KAFKAJS_LANE: docker
           KAFKAJS_DEBUG_PROTOCOL_BUFFERS: '1'
           SHARE_SOAK_E2E: '1'
-        run: |
-          node <<'NODE'
-          const fs = require('fs')
-          const { spawnSync } = require('child_process')
-          const totalMs = 540000
-          const exitMs = 10000
-          const startedAt = Number(process.hrtime.bigint() / 1000000n)
-          const result = spawnSync(process.execPath, [
-            '--expose-gc', 'node_modules/jest/bin/jest.js', '--ci', '--detectOpenHandles',
-            '--runInBand', '--runTestsByPath', 'src/consumer/share/__tests__/shareSoakLive.spec.js',
-          ], { stdio: 'inherit', timeout: totalMs, killSignal: 'SIGKILL' })
-          const exitedAt = Number(process.hrtime.bigint() / 1000000n)
-          fs.writeFileSync('.tmp/e2e/share-soak-exit.json', JSON.stringify({
-            startedAt, exitedAt, status: result.status, signal: result.signal,
-            totalMs, exitMs, watchdogTerminated: result.error?.code === 'ETIMEDOUT',
-            error: result.error?.message,
-          }) + '\n')
-          if (result.error) throw result.error
-          if (result.status !== 0 || result.signal) throw new Error('Soak Jest did not exit successfully')
-          const rows = fs.readFileSync('.tmp/e2e/share-soak.jsonl', 'utf8')
-            .trim().split('\n').map(JSON.parse)
-          const done = rows.filter(row => row.event === 'case-complete')
-          if (done.length !== 1 ||
-              done[0].case !== 'preserves share identities and resources through the short soak' ||
-              rows.some(row => row.event === 'case-failed') ||
-              done.some(row => row.status !== 'passed' || row.tainted !== false ||
-                row.profileMs !== 480000 ||
-                row.cleanup?.groupsAbsent !== true || row.cleanup?.topicsAbsent !== true ||
-                !Number.isSafeInteger(row.cleanup?.completedAt) ||
-                row.cleanup.completedAt < startedAt || row.cleanup.completedAt > exitedAt)) {
-            throw new Error('Soak evidence has incomplete or invalid cleanup timestamps')
-          }
-          const cleanupAt = done[0].cleanup.completedAt
-          if (exitedAt - startedAt > totalMs || exitedAt - cleanupAt > exitMs) {
-            throw new Error('Soak did not exit naturally within its process and cleanup bounds')
-          }
-          NODE
+        run: node scripts/ci/naturalExit.js soak
       - name: Prove shutdown exits naturally
         if: matrix.group == 'share'
         env:
           KAFKAJS_LANE: docker
           KAFKAJS_DEBUG_PROTOCOL_BUFFERS: '1'
           SHARE_SHUTDOWN_E2E: '1'
-        run: |
-          node <<'NODE'
-          const fs = require('fs')
-          const { spawnSync } = require('child_process')
-          const startedAt = Number(process.hrtime.bigint() / 1000000n)
-          const result = spawnSync(process.execPath, [
-            'node_modules/jest/bin/jest.js', '--ci', '--detectOpenHandles', '--runInBand',
-            '--runTestsByPath', 'src/consumer/share/__tests__/shareShutdownLive.spec.js',
-          ], { stdio: 'inherit', timeout: 120000, killSignal: 'SIGKILL' })
-          const exitedAt = Number(process.hrtime.bigint() / 1000000n)
-          fs.writeFileSync('.tmp/e2e/share-shutdown-exit.json', JSON.stringify({
-            startedAt, exitedAt, status: result.status, signal: result.signal,
-            error: result.error?.message,
-          }) + '\n')
-          if (result.error) throw result.error
-          if (result.status !== 0 || result.signal) throw new Error('Shutdown Jest did not exit successfully')
-          const rows = fs.readFileSync('.tmp/e2e/share-shutdown.jsonl', 'utf8')
-            .trim().split('\n').map(JSON.parse)
-          const done = rows.filter(row => row.event === 'case-complete')
-          if (done.length !== 3 || new Set(done.map(row => row.case)).size !== 3 ||
-              rows.some(row => row.event === 'case-failed') ||
-              done.some(row => row.status !== 'passed' || row.tainted !== false ||
-                !Number.isSafeInteger(row.cleanup?.completedAt) ||
-                row.cleanup.completedAt < startedAt || row.cleanup.completedAt > exitedAt)) {
-            throw new Error('Shutdown evidence has incomplete or invalid cleanup timestamps')
-          }
-          const cleanupAt = Math.max(...done.map(row => row.cleanup.completedAt))
-          if (exitedAt - startedAt > 120000 || exitedAt - cleanupAt > 10000) {
-            throw new Error('Shutdown did not exit naturally within its process and cleanup bounds')
-          }
-          NODE
+        run: node scripts/ci/naturalExit.js shutdown
       - name: Verify share evidence before teardown
         if: always() && startsWith(matrix.group, 'share')
         run: |
