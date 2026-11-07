@@ -48,23 +48,47 @@ jobs:
           NODE
   resources:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         node: ${{ fromJSON(inputs.full && '[22, 24, 26]' || '[24]') }}
+    env:
+      TELEMETRY_RESOURCES_ARTIFACT_DIR: ${{ github.workspace }}/.tmp/telemetry-resources
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: '${{ matrix.node }}', cache: npm }
       - run: npm ci
         timeout-minutes: 5
-      - name: Run the quiet resource measurements alone
-        timeout-minutes: 20
+      - name: Stamp the run and prepare the artifact directory
+        timeout-minutes: 1
+        run: |
+          echo "KAFKAJS_TREE=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          mkdir -p "$TELEMETRY_RESOURCES_ARTIFACT_DIR"
+      - name: Measure single-client memory alone on the idle runner
+        timeout-minutes: 10
         env:
           TMPDIR: ${{ runner.temp }}
           TELEMETRY_RESOURCES_QUIET: '1'
-        run: timeout -k 10s 1100s node --expose-gc node_modules/jest/bin/jest.js --runInBand --ci --detectOpenHandles --testPathPatterns 'src/telemetry/__tests__/resources\.spec\.js$'
+        run: timeout -k 10s 540s node --expose-gc node_modules/jest/bin/jest.js --runInBand --ci --detectOpenHandles --testPathPatterns 'src/telemetry/__tests__/resources\.spec\.js$' --testNamePattern 'resource memory for'
+      - name: Run the bounded-resource schedules
+        timeout-minutes: 30
+        env:
+          TMPDIR: ${{ runner.temp }}
+          TELEMETRY_RESOURCES_QUIET: '1'
+        run: timeout -k 10s 1750s node --expose-gc node_modules/jest/bin/jest.js --runInBand --ci --detectOpenHandles --testPathPatterns 'src/telemetry/__tests__/resources\.spec\.js$' --testNamePattern '^(?!.*resource memory for)'
+      - name: Validate the recorded measurements for this tree and Node
+        if: always()
+        timeout-minutes: 2
+        run: node scripts/e2e/telemetry/resourceArtifact.js "$TELEMETRY_RESOURCES_ARTIFACT_DIR" --tree "$KAFKAJS_TREE" --node "$(node -p process.version)"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resources-node${{ matrix.node }}
+          path: .tmp/telemetry-resources/
+          if-no-files-found: error
+          include-hidden-files: true
   telemetry:
     runs-on: ubuntu-latest
     timeout-minutes: 45

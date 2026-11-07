@@ -1,10 +1,16 @@
 const { spawn } = require('node:child_process')
+const fs = require('node:fs')
+const os = require('node:os')
 const path = require('node:path')
 const TelemetryPayload = require('../payload')
 const gzip = require('../../protocol/message/compression/gzip')
-const zstd = require('../../protocol/message/compression/zstd')
+const Connection = require('../../network/connection')
+const Decoder = require('../../protocol/decoder')
 const oauthBearerAuthenticator = require('../../broker/saslAuthenticator/oauthBearer')
 const { maximum } = require('./fixtures/maximum')
+const { CycleLedger, IndexOneWatch, KindForeground } = require('./fixtures/cycleKit')
+const { compareSnapshots } = require('../../../testHelpers/resourceProbe')
+const { judgeMemoryArm } = require('../../../scripts/e2e/telemetry/resourceArtifact')
 const {
   PublicTelemetryRound,
   RELEASE_ACTIONS,
@@ -173,29 +179,43 @@ describe('public telemetry resources', () => {
     'bounds timers queues listeners and sockets for %s',
     async (kind) => {
       const seen = {}
-      const reading = (name, round) => {
+      const owners = {}
+      const watches = []
+      const watchOf = (round) => {
+        const watch = new IndexOneWatch(round)
+        watches.push(watch)
+        return () => watch.install()
+      }
+      const reading = async (name, round) => {
         seen[name] = observe(round)
         expectBounded(seen[name])
+        owners[name] = await new CycleLedger(round, () => ({})).churnProbe.snapshot()
       }
       const getting = new PublicTelemetryRound({ kind })
       try {
         const gate = getting.hold('S09', { mode: 'get' })
-        await getting.wait(() => getting.start({ drive: 'get' }))
+        await getting.wait(() => getting.start({ drive: 'get', beforeConnect: watchOf(getting) }))
         await getting.wait(() => gate.arrived())
-        reading('GETTING', getting)
+        await reading('GETTING', getting)
         expect(seen.GETTING.state).toBe('GETTING')
         expect(seen.GETTING.owned).toContain('watchdog')
+        expect(owners.GETTING.identities.operations).toHaveLength(1)
         await getting.drainReleased(gate)
         await getting.until(() => getting.machine.subscription !== null)
         await getting.ready()
-        reading('READY', getting)
+        await reading('READY', getting)
         expect(seen.READY.state).toBe('READY')
         expect(seen.READY.sockets).toBe(1)
         expect(seen.READY.queue).toBe(0)
         expect(seen.READY.owned).toEqual(['scheduler'])
+        expect(owners.READY.identities.sockets).toHaveLength(1)
+        expect(owners.READY.identities.operations).toEqual([])
+        expect(owners.READY.registrations['dedicated-socket'].id).toBe(
+          owners.READY.identities.sockets[0]
+        )
         await getting.wait(() => getting.beginClose(getting.closeOptions(0)))
         await getting.settleWork()
-        reading('CLOSED', getting)
+        await reading('CLOSED', getting)
         expect(seen.CLOSED).toMatchObject({
           state: 'CLOSED',
           owned: [],
@@ -205,6 +225,8 @@ describe('public telemetry resources', () => {
           sockets: 0,
           listeners: 0,
         })
+        expect(Object.values(owners.CLOSED.identities).flat()).toEqual([])
+        expect(owners.CLOSED.registrations).toEqual({})
       } finally {
         await getting.dispose()
       }
@@ -212,11 +234,14 @@ describe('public telemetry resources', () => {
       const pushing = new PublicTelemetryRound({ kind })
       try {
         const gate = pushing.hold('S13', { mode: 'normal' })
-        await pushing.wait(() => pushing.start({ drive: 'normal' }))
+        await pushing.wait(() =>
+          pushing.start({ drive: 'normal', beforeConnect: watchOf(pushing) })
+        )
         await pushing.wait(() => gate.arrived())
-        reading('PUSHING', pushing)
+        await reading('PUSHING', pushing)
         expect(seen.PUSHING.state).toBe('PUSHING')
         expect(seen.PUSHING.owned).toContain('watchdog')
+        expect(owners.PUSHING.identities.operations).toHaveLength(1)
         pushing.faultDedicated()
         const watchdog = pushing.machine.watchdog
         pushing.clock.jump(pushing.clock.time + 30000)
@@ -224,8 +249,9 @@ describe('public telemetry resources', () => {
         await pushing.until(
           () => pushing.machine.state === 'BACKOFF' && pushing.machine.timer !== null
         )
-        reading('BACKOFF', pushing)
+        await reading('BACKOFF', pushing)
         expect(seen.BACKOFF.owned).toEqual(['scheduler'])
+        expect(owners.BACKOFF.identities.sockets).toEqual([])
         await pushing.drainReleased(gate)
       } finally {
         await pushing.dispose()
@@ -234,26 +260,45 @@ describe('public telemetry resources', () => {
       const closing = new PublicTelemetryRound({ kind })
       try {
         const gate = closing.hold('S13', { mode: 'final' })
-        await closing.start()
+        await closing.start({ beforeConnect: watchOf(closing) })
         await closing.ready()
         closing.arm()
         closing.closePromise = closing.beginClose(closing.closeOptions(1000))
         await closing.wait(() => gate.arrived())
-        reading('CLOSING', closing)
+        await reading('CLOSING', closing)
         expect(seen.CLOSING.state).toBe('CLOSING')
         expect(seen.CLOSING.owned).toContain('close')
         await closing.drainReleased(gate)
         await closing.settleClose()
         await closing.settleWork()
-        reading('CLOSED after final', closing)
+        await reading('CLOSED after final', closing)
         expect(seen['CLOSED after final']).toMatchObject({ owned: [], sockets: 0, listeners: 0 })
+        expect(Object.values(owners['CLOSED after final'].identities).flat()).toEqual([])
         expect(closing.capture().uuid).toBe(TELEMETRY_UUID)
       } finally {
         await closing.dispose()
       }
+
+      expect(watches.map((watch) => watch.pools >= 1)).toEqual([true, true, true])
+      expect(watches.reduce((total, watch) => total + watch.opens, 0)).toBe(0)
     },
     90000
   )
+
+  test('counts an attempted open of the second connection of a dedicated pool', async () => {
+    const round = new PublicTelemetryRound({ kind: 'producer' })
+    const watch = new IndexOneWatch(round)
+    try {
+      await round.wait(() => round.start({ beforeConnect: () => watch.install() }))
+      await round.ready()
+      expect(watch.pools).toBeGreaterThanOrEqual(1)
+      expect(watch.opens).toBe(0)
+      await round.wait(() => watch.last.getConnection(1)).catch(() => {})
+      expect(watch.opens).toBe(1)
+    } finally {
+      await round.dispose()
+    }
+  }, 60000)
 
   test.each(KINDS)(
     'bounds independent id waiters for %s',
@@ -263,8 +308,8 @@ describe('public telemetry resources', () => {
         const gate = round.hold('S09', { mode: 'get' })
         await round.wait(() => round.start({ drive: 'get' }))
         await round.wait(() => gate.arrived())
+        const { machine, clock } = round
         const settled = []
-        const requestsBefore = round.telemetryRequests().length
         const call = (timeout, label) =>
           round.pending.push(
             round.client.clientInstanceId({ timeout }).then(
@@ -272,68 +317,70 @@ describe('public telemetry resources', () => {
               (error) => settled.push([label, error.reason])
             )
           )
-        call(1000, 'earliest')
-        for (let i = 1; i < 64; i++) call(60000, `waiter-${i}`)
-        expect(round.machine.waiters.size).toBe(64)
-        expect(
-          round.machine.waiterTimer !== null && round.clock.pending.has(round.machine.waiterTimer)
-        ).toBe(true)
-        const timersBefore = round.clock.pending.size
+        call(1000, 'short')
+        for (let i = 1; i < 64; i++) call(60000, `long-${i}`)
+        expect(machine.waiters.size).toBe(64)
+        const firstTimer = machine.waiterTimer
+        expect(firstTimer !== null && clock.pending.has(firstTimer)).toBe(true)
+        const timersBefore = clock.pending.size
+        const requestsBefore = round.telemetryRequests().length
 
         await expect(round.client.clientInstanceId({ timeout: 60000 })).rejects.toMatchObject({
           reason: 'limit',
         })
-        expect(round.machine.waiters.size).toBe(64)
-        expect(round.clock.pending.size).toBe(timersBefore)
+        expect(machine.waiters.size).toBe(64)
+        expect(machine.waiterTimer).toBe(firstTimer)
+        expect(clock.pending.size).toBe(timersBefore)
         expect(round.telemetryRequests().length).toBe(requestsBefore)
 
-        const withheld = round.clock.callback(round.machine.waiterTimer)
-        round.clock.jump(round.clock.time + 1001)
-        await round.drainReleased(gate)
-        await round.until(() => settled.length === 64)
-        expect(settled.find(([label]) => label === 'earliest')).toEqual(['earliest', 'timeout'])
-        expect(settled.filter(([, value]) => value === TELEMETRY_UUID)).toHaveLength(63)
-        expect(round.machine.waiters.size).toBe(0)
-        expect(round.machine.waiterTimer).toBeNull()
-        const replacement = round.capture()
-        withheld()
-        round.assertReplacementUnchanged(replacement)
-        await expect(round.client.clientInstanceId({ timeout: 0 })).resolves.toBe(TELEMETRY_UUID)
-      } finally {
-        await round.dispose()
-      }
+        // Only the short deadline passes. No timer is delivered, the Get stays held and nothing
+        // settles the waiters before the next caller arrives.
+        const obsolete = clock.callback(firstTimer)
+        clock.jump(clock.time + 1001)
+        const dials = round.dedicatedCount()
+        call(60000, 'replacement')
+        await round.until(() => settled.length === 1)
+        expect(settled).toEqual([['short', 'timeout']])
+        expect(machine.waiters.size).toBe(64)
+        const deadlines = [...machine.waiters].map((waiter) => waiter.deadline)
+        expect(deadlines.filter((deadline) => deadline === clock.now() + 60000)).toHaveLength(1)
+        expect(machine.waiterTimer).not.toBe(firstTimer)
+        expect(clock.pending.has(firstTimer)).toBe(false)
+        expect(clock.pending.get(machine.waiterTimer).due).toBe(Math.min(...deadlines))
+        expect(clock.pending.size).toBe(timersBefore)
+        expect(round.telemetryRequests().length).toBe(requestsBefore)
+        expect(round.dedicatedCount()).toBe(dials)
 
-      const closed = new PublicTelemetryRound({ kind })
-      try {
-        const gate = closed.hold('S09', { mode: 'get' })
-        await closed.wait(() => closed.start({ drive: 'get' }))
-        await closed.wait(() => gate.arrived())
-        const settled = []
-        for (let i = 0; i < 64; i++)
-          closed.pending.push(
-            closed.client.clientInstanceId({ timeout: 60000 }).then(
-              (value) => settled.push(value),
-              (error) => settled.push(error.reason)
-            )
-          )
-        expect(closed.machine.waiters.size).toBe(64)
-        await closed.wait(() => closed.beginClose(closed.closeOptions(0)))
-        await closed.until(() => settled.length === 64)
-        expect(settled.every((reason) => reason === 'closed' || reason === 'not-connected')).toBe(
-          true
-        )
-        expect(closed.machine.waiters.size).toBe(0)
-        expect(closed.machine.waiterTimer).toBeNull()
-        await closed.client.connect()
-        const next = closed.client.clientInstanceId({ timeout: 60000 }).catch((error) => error)
-        const before = closed.capture()
-        await closed.drainReleased(gate)
-        expect(closed.capture().waiters).toBe(before.waiters)
-        expect(closed.machine.waiters.size).toBe(1)
-        closed.tick()
+        await expect(round.client.clientInstanceId({ timeout: 60000 })).rejects.toMatchObject({
+          reason: 'limit',
+        })
+        expect(clock.pending.size).toBe(timersBefore)
+
+        obsolete()
+        expect(settled).toHaveLength(1)
+        expect(machine.waiters.size).toBe(64)
+        expect(clock.pending.size).toBe(timersBefore)
+        expect(clock.pending.get(machine.waiterTimer).due).toBe(Math.min(...deadlines))
+
+        await round.wait(() => round.beginClose(round.closeOptions(0)))
+        await round.until(() => settled.length === 65)
+        expect(
+          settled.slice(1).every(([, reason]) => reason === 'closed' || reason === 'not-connected')
+        ).toBe(true)
+        expect(machine.waiters.size).toBe(0)
+        expect(machine.waiterTimer).toBeNull()
+
+        await round.client.connect()
+        const next = round.client.clientInstanceId({ timeout: 60000 }).catch((error) => error)
+        round.pending.push(next)
+        const before = round.capture()
+        await round.drainReleased(gate)
+        expect(round.capture().waiters).toBe(before.waiters)
+        expect(machine.waiters.size).toBe(1)
+        round.tick()
         expect(await next).toBe(TELEMETRY_UUID)
       } finally {
-        await closed.dispose()
+        await round.dispose()
       }
     },
     90000
@@ -342,41 +389,48 @@ describe('public telemetry resources', () => {
   test.each(KINDS)(
     'keeps disabled clients resource free for %s',
     async (kind) => {
-      const round = new PublicTelemetryRound({ kind, enabled: false })
-      try {
-        await round.wait(() => round.start())
-        expect(round.machine).toBeNull()
-        expect(round.metrics).toBeNull()
-        expect(() =>
-          round.client.registerMetricForSubscription({
-            name: 'com.example.off',
-            type: 'gauge',
-            value: 1,
+      const arms = [
+        ['root false', { enabled: false }, {}],
+        [
+          'client false over root true',
+          {},
+          { kafka: { enableMetricsPush: true }, client: { enableMetricsPush: false } },
+        ],
+      ]
+      for (const [arm, variant, options] of arms) {
+        const round = new PublicTelemetryRound({ kind, ...variant })
+        const foreground = new KindForeground(round).prepare()
+        try {
+          await round.wait(() => round.start(options))
+          expect({ arm, machine: round.machine }).toEqual({ arm, machine: null })
+          expect({ arm, metrics: round.metrics }).toEqual({ arm, metrics: null })
+          const register = () =>
+            round.client.registerMetricForSubscription({
+              name: 'com.example.off',
+              type: 'gauge',
+              value: 1,
+            })
+          expect(register).toThrow(expect.objectContaining({ reason: 'disabled' }))
+          expect(register).toThrow(KafkaJSTelemetryError)
+          expect(
+            round.client.unregisterMetricFromSubscription({ name: 'com.example.off' })
+          ).toBeUndefined()
+          await expect(round.client.clientInstanceId({ timeout: 0 })).rejects.toMatchObject({
+            reason: 'disabled',
           })
-        ).toThrow(expect.objectContaining({ reason: 'disabled' }))
-        expect(() =>
-          round.client.registerMetricForSubscription({
-            name: 'com.example.off',
-            type: 'gauge',
-            value: 1,
-          })
-        ).toThrow(KafkaJSTelemetryError)
-        expect(
-          round.client.unregisterMetricFromSubscription({ name: 'com.example.off' })
-        ).toBeUndefined()
-        await expect(round.client.clientInstanceId({ timeout: 0 })).rejects.toMatchObject({
-          reason: 'disabled',
-        })
-        expect(round.clock.pending.size).toBe(0)
-        expect(round.dedicatedCount()).toBe(0)
-        expect(round.telemetryRequests()).toEqual([])
-        expect(round.builtHandles).toEqual([])
-        expect(round.setupCalls).toEqual([])
-      } finally {
-        await round.dispose()
+          const identity = await foreground.act(0)
+          expect(typeof identity).toBe('object')
+          expect(round.clock.pending.size).toBe(0)
+          expect(round.dedicatedCount()).toBe(0)
+          expect(round.telemetryRequests()).toEqual([])
+          expect(round.builtHandles).toEqual([])
+          expect(round.setupCalls).toEqual([])
+        } finally {
+          await round.dispose()
+        }
       }
     },
-    60000
+    90000
   )
 
   test.each(KINDS)(
@@ -441,28 +495,45 @@ const answered = (round, api) =>
   round.wire.requests().filter((r) => r.api === api && r.answeredOrder !== undefined).length
 
 /**
- * Takes one scalar reading of a 100-cycle public schedule. Only numbers, booleans and strings are
- * kept, so the journal never retains a payload, snapshot, socket or transport.
- * @param {PublicTelemetryRound} round started round @param {number} cycle attempt number
- * @param {object} owners the identities that must not change across attempts
- * @returns {Promise<object>} the cycle record
+ * Checks one journaled cycle against the held shell and the per-cycle bounds. Every comparison is
+ * by issued identity: the same occupied shell, never merely the same count.
+ * @param {object} row the cycle record @param {object} shell the baseline shell snapshot
+ * @param {string[]} roles the shell roles that must be present and unchanged
+ * @returns {void}
  */
-const record = async (round, cycle, owners) => {
-  const seen = observe(round)
-  return {
-    cycle,
-    lifecycle: String(round.machine.lifecycle),
-    sameBuilder: round.machine.payload === owners.builder,
-    nativeJobs: round.codecJobs.length,
-    supplierCalls: owners.supplierCalls ? owners.supplierCalls() : 0,
-    snapshots: round.snapshots.length,
-    liveHandles: seen.handles - round.retirements.length,
-    sockets: seen.sockets,
-    timers: seen.pending.length,
-    waiters: seen.waiters,
-    queue: seen.queue,
-    uuid: await round.client.clientInstanceId({ timeout: 0 }),
-  }
+const expectCycle = (row, shell, roles) => {
+  expect(compareSnapshots(shell, row.shell, { identities: roles })).toEqual([])
+  expect(row.uuid).toBe(TELEMETRY_UUID)
+  expect(row.churn.identities.foreground).toHaveLength(1)
+  expect(row.churn.identities.sockets.length).toBeLessThanOrEqual(1)
+  expect(row.churn.identities.queue.length).toBeLessThanOrEqual(1)
+  expect(row.churn.identities.waiters).toEqual([])
+  expect(row.churn.identities.snapshots.length).toBeLessThanOrEqual(1)
+  expect(row.churn.identities.handles.length).toBeLessThanOrEqual(1)
+  expect(row.timers.length).toBeLessThanOrEqual(3)
+  expect(row.afterRelease).toEqual({
+    snapshots: expect.any(Number),
+    handles: expect.any(Number),
+    retirements: 0,
+    frames: 0,
+    sockets: expect.any(Number),
+  })
+  expect(row.afterRelease.snapshots).toBeLessThanOrEqual(1)
+  expect(row.afterRelease.handles).toBeLessThanOrEqual(2)
+  expect(row.afterRelease.sockets).toBeLessThanOrEqual(1)
+}
+
+/**
+ * Checks what all one hundred cycles together must show.
+ * @param {object[]} rows the journal @returns {void}
+ */
+const expectJournal = (rows) => {
+  expect(rows).toHaveLength(CYCLES)
+  expect(new Set(rows.map((row) => row.lifecycle)).size).toBe(CYCLES)
+  expect(new Set(rows.map((row) => row.transport)).size).toBe(CYCLES)
+  expect(new Set(rows.map((row) => row.churn.identities.foreground[0])).size).toBe(CYCLES)
+  for (const row of rows)
+    expect(Object.values(row).every((value) => typeof value !== 'function')).toBe(true)
 }
 
 describe('public telemetry resources', () => {
@@ -470,51 +541,60 @@ describe('public telemetry resources', () => {
     'holds the native result through public cycles for %s with late %s',
     async (kind, outcome) => {
       const round = new PublicTelemetryRound({ kind })
+      const foreground = new KindForeground(round).prepare()
+      const watch = new IndexOneWatch(round)
       let failNext = false
-      round.patch(
-        gzip,
-        'compress',
-        (original) =>
-          (...args) =>
-            failNext ? Promise.reject(new Error('late codec failure')) : original(...args)
-      )
+      let compressCalls = 0
+      round.patch(gzip, 'compress', (original) => (...args) => {
+        compressCalls += 1
+        return failNext ? Promise.reject(new Error('late codec failure')) : original(...args)
+      })
       const gate = round.hold('S12', { mode: 'normal' })
       try {
         await round.wait(() =>
-          round.start({ points: 'large', subscription: { acceptedCompressionTypes: [1, 0] } })
+          round.start({
+            points: 'large',
+            subscription: { acceptedCompressionTypes: [1, 0] },
+            beforeConnect: () => watch.install(),
+          })
         )
         await round.ready()
-        const owners = { builder: round.machine.payload }
         failNext = outcome === 'reject'
         round.arm()
         round.tick()
         await round.wait(() => gate.arrived())
         failNext = false
         expect(round.codecJobs).toHaveLength(1)
-        const journal = []
+        const heldJob = round.codecJobs[0]
+        const callsAtHold = compressCalls
+        const roles = ['builder', 'nativeJob', 'nativeResult']
+        const ledger = new CycleLedger(round, () => ({
+          builder: [round.machine.payload],
+          nativeJob: round.codecJobs.slice(0, 1),
+          nativeResult: round.codecJobs.slice(0, 1).map((job) => job.promise),
+        }))
+        const shell = await ledger.baseline()
+        for (const role of roles) expect(shell.identities[role]).toHaveLength(1)
+
         for (let cycle = 0; cycle < CYCLES; cycle++) {
           await round.wait(() => round.beginClose(round.closeOptions(0)))
           await round.wait(() => round.client.connect())
+          await round.wait(() => foreground.resume(), 30000)
           const gets = answered(round, 'GetTelemetrySubscriptions')
           round.tick()
           await round.until(
             () => answered(round, 'GetTelemetrySubscriptions') > gets && !round.machine.running
           )
-          journal.push(await record(round, cycle, owners))
+          const identity = await round.wait(() => foreground.act(cycle), 30000)
+          expectCycle(await ledger.record(cycle, identity), shell, roles)
+          expect(compressCalls).toBe(callsAtHold)
         }
-        expect(journal).toHaveLength(CYCLES)
-        expect(new Set(journal.map((row) => row.lifecycle)).size).toBe(CYCLES)
-        for (const row of journal) {
-          expect(row.sameBuilder).toBe(true)
-          expect(row.nativeJobs).toBe(1)
-          expect(row.snapshots).toBe(journal[0].snapshots)
-          expect(row.sockets).toBeLessThanOrEqual(1)
-          expect(row.queue).toBeLessThanOrEqual(1)
-          expect(row.waiters).toBe(0)
-          expect(row.timers).toBeLessThanOrEqual(3)
-          expect(row.uuid).toBe(TELEMETRY_UUID)
-        }
-        expect(Math.max(...journal.map((row) => row.liveHandles))).toBeLessThanOrEqual(2)
+        expectJournal(ledger.rows)
+        expect(round.codecJobs[0]).toBe(heldJob)
+        expect(heldJob.settled).toBe(false)
+        expect(watch.pools).toBeGreaterThan(0)
+        expect(watch.opens).toBe(0)
+
         const blocked = round.pushes().length
         round.tick()
         await round.until(() => !round.machine.running)
@@ -522,20 +602,26 @@ describe('public telemetry resources', () => {
         expect(round.pushes().length).toBe(blocked)
 
         const replacement = round.capture()
-        const writes = round.socketWrites.length
+        const writes = ledger.totalWrites()
         round.armed = false
         await round.drainReleased(gate)
+        expect(heldJob.settled).toBe(true)
         round.assertReplacementUnchanged(replacement)
-        expect(round.socketWrites.length).toBe(writes)
+        expect(ledger.totalWrites()).toBe(writes)
+        expect(
+          compareSnapshots(shell, await ledger.baseline(), { identities: ['builder'] })
+        ).toEqual([])
         expect(round.machine.uuid).toBe(TELEMETRY_UUID)
         await round.ready()
         expect(round.pushes().length).toBeGreaterThan(blocked)
         expect(round.codecJobs).toHaveLength(1)
+        expect(compressCalls).toBeGreaterThan(callsAtHold)
+        expect(watch.opens).toBe(0)
       } finally {
         await round.dispose()
       }
     },
-    180000
+    240000
   )
 
   const mechanisms = ['built-in OAuth', 'custom provider']
@@ -549,6 +635,8 @@ describe('public telemetry resources', () => {
     'holds the auth supplier through public cycles for %s using %s with late %s',
     async (kind, mechanism, outcome) => {
       const round = new PublicTelemetryRound({ kind })
+      const foreground = new KindForeground(round).prepare()
+      const watch = new IndexOneWatch(round)
       let calls = 0
       let late = false
       const supplier = async () => {
@@ -563,9 +651,11 @@ describe('public telemetry resources', () => {
         sasl.authenticationProvider = (args) => oauthBearerAuthenticator(sasl)(args)
       const gate = round.hold('S19b', { mode: 'normal' })
       try {
-        await round.wait(() => round.start({ sasl: true, kafka: { sasl } }))
+        await round.wait(() =>
+          round.start({ sasl: true, kafka: { sasl }, beforeConnect: () => watch.install() })
+        )
         await round.ready()
-        const owners = { builder: round.machine.payload, supplierCalls: () => calls }
+        const owner = round.dedicatedConnection.authenticationOwner
         const baseline = calls
         round.armRenewal()
         round.arm()
@@ -574,6 +664,15 @@ describe('public telemetry resources', () => {
         await round.wait(() => gate.arrived())
         late = false
         expect(calls).toBe(baseline + 1)
+        const heldPending = owner.pending
+        expect(heldPending).not.toBeNull()
+        const roles = ['supplier', 'pending']
+        const ledger = new CycleLedger(round, () => ({
+          supplier: [owner],
+          pending: owner.pending ? [owner.pending] : [],
+        }))
+        const shell = await ledger.baseline()
+        for (const role of roles) expect(shell.identities[role]).toHaveLength(1)
         const apiCounts = () =>
           Object.fromEntries(
             ['SaslAuthenticate', 'GetTelemetrySubscriptions', 'PushTelemetry'].map((api) => [
@@ -581,87 +680,163 @@ describe('public telemetry resources', () => {
               round.wire.requests().filter((r) => r.api === api).length,
             ])
           )
-        const journal = []
+
         for (let cycle = 0; cycle < CYCLES; cycle++) {
           await round.wait(() => round.beginClose(round.closeOptions(0)))
           await round.wait(() => round.client.connect())
+          await round.wait(() => foreground.resume(), 30000)
           if (round.machine.timer !== null) round.tick()
           for (let i = 0; i < 3; i++) await turn()
-          journal.push(await record(round, cycle, owners))
+          const identity = await round.wait(() => foreground.act(cycle), 30000)
+          expectCycle(await ledger.record(cycle, identity), shell, roles)
+          expect(calls).toBe(baseline + 1)
+          expect(owner.pending).toBe(heldPending)
         }
-        for (const row of journal) {
-          expect(row.supplierCalls).toBe(baseline + 1)
-          expect(row.sockets).toBeLessThanOrEqual(1)
-          expect(row.queue).toBeLessThanOrEqual(1)
-          expect(row.uuid).toBe(TELEMETRY_UUID)
-        }
-        const replacement = round.capture()
-        const before = apiCounts()
-        const writes = round.socketWrites.length
+        expectJournal(ledger.rows)
+        expect(watch.pools).toBeGreaterThan(0)
+        expect(watch.opens).toBe(0)
+
         await round.wait(() => round.beginClose(round.closeOptions(0)))
         await round.wait(() => round.client.connect())
+        await round.wait(() => foreground.resume(), 30000)
         const idle = round.capture()
+        const before = apiCounts()
+        const writes = ledger.totalWrites()
         round.armed = false
         await round.drainReleased(gate)
         expect(apiCounts()).toEqual(before)
-        expect(round.socketWrites.length).toBe(writes)
+        expect(ledger.totalWrites()).toBe(writes)
+        expect(owner.pending).toBeNull()
         round.assertReplacementUnchanged(idle)
-        expect(replacement.uuid).toBe(TELEMETRY_UUID)
+        expect(idle.uuid).toBe(TELEMETRY_UUID)
         await round.establish()
         expect(apiCounts().PushTelemetry).toBeGreaterThan(before.PushTelemetry)
         expect(round.machine.uuid).toBe(TELEMETRY_UUID)
+        expect(watch.opens).toBe(0)
       } finally {
         await round.dispose()
       }
     },
-    180000
+    240000
   )
 })
 
+/** @returns {{memorySomeAvg10: number}|null} the kernel's memory pressure, when it reports one */
+const memoryPressure = () => {
+  try {
+    const match = /some avg10=([\d.]+)/.exec(fs.readFileSync('/proc/pressure/memory', 'utf8'))
+    return match ? { memorySomeAvg10: Number(match[1]) } : null
+  } catch {
+    return null
+  }
+}
+
+/** @returns {object} the CPU, load and memory context of this host right now */
+const hostContext = () => ({
+  cpus: os.cpus().length,
+  load: os.loadavg(),
+  freeBytes: os.freemem(),
+  totalBytes: os.totalmem(),
+  psi: memoryPressure(),
+})
+
 /**
- * Runs one single-client memory child under the parent's supervision, with bounded output.
- * @param {string} kind public client kind
- * @returns {Promise<{readings:object, code:number|null, signal:string|null, stderr:string,
- *   closedAfterReceiptMs:number}>} the one reported line and the natural close facts
+ * Runs one single-client memory child under the parent's supervision, with bounded output. A child
+ * that overruns is killed and still joined; the facts come back whatever happened, so a failure
+ * leaves its evidence.
+ * @param {string} script fixture file name @param {string} kind public client kind
+ * @returns {Promise<object>} exit, output and receipt facts and the readings line
  */
-const supervise = (kind) =>
-  new Promise((resolve, reject) => {
-    const script = path.join(__dirname, 'fixtures', 'resourceChild.js')
-    const child = spawn(process.execPath, ['--expose-gc', script, kind], {
+const supervise = (script, kind) =>
+  new Promise((resolve) => {
+    const file = path.join(__dirname, 'fixtures', script)
+    const child = spawn(process.execPath, ['--expose-gc', file, kind], {
       stdio: ['ignore', 'pipe', 'pipe'],
     })
-    let out = ''
+    let stdout = ''
     let stderr = ''
-    let receipt = null
+    let stdoutBytes = 0
+    let stderrBytes = 0
+    let mark = null
+    let timedOut = false
+    let failure = null
     const limit = setTimeout(() => {
+      timedOut = true
       child.kill('SIGKILL')
-      reject(new Error('Memory arm exceeded its bound'))
     }, 90000)
     child.stdout.on('data', (chunk) => {
-      if (out.length < 65536) out += chunk
-      if (receipt === null && out.includes('\n')) receipt = Date.now()
+      stdoutBytes += chunk.length
+      if (stdout.length < 65536) stdout += chunk
+      if (mark === null && stdout.includes('\n')) mark = Date.now()
     })
     child.stderr.on('data', (chunk) => {
-      if (stderr.length < 65536) stderr += chunk
+      stderrBytes += chunk.length
+      if (stderr.length < 1024) stderr += chunk
     })
-    child.on('error', reject)
+    child.on('error', (error) => {
+      failure = error.message
+    })
     child.on('close', (code, signal) => {
       clearTimeout(limit)
-      let readings = null
-      try {
-        readings = JSON.parse(out.trim())
-      } catch (error) {
-        return reject(error)
+      const lines = []
+      for (const line of stdout.split('\n').filter(Boolean)) {
+        try {
+          lines.push(JSON.parse(line))
+        } catch (error) {
+          failure = `unreadable output line: ${error.message}`
+        }
       }
-      return resolve({
-        readings,
+      resolve({
         code,
         signal,
+        timedOut,
+        failure,
+        stdoutBytes,
+        stderrBytes,
         stderr,
-        closedAfterReceiptMs: receipt === null ? Infinity : Date.now() - receipt,
+        receipts: lines.filter((line) => line.receipt === 'disconnect').length,
+        readings: lines.find((line) => line.readings)?.readings ?? null,
+        closedAfterMarkMs: mark === null ? null : Date.now() - mark,
       })
     })
   })
+
+/**
+ * Records one measured arm where the resource job collects it, before any assertion runs.
+ * @param {string} arm `public` or `collector` @param {string} kind public client kind
+ * @param {object} run what `supervise` returned
+ * @param {object} before host context before the child @param {object} after after it
+ * @returns {object} the record that was judged, also written to the artifact directory when one
+ *   is configured
+ */
+const record = (arm, kind, run, before, after) => {
+  const { readings, failure, ...exit } = run
+  const artifact = {
+    schema: 1,
+    arm,
+    kind,
+    stamp: {
+      tree: process.env.KAFKAJS_TREE || 'unfrozen',
+      node: process.version,
+      platform: process.platform,
+      arch: process.arch,
+      runId: process.env.GITHUB_RUN_ID ?? null,
+      at: new Date().toISOString(),
+    },
+    context: { before, after },
+    exit: { ...exit, failure },
+    readings,
+  }
+  const directory = process.env.TELEMETRY_RESOURCES_ARTIFACT_DIR
+  if (directory) {
+    fs.mkdirSync(directory, { recursive: true })
+    fs.writeFileSync(
+      path.join(directory, `resources-${arm}-${kind}.json`),
+      JSON.stringify(artifact)
+    )
+  }
+  return artifact
+}
 
 // Memory and RSS readings need a quiet host: the unit lane skips them and the dedicated resources
 // job, which runs this file alone with the variable set, owns them.
@@ -669,26 +844,21 @@ const quiet = process.env.TELEMETRY_RESOURCES_QUIET === '1' ? test.each : test.s
 quiet(KINDS)(
   'single client resource memory for %s',
   async (kind) => {
-    const { readings, code, signal, stderr, closedAfterReceiptMs } = await supervise(kind)
-    expect({ code, signal, stderr }).toEqual({ code: 0, signal: null, stderr: '' })
-    expect(closedAfterReceiptMs).toBeLessThanOrEqual(10000)
-    const built = readings.builds.filter((row) => row.rawBytes !== undefined)
-    expect(built.map((row) => row.codec)).toEqual(zstd.isSupported ? ['gzip', 'zstd'] : ['gzip'])
-    for (const row of built) {
-      expect(row.points).toBe(257)
-      expect(row.rawBytes).toBeGreaterThan(1000)
-      expect(row.rawBytes).toBeLessThanOrEqual(1048576)
-      expect(row.compressionType).toBe(row.codec === 'zstd' ? 4 : 1)
-      expect(row.transmittedBytes).toBeLessThan(row.rawBytes)
-    }
-    expect(readings.builds.filter((row) => row.retiredCompletion !== undefined)).toEqual(
-      built.map((row) => ({ codec: row.codec, retiredCompletion: true }))
-    )
-    expect(readings.rssSamples).toBeGreaterThanOrEqual(2 * built.length)
-    expect(readings.held.retained - readings.matched.retained).toBeLessThanOrEqual(8388608)
-    expect(readings.closed.retained - readings.matched.retained).toBeLessThanOrEqual(262144)
-    expect(readings.peakRss).toBeLessThanOrEqual(67108864)
-    expect(readings.rssPeakSample).toBeLessThanOrEqual(67108864)
+    const before = hostContext()
+    const run = await supervise('publicMemoryChild.js', kind)
+    const judged = judgeMemoryArm(record('public', kind, run, before, hostContext()))
+    expect(judged).toEqual({ verdict: 'pass', problems: [] })
+  },
+  120000
+)
+
+quiet(KINDS)(
+  'collector only resource memory for %s',
+  async (kind) => {
+    const before = hostContext()
+    const run = await supervise('resourceChild.js', kind)
+    const judged = judgeMemoryArm(record('collector', kind, run, before, hostContext()))
+    expect(judged).toEqual({ verdict: 'pass', problems: [] })
   },
   120000
 )
@@ -734,22 +904,95 @@ describe('public telemetry resources', () => {
     }
   }
 
+  /**
+   * Orders, on the real decoder, what one Get response materializes against its refusal. Wrappers
+   * only observe: the production decoder runs unchanged and returns or throws what it always did.
+   * Array and string materialization is recorded only while a Get response is being decoded.
+   * @param {PublicTelemetryRound} round owner, before `start` @returns {string[]} live ordered
+   *   events: `decode`, then each materialization, then `decoded` or `refused`
+   */
+  const witness = (round) => {
+    const events = []
+    let active = false
+    for (const key of ['readUVarIntArray', 'readUVarIntString'])
+      round.patch(
+        Decoder.prototype,
+        key,
+        (original) =>
+          function (...args) {
+            if (active) events.push(key)
+            return original.apply(this, args)
+          }
+      )
+    round.patch(
+      Connection.prototype,
+      'send',
+      (original) =>
+        function (options) {
+          if (!this.authenticationOwner || options.request.apiKey !== 71)
+            return original.call(this, options)
+          const decode = options.response.decode
+          return original.call(this, {
+            ...options,
+            response: {
+              ...options.response,
+              decode: (...args) => {
+                active = true
+                events.push('decode')
+                let outcome
+                try {
+                  outcome = decode(...args)
+                } finally {
+                  active = false
+                }
+                return Promise.resolve(outcome).then(
+                  (value) => {
+                    events.push('decoded')
+                    return value
+                  },
+                  (error) => {
+                    events.push('refused')
+                    throw error
+                  }
+                )
+              },
+            },
+          })
+        }
+    )
+    return events
+  }
+
+  const materialized = (events) => events.filter((event) => event.startsWith('read'))
+
   test('bounds accepted selection metadata', async () => {
     for (const [name, fields] of Object.entries(accepted)) {
       await inRound(async (round) => {
+        const events = witness(round)
         await round.wait(() => round.start({ subscription: fields }))
         await round.ready()
         for (const [key, value] of Object.entries(fields))
           expect({ name, [key]: round.machine.subscription[key] }).toEqual({ name, [key]: value })
         expect({ name, state: round.machine.state }).toEqual({ name, state: 'READY' })
         expect(round.machine.uuid).toBe(TELEMETRY_UUID)
+        expect({ name, first: events[0], last: events.at(-1) }).toEqual({
+          name,
+          first: 'decode',
+          last: 'decoded',
+        })
+        expect({ name, materialized: materialized(events).length > 0 }).toEqual({
+          name,
+          materialized: true,
+        })
       })
     }
     for (const [name, fields] of Object.entries(refused)) {
       await inRound(async (round) => {
+        const events = witness(round)
         await round.wait(() => round.start({ subscription: fields }))
         round.tick()
         await round.until(() => round.machine.state === 'STOPPED')
+        expect({ name, events }).toEqual({ name, events: ['decode', 'refused'] })
         expect({ name, subscription: round.machine.subscription }).toEqual({
           name,
           subscription: null,
@@ -761,14 +1004,18 @@ describe('public telemetry resources', () => {
         })
       })
       await inRound(async (round) => {
+        const events = witness(round)
         await round.wait(() => round.start())
         await round.ready()
+        expect({ name, last: events.at(-1) }).toEqual({ name, last: 'decoded' })
         const previous = round.machine.subscription
+        events.length = 0
         await round.wait(() => round.beginClose(round.closeOptions(0)))
         await round.wait(() => round.client.connect())
         round.subscription = { ...round.subscription, ...fields }
         round.tick()
         await round.until(() => round.machine.state === 'STOPPED')
+        expect({ name, events }).toEqual({ name, events: ['decode', 'refused'] })
         expect({ name, kept: round.machine.subscription === previous }).toEqual({
           name,
           kept: true,
