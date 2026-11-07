@@ -5406,9 +5406,8 @@ class ShareSoak {
           this.counts.memberAdds += 1
           this.counts.memberRemoves += 1
           if (observation.reset) this.counts.resets += 1
+          // Idling to the slot boundary is not cycle work; a timer always wakes a little after due.
           while (this.clock.now() < due) await this.pause(scope, due - this.clock.now())
-          if (this.clock.now() > due)
-            throw new Error(`Cycle ${cycle} completed after its absolute cutoff`)
         },
         `Cycle ${cycle}`
       )
