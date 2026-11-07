@@ -1,4 +1,5 @@
 const TelemetryMetrics = require('../metrics')
+const { PublicTelemetryRound } = require('../../../testHelpers/lifecycle')
 const { KafkaJSInvalidConfigurationError } = require('../../errors')
 
 /** @param {object} metrics collector @returns {object} selected current sample */
@@ -287,4 +288,35 @@ describe('numeric registration is atomic and bounded', () => {
     ])
     expect(() => metrics.unregister({ name: 'invalid' })).toThrow(KafkaJSInvalidConfigurationError)
   })
+})
+
+describe('public final reentrancy', () => {
+  test.each(['producer', 'consumer', 'admin', 'shareConsumer'])(
+    '%s refuses an old final after a reentrant unregister and register',
+    async (kind) => {
+      const identity = { name: 'com.example.total' }
+      const round = new PublicTelemetryRound({ kind, enforceRequestTimeout: true })
+      try {
+        await round.wait(() => round.start())
+        await round.ready()
+        const before = round.capture()
+        round.atFinalPrewrite(() => {
+          round.client.unregisterMetricFromSubscription(identity)
+          round.client.registerMetricForSubscription({ ...identity, type: 'sum', value: 11n })
+        })
+        await round.wait(() => round.beginClose(round.closeOptions(20)))
+        expect(round.finalFrames()).toEqual([])
+        expect(round.writtenFor(round.finalSnapshotIdentity())).toBe(0)
+        await round.wait(() => round.client.connect())
+        await round.ready()
+        const point = round.decodedLatestPoint(identity)
+        expect(point.value).toBe(11n)
+        expect(point.metricRevision).not.toBe(before.metricRevision)
+        expect(point.origin).toBe(round.replacementMetricOrigin())
+      } finally {
+        await round.dispose()
+      }
+    },
+    60000
+  )
 })

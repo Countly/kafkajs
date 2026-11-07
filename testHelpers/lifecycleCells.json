@@ -4138,5 +4138,997 @@
     "boundary": "commit:answer-held",
     "protocol": "manual",
     "membership": "grouped"
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:final-encode",
+    "protocol": "classic-eager",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:final-encode",
+    "protocol": "classic-eager",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:final-dispatch",
+    "protocol": "classic-eager",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:final-dispatch",
+    "protocol": "classic-eager",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:deadline",
+    "protocol": "classic-eager",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:deadline",
+    "protocol": "classic-eager",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "crash",
+    "boundary": "telemetry:get-answer",
+    "protocol": "classic-eager",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "crash",
+    "boundary": "telemetry:get-answer",
+    "protocol": "classic-eager",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "crash",
+    "boundary": "telemetry:waiter-deadline",
+    "protocol": "classic-eager",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "crash",
+    "boundary": "telemetry:waiter-deadline",
+    "protocol": "classic-eager",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "stop",
+    "boundary": "telemetry:active-push",
+    "protocol": "classic-eager",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "stop",
+    "boundary": "telemetry:active-push",
+    "protocol": "classic-eager",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "rejoin",
+    "boundary": "telemetry:resource-snapshot",
+    "protocol": "classic-eager",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "rejoin",
+    "boundary": "telemetry:resource-snapshot",
+    "protocol": "classic-eager",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:old-final-result",
+    "protocol": "classic-eager",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:old-final-result",
+    "protocol": "classic-eager",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:final-encode",
+    "protocol": "classic-eager",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:final-encode",
+    "protocol": "classic-eager",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:final-dispatch",
+    "protocol": "classic-eager",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:final-dispatch",
+    "protocol": "classic-eager",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:deadline",
+    "protocol": "classic-eager",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:deadline",
+    "protocol": "classic-eager",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "crash",
+    "boundary": "telemetry:get-answer",
+    "protocol": "classic-eager",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "crash",
+    "boundary": "telemetry:get-answer",
+    "protocol": "classic-eager",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "crash",
+    "boundary": "telemetry:waiter-deadline",
+    "protocol": "classic-eager",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "crash",
+    "boundary": "telemetry:waiter-deadline",
+    "protocol": "classic-eager",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "stop",
+    "boundary": "telemetry:active-push",
+    "protocol": "classic-eager",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "stop",
+    "boundary": "telemetry:active-push",
+    "protocol": "classic-eager",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "rejoin",
+    "boundary": "telemetry:resource-snapshot",
+    "protocol": "classic-eager",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "rejoin",
+    "boundary": "telemetry:resource-snapshot",
+    "protocol": "classic-eager",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:old-final-result",
+    "protocol": "classic-eager",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:old-final-result",
+    "protocol": "classic-eager",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:final-encode",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:final-encode",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:final-dispatch",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:final-dispatch",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:deadline",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:deadline",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "crash",
+    "boundary": "telemetry:get-answer",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "crash",
+    "boundary": "telemetry:get-answer",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "crash",
+    "boundary": "telemetry:waiter-deadline",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "crash",
+    "boundary": "telemetry:waiter-deadline",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "stop",
+    "boundary": "telemetry:active-push",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "stop",
+    "boundary": "telemetry:active-push",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "rejoin",
+    "boundary": "telemetry:resource-snapshot",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "rejoin",
+    "boundary": "telemetry:resource-snapshot",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:old-final-result",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:old-final-result",
+    "protocol": "classic-cooperative",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:final-encode",
+    "protocol": "classic-cooperative",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:final-encode",
+    "protocol": "classic-cooperative",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:final-dispatch",
+    "protocol": "classic-cooperative",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:final-dispatch",
+    "protocol": "classic-cooperative",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:deadline",
+    "protocol": "classic-cooperative",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:deadline",
+    "protocol": "classic-cooperative",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "crash",
+    "boundary": "telemetry:get-answer",
+    "protocol": "classic-cooperative",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "crash",
+    "boundary": "telemetry:get-answer",
+    "protocol": "classic-cooperative",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "crash",
+    "boundary": "telemetry:waiter-deadline",
+    "protocol": "classic-cooperative",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "crash",
+    "boundary": "telemetry:waiter-deadline",
+    "protocol": "classic-cooperative",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "stop",
+    "boundary": "telemetry:active-push",
+    "protocol": "classic-cooperative",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "stop",
+    "boundary": "telemetry:active-push",
+    "protocol": "classic-cooperative",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "rejoin",
+    "boundary": "telemetry:resource-snapshot",
+    "protocol": "classic-cooperative",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "rejoin",
+    "boundary": "telemetry:resource-snapshot",
+    "protocol": "classic-cooperative",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:old-final-result",
+    "protocol": "classic-cooperative",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:old-final-result",
+    "protocol": "classic-cooperative",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:final-encode",
+    "protocol": "consumer",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:final-encode",
+    "protocol": "consumer",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:final-dispatch",
+    "protocol": "consumer",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:final-dispatch",
+    "protocol": "consumer",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:deadline",
+    "protocol": "consumer",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:deadline",
+    "protocol": "consumer",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "crash",
+    "boundary": "telemetry:get-answer",
+    "protocol": "consumer",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "crash",
+    "boundary": "telemetry:get-answer",
+    "protocol": "consumer",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "crash",
+    "boundary": "telemetry:waiter-deadline",
+    "protocol": "consumer",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "crash",
+    "boundary": "telemetry:waiter-deadline",
+    "protocol": "consumer",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "stop",
+    "boundary": "telemetry:active-push",
+    "protocol": "consumer",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "stop",
+    "boundary": "telemetry:active-push",
+    "protocol": "consumer",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "rejoin",
+    "boundary": "telemetry:resource-snapshot",
+    "protocol": "consumer",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "rejoin",
+    "boundary": "telemetry:resource-snapshot",
+    "protocol": "consumer",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:old-final-result",
+    "protocol": "consumer",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:old-final-result",
+    "protocol": "consumer",
+    "membership": "dynamic",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:final-encode",
+    "protocol": "consumer",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:final-encode",
+    "protocol": "consumer",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:final-dispatch",
+    "protocol": "consumer",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:final-dispatch",
+    "protocol": "consumer",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:deadline",
+    "protocol": "consumer",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:deadline",
+    "protocol": "consumer",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "crash",
+    "boundary": "telemetry:get-answer",
+    "protocol": "consumer",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "crash",
+    "boundary": "telemetry:get-answer",
+    "protocol": "consumer",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "crash",
+    "boundary": "telemetry:waiter-deadline",
+    "protocol": "consumer",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "crash",
+    "boundary": "telemetry:waiter-deadline",
+    "protocol": "consumer",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "stop",
+    "boundary": "telemetry:active-push",
+    "protocol": "consumer",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "stop",
+    "boundary": "telemetry:active-push",
+    "protocol": "consumer",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "rejoin",
+    "boundary": "telemetry:resource-snapshot",
+    "protocol": "consumer",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "rejoin",
+    "boundary": "telemetry:resource-snapshot",
+    "protocol": "consumer",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:old-final-result",
+    "protocol": "consumer",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:old-final-result",
+    "protocol": "consumer",
+    "membership": "static",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:final-encode",
+    "protocol": "manual",
+    "membership": "grouped",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:final-encode",
+    "protocol": "manual",
+    "membership": "grouped",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:final-dispatch",
+    "protocol": "manual",
+    "membership": "grouped",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:final-dispatch",
+    "protocol": "manual",
+    "membership": "grouped",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:deadline",
+    "protocol": "manual",
+    "membership": "grouped",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:deadline",
+    "protocol": "manual",
+    "membership": "grouped",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "crash",
+    "boundary": "telemetry:get-answer",
+    "protocol": "manual",
+    "membership": "grouped",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "crash",
+    "boundary": "telemetry:get-answer",
+    "protocol": "manual",
+    "membership": "grouped",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "crash",
+    "boundary": "telemetry:waiter-deadline",
+    "protocol": "manual",
+    "membership": "grouped",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "crash",
+    "boundary": "telemetry:waiter-deadline",
+    "protocol": "manual",
+    "membership": "grouped",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "stop",
+    "boundary": "telemetry:active-push",
+    "protocol": "manual",
+    "membership": "grouped",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "stop",
+    "boundary": "telemetry:active-push",
+    "protocol": "manual",
+    "membership": "grouped",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:old-final-result",
+    "protocol": "manual",
+    "membership": "grouped",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:old-final-result",
+    "protocol": "manual",
+    "membership": "grouped",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:final-encode",
+    "protocol": "manual",
+    "membership": "no-group",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:final-encode",
+    "protocol": "manual",
+    "membership": "no-group",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:final-dispatch",
+    "protocol": "manual",
+    "membership": "no-group",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:final-dispatch",
+    "protocol": "manual",
+    "membership": "no-group",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:deadline",
+    "protocol": "manual",
+    "membership": "no-group",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:deadline",
+    "protocol": "manual",
+    "membership": "no-group",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "crash",
+    "boundary": "telemetry:get-answer",
+    "protocol": "manual",
+    "membership": "no-group",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "crash",
+    "boundary": "telemetry:get-answer",
+    "protocol": "manual",
+    "membership": "no-group",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "crash",
+    "boundary": "telemetry:waiter-deadline",
+    "protocol": "manual",
+    "membership": "no-group",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "crash",
+    "boundary": "telemetry:waiter-deadline",
+    "protocol": "manual",
+    "membership": "no-group",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "stop",
+    "boundary": "telemetry:active-push",
+    "protocol": "manual",
+    "membership": "no-group",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "stop",
+    "boundary": "telemetry:active-push",
+    "protocol": "manual",
+    "membership": "no-group",
+    "telemetry": true,
+    "enforceRequestTimeout": true
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:old-final-result",
+    "protocol": "manual",
+    "membership": "no-group",
+    "telemetry": true,
+    "enforceRequestTimeout": false
+  },
+  {
+    "event": "disconnect",
+    "boundary": "telemetry:old-final-result",
+    "protocol": "manual",
+    "membership": "no-group",
+    "telemetry": true,
+    "enforceRequestTimeout": true
   }
 ]
