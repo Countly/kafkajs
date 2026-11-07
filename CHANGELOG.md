@@ -29,6 +29,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Defer telemetry benchmark payload decoding and capture hashing until after delivery timing, and verify inherited consume bytes through frozen manifest inputs.
 - Verify client telemetry updates, custom metrics, payload limits, Java interoperability, unsupported brokers and unchanged foreground outcomes.
 - Verify every captured telemetry exchange, exact close cancellations, broker-qualified cache retirement, share acknowledgements and complete Java export semantics.
+- Require complete post-recovery telemetry exports, distinguish share fetch and acknowledgement statuses, and pin archive negative controls to their intended diagnostics.
 
 #### Behavior changes
 

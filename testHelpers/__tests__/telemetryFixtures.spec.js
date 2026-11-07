@@ -2149,18 +2149,18 @@ describe('required live archive dimensions and semantics', () => {
     const a = javaArchive()
     a.verify()
     a.streams['js-admin'].snapshots[2].metrics[0].monotonic = false
-    expect(() => a.verify()).toThrow()
+    expect(() => a.verify()).toThrow('JS common counter must be monotonic')
   })
   test.each([
-    'missing',
-    'foreign',
-    'inapplicable',
-    'value',
-    'unit',
-    'dynamic-member',
-    'missing-member',
-    'duplicate',
-  ])('rejects Java %s resource or descriptor evidence', (change) => {
+    ['missing', 'Unexpected Java resource catalogue'],
+    ['foreign', 'Unexpected Java resource catalogue'],
+    ['inapplicable', 'Unexpected Java resource catalogue'],
+    ['value', 'Unexpected Java resource catalogue'],
+    ['unit', 'Unexpected Java descriptor unit'],
+    ['dynamic-member', 'Unexpected Java resource catalogue'],
+    ['missing-member', 'Unexpected Java resource catalogue'],
+    ['duplicate', 'Duplicate Java resource key'],
+  ])('rejects Java %s resource or descriptor evidence', (change, diagnostic) => {
     const a = javaArchive()
     a.verify()
     for (const r of a.rows.filter(
@@ -2178,7 +2178,7 @@ describe('required live archive dimensions and semantics', () => {
       if (change === 'duplicate') r.resources[0].attrs.push(r.resources[0].attrs[0])
       if (change === 'unit') r.metrics[1].unit = '1'
     }
-    expect(() => a.verify()).toThrow()
+    expect(() => a.verify()).toThrow(diagnostic)
   })
   /** @returns {Archive} complete custom lifecycle archive */
   const customArchive = () => {
@@ -2239,9 +2239,14 @@ describe('required live archive dimensions and semantics', () => {
   test('verifies exact custom resource metric and point cardinalities in every lifecycle window', () => {
     customArchive().verify()
   })
-  test.each(['metric', 'series', 'resource', 'point-count'])(
+  test.each([
+    ['metric', 'Custom metric count differs'],
+    ['series', 'Custom total point count differs'],
+    ['resource', 'Custom resource count differs'],
+    ['point-count', 'Custom total point count differs'],
+  ])(
     'rejects a later custom duplicate %s with consistent raw decode sink and hashes',
-    (change) => {
+    (change, diagnostic) => {
       const a = customArchive()
       a.verify()
       const d = a.streams.producer.snapshots[2]
@@ -2261,11 +2266,19 @@ describe('required live archive dimensions and semantics', () => {
         d.resourceMetricsCount++
       }
       if (change === 'point-count') d.pointsTotal++
-      expect(() => a.verify()).toThrow()
+      expect(() => a.verify()).toThrow(diagnostic)
     }
   )
-  /** @param {string} topicId owned or deliberately foreign UUID @param {number} [releaseAt] broker confirmation time @returns {object[]} original acquisition and acknowledgements */
-  const shareFrames = (topicId, releaseAt = 301, releaseType = 2) => {
+  /**
+   * Builds independent acquisition and settlement exchanges, retaining both ShareFetch statuses.
+   * @param {string} topicId owned or deliberately foreign UUID
+   * @param {number} [releaseAt] broker confirmation time
+   * @param {number} [releaseType] release or accept decision
+   * @param {object} [statuses] independent acquisition/settlement status controls
+   * @returns {object[]} original acquisition and acknowledgements
+   * @throws {Error} for invalid primitive wire fields
+   */
+  const shareFrames = (topicId, releaseAt = 301, releaseType = 2, statuses = {}) => {
     const frame = (buffer) => new Encoder().writeInt32(buffer.length).writeBuffer(buffer).buffer
     const exchange = (apiKey, correlation, batches, acquired, at, responseAt) => {
       const partition = new Encoder()
@@ -2322,9 +2335,19 @@ describe('required live archive dimensions and semantics', () => {
             partitions: [
               {
                 partitionIndex: 0,
-                errorCode: 0,
+                errorCode:
+                  correlation === 1
+                    ? (statuses.acquisitionFetchError ?? 0)
+                    : correlation === 2
+                      ? (statuses.settlementFetchError ?? 0)
+                      : 0,
                 errorMessage: null,
-                acknowledgeErrorCode: 0,
+                acknowledgeErrorCode:
+                  correlation === 1
+                    ? (statuses.acquisitionAckError ?? 0)
+                    : correlation === 2
+                      ? (statuses.settlementAckError ?? 0)
+                      : 0,
                 acknowledgeErrorMessage: null,
                 currentLeader: { leaderId: 1, leaderEpoch: 0 },
                 records: '',
@@ -2345,7 +2368,7 @@ describe('required live archive dimensions and semantics', () => {
     }
     return [
       exchange(78, 1, [], [{ firstOffset: '0', lastOffset: '9', deliveryCount: 1 }], 100, 110),
-      exchange(79, 2, [['0', '3', 1]], [], 200, 201),
+      exchange(statuses.settlementApi ?? 79, 2, [['0', '3', 1]], [], 200, 201),
       exchange(79, 3, [['4', '9', releaseType]], [], 300, releaseAt),
     ]
   }
@@ -2406,9 +2429,31 @@ describe('required live archive dimensions and semantics', () => {
     const stream = a.owner(
       'share',
       'share',
-      [{ metrics: [common('share')], resources: [{ attrs: [] }] }],
+      Array.from({ length: 2 }, () => ({
+        metrics: [common('share')],
+        resources: [{ attrs: [] }],
+      })),
       'drop'
     )
+    const records = stream.transcript.records
+    const before = records.splice(
+      records.findIndex((r) => r.requestKey === 'r10'),
+      1
+    )[0]
+    Object.assign(before, {
+      index: 2,
+      socketId: 1,
+      writeAt: 2,
+      response: { errorCode: 0, responseAt: 3 },
+    })
+    records.splice(
+      records.findIndex((r) => r.requestKey === 'r2'),
+      0,
+      before
+    )
+    records.find((r) => r.requestKey === 'r2').index = 3
+    records.find((r) => r.requestKey === 'r3').index = 4
+    Object.assign(stream.recovery, { checkpoint: 2, recoveredPush: 'r20' })
     const topic = 'required-share-topic'
     const topicId = 'ffeeddcc-bbaa-9988-7766-554433221100'
     const frames = shareFrames(topicId)
@@ -2477,17 +2522,17 @@ describe('required live archive dimensions and semantics', () => {
     }
   )
   test.each([
-    'missing-recovery',
-    'unexercised-recovery',
-    'foreign-topic',
-    'handler-offset',
-    'extra-settlement',
-    'duplicate-settlement',
-    'lock-expired-release',
-    'duplicate-broker-settlement',
-    'foreign-acquisition',
-    'public-topic',
-  ])('rejects share %s through the full archive verifier', (change) => {
+    ['missing-recovery', 'Missing configured share recovery'],
+    ['unexercised-recovery', 'Invalid recovered Push'],
+    ['foreign-topic', 'Broker share settlement topic differs'],
+    ['handler-offset', 'Share handler identities differ'],
+    ['extra-settlement', 'Public share settlement outside owned offsets'],
+    ['duplicate-settlement', 'Public share settlement must occur exactly once'],
+    ['lock-expired-release', 'Settlement after lock expiry'],
+    ['duplicate-broker-settlement', 'Extra or duplicate broker share settlement'],
+    ['foreign-acquisition', 'Share acquisition topic differs'],
+    ['public-topic', 'Public share settlement topic differs'],
+  ])('rejects share %s through the full archive verifier', (change, diagnostic) => {
     const a = outcomesArchive()
     a.verify()
     const inputs = a.oracles.share
@@ -2514,8 +2559,49 @@ describe('required live archive dimensions and semantics', () => {
       inputs.held = heldAcquisitions(inputs.frames, inputs.group)
     }
     if (change === 'public-topic') inputs.settlements[1].topic = 'foreign'
-    expect(() => a.verify()).toThrow()
+    expect(() => a.verify()).toThrow(diagnostic)
   })
+  test.each(['replacement Get', 'pre-fault Push', 'only pre-fault exports'])(
+    'rejects recovery using %s with consistent raw decode sink and hashes',
+    (change) => {
+      const a = outcomesArchive()
+      a.verify()
+      const recovery = a.record.results.share.recovery
+      if (change === 'replacement Get') recovery.recoveredPush = recovery.replacementGet
+      else if (change === 'pre-fault Push') recovery.recoveredPush = 'r10'
+      else {
+        recovery.recoveredPush = recovery.replacementGet
+        a.streams.share.snapshots.pop()
+        a.streams.share.transcript.records = a.streams.share.transcript.records.filter(
+          (r) => r.requestKey !== 'r20'
+        )
+        a.record.pushes = a.record.pushes.filter(
+          (p) => p.owner !== 'share' || p.requestKey !== 'r20'
+        )
+      }
+      expect(() => a.verify()).toThrow('Invalid recovered Push')
+    }
+  )
+  test('rejects a recovered Push substituted as the replacement Get with refreshed hashes', () => {
+    const a = outcomesArchive()
+    a.verify()
+    a.record.results.share.recovery.replacementGet = a.record.results.share.recovery.recoveredPush
+    expect(() => a.verify()).toThrow('Invalid recovery replacement Get')
+  })
+  test.each(['request ordinal', 'response time'])(
+    'rejects a recovered Push at the replacement Get %s with refreshed hashes',
+    (boundary) => {
+      const a = outcomesArchive()
+      a.verify()
+      const { recovery } = a.record.results.share
+      const records = a.streams.share.transcript.records
+      const get = records.find((r) => r.requestKey === recovery.replacementGet)
+      const push = records.find((r) => r.requestKey === recovery.recoveredPush)
+      if (boundary === 'request ordinal') push.index = get.index
+      else push.writeAt = get.response.responseAt
+      expect(() => a.verify()).toThrow('Invalid recovered Push')
+    }
+  )
   /** @returns {Archive} all four reopen episodes, three zero-timeout owners and admin blackhole */
   const shutdownArchive = () => {
     const a = new Archive('telemetry-shutdown')
@@ -2674,9 +2760,45 @@ describe('required live archive dimensions and semantics', () => {
       a.verify()
       const share = a.oracles.share[owner]
       share.frames.splice(1, 2, ...shareFrames(ID, 301, 1).slice(1))
-      expect(() => a.verify()).toThrow()
+      expect(() => a.verify()).toThrow('Capable share broker settlement identity differs')
     }
   )
+  test.each(['configured share', 'share', 'share-off'])(
+    'verifies independent fetch and acknowledgement statuses for %s',
+    (owner) => {
+      const a = owner === 'configured share' ? outcomesArchive() : unsupportedArchive()
+      const share = owner === 'configured share' ? a.oracles.share : a.oracles.share[owner]
+      const releaseType = owner === 'configured share' ? 2 : 1
+      a.verify()
+      share.frames = shareFrames(share.topicId, 301, releaseType, {
+        acquisitionAckError: 7,
+        settlementApi: 78,
+        settlementFetchError: 7,
+      })
+      a.verify()
+    }
+  )
+  test.each([
+    ['configured share', 'fetch error + ack ok', 'Missing raw share acquisition'],
+    ['configured share', 'fetch ok + ack error', 'Contradicted acknowledgement ledger'],
+    ['share', 'fetch error + ack ok', 'Contradicted held acquisition ranges'],
+    ['share', 'fetch ok + ack error', 'Incomplete capable share broker settlement'],
+    ['share-off', 'fetch error + ack ok', 'Contradicted held acquisition ranges'],
+    ['share-off', 'fetch ok + ack error', 'Incomplete capable share broker settlement'],
+  ])('rejects %s %s with refreshed hashes', (owner, change, diagnostic) => {
+    const a = owner === 'configured share' ? outcomesArchive() : unsupportedArchive()
+    const share = owner === 'configured share' ? a.oracles.share : a.oracles.share[owner]
+    const releaseType = owner === 'configured share' ? 2 : 1
+    share.frames = shareFrames(share.topicId, 301, releaseType, { settlementApi: 78 })
+    a.verify()
+    share.frames = shareFrames(share.topicId, 301, releaseType, {
+      settlementApi: 78,
+      ...(change === 'fetch error + ack ok'
+        ? { acquisitionFetchError: 7 }
+        : { settlementAckError: 7 }),
+    })
+    expect(() => a.verify()).toThrow(diagnostic)
+  })
   test('verifies the base outcomes catalogue and rejects a missing ordinary arm', () => {
     const a = outcomesArchive()
     a.record.mode = 'base'

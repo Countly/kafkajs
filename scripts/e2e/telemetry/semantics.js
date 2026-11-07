@@ -83,7 +83,7 @@ const assertJsCounter = (kind, decoded) => {
   const [metric] = metrics
   assert.equal(metric.kind, 'SUM')
   assert.equal(metric.unit, '1')
-  assert.equal(metric.monotonic, true)
+  assert.equal(metric.monotonic, true, 'JS common counter must be monotonic')
   assert.equal(metric.temporality, 'AGGREGATION_TEMPORALITY_DELTA')
   assert.equal(metric.pointsInMessage, metric.points.length)
   assert.equal(metric.points.length, 1)
@@ -106,12 +106,12 @@ const assertJsCounter = (kind, decoded) => {
  * @throws {Error} for duplicate metrics/series, missing resources or incomplete point counts
  */
 const assertCustomShape = (decoded, names) => {
-  assert.equal(decoded.resourceMetricsCount, 1)
-  assert.equal(decoded.resources.length, 1)
+  assert.equal(decoded.resourceMetricsCount, 1, 'Custom resource count differs')
+  assert.equal(decoded.resources.length, 1, 'Custom resource catalogue count differs')
   assert.equal(decoded.resources[0].droppedAttributes, 0)
-  assert.equal(decoded.metricsTotal, names.length)
-  assert.equal(decoded.metricsKept, names.length)
-  assert.equal(decoded.pointsTotal, names.length)
+  assert.equal(decoded.metricsTotal, names.length, 'Custom metric count differs')
+  assert.equal(decoded.metricsKept, names.length, 'Custom retained metric count differs')
+  assert.equal(decoded.pointsTotal, names.length, 'Custom total point count differs')
   assert.deepEqual(
     decoded.metrics.map((m) => m.name).sort(),
     [...names].sort(),
@@ -162,7 +162,11 @@ const assertJavaRows = (role, rows, { clientId, closing, closed, group, membersh
     assert.equal(row.resources.length, 1)
     assert.equal(row.resources[0].droppedAttributes, 0)
     const attrs = row.resources[0].attrs
-    assert.equal(new Set(attrs.map(([key]) => key)).size, attrs.length)
+    assert.equal(
+      new Set(attrs.map(([key]) => key)).size,
+      attrs.length,
+      'Duplicate Java resource key'
+    )
     const expected = javaResources(role, group, membership, row.metrics[0].points[0].timeNs)
     assert(
       expected.some((catalogue) => {
