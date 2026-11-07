@@ -3646,6 +3646,8 @@ class ShareFetchTap {
     this.frameSequence = 0
     this.faults = 0
     this.context = new AsyncLocalStorage()
+    this.observers = new Set()
+    this.socketObservers = new WeakMap()
   }
 
   /**
@@ -3653,16 +3655,29 @@ class ShareFetchTap {
    * @returns {Function} a factory whose sockets this tap observes
    */
   factory(inner) {
-    return (args) => this.wrap(inner(args), `${args.host}:${args.port}`)
+    const tap = this
+    return (args) => {
+      const id = ++this.created
+      const endpoint = `${args.host}:${args.port}`
+      this.notify('socket-connect-start', { socket: id, endpoint })
+      const socket = inner({
+        ...args,
+        onConnect(...rest) {
+          tap.notify('socket-connect-end', { socket: id, endpoint })
+          return args.onConnect.apply(this, rest)
+        },
+      })
+      return this.wrap(socket, endpoint, id)
+    }
   }
 
   /**
    * @param {object} socket the socket the product will write to
    * @param {string} endpoint `host:port` it dialled
+   * @param {number} [id] Identity reserved by the observed factory.
    * @returns {object} the same socket, observed
    */
-  wrap(socket, endpoint) {
-    const id = ++this.created
+  wrap(socket, endpoint, id = ++this.created) {
     for (const [known, ref] of this.sockets)
       if (ref.deref()?.destroyed !== false) this.sockets.delete(known)
     this.sockets.set(id, new WeakRef(socket))
@@ -3682,8 +3697,23 @@ class ShareFetchTap {
         incoming = incoming.subarray(end)
       }
     }
+    const ended = () => this.notify('socket-end', { socket: id, endpoint })
+    const errored = (error) =>
+      this.notify('socket-error', {
+        socket: id,
+        endpoint,
+        error: { name: error.name, message: error.message, code: error.code },
+      })
     socket.on?.('data', receive)
-    socket.once?.('close', () => {
+    this.socketObservers.set(socket, () => {
+      socket.on?.('end', ended)
+      socket.on?.('error', errored)
+    })
+    socket.once?.('close', (hadError) => {
+      this.notify('socket-close', { socket: id, endpoint, hadError, destroyed: socket.destroyed })
+      socket.off('end', ended)
+      socket.off('error', errored)
+      this.socketObservers.delete(socket)
       socket.off('data', receive)
       for (const frame of outstanding.values()) frame.lostAt = this.clock.now()
       outstanding.clear()
@@ -3746,9 +3776,47 @@ class ShareFetchTap {
       const { readRequest } = require('../../testHelpers/wire/shareFetchV2')
       epoch = readRequest(frame.subarray(header.byteLength)).shareSessionEpoch
     } catch {}
-    this.facts.push({ sequence: ++this.sequence, socket, endpoint, epoch, at: this.clock.now() })
+    const fact = {
+      sequence: ++this.sequence,
+      socket,
+      endpoint,
+      epoch,
+      at: written?.at ?? this.clock.now(),
+    }
+    this.facts.push(fact)
+    this.notify(
+      'api78-write',
+      {
+        ...fact,
+        frame: written?.id,
+        exchange: context?.id,
+        memberId: context?.memberId,
+        groupId: context?.groupId,
+        attempted: true,
+      },
+      fact.at
+    )
     if (this.facts.length > this.limit) this.facts.shift()
     return written
+  }
+
+  /**
+   * @param {Function} observer Receives original transport times without retaining sockets.
+   * @returns {Function} Removes this cycle's observer.
+   */
+  listen(observer) {
+    this.observers.add(observer)
+    return () => this.observers.delete(observer)
+  }
+
+  /**
+   * @param {string} step Original socket or frame observation.
+   * @param {object} fields Primitive event details.
+   * @param {number} [at] Original monotonic timestamp.
+   * @returns {void}
+   */
+  notify(step, fields, at = this.clock.now()) {
+    for (const observer of this.observers) observer(step, fields, at)
   }
 
   /** @returns {number} a position after which `since` reads only later requests */
@@ -3774,6 +3842,7 @@ class ShareFetchTap {
   destroy(socket) {
     const target = this.sockets.get(socket)?.deref()
     if (!target || target.destroyed) throw new Error('The original data socket is already gone')
+    this.socketObservers.get(target)?.()
     target.destroy()
   }
 }
@@ -4086,7 +4155,10 @@ class ShareMember {
           error: error ? { name: error.name, message: error.message } : null,
         })
       }),
-      this.client.on(events.SESSION_RESET, ({ payload }) => this.resets.push(payload)),
+      this.client.on(events.SESSION_RESET, ({ payload }) => {
+        this.resets.push(payload)
+        this.onProgress('SESSION_RESET', payload)
+      }),
       this.client.on(events.CRASH, ({ payload }) => this.crashes.push(payload.error)),
     ]
     if (events.HEARTBEAT)
@@ -4142,6 +4214,7 @@ class ShareMember {
         } finally {
           await this.client.disconnect({ timeout: 2000 })
           status = 'completed'
+          this.disconnected = true
         }
       } finally {
         try {
@@ -4152,6 +4225,24 @@ class ShareMember {
       }
     })()
     return this.stopTask
+  }
+
+  /** @returns {object} Current public observations without declaring the handler joined. */
+  snapshot() {
+    return {
+      member: this.label,
+      memberId: this.memberId,
+      assignment: this.assignment,
+      handler: this.entries,
+      acknowledgements: this.acks.map(({ error, ...ack }) => ({
+        ...ack,
+        error: error ? { name: error.name, message: error.message, code: error.code } : null,
+      })),
+      resets: this.resets,
+      crashes: this.crashes.map(({ name, message }) => ({ name, message })),
+      disconnected: this.disconnected === true,
+      finalized: this.finalized === true,
+    }
   }
 
   /** @returns {object[]} The complete joined journal; any later callback invalidates the run. */
@@ -4199,6 +4290,7 @@ class ShareSoakDriver {
     this.admin = null
     this.producer = null
     this.leaders = new Map()
+    this.nodes = new Map()
     this.completedAt = null
     this.acknowledged = []
   }
@@ -4261,6 +4353,7 @@ class ShareSoakDriver {
     )
     const [topic] = metadata.topics.filter(({ name }) => name === this.topic)
     const { brokers } = await bounded(scope, Infinity, () => admin.describeCluster())
+    this.nodes = new Map(brokers.map(({ host, port, nodeId }) => [`${host}:${port}`, nodeId]))
     for (const { partitionId, leader } of topic.partitions) {
       const node = brokers.find(({ nodeId }) => nodeId === leader)
       if (!node) throw new Error(`Partition ${partitionId} has no known leader`)
@@ -4423,8 +4516,18 @@ class ShareSoakDriver {
     stack.add('restore the cycle journal', () => {
       try {
         observation.provenance = journal.snapshot()
+        observation.memberObservations = members.map((member) => member.snapshot())
+        observation.snapshot = {
+          at: clock.now(),
+          workloadJoined:
+            members.length === 2 &&
+            members.every((member) => member.disconnected && member.finalized),
+        }
+        if (active.failureArchived) this.onCycleCleanup?.(capture())
       } finally {
+        unlisten()
         journal.restore()
+        active.restored = true
       }
     })
     const observation = {
@@ -4435,8 +4538,7 @@ class ShareSoakDriver {
       steps: [],
       timing: { cycle: plan.cycle, kind: 'cycle', startedAt: clock.now(), due },
     }
-    const note = (step, fields = {}) => {
-      const at = clock.now()
+    const note = (step, fields = {}, at = clock.now()) => {
       const row = {
         cycle: plan.cycle,
         step,
@@ -4450,6 +4552,44 @@ class ShareSoakDriver {
       this.onProgress(row)
     }
     const members = []
+    const capture = () =>
+      JSON.parse(
+        JSON.stringify({
+          ...observation,
+          provenance: journal.snapshot(),
+          handler: members.flatMap((member) => member.entries),
+          accepted: members.flatMap((member) => member.accepted()),
+          memberObservations: members.map((member) => member.snapshot()),
+          snapshot: {
+            at: clock.now(),
+            workloadJoined:
+              members.length === 2 &&
+              members.every((member) => member.disconnected && member.finalized),
+          },
+        })
+      )
+    const active = { capture, observation, failureArchived: false }
+    this.activeCycle = active
+    const postResetNodes = new Set()
+    const unlisten = this.tap.listen((step, fields, at) => {
+      const target = observation.resetTarget
+      if (!target) return
+      const nodeId = this.nodes.get(fields.endpoint)
+      if (step === 'api78-write') {
+        if (
+          fields.memberId !== target.memberId ||
+          fields.groupId !== this.group ||
+          postResetNodes.has(fields.endpoint)
+        )
+          return
+        postResetNodes.add(fields.endpoint)
+        note('post-reset-api78', { ...fields, nodeId }, at)
+      } else if (fields.socket === target.socket) {
+        note(step, { ...fields, nodeId }, at)
+      } else if (fields.endpoint === target.endpoint && step.startsWith('socket-connect-')) {
+        note(step.replace('socket-connect-', 'reconnect-'), { ...fields, nodeId }, at)
+      }
+    })
     let allAcknowledged = false
     const noteAcknowledgements = () => {
       if (allAcknowledged || !observation.produced) return
@@ -4487,6 +4627,13 @@ class ShareSoakDriver {
         onProgress: (step, fields) => {
           note(step, { member: label, ...fields })
           if (step === 'acknowledgement') noteAcknowledgements()
+          if (
+            step === 'disconnect-end' &&
+            active.restored &&
+            active.failureArchived &&
+            members.every((member) => member.disconnected && member.finalized)
+          )
+            this.onCycleCleanup?.(capture())
         },
         onBatch,
       })
@@ -4502,9 +4649,15 @@ class ShareSoakDriver {
         note('cycle-start')
         const a = track(
           member('A', async (entries, partition) => {
+            if (observation.resetTarget)
+              for (const entry of entries)
+                if (observation.held.includes(entry.identity))
+                  note('held-redelivery', { member: 'A', partition, ...entry })
             if (!plan.reset || hold.entries) return
             hold.entries = entries.map(({ identity }) => identity)
             hold.partition = partition
+            hold.acquisition = entries[0]?.acquisition
+            hold.dispatch = entries[0]?.dispatch
             await new Promise((resolve) => {
               hold.release = resolve
             })
@@ -4621,6 +4774,17 @@ class ShareSoakDriver {
       },
       { budgetMs: 2000 }
     )
+  }
+
+  /**
+   * Freezes active provenance and partial public observations at the failure archive boundary.
+   * Cleanup may still be running; its later snapshot is archived separately.
+   * @returns {object|undefined} Detached evidence without finalizing a member.
+   */
+  snapshotCycle() {
+    if (!this.activeCycle || this.activeCycle.observation !== this.lastCycle) return this.lastCycle
+    this.activeCycle.failureArchived = true
+    return this.activeCycle.capture()
   }
 
   /**
@@ -4744,7 +4908,8 @@ class ShareSoakDriver {
    * handler, and observes the session reset and the new epoch-zero open on a new socket.
    * @param {AbortSignal} scope the cycle scope
    * @param {ShareMember} member A
-   * @param {{ entries: string[], partition: number, release: Function }} hold the held batch
+   * @param {{ entries: string[], partition: number, acquisition: number, dispatch: number,
+   *   release: Function }} hold the held batch
    * @param {number} mark the tap position after B left
    * @param {object} observation receives the frozen held set before the fault
    * @returns {Promise<object>} the observed reset and reopen
@@ -4758,6 +4923,19 @@ class ShareSoakDriver {
       .at(-1)
     if (!old) throw new Error(`No established ShareFetch slot on ${endpoint}`)
     observation.held = [...hold.entries]
+    observation.resetTarget = {
+      socket: old.socket,
+      endpoint,
+      nodeId: this.nodes.get(endpoint),
+      memberId: member.memberId,
+      epoch: old.epoch,
+      partition: hold.partition,
+      acquisition: hold.acquisition,
+      dispatch: hold.dispatch,
+      held: observation.held,
+    }
+    const target = observation.resetTarget
+    this.tap.notify('reset-target', target)
     this.tap.destroy(old.socket)
     hold.release()
     let next
@@ -5218,6 +5396,8 @@ class ShareSoak {
       )
     this.driver.onProgress = ({ at, ...row }) =>
       this.row('soak-cycle-step', { ...row, monotonicAt: at })
+    this.driver.onCycleCleanup = (observation) =>
+      this.row('soak-cycle-cleanup', { cycle: observation.timing.cycle, observation })
   }
 
   /**
@@ -5398,6 +5578,7 @@ class ShareSoak {
             violations.push(`cycle ${cycle}: the proof is outside its original slot`)
           this.recordCycle(plan, observation, violations)
           this.driver.lastCycle = null
+          this.driver.activeCycle = null
           if (violations.length > 0) throw new Error(violations.join('; '))
           if (this.clock.now() > due)
             throw new Error(`Cycle ${cycle} completed after its absolute cutoff`)
@@ -5411,7 +5592,10 @@ class ShareSoak {
       // Boundary padding uses the profile's cumulative margin, outside the cycle-work timer.
       while (this.clock.now() < due) await this.pause(idleScope, due - this.clock.now())
     } catch (error) {
-      if (this.driver.lastCycle) this.recordCycle(plan, this.driver.lastCycle, [error.message])
+      if (this.driver.lastCycle) {
+        const observation = this.driver.snapshotCycle?.() ?? this.driver.lastCycle
+        this.recordCycle(plan, observation, [error.message])
+      }
       throw error
     } finally {
       this.timing.slots.push({ cycle, startedAt, due, completedAt: this.clock.now() })
@@ -5449,6 +5633,9 @@ class ShareSoak {
       memberAdded: members.bAdded === true,
       memberRemoved: members.bRemoved === true,
       held: observation.held ?? [],
+      resetTarget: observation.resetTarget,
+      snapshot: observation.snapshot,
+      memberObservations: observation.memberObservations,
       resetObserved: reset !== null,
       reset,
       cleanup: {

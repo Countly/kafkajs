@@ -2340,6 +2340,53 @@ describe('Share soak ShareFetch tap', () => {
     expect([...tap.sockets.keys()]).toEqual([2])
   })
 
+  test.each(['close', 'error', 'end'])(
+    'reports actual reset socket events with original times, event=%s',
+    async (event) => {
+      const { createFakeSocketFactory } = require('../../../testHelpers/fakeSocket')
+      let now = 10
+      const tap = new ShareFetchTap(64, { now: () => now })
+      const observed = []
+      const unlisten = tap.listen((step, fields, at) => observed.push({ step, ...fields, at }))
+      const { factory } = createFakeSocketFactory()
+      const connected = jest.fn()
+      const socket = tap.factory(factory)({ host: 'h', port: 9, onConnect: connected })
+      await new Promise(setImmediate)
+      expect(connected).toHaveBeenCalledTimes(1)
+      expect(observed.map(({ step }) => step)).toEqual([
+        'socket-connect-start',
+        'socket-connect-end',
+      ])
+      const destroy = socket.destroy.bind(socket)
+      if (event === 'error')
+        socket.destroy = () => destroy(Object.assign(new Error('reset'), { code: 'ECONNRESET' }))
+      if (event === 'end')
+        socket.destroy = () => {
+          socket.emit('end')
+          return destroy()
+        }
+      now = 25
+      tap.destroy(1)
+      expect(observed.some(({ step }) => step === 'socket-close')).toBe(false)
+      await Promise.resolve()
+      expect(observed.filter(({ at }) => at === 25).map(({ step }) => step)).toEqual(
+        event === 'close' ? ['socket-close'] : [`socket-${event}`, 'socket-close']
+      )
+      expect(observed.at(-1)).toEqual({
+        step: 'socket-close',
+        socket: 1,
+        endpoint: 'h:9',
+        at: 25,
+        hadError: event === 'error',
+        destroyed: true,
+      })
+      expect(socket.listenerCount('end')).toBe(0)
+      expect(socket.listenerCount('error')).toBe(0)
+      unlisten()
+      expect(tap.observers.size).toBe(0)
+    }
+  )
+
   test('wraps a factory so its sockets are observed', () => {
     const tap = new ShareFetchTap()
     const socket = fakeSocket()
@@ -5135,6 +5182,8 @@ describe('Share soak complete original-owner schedules', () => {
     replayAt,
     drainReplay = false,
     socketClosed = () => {},
+    closeOnly = false,
+    observeRow = () => {},
   } = {}) => {
     const clock = new ShareClock().install()
     const exposed = globalThis.gc
@@ -5147,33 +5196,38 @@ describe('Share soak complete original-owner schedules', () => {
      * Rejects destroyed-stream writes before they can apply acknowledgements at the broker.
      * Connection removes its end listener before deliberate shutdown; destroying a live stream
      * instead reports the injected reset, settling original requests before close releases listeners.
+     * The close-only variant preserves the fake socket's original destroy and write semantics.
      * @param {object} options Socket endpoint and connection callback.
      * @returns {object} The scripted socket with asynchronous stream-write failures.
      */
     const socketFactory = (options) => {
       const socket = cluster.socketFactory(options)
-      const destroy = socket.destroy.bind(socket)
-      socket.destroy = (error) =>
-        destroy(
-          error ??
-            (socket.listenerCount('end') > 0
-              ? Object.assign(new Error('Connection reset'), { code: 'ECONNRESET' })
-              : undefined)
-        )
+      if (!closeOnly) {
+        const destroy = socket.destroy.bind(socket)
+        socket.destroy = (error) =>
+          destroy(
+            error ??
+              (socket.listenerCount('end') > 0
+                ? Object.assign(new Error('Connection reset'), { code: 'ECONNRESET' })
+                : undefined)
+          )
+      }
       socket.once('close', () => {
         socket.removeAllListeners()
         socketClosed(socket)
       })
-      const write = socket.write.bind(socket)
-      socket.write = (...args) => {
-        if (!socket.destroyed) return write(...args)
-        const error = Object.assign(new Error('Cannot call write after a stream was destroyed'), {
-          code: 'ERR_STREAM_DESTROYED',
-        })
-        queueMicrotask(() => {
-          if (socket.listenerCount('error')) socket.emit('error', error)
-        })
-        return false
+      if (!closeOnly) {
+        const write = socket.write.bind(socket)
+        socket.write = (...args) => {
+          if (!socket.destroyed) return write(...args)
+          const error = Object.assign(new Error('Cannot call write after a stream was destroyed'), {
+            code: 'ERR_STREAM_DESTROYED',
+          })
+          queueMicrotask(() => {
+            if (socket.listenerCount('error')) socket.emit('error', error)
+          })
+          return false
+        }
       }
       return socket
     }
@@ -5425,7 +5479,14 @@ describe('Share soak complete original-owner schedules', () => {
     const kafka = {
       shareConsumer: (options) => {
         const client = instrumented.kafka.shareConsumer(options)
-        if (!driver.lastCycle?.members.aLeft && owner.counts.cycles !== 30) return client
+        if (!driver.lastCycle?.members.aLeft && owner.counts.cycles !== 30)
+          return {
+            ...client,
+            disconnect: async (options) => {
+              await io('workload-disconnect', { owner, driver, clock })
+              return client.disconnect(options)
+            },
+          }
         const assignment = client.assignment
         const disconnect = client.disconnect
         // The public consumer is frozen: wrap a copy instead of mutating it.
@@ -5544,6 +5605,7 @@ describe('Share soak complete original-owner schedules', () => {
           if (row.event === 'soak-resources' && row.kind === 'teardown')
             finalDamage(owner.final, { owner, rows, clock })
           rows.push(row)
+          observeRow(row, { owner, driver, clock })
         },
       },
     })
@@ -5612,6 +5674,154 @@ describe('Share soak complete original-owner schedules', () => {
       reason: error?.message ?? result?.violations.join('; '),
     }
   }
+
+  /**
+   * Checks original reset observations against primitive frames and immediate evidence rows.
+   * @param {object[]} cycles Archived cycles.
+   * @param {object[]} rows All evidence rows in write order.
+   * @param {boolean} closeOnly Whether destruction must emit close without error or end.
+   * @returns {void}
+   */
+  const resetDiagnostics = (cycles, rows, closeOnly) => {
+    for (const cycle of cycles.filter(({ reset }) => reset)) {
+      const { resetTarget: target, reset, steps, provenance, held, handler } = cycle
+      expect(target).toMatchObject({
+        socket: reset.oldSocket,
+        nodeId: reset.nodeId,
+        epoch: reset.oldEpoch,
+        acquisition: expect.any(Number),
+        dispatch: expect.any(Number),
+        held,
+      })
+      expect(provenance.acquisitions).toEqual(
+        expect.arrayContaining([expect.objectContaining({ id: target.acquisition })])
+      )
+      expect(steps.map(({ step }) => step)).toEqual(
+        expect.arrayContaining([
+          'reset-target',
+          'socket-close',
+          'reconnect-start',
+          'reconnect-end',
+          'post-reset-api78',
+          'SESSION_RESET',
+          'held-redelivery',
+        ])
+      )
+      expect(steps.find(({ step }) => step === 'socket-close')).toMatchObject({
+        socket: target.socket,
+        endpoint: target.endpoint,
+        nodeId: target.nodeId,
+        hadError: !closeOnly,
+        destroyed: true,
+      })
+      if (closeOnly)
+        expect(steps.some(({ step }) => step === 'socket-error' || step === 'socket-end')).toBe(
+          false
+        )
+      else expect(steps.some(({ step }) => step === 'socket-error')).toBe(true)
+      const firstWrites = steps.filter(({ step }) => step === 'post-reset-api78')
+      expect(new Set(firstWrites.map(({ nodeId }) => nodeId)).size).toBe(3)
+      expect(firstWrites).toHaveLength(3)
+      for (const written of firstWrites) {
+        const exchange = provenance.exchanges.find(({ id }) => id === written.exchange)
+        const frame = exchange.frames.find(({ id }) => id === written.frame)
+        expect(written).toMatchObject({
+          at: frame.at,
+          socket: frame.socket,
+          endpoint: frame.endpoint,
+          epoch: frame.request.shareSessionEpoch,
+          attempted: true,
+        })
+      }
+      const reopen = firstWrites.find(({ nodeId }) => nodeId === target.nodeId)
+      expect(reopen).toMatchObject({ epoch: 0, socket: reset.nextSocket })
+      const replays = steps.filter(({ step }) => step === 'held-redelivery')
+      expect(replays.map(({ identity }) => identity).sort()).toEqual([...held].sort())
+      for (const replay of replays) {
+        expect(replay.deliveryCount).toBe(2)
+        expect(handler).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              identity: replay.identity,
+              acquisition: replay.acquisition,
+              dispatch: replay.dispatch,
+              deliveryCount: replay.deliveryCount,
+            }),
+          ])
+        )
+      }
+      expect(
+        rows.filter(({ event, cycle: id }) => event === 'soak-cycle-step' && id === cycle.cycle)
+      ).toEqual(
+        steps.map(({ at, ...step }) => expect.objectContaining({ ...step, monotonicAt: at }))
+      )
+    }
+  }
+
+  test.each([true, false])(
+    'recovers ten reset cycles with original close-only fake sockets, short=%s',
+    async (short) => {
+      const { rows, result, error } = await schedule({ short, closeOnly: true })
+      expect(error).toBeUndefined()
+      expect(result).toMatchObject({
+        ok: true,
+        violations: [],
+        counts: { cycles: 30, resets: 10, memberAdds: 30, memberRemoves: 30 },
+      })
+      const cycles = rows.filter(({ event }) => event === 'soak-cycle')
+      expect(cycles).toHaveLength(30)
+      expect(cycles.filter(({ reset }) => reset)).toHaveLength(10)
+      resetDiagnostics(cycles, rows, true)
+    },
+    120000
+  )
+
+  test('archives active reset provenance before delayed disconnect joins and keeps the later cleanup separate', async () => {
+    let release
+    let archived
+    const { rows, result, error } = await schedule({
+      io: async (event, { driver }) => {
+        if (
+          event === 'workload-disconnect' &&
+          driver.lastCycle?.timing.cycle === 10 &&
+          driver.lastCycle.members.bRemoved
+        )
+          await new Promise((resolve) => {
+            release = resolve
+          })
+      },
+      observeRow: (row) => {
+        if (row.event !== 'soak-cycle' || row.status !== 'failed' || row.cycle !== 10) return
+        archived = JSON.parse(JSON.stringify(row))
+        release()
+      },
+    })
+    expect(result?.ok).not.toBe(true)
+    expect(error).toBeDefined()
+    const failed = rows.find(
+      ({ event, status, cycle }) => event === 'soak-cycle' && status === 'failed' && cycle === 10
+    )
+    expect(failed.provenance.exchanges.length).toBeGreaterThan(0)
+    expect(failed.handler.length).toBeGreaterThan(0)
+    expect(failed.memberObservations.find(({ member }) => member === 'A')).toMatchObject({
+      disconnected: false,
+      finalized: false,
+    })
+    expect(failed.snapshot.workloadJoined).toBe(false)
+    expect(failed.cleanup.clientsDisconnected).toBe(false)
+    const cleanup = rows.find(({ event, cycle }) => event === 'soak-cycle-cleanup' && cycle === 10)
+    expect(cleanup.observation.snapshot).toMatchObject({
+      workloadJoined: true,
+      at: expect.any(Number),
+    })
+    expect(cleanup.observation.snapshot.at).toBeGreaterThanOrEqual(failed.snapshot.at)
+    expect(cleanup.observation.memberObservations.every(({ disconnected }) => disconnected)).toBe(
+      true
+    )
+    expect(rows.indexOf(cleanup)).toBeGreaterThan(rows.indexOf(failed))
+    expect(failed).toEqual(archived)
+    expect(rows.some(({ event }) => event === 'case-complete')).toBe(false)
+  }, 120000)
 
   test.each([
     [true, 0],
@@ -5703,6 +5913,7 @@ describe('Share soak complete original-owner schedules', () => {
           )
       ).toBe(true)
       expect(rows.filter(({ event }) => event === 'soak-reset')).toHaveLength(10)
+      resetDiagnostics(cycles, rows, false)
       for (const verifier of [...cycles.map(({ verifier }) => verifier), owner.final.verifier])
         expect(
           verifier.events

@@ -99,6 +99,57 @@ enabled('share consumer short soak', () => {
             'cycle-end',
           ])
         )
+        expect(cycle.snapshot.workloadJoined).toBe(true)
+        expect(cycle.memberObservations).toHaveLength(2)
+        expect(
+          cycle.memberObservations.every(({ disconnected, finalized }) => disconnected && finalized)
+        ).toBe(true)
+        if (cycle.reset) {
+          const { resetTarget: target, reset, provenance } = cycle
+          expect(target).toMatchObject({
+            socket: reset.oldSocket,
+            nodeId: reset.nodeId,
+            epoch: reset.oldEpoch,
+            acquisition: expect.any(Number),
+            dispatch: expect.any(Number),
+            held: cycle.held,
+          })
+          expect(provenance.acquisitions.some(({ id }) => id === target.acquisition)).toBe(true)
+          expect(cycle.steps.map(({ step }) => step)).toEqual(
+            expect.arrayContaining([
+              'reset-target',
+              'socket-close',
+              'reconnect-start',
+              'reconnect-end',
+              'post-reset-api78',
+              'SESSION_RESET',
+              'held-redelivery',
+            ])
+          )
+          const closed = cycle.steps.find(({ step }) => step === 'socket-close')
+          expect(closed).toMatchObject({ socket: target.socket, endpoint: target.endpoint })
+          const writes = cycle.steps.filter(({ step }) => step === 'post-reset-api78')
+          expect(new Set(writes.map(({ nodeId }) => nodeId)).size).toBe(3)
+          expect(writes).toHaveLength(3)
+          for (const written of writes) {
+            const exchange = provenance.exchanges.find(({ id }) => id === written.exchange)
+            const frame = exchange.frames.find(({ id }) => id === written.frame)
+            expect(written).toMatchObject({
+              at: frame.at,
+              epoch: frame.request.shareSessionEpoch,
+              socket: frame.socket,
+              endpoint: frame.endpoint,
+              attempted: true,
+            })
+          }
+          expect(writes.find(({ nodeId }) => nodeId === target.nodeId)).toMatchObject({
+            epoch: 0,
+            socket: reset.nextSocket,
+          })
+          const redeliveries = cycle.steps.filter(({ step }) => step === 'held-redelivery')
+          expect(new Set(redeliveries.map(({ identity }) => identity))).toEqual(new Set(cycle.held))
+          expect(redeliveries.every(({ deliveryCount }) => deliveryCount >= 1)).toBe(true)
+        }
         expect(
           cycle.steps.every(
             ({ at, elapsedMs, due, remainingMs }) =>
