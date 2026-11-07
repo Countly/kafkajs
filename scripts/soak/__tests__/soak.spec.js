@@ -4143,6 +4143,7 @@ describe('Share soak cycle finalization and isolation adapter', () => {
     const facts = cycleFacts(plan.cycle)
     const original = { sequence: 1, epoch: 4, socket: 1, endpoint: 'node:1' }
     let broken = false
+    let redeliver
     const tap = new ShareFetchTap()
     tap.mark = () => 0
     tap.since = (mark) =>
@@ -4198,6 +4199,11 @@ describe('Share soak cycle finalization and isolation adapter', () => {
         pollUntil: async (_scope, _ms, predicate) => {
           for (let i = 0; i < 20; i++) {
             if (await predicate(NEVER)) return
+            if (redeliver) {
+              const recover = redeliver
+              redeliver = null
+              await recover()
+            }
             await Promise.resolve()
           }
           throw new Error('Scripted barrier never converged')
@@ -4234,15 +4240,17 @@ describe('Share soak cycle finalization and isolation adapter', () => {
       }))
       a.batch = batches[0]
       const tasks = batches.map((batch) => a.handlers.eachBatch(batch))
-      a.pending = Promise.all(tasks).then(async () => {
-        if (reset)
+      a.pending = Promise.all(tasks)
+      if (reset)
+        redeliver = async () => {
+          await a.pending
           await a.handlers.eachBatch({
             batch: {
               ...a.batch.batch,
               messages: a.batch.batch.messages.map((message) => ({ ...message, deliveryCount: 2 })),
             },
           })
-      })
+        }
       return facts.produced
     }
     driver.rawLog = async () =>
@@ -4312,6 +4320,19 @@ describe('Share soak cycle finalization and isolation adapter', () => {
       ).toBe(true)
     }
   )
+
+  test('waits for held identities to be redelivered before closing the workload member', async () => {
+    const { work } = await cycle({ reset: true })
+    const observed = await work
+    expect(observed.held).toHaveLength(20)
+    expect(observed.handler).toHaveLength(80)
+    for (const identity of observed.held)
+      expect(
+        observed.handler
+          .filter((entry) => entry.identity === identity)
+          .map((entry) => entry.deliveryCount)
+      ).toEqual([1, 2])
+  })
 
   test('refuses before invoking the verifier when the slot has only 4999 ms remaining', async () => {
     const { driver, work } = await cycle({ remaining: 4999 })
@@ -4851,6 +4872,16 @@ describe('Share soak complete original-owner schedules', () => {
           )
       ).toBe(true)
       expect(rows.filter(({ event }) => event === 'soak-reset')).toHaveLength(10)
+      for (const { held, handler, reset } of cycles) {
+        if (!reset) continue
+        expect(held).toHaveLength(20)
+        for (const identity of held)
+          expect(
+            handler
+              .filter((entry) => entry.identity === identity)
+              .map((entry) => entry.deliveryCount)
+          ).toEqual([1, 2])
+      }
       expect(
         cycles.every(({ verifier }) => {
           const start = verifier.events.find(({ kind }) => kind === 'window-start')
