@@ -39,6 +39,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Enabling broker telemetry can open one additional broker connection per client and send GetTelemetrySubscriptions/PushTelemetry traffic. Unsupported brokers quietly leave foreground operations usable.
 - Telemetry includes only applicable rack/group/static-member/current-member/transaction identity attributes, library scope/version and per-node metric labels.
 - Each client exposes an asynchronous stable `clientInstanceId({ timeout })`; disabled/unsupported/closed/unavailable calls reject with `KafkaJSTelemetryError`.
+- A `clientInstanceId()` caller whose own timeout has passed gives up its waiting slot when the next caller is admitted, without waiting for a timer; a new caller is refused with `limit` only while 64 unexpired callers wait.
+- A subscription response with more than 128 compression codecs, 256 requested-metric prefixes, 256 bytes in one prefix or 16384 prefix bytes is refused while it is decoded, before any array or string is built; telemetry stops for that client and foreground work continues.
 - Applications may register/unregister finite numeric Gauge and monotonic BigInt Sum snapshots for broker subscriptions.
 - Disconnect sends a best-effort terminating telemetry push on an active connected subscription, for at most 1000 ms within the existing close budget; timeout0 sends no final.
 - Preserve shared foreground SASL renewal when an individual caller expires; contain private telemetry commit and logging failures, retry transient socket failures, and retire expired telemetry work.

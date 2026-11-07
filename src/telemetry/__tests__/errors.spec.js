@@ -5,6 +5,7 @@ const {
   KafkaJSError,
   KafkaJSNumberOfRetriesExceeded,
 } = require('../../errors')
+const response = require('../../protocol/requests/getTelemetrySubscriptions/v0/response')
 const ID = '01020304-0506-0708-090a-0b0c0d0e0f10'
 const subscription = (fields = {}) => ({
   clientInstanceId: ID,
@@ -440,6 +441,88 @@ describe('corrective request authority', () => {
     await jest.advanceTimersByTimeAsync(0)
     expect(h.transport.open).not.toHaveBeenCalled()
     expect(h.client.stopped).toBe(true)
+  })
+})
+
+/**
+ * Encodes an unsigned varint independently of the decoder under test.
+ * @param {number} value non-negative integer below 2^32
+ * @returns {Buffer} the 1-5 byte encoding
+ */
+const uvarint = (value) => {
+  const bytes = []
+  for (; value >= 0x80; value = Math.floor(value / 0x80)) bytes.push((value % 0x80) | 0x80)
+  return Buffer.from([...bytes, value])
+}
+
+/**
+ * Encodes a successful GetTelemetrySubscriptions body for the accepted instance ID.
+ * @param {{codecs?:number, prefixes?:string[]}} fields codec count and requested-metric prefixes
+ * @returns {Buffer} body after response header v1
+ */
+const wire = ({ codecs = 1, prefixes = ['*'] } = {}) =>
+  Buffer.concat([
+    Buffer.from([0, 0, 0, 0, 0, 0]),
+    Buffer.from(ID.replaceAll('-', ''), 'hex'),
+    Buffer.from([0, 0, 0, 7]),
+    uvarint(codecs + 1),
+    Buffer.alloc(codecs),
+    Buffer.from([0, 0, 0x03, 0xe8, 0, 0x10, 0, 0, 1]),
+    uvarint(prefixes.length + 1),
+    ...prefixes.map((text) =>
+      Buffer.concat([uvarint(Buffer.byteLength(text) + 1), Buffer.from(text)])
+    ),
+    Buffer.from([0]),
+  ])
+
+/** @param {Buffer} body raw response @returns {Function} a Get answer decoded and parsed by the real protocol response */
+const decoded = (body) => () => response.decode(body).then(response.parse)
+
+describe('over-limit subscription metadata from the wire', () => {
+  const exact = {
+    codecs: 128,
+    prefixes: Array.from({ length: 256 }, (_, i) => String(i).padEnd(64, 'x')),
+  }
+  it('installs both selections at their exact limits', async () => {
+    const h = setup()
+    h.gets.push(decoded(wire(exact)))
+    h.client.resume()
+    await jest.advanceTimersByTimeAsync(0)
+    expect(h.client.state).toBe('READY')
+    expect(h.client.subscription.acceptedCompressionTypes).toHaveLength(128)
+    expect(h.client.subscription.requestedMetrics).toEqual(exact.prefixes)
+    h.client.suspend()
+  })
+  it.each([
+    ['129 codecs', { codecs: 129 }],
+    ['257 prefixes', { prefixes: Array(257).fill('a') }],
+    ['a 257-byte prefix', { prefixes: ['a'.repeat(257)] }],
+    ['16385 prefix bytes', { prefixes: [...Array(255).fill('a'.repeat(64)), 'a'.repeat(65)] }],
+  ])('stops once on %s without retry and keeps the accepted selection', async (_, fields) => {
+    const logger = { warn: jest.fn() }
+    const h = setup({ logger })
+    const install = jest.spyOn(h.client, 'install')
+    const select = jest.spyOn(h.metrics, 'select')
+    h.gets.push(subscription(), decoded(wire(fields)))
+    h.pushes.push(() => Promise.reject(failure(117)))
+    h.client.resume()
+    await jest.advanceTimersByTimeAsync(0)
+    const accepted = h.client.subscription
+    expect(accepted.requestedMetrics).toEqual(['*'])
+    await jest.advanceTimersByTimeAsync(1001)
+    expect(h.events.filter((e) => e.api === 71)).toHaveLength(2)
+    expect(h.client.state).toBe('STOPPED')
+    expect(h.client.stopped).toBe(true)
+    expect(install).toHaveBeenCalledTimes(1)
+    expect(select).toHaveBeenCalledTimes(1)
+    expect(h.client.uuid).toBe(ID)
+    expect(h.client.subscription).toBe(accepted)
+    expect(logger.warn).toHaveBeenCalledWith('Telemetry stopped')
+    expect(jest.getTimerCount()).toBe(0)
+    await jest.advanceTimersByTimeAsync(600000)
+    expect(h.events.filter((e) => e.api === 71)).toHaveLength(2)
+    expect(h.events.filter((e) => e.api === 72)).toHaveLength(1)
+    expect(h.handles).toHaveLength(1)
   })
 })
 

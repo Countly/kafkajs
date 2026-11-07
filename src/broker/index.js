@@ -1,4 +1,3 @@
-const Decoder = require('../protocol/decoder')
 const { currentDeadline, checked, withAdminGuard, sharedSetup } = require('../admin/deadline')
 const Lock = require('../utils/lock')
 const describeThrown = require('../network/describeThrown')
@@ -2800,41 +2799,6 @@ module.exports = class Broker {
   }
 
   /**
-   * Checks compact counts and byte lengths before any array or string is allocated by the codec.
-   * @param {Buffer} raw bounded Get response body
-   * @returns {void} unknown tags remain the codec's responsibility
-   * @throws {KafkaJSNonRetriableError} invalid metadata; telemetry stops in isolation
-   */
-  validateTelemetryMetadata(raw) {
-    const invalid = () => {
-      throw new KafkaJSNonRetriableError('Invalid telemetry metadata')
-    }
-    if (raw.length > 65536) invalid()
-    const decoder = new Decoder(raw)
-    decoder.ensureReadable(26, 'telemetry metadata')
-    decoder.offset = 26
-    const codecs = decoder.readUVarInt()
-    if (codecs < 1 || codecs > 129) invalid()
-    decoder.ensureReadable(codecs - 1, 'telemetry codecs')
-    decoder.offset += codecs - 1
-    decoder.readInt32()
-    decoder.readInt32()
-    if (![0, 1].includes(decoder.readInt8())) invalid()
-    const prefixes = decoder.readUVarInt()
-    if (prefixes < 1 || prefixes > 257) invalid()
-    decoder.ensureReadable(prefixes - 1, 'telemetry prefixes')
-    let total = 0
-    for (let index = 1; index < prefixes; index++) {
-      const length = decoder.readUVarInt()
-      if (length < 1 || length > 257) invalid()
-      total += length - 1
-      if (total > 16384) invalid()
-      decoder.ensureReadable(length - 1, 'telemetry prefix bytes')
-      decoder.offset += length - 1
-    }
-  }
-
-  /**
    * Captures pool and physical attempt before any await and refuses rather than reconnecting.
    * @param {number} apiKey telemetry key
    * @param {object} definition versioned protocol definition
@@ -2860,16 +2824,6 @@ module.exports = class Broker {
     connection.failIfNotConnected(attempt)
     const build = this.lookupRequest(apiKey, definition)
     const protocol = build(payload)
-    if (apiKey === 71) {
-      const response = protocol.response
-      protocol.response = {
-        ...response,
-        decode: async (raw) => {
-          this.validateTelemetryMetadata(raw)
-          return response.decode(raw)
-        },
-      }
-    }
     return connection.send({
       ...protocol,
       guard: captured,
