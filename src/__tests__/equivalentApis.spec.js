@@ -1964,6 +1964,71 @@ it('maps synthetic DeleteGroups v3 outcomes through Admin and Broker for a share
   }
 })
 
+it('R1§C:deleteShareGroups', async () => {
+  const GROUP = 'equivalent-share-empty'
+  /** Kafka 4.4.0 DeleteGroups v3 messages for empty and member-present share groups. */
+  const EMPTY_MESSAGE = null
+  const ACTIVE_MESSAGE = null
+  /**
+   * @param {number} code Group-level error code.
+   * @param {string|null} message Broker message.
+   * @returns {Buffer} A DeleteGroups v3 answer for the one group.
+   * @throws Never.
+   */
+  const answerFor = (code, message) =>
+    Buffer.from(
+      `00000000${'02'}${compactHex(GROUP)}${code.toString(16).padStart(4, '0')}${
+        message === null ? '00' : compactHex(message)
+      }0000`,
+      'hex'
+    )
+  for (const [code, message] of [
+    [0, EMPTY_MESSAGE],
+    [68, ACTIVE_MESSAGE],
+  ]) {
+    const harness = createGroupApiBroker({
+      versions: { [apiKeys.DeleteGroups]: { minVersion: 0, maxVersion: 3 } },
+      respond: () => answerFor(code, message),
+    })
+    use({ disconnect: () => harness.pool.destroy() }, {})
+    const lookups = []
+    const admin = adminFactory({
+      logger: logger(),
+      retry,
+      cluster: {
+        refreshMetadata: async () => {},
+        findGroupCoordinator: async (options) => {
+          lookups.push(options)
+          return harness.broker
+        },
+        targetTopics: new Set(),
+      },
+    })
+    expect(admin.deleteShareGroups).toBeUndefined()
+    if (code === 0) {
+      await expect(admin.deleteGroups([GROUP])).resolves.toEqual([
+        { groupId: GROUP, errorCode: 0, errorMessage: EMPTY_MESSAGE },
+      ])
+    } else {
+      const failure = await admin.deleteGroups([GROUP]).catch((error) => error)
+      expect(failure).toBeInstanceOf(KafkaJSDeleteGroupsError)
+      expect(failure.groups).toEqual([
+        {
+          groupId: GROUP,
+          errorCode: 68,
+          error: expect.objectContaining({ code: 68, type: 'NON_EMPTY_GROUP' }),
+          errorMessage: ACTIVE_MESSAGE,
+        },
+      ])
+    }
+    expect(lookups).toEqual([{ groupId: GROUP }])
+    expect(harness.requests.map(({ apiKey, apiVersion }) => [apiKey, apiVersion])).toEqual([
+      [apiKeys.DeleteGroups, 3],
+    ])
+    expect(harness.requests[0].body.toString('hex')).toBe(`02${compactHex(GROUP)}00`)
+  }
+})
+
 it('R1§E:commitSync', async () => {
   const { h, acks } = await startShare()
   const { consumer } = h

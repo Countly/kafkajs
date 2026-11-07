@@ -1058,8 +1058,6 @@ Groups are batched by group coordinator. Each group result contains `groupId`, `
 
 Repeated ids share their work and produce fresh result snapshots in caller order, including repeated rows. `authorizedOperations` is a raw signed INT32 number that keeps unknown bits, or `null` when it was not requested or the broker sent the absent value. It is never converted to an array of operation names.
 
-`describeGroups` can still be called with a share group id; it returns what the broker answers for that id. Use `describeShareGroups` to see share membership.
-
 ## <a name="list-share-group-offsets"></a> List share group offsets
 
 ```javascript
@@ -1096,6 +1094,8 @@ const deleted = await admin.deleteShareGroupOffsets({
 ```
 
 The group must no longer subscribe to the named topics. Results are arrays of `{ topic, topicId, errorCode, error? }`; topic failures are data and group failures throw. No `deleteShareGroups` method exists: delete a share group with [`deleteGroups`](#delete-groups). On a broker that offers DeleteGroups v3, each result carries the broker's `errorMessage`.
+
+Use describeShareGroups for share-group membership. The existing describeGroups call retains its generic-group behavior. Captured public outcomes (group ids normalized) are: Kafka 4.3.1, empty: {"kind":"return","value":{"groups":[{"groupId":"share-group","protocolType":"","protocol":"","state":"Dead","errorCode":69,"errorMessage":"Group share-group is not a consumer group.","groupType":"classic","groupEpoch":null,"assignmentEpoch":null,"assignorName":null,"authorizedOperations":null,"members":[]}]}}; Kafka 4.3.1, member-present: {"kind":"return","value":{"groups":[{"groupId":"share-group","protocolType":"","protocol":"","state":"Dead","errorCode":69,"errorMessage":"Group share-group is not a consumer group.","groupType":"classic","groupEpoch":null,"assignmentEpoch":null,"assignorName":null,"authorizedOperations":null,"members":[]}]}}; Kafka 4.4.0, empty: {"kind":"return","value":{"groups":[{"groupId":"share-group","protocolType":"","protocol":"","state":"Dead","errorCode":69,"errorMessage":"Group share-group is not a consumer group.","groupType":"classic","groupEpoch":null,"assignmentEpoch":null,"assignorName":null,"authorizedOperations":null,"members":[]}]}}; Kafka 4.4.0, member-present: {"kind":"return","value":{"groups":[{"groupId":"share-group","protocolType":"","protocol":"","state":"Dead","errorCode":69,"errorMessage":"Group share-group is not a consumer group.","groupType":"classic","groupEpoch":null,"assignmentEpoch":null,"assignorName":null,"authorizedOperations":null,"members":[]}]}}. These are captured broker/client results; they do not describe share membership. The fixture src/admin/__tests__/fixtures/describeGroupsShareGroup.json and its replay pin this behavior.
 
 ## <a name="reset-share-group-offsets"></a> Reset an empty share group's offsets
 
