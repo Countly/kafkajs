@@ -245,7 +245,7 @@ class TelemetrySegments {
     this.#cap = cap
     this.#directory = directory
     this.#clock = clock
-    this.#observerOptions = { ...observer, directory, clock, completeStream: true }
+    this.#observerOptions = { completeStream: true, ...observer, directory, clock }
     this.socketFactory = (options) => this.#route(options)
     this.#active = this.#create()
   }
@@ -363,6 +363,21 @@ class TelemetrySegments {
     })
     reopened.catch(() => {})
     return { from, to, closed, reopened }
+  }
+
+  /**
+   * Selects the next lifecycle's segment once the selected one has been closed, without touching a
+   * client: the caller opens the next lifecycle itself.
+   * @returns {{from:object,to:object}} the closed and the newly selected segment
+   * @throws {Error} while the selected segment is not closed, at the cap, or at the two-segment limit
+   */
+  advance() {
+    const from = this.#active
+    if (from.state !== 'closed') throw new Error(`Segment ${from.id} is still ${from.state}`)
+    const to = this.#create()
+    this.#note('select', { from: from.id, to: to.id })
+    this.#active = to
+    return { from, to }
   }
 
   /**

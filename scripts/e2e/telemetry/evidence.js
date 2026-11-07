@@ -446,7 +446,7 @@ const verifyScenario = (record, directory) => {
     assert(identity.readyAt && identity.startedAt && identity.configSha256)
     if (
       manifest.scenario === 'telemetry-reporter' ||
-      (LIVE.includes(manifest.scenario) && identity.compose === CONFIGURED_COMPOSE)
+      ([...LIVE, CHURN].includes(manifest.scenario) && identity.compose === CONFIGURED_COMPOSE)
     ) {
       const pinned = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures/manifest.json')))
       for (const image of identity.images)
@@ -467,7 +467,7 @@ const verifyScenario = (record, directory) => {
       assert.equal(record.run.composeSha256, pinned.composeSha256['docker-compose.telemetry.yml'])
     }
   }
-  if (manifest.scenario === SHUTDOWN)
+  if ([SHUTDOWN, CHURN].includes(manifest.scenario))
     assert.equal(manifest.format, SEGMENT_FORMAT, 'Missing segmented evidence format')
   const noPlugin = ['telemetry-reporter-no-plugin', UNSUPPORTED, 'telemetry-floor'].includes(
     manifest.scenario
@@ -504,7 +504,7 @@ const verifyScenario = (record, directory) => {
     assert.deepEqual(transcript.cleanup, { children: 0, timers: 0, stillOpen: [], attached: 0 })
   }
   if (manifest.scenario === CHURN) {
-    verifyChurn(record)
+    verifyChurn(record, directory, manifest, read)
     return
   }
   if (manifest.scenario === 'telemetry-reporter') {
@@ -2417,43 +2417,655 @@ const verifyControl = (results, transcript, samples) => {
   }
 }
 
+/** Pushes written this soon after a registry replacement may still carry one frozen old sample. */
+const CHURN_FENCE_MS = 1500
+const CHURN_NAMES = Object.freeze({
+  lifecycle: 'reopen',
+  retire: 'retire',
+  confirm: 'subscription',
+})
+
 /**
- * Re-derives the churn verdict from its rows: one resource input per client kind, judged again by
- * the checked evaluator, one natural close per kind, one oracle and one final verdict inside the
- * fixed budgets. A boolean in a row is never enough.
- * @param {object} record the stamped churn record whose `results.rows` holds the soak's rows
- * @returns {void}
- * @throws {Error} for a missing, duplicate, substituted, failed or aggregate-only row
+ * Re-derives the structure of the churn archive from the sealed segment files alone: the fixed
+ * segment catalogue, every segment's owner, client, sockets and cleanup, the declared proof
+ * selection, and the byte, response, node, subscription and sink join of every accepted Push, with
+ * the selected ones decoded in full and tied to the parent's own decoder receipts.
+ * @param {object} record stamped evidence @param {string} directory absolute run directory
+ * @param {object} manifest the sidecar manifest @param {object} archive the parent's replay inputs
+ * @returns {{transcripts:Object<string,object>, bundles:Object<string,object>,
+ *   hashes:Set<string>}} the parsed transcript and checked bundle of every segment, by segment ID,
+ *   and the raw hash of every decoded proof
+ * @throws {Error} for a missing, extra, swapped, altered or unjoined segment, proof or Push
  */
-const verifyChurn = (record) => {
+const verifyChurnSegments = (record, directory, manifest, archive) => {
+  const { TelemetryProofs } = require('../../soak/telemetryChurn')
+  const schedule = SCHEDULES[CHURN]
+  const stem = archive.stem
+  const listed = new Set(manifest.files.map((f) => f.path))
+  const bytesOf = (relative) => {
+    assert(listed.has(relative), 'Unlisted sidecar')
+    return fs.readFileSync(path.join(directory, relative))
+  }
+  assert.deepEqual(
+    JSON.parse(bytesOf(`${manifest.root}/index.json`)),
+    { format: SEGMENT_FORMAT, scenario: CHURN, segments: manifest.segments },
+    'Segment index differs from the manifest'
+  )
+  const identities = segmentIdentities(CHURN)
+  assert.deepEqual(
+    manifest.segments.map((s) => s.id).sort(),
+    segmentCatalogue(CHURN),
+    'Required segment catalogue differs'
+  )
+  for (const kind of schedule.kinds)
+    assert.equal(
+      manifest.segments.filter((s) => s.kind === kind && s.role === 'ordinary').length,
+      schedule.perKind,
+      `Segment count of ${kind} differs`
+    )
+  const sink = new Map(
+    new TelemetryExportReader(path.join(directory, manifest.root))
+      .readExports()
+      .map((row) => [`${row.node}:${row.seq}`, row])
+  )
+  const consumed = new Set()
+  const transcripts = {}
+  const bundles = {}
+  const hashes = new Set()
+  const used = new Set()
+  const calls = new Map()
+  for (const call of archive.decoder.calls) calls.set(call.rawSha256, call.kind)
+  for (const entry of manifest.segments) {
+    const meta = identities.get(entry.id)
+    assert.deepEqual(
+      { kind: entry.kind, role: entry.role },
+      { kind: meta.kind, role: meta.role },
+      'Segment identity differs'
+    )
+    const files = {
+      transcript: `${manifest.root}/segments/${entry.id}.transcript.json`,
+      bundle: `${manifest.root}/segments/${entry.id}.bundle.jsonl`,
+    }
+    assert.deepEqual(
+      { transcript: entry.transcript, bundle: entry.bundle },
+      files,
+      'Segment path does not belong to its identity'
+    )
+    for (const file of Object.values(files)) {
+      assert(!used.has(file), 'Reused segment path')
+      used.add(file)
+    }
+    const transcriptBytes = bytesOf(files.transcript)
+    const parsed = JSON.parse(transcriptBytes)
+    const terminal = meta.index === schedule.perKind - 1
+    const keys = TelemetryProofs.selection(parsed.records, { terminal })
+    const checked = checkSegmentFiles({
+      id: entry.id,
+      transcript: transcriptBytes,
+      bundle: bytesOf(files.bundle).toString('utf8'),
+      proofs: keys,
+    })
+    const transcript = checked.transcript
+    const requests = transcript.records.filter((r) => r.type === 'request')
+    assert(
+      requests.length > 0 && requests.every((r) => r.clientId === `${stem}-${meta.kind}`),
+      'Segment client identity differs'
+    )
+    assert.deepEqual(transcript.failures, [])
+    assert.deepEqual(transcript.cleanup, { children: 0, timers: 0, stillOpen: [], attached: 0 })
+    assert(transcript.sockets.length > 0, 'A segment without sockets')
+    assert(
+      transcript.sockets.every((s) => Number.isFinite(s.closedAt)),
+      'A segment socket never closed'
+    )
+    assert(transcript.closures.length === 1, 'A lifecycle must have exactly one public close')
+    transcripts[entry.id] = transcript
+    bundles[entry.id] = checked
+    for (const request of transcript.records.filter(
+      (r) =>
+        r.type === 'request' && r.apiKey === 72 && r.response?.errorCode === 0 && r.metricsBytes > 0
+    )) {
+      const blob = checked.pushes.get(request.requestKey).blob
+      const cap = 4096
+      const options = { maxOutputLength: cap }
+      let raw
+      if (request.compressionType === 0) raw = blob
+      else if (request.compressionType === 1) raw = zlib.gunzipSync(blob, options)
+      // eslint-disable-next-line n/no-unsupported-features/node-builtins -- required live Node lines provide the built-in codec
+      else if (request.compressionType === 4) raw = zlib.zstdDecompressSync(blob, options)
+      else throw new Error('Unsupported captured compression')
+      assert(raw.length > 0 && raw.length <= cap, 'A Push body is outside its bound')
+      const rawSha = sha(raw)
+      const row = [...sink]
+        .filter(
+          ([token, r]) =>
+            !consumed.has(token) &&
+            r.node === request.node &&
+            r.clientInstanceId === request.uuid &&
+            r.clientId === request.clientId &&
+            r.dataSha256 === rawSha &&
+            r.dataBytes === raw.length &&
+            r.terminating === request.terminating &&
+            r.parse === 'ok'
+        )
+        .at(0)
+      assert(row, `No unconsumed sink record joins ${entry.id}/${request.requestKey}`)
+      consumed.add(row[0])
+      const subscription = lastSubscription(transcript, request)
+      assert(subscription, 'Push without a successful subscription')
+      assert.equal(subscription.response.uuid, request.uuid)
+      assert.equal(subscription.response.subscriptionId, request.subscriptionId)
+      if (!keys.includes(request.requestKey)) continue
+      const proof = checked.proofs.get(request.requestKey)
+      const { decoded } = proof
+      hashes.add(decoded.rawSha256)
+      assert.equal(calls.get(decoded.rawSha256), meta.kind, 'The parent never decoded this proof')
+      assertPushProof({
+        request,
+        subscription,
+        decoded,
+        line: record.run.line,
+        transmitted: () => blob,
+        stored: () => proof.raw,
+        receipts: () =>
+          archive.decoder.receipts
+            .filter(
+              (r) =>
+                r.rawSha256 === decoded.rawSha256 &&
+                r.line === record.run.line &&
+                r.bodySha256 === sha(JSON.stringify(decoded.decoded))
+            )
+            .map((r) => ({
+              code: r.code,
+              signal: r.signal,
+              line: r.line,
+              stdout: `${JSON.stringify(r.identity)}\n${JSON.stringify(decoded.decoded)}`,
+            })),
+      })
+      assert.deepEqual(
+        decoded.exportIdentity,
+        { node: row[1].node, seq: row[1].seq },
+        'The decoded Push joined another sink record'
+      )
+    }
+  }
+  return { transcripts, bundles, hashes }
+}
+
+/**
+ * @param {object} transcript one segment's transcript @param {string} key a request key
+ * @returns {object} that record @throws {Error} when the segment holds no such record
+ */
+const churnRecord = (transcript, key) => {
+  const found = transcript.records.find((r) => r.requestKey === key)
+  assert(found, `Missing record ${key}`)
+  return found
+}
+
+/**
+ * The strict proof of one Push on the socket of a replacement Get.
+ * @param {object} transcript the segment @param {object} get the replacement Get
+ * @param {string} pushKey the advertised proving Push @returns {object} the proving Push
+ * @throws {Error} unless the advertised Push is the first accepted nonempty nonterminating one,
+ *   on the same socket, later in order and strictly after the Get's response
+ */
+const churnProof = (transcript, get, pushKey) => {
+  const { TelemetryProofs } = require('../../soak/telemetryChurn')
+  const found = TelemetryProofs.provingPush(transcript.records, get)
+  assert(found, `No proving Push after the Get ${get.requestKey}`)
+  assert.equal(found.requestKey, pushKey, 'The advertised proving Push is not the first one')
+  assert(found.index > get.index && found.writeAt > get.response.responseAt)
+  assert.equal(found.socketId, get.socketId, 'The proving Push is on another socket')
+  return found
+}
+
+/**
+ * Re-derives one public reopen from its two segments and the ordering journal: the next segment was
+ * selected before the close resolved, connect was the next public action, there was no Get, connect
+ * or authentication during the final, the cached UUID and a successful replacement Get that carried
+ * it, and admission paused, drained and confirmed before the close.
+ * @param {object} input `claim`, `from` and `to` transcripts, the worker `journal` and its `uuid`
+ * @returns {void} @throws {Error} naming the first contradicted proof
+ */
+const verifyChurnReopen = ({ claim, from, to, journal, uuid }) => {
+  const { TelemetryProofs } = require('../../soak/telemetryChurn')
+  const note = (type) => {
+    const found = journal.filter(
+      (n) => n.type === type && n.from === claim.from && n.to === claim.to
+    )
+    assert.equal(found.length, 1, `Missing or duplicate ${type} note for ${claim.to}`)
+    return found[0]
+  }
+  const [select, resolved, called] = ['select', 'disconnect-resolved', 'connect-called'].map(note)
+  assert(select.seq < resolved.seq, 'The next segment was not selected before the close resolved')
+  assert.equal(called.seq, resolved.seq + 1, 'Connect was not the next public action')
+  assert.equal(from.closures.length, 1, 'A lifecycle must have exactly one public close')
+  const [closure] = from.closures
+  assert(
+    claim.observedAt <= select.at &&
+      select.at <= closure.at &&
+      closure.end <= resolved.at &&
+      resolved.at <= called.at,
+    'Boundary times are out of order'
+  )
+  assert.deepEqual(
+    from.records.filter(
+      (r) =>
+        (r.type === 'connect' && r.at >= closure.at) ||
+        (r.type === 'request' && [17, 18, 36, 71].includes(r.apiKey) && r.writeAt >= closure.at)
+    ),
+    [],
+    'Get, connect or authentication during the final'
+  )
+  assert.equal(claim.cachedUuid, uuid, 'The cached timeout-zero UUID differs')
+  const get = churnRecord(to, claim.get)
+  assert(
+    TelemetryProofs.gets(to.records, uuid).some((g) => g.requestKey === get.requestKey),
+    'The replacement Get is not a successful Get carrying the cached UUID'
+  )
+  assert(get.writeAt >= called.at, 'The replacement Get precedes the reconnect')
+  const connect = to.records.find((r) => r.type === 'connect' && r.socketId === get.socketId)
+  assert(connect && connect.at >= called.at, 'The replacement socket precedes the reconnect')
+  assert(
+    claim.pause.pausedAt <= claim.pause.idleAt &&
+      claim.pause.idleAt <= claim.pause.confirmedAt &&
+      claim.pause.confirmedAt <= claim.observedAt,
+    'Admission was not paused, drained and confirmed before the close'
+  )
+}
+
+/**
+ * Re-derives one telemetry retirement: the declared fault on a telemetry socket, exactly one cut-off
+ * exchange joined to it, ordinary core work on a normal socket from the declaration on, and a
+ * successful recovery Get on a new socket.
+ * @param {object} input `claim`, the segment `transcript` and the worker `uuid`
+ * @returns {void} @throws {Error} naming the first contradicted proof
+ */
+const verifyChurnRetirement = ({ claim, transcript, uuid }) => {
+  const { TelemetryProofs } = require('../../soak/telemetryChurn')
+  assert(
+    transcript.faults.some((f) => f.socketId === claim.faulted),
+    'Undeclared faulted socket'
+  )
+  const socket = transcript.sockets.find((s) => s.id === claim.faulted)
+  assert(
+    socket?.kind === 'telemetry' && Number.isFinite(socket.closedAt),
+    'Faulted a non-telemetry socket'
+  )
+  const cut = transcript.cancellations.filter((c) => c.socketId === claim.faulted)
+  assert.equal(cut.length, 1, 'Exactly one exchange must be cut off')
+  assert.equal(cut[0].disposition, 'faulted-transport')
+  const core = churnRecord(transcript, claim.core)
+  assert(![71, 72].includes(core.apiKey) && core.response, 'No ordinary core work beside the fault')
+  assert(core.writeAt >= claim.declaredAt, 'The core work precedes the fault declaration')
+  assert.equal(
+    transcript.sockets.find((s) => s.id === core.socketId)?.kind,
+    'normal',
+    'The core work ran on a telemetry socket'
+  )
+  const get = churnRecord(transcript, claim.get)
+  assert(
+    TelemetryProofs.gets(transcript.records, uuid).some((g) => g.requestKey === get.requestKey) &&
+      get.socketId !== claim.faulted &&
+      get.writeAt >= claim.declaredAt,
+    'The recovery Get is not a successful Get on a new socket'
+  )
+}
+
+/**
+ * Re-derives one subscription transition: the parent's set and readback, the successful Get that
+ * proves exactly that selection (written after the worker took the confirmation), a subscription
+ * that differs from the last one, and the current Push proof every lifecycle change at the tick owes.
+ * @param {object} input `claim`, `tick`, the parent's `rotation`, the segment `transcript`, the
+ *   worker `uuid`, the `selection` the table requires and the `previous` subscription ID
+ * @returns {void} @throws {Error} naming the first contradicted proof
+ */
+const verifyChurnTransition = ({
+  claim,
+  tick,
+  rotation,
+  transcript,
+  uuid,
+  selection,
+  previous,
+}) => {
+  const { TelemetryProofs } = require('../../soak/telemetryChurn')
+  assert(rotation, 'No parent set and readback for the transition')
+  assert.equal(rotation.selection, selection)
+  assert.equal(rotation.readback, rotation.selection, 'The readback differs from the set')
+  assert(rotation.setAt <= rotation.readbackAt)
+  assert.equal(claim.selection, rotation.selection)
+  const get = churnRecord(transcript, claim.get)
+  const list = claim.selection === '' ? [] : [claim.selection]
+  assert(
+    TelemetryProofs.gets(transcript.records, uuid).some((g) => g.requestKey === get.requestKey) &&
+      get.writeAt >= claim.receivedAt &&
+      get.response.pushIntervalMs === 1000 &&
+      JSON.stringify(get.response.requestedMetrics) === JSON.stringify(list),
+    'No successful Get proves the selection'
+  )
+  assert.equal(get.response.subscriptionId, claim.subscriptionId)
+  assert.notEqual(claim.subscriptionId, previous, 'The subscription did not change')
+  const owed = tick.actions.filter((a) => a !== 'subscription').sort()
+  if (!owed.length) return assert.equal(claim.proof, null)
+  assert(claim.proof, 'A lifecycle change without its current Push proof')
+  assert.deepEqual([...claim.proof.owedBy].sort(), owed)
+  assert(list.length > 0, 'A proof cannot be owed under an empty selection')
+  const first = TelemetryProofs.gets(transcript.records, uuid).find(
+    (g) => g.socketId === claim.proof.socketId
+  )
+  assert.equal(
+    first?.requestKey,
+    claim.proof.get,
+    'The proof Get is not the socket replacement Get'
+  )
+  churnProof(transcript, first, claim.proof.push)
+}
+
+/**
+ * Re-derives every lifecycle claim of one worker from its segments' wire records: the setup and
+ * initial lifecycles, each public reopen, each telemetry retirement, each subscription transition,
+ * every proving Push, the measured stage counts, the empty-selection and corrective-budget rules.
+ * @param {object} context `kind`, `uuid`, `facts`, `transcripts`, `schedule` and `archive`
+ * @returns {void}
+ * @throws {Error} naming the first contradicted claim
+ */
+const verifyChurnWorker = ({ kind, uuid, facts, transcripts, schedule, archive }) => {
+  const { TelemetryProofs, TelemetrySchedule } = require('../../soak/telemetryChurn')
+  const table = new TelemetrySchedule({ warmupMs: 60000, measureMs: 300000 })
+  const names = Array.from({ length: schedule.perKind }, (_, i) => schedule.name(kind, i))
+  const segment = (id) => {
+    assert(transcripts[id], `Unknown segment ${id}`)
+    return transcripts[id]
+  }
+  assert.notEqual(uuid, '00000000-0000-0000-0000-000000000000')
+  for (const id of names)
+    for (const get of segment(id).records.filter(
+      (r) => r.type === 'request' && r.apiKey === 71 && r.response?.errorCode === 0
+    ))
+      assert.equal(get.response.uuid, uuid, 'A Get returned another instance ID')
+  const { claims, journal } = facts
+  assert.equal(claims.setup.segment, names[0])
+  const setup = churnRecord(segment(names[0]), claims.setup.get)
+  assert(setup.apiKey === 71 && setup.response?.errorCode === 0 && setup.response.uuid === uuid)
+  assert.equal(claims.initial.segment, names[1])
+  assert.equal(claims.initial.cachedUuid, uuid)
+  const initial = churnRecord(segment(names[1]), claims.initial.get)
+  assert(
+    TelemetryProofs.gets(segment(names[1]).records, uuid).some(
+      (r) => r.requestKey === initial.requestKey
+    )
+  )
+  churnProof(segment(names[1]), initial, claims.initial.push)
+  assert.equal(
+    journal.filter((n) => n.type === 'select').length,
+    schedule.perKind - 1,
+    `${kind} select journal differs`
+  )
+  const reopenTicks = table.ticks.filter((t) => t.actions.includes('reopen'))
+  assert.equal(claims.reopens.length, reopenTicks.length, `Missing ${kind} reopens`)
+  claims.reopens.forEach((claim, position) => {
+    assert.equal(claim.tick, reopenTicks[position].number)
+    assert.deepEqual(
+      [claim.from, claim.to],
+      [names[position + 1], names[position + 2]],
+      'Reopen segments differ from the schedule'
+    )
+    verifyChurnReopen({ claim, from: segment(claim.from), to: segment(claim.to), journal, uuid })
+  })
+  const retireTicks = table.ticks.filter((t) => t.actions.includes('retire'))
+  assert.equal(claims.retirements.length, retireTicks.length, `Missing ${kind} retirements`)
+  claims.retirements.forEach((claim, position) => {
+    assert.equal(claim.tick, retireTicks[position].number)
+    verifyChurnRetirement({ claim, transcript: segment(claim.segment), uuid })
+  })
+  assert.equal(claims.transitions.length, table.ticks.length, `Missing ${kind} transitions`)
+  let previous = null
+  claims.transitions.forEach((claim, position) => {
+    const tick = table.ticks[position]
+    assert.equal(claim.tick, tick.number)
+    verifyChurnTransition({
+      claim,
+      tick,
+      rotation: archive.rotations.find((r) => r.tick === tick.number),
+      transcript: segment(claim.segment),
+      uuid,
+      selection: table.selection(tick.index),
+      previous,
+    })
+    previous = claim.subscriptionId
+  })
+  const unique = new Set(claims.proofs.map((p) => `${p.segment}/${p.push}`))
+  assert.equal(unique.size, claims.proofs.length, 'A proving Push was claimed twice')
+  const stageOf = { reopen: 'lifecycle', retire: 'retire', subscription: 'confirm' }
+  const measured = { subscription: 0, retire: 0, reopen: 0 }
+  for (const stage of archive.stages.filter((s) => s.kind === kind)) {
+    const tick = table.ticks[stage.tick]
+    assert(
+      tick && tick.actions.map((a) => stageOf[a]).includes(stage.stage),
+      'A stage outside the fixed table'
+    )
+    assert(stage.workerStartedAt <= stage.workerDoneAt)
+    if (table.measured(tick)) measured[CHURN_NAMES[stage.stage]] += 1
+  }
+  assert.deepEqual(
+    measured,
+    table.required(),
+    `${kind} measured stage counts differ from the table`
+  )
+  for (const id of names) {
+    const records = segment(id).records
+    for (const push of TelemetryProofs.accepted(records))
+      assert(
+        TelemetryProofs.governing(records, push)?.response.requestedMetrics.length > 0,
+        'A Push was accepted under an empty selection'
+      )
+    const gets = records.filter(
+      (r) => r.type === 'request' && r.apiKey === 71 && r.response?.errorCode === 0
+    )
+    let changes = 0
+    let last = null
+    for (const get of gets) {
+      if (get.response.subscriptionId !== last) changes += 1
+      last = get.response.subscriptionId
+    }
+    const rejected = records.filter(
+      (r) => r.type === 'request' && r.apiKey === 72 && !r.terminating && r.response?.errorCode
+    )
+    assert(
+      rejected.length <= changes && rejected.every((r) => r.response.errorCode === 42),
+      'Corrective Push budget exceeded'
+    )
+  }
+}
+
+/**
+ * Recomputes the custom-identity fence of every decoded custom Push of one worker: after a registry
+ * replacement settles, the replaced slot carries only its current variant.
+ * @param {string} kind the worker kind @param {object} facts its archived facts
+ * @param {Object<string,object>} bundles checked bundle by segment ID @param {Object<string,object>} transcripts
+ * @returns {number} how many custom proofs were checked
+ * @throws {Error} when a decoded payload carries a retired identity
+ */
+const verifyChurnFence = (kind, facts, bundles, transcripts) => {
+  const { TelemetryProofs } = require('../../soak/telemetryChurn')
+  const slot = `com.example.soak.${kind}.000`
+  let checked = 0
+  for (const [id, bundle] of Object.entries(bundles)) {
+    if (!id.startsWith(`${kind}-`)) continue
+    const records = transcripts[id].records
+    for (const [key, proof] of bundle.proofs) {
+      const push = records.find((r) => r.requestKey === key)
+      const governing = TelemetryProofs.governing(records, push)
+      if (!governing.response.requestedMetrics.some((p) => p.startsWith('com.example.'))) continue
+      const settled = facts.replacements.filter((r) => r.at + CHURN_FENCE_MS <= push.writeAt).at(-1)
+      const variant = settled ? settled.addedVariant : 'a'
+      const metric = proof.decoded.decoded.metrics.find((m) => m.name === slot)
+      assert(metric, 'A custom Push lacks the replaced slot')
+      for (const point of metric.points) {
+        const attrs = Object.fromEntries(point.attrs.map(([name, , value]) => [name, value]))
+        assert.equal(
+          attrs.variant,
+          variant,
+          'A retired custom identity was exported after its fence'
+        )
+      }
+      checked += 1
+    }
+  }
+  return checked
+}
+
+/**
+ * Re-derives the whole churn verdict from the sealed archive and the stamped rows, never from an
+ * advertised boolean: every segment and Push, every lifecycle claim of every worker, the four
+ * resource inputs judged again, the four natural exits and the final budgets from their raw
+ * stamps, the ordinary and share oracles from their archived inputs, and the parent's decoder
+ * receipts.
+ * @param {object} record the stamped churn record whose `results.rows` holds the soak's rows
+ * @param {string} directory absolute run directory @param {object} manifest sidecar manifest
+ * @param {function(string):object} read verified JSON sidecar reader
+ * @returns {void}
+ * @throws {Error} for a missing, duplicate, substituted, failed or aggregate-only fact
+ */
+const verifyChurn = (record, directory, manifest, read) => {
   const { TelemetryResourceVerdict } = require('../../soak/soak')
+  const churn = require('../../soak/telemetryChurn')
+  const schedule = SCHEDULES[CHURN]
+  const table = new churn.TelemetrySchedule({ warmupMs: 60000, measureMs: 300000 })
   const rows = record.results?.rows
   assert(Array.isArray(rows), 'Missing churn rows')
   const of = (kind) => rows.filter((row) => row.kind === kind)
+  const oracles = read(`${manifest.root}/oracles.json`)
+  assert.deepEqual(Object.keys(oracles), ['churn'], 'Required oracle catalogue differs')
+  const archive = oracles.churn
+  assert.equal(typeof archive.stem, 'string')
   const resources = of('resource-verdict')
   const exits = of('natural-exit')
   assert.deepEqual(resources.map((row) => row.clientKind).sort(), [...CHURN_KINDS].sort())
   assert.deepEqual(exits.map((row) => row.clientKind).sort(), [...CHURN_KINDS].sort())
+  assert.deepEqual(Object.keys(archive.workers).sort(), [...CHURN_KINDS].sort())
+  const { transcripts, bundles, hashes } = verifyChurnSegments(record, directory, manifest, archive)
+  const uuids = new Set()
   for (const row of resources) {
     assert.equal(row.input.clientCount, 1, 'A churn input must be one client')
-    assert.equal(TelemetryResourceVerdict.evaluate(row.input).ok, true, `${row.clientKind} memory`)
-    assert(row.uuid && row.clientId, 'Missing client identity')
+    const evaluated = TelemetryResourceVerdict.evaluate(row.input)
+    assert.equal(
+      evaluated.ok,
+      true,
+      `${row.clientKind} memory: ${evaluated.violations} ${evaluated.inconclusive}`
+    )
+    assert.deepEqual(
+      evaluated,
+      row.result,
+      'The advertised resource verdict differs from its inputs'
+    )
+    assert.equal(row.clientId, `${archive.stem}-${row.clientKind}`, 'Client identity differs')
+    assert(row.uuid, 'Missing client identity')
+    uuids.add(row.uuid)
+    const facts = archive.workers[row.clientKind]
+    assert.equal(facts.kind, row.clientKind)
+    assert.equal(facts.uuid, row.uuid, 'A worker identity differs from its resource row')
+    assert(facts.requirements.ok, `${row.clientKind} requirements`)
+    verifyChurnWorker({
+      kind: row.clientKind,
+      uuid: row.uuid,
+      facts,
+      transcripts,
+      schedule,
+      archive,
+    })
+    assert(
+      verifyChurnFence(row.clientKind, facts, bundles, transcripts) > 0,
+      'No custom Push was decoded for the fence'
+    )
+    const last = transcripts[schedule.name(row.clientKind, schedule.perKind - 1)]
+    const [closure] = last.closures
+    assert(
+      facts.timing.receiptAt >= closure.end && facts.timing.receiptAt - closure.end <= 500,
+      'The explicit-disconnect receipt did not follow the close immediately'
+    )
   }
+  assert.equal(uuids.size, 4, 'The four workers must hold four distinct instance IDs')
   for (const row of exits) {
     assert.equal(row.event, 'close')
     assert.equal(row.code, 0)
     assert.equal(row.signal, null)
-    assert(Number.isFinite(row.afterDisconnectMs) && row.afterDisconnectMs <= 10000)
     assert.equal(row.stderrBytes, 0)
     assert.equal(row.unhandled, 0)
+    assert.equal(row.receipts, 1, 'Exactly one explicit-disconnect receipt is required')
+    assert.equal(row.killed, false)
     assert.equal(row.watchdogExpired, false)
+    assert(Number.isFinite(row.receiptAt) && Number.isFinite(row.closedAt))
+    assert.equal(row.afterDisconnectMs, row.closedAt - row.receiptAt)
+    assert(row.afterDisconnectMs >= 0 && row.afterDisconnectMs <= 10000)
   }
   const [oracle, ...extraOracle] = of('oracle')
   const [verdict, ...extraVerdict] = of('verdict')
   assert(oracle && verdict && !extraOracle.length && !extraVerdict.length, 'Missing churn verdict')
+  assert.equal(rows.at(-1), verdict, 'The verdict must follow every other row')
+  const { stem, inputs } = archive
+  assert(inputs, 'Missing oracle inputs')
+  const share = inputs.shareConsumer
+  const shareClosures = Object.keys(transcripts)
+    .filter((id) => id.startsWith('shareConsumer-'))
+    .sort()
+    .flatMap((id) => transcripts[id].closures.map(({ at, end }) => ({ at, end })))
+  assert.deepEqual(share.closures, shareClosures, 'Share close boundaries differ from the segments')
+  assert.deepEqual(inputs.consumer.handled, archive.workers.consumer.ordinary.handled)
+  assert.deepEqual(share.handled, archive.workers.shareConsumer.ordinary.handled)
+  assert.deepEqual(inputs.producer.offered, archive.workers.producer.ordinary.offered)
+  assert.deepEqual(share.acquisitions, archive.workers.shareConsumer.share.acquisitions)
+  assert.deepEqual(share.settlements, archive.workers.shareConsumer.share.settlements)
+  assert.deepEqual(share.settled, archive.workers.shareConsumer.share.settled)
+  const checks = {
+    producer: churn.OrdinaryOracle.check({ kind: 'producer', stem, ...inputs.producer }),
+    consumer: churn.OrdinaryOracle.check({ kind: 'consumer', stem, ...inputs.consumer }),
+    shareConsumer: churn.ShareOracle.check({ stem, ...share }),
+  }
+  for (const [kind, check] of Object.entries(checks))
+    assert.deepEqual(check.violations, [], `${kind} oracle: ${check.violations}`)
   assert.equal(oracle.ok, true)
+  assert.deepEqual(
+    oracle.independentSetHashes,
+    Object.fromEntries(Object.entries(checks).map(([kind, check]) => [kind, check.hashes])),
+    'The advertised oracle hashes differ from the archived inputs'
+  )
+  for (const kind of ['consumer', 'shareConsumer'])
+    assert.equal(
+      new Set(inputs.parentOffered[kind]).size,
+      10000,
+      `The parent offered an incomplete ${kind} corpus`
+    )
+  const { receipts, calls } = archive.decoder
+  assert.equal(receipts.length, calls.length, 'Decoder receipts differ from the decode requests')
+  assert(
+    calls.length > 0 && calls.every((c) => hashes.has(c.rawSha256)),
+    'A decode was not a declared proof'
+  )
+  for (const receipt of receipts) {
+    assert.equal(receipt.code, 0)
+    assert.equal(receipt.signal, null)
+    assert.equal(receipt.line, record.run.line)
+    assert.equal(receipt.identity?.verified, true)
+    assert.equal(receipt.identity.line, record.run.line)
+  }
+  assert.equal(archive.missed.filter((m) => m.measured).length, 0, 'A measured tick was missed')
+  assert.equal(
+    archive.rotations.length,
+    table.ticks.length,
+    'Transition set and readback differ from the table'
+  )
+  const { timeline } = verdict
+  assert(timeline.boundaryAt - timeline.epochAt >= 360000, 'The measurement boundary came early')
+  assert.equal(verdict.setupMs, timeline.epochAt - timeline.t0)
+  assert.equal(verdict.cleanupMs, timeline.cleanupEndAt - timeline.boundaryAt)
+  assert.equal(verdict.totalMs, timeline.cleanupEndAt - timeline.t0)
+  assert(verdict.setupMs <= 48000, 'The setup exceeded its budget')
+  assert(verdict.cleanupMs <= 120000, 'The cleanup exceeded its budget')
+  assert(verdict.totalMs <= 538000, 'The case exceeded its internal budget')
   assert.equal(verdict.ok, true)
-  assert(verdict.setupMs <= 48000 && verdict.cleanupMs <= 120000 && verdict.totalMs <= 540000)
+  assert.deepEqual(verdict.violations, [])
 }
 
 /**
@@ -2555,6 +3167,11 @@ module.exports = {
   persistEvidence,
   verifyScenario,
   verifyChurn,
+  verifyChurnFence,
+  verifyChurnReopen,
+  verifyChurnRetirement,
+  verifyChurnTransition,
+  verifyChurnWorker,
   verifyShutdown,
   traceChunk,
   joinChunks,

@@ -6635,23 +6635,67 @@ describe('Share soak complete original-owner schedules', () => {
   )
 })
 
+/**
+ * A complete, flat telemetry resident-size reference: the control agrees with itself, every peak
+ * covers its own current reading and no later peak is lower, so only a deliberate change fails.
+ */
+const reading = (over = {}) => ({
+  rss: 70 * MIB,
+  external: 4 * MIB,
+  retained: 20 * MIB,
+  hwm: 80 * MIB,
+  ...over,
+})
+const host = () => ({
+  cpus: 4,
+  load1: 0.4,
+  loadPerCpu: 0.1,
+  freeBytes: 1024 * MIB,
+  pressure: { available: true, someAvg10: 0 },
+})
+const reference = () => ({
+  version: 'rss-reference-1',
+  source: 'proc-status-vmhwm',
+  capability: { gc: true, peak: true },
+  startup: reading({ rss: 40 * MIB, hwm: 41 * MIB }),
+  loaded: reading({ rss: 68 * MIB, hwm: 70 * MIB }),
+  control: {
+    telemetryFrames: 0,
+    openSockets: 0,
+    leftoverHandles: 0,
+    c0: reading(),
+    c1: reading(),
+    released: reading(),
+  },
+  final: reading(),
+  host: { before: host(), boundary: host(), after: host() },
+})
+
 describe('telemetry resource evidence', () => {
   const snapshot = (bytes = 10000000, overrides = {}) => ({
-    memory: { retainedBytes: bytes },
-    registryDigest: 'retained-four-client-state',
-    identities: { timers: [], sockets: [], listeners: [1] },
+    memory: { retainedBytes: bytes, rss: 70 * MIB, external: 4 * MIB, hwm: 80 * MIB },
+    registryDigest: 'retained-state',
+    identities: {
+      sockets: [],
+      'resources:fixture': [],
+      'resources:target': [],
+      'resources:unknown': [],
+      'listener:socket1:data': [1],
+    },
     ...overrides,
   })
-  const run = () => ({
-    clientCount: 4,
+  const run = (count = 1) => ({
+    clientCount: count,
     baseline: snapshot(),
     samples: Array.from({ length: 11 }, (_, i) => ({
-      atMs: 60000 + i * 30000,
+      admittedAtMs: 60000 + i * 29900,
+      completedAtMs: 60300 + i * 29900,
       snapshot: snapshot(),
     })),
     teardown: snapshot(),
     cleanupMs: 120000,
     measurementMs: 300000,
+    reference: reference(),
   })
   const evaluate = (input) => TelemetryResourceVerdict.evaluate(input)
 
@@ -6673,17 +6717,39 @@ describe('telemetry resource evidence', () => {
       caseMs: 540000,
       exitMs: 10000,
       sampleMs: 30000,
+      sampleAt: [
+        60000, 90000, 120000, 150000, 180000, 210000, 240000, 270000, 300000, 330000, 359000,
+      ],
       minSamples: 10,
+      minSpanMs: 270000,
       slopeBytesPerMinute: 65536,
       endpointBytes: 1048576,
       activeBytes: 8388608,
       closedBytes: 262144,
-      nativeBytes: 67108864,
+      rssDeltaBytes: 67108864,
+      externalDeltaBytes: 67108864,
+      setupPeakBytes: 100663296,
+      peakBytes: 167772160,
+      controlRssDriftBytes: 2097152,
+      controlRetainedDriftBytes: 262144,
+      noiseLoadPerCpu: 0.75,
+      noiseFreeBytes: 268435456,
+      noisePressure: 5,
     })
     expect(evaluate(run())).toMatchObject({
       ok: true,
+      outcome: 'passed',
       violations: [],
-      measured: { samples: 11, slopeBytesPerMinute: 0, endpointBytes: 0 },
+      inconclusive: [],
+      measured: {
+        samples: 11,
+        slopeBytesPerMinute: 0,
+        endpointBytes: 0,
+        controlBaseRss: 70 * MIB,
+        peak: 80 * MIB,
+        rssDelta: 10 * MIB,
+        externalDelta: 0,
+      },
     })
   })
 
@@ -6710,11 +6776,26 @@ describe('telemetry resource evidence', () => {
       'identity roles',
     ],
     [
+      'an omitted required source role',
+      (r) => {
+        delete r.baseline.identities['resources:target']
+        delete r.teardown.identities['resources:target']
+      },
+      'identity roles',
+    ],
+    [
       'same-count replacement',
       (r) => {
-        r.teardown.identities.listeners = [2]
+        r.teardown.identities['listener:socket1:data'] = [2]
       },
-      'quiet identity listeners',
+      'quiet identity listener:socket1:data',
+    ],
+    [
+      'a surviving unknown handle',
+      (r) => {
+        r.teardown.identities['resources:unknown'] = [9]
+      },
+      'quiet identity resources:unknown',
     ],
     [
       'extra event role',
@@ -6748,15 +6829,37 @@ describe('telemetry resource evidence', () => {
       'short run',
       (r) => {
         r.samples.forEach((s, i) => {
-          s.atMs = 60000 + i
+          s.admittedAtMs = 60000 + i
+          s.completedAtMs = 60100 + i
         })
       },
       'measurement span',
     ],
     [
-      'duplicate timestamp',
+      'duplicate admission time',
       (r) => {
-        r.samples[2].atMs = r.samples[1].atMs
+        r.samples[2].admittedAtMs = r.samples[1].admittedAtMs
+      },
+      'post-GC sample shape or retained state',
+    ],
+    [
+      'a reading that completed before it was admitted',
+      (r) => {
+        r.samples[3].completedAtMs = r.samples[3].admittedAtMs - 1
+      },
+      'post-GC sample shape or retained state',
+    ],
+    [
+      'a reading that completed after the window',
+      (r) => {
+        r.samples.at(-1).completedAtMs = 360001
+      },
+      'post-GC sample shape or retained state',
+    ],
+    [
+      'a reading admitted before the window',
+      (r) => {
+        r.samples[0].admittedAtMs = 59999
       },
       'post-GC sample shape or retained state',
     ],
@@ -6770,14 +6873,14 @@ describe('telemetry resource evidence', () => {
     [
       'closed transient overflow',
       (r) => {
-        r.teardown.memory.retainedBytes += 4 * 262144 + 1
+        r.teardown.memory.retainedBytes += 262144 + 1
       },
       'closed transient ceiling',
     ],
     [
       'active overflow',
       (r) => {
-        r.samples[5].snapshot.memory.retainedBytes += 4 * 8388608 + 1
+        r.samples[5].snapshot.memory.retainedBytes += 8388608 + 1
       },
       'active retained ceiling',
     ],
@@ -6785,7 +6888,7 @@ describe('telemetry resource evidence', () => {
       'steep slope',
       (r) => {
         r.samples.forEach((s, i) => {
-          s.snapshot.memory.retainedBytes += i * (4 * 32768 + 1)
+          s.snapshot.memory.retainedBytes += i * 32769
         })
       },
       'retained slope',
@@ -6793,7 +6896,7 @@ describe('telemetry resource evidence', () => {
     [
       'last endpoint',
       (r) => {
-        r.samples.at(-1).snapshot.memory.retainedBytes += 4 * 1048576 + 1
+        r.samples.at(-1).snapshot.memory.retainedBytes += 1048576 + 1
       },
       'retained endpoint',
     ],
@@ -6806,9 +6909,9 @@ describe('telemetry resource evidence', () => {
 
   test('accepts the closed transient and active ceilings at equality', () => {
     const input = run()
-    input.teardown.memory.retainedBytes += 4 * 262144
+    input.teardown.memory.retainedBytes += 262144
     input.samples.forEach((s) => {
-      s.snapshot.memory.retainedBytes += 4 * 8388608
+      s.snapshot.memory.retainedBytes += 8388608
     })
     expect(evaluate(input).ok).toBe(true)
   })
@@ -6834,37 +6937,189 @@ describe('telemetry resource evidence', () => {
   })
 })
 
-describe('single-client telemetry attribution', () => {
-  const make = () => {
-    const snapshot = () => ({
-      memory: { retainedBytes: 10000000, peakRss: 67108864 },
-      registryDigest: 'one-kind',
-      identities: { timers: [], sockets: [] },
+describe('telemetry resident-size reference', () => {
+  const snapshot = (memory = {}) => ({
+    memory: { retainedBytes: 10000000, rss: 70 * MIB, external: 4 * MIB, hwm: 80 * MIB, ...memory },
+    registryDigest: 'one-kind',
+    identities: {
+      sockets: [],
+      'resources:fixture': [],
+      'resources:target': [],
+      'resources:unknown': [],
+    },
+  })
+  const make = () => ({
+    clientCount: 1,
+    baseline: snapshot(),
+    samples: Array.from({ length: 11 }, (_, i) => ({
+      admittedAtMs: 60000 + i * 29900,
+      completedAtMs: 60300 + i * 29900,
+      snapshot: snapshot(),
+    })),
+    teardown: snapshot(),
+    cleanupMs: 120000,
+    measurementMs: 300000,
+    reference: reference(),
+  })
+  const evaluate = (input) => TelemetryResourceVerdict.evaluate(input)
+  /** Raises the peak of one mid-run reading and everything after it, as a real high water would. */
+  const raise = (input, hwm, external) => {
+    input.samples.slice(4).forEach((s) => {
+      s.snapshot.memory.hwm = hwm
+      if (external !== undefined) s.snapshot.memory.external = external
     })
-    return {
-      clientCount: 1,
-      baseline: snapshot(),
-      samples: Array.from({ length: 11 }, (_, i) => ({
-        atMs: 60000 + i * 30000,
-        snapshot: snapshot(),
-      })),
-      teardown: snapshot(),
-      cleanupMs: 120000,
-      measurementMs: 300000,
+    input.teardown.memory.hwm = hwm
+    input.reference.final.hwm = hwm
+    if (external !== undefined) {
+      input.teardown.memory.external = external
+      input.reference.final.external = external
     }
   }
 
-  test('accepts the single-client peak at equality and rejects one byte over', () => {
+  test('measures against the disabled control and no longer against an absolute 64 MiB', () => {
     const input = make()
-    expect(TelemetryResourceVerdict.evaluate(input).ok).toBe(true)
-    input.samples[4].snapshot.memory.peakRss++
-    expect(TelemetryResourceVerdict.evaluate(input).violations).toContain('single-client RSS peak')
+    raise(input, 80 * MIB + 64 * MIB)
+    const verdict = evaluate(input)
+    expect(verdict.measured.rssDelta).toBe(74 * MIB)
+    expect(verdict.violations).toEqual(['telemetry resident-size increase'])
+    const inside = make()
+    raise(inside, 70 * MIB + 64 * MIB)
+    expect(evaluate(inside).measured.rssDelta).toBe(64 * MIB)
+    expect(evaluate(inside)).toMatchObject({ ok: true, outcome: 'passed' })
+    expect(evaluate(make()).measured.peak).toBe(80 * MIB)
   })
 
-  test('refuses a missing native peak instead of treating it as zero', () => {
+  test('holds the absolute backstop and the increase together at equality, one byte over fails both', () => {
+    const equal = make()
+    const readings = [
+      equal.reference.control.c0,
+      equal.reference.control.c1,
+      equal.reference.control.released,
+      equal.baseline.memory,
+      ...equal.samples.map((s) => s.snapshot.memory),
+      equal.teardown.memory,
+      equal.reference.final,
+    ]
+    for (const r of readings) Object.assign(r, { rss: 96 * MIB, hwm: 96 * MIB })
+    raise(equal, 160 * MIB)
+    const verdict = evaluate(equal)
+    expect(verdict.measured).toMatchObject({
+      peak: 160 * MIB,
+      setupPeak: 96 * MIB,
+      rssDelta: 64 * MIB,
+    })
+    expect(verdict).toMatchObject({ ok: true, violations: [], inconclusive: [] })
+    raise(equal, 160 * MIB + 1)
+    expect(evaluate(equal).violations).toEqual([
+      'telemetry resident-size increase',
+      'absolute resident-size peak',
+    ])
+  })
+
+  test('holds the external-memory increase at equality and fails one byte over', () => {
     const input = make()
-    delete input.samples[4].snapshot.memory.peakRss
-    expect(TelemetryResourceVerdict.evaluate(input).violations).toContain('single-client RSS peak')
+    raise(input, 80 * MIB, 4 * MIB + 64 * MIB)
+    expect(evaluate(input).violations).not.toContain('external-memory increase')
+    raise(input, 80 * MIB, 4 * MIB + 64 * MIB + 1)
+    expect(evaluate(input).violations).toContain('external-memory increase')
+  })
+
+  test('is inconclusive for an unstable control, an inflated setup or a missing capability', () => {
+    const drift = make()
+    drift.reference.control.c1.rss += 2 * MIB + 1
+    expect(evaluate(drift)).toMatchObject({ ok: false, outcome: 'inconclusive' })
+    expect(evaluate(drift).inconclusive).toContain('unstable control')
+    const retained = make()
+    retained.reference.control.c1.retained += 262145
+    expect(evaluate(retained).inconclusive).toContain('unstable control')
+    const steady = make()
+    steady.reference.control.c1.rss += 2 * MIB
+    expect(evaluate(steady).inconclusive).toEqual([])
+    const setup = make()
+    setup.reference.loaded.hwm = 96 * MIB + 1
+    setup.reference.control.c0.hwm = 96 * MIB + 1
+    setup.reference.control.c1.hwm = 96 * MIB + 1
+    setup.reference.control.released.hwm = 96 * MIB + 1
+    setup.baseline.memory.hwm = 96 * MIB + 1
+    setup.samples.forEach((s) => (s.snapshot.memory.hwm = 96 * MIB + 1))
+    setup.teardown.memory.hwm = 96 * MIB + 1
+    setup.reference.final.hwm = 96 * MIB + 1
+    expect(evaluate(setup).inconclusive).toContain('setup peak above its allowance')
+    const capability = make()
+    capability.reference.capability.gc = false
+    expect(evaluate(capability)).toMatchObject({ ok: false, outcome: 'inconclusive' })
+  })
+
+  test('lets a failure take precedence over an inconclusive measurement', () => {
+    const input = make()
+    input.reference.capability.peak = false
+    input.reference.control.telemetryFrames = 2
+    const verdict = evaluate(input)
+    expect(verdict.outcome).toBe('failed')
+    expect(verdict.violations).toContain('telemetry-disabled control')
+    expect(verdict.inconclusive).toContain('collection or peak capability')
+  })
+
+  test.each([
+    [
+      'a control that sent telemetry',
+      (r) => (r.reference.control.telemetryFrames = 1),
+      'telemetry-disabled control',
+    ],
+    [
+      'a control that left a handle',
+      (r) => (r.reference.control.leftoverHandles = 1),
+      'telemetry-disabled control',
+    ],
+    [
+      'the old schema',
+      (r) => (r.reference.version = 'rss-reference-0'),
+      'resident-size reference facts',
+    ],
+    ['an absent reference', (r) => delete r.reference, 'resident-size reference facts'],
+    ['a wrong peak source', (r) => (r.reference.source = 'maxrss'), 'resident-size peak source'],
+    [
+      'a decreasing peak',
+      (r) => {
+        r.samples[6].snapshot.memory.hwm = 75 * MIB
+      },
+      'resident-size peak series',
+    ],
+    [
+      'a peak below its own reading',
+      (r) => {
+        r.baseline.memory.rss = 85 * MIB
+      },
+      'resident-size peak series',
+    ],
+    [
+      'a missing reading field',
+      (r) => {
+        delete r.reference.loaded.external
+      },
+      'resident-size reading shape',
+    ],
+    ['a missing host context', (r) => delete r.reference.host.boundary, 'host contexts'],
+  ])('fails %s', (_name, change, label) => {
+    const input = make()
+    change(input)
+    expect(evaluate(input).violations).toContain(label)
+    expect(evaluate(input).ok).toBe(false)
+  })
+
+  test('is inconclusive on a noisy host and keeps the unavailable pressure capability visible', () => {
+    const loaded = make()
+    loaded.reference.host.before.load1 = 3.1
+    expect(evaluate(loaded).inconclusive).toContain('host noise before')
+    const memory = make()
+    memory.reference.host.after.freeBytes = 268435455
+    expect(evaluate(memory).inconclusive).toContain('host noise after')
+    const pressure = make()
+    pressure.reference.host.boundary.pressure.someAvg10 = 5.01
+    expect(evaluate(pressure).inconclusive).toContain('host noise boundary')
+    const quiet = make()
+    quiet.reference.host.before.pressure = { available: false }
+    expect(evaluate(quiet)).toMatchObject({ ok: true, inconclusive: [] })
   })
 })
 
@@ -6925,28 +7180,67 @@ describe('telemetry sampler ownership', () => {
     expect(atBoundary).toBeGreaterThan(0)
     expect(rows.filter(({ kind }) => kind === 'sample')).toHaveLength(atBoundary)
   })
-})
 
-describe('telemetry measurement duration', () => {
-  test('refuses a shortened measurement even with eleven plausible samples', () => {
-    const snapshot = () => ({
-      memory: { retainedBytes: 10, peakRss: 20 },
-      registryDigest: 'same',
-      identities: { sockets: [] },
+  test('records admission and completion times on the fixed grid, skipping a time already past', async () => {
+    const rows = []
+    const soak = new Soak({
+      kafka: {},
+      phases: [{ name: 'telemetry', workload: 'telemetry', ms: 1 }],
+      context: {},
+      settleMs: 0,
+      sampleAt: [0, 20, 40, 60],
+      warmupMs: 0,
+      probe: {
+        snapshot: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 5))
+          return { sockets: { open: 0 } }
+        },
+      },
+      record: (row) => rows.push(row),
+      workloads: {
+        telemetry: async () => {
+          expect(soak.phaseStartedAt).not.toBeNull()
+          await new Promise((resolve) => setTimeout(resolve, 100))
+          await soak.endSampling()
+        },
+      },
+      judge: () => ({ ok: true, violations: [] }),
     })
-    const input = {
-      clientCount: 1,
-      baseline: snapshot(),
-      teardown: snapshot(),
-      cleanupMs: 0,
-      measurementMs: 299999,
-      samples: Array.from({ length: 11 }, (_, i) => ({
-        atMs: 60000 + i * 30000,
-        snapshot: snapshot(),
-      })),
-    }
-    expect(TelemetryResourceVerdict.evaluate(input).violations).toContain('measurement duration')
-    input.measurementMs = 300000
-    expect(TelemetryResourceVerdict.evaluate(input).ok).toBe(true)
+    await soak.run()
+    const samples = rows.filter(({ kind }) => kind === 'sample')
+    expect(samples.length).toBeGreaterThanOrEqual(3)
+    samples.forEach((sample, index) => {
+      expect(sample.admittedPhaseMs).toBeGreaterThanOrEqual([0, 20, 40, 60][index] - 2)
+      expect(sample.phaseMs).toBeGreaterThanOrEqual(sample.admittedPhaseMs + 3)
+      expect(sample.atMs).toBeGreaterThanOrEqual(sample.admittedAtMs)
+    })
+  })
+
+  test('keeps a late read failure as a fact and rejects the join', async () => {
+    const soak = new Soak({
+      kafka: {},
+      phases: [{ name: 'telemetry', workload: 'telemetry', ms: 1 }],
+      context: {},
+      settleMs: 0,
+      sampleAt: [5],
+      warmupMs: 0,
+      probe: {
+        snapshot: async () => {
+          if (soak.phaseStartedAt !== null) throw new Error('late read')
+          return { sockets: { open: 0 } }
+        },
+      },
+      record: () => {},
+      workloads: {
+        telemetry: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 30))
+          await soak.endSampling()
+        },
+      },
+      judge: () => ({ ok: true, violations: [] }),
+    })
+    await expect(soak.run()).rejects.toThrow('late read')
+    expect(soak.readFailures).toHaveLength(1)
+    expect(soak.readFailures[0].message).toBe('late read')
   })
 })

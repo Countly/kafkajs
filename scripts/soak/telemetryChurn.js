@@ -4,31 +4,60 @@
  * The telemetry churn profile: one parent that supervises four one-client worker processes, one per
  * public client kind. Each worker holds the descriptors and instance ID of its client through
  * subscription changes, telemetry reconnects and public close/reopen cycles, and is judged on its
- * own memory and exact resource identities. The parent owns the broker resource, the independent
- * record oracle and the natural-exit observations of the children.
+ * own memory and exact resource identities. The parent owns the broker resource, the parent-
+ * coordinated tick catalogue, the independent record oracle, the independent protobuf decoding and
+ * the natural-exit observations of the children.
  *
  * Development-only and public-API-only: nothing here reads a private member of the client.
  * `soak.js` injects its `Soak`, `instrument` and verdict so this module never requires it back.
  */
 const crypto = require('node:crypto')
+const fs = require('node:fs')
+const os = require('node:os')
 // eslint-disable-next-line n/no-unsupported-features/node-builtins -- development driver; only the resource lifetime hooks are used
-const { createHook } = require('node:async_hooks')
+const { AsyncLocalStorage, createHook } = require('node:async_hooks')
 const { fork } = require('node:child_process')
 const { createChaosSocketFactory, FrameFilter } = require('../../testHelpers/chaosSocket')
+const { DecoderGate, TelemetryWireObserver } = require('../../testHelpers/telemetryFixtures')
+const { TelemetrySegments } = require('../../testHelpers/telemetrySegments')
+const {
+  ShareTrace,
+  confirmedDecisions,
+  heldAcquisitions,
+} = require('../e2e/telemetry/shareEvidence')
 
+const SCENARIO = 'telemetry-churn'
 const KINDS = Object.freeze(['producer', 'consumer', 'admin', 'shareConsumer'])
 const STEPS = Object.freeze({ subscriptionMs: 10000, retireMs: 30000, reopenMs: 60000 })
 const ORDER = Object.freeze(['reopen', 'retire', 'subscription'])
+const STAGE_OF = Object.freeze({ reopen: 'lifecycle', retire: 'retire', subscription: 'confirm' })
 const MINIMUMS = Object.freeze({ subscription: 30, retire: 10, reopen: 5 })
 const LATE_MS = 5000
 const DESCRIPTORS = 128
 const CORPUS = Object.freeze({ records: 10000, batch: 100, batchMs: 3000, bytes: 200 })
 const SETUP_MS = 48000
 const NATURAL_EXIT_MS = 10000
+const STAGE_MS = Object.freeze({ lifecycle: 12000, retire: 8000, confirm: 10000 })
+const DECODER_SLOTS = 4
+const DECODE_BUDGET_MS = 6000
+const MESSAGE_BYTES = 8 * 1024 * 1024
+const TOTAL_BYTES = 48 * 1024 * 1024
 const MAX_STDERR = 65536
 const WORKER_ENV = 'TELEMETRY_WORKER_KIND'
 const WORKER_TOKEN = 'TELEMETRY_WORKER_TOKEN'
 const SUBSCRIPTIONS = Object.freeze(['com.example.', '', 'org.apache.kafka.'])
+const INITIAL_SELECTION = SUBSCRIPTIONS[2]
+const CUSTOM_PREFIX = SUBSCRIPTIONS[0]
+const PUSH_INTERVAL_MS = 1000
+const TICK_PROOF_MS = 5000
+const MIB = 1048576
+const CONTROL = Object.freeze({
+  rssDriftBytes: 2 * MIB,
+  retainedDriftBytes: 262144,
+  idleMs: 2000,
+  setupPeakBytes: 96 * MIB,
+  catalogue: Object.freeze({ producer: 20, consumer: 0, admin: 10, shareConsumer: 0 }),
+})
 const TRACKED = new Set([
   'Timeout',
   'TCPWRAP',
@@ -38,6 +67,20 @@ const TRACKED = new Set([
   'UDPWRAP',
   'MESSAGEPORT',
 ])
+const MESSAGE_TYPES = Object.freeze({
+  worker: [
+    'hello',
+    'ready',
+    'phase',
+    'stage-done',
+    'decode',
+    'result',
+    'failure',
+    'receipt',
+    'unhandled',
+  ],
+  once: ['hello', 'ready', 'phase', 'result', 'receipt'],
+})
 
 /**
  * @param {number} ms delay
@@ -58,12 +101,152 @@ const labelOf = (kind) => (kind === 'shareConsumer' ? 'share' : kind)
 const recordId = (stem, kind, index) => `${stem}:${labelOf(kind)}:${String(index).padStart(5, '0')}`
 
 /**
+ * @param {string} key a corpus record key @returns {number} its position in the corpus, or -1
+ */
+const indexOf = (key) => {
+  const match = /:(\d{5})$/.exec(String(key))
+  return match ? Number(match[1]) : -1
+}
+
+/**
  * The fixed 200 byte value of a record, carrying its identity.
  * @param {string} id record identity @returns {Buffer} exactly `CORPUS.bytes` bytes
  */
 const valueOf = (id) => Buffer.from(id.padEnd(CORPUS.bytes, '.'))
 
-/** The deterministic action table of one run: what happens at which millisecond after the epoch. */
+/**
+ * @param {Buffer|string} bytes data @returns {string} lower-case SHA-256 hex
+ */
+const sha = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex')
+
+/**
+ * @param {string[]|number[]} ids identities @returns {string} hash of the sorted identity list
+ */
+const hashIds = (ids) => sha(JSON.stringify([...ids].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))))
+
+/**
+ * Rejects the first arrival of a promise that was not settled within `ms`; the timer never lingers.
+ * @template T
+ * @param {Promise<T>|function():Promise<T>} work the awaited work @param {number} ms bound
+ * @param {string} label failure description @returns {Promise<T>} the work's own outcome
+ * @throws {Error} naming the label when the bound passed first
+ */
+const within = async (work, ms, label) => {
+  let timer
+  try {
+    return await Promise.race([
+      typeof work === 'function' ? work() : work,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} did not finish within ${ms} ms`)), ms)
+      }),
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/**
+ * Reads the kernel's lifetime peak resident size of this executable image.
+ * @returns {number|null} bytes, or null where the source does not exist or cannot be parsed
+ */
+const readHighWater = () => {
+  try {
+    const found = /^VmHWM:\s+(\d+)\s+kB$/m.exec(fs.readFileSync('/proc/self/status', 'utf8'))
+    return found ? Number(found[1]) * 1024 : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * One unsettled memory reading: current and peak sizes in bytes, never rebased or clamped.
+ * @param {string} phase the reading's place in the fixed catalogue
+ * @param {function():number} [now] monotonic milliseconds
+ * @returns {object} `phase`, `at`, rss, heapUsed, external, arrayBuffers, retained, hwm, rawMaxRss
+ */
+const readMemory = (phase, now = () => performance.now()) => {
+  const usage = process.memoryUsage()
+  return {
+    phase,
+    at: now(),
+    rss: usage.rss,
+    heapUsed: usage.heapUsed,
+    external: usage.external,
+    arrayBuffers: usage.arrayBuffers,
+    retained: usage.heapUsed + usage.external,
+    hwm: readHighWater(),
+    rawMaxRss: process.resourceUsage().maxRSS * 1024,
+  }
+}
+
+/**
+ * Two collections 100 ms apart with the collection callbacks left to settle, then a reading.
+ * @param {string} phase the reading's place in the fixed catalogue
+ * @param {object} io `{gc, pause, now}`; the pause must let timers and immediates run
+ * @returns {Promise<object>} the settled reading, with the admission and completion times
+ */
+const settledReading = async (phase, { gc, pause, now }) => {
+  const admittedAt = now()
+  gc()
+  await pause(100)
+  gc()
+  await new Promise((resolve) => setImmediate(resolve))
+  await new Promise((resolve) => setImmediate(resolve))
+  return { ...readMemory(phase, now), admittedAt }
+}
+
+/**
+ * @param {function():number} [now] monotonic milliseconds
+ * @returns {object} one-minute load per CPU, free memory and memory pressure, with unavailable
+ *   capabilities named rather than reported as quiet
+ */
+const hostContext = (now = () => performance.now()) => {
+  let pressure = { available: false }
+  try {
+    const found = /^some avg10=([\d.]+)/m.exec(fs.readFileSync('/proc/pressure/memory', 'utf8'))
+    if (found) pressure = { available: true, someAvg10: Number(found[1]) }
+  } catch {
+    // an unreadable pressure file is reported as unavailable
+  }
+  const cpus = os.cpus().length
+  return {
+    at: now(),
+    cpus,
+    load1: os.loadavg()[0],
+    loadPerCpu: os.loadavg()[0] / Math.max(1, cpus),
+    freeBytes: os.freemem(),
+    pressure,
+  }
+}
+
+/**
+ * @param {Array<{kind:string,type:string,token:object}>} facts compressible per-offset facts
+ * @returns {object[]} the same facts as inclusive offset ranges where neighbours agree in every
+ *   other field, in the original order
+ */
+const compactRuns = (facts) => {
+  const runs = []
+  for (const fact of facts) {
+    const last = runs.at(-1)
+    const joins =
+      last &&
+      last.topicId === fact.topicId &&
+      last.partition === fact.partition &&
+      last.type === fact.type &&
+      last.at === fact.at &&
+      last.errorCode === fact.errorCode &&
+      BigInt(last.lastOffset) + 1n === BigInt(fact.offset)
+    if (joins) last.lastOffset = fact.offset
+    else
+      runs.push({ ...fact, firstOffset: fact.offset, lastOffset: fact.offset, offset: undefined })
+  }
+  return runs.map(({ offset, ...run }) => run)
+}
+
+/**
+ * The deterministic action table of one run, derived from the fixed schedule alone: what happens at
+ * which millisecond after the epoch, split into the three coordinated stages of every tick.
+ */
 class TelemetrySchedule {
   /**
    * @param {{warmupMs:number, measureMs:number}} window warm-up and measurement lengths
@@ -80,7 +263,12 @@ class TelemetrySchedule {
       for (let ms = step; ms < this.endMs; ms += step) at.set(ms, [...(at.get(ms) ?? []), action])
     this.ticks = [...at]
       .sort((a, b) => a[0] - b[0])
-      .map(([ms, actions]) => ({ at: ms, actions: ORDER.filter((a) => actions.includes(a)) }))
+      .map(([ms, actions], number) => ({
+        number,
+        at: ms,
+        index: ms / STEPS.subscriptionMs,
+        actions: ORDER.filter((a) => actions.includes(a)),
+      }))
   }
 
   /**
@@ -88,6 +276,21 @@ class TelemetrySchedule {
    */
   measured(tick) {
     return tick.at >= this.warmupMs
+  }
+
+  /**
+   * @param {{actions:string[]}} tick one table row @returns {string[]} its stages, in order
+   */
+  stages(tick) {
+    return tick.actions.map((action) => STAGE_OF[action])
+  }
+
+  /**
+   * @param {number} index the 10 s transition number, from 1
+   * @returns {string} the metrics prefix list the resource holds after that transition
+   */
+  selection(index) {
+    return SUBSCRIPTIONS[(index - 1) % SUBSCRIPTIONS.length]
   }
 
   /**
@@ -100,20 +303,41 @@ class TelemetrySchedule {
       if (this.measured(tick)) for (const action of tick.actions) counts[action] += 1
     return counts
   }
+
+  /**
+   * @returns {number[]} the fixed slots, in ms after the epoch, at which the measured corpus batches
+   *   are offered; none falls in the warm-up
+   */
+  corpusSlots() {
+    return Array.from(
+      { length: CORPUS.records / CORPUS.batch },
+      (_, batch) => this.warmupMs + batch * CORPUS.batchMs
+    )
+  }
 }
 
 /**
  * Tracks the live timers and handles of this process from before the target is built, with stable
- * issued tokens and a finite live map. Resources created before `start` (the IPC channel) are not
- * seen; resources the fixture itself owns are the caller's to keep out of the comparison.
+ * issued tokens, a finite live map and the role of the code that created each one. A resource is
+ * `target` when created inside `as('target', ...)`, `fixture` inside `as('fixture:<name>', ...)`
+ * and `unknown` otherwise. Every token also names the resource that triggered it. Resources created
+ * before `start` (the IPC channel) are not seen.
  */
 class ProcessResources {
+  #roles = new AsyncLocalStorage()
+
   /** Builds a disabled tracker. */
   constructor() {
     this.live = new Map()
     this.hook = createHook({
-      init: (id, type) => {
-        if (TRACKED.has(type)) this.live.set(id, { type, token: { id } })
+      init: (id, type, trigger) => {
+        if (!TRACKED.has(type)) return
+        const role = this.#roles.getStore() ?? 'unknown'
+        const parent = this.live.get(trigger)
+        this.live.set(id, {
+          group: role === 'target' ? 'target' : role.startsWith('fixture') ? 'fixture' : 'unknown',
+          token: { id, type, role, trigger, triggerRole: parent?.token.role ?? null },
+        })
       },
       destroy: (id) => {
         this.live.delete(id)
@@ -133,80 +357,23 @@ class ProcessResources {
   }
 
   /**
-   * @returns {Record<string, object[]>} the token of each live resource, by type. Tokens are the
-   *   same object for the same resource, so a probe can tell a replacement from the original.
+   * @template T
+   * @param {string} role `target` or `fixture:<name>` @param {function():T} work
+   * @returns {T} the work's own result; every resource it creates carries the role
    */
-  identities() {
-    const roles = {}
-    for (const { type, token } of this.live.values()) (roles[`resource:${type}`] ??= []).push(token)
-    return roles
-  }
-}
-
-/**
- * The classifying socket factory of one worker: every socket is a chaos socket, and the first
- * request frame of API 71 or 72 marks that very socket as the telemetry transport. It counts Get
- * and Push frames and can retire the one open telemetry socket, leaving core sockets untouched.
- */
-class TelemetryTap {
-  /** @param {Function} inner the underlying socket factory */
-  constructor(inner) {
-    const chaos = createChaosSocketFactory(inner)
-    this.records = []
-    this.factory = (options) => this.track(chaos(options))
+  as(role, work) {
+    return this.#roles.run(role, work)
   }
 
   /**
-   * @param {object} socket the chaos socket just issued @returns {object} the same socket, classified
+   * @returns {Record<string, object[]>} the three fixed role groups, each possibly empty, holding
+   *   the token of every live resource. Tokens are the same object for the same resource, so a
+   *   probe tells a replacement from the original, and a missing group is never mistaken for none.
    */
-  track(socket) {
-    const record = { socket, telemetry: false, closed: false, gets: 0, pushes: 0 }
-    const classifier = new FrameFilter({
-      headerBytes: 12,
-      decide: (header) => {
-        const api = header.length >= 12 ? header.readInt16BE(4) : -1
-        if (api === 71 || api === 72) {
-          record.telemetry = true
-          if (api === 71) record.gets += 1
-          else record.pushes += 1
-        }
-        return false
-      },
-    })
-    const write = socket.write
-    socket.write = function (data, encoding) {
-      classifier.push(Buffer.from(data, encoding))
-      return write.call(this, data, encoding)
-    }
-    socket.on('close', () => {
-      record.closed = true
-      this.records = this.records.filter((entry) => !entry.closed || entry.telemetry)
-    })
-    this.records.push(record)
-    return socket
-  }
-
-  /** @returns {{gets:number, pushes:number, sockets:number}} totals over every telemetry socket seen */
-  counts() {
-    const seen = this.records.filter((r) => r.telemetry)
-    return {
-      gets: seen.reduce((sum, r) => sum + r.gets, 0),
-      pushes: seen.reduce((sum, r) => sum + r.pushes, 0),
-      sockets: seen.length,
-    }
-  }
-
-  /** @returns {number} destroyed telemetry sockets, at most one: the captured transport only */
-  retire() {
-    const open = this.records.filter((r) => r.telemetry && !r.closed)
-    for (const { socket } of open.slice(0, 1))
-      socket.destroy(new Error('telemetry transport retired'))
-    return Math.min(1, open.length)
-  }
-
-  /** @returns {number} telemetry sockets still open */
-  open() {
-    return this.records.filter((r) => r.telemetry && !r.closed).length
+  identities() {
+    const roles = { 'resources:target': [], 'resources:fixture': [], 'resources:unknown': [] }
+    for (const { group, token } of this.live.values()) roles[`resources:${group}`].push(token)
+    return roles
   }
 }
 
@@ -221,14 +388,17 @@ class Registry {
    * @param {object} client a public client with the additive registration methods
    * @param {string} kind its kind, part of every name
    * @param {number} [count] canonical descriptors
+   * @param {{now:function():number}} [clock] monotonic time for the replacement journal
    */
-  constructor(client, kind, count = DESCRIPTORS) {
+  constructor(client, kind, count = DESCRIPTORS, clock = { now: () => performance.now() }) {
     this.client = client
     this.kind = kind
     this.count = count
+    this.clock = clock
     this.variant = 'a'
     this.registered = []
     this.bytes = 0
+    this.replacements = []
   }
 
   /**
@@ -285,17 +455,25 @@ class Registry {
     this.bytes -= this.charge(descriptor)
   }
 
-  /** @returns {void} swaps slot 0 for an identity of the same charge */
-  replace() {
+  /**
+   * Swaps slot 0 for an identity of the same charge and journals both calls.
+   * @param {number} [tick] the tick that asked for the swap
+   * @returns {{tick:number|null, removedVariant:string, addedVariant:string, at:number}} the entry
+   */
+  replace(tick = null) {
     const next = this.variant === 'a' ? 'b' : 'a'
+    const entry = { tick, removedVariant: this.variant, addedVariant: next, at: null }
     this.remove(this.registered.find((d) => d.name === this.descriptor(0).name))
     this.add(this.descriptor(0, next))
     this.variant = next
+    entry.at = this.clock.now()
+    this.replacements.push(entry)
+    return entry
   }
 
   /** @returns {void} puts the canonical identity back, so every checkpoint compares one registry */
   restore() {
-    if (this.variant !== 'a') this.replace()
+    if (this.variant !== 'a') this.replace(null)
   }
 
   /**
@@ -314,250 +492,1071 @@ class Registry {
 }
 
 /**
- * Compares the independent identity sets of the ordinary work: what was offered, what the raw log
- * holds, what the handler saw and what was committed. Every set must equal its expectation exactly.
+ * Pure predicates over one segment's wire records (the observer's own transcript, live or
+ * archived). The worker uses them to claim proofs while the run is live; the verifier uses the very
+ * same predicates on the sealed archive, so a claim is only ever as good as the bytes it names.
  */
-class OrdinaryOracle {
+class TelemetryProofs {
   /**
-   * @param {{expected:string[], durable:string[], handled:string[], committed?:Object<string,string>,
-   *   processed?:Object<string,string>}} input independent readings
-   * @returns {{ok:boolean, violations:string[], hashes:object}} the verdict with set hashes
+   * @param {object[]} records one segment's transcript records
+   * @param {string} uuid the client's assigned instance ID
+   * @returns {object[]} successful Gets that carried and returned that UUID, in order
    */
-  static check({ expected, durable, handled, committed, processed }) {
-    const violations = []
-    const sorted = (ids) => [...ids].sort()
-    const same = (a, b) => JSON.stringify(sorted(a)) === JSON.stringify(sorted(b))
-    const unique = (ids) => new Set(ids).size === ids.length
-    if (!unique(expected)) violations.push('expected identities repeat')
-    if (!same(durable, expected) || !unique(durable)) violations.push('durable identities differ')
-    if (!same(handled, expected) || !unique(handled)) violations.push('handler identities differ')
-    if (committed !== undefined || processed !== undefined) {
-      const keys = new Set([...Object.keys(committed ?? {}), ...Object.keys(processed ?? {})])
-      for (const key of keys)
-        if (committed?.[key] !== processed?.[key])
-          violations.push(`committed end differs on ${key}`)
-    }
-    const hash = (ids) =>
-      crypto
-        .createHash('sha256')
-        .update(JSON.stringify(sorted(ids)))
-        .digest('hex')
-    return {
-      ok: violations.length === 0,
-      violations,
-      hashes: { expected: hash(expected), durable: hash(durable), handled: hash(handled) },
-    }
-  }
-}
-
-/**
- * One worker: a single public client of one kind, its retained registry and baseline, the public
- * workload and the fixed churn schedule, run under the inherited `Soak` sampler with a verdict of
- * its own. It never closes a client it did not create and never exits the process.
- */
-class TelemetryWorker {
-  /**
-   * @param {object} options
-   * @param {string} options.kind the one target client kind
-   * @param {object} options.client the target public client
-   * @param {TelemetryTap} options.tap its classifying socket tap
-   * @param {Registry} options.registry its retained descriptors
-   * @param {{now: () => number}} options.clock monotonic milliseconds
-   * @param {(ms:number) => Promise<void>} [options.sleep] real delay
-   * @param {object} options.ordinary kind-specific workload: `start`, `stop`, `drain`, `ids`
-   * @param {{warmupMs:number, measureMs:number}} options.limits the fixed window
-   * @param {object} [options.schedule] a `TelemetrySchedule`
-   */
-  constructor({ kind, client, tap, registry, clock, sleep = wait, ordinary, limits, schedule }) {
-    Object.assign(this, { kind, client, tap, registry, clock, sleep, ordinary, limits })
-    this.schedule = schedule ?? new TelemetrySchedule(limits)
-    this.uuid = null
-    this.actions = {
-      warm: { subscription: 0, retire: 0, reopen: 0 },
-      measured: { subscription: 0, retire: 0, reopen: 0 },
-    }
-    this.missed = []
-    this.reopens = []
-    this.rotations = []
-    this.confirmations = []
-    this.timing = { boundaryMs: null, measurementMs: null, cleanupMs: null }
-    /** The supervising Soak, set by the owner before `work` runs. */
-    this.sampler = null
-  }
-
-  /**
-   * Registers the descriptors, obtains the UUID, disconnects and leaves the client disconnected
-   * with exactly that state retained.
-   * @returns {Promise<string>} the retained instance ID
-   * @throws {Error} a failed registration, connect or UUID wait
-   */
-  async prepare() {
-    this.registry.fill()
-    await this.client.connect()
-    this.uuid = await this.client.clientInstanceId({ timeout: 15000 })
-    await this.client.disconnect()
-    return this.uuid
-  }
-
-  /**
-   * @param {number} epoch the monotonic reading at which the schedule began
-   * @param {number} at the target millisecond after the epoch
-   * @returns {Promise<void>} resolves once the monotonic clock reads `at`, whatever the timers did
-   */
-  async until(epoch, at) {
-    for (;;) {
-      const left = at - (this.clock.now() - epoch)
-      if (left <= 0) return
-      await this.sleep(Math.min(left, 1000))
-    }
-  }
-
-  /**
-   * One public close then, as the next public action, an immediate connect on the same object.
-   * @returns {Promise<void>} after the reopen is proven by the cached UUID and a new Push frame
-   * @throws {Error} a changed UUID or a missing Push on the replacement socket
-   */
-  async reopen() {
-    await this.ordinary.drain()
-    const before = this.tap.counts()
-    const order = []
-    await this.client.disconnect()
-    order.push('disconnect-resolved')
-    const connecting = this.client.connect()
-    order.push('connect-called')
-    await connecting
-    await this.ordinary.resume()
-    const cached = await this.client.clientInstanceId({ timeout: 0 })
-    await this.pushAfter(before.pushes, LATE_MS)
-    this.reopens.push({
-      order,
-      uuid: cached,
-      push: this.tap.counts().pushes > before.pushes,
-      open: this.tap.open(),
-    })
-    if (cached !== this.uuid) throw new Error('The instance ID changed across a public reopen')
-    if (!this.reopens.at(-1).push) throw new Error('No normal Push followed the public reopen')
-  }
-
-  /**
-   * Retires the one captured telemetry socket and waits for the replacement's first Push.
-   * @returns {Promise<void>} @throws {Error} when no telemetry socket was open or no Push followed
-   */
-  async retire() {
-    const before = this.tap.counts()
-    if (this.tap.retire() !== 1) throw new Error('No open telemetry socket to retire')
-    await this.pushAfter(before.pushes, 4 * LATE_MS)
-    if (this.tap.counts().pushes <= before.pushes)
-      throw new Error('No Push followed the telemetry reconnect')
-  }
-
-  /**
-   * @param {number} pushes the Push frame total to exceed @param {number} ms bound
-   * @returns {Promise<void>} resolves at the first newer Push frame or at the bound
-   */
-  async pushAfter(pushes, ms) {
-    const deadline = this.clock.now() + ms
-    while (this.tap.counts().pushes <= pushes && this.clock.now() < deadline) await this.sleep(100)
-  }
-
-  /**
-   * Records that the broker resource just changed and waits for this client's next Get frame.
-   * @param {number} index the rotation number @returns {void} confirmation is joined at cleanup
-   */
-  rotated(index) {
-    const gets = this.tap.counts().gets
-    const entry = { index, confirmed: false, measured: null }
-    this.rotations.push(entry)
-    this.confirmations.push(
-      (async () => {
-        const deadline = this.clock.now() + LATE_MS
-        while (this.tap.counts().gets <= gets && this.clock.now() < deadline) await this.sleep(100)
-        entry.confirmed = this.tap.counts().gets > gets
-      })()
+  static gets(records, uuid) {
+    return records.filter(
+      (r) =>
+        r.type === 'request' &&
+        r.apiKey === 71 &&
+        r.uuid === uuid &&
+        r.response?.errorCode === 0 &&
+        r.response.uuid === uuid
     )
   }
 
   /**
-   * Runs the warm-up and measurement under the supervising Soak, then the cleanup. The sampler is
-   * stopped and joined at the measurement boundary, before any cleanup await.
-   * @param {number} ms the fixed warm-up plus measurement
-   * @returns {Promise<void>} after cleanup; a failure keeps the primary and every cleanup error
-   * @throws {Error|AggregateError} the first workload failure with the cleanup failures
+   * @param {object[]} records one segment's transcript records
+   * @returns {object[]} accepted, nonempty, nonterminating Pushes, in order
    */
-  async work(ms) {
-    const { warmupMs, measureMs } = this.limits
-    if (ms !== warmupMs + measureMs) throw new Error('Telemetry churn runs its fixed 360000 ms')
-    const errors = []
-    const epoch = this.clock.now()
-    let boundary = null
-    try {
-      const connecting = this.client.connect()
-      await connecting
-      await this.ordinary.start()
-      for (const tick of this.schedule.ticks) {
-        await this.until(epoch, tick.at)
-        if (boundary === null && this.schedule.measured(tick)) boundary = this.clock.now() - epoch
-        const late = this.clock.now() - epoch - tick.at
-        const bucket = this.schedule.measured(tick) ? this.actions.measured : this.actions.warm
-        if (late > LATE_MS) {
-          this.missed.push({ at: tick.at, actions: tick.actions, late })
-          continue
-        }
-        for (const action of tick.actions) {
-          if (action === 'reopen') await this.reopen()
-          else if (action === 'retire') await this.retire()
-          else this.registry.replace()
-          bucket[action] += 1
-        }
-      }
-      await this.until(epoch, this.schedule.endMs)
-      this.timing.boundaryMs = boundary
-      this.timing.measurementMs = this.clock.now() - epoch - warmupMs
-      await this.sampler.endSampling()
-    } catch (error) {
-      errors.push(error)
-    }
-    const cleanupAt = this.clock.now()
-    await this.sampler.endSampling().catch((error) => errors.push(error))
-    for (const step of [
-      async () => {
-        for (const outcome of await Promise.allSettled(this.confirmations))
-          if (outcome.status === 'rejected') throw outcome.reason
-      },
-      () => this.ordinary.stop(),
-      () => this.registry.restore(),
-      () => this.client.disconnect(),
-    ]) {
-      try {
-        await step()
-      } catch (error) {
-        errors.push(error)
-      }
-    }
-    this.timing.cleanupMs = this.clock.now() - cleanupAt
-    if (errors.length === 1) throw errors[0]
-    if (errors.length) throw new AggregateError(errors, 'Telemetry worker failed')
+  static accepted(records) {
+    return records.filter(
+      (r) =>
+        r.type === 'request' &&
+        r.apiKey === 72 &&
+        !r.terminating &&
+        r.response?.errorCode === 0 &&
+        r.metricsBytes > 0
+    )
   }
 
   /**
-   * @returns {{ok:boolean, violations:string[]}} whether every required measured action completed
-   *   and none was skipped by a late tick
+   * @param {object[]} records one segment's transcript records
+   * @param {object} push a Push of those records
+   * @returns {object|undefined} the last successful Get on the Push's own socket before it was written
    */
-  requirements() {
-    const violations = []
-    const need = this.schedule.required()
-    for (const action of Object.keys(need))
-      if (this.actions.measured[action] < Math.min(need[action], MINIMUMS[action]))
-        violations.push(`measured ${action} actions ${this.actions.measured[action]}`)
-    if (this.missed.some((m) => m.at >= this.schedule.warmupMs))
-      violations.push('a measured tick was missed')
-    return { ok: violations.length === 0, violations }
+  static governing(records, push) {
+    return records
+      .filter(
+        (r) =>
+          r.type === 'request' &&
+          r.apiKey === 71 &&
+          r.socketId === push.socketId &&
+          r.response?.errorCode === 0 &&
+          r.response.responseAt <= push.writeAt
+      )
+      .at(-1)
+  }
+
+  /**
+   * The first accepted nonempty nonterminating Push on the socket of a replacement Get, written
+   * strictly after that Get's response, later in request order, under a successful subscription of
+   * the same client.
+   * @param {object[]} records one segment's transcript records
+   * @param {object} get the replacement Get @returns {object|undefined} the proving Push
+   */
+  static provingPush(records, get) {
+    return TelemetryProofs.accepted(records).find(
+      (push) =>
+        push.socketId === get.socketId &&
+        push.index > get.index &&
+        push.writeAt > get.response.responseAt &&
+        push.uuid === get.response.uuid &&
+        TelemetryProofs.governing(records, push)?.response.uuid === push.uuid
+    )
+  }
+
+  /**
+   * @param {object[]} records one segment's transcript records @param {string} uuid assigned UUID
+   * @param {{after?:number, selection:string[]}} want the earliest write time and the exact list
+   * @returns {object|undefined} the first successful Get that proves the selection: written at or
+   *   after `after`, carrying and returning the UUID, with exactly that requested list and 1000 ms
+   */
+  static selectionGet(records, uuid, { after = -Infinity, selection }) {
+    return TelemetryProofs.gets(records, uuid).find(
+      (get) =>
+        get.writeAt >= after &&
+        get.response.pushIntervalMs === PUSH_INTERVAL_MS &&
+        JSON.stringify(get.response.requestedMetrics) === JSON.stringify(selection)
+    )
+  }
+
+  /**
+   * The declared proof selection: a pure function of one segment's transcript. It names the first
+   * accepted nonempty Push of every telemetry socket that had a successful Get, the first accepted
+   * Push governed by each successful custom-prefix Get, and the accepted final of a segment that is
+   * not the terminal one. Every other accepted Push keeps its bytes, response, node, subscription and sink
+   * join but is not fully decoded.
+   * @param {object[]} records one segment's transcript records
+   * @param {{terminal:boolean}} options whether this is the kind's last segment
+   * @returns {string[]} the request keys to decode, sorted
+   */
+  static selection(records, { terminal }) {
+    const keys = new Set()
+    const pushes = TelemetryProofs.accepted(records)
+    const seenSockets = new Set()
+    const seenCustom = new Set()
+    for (const push of pushes) {
+      const get = TelemetryProofs.governing(records, push)
+      if (!get) continue
+      if (!seenSockets.has(push.socketId)) {
+        seenSockets.add(push.socketId)
+        keys.add(push.requestKey)
+      }
+      if (
+        get.response.requestedMetrics.some((p) => p.startsWith(CUSTOM_PREFIX)) &&
+        push.subscriptionId === get.response.subscriptionId &&
+        !seenCustom.has(get.requestKey)
+      ) {
+        seenCustom.add(get.requestKey)
+        keys.add(push.requestKey)
+      }
+    }
+    if (!terminal)
+      for (const r of records)
+        if (
+          r.type === 'request' &&
+          r.apiKey === 72 &&
+          r.terminating &&
+          r.response?.errorCode === 0 &&
+          r.metricsBytes > 0
+        )
+          keys.add(r.requestKey)
+    return [...keys].sort()
   }
 }
 
 /**
- * Supervises the four worker processes: one forked driver per kind, a fixed handshake, bounded
- * output, and a natural-exit observation that starts at the explicit-disconnect receipt.
+ * @param {number[]} indexes record positions @returns {string[]} violations of "exactly 0..records-1"
+ */
+const identityViolations = (indexes, label) => {
+  const seen = new Set()
+  const out = []
+  for (const index of indexes) {
+    if (!Number.isInteger(index) || index < 0 || index >= CORPUS.records)
+      out.push(`${label} holds an identity outside the corpus`)
+    else if (seen.has(index)) out.push(`${label} repeats an identity`)
+    seen.add(index)
+  }
+  if (seen.size !== CORPUS.records) out.push(`${label} identities are incomplete`)
+  return [...new Set(out)]
+}
+
+/**
+ * The independent raw-log reading of one corpus topic in its archived, replayable shape.
+ * @param {Map<number,{records:object[]}>} log the raw log by partition, as `readLog` returns it
+ * @param {string} stem run prefix @param {string} kind the corpus kind
+ * @returns {{partitions:Object<string,number[][]>, valuesSha256:Object<string,string>,
+ *   ends:Object<string,string>}} `[offset, index]` rows, the hash of each partition's value bytes
+ *   in offset order, and the log end of each partition
+ */
+const logInputs = (log, stem, kind) => {
+  const partitions = {}
+  const valuesSha256 = {}
+  const ends = {}
+  for (const [partition, { records }] of log) {
+    const rows = records.map((r) => [Number(r.offset), indexOf(r.key)]).sort((a, b) => a[0] - b[0])
+    const hash = crypto.createHash('sha256')
+    for (const r of [...records].sort((a, b) => Number(a.offset) - Number(b.offset)))
+      hash.update(Buffer.from(r.value ?? ''))
+    partitions[partition] = rows
+    valuesSha256[partition] = hash.digest('hex')
+    ends[partition] = String(rows.length ? rows.at(-1)[0] + 1 : 0)
+  }
+  return { partitions, valuesSha256, ends }
+}
+
+/**
+ * Recomputes one corpus topic's durable-identity conclusions from archived inputs alone: the log
+ * holds each of the 10000 identities once, from offset 0 without gaps, with the exact value bytes.
+ * @param {object} inputs `logInputs` output plus `stem` and `kind`
+ * @returns {{violations:string[], indexes:number[], byOffset:Map<string,number>}} the conclusions
+ */
+const checkLog = ({ partitions, valuesSha256, ends, stem, kind }) => {
+  const violations = []
+  const indexes = []
+  const byOffset = new Map()
+  for (const [partition, rows] of Object.entries(partitions)) {
+    const hash = crypto.createHash('sha256')
+    rows.forEach(([offset, index], position) => {
+      if (offset !== position) violations.push(`log ${partition} has a gap or reorder at ${offset}`)
+      indexes.push(index)
+      byOffset.set(`${partition}:${offset}`, index)
+      hash.update(valueOf(recordId(stem, kind, index)))
+    })
+    if (hash.digest('hex') !== valuesSha256?.[partition])
+      violations.push(`log ${partition} value bytes differ from the corpus`)
+    if (ends?.[partition] !== String(rows.length))
+      violations.push(`log ${partition} end differs from its records`)
+  }
+  violations.push(...identityViolations(indexes, 'durable'))
+  return { violations: [...new Set(violations)], indexes, byOffset }
+}
+
+/**
+ * Compares the independent identity sets of the ordinary work: what was offered, what the broker
+ * resolved, what the raw log holds, what the handler entered and what was committed. Every set
+ * must equal its expectation exactly and nothing may be replayed.
+ */
+class OrdinaryOracle {
+  /**
+   * @param {object} input independent readings, all archived by the caller
+   * @param {'producer'|'consumer'} input.kind the ordinary kind
+   * @param {string} input.stem run prefix
+   * @param {object} input.log `logInputs` output
+   * @param {number[]} [input.offered] producer offers, by corpus position
+   * @param {number[]} [input.resolved] producer resolutions, by corpus position
+   * @param {number[][]} [input.handled] `[partition, offset, index, enteredAt, exitedAt]` entries
+   * @param {Object<string,string>} [input.processed] the handler's next offset per partition
+   * @param {Object<string,string>} [input.committed] raw broker committed next offsets
+   * @returns {{ok:boolean, violations:string[], hashes:object}} the verdict with set hashes
+   */
+  static check({ kind, stem, log, offered, resolved, handled, processed, committed }) {
+    const durable = checkLog({ ...log, stem, kind })
+    const violations = [...durable.violations]
+    const hashes = { durable: hashIds(durable.indexes.map(String)) }
+    if (kind === 'producer') {
+      violations.push(...identityViolations(offered ?? [], 'offered'))
+      violations.push(...identityViolations(resolved ?? [], 'resolved'))
+      hashes.offered = hashIds((offered ?? []).map(String))
+      hashes.resolved = hashIds((resolved ?? []).map(String))
+    } else {
+      const entries = handled ?? []
+      violations.push(
+        ...identityViolations(
+          entries.map((e) => e[2]),
+          'handler'
+        )
+      )
+      for (const [partition, offset, index] of entries)
+        if (durable.byOffset.get(`${partition}:${offset}`) !== index)
+          violations.push('a handler entry differs from the raw log at its offset')
+      hashes.handled = hashIds(entries.map((e) => String(e[2])))
+      const keys = new Set([
+        ...Object.keys(log.ends ?? {}),
+        ...Object.keys(processed ?? {}),
+        ...Object.keys(committed ?? {}),
+      ])
+      for (const key of keys) {
+        if (processed?.[key] !== log.ends?.[key])
+          violations.push(`processed end differs from the log end on ${key}`)
+        if (committed?.[key] !== processed?.[key])
+          violations.push(`committed end differs on ${key}`)
+      }
+    }
+    return { ok: violations.length === 0, violations: [...new Set(violations)], hashes }
+  }
+}
+
+/**
+ * Recomputes the share conclusions from archived inputs: the delivered accepted-prefix and
+ * rest-release behaviour. Every offset is accepted exactly once at the broker and publicly; releases
+ * may precede the accept and are the only reason for a second delivery; no accepted work is
+ * delivered again; and at every public close each offset still unsettled ends in the decision its
+ * handler progress demands. Fetch status and acknowledgement status stay separate facts.
+ */
+class ShareOracle {
+  /**
+   * @param {object} input archived share inputs
+   * @param {string} input.stem run prefix @param {object} input.log `logInputs` output
+   * @param {string} input.topicId the corpus topic's ID
+   * @param {number[][]} input.handled `[partition, offset, index, enteredAt, exitedAt]`
+   * @param {object[]} input.acquisitions raw acquired ranges of successful fetch partitions
+   * @param {object[]} input.settlements broker-confirmed acknowledgement ranges, type 1/2/3
+   * @param {object[]} input.settled public acknowledge events with their time
+   * @param {Array<{at:number,end:number}>} input.closures captured public close boundaries
+   * @returns {{ok:boolean, violations:string[], hashes:object}} the verdict with set hashes
+   */
+  static check({ stem, log, topicId, handled, acquisitions, settlements, settled, closures }) {
+    const durable = checkLog({ ...log, stem, kind: 'shareConsumer' })
+    const violations = [...durable.violations]
+    const offsets = [...durable.byOffset.keys()]
+    const each = (ranges, work) => {
+      for (const range of ranges) {
+        let count = 0
+        for (let n = BigInt(range.firstOffset); n <= BigInt(range.lastOffset); n++) {
+          if (++count > CORPUS.records) throw new Error('Unbounded share range')
+          work(`${range.partition}:${n}`, range)
+        }
+      }
+    }
+    const acquired = new Map()
+    const accepted = new Map()
+    const released = new Map()
+    const decided = new Map()
+    const publics = new Map()
+    const push = (map, key, value) => map.set(key, [...(map.get(key) ?? []), value])
+    each(acquisitions, (key, r) => {
+      if (r.topicId !== topicId) violations.push('an acquisition names a foreign topic')
+      push(acquired, key, r)
+    })
+    each(settlements, (key, r) => {
+      if (r.topicId !== topicId) violations.push('a settlement names a foreign topic')
+      if (r.errorCode !== 0) violations.push('a failed acknowledgement counted as a settlement')
+      push(decided, key, r)
+      if (r.type === 1) push(accepted, key, r)
+      else if (r.type === 2) push(released, key, r)
+      else violations.push('an offset was rejected or settled with an unknown type')
+    })
+    each(
+      settled.filter((r) => ['accept', 'release'].includes(r.type)),
+      (key, r) => {
+        if (r.error !== null) violations.push('a public acknowledgement carried an error')
+        push(publics, key, r)
+      }
+    )
+    const entries = new Map()
+    for (const [partition, offset, index, enteredAt, exitedAt] of handled)
+      push(entries, `${partition}:${offset}`, { index, enteredAt, exitedAt })
+    for (const key of offsets) {
+      const deliveries = (acquired.get(key) ?? []).sort((a, b) => a.at - b.at)
+      const decisions = (decided.get(key) ?? []).sort((a, b) => a.at - b.at)
+      const accepts = accepted.get(key) ?? []
+      const releases = released.get(key) ?? []
+      const events = publics.get(key) ?? []
+      const seen = entries.get(key) ?? []
+      if (accepts.length !== 1) violations.push('an offset lacks exactly one broker accept')
+      if (decisions.length && decisions.at(-1).type !== 1)
+        violations.push('an offset was settled again after its accept')
+      if (deliveries.length !== 1 + releases.length)
+        violations.push('deliveries differ from one plus the releases')
+      deliveries.forEach((r, position) => {
+        if (r.deliveryCount !== position + 1) violations.push('a delivery count is not sequential')
+      })
+      if (events.filter((e) => e.type === 'accept').length !== 1)
+        violations.push('an offset lacks exactly one public accept')
+      if (events.filter((e) => e.type === 'release').length !== releases.length)
+        violations.push('public releases differ from broker releases')
+      if (!seen.length || seen.length > 1 + releases.length)
+        violations.push('handler entries differ from one plus the releases')
+      if (accepts.length === 1 && seen.some((e) => e.enteredAt > accepts[0].at))
+        violations.push('accepted work was delivered again')
+      for (const closure of closures) {
+        const first = decisions.find((d) => d.at > closure.at)
+        if (!first || !deliveries.some((d) => d.at <= closure.end)) continue
+        const entered = seen.filter((e) => e.enteredAt <= closure.end)
+        const prefix =
+          entered.length > 0 &&
+          entered.every((e) => e.exitedAt !== null && e.exitedAt <= closure.end)
+        if (decisions.some((d) => d.at <= closure.at)) continue
+        if (first.at > closure.end) violations.push('an offset was unsettled when its close ended')
+        else if (first.type !== (prefix ? 1 : 2))
+          violations.push('the close did not accept the handled prefix and release the rest')
+      }
+    }
+    return {
+      ok: violations.length === 0,
+      violations: [...new Set(violations)],
+      hashes: {
+        durable: hashIds(durable.indexes.map(String)),
+        handled: hashIds(handled.map((e) => `${e[0]}:${e[1]}:${e[2]}`)),
+      },
+    }
+  }
+}
+
+/**
+ * The classifying socket factory of one worker. Every socket is a chaos socket over the socket of
+ * the observer segment the owner has selected. The first request frame of API 71 or 72 marks that
+ * very socket as the telemetry transport; one such open socket can be retired, leaving core sockets
+ * untouched. A closed socket is released at once, so only scalar facts outlive it.
+ */
+class TelemetryTap {
+  /**
+   * @param {TelemetrySegments} segments the owner whose selected segment receives every socket
+   * @param {{share?:ShareLedger, clock?:{now:function():number}}} [options] a ledger that also
+   *   wraps every socket of a share consumer
+   */
+  constructor(segments, { share = null, clock = { now: () => performance.now() } } = {}) {
+    const chaos = createChaosSocketFactory((options) => segments.socketFactory(options))
+    this.segments = segments
+    this.share = share
+    this.clock = clock
+    this.records = []
+    this.factory = (options) => this.track(chaos(options), segments.current())
+  }
+
+  /**
+   * @param {object} socket the chaos socket just issued @param {object} segment the segment whose
+   *   observer received it @returns {object} the same socket, classified
+   */
+  track(socket, segment) {
+    const record = {
+      segment: segment.id,
+      ordinal: segment.observer.socketOwnership().length,
+      socket,
+      telemetry: false,
+      closed: false,
+      closedAt: null,
+    }
+    const classifier = new FrameFilter({
+      headerBytes: 12,
+      decide: (header) => {
+        if (header.length >= 12 && [71, 72].includes(header.readInt16BE(4))) {
+          record.telemetry = true
+          if (record.armed) record.hit = true
+        }
+        return false
+      },
+    })
+    const write = socket.write
+    const tap = this
+    socket.write = function (data, encoding) {
+      classifier.push(Buffer.from(data, encoding))
+      const result = write.call(this, data, encoding)
+      if (record.armed && record.hit) {
+        record.armed = false
+        record.hit = false
+        const at = tap.clock.now()
+        this.destroy(new Error('telemetry transport retired'))
+        record.faulted(at)
+      }
+      return result
+    }
+    record.restore = () => {
+      delete socket.write
+    }
+    if (this.share) this.share.wrap(socket)
+    socket.on('close', () => {
+      record.closed = true
+      record.closedAt = this.clock.now()
+      record.restore?.()
+      record.restore = null
+      record.socket = null
+    })
+    this.records.push(record)
+    return socket
+  }
+
+  /** @returns {object[]} open sockets proven by an actual 71/72 frame to be the telemetry transport */
+  telemetry() {
+    return this.records.filter((r) => r.telemetry && !r.closed)
+  }
+
+  /** @returns {number} how many sockets are still open, of any kind */
+  open() {
+    return this.records.filter((r) => !r.closed).length
+  }
+
+  /**
+   * Declares the one captured telemetry socket as faulted and destroys it right after the next
+   * telemetry request it carries is written, so exactly one exchange is cut off. Core sockets are
+   * never a target.
+   * @returns {{segment:string, ordinal:number, declaredAt:number, hit:Promise<number>}} what was
+   *   declared; `hit` resolves with the time the socket was destroyed
+   * @throws {Error} unless exactly one telemetry socket is open in the selected segment
+   */
+  retire() {
+    const open = this.telemetry()
+    const current = this.segments.current()
+    if (open.length !== 1 || open[0].segment !== current.id)
+      throw new Error('Expected exactly one open telemetry socket in the selected segment')
+    const [target] = open
+    const hit = new Promise((resolve) => {
+      target.faulted = resolve
+    })
+    const declaredAt = this.clock.now()
+    current.observer.declareFault(target.ordinal)
+    target.hit = false
+    target.armed = true
+    return { segment: target.segment, ordinal: target.ordinal, declaredAt, hit }
+  }
+
+  /** @returns {void} removes every classifier patch still installed */
+  restore() {
+    for (const record of this.records) {
+      record.restore?.()
+      record.restore = null
+    }
+  }
+}
+
+/**
+ * The share consumer's raw acknowledgement facts, read by the existing independent readers one
+ * completed exchange at a time so the trace never grows with the corpus. What is kept is what the
+ * readers derive: acquired ranges of successful fetch partitions with their delivery counts, and
+ * broker-confirmed acknowledgement ranges, each with its response time; plus the public
+ * acknowledge events and the handler progress the caller records. Fetch status and acknowledgement
+ * status are separate facts.
+ */
+class ShareLedger {
+  /**
+   * @param {object} options
+   * @param {string} options.group the share group @param {{now:function():number}} options.clock
+   */
+  constructor({ group, clock }) {
+    this.group = group
+    this.clock = clock
+    this.trace = new ShareTrace()
+    this.acquisitions = []
+    this.settlements = []
+    this.settled = []
+    this.frames = 0
+    this.failures = []
+  }
+
+  /**
+   * @param {object} socket one socket of the share consumer @returns {object} the same socket
+   */
+  wrap(socket) {
+    return this.trace.wrap(socket)
+  }
+
+  /**
+   * Reads every completed exchange and forgets its frames.
+   * @returns {void} @throws {Error} for a capture failure or an unreadable acknowledgement frame
+   */
+  drain() {
+    if (this.trace.failures.length) throw new Error(this.trace.failures[0])
+    const done = this.trace.frames.filter((frame) => frame.responseHex)
+    this.trace.frames = this.trace.frames.filter((frame) => !frame.responseHex)
+    for (const frame of done) {
+      this.frames += 1
+      this.acquisitions.push(...heldAcquisitions([frame], this.group))
+      this.settlements.push(...compactRuns(confirmedDecisions([frame], this.group)))
+    }
+  }
+
+  /**
+   * @param {object} event a public acknowledge event @returns {void} retained with its time
+   */
+  record(event) {
+    this.settled.push({
+      topic: event.payload.topic,
+      partition: event.payload.partition,
+      firstOffset: event.payload.firstOffset,
+      lastOffset: event.payload.lastOffset,
+      type: event.payload.type,
+      error: event.payload.error
+        ? { name: event.payload.error.name, reason: event.payload.error.reason }
+        : null,
+      at: this.clock.now(),
+    })
+  }
+
+  /** @returns {object} the archived facts, after a final drain */
+  facts() {
+    this.drain()
+    return {
+      group: this.group,
+      frames: this.frames,
+      acquisitions: this.acquisitions,
+      settlements: this.settlements,
+      settled: this.settled,
+    }
+  }
+}
+
+/**
+ * The ordinary public work of one worker kind, independent of telemetry, confined to the
+ * measurement. The producer offers its finite corpus in fixed slots, one batch per slot; the
+ * consumers only handle what the parent offers. Admission is paused, in-flight work finished and
+ * commits confirmed before a public close, and resumed only after the reconnect. Every identity
+ * offered, resolved, handled and committed is kept as an independent ledger.
+ */
+class OrdinaryWork {
+  /**
+   * @param {object} options
+   * @param {string} options.kind the client kind @param {object} options.client the target client
+   * @param {string} options.stem run prefix @param {string} options.topic the corpus topic
+   * @param {string} options.ctl the control topic for work that is not corpus
+   * @param {{now:()=>number}} options.clock monotonic time
+   * @param {(ms:number)=>Promise<void>} [options.sleep] real delay
+   * @param {ShareLedger} [options.ledger] the share ledger of a share consumer
+   * @param {number[]} [options.slots] producer batch slots, in ms after the corpus start
+   */
+  constructor({ kind, client, stem, topic, ctl, clock, sleep = wait, ledger = null, slots = [] }) {
+    Object.assign(this, { kind, client, stem, topic, ctl, clock, sleep, ledger, slots })
+    this.running = false
+    this.paused = false
+    this.loop = null
+    this.inflight = null
+    this.active = 0
+    this.lastExit = -Infinity
+    this.offered = []
+    this.resolved = []
+    this.handled = []
+    this.processed = new Map()
+    this.committed = new Map()
+    this.commits = []
+    this.pauses = []
+    this.late = []
+    this.failures = []
+    this.listening = false
+  }
+
+  /**
+   * @returns {Promise<void>} subscribes and runs the consuming kinds, again after each reopen
+   * @throws {Error} a refusal of subscribe or run
+   */
+  async attach() {
+    const handle = async ({ partition, message }) => {
+      this.active += 1
+      const entry = [
+        partition,
+        Number(message.offset),
+        indexOf(String(message.key)),
+        this.clock.now(),
+        null,
+      ]
+      this.handled.push(entry)
+      if (this.kind === 'consumer')
+        this.processed.set(String(partition), String(BigInt(message.offset) + 1n))
+      entry[4] = this.clock.now()
+      this.lastExit = entry[4]
+      this.active -= 1
+    }
+    if (this.kind === 'shareConsumer') {
+      if (!this.listening) {
+        this.client.on(this.client.events.ACKNOWLEDGE, (event) => {
+          this.ledger.record(event)
+          this.ledger.drain()
+        })
+        this.client.on(this.client.events.FETCH, () => this.ledger.drain())
+        this.listening = true
+      }
+      await this.client.subscribe({ topics: [this.topic] })
+      await this.client.run({ eachMessage: handle })
+    } else {
+      await this.client.subscribe({ topic: this.topic, fromBeginning: true })
+      await this.client.run({ autoCommit: false, eachMessage: handle })
+    }
+  }
+
+  /**
+   * Begins the kind's idle work: the consumers attach, the admin starts its paced describes.
+   * @returns {Promise<void>} after the first attach
+   */
+  async start() {
+    this.running = true
+    if (this.kind === 'consumer' || this.kind === 'shareConsumer') await this.attach()
+    if (this.kind === 'admin') {
+      this.loop = this.poll()
+      this.loop.catch(() => {})
+    }
+  }
+
+  /**
+   * Starts the measured corpus: only the producer offers records here.
+   * @returns {void}
+   */
+  corpus() {
+    if (this.kind !== 'producer' || this.loop) return
+    this.loop = this.pace()
+    this.loop.catch(() => {})
+  }
+
+  /** @returns {Promise<void>} the admin's paced metadata requests until `stop` */
+  async poll() {
+    while (this.running) {
+      if (!this.paused) {
+        this.inflight = this.client.describeCluster({ timeout: 3000 })
+        try {
+          await this.inflight
+        } catch (error) {
+          this.failures.push(error)
+          this.running = false
+          return
+        }
+      }
+      await this.sleep(CORPUS.batchMs)
+    }
+  }
+
+  /**
+   * Offers the corpus batch by batch, each no earlier than its fixed slot and none while paused.
+   * A batch the pause delayed is sent as soon as admission resumes, one batch at a time.
+   * @returns {Promise<void>} after the last batch or at `stop`
+   */
+  async pace() {
+    const start = this.clock.now()
+    for (let batch = 0; batch < this.slots.length && this.running; batch++) {
+      const due = start + (this.slots[batch] - this.slots[0])
+      while (this.running && (this.clock.now() < due || this.paused))
+        await this.sleep(Math.min(100, Math.max(1, due - this.clock.now())))
+      if (!this.running) return
+      const ids = Array.from({ length: CORPUS.batch }, (_, i) => batch * CORPUS.batch + i)
+      this.late.push(Math.max(0, this.clock.now() - due))
+      this.offered.push(...ids)
+      this.inflight = this.client.send({
+        topic: this.topic,
+        acks: -1,
+        messages: ids.map((i) => {
+          const id = recordId(this.stem, 'producer', i)
+          return { key: id, value: valueOf(id) }
+        }),
+      })
+      try {
+        await this.inflight
+      } catch (error) {
+        this.failures.push(error)
+        this.running = false
+        return
+      }
+      this.resolved.push(...ids)
+    }
+  }
+
+  /**
+   * Work that is not corpus, used while a telemetry socket is faulted: it must still succeed.
+   * @param {number} n a unique number for this call
+   * @returns {Promise<void>} after the kind's own ordinary operation, if it has one
+   */
+  async core(n) {
+    if (this.kind === 'admin') await this.client.describeCluster({ timeout: 3000 })
+    else if (this.kind === 'producer')
+      await this.client.send({
+        topic: this.ctl,
+        acks: -1,
+        messages: [{ key: `${this.stem}:core:${n}`, value: Buffer.from('core') }],
+      })
+  }
+
+  /** @returns {Promise<void>} commits the processed next offsets of the classic consumer */
+  async commit() {
+    const offsets = [...this.processed]
+      .filter(([partition, offset]) => this.committed.get(partition) !== offset)
+      .map(([partition, offset]) => ({
+        topic: this.topic,
+        partition: Number(partition),
+        offset,
+      }))
+    if (!offsets.length) return
+    await this.client.commitOffsets(offsets)
+    for (const { partition, offset } of offsets) this.committed.set(String(partition), offset)
+    this.commits.push({ at: this.clock.now(), count: offsets.length })
+  }
+
+  /**
+   * Pauses admission, finishes in-flight work and confirms every commit, ahead of a public close.
+   * @returns {Promise<{pausedAt:number, idleAt:number, confirmedAt:number}>} the barrier's receipt
+   * @throws {Error} a failure of in-flight work or of the commit, or work that does not go idle
+   */
+  async pause() {
+    const receipt = { pausedAt: this.clock.now(), idleAt: null, confirmedAt: null }
+    this.paused = true
+    if (this.inflight) await this.inflight
+    if (this.kind === 'consumer') {
+      await this.client.pause([{ topic: this.topic }])
+      const deadline = this.clock.now() + 8000
+      while (this.active > 0 || this.clock.now() - this.lastExit < 200) {
+        if (this.clock.now() > deadline) throw new Error('The consumer handler did not go idle')
+        await this.sleep(50)
+      }
+      receipt.idleAt = this.clock.now()
+      await this.commit()
+      receipt.confirmedAt = this.clock.now()
+    } else {
+      receipt.idleAt = this.clock.now()
+      receipt.confirmedAt = receipt.idleAt
+    }
+    this.pauses.push(receipt)
+    return receipt
+  }
+
+  /**
+   * Resumes admission after the reconnect; a consuming kind runs again on the reconnected object.
+   * @returns {Promise<void>} when admission is open again
+   */
+  async resume() {
+    if (this.running && (this.kind === 'consumer' || this.kind === 'shareConsumer'))
+      await this.attach()
+    if (this.kind === 'consumer') await this.client.resume([{ topic: this.topic }])
+    this.paused = false
+  }
+
+  /**
+   * Stops admission, joins the loop and, for a consuming kind, waits until the whole corpus was
+   * handled before confirming the last commit.
+   * @param {number} ms how long the consumer may take to finish the corpus
+   * @returns {Promise<void>} @throws {Error} the first ordinary failure, or an incomplete corpus
+   */
+  async stop(ms = 40000) {
+    if (this.loop && this.kind === 'producer') await this.loop
+    this.running = false
+    if (this.loop) await this.loop
+    if (this.failures.length) throw this.failures[0]
+    if (this.kind === 'consumer' || this.kind === 'shareConsumer') {
+      const deadline = this.clock.now() + ms
+      while (
+        new Set(this.handled.map((e) => e[2])).size < CORPUS.records &&
+        this.clock.now() < deadline
+      )
+        await this.sleep(200)
+      if (new Set(this.handled.map((e) => e[2])).size < CORPUS.records)
+        throw new Error('The corpus was not fully handled before the close')
+      if (this.kind === 'consumer') await this.commit()
+    }
+  }
+
+  /**
+   * @returns {object} the archived identity ledgers of this worker: offered and resolved positions,
+   *   every handler entry, processed and committed ends, commit and pause receipts
+   */
+  ids() {
+    return {
+      kind: this.kind,
+      offered: this.offered,
+      resolved: this.resolved,
+      handled: this.handled,
+      processed: Object.fromEntries(this.processed),
+      committed: Object.fromEntries(this.committed),
+      commits: this.commits,
+      pauses: this.pauses,
+      late: this.late,
+    }
+  }
+}
+
+/**
+ * The parent's own telemetry-disabled clients: the topics, the broker resource, the paced
+ * producer of the consumer and share corpora, and the independent raw-log and offset readers.
+ */
+class ParentFixture {
+  /**
+   * @param {object} options
+   * @param {string[]} options.brokers seed addresses @param {string} options.stem run prefix
+   * @param {object} options.kafka a `Kafka` whose clients opt out of telemetry
+   * @param {Function} options.readLog the raw log reader @param {Function} options.withResource
+   *   the owner of one initially absent broker resource
+   * @param {{now:function():number}} [options.clock] monotonic time for the rows
+   */
+  constructor({
+    brokers,
+    stem,
+    kafka,
+    readLog,
+    withResource,
+    clock = { now: () => performance.now() },
+  }) {
+    Object.assign(this, { brokers, stem, kafka, readLog, withResource, clock })
+    this.admin = kafka.admin({ enableMetricsPush: false })
+    this.producer = kafka.producer({ enableMetricsPush: false, idempotent: true })
+    this.rotationEntries = { 'interval.ms': '1000', match: `client_id=^${stem}-` }
+  }
+
+  /** @param {string} kind the client kind @returns {string} its corpus topic */
+  topic(kind) {
+    return `${this.stem}-${labelOf(kind)}`
+  }
+
+  /** @param {string} kind @returns {string} its consumer group */
+  group(kind) {
+    return `${this.stem}-${labelOf(kind)}-group`
+  }
+
+  /** @returns {string} the topic of work that is not corpus: control and core probes */
+  get ctl() {
+    return `${this.stem}-ctl`
+  }
+
+  /** @returns {Promise<void>} connects and creates the corpus and control topics, 3 partitions RF3 */
+  async open() {
+    await this.admin.connect()
+    await this.producer.connect()
+    await this.admin.createTopics({
+      waitForLeaders: true,
+      topics: [
+        this.topic('producer'),
+        this.topic('consumer'),
+        this.topic('shareConsumer'),
+        this.ctl,
+      ].map((topic) => ({
+        topic,
+        numPartitions: 3,
+        replicationFactor: 3,
+        configEntries: [{ name: 'min.insync.replicas', value: '2' }],
+      })),
+    })
+  }
+
+  /**
+   * @param {function():Promise<void>} work runs while the resource exists
+   * @returns {Promise<void>} after the resource was created, read back, and deleted again
+   */
+  inResource(work) {
+    return this.withResource(
+      this.admin,
+      { name: this.stem, entries: { metrics: INITIAL_SELECTION, ...this.rotationEntries } },
+      work
+    )
+  }
+
+  /**
+   * Sets the next subscription value, checks the set succeeded and reads the resource back.
+   * @param {number} index the 10 s transition number, from 1 @param {string} metrics the new value
+   * @returns {Promise<{index:number, selection:string, setAt:number, readbackAt:number,
+   *   readback:string}>} the transition row, times on this process's monotonic clock
+   * @throws {Error} when the set or the readback is not exactly what was asked
+   */
+  async rotate(index, metrics) {
+    const resource = { type: 16, name: this.stem }
+    const set = await this.admin.incrementalAlterConfigs({
+      timeout: 3000,
+      resources: [
+        { ...resource, configEntries: [{ name: 'metrics', operation: 0, value: metrics }] },
+      ],
+    })
+    const setAt = this.clock.now()
+    const rows = set?.resources
+    if (!Array.isArray(rows) || rows.length !== 1 || rows[0].errorCode !== 0)
+      throw new Error('The subscription set was not accepted')
+    const read = await this.admin.describeConfigs({
+      timeout: 3000,
+      resources: [{ ...resource, configNames: ['metrics', 'interval.ms', 'match'] }],
+    })
+    const entries = Object.fromEntries(
+      read.resources[0].configEntries.map((e) => [e.configName, e.configValue])
+    )
+    const readbackAt = this.clock.now()
+    if (
+      (entries.metrics ?? '') !== metrics ||
+      entries['interval.ms'] !== this.rotationEntries['interval.ms'] ||
+      entries.match !== this.rotationEntries.match
+    )
+      throw new Error('The subscription readback differs')
+    return { index, selection: metrics, setAt, readbackAt, readback: entries.metrics ?? '' }
+  }
+
+  /**
+   * Produces records `from`..`from + count` of one parent-owned corpus.
+   * @param {string} kind consumer or shareConsumer @param {number} from first position
+   * @param {number} count how many @returns {Promise<number[]>} the produced positions
+   */
+  async produce(kind, from, count) {
+    const ids = Array.from({ length: count }, (_, i) => from + i)
+    await this.producer.send({
+      topic: this.topic(kind),
+      acks: -1,
+      messages: ids.map((i) => {
+        const id = recordId(this.stem, kind, i)
+        return { key: id, value: valueOf(id) }
+      }),
+    })
+    return ids
+  }
+
+  /** @param {string} kind @returns {Promise<object>} `logInputs` of the topic's raw log */
+  async durable(kind) {
+    const log = await this.readLog({ brokers: this.brokers, topic: this.topic(kind) })
+    return logInputs(log, this.stem, kind)
+  }
+
+  /** @returns {Promise<Object<string,string>>} the group's committed next offsets, unresolved */
+  async committed() {
+    const answer = await this.admin.fetchOffsets({
+      groupId: this.group('consumer'),
+      topics: [this.topic('consumer')],
+      resolveOffsets: false,
+    })
+    return Object.fromEntries(
+      answer.flatMap(({ partitions }) =>
+        partitions.map((p) => [String(p.partition), String(p.offset)])
+      )
+    )
+  }
+
+  /** @returns {Promise<string>} the topic ID of the share corpus topic, from public metadata */
+  async topicId() {
+    const found = await this.admin.fetchTopicMetadata({ topics: [this.topic('shareConsumer')] })
+    const topic = found.topics.find((t) => t.name === this.topic('shareConsumer'))
+    if (!topic?.topicId) throw new Error('The share topic has no topic ID')
+    return topic.topicId
+  }
+
+  /** @returns {Promise<void>} disconnects every client the fixture opened */
+  async close() {
+    const outcomes = await Promise.allSettled([this.producer.disconnect(), this.admin.disconnect()])
+    const errors = outcomes.filter((o) => o.status === 'rejected').map((o) => o.reason)
+    if (errors.length) throw new AggregateError(errors, 'Fixture cleanup failed')
+  }
+}
+
+/**
+ * The parent's independent decoding of the workers' selected Pushes. A worker forwards bounded raw
+ * input and receives the real pinned Java result; the parent keeps the real receipts, outside any
+ * target worker's memory, and reduces them to the facts a replay joins by raw hash and broker line.
+ */
+class DecoderCoordinator {
+  /**
+   * @param {object} options
+   * @param {string} options.directory absolute run directory @param {string} options.line broker line
+   * @param {{now:function():number}} options.clock monotonic time
+   * @param {object} [options.env] environment of the decoder child
+   * @param {DecoderGate} [options.gate] the concurrency limiter, four by default
+   * @param {Function} [options.make] builds the observer; a spec supplies a fake
+   */
+  constructor({
+    directory,
+    line,
+    clock,
+    env = process.env,
+    gate = new DecoderGate(DECODER_SLOTS),
+    make = (options) => new TelemetryWireObserver(options),
+  }) {
+    this.observer = make({
+      directory,
+      line,
+      clock,
+      mode: 'configured',
+      owner: 'parent-decoder',
+      gate,
+      env,
+    })
+    this.calls = []
+    this.closed = null
+  }
+
+  /**
+   * @param {string} kind the worker that asked @param {string} rawB64 the raw MetricsData, base64
+   * @returns {Promise<object>} the pinned Java decode of exactly those bytes
+   * @throws {Error} for oversized input or any decoder failure
+   */
+  async decode(kind, rawB64) {
+    const raw = Buffer.from(rawB64, 'base64')
+    if (raw.length === 0 || raw.length > 4096) throw new Error('Decoder input is outside its bound')
+    this.calls.push({ kind, rawSha256: sha(raw), bytes: raw.length })
+    return this.observer.decodeRaw(raw, { budgetMs: DECODE_BUDGET_MS })
+  }
+
+  /**
+   * Joins the decoder children and reduces their receipts. Calling it again returns the first result.
+   * @returns {Promise<{receipts:object[], calls:object[]}>} one compact receipt per decoder child
+   * @throws {Error} when the observer is not clean
+   */
+  close() {
+    this.closed ??= (async () => {
+      await this.observer.dispose()
+      this.observer.assertClean()
+      const receipts = fs
+        .readdirSync(this.observer.directory)
+        .filter((name) => /^decoder-\d+\.json$/.test(name))
+        .map((name) => {
+          const receipt = JSON.parse(fs.readFileSync(`${this.observer.directory}/${name}`, 'utf8'))
+          const [identity, body] = String(receipt.stdout ?? '')
+            .trim()
+            .split('\n')
+          return {
+            pid: Number(/\d+/.exec(name)[0]),
+            code: receipt.code,
+            signal: receipt.signal ?? null,
+            line: receipt.line,
+            rawSha256: receipt.rawSha256,
+            identity: identity ? JSON.parse(identity) : null,
+            bodySha256: body ? sha(JSON.stringify(JSON.parse(body))) : null,
+            stderrBytes: Buffer.byteLength(receipt.stderr ?? ''),
+          }
+        })
+        .sort((a, b) => a.pid - b.pid)
+      return { receipts, calls: this.calls }
+    })()
+    return this.closed
+  }
+}
+
+/**
+ * Supervises the four worker processes: one forked driver per kind, a fixed handshake and message
+ * catalogue, bounded output, and a natural-exit observation that starts at the one explicit-
+ * disconnect receipt. A violation of the catalogue, a duplicate, a substituted or oversized
+ * message fails the worker instead of being ignored or clipped.
  */
 class TelemetryProcesses {
   /**
@@ -566,9 +1565,18 @@ class TelemetryProcesses {
    * @param {Function} [options.spawn] the fork function; a spec supplies a fake
    * @param {Function} [options.now] a monotonic millisecond clock
    * @param {string[]} [options.args] the driver arguments
+   * @param {(kind:string, error:Error)=>void} [options.onFailure] told once per failed worker
+   * @param {(kind:string, message:object)=>void} [options.onDecode] serves a worker's decode request
    */
-  constructor({ script, spawn = fork, now = () => performance.now(), args = [] }) {
-    Object.assign(this, { script, spawn, now, args })
+  constructor({
+    script,
+    spawn = fork,
+    now = () => performance.now(),
+    args = [],
+    onFailure = () => {},
+    onDecode = () => {},
+  }) {
+    Object.assign(this, { script, spawn, now, args, onFailure, onDecode })
     this.workers = new Map()
   }
 
@@ -593,66 +1601,111 @@ class TelemetryProcesses {
       token,
       child,
       messages: [],
+      counts: new Map(),
+      bytes: 0,
       stderr: '',
       stdout: '',
+      stdoutBytes: 0,
       receiptAt: null,
       exit: null,
+      error: null,
+      tainted: false,
       waiters: [],
     }
-    child.stdout?.on('data', (chunk) => {
-      if (worker.stdout.length < MAX_STDERR) worker.stdout += chunk
-    })
-    child.stderr?.on('data', (chunk) => {
-      if (worker.stderr.length < MAX_STDERR) worker.stderr += chunk
-    })
+    const capture = (name) => (chunk) => {
+      const size = Buffer.byteLength(chunk)
+      worker[`${name}Bytes`] = (worker[`${name}Bytes`] ?? 0) + size
+      if (worker[`${name}Bytes`] > MAX_STDERR)
+        this.fail(worker, new Error(`Worker ${name} overflow`))
+      else worker[name] += chunk
+    }
+    worker.stderrBytes = 0
+    child.stdout?.on('data', capture('stdout'))
+    child.stderr?.on('data', capture('stderr'))
     child.on('message', (message) => this.receive(kind, message))
     worker.closed = new Promise((resolve) => {
       child.once('close', (code, signal) => {
         worker.exit = { event: 'close', code, signal, closedAt: this.now() }
+        if (!worker.messages.some((m) => m.type === 'result') && !worker.tainted)
+          this.fail(worker, new Error(`Telemetry worker ${kind} exited before its result`))
+        this.wake(worker)
         resolve(worker.exit)
       })
     })
-    child.once('error', (error) => {
-      worker.error = error
-    })
+    child.once('error', (error) => this.fail(worker, error))
     this.workers.set(kind, worker)
     return worker
   }
 
   /**
-   * Accepts one IPC message from a worker, validating its handshake and wake-ups.
+   * @param {object} worker the supervised record @param {Error} error its first failure
+   * @returns {void} retained once and reported to the owner
+   */
+  fail(worker, error) {
+    if (worker.error) return
+    worker.error = error
+    this.wake(worker)
+    this.onFailure(worker.kind, error)
+  }
+
+  /** @param {object} worker the supervised record @returns {void} wakes every waiter */
+  wake(worker) {
+    for (const wake of worker.waiters.splice(0)) wake()
+  }
+
+  /**
+   * Accepts one IPC message from a worker. Only the fixed catalogue is accepted: each of hello,
+   * ready, phase, result and receipt at most once, every message bound to the handshake token, and
+   * every message and the total within their byte bounds.
    * @param {string} kind the sending worker @param {object} message the message
    * @returns {void}
    */
   receive(kind, message) {
     const worker = this.workers.get(kind)
-    if (!worker || typeof message !== 'object' || message === null) return
-    if (message.type === 'hello' && (message.kind !== kind || message.token !== worker.token)) {
-      worker.error = new Error(`Substituted telemetry worker handshake for ${kind}`)
+    if (!worker || worker.error) return
+    const bad = (why) => this.fail(worker, new Error(`Telemetry worker ${kind}: ${why}`))
+    if (typeof message !== 'object' || message === null) return bad('a non-object message')
+    if (!MESSAGE_TYPES.worker.includes(message.type)) return bad(`unknown message ${message.type}`)
+    if (message.kind !== kind || message.token !== worker.token)
+      return bad('a substituted handshake or message')
+    const size = Buffer.byteLength(JSON.stringify(message))
+    worker.bytes += size
+    if (size > MESSAGE_BYTES || worker.bytes > TOTAL_BYTES) return bad('IPC overflow')
+    const seen = (worker.counts.get(message.type) ?? 0) + 1
+    worker.counts.set(message.type, seen)
+    if (MESSAGE_TYPES.once.includes(message.type) && seen > 1)
+      return bad(`a duplicate ${message.type}`)
+    if (message.type !== 'hello' && !worker.counts.has('hello'))
+      return bad('a message before hello')
+    if (message.type === 'receipt') worker.receiptAt = this.now()
+    if (message.type === 'decode') {
+      this.onDecode(kind, message)
       return
     }
-    if (message.type === 'receipt') worker.receiptAt = this.now()
-    worker.messages.push(message)
-    for (const wake of worker.waiters.splice(0)) wake()
+    worker.messages.push({ ...message, parentAt: this.now() })
+    if (message.type === 'failure')
+      this.fail(worker, new Error(`Telemetry worker ${kind} failed: ${message.message}`))
+    if (message.type === 'unhandled')
+      this.fail(worker, new Error(`Telemetry worker ${kind} had an unhandled rejection`))
+    this.wake(worker)
   }
 
   /**
-   * @param {string} kind the worker @param {string} type the message type to wait for
-   * @param {number} ms bound @returns {Promise<object>} the first such message
-   * @throws {Error} on timeout, a handshake failure or an early exit
+   * @param {string} kind the worker @param {function(object):boolean} match which message
+   * @param {number} ms bound @param {string} label what is awaited
+   * @returns {Promise<object>} the first matching message
+   * @throws {Error} on timeout, a protocol failure or an early exit
    */
-  async message(kind, type, ms) {
+  async until(kind, match, ms, label) {
     const worker = this.workers.get(kind)
     const deadline = this.now() + ms
     for (;;) {
       if (worker.error) throw worker.error
-      const found = worker.messages.find((m) => m.type === type)
+      const found = worker.messages.find(match)
       if (found) return found
-      const failed = worker.messages.find((m) => m.type === 'failure')
-      if (failed) throw new Error(`Telemetry worker ${kind} failed: ${failed.message}`)
-      if (worker.exit) throw new Error(`Telemetry worker ${kind} exited before ${type}`)
+      if (worker.exit) throw new Error(`Telemetry worker ${kind} exited before ${label}`)
       const left = deadline - this.now()
-      if (left <= 0) throw new Error(`Telemetry worker ${kind} sent no ${type} within ${ms} ms`)
+      if (left <= 0) throw new Error(`Telemetry worker ${kind} sent no ${label} within ${ms} ms`)
       await new Promise((resolve) => {
         worker.waiters.push(resolve)
         setTimeout(resolve, Math.min(left, 250)).unref?.()
@@ -661,7 +1714,26 @@ class TelemetryProcesses {
   }
 
   /**
-   * Waits for the natural close of one worker and reports the facts the acceptance needs.
+   * @param {string} kind the worker @param {string} type the message type to wait for
+   * @param {number} ms bound @returns {Promise<object>} the first such message
+   */
+  message(kind, type, ms) {
+    return this.until(kind, (m) => m.type === type, ms, type)
+  }
+
+  /**
+   * @param {string} kind the worker @param {object} message the parent message to deliver
+   * @returns {void} @throws {Error} when the worker is gone
+   */
+  send(kind, message) {
+    const worker = this.workers.get(kind)
+    if (!worker || worker.exit || worker.error) throw new Error(`Telemetry worker ${kind} is gone`)
+    worker.child.send(message)
+  }
+
+  /**
+   * Waits for the natural close of one worker and reports the facts the acceptance needs, all of
+   * them raw so a replay recomputes the interval itself.
    * @param {string} kind the worker @param {number} [ms] the bound after the receipt
    * @returns {Promise<object>} the natural-exit row; a timeout is reported, never turned into success
    */
@@ -676,15 +1748,19 @@ class TelemetryProcesses {
     const closed = await Promise.race([worker.closed, timeout])
     clearTimeout(timer)
     const exit = closed ?? { event: 'timeout', code: null, signal: null }
-    const unhandled = worker.messages.filter((m) => m.type === 'unhandled').length
     return {
       kind,
       event: exit.event,
       code: exit.code,
       signal: exit.signal,
       stderrBytes: Buffer.byteLength(worker.stderr),
-      unhandled,
+      stdoutBytes: Buffer.byteLength(worker.stdout),
+      unhandled: worker.messages.filter((m) => m.type === 'unhandled').length,
+      receipts: worker.counts.get('receipt') ?? 0,
       watchdogExpired: closed === null,
+      killed: worker.tainted,
+      receiptAt: receipt,
+      closedAt: exit.closedAt ?? null,
       afterDisconnectMs: receipt === null || !exit.closedAt ? null : exit.closedAt - receipt,
     }
   }
@@ -695,268 +1771,778 @@ class TelemetryProcesses {
    */
   taint(kind) {
     const worker = this.workers.get(kind)
-    if (worker && !worker.exit) worker.child.kill('SIGKILL')
+    if (worker && !worker.exit) {
+      worker.tainted = true
+      worker.child.kill('SIGKILL')
+    }
+  }
+}
+
+/** A FIFO of parent messages that a worker takes by predicate; nothing is dropped. */
+class Inbox {
+  /** Builds an empty inbox. */
+  constructor() {
+    this.items = []
+    this.waiting = []
+  }
+
+  /** @param {object} message a parent message @returns {void} */
+  push(message) {
+    this.items.push(message)
+    this.waiting = this.waiting.filter((take) => !take())
+  }
+
+  /**
+   * @param {function(object):boolean} match which message @returns {Promise<object>} the first one
+   */
+  take(match) {
+    return new Promise((resolve) => {
+      const take = () => {
+        const index = this.items.findIndex(match)
+        if (index < 0) return false
+        resolve(this.items.splice(index, 1)[0])
+        return true
+      }
+      if (!take()) this.waiting.push(take)
+    })
   }
 }
 
 /**
- * The ordinary public work of one worker kind, independent of telemetry. Every kind reports the
- * identities it offered and handled so the parent can compare them with the raw log.
+ * One worker: a single public client of one kind, its retained registry, the observer segments of
+ * its lifecycles, the ordinary work and the parent-coordinated churn, run under the inherited
+ * `Soak` sampler. The parent owns the tick catalogue and sends one command per stage; the worker
+ * executes it with public operations only, claims what proves it and replies with a receipt. It
+ * never closes a client it did not create and never exits the process.
  */
-class OrdinaryWork {
+class TelemetryWorker {
   /**
    * @param {object} options
-   * @param {string} options.kind the client kind
+   * @param {string} options.kind the one target client kind
    * @param {object} options.client the target public client
-   * @param {string} options.stem run prefix @param {string} options.topic the corpus topic
-   * @param {{now:()=>number}} options.clock monotonic time
-   * @param {(ms:number)=>Promise<void>} [options.sleep] real delay
+   * @param {TelemetryTap} options.tap its classifying socket tap
+   * @param {TelemetrySegments} options.segments the owner of its observer segments
+   * @param {Registry} options.registry its retained descriptors
+   * @param {{now: () => number}} options.clock monotonic milliseconds
+   * @param {(ms:number) => Promise<void>} [options.sleep] real delay
+   * @param {OrdinaryWork} options.ordinary kind-specific workload
+   * @param {{warmupMs:number, measureMs:number}} options.limits the fixed window
+   * @param {Inbox} options.inbox the parent's messages @param {function(object):void} options.send
+   *   delivers a message to the parent
+   * @param {function(Function):*} [options.target] runs a public client call under the target role
+   * @param {ShareLedger} [options.ledger] the share ledger of a share consumer
+   * @param {object} [options.schedule] a `TelemetrySchedule`
    */
-  constructor({ kind, client, stem, topic, clock, sleep = wait }) {
-    Object.assign(this, { kind, client, stem, topic, clock, sleep })
-    this.running = false
-    this.loop = null
-    this.offered = []
-    this.handled = []
-    this.processed = new Map()
-    this.committed = new Map()
-    this.inflight = Promise.resolve()
-  }
-
-  /** @returns {Promise<void>} begins this kind's work; the paced loop is joined by `stop` */
-  async start() {
-    this.running = true
-    if (this.kind === 'consumer' || this.kind === 'shareConsumer') await this.attach()
-    this.loop = this.pace()
-    this.loop.catch(() => {})
-  }
-
-  /** @returns {Promise<void>} subscribes and runs the consuming kinds, again after each reopen */
-  async attach() {
-    const handle = async ({ partition, message }) => {
-      this.handled.push(String(message.key))
-      if (this.kind === 'consumer')
-        this.processed.set(partition, String(BigInt(message.offset) + 1n))
+  constructor({
+    kind,
+    client,
+    tap,
+    segments,
+    registry,
+    clock,
+    sleep = wait,
+    ordinary,
+    limits,
+    inbox,
+    send,
+    target = (work) => work(),
+    ledger = null,
+    schedule,
+  }) {
+    Object.assign(this, {
+      kind,
+      client,
+      tap,
+      segments,
+      registry,
+      clock,
+      sleep,
+      ordinary,
+      limits,
+      inbox,
+      send,
+      target,
+      ledger,
+    })
+    this.schedule = schedule ?? new TelemetrySchedule(limits)
+    this.uuid = null
+    this.actions = {
+      warm: { subscription: 0, retire: 0, reopen: 0 },
+      measured: { subscription: 0, retire: 0, reopen: 0 },
     }
-    if (this.kind === 'shareConsumer') {
-      await this.client.subscribe({ topics: [this.topic] })
-      await this.client.run({ eachMessage: handle })
-    } else {
-      await this.client.subscribe({ topic: this.topic, fromBeginning: true })
-      await this.client.run({ autoCommit: false, eachMessage: handle })
+    this.claims = {
+      setup: null,
+      initial: null,
+      reopens: [],
+      retirements: [],
+      transitions: [],
+      proofs: [],
     }
-  }
-
-  /** @returns {Promise<void>} the paced producer or admin loop until `stop` */
-  async pace() {
-    for (let batch = 0; this.running; batch++) {
-      const startedAt = this.clock.now()
-      if (this.kind === 'producer' && batch < CORPUS.records / CORPUS.batch) {
-        const ids = Array.from({ length: CORPUS.batch }, (_, i) =>
-          recordId(this.stem, 'producer', batch * CORPUS.batch + i)
-        )
-        this.inflight = this.client.send({
-          topic: this.topic,
-          acks: -1,
-          messages: ids.map((id) => ({ key: id, value: valueOf(id) })),
-        })
-        await this.inflight
-        this.offered.push(...ids)
-      } else if (this.kind === 'admin') {
-        this.inflight = this.client.describeCluster({ timeout: 3000 })
-        await this.inflight
-      } else if (this.kind === 'consumer') await this.commit()
-      const left = CORPUS.batchMs - (this.clock.now() - startedAt)
-      if (left > 0) await this.sleep(left)
+    this.stages = []
+    this.owed = new Set()
+    this.coreN = 0
+    this.sealing = null
+    this.timing = {
+      phaseAt: null,
+      goAt: null,
+      boundaryAt: null,
+      measurementMs: null,
+      cleanupMs: null,
+      receiptAt: null,
     }
+    /** The supervising Soak, set by the owner before `work` runs. */
+    this.sampler = null
   }
 
-  /** @returns {Promise<void>} commits the processed next offsets of the classic consumer */
-  async commit() {
-    const offsets = [...this.processed]
-      .filter(([partition, offset]) => this.committed.get(partition) !== offset)
-      .map(([partition, offset]) => ({ topic: this.topic, partition, offset }))
-    if (!offsets.length) return
-    await this.client.commitOffsets(offsets)
-    for (const { partition, offset } of offsets) this.committed.set(partition, offset)
-  }
-
-  /** @returns {Promise<void>} finishes in-flight work and confirms every commit before a close */
-  async drain() {
-    await this.inflight.catch(() => {})
-    if (this.kind === 'consumer') await this.commit()
-  }
-
-  /** @returns {Promise<void>} consuming kinds run again on the reconnected object */
-  async resume() {
-    if (this.running && (this.kind === 'consumer' || this.kind === 'shareConsumer'))
-      await this.attach()
-  }
-
-  /** @returns {Promise<void>} stops the loop and joins it, keeping its failure */
-  async stop() {
-    this.running = false
-    if (this.loop) await this.loop
-    await this.drain()
+  /** @returns {object|undefined} the close arguments of this kind; an admin has none */
+  closeOptions() {
+    return this.kind === 'admin' ? undefined : { timeout: 3000 }
   }
 
   /**
-   * @returns {{offered:string[], handled:string[], processed:Object<string,string>,
-   *   committed:Object<string,string>}} the identity sets this worker saw
+   * Polls a lookup until it returns a truthy value.
+   * @param {string} label what is awaited @param {number} ms bound @param {function():*} lookup
+   * @returns {Promise<*>} the truthy result @throws {Error} when the bound passes first
    */
-  ids() {
+  async find(label, ms, lookup) {
+    const deadline = this.clock.now() + ms
+    for (;;) {
+      const found = lookup()
+      if (found) return found
+      if (this.clock.now() > deadline) throw new Error(`${this.kind}: no ${label} within ${ms} ms`)
+      await this.sleep(50)
+    }
+  }
+
+  /**
+   * Registers the descriptors, obtains the UUID in the setup lifecycle, disconnects and leaves the
+   * client disconnected with exactly that state retained, the next lifecycle's segment selected and
+   * the setup segment sealed.
+   * @returns {Promise<string>} the retained instance ID
+   * @throws {Error} a failed registration, connect, UUID wait or seal
+   */
+  async prepare() {
+    this.registry.fill()
+    const first = this.segments.current()
+    await this.target(() => this.client.connect())
+    this.uuid = await this.target(() => this.client.clientInstanceId({ timeout: 15000 }))
+    const get = await this.find('setup Get', 15000, () =>
+      first.observer
+        .subscriptions({ uuid: this.uuid })
+        .find((r) => r.response?.errorCode === 0 && r.response.uuid === this.uuid)
+    )
+    await this.target(() => this.segments.close(this.client, this.closeOptions()))
+    this.segments.advance()
+    this.claims.setup = { segment: first.id, uuid: this.uuid, get: get.requestKey }
+    await this.seal(first, false)
+    return this.uuid
+  }
+
+  /**
+   * Seals one closed segment: decodes exactly its declared proof selection through the parent, then
+   * discharges it. The previous seal must have finished by the next boundary.
+   * @param {object} segment a closed segment @param {boolean} terminal whether it is the last one
+   * @returns {Promise<object>} its sealed summary
+   * @throws {Error} for a claimed proof outside the declared selection, a decode failure or a seal failure
+   */
+  async seal(segment, terminal) {
+    const { observer } = segment
+    await within(observer.socketsClosed(), 5000, `${segment.id} sockets closing`)
+    const records = observer.readTranscript()
+    const keys = TelemetryProofs.selection(records, { terminal })
+    const claimed = this.claims.proofs.filter((p) => p.segment === segment.id).map((p) => p.push)
+    for (const key of claimed)
+      if (!keys.includes(key))
+        throw new Error(`${segment.id}: claimed proof ${key} is not in the declared selection`)
+    const outcomes = await Promise.allSettled(
+      keys.map((key) =>
+        observer.decodeAccepted({ requestKey: key }, { budgetMs: DECODE_BUDGET_MS })
+      )
+    )
+    const failed = outcomes.find((o) => o.status === 'rejected')
+    if (failed) throw failed.reason
+    return this.segments.discharge(segment, { proofs: keys })
+  }
+
+  /**
+   * Starts sealing a closed segment in the background while the next lifecycle runs.
+   * @param {object} segment the closed segment @returns {void}
+   */
+  drain(segment) {
+    const draining = { settled: false, error: null, id: segment.id }
+    draining.promise = this.seal(segment, false).then(
+      () => {
+        draining.settled = true
+      },
+      (error) => {
+        draining.settled = true
+        draining.error = error
+      }
+    )
+    this.sealing = draining
+  }
+
+  /**
+   * @returns {Promise<void>} once the previous segment is sealed
+   * @throws {Error} when it is still draining at a boundary or failed to seal; nothing queues
+   */
+  drained() {
+    const previous = this.sealing
+    if (!previous) return Promise.resolve()
+    if (!previous.settled) throw new Error(`The previous ${this.kind} segment has not drained`)
+    if (previous.error) throw previous.error
+    return Promise.resolve()
+  }
+
+  /**
+   * Opens the initial active lifecycle on the already selected segment and proves its Get and a
+   * current normal Push.
+   * @returns {Promise<void>} after the first accepted Push under the initial subscription
+   */
+  async begin() {
+    const to = this.segments.current()
+    await this.target(() => this.client.connect())
+    await this.target(() => this.ordinary.start())
+    const cached = await this.target(() => this.client.clientInstanceId({ timeout: 0 }))
+    if (cached !== this.uuid)
+      throw new Error('The instance ID changed before the first measurement')
+    const get = await this.find(
+      'initial Get',
+      15000,
+      () => TelemetryProofs.gets(to.observer.readTranscript(), this.uuid)[0]
+    )
+    const push = await this.find('initial proving Push', 15000, () =>
+      TelemetryProofs.provingPush(to.observer.readTranscript({ after: get.index - 1 }), get)
+    )
+    this.claims.initial = {
+      segment: to.id,
+      cachedUuid: cached,
+      get: get.requestKey,
+      push: push.requestKey,
+    }
+    this.claims.proofs.push({
+      tick: null,
+      segment: to.id,
+      push: push.requestKey,
+      owedBy: ['initial'],
+    })
+  }
+
+  /**
+   * One public close then, as the next public action, an immediate connect on the same object, with
+   * admission paused and drained before and resumed after. Proves the cached UUID and a successful
+   * replacement Get; the current normal Push is proved after the tick's configuration.
+   * @param {{tick:number}} command the stage command
+   * @returns {Promise<object>} the facts of the stage
+   * @throws {Error} a changed UUID, a missing replacement Get or an undrained previous segment
+   */
+  async reopen(command) {
+    await this.drained()
+    const pause = await this.target(() => this.ordinary.pause())
+    const observedAt = this.clock.now()
+    const cycle = this.target(() => this.segments.cycle(this.client, this.closeOptions()))
+    await within(cycle.closed, 8000, `The ${this.kind} close`)
+    const closedAt = this.clock.now()
+    this.drain(cycle.from)
+    await within(cycle.reopened, 10000, `The ${this.kind} reconnect`)
+    const cached = await this.target(() => this.client.clientInstanceId({ timeout: 0 }))
+    const get = await this.find(
+      'replacement Get',
+      15000,
+      () => TelemetryProofs.gets(cycle.to.observer.readTranscript(), this.uuid)[0]
+    )
+    await this.target(() => this.ordinary.resume())
+    const notes = this.segments.journal().slice(-3)
+    if (
+      notes.map((n) => n.type).join() !== 'select,disconnect-resolved,connect-called' ||
+      notes[2].seq !== notes[1].seq + 1
+    )
+      throw new Error('The connect was not the next public action after the close')
+    if (cached !== this.uuid) throw new Error('The instance ID changed across a public reopen')
+    this.owed.add('reopen')
+    const claim = {
+      tick: command.tick,
+      from: cycle.from.id,
+      to: cycle.to.id,
+      observedAt,
+      closedAt,
+      cachedUuid: cached,
+      get: get.requestKey,
+      pause,
+    }
+    this.claims.reopens.push(claim)
+    return claim
+  }
+
+  /**
+   * Faults the one captured telemetry socket while ordinary work continues, and proves the
+   * replacement Get on a new socket of the same lifecycle.
+   * @param {{tick:number}} command the stage command
+   * @returns {Promise<object>} the facts of the stage
+   * @throws {Error} without an open telemetry socket, a failed core operation or no replacement Get
+   */
+  async retire(command) {
+    const segment = this.segments.current()
+    const after = segment.observer.checkpoint()
+    const fault = this.tap.retire()
+    const working = this.target(() => this.ordinary.core(this.coreN++)).then(
+      () => null,
+      (error) => error
+    )
+    const faultedAt = await within(fault.hit, 8000, `The ${this.kind} telemetry fault`)
+    const coreError = await working
+    if (coreError) throw coreError
+    const core = await this.find('core request beside the fault', 8000, () =>
+      segment.observer
+        .normalRequests({ after })
+        .find((r) => r.writeAt >= fault.declaredAt && r.response?.responseAt !== undefined)
+    )
+    const get = await this.find('replacement Get after the retirement', 12000, () =>
+      TelemetryProofs.gets(segment.observer.readTranscript({ after }), this.uuid).find(
+        (r) => r.socketId !== fault.ordinal
+      )
+    )
+    this.owed.add('retire')
+    const claim = {
+      tick: command.tick,
+      segment: segment.id,
+      faulted: fault.ordinal,
+      declaredAt: fault.declaredAt,
+      faultedAt,
+      core: core.requestKey,
+      get: get.requestKey,
+    }
+    this.claims.retirements.push(claim)
+    return claim
+  }
+
+  /**
+   * After the parent confirmed its set and readback: swaps one custom identity, waits for the
+   * successful Get that proves the selection (written after this message was taken), and discharges
+   * the current normal Push proof this tick owes on its current subscribed socket.
+   * @param {{tick:number, index:number, selection:string}} command the stage command
+   * @returns {Promise<object>} the facts of the stage
+   * @throws {Error} when no Get proves the selection or the owed Push never arrives
+   */
+  async confirm(command) {
+    const receivedAt = this.clock.now()
+    const segment = this.segments.current()
+    const after = segment.observer.checkpoint()
+    const replacement = this.registry.replace(command.tick)
+    const list = command.selection === '' ? [] : [command.selection]
+    const get = await this.find('selection Get', STAGE_MS.confirm - 2000, () =>
+      TelemetryProofs.selectionGet(segment.observer.readTranscript({ after }), this.uuid, {
+        after: receivedAt,
+        selection: list,
+      })
+    )
+    const claim = {
+      tick: command.tick,
+      index: command.index,
+      selection: command.selection,
+      segment: segment.id,
+      receivedAt,
+      get: get.requestKey,
+      subscriptionId: get.response.subscriptionId,
+      replacement,
+      proof: null,
+    }
+    if (this.owed.size) {
+      const open = this.tap.telemetry()
+      if (open.length !== 1 || open[0].segment !== segment.id)
+        throw new Error(`${this.kind}: expected one open telemetry socket for the owed proof`)
+      const records = () => segment.observer.readTranscript({ after: 0 })
+      const current = TelemetryProofs.gets(records(), this.uuid)
+        .filter((g) => g.socketId === open[0].ordinal)
+        .at(0)
+      if (!current) throw new Error(`${this.kind}: the current socket has no replacement Get`)
+      const push = await this.find('owed current Push', TICK_PROOF_MS, () =>
+        TelemetryProofs.provingPush(
+          segment.observer.readTranscript({ after: current.index - 1 }),
+          current
+        )
+      )
+      claim.proof = {
+        socketId: open[0].ordinal,
+        get: current.requestKey,
+        push: push.requestKey,
+        owedBy: [...this.owed],
+      }
+      this.claims.proofs.push({
+        tick: command.tick,
+        segment: segment.id,
+        push: push.requestKey,
+        owedBy: [...this.owed],
+      })
+      this.owed.clear()
+    }
+    this.claims.transitions.push(claim)
+    return claim
+  }
+
+  /**
+   * Executes one parent command and replies with a receipt carrying this worker's own times.
+   * @param {object} command `{type:'stage', tick, stage, ...}` or `{type:'corpus'}`
+   * @returns {Promise<void>} after the receipt was sent
+   * @throws {Error} a failed stage; the parent has the failure message and no later stage runs
+   */
+  async handle(command) {
+    if (command.type === 'corpus') {
+      this.ordinary.corpus()
+      return
+    }
+    const tick = this.schedule.ticks[command.tick]
+    if (!tick || !tick.actions.map((a) => STAGE_OF[a]).includes(command.stage))
+      throw new Error(`A stage the fixed table does not hold: ${command.tick}/${command.stage}`)
+    const startedAt = this.clock.now()
+    if (command.stage === 'lifecycle') await this.reopen(command)
+    else if (command.stage === 'retire') await this.retire(command)
+    else await this.confirm(command)
+    const bucket = this.schedule.measured(tick) ? this.actions.measured : this.actions.warm
+    const action = { lifecycle: 'reopen', retire: 'retire', confirm: 'subscription' }[command.stage]
+    bucket[action] += 1
+    const doneAt = this.clock.now()
+    this.stages.push({ tick: command.tick, stage: command.stage, startedAt, doneAt })
+    this.send({ type: 'stage-done', tick: command.tick, stage: command.stage, startedAt, doneAt })
+  }
+
+  /**
+   * Runs the warm-up and measurement under the supervising Soak, then the cleanup. The sampler is
+   * stopped and joined at the measurement boundary, before any cleanup await; after a failure no
+   * later stage runs, and every owned release is still attempted.
+   * @param {number} ms the fixed warm-up plus measurement
+   * @returns {Promise<void>} after cleanup; a failure keeps the primary and every cleanup error
+   * @throws {Error|AggregateError} the first workload failure with the cleanup failures
+   */
+  async work(ms) {
+    const { warmupMs, measureMs } = this.limits
+    if (ms !== warmupMs + measureMs) throw new Error('Telemetry churn runs its fixed 360000 ms')
+    const errors = []
+    this.timing.phaseAt = this.sampler.phaseStartedAt
+    this.send({ type: 'phase', at: this.timing.phaseAt, uuid: this.uuid })
+    try {
+      await this.inbox.take((m) => m.type === 'go')
+      this.timing.goAt = this.clock.now()
+      await this.begin()
+      for (;;) {
+        const command = await this.inbox.take((m) => ['stage', 'corpus', 'finish'].includes(m.type))
+        if (command.type === 'finish') break
+        await this.handle(command)
+      }
+    } catch (error) {
+      errors.push(error)
+    }
+    await this.cleanup(errors)
+    if (errors.length === 1) throw errors[0]
+    if (errors.length) throw new AggregateError(errors, 'Telemetry worker failed')
+  }
+
+  /**
+   * The cleanup after the common end-of-measurement boundary, every release attempted and all
+   * failures kept: the sampler stops first, ordinary work is finished and confirmed, the registry is
+   * restored, the terminal segment's declared proofs are decoded, the one explicit public close
+   * sends its receipt the moment it resolves, and the remaining segments are sealed.
+   * @param {Error[]} errors the failures so far, appended to
+   * @returns {Promise<void>}
+   */
+  async cleanup(errors) {
+    const attempt = async (work) => {
+      try {
+        await work()
+      } catch (error) {
+        errors.push(error)
+      }
+    }
+    this.timing.boundaryAt = this.clock.now()
+    this.timing.measurementMs = this.timing.boundaryAt - this.timing.phaseAt - this.limits.warmupMs
+    await attempt(() => this.sampler.endSampling())
+    const cleanupAt = this.clock.now()
+    await attempt(() => this.target(() => this.ordinary.stop()))
+    await attempt(() => this.registry.restore())
+    const last = this.segments.current()
+    await attempt(async () => {
+      if (errors.length) return
+      await this.drained()
+      const keys = TelemetryProofs.selection(last.observer.readTranscript(), { terminal: true })
+      const outcomes = await Promise.allSettled(
+        keys.map((key) =>
+          last.observer.decodeAccepted({ requestKey: key }, { budgetMs: DECODE_BUDGET_MS })
+        )
+      )
+      const failed = outcomes.find((o) => o.status === 'rejected')
+      if (failed) throw failed.reason
+    })
+    let closing = null
+    await attempt(async () => {
+      closing = this.target(() => this.segments.close(this.client, this.closeOptions()))
+      closing.then(
+        () => {
+          this.timing.receiptAt = this.clock.now()
+          this.send({ type: 'receipt', at: this.timing.receiptAt })
+        },
+        () => {}
+      )
+      await closing
+    })
+    await attempt(async () => {
+      if (!closing) return
+      await this.sealing?.promise
+      if (this.sealing?.error) throw this.sealing.error
+      await this.seal(last, true)
+    })
+    await attempt(() => this.ledger?.drain())
+    this.tap.restore()
+    this.timing.cleanupMs = this.clock.now() - cleanupAt
+  }
+
+  /**
+   * Closes whatever a failed setup left open, attempting every release.
+   * @returns {Promise<void>} @throws {AggregateError} the cleanup failures
+   */
+  async abort() {
+    const errors = []
+    for (const work of [
+      () => this.ordinary.stop(1),
+      () => this.client.disconnect(),
+      () => this.sampler?.endSampling(),
+      () => this.tap.restore(),
+    ])
+      try {
+        await work()
+      } catch (error) {
+        errors.push(error)
+      }
+    if (errors.length) throw new AggregateError(errors, 'Telemetry worker abort failed')
+  }
+
+  /**
+   * @returns {{ok:boolean, violations:string[]}} whether every required measured action completed
+   */
+  requirements() {
+    const violations = []
+    const need = this.schedule.required()
+    for (const action of Object.keys(need))
+      if (this.actions.measured[action] < need[action] || need[action] < MINIMUMS[action])
+        violations.push(`measured ${action} actions ${this.actions.measured[action]}`)
+    return { ok: violations.length === 0, violations }
+  }
+
+  /**
+   * @returns {object} everything the parent archives for this worker: claims, receipts, action
+   *   counts, the ordering journal, the replacements, the sealed segments and the share facts
+   */
+  facts() {
     return {
-      offered: this.offered,
-      handled: this.handled,
-      processed: Object.fromEntries(this.processed),
-      committed: Object.fromEntries(this.committed),
+      kind: this.kind,
+      uuid: this.uuid,
+      claims: this.claims,
+      stages: this.stages,
+      actions: this.actions,
+      journal: this.segments.journal(),
+      replacements: this.registry.replacements,
+      sealed: this.segments.sealed(),
+      timing: this.timing,
+      requirements: this.requirements(),
+      ordinary: this.ordinary.ids(),
+      share: this.ledger ? this.ledger.facts() : null,
     }
   }
 }
 
+/** Counts the telemetry request frames of the sockets it issues, to prove a control sent none. */
+class FrameCounter {
+  /** @param {Function} inner the underlying socket factory */
+  constructor(inner) {
+    const chaos = createChaosSocketFactory(inner)
+    this.frames = 0
+    this.open = 0
+    this.factory = (options) => this.track(chaos(options))
+  }
+
+  /** @param {object} socket a chaos socket @returns {object} the same socket, counted */
+  track(socket) {
+    const classifier = new FrameFilter({
+      headerBytes: 12,
+      decide: (header) => {
+        if (header.length >= 12 && [71, 72].includes(header.readInt16BE(4))) this.frames += 1
+        return false
+      },
+    })
+    const write = socket.write
+    socket.write = function (data, encoding) {
+      classifier.push(Buffer.from(data, encoding))
+      return write.call(this, data, encoding)
+    }
+    this.open += 1
+    socket.on('close', () => {
+      this.open -= 1
+      delete socket.write
+    })
+    return socket
+  }
+}
+
 /**
- * The parent's own telemetry-disabled clients: the topics, the broker resource, the paced
- * producer of the consumer and share corpora, and the independent raw-log and offset readers.
+ * The telemetry-disabled reference of one worker: the same kind, the same process and loaded
+ * modules, a bounded foreground catalogue, two settled readings that must agree, and a complete
+ * release before the enabled client exists. It performs no telemetry work and proves that.
  */
-class ParentFixture {
+class ReferenceControl {
   /**
    * @param {object} options
-   * @param {string[]} options.brokers seed addresses @param {string} options.stem run prefix
-   * @param {object} options.kafka a `Kafka` whose clients opt out of telemetry
-   * @param {Function} options.readLog the raw log reader @param {Function} options.withResource
-   *   the owner of one initially absent broker resource
+   * @param {string} options.kind the client kind @param {object} options.config the parent's configuration
+   * @param {Function} options.Kafka the client constructor @param {Function} options.socketFactory
+   * @param {object} options.logLevel the log levels @param {ProcessResources} options.resources
+   * @param {{now:function():number}} options.clock monotonic time
+   * @param {(ms:number)=>Promise<void>} [options.sleep] real delay
+   * @param {function():void} [options.gc] a full collection, `global.gc` by default
    */
-  constructor({ brokers, stem, kafka, readLog, withResource }) {
-    Object.assign(this, { brokers, stem, kafka, readLog, withResource })
-    this.admin = kafka.admin({ enableMetricsPush: false })
-    this.producer = kafka.producer({ enableMetricsPush: false, idempotent: true })
-    this.rotationEntries = { 'interval.ms': '1000', match: `client_id=^${stem}-` }
-  }
-
-  /** @param {string} kind the client kind @returns {string} its corpus topic */
-  topic(kind) {
-    return `${this.stem}-${labelOf(kind)}`
-  }
-
-  /** @param {string} kind @returns {string} its consumer group */
-  group(kind) {
-    return `${this.stem}-${labelOf(kind)}-group`
-  }
-
-  /** @returns {Promise<void>} connects and creates the three corpus topics, 3 partitions RF3 */
-  async open() {
-    await this.admin.connect()
-    await this.producer.connect()
-    await this.admin.createTopics({
-      waitForLeaders: true,
-      topics: ['producer', 'consumer', 'shareConsumer'].map((kind) => ({
-        topic: this.topic(kind),
-        numPartitions: 3,
-        replicationFactor: 3,
-        configEntries: [{ name: 'min.insync.replicas', value: '2' }],
-      })),
+  constructor({
+    kind,
+    config,
+    Kafka,
+    socketFactory,
+    logLevel,
+    resources,
+    clock,
+    sleep = wait,
+    gc = globalThis.gc,
+  }) {
+    Object.assign(this, {
+      kind,
+      config,
+      Kafka,
+      socketFactory,
+      logLevel,
+      resources,
+      clock,
+      sleep,
+      gc,
     })
   }
 
   /**
-   * @param {function():Promise<void>} work runs while the resource exists
-   * @returns {Promise<void>} after the resource was created, read back, and deleted again
+   * @returns {Promise<object>} the control facts: both settled readings, the release reading, the
+   *   telemetry frames it sent (none), the handles it left (none) and its own peak
+   * @throws {Error} a failed foreground operation or a control that is still holding something
    */
-  inResource(work) {
-    return this.withResource(
-      this.admin,
-      { name: this.stem, entries: { metrics: SUBSCRIPTIONS[2], ...this.rotationEntries } },
-      work
-    )
-  }
-
-  /**
-   * Sets the next subscription value and reads it back.
-   * @param {number} index rotation number @returns {Promise<string>} the value now in force
-   * @throws {Error} when the readback differs
-   */
-  async rotate(index) {
-    const metrics = SUBSCRIPTIONS[index % SUBSCRIPTIONS.length]
-    const resource = { type: 16, name: this.stem }
-    await this.admin.incrementalAlterConfigs({
-      timeout: 3000,
-      resources: [
-        { ...resource, configEntries: [{ name: 'metrics', operation: 0, value: metrics }] },
-      ],
+  async run() {
+    const { kind, config, clock } = this
+    const io = { gc: this.gc, pause: (ms) => this.sleep(ms), now: () => clock.now() }
+    const counter = new FrameCounter(this.socketFactory)
+    return this.resources.as('fixture:control', async () => {
+      const kafka = new this.Kafka({
+        clientId: `${config.stem}-ctl-${kind}`,
+        brokers: config.brokers,
+        logLevel: this.logLevel.NOTHING,
+        socketFactory: counter.factory,
+      })
+      const off = { enableMetricsPush: false }
+      const group = `${config.stem}-ctl-${kind}-group`
+      const client =
+        kind === 'producer'
+          ? kafka.producer({ ...off, idempotent: true })
+          : kind === 'admin'
+            ? kafka.admin(off)
+            : kind === 'shareConsumer'
+              ? kafka.shareConsumer({ ...off, groupId: group })
+              : kafka.consumer({
+                  ...off,
+                  groupId: group,
+                  sessionTimeout: 30000,
+                  heartbeatInterval: 3000,
+                  maxWaitTimeInMs: 500,
+                  readUncommitted: false,
+                })
+      const catalogue = CONTROL.catalogue[kind]
+      let c0
+      let c1
+      try {
+        await client.connect()
+        if (kind === 'producer')
+          for (let i = 0; i < catalogue; i++)
+            await client.send({
+              topic: config.ctl,
+              acks: -1,
+              messages: [{ key: `${config.stem}:ctl:${i}`, value: Buffer.from('control') }],
+            })
+        if (kind === 'admin')
+          for (let i = 0; i < catalogue; i++) await client.describeCluster({ timeout: 3000 })
+        if (kind === 'consumer') {
+          await client.subscribe({ topic: config.ctl, fromBeginning: false })
+          await client.run({ autoCommit: false, eachMessage: async () => {} })
+        }
+        if (kind === 'shareConsumer') {
+          await client.subscribe({ topics: [config.ctl] })
+          await client.run({ eachMessage: async () => {} })
+        }
+        await this.sleep(3000)
+        c0 = await settledReading('c0', io)
+        await this.sleep(CONTROL.idleMs)
+        c1 = await settledReading('c1', io)
+      } catch (error) {
+        await client.disconnect().catch(() => {})
+        throw error
+      }
+      await client.disconnect()
+      const deadline = clock.now() + 5000
+      while (counter.open > 0 && clock.now() < deadline) await this.sleep(50)
+      const released = await settledReading('control-released', io)
+      const leftover = [...this.resources.live.values()].filter(
+        (entry) => entry.token.role === 'fixture:control'
+      ).length
+      return {
+        kind,
+        catalogue,
+        telemetryFrames: counter.frames,
+        openSockets: counter.open,
+        leftoverHandles: leftover,
+        c0,
+        c1,
+        released,
+      }
     })
-    const read = await this.admin.describeConfigs({
-      timeout: 3000,
-      resources: [{ ...resource, configNames: ['metrics'] }],
-    })
-    const value = read.resources[0].configEntries.find(
-      (e) => e.configName === 'metrics'
-    )?.configValue
-    if ((value ?? '') !== metrics) throw new Error('The subscription readback differs')
-    return metrics
-  }
-
-  /**
-   * Produces records `from`..`from + count` of one parent-owned corpus.
-   * @param {string} kind consumer or shareConsumer @param {number} from first position
-   * @param {number} count how many @returns {Promise<string[]>} the produced identities
-   */
-  async produce(kind, from, count) {
-    const ids = Array.from({ length: count }, (_, i) => recordId(this.stem, kind, from + i))
-    await this.producer.send({
-      topic: this.topic(kind),
-      acks: -1,
-      messages: ids.map((id) => ({ key: id, value: valueOf(id) })),
-    })
-    return ids
-  }
-
-  /** @param {string} kind @returns {Promise<string[]>} every key in the topic's raw log */
-  async durable(kind) {
-    const log = await this.readLog({ brokers: this.brokers, topic: this.topic(kind) })
-    return [...log.values()].flatMap(({ records }) => records.map((r) => String(r.key)))
-  }
-
-  /** @returns {Promise<Object<string,string>>} the group's committed next offsets, unresolved */
-  async committed() {
-    const answer = await this.admin.fetchOffsets({
-      groupId: this.group('consumer'),
-      topics: [this.topic('consumer')],
-      resolveOffsets: false,
-    })
-    return Object.fromEntries(
-      answer.flatMap(({ partitions }) => partitions.map((p) => [p.partition, String(p.offset)]))
-    )
-  }
-
-  /** @returns {Promise<void>} disconnects every client the fixture opened */
-  async close() {
-    const outcomes = await Promise.allSettled([this.producer.disconnect(), this.admin.disconnect()])
-    const errors = outcomes.filter((o) => o.status === 'rejected').map((o) => o.reason)
-    if (errors.length) throw new AggregateError(errors, 'Fixture cleanup failed')
   }
 }
 
 /**
- * The parent of a run: configures the broker resource, starts four workers concurrently, drives the
- * subscription rotation and the parent-owned corpora, and writes one oracle, four natural-exit
- * rows, four resource verdicts and one final verdict.
+ * The parent of a run: configures the broker resource, starts four workers, coordinates the fixed
+ * tick catalogue in joined stages, offers the parent-owned corpora, decodes the workers' selected
+ * Pushes independently, and writes one oracle, four natural-exit rows, four resource verdicts and
+ * one final verdict, stamped only after every cleanup. A failure taints the run: no later lazy work
+ * starts, every owned release is still attempted and joined, and no cleanup failure is swallowed.
  */
 class TelemetryChurn {
   /**
    * @param {object} options
-   * @param {object} options.fixture a `ParentFixture`
-   * @param {TelemetryProcesses} options.processes the supervised workers
+   * @param {object} options.fixture a `ParentFixture` @param {TelemetryProcesses} options.processes
+   *   the supervised workers @param {DecoderCoordinator} options.decoder the independent decoder
    * @param {(row:object)=>void} options.record evidence sink
    * @param {{now:()=>number}} options.clock monotonic time
    * @param {(ms:number)=>Promise<void>} [options.sleep] real delay
    * @param {object} options.limits the `TELEMETRY` limits
    * @param {Function} options.verdict `TelemetryResourceVerdict.evaluate`
    * @param {string[]} options.brokers seed addresses @param {string} options.stem run prefix
+   * @param {string} options.line broker line @param {string} options.directory absolute run directory
    */
-  constructor({ fixture, processes, record, clock, sleep = wait, limits, verdict, brokers, stem }) {
+  constructor({
+    fixture,
+    processes,
+    decoder,
+    record,
+    clock,
+    sleep = wait,
+    limits,
+    verdict,
+    brokers,
+    stem,
+    line,
+    directory,
+  }) {
     Object.assign(this, {
       fixture,
       processes,
+      decoder,
       record,
       clock,
       sleep,
@@ -964,56 +2550,393 @@ class TelemetryChurn {
       verdict,
       brokers,
       stem,
+      line,
+      directory,
     })
     this.closed = null
-    this.taint = null
+    this.failed = false
+    this.cause = undefined
+    this.stages = []
+    this.rotations = []
+    this.missed = []
+    this.offered = { consumer: [], shareConsumer: [] }
+    this.abort = new Promise((_, reject) => {
+      this.rejectAbort = reject
+    })
+    this.abort.catch(() => {})
+    processes.onFailure = (kind, error) => this.fail(error)
+    processes.onDecode = (kind, message) => this.serve(kind, message)
+  }
+
+  /**
+   * @param {Error} error the first failure of the run @returns {void} later lazy work now refuses
+   */
+  fail(error) {
+    if (!this.failed) {
+      this.failed = true
+      this.cause = error
+    }
+    this.rejectAbort(error)
+  }
+
+  /** @returns {void} @throws {*} the run's first failure, even a falsy one, so no later work starts */
+  guard() {
+    if (this.failed) throw this.cause
+  }
+
+  /**
+   * Answers one worker's request for an independent decode, never blocking the other workers.
+   * @param {string} kind the asking worker @param {object} message `{id, rawB64}` @returns {void}
+   */
+  serve(kind, message) {
+    this.decoder.decode(kind, message.rawB64).then(
+      (body) => this.sendTo(kind, { type: 'decoded', id: message.id, body }),
+      (error) =>
+        this.sendTo(kind, {
+          type: 'decoded',
+          id: message.id,
+          error: String(error?.message ?? error).slice(0, 1024),
+        })
+    )
+  }
+
+  /**
+   * @param {string} kind the worker @param {object} message what to send
+   * @returns {void} a worker that is already gone is not an error of the decoder
+   */
+  sendTo(kind, message) {
+    try {
+      this.processes.send(kind, message)
+    } catch {
+      // the worker's own failure is already the run's failure
+    }
+  }
+
+  /**
+   * @param {number} target a monotonic reading @returns {Promise<void>} resolves once it is reached
+   * @throws {Error} the run's failure, as soon as it exists
+   */
+  async until(target) {
+    for (;;) {
+      this.guard()
+      const left = target - this.clock.now()
+      if (left <= 0) return
+      await this.sleep(Math.min(left, 250))
+    }
   }
 
   /**
    * Runs the whole fixed case and judges it.
    * @returns {Promise<{ok:boolean, violations:string[], clientKinds:string[], workers:object[],
-   *   oracle:object, setupMs:number, cleanupMs:number, totalMs:number}>}
-   * @throws {Error} a failure of the case itself; cleanup is `close`'s
+   *   oracle:object, timeline:object, setupMs:number, cleanupMs:number, totalMs:number,
+   *   archive:object}>}
+   * @throws {Error} a failure that left no verdict; cleanup is still attempted and joined
    */
   async run() {
-    const t0 = this.clock.now()
-    const { warmupMs, measureMs, cleanupMs: cleanupBound, caseMs } = this.limits
-    const violations = []
+    const timeline = { t0: this.clock.now(), epochAt: null, boundaryAt: null, cleanupEndAt: null }
+    const schedule = new TelemetrySchedule(this.limits)
+    let results = []
+    let primary
+    let failed = false
+    try {
+      results = await this.measure(timeline, schedule)
+    } catch (error) {
+      primary = error
+      failed = true
+      this.fail(error)
+    }
+    timeline.boundaryAt ??= this.clock.now()
+    const shutdown = await this.shutdown(results)
+    timeline.cleanupEndAt = this.clock.now()
+    if (failed || shutdown.errors.length) {
+      const errors = [...(failed ? [primary] : []), ...shutdown.errors]
+      throw errors.length === 1 ? errors[0] : new AggregateError(errors, 'Telemetry churn failed')
+    }
+    return this.judge(results, shutdown, timeline, schedule)
+  }
+
+  /**
+   * Setup, then the measurement, in the fixed order: start the workers, join their handshakes,
+   * ready receipts and phase starts inside the setup budget, fix one epoch, run the corpus and
+   * the tick catalogue in joined stages, then take every worker's result.
+   * @param {object} timeline the run's raw monotonic stamps, filled in as it goes
+   * @param {TelemetrySchedule} schedule the fixed catalogue @returns {Promise<object[]>} the results
+   * @throws {Error} a setup over its budget, a missed measured tick, or any stage failure
+   */
+  async measure(timeline, schedule) {
+    const { warmupMs, measureMs, cleanupMs: cleanupBound } = this.limits
+    const left = () => Math.max(1, SETUP_MS - (this.clock.now() - timeline.t0))
+    let results = []
     await this.fixture.open()
-    let results
-    let setupMs
-    let epoch
     await this.fixture.inResource(async () => {
-      const setupLeft = () => Math.max(1, SETUP_MS - (this.clock.now() - t0))
       for (const kind of KINDS) this.processes.start(kind)
-      await Promise.all(KINDS.map((kind) => this.processes.message(kind, 'hello', setupLeft())))
+      await Promise.all(KINDS.map((kind) => this.processes.message(kind, 'hello', left())))
       for (const kind of KINDS)
-        this.processes.workers.get(kind).child.send({
+        this.processes.send(kind, {
           type: 'config',
           stem: this.stem,
           brokers: this.brokers,
           topic: this.fixture.topic(kind),
           group: this.fixture.group(kind),
+          ctl: this.fixture.ctl,
+          line: this.line,
+          directory: this.directory,
         })
-      await Promise.all(KINDS.map((kind) => this.processes.message(kind, 'ready', setupLeft())))
-      setupMs = this.clock.now() - t0
-      epoch = this.clock.now()
-      for (const kind of KINDS) this.processes.workers.get(kind).child.send({ type: 'go' })
-      const ordinary = this.drive(epoch, warmupMs + measureMs)
-      results = await Promise.all(
-        KINDS.map((kind) =>
-          this.processes.message(kind, 'result', warmupMs + measureMs + cleanupBound)
+      await Promise.all(KINDS.map((kind) => this.processes.message(kind, 'ready', left())))
+      for (const kind of KINDS) this.processes.send(kind, { type: 'start' })
+      await Promise.all(KINDS.map((kind) => this.processes.message(kind, 'phase', left())))
+      timeline.epochAt = this.clock.now()
+      timeline.setupMs = timeline.epochAt - timeline.t0
+      if (timeline.setupMs > SETUP_MS) throw new Error('The setup exceeded its budget')
+      for (const kind of KINDS) this.processes.send(kind, { type: 'go' })
+      const corpus = this.offerCorpus(timeline.epochAt, schedule)
+      corpus.catch((error) => this.fail(error))
+      await this.ticks(timeline.epochAt, schedule)
+      await this.until(timeline.epochAt + warmupMs + measureMs)
+      timeline.boundaryAt = this.clock.now()
+      await corpus
+      for (const kind of KINDS) this.processes.send(kind, { type: 'finish' })
+      results = await Promise.race([
+        Promise.all(KINDS.map((kind) => this.processes.message(kind, 'result', cleanupBound))),
+        this.abort,
+      ])
+    })
+    return results
+  }
+
+  /**
+   * Offers the parent-owned corpora in their fixed measured slots, one batch per slot, and starts
+   * the workers' own producer pacing at the first slot. Nothing is offered in the warm-up.
+   * @param {number} epoch the monotonic reading at which the schedule began
+   * @param {TelemetrySchedule} schedule the fixed catalogue @returns {Promise<void>} after the last batch
+   * @throws {Error} the run's failure at any slot, or a failed produce
+   */
+  async offerCorpus(epoch, schedule) {
+    const slots = schedule.corpusSlots()
+    for (let batch = 0; batch < slots.length; batch++) {
+      await this.until(epoch + slots[batch])
+      if (batch === 0) for (const kind of KINDS) this.processes.send(kind, { type: 'corpus' })
+      const from = batch * CORPUS.batch
+      for (const kind of ['consumer', 'shareConsumer'])
+        this.offered[kind].push(...(await this.fixture.produce(kind, from, CORPUS.batch)))
+    }
+  }
+
+  /**
+   * The fixed tick catalogue. At every tick the stages run in order and are joined across all four
+   * workers: close and immediate connect, then telemetry retirement, then the parent's set and
+   * readback followed by every worker's selection confirmation. A tick that is more than the late
+   * bound behind is a missed tick and is never caught up.
+   * @param {number} epoch the monotonic reading at which the schedule began
+   * @param {TelemetrySchedule} schedule the fixed catalogue @returns {Promise<void>} after the last tick
+   * @throws {Error} a missed measured tick, a stage over its bound or a failed set
+   */
+  async ticks(epoch, schedule) {
+    for (const tick of schedule.ticks) {
+      await this.until(epoch + tick.at)
+      const late = this.clock.now() - (epoch + tick.at)
+      if (late > LATE_MS) {
+        this.missed.push({
+          tick: tick.number,
+          at: tick.at,
+          late,
+          measured: schedule.measured(tick),
+        })
+        if (schedule.measured(tick))
+          throw new Error(`The measured tick at ${tick.at} ms was missed`)
+        continue
+      }
+      for (const stage of schedule.stages(tick)) {
+        this.guard()
+        let rotation = null
+        if (stage === 'confirm') {
+          rotation = await within(
+            this.fixture.rotate(tick.index, schedule.selection(tick.index)),
+            STAGE_MS.confirm - 1000,
+            'The subscription set and readback'
+          )
+          this.rotations.push({ tick: tick.number, ...rotation })
+        }
+        const sentAt = this.clock.now()
+        for (const kind of KINDS)
+          this.processes.send(kind, {
+            type: 'stage',
+            tick: tick.number,
+            stage,
+            index: tick.index,
+            selection: schedule.selection(tick.index),
+          })
+        const done = await Promise.race([
+          Promise.all(
+            KINDS.map((kind) =>
+              this.processes.until(
+                kind,
+                (m) => m.type === 'stage-done' && m.tick === tick.number && m.stage === stage,
+                STAGE_MS[stage],
+                `${stage} of tick ${tick.number}`
+              )
+            )
+          ),
+          this.abort,
+        ])
+        done.forEach((message, position) =>
+          this.stages.push({
+            tick: tick.number,
+            stage,
+            kind: KINDS[position],
+            sentAt,
+            parentAt: message.parentAt,
+            workerStartedAt: message.startedAt,
+            workerDoneAt: message.doneAt,
+          })
+        )
+      }
+    }
+  }
+
+  /**
+   * Joins every owned resource, all-settled: each worker's natural close (a worker that does not
+   * close naturally is killed and stays failed), the oracle readings while the parent clients are
+   * open, the independent decoder, and the parent's own clients. Nothing here starts new churn.
+   * @param {object[]} results the worker results, possibly empty after a failure
+   * @returns {Promise<{exits:object, oracle:object|null, decoder:object|null, errors:Error[]}>}
+   */
+  async shutdown(results) {
+    const errors = []
+    const exits = {}
+    const attempt = async (work) => {
+      try {
+        return await work()
+      } catch (error) {
+        errors.push(error)
+        return null
+      }
+    }
+    for (const kind of KINDS) {
+      const worker = this.processes.workers.get(kind)
+      if (!worker) continue
+      const exit = await attempt(() => this.processes.join(kind))
+      if (exit === null || exit.event !== 'close') this.processes.taint(kind)
+      if (exit) exits[kind] = exit
+      if (exit && exit.event !== 'close')
+        errors.push(new Error(`Telemetry worker ${kind} did not close naturally`))
+    }
+    const oracle = results.length && !this.failed ? await attempt(() => this.oracle(results)) : null
+    const decoder = await attempt(() => this.decoder.close())
+    await attempt(() => this.fixture.close())
+    return { exits, oracle, decoder, errors }
+  }
+
+  /**
+   * Compares the independent raw logs, raw committed offsets and the share acknowledgements with
+   * each worker's own ledgers, and keeps every input so a replay recomputes the same conclusions.
+   * @param {object[]} results the four worker results @returns {Promise<object>} the oracle row and inputs
+   */
+  async oracle(results) {
+    const byKind = Object.fromEntries(results.map((r) => [r.kind, r.facts]))
+    const logs = {}
+    for (const kind of ['producer', 'consumer', 'shareConsumer'])
+      logs[kind] = await this.fixture.durable(kind)
+    const committed = await this.fixture.committed()
+    const topicId = await this.fixture.topicId()
+    const closures = this.closuresOf(byKind.shareConsumer.sealed)
+    const inputs = {
+      stem: this.stem,
+      producer: {
+        log: logs.producer,
+        offered: byKind.producer.ordinary.offered,
+        resolved: byKind.producer.ordinary.resolved,
+      },
+      consumer: {
+        log: logs.consumer,
+        handled: byKind.consumer.ordinary.handled,
+        processed: byKind.consumer.ordinary.processed,
+        committed,
+      },
+      shareConsumer: {
+        log: logs.shareConsumer,
+        topicId,
+        handled: byKind.shareConsumer.ordinary.handled,
+        acquisitions: byKind.shareConsumer.share.acquisitions,
+        settlements: byKind.shareConsumer.share.settlements,
+        settled: byKind.shareConsumer.share.settled,
+        closures,
+      },
+      parentOffered: this.offered,
+    }
+    const checks = {
+      producer: OrdinaryOracle.check({ kind: 'producer', stem: this.stem, ...inputs.producer }),
+      consumer: OrdinaryOracle.check({ kind: 'consumer', stem: this.stem, ...inputs.consumer }),
+      shareConsumer: ShareOracle.check({ stem: this.stem, ...inputs.shareConsumer }),
+    }
+    const violations = Object.entries(checks).flatMap(([kind, check]) =>
+      check.violations.map((v) => `${kind}: ${v}`)
+    )
+    for (const kind of ['consumer', 'shareConsumer'])
+      violations.push(
+        ...identityViolations(this.offered[kind], `the parent's ${kind} offers`).map(
+          (v) => `${kind}: ${v}`
         )
       )
-      await ordinary
-    })
-    const cleanupAt = this.clock.now()
+    return {
+      ok: violations.length === 0,
+      violations,
+      independentSetHashes: Object.fromEntries(
+        Object.entries(checks).map(([kind, check]) => [kind, check.hashes])
+      ),
+      recordCounts: {
+        producer: {
+          offered: byKind.producer.ordinary.offered.length,
+          handled: byKind.producer.ordinary.resolved.length,
+        },
+        consumer: {
+          offered: this.offered.consumer.length,
+          handled: byKind.consumer.ordinary.handled.length,
+        },
+        shareConsumer: {
+          offered: this.offered.shareConsumer.length,
+          handled: byKind.shareConsumer.ordinary.handled.length,
+        },
+      },
+      inputs,
+    }
+  }
+
+  /**
+   * @param {object[]} sealed the sealed summaries of the share consumer's segments
+   * @returns {Array<{at:number,end:number}>} the public close boundaries its observers captured
+   */
+  closuresOf(sealed) {
+    return sealed.flatMap((pack) =>
+      JSON.parse(
+        fs.readFileSync(`${this.directory}/segments/${pack.transcript.name}`, 'utf8')
+      ).closures.map(({ at, end }) => ({ at, end }))
+    )
+  }
+
+  /**
+   * Judges the finished run from raw facts and stamps the verdict. Everything it states was
+   * produced after the last cleanup step, so a pass never precedes a release.
+   * @param {object[]} results worker results @param {object} shutdown the joined outcomes
+   * @param {object} timeline the raw stamps @param {TelemetrySchedule} schedule the catalogue
+   * @returns {object} the run's result, with the heavy replay inputs under `archive`
+   */
+  judge(results, shutdown, timeline, schedule) {
+    const { warmupMs, measureMs, cleanupMs: cleanupBound, caseMs } = this.limits
+    const violations = []
     const workers = []
     for (const result of results) {
-      const exit = await this.processes.join(result.kind)
+      const exit = shutdown.exits[result.kind]
       const input = { ...result.input, clientCount: 1 }
       const evaluated = this.verdict(input)
-      workers.push({ kind: result.kind, input, result: evaluated, exit, uuid: result.uuid })
+      workers.push({
+        kind: result.kind,
+        input,
+        result: evaluated,
+        exit,
+        uuid: result.uuid,
+        facts: result.facts,
+      })
       this.record({
         kind: 'resource-verdict',
         clientKind: result.kind,
@@ -1023,102 +2946,85 @@ class TelemetryChurn {
         result: evaluated,
       })
       this.record({ kind: 'natural-exit', clientKind: result.kind, ...exit })
-      if (!evaluated.ok) violations.push(`${result.kind}: ${evaluated.violations.join(', ')}`)
-      if (!result.requirements.ok)
-        violations.push(`${result.kind}: ${result.requirements.violations}`)
-      if (result.rotations.filter((r) => r.confirmed).length < MINIMUMS.subscription)
-        violations.push(`${result.kind}: too few confirmed subscription transitions`)
+      if (!evaluated.ok)
+        violations.push(
+          `${result.kind}: ${[...evaluated.violations, ...(evaluated.inconclusive ?? [])].join(', ')}`
+        )
+      if (!result.facts.requirements.ok)
+        violations.push(`${result.kind}: ${result.facts.requirements.violations}`)
       if (
         exit.event !== 'close' ||
         exit.code !== 0 ||
         exit.signal !== null ||
         exit.stderrBytes !== 0 ||
         exit.unhandled !== 0 ||
+        exit.receipts !== 1 ||
+        exit.killed ||
         exit.watchdogExpired ||
         !(Number.isFinite(exit.afterDisconnectMs) && exit.afterDisconnectMs >= 0) ||
         exit.afterDisconnectMs > this.limits.exitMs
       )
         violations.push(`${result.kind}: the child did not exit naturally`)
     }
-    const oracle = await this.oracle(results)
-    this.record({ kind: 'oracle', ...oracle })
-    if (!oracle.ok) violations.push(...oracle.violations)
-    const totalMs = this.clock.now() - t0
-    const cleanupMs = this.clock.now() - cleanupAt
-    if (totalMs > caseMs) violations.push('the case exceeded its total budget')
+    const need = schedule.required()
+    const measured = { subscription: 0, retire: 0, reopen: 0 }
+    const unit = { lifecycle: 'reopen', retire: 'retire', confirm: 'subscription' }
+    for (const tick of schedule.ticks)
+      if (schedule.measured(tick))
+        for (const stage of schedule.stages(tick))
+          if (
+            KINDS.every((kind) =>
+              this.stages.some(
+                (s) => s.tick === tick.number && s.stage === stage && s.kind === kind
+              )
+            )
+          )
+            measured[unit[stage]] += 1
+    for (const action of Object.keys(need))
+      if (measured[action] < need[action] || measured[action] < MINIMUMS[action])
+        violations.push(`measured ${action} stages ${measured[action]} of ${need[action]}`)
+    if (this.missed.some((m) => m.measured)) violations.push('a measured tick was missed')
+    const oracle = shutdown.oracle
+    if (!oracle) violations.push('the oracle was not computed')
+    else if (!oracle.ok) violations.push(...oracle.violations)
+    const setupMs = timeline.epochAt - timeline.t0
+    const cleanupMs = timeline.cleanupEndAt - timeline.boundaryAt
+    const totalMs = timeline.cleanupEndAt - timeline.t0
+    if (setupMs > SETUP_MS) violations.push('the setup exceeded its budget')
+    if (cleanupMs > cleanupBound) violations.push('the cleanup exceeded its budget')
+    if (totalMs > caseMs - 2000) violations.push('the case exceeded its total budget')
     const verdict = { ok: violations.length === 0, violations, setupMs, cleanupMs, totalMs }
-    this.record({ kind: 'verdict', ...verdict, warmupMs, measurementMs: measureMs })
-    return { ...verdict, clientKinds: [...KINDS], workers, oracle }
-  }
-
-  /**
-   * Runs the parent-side schedule: subscription rotations every 10 s and the paced corpora.
-   * @param {number} epoch monotonic start @param {number} endMs the schedule length
-   * @returns {Promise<void>} after the last rotation and the last corpus batch
-   */
-  async drive(epoch, endMs) {
-    let from = 0
-    const batches = CORPUS.records / CORPUS.batch
-    for (let index = 0; index * STEPS.subscriptionMs + STEPS.subscriptionMs < endMs; index++) {
-      const at = (index + 1) * STEPS.subscriptionMs
-      while (this.clock.now() - epoch < at) await this.sleep(250)
-      await this.fixture.rotate(index)
-      for (const kind of KINDS)
-        this.processes.workers.get(kind).child.send({ type: 'rotated', index })
-      const due = Math.min(batches, Math.floor(at / CORPUS.batchMs))
-      while (from < due) {
-        await this.fixture.produce('consumer', from * CORPUS.batch, CORPUS.batch)
-        await this.fixture.produce('shareConsumer', from * CORPUS.batch, CORPUS.batch)
-        from += 1
-      }
-    }
-    while (from < batches) {
-      await this.fixture.produce('consumer', from * CORPUS.batch, CORPUS.batch)
-      await this.fixture.produce('shareConsumer', from * CORPUS.batch, CORPUS.batch)
-      from += 1
-    }
-  }
-
-  /**
-   * Compares the independent raw logs and committed offsets with each worker's own sets.
-   * @param {object[]} results the four worker results @returns {Promise<object>} the oracle row
-   */
-  async oracle(results) {
-    const byKind = Object.fromEntries(results.map((r) => [r.kind, r.ordinary]))
-    const expected = (kind) =>
-      Array.from({ length: CORPUS.records }, (_, i) => recordId(this.stem, kind, i))
-    const checks = {}
-    for (const kind of ['producer', 'consumer', 'shareConsumer']) {
-      const durable = await this.fixture.durable(kind)
-      checks[kind] = OrdinaryOracle.check({
-        expected: expected(kind),
-        durable,
-        handled: kind === 'producer' ? byKind.producer.offered : byKind[kind].handled,
-        ...(kind === 'consumer'
-          ? { committed: await this.fixture.committed(), processed: byKind.consumer.processed }
-          : {}),
-      })
-    }
-    const violations = Object.entries(checks).flatMap(([kind, check]) =>
-      check.violations.map((v) => `${kind}: ${v}`)
-    )
+    const { inputs, ...oracleRow } = oracle ?? { ok: false, violations: [] }
+    this.record({ kind: 'oracle', ...oracleRow })
+    this.record({
+      kind: 'verdict',
+      ...verdict,
+      warmupMs,
+      measurementMs: measureMs,
+      timeline,
+      measured,
+    })
     return {
-      ok: violations.length === 0,
-      violations,
-      independentSetHashes: Object.fromEntries(
-        Object.entries(checks).map(([kind, check]) => [kind, check.hashes])
-      ),
-      recordCounts: Object.fromEntries(
-        Object.entries(byKind).map(([kind, o]) => [
-          kind,
-          { offered: o.offered.length, handled: o.handled.length },
-        ])
-      ),
+      ...verdict,
+      clientKinds: [...KINDS],
+      workers,
+      oracle: oracleRow,
+      timeline,
+      archive: {
+        stem: this.stem,
+        inputs,
+        stages: this.stages,
+        rotations: this.rotations,
+        missed: this.missed,
+        decoder: shutdown.decoder,
+        workers: Object.fromEntries(workers.map((w) => [w.kind, w.facts])),
+      },
     }
   }
 
   /**
-   * Cleans up once: kills no clean worker, joins every child it started, closes its own clients.
+   * Idempotent safety net for what `run` already released: joins every child it started, kills no
+   * clean worker, and closes the parent's clients and decoder if a failure stopped `run` early.
    * @returns {Promise<void>} @throws {Error|AggregateError} every cleanup failure, first one first
    */
   close() {
@@ -1132,11 +3038,12 @@ class TelemetryChurn {
           if (exit instanceof Error) errors.push(exit)
         }
       }
-      try {
-        await this.fixture.close()
-      } catch (error) {
-        errors.push(error)
-      }
+      for (const work of [() => this.decoder.close(), () => this.fixture.close()])
+        try {
+          await work()
+        } catch (error) {
+          errors.push(error)
+        }
       if (errors.length === 1) throw errors[0]
       if (errors.length) throw new AggregateError(errors, 'Telemetry cleanup failed')
     })()
@@ -1145,18 +3052,21 @@ class TelemetryChurn {
 }
 
 /**
- * The child side of one worker: handshake, one public target client, setup, the supervised soak,
- * and the explicit-disconnect receipt after which the process is left to exit by itself.
+ * The child side of one worker: handshake, the disabled reference control, one public target
+ * client with its observer segments, setup, the supervised soak, and the one explicit-disconnect
+ * receipt, after which the process is left to exit by itself. Every message names the worker and
+ * carries the handshake token.
  */
 class TelemetryWorkerProcess {
   /**
    * @param {object} options
    * @param {string} options.kind the one client kind
    * @param {object} options.soak injected `{ Soak, WORKLOADS, PROFILES, instrument, TELEMETRY,
-   *   TelemetryResourceVerdict, logLevel, Kafka }`
+   *   TelemetryResourceVerdict, logLevel, Kafka, socketFactory, startup }`
    * @param {object} [options.proc] the process, for its IPC channel; a spec supplies a fake
    * @param {{now:()=>number}} [options.clock] monotonic time
    * @param {Function} [options.sleep] real delay
+   * @param {object} [options.env] where the handshake token is read, `process.env` by default
    */
   constructor({
     kind,
@@ -1164,37 +3074,50 @@ class TelemetryWorkerProcess {
     proc = process,
     clock = { now: () => performance.now() },
     sleep = wait,
+    env = process.env,
   }) {
-    Object.assign(this, { kind, soak, proc, clock, sleep })
-    this.inbox = []
-    this.waiting = []
+    Object.assign(this, { kind, soak, proc, clock, sleep, env })
+    this.inbox = new Inbox()
+    this.pending = new Map()
+    this.nextDecode = 0
     this.worker = null
   }
 
   /**
-   * @param {string} type message type @returns {Promise<object>} the next such message from the parent
-   * @throws {Error} when the process has no IPC channel
+   * @param {object} message what to tell the parent @returns {void} named and token-bound
    */
-  expect(type) {
-    return new Promise((resolve) => {
-      const take = () => {
-        const index = this.inbox.findIndex((m) => m.type === type)
-        if (index < 0) return false
-        resolve(this.inbox.splice(index, 1)[0])
-        return true
-      }
-      if (!take()) this.waiting.push(take)
-    })
+  send(message) {
+    this.proc.send({ ...message, kind: this.kind, token: this.env[WORKER_TOKEN] })
   }
 
-  /** @returns {void} routes parent messages: rotations go to the worker, the rest wait to be taken */
+  /** @returns {void} routes parent messages: decode answers settle their request, the rest wait */
   listen() {
     this.proc.on('message', (message) => {
-      if (message?.type === 'rotated' && this.worker) this.worker.rotated(message.index)
-      else this.inbox.push(message)
-      this.waiting = this.waiting.filter((take) => !take())
+      if (message?.type === 'decoded') {
+        const pending = this.pending.get(message.id)
+        this.pending.delete(message.id)
+        if (!pending) return
+        if (message.error) pending.reject(new Error(message.error))
+        else pending.resolve(message.body)
+      } else this.inbox.push(message)
     })
-    this.proc.on('unhandledRejection', () => this.proc.send({ type: 'unhandled' }))
+    this.proc.on('unhandledRejection', () => this.send({ type: 'unhandled' }))
+  }
+
+  /**
+   * The decoder seam of the observer: forwards bounded raw input to the parent and returns the real
+   * pinned Java result.
+   * @param {Buffer} raw the decompressed MetricsData, at most 4096 bytes
+   * @returns {Promise<object>} the decoded body @throws {Error} when the parent could not decode
+   */
+  askDecode(raw) {
+    if (this.pending.size >= 16)
+      return Promise.reject(new Error('Too many decode requests pending'))
+    const id = ++this.nextDecode
+    return new Promise((resolve, reject) => {
+      this.pending.set(id, { resolve, reject })
+      this.send({ type: 'decode', id, rawB64: raw.toString('base64') })
+    })
   }
 
   /**
@@ -1219,23 +3142,71 @@ class TelemetryWorkerProcess {
   }
 
   /**
-   * Runs the worker to its receipt.
+   * @param {object} parts what the reference holds when the run is judged
+   * @returns {object} the replayable reference facts: source and capability, every reading, the
+   *   control, and the host before the control, at the boundary and after the run
+   */
+  reference({ loaded, control, host }) {
+    return {
+      version: 'rss-reference-1',
+      source: 'proc-status-vmhwm',
+      capability: { gc: typeof globalThis.gc === 'function', peak: readHighWater() !== null },
+      startup: this.soak.startup ?? null,
+      loaded,
+      control,
+      final: readMemory('final', () => this.clock.now()),
+      host: { ...host, after: hostContext(() => this.clock.now()) },
+    }
+  }
+
+  /**
+   * Runs the worker to its receipt and result.
    * @returns {Promise<{ok:boolean, violations:string[]}>} the resource verdict of this one client
-   * @throws {Error} a failed setup or run, after the receipt was still sent
+   * @throws {Error} a failed setup or run, after the failure message was still sent
    */
   async run() {
     const { soak, kind, proc } = this
     if (typeof proc.send !== 'function')
       throw new Error('A telemetry worker needs its parent channel')
     this.listen()
-    proc.send({ type: 'hello', kind, token: process.env[WORKER_TOKEN] })
-    const config = await this.expect('config')
+    this.send({ type: 'hello' })
+    const config = await this.inbox.take((m) => m.type === 'config')
     const resources = new ProcessResources()
     resources.start()
+    const target = (work) => resources.as('target', work)
     let verdict
     let failure
+    let worker = null
     try {
-      const tap = new TelemetryTap((options) => soak.socketFactory(options))
+      const loaded = readMemory('loaded', () => this.clock.now())
+      const host = { before: hostContext(() => this.clock.now()) }
+      const control = await new ReferenceControl({
+        kind,
+        config,
+        Kafka: soak.Kafka,
+        socketFactory: soak.socketFactory,
+        logLevel: soak.logLevel,
+        resources,
+        clock: this.clock,
+        sleep: this.sleep,
+      }).run()
+      host.boundary = hostContext(() => this.clock.now())
+      const ledger =
+        kind === 'shareConsumer'
+          ? new ShareLedger({ group: config.group, clock: this.clock })
+          : null
+      const segments = TelemetrySegments.ordinary(SCENARIO, kind, {
+        directory: config.directory,
+        clock: this.clock,
+        observer: {
+          line: config.line,
+          mode: 'configured',
+          decoder: (raw) => this.askDecode(raw),
+          completeStream: false,
+          consumed: new Set(),
+        },
+      })
+      const tap = new TelemetryTap(segments, { share: ledger, clock: this.clock })
       const { kafka, probe } = soak.instrument(
         {
           clientId: `${config.stem}-${kind}`,
@@ -1246,46 +3217,62 @@ class TelemetryWorkerProcess {
         { publicOnly: true, memory: true, identities: () => resources.identities() }
       )
       const client = this.create(kafka, config)
-      const registry = new Registry(client, kind)
-      const worker = new TelemetryWorker({
+      const schedule = new TelemetrySchedule(soak.TELEMETRY)
+      worker = new TelemetryWorker({
         kind,
         client,
         tap,
-        registry,
+        segments,
+        registry: new Registry(client, kind, DESCRIPTORS, this.clock),
         clock: this.clock,
         sleep: this.sleep,
         limits: soak.TELEMETRY,
+        schedule,
+        inbox: this.inbox,
+        send: (message) => this.send(message),
+        target,
+        ledger,
         ordinary: new OrdinaryWork({
           kind,
           client,
           stem: config.stem,
           topic: config.topic,
+          ctl: config.ctl,
           clock: this.clock,
           sleep: this.sleep,
+          ledger,
+          slots: schedule.corpusSlots(),
         }),
       })
-      this.worker = worker
       const uuid = await worker.prepare()
       const measured = {
         snapshot: async () => {
-          registry.restore()
-          return { ...(await probe.snapshot()), registryDigest: registry.digest(uuid) }
+          worker.registry.restore()
+          const snapshot = await probe.snapshot()
+          return {
+            ...snapshot,
+            memory: snapshot.memory && { ...snapshot.memory, hwm: readHighWater() },
+            registryDigest: worker.registry.digest(uuid),
+          }
         },
       }
-      const { warmupMs, measureMs } = soak.TELEMETRY
-      /** A reading belongs to the measurement only inside the fixed window, never after its end. */
-      const inWindow = ({ atMs }) => atMs >= warmupMs && atMs <= warmupMs + measureMs
-      let readings
+      let input
       const judge = (run) => {
-        readings = run
-        return soak.TelemetryResourceVerdict.evaluate({
+        input = {
           clientCount: 1,
           baseline: run.baseline,
-          samples: run.samples.filter(inWindow),
+          samples: run.samples.map((s) => ({
+            admittedAtMs: s.admittedPhaseMs,
+            completedAtMs: s.phaseMs,
+            atMs: s.phaseMs,
+            snapshot: s.snapshot,
+          })),
           teardown: run.teardown,
           measurementMs: worker.timing.measurementMs,
           cleanupMs: worker.timing.cleanupMs,
-        })
+          reference: this.reference({ loaded, control, host }),
+        }
+        return soak.TelemetryResourceVerdict.evaluate(input)
       }
       const sampler = new soak.Soak({
         kafka,
@@ -1293,6 +3280,7 @@ class TelemetryWorkerProcess {
         phases: soak.PROFILES.telemetry,
         context: { telemetryChurn: worker },
         sampleMs: soak.TELEMETRY.sampleMs,
+        sampleAt: soak.TELEMETRY.sampleAt,
         warmupMs: soak.TELEMETRY.warmupMs,
         judge,
         record: () => {},
@@ -1300,37 +3288,34 @@ class TelemetryWorkerProcess {
         clock: this.clock,
       })
       worker.sampler = sampler
-      proc.send({ type: 'ready', kind, uuid })
-      await this.expect('go')
-      verdict = await sampler.run()
-      proc.send({
+      this.send({ type: 'ready', uuid, clientId: `${config.stem}-${kind}` })
+      await this.inbox.take((m) => m.type === 'start')
+      verdict = await resources.as('fixture:sampler', () => sampler.run())
+      this.send({
         type: 'result',
-        kind,
         clientId: `${config.stem}-${kind}`,
         uuid,
         verdict,
-        input: {
-          baseline: readings.baseline,
-          samples: readings.samples.filter(inWindow),
-          warmSamples: readings.samples.filter(({ atMs }) => atMs < warmupMs).length,
-          lateSamples: readings.samples.filter(({ atMs }) => atMs > warmupMs + measureMs).length,
-          teardown: readings.teardown,
-          measurementMs: worker.timing.measurementMs,
-          cleanupMs: worker.timing.cleanupMs,
-        },
-        requirements: worker.requirements(),
-        rotations: worker.rotations,
-        actions: worker.actions,
-        missed: worker.missed,
-        reopens: worker.reopens,
-        ordinary: worker.ordinary.ids(),
+        input,
+        facts: worker.facts(),
       })
     } catch (error) {
       failure = error
-      proc.send({ type: 'failure', kind, message: String(error?.message ?? error).slice(0, 2048) })
+      const causes = [error]
+      try {
+        await worker?.abort()
+      } catch (abortError) {
+        causes.push(abortError)
+      }
+      this.send({
+        type: 'failure',
+        message: causes
+          .map((c) => String(c?.message ?? c))
+          .join('; ')
+          .slice(0, 2048),
+      })
     }
     resources.stop()
-    proc.send({ type: 'receipt', kind })
     proc.disconnect?.()
     if (failure) throw failure
     return verdict
@@ -1339,27 +3324,45 @@ class TelemetryWorkerProcess {
 
 module.exports = {
   KINDS,
+  SCENARIO,
   SCHEDULE_STEPS: STEPS,
   MINIMUMS,
   CORPUS,
+  CONTROL,
   SETUP_MS,
   NATURAL_EXIT_MS,
   WORKER_ENV,
   WORKER_TOKEN,
   SUBSCRIPTIONS,
+  DecoderCoordinator,
+  FrameCounter,
+  Inbox,
   OrdinaryOracle,
   OrdinaryWork,
   ParentFixture,
   ProcessResources,
+  ReferenceControl,
   Registry,
+  ShareLedger,
+  ShareOracle,
   TelemetryChurn,
   TelemetryProcesses,
+  TelemetryProofs,
   TelemetrySchedule,
   TelemetryTap,
   TelemetryWorker,
   TelemetryWorkerProcess,
+  checkLog,
+  compactRuns,
+  hostContext,
+  indexOf,
   labelOf,
+  logInputs,
+  readHighWater,
+  readMemory,
   recordId,
+  settledReading,
   valueOf,
   wait,
+  within,
 }

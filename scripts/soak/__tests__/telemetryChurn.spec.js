@@ -1,31 +1,38 @@
 const { EventEmitter } = require('node:events')
+const crypto = require('node:crypto')
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
 const {
+  CORPUS,
+  DecoderCoordinator,
   KINDS,
   OrdinaryOracle,
   OrdinaryWork,
   ProcessResources,
   Registry,
+  ShareOracle,
   TelemetryChurn,
   TelemetryProcesses,
+  TelemetryProofs,
   TelemetrySchedule,
   TelemetryTap,
   TelemetryWorker,
   TelemetryWorkerProcess,
   WORKER_ENV,
   WORKER_TOKEN,
+  compactRuns,
+  logInputs,
   recordId,
+  valueOf,
 } = require('../telemetryChurn')
+const { PROFILES, buildTelemetryChurn, instrument, main, parseArgs } = require('../soak')
 const {
-  PROFILES,
-  TELEMETRY,
-  TelemetryResourceVerdict,
-  Soak,
-  WORKLOADS,
-  buildTelemetryChurn,
-  instrument,
-  main,
-  parseArgs,
-} = require('../soak')
+  verifyChurnFence,
+  verifyChurnReopen,
+  verifyChurnRetirement,
+  verifyChurnTransition,
+} = require('../../e2e/telemetry/evidence')
 
 const mockReads = { symbols: 0 }
 jest.mock('../../../index', () => {
@@ -45,6 +52,8 @@ jest.mock('../../../index', () => {
     }),
   }
 })
+
+const sha = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex')
 
 /** Runs `work` with a stand-in for the collection function, as the inherited soak specs do. */
 const withGc = async (work) => {
@@ -81,7 +90,41 @@ const noGc = (work) => {
 
 const turn = () => new Promise((resolve) => setImmediate(resolve))
 
-describe('telemetry profile routes and builds', () => {
+/** Waits for a condition across event loop turns, never longer than a thousand of them. */
+const until = async (condition) => {
+  for (let i = 0; i < 1000 && !condition(); i++) await turn()
+  expect(condition()).toBe(true)
+}
+
+const U = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+const STEM = 's'
+
+const fakeChild = () =>
+  Object.assign(new EventEmitter(), {
+    stdout: new EventEmitter(),
+    stderr: new EventEmitter(),
+    send: jest.fn(),
+    kill: jest.fn(),
+  })
+
+/** A supervisor over fake children, and a way for each to speak with its own handshake token. */
+const rig = (options = {}) => {
+  const children = []
+  const processes = new TelemetryProcesses({
+    script: 'driver.js',
+    spawn: () => {
+      const child = fakeChild()
+      children.push(child)
+      return child
+    },
+    ...options,
+  })
+  const say = (kind, message) =>
+    processes.receive(kind, { kind, token: processes.workers.get(kind).token, ...message })
+  return { processes, children, say }
+}
+
+describe('telemetry profile', () => {
   const owner = (over = {}) => ({
     run: jest.fn(async () => ({ ok: true, marker: 'verdict' })),
     close: jest.fn(async () => {}),
@@ -149,12 +192,7 @@ describe('telemetry profile routes and builds', () => {
     const processes = new TelemetryProcesses({
       script: 'driver.js',
       spawn: (script, args, options) => {
-        const child = Object.assign(new EventEmitter(), {
-          stdout: new EventEmitter(),
-          stderr: new EventEmitter(),
-          send: jest.fn(),
-          kill: jest.fn(),
-        })
+        const child = fakeChild()
         spawned.push({ script, args, options, child })
         return child
       },
@@ -195,70 +233,121 @@ describe('telemetry profile routes and builds', () => {
     }
   })
 
-  test('rejects a duplicate, substituted or missing handshake', async () => {
+  test('rejects a duplicate, substituted, early, uncatalogued or oversized message', async () => {
     let now = 0
-    const processes = new TelemetryProcesses({
-      script: 'driver.js',
-      now: () => (now += 400),
-      spawn: () =>
-        Object.assign(new EventEmitter(), {
-          stdout: new EventEmitter(),
-          stderr: new EventEmitter(),
-        }),
-    })
-    const producer = processes.start('producer')
-    processes.start('consumer')
-    processes.receive('producer', { type: 'hello', kind: 'producer', token: producer.token })
+    const onFailure = jest.fn()
+    const { processes, say } = rig({ now: () => (now += 400), onFailure })
+    for (const kind of KINDS) processes.start(kind)
+    say('producer', { type: 'hello' })
     await expect(processes.message('producer', 'hello', 500)).resolves.toMatchObject({
       kind: 'producer',
     })
-    processes.receive('consumer', { type: 'hello', kind: 'producer', token: producer.token })
-    await expect(processes.message('consumer', 'hello', 500)).rejects.toThrow('Substituted')
-    processes.start('admin')
-    await expect(processes.message('admin', 'hello', 500)).rejects.toThrow('sent no hello')
-    processes.receive('producer', { type: 'failure', kind: 'producer', message: 'boom' })
-    await expect(processes.message('producer', 'result', 500)).rejects.toThrow(
+    processes.receive('consumer', { type: 'hello', kind: 'consumer', token: 'wrong' })
+    await expect(processes.message('consumer', 'hello', 500)).rejects.toThrow('substituted')
+    say('producer', { type: 'hello' })
+    await expect(processes.message('producer', 'result', 500)).rejects.toThrow('a duplicate hello')
+    say('admin', { type: 'ready' })
+    await expect(processes.message('admin', 'ready', 500)).rejects.toThrow('before hello')
+    say('shareConsumer', { type: 'hello' })
+    say('shareConsumer', { type: 'surprise' })
+    await expect(processes.message('shareConsumer', 'ready', 500)).rejects.toThrow(
+      'unknown message surprise'
+    )
+    expect(onFailure.mock.calls.map(([kind]) => kind).sort()).toEqual([
+      'admin',
+      'consumer',
+      'producer',
+      'shareConsumer',
+    ])
+    const big = rig()
+    big.processes.start('producer')
+    big.say('producer', { type: 'hello' })
+    big.say('producer', { type: 'stage-done', pad: 'x'.repeat(8 * 1024 * 1024 + 1) })
+    await expect(big.processes.message('producer', 'ready', 500)).rejects.toThrow('IPC overflow')
+    const silent = rig({ now: () => (now += 400) })
+    silent.processes.start('admin')
+    await expect(silent.processes.message('admin', 'hello', 500)).rejects.toThrow('sent no hello')
+    const failing = rig()
+    failing.processes.start('producer')
+    failing.say('producer', { type: 'hello' })
+    failing.say('producer', { type: 'failure', message: 'boom' })
+    await expect(failing.processes.message('producer', 'result', 500)).rejects.toThrow(
       'Telemetry worker producer failed: boom'
     )
   })
-})
 
-describe('telemetry profile schedule and resources', () => {
-  test('holds the fixed measured action counts and the serialization order', () => {
+  test('holds the fixed measured action counts, the serialization order and the corpus slots', () => {
     const schedule = new TelemetrySchedule({ warmupMs: 60000, measureMs: 300000 })
     expect(schedule.required()).toEqual({ subscription: 30, retire: 10, reopen: 5 })
-    expect(schedule.ticks.find((tick) => tick.at === 60000).actions).toEqual([
-      'reopen',
-      'retire',
-      'subscription',
-    ])
+    expect(schedule.ticks).toHaveLength(35)
+    schedule.ticks.forEach((tick, number) => {
+      expect(tick.number).toBe(number)
+      expect(tick.index).toBe(tick.at / 10000)
+    })
+    const sixty = schedule.ticks.find((tick) => tick.at === 60000)
+    expect(sixty.actions).toEqual(['reopen', 'retire', 'subscription'])
+    expect(schedule.stages(sixty)).toEqual(['lifecycle', 'retire', 'confirm'])
+    expect(schedule.stages(schedule.ticks[0])).toEqual(['confirm'])
     expect(schedule.ticks.at(-1).at).toBe(350000)
     expect(
       schedule.ticks.filter((tick) => !schedule.measured(tick)).flatMap((t) => t.actions)
     ).toEqual(expect.arrayContaining(['retire', 'subscription']))
+    expect([1, 2, 3, 4, 5, 6].map((i) => schedule.selection(i))).toEqual([
+      'com.example.',
+      '',
+      'org.apache.kafka.',
+      'com.example.',
+      '',
+      'org.apache.kafka.',
+    ])
+    for (const tick of schedule.ticks.filter((t) => t.actions.length > 1))
+      expect(schedule.selection(tick.index)).not.toBe('')
+    const slots = schedule.corpusSlots()
+    expect(slots).toHaveLength(CORPUS.records / CORPUS.batch)
+    expect(slots[0]).toBe(60000)
+    expect(slots.at(-1)).toBe(357000)
+    expect(slots.every((slot) => slot >= 60000 && slot < 360000)).toBe(true)
   })
 
-  test('tracks same-count timer replacement by token, not by count', async () => {
+  test('tracks resources by creating role and trigger, and a same-count swap by token', async () => {
     const resources = new ProcessResources()
     resources.start()
+    const timers = []
     try {
-      const timers = () => resources.identities()['resource:Timeout'] ?? []
-      const first = setTimeout(() => {}, 1e6)
+      expect(Object.keys(resources.identities()).sort()).toEqual([
+        'resources:fixture',
+        'resources:target',
+        'resources:unknown',
+      ])
+      const target = resources.as('target', () => setTimeout(() => {}, 1e6))
+      timers.push(target)
+      timers.push(resources.as('fixture:sampler', () => setTimeout(() => {}, 1e6)))
+      timers.push(setTimeout(() => {}, 1e6))
       await turn()
-      const before = timers()
-      clearTimeout(first)
+      const roles = resources.identities()
+      expect(roles['resources:target']).toHaveLength(1)
+      expect(roles['resources:fixture']).toHaveLength(1)
+      expect(roles['resources:unknown']).toHaveLength(1)
+      expect(roles['resources:target'][0]).toMatchObject({ type: 'Timeout', role: 'target' })
+      expect(roles['resources:fixture'][0].role).toBe('fixture:sampler')
+      const before = roles['resources:target']
+      clearTimeout(target)
       await turn()
       await turn()
-      const second = setTimeout(() => {}, 1e6)
+      timers.push(resources.as('target', () => setTimeout(() => {}, 1e6)))
       await turn()
-      const after = timers()
+      const after = resources.identities()['resources:target']
       expect(after).toHaveLength(before.length)
-      expect(after.filter((token) => before.includes(token))).toHaveLength(before.length - 1)
-      clearTimeout(second)
+      expect(after.filter((token) => before.includes(token))).toHaveLength(0)
     } finally {
+      for (const timer of timers) clearTimeout(timer)
       resources.stop()
     }
-    expect(resources.identities()).toEqual({})
+    expect(resources.identities()).toEqual({
+      'resources:target': [],
+      'resources:fixture': [],
+      'resources:unknown': [],
+    })
   })
 
   test('keeps the registry fingerprint through replacement and restore, and fails atomically', () => {
@@ -267,16 +356,22 @@ describe('telemetry profile schedule and resources', () => {
       registerMetricForSubscription: jest.fn((metric) => calls.push(['add', metric.name])),
       unregisterMetricFromSubscription: jest.fn((id) => calls.push(['remove', id.name])),
     }
-    const registry = new Registry(client, 'producer')
+    let now = 100
+    const registry = new Registry(client, 'producer', 128, { now: () => (now += 1) })
     registry.fill()
     expect(registry.registered).toHaveLength(128)
     const canonical = registry.digest('uuid')
-    registry.replace()
+    const entry = registry.replace(7)
+    expect(entry).toEqual({ tick: 7, removedVariant: 'a', addedVariant: 'b', at: 101 })
     expect(registry.registered).toHaveLength(128)
     expect(registry.digest('uuid')).not.toBe(canonical)
     registry.restore()
     expect(registry.digest('uuid')).toBe(canonical)
     expect(registry.digest('other')).not.toBe(canonical)
+    expect(registry.replacements.map((r) => [r.tick, r.addedVariant])).toEqual([
+      [7, 'b'],
+      [null, 'a'],
+    ])
     const bytes = registry.bytes
     client.registerMetricForSubscription.mockImplementationOnce(() => {
       throw new Error('refused')
@@ -286,36 +381,70 @@ describe('telemetry profile schedule and resources', () => {
     expect(registry.registered).toHaveLength(127)
   })
 
-  test('classifies the telemetry transport by its own frames and retires only that socket', () => {
-    const tap = new TelemetryTap(() => {
-      throw new Error('unused')
-    })
-    const socket = () =>
-      Object.assign(new EventEmitter(), { write: jest.fn(() => true), destroy: jest.fn() })
+  describe('transport tap', () => {
     const frame = (api) => {
       const bytes = Buffer.alloc(16)
       bytes.writeInt32BE(12, 0)
       bytes.writeInt16BE(api, 4)
       return bytes
     }
-    const core = tap.track(socket())
-    const telemetry = tap.track(socket())
-    core.write(frame(3))
-    telemetry.write(frame(71))
-    telemetry.write(frame(72))
-    telemetry.write(frame(72))
-    expect(tap.counts()).toEqual({ gets: 1, pushes: 2, sockets: 1 })
-    expect(tap.open()).toBe(1)
-    expect(tap.retire()).toBe(1)
-    expect(telemetry.destroy).toHaveBeenCalledTimes(1)
-    expect(core.destroy).not.toHaveBeenCalled()
-    telemetry.emit('close')
-    expect(tap.open()).toBe(0)
-    expect(tap.retire()).toBe(0)
-  })
-})
+    const socket = () =>
+      Object.assign(new EventEmitter(), { write: jest.fn(() => true), destroy: jest.fn() })
+    const make = () => {
+      const owners = []
+      const observer = {
+        socketOwnership: () => owners,
+        declareFault: jest.fn(),
+      }
+      const segment = { id: 'producer-lc-1', observer }
+      let now = 0
+      const tap = new TelemetryTap(
+        { socketFactory: jest.fn(), current: () => segment },
+        { clock: { now: () => (now += 1) } }
+      )
+      const add = () => {
+        owners.push({})
+        return tap.track(socket(), segment)
+      }
+      return { tap, observer, add }
+    }
 
-describe('telemetry profile instrumentation', () => {
+    test('classifies the telemetry transport by its own frames and faults only the next exchange', async () => {
+      const { tap, observer, add } = make()
+      const core = add()
+      const telemetry = add()
+      core.write(frame(3))
+      telemetry.write(frame(71))
+      expect(tap.telemetry()).toHaveLength(1)
+      expect(tap.open()).toBe(2)
+      const fault = tap.retire()
+      expect(fault).toMatchObject({ segment: 'producer-lc-1', ordinal: 2 })
+      expect(observer.declareFault).toHaveBeenCalledWith(2)
+      expect(telemetry.destroy).not.toHaveBeenCalled()
+      telemetry.write(frame(3))
+      expect(telemetry.destroy).not.toHaveBeenCalled()
+      core.write(frame(3))
+      expect(core.destroy).not.toHaveBeenCalled()
+      telemetry.write(frame(72))
+      expect(telemetry.destroy).toHaveBeenCalledTimes(1)
+      expect(core.destroy).not.toHaveBeenCalled()
+      await expect(fault.hit).resolves.toBeGreaterThan(fault.declaredAt)
+      telemetry.write(frame(72))
+      expect(telemetry.destroy).toHaveBeenCalledTimes(1)
+      telemetry.emit('close')
+      expect(tap.telemetry()).toHaveLength(0)
+      expect(tap.records[1].socket).toBeNull()
+      expect(() => tap.retire()).toThrow('exactly one open telemetry socket')
+    })
+
+    test('refuses to fault when more than one telemetry socket is open', () => {
+      const { tap, add } = make()
+      add().write(frame(71))
+      add().write(frame(72))
+      expect(() => tap.retire()).toThrow('exactly one open telemetry socket')
+    })
+  })
+
   test('uses public instrumentation without private symbols', async () => {
     mockReads.symbols = 0
     const sockets = []
@@ -340,7 +469,8 @@ describe('telemetry profile instrumentation', () => {
     expect(mockReads.symbols).toBe(0)
     expect(row.sockets).toEqual({ created: 1, destroyed: 0, open: 1 })
     expect(row.identities.sockets).toHaveLength(1)
-    expect(row.identities['listener:sockets:data']).toHaveLength(2)
+    expect(row.identities['listener:socket1:data']).toHaveLength(2)
+    expect(Object.keys(row.identities)).not.toContain('listener:sockets:data')
     for (const omitted of ['queueDepth', 'ledgerSize', 'obligationSize'])
       expect(row).not.toHaveProperty(omitted)
     expect(listeners()).toEqual({ sockets: { data: 2 } })
@@ -356,11 +486,7 @@ describe('telemetry profile instrumentation', () => {
       expect(() =>
         instrument(
           { clientId: 'm', brokers: ['a:1'], socketFactory: () => new EventEmitter() },
-          {
-            publicOnly: true,
-            activeResources: false,
-            memory: true,
-          }
+          { publicOnly: true, activeResources: false, memory: true }
         )
       ).toThrow('--expose-gc')
     } finally {
@@ -377,250 +503,549 @@ describe('telemetry profile instrumentation', () => {
   })
 })
 
-/** A client double that logs its public calls in order. */
-const fakeClient = (log, over = {}) => ({
-  connect: jest.fn(async () => log.push('connect')),
-  disconnect: jest.fn(async () => log.push('disconnect')),
-  clientInstanceId: jest.fn(async () => {
-    log.push('cache-read')
-    return 'uuid-1'
-  }),
-  registerMetricForSubscription: jest.fn(),
-  unregisterMetricFromSubscription: jest.fn(),
-  ...over,
-})
-
-/** A tap double whose Push total moves when asked. */
-const fakeTap = (state = { gets: 0, pushes: 0, open: 1 }) => ({
-  state,
-  counts: () => ({ gets: state.gets, pushes: state.pushes, sockets: 1 }),
-  open: () => state.open,
-  retire: jest.fn(() => {
-    state.pushes += 1
-    return 1
-  }),
-})
-
-/**
- * Builds a worker over doubles and a small window.
- * @param {object} [over] replacements
- * @returns {{worker:object, log:string[], tap:object, ordinary:object, client:object}}
- */
-const makeWorker = (over = {}) => {
-  const log = []
-  const client = fakeClient(log, over.client)
-  const tap = over.tap ?? fakeTap()
-  const ordinary = {
-    start: jest.fn(async () => log.push('start')),
-    stop: jest.fn(async () => log.push('stop')),
-    drain: jest.fn(async () => log.push('drain')),
-    resume: jest.fn(async () => log.push('resume')),
-    ids: () => ({}),
-    ...over.ordinary,
-  }
-  let now = 0
-  const limits = over.limits ?? { warmupMs: 20, measureMs: 60 }
-  const worker = new TelemetryWorker({
-    kind: 'producer',
-    client,
-    tap,
-    registry: over.registry ?? new Registry(client, 'producer', 2),
-    clock: over.clock ?? { now: () => (now += 5) },
-    sleep: async () => {},
-    ordinary,
-    limits,
-    schedule: over.schedule ?? new TelemetrySchedule(limits),
+describe('telemetry wire proofs', () => {
+  const get = (index, over = {}) => ({
+    type: 'request',
+    apiKey: 71,
+    index,
+    requestKey: `r${index}`,
+    socketId: 1,
+    uuid: U,
+    writeAt: index * 10,
+    response: {
+      errorCode: 0,
+      uuid: U,
+      subscriptionId: 7,
+      pushIntervalMs: 1000,
+      requestedMetrics: ['org.apache.kafka.'],
+      responseAt: index * 10 + 5,
+    },
+    ...over,
   })
-  if (!over.registry) worker.registry.fill()
-  worker.uuid = 'uuid-1'
-  worker.sampler = over.sampler ?? { endSampling: jest.fn(async () => log.push('end-sampling')) }
-  client.connect.mockImplementation(async () => {
-    log.push('connect')
-    tap.state.pushes += 1
+  const push = (index, over = {}) => ({
+    type: 'request',
+    apiKey: 72,
+    index,
+    requestKey: `r${index}`,
+    socketId: 1,
+    uuid: U,
+    subscriptionId: 7,
+    terminating: false,
+    metricsBytes: 10,
+    writeAt: index * 10,
+    response: { errorCode: 0, responseAt: index * 10 + 5 },
+    ...over,
   })
-  return { worker, log, tap, ordinary, client }
-}
 
-describe('telemetry profile worker', () => {
-  test('retains immediate reopen ordering and normal pushes', async () => {
-    const { worker, log, tap } = makeWorker()
-    await worker.reopen()
-    expect(log).toEqual(['drain', 'disconnect', 'connect', 'resume', 'cache-read'])
-    expect(worker.reopens).toEqual([
-      { order: ['disconnect-resolved', 'connect-called'], uuid: 'uuid-1', push: true, open: 1 },
+  test('counts only a successful Get that carried and returned the assigned UUID', () => {
+    const zero = get(1, { uuid: '00000000-0000-0000-0000-000000000000' })
+    const failed = get(3, { response: { errorCode: 3 } })
+    const foreign = get(4, { response: { ...get(4).response, uuid: 'other' } })
+    expect(
+      TelemetryProofs.gets([zero, get(2), failed, foreign], U).map((r) => r.requestKey)
+    ).toEqual(['r2'])
+  })
+
+  test('proves a replacement only with a later accepted nonempty Push on the same socket', () => {
+    const records = [get(1), push(2)]
+    expect(TelemetryProofs.provingPush(records, records[0]).requestKey).toBe('r2')
+    const rejected = [
+      ['a Push at the Get response time', push(2, { writeAt: 15 })],
+      ['a Push on another socket', push(2, { socketId: 2 })],
+      ['a final', push(2, { terminating: true })],
+      ['an empty Push', push(2, { metricsBytes: 0 })],
+      ['a rejected Push', push(2, { response: { errorCode: 42, responseAt: 25 } })],
+      ['a Push of another client', push(2, { uuid: 'other' })],
+      ['a Push before the Get', push(0, { writeAt: 1, index: 0 })],
+    ]
+    for (const [, other] of rejected)
+      expect(TelemetryProofs.provingPush([get(1), other], get(1))).toBeUndefined()
+  })
+
+  test('requires the exact requested list and interval for a selection Get', () => {
+    const custom = get(2, {
+      response: { ...get(2).response, requestedMetrics: ['com.example.'], subscriptionId: 8 },
+    })
+    const empty = get(3, { response: { ...get(3).response, requestedMetrics: [] } })
+    const slow = get(4, { response: { ...get(4).response, pushIntervalMs: 300000 } })
+    const records = [get(1), custom, empty, slow]
+    expect(
+      TelemetryProofs.selectionGet(records, U, { selection: ['com.example.'] }).requestKey
+    ).toBe('r2')
+    expect(TelemetryProofs.selectionGet(records, U, { selection: [] }).requestKey).toBe('r3')
+    expect(TelemetryProofs.selectionGet(records, U, { selection: ['org.'] })).toBeUndefined()
+    expect(
+      TelemetryProofs.selectionGet(records, U, { selection: ['com.example.'], after: 21 })
+    ).toBeUndefined()
+    expect(TelemetryProofs.selectionGet([slow], U, { selection: ['org.apache.kafka.'] })).toBe(
+      undefined
+    )
+  })
+
+  test('declares the proof selection from the transcript alone', () => {
+    const records = [
+      get(1),
+      push(2),
+      push(3),
+      get(4, {
+        response: { ...get(4).response, requestedMetrics: ['com.example.'], subscriptionId: 8 },
+      }),
+      push(5, { subscriptionId: 8 }),
+      push(6, { subscriptionId: 8 }),
+      get(7, { socketId: 2 }),
+      push(8, { socketId: 2 }),
+      push(9, { terminating: true, socketId: 2 }),
+      push(10, { socketId: 2, response: { errorCode: 42, responseAt: 105 } }),
+    ]
+    expect(TelemetryProofs.selection(records, { terminal: false })).toEqual([
+      'r2',
+      'r5',
+      'r8',
+      'r9',
     ])
-    expect(tap.state.pushes).toBe(1)
-
-    const changed = makeWorker({ client: { clientInstanceId: jest.fn(async () => 'uuid-2') } })
-    await expect(changed.worker.reopen()).rejects.toThrow('instance ID changed')
-
-    const silent = makeWorker()
-    silent.client.connect.mockImplementation(async () => silent.log.push('connect'))
-    await expect(silent.worker.reopen()).rejects.toThrow('No normal Push followed')
-  })
-
-  test('samples the full window and stops before cleanup', async () => {
-    const order = []
-    let samples = 0
-    const sampler = {
-      endSampling: jest.fn(async () => order.push(`end-sampling:${samples}`)),
-    }
-    const harness = makeWorker({
-      sampler,
-      ordinary: { stop: jest.fn(async () => order.push('cleanup-stop')) },
-      limits: { warmupMs: 60000, measureMs: 300000 },
-    })
-    samples = 11
-    const { worker } = harness
-    await worker.work(360000)
-    expect(order[0]).toBe('end-sampling:11')
-    expect(order.indexOf('cleanup-stop')).toBeGreaterThan(0)
-    expect(order.filter((entry) => entry.startsWith('end-sampling'))).toHaveLength(2)
-    expect(worker.actions.measured).toEqual({ subscription: 30, retire: 10, reopen: 5 })
-    expect(worker.requirements()).toEqual({ ok: true, violations: [] })
-    expect(worker.timing.measurementMs).toBeGreaterThanOrEqual(300000)
-    expect(worker.timing.cleanupMs).toBeGreaterThanOrEqual(0)
-    await expect(worker.work(1000)).rejects.toThrow('fixed 360000 ms')
-  })
-
-  test('fails a run that missed a measured tick', () => {
-    const { worker } = makeWorker()
-    worker.actions.measured = { subscription: 30, retire: 10, reopen: 5 }
-    expect(worker.requirements().ok).toBe(true)
-    worker.missed.push({ at: 70000, actions: ['subscription'], late: 9000 })
-    expect(worker.requirements().violations).toContain('a measured tick was missed')
-    worker.missed.length = 0
-    worker.actions.measured.reopen = 4
-    expect(worker.requirements().violations).toContain('measured reopen actions 4')
-  })
-
-  test.each([
-    [
-      'sampler join',
-      { sampler: { endSampling: jest.fn(async () => Promise.reject(new Error('sampler'))) } },
-      'sampler',
-    ],
-    [
-      'ordinary stop',
-      { ordinary: { stop: jest.fn(async () => Promise.reject(new Error('stop'))) } },
-      'stop',
-    ],
-    [
-      'registry restore',
-      {
-        registry: {
-          restore: jest.fn(() => {
-            throw new Error('restore')
-          }),
-        },
-      },
-      'restore',
-    ],
-    [
-      'disconnect',
-      { client: { disconnect: jest.fn(async () => Promise.reject(new Error('disconnect'))) } },
-      'disconnect',
-    ],
-  ])('restores owned resources after a %s failure', async (_name, over, message) => {
-    const harness = makeWorker({ ...over, limits: { warmupMs: 10, measureMs: 20 } })
-    const failure = await harness.worker.work(30).catch((error) => error)
-    const messages =
-      failure instanceof AggregateError ? failure.errors.map((e) => e.message) : [failure.message]
-    expect(messages).toContain(message)
-    expect(harness.ordinary.stop).toHaveBeenCalledTimes(1)
-    expect(harness.client.disconnect).toHaveBeenCalledTimes(1)
-  })
-
-  test('keeps the primary workload failure ahead of cleanup failures', async () => {
-    const harness = makeWorker({
-      limits: { warmupMs: 10, measureMs: 20 },
-      ordinary: {
-        start: jest.fn(async () => Promise.reject(new Error('primary'))),
-        stop: jest.fn(async () => Promise.reject(new Error('stop'))),
-      },
-    })
-    const failure = await harness.worker.work(30).catch((error) => error)
-    expect(failure).toBeInstanceOf(AggregateError)
-    expect(failure.errors.map((e) => e.message)).toEqual(['primary', 'stop'])
+    expect(TelemetryProofs.selection(records, { terminal: true })).toEqual(['r2', 'r5', 'r8'])
+    expect(TelemetryProofs.selection([get(1)], { terminal: false })).toEqual([])
   })
 })
 
-describe('telemetry profile sampling under the inherited Soak', () => {
-  test('admits at least ten post-collection samples inside the window', async () => {
-    jest.useFakeTimers()
-    try {
-      let samples = 0
-      const probe = {
-        snapshot: async () => ({
-          sockets: { open: 0 },
-          memory: { retainedBytes: 10, peakRss: 20 },
-          identities: { sockets: [] },
-          registryDigest: 'd',
-          n: ++samples,
-        }),
-      }
-      const clock = { now: () => Date.now() }
-      const harness = makeWorker({
-        clock,
-        limits: { warmupMs: 60000, measureMs: 300000 },
-      })
-      harness.worker.sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
-      let judged
-      const soak = new Soak({
-        kafka: {},
-        probe,
-        phases: PROFILES.telemetry,
-        context: { telemetryChurn: harness.worker },
-        sampleMs: TELEMETRY.sampleMs,
-        warmupMs: TELEMETRY.warmupMs,
-        settleMs: 0,
-        clock,
-        record: () => {},
-        workloads: WORKLOADS,
-        judge: (run) => {
-          judged = run
-          return { ok: true, violations: [] }
-        },
-      })
-      harness.worker.sampler = soak
-      const done = soak.run()
-      for (let i = 0; i < 420; i++) await jest.advanceTimersByTimeAsync(1000)
-      await done
-      const measured = judged.samples.filter((s) => s.atMs >= TELEMETRY.warmupMs)
-      expect(measured.length).toBeGreaterThanOrEqual(10)
-      expect(Math.max(...judged.samples.map((s) => s.atMs))).toBeLessThanOrEqual(360000)
-      expect(harness.worker.requirements().ok).toBe(true)
-    } finally {
-      jest.useRealTimers()
+describe('telemetry profile oracles', () => {
+  const logFor = (kind, tamper = () => {}) => {
+    const parts = [[], [], []]
+    for (let i = 0; i < CORPUS.records; i++) {
+      const id = recordId(STEM, kind, i)
+      parts[i % 3].push({ offset: String(parts[i % 3].length), key: id, value: valueOf(id) })
     }
-  }, 60000)
+    tamper(parts)
+    return new Map(parts.map((records, partition) => [partition, { records }]))
+  }
+  const inputsOf = (kind, tamper) => logInputs(logFor(kind, tamper), STEM, kind)
+  const handledOf = (log) =>
+    Object.entries(log.partitions).flatMap(([partition, rows]) =>
+      rows.map(([offset, index]) => [Number(partition), offset, index, 12, 13])
+    )
+
+  test('compacts neighbouring settlements into ranges without changing any field', () => {
+    const fact = (offset, over = {}) => ({
+      topicId: 'T',
+      partition: 0,
+      offset: String(offset),
+      type: 1,
+      errorCode: 0,
+      at: 5,
+      ...over,
+    })
+    expect(compactRuns([fact(0), fact(1), fact(2), fact(4), fact(5, { type: 2 })])).toEqual([
+      {
+        topicId: 'T',
+        partition: 0,
+        type: 1,
+        errorCode: 0,
+        at: 5,
+        firstOffset: '0',
+        lastOffset: '2',
+      },
+      {
+        topicId: 'T',
+        partition: 0,
+        type: 1,
+        errorCode: 0,
+        at: 5,
+        firstOffset: '4',
+        lastOffset: '4',
+      },
+      {
+        topicId: 'T',
+        partition: 0,
+        type: 2,
+        errorCode: 0,
+        at: 5,
+        firstOffset: '5',
+        lastOffset: '5',
+      },
+    ])
+  })
+
+  test('preserves record commit and handler identities', () => {
+    const log = inputsOf('consumer')
+    const handled = handledOf(log)
+    const good = () => ({
+      kind: 'consumer',
+      stem: STEM,
+      log,
+      handled: handled.map((e) => [...e]),
+      processed: { ...log.ends },
+      committed: { ...log.ends },
+    })
+    const ok = OrdinaryOracle.check(good())
+    expect(ok).toMatchObject({ ok: true, violations: [] })
+    const same = OrdinaryOracle.check(good())
+    expect(same.hashes).toEqual(ok.hashes)
+    const control = (change) => {
+      const input = good()
+      change(input)
+      return OrdinaryOracle.check(input)
+    }
+    expect(control((i) => i.handled.pop()).violations).toContain(
+      'handler identities are incomplete'
+    )
+    expect(control((i) => i.handled.push([...i.handled[0]])).violations).toContain(
+      'handler repeats an identity'
+    )
+    expect(
+      control((i) => {
+        i.handled[5][2] = i.handled[6][2]
+      }).violations
+    ).toEqual(
+      expect.arrayContaining([
+        'handler repeats an identity',
+        'a handler entry differs from the raw log at its offset',
+      ])
+    )
+    expect(
+      control((i) => {
+        i.committed['1'] = String(Number(i.committed['1']) - 1)
+      }).violations
+    ).toContain('committed end differs on 1')
+    expect(
+      control((i) => {
+        i.processed['0'] = String(Number(i.processed['0']) + 1)
+      }).violations
+    ).toEqual(
+      expect.arrayContaining([
+        'processed end differs from the log end on 0',
+        'committed end differs on 0',
+      ])
+    )
+    const altered = inputsOf('consumer', (parts) => {
+      parts[0][3].value = Buffer.from('changed')
+    })
+    expect(OrdinaryOracle.check({ ...good(), log: altered }).violations).toContain(
+      'log 0 value bytes differ from the corpus'
+    )
+    const missing = inputsOf('consumer', (parts) => parts[2].pop())
+    expect(OrdinaryOracle.check({ ...good(), log: missing }).violations).toContain(
+      'durable identities are incomplete'
+    )
+  })
+
+  test('keeps the producer offer and resolution ledgers apart from the raw log', () => {
+    const log = inputsOf('producer')
+    const all = Array.from({ length: CORPUS.records }, (_, i) => i)
+    expect(
+      OrdinaryOracle.check({ kind: 'producer', stem: STEM, log, offered: all, resolved: all })
+    ).toMatchObject({ ok: true })
+    const dropped = OrdinaryOracle.check({
+      kind: 'producer',
+      stem: STEM,
+      log,
+      offered: all,
+      resolved: all.slice(1),
+    })
+    expect(dropped.violations).toEqual(['resolved identities are incomplete'])
+  })
+
+  describe('share', () => {
+    const range = (partition, count, over = {}) => ({
+      topicId: 'T',
+      partition,
+      firstOffset: '0',
+      lastOffset: String(count - 1),
+      ...over,
+    })
+    const build = () => {
+      const log = inputsOf('shareConsumer')
+      const counts = Object.entries(log.partitions).map(([p, rows]) => [Number(p), rows.length])
+      return {
+        stem: STEM,
+        log,
+        topicId: 'T',
+        handled: handledOf(log),
+        acquisitions: counts.map(([p, n]) =>
+          range(p, n, { deliveryCount: 1, at: 10, lockMs: 15000 })
+        ),
+        settlements: counts.map(([p, n]) => range(p, n, { type: 1, errorCode: 0, at: 20 })),
+        settled: counts.map(([p, n]) =>
+          range(p, n, { topic: 'share', type: 'accept', error: null, at: 21 })
+        ),
+        closures: [],
+      }
+    }
+    const check = (change) => {
+      const input = build()
+      change(input)
+      return ShareOracle.check(input)
+    }
+
+    test('accepts every offset once at the broker and publicly with no duplicate delivery', () => {
+      expect(ShareOracle.check(build())).toMatchObject({ ok: true, violations: [] })
+    })
+
+    test.each([
+      [
+        'a second accept',
+        (i) => i.settlements.push(range(0, 1, { type: 1, errorCode: 0, at: 30 })),
+        'an offset lacks exactly one broker accept',
+      ],
+      [
+        'a settlement after the accept',
+        (i) => i.settlements.push(range(0, 1, { type: 2, errorCode: 0, at: 30 })),
+        'an offset was settled again after its accept',
+      ],
+      [
+        'a failed acknowledgement counted as a settlement',
+        (i) => (i.settlements[0].errorCode = 9),
+        'a failed acknowledgement counted as a settlement',
+      ],
+      [
+        'a missing public accept',
+        (i) => i.settled.pop(),
+        'an offset lacks exactly one public accept',
+      ],
+      [
+        'a public acknowledgement error',
+        (i) => (i.settled[0].error = { name: 'KafkaJSShareAcknowledgementError', reason: 'x' }),
+        'a public acknowledgement carried an error',
+      ],
+      [
+        'accepted work delivered again',
+        (i) => i.handled.push([0, 0, 0, 25, 26]),
+        'accepted work was delivered again',
+      ],
+      [
+        'a release without a redelivery',
+        (i) => {
+          i.settlements.push(range(0, 1, { type: 2, errorCode: 0, at: 15 }))
+          i.settled.push(range(0, 1, { topic: 'share', type: 'release', error: null, at: 16 }))
+        },
+        'deliveries differ from one plus the releases',
+      ],
+      [
+        'a foreign topic',
+        (i) => (i.acquisitions[0].topicId = 'X'),
+        'an acquisition names a foreign topic',
+      ],
+    ])('rejects %s', (_name, change, label) => {
+      expect(check(change).violations).toContain(label)
+    })
+
+    test('requires the close to accept the handled prefix and release the rest', () => {
+      const closed = (change = () => {}) => {
+        const input = build()
+        input.closures = [{ at: 15, end: 18 }]
+        input.settlements.forEach((s) => (s.at = 16))
+        change(input)
+        return ShareOracle.check(input)
+      }
+      expect(closed()).toMatchObject({ ok: true })
+      expect(
+        closed((i) => {
+          i.handled.forEach((e) => (e[4] = null))
+        }).violations
+      ).toContain('the close did not accept the handled prefix and release the rest')
+      expect(closed((i) => i.settlements.forEach((s) => (s.at = 40))).violations).toContain(
+        'an offset was unsettled when its close ended'
+      )
+    })
+  })
+})
+
+describe('telemetry profile ordinary work', () => {
+  const consumer = () => {
+    const calls = []
+    const handlers = []
+    const client = {
+      subscribe: jest.fn(async () => calls.push('subscribe')),
+      run: jest.fn(async ({ eachMessage }) => {
+        handlers.push(eachMessage)
+        calls.push('run')
+      }),
+      pause: jest.fn(async () => calls.push('pause')),
+      resume: jest.fn(async () => calls.push('resume')),
+      commitOffsets: jest.fn(async (offsets) => calls.push(['commit', offsets])),
+    }
+    let now = 0
+    const work = new OrdinaryWork({
+      kind: 'consumer',
+      client,
+      stem: STEM,
+      topic: 't',
+      ctl: 'c',
+      clock: { now: () => (now += 1) },
+      sleep: async () => {},
+    })
+    return { work, client, calls, handlers }
+  }
+  const message = (offset) => ({
+    partition: 0,
+    message: { offset: String(offset), key: recordId(STEM, 'consumer', offset) },
+  })
+
+  test('pauses admission, drains in-flight work and confirms commits before a close, resuming after', async () => {
+    const { work, calls, handlers } = consumer()
+    await work.start()
+    await handlers[0](message(4))
+    const receipt = await work.pause()
+    expect(calls).toEqual([
+      'subscribe',
+      'run',
+      'pause',
+      ['commit', [{ topic: 't', partition: 0, offset: '5' }]],
+    ])
+    expect(receipt.pausedAt).toBeLessThanOrEqual(receipt.idleAt)
+    expect(receipt.idleAt).toBeLessThanOrEqual(receipt.confirmedAt)
+    expect(work.paused).toBe(true)
+    await work.resume()
+    expect(calls.slice(4)).toEqual(['subscribe', 'run', 'resume'])
+    expect(work.paused).toBe(false)
+    expect(work.ids()).toMatchObject({
+      handled: [[0, 4, 4, expect.any(Number), expect.any(Number)]],
+      processed: { 0: '5' },
+      committed: { 0: '5' },
+    })
+    expect(work.ids().pauses).toHaveLength(1)
+  })
+
+  test('waits for an in-flight handler before confirming, and refuses one that never goes idle', async () => {
+    const { work } = consumer()
+    await work.start()
+    work.active = 1
+    const pausing = work.pause()
+    pausing.catch(() => {})
+    await expect(pausing).rejects.toThrow('did not go idle')
+  })
+
+  test('offers the producer corpus only in its fixed slots and never while paused', async () => {
+    let now = 0
+    const send = jest.fn(async () => [])
+    const work = new OrdinaryWork({
+      kind: 'producer',
+      client: { send },
+      stem: STEM,
+      topic: 't',
+      ctl: 'c',
+      clock: { now: () => now },
+      sleep: (ms) =>
+        new Promise((resolve) =>
+          setImmediate(() => {
+            now += ms
+            resolve()
+          })
+        ),
+      slots: [1000, 1010, 1020],
+    })
+    work.running = true
+    work.paused = true
+    work.corpus()
+    for (let i = 0; i < 20; i++) await turn()
+    expect(send).not.toHaveBeenCalled()
+    work.paused = false
+    await until(() => send.mock.calls.length === 3)
+    await work.stop()
+    expect(work.ids().offered).toHaveLength(300)
+    expect(work.ids().resolved).toEqual(work.ids().offered)
+    expect(send.mock.calls[0][0].messages[0]).toMatchObject({ key: recordId(STEM, 'producer', 0) })
+    expect(send.mock.calls[2][0].messages.at(-1).key).toBe(recordId(STEM, 'producer', 299))
+    expect(work.ids().late).toHaveLength(3)
+  })
+
+  test('sends core work to the control topic and describes the cluster for an admin', async () => {
+    const send = jest.fn(async () => [])
+    const producer = new OrdinaryWork({
+      kind: 'producer',
+      client: { send },
+      stem: STEM,
+      topic: 't',
+      ctl: 'ctl',
+      clock: { now: () => 0 },
+    })
+    await producer.core(3)
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({ topic: 'ctl', acks: -1 }))
+    const describeCluster = jest.fn(async () => ({}))
+    const admin = new OrdinaryWork({
+      kind: 'admin',
+      client: { describeCluster },
+      stem: STEM,
+      topic: 't',
+      ctl: 'ctl',
+      clock: { now: () => 0 },
+    })
+    await admin.core(1)
+    expect(describeCluster).toHaveBeenCalledWith({ timeout: 3000 })
+  })
+})
+
+describe('telemetry profile decoder', () => {
+  test('forwards bounded raw input and reduces the real receipts to replayable facts', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'decoder-spec-'))
+    try {
+      const body = { parse: 'ok', metrics: [] }
+      fs.writeFileSync(
+        path.join(directory, 'decoder-123.json'),
+        JSON.stringify({
+          code: 0,
+          signal: null,
+          line: '4.3.1',
+          rawSha256: 'ab'.repeat(32),
+          stdout: `${JSON.stringify({ verified: true, line: '4.3.1' })}\n${JSON.stringify(body)}\n`,
+          stderr: '',
+        })
+      )
+      const observer = {
+        directory,
+        decodeRaw: jest.fn(async () => body),
+        dispose: jest.fn(async () => {}),
+        assertClean: jest.fn(),
+      }
+      const decoder = new DecoderCoordinator({
+        directory,
+        line: '4.3.1',
+        clock: { now: () => 0 },
+        make: () => observer,
+      })
+      await expect(
+        decoder.decode('producer', Buffer.alloc(10, 1).toString('base64'))
+      ).resolves.toBe(body)
+      await expect(decoder.decode('producer', '')).rejects.toThrow('outside its bound')
+      await expect(decoder.decode('admin', Buffer.alloc(4097).toString('base64'))).rejects.toThrow(
+        'outside its bound'
+      )
+      const closed = await decoder.close()
+      expect(await decoder.close()).toBe(closed)
+      expect(observer.dispose).toHaveBeenCalledTimes(1)
+      expect(closed.calls).toEqual([
+        { kind: 'producer', rawSha256: sha(Buffer.alloc(10, 1)), bytes: 10 },
+      ])
+      expect(closed.receipts).toEqual([
+        {
+          pid: 123,
+          code: 0,
+          signal: null,
+          line: '4.3.1',
+          rawSha256: 'ab'.repeat(32),
+          identity: { verified: true, line: '4.3.1' },
+          bodySha256: sha(JSON.stringify(body)),
+          stderrBytes: 0,
+        },
+      ])
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
 })
 
 describe('telemetry profile natural exit', () => {
-  const rig = () => {
+  const natural = () => {
     jest.useFakeTimers()
-    const spawned = []
-    const processes = new TelemetryProcesses({
-      script: 'driver.js',
-      now: () => Date.now(),
-      spawn: () => {
-        const child = Object.assign(new EventEmitter(), {
-          stdout: new EventEmitter(),
-          stderr: new EventEmitter(),
-          kill: jest.fn(),
-        })
-        spawned.push(child)
-        return child
-      },
-    })
-    processes.start('producer')
-    return { processes, child: spawned[0] }
+    const made = rig({ now: () => Date.now() })
+    made.processes.start('producer')
+    made.say('producer', { type: 'hello' })
+    return { ...made, child: made.children[0] }
   }
   afterEach(() => jest.useRealTimers())
 
   test('joins children naturally and treats timeouts as failures', async () => {
-    const clean = rig()
-    clean.processes.receive('producer', { type: 'receipt' })
+    const clean = natural()
+    clean.say('producer', { type: 'receipt' })
     const joined = clean.processes.join('producer')
     await jest.advanceTimersByTimeAsync(9000)
     clean.child.emit('close', 0, null)
@@ -630,28 +1055,31 @@ describe('telemetry profile natural exit', () => {
       signal: null,
       stderrBytes: 0,
       unhandled: 0,
+      receipts: 1,
+      killed: false,
       watchdogExpired: false,
       afterDisconnectMs: 9000,
     })
 
-    const late = rig()
-    late.processes.receive('producer', { type: 'receipt' })
+    const late = natural()
+    late.say('producer', { type: 'receipt' })
     const lateJoin = late.processes.join('producer')
     await jest.advanceTimersByTimeAsync(10001)
     late.child.emit('close', 0, null)
     await expect(lateJoin).resolves.toMatchObject({ event: 'timeout', watchdogExpired: true })
 
-    const noReceipt = rig()
+    const noReceipt = natural()
     noReceipt.child.emit('close', 0, null)
     await expect(noReceipt.processes.join('producer')).resolves.toMatchObject({
       event: 'close',
       afterDisconnectMs: null,
+      receipts: 0,
     })
 
-    const killed = rig()
-    killed.processes.receive('producer', { type: 'receipt' })
+    const killed = natural()
+    killed.say('producer', { type: 'receipt' })
     killed.child.stderr.emit('data', 'boom')
-    killed.processes.receive('producer', { type: 'unhandled' })
+    killed.say('producer', { type: 'unhandled' })
     const killedJoin = killed.processes.join('producer')
     killed.child.emit('close', null, 'SIGTERM')
     await expect(killedJoin).resolves.toMatchObject({
@@ -660,266 +1088,855 @@ describe('telemetry profile natural exit', () => {
       stderrBytes: 4,
       unhandled: 1,
     })
+
+    const tainted = natural()
+    tainted.say('producer', { type: 'receipt' })
+    tainted.processes.taint('producer')
+    expect(tainted.child.kill).toHaveBeenCalledWith('SIGKILL')
+    tainted.child.emit('close', null, 'SIGKILL')
+    await expect(tainted.processes.join('producer')).resolves.toMatchObject({ killed: true })
+  })
+
+  test('rejects a second explicit-disconnect receipt and output beyond its bound', async () => {
+    const onFailure = jest.fn()
+    const dup = rig({ onFailure })
+    dup.processes.start('producer')
+    dup.say('producer', { type: 'hello' })
+    dup.say('producer', { type: 'receipt' })
+    dup.say('producer', { type: 'receipt' })
+    expect(onFailure).toHaveBeenCalledTimes(1)
+    expect(onFailure.mock.calls[0][1].message).toContain('a duplicate receipt')
+    const loud = rig({ onFailure })
+    loud.processes.start('admin')
+    loud.children[0].stderr.emit('data', 'x'.repeat(65537))
+    expect(onFailure.mock.calls.at(-1)[1].message).toContain('stderr overflow')
   })
 })
 
-/** The identity of record `index` of a kind, as the parent's corpus names it. */
-const ids = (kind, count = 10000) => Array.from({ length: count }, (_, i) => recordId('s', kind, i))
-
-describe('telemetry profile parent', () => {
-  const flat = () => {
-    const snapshot = () => ({
-      memory: { retainedBytes: 10, peakRss: 20 },
-      registryDigest: 'd',
-      identities: { sockets: [] },
-    })
-    return {
-      baseline: snapshot(),
-      samples: Array.from({ length: 11 }, (_, i) => ({
-        atMs: 60000 + i * 30000,
-        snapshot: snapshot(),
-      })),
-      teardown: snapshot(),
-      measurementMs: 300000,
-      cleanupMs: 1000,
-    }
-  }
-  const natural = (kind, over = {}) => ({
-    kind,
-    event: 'close',
-    code: 0,
-    signal: null,
-    stderrBytes: 0,
-    unhandled: 0,
-    watchdogExpired: false,
-    afterDisconnectMs: 100,
-    ...over,
-  })
-  const result = (kind, over = {}) => ({
-    type: 'result',
-    kind,
-    clientId: `s-${kind}`,
-    uuid: `uuid-${kind}`,
-    input: flat(),
-    requirements: { ok: true, violations: [] },
-    rotations: Array.from({ length: 30 }, (_, index) => ({ index, confirmed: true })),
-    ordinary: {
-      offered: ids(kind),
-      handled: ids(kind),
-      processed: { 0: '3' },
+describe('telemetry profile worker', () => {
+  const getRecord = (index, socketId, over = {}) => ({
+    type: 'request',
+    apiKey: 71,
+    index,
+    requestKey: `r${index}`,
+    socketId,
+    uuid: U,
+    writeAt: index * 10,
+    response: {
+      errorCode: 0,
+      uuid: U,
+      subscriptionId: 7,
+      pushIntervalMs: 1000,
+      requestedMetrics: ['org.apache.kafka.'],
+      responseAt: index * 10 + 5,
     },
     ...over,
   })
-  const build = (over = {}) => {
-    const rows = []
-    const sends = []
-    let t = 0
+  const observerOf = (records) => ({
+    records,
+    readTranscript: ({ after = 0 } = {}) =>
+      records.filter((r) => r.index > after).map((r) => ({ ...r })),
+    checkpoint: () => records.length,
+    normalRequests: ({ after = 0 } = {}) =>
+      records.filter((r) => r.index > after && r.response && r.normal),
+    socketsClosed: async () => {},
+    decodeAccepted: jest.fn(async () => ({})),
+  })
+  const make = (over = {}) => {
+    const log = []
+    let now = 0
+    const from = { id: 'producer-lc-1', observer: observerOf([]) }
+    const to = { id: 'producer-lc-2', observer: observerOf([getRecord(1, 3)]) }
+    const notes = over.notes ?? [
+      { seq: 1, type: 'select', from: from.id, to: to.id, at: 1 },
+      { seq: 2, type: 'disconnect-resolved', from: from.id, to: to.id, at: 2 },
+      { seq: 3, type: 'connect-called', from: from.id, to: to.id, at: 3 },
+    ]
+    const segments = {
+      current: () => over.current ?? to,
+      cycle: jest.fn(() => {
+        log.push('cycle')
+        return { from, to, closed: Promise.resolve(), reopened: Promise.resolve() }
+      }),
+      journal: () => notes,
+      discharge: jest.fn(async () => ({})),
+      sealed: () => [],
+    }
+    const ordinary = {
+      pause: jest.fn(async () => {
+        log.push('pause')
+        return { pausedAt: 1, idleAt: 2, confirmedAt: 3 }
+      }),
+      resume: jest.fn(async () => log.push('resume')),
+      core: jest.fn(async () => log.push('core')),
+    }
+    const client = {
+      clientInstanceId: jest.fn(async () => over.cached ?? U),
+    }
+    const limits = { warmupMs: 60000, measureMs: 300000 }
+    const worker = new TelemetryWorker({
+      kind: 'producer',
+      client,
+      tap: over.tap ?? { telemetry: () => [] },
+      segments,
+      registry: over.registry ?? { replace: jest.fn(() => ({ tick: 0, at: 1 })), replacements: [] },
+      clock: { now: () => (now += 100) },
+      sleep: over.sleep ?? (async () => {}),
+      ordinary,
+      limits,
+      inbox: { take: async () => ({}) },
+      send: jest.fn(),
+    })
+    worker.uuid = U
+    return { worker, log, from, to, segments, ordinary }
+  }
+
+  test('retains immediate reopen ordering and normal pushes', async () => {
+    const { worker, log, from, segments } = make()
+    const claim = await worker.reopen({ tick: 5 })
+    expect(log).toEqual(['pause', 'cycle', 'resume'])
+    expect(claim).toMatchObject({
+      tick: 5,
+      from: 'producer-lc-1',
+      to: 'producer-lc-2',
+      cachedUuid: U,
+      get: 'r1',
+    })
+    expect(claim.pause).toEqual({ pausedAt: 1, idleAt: 2, confirmedAt: 3 })
+    expect(worker.owed.has('reopen')).toBe(true)
+    await worker.sealing.promise
+    expect(segments.discharge).toHaveBeenCalledWith(from, { proofs: [] })
+  })
+
+  test.each([
+    [
+      'a connect that was not the next public action',
+      {
+        notes: [
+          { seq: 1, type: 'select', from: 'producer-lc-1', to: 'producer-lc-2' },
+          { seq: 2, type: 'disconnect-resolved', from: 'producer-lc-1', to: 'producer-lc-2' },
+          { seq: 4, type: 'connect-called', from: 'producer-lc-1', to: 'producer-lc-2' },
+        ],
+      },
+      'not the next public action',
+    ],
+    ['a changed cached UUID', { cached: 'other' }, 'instance ID changed across a public reopen'],
+  ])('refuses %s on a public reopen', async (_name, over, message) => {
+    const { worker } = make(over)
+    await expect(worker.reopen({ tick: 5 })).rejects.toThrow(message)
+  })
+
+  test('refuses a reopen without a successful replacement Get', async () => {
+    const { worker, to } = make()
+    to.observer.records.length = 0
+    await expect(worker.reopen({ tick: 5 })).rejects.toThrow('no replacement Get within 15000 ms')
+  })
+
+  test('faults one telemetry socket beside ordinary work and proves the recovery Get', async () => {
+    const records = []
+    const current = { id: 'producer-lc-2', observer: observerOf(records) }
+    const fault = { segment: current.id, ordinal: 3, declaredAt: 10, hit: Promise.resolve(15) }
+    const tap = { retire: jest.fn(() => fault), telemetry: () => [] }
+    let slept = 0
+    const { worker, ordinary } = make({
+      current,
+      tap,
+      sleep: async () => {
+        slept += 1
+        if (slept === 1)
+          records.push({
+            type: 'request',
+            apiKey: 1,
+            index: 1,
+            requestKey: 'r1',
+            socketId: 2,
+            normal: true,
+            writeAt: 12,
+            response: { errorCode: 0, responseAt: 14 },
+          })
+        if (slept === 2) records.push(getRecord(2, 4, { writeAt: 40 }))
+      },
+    })
+    const claim = await worker.retire({ tick: 3 })
+    expect(ordinary.core).toHaveBeenCalledTimes(1)
+    expect(claim).toMatchObject({
+      tick: 3,
+      segment: current.id,
+      faulted: 3,
+      declaredAt: 10,
+      faultedAt: 15,
+      core: 'r1',
+      get: 'r2',
+    })
+    expect(worker.owed.has('retire')).toBe(true)
+  })
+
+  test('fails the stage when ordinary work beside the fault fails', async () => {
+    const current = { id: 'producer-lc-2', observer: observerOf([]) }
+    const tap = {
+      retire: () => ({ segment: current.id, ordinal: 3, declaredAt: 10, hit: Promise.resolve(15) }),
+    }
+    const { worker, ordinary } = make({ current, tap })
+    ordinary.core.mockRejectedValueOnce(new Error('core failed'))
+    await expect(worker.retire({ tick: 3 })).rejects.toThrow('core failed')
+  })
+
+  test('confirms the selection with a later Get and discharges the push owed on the current socket', async () => {
+    const records = [getRecord(1, 3)]
+    const current = { id: 'producer-lc-2', observer: observerOf(records) }
+    let slept = 0
+    const { worker } = make({
+      current,
+      tap: { telemetry: () => [{ segment: current.id, ordinal: 3 }] },
+      sleep: async () => {
+        slept += 1
+        if (slept === 1)
+          records.push(
+            getRecord(2, 3, {
+              writeAt: 1e9,
+              response: {
+                ...getRecord(2, 3).response,
+                requestedMetrics: ['com.example.'],
+                subscriptionId: 8,
+              },
+            })
+          )
+        if (slept === 2)
+          records.push({
+            type: 'request',
+            apiKey: 72,
+            index: 3,
+            requestKey: 'r3',
+            socketId: 3,
+            uuid: U,
+            subscriptionId: 8,
+            terminating: false,
+            metricsBytes: 10,
+            writeAt: 1e9 + 10,
+            response: { errorCode: 0, responseAt: 1e9 + 15 },
+          })
+      },
+    })
+    worker.owed.add('reopen')
+    const claim = await worker.confirm({ tick: 1, index: 6, selection: 'com.example.' })
+    expect(claim).toMatchObject({
+      tick: 1,
+      selection: 'com.example.',
+      get: 'r2',
+      subscriptionId: 8,
+      proof: { socketId: 3, get: 'r1', push: 'r3', owedBy: ['reopen'] },
+    })
+    expect(worker.owed.size).toBe(0)
+    expect(worker.claims.proofs).toEqual([
+      { tick: 1, segment: current.id, push: 'r3', owedBy: ['reopen'] },
+    ])
+  })
+
+  test('proves an empty selection by its Get alone and never owes a Push under it', async () => {
+    const records = [getRecord(1, 3)]
+    const current = { id: 'producer-lc-2', observer: observerOf(records) }
+    let slept = 0
+    const { worker } = make({
+      current,
+      tap: { telemetry: () => [{ segment: current.id, ordinal: 3 }] },
+      sleep: async () => {
+        slept += 1
+        if (slept === 1)
+          records.push(
+            getRecord(2, 3, {
+              writeAt: 1e9,
+              response: { ...getRecord(2, 3).response, requestedMetrics: [], subscriptionId: 9 },
+            })
+          )
+      },
+    })
+    const claim = await worker.confirm({ tick: 1, index: 2, selection: '' })
+    expect(claim).toMatchObject({ selection: '', get: 'r2', proof: null })
+    worker.owed.add('retire')
+    const none = make({
+      current,
+      tap: { telemetry: () => [{ segment: current.id, ordinal: 3 }] },
+      sleep: async () => {},
+    })
+    none.worker.owed.add('retire')
+    await expect(none.worker.confirm({ tick: 1, index: 2, selection: '' })).rejects.toThrow(
+      'no selection Get'
+    )
+  })
+
+  test('refuses a stage the fixed table does not hold', async () => {
+    const { worker } = make()
+    await expect(worker.handle({ type: 'stage', tick: 0, stage: 'lifecycle' })).rejects.toThrow(
+      'A stage the fixed table does not hold'
+    )
+  })
+
+  test('binds every worker message to the handshake and answers decode requests by identity', async () => {
+    const handlers = {}
+    const proc = {
+      send: jest.fn(),
+      on: jest.fn((event, handler) => {
+        handlers[event] = handler
+      }),
+    }
+    const env = { [WORKER_TOKEN]: 'tok' }
+    const process = new TelemetryWorkerProcess({ kind: 'admin', soak: {}, proc, env })
+    process.send({ type: 'hello' })
+    expect(proc.send).toHaveBeenCalledWith({ type: 'hello', kind: 'admin', token: 'tok' })
+    process.listen()
+    const ok = process.askDecode(Buffer.from('ab'))
+    expect(proc.send).toHaveBeenLastCalledWith({
+      type: 'decode',
+      id: 1,
+      rawB64: Buffer.from('ab').toString('base64'),
+      kind: 'admin',
+      token: 'tok',
+    })
+    handlers.message({ type: 'decoded', id: 1, body: { parse: 'ok' } })
+    await expect(ok).resolves.toEqual({ parse: 'ok' })
+    const bad = process.askDecode(Buffer.from('cd'))
+    handlers.message({ type: 'decoded', id: 2, error: 'boom' })
+    await expect(bad).rejects.toThrow('boom')
+    for (let i = 0; i < 16; i++) process.askDecode(Buffer.from('x')).catch(() => {})
+    await expect(process.askDecode(Buffer.from('y'))).rejects.toThrow('Too many decode requests')
+    handlers.unhandledRejection()
+    expect(proc.send).toHaveBeenLastCalledWith({ type: 'unhandled', kind: 'admin', token: 'tok' })
+    await expect(
+      new TelemetryWorkerProcess({ kind: 'admin', soak: {}, proc: {}, env }).run()
+    ).rejects.toThrow('needs its parent channel')
+  })
+})
+
+describe('telemetry profile parent', () => {
+  /** A scripted supervisor: answers every join at once and records what the parent sent. */
+  const scripted = (clock) => {
+    const sent = []
+    const workers = new Map(KINDS.map((kind) => [kind, { exit: null }]))
+    const processes = {
+      workers,
+      sent,
+      start: jest.fn(),
+      send: jest.fn((kind, message) => sent.push({ kind, ...message, at: clock.now() })),
+      message: jest.fn(async (kind, type) => ({ type, kind, parentAt: clock.now() })),
+      until: jest.fn(async (kind, match) => {
+        const last = sent.filter((m) => m.kind === kind && m.type === 'stage').at(-1)
+        return {
+          type: 'stage-done',
+          kind,
+          tick: last.tick,
+          stage: last.stage,
+          startedAt: 1,
+          doneAt: 2,
+          parentAt: clock.now(),
+        }
+      }),
+      join: jest.fn(async (kind) => ({ kind, event: 'close' })),
+      taint: jest.fn(),
+    }
+    return processes
+  }
+  const make = (over = {}) => {
+    let now = 1000
+    const clock = { now: () => now }
+    const calls = []
     const fixture = {
+      open: jest.fn(async () => calls.push('open')),
+      inResource: jest.fn(async (work) => {
+        calls.push('resource')
+        try {
+          await work()
+        } finally {
+          calls.push('restore')
+        }
+      }),
       topic: (kind) => `t-${kind}`,
       group: (kind) => `g-${kind}`,
-      open: jest.fn(async () => {}),
-      inResource: jest.fn(async (work) => work()),
-      rotate: jest.fn(async () => 'value'),
-      produce: jest.fn(async () => []),
-      durable: jest.fn(async (kind) => ids(kind)),
-      committed: jest.fn(async () => ({ 0: '3' })),
-      close: jest.fn(async () => {}),
+      ctl: 'ctl',
+      rotate: jest.fn(async (index, selection) => ({
+        index,
+        selection,
+        setAt: now,
+        readbackAt: now,
+        readback: selection,
+      })),
+      produce: jest.fn(async (kind, from, count) => {
+        calls.push(['produce', kind, from, now])
+        return Array.from({ length: count }, (_, i) => from + i)
+      }),
+      close: jest.fn(async () => calls.push('fixture-close')),
       ...over.fixture,
     }
-    const processes = {
-      workers: new Map(
-        KINDS.map((kind) => [kind, { child: { send: (m) => sends.push([kind, m]) }, exit: null }])
-      ),
-      start: jest.fn(),
-      message: jest.fn(async (kind, type) =>
-        type === 'result' ? (over.results?.[kind] ?? result(kind)) : { type, kind }
-      ),
-      join: jest.fn(async (kind) => over.exits?.[kind] ?? natural(kind)),
-      taint: jest.fn(),
-      ...over.processes,
-    }
+    const decoder = { close: jest.fn(async () => ({ receipts: [], calls: [] })), ...over.decoder }
+    const processes = over.processes ?? scripted(clock)
     const churn = new TelemetryChurn({
       fixture,
       processes,
-      record: (row) => rows.push(row),
-      clock: { now: () => (t += 250) },
-      sleep: async () => {},
-      limits: TELEMETRY,
-      verdict: (input) => TelemetryResourceVerdict.evaluate(input),
-      brokers: ['a:1'],
-      stem: 's',
+      decoder,
+      record: jest.fn(),
+      clock,
+      sleep: (ms) =>
+        new Promise((resolve) =>
+          setImmediate(() => {
+            now += ms
+            resolve()
+          })
+        ),
+      limits: {
+        warmupMs: 60000,
+        measureMs: 300000,
+        cleanupMs: 120000,
+        caseMs: 540000,
+        exitMs: 10000,
+      },
+      verdict: jest.fn(),
+      brokers: ['b:1'],
+      stem: STEM,
+      line: '4.3.1',
+      directory: '/evidence',
     })
-    return { churn, fixture, processes, rows, sends }
+    return { churn, fixture, decoder, processes, calls, advance: (ms) => (now += ms), clock }
   }
-  /** A corpus where the consumer committed 3 and processed 3 on partition 0. */
-  const patched = (over) => build(over)
 
-  test('starts one worker for each kind and writes the four-and-four rows with one verdict', async () => {
-    const { churn, processes, rows, sends } = patched({})
-    const outcome = await churn.run()
-    expect(outcome.ok).toBe(true)
-    expect(outcome.clientKinds).toEqual([...KINDS])
-    expect(processes.start.mock.calls.map(([kind]) => kind)).toEqual([...KINDS])
-    expect(sends.filter(([, message]) => message.type === 'config').map(([kind]) => kind)).toEqual([
-      ...KINDS,
-    ])
-    expect(
-      rows.filter((row) => row.kind === 'resource-verdict').map((row) => row.clientKind)
-    ).toEqual([...KINDS])
-    expect(rows.filter((row) => row.kind === 'natural-exit')).toHaveLength(4)
-    expect(rows.filter((row) => row.kind === 'oracle')).toHaveLength(1)
-    expect(rows.filter((row) => row.kind === 'verdict')).toHaveLength(1)
-    for (const row of rows.filter((r) => r.kind === 'resource-verdict')) {
-      expect(row.input.clientCount).toBe(1)
-      expect(row.result.ok).toBe(true)
-    }
-    expect(sends.filter(([, m]) => m.type === 'rotated')).toHaveLength(4 * 35)
+  test('runs every tick in joined stages, rotates before confirming and offers nothing in the warm-up', async () => {
+    const { churn, fixture, processes, calls, clock } = make()
+    const timeline = { t0: clock.now() }
+    const schedule = new TelemetrySchedule({ warmupMs: 60000, measureMs: 300000 })
+    const results = await churn.measure(timeline, schedule)
+    expect(results.map((r) => r.kind)).toEqual([...KINDS])
+    const stages = processes.sent.filter((m) => m.type === 'stage')
+    const sixty = schedule.ticks.find((t) => t.at === 60000).number
+    expect(stages.filter((m) => m.tick === sixty).map((m) => `${m.kind}:${m.stage}`)).toEqual(
+      ['lifecycle', 'retire', 'confirm'].flatMap((stage) => KINDS.map((kind) => `${kind}:${stage}`))
+    )
+    expect(fixture.rotate).toHaveBeenCalledTimes(35)
+    expect(fixture.rotate.mock.calls[0]).toEqual([1, 'com.example.'])
+    expect(fixture.rotate.mock.calls[1]).toEqual([2, ''])
+    const produce = calls.filter((c) => Array.isArray(c))
+    expect(produce).toHaveLength(2 * 100)
+    expect(produce[0][3] - timeline.epochAt).toBeGreaterThanOrEqual(60000)
+    expect(churn.rotations).toHaveLength(35)
+    expect(churn.stages).toHaveLength(KINDS.length * (35 + 11 + 5))
+    expect(timeline.setupMs).toBe(0)
+    expect(processes.sent.filter((m) => m.type === 'corpus')).toHaveLength(KINDS.length)
+    expect(processes.sent.filter((m) => m.type === 'finish')).toHaveLength(KINDS.length)
+    expect(timeline.boundaryAt - timeline.epochAt).toBeGreaterThanOrEqual(360000)
   })
 
-  test.each([
-    ['a signal', { signal: 'SIGTERM', code: null }],
-    ['a nonzero code', { code: 1 }],
-    ['unexpected stderr', { stderrBytes: 1 }],
-    ['an unhandled rejection', { unhandled: 1 }],
-    ['a watchdog expiry', { watchdogExpired: true, event: 'timeout' }],
-    ['a late close', { afterDisconnectMs: 10001 }],
-    ['a missing receipt', { afterDisconnectMs: null }],
-  ])('rejects %s as a clean exit', async (_name, over) => {
-    const { churn } = patched({ exits: { consumer: natural('consumer', over) } })
-    const outcome = await churn.run()
-    expect(outcome.ok).toBe(false)
-    expect(outcome.violations).toContain('consumer: the child did not exit naturally')
-  })
-
-  test('does not let an aggregate or a missing kind stand in for one worker', async () => {
-    const bad = flat()
-    bad.samples[3].snapshot.memory.retainedBytes += 100 * 1024 * 1024
-    const { churn } = patched({ results: { admin: result('admin', { input: bad }) } })
-    const outcome = await churn.run()
-    expect(outcome.ok).toBe(false)
-    expect(outcome.violations.join('\n')).toMatch(/admin: .*active retained ceiling/)
-    const missing = patched({
-      processes: {
-        message: jest.fn(async (kind, type) => {
-          if (kind === 'shareConsumer' && type === 'result') throw new Error('no result')
-          return type === 'result' ? result(kind) : { type, kind }
-        }),
-      },
+  test('fails a measured tick that is more than its late bound behind and never catches it up', async () => {
+    const { churn, processes, advance, fixture } = make()
+    const original = processes.until
+    processes.until = jest.fn(async (...args) => {
+      if (processes.sent.filter((m) => m.type === 'stage').length === 4 * 12) advance(30000)
+      return original(...args)
     })
-    await expect(missing.churn.run()).rejects.toThrow('no result')
+    await expect(churn.run()).rejects.toThrow('The measured tick at')
+    expect(churn.missed.length).toBe(1)
+    expect(churn.missed[0].measured).toBe(true)
+    expect(fixture.rotate.mock.calls.length).toBeLessThan(35)
+    expect(() => churn.guard()).toThrow('The measured tick at')
   })
 
-  test.each([
-    ['open', { fixture: { open: jest.fn(async () => Promise.reject(new Error('open'))) } }],
-    [
-      'resource',
-      { fixture: { inResource: jest.fn(async () => Promise.reject(new Error('resource'))) } },
-    ],
-    [
-      'rotation',
-      { fixture: { rotate: jest.fn(async () => Promise.reject(new Error('rotation'))) } },
-    ],
-    ['oracle', { fixture: { durable: jest.fn(async () => Promise.reject(new Error('oracle'))) } }],
-  ])('restores owned resources after a %s failure', async (name, over) => {
-    const { churn, fixture, processes } = patched(over)
-    await expect(churn.run()).rejects.toThrow(name)
-    processes.workers.get('producer').exit = null
-    processes.join.mockImplementation(async () => ({ event: 'timeout' }))
-    await churn.close()
-    expect(fixture.close).toHaveBeenCalledTimes(1)
-    expect(processes.taint).toHaveBeenCalled()
-    await churn.close()
-    expect(fixture.close).toHaveBeenCalledTimes(1)
+  test('refuses a setup over its budget', async () => {
+    const { churn, advance, clock } = make()
+    const t0 = clock.now()
+    advance(48001)
+    await expect(
+      churn.measure({ t0 }, new TelemetrySchedule({ warmupMs: 60000, measureMs: 300000 }))
+    ).rejects.toThrow('The setup exceeded its budget')
   })
 
-  test('preserves a falsy primary failure and a failed cleanup', async () => {
-    const { churn } = patched({
-      fixture: {
-        open: jest.fn(async () => {
-          // eslint-disable-next-line no-throw-literal
-          throw undefined
-        }),
-        close: jest.fn(async () => Promise.reject(new Error('closing'))),
-      },
-    })
-    await expect(churn.run()).rejects.toBeUndefined()
-    await expect(churn.close()).rejects.toThrow('closing')
-  })
-})
-
-describe('telemetry profile oracle', () => {
-  const sets = () => ({
-    expected: ids('producer'),
-    durable: ids('producer'),
-    handled: ids('producer'),
-  })
-
-  test('preserves record commit and handler identities', () => {
-    const control = OrdinaryOracle.check({
-      ...sets(),
-      committed: { 0: '5' },
-      processed: { 0: '5' },
-    })
-    expect(control.ok).toBe(true)
-    expect(Object.keys(control.hashes)).toEqual(['expected', 'durable', 'handled'])
-    const cases = {
-      'a dropped durable record': { durable: sets().durable.slice(1) },
-      'a duplicated durable record': { durable: [...sets().durable.slice(1), sets().durable[1]] },
-      'a same-count substitution': {
-        handled: [...sets().handled.slice(1), recordId('s', 'consumer', 0)],
-      },
-      'a replayed callback': { handled: [...sets().handled, sets().handled[0]] },
-      'an incorrect committed end': { committed: { 0: '4' }, processed: { 0: '5' } },
-      'a misclassified share suffix': {
-        handled: [...sets().handled.slice(0, -1), recordId('s', 'shareConsumer', 5)],
-      },
+  test('restores owned resources after every failure stage and keeps every failure', async () => {
+    const stage = async (over, expected) => {
+      const made = make(over)
+      const failure = await made.churn.run().catch((e) => e)
+      expect(made.fixture.close).toHaveBeenCalledTimes(1)
+      expect(made.decoder.close).toHaveBeenCalledTimes(1)
+      expect(failure).toBeInstanceOf(AggregateError)
+      expect(failure.errors.map((e) => e.message)).toEqual(expected)
+      expect(() => made.churn.guard()).toThrow()
+      return made
     }
-    for (const [name, change] of Object.entries(cases)) {
-      const outcome = OrdinaryOracle.check({
-        ...sets(),
-        committed: { 0: '5' },
-        processed: { 0: '5' },
-        ...change,
-      })
-      expect({ name, ok: outcome.ok }).toEqual({ name, ok: false })
-      expect(outcome.violations.length).toBeGreaterThan(0)
-    }
-  })
-
-  test('counts the identities an ordinary producer resolved, never the ones it only offered', async () => {
-    const make = (send) => {
-      const work = new OrdinaryWork({
-        kind: 'producer',
-        client: { send },
-        stem: 's',
-        topic: 't',
-        clock: { now: () => 0 },
-        sleep: async () => {
-          work.running = false
+    await stage(
+      {
+        fixture: { open: jest.fn(async () => Promise.reject(new Error('open'))) },
+        decoder: { close: jest.fn(async () => Promise.reject(new Error('decoder'))) },
+      },
+      ['open', 'decoder']
+    )
+    await stage(
+      {
+        fixture: {
+          open: jest.fn(async () => Promise.reject(new Error('open'))),
+          close: jest.fn(async () => Promise.reject(new Error('fixture'))),
         },
-      })
-      return work
-    }
-    const ok = jest.fn(async () => {})
-    const resolved = make(ok)
-    await resolved.start()
-    await resolved.stop()
-    expect(ok).toHaveBeenCalledTimes(1)
-    expect(ok.mock.calls[0][0]).toMatchObject({ topic: 't', acks: -1 })
-    expect(ok.mock.calls[0][0].messages).toHaveLength(100)
-    expect(ok.mock.calls[0][0].messages.every((m) => m.value.length === 200)).toBe(true)
-    expect(resolved.ids().offered).toEqual(ids('producer', 100))
+      },
+      ['open', 'fixture']
+    )
+    const config = await stage(
+      {
+        processes: Object.assign(scripted({ now: () => 0 }), {
+          message: jest.fn(async () => Promise.reject(new Error('hello'))),
+        }),
+        fixture: { close: jest.fn(async () => Promise.reject(new Error('fixture'))) },
+      },
+      ['hello', 'fixture']
+    )
+    expect(config.calls).toEqual(['open', 'resource', 'restore'])
+    for (const kind of KINDS) expect(config.processes.join).toHaveBeenCalledWith(kind)
+  })
 
-    const refused = make(jest.fn(async () => Promise.reject(new Error('send failed'))))
-    await refused.start()
-    await expect(refused.stop()).rejects.toThrow('send failed')
-    expect(refused.ids().offered).toEqual([])
+  test('preserves a falsy primary failure and stops later work after it', async () => {
+    const made = make({
+      // eslint-disable-next-line prefer-promise-reject-errors
+      fixture: { open: jest.fn(async () => Promise.reject(undefined)) },
+    })
+    await expect(made.churn.run()).rejects.toBeUndefined()
+    expect(made.fixture.close).toHaveBeenCalledTimes(1)
+    expect(made.decoder.close).toHaveBeenCalledTimes(1)
+    expect(() => made.churn.guard()).toThrow()
+    await expect(made.churn.until(1e9)).rejects.toBeUndefined()
+    expect(made.fixture.produce).not.toHaveBeenCalled()
+  })
+
+  test('taints the run when a worker reports a failure while stages are in flight', async () => {
+    const made = make()
+    const error = new Error('worker failed')
+    made.churn.fail(error)
+    made.churn.fail(new Error('later'))
+    expect(() => made.churn.guard()).toThrow(error)
+    await expect(made.churn.abort).rejects.toBe(error)
   })
 })
 
-describe('telemetry profile worker process', () => {
-  test('refuses to run without its parent channel', async () => {
-    const worker = new TelemetryWorkerProcess({ kind: 'producer', soak: {}, proc: {} })
-    await expect(worker.run()).rejects.toThrow('parent channel')
+describe('telemetry churn verification of one worker', () => {
+  const getRec = (index, socketId, over = {}) => ({
+    type: 'request',
+    apiKey: 71,
+    index,
+    requestKey: `r${index}`,
+    socketId,
+    uuid: U,
+    writeAt: index * 10,
+    response: {
+      errorCode: 0,
+      uuid: U,
+      subscriptionId: 7,
+      pushIntervalMs: 1000,
+      requestedMetrics: ['org.apache.kafka.'],
+      responseAt: index * 10 + 5,
+    },
+    ...over,
+  })
+  const pushRec = (index, socketId, over = {}) => ({
+    type: 'request',
+    apiKey: 72,
+    index,
+    requestKey: `r${index}`,
+    socketId,
+    uuid: U,
+    subscriptionId: 7,
+    terminating: false,
+    metricsBytes: 10,
+    writeAt: index * 10,
+    response: { errorCode: 0, responseAt: index * 10 + 5 },
+    ...over,
+  })
+
+  describe('reopen', () => {
+    const base = () => ({
+      claim: {
+        tick: 5,
+        from: 'a',
+        to: 'b',
+        observedAt: 90,
+        cachedUuid: U,
+        get: 'r2',
+        pause: { pausedAt: 50, idleAt: 60, confirmedAt: 70 },
+      },
+      from: {
+        records: [{ type: 'connect', socketId: 1, at: 5, index: 1 }],
+        closures: [{ at: 100, end: 110, pending: [] }],
+      },
+      to: {
+        records: [
+          { type: 'connect', socketId: 1, at: 130, index: 1 },
+          getRec(2, 1, { writeAt: 140 }),
+        ],
+        closures: [],
+      },
+      journal: [
+        { seq: 1, type: 'select', from: 'a', to: 'b', at: 95 },
+        { seq: 2, type: 'disconnect-resolved', from: 'a', to: 'b', at: 120 },
+        { seq: 3, type: 'connect-called', from: 'a', to: 'b', at: 125 },
+      ],
+      uuid: U,
+    })
+
+    test('accepts the immediate same-object reopen with its replacement Get', () => {
+      expect(() => verifyChurnReopen(base())).not.toThrow()
+    })
+
+    test.each([
+      [
+        'a connect that was not next',
+        (i) => (i.journal[2].seq = 4),
+        'Connect was not the next public action',
+      ],
+      [
+        'a segment selected after the close resolved',
+        (i) => (i.journal[0].seq = 9),
+        'The next segment was not selected before the close resolved',
+      ],
+      [
+        'a Get during the final',
+        (i) => i.from.records.push(getRec(3, 1, { writeAt: 105 })),
+        'Get, connect or authentication during the final',
+      ],
+      [
+        'a different cached UUID',
+        (i) => (i.claim.cachedUuid = 'other'),
+        'The cached timeout-zero UUID differs',
+      ],
+      [
+        'a replacement Get before the reconnect',
+        (i) => (i.to.records[1].writeAt = 124),
+        'The replacement Get precedes the reconnect',
+      ],
+      [
+        'a replacement socket before the reconnect',
+        (i) => (i.to.records[0].at = 100),
+        'The replacement socket precedes the reconnect',
+      ],
+      [
+        'a replacement Get that did not carry the cached UUID',
+        (i) => (i.to.records[1].uuid = '00000000-0000-0000-0000-000000000000'),
+        'The replacement Get is not a successful Get carrying the cached UUID',
+      ],
+      [
+        'undrained admission',
+        (i) => (i.claim.pause.confirmedAt = 91),
+        'Admission was not paused, drained and confirmed before the close',
+      ],
+      [
+        'two public closes',
+        (i) => i.from.closures.push({ at: 101, end: 102 }),
+        'A lifecycle must have exactly one public close',
+      ],
+      [
+        'boundary times out of order',
+        (i) => (i.claim.observedAt = 99.5 + 1),
+        'Boundary times are out of order',
+      ],
+    ])('rejects %s', (_name, change, message) => {
+      const input = base()
+      change(input)
+      expect(() => verifyChurnReopen(input)).toThrow(message)
+    })
+  })
+
+  describe('retirement', () => {
+    const base = () => ({
+      claim: { tick: 3, segment: 's', faulted: 1, declaredAt: 20, core: 'r4', get: 'r6' },
+      transcript: {
+        faults: [{ socketId: 1, at: 20 }],
+        sockets: [
+          { id: 1, kind: 'telemetry', closedAt: 30 },
+          { id: 2, kind: 'normal', closedAt: 99 },
+          { id: 3, kind: 'telemetry', closedAt: 99 },
+        ],
+        cancellations: [{ socketId: 1, requestKey: 'r5', disposition: 'faulted-transport' }],
+        records: [
+          {
+            type: 'request',
+            requestKey: 'r4',
+            apiKey: 1,
+            socketId: 2,
+            writeAt: 21,
+            index: 4,
+            response: { errorCode: 0, responseAt: 25 },
+          },
+          getRec(6, 3, { writeAt: 40 }),
+        ],
+      },
+      uuid: U,
+    })
+
+    test('accepts one declared fault with core work beside it and a recovery Get', () => {
+      expect(() => verifyChurnRetirement(base())).not.toThrow()
+    })
+
+    test.each([
+      ['an undeclared fault', (i) => (i.transcript.faults = []), 'Undeclared faulted socket'],
+      [
+        'a non-telemetry target',
+        (i) => (i.transcript.sockets[0].kind = 'normal'),
+        'Faulted a non-telemetry socket',
+      ],
+      [
+        'no cut-off exchange',
+        (i) => (i.transcript.cancellations = []),
+        'Exactly one exchange must be cut off',
+      ],
+      [
+        'a close disposition',
+        (i) => (i.transcript.cancellations[0].disposition = 'close-in-flight'),
+        'faulted-transport',
+      ],
+      [
+        'core work on the telemetry socket',
+        (i) => (i.transcript.records[0].socketId = 3),
+        'The core work ran on a telemetry socket',
+      ],
+      [
+        'core work before the declaration',
+        (i) => (i.transcript.records[0].writeAt = 19),
+        'The core work precedes the fault declaration',
+      ],
+      [
+        'a recovery on the faulted socket',
+        (i) => (i.transcript.records[1].socketId = 1),
+        'The recovery Get is not a successful Get on a new socket',
+      ],
+    ])('rejects %s', (_name, change, message) => {
+      const input = base()
+      change(input)
+      expect(() => verifyChurnRetirement(input)).toThrow(message)
+    })
+  })
+
+  describe('transition', () => {
+    const custom = (over = {}) =>
+      getRec(2, 3, {
+        writeAt: 60,
+        response: {
+          ...getRec(2, 3).response,
+          requestedMetrics: ['com.example.'],
+          subscriptionId: 8,
+        },
+        ...over,
+      })
+    const base = () => ({
+      claim: {
+        tick: 1,
+        index: 6,
+        selection: 'com.example.',
+        segment: 's',
+        receivedAt: 50,
+        get: 'r2',
+        subscriptionId: 8,
+        proof: { socketId: 3, get: 'r1', push: 'r3', owedBy: ['reopen'] },
+      },
+      tick: { actions: ['reopen', 'subscription'] },
+      rotation: { selection: 'com.example.', readback: 'com.example.', setAt: 40, readbackAt: 45 },
+      transcript: {
+        records: [getRec(1, 3), custom(), pushRec(3, 3, { subscriptionId: 8, writeAt: 70 })],
+      },
+      uuid: U,
+      selection: 'com.example.',
+      previous: 7,
+    })
+
+    test('accepts a confirmed transition with its owed current Push', () => {
+      expect(() => verifyChurnTransition(base())).not.toThrow()
+    })
+
+    test.each([
+      [
+        'a readback that differs',
+        (i) => (i.rotation.readback = ''),
+        'The readback differs from the set',
+      ],
+      ['a missing parent set', (i) => (i.rotation = undefined), 'No parent set and readback'],
+      [
+        'a Get written before the confirmation',
+        (i) => (i.claim.receivedAt = 61),
+        'No successful Get proves the selection',
+      ],
+      [
+        'the wrong requested list',
+        (i) => (i.transcript.records[1].response.requestedMetrics = ['org.apache.kafka.']),
+        'No successful Get proves the selection',
+      ],
+      ['an unchanged subscription', (i) => (i.previous = 8), 'The subscription did not change'],
+      [
+        'a missing proof',
+        (i) => (i.claim.proof = null),
+        'A lifecycle change without its current Push proof',
+      ],
+      [
+        'a proof for another action',
+        (i) => (i.claim.proof.owedBy = ['retire']),
+        'Expected values to be strictly deep-equal',
+      ],
+      [
+        'a Push at the Get response time',
+        (i) => (i.transcript.records[2].writeAt = 1),
+        'No proving Push after the Get r1',
+      ],
+      [
+        'a proof under an empty selection',
+        (i) => {
+          i.claim.selection = ''
+          i.selection = ''
+          i.rotation.selection = ''
+          i.rotation.readback = ''
+          i.transcript.records[1].response.requestedMetrics = []
+        },
+        'A proof cannot be owed under an empty selection',
+      ],
+    ])('rejects %s', (_name, change, message) => {
+      const input = base()
+      change(input)
+      expect(() => verifyChurnTransition(input)).toThrow(message)
+    })
+
+    test('requires no proof at a tick without a lifecycle change', () => {
+      const input = base()
+      input.tick = { actions: ['subscription'] }
+      expect(() => verifyChurnTransition(input)).toThrow()
+      input.claim.proof = null
+      expect(() => verifyChurnTransition(input)).not.toThrow()
+    })
+  })
+
+  describe('custom identity fence', () => {
+    const slot = 'com.example.soak.producer.000'
+    const proof = (variant) => ({
+      decoded: {
+        decoded: {
+          metrics: [{ name: slot, points: [{ attrs: [['variant', 'string', variant]] }] }],
+        },
+      },
+    })
+    const base = (variant, writeAt) => ({
+      facts: { replacements: [{ at: 1000, addedVariant: 'b' }] },
+      bundles: { 'producer-lc-1': { proofs: new Map([['r2', proof(variant)]]) } },
+      transcripts: {
+        'producer-lc-1': {
+          records: [
+            getRec(1, 1, {
+              response: { ...getRec(1, 1).response, requestedMetrics: ['com.example.'] },
+            }),
+            pushRec(2, 1, { writeAt }),
+          ],
+        },
+      },
+    })
+
+    test('requires the current variant once the fence has settled', () => {
+      const ok = base('b', 5000)
+      expect(verifyChurnFence('producer', ok.facts, ok.bundles, ok.transcripts)).toBe(1)
+      const stale = base('a', 5000)
+      expect(() =>
+        verifyChurnFence('producer', stale.facts, stale.bundles, stale.transcripts)
+      ).toThrow('A retired custom identity was exported after its fence')
+    })
+
+    test('allows one frozen old sample inside the fence window and treats the original variant before any swap', () => {
+      const frozen = base('a', 2400)
+      expect(verifyChurnFence('producer', frozen.facts, frozen.bundles, frozen.transcripts)).toBe(1)
+      const before = base('a', 500)
+      expect(verifyChurnFence('producer', before.facts, before.bundles, before.transcripts)).toBe(1)
+    })
   })
 })

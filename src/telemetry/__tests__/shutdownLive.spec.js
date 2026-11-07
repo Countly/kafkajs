@@ -1023,15 +1023,18 @@ const exposeCollection = () => {
 /**
  * L9: the same `main('telemetry')` owner the CLI runs, with its rows captured into one stamped
  * scenario record. Four one-client workers are judged on their own memory and exact resource
- * identities; the parent's independent record oracle and the natural exit of every child are
- * required. A shortened or forced run cannot satisfy it.
+ * identities, every lifecycle is a sealed observer segment, and the parent's independent decode,
+ * ordinary and share oracles and the natural exit of every child are archived with every input,
+ * so the verifier recomputes the verdict instead of trusting it. A shortened or forced run cannot
+ * satisfy it.
  */
 live(
   'telemetry churn',
   liveCase(CHURN_BUDGET, (scope) =>
     runCase('telemetry-churn', async (cleanup, publish, attempt) => {
       const directory = process.env.TELEMETRY_EVIDENCE_DIR
-      if (!process.env.KAFKA_VERSION) throw new Error('KAFKA_VERSION must name the broker line')
+      const line = process.env.KAFKA_VERSION
+      if (!line) throw new Error('KAFKA_VERSION must name the broker line')
       if (!directory || !path.isAbsolute(directory))
         throw new Error('TELEMETRY_EVIDENCE_DIR must name the absolute run directory')
       const {
@@ -1044,7 +1047,7 @@ live(
       cleanup.defer(() => restore())
       const result = await bounded(
         scope,
-        CHURN_BUDGET - 10000,
+        CHURN_BUDGET,
         () =>
           main('telemetry', {
             brokers: PORTS.map((port) => `localhost:${port}`),
@@ -1072,15 +1075,24 @@ live(
         expect(worker.exit.afterDisconnectMs).toBeLessThanOrEqual(10000)
       }
       expect(result.oracle.ok).toBe(true)
+      expect(result.setupMs).toBeLessThanOrEqual(48000)
       expect(result.cleanupMs).toBeLessThanOrEqual(120000)
-      expect(result.totalMs).toBeLessThanOrEqual(540000)
+      expect(result.totalMs).toBeLessThanOrEqual(CHURN_BUDGET)
       expect(result.ok).toBe(true)
+      const manifest = JSON.parse(fs.readFileSync(MANIFEST_FILE, 'utf8'))
+      attempt.segments = result.workers.map((worker) => ({ sealed: () => worker.facts.sealed }))
       attempt.record = {
         ...attempt.record,
+        wireVersions: { 71: 0, 72: 0 },
         run: {
           ...attempt.record.run,
           composeSha256: fileSha(path.join(ROOT, 'docker-compose.telemetry.yml')),
         },
+        fixture: {
+          manifestSha256: fileSha(MANIFEST_FILE),
+          reporterJar: manifest.lines[line].reporterJar,
+        },
+        oracles: { churn: result.archive },
         results: {
           rows,
           verdict: {
