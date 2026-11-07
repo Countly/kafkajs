@@ -169,6 +169,32 @@ const assertRecoveryTiming = ({
 }
 
 /**
+ * Requires the undecided held record's single local loss, without conflating other partitions.
+ * @param {object} held Original held handler entry with its full immutable identity.
+ * @param {object[]} outcomes The leaving member's public acknowledgement outcomes.
+ * @returns {void} Throws for missing, repeated, successful or incorrectly classified settlement.
+ */
+const assertHeldLeaveOutcome = (held, outcomes) => {
+  const [topic, partition, offset] = JSON.parse(held.identity)
+  const matching = outcomes.filter(
+    (row) =>
+      row.topic === topic &&
+      row.partition === partition &&
+      BigInt(row.firstOffset) <= BigInt(offset) &&
+      BigInt(row.lastOffset) >= BigInt(offset)
+  )
+  expect(matching).toHaveLength(1)
+  expect(matching[0]).toMatchObject({
+    type: 'release',
+    error: {
+      name: 'KafkaJSShareAcknowledgementError',
+      reason: 'membership-lost',
+      retriable: false,
+    },
+  })
+}
+
+/**
  * Validates frozen kill provenance before any replay can satisfy recovery.
  * @param {object} fault Original parent boundary and durable child observations.
  * @returns {void} Throws for replaced children, invented clocks or omitted held starts.
@@ -2007,6 +2033,7 @@ class MembershipCase {
     })
     const originalHeld = { ...b.held }
     this.assertReplayAcquisition(originalHeld)
+    expect(b.inflightEntries.has(b.held)).toBe(true)
     const childInvocation = c.of('held').at(-1).invocation
     const leaveCalledWallAt = Date.now()
     const leaveCalledAt = performance.now()
@@ -2027,9 +2054,11 @@ class MembershipCase {
       leaveCalledWallAt,
       leftWallAt,
       originalHeld,
+      heldAtLeft: b.inflight(),
       childInvocation,
     }
-    bGate.open()
+    expect(this.recovery.leave.heldAtLeft).toContain(originalHeld.identity)
+    expect(b.inflightEntries.has(b.held)).toBe(true)
     this.row('acknowledgement', {
       name: 'cleanLeaveChronology',
       leaveCalledAt,
@@ -2037,10 +2066,14 @@ class MembershipCase {
       leaveCalledWallAt,
       leftWallAt,
       gateReleasedAt,
+      originalHeld,
+      heldAtLeft: this.recovery.leave.heldAtLeft,
       wire: this.sockets.acknowledgements.snapshot().filter(({ label }) => label === 'B'),
       acknowledgements: b.acks
         .filter(({ at }) => at >= leaveCalledAt - 100)
-        .map(({ type, firstOffset, lastOffset, error, at }) => ({
+        .map(({ topic, partition, type, firstOffset, lastOffset, error, at }) => ({
+          topic,
+          partition,
           type,
           firstOffset,
           lastOffset,
@@ -2065,19 +2098,15 @@ class MembershipCase {
     )
     expect(leaves).toHaveLength(1)
     expect(leaves[0].response?.errorCode).toBe(0)
+    for (const frame of finals) expect(frame.at).toBeLessThan(leaves[0].at)
     for (const frame of leaveFrames)
       expect(frame.at).toBeLessThanOrEqual(leaveCalledAt + CLEAN_LEAVE_MS)
-    expect(
-      b.acks.some(
-        ({ type, error, firstOffset, lastOffset }) =>
-          type === 'accept' &&
-          error === null &&
-          BigInt(firstOffset) <= BigInt(originalHeld.offset) &&
-          BigInt(lastOffset) >= BigInt(originalHeld.offset)
-      )
-    ).toBe(false)
+    expect(b.inflightEntries.has(b.held)).toBe(true)
+    assertHeldLeaveOutcome(originalHeld, b.acks)
     this.recovery.leave.wire = leaveFrames
     this.recovery.leave.releaseAt = Math.min(...finals.map(({ at }) => at))
+    bGate.open()
+    this.recovery.leave.bGateReleasedAt = performance.now()
     await this.awaitReleased(scope, this.frozen.cleanHandoverHeld, this.recovery.leave)
     await this.converge(scope, ['A', 'C'], 'B left', this.recovery.leave.deadline)
     await c.waitFor(
@@ -2746,6 +2775,53 @@ describe('membership assignment observation', () => {
 
   it('rejects a foreign topic UUID', () => {
     expect(assignmentAgrees(member(), event(), 'foreign-topic')).toBe(false)
+  })
+})
+
+describe('scripted membership clean-leave outcomes', () => {
+  const held = { identity: '["records",0,"200",null,null]' }
+  const lost = {
+    topic: 'records',
+    partition: 0,
+    firstOffset: '200',
+    lastOffset: '200',
+    type: 'release',
+    error: {
+      name: 'KafkaJSShareAcknowledgementError',
+      reason: 'membership-lost',
+      retriable: false,
+    },
+  }
+  const accepted = { ...lost, type: 'accept', error: null }
+
+  it('keeps same-offset Accepts on other partitions or topics separate from the held loss', () => {
+    assertHeldLeaveOutcome(held, [
+      lost,
+      { ...accepted, partition: 1 },
+      { ...accepted, topic: 'other' },
+    ])
+  })
+
+  it('rejects an Accept covering the original held topic and partition', () => {
+    expect(() => assertHeldLeaveOutcome(held, [accepted])).toThrow()
+    expect(() =>
+      assertHeldLeaveOutcome(held, [{ ...accepted, firstOffset: '199', lastOffset: '201' }])
+    ).toThrow()
+    expect(() => assertHeldLeaveOutcome(held, [lost, accepted])).toThrow()
+  })
+
+  it('requires one failed membership release for the original held identity', () => {
+    for (const outcomes of [
+      [],
+      [lost, lost],
+      [{ ...lost, partition: 1 }],
+      [{ ...lost, topic: 'other' }],
+      [{ ...lost, firstOffset: '201', lastOffset: '201' }],
+      [{ ...lost, error: null }],
+      [{ ...lost, error: { ...lost.error, reason: 'expired' } }],
+    ]) {
+      expect(() => assertHeldLeaveOutcome(held, outcomes)).toThrow()
+    }
   })
 })
 
