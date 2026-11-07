@@ -1,5 +1,7 @@
 const net = require('net')
 const { createHash } = require('crypto')
+const { statSync, truncateSync } = require('fs')
+const { isDeepStrictEqual } = require('util')
 const Decoder = require('../../../protocol/decoder')
 const ProducerStateManager = require('../../../producer/state')
 const PartitionSequencer = require('../../../producer/state/partitionSequencer')
@@ -19,6 +21,7 @@ const { Kafka, logLevel, ConfigResourceTypes } = require('../../../../index')
 const {
   createTopic,
   createConnectionPool,
+  evidencePath,
   newLogger,
   plainTextBrokers,
   readRequestHeader,
@@ -88,9 +91,12 @@ const SERVICES = ['kafka1', 'kafka2', 'kafka3']
 const SHARE_STATE_TOPIC = '__share_group_state'
 const OFFSETS_TOPIC = '__consumer_offsets'
 const SHARE_APIS = new Set([76, 78, 79])
-const ARCHIVE_APIS = new Set([0, 1, 2, 3, 19, 22, 32, 61, 75, 76, 78, 79])
 const WIRE_BYTES = 96 * 1024 * 1024
 const PRODUCER_EVIDENCE_BYTES = 64 * 1024 * 1024
+const ARCHIVE_BYTES = 10 * 1024 * 1024
+const ARCHIVE_ROW_BYTES = 256 * 1024
+const RAW_PRODUCE_BYTES = 2 * 1024 * 1024
+const RAW_PRODUCE_PER_PARTITION = 32
 const PRODUCER_CONFIGS = [
   'producer.id.expiration.ms',
   'producer.id.expiration.check.interval.ms',
@@ -158,6 +164,11 @@ class ShareWireTap {
     this.order = 0
     this.byteCount = 0
     this.problems = []
+    this.rawProduce = new Map()
+    this.recentProduce = new Map()
+    this.rawProduceBytes = 0
+    this.pinnedProduce = new Set()
+    this.fetchedStamps = new Map()
   }
 
   /** @returns {object} A case-monotonic timestamp and a total observation order. */
@@ -229,7 +240,7 @@ class ShareWireTap {
       entry.reader.push(chunk).forEach((bytes) => {
         const request = entry.outstanding.get(bytes.readInt32BE(4))
         if (!request) return
-        if (this.reserve(bytes.length)) request.responseBytes = bytes.toString('base64')
+        this.response(request, bytes)
         const stamp = this.stamp()
         request.responseAt = stamp.at
         request.responseOrder = stamp.order
@@ -247,7 +258,7 @@ class ShareWireTap {
    * @returns {void}
    */
   record(entry, frame, written = this.stamp()) {
-    if (this.allFrames.length >= 100000 || !this.reserve(frame.length)) {
+    if (this.allFrames.length >= 100000) {
       this.problem('Wire archive exhausted; original attempts are missing')
       return
     }
@@ -266,8 +277,20 @@ class ShareWireTap {
       correlationId,
       clientId,
       ...this.stamp(),
-      bytes: frame.toString('base64'),
     }
+    const context = this.context.getStore()
+    if (context && context.apiKey === apiKey) fact.attempt = context.id ?? null
+    if (apiKey === 0 || apiKey === 22) {
+      try {
+        if (apiKey === 0) {
+          fact.batches = wireBatchStamps(fact, frame).filter(
+            ({ topic, topicId }) => topic === this.topic || (topicId && topicId === this.topicId)
+          )
+        } else fact.identityRequest = initProducerFact(fact, frame, false)
+      } catch (error) {
+        this.problem(`Producer diagnostic frame ${fact.id}: ${error.message}`)
+      }
+    } else if (this.reserve(frame.length)) fact.bytes = frame.toString('base64')
     if ([78, 79].includes(apiKey) && apiVersion === 2) {
       const reader = apiKey === 78 ? fetchWire : ackWire
       try {
@@ -277,10 +300,82 @@ class ShareWireTap {
       }
     }
     this.allFrames.push(fact)
+    if (fact.batches?.length) this.retainProduce(fact, frame)
     entry.outstanding.set(correlationId, fact)
-    const context = this.context.getStore()
     if (context && context.apiKey === apiKey) context.frames.push(fact)
     if (SHARE_APIS.has(apiKey)) this.frames.push(fact)
+  }
+
+  /** @param {object} frame Original request. @param {Buffer} bytes Complete response. @returns {void} */
+  response(frame, bytes) {
+    if (frame.apiKey === 0 || frame.apiKey === 22) {
+      try {
+        if (frame.apiKey === 0) frame.partitionResults = produceResponseFacts(frame, bytes)
+        else frame.identityResponse = initProducerFact(frame, bytes, true)
+      } catch (error) {
+        this.problem(`Producer diagnostic response ${frame.id}: ${error.message}`)
+      }
+      return
+    }
+    if (this.reserve(bytes.length)) frame.responseBytes = bytes.toString('base64')
+    if (frame.apiKey !== 78 || frame.apiVersion !== 2) return
+    try {
+      frame.batches = wireBatchStamps(frame, bytes)
+      for (const batch of frame.batches) {
+        if (this.topicId && batch.topicId !== this.topicId) continue
+        const key = batchStampKey(batch)
+        const prior = this.fetchedStamps.get(key)
+        if (prior && prior.baseOffset !== batch.baseOffset) this.pinProduce(batch)
+        else if (!prior) this.fetchedStamps.set(key, batch)
+      }
+    } catch (error) {
+      this.problem(`Fetch diagnostic response ${frame.id}: ${error.message}`)
+    }
+  }
+
+  /**
+   * Keeps recent original payloads without base64 encoding; eviction never removes compact facts.
+   * @param {object} fact Compact Produce fact.
+   * @param {Buffer} bytes Complete original request.
+   * @returns {void}
+   */
+  retainProduce(fact, bytes) {
+    if (!fact.batches.length) return
+    this.rawProduce.set(fact.id, bytes)
+    this.rawProduceBytes += bytes.length
+    for (const partition of new Set(fact.batches.map(({ partition }) => partition))) {
+      if (!this.recentProduce.has(partition)) this.recentProduce.set(partition, [])
+      this.recentProduce.get(partition).push(fact.id)
+      while (this.recentProduce.get(partition).length > RAW_PRODUCE_PER_PARTITION) {
+        const id = this.recentProduce.get(partition).find((id) => !this.pinnedProduce.has(id))
+        if (id === undefined) break
+        this.evictProduce(id)
+      }
+    }
+    while (this.rawProduceBytes > RAW_PRODUCE_BYTES) {
+      const id = [...this.rawProduce.keys()].find((id) => !this.pinnedProduce.has(id))
+      if (id === undefined) break
+      this.evictProduce(id)
+    }
+  }
+
+  /** @param {number} id Evicted raw payload; compact attempt facts remain. @returns {void} */
+  evictProduce(id) {
+    this.rawProduceBytes -= this.rawProduce.get(id).length
+    this.rawProduce.delete(id)
+    for (const [partition, ids] of this.recentProduce)
+      this.recentProduce.set(
+        partition,
+        ids.filter((candidate) => candidate !== id)
+      )
+  }
+
+  /** @param {object} batch Original fetched batch at two offsets. @returns {void} */
+  pinProduce(batch) {
+    const key = batchStampKey(batch)
+    for (const id of this.rawProduce.keys())
+      if (this.allFrames[id]?.batches?.some((candidate) => batchStampKey(candidate) === key))
+        this.pinnedProduce.add(id)
   }
 
   /** @param {string} problem Missing evidence, recorded once. @returns {void} */
@@ -2381,17 +2476,16 @@ const originalBatchStamps = (records) => {
  * @returns {object[]} Topic/partition batch stamps, or an empty array when no response exists.
  * @throws {Error} Incomplete or unsupported evidence, never a substituted stamp.
  */
-const wireBatchStamps = (frame) => {
+const wireBatchStamps = (frame, raw) => {
   const batches = []
   if (frame.apiKey === 0) {
-    const bytes = Buffer.from(frame.bytes, 'base64')
+    const bytes = raw ?? Buffer.from(frame.bytes, 'base64')
     const { byteLength } = readRequestHeader(bytes)
     const reader = new Decoder(bytes.subarray(byteLength))
     const flexible = frame.apiVersion >= 9
-    if (flexible) reader.readUVarIntString()
-    else reader.readString()
-    reader.readInt16()
-    reader.readInt32()
+    frame.transactionalId = flexible ? reader.readUVarIntString() : reader.readString()
+    frame.acks = reader.readInt16()
+    frame.timeout = reader.readInt32()
     const array = (read) =>
       flexible ? reader.readUVarIntArray(() => read()) : reader.readArray(() => read())
     array(() => {
@@ -2408,8 +2502,8 @@ const wireBatchStamps = (frame) => {
       if (flexible) reader.readTaggedFields()
     })
     if (flexible) reader.readTaggedFields()
-  } else if (frame.apiKey === 78 && frame.apiVersion === 2 && frame.responseBytes) {
-    const reader = new Decoder(Buffer.from(frame.responseBytes, 'base64').subarray(8))
+  } else if (frame.apiKey === 78 && frame.apiVersion === 2 && (raw || frame.responseBytes)) {
+    const reader = new Decoder((raw ?? Buffer.from(frame.responseBytes, 'base64')).subarray(8))
     reader.readTaggedFields()
     reader.readInt32()
     const topError = reader.readInt16()
@@ -2443,6 +2537,160 @@ const wireBatchStamps = (frame) => {
   return batches.map((batch) => ({ frame: frame.id, ...batch }))
 }
 
+/** @param {object} batch Original batch. @returns {string} Offset-independent batch identity. */
+const batchStampKey = (batch) =>
+  [
+    batch.partition,
+    batch.producerId,
+    batch.producerEpoch,
+    batch.firstSequence,
+    batch.count,
+    batch.bodyHash,
+    batch.payloadHash,
+  ].join(':')
+
+/**
+ * Reads partition offsets/statuses without invoking the product's result mapping.
+ * @param {object} frame Original Produce request fact.
+ * @param {Buffer} bytes Original response, including length and correlation.
+ * @returns {object[]} Compact original partition results, including errors and leader hints.
+ */
+const produceResponseFacts = (frame, bytes) => {
+  const reader = new Decoder(bytes.subarray(8))
+  const flexible = frame.apiVersion >= 9
+  if (flexible) reader.readTaggedFields()
+  const array = (read) =>
+    flexible ? reader.readUVarIntArray(() => read()) : reader.readArray(() => read())
+  const results = []
+  array(() => {
+    const topic =
+      frame.apiVersion >= 13 ? null : flexible ? reader.readUVarIntString() : reader.readString()
+    const topicId = frame.apiVersion >= 13 ? reader.readUuid() : null
+    array(() => {
+      const fact = {
+        topic,
+        topicId,
+        partition: reader.readInt32(),
+        errorCode: reader.readInt16(),
+        baseOffset: reader.readInt64().toString(),
+        logAppendTime: reader.readInt64().toString(),
+        logStartOffset: frame.apiVersion >= 5 ? reader.readInt64().toString() : null,
+      }
+      if (frame.apiVersion >= 8) {
+        fact.recordErrors = array(() => {
+          const error = {
+            batchIndex: reader.readInt32(),
+            message: flexible ? reader.readUVarIntString() : reader.readString(),
+          }
+          if (flexible) reader.readTaggedFields()
+          return error
+        })
+        fact.errorMessage = flexible ? reader.readUVarIntString() : reader.readString()
+      }
+      if (flexible) {
+        const hint = reader.readTaggedFields().get(0)
+        if (hint) {
+          const leader = new Decoder(hint)
+          fact.currentLeader = { leaderId: leader.readInt32(), leaderEpoch: leader.readInt32() }
+        }
+      }
+      results.push(fact)
+    })
+    if (flexible) reader.readTaggedFields()
+  })
+  frame.throttleTime = reader.readInt32()
+  if (flexible) reader.readTaggedFields()
+  return results
+}
+
+/**
+ * @param {object} frame InitProducerId version/header facts.
+ * @param {Buffer} bytes Complete original frame.
+ * @param {boolean} response Whether this is the answer.
+ * @returns {object} Original identity fields, with no record decoding or base64 copy.
+ */
+const initProducerFact = (frame, bytes, response) => {
+  const reader = new Decoder(bytes.subarray(response ? 8 : readRequestHeader(bytes).byteLength))
+  const flexible = frame.apiVersion >= 2
+  if (response && flexible) reader.readTaggedFields()
+  const fact = response
+    ? { throttleTime: reader.readInt32(), errorCode: reader.readInt16() }
+    : {
+        transactionalId: flexible ? reader.readUVarIntString() : reader.readString(),
+        transactionTimeout: reader.readInt32(),
+      }
+  if (response || frame.apiVersion >= 3) {
+    fact.producerId = reader.readInt64().toString()
+    fact.producerEpoch = reader.readInt16()
+  }
+  if (flexible) reader.readTaggedFields()
+  return fact
+}
+
+/**
+ * Copies only a bounded amount of evidence; never traverses or stringifies a large journal.
+ * @param {*} value Original facts.
+ * @param {number} limit Conservative upper bound on encoded bytes, including JSON escaping.
+ * @returns {{value:*, bytes:number, truncated:boolean}} Detached projection and explicit omission flag.
+ */
+const boundedEvidence = (value, limit) => {
+  let bytes = 0
+  let truncated = false
+  const copy = (item, depth = 0) => {
+    if (bytes + 64 > limit || depth > 24) {
+      truncated = true
+      return undefined
+    }
+    if (item == null || typeof item !== 'object') {
+      const cost = typeof item === 'string' ? item.length * 6 + 2 : 32
+      if (bytes + cost > limit) {
+        truncated = true
+        return undefined
+      }
+      bytes += cost
+      return typeof item === 'bigint' ? String(item) : item
+    }
+    bytes += 2
+    const result = Array.isArray(item) ? [] : {}
+    for (const key of Array.isArray(item) ? item.keys() : Object.keys(item)) {
+      const cost = Array.isArray(item) ? 1 : key.length * 6 + 4
+      if (bytes + cost + 64 > limit) {
+        truncated = true
+        break
+      }
+      bytes += cost
+      const child = copy(item[key], depth + 1)
+      if (child !== undefined) result[key] = child
+      if (truncated) break
+    }
+    return result
+  }
+  return { value: copy(value), bytes, truncated }
+}
+
+/** @param {object[]} messages Original batch membership. @returns {string} Length-delimited input hash. */
+const membershipHash = (messages) => {
+  const hash = createHash('sha256')
+  const field = (value) => {
+    const bytes = value == null ? null : Buffer.from(value)
+    hash.update(`${bytes?.length ?? -1}:`)
+    if (bytes) hash.update(bytes)
+  }
+  for (const message of messages) {
+    field(message.key)
+    field(message.value)
+    field(String(message.timestamp))
+    for (const [key, values] of Object.entries(message.headers ?? {})) {
+      for (const value of Array.isArray(values) ? values : [values]) {
+        field(key)
+        field(value)
+      }
+    }
+    field(null)
+  }
+  return hash.digest('hex')
+}
+
 /** Test-local, call-through producer observations; no batch or producer state is changed. */
 class BounceProducerEvidence {
   /** @param {ShareBounceCase} owner Original workload. */
@@ -2461,13 +2709,13 @@ class BounceProducerEvidence {
 
   /** @param {Array} stream Destination. @param {object} fact Original observation. @returns {object|null} Stored snapshot. */
   retain(stream, fact) {
-    const size = Buffer.byteLength(JSON.stringify(fact))
-    if (this.bytes + size > PRODUCER_EVIDENCE_BYTES) {
+    const snapshot = boundedEvidence(fact, 128 * 1024)
+    if (snapshot.truncated || this.bytes + snapshot.bytes > PRODUCER_EVIDENCE_BYTES) {
       if (!this.problems.length) this.problems.push('Producer evidence exceeded its byte bound')
       return null
     }
-    this.bytes += size
-    const copy = immutable(fact)
+    this.bytes += snapshot.bytes
+    const copy = snapshot.value
     stream.push(copy)
     return copy
   }
@@ -2481,7 +2729,9 @@ class BounceProducerEvidence {
         topic: batch.topic,
         topicId: this.owner.topicId,
         partition: batch.partition,
-        messages: (batch.messages ?? []).map(originalMessage),
+        count: batch.messages?.length ?? 0,
+        membershipHash: membershipHash(batch.messages ?? []),
+        sends: this.sendIds(batch.messages ?? []),
         ...this.owner.tap.stamp(),
       })
       if (!fact) return null
@@ -2511,18 +2761,25 @@ class BounceProducerEvidence {
       createdAt: batch.createdAt,
       incarnation: batch.incarnation,
       child: this.owner.evidence.label(batch.child),
-      membershipHash:
-        batch.messages == null
-          ? null
-          : createHash('sha256')
-              .update(JSON.stringify(batch.messages.map(originalMessage)))
-              .digest('hex'),
+      membershipHash: this.batches[id]?.membershipHash ?? null,
       everWritten: delivery?.everWritten ?? null,
       dispatched: delivery?.dispatched ?? null,
       settled: delivery?.settled ?? null,
       routingFailures: delivery?.routingFailures ?? null,
       backoffUntil: batch.backoffUntil,
     }
+  }
+
+  /** @param {object[]} messages Batch membership. @returns {Array<number|null>} Original parent sends. */
+  sendIds(messages) {
+    return [
+      ...new Set(
+        messages.map(
+          ({ key }) =>
+            this.owner.sendKeys.get(createHash('sha256').update(key).digest('hex')) ?? null
+        )
+      ),
+    ]
   }
 
   /** @param {object} manager Original manager. @returns {object} Current identity and partition queues. */
@@ -2577,7 +2834,7 @@ class BounceProducerEvidence {
         const started = this.owner.tap.stamp()
         const result = original.apply(sequencer, args)
         const after = this.state(manager)
-        if (JSON.stringify(before) !== JSON.stringify(after) || method === 'verdict')
+        if (!isDeepStrictEqual(before, after) || method === 'verdict')
           this.retain(this.transitions, {
             method,
             started,
@@ -2613,7 +2870,7 @@ class BounceProducerEvidence {
         }
         const observe = (result, error) => {
           const after = this.state(manager)
-          if (method === 'fail' || JSON.stringify(before) !== JSON.stringify(after) || error)
+          if (method === 'fail' || !isDeepStrictEqual(before, after) || error)
             this.retain(this.transitions, {
               ...trigger,
               ended: this.owner.tap.stamp(),
@@ -2662,7 +2919,8 @@ class BounceProducerEvidence {
           partition,
           firstSequence,
           count: messages.length,
-          membership: messages.map(({ key }) => originalBytes(key)),
+          membershipHash: membershipHash(messages),
+          sends: this.sendIds(messages),
         }))
       )
       const fact = {
@@ -2688,8 +2946,6 @@ class BounceProducerEvidence {
           })),
       }
       if (!this.retain([], { ...fact, frames: [] })) return original.call(broker, options)
-      fact.partitions = immutable(fact.partitions)
-      fact.batchStates = immutable(fact.batchStates)
       this.attempts.push(fact)
       const result = this.owner.tap.context.run(fact, () => original.call(broker, options))
       result.then(
@@ -2712,31 +2968,32 @@ class BounceProducerEvidence {
 
   /** @returns {object[]} Original send links derived from immutable record membership, never offset admission. */
   links() {
-    const keys = new Map(
-      this.owner.sends.flatMap((send) =>
-        send.original.messages.map((message) => [message.key, send.id])
-      )
-    )
-    const batchesByKey = new Map()
-    const links = this.batches.map((batch) => {
-      for (const { key } of batch.messages) {
-        if (!batchesByKey.has(key)) batchesByKey.set(key, [])
-        batchesByKey.get(key).push(batch.id)
-      }
-      return {
-        batch: batch.id,
-        sends: [...new Set(batch.messages.map(({ key }) => keys.get(key) ?? null))],
-        attempts: [],
-        retryCount: this.retryCounts.get(batch.id) ?? 0,
-      }
-    })
+    const links = this.batches.map((batch) => ({
+      batch: batch.id,
+      sends: batch.sends,
+      attempts: [],
+      retryCount: this.retryCounts.get(batch.id) ?? 0,
+    }))
     for (const attempt of this.attempts) {
       const batches = new Set(
-        attempt.partitions.flatMap(({ membership }) =>
-          membership.flatMap((key) => batchesByKey.get(key) ?? [])
+        attempt.batchStates.flatMap(({ partitions }) =>
+          partitions.flatMap(({ inFlight }) =>
+            (inFlight ?? [])
+              .filter((batch) =>
+                attempt.partitions.some(
+                  (partition) =>
+                    partition.topic === batch.topic &&
+                    partition.partition === batch.partition &&
+                    partition.firstSequence === batch.firstSequence &&
+                    attempt.producerId === batch.producerId &&
+                    attempt.producerEpoch === batch.producerEpoch
+                )
+              )
+              .map(({ id }) => id)
+          )
         )
       )
-      for (const batch of batches) links[batch].attempts.push(attempt.id)
+      for (const batch of batches) if (links[batch]) links[batch].attempts.push(attempt.id)
     }
     return links
   }
@@ -2756,6 +3013,7 @@ class ShareBounceCase {
     this.group = `e2e-p9e-bounce-group-${this.nonce}`
     this.stack = new CleanupStack()
     this.tap = new ShareWireTap()
+    this.tap.topic = this.topic
     this.evidence = new BounceEvidence(this)
     this.producerEvidence = new BounceProducerEvidence(this)
     this.gauge = new ResourceGauge()
@@ -2768,6 +3026,7 @@ class ShareBounceCase {
     this.requests = []
     this.expected = []
     this.sends = []
+    this.sendKeys = new Map()
     this.pendingSends = []
     this.appended = 0
     this.lateness = 0
@@ -2815,7 +3074,32 @@ class ShareBounceCase {
    * @returns {void}
    */
   row(event, fields = {}) {
-    writeEvidence(EVIDENCE, {
+    const file = evidencePath(EVIDENCE)
+    let before = 0
+    try {
+      before = statSync(file).size
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error
+    }
+    const final = ['case-failed', 'case-complete'].includes(event)
+    const ceiling = ARCHIVE_BYTES - (final ? 0 : 2 * ARCHIVE_ROW_BYTES)
+    if (this.archiveFull && !final) return
+    const remaining = ceiling - before - 32768
+    if (remaining < 1024) {
+      this.archiveFull = true
+      writeEvidence(EVIDENCE, {
+        event: final ? event : 'archive-truncated',
+        case: TITLE,
+        scenario: this.nonce,
+        truncated: true,
+        truncationReason: 'archive-byte-limit',
+        archiveLimit: ARCHIVE_BYTES,
+      })
+      if (statSync(file).size > ARCHIVE_BYTES) truncateSync(file, before)
+      return
+    }
+    const snapshot = boundedEvidence(fields, Math.min(ARCHIVE_ROW_BYTES, remaining))
+    const envelope = {
       event,
       case: TITLE,
       profile: PROFILE,
@@ -2829,8 +3113,33 @@ class ShareBounceCase {
         finalMs: FINAL_MS,
       },
       wireVersions: wireVersionsOf(this.requests),
-      ...fields,
+    }
+    writeEvidence(EVIDENCE, {
+      ...envelope,
+      ...snapshot.value,
+      ...(snapshot.truncated && { truncated: true, truncationReason: 'evidence-row-byte-limit' }),
     })
+    if (statSync(file).size > ceiling) {
+      truncateSync(file, before)
+      this.archiveFull = true
+      writeEvidence(EVIDENCE, {
+        ...envelope,
+        truncated: true,
+        truncationReason: 'archive-byte-limit',
+        archiveLimit: ARCHIVE_BYTES,
+      })
+      if (statSync(file).size > ARCHIVE_BYTES) truncateSync(file, before)
+    } else if (remaining < ARCHIVE_ROW_BYTES && !final) {
+      this.archiveFull = true
+      writeEvidence(EVIDENCE, {
+        ...envelope,
+        event: 'archive-truncated',
+        truncated: true,
+        truncationReason: 'archive-byte-limit',
+        archiveLimit: ARCHIVE_BYTES,
+      })
+      if (statSync(file).size > ARCHIVE_BYTES) truncateSync(file, before)
+    }
   }
 
   /** @returns {object} Progress and public outcomes before cleanup can change them. */
@@ -2915,8 +3224,12 @@ class ShareBounceCase {
       if (cleanupErrors.length) throw new AggregateError(cleanupErrors, 'Cleanup failed')
       await bounded(scope, this.window(FINAL_MS, 0), (inner) => this.complete(inner))
     } catch (error) {
-      this.archive()
-      this.row('case-failed', { error: describeError(error), ...this.progress() })
+      this.archive(true)
+      this.row('case-failed', {
+        logAnomaly: this.appendAnomalies?.length ? this.appendFailure() : null,
+        error: describeError(error),
+        ...this.progress(),
+      })
       throw error
     } finally {
       this.evidence.restore()
@@ -3053,6 +3366,7 @@ class ShareBounceCase {
     const { topics } = await this.admin.fetchTopicMetadata({ topics: [this.topic] })
     const partitions = topics[0].partitions
     this.topicId = topics[0].topicId
+    this.tap.topicId = this.topicId
     this.deliveryLimits = Object.values(NODES).map(({ nodeId }) =>
       Number(
         valueOf(ConfigResourceTypes.BROKER, String(nodeId), 'group.share.delivery.count.limit')
@@ -3425,6 +3739,8 @@ class ShareBounceCase {
       receiptIdentities: [],
     }
     this.sends.push(send)
+    for (const { key } of messages)
+      this.sendKeys.set(createHash('sha256').update(key).digest('hex'), send.id)
     this.pendingSends.push(
       this.producer.send({ topic: this.topic, acks: -1, messages }).then(
         (results) => {
@@ -3882,7 +4198,7 @@ class ShareBounceCase {
     for (const frame of this.tap.allFrames) {
       if (![0, 78].includes(frame.apiKey)) continue
       try {
-        batches.push(...wireBatchStamps(frame))
+        batches.push(...(frame.batches ?? wireBatchStamps(frame)))
       } catch (error) {
         this.tap.problem(`Batch diagnostic frame ${frame.id}: ${error.message}`)
       }
@@ -3978,14 +4294,27 @@ class ShareBounceCase {
           }),
         evidenceStatus: received.length ? 'original-wire-batches' : 'missing-wire-batch',
       }
-      diagnosticBytes += Buffer.byteLength(JSON.stringify(join))
-      if (diagnosticBytes > 16 * 1024 * 1024) {
+      const snapshot = boundedEvidence(join, ARCHIVE_ROW_BYTES)
+      diagnosticBytes += snapshot.bytes
+      if (snapshot.truncated || diagnosticBytes > 1024 * 1024) {
         this.tap.problem(
-          'Append diagnostic joins exceeded 16 MiB; remaining identities are unverified'
+          'Append diagnostic joins exceeded 1 MiB; remaining identities are unverified'
         )
+        if (!joins.length)
+          joins.push({
+            ...join,
+            batches: received.slice(0, 1),
+            copies: [...new Map(join.copies.map((copy) => [copy.offset, copy])).values()].slice(
+              0,
+              8
+            ),
+            produceAttempts: join.produceAttempts.slice(0, 32),
+            receiptIdentities: join.receiptIdentities.slice(0, 8),
+            truncated: true,
+          })
         break
       }
-      joins.push(join)
+      joins.push(snapshot.value)
     }
     return joins
   }
@@ -4074,80 +4403,85 @@ class ShareBounceCase {
         }
         return log
       })
+      const involved = new Set(
+        (this.appendAnomalies ?? []).flatMap((anomaly) =>
+          [anomaly, ...anomaly.copies, ...anomaly.receiptIdentities].map(
+            ({ partition, offset }) => `${partition}:${offset}`
+          )
+        )
+      )
+      for (const entry of this.entries) if (!this.confirmed.has(entry.key)) involved.add(entry.key)
       const partitions = [...log].map(([partition, { endOffset, records }]) => ({
         partition,
         endOffset,
-        records: records.map((record) => ({
-          offset: String(record.offset),
-          ...originalMessage(record),
-          batchContext: record.batchContext,
-        })),
+        recordCount: records.length,
+        records: records
+          .filter(({ offset }) => involved.has(`${partition}:${offset}`))
+          .map((record) => ({
+            offset: String(record.offset),
+            ...originalMessage(record),
+            batchContext: record.batchContext,
+          })),
       }))
-      if (Buffer.byteLength(JSON.stringify(partitions)) > PRODUCER_EVIDENCE_BYTES)
-        throw new Error(
-          'Raw-log snapshot exceeded its byte bound; original wire frames retained within their bound'
-        )
-      this.failureLog.partitions = immutable(partitions)
-      this.failureLog.status = 'captured'
+      const snapshot = boundedEvidence(partitions, ARCHIVE_ROW_BYTES)
+      this.failureLog.partitions = snapshot.value
+      this.failureLog.truncated = snapshot.truncated
+      this.failureLog.status = snapshot.truncated ? 'partial' : 'captured'
     } catch (error) {
       this.failureLog.error = describeError(error, 8)
     }
     this.failureLog.ended = this.tap.stamp()
   }
 
-  /** @returns {void} Archives original streams on success and failure, without success summaries. */
-  archive() {
-    const producerLinks = this.producerEvidence.links()
+  /**
+   * Writes compact producer facts on success; failures retain only involved identity/batch streams.
+   * Large streams are emitted one bounded row at a time, never as one acquisition/fetch journal.
+   * @param {boolean} [failed] Whether the original case failed, including after terminal proof.
+   * @returns {void}
+   */
+  archive(failed = false) {
+    this.appendAnomalies ??= failed ? this.diagnoseAppends() : []
     this.row('acquisition-journal', {
+      evidenceSchema: 2,
+      producerSchema: 2,
+      status: failed ? 'failed' : 'terminal-verified',
+      projection: failed ? 'involved-identities-and-batches' : 'compact-summary',
       topic: this.topic,
       topicId: this.topicId,
-      corpus: this.expected,
-      entries: this.entries.map(({ acquisition, ...entry }) => ({
-        ...entry,
-        acquisition: acquisition?.id,
-      })),
-      acquisitions: this.evidence.acquisitions.map(({ source, ...acquisition }) => acquisition),
-      exchanges: this.evidence.exchanges.map(({ frames, ...exchange }) => ({
-        ...exchange,
-        frames: frames.map(({ id }) => id),
-      })),
-      outcomes: this.evidence.outcomes,
-      retirements: this.evidence.retirements,
-      commands: this.evidence.commands,
-      epochSources: this.evidence.epochs.map(({ frames, ...source }) => ({
-        ...source,
-        frames: frames.map(({ id }) => id),
-      })),
-      socketEvents: this.tap.socketEvents,
-      provisionalUnknownCandidates: this.settlement?.unknown ?? [],
-      terminalUnknown: this.terminalVerified ? (this.settlement?.unknown ?? []) : [],
-      producerSchema: 1,
-      sends: this.sends.map((send) => ({
-        ...send,
-        outcome: send.outcome === 'pending' ? 'unknown' : send.outcome,
-        retryCount: producerLinks
-          .filter(({ sends }) => sends.includes(send.id))
-          .map(({ batch, retryCount, attempts }) => ({
-            batch,
-            retryCount,
-            rpcAttempts: attempts.length,
-            writtenAttempts: attempts.filter(
-              (id) => this.producerEvidence.attempts[id].frames.length
-            ).length,
-          })),
-      })),
-      producerBatches: this.producerEvidence.batches,
-      producerLinks,
-      producerTransitions: this.producerEvidence.transitions,
-      produceAttempts: this.producerEvidence.attempts.map(({ frames, ...attempt }) => ({
-        ...attempt,
-        frames: frames.map(({ id }) => id),
-      })),
-      producerBrokerStates: this.evidence.brokerStates.map(({ frames, ...state }) => ({
-        ...state,
-        frames: frames.map(({ id }) => id),
-      })),
-      brokerConfigs: this.brokerConfigs,
+      counts: {
+        corpus: this.expected.length,
+        entries: this.entries.length,
+        acquisitions: this.evidence.acquisitions.length,
+        exchanges: this.evidence.exchanges.length,
+        outcomes: this.evidence.outcomes.length,
+        successfulAccept: this.settlement?.successful.length ?? 0,
+        replayEvents: this.replay?.extras.length ?? 0,
+        replayPerEpisode: this.replay?.perBounce ?? [],
+        provisionalUnknown: this.settlement?.unknown.length ?? 0,
+        terminalUnknown: this.terminalVerified ? (this.settlement?.unknown.length ?? 0) : 0,
+      },
+      deliveryLimits: this.deliveryLimits,
+      position: this.beforeTerminal,
+      postVerifierPosition: this.afterTerminal,
+      verifier: this.verifier,
+      replayProblems: this.replay?.problems ?? [],
+      settlementProblems: this.settlement?.problems ?? [],
+      captureBounds: {
+        archiveBytes: ARCHIVE_BYTES,
+        rowBytes: ARCHIVE_ROW_BYTES,
+        wireBytes: WIRE_BYTES,
+        wireUsed: this.tap.byteCount,
+        producerBytes: PRODUCER_EVIDENCE_BYTES,
+        producerUsed: this.producerEvidence.bytes,
+        rawProduceBytes: RAW_PRODUCE_BYTES,
+        rawProduceUsed: this.tap.rawProduceBytes,
+        rawProducePerPartition: RAW_PRODUCE_PER_PARTITION,
+      },
+      captureProblems: [
+        ...this.captureProblems,
+        ...this.tap.problems,
+        ...this.producerEvidence.problems,
+      ],
       brokerMechanism: {
         status: 'unverified',
         unavailable: [
@@ -4157,47 +4491,186 @@ class ShareBounceCase {
           'continuous high-watermark/ELR/election history',
         ],
         reason:
-          'Client APIs expose sampled metadata, ends and DescribeProducers; controller broker artifacts are required for the remaining facts',
+          'Client APIs expose sampled metadata, ends and DescribeProducers; broker artifacts are required for the remaining facts',
       },
-      appendAnomalies: this.appendAnomalies ?? this.diagnoseAppends(),
-      failureLog: this.failureLog,
-      captureBounds: {
-        wireBytes: WIRE_BYTES,
-        wireUsed: this.tap.byteCount,
-        producerBytes: PRODUCER_EVIDENCE_BYTES,
-        producerUsed: this.producerEvidence.bytes,
-      },
-      captureProblems: [
-        ...this.captureProblems,
-        ...this.tap.problems,
-        ...this.producerEvidence.problems,
-      ],
-      wire: this.tap.allFrames.filter(({ apiKey }) => ARCHIVE_APIS.has(apiKey)),
-      frozen: this.snapshots.map(({ held, ...rest }) => ({ ...rest, held: [...held] })),
-      uncertainty: freezeAccounting(this.entries, this.snapshots, this.evidence),
-      replay: this.replay,
-      counts: {
-        successfulAccept: this.settlement?.successful.length ?? 0,
-        replayEvents: this.replay?.extras.length ?? 0,
-        replayPerEpisode: this.replay?.perBounce ?? [],
-        provisionalUnknown: this.settlement?.unknown.length ?? 0,
-        provisionalUnknownPerEpisode: this.settlement?.perBounce ?? [],
-        terminalUnknown: this.terminalVerified ? (this.settlement?.unknown.length ?? 0) : 0,
-        terminalUnknownPerEpisode: this.terminalVerified ? (this.settlement?.perBounce ?? []) : [],
-      },
-      effective: this.snapshots.map((bounce) => ({
-        index: bounce.index,
-        identities: [...effectiveObligations(bounce).keys()],
-        obligations: [...effectiveObligations(bounce).values()].flat(),
-      })),
-      deliveryLimits: this.deliveryLimits,
-      position: this.beforeTerminal,
-      verifier: this.verifier,
-      quiet: this.quiet,
-      postVerifierPosition: this.afterTerminal,
-      raw: this.rawIdentities,
-      settlement: this.settlement,
     })
+    for (const candidate of this.settlement?.unknown ?? [])
+      this.row('unknown-settlement', {
+        ...candidate,
+        terminalVerified: Boolean(this.terminalVerified),
+      })
+    for (const extra of this.replay?.extras ?? []) this.row('replay-entry', extra)
+    this.row('quiet-observation', this.quiet)
+    const identities = new Set(this.appendAnomalies.map(({ identity }) => identity))
+    if (failed) {
+      const counts = tally(this.entries.map(({ identity }) => identity))
+      for (const [identity, count] of counts) if (count > 1) identities.add(identity)
+      for (const entry of this.entries)
+        if (!this.confirmed.has(entry.key)) identities.add(entry.identity)
+      for (const { identity } of this.settlement?.unknown ?? []) identities.add(identity)
+      for (const anomaly of this.appendAnomalies) {
+        this.row('append-anomaly', anomaly)
+        for (const { identity } of anomaly.receiptIdentities) identities.add(identity)
+      }
+    }
+    const sendIds = new Set(this.appendAnomalies.flatMap(({ sends }) => sends))
+    if (failed) {
+      for (const send of this.sends)
+        if (
+          send.error ||
+          send.outcome !== 'success' ||
+          send.receiptIdentities.some(({ identity }) => identities.has(identity))
+        )
+          sendIds.add(send.id)
+    }
+    const links = this.producerEvidence.links()
+    const batchIds = new Set(
+      links
+        .filter(({ sends }) => !failed || sends.some((id) => sendIds.has(id)))
+        .map(({ batch }) => batch)
+    )
+    const attemptIds = new Set(
+      links.filter(({ batch }) => batchIds.has(batch)).flatMap(({ attempts }) => attempts)
+    )
+    const frameIds = new Set(
+      this.appendAnomalies.flatMap(({ batches, copies, produceAttempts }) =>
+        [...batches, ...copies, ...produceAttempts].map(({ frame }) => frame)
+      )
+    )
+    for (const attempt of this.producerEvidence.attempts)
+      if (attemptIds.has(attempt.id)) for (const { id } of attempt.frames) frameIds.add(id)
+
+    if (failed) {
+      this.archiveFailureIdentities(identities, frameIds)
+      this.row('failure-log', this.failureLog)
+    }
+    for (const frame of this.tap.allFrames) {
+      const producerFrame = [0, 22].includes(frame.apiKey)
+      if (!producerFrame && !frameIds.has(frame.id)) continue
+      const { bytes, responseBytes, ...fact } = frame
+      const raw = this.tap.rawProduce.get(frame.id)
+      this.row('wire-exchange', {
+        ...fact,
+        ...(!producerFrame && { bytes, responseBytes }),
+        ...(failed &&
+          frame.apiKey === 0 &&
+          frameIds.has(frame.id) && {
+            bytes: raw?.toString('base64'),
+            rawStatus: raw ? 'retained-original' : 'evicted-from-bounded-ring',
+          }),
+      })
+    }
+    for (const send of this.sends) {
+      const { receiptIdentities, ...original } = send
+      if (failed && !sendIds.has(send.id)) {
+        const { original: input, ...settlement } = original
+        this.row('original-send', {
+          ...settlement,
+          outcome: send.outcome === 'pending' ? 'unknown' : send.outcome,
+          inputRecordCount: input.messages.length,
+          receiptCount: receiptIdentities.length,
+          projection: 'uninvolved-send-outcome',
+        })
+        continue
+      }
+      this.row('original-send', {
+        ...original,
+        outcome: send.outcome === 'pending' ? 'unknown' : send.outcome,
+        receiptCount: receiptIdentities.length,
+        receiptIdentities: failed
+          ? receiptIdentities.filter(({ identity }) => identities.has(identity))
+          : undefined,
+      })
+    }
+    for (const batch of this.producerEvidence.batches)
+      if (batchIds.has(batch.id)) this.row('producer-batch', { ...batch, link: links[batch.id] })
+    for (const { frames, batchStates, ...attempt } of this.producerEvidence.attempts)
+      this.row('produce-attempt', {
+        ...attempt,
+        batchStates: attemptIds.has(attempt.id) ? batchStates : undefined,
+        frames: frames.map(({ id }) => id),
+      })
+    for (const transition of this.producerEvidence.transitions) {
+      const states = [transition.before, transition.after].filter(Boolean)
+      const involved =
+        (transition.batch && batchIds.has(transition.batch.id)) ||
+        states.some(({ partitions }) =>
+          partitions?.some(
+            ({ queued, inFlight }) =>
+              (queued ?? []).some((id) => batchIds.has(id)) ||
+              (inFlight ?? []).some(({ id }) => batchIds.has(id))
+          )
+        )
+      if (!failed || involved || transition.method === 'identity.bumpEpoch')
+        this.row('producer-transition', transition)
+    }
+    this.row('broker-configs', { configs: this.brokerConfigs })
+    for (const { frames, ...state } of this.evidence.brokerStates)
+      this.row('producer-broker-state', { ...state, frames: frames.map(({ id }) => id) })
+  }
+
+  /**
+   * Retains original acquisition/receipt provenance only for involved identities, with raw frame links.
+   * @param {Set<string>} identities Failure identities and their matching public receipts.
+   * @param {Set<number>} frameIds Relevant frames, extended with acquisition/receipt/epoch sources.
+   * @returns {void}
+   */
+  archiveFailureIdentities(identities, frameIds) {
+    const cohorts = new Set()
+    const exchanges = new Set()
+    for (const { acquisition, ...entry } of this.entries) {
+      if (!identities.has(entry.identity)) continue
+      cohorts.add(acquisition?.id)
+      exchanges.add(acquisition?.exchange)
+      this.row('handler-entry', { ...entry, acquisition: acquisition?.id })
+    }
+    for (const { source, ...acquisition } of this.evidence.acquisitions)
+      if (cohorts.has(acquisition.id)) this.row('acquisition', acquisition)
+    for (const { frames, response, ...exchange } of this.evidence.exchanges) {
+      if (
+        !exchange.tickets.some(({ cohort }) => cohorts.has(cohort)) &&
+        !exchanges.has(exchange.id)
+      )
+        continue
+      for (const { id } of frames) frameIds.add(id)
+      this.row('share-exchange', {
+        ...exchange,
+        frames: frames.map(({ id }) => id),
+        response: response && {
+          errorCode: response.errorCode,
+          errorMessage: response.errorMessage,
+          responses: response.responses.map(({ topicId, partitions }) => ({
+            topicId,
+            partitions: partitions.map(
+              ({
+                partitionIndex,
+                errorCode,
+                acknowledgeErrorCode,
+                currentLeader,
+                acquiredRecords,
+              }) => ({
+                partitionIndex,
+                errorCode,
+                acknowledgeErrorCode,
+                currentLeader,
+                acquiredRecords,
+              })
+            ),
+          })),
+        },
+      })
+    }
+    for (const outcome of this.evidence.outcomes)
+      if (cohorts.has(outcome.cohort)) this.row('acknowledgement-outcome', outcome)
+    for (const { frames, ...source } of this.evidence.epochs) {
+      for (const { id } of frames) frameIds.add(id)
+      this.row('epoch-source', { ...source, frames: frames.map(({ id }) => id) })
+    }
+    for (const event of this.tap.socketEvents) this.row('socket-event', event)
+    for (const retirement of this.evidence.retirements) this.row('retirement', retirement)
+    for (const command of this.evidence.commands) this.row('bounce-command', command)
+    for (const { held, ...bounce } of this.snapshots)
+      this.row('frozen-bounce', { ...bounce, held: [...held] })
   }
 
   /**
