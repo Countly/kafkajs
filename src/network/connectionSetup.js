@@ -332,8 +332,10 @@ class SetupAttempt {
     this.onExpire?.(error)
   }
 
-  /** @returns {void} @throws {KafkaJSConnectionError} when this original attempt ended */
+  /** @returns {void} @throws {Error} when its captured private authority or original setup ended */
   assertCurrent() {
+    const refusal = this.externalGuard && this.externalGuard()
+    if (refusal) throw refusal
     if (this.now() >= this.limit) this.expire()
     if (this.status !== 'active')
       throw (

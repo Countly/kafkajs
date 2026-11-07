@@ -145,3 +145,70 @@ are best effort and a rejected written sample can therefore be absent from a lat
 delta. Omission counts are local diagnostics, with at most one sanitized warning per
 subscription revision. These are internal primitives; returned-client configuration
 and lifecycle attachment have separate implementation milestones.
+
+## Subscription transport and recovery
+
+The subscription engine uses one dedicated broker socket per enabled client. It
+inherits TLS, SASL and the socket factory, authenticates separately, and keeps its
+queue, throttling and failure state separate from foreground operations. It uses
+only current connected broker advertisements, requires version 0 of both telemetry
+APIs, then negotiates again on the dedicated socket and completes a successful Get.
+A missing exporter leaves telemetry dormant. A successful Get with no matching
+CLIENT_METRICS resource keeps its UUID and polls without sending Push requests.
+This transport milestone does not activate a public factory option.
+
+Each accepted Get replaces filters, codecs, cap, interval and temporality together.
+The first Get uses a zero UUID until a current successful response assigns one; all
+later Gets retain that ID. Subscription IDs are opaque signed integers. An empty
+requested list polls; a nonempty list with no matching points sends a zero-byte
+Metrics blob using no compression. A single `*` selects all; mixed lists are literal
+case-sensitive prefixes, including an empty prefix.
+
+The first Push waits 0.5 to 1.5 intervals. Subsequent Pushes and empty polls wait
+from completion and respect the broker throttle. Nonpositive intervals use 300000 ms;
+positive intervals below 100 ms are clamped to 100 ms for local resource safety.
+Large delays use stepped timers, and a delayed callback never causes catch-up Pushes.
+Each setup, serialization and RPC attempt has a 30000 ms local cap. The dedicated
+queue enforces a 5000 ms response timeout and one in-flight request even when
+foreground request-timeout enforcement is disabled. Response frames are limited to
+65536 bytes or the configured smaller frame limit. Metadata is bounded before
+array allocation: 128 codecs, 256 prefixes, 256 UTF-8 bytes per prefix, and 16384
+aggregate prefix bytes.
+
+| Result | Isolated next action |
+|---|---|
+| Success | Install a complete Get replacement or schedule the next normal Push. |
+| 117 or 76 from Push | One immediate Get subject to throttle; repeated recovery before a successful Push backs off. A rejected codec stays suppressed if the refreshed list repeats it. |
+| 117 or 76 from Get | Back off without recursive Get. |
+| 118 | Halve the effective payload budget to at least one byte; wait interval and throttle, then Get. A larger refreshed cap cannot clear the penalty before a successful Push. |
+| 89 | Wait at least interval and throttle, then Get. |
+| 35 | Refuse this endpoint advertisement revision; switch only to an already-known eligible candidate after backoff, otherwise become dormant. |
+| Retriable transport or local deadline | Retire only the dedicated socket and back off from 1000 ms exponentially, with 0.8–1.2 jitter and a final 30000 ms cap, then Get with the retained UUID. |
+| 42, 87, unknown code, malformed success or non-retriable authentication failure | Stop this object's telemetry and leave foreground operation outcomes unchanged. |
+
+A public reconnect after a terminating attempt keeps the accepted UUID and uses a
+new socket. Its stream remains provisional until a successful normal Push. If that
+provisional Push receives 42, one corrective retirement, backoff, nonzero-ID Get
+and additional normal Push is permitted. The allowance is consumed before this
+work; successful Gets and codec refreshes cannot refill it. A second 42 stops
+telemetry. Established streams have no such exception. Closing a provisional
+stream skips another terminating Push.
+
+Metric baselines advance only at the authorized socket-write boundary, for the
+complete points actually included. A later rejection or lost response does not
+rewind a written sample. Unsent work preserves eligible sums and windows. Omitted
+points are counted locally, with one fixed warning per subscription revision.
+Diagnostics contain fixed text and never expose raw broker messages, metric
+values, credentials, payloads or application causes.
+
+Authentication uses one persistent client-owned shell for the entire mechanism,
+including built-in OAuth token retrieval and custom providers. Retiring a socket
+cancels its local wait but does not free the shell until the underlying work
+settles. A later ordinary request captures its own authority for renewal, including
+all internal SASL writes and readiness publication. It cannot inherit an expired
+opening request or adopt a newer request midway through authentication.
+
+A terminating Push is established-only: it never dials or starts authentication.
+If authentication is due at preparation or becomes due while the final waits in
+the queue, the final is abandoned and only its captured transport is retired.
+An already-authenticated final can write once within the original close budget.

@@ -162,6 +162,7 @@ module.exports = class RequestQueue extends EventEmitter {
       frameLength: pushedRequest.frameLength,
       telemetrySink: pushedRequest.telemetrySink,
       telemetrySlot: pushedRequest.telemetrySlot,
+      onWrite: pushedRequest.onWrite,
       requestTimeout,
       send: () => {
         if (this.inflight.has(correlationId)) {
@@ -186,6 +187,7 @@ module.exports = class RequestQueue extends EventEmitter {
    * @property {number} [frameLength] complete encoded frame bytes, including the length prefix
    * @property {object|null} [telemetrySink] private numeric observer captured at send entry
    * @property {object|null} [telemetrySlot] original node slot, never looked up at completion
+   * @property {Function|null} [onWrite] private commit; a thrown refusal rejects before in-flight ownership
    * @property {Function} sendRequest
    * @property {number} [requestTimeout]
    * @property {(frameLength?: number) => Error|null} [guard] checked just before the request is written; an error it
@@ -261,13 +263,26 @@ module.exports = class RequestQueue extends EventEmitter {
   }
 
   /**
-   * @param {SocketRequest} socketRequest
+   * Commits private transmission after authority checks and before synchronous send. A failed
+   * commit settles only this request, including when dispatch runs inside a timer or response.
+   * @param {SocketRequest} socketRequest captured pending request
+   * @returns {void} foreground send failures keep their existing propagation
    */
   sendSocketRequest(socketRequest) {
     const refusal = socketRequest.refusal()
     if (refusal) {
       socketRequest.rejected(refusal)
       return
+    }
+
+    if (socketRequest.onWrite) {
+      try {
+        socketRequest.onWrite()
+      } catch (error) {
+        socketRequest.rejected(error)
+        this.emitQueueState()
+        return
+      }
     }
 
     socketRequest.send()

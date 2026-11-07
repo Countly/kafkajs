@@ -27,6 +27,7 @@ module.exports = class ConnectionPool {
   /**
    * @param {ConstructorParameters<typeof Connection>[0] & {
    *   authenticationTimeout?: number,
+   *   setupGuard?: () => Error|null,
    *   authenticationBlackout?: Map<string, { until: number, errorMessage: string }>,
    *   drainTimeout?: number,
    *   generation?: number
@@ -47,6 +48,7 @@ module.exports = class ConnectionPool {
     this.authenticationTimeout = options.authenticationTimeout
     this.drainTimeout = options.drainTimeout
     this.retired = false
+    this.setupGuard = options.setupGuard || null
     this.generationBase = options.generation ?? 0
     this.brokerAddress = `${this.host}:${this.port}`
     this.setupPolicy = options.setupPolicy || ConnectionSetupPolicy.resolve(options)
@@ -109,11 +111,13 @@ module.exports = class ConnectionPool {
   /** Creates one attempt against the current shared owner. @returns {SetupAttempt} */
   beginSetup() {
     this.throwIfRetired()
-    return new SetupAttempt({
+    const attempt = new SetupAttempt({
       states: this.setupStates,
       address: this.brokerAddress,
       policy: this.setupPolicy,
     })
+    attempt.externalGuard = this.setupGuard
+    return attempt
   }
 
   isConnected() {

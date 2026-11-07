@@ -145,6 +145,7 @@ module.exports = class BrokerPool {
     this.setupStates = null
     this.setupMetadataEndpoints = new Map()
 
+    this.telemetryAdvertisementListener = null
     /**
      * Every broker of this pool is built here, so each one names the identity the pool currently
      * holds in its ApiVersions requests, follows the pool's recovery strategy and reports a
@@ -154,6 +155,7 @@ module.exports = class BrokerPool {
      */
     this.createBroker = (options) => {
       const broker = new Broker({
+        onReady: () => this.telemetryAdvertisementListener?.(),
         allowAutoTopicCreation,
         authenticationTimeout,
         metadataRecoveryStrategy: this.metadataRecoveryStrategy,
@@ -168,6 +170,8 @@ module.exports = class BrokerPool {
     }
 
     this.brokers = {}
+    this.telemetryEndpointRevision = 0n
+    this.telemetryAdvertisements = new WeakMap()
     /** @type {Broker | undefined} */
     this.seedBroker = undefined
     /** @type {import("../../types").BrokerMetadata | null} */
@@ -512,6 +516,54 @@ module.exports = class BrokerPool {
         })
       )
       .catch(() => {})
+  }
+
+  /**
+   * Copies only current ready foreground advertisements without discovery or connection work.
+   * Revisions are issued on pool/generation/node changes and never reused on this owner.
+   * @returns {ReadonlyArray<object>} immutable endpoint hints; no application-owned objects
+   * @throws {Error} internal invalid advertisement; contained by the telemetry owner
+   */
+  telemetryCandidates() {
+    const result = []
+    const known = new Set([this.seedBroker, ...Object.values(this.brokers)])
+    for (const broker of known) {
+      if (!broker || broker.retired || !broker.isConnected()) continue
+      const pool = broker.connectionPool
+      if (pool.retired || broker.versionsGeneration !== pool.generation) continue
+      let entry = this.telemetryAdvertisements.get(broker)
+      if (
+        !entry ||
+        entry.pool !== pool ||
+        entry.generation !== pool.generation ||
+        entry.nodeId !== broker.nodeId ||
+        entry.versions !== broker.versions
+      ) {
+        entry = {
+          pool,
+          generation: pool.generation,
+          nodeId: broker.nodeId,
+          versions: broker.versions,
+          revision: ++this.telemetryEndpointRevision,
+        }
+        this.telemetryAdvertisements.set(broker, entry)
+      }
+      const versions = Object.freeze(
+        Object.fromEntries(
+          Object.entries(broker.versions).map(([key, range]) => [key, Object.freeze({ ...range })])
+        )
+      )
+      result.push(
+        Object.freeze({
+          nodeId: broker.nodeId,
+          host: pool.host,
+          port: pool.port,
+          versions,
+          endpointRevision: entry.revision,
+        })
+      )
+    }
+    return Object.freeze(result)
   }
 
   /**

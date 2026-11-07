@@ -53,6 +53,7 @@ module.exports = class SocketRequest {
    * @param {number} [options.frameLength] complete frame bytes, supplied to the transmission guard
    * @param {object|null} [options.telemetrySink=null] private numeric collector
    * @param {object|null} [options.telemetrySlot=null] captured slot reference
+   * @param {Function|null} [options.onWrite=null] private commit immediately before synchronous send
    * @param {Function} options.send
    * @param {() => void} options.timeout bookkeeping the queue does when this request times out
    * @param {(socketRequest: SocketRequest) => void} [options.afterTimeout] called once the request was rejected with its own
@@ -74,6 +75,7 @@ module.exports = class SocketRequest {
     frameLength,
     telemetrySink = null,
     telemetrySlot = null,
+    onWrite = null,
     instrumentationEmitter = null,
     logger = null,
   }) {
@@ -92,6 +94,7 @@ module.exports = class SocketRequest {
     this.logger = logger
     this.telemetrySink = telemetrySink
     this.telemetrySlot = telemetrySlot
+    this.onWrite = onWrite
 
     this.sentAt = null
     this.duration = null

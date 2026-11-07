@@ -699,3 +699,14 @@ const socketFactory = ({ host, port, ssl, onConnect }) => {
   return socket
 }
 ```
+
+## Telemetry transport cost
+
+The internal telemetry transport can use one additional broker connection per
+client, including its TLS and SASL authentication. It sends interval-driven
+GetTelemetrySubscriptions and PushTelemetry traffic on a dedicated queue. Both
+negotiated APIs and a successful runtime handshake are required. Missing exporter
+and no matching CLIENT_METRICS resource are different outcomes: the former is
+dormant, while the latter polls without Push. Foreground operations retain their
+original results and errors. The factory configuration surface is documented when
+its public integration is available; see [Client Telemetry](ClientTelemetry.md).
