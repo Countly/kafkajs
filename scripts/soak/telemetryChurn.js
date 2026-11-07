@@ -3271,6 +3271,7 @@ class TelemetryWorkerProcess {
           measurementMs: worker.timing.measurementMs,
           cleanupMs: worker.timing.cleanupMs,
           reference: this.reference({ loaded, control, host }),
+          sampler: { skipped: sampler.skipped, readFailures: sampler.readFailures },
         }
         return soak.TelemetryResourceVerdict.evaluate(input)
       }

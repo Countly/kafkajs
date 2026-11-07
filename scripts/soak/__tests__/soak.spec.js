@@ -6871,6 +6871,13 @@ describe('telemetry resource evidence', () => {
       'cleanup budget',
     ],
     [
+      'a reading that failed after admission',
+      (r) => {
+        r.sampler = { skipped: [], readFailures: [{ admittedPhaseMs: 330000, message: 'late' }] }
+      },
+      'sampler read failure',
+    ],
+    [
       'closed transient overflow',
       (r) => {
         r.teardown.memory.retainedBytes += 262144 + 1

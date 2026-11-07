@@ -320,6 +320,8 @@ class TelemetryResourceVerdict {
    * @param {number} run.measurementMs how long the measurement window lasted
    * @param {object} run.reference the replayable resident-size reference: peak source and
    *   capability, startup, loaded and control readings, host contexts and the final reading
+   * @param {{skipped:number[], readFailures:object[]}} [run.sampler] the sampler's own facts: fixed
+   *   grid times skipped and readings that failed after they were admitted
    * @returns {{ok:boolean, outcome:'passed'|'failed'|'inconclusive', violations:string[],
    *   inconclusive:string[], measured:object}} the verdict: failures take precedence over an
    *   inconclusive measurement, and only a passed outcome is `ok`
@@ -333,9 +335,15 @@ class TelemetryResourceVerdict {
     cleanupMs,
     measurementMs,
     reference,
+    sampler,
   }) {
     const violations = []
-    const measured = { samples: samples.length, slopeBytesPerMinute: null, endpointBytes: null }
+    const measured = {
+      samples: samples.length,
+      skippedSamples: sampler?.skipped?.length ?? 0,
+      slopeBytesPerMinute: null,
+      endpointBytes: null,
+    }
     const fail = (condition, label) => {
       if (!condition) violations.push(label)
     }
@@ -350,6 +358,7 @@ class TelemetryResourceVerdict {
       'cleanup budget'
     )
     fail(samples.length >= TELEMETRY.minSamples, 'post-GC sample count')
+    fail(!sampler?.readFailures?.length, 'sampler read failure')
     fail(
       Number.isFinite(measurementMs) && measurementMs >= TELEMETRY.measureMs,
       'measurement duration'
