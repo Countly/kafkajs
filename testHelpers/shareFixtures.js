@@ -350,10 +350,16 @@ class ShareHandlerLog {
  * @param {object} [options.kafka] defaults to the repository's plaintext Kafka configuration
  * @param {AbortSignal} [options.signal] enclosing case scope
  * @param {number} [options.windowMs=5000] post-join observation window
+ * @param {Function} [options.record] Verifier sub-step observations on the monotonic clock.
+ * @param {Function} [options.onClient] Registers the original client with its enclosing owner.
  * @returns {Promise<object[]>} actual delivered identities and delivery counts
  * @throws {Error} on join, crash, bound or cleanup failure
  */
-const verifierMember = async (group, topic, { kafka, signal, windowMs = 5000 } = {}) => {
+const verifierMember = async (
+  group,
+  topic,
+  { kafka, signal, windowMs = 5000, record, onClient } = {}
+) => {
   const { NEVER, bounded, delay, pollUntil } = require('../src/producer/__tests__/fixtures/bounded')
   const { CleanupStack } = require('../src/producer/__tests__/fixtures/liveProbe')
   const { Kafka, logLevel } = require('../index')
@@ -366,25 +372,67 @@ const verifierMember = async (group, topic, { kafka, signal, windowMs = 5000 } =
     maxWaitTimeInMs: 250,
     acknowledgementMode: 'implicit',
   })
+  onClient?.(client)
+  const startedAt = performance.now()
+  const note = (step, fields = {}) =>
+    record?.({
+      status: 'progress',
+      groupId: group,
+      topic,
+      step,
+      elapsedMs: performance.now() - startedAt,
+      ...fields,
+    })
   const cleanup = new CleanupStack()
+  let stopping
+  const abort = () => {
+    note('abort')
+    stopping = client.disconnect({ timeout: 0 })
+    stopping.catch(() => {})
+  }
+  owner.addEventListener('abort', abort, { once: true })
+  const removers = [() => owner.removeEventListener('abort', abort)]
   const delivered = []
   const crashes = []
   const remove = client.on(client.events.CRASH, ({ payload }) => {
     crashes.push(payload.error)
   })
-  cleanup.add('remove verifier listener', () => remove())
+  removers.push(remove)
+  for (const [event, step] of [
+    [client.events.GROUP_JOIN, 'joined'],
+    [client.events.ASSIGNMENT_CHANGED, 'assignment'],
+  ]) {
+    if (!event) continue
+    const removeEvent = client.on(event, ({ payload }) => note(step, { payload }))
+    removers.push(removeEvent)
+  }
   const fetches = []
   if (client.events.REQUEST) {
     const removeRequests = client.on(client.events.REQUEST, ({ payload }) => {
-      if (payload.apiName === 'ShareFetch') fetches.push(payload)
+      if (payload.apiName === 'ShareFetch') {
+        if (fetches.length === 0) note('first fetch', { payload })
+        fetches.push(payload)
+      }
     })
-    cleanup.add('remove verifier request listener', () => removeRequests())
+    removers.push(removeRequests)
   }
-  cleanup.add('disconnect verifier', () => client.disconnect({ timeout: 2000 }))
+  cleanup.add('disconnect verifier', async () => {
+    note('disconnect start')
+    try {
+      await client.disconnect({ timeout: owner.aborted ? 0 : 2000 })
+      await stopping
+      note('disconnected')
+    } finally {
+      for (const remove of removers.reverse()) remove()
+    }
+  })
   return cleanup.run(
     async () => {
+      note('connect start')
       await bounded(owner, 10000, () => client.connect())
+      note('connected')
       await bounded(owner, 10000, () => client.subscribe({ topics: [topic] }))
+      note('join start')
       await bounded(owner, 10000, async (scope) => {
         await client.run({
           eachMessage: async ({ topic: name, partition, message }) => {
@@ -394,6 +442,7 @@ const verifierMember = async (group, topic, { kafka, signal, windowMs = 5000 } =
             })
           },
         })
+        note('run resolved')
         await pollUntil(
           scope,
           Infinity,
@@ -410,10 +459,12 @@ const verifierMember = async (group, topic, { kafka, signal, windowMs = 5000 } =
           { label: 'The verifier assignment' }
         )
       })
-      const startedAt = Date.now()
+      const windowStartedAt = Date.now()
+      note('window start', { assignment: client.assignment?.(), fetches: fetches.length, windowMs })
       await delay(owner, windowMs)
+      note('window end', { assignment: client.assignment?.(), fetches: fetches.length, windowMs })
       if (crashes.length) throw crashes[0]
-      if (client.events.REQUEST && !fetches.some(({ sentAt }) => sentAt >= startedAt)) {
+      if (client.events.REQUEST && !fetches.some(({ sentAt }) => sentAt >= windowStartedAt)) {
         throw new Error('The assigned verifier completed no active fetch in its observation window')
       }
       if (
@@ -659,6 +710,7 @@ const assertShareCleanup = async (
   const { NEVER, bounded, pollUntil } = require('../src/producer/__tests__/fixtures/bounded')
   const keys = ['listeners', 'sockets', 'queueDepth', 'ledgerSize', 'activeResources']
   let after
+  let previous
   try {
     return await bounded(signal || NEVER, 10000, async (scope) => {
       await waitForShareFixtureAbsence(admin, groups, topics, { signal: scope, unrelated, record })
@@ -671,10 +723,12 @@ const assertShareCleanup = async (
         Infinity,
         async (sampleScope) => {
           after = await sampleShareCleanup(probe, sampleScope)
-          const restored = isDeepStrictEqual(
-            shareCleanupResources(after),
-            shareCleanupResources(baseline)
-          )
+          const resources = shareCleanupResources(after)
+          const restored = isDeepStrictEqual(resources, shareCleanupResources(baseline))
+          if (!isDeepStrictEqual(resources, previous)) {
+            record?.('cleanup-resources', { baseline, after, restored })
+            previous = resources
+          }
           if (!restored && !disconnectAdmin) {
             throw new Error('Share resources did not return to baseline')
           }
