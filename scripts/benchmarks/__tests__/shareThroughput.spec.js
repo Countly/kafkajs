@@ -728,11 +728,15 @@ describe('Share throughput terminal proof', () => {
 
   /**
    * Public-client doubles retain the actual terminal and active-verifier helper behavior.
+   * Monotonic time starts beyond the old fixed deadlines and advances with the fake timers.
    * @param {object} [options] Scripted verifier and post-verifier failures.
-   * @returns {object} Driver and original admin observations, without broker I/O.
+   * @returns {object} Driver, original admin observations and clock-relative deadlines, without broker I/O.
    */
   const fixture = ({ silent = false, replay = false, drainReplay = false, failedRead } = {}) => {
-    jest.useFakeTimers()
+    jest.useFakeTimers({ doNotFake: ['performance'] })
+    const startedAt = Date.now()
+    jest.spyOn(performance, 'now').mockImplementation(() => 1000000.25 + (Date.now() - startedAt))
+    const deadline = performance.now() + 100000
     const steps = []
     const frames = new Frames(fakeSocket)
     const ends = [0, 1, 2].map((partition) => ({ partition, high: '1' }))
@@ -834,11 +838,11 @@ describe('Share throughput terminal proof', () => {
         steps.push('workload-disconnect')
       },
     }
-    return { driver, steps, ends, listing }
+    return { driver, steps, ends, listing, deadline, cleanupDeadline: deadline + LIMITS.cleanup }
   }
 
   test('captures ends before consumption and archives both terminal reads after an active quiet window', async () => {
-    const { driver, steps, listing } = fixture()
+    const { driver, steps, listing, deadline, cleanupDeadline } = fixture()
     jest.spyOn(driver, 'admit').mockResolvedValue()
     jest.spyOn(driver, 'consume').mockImplementation(async () => {
       steps.push('consume')
@@ -853,11 +857,22 @@ describe('Share throughput terminal proof', () => {
 
     const observation = driver.observe(
       { topic: 't', expected: ['corpus'], leaders: new Map() },
-      100000,
-      130000
+      deadline,
+      cleanupDeadline
     )
-    await jest.advanceTimersByTimeAsync(5000)
-    await expect(observation).resolves.toMatchObject({ status: 'valid', traceHash: 'hash' })
+    const startedAt = performance.now()
+    await Promise.all([
+      expect(observation).resolves.toMatchObject({ status: 'valid', traceHash: 'hash' }),
+      (async () => {
+        await jest.advanceTimersByTimeAsync(4999)
+        expect(performance.now() - startedAt).toBe(4999)
+        expect(steps).toContain('verifier-connect')
+        expect(steps).not.toContain('verifier-disconnect')
+        expect(archive).not.toHaveBeenCalled()
+        await jest.advanceTimersByTimeAsync(1)
+      })(),
+    ])
+    expect(performance.now() - startedAt).toBe(5000)
 
     expect(
       steps.filter((step) =>
@@ -915,16 +930,34 @@ describe('Share throughput terminal proof', () => {
   test.each([
     [{ replay: true }, 'Same-group verifier delivered'],
     [{ drainReplay: true }, 'Same-group verifier delivered'],
-    [{ silent: true }, 'completed no active fetch'],
+    [{ silent: true }, 'The assigned verifier completed no active fetch in its observation window'],
     [{ failedRead: 'ends' }, 'Post-verifier end unavailable'],
     [{ failedRead: 'listing' }, 'Post-verifier listing refused'],
   ])('rejects an incomplete terminal proof: %s', async (options, diagnostic) => {
-    const { driver } = fixture(options)
-    await driver.captureEnds('t', 100000)
+    const { driver, steps, deadline } = fixture(options)
+    await driver.captureEnds('t', deadline)
     await Promise.all([
-      expect(driver.verifyTerminal('t', 100000)).rejects.toThrow(diagnostic),
+      expect(driver.verifyTerminal('t', deadline)).rejects.toThrow(diagnostic),
       jest.advanceTimersByTimeAsync(5000),
     ])
+    expect(steps).toContain('verifier-disconnect')
+    expect(driver.terminal[1]).toMatchObject({ stage: 'terminal', status: 'settled' })
+    const proof = driver.terminal.filter(({ stage }) => stage === 'quiet-verifier')
+    if (options.replay || options.drainReplay) {
+      expect(proof).toEqual([
+        expect.objectContaining({
+          status: 'failed',
+          delivered: ['["t",0,"0","6b","76"]'],
+        }),
+      ])
+    } else if (options.silent) {
+      expect(proof).toEqual([])
+    } else {
+      expect(proof).toEqual([
+        expect.objectContaining({ status: 'quiet', delivered: [] }),
+        expect.objectContaining({ status: 'failed' }),
+      ])
+    }
   })
 
   test.each([
@@ -941,9 +974,12 @@ describe('Share throughput terminal proof', () => {
       ends.pop()
     },
   ])('refuses an invalid independent end before consumption', async (mutate) => {
-    const { driver, ends } = fixture()
+    const { driver, ends, steps, deadline } = fixture()
     mutate(ends)
-    await expect(driver.captureEnds('t', 100000)).rejects.toThrow('Invalid independent log ends')
+    await expect(driver.captureEnds('t', deadline)).rejects.toThrow('Invalid independent log ends')
+    expect(steps).toEqual(['admin-connect', 'ends', 'admin-disconnect'])
+    expect(driver.partitions).toBeNull()
+    expect(driver.terminal).toEqual([])
   })
 })
 
