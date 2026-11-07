@@ -350,10 +350,16 @@ class ShareHandlerLog {
  * @param {object} [options.kafka] defaults to the repository's plaintext Kafka configuration
  * @param {AbortSignal} [options.signal] enclosing case scope
  * @param {number} [options.windowMs=5000] post-join observation window
+ * @param {Function} [options.record] Verifier sub-step observations on the monotonic clock.
+ * @param {Function} [options.onClient] Registers the original client with its enclosing owner.
  * @returns {Promise<object[]>} actual delivered identities and delivery counts
  * @throws {Error} on join, crash, bound or cleanup failure
  */
-const verifierMember = async (group, topic, { kafka, signal, windowMs = 5000 } = {}) => {
+const verifierMember = async (
+  group,
+  topic,
+  { kafka, signal, windowMs = 5000, record, onClient } = {}
+) => {
   const { NEVER, bounded, delay, pollUntil } = require('../src/producer/__tests__/fixtures/bounded')
   const { CleanupStack } = require('../src/producer/__tests__/fixtures/liveProbe')
   const { Kafka, logLevel } = require('../index')
@@ -366,25 +372,67 @@ const verifierMember = async (group, topic, { kafka, signal, windowMs = 5000 } =
     maxWaitTimeInMs: 250,
     acknowledgementMode: 'implicit',
   })
+  onClient?.(client)
+  const startedAt = performance.now()
+  const note = (step, fields = {}) =>
+    record?.({
+      status: 'progress',
+      groupId: group,
+      topic,
+      step,
+      elapsedMs: performance.now() - startedAt,
+      ...fields,
+    })
   const cleanup = new CleanupStack()
+  let stopping
+  const abort = () => {
+    note('abort')
+    stopping = client.disconnect({ timeout: 0 })
+    stopping.catch(() => {})
+  }
+  owner.addEventListener('abort', abort, { once: true })
+  const removers = [() => owner.removeEventListener('abort', abort)]
   const delivered = []
   const crashes = []
   const remove = client.on(client.events.CRASH, ({ payload }) => {
     crashes.push(payload.error)
   })
-  cleanup.add('remove verifier listener', () => remove())
+  removers.push(remove)
+  for (const [event, step] of [
+    [client.events.GROUP_JOIN, 'joined'],
+    [client.events.ASSIGNMENT_CHANGED, 'assignment'],
+  ]) {
+    if (!event) continue
+    const removeEvent = client.on(event, ({ payload }) => note(step, { payload }))
+    removers.push(removeEvent)
+  }
   const fetches = []
   if (client.events.REQUEST) {
     const removeRequests = client.on(client.events.REQUEST, ({ payload }) => {
-      if (payload.apiName === 'ShareFetch') fetches.push(payload)
+      if (payload.apiName === 'ShareFetch') {
+        if (fetches.length === 0) note('first fetch', { payload })
+        fetches.push(payload)
+      }
     })
-    cleanup.add('remove verifier request listener', () => removeRequests())
+    removers.push(removeRequests)
   }
-  cleanup.add('disconnect verifier', () => client.disconnect({ timeout: 2000 }))
+  cleanup.add('disconnect verifier', async () => {
+    note('disconnect start')
+    try {
+      await client.disconnect({ timeout: owner.aborted ? 0 : 2000 })
+      await stopping
+      note('disconnected')
+    } finally {
+      for (const remove of removers.reverse()) remove()
+    }
+  })
   return cleanup.run(
     async () => {
+      note('connect start')
       await bounded(owner, 10000, () => client.connect())
+      note('connected')
       await bounded(owner, 10000, () => client.subscribe({ topics: [topic] }))
+      note('join start')
       await bounded(owner, 10000, async (scope) => {
         await client.run({
           eachMessage: async ({ topic: name, partition, message }) => {
@@ -394,6 +442,7 @@ const verifierMember = async (group, topic, { kafka, signal, windowMs = 5000 } =
             })
           },
         })
+        note('run resolved')
         await pollUntil(
           scope,
           Infinity,
@@ -410,10 +459,12 @@ const verifierMember = async (group, topic, { kafka, signal, windowMs = 5000 } =
           { label: 'The verifier assignment' }
         )
       })
-      const startedAt = Date.now()
+      const windowStartedAt = Date.now()
+      note('window start', { assignment: client.assignment?.(), fetches: fetches.length, windowMs })
       await delay(owner, windowMs)
+      note('window end', { assignment: client.assignment?.(), fetches: fetches.length, windowMs })
       if (crashes.length) throw crashes[0]
-      if (client.events.REQUEST && !fetches.some(({ sentAt }) => sentAt >= startedAt)) {
+      if (client.events.REQUEST && !fetches.some(({ sentAt }) => sentAt >= windowStartedAt)) {
         throw new Error('The assigned verifier completed no active fetch in its observation window')
       }
       if (
@@ -530,6 +581,107 @@ const captureShareCleanupBaseline = async (probe, { signal, cleanupStack = true 
 }
 
 /**
+ * Waits for every owned share group to be empty or absent before deletion.
+ * @param {object} admin Connected admin client.
+ * @param {string[]} groups Owned share group ids.
+ * @param {{ signal?: AbortSignal, record?: Function }} [options] Existing cleanup scope and evidence sink.
+ * @returns {Promise<void>} Once no owned group has members.
+ * @throws {Error} On missing/refused descriptions, retained membership or expiry.
+ */
+const waitForShareGroupsEmpty = async (admin, groups, { signal, record } = {}) => {
+  if (groups.length === 0) return
+  const { NEVER, bounded, pollUntil } = require('../src/producer/__tests__/fixtures/bounded')
+  await pollUntil(
+    signal || NEVER,
+    10000,
+    async (scope) => {
+      const described = await bounded(scope, Infinity, () =>
+        admin.describeShareGroups(groups, { apiTimeout: 6000 })
+      )
+      let empty = true
+      for (const groupId of groups) {
+        const matches = described.groups.filter((group) => group.groupId === groupId)
+        if (matches.length !== 1)
+          throw new Error('Missing owned share group description during cleanup')
+        const [group] = matches
+        record?.('cleanup-members', { group })
+        if (group.errorCode === 69) continue
+        if (group.errorCode !== 0) {
+          throw new Error(`Share group cleanup description failed: ${group.errorCode}`)
+        }
+        if (group.state !== 'Empty' || group.members.length !== 0) empty = false
+      }
+      return empty
+    },
+    { label: 'Every share member leaving' }
+  )
+}
+
+/**
+ * Proves owned groups absent and topics absent on every advertised broker within the caller's bound.
+ * Group listings aggregate all brokers; topic listings are attributed through original request events.
+ * @param {object} admin Connected admin client.
+ * @param {string[]} groups Owned share group ids.
+ * @param {string[]} topics Owned topic names.
+ * @param {{ signal: AbortSignal, unrelated: string[], record?: Function }} options Existing cleanup scope and evidence sink.
+ * @param {number} [options.delayMs=250] Pause between broker absence observations.
+ * @returns {Promise<void>} Once all absence and unrelated-presence checks hold.
+ * @throws {Error} On missing evidence, a harmed sibling, retained fixtures or expiry.
+ */
+const waitForShareFixtureAbsence = async (
+  admin,
+  groups,
+  topics,
+  { signal, unrelated, record, delayMs = 250 }
+) => {
+  const { bounded, pollUntil } = require('../src/producer/__tests__/fixtures/bounded')
+  await waitForShareGroupsEmpty(admin, groups, { signal, record })
+  const pending = new Set()
+  if (topics.length > 0) {
+    const { brokers } = await bounded(signal, Infinity, () => admin.describeCluster())
+    for (const { host, port } of brokers) pending.add(`${host}:${port}`)
+    if (pending.size === 0) throw new Error('No brokers available to prove topic deletion')
+  }
+  let request
+  const remove = topics.length
+    ? admin.on(admin.events.REQUEST, ({ payload }) => {
+        if (payload.apiName === 'Metadata') request = payload
+      })
+    : () => {}
+  try {
+    await pollUntil(
+      signal,
+      Infinity,
+      async (scope) => {
+        const { groups: listed } = await bounded(scope, Infinity, () => admin.listGroups())
+        const names = new Set(listed.map(({ groupId }) => groupId))
+        if (unrelated.some((id) => !names.has(id))) throw new Error('Unrelated group disappeared')
+        const remaining = groups.filter((id) => names.has(id))
+        record?.('group-deletion', { remaining })
+        if (topics.length > 0) {
+          request = undefined
+          const listedTopics = await bounded(scope, Infinity, () => admin.listTopics())
+          if (!request) throw new Error('Missing topic listing request evidence')
+          const present = topics.filter((name) => listedTopics.includes(name))
+          if (present.length) pending.add(request.broker)
+          else pending.delete(request.broker)
+          record?.('topic-deletion', {
+            topics,
+            broker: request.broker,
+            present,
+            pending: [...pending],
+          })
+        }
+        return remaining.length === 0 && pending.size === 0
+      },
+      { delayMs, label: 'Share fixtures disappearing on every broker' }
+    )
+  } finally {
+    remove()
+  }
+}
+
+/**
  * Proves owned groups/topics absent and measured owners back at baseline after CleanupStack.
  * Unrelated groups are checked for presence only, never whole-cluster list equality.
  * @param {object} admin still-connected admin used to prove fixture absence
@@ -540,6 +692,7 @@ const captureShareCleanupBaseline = async (probe, { signal, cleanupStack = true 
  * @param {object} [options] unrelated group ids and case signal
  * @param {string[]} [options.unrelated=[]] previously observed unrelated groups
  * @param {AbortSignal} [options.signal] enclosing cleanup scope
+ * @param {Function} [options.record] Original cleanup observations for the evidence sink.
  * @param {boolean} [options.disconnectAdmin=false] close admin and fixture propagation
  *   connections before measuring against a client-free baseline
  * @returns {Promise<object>} final measured snapshot
@@ -551,21 +704,16 @@ const assertShareCleanup = async (
   topics,
   baseline,
   probe,
-  { unrelated = [], signal, disconnectAdmin = false } = {}
+  { unrelated = [], signal, disconnectAdmin = false, record } = {}
 ) => {
   const { inspect, isDeepStrictEqual } = require('util')
   const { NEVER, bounded, pollUntil } = require('../src/producer/__tests__/fixtures/bounded')
   const keys = ['listeners', 'sockets', 'queueDepth', 'ledgerSize', 'activeResources']
   let after
+  let previous
   try {
     return await bounded(signal || NEVER, 10000, async (scope) => {
-      const { groups: listed } = await bounded(scope, Infinity, () => admin.listGroups())
-      const names = new Set(listed.map(({ groupId }) => groupId))
-      const remaining = await bounded(scope, Infinity, () => admin.listTopics())
-      if (groups.some((id) => names.has(id)) || topics.some((name) => remaining.includes(name))) {
-        throw new Error('Share fixture remains after cleanup')
-      }
-      if (unrelated.some((id) => !names.has(id))) throw new Error('Unrelated group disappeared')
+      await waitForShareFixtureAbsence(admin, groups, topics, { signal: scope, unrelated, record })
       if (disconnectAdmin) {
         await bounded(scope, Infinity, () => admin.disconnect())
         await bounded(scope, Infinity, () => helpers.disconnectPropagationBrokers())
@@ -575,10 +723,12 @@ const assertShareCleanup = async (
         Infinity,
         async (sampleScope) => {
           after = await sampleShareCleanup(probe, sampleScope)
-          const restored = isDeepStrictEqual(
-            shareCleanupResources(after),
-            shareCleanupResources(baseline)
-          )
+          const resources = shareCleanupResources(after)
+          const restored = isDeepStrictEqual(resources, shareCleanupResources(baseline))
+          if (!isDeepStrictEqual(resources, previous)) {
+            record?.('cleanup-resources', { baseline, after, restored })
+            previous = resources
+          }
           if (!restored && !disconnectAdmin) {
             throw new Error('Share resources did not return to baseline')
           }
@@ -617,5 +767,7 @@ module.exports = {
   ShareHandlerLog,
   verifierMember,
   captureShareCleanupBaseline,
+  waitForShareGroupsEmpty,
+  waitForShareFixtureAbsence,
   assertShareCleanup,
 }

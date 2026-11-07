@@ -1,3 +1,5 @@
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -16,11 +18,17 @@ import org.apache.kafka.common.TopicIdPartition;
 /**
  * Development-only explicit-acknowledgement share member for mixed Java/JavaScript scenarios.
  *
- * <p>Arguments: {@code --role share-member [--halt-after N] bootstrapServers groupId topic
- * runForMs}, or {@code --role share-member --probe}. Stdout contains record JSON lines and a
- * final {@code {"event":"done"}} after successful close. Offsets are decimal strings and a
- * missing delivery count is JSON null. A deliberate halt prints its last record before halting,
- * without acknowledging that record, committing that poll, closing, or running shutdown hooks.
+ * <p>Arguments: {@code --role share-member [--halt-after N] [--report-polls] [--close-file path]
+ * bootstrapServers groupId topic runForMs}, or {@code --role share-member --probe}. Stdout contains record JSON
+ * lines and a final {@code {"event":"done"}} after successful close. Offsets are decimal strings
+ * and a missing delivery count is JSON null. A deliberate halt prints its last record before
+ * halting, without acknowledging that record, committing that poll, closing, or running shutdown
+ * hooks.
+ *
+ * <p>With {@code --report-polls} every nonempty poll is first flushed whole as a {@code poll}
+ * line, before any record line, acknowledgement or halt, and a {@code committed} line follows
+ * only once its commit reported no partition error.
+ * The optional close file requests normal close between polls; runForMs remains the lifetime cap.
  */
 public final class JavaShareMember {
   /** Prevents construction of this command-line entry point. */
@@ -36,6 +44,8 @@ public final class JavaShareMember {
       List<String> positional = new ArrayList<>();
       String role = null;
       boolean probe = false;
+      boolean reportPolls = false;
+      Path closeFile = null;
       int haltAfter = 0;
       for (int i = 0; i < args.length; i++) {
         switch (args[i]) {
@@ -45,6 +55,12 @@ public final class JavaShareMember {
           case "--halt-after":
             haltAfter = Integer.parseInt(args[++i]);
             if (haltAfter <= 0) throw new IllegalArgumentException();
+            break;
+          case "--report-polls":
+            reportPolls = true;
+            break;
+          case "--close-file":
+            closeFile = Path.of(args[++i]);
             break;
           case "--probe":
             probe = true;
@@ -56,16 +72,20 @@ public final class JavaShareMember {
       }
       if (!"share-member".equals(role)) throw new IllegalArgumentException();
       if (probe) {
-        if (!positional.isEmpty() || haltAfter != 0) throw new IllegalArgumentException();
+        if (!positional.isEmpty() || haltAfter != 0 || reportPolls || closeFile != null) {
+          throw new IllegalArgumentException();
+        }
         probe();
         return;
       }
       if (positional.size() != 4) throw new IllegalArgumentException();
       long runForMs = Long.parseLong(positional.get(3));
       if (runForMs <= 0 || runForMs > Integer.MAX_VALUE) throw new IllegalArgumentException();
-      consume(positional.get(0), positional.get(1), positional.get(2), runForMs, haltAfter);
+      if (haltAfter > 0 && closeFile != null) throw new IllegalArgumentException();
+      consume(positional.get(0), positional.get(1), positional.get(2), runForMs,
+          haltAfter, reportPolls, closeFile);
     } catch (IllegalArgumentException | IndexOutOfBoundsException e) {
-      System.err.println("Usage: --role share-member [--halt-after N] bootstrapServers groupId topic runForMs; or --role share-member --probe");
+      System.err.println("Usage: --role share-member [--halt-after N] [--report-polls] [--close-file path] bootstrapServers groupId topic runForMs; or --role share-member --probe");
       System.exit(2);
     }
   }
@@ -78,9 +98,11 @@ public final class JavaShareMember {
    * @param topic the single topic to subscribe to
    * @param runForMs positive polling lifetime in milliseconds, bounded by Integer.MAX_VALUE
    * @param haltAfter positive number of emitted records before halt, or zero to finish normally
+   * @param reportPolls whether to flush the complete poll before any decision, then its commit receipt
+   * @param closeFile optional parent request to close normally after the current poll is committed
    */
   private static void consume(String bootstrapServers, String groupId, String topic,
-                              long runForMs, int haltAfter) {
+                              long runForMs, int haltAfter, boolean reportPolls, Path closeFile) {
     Properties properties = new Properties();
     properties.put("bootstrap.servers", bootstrapServers);
     properties.put("group.id", groupId);
@@ -95,8 +117,11 @@ public final class JavaShareMember {
       long started = System.nanoTime();
       long lifetime = Duration.ofMillis(runForMs).toNanos();
       int count = 0;
-      while (System.nanoTime() - started < lifetime) {
+      long pollId = 0;
+      while (System.nanoTime() - started < lifetime
+          && (closeFile == null || !Files.exists(closeFile))) {
         ConsumerRecords<byte[], byte[]> records = consumer.poll(Duration.ofMillis(500));
+        if (!records.isEmpty() && reportPolls) printPoll(++pollId, records, consumer.acquisitionLockTimeoutMs());
         for (ConsumerRecord<byte[], byte[]> record : records) {
           printRecord(record);
           count++;
@@ -110,6 +135,7 @@ public final class JavaShareMember {
           for (Optional<KafkaException> error : results.values()) {
             if (error.isPresent()) throw error.get();
           }
+          if (reportPolls) print("{\"event\":\"committed\",\"pollId\":" + quote(Long.toString(pollId)) + "}");
         }
       }
       consumer.close(Duration.ofSeconds(5));
@@ -139,6 +165,53 @@ public final class JavaShareMember {
     print("{\"event\":\"record\",\"topic\":" + quote(record.topic())
         + ",\"partition\":" + record.partition() + ",\"offset\":" + quote(Long.toString(record.offset()))
         + ",\"deliveryCount\":" + (deliveryCount.isPresent() ? deliveryCount.get().toString() : "null") + "}");
+  }
+
+  /**
+   * Flushes every record of the returned poll before any record is acknowledged or a halt occurs.
+   * A committed receipt is emitted separately only after commitSync reports no partition error.
+   *
+   * @param pollId monotonic nonempty-poll identity, serialized as an exact decimal string
+   * @param records complete returned poll, including records not subsequently printed by a halt
+   * @param lockTimeoutMs observed acquisition lock, or absent when the client has not learnt it
+   */
+  private static void printPoll(long pollId, ConsumerRecords<byte[], byte[]> records,
+                                Optional<Integer> lockTimeoutMs) {
+    StringBuilder json = new StringBuilder("{\"event\":\"poll\",\"pollId\":")
+        .append(quote(Long.toString(pollId))).append(",\"lockTimeoutMs\":")
+        .append(lockTimeoutMs.isPresent() ? lockTimeoutMs.get().toString() : "null")
+        .append(",\"records\":[");
+    boolean first = true;
+    for (ConsumerRecord<byte[], byte[]> record : records) {
+      if (!first) json.append(',');
+      first = false;
+      Optional<Short> count = record.deliveryCount();
+      json.append("{\"topic\":").append(quote(record.topic()))
+          .append(",\"partition\":").append(record.partition())
+          .append(",\"offset\":").append(quote(Long.toString(record.offset())))
+          .append(",\"keyHex\":").append(quote(hex(record.key())))
+          .append(",\"valueHex\":").append(quote(hex(record.value())))
+          .append(",\"deliveryCount\":").append(count.isPresent() ? count.get().toString() : "null")
+          .append('}');
+    }
+    print(json.append("]}").toString());
+  }
+
+  /**
+   * Encodes nullable bytes without changing their identity or expanding signed bytes incorrectly.
+   * @param value original key or value bytes
+   * @return lowercase hexadecimal, or null for an absent value
+   */
+  private static String hex(byte[] value) {
+    if (value == null) return null;
+    char[] digits = "0123456789abcdef".toCharArray();
+    char[] result = new char[value.length * 2];
+    for (int i = 0; i < value.length; i++) {
+      int b = value[i] & 0xff;
+      result[2 * i] = digits[b >>> 4];
+      result[2 * i + 1] = digits[b & 0xf];
+    }
+    return new String(result);
   }
 
   /** Loads required classes eagerly without constructing a client or opening a connection. */

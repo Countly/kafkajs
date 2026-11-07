@@ -414,6 +414,7 @@ describe('share live fixture observations', () => {
     verifierMember,
     captureShareCleanupBaseline,
     assertShareCleanup,
+    waitForShareGroupsEmpty,
   } = require('../shareFixtures')
   const { NEVER, bounded, liveRun } = require('../../src/producer/__tests__/fixtures/bounded')
   const { CleanupStack } = require('../../src/producer/__tests__/fixtures/liveProbe')
@@ -544,10 +545,87 @@ describe('share live fixture observations', () => {
     ledgerSize: 0,
     activeResources: {},
   })
-  const admin = () => ({
-    listGroups: async () => ({ groups: [{ groupId: 'ordinary' }] }),
-    listTopics: async () => [],
-    disconnect: async () => {},
+  const admin = () => {
+    const events = new EventEmitter()
+    let nextBroker = 0
+    return {
+      events: { REQUEST: 'request' },
+      on: (event, listener) => {
+        events.on(event, listener)
+        return () => events.removeListener(event, listener)
+      },
+      describeCluster: async () => ({
+        brokers: [
+          { host: 'one', port: 9092 },
+          { host: 'two', port: 9092 },
+        ],
+      }),
+      describeShareGroups: async (groups) => ({
+        groups: groups.map((groupId) => ({ groupId, errorCode: 69 })),
+      }),
+      listGroups: async () => ({ groups: [{ groupId: 'ordinary' }] }),
+      listTopics: async () => {
+        events.emit('request', {
+          payload: { apiName: 'Metadata', broker: `${nextBroker++ % 2 ? 'two' : 'one'}:9092` },
+        })
+        return []
+      },
+      disconnect: async () => {},
+    }
+  }
+
+  it.each([false, true])(
+    'requires topic absence on both brokers, with the second broker catching up: %s',
+    async (catchesUp) => {
+      jest.useFakeTimers()
+      const api = admin()
+      const listTopics = api.listTopics
+      let stale = true
+      let broker = 0
+      api.listTopics = async () => {
+        await listTopics()
+        return broker++ % 2 && stale ? ['owned-topic'] : []
+      }
+      const probe = { snapshot: jest.fn(async () => snapshot()) }
+      const pending = assertShareCleanup(api, ['owned'], ['owned-topic'], snapshot(), probe).catch(
+        (error) => error
+      )
+      const state = track(pending)
+      await jest.advanceTimersByTimeAsync(500)
+      expect(state.settled).toBe(false)
+      expect(probe.snapshot).not.toHaveBeenCalled()
+      if (catchesUp) {
+        stale = false
+        await jest.advanceTimersByTimeAsync(500)
+        expect(await pending).toEqual(snapshot())
+      } else {
+        await jest.advanceTimersByTimeAsync(9499)
+        expect(state.settled).toBe(false)
+        await jest.advanceTimersByTimeAsync(1)
+        expect((await pending).message).toContain('did not settle within 10000 ms')
+        expect(probe.snapshot).not.toHaveBeenCalled()
+      }
+      expect(jest.getTimerCount()).toBe(0)
+    }
+  )
+
+  it('waits for empty membership before the owned group can be deleted', async () => {
+    jest.useFakeTimers()
+    const api = admin()
+    let members = [{ memberId: 'departing' }]
+    api.describeShareGroups = async () => ({
+      groups: [
+        { groupId: 'owned', errorCode: 0, state: members.length ? 'Stable' : 'Empty', members },
+      ],
+    })
+    const pending = waitForShareGroupsEmpty(api, ['owned'])
+    const state = track(pending)
+    await jest.advanceTimersByTimeAsync(500)
+    expect(state.settled).toBe(false)
+    members = []
+    await jest.advanceTimersByTimeAsync(250)
+    await expect(pending).resolves.toBeUndefined()
+    expect(jest.getTimerCount()).toBe(0)
   })
 
   it.each([true, false])(
@@ -764,14 +842,23 @@ describe('share live fixture observations', () => {
   it.each(['group', 'topic', 'sibling', 'resource', 'measurement'])(
     'rejects a false cleanup proof: %s',
     async (fault) => {
+      jest.useFakeTimers()
       const api = admin()
       const after = snapshot()
-      if (fault === 'group') api.listGroups = async () => ({ groups: [{ groupId: 'owned' }] })
-      if (fault === 'topic') api.listTopics = async () => ['owned-topic']
+      if (fault === 'group') {
+        api.listGroups = async () => ({ groups: [{ groupId: 'owned' }, { groupId: 'ordinary' }] })
+      }
+      if (fault === 'topic') {
+        const listTopics = api.listTopics
+        api.listTopics = async () => {
+          await listTopics()
+          return ['owned-topic']
+        }
+      }
       if (fault === 'sibling') api.listGroups = async () => ({ groups: [] })
       if (fault === 'resource') after.ledgerSize = 1
       if (fault === 'measurement') delete after.activeResources
-      const error = await assertShareCleanup(
+      const pending = assertShareCleanup(
         api,
         ['owned'],
         ['owned-topic'],
@@ -779,6 +866,8 @@ describe('share live fixture observations', () => {
         { snapshot: async () => after },
         { unrelated: ['ordinary'] }
       ).catch((e) => e)
+      await jest.advanceTimersByTimeAsync(10000)
+      const error = await pending
       expect(error).toBeInstanceOf(Error)
       expect(error.message).toContain('baseline:')
       expect(error.message).toContain('lastAfter:')
