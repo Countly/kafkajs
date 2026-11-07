@@ -32,7 +32,6 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Add deterministic share membership, session and acknowledgement fault matrices, with captured shutdown authority, exact record outcomes and resource cleanup checks.
 - Verify share delivery, acknowledgement types, locks, isolation, membership, recovery, shutdown and administration against live brokers.
 - Verify share capability refusals, broker-bounce recovery, Java interoperability and diagnostics channels.
-- Add share-consumer soak and benchmark gates with separate batch and message identity controls.
 
 #### Fixes
 
@@ -47,6 +46,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Unimplemented request slots throw `KafkaJSNotImplemented` with a diagnostic message instead of a `TypeError`.
 
 #### Tooling
+
+- Add share-consumer soak and benchmark gates with separate batch and message identity controls. The short/full soak profiles use 32/64-second slots and 960/1920-second profiles, 1020/1980-second inclusive child budgets and 1440/2400-second cold caps. Both retain thirty cycles, ten resets and separate 5000 ms per-cycle and final observations, with configuration, heartbeat and cycle-step evidence. These are declared bounds; live acceptance and measured performance remain unverified.
 
 - Track the seven released share-group APIs (keys 76–79 and 90–92) in the Kafka 4.4.0 and 4.3.1 message snapshots and regenerate their protocol compatibility inventory. Source inventory alone does not add share-group support.
 - Add a Java share-consumer interoperability member and classpath probe.

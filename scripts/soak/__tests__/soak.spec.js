@@ -1778,8 +1778,8 @@ describe('Share soak resource screen', () => {
       resets: 10,
       maxRecords: 100,
       nodes: 3,
-      shortMs: 480000,
-      fullMs: 960000,
+      shortMs: 960000,
+      fullMs: 1920000,
       endpointBytes: 2097152,
       slopeBytesPerMinute: 262144,
     })
@@ -1926,8 +1926,8 @@ describe('Share soak profiles', () => {
   })
 
   test.each([
-    ['share-consumer-short', 160000, 480000],
-    ['share-consumer', 320000, 960000],
+    ['share-consumer-short', 320000, 960000],
+    ['share-consumer', 640000, 1920000],
   ])('%s is three phases of %i ms, %i ms in all', (name, phaseMs, total) => {
     expect(PROFILES[name]).toEqual(
       ['share-steady', 'share-reset', 'share-members'].map((phase) => ({
@@ -1966,9 +1966,12 @@ describe('Share soak profiles', () => {
     const phaseMs = profileMs / SHARE_SOAK.phases.length
     const readings = Math.floor((phaseMs - SHARE_SOAK.warmupMs) / SHARE_SOAK.sampleMs[mode])
     expect(readings).toBeGreaterThanOrEqual(6)
-    expect(totalMs).toBe(mode === 'short' ? 540000 : 1020000)
+    expect(totalMs).toBe(mode === 'short' ? 1020000 : 1980000)
+    expect(totalMs - profileMs).toBe(60000)
+    expect(totalMs - (setupMs + profileMs + transitionMs + cleanupMs + exitMs)).toBe(10000)
     expect(budget.watchdogMs).toBe(totalMs)
-    expect(budget.lifecycleMs).toBe(mode === 'short' ? 600000 : 1080000)
+    expect(budget.lifecycleMs).toBe(mode === 'short' ? 1440000 : 2400000)
+    expect(budget.lifecycleMs - totalMs).toBe(420000)
   })
 })
 
@@ -2516,7 +2519,7 @@ const positionFacts = (plan) => {
 }
 
 /** Measured assigned interval, with an actual in-window ShareFetch and joined leave. */
-const verifierFacts = (cycle = 0, base = cycle * 16000 + 1000, kind = 'cycle') => {
+const verifierFacts = (cycle = 0, base = cycle * 32000 + 1000, kind = 'cycle') => {
   const memberId = `verifier-${kind}-${cycle}`
   const exchanges = [0, 1, 2].map((partition) => {
     const exchange = exchangeFacts(9000 + partition, partition, [])
@@ -2569,7 +2572,7 @@ const verifierFacts = (cycle = 0, base = cycle * 16000 + 1000, kind = 'cycle') =
 
 const cycleFacts = (
   cycle,
-  { startedAt = cycle * 16000, due = startedAt + 16000, kind = 'cycle' } = {}
+  { startedAt = cycle * 32000, due = startedAt + 32000, kind = 'cycle' } = {}
 ) => {
   const plan = ShareCycleOracle.plan(cycle)
   const produced = cycleIdentities(plan)
@@ -3067,7 +3070,7 @@ describe('Share soak owner', () => {
       const { owner, rows } = build({ short })
       await owner.run()
       await owner.close()
-      expect(owner.elapsedProfileMs).toBe(short ? 480000 : 960000)
+      expect(owner.elapsedProfileMs).toBe(short ? 960000 : 1920000)
       expect(
         rows.filter(({ event }) => event === 'soak-cycle').map(({ verifier }) => verifier.windowMs)
       ).toEqual(Array(30).fill(5000))
@@ -3112,7 +3115,7 @@ describe('Share soak owner', () => {
       status: 'passed',
       tainted: false,
       profile: 'tv2',
-      profileMs: 480000,
+      profileMs: 960000,
       memberAdds: 30,
       memberRemoves: 30,
       cleanup: { groupsAbsent: true, topicsAbsent: true, completedAt: 123456 },
@@ -3261,17 +3264,17 @@ describe('Share soak owner', () => {
 
   test('refuses a phase of another length and a fourth phase', async () => {
     const { owner, driver } = build()
-    await expect(owner.runPhase(160001)).rejects.toThrow('is not the declared 160000 ms')
+    await expect(owner.runPhase(320001)).rejects.toThrow('is not the declared 320000 ms')
     expect(driver.openPhase).not.toHaveBeenCalled()
-    for (let i = 0; i < 3; i++) await owner.runPhase(160000)
-    await expect(owner.runPhase(160000)).rejects.toThrow('Every share phase already ran')
+    for (let i = 0; i < 3; i++) await owner.runPhase(320000)
+    await expect(owner.runPhase(320000)).rejects.toThrow('Every share phase already ran')
   })
 
   test('disconnects the phase clients when a cycle fails', async () => {
     const { owner, driver } = build({
       driver: scripted({ cycle: jest.fn(async () => Promise.reject(new Error('cycle failed'))) }),
     })
-    await expect(owner.runPhase(160000)).rejects.toThrow('cycle failed')
+    await expect(owner.runPhase(320000)).rejects.toThrow('cycle failed')
     expect(driver.closePhase).toHaveBeenCalledTimes(1)
   })
 
@@ -3279,14 +3282,14 @@ describe('Share soak owner', () => {
     let now = 0
     const driver = scripted({
       cycle: jest.fn(async (plan) => {
-        now += 16001
+        now += 32001
         return cycleFacts(plan.cycle)
       }),
     })
     const { owner } = build({ driver, clock: { now: () => now } })
     await expect(owner.run()).rejects.toThrow('absolute cutoff')
     expect(driver.cycle).toHaveBeenCalledTimes(1)
-    expect(owner.timing.slots[0]).toMatchObject({ due: 16000, completedAt: 16001 })
+    expect(owner.timing.slots[0]).toMatchObject({ due: 32000, completedAt: 32001 })
     await owner.close()
   })
 
@@ -3329,34 +3332,34 @@ describe('Share soak owner', () => {
     let now = 0
     const { owner } = build({ clock: { now: () => now } })
     owner.phaseStartedAt = 0
-    owner.phaseDue = 160000
-    now = 16001
+    owner.phaseDue = 320000
+    now = 32001
     await expect(owner.runCycle(0)).rejects.toThrow('deadline exhausted')
     expect(owner.driver.cycle).not.toHaveBeenCalled()
   })
 
   describe('the combined verdict', () => {
     const complete = (mutate) => {
-      const { owner, rows } = build({ clock: { now: () => 487000 } })
+      const { owner, rows } = build({ clock: { now: () => 967000 } })
       for (let cycle = 0; cycle < 30; cycle++) {
         const facts = cycleFacts(cycle)
         owner.recordCycle(ShareCycleOracle.plan(cycle), facts, [])
       }
       owner.counts = { cycles: 30, resets: 10, memberAdds: 30, memberRemoves: 30 }
-      owner.cleanupDue = 500000
-      owner.final = cycleFacts(29, { startedAt: 480000, due: 500000, kind: 'final' })
+      owner.cleanupDue = 980000
+      owner.final = cycleFacts(29, { startedAt: 960000, due: 980000, kind: 'final' })
       owner.elapsedProfileMs = SHARE_SOAK.shortMs
       owner.timing.phases = [0, 1, 2].map((phase) => ({
         phase,
-        startedAt: phase * 160000,
-        due: (phase + 1) * 160000,
-        completedAt: (phase + 1) * 160000,
+        startedAt: phase * 320000,
+        due: (phase + 1) * 320000,
+        completedAt: (phase + 1) * 320000,
       }))
       owner.timing.slots = Array.from({ length: 30 }, (_, cycle) => ({
         cycle,
-        startedAt: cycle * 16000,
-        due: (cycle + 1) * 16000,
-        completedAt: (cycle + 1) * 16000,
+        startedAt: cycle * 32000,
+        due: (cycle + 1) * 32000,
+        completedAt: (cycle + 1) * 32000,
       }))
       owner.timing.stages = owner.timing.phases.map((phase) => ({ ...phase, name: 'profile' }))
       owner.baseline = quietShare()
@@ -3978,7 +3981,7 @@ describe('Share soak real cycle adapters', () => {
     beforeEach(() => jest.useFakeTimers())
     afterEach(() => jest.useRealTimers())
 
-    const verify = ({ replayAt, duringDrain = false, assignmentAt = 0, due = 16000 } = {}) => {
+    const verify = ({ replayAt, duringDrain = false, assignmentAt = 0, due = 32000 } = {}) => {
       const clients = []
       const kafka = {
         shareConsumer: () => {
@@ -4223,7 +4226,7 @@ describe('Share soak cycle finalization and isolation adapter', () => {
   const cycle = async ({
     reset = false,
     lateDuringClose = false,
-    remaining = 16000,
+    remaining = 32000,
     holdPost = false,
     holdRaw = false,
     failRaw = false,
@@ -4707,20 +4710,20 @@ describe('Share soak complete original-owner schedules', () => {
           errorCode: 0,
           memberId: fields.memberId,
           memberEpoch: -1,
-          heartbeatIntervalMs: 1000,
+          heartbeatIntervalMs: 5000,
           assignment: null,
         }
       }
       members.set(fields.memberId, true)
       if (!seenMembers.has(fields.memberId)) seenMembers.set(fields.memberId, performance.now())
       const waiting =
-        driver.lastCycle?.members.aLeft &&
-        performance.now() - seenMembers.get(fields.memberId) < assignmentDelay
+        performance.now() - seenMembers.get(fields.memberId) <
+        5000 + (driver.lastCycle?.members.aLeft ? assignmentDelay : 0)
       return {
         errorCode: 0,
         memberId: fields.memberId,
         memberEpoch: 1,
-        heartbeatIntervalMs: 1000,
+        heartbeatIntervalMs: 5000,
         assignment: waiting ? null : wireAssignment(fields.memberId),
       }
     })
@@ -4852,20 +4855,44 @@ describe('Share soak complete original-owner schedules', () => {
             else configs.set(name, value)
           return { resources: [{ errorCode: 0 }] }
         },
-        describeConfigs: async ({ resources: [resource] }) => ({
-          resources: [
-            {
-              resourceName: resource.name,
-              resourceType: resource.type,
-              errorCode: 0,
-              configEntries: [...configs].map(([configName, configValue]) => ({
-                configName,
-                configValue,
-                configSource: 8,
-              })),
-            },
-          ],
-        }),
+        describeConfigs: async ({ resources: [resource] }) => {
+          const values =
+            resource.type === 32
+              ? new Map([
+                  ['share.heartbeat.interval.ms', '5000'],
+                  ['share.session.timeout.ms', '45000'],
+                  ...configs,
+                ])
+              : new Map([
+                  ['group.share.heartbeat.interval.ms', '5000'],
+                  ['group.share.min.heartbeat.interval.ms', '5000'],
+                  ['group.share.max.heartbeat.interval.ms', '15000'],
+                  ['group.share.session.timeout.ms', '45000'],
+                  ['group.share.min.session.timeout.ms', '45000'],
+                  ['group.share.max.session.timeout.ms', '60000'],
+                  ['group.share.assignment.interval.ms', '1000'],
+                  ['group.share.min.assignment.interval.ms', '0'],
+                  ['group.share.max.assignment.interval.ms', '15000'],
+                  ['group.share.assignors', 'simple'],
+                ])
+          return {
+            resources: [
+              {
+                resourceName: resource.name,
+                resourceType: resource.type,
+                errorCode: 0,
+                configEntries: [...values]
+                  .filter(([name]) => !resource.configNames || resource.configNames.includes(name))
+                  .map(([configName, configValue]) => ({
+                    configName,
+                    configValue,
+                    configSource: configs.has(configName) ? 8 : resource.type === 32 ? 5 : 4,
+                    configSynonyms: [],
+                  })),
+              },
+            ],
+          }
+        },
       }
     }
     const kafka = {
@@ -5007,7 +5034,7 @@ describe('Share soak complete original-owner schedules', () => {
       })
     const cleanupErrors = []
     try {
-      for (let tick = 0; tick < 5000; tick++) {
+      for (let tick = 0; tick <= owner.budget.totalMs / 250; tick++) {
         if (done) break
         // Drain response macrotasks at the replay boundary before advancing past the window.
         const step = replayDue === undefined ? 250 : Math.max(0, replayDue - performance.now())
@@ -5068,6 +5095,62 @@ describe('Share soak complete original-owner schedules', () => {
       expect(records.map((rows) => rows.length)).toEqual([600, 600, 600])
       const cycles = rows.filter(({ event }) => event === 'soak-cycle')
       expect(cycles).toHaveLength(30)
+      expect(rows.find(({ event }) => event === 'soak-schedule')).toMatchObject({
+        selector: short ? 'SHARE_SOAK_E2E' : 'SHARE_SOAK_FULL',
+        soakProfile: short ? 'share-consumer-short' : 'share-consumer',
+        stem: short ? 'share-soak' : 'share-soak-full',
+        schedule: { slotMs: short ? 32000 : 64000, profileMs: short ? 960000 : 1920000 },
+      })
+      const configuration = rows.find(({ event }) => event === 'soak-configuration').config
+      expect(configuration).toMatchObject({
+        groupId: owner.driver.group,
+        topic: owner.driver.topic,
+        topicId: SOAK_UUID,
+      })
+      expect(configuration.reads).toHaveLength(4)
+      expect(configuration.effective).toHaveLength(3)
+      for (const { timings } of configuration.effective) {
+        expect(timings['heartbeat.interval.ms']).toMatchObject({
+          configValue: '5000',
+          configSource: 5,
+          fallback: false,
+        })
+        expect(timings['assignment.interval.ms']).toMatchObject({
+          configValue: '1000',
+          configSource: 4,
+          fallback: true,
+        })
+      }
+      for (const cycle of cycles) {
+        const at = (step) => cycle.steps.find((row) => row.step === step).at
+        expect(at('a-membership-end') - at('a-membership-start')).toBeGreaterThanOrEqual(5000)
+        expect(at('member-add-end') - at('member-add-start')).toBeGreaterThanOrEqual(5000)
+        expect(at('member-remove-end') - at('member-remove-start')).toBeGreaterThanOrEqual(4500)
+        const start = cycle.verifier.events.find(({ kind }) => kind === 'window-start')
+        expect(start.at - cycle.verifier.openedAt).toBeGreaterThanOrEqual(5000)
+        const beats = cycle.verifier.provenance.heartbeats
+        const joined = beats.filter(
+          ({ request, response }) => request.memberEpoch === 0 && response?.errorCode === 0
+        )
+        expect(new Set(joined.map(({ memberId }) => memberId)).size).toBe(3)
+        for (const beat of beats.filter(({ response }) => response?.errorCode === 0)) {
+          expect(beat.response.heartbeatIntervalMs).toBe(5000)
+          expect(beat.answeredAt).toBeGreaterThanOrEqual(beat.at)
+          expect(beat.frames).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({
+                apiKey: 76,
+                request: expect.objectContaining({
+                  groupId: owner.driver.group,
+                  memberId: beat.memberId,
+                }),
+                responseBytes: expect.any(String),
+                answeredAt: expect.any(Number),
+              }),
+            ])
+          )
+        }
+      }
       expect(
         new Set([...cycles.map(({ verifier }) => verifier.memberId), owner.final.verifier.memberId])
           .size
@@ -5113,10 +5196,10 @@ describe('Share soak complete original-owner schedules', () => {
       expect(result.resources.measured.phases.every(({ heapSamples }) => heapSamples >= 6)).toBe(
         true
       )
-      expect(owner.elapsedProfileMs).toBe(short ? 480000 : 960000)
+      expect(owner.elapsedProfileMs).toBe(short ? 960000 : 1920000)
       expect(owner.budget).toMatchObject({
-        watchdogMs: short ? 540000 : 1020000,
-        lifecycleMs: short ? 600000 : 1080000,
+        watchdogMs: short ? 1020000 : 1980000,
+        lifecycleMs: short ? 1440000 : 2400000,
       })
     },
     120000
@@ -5209,7 +5292,7 @@ describe('Share soak complete original-owner schedules', () => {
     [
       'slot completion one millisecond late',
       (row, { clock }) => {
-        clock.skew(16001)
+        clock.skew(32001)
       },
       'absolute cutoff',
     ],
@@ -5310,7 +5393,7 @@ describe('Share soak complete original-owner schedules', () => {
       'slot exhausted before verifier admission',
       'terminal-ends',
       ({ driver }) => driver.lastCycle?.positions.length === 0,
-      12000,
+      'exhaust',
       'complete verifier window',
     ],
     [
@@ -5348,7 +5431,11 @@ describe('Share soak complete original-owner schedules', () => {
         io: async (event, context) => {
           if (event !== selected || !eligible(context)) return
           const { driver, clock } = context
-          clock.skew(extra ?? driver.lastCycle.timing.due - performance.now() + 1)
+          clock.skew(
+            extra === 'exhaust'
+              ? driver.lastCycle.timing.due - performance.now() - 4999
+              : (extra ?? driver.lastCycle.timing.due - performance.now() + 1)
+          )
         },
       })
       expect(reason).toContain(message)
@@ -5360,6 +5447,30 @@ describe('Share soak complete original-owner schedules', () => {
         )
         expect(owner.spent.cleanup).toBeGreaterThan(owner.budget.cleanupMs)
       }
+      expect(rows.some(({ event }) => event === 'case-complete')).toBe(false)
+    },
+    120000
+  )
+
+  test.each([true, false])(
+    'rejects the original anchored slot cutoff plus one millisecond, short=%s',
+    async (short) => {
+      let crossed = false
+      const { owner, reason, rows } = await schedule({
+        short,
+        io: async (event, { driver, clock }) => {
+          if (crossed || event !== 'terminal-ends' || !driver.lastCycle?.verifier) return
+          crossed = true
+          clock.skew(driver.lastCycle.timing.due - performance.now() + 1)
+        },
+      })
+      expect(crossed).toBe(true)
+      expect(reason).toContain('absolute cutoff')
+      expect(owner.timing.slots).toHaveLength(1)
+      const [slot] = owner.timing.slots
+      expect(slot.due).toBe(owner.timing.phases[0].startedAt + (short ? 32000 : 64000))
+      expect(slot.completedAt).toBe(slot.due + 1)
+      expect(owner.counts.cycles).toBe(0)
       expect(rows.some(({ event }) => event === 'case-complete')).toBe(false)
     },
     120000

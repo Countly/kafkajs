@@ -31,12 +31,12 @@
  *                     churn, pause and topic recreation, and a mostly idle 1000-partition
  *                     assignment, judged by an independent log, broker-offset and handler check;
  *                     see `ConsumerChurnRun`
- *   share-consumer    three phases of 320 s (steady, reset, members), ten cycles of 32 s each: a share
+ *   share-consumer    three phases of 640 s (steady, reset, members), ten cycles of 64 s each: a share
  *                     group member and a transient second one join and leave every cycle, sixty
  *                     fixed records are delivered and acknowledged, and the reset phase forces one
  *                     session reset per cycle; judged by independent log, broker-position and
  *                     handler checks and a per-phase resource screen; see `ShareSoak`
- *   share-consumer-short  the same three phases of 160 s with cycles of 16 s; takes no --phase-seconds
+ *   share-consumer-short  the same three phases of 320 s with cycles of 32 s; takes no --phase-seconds
  * Every phase ends by disconnecting its clients, also when it fails; the readings that must be zero
  * are taken there.
  * `--phase-seconds n` shortens every phase to n seconds: a smoke run of the driver, not of memory.
@@ -149,8 +149,8 @@ const OUTAGE_KINDS = Object.freeze({ stop: 'clean', kill: 'hard' })
  * inclusive allowance of the whole child, natural exit included; no stage borrows from another.
  */
 const SHARE_SOAK = Object.freeze({
-  shortMs: 480000,
-  fullMs: 960000,
+  shortMs: 960000,
+  fullMs: 1920000,
   phases: Object.freeze(['steady', 'reset', 'members']),
   cycles: 30,
   cyclesPerPhase: 10,
@@ -162,21 +162,11 @@ const SHARE_SOAK = Object.freeze({
   lockMs: 30000,
   warmupMs: 10000,
   settleMs: 1000,
-  slotMs: Object.freeze({ short: 16000, full: 32000 }),
+  slotMs: Object.freeze({ short: 32000, full: 64000 }),
   sampleMs: Object.freeze({ short: 4000, full: 20000 }),
   quietMs: Object.freeze({ cycle: 5000, final: 5000 }),
   budgets: Object.freeze({
     short: Object.freeze({
-      setupMs: 15000,
-      profileMs: 480000,
-      transitionMs: 5000,
-      cleanupMs: 20000,
-      exitMs: 10000,
-      totalMs: 540000,
-      watchdogMs: 540000,
-      lifecycleMs: 600000,
-    }),
-    full: Object.freeze({
       setupMs: 15000,
       profileMs: 960000,
       transitionMs: 5000,
@@ -184,7 +174,17 @@ const SHARE_SOAK = Object.freeze({
       exitMs: 10000,
       totalMs: 1020000,
       watchdogMs: 1020000,
-      lifecycleMs: 1080000,
+      lifecycleMs: 1440000,
+    }),
+    full: Object.freeze({
+      setupMs: 15000,
+      profileMs: 1920000,
+      transitionMs: 5000,
+      cleanupMs: 20000,
+      exitMs: 10000,
+      totalMs: 1980000,
+      watchdogMs: 1980000,
+      lifecycleMs: 2400000,
     }),
   }),
   endpointBytes: ENDPOINT_BYTES,
@@ -3659,12 +3659,13 @@ class ShareFetchTap {
     const header = readRequestHeader(frame)
     const context = this.context.getStore()
     let written
-    if (context && [78, 79].includes(header.apiKey)) {
-      const wire = require(
-        header.apiKey === 78
-          ? '../../testHelpers/wire/shareFetchV2'
-          : '../../testHelpers/wire/shareAcknowledgeV2'
-      )
+    if (context && [76, 78, 79].includes(header.apiKey)) {
+      const modules = {
+        76: 'shareGroupHeartbeatV1',
+        78: 'shareFetchV2',
+        79: 'shareAcknowledgeV2',
+      }
+      const wire = require(`../../testHelpers/wire/${modules[header.apiKey]}`)
       written = {
         id: ++this.frameSequence,
         socket,
@@ -3725,6 +3726,7 @@ class ShareCycleJournal {
     this.tap = tap
     this.labels = new Map()
     this.exchanges = []
+    this.heartbeats = []
     this.acquisitions = []
     this.outcomes = []
     this.retirements = []
@@ -3806,6 +3808,31 @@ class ShareCycleJournal {
             }
           : request
       )
+    })
+    this.wrap(Broker.prototype, 'shareGroupHeartbeat', (broker, original, args) => {
+      const [request] = args
+      if (request.groupId !== this.group) return original.apply(broker, args)
+      const fact = {
+        groupId: this.group,
+        memberId: request.memberId,
+        endpoint: broker.brokerAddress,
+        at: this.tap.clock.now(),
+        request: { ...request },
+        frames: [],
+      }
+      this.heartbeats.push(fact)
+      const pending = this.tap.context.run(fact, () => original.apply(broker, args))
+      pending.then(
+        (response) => {
+          fact.answeredAt = this.tap.clock.now()
+          fact.response = response
+        },
+        (error) => {
+          fact.failedAt = this.tap.clock.now()
+          fact.error = { name: error.name, message: error.message }
+        }
+      )
+      return pending
     })
     this.wrap(ShareFetchLoop.prototype, 'send', (loop, original, [exchange]) => {
       if (loop.groupId !== this.group) return original.call(loop, exchange)
@@ -3905,6 +3932,7 @@ class ShareCycleJournal {
     return JSON.parse(
       JSON.stringify({
         exchanges: this.exchanges,
+        heartbeats: this.heartbeats,
         acquisitions: this.acquisitions,
         outcomes: this.outcomes,
         retirements: this.retirements,
@@ -4176,6 +4204,7 @@ class ShareSoakDriver {
       this.leaders.set(partitionId, `${node.host}:${node.port}`)
     }
     this.topicId = topic.topicId
+    this.configuration = await this.readConfiguration(admin, brokers, scope)
     const { groups } = await bounded(scope, Infinity, () => admin.listGroups())
     this.unrelated = groups.map(({ groupId }) => groupId).filter((id) => id !== this.group)
     await bounded(scope, Infinity, () => admin.disconnect())
@@ -4183,6 +4212,91 @@ class ShareSoakDriver {
     this.baseline = await fixtures.captureShareCleanupBaseline(this.shares, { signal: scope })
 
     return { topic: this.topic, group: this.group }
+  }
+
+  /**
+   * Reads effective group timings and each owned broker's defaults and bounds without changing
+   * them. Missing group values fall back only to that broker's observed value, never a constant.
+   * Raw resources retain configuration sources and synonyms for independent reconstruction.
+   * @param {object} admin Connected owned admin.
+   * @param {object[]} brokers Original cluster node identities and endpoints.
+   * @param {AbortSignal} scope Original setup scope.
+   * @returns {Promise<object>} Original reads, effective values and their fallback sources.
+   * @throws {Error} On failed, missing or unusable configuration readback.
+   */
+  async readConfiguration(admin, brokers, scope) {
+    const { GROUP, BROKER } = require('../../src/protocol/configResourceTypes')
+    const timings = ['heartbeat.interval.ms', 'session.timeout.ms', 'assignment.interval.ms']
+    const groupNames = [...GROUP_CONFIG_NAMES, ...timings.map((key) => `share.${key}`)]
+    const brokerNames = [
+      ...timings.flatMap((key) => [
+        `group.share.${key}`,
+        `group.share.min.${key}`,
+        `group.share.max.${key}`,
+      ]),
+      'group.share.assignors',
+    ]
+    const queries = [
+      { type: GROUP, name: this.group, configNames: groupNames },
+      ...brokers.map(({ nodeId }) => ({
+        type: BROKER,
+        name: String(nodeId),
+        configNames: brokerNames,
+      })),
+    ]
+    const startedAt = SHARE_CLOCK.now()
+    const results = await Promise.allSettled(
+      queries.map(async (query) => {
+        const response = await this.ports.bounded.bounded(scope, Infinity, () =>
+          admin.describeConfigs({ resources: [query], includeSynonyms: true })
+        )
+        const resource = response.resources.find(
+          ({ resourceType, resourceName }) =>
+            resourceType === query.type && resourceName === query.name
+        )
+        if (!resource || resource.errorCode !== 0)
+          throw new Error('The share soak configuration readback failed')
+        return { query, resource, completedAt: SHARE_CLOCK.now() }
+      })
+    )
+    const failed = results.find(({ status }) => status === 'rejected')
+    if (failed) throw failed.reason
+    const reads = results.map(({ value }) => value)
+    const entry = (read, name) =>
+      read.resource.configEntries.find(({ configName }) => configName === name)
+    const usable = (value) => value?.configValue != null && Number.isInteger(value.configSource)
+    const effective = brokers.map((broker, index) => {
+      const read = reads[index + 1]
+      if (brokerNames.some((name) => !usable(entry(read, name))))
+        throw new Error('The share soak broker configuration is incomplete')
+      return {
+        ...broker,
+        timings: Object.fromEntries(
+          timings.map((key) => {
+            const group = entry(reads[0], `share.${key}`)
+            const fallback = !usable(group)
+            return [
+              key,
+              {
+                ...(fallback ? entry(read, `group.share.${key}`) : group),
+                resourceType: fallback ? BROKER : GROUP,
+                resourceName: fallback ? String(broker.nodeId) : this.group,
+                fallback,
+              },
+            ]
+          })
+        ),
+      }
+    })
+    return {
+      groupId: this.group,
+      topic: this.topic,
+      topicId: this.topicId,
+      startedAt,
+      completedAt: SHARE_CLOCK.now(),
+      reads,
+      effective,
+    }
   }
 
   /**
@@ -4982,7 +5096,7 @@ class ShareSoak {
    * @param {{ snapshot: () => Promise<object>, restore: () => void }} options.shares the resource
    *   observer; `snapshot` is the probe every reading goes through
    * @param {{ add: Function, run: Function }} options.stack the cleanup stack the driver registers on
-   * @param {boolean} options.short whether this is the 480 s profile rather than the 960 s one
+   * @param {boolean} options.short whether this is the 960 s profile rather than the 1920 s one
    * @param {{ write: (row: object) => void, read: () => object[] }} options.evidence where every row
    *   goes, and the rows the run wrote, in order
    * @param {{ taint: Function, assertClean: Function }} options.gate the live run's taint gate
@@ -5101,8 +5215,24 @@ class ShareSoak {
    * @returns {Promise<void>}
    * @throws {Error} the setup failure; its cleanups are registered already and run on `close`
    */
-  prepare() {
-    return this.stage('setup', (scope) => this.driver.prepare(this.stack, scope))
+  async prepare() {
+    await this.stage('setup', async (scope) => {
+      const digest = (file) =>
+        require('node:crypto').createHash('sha256').update(fs.readFileSync(file)).digest('hex')
+      this.row('soak-schedule', {
+        schedule: { slotMs: this.slotMs, ...this.budget },
+        config: {
+          compose: (process.env.COMPOSE_FILE || 'docker-compose.yml')
+            .split(path.delimiter)
+            .map((file) => ({ file, sha256: digest(file) })),
+          source: { file: 'scripts/soak/soak.js', sha256: digest(__filename) },
+          brokers: this.driver.brokers,
+        },
+      })
+      await this.driver.prepare(this.stack, scope)
+      if (this.driver.configuration)
+        this.row('soak-configuration', { config: this.driver.configuration })
+    })
   }
 
   /**
@@ -5595,6 +5725,8 @@ class ShareSoak {
       profile: 'tv2',
       scenario: this.nonce,
       stem: this.stem,
+      selector: this.short ? 'SHARE_SOAK_E2E' : 'SHARE_SOAK_FULL',
+      soakProfile: this.short ? 'share-consumer-short' : 'share-consumer',
       ...fields,
     })
   }
@@ -5640,7 +5772,7 @@ class ShareSoak {
  * the final summary reads each cycle's archived identities back from.
  * @param {object} options
  * @param {string[]} options.brokers seed addresses, `host:port`
- * @param {boolean} [options.short=false] the 480 s profile rather than the 960 s one
+ * @param {boolean} [options.short=false] the 960 s profile rather than the 1920 s one
  * @param {(row: object) => void} [options.record] a second sink beside the evidence file
  * @param {{ taint: Function, assertClean: Function }} [options.run] the live run's gate; the
  *   run of this process by default

@@ -13,7 +13,7 @@ const SHUTDOWN_CASES = [
  * @returns {object} Mutable original timestamps, child result, evidence and captured artifacts.
  */
 const fixture = (lane) => {
-  const totalMs = lane === 'soak' ? 540000 : 120000
+  const totalMs = lane === 'soak' ? 1020000 : 120000
   const completedAt = 1000 + totalMs - 10000
   const cases = lane === 'soak' ? [SOAK_CASE] : SHUTDOWN_CASES
   const state = {
@@ -27,7 +27,13 @@ const fixture = (lane) => {
         case: title,
         status: 'passed',
         tainted: false,
-        ...(lane === 'soak' && { profileMs: 480000 }),
+        ...(lane === 'soak' && {
+          profileMs: 960000,
+          selector: 'SHARE_SOAK_E2E',
+          soakProfile: 'share-consumer-short',
+          stem: 'share-soak',
+          schedule: { slotMs: 32000, totalMs },
+        }),
         cleanup: {
           groupsAbsent: true,
           topicsAbsent: true,
@@ -64,12 +70,12 @@ describe.each(['soak', 'shutdown'])('CI natural exit > %s', (lane) => {
 
     expect(run()).toMatchObject({
       startedAt: 1000,
-      exitedAt: lane === 'soak' ? 541000 : 121000,
-      cleanupAt: lane === 'soak' ? 531000 : 111000,
+      exitedAt: lane === 'soak' ? 1021000 : 121000,
+      cleanupAt: lane === 'soak' ? 1011000 : 111000,
       status: 0,
       signal: null,
       origin: 'hrtime',
-      totalMs: lane === 'soak' ? 540000 : 120000,
+      totalMs: lane === 'soak' ? 1020000 : 120000,
       exitMs: 10000,
       watchdogTerminated: false,
     })
@@ -111,7 +117,7 @@ describe.each(['soak', 'shutdown'])('CI natural exit > %s', (lane) => {
         '--runTestsByPath',
         `src/consumer/share/__tests__/share${lane === 'soak' ? 'Soak' : 'Shutdown'}Live.spec.js`,
       ],
-      { stdio: 'inherit', timeout: lane === 'soak' ? 540000 : 120000, killSignal: 'SIGKILL' }
+      { stdio: 'inherit', timeout: lane === 'soak' ? 1020000 : 120000, killSignal: 'SIGKILL' }
     )
   })
 
@@ -236,6 +242,25 @@ describe.each(['soak', 'shutdown'])('CI natural exit > %s', (lane) => {
 })
 
 describe('CI natural exit > soak cleanup contract', () => {
+  test.each([
+    ['historical short', { profileMs: 480000 }],
+    [
+      'historical full with matching durations',
+      {
+        selector: 'SHARE_SOAK_FULL',
+        soakProfile: 'share-consumer',
+        stem: 'share-soak-full',
+      },
+    ],
+    ['unbound selector', { selector: undefined }],
+    ['old slot', { schedule: { slotMs: 16000, totalMs: 1020000 } }],
+    ['old total', { schedule: { slotMs: 32000, totalMs: 540000 } }],
+  ])('rejects %s evidence', (_name, change) => {
+    const { state, run } = fixture('soak')
+    Object.assign(state.rows[0], change)
+    expect(run).toThrow(/cleanup evidence/)
+  })
+
   test.each([
     [
       'missing clock origin',

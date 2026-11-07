@@ -37,6 +37,7 @@ jobs:
       - run: npm run test:pack
   integration:
     runs-on: ubuntu-latest
+    timeout-minutes: ${{ matrix.timeout || 360 }}
     needs: [unit]
     strategy:
       fail-fast: false
@@ -53,7 +54,7 @@ jobs:
           - { node: 22, kafka: 4.3.1, group: others }
           - { node: 26, kafka: 4.3.1, group: broker }
           - { node: 26, kafka: 4.3.1, group: others }
-          - { node: 24, kafka: 4.3.1, group: share-base }
+          - { node: 24, kafka: 4.3.1, group: share-base, timeout: 35 }
           - { node: 24, kafka: 4.4.0, group: share-base, clients: 4.4.0 }
           - { node: 24, kafka: 4.3.1, group: share, compose: docker-compose.share.yml }
           - { node: 24, kafka: 4.4.0, group: share, compose: docker-compose.share.yml, clients: 4.4.0 }
@@ -83,7 +84,7 @@ jobs:
         run: ./scripts/testWithKafka.sh "npm run test:group:${{ matrix.group }} -- --ci"
       - name: Run share soak (natural exit)
         if: matrix.group == 'share-base' && matrix.kafka == '4.3.1'
-        timeout-minutes: 10
+        timeout-minutes: 18
         env:
           KAFKAJS_LANE: docker
           KAFKAJS_DEBUG_PROTOCOL_BUFFERS: '1'

@@ -3,7 +3,7 @@ const { spawnSync } = require('child_process')
 
 const LANES = {
   soak: {
-    totalMs: 540000,
+    totalMs: 1020000,
     spec: 'shareSoakLive.spec.js',
     cases: ['preserves share identities and resources through the short soak'],
   },
@@ -52,7 +52,12 @@ const cleanupTimestamp = (lane, text, { startedAt, exitedAt }) => {
         at > exitedAt ||
         (clock !== undefined && (clock?.origin !== 'hrtime' || clock?.completedAt !== at)) ||
         (lane === 'soak' &&
-          (row.profileMs !== 480000 ||
+          (row.profileMs !== 960000 ||
+            row.selector !== 'SHARE_SOAK_E2E' ||
+            row.soakProfile !== 'share-consumer-short' ||
+            row.stem !== 'share-soak' ||
+            row.schedule?.slotMs !== 32000 ||
+            row.schedule?.totalMs !== LANES.soak.totalMs ||
             cleanup?.groupsAbsent !== true ||
             cleanup?.topicsAbsent !== true ||
             clock?.origin !== 'hrtime'))

@@ -23,6 +23,18 @@ enabled('share consumer short soak', () => {
   test(
     TITLE,
     liveCase(BUDGET_MS, async () => {
+      expect(SHARE_SOAK).toMatchObject({
+        shortMs: 960000,
+        fullMs: 1920000,
+        slotMs: { short: 32000, full: 64000 },
+        quietMs: { cycle: 5000, final: 5000 },
+        cycles: 30,
+        resets: 10,
+        budgets: {
+          short: { profileMs: 960000, totalMs: 1020000, watchdogMs: 1020000, lifecycleMs: 1440000 },
+          full: { profileMs: 1920000, totalMs: 1980000, watchdogMs: 1980000, lifecycleMs: 2400000 },
+        },
+      })
       if (typeof globalThis.gc !== 'function') {
         throw new Error(
           'The short soak reads the heap after a collection: run node with --expose-gc'
@@ -50,10 +62,17 @@ enabled('share consumer short soak', () => {
       expect(owner.elapsedProfileMs).toBe(SHARE_SOAK.shortMs)
       expect(owner.timing.slots).toHaveLength(SHARE_SOAK.cycles)
       expect(owner.timing.slots.every(({ due, completedAt }) => completedAt <= due)).toBe(true)
+      for (const [index, slot] of owner.timing.slots.entries()) {
+        const phase = owner.timing.phases[Math.floor(index / 10)]
+        expect(phase.due - phase.startedAt).toBe(320000)
+        expect(slot.due).toBe(phase.startedAt + ((index % 10) + 1) * 32000)
+        expect(slot.completedAt).toBe(slot.due)
+      }
       expect(owner.final.verifier.windowMs).toBe(5000)
       const cycles = owner.evidence.read().filter(({ event }) => event === 'soak-cycle')
       const steps = owner.evidence.read().filter(({ event }) => event === 'soak-cycle-step')
       for (const cycle of cycles) {
+        expect(cycle.verifier.windowMs).toBe(5000)
         expect(steps.filter((row) => row.cycle === cycle.cycle)).toEqual(
           expect.arrayContaining(
             cycle.steps.map(({ at, ...step }) =>
@@ -90,6 +109,25 @@ enabled('share consumer short soak', () => {
         ).toBe(true)
       }
       const verifiers = [...cycles.map(({ verifier }) => verifier), owner.final.verifier]
+      const configuration = owner.evidence
+        .read()
+        .find(({ event }) => event === 'soak-configuration')
+      expect(configuration.config.groupId).toBe(owner.driver.group)
+      expect(configuration.config.effective).toHaveLength(3)
+      for (const verifier of verifiers) {
+        const beats = verifier.provenance.heartbeats.filter(
+          ({ memberId, response }) => memberId === verifier.memberId && response?.errorCode === 0
+        )
+        expect(beats.length).toBeGreaterThan(0)
+        expect(
+          beats.every(
+            ({ frames, response, at, answeredAt }) =>
+              response.heartbeatIntervalMs > 0 &&
+              answeredAt >= at &&
+              frames.some((frame) => frame.apiKey === 76 && typeof frame.responseBytes === 'string')
+          )
+        ).toBe(true)
+      }
       expect(new Set(verifiers.map(({ memberId }) => memberId)).size).toBe(31)
       expect(
         verifiers.every(
