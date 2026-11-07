@@ -382,7 +382,10 @@ describe('share disconnect after coordinator transport recovery', () => {
       } else if (refusal === 'late response') clock.skew(400)
       else {
         await original.binding.connection.disconnect({ drainTimeout: 0 })
-        await original.binding.connection.connect()
+        await expect(original.binding.connection.connect()).rejects.toMatchObject({
+          name: 'KafkaJSConnectionError',
+          message: 'Connection closed while connecting',
+        })
       }
       leave.release({
         errorCode: 0,
