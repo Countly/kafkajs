@@ -1,7 +1,9 @@
 const net = require('net')
+const { execFile } = require('child_process')
+const { deflateRawSync, inflateRawSync } = require('zlib')
 const { createHash } = require('crypto')
-const { statSync, truncateSync } = require('fs')
-const { isDeepStrictEqual } = require('util')
+const { readFileSync, statSync, truncateSync } = require('fs')
+const { isDeepStrictEqual, promisify } = require('util')
 const Decoder = require('../../../protocol/decoder')
 const ProducerStateManager = require('../../../producer/state')
 const PartitionSequencer = require('../../../producer/state/partitionSequencer')
@@ -198,6 +200,7 @@ class ShareWireTap {
     const entry = {
       label,
       socket,
+      opened: this.stamp(),
       endpoint: `${options.host}:${options.port}`,
       writer: new FrameSplitter(),
       reader: new FrameSplitter(),
@@ -271,6 +274,7 @@ class ShareWireTap {
       nodeId:
         Object.values(NODES).find(({ host, port }) => `${host}:${port}` === entry.endpoint)
           ?.nodeId ?? null,
+      socketOpened: entry.opened,
       writeStarted: written,
       apiKey,
       apiVersion,
@@ -290,7 +294,8 @@ class ShareWireTap {
       } catch (error) {
         this.problem(`Producer diagnostic frame ${fact.id}: ${error.message}`)
       }
-    } else if (this.reserve(frame.length)) fact.bytes = frame.toString('base64')
+    }
+    if (this.reserve(frame.length)) fact.bytes = frame.toString('base64')
     if ([78, 79].includes(apiKey) && apiVersion === 2) {
       const reader = apiKey === 78 ? fetchWire : ackWire
       try {
@@ -315,7 +320,6 @@ class ShareWireTap {
       } catch (error) {
         this.problem(`Producer diagnostic response ${frame.id}: ${error.message}`)
       }
-      return
     }
     if (this.reserve(bytes.length)) frame.responseBytes = bytes.toString('base64')
     if (frame.apiKey !== 78 || frame.apiVersion !== 2) return
@@ -519,6 +523,9 @@ class BounceEvidence {
     this.exchangesByCohort = new Map()
     this.retirements = []
     this.commands = []
+    this.controls = []
+    this.closes = []
+    this.restorations = []
     this.epochs = []
     this.brokers = new Set()
     this.epochAuthorities = new Map()
@@ -560,6 +567,69 @@ class BounceEvidence {
   /** @returns {void} Installs read-only observers before the workload connects. */
   install() {
     const owns = (loop) => loop.groupId === this.owner.group
+    this.wrap(ShareRun.prototype, 'closeTraffic', async (run, original, [episode]) => {
+      if (run.options.groupId !== this.owner.group) return original.call(run, episode)
+      const fact = {
+        id: this.closes.length,
+        kind: 'close-traffic',
+        started: this.owner.tap.stamp(),
+        memberId: run.membership.memberId,
+        memberEpoch: run.membership.memberEpoch,
+      }
+      this.closes.push(fact)
+      try {
+        return await original.call(run, episode)
+      } finally {
+        Object.assign(fact, {
+          ended: this.owner.tap.stamp(),
+          leaveWritten: Boolean(episode.leaveWritten),
+          leaveReported: Boolean(episode.leaveReported),
+          revoked: episode.revoked,
+          finalDeadline: episode.finalDeadline,
+        })
+      }
+    })
+    this.wrap(ShareRun.prototype, 'leaveSkipped', (run, original, [episode, reason]) => {
+      if (run.options.groupId === this.owner.group)
+        this.closes.push(
+          immutable({
+            id: this.closes.length,
+            kind: 'leave-skipped',
+            ...this.owner.tap.stamp(),
+            reason,
+            leaveWritten: Boolean(episode.leaveWritten),
+            memberId: run.membership.memberId,
+          })
+        )
+      return original.call(run, episode, reason)
+    })
+    this.wrap(Broker.prototype, 'shareGroupHeartbeat', async (broker, original, args) => {
+      const [request] = args
+      if (request.groupId !== this.owner.group || request.memberEpoch >= 0)
+        return original.apply(broker, args)
+      const fact = {
+        id: this.closes.length,
+        kind: 'leave',
+        apiKey: 76,
+        request: immutable(request),
+        nodeId: broker.nodeId,
+        frames: [],
+        started: this.owner.tap.stamp(),
+      }
+      this.closes.push(fact)
+      return this.owner.tap.context.run(fact, async () => {
+        try {
+          const response = await original.apply(broker, args)
+          fact.response = immutable(response)
+          return response
+        } catch (error) {
+          fact.error = describeError(error)
+          throw error
+        } finally {
+          fact.ended = this.owner.tap.stamp()
+        }
+      })
+    })
     this.wrap(Broker.prototype, 'connect', async (broker, original, args) => {
       const result = await original.apply(broker, args)
       if (broker.connectionPool.clientId === `member-${this.owner.nonce}`) {
@@ -1035,6 +1105,8 @@ const validAcquisition = (entry) => {
     frame.request?.groupId === entry.groupId &&
     frame.request?.memberId === entry.memberId &&
     frame.endpoint === source.endpoint &&
+    Number.isInteger(frame.nodeId) &&
+    frame.nodeId === source.nodeId &&
     source.groupId === entry.groupId &&
     source.memberId === entry.memberId &&
     source.open !== null &&
@@ -1496,9 +1568,9 @@ const historyAccounting = (entries, bounces, evidence, cut) => {
  * @param {object[]} entries Original handler journal.
  * @param {object[]} bounces Archived episode restoration boundaries.
  * @param {BounceEvidence} evidence Primitive observations.
- * @returns {object[]} Reconstructed command and first-interruption snapshots.
+ * @returns {Generator} Steps returning reconstructed command and first-interruption snapshots.
  */
-const reconstructFreezes = (entries, bounces, evidence) => {
+const reconstructFreezes = function* (entries, bounces, evidence) {
   const reconstructed = []
   const journal = [
     ...interruptionJournal(evidence),
@@ -1509,6 +1581,7 @@ const reconstructFreezes = (entries, bounces, evidence) => {
     return first.at - second.at || first.order - second.order
   })
   for (const { kind, event } of journal) {
+    yield
     const cut = interruptionEvent(kind, event)
     if (kind === 'command') {
       const history = unresolvedAt(entries, evidence, cut)
@@ -1559,15 +1632,16 @@ const reconstructFreezes = (entries, bounces, evidence) => {
  * @param {object[]} entries All original handlers.
  * @param {object[]} bounces Archived command and interruption snapshots.
  * @param {BounceEvidence} evidence Primitive observations and actual receipts.
- * @returns {object} Separate budgets, reconstructed cuts and all disagreements.
+ * @returns {Generator} Steps returning separate budgets, reconstructed cuts and disagreements.
  */
-const freezeAccounting = (entries, bounces, evidence) => {
-  const reconstructed = reconstructFreezes(entries, bounces, evidence)
+const freezeAccountingWork = function* (entries, bounces, evidence) {
+  const reconstructed = yield* reconstructFreezes(entries, bounces, evidence)
   const accounting = admissionAccounting(reconstructed)
   const problems = [...accounting.problems]
   const observations = []
   if (reconstructed.length !== bounces.length) problems.push('Command journal length mismatch')
   for (const [position, bounce] of reconstructed.entries()) {
+    yield
     const supplied = bounces[position]
     if (
       !supplied ||
@@ -1615,6 +1689,47 @@ const freezeAccounting = (entries, bounces, evidence) => {
   }
   return { ...accounting, observations, problems }
 }
+
+/**
+ * Drains a read-only audit synchronously for deterministic scripted controls.
+ * @param {Generator} work Audit steps.
+ * @returns {*} Final audit result.
+ */
+const finishAudit = (work) => {
+  let step
+  do {
+    step = work.next()
+  } while (!step.done)
+  return step.value
+}
+
+/**
+ * Lets live heartbeats and shutdown traffic run between read-only audit steps.
+ * @param {Generator} work The same audit used by scripted controls.
+ * @param {AbortSignal} signal Existing body scope, never extended.
+ * @returns {Promise<object>} Final audit result.
+ */
+const cooperativeAudit = async (work, signal) => {
+  try {
+    for (;;) {
+      signal.throwIfAborted()
+      const step = work.next()
+      if (step.done) return step.value
+      await new Promise((resolve) => setImmediate(resolve))
+    }
+  } finally {
+    work.return()
+  }
+}
+
+/**
+ * @param {object[]} entries Original handlers.
+ * @param {object[]} bounces Original episodes.
+ * @param {BounceEvidence} evidence Original journals.
+ * @returns {object} Complete frozen accounting.
+ */
+const freezeAccounting = (entries, bounces, evidence) =>
+  finishAudit(freezeAccountingWork(entries, bounces, evidence))
 
 /**
  * @param {object[]} entries All original handlers.
@@ -1676,8 +1791,16 @@ const ownEpochSamples = (entry, samples) =>
  */
 const epochAdvance = (old, next, bounce, samples, exchanges) => {
   if (!Number.isFinite(bounce.downAt) || bounce.downAt <= bounce.at) return null
-  for (const before of ownEpochSamples(old, samples))
-    for (const after of ownEpochSamples(next, samples)) {
+  const upperSamples = ownEpochSamples(old, samples).filter(
+    ({ frame }) =>
+      old.acquisition.source.frames[0].responseAt < frame.at && frame.responseAt < bounce.downAt
+  )
+  const lowerSamples = ownEpochSamples(next, samples).filter(
+    ({ frame }) =>
+      bounce.downAt < frame.at && frame.responseAt < next.acquisition.source.frames[0].at
+  )
+  for (const before of upperSamples)
+    for (const after of lowerSamples) {
       if (
         old.acquisition.source.frames[0].responseAt >= before.frame.at ||
         before.frame.responseAt >= bounce.downAt ||
@@ -1761,14 +1884,171 @@ const epochAdvance = (old, next, bounce, samples, exchanges) => {
   return null
 }
 
+/** @param {*} count Original broker count. @returns {boolean} Whether it is a valid short count. */
+const validCount = (count) => Number.isInteger(count) && count >= 1 && count <= 32767
+
+/**
+ * Reconstructs one incarnation boundary from original controls and successful partition service.
+ * Process names identify control intervals, never an inferred Kafka leader epoch or OS PID.
+ * @param {object} old Previous handler.
+ * @param {object} next Adjacent handler of the same identity.
+ * @param {object} bounce Original episode.
+ * @param {BounceEvidence} evidence Primitive journals.
+ * @returns {{witness:object|null, failed:string[]}} One complete alternative or its missing components.
+ */
+const changedIncarnation = (old, next, bounce, evidence) => {
+  const failed = []
+  const before = old.acquisition.source.frames[0]
+  const after = next.acquisition.source.frames[0]
+  const interruption = matchingInterruption(old, bounce, evidence, after.at)
+  const controls = evidence.controls ?? []
+  const down = controls.find(
+    (control) => control.episode === bounce.index && control.kind !== 'start'
+  )
+  const command = evidence.commands.find(({ index }) => index === bounce.index)
+  const mapping = evidence.owner.lifecycle?.[bounce.service]
+  const targeted =
+    down &&
+    command &&
+    ['stop', 'kill'].includes(down.kind) &&
+    down.kind === bounce.kind &&
+    down.service === bounce.service &&
+    down.nodeId === bounce.nodeId &&
+    down.invoked &&
+    down.settled &&
+    down.invoked.at === command.at &&
+    down.invoked.order === command.order &&
+    down.semantics === 'awaited-compose-service-process' &&
+    mapping &&
+    isDeepStrictEqual(mapping, down.mapping) &&
+    down.mapping?.containerId &&
+    ['', 'no'].includes(down.mapping.restartPolicy) &&
+    down.mapping.service === down.service &&
+    down.mapping.nodeId === down.nodeId &&
+    down.mapping.endpoint === before.endpoint &&
+    old.acquisition.source.nodeId === down.nodeId &&
+    down.status === 'fulfilled' &&
+    down.exitCode === 0 &&
+    down.result !== undefined &&
+    precedes(down.invoked, down.settled)
+  const ordered =
+    interruption &&
+    precedes({ at: before.responseAt, order: before.responseOrder }, after) &&
+    precedes(interruption.cut, after)
+  if (!targeted) failed.push('control: missing successful stop/kill of the original serving node')
+  if (!ordered)
+    failed.push('chronology: old response and original interruption must precede new write')
+  if (targeted && ordered && next.acquisition.source.nodeId !== down.nodeId)
+    return {
+      witness: {
+        kind: 'different-serving-nodes',
+        down: down.id,
+        oldFrame: before.id,
+        newFrame: after.id,
+        cut: { kind: interruption.cut.kind, event: interruption.cut.event },
+      },
+      failed: [],
+    }
+  failed.push('different-serving-nodes: no ordered successful service at another node')
+  const start = controls.find(
+    (control) => control.kind === 'start' && control.episode === bounce.index
+  )
+  const priorDown = controls.findLast(
+    (control) =>
+      control.service === bounce.service && control.kind !== 'start' && control.id < down?.id
+  )
+  const priorStart =
+    priorDown &&
+    controls.find(
+      (control) =>
+        control.kind === 'start' &&
+        control.replaces === priorDown.id &&
+        control.status === 'fulfilled' &&
+        control.exitCode === 0 &&
+        control.result !== undefined &&
+        isDeepStrictEqual(control.mapping, mapping)
+    )
+  const originalProcess =
+    !priorDown ||
+    (priorDown.status === 'fulfilled' &&
+      priorDown.settled &&
+      priorStart?.settled &&
+      before.socketOpened &&
+      precedes(priorDown.settled, before.socketOpened) &&
+      precedes(priorStart.settled, down.invoked))
+  const replacement =
+    targeted &&
+    originalProcess &&
+    start &&
+    start.invoked &&
+    start.settled &&
+    start.replaces === down.id &&
+    start.semantics === down.semantics &&
+    start.status === 'fulfilled' &&
+    start.exitCode === 0 &&
+    start.result !== undefined &&
+    isDeepStrictEqual(start.mapping, down.mapping) &&
+    precedes(down.settled, start.invoked) &&
+    precedes(start.invoked, start.settled) &&
+    precedes(start.settled, after) &&
+    Number.isInteger(down.mapping.process?.pid) &&
+    down.mapping.process.pid > 0 &&
+    typeof down.mapping.process.startedAt === 'string' &&
+    down.mapping.process.startedAt.length > 0 &&
+    before.socketOpened &&
+    down.mapping.observed &&
+    precedes(down.mapping.observed, before.socketOpened) &&
+    precedes(before.socketOpened, down.invoked) &&
+    before.responseAt < down.settled.at &&
+    after.socketOpened &&
+    precedes(down.settled, after.socketOpened) &&
+    precedes(after.socketOpened, after) &&
+    before.socket !== after.socket &&
+    after.endpoint === start.mapping.endpoint &&
+    next.acquisition.source.nodeId === start.nodeId &&
+    start.service === down.service &&
+    start.nodeId === down.nodeId &&
+    !controls.some(
+      (control) =>
+        control.id !== down.id &&
+        control.id !== start.id &&
+        control.service === down.service &&
+        precedes(down.invoked, control.invoked) &&
+        precedes(control.invoked, after)
+    )
+  if (ordered && replacement)
+    return {
+      witness: {
+        kind: 'serving-process-restarted',
+        down: down.id,
+        start: start.id,
+        oldFrame: before.id,
+        newFrame: after.id,
+        oldSocket: before.socket,
+        newSocket: after.socket,
+        oldProcessStart: priorStart?.id ?? null,
+        cut: { kind: interruption.cut.kind, event: interruption.cut.event },
+      },
+      failed: [],
+    }
+  failed.push(
+    'lifecycle: missing termination/replacement mapping or original/replacement socket order'
+  )
+  const numeric = epochAdvance(old, next, bounce, evidence.epochs, evidence.exchanges)
+  if (numeric) return { witness: { kind: 'partition-transition', ...numeric }, failed: [] }
+  failed.push('partition-transition: missing disjoint serving-epoch bounds or causal transition')
+  return { witness: null, failed }
+}
+
 /**
  * @param {object} entry Failing replay.
  * @param {object[]} entries Complete original handler journal.
  * @param {object} bounce Causally matched command and interruption observations.
  * @param {object} evidence Original epoch and exchange journals.
+ * @param {string[]} failed Missing witness components.
  * @returns {string} Identity, every delivery interval and the nearest usable or overlapping epochs.
  */
-const countProgressionProblem = (entry, entries, bounce, evidence) => {
+const countProgressionProblem = (entry, entries, bounce, evidence, failed) => {
   const deliveries = entries
     .filter(({ identity }) => identity === entry.identity)
     .map((delivery) => {
@@ -1840,6 +2120,7 @@ const countProgressionProblem = (entry, entries, bounce, evidence) => {
       }
     })
   return `${entry.identity} has no proved delivery-count progression: ${JSON.stringify({
+    failedWitnessComponents: failed,
     topicId: entry.topicId,
     partition: entry.partition,
     bounce: {
@@ -1927,44 +2208,54 @@ const unknownBudgets = (unknown, episodes) => {
  * @param {object[]} bounces Immutable held sets, obligations and down/restore observations.
  * @param {Set<string>} corpus Immutable append identities.
  * @param {object} evidence Original epoch samples and authority retirements.
- * @returns {object} Charged extras, counters and all violations.
+ * @returns {Generator} Steps returning charged extras, counters and all violations.
  */
-const auditReplay = (entries, bounces, corpus, evidence) => {
+const auditReplayWork = function* (entries, bounces, corpus, evidence) {
   const previous = new Map()
   const dispatched = new Set()
-  const uncertainty = freezeAccounting(entries, bounces, evidence)
+  const uncertainty = yield* freezeAccountingWork(entries, bounces, evidence)
   const problems = [...uncertainty.problems]
   const extras = []
-  for (const entry of entries) {
+  for (const [index, entry] of entries.entries()) {
+    if (index % 100 === 0) yield
     const old = previous.get(entry.identity)
     const key = `${entry.acquisition?.source?.frames[0]?.id}:${entry.topicId}:${entry.partition}:${entry.offset}`
     if (!corpus.has(entry.identity)) problems.push(`${entry.identity} is outside the corpus`)
     if (!validAcquisition(entry))
       problems.push(`${entry.identity} lacks an adopted wire acquisition`)
-    if (
-      !Number.isInteger(entry.deliveryCount) ||
-      entry.deliveryCount < 1 ||
-      entry.deliveryCount > 32767
-    )
+    if (!validCount(entry.deliveryCount))
       problems.push(`${entry.identity} has an invalid delivery count`)
-    if (dispatched.has(key)) problems.push(`${entry.identity} dispatched one acquisition twice`)
+    const duplicate = dispatched.has(key)
+    if (duplicate) problems.push(`${entry.identity} dispatched one acquisition twice`)
     dispatched.add(key)
     if (old) {
+      const eligible =
+        corpus.has(entry.identity) &&
+        validAcquisition(old) &&
+        validAcquisition(entry) &&
+        !duplicate &&
+        samePartition(old, entry) &&
+        old.memberId === entry.memberId
       const bounce = bounces.find((episode) =>
         matchingInterruption(old, episode, evidence, entry.acquisition?.source?.frames[0]?.at)
       )
-      const witness =
-        bounce &&
-        validAcquisition(old) &&
-        validAcquisition(entry) &&
-        entry.deliveryCount === old.deliveryCount &&
-        epochAdvance(old, entry, bounce, evidence.epochs, evidence.exchanges)
+      const boundary =
+        eligible && bounce
+          ? entry.deliveryCount > old.deliveryCount
+            ? { witness: null, failed: [] }
+            : changedIncarnation(old, entry, bounce, evidence)
+          : {
+              witness: null,
+              failed: ['eligibility: missing distinct successful original acquisitions'],
+            }
       if (!bounce) problems.push(`${entry.identity} has no original fault obligation`)
       else if (
-        entry.deliveryCount < old.deliveryCount ||
-        (entry.deliveryCount === old.deliveryCount && !witness)
+        !eligible ||
+        !validCount(old.deliveryCount) ||
+        !validCount(entry.deliveryCount) ||
+        !(entry.deliveryCount > old.deliveryCount || boundary.witness)
       )
-        problems.push(countProgressionProblem(entry, entries, bounce, evidence))
+        problems.push(countProgressionProblem(entry, entries, bounce, evidence, boundary.failed))
       else if (!dispatched.has(`charged:${entry.id}`)) {
         dispatched.add(`charged:${entry.id}`)
         extras.push({
@@ -1974,7 +2265,9 @@ const auditReplay = (entries, bounces, corpus, evidence) => {
           bounce: bounce.index,
           deliveryCount: entry.deliveryCount,
           at: entry.at,
-          epochWitness: witness,
+          incarnationWitness: boundary.witness,
+          epochWitness:
+            boundary.witness?.kind === 'partition-transition' ? boundary.witness : undefined,
         })
       } else problems.push(`${entry.identity} charged an entry twice`)
     }
@@ -1984,6 +2277,16 @@ const auditReplay = (entries, bounces, corpus, evidence) => {
   problems.push(...budget.problems)
   return { extras, perBounce: budget.perBounce, uncertainty, problems }
 }
+
+/**
+ * @param {object[]} entries Original handlers.
+ * @param {object[]} bounces Original episodes.
+ * @param {Set<string>} corpus Immutable corpus.
+ * @param {BounceEvidence} evidence Primitive journals.
+ * @returns {object} The synchronous replay audit for scripted controls and closed workloads.
+ */
+const auditReplay = (entries, bounces, corpus, evidence) =>
+  finishAudit(auditReplayWork(entries, bounces, corpus, evidence))
 
 /**
  * Classifies successful and fault-unknown candidates without promoting any client outcome.
@@ -2668,6 +2971,41 @@ const boundedEvidence = (value, limit) => {
   return { value: copy(value), bytes, truncated }
 }
 
+/**
+ * Compresses complete JSON losslessly; chunks split encoded bytes, never nested membership.
+ * Manifest counts and the digest let readers reject missing, reordered or changed chunks.
+ * @param {string} event Original row kind.
+ * @param {string} id Stable object ID.
+ * @param {object} fields Complete original facts.
+ * @returns {object[]} Lossless rows below the existing row bound.
+ */
+const evidenceRows = (event, id, fields) => {
+  const json = JSON.stringify(fields ?? {})
+  if (Buffer.byteLength(json) < 20000) return [{ ...fields, event, evidenceId: id }]
+  const encoded = deflateRawSync(Buffer.from(json)).toString('base64')
+  const chunks = []
+  for (let offset = 0; offset < encoded.length; offset += 16000)
+    chunks.push(encoded.slice(offset, offset + 16000))
+  return [
+    {
+      event,
+      evidenceId: id,
+      encoding: 'deflate-raw-base64-chunks',
+      chunkCount: chunks.length,
+      characterCount: json.length,
+      encodedCharacters: encoded.length,
+      byteCount: Buffer.byteLength(json),
+      sha256: createHash('sha256').update(json).digest('hex'),
+      membership: Object.fromEntries(
+        Object.entries(fields)
+          .filter(([, value]) => Array.isArray(value))
+          .map(([key, value]) => [key, value.length])
+      ),
+    },
+    ...chunks.map((data, index) => ({ event: 'evidence-chunk', evidenceId: id, index, data })),
+  ]
+}
+
 /** @param {object[]} messages Original batch membership. @returns {string} Length-delimited input hash. */
 const membershipHash = (messages) => {
   const hash = createHash('sha256')
@@ -3071,9 +3409,10 @@ class ShareBounceCase {
    * Appends one evidence row.
    * @param {string} event the row kind
    * @param {object} [fields] the measured facts
-   * @returns {void}
+   * @param {boolean} [required] Whether omission must fail completion.
+   * @returns {boolean} Whether the complete object was archived.
    */
-  row(event, fields = {}) {
+  row(event, fields = {}, required = true) {
     const file = evidencePath(EVIDENCE)
     let before = 0
     try {
@@ -3082,25 +3421,7 @@ class ShareBounceCase {
       if (error.code !== 'ENOENT') throw error
     }
     const final = ['case-failed', 'case-complete'].includes(event)
-    const ceiling = ARCHIVE_BYTES - (final ? 0 : 2 * ARCHIVE_ROW_BYTES)
-    if (this.archiveFull && !final) return
-    const remaining = ceiling - before - 32768
-    if (remaining < 1024) {
-      this.archiveFull = true
-      writeEvidence(EVIDENCE, {
-        event: final ? event : 'archive-truncated',
-        case: TITLE,
-        scenario: this.nonce,
-        truncated: true,
-        truncationReason: 'archive-byte-limit',
-        archiveLimit: ARCHIVE_BYTES,
-      })
-      if (statSync(file).size > ARCHIVE_BYTES) truncateSync(file, before)
-      return
-    }
-    const snapshot = boundedEvidence(fields, Math.min(ARCHIVE_ROW_BYTES, remaining))
     const envelope = {
-      event,
       case: TITLE,
       profile: PROFILE,
       scenario: this.nonce,
@@ -3114,32 +3435,44 @@ class ShareBounceCase {
       },
       wireVersions: wireVersionsOf(this.requests),
     }
-    writeEvidence(EVIDENCE, {
-      ...envelope,
-      ...snapshot.value,
-      ...(snapshot.truncated && { truncated: true, truncationReason: 'evidence-row-byte-limit' }),
-    })
+    const id = `${this.nonce}:${this.archiveSequence ?? 0}`
+    this.archiveSequence = (this.archiveSequence ?? 0) + 1
+    const rows = evidenceRows(event, id, fields)
+    const ceiling = ARCHIVE_BYTES - (final ? 0 : 2 * ARCHIVE_ROW_BYTES)
+    const bytes = rows.reduce(
+      (sum, fact) => sum + Buffer.byteLength(JSON.stringify({ ...envelope, ...fact })) + 4096,
+      0
+    )
+    if (this.archiveFull || before + bytes > ceiling) {
+      if (!required) return false
+      this.archiveFull = true
+      this.archiveIncomplete = true
+      const problem = 'Required evidence does not fit the archive byte bound'
+      if (!this.captureProblems.includes(problem)) this.captureProblems.push(problem)
+      if (!this.archiveLimitRecorded || final) {
+        writeEvidence(EVIDENCE, {
+          ...envelope,
+          event: final ? 'case-failed' : 'evidence-incomplete',
+          originalEvent: event,
+          evidenceId: id,
+          requiredBytes: bytes,
+          archiveLimit: ARCHIVE_BYTES,
+          error: problem,
+        })
+        this.archiveLimitRecorded = true
+        if (statSync(file).size > ARCHIVE_BYTES) truncateSync(file, before)
+      }
+      return false
+    }
+    for (const fact of rows) writeEvidence(EVIDENCE, { ...envelope, ...fact })
     if (statSync(file).size > ceiling) {
       truncateSync(file, before)
       this.archiveFull = true
-      writeEvidence(EVIDENCE, {
-        ...envelope,
-        truncated: true,
-        truncationReason: 'archive-byte-limit',
-        archiveLimit: ARCHIVE_BYTES,
-      })
-      if (statSync(file).size > ARCHIVE_BYTES) truncateSync(file, before)
-    } else if (remaining < ARCHIVE_ROW_BYTES && !final) {
-      this.archiveFull = true
-      writeEvidence(EVIDENCE, {
-        ...envelope,
-        event: 'archive-truncated',
-        truncated: true,
-        truncationReason: 'archive-byte-limit',
-        archiveLimit: ARCHIVE_BYTES,
-      })
-      if (statSync(file).size > ARCHIVE_BYTES) truncateSync(file, before)
+      this.archiveIncomplete = true
+      this.captureProblems.push('Evidence envelope exceeded its reserved byte bound')
+      return false
     }
+    return true
   }
 
   /** @returns {object} Progress and public outcomes before cleanup can change them. */
@@ -3222,7 +3555,15 @@ class ShareBounceCase {
         throw primary
       }
       if (cleanupErrors.length) throw new AggregateError(cleanupErrors, 'Cleanup failed')
-      await bounded(scope, this.window(FINAL_MS, 0), (inner) => this.complete(inner))
+      this.archive()
+      if (this.archiveIncomplete) throw new Error('Required witness closure is incomplete')
+      const finalWindow = this.window(FINAL_MS, 0)
+      const finalDeadline = performance.now() + finalWindow
+      await bounded(scope, finalWindow, async (inner) => {
+        await this.complete(inner)
+        if (performance.now() >= finalDeadline)
+          throw new Error('The final evidence deadline passed')
+      })
     } catch (error) {
       this.archive(true)
       this.row('case-failed', {
@@ -3248,7 +3589,10 @@ class ShareBounceCase {
    */
   async setup(scope) {
     this.assertOwnership()
-    await bounded(scope, 30000, () => this.bouncer.assertAllUp())
+    await bounded(scope, 30000, async (signal) => {
+      await this.bouncer.assertAllUp()
+      await this.captureLifecycle(signal)
+    })
     this.admin = this.client('admin').admin()
     const removeAdmin = this.admin.on(this.admin.events.REQUEST, ({ payload }) =>
       this.requests.push(payload)
@@ -3305,6 +3649,65 @@ class ShareBounceCase {
       throw new Error('The cluster guard and its manifest must be named together')
     }
     this.guarded = Boolean(guard)
+  }
+
+  /**
+   * Observes the actual container mapping before the workload; controls keep their existing schedule.
+   * Only stopped/started containers with no automatic restart policy can prove replacement by result.
+   * @param {AbortSignal} signal Existing setup scope.
+   * @returns {Promise<void>} Detached lifecycle mapping, or an explicit unavailable observation.
+   */
+  async captureLifecycle(signal) {
+    try {
+      const manifest = process.env.KAFKAJS_CLUSTER_MANIFEST
+        ? JSON.parse(readFileSync(process.env.KAFKAJS_CLUSTER_MANIFEST, 'utf8'))
+        : null
+      const { stdout } = await promisify(execFile)('docker', ['inspect', ...SERVICES], { signal })
+      const items = JSON.parse(stdout)
+      this.lifecycle = Object.fromEntries(
+        SERVICES.map((service) => {
+          const item = items.find(({ Name }) => Name === `/${service}`)
+          const node = NODES[service]
+          const labels = item?.Config?.Labels ?? {}
+          const environment = item?.Config?.Env ?? []
+          const policy = item?.HostConfig?.RestartPolicy?.Name
+          const endpoint = `${node.host}:${node.port}`
+          if (
+            !item?.State?.Running ||
+            item.State.Paused ||
+            labels['com.docker.compose.service'] !== service ||
+            !environment.includes(`KAFKA_NODE_ID=${node.nodeId}`) ||
+            !environment.some(
+              (entry) =>
+                entry.startsWith('KAFKA_ADVERTISED_LISTENERS=') && entry.includes(`://${endpoint}`)
+            ) ||
+            !['', 'no'].includes(policy) ||
+            (manifest && !manifest.ids.includes(item.Id))
+          )
+            throw new Error(`Lifecycle mapping unavailable for ${service}`)
+          return [
+            service,
+            immutable({
+              service,
+              nodeId: node.nodeId,
+              endpoint,
+              containerId: item.Id,
+              project: labels['com.docker.compose.project'],
+              composeFile: labels['com.docker.compose.project.config_files'],
+              restartPolicy: policy,
+              process: {
+                pid: item.State.Pid,
+                startedAt: item.State.StartedAt,
+                restartCount: item.RestartCount,
+              },
+              observed: this.tap.stamp(),
+            }),
+          ]
+        })
+      )
+    } catch (error) {
+      this.lifecycleUnavailable = describeError(error)
+    }
   }
 
   /**
@@ -3554,6 +3957,27 @@ class ShareBounceCase {
         own.abort(error)
       })
     this.bouncer.run = this.watchDown(this.bouncer.run)
+    const step = this.bouncer.step.bind(this.bouncer)
+    this.bouncer.step = async (...args) => {
+      try {
+        const result = await step(...args)
+        const frozen = this.snapshots[this.snapshots.length - 1]
+        frozen.restoredAt = result.tRestored
+        this.evidence.restorations.push(
+          immutable({ episode: frozen.index, result, settled: this.tap.stamp() })
+        )
+        return result
+      } catch (error) {
+        this.evidence.restorations.push(
+          immutable({
+            episode: this.snapshots.at(-1)?.index,
+            error: describeError(error),
+            settled: this.tap.stamp(),
+          })
+        )
+        throw error
+      }
+    }
     const driving = Promise.all([guard(this.produce(inner)), guard(this.bounce(inner))]).finally(
       () => {
         this.driveFinished = true
@@ -3582,15 +4006,53 @@ class ShareBounceCase {
    */
   watchDown(run) {
     return async (kind, service) => {
-      if (kind !== 'stop' && kind !== 'kill') return run(kind, service)
-      this.freeze(kind, service)
+      const down = kind === 'stop' || kind === 'kill'
+      if (down) this.freeze(kind, service)
       const frozen = this.snapshots[this.snapshots.length - 1]
-      if (frozen.at < this.produceStart || performance.now() >= this.produceStart + PRODUCER_MS) {
+      if (
+        down &&
+        (frozen.at < this.produceStart || performance.now() >= this.produceStart + PRODUCER_MS)
+      )
         throw new Error('A down action would start outside the producer interval')
+      const controls = this.evidence.controls
+      const prior = controls.findLast(
+        (control) => control.service === service && control.kind !== 'start'
+      )
+      const control = {
+        id: controls.length,
+        episode: frozen?.index,
+        kind,
+        service,
+        nodeId: NODES[service]?.nodeId,
+        mapping: this.lifecycle?.[service] ?? null,
+        lifecycleUnavailable: this.lifecycleUnavailable,
+        invoked: down ? { at: frozen.at, order: frozen.order } : this.tap.stamp(),
+        ...(kind === 'start' && { replaces: prior?.id }),
+        semantics: 'awaited-compose-service-process',
+        status: 'pending',
       }
-      const result = await run(kind, service)
-      frozen.downAt = performance.now()
-      return result
+      controls.push(control)
+      try {
+        const result = await run(kind, service)
+        Object.assign(control, {
+          settled: this.tap.stamp(),
+          status: 'fulfilled',
+          exitCode: 0,
+          result: result === undefined ? null : immutable(result),
+        })
+        if (down) frozen.downAt = control.settled.at
+        return result
+      } catch (error) {
+        Object.assign(control, {
+          settled: this.tap.stamp(),
+          status: 'rejected',
+          exitCode: error.code ?? null,
+          error: describeError(error, 8),
+          stdout: error.stdout ?? null,
+          stderr: error.stderr ?? null,
+        })
+        throw error
+      }
     }
   }
 
@@ -3963,7 +4425,7 @@ class ShareBounceCase {
    * @returns {Promise<void>}
    */
   async observe(scope) {
-    this.checkBounces()
+    await this.checkBounces(scope)
     const log = await bounded(scope, 40000, (signal) => this.readRawLog(signal))
     this.log = log
     const raw = []
@@ -4011,10 +4473,11 @@ class ShareBounceCase {
    * each node taken down while the producer ran, no crash and no handler failure, at least one
    * authentic session reset from a lost connection or a moved leader, no membership change, and
    * the frozen held sets and charged replay entries within their allowances.
-   * @returns {void}
+   * @param {AbortSignal} scope Existing body scope.
+   * @returns {Promise<void>} After the cooperative replay audit.
    * @throws {Error} the first way the evidence falls short
    */
-  checkBounces() {
+  async checkBounces(scope) {
     expect(this.outages).toHaveLength(2 * SERVICES.length)
     expect(this.snapshots).toHaveLength(this.outages.length)
     expect(this.crashes.map((error) => error.message)).toEqual([])
@@ -4059,7 +4522,10 @@ class ShareBounceCase {
     if (this.appendAnomalies.length) {
       throw new Error(`Log/idempotency anomaly: ${this.appendFailure()}`)
     }
-    this.replay = auditReplay(this.entries, this.snapshots, new Set(this.expected), this.evidence)
+    this.replay = await cooperativeAudit(
+      auditReplayWork(this.entries, this.snapshots, new Set(this.expected), this.evidence),
+      scope
+    )
     expect(this.replay.problems).toEqual([])
   }
 
@@ -4176,7 +4642,6 @@ class ShareBounceCase {
     expect(this.crashes.map((error) => error.message)).toEqual([])
     expect([...this.tap.problems, ...this.producerEvidence.problems]).toEqual([])
     this.terminalVerified = true
-    this.archive()
   }
 
   /**
@@ -4423,10 +4888,8 @@ class ShareBounceCase {
             batchContext: record.batchContext,
           })),
       }))
-      const snapshot = boundedEvidence(partitions, ARCHIVE_ROW_BYTES)
-      this.failureLog.partitions = snapshot.value
-      this.failureLog.truncated = snapshot.truncated
-      this.failureLog.status = snapshot.truncated ? 'partial' : 'captured'
+      this.failureLog.partitions = partitions
+      this.failureLog.status = 'captured'
     } catch (error) {
       this.failureLog.error = describeError(error, 8)
     }
@@ -4440,9 +4903,13 @@ class ShareBounceCase {
    * @returns {void}
    */
   archive(failed = false) {
+    if (this.archived) return
+    this.archived = true
+    const rows = []
+    const emit = (event, fields) => rows.push({ event, fields })
     this.appendAnomalies ??= failed ? this.diagnoseAppends() : []
-    this.row('acquisition-journal', {
-      evidenceSchema: 2,
+    emit('acquisition-journal', {
+      evidenceSchema: 3,
       producerSchema: 2,
       status: failed ? 'failed' : 'terminal-verified',
       projection: failed ? 'involved-identities-and-batches' : 'compact-summary',
@@ -4495,12 +4962,12 @@ class ShareBounceCase {
       },
     })
     for (const candidate of this.settlement?.unknown ?? [])
-      this.row('unknown-settlement', {
+      emit('unknown-settlement', {
         ...candidate,
         terminalVerified: Boolean(this.terminalVerified),
       })
-    for (const extra of this.replay?.extras ?? []) this.row('replay-entry', extra)
-    this.row('quiet-observation', this.quiet)
+    for (const extra of this.replay?.extras ?? []) emit('replay-entry', extra)
+    emit('quiet-observation', this.quiet)
     const identities = new Set(this.appendAnomalies.map(({ identity }) => identity))
     if (failed) {
       const counts = tally(this.entries.map(({ identity }) => identity))
@@ -4509,7 +4976,7 @@ class ShareBounceCase {
         if (!this.confirmed.has(entry.key)) identities.add(entry.identity)
       for (const { identity } of this.settlement?.unknown ?? []) identities.add(identity)
       for (const anomaly of this.appendAnomalies) {
-        this.row('append-anomaly', anomaly)
+        emit('append-anomaly', anomaly)
         for (const { identity } of anomaly.receiptIdentities) identities.add(identity)
       }
     }
@@ -4540,31 +5007,53 @@ class ShareBounceCase {
     for (const attempt of this.producerEvidence.attempts)
       if (attemptIds.has(attempt.id)) for (const { id } of attempt.frames) frameIds.add(id)
 
-    if (failed) {
-      this.archiveFailureIdentities(identities, frameIds)
-      this.row('failure-log', this.failureLog)
-    }
+    for (const bounce of this.snapshots)
+      for (const held of [
+        ...bounce.obligations,
+        ...bounce.carried,
+        ...bounce.interruptions.flatMap((cut) => [...cut.obligations, ...cut.carried]),
+      ])
+        identities.add(held.identity)
+    const historyEntries = new Set(
+      this.snapshots.flatMap((bounce) => bounce.interruptions.flatMap((cut) => cut.history))
+    )
+    for (const entry of this.entries)
+      if (historyEntries.has(entry.id)) identities.add(entry.identity)
+    for (const extra of this.replay?.extras ?? []) identities.add(extra.identity)
+    for (const candidate of this.settlement?.unknown ?? []) identities.add(candidate.identity)
+    this.archiveFailureIdentities(identities, frameIds, emit)
+    if (failed) emit('failure-log', this.failureLog)
+    const bulkFrames = []
     for (const frame of this.tap.allFrames) {
       const producerFrame = [0, 22].includes(frame.apiKey)
-      if (!producerFrame && !frameIds.has(frame.id)) continue
+      if (failed && !producerFrame && !frameIds.has(frame.id)) continue
       const { bytes, responseBytes, ...fact } = frame
       const raw = this.tap.rawProduce.get(frame.id)
-      this.row('wire-exchange', {
+      if (frameIds.has(frame.id) && !(bytes || raw)) {
+        this.archiveIncomplete = true
+        this.captureProblems.push(
+          `Required original request bytes unavailable for frame ${frame.id}`
+        )
+      }
+      const original = {
         ...fact,
-        ...(!producerFrame && { bytes, responseBytes }),
-        ...(failed &&
-          frame.apiKey === 0 &&
+        bytes,
+        responseBytes,
+        ...(frame.apiKey === 0 &&
           frameIds.has(frame.id) && {
-            bytes: raw?.toString('base64'),
-            rawStatus: raw ? 'retained-original' : 'evicted-from-bounded-ring',
+            bytes: bytes ?? raw?.toString('base64'),
+            rawStatus: bytes || raw ? 'retained-original' : 'unavailable',
           }),
-      })
+      }
+      if (frameIds.has(frame.id)) emit('wire-exchange', original)
+      else bulkFrames.push(original)
     }
+    emit('wire-history', { frames: bulkFrames })
     for (const send of this.sends) {
       const { receiptIdentities, ...original } = send
       if (failed && !sendIds.has(send.id)) {
         const { original: input, ...settlement } = original
-        this.row('original-send', {
+        emit('original-send', {
           ...settlement,
           outcome: send.outcome === 'pending' ? 'unknown' : send.outcome,
           inputRecordCount: input.messages.length,
@@ -4573,19 +5062,17 @@ class ShareBounceCase {
         })
         continue
       }
-      this.row('original-send', {
+      emit('original-send', {
         ...original,
         outcome: send.outcome === 'pending' ? 'unknown' : send.outcome,
         receiptCount: receiptIdentities.length,
-        receiptIdentities: failed
-          ? receiptIdentities.filter(({ identity }) => identities.has(identity))
-          : undefined,
+        receiptIdentities,
       })
     }
     for (const batch of this.producerEvidence.batches)
-      if (batchIds.has(batch.id)) this.row('producer-batch', { ...batch, link: links[batch.id] })
+      if (batchIds.has(batch.id)) emit('producer-batch', { ...batch, link: links[batch.id] })
     for (const { frames, batchStates, ...attempt } of this.producerEvidence.attempts)
-      this.row('produce-attempt', {
+      emit('produce-attempt', {
         ...attempt,
         batchStates: attemptIds.has(attempt.id) ? batchStates : undefined,
         frames: frames.map(({ id }) => id),
@@ -4602,30 +5089,116 @@ class ShareBounceCase {
           )
         )
       if (!failed || involved || transition.method === 'identity.bumpEpoch')
-        this.row('producer-transition', transition)
+        emit('producer-transition', transition)
     }
-    this.row('broker-configs', { configs: this.brokerConfigs })
+    if (!failed) {
+      emit('handler-history', {
+        entries: this.entries.map(({ acquisition, ...entry }) => ({
+          ...entry,
+          acquisition: acquisition?.id,
+        })),
+      })
+      emit('acquisition-history', {
+        acquisitions: this.evidence.acquisitions.map(({ source, ...acquisition }) => acquisition),
+      })
+      emit('exchange-history', {
+        exchanges: this.evidence.exchanges.map(({ frames, response, ...exchange }) => ({
+          ...exchange,
+          frames: frames.map(({ id }) => id),
+        })),
+      })
+    }
+    emit('broker-configs', { configs: this.brokerConfigs })
     for (const { frames, ...state } of this.evidence.brokerStates)
-      this.row('producer-broker-state', { ...state, frames: frames.map(({ id }) => id) })
+      emit('producer-broker-state', { ...state, frames: frames.map(({ id }) => id) })
+    const first = new Set([
+      'bounce-restoration',
+      'lifecycle-mapping',
+      'bounce-control',
+      'bounce-command',
+      'frozen-bounce',
+      'socket-event',
+      'retirement',
+      'group-deletion',
+      'member-close',
+    ])
+    const required = new Set([
+      'handler-entry',
+      'acquisition',
+      'share-exchange',
+      'acknowledgement-outcome',
+      'epoch-source',
+      'unknown-settlement',
+      'replay-entry',
+      'append-anomaly',
+      'failure-log',
+    ])
+    const priority = ({ event, fields }) => {
+      if (first.has(event)) return 0
+      if (event === 'wire-exchange') return frameIds.has(fields.id) ? 1 : 4
+      if (event === 'wire-history' || event === 'socket-history') return failed ? 4 : 3
+      if (required.has(event)) return 2
+      if (event === 'original-send') return sendIds.has(fields.id) ? 2 : failed ? 4 : 3
+      if (event === 'producer-batch') return batchIds.has(fields.id) ? 2 : 4
+      if (event === 'produce-attempt') return attemptIds.has(fields.id) ? 2 : 4
+      return 3
+    }
+    rows.sort((a, b) => priority(a) - priority(b))
+    this.row('witness-closure', {
+      evidenceSchema: 3,
+      identities: [...identities],
+      frames: [...frameIds].sort((a, b) => a - b),
+      rows: rows.map((fact, index) => ({
+        index,
+        event: fact.event,
+        id: fact.fields?.id,
+        required: priority(fact) < 4,
+        evidenceId: `${this.nonce}:${(this.archiveSequence ?? 0) + 1 + index}`,
+      })),
+      omitted: {
+        epochSources:
+          this.evidence.epochs.length - rows.filter(({ event }) => event === 'epoch-source').length,
+      },
+    })
+    let omitted = 0
+    for (const fact of rows) if (!this.row(fact.event, fact.fields, priority(fact) < 4)) omitted++
+    this.row('witness-closure-end', {
+      complete: !this.archiveIncomplete,
+      rows: rows.length,
+      omittedOptionalRows: omitted,
+    })
   }
 
   /**
    * Retains original acquisition/receipt provenance only for involved identities, with raw frame links.
    * @param {Set<string>} identities Failure identities and their matching public receipts.
    * @param {Set<number>} frameIds Relevant frames, extended with acquisition/receipt/epoch sources.
+   * @param {Function} emit Collects rows for closure ordering.
    * @returns {void}
    */
-  archiveFailureIdentities(identities, frameIds) {
+  archiveFailureIdentities(identities, frameIds, emit) {
     const cohorts = new Set()
     const exchanges = new Set()
     for (const { acquisition, ...entry } of this.entries) {
       if (!identities.has(entry.identity)) continue
       cohorts.add(acquisition?.id)
       exchanges.add(acquisition?.exchange)
-      this.row('handler-entry', { ...entry, acquisition: acquisition?.id })
+      emit('handler-entry', { ...entry, acquisition: acquisition?.id })
     }
     for (const { source, ...acquisition } of this.evidence.acquisitions)
-      if (cohorts.has(acquisition.id)) this.row('acquisition', acquisition)
+      if (cohorts.has(acquisition.id)) emit('acquisition', acquisition)
+    for (const bounce of this.snapshots)
+      for (const cut of bounce.interruptions) if (cut.kind === 'failure') exchanges.add(cut.event)
+    for (const extra of this.replay?.extras ?? []) {
+      const witness = extra.incarnationWitness
+      if (witness?.kind !== 'partition-transition') continue
+      for (const key of ['before', 'after', 'transition', 'metadataTransition']) {
+        if (witness[key] === undefined) continue
+        frameIds.add(witness[key])
+        for (const exchange of this.evidence.exchanges)
+          if (exchange.frames.some(({ id }) => id === witness[key])) exchanges.add(exchange.id)
+      }
+    }
     for (const { frames, response, ...exchange } of this.evidence.exchanges) {
       if (
         !exchange.tickets.some(({ cohort }) => cohorts.has(cohort)) &&
@@ -4633,7 +5206,7 @@ class ShareBounceCase {
       )
         continue
       for (const { id } of frames) frameIds.add(id)
-      this.row('share-exchange', {
+      emit('share-exchange', {
         ...exchange,
         frames: frames.map(({ id }) => id),
         response: response && {
@@ -4661,16 +5234,78 @@ class ShareBounceCase {
       })
     }
     for (const outcome of this.evidence.outcomes)
-      if (cohorts.has(outcome.cohort)) this.row('acknowledgement-outcome', outcome)
-    for (const { frames, ...source } of this.evidence.epochs) {
-      for (const { id } of frames) frameIds.add(id)
-      this.row('epoch-source', { ...source, frames: frames.map(({ id }) => id) })
+      if (cohorts.has(outcome.cohort)) emit('acknowledgement-outcome', outcome)
+    const chosen = new Set()
+    for (const extra of this.replay?.extras ?? []) {
+      const witness = extra.incarnationWitness
+      if (witness?.kind === 'partition-transition')
+        for (const key of ['before', 'after', 'transition', 'metadataTransition'])
+          if (witness[key] !== undefined) chosen.add(witness[key])
     }
-    for (const event of this.tap.socketEvents) this.row('socket-event', event)
-    for (const retirement of this.evidence.retirements) this.row('retirement', retirement)
-    for (const command of this.evidence.commands) this.row('bounce-command', command)
-    for (const { held, ...bounce } of this.snapshots)
-      this.row('frozen-bounce', { ...bounce, held: [...held] })
+    for (const entry of this.entries.filter(({ identity }) => identities.has(identity))) {
+      const frame = entry.acquisition?.source?.frames[0]
+      if (!frame) continue
+      const samples = sourceEpochSamples(entry, this.evidence.epochs).sort(
+        (a, b) => a.frame.at - b.frame.at
+      )
+      const before = samples.findLast(({ frame: sample }) => sample.responseAt < frame.at)
+      const after = samples.find(({ frame: sample }) => sample.at > frame.responseAt)
+      if (before) chosen.add(before.frame.id)
+      if (after) chosen.add(after.frame.id)
+      for (const sample of samples)
+        if (
+          sample.row.leader !== entry.acquisition.source.nodeId &&
+          this.snapshots.some(
+            (bounce) =>
+              bounce.nodeId === entry.acquisition.source.nodeId &&
+              frame.responseAt < sample.frame.at &&
+              bounce.at < sample.frame.at &&
+              sample.frame.responseAt < bounce.restoredAt
+          )
+        )
+          chosen.add(sample.frame.id)
+    }
+    for (const { frames, ...source } of this.evidence.epochs) {
+      if (!frames.some(({ id }) => chosen.has(id))) continue
+      for (const { id } of frames) frameIds.add(id)
+      emit('epoch-source', { ...source, frames: frames.map(({ id }) => id) })
+    }
+    const sockets = new Set(
+      this.entries
+        .filter(({ identity }) => identities.has(identity))
+        .map((entry) => entry.acquisition?.source?.frames[0]?.socket)
+    )
+    for (const frame of this.tap.allFrames) if (frameIds.has(frame.id)) sockets.add(frame.socket)
+    const omittedEvents = []
+    for (const event of this.tap.socketEvents) {
+      if (!sockets.has(event.socket)) {
+        omittedEvents.push(event)
+        continue
+      }
+      for (const id of event.outstanding) frameIds.add(id)
+      emit('socket-event', { ...event, socketEvent: event.event })
+    }
+    emit('socket-history', { events: omittedEvents })
+    for (const retirement of this.evidence.retirements) emit('retirement', retirement)
+    emit('lifecycle-mapping', { nodes: this.lifecycle, unavailable: this.lifecycleUnavailable })
+    for (const { frames, ...close } of this.evidence.closes) {
+      for (const frame of frames ?? []) frameIds.add(frame.id)
+      emit('member-close', { ...close, frames: frames?.map(({ id }) => id) })
+    }
+    for (const restoration of this.evidence.restorations) emit('bounce-restoration', restoration)
+    for (const observation of this.groupDeletion ?? []) emit('group-deletion', observation)
+    for (const control of this.evidence.controls) emit('bounce-control', control)
+    for (const command of this.evidence.commands) emit('bounce-command', command)
+    for (const { held, inFlight, ...bounce } of this.snapshots) {
+      for (const frame of inFlight) frameIds.add(frame.id)
+      emit('frozen-bounce', { ...bounce, held: [...held], inFlight: inFlight.map(({ id }) => id) })
+    }
+    for (const frame of this.tap.allFrames)
+      if (
+        [15, 42, 66, 76].includes(frame.apiKey) ||
+        (frame.label === 'admin' && [3, 32].includes(frame.apiKey))
+      )
+        frameIds.add(frame.id)
   }
 
   /**
@@ -4740,18 +5375,37 @@ class ShareBounceCase {
    * @throws {Error} when the group is still listed after deletion
    */
   async deleteGroup(signal) {
+    this.groupDeletion = []
     await pollUntil(
       signal,
       10000,
-      async () => {
+      async (scope) => {
+        const observation = { id: this.groupDeletion.length, started: this.tap.stamp() }
+        this.groupDeletion.push(observation)
         try {
-          await this.admin.deleteGroups([this.group])
+          observation.result = await this.admin.deleteGroups([this.group])
           return true
         } catch (error) {
-          const code = error.groups?.[0]?.error?.code
+          observation.error = describeError(error, 8)
+          observation.groups = error.groups?.map(({ groupId, errorCode, errorMessage, error }) => ({
+            groupId,
+            errorCode,
+            errorMessage,
+            error: describeError(error),
+          }))
+          const code = error.groups?.[0]?.errorCode ?? error.groups?.[0]?.error?.code
           if (code === 69) return true
-          if (code === 68) return false
-          throw error
+          if (code !== 68) throw error
+          try {
+            observation.membership = await bounded(scope, 6000, () =>
+              this.admin.describeShareGroups([this.group], { apiTimeout: 6000 })
+            )
+          } catch (failure) {
+            observation.membershipError = describeError(failure)
+          }
+          return false
+        } finally {
+          observation.ended = this.tap.stamp()
         }
       },
       { label: 'The group deletion' }
@@ -4843,7 +5497,7 @@ class ShareBounceCase {
       bounces: this.bounceFacts.map((fact, index) => ({
         ...fact,
         held: [...this.snapshots[index].held].sort(),
-        inFlight: this.snapshots[index].inFlight,
+        inFlight: this.snapshots[index].inFlight.map(({ id }) => id),
         duplicates: extras.filter(({ bounce }) => bounce === index),
         extraEntries: perBounce[index],
       })),
@@ -4851,6 +5505,7 @@ class ShareBounceCase {
       wireVersions: wireVersionsOf(this.requests),
       config: { client: this.clientConfig, group: this.groupConfig },
     })
+    if (this.archiveIncomplete) throw new Error('Required completion evidence is incomplete')
   }
 }
 
@@ -5066,6 +5721,7 @@ const replayFixture = ({ count = 1, sameLeader = false, offset = '0' } = {}) => 
     const range = { firstOffset: offset, lastOffset: offset, deliveryCount }
     const frame = {
       id,
+      nodeId,
       apiKey: 78,
       apiVersion: 2,
       correlationId: 7,
@@ -5668,6 +6324,309 @@ describe('share bounce acquisition and settlement sensitivity', () => {
   const audit = ({ entries, bounces, corpus, evidence }) =>
     auditReplay(entries, bounces, new Set(corpus), evidence)
 
+  /** @returns {object} Same-node stop/restart with late entry and no old numeric upper bound. */
+  const restartFixture = () => {
+    const fixture = replayFixture({ sameLeader: true })
+    const { old, next, bounces, evidence } = fixture
+    Object.assign(bounces[0], { at: 3, kind: 'stop', service: 'kafka1' })
+    Object.assign(old.acquisition.source.frames[0], {
+      at: 3.1,
+      responseAt: 3.2,
+      socketOpened: { at: 0.5 },
+    })
+    old.acquisition.adoptedAt = 3.3
+    next.acquisition.source.frames[0].socketOpened = { at: 12 }
+    evidence.epochs[0].frames[0].at = 3.1
+    evidence.epochs[0].frames[0].responseAt = 3.15
+    const away = JSON.parse(JSON.stringify(evidence.epochs[0]))
+    Object.assign(away.frames[0], { id: 50, at: 5, responseAt: 6 })
+    Object.assign(away.response.topicMetadata[0].partitionMetadata[0], {
+      leader: 2,
+      leaderEpoch: 2,
+    })
+    evidence.epochs.push(away)
+    captureFreezes(fixture)
+    const mapping = {
+      service: 'kafka1',
+      nodeId: 1,
+      endpoint: 'node-1',
+      containerId: 'owned-container',
+      restartPolicy: 'no',
+      observed: { at: 0.1 },
+      process: { pid: 100, startedAt: 'original' },
+    }
+    evidence.owner.lifecycle = { kafka1: immutable(mapping) }
+    evidence.controls = [
+      {
+        id: 0,
+        episode: 0,
+        kind: 'stop',
+        service: 'kafka1',
+        nodeId: 1,
+        mapping,
+        semantics: 'awaited-compose-service-process',
+        invoked: { at: 3 },
+        settled: { at: 9 },
+        status: 'fulfilled',
+        exitCode: 0,
+        result: { stdout: '', stderr: 'Stopped' },
+      },
+      {
+        id: 1,
+        episode: 0,
+        kind: 'start',
+        service: 'kafka1',
+        nodeId: 1,
+        mapping,
+        semantics: 'awaited-compose-service-process',
+        invoked: { at: 10 },
+        settled: { at: 11 },
+        status: 'fulfilled',
+        exitCode: 0,
+        result: { stdout: '', stderr: 'Started' },
+        replaces: 0,
+      },
+    ]
+    return fixture
+  }
+
+  it('admits a late count-one same-node return using its actual stop/start results', () => {
+    const fixture = restartFixture()
+    const result = audit(fixture)
+    expect(fixture.bounces[0].held.size).toBe(0)
+    expect(fixture.bounces[0].interruptions[0].lateEntries).toContain(fixture.old.id)
+    expect(result.problems).toEqual([])
+    expect(result.extras[0].incarnationWitness).toMatchObject({
+      kind: 'serving-process-restarted',
+      down: 0,
+      start: 1,
+    })
+    expect(result.extras[0].epochWitness).toBeUndefined()
+  })
+
+  it('admits different-node service before graceful stop returns without old Metadata', () => {
+    const fixture = restartFixture()
+    fixture.evidence.epochs = []
+    fixture.evidence.controls[0].settled.at = 25
+    fixture.evidence.controls[1].invoked.at = 26
+    fixture.evidence.controls[1].settled.at = 27
+    fixture.bounces[0].restoredAt = 28
+    const source = fixture.next.acquisition.source
+    source.nodeId = 2
+    source.endpoint = 'node-2'
+    source.frames[0].endpoint = 'node-2'
+    source.frames[0].nodeId = 2
+    expect(audit(fixture).problems).toEqual([])
+    expect(audit(fixture).extras[0].incarnationWitness.kind).toBe('different-serving-nodes')
+    source.response.responses[0].partitions[0].errorCode = 6
+    expect(audit(fixture).problems.length).toBeGreaterThan(0)
+  })
+
+  it.each([
+    ['failed stop', (f) => (f.evidence.controls[0].status = 'rejected')],
+    ['nonzero exit', (f) => (f.evidence.controls[0].exitCode = 1)],
+    ['unfinished stop', (f) => delete f.evidence.controls[0].settled],
+    ['invocation only', (f) => delete f.evidence.controls[0].result],
+    ['no-op runner', (f) => (f.evidence.controls[0].semantics = 'no-op')],
+    ['pause', (f) => (f.evidence.controls[0].kind = 'pause')],
+    ['no start', (f) => f.evidence.controls.pop()],
+    ['failed start', (f) => (f.evidence.controls[1].status = 'rejected')],
+    ['wrong replacement', (f) => (f.evidence.controls[1].replaces = 99)],
+    [
+      'wrong container',
+      (f) =>
+        (f.evidence.controls[1].mapping = {
+          ...f.evidence.controls[1].mapping,
+          containerId: 'foreign',
+        }),
+    ],
+    ['wrong node', (f) => (f.evidence.controls[0].nodeId = 3)],
+    ['source-node mismatch', (f) => (f.next.acquisition.source.frames[0].nodeId = 3)],
+    [
+      'missing process identity',
+      (f) => {
+        delete f.evidence.controls[0].mapping.process
+      },
+    ],
+    [
+      'wrong endpoint',
+      (f) =>
+        (f.evidence.controls[1].mapping = { ...f.evidence.controls[1].mapping, endpoint: 'other' }),
+    ],
+    ['automatic restart', (f) => (f.evidence.controls[0].mapping.restartPolicy = 'always')],
+    ['old socket survives', (f) => (f.next.acquisition.source.frames[0].socketOpened.at = 2)],
+    ['write before restoration', (f) => (f.evidence.controls[1].settled.at = 22)],
+    ['delayed old response', (f) => (f.old.acquisition.source.frames[0].responseAt = 13)],
+    ['restarted original socket', (f) => (f.old.acquisition.source.frames[0].socketOpened.at = 12)],
+    [
+      'contradictory start',
+      (f) => f.evidence.controls.push({ ...f.evidence.controls[1], id: 2, invoked: { at: 15 } }),
+    ],
+  ])('rejects lifecycle evidence with %s', (_name, mutate) => {
+    const fixture = restartFixture()
+    mutate(fixture)
+    expect(audit(fixture).problems.length).toBeGreaterThan(0)
+  })
+
+  it.each([1, 2])('requires a boundary for same-process count %s to one', (count) => {
+    const fixture = restartFixture()
+    fixture.old.deliveryCount = count
+    fixture.old.acquisition.acquiredRecords[0].deliveryCount = count
+    expect(audit(fixture).problems).toEqual([])
+    fixture.evidence.controls = []
+    expect(audit(fixture).problems.length).toBeGreaterThan(0)
+  })
+
+  it.each([undefined, 0, -1, 1.5, 32768])(
+    'rejects invalid original or replacement count %s across restart',
+    (count) => {
+      for (const which of ['old', 'next']) {
+        const fixture = restartFixture()
+        fixture[which].deliveryCount = count
+        fixture[which].acquisition.acquiredRecords[0].deliveryCount = count
+        expect(audit(fixture).problems.length).toBeGreaterThan(0)
+      }
+    }
+  )
+
+  it('cannot reuse a restart boundary for a second equal-count replacement acquisition', () => {
+    const fixture = restartFixture()
+    const third = JSON.parse(JSON.stringify(fixture.next))
+    third.id = 2
+    third.at = 33
+    Object.assign(third.acquisition, { id: 2, exchange: 2, adoptedAt: 32 })
+    Object.assign(third.acquisition.source, { id: 2 })
+    Object.assign(third.acquisition.source.frames[0], { id: 2, at: 30, responseAt: 31 })
+    fixture.entries.push(third)
+    fixture.evidence.exchanges.push(third.acquisition.source)
+    expect(audit(fixture).problems).toContain(`${third.identity} has no original fault obligation`)
+  })
+
+  it('keeps a same-stamp copy at another physical offset outside the corpus across restart', () => {
+    const fixture = restartFixture()
+    const extra = JSON.parse(JSON.stringify(fixture.next))
+    extra.id = 2
+    extra.offset = '1'
+    extra.identity = shareRecordIdentity({
+      topic: extra.topic,
+      partition: 0,
+      offset: '1',
+      key: Buffer.from('k'),
+      value: Buffer.from('v'),
+    })
+    const stamp = {
+      producerId: '0',
+      producerEpoch: 0,
+      firstSequence: 0,
+      count: 1,
+      recordBody: 'same-original-body',
+    }
+    fixture.next.acquisition.source.frames[0].batches = [{ ...stamp, baseOffset: '0' }]
+    const range = { firstOffset: '1', lastOffset: '1', deliveryCount: 1 }
+    Object.assign(extra.acquisition, {
+      id: 2,
+      exchange: 2,
+      adoptedAt: 32,
+      acquiredRecords: [range],
+    })
+    Object.assign(extra.acquisition.source, { id: 2 })
+    extra.acquisition.source.response.responses[0].partitions[0].acquiredRecords = [range]
+    Object.assign(extra.acquisition.source.frames[0], {
+      id: 2,
+      at: 30,
+      responseAt: 31,
+      batches: [{ ...stamp, baseOffset: '1' }],
+    })
+    extra.at = 33
+    expect(validAcquisition(extra)).toBeTruthy()
+    fixture.entries.push(extra)
+    expect(audit(fixture).problems).toContain(`${extra.identity} is outside the corpus`)
+  })
+
+  it('chunks complete nested cuts and raw frames with checked membership and stable IDs', () => {
+    const fields = {
+      interruptions: Array.from({ length: 300 }, (_, entry) => ({
+        obligations: [{ entry, authority: { socket: entry }, original: 'x'.repeat(200) }],
+      })),
+      bytes: 'b'.repeat(300000),
+    }
+    const rows = evidenceRows('frozen-bounce', 'stable-object', fields)
+    const [manifest, ...chunks] = rows
+    expect(manifest).toMatchObject({
+      evidenceId: 'stable-object',
+      chunkCount: chunks.length,
+      membership: { interruptions: 300 },
+    })
+    const encoded = chunks.map(({ data }) => data).join('')
+    expect(encoded.length).toBe(manifest.encodedCharacters)
+    const json = inflateRawSync(Buffer.from(encoded, 'base64')).toString()
+    expect(JSON.parse(json)).toEqual(fields)
+    expect(createHash('sha256').update(json).digest('hex')).toBe(manifest.sha256)
+    expect(Buffer.byteLength(json)).toBe(manifest.byteCount)
+    expect(rows.every((row) => Buffer.byteLength(JSON.stringify(row)) < ARCHIVE_ROW_BYTES)).toBe(
+      true
+    )
+    expect(
+      createHash('sha256')
+        .update(
+          chunks
+            .slice(1)
+            .map(({ data }) => data)
+            .join('')
+        )
+        .digest('hex')
+    ).not.toBe(manifest.sha256)
+  })
+
+  it('archives actual down/start results without awaiting anything between freeze and down', async () => {
+    const instance = new ShareBounceCase()
+    instance.produceStart = performance.now() - 10
+    const calls = []
+    instance.freeze = (kind, service) => {
+      calls.push('freeze')
+      instance.snapshots.push({ index: 0, kind, service, ...instance.tap.stamp() })
+    }
+    const result = { stdout: 'actual stdout', stderr: 'actual stderr' }
+    const wrapped = instance.watchDown((kind) => {
+      calls.push(kind)
+      return Promise.resolve(result)
+    })
+    const pending = wrapped('stop', 'kafka1')
+    expect(calls).toEqual(['freeze', 'stop'])
+    expect(instance.evidence.controls[0].status).toBe('pending')
+    expect(await pending).toBe(result)
+    expect(await wrapped('start', 'kafka1')).toBe(result)
+    expect(
+      instance.evidence.controls.map(({ kind, status, result: observed }) => ({
+        kind,
+        status,
+        observed,
+      }))
+    ).toEqual([
+      { kind: 'stop', status: 'fulfilled', observed: result },
+      { kind: 'start', status: 'fulfilled', observed: result },
+    ])
+    expect(instance.evidence.controls[1].replaces).toBe(0)
+  })
+
+  it('runs the same read-only audit while allowing live heartbeat turns', async () => {
+    const fixture = restartFixture()
+    let turns = 0
+    const heartbeat = new Promise((resolve) =>
+      setImmediate(() => {
+        turns++
+        resolve()
+      })
+    )
+    const result = await cooperativeAudit(
+      auditReplayWork(fixture.entries, fixture.bounces, new Set(fixture.corpus), fixture.evidence),
+      NEVER
+    )
+    expect(turns).toBeGreaterThan(0)
+    expect(result).toEqual(audit(fixture))
+    await heartbeat
+  })
+
   it('permits 1800 terminal unknowns only beside 28200 real Accepts and complete terminal proof', () => {
     const proof = terminalBudgetFixture()
     const result = auditTerminal(proof)
@@ -6084,13 +7043,11 @@ describe('share bounce acquisition and settlement sensitivity', () => {
     expect(audit(replayFixture({ count })).problems.length).toBeGreaterThan(0)
   })
 
-  it('rejects lower counts even across a proved epoch advance', () => {
+  it('permits a valid reset floor across a complete partition transition', () => {
     const fixture = replayFixture()
     fixture.old.deliveryCount = 2
     fixture.old.acquisition.acquiredRecords[0].deliveryCount = 2
-    expect(audit(fixture).problems).toContainEqual(
-      expect.stringContaining(`${fixture.old.identity} has no proved delivery-count progression`)
-    )
+    expect(audit(fixture).problems).toEqual([])
   })
 
   it('retains the original episode across later held sets and rejects a duplicate charge', () => {
@@ -6404,6 +7361,7 @@ describe('share bounce acquisition and settlement sensitivity', () => {
         for (const frame of exchange.frames) {
           frame.socket = 99
           frame.endpoint = 'node-3'
+          frame.nodeId = 3
         }
       }
     }
@@ -6876,6 +7834,7 @@ describe('share bounce acquisition and settlement sensitivity', () => {
     replacement.acquisition.source.nodeId = 1
     replacement.acquisition.source.endpoint = 'node-1'
     replacement.acquisition.source.frames[0].endpoint = 'node-1'
+    replacement.acquisition.source.frames[0].nodeId = 1
     replacement.acquisition.source.frames[0].at = 8.4
     replacement.acquisition.source.frames[0].responseAt = 8.5
     replacement.acquisition.adoptedAt = 8.6
