@@ -259,8 +259,9 @@ const FINAL_ACTIONS = Object.freeze([
 /**
  * The boundary ledger: each stale-work boundary with the operation modes that can reach it. S15 is
  * only reachable for a final queued behind an in-flight ordinary request, so it has no other mode.
- * S18's get and normal rows retire only through a close or reopen, so their hold arrives during
- * the action (`lateArrival`) and they carry only those actions.
+ * S18 holds the retirement itself: its get and normal rows retire only through a close, so their
+ * hold arrives during the action (`lateArrival`); a held retirement keeps the close open, so S18
+ * never carries the reopen action.
  * @type {ReadonlyArray<[string, ReadonlyArray<'get'|'normal'|'final'>]>}
  */
 const RELEASE_LEDGER = Object.freeze([
@@ -281,8 +282,11 @@ const SASL_BOUNDARIES = new Set(['S03', 'S04', 'S05', 'S06', 'S07', ...RENEWAL_B
  * @returns {ReadonlyArray<string>} the actions that apply to the boundary in this mode
  */
 const actionsFor = (boundary, mode) => {
+  if (boundary === 'S18')
+    return mode === 'final'
+      ? [RELEASE_ACTIONS[0], RELEASE_ACTIONS[1], RELEASE_ACTIONS[4]]
+      : [RELEASE_ACTIONS[2], RELEASE_ACTIONS[3]]
   if (mode === 'final') return FINAL_ACTIONS
-  if (boundary === 'S18') return [RELEASE_ACTIONS[2], RELEASE_ACTIONS[3], RELEASE_ACTIONS[5]]
   return RELEASE_ACTIONS
 }
 
@@ -330,8 +334,7 @@ const manifestOf =
       if (!['S09', 'S17', 'S18'].includes(boundary))
         expected.push(frame({ get: 'G', normal: 'P', final: 'F' }[mode], 1n, true))
     } else if (action === RELEASE_ACTIONS[1] && mode !== 'final') expected.push(...reconnect())
-    else if (action === RELEASE_ACTIONS[2] && mode === 'normal' && boundary !== 'S18')
-      expected.push(frame('F', 1n))
+    else if (action === RELEASE_ACTIONS[2] && mode === 'normal') expected.push(frame('F', 1n))
     else if (action === RELEASE_ACTIONS[5]) expected.push(...reconnect())
     return expected
   }

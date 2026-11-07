@@ -147,8 +147,10 @@ describe('release catalogue', () => {
     ],
     final: ['S10', 'S11', 'S12', 'S13', 'S14', 'S15', 'S16', 'S17', 'S18'],
   }
-  const actions = (boundary, mode) =>
-    mode === 'final' ? 4 : boundary === 'S18' ? 3 : RELEASE_ACTIONS.length
+  const actions = (boundary, mode) => {
+    if (boundary === 'S18') return mode === 'final' ? 3 : 2
+    return mode === 'final' ? 4 : RELEASE_ACTIONS.length
+  }
   const expected = Object.entries(modes).reduce(
     (sum, [mode, ids]) => sum + ids.reduce((inner, id) => inner + actions(id, mode), 0),
     0
