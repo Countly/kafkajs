@@ -3739,17 +3739,22 @@ describe('Share soak natural exit observations', () => {
   })
 
   test.each([
+    ['short', 1020000],
+    ['full', 1980000],
+  ])('rejects inclusive total +1 regardless of passing summary values for %s', (mode, totalMs) => {
+    const facts = observation()
+    facts.completedAt = totalMs - 1
+    facts.exitedAt = totalMs + 1
+    const budget = SHARE_SOAK.budgets[mode]
+    expect(facts.exitedAt - facts.completedAt).toBeLessThanOrEqual(budget.exitMs)
+    expect(shareSoakNaturalExit(facts, budget)).toBe(false)
+  })
+
+  test.each([
     [
       'post-cleanup +10001',
       (o) => {
         o.exitedAt++
-      },
-    ],
-    [
-      'inclusive total +1',
-      (o) => {
-        o.completedAt = 539999
-        o.exitedAt = 540001
       },
     ],
     [
@@ -4696,6 +4701,7 @@ describe('Share soak complete original-owner schedules', () => {
     let replayDue
     const verifierStarts = []
     const seenMembers = new Map()
+    const assignedMembers = new Set()
     const assignment = (id) => {
       const ids = [...members.keys()]
       return [{ topic, partitions: ids.length < 2 ? [0, 1, 2] : id === ids[0] ? [0, 1] : [2] }]
@@ -4703,7 +4709,7 @@ describe('Share soak complete original-owner schedules', () => {
     const wireAssignment = (id) => ({
       topicPartitions: assignment(id).map(({ partitions }) => ({ topicId: SOAK_UUID, partitions })),
     })
-    cluster.answer('ShareGroupHeartbeat', (fields) => {
+    cluster.answer('ShareGroupHeartbeat', async (fields) => {
       if (fields.memberEpoch === -1) {
         members.delete(fields.memberId)
         return {
@@ -4716,9 +4722,16 @@ describe('Share soak complete original-owner schedules', () => {
       }
       members.set(fields.memberId, true)
       if (!seenMembers.has(fields.memberId)) seenMembers.set(fields.memberId, performance.now())
-      const waiting =
-        performance.now() - seenMembers.get(fields.memberId) <
-        5000 + (driver.lastCycle?.members.aLeft ? assignmentDelay : 0)
+      const waiting = performance.now() - seenMembers.get(fields.memberId) < 5000
+      if (!waiting && !assignedMembers.has(fields.memberId)) {
+        assignedMembers.add(fields.memberId)
+        // Delay the first assignment reply without requiring a heartbeat beyond the join bound.
+        if (
+          assignmentDelay &&
+          (driver.lastCycle?.members.aLeft || owner.counts.cycles === SHARE_SOAK.cycles)
+        )
+          await new Promise((resolve) => setTimeout(resolve, assignmentDelay))
+      }
       return {
         errorCode: 0,
         memberId: fields.memberId,
@@ -5348,13 +5361,31 @@ describe('Share soak complete original-owner schedules', () => {
   }, 120000)
 
   test('starts each complete window only after delayed original assignment and fetching', async () => {
-    const { result, error, rows } = await schedule({ assignmentDelay: 2000 })
+    const { owner, result, error, rows } = await schedule({ assignmentDelay: 2000 })
     expect(error).toBeUndefined()
     expect(result.ok).toBe(true)
-    for (const { verifier } of rows.filter(({ event }) => event === 'soak-cycle')) {
+    const cycles = rows.filter(({ event }) => event === 'soak-cycle')
+    expect(cycles).toHaveLength(30)
+    for (const { verifier } of [...cycles, owner.final]) {
       const start = verifier.events.find(({ kind }) => kind === 'window-start')
       const end = verifier.events.find(({ kind }) => kind === 'window-end')
-      expect(start.at - verifier.openedAt).toBeGreaterThanOrEqual(2000)
+      const assigned = verifier.provenance.heartbeats.find(
+        ({ memberId, response }) =>
+          memberId === verifier.memberId &&
+          response?.assignment?.topicPartitions.some(({ partitions }) => partitions.length > 0)
+      )
+      expect(assigned).toBeDefined()
+      expect(assigned.answeredAt - assigned.at).toBeGreaterThanOrEqual(2000)
+      expect(start.at - verifier.openedAt).toBeGreaterThanOrEqual(7000)
+      expect(
+        verifier.provenance.exchanges
+          .filter(({ apiKey, memberId }) => apiKey === 78 && memberId === verifier.memberId)
+          .flatMap(({ frames }) => frames)
+          .some(
+            ({ at, answeredAt, responseBytes }) =>
+              responseBytes && at >= assigned.answeredAt && answeredAt <= start.at
+          )
+      ).toBe(true)
       expect(end.at - start.at).toBeGreaterThanOrEqual(5000)
     }
   }, 120000)
