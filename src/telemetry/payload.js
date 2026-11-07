@@ -1,6 +1,6 @@
 const gzip = require('../protocol/message/compression/gzip')
 const zstd = require('../protocol/message/compression/zstd')
-const { encodeMetricsData, measureMetricsData } = require('./otlp')
+const otlp = require('./otlp')
 
 /** Orders complete omission groups without changing the collector sample.
  * @param {Array} points immutable point list @returns {Array<Array>} connection, numeric node pairs, custom
@@ -100,7 +100,7 @@ class TelemetryPayload {
     let sizeProbes = 0
     while (low < high) {
       const mid = Math.ceil((low + high) / 2)
-      const measured = measureMetricsData(snapshot, groups.slice(0, mid).flat())
+      const measured = otlp.measureMetricsData(snapshot, groups.slice(0, mid).flat())
       sizeProbes += 1
       if (measured <= cap) {
         low = mid
@@ -109,7 +109,7 @@ class TelemetryPayload {
     }
     const points = groups.slice(0, low).flat()
     const size = lowSize
-    const raw = encodeMetricsData(snapshot, { points, maxBytes: cap })
+    const raw = otlp.encodeMetricsData(snapshot, { points, maxBytes: cap })
     if (raw.length !== size) throw new RangeError('Telemetry size changed')
     const includedIdentities = points.map((p) => p.identity)
     const included = new Set(includedIdentities)

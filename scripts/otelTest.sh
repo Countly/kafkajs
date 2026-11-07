@@ -34,6 +34,7 @@ run_tests() {
   fi
 }
 
+# Includes the mandatory O17–O19 meter/span/context/getter/logger containment matrix.
 run_tests --test test/*.test.js
 
 # Each file runs in its own process: a loader or a registration hook applies to a whole process.

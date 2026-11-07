@@ -18,6 +18,23 @@ const { ATTR_ERROR_TYPE } = require('@opentelemetry/semantic-conventions')
 const instrumentationExports = require('../src/instrumentation')
 const { OPERATIONS, assertContained, createHarness } = require('./failureContainmentHelpers')
 
+// This lane installs the packed client before loading any instrumentation.
+it('O17 O18 O19 use the byte-identical regular packed candidate', () => {
+  const candidate = path.resolve(__dirname, '../node_modules/@countly/kafkajs')
+  assert.ok(fs.lstatSync(candidate).isDirectory())
+  assert.strictEqual(fs.lstatSync(candidate).isSymbolicLink(), false)
+  for (const file of [
+    'src/telemetry/client.js',
+    'src/telemetry/payload.js',
+    'src/telemetry/factory.js',
+    'src/network/connection.js',
+  ])
+    assert.deepStrictEqual(
+      fs.readFileSync(path.join(candidate, file)),
+      fs.readFileSync(path.resolve(__dirname, '../..', file))
+    )
+})
+
 const ASYNC = ['resolve', 'reject', 'throw']
 const SYNC = ['resolve', 'throw']
 const FAILING = ['reject', 'throw']

@@ -272,3 +272,29 @@ describe('broker telemetry fixture documentation', () => {
     )
   })
 })
+
+describe('telemetry lifecycle documentation', () => {
+  const read = (path) =>
+    require('node:fs').readFileSync(require('node:path').resolve(__dirname, '../..', path), 'utf8')
+  test('testing describes public identity and delayed callback schedules', () => {
+    const text = read('docs/Testing.md')
+    expect(text).toContain('### Telemetry lifecycle and outcome schedules')
+    expect(text).toContain('request bytes and captured identities together')
+    expect(text).toContain('delayed timer delivery')
+    expect(text).toContain('do not prove broker export or native resource bounds')
+  })
+  test('guide preserves bounded best effort and original outcomes', () => {
+    const text = read('docs/ClientTelemetry.md')
+    expect(text).toContain('## Lifecycle and observation checks')
+    expect(text).toContain('A zero close budget sends no final push.')
+    expect(text).toContain('the normal push must succeed')
+    expect(text).toContain(
+      'do not change foreground results, rejections or handler invocation counts'
+    )
+  })
+  test('creator changelog is present', () => {
+    expect(read('CHANGELOG.md')).toContain(
+      'Add deterministic lifecycle, shutdown and observer-failure schedules for client telemetry.'
+    )
+  })
+})
