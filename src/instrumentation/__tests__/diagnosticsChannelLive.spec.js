@@ -1,7 +1,7 @@
 const diagnosticsChannel = require('node:diagnostics_channel')
 const { Kafka, logLevel } = require('../../../index')
 const { createTopic, plainTextBrokers, secureRandom, writeEvidence } = require('testHelpers')
-const { waitForCondition, withTimeout } = require('../../consumer/__tests__/fixtures/liveScenario')
+const { waitForCondition } = require('../../consumer/__tests__/fixtures/liveScenario')
 const { runRecipe } = require('./fixtures/metricsRecipe')
 const net = require('net')
 const { isDeepStrictEqual } = require('util')
@@ -21,7 +21,11 @@ const {
 } = require('../../../testHelpers/shareLiveDiagnostics')
 const { readLog } = require('../../../testHelpers/rawLog')
 const { createResourceProbe } = require('../../../testHelpers/resourceProbe')
+const RequestQueue = require('../../network/requestQueue')
+const InstrumentationEventEmitter = require('../emitter')
+const { ShareAckLedger } = require('../../consumer/share/shareAckLedger')
 const {
+  CASE_JOIN_MS,
   NEVER,
   bounded,
   caseTimeout,
@@ -39,6 +43,11 @@ const EVIDENCE = 'diagnostics-channel'
 // Named so each wait says how long it is prepared to be wrong for.
 const SCENARIO_BUDGET_MS = 60000
 const DISCONNECT_BUDGET_MS = 15000
+const FILE_BUDGET_MS = 210000
+const HOOK_MS = 10000
+const ORDINARY_CLEANUP_MS = 34000
+const FINAL_MS = 10000
+let fileDeadline = null
 const WAIT_BUDGET = { attempts: 120, delay: 250 } // 30 s
 const MESSAGES = 20
 const CHANNELS = [
@@ -46,6 +55,40 @@ const CHANNELS = [
   'kafkajs.consumer.fetch',
   'kafkajs.consumer.end_batch_process',
 ]
+
+/**
+ * Limits every selected phase to the original file deadline, including its remaining reserves.
+ * @param {number} limit The phase limit in milliseconds.
+ * @param {number} [reserve] Time retained for joins and later phases.
+ * @returns {number} The phase's remaining allowance.
+ * @throws {Error} When the selection has no time left outside its reserves.
+ */
+const diagnosticsBudget = (limit, reserve = CASE_JOIN_MS) => {
+  const remaining = fileDeadline - performance.now() - reserve
+  if (!(remaining > 0)) {
+    const error = new Error('The diagnostics file deadline has expired')
+    liveRun.taint(error)
+    throw error
+  }
+  return Math.min(limit, remaining)
+}
+
+/**
+ * Contains an ordinary phase failure in the same run as the share case.
+ * @param {Function} body The bounded phase whose arguments and rejection are preserved.
+ * @returns {Function} An awaited phase that taints the run before forwarding a failure.
+ * @throws {unknown} The original phase error.
+ */
+const containDiagnosticsPhase =
+  (body) =>
+  async (...args) => {
+    try {
+      return await body(...args)
+    } catch (error) {
+      liveRun.taint(error)
+      throw error
+    }
+  }
 
 /**
  * Live proof that the instrumentation events reach `node:diagnostics_channel` subscribers from real
@@ -56,7 +99,7 @@ const CHANNELS = [
 describeChannelsLive('Instrumentation > diagnostics channels (live)', () => {
   /** @type {{ channel: string, type: string, payload: object }[]} */
   const published = []
-  const clients = []
+  const cleanup = new CleanupStack()
   let recipe
 
   /** Records what a channel delivers, with the type as it is when it is published. */
@@ -64,86 +107,130 @@ describeChannelsLive('Instrumentation > diagnostics channels (live)', () => {
     published.push({ channel, type: message.type, payload: message.payload })
   const subscribers = CHANNELS.map((channel) => [channel, record(channel)])
 
-  beforeAll(() => {
-    recipe = runRecipe()
-    for (const [channel, onMessage] of subscribers) {
-      diagnosticsChannel.subscribe(channel, onMessage)
-    }
-  })
+  beforeAll(
+    containDiagnosticsPhase(() => {
+      fileDeadline ??= performance.now() + FILE_BUDGET_MS
+      return bounded(NEVER, diagnosticsBudget(HOOK_MS - CASE_JOIN_MS), () => {
+        liveRun.assertClean()
+        cleanup.add('stop metrics recipe', () => recipe?.stop())
+        recipe = runRecipe()
+        for (const [channel, onMessage] of subscribers) {
+          cleanup.add(`unsubscribe ${channel}`, () =>
+            diagnosticsChannel.unsubscribe(channel, onMessage)
+          )
+          diagnosticsChannel.subscribe(channel, onMessage)
+        }
+      })
+    }),
+    HOOK_MS
+  )
 
-  afterAll(async () => {
-    for (const [channel, onMessage] of subscribers) {
-      diagnosticsChannel.unsubscribe(channel, onMessage)
-    }
-    recipe.stop()
-    for (const client of clients.reverse()) {
-      await withTimeout(
-        client.disconnect().catch(() => {}),
-        DISCONNECT_BUDGET_MS
-      )
-    }
-  }, SCENARIO_BUDGET_MS)
+  afterAll(
+    containDiagnosticsPhase(async () => {
+      const failures = await cleanup.closeAll({
+        budgetMs: diagnosticsBudget(ORDINARY_CLEANUP_MS, FINAL_MS + CASE_JOIN_MS),
+      })
+      if (failures.length) throw new AggregateError(failures, 'Diagnostics cleanup failed')
+      liveRun.takeAdmission()
+    }),
+    caseTimeout(ORDINARY_CLEANUP_MS)
+  )
 
   test(
     'a round trip reaches the channels with public event names, and the recipe counts what was consumed',
-    async () => {
-      const topic = `e2e-p8-diagnostics-channel-${secureRandom()}`
-      await createTopic({ topic, partitions: 3 })
-      const kafka = new Kafka({
-        clientId: `e2e-p8-diagnostics-channel-${secureRandom()}`,
-        brokers: plainTextBrokers(),
-        logLevel: logLevel.NOTHING,
-      })
-      const producer = kafka.producer()
-      const consumer = kafka.consumer({ groupId: `e2e-p8-diagnostics-channel-${secureRandom()}` })
-      clients.push(producer, consumer)
-      let consumed = 0
+    liveCase(
+      SCENARIO_BUDGET_MS - CASE_JOIN_MS,
+      containDiagnosticsPhase((signal) =>
+        bounded(
+          signal,
+          diagnosticsBudget(
+            SCENARIO_BUDGET_MS - CASE_JOIN_MS,
+            ORDINARY_CLEANUP_MS + FINAL_MS + CASE_JOIN_MS
+          ),
+          async (scope) => {
+            const topic = `e2e-p8-diagnostics-channel-${secureRandom()}`
+            await bounded(scope, Infinity, () => createTopic({ topic, partitions: 3 }))
+            const kafka = new Kafka({
+              clientId: `e2e-p8-diagnostics-channel-${secureRandom()}`,
+              brokers: plainTextBrokers(),
+              logLevel: logLevel.NOTHING,
+            })
+            const producer = kafka.producer()
+            const consumer = kafka.consumer({
+              groupId: `e2e-p8-diagnostics-channel-${secureRandom()}`,
+            })
+            for (const client of [producer, consumer]) {
+              cleanup.add('disconnect diagnostics client', (signal) =>
+                bounded(signal, DISCONNECT_BUDGET_MS, () => client.disconnect())
+              )
+            }
+            let consumed = 0
 
-      await producer.connect()
-      await producer.send({
-        topic,
-        messages: Array.from({ length: MESSAGES }, (_, index) => ({ value: `message-${index}` })),
-      })
-      await consumer.connect()
-      await consumer.subscribe({ topics: [topic], fromBeginning: true })
-      await consumer.run({
-        eachMessage: async () => {
-          consumed += 1
-        },
-      })
-      await waitForCondition(() => consumed >= MESSAGES, WAIT_BUDGET)
-      const total = () =>
-        recipe
-          .metric('kafkajs_consumer_messages_total')
-          .samples.reduce((sum, { value }) => sum + value, 0)
-      await waitForCondition(() => total() >= MESSAGES, WAIT_BUDGET)
+            await bounded(scope, Infinity, () => producer.connect())
+            await bounded(scope, Infinity, () =>
+              producer.send({
+                topic,
+                messages: Array.from({ length: MESSAGES }, (_, index) => ({
+                  value: `message-${index}`,
+                })),
+              })
+            )
+            await bounded(scope, Infinity, () => consumer.connect())
+            await bounded(scope, Infinity, () =>
+              consumer.subscribe({ topics: [topic], fromBeginning: true })
+            )
+            await bounded(scope, Infinity, () =>
+              consumer.run({
+                eachMessage: async () => {
+                  consumed += 1
+                },
+              })
+            )
+            await bounded(scope, Infinity, () =>
+              waitForCondition(() => consumed >= MESSAGES, WAIT_BUDGET)
+            )
+            const total = () =>
+              recipe
+                .metric('kafkajs_consumer_messages_total')
+                .samples.reduce((sum, { value }) => sum + value, 0)
+            await bounded(scope, Infinity, () =>
+              waitForCondition(() => total() >= MESSAGES, WAIT_BUDGET)
+            )
+            scope.throwIfAborted()
 
-      const on = (channel) => published.filter((event) => event.channel === channel)
-      writeEvidence(EVIDENCE, {
-        scenario: 'round-trip',
-        events: Object.fromEntries(CHANNELS.map((channel) => [channel, on(channel).length])),
-        producerApis: [...new Set(on(CHANNELS[0]).map(({ payload }) => payload.apiName))],
-        consumed,
-        recipeMessages: total(),
-      })
+            const on = (channel) => published.filter((event) => event.channel === channel)
+            writeEvidence(EVIDENCE, {
+              scenario: 'round-trip',
+              events: Object.fromEntries(CHANNELS.map((channel) => [channel, on(channel).length])),
+              producerApis: [...new Set(on(CHANNELS[0]).map(({ payload }) => payload.apiName))],
+              consumed,
+              recipeMessages: total(),
+            })
 
-      for (const channel of CHANNELS) {
-        expect(on(channel).length).toBeGreaterThan(0)
-        expect(on(channel).every(({ type }) => type === channel.replace('kafkajs.', ''))).toBe(true)
-      }
-      expect(on(CHANNELS[0]).map(({ payload }) => payload.apiName)).toContain('Produce')
-      expect(on(CHANNELS[1]).every(({ payload }) => typeof payload.duration === 'number')).toBe(
-        true
+            for (const channel of CHANNELS) {
+              expect(on(channel).length).toBeGreaterThan(0)
+              expect(
+                on(channel).every(({ type }) => type === channel.replace('kafkajs.', ''))
+              ).toBe(true)
+            }
+            expect(on(CHANNELS[0]).map(({ payload }) => payload.apiName)).toContain('Produce')
+            expect(
+              on(CHANNELS[1]).every(({ payload }) => typeof payload.duration === 'number')
+            ).toBe(true)
+            expect(consumed).toBe(MESSAGES)
+            expect(total()).toBe(MESSAGES)
+            expect(
+              recipe
+                .metric('kafkajs_requests_total')
+                .samples.some(
+                  ({ labels }) => labels.kind === 'producer' && labels.api === 'Produce'
+                )
+            ).toBe(true)
+          }
+        )
       )
-      expect(consumed).toBe(MESSAGES)
-      expect(total()).toBe(MESSAGES)
-      expect(
-        recipe
-          .metric('kafkajs_requests_total')
-          .samples.some(({ labels }) => labels.kind === 'producer' && labels.api === 'Produce')
-      ).toBe(true)
-    },
-    SCENARIO_BUDGET_MS
+    ),
+    caseTimeout(SCENARIO_BUDGET_MS - CASE_JOIN_MS)
   )
 })
 
@@ -325,8 +412,8 @@ const resourceSummary = (snapshot) => ({
 })
 
 /**
- * Logs every request frame the clients of one case write and counts their sockets and unanswered
- * requests from the bytes actually written and read. Every byte passes through untouched.
+ * Logs every request frame the clients of one case write and counts their original sockets.
+ * Every byte passes through untouched.
  */
 class SocketLedger {
   /** Starts with no sockets. */
@@ -348,24 +435,8 @@ class SocketLedger {
    */
   open(host, port, onConnect) {
     const socket = net.connect({ host, port }, onConnect)
-    const entry = { socket, answered: 0, carry: Buffer.alloc(0) }
-    socket.on('data', (chunk) => this.read(entry, chunk))
-    this.entries.push(entry)
+    this.entries.push({ socket })
     return socket
-  }
-
-  /**
-   * @param {{ answered: number, carry: Buffer }} entry the socket's bookkeeping
-   * @param {Buffer} chunk the next bytes the broker sent on it
-   * @returns {void} counts the response frames the chunk completed
-   */
-  read(entry, chunk) {
-    let bytes = Buffer.concat([entry.carry, chunk])
-    while (bytes.length >= 4 && bytes.length >= 4 + bytes.readInt32BE(0)) {
-      bytes = bytes.subarray(4 + bytes.readInt32BE(0))
-      entry.answered++
-    }
-    entry.carry = bytes
   }
 
   /** @returns {{ created: number, destroyed: number }} sockets opened and since destroyed */
@@ -374,19 +445,6 @@ class SocketLedger {
       created: this.entries.length,
       destroyed: this.entries.filter(({ socket }) => socket.destroyed).length,
     }
-  }
-
-  /** @returns {number} requests written on live sockets that have no response yet */
-  pending() {
-    return this.entries.reduce(
-      (total, { socket, answered }, index) =>
-        socket.destroyed
-          ? total
-          : total +
-            this.log.frames.filter(({ connection }) => connection === index + 1).length -
-            answered,
-      0
-    )
   }
 
   /** @returns {object[]} every share request frame written, with its header facts */
@@ -402,6 +460,136 @@ class SocketLedger {
   }
 }
 
+/** Runs strict cleanup with the allowance left when cleanup actually begins. */
+class FileCleanupStack extends CleanupStack {
+  /**
+   * @returns {Promise<Error[]>} Failed cleanups, including an exhausted file deadline, so the
+   *   original work failure remains primary. No cleanup starts after the file allowance expires.
+   */
+  async closeAll() {
+    try {
+      return await super.closeAll({
+        budgetMs: diagnosticsBudget(SHARE_CLEANUP_MS, FINAL_MS + CASE_JOIN_MS),
+      })
+    } catch (error) {
+      liveRun.taint(error)
+      return [error]
+    }
+  }
+}
+
+/** Observes original resource owners without changing method results or receiver identities. */
+class ResourceGauge {
+  /** Retains owners until after the cleanup comparison, including destroyed connections. */
+  constructor() {
+    this.ledgers = new Set()
+    this.queues = new Set()
+    this.emitters = new Set()
+    this.restores = []
+  }
+
+  /** @returns {void} Installs call-through observers before clients are constructed. */
+  install() {
+    this.watch(
+      ShareAckLedger.prototype,
+      [
+        'canStart',
+        'decide',
+        'complete',
+        'completeRange',
+        'dropExpired',
+        'needsFlush',
+        'prepare',
+        'settle',
+        'invalidate',
+      ],
+      this.ledgers
+    )
+    this.watch(
+      RequestQueue.prototype,
+      ['push', 'scheduleRequestTimeoutCheck', 'waitForPendingRequests', 'destroy'],
+      this.queues
+    )
+    this.watch(InstrumentationEventEmitter.prototype, ['addListener', 'emit'], this.emitters)
+  }
+
+  /**
+   * @param {object} prototype Original class prototype.
+   * @param {string[]} names Methods to observe.
+   * @param {Set<object>} seen Original receivers retained for measurement.
+   * @returns {void}
+   */
+  watch(prototype, names, seen) {
+    for (const name of names) {
+      const original = prototype[name]
+      prototype[name] = function (...args) {
+        seen.add(this)
+        return original.apply(this, args)
+      }
+      this.restores.push(() => {
+        prototype[name] = original
+      })
+    }
+  }
+
+  /** @returns {void} Restores observers only after the final resource proof. */
+  uninstall() {
+    for (const restore of this.restores.splice(0).reverse()) restore()
+    this.ledgers.clear()
+    this.queues.clear()
+    this.emitters.clear()
+  }
+
+  /** @returns {number} Entries still held by original ledgers, including retired acquisitions. */
+  ledgerSize() {
+    return [...this.ledgers].reduce((total, ledger) => total + ledger.size, 0)
+  }
+
+  /** @returns {number} Pending and in-flight requests, regardless of socket destruction. */
+  queueDepth() {
+    return [...this.queues].reduce(
+      (total, queue) => total + queue.pending.length + queue.inflight.size,
+      0
+    )
+  }
+
+  /**
+   * @param {Iterable<import('events').EventEmitter>} emitters Original client or queue emitters.
+   * @returns {number} Listeners over every event of every retained emitter.
+   */
+  listenerCount(emitters) {
+    let total = 0
+    for (const emitter of emitters)
+      for (const event of emitter.eventNames()) total += emitter.listenerCount(event)
+    return total
+  }
+
+  /**
+   * @param {object} sources Socket, process-listener and event-loop measurements.
+   * @returns {{ snapshot: () => Promise<object> }} Probe with fixed keys and measured owner totals.
+   */
+  probe(sources) {
+    const probe = createResourceProbe({
+      ...sources,
+      queueDepth: () => this.queueDepth(),
+      ledgerSize: () => this.ledgerSize(),
+    })
+    return {
+      snapshot: async () => {
+        const snapshot = await probe.snapshot()
+        return {
+          ...snapshot,
+          listeners: {
+            ...snapshot.listeners,
+            clients: this.listenerCount([...this.emitters].map(({ emitter }) => emitter)),
+            queues: this.listenerCount(this.queues),
+          },
+        }
+      },
+    }
+  }
+}
+
 /**
  * One live run of the share diagnostics scenario: a share member reads twenty fixed records while
  * all eighteen share channels are subscribed by their public names and the same events are also
@@ -414,15 +602,13 @@ class ShareDiagnosticsCase {
     this.nonce = secureRandom(6)
     this.topic = shareTopicName('diagnostics')
     this.group = `e2e-p9e-diagnostics-group-${this.nonce}`
-    this.stack = new CleanupStack()
+    this.stack = new FileCleanupStack()
     this.ledger = new SocketLedger()
     this.acknowledgements = new ShareAcknowledgementObserver()
-    this.openHandlers = 0
-    this.probe = createResourceProbe({
+    this.gauge = new ResourceGauge()
+    this.probe = this.gauge.probe({
       emitters: { process },
       sockets: () => this.ledger.counts(),
-      queueDepth: () => this.ledger.pending(),
-      ledgerSize: () => this.openHandlers,
       activeResources: true,
     })
     this.channels = Object.keys(SHARE_PAYLOADS).map((suffix) => ({
@@ -500,17 +686,15 @@ class ShareDiagnosticsCase {
    * @throws {Error} the first assertion or fixture failure, with cleanup failures attached
    */
   async run(scope) {
+    this.gauge.install()
     this.acknowledgements.install()
     try {
-      await this.stack.run(
-        async () => {
-          await this.setup(scope)
-          await this.deliver(scope)
-          await this.observe(scope)
-          await this.finish(scope)
-        },
-        { budgetMs: SHARE_CLEANUP_MS }
-      )
+      await this.stack.run(async () => {
+        await this.setup(scope)
+        await this.deliver(scope)
+        await this.observe(scope)
+        await this.finish(scope)
+      })
       await this.complete(scope)
     } catch (error) {
       this.row('case-failed', {
@@ -522,6 +706,7 @@ class ShareDiagnosticsCase {
       throw error
     } finally {
       this.acknowledgements.restore()
+      this.gauge.uninstall()
     }
   }
 
@@ -576,8 +761,11 @@ class ShareDiagnosticsCase {
     this.beforeAdmin = await captureShareCleanupBaseline(this.probe, { signal: scope })
     this.baseline = this.beforeAdmin
     this.admin = this.client('admin').admin()
-    this.admin.on(this.admin.events.REQUEST, ({ payload }) => this.requests.push(payload))
     this.stack.add('prove cleanup and disconnect admin', (signal) => this.cleanup(signal))
+    this.stack.add(
+      'remove admin listeners',
+      this.admin.on(this.admin.events.REQUEST, ({ payload }) => this.requests.push(payload))
+    )
     this.stack.add('delete topic', (signal) => this.deleteTopic(signal))
     this.stack.add('delete group', (signal) => this.deleteGroup(signal))
     this.stack.add('reset group configs', (signal) => this.resetConfigs(signal))
@@ -612,7 +800,10 @@ class ShareDiagnosticsCase {
     this.row('resource-baseline', { snapshot: this.baseline })
 
     this.producer = this.client('producer').producer({ idempotent: true })
-    this.producer.on(this.producer.events.REQUEST, ({ payload }) => this.requests.push(payload))
+    this.stack.add(
+      'remove producer listeners',
+      this.producer.on(this.producer.events.REQUEST, ({ payload }) => this.requests.push(payload))
+    )
     this.stack.add('disconnect producer', () => this.producer.disconnect())
     await bounded(scope, 15000, () => this.producer.connect())
   }
@@ -648,12 +839,7 @@ class ShareDiagnosticsCase {
     await bounded(scope, 20000, () =>
       consumer.run({
         eachMessage: async ({ topic, partition, message }) => {
-          this.openHandlers++
-          try {
-            this.entries.push(shareRecordIdentity({ ...message, topic, partition }))
-          } finally {
-            this.openHandlers--
-          }
+          this.entries.push(shareRecordIdentity({ ...message, topic, partition }))
         },
       })
     )
@@ -958,6 +1144,8 @@ class ShareDiagnosticsCase {
       { delayMs: 50, label: 'The admin sockets closing' }
     )
     this.row('cleanup', { snapshot: await bounded(scope, 10000, () => this.probe.snapshot()) })
+    liveRun.assertClean()
+    diagnosticsBudget(Infinity)
     this.row('case-complete', {
       status: 'passed',
       tainted: false,
@@ -985,16 +1173,24 @@ class ShareDiagnosticsCase {
 
 describeShareChannelsLive('Instrumentation > share diagnostics channels (live)', () => {
   beforeAll(
-    () =>
-      bounded(NEVER, SHARE_HOOK_MS - 2000, () => {
+    containDiagnosticsPhase(() => {
+      fileDeadline ??= performance.now() + FILE_BUDGET_MS
+      return bounded(NEVER, diagnosticsBudget(SHARE_HOOK_MS - CASE_JOIN_MS), () => {
         liveRun.assertClean()
-      }),
+      })
+    }),
     SHARE_HOOK_MS
   )
 
   test(
     SHARE_TITLE,
-    liveCase(SHARE_BUDGET_MS, (scope) => new ShareDiagnosticsCase().run(scope)),
+    liveCase(SHARE_BUDGET_MS, (scope) =>
+      bounded(
+        scope,
+        diagnosticsBudget(SHARE_BUDGET_MS, SHARE_CLEANUP_MS + FINAL_MS + CASE_JOIN_MS),
+        (signal) => new ShareDiagnosticsCase().run(signal)
+      )
+    ),
     caseTimeout(SHARE_BUDGET_MS)
   )
 
