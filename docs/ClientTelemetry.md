@@ -300,3 +300,11 @@ The local live guard owns its reserved project. Ephemeral CI uses a unique proje
 Telemetry work belongs to the connection episode that created it. Disconnect invalidates ordinary telemetry work immediately. An eligible captured close may send one final push on its already connected telemetry socket, within the original remaining close budget and the telemetry limit of 1000 ms. A zero close budget sends no final push. This best-effort attempt has no delivery guarantee and does not reconnect or retry.
 
 An explicit reconnect keeps the accepted client instance ID and uses fresh local authority. A successful subscription response alone does not establish a reopened stream; the normal push must succeed. Telemetry observers, encoders, codecs and loggers do not change foreground results, rejections or handler invocation counts. The lifecycle checks include late callbacks and repeated identity values. Application rebalance-hook failures retain their documented behavior.
+
+## Performance evidence
+
+Telemetry is opt-in through `enableMetricsPush`. Benchmark evidence compares disabled observation with the accepted previous snapshot and enabled observation with the same candidate's disabled arm. Serialization uses production-validated descriptors and the configured byte cap. Reports contain actual encoded byte lengths, complete point identities and any omissions; the configured cap is not an expected payload size.
+
+A20/A31 measured acceptance is pending P10 CI measurements. This driver-only delivery still requires F08 configured-outcome evidence, an accepted previous baseline, final public lifecycle delivery and the reviewed broker-guard adapter.
+
+The benchmark suite uses separate request, serialization and delivery workloads. It keeps message counts separate from batch callbacks and actual delivery-gap samples. Noise controls, full identity checks and same-path overhead controls must pass before a measured comparison is valid. The driver spec checks correctness without asserting elapsed-time limits. See the Testing guide for session evidence and CI execution. No measured tuning recommendation follows from a broker-free test pass.

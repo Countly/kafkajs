@@ -25,6 +25,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Verify captured telemetry request identities and complete bodies, startup-failure cleanup, concurrent public commits and original rejection outcomes. Run optional OpenTelemetry containment against the byte-identical packed client in CI.
 - Add deterministic lifecycle, shutdown and observer-failure schedules for client telemetry.
 - Bound telemetry schedule cleanup and await operation settlement before lifecycle assertions.
+- Measure telemetry observation, bounded serialization and end-to-end overhead with independent work and identity controls.
 
 #### Behavior changes
 

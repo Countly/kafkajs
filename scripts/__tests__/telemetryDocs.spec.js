@@ -298,3 +298,51 @@ describe('telemetry lifecycle documentation', () => {
     )
   })
 })
+
+describe('telemetry benchmark documentation', () => {
+  const fs = require('node:fs')
+  const path = require('node:path')
+  const read = (name) => fs.readFileSync(path.resolve(__dirname, '../..', name), 'utf8')
+
+  test('registers the single driver and exact broker free spec', () => {
+    const scripts = JSON.parse(read('package.json')).scripts
+    expect(scripts['bench:telemetry']).toBe('node --expose-gc scripts/benchmarks/telemetry.js')
+    const pattern = 'scripts/benchmarks/__tests__/telemetry\\.spec\\.js$'
+    for (const name of ['test:unit', 'test:coverage:unit']) {
+      expect(scripts[name].split(`'${pattern}'`)).toHaveLength(2)
+      expect(scripts[name]).not.toContain("'scripts/benchmarks/.*'")
+    }
+    expect(new RegExp(pattern).test('scripts/benchmarks/__tests__/telemetry.spec.js')).toBe(true)
+    expect(new RegExp(pattern).test('scripts/benchmarks/__tests__/telemetryXspecXjs')).toBe(false)
+    expect(new RegExp(pattern).test('scripts/benchmarks/__tests__/telemetryLive.spec.js')).toBe(
+      false
+    )
+  })
+
+  test('documents actual denominators noise and independent evidence', () => {
+    const text = read('docs/Testing.md')
+    expect(text).toContain('### Telemetry benchmark evidence')
+    expect(text).toContain('A20/A31 measured acceptance remains pending P10 CI measurements')
+    expect(text).toContain('reviewed broker-guard adapter')
+    expect(text).toContain('CPU or throughput noise above 3%, or p99 noise above 5%')
+    expect(text).toContain('completed correlated pairs')
+    expect(text).toContain('128 validated custom series plus 129 built-ins')
+    expect(text).toContain('raw broker commits are independent checks')
+    expect(text).toContain('no performance timing assertions')
+  })
+
+  test('retains opt in and makes no unit derived performance claim', () => {
+    const text = read('docs/ClientTelemetry.md')
+    expect(text).toContain('## Performance evidence')
+    expect(text).toContain('A20/A31 measured acceptance is pending P10 CI measurements')
+    expect(text).toContain('F08 configured-outcome evidence')
+    expect(text).toContain('enableMetricsPush')
+    expect(text).toContain('actual encoded byte lengths')
+    expect(text).toContain(
+      'No measured tuning recommendation follows from a broker-free test pass.'
+    )
+    expect(read('CHANGELOG.md')).toContain(
+      'Measure telemetry observation, bounded serialization and end-to-end overhead with independent work and identity controls.'
+    )
+  })
+})
