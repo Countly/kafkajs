@@ -35,7 +35,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Fixes
 
-- A broker restart no longer crashes a share consumer with "Metadata discovery completed" when a metadata notification starts a new fetch loop.
+- A broker restart no longer crashes a share consumer with "Metadata discovery completed" when a metadata notification starts a new fetch loop. Rebootstrap and request-queue-size listeners, and the queue's pending-check timer, also run independently of the publishing discovery or admin invocation.
 - A share answer that arrives from a replaced connection pool is discarded and the session reopens on the next round, instead of ending the run and losing unrelated acquisitions.
 - A failed share heartbeat preserves the healthy data socket and its acquisitions while the coordinator reconnects.
 
