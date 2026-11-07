@@ -23,6 +23,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Retain checksum-pinned telemetry fixtures and verify complete export evidence and isolated CI ownership receipts.
 - Harden telemetry cleanup deadlines, complete Push and controlled RTT evidence verification, failed-capture archives, and development/exit-gate matrix scheduling.
 - Measure telemetry observation, bounded serialization and end-to-end overhead with independent work and identity controls.
+- Defer telemetry benchmark payload decoding and capture hashing until after delivery timing, and verify inherited consume bytes through frozen manifest inputs.
 
 #### Behavior changes
 
