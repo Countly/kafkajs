@@ -2512,6 +2512,28 @@ class ShareSoakScreen {
       !ShareSoakScreen.same(point.namedListeners, baseline?.namedListeners)
     ) {
       violations.push(`${label}: resources differ or a source is absent`)
+      const report = (source, before, after) =>
+        violations.push(
+          `${label}: ${source} baseline=${JSON.stringify(before) ?? 'absent'} after=${JSON.stringify(after) ?? 'absent'}`
+        )
+      for (const name of held)
+        if (!ShareSoakScreen.count(point?.[name]) || point[name] !== 0)
+          report(name, baseline?.[name], point?.[name])
+      if (!ShareSoakScreen.count(point?.sockets?.open) || point.sockets.open !== 0)
+        report('sockets.open', baseline?.sockets?.open, point?.sockets?.open)
+      for (const source of ['activeResources', 'namedListeners']) {
+        const before = baseline?.[source]
+        const after = point?.[source]
+        if (!before || !after) report(source, before, after)
+        else
+          for (const name of new Set([...Object.keys(before), ...Object.keys(after)]))
+            if (
+              !ShareSoakScreen.count(before[name] ?? 0) ||
+              !ShareSoakScreen.count(after[name] ?? 0) ||
+              (before[name] ?? 0) !== (after[name] ?? 0)
+            )
+              report(`${source}.${name}`, before[name] ?? 0, after[name] ?? 0)
+      }
     }
   }
 

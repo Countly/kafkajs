@@ -1826,6 +1826,23 @@ describe('Share soak resource screen', () => {
     expect(ShareSoakScreen.evaluate(extra).ok).toBe(false)
   })
 
+  test('names each differing source with its baseline and quiet-point reading', () => {
+    const run = shareScreenRun()
+    run.teardown.queueDepth = 1
+    delete run.teardown.shareRanges
+    run.teardown.sockets.open = 1
+    run.teardown.activeResources.Timeout = 2
+    run.teardown.namedListeners['owner1:error'] = 1
+    expect(ShareSoakScreen.evaluate(run).violations).toEqual([
+      'teardown: resources differ or a source is absent',
+      'teardown: queueDepth baseline=0 after=1',
+      'teardown: shareRanges baseline=0 after=absent',
+      'teardown: sockets.open baseline=0 after=1',
+      'teardown: activeResources.Timeout baseline=1 after=2',
+      'teardown: namedListeners.owner1:error baseline=0 after=1',
+    ])
+  })
+
   test('refuses a listener swap that leaves the total unchanged', () => {
     const run = shareScreenRun()
     run.baseline.namedListeners = { 's:data': 1 }
@@ -4453,6 +4470,7 @@ describe('Share soak complete original-owner schedules', () => {
     assignmentDelay = 0,
     replayAt,
     drainReplay = false,
+    socketClosed = () => {},
   } = {}) => {
     const clock = new ShareClock().install()
     const exposed = globalThis.gc
@@ -4461,19 +4479,36 @@ describe('Share soak complete original-owner schedules', () => {
     const { cluster, table } = transport
     const tap = new ShareFetchTap(64, { now: () => performance.now() })
     /**
+     * Models transport reset and close even though the wire archive retains destroyed sockets.
      * Rejects destroyed-stream writes before they can apply acknowledgements at the broker.
+     * Connection removes its end listener before deliberate shutdown; destroying a live stream
+     * instead reports the injected reset, settling original requests before close releases listeners.
      * @param {object} options Socket endpoint and connection callback.
      * @returns {object} The scripted socket with asynchronous stream-write failures.
      */
     const socketFactory = (options) => {
       const socket = cluster.socketFactory(options)
+      const destroy = socket.destroy.bind(socket)
+      socket.destroy = (error) =>
+        destroy(
+          error ??
+            (socket.listenerCount('end') > 0
+              ? Object.assign(new Error('Connection reset'), { code: 'ECONNRESET' })
+              : undefined)
+        )
+      socket.once('close', () => {
+        socket.removeAllListeners()
+        socketClosed(socket)
+      })
       const write = socket.write.bind(socket)
       socket.write = (...args) => {
         if (!socket.destroyed) return write(...args)
         const error = Object.assign(new Error('Cannot call write after a stream was destroyed'), {
           code: 'ERR_STREAM_DESTROYED',
         })
-        queueMicrotask(() => socket.emit('error', error))
+        queueMicrotask(() => {
+          if (socket.listenerCount('error')) socket.emit('error', error)
+        })
         return false
       }
       return socket
@@ -4503,6 +4538,7 @@ describe('Share soak complete original-owner schedules', () => {
     let groupPresent = false
     let listingNode = 0
     let firstWindow
+    let replayDue
     const verifierStarts = []
     const seenMembers = new Map()
     const assignment = (id) => {
@@ -4592,7 +4628,7 @@ describe('Share soak complete original-owner schedules', () => {
           return () => events.off(event, listener)
         },
         connect: async () => {},
-        disconnect: async () => {},
+        disconnect: async () => io('admin-disconnect', { owner, driver, clock }),
         createTopics: async ({ topics: [created] }) => {
           topic = created.topic
           table.set(topic, {
@@ -4716,7 +4752,10 @@ describe('Share soak complete original-owner schedules', () => {
             verifierStarts.push(performance.now())
             if (replayAt !== undefined || drainReplay) {
               gate = transport.hold({ api: 'ShareFetch', node: 0 })
-              if (!drainReplay) setTimeout(() => gate.release(replay()), replayAt)
+              if (!drainReplay) {
+                replayDue = performance.now() + replayAt
+                setTimeout(() => gate.release(replay()), replayAt)
+              }
             }
           }
           return current
@@ -4818,7 +4857,10 @@ describe('Share soak complete original-owner schedules', () => {
     try {
       for (let tick = 0; tick < 5000; tick++) {
         if (done) break
-        await clock.advance(250)
+        // Drain response macrotasks at the replay boundary before advancing past the window.
+        const step = replayDue === undefined ? 250 : Math.max(0, replayDue - performance.now())
+        await clock.advance(Math.min(250, step))
+        if (performance.now() >= replayDue) replayDue = undefined
       }
       if (!done) throw new Error('The scripted schedule did not finish within its frozen envelope')
       await work
@@ -5028,13 +5070,35 @@ describe('Share soak complete original-owner schedules', () => {
     'a real verifier replay at +%i fails before another cycle can start',
     async (replayAt) => {
       const { reason, rows } = await schedule({ replayAt })
-      expect(reason).toContain('verifier')
+      expect(reason).toContain('the same-group verifier was inactive or received a record')
       const cycles = rows.filter(({ event }) => event === 'soak-cycle')
       expect(cycles.map(({ cycle }) => cycle)).toEqual([0])
       expect(cycles[0].verifier.delivered).toHaveLength(1)
+      const verifier = cycles[0].verifier
+      const start = verifier.events.find(({ kind }) => kind === 'window-start')
+      const response = verifier.provenance.exchanges.find(
+        (exchange) =>
+          exchange.memberId === verifier.memberId &&
+          ShareCycleOracle.partitionResponse(exchange, {
+            topicId: verifier.topicId,
+            partition: 0,
+          })?.acquiredRecords?.length === 1
+      )
+      expect(response).toMatchObject({
+        frames: [expect.objectContaining({ answeredAt: start.at + replayAt })],
+      })
     },
     120000
   )
+
+  test('the exact screen detects a listener retained by an archived closed socket', async () => {
+    const { result, reason, rows } = await schedule({
+      socketClosed: (socket) => socket.on('leaked', () => {}),
+    })
+    expect(result.ok).toBe(false)
+    expect(reason).toMatch(/namedListeners\.owner\d+:leaked baseline=0 after=1/)
+    expect(rows.some(({ event }) => event === 'case-complete')).toBe(false)
+  }, 120000)
 
   test('keeps real verifier observations through its disconnect callback and join', async () => {
     const { reason, rows } = await schedule({ drainReplay: true })
@@ -5110,19 +5174,19 @@ describe('Share soak complete original-owner schedules', () => {
       'phase-open',
       () => true,
       2000,
-      'shared transition deadline exceeded',
+      'shared transition deadline exhausted',
     ],
     [
       'combined final proof and cleanup',
-      'delete-topic',
-      () => true,
+      'admin-disconnect',
+      ({ driver }) => Boolean(driver.after),
       16000,
       'shared cleanup deadline exceeded',
     ],
   ])(
     'rejects %s without renewing its original allocation',
     async (_name, selected, eligible, extra, message) => {
-      const { reason, rows } = await schedule({
+      const { owner, reason, rows } = await schedule({
         io: async (event, context) => {
           if (event !== selected || !eligible(context)) return
           const { driver, clock } = context
@@ -5130,6 +5194,14 @@ describe('Share soak complete original-owner schedules', () => {
         },
       })
       expect(reason).toContain(message)
+      if (selected === 'phase-open')
+        expect(owner.spent.transition).toBeGreaterThan(owner.budget.transitionMs)
+      if (selected === 'admin-disconnect') {
+        expect(owner.final.timing.completedAt - owner.final.timing.startedAt).toBeLessThan(
+          owner.budget.cleanupMs
+        )
+        expect(owner.spent.cleanup).toBeGreaterThan(owner.budget.cleanupMs)
+      }
       expect(rows.some(({ event }) => event === 'case-complete')).toBe(false)
     },
     120000
