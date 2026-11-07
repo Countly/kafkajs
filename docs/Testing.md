@@ -84,6 +84,22 @@ broker-ordered built-ins and retired native completions. Configured exporter and
 Java GZIP/ZSTD decode remain separate integration checks. A missing independent
 toolchain is an unrun check, never an equivalent pass.
 
+### Telemetry subscription transport checks
+
+Broker-free capability, subscription and error specs exercise atomic replacement,
+UUID retention, pacing, local caps, finite recovery and provisional reconnect. The
+broker request spec drives actual Connection queues with independent version-0
+wire pairs; the transport spec negotiates the actual private socket. Captured
+authority reaches setup, authentication, encoding, queue dispatch, socket write and
+response installation. Public lifecycle release schedules and configured receiver
+evidence are separate checks. Controller live runs use the existing guarded
+foreground runner with its shared reservation and the tv2 profile.
+
+Capability inspection runs at subscription scheduling boundaries. Extra nullable
+guard and transmission-callback checks on the ordinary request path must be
+measured with the actual Connection prepare/queue/fulfill driver, interleaved
+previous and candidate arms, recorded host load, and the fixed A/A controls.
+
 ## Integration tests
 
 Most of the test suite talks to a real Kafka cluster. `npm test` runs `npm run lint`, `npm run compat:check` and `npm run protocol:check`, boots the cluster, runs everything, and tears the cluster down again — it's a convenient local shortcut, but it is not what CI runs.

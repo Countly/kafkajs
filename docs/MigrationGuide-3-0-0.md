@@ -1515,3 +1515,16 @@ Snappy, native LZ4 and custom codec callbacks are outside this telemetry sender'
 supported subset. Broker accepted codecs can exclude an unwanted built-in; runtime
 ZSTD unavailability falls back to the next supported codec or NONE. Existing record
 compression and decompression limits retain their own configuration and behavior.
+
+### Dedicated telemetry traffic and pacing
+
+The internal subscription transport uses one dedicated authenticated connection
+per enabled client and sends GetTelemetrySubscriptions/PushTelemetry traffic.
+Unsupported brokers quietly leave foreground operations usable. A missing exporter
+is different from an absent matching CLIENT_METRICS resource: no-resource clients
+poll without Push. Account for the extra socket and authentication cost when
+activating telemetry through the public factory configuration. Disabling telemetry
+is the escape from this traffic. Broker intervals below 100 ms are clamped to
+100 ms locally; nonpositive intervals use 300000 ms. See
+[Client Telemetry](ClientTelemetry.md#subscription-transport-and-recovery) for
+capability, error, throttle and best-effort delivery behavior.

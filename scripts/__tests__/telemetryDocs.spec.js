@@ -112,3 +112,39 @@ describe('bounded telemetry payload documentation', () => {
     }
   )
 })
+
+describe('telemetry subscription documentation', () => {
+  it('publishes the numeric policy and socket cost with the transport', () => {
+    const guide = read('docs/ClientTelemetry.md')
+    for (const text of [
+      '## Subscription transport and recovery',
+      '5000 ms',
+      '30000 ms',
+      '65536',
+      'A second 42',
+      'successful Gets',
+      '117 or 76',
+      '16384',
+      'persistent client-owned shell',
+      'established-only',
+      'never dials or starts authentication',
+    ])
+      expect(guide.toLowerCase()).toContain(text.toLowerCase())
+    expect(read('docs/Configuration.md')).toContain('## Telemetry transport cost')
+  })
+  it('registers the five physical specs in both narrow lanes', () => {
+    const scripts = pkg.scripts
+    for (const file of [
+      'src/telemetry/__tests__/capability.spec.js',
+      'src/telemetry/__tests__/subscription.spec.js',
+      'src/telemetry/__tests__/errors.spec.js',
+      'src/broker/__tests__/telemetryRequests.spec.js',
+      'src/cluster/__tests__/telemetryTransport.spec.js',
+    ]) {
+      const pattern = file.replaceAll('.', String.fromCharCode(92) + '.') + '$'
+      for (const name of ['test:unit', 'test:coverage:unit'])
+        expect(scripts[name]).toContain("'" + pattern + "'")
+      expect(new RegExp(pattern).test(file.replace('.spec', 'Xspec'))).toBe(false)
+    }
+  })
+})
