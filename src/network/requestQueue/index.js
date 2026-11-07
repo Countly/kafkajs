@@ -160,6 +160,8 @@ module.exports = class RequestQueue extends EventEmitter {
       logger: this.logger,
       guard: pushedRequest.guard,
       frameLength: pushedRequest.frameLength,
+      telemetrySink: pushedRequest.telemetrySink,
+      telemetrySlot: pushedRequest.telemetrySlot,
       requestTimeout,
       send: () => {
         if (this.inflight.has(correlationId)) {
@@ -182,6 +184,8 @@ module.exports = class RequestQueue extends EventEmitter {
    * @property {import("./socketRequest").RequestEntry} entry
    * @property {boolean} expectResponse
    * @property {number} [frameLength] complete encoded frame bytes, including the length prefix
+   * @property {object|null} [telemetrySink] private numeric observer captured at send entry
+   * @property {object|null} [telemetrySlot] original node slot, never looked up at completion
    * @property {Function} sendRequest
    * @property {number} [requestTimeout]
    * @property {(frameLength?: number) => Error|null} [guard] checked just before the request is written; an error it

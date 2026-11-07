@@ -10,14 +10,16 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 #### Additions
 
 - Implement the two flexible telemetry protocol codecs with capability-qualified compatibility output.
+- Add bounded numeric Gauge and monotonic BigInt Sum collection and snapshot registration internally.
 
 #### Tooling
 
 - Add independent telemetry request/response vectors and strict wire fixtures.
+- Verify normal physical connections and completed-request observations independently.
 
 #### Behavior changes
 
-None in this protocol-only milestone. Existing client configuration and foreground operations are unchanged.
+- Telemetry codecs, numeric collection and snapshot registration are internal at this stage. Existing client configuration and foreground operations are unchanged, and returned-client registration methods are not attached yet.
 
 ### Phase 9E — Share groups
 
