@@ -10,6 +10,7 @@ const {
 const path = require('path')
 const { spawn } = require('child_process')
 const { isDeepStrictEqual } = require('util')
+const { runInNewContext } = require('vm')
 const { AsyncLocalStorage } = require('async_hooks')
 const { Kafka, logLevel } = require('../../../../index')
 const { createChaosSocketFactory } = require('../../../../testHelpers/chaosSocket')
@@ -1471,10 +1472,9 @@ const assertLeaderReplayEvidence = async (evidence, terminal = false) => {
     expect(handler.ledger).toBe(handler.originalLedger)
     expect(handler.acquisition).toBe(handler.originalToken)
     expect(adoption.records).toEqual(adoption.original.records)
-    expect(adoption.deliveryCounts).toBeInstanceOf(Uint16Array)
-    expect(Array.from(adoption.deliveryCounts)).toEqual(
-      Array.from(adoption.original.deliveryCounts)
-    )
+    expect(Array.isArray(adoption.deliveryCounts)).toBe(true)
+    expect(adoption.deliveryCounts).toHaveLength(adoption.records.length)
+    expect(adoption.deliveryCounts).toEqual(adoption.original.deliveryCounts)
     const index = adoption.records.findIndex(({ offset }) => offset === handler.offset)
     expect(index).toBeGreaterThanOrEqual(0)
     expect(adoption.records[index]).toEqual({
@@ -2552,22 +2552,28 @@ class SessionCase {
         }),
       })),
       assignments: capture.assignments.map(({ run, ...fact }) => ({ ...fact, run: id(run) })),
-      acquisitions: capture.acquisitions.map(({ cohort, exchange, ...fact }) => ({
-        ...fact,
-        cohort: id(cohort),
-        acquisition: id(cohort.token),
-        ledger: id(cohort.ledger),
-        exchange: id(exchange),
-        topicId: cohort.topicId,
-        partition: cohort.partition,
-        groupId: capture.writes.find((write) => write.exchange === exchange)?.fields.groupId,
-        records: cohort.walk.deliver.records.map(({ offset, key, value }) => ({
-          offset,
-          key: key?.toString('base64'),
-          value: value?.toString('base64'),
-        })),
-        deliveryCounts: cohort.walk.deliver.deliveryCounts,
-      })),
+      acquisitions: capture.acquisitions.map(({ cohort, exchange, ...fact }) => {
+        if (this.action === 'leader')
+          expect(Object.prototype.toString.call(cohort.walk.deliver.deliveryCounts)).toBe(
+            '[object Uint16Array]'
+          )
+        return {
+          ...fact,
+          cohort: id(cohort),
+          acquisition: id(cohort.token),
+          ledger: id(cohort.ledger),
+          exchange: id(exchange),
+          topicId: cohort.topicId,
+          partition: cohort.partition,
+          groupId: capture.writes.find((write) => write.exchange === exchange)?.fields.groupId,
+          records: cohort.walk.deliver.records.map(({ offset, key, value }) => ({
+            offset,
+            key: key?.toString('base64'),
+            value: value?.toString('base64'),
+          })),
+          deliveryCounts: [...cohort.walk.deliver.deliveryCounts],
+        }
+      }),
       handlers: capture.handlers.map(({ run, node, cohort, call, ...fact }) => ({
         ...fact,
         handler: id(capture.handlers.find((entry) => entry.sequence === fact.sequence)),
@@ -3069,25 +3075,27 @@ class SessionCase {
    */
   async assertLeaderReplay(terminal = false) {
     await this.capture.refresh()
-    this.leaderEvidence = {
-      action: this.action,
-      scenario: this.nonce,
-      groupId: this.groups.main,
-      topic: this.topic,
-      topicId: this.topicId,
-      expected: this.expected,
-      move: this.leaderMove,
-      capture: this.captureEvidence(),
-      diagnosticErrors: this.leadershipErrors ?? [],
-      restoration: this.leaderRestoration,
-      ...(terminal && {
-        log: this.log,
-        logEnd: this.logEnd,
-        terminalBefore: this.terminalBefore,
-        quiet: this.quiet,
-        quietObservations: this.quietObservations,
-      }),
-    }
+    this.leaderEvidence = JSON.parse(
+      JSON.stringify({
+        action: this.action,
+        scenario: this.nonce,
+        groupId: this.groups.main,
+        topic: this.topic,
+        topicId: this.topicId,
+        expected: this.expected,
+        move: this.leaderMove,
+        capture: this.captureEvidence(),
+        diagnosticErrors: this.leadershipErrors ?? [],
+        restoration: this.leaderRestoration,
+        ...(terminal && {
+          log: this.log,
+          logEnd: this.logEnd,
+          terminalBefore: this.terminalBefore,
+          quiet: this.quiet,
+          quietObservations: this.quietObservations,
+        }),
+      })
+    )
     await assertLeaderReplayEvidence(this.leaderEvidence, terminal)
   }
 
@@ -3831,9 +3839,10 @@ const scriptedSettlement = async () => {
 
 /** Builds two original acquisitions and one controlled move without a broker or a timer.
  * @param {number} count Replayed wire count.
+ * @param {Function} [counts] Builds the product's original delivery-count array.
  * @returns {Promise<object>} Lossless evidence with an independent fixed corpus.
  */
-const scriptedLeaderReplay = async (count) => {
+const scriptedLeaderReplay = async (count, counts = (value) => new Uint16Array([value])) => {
   const Encoder = require('../../../protocol/encoder')
   const {
     batch,
@@ -3989,7 +3998,7 @@ const scriptedLeaderReplay = async (count) => {
   const adopt = (source, message, deliveryCount) => {
     const token = Symbol('acquisition')
     const walk = {
-      deliver: { records: [message], deliveryCounts: new Uint16Array([deliveryCount]) },
+      deliver: { records: [message], deliveryCounts: counts(deliveryCount) },
       gaps: [],
       release: [],
       reject: [],
@@ -4381,11 +4390,29 @@ const changeLeaderAnswer = async (evidence, request, mutate) => {
  * @returns {Promise<void>} Both validators must reject without a timeout.
  */
 const rejectLeaderScript = async (evidence) => {
-  await expect(assertScriptedLeaderCase(evidence)).rejects.toThrow()
-  await expect(assertLeaderReplayEvidence(evidence, true)).rejects.toThrow()
+  const archived = JSON.parse(JSON.stringify(evidence))
+  await expect(assertScriptedLeaderCase(archived)).rejects.toThrow()
+  await expect(assertLeaderReplayEvidence(archived, true)).rejects.toThrow()
 }
 
 describe('held leader-move replay sensitivity', () => {
+  it('archives cross-realm product counts as portable number arrays', async () => {
+    const evidence = await scriptedLeaderReplay(1, (value) =>
+      runInNewContext('new Uint16Array([value])', { value })
+    )
+    const archived = JSON.parse(JSON.stringify(evidence))
+    for (const adoption of archived.capture.acquisitions) {
+      expect(Array.isArray(adoption.deliveryCounts)).toBe(true)
+      expect(adoption.deliveryCounts).toEqual([1])
+    }
+    await assertScriptedLeaderCase(archived)
+    await assertLeaderReplayEvidence(archived, true)
+  })
+
+  it('requires the original product counts to remain a Uint16Array', async () => {
+    await expect(scriptedLeaderReplay(1, (value) => [value])).rejects.toThrow()
+  })
+
   it.each(['4.3.1', '4.4.0'])(
     'accepts both witnessed original count histories under %s',
     async (version) => {
@@ -4394,6 +4421,9 @@ describe('held leader-move replay sensitivity', () => {
         evidence.version = version
         await assertScriptedLeaderCase(evidence)
         await assertLeaderReplayEvidence(evidence, true)
+        const archived = JSON.parse(JSON.stringify(evidence))
+        await assertScriptedLeaderCase(archived)
+        await assertLeaderReplayEvidence(archived, true)
         const pair = evidence.capture.handlers.filter(
           ({ identity }) => identity === evidence.expected[0]
         )
@@ -4916,7 +4946,7 @@ describe('held leader-move replay sensitivity', () => {
       const evidence = await scriptedLeaderReplay(1)
       evidence.capture.handlers[1].deliveryCount = deliveryCount
       const adoption = evidence.capture.acquisitions[1]
-      adoption.deliveryCounts = new Uint16Array([deliveryCount])
+      adoption.deliveryCounts = [deliveryCount]
       adoption.original.deliveryCounts = [deliveryCount]
       const request = evidence.capture.frames.find(({ exchange }) => exchange === adoption.exchange)
       await changeLeaderAnswer(evidence, request, (answer) => {
@@ -4930,7 +4960,7 @@ describe('held leader-move replay sensitivity', () => {
     const evidence = await scriptedLeaderReplay(1)
     evidence.capture.handlers[0].deliveryCount = 2
     const adoption = evidence.capture.acquisitions[0]
-    adoption.deliveryCounts = new Uint16Array([2])
+    adoption.deliveryCounts = [2]
     adoption.original.deliveryCounts = [2]
     const request = evidence.capture.frames.find(({ exchange }) => exchange === adoption.exchange)
     await changeLeaderAnswer(evidence, request, (answer) => {

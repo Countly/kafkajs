@@ -39,6 +39,8 @@ const defaultSocketFactory = require('../../../network/socketFactory')
 const RequestQueue = require('../../../network/requestQueue')
 const CONFIG_RESOURCE_TYPES = require('../../../protocol/configResourceTypes')
 const { ShareAckLedger } = require('../shareAckLedger')
+const { ShareHandlerCall } = require('../shareHandlerCall')
+const { KafkaJSNonRetriableError } = require('../../../errors')
 const {
   NEVER,
   bounded,
@@ -231,6 +233,96 @@ class AcknowledgementTrace {
   }
 }
 
+/** Observes original handler authority and retains every scheduled renewal failure. */
+class RenewalObserver {
+  /** @param {Function} [record] Receives failures and validated stale-call refusals. */
+  constructor(record = () => {}) {
+    this.record = record
+    this.calls = new WeakMap()
+    this.failures = []
+    this.pending = new Set()
+    this.stops = new Set()
+  }
+
+  /** @returns {void} Installs a call-through observer before handlers start. */
+  install() {
+    const original = ShareHandlerCall.prototype.messagePayload
+    const calls = this.calls
+    ShareHandlerCall.prototype.messagePayload = function (...args) {
+      const payload = original.apply(this, args)
+      calls.set(payload, this)
+      return payload
+    }
+    this.restore = () => {
+      ShareHandlerCall.prototype.messagePayload = original
+    }
+  }
+
+  /**
+   * @param {object} payload Original invocation payload.
+   * @param {string} identity Held identity, retained with any failure.
+   * @returns {Function} Stops the timer and joins its observed renewals.
+   */
+  start(payload, identity) {
+    const call = this.calls.get(payload)
+    if (!call) throw new Error('Missing original handler call for renewal')
+    const timer = setInterval(() => {
+      let revoked = false
+      try {
+        revoked = !call.open || !call.authority.current()
+        const renewal = payload.renew()
+        const observed = renewal.catch((error) => this.reject(error, false, revoked, identity))
+        this.pending.add(observed)
+        observed.then(() => this.pending.delete(observed))
+      } catch (error) {
+        this.reject(error, true, revoked, identity)
+        clearInterval(timer)
+      }
+    }, RENEW_MS)
+    const stop = async () => {
+      clearInterval(timer)
+      this.stops.delete(stop)
+      await this.join()
+    }
+    this.stops.add(stop)
+    return stop
+  }
+
+  /**
+   * @param {*} error Original thrown value or rejection.
+   * @param {boolean} synchronous Whether the renewal call threw before returning.
+   * @param {boolean} revoked Whether original authority was already revoked before the call.
+   * @param {string} identity Original held identity.
+   * @returns {void} Only the exact synchronous post-revocation refusal is tolerated.
+   */
+  reject(error, synchronous, revoked, identity) {
+    const tolerated =
+      synchronous &&
+      revoked &&
+      error instanceof KafkaJSNonRetriableError &&
+      error.name === 'KafkaJSNonRetriableError' &&
+      error.message === 'Handler call is no longer current'
+    if (!tolerated) this.failures.push({ error, identity })
+    this.record({ identity, synchronous, revoked, tolerated, error: describeError(error) })
+  }
+
+  /** @returns {Promise<void>} Joins all renewals and propagates retained failures. */
+  async join() {
+    await Promise.all([...this.pending])
+    if (this.failures.length) throw this.failures[0].error
+  }
+
+  /** @returns {Promise<void>} Stops every schedule and restores the original method. */
+  async uninstall() {
+    try {
+      await Promise.all([...this.stops].map((stop) => stop()))
+      await this.join()
+    } finally {
+      this.restore?.()
+    }
+  }
+}
+
 /**
  * The child member's whole program. It writes each invocation's start to a synchronous journal
  * before it can block or be killed, reports over IPC only after that, and keeps each held
@@ -245,10 +337,16 @@ const acknowledgeResponse = require(process.env.SHARE_LIVE_ROOT + '/src/protocol
 const defaultSocketFactory = require(process.env.SHARE_LIVE_ROOT + '/src/network/socketFactory')
 const AcknowledgementTrace = ${AcknowledgementTrace.toString()}
 const { Kafka, logLevel } = require(process.env.SHARE_LIVE_ROOT + '/index')
+const { KafkaJSNonRetriableError } = require(process.env.SHARE_LIVE_ROOT + '/src/errors')
+const { ShareHandlerCall } = require(process.env.SHARE_LIVE_ROOT + '/src/consumer/share/shareHandlerCall')
+const RENEW_MS = ${RENEW_MS}
+const RenewalObserver = ${RenewalObserver.toString()}
 const { ShareHandlerLog, shareRecordIdentity } = require(process.env.SHARE_LIVE_ROOT + '/testHelpers/shareFixtures')
 const config = JSON.parse(process.env.SHARE_LIVE_CHILD)
 const journal = new ShareHandlerLog(config.journal, config.clientId)
 const report = (message) => process.send(message)
+const renewals = new RenewalObserver((fact) => report({ event: 'renewal', ...fact }))
+renewals.install()
 let hold = null
 let current = null
 let frozen = null
@@ -293,7 +391,8 @@ client.on(events.ACKNOWLEDGE, ({ payload }) =>
 client.on(events.CRASH, ({ payload }) =>
   report({ event: 'crash', message: String(payload.error && payload.error.message) })
 )
-const handle = async ({ topic, partition, message, renew }) => {
+const handle = async (payload) => {
+  const { topic, partition, message } = payload
   const record = {
     topic,
     partition,
@@ -308,14 +407,16 @@ const handle = async ({ topic, partition, message, renew }) => {
   if (hold) {
     const mine = hold
     hold = null
-    let timer = null
-    await new Promise((resolve) => {
-      current = { invocation, release: resolve }
-      if (mine.renew) timer = setInterval(() => renew().catch(() => {}), ${RENEW_MS})
-      report({ event: 'held', invocation, identity, deliveryCount: message.deliveryCount })
-    })
-    clearInterval(timer)
-    current = null
+    const stopRenewing = mine.renew ? renewals.start(payload, identity) : null
+    try {
+      await new Promise((resolve) => {
+        current = { invocation, release: resolve }
+        report({ event: 'held', invocation, identity, deliveryCount: message.deliveryCount })
+      })
+    } finally {
+      if (stopRenewing) await stopRenewing()
+      current = null
+    }
   } else if (!frozen) {
     await new Promise((resolve) => setTimeout(resolve, 5))
   }
@@ -328,6 +429,7 @@ const stop = async () => {
     if (frozen) frozen.release()
     if (current) current.release()
     await client.disconnect({ timeout: 3000 })
+    await renewals.uninstall()
     await trace.join()
   } finally {
     journal.close()
@@ -540,11 +642,13 @@ class Member {
    * @param {string} options.label short name in evidence
    * @param {string} options.groupId the share group
    * @param {number} [options.workMs=5] how long an ordinary handler takes
+   * @param {RenewalObserver} options.renewals Original-call renewal observer.
    */
-  constructor({ kafka, label, groupId, workMs = 5 }) {
+  constructor({ kafka, label, groupId, workMs = 5, renewals }) {
     this.label = label
     this.groupId = groupId
     this.workMs = workMs
+    this.renewals = renewals
     this.config = { maxRecords: 1, maxWaitTimeInMs: 250, acknowledgementMode: 'implicit' }
     this.client = kafka.shareConsumer({ groupId, ...this.config })
     /** @type {Array<{identity: string, deliveryCount: number, offset: string, at: number}>} */
@@ -626,18 +730,11 @@ class Member {
       if (hold) {
         this.hold = null
         this.held = entry
-        const timer = setInterval(() => {
-          try {
-            payload.renew().catch(() => {})
-          } catch {
-            // A revoked call refuses renewal synchronously; there is nothing left to renew.
-            clearInterval(timer)
-          }
-        }, RENEW_MS)
+        const stopRenewing = this.renewals.start(payload, entry.identity)
         try {
           await hold.promise
         } finally {
-          clearInterval(timer)
+          await stopRenewing()
         }
       } else {
         await new Promise((resolve) => setTimeout(resolve, this.workMs))
@@ -770,6 +867,8 @@ class ChildMember {
       this.wireAcknowledgements.push(message.row)
     } else if (message.event === 'acknowledge') {
       this.acks.push(fact)
+    } else if (message.event === 'renewal' && !message.tolerated) {
+      this.failure = new Error(`The child renewal failed: ${JSON.stringify(message)}`)
     } else if (message.event === 'failed' || message.event === 'crash') {
       this.failure = new Error(`The child reported ${message.event}: ${message.message}`)
     }
@@ -927,6 +1026,7 @@ class MembershipCase {
     this.groups = { main: this.group }
     this.sockets = new SocketCounter()
     this.gauge = new ResourceGauge()
+    this.renewals = new RenewalObserver((fact) => this.row('renewal', fact))
     this.probe = createResourceProbe({
       emitters: { process },
       sockets: () => this.sockets.counts(),
@@ -1003,6 +1103,7 @@ class MembershipCase {
   async run(scope) {
     const outer = new CleanupStack()
     outer.add('release resource gauge', () => this.gauge.uninstall())
+    outer.add('release renewal observer', () => this.renewals.uninstall())
     outer.add('disconnect admin', () => this.admin.disconnect())
     let pre
     let base
@@ -1011,6 +1112,7 @@ class MembershipCase {
       await outer.run(
         async () => {
           this.gauge.install()
+          this.renewals.install()
           pre = await captureShareCleanupBaseline(this.probe, {
             signal: scope,
             cleanupStack: false,
@@ -1047,6 +1149,8 @@ class MembershipCase {
         { budgetMs: PROOF_MS }
       )
       await this.settleProcess(scope, pre)
+      await this.renewals.join()
+      this.assertHealthy()
       this.complete(base, after)
     } catch (error) {
       this.row('case-failed', { status: 'failed', error: describeError(error), ...this.progress() })
@@ -1175,7 +1279,13 @@ class MembershipCase {
       clientId: this.clientIdOf(label),
       socketFactory: this.sockets.factory(label),
     })
-    const member = new Member({ kafka, label, groupId: this.group, workMs })
+    const member = new Member({
+      kafka,
+      label,
+      groupId: this.group,
+      workMs,
+      renewals: this.renewals,
+    })
     this.members[label] = member
     member.listen()
     this.stack.add(`remove ${label} listeners`, () => member.unlisten())
@@ -1345,6 +1455,7 @@ class MembershipCase {
    * @throws {Error} a crash of an in-process member or any failure of the child
    */
   assertHealthy() {
+    expect(this.renewals.failures).toEqual([])
     for (const member of Object.values(this.members)) {
       if (member instanceof ChildMember) {
         if (member.failure) throw member.failure
@@ -1531,6 +1642,7 @@ class MembershipCase {
     await this.settled(scope, 4 * PER_PARTITION)
 
     await this.produce(scope, 4)
+    await this.settled(scope, 5 * PER_PARTITION)
     await this.produce(scope, 5)
     await this.settled(scope, STAGES * PER_PARTITION)
   }
@@ -1807,6 +1919,77 @@ enabled('share membership on a live broker', () => {
   afterEach(() => {
     if (!liveRun.takeAdmission()) return
     liveRun.assertClean()
+  })
+})
+
+describe('membership renewal observation', () => {
+  afterEach(() => jest.useRealTimers())
+
+  it.each([
+    ['synchronous stale refusal after revocation', true, true, 'stale', true],
+    ['synchronous stale refusal before revocation', false, true, 'stale', false],
+    ['asynchronous stale refusal after revocation', true, false, 'stale', false],
+    ['asynchronous stale refusal before revocation', false, false, 'stale', false],
+    ['synchronous TypeError after revocation', true, true, 'type', false],
+    ['synchronous TypeError before revocation', false, true, 'type', false],
+    ['asynchronous TypeError after revocation', true, false, 'type', false],
+    ['asynchronous TypeError before revocation', false, false, 'type', false],
+    ['another nonretriable refusal after revocation', true, true, 'other', false],
+    ['a same-message untyped refusal after revocation', true, true, 'untyped', false],
+  ])('checks %s', async (_name, revoked, synchronous, kind, tolerated) => {
+    jest.useFakeTimers()
+    const facts = []
+    const observer = new RenewalObserver((fact) => facts.push(fact))
+    observer.install()
+    const stale = 'Handler call is no longer current'
+    const error =
+      kind === 'type'
+        ? new TypeError('Unexpected renewal failure')
+        : kind === 'untyped'
+          ? new Error(stale)
+          : new KafkaJSNonRetriableError(kind === 'stale' ? stale : 'Another refusal')
+    try {
+      const call = new ShareHandlerCall({
+        records: [{ offset: '0' }],
+        ledger: {},
+        authority: { current: () => !revoked },
+      })
+      const payload = call.messagePayload('records', 0)
+      payload.renew = () => {
+        if (synchronous) throw error
+        return Promise.reject(error)
+      }
+      const stop = observer.start(payload, 'held-identity')
+      jest.advanceTimersByTime(RENEW_MS)
+      if (tolerated) await expect(stop()).resolves.toBeUndefined()
+      else await expect(stop()).rejects.toBe(error)
+      expect(facts).toEqual([
+        {
+          identity: 'held-identity',
+          synchronous,
+          revoked,
+          tolerated,
+          error: describeError(error),
+        },
+      ])
+      expect(observer.failures).toEqual(tolerated ? [] : [{ error, identity: 'held-identity' }])
+    } finally {
+      if (observer.failures.length) await expect(observer.uninstall()).rejects.toBe(error)
+      else await observer.uninstall()
+    }
+  })
+
+  it('retains a child renewal failure for the parent health check', () => {
+    const child = new ChildMember({ label: 'C' })
+    child.receive({
+      event: 'renewal',
+      synchronous: false,
+      revoked: true,
+      tolerated: false,
+      error: { name: 'TypeError', message: 'Unexpected renewal failure' },
+    })
+    expect(child.failure.message).toContain('Unexpected renewal failure')
+    expect(child.of('renewal')).toHaveLength(1)
   })
 })
 
