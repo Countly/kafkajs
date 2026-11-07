@@ -4460,9 +4460,27 @@ describe('Share soak complete original-owner schedules', () => {
     const transport = shareClient({ nodes: 3, topics: {} })
     const { cluster, table } = transport
     const tap = new ShareFetchTap(64, { now: () => performance.now() })
+    /**
+     * Rejects destroyed-stream writes before they can apply acknowledgements at the broker.
+     * @param {object} options Socket endpoint and connection callback.
+     * @returns {object} The scripted socket with asynchronous stream-write failures.
+     */
+    const socketFactory = (options) => {
+      const socket = cluster.socketFactory(options)
+      const write = socket.write.bind(socket)
+      socket.write = (...args) => {
+        if (!socket.destroyed) return write(...args)
+        const error = Object.assign(new Error('Cannot call write after a stream was destroyed'), {
+          code: 'ERR_STREAM_DESTROYED',
+        })
+        queueMicrotask(() => socket.emit('error', error))
+        return false
+      }
+      return socket
+    }
     const instrumented = instrumentShare(
       cluster.kafkaOptions({
-        socketFactory: tap.factory(cluster.socketFactory),
+        socketFactory: tap.factory(socketFactory),
         retry: { initialRetryTime: 50, maxRetryTime: 100, factor: 0, retries: 3 },
       }),
       { activeResources: false }
