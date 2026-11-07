@@ -1,0 +1,59 @@
+{
+  "message": "MetricsData",
+  "version": "1.9.0",
+  "case": "zero",
+  "hex": "0a6b0a0012670a180a0f636f756e746c792d6b61666b616a731205332e302e3012270a11636f6d2e6578616d706c652e636f756e741a01313a0f0a093100000000000000001001180112220a10636f6d2e6578616d706c652e7a65726f1a01312a0b0a09210000000000000000",
+  "fields": {
+    "revision": "1",
+    "subscriptionRevision": "1",
+    "points": [
+      {
+        "identity": {
+          "key": "[\"com.example.zero\",[]]",
+          "revision": "1"
+        },
+        "name": "com.example.zero",
+        "type": "gauge",
+        "unit": "1",
+        "attributes": [],
+        "value": 0,
+        "timeUnixNano": "0"
+      },
+      {
+        "identity": {
+          "key": "[\"com.example.count\",[]]",
+          "revision": "1"
+        },
+        "name": "com.example.count",
+        "type": "sum",
+        "unit": "1",
+        "attributes": [],
+        "value": "0",
+        "timeUnixNano": "0",
+        "startTimeUnixNano": "0",
+        "aggregationTemporality": 1,
+        "isMonotonic": true
+      }
+    ],
+    "resources": [],
+    "droppedResourceAttributesCount": 0,
+    "scope": {
+      "name": "countly-kafkajs",
+      "version": "3.0.0"
+    }
+  },
+  "provenance": {
+    "protoTag": "v1.9.0",
+    "protoSha256": {
+      "common/v1/common.proto": "354d818af9cb0ed67f7447b9cf8408f1ac8911cedea0db73c5309484ec2bcc04",
+      "metrics/v1/metrics.proto": "d0a53dda45ad100edbf25675f5b339ce8bf689bdc51816f8cf19b0d51464e1a4",
+      "resource/v1/resource.proto": "e0a7cdc0ffcfeffaa2606e8611839735ebffaa2d6acdf33e9356f2c48ae692d3"
+    },
+    "generator": "scripts/protocol/javaVectors/GenerateTelemetryVectors.java",
+    "generatorSha256": "a79918257028544cf389b20dc120687a0f9356e1d8f6953469c632675dc67e2c",
+    "bindingsSha256": "99676bd7a6eff2b8e068a1ab10fe30cadf27958e82914adc6516699c88e266e7",
+    "protobufJavaSha256": "8540247fad9e06baefa8fb45eb313802d019f485f14300e0f9d6b556ed88e753",
+    "protocSha256": "d69b0a9ac8264bb3d464ae22742430943aa0a6cdf3734180af5a607c0bf8adaa",
+    "status": "field-by-field candidate; Java regeneration required"
+  }
+}

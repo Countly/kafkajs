@@ -16,10 +16,13 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - Add independent telemetry request/response vectors and strict wire fixtures.
 - Verify normal physical connections and completed-request observations independently.
+- Add independently generated and decoded OTLP metric vectors.
 
 #### Behavior changes
 
 - Telemetry codecs, numeric collection and snapshot registration are internal at this stage. Existing client configuration and foreground operations are unchanged, and returned-client registration methods are not attached yet.
+- Bound raw and transmitted telemetry bodies, omit whole metric groups under small limits, and advance only written included baselines; a rejected written sample can be lost from later deltas.
+- Telemetry payloads over1000 bytes use mutually supported built-in ZSTD/GZIP in broker order; NONE is always available. Producer codec registrations are unchanged.
 
 ### Phase 9E — Share groups
 
