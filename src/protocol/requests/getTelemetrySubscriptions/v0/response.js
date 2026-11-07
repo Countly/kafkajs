@@ -3,11 +3,17 @@ const { failure, createErrorFromCode } = require('../../../error')
 const { KafkaJSPartialMessageError } = require('../../../../errors')
 
 /** Bounds on broker-supplied subscription metadata, counted in entries and raw UTF-8 bytes. */
-const LIMITS = Object.freeze({ codecs: 128, prefixes: 256, prefixBytes: 256, totalBytes: 16384 })
+const LIMITS = Object.freeze({
+  body: 65536,
+  codecs: 128,
+  prefixes: 256,
+  prefixBytes: 256,
+  totalBytes: 16384,
+})
 /** ThrottleTimeMs, ErrorCode, ClientInstanceId and SubscriptionId. */
 const LEADING_BYTES = 26
-/** PushIntervalMs, TelemetryMaxBytes and DeltaTemporality. */
-const SCALAR_BYTES = 9
+/** PushIntervalMs and TelemetryMaxBytes. */
+const INTERVAL_BYTES = 8
 
 /**
  * Reads a compact array count without allocating the array.
@@ -30,15 +36,23 @@ const readCount = (scan, field, max) => {
  * Strings are bounded by raw UTF-8 bytes. Tags and trailing bytes are left to decode.
  * @param {Buffer} rawData response body only, after response header v1
  * @returns {void}
- * @throws {KafkaJSPartialMessageError} on truncation, a null field, or a count or byte limit breach
+ * @throws {KafkaJSPartialMessageError} on truncation, a null field, a non-boolean DeltaTemporality,
+ *   or a body, count or byte limit breach
  */
 const preflight = (rawData) => {
+  if (rawData.length > LIMITS.body)
+    throw new KafkaJSPartialMessageError(
+      `GetTelemetrySubscriptions response exceeds ${LIMITS.body} bytes`
+    )
   const scan = new Decoder(rawData)
   scan.ensureReadable(LEADING_BYTES, 'GetTelemetrySubscriptions response')
   scan.offset = LEADING_BYTES
   const codecs = readCount(scan, 'AcceptedCompressionTypes', LIMITS.codecs)
-  scan.ensureReadable(codecs + SCALAR_BYTES, 'AcceptedCompressionTypes')
-  scan.offset += codecs + SCALAR_BYTES
+  scan.ensureReadable(codecs + INTERVAL_BYTES + 1, 'AcceptedCompressionTypes')
+  scan.offset += codecs + INTERVAL_BYTES
+  const delta = scan.readInt8()
+  if (delta !== 0 && delta !== 1)
+    throw new KafkaJSPartialMessageError('DeltaTemporality must be 0 or 1')
   const prefixes = readCount(scan, 'RequestedMetrics', LIMITS.prefixes)
   scan.ensureReadable(prefixes, 'RequestedMetrics')
   let total = 0

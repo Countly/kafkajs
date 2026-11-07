@@ -232,6 +232,28 @@ describe('GetTelemetrySubscriptions v0 response metadata limits', () => {
     expect([journal.arrays, journal.strings, journal.utf8]).toEqual([0, 0, 0])
   })
 
+  test('refuses a DeltaTemporality byte other than 0 or 1 before allocation', async () => {
+    const body = wire({ codecs: [0], selection: compactStrings(['a']) })
+    expect(body[36]).toBe(1)
+    body[36] = 2
+    const journal = await withAllocationJournal(body)
+    expect(journal.outcome.error).toMatchObject({
+      name: 'KafkaJSPartialMessageError',
+      message: 'DeltaTemporality must be 0 or 1',
+    })
+    expect([journal.arrays, journal.strings, journal.utf8]).toEqual([0, 0, 0])
+  })
+
+  test('refuses a body over 65536 bytes before reading any field', async () => {
+    const body = Buffer.concat([wire({ codecs: [0] }), Buffer.alloc(65536)])
+    const journal = await withAllocationJournal(body)
+    expect(journal.outcome.error).toMatchObject({
+      name: 'KafkaJSPartialMessageError',
+      message: 'GetTelemetrySubscriptions response exceeds 65536 bytes',
+    })
+    expect([journal.arrays, journal.strings, journal.utf8]).toEqual([0, 0, 0])
+  })
+
   test('keeps tags, truncation and trailing-byte refusal at the exact limits', async () => {
     const body = wire(AT_LIMIT)
     const tagged = Buffer.concat([body.subarray(0, -1), Buffer.from('010703aabbcc', 'hex')])
