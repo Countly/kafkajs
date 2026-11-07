@@ -38,10 +38,10 @@ const sleep = require('../../src/utils/sleep')
 const defaultSocketFactory = require('../../src/network/socketFactory')
 const { plainTextBrokers } = require('../../testHelpers')
 const {
-  assertShareCleanup,
   resetShareGroupConfigs,
   setShareGroupConfigs,
   shareRecordIdentity,
+  waitForShareFixtureAbsence,
 } = require('../../testHelpers/shareFixtures')
 
 /** Fixed configuration, declared before any measurement. */
@@ -1134,7 +1134,13 @@ class ShareThroughput {
         this.consumer.subscribe(this.share ? { topics: [topic] } : { topic, fromBeginning: true }),
       deadline
     )
-    await bounded(() => this.consumer.run({ eachBatch: this.handler }), deadline)
+    await bounded(
+      () =>
+        this.consumer.run(
+          this.share ? { eachBatch: this.handler } : { autoCommit: false, eachBatch: this.handler }
+        ),
+      deadline
+    )
     await until(() => this.drained(count), deadline, 50)
   }
 
@@ -1395,19 +1401,6 @@ class ShareThroughput {
 }
 
 /**
- * A client-free resource reading. Fixture cleanup proves topic absence only, so its resource
- * comparison is vacuous by construction.
- * @returns {object} A fixed quiet reading.
- */
-const quiet = () => ({
-  listeners: {},
-  sockets: { created: 0, destroyed: 0, open: 0 },
-  queueDepth: 0,
-  ledgerSize: 0,
-  activeResources: {},
-})
-
-/**
  * Creates or removes the shared corpus through public APIs inside the guarded CI owner. The topic
  * outlives all arms and repetitions, and only this fixture deletes it.
  */
@@ -1529,7 +1522,11 @@ class CorpusFixture {
       }
     )
     await bounded(
-      () => assertShareCleanup(this.admin, [], [topic], quiet(), { snapshot: async () => quiet() }),
+      () =>
+        waitForShareFixtureAbsence(this.admin, [], [topic], {
+          signal: AbortSignal.timeout(Math.max(1, due - performance.now())),
+          unrelated: [],
+        }),
       due
     )
   }

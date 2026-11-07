@@ -32,6 +32,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Add deterministic share membership, session and acknowledgement fault matrices, with captured shutdown authority, exact record outcomes and resource cleanup checks.
 - Verify share delivery, acknowledgement types, locks, isolation, membership, recovery, shutdown and administration against live brokers.
 - Verify share capability refusals, broker-bounce recovery, Java interoperability and diagnostics channels.
+- Add share-consumer soak and benchmark gates with separate batch and message identity controls.
 
 #### Fixes
 

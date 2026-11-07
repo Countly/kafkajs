@@ -81,6 +81,11 @@ jobs:
         env:
           DO_NOT_STOP: '1'
         run: ./scripts/testWithKafka.sh "npm run test:group:${{ matrix.group }} -- --ci"
+      - name: Run share soak (natural exit)
+        if: matrix.group == 'share-base' && matrix.kafka == '4.3.1'
+        env:
+          DO_NOT_STOP: '1'
+        run: ./scripts/testWithKafka.sh "npm run test:group:share-soak -- --ci"
       - name: Prove shutdown exits naturally
         if: matrix.group == 'share'
         env:

@@ -382,6 +382,32 @@ describe('mixed delivery, gap, hole and release acquisition above 2^53', () => {
     ])
     expect(ledger.size).toBe(0)
   })
+
+  test('counts separate delivered records from compact ranges as they are decided, settled and retired', () => {
+    const { ledger, token } = mixed()
+    expect(ledger.counts).toEqual({ records: 4, ranges: 2 })
+    ledger.decide(at(1), 'reject')
+    ledger.complete([at(0), at(1), at(6), at(7)], 'accept')
+    expect(ledger.counts).toEqual({ records: 4, ranges: 2 })
+    const first = ledger.prepare({ token }).ticket
+    ledger.settle(first, { token })
+    expect(ledger.counts).toEqual({ records: 0, ranges: 0 })
+    expect(ledger.counts.records + ledger.counts.ranges).toBe(ledger.size)
+
+    const lost = mixed()
+    expect(lost.ledger.counts).toEqual({ records: 4, ranges: 2 })
+    lost.ledger.invalidate('session-lost')
+    expect(lost.ledger.counts).toEqual({ records: 0, ranges: 0 })
+    expect(lost.ledger.size).toBe(0)
+  })
+
+  test('counts drop settled automatic ranges while the delivered records stay held', () => {
+    const { ledger, token } = mixed()
+    const automatic = ledger.prepare({ token }).ticket
+    ledger.settle(automatic, { token })
+    expect(ledger.counts).toEqual({ records: 4, ranges: 0 })
+    expect(ledger.counts.records + ledger.counts.ranges).toBe(ledger.size)
+  })
 })
 
 describe('fixed-seed ledger settlement properties', () => {

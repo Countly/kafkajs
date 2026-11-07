@@ -708,5 +708,6 @@ module.exports = {
   verifierMember,
   captureShareCleanupBaseline,
   waitForShareGroupsEmpty,
+  waitForShareFixtureAbsence,
   assertShareCleanup,
 }

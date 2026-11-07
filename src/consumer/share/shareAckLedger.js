@@ -223,6 +223,16 @@ class ShareAckLedger {
   }
 
   /**
+   * @returns {{ records: number, ranges: number }} Retained delivered-record entries and compact
+   *   range entries, read on demand; never called on a fetch, dispatch or settlement path.
+   */
+  get counts() {
+    let records = 0
+    for (const entry of this.#entries.values()) if (!entry.automatic) records += 1
+    return { records, ranges: this.#entries.size - records }
+  }
+
+  /**
    * @param {string|bigint|number} offset Delivered offset.
    * @returns {object} Held delivered entry; never returns automatic range entries.
    * @throws {KafkaJSNonRetriableError} For a late, foreign, retired or already-completed decision.
