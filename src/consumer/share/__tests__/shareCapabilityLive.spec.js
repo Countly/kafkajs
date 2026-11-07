@@ -1,3 +1,5 @@
+// eslint-disable-next-line n/no-unsupported-features/node-builtins -- Test-only timer allocation diagnostics; the hook is disabled after cleanup.
+const { createHook } = require('async_hooks')
 const fs = require('fs')
 const net = require('net')
 const path = require('path')
@@ -35,6 +37,7 @@ const { createResourceProbe } = require('../../../../testHelpers/resourceProbe')
 const RequestQueue = require('../../../network/requestQueue')
 const InstrumentationEventEmitter = require('../../../instrumentation/emitter')
 const { ShareAckLedger } = require('../shareAckLedger')
+const { ShareRunner } = require('../shareRunner')
 const {
   SHARE_VERSION,
   featuresOf,
@@ -230,11 +233,13 @@ class SocketLedger {
   shareFrames() {
     return this.log.frames
       .filter(({ apiKey }) => SHARE_API_KEYS.includes(apiKey))
-      .map(({ apiKey, apiVersion, correlationId, connection }) => ({
+      .map(({ apiKey, apiVersion, correlationId, connection, at, endpoint }) => ({
         apiKey,
         version: apiVersion,
         correlationId,
         socketId: connection,
+        writtenAt: at,
+        endpoint,
       }))
   }
 }
@@ -435,11 +440,13 @@ const runCapabilityCase = async (scope, budgetMs, method) => {
   const allowance = capabilityBudget(budgetMs, CLEANUP_MS + FINAL_MS + CASE_JOIN_MS)
   state.deadline = performance.now() + allowance - CASE_JOIN_MS
   state.scope = AbortSignal.any([scope, controller.signal])
+  state.gauge.install()
   const timer = setTimeout(
     () =>
       controller.abort(new Error('The capability case exhausted its work and cleanup allowance')),
     Math.max(0, state.deadline - performance.now())
   )
+  state.gauge.timerLabels.set(timer, 'capability case deadline')
   let stopping
   const stop = () => {
     liveRun.taint(state.scope.reason)
@@ -453,7 +460,7 @@ const runCapabilityCase = async (scope, budgetMs, method) => {
     failure = error
   }
   try {
-    const joined = await Promise.allSettled([state.sentinelReady])
+    const joined = await Promise.allSettled([state.sentinelReady, state.verification])
     const stopped = (await stopping) || []
     const failures = [...joined, ...stopped]
       .filter(({ status }) => status === 'rejected')
@@ -487,10 +494,37 @@ class ResourceGauge {
     this.queues = new Set()
     this.emitters = new Set()
     this.restores = []
+    this.emitterOrigins = new Map()
+    this.timers = new Map()
+    this.timerLabels = new WeakMap()
+    this.runs = new Set()
   }
 
   /** @returns {void} Installs call-through observers before clients are constructed. */
   install() {
+    if (this.timerHook) return
+    this.timerHook = createHook({
+      init: (id, type, trigger, resource) => {
+        if (type === 'Timeout') {
+          this.timers.set(id, {
+            handle: new WeakRef(resource),
+            createdAt: performance.now(),
+            stack: new Error().stack,
+          })
+        }
+      },
+      destroy: (id) => this.timers.delete(id),
+    }).enable()
+    const original = ShareRunner.prototype.newRun
+    const gauge = this
+    ShareRunner.prototype.newRun = function (...args) {
+      const run = original.apply(this, args)
+      gauge.runs.add(run)
+      return run
+    }
+    this.restores.push(() => {
+      ShareRunner.prototype.newRun = original
+    })
     this.watch(
       ShareAckLedger.prototype,
       [
@@ -523,7 +557,11 @@ class ResourceGauge {
   watch(prototype, names, seen) {
     for (const name of names) {
       const original = prototype[name]
+      const gauge = this
       prototype[name] = function (...args) {
+        if (prototype === InstrumentationEventEmitter.prototype && !seen.has(this)) {
+          gauge.emitterOrigins.set(this, new Error().stack)
+        }
         seen.add(this)
         return original.apply(this, args)
       }
@@ -535,6 +573,11 @@ class ResourceGauge {
 
   /** @returns {void} Restores observers only after the final resource proof. */
   uninstall() {
+    this.timerHook?.disable()
+    this.timerHook = null
+    this.timers.clear()
+    this.runs.clear()
+    this.emitterOrigins.clear()
     for (const restore of this.restores.splice(0).reverse()) restore()
     this.ledgers.clear()
     this.queues.clear()
@@ -566,6 +609,87 @@ class ResourceGauge {
   }
 
   /**
+   * Attributes retained listeners and referenced timers to their original allocations.
+   * @returns {object} Owner names and creation stacks, alongside the unchanged count oracle.
+   */
+  owners() {
+    return {
+      clients: [...this.emitters].flatMap((owner, index) => {
+        const events = owner.emitter.eventNames().map((event) => ({
+          event: String(event),
+          listeners: owner.emitter.rawListeners(event).map((listener) => listener.name),
+        }))
+        return events.length
+          ? [
+              {
+                owner: `emitter-${index}`,
+                clientIds: [
+                  ...new Set(
+                    [...this.queues]
+                      .filter((queue) => queue.instrumentationEmitter === owner)
+                      .map((queue) => queue.clientId)
+                  ),
+                ],
+                origin: this.emitterOrigins.get(owner),
+                events,
+              },
+            ]
+          : []
+      }),
+      queues: [...this.queues].map((queue) => ({
+        clientId: queue.clientId,
+        broker: queue.broker,
+        pending: queue.pending.length,
+        inflight: queue.inflight.size,
+        listeners: queue.eventNames().map((event) => ({
+          event: String(event),
+          count: queue.listenerCount(event),
+        })),
+      })),
+      timers: [...this.timers].flatMap(([id, { handle, ...origin }]) => {
+        const timer = handle.deref()
+        return timer && !timer._destroyed && timer.hasRef()
+          ? [
+              {
+                id,
+                owner: this.timerOwner(timer),
+                callback: timer._onTimeout?.name,
+                delayMs: timer._idleTimeout,
+                ...origin,
+              },
+            ]
+          : []
+      }),
+    }
+  }
+
+  /**
+   * Names original timer fields without changing or clearing the handles they hold.
+   * @param {object} timer The original Timeout resource.
+   * @returns {string} Known object and field, or the allocation stack for other owners.
+   */
+  timerOwner(timer) {
+    const label = this.timerLabels.get(timer)
+    if (label) return label
+    for (const queue of this.queues) {
+      for (const field of ['requestTimeoutIntervalId', 'throttleCheckTimeoutId']) {
+        if (queue[field] === timer) return `${queue.clientId} ${queue.broker} RequestQueue.${field}`
+      }
+    }
+    for (const run of this.runs) {
+      if (run.manager.handle === timer) return `${run.options.groupId} HeartbeatManager.handle`
+      if (run.operation.timer === timer) return `${run.options.groupId} ShareRun.operation.timer`
+      for (const [id, node] of run.nodes) {
+        for (const field of ['operation', 'pacing']) {
+          if (node[field]?.timer === timer)
+            return `${run.options.groupId} node ${id} ${field}.timer`
+        }
+      }
+    }
+    return 'allocation stack'
+  }
+
+  /**
    * @param {object} sources Socket, process-listener and event-loop measurements.
    * @returns {{ snapshot: () => Promise<object> }} Probe with fixed keys and measured owner totals.
    */
@@ -580,6 +704,7 @@ class ResourceGauge {
         const snapshot = await probe.snapshot()
         return {
           ...snapshot,
+          owners: this.owners(),
           listeners: {
             ...snapshot.listeners,
             clients: this.listenerCount([...this.emitters].map(({ emitter }) => emitter)),
@@ -678,6 +803,8 @@ class CapabilityCase {
           ['admin', this.admin],
           ['consumer', this.consumer],
           ['producer', this.producer],
+          ['sentinel', this.sentinelConsumer],
+          ['verifier', this.verifier],
         ]
           .filter(([, client]) => client)
           .map(([name, client]) =>
@@ -735,6 +862,7 @@ class CapabilityCase {
       crashes: this.crashes.map((error) => describeError(error)),
       feature: this.feature,
       cleanupSteps: this.cleanupSteps,
+      resourceOwners: this.resourceOwners ?? this.gauge.owners(),
     }
   }
 
@@ -842,6 +970,7 @@ class CapabilityCase {
       else await this.refused(scope, expected)
     } finally {
       this.acknowledgements.restore()
+      this.resourceOwners = this.gauge.owners()
       this.gauge.uninstall()
     }
   }
@@ -895,6 +1024,7 @@ class CapabilityCase {
         order: run.order,
       })
     } finally {
+      this.resourceOwners = this.gauge.owners()
       this.gauge.uninstall()
     }
   }
@@ -1195,7 +1325,7 @@ class CapabilityCase {
 
   /**
    * Starts the unrelated group alongside the workload and joins its creation before cleanup proof.
-   * The paused temporary member used by setOffsets need not delay the share member's first join.
+   * The paused sentinel member need not delay the share member's first join.
    * @param {AbortSignal} scope The case scope, including the sentinel's original creation bound.
    * @returns {void}
    */
@@ -1205,19 +1335,62 @@ class CapabilityCase {
     )
     this.sentinelCreated = true
     const startedAt = performance.now()
-    this.sentinelReady = bounded(scope, 10000, () =>
-      this.admin.setOffsets({
-        groupId: this.sentinel,
-        topic: this.topic,
-        partitions: [{ partition: 0, offset: '0' }],
-      })
-    ).then(() => this.row('sentinel-created', { elapsedMs: performance.now() - startedAt }))
+    this.sentinelReady = bounded(scope, 10000, (signal) => this.createSentinel(signal)).then(() =>
+      this.row('sentinel-created', { elapsedMs: performance.now() - startedAt })
+    )
     this.sentinelReady.catch((error) =>
       this.row('sentinel-failed', {
         elapsedMs: performance.now() - startedAt,
         error: cleanupError(error),
       })
     )
+  }
+
+  /**
+   * Creates the unrelated committed group through a paused member whose listeners we own.
+   * @param {AbortSignal} signal The original sentinel creation scope.
+   * @returns {Promise<void>} Once the offset is committed and the temporary member is closed.
+   */
+  async createSentinel(signal) {
+    const consumer = this.client('sentinel').consumer({ groupId: this.sentinel })
+    this.sentinelConsumer = consumer
+    let joined = false
+    const remove = consumer.on(consumer.events.GROUP_JOIN, ({ payload }) => {
+      joined = true
+      this.row('sentinel-joined', { memberId: payload.memberId })
+    })
+    let stopping
+    const abort = () => {
+      stopping = consumer.disconnect({ timeout: 0 })
+      stopping.catch(() => {})
+    }
+    signal.addEventListener('abort', abort, { once: true })
+    try {
+      signal.throwIfAborted()
+      await bounded(signal, Infinity, () => consumer.connect())
+      await bounded(signal, Infinity, () => consumer.subscribe({ topics: [this.topic] }))
+      consumer.pause([{ topic: this.topic }])
+      await bounded(signal, Infinity, () =>
+        consumer.run({
+          eachBatchAutoResolve: false,
+          eachBatch: async () => {
+            throw new Error('The paused sentinel must not consume records')
+          },
+        })
+      )
+      if (!joined) throw new Error('The sentinel did not join its group')
+      await bounded(signal, Infinity, () =>
+        consumer.commitOffsets([{ topic: this.topic, partition: 0, offset: '0' }])
+      )
+    } finally {
+      try {
+        await consumer.disconnect({ timeout: signal.aborted ? 0 : 2000 })
+        await stopping
+      } finally {
+        signal.removeEventListener('abort', abort)
+        remove()
+      }
+    }
   }
 
   /**
@@ -1352,9 +1525,11 @@ class CapabilityCase {
    * @returns {Promise<void>}
    */
   async finish(scope) {
-    await bounded(scope, 10000, () => this.disconnect(this.consumer, 5000))
+    await this.cleanupStep('disconnect workload before verifier', () =>
+      bounded(scope, 10000, () => this.disconnect(this.consumer, 5000))
+    )
     expect(this.disconnects).toBe(1)
-    this.quiet = await assertQuietTerminalGroup({
+    this.verification = assertQuietTerminalGroup({
       kafka: this.client('verifier'),
       admin: this.admin,
       groupId: this.group,
@@ -1363,7 +1538,12 @@ class CapabilityCase {
       signal: scope,
       timeoutMs: 30000,
       record: (fields) => this.row('quiet-verifier', fields),
+      onClient: (client) => {
+        this.verifier = client
+      },
     })
+    this.verification.catch(() => {})
+    this.quiet = await this.verification
     this.broker = this.quiet.position.rows
     expect(this.quiet.delivered).toEqual([])
     expect(this.entries.map(({ identity }) => identity)).toEqual([this.expected])
@@ -1551,7 +1731,7 @@ describe('capability sentinel ownership', () => {
       const state = new CapabilityCase()
       const cleanup = new CleanupStack()
       state.stack = cleanup
-      state.admin = { setOffsets: () => creation }
+      state.createSentinel = () => creation
       state.row = jest.fn()
       state.startSentinel(NEVER)
       let settled = false

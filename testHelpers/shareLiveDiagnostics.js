@@ -226,7 +226,7 @@ const awaitTerminalSharePosition = async (admin, target, { signal, timeoutMs, la
 
 /**
  * Actively verifies an assigned same-group member is quiet, then rechecks the unchanged log ends.
- * @param {{kafka:object, admin:object, groupId:string, topic:string, partitions:object[], signal:AbortSignal, windowMs?:number, timeoutMs:number, record?:Function}} options Existing group and enclosing bound.
+ * @param {{kafka:object, admin:object, groupId:string, topic:string, partitions:object[], signal:AbortSignal, windowMs?:number, timeoutMs:number, record?:Function, onClient?:Function}} options Existing group and enclosing bound.
  * @returns {Promise<{delivered:string[], position:object}>} Actual quiet and position evidence.
  * @throws {Error} On any verifier delivery, failed cleanup, or nonterminal observation.
  */
@@ -240,12 +240,15 @@ const assertQuietTerminalGroup = async ({
   windowMs = 5000,
   timeoutMs,
   record,
+  onClient,
 }) =>
   bounded(signal, timeoutMs, async (scope) => {
     const observed = await fixtures.verifierMember(groupId, topic, {
       kafka,
       signal: scope,
       windowMs,
+      record,
+      onClient,
     })
     const delivered = observed.map(({ identity }) => identity)
     record?.({ status: delivered.length ? 'failed' : 'quiet', groupId, topic, windowMs, delivered })
