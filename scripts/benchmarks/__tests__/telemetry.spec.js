@@ -2256,6 +2256,187 @@ describe('telemetry benchmark session', () => {
 })
 
 describe('telemetry review regressions', () => {
+  test('in-window Push capture forwards unchanged bytes before any independent decoding or hashing', () => {
+    const i16 = (n) => {
+      const b = Buffer.alloc(2)
+      b.writeInt16BE(n)
+      return b
+    }
+    const i32 = (n) => {
+      const b = Buffer.alloc(4)
+      b.writeInt32BE(n)
+      return b
+    }
+    const frame = (...parts) => {
+      const body = Buffer.concat(parts)
+      return Buffer.concat([i32(body.length), body])
+    }
+    const header = (api, correlation) =>
+      Buffer.concat([i16(api), i16(0), i32(correlation), i16(0), Buffer.from([0])])
+    const uuid = Buffer.alloc(16, 1)
+    const id = '01010101-0101-0101-0101-010101010101'
+    const raw = Buffer.from('0a14121212100a01612a0b0a09310100000000000000', 'hex')
+    const gzip = zlib.gzipSync(raw)
+    const push = frame(
+      header(72, 2),
+      uuid,
+      i32(7),
+      Buffer.from([0, 1, gzip.length + 1]),
+      gzip,
+      Buffer.from([0])
+    )
+    const response = frame(i32(2), Buffer.from([0]), i32(0), i16(0), Buffer.from([0]))
+    const exports = [
+      {
+        v: 1,
+        node: '1',
+        seq: 1,
+        clientInstanceId: id,
+        pushIntervalMs: 1000,
+        dataBytes: raw.length,
+        dataSha256: hashBytes(raw),
+        terminating: false,
+        parse: 'ok',
+      },
+    ]
+    const evidence = new EvidenceWriter(tmp())
+    const probe = new TelemetryPushProbe({ evidence, now: () => 1000 })
+    const order = []
+    const forwarded = {}
+    const socket = new (require('node:events').EventEmitter)()
+    const write = jest.fn(() => forwarded)
+    socket.write = write
+    socket.on('data', () => order.push('data'))
+    const tapped = probe.wrap(
+      () => socket,
+      () => '1'
+    )({})
+    tapped.write(frame(header(71, 1), uuid, Buffer.from([0])))
+    tapped.emit(
+      'data',
+      frame(
+        i32(1),
+        Buffer.from([0]),
+        i32(0),
+        i16(0),
+        uuid,
+        i32(7),
+        Buffer.from([1]),
+        i32(1000),
+        i32(4096),
+        Buffer.from([1, 1, 0])
+      )
+    )
+    write.mockImplementation(() => {
+      order.push('write')
+      tapped.emit('data', response)
+      return forwarded
+    })
+    order.length = 0
+    const decode = zlib.gunzipSync
+    const decoder = jest.spyOn(zlib, 'gunzipSync').mockImplementation((...args) => {
+      order.push('decode')
+      return decode(...args)
+    })
+    const hasher = jest.spyOn(require('node:crypto'), 'createHash')
+    try {
+      const callback = jest.fn()
+      expect(tapped.write(push, callback)).toBe(forwarded)
+      expect(write).toHaveBeenLastCalledWith(push, callback)
+      expect(order).toEqual(['write', 'data'])
+      expect(decoder).not.toHaveBeenCalled()
+      expect(hasher).not.toHaveBeenCalled()
+      const captured = probe.records.find((r) => r.kind === 'push')
+      expect(Object.keys(captured).sort()).toEqual([
+        'apiKey',
+        'bodyHex',
+        'correlation',
+        'errorCode',
+        'kind',
+        'node',
+        'observedMs',
+        'socket',
+      ])
+      const records = probe.finish()
+      expect(order.indexOf('decode')).toBeGreaterThan(order.indexOf('data'))
+      expect(decoder).toHaveBeenCalled()
+      expect(hasher).toHaveBeenCalled()
+      const options = {
+        active: true,
+        intervalMs: 1000,
+        clients: 1,
+        window: { startMs: 999, endMs: 1001 },
+        exports,
+      }
+      expect(telemetryEvidence(records, options)).toEqual({ clients: 1, pushes: 1 })
+      const archived = readChunks(
+        evidence.directory,
+        evidence.artifacts(),
+        'delivery-telemetry'
+      ).flatMap((chunk) =>
+        chunk
+          .toString()
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line))
+      )
+      expect(telemetryEvidence(archived, options)).toEqual({ clients: 1, pushes: 1 })
+      const corrupt = archived.map((record) => {
+        if (record.kind !== 'push') return record
+        const body = Buffer.from(record.bodyHex, 'hex')
+        body[23] ^= 255
+        return { ...record, bodyHex: body.toString('hex') }
+      })
+      expect(() => telemetryEvidence(corrupt, options)).toThrow()
+      expect(() =>
+        telemetryEvidence(archived, {
+          ...options,
+          exports: exports.map((e) => ({ ...e, dataSha256: '0'.repeat(64) })),
+        })
+      ).toThrow(/exporter/)
+
+      const overflow = new TelemetryPushProbe({ evidence: new EvidenceWriter(tmp()), maxFrame: 16 })
+      const failingSocket = new (require('node:events').EventEmitter)()
+      const failedWrite = jest.fn(() => forwarded)
+      failingSocket.write = failedWrite
+      const failingTap = overflow.wrap(() => failingSocket)({})
+      expect(failingTap.write(push, callback)).toBe(forwarded)
+      expect(failedWrite).toHaveBeenCalledWith(push, callback)
+      expect(() => overflow.finish()).toThrow(/latched/)
+    } finally {
+      decoder.mockRestore()
+      hasher.mockRestore()
+    }
+  })
+
+  test('captured chunks defer hashing until the telemetry series is sealed', () => {
+    const evidence = new EvidenceWriter(tmp())
+    const bytes = Buffer.from('captured wire bytes')
+    const hasher = jest.spyOn(require('node:crypto'), 'createHash')
+    try {
+      evidence.chunk('delivery-telemetry', bytes, { deferHash: true })
+      evidence.chunk('delivery-exports', bytes, { deferHash: true })
+      expect(hasher).not.toHaveBeenCalled()
+      expect(() => evidence.artifacts()).toThrow(/unsealed/)
+      evidence.sealChunks('delivery-telemetry')
+      expect(hasher).toHaveBeenCalled()
+      expect(
+        readChunks(
+          evidence.directory,
+          evidence.artifacts('delivery-telemetry'),
+          'delivery-telemetry'
+        )
+      ).toEqual([bytes])
+      expect(() => evidence.artifacts()).toThrow(/unsealed/)
+      evidence.sealChunks('delivery-exports')
+      expect(readChunks(evidence.directory, evidence.artifacts(), 'delivery-telemetry')).toEqual([
+        bytes,
+      ])
+    } finally {
+      hasher.mockRestore()
+    }
+  })
+
   test('export polling archives full rows with independent node cursors and preserves failures', async () => {
     const evidence = new EvidenceWriter(tmp())
     const requests = []
@@ -2607,6 +2788,26 @@ describe('telemetry review regressions', () => {
 })
 
 describe('telemetry frozen provenance', () => {
+  test('driver and session only overlay resolves consume bytes from the manifest and frozen roots', () => {
+    const manifest = makeManifest('requests-normal')
+    const overlay = tmp()
+    for (const name of ['driver', 'session']) {
+      const staged = path.join(overlay, path.basename(manifest[name].path))
+      fs.copyFileSync(manifest[name].path, staged)
+      manifest[name] = asset(staged)
+    }
+    const consume = path.join(manifest.arms[0].root, 'scripts/benchmarks/consumeThroughput.js')
+    manifest.consume = asset(consume)
+    expect(fs.readdirSync(overlay).sort()).toEqual(['session.js', 'telemetry.js'])
+    const staged = require(manifest.driver.path)
+    expect(() => staged.validateManifest(manifest)).not.toThrow()
+    const changed = path.join(tmp(), 'consume.js')
+    fs.writeFileSync(changed, 'different inherited consume bytes')
+    expect(() => staged.validateManifest({ ...manifest, consume: asset(changed) })).toThrow(
+      /consume driver/
+    )
+  })
+
   test('supervisor rejects unused assets runtime drift and modified frozen source before spawning', () => {
     for (const change of [
       (m) => {
