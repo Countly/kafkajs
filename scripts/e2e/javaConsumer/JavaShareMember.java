@@ -1,3 +1,5 @@
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -16,8 +18,8 @@ import org.apache.kafka.common.TopicIdPartition;
 /**
  * Development-only explicit-acknowledgement share member for mixed Java/JavaScript scenarios.
  *
- * <p>Arguments: {@code --role share-member [--halt-after N] [--report-polls] bootstrapServers
- * groupId topic runForMs}, or {@code --role share-member --probe}. Stdout contains record JSON
+ * <p>Arguments: {@code --role share-member [--halt-after N] [--report-polls] [--close-file path]
+ * bootstrapServers groupId topic runForMs}, or {@code --role share-member --probe}. Stdout contains record JSON
  * lines and a final {@code {"event":"done"}} after successful close. Offsets are decimal strings
  * and a missing delivery count is JSON null. A deliberate halt prints its last record before
  * halting, without acknowledging that record, committing that poll, closing, or running shutdown
@@ -26,6 +28,7 @@ import org.apache.kafka.common.TopicIdPartition;
  * <p>With {@code --report-polls} every nonempty poll is first flushed whole as a {@code poll}
  * line, before any record line, acknowledgement or halt, and a {@code committed} line follows
  * only once its commit reported no partition error.
+ * The optional close file requests normal close between polls; runForMs remains the lifetime cap.
  */
 public final class JavaShareMember {
   /** Prevents construction of this command-line entry point. */
@@ -42,6 +45,7 @@ public final class JavaShareMember {
       String role = null;
       boolean probe = false;
       boolean reportPolls = false;
+      Path closeFile = null;
       int haltAfter = 0;
       for (int i = 0; i < args.length; i++) {
         switch (args[i]) {
@@ -55,6 +59,9 @@ public final class JavaShareMember {
           case "--report-polls":
             reportPolls = true;
             break;
+          case "--close-file":
+            closeFile = Path.of(args[++i]);
+            break;
           case "--probe":
             probe = true;
             break;
@@ -65,16 +72,20 @@ public final class JavaShareMember {
       }
       if (!"share-member".equals(role)) throw new IllegalArgumentException();
       if (probe) {
-        if (!positional.isEmpty() || haltAfter != 0 || reportPolls) throw new IllegalArgumentException();
+        if (!positional.isEmpty() || haltAfter != 0 || reportPolls || closeFile != null) {
+          throw new IllegalArgumentException();
+        }
         probe();
         return;
       }
       if (positional.size() != 4) throw new IllegalArgumentException();
       long runForMs = Long.parseLong(positional.get(3));
       if (runForMs <= 0 || runForMs > Integer.MAX_VALUE) throw new IllegalArgumentException();
-      consume(positional.get(0), positional.get(1), positional.get(2), runForMs, haltAfter, reportPolls);
+      if (haltAfter > 0 && closeFile != null) throw new IllegalArgumentException();
+      consume(positional.get(0), positional.get(1), positional.get(2), runForMs,
+          haltAfter, reportPolls, closeFile);
     } catch (IllegalArgumentException | IndexOutOfBoundsException e) {
-      System.err.println("Usage: --role share-member [--halt-after N] [--report-polls] bootstrapServers groupId topic runForMs; or --role share-member --probe");
+      System.err.println("Usage: --role share-member [--halt-after N] [--report-polls] [--close-file path] bootstrapServers groupId topic runForMs; or --role share-member --probe");
       System.exit(2);
     }
   }
@@ -88,9 +99,10 @@ public final class JavaShareMember {
    * @param runForMs positive polling lifetime in milliseconds, bounded by Integer.MAX_VALUE
    * @param haltAfter positive number of emitted records before halt, or zero to finish normally
    * @param reportPolls whether to flush the complete poll before any decision, then its commit receipt
+   * @param closeFile optional parent request to close normally after the current poll is committed
    */
   private static void consume(String bootstrapServers, String groupId, String topic,
-                              long runForMs, int haltAfter, boolean reportPolls) {
+                              long runForMs, int haltAfter, boolean reportPolls, Path closeFile) {
     Properties properties = new Properties();
     properties.put("bootstrap.servers", bootstrapServers);
     properties.put("group.id", groupId);
@@ -106,7 +118,8 @@ public final class JavaShareMember {
       long lifetime = Duration.ofMillis(runForMs).toNanos();
       int count = 0;
       long pollId = 0;
-      while (System.nanoTime() - started < lifetime) {
+      while (System.nanoTime() - started < lifetime
+          && (closeFile == null || !Files.exists(closeFile))) {
         ConsumerRecords<byte[], byte[]> records = consumer.poll(Duration.ofMillis(500));
         if (!records.isEmpty() && reportPolls) printPoll(++pollId, records, consumer.acquisitionLockTimeoutMs());
         for (ConsumerRecord<byte[], byte[]> record : records) {
