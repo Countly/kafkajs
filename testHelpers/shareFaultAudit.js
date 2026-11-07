@@ -610,10 +610,11 @@ class FaultCapture {
       }
       const socket = connection.socket
       if (socket && !this.sockets.has(socket)) {
-        this.sockets.set(
-          socket,
-          new Map(['error', 'close'].map((name) => [name, socket.rawListeners(name)]))
-        )
+        const [onClose] = socket.listeners('end')
+        const close = socket.rawListeners('close')
+        assert.equal(typeof onClose, 'function', 'original socket end handler')
+        assert(close.includes(onClose), 'original socket close handler')
+        this.sockets.set(socket, { onClose, close, error: socket.rawListeners('error') })
       }
       return next()
     })
@@ -1599,7 +1600,7 @@ class FaultCase {
 
   /**
    * Checks exact timer/open-socket/vector baselines and original listener identities. The inert
-   * socket error/close handlers retained by Connection are compared separately from active ones.
+   * socket error handler and independent close listeners survive removal of KafkaJS's close handler.
    * @returns {Promise<void>}
    * @throws {AssertionError} For any leaked resource or unexpected listener change.
    */
@@ -1640,9 +1641,14 @@ class FaultCase {
       for (const name of ['data', 'end', 'timeout'])
         assert.equal(socket.listenerCount(name), 0, `socket ${name} listeners`)
       const before = this.observer.sockets.get(socket)
-      if (before)
-        for (const name of ['error', 'close'])
-          assert.deepEqual(socket.rawListeners(name), before.get(name), `socket ${name} identities`)
+      if (before) {
+        assert.deepEqual(socket.rawListeners('error'), before.error, 'socket error identities')
+        assert.deepEqual(
+          socket.rawListeners('close'),
+          before.close.filter((listener) => listener !== before.onClose),
+          'socket close identities'
+        )
+      }
     }
     assert.equal(this.audit.handlers.size, 0, 'active application calls')
     for (const [ledger, cohort] of this.observer.ledgers) {

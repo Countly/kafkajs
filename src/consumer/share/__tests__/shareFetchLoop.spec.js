@@ -343,12 +343,12 @@ const episode = (captured, guard = () => null) => ({
 const SOCKET_EVENTS = ['data', 'end', 'error', 'close', 'timeout', 'connect']
 /**
  * @param {object} socket A fake socket.
- * @returns {Record<string, number>} How many listeners it has for each event the client uses.
+ * @returns {Record<string, Function[]>} Exact listener identities for each event the client uses.
  */
 const listeners = (socket) =>
-  Object.fromEntries(SOCKET_EVENTS.map((name) => [name, socket.listenerCount(name)]))
-/** What a closed data socket keeps: the client removes only these three listeners and keeps `error`, inert. */
-const REMOVED_ON_CLOSE = { data: 0, end: 0, timeout: 0 }
+  Object.fromEntries(SOCKET_EVENTS.map((name) => [name, socket.rawListeners(name)]))
+/** Cleared event lists; close loses only the captured KafkaJS end handler, and error stays inert. */
+const REMOVED_ON_CLOSE = { data: [], end: [], timeout: [] }
 const A0 = { topicId: A, partition: 0 }
 const A1 = { topicId: A, partition: 1 }
 const batchOf = (first, last, type) => ({
@@ -1985,8 +1985,13 @@ describe('share node socket integration', () => {
       const m = await established()
       const connection = m.pool.pool[1]
       const { socket, requestQueue: queue } = connection
+      const [onEnd] = socket.listeners('end')
+      const onClose = jest.fn()
+      socket.on('close', onClose)
       const baseline = listeners(socket)
-      expect(baseline.data).toBeGreaterThan(0)
+      expect(baseline.data.length).toBeGreaterThan(0)
+      expect(typeof onEnd).toBe('function')
+      expect(baseline.close).toContain(onEnd)
       const captured = m.loop.captureFinal()
       const gate = h.hold({ api: 'ShareAcknowledge' })
       const operation = new ConsumerOperation({ deadlineAt: 2000, now: () => h.clock.time })
@@ -2007,7 +2012,11 @@ describe('share node socket integration', () => {
         expect(okResults(m)).toEqual([])
         expect(m.loop.exchanges.size).toBe(0)
         await until(() => !connection.isConnected(), 'the unanswered final transport to close')
-        expect(listeners(socket)).toEqual({ ...baseline, ...REMOVED_ON_CLOSE })
+        expect(listeners(socket)).toEqual({
+          ...baseline,
+          ...REMOVED_ON_CLOSE,
+          close: baseline.close.filter((listener) => listener !== onEnd),
+        })
         expect([queue.pending.length, queue.inflight.size]).toEqual([0, 0])
         expect([operation.waiters.size, operation.disposers.size]).toEqual([0, 0])
         expect([m.session.queue.length, m.loop.cohorts.size]).toEqual([0, 0])
@@ -2094,8 +2103,13 @@ describe('share node socket integration', () => {
       const connection = m.pool.pool[1]
       const queue = connection.requestQueue
       const dataSocket = connection.socket
+      const [onEnd] = dataSocket.listeners('end')
+      const onClose = jest.fn()
+      dataSocket.on('close', onClose)
       const dataBaseline = listeners(dataSocket)
-      expect(dataBaseline.data).toBeGreaterThan(0)
+      expect(dataBaseline.data.length).toBeGreaterThan(0)
+      expect(typeof onEnd).toBe('function')
+      expect(dataBaseline.close).toContain(onEnd)
       const heartbeat = listeners(m.pool.pool[0].socket)
       const sockets = h.cluster.sockets().length
       const gate = h.hold({ api: 'ShareFetch' })
@@ -2106,7 +2120,11 @@ describe('share node socket integration', () => {
       m.loop.dispose(new Error('node closed'))
       expect((await round).error.message).toBe('node closed')
       await until(() => !connection.isConnected(), 'the data socket to close')
-      expect(listeners(dataSocket)).toEqual({ ...dataBaseline, ...REMOVED_ON_CLOSE })
+      expect(listeners(dataSocket)).toEqual({
+        ...dataBaseline,
+        ...REMOVED_ON_CLOSE,
+        close: dataBaseline.close.filter((listener) => listener !== onEnd),
+      })
       expect([queue.inflight.size, queue.pending.length]).toEqual([0, 0])
       expect([m.operation.waiters.size, m.operation.disposers.size]).toEqual([0, 0])
       expect([m.session.queue.length, m.loop.exchanges.size, m.loop.cohorts.size]).toEqual([

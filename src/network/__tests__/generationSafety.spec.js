@@ -222,8 +222,24 @@ describe('Network > generation failure boundaries', () => {
   )
 
   it('an intentional disconnect ignores its socket close without another queue event', async () => {
-    const { connection, cluster, pending } = await stalledBroker()
-    const socket = cluster.sockets()[0]
+    const fake = createFakeSocketFactory()
+    const connection = new Connection(
+      connectionOpts({ socketFactory: fake.factory, enforceRequestTimeout: false })
+    )
+    connections.push(connection)
+    await connection.connect()
+    const socket = fake.state.socket
+    const onClose = jest.fn()
+    socket.on('close', onClose)
+    const pending = settle(
+      connection.send({
+        ...noResponseProtocol,
+        request: { ...noResponseProtocol.request, expectResponse: () => true },
+      })
+    )
+    await new Promise(setImmediate)
+    expect(fake.state.writes).toHaveLength(1)
+    expect(connection.requestQueue.inflight.size).toBe(1)
     const fail = jest.spyOn(connection, 'failGeneration')
     const queueState = jest.spyOn(connection.requestQueue, 'emitQueueState')
 
@@ -231,8 +247,13 @@ describe('Network > generation failure boundaries', () => {
     await new Promise(setImmediate)
 
     expect(socket.destroyed).toBe(true)
+    expect(onClose).toHaveBeenCalledTimes(1)
+    expect(onClose).toHaveBeenCalledWith(false)
     expect(connection.isConnected()).toBe(false)
+    expect(connection.socket).toBeNull()
     expect((await pending).error).toBeInstanceOf(KafkaJSConnectionClosedError)
+    expect(connection.requestQueue.inflight.size).toBe(0)
+    expect(connection.requestQueue.pending).toHaveLength(0)
     expect(fail).not.toHaveBeenCalled()
     expect(queueState).toHaveBeenCalledTimes(1)
   })
