@@ -122,6 +122,7 @@ module.exports = class TelemetryMetrics {
   #kind
   #clock
   #logger
+  #warnedSubscription = null
   #wall
   #mono
   #lastTime
@@ -211,13 +212,18 @@ module.exports = class TelemetryMetrics {
   }
 
   /**
-   * Contains a fixed diagnostic and a hostile logger without exposing the original exception.
-   * @returns {void}
+   * Defers a fixed diagnostic so application logging cannot interrupt a commit/socket write.
+   * @returns {void} warns at most once per subscription revision; logger failures are contained
    */
   #warn() {
-    try {
-      this.#logger?.warn('Telemetry numeric observation was discarded')
-    } catch {}
+    const revision = this.#subscription?.revision
+    if (this.#warnedSubscription === revision) return
+    this.#warnedSubscription = revision
+    Promise.resolve().then(() => {
+      try {
+        this.#logger?.warn('Telemetry numeric observation was discarded')
+      } catch {}
+    })
   }
 
   /**
@@ -645,7 +651,7 @@ module.exports = class TelemetryMetrics {
   /**
    * Merges an omitted/unsent frozen gauge with later observations; never subtracts maxima.
    * @param {object} state current metric @param {object|null} frozen earlier window
-   * @returns {void} invalid/overflowed windows are discarded, with a fixed diagnostic
+   * @returns {void} invalid/overflowed windows are discarded, with a deferred fixed diagnostic
    */
   #merge(state, frozen) {
     if (!frozen) return
@@ -668,7 +674,7 @@ module.exports = class TelemetryMetrics {
    * Commits only included issued identities at actual write, independent of response success or loss.
    * @param {object} snapshot issued sample
    * @param {Array<{key:string,revision:bigint}>} includedIdentities points actually encoded, not names
-   * @returns {void} obsolete/repeated callbacks cannot advance replacement baselines
+   * @returns {void} no application callbacks; obsolete/repeated commits cannot advance replacement baselines
    */
   written(snapshot, includedIdentities) {
     if (!this.isCurrent(snapshot)) return

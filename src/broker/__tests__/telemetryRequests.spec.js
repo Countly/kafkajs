@@ -640,3 +640,124 @@ it.each(['suspend', 'close'])(
     }
   }
 )
+
+it.each([true, false])(
+  'writes and commits an omitted-gauge overflow before collector logger suspension=%s',
+  async (suspend) => {
+    const h = await setup({ enforceRequestTimeout: false })
+    jest.useFakeTimers({ now: 0, doNotFake: ['setImmediate', 'nextTick'] })
+    let release
+    const held = new Promise((resolve) => {
+      release = resolve
+    })
+    let snapshot
+    const writesAtWarning = []
+    const currentAtWarning = []
+    const logger = {
+      warn: jest.fn(() => {
+        writesAtWarning.push(h.fake.state.writes.map((frame) => readRequestHeader(frame).apiKey))
+        currentAtWarning.push(metrics.isCurrent(snapshot))
+        if (suspend) client.suspend()
+        throw new Error('hostile collector diagnostic')
+      }),
+    }
+    const metrics = new TelemetryMetrics({
+      kind: 'producer',
+      logger,
+      clock: { wallMs: () => 1000, monotonicNs: () => BigInt(jest.now()) * 1000000n },
+    })
+    const omissionLogger = { warn: jest.fn() }
+    const client = new ClientTelemetry({
+      kind: 'producer',
+      metrics,
+      logger: omissionLogger,
+      clock: { now: () => jest.now(), random: () => 0.5, setTimeout, clearTimeout },
+      transport: { candidates: () => [], open: () => {} },
+    })
+    client.connected = true
+    client.handle = {
+      push: (payload, options) => h.broker.pushTelemetry(payload, options),
+      isConnected: () => h.connection.isConnected(),
+      retire: () => h.pool.destroy({ drainTimeout: 0 }),
+    }
+    const sumName = 'org.apache.kafka.producer.connection.creation.total'
+    const averageName = 'org.apache.kafka.producer.node.request.latency.avg'
+    client.install({
+      clientInstanceId: ID,
+      subscriptionId: 1,
+      acceptedCompressionTypes: [0],
+      pushIntervalMs: 1000,
+      telemetryMaxBytes: 160,
+      deltaTemporality: true,
+      requestedMetrics: [sumName, averageName],
+    })
+    client.clearTimer()
+    const subscription = client.subscription
+    const ref = metrics.bindNode({ nodeId: 1, endpoint: 'a:9092', endpointRevision: 1 })
+    metrics.observeConnection({})
+    metrics.observeRequest(ref, 1)
+    const buildPayload = client.payload.buildPayload.bind(client.payload)
+    let fitted
+    client.payload.buildPayload = async (sample, options) => {
+      snapshot = sample
+      await held
+      fitted = await buildPayload(sample, options)
+      return fitted
+    }
+    h.connection.requestQueue.maybeThrottle(100)
+    const pending = client.run('push')
+    try {
+      await turn()
+      expect(snapshot.points.map((point) => [point.name, point.value])).toEqual([
+        [sumName, 1n],
+        [averageName, 1],
+      ])
+      metrics.observeRequest(ref, Number.MAX_SAFE_INTEGER)
+      expect(logger.warn).not.toHaveBeenCalled()
+      release()
+      await turn()
+      expect(fitted.includedIdentities).toEqual([snapshot.points[0].identity])
+      expect(fitted.omittedIdentities).toEqual([snapshot.points[1].identity])
+      expect(h.connection.requestQueue.pending).toHaveLength(1)
+      expect(h.fake.state.writes).toEqual([])
+      expect(metrics.isCurrent(snapshot)).toBe(true)
+
+      await jest.advanceTimersByTimeAsync(100)
+      await turn()
+      expect(logger.warn).toHaveBeenCalledTimes(1)
+      expect(writesAtWarning).toEqual([[72]])
+      expect(currentAtWarning).toEqual([false])
+      expect(h.fake.state.writes).toHaveLength(1)
+      const frame = h.fake.state.writes[0]
+      const header = readRequestHeader(frame)
+      const push = pushPair.readRequest(frame.subarray(header.byteLength))
+      expect(push).toEqual({
+        clientInstanceId: ID,
+        subscriptionId: 1,
+        terminating: false,
+        compressionType: 0,
+        metrics: fitted.metrics.toString('hex'),
+      })
+      const bytes = Buffer.from(push.metrics, 'hex')
+      expect(bytes.includes(Buffer.from(sumName))).toBe(true)
+      expect(bytes.includes(Buffer.from(averageName))).toBe(false)
+      if (!suspend)
+        respondWithFrame(h.fake.state, header.correlationId, 1, pushPair.buildResponse())
+      await pending
+      expect(client.connected).toBe(!suspend)
+      expect(omissionLogger.warn).toHaveBeenCalledTimes(1)
+      expect(client.omittedPoints).toBe(1n)
+      const next = metrics.snapshot(subscription)
+      expect(next.points.map((point) => [point.name, point.value])).toEqual([[sumName, 0n]])
+      metrics.abandon(next)
+    } finally {
+      release()
+      client.suspend()
+      await h.pool.destroy({ drainTimeout: 0 })
+      await pending
+      const timers = jest.getTimerCount()
+      jest.useRealTimers()
+      expect(timers).toBe(0)
+    }
+  }
+)

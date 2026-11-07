@@ -1,12 +1,13 @@
 const TelemetryMetrics = require('../metrics')
 const { KafkaJSInvalidConfigurationError } = require('../../errors')
 
-/** @returns {object} exact-time collector fixture */
-const fixture = () => {
+/** @param {object|null} logger diagnostic sink @returns {object} exact-time collector fixture */
+const fixture = (logger = null) => {
   let time = 0n
   let revision = 0n
   const metrics = new TelemetryMetrics({
     kind: 'producer',
+    logger,
     clock: { wallMs: () => 0, monotonicNs: () => time },
   })
   return {
@@ -89,6 +90,44 @@ describe('written metric baselines preserve exact temporality', () => {
     metrics.abandon(first)
     expect(metrics.snapshot(s).points.map((p) => p.value)).toEqual([0n, 5, 8])
   })
+
+  test.each(['written', 'abandon'])(
+    'defers overflow diagnostics and warns once per subscription revision on %s',
+    async (commit) => {
+      const logger = {
+        warn: jest.fn(() => {
+          throw new Error('hostile diagnostic')
+        }),
+      }
+      const { metrics, select } = fixture(logger)
+      let subscription = select(true, [
+        'org.apache.kafka.producer.connection.creation.total',
+        'org.apache.kafka.producer.node.request.latency.avg',
+      ])
+      /** @param {number} nodeId fresh slot @returns {void} overflow only while settling the snapshot */
+      const overflow = (nodeId) => {
+        const ref = metrics.bindNode({ nodeId, endpoint: String(nodeId), endpointRevision: 1 })
+        metrics.observeRequest(ref, 1)
+        const sample = metrics.snapshot(subscription)
+        metrics.observeRequest(ref, Number.MAX_SAFE_INTEGER)
+        if (commit === 'written') metrics.written(sample, [sum(sample).identity])
+        else metrics.abandon(sample)
+        expect(metrics.isCurrent(sample)).toBe(false)
+      }
+      overflow(1)
+      expect(logger.warn).not.toHaveBeenCalled()
+      await Promise.resolve()
+      expect(logger.warn).toHaveBeenCalledTimes(1)
+      overflow(2)
+      await Promise.resolve()
+      expect(logger.warn).toHaveBeenCalledTimes(1)
+      subscription = select(true, subscription.requestedMetrics)
+      overflow(3)
+      expect(logger.warn).toHaveBeenCalledTimes(1)
+      await Promise.resolve()
+      expect(logger.warn).toHaveBeenCalledTimes(2)
+    }
+  )
 
   test('cumulative delta cumulative switches occur at accepted boundaries', () => {
     const { metrics, select, tick } = fixture()

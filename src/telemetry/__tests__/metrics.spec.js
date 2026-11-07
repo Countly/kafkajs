@@ -189,7 +189,7 @@ describe('metric names selectors and resources', () => {
     expect(metrics.snapshot(s).points.map((p) => p.value)).toEqual([0n, 3, 3])
   })
 
-  test('invalid numeric windows are omitted and the next interval restarts', () => {
+  test('invalid numeric windows are omitted and the next interval restarts', async () => {
     const logger = {
       warn: jest.fn(() => {
         throw new Error('logger')
@@ -205,6 +205,7 @@ describe('metric names selectors and resources', () => {
     metrics.observeRequest(ref, -1)
     const bad = metrics.snapshot(s)
     expect(bad.points.some((p) => p.name.endsWith('.avg'))).toBe(false)
+    await Promise.resolve()
     expect(logger.warn).toHaveBeenCalledTimes(1)
     metrics.written(
       bad,
