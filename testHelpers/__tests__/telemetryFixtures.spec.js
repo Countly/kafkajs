@@ -3115,6 +3115,7 @@ describe('telemetry observation segments', () => {
 })
 
 describe('telemetry profile', () => {
+  const scratch = []
   const { OBSERVER_LIMITS } = require('../telemetryFixtures')
   const { SCHEDULES, TelemetrySegments, segmentCatalogue } = require('../telemetrySegments')
   const { buildShutdownModel, writeShutdownArchive } = require('../segmentArchiveFixture')
@@ -3187,7 +3188,8 @@ describe('telemetry profile', () => {
     await Promise.allSettled(
       owners.flatMap((owner) => owner.undischarged().map((segment) => segment.observer?.dispose()))
     )
-    fs.rmSync(directory, { recursive: true, force: true })
+    for (const root of [directory, ...scratch.splice(0)])
+      fs.rmSync(root, { recursive: true, force: true })
   })
 
   test('keeps observation segments bounded', async () => {
@@ -3250,6 +3252,7 @@ describe('telemetry profile', () => {
     expect(catalogue.filter((id) => id.endsWith('-t0') || id.endsWith('-bh'))).toHaveLength(4)
     const model = buildShutdownModel()
     const archive = writeShutdownArchive(model)
+    scratch.push(archive.directory)
     const verify = ({ record, directory: root }) => verifyScenario(record, root)
     expect(() => verify(archive)).not.toThrow()
     const keyed = (id) =>
@@ -3545,8 +3548,11 @@ describe('telemetry profile', () => {
     expect(() => reader.readExports({ after: cursor })).toThrow('replaced after cursor')
     const bloated = buildShutdownModel()
     bloated.padding = 17 * 1024 * 1024
-    expect(() => writeShutdownArchive(bloated)).toThrow('Sidecar archive exceeds bound')
-    fs.rmSync(archive.directory, { recursive: true, force: true })
+    const overflow = fs.mkdtempSync(path.join(os.tmpdir(), 'telemetry-profile-overflow-'))
+    scratch.push(overflow)
+    expect(() => writeShutdownArchive(bloated, { directory: overflow })).toThrow(
+      'Sidecar archive exceeds bound'
+    )
     expect(SCHEDULES['telemetry-shutdown'].cap).toBe(21)
   }, 180000)
 })
