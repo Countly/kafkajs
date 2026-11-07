@@ -1726,6 +1726,7 @@ const {
   liveRun,
   NEVER,
   bounded,
+  delay,
 } = require('../../../src/producer/__tests__/fixtures/bounded')
 const {
   SHARE_SOAK,
@@ -3181,6 +3182,7 @@ describe('Share soak owner', () => {
     soak = {},
     short = true,
     clock,
+    idleWakeMs = 0,
   } = {}) => {
     let now = 0
     const timer = clock ?? { now: () => now }
@@ -3207,7 +3209,7 @@ describe('Share soak owner', () => {
       evidence: { write: (row) => rows.push(row), read: () => rows },
       gate,
       pause: async (_scope, ms) => {
-        now += ms
+        now += ms + idleWakeMs
       },
       clock: timer,
       slotMs,
@@ -3232,6 +3234,47 @@ describe('Share soak owner', () => {
       expect(owner.timing.slots).toHaveLength(30)
     }
   )
+
+  test.each([true, false])(
+    'accepts late idle wakes at every slot and phase without moving work cutoffs, short=%s',
+    async (short) => {
+      const { owner, rows } = build({ short, idleWakeMs: 3 })
+      const verdict = await owner.run()
+      await owner.close()
+
+      expect(verdict.ok).toBe(true)
+      expect(owner.elapsedProfileMs).toBe((short ? 960000 : 1920000) + 9)
+      for (const [index, slot] of owner.timing.slots.entries()) {
+        const phase = owner.timing.phases[Math.floor(index / 10)]
+        expect(slot.due).toBe(phase.startedAt + ((index % 10) + 1) * (short ? 32000 : 64000))
+        expect(slot.completedAt).toBe(slot.due + 3)
+        expect(slot.startedAt).toBeGreaterThanOrEqual(
+          index ? owner.timing.slots[index - 1].completedAt : phase.startedAt
+        )
+      }
+      for (const [index, phase] of owner.timing.phases.entries()) {
+        expect(phase.completedAt).toBe(phase.due + 3)
+        if (index)
+          expect(phase.startedAt).toBeGreaterThanOrEqual(owner.timing.phases[index - 1].completedAt)
+      }
+      for (const row of rows.filter(({ event }) => event === 'soak-cycle'))
+        expect(row.timing.completedAt).toBeLessThanOrEqual(row.timing.due)
+      expect(rows.filter(({ event }) => event === 'case-complete')).toHaveLength(1)
+    }
+  )
+
+  test('all phases share the idle-wake margin and cannot borrow the exit reserve', async () => {
+    const { owner, rows, gate } = build({ idleWakeMs: 3334 })
+    await expect(owner.run()).rejects.toThrow('shared profile deadline exceeded')
+    await owner.close()
+    expect(owner.elapsedProfileMs).toBe(970002)
+    expect(owner.timing.stages.filter(({ name }) => name === 'profile').at(-1)).toMatchObject({
+      due: 970000,
+      completedAt: 970002,
+    })
+    expect(gate.tainted).toBe(true)
+    expect(rows.some(({ event }) => event === 'case-complete')).toBe(false)
+  })
 
   test('runs three phases of ten cycles in order and records every cycle, reset and the completion', async () => {
     const { owner, driver, rows, shares } = build()
@@ -3549,8 +3592,8 @@ describe('Share soak owner', () => {
   })
 
   describe('the combined verdict', () => {
-    const complete = (mutate) => {
-      const { owner, rows } = build({ clock: { now: () => 967000 } })
+    const complete = (mutate, now = 967000) => {
+      const { owner, rows } = build({ clock: { now: () => now } })
       for (let cycle = 0; cycle < 30; cycle++) {
         const facts = cycleFacts(cycle)
         owner.recordCycle(ShareCycleOracle.plan(cycle), facts, [])
@@ -3584,6 +3627,18 @@ describe('Share soak owner', () => {
       expect(rows.filter(({ event }) => event === 'case-complete')).toHaveLength(1)
     })
 
+    test('accepts exactly the unallocated margin with original anchored deadlines', () => {
+      const { verdict, rows } = complete((o) => {
+        o.elapsedProfileMs = 970000
+        o.timing.phases[2].completedAt = 970000
+        o.timing.slots[29].completedAt = 970000
+        Object.assign(o.timing.stages[2], { due: 970000, completedAt: 970000 })
+        o.final = cycleFacts(29, { startedAt: 970000, due: 980000, kind: 'final' })
+      }, 977000)
+      expect(verdict).toMatchObject({ ok: true, violations: [] })
+      expect(rows.filter(({ event }) => event === 'case-complete')).toHaveLength(1)
+    })
+
     test.each([
       [
         'thirty replays of an old verifier window',
@@ -3605,11 +3660,50 @@ describe('Share soak owner', () => {
         'distinct post-profile',
       ],
       [
-        'an actual slot overrun hidden by a nominal profile total',
+        'a slot overlapping the next start',
         (o) => {
           o.timing.slots[5].completedAt++
         },
         'original slot, phase',
+      ],
+      [
+        'late work hidden inside an allowed idle wake',
+        (o, rows) => {
+          o.timing.slots[0].completedAt += 3
+          const row = rows.find(({ event }) => event === 'soak-cycle')
+          row.timing.completedAt = row.timing.due + 1
+        },
+        'cycle 0: the proof is outside its original slot',
+      ],
+      [
+        'a slot due drifting from its phase anchor',
+        (o) => o.timing.slots[5].due++,
+        'the original slot, phase or stage timestamps do not prove the fixed schedule',
+      ],
+      [
+        'a profile shorter than its declared duration',
+        (o) => o.elapsedProfileMs--,
+        'the actual uncapped profile duration does not reach the declared schedule',
+      ],
+      [
+        'profile overshoot beyond the unallocated margin',
+        (o) => (o.elapsedProfileMs += 10001),
+        'the actual uncapped profile overshoot exceeds the 10000 ms unallocated margin',
+      ],
+      [
+        'a slot whose padding ends before its boundary',
+        (o) => o.timing.slots[5].completedAt--,
+        'the original slot, phase or stage timestamps do not prove the fixed schedule',
+      ],
+      [
+        'a phase overlapping the next phase start',
+        (o) => o.timing.phases[0].completedAt++,
+        'the original slot, phase or stage timestamps do not prove the fixed schedule',
+      ],
+      [
+        'non-finite uncapped profile time',
+        (o) => (o.elapsedProfileMs = NaN),
+        'the actual uncapped profile duration does not reach the declared schedule',
       ],
       [
         'a whole profile with no slot chronology',
@@ -5037,6 +5131,7 @@ describe('Share soak complete original-owner schedules', () => {
     finalDamage = () => {},
     io = async () => {},
     assignmentDelay = 0,
+    idleWakeMs = 0,
     replayAt,
     drainReplay = false,
     socketClosed = () => {},
@@ -5434,6 +5529,10 @@ describe('Share soak complete original-owner schedules', () => {
       short,
       stack: new CleanupStack(),
       clock: { now: () => performance.now() },
+      pause: async (scope, ms) => {
+        await delay(scope, ms)
+        clock.skew(idleWakeMs)
+      },
       gate: new LiveRun(),
       evidence: {
         read: () => rows,
@@ -5514,10 +5613,15 @@ describe('Share soak complete original-owner schedules', () => {
     }
   }
 
-  test.each([true, false])(
-    'reconstructs thirty real adapter cycles and ten actual socket resets, short=%s',
-    async (short) => {
-      const { owner, rows, result, error, records } = await schedule({ short })
+  test.each([
+    [true, 0],
+    [false, 0],
+    [true, 3],
+    [false, 3],
+  ])(
+    'reconstructs thirty real adapter cycles and ten actual socket resets, short=%s, idleWakeMs=%s',
+    async (short, idleWakeMs) => {
+      const { owner, rows, result, error, records } = await schedule({ short, idleWakeMs })
       expect(error).toBeUndefined()
       expect(result).toMatchObject({
         ok: true,
@@ -5628,11 +5732,57 @@ describe('Share soak complete original-owner schedules', () => {
       expect(result.resources.measured.phases.every(({ heapSamples }) => heapSamples >= 6)).toBe(
         true
       )
-      expect(owner.elapsedProfileMs).toBe(short ? 960000 : 1920000)
+      expect(owner.elapsedProfileMs).toBe((short ? 960000 : 1920000) + 3 * idleWakeMs)
+      for (const [index, slot] of owner.timing.slots.entries()) {
+        const phase = owner.timing.phases[Math.floor(index / 10)]
+        expect(slot.due).toBe(phase.startedAt + ((index % 10) + 1) * (short ? 32000 : 64000))
+        expect(slot.completedAt).toBe(slot.due + idleWakeMs)
+        expect(slot.startedAt).toBeGreaterThanOrEqual(
+          index ? owner.timing.slots[index - 1].completedAt : phase.startedAt
+        )
+        expect(cycles[index].timing.completedAt).toBeLessThanOrEqual(slot.due)
+      }
+      for (const [index, phase] of owner.timing.phases.entries()) {
+        expect(phase.completedAt).toBe(phase.due + idleWakeMs)
+        if (index)
+          expect(phase.startedAt).toBeGreaterThanOrEqual(owner.timing.phases[index - 1].completedAt)
+      }
       expect(owner.budget).toMatchObject({
         watchdogMs: short ? 1020000 : 1980000,
         lifecycleMs: short ? 1440000 : 2400000,
       })
+    },
+    120000
+  )
+
+  test.each([
+    [
+      'a drifting slot deadline',
+      (owner) => owner.timing.slots[5].due++,
+      'the original slot, phase or stage timestamps do not prove the fixed schedule',
+    ],
+    [
+      'a profile shorter than declared',
+      (owner) => owner.elapsedProfileMs--,
+      'the actual uncapped profile duration does not reach the declared schedule',
+    ],
+    [
+      'profile overshoot beyond its margin',
+      (owner) => (owner.elapsedProfileMs += 10001),
+      'the actual uncapped profile overshoot exceeds the 10000 ms unallocated margin',
+    ],
+  ])(
+    'rejects %s when reconstructing the complete original-owner schedule',
+    async (_name, damage, message) => {
+      const { result, reason, rows } = await schedule({
+        finalDamage: (_final, { owner }) => damage(owner),
+      })
+      expect(result?.ok).not.toBe(true)
+      expect(reason).toContain(message)
+      expect(
+        rows.filter(({ event, status }) => event === 'soak-cycle' && status === 'passed')
+      ).toHaveLength(30)
+      expect(rows.some(({ event }) => event === 'case-complete')).toBe(false)
     },
     120000
   )

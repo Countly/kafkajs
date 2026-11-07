@@ -5195,6 +5195,9 @@ class ShareSoak {
       soakOptions: soak,
     })
     this.budget = SHARE_SOAK.budgets[mode]
+    const { totalMs, setupMs, profileMs, transitionMs, cleanupMs, exitMs } = this.budget
+    // Only idle-wake overhead may use the unallocated margin; cycle work keeps its fixed cutoff.
+    this.profileMarginMs = totalMs - (setupMs + profileMs + transitionMs + cleanupMs + exitMs)
     this.slotMs = slotMs ?? SHARE_SOAK.slotMs[mode]
     this.phaseMs = (short ? SHARE_SOAK.shortMs : SHARE_SOAK.fullMs) / SHARE_SOAK.phases.length
     this.stem = short ? 'share-soak' : 'share-soak-full'
@@ -5226,12 +5229,7 @@ class ShareSoak {
   async run() {
     this.gate.assertClean()
     this.startedAt = this.clock.now()
-    this.workDue =
-      this.startedAt +
-      this.budget.setupMs +
-      this.budget.profileMs +
-      this.budget.transitionMs +
-      this.budget.cleanupMs
+    this.workDue = this.startedAt + this.budget.totalMs - this.budget.exitMs
     try {
       const verdict = await bounded(
         NEVER,
@@ -5350,9 +5348,9 @@ class ShareSoak {
     this.phaseStartedAt = startedAt
     this.phaseDue = startedAt + ms
     try {
-      await this.stage('profile', async () => {
+      await this.stage('profile', async (scope) => {
         for (let i = 0; i < SHARE_SOAK.cyclesPerPhase; i++) {
-          await this.runCycle(index * SHARE_SOAK.cyclesPerPhase + i)
+          await this.runCycle(index * SHARE_SOAK.cyclesPerPhase + i, scope)
         }
       })
     } finally {
@@ -5368,10 +5366,11 @@ class ShareSoak {
    * Runs one cycle inside its slot, judges it, records it, and sleeps the rest of the slot. A cycle
    * that cannot finish inside its slot fails the scenario; the cycle count never shrinks to fit.
    * @param {number} cycle zero-based cycle
+   * @param {AbortSignal} [idleScope] enclosing profile scope for boundary padding
    * @returns {Promise<void>}
    * @throws {Error} the slot's expiry, or every broken check of the cycle
    */
-  async runCycle(cycle) {
+  async runCycle(cycle, idleScope = this.scope) {
     const plan = ShareCycleOracle.plan(cycle)
     const startedAt = this.clock.now()
     const slotIndex = cycle % SHARE_SOAK.cyclesPerPhase
@@ -5406,11 +5405,11 @@ class ShareSoak {
           this.counts.memberAdds += 1
           this.counts.memberRemoves += 1
           if (observation.reset) this.counts.resets += 1
-          // Idling to the slot boundary is not cycle work; a timer always wakes a little after due.
-          while (this.clock.now() < due) await this.pause(scope, due - this.clock.now())
         },
         `Cycle ${cycle}`
       )
+      // Boundary padding uses the profile's cumulative margin, outside the cycle-work timer.
+      while (this.clock.now() < due) await this.pause(idleScope, due - this.clock.now())
     } catch (error) {
       if (this.driver.lastCycle) this.recordCycle(plan, this.driver.lastCycle, [error.message])
       throw error
@@ -5529,13 +5528,15 @@ class ShareSoak {
    */
   async stage(name, work) {
     const startedAt = this.clock.now()
-    const allowance = this.budget[`${name}Ms`] - this.spent[name]
+    const margin = name === 'profile' ? this.profileMarginMs : 0
+    const allowance = this.budget[`${name}Ms`] + margin - this.spent[name]
+    const previousOvershoot = this.elapsedProfileMs - this.phasesDone * this.phaseMs
     if (name === 'cleanup') this.cleanupDue ??= Math.min(startedAt + allowance, this.workDue)
     const due = Math.min(
       startedAt + allowance,
       this.workDue,
       name === 'cleanup' ? this.cleanupDue : Infinity,
-      name === 'profile' ? this.phaseDue : Infinity
+      name === 'profile' ? this.phaseDue + margin - previousOvershoot : Infinity
     )
     if (startedAt >= due) throw new Error(`The shared ${name} deadline exhausted`)
     try {
@@ -5563,8 +5564,12 @@ class ShareSoak {
       .filter(({ event, scenario }) => event === 'soak-cycle' && scenario === this.nonce)
       .sort((a, b) => a.cycle - b.cycle)
     const violations = [...resources.violations]
-    if (this.elapsedProfileMs !== this.budget.profileMs)
-      violations.push('the actual uncapped profile duration differs from the declared schedule')
+    if (!Number.isFinite(this.elapsedProfileMs) || this.elapsedProfileMs < this.budget.profileMs)
+      violations.push('the actual uncapped profile duration does not reach the declared schedule')
+    if (this.elapsedProfileMs > this.budget.profileMs + this.profileMarginMs)
+      violations.push(
+        `the actual uncapped profile overshoot exceeds the ${this.profileMarginMs} ms unallocated margin`
+      )
     const expected = SHARE_SOAK.cycles
     const { slots, phases, stages } = this.timing
     if (
@@ -5575,18 +5580,31 @@ class ShareSoak {
         return (
           slot.cycle !== index ||
           !phase ||
+          ![slot.startedAt, slot.due, slot.completedAt].every(Number.isFinite) ||
           slot.due !== phase.startedAt + ((index % SHARE_SOAK.cyclesPerPhase) + 1) * this.slotMs ||
-          slot.completedAt !== slot.due ||
-          slot.startedAt > slot.completedAt
+          slot.completedAt < slot.due ||
+          slot.startedAt < phase.startedAt ||
+          slot.startedAt >= slot.due ||
+          slot.completedAt > phase.completedAt ||
+          (index > 0 && slot.startedAt < slots[index - 1].completedAt)
         )
       }) ||
       phases.some(
         (phase, index) =>
           phase.phase !== index ||
+          ![phase.startedAt, phase.due, phase.completedAt].every(Number.isFinite) ||
           phase.due !== phase.startedAt + this.phaseMs ||
-          phase.completedAt !== phase.due
+          phase.completedAt < phase.due ||
+          (index > 0 && phase.startedAt < phases[index - 1].completedAt)
       ) ||
-      stages.some(({ startedAt, completedAt, due }) => completedAt < startedAt || completedAt > due)
+      phases.reduce((total, phase) => total + (phase.completedAt - phase.startedAt), 0) !==
+        this.elapsedProfileMs ||
+      stages.some(
+        ({ startedAt, completedAt, due }) =>
+          ![startedAt, completedAt, due].every(Number.isFinite) ||
+          completedAt < startedAt ||
+          completedAt > due
+      )
     )
       violations.push(
         'the original slot, phase or stage timestamps do not prove the fixed schedule'
@@ -5595,7 +5613,7 @@ class ShareSoak {
       const spent = stages
         .filter((stage) => stage.name === name)
         .reduce((total, stage) => total + stage.completedAt - stage.startedAt, 0)
-      if (spent > this.budget[`${name}Ms`])
+      if (spent > this.budget[`${name}Ms`] + (name === 'profile' ? this.profileMarginMs : 0))
         violations.push(`the cumulative ${name} allocation exceeded`)
     }
     if (
@@ -5642,7 +5660,7 @@ class ShareSoak {
         row.timing?.kind !== 'cycle' ||
         row.timing.startedAt < slot.startedAt ||
         row.timing.due !== slot.due ||
-        row.timing.completedAt > slot.completedAt
+        row.timing.completedAt > slot.due
       )
         violations.push(`cycle ${row.cycle}: the proof is outside its original slot`)
       violations.push(...ShareCycleOracle.judge(ShareCycleOracle.plan(row.cycle), observation))
