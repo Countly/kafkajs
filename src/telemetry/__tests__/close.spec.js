@@ -6,7 +6,7 @@ const {
 } = require('../../../testHelpers/lifecycle')
 const { KafkaJSInvalidConfigurationError } = require('../../errors')
 
-const TIMEOUT_KINDS = TELEMETRY_KINDS.filter((kind) => kind !== 'admin')
+const TIMEOUT_KINDS = TELEMETRY_KINDS
 const FINAL_BOUNDARIES = ['S10', 'S11', 'S12', 'S13', 'S14', 'S15', 'S16', 'S17', 'S18']
 
 /**
@@ -60,15 +60,16 @@ const closing = async (cell, { boundary, mode = 'final', timeout = 1000, start }
   await round.ready()
   round.arm()
   const before = round.capture()
-  if (boundary === 'S15') {
-    const sent = round.pushes().length
-    round.tick()
-    await round.until(() => round.pushes().length > sent)
-  }
+  if (boundary === 'S15') await round.occupyFinalQueue()
   round.closePromise = round.beginClose(
     timeout === undefined ? undefined : round.closeOptions(timeout)
   )
+  if (boundary === 'S18') await round.expireForRetirement()
   if (gate) await round.wait(() => gate.arrived())
+  if (boundary === 'S15')
+    await round.until(() =>
+      round.dedicatedConnection.requestQueue.pending.some((request) => request.entry.apiKey === 72)
+    )
   return { round, gate, before }
 }
 
@@ -118,7 +119,7 @@ describe.each([false, true])('captured close with enforcement %s', (enforceReque
       }
     }, 60000)
 
-    test('C03 zero and elapsed budgets never start a final', async () => {
+    test('C03 zero budget never starts a final', async () => {
       const round = new PublicTelemetryRound(cell)
       try {
         await round.start()
@@ -132,6 +133,54 @@ describe.each([false, true])('captured close with enforcement %s', (enforceReque
         await round.dispose()
       }
     }, 60000)
+
+    test.each([7, 20])(
+      'C03 an original T20 budget already spent %s ms is never restarted',
+      async (spent) => {
+        const round = new PublicTelemetryRound(cell)
+        const Payload = require('../payload')
+        try {
+          await round.start()
+          await round.ready()
+          const before = round.capture()
+          let builds = 0
+          round.patch(
+            Payload.prototype,
+            'buildPayload',
+            (original) =>
+              function (...args) {
+                builds++
+                return original.apply(this, args)
+              }
+          )
+          round.patch(
+            round.binding,
+            'close',
+            (original) =>
+              function (budget) {
+                round.clock.jump(round.clock.now() + spent)
+                expect(budget.remaining()).toBe(20 - spent)
+                return original.call(this, budget)
+              }
+          )
+          const entry = round.clock.now()
+          await round.wait(() => round.beginClose(round.closeOptions(20)))
+          expect(round.machine.closing.deadline).toBe(entry + 20)
+          expect(round.machine.closing.deadline - round.closeEntry).toBeLessThanOrEqual(20)
+          expect(round.finalFrames()).toHaveLength(spent === 20 ? 0 : 1)
+          expect(builds).toBe(spent === 20 ? 0 : 1)
+          expect(round.newSetupCallsSince(before)).toEqual([])
+          expect(round.machine.uuid).toBe(TELEMETRY_UUID)
+          for (const write of round.socketWrites.filter(
+            (write) => write.bytes.readInt16BE(4) === 72 && write.time >= entry
+          ))
+            expect(write.time).toBeLessThan(round.machine.closing.deadline)
+        } finally {
+          await round.dispose()
+        }
+      },
+      60000
+    )
 
     test.each([
       ['no accepted ID', {}],
@@ -217,6 +266,65 @@ describe.each([false, true])('captured close with enforcement %s', (enforceReque
           expect(round.newSetupCallsSince(before)).toEqual([])
           expect(round.pushes()).toHaveLength(1)
           expect(round.machine.state).toBe('CLOSED')
+        } finally {
+          await round.dispose()
+        }
+      },
+      60000
+    )
+
+    test.each(['transport-refused', 'response-lost', 'decode-failure', 'blackhole'])(
+      'C06 final %s never retries or reconnects',
+      async (fault) => {
+        const round = new PublicTelemetryRound(cell)
+        const gate = round.hold('S13', { mode: 'final' })
+        try {
+          await round.start({ beforeConnect: (r) => r.useChaos() })
+          await round.ready()
+          round.arm()
+          const before = round.capture()
+          if (fault === 'decode-failure') {
+            const Connection = require('../../network/connection')
+            round.patch(
+              Connection.prototype,
+              'send',
+              (original) =>
+                function (options) {
+                  if (this === round.dedicatedConnection && options.request.apiKey === 72)
+                    options = {
+                      ...options,
+                      response: {
+                        ...options.response,
+                        decode: async () => {
+                          throw new Error('private decode')
+                        },
+                      },
+                    }
+                  return original.call(this, options)
+                }
+            )
+          }
+          round.closePromise = round.beginClose(round.closeOptions(1000))
+          await round.wait(() => gate.arrived())
+          const socket = round.dedicatedConnection.socket
+          if (fault === 'transport-refused') round.faultDedicated()
+          if (fault === 'response-lost') socket.dropResponses(1, { apiKey: 72 })
+          if (fault === 'blackhole') socket.blackhole()
+          await round.drainReleased(gate)
+          if (fault === 'response-lost' || fault === 'blackhole') {
+            expect(round.closeDone).toBe(false)
+            expect(round.machine.closing.attempted).toBe(true)
+            round.clock.jump(round.machine.closing.deadline)
+            await round.deliverCloseWatchdog()
+          }
+          await round.settleClose()
+          expect(round.finalFrames()).toHaveLength(
+            ['transport-refused', 'blackhole'].includes(fault) ? 0 : 1
+          )
+          expect(round.written.length - before.written).toBe(fault === 'transport-refused' ? 0 : 1)
+          expect(round.newSetupCallsSince(before)).toEqual([])
+          expect(round.machine.state).toBe('CLOSED')
+          expect(round.unhandled).toEqual([])
         } finally {
           await round.dispose()
         }
@@ -329,35 +437,162 @@ describe.each([false, true])('captured close with enforcement %s', (enforceReque
     }, 60000)
   })
 
-  test('C09 the core drain starts concurrently with the final work', async () => {
-    const round = new PublicTelemetryRound({ kind: 'consumer', enforceRequestTimeout })
+  test.each(
+    TELEMETRY_KINDS.flatMap((kind) => {
+      const stages =
+        kind === 'consumer'
+          ? ['handler', 'hook', 'commit', 'leave', 'cluster']
+          : kind === 'shareConsumer'
+            ? ['handler', 'ack', 'leave', 'cluster']
+            : kind === 'producer'
+              ? ['delivery', 'transaction', 'cluster']
+              : ['request', 'cluster']
+      return stages.flatMap((stage) => [false, true].map((enabled) => ({ kind, stage, enabled })))
+    })
+  )(
+    'C09 $kind core $stage drains concurrently enabled=$enabled',
+    async ({ kind, stage, enabled }) => {
+      const round = new PublicTelemetryRound({ kind, enforceRequestTimeout, enabled })
+      const { Schedule } = require('../../../testHelpers/schedule')
+      const schedule = new Schedule()
+      const core = schedule.hold({ boundary: stage })
+      round.gates.push(core)
+      let calls = 0
+      const hold = (target, key) =>
+        round.patch(
+          target,
+          key,
+          (original) =>
+            async function (...args) {
+              calls++
+              await schedule.run({ boundary: stage }, () => undefined)
+              return original.apply(this, args)
+            }
+        )
+      let pending
+      try {
+        const gate = enabled ? round.hold('S13', { mode: 'final' }) : null
+        await round.start({
+          client: kind === 'producer' ? { transactionalId: 'close-tx', linger: 0 } : {},
+          beforeConnect: (r) => {
+            if (kind === 'consumer')
+              r.runOptions = { rebalanceListener: { onPartitionsRevoked: async () => {} } }
+            if (stage === 'handler') {
+              r.runOptions = {
+                ...r.runOptions,
+                eachMessage: async () => {
+                  calls++
+                  await schedule.run({ boundary: stage }, () => undefined)
+                },
+              }
+              if (kind === 'shareConsumer') {
+                const {
+                  A,
+                  part,
+                  acquired,
+                  recordsHex,
+                  fetchAnswer,
+                } = require('../../../testHelpers/shareHarness')
+                r.harness.script('ShareFetch', [
+                  fetchAnswer([
+                    part({
+                      topicId: A,
+                      partition: 0,
+                      acquire: [acquired(0, 0)],
+                      records: recordsHex(0, ['held core handler']),
+                    }),
+                  ]),
+                ])
+              }
+            }
+          },
+        })
+        if (enabled) await round.ready()
+        if (stage === 'cluster') hold(round.cluster, 'disconnect')
+        else if (kind === 'consumer') {
+          const runner = round.runner
+          if (stage === 'handler') await round.wait(() => core.arrived())
+          if (stage === 'hook') hold(runner, 'invokeCloseHook')
+          if (stage === 'commit') {
+            runner.autoCommit = true
+            runner.consumerGroup.offsetManager.resolveOffset({
+              topic: 'test-topic',
+              partition: 0,
+              offset: '0',
+            })
+            hold(runner.consumerGroup, 'commitOffsets')
+          }
+          if (stage === 'leave') hold(runner.consumerGroup, 'leave')
+        } else if (kind === 'shareConsumer') {
+          if (stage === 'handler') await round.wait(() => core.arrived())
+          else if (stage === 'ack') {
+            await round.until(() => round.runner.current.nodes.size > 0)
+            hold(
+              require('../../consumer/share/shareFetchLoop').ShareFetchLoop.prototype,
+              'sendFinal'
+            )
+          } else hold(round.runner.current, 'leave')
+        } else {
+          const Broker = require('../../broker')
+          const method =
+            stage === 'transaction' ? 'endTxn' : kind === 'producer' ? 'produce' : 'metadata'
+          hold(Broker.prototype, method)
+          if (stage === 'transaction') {
+            const transaction = await round.client.transaction()
+            await transaction.send({ topic: 'test-topic', messages: [{ value: 'close' }] })
+            pending = transaction.commit()
+          } else if (kind === 'producer')
+            pending = round.client.send({ topic: 'test-topic', messages: [{ value: 'close' }] })
+          else pending = round.client.fetchTopicMetadata({ topics: ['test-topic'] })
+          round.pending.push(pending.catch(() => {}))
+          await round.wait(() => core.arrived())
+        }
+        round.arm()
+        const entry = round.clock.now()
+        round.closePromise = round.beginClose({ timeout: 1000, leaveGroup: true })
+        if (gate) await round.wait(() => gate.arrived())
+        await round.wait(() => core.arrived())
+        expect(round.closeDone).toBe(false)
+        expect(calls).toBe(1)
+        if (enabled) expect(round.machine.closing.deadline).toBe(entry + 1000)
+        if (gate) await round.drainReleased(gate)
+        expect(round.closeDone).toBe(false)
+        core.release()
+        await round.settleClose()
+        await pending
+        expect(calls).toBe(1)
+        expect(round.finalFrames()).toHaveLength(enabled ? 1 : 0)
+        expect(round.unhandled).toEqual([])
+      } finally {
+        await round.dispose()
+      }
+    },
+    60000
+  )
+
+  test('C11 the frozen final carries the captured member strings', async () => {
+    const round = new PublicTelemetryRound({
+      kind: 'consumer',
+      enforceRequestTimeout,
+      membership: 'static',
+    })
     const gate = round.hold('S13', { mode: 'final' })
     try {
       await round.start()
       await round.ready()
+      const ordinaryResources = round.binding.captureResources()
+      const captured = ordinaryResources.values
       round.arm()
       round.closePromise = round.beginClose({ timeout: 1000, leaveGroup: true })
       await round.wait(() => gate.arrived())
-      await round.until(() => round.wire.requests().some((r) => r.api === 'LeaveGroup'))
-      expect(round.closeDone).toBe(false)
+      await round.until(() => round.wire.requests().some((row) => row.api === 'LeaveGroup'))
+      await round.until(() => !ordinaryResources.isCurrent())
       await round.drainReleased(gate)
       await round.settleClose()
-      expect(round.finalFrames()).toHaveLength(1)
-      expect(round.wire.requests().filter((r) => r.api === 'LeaveGroup')).toHaveLength(1)
-    } finally {
-      await round.dispose()
-    }
-  }, 60000)
-
-  test('C11 the frozen final carries the captured member strings', async () => {
-    const round = new PublicTelemetryRound({ kind: 'consumer', enforceRequestTimeout })
-    try {
-      await round.start()
-      await round.ready()
-      await round.wait(() => round.beginClose({ timeout: 1000, leaveGroup: true }))
       const [final] = round.finalFrames()
       expect(resourceOf(final)).toMatchObject({ group_id: 'telemetry-g' })
-      expect(resourceOf(final).group_member_id).toEqual(expect.any(String))
+      expect(resourceOf(final).group_member_id).toBe(captured.group_member_id)
+      expect(resourceOf(final).group_instance_id).toBe('static-instance')
     } finally {
       await round.dispose()
     }
@@ -378,4 +613,87 @@ describe.each([false, true])('captured close with enforcement %s', (enforceReque
       await manual.dispose()
     }
   }, 60000)
+  test('C11 share resources omit static membership and preserve the captured member at close', async () => {
+    const round = new PublicTelemetryRound({ kind: 'shareConsumer', enforceRequestTimeout })
+    const gate = round.hold('S13', { mode: 'final' })
+    try {
+      await round.start()
+      await round.ready()
+      const ordinaryResources = round.binding.captureResources()
+      const captured = ordinaryResources.values
+      round.arm()
+      round.closePromise = round.beginClose({ timeout: 1000 })
+      await round.wait(() => gate.arrived())
+      await round.until(() =>
+        round.wire
+          .requests()
+          .some((row) => row.api === 'ShareGroupHeartbeat' && row.fields.memberEpoch < 0)
+      )
+      expect(ordinaryResources.isCurrent()).toBe(false)
+      await round.drainReleased(gate)
+      await round.settleClose()
+      const resource = resourceOf(round.finalFrames()[0])
+      expect(resource.group_member_id).toBe(captured.group_member_id)
+      expect(resource.group_id).toBe('telemetry-g')
+      expect(resource).not.toHaveProperty('group_instance_id')
+    } finally {
+      await round.dispose()
+    }
+  }, 60000)
+
+  test.each(TELEMETRY_KINDS)(
+    'C11 %s invalid resources at entry authorize no final',
+    async (kind) => {
+      const round = new PublicTelemetryRound({ kind, enforceRequestTimeout })
+      try {
+        await round.start()
+        await round.ready()
+        round.binding.setResourceReader(() => ({ values: {}, isCurrent: () => false }))
+        await round.wait(() => round.beginClose(round.closeOptions(1000)))
+        expect(round.finalFrames()).toEqual([])
+      } finally {
+        await round.dispose()
+      }
+    },
+    60000
+  )
+
+  test.each(TELEMETRY_KINDS)(
+    'C09 %s preserves the original natural core close rejection',
+    async (kind) => {
+      const reason = new Error('original core close rejection')
+      const outcomes = []
+      for (const enabled of [false, true]) {
+        const round = new PublicTelemetryRound({ kind, enabled, enforceRequestTimeout })
+        try {
+          await round.start()
+          if (enabled) await round.ready()
+          let calls = 0
+          round.patch(
+            round.cluster,
+            'disconnect',
+            (original) =>
+              async function (...args) {
+                calls++
+                await original.apply(this, args)
+                throw reason
+              }
+          )
+          const { telemetryOutcome } = require('../../../testHelpers/lifecycle')
+          outcomes.push(await telemetryOutcome(() => round.client.disconnect()))
+          expect(calls).toBe(1)
+          expect(round.unhandled).toEqual([])
+        } finally {
+          await round.dispose()
+        }
+      }
+      expect(outcomes[1].kind).toBe(outcomes[0].kind)
+      if (outcomes[0].kind === 'return') expect(outcomes[1].value).toBe(outcomes[0].value)
+      else {
+        expect(outcomes[0].reason).toBe(reason)
+        expect(outcomes[1].reason).toBe(reason)
+      }
+    },
+    60000
+  )
 })

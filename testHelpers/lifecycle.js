@@ -257,18 +257,14 @@ const FINAL_ACTIONS = Object.freeze([
 ])
 
 /**
- * The boundary ledger: each stale-work boundary with the operation modes that can reach it. S15 is
- * only reachable for a final queued behind an in-flight ordinary request, so it has no other mode.
- * S18 holds the retirement itself: its get and normal rows retire only through a close, so their
- * hold arrives during the action (`lateArrival`); a held retirement keeps the close open, so S18
- * never carries the reopen action.
+ * Each boundary's reachable modes. Pending dispatch uses a real in-flight ApiVersions blocker.
+ * Retirement holds its result after the captured pool has actually been destroyed.
  * @type {ReadonlyArray<[string, ReadonlyArray<'get'|'normal'|'final'>]>}
  */
 const RELEASE_LEDGER = Object.freeze([
   ...['S01', 'S02', 'S03', 'S04', 'S05', 'S06', 'S07', 'S08', 'S09'].map((id) => [id, ['get']]),
   ...['S10', 'S11', 'S12'].map((id) => [id, ['normal', 'final']]),
-  ...['S13', 'S14', 'S16', 'S17', 'S18'].map((id) => [id, ['get', 'normal', 'final']]),
-  ['S15', ['final']],
+  ...['S13', 'S14', 'S15', 'S16', 'S17', 'S18'].map((id) => [id, ['get', 'normal', 'final']]),
 ])
 
 /** S19 renewal sub-boundaries: handshake, supplier, encode, decode, parse, provider completion. */
@@ -282,10 +278,6 @@ const SASL_BOUNDARIES = new Set(['S03', 'S04', 'S05', 'S06', 'S07', ...RENEWAL_B
  * @returns {ReadonlyArray<string>} the actions that apply to the boundary in this mode
  */
 const actionsFor = (boundary, mode) => {
-  if (boundary === 'S18')
-    return mode === 'final'
-      ? [RELEASE_ACTIONS[0], RELEASE_ACTIONS[1], RELEASE_ACTIONS[4]]
-      : [RELEASE_ACTIONS[2], RELEASE_ACTIONS[3]]
   if (mode === 'final') return FINAL_ACTIONS
   return RELEASE_ACTIONS
 }
@@ -296,12 +288,15 @@ const actionsFor = (boundary, mode) => {
  * @param {'get'|'normal'|'final'} mode operation mode
  * @returns {Array<'G'|'P'|'F'>} Get, ordinary Push and final Push in write order
  */
-const prewritten = (boundary, mode) => {
+const prewritten = (boundary, mode, position = 'before') => {
   const base = mode === 'get' ? [] : ['G', 'P']
+  if (boundary === 'S14' && position === 'after')
+    return [...base, { get: 'G', normal: 'P', final: 'F' }[mode]]
   if (boundary === 'S09' || (boundary === 'S17' && mode === 'get')) return ['G']
   if (boundary === 'S17' && mode === 'normal') return [...base, 'P']
-  if (boundary === 'S17' || boundary === 'S18') return mode === 'final' ? [...base, 'F'] : base
-  if (boundary === 'S15') return [...base, 'P']
+  if (boundary === 'S15' && mode === 'final') return [...base, 'P']
+  if (boundary === 'S18') return mode === 'get' ? ['G'] : [...base, mode === 'final' ? 'F' : 'P']
+  if (boundary === 'S17') return [...base, 'F']
   return base
 }
 
@@ -313,7 +308,7 @@ const prewritten = (boundary, mode) => {
  * @returns {(old:object, replacement:object) => Array<object>} manifest builder over captured ids
  */
 const manifestOf =
-  ({ boundary, mode, action }) =>
+  ({ boundary, mode, action, options }) =>
   (old) => {
     const fresh = mode === 'get'
     const frame = (kind, socket, held) => ({
@@ -324,17 +319,27 @@ const manifestOf =
       socket,
       ...(held && kind !== 'F' ? { lifecycle: old.lifecycle } : {}),
     })
-    const before = prewritten(boundary, mode)
+    const before = prewritten(boundary, mode, options.position)
     const expected = before.map((kind, index) =>
-      frame(kind, 1n, index === before.length - 1 && ['S09', 'S17'].includes(boundary))
+      frame(
+        kind,
+        1n,
+        index === before.length - 1 &&
+          (['S09', 'S17'].includes(boundary) ||
+            (boundary === 'S14' && options.position === 'after'))
+      )
     )
     const successor = boundary === 'S01' && fresh ? 1n : 2n
     const reconnect = () => [frame('G', successor), frame('P', successor)]
     if (action === RELEASE_ACTIONS[0]) {
-      if (!['S09', 'S17', 'S18'].includes(boundary))
+      if (
+        !['S09', 'S17', 'S18'].includes(boundary) &&
+        !(boundary === 'S14' && options.position === 'after')
+      )
         expected.push(frame({ get: 'G', normal: 'P', final: 'F' }[mode], 1n, true))
     } else if (action === RELEASE_ACTIONS[1] && mode !== 'final') expected.push(...reconnect())
-    else if (action === RELEASE_ACTIONS[2] && mode === 'normal') expected.push(frame('F', 1n))
+    else if (action === RELEASE_ACTIONS[2] && mode === 'normal' && boundary !== 'S18')
+      expected.push(frame('F', 1n))
     else if (action === RELEASE_ACTIONS[5]) expected.push(...reconnect())
     return expected
   }
@@ -368,21 +373,22 @@ const telemetryReleaseCells = () => {
     for (const enforceRequestTimeout of [false, true])
       for (const [boundary, modes] of ledger)
         for (const mode of modes)
-          for (const action of actionsFor(boundary, mode)) {
-            const cell = {
-              name: `${kind}/${enforceRequestTimeout ? 'enforced' : 'natural'}/${boundary}/${mode}/${action}`,
-              kind,
-              enforceRequestTimeout,
-              boundary,
-              action,
-              mode,
-              start: { ...startFor(boundary), drive: mode },
-              options: {},
-              releaseValue: undefined,
-              lateArrival: boundary === 'S18' && mode !== 'final',
+          for (const action of actionsFor(boundary, mode))
+            for (const position of boundary === 'S14' ? ['before', 'after'] : ['before']) {
+              const cell = {
+                name: `${kind}/${enforceRequestTimeout ? 'enforced' : 'natural'}/${boundary}/${mode}/${position}/${action}`,
+                kind,
+                enforceRequestTimeout,
+                boundary,
+                action,
+                mode,
+                start: { ...startFor(boundary), drive: mode },
+                options: { position },
+                releaseValue: undefined,
+                lateArrival: false,
+              }
+              cells.push({ ...cell, expectation: manifestOf(cell) })
             }
-            cells.push({ ...cell, expectation: manifestOf(cell) })
-          }
   return cells
 }
 
@@ -552,12 +558,16 @@ class PublicTelemetryRound {
     this.snapshots = []
     this.guards = { ordinary: null, closing: null }
     this.setupCalls = []
+    this.socketWrites = []
     this.retirements = []
     this.finalHook = null
     this.reregisteredAt = null
     this.dedicatedConnection = null
+    this.dedicatedSockets = []
     this.brokerAnswerTimers = new Set()
     this.deliveries = []
+    this.eventRemovers = []
+    this.core = { handlers: [], commits: [], leaves: [], losses: [], joins: [] }
     this.listener = (reason) => this.unhandled.push(reason)
     process.on('unhandledRejection', this.listener)
   }
@@ -613,7 +623,7 @@ class PublicTelemetryRound {
 
   /** @returns {number} dedicated sockets opened so far */
   dedicatedCount() {
-    return Math.max(0, this.wire.sockets().length - this.foregroundSockets)
+    return this.dedicatedSockets.length
   }
 
   /**
@@ -628,14 +638,16 @@ class PublicTelemetryRound {
    * Installs exactly one hold. Its wrapper selects the dedicated telemetry connection by its
    * private authentication owner, never by endpoint, and runs only while the round is armed.
    * @param {string} boundary ledger id S01-S19f
-   * @param {{mode?:'get'|'normal'|'final'}} [options] operation the hold applies to
+   * @param {{mode?:'get'|'normal'|'final',retirementResultOnly?:boolean,position?:'before'|'after'}} [options] operation;
+   *   retirementResultOnly selects a naturally triggered retirement without expiring a held answer
    * @returns {object} a Schedule gate, or a dial gate for S02
    * @throws {Error} duplicate or unknown boundary
    */
-  hold(boundary, { mode = 'normal' } = {}) {
+  hold(boundary, { mode = 'normal', retirementResultOnly = false, position = 'before' } = {}) {
     if (this.held) throw new Error('Duplicate telemetry hold')
     const Connection = require('../src/network/connection')
     const Broker = require('../src/broker')
+    const RequestQueue = require('../src/network/requestQueue')
     const TelemetryPayload = require('../src/telemetry/payload')
     const gzip = require('../src/protocol/message/compression/gzip')
     const round = this
@@ -683,6 +695,7 @@ class PublicTelemetryRound {
               kindOf(request.apiKey, establishedOnly ?? closing()) === mode
             if (selected && position === 'before') await round.enter(boundary)
             const result = await original.apply(this, args)
+            if (result?.answered) result.answered.catch(() => {})
             if (selected && position === 'after') await round.enter(boundary)
             return result
           }
@@ -716,6 +729,48 @@ class PublicTelemetryRound {
             return result
           }
       )
+    const dispatchHold = (apiKeys) => {
+      this.patch(
+        RequestQueue.prototype,
+        'sendSocketRequest',
+        (original) =>
+          function (request) {
+            const connection = round.dedicatedConnection
+            const selected =
+              round.armed &&
+              connection?.requestQueue === this &&
+              apiKeys.includes(request.entry.apiKey) &&
+              (![71, 72].includes(request.entry.apiKey) ||
+                kindOf(request.entry.apiKey, closing()) === mode)
+            if (!selected) return original.call(this, request)
+            const continuation = round.enter(boundary).then(() => original.call(this, request))
+            round.pending.push(continuation.catch((error) => request.entry.reject(error)))
+          }
+      )
+    }
+    const responseHold = (apiKey, stage) => {
+      this.patch(
+        Connection.prototype,
+        'send',
+        (original) =>
+          function (options) {
+            if (!round.armed || !dedicated(this) || options.request.apiKey !== apiKey)
+              return original.call(this, options)
+            const response = options.response
+            return original.call(this, {
+              ...options,
+              response: {
+                ...response,
+                [stage]: async (...args) => {
+                  const result = await response[stage](...args)
+                  await round.enter(boundary)
+                  return result
+                },
+              },
+            })
+          }
+      )
+    }
     const traced = () => this.trace.hold({ boundary })
     const wired = (selector) => this.wireSchedule.hold(selector)
     const holds = {
@@ -727,7 +782,7 @@ class PublicTelemetryRound {
         return traced()
       },
       S05: () => {
-        encodeHold([17], 'after')
+        dispatchHold([17])
         return traced()
       },
       S06: () => {
@@ -735,7 +790,7 @@ class PublicTelemetryRound {
         return traced()
       },
       S07: () => {
-        encodeHold([36], 'after')
+        dispatchHold([36])
         return traced()
       },
       S08: () =>
@@ -764,20 +819,72 @@ class PublicTelemetryRound {
         return traced()
       },
       S14: () => {
-        stageHold('private:Connection:enqueue', 'before')
+        stageHold('private:Connection:enqueue', position)
         return traced()
       },
-      S15: () =>
-        wired({ api: 'PushTelemetry', match: (call) => round.armed && !call.fields.terminating }),
+      S15: () => {
+        if (mode === 'final')
+          return wired({
+            api: 'PushTelemetry',
+            match: (call) => round.armed && !call.fields.terminating,
+          })
+        const blocker = wired({ api: 'ApiVersions', match: () => round.blockingDispatch === true })
+        this.patch(
+          Connection.prototype,
+          'send',
+          (original) =>
+            async function (options) {
+              const api = options.request.apiKey
+              if (
+                round.armed &&
+                dedicated(this) &&
+                [71, 72].includes(api) &&
+                kindOf(api, options.establishedOnly) === mode &&
+                !round.blockingDispatch
+              ) {
+                round.blockingDispatch = true
+                const definition = require('../src/protocol/requests/apiVersions').protocol({
+                  version: 0,
+                })()
+                const pending = original.call(this, { ...definition, guard: options.guard })
+                round.pending.push(pending.catch(() => {}))
+                await blocker.arrived()
+              }
+              return original.call(this, options)
+            }
+        )
+        return {
+          get settle() {
+            return blocker.settle
+          },
+          arrived: async () => {
+            await blocker.arrived()
+            await round.until(() =>
+              round.dedicatedConnection.requestQueue.pending.some(
+                (request) => request.entry.apiKey === (mode === 'get' ? 71 : 72)
+              )
+            )
+          },
+          release: (value) => blocker.release(value),
+        }
+      },
       S16: () => {
-        stageHold('private:Connection:prepare', 'after')
+        dispatchHold([71, 72])
         return traced()
       },
       S17: () => {
         brokerHold()
         return traced()
       },
-      S18: traced,
+      S18: () => {
+        if (retirementResultOnly) return traced()
+        this.retirementAnswer = wired({
+          api: mode === 'get' ? 'GetTelemetrySubscriptions' : 'PushTelemetry',
+          match: (call) =>
+            round.armed && (mode === 'get' || call.fields.terminating === (mode === 'final')),
+        })
+        return traced()
+      },
       S19a: () => {
         encodeHold([17], 'before')
         return traced()
@@ -787,23 +894,12 @@ class PublicTelemetryRound {
         encodeHold([36], 'before')
         return traced()
       },
-      S19d: () =>
-        wired({
-          api: 'SaslAuthenticate',
-          match: (call) => round.armed && call.generation > round.foregroundSockets,
-        }),
+      S19d: () => {
+        responseHold(36, 'decode')
+        return traced()
+      },
       S19e: () => {
-        this.patch(
-          Connection.prototype,
-          'send',
-          (original) =>
-            async function (options) {
-              const result = await original.call(this, options)
-              if (round.armed && dedicated(this) && options.request.apiKey === 36)
-                await round.enter(boundary)
-              return result
-            }
-        )
+        responseHold(36, 'parse')
         return traced()
       },
       S19f: traced,
@@ -842,10 +938,14 @@ class PublicTelemetryRound {
               ...options,
               onAllocated: (handle) => {
                 const retire = handle.retire
+                let heldRetirement = false
                 handle.retire = async (...args) => {
                   round.retirements.push(handle)
-                  if (round.armed && round.held?.boundary === 'S18') await round.enter('S18')
-                  return retire(...args)
+                  const selected = round.armed && round.held?.boundary === 'S18' && !heldRetirement
+                  if (selected) heldRetirement = true
+                  const result = await retire(...args)
+                  if (selected) await round.enter('S18')
+                  return result
                 }
                 options.onAllocated(handle)
               },
@@ -853,6 +953,33 @@ class PublicTelemetryRound {
           }
           return transport
         }
+    )
+  }
+
+  /** Observes socket allocation before a dial can be held, including repeated attempts.
+   * @param {object} connection actual private Connection @returns {void} never changes socket identity
+   */
+  watchSocket(connection) {
+    this.socketOwners ??= new Set()
+    if (this.socketOwners.has(connection)) return
+    this.socketOwners.add(connection)
+    const descriptor = Object.getOwnPropertyDescriptor(connection, 'socket')
+    let current = connection.socket
+    const round = this
+    Object.defineProperty(connection, 'socket', {
+      configurable: true,
+      enumerable: true,
+      get() {
+        return current
+      },
+      set(socket) {
+        current = socket
+        const raw = socket?.inner ?? socket
+        if (raw && !round.dedicatedSockets.includes(raw)) round.dedicatedSockets.push(raw)
+      },
+    })
+    this.restores.push(() =>
+      Object.defineProperty(connection, 'socket', { ...descriptor, value: current })
     )
   }
 
@@ -867,10 +994,48 @@ class PublicTelemetryRound {
     const round = this
     this.patch(
       Connection.prototype,
+      'connect',
+      (original) =>
+        function (...args) {
+          if (this.authenticationOwner) round.watchSocket(this)
+          const result = original.apply(this, args)
+          if (this.authenticationOwner) {
+            round.dedicatedConnection = this
+            const socket = this.socket?.inner ?? this.socket
+            if (socket && !round.dedicatedSockets.includes(socket))
+              round.dedicatedSockets.push(socket)
+          }
+          return result
+        }
+    )
+    this.patch(
+      Connection.prototype,
       'send',
       (original) =>
         function (options) {
-          if (this.authenticationOwner) round.dedicatedConnection = this
+          if (this.authenticationOwner) {
+            const socket = this.socket?.inner ?? this.socket
+            if (socket && !round.dedicatedSockets.includes(socket))
+              round.dedicatedSockets.push(socket)
+            round.dedicatedConnection = this
+            if (this.socket && !round.observedSockets?.has(this.socket)) {
+              round.observedSockets ??= new Set()
+              round.observedSockets.add(this.socket)
+              round.patch(
+                this.socket,
+                'write',
+                (write) =>
+                  function (bytes, ...args) {
+                    round.socketWrites.push({
+                      socket: this,
+                      bytes: Buffer.from(bytes),
+                      time: round.clock.now(),
+                    })
+                    return write.call(this, bytes, ...args)
+                  }
+              )
+            }
+          }
           return original.call(this, options)
         }
     )
@@ -907,7 +1072,7 @@ class PublicTelemetryRound {
       if (this.machine && (apiKey === 71 || apiKey === 72)) {
         const machine = this.machine
         this.trace.write({
-          connection: BigInt(this.wire.sockets().indexOf(socket) - this.foregroundSockets + 1),
+          connection: BigInt(this.dedicatedSockets.indexOf(socket) + 1),
           attempt: BigInt(generation),
           lifecycle: machine.lifecycle,
           transport: machine.transportRevision,
@@ -934,6 +1099,20 @@ class PublicTelemetryRound {
     this.patch(metrics, 'abandon', (original) => (snapshot) => {
       this.abandoned.push(snapshot)
       return original.call(metrics, snapshot)
+    })
+  }
+
+  /** Adds the inherited frame-aware chaos wrapper around every subsequently connected socket.
+   * @returns {void} stores wrappers separately from the strict wire's physical sockets
+   */
+  useChaos() {
+    const { ChaosSocket } = require('./chaosSocket')
+    this.chaosSockets = []
+    this.patch(this.wire, 'connect', (original) => (host, port, onConnect) => {
+      const inner = original.call(this.wire, host, port, onConnect)
+      const socket = new ChaosSocket(inner, { host, port }, () => 0.5)
+      this.chaosSockets.push(socket)
+      return socket
     })
   }
 
@@ -964,19 +1143,37 @@ class PublicTelemetryRound {
     this.subscription = { ...DEFAULT_SUBSCRIPTION, ...subscription }
     this.patch(Date, 'now', () => () => 1000 + round.clock.now())
     this.patch(process.hrtime, 'bigint', () => () => BigInt(round.clock.now()) * 1000000n)
+    const importedClock = require('node:perf_hooks').performance
+    const clockSpy = jest.spyOn(importedClock, 'now').mockImplementation(() => round.clock.now())
+    this.restores.push(() => clockSpy.mockRestore())
+    if (global.performance !== importedClock) {
+      const globalSpy = jest
+        .spyOn(global.performance, 'now')
+        .mockImplementation(() => round.clock.now())
+      this.restores.push(() => globalSpy.mockRestore())
+    }
     this.patch(
       TelemetryFactory.prototype,
       'bind',
       (original) =>
         function (cluster) {
-          if (this.config.enableMetricsPush) {
-            this.clock = round.clock
-            round.bindings.push(this)
-          }
+          round.cluster = cluster
+          round.bindings.push(this)
+          if (this.config.enableMetricsPush) this.clock = round.clock
           return original.call(this, cluster)
         }
     )
     this.watchTransport()
+    const crypto = require('node:crypto')
+    this.patch(
+      crypto,
+      'randomBytes',
+      (original) =>
+        (size, ...args) =>
+          size === 16 && args.length === 0
+            ? Buffer.from('0102030405060708090a0b0c0d0e0f10', 'hex')
+            : original(size, ...args)
+    )
     this.provider = async () => {
       const hold = this.armed ? this.held?.boundary : null
       if (hold === 'S03' || hold === 'S19b') await this.enter(hold)
@@ -1000,7 +1197,7 @@ class PublicTelemetryRound {
       const harness = shareClient({
         advertise,
         kafka: kafkaOptions,
-        share: client,
+        share: { groupId: 'telemetry-g', maxWaitTimeInMs: 5, ...client },
         profile: 'share',
       })
       this.harness = harness
@@ -1009,7 +1206,12 @@ class PublicTelemetryRound {
       this.kafka = harness.client
       this.client = harness.consumer
     } else {
-      const base = this.kind === 'consumer' && this.protocol === 'consumer' ? 'consumer' : 'default'
+      const base =
+        this.kind === 'consumer' && this.protocol === 'consumer'
+          ? 'consumer'
+          : this.kind === 'producer' && client.transactionalId
+            ? 'tv2'
+            : 'default'
       this.wire = scripted.createScriptedCluster({
         nodes: [{ id: 1, host: 'a', port: 9092 }],
         profile: base,
@@ -1026,6 +1228,7 @@ class PublicTelemetryRound {
     this.wire.answer('PushTelemetry', () => ({}))
     if (sasl) this.wire.answer('SaslHandshake', () => ({ enabledMechanisms: ['OAUTHBEARER'] }))
     if (this.kind !== 'shareConsumer') await this.createClient(client)
+    if (this.kind === 'producer') scripted.producerScript(this.wire)
     this.binding = this.bindings.at(-1) ?? null
     this.machine = this.binding?.machine ?? null
     this.metrics = this.binding?.metrics ?? null
@@ -1040,6 +1243,7 @@ class PublicTelemetryRound {
     if (drive === 'get') {
       this.arm()
       this.tick()
+      if (this.held?.boundary === 'S18') await this.expireForRetirement()
       return this
     }
     await this.ready()
@@ -1047,14 +1251,42 @@ class PublicTelemetryRound {
     this.arm()
     if (drive === 'normal') this.tick()
     else {
-      if (this.held?.boundary === 'S15') {
-        const sent = this.pushes().length
-        this.tick()
-        await this.until(() => this.pushes().length > sent)
-      }
+      if (this.held?.boundary === 'S15') await this.occupyFinalQueue()
       this.closePromise = this.beginClose(this.closeOptions(1000))
+      if (this.held?.boundary === 'S15')
+        await this.until(() =>
+          this.dedicatedConnection.requestQueue.pending.some(
+            (request) => request.entry.apiKey === 72
+          )
+        )
     }
+    if (this.held?.boundary === 'S18') await this.expireForRetirement()
     return this
+  }
+
+  /** Starts one real ordinary Push whose response keeps the sole queue slot occupied at close.
+   * @returns {Promise<void>} the response hold and its exact request have arrived
+   */
+  async occupyFinalQueue() {
+    const count = this.pushes().length
+    this.tick()
+    await this.until(() => this.pushes().length > count)
+    await this.held.gate.arrived()
+  }
+
+  /** Expires a written operation so background retirement can remain held after public close.
+   * The raw answer is independently retained; repeated retire calls still join actual pool cleanup.
+   * @returns {Promise<void>} the retirement result hold has arrived
+   */
+  async expireForRetirement() {
+    await this.retirementAnswer.arrived()
+    const machine = this.machine
+    const id = machine.closing ? this.closeTimer : machine.watchdog
+    const entry = this.clock.pending.get(id)
+    this.clock.jump(entry.due)
+    this.clock.deliver(id)
+    await this.held.gate.arrived()
+    if (!machine.closing) await this.until(() => machine.timer !== null && !machine.running)
   }
 
   /**
@@ -1134,7 +1366,12 @@ class PublicTelemetryRound {
           }
       )
       await this.client.subscribe({ topics: ['topic-a'] })
-      await this.client.run({ eachMessage: async () => {} })
+      await this.client.run({
+        eachMessage: async (payload) => {
+          this.core.handlers.push(payload.message.offset)
+        },
+        ...this.runOptions,
+      })
       return this.until(() => this.runner?.current?.membership.memberEpoch > 0)
     }
     const { TOPIC } = require('../src/consumer/__tests__/fixtures/fetchHarness')
@@ -1153,7 +1390,23 @@ class PublicTelemetryRound {
     if (this.protocol === 'manual')
       await this.client.assign([{ topic: TOPIC, partitions: [0] }], { offsetReset: 'earliest' })
     else await this.client.subscribe({ topic: TOPIC, fromBeginning: true })
-    await this.client.run({ autoCommit: false, eachMessage: async () => {} })
+    this.eventRemovers.push(
+      this.client.on(this.client.events.PARTITIONS_LOST, () =>
+        this.core.losses.push(this.wire.requests().length)
+      )
+    )
+    this.eventRemovers.push(
+      this.client.on(this.client.events.GROUP_JOIN, () =>
+        this.core.joins.push(this.wire.requests().length)
+      )
+    )
+    await this.client.run({
+      autoCommit: false,
+      eachMessage: async (payload) => {
+        this.core.handlers.push(payload.message.offset)
+      },
+      ...this.runOptions,
+    })
   }
 
   /** @returns {void} activates the hold and, for S02, blackholes the next dial */
@@ -1262,11 +1515,9 @@ class PublicTelemetryRound {
 
   /** @returns {number} destroys the newest dedicated socket with an OS-coded transport error */
   faultDedicated() {
-    const sockets = this.wire.sockets()
-    if (sockets.length <= this.foregroundSockets) return 0
-    sockets
-      .at(-1)
-      .destroy(Object.assign(new Error('telemetry transport lost'), { code: 'ECONNRESET' }))
+    const socket = this.dedicatedConnection?.socket
+    if (!socket) return 0
+    socket.destroy(Object.assign(new Error('telemetry transport lost'), { code: 'ECONNRESET' }))
     return 1
   }
 
@@ -1300,9 +1551,13 @@ class PublicTelemetryRound {
       this.faultDedicated()
       if (machine.closing) return undefined
       const watchdog = machine.watchdog
-      this.clock.jump(this.clock.time + 30000)
+      if (this.held?.boundary !== 'S18') this.clock.jump(this.clock.time + 30000)
       if (watchdog && this.clock.pending.has(watchdog)) this.clock.deliver(watchdog)
       await this.until(() => machine.state === 'BACKOFF' && machine.timer !== null)
+      if (['S03', 'S12', 'S19b', 'S19f'].includes(this.held?.boundary)) {
+        this.deferredReplacement = true
+        return
+      }
       return this.establish()
     }
     if (name === RELEASE_ACTIONS[2] || name === RELEASE_ACTIONS[3]) {
@@ -1321,9 +1576,96 @@ class PublicTelemetryRound {
       } else this.closePromise = this.beginClose(this.closeOptions(0))
       await this.settleClose()
       await this.client.connect()
+      if (['S03', 'S12', 'S19b', 'S19f'].includes(this.held?.boundary)) {
+        this.deferredReplacement = true
+        return
+      }
       return this.establish()
     }
     throw new Error(`Unknown telemetry action ${name}`)
+  }
+
+  /** Replaces membership through the original runner, preserving broker-provided member strings.
+   * @returns {Promise<void>} a fresh accepted member @throws {Error} for a manual run
+   */
+  async rejoin() {
+    if (this.kind === 'shareConsumer') {
+      const previous = this.runner.current
+      await this.client.stop()
+      await this.client.run({
+        eachMessage: async (payload) => this.core.handlers.push(payload.message.offset),
+      })
+      telemetryAssert.notEqual(this.runner.current, previous)
+      return
+    }
+    if (this.protocol === 'manual') throw new Error('Manual runs have no rejoin')
+    const group = this.runner.consumerGroup
+    const token = group.ownership.token()
+    await this.runner.handleRebalanceError({
+      kind: 'revoked',
+      reason: 'assignment',
+      error: new Error('assignment'),
+    })
+    telemetryAssert.notEqual(group.ownership.token(), token)
+  }
+
+  /** Asserts original commit/leave and handler identity invariants independently of telemetry.
+   * @param {number} from first core request index @param {string} event actual transition
+   * @returns {void} @throws {import('node:assert').AssertionError} changed core behavior
+   */
+  assertCore(from, event) {
+    const rows = this.wire.requests().slice(from)
+    telemetryAssert.deepStrictEqual(
+      rows.filter((r) => r.api === 'OffsetCommit'),
+      []
+    )
+    const leaves = rows.filter(
+      (r) =>
+        r.api === 'LeaveGroup' || (r.api === 'ConsumerGroupHeartbeat' && r.fields.memberEpoch < 0)
+    )
+    if (
+      ['stop', 'disconnect'].includes(event) &&
+      this.kind === 'consumer' &&
+      this.protocol !== 'manual' &&
+      (this.membership !== 'static' || this.protocol === 'consumer')
+    )
+      telemetryAssert.equal(leaves.length, 1)
+    for (const fromLoss of this.core.losses)
+      telemetryAssert.deepStrictEqual(
+        this.wire
+          .requests()
+          .slice(
+            fromLoss,
+            this.core.joins.find((index) => index > fromLoss)
+          )
+          .filter((r) => r.api === 'OffsetCommit'),
+        []
+      )
+    telemetryAssert.equal(new Set(this.core.handlers).size, this.core.handlers.length)
+  }
+
+  /** Suspends through the actual crash owner, or closes a non-running public client.
+   * @returns {Promise<void>} completes original suspension/close
+   */
+  async suspendForeground() {
+    if (this.kind === 'consumer' || this.kind === 'shareConsumer') return this.crash()
+    return this.client.disconnect(this.closeOptions(0))
+  }
+
+  /** Starts an actual replacement run, including its new membership and telemetry resume.
+   * @returns {Promise<void>} original run readiness
+   */
+  async restartForeground() {
+    if (this.kind === 'consumer') {
+      await this.client.connect()
+      await this.client.run({ autoCommit: false, eachMessage: async () => {} })
+      return
+    }
+    if (this.kind === 'shareConsumer') {
+      await this.client.run({ eachMessage: async () => {} })
+      return
+    }
+    await this.client.connect()
   }
 
   /** @returns {Promise<void>} signals the original crash path of the running consumer or share consumer */
@@ -1332,8 +1674,9 @@ class PublicTelemetryRound {
   }
 
   /** @returns {Promise<void>} waits until the actual public close promise has settled */
-  settleClose() {
-    return this.until(() => this.closeDone)
+  async settleClose() {
+    await this.until(() => this.closeDone)
+    return this.closePromise
   }
 
   /**
@@ -1346,6 +1689,7 @@ class PublicTelemetryRound {
     this.closeEntry = this.clock.now()
     this.closeDone = false
     const promise = this.client.disconnect(options)
+    this.closePromise = promise
     for (const id of this.clock.pending.keys()) if (!before.has(id)) this.closeTimer = id
     this.pending.push(
       promise.then(
@@ -1362,10 +1706,10 @@ class PublicTelemetryRound {
 
   /**
    * @param {number} timeout milliseconds @returns {{timeout:number}|undefined} the inherited public
-   *   option on timeout-capable kinds, undefined for admin which has no overload
+   *   option supported by each delivered public close owner
    */
   closeOptions(timeout) {
-    return this.kind === 'admin' ? undefined : { timeout }
+    return { timeout }
   }
 
   /** @returns {Error|null} the exact guard of the latest ordinary telemetry request, called now */
@@ -1471,6 +1815,7 @@ class PublicTelemetryRound {
    */
   async drainReleased(gate, value) {
     if (gate.settle) gate.release(value)
+    if (this.retirementAnswer?.settle) this.retirementAnswer.release()
     for (let step = 0; step < 200; step++) await turn()
   }
 
@@ -1531,23 +1876,57 @@ class PublicTelemetryRound {
   /**
    * Runs one actual foreground original below the public method, with a unique outcome, and
    * records every invocation's receiver and arguments.
-   * @param {{target:object,key:string|symbol,outcome:'return'|'throw'|'reject',identity:*,
-   *   run:Function}} options the original to control and the public call that reaches it
-   * @returns {Promise<{actual:object,log:Array<{receiver:*,args:Array}>}>} tagged outcome and calls
+   * @param {{target:object,key:string|symbol,outcome?:'return'|'throw'|'reject',identity?:*,
+   *   run:Function,tap?:boolean,select?:(receiver:object,args:Array)=>boolean}} options the original to control and the public call that reaches it
+   * @returns {Promise<{actual:object,expected:object,log:Array<{receiver:*,args:Array}>}>} exact
+   *   original boundary outcome and inherited public normalization, plus receiver/argument order
+   * @throws {import('node:assert').AssertionError} an original was not invoked exactly once
    */
-  async exerciseForeground({ target, key, outcome, identity, run }) {
+  async exerciseForeground({
+    target,
+    key,
+    outcome = 'return',
+    identity,
+    run,
+    tap = false,
+    select = null,
+  }) {
     const log = []
+    let originalOutcome
     this.patch(
       target,
       key,
-      () =>
+      (original) =>
         function (...args) {
+          if (select && !select(this, args)) return original.apply(this, args)
           log.push({ receiver: this, args })
+          if (tap) {
+            const value = original.apply(this, args)
+            if (value && typeof value.then === 'function')
+              return value.then(
+                (result) => {
+                  originalOutcome = { kind: 'return', value: result }
+                  return result
+                },
+                (reason) => {
+                  originalOutcome = { kind: 'reject', reason }
+                  throw reason
+                }
+              )
+            originalOutcome = { kind: 'return', value }
+            return value
+          }
+          originalOutcome = {
+            kind: outcome === 'return' ? 'return' : outcome === 'throw' ? 'throw' : 'reject',
+            [outcome === 'return' ? 'value' : 'reason']: identity,
+          }
           if (outcome === 'throw') throw identity
           return outcome === 'reject' ? Promise.reject(identity) : identity
         }
     )
-    return { actual: await telemetryOutcome(run), log }
+    const actual = await telemetryOutcome(run)
+    telemetryAssert.equal(log.length, 1)
+    return { actual, expected: originalOutcome, log }
   }
 
   /**
@@ -1582,6 +1961,7 @@ class PublicTelemetryRound {
     } catch (error) {
       failure = error
     } finally {
+      for (const remove of this.eventRemovers) remove()
       process.off('unhandledRejection', this.listener)
       while (this.restores.length) this.restores.pop()()
     }
@@ -1693,11 +2073,12 @@ const runTelemetryLifecycleCell = async (cell) => {
       await round.wait(() => gate.arrived())
       const captured = round.binding.captureResources()
       const frames = round.trace.frames.length
-      round.binding.updateResources(captured.values)
+      await round.rejoin()
       telemetryAssert.equal(captured.isCurrent(), false)
       await round.drainReleased(gate)
       telemetryAssert.equal(round.trace.frames.length, frames)
     } else throw new Error(`Unmapped telemetry lifecycle boundary ${cell.boundary}`)
+    round.assertCore(0, cell.event)
   } finally {
     await round.dispose()
   }

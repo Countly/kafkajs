@@ -125,6 +125,7 @@ describe('release catalogue', () => {
       'S09',
       'S13',
       'S14',
+      'S15',
       'S16',
       'S17',
       'S18',
@@ -135,6 +136,7 @@ describe('release catalogue', () => {
       'S12',
       'S13',
       'S14',
+      'S15',
       'S16',
       'S17',
       'S18',
@@ -147,12 +149,12 @@ describe('release catalogue', () => {
     ],
     final: ['S10', 'S11', 'S12', 'S13', 'S14', 'S15', 'S16', 'S17', 'S18'],
   }
-  const actions = (boundary, mode) => {
-    if (boundary === 'S18') return mode === 'final' ? 3 : 2
+  const actions = (_boundary, mode) => {
     return mode === 'final' ? 4 : RELEASE_ACTIONS.length
   }
   const expected = Object.entries(modes).reduce(
-    (sum, [mode, ids]) => sum + ids.reduce((inner, id) => inner + actions(id, mode), 0),
+    (sum, [mode, ids]) =>
+      sum + ids.reduce((inner, id) => inner + actions(id, mode) * (id === 'S14' ? 2 : 1), 0),
     0
   )
   test('dimension cardinalities equal the explicit ledger', () => {
@@ -164,19 +166,18 @@ describe('release catalogue', () => {
           cells.filter((c) => c.kind === kind && c.enforceRequestTimeout === enforce)
         ).toHaveLength(expected)
   })
-  test.each([...new Set(cells.map((cell) => `${cell.boundary}/${cell.mode}`))])(
-    '%s resolves to an installable source hook',
-    async (key) => {
-      const [boundary, mode] = key.split('/')
-      const round = new PublicTelemetryRound({ kind: 'producer' })
-      try {
-        expect(round.hold(boundary, { mode })).toBeDefined()
-        expect(() => round.hold(boundary, { mode })).toThrow('Duplicate telemetry hold')
-      } finally {
-        await round.dispose()
-      }
+  test.each([
+    ...new Set(cells.map((cell) => `${cell.boundary}/${cell.mode}/${cell.options.position}`)),
+  ])('%s resolves to an installable source hook', async (key) => {
+    const [boundary, mode, position] = key.split('/')
+    const round = new PublicTelemetryRound({ kind: 'producer' })
+    try {
+      expect(round.hold(boundary, { mode, position })).toBeDefined()
+      expect(() => round.hold(boundary, { mode })).toThrow('Duplicate telemetry hold')
+    } finally {
+      await round.dispose()
     }
-  )
+  })
 })
 
 describe('stale work release matrix', () => {
@@ -185,7 +186,7 @@ describe('stale work release matrix', () => {
     async (cell) => {
       const round = new PublicTelemetryRound(cell)
       try {
-        const gate = round.hold(cell.boundary, { mode: cell.mode })
+        const gate = round.hold(cell.boundary, { mode: cell.mode, ...cell.options })
         await round.wait(() => round.start(cell.start))
         if (!cell.lateArrival) await round.wait(() => gate.arrived())
         const old = round.capture()
@@ -193,8 +194,19 @@ describe('stale work release matrix', () => {
         if (cell.lateArrival) await round.wait(() => gate.arrived())
         const replacement = round.capture()
         await round.wait(() => round.drainReleased(gate, cell.releaseValue))
+        if (round.deferredReplacement) {
+          round.assertReplacementUnchanged(replacement)
+          if (round.machine.uuid)
+            await expect(round.client.clientInstanceId({ timeout: 0 })).resolves.toBe(
+              TELEMETRY_UUID
+            )
+          await round.establish()
+        }
         round.assertTrace(cell.expectation(old, replacement))
-        if (cell.action.includes('replacement') || cell.action.includes('reopen'))
+        if (
+          !round.deferredReplacement &&
+          (cell.action.includes('replacement') || cell.action.includes('reopen'))
+        )
           round.assertReplacementUnchanged(replacement)
         expect(round.unhandled).toEqual([])
       } finally {
@@ -283,7 +295,7 @@ describe('timer authority', () => {
     60000
   )
 
-  test.each(['consumer', 'shareConsumer'])(
+  test.each(TELEMETRY_KINDS)(
     '%s earliest waiter timer cannot settle replacement caller',
     async (kind) => {
       const round = new PublicTelemetryRound({ kind })
@@ -301,10 +313,13 @@ describe('timer authority', () => {
           )
         const oldTimer = round.clock.callback(round.machine.waiterTimer)
         round.clock.jump(11)
-        await round.wait(() => round.crash())
+        await round.wait(() => round.suspendForeground())
         await round.until(() => settled.length === 2)
-        expect(settled).toEqual(['timeout', 'not-connected'])
-        await round.wait(() => round.client.connect())
+        expect(settled).toEqual([
+          'timeout',
+          ['consumer', 'shareConsumer'].includes(kind) ? 'not-connected' : 'closed',
+        ])
+        await round.wait(() => round.restartForeground())
         const third = round.client.clientInstanceId({ timeout: 1000 })
         oldTimer()
         await round.drainReleased(gate)
@@ -318,11 +333,15 @@ describe('timer authority', () => {
     60000
   )
 
-  test.each(TELEMETRY_KINDS.filter((kind) => kind !== 'admin'))(
-    '%s close watchdog uses original deadline under delayed delivery',
-    async (kind) => {
+  test.each(
+    TELEMETRY_KINDS.flatMap((kind) =>
+      [false, true].map((enforceRequestTimeout) => ({ kind, enforceRequestTimeout }))
+    )
+  )(
+    '$kind close watchdog uses original deadline under delayed delivery enforce=$enforceRequestTimeout',
+    async (cell) => {
       for (const timeout of [20, undefined]) {
-        const round = new PublicTelemetryRound({ kind })
+        const round = new PublicTelemetryRound(cell)
         try {
           const gate = round.hold('S13', { mode: 'final' })
           await round.start()
@@ -346,7 +365,7 @@ describe('timer authority', () => {
     60000
   )
 
-  test.each(['consumer', 'shareConsumer'])(
+  test.each(TELEMETRY_KINDS)(
     '%s retry preserves uncached caller deadlines',
     async (kind) => {
       const round = new PublicTelemetryRound({ kind })
@@ -355,7 +374,7 @@ describe('timer authority', () => {
         await round.wait(() => round.start({ drive: 'get' }))
         await round.wait(() => gate.arrived())
         const settled = []
-        for (const timeout of [10, 30])
+        for (const timeout of [10, 3000])
           round.pending.push(
             round.client.clientInstanceId({ timeout }).then(
               (value) => settled.push(value),
@@ -370,10 +389,17 @@ describe('timer authority', () => {
         round.clock.deliver(round.machine.waiterTimer)
         await round.until(() => settled.length === 1)
         expect(settled).toEqual(['timeout'])
-        round.clock.jump(30)
-        round.clock.deliver(round.machine.waiterTimer)
+        const survivor = [...round.machine.waiters][0]
+        expect(survivor.deadline).toBe(3000)
+        expect(round.machine.timer).not.toBeNull()
+        round.tick()
         await round.until(() => settled.length === 2)
-        expect(settled).toEqual(['timeout', 'timeout'])
+        expect(round.clock.now()).toBeLessThan(survivor.deadline)
+        expect(settled).toEqual(['timeout', TELEMETRY_UUID])
+        expect(round.machine.waiters.size).toBe(0)
+        expect(round.machine.waiterTimer).toBeNull()
+        await round.wait(() => round.suspendForeground())
+        await expect(round.client.clientInstanceId({ timeout: 0 })).resolves.toBe(TELEMETRY_UUID)
       } finally {
         await round.dispose()
       }
@@ -387,8 +413,17 @@ describe('numeric authority', () => {
     '%s subscription A to B to A issues three distinct revisions',
     async (kind) => {
       const round = await established({ kind })
+      const gate = round.hold('S11', { mode: 'normal' })
       try {
+        round.arm()
+        round.tick()
+        await round.wait(() => gate.arrived())
+        const old = round.capture()
         const revisions = [round.machine.subscription.revision]
+        const watchdog = round.machine.watchdog
+        round.clock.jump(round.clock.pending.get(watchdog).due)
+        round.clock.deliver(watchdog)
+        await round.until(() => !round.machine.running && round.machine.timer !== null)
         const answers = [9, 7]
         round.wire.answer('GetTelemetrySubscriptions', (fields) => ({
           ...round.subscription,
@@ -396,9 +431,11 @@ describe('numeric authority', () => {
           clientInstanceId: fields.clientInstanceId ?? TELEMETRY_UUID,
         }))
         for (const next of answers) {
-          round.wire.answer('PushTelemetry', () => ({ errorCode: 117 }))
-          round.tick()
-          await round.until(() => round.machine.state === 'BACKOFF')
+          if (next === 7) {
+            round.wire.answer('PushTelemetry', () => ({ errorCode: 117 }))
+            round.tick()
+            await round.until(() => round.machine.state === 'BACKOFF' && !round.machine.running)
+          }
           round.wire.answer('PushTelemetry', () => ({}))
           round.wire.answer('GetTelemetrySubscriptions', (fields) => ({
             ...round.subscription,
@@ -417,6 +454,18 @@ describe('numeric authority', () => {
         expect(revisions.map((r) => typeof r)).toEqual(['bigint', 'bigint', 'bigint'])
         expect(new Set(revisions).size).toBe(3)
         expect(round.machine.subscription.subscriptionId).toBe(7)
+        const replacement = round.capture()
+        await round.drainReleased(gate)
+        round.assertReplacementUnchanged(replacement)
+        expect(
+          round.written
+            .slice(old.written)
+            .some((entry) => entry.snapshot === round.snapshots[old.snapshots - 1]?.snapshot)
+        ).toBe(false)
+        const count = round.pushes().length
+        round.tick()
+        await round.until(() => round.pushes().length > count && !round.machine.running)
+        expect(round.decodedLatestPoint({ name: 'com.example.total' }).value).toBe(0n)
       } finally {
         await round.dispose()
       }
@@ -608,23 +657,55 @@ describe('corrective public reopen and suspension', () => {
     60000
   )
 
-  test.each(TELEMETRY_KINDS)(
-    '%s close and reopen revoke each corrective continuation',
-    async (kind) => {
+  test.each(
+    TELEMETRY_KINDS.flatMap((kind) =>
+      ['retirement', 'backoff', 'Get', 'Push'].map((stage) => ({ kind, stage }))
+    )
+  )(
+    '$kind close and reopen revoke corrective $stage',
+    async ({ kind, stage }) => {
       const round = await reopened(kind, 1)
       try {
+        let gate
+        if (stage === 'retirement') {
+          gate = round.hold('S18', { mode: 'normal', retirementResultOnly: true })
+        }
+        if (stage === 'Get') gate = round.hold('S09', { mode: 'get' })
+        if (stage === 'Push') gate = round.hold('S13', { mode: 'normal' })
+        if (stage === 'retirement') round.arm()
         await getThenPush(round)
         await round.until(() => round.machine.reopen?.used === true)
-        const callback = round.clock.callback(round.machine.timer)
+        const old = round.capture()
+        let callback
+        if (stage === 'backoff') callback = round.clock.callback(round.machine.timer)
+        if (stage === 'Get') {
+          round.arm()
+          round.tick()
+          await round.wait(() => gate.arrived())
+        }
+        if (stage === 'Push') {
+          const gets = answered(round, 'GetTelemetrySubscriptions').length
+          round.tick()
+          await round.until(
+            () =>
+              answered(round, 'GetTelemetrySubscriptions').length > gets && !round.machine.running
+          )
+          round.arm()
+          round.tick()
+          await round.wait(() => gate.arrived())
+        }
+        if (stage === 'retirement') await round.wait(() => gate.arrived())
         await round.wait(() => round.beginClose(round.closeOptions(0)))
         await round.settleClose()
         await round.wait(() => round.client.connect())
         const replacement = round.capture()
-        callback()
-        for (let turn = 0; turn < 50; turn++) await new Promise(setImmediate)
-        expect(round.capture().requests).toBe(replacement.requests)
+        expect(replacement.lifecycle).not.toBe(old.lifecycle)
+        callback?.()
+        if (gate) await round.drainReleased(gate)
         round.assertReplacementUnchanged(replacement)
         expect(round.finalFrames()).toHaveLength(1)
+        await round.establish()
+        expect(round.machine.reopen).toBeNull()
       } finally {
         await round.dispose()
       }
@@ -722,6 +803,109 @@ describe('first public resume', () => {
         resume.mockRestore()
         await round.dispose()
       }
+    },
+    60000
+  )
+})
+
+describe('resource and connect continuation authority', () => {
+  test.each(['consumer', 'shareConsumer'])(
+    'S23 %s replaces the real member while a sample is held',
+    async (kind) => {
+      const round = await established({ kind })
+      const gate = round.hold('S10', { mode: 'normal' })
+      try {
+        round.arm()
+        round.tick()
+        await round.wait(() => gate.arrived())
+        const resources = round.binding.captureResources()
+        const frames = round.trace.frames.length
+        await round.rejoin()
+        expect(resources.isCurrent()).toBe(false)
+        expect(round.binding.captureResources().values).toEqual(resources.values)
+        await round.drainReleased(gate)
+        expect(round.trace.frames).toHaveLength(frames)
+        const count = round.pushes().length
+        round.tick()
+        await round.until(() => round.pushes().length > count && !round.machine.running)
+        round.assertCore(0, 'rejoin')
+      } finally {
+        await round.dispose()
+      }
+    },
+    60000
+  )
+
+  test.each([false, true])(
+    'S24 connect/close race preserves the original connect result enabled=%s',
+    async (enabled) => {
+      const round = new PublicTelemetryRound({ kind: 'producer', enabled })
+      const ClientTelemetry = require('../client')
+      const resume = jest.spyOn(ClientTelemetry.prototype, 'resume')
+      try {
+        await round.start()
+        await round.wait(() => round.client.disconnect({ timeout: 0 }))
+        const Generation = require('../../producer/generation')
+        let admitted = false
+        let release
+        const gate = new Promise((resolve) => {
+          release = resolve
+        })
+        round.patch(
+          Generation.prototype,
+          'wait',
+          (original) =>
+            async function (...args) {
+              const value = await original.apply(this, args)
+              if (!admitted) {
+                admitted = true
+                await gate
+              }
+              return value
+            }
+        )
+        const before = resume.mock.calls.length
+        const connecting = round.client.connect()
+        round.pending.push(connecting.catch(() => {}))
+        await round.until(() => admitted)
+        const closing = round.client.disconnect({ timeout: 0 })
+        release()
+        await expect(connecting).resolves.toBeUndefined()
+        await closing
+        expect(resume.mock.calls.length).toBe(before)
+        if (!enabled) expect(round.telemetryRequests()).toEqual([])
+      } finally {
+        resume.mockRestore()
+        await round.dispose()
+      }
+    },
+    60000
+  )
+})
+
+describe('round clock restoration', () => {
+  test.each([false, true])(
+    'restores wall and monotonic sources after startup failure=%s',
+    async (fail) => {
+      const wall = Date.now
+      const monotonic = process.hrtime.bigint
+      const performanceNow = require('node:perf_hooks').performance.now
+      const round = new PublicTelemetryRound({ kind: 'producer' })
+      const reason = new Error('fixture startup failure')
+      try {
+        const starting = round.start({
+          beforeConnect: () => {
+            if (fail) throw reason
+          },
+        })
+        if (fail) await expect(starting).rejects.toBe(reason)
+        else await starting
+      } finally {
+        await round.dispose()
+      }
+      expect(Date.now).toBe(wall)
+      expect(process.hrtime.bigint).toBe(monotonic)
+      expect(require('node:perf_hooks').performance.now).toBe(performanceNow)
     },
     60000
   )
