@@ -17,10 +17,13 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Add independent telemetry request/response vectors and strict wire fixtures.
 - Verify normal physical connections and completed-request observations independently.
 - Add independently generated and decoded OTLP metric vectors.
+- Exercise subscription updates and isolated bounded error recovery through the real network stack.
 
 #### Behavior changes
 
 - Telemetry codecs, numeric collection and snapshot registration are internal at this stage. Existing client configuration and foreground operations are unchanged, and returned-client registration methods are not attached yet.
+- The internal telemetry transport uses one dedicated authenticated socket, requires both negotiated telemetry APIs and a successful runtime Get, and leaves unsupported foreground operations usable.
+- Positive telemetry push intervals below 100 ms are clamped to 100 ms locally; nonpositive intervals use 300000 ms.
 - Bound raw and transmitted telemetry bodies, omit whole metric groups under small limits, and advance only written included baselines; a rejected written sample can be lost from later deltas.
 - Telemetry payloads over1000 bytes use mutually supported built-in ZSTD/GZIP in broker order; NONE is always available. Producer codec registrations are unchanged.
 

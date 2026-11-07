@@ -1,0 +1,458 @@
+const ClientTelemetry = require('../client')
+const TelemetryMetrics = require('../metrics')
+const ID = '01020304-0506-0708-090a-0b0c0d0e0f10'
+const subscription = (fields = {}) => ({
+  clientInstanceId: ID,
+  subscriptionId: -7,
+  acceptedCompressionTypes: [0],
+  pushIntervalMs: 1000,
+  telemetryMaxBytes: 1048576,
+  deltaTemporality: true,
+  requestedMetrics: ['*'],
+  ...fields,
+})
+const failure = (code, extra = {}) =>
+  Object.assign(new Error('private diagnostic'), { code, clientSideThrottleTime: 0, ...extra })
+/** @param {object} options deterministic controls @returns {object} real collector and finite transport */
+const setup = (options = {}) => {
+  const clock = {
+    now: () => jest.now(),
+    random: () => options.random ?? 0.5,
+    setTimeout,
+    clearTimeout,
+  }
+  const metrics = new TelemetryMetrics({
+    kind: 'producer',
+    clock: { wallMs: () => 1000, monotonicNs: () => BigInt(jest.now()) * 1000000n },
+  })
+  const events = []
+  const gets = []
+  const pushes = []
+  const handles = []
+  let candidates = options.candidates ?? [
+    {
+      nodeId: 1,
+      host: 'a',
+      port: 9092,
+      endpointRevision: 1n,
+      versions: { 71: { minVersion: 0, maxVersion: 0 }, 72: { minVersion: 0, maxVersion: 0 } },
+    },
+  ]
+  const transport = {
+    candidates: () => candidates,
+    open: jest.fn(async (candidate, { guard, onAllocated }) => {
+      const handle = {
+        retired: false,
+        isConnected: () => !handle.retired,
+        get: jest.fn(async (payload, authority) => {
+          const error = authority.guard()
+          if (error) throw error
+          events.push({ api: 71, ...payload })
+          const answer = gets.shift()
+          return typeof answer === 'function'
+            ? answer(payload, authority)
+            : (answer ?? subscription())
+        }),
+        push: jest.fn(async (payload, authority) => {
+          const error = authority.guard()
+          if (error) throw error
+          authority.onWrite()
+          events.push({ api: 72, ...payload })
+          const answer = pushes.shift()
+          return typeof answer === 'function'
+            ? answer(payload, authority)
+            : (answer ?? { errorCode: 0, clientSideThrottleTime: 0 })
+        }),
+        retire: jest.fn(async () => {
+          handle.retired = true
+        }),
+      }
+      handles.push(handle)
+      onAllocated(handle)
+      const refusal = guard()
+      if (refusal) throw refusal
+      return handle
+    }),
+  }
+  const client = new ClientTelemetry({
+    kind: 'producer',
+    metrics,
+    transport,
+    clock,
+    logger: options.logger,
+    config: { enableMetricsPush: true, ...options.config },
+  })
+  return {
+    client,
+    metrics,
+    transport,
+    events,
+    gets,
+    pushes,
+    handles,
+    setCandidates: (value) => {
+      candidates = value
+    },
+  }
+}
+beforeEach(() => {
+  jest.useFakeTimers({ now: 0 })
+})
+afterEach(() => {
+  jest.useRealTimers()
+})
+
+describe('bounded numeric telemetry error recovery', () => {
+  it.each([42, 87, 58, 999])('stops ordinary streams on fatal code %i', async (code) => {
+    const h = setup()
+    h.pushes.push(() => Promise.reject(failure(code)))
+    h.client.resume()
+    await jest.advanceTimersByTimeAsync(0)
+    await jest.advanceTimersByTimeAsync(1000)
+    expect(h.client.state).toBe('STOPPED')
+    expect(jest.getTimerCount()).toBe(0)
+  })
+  it.each([117, 76])('allows one immediate refresh for push error %i', async (code) => {
+    const h = setup()
+    h.pushes.push(
+      () => Promise.reject(failure(code)),
+      () => Promise.reject(failure(code))
+    )
+    h.client.resume()
+    await jest.advanceTimersByTimeAsync(0)
+    await jest.advanceTimersByTimeAsync(1000)
+    await jest.advanceTimersByTimeAsync(1)
+    expect(h.events.filter((e) => e.api === 71)).toHaveLength(2)
+    expect(h.client.recoveryUsed).toBe(true)
+    await jest.advanceTimersByTimeAsync(999)
+    expect(h.events.filter((e) => e.api === 71)).toHaveLength(2)
+    await jest.advanceTimersByTimeAsync(1000)
+    expect(h.events.filter((e) => e.api === 71)).toHaveLength(2)
+    await jest.advanceTimersByTimeAsync(1)
+    expect(h.events.filter((e) => e.api === 71)).toHaveLength(3)
+    h.client.suspend()
+  })
+  it.each([117, 76])('backs off a failed Get without recursive refresh: %i', async (code) => {
+    const h = setup()
+    h.gets.push(() => Promise.reject(failure(code)))
+    h.client.resume()
+    await jest.advanceTimersByTimeAsync(0)
+    expect(h.events).toHaveLength(1)
+    await jest.advanceTimersByTimeAsync(999)
+    expect(h.events).toHaveLength(1)
+    await jest.advanceTimersByTimeAsync(1)
+    expect(h.events).toHaveLength(2)
+    h.client.suspend()
+  })
+  it('halves the effective budget and retains its penalty across a larger refreshed cap', async () => {
+    const h = setup()
+    h.gets.push(subscription({ telemetryMaxBytes: 200 }))
+    h.pushes.push(() => Promise.reject(failure(118)))
+    h.client.resume()
+    await jest.advanceTimersByTimeAsync(0)
+    await jest.advanceTimersByTimeAsync(1000)
+    expect(h.client.penalty).toBe(100)
+    await jest.advanceTimersByTimeAsync(1000)
+    expect(h.client.penalty).toBe(100)
+    expect(h.client.subscription.telemetryMaxBytes).toBe(1048576)
+    await jest.advanceTimersByTimeAsync(1000)
+    expect(h.client.penalty).toBeNull()
+    h.client.suspend()
+  })
+  it('waits for both interval and quota after code89', async () => {
+    const h = setup()
+    h.pushes.push(() => Promise.reject(failure(89, { clientSideThrottleTime: 2000 })))
+    h.client.resume()
+    await jest.advanceTimersByTimeAsync(0)
+    await jest.advanceTimersByTimeAsync(2999)
+    expect(h.events.filter((e) => e.api === 71)).toHaveLength(1)
+    await jest.advanceTimersByTimeAsync(1)
+    expect(h.events.filter((e) => e.api === 71)).toHaveLength(2)
+    h.client.suspend()
+  })
+  it('caps every backoff after jitter and resets only on push or empty poll', () => {
+    const h = setup({ random: 1 })
+    expect(Array.from({ length: 8 }, () => h.client.backoff())).toEqual([
+      1200, 2400, 4800, 9600, 19200, 30000, 30000, 30000,
+    ])
+  })
+  it('expires a held Get at the local budget even when foreground enforcement is off', async () => {
+    const h = setup({ config: { enforceRequestTimeout: false } })
+    let release
+    h.gets.push(
+      () =>
+        new Promise((resolve) => {
+          release = resolve
+        })
+    )
+    h.client.resume()
+    await jest.advanceTimersByTimeAsync(0)
+    await jest.advanceTimersByTimeAsync(30000)
+    expect(h.client.state).toBe('BACKOFF')
+    expect(h.handles[0].retired).toBe(true)
+    release(subscription())
+    await jest.advanceTimersByTimeAsync(0)
+    expect(h.client.uuid).toBeNull()
+    h.client.suspend()
+  })
+  it('retains unsent samples and backs off a local payload failure', async () => {
+    const h = setup()
+    h.client.payload.buildPayload = async () => {
+      throw Error('secret')
+    }
+    h.client.resume()
+    await jest.advanceTimersByTimeAsync(0)
+    await jest.advanceTimersByTimeAsync(1000)
+    expect(h.client.state).toBe('BACKOFF')
+    expect(h.events.filter((e) => e.api === 72)).toHaveLength(0)
+    h.client.suspend()
+  })
+})
+describe('provisional post-final reopen', () => {
+  it.each(['beforeGet', 'afterGet', 'afterPush'])(
+    'retains UUID with cache retirement %s',
+    async (position) => {
+      const h = setup()
+      h.client.resume()
+      await jest.advanceTimersByTimeAsync(0)
+      await jest.advanceTimersByTimeAsync(1000)
+      await h.client.close({ remaining: () => 1000 })
+      let retired = position === 'beforeGet'
+      const order = []
+      h.gets.push(() => {
+        order.push('get')
+        if (position === 'afterGet') retired = true
+        return subscription({ clientInstanceId: null })
+      })
+      h.pushes.push(() => {
+        order.push('push')
+        if (!retired) {
+          retired = true
+          throw failure(42)
+        }
+        return { errorCode: 0 }
+      })
+      h.client.resume()
+      await jest.advanceTimersByTimeAsync(0)
+      expect(h.client.reopen).not.toBeNull()
+      expect(h.events.at(-1)).toMatchObject({ api: 71, clientInstanceId: ID })
+      await jest.advanceTimersByTimeAsync(1000)
+      if (position === 'afterPush') {
+        expect(h.client.reopen.used).toBe(true)
+        await jest.advanceTimersByTimeAsync(2000)
+      }
+      expect(retired).toBe(true)
+      expect(order).toEqual(['get', 'push'])
+      expect(h.client.reopen).toBeNull()
+      expect(h.events.at(-1).clientInstanceId).toBe(ID)
+      expect(h.events.filter((e) => e.terminating)).toHaveLength(1)
+      h.client.suspend()
+    }
+  )
+  it('consumes the single corrective allowance before retirement and keeps it through Get', async () => {
+    const h = setup()
+    h.client.resume()
+    await jest.advanceTimersByTimeAsync(0)
+    await jest.advanceTimersByTimeAsync(1000)
+    await h.client.close({ remaining: () => 1000 })
+    h.pushes.push(() => Promise.reject(failure(42)))
+    h.client.resume()
+    await jest.advanceTimersByTimeAsync(0)
+    const reopen = h.client.reopen
+    await jest.advanceTimersByTimeAsync(1000)
+    expect(reopen.used).toBe(true)
+    expect(h.client.reopen).toBe(reopen)
+    await jest.advanceTimersByTimeAsync(1000)
+    expect(h.events.at(-1)).toMatchObject({ api: 71, clientInstanceId: ID })
+    expect(h.client.reopen).toBe(reopen)
+    await jest.advanceTimersByTimeAsync(1000)
+    expect(h.client.reopen).toBeNull()
+    h.client.suspend()
+  })
+  it('stops after repeated corrective42 without another final', async () => {
+    const h = setup()
+    h.client.resume()
+    await jest.advanceTimersByTimeAsync(0)
+    await jest.advanceTimersByTimeAsync(1000)
+    await h.client.close({ remaining: () => 1000 })
+    h.pushes.push(
+      () => Promise.reject(failure(42)),
+      () => Promise.reject(failure(42))
+    )
+    h.client.resume()
+    await jest.advanceTimersByTimeAsync(0)
+    await jest.advanceTimersByTimeAsync(3000)
+    expect(h.client.state).toBe('STOPPED')
+    expect(h.events.filter((e) => e.terminating)).toHaveLength(1)
+  })
+  it('codec refresh never restores the corrective reopen allowance', () => {
+    const h = setup()
+    h.client.connected = true
+    h.client.install(subscription())
+    h.client.reopen = { revision: h.client.issue(), lifecycle: h.client.lifecycle, used: true }
+    h.client.rejectedCodecs.add(1)
+    const before = h.client.reopen
+    h.client.install(subscription({ clientInstanceId: null, acceptedCompressionTypes: [1, 0] }))
+    expect(h.client.reopen).toBe(before)
+    expect(h.client.reopen.used).toBe(true)
+    expect([...h.client.rejectedCodecs]).toEqual([1])
+    h.client.handleError(failure(42), 'push', { lifecycle: h.client.lifecycle })
+    expect(h.client.state).toBe('STOPPED')
+  })
+  it('skips another final if close interrupts a provisional reopen', async () => {
+    const h = setup()
+    h.client.resume()
+    await jest.advanceTimersByTimeAsync(0)
+    await jest.advanceTimersByTimeAsync(1000)
+    await h.client.close({ remaining: () => 1000 })
+    h.client.resume()
+    await jest.advanceTimersByTimeAsync(0)
+    await h.client.close({ remaining: () => 1000 })
+    expect(h.events.filter((e) => e.terminating)).toHaveLength(1)
+    expect(jest.getTimerCount()).toBe(0)
+  })
+})
+
+describe('corrective request authority', () => {
+  it.each(['backoff', 'get', 'push'])(
+    'revokes held corrective %s through another public reopen',
+    async (phase) => {
+      const h = setup()
+      h.client.resume()
+      await jest.advanceTimersByTimeAsync(0)
+      await jest.advanceTimersByTimeAsync(1000)
+      await h.client.close({ remaining: () => 1000 })
+      h.pushes.push(() => Promise.reject(failure(42)))
+      h.client.resume()
+      await jest.advanceTimersByTimeAsync(0)
+      await jest.advanceTimersByTimeAsync(1000)
+      const old = h.client.reopen
+      let release
+      if (phase === 'backoff') await jest.advanceTimersByTimeAsync(999)
+      if (phase === 'get') {
+        h.gets.push(
+          () =>
+            new Promise((resolve) => {
+              release = resolve
+            })
+        )
+        await jest.advanceTimersByTimeAsync(1000)
+      }
+      if (phase === 'push') {
+        await jest.advanceTimersByTimeAsync(1000)
+        h.pushes.push(
+          () =>
+            new Promise((resolve) => {
+              release = resolve
+            })
+        )
+        await jest.advanceTimersByTimeAsync(1000)
+      }
+      await h.client.close({ zero: true })
+      h.client.resume()
+      await jest.advanceTimersByTimeAsync(0)
+      const next = h.client.subscription
+      if (release) {
+        release(phase === 'get' ? subscription({ subscriptionId: 99 }) : { errorCode: 0 })
+        await jest.advanceTimersByTimeAsync(0)
+      }
+      expect(h.client.reopen).not.toBe(old)
+      expect(h.client.subscription).toBe(next)
+      expect(h.client.uuid).toBe(ID)
+      expect(h.events.filter((e) => e.terminating)).toHaveLength(1)
+      h.client.suspend()
+    }
+  )
+  it('keeps fatal telemetry stopped through public close and connect', async () => {
+    const h = setup()
+    h.client.stop()
+    await h.client.close({ zero: true })
+    h.client.resume()
+    await jest.advanceTimersByTimeAsync(0)
+    expect(h.transport.open).not.toHaveBeenCalled()
+    expect(h.client.stopped).toBe(true)
+  })
+})
+
+describe('safe wrapped failure classification', () => {
+  it('finds retriable transport causes with a finite cycle bound', () => {
+    const h = setup()
+    const inner = Object.assign(new Error('secret'), { retriable: true })
+    const outer = Object.assign(new Error('wrapper'), { cause: inner })
+    inner.cause = outer
+    expect(h.client.classify(outer)).toMatchObject({ retriable: true, code: undefined })
+    expect(h.client.classify({ cause: failure(58), retriable: true }).code).toBe(58)
+  })
+  it('never invokes thrown diagnostic accessors', () => {
+    const h = setup()
+    const getter = jest.fn(() => {
+      throw Error('secret')
+    })
+    const error = {}
+    Object.defineProperty(error, 'message', { get: getter })
+    Object.defineProperty(error, 'code', { get: getter })
+    Object.defineProperty(error, 'cause', { get: getter })
+    expect(h.client.classify(error)).toMatchObject({ retriable: false, code: undefined })
+    expect(getter).not.toHaveBeenCalled()
+  })
+})
+
+describe('terminating provenance', () => {
+  it('retires final provenance after a successful normal reopen push', async () => {
+    const h = setup()
+    h.client.resume()
+    await jest.advanceTimersByTimeAsync(0)
+    await jest.advanceTimersByTimeAsync(1000)
+    await h.client.close({ remaining: () => 1000 })
+    h.client.resume()
+    await jest.advanceTimersByTimeAsync(0)
+    await jest.advanceTimersByTimeAsync(1000)
+    expect(h.client.hadFinal).toBe(false)
+    await h.client.close({ zero: true })
+    h.client.resume()
+    await jest.advanceTimersByTimeAsync(0)
+    expect(h.client.reopen).toBeNull()
+    h.pushes.push(() => Promise.reject(failure(42)))
+    await jest.advanceTimersByTimeAsync(1000)
+    expect(h.client.state).toBe('STOPPED')
+    expect(h.events.filter((e) => e.terminating)).toHaveLength(1)
+  })
+})
+
+it.each([0, 20, 1000, 5000])('bounds primitive close with remaining budget %i', async (budget) => {
+  const h = setup()
+  h.client.resume()
+  await jest.advanceTimersByTimeAsync(0)
+  let release
+  h.pushes.push(
+    () =>
+      new Promise((resolve) => {
+        release = resolve
+      })
+  )
+  const entered = jest.now()
+  let ended = false
+  const closing = h.client
+    .close({ zero: budget === 0, remaining: () => budget - (jest.now() - entered) })
+    .then(() => {
+      ended = true
+    })
+  await jest.advanceTimersByTimeAsync(0)
+  const cap = Math.min(1000, budget)
+  if (cap > 0) {
+    expect(ended).toBe(false)
+    expect(h.events.filter((event) => event.terminating)).toHaveLength(1)
+    await jest.advanceTimersByTimeAsync(cap - 1)
+    expect(ended).toBe(false)
+    await jest.advanceTimersByTimeAsync(1)
+  } else {
+    expect(h.events.filter((event) => event.terminating)).toHaveLength(0)
+  }
+  await closing
+  expect(h.handles[0].retired).toBe(true)
+  expect(h.client.state).toBe('CLOSED')
+  expect(jest.getTimerCount()).toBe(0)
+  if (release) release({ errorCode: 0 })
+  await jest.advanceTimersByTimeAsync(0)
+  expect(jest.getTimerCount()).toBe(0)
+})

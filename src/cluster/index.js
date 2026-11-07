@@ -1,4 +1,5 @@
-const { checked, waitOf, shareMetadata, retrierOf } = require('../admin/deadline')
+const Broker = require('../broker')
+const { checked, waitOf, shareMetadata, retrierOf, sharedSetup } = require('../admin/deadline')
 const CommittedOffsetRevisions = require('./committedOffsetRevisions')
 const describeThrown = require('../network/describeThrown')
 const BrokerPool = require('./brokerPool')
@@ -292,6 +293,122 @@ module.exports = class Cluster {
    */
   retryFor(fence) {
     return fence ? createRetry({ ...this.retryOptions, fence }) : this.retrier
+  }
+
+  /**
+   * Creates one private adapter per returned client, with isolated failure and supplier state.
+   * Notifications and transport work leave any calling admin/discovery scope; explicit guards remain.
+   * @param {{now:Function}} clock monotonic millisecond clock shared with its owner
+   * @returns {object} candidates/open adapter; foreground discovery and maps are untouched
+   * @throws {Error} only from awaited private open; foreground callers do not await it
+   */
+  createTelemetryTransport(clock) {
+    const builder = this.connectionPoolBuilder
+    const source = this.brokerPool
+    let active = null
+    let retiring = Promise.resolve()
+    const supplier = {
+      pending: null,
+      /**
+       * Holds the client shell until the underlying authentication truly settles, even after cancellation.
+       * @param {Function} authenticate lazy whole-mechanism invocation, including built-in suppliers
+       * @param {Function} guard fixed invocation authority, never a replacement request
+       * @returns {Promise<void>} underlying completion, not the local cancellation race
+       * @throws {Error} occupied shell, revoked authority or original authentication error
+       */
+      async run(authenticate, guard) {
+        if (this.pending)
+          throw new KafkaJSConnectionError('Telemetry authentication remains pending')
+        const pending = Promise.resolve().then(() => {
+          const refusal = guard()
+          if (refusal) throw refusal
+          return authenticate()
+        })
+        this.pending = pending
+        try {
+          await pending
+        } finally {
+          if (this.pending === pending) this.pending = null
+        }
+      },
+    }
+    return {
+      /** @returns {ReadonlyArray<object>} ready foreground hints, with no discovery */
+      candidates: () => source.telemetryCandidates(),
+      /** @param {Function|null} listener private owner callback @returns {void} outside the calling scope */
+      onCandidatesChanged: (listener) => {
+        source.telemetryAdvertisementListener = listener ? () => sharedSetup(listener) : null
+      },
+      /**
+       * Retires the previous socket before opening index zero and renegotiating on that socket.
+       * @param {object} candidate known immutable endpoint
+       * @param {{guard:Function,deadline:number,onAllocated:Function}} options captured authority
+       * @returns {Promise<object>} isolated Get/Push/retire handle after actual ApiVersions
+       * @throws {Error} stale authority, setup/auth failure or missing paired APIs
+       */
+      open: (candidate, { guard, deadline, onAllocated }) =>
+        sharedSetup(async () => {
+          if (supplier.pending)
+            throw new KafkaJSConnectionError('Telemetry authentication remains pending')
+          if (active) await active.retire({ drainTimeout: 0 })
+          await retiring
+          const refusal = guard()
+          if (refusal) throw refusal
+          const sasl = builder.telemetrySasl()
+          const pool = builder.buildTelemetry(candidate, {
+            guard,
+            remaining: () => deadline - clock.now(),
+            sasl,
+            authenticationOwner: supplier,
+          })
+          const broker = new Broker({
+            connectionPool: pool,
+            logger: pool.pool[0].logger,
+            authenticationTimeout: pool.authenticationTimeout,
+            nodeId: candidate.nodeId,
+          })
+          let retired = false
+          const handle = {
+            /** @returns {boolean} live dedicated index zero, no socket acquisition */
+            isConnected: () => !retired && broker.isConnected(),
+            /** @param {object} payload UUID @param {object} options authority @returns {Promise<object>} response */
+            get: (payload, options) =>
+              sharedSetup(() => broker.getTelemetrySubscriptions(payload, options)),
+            /** @param {object} payload Metrics @param {object} options authority @returns {Promise<object>} response */
+            push: (payload, options) => sharedSetup(() => broker.pushTelemetry(payload, options)),
+            /** @param {object} options inherited forced drain @returns {Promise<void>} captured cleanup only */
+            retire: (options = { drainTimeout: 0 }) =>
+              sharedSetup(() => {
+                if (retired) return retiring
+                retired = true
+                pool.retire()
+                const done = pool.destroy(options)
+                retiring = done.catch(() => {})
+                if (active === handle) active = null
+                return retiring
+              }),
+          }
+          active = handle
+          onAllocated(handle)
+          try {
+            await broker.connect({ guard })
+            const refusal = guard()
+            if (refusal) throw refusal
+            const paired = [71, 72].every(
+              (key) =>
+                broker.versions[key]?.minVersion <= 0 && broker.versions[key]?.maxVersion >= 0
+            )
+            if (!paired)
+              throw Object.assign(new KafkaJSConnectionError('Telemetry APIs unavailable'), {
+                code: 35,
+              })
+            return handle
+          } catch (error) {
+            await handle.retire({ drainTimeout: 0 })
+            throw error
+          }
+        }),
+    }
   }
 
   /**

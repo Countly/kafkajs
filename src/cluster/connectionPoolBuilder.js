@@ -130,7 +130,63 @@ module.exports = ({
     return list
   }
 
+  const quietLogger = {
+    /** @returns {object} same private sink; namespaces cannot carry application data */
+    namespace() {
+      return this
+    },
+    /** @returns {void} private request data is never published */
+    debug() {},
+    /** @returns {void} private setup data is never published */
+    info() {},
+    /** @returns {void} machine owns fixed bounded diagnostics */
+    warn() {},
+    /** @returns {void} machine owns fixed bounded diagnostics */
+    error() {},
+  }
+
   return {
+    /** @returns {object|undefined} independent shallow SASL config; provider identity is retained */
+    telemetrySasl: () => (sasl ? { ...sasl } : undefined),
+    /**
+     * Builds an unused private pool for an explicit known endpoint, without brokers().
+     * @param {object} candidate immutable host/port hint
+     * @param {{guard:Function,remaining:Function,sasl?:object,authenticationOwner?:object}} options local authority and copied SASL
+     * @returns {ConnectionPool} two objects, only index zero is ever connected
+     * @throws {Error} invalid endpoint or expired local authority
+     */
+    buildTelemetry: (candidate, { guard, remaining, sasl: privateSasl, authenticationOwner }) => {
+      const refusal = guard()
+      if (refusal) throw refusal
+      const budget = Math.max(1, Math.min(30000, Math.floor(remaining())))
+      const pool = new ConnectionPool({
+        host: candidate.host,
+        port: candidate.port,
+        ssl,
+        sasl: privateSasl,
+        authenticationOwner,
+        clientId,
+        socketFactory,
+        setupPolicy,
+        authenticationTimeout,
+        connectionTimeout: Math.min(connectionTimeout ?? budget, budget),
+        connectionTimeoutMax: Math.min(connectionTimeoutMax ?? budget, budget),
+        reconnectBackoff,
+        reconnectBackoffMax,
+        requestTimeout: 5000,
+        enforceRequestTimeout: true,
+        maxInFlightRequests: 1,
+        maxResponseSize: Math.min(maxResponseSize ?? 65536, 65536),
+        drainTimeout: 0,
+        setupGuard: guard,
+        instrumentationEmitter: null,
+        telemetrySink: null,
+        logger: quietLogger,
+        reauthenticationThreshold,
+        connectionsMaxIdle,
+      })
+      return pool
+    },
     /** @returns {Set<string>} copy of the complete latest validated bootstrap endpoints */
     get bootstrapEndpoints() {
       return new Set(bootstrapEndpoints)
