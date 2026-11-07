@@ -1,0 +1,7 @@
+{
+  "message": "ShareAcknowledgeRequest",
+  "version": 2,
+  "case": "uniform11",
+  "hex": "0c73686172652d67726f75700d73686172652d6d656d6265720000000100020102030405060708090a0b0c0d0e0f100200000000020020000000000001002000000000000b020100000000",
+  "fields": {"groupId":"share-group","memberId":"share-member","shareSessionEpoch":1,"isRenewAck":false,"topics":[{"topicId":"01020304-0506-0708-090a-0b0c0d0e0f10","partitions":[{"partitionIndex":0,"acknowledgementBatches":[{"firstOffset":"9007199254740993","lastOffset":"9007199254741003","acknowledgeTypes":[1]}]}]}]}
+}

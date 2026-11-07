@@ -18,8 +18,13 @@ const { KafkaJSServerDoesNotSupportApiKey, KafkaJSNotImplemented } = require('..
 /** @type {RequestDefinitions} */
 const noImplementedRequestDefinitions = {
   versions: [],
+  /**
+   * Rejects protocol construction for every unimplemented request.
+   * @returns {never}
+   * @throws {KafkaJSNotImplemented} Always, with a diagnostic message.
+   */
   protocol: () => {
-    throw new KafkaJSNotImplemented()
+    throw new KafkaJSNotImplemented('The requested API is not implemented')
   },
 }
 
@@ -88,6 +93,13 @@ const requests = {
   ConsumerGroupDescribe: require('./consumerGroupDescribe'),
   ListConfigResources: require('./listConfigResources'),
   DescribeTopicPartitions: require('./describeTopicPartitions'),
+  ShareGroupHeartbeat: require('./shareGroupHeartbeat'),
+  ShareGroupDescribe: require('./shareGroupDescribe'),
+  ShareFetch: require('./shareFetch'),
+  ShareAcknowledge: require('./shareAcknowledge'),
+  DescribeShareGroupOffsets: require('./describeShareGroupOffsets'),
+  AlterShareGroupOffsets: require('./alterShareGroupOffsets'),
+  DeleteShareGroupOffsets: require('./deleteShareGroupOffsets'),
 }
 
 const names = Object.keys(apiKeys)

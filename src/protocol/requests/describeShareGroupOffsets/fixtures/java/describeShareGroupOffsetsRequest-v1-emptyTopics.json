@@ -1,0 +1,7 @@
+{
+  "message": "DescribeShareGroupOffsetsRequest",
+  "version": 1,
+  "case": "emptyTopics",
+  "hex": "020c73686172652d67726f7570010000",
+  "fields": {"groups":[{"groupId":"share-group","topics":[]}]}
+}

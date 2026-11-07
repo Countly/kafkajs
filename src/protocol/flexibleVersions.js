@@ -73,4 +73,11 @@ module.exports = {
   72: 0, // PushTelemetry
   74: 0, // ListConfigResources
   75: 0, // DescribeTopicPartitions
+  76: 0, // ShareGroupHeartbeat
+  77: 0, // ShareGroupDescribe
+  78: 0, // ShareFetch
+  79: 0, // ShareAcknowledge
+  90: 0, // DescribeShareGroupOffsets
+  91: 0, // AlterShareGroupOffsets
+  92: 0, // DeleteShareGroupOffsets
 }

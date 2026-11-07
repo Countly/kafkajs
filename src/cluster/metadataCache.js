@@ -1,4 +1,5 @@
 const { CLUSTER_TOPIC_RECREATED } = require('./instrumentationEvents')
+const { sharedSetup } = require('../admin/deadline')
 
 const UNKNOWN_EPOCH = -1
 const NO_LEADER_ID = -1
@@ -184,13 +185,14 @@ module.exports = class MetadataCache {
 
   /**
    * Notifies the routing listeners. Conservative: it does not diff what changed.
+   * Listeners can start long-lived work, so they must not inherit the publishing discovery.
    * @private
    * @returns {void}
    */
   publishRoutingChange() {
     for (const listener of this.routingListeners) {
       try {
-        listener()
+        sharedSetup(listener)
       } catch (e) {
         this.logger.error('Routing change listener threw, ignoring it', { error: e.message })
       }
@@ -534,7 +536,7 @@ module.exports = class MetadataCache {
    * emitter, and the clients' public `on()` wrapper only guards a *rejected promise*, not a
    * synchronous throw - so one application listener that throws would otherwise propagate out of
    * a metadata refresh and take the client's metadata path down with it. A throw is logged and
-   * dropped instead.
+   * dropped instead. Listener work is independent of the publishing discovery's lifetime.
    *
    * @private
    * @param {string} eventName
@@ -547,7 +549,7 @@ module.exports = class MetadataCache {
     }
 
     try {
-      this.instrumentationEmitter.emit(eventName, payload)
+      sharedSetup(() => this.instrumentationEmitter.emit(eventName, payload))
     } catch (e) {
       this.logger.error('Instrumentation event listener threw, ignoring it', {
         eventName,

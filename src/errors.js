@@ -266,6 +266,56 @@ class KafkaJSServerDoesNotSupportApiKey extends KafkaJSNonRetriableError {
   }
 }
 
+/**
+ * Reports compact acknowledgement ranges without claiming an unknown remote outcome succeeded.
+ * No acknowledgement retry is authorized by this error. Explicit omissions are thrown by the runner;
+ * terminal transport outcomes are reported as events by its owner.
+ * @extends KafkaJSError
+ */
+class KafkaJSShareAcknowledgementError extends KafkaJSError {
+  /**
+   * @param {Error|string} e Original error or diagnostic.
+   * @param {object} options Compact acknowledgement failure.
+   * @param {'unacknowledged'|'session-lost'|'membership-lost'|'not-sent'|'rejected-by-broker'} options.reason Failure stage.
+   * @param {string} options.topic Topic name.
+   * @param {number} options.partition Partition index.
+   * @param {{firstOffset:string,lastOffset:string}[]} options.ranges Homogeneous inclusive ranges.
+   * @param {Error} [options.cause] Original failure, including broker protocol refusal.
+   * @returns {KafkaJSShareAcknowledgementError} Non-retriable error with compact copied ranges.
+   * @throws {TypeError} For an options shape outside the declared contract.
+   */
+  constructor(e, { reason, topic, partition, ranges, cause }) {
+    super(e, { retriable: false, cause })
+    this.name = 'KafkaJSShareAcknowledgementError'
+    this.reason = reason
+    this.topic = topic
+    this.partition = partition
+    this.ranges = ranges.map(({ firstOffset, lastOffset }) => ({ firstOffset, lastOffset }))
+  }
+}
+
+/**
+ * The cluster cannot run share groups for this client. A subclass of the unsupported-API error, so
+ * existing handlers still see it; non-retriable, because repeating the request cannot help.
+ * @extends KafkaJSServerDoesNotSupportApiKey
+ */
+class KafkaJSShareGroupsNotSupportedError extends KafkaJSServerDoesNotSupportApiKey {
+  /**
+   * @param {Error|string} e Original cause or message; name the refused ranges in the message.
+   * @param {object} metadata The refusal, from the capability check or a runtime classifier.
+   * @param {number} metadata.apiKey Refused share API key.
+   * @param {string} metadata.apiName Protocol name of that API.
+   * @param {'api-not-advertised'|'api-version-range'|'feature-disabled'|'refused-by-broker'} metadata.reason Stage that refused.
+   * @param {number|null} [metadata.shareVersion=null] Finalized `share.version` level, or null when the broker reported no feature epoch.
+   */
+  constructor(e, { apiKey, apiName, reason, shareVersion = null }) {
+    super(e, { apiKey, apiName })
+    this.name = 'KafkaJSShareGroupsNotSupportedError'
+    this.reason = reason
+    this.shareVersion = shareVersion
+  }
+}
+
 class KafkaJSBrokerNotFound extends KafkaJSError {
   constructor() {
     super(...arguments)
@@ -854,6 +904,8 @@ module.exports = {
   KafkaJSTimeout,
   KafkaJSLockTimeout,
   KafkaJSServerDoesNotSupportApiKey,
+  KafkaJSShareGroupsNotSupportedError,
+  KafkaJSShareAcknowledgementError,
   KafkaJSUnsupportedMagicByteInMessageSet,
   KafkaJSDeleteTopicRecordsError,
   KafkaJSInvariantViolation,

@@ -1,0 +1,7 @@
+{
+  "message": "DeleteShareGroupOffsetsResponse",
+  "version": 0,
+  "case": "error",
+  "hex": "000000000056000100",
+  "fields": {"throttleTime":0,"errorCode":86,"errorMessage":null,"responses":[]}
+}

@@ -2,6 +2,7 @@ const diagnosticsChannel = require('node:diagnostics_channel')
 const producerEvents = require('../producer/instrumentationEvents')
 const consumerEvents = require('../consumer/instrumentationEvents')
 const adminEvents = require('../admin/instrumentationEvents')
+const shareConsumerEvents = require('../consumer/share/instrumentationEvents')
 
 /** Every public event name is published on the channel of that name under this prefix. */
 const CHANNEL_PREFIX = 'kafkajs.'
@@ -25,14 +26,15 @@ const channelsOf = ({ events, unwrap }) =>
   )
 
 /**
- * One channel per public instrumentation event, `kafkajs.<event name>` - 43 in all - created once
- * when this module loads: Node advises against acquiring channels at runtime, and an emit never
- * does. Each client kind has its own table, because the network and cluster events share their
- * internal names across kinds.
+ * One channel per public instrumentation event, `kafkajs.<event name>`, created once when this
+ * module loads: Node advises against acquiring channels at runtime, and an emit never does. Each
+ * client kind has its own table, because the network and cluster events share their internal names
+ * across kinds.
  */
 module.exports = {
   CHANNEL_PREFIX,
   producer: channelsOf(producerEvents),
   consumer: channelsOf(consumerEvents),
   admin: channelsOf(adminEvents),
+  shareConsumer: channelsOf(shareConsumerEvents),
 }

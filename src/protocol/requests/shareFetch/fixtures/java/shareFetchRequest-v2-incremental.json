@@ -1,0 +1,7 @@
+{
+  "message": "ShareFetchRequest",
+  "version": 2,
+  "case": "incremental",
+  "hex": "0c73686172652d67726f75700d73686172652d6d656d62657200000001000001f4000000007fffffff00000005000000050100020102030405060708090a0b0c0d0e0f1002000000000400200000000000010020000000000003020100002000000000000500200000000000080501000203007fffffffffffffff7fffffffffffffff02030000000100",
+  "fields": {"groupId":"share-group","memberId":"share-member","shareSessionEpoch":1,"maxWaitMs":500,"minBytes":0,"maxBytes":2147483647,"maxRecords":5,"batchSize":5,"shareAcquireMode":1,"isRenewAck":false,"topics":[{"topicId":"01020304-0506-0708-090a-0b0c0d0e0f10","partitions":[{"partitionIndex":0,"acknowledgementBatches":[{"firstOffset":"9007199254740993","lastOffset":"9007199254740995","acknowledgeTypes":[1]},{"firstOffset":"9007199254740997","lastOffset":"9007199254741000","acknowledgeTypes":[1,0,2,3]},{"firstOffset":"9223372036854775807","lastOffset":"9223372036854775807","acknowledgeTypes":[3]}]}]}],"forgottenTopicsData":[]}
+}

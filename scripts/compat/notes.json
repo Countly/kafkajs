@@ -143,6 +143,34 @@
     "SaslAuthenticate": {
       "note": "v1 adds SessionLifetimeMs (KIP-368 re-authentication), v2 is flexible. The mechanism-provider contract is unchanged at every version: a provider returns INT32-length-prefixed bytes from request.encode() and receives them in response.decode() - v2 strips and re-wraps that prefix inside its own codec.",
       "since": "2026-09-06"
+    },
+    "ShareGroupHeartbeat": {
+      "note": "KIP-932 share group membership: joins, keeps and leaves a share group, sends the subscribed topic names and receives the partitions assigned to the member. v1 is the only version.",
+      "since": "2026-11-05"
+    },
+    "ShareGroupDescribe": {
+      "note": "Admin-side describe of share groups: state, epochs, members with their subscriptions and assignments, and authorized operations. v1 is the only version.",
+      "since": "2026-11-05"
+    },
+    "ShareFetch": {
+      "note": "Fetches records for a share group member and carries its acknowledgements; the response names the acquired offset ranges with their delivery counts. v2 is the only implemented version; v1 is not implemented.",
+      "since": "2026-11-05"
+    },
+    "ShareAcknowledge": {
+      "note": "Acknowledges the records a share group member acquired: accept, release, reject or renew. v2 is the only implemented version; v1 is not implemented.",
+      "since": "2026-11-05"
+    },
+    "DescribeShareGroupOffsets": {
+      "note": "Admin-side read of a share group's start offsets and lag; a null topic list asks for every topic the group has offsets for. v1 is the only implemented version; v0 is not implemented.",
+      "since": "2026-11-05"
+    },
+    "AlterShareGroupOffsets": {
+      "note": "Admin-side change of a share group's start offsets for the named topics and partitions. v0 is the only version.",
+      "since": "2026-11-05"
+    },
+    "DeleteShareGroupOffsets": {
+      "note": "Admin-side deletion of a share group's offsets for the named topics. v0 is the only version.",
+      "since": "2026-11-05"
     }
   },
   "crossCutting": [

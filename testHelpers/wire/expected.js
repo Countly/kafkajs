@@ -18,6 +18,427 @@
  * numbers below are that file's.
  */
 module.exports = {
+  shareGroupHeartbeatV1: {
+    source:
+      'GenerateMessageVectors.java shareVectors, Apache Kafka 4.4.0 ShareGroupHeartbeat v1 join/assigned; literal wire layout and inputs',
+    request: {
+      groupId: 'share-group',
+      memberId: 'share-member',
+      memberEpoch: 0,
+      rackId: 'rack-a',
+      subscribedTopicNames: ['alpha', 'βeta'],
+    },
+    response: {
+      throttleTime: 17,
+      errorCode: 0,
+      errorMessage: null,
+      memberId: 'share-member',
+      memberEpoch: 2147483647,
+      heartbeatIntervalMs: 500,
+      assignment: {
+        topicPartitions: [
+          {
+            topicId: '01020304-0506-0708-090a-0b0c0d0e0f10',
+            partitions: [0, 2],
+          },
+        ],
+      },
+    },
+    requestHex:
+      '0c73686172652d67726f75700d73686172652d6d656d62657200000000077261636b2d610306616c70686106ceb265746100',
+    responseHex:
+      '000000110000000d73686172652d6d656d6265727fffffff000001f401020102030405060708090a0b0c0d0e0f10030000000000000002000000',
+  },
+  shareFetchV2: {
+    source:
+      'GenerateMessageVectors.java shareVectors, Apache Kafka 4.4.0 ShareFetch v2 open/recordsAndErrors; literal wire layout and inputs',
+    request: {
+      groupId: 'share-group',
+      memberId: 'share-member',
+      shareSessionEpoch: 0,
+      maxWaitMs: 500,
+      minBytes: 1,
+      maxBytes: 1048576,
+      maxRecords: 500,
+      batchSize: 500,
+      shareAcquireMode: 1,
+      isRenewAck: false,
+      topics: [
+        {
+          topicId: '01020304-0506-0708-090a-0b0c0d0e0f10',
+          partitions: [
+            {
+              partitionIndex: 0,
+              acknowledgementBatches: [],
+            },
+            {
+              partitionIndex: 1,
+              acknowledgementBatches: [],
+            },
+            {
+              partitionIndex: 2,
+              acknowledgementBatches: [],
+            },
+          ],
+        },
+      ],
+      forgottenTopicsData: [],
+    },
+    response: {
+      throttleTime: 23,
+      errorCode: 0,
+      errorMessage: null,
+      acquisitionLockTimeoutMs: 15000,
+      responses: [
+        {
+          topicId: '01020304-0506-0708-090a-0b0c0d0e0f10',
+          partitions: [
+            {
+              partitionIndex: 0,
+              errorCode: 0,
+              errorMessage: null,
+              acknowledgeErrorCode: 0,
+              acknowledgeErrorMessage: null,
+              currentLeader: {
+                leaderId: 2,
+                leaderEpoch: 2147483647,
+              },
+              acquiredRecords: [
+                {
+                  firstOffset: '9007199254740993',
+                  lastOffset: '9007199254740995',
+                  deliveryCount: 2,
+                },
+                {
+                  firstOffset: '9223372036854775807',
+                  lastOffset: '9223372036854775807',
+                  deliveryCount: 32767,
+                },
+              ],
+              messages: [
+                {
+                  offset: '9007199254740993',
+                  timestamp: '1700000000000',
+                  key: '6b',
+                  value: '76',
+                  headers: {},
+                },
+              ],
+            },
+            {
+              partitionIndex: 1,
+              errorCode: 6,
+              errorMessage: 'moved',
+              acknowledgeErrorCode: 121,
+              acknowledgeErrorMessage: 'not held',
+              currentLeader: {
+                leaderId: 3,
+                leaderEpoch: 12,
+              },
+              acquiredRecords: [],
+              messages: [],
+            },
+          ],
+        },
+      ],
+      nodeEndpoints: [
+        {
+          nodeId: 2,
+          host: 'localhost',
+          port: 9092,
+          rack: null,
+        },
+        {
+          nodeId: 3,
+          host: 'node-3',
+          port: 9093,
+          rack: 'rack-b',
+        },
+      ],
+    },
+    requestHex:
+      '0c73686172652d67726f75700d73686172652d6d656d62657200000000000001f40000000100100000000001f4000001f40100020102030405060708090a0b0c0d0e0f1004000000000100000000010100000000020100000100',
+    responseHex:
+      '0000001700000000003a98020102030405060708090a0b0c0d0e0f100300000000000000000000000000027fffffff004700200000000000010000003affffffff02e99b8dd80000000000000000018bcfe568000000018bcfe56800ffffffffffffffffffffffffffff0000000110000000026b02760003002000000000000100200000000000030002007fffffffffffffff7fffffffffffffff7fff0000000000010006066d6f7665640079096e6f742068656c64000000030000000c000101000003000000020a6c6f63616c686f737400002384000000000003076e6f64652d3300002385077261636b2d620000',
+    recordsHex:
+      '00200000000000010000003affffffff02e99b8dd80000000000000000018bcfe568000000018bcfe56800ffffffffffffffffffffffffffff0000000110000000026b027600',
+    recordMessage: {
+      offset: '9007199254740993',
+      timestamp: '1700000000000',
+      key: '6b',
+      value: '76',
+      headers: {},
+    },
+  },
+  shareAcknowledgeV2: {
+    source:
+      'GenerateMessageVectors.java shareVectors, Apache Kafka 4.4.0 ShareAcknowledge v2 renew/mixed; literal wire layout and inputs',
+    request: {
+      groupId: 'share-group',
+      memberId: 'share-member',
+      shareSessionEpoch: 1,
+      isRenewAck: true,
+      topics: [
+        {
+          topicId: '01020304-0506-0708-090a-0b0c0d0e0f10',
+          partitions: [
+            {
+              partitionIndex: 0,
+              acknowledgementBatches: [
+                {
+                  firstOffset: '9007199254740993',
+                  lastOffset: '9007199254740994',
+                  acknowledgeTypes: [4],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+    response: {
+      throttleTime: 29,
+      errorCode: 0,
+      errorMessage: null,
+      acquisitionLockTimeoutMs: 15000,
+      responses: [
+        {
+          topicId: '01020304-0506-0708-090a-0b0c0d0e0f10',
+          partitions: [
+            {
+              partitionIndex: 0,
+              errorCode: 0,
+              errorMessage: null,
+              currentLeader: {
+                leaderId: 2,
+                leaderEpoch: 2147483647,
+              },
+            },
+            {
+              partitionIndex: 1,
+              errorCode: 121,
+              errorMessage: 'not held',
+              currentLeader: {
+                leaderId: 3,
+                leaderEpoch: 8,
+              },
+            },
+          ],
+        },
+      ],
+      nodeEndpoints: [
+        {
+          nodeId: 3,
+          host: 'node-3',
+          port: 9093,
+          rack: null,
+        },
+      ],
+    },
+    requestHex:
+      '0c73686172652d67726f75700d73686172652d6d656d6265720000000101020102030405060708090a0b0c0d0e0f1002000000000200200000000000010020000000000002020400000000',
+    responseHex:
+      '0000001d00000000003a98020102030405060708090a0b0c0d0e0f100300000000000000000000027fffffff0000000000010079096e6f742068656c6400000003000000080000000200000003076e6f64652d3300002385000000',
+  },
+
+  shareGroupDescribeV1: {
+    source:
+      'GenerateMessageVectors.java shareVectors, Apache Kafka 4.4.0 ShareGroupDescribe v1 basic/mixed; literal wire layout and inputs',
+    request: {
+      groupIds: ['share-group', 'absent'],
+      includeAuthorizedOperations: false,
+    },
+    response: {
+      throttleTime: 19,
+      groups: [
+        {
+          errorCode: 0,
+          errorMessage: null,
+          groupId: 'share-group',
+          groupState: 'Stable',
+          groupEpoch: 2147483647,
+          assignmentEpoch: 9,
+          assignorName: 'simple',
+          members: [
+            {
+              memberId: 'share-member',
+              rackId: null,
+              memberEpoch: 8,
+              clientId: 'client-a',
+              clientHost: '/127.0.0.1',
+              subscribedTopicNames: ['alpha', 'βeta'],
+              assignment: {
+                topicPartitions: [
+                  {
+                    topicId: '01020304-0506-0708-090a-0b0c0d0e0f10',
+                    topicName: 'alpha',
+                    partitions: [0, 2],
+                  },
+                ],
+              },
+            },
+          ],
+          authorizedOperations: -2147483647,
+        },
+        {
+          errorCode: 69,
+          errorMessage: 'missing',
+          groupId: 'absent',
+          groupState: '',
+          groupEpoch: 0,
+          assignmentEpoch: 0,
+          assignorName: '',
+          members: [],
+          authorizedOperations: -2147483648,
+        },
+      ],
+    },
+    requestHex: '030c73686172652d67726f757007616273656e740000',
+    responseHex:
+      '00000013030000000c73686172652d67726f757007537461626c657fffffff000000090773696d706c65020d73686172652d6d656d626572000000000809636c69656e742d610b2f3132372e302e302e310306616c70686106ceb2657461020102030405060708090a0b0c0d0e0f1006616c70686103000000000000000200000080000001000045086d697373696e6707616273656e740100000000000000000101800000000000',
+  },
+  describeShareGroupOffsetsV1: {
+    source:
+      'GenerateMessageVectors.java shareVectors, Apache Kafka 4.4.0 DescribeShareGroupOffsets v1 nullTopics/knownAndUnknownLag; literal wire layout and inputs',
+    request: {
+      groups: [
+        {
+          groupId: 'share-group',
+          topics: null,
+        },
+      ],
+    },
+    response: {
+      throttleTime: 31,
+      groups: [
+        {
+          groupId: 'share-group',
+          topics: [
+            {
+              topicName: 'alpha',
+              topicId: '01020304-0506-0708-090a-0b0c0d0e0f10',
+              partitions: [
+                {
+                  partitionIndex: 0,
+                  startOffset: '9007199254740993',
+                  leaderEpoch: 2147483647,
+                  lag: '9223372036854775807',
+                  errorCode: 0,
+                  errorMessage: null,
+                },
+                {
+                  partitionIndex: 2,
+                  startOffset: '9223372036854775807',
+                  leaderEpoch: -1,
+                  lag: '-1',
+                  errorCode: 29,
+                  errorMessage: 'denied',
+                },
+              ],
+            },
+          ],
+          errorCode: 0,
+          errorMessage: null,
+        },
+        {
+          groupId: 'absent',
+          topics: [],
+          errorCode: 69,
+          errorMessage: 'missing',
+        },
+      ],
+    },
+    requestHex: '020c73686172652d67726f7570000000',
+    responseHex:
+      '0000001f030c73686172652d67726f75700206616c7068610102030405060708090a0b0c0d0e0f10030000000000200000000000017fffffff7fffffffffffffff00000000000000027fffffffffffffffffffffffffffffffffffffff001d0764656e69656400000000000007616273656e74010045086d697373696e670000',
+  },
+  alterShareGroupOffsetsV0: {
+    source:
+      'GenerateMessageVectors.java shareVectors, Apache Kafka 4.4.0 AlterShareGroupOffsets v0 offsets/mixed; literal wire layout and inputs',
+    request: {
+      groupId: 'share-group',
+      topics: [
+        {
+          topicName: 'alpha',
+          partitions: [
+            {
+              partitionIndex: 0,
+              startOffset: '9007199254740993',
+            },
+            {
+              partitionIndex: 2,
+              startOffset: '9223372036854775807',
+            },
+          ],
+        },
+      ],
+    },
+    response: {
+      throttleTime: 37,
+      errorCode: 0,
+      errorMessage: null,
+      responses: [
+        {
+          topicName: 'alpha',
+          topicId: '01020304-0506-0708-090a-0b0c0d0e0f10',
+          partitions: [
+            {
+              partitionIndex: 0,
+              errorCode: 0,
+              errorMessage: null,
+            },
+            {
+              partitionIndex: 2,
+              errorCode: 29,
+              errorMessage: 'denied',
+            },
+          ],
+        },
+      ],
+    },
+    requestHex:
+      '0c73686172652d67726f75700206616c7068610300000000002000000000000100000000027fffffffffffffff000000',
+    responseHex:
+      '000000250000000206616c7068610102030405060708090a0b0c0d0e0f1003000000000000000000000002001d0764656e696564000000',
+  },
+  deleteShareGroupOffsetsV0: {
+    source:
+      'GenerateMessageVectors.java shareVectors, Apache Kafka 4.4.0 DeleteShareGroupOffsets v0 topics/mixed; literal wire layout and inputs',
+    request: {
+      groupId: 'share-group',
+      topics: [
+        {
+          topicName: 'alpha',
+        },
+        {
+          topicName: 'βeta',
+        },
+      ],
+    },
+    response: {
+      throttleTime: 41,
+      errorCode: 0,
+      errorMessage: null,
+      responses: [
+        {
+          topicName: 'alpha',
+          topicId: '01020304-0506-0708-090a-0b0c0d0e0f10',
+          errorCode: 0,
+          errorMessage: null,
+        },
+        {
+          topicName: 'βeta',
+          topicId: '01020304-0506-0708-090a-0b0c0d0e0f10',
+          errorCode: 29,
+          errorMessage: 'denied',
+        },
+      ],
+    },
+    requestHex: '0c73686172652d67726f75700306616c7068610006ceb26574610000',
+    responseHex:
+      '000000290000000306616c7068610102030405060708090a0b0c0d0e0f100000000006ceb26574610102030405060708090a0b0c0d0e0f10001d0764656e6965640000',
+  },
+
   describeProducersV0: {
     source: 'Apache Kafka 4.3.1 message layout; Java verification required',
     request: {

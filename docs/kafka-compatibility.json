@@ -1430,6 +1430,153 @@
       "onFloor": false,
       "belowFloor": [],
       "notes": "Paginated describe of topics by name, with topic ids and eligible leader replicas; v0 is the only version and every 4.x broker offers it. The ELR arrays are null unless the cluster tracks them."
+    },
+    {
+      "kafkaName": "ShareGroupHeartbeat",
+      "apiKey": 76,
+      "forkName": "shareGroupHeartbeat",
+      "apiKeysName": "ShareGroupHeartbeat",
+      "planned": "done",
+      "validVersions": [
+        1,
+        1
+      ],
+      "flexibleFrom": 0,
+      "deprecatedVersions": null,
+      "latestVersionUnstable": false,
+      "forkVersions": [
+        1
+      ],
+      "gap": "current",
+      "onFloor": true,
+      "belowFloor": [],
+      "notes": "KIP-932 share group membership: joins, keeps and leaves a share group, sends the subscribed topic names and receives the partitions assigned to the member. v1 is the only version."
+    },
+    {
+      "kafkaName": "ShareGroupDescribe",
+      "apiKey": 77,
+      "forkName": "shareGroupDescribe",
+      "apiKeysName": "ShareGroupDescribe",
+      "planned": "done",
+      "validVersions": [
+        1,
+        1
+      ],
+      "flexibleFrom": 0,
+      "deprecatedVersions": null,
+      "latestVersionUnstable": false,
+      "forkVersions": [
+        1
+      ],
+      "gap": "current",
+      "onFloor": true,
+      "belowFloor": [],
+      "notes": "Admin-side describe of share groups: state, epochs, members with their subscriptions and assignments, and authorized operations. v1 is the only version."
+    },
+    {
+      "kafkaName": "ShareFetch",
+      "apiKey": 78,
+      "forkName": "shareFetch",
+      "apiKeysName": "ShareFetch",
+      "planned": "done",
+      "validVersions": [
+        1,
+        2
+      ],
+      "flexibleFrom": 0,
+      "deprecatedVersions": null,
+      "latestVersionUnstable": false,
+      "forkVersions": [
+        2
+      ],
+      "gap": "current",
+      "onFloor": false,
+      "belowFloor": [],
+      "notes": "Fetches records for a share group member and carries its acknowledgements; the response names the acquired offset ranges with their delivery counts. v2 is the only implemented version; v1 is not implemented."
+    },
+    {
+      "kafkaName": "ShareAcknowledge",
+      "apiKey": 79,
+      "forkName": "shareAcknowledge",
+      "apiKeysName": "ShareAcknowledge",
+      "planned": "done",
+      "validVersions": [
+        1,
+        2
+      ],
+      "flexibleFrom": 0,
+      "deprecatedVersions": null,
+      "latestVersionUnstable": false,
+      "forkVersions": [
+        2
+      ],
+      "gap": "current",
+      "onFloor": false,
+      "belowFloor": [],
+      "notes": "Acknowledges the records a share group member acquired: accept, release, reject or renew. v2 is the only implemented version; v1 is not implemented."
+    },
+    {
+      "kafkaName": "DescribeShareGroupOffsets",
+      "apiKey": 90,
+      "forkName": "describeShareGroupOffsets",
+      "apiKeysName": "DescribeShareGroupOffsets",
+      "planned": "done",
+      "validVersions": [
+        0,
+        1
+      ],
+      "flexibleFrom": 0,
+      "deprecatedVersions": null,
+      "latestVersionUnstable": false,
+      "forkVersions": [
+        1
+      ],
+      "gap": "current",
+      "onFloor": false,
+      "belowFloor": [],
+      "notes": "Admin-side read of a share group's start offsets and lag; a null topic list asks for every topic the group has offsets for. v1 is the only implemented version; v0 is not implemented."
+    },
+    {
+      "kafkaName": "AlterShareGroupOffsets",
+      "apiKey": 91,
+      "forkName": "alterShareGroupOffsets",
+      "apiKeysName": "AlterShareGroupOffsets",
+      "planned": "done",
+      "validVersions": [
+        0,
+        0
+      ],
+      "flexibleFrom": 0,
+      "deprecatedVersions": null,
+      "latestVersionUnstable": false,
+      "forkVersions": [
+        0
+      ],
+      "gap": "current",
+      "onFloor": false,
+      "belowFloor": [],
+      "notes": "Admin-side change of a share group's start offsets for the named topics and partitions. v0 is the only version."
+    },
+    {
+      "kafkaName": "DeleteShareGroupOffsets",
+      "apiKey": 92,
+      "forkName": "deleteShareGroupOffsets",
+      "apiKeysName": "DeleteShareGroupOffsets",
+      "planned": "done",
+      "validVersions": [
+        0,
+        0
+      ],
+      "flexibleFrom": 0,
+      "deprecatedVersions": null,
+      "latestVersionUnstable": false,
+      "forkVersions": [
+        0
+      ],
+      "gap": "current",
+      "onFloor": false,
+      "belowFloor": [],
+      "notes": "Admin-side deletion of a share group's offsets for the named topics. v0 is the only version."
     }
   ],
   "waivers": [],

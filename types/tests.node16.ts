@@ -299,3 +299,134 @@ void useBoundedDisconnect
   // @ts-expect-error fetchSessions accepts only booleans
   kafka.consumer({ groupId: 'sessions', fetchSessions: 'true' })
 }
+
+import {
+  KafkaJSShareGroupsNotSupportedError,
+  KafkaJSServerDoesNotSupportApiKey,
+  ShareGroupsNotSupportedReason,
+} from '@countly/kafkajs'
+{
+  const shareUnsupported = new KafkaJSShareGroupsNotSupportedError('ShareFetch requires v2', {
+    apiKey: 78, apiName: 'ShareFetch', reason: 'api-version-range', shareVersion: 0,
+  })
+  const base: KafkaJSServerDoesNotSupportApiKey = shareUnsupported
+  const reason: ShareGroupsNotSupportedReason = shareUnsupported.reason
+  const level: number | null = shareUnsupported.shareVersion
+  void [base, reason, level]
+  // @ts-expect-error the refusal stage is required
+  new KafkaJSShareGroupsNotSupportedError('x', { apiKey: 78, apiName: 'ShareFetch' })
+}
+
+import { KafkaJSShareAcknowledgementError as CompactAckError } from '@countly/kafkajs'
+const compactAckCause = new Error('broker refusal')
+const compactAckError = new CompactAckError('not confirmed', {
+  reason: 'rejected-by-broker', topic: 'topic', partition: 0,
+  ranges: [{ firstOffset: '9007199254740993', lastOffset: '9223372036854775807' }],
+  cause: compactAckCause,
+})
+const compactAckReason: 'unacknowledged' | 'session-lost' | 'membership-lost' | 'not-sent' | 'rejected-by-broker' = compactAckError.reason
+const compactAckRanges: Array<{ firstOffset: string; lastOffset: string }> = compactAckError.ranges
+const compactAckOptionalCause: Error | undefined = compactAckError.cause
+void [compactAckReason, compactAckRanges, compactAckOptionalCause]
+// @ts-expect-error reason is readonly
+compactAckError.reason = 'session-lost'
+// @ts-expect-error ranges is readonly
+compactAckError.ranges = []
+// @ts-expect-error acknowledgement outcomes do not introduce a retry reason
+new CompactAckError('bad', { reason: 'retry', topic: 'topic', partition: 0, ranges: [] })
+// @ts-expect-error offsets are exact decimal strings
+new CompactAckError('bad', { reason: 'not-sent', topic: 'topic', partition: 0, ranges: [{ firstOffset: 1, lastOffset: '2' }] })
+// @ts-expect-error constructor never exposes a retry option
+new CompactAckError('bad', { reason: 'not-sent', topic: 'topic', partition: 0, ranges: [], retriable: true })
+
+import type { Admin as ShareAdmin, ShareGroupDescription, ShareGroupTopicOffsets, ShareGroupAlterOffsetsResult, ShareGroupDeleteOffsetsResult } from '@countly/kafkajs'
+
+/** Compiles the additive administration surface and exact public result domains. */
+async function shareAdminTypes(admin: ShareAdmin) {
+  const described: { groups: ShareGroupDescription[] } = await admin.describeShareGroups(['share'], { includeAuthorizedOperations: true, apiTimeout: 1000 })
+  const mask: number | null = described.groups[0].authorizedOperations
+  const listed: ShareGroupTopicOffsets[] = await admin.listShareGroupOffsets({ groupId: 'share' })
+  const lag: string | null = listed[0].partitions[0].lag
+  const changed: ShareGroupAlterOffsetsResult[] = await admin.alterShareGroupOffsets({ groupId: 'share', topics: [{ topic: 'alpha', partitions: [{ partition: 0, offset: '9007199254740993' }] }], apiTimeout: 1000 })
+  const deleted: ShareGroupDeleteOffsetsResult[] = await admin.deleteShareGroupOffsets({ groupId: 'share', topics: ['alpha'], apiTimeout: 1000 })
+  await admin.listShareGroupOffsets({ groupId: 'share', topics: [] })
+  await admin.listShareGroupOffsets({ groupId: 'share', topics: [{ topic: 'alpha', partitions: [0] }] })
+  // @ts-expect-error Offsets must remain exact decimal strings.
+  await admin.alterShareGroupOffsets({ groupId: 'share', topics: [{ topic: 'alpha', partitions: [{ partition: 0, offset: 9007199254740994 }] }] })
+  // @ts-expect-error Authorization is a raw signed mask, never an array.
+  const operations: string[] = described.groups[0].authorizedOperations
+  // @ts-expect-error Unknown lag is null rather than a number.
+  const numericLag: number = listed[0].partitions[0].lag
+  // @ts-expect-error Delete selects topic names, not partition objects.
+  await admin.deleteShareGroupOffsets({ groupId: 'share', topics: [{ topic: 'alpha' }] })
+  // @ts-expect-error Share deletion uses the existing generic method.
+  await admin.deleteShareGroups(['share'])
+  // @ts-expect-error Timeout keeps the existing integer number domain.
+  await admin.describeShareGroups(['share'], { apiTimeout: '1000' })
+  return { mask, lag, changed, deleted }
+}
+
+import * as ShareSurface from '@countly/kafkajs'
+
+namespace ShareConsumerSurface {
+  const kafka = new ShareSurface.Kafka({ brokers: [] })
+  const share = kafka.shareConsumer({ groupId: 'g' })
+  const full = kafka.shareConsumer({ groupId: 'g', acknowledgementMode: 'explicit', acquireMode: 'batch_optimized', maxRecords: 500, minBytes: 0, maxBytes: 10485760, maxWaitTimeInMs: 0, metadataMaxAge: 300000, maxPollInterval: 300000, rackId: '', checkCrcs: true, allowAutoTopicCreation: false, maxInFlightRequests: null, retry: { retries: 5, restartOnFailure: async (error) => error instanceof Error } })
+  share.run({ eachMessage: async ({ topic, partition, message, acknowledge, renew, isRunning }) => {
+    const count: number = message.deliveryCount; const offset: string = message.offset
+    const value: Buffer | null = message.value; const key: Buffer | null = message.key
+    acknowledge(); acknowledge('release'); const duration: number = await renew()
+    const running: boolean = isRunning(); void [topic, partition, count, offset, value, key, duration, running]
+  } })
+  full.run({ eachBatch: async ({ batch, acknowledge, renew, isRunning }) => {
+    acknowledge(batch.messages[0], 'reject'); acknowledge({ offset: batch.messages[0].offset })
+    const duration: number = await renew([batch.messages[0], { offset: batch.messages[0].offset }])
+    await renew(); const running: boolean = isRunning(); void [duration, running, batch.acquisitionLockTimeoutMs]
+  } })
+  share.on(share.events.ACKNOWLEDGE, ({ payload }) => {
+    const first: string = payload.firstOffset; const last: string = payload.lastOffset
+    const error: ShareSurface.KafkaJSShareAcknowledgementError | null = payload.error; void [first, last, error]
+  })
+  share.on(share.events.REQUEST, ({ payload }) => { void payload })
+  const event: ShareSurface.ShareConsumerEvents[keyof ShareSurface.ShareConsumerEvents] = share.events.FETCH
+  share.on(event, (record) => { void record.type })
+  process.on('SIGTERM', share.disconnect)
+  const parameters: Parameters<ShareSurface.ShareConsumer['disconnect']> = []
+  const duration: number | null = share.acquisitionLockTimeoutMs()
+  void [parameters, duration, share.subscription(), share.assignment(), share.logger(), share.stop(), share.disconnect({ timeout: 0 })]
+  const admin = kafka.admin()
+  void [admin.describeShareGroups(['g']), admin.listShareGroupOffsets({ groupId: 'g' }), admin.alterShareGroupOffsets({ groupId: 'g', topics: [{ topic: 't', partitions: [{ partition: 0, offset: '9007199254740993' }] }] }), admin.deleteShareGroupOffsets({ groupId: 'g', topics: ['t'] }), admin.deleteGroups(['g']), admin.listGroups({ types: ['share'] })]
+  const error: Error = new ShareSurface.KafkaJSShareGroupsNotSupportedError('unsupported', { apiKey: 78, apiName: 'shareFetch', reason: 'api-version-range' })
+  if (error instanceof ShareSurface.KafkaJSShareGroupsNotSupportedError) {
+    const base: ShareSurface.KafkaJSServerDoesNotSupportApiKey = error; void [base, error.reason]
+  }
+  // @ts-expect-error Group isolation is configured on the broker.
+  kafka.shareConsumer({ groupId: 'g', readUncommitted: true })
+  // @ts-expect-error Offset reset is configured on the broker.
+  kafka.shareConsumer({ groupId: 'g', fromBeginning: true })
+  // @ts-expect-error Share groups have no static membership.
+  kafka.shareConsumer({ groupId: 'g', groupInstanceId: 'member' })
+  // @ts-expect-error Only implicit and explicit modes exist.
+  kafka.shareConsumer({ groupId: 'g', acknowledgementMode: 'manual' })
+  // @ts-expect-error Only the two documented acquisition modes exist.
+  kafka.shareConsumer({ groupId: 'g', acquireMode: 'strict' })
+  // @ts-expect-error A group id is required.
+  kafka.shareConsumer({})
+  // @ts-expect-error Topics are strings.
+  share.subscribe({ topics: [/topic/] })
+  // @ts-expect-error Regex subscription is unavailable.
+  share.subscribe({ topics: ['t'], regex: /topic/ })
+  // @ts-expect-error Offset reset is a group configuration.
+  share.subscribe({ topics: ['t'], offsetReset: 'earliest' })
+  // @ts-expect-error Renew is a separate operation.
+  const terminalType: ShareSurface.ShareAcknowledgeType = 'renew'
+  // @ts-expect-error Numeric disconnect arguments are accepted only at runtime for signals.
+  share.disconnect(5)
+  // @ts-expect-error A handler receives the share payload.
+  share.run({ eachMessage: async (payload: string) => { void payload } })
+  // @ts-expect-error Only share event names are accepted.
+  share.on('share_consumer.missing', () => {})
+  // @ts-expect-error Lock duration is a number or null.
+  const stringDuration: string = share.acquisitionLockTimeoutMs()
+  void [terminalType, stringDuration]
+}

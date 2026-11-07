@@ -106,6 +106,14 @@ docs/OAuth.md:`jwtBearer` sends the JWT-bearer grant (RFC 7523 \u00a72.1): the a
 src/__tests__/equivalentApis.spec.js:  it('R1\u00a7C:listTopics', async () => {
 src/__tests__/equivalentApis.spec.js:  it('R2\u00a75:kadm.Lag', async () => {
 src/__tests__/equivalentApis.spec.js:it('R1\u00a7C:forceTerminateTransaction', async () => {
+src/__tests__/equivalentApis.spec.js:it('R1\u00a7C:deleteShareGroups', async () => {
+src/__tests__/equivalentApis.spec.js:it('R1\u00a7E:poll', async () => {
+src/__tests__/equivalentApis.spec.js:it('R1\u00a7E:commitAsync', async () => {
+src/__tests__/equivalentApis.spec.js:it('R1\u00a7E:ackCallback', async () => {
+src/__tests__/equivalentApis.spec.js:it('R1\u00a7E:reset-offsets', async () => {
+src/__tests__/equivalentApis.spec.js:it('R1\u00a7E:commitSync', async () => {
+src/__tests__/equivalentApis.spec.js:it('R1\u00a7E:unsubscribe', async () => {
+src/__tests__/equivalentApis.spec.js:it('R1\u00a7E:resubscribe', async () => {
 src/oauth/clientCredentials.js: * @returns {string} the value form-encoded, as RFC 6749 \u00a72.3.1 requires before HTTP Basic
 src/oauth/clientCredentials.js: * Basic authentication; with `clientAssertion` (RFC 7523 \u00a72.2, KIP-1258) it carries the supplied
 src/oauth/clientCredentials.js: * The OAuth `error` codes RFC 6749 defines (\u00a75.2; \u00a74.1.2.1 for the last two) that a helper error

@@ -90,9 +90,36 @@ Stop and disconnect completion refer to the run captured by that lifecycle opera
 | TOPIC_RECREATED     | {`topic`, `previousTopicId`, `topicId`}                                                    | A topic this client had metadata for came back from a metadata refresh with a different topic id — it was deleted and recreated. Observational: this client takes no action of its own. (A consumer additionally resets that topic's offsets once — see the consumer table.) |
 | REBOOTSTRAP         | {`reason`}                                                                                 | The client rebuilt its connections and metadata from the configured broker list (KIP-899/1102). `reason` is `'timeout'` (metadata failed continuously for `metadataRecoveryRebootstrapTriggerMs`), `'required'` (a broker returned `REBOOTSTRAP_REQUIRED`), or `'all-brokers-unavailable'` (every known broker became unreachable). Only fires when `metadataRecoveryStrategy` is `'rebootstrap'` (the default). |
 
+### <a name="share-consumer"></a> Share consumer
+
+Each name has the `share_consumer.` prefix. Use the constants on `share.events` with `share.on()`. Sync throws and rejected listener returns are logged and contained. Each event is also published at `kafkajs.<full event name>` through `node:diagnostics_channel`; a diagnostics subscriber exception follows Node's uncaught-exception behavior.
+
+| Constant | Event name | Payload fields |
+|---|---|---|
+| HEARTBEAT | share_consumer.heartbeat | groupId, memberId, memberEpoch, heartbeatIntervalMs |
+| GROUP_JOIN | share_consumer.group_join | groupId, memberId, memberEpoch |
+| ASSIGNMENT_CHANGED | share_consumer.assignment_changed | groupId, memberId, memberEpoch, assignment, added, removed |
+| FETCH | share_consumer.fetch | nodeId, sessionEpoch, numberOfRecords, numberOfGaps, acknowledgementsPiggybacked, duration |
+| ACKNOWLEDGE | share_consumer.acknowledge | topic, partition, firstOffset, lastOffset, type, error |
+| SESSION_RESET | share_consumer.session_reset | nodeId, reason, recordsDropped |
+| LOCK_EXPIRED | share_consumer.lock_expired | topic, partition, offsets, stage |
+| HANDLER_ERROR | share_consumer.handler_error | topic, partition, offsets, error |
+| CONNECT | share_consumer.connect | none |
+| DISCONNECT | share_consumer.disconnect | none |
+| STOP | share_consumer.stop | none |
+| CRASH | share_consumer.crash | error, groupId, restart |
+| REQUEST | share_consumer.network.request | existing network request schema |
+| REQUEST_TIMEOUT | share_consumer.network.request_timeout | existing network request-timeout schema |
+| REQUEST_QUEUE_SIZE | share_consumer.network.request_queue_size | existing network queue-size schema |
+| AUTHENTICATION_FAILURE | share_consumer.network.authentication_failure | existing network authentication-failure schema |
+| TOPIC_RECREATED | share_consumer.cluster.topic_recreated | existing cluster topic-recreated schema |
+| REBOOTSTRAP | share_consumer.cluster.rebootstrap | existing cluster rebootstrap schema |
+
+Acknowledgement endpoints are inclusive decimal strings. Terminal homogeneous subsets settle at most once; renew results are nonterminal and can repeat. Error instances carry compact ranges and an optional protocol cause. A null acknowledgement error confirms broker acceptance; a failed or unanswered mutation may remain remotely unknown. Lock-expired and handler-error offsets name delivered records only. No event carries record values or keys.
+
 ## <a name="channels"></a> Channels (`node:diagnostics_channel`)
 
-Every event above is also published on [`node:diagnostics_channel`](https://nodejs.org/api/diagnostics_channel.html), on the channel named `kafkajs.` plus the event's name: the consumer's `REQUEST` is on `kafkajs.consumer.network.request`. A library can then observe every client in the process (a metrics layer, a tracer) without holding a reference to any of them. The 43 channels exist from the moment the package is loaded, and while a channel has no subscriber and the event has no `on()` listener nothing is allocated and nothing is published.
+Every event above is also published on [`node:diagnostics_channel`](https://nodejs.org/api/diagnostics_channel.html), on the channel named `kafkajs.` plus the event's name: the consumer's `REQUEST` is on `kafkajs.consumer.network.request`. A library can then observe every client in the process (a metrics layer, a tracer) without holding a reference to any of them. The 43 ordinary channels and 18 share channels exist from the moment the package is loaded, and while a channel has no subscriber and the event has no `on()` listener nothing is allocated and nothing is published.
 
 ```javascript
 const diagnosticsChannel = require('node:diagnostics_channel')

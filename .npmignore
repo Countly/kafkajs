@@ -9,7 +9,8 @@ testHelpers/
 scripts/
 /otel/
 examples/
-docs/
+docs/*
+!docs/ShareConsumer.md
 docker-compose.yml
 docker-compose.*.yml
 jest.config.js

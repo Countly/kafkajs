@@ -3,7 +3,7 @@ const apiKeys = require('../protocol/requests/apiKeys')
 const Connection = require('./connection')
 const { ConnectionSetupPolicy, NodeSetupStates, SetupAttempt } = require('./connectionSetup')
 
-/** Number of slots: Fetch uses the second; every other API uses the first. @type {number} */
+/** Fetch and share data use the second slot; coordinator requests use the first. @type {number} */
 const POOL_SIZE = 2
 const { KafkaJSConnectionError, KafkaJSSASLAuthenticationError } = require('../errors')
 
@@ -161,6 +161,31 @@ module.exports = class ConnectionPool {
   }
 
   /**
+   * Reads the generation of the socket an API uses, without opening it. The pool baseline is
+   * included, so an established generation is never reused after the pool is rebuilt. Read it after
+   * the connection is established: reconnecting the other slot does not change it.
+   * @param {number} apiKey Request API key; an unknown key is routed to the first slot.
+   * @returns {number} The pool baseline plus the selected connection's generation.
+   */
+  generationFor(apiKey) {
+    return this.generationBase + this.pool[this.connectionIndexFor(apiKey)].generation
+  }
+
+  /**
+   * Selects the slot for routing and generation reads, from constants and without allocating.
+   * @param {number} apiKey Request API key.
+   * @returns {0|1} 1 for Fetch, ShareFetch and ShareAcknowledge; 0 for every other key.
+   */
+  connectionIndexFor(apiKey) {
+    return POOL_SIZE > 1 &&
+      (apiKey === apiKeys.Fetch ||
+        apiKey === apiKeys.ShareFetch ||
+        apiKey === apiKeys.ShareAcknowledge)
+      ? 1
+      : 0
+  }
+
+  /**
    * Counts the generation on from at least `generation`; never lowers it. A pool that replaces
    * another calls this when it is installed, so the numbers of the two pools never overlap
    * however far the replaced one advanced while the replacement was being built.
@@ -239,7 +264,7 @@ module.exports = class ConnectionPool {
    * @throws {KafkaJSConnectionError} when the pool was retired
    */
   getConnectionByRequest({ request: { apiKey } }, options) {
-    const index = apiKey === apiKeys.Fetch && POOL_SIZE > 1 ? 1 : 0
+    const index = this.connectionIndexFor(apiKey)
     return options ? this.getConnection(index, options) : this.getConnection(index)
   }
 

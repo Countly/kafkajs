@@ -482,19 +482,19 @@
       0,
       0
     ],
-    "ApiKey76": [
+    "ShareGroupHeartbeat": [
       1,
       1
     ],
-    "ApiKey77": [
+    "ShareGroupDescribe": [
       1,
       1
     ],
-    "ApiKey78": [
+    "ShareFetch": [
       1,
       1
     ],
-    "ApiKey79": [
+    "ShareAcknowledge": [
       1,
       1
     ],
@@ -526,15 +526,15 @@
       0,
       0
     ],
-    "ApiKey90": [
+    "DescribeShareGroupOffsets": [
       0,
       0
     ],
-    "ApiKey91": [
+    "AlterShareGroupOffsets": [
       0,
       0
     ],
-    "ApiKey92": [
+    "DeleteShareGroupOffsets": [
       0,
       0
     ]
@@ -776,19 +776,19 @@
       0,
       0
     ],
-    "ApiKey76": [
+    "ShareGroupHeartbeat": [
       1,
       1
     ],
-    "ApiKey77": [
+    "ShareGroupDescribe": [
       1,
       1
     ],
-    "ApiKey78": [
+    "ShareFetch": [
       1,
       2
     ],
-    "ApiKey79": [
+    "ShareAcknowledge": [
       1,
       2
     ],
@@ -828,15 +828,15 @@
       0,
       0
     ],
-    "ApiKey90": [
+    "DescribeShareGroupOffsets": [
       0,
       1
     ],
-    "ApiKey91": [
+    "AlterShareGroupOffsets": [
       0,
       0
     ],
-    "ApiKey92": [
+    "DeleteShareGroupOffsets": [
       0,
       0
     ]
@@ -1078,19 +1078,19 @@
       0,
       0
     ],
-    "ApiKey76": [
+    "ShareGroupHeartbeat": [
       1,
       1
     ],
-    "ApiKey77": [
+    "ShareGroupDescribe": [
       1,
       1
     ],
-    "ApiKey78": [
+    "ShareFetch": [
       1,
       2
     ],
-    "ApiKey79": [
+    "ShareAcknowledge": [
       1,
       2
     ],
@@ -1130,15 +1130,15 @@
       0,
       0
     ],
-    "ApiKey90": [
+    "DescribeShareGroupOffsets": [
       0,
       1
     ],
-    "ApiKey91": [
+    "AlterShareGroupOffsets": [
       0,
       0
     ],
-    "ApiKey92": [
+    "DeleteShareGroupOffsets": [
       0,
       0
     ]

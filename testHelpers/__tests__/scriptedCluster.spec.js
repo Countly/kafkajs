@@ -7,6 +7,7 @@ const {
   consumerProtocolScript,
   groupScript,
   producerScript,
+  shareScript,
   PROFILES,
   NEGOTIATION_MS,
 } = require('../scriptedCluster')
@@ -1951,6 +1952,123 @@ test('a blackholed dial never connects and up only restores future dials', async
   }
 })
 
+describe('held dials and outages', () => {
+  const TWO_NODES = [...NODES, { id: 1, host: 'node1', port: 9092 }]
+  const sockets = []
+  /** Dials a node of `cluster`, keeps the socket for cleanup and collects what it receives. */
+  const dialNode = (cluster, node, onConnect = () => {}) => {
+    const socket = cluster.socketFactory({ ...node, onConnect })
+    const frames = []
+    socket.on('data', (chunk) => frames.push(chunk))
+    socket.on('error', () => {})
+    sockets.push(socket)
+    return { socket, frames }
+  }
+  /** The top-level error code of a Metadata v13 response frame, which ends with it and a tag buffer. */
+  const topLevelCode = (frame) => frame.readInt16BE(frame.length - 3)
+  const metadataRequest = () => frameOf(apiKeys.Metadata, 13, METADATA_REQUEST)
+
+  afterEach(() => {
+    for (const socket of sockets.splice(0)) socket.destroy()
+  })
+
+  test('release connects a blackholed dial once, and the socket then answers requests', async () => {
+    const cluster = createScriptedCluster({ nodes: NODES })
+    const connected = jest.fn()
+    const { socket, frames } = dialNode(cluster.blackhole(0), NODES[0], connected)
+    await settle()
+    expect(connected).not.toHaveBeenCalled()
+    expect(cluster.heldDialsTo(0)).toBe(1)
+
+    expect(cluster.release(0)).toBe(cluster)
+    await settle()
+    expect(connected).toHaveBeenCalledTimes(1)
+    expect(cluster.heldDialsTo(0)).toBe(0)
+    socket.write(metadataRequest())
+    await settle()
+    expect(frames).toHaveLength(1)
+    expect(cluster.requests().map(({ api, generation }) => [api, generation])).toEqual([
+      ['Metadata', 1],
+    ])
+
+    cluster.release(0)
+    await settle()
+    expect(connected).toHaveBeenCalledTimes(1)
+    cluster.assertClean()
+  })
+
+  test('release skips a dial the client already destroyed and every dial of another node', async () => {
+    const cluster = createScriptedCluster({ nodes: TWO_NODES }).blackhole(0).blackhole(1)
+    const destroyed = jest.fn()
+    const alive = jest.fn()
+    const other = jest.fn()
+    const dead = dialNode(cluster, TWO_NODES[0], destroyed)
+    dialNode(cluster, TWO_NODES[0], alive)
+    dialNode(cluster, TWO_NODES[1], other)
+    dead.socket.destroy()
+    await settle()
+    expect(cluster.heldDialsTo(0)).toBe(1)
+    expect(cluster.heldDialsTo(1)).toBe(1)
+
+    cluster.release(0)
+    await settle()
+    expect(destroyed).not.toHaveBeenCalled()
+    expect(alive).toHaveBeenCalledTimes(1)
+    expect(other).not.toHaveBeenCalled()
+    expect(cluster.heldDialsTo(1)).toBe(1)
+  })
+
+  test('a released dial keeps the generation it was dialled with', async () => {
+    const cluster = createScriptedCluster({ nodes: NODES })
+    const held = dialNode(cluster.blackhole(0), NODES[0])
+    cluster.up(0)
+    const later = dialNode(cluster, NODES[0])
+    cluster.release(0)
+    await settle()
+    held.socket.write(metadataRequest())
+    later.socket.write(metadataRequest())
+    await settle()
+
+    expect(cluster.requests().map(({ generation }) => generation)).toEqual([1, 2])
+    cluster.assertClean()
+  })
+
+  test('an outage lays its fields over the answers of its API until recover', async () => {
+    const cluster = createScriptedCluster({ nodes: NODES })
+    const { socket, frames } = dialNode(cluster, NODES[0])
+    const ask = async () => {
+      socket.write(metadataRequest())
+      await settle()
+      return topLevelCode(frames[frames.length - 1])
+    }
+
+    const before = await ask()
+    expect(cluster.outage('Metadata', { errorCode: 129 })).toBe(cluster)
+    const during = await ask()
+    const duringAgain = await ask()
+    expect(cluster.recover('Metadata')).toBe(cluster)
+    const after = await ask()
+
+    expect([before, during, duringAgain, after]).toEqual([0, 129, 129, 0])
+    expect(frames).toHaveLength(4)
+    cluster.assertClean()
+  })
+
+  test('an outage leaves a Buffer answer released by the test as it is', async () => {
+    const cluster = createScriptedCluster({ nodes: NODES }).outage('Metadata', { errorCode: 129 })
+    const { socket, frames } = dialNode(cluster, NODES[0])
+    const gate = cluster.schedule.hold({ api: 'Metadata' })
+    socket.write(metadataRequest())
+    await within(gate.arrived(), 1000, 'the held Metadata call')
+    gate.release(metadataV13.buildResponse({ errorCode: 0 }))
+    await settle()
+
+    expect(frames).toHaveLength(1)
+    expect(topLevelCode(frames[0])).toBe(0)
+    cluster.assertClean()
+  })
+})
+
 test('a connect to a profile that offers ApiVersions v4 takes exactly NEGOTIATION_MS fake milliseconds', async () => {
   jest.useFakeTimers()
   const cluster = createScriptedCluster({ nodes: NODES })
@@ -1983,4 +2101,118 @@ test('a connect to a profile that offers ApiVersions v4 takes exactly NEGOTIATIO
     cluster.assertClean()
     jest.useRealTimers()
   }
+})
+
+describe('share profile', () => {
+  test.each(PROFILES.share.filter(([api]) => api.includes('Share')))(
+    'defaults %s v%i answers to zero throttle and preserves explicit throttles and buffers',
+    async (api, version) => {
+      const cluster = createScriptedCluster({ nodes: NODES, profile: 'share' })
+      const pair = cluster.pairFor(api, version)
+      const literal =
+        require('../wire/expected')[`${api[0].toLowerCase()}${api.slice(1)}V${version}`]
+      const request = frameOf(apiKeys[api], version, Buffer.from(literal.requestHex, 'hex'))
+      const { socket, frames } = dial(cluster)
+      try {
+        socket.write(request)
+        await settle()
+        cluster.answer(api, () => ({ throttleTime: 43 }))
+        socket.write(request)
+        await settle()
+        const gate = cluster.schedule.hold({ api })
+        socket.write(request)
+        await within(gate.arrived(), 5000, 'the held share response')
+        expect(frames).toHaveLength(2)
+        gate.release({})
+        await settle()
+        const raw = pair.buildResponse({ throttleTime: 71 })
+        cluster.schedule.once({ api }, raw)
+        socket.write(request)
+        await settle()
+
+        expect(frames).toHaveLength(4)
+        expect(frames.map((frame) => frame.readInt32BE(9))).toEqual([0, 43, 0, 71])
+        expect(frames[3].subarray(9)).toEqual(raw)
+        cluster.assertClean()
+      } finally {
+        socket.destroy()
+      }
+    }
+  )
+
+  test('installs literal rows without simulating group state', () => {
+    const cluster = createScriptedCluster({ nodes: NODES, profile: 'share' })
+    const response = Object.freeze({ memberEpoch: 7, assignment: null })
+
+    expect(shareScript(cluster, [{ api: 'ShareGroupHeartbeat', response }])).toBe(cluster)
+    expect(cluster.answerers.get('ShareGroupHeartbeat')({ memberEpoch: 0 })).toBe(response)
+    expect(cluster.answerers.get('ShareGroupHeartbeat')({ memberEpoch: -1 })).toBe(response)
+    expect(cluster.requests()).toEqual([])
+  })
+
+  test('replaces an earlier answer of the same API with the later row', () => {
+    const cluster = createScriptedCluster({ nodes: NODES, profile: 'share' })
+    const first = { memberEpoch: 1 }
+    const second = { memberEpoch: 2 }
+
+    shareScript(cluster, [
+      { api: 'ShareGroupHeartbeat', response: first },
+      { api: 'ShareGroupHeartbeat', response: second },
+    ])
+
+    expect(cluster.answerers.get('ShareGroupHeartbeat')({})).toBe(second)
+  })
+
+  test('advertises only bootstrap and the seven released share versions', () => {
+    expect(PROFILES.share).toEqual([
+      ['ApiVersions', 4],
+      ['Metadata', 13],
+      ['FindCoordinator', 6],
+      ['ShareGroupHeartbeat', 1],
+      ['ShareGroupDescribe', 1],
+      ['ShareFetch', 2],
+      ['ShareAcknowledge', 2],
+      ['DescribeShareGroupOffsets', 1],
+      ['AlterShareGroupOffsets', 0],
+      ['DeleteShareGroupOffsets', 0],
+    ])
+    const cluster = createScriptedCluster({ nodes: NODES, profile: 'share' })
+
+    expect(cluster.apiVersionsTable()).toHaveLength(10)
+    expect(cluster.apiVersionsAnswer()).toMatchObject({
+      finalizedFeaturesEpoch: 7,
+      finalizedFeatures: [{ name: 'share.version', minVersionLevel: 1, maxVersionLevel: 1 }],
+    })
+    for (const [api, version] of PROFILES.share) {
+      expect(cluster.apiVersionsTable()).toContainEqual({
+        apiKey: api === 'FindCoordinator' ? 10 : apiKeys[api],
+        minVersion: version,
+        maxVersion: version,
+      })
+    }
+    for (const api of [
+      'ApiVersions',
+      'Metadata',
+      'FindCoordinator',
+      'ShareGroupHeartbeat',
+      'ShareFetch',
+      'ShareAcknowledge',
+    ]) {
+      const version = Object.fromEntries(PROFILES.share)[api]
+
+      expect(cluster.pairFor(api, version)).toMatchObject({ version })
+    }
+    cluster.assertClean()
+  })
+
+  test('requires all seven concrete share builders without a missing-pair escape', () => {
+    const cluster = createScriptedCluster({ nodes: NODES, profile: 'share' })
+    const shareApis = PROFILES.share.filter(([api]) => api.includes('Share'))
+
+    expect(shareApis).toHaveLength(7)
+    for (const [api, version] of shareApis) {
+      expect(cluster.pairFor(api, version)).toMatchObject({ api, version })
+    }
+    cluster.assertClean()
+  })
 })

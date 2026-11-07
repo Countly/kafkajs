@@ -2,6 +2,7 @@ const {
   currentDeadline,
   checked,
   shareMetadata,
+  sharedSetup,
   retrierOf,
   withAdminGuard,
 } = require('../admin/deadline')
@@ -1377,7 +1378,8 @@ module.exports = class BrokerPool {
    * wrapper only guards a rejected promise, so an application listener that throws synchronously
    * would otherwise reject the shared `rebootstrap()` promise - and with it the metadata refresh
    * that triggered the rebootstrap, replacing the caller's original error with the listener's.
-   * A throw is logged and dropped instead.
+   * A throw is logged and dropped instead. Listener work does not belong to the publishing
+   * discovery's lifetime.
    *
    * @private
    * @param {string} eventName
@@ -1390,7 +1392,7 @@ module.exports = class BrokerPool {
     }
 
     try {
-      this.instrumentationEmitter.emit(eventName, payload)
+      sharedSetup(() => this.instrumentationEmitter.emit(eventName, payload))
     } catch (e) {
       this.logger.error('Instrumentation event listener threw, ignoring it', {
         eventName,

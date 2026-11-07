@@ -1,0 +1,7 @@
+{
+  "message": "AlterShareGroupOffsetsResponse",
+  "version": 0,
+  "case": "error",
+  "hex": "0000000000560f6d656d626572732072656d61696e0100",
+  "fields": {"throttleTime":0,"errorCode":86,"errorMessage":"members remain","responses":[]}
+}
