@@ -47,7 +47,10 @@ enabled('share consumer short soak', () => {
         memberAdds: SHARE_SOAK.cycles,
         memberRemoves: SHARE_SOAK.cycles,
       })
-      expect(owner.elapsedProfileMs).toBeLessThanOrEqual(SHARE_SOAK.shortMs)
+      expect(owner.elapsedProfileMs).toBe(SHARE_SOAK.shortMs)
+      expect(owner.timing.slots).toHaveLength(SHARE_SOAK.cycles)
+      expect(owner.timing.slots.every(({ due, completedAt }) => completedAt <= due)).toBe(true)
+      expect(owner.final.verifier.windowMs).toBe(5000)
     }),
     caseTimeout(BUDGET_MS)
   )
