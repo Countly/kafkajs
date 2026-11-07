@@ -21,6 +21,7 @@ const {
 const {
   assertShareCleanup,
   captureShareCleanupBaseline,
+  waitForShareFixtureAbsence,
   setShareGroupConfigs,
   resetShareGroupConfigs,
   shareRecordIdentity,
@@ -428,6 +429,30 @@ class AcknowledgementTrace {
 let fileStart = 0
 
 /**
+ * Preserves nested cleanup failures and their timings without following repeated causes.
+ * @param {Error} error Original failure.
+ * @param {Set<Error>} [seen] Ancestors already described.
+ * @returns {object|null} Original error details, including aggregate and cleanup failures.
+ */
+const cleanupError = (error, seen = new Set()) => {
+  if (error == null) return null
+  const detail = {
+    ...describeError(error),
+    message: String(error.message),
+    step: error.step,
+    elapsedMs: error.elapsedMs,
+  }
+  if (seen.has(error)) return detail
+  const ancestors = new Set([...seen, error])
+  return {
+    ...detail,
+    cause: error.cause ? cleanupError(error.cause, ancestors) : undefined,
+    errors: error.errors?.map((failure) => cleanupError(failure, ancestors)),
+    cleanupErrors: error.cleanupErrors?.map((failure) => cleanupError(failure, ancestors)),
+  }
+}
+
+/**
  * Splits a byte stream into whole length-prefixed Kafka frames.
  */
 class FrameSplitter {
@@ -828,6 +853,7 @@ class LockCase {
     this.topic = shareTopicName(`lock-${kind}`)
     this.group = `e2e-p9e-lock-${kind}-group-${this.nonce}`
     this.stack = new CleanupStack()
+    this.cleanupSteps = []
     this.tap = new ShareWireTap()
     this.gauge = new ResourceGauge()
     this.probe = this.gauge.probe({
@@ -898,6 +924,40 @@ class LockCase {
     })
   }
 
+  /**
+   * Registers a cleanup with its original order, scope and deadline, adding step diagnostics.
+   * @param {string} step Operation name.
+   * @param {Function} close Cleanup operation receiving the stack's signal.
+   * @returns {void}
+   */
+  addCleanup(step, close) {
+    this.stack.add(step, (signal) => this.cleanupStep(step, () => close(signal)))
+  }
+
+  /**
+   * Records the start, duration and original outcome of one cleanup operation.
+   * @param {string} step Operation name.
+   * @param {Function} work Operation to run and join.
+   * @returns {Promise<*>} Original result.
+   */
+  async cleanupStep(step, work) {
+    const startedAt = performance.now()
+    const entry = { step, startedAtMs: startedAt - this.startedAt, elapsedMs: null, error: null }
+    this.cleanupSteps.push(entry)
+    this.row('cleanup-step', { status: 'started', step, startedAtMs: entry.startedAtMs })
+    try {
+      return await work()
+    } catch (error) {
+      error.step ??= step
+      error.elapsedMs ??= performance.now() - startedAt
+      entry.error = cleanupError(error)
+      throw error
+    } finally {
+      entry.elapsedMs = performance.now() - startedAt
+      this.row('cleanup-step', { status: entry.error ? 'failed' : 'settled', ...entry })
+    }
+  }
+
   /** @returns {object} Handler counts, actual outcomes and original wire acknowledgements. */
   progress() {
     return {
@@ -919,6 +979,7 @@ class LockCase {
       },
       acknowledgementRequests: acknowledgementRequests(this.tap.frames),
       wireAcknowledgements: this.tap.acknowledgements.snapshot(),
+      cleanupSteps: this.cleanupSteps,
     }
   }
 
@@ -963,7 +1024,7 @@ class LockCase {
       )
       await this.complete(scope)
     } catch (error) {
-      this.row('case-failed', { error: describeError(error), ...this.progress() })
+      this.row('case-failed', { error: cleanupError(error), ...this.progress() })
       throw error
     } finally {
       this.gauge.uninstall()
@@ -978,14 +1039,13 @@ class LockCase {
    */
   async setup(scope) {
     this.admin = this.client('admin').admin()
-    this.stack.add('prove cleanup and disconnect admin', (signal) => this.cleanup(signal))
-    this.stack.add(
+    this.addCleanup('prove cleanup and disconnect admin', (signal) => this.cleanup(signal))
+    this.addCleanup(
       'remove admin listeners',
       this.admin.on(this.admin.events.REQUEST, ({ payload }) => this.requests.push(payload))
     )
-    this.stack.add('delete topic', (signal) => this.deleteTopic(signal))
-    this.stack.add('delete group', (signal) => this.deleteGroup(signal))
-    this.stack.add('reset group configs', (signal) => this.resetConfigs(signal))
+    this.addCleanup('delete fixtures', (signal) => this.deleteFixtures(signal))
+    this.addCleanup('reset group configs', (signal) => this.resetConfigs(signal))
     await bounded(scope, 10000, () => this.admin.connect())
     await bounded(scope, 20000, () =>
       createTopic({
@@ -1005,11 +1065,11 @@ class LockCase {
     this.row('resource-baseline', { snapshot: this.baseline })
 
     this.producer = this.client('producer').producer({ idempotent: true })
-    this.stack.add(
+    this.addCleanup(
       'remove producer listeners',
       this.producer.on(this.producer.events.REQUEST, ({ payload }) => this.requests.push(payload))
     )
-    this.stack.add('disconnect producer', () => this.producer.disconnect())
+    this.addCleanup('disconnect producer', () => this.producer.disconnect())
     await bounded(scope, 10000, () => this.producer.connect())
 
     this.gateB = this.tap.hold('B', SHARE_FETCH)
@@ -1054,8 +1114,8 @@ class LockCase {
       consumer.on(events.REQUEST, ({ payload }) => this.requests.push(payload)),
       consumer.on(events.FETCH, ({ payload }) => this.onFetch(member, payload)),
     ]
-    this.stack.add(`remove ${label} listeners`, () => removers.forEach((remove) => remove()))
-    this.stack.add(`disconnect and join ${label}`, async () => {
+    this.addCleanup(`remove ${label} listeners`, () => removers.forEach((remove) => remove()))
+    this.addCleanup(`disconnect and join ${label}`, async () => {
       this.tap.discardHolds()
       await consumer.disconnect({ timeout: 2000 })
       await Promise.allSettled([...this.handlerWork])
@@ -1542,7 +1602,7 @@ class LockCase {
       open = resolve
     })
     this.expiryGate = { promise, openedAt: null }
-    this.stack.add('release the expiry handler', () => {
+    this.addCleanup('release the expiry handler', () => {
       this.expiryGate.openedAt ??= performance.now()
       open()
     })
@@ -1992,28 +2052,63 @@ class LockCase {
    * @returns {Promise<void>}
    */
   async cleanup(signal) {
-    try {
-      if (this.baseline) {
-        signal.throwIfAborted()
-        this.after = await assertShareCleanup(
-          this.admin,
-          [this.group],
-          [this.topic],
-          this.baseline,
-          this.probe,
-          { signal, disconnectAdmin: true }
-        )
+    this.tap.discardHolds()
+    const failures = []
+    const steps = [
+      [
+        'prove fixture absence on every broker',
+        () =>
+          waitForShareFixtureAbsence(this.admin, [this.group], [this.topic], {
+            signal,
+            unrelated: [],
+            delayMs: 50,
+            record: (event, fields) => this.row(event, fields),
+          }),
+      ],
+      [
+        'prove resources',
+        async () => {
+          if (this.baseline) {
+            this.after = await assertShareCleanup(this.admin, [], [], this.baseline, this.probe, {
+              signal,
+              disconnectAdmin: true,
+              record: (event, fields) => this.row(event, fields),
+            })
+          }
+        },
+      ],
+      ['disconnect admin', () => this.admin.disconnect()],
+    ]
+    for (const [step, work] of steps) {
+      try {
+        await this.cleanupStep(step, work)
+      } catch (error) {
+        failures.push(error)
       }
-    } finally {
-      this.tap.discardHolds()
-      await this.admin.disconnect()
     }
+    if (failures.length) throw new AggregateError(failures, 'Cleanup proof failed')
+  }
+
+  /**
+   * Joins independent group and topic deletion before proving their absence together.
+   * @param {AbortSignal} signal Cleanup scope shared by both operations.
+   * @returns {Promise<void>} Once both deletion operations have settled.
+   */
+  async deleteFixtures(signal) {
+    const results = await Promise.allSettled([
+      this.cleanupStep('delete group', () => this.deleteGroup(signal)),
+      this.cleanupStep('delete topic', () => this.deleteTopic(signal)),
+    ])
+    const failures = results
+      .filter(({ status }) => status === 'rejected')
+      .map(({ reason }) => reason)
+    if (failures.length) throw new AggregateError(failures, 'Fixture deletion failed')
   }
 
   /**
    * @param {AbortSignal} signal the cleanup scope
    * @returns {Promise<void>}
-   * @throws {Error} when the topic is still listed after deletion
+   * @throws {Error} When deletion is refused; the final cleanup proof checks absence.
    */
   async deleteTopic(signal) {
     await bounded(signal, 10000, () =>
@@ -2021,20 +2116,12 @@ class LockCase {
     ).catch((error) => {
       if (error.type !== 'UNKNOWN_TOPIC_OR_PARTITION') throw error
     })
-    await pollUntil(
-      signal,
-      10000,
-      async () => !(await this.admin.listTopics()).includes(this.topic),
-      {
-        label: 'The topic disappearing',
-      }
-    )
   }
 
   /**
    * @param {AbortSignal} signal the cleanup scope
    * @returns {Promise<void>}
-   * @throws {Error} when the group is still listed after deletion
+   * @throws {Error} When deletion is refused; the final cleanup proof checks absence.
    */
   async deleteGroup(signal) {
     await pollUntil(
@@ -2051,14 +2138,7 @@ class LockCase {
           throw error
         }
       },
-      { label: 'The group deletion' }
-    )
-    await pollUntil(
-      signal,
-      10000,
-      async () =>
-        !(await this.admin.listGroups()).groups.some(({ groupId }) => groupId === this.group),
-      { label: 'The group disappearing' }
+      { delayMs: 50, label: 'The group deletion' }
     )
   }
 
