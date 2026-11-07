@@ -1,5 +1,5 @@
 const { plainTextBrokers } = require('testHelpers')
-const { SHARE_SOAK, buildShareSoak } = require('../../../../scripts/soak/soak')
+const { SHARE_SOAK, ShareCycleOracle, buildShareSoak } = require('../../../../scripts/soak/soak')
 const { caseTimeout, liveCase, liveRun } = require('../../../producer/__tests__/fixtures/bounded')
 const { CleanupStack } = require('../../../producer/__tests__/fixtures/liveProbe')
 
@@ -98,6 +98,51 @@ enabled('share consumer short soak', () => {
             'verifier-end',
             'cycle-end',
           ])
+        )
+        for (const member of cycle.memberObservations) {
+          const frame = ShareCycleOracle.departure(
+            cycle.provenance,
+            cycle.verifier.groupId,
+            member.memberId
+          )
+          expect(frame).not.toBeNull()
+          const written = cycle.steps.find(
+            ({ step, memberId, socket, correlationId }) =>
+              step === 'leave-write' &&
+              memberId === member.memberId &&
+              socket === frame.socket &&
+              correlationId === frame.correlationId
+          )
+          const answered = cycle.steps.find(
+            ({ step, memberId, socket, correlationId }) =>
+              step === 'leave-answer' &&
+              memberId === member.memberId &&
+              socket === written?.socket &&
+              correlationId === written?.correlationId
+          )
+          expect(written).toMatchObject({
+            member: member.member,
+            groupId: cycle.verifier.groupId,
+            memberEpoch: -1,
+            socket: expect.any(Number),
+            endpoint: expect.any(String),
+            correlationId: expect.any(Number),
+            invokedAt: expect.any(Number),
+            writtenAt: expect.any(Number),
+          })
+          expect(answered).toMatchObject({ errorCode: 0, answeredAt: expect.any(Number) })
+          expect(answered.answeredAt).toBeGreaterThanOrEqual(written.writtenAt)
+        }
+        const descriptions = cycle.provenance.groupDescriptions
+        expect(descriptions.length).toBeGreaterThan(0)
+        expect(descriptions.at(-1).group).toMatchObject({
+          groupId: cycle.verifier.groupId,
+          errorCode: 0,
+          state: 'Empty',
+          members: [],
+        })
+        expect(cycle.steps.filter(({ step }) => step === 'cleanup-members')).toHaveLength(
+          descriptions.length
         )
         expect(cycle.snapshot.workloadJoined).toBe(true)
         expect(cycle.memberObservations).toHaveLength(2)

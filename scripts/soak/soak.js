@@ -3315,6 +3315,100 @@ class ShareCycleOracle {
   }
 
   /**
+   * Decodes a socket-matched heartbeat answer without using the Broker completion as a receipt.
+   * @param {object} frame Original heartbeat request and response bytes.
+   * @returns {object|null} Raw heartbeat fields, or no matched response.
+   * @throws {Error} On malformed/truncated response fields.
+   */
+  static heartbeatResponse(frame) {
+    const Decoder = require('../../src/protocol/decoder')
+    const bytes = Buffer.from(frame.responseBytes, 'base64')
+    const decoder = new Decoder(bytes)
+    if (decoder.readInt32() !== bytes.length - 4 || decoder.readInt32() !== frame.correlationId)
+      return null
+    decoder.readTaggedFields()
+    decoder.readInt32()
+    const errorCode = decoder.readInt16()
+    decoder.readUVarIntString()
+    const memberId = decoder.readUVarIntString()
+    const memberEpoch = decoder.readInt32()
+    const heartbeatIntervalMs = decoder.readInt32()
+    const present = decoder.readInt8()
+    if (present !== -1 && present !== 1) return null
+    if (present === 1) {
+      decoder.readUVarIntArray((entry) => {
+        entry.readUuid()
+        entry.readUVarIntArray((entry) => entry.readInt32())
+        entry.readTaggedFields()
+      })
+      decoder.readTaggedFields()
+    }
+    decoder.readTaggedFields()
+    return decoder.canReadBytes(1)
+      ? null
+      : { errorCode, memberId, memberEpoch, heartbeatIntervalMs }
+  }
+
+  /**
+   * Proves a member's departure from its invoked epoch -1 request and matched successful answer.
+   * @param {object} provenance Original heartbeat call-through and wire archive.
+   * @param {string} groupId Original group.
+   * @param {string} memberId Original member, never inferred from disconnect completion.
+   * @returns {object|null} The successful leave frame, or no departure proof.
+   */
+  static departure(provenance, groupId, memberId) {
+    if (!groupId || !memberId) return null
+    for (const beat of provenance.heartbeats ?? []) {
+      if (
+        beat.groupId !== groupId ||
+        beat.memberId !== memberId ||
+        beat.request?.groupId !== groupId ||
+        beat.request?.memberId !== memberId ||
+        beat.request?.memberEpoch !== -1
+      )
+        continue
+      for (const frame of beat.frames ?? []) {
+        if (
+          frame.apiKey !== 76 ||
+          frame.apiVersion !== 1 ||
+          !Number.isInteger(frame.socket) ||
+          frame.endpoint !== beat.endpoint ||
+          !Number.isInteger(frame.correlationId) ||
+          ![beat.at, frame.at, frame.answeredAt].every(Number.isFinite) ||
+          frame.at < beat.at ||
+          frame.answeredAt < frame.at ||
+          frame.lostAt !== undefined ||
+          !frame.responseBytes
+        )
+          continue
+        try {
+          const { readRequestHeader } = require('../../testHelpers/fakeSocket')
+          const wire = require('../../testHelpers/wire/shareGroupHeartbeatV1')
+          const bytes = Buffer.from(frame.bytes, 'base64')
+          const header = readRequestHeader(bytes)
+          const request = wire.readRequest(bytes.subarray(header.byteLength))
+          const response = ShareCycleOracle.heartbeatResponse(frame)
+          if (
+            bytes.readInt32BE(0) === bytes.length - 4 &&
+            header.apiKey === 76 &&
+            header.apiVersion === 1 &&
+            header.correlationId === frame.correlationId &&
+            JSON.stringify(request) === JSON.stringify(frame.request) &&
+            request.groupId === groupId &&
+            request.memberId === memberId &&
+            request.memberEpoch === -1 &&
+            response?.errorCode === 0 &&
+            response.memberEpoch === -1 &&
+            (response.memberId === null || response.memberId === memberId)
+          )
+            return frame
+        } catch {}
+      }
+    }
+    return null
+  }
+
+  /**
    * Recomputes terminality from raw named/all listings and independent ends.
    * @param {object} plan Fixed cumulative end.
    * @param {object} position Archived primitive observation.
@@ -3562,7 +3656,21 @@ class ShareCycleOracle {
    * @returns {void}
    */
   static membership(plan, observation, fail) {
-    const { members = {}, reset = null, verifier = {} } = observation
+    const { members = {}, reset = null, verifier = {}, provenance = {} } = observation
+    for (const label of ['A', 'B']) {
+      const member = observation.memberObservations?.find((member) => member.member === label)
+      const leave = ShareCycleOracle.departure(provenance, verifier.groupId, member?.memberId)
+      const removedAt = label === 'A' ? members.aLeftAt : members.bRemovedAt
+      if (
+        !leave ||
+        !Number.isFinite(removedAt) ||
+        leave.answeredAt > removedAt ||
+        leave.at < observation.timing?.startedAt
+      )
+        fail(
+          `member ${label} (${member?.memberId ?? 'unknown'}) lacks original successful leave evidence`
+        )
+    }
     if (!(members.aJoined && members.aLeft && members.bAdded && members.bRemoved)) {
       fail('the member joins, leaves and the additional member add and remove are incomplete')
     }
@@ -3693,6 +3801,27 @@ class ShareFetchTap {
           frame.responseBytes = incoming.subarray(0, end).toString('base64')
           frame.answeredAt = this.clock.now()
           outstanding.delete(frame.correlationId)
+          if (frame.apiKey === 76 && frame.request.memberEpoch === -1) {
+            let response
+            let error
+            try {
+              response = ShareCycleOracle.heartbeatResponse(frame)
+            } catch (failure) {
+              error = { name: failure.name, message: failure.message }
+            }
+            this.leave(
+              'leave-answer',
+              frame,
+              frame,
+              {
+                errorCode: response?.errorCode ?? null,
+                responseMemberId: response?.memberId ?? null,
+                responseMemberEpoch: response?.memberEpoch ?? null,
+                error,
+              },
+              frame.answeredAt
+            )
+          }
         }
         incoming = incoming.subarray(end)
       }
@@ -3715,7 +3844,11 @@ class ShareFetchTap {
       socket.off('error', errored)
       this.socketObservers.delete(socket)
       socket.off('data', receive)
-      for (const frame of outstanding.values()) frame.lostAt = this.clock.now()
+      for (const frame of outstanding.values()) {
+        frame.lostAt = this.clock.now()
+        if (frame.apiKey === 76 && frame.request.memberEpoch === -1)
+          this.leave('leave-lost', frame, frame, {}, frame.lostAt)
+      }
       outstanding.clear()
     })
     const write = socket.write.bind(socket)
@@ -3769,6 +3902,10 @@ class ShareFetchTap {
         request: wire.readRequest(frame.subarray(header.byteLength)),
       }
       context.frames.push(written)
+      if (header.apiKey === 76 && written.request.memberEpoch === -1) {
+        written.invokedAt = context.at
+        this.leave('leave-write', context, written, {}, written.at)
+      }
     }
     if (header.apiKey !== 78) return written
     let epoch = null
@@ -3798,6 +3935,36 @@ class ShareFetchTap {
     )
     if (this.facts.length > this.limit) this.facts.shift()
     return written
+  }
+
+  /**
+   * Emits original leave facts; absent transport fields stay explicitly unknown before a write.
+   * @param {string} step Invocation, wire, failure or no-write observation.
+   * @param {object} fact Original heartbeat invocation.
+   * @param {object|null} frame Original socket frame, when one exists.
+   * @param {object} [fields] Decoded response or failure details.
+   * @param {number} [at] Original event timestamp.
+   * @returns {void}
+   */
+  leave(step, fact, frame, fields = {}, at = this.clock.now()) {
+    this.notify(
+      step,
+      {
+        groupId: fact.request.groupId,
+        memberId: fact.request.memberId,
+        memberEpoch: fact.request.memberEpoch,
+        endpoint: frame?.endpoint ?? fact.endpoint,
+        socket: frame?.socket ?? null,
+        correlationId: frame?.correlationId ?? null,
+        frame: frame?.id ?? null,
+        invokedAt: frame?.invokedAt ?? fact.at,
+        writtenAt: frame?.at ?? null,
+        answeredAt: frame?.answeredAt ?? null,
+        lostAt: frame?.lostAt ?? null,
+        ...fields,
+      },
+      at
+    )
   }
 
   /**
@@ -3859,6 +4026,7 @@ class ShareCycleJournal {
     this.labels = new Map()
     this.exchanges = []
     this.heartbeats = []
+    this.groupDescriptions = []
     this.acquisitions = []
     this.outcomes = []
     this.retirements = []
@@ -3953,17 +4121,32 @@ class ShareCycleJournal {
         frames: [],
       }
       this.heartbeats.push(fact)
-      const pending = this.tap.context.run(fact, () => original.apply(broker, args))
-      pending.then(
-        (response) => {
-          fact.answeredAt = this.tap.clock.now()
-          fact.response = response
-        },
-        (error) => {
-          fact.failedAt = this.tap.clock.now()
-          fact.error = { name: error.name, message: error.message }
+      const leaving = request.memberEpoch === -1
+      if (leaving) this.tap.leave('leave-invoked', fact, null, {}, fact.at)
+      const noWrite = () => {
+        if (leaving && fact.frames.length === 0) this.tap.leave('leave-no-write', fact, null)
+      }
+      const failed = (error) => {
+        fact.failedAt = this.tap.clock.now()
+        fact.error = { name: error.name, message: error.message, code: error.code }
+        noWrite()
+        if (leaving) {
+          for (const frame of fact.frames.length ? fact.frames : [null])
+            this.tap.leave('leave-failure', fact, frame, { error: fact.error }, fact.failedAt)
         }
-      )
+      }
+      let pending
+      try {
+        pending = this.tap.context.run(fact, () => original.apply(broker, args))
+      } catch (error) {
+        failed(error)
+        throw error
+      }
+      pending.then((response) => {
+        fact.answeredAt = this.tap.clock.now()
+        fact.response = response
+        noWrite()
+      }, failed)
       return pending
     })
     this.wrap(ShareFetchLoop.prototype, 'send', (loop, original, [exchange]) => {
@@ -4065,6 +4248,7 @@ class ShareCycleJournal {
       JSON.stringify({
         exchanges: this.exchanges,
         heartbeats: this.heartbeats,
+        groupDescriptions: this.groupDescriptions,
         acquisitions: this.acquisitions,
         outcomes: this.outcomes,
         retirements: this.retirements,
@@ -4572,6 +4756,11 @@ class ShareSoakDriver {
     this.activeCycle = active
     const postResetNodes = new Set()
     const unlisten = this.tap.listen((step, fields, at) => {
+      if (step.startsWith('leave-') && fields.groupId === this.group) {
+        const member = members.find((member) => member.memberId === fields.memberId)
+        note(step, { member: member?.label ?? null, ...fields }, at)
+        return
+      }
       const target = observation.resetTarget
       if (!target) return
       const nodeId = this.nodes.get(fields.endpoint)
@@ -4677,6 +4866,8 @@ class ShareSoakDriver {
         note('member-add-end')
         note('member-remove-start')
         await b.stop()
+        if (!ShareCycleOracle.departure(journal, this.group, b.memberId))
+          throw new Error(`Member B (${b.memberId}) has no original successful leave exchange`)
         await this.awaitMembers(scope, [a])
         observation.members.bRemoved = b.entries.length === 0
         observation.members.bRemovedAt = clock.now()
@@ -4728,7 +4919,9 @@ class ShareSoakDriver {
           })(),
           (async () => {
             await a.stop()
-            observation.members.aLeftAt = clock.now()
+            const leave = ShareCycleOracle.departure(journal, this.group, a.memberId)
+            observation.members.aLeft = Boolean(leave) && a.crashes.length === 0
+            if (leave) observation.members.aLeftAt = leave.answeredAt
             noteAcknowledgements()
           })(),
         ])
@@ -4743,11 +4936,30 @@ class ShareSoakDriver {
         note('position-before-start')
         observation.positions.push(await this.position(plan, scope, { clock }))
         note('position-before-end')
-        observation.members.aLeft = a.crashes.length === 0
         note('group-empty-start')
-        await bounded(scope, Infinity, () =>
-          fixtures.waitForShareGroupsEmpty(this.admin, [this.group], { signal: scope })
-        )
+        try {
+          await bounded(scope, Infinity, () =>
+            fixtures.waitForShareGroupsEmpty(this.admin, [this.group], {
+              signal: scope,
+              record: (step, { group }) => {
+                const at = clock.now()
+                const described = JSON.parse(JSON.stringify(group))
+                journal.groupDescriptions.push({ at, group: described })
+                note(step, { group: described }, at)
+              },
+            })
+          )
+        } catch (error) {
+          const latest = journal.groupDescriptions.at(-1)?.group
+          const retained = latest?.members?.map(({ memberId }) => memberId) ?? []
+          throw new Error(
+            `${error.message}; last described members still listed in ${this.group}: ` +
+              (retained.length ? retained.join(', ') : '(none observed)'),
+            { cause: error }
+          )
+        }
+        if (!observation.members.aLeft)
+          throw new Error(`Member A (${a.memberId}) has no original successful leave exchange`)
         observation.members.emptyAt = clock.now()
         note('group-empty-end', { emptyAt: observation.members.emptyAt })
         if (due - clock.now() < SHARE_SOAK.quietMs.cycle)
@@ -5829,6 +6041,7 @@ class ShareSoak {
         reset: row.reset,
         verifier: row.verifier,
         provenance: row.provenance,
+        memberObservations: row.memberObservations,
         prefix: row.prefix,
         acknowledgedPrefix: row.acknowledgedPrefix,
         members: {

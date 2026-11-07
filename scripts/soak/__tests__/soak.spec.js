@@ -2548,6 +2548,68 @@ const sealExchange = (exchange) => {
   return exchange
 }
 
+/**
+ * Independent heartbeat request bytes, including the original socket correlation header.
+ * @param {object} request Original group/member/epoch fields.
+ * @param {number} correlationId Socket correlation.
+ * @returns {Buffer} Complete request frame.
+ */
+const heartbeatBytes = (request, correlationId) => {
+  const bytes = new Encoder()
+    .writeInt16(76)
+    .writeInt16(1)
+    .writeInt32(correlationId)
+    .writeString('soak')
+    .writeTaggedFields([])
+    .writeUVarIntString(request.groupId)
+    .writeUVarIntString(request.memberId)
+    .writeInt32(request.memberEpoch)
+    .writeUVarIntString(null)
+    .writeUVarIntArray(null)
+    .writeTaggedFields([])
+  return new Encoder().writeInt32(bytes.size()).writeEncoder(bytes).buffer
+}
+
+/**
+ * A matched original leave exchange for the pure reconstruction controls.
+ * @param {string} memberId Original cycle member.
+ * @param {number} at Original invocation/write/answer timestamp.
+ * @param {number} socket Original socket identity and correlation.
+ * @returns {object} Heartbeat invocation with matched request and response bytes.
+ */
+const leaveFacts = (memberId, at, socket) => {
+  const request = { groupId: 'soak-group', memberId, memberEpoch: -1 }
+  const response = { errorCode: 0, memberId, memberEpoch: -1, assignment: null }
+  const body = require('../../../testHelpers/wire/shareGroupHeartbeatV1').buildResponse(response)
+  const answer = new Encoder().writeInt32(socket).writeTaggedFields([]).writeBuffer(body)
+  return {
+    ...request,
+    endpoint: 'node:1',
+    at,
+    request,
+    answeredAt: at,
+    response,
+    frames: [
+      {
+        id: socket,
+        apiKey: 76,
+        apiVersion: 1,
+        correlationId: socket,
+        socket,
+        endpoint: 'node:1',
+        at,
+        answeredAt: at,
+        request: { ...request, rackId: null, subscribedTopicNames: null },
+        bytes: heartbeatBytes(request, socket).toString('base64'),
+        responseBytes: new Encoder()
+          .writeInt32(answer.size())
+          .writeEncoder(answer)
+          .buffer.toString('base64'),
+      },
+    ],
+  }
+}
+
 /** Both actual listing forms and independent ends, kept separate from normalized rows. */
 const positionFacts = (plan) => {
   const partitions = [0, 1, 2].map((partition) => ({ partition, floor: '0', end: plan.end }))
@@ -2897,6 +2959,14 @@ const cycleFacts = (
     facts.accepted.push({ topic: TOPIC_NAME, partition, firstOffset: offset, lastOffset: offset })
   }
   provenance.exchanges.forEach(sealExchange)
+  provenance.heartbeats = [
+    leaveFacts('member-B', facts.members.bRemovedAt, 101),
+    leaveFacts('member-A', facts.members.aLeftAt, 102),
+  ]
+  facts.memberObservations = [
+    { member: 'A', memberId: 'member-A' },
+    { member: 'B', memberId: 'member-B' },
+  ]
   facts.provenance = provenance
   return facts
 }
@@ -2933,6 +3003,49 @@ describe('Share soak cycle oracle', () => {
 
   test.each([0, 10, 29])('accepts a correct cycle %i', (cycle) => {
     expect(ShareCycleOracle.judge(ShareCycleOracle.plan(cycle), cycleFacts(cycle))).toEqual([])
+  })
+
+  test.each([
+    [
+      'missing invocation',
+      (beat) => {
+        beat.request.memberEpoch = 1
+      },
+    ],
+    [
+      'invocation without a write',
+      (beat) => {
+        beat.frames = []
+      },
+    ],
+    [
+      'unanswered write',
+      (beat) => {
+        delete beat.frames[0].responseBytes
+      },
+    ],
+    [
+      'lost socket',
+      (beat) => {
+        beat.frames[0].lostAt = beat.at
+      },
+    ],
+    [
+      'foreign correlation',
+      (beat) => {
+        beat.frames[0].correlationId++
+      },
+    ],
+    [
+      'foreign member',
+      (beat) => {
+        beat.frames[0].request.memberId = 'other-member'
+      },
+    ],
+  ])('rejects supplied departure booleans with %s', (_name, damage) => {
+    const facts = cycleFacts(0)
+    damage(facts.provenance.heartbeats[1])
+    expect(ShareCycleOracle.judge(ShareCycleOracle.plan(0), facts).join('; ')).toContain('member-A')
   })
 
   /** Each case damages one independent fact and names the check that must catch it. */
@@ -4785,6 +4898,8 @@ describe('Share soak cycle finalization and isolation adapter', () => {
     holdPost = false,
     holdRaw = false,
     failRaw = false,
+    leaveMode = 'answered',
+    retained = false,
   } = {}) => {
     const plan = ShareCycleOracle.plan(reset ? 10 : 0)
     const clients = []
@@ -4792,7 +4907,38 @@ describe('Share soak cycle finalization and isolation adapter', () => {
     const original = { sequence: 1, epoch: 4, socket: 1, endpoint: 'node:1' }
     let broken = false
     let redeliver
-    const tap = new ShareFetchTap()
+    const tap = new ShareFetchTap(64, { now: () => 0 })
+    const Broker = require('../../../src/broker')
+    const { respondWithFrame } = require('../../../testHelpers/fakeSocket')
+    const socket = tap.wrap(Object.assign(new EventEmitter(), { write: () => true }), 'node:1')
+    let correlationId = 0
+    const broker = Object.assign(Object.create(Broker.prototype), { brokerAddress: 'node:1' })
+    const heartbeat = jest
+      .spyOn(Broker.prototype, 'shareGroupHeartbeat')
+      .mockImplementation(async (request) => {
+        const mode = request.memberId === 'member-1' ? leaveMode : 'answered'
+        const response = {
+          errorCode: 0,
+          memberId: request.memberId,
+          memberEpoch: -1,
+          assignment: null,
+        }
+        if (mode === 'no-write') return response
+        const correlation = ++correlationId
+        socket.write(heartbeatBytes(request, correlation))
+        if (mode === 'transport-failure') {
+          socket.emit('close', true)
+          throw new Error('Leave transport failed')
+        }
+        if (mode === 'rejected') response.errorCode = 15
+        respondWithFrame(
+          { socket },
+          correlation,
+          1,
+          require('../../../testHelpers/wire/shareGroupHeartbeatV1').buildResponse(response)
+        )
+        return response
+      })
     tap.mark = () => 0
     tap.since = (mark) =>
       mark === 0 ? [original] : broken ? [{ sequence: 2, epoch: 0, socket: 2 }] : []
@@ -4823,7 +4969,8 @@ describe('Share soak cycle finalization and isolation adapter', () => {
           subscribe: async () => {},
           run: async (handlers) => {
             client.handlers = handlers
-            client.emit('GROUP_JOIN', { memberId: `member-${clients.length}` })
+            client.memberId = `member-${clients.length}`
+            client.emit('GROUP_JOIN', { memberId: client.memberId })
           },
           disconnect: async () => {
             await client.pending
@@ -4832,6 +4979,12 @@ describe('Share soak cycle finalization and isolation adapter', () => {
             if (client === clients[0])
               for (const range of facts.accepted)
                 client.emit('ACKNOWLEDGE', { ...range, type: 'accept' })
+            if (client !== clients[0] || leaveMode !== 'no-invocation')
+              await broker.shareGroupHeartbeat({
+                groupId: 'soak-group',
+                memberId: client.memberId,
+                memberEpoch: -1,
+              })
             client.emit('DISCONNECT', {})
           },
         }
@@ -4840,7 +4993,27 @@ describe('Share soak cycle finalization and isolation adapter', () => {
       },
     }
     const ports = {
-      fixtures: { shareRecordIdentity, waitForShareGroupsEmpty: async () => {} },
+      fixtures: {
+        shareRecordIdentity,
+        waitForShareGroupsEmpty: async (_admin, [groupId], { record }) => {
+          record('cleanup-members', {
+            group: {
+              groupId,
+              errorCode: 0,
+              state: retained ? 'Stable' : 'Empty',
+              members: retained
+                ? [
+                    {
+                      memberId: 'member-1',
+                      assignment: [{ topic: TOPIC_NAME, partitions: [0, 1, 2] }],
+                    },
+                  ]
+                : [],
+            },
+          })
+          if (retained) throw new Error('Every share member leaving did not settle within 10000 ms')
+        },
+      },
       probe: { CleanupStack },
       bounded: {
         bounded,
@@ -4952,7 +5125,9 @@ describe('Share soak cycle finalization and isolation adapter', () => {
       return { ...positionFacts(plan), rows: facts.broker }
     }
     driver.quiet = jest.fn(async () => verifierFacts())
-    const work = driver.cycle(plan, NEVER, { due: remaining, clock: { now: () => 0 } })
+    const work = driver
+      .cycle(plan, NEVER, { due: remaining, clock: { now: () => 0 } })
+      .finally(() => heartbeat.mockRestore())
     work.catch(() => {})
     return {
       driver,
@@ -4965,6 +5140,105 @@ describe('Share soak cycle finalization and isolation adapter', () => {
       release: () => release?.(),
     }
   }
+
+  test.each(['no-invocation', 'no-write'])(
+    'fails the cycle naming the original member after resolved disconnect with %s',
+    async (leaveMode) => {
+      const { driver, work, steps } = await cycle({ leaveMode })
+      await expect(work).rejects.toThrow(/A.*member-1.*leave/)
+      expect(steps).toContainEqual(
+        expect.objectContaining({ step: 'disconnect-end', member: 'A', status: 'completed' })
+      )
+      expect(driver.lastCycle.members.aLeft).toBe(false)
+      expect(driver.quiet).not.toHaveBeenCalled()
+      if (leaveMode === 'no-write')
+        expect(steps).toContainEqual(
+          expect.objectContaining({ step: 'leave-no-write', member: 'A', memberId: 'member-1' })
+        )
+      expect(steps.some(({ step, member }) => step === 'leave-write' && member === 'A')).toBe(false)
+    }
+  )
+
+  test('proves each departure from the invoked, written and matched answered leave', async () => {
+    const { driver, work, steps } = await cycle()
+    const observed = await work
+    expect(observed.members).toMatchObject({ aLeft: true, bRemoved: true })
+    for (const [member, memberId] of [
+      ['A', 'member-1'],
+      ['B', 'member-2'],
+    ]) {
+      const beat = observed.provenance.heartbeats.find((beat) => beat.memberId === memberId)
+      const frame = beat.frames[0]
+      expect(ShareCycleOracle.departure(observed.provenance, 'soak-group', memberId)).toEqual(frame)
+      for (const step of ['leave-invoked', 'leave-write', 'leave-answer'])
+        expect(steps).toContainEqual(
+          expect.objectContaining({ step, member, memberId, groupId: 'soak-group' })
+        )
+      expect(steps).toContainEqual(
+        expect.objectContaining({
+          step: 'leave-answer',
+          member,
+          socket: frame.socket,
+          endpoint: frame.endpoint,
+          correlationId: frame.correlationId,
+          writtenAt: frame.at,
+          answeredAt: frame.answeredAt,
+          errorCode: 0,
+        })
+      )
+    }
+    expect(driver.quiet).toHaveBeenCalledTimes(1)
+  })
+
+  test('retains full empty-wait descriptions and names members still listed on failure', async () => {
+    const { driver, work, steps } = await cycle({ leaveMode: 'no-invocation', retained: true })
+    await expect(work).rejects.toThrow(/10000 ms.*member-1/)
+    const row = steps.find(({ step }) => step === 'cleanup-members')
+    expect(row.group).toEqual({
+      groupId: 'soak-group',
+      errorCode: 0,
+      state: 'Stable',
+      members: [
+        { memberId: 'member-1', assignment: [{ topic: TOPIC_NAME, partitions: [0, 1, 2] }] },
+      ],
+    })
+    expect(driver.lastCycle.provenance.groupDescriptions).toContainEqual({
+      at: row.at,
+      group: row.group,
+    })
+    expect(driver.lastCycle.members.aLeft).toBe(false)
+  })
+
+  test.each(['transport-failure', 'rejected'])(
+    'does not prove departure from a %s leave',
+    async (leaveMode) => {
+      const { driver, work, steps } = await cycle({ leaveMode })
+      await expect(work).rejects.toThrow(
+        leaveMode === 'rejected' ? /member-1.*leave/ : 'Leave transport failed'
+      )
+      expect(driver.lastCycle.members.aLeft).toBe(false)
+      if (leaveMode === 'transport-failure') {
+        expect(steps).toContainEqual(
+          expect.objectContaining({
+            step: 'leave-lost',
+            member: 'A',
+            memberId: 'member-1',
+            lostAt: 0,
+          })
+        )
+        expect(steps).toContainEqual(
+          expect.objectContaining({
+            step: 'leave-failure',
+            member: 'A',
+            error: expect.objectContaining({ message: 'Leave transport failed' }),
+          })
+        )
+      } else
+        expect(steps).toContainEqual(
+          expect.objectContaining({ step: 'leave-answer', member: 'A', errorCode: 15 })
+        )
+    }
+  )
 
   test.each([false, true])(
     'starts member disconnect during the independent raw read, failing read=%s',
