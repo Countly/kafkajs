@@ -1169,6 +1169,22 @@ describe('broker telemetry fixture', () => {
     }
     exact('test:group:telemetry-reporter', '^(reporter export|reporter no-resource control)$')
     exact('test:group:telemetry-base', '^reporter no-plugin control$')
+    const live = [
+      ['prefix', 'subscriptionLive', 'subscription updates'],
+      ['custom', 'subscriptionLive', 'custom numeric snapshots'],
+      ['payload', 'subscriptionLive', 'bounded compressed payload'],
+      ['unsupported', 'unsupportedLive', 'unsupported telemetry'],
+      ['java', 'javaInteropLive', 'java telemetry interoperability'],
+      ['outcomes', 'outcomesLive', 'foreground outcomes'],
+      ['shutdown', 'shutdownLive', 'close and reopen'],
+    ]
+    for (const [name, file, title] of live) {
+      const script = scripts['test:group:telemetry-' + name]
+      expect(script).toContain('TELEMETRY_E2E=1 jest --detectOpenHandles --runInBand')
+      expect(script).not.toContain('forceExit')
+      expect(script).toContain(`--testPathPatterns 'src/telemetry/__tests__/${file}\\.spec\\.js'`)
+      expect(script).toContain(`--testNamePattern '^${title}$'`)
+    }
     // eslint-disable-next-line n/no-extraneous-require -- YAML parser is pinned by the ESLint/Jest toolchain
     const yaml = require('js-yaml')
     const parse = (file) => yaml.load(read(file).toString())
@@ -1229,32 +1245,41 @@ describe('broker telemetry fixture', () => {
       })
       return JSON.parse(output.trim().slice('matrix='.length)).include
     }
-    expect(catalogue(false)).toEqual([
-      {
-        node: 24,
-        kafka: '4.3.1',
-        group: 'telemetry-reporter',
-        compose: 'docker-compose.telemetry.yml',
-      },
-      { node: 24, kafka: '4.3.1', group: 'telemetry-base', compose: 'docker-compose.yml' },
-      { node: 24, kafka: '4.4.0', group: 'telemetry-base', compose: 'docker-compose.yml' },
-    ])
-    const required = [22, 24, 26].flatMap((node) => [
-      ...['4.3.1', '4.2.2'].map((kafka) => ({
-        node,
-        kafka,
-        group: 'telemetry-reporter',
-        compose: 'docker-compose.telemetry.yml',
-      })),
-      ...['4.3.1', '4.2.2', '4.1.2', '4.0.2', '4.4.0'].map((kafka) => ({
-        node,
-        kafka,
-        group: 'telemetry-base',
-        compose: 'docker-compose.yml',
-      })),
-    ])
+    const configuredGroups = [
+      'telemetry-reporter',
+      'telemetry-prefix',
+      'telemetry-custom',
+      'telemetry-payload',
+      'telemetry-java',
+      'telemetry-outcomes',
+      'telemetry-shutdown',
+    ]
+    const configured = (node, kafkas) =>
+      configuredGroups.flatMap((group) =>
+        kafkas.map((kafka) => ({ node, kafka, group, compose: 'docker-compose.telemetry.yml' }))
+      )
+    const base = (node, group, kafkas) =>
+      kafkas.map((kafka) => ({ node, kafka, group, compose: 'docker-compose.yml' }))
+    const noPlugin = ['4.3.1', '4.2.2', '4.1.2', '4.0.2', '4.4.0']
+    const rowsOf = (node, full) => {
+      const rows = []
+      for (const group of configuredGroups)
+        rows.push(
+          ...configured(node, full ? ['4.3.1', '4.2.2'] : ['4.3.1']).filter(
+            (r) => r.group === group
+          )
+        )
+      rows.push(...base(node, 'telemetry-base', full ? noPlugin : ['4.3.1', '4.4.0']))
+      rows.push(...base(node, 'telemetry-unsupported', full ? noPlugin : ['4.3.1', '4.4.0']))
+      if (full) rows.push(...base(node, 'telemetry-outcomes', ['4.1.2']))
+      return rows
+    }
+    expect(catalogue(false)).toEqual(rowsOf(24, false))
+    expect(catalogue(false)).toHaveLength(11)
+    const required = [22, 24, 26].flatMap((node) => rowsOf(node, true))
     expect(catalogue(true)).toEqual(required)
-    expect(new Set(catalogue(true).map(JSON.stringify)).size).toBe(21)
+    expect(new Set(catalogue(true).map(JSON.stringify)).size).toBe(75)
+    expect(new Set(catalogue(true).map((r) => `${r.group}-${r.kafka}-${r.node}`)).size).toBe(75)
     const job = workflow.jobs.telemetry
     for (const identity of ['github.run_id', 'github.run_attempt', 'strategy.job-index'])
       expect(job.env.COMPOSE_PROJECT_NAME).toContain(identity)
@@ -1287,4 +1312,328 @@ describe('broker telemetry fixture', () => {
     for (const type of ['containers', 'networks', 'volumes']) expect(owner).toContain(type)
     expect(serialized).not.toMatch(/forceExit|docker (pull|system prune)/)
   })
+})
+
+describe('Java telemetry role runner', () => {
+  const runner = path.resolve(__dirname, '../telemetry/run.sh')
+  const directories = []
+
+  afterEach(() => {
+    for (const directory of directories.splice(0))
+      fs.rmSync(directory, { recursive: true, force: true })
+  })
+
+  /**
+   * Exercises shell argument composition with finite offline tool stubs, never a client or broker.
+   * @param {string} mode runner mode
+   * @param {string} role literal role argument
+   * @returns {{ result: object, argv: string[] | null }} exit and Java argv
+   * @throws {Error} for local fixture creation failures
+   */
+  const invoke = (mode, role = 'producer') => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'telemetry-runner-'))
+    directories.push(directory)
+    const argvFile = path.join(directory, 'java.json')
+    fs.writeFileSync(path.join(directory, 'node'), '#!/bin/sh\ncat >/dev/null\n', {
+      mode: 0o700,
+    })
+    fs.writeFileSync(
+      path.join(directory, 'java'),
+      '#!/bin/sh\nexec "$ROLE_TEST_NODE" -e \'require("fs").writeFileSync(process.env.ROLE_TEST_ARGV, JSON.stringify(process.argv.slice(1)))\' -- "$@"\n',
+      { mode: 0o700 }
+    )
+    const result = spawnSync(
+      'timeout',
+      [
+        '-k',
+        '1s',
+        '5s',
+        'bash',
+        runner,
+        mode,
+        '4.3.1',
+        role,
+        'localhost:19092',
+        'telemetry-java-client',
+        'telemetry-java-topic',
+        'telemetry-java-group',
+        '5000',
+        'active-close',
+      ],
+      {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          PATH: directory + path.delimiter + process.env.PATH,
+          TMPDIR: directory,
+          TELEMETRY_INTEROP_CACHE: directory,
+          TELEMETRY_JAVA_CACHE: '',
+          ROLE_TEST_NODE: process.execPath,
+          ROLE_TEST_ARGV: argvFile,
+        },
+      }
+    )
+    return {
+      result,
+      argv: fs.existsSync(argvFile) ? JSON.parse(fs.readFileSync(argvFile, 'utf8')) : null,
+    }
+  }
+
+  test.each(['producer', 'consumer', 'admin'])(
+    'passes literal %s client arguments once',
+    (role) => {
+      const { result, argv } = invoke('client', role)
+      expect(result.status).toBe(0)
+      expect(result.signal).toBeNull()
+      expect(argv.slice(-7)).toEqual([
+        role,
+        'localhost:19092',
+        'telemetry-java-client',
+        'telemetry-java-topic',
+        'telemetry-java-group',
+        '5000',
+        'active-close',
+      ])
+      expect(argv).not.toContain('--check')
+      const cp = argv[argv.indexOf('--class-path') + 1].split(path.delimiter)
+      expect(cp.map((file) => path.basename(file))).toEqual([
+        'kafka-clients-4.3.1.jar',
+        'slf4j-api-1.7.36.jar',
+        'lz4-java-1.10.2.jar',
+        'snappy-java-1.1.10.7.jar',
+        'zstd-jni-1.5.6-10.jar',
+      ])
+      expect(argv[argv.length - 8]).toBe(
+        path.join(path.dirname(runner), 'JavaTelemetryClient.java')
+      )
+    }
+  )
+
+  test('places the no-network readiness flag before role arguments', () => {
+    const { result, argv } = invoke('client-check', 'consumer')
+    expect(result.status).toBe(0)
+    expect(argv.slice(-8, -6)).toEqual(['--check', 'consumer'])
+    expect(argv.filter((value) => value === '--check')).toHaveLength(1)
+  })
+
+  test('rejects an unknown mode before invoking Java', () => {
+    const { result, argv } = invoke('client-unknown')
+    expect(result.status).toBe(2)
+    expect(argv).toBeNull()
+  })
+
+  test('keeps the Java sources, pin lists and retained probe at their reviewed identities', () => {
+    const { createHash } = require('crypto')
+    const root = path.resolve(__dirname, '../../..')
+    const fixture = path.join(root, 'scripts/e2e/telemetry')
+    const digest = (file) => createHash('sha256').update(fs.readFileSync(file)).digest('hex')
+    expect(digest(path.join(fixture, 'JavaTelemetryClient.java'))).toBe(
+      'd3ed209142b991ed9c2f1a61c92ed98fec83c9daa796175af117cf95dcd27031'
+    )
+    expect(digest(path.join(fixture, 'telemetryWireProbe.js'))).toBe(
+      '139afdbec5034f7c1498b90306889fd918ae13097efee1ea9f435b03dcf9b1b1'
+    )
+    const source = fs.readFileSync(path.join(fixture, 'JavaTelemetryClient.java'), 'utf8')
+    for (const preserved of [
+      'gauge.double',
+      'gauge.long',
+      'sum.total',
+      '42.5',
+      '4242L',
+      '7.0',
+      'active-close',
+    ])
+      expect(source).toContain(preserved)
+    const pins = Object.fromEntries(
+      fs
+        .readFileSync(path.join(fixture, 'interop.sha256'), 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => line.split(/\s+/).reverse())
+    )
+    const script = fs.readFileSync(path.join(fixture, 'run.sh'), 'utf8')
+    expect(Object.keys(pins)).toHaveLength(5)
+    for (const [name, sha] of Object.entries(pins)) expect(script).toContain(`'${name}': '${sha}'`)
+    const fetcher = fs.readFileSync(path.join(fixture, 'fetch-interop.sh'), 'utf8')
+    for (const name of Object.keys(pins)) expect(fetcher).toContain(name)
+    expect(fetcher).not.toMatch(/docker|--forceExit/)
+  })
+})
+
+describe('broker cache retirement trace', () => {
+  const { cacheRetirement, retirementsOf } = require('../telemetry/cacheTrace')
+  const removing = (id) =>
+    `[2026-11-07 10:00:00,000] TRACE Removing client connection id [${id}] from the client instance cache (org.apache.kafka.server.ClientMetricsManager)`
+  const missing = (id) =>
+    `[2026-11-07 10:00:00,001] TRACE Client connection id [${id}] is not found in the client instance cache (org.apache.kafka.server.ClientMetricsManager)`
+  const registered = '172.18.0.3:9092-172.18.0.1:54321-3'
+  const plain = '172.18.0.3:9092-172.18.0.1:54999-4'
+  const logs = (overrides = {}) => ({
+    1: { text: [removing(plain), missing(plain), removing(registered)].join('\n') },
+    2: { text: '' },
+    3: { text: '' },
+    ...overrides,
+  })
+
+  test('accepts one registered connection retired on the expected node and listener', () => {
+    expect(cacheRetirement({ logs: logs(), node: '1', localPort: '9092' })).toEqual({
+      source: 'broker-disconnect-trace',
+      node: '1',
+      connectionIdentity: { node: '1', localPort: '9092' },
+      connectionId: registered,
+      line: expect.stringContaining(registered),
+    })
+  })
+
+  test('does not count a removal followed by not-found for the same connection', () => {
+    expect(retirementsOf([removing(plain), missing(plain)].join('\n'))).toEqual([])
+    expect(() =>
+      cacheRetirement({
+        logs: logs({ 1: { text: [removing(plain), missing(plain)].join('\n') } }),
+        node: '1',
+        localPort: '9092',
+      })
+    ).toThrow('No client instance cache retirement was logged')
+  })
+
+  test.each([
+    ['an absent event', { 1: { text: '' } }, 'No client instance cache retirement was logged'],
+    [
+      'a truncated log',
+      { 3: { text: '', truncated: true } },
+      'Broker 3 log is unavailable or truncated',
+    ],
+    ['an unavailable log', { 2: undefined }, 'Broker 2 log is unavailable or truncated'],
+    [
+      'another node',
+      { 2: { text: removing('172.18.0.4:9095-172.18.0.1:50000-1') }, 1: { text: '' } },
+      'Retirement on node 2, expected 1',
+    ],
+    [
+      'another listener',
+      { 1: { text: removing('172.18.0.3:9093-172.18.0.1:50000-1') } },
+      'Retirement on listener 9093, expected 9092',
+    ],
+    [
+      'a second retirement',
+      { 2: { text: removing('172.18.0.4:9095-172.18.0.1:50001-2') } },
+      'Expected one cache retirement, found 2',
+    ],
+  ])('rejects %s', (_name, overrides, message) => {
+    expect(() => cacheRetirement({ logs: logs(overrides), node: '1', localPort: '9092' })).toThrow(
+      message
+    )
+  })
+
+  test('rejects a missing broker log and a malformed connection id', () => {
+    expect(() =>
+      cacheRetirement({ logs: { 1: { text: '' } }, node: '1', localPort: '9092' })
+    ).toThrow('Expected the logs of brokers 1, 2 and 3')
+    expect(() => retirementsOf(removing('not-a-connection'))).toThrow(
+      'Unrecognized broker connection id'
+    )
+  })
+})
+
+describe('live telemetry scenario evidence accounting', () => {
+  const evidence = require('../telemetry/evidence')
+  const request = (extra) => ({
+    type: 'request',
+    requestKey: 'r1',
+    apiKey: 72,
+    socketId: 1,
+    terminating: false,
+    response: { errorCode: 0 },
+    ...extra,
+  })
+  const owners = (record) => ({ producer: { records: [record] } })
+
+  test('accepts successes, declared errors, cut-off finals and faulted-socket requests', () => {
+    expect(() =>
+      evidence.assertStreamAccounted(
+        {
+          producer: {
+            records: [
+              request(),
+              request({ requestKey: 'r2', response: { errorCode: 117 } }),
+              request({ requestKey: 'r3', terminating: true, response: undefined }),
+              request({ requestKey: 'r4', apiKey: 71, socketId: 2, response: undefined }),
+            ],
+          },
+        },
+        { errors: { producer: [117] }, faultedSockets: { producer: [2] } }
+      )
+    ).not.toThrow()
+  })
+
+  test.each([
+    [
+      'an undeclared error code',
+      request({ response: { errorCode: 118 } }),
+      { errors: { producer: [117] } },
+      'Undeclared error 118',
+    ],
+    [
+      'an error declared for another owner',
+      request({ response: { errorCode: 117 } }),
+      { errors: { admin: [117] } },
+      'Undeclared error 117',
+    ],
+    ['an unanswered normal Push', request({ response: undefined }), {}, 'Unanswered 72 request r1'],
+    [
+      'an unanswered Get off a faulted socket',
+      request({ apiKey: 71, socketId: 3, response: undefined }),
+      { faultedSockets: { producer: [2] } },
+      'Unanswered 71 request r1',
+    ],
+  ])('rejects %s', (_name, record, allowed, message) => {
+    expect(() => evidence.assertStreamAccounted(owners(record), allowed)).toThrow(message)
+  })
+
+  const corpus = () => ({
+    count: 1000,
+    expectedSha256: 'a',
+    logSha256: 'a',
+    handlerSha256: 'a',
+    handlerEntries: 1000,
+    rawCommitted: { 0: '334', 1: '333', 2: '333' },
+    processedNext: { 0: '334', 1: '333', 2: '333' },
+    rawEnd: { 0: '334', 1: '333', 2: '333' },
+  })
+
+  test('requires the durable log, handler set and raw commits to agree', () => {
+    expect(() => evidence.assertCorpus(corpus())).not.toThrow()
+    expect(() => evidence.assertCorpus({ ...corpus(), logSha256: 'b' })).toThrow(
+      'Durable log differs'
+    )
+    expect(() => evidence.assertCorpus({ ...corpus(), handlerSha256: 'b' })).toThrow(
+      'Handler set differs'
+    )
+    expect(() => evidence.assertCorpus({ ...corpus(), handlerEntries: 1001 })).toThrow(
+      'Handler entries differ'
+    )
+    expect(() =>
+      evidence.assertCorpus({ ...corpus(), rawCommitted: { 0: '300', 1: '333', 2: '333' } })
+    ).toThrow('Raw commits differ from processed')
+    expect(() =>
+      evidence.assertCorpus({
+        ...corpus(),
+        rawCommitted: { 0: '334', 1: '333', 2: '333' },
+        processedNext: { 0: '334', 1: '333', 2: '333' },
+        rawEnd: { 0: '335', 1: '333', 2: '333' },
+      })
+    ).toThrow('Raw commits are not at the log end')
+  })
+
+  test.each(['telemetry-prefix', 'telemetry-java', 'telemetry-unsupported'])(
+    'requires exactly the %s scenario in its lane',
+    (group) => {
+      expect(() => evidence.verifyEvidence(group, os.tmpdir(), [])).toThrow(
+        'Scenario catalogue mismatch'
+      )
+      expect(() => evidence.verifyEvidence('telemetry-unknown', os.tmpdir(), [])).toThrow(
+        'Unknown telemetry lane'
+      )
+    }
+  )
 })

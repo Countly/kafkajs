@@ -11,6 +11,16 @@ const {
 const sha = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex')
 const KINDS = ['producer', 'consumer', 'admin', 'share']
 const CAP = 16 * 1024 * 1024
+const CONFIGURED_COMPOSE = 'docker-compose.telemetry.yml'
+const LIVE = Object.freeze([
+  'telemetry-prefix',
+  'telemetry-custom',
+  'telemetry-payload',
+  'telemetry-java',
+  'telemetry-outcomes',
+  'telemetry-shutdown',
+])
+const UNSUPPORTED = 'telemetry-unsupported'
 
 /** Owns one case's cleanup tasks in reverse allocation order. */
 class Cleanup {
@@ -222,7 +232,10 @@ const verifyScenario = (record, directory) => {
     assert.equal(identity.brokers.length, 3)
     assert.equal(new Set(identity.images.map((item) => item.container)).size, 3)
     assert(identity.readyAt && identity.startedAt && identity.configSha256)
-    if (manifest.scenario === 'telemetry-reporter') {
+    if (
+      manifest.scenario === 'telemetry-reporter' ||
+      (LIVE.includes(manifest.scenario) && identity.compose === CONFIGURED_COMPOSE)
+    ) {
       const pinned = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures/manifest.json')))
       for (const image of identity.images)
         assert(
@@ -242,11 +255,10 @@ const verifyScenario = (record, directory) => {
       assert.equal(record.run.composeSha256, pinned.composeSha256['docker-compose.telemetry.yml'])
     }
   }
-  const ownerKeys =
-    manifest.scenario === 'telemetry-reporter-no-plugin'
-      ? [...KINDS, ...KINDS.map((k) => k + '-off')]
-      : KINDS
-  assert.deepEqual(Object.keys(manifest.owners).sort(), ownerKeys.sort())
+  const noPlugin = ['telemetry-reporter-no-plugin', UNSUPPORTED].includes(manifest.scenario)
+  const ownerKeys = noPlugin ? [...KINDS, ...KINDS.map((k) => k + '-off')] : KINDS
+  if (LIVE.includes(manifest.scenario)) assert(Object.keys(manifest.owners).length > 0)
+  else assert.deepEqual(Object.keys(manifest.owners).sort(), ownerKeys.sort())
   for (const relative of Object.values(manifest.owners)) {
     const transcript = read(relative)
     assert.deepEqual(transcript.failures, [])
@@ -439,20 +451,25 @@ const verifyScenario = (record, directory) => {
       assert.equal(proof.node, node)
       assert.equal(proof.kafkaClients, record.run.line)
     }
+  } else if (LIVE.includes(manifest.scenario)) {
+    verifyLive(record, directory, manifest, read)
   } else {
     assert(
-      ['telemetry-reporter-no-resource', 'telemetry-reporter-no-plugin'].includes(manifest.scenario)
+      ['telemetry-reporter-no-resource', 'telemetry-reporter-no-plugin', UNSUPPORTED].includes(
+        manifest.scenario
+      )
     )
     for (const [kind, relative] of Object.entries(manifest.owners)) {
       const { records, sockets } = read(relative)
       assert(!records.some((r) => r.apiKey === 72), 'Unexpected Push in negative control')
-      if (manifest.scenario.endsWith('no-plugin')) {
+      if (noPlugin) {
         assert(!records.some((r) => r.apiKey === 71))
         assert(!sockets.some((s) => s.kind === 'telemetry'))
         assert(
           records.some((r) => r.type === 'connect'),
           'No ordinary baseline'
         )
+        if (manifest.scenario === UNSUPPORTED) assertCorpus(record.corpus)
         const outcome = (kind.endsWith('-off') ? record.disabledOutcomes : record.outcomes)[
           kind.replace(/-off$/, '')
         ]
@@ -467,6 +484,144 @@ const verifyScenario = (record, directory) => {
         assert.equal(gets[0].response.pushIntervalMs, 300000)
       }
     }
+  }
+}
+
+/**
+ * Requires every Push and Get of every owner to be accounted for: answered with success, answered
+ * with an error the case declared for that owner, or unanswered only as a cut-off terminating Push
+ * or a request on a socket the case deliberately faulted.
+ * @param {Object<string,object>} transcripts observer transcript by owner label
+ * @param {{errors?:Object<string,number[]>,faultedSockets?:Object<string,number[]>}} allowed the
+ *   case's declared deliberate outcomes
+ * @returns {void}
+ * @throws {Error} naming the first undeclared error or unanswered request
+ */
+const assertStreamAccounted = (transcripts, allowed = {}) => {
+  for (const [owner, transcript] of Object.entries(transcripts))
+    for (const r of transcript.records) {
+      if (r.type !== 'request' || ![71, 72].includes(r.apiKey)) continue
+      if (!r.response) {
+        const faulted = allowed.faultedSockets?.[owner] ?? []
+        assert(
+          (r.apiKey === 72 && r.terminating) || faulted.includes(r.socketId),
+          `Unanswered ${r.apiKey} request ${r.requestKey} of ${owner}`
+        )
+      } else if (r.response.errorCode !== 0)
+        assert(
+          (allowed.errors?.[owner] ?? []).includes(r.response.errorCode),
+          `Undeclared error ${r.response.errorCode} for ${r.requestKey} of ${owner}`
+        )
+    }
+}
+
+/**
+ * Checks the three independent oracles of one ordinary workload against each other.
+ * @param {object} corpus count, three set digests, handler entries, raw commits, processed next and raw end
+ * @returns {void}
+ * @throws {Error} when the sets differ, a record is missing or duplicated, or commits are not at the end
+ */
+const assertCorpus = (corpus) => {
+  assert.equal(corpus.count, 1000)
+  assert.equal(corpus.logSha256, corpus.expectedSha256, 'Durable log differs from the corpus')
+  assert.equal(corpus.handlerSha256, corpus.expectedSha256, 'Handler set differs from the corpus')
+  assert.equal(corpus.handlerEntries, corpus.count, 'Handler entries differ from the corpus')
+  assert.deepEqual(corpus.rawCommitted, corpus.processedNext, 'Raw commits differ from processed')
+  assert.deepEqual(corpus.rawCommitted, corpus.rawEnd, 'Raw commits are not at the log end')
+}
+
+/**
+ * Re-derives, from the archived transcripts and sink files, what the L2–L8 scenarios proved: the
+ * complete stream is accounted for, every claimed Push joins its decode, transmitted bytes and a
+ * once-consumed sink record, and each scenario's own wire or sink conclusion still holds.
+ * @param {object} record stamped evidence
+ * @param {string} directory absolute run directory
+ * @param {object} manifest sidecar manifest
+ * @param {function(string):object} read verified JSON sidecar reader
+ * @returns {void}
+ * @throws {Error} for any unaccounted request, unjoined Push or contradicted conclusion
+ */
+const verifyLive = (record, directory, manifest, read) => {
+  const transcripts = Object.fromEntries(
+    Object.entries(manifest.owners).map(([owner, relative]) => [owner, read(relative)])
+  )
+  assertStreamAccounted(transcripts, record.allowed)
+  const reader = new TelemetryExportReader(path.join(directory, manifest.root))
+  const consumed = new Set()
+  for (const { owner, requestKey } of record.pushes) {
+    const request = transcripts[owner].records.find((r) => r.requestKey === requestKey)
+    assert(request && request.apiKey === 72 && request.response?.errorCode === 0)
+    const subdir = path.dirname(manifest.owners[owner])
+    const decoded = read(`${subdir}/decoded-${requestKey}.json`)
+    assert.equal(decoded.requestKey, requestKey)
+    assert.equal(decoded.uuid, request.uuid)
+    assert.equal(decoded.transmittedSha256, request.metricsSha256)
+    assert.equal(decoded.transmittedBytes, request.metricsBytes)
+    assert.equal(decoded.exportIdentity.node, request.node)
+    const token = `${owner}:${decoded.exportIdentity.node}:${decoded.exportIdentity.seq}`
+    assert(!consumed.has(token), 'Reused sink record')
+    consumed.add(token)
+    const rows = reader
+      .readExports({ uuid: request.uuid })
+      .filter((r) => r.node === decoded.exportIdentity.node && r.seq === decoded.exportIdentity.seq)
+    assert.equal(rows.length, 1)
+    assert.equal(rows[0].dataSha256, decoded.rawSha256)
+  }
+  const { results } = record
+  if (manifest.scenario === 'telemetry-prefix') {
+    const { owner, from, to } = results.quiet
+    assert.deepEqual(
+      transcripts[owner].records.filter(
+        (r) => r.apiKey === 72 && r.writeAt >= from && r.writeAt < to
+      ),
+      [],
+      'A Push was written in the empty-selection interval'
+    )
+  } else if (manifest.scenario === 'telemetry-payload') {
+    assert.equal(results.rawControl.errorCode, 118)
+    assert.equal(results.rawControl.transmittedBytes, 4097)
+    assert.notEqual(results.rawControl.uuid, results.uuid)
+    for (const sample of results.candidate.samples) {
+      assert(sample.rawBytes <= 4096 && sample.transmittedBytes <= 4096)
+      assert.deepEqual(sample.partialPoints, [])
+    }
+  } else if (manifest.scenario === 'telemetry-java') {
+    for (const [role, java] of Object.entries(results.java)) {
+      const rows = reader.readExports({ uuid: java.uuid })
+      assert(rows.filter((r) => !r.terminating).length >= 2, `Too few ${role} exports`)
+      assert.equal(rows.filter((r) => r.terminating).length, 1, `Missing ${role} final`)
+      assert(rows.every((r) => r.parse === 'ok' && r.truncated === false))
+      assert.equal(java.exitCode, 0)
+      assert.equal(java.exitSignal, null)
+      assert(java.closeToExitMs <= 10000)
+      assert.deepEqual(java.liveDescendants, [])
+    }
+    assert.equal(
+      new Set([...Object.values(results.uuids.java), ...Object.values(results.uuids.js)]).size,
+      7
+    )
+  } else if (manifest.scenario === 'telemetry-outcomes') {
+    for (const arm of Object.values(results.arms)) assertCorpus(arm)
+    const [control, ...others] = Object.values(results.arms)
+    for (const arm of others) {
+      assert.deepEqual(arm.rawCommitted, control.rawCommitted)
+      assert.deepEqual(arm.rawEnd, control.rawEnd)
+    }
+  } else if (manifest.scenario === 'telemetry-shutdown') {
+    for (const [kind, episode] of Object.entries(results.episodes)) {
+      assert.equal(episode.reopen.calledBeforeCacheAwait, true, `${kind} reopen was delayed`)
+      assert.equal(episode.reopen.cachedUuid, episode.before.uuid)
+      assert.equal(episode.reopen.get.requestUuid, episode.before.uuid)
+      assert.equal(episode.reopen.finalResends, 0)
+      assert(episode.reopen.correctiveExtraPushes <= 1)
+      assert.deepEqual(episode.close.getOrConnectOrAuthFrames, [])
+      assert.equal(episode.cacheEvent.source, 'broker-disconnect-trace')
+      assert.deepEqual(
+        episode.cacheEvent.connectionIdentity,
+        episode.before.serverConnectionIdentity
+      )
+    }
+    for (const zero of Object.values(results.timeout0)) assert.equal(zero.finalZeroTimeoutWrites, 0)
   }
 }
 
@@ -617,7 +772,9 @@ const verifyEvidence = (group, directory, files) => {
       ? ['telemetry-reporter', 'telemetry-reporter-no-resource']
       : group === 'telemetry-base'
         ? ['telemetry-reporter-no-plugin']
-        : []
+        : [...LIVE, UNSUPPORTED].includes(group)
+          ? [group]
+          : []
   assert(expected.length, 'Unknown telemetry lane')
   const records = files.flatMap((file) =>
     fs.readFileSync(file, 'utf8').trim().split('\n').map(JSON.parse)
@@ -669,4 +826,12 @@ const verifyCleanup = (directory, stamps, project) => {
 if (require.main === module)
   verifyEvidence(process.argv[2], process.env.TELEMETRY_EVIDENCE_DIR, process.argv.slice(3))
 
-module.exports = { runCase, persistEvidence, verifyScenario, verifyEvidence, verifyCleanup }
+module.exports = {
+  runCase,
+  persistEvidence,
+  verifyScenario,
+  verifyEvidence,
+  verifyCleanup,
+  assertStreamAccounted,
+  assertCorpus,
+}

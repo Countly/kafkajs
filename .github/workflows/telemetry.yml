@@ -18,13 +18,30 @@ jobs:
           FULL: ${{ inputs.full }}
         run: |
           node <<'NODE'
+          const configured = 'docker-compose.telemetry.yml'
+          const base = 'docker-compose.yml'
+          const both = ['4.3.1', '4.2.2']
+          const noPlugin = ['4.3.1', '4.2.2', '4.1.2', '4.0.2', '4.4.0']
+          const lanes = [
+            ...[
+              'telemetry-reporter',
+              'telemetry-prefix',
+              'telemetry-custom',
+              'telemetry-payload',
+              'telemetry-java',
+              'telemetry-outcomes',
+              'telemetry-shutdown',
+            ].map((group) => ({ group, compose: configured, full: both, dev: ['4.3.1'] })),
+            { group: 'telemetry-base', compose: base, full: noPlugin, dev: ['4.3.1', '4.4.0'] },
+            { group: 'telemetry-unsupported', compose: base, full: noPlugin, dev: ['4.3.1', '4.4.0'] },
+            { group: 'telemetry-outcomes', compose: base, full: ['4.1.2'], dev: [] },
+          ]
+          const full = process.env.FULL === 'true'
           const include = []
-          for (const node of (process.env.FULL === 'true' ? [22, 24, 26] : [24])) {
-            for (const kafka of (process.env.FULL === 'true' ? ['4.3.1', '4.2.2'] : ['4.3.1']))
-              include.push({ node, kafka, group: 'telemetry-reporter', compose: 'docker-compose.telemetry.yml' })
-            for (const kafka of (process.env.FULL === 'true' ? ['4.3.1', '4.2.2', '4.1.2', '4.0.2', '4.4.0'] : ['4.3.1', '4.4.0']))
-              include.push({ node, kafka, group: 'telemetry-base', compose: 'docker-compose.yml' })
-          }
+          for (const node of full ? [22, 24, 26] : [24])
+            for (const lane of lanes)
+              for (const kafka of full ? lane.full : lane.dev)
+                include.push({ node, kafka, group: lane.group, compose: lane.compose })
           require('fs').appendFileSync(process.env.GITHUB_OUTPUT, `matrix=${JSON.stringify({ include })}\n`)
           NODE
   telemetry:
@@ -40,13 +57,14 @@ jobs:
       COMPOSE_PROJECT_NAME: telemetry-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
       TF1_CACHE: ${{ github.workspace }}/.tmp/telemetry-cache
       TELEMETRY_JAVA_CACHE: ${{ github.workspace }}/.tmp/telemetry-cache
+      TELEMETRY_INTEROP_CACHE: ${{ github.workspace }}/.tmp/telemetry-interop
       TELEMETRY_EVIDENCE_DIR: ${{ github.workspace }}/.tmp/telemetry-evidence
       KAFKAJS_LANE: docker
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: '${{ matrix.node }}', cache: npm }
-      - if: matrix.group == 'telemetry-reporter'
+      - if: matrix.compose == 'docker-compose.telemetry.yml'
         uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: '21' }
       - run: npm ci
@@ -58,7 +76,7 @@ jobs:
           mkdir -p .tmp/e2e "$TELEMETRY_EVIDENCE_DIR"
           chmod 0777 "$TELEMETRY_EVIDENCE_DIR"
       - name: Verify retained jars offline and prepare decoder inputs
-        if: matrix.group == 'telemetry-reporter'
+        if: matrix.compose == 'docker-compose.telemetry.yml'
         timeout-minutes: 5
         env:
           TMPDIR: ${{ runner.temp }}
@@ -66,6 +84,10 @@ jobs:
           timeout -k 5s 30s env -u TELEMETRY_JAVA_CACHE bash scripts/e2e/telemetry/run.sh verify "$KAFKA_VERSION"
           timeout -k 5s 180s bash scripts/e2e/telemetry/fetch.sh
           timeout -k 5s 30s bash scripts/e2e/telemetry/run.sh verify "$KAFKA_VERSION"
+      - name: Fetch and verify the pinned Java interop jars
+        if: matrix.group == 'telemetry-java'
+        timeout-minutes: 4
+        run: timeout -k 5s 200s bash scripts/e2e/telemetry/fetch-interop.sh
       - name: Run the observer checks with the independent Java decoder
         if: matrix.group == 'telemetry-reporter' && matrix.kafka == '4.3.1'
         timeout-minutes: 3
