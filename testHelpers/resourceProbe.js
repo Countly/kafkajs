@@ -2,6 +2,7 @@ const v8 = require('v8')
 // eslint-disable-next-line n/no-unsupported-features/node-builtins -- a development helper that follows resource ancestry; createHook is still the only way to see it
 const { AsyncLocalStorage, createHook } = require('async_hooks')
 const sleep = require('../src/utils/sleep')
+const { readProcStatus, selectPeakSource } = require('./processMemory')
 
 /**
  * What a probe reports. Only the parts whose source was given are present.
@@ -21,8 +22,11 @@ const sleep = require('../src/utils/sleep')
  * @property {number} [heapUsed] bytes of the V8 heap in use after two collections
  * @property {Record<string, number[]>} [identities] stable weak object IDs by caller-owned role;
  *   repeated entries represent multiple registrations and are not deduplicated
- * @property {{ heapUsed: number, external: number, retainedBytes: number,
- *   rss: number, peakRss: number }} [memory] settled heap plus external, with separate RSS readings
+ * @property {{ heapUsed: number, external: number, retainedBytes: number, rss: number,
+ *   peakRss: number, rawMaxRss: number, highWaterRss: number|null, highWaterSource: string|null }} [memory]
+ *   settled heap plus external with separate RSS readings: `peakRss` and `rawMaxRss` are the raw
+ *   `maxRSS * 1024` (which can predate this executable's own image), `highWaterRss` the absolute
+ *   `/proc/self/status` high water where that source exists, never a substitute for the raw value
  * @property {Record<string, { id: number, events: Record<string, number[]> }>} [registrations]
  *   per named emitter: its own ID and, per event, the IDs of its raw listeners with multiplicity
  * @property {Record<string, Record<string, number[]>>} [resources] live async resources by role
@@ -356,12 +360,17 @@ const createResourceProbe = ({
         if (heap) snapshot.heapUsed = heapUsed
         if (memory) {
           const usage = process.memoryUsage()
+          const rawMaxRss = process.resourceUsage().maxRSS * 1024
+          const status = readProcStatus()
           snapshot.memory = {
             heapUsed: usage.heapUsed,
             external: usage.external,
             retainedBytes: usage.heapUsed + usage.external,
             rss: usage.rss,
-            peakRss: process.resourceUsage().maxRSS * 1024,
+            peakRss: rawMaxRss,
+            rawMaxRss,
+            highWaterRss: status ? status.vmhwm : null,
+            highWaterSource: selectPeakSource(() => status)?.name ?? null,
           }
         }
       }

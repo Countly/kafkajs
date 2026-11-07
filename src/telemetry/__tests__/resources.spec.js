@@ -1,17 +1,23 @@
 const { spawn } = require('node:child_process')
 const fs = require('node:fs')
-const os = require('node:os')
 const path = require('node:path')
 const TelemetryPayload = require('../payload')
 const gzip = require('../../protocol/message/compression/gzip')
 const Connection = require('../../network/connection')
 const Decoder = require('../../protocol/decoder')
-const oauthBearerAuthenticator = require('../../broker/saslAuthenticator/oauthBearer')
 const { maximum } = require('./fixtures/maximum')
-const { CycleLedger, IndexOneWatch, KindForeground } = require('./fixtures/cycleKit')
-const { compareSnapshots } = require('../../../testHelpers/resourceProbe')
-const { judgeMemoryArm } = require('../../../scripts/e2e/telemetry/resourceArtifact')
 const {
+  BoundedAudit,
+  CycleLedger,
+  IndexOneWatch,
+  KindForeground,
+  NativeResultFamily,
+  SupplierFamily,
+} = require('./fixtures/cycleKit')
+const { hostContext } = require('../../../testHelpers/processMemory')
+const { SCHEMA, judgeMemoryArm } = require('../../../scripts/e2e/telemetry/resourceArtifact')
+const {
+  BOUNDED_LIMITS,
   PublicTelemetryRound,
   RELEASE_ACTIONS,
   TELEMETRY_KINDS,
@@ -140,7 +146,7 @@ const observe = (round) => {
   }
   const owned = Object.entries(named).filter(([, id]) => id != null && clock.pending.has(id))
   const queue = round.dedicatedConnection?.requestQueue
-  const sockets = round.dedicatedSockets.filter((socket) => !socket.destroyed)
+  const sockets = round.openDedicated()
   return Object.freeze({
     state: machine.state,
     pending: [...clock.pending.keys()].sort(),
@@ -483,142 +489,29 @@ describe('public telemetry resources', () => {
 })
 
 const CYCLES = 100
+const CONTROL_CYCLES = 3
 
 /** @returns {Promise<void>} resolves after one macrotask, so queued continuations can run */
 const turn = () => new Promise((resolve) => setImmediate(resolve))
 
-/**
- * @param {PublicTelemetryRound} round started round @param {string} api wire API name
- * @returns {number} requests of that API the strict wire has answered
- */
-const answered = (round, api) =>
-  round.wire.requests().filter((r) => r.api === api && r.answeredOrder !== undefined).length
-
-/**
- * Checks one journaled cycle against the held shell and the per-cycle bounds. Every comparison is
- * by issued identity: the same occupied shell, never merely the same count.
- * @param {object} row the cycle record @param {object} shell the baseline shell snapshot
- * @param {string[]} roles the shell roles that must be present and unchanged
- * @returns {void}
- */
-const expectCycle = (row, shell, roles) => {
-  expect(compareSnapshots(shell, row.shell, { identities: roles })).toEqual([])
-  expect(row.uuid).toBe(TELEMETRY_UUID)
-  expect(row.churn.identities.foreground).toHaveLength(1)
-  expect(row.churn.identities.sockets.length).toBeLessThanOrEqual(1)
-  expect(row.churn.identities.queue.length).toBeLessThanOrEqual(1)
-  expect(row.churn.identities.waiters).toEqual([])
-  expect(row.churn.identities.snapshots.length).toBeLessThanOrEqual(1)
-  expect(row.churn.identities.handles.length).toBeLessThanOrEqual(1)
-  expect(row.timers.length).toBeLessThanOrEqual(3)
-  expect(row.afterRelease).toEqual({
-    snapshots: expect.any(Number),
-    handles: expect.any(Number),
-    retirements: 0,
-    frames: 0,
-    sockets: expect.any(Number),
-  })
-  expect(row.afterRelease.snapshots).toBeLessThanOrEqual(1)
-  expect(row.afterRelease.handles).toBeLessThanOrEqual(2)
-  expect(row.afterRelease.sockets).toBeLessThanOrEqual(1)
-}
-
-/**
- * Checks what all one hundred cycles together must show.
- * @param {object[]} rows the journal @returns {void}
- */
-const expectJournal = (rows) => {
-  expect(rows).toHaveLength(CYCLES)
-  expect(new Set(rows.map((row) => row.lifecycle)).size).toBe(CYCLES)
-  expect(new Set(rows.map((row) => row.transport)).size).toBe(CYCLES)
-  expect(new Set(rows.map((row) => row.churn.identities.foreground[0])).size).toBe(CYCLES)
-  for (const row of rows)
-    expect(Object.values(row).every((value) => typeof value !== 'function')).toBe(true)
-}
+const LATE = ['resolve', 'reject']
+const KIND_OUTCOMES = KINDS.flatMap((kind) => LATE.map((outcome) => [kind, outcome]))
 
 describe('public telemetry resources', () => {
-  test.each(KINDS.flatMap((kind) => ['resolve', 'reject'].map((outcome) => [kind, outcome])))(
+  test.each(KIND_OUTCOMES)(
     'holds the native result through public cycles for %s with late %s',
     async (kind, outcome) => {
-      const round = new PublicTelemetryRound({ kind })
-      const foreground = new KindForeground(round).prepare()
-      const watch = new IndexOneWatch(round)
-      let failNext = false
-      let compressCalls = 0
-      round.patch(gzip, 'compress', (original) => (...args) => {
-        compressCalls += 1
-        return failNext ? Promise.reject(new Error('late codec failure')) : original(...args)
-      })
-      const gate = round.hold('S12', { mode: 'normal' })
+      const family = new NativeResultFamily({ kind, outcome })
       try {
-        await round.wait(() =>
-          round.start({
-            points: 'large',
-            subscription: { acceptedCompressionTypes: [1, 0] },
-            beforeConnect: () => watch.install(),
-          })
-        )
-        await round.ready()
-        failNext = outcome === 'reject'
-        round.arm()
-        round.tick()
-        await round.wait(() => gate.arrived())
-        failNext = false
-        expect(round.codecJobs).toHaveLength(1)
-        const heldJob = round.codecJobs[0]
-        const callsAtHold = compressCalls
-        const roles = ['builder', 'nativeJob', 'nativeResult']
-        const ledger = new CycleLedger(round, () => ({
-          builder: [round.machine.payload],
-          nativeJob: round.codecJobs.slice(0, 1),
-          nativeResult: round.codecJobs.slice(0, 1).map((job) => job.promise),
-        }))
-        const shell = await ledger.baseline()
-        for (const role of roles) expect(shell.identities[role]).toHaveLength(1)
-
+        await family.open()
         for (let cycle = 0; cycle < CYCLES; cycle++) {
-          await round.wait(() => round.beginClose(round.closeOptions(0)))
-          await round.wait(() => round.client.connect())
-          await round.wait(() => foreground.resume(), 30000)
-          const gets = answered(round, 'GetTelemetrySubscriptions')
-          round.tick()
-          await round.until(
-            () => answered(round, 'GetTelemetrySubscriptions') > gets && !round.machine.running
-          )
-          const identity = await round.wait(() => foreground.act(cycle), 30000)
-          expectCycle(await ledger.record(cycle, identity), shell, roles)
-          expect(compressCalls).toBe(callsAtHold)
+          const row = await family.cycle(cycle)
+          expect({ cycle, problems: family.audit(row) }).toEqual({ cycle, problems: [] })
         }
-        expectJournal(ledger.rows)
-        expect(round.codecJobs[0]).toBe(heldJob)
-        expect(heldJob.settled).toBe(false)
-        expect(watch.pools).toBeGreaterThan(0)
-        expect(watch.opens).toBe(0)
-
-        const blocked = round.pushes().length
-        round.tick()
-        await round.until(() => !round.machine.running)
-        expect(round.codecJobs).toHaveLength(1)
-        expect(round.pushes().length).toBe(blocked)
-
-        const replacement = round.capture()
-        const writes = ledger.totalWrites()
-        round.armed = false
-        await round.drainReleased(gate)
-        expect(heldJob.settled).toBe(true)
-        round.assertReplacementUnchanged(replacement)
-        expect(ledger.totalWrites()).toBe(writes)
-        expect(
-          compareSnapshots(shell, await ledger.baseline(), { identities: ['builder'] })
-        ).toEqual([])
-        expect(round.machine.uuid).toBe(TELEMETRY_UUID)
-        await round.ready()
-        expect(round.pushes().length).toBeGreaterThan(blocked)
-        expect(round.codecJobs).toHaveLength(1)
-        expect(compressCalls).toBeGreaterThan(callsAtHold)
-        expect(watch.opens).toBe(0)
+        expect(BoundedAudit.journal(family.ledger.rows, CYCLES)).toEqual([])
+        await family.finish()
       } finally {
-        await round.dispose()
+        await family.close()
       }
     },
     240000
@@ -627,117 +520,215 @@ describe('public telemetry resources', () => {
   const mechanisms = ['built-in OAuth', 'custom provider']
   test.each(
     KINDS.flatMap((kind) =>
-      mechanisms.flatMap((mechanism) =>
-        ['resolve', 'reject'].map((outcome) => [kind, mechanism, outcome])
-      )
+      mechanisms.flatMap((mechanism) => LATE.map((outcome) => [kind, mechanism, outcome]))
     )
   )(
     'holds the auth supplier through public cycles for %s using %s with late %s',
     async (kind, mechanism, outcome) => {
-      const round = new PublicTelemetryRound({ kind })
-      const foreground = new KindForeground(round).prepare()
-      const watch = new IndexOneWatch(round)
-      let calls = 0
-      let late = false
-      const supplier = async () => {
-        calls += 1
-        const held = late
-        if (held) await round.enter('S19b')
-        if (held && outcome === 'reject') throw new Error('late supplier failure')
-        return { value: 'telemetry-token' }
-      }
-      const sasl = { mechanism: 'oauthbearer', oauthBearerProvider: supplier }
-      if (mechanism === 'custom provider')
-        sasl.authenticationProvider = (args) => oauthBearerAuthenticator(sasl)(args)
-      const gate = round.hold('S19b', { mode: 'normal' })
+      const family = new SupplierFamily({ kind, mechanism, outcome })
       try {
-        await round.wait(() =>
-          round.start({ sasl: true, kafka: { sasl }, beforeConnect: () => watch.install() })
-        )
-        await round.ready()
-        const owner = round.dedicatedConnection.authenticationOwner
-        const baseline = calls
-        round.armRenewal()
-        round.arm()
-        late = true
-        round.tick()
-        await round.wait(() => gate.arrived())
-        late = false
-        expect(calls).toBe(baseline + 1)
-        const heldPending = owner.pending
-        expect(heldPending).not.toBeNull()
-        const roles = ['supplier', 'pending']
-        const ledger = new CycleLedger(round, () => ({
-          supplier: [owner],
-          pending: owner.pending ? [owner.pending] : [],
-        }))
-        const shell = await ledger.baseline()
-        for (const role of roles) expect(shell.identities[role]).toHaveLength(1)
-        const apiCounts = () =>
-          Object.fromEntries(
-            ['SaslAuthenticate', 'GetTelemetrySubscriptions', 'PushTelemetry'].map((api) => [
-              api,
-              round.wire.requests().filter((r) => r.api === api).length,
-            ])
-          )
-
+        await family.open()
         for (let cycle = 0; cycle < CYCLES; cycle++) {
-          await round.wait(() => round.beginClose(round.closeOptions(0)))
-          await round.wait(() => round.client.connect())
-          await round.wait(() => foreground.resume(), 30000)
-          if (round.machine.timer !== null) round.tick()
-          for (let i = 0; i < 3; i++) await turn()
-          const identity = await round.wait(() => foreground.act(cycle), 30000)
-          expectCycle(await ledger.record(cycle, identity), shell, roles)
-          expect(calls).toBe(baseline + 1)
-          expect(owner.pending).toBe(heldPending)
+          const row = await family.cycle(cycle)
+          expect({ cycle, problems: family.audit(row) }).toEqual({ cycle, problems: [] })
         }
-        expectJournal(ledger.rows)
-        expect(watch.pools).toBeGreaterThan(0)
-        expect(watch.opens).toBe(0)
-
-        await round.wait(() => round.beginClose(round.closeOptions(0)))
-        await round.wait(() => round.client.connect())
-        await round.wait(() => foreground.resume(), 30000)
-        const idle = round.capture()
-        const before = apiCounts()
-        const writes = ledger.totalWrites()
-        round.armed = false
-        await round.drainReleased(gate)
-        expect(apiCounts()).toEqual(before)
-        expect(ledger.totalWrites()).toBe(writes)
-        expect(owner.pending).toBeNull()
-        round.assertReplacementUnchanged(idle)
-        expect(idle.uuid).toBe(TELEMETRY_UUID)
-        await round.establish()
-        expect(apiCounts().PushTelemetry).toBeGreaterThan(before.PushTelemetry)
-        expect(round.machine.uuid).toBe(TELEMETRY_UUID)
-        expect(watch.opens).toBe(0)
+        expect(BoundedAudit.journal(family.ledger.rows, CYCLES)).toEqual([])
+        await family.finish()
       } finally {
-        await round.dispose()
+        await family.close()
       }
     },
     240000
   )
 })
 
-/** @returns {{memorySomeAvg10: number}|null} the kernel's memory pressure, when it reports one */
-const memoryPressure = () => {
-  try {
-    const match = /some avg10=([\d.]+)/.exec(fs.readFileSync('/proc/pressure/memory', 'utf8'))
-    return match ? { memorySomeAvg10: Number(match[1]) } : null
-  } catch {
-    return null
-  }
-}
+describe.each([
+  ['native result', (kind, outcome) => new NativeResultFamily({ kind, outcome })],
+  ['auth supplier', (kind, outcome) => new SupplierFamily({ kind, outcome })],
+])('bounded capture controls for the %s family', (_name, make) => {
+  test.each(KIND_OUTCOMES)(
+    'fails each deliberate fault with its own diagnostic for %s with late %s',
+    async (kind, outcome) => {
+      const family = make(kind, outcome)
+      try {
+        await family.open()
+        for (let cycle = 0; cycle < CONTROL_CYCLES; cycle++) {
+          const row = await family.cycle(cycle)
+          expect({ cycle, problems: family.audit(row) }).toEqual({ cycle, problems: [] })
+        }
+        const { round, ledger } = family
+        const row = ledger.rows.at(-1)
+        const rows = ledger.rows.map((entry) => ({ ...entry }))
+        expect(BoundedAudit.journal(rows, CONTROL_CYCLES)).toEqual([])
 
-/** @returns {object} the CPU, load and memory context of this host right now */
-const hostContext = () => ({
-  cpus: os.cpus().length,
-  load: os.loadavg(),
-  freeBytes: os.freemem(),
-  totalBytes: os.totalmem(),
-  psi: memoryPressure(),
+        // The same number of owners, none of them the held shell.
+        const decoy = new CycleLedger(round, () => family.decoyShell())
+        expect(family.audit({ ...row, shell: await decoy.baseline() })).toEqual(
+          family.roles.map((role) => `identities ${role} changed`)
+        )
+
+        // A completed owner left in the restore table survives until it is released.
+        const retired = {}
+        round.owners.add(
+          retired,
+          () => {},
+          () => true
+        )
+        expect(BoundedAudit.state(round.boundedState(), ledger.base)).toEqual([
+          'a retired owner is still in the restore table',
+        ])
+        round.releaseCompleted()
+        expect(BoundedAudit.state(round.boundedState(), ledger.base)).toEqual([])
+
+        // One registration twice on the open dedicated socket.
+        const [socket] = round.openDedicated()
+        const event = socket.eventNames().find((name) => typeof name === 'string')
+        const [listener] = socket.rawListeners(event)
+        socket.on(event, listener)
+        try {
+          ledger.current = [{}]
+          const churn = await ledger.churnProbe.snapshot()
+          ledger.current = []
+          expect(family.audit({ ...row, churn })).toEqual(['dedicated socket listeners changed'])
+        } finally {
+          socket.off(event, listener)
+        }
+
+        // Issued numbers that fall are a reset after pruning, not a continuation.
+        const reset = rows.map((entry, index) =>
+          index === 1 ? { ...entry, state: { ...entry.state, socketsIssued: 0 } } : entry
+        )
+        expect(BoundedAudit.journal(reset, CONTROL_CYCLES)).toEqual([
+          'issued socket numbers fell at cycle 1',
+        ])
+
+        // More live owners than the table admits fails instead of growing.
+        const filler = Array.from({ length: BOUNDED_LIMITS.owners + 1 }, () => ({}))
+        try {
+          expect(() => filler.forEach((owner) => round.owners.add(owner, () => {}))).toThrow(
+            `Bounded capture overflow: more than ${BOUNDED_LIMITS.owners} live owners`
+          )
+        } finally {
+          filler.forEach((owner) => round.owners.release(owner))
+        }
+        expect(BoundedAudit.state(round.boundedState(), ledger.base)).toEqual([])
+
+        // The held late outcome is real: letting it settle early is a failure of the schedule.
+        await family.releaseEarly()
+        expect(family.held()).toEqual([
+          family.roles.includes('builder')
+            ? 'the held native job settled during the schedule'
+            : 'the held supplier shell settled early',
+        ])
+
+        // A write to a socket that already closed is counted and judged.
+        const [node] = round.wire.nodes
+        const stray = round.wire.fake.factory({
+          host: node.host,
+          port: node.port,
+          onConnect: () => {},
+        })
+        stray.destroy()
+        await turn()
+        await turn()
+        stray.write(Buffer.alloc(1))
+        expect(BoundedAudit.state(round.boundedState(), ledger.base)).toEqual([
+          'a write reached a closed socket',
+        ])
+      } finally {
+        await family.close()
+      }
+    },
+    120000
+  )
+})
+
+describe('bounded capture of the round', () => {
+  test('keeps every default round history and counts the same work', async () => {
+    const round = new PublicTelemetryRound({ kind: 'producer' })
+    try {
+      await round.wait(() => round.start())
+      await round.ready()
+      const state = round.boundedState()
+      expect(round.bounded).toBe(false)
+      expect(state.history).toBeGreaterThan(0)
+      expect(state.restorers).toBeGreaterThan(0)
+      expect(state.owners).toBe(0)
+      expect(round.pushes()).toHaveLength(round.pushesRequested())
+      expect(round.dedicatedCount()).toBe(round.dedicatedSockets.length)
+      expect(round.releaseCompleted()).toBe(0)
+    } finally {
+      await round.dispose()
+    }
+  }, 60000)
+
+  test.each(KINDS)(
+    'holds no history of completed work and refuses what needs it for %s',
+    async (kind) => {
+      const round = new PublicTelemetryRound({ kind, bounded: true })
+      try {
+        await round.wait(() => round.start())
+        await round.ready()
+        await round.wait(() => round.beginClose(round.closeOptions(0)))
+        await round.wait(() => round.client.connect())
+        await round.establish()
+        round.releaseCompleted()
+        const state = round.boundedState()
+        expect(state.history).toBe(0)
+        expect(state.retainedBytes).toBe(0)
+        expect(state.ownersCompleted).toBe(0)
+        expect(state.socketsIssued).toBeGreaterThan(1)
+        expect(round.dedicatedCount()).toBe(state.socketsIssued)
+        expect(round.openDedicated()).toHaveLength(1)
+        expect(round.pushesAnswered()).toBeGreaterThan(0)
+        for (const name of [
+          'pushes',
+          'telemetryRequests',
+          'assertTrace',
+          'writtenFor',
+          'finalSnapshotIdentity',
+          'replacementMetricOrigin',
+          'forcedRetirements',
+          'newSetupCallsSince',
+        ])
+          expect(() => round[name]()).toThrow(`${name}() needs the full capture`)
+      } finally {
+        await round.dispose()
+      }
+    },
+    90000
+  )
+
+  test('releases a completed owner and restores its patch, and drains the live ones on disposal', async () => {
+    const round = new PublicTelemetryRound({ kind: 'producer', bounded: true })
+    const done = { value: false }
+    const live = { write: () => 'original' }
+    const finished = { write: () => 'original' }
+    const original = finished.write
+    round.patchFor(
+      finished,
+      'write',
+      () => () => 'patched',
+      () => done.value
+    )
+    round.patchFor(
+      live,
+      'write',
+      () => () => 'patched',
+      () => false
+    )
+    expect(finished.write()).toBe('patched')
+    expect(round.owners.size).toBe(2)
+    expect(round.releaseCompleted()).toBe(0)
+    done.value = true
+    expect(round.releaseCompleted()).toBe(1)
+    expect(finished.write).toBe(original)
+    expect(round.owners.has(finished)).toBe(false)
+    expect(live.write()).toBe('patched')
+    await round.dispose()
+    expect(live.write()).toBe('original')
+    expect(round.owners.size).toBe(0)
+  })
 })
 
 /**
@@ -750,7 +741,11 @@ const hostContext = () => ({
 const supervise = (script, kind) =>
   new Promise((resolve) => {
     const file = path.join(__dirname, 'fixtures', script)
+    // The child runs without coverage, inspector or Jest, so none of them can add to its memory.
+    const env = { ...process.env }
+    delete env.NODE_V8_COVERAGE
     const child = spawn(process.execPath, ['--expose-gc', file, kind], {
+      env,
       stdio: ['ignore', 'pipe', 'pipe'],
     })
     let stdout = ''
@@ -812,7 +807,7 @@ const supervise = (script, kind) =>
 const record = (arm, kind, run, before, after) => {
   const { readings, failure, ...exit } = run
   const artifact = {
-    schema: 1,
+    schema: SCHEMA,
     arm,
     kind,
     stamp: {

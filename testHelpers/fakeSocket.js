@@ -9,24 +9,77 @@ const Encoder = require('../src/protocol/encoder')
  * Every socket remembers the endpoint the product dialled (`socket.endpoint`) and what was written
  * to it (`socket.writes`), so a scenario of several nodes can tell them apart; `state.writes` is
  * every socket's writes in one list, `state.sockets` every socket ever built, oldest first, and
- * `state.socket` the newest. `destroy()` behaves as `net.Socket#destroy` does, minus the kernel: it
+ * `state.socket` the newest (null in bounded mode once it has closed). `destroy()` behaves as `net.Socket#destroy` does, minus the kernel: it
  * marks the socket `destroyed` at once and emits `error` (when given one) and `close` a microtask
  * later, once. A write after that is still recorded, so a test can see it.
+ *
+ * Scalar counters are kept in both modes: `state.issued`, `state.closed`, `state.writeCount`,
+ * `state.writeBytes`, `state.writesAfterClose` and the per-endpoint `state.issuedByEndpoint`.
+ *
+ * With `bounded`, the factory keeps no history of completed objects: `state.sockets` holds only
+ * sockets whose close has not been emitted, `state.writes` and `socket.writes` stay empty, and a
+ * socket is dropped once its queued `error` and `close` callbacks have run. Only the counters
+ * survive, so an issued number is never reused. Building a socket past `maxLiveSockets` live ones
+ * reports an overflow and throws instead of growing.
+ * @param {object} [options]
+ * @param {{ maxLiveSockets?: number, onClosed?: (socket: EventEmitter) => void,
+ *   onOverflow?: (error: Error) => void }|null} [options.bounded] opt-in bounded capture
  * @returns {{ factory: Function, state: { writes: Buffer[], socket: EventEmitter,
- *   sockets: EventEmitter[] } }}
+ *   sockets: EventEmitter[], issued: number, closed: number, writeCount: number,
+ *   writeBytes: number, writesAfterClose: number, issuedByEndpoint: Map<string, number>,
+ *   bounded: boolean } }}
  */
-const createFakeSocketFactory = () => {
-  const state = { writes: [], socket: null, sockets: [] }
+const createFakeSocketFactory = ({ bounded = null } = {}) => {
+  const state = {
+    writes: [],
+    socket: null,
+    sockets: [],
+    issued: 0,
+    closed: 0,
+    writeCount: 0,
+    writeBytes: 0,
+    writesAfterClose: 0,
+    issuedByEndpoint: new Map(),
+    bounded: bounded !== null,
+  }
+  const maxLive = bounded?.maxLiveSockets ?? 16
+
+  /**
+   * Drops a closed socket from the live list once its callbacks have run.
+   * @param {EventEmitter} socket the socket whose close was just emitted
+   * @returns {void}
+   */
+  const settle = (socket) => {
+    state.closed += 1
+    if (bounded) {
+      const at = state.sockets.indexOf(socket)
+      if (at !== -1) state.sockets.splice(at, 1)
+      if (state.socket === socket) state.socket = null
+      bounded.onClosed?.(socket)
+    }
+  }
 
   const factory = ({ host, port, onConnect }) => {
+    if (bounded && state.sockets.length >= maxLive) {
+      const error = new Error(`Fake socket capture overflow: more than ${maxLive} live sockets`)
+      bounded.onOverflow?.(error)
+      throw error
+    }
     const socket = new EventEmitter()
     socket.endpoint = { host, port }
     socket.destroyed = false
     socket.writes = []
     socket.write = (buffer) => {
-      const written = Buffer.from(buffer)
-      socket.writes.push(written)
-      state.writes.push(written)
+      state.writeCount += 1
+      if (socket.destroyed) state.writesAfterClose += 1
+      if (bounded) {
+        state.writeBytes += buffer.length
+      } else {
+        const written = Buffer.from(buffer)
+        state.writeBytes += written.length
+        socket.writes.push(written)
+        state.writes.push(written)
+      }
       return true
     }
     socket.end = () => {}
@@ -39,11 +92,15 @@ const createFakeSocketFactory = () => {
             socket.emit('error', error)
           }
           socket.emit('close', Boolean(error))
+          settle(socket)
         })
       }
 
       return socket
     }
+    const key = `${host}:${port}`
+    state.issued += 1
+    state.issuedByEndpoint.set(key, (state.issuedByEndpoint.get(key) ?? 0) + 1)
     state.socket = socket
     state.sockets.push(socket)
     setImmediate(onConnect)
@@ -54,14 +111,21 @@ const createFakeSocketFactory = () => {
 }
 
 /**
- * @param {{ sockets: Array<{ destroyed: boolean }> }} state a fake socket factory's state
+ * @param {{ sockets: Array<{ destroyed: boolean }>, issued?: number, closed?: number }} state a
+ *   fake socket factory's state; a bounded one carries its own issued and closed counters
  * @returns {{ created: number, destroyed: number }} how many sockets the product has opened, and
  *   how many of them it has destroyed
  */
-const socketCounts = ({ sockets }) => ({
-  created: sockets.length,
-  destroyed: sockets.filter((socket) => socket.destroyed).length,
-})
+const socketCounts = ({ sockets, issued, closed, bounded }) =>
+  bounded
+    ? {
+        created: issued,
+        destroyed: closed + sockets.filter((socket) => socket.destroyed).length,
+      }
+    : {
+        created: sockets.length,
+        destroyed: sockets.filter((socket) => socket.destroyed).length,
+      }
 
 /**
  * Frames a response the way a broker does: size, correlation id, optional header tag buffer,
