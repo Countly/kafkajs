@@ -11,6 +11,7 @@ const { EventEmitter } = require('events')
 const { Kafka, logLevel } = require('../../../../index')
 const {
   createTopic,
+  newLogger,
   plainTextBrokers,
   readRequestHeader,
   secureRandom,
@@ -27,6 +28,12 @@ const {
 } = require('../../../../testHelpers/shareFixtures')
 const { readLog, endOffsets } = require('../../../../testHelpers/rawLog')
 const { createResourceProbe } = require('../../../../testHelpers/resourceProbe')
+const RequestQueue = require('../../../network/requestQueue')
+const InstrumentationEventEmitter = require('../../../instrumentation/emitter')
+const { ShareAckLedger } = require('../shareAckLedger')
+const { ShareFetchLoop } = require('../shareFetchLoop')
+const { ShareSession } = require('../shareSession')
+const { ShareRun } = require('../shareRun')
 const shareFetchV2 = require('../../../../testHelpers/wire/shareFetchV2')
 const shareAcknowledgeV2 = require('../../../../testHelpers/wire/shareAcknowledgeV2')
 const {
@@ -64,6 +71,165 @@ const INVALID_RECORD_STATE = 121
 const BASE_GROUP = {
   'share.auto.offset.reset': 'earliest',
   'share.record.lock.duration.ms': LOCK_MS,
+}
+
+/**
+ * Validates the controlled expiry sequence from portable original observations.
+ * @param {object} proof Acquisitions, invocations, tickets, wire responses and public results.
+ * @param {boolean} [complete=true] Also require B's terminal settlement after opening its gate.
+ * @returns {void} Throws for a missing, duplicate, uncorrelated or permissive expiry result.
+ */
+const assertControlledExpiry = (proof, complete = true) => {
+  const {
+    group,
+    topic,
+    topicId,
+    members,
+    acquisitions,
+    entries,
+    wire,
+    results,
+    tickets,
+    renewals,
+  } = proof
+  expect(entries).toHaveLength(2)
+  const [a, b] = entries
+  expect([a.member, b.member]).toEqual(['A', 'B'])
+  expect([a.deliveryCount, b.deliveryCount]).toEqual([1, 2])
+  expect(b.identity).toBe(a.identity)
+  expect(acquisitions).toHaveLength(2)
+  expect(acquisitions[0].id).not.toBe(acquisitions[1].id)
+  for (const [index, entry] of entries.entries()) {
+    const acquisition = acquisitions[index]
+    expect(acquisition).toMatchObject({
+      member: entry.member,
+      group,
+      topicId,
+      partition: 0,
+      identities: [entry.identity],
+      counts: [entry.deliveryCount],
+      lockDuration: LOCK_MS,
+    })
+    expect(entry.acquisition).toBe(acquisition.id)
+    expect(acquisition.sentAt).toBeLessThanOrEqual(entry.at)
+    expect(acquisition.deadline).toBe(acquisition.sentAt + LOCK_MS)
+  }
+  expect(b.at).toBeLessThanOrEqual(acquisitions[0].deadline + REDELIVERY_SLACK_MS)
+  expect(a.decidedAt).toBeGreaterThanOrEqual(a.at + LATE_ACCEPT_AT_MS.expire)
+  expect(wire.filter((frame) => frame.label === 'A' && frame.isRenewAck)).toEqual([])
+  /** @param {string} label Member label. @param {string} type Public result type. @param {number} code Required ack code. @returns {object[]} Correlated exchanges. */
+  const check = (label, type, code) => {
+    const frames = wire.filter(
+      (frame) => frame.label === label && frame.isRenewAck === (type === 'renew')
+    )
+    const outcomes = results.filter((result) => result.member === label && result.type === type)
+    expect(frames.length).toBeGreaterThan(0)
+    expect(outcomes).toHaveLength(frames.length)
+    const seen = new Set()
+    for (const [index, frame] of frames.entries()) {
+      expect([78, 79]).toContain(frame.apiKey)
+      expect(frame).toMatchObject({ apiVersion: 2, groupId: group, memberId: members[label] })
+      expect(Number.isInteger(frame.socket)).toBe(true)
+      expect(Number.isInteger(frame.correlationId)).toBe(true)
+      const exchange = `${frame.socket}:${frame.correlationId}`
+      expect(seen.has(exchange)).toBe(false)
+      seen.add(exchange)
+      expect(frame.topics).toEqual([
+        {
+          topicId,
+          partitions: [
+            {
+              partitionIndex: 0,
+              acknowledgementBatches: [
+                {
+                  firstOffset: '0',
+                  lastOffset: '0',
+                  acknowledgeTypes: [type === 'renew' ? RENEW : ACCEPT],
+                },
+              ],
+            },
+          ],
+        },
+      ])
+      expect(frame.response?.errorCode).toBe(0)
+      expect(frame.response.topics).toHaveLength(1)
+      expect(frame.response.topics[0].topicId).toBe(topicId)
+      expect(frame.response.topics[0].partitions).toHaveLength(1)
+      const [partition] = frame.response.topics[0].partitions
+      expect(partition.partitionIndex).toBe(0)
+      expect(
+        frame.apiKey === SHARE_FETCH ? partition.acknowledgeErrorCode : partition.errorCode
+      ).toBe(code)
+      expect(frame.response.at).toBeGreaterThanOrEqual(frame.at)
+      const outcome = outcomes[index]
+      expect(outcome).toMatchObject({
+        topic,
+        partition: 0,
+        firstOffset: '0',
+        lastOffset: '0',
+        type,
+      })
+      if (code === 0) expect(outcome.error).toBeNull()
+      else {
+        expect(outcome.error).toMatchObject({
+          name: 'KafkaJSShareAcknowledgementError',
+          reason: 'rejected-by-broker',
+        })
+        expect(causeCodes(outcome.error)).toContain(code)
+      }
+      const matching = tickets.filter(
+        (ticket) =>
+          ticket.member === label &&
+          ticket.isRenewAck === frame.isRenewAck &&
+          ticket.preparedAt <= frame.at &&
+          ticket.settledAt >= frame.at &&
+          ticket.settledAt <= outcome.at
+      )
+      expect(matching).toHaveLength(1)
+      expect(matching[0].settlements).toBe(1)
+      expect(matching[0].acquisition).toBe(label === 'A' ? a.acquisition : b.acquisition)
+      expect(matching[0].batches).toEqual(frame.topics[0].partitions[0].acknowledgementBatches)
+      expect(matching[0].results).toEqual([
+        { firstOffset: '0', lastOffset: '0', type, error: outcome.error },
+      ])
+    }
+    return frames
+  }
+  const aFrames = check('A', 'accept', INVALID_RECORD_STATE)
+  expect(aFrames).toHaveLength(1)
+  expect(results.filter(({ member }) => member === 'A')).toHaveLength(1)
+  const verdictAt = Math.max(
+    aFrames[0].response.at,
+    results.find(({ member }) => member === 'A').at
+  )
+  expect(aFrames[0].at).toBeGreaterThanOrEqual(a.decidedAt)
+  const renewalFrames = check('B', 'renew', 0)
+  expect(renewals).toHaveLength(renewalFrames.length)
+  expect(renewals.length).toBeGreaterThan(0)
+  let deadline = acquisitions[1].deadline
+  for (const [index, renewal] of renewals.entries()) {
+    expect(renewal.duration).toBe(LOCK_MS)
+    expect(renewal.error).toBeNull()
+    expect(renewal.calledAt).toBeLessThan(deadline)
+    expect(renewal.completedAt).toBeLessThanOrEqual(deadline)
+    expect(renewalFrames[index].at).toBeGreaterThanOrEqual(renewal.calledAt)
+    expect(renewalFrames[index].response.at).toBeLessThanOrEqual(renewal.completedAt)
+    deadline = renewalFrames[index].at + LOCK_MS
+  }
+  expect(deadline).toBeGreaterThan(verdictAt)
+  if (!complete) {
+    expect(b.decidedAt).toBeUndefined()
+    expect(results.filter(({ member, type }) => member === 'B' && type !== 'renew')).toEqual([])
+    expect(wire.filter(({ label, isRenewAck }) => label === 'B' && !isRenewAck)).toEqual([])
+    return
+  }
+  expect(proof.gateOpenedAt).toBeGreaterThanOrEqual(verdictAt)
+  expect(b.decidedAt).toBeGreaterThanOrEqual(proof.gateOpenedAt)
+  expect(b.decidedAt).toBeLessThan(deadline)
+  const bFrames = check('B', 'accept', 0)
+  expect(bFrames).toHaveLength(1)
+  expect(bFrames[0].at).toBeGreaterThanOrEqual(b.decidedAt)
+  expect(results.filter(({ member, type }) => member === 'B' && type !== 'renew')).toHaveLength(1)
 }
 
 /**
@@ -152,6 +318,7 @@ class AcknowledgementTrace {
           socket: ordinal,
           bytes,
           headerBytes: header.byteLength,
+          requestHex: bytes.toString('hex'),
           at: performance.now(),
         }
         const [request] = acknowledgementRequests([fact])
@@ -168,6 +335,8 @@ class AcknowledgementTrace {
         if (!fact) continue
         pending.delete(fact.correlationId)
         const decoder = fact.apiKey === 78 ? fetchAcknowledgementResponse : acknowledgeResponse
+        fact.receivedAt = performance.now()
+        fact.responseHex = bytes.toString('hex')
         fact.decoding = Promise.resolve()
           .then(() => {
             if (bytes[8] !== 0) throw new Error('Unexpected response header tags')
@@ -176,7 +345,7 @@ class AcknowledgementTrace {
           .then(({ errorCode, responses }) => {
             fact.response = {
               errorCode,
-              at: performance.now(),
+              at: fact.receivedAt,
               topics: responses.map(({ topicId, partitions }) => ({
                 topicId,
                 partitions: partitions.map(
@@ -206,8 +375,10 @@ class AcknowledgementTrace {
 
   /** @returns {object[]} Original requests and correlated partition outcomes, without byte buffers. */
   snapshot() {
-    return this.frames.map(({ request, at, response, decodeError }) => ({
+    return this.frames.map(({ request, at, response, decodeError, requestHex, responseHex }) => ({
       ...request,
+      requestHex,
+      responseHex,
       at,
       response: response ?? null,
       decodeError,
@@ -528,6 +699,118 @@ const causeCodes = (error) => {
   return codes
 }
 
+/** Observes original resource owners without changing method results or receiver identities. */
+class ResourceGauge {
+  /** Retains owners until after the cleanup comparison, including destroyed connections. */
+  constructor() {
+    this.ledgers = new Set()
+    this.queues = new Set()
+    this.emitters = new Set()
+    this.restores = []
+  }
+
+  /** @returns {void} Installs call-through observers before clients are constructed. */
+  install() {
+    this.watch(
+      ShareAckLedger.prototype,
+      [
+        'canStart',
+        'decide',
+        'complete',
+        'completeRange',
+        'dropExpired',
+        'needsFlush',
+        'prepare',
+        'settle',
+        'invalidate',
+      ],
+      this.ledgers
+    )
+    this.watch(
+      RequestQueue.prototype,
+      ['push', 'scheduleRequestTimeoutCheck', 'waitForPendingRequests', 'destroy'],
+      this.queues
+    )
+    this.watch(InstrumentationEventEmitter.prototype, ['addListener', 'emit'], this.emitters)
+  }
+
+  /**
+   * @param {object} prototype Original class prototype.
+   * @param {string[]} names Methods to observe.
+   * @param {Set<object>} seen Original receivers retained for measurement.
+   * @returns {void}
+   */
+  watch(prototype, names, seen) {
+    for (const name of names) {
+      const original = prototype[name]
+      prototype[name] = function (...args) {
+        seen.add(this)
+        return original.apply(this, args)
+      }
+      this.restores.push(() => {
+        prototype[name] = original
+      })
+    }
+  }
+
+  /** @returns {void} Restores observers only after the final resource proof. */
+  uninstall() {
+    for (const restore of this.restores.splice(0).reverse()) restore()
+    this.ledgers.clear()
+    this.queues.clear()
+    this.emitters.clear()
+  }
+
+  /** @returns {number} Entries still held by original ledgers, including retired acquisitions. */
+  ledgerSize() {
+    return [...this.ledgers].reduce((total, ledger) => total + ledger.size, 0)
+  }
+
+  /** @returns {number} Pending and in-flight requests, regardless of socket destruction. */
+  queueDepth() {
+    return [...this.queues].reduce(
+      (total, queue) => total + queue.pending.length + queue.inflight.size,
+      0
+    )
+  }
+
+  /**
+   * @param {Iterable<import('events').EventEmitter>} emitters Original client or queue emitters.
+   * @returns {number} Listeners over every event of every retained emitter.
+   */
+  listenerCount(emitters) {
+    let total = 0
+    for (const emitter of emitters)
+      for (const event of emitter.eventNames()) total += emitter.listenerCount(event)
+    return total
+  }
+
+  /**
+   * @param {object} sources Socket, process-listener and event-loop measurements.
+   * @returns {{ snapshot: () => Promise<object> }} Probe with fixed keys and measured owner totals.
+   */
+  probe(sources) {
+    const probe = createResourceProbe({
+      ...sources,
+      queueDepth: () => this.queueDepth(),
+      ledgerSize: () => this.ledgerSize(),
+    })
+    return {
+      snapshot: async () => {
+        const snapshot = await probe.snapshot()
+        return {
+          ...snapshot,
+          listeners: {
+            ...snapshot.listeners,
+            clients: this.listenerCount([...this.emitters].map(({ emitter }) => emitter)),
+            queues: this.listenerCount(this.queues),
+          },
+        }
+      },
+    }
+  }
+}
+
 /**
  * One live run of a lock scenario: two members share one partition under a three second lock,
  * a first-fetch gate gives member A the targeted acquisition, and the log, broker and handler
@@ -546,16 +829,14 @@ class LockCase {
     this.group = `e2e-p9e-lock-${kind}-group-${this.nonce}`
     this.stack = new CleanupStack()
     this.tap = new ShareWireTap()
-    this.probe = createResourceProbe({
+    this.gauge = new ResourceGauge()
+    this.probe = this.gauge.probe({
       emitters: { process },
       sockets: () => this.tap.socketCounts(),
-      queueDepth: () => this.tap.pending(),
-      ledgerSize: () => this.openHandlers,
       activeResources: true,
     })
     this.members = new Map()
     this.entries = []
-    this.openHandlers = 0
     this.handlerWork = new Set()
     this.startedAt = performance.now()
     this.requests = []
@@ -563,7 +844,15 @@ class LockCase {
     this.expected = []
     this.renewals = []
     this.renewOutcome = null
+    this.expiryRenewals = []
+    this.acquisitions = []
+    this.tickets = []
+    this.ledgerAcquisitions = new WeakMap()
+    this.ticketFacts = new WeakMap()
+    this.expiryGate = null
     this.fetched = null
+    this.gateAcquisitions = []
+    this.gateExpiry = null
     this.gateB = null
     this.baseline = null
     this.beforeAdmin = null
@@ -623,6 +912,7 @@ class LockCase {
       })),
       entries: this.entries,
       renewals: this.renewals,
+      controlledExpiry: this.kind === 'expire' ? this.expiryProof() : undefined,
       renewOutcome: this.renewOutcome && {
         ...this.renewOutcome,
         error: describeError(this.renewOutcome.error),
@@ -639,6 +929,9 @@ class LockCase {
    * @throws {Error} the first assertion or fixture failure, with cleanup failures attached
    */
   async run(scope) {
+    this.gauge.install()
+    if (this.kind === 'gate') this.watchGateAcquisition()
+    if (this.kind === 'expire') this.watchExpiryAcquisitions()
     try {
       const left = FILE_MS - (performance.now() - fileStart)
       if (left < this.scenario.budgetMs + JOIN_MS) {
@@ -672,6 +965,8 @@ class LockCase {
     } catch (error) {
       this.row('case-failed', { error: describeError(error), ...this.progress() })
       throw error
+    } finally {
+      this.gauge.uninstall()
     }
   }
 
@@ -683,8 +978,11 @@ class LockCase {
    */
   async setup(scope) {
     this.admin = this.client('admin').admin()
-    this.admin.on(this.admin.events.REQUEST, ({ payload }) => this.requests.push(payload))
     this.stack.add('prove cleanup and disconnect admin', (signal) => this.cleanup(signal))
+    this.stack.add(
+      'remove admin listeners',
+      this.admin.on(this.admin.events.REQUEST, ({ payload }) => this.requests.push(payload))
+    )
     this.stack.add('delete topic', (signal) => this.deleteTopic(signal))
     this.stack.add('delete group', (signal) => this.deleteGroup(signal))
     this.stack.add('reset group configs', (signal) => this.resetConfigs(signal))
@@ -707,7 +1005,10 @@ class LockCase {
     this.row('resource-baseline', { snapshot: this.baseline })
 
     this.producer = this.client('producer').producer({ idempotent: true })
-    this.producer.on(this.producer.events.REQUEST, ({ payload }) => this.requests.push(payload))
+    this.stack.add(
+      'remove producer listeners',
+      this.producer.on(this.producer.events.REQUEST, ({ payload }) => this.requests.push(payload))
+    )
     this.stack.add('disconnect producer', () => this.producer.disconnect())
     await bounded(scope, 10000, () => this.producer.connect())
 
@@ -745,7 +1046,10 @@ class LockCase {
       consumer.on(events.ACKNOWLEDGE, ({ payload }) =>
         member.acks.push({ ...payload, at: performance.now() })
       ),
-      consumer.on(events.LOCK_EXPIRED, ({ payload }) => member.expired.push(payload)),
+      consumer.on(events.LOCK_EXPIRED, ({ payload }) => {
+        member.expired.push(payload)
+        this.freezeGateExpiry()
+      }),
       consumer.on(events.CRASH, ({ payload }) => member.crashes.push(payload.error)),
       consumer.on(events.REQUEST, ({ payload }) => this.requests.push(payload)),
       consumer.on(events.FETCH, ({ payload }) => this.onFetch(member, payload)),
@@ -760,6 +1064,193 @@ class LockCase {
     await bounded(scope, 10000, () => consumer.connect())
     await bounded(scope, 10000, () => consumer.subscribe({ topics: [this.topic] }))
     await bounded(scope, 15000, () => consumer.run({ eachMessage: this.handler(label, scope) }))
+  }
+
+  /** @returns {void} Observes validated parallel acquisition counts and once-only ticket ownership. */
+  watchExpiryAcquisitions() {
+    const owner = this
+    const adopt = ShareFetchLoop.prototype.adopt
+    ShareFetchLoop.prototype.adopt = function (...args) {
+      const cohort = adopt.apply(this, args)
+      if (this.groupId === owner.group && cohort.walk.deliver.records.length) {
+        const { records, deliveryCounts } = cohort.walk.deliver
+        if (!deliveryCounts || deliveryCounts.length !== records.length) {
+          throw new Error('Acquisition delivery counts must match records')
+        }
+        const counts = Array.from(deliveryCounts)
+        if (counts.some((count) => !Number.isInteger(count) || count < 1 || count > 32767)) {
+          throw new Error('Acquisition delivery counts must be integers in 1–32767')
+        }
+        const [exchange, topicId, partition, lockDuration] = args
+        const member = [...owner.members.values()].find(
+          ({ memberId }) => memberId === this.memberId
+        )?.label
+        const acquisition = {
+          id: owner.acquisitions.length + 1,
+          member,
+          group: this.groupId,
+          memberId: this.memberId,
+          topicId,
+          partition: partition.partitionIndex,
+          sentAt: exchange.sentAt,
+          deadline: exchange.sentAt + lockDuration,
+          lockDuration,
+          identities: records.map((message) =>
+            shareRecordIdentity({
+              ...message,
+              topic: cohort.topic,
+              partition: cohort.partition,
+            })
+          ),
+          counts,
+          request: JSON.parse(JSON.stringify(exchange.fields)),
+          acquiredRecords: partition.acquiredRecords,
+          errorCode: partition.errorCode,
+        }
+        owner.acquisitions.push(acquisition)
+        owner.ledgerAcquisitions.set(cohort.ledger, acquisition)
+      }
+      return cohort
+    }
+    const prepare = ShareAckLedger.prototype.prepare
+    ShareAckLedger.prototype.prepare = function (...args) {
+      const result = prepare.apply(this, args)
+      const acquisition = owner.ledgerAcquisitions.get(this)
+      if (acquisition && result.ticket) {
+        const fact = {
+          id: owner.tickets.length + 1,
+          acquisition: acquisition.id,
+          member: acquisition.member,
+          preparedAt: performance.now(),
+          isRenewAck: result.ticket.isRenewAck,
+          batches: result.ticket.acknowledgementBatches,
+        }
+        owner.tickets.push(fact)
+        owner.ticketFacts.set(result.ticket, fact)
+      }
+      return result
+    }
+    const settle = ShareAckLedger.prototype.settle
+    ShareAckLedger.prototype.settle = function (ticket, ...args) {
+      const result = settle.call(this, ticket, ...args)
+      const fact = owner.ticketFacts.get(ticket)
+      if (fact) {
+        fact.settlements = (fact.settlements ?? 0) + 1
+        fact.settledAt = performance.now()
+        fact.results = result.map(({ error, ...fields }) => ({
+          ...fields,
+          error: describeError(error),
+        }))
+      }
+      return result
+    }
+    this.gauge.restores.push(() => {
+      ShareFetchLoop.prototype.adopt = adopt
+      ShareAckLedger.prototype.prepare = prepare
+      ShareAckLedger.prototype.settle = settle
+    })
+  }
+
+  /** @returns {object} Complete JSON-safe expiry observations for independent replay. */
+  expiryProof() {
+    return {
+      group: this.group,
+      topic: this.topic,
+      topicId: this.topicId,
+      members: Object.fromEntries(
+        [...this.members.values()].map(({ label, memberId }) => [label, memberId])
+      ),
+      acquisitions: this.acquisitions,
+      entries: this.entries,
+      tickets: this.tickets,
+      gateOpenedAt: this.expiryGate?.openedAt,
+      renewals: this.expiryRenewals,
+      wire: this.tap.acknowledgements.snapshot(),
+      results: [...this.members.values()].flatMap(({ label, acks }) =>
+        acks.map(({ error, ...fields }) => ({
+          ...fields,
+          member: label,
+          error: describeError(error),
+        }))
+      ),
+    }
+  }
+
+  /** @returns {void} Records the original acquisition and its conservative expiry boundary. */
+  watchGateAcquisition() {
+    const owner = this
+    const original = ShareFetchLoop.prototype.adopt
+    ShareFetchLoop.prototype.adopt = function (...args) {
+      const cohort = original.apply(this, args)
+      if (
+        this.groupId === owner.group &&
+        this.memberId === owner.members.get('A')?.memberId &&
+        cohort.walk.deliver.records.length > 0
+      ) {
+        const [exchange, , , lockDuration] = args
+        owner.gateAcquisitions.push({
+          cohort,
+          sentAt: exchange.sentAt,
+          lockDuration,
+          deadline: exchange.sentAt + lockDuration,
+          identities: cohort.walk.deliver.records.map((message) =>
+            shareRecordIdentity({ ...message, topic: cohort.topic, partition: cohort.partition })
+          ),
+        })
+      }
+      return cohort
+    }
+    this.gauge.restores.push(() => {
+      ShareFetchLoop.prototype.adopt = original
+    })
+  }
+
+  /**
+   * Freezes original invocation intervals at the first callback crossing acquisition expiry.
+   * Handler entry/return times preserve the exact boundary even if the event loop resumes later.
+   * @returns {void}
+   */
+  freezeGateExpiry() {
+    const acquisition = this.gateAcquisitions[0]
+    if (this.gateExpiry || !acquisition || performance.now() < acquisition.deadline) return
+    const { deadline, identities, sentAt, lockDuration } = acquisition
+    const own = this.entriesOf('A').filter(({ at }) => at <= deadline)
+    const processed = own.map(({ identity }) => identity)
+    const active = own.filter(({ returnedAt }) => returnedAt === null || returnedAt > deadline)
+    this.gateExpiry = Object.freeze({
+      capturedAt: performance.now(),
+      deadline,
+      sentAt,
+      lockDuration,
+      processed: Object.freeze(processed),
+      dropped: Object.freeze(identities.filter((identity) => !processed.includes(identity))),
+      inFlight: Object.freeze(
+        active.map(({ invocation, identity, at }) => Object.freeze({ invocation, identity, at }))
+      ),
+      expected: Object.freeze(
+        [null, ...active.map(({ identity }) => identity)].map((duplicate) =>
+          Object.freeze(
+            identities.map((identity) => Object.freeze([identity, identity === duplicate ? 2 : 1]))
+          )
+        )
+      ),
+    })
+    this.row('held-set', { expiry: this.gateExpiry })
+  }
+
+  /**
+   * @returns {Map<string, number>} The sole matching multiset declared by the original expiry set.
+   * @throws {Error} For any replay or omission outside those predeclared alternatives.
+   */
+  gateExpectation() {
+    const actual = tally(this.entries.map(({ identity }) => identity))
+    const matching = this.gateExpiry.expected
+      .map((entries) => new Map(entries))
+      .filter((expected) =>
+        Object.values(multisetProblems(expected, actual)).every((problems) => problems.length === 0)
+      )
+    expect(matching).toHaveLength(1)
+    return matching[0]
   }
 
   /**
@@ -801,28 +1292,37 @@ class LockCase {
    */
   async handle(label, payload, scope) {
     const { topic, partition, message } = payload
+    this.freezeGateExpiry()
     const entry = {
+      invocation: this.entries.length + 1,
       member: label,
       identity: shareRecordIdentity({ ...message, topic, partition }),
       deliveryCount: message.deliveryCount,
       at: performance.now(),
       returnedAt: null,
       handled: false,
+      ...(this.kind === 'expire' && {
+        acquisition: this.acquisitions.find(
+          (row) =>
+            row.member === label &&
+            row.identities.includes(shareRecordIdentity({ ...message, topic, partition })) &&
+            row.counts.includes(message.deliveryCount)
+        )?.id,
+      }),
     }
     this.entries.push(entry)
-    this.openHandlers++
     try {
       await this.behave(entry, payload, scope)
       entry.handled = true
     } finally {
       entry.returnedAt = performance.now()
-      this.openHandlers--
+      this.freezeGateExpiry()
     }
   }
 
   /**
-   * The scenario's fixed handler behaviour. Member B accepts at once; member A holds, renews or
-   * works as its scenario prescribes, on a schedule counted from its own first handler start.
+   * The scenario's fixed handler behaviour. B holds and renews during controlled expiry; other
+   * B invocations accept at once. A follows the schedule from its original handler start.
    * @param {object} entry the recorded entry of this invocation
    * @param {object} payload the eachMessage payload
    * @param {AbortSignal} scope the case scope
@@ -830,6 +1330,46 @@ class LockCase {
    */
   async behave(entry, payload, scope) {
     if (entry.member === 'B') {
+      if (this.kind === 'expire') {
+        let next = entry.at + 1500
+        while (!this.expiryGate.openedAt) {
+          const opened = await bounded(
+            scope,
+            Infinity,
+            () =>
+              new Promise((resolve) => {
+                const timer = setTimeout(
+                  () => resolve(false),
+                  Math.max(0, next - performance.now())
+                )
+                this.expiryGate.promise.then(() => {
+                  clearTimeout(timer)
+                  resolve(true)
+                })
+              })
+          )
+          if (opened) break
+          if (performance.now() < next) continue
+          const renewal = {
+            scheduledAt: next,
+            calledAt: performance.now(),
+            duration: null,
+            error: null,
+          }
+          this.expiryRenewals.push(renewal)
+          try {
+            renewal.duration = await payload.renew()
+            expect(renewal.duration).toBe(LOCK_MS)
+          } catch (error) {
+            renewal.error = describeError(error)
+            throw error
+          } finally {
+            renewal.completedAt = performance.now()
+          }
+          next += 1500
+        }
+      }
+      entry.decidedAt = performance.now()
       if (this.scenario.mode === 'explicit') payload.acknowledge('accept')
       return
     }
@@ -838,7 +1378,11 @@ class LockCase {
       return
     }
     this.gateB.release()
-    const wait = (until) => delay(scope, Math.max(0, entry.at + until - performance.now()))
+    const wait = async (until) => {
+      while (performance.now() < entry.at + until) {
+        await delay(scope, Math.max(1, entry.at + until - performance.now()))
+      }
+    }
     const settle = (promise) =>
       promise.then(
         (value) => ({ value }),
@@ -993,6 +1537,15 @@ class LockCase {
    * @returns {Promise<void>}
    */
   async expire(scope) {
+    let open
+    const promise = new Promise((resolve) => {
+      open = resolve
+    })
+    this.expiryGate = { promise, openedAt: null }
+    this.stack.add('release the expiry handler', () => {
+      this.expiryGate.openedAt ??= performance.now()
+      open()
+    })
     await this.produce(scope)
     const first = await this.firstDelivery(scope)
     const second = await this.awaitRedelivery(scope)
@@ -1000,8 +1553,27 @@ class LockCase {
     expect(second.identity).toBe(first.identity)
     const a = this.members.get('A')
     await this.observe(scope, 'The late accept result', 15000, () => this.accepts(a).length > 0)
-    const [late] = this.accepts(a)
-    this.checkLateAccept(late)
+    await this.observe(
+      scope,
+      'The original B renewal schedule settling',
+      3000,
+      () =>
+        this.expiryRenewals.length > 0 &&
+        this.expiryRenewals.every(({ completedAt }) => completedAt !== undefined)
+    )
+    await this.tap.acknowledgements.join()
+    assertControlledExpiry(JSON.parse(JSON.stringify(this.expiryProof())), false)
+    this.expiryGate.openedAt = performance.now()
+    open()
+    await this.observe(
+      scope,
+      'B accepting after the late rejection',
+      5000,
+      () => this.accepts(this.members.get('B')).length > 0 && second.returnedAt !== null
+    )
+    await this.tap.acknowledgements.join()
+    assertControlledExpiry(JSON.parse(JSON.stringify(this.expiryProof())))
+    this.row('controlled-expiry', { proof: this.expiryProof() })
     expect(a.crashes).toEqual([])
     expect(a.consumer.assignment()).not.toEqual([])
     this.expectedHandled = new Map([[first.identity, 2]])
@@ -1095,27 +1667,36 @@ class LockCase {
     const a = this.members.get('A')
     const own = this.entriesOf('A')
     const second = this.entriesOf('B')
+    expect(this.gateAcquisitions).toHaveLength(1)
+    expect(this.gateAcquisitions[0].lockDuration).toBe(LOCK_MS)
+    expect([...this.gateAcquisitions[0].identities].sort()).toEqual([...this.expected].sort())
+    expect(this.gateExpiry).not.toBeNull()
+    const { processed: frozenProcessed, dropped, inFlight: frozenInvocations } = this.gateExpiry
+    const inFlight = frozenInvocations.map(({ identity }) => identity)
+    expect(inFlight.length).toBeLessThanOrEqual(1)
     const firstStart = own[0].at
     expect(own.filter(({ at }) => at > firstStart + LOCK_MS)).toEqual([])
     expect(own.every(({ deliveryCount }) => deliveryCount === 1)).toBe(true)
-    const processed = new Set(own.map(({ identity }) => identity))
+    const processed = new Set(frozenProcessed)
     expect(processed.size).toBe(own.length)
-    const dropped = this.expected.filter((identity) => !processed.has(identity))
+    expect([...processed].sort()).toEqual(own.map(({ identity }) => identity).sort())
+    expect([...processed, ...dropped].sort()).toEqual([...this.expected].sort())
     const received = tally(second.map(({ identity }) => identity))
     expect(second.every(({ deliveryCount }) => deliveryCount === 2)).toBe(true)
     expect([...received.values()].every((n) => n === 1)).toBe(true)
-    const inFlight = [...received.keys()].filter((identity) => processed.has(identity))
-    expect(inFlight.length).toBeLessThanOrEqual(1)
+    const duplicated = [...received.keys()].filter((identity) => processed.has(identity))
+    expect(duplicated.filter((identity) => !inFlight.includes(identity))).toEqual([])
+    expect(duplicated.length).toBeLessThanOrEqual(1)
     expect(dropped.filter((identity) => !received.has(identity))).toEqual([])
-    expect(received.size).toBe(dropped.length + inFlight.length)
-    this.expectedHandled = new Map(
-      this.expected.map((identity) => [identity, inFlight.includes(identity) ? 2 : 1])
-    )
+    expect(received.size).toBe(dropped.length + duplicated.length)
+    this.expectedHandled = this.gateExpectation()
     this.row('held-set', {
       acquiredAt: this.acquiredAt('A'),
       processed: [...processed],
       dropped,
       inFlight,
+      duplicated,
+      expiry: this.gateExpiry,
       firstStart,
     })
     const offsetOf = new Map(this.corpus.map(({ identity, offset }) => [identity, offset]))
@@ -1125,7 +1706,7 @@ class LockCase {
     expect(dropped.filter((identity) => !before.has(offsetOf.get(identity)))).toEqual([])
     expect([...processed].filter((identity) => before.has(offsetOf.get(identity)))).toEqual([])
     const accepted = () => a.acks.filter(({ type, error }) => type === 'accept' && error === null)
-    const lapse = this.acquiredAt('A') + LOCK_MS
+    const lapse = this.gateExpiry.deadline
     const lastReturn = Math.max(...own.map(({ returnedAt }) => returnedAt))
     expect(accepted().some(({ at }) => at < Math.min(lapse, lastReturn))).toBe(true)
     await this.observe(scope, 'Every finished record accepted', 15000, () => {
@@ -1387,6 +1968,8 @@ class LockCase {
     })
     this.broker = verified.position.rows
     this.quiet = verified
+    if (this.kind === 'expire')
+      assertControlledExpiry(JSON.parse(JSON.stringify(this.expiryProof())))
     const ends = await bounded(scope, 20000, () =>
       endOffsets({ brokers: plainTextBrokers(), topic: this.topic })
     )
@@ -1545,6 +2128,271 @@ class LockCase {
   }
 }
 
+describe('lock acquisition observation', () => {
+  let observer
+  let run
+  let node
+  let partition
+  let exchange
+  let handled
+  const topicId = '00112233-4455-6677-8899-aabbccddeeff'
+
+  beforeEach(() => {
+    handled = []
+    run = new ShareRun({
+      runner: {
+        subscription: ['records'],
+        options: {
+          groupId: 'group',
+          acknowledgementMode: 'implicit',
+          maxPollInterval: 30000,
+          logger: newLogger(),
+          cluster: { topicName: () => 'records', onRoutingChange: () => () => {} },
+        },
+      },
+      handler: ({ message }) => handled.push(message.deliveryCount),
+      batch: false,
+    })
+    node = {
+      issued: run.authorityToken,
+      session: new ShareSession({ operation: run.operation }),
+      keys: new Set([`${topicId}:0`]),
+      lockDuration: LOCK_MS,
+    }
+    node.loop = run.createLoop(node)
+    exchange = { open: node.session.token, sentAt: performance.now(), fields: { groupId: 'group' } }
+    partition = {
+      partitionIndex: 0,
+      errorCode: 0,
+      messages: [
+        { offset: '0', key: null, value: null },
+        { offset: '1', key: null, value: null },
+      ],
+      acquiredRecords: [
+        { firstOffset: '0', lastOffset: '0', deliveryCount: 1 },
+        { firstOffset: '1', lastOffset: '1', deliveryCount: 32767 },
+      ],
+    }
+    observer = new LockCase('expire')
+    observer.group = 'group'
+    observer.members.set('A', { label: 'A', memberId: run.membership.memberId })
+  })
+
+  afterEach(() => {
+    observer.gauge.uninstall()
+    jest.restoreAllMocks()
+    node.session.retire()
+    run.manager.shutdown()
+    run.poll.stop()
+    run.unrouted()
+  })
+
+  it('copies parallel counts before dispatch attaches them to the original records', async () => {
+    observer.watchExpiryAcquisitions()
+    expect(partition.messages.every((message) => !Object.hasOwn(message, 'deliveryCount'))).toBe(
+      true
+    )
+    const cohort = node.loop.adopt(exchange, topicId, partition, LOCK_MS)
+    expect(partition.messages.every((message) => !Object.hasOwn(message, 'deliveryCount'))).toBe(
+      true
+    )
+    expect(observer.acquisitions).toHaveLength(1)
+    const [acquisition] = observer.acquisitions
+    expect(acquisition.identities).toEqual([
+      '["records",0,"0",null,null]',
+      '["records",0,"1",null,null]',
+    ])
+    expect(Array.isArray(acquisition.counts)).toBe(true)
+    expect(acquisition.counts).toEqual([1, 32767])
+    await node.loop.dispatchCohorts([cohort])
+    expect(handled).toEqual([1, 32767])
+    cohort.walk.deliver.deliveryCounts.fill(2)
+    partition.messages.forEach((message) => (message.deliveryCount = 3))
+    expect(JSON.parse(JSON.stringify(acquisition)).counts).toEqual([1, 32767])
+  })
+
+  it.each([
+    ['missing', undefined],
+    ['short', new Uint16Array([1])],
+    ['extra', new Uint16Array([1, 2, 3])],
+    ['zero', [1, 0]],
+    ['over-limit', [1, 32768]],
+    ['fractional', [1, 1.5]],
+    ['non-number', [1, '2']],
+    ['NaN', [1, NaN]],
+  ])('rejects %s parallel counts at adoption', (name, deliveryCounts) => {
+    const adopt = ShareFetchLoop.prototype.adopt
+    jest.spyOn(ShareFetchLoop.prototype, 'adopt').mockImplementation(function (...args) {
+      const cohort = adopt.apply(this, args)
+      cohort.walk.deliver.deliveryCounts = deliveryCounts
+      return cohort
+    })
+    observer.watchExpiryAcquisitions()
+    expect(() => node.loop.adopt(exchange, topicId, partition, LOCK_MS)).toThrow(
+      'Acquisition delivery counts'
+    )
+    expect(observer.acquisitions).toEqual([])
+  })
+})
+
+describe('share gate expiry snapshot', () => {
+  /** @returns {LockCase} Original invocation intervals spanning a past acquisition deadline. */
+  const fixture = () => {
+    const run = new LockCase('gate')
+    const deadline = performance.now() - 100
+    run.row = () => {}
+    run.gateAcquisitions.push({
+      sentAt: deadline - LOCK_MS,
+      lockDuration: LOCK_MS,
+      deadline,
+      identities: ['completed', 'active', 'dropped'],
+    })
+    run.entries.push(
+      {
+        invocation: 1,
+        member: 'A',
+        identity: 'completed',
+        at: deadline - 400,
+        returnedAt: deadline - 200,
+      },
+      {
+        invocation: 2,
+        member: 'A',
+        identity: 'active',
+        at: deadline - 200,
+        returnedAt: deadline + 50,
+      }
+    )
+    run.freezeGateExpiry()
+    return run
+  }
+
+  it('freezes the active original at expiry even when the callback resumes after its return', () => {
+    const run = fixture()
+    const frozen = run.gateExpiry
+    expect(frozen.processed).toEqual(['completed', 'active'])
+    expect(frozen.dropped).toEqual(['dropped'])
+    expect(frozen.inFlight.map(({ invocation, identity }) => [invocation, identity])).toEqual([
+      [2, 'active'],
+    ])
+    run.entries.push({ member: 'B', identity: 'completed' })
+    run.freezeGateExpiry()
+    expect(run.gateExpiry).toBe(frozen)
+    expect(frozen.inFlight.map(({ identity }) => identity)).toEqual(['active'])
+  })
+
+  it.each([null, 'active'])('admits the predeclared optional replay %s', (duplicate) => {
+    const run = fixture()
+    run.entries.push({ member: 'B', identity: 'dropped' })
+    if (duplicate) run.entries.push({ member: 'B', identity: duplicate })
+    expect(run.gateExpectation().get('active')).toBe(duplicate ? 2 : 1)
+  })
+
+  it.each(['completed', 'foreign', 'third-delivery', 'missing-dropped'])(
+    'rejects %s without changing the frozen allowance',
+    (fault) => {
+      const run = fixture()
+      if (fault !== 'missing-dropped') run.entries.push({ member: 'B', identity: 'dropped' })
+      if (fault === 'third-delivery') {
+        run.entries.push({ member: 'B', identity: 'active' }, { member: 'B', identity: 'active' })
+      } else if (fault !== 'missing-dropped') {
+        run.entries.push({ member: 'B', identity: fault })
+      }
+      expect(() => run.gateExpectation()).toThrow()
+      expect(run.gateExpiry.inFlight.map(({ identity }) => identity)).toEqual(['active'])
+    }
+  )
+})
+
+describe('original share resource gauges', () => {
+  let gauge
+  let probe
+
+  beforeEach(() => {
+    gauge = new ResourceGauge()
+    gauge.install()
+    probe = gauge.probe({})
+  })
+
+  afterEach(() => gauge.uninstall())
+
+  it('detects a ledger entry after the application handler has returned', async () => {
+    const before = await probe.snapshot()
+    const ledger = new ShareAckLedger({
+      topic: 'resource-probe',
+      topicId: 'resource-probe-id',
+      partition: 0,
+      token: Symbol('original-acquisition'),
+      sentAt: 0,
+      lockDuration: 3000,
+      walk: {
+        deliver: { records: [{ offset: '0' }], deliveryCounts: [1] },
+        gaps: [],
+        release: [],
+        reject: [],
+      },
+    })
+    ledger.complete(['0'], 'accept')
+    expect((await probe.snapshot()).ledgerSize).toBe(before.ledgerSize + 1)
+    expect(await probe.snapshot()).not.toEqual(before)
+    ledger.invalidate('membership-lost')
+    expect(await probe.snapshot()).toEqual(before)
+  })
+
+  it.each([
+    ['pending', 0],
+    ['inflight', 1],
+  ])(
+    'detects an original %s request after its socket and queue are destroyed',
+    async (population, maxInFlightRequests) => {
+      const before = await probe.snapshot()
+      const socket = new net.Socket()
+      const queue = new RequestQueue({
+        maxInFlightRequests,
+        requestTimeout: 30000,
+        enforceRequestTimeout: false,
+        logger: { debug: () => {}, error: () => {} },
+        isConnected: () => !socket.destroyed,
+      })
+      try {
+        queue.push({
+          entry: { correlationId: 1, resolve: () => {}, reject: () => {} },
+          expectResponse: true,
+          sendRequest: () => {},
+        })
+        socket.destroy()
+        queue.destroy()
+        expect(population === 'pending' ? queue.pending.length : queue.inflight.size).toBe(1)
+        expect((await probe.snapshot()).queueDepth).toBe(before.queueDepth + 1)
+        expect(await probe.snapshot()).not.toEqual(before)
+        queue.settleAll(new Error('cleanup'))
+        expect(await probe.snapshot()).toEqual(before)
+      } finally {
+        socket.destroy()
+        queue.settleAll(new Error('cleanup'))
+        queue.destroy()
+      }
+    }
+  )
+
+  it('detects listeners on original client and destroyed queue emitters', async () => {
+    const before = await probe.snapshot()
+    const emitter = new InstrumentationEventEmitter()
+    const remove = emitter.addListener('client-listener', () => {})
+    expect((await probe.snapshot()).listeners.clients).toBe(before.listeners.clients + 1)
+    expect(await probe.snapshot()).not.toEqual(before)
+    remove()
+    expect(await probe.snapshot()).toEqual(before)
+    const queue = new RequestQueue({})
+    queue.on('queue-listener', () => {})
+    queue.destroy()
+    expect((await probe.snapshot()).listeners.queues).toBe(before.listeners.queues + 1)
+    expect(await probe.snapshot()).not.toEqual(before)
+    queue.removeAllListeners()
+    expect(await probe.snapshot()).toEqual(before)
+  })
+})
+
 describe('share wire tap', () => {
   const frame = (apiKey, payload) => {
     const header = Buffer.alloc(11)
@@ -1634,5 +2482,232 @@ enabled('share record locks on a live group', () => {
   afterEach(() => {
     if (!liveRun.takeAdmission()) return
     liveRun.assertClean()
+  })
+})
+
+describe('scripted controlled expiry evidence', () => {
+  /** @returns {object} Labelled observations; no broker state is simulated. */
+  const proof = () => {
+    const group = 'scripted-group'
+    const topic = 'scripted-topic'
+    const topicId = '12345678-1234-1234-1234-123456789abc'
+    const identity = JSON.stringify([topic, 0, '0', 'key', 'value'])
+    const error = {
+      name: 'KafkaJSShareAcknowledgementError',
+      reason: 'rejected-by-broker',
+      cause: { code: 121 },
+    }
+    const entries = [
+      { member: 'A', identity, acquisition: 1, deliveryCount: 1, at: 100, decidedAt: 6100 },
+      { member: 'B', identity, acquisition: 2, deliveryCount: 2, at: 3100, decidedAt: 6140 },
+    ]
+    const results = []
+    const tickets = []
+    const wire = []
+    /** @param {string} label Owner. @param {boolean} renew Renewal flag. @param {number} at Original write. @param {number} code Ack code. @returns {void} Appends one complete exchange. */
+    const add = (label, renew, at, code) => {
+      const type = renew ? 'renew' : 'accept'
+      const batches = [{ firstOffset: '0', lastOffset: '0', acknowledgeTypes: [renew ? 4 : 1] }]
+      wire.push({
+        label,
+        apiKey: 79,
+        apiVersion: 2,
+        socket: label === 'A' ? 1 : 2,
+        correlationId: wire.length,
+        groupId: group,
+        memberId: label,
+        isRenewAck: renew,
+        at,
+        topics: [{ topicId, partitions: [{ partitionIndex: 0, acknowledgementBatches: batches }] }],
+        response: {
+          errorCode: 0,
+          at: at + 10,
+          topics: [{ topicId, partitions: [{ partitionIndex: 0, errorCode: code }] }],
+        },
+      })
+      results.push({
+        member: label,
+        topic,
+        partition: 0,
+        firstOffset: '0',
+        lastOffset: '0',
+        type,
+        at: at + 20,
+        error: code ? error : null,
+      })
+      tickets.push({
+        id: tickets.length + 1,
+        member: label,
+        acquisition: label === 'A' ? 1 : 2,
+        isRenewAck: renew,
+        batches,
+        preparedAt: at - 1,
+        settledAt: at + 15,
+        settlements: 1,
+        results: [{ firstOffset: '0', lastOffset: '0', type, error: code ? error : null }],
+      })
+    }
+    add('B', true, 4601, 0)
+    add('B', true, 6101, 0)
+    add('A', false, 6102, 121)
+    add('B', false, 6141, 0)
+    return {
+      source: 'scripted',
+      group,
+      topic,
+      topicId,
+      members: { A: 'A', B: 'B' },
+      entries,
+      acquisitions: entries.map((entry, index) => ({
+        id: index + 1,
+        member: entry.member,
+        group,
+        topicId,
+        partition: 0,
+        sentAt: index ? 3000 : 0,
+        lockDuration: LOCK_MS,
+        deadline: (index ? 3000 : 0) + LOCK_MS,
+        identities: [identity],
+        counts: [index + 1],
+      })),
+      results,
+      tickets,
+      wire,
+      gateOpenedAt: 6130,
+      renewals: [4600, 6100].map((calledAt) => ({
+        calledAt,
+        completedAt: calledAt + 25,
+        duration: 3000,
+        error: null,
+      })),
+    }
+  }
+
+  it.each(['4.3.1', '4.4.0'])('requires the same controlled121 sequence for %s', (version) => {
+    assertControlledExpiry(JSON.parse(JSON.stringify({ ...proof(), version })))
+  })
+
+  it.each([
+    [
+      'successful skip after prior B Accept',
+      (row) => {
+        row.wire[2].response.topics[0].partitions[0].errorCode = 0
+        row.results[2].error = null
+        row.tickets[2].results[0].error = null
+        row.entries[1].decidedAt = 6000
+        row.gateOpenedAt = 5999
+        row.wire[3].at = 6001
+        row.wire[3].response.at = 6011
+        row.results[3].at = 6021
+        row.tickets[3].preparedAt = 6000
+        row.tickets[3].settledAt = 6016
+        row.diagnostic = 'success-after-prior-accept'
+      },
+    ],
+    [
+      'no wire write',
+      (row) => {
+        row.wire.splice(2, 1)
+      },
+    ],
+    [
+      'foreign owner',
+      (row) => {
+        row.wire[2].memberId = 'foreign'
+      },
+    ],
+    [
+      'foreign group',
+      (row) => {
+        row.wire[2].groupId = 'foreign'
+      },
+    ],
+    [
+      'foreign UUID',
+      (row) => {
+        row.wire[2].topics[0].topicId = 'foreign'
+      },
+    ],
+    [
+      'foreign ticket',
+      (row) => {
+        row.tickets[2].acquisition = 2
+      },
+    ],
+    [
+      'fetch121 with ack0',
+      (row) => {
+        row.wire[2].apiKey = 78
+        row.wire[2].response.topics[0].partitions[0] = {
+          partitionIndex: 0,
+          errorCode: 121,
+          acknowledgeErrorCode: 0,
+        }
+      },
+    ],
+    [
+      'group error',
+      (row) => {
+        row.wire[2].response.errorCode = 121
+      },
+    ],
+    [
+      'wrong typed reason',
+      (row) => {
+        row.results[2].error.reason = 'unacknowledged'
+      },
+    ],
+    [
+      'wrong cause',
+      (row) => {
+        row.results[2].error.cause.code = 122
+      },
+    ],
+    [
+      'duplicate outcome',
+      (row) => {
+        row.results.push(row.results[2])
+      },
+    ],
+    [
+      'duplicate settlement',
+      (row) => {
+        row.tickets[2].settlements = 2
+      },
+    ],
+    [
+      'B decides before A verdict',
+      (row) => {
+        row.entries[1].decidedAt = 6100
+      },
+    ],
+    [
+      'failed renewal',
+      (row) => {
+        row.renewals[0].error = { code: 121 }
+      },
+    ],
+    [
+      'missing renewal',
+      (row) => {
+        row.renewals = []
+      },
+    ],
+    [
+      'missing B settlement',
+      (row) => {
+        row.tickets.pop()
+      },
+    ],
+    [
+      'third delivery',
+      (row) => {
+        row.entries.push({ ...row.entries[1], deliveryCount: 3 })
+      },
+    ],
+  ])('rejects %s', (_label, mutate) => {
+    const input = JSON.parse(JSON.stringify(proof()))
+    mutate(input)
+    expect(() => assertControlledExpiry(input)).toThrow()
   })
 })

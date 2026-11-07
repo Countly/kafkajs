@@ -1,3 +1,7 @@
+const createAdmin = require('../../../admin')
+const { createScriptedCluster } = require('../../../../testHelpers/scriptedCluster')
+const deleteOffsetsResponse = require('../../../protocol/requests/deleteShareGroupOffsets/v0/response')
+const { ShareDecoder } = require('../../../protocol/requests/shareFetch/codec')
 const {
   acknowledgementResults,
   awaitTerminalSharePosition,
@@ -23,6 +27,8 @@ const {
   secureRandom,
   writeEvidence,
   wireVersionsOf,
+  readRequestHeader,
+  newLogger,
 } = require('testHelpers')
 const { readLog, endOffsets } = require('../../../../testHelpers/rawLog')
 const { createResourceProbe } = require('../../../../testHelpers/resourceProbe')
@@ -268,6 +274,182 @@ class LegacyDescriptionCapture {
   }
 }
 
+/** Captures original API92 frames and same-socket responses without classifying errors. */
+class OffsetDeletionTrace {
+  /** Starts with no exchanges. */
+  constructor() {
+    this.frames = []
+    this.sockets = 0
+  }
+
+  /** @returns {Function} Call-through socket factory. */
+  factory() {
+    const create = defaultSocketFactory()
+    return (options) => {
+      const socket = create(options)
+      const ordinal = ++this.sockets
+      const pending = new Map()
+      const carry = { request: Buffer.alloc(0), response: Buffer.alloc(0) }
+      /** @param {string} direction Stream direction. @param {Buffer} chunk Original bytes. @returns {Buffer[]} Complete frames. */
+      const split = (direction, chunk) => {
+        let bytes = Buffer.concat([carry[direction], chunk])
+        const frames = []
+        while (bytes.length >= 4 && bytes.length >= bytes.readInt32BE(0) + 4) {
+          const size = bytes.readInt32BE(0) + 4
+          if (size < 4) throw new Error('Invalid deletion frame size')
+          frames.push(Buffer.from(bytes.subarray(0, size)))
+          bytes = bytes.subarray(size)
+        }
+        carry[direction] = bytes
+        return frames
+      }
+      const write = socket.write.bind(socket)
+      socket.write = (chunk, ...rest) => {
+        for (const bytes of split('request', Buffer.from(chunk))) {
+          const header = readRequestHeader(bytes)
+          if (header.apiKey !== 92) continue
+          const decoder = new ShareDecoder(bytes.subarray(header.byteLength))
+          const groupId = decoder.readCompactString()
+          const topics = decoder.readCompactArray((row) => {
+            const topicName = row.readCompactString()
+            row.readTaggedFields()
+            return { topicName }
+          })
+          decoder.readTaggedFields()
+          decoder.finish()
+          const fact = {
+            ...header,
+            socket: ordinal,
+            groupId,
+            topics,
+            requestHex: bytes.toString('hex'),
+            at: performance.now(),
+          }
+          this.frames.push(fact)
+          pending.set(header.correlationId, fact)
+        }
+        return write(chunk, ...rest)
+      }
+      socket.on('data', (chunk) => {
+        for (const bytes of split('response', chunk)) {
+          const fact = pending.get(bytes.readInt32BE(4))
+          if (!fact) continue
+          pending.delete(fact.correlationId)
+          fact.responseHex = bytes.toString('hex')
+          fact.receivedAt = performance.now()
+          fact.decoding = Promise.resolve()
+            .then(() => {
+              if (bytes[8] !== 0) throw new Error('Unexpected deletion response header tags')
+              return deleteOffsetsResponse.decode(bytes.subarray(9))
+            })
+            .then((response) => {
+              fact.response = response
+            })
+          fact.decoding.catch((error) => {
+            fact.decodeError = serializeError(error)
+          })
+        }
+      })
+      return socket
+    }
+  }
+
+  /** @param {number} start Original frame cursor. @returns {Promise<object[]>} Portable exchanges. */
+  async since(start) {
+    const frames = this.frames.slice(start)
+    await Promise.all(frames.map(({ decoding }) => decoding))
+    return serialize(frames.map(({ decoding: _decoding, ...fact }) => fact))
+  }
+}
+
+/**
+ * Requires the active member's original description and API92 group-level refusal.
+ * @param {object} evidence Original request, response, description and public outcome.
+ * @returns {void} Throws if any layer is missing or belongs to another operation.
+ */
+const assertActiveDeletionRefusal = ({
+  groupId,
+  topic,
+  topicId,
+  memberId,
+  described,
+  frames,
+  outcome,
+}) => {
+  expect(described).toMatchObject({ groupId, errorCode: 0, state: 'Stable' })
+  expect(described.members).toHaveLength(1)
+  expect(described.members[0]).toMatchObject({ memberId, subscribedTopics: [topic] })
+  expect(described.members[0].assignment).toEqual([
+    expect.objectContaining({ topic, topicId, partitions: [0] }),
+  ])
+  expect(frames).toHaveLength(1)
+  expect(frames[0]).toMatchObject({
+    apiKey: 92,
+    apiVersion: 0,
+    groupId,
+    topics: [{ topicName: topic }],
+    response: { errorCode: NON_EMPTY_GROUP, responses: [] },
+  })
+  expect(Number.isInteger(frames[0].socket)).toBe(true)
+  expect(Number.isInteger(frames[0].correlationId)).toBe(true)
+  expect(frames[0].receivedAt).toBeGreaterThanOrEqual(frames[0].at)
+  expect(frames[0].requestHex).toEqual(expect.any(String))
+  expect(frames[0].responseHex).toEqual(expect.any(String))
+  expect(frames[0].decodeError).toBeUndefined()
+  expect(outcome).toMatchObject({
+    kind: 'throw',
+    error: {
+      name: 'KafkaJSProtocolError',
+      type: 'NON_EMPTY_GROUP',
+      code: NON_EMPTY_GROUP,
+      message: expect.any(String),
+    },
+  })
+  expect(outcome.error.groups).toBeUndefined()
+}
+
+/**
+ * Requires initialized matching topic state to be deleted only from the empty group.
+ * @param {object} evidence Empty description, initialized UUID, deletion and both post-listings.
+ * @returns {void} Throws for missing results or retained known offsets.
+ */
+const assertEmptyDeletion = ({
+  groupId,
+  topic,
+  topicId,
+  described,
+  initialized,
+  frames,
+  results,
+  all,
+  named,
+}) => {
+  expect(described).toMatchObject({ groupId, errorCode: 0, state: 'Empty', members: [] })
+  const matching = initialized.filter((row) => row.topic === topic && row.topicId === topicId)
+  expect(matching).toHaveLength(1)
+  expect(matching[0].partitions).toHaveLength(1)
+  expect(matching[0].partitions[0]).toMatchObject({ partition: 0, errorCode: 0, lag: '0' })
+  expect(matching[0].partitions[0].startOffset).toMatch(/^(0|[1-9][0-9]*)$/)
+  expect(frames).toHaveLength(1)
+  expect(frames[0]).toMatchObject({
+    apiKey: 92,
+    apiVersion: 0,
+    groupId,
+    topics: [{ topicName: topic }],
+    response: { errorCode: 0, responses: [{ topicName: topic, topicId, errorCode: 0 }] },
+  })
+  expect(results).toEqual([{ topic, topicId, errorCode: 0 }])
+  expect(all.some((row) => row.topic === topic)).toBe(false)
+  expect(
+    named.some((row) =>
+      row.partitions.some(
+        ({ errorCode, startOffset }) =>
+          errorCode === 0 && startOffset === matching[0].partitions[0].startOffset
+      )
+    )
+  ).toBe(false)
+}
+
 /**
  * Counts the sockets a client opens and closes, for the resource probe.
  */
@@ -459,6 +641,7 @@ class AdminCase {
     this.listeners = new ListenerCounter()
     this.ledgers = new LedgerWatch()
     this.sockets = new SocketCounter()
+    this.deletions = new OffsetDeletionTrace()
     this.groups = {
       share: `e2e-p9e-admin-share-${this.id}`,
       legacy: `e2e-p9e-admin-legacy-${this.id}`,
@@ -576,7 +759,11 @@ class AdminCase {
     liveRun.assertClean()
     this.baseline = await captureShareCleanupBaseline(this.probe, { signal: scope })
     const common = { brokers: plainTextBrokers(), logLevel: logLevel.NOTHING, retry: { factor: 0 } }
-    this.adminKafka = new Kafka({ ...common, clientId: `e2e-p9e-admin-${this.id}` })
+    this.adminKafka = new Kafka({
+      ...common,
+      clientId: `e2e-p9e-admin-${this.id}`,
+      socketFactory: this.deletions.factory(),
+    })
     this.kafka = new Kafka({
       ...common,
       clientId: `e2e-p9e-admin-clients-${this.id}`,
@@ -1025,6 +1212,7 @@ class AdminCase {
     )
     const mask = masked.groups[0].authorizedOperations
     expect(mask === null || Number.isInteger(mask)).toBe(true)
+    this.activeDescription = serialize(described)
     this.note('assignment', {
       stage: 'describe-with-member',
       described: serialize(described),
@@ -1060,6 +1248,7 @@ class AdminCase {
     )
     this.note('fault', { stage: 'alter-with-member', group: GROUP_ALIAS, outcome: alterRefusal })
 
+    const cursor = this.deletions.frames.length
     const subscribed = await outcomeOf(() =>
       bounded(scope, STEP_MS, () =>
         this.admin.deleteShareGroupOffsets({
@@ -1069,15 +1258,18 @@ class AdminCase {
         })
       )
     )
-    expect(subscribed).toMatchObject({
-      kind: 'throw',
-      error: { name: 'KafkaJSProtocolError', type: 'NON_EMPTY_GROUP', code: NON_EMPTY_GROUP },
-    })
-    this.note('fault', {
-      stage: 'delete-offsets-subscribed',
+    const evidence = {
+      groupId: group,
+      topic,
       memberId: this.share.memberId,
+      topicId: this.activeDescription.members[0].assignment[0].topicId,
+      described: this.activeDescription,
+      frames: await this.deletions.since(cursor),
       outcome: subscribed,
-    })
+    }
+    assertActiveDeletionRefusal(JSON.parse(JSON.stringify(evidence)))
+    this.oracles.activeDeletion = evidence
+    this.note('fault', { stage: 'delete-offsets-subscribed', ...evidence })
 
     let refusal
     try {
@@ -1102,6 +1294,7 @@ class AdminCase {
     expect(groups.map(({ groupId }) => groupId)).toContain(group)
     expect(this.share.crashes).toEqual([])
     expect(this.share.assigned()).toEqual([{ topic, partitions: [0] }])
+    await this.describeAndList(scope)
   }
 
   /**
@@ -1134,6 +1327,9 @@ class AdminCase {
     this.oracles.quiet = quiet
     this.oracles.acknowledgements = this.acknowledgements.evidence(group)
     await this.untilEmpty(scope, group)
+    const described = await this.untilEmpty(scope, group)
+    const initialized = await this.listOffsets(scope, group)
+    const cursor = this.deletions.frames.length
     const removed = await bounded(scope, STEP_MS, () =>
       this.admin.deleteShareGroupOffsets({
         groupId: group,
@@ -1147,17 +1343,20 @@ class AdminCase {
     const all = await this.listOffsets(scope, group)
     expect(all.map(({ topic: name }) => name)).not.toContain(topic)
     const named = await this.listOffsets(scope, group, [{ topic, partitions: [0] }])
-    const claimsOld = named.some(({ partitions }) =>
-      partitions.some(
-        ({ errorCode, startOffset }) => errorCode === 0 && startOffset === String(RECORDS)
-      )
-    )
-    expect(claimsOld).toBe(false)
-    this.note('acknowledgement', {
-      stage: 'delete-offsets-empty',
+    const evidence = {
+      groupId: group,
+      topic,
+      topicId: this.activeDescription.members[0].assignment[0].topicId,
+      described,
+      initialized,
+      frames: await this.deletions.since(cursor),
       results: serialize(removed),
-      namedAfterDelete: serialize(named),
-    })
+      all: serialize(all),
+      named: serialize(named),
+    }
+    assertEmptyDeletion(JSON.parse(JSON.stringify(evidence)))
+    this.oracles.emptyDeletion = evidence
+    this.note('acknowledgement', { stage: 'delete-offsets-empty', ...evidence })
 
     const deleted = await bounded(scope, STEP_MS, () => this.admin.deleteGroups([group]))
     expect(deleted.map(({ groupId, errorCode }) => ({ groupId, errorCode }))).toEqual([
@@ -1175,10 +1374,11 @@ class AdminCase {
   /**
    * @param {AbortSignal} scope
    * @param {string} group
-   * @returns {Promise<void>} once the dedicated describe lists no member
+   * @returns {Promise<object>} the original empty dedicated description
    */
-  untilEmpty(scope, group) {
-    return pollUntil(
+  async untilEmpty(scope, group) {
+    let empty
+    await pollUntil(
       scope,
       STEP_MS,
       async () => {
@@ -1189,10 +1389,13 @@ class AdminCase {
         expect(groups).toHaveLength(1)
         expect(described.groupId).toBe(group)
         expect(described.errorCode).toBe(0)
-        return described.state === 'Empty' && described.members.length === 0
+        if (described.state !== 'Empty' || described.members.length !== 0) return false
+        empty = serialize(described)
+        return true
       },
       { delayMs: 200, label: 'The empty share group' }
     )
+    return empty
   }
 
   /**
@@ -1476,5 +1679,193 @@ describe('Share consumer > administration capture helpers', () => {
     expect(listeners.eventNames()).toEqual(['a'])
     expect(listeners.listenerCount('a')).toBe(1)
     expect(listeners.listenerCount('b')).toBe(0)
+  })
+})
+
+describe('scripted administration refusal layers', () => {
+  const groupId = 'scripted-group'
+  const topic = 'scripted-topic'
+  const topicId = '12345678-1234-1234-1234-123456789abc'
+  /** @returns {object} Labelled input for the same live predicate. */
+  const evidence = () => ({
+    source: 'scripted',
+    groupId,
+    topic,
+    topicId,
+    memberId: 'member',
+    described: {
+      groupId,
+      errorCode: 0,
+      state: 'Stable',
+      members: [
+        {
+          memberId: 'member',
+          subscribedTopics: [topic],
+          assignment: [{ topic, topicId, partitions: [0] }],
+        },
+      ],
+    },
+    frames: [
+      {
+        apiKey: 92,
+        apiVersion: 0,
+        socket: 1,
+        correlationId: 1,
+        groupId,
+        topics: [{ topicName: topic }],
+        at: 1,
+        receivedAt: 2,
+        requestHex: 'scripted',
+        responseHex: 'scripted',
+        response: { errorCode: 68, errorMessage: 'scripted refusal', responses: [] },
+      },
+    ],
+    outcome: {
+      kind: 'throw',
+      error: {
+        name: 'KafkaJSProtocolError',
+        code: 68,
+        type: 'NON_EMPTY_GROUP',
+        message: 'scripted refusal',
+      },
+    },
+  })
+
+  it.each([68, 86])(
+    'preserves scripted topic %i as public data but rejects it for active membership',
+    async (code) => {
+      const scripted = createScriptedCluster({
+        nodes: [{ id: 0, host: 'node0', port: 9092 }],
+        profile: 'share',
+      })
+      scripted.answer('DeleteShareGroupOffsets', () => ({
+        throttleTimeMs: 0,
+        errorCode: 0,
+        errorMessage: null,
+        responses: [{ topicName: topic, topicId, errorCode: code, errorMessage: null }],
+      }))
+      const admin = new Kafka(scripted.kafkaOptions({ retry: { retries: 0 } })).admin()
+      try {
+        await admin.connect()
+        const outcome = await outcomeOf(() =>
+          admin.deleteShareGroupOffsets({ groupId, topics: [topic] })
+        )
+        expect(outcome).toMatchObject({
+          kind: 'return',
+          value: [{ topic, topicId, errorCode: code }],
+        })
+        const input = evidence()
+        input.frames[0].response = {
+          errorCode: 0,
+          responses: [{ topicName: topic, topicId, errorCode: code }],
+        }
+        input.outcome = outcome
+        expect(() => assertActiveDeletionRefusal(JSON.parse(JSON.stringify(input)))).toThrow()
+      } finally {
+        await admin.disconnect()
+        scripted.assertClean()
+      }
+    }
+  )
+
+  it('throws the supplied API92 group error through the real public client', async () => {
+    const scripted = createScriptedCluster({
+      nodes: [{ id: 0, host: 'node0', port: 9092 }],
+      profile: 'share',
+    })
+    scripted.answer('DeleteShareGroupOffsets', () => ({
+      throttleTimeMs: 0,
+      errorCode: 68,
+      errorMessage: 'scripted refusal',
+      responses: [],
+    }))
+    const admin = new Kafka(scripted.kafkaOptions({ retry: { retries: 0 } })).admin()
+    try {
+      await admin.connect()
+      const pending = outcomeOf(() => admin.deleteShareGroupOffsets({ groupId, topics: [topic] }))
+      const input = evidence()
+      input.outcome = await pending
+      const actual = scripted.requests().filter(({ apiKey }) => apiKey === 92)
+      expect(actual).toHaveLength(1)
+      expect(actual[0]).toMatchObject({
+        apiKey: 92,
+        version: 0,
+        fields: { groupId, topics: [{ topicName: topic }] },
+      })
+      Object.assign(input.frames[0], {
+        socket: actual[0].generation,
+        correlationId: actual[0].correlationId,
+        groupId: actual[0].fields.groupId,
+        topics: actual[0].fields.topics,
+      })
+      assertActiveDeletionRefusal(JSON.parse(JSON.stringify(input)))
+      input.outcome.error.name = 'KafkaJSDeleteGroupsError'
+      expect(() => assertActiveDeletionRefusal(JSON.parse(JSON.stringify(input)))).toThrow()
+    } finally {
+      await admin.disconnect()
+      scripted.assertClean()
+    }
+  })
+
+  it('keeps DeleteGroups item68 in its own aggregate', async () => {
+    const admin = createAdmin({
+      retry: { retries: 0 },
+      logger: newLogger(),
+      cluster: {
+        refreshMetadata: async () => {},
+        findGroupCoordinator: async () => ({
+          nodeId: 0,
+          deleteGroups: async () => ({ results: [{ groupId, errorCode: 68 }] }),
+        }),
+      },
+    })
+    const pending = outcomeOf(() => admin.deleteGroups([groupId]))
+    expect(await pending).toMatchObject({
+      kind: 'throw',
+      error: { name: 'KafkaJSDeleteGroupsError', groups: [{ groupId, errorCode: 68 }] },
+    })
+  })
+
+  it('requires empty matching initialized state, a topic result and post-deletion proof', () => {
+    const input = evidence()
+    input.described = { groupId, errorCode: 0, state: 'Empty', members: [] }
+    input.initialized = [
+      { topic, topicId, partitions: [{ partition: 0, errorCode: 0, lag: '0', startOffset: '20' }] },
+    ]
+    input.frames[0].response = {
+      errorCode: 0,
+      responses: [{ topicName: topic, topicId, errorCode: 0 }],
+    }
+    input.results = [{ topic, topicId, errorCode: 0 }]
+    input.all = []
+    input.named = [{ topic, partitions: [{ errorCode: 3, startOffset: '-1' }] }]
+    assertEmptyDeletion(JSON.parse(JSON.stringify(input)))
+    for (const mutate of [
+      (row) => {
+        row.described.state = 'Stable'
+      },
+      (row) => {
+        row.initialized[0].topicId = 'foreign'
+      },
+      (row) => {
+        row.frames[0].response.responses = []
+      },
+      (row) => {
+        row.results = []
+      },
+      (row) => {
+        row.results[0].topicId = 'foreign'
+      },
+      (row) => {
+        row.all = [{ topic }]
+      },
+      (row) => {
+        row.named[0].partitions = [{ errorCode: 0, startOffset: '20' }]
+      },
+    ]) {
+      const changed = JSON.parse(JSON.stringify(input))
+      mutate(changed)
+      expect(() => assertEmptyDeletion(changed)).toThrow()
+    }
   })
 })
