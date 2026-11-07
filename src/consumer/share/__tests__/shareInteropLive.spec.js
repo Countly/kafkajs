@@ -28,13 +28,20 @@ const shareAcknowledge = require('../../../../testHelpers/wire/shareAcknowledgeV
 const shareGroupHeartbeat = require('../../../../testHelpers/wire/shareGroupHeartbeatV1')
 const { readLog } = require('../../../../testHelpers/rawLog')
 const { createResourceProbe } = require('../../../../testHelpers/resourceProbe')
+const RequestQueue = require('../../../network/requestQueue')
+const InstrumentationEventEmitter = require('../../../instrumentation/emitter')
+const { ShareAckLedger } = require('../shareAckLedger')
+const { ShareFetchLoop } = require('../shareFetchLoop')
+const { ShareRun } = require('../shareRun')
 const {
   awaitTerminalSharePosition,
   assertQuietTerminalGroup,
   ShareAcknowledgementObserver,
 } = require('../../../../testHelpers/shareLiveDiagnostics')
 const {
+  CASE_JOIN_MS,
   NEVER,
+  STOP_GRACE_MS,
   bounded,
   caseTimeout,
   delay,
@@ -56,7 +63,10 @@ const RUN_SH = path.join(
   'javaConsumer',
   'run.sh'
 )
-const PROBE_MS = 60000
+const PROBE_MS = 30000
+const FILE_MS = 240000
+const CASE_MS = 60000
+const FINAL_MS = 10000
 
 /**
  * Builds the Java member once, at collection time, so a missing JDK, cache or class is decided
@@ -72,7 +82,7 @@ const preflight = () => {
   const probe = spawnSync(RUN_SH, ['--role', 'share-member', '--probe'], {
     env: { ...process.env, JAVA_E2E_WORK_DIR: workDir },
     encoding: 'utf8',
-    timeout: PROBE_MS,
+    timeout: fileAllowance(PROBE_MS, FINAL_MS + CASE_JOIN_MS),
   })
   const failed = (reason) => {
     if (owned) fs.rmSync(workDir, { recursive: true, force: true })
@@ -99,6 +109,7 @@ const preflight = () => {
 // (docker-compose.share.yml: session 6000 ms, heartbeat 1000 ms) and a JDK, and runs through the
 // share lane or the guarded live entry with SHARE_INTEROP_E2E=1.
 const GATED = process.env.SHARE_INTEROP_E2E === '1'
+const FILE_DEADLINE = GATED ? performance.now() + FILE_MS : Infinity
 const enabled = GATED ? describe : describe.skip
 
 const EVIDENCE = 'share-interop'
@@ -108,9 +119,9 @@ const TITLES = {
   leave: 'releases unstarted records to Java on a clean leave',
   halt: 'recovers the complete uncommitted Java poll after a halt',
 }
-const BODY_MS = { join: 70000, leave: 70000, halt: 80000 }
 const HOOK_MS = 10000
 const CLEANUP_MS = 15000
+const BODY_MS = CASE_MS - CLEANUP_MS - STOP_GRACE_MS
 const PARTITIONS = 4
 const RECORDS = 600
 const PER_PARTITION = RECORDS / PARTITIONS
@@ -133,6 +144,23 @@ const CLIENT_CONFIG = {
   acquireMode: 'record_limit',
   maxRecords: 100,
   maxWaitTimeInMs: 250,
+}
+
+/**
+ * Limits later phases to the original selection deadline, retaining their join/final reserves.
+ * @param {number} limit Maximum phase duration.
+ * @param {number} [reserve=0] Time reserved for later phases.
+ * @returns {number} Remaining allowance, never a fresh file budget.
+ * @throws {Error} When the selection has exhausted its allowance; later cases are refused.
+ */
+const fileAllowance = (limit, reserve = 0) => {
+  const remaining = Math.min(limit, FILE_DEADLINE - performance.now() - reserve)
+  if (remaining <= 0) {
+    const error = new Error('The interop file deadline has expired')
+    liveRun.taint(error)
+    throw error
+  }
+  return remaining
 }
 
 /**
@@ -258,8 +286,8 @@ class ShareWireTap {
    * Reads the closing requests a client wrote with the independent wire readers.
    * @param {number} from index of the first frame to consider
    * @param {string} label the client whose frames are read
-   * @returns {{ final: object|undefined, leave: object|undefined }} the first final acknowledgement
-   *   (share session epoch -1) and the first leave heartbeat (member epoch -1) it wrote since
+   * @returns {{ final: object|undefined, finals: object[], leave: object|undefined }} All finals,
+   *   the decision-bearing final (or first empty final), and the first leave heartbeat.
    */
   closing(from, label) {
     const read = (reader, key, field) =>
@@ -269,12 +297,21 @@ class ShareWireTap {
         .map((frame) => ({
           at: frame.at,
           apiVersion: frame.apiVersion,
-          [field]: reader.readRequest(frame.bytes.subarray(frame.headerBytes))[field],
+          socket: frame.socket,
+          correlationId: frame.correlationId,
+          ...reader.readRequest(frame.bytes.subarray(frame.headerBytes)),
         }))
-        .find((fact) => fact[field] === -1)
+        .filter((fact) => fact[field] === -1)
+    const finals = read(shareAcknowledge, 79, 'shareSessionEpoch')
+    const decisions = finals.filter(({ topics }) =>
+      topics.some(({ partitions }) =>
+        partitions.some(({ acknowledgementBatches }) => acknowledgementBatches.length)
+      )
+    )
     return {
-      final: read(shareAcknowledge, 79, 'shareSessionEpoch'),
-      leave: read(shareGroupHeartbeat, 76, 'memberEpoch'),
+      final: decisions[0] ?? finals[0],
+      finals,
+      leave: read(shareGroupHeartbeat, 76, 'memberEpoch')[0],
     }
   }
 }
@@ -632,6 +669,210 @@ class JavaShareMember {
   }
 }
 
+/** Observes original resource owners without changing method results or receiver identities. */
+class ResourceGauge {
+  /** Retains owners until after the cleanup comparison, including destroyed connections. */
+  constructor() {
+    this.ledgers = new Set()
+    this.queues = new Set()
+    this.emitters = new Set()
+    this.restores = []
+  }
+
+  /** @returns {void} Installs call-through observers before clients are constructed. */
+  install() {
+    this.watch(
+      ShareAckLedger.prototype,
+      [
+        'canStart',
+        'decide',
+        'complete',
+        'completeRange',
+        'dropExpired',
+        'needsFlush',
+        'prepare',
+        'settle',
+        'invalidate',
+      ],
+      this.ledgers
+    )
+    this.watch(
+      RequestQueue.prototype,
+      ['push', 'scheduleRequestTimeoutCheck', 'waitForPendingRequests', 'destroy'],
+      this.queues
+    )
+    this.watch(InstrumentationEventEmitter.prototype, ['addListener', 'emit'], this.emitters)
+  }
+
+  /**
+   * @param {object} prototype Original class prototype.
+   * @param {string[]} names Methods to observe.
+   * @param {Set<object>} seen Original receivers retained for measurement.
+   * @returns {void}
+   */
+  watch(prototype, names, seen) {
+    for (const name of names) {
+      const original = prototype[name]
+      prototype[name] = function (...args) {
+        seen.add(this)
+        return original.apply(this, args)
+      }
+      this.restores.push(() => {
+        prototype[name] = original
+      })
+    }
+  }
+
+  /** @returns {void} Restores observers only after the final resource proof. */
+  uninstall() {
+    for (const restore of this.restores.splice(0).reverse()) restore()
+    this.ledgers.clear()
+    this.queues.clear()
+    this.emitters.clear()
+  }
+
+  /** @returns {number} Entries still held by original ledgers, including retired acquisitions. */
+  ledgerSize() {
+    return [...this.ledgers].reduce((total, ledger) => total + ledger.size, 0)
+  }
+
+  /** @returns {number} Pending and in-flight requests, regardless of socket destruction. */
+  queueDepth() {
+    return [...this.queues].reduce(
+      (total, queue) => total + queue.pending.length + queue.inflight.size,
+      0
+    )
+  }
+
+  /**
+   * @param {Iterable<import('events').EventEmitter>} emitters Original client or queue emitters.
+   * @returns {number} Listeners over every event of every retained emitter.
+   */
+  listenerCount(emitters) {
+    let total = 0
+    for (const emitter of emitters)
+      for (const event of emitter.eventNames()) total += emitter.listenerCount(event)
+    return total
+  }
+
+  /**
+   * @param {object} sources Socket, process-listener and event-loop measurements.
+   * @returns {{ snapshot: () => Promise<object> }} Probe with fixed keys and measured owner totals.
+   */
+  probe(sources) {
+    const probe = createResourceProbe({
+      ...sources,
+      queueDepth: () => this.queueDepth(),
+      ledgerSize: () => this.ledgerSize(),
+    })
+    return {
+      snapshot: async () => {
+        const snapshot = await probe.snapshot()
+        return {
+          ...snapshot,
+          listeners: {
+            ...snapshot.listeners,
+            clients: this.listenerCount([...this.emitters].map(({ emitter }) => emitter)),
+            queues: this.listenerCount(this.queues),
+          },
+        }
+      },
+    }
+  }
+}
+
+/** Captures original adopted acquisitions and handler calls without changing their authority. */
+class AcquisitionObserver {
+  /** Retains original owners and immutable acquisition data until the case has closed. */
+  constructor() {
+    this.acquisitions = []
+    this.invocations = []
+    this.restores = []
+  }
+
+  /** @returns {void} Installs call-through observers before the workload member starts. */
+  install() {
+    const observer = this
+    const adopt = ShareFetchLoop.prototype.adopt
+    ShareFetchLoop.prototype.adopt = function (exchange, topicId, partition, ...args) {
+      const cohort = adopt.call(this, exchange, topicId, partition, ...args)
+      observer.acquisitions.push({
+        cohort,
+        exchange,
+        socket: exchange.binding.connection.socket,
+        groupId: this.groupId,
+        memberId: this.memberId,
+        ranges: Object.freeze(
+          (partition.acquiredRecords ?? []).map((range) => Object.freeze({ ...range }))
+        ),
+        records: Object.freeze(
+          cohort.walk.deliver.records.map((record) =>
+            Object.freeze({
+              offset: record.offset,
+              identity: shareRecordIdentity({
+                ...record,
+                topic: cohort.topic,
+                partition: cohort.partition,
+              }),
+            })
+          )
+        ),
+      })
+      return cohort
+    }
+    this.restores.push(() => {
+      ShareFetchLoop.prototype.adopt = adopt
+    })
+    const invoke = ShareRun.prototype.invoke
+    ShareRun.prototype.invoke = function (node, cohort, call, payload) {
+      observer.invocations.push({
+        cohort,
+        call,
+        identities: Object.freeze(
+          call.records
+            .slice(call.start, call.end)
+            .map((record) =>
+              shareRecordIdentity({ ...record, topic: cohort.topic, partition: cohort.partition })
+            )
+        ),
+      })
+      return invoke.call(this, node, cohort, call, payload)
+    }
+    this.restores.push(() => {
+      ShareRun.prototype.invoke = invoke
+    })
+  }
+
+  /** @returns {void} Restores observers after all original client work has joined. */
+  restore() {
+    for (const restore of this.restores.splice(0).reverse()) restore()
+  }
+}
+
+/**
+ * Expands acknowledgement batches while retaining offset/type multiplicity and partition identity.
+ * @param {object[]} topics Original request topics.
+ * @returns {string[]} Sorted topic/partition/offset/type tuples.
+ */
+const decisionTuples = (topics) =>
+  topics
+    .flatMap(({ topicId, partitions }) =>
+      partitions.flatMap(({ partitionIndex, acknowledgementBatches }) =>
+        acknowledgementBatches.flatMap(({ firstOffset, lastOffset, acknowledgeTypes }) => {
+          const tuples = []
+          for (let offset = BigInt(firstOffset); offset <= BigInt(lastOffset); offset++) {
+            const type =
+              acknowledgeTypes.length === 1
+                ? acknowledgeTypes[0]
+                : acknowledgeTypes[Number(offset - BigInt(firstOffset))]
+            tuples.push(JSON.stringify([topicId, partitionIndex, String(offset), type]))
+          }
+          return tuples
+        })
+      )
+    )
+    .sort()
+
 /**
  * One live run of an interop scenario: a JavaScript share member and a Java share member read a
  * four-partition topic of 600 fixed records in one group, and every record must be handled with its
@@ -656,12 +897,11 @@ class ShareInteropCase {
     this.stack = new CleanupStack()
     this.tap = new ShareWireTap()
     this.acknowledgements = new ShareAcknowledgementObserver()
-    this.openHandlers = 0
-    this.probe = createResourceProbe({
+    this.acquisitions = new AcquisitionObserver()
+    this.gauge = new ResourceGauge()
+    this.probe = this.gauge.probe({
       emitters: { process },
       sockets: () => this.tap.socketCounts(),
-      queueDepth: () => this.tap.pending(),
-      ledgerSize: () => this.openHandlers,
       activeResources: true,
     })
     this.requests = []
@@ -711,7 +951,7 @@ class ShareInteropCase {
       profile: PROFILE,
       scenario: this.nonce,
       groups: { interop: this.group },
-      budgets: { caseMs: BODY_MS[this.kind], cleanupMs: CLEANUP_MS },
+      budgets: { fileMs: FILE_MS, probeMs: PROBE_MS, caseMs: CASE_MS, cleanupMs: CLEANUP_MS },
       wireVersions: wireVersionsOf(this.requests),
       ...fields,
     })
@@ -739,16 +979,27 @@ class ShareInteropCase {
    * @throws {Error} the first assertion or fixture failure, with cleanup failures attached
    */
   async run(scope) {
+    this.gauge.install()
+    this.acquisitions.install()
     this.acknowledgements.install()
+    const bodyDeadline = performance.now() + BODY_MS
     try {
       await this.stack.run(
         async () => {
-          await this.setup(scope)
-          await this[this.kind](scope)
-          await this.observe(scope)
-          await this.finish(scope)
+          this.beforeAdmin = await captureShareCleanupBaseline(this.probe, { signal: scope })
+          this.baseline = this.beforeAdmin
+          await bounded(
+            scope,
+            fileAllowance(bodyDeadline - performance.now(), CLEANUP_MS + FINAL_MS + CASE_JOIN_MS),
+            async (body) => {
+              await this.setup(body)
+              await this[this.kind](body)
+              await this.observe(body)
+              await this.finish(body)
+            }
+          )
         },
-        { budgetMs: CLEANUP_MS }
+        { budgetMs: fileAllowance(CLEANUP_MS, FINAL_MS + CASE_JOIN_MS) }
       )
       await this.complete(scope)
     } catch (error) {
@@ -756,21 +1007,24 @@ class ShareInteropCase {
       throw error
     } finally {
       this.acknowledgements.restore()
+      this.acquisitions.restore()
+      this.gauge.uninstall()
     }
   }
 
   /**
-   * Creates the topic and group config, measures the baseline, and starts the producer and the
-   * JavaScript member, which holds all four partitions before anything else joins.
+   * Creates the topic and group config, then starts the producer and the JavaScript member,
+   * which holds all four partitions before anything else joins.
    * @param {AbortSignal} scope the case scope
    * @returns {Promise<void>}
    */
   async setup(scope) {
-    this.beforeAdmin = await captureShareCleanupBaseline(this.probe, { signal: scope })
-    this.baseline = this.beforeAdmin
     this.admin = this.client('admin').admin()
-    this.admin.on(this.admin.events.REQUEST, ({ payload }) => this.requests.push(payload))
     this.stack.add('prove cleanup and disconnect admin', (signal) => this.cleanup(signal))
+    this.stack.add(
+      'remove admin listeners',
+      this.admin.on(this.admin.events.REQUEST, ({ payload }) => this.requests.push(payload))
+    )
     this.stack.add('delete topic', (signal) => this.deleteTopic(signal))
     this.stack.add('delete group', (signal) => this.deleteGroup(signal))
     this.stack.add('reset group configs', (signal) => this.resetConfigs(signal))
@@ -795,7 +1049,10 @@ class ShareInteropCase {
     this.row('resource-baseline', { snapshot: this.baseline })
 
     this.producer = this.client('producer').producer({ idempotent: true })
-    this.producer.on(this.producer.events.REQUEST, ({ payload }) => this.requests.push(payload))
+    this.stack.add(
+      'remove producer listeners',
+      this.producer.on(this.producer.events.REQUEST, ({ payload }) => this.requests.push(payload))
+    )
     this.stack.add('disconnect producer', () => this.producer.disconnect())
     await bounded(scope, 15000, () => this.producer.connect())
     await this.startJs(scope)
@@ -854,7 +1111,6 @@ class ShareInteropCase {
           }
           this.jsEntries.push(entry)
           if (!this.jsFirst.has(identity)) this.jsFirst.set(identity, entry.at)
-          this.openHandlers++
           try {
             if (this.hold && !this.hold.taken) {
               this.hold.taken = true
@@ -862,7 +1118,6 @@ class ShareInteropCase {
               await this.hold.release.promise
             }
           } finally {
-            this.openHandlers--
             this.handlerLog.finish(invocation)
           }
         },
@@ -1135,6 +1390,143 @@ class ShareInteropCase {
   }
 
   /**
+   * Freezes the actual adopted acquisition and original invocation before disconnect can alter them.
+   * @param {number} target Observed JS-owned partition.
+   * @param {object} held The original first handler journal entry.
+   * @returns {object} Immutable ranges, ledger/call links, identities and acquired-but-unstarted set.
+   * @throws {Error} On missing, duplicate, foreign or inconsistent original acquisition evidence.
+   */
+  freezeLeave(target, held) {
+    const sources = this.acquisitions.acquisitions.filter(
+      ({ groupId, cohort, records }) =>
+        groupId === this.group && cohort.topicId === this.topicId && records.length > 0
+    )
+    expect(sources).toHaveLength(1)
+    const [source] = sources
+    const { cohort, memberId, ranges, records } = source
+    expect(cohort.partition).toBe(target)
+    expect(cohort.topic).toBe(this.topic)
+    expect(memberId).toBe(this.js.memberId)
+    expect(this.gauge.ledgers.has(cohort.ledger)).toBe(true)
+    expect(cohort.ledger.size).toBe(records.length)
+    const socket = this.tap.sockets.findIndex((entry) => entry.socket === source.socket)
+    expect(socket).toBeGreaterThanOrEqual(0)
+    const offsets = ranges.flatMap(({ firstOffset, lastOffset }) => {
+      const values = []
+      for (let offset = BigInt(firstOffset); offset <= BigInt(lastOffset); offset++)
+        values.push(String(offset))
+      return values
+    })
+    expect(new Set(offsets).size).toBe(offsets.length)
+    expect([...offsets].sort()).toEqual(records.map(({ offset }) => offset).sort())
+    expect(
+      [...this.acknowledgements.acquiredOffsets(this.group, this.topicId, target)].sort()
+    ).toEqual([...offsets].sort())
+    expect(records.length).toBeGreaterThanOrEqual(2)
+    expect(new Set(records.map(({ identity }) => identity)).size).toBe(records.length)
+    const corpus = this.corpus.get(target)
+    expect(
+      records.every(({ offset, identity }) =>
+        corpus.some((r) => r.offset === offset && r.identity === identity)
+      )
+    ).toBe(true)
+    const invocations = Object.freeze(this.jsEntries.map((entry) => Object.freeze({ ...entry })))
+    expect(invocations).toEqual([held])
+    const calls = this.acquisitions.invocations.filter((row) => row.cohort === cohort)
+    expect(calls).toHaveLength(1)
+    const [invocation] = calls
+    expect(invocation.call.batch).toBe(false)
+    expect(invocation.call.open).toBe(true)
+    expect(invocation.call.ledger).toBe(cohort.ledger)
+    expect(invocation.identities).toEqual([held.identity])
+    const started = new Set(invocations.map(({ identity }) => identity))
+    expect(records.some(({ identity }) => identity === held.identity)).toBe(true)
+    const unstarted = Object.freeze(
+      records.filter(({ identity }) => !started.has(identity)).map(({ identity }) => identity)
+    )
+    expect(unstarted.length).toBe(records.length - 1)
+    return Object.freeze({
+      groupId: this.group,
+      memberId,
+      topicId: this.topicId,
+      partition: target,
+      acquisition: this.acquisitions.acquisitions.indexOf(source),
+      ledger: [...this.gauge.ledgers].indexOf(cohort.ledger),
+      ledgerEntries: cohort.ledger.size,
+      socket,
+      sentAt: source.exchange.sentAt,
+      fetchEpoch: source.exchange.fields.shareSessionEpoch,
+      call: this.acquisitions.invocations.indexOf(invocation),
+      invocation: held.invocation,
+      ranges,
+      records,
+      invocations,
+      unstarted,
+    })
+  }
+
+  /**
+   * Requires exactly one successful final decision and public outcome per original acquired record.
+   * The running eachMessage returns before the boundary; its unstarted peers require wire Releases.
+   * @param {object} original Immutable pre-disconnect acquisition and invocation snapshot.
+   * @param {object} final Independently decoded original final-epoch wire request.
+   * @returns {void}
+   * @throws {Error} On missing, duplicate, failed or mismatched Accept/Release coverage.
+   */
+  assertLeaveOutcomes(original, final) {
+    const { topicId, partition, memberId, records, unstarted } = original
+    const expected = records
+      .map(({ offset, identity }) =>
+        JSON.stringify([topicId, partition, offset, unstarted.includes(identity) ? 2 : 1])
+      )
+      .sort()
+    expect(final.groupId).toBe(original.groupId)
+    expect(final.memberId).toBe(memberId)
+    expect(final.socket).toBe(original.socket)
+    expect(final.shareSessionEpoch).toBe(-1)
+    expect(final.isRenewAck).toBe(false)
+    expect(decisionTuples(final.topics)).toEqual(expected)
+    const responses = this.acknowledgements
+      .evidence(this.group)
+      .filter(
+        (row) => row.apiKey === 79 && row.shareSessionEpoch === -1 && row.memberId === memberId
+      )
+    expect(responses).toHaveLength(1)
+    expect(responses.every(({ successful }) => successful)).toBe(true)
+    expect(
+      decisionTuples(
+        responses.map((row) => ({
+          topicId: row.topicId,
+          partitions: [
+            { partitionIndex: row.partition, acknowledgementBatches: row.acknowledgementBatches },
+          ],
+        }))
+      )
+    ).toEqual(expected)
+    const outcomes = this.js.acks.filter(({ type }) => type !== 'renew')
+    expect(outcomes.every(({ topic, error }) => topic === this.topic && error === null)).toBe(true)
+    expect(
+      decisionTuples(
+        outcomes.map(({ partition, firstOffset, lastOffset, type }) => ({
+          topicId,
+          partitions: [
+            {
+              partitionIndex: partition,
+              acknowledgementBatches: [
+                {
+                  firstOffset,
+                  lastOffset,
+                  acknowledgeTypes: [{ accept: 1, release: 2, reject: 3 }[type]],
+                },
+              ],
+            },
+          ],
+        }))
+      )
+    ).toEqual(expected)
+  }
+
+  /**
    * The JavaScript member's first handler is held while it disconnects with a short timeout; the
    * records it acquired but had not started must reach the Java member within two seconds of the
    * call, and no unstarted record may enter the JavaScript handler.
@@ -1153,12 +1545,10 @@ class ShareInteropCase {
     await pollUntil(scope, 10000, () => this.js.fetches.some((f) => f.numberOfRecords > 0), {
       label: 'The acquisition',
     })
-    const acquired = this.js.fetches.find((f) => f.numberOfRecords > 0).numberOfRecords
-    expect(acquired).toBeGreaterThanOrEqual(2)
-    const batch = this.corpus.get(target)
-    const unstarted = batch.slice(1, acquired).map(({ identity }) => identity)
-    expect(held.identity).toBe(batch[0].identity)
-    expect(this.jsEntries.map(({ identity }) => identity)).toEqual([batch[0].identity])
+    const original = this.freezeLeave(target, held)
+    const { unstarted } = original
+    const acquired = original.records.length
+    this.facts.original = original
 
     const mark = this.tap.frames.length
     const disconnectAt = performance.now()
@@ -1178,11 +1568,17 @@ class ShareInteropCase {
     expect(this.jsEntries).toHaveLength(1)
     const releasedAt = performance.now()
     this.hold.release.resolve()
-    await bounded(scope, DISCONNECT_MS + 2000, () => closing, { label: 'The disconnect' })
+    await bounded(
+      scope,
+      Math.max(0, disconnectAt + DISCONNECT_MS - performance.now()),
+      () => closing,
+      { label: 'The disconnect' }
+    )
+    expect(settledAt - disconnectAt).toBeLessThanOrEqual(DISCONNECT_MS)
 
     await pollUntil(
       scope,
-      HANDOVER_MS + 3000,
+      Math.max(0, disconnectAt + HANDOVER_MS - performance.now()),
       () =>
         unstarted.every((identity) => this.javaMember.journal.firstEntryAt(identity) !== undefined),
       { delayMs: 25, label: 'The unstarted records reaching the Java member' }
@@ -1194,17 +1590,17 @@ class ShareInteropCase {
     expect(closingFrames.final).toBeDefined()
     expect(closingFrames.leave).toBeDefined()
     expect(handoverAt - disconnectAt).toBeLessThanOrEqual(HANDOVER_MS)
-    expect(this.jsEntries.map(({ identity }) => identity)).toEqual([batch[0].identity])
-    const accepts = this.js.acks.filter(
-      ({ type, partition }) => type === 'accept' && partition === target
+    for (const identity of unstarted) {
+      const at = this.javaMember.journal.firstEntryAt(identity)
+      expect(at).toBeGreaterThanOrEqual(disconnectAt)
+      expect(at).toBeLessThanOrEqual(disconnectAt + HANDOVER_MS)
+    }
+    expect(this.jsEntries).toEqual(original.invocations)
+    expect(closingFrames.final.at).toBeLessThanOrEqual(closingFrames.leave.at)
+    expect(closingFrames.finals.flatMap(({ topics }) => decisionTuples(topics))).toHaveLength(
+      acquired
     )
-    const covers = (offset) =>
-      accepts.some(
-        ({ firstOffset, lastOffset }) =>
-          BigInt(firstOffset) <= BigInt(offset) && BigInt(offset) <= BigInt(lastOffset)
-      )
-    expect(covers(batch[0].offset)).toBe(true)
-    expect(batch.slice(1, acquired).some(({ offset }) => covers(offset))).toBe(false)
+    this.assertLeaveOutcomes(original, closingFrames.final)
     Object.assign(this.facts, {
       target,
       acquired,
@@ -1261,7 +1657,7 @@ class ShareInteropCase {
     const deadline = haltedAt + poll.lockTimeoutMs + RECOVERY_SLACK_MS
     await pollUntil(
       scope,
-      Math.max(1000, deadline - performance.now()),
+      Math.max(0, deadline - performance.now()),
       () => this.haltRecovered(poll, haltedAt),
       { delayMs: 100, label: 'The halted poll recovering in the surviving member' }
     )
@@ -1622,6 +2018,9 @@ class ShareInteropCase {
     )
     const final = await bounded(scope, 10000, () => this.probe.snapshot())
     this.row('cleanup', { snapshot: final })
+    scope.throwIfAborted()
+    fileAllowance(1, FINAL_MS + CASE_JOIN_MS)
+    liveRun.assertClean()
     this.row('case-complete', {
       status: 'passed',
       tainted: false,
@@ -1814,6 +2213,165 @@ describe('share interop Java journal', () => {
   })
 })
 
+describe('share interop clean-leave proof', () => {
+  /** @returns {object} Independent corpus, sparse original acquisition, call and successful final. */
+  const leaveState = () => {
+    const record = (offset) => ({ offset, key: null, value: null })
+    const identity = (offset) =>
+      shareRecordIdentity({ ...record(offset), topic: 't', partition: 0 })
+    const records = Object.freeze(
+      ['0', '98', '99'].map((offset) => Object.freeze({ offset, identity: identity(offset) }))
+    )
+    const ledger = new ShareAckLedger({
+      topic: 't',
+      topicId: 'id',
+      partition: 0,
+      token: Symbol('acquisition'),
+      sentAt: 1,
+      lockDuration: LOCK_MS,
+      walk: {
+        deliver: {
+          records: records.map(({ offset }) => record(offset)),
+          deliveryCounts: [1, 1, 1],
+        },
+        gaps: [],
+        release: [],
+        reject: [],
+      },
+    })
+    const cohort = { topic: 't', topicId: 'id', partition: 0, ledger }
+    const socket = {}
+    const exchange = { sentAt: 1, fields: { shareSessionEpoch: 1 } }
+    const ranges = Object.freeze(
+      records.map(({ offset }) =>
+        Object.freeze({ firstOffset: offset, lastOffset: offset, deliveryCount: 1 })
+      )
+    )
+    const held = { invocation: 1, identity: identity('0'), at: 10, deliveryCount: 1 }
+    const acknowledgements = new ShareAcknowledgementObserver()
+    const final = {
+      socket: 0,
+      groupId: 'g',
+      memberId: 'm',
+      shareSessionEpoch: -1,
+      isRenewAck: false,
+      topics: [
+        {
+          topicId: 'id',
+          partitions: [
+            {
+              partitionIndex: 0,
+              acknowledgementBatches: records.map(({ offset }) => ({
+                firstOffset: offset,
+                lastOffset: offset,
+                acknowledgeTypes: [offset === '0' ? 1 : 2],
+              })),
+            },
+          ],
+        },
+      ],
+    }
+    acknowledgements.exchanges.push({
+      apiKey: 79,
+      request: final,
+      response: {
+        errorCode: 0,
+        responses: [{ topicId: 'id', partitions: [{ partitionIndex: 0, errorCode: 0 }] }],
+      },
+    })
+    acknowledgements.acquisitions.push({
+      groupId: 'g',
+      topicId: 'id',
+      partition: 0,
+      acquiredRecords: ranges,
+    })
+    return {
+      held,
+      final,
+      tap: { sockets: [{ socket }] },
+      group: 'g',
+      topic: 't',
+      topicId: 'id',
+      acknowledgements,
+      corpus: new Map([
+        [
+          0,
+          Array.from({ length: 100 }, (_, i) => ({
+            offset: String(i),
+            identity: identity(String(i)),
+          })),
+        ],
+      ]),
+      jsEntries: [held],
+      js: {
+        memberId: 'm',
+        acks: records.map(({ offset }) => ({
+          topic: 't',
+          partition: 0,
+          firstOffset: offset,
+          lastOffset: offset,
+          type: offset === '0' ? 'accept' : 'release',
+          error: null,
+        })),
+      },
+      gauge: { ledgers: new Set([ledger]) },
+      acquisitions: {
+        acquisitions: [{ groupId: 'g', memberId: 'm', cohort, ranges, records, socket, exchange }],
+        invocations: [
+          { cohort, call: { ledger, batch: false, open: true }, identities: [held.identity] },
+        ],
+      },
+    }
+  }
+
+  it('freezes sparse original acquisitions and invocation identities instead of a corpus prefix', () => {
+    const state = leaveState()
+    const original = ShareInteropCase.prototype.freezeLeave.call(state, 0, state.held)
+    expect(original.unstarted).toEqual(
+      state.acquisitions.acquisitions[0].records.slice(1).map(({ identity }) => identity)
+    )
+    expect(original.records.map(({ offset }) => offset)).toEqual(['0', '98', '99'])
+    state.jsEntries.push({ ...state.held, invocation: 2 })
+    expect(original.invocations).toEqual([state.held])
+    expect(Object.isFrozen(original)).toBe(true)
+    expect(Object.isFrozen(original.unstarted)).toBe(true)
+  })
+
+  it('requires complete final-epoch Release coverage for the original unstarted identities', () => {
+    const state = leaveState()
+    const original = ShareInteropCase.prototype.freezeLeave.call(state, 0, state.held)
+    const check = () =>
+      ShareInteropCase.prototype.assertLeaveOutcomes.call(state, original, state.final)
+    expect(check).not.toThrow()
+    const batches = state.final.topics[0].partitions[0].acknowledgementBatches
+    const last = batches.pop()
+    expect(check).toThrow()
+    batches.push(last)
+    last.acknowledgeTypes = [1]
+    expect(check).toThrow()
+  })
+
+  it('rejects failed original responses and missing, failed or duplicate public Releases', () => {
+    const state = leaveState()
+    const original = ShareInteropCase.prototype.freezeLeave.call(state, 0, state.held)
+    const check = () =>
+      ShareInteropCase.prototype.assertLeaveOutcomes.call(state, original, state.final)
+    const response = state.acknowledgements.exchanges[0].response
+    response.responses[0].partitions[0].errorCode = 121
+    expect(check).toThrow()
+    response.responses[0].partitions[0].errorCode = 0
+    const last = state.js.acks.pop()
+    expect(check).toThrow()
+    state.js.acks.push(last)
+    last.error = { name: 'KafkaJSShareAcknowledgementError', reason: 'membership-lost' }
+    expect(check).toThrow()
+    last.error = null
+    expect(check).not.toThrow()
+    state.js.acks.push(last)
+    expect(check).toThrow()
+  })
+})
+
 describe('share interop halted-poll proof', () => {
   /** @returns {object} Independent corpus, original Java poll and successful JS broker exchange. */
   const haltedState = () => {
@@ -1917,27 +2475,39 @@ enabled('share interop with a Java member', () => {
 
   beforeAll(
     () =>
-      bounded(NEVER, HOOK_MS - 2000, () => {
+      bounded(NEVER, fileAllowance(HOOK_MS - CASE_JOIN_MS, FINAL_MS), () => {
         liveRun.assertClean()
       }),
     HOOK_MS
   )
 
-  afterAll(() => {
-    if (JAVA.owned) fs.rmSync(JAVA.workDir, { recursive: true, force: true })
-  })
+  afterAll(
+    () =>
+      bounded(NEVER, fileAllowance(FINAL_MS - CASE_JOIN_MS), () => {
+        if (JAVA.owned) fs.rmSync(JAVA.workDir, { recursive: true, force: true })
+        liveRun.assertClean()
+      }),
+    FINAL_MS
+  )
 
   for (const kind of ['join', 'leave', 'halt']) {
-    const budget = BODY_MS[kind] + CLEANUP_MS
     it(
       TITLES[kind],
-      liveCase(budget, (scope) => new ShareInteropCase(kind, JAVA).run(scope)),
-      caseTimeout(budget)
+      liveCase(CASE_MS, (scope) =>
+        bounded(scope, fileAllowance(CASE_MS, FINAL_MS + CASE_JOIN_MS), (caseScope) =>
+          new ShareInteropCase(kind, JAVA).run(caseScope)
+        )
+      ),
+      caseTimeout(CASE_MS)
     )
   }
 
-  afterEach(() => {
-    if (!liveRun.takeAdmission()) return
-    liveRun.assertClean()
-  })
+  afterEach(
+    () =>
+      bounded(NEVER, fileAllowance(HOOK_MS - CASE_JOIN_MS, FINAL_MS), () => {
+        if (!liveRun.takeAdmission()) return
+        liveRun.assertClean()
+      }),
+    HOOK_MS
+  )
 })
