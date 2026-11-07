@@ -305,7 +305,7 @@ jobs:
           path: ${{ runner.temp }}/${{ matrix.id }}.json
 
   verdict:
-    needs: [plan, check]
+    needs: [plan, check, telemetry]
     if: always() && needs.plan.result != 'skipped'
     runs-on: ${{ vars.GATE_RUNNER || 'ubuntu-latest' }}
     steps:
@@ -323,6 +323,7 @@ jobs:
           MATRIX: ${{ needs.plan.outputs.matrix }}
           PLAN_RESULT: ${{ needs.plan.result }}
           CHECK_RESULT: ${{ needs.check.result }}
+          TELEMETRY_RESULT: ${{ needs.telemetry.result }}
         run: |
           node <<'NODE'
           const fs = require('fs')
@@ -331,7 +332,14 @@ jobs:
             const file = `results/${id}.json`
             return { id, result: fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')).result : 'missing' }
           })
+          rows.push({ id: 'telemetry-full', result: process.env.TELEMETRY_RESULT })
           const summary = ['| Check id | Result |', '| --- | --- |', ...rows.map(({ id, result }) => `| ${id} | ${result} |`)]
           fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, summary.join('\n') + '\n')
           if (process.env.PLAN_RESULT !== 'success' || process.env.CHECK_RESULT !== 'success' || rows.some(row => row.result !== 'success')) process.exitCode = 1
           NODE
+
+  telemetry:
+    needs: plan
+    uses: ./.github/workflows/telemetry.yml
+    with:
+      full: true

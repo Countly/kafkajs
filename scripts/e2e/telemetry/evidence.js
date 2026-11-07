@@ -12,6 +12,97 @@ const sha = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex')
 const KINDS = ['producer', 'consumer', 'admin', 'share']
 const CAP = 16 * 1024 * 1024
 
+/** Owns one case's cleanup tasks in reverse allocation order. */
+class Cleanup {
+  /** @param {object} evidence mutable attempt retained even when the case fails */
+  constructor(evidence) {
+    this.evidence = evidence
+    this.tasks = []
+  }
+
+  /** @param {function():Promise<void>|void} task release to attempt at case exit @returns {void} */
+  defer(task) {
+    this.tasks.push(task)
+  }
+
+  /** @returns {Promise<*[]>} ordered failures after every release was attempted */
+  async run() {
+    const errors = []
+    while (this.tasks.length) {
+      try {
+        await this.tasks.pop()()
+      } catch (error) {
+        errors.push(error)
+      }
+    }
+    return errors
+  }
+}
+
+/**
+ * Finalizes passing and failed attempts after every cleanup, preserving the original failure first.
+ * Failed records have their own catalogue and an on-disk result even if broker stamping fails.
+ * @param {string} name scenario name
+ * @param {function(Cleanup,function(object):void,object):Promise<void>} body case and partial evidence
+ * @param {object} [options] directory and stamped writer seam for offline failure controls
+ * @returns {Promise<void>} when body, cleanup and persistence all succeed
+ * @throws {*} original failure or an AggregateError with ordered cleanup/persistence causes
+ */
+const runCase = async (
+  name,
+  body,
+  {
+    directory = process.env.TELEMETRY_EVIDENCE_DIR,
+    write = require('../../../testHelpers/e2eEvidence').writeEvidence,
+  } = {}
+) => {
+  const evidence = {
+    name,
+    directory,
+    observers: {},
+    stage: 'setup',
+    record: {
+      run: {
+        stem: `${name}-${crypto.randomBytes(8).toString('hex')}`,
+        line: process.env.KAFKA_VERSION,
+        project: process.env.COMPOSE_PROJECT_NAME,
+      },
+    },
+  }
+  const cleanup = new Cleanup(evidence)
+  const errors = []
+  try {
+    await body(cleanup, (value) => Object.assign(evidence, value), evidence)
+  } catch (error) {
+    errors.push(error)
+  }
+  if (!errors.length) evidence.stage = 'cleanup'
+  errors.push(...(await cleanup.run()))
+  const describe = (error, depth = 0) => ({
+    name: error?.name || typeof error,
+    message: String(error?.message ?? error).slice(0, 4096),
+    ...(depth < 4 && Array.isArray(error?.errors)
+      ? { causes: error.errors.slice(0, 16).map((cause) => describe(cause, depth + 1)) }
+      : {}),
+  })
+  const record = { ...evidence.record, status: errors.length ? 'failed' : 'passed' }
+  if (errors.length)
+    record.failure = { stage: evidence.stage, causes: errors.map((error) => describe(error)) }
+  try {
+    record.sidecars = persistEvidence({ ...evidence, record })
+    if (errors.length)
+      fs.writeFileSync(
+        path.join(directory, record.sidecars.root, 'failed-attempt.json'),
+        JSON.stringify(record, null, 2)
+      )
+    write(errors.length ? `${name}-failed` : name, record)
+  } catch (error) {
+    errors.push(error)
+  }
+  if (errors.length === 1) throw errors[0]
+  if (errors.length) throw new AggregateError(errors, 'Telemetry case and cleanup failed')
+}
+
 /**
  * Archives immutable per-case sidecars after natural client/observer cleanup, before another case
  * can append to the broker sinks. Stamped evidence references only these relative paths.
@@ -24,6 +115,8 @@ const persistEvidence = ({ name, record, directory, observers }) => {
   const target = path.join(directory, root)
   fs.mkdirSync(target)
   const files = []
+  const archiveErrors = []
+  const failed = record.status === 'failed'
   let total = 0
   const retain = (source, relative) => {
     const stat = fs.lstatSync(source)
@@ -36,27 +129,40 @@ const persistEvidence = ({ name, record, directory, observers }) => {
     fs.writeFileSync(output, bytes, { flag: 'wx', mode: 0o600 })
     files.push({ path: `${root}/${relative}`, bytes: bytes.length, sha256: sha(bytes) })
   }
+  const available = (work) => {
+    try {
+      work()
+    } catch (error) {
+      if (!failed) throw error
+      archiveErrors.push(error.message)
+    }
+  }
   for (const file of fs.readdirSync(directory))
     if (/^(exports-\d+\.jsonl|reporter-\d+\.json|OVERFLOW.*|identity\.json)$/.test(file))
-      retain(path.join(directory, file), file)
+      available(() => retain(path.join(directory, file), file))
   const owners = {}
   for (const [kind, observer] of Object.entries(observers)) {
-    assert(
-      fs.existsSync(path.join(observer.directory, 'transcript.json')),
-      'Missing observer cleanup receipt'
+    available(() =>
+      assert(
+        fs.existsSync(path.join(observer.directory, 'transcript.json')),
+        'Missing observer cleanup receipt'
+      )
     )
     const subdir = path.basename(observer.directory)
     owners[kind] = `${root}/${subdir}/transcript.json`
-    for (const file of fs.readdirSync(observer.directory))
-      if (
-        /^(transcript\.json|raw-[a-f0-9]+\.bin|push-r\d+\.bin|decoded-r\d+\.json|decoder-\d+\.json)$/.test(
-          file
+    available(() => {
+      for (const file of fs.readdirSync(observer.directory))
+        if (
+          /^(transcript\.json|raw-[a-f0-9]+\.bin|push-r\d+\.bin|decoded-r\d+\.json|decoder-\d+\.json)$/.test(
+            file
+          )
         )
-      )
-        retain(path.join(observer.directory, file), `${subdir}/${file}`)
+          available(() => retain(path.join(observer.directory, file), `${subdir}/${file}`))
+    })
   }
   return {
     scenario: name,
+    archiveErrors,
     root,
     owners,
     files,
@@ -152,6 +258,7 @@ const verifyScenario = (record, directory) => {
     assert.equal(results.resource.deleted, true)
     const reader = new TelemetryExportReader(path.join(directory, manifest.root))
     const consumed = new Set()
+    let adminSamples
     for (const kind of KINDS) {
       const result = results[kind]
       assert(/^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(result.uuid))
@@ -171,6 +278,28 @@ const verifyScenario = (record, directory) => {
         assert.deepEqual(get.response.requestedMetrics, ['org.apache.kafka.'])
       }
       const subdir = path.dirname(manifest.owners[kind])
+      const stream = transcript.records.filter(
+        (r) => r.apiKey === 72 && !r.terminating && r.writeAt <= results.window.deadline
+      )
+      assert.deepEqual(
+        result.requestKeys,
+        stream.map((r) => r.requestKey),
+        'Incomplete Push stream'
+      )
+      assert.equal(
+        new Set(result.requestKeys).size,
+        result.requestKeys.length,
+        'Duplicate Push identity'
+      )
+      for (const push of stream) {
+        assert(push.writeAt >= results.window.start, 'Push before capture')
+        assert(
+          push.response &&
+            push.response.errorCode === 0 &&
+            push.response.responseAt <= results.window.deadline,
+          'Failed or unmatched Push window'
+        )
+      }
       const samples = result.requestKeys.map((key) => {
         const decoded = read(`${subdir}/decoded-${key}.json`)
         const rawFile = `${subdir}/raw-${decoded.rawSha256}.bin`
@@ -189,6 +318,8 @@ const verifyScenario = (record, directory) => {
         assert.equal(decoded.requestKey, key)
         assert.equal(decoded.uuid, result.uuid)
         assert.equal(decoded.node, request.node)
+        assert.equal(decoded.exportIdentity.node, request.node, 'Export source node mismatch')
+        assert.equal(decoded.compressionType, request.compressionType)
         assert.equal(decoded.transmittedBytes, request.metricsBytes)
         const transmittedPath = `${subdir}/push-${key}.bin`
         assert(paths.has(transmittedPath), 'Missing transmitted sidecar')
@@ -225,6 +356,7 @@ const verifyScenario = (record, directory) => {
         return { ...decoded, writeAt: request.writeAt }
       })
       assert(samples.length >= 2)
+      if (kind === 'admin') adminSamples = samples
       const { requests, connects, delta } = result.arithmetic
       const topology = results.control.discovery.filter((r) => r.apiKey === 3)
       assert.equal(topology.length, 1)
@@ -301,7 +433,7 @@ const verifyScenario = (record, directory) => {
         result.arithmetic
       )
     }
-    assert(results.control.requests.length > 0)
+    verifyControl(results, read(manifest.owners.admin), adminSamples)
     for (const node of ['1', '2', '3']) {
       const proof = read(`${manifest.root}/reporter-${node}.json`)
       assert.equal(proof.node, node)
@@ -335,6 +467,139 @@ const verifyScenario = (record, directory) => {
         assert.equal(gets[0].response.pushIntervalMs, 300000)
       }
     }
+  }
+}
+
+/**
+ * Binds the mandatory admin RTT control to the complete ordinary ledger and next three Pushes.
+ * Every controlled response must be allocated exactly once in the first two, followed by idle.
+ * @param {object} results complete configured results
+ * @param {object} transcript independent admin transcript
+ * @param {object[]} samples verified complete admin Push stream
+ * @returns {void}
+ * @throws {Error} on invented identities, omitted windows, contamination or ambiguous partitions
+ */
+const verifyControl = (results, transcript, samples) => {
+  const control = results.control
+  assert(
+    Number.isFinite(control.controlledAt) && control.controlledAt > control.knownAfter,
+    'Invalid controlled request time'
+  )
+  const ordinaryIds = new Set(
+    transcript.sockets.filter((s) => s.kind === 'normal').map((s) => s.id)
+  )
+  assert(
+    Number.isSafeInteger(control.checkpoint) && control.checkpoint >= 0,
+    'Invalid control checkpoint'
+  )
+  const discovery = transcript.records.filter(
+    (r) =>
+      r.type === 'request' &&
+      ordinaryIds.has(r.socketId) &&
+      control.discovery.some((d) => d.requestKey === r.requestKey)
+  )
+  assert.deepEqual(control.discovery, discovery, 'Invented discovery identity')
+  assert(
+    discovery.some((r) => r.apiKey === 3 && r.response?.responseAt === control.knownAfter),
+    'Missing topology response'
+  )
+  assert(
+    discovery.some((r) => r.apiKey === 32 && r.writeAt > control.knownAfter),
+    'Missing topology follow-up'
+  )
+  const wire = transcript.records.filter(
+    (r) => r.type === 'request' && ordinaryIds.has(r.socketId) && r.index > control.checkpoint
+  )
+  assert.deepEqual(control.wire, wire, 'Incomplete control wire ledger')
+  assert(
+    wire.length > 0 && wire.every((r) => r.response && r.writeAt >= control.controlledAt),
+    'Missing or unmatched controlled request'
+  )
+  const keys = new Set(wire.map((r) => r.requestKey))
+  const requests = results.admin.arithmetic.requests.filter((r) => keys.has(r.requestKey))
+  assert.deepEqual(control.requests, requests, 'Invented control request')
+  assert.equal(requests.length, wire.length)
+  assert(
+    requests.every((r) => r.knownNode),
+    'Control node is unknown'
+  )
+  assert.equal(control.requestEvents.length, requests.length)
+  for (const request of requests) {
+    const events = control.requestEvents.filter(
+      (e) =>
+        e.correlationId === request.correlationId &&
+        e.apiKey === request.apiKey &&
+        e.apiVersion === request.apiVersion &&
+        e.clientId === request.clientId
+    )
+    assert.equal(events.length, 1, 'Control event identity mismatch')
+    for (const field of ['duration', 'sentAt', 'broker'])
+      assert.equal(events[0][field], request[field])
+  }
+  const selected = samples.filter((sample) => sample.writeAt > control.controlledAt).slice(0, 3)
+  assert.equal(selected.length, 3, 'Missing controlled or quiescent sample')
+  assert.deepEqual(
+    control.samples,
+    selected.map((sample) => sample.requestKey),
+    'Control sample order mismatch'
+  )
+  const indexes = selected.map((sample) => samples.indexOf(sample))
+  const prior = samples[indexes[0] - 1]
+  assert(
+    prior && prior.writeAt > control.knownAfter && prior.writeAt <= control.controlledAt,
+    'Missing pre-control quiescent sample'
+  )
+  const nodePoints = (sample) =>
+    sample.decoded.metrics.filter((m) => m.kind === 'GAUGE').flatMap((m) => m.points)
+  assert.equal(nodePoints(prior).length, 0, 'Pre-control sample is not quiescent')
+  assert.equal(nodePoints(selected[2]).length, 0, 'Missing quiescent control result')
+  const allocated = results.admin.arithmetic.allocations.flatMap(({ windows }) =>
+    indexes.slice(0, 2).flatMap((index) => windows[index])
+  )
+  assert.deepEqual(
+    allocated.sort(),
+    [...keys].sort(),
+    'Control next-two-sample allocation mismatch'
+  )
+  const emitted = new Set(
+    selected
+      .slice(0, 2)
+      .flatMap(nodePoints)
+      .map((p) => p.attrs[0][2])
+  )
+  assert.deepEqual([...emitted].sort(), [...new Set(requests.map((r) => r.node))].sort())
+  // Multiple time-feasible partitions with identical arithmetic cannot establish this control.
+  for (const node of emitted) {
+    const events = requests.filter((r) => r.node === node)
+    let matches = 0
+    for (let split = 0; split <= events.length; split++) {
+      const partitions = [events.slice(0, split), events.slice(split)]
+      const compatible = partitions.every((part, i) => {
+        const metrics = selected[i].decoded.metrics
+        const points = (suffix) =>
+          metrics
+            .find((m) => m.name.endsWith(suffix))
+            ?.points.filter((p) => p.attrs[0][2] === node) || []
+        const avg = points('.avg')
+        const max = points('.max')
+        if (!part.length) return avg.length === 0 && max.length === 0
+        if (part.some((r) => r.responseAt > selected[i].writeAt)) return false
+        const next = partitions[i + 1] || []
+        if (next.some((r) => r.responseAt <= prior.writeAt)) return false
+        const mean = part.reduce((sum, r) => sum + r.duration, 0) / part.length
+        return (
+          avg.length === 1 &&
+          max.length === 1 &&
+          Math.abs(Number(avg[0].asDouble) - mean) <= 1e-9 + 1e-12 * Math.abs(mean) &&
+          Number(max[0].asDouble) === Math.max(...part.map((r) => r.duration))
+        )
+      })
+      if (compatible) matches++
+    }
+    assert(
+      matches === 1 || (events.length === 1 && events[0].duration === 0 && matches > 0),
+      'Ambiguous controlled response partition'
+    )
   }
 }
 
@@ -388,6 +653,8 @@ const verifyCleanup = (directory, stamps, project) => {
   assert.equal(receipt.project, project)
   assert.equal(receipt.preflightPassed, true)
   assert.equal(receipt.removalVerified, true)
+  assert.equal(receipt.journalComplete, true)
+  for (const key of ['journalError', 'cleanupError', 'removalError']) assert(!receipt[key])
   assert(receipt.startedAt && receipt.stoppedAt)
   assert.deepEqual(receipt.removalProof, { containers: [], networks: [], volumes: [] })
   assert.deepEqual(receipt.ownedRemovalProof, { containers: [], networks: [], volumes: [] })
@@ -402,4 +669,4 @@ const verifyCleanup = (directory, stamps, project) => {
 if (require.main === module)
   verifyEvidence(process.argv[2], process.env.TELEMETRY_EVIDENCE_DIR, process.argv.slice(3))
 
-module.exports = { persistEvidence, verifyScenario, verifyEvidence, verifyCleanup }
+module.exports = { runCase, persistEvidence, verifyScenario, verifyEvidence, verifyCleanup }

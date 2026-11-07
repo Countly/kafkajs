@@ -601,6 +601,50 @@ describe('telemetry wire observer', () => {
     expect(() => check([descriptor])).toThrow('Duplicate')
   })
 
+  test('retains captured Push bytes and a failed attempt after capture and cleanup fail', async () => {
+    const { runCase } = require('../../scripts/e2e/telemetry/evidence')
+    const { observer } = observe()
+    const primary = new Error('capture expired')
+    const cleanupError = new Error('client cleanup failed')
+    const written = []
+    let key
+    await expect(
+      runCase(
+        'telemetry-reporter',
+        async (cleanup, publish, attempt) => {
+          attempt.observers.producer = observer
+          attempt.stage = 'capture'
+          cleanup.defer(() => {
+            throw cleanupError
+          })
+          cleanup.defer(() => observer.dispose())
+          const socket = open(observer)
+          send(socket, push72(9, Buffer.from('captured-before-failure')))
+          key = observer.readTranscript().find((r) => r.apiKey === 72).requestKey
+          socket.emit('close')
+          throw primary
+        },
+        { directory, write: (name, record) => written.push({ name, record }) }
+      )
+    ).rejects.toMatchObject({ errors: [primary, cleanupError] })
+    expect(written).toHaveLength(1)
+    expect(written[0].name).toBe('telemetry-reporter-failed')
+    const record = written[0].record
+    expect(record.status).toBe('failed')
+    expect(record.failure).toMatchObject({
+      stage: 'capture',
+      causes: [{ message: 'capture expired' }, { message: 'client cleanup failed' }],
+    })
+    const payload = record.sidecars.files.find((item) => item.path.endsWith(`/push-${key}.bin`))
+    expect(fs.readFileSync(path.join(directory, payload.path))).toEqual(
+      Buffer.from('captured-before-failure')
+    )
+    expect(record.sidecars.files.some((item) => item.path.endsWith('/transcript.json'))).toBe(true)
+    expect(
+      JSON.parse(fs.readFileSync(path.join(directory, record.sidecars.root, 'failed-attempt.json')))
+    ).toMatchObject({ status: 'failed', failure: record.failure })
+  })
+
   test('keeps the zero-request Get under its assigned response UUID', async () => {
     const { observer } = observe()
     const socket = open(observer)
@@ -1005,6 +1049,67 @@ describe('isolated telemetry CI ownership', () => {
     expect(receipt.removalVerified).not.toBe(true)
   })
 
+  test('retains partial ownership and refuses removal certification after startup inspection fails', () => {
+    let removed = false
+    const owner = owned((args) => {
+      if (args.includes('down')) removed = true
+      if (!removed && args[0] === 'ps') return 'partial-container'
+      if (args[0] === 'inspect') throw new Error('startup inspection failed')
+      return ''
+    })
+    owner.save({ project: owner.project, compose: owner.file, preflightPassed: true })
+    expect(() => owner.stop()).toThrow('startup inspection failed')
+    expect(removed).toBe(true)
+    const receipt = JSON.parse(
+      fs.readFileSync(path.join(owner.directory, 'ownership-receipt.json'))
+    )
+    expect(receipt.owned.containers).toEqual(['partial-container'])
+    expect(receipt.journalComplete).toBe(false)
+    expect(receipt.removalVerified).toBe(false)
+    expect(receipt.journalError).toBe('startup inspection failed')
+    expect(fs.existsSync(path.join(owner.directory, 'cleanup-manifest.json'))).toBe(true)
+  })
+
+  test('keeps a failed capture journal fatal when cleanup discovery later succeeds', () => {
+    const owner = owned((args) => {
+      if (args[0] === 'ps') return 'partial-container'
+      if (args[0] === 'inspect') throw new Error('capture journal failed')
+      return ''
+    })
+    owner.save({ project: owner.project, compose: owner.file, preflightPassed: true })
+    expect(() => owner.capture()).toThrow('capture journal failed')
+    owner.docker = empty
+    expect(() => owner.stop()).toThrow('capture journal failed')
+    expect(
+      JSON.parse(fs.readFileSync(path.join(owner.directory, 'ownership-receipt.json')))
+    ).toMatchObject({ journalError: 'capture journal failed', removalVerified: false })
+  })
+
+  test('reserves teardown and finalization time when diagnostics exhaust their shared budget', () => {
+    let now = 0
+    const calls = []
+    const owner = new CiOwnership({
+      env: environment(),
+      now: () => now,
+      docker: (args, { timeoutMs }) => {
+        calls.push({ args, at: now, timeoutMs })
+        now += timeoutMs
+        return ''
+      },
+    })
+    owner.receiptFile = path.join(directory, 'ownership.json')
+    owner.save({ project: owner.project, compose: owner.file, preflightPassed: true })
+    expect(() => owner.stop()).toThrow('Cleanup command budget exhausted')
+    const down = calls.find(({ args }) => args.includes('down'))
+    expect(down.at).toBeLessThanOrEqual(25000)
+    expect(down.timeoutMs).toBeGreaterThanOrEqual(30000)
+    expect(calls.some(({ args }) => args.includes('logs'))).toBe(false)
+    expect(now).toBeLessThanOrEqual(130000)
+    expect(
+      JSON.parse(fs.readFileSync(path.join(owner.directory, 'ownership-receipt.json')))
+    ).toMatchObject({ removalVerified: false, stoppedAt: expect.any(String) })
+  })
+
   test('rejects a surviving volume and retains teardown failures', () => {
     const owner = owned(empty)
     owner.save({ project: owner.project, compose: owner.file, preflightPassed: true })
@@ -1074,6 +1179,279 @@ describe('telemetry sidecar verification', () => {
     record.sidecars = persistEvidence({ name, record, directory, observers })
     return record
   }
+
+  const configured = () => {
+    const pinned = JSON.parse(
+      fs.readFileSync(path.resolve('scripts/e2e/telemetry/fixtures/manifest.json'))
+    )
+    const digest = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex')
+    const record = {
+      status: 'passed',
+      run: {
+        stem: 'positive',
+        project: 'telemetry-positive',
+        line: '4.3.1',
+        composeSha256: pinned.composeSha256['docker-compose.telemetry.yml'],
+      },
+      fixture: {
+        manifestSha256: digest(fs.readFileSync('scripts/e2e/telemetry/fixtures/manifest.json')),
+      },
+      results: { resource: { deleted: true }, window: { start: 0, deadline: 60 } },
+    }
+    const put = (file, value) => fs.writeFileSync(path.join(directory, file), JSON.stringify(value))
+    put('identity.json', {
+      project: record.run.project,
+      line: '4.3.1',
+      preflightPassed: true,
+      preflight: { containers: [], networks: [], volumes: [] },
+      readyAt: 'ready',
+      startedAt: 'started',
+      configSha256: 'config',
+      images: [1, 2, 3].map((n) => ({
+        container: String(n),
+        repoDigests: pinned.lines['4.3.1'].repoDigests,
+      })),
+      brokers: [1, 2, 3].map(() => ({
+        reporterSha256: pinned.lines['4.3.1'].reporterJar.sha256,
+        configSha256: 'config',
+      })),
+    })
+    for (const node of ['1', '2', '3'])
+      put(`reporter-${node}.json`, { node, kafkaClients: '4.3.1' })
+    const observers = {}
+    const rows = []
+    for (const [i, kind] of kinds.entries()) {
+      const uuid = `00112233-4455-6677-8899-aabbccddee0${i}`
+      const clientId = `positive-${kind}`
+      const subdir = `observer-${kind}`
+      fs.mkdirSync(path.join(directory, subdir))
+      observers[kind] = { directory: path.join(directory, subdir) }
+      const event = (requestKey, apiKey, writeAt, responseAt, duration) => ({
+        requestKey,
+        apiKey,
+        apiVersion: 0,
+        writeAt,
+        responseAt,
+        duration,
+        clientId,
+        node: '1',
+        socketId: 1,
+        correlationId: Number(requestKey.slice(1)),
+        knownNode: kind === 'admin' && writeAt > 2,
+      })
+      const requests =
+        kind === 'admin'
+          ? [event('r1', 3, 1, 2, 1), event('r2', 32, 3, 4, 5), event('r3', 60, 23, 25, 7)]
+          : [event('r1', 18, 1, 2, 1)]
+      const wire = requests.map((r, index) => ({
+        type: 'request',
+        ...r,
+        index: index + 1,
+        correlation: r.correlationId,
+        response: { responseAt: r.responseAt },
+      }))
+      const connects = [{ type: 'connect', socketId: 1, at: 0.5 }]
+      const get = {
+        apiKey: 71,
+        apiVersion: 0,
+        uuid,
+        response: {
+          uuid,
+          errorCode: 0,
+          pushIntervalMs: 1000,
+          telemetryMaxBytes: 4096,
+          requestedMetrics: ['org.apache.kafka.'],
+          subscriptionId: 1,
+          deltaTemporality: true,
+        },
+      }
+      const times = kind === 'admin' ? [10, 20, 30, 40, 50] : [10, 20, 30]
+      const keys = times.map((_, j) => `r${10 + j}`)
+      const pushes = times.map((writeAt, j) => {
+        const raw = Buffer.from(`${kind}-${j}`)
+        const hash = digest(raw)
+        const requestKey = keys[j]
+        const metrics = [
+          {
+            name: `org.apache.kafka.${kind === 'share' ? 'consumer' : kind}.connection.creation.total`,
+            kind: 'SUM',
+            monotonic: true,
+            temporality: 'AGGREGATION_TEMPORALITY_DELTA',
+            points: [{ attrs: [], asInt: j === 0 ? '1' : '0' }],
+          },
+        ]
+        if (kind === 'admin' && [0, 2].includes(j))
+          for (const suffix of ['avg', 'max'])
+            metrics.push({
+              name: `org.apache.kafka.admin.node.request.latency.${suffix}`,
+              kind: 'GAUGE',
+              points: [{ attrs: [['node_id', 'string', '1']], asDouble: j === 0 ? '5' : '7' }],
+            })
+        const attrs = kind === 'admin' ? [] : [['client_rack', 'string', 'fixture-rack']]
+        if (kind === 'consumer' || kind === 'share')
+          attrs.push([
+            'group_id',
+            'string',
+            kind === 'share' ? 'positive-share-group' : 'positive-group',
+          ])
+        const decoded = { dataSha256: hash, dataBytes: raw.length, resources: [{ attrs }], metrics }
+        const seq = rows.length + 1
+        rows.push(
+          row('1', seq, {
+            clientInstanceId: uuid,
+            clientId,
+            dataBytes: raw.length,
+            dataSha256: hash,
+          })
+        )
+        const result = {
+          requestKey,
+          uuid,
+          node: '1',
+          compressionType: 0,
+          rawBytes: raw.length,
+          transmittedBytes: raw.length,
+          rawSha256: hash,
+          transmittedSha256: hash,
+          decoded,
+          exportIdentity: { node: '1', seq },
+        }
+        fs.writeFileSync(path.join(directory, subdir, `push-${requestKey}.bin`), raw)
+        fs.writeFileSync(path.join(directory, subdir, `raw-${hash}.bin`), raw)
+        put(`${subdir}/decoded-${requestKey}.json`, result)
+        return {
+          type: 'request',
+          apiKey: 72,
+          apiVersion: 0,
+          requestKey,
+          writeAt,
+          response: { errorCode: 0, responseAt: writeAt + 1 },
+          uuid,
+          clientId,
+          node: '1',
+          subscriptionId: 1,
+          compressionType: 0,
+          metricsBytes: raw.length,
+          metricsSha256: hash,
+          terminating: false,
+        }
+      })
+      record.results[kind] = {
+        uuid,
+        clientId,
+        requestKeys: keys,
+        arithmetic: {
+          requests,
+          connects,
+          delta: true,
+          total: '1',
+          expected: 1,
+          sums: times.map((_, j) => (j === 0 ? '1' : '0')),
+          allocations:
+            kind === 'admin' ? [{ node: '1', windows: [['r2'], [], ['r3'], [], []] }] : [],
+        },
+      }
+      if (kind === 'admin')
+        record.results.control = {
+          discovery: wire.slice(0, 2),
+          knownAfter: 2,
+          checkpoint: 2,
+          controlledAt: 22,
+          wire: wire.slice(2),
+          requestEvents: requests.slice(2),
+          requests: requests.slice(2),
+          samples: ['r12', 'r13', 'r14'],
+        }
+      put(`${subdir}/transcript.json`, {
+        records: [...connects, ...wire, get, ...pushes],
+        sockets: [{ id: 1, kind: 'normal' }],
+        failures: [],
+        cleanup: { children: 0, timers: 0, stillOpen: [], attached: 0 },
+      })
+    }
+    fs.writeFileSync(
+      path.join(directory, 'exports-1.jsonl'),
+      rows.map(JSON.stringify).join('\n') + '\n'
+    )
+    fs.writeFileSync(path.join(directory, 'exports-2.jsonl'), '')
+    record.sidecars = persistEvidence({ name: 'telemetry-reporter', record, directory, observers })
+    return record
+  }
+  const rewrite = (record, relative, change) => {
+    const file = path.join(directory, relative)
+    const value = JSON.parse(fs.readFileSync(file))
+    change(value)
+    const bytes = Buffer.from(JSON.stringify(value))
+    fs.writeFileSync(file, bytes)
+    Object.assign(
+      record.sidecars.files.find((item) => item.path === relative),
+      {
+        bytes: bytes.length,
+        sha256: crypto.createHash('sha256').update(bytes).digest('hex'),
+      }
+    )
+  }
+
+  test('verifies configured project evidence including complete Push and controlled RTT ledgers', () => {
+    expect(() => verifyScenario(configured(), directory)).not.toThrow()
+  })
+
+  test.each([
+    'omitted',
+    'rejected',
+    'unanswered',
+    'source-node',
+    'invented-control',
+    'skipped-control-sample',
+    'late-control',
+    'missing-idle',
+  ])('rejects configured evidence with %s even when sidecar hashes are refreshed', (mutation) => {
+    const record = configured()
+    const result = record.results.producer
+    if (mutation === 'omitted') {
+      result.requestKeys.splice(1, 1)
+      result.arithmetic.sums.splice(1, 1)
+    } else if (mutation === 'rejected' || mutation === 'unanswered') {
+      rewrite(record, record.sidecars.owners.producer, (t) => {
+        const push = { ...t.records.find((r) => r.apiKey === 72), requestKey: 'r99', writeAt: 15 }
+        if (mutation === 'unanswered') delete push.response
+        else push.response = { errorCode: 42, responseAt: 16 }
+        t.records.splice(
+          t.records.findIndex((r) => r.requestKey === 'r11'),
+          0,
+          push
+        )
+      })
+    } else if (mutation === 'source-node') {
+      rewrite(record, `${record.sidecars.root}/observer-producer/decoded-r10.json`, (d) => {
+        d.exportIdentity.node = '2'
+      })
+      const source = JSON.parse(
+        fs
+          .readFileSync(path.join(directory, record.sidecars.root, 'exports-1.jsonl'), 'utf8')
+          .split('\n')[0]
+      )
+      const relative = `${record.sidecars.root}/exports-2.jsonl`
+      const bytes = Buffer.from(JSON.stringify({ ...source, node: '2' }) + '\n')
+      fs.writeFileSync(path.join(directory, relative), bytes)
+      Object.assign(
+        record.sidecars.files.find((item) => item.path === relative),
+        {
+          bytes: bytes.length,
+          sha256: crypto.createHash('sha256').update(bytes).digest('hex'),
+        }
+      )
+    } else if (mutation === 'invented-control') {
+      record.results.control.requests = [{ requestKey: 'invented' }]
+    } else if (mutation === 'skipped-control-sample') {
+      record.results.control.samples = ['r12', 'r14', 'r13']
+    } else if (mutation === 'late-control') {
+      record.results.control.controlledAt = 5
+    } else {
+      record.results.control.samples.pop()
+    }
+    expect(() => verifyScenario(record, directory)).toThrow()
+  })
 
   test('verifies full immutable archives and rejects tampering or missing cleanup', () => {
     const record = create()

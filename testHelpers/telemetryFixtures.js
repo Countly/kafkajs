@@ -836,10 +836,6 @@ class TelemetryWireObserver {
     const raw = decompress(record.compressionType, blob)
     if (raw.length > PAYLOAD_CAP) throw new Error('Raw telemetry exceeds 4096 bytes')
     const rawSha256 = sha256(raw)
-    fs.writeFileSync(path.join(this.directory, `push-${record.requestKey}.bin`), blob, {
-      flag: 'wx',
-      mode: 0o600,
-    })
     const rawFile = path.join(this.directory, `raw-${rawSha256}.bin`)
     if (!fs.existsSync(rawFile)) fs.writeFileSync(rawFile, raw, { flag: 'wx', mode: 0o600 })
     const row = await this.#join(record, raw.length, rawSha256, sinkWaitMs)
@@ -1172,7 +1168,13 @@ class TelemetryWireObserver {
       record.metricsSha256 = sha256(blob)
     }
     this.#add(record)
-    if (blob) this.#blobs.set(record.requestKey, blob)
+    if (blob) {
+      fs.writeFileSync(path.join(this.directory, `push-${record.requestKey}.bin`), blob, {
+        flag: 'wx',
+        mode: 0o600,
+      })
+      this.#blobs.set(record.requestKey, blob)
+    }
     state.pending.set(head.correlation, record)
     if (TELEMETRY_APIS.has(head.apiKey)) state.kind = 'telemetry'
     else if (state.kind === 'undecided' && !SETUP_APIS.has(head.apiKey)) state.kind = 'normal'
