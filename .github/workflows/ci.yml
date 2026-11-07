@@ -122,3 +122,97 @@ jobs:
           path: .tmp/e2e/
           if-no-files-found: ignore
           include-hidden-files: true
+  telemetry:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    needs: [unit]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { node: 24, kafka: 4.3.1, group: telemetry-reporter, compose: docker-compose.telemetry.yml }
+          - { node: 24, kafka: 4.2.2, group: telemetry-reporter, compose: docker-compose.telemetry.yml }
+          - { node: 24, kafka: 4.3.1, group: telemetry-base, compose: docker-compose.yml }
+          - { node: 24, kafka: 4.4.0, group: telemetry-base, compose: docker-compose.yml }
+    env:
+      KAFKA_VERSION: ${{ matrix.kafka }}
+      COMPOSE_FILE: ${{ matrix.compose }}
+      TF1_CACHE: ${{ github.workspace }}/.tmp/telemetry-cache
+      TF1_WORK: ${{ github.workspace }}/.tmp/telemetry-work
+      TELEMETRY_JAVA_CACHE: ${{ github.workspace }}/.tmp/telemetry-cache
+      TELEMETRY_EVIDENCE_DIR: ${{ github.workspace }}/.tmp/telemetry-evidence
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '${{ matrix.node }}', cache: npm }
+      - if: matrix.group == 'telemetry-reporter'
+        uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '21' }
+      - run: npm ci
+      - run: docker compose version
+      - name: Build and verify the reporter fixture
+        if: matrix.group == 'telemetry-reporter'
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          bash scripts/e2e/telemetry/fetch.sh
+          bash scripts/e2e/telemetry/build.sh "$KAFKA_VERSION"
+          bash scripts/e2e/telemetry/run.sh verify "$KAFKA_VERSION"
+      - name: Run the observer checks with the independent Java decoder
+        if: matrix.group == 'telemetry-reporter' && matrix.kafka == '4.3.1'
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: npx jest --runInBand --ci --testPathPatterns 'testHelpers/__tests__/telemetryFixtures\.spec\.js$'
+      - name: Prepare telemetry evidence
+        run: |
+          echo "KAFKAJS_TREE=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          rm -rf .tmp/e2e "$TELEMETRY_EVIDENCE_DIR"
+          mkdir -p .tmp/e2e "$TELEMETRY_EVIDENCE_DIR"
+          chmod 0777 "$TELEMETRY_EVIDENCE_DIR"
+      - name: Run telemetry lane
+        timeout-minutes: 15
+        env:
+          DO_NOT_STOP: '1'
+          KAFKAJS_LANE: docker
+          TMPDIR: ${{ runner.temp }}
+        run: ./scripts/testWithKafka.sh "npm run test:group:${{ matrix.group }} -- --ci"
+      - name: Verify the mounted reporter on every broker
+        if: always() && matrix.group == 'telemetry-reporter'
+        run: |
+          set -euo pipefail
+          expected=$(node -p "require('./scripts/e2e/telemetry/fixtures/manifest.json').lines['$KAFKA_VERSION'].reporterJar.sha256")
+          for service in kafka1 kafka2 kafka3; do
+            actual=$(docker compose -f "$COMPOSE_FILE" exec -T "$service" sha256sum /opt/kafka/libs/counting-telemetry-reporter.jar | cut -d' ' -f1)
+            test "$actual" = "$expected"
+          done
+      - name: Verify telemetry evidence before teardown
+        if: always()
+        run: |
+          node <<'NODE'
+          const fs = require('fs')
+          const { spawnSync } = require('child_process')
+          const { readBrokerVersion } = require('./testHelpers/brokerVersion')
+          const files = fs.readdirSync('.tmp/e2e').filter(name => name.endsWith('.jsonl'))
+            .map(name => `.tmp/e2e/${name}`)
+          const result = spawnSync(process.execPath, [
+            'scripts/evidence/verify.js', '--broker', readBrokerVersion(), ...files,
+          ], { stdio: 'inherit' })
+          if (result.error) throw result.error
+          process.exitCode = result.status ?? 1
+          NODE
+      - name: Stop telemetry cluster
+        if: always()
+        run: |
+          docker compose -f "$COMPOSE_FILE" logs --no-color > .tmp/e2e/compose.log 2>&1 || true
+          docker compose -f "$COMPOSE_FILE" down --remove-orphans
+          test -z "$(docker ps -aq --filter label=custom.project=kafkajs)"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-${{ matrix.group }}-${{ matrix.kafka }}-node${{ matrix.node }}
+          path: |
+            .tmp/e2e/
+            .tmp/telemetry-evidence/
+          if-no-files-found: ignore
+          include-hidden-files: true

@@ -61,6 +61,8 @@
     "test:group:share-shutdown": "SHARE_SHUTDOWN_E2E=1 jest --detectOpenHandles --runInBand --runTestsByPath src/consumer/share/__tests__/shareShutdownLive.spec.js",
     "test:group:share-soak": "SHARE_SOAK_E2E=1 node --expose-gc node_modules/jest/bin/jest.js --detectOpenHandles --runInBand --runTestsByPath src/consumer/share/__tests__/shareSoakLive.spec.js",
     "test:group:share-limit": "SHARE_SESSION_E2E=1 SHARE_SESSION_LIMIT_E2E=1 jest --forceExit --runInBand --testPathPatterns 'src/consumer/share/__tests__/shareSessionLive\\.spec\\.js'",
+    "test:group:telemetry-reporter": "TELEMETRY_E2E=1 jest --detectOpenHandles --runInBand --testPathPatterns 'src/telemetry/__tests__/reporterLive\\.spec\\.js' --testNamePattern '^(reporter export|reporter no-resource control)$'",
+    "test:group:telemetry-base": "TELEMETRY_E2E=1 jest --detectOpenHandles --runInBand --testPathPatterns 'src/telemetry/__tests__/reporterLive\\.spec\\.js' --testNamePattern '^reporter no-plugin control$'",
     "test:e2e:share-delivery": "timeout --signal=TERM --kill-after=15s 600s node \"${KAFKAJS_LIVE_GUARD:?Set the reviewed live guard path}\" \"${KAFKA_VERSION:-4.3.1}\" tv2 SHARE_DELIVERY_E2E src/consumer/share/__tests__/shareDeliveryLive.spec.js",
     "test:e2e:share-ack": "timeout --signal=TERM --kill-after=15s 600s node \"${KAFKAJS_LIVE_GUARD:?Set the reviewed live guard path}\" \"${KAFKA_VERSION:-4.3.1}\" tv2 SHARE_ACK_E2E src/consumer/share/__tests__/shareAckTypesLive.spec.js",
     "test:e2e:share-lock": "timeout --signal=TERM --kill-after=15s 600s node \"${KAFKAJS_LIVE_GUARD:?Set the reviewed live guard path}\" \"${KAFKA_VERSION:-4.3.1}\" share SHARE_LOCK_E2E src/consumer/share/__tests__/shareLockLive.spec.js",
@@ -164,7 +166,16 @@
     "test:e2e:admin-tokens": "timeout --kill-after=30s 600s node \"$P9_CLUSTER_GUARD\" \"${KAFKA_VERSION:-4.3.1}\" tokens ADMIN_TOKENS_E2E src/admin/__tests__/adminTokensLive.spec.js",
     "test:e2e:admin-lifecycle": "timeout --kill-after=30s 600s node \"$P9_CLUSTER_GUARD\" \"${KAFKA_VERSION:-4.3.1}\" tv2 ADMIN_LIFECYCLE_E2E src/admin/__tests__/adminLifecycleLive.spec.js",
     "test:e2e:admin-quota": "timeout --kill-after=30s 900s node \"$P9_CLUSTER_GUARD\" \"${KAFKA_VERSION:-4.3.1}\" tv2 ADMIN_QUOTA_E2E src/admin/__tests__/quotaThrottleLive.spec.js",
-    "test:e2e:admin-tiered": "timeout --kill-after=30s 1200s node \"$P9_CLUSTER_GUARD\" \"${KAFKA_VERSION:-4.3.1}\" tiered ADMIN_TIERED_E2E src/admin/__tests__/adminTieredLive.spec.js"
+    "test:e2e:admin-tiered": "timeout --kill-after=30s 1200s node \"$P9_CLUSTER_GUARD\" \"${KAFKA_VERSION:-4.3.1}\" tiered ADMIN_TIERED_E2E src/admin/__tests__/adminTieredLive.spec.js",
+    "test:e2e:telemetry-reporter": "timeout -k 10s 600s node \"${P9_CLUSTER_GUARD:?set sole live guard}\" \"${KAFKA_VERSION:?set broker line}\" tv2 TELEMETRY_E2E src/telemetry/__tests__/reporterLive.spec.js 'reporter export'",
+    "test:e2e:telemetry-prefix": "timeout -k 10s 600s node \"${P9_CLUSTER_GUARD:?set sole live guard}\" \"${KAFKA_VERSION:?set broker line}\" tv2 TELEMETRY_E2E src/telemetry/__tests__/subscriptionLive.spec.js 'subscription updates'",
+    "test:e2e:telemetry-custom": "timeout -k 10s 600s node \"${P9_CLUSTER_GUARD:?set sole live guard}\" \"${KAFKA_VERSION:?set broker line}\" tv2 TELEMETRY_E2E src/telemetry/__tests__/subscriptionLive.spec.js 'custom numeric snapshots'",
+    "test:e2e:telemetry-payload": "timeout -k 10s 600s node \"${P9_CLUSTER_GUARD:?set sole live guard}\" \"${KAFKA_VERSION:?set broker line}\" tv2 TELEMETRY_E2E src/telemetry/__tests__/subscriptionLive.spec.js 'bounded compressed payload'",
+    "test:e2e:telemetry-shutdown": "timeout -k 10s 600s node \"${P9_CLUSTER_GUARD:?set sole live guard}\" \"${KAFKA_VERSION:?set broker line}\" tv2 TELEMETRY_E2E src/telemetry/__tests__/shutdownLive.spec.js 'close and reopen'",
+    "test:e2e:telemetry-unsupported": "timeout -k 10s 600s node \"${P9_CLUSTER_GUARD:?set sole live guard}\" \"${KAFKA_VERSION:?set broker line}\" tv2 TELEMETRY_E2E src/telemetry/__tests__/unsupportedLive.spec.js 'unsupported telemetry'",
+    "test:e2e:telemetry-java": "timeout -k 10s 600s node \"${P9_CLUSTER_GUARD:?set sole live guard}\" \"${KAFKA_VERSION:?set broker line}\" tv2 TELEMETRY_E2E src/telemetry/__tests__/javaInteropLive.spec.js 'java telemetry interoperability'",
+    "test:e2e:telemetry-outcomes": "timeout -k 10s 600s node \"${P9_CLUSTER_GUARD:?set sole live guard}\" \"${KAFKA_VERSION:?set broker line}\" tv2 TELEMETRY_E2E src/telemetry/__tests__/outcomesLive.spec.js 'foreground outcomes'",
+    "test:e2e:telemetry-soak": "timeout -k 10s 600s node \"${P9_CLUSTER_GUARD:?set sole live guard}\" \"${KAFKA_VERSION:?set broker line}\" tv2 TELEMETRY_E2E src/telemetry/__tests__/shutdownLive.spec.js 'telemetry churn'"
   },
   "devDependencies": {
     "@eslint/compat": "^1.4.1",

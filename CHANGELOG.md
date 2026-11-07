@@ -19,6 +19,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Verify normal physical connections and completed-request observations independently.
 - Add independently generated and decoded OTLP metric vectors.
 - Exercise subscription updates and isolated bounded error recovery with fake transport handles. Verify Broker framing/quota propagation, transport negotiation and authentication, queue commit refusal, and omission-warning boundaries through the real network stack.
+- Add a pinned broker metrics reporter fixture with independent OTLP export and push-interval verification.
 
 #### Behavior changes
 
