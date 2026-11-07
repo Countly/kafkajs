@@ -75,6 +75,60 @@ const settle = async () => {
   for (let turn = 0; turn < 30; turn++) await Promise.resolve()
 }
 
+/**
+ * Journals every timer the machine arms or clears while the fake clock still owns delivery.
+ * @param {{setTimeout:Function,clearTimeout:Function}} clock the machine's own clock object
+ * @returns {{armed:object[],cleared:object[]}} callbacks, delays and handles in call order
+ */
+const journalTimers = (clock) => {
+  const journal = { armed: [], cleared: [] }
+  const { setTimeout: arm, clearTimeout: clear } = clock
+  clock.setTimeout = (callback, delay) => {
+    const handle = arm(callback, delay)
+    journal.armed.push({ callback, delay, handle })
+    return handle
+  }
+  clock.clearTimeout = (handle) => {
+    journal.cleared.push(handle)
+    return clear(handle)
+  }
+  return journal
+}
+
+/**
+ * Starts one public getter call and records whether it has settled.
+ * @param {object} h the setup controls
+ * @param {number} timeout public timeout in milliseconds
+ * @returns {{settled:boolean,result:Promise<*>}} the call's outcome, with rejections as values
+ */
+const caller = (h, timeout) => {
+  const call = { settled: false }
+  call.result = h.client
+    .clientInstanceId({ timeout })
+    .catch((error) => error)
+    .then((value) => {
+      call.settled = true
+      return value
+    })
+  return call
+}
+
+/**
+ * Holds the first Get and admits one short (10 ms) and sixty-three long (5000 ms) waiters.
+ * @param {object} h the setup controls
+ * @returns {Promise<{short:object,long:object[],journal:object}>} the callers and the timer journal
+ */
+const fillWithOneShort = async (h) => {
+  h.client.resume()
+  await jest.advanceTimersByTimeAsync(0)
+  const journal = journalTimers(h.client.clock)
+  const short = caller(h, 10)
+  const long = Array.from({ length: 63 }, () => caller(h, 5000))
+  expect(h.client.waiters.size).toBe(64)
+  expect(h.handle.get).toHaveBeenCalledTimes(1)
+  return { short, long, journal }
+}
+
 beforeEach(() => jest.useFakeTimers({ now: 0 }))
 afterEach(() => jest.useRealTimers())
 
@@ -243,6 +297,149 @@ describe('public instance ID contract', () => {
     expect(h.client.waiters.size).toBe(1)
     h.client.suspend()
     expect(await replacement).toMatchObject({ reason: 'not-connected' })
+    expect(jest.getTimerCount()).toBe(0)
+  })
+
+  test('admission reclaims an expired slot before any Get release, timer delivery or settlement', async () => {
+    const h = setup()
+    const { short, long, journal } = await fillWithOneShort(h)
+    const obsolete = journal.armed.at(-1)
+    expect(h.client.waiterTimer).toBe(obsolete.handle)
+    h.advance(11)
+    const timers = jest.getTimerCount()
+    const armed = journal.armed.length
+    const cleared = journal.cleared.length
+    const replacement = caller(h, 3000)
+    expect(h.client.waiters.size).toBe(64)
+    expect([...h.client.waiters].map((waiter) => waiter.deadline).sort((a, b) => a - b)).toEqual([
+      3011,
+      ...Array(63).fill(5000),
+    ])
+    expect(journal.armed).toHaveLength(armed + 1)
+    expect(journal.armed.at(-1).delay).toBe(3000)
+    expect(journal.cleared).toHaveLength(cleared + 1)
+    expect(journal.cleared.at(-1)).toBe(obsolete.handle)
+    expect(h.client.waiterTimer).toBe(journal.armed.at(-1).handle)
+    expect(jest.getTimerCount()).toBe(timers)
+    expect(await short.result).toMatchObject({ reason: 'timeout' })
+    await settle()
+    expect([...long, replacement].some((call) => call.settled)).toBe(false)
+    expect(h.handle.get).toHaveBeenCalledTimes(1)
+    expect(h.transport.open).toHaveBeenCalledTimes(1)
+    obsolete.callback()
+    expect(h.client.waiters.size).toBe(64)
+    expect(journal.armed).toHaveLength(armed + 2)
+    expect(journal.armed.at(-1).delay).toBe(3000)
+    expect(jest.getTimerCount()).toBe(timers)
+    await settle()
+    expect([...long, replacement].some((call) => call.settled)).toBe(false)
+    h.client.suspend()
+    const outcomes = await Promise.all([...long, replacement].map((call) => call.result))
+    expect(outcomes.every((error) => error.reason === 'not-connected')).toBe(true)
+    expect(jest.getTimerCount()).toBe(0)
+  })
+
+  test('public close after a reclaiming admission rejects every uncached caller and a stale answer cannot settle a replacement', async () => {
+    const h = setup()
+    const { short, long } = await fillWithOneShort(h)
+    h.advance(11)
+    const admitted = caller(h, 3000)
+    await h.client.close()
+    expect(await short.result).toMatchObject({ reason: 'timeout' })
+    const closed = await Promise.all([...long, admitted].map((call) => call.result))
+    expect(closed).toHaveLength(64)
+    expect(closed.every((error) => error.reason === 'closed')).toBe(true)
+    expect(h.client.waiters.size).toBe(0)
+    expect(h.client.waiterTimer).toBeNull()
+    expect(jest.getTimerCount()).toBe(0)
+    h.client.resume()
+    const replacement = caller(h, 3000)
+    expect(h.client.waiters.size).toBe(1)
+    h.resolveGet(h.answer)
+    await settle()
+    expect(h.client.uuid).toBeNull()
+    expect(h.client.waiters.size).toBe(1)
+    expect(replacement.settled).toBe(false)
+    h.client.suspend()
+    expect(await replacement.result).toMatchObject({ reason: 'not-connected' })
+    expect(jest.getTimerCount()).toBe(0)
+  })
+
+  test('the sixty-fifth live waiter is refused without touching a timer and the exact deadline instant frees one slot', async () => {
+    const h = setup()
+    const { short, long, journal } = await fillWithOneShort(h)
+    const members = [...h.client.waiters]
+    const timer = h.client.waiterTimer
+    const timers = jest.getTimerCount()
+    const armed = journal.armed.length
+    const cleared = journal.cleared.length
+    h.advance(9)
+    await expect(h.client.clientInstanceId({ timeout: 100 })).rejects.toMatchObject({
+      reason: 'limit',
+    })
+    expect([...h.client.waiters]).toHaveLength(64)
+    expect([...h.client.waiters].every((waiter, index) => waiter === members[index])).toBe(true)
+    expect(h.client.waiterTimer).toBe(timer)
+    expect(journal.armed).toHaveLength(armed)
+    expect(journal.cleared).toHaveLength(cleared)
+    expect(jest.getTimerCount()).toBe(timers)
+    expect(short.settled).toBe(false)
+    h.advance(10)
+    const next = caller(h, 100)
+    expect(h.client.waiters.size).toBe(64)
+    expect(h.client.waiters.has(members[0])).toBe(false)
+    expect(await short.result).toMatchObject({ reason: 'timeout' })
+    expect(journal.armed).toHaveLength(armed + 1)
+    h.client.suspend()
+    const outcomes = await Promise.all([...long, next].map((call) => call.result))
+    expect(outcomes.every((error) => error.reason === 'not-connected')).toBe(true)
+    expect(jest.getTimerCount()).toBe(0)
+  })
+
+  test('one admission reclaims every expired waiter and arms a single timer for the live set', async () => {
+    const h = setup()
+    h.client.resume()
+    await jest.advanceTimersByTimeAsync(0)
+    const journal = journalTimers(h.client.clock)
+    const expired = Array.from({ length: 64 }, () => caller(h, 10))
+    expect(h.client.waiters.size).toBe(64)
+    h.advance(10)
+    const armed = journal.armed.length
+    const live = caller(h, 500)
+    expect(h.client.waiters.size).toBe(1)
+    expect(journal.armed).toHaveLength(armed + 1)
+    expect(journal.armed.at(-1).delay).toBe(500)
+    const outcomes = await Promise.all(expired.map((call) => call.result))
+    expect(outcomes.every((error) => error.reason === 'timeout')).toBe(true)
+    expect(live.settled).toBe(false)
+    expect(h.handle.get).toHaveBeenCalledTimes(1)
+    h.client.suspend()
+    expect(await live.result).toMatchObject({ reason: 'not-connected' })
+    expect(jest.getTimerCount()).toBe(0)
+  })
+
+  test('validation, cache and timeout-zero outcomes never reclaim another caller slot', async () => {
+    const h = setup()
+    const { short, long, journal } = await fillWithOneShort(h)
+    h.advance(11)
+    const armed = journal.armed.length
+    const cleared = journal.cleared.length
+    await expect(h.client.clientInstanceId({ timeout: 0 })).rejects.toMatchObject({
+      reason: 'timeout',
+    })
+    await expect(h.client.clientInstanceId({ timeout: -1 })).rejects.toBeInstanceOf(
+      KafkaJSInvalidConfigurationError
+    )
+    h.client.uuid = ID
+    await expect(h.client.clientInstanceId()).resolves.toBe(ID)
+    h.client.uuid = null
+    expect(h.client.waiters.size).toBe(64)
+    expect(short.settled).toBe(false)
+    expect(journal.armed).toHaveLength(armed)
+    expect(journal.cleared).toHaveLength(cleared)
+    h.client.suspend()
+    expect(await short.result).toMatchObject({ reason: 'timeout' })
+    await Promise.all(long.map((call) => call.result))
     expect(jest.getTimerCount()).toBe(0)
   })
 
