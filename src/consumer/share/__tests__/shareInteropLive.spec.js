@@ -833,15 +833,17 @@ class JavaJournal {
  * @param {string} options.topic the topic to read
  * @param {number} options.runForMs how long the member polls
  * @param {number} [options.haltAfter] halt after this many printed records, when positive
+ * @param {string} [options.closeFile] Parent's request for a normal close after settlement.
  * @returns {string[]} the argv of the watchdog that runs the launcher, with no shell involved
  */
-const javaArgv = ({ bootstrap, group, topic, runForMs, haltAfter = 0 }) => [
+const javaArgv = ({ bootstrap, group, topic, runForMs, haltAfter = 0, closeFile }) => [
   ...JAVA_WATCHDOG,
   RUN_SH,
   '--role',
   'share-member',
   '--report-polls',
   ...(haltAfter > 0 ? ['--halt-after', String(haltAfter)] : []),
+  ...(closeFile ? ['--close-file', closeFile] : []),
   bootstrap,
   group,
   topic,
@@ -896,9 +898,17 @@ class JavaShareMember {
       this.exit = { code, signal, at: performance.now(), pid: child.pid, nonce: this.nonce }
     })
     child.once('close', () => {
+      this.closedAt = performance.now()
       this.journal.finish()
       this.settle()
     })
+  }
+
+  /** @returns {void} Requests normal close without signalling the watchdog or changing receipts. */
+  requestClose() {
+    if (this.exit !== null) return
+    fs.writeFileSync(this.argv.closeFile, '', { flag: 'wx' })
+    this.closeRequestedAt = performance.now()
   }
 
   /**
@@ -1240,12 +1250,25 @@ class ShareInteropCase {
 
   /** @returns {object} Progress and public outcomes before cleanup can change them. */
   progress() {
+    const member = this.javaMember
     return {
+      pendingPredicate: this.pendingPredicate,
+      acceptCoverageComplete: this.successfulAccepts(),
       jsEntries: this.jsEntries.length,
-      javaEntries: this.javaMember?.journal.entries.length,
-      javaExit: this.javaMember?.exit,
-      javaStderr: this.javaMember?.stderr,
-      javaProblem: this.javaMember?.journal.problem,
+      javaEntries: member?.journal.entries.length,
+      javaStartedAt: member?.startedAt,
+      javaCloseRequestedAt: member?.closeRequestedAt,
+      javaClosedAt: member?.closedAt,
+      javaDone: member?.journal.done,
+      javaCommittedPolls: member?.journal.committed,
+      javaUncommittedPolls: member?.journal.polls
+        .filter(({ pollId }) => !member.journal.committed.includes(pollId))
+        .map(({ pollId }) => pollId),
+      javaJournal: member && { lines: [...member.journal.lines], sha256: member.journal.sha256() },
+      javaExit: member?.exit,
+      javaStderr: member?.stderr,
+      javaProblem: member?.journal.problem,
+      javaErrors: member?.journal.errors,
       acknowledgements: this.js.acks.map((row) => ({ ...row, error: describeError(row.error) })),
       acknowledgementResponses: this.acknowledgements.evidence(this.group),
       heartbeats: this.tap.heartbeats,
@@ -1275,15 +1298,24 @@ class ShareInteropCase {
             scope,
             fileAllowance(bodyDeadline - performance.now(), CLEANUP_MS + FINAL_MS + CASE_JOIN_MS),
             async (body) => {
+              this.pendingPredicate = 'Case setup'
               await this.setup(body)
+              this.pendingPredicate = 'Scenario schedule'
               await this[this.kind](body)
+              this.pendingPredicate = 'Raw-log and handler oracles'
               await this.observe(body)
+              this.pendingPredicate = 'Workload members closing'
               await this.finish(body)
+              this.pendingPredicate = 'Cleanup and resource proof'
             }
-          )
+          ).catch((error) => {
+            this.row('body-failed', { error: describeError(error), ...this.progress() })
+            throw error
+          })
         },
         { budgetMs: fileAllowance(CLEANUP_MS, FINAL_MS + CASE_JOIN_MS) }
       )
+      this.pendingPredicate = 'Final resource proof'
       await this.complete(scope)
     } catch (error) {
       this.row('case-failed', { error: describeError(error), ...this.progress() })
@@ -1452,6 +1484,7 @@ class ShareInteropCase {
         topic: this.topic,
         runForMs: JAVA_RUN_MS[this.kind],
         haltAfter,
+        ...(haltAfter === 0 ? { closeFile: path.join(this.dir, 'java-close') } : {}),
       },
     })
     this.javaMember = member
@@ -1509,6 +1542,7 @@ class ShareInteropCase {
    * @returns {Promise<void>}
    */
   async produceRest(scope) {
+    this.pendingPredicate = 'The remaining corpus append'
     for (let partition = 0; partition < PARTITIONS; partition++) {
       const need = PER_PARTITION - (this.corpus.get(partition)?.length ?? 0)
       if (need > 0) await this.produceTo(scope, partition, need)
@@ -1534,6 +1568,7 @@ class ShareInteropCase {
    * @returns {Promise<{ js: number[], java: number[] }>} the partitions each member owns
    */
   async awaitMembers(scope) {
+    this.pendingPredicate = 'The two-member assignment'
     await pollTolerating(
       scope,
       25000,
@@ -1630,6 +1665,7 @@ class ShareInteropCase {
    * @returns {Promise<object[]>} Actual persisted rows.
    */
   async awaitPositions(scope, ends) {
+    this.pendingPredicate = 'The terminal share position'
     const position = await awaitTerminalSharePosition(
       this.admin,
       {
@@ -1647,13 +1683,28 @@ class ShareInteropCase {
   }
 
   /**
-   * Waits for the Java member to end, and checks its output.
+   * Waits for all successful Accepts before requesting Java's normal close, without idle polling.
    * @param {AbortSignal} scope the case scope
    * @returns {Promise<void>}
    */
   async awaitJavaExit(scope) {
+    this.pendingPredicate = 'Every record handled and successfully accepted'
+    await pollUntil(
+      scope,
+      15000,
+      () => {
+        this.javaMember.assertClean()
+        if (this.javaMember.closedAt !== undefined) this.javaMember.assertNormalExit()
+        this.acceptedOffsets()
+        return this.handlerTotal() >= RECORDS && this.successfulAccepts()
+      },
+      { label: this.pendingPredicate }
+    )
+    this.javaMember.requestClose()
+    this.pendingPredicate = 'The Java member exit and stream close'
+    this.row('java-close-requested', this.progress())
     await bounded(scope, JAVA_RUN_MS[this.kind] + 20000, () => this.javaMember.closed, {
-      label: 'The Java member ending',
+      label: this.pendingPredicate,
     })
   }
 
@@ -1671,6 +1722,7 @@ class ShareInteropCase {
    * @returns {Promise<void>}
    */
   async join(scope) {
+    this.pendingPredicate = 'The JavaScript member accepting its first records'
     for (let partition = 0; partition < PARTITIONS; partition++) {
       await this.produceTo(scope, partition, PER_PARTITION / 5)
     }
@@ -1693,9 +1745,6 @@ class ShareInteropCase {
     await this.produceRest(scope)
     await this.awaitJavaExit(scope)
     this.javaMember.assertNormalExit()
-    await pollUntil(scope, 15000, () => this.handlerTotal() >= RECORDS, {
-      label: 'Every record handled',
-    })
     expect(this.jsEntries.length).toBeGreaterThan(0)
     expect(this.javaMember.journal.entries.length).toBeGreaterThan(0)
   }
@@ -1938,9 +1987,6 @@ class ShareInteropCase {
     await this.produceRest(scope)
     await this.awaitJavaExit(scope)
     this.javaMember.assertNormalExit()
-    await pollUntil(scope, 15000, () => this.handlerTotal() >= RECORDS, {
-      label: 'Every record handled',
-    })
   }
 
   /**
@@ -2121,6 +2167,7 @@ class ShareInteropCase {
     expect(this.terminalPartitions).toHaveLength(PARTITIONS)
     expect(this.terminalPartitions.every(({ end }) => end === String(PER_PARTITION))).toBe(true)
     this.broker = await bounded(scope, 20000, async (inner) => {
+      this.pendingPredicate = 'Every identity successfully accepted'
       await pollUntil(
         inner,
         Infinity,
@@ -2147,6 +2194,8 @@ class ShareInteropCase {
     await bounded(scope, 10000, () => this.consumer.disconnect({ timeout: 5000 }))
     await bounded(scope, 30000, () => this.javaMember.closed)
     this.javaMember.assertClean()
+    this.pendingPredicate =
+      'The active same-group quiet verifier and post-verifier terminal position'
     this.quiet = await assertQuietTerminalGroup({
       kafka: this.client('verifier'),
       admin: this.admin,
@@ -2309,6 +2358,8 @@ class ShareInteropCase {
       })),
       javaExit: exit,
       javaStartedAt: this.javaMember.startedAt,
+      javaCloseRequestedAt: this.javaMember.closeRequestedAt,
+      javaClosedAt: this.javaMember.closedAt,
       javaStderr: this.javaMember.stderr,
       javaStderrHex: Buffer.concat(this.javaMember.stderrChunks).toString('hex'),
       javaProcess: {

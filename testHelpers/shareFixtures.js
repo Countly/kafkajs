@@ -573,10 +573,16 @@ const waitForShareGroupsEmpty = async (admin, groups, { signal, record } = {}) =
  * @param {string[]} groups Owned share group ids.
  * @param {string[]} topics Owned topic names.
  * @param {{ signal: AbortSignal, unrelated: string[], record?: Function }} options Existing cleanup scope and evidence sink.
+ * @param {number} [options.delayMs=250] Pause between broker absence observations.
  * @returns {Promise<void>} Once all absence and unrelated-presence checks hold.
  * @throws {Error} On missing evidence, a harmed sibling, retained fixtures or expiry.
  */
-const waitForShareFixtureAbsence = async (admin, groups, topics, { signal, unrelated, record }) => {
+const waitForShareFixtureAbsence = async (
+  admin,
+  groups,
+  topics,
+  { signal, unrelated, record, delayMs = 250 }
+) => {
   const { bounded, pollUntil } = require('../src/producer/__tests__/fixtures/bounded')
   await waitForShareGroupsEmpty(admin, groups, { signal, record })
   const pending = new Set()
@@ -617,7 +623,7 @@ const waitForShareFixtureAbsence = async (admin, groups, topics, { signal, unrel
         }
         return remaining.length === 0 && pending.size === 0
       },
-      { label: 'Share fixtures disappearing on every broker' }
+      { delayMs, label: 'Share fixtures disappearing on every broker' }
     )
   } finally {
     remove()

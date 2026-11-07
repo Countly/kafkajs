@@ -19,6 +19,7 @@ const {
 const {
   assertShareCleanup,
   captureShareCleanupBaseline,
+  waitForShareFixtureAbsence,
   setShareGroupConfigs,
   resetShareGroupConfigs,
   shareRecordIdentity,
@@ -313,21 +314,168 @@ class FeatureOffRun {
   }
 }
 
-/** Runs strict cleanup with the allowance left when cleanup actually begins. */
+/**
+ * Preserves every aggregate or restoration error without recursing through repeated causes.
+ * @param {Error} error The original failure.
+ * @param {Set<Error>} [seen] Ancestors already described in this error tree.
+ * @returns {object|null} The error and its nested cleanup failures.
+ */
+const cleanupError = (error, seen = new Set()) => {
+  if (error == null) return null
+  const detail = {
+    ...describeError(error),
+    message: String(error.message),
+    step: error.step,
+    elapsedMs: error.elapsedMs,
+  }
+  if (seen.has(error)) return detail
+  const ancestors = new Set([...seen, error])
+  return {
+    ...detail,
+    cause: error.cause ? cleanupError(error.cause, ancestors) : undefined,
+    errors: error.errors?.map((failure) => cleanupError(failure, ancestors)),
+    cleanupErrors: error.cleanupErrors?.map((failure) => cleanupError(failure, ancestors)),
+  }
+}
+
+/** Runs and joins every cleanup inside the case and file deadlines. */
 class FileCleanupStack extends CleanupStack {
+  /** @param {CapabilityCase} owner The case owning these cleanup operations. */
+  constructor(owner) {
+    super()
+    this.owner = owner
+  }
+
   /**
-   * @returns {Promise<Error[]>} Failed cleanups, including an exhausted file deadline, so the
-   *   original work failure remains primary. No cleanup starts after the file allowance expires.
+   * Joins cleanup without overwriting an earlier restoration failure on the primary error.
+   * @param {Function} work The case workload.
+   * @returns {Promise<*>} The workload result after all cleanup has settled.
    */
-  async closeAll() {
+  async run(work) {
+    let result
+    let primary
     try {
-      return await super.closeAll({
-        budgetMs: capabilityBudget(CLEANUP_MS, FINAL_MS + CASE_JOIN_MS),
-      })
+      result = await work()
     } catch (error) {
-      liveRun.taint(error)
-      return [error]
+      primary = error
     }
+    const failures = await this.closeAll()
+    if (primary) {
+      primary.cleanupErrors = [...new Set([...(primary.cleanupErrors || []), ...failures])].filter(
+        (error) => error !== primary
+      )
+      throw primary
+    }
+    if (failures.length) throw new AggregateError(failures, 'Cleanup failed')
+    return result
+  }
+
+  /** @returns {Promise<Error[]>} Every failed cleanup, with its step and elapsed time retained. */
+  async closeAll() {
+    const deadline = Math.min(
+      this.owner.deadline,
+      fileDeadline - FINAL_MS - CASE_JOIN_MS,
+      performance.now() + CLEANUP_MS
+    )
+    const failures = []
+    for (const { name, close } of this.cleanups.splice(0).reverse()) {
+      let work
+      let stopping
+      const startedAt = performance.now()
+      try {
+        await bounded(NEVER, Math.max(0, deadline - performance.now()), async (signal) => {
+          const expired = performance.now() >= deadline
+          const scope = AbortSignal.any([
+            signal,
+            this.owner.scope,
+            ...(expired ? [AbortSignal.abort(new Error('The cleanup deadline has expired'))] : []),
+          ])
+          const stop = () => {
+            stopping = Promise.allSettled([this.owner.abortClients()])
+          }
+          scope.addEventListener('abort', stop, { once: true })
+          if (scope.aborted) stop()
+          work = this.owner.cleanupStep(name, () => close(scope))
+          try {
+            return await work
+          } finally {
+            scope.removeEventListener('abort', stop)
+          }
+        })
+      } catch (error) {
+        error.step ??= name
+        error.elapsedMs ??= performance.now() - startedAt
+        liveRun.taint(error)
+        failures.push(error)
+      } finally {
+        const [result] = await Promise.allSettled([work])
+        const joined = [result, ...((await stopping) || [])]
+        for (const result of joined) {
+          if (result.status === 'rejected' && !failures.includes(result.reason)) {
+            liveRun.taint(result.reason)
+            failures.push(result.reason)
+          }
+        }
+      }
+    }
+    return failures
+  }
+}
+
+/**
+ * Keeps the case scope active through joined cleanup, reserving the existing join allowance.
+ * @param {AbortSignal} scope The enclosing live-case scope.
+ * @param {number} budgetMs The unchanged case budget.
+ * @param {'default'|'disabled'} method The selected capability arm.
+ * @returns {Promise<void>} Once the arm and all aborted client work have settled.
+ */
+const runCapabilityCase = async (scope, budgetMs, method) => {
+  const state = new CapabilityCase()
+  const controller = new AbortController()
+  const allowance = capabilityBudget(budgetMs, CLEANUP_MS + FINAL_MS + CASE_JOIN_MS)
+  state.deadline = performance.now() + allowance - CASE_JOIN_MS
+  state.scope = AbortSignal.any([scope, controller.signal])
+  const timer = setTimeout(
+    () =>
+      controller.abort(new Error('The capability case exhausted its work and cleanup allowance')),
+    Math.max(0, state.deadline - performance.now())
+  )
+  let stopping
+  const stop = () => {
+    liveRun.taint(state.scope.reason)
+    stopping = Promise.allSettled([state.abortClients()])
+  }
+  state.scope.addEventListener('abort', stop, { once: true })
+  let failure
+  try {
+    await state[method](state.scope)
+  } catch (error) {
+    failure = error
+  }
+  try {
+    const joined = await Promise.allSettled([state.sentinelReady])
+    const stopped = (await stopping) || []
+    const failures = [...joined, ...stopped]
+      .filter(({ status }) => status === 'rejected')
+      .map(({ reason }) => reason)
+    if (failures.length) {
+      liveRun.taint(failures[0])
+      if (!failure) failure = new AggregateError(failures, 'Case join failed')
+      else
+        failure.cleanupErrors = [
+          ...new Set([
+            ...(failure.cleanupErrors || []),
+            ...failures.filter((error) => error !== failure),
+          ]),
+        ]
+    }
+  } finally {
+    clearTimeout(timer)
+    state.scope.removeEventListener('abort', stop)
+  }
+  if (failure) {
+    state.row('case-failed', { error: cleanupError(failure), ...state.progress() })
+    throw failure
   }
 }
 
@@ -452,6 +600,7 @@ class ResourceGauge {
 class CapabilityCase {
   /** Builds a case with fresh names; nothing is created until `default` or `disabled`. */
   constructor() {
+    this.startedAt = performance.now()
     this.nonce = secureRandom(6)
     this.line = LINE
     this.topic = shareTopicName('capability')
@@ -459,7 +608,8 @@ class CapabilityCase {
     this.sentinel = `e2e-p9e-capability-sentinel-${this.nonce}`
     this.title = null
     this.budgetMs = null
-    this.stack = new FileCleanupStack()
+    this.stack = new FileCleanupStack(this)
+    this.cleanupSteps = []
     this.ledger = new SocketLedger()
     this.acknowledgements = new ShareAcknowledgementObserver()
     this.gauge = new ResourceGauge()
@@ -480,6 +630,66 @@ class CapabilityCase {
     this.admin = null
     this.sentinelCreated = false
     this.feature = { transcripts: [] }
+  }
+
+  /**
+   * Records the duration and original error of one cleanup operation, including nested steps.
+   * @param {string} step The operation name.
+   * @param {Function} work The operation to run and join.
+   * @returns {Promise<*>} The original result.
+   */
+  async cleanupStep(step, work) {
+    const startedAt = performance.now()
+    const entry = { step, elapsedMs: null, error: null }
+    this.cleanupSteps.push(entry)
+    try {
+      return await work()
+    } catch (error) {
+      error.step ??= step
+      error.elapsedMs ??= performance.now() - startedAt
+      entry.error = cleanupError(error)
+      throw error
+    } finally {
+      entry.elapsedMs = performance.now() - startedAt
+      this.row('cleanup-step', entry)
+    }
+  }
+
+  /**
+   * Captures a client's first close deadline inside the remaining case allowance.
+   * @param {object} client The client to disconnect.
+   * @param {number} limit The existing close allowance in milliseconds.
+   * @returns {Promise<void>} The original disconnect result.
+   */
+  disconnect(client, limit) {
+    const timeout = Math.max(0, Math.floor(Math.min(limit, this.deadline - performance.now())))
+    return client.disconnect({ timeout })
+  }
+
+  /**
+   * Fences pending admin calls and closes all case transports when their scope expires.
+   * @returns {Promise<void>} Once every forced client close has settled.
+   */
+  abortClients() {
+    this.stopping ??= (async () => {
+      for (const { socket } of this.ledger.entries) socket.destroy()
+      const results = await Promise.allSettled(
+        [
+          ['admin', this.admin],
+          ['consumer', this.consumer],
+          ['producer', this.producer],
+        ]
+          .filter(([, client]) => client)
+          .map(([name, client]) =>
+            this.cleanupStep(`abort ${name}`, () => client.disconnect({ timeout: 0 }))
+          )
+      )
+      const failures = results
+        .filter(({ status }) => status === 'rejected')
+        .map(({ reason }) => reason)
+      if (failures.length) throw new AggregateError(failures, 'Client abort failed')
+    })()
+    return this.stopping
   }
 
   /**
@@ -507,6 +717,7 @@ class CapabilityCase {
       case: this.title,
       profile: PROFILE,
       scenario: this.nonce,
+      caseElapsedMs: performance.now() - this.startedAt,
       groups: { capability: this.group },
       budgets: { caseMs: this.budgetMs, cleanupMs: CLEANUP_MS },
       wireVersions: wireVersionsOf(this.requests),
@@ -523,6 +734,7 @@ class CapabilityCase {
       shareFrames: this.ledger.shareFrames(),
       crashes: this.crashes.map((error) => describeError(error)),
       feature: this.feature,
+      cleanupSteps: this.cleanupSteps,
     }
   }
 
@@ -586,7 +798,7 @@ class CapabilityCase {
       consumer.on(events.DISCONNECT, () => this.disconnects++),
     ]
     this.stack.add(`remove ${label} listeners`, () => removers.forEach((remove) => remove()))
-    this.stack.add(`disconnect ${label}`, () => consumer.disconnect({ timeout: 2000 }))
+    this.stack.add(`disconnect ${label}`, () => this.disconnect(consumer, 2000))
     this.consumer = consumer
     this.connectAttempts++
     try {
@@ -628,9 +840,6 @@ class CapabilityCase {
       if (!expected) throw new Error(`No share capability expectation for broker line ${this.line}`)
       if (expected.connected) await this.roundTrip(scope, expected)
       else await this.refused(scope, expected)
-    } catch (error) {
-      this.row('case-failed', { error: describeError(error), ...this.progress() })
-      throw error
     } finally {
       this.acknowledgements.restore()
       this.gauge.uninstall()
@@ -662,8 +871,14 @@ class CapabilityCase {
         restore: (original) =>
           bounded(
             NEVER,
-            capabilityBudget(CLEANUP_MS, CLEANUP_MS + FINAL_MS + CASE_JOIN_MS),
-            (signal) => this.restore(original, signal)
+            Math.max(
+              0,
+              Math.min(
+                this.deadline - performance.now(),
+                capabilityBudget(CLEANUP_MS, CLEANUP_MS + FINAL_MS + CASE_JOIN_MS)
+              )
+            ),
+            (signal) => this.restore(original, AbortSignal.any([signal, scope]))
           ),
       })
       let state
@@ -679,9 +894,6 @@ class CapabilityCase {
         featureCommands: this.feature.transcripts,
         order: run.order,
       })
-    } catch (error) {
-      this.row('case-failed', { error: describeError(error), ...this.progress() })
-      throw error
     } finally {
       this.gauge.uninstall()
     }
@@ -897,12 +1109,12 @@ class CapabilityCase {
         groupId: this.group,
         ...CLIENT_CONFIG,
       })
-      this.stack.add('disconnect feature control', () => control.disconnect({ timeout: 2000 }))
+      this.stack.add('disconnect feature control', () => this.disconnect(control, 2000))
       try {
         await bounded(scope, 10000, () => control.connect())
         restore.control = 'connected'
       } finally {
-        await bounded(scope, 5000, () => control.disconnect({ timeout: 2000 }))
+        await bounded(scope, 5000, () => this.disconnect(control, 2000))
       }
     }
     restore.succeeded = true
@@ -949,8 +1161,7 @@ class CapabilityCase {
       'remove admin listeners',
       this.admin.on(this.admin.events.REQUEST, ({ payload }) => this.requests.push(payload))
     )
-    this.stack.add('delete topic', (signal) => this.deleteTopic(signal))
-    this.stack.add('delete group', (signal) => this.deleteGroup(signal, this.group))
+    this.stack.add('delete owned fixtures', (signal) => this.deleteFixtures(signal))
     this.stack.add('reset group configs', (signal) => this.resetConfigs(signal))
     await bounded(scope, 15000, () => this.admin.connect())
     await bounded(scope, 30000, () =>
@@ -978,7 +1189,7 @@ class CapabilityCase {
       'remove producer listeners',
       this.producer.on(this.producer.events.REQUEST, ({ payload }) => this.requests.push(payload))
     )
-    this.stack.add('disconnect producer', () => this.producer.disconnect())
+    this.stack.add('disconnect producer', () => this.disconnect(this.producer, CLEANUP_MS))
     await bounded(scope, 15000, () => this.producer.connect())
   }
 
@@ -1001,7 +1212,12 @@ class CapabilityCase {
         partitions: [{ partition: 0, offset: '0' }],
       })
     ).then(() => this.row('sentinel-created', { elapsedMs: performance.now() - startedAt }))
-    this.sentinelReady.catch(() => {})
+    this.sentinelReady.catch((error) =>
+      this.row('sentinel-failed', {
+        elapsedMs: performance.now() - startedAt,
+        error: cleanupError(error),
+      })
+    )
   }
 
   /**
@@ -1136,7 +1352,7 @@ class CapabilityCase {
    * @returns {Promise<void>}
    */
   async finish(scope) {
-    await bounded(scope, 10000, () => this.consumer.disconnect({ timeout: 5000 }))
+    await bounded(scope, 10000, () => this.disconnect(this.consumer, 5000))
     expect(this.disconnects).toBe(1)
     this.quiet = await assertQuietTerminalGroup({
       kafka: this.client('verifier'),
@@ -1156,76 +1372,92 @@ class CapabilityCase {
   }
 
   /**
-   * Proves owned objects are gone and resources are back at baseline, keeping the unrelated group
-   * until the proof is made, then removes it and disconnects the admin. It runs last.
-   * @param {AbortSignal} signal the cleanup scope
-   * @returns {Promise<void>}
-   * @throws {Error} the first failure of the proof, the removal or the disconnect
+   * Proves owned fixtures absent while preserving the sentinel, then removes it before one
+   * client-free resource comparison. Topic absence on every broker is proved only once.
+   * @param {AbortSignal} signal The cleanup scope.
+   * @returns {Promise<void>} Once all proofs and the final admin close have settled.
    */
   async cleanup(signal) {
-    let failure = null
-    try {
-      if (this.baseline) {
-        this.after = await assertShareCleanup(
-          this.admin,
-          [this.group],
-          [this.topic],
-          this.baseline,
-          this.probe,
-          { unrelated: this.sentinelCreated ? [this.sentinel] : [], signal, disconnectAdmin: true }
-        )
+    const failures = []
+    const steps = [
+      [
+        'prove owned fixture absence',
+        () =>
+          waitForShareFixtureAbsence(this.admin, [this.group], [this.topic], {
+            signal,
+            unrelated: this.sentinelCreated ? [this.sentinel] : [],
+            delayMs: 50,
+            record: (event, fields) => this.row(event, fields),
+          }),
+      ],
+      [
+        'delete sentinel',
+        async () => {
+          if (this.sentinelCreated) await this.deleteGroup(signal, this.sentinel)
+        },
+      ],
+      [
+        'prove final absence and resources',
+        async () => {
+          if (this.baseline) {
+            this.after = await assertShareCleanup(
+              this.admin,
+              [this.group, ...(this.sentinelCreated ? [this.sentinel] : [])],
+              [],
+              this.baseline,
+              this.probe,
+              { signal, disconnectAdmin: true, record: (event, fields) => this.row(event, fields) }
+            )
+          }
+        },
+      ],
+      ['disconnect admin', () => this.admin.disconnect({ timeout: 0 })],
+    ]
+    for (const [step, work] of steps) {
+      try {
+        await this.cleanupStep(step, work)
+      } catch (error) {
+        failures.push(error)
       }
-    } catch (error) {
-      failure = error
     }
-    try {
-      if (this.sentinelCreated) {
-        await bounded(signal, 15000, () => this.admin.connect())
-        await this.deleteGroup(signal, this.sentinel)
-        this.after = await assertShareCleanup(
-          this.admin,
-          [this.group, this.sentinel],
-          [this.topic],
-          this.baseline,
-          this.probe,
-          { signal, disconnectAdmin: true }
-        )
-      }
-    } catch (error) {
-      failure ??= error
-    }
-    try {
-      await this.admin.disconnect()
-    } catch (error) {
-      failure ??= error
-    }
-    if (failure) throw failure
+    if (failures.length) throw new AggregateError(failures, 'Cleanup proof failed')
+  }
+
+  /**
+   * Overlaps independent group and topic removal, retaining both outcomes before the proof.
+   * @param {AbortSignal} signal The cleanup scope.
+   * @returns {Promise<void>} Once both deletion operations have settled.
+   */
+  async deleteFixtures(signal) {
+    const results = await Promise.allSettled([
+      this.cleanupStep('delete group', () => this.deleteGroup(signal, this.group)),
+      this.cleanupStep('delete topic', () => this.deleteTopic(signal)),
+    ])
+    const failures = results
+      .filter(({ status }) => status === 'rejected')
+      .map(({ reason }) => reason)
+    if (failures.length) throw new AggregateError(failures, 'Fixture deletion failed')
   }
 
   /**
    * @param {AbortSignal} signal the cleanup scope
    * @returns {Promise<void>}
-   * @throws {Error} when the topic is still listed after deletion
+   * @throws {Error} When topic deletion is refused; the shared proof checks absence.
    */
   async deleteTopic(signal) {
     await bounded(signal, 10000, () =>
       this.admin.deleteTopics({ topics: [this.topic], timeout: 8000 })
     ).catch((error) => {
       if (error.type !== 'UNKNOWN_TOPIC_OR_PARTITION') throw error
+      this.row('topic-already-absent', { error: cleanupError(error) })
     })
-    await pollUntil(
-      signal,
-      10000,
-      async () => !(await this.admin.listTopics()).includes(this.topic),
-      { label: 'The topic disappearing' }
-    )
   }
 
   /**
    * @param {AbortSignal} signal the cleanup scope
    * @param {string} groupId the group to remove
    * @returns {Promise<void>}
-   * @throws {Error} when the group is still listed after deletion
+   * @throws {Error} When group deletion is refused; the shared proof checks absence.
    */
   async deleteGroup(signal, groupId) {
     await pollUntil(
@@ -1242,14 +1474,7 @@ class CapabilityCase {
           throw error
         }
       },
-      { label: 'The group deletion' }
-    )
-    await pollUntil(
-      signal,
-      10000,
-      async () =>
-        !(await this.admin.listGroups()).groups.some((group) => group.groupId === groupId),
-      { label: 'The group disappearing' }
+      { delayMs: 50, label: 'The group deletion' }
     )
   }
 
@@ -1494,13 +1719,7 @@ enabled('share capability on a live broker', () => {
 
   it(
     TITLE_DEFAULT,
-    liveCase(DEFAULT_BUDGET_MS, (scope) =>
-      bounded(
-        scope,
-        capabilityBudget(DEFAULT_BUDGET_MS, CLEANUP_MS + FINAL_MS + CASE_JOIN_MS),
-        (signal) => new CapabilityCase().default(signal)
-      )
-    ),
+    liveCase(DEFAULT_BUDGET_MS, (scope) => runCapabilityCase(scope, DEFAULT_BUDGET_MS, 'default')),
     caseTimeout(DEFAULT_BUDGET_MS)
   )
 
@@ -1508,11 +1727,7 @@ enabled('share capability on a live broker', () => {
     it(
       TITLE_DISABLED,
       liveCase(DISABLED_BUDGET_MS, (scope) =>
-        bounded(
-          scope,
-          capabilityBudget(DISABLED_BUDGET_MS, CLEANUP_MS + FINAL_MS + CASE_JOIN_MS),
-          (signal) => new CapabilityCase().disabled(signal)
-        )
+        runCapabilityCase(scope, DISABLED_BUDGET_MS, 'disabled')
       ),
       caseTimeout(DISABLED_BUDGET_MS)
     )
