@@ -68,11 +68,78 @@ jobs:
         with: { node-version: '${{ matrix.node }}', cache: npm }
       - run: npm ci
       - run: docker compose version
-      # Share lanes run serially (--runInBand in their scripts), and Jest rejects --maxWorkers with it.
-      - run: ./scripts/testWithKafka.sh "npm run test:group:${{ matrix.group }} -- --ci${{ !startsWith(matrix.group, 'share') && ' --maxWorkers=4' || '' }}"
+      - if: ${{ !startsWith(matrix.group, 'share') }}
+        run: ./scripts/testWithKafka.sh "npm run test:group:${{ matrix.group }} -- --ci --maxWorkers=4"
+      - name: Prepare share evidence
+        if: startsWith(matrix.group, 'share')
+        run: |
+          echo "KAFKAJS_TREE=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          rm -rf .tmp/e2e
+          mkdir -p .tmp/e2e
+      - name: Run share lane
+        if: startsWith(matrix.group, 'share')
+        env:
+          DO_NOT_STOP: '1'
+        run: ./scripts/testWithKafka.sh "npm run test:group:${{ matrix.group }} -- --ci"
+      - name: Prove shutdown exits naturally
+        if: matrix.group == 'share'
+        env:
+          KAFKAJS_LANE: docker
+          KAFKAJS_DEBUG_PROTOCOL_BUFFERS: '1'
+          SHARE_SHUTDOWN_E2E: '1'
+        run: |
+          node <<'NODE'
+          const fs = require('fs')
+          const { spawnSync } = require('child_process')
+          const startedAt = Number(process.hrtime.bigint() / 1000000n)
+          const result = spawnSync(process.execPath, [
+            'node_modules/jest/bin/jest.js', '--ci', '--detectOpenHandles', '--runInBand',
+            '--runTestsByPath', 'src/consumer/share/__tests__/shareShutdownLive.spec.js',
+          ], { stdio: 'inherit', timeout: 120000, killSignal: 'SIGKILL' })
+          const exitedAt = Number(process.hrtime.bigint() / 1000000n)
+          fs.writeFileSync('.tmp/e2e/share-shutdown-exit.json', JSON.stringify({
+            startedAt, exitedAt, status: result.status, signal: result.signal,
+            error: result.error?.message,
+          }) + '\n')
+          if (result.error) throw result.error
+          if (result.status !== 0 || result.signal) throw new Error('Shutdown Jest did not exit successfully')
+          const rows = fs.readFileSync('.tmp/e2e/share-shutdown.jsonl', 'utf8')
+            .trim().split('\n').map(JSON.parse)
+          const done = rows.filter(row => row.event === 'case-complete')
+          if (done.length !== 3 || new Set(done.map(row => row.case)).size !== 3 ||
+              rows.some(row => row.event === 'case-failed') ||
+              done.some(row => row.status !== 'passed' || row.tainted !== false ||
+                !Number.isSafeInteger(row.cleanup?.completedAt) ||
+                row.cleanup.completedAt < startedAt || row.cleanup.completedAt > exitedAt)) {
+            throw new Error('Shutdown evidence has incomplete or invalid cleanup timestamps')
+          }
+          const cleanupAt = Math.max(...done.map(row => row.cleanup.completedAt))
+          if (exitedAt - startedAt > 120000 || exitedAt - cleanupAt > 10000) {
+            throw new Error('Shutdown did not exit naturally within its process and cleanup bounds')
+          }
+          NODE
+      - name: Verify share evidence before teardown
+        if: always() && startsWith(matrix.group, 'share')
+        run: |
+          node <<'NODE'
+          const fs = require('fs')
+          const { spawnSync } = require('child_process')
+          const { readBrokerVersion } = require('./testHelpers/brokerVersion')
+          const files = fs.readdirSync('.tmp/e2e').filter(name => name.endsWith('.jsonl'))
+            .map(name => `.tmp/e2e/${name}`)
+          const result = spawnSync(process.execPath, [
+            'scripts/evidence/verify.js', '--broker', readBrokerVersion(), ...files,
+          ], { stdio: 'inherit' })
+          if (result.error) throw result.error
+          process.exitCode = result.status ?? 1
+          NODE
+      - name: Stop share cluster
+        if: always() && startsWith(matrix.group, 'share')
+        run: docker compose -f "$COMPOSE_FILE" down --remove-orphans
       - if: always() && startsWith(matrix.group, 'share')
         uses: actions/upload-artifact@v4
         with:
           name: e2e-${{ matrix.group }}-${{ matrix.kafka }}-node${{ matrix.node }}
           path: .tmp/e2e/
           if-no-files-found: ignore
+          include-hidden-files: true

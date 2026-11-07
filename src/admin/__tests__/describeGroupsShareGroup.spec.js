@@ -206,7 +206,9 @@ describe('Admin > describeGroups on a share group > captured legacy outcomes', (
       }
     )
   } else {
-    it.skip(`replays the captured legacy share-group outcome (skipped: ${FIXTURE_PATH} is absent until an authentic live capture is committed)`, () => {})
+    it('requires the authentic legacy share-group capture fixture', () => {
+      throw new Error(`Missing authentic capture fixture: ${FIXTURE_PATH}`)
+    })
   }
 })
 
