@@ -6,7 +6,7 @@ const path = require('path')
 const { EventEmitter } = require('events')
 const { StringDecoder } = require('string_decoder')
 const { spawn, spawnSync } = require('child_process')
-const { Kafka, logLevel } = require('../../../../index')
+const { Kafka, logLevel, ConfigResourceTypes } = require('../../../../index')
 const {
   createTopic,
   plainTextBrokers,
@@ -29,6 +29,9 @@ const shareGroupHeartbeat = require('../../../../testHelpers/wire/shareGroupHear
 const { readLog } = require('../../../../testHelpers/rawLog')
 const { createResourceProbe } = require('../../../../testHelpers/resourceProbe')
 const RequestQueue = require('../../../network/requestQueue')
+const Broker = require('../../../broker')
+const CONFIG_SOURCE = require('../../../protocol/configSource')
+const { readBrokerVersion } = require('../../../../testHelpers/brokerVersion')
 const InstrumentationEventEmitter = require('../../../instrumentation/emitter')
 const { ShareAckLedger } = require('../shareAckLedger')
 const { ShareFetchLoop } = require('../shareFetchLoop')
@@ -76,20 +79,40 @@ const FINAL_MS = 10000
  *   this spec created `workDir` and so removes it
  */
 const preflight = () => {
+  const startedAt = performance.now()
+  const probeDeadline = startedAt + PROBE_MS
   const supplied = process.env.JAVA_E2E_WORK_DIR
   const owned = !supplied
   const workDir = supplied || fs.mkdtempSync(path.join(os.tmpdir(), 'kafkajs-share-interop-'))
+  const timeout = Math.floor(
+    fileAllowance(probeDeadline - performance.now(), FINAL_MS + CASE_JOIN_MS)
+  )
+  if (timeout < 1) {
+    if (owned) fs.rmSync(workDir, { recursive: true, force: true })
+    throw new Error('The Java probe has no remaining allowance')
+  }
   const probe = spawnSync(RUN_SH, ['--role', 'share-member', '--probe'], {
-    env: { ...process.env, JAVA_E2E_WORK_DIR: workDir },
+    env: { ...process.env, JAVA_E2E_WORK_DIR: workDir, KAFKA_CLIENTS_VERSION: JAVA_VERSION },
     encoding: 'utf8',
-    timeout: fileAllowance(PROBE_MS, FINAL_MS + CASE_JOIN_MS),
+    timeout,
   })
+  const receipt = {
+    startedAt,
+    completedAt: performance.now(),
+    status: probe.status,
+    signal: probe.signal,
+    stdout: probe.stdout,
+    stderr: probe.stderr,
+    version: JAVA_VERSION,
+  }
   const failed = (reason) => {
     if (owned) fs.rmSync(workDir, { recursive: true, force: true })
-    return { ok: false, reason, workDir: null, owned }
+    return { ok: false, reason, workDir: null, owned, probe: receipt }
   }
   if (probe.error?.code === 'ENOENT') return failed('run.sh not executable')
-  if (probe.error) return failed('the Java probe did not finish in time')
+  if (probe.error || receipt.completedAt > probeDeadline) {
+    return failed('the Java probe did not finish in time')
+  }
   if (probe.status !== 0) {
     const stderr = probe.stderr || ''
     return failed(
@@ -102,7 +125,17 @@ const preflight = () => {
             : 'the jars could not be downloaded'
     )
   }
-  return { ok: true, reason: '', workDir, owned }
+  return {
+    ok: true,
+    reason: '',
+    workDir,
+    owned,
+    probe: receipt,
+    artifact: {
+      version: JAVA_VERSION,
+      sha256: sha256(fs.readFileSync(path.join(workDir, `kafka-clients-${JAVA_VERSION}.jar`))),
+    },
+  }
 }
 
 // Gated: it needs a share-enabled cluster with fast share-group failure detection
@@ -113,7 +146,10 @@ const FILE_DEADLINE = GATED ? performance.now() + FILE_MS : Infinity
 const enabled = GATED ? describe : describe.skip
 
 const EVIDENCE = 'share-interop'
-const PROFILE = 'tv2'
+const PROFILE = 'share'
+const ROOT = path.resolve(__dirname, '../../../..')
+const COMPOSE = 'docker-compose.share.yml'
+const JAVA_VERSION = process.env.KAFKA_CLIENTS_VERSION || '4.3.1'
 const TITLES = {
   join: 'shares six hundred records with a joining Java member',
   leave: 'releases unstarted records to Java on a clean leave',
@@ -154,14 +190,201 @@ const CLIENT_CONFIG = {
  * @throws {Error} When the selection has exhausted its allowance; later cases are refused.
  */
 const fileAllowance = (limit, reserve = 0) => {
-  const remaining = Math.min(limit, FILE_DEADLINE - performance.now() - reserve)
-  if (remaining <= 0) {
-    const error = new Error('The interop file deadline has expired')
+  try {
+    return remainingAllowance(limit, FILE_DEADLINE, performance.now(), reserve)
+  } catch (error) {
     liveRun.taint(error)
     throw error
   }
+}
+
+/**
+ * @param {number} limit Phase cap.
+ * @param {number} deadline Original file deadline on the same monotonic clock.
+ * @param {number} now Current observation; scripted controls supply a fake clock.
+ * @param {number} reserve Later join/final allowance.
+ * @returns {number} Remaining time, without a minimum polling extension.
+ * @throws {Error} When the original file allowance is exhausted.
+ */
+const remainingAllowance = (limit, deadline, now, reserve) => {
+  const remaining = Math.min(limit, deadline - now - reserve)
+  if (!(remaining > 0)) throw new Error('The interop file deadline has expired')
   return remaining
 }
+
+/** @param {Buffer} bytes Original bytes. @returns {string} Their SHA-256. */
+const sha256 = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex')
+
+/**
+ * Reads the selected compose bytes and the guard's original manifest without altering either.
+ * Unguarded grouped CI remains supplementary; mandatory acceptance requires the owned manifest.
+ * @returns {object} Compose identity, original ownership record and its bound selection.
+ * @throws {Error} On incomplete ownership or a disagreeing compose selection.
+ */
+const fixtureProvenance = () => {
+  const guard = process.env.KAFKAJS_CLUSTER_GUARD || process.env.P9_CLUSTER_GUARD
+  const manifestFile = process.env.KAFKAJS_CLUSTER_MANIFEST || process.env.P9_CLUSTER_MANIFEST
+  if (Boolean(guard) !== Boolean(manifestFile)) throw new Error('Incomplete interop ownership')
+  const owned = manifestFile ? JSON.parse(fs.readFileSync(manifestFile, 'utf8')) : null
+  const selected = path.resolve(
+    ROOT,
+    process.env.COMPOSE_FILE || owned?.file || 'docker-compose.yml'
+  )
+  if (selected !== path.join(ROOT, COMPOSE)) throw new Error('Interop requires the share compose')
+  const compose = { file: COMPOSE, sha256: sha256(fs.readFileSync(selected)) }
+  if (owned && (owned.root !== fs.realpathSync(ROOT) || owned.file !== selected)) {
+    throw new Error('Interop ownership does not name the selected compose')
+  }
+  return {
+    profile: PROFILE,
+    compose,
+    owned,
+    manifest: owned && {
+      profile: owned.profile,
+      file: path.basename(owned.file),
+      composeSha256: owned.composeSha256,
+      version: owned.version,
+    },
+    supplementary: !owned,
+  }
+}
+
+/**
+ * Resolves original GROUP entries against all three original broker defaults on every version.
+ * Assignment's absent override uses the broker fallback even if DescribeConfigs prints its schema
+ * default. No membership or assignment setting is written to repair this fixture.
+ * @param {object} fixture Original selection, artifact, resource identities and config response.
+ * @param {object} [options] Mandatory acceptance requires ownership; grouped CI is supplementary.
+ * @param {boolean} [options.requireOwnership=true] Require the original owned manifest.
+ * @returns {object} Effective settings, with their original response retained by the caller.
+ * @throws {Error} On a missing, conflicting or unproved fixture value.
+ */
+const assertInteropFixture = (fixture, { requireOwnership = true } = {}) => {
+  const { profile, compose, manifest, brokerVersion, java, groupId, response } = fixture
+  expect(profile).toBe(PROFILE)
+  expect(compose.file).toBe(COMPOSE)
+  expect(compose.sha256).toMatch(/^[a-f0-9]{64}$/)
+  if (requireOwnership) expect(manifest).toBeTruthy()
+  if (manifest) {
+    expect(manifest.profile).toBe(PROFILE)
+    expect(manifest.file).toBe(COMPOSE)
+    expect(manifest.composeSha256).toBe(compose.sha256)
+    expect(manifest.version).toBe(brokerVersion)
+  }
+  expect(java.version).toBe(brokerVersion)
+  expect(java.sha256).toMatch(/^[a-f0-9]{64}$/)
+  const resources = response.resources
+  const resource = (type, name) => {
+    const matches = resources.filter((r) => r.resourceType === type && r.resourceName === name)
+    expect(matches).toHaveLength(1)
+    expect(matches[0].errorCode).toBe(0)
+    return matches[0]
+  }
+  const entry = (resource, name) => {
+    const matches = resource.configEntries.filter(({ configName }) => configName === name)
+    expect(matches).toHaveLength(1)
+    const [value] = matches
+    expect(value.isSensitive).not.toBe(true)
+    expect(value.configSynonyms).toEqual(expect.any(Array))
+    const overrides = value.configSynonyms.filter(
+      ({ configSource }) => configSource === CONFIG_SOURCE.GROUP_CONFIG
+    )
+    for (const override of overrides) {
+      expect(value.configSource).toBe(CONFIG_SOURCE.GROUP_CONFIG)
+      expect(override.configName).toBe(name)
+      expect(override.configValue).toBe(value.configValue)
+    }
+    return value
+  }
+  const brokers = ['1', '2', '3'].map((name) => resource(ConfigResourceTypes.BROKER, name))
+  const group = resource(ConfigResourceTypes.GROUP, groupId)
+  const effective = {}
+  for (const [suffix, required] of [
+    ['session.timeout.ms', 6000],
+    ['heartbeat.interval.ms', 1000],
+    ['assignment.interval.ms', null],
+  ]) {
+    const defaults = brokers.map((broker) => {
+      const value = entry(broker, `group.share.${suffix}`)
+      expect([2, 3, 4, 5]).toContain(value.configSource)
+      expect(value.configValue).toMatch(/^(0|[1-9][0-9]*)$/)
+      return Number(value.configValue)
+    })
+    expect(new Set(defaults).size).toBe(1)
+    const value = entry(group, `share.${suffix}`)
+    expect([CONFIG_SOURCE.GROUP_CONFIG, CONFIG_SOURCE.DEFAULT_CONFIG]).toContain(value.configSource)
+    expect(value.configValue).toMatch(/^(0|[1-9][0-9]*)$/)
+    const override = value.configSource === CONFIG_SOURCE.GROUP_CONFIG
+    const resolved = override ? Number(value.configValue) : defaults[0]
+    if (suffix !== 'assignment.interval.ms' || override) {
+      expect(Number(value.configValue)).toBe(resolved)
+    } else {
+      expect([resolved, 1000]).toContain(Number(value.configValue))
+    }
+    if (required !== null) {
+      expect(defaults[0]).toBe(required)
+      expect(resolved).toBe(required)
+    } else {
+      expect(Number.isSafeInteger(resolved)).toBe(true)
+      expect(resolved).toBeGreaterThanOrEqual(0)
+      expect(resolved).toBeLessThanOrEqual(1000)
+    }
+    effective[suffix] = { value: resolved, override, brokerDefaults: defaults }
+  }
+  for (const [name, required] of Object.entries(GROUP_CONFIG)) {
+    const value = entry(group, name)
+    expect(value.configSource).toBe(CONFIG_SOURCE.GROUP_CONFIG)
+    expect(value.configValue).toBe(String(required))
+  }
+  return { ...effective, assignmentMs: effective['assignment.interval.ms'].value }
+}
+
+/**
+ * @param {object} poll Original Java poll, after production.
+ * @returns {void}
+ * @throws {Error} Unless its actual observed lock is the required group lock.
+ */
+const assertPollLock = (poll) => {
+  expect(poll.lockTimeoutMs).toBe(LOCK_MS)
+}
+
+/**
+ * @param {object[]} exchanges Original successful or failed heartbeat calls and responses.
+ * @param {string} groupId Exact workload group.
+ * @returns {void}
+ * @throws {Error} On missing or conflicting applied heartbeat observations.
+ */
+const assertHeartbeatInterval = (exchanges, groupId) => {
+  const successful = exchanges.filter(
+    ({ request, response }) =>
+      request.groupId === groupId && request.memberEpoch !== -1 && response?.errorCode === 0
+  )
+  expect(successful.length).toBeGreaterThan(0)
+  for (const { response } of successful) expect(response.heartbeatIntervalMs).toBe(1000)
+}
+
+/**
+ * @param {object} facts Original call, settlement, Release write and Java record-entry facts.
+ * @returns {boolean} Each original unstarted identity arrived after Release within the call bound.
+ */
+const cleanHandover = ({ disconnectAt, settledAt, releaseWrittenAt, entries, unstarted }) =>
+  Number.isFinite(disconnectAt) &&
+  disconnectAt >= 0 &&
+  Number.isFinite(settledAt) &&
+  Number.isFinite(releaseWrittenAt) &&
+  settledAt >= disconnectAt &&
+  settledAt <= disconnectAt + DISCONNECT_MS &&
+  releaseWrittenAt >= disconnectAt &&
+  unstarted.length > 0 &&
+  unstarted.every((identity) => {
+    const matches = entries.filter((entry) => entry.identity === identity)
+    return (
+      matches.length === 1 &&
+      Number.isFinite(matches[0].at) &&
+      matches[0].at >= releaseWrittenAt &&
+      matches[0].at <= disconnectAt + HANDOVER_MS
+    )
+  })
 
 /**
  * Splits a byte stream into whole length-prefixed Kafka frames.
@@ -203,6 +426,34 @@ class ShareWireTap {
     this.connect = connect
     this.sockets = []
     this.frames = []
+    this.heartbeats = []
+    this.restoreHeartbeat = null
+  }
+
+  /** @returns {void} Observes heartbeat results without changing calls, replies or errors. */
+  install() {
+    const tap = this
+    const original = Broker.prototype.shareGroupHeartbeat
+    Broker.prototype.shareGroupHeartbeat = async function (request, ...args) {
+      const exchange = { request, sentAt: performance.now() }
+      tap.heartbeats.push(exchange)
+      try {
+        const response = await original.call(this, request, ...args)
+        Object.assign(exchange, { response, receivedAt: performance.now() })
+        return response
+      } catch (error) {
+        exchange.error = describeError(error)
+        throw error
+      }
+    }
+    this.restoreHeartbeat = () => {
+      Broker.prototype.shareGroupHeartbeat = original
+    }
+  }
+
+  /** @returns {void} Restores the original heartbeat method after the case joins. */
+  restore() {
+    this.restoreHeartbeat?.()
   }
 
   /**
@@ -597,6 +848,9 @@ class JavaShareMember {
     this.argv = argv
     this.journal = new JavaJournal(journalFile)
     this.stderr = ''
+    this.stderrChunks = []
+    this.nonce = secureRandom(6)
+    this.stopRequested = false
     this.exit = null
     this.spawnError = null
     this.child = null
@@ -609,19 +863,20 @@ class JavaShareMember {
   start() {
     this.startedAt = performance.now()
     const child = spawn('timeout', javaArgv(this.argv), {
-      env: { ...process.env, JAVA_E2E_WORK_DIR: this.workDir },
+      env: { ...process.env, JAVA_E2E_WORK_DIR: this.workDir, KAFKA_CLIENTS_VERSION: JAVA_VERSION },
       stdio: ['ignore', 'pipe', 'pipe'],
     })
     this.child = child
     child.stdout.on('data', (chunk) => this.journal.push(chunk, performance.now()))
     child.stderr.on('data', (chunk) => {
-      this.stderr = `${this.stderr}${chunk}`.slice(-2000)
+      this.stderrChunks.push(Buffer.from(chunk))
+      this.stderr = Buffer.concat(this.stderrChunks).toString('utf8')
     })
     child.once('error', (error) => {
       this.spawnError = error
     })
     child.once('exit', (code, signal) => {
-      this.exit = { code, signal, at: performance.now() }
+      this.exit = { code, signal, at: performance.now(), pid: child.pid, nonce: this.nonce }
     })
     child.once('close', () => {
       this.journal.finish()
@@ -636,7 +891,10 @@ class JavaShareMember {
    * @returns {Promise<void>}
    */
   async stop(signal) {
-    if (this.child && this.exit === null && !this.spawnError) this.child.kill('SIGTERM')
+    if (this.child && this.exit === null && !this.spawnError) {
+      this.stopRequested = true
+      this.child.kill('SIGTERM')
+    }
     await bounded(signal, 8000, () => this.closed, { label: 'The Java member closing' })
     this.journal.finish()
   }
@@ -802,6 +1060,8 @@ class AcquisitionObserver {
         socket: exchange.binding.connection.socket,
         groupId: this.groupId,
         memberId: this.memberId,
+        lockTimeoutMs: args[0],
+        observedAt: performance.now(),
         ranges: Object.freeze(
           (partition.acquiredRecords ?? []).map((range) => Object.freeze({ ...range }))
         ),
@@ -948,12 +1208,16 @@ class ShareInteropCase {
     writeEvidence(EVIDENCE, {
       event,
       case: this.title,
-      profile: PROFILE,
+      fixture: this.fixture,
+      java: this.java.artifact,
+      clock: 'parent-performance',
+      probe: this.java.probe,
       scenario: this.nonce,
       groups: { interop: this.group },
       budgets: { fileMs: FILE_MS, probeMs: PROBE_MS, caseMs: CASE_MS, cleanupMs: CLEANUP_MS },
       wireVersions: wireVersionsOf(this.requests),
       ...fields,
+      profile: PROFILE,
     })
   }
 
@@ -967,6 +1231,7 @@ class ShareInteropCase {
       javaProblem: this.javaMember?.journal.problem,
       acknowledgements: this.js.acks.map((row) => ({ ...row, error: describeError(row.error) })),
       acknowledgementResponses: this.acknowledgements.evidence(this.group),
+      heartbeats: this.tap.heartbeats,
       crashes: this.js.crashes.map((error) => describeError(error)),
       facts: this.facts,
     }
@@ -979,6 +1244,7 @@ class ShareInteropCase {
    * @throws {Error} the first assertion or fixture failure, with cleanup failures attached
    */
   async run(scope) {
+    this.tap.install()
     this.gauge.install()
     this.acquisitions.install()
     this.acknowledgements.install()
@@ -1009,6 +1275,7 @@ class ShareInteropCase {
       this.acknowledgements.restore()
       this.acquisitions.restore()
       this.gauge.uninstall()
+      this.tap.restore()
     }
   }
 
@@ -1045,7 +1312,33 @@ class ShareInteropCase {
     )
     this.topicId = metadata.topics.find(({ name }) => name === this.topic).topicId
     await bounded(scope, 15000, () => setShareGroupConfigs(this.admin, this.group, GROUP_CONFIG))
+    this.fixture = {
+      ...fixtureProvenance(),
+      brokerVersion: readBrokerVersion(),
+      java: this.java.artifact,
+      groupId: this.group,
+      response: await bounded(scope, 10000, () =>
+        this.admin.describeConfigs({
+          includeSynonyms: true,
+          resources: [
+            ...['1', '2', '3'].map((name) => ({
+              type: ConfigResourceTypes.BROKER,
+              name,
+              configNames: [
+                'group.share.session.timeout.ms',
+                'group.share.heartbeat.interval.ms',
+                'group.share.assignment.interval.ms',
+              ],
+            })),
+            { type: ConfigResourceTypes.GROUP, name: this.group, configNames: null },
+          ],
+        })
+      ),
+    }
     this.row('config-readback', { group: GROUP_CONFIG, client: CLIENT_CONFIG })
+    this.fixture.effective = assertInteropFixture(this.fixture, {
+      requireOwnership: this.fixture.owned !== null,
+    })
     this.row('resource-baseline', { snapshot: this.baseline })
 
     this.producer = this.client('producer').producer({ idempotent: true })
@@ -1059,6 +1352,7 @@ class ShareInteropCase {
     await pollUntil(scope, 20000, () => partitionsOf(this.js.assignment).length === PARTITIONS, {
       label: 'The JavaScript member holding every partition',
     })
+    assertHeartbeatInterval(this.tap.heartbeats, this.group)
     this.facts.jsBefore = partitionsOf(this.js.assignment)
   }
 
@@ -1407,6 +1701,7 @@ class ShareInteropCase {
     expect(cohort.partition).toBe(target)
     expect(cohort.topic).toBe(this.topic)
     expect(memberId).toBe(this.js.memberId)
+    expect(source.lockTimeoutMs).toBe(LOCK_MS)
     expect(this.gauge.ledgers.has(cohort.ledger)).toBe(true)
     expect(cohort.ledger.size).toBe(records.length)
     const socket = this.tap.sockets.findIndex((entry) => entry.socket === source.socket)
@@ -1455,6 +1750,7 @@ class ShareInteropCase {
       ledgerEntries: cohort.ledger.size,
       socket,
       sentAt: source.exchange.sentAt,
+      lockTimeoutMs: source.lockTimeoutMs,
       fetchEpoch: source.exchange.fields.shareSessionEpoch,
       call: this.acquisitions.invocations.indexOf(invocation),
       invocation: held.invocation,
@@ -1601,6 +1897,15 @@ class ShareInteropCase {
       acquired
     )
     this.assertLeaveOutcomes(original, closingFrames.final)
+    expect(
+      cleanHandover({
+        disconnectAt,
+        settledAt,
+        releaseWrittenAt: closingFrames.final.at,
+        entries: this.javaMember.journal.entries,
+        unstarted,
+      })
+    ).toBe(true)
     Object.assign(this.facts, {
       target,
       acquired,
@@ -1640,13 +1945,17 @@ class ShareInteropCase {
     const [poll] = member.journal.polls
     const haltedAt = member.exit.at
     expect(member.exit.code).toBe(137)
+    expect(member.exit.signal).toBeNull()
+    expect(member.stopRequested).toBe(false)
+    expect(member.exit.pid).toBe(member.child.pid)
+    expect(member.exit.nonce).toBe(member.nonce)
     expect(haltedAt - member.startedAt).toBeLessThan(49000)
     expect(member.journal.done).toBe(false)
     expect(member.journal.errors).toEqual([])
     expect(member.journal.committed).toEqual([])
     expect(poll).toBeDefined()
     expect(poll.records.length).toBeGreaterThanOrEqual(2)
-    expect(Number.isSafeInteger(poll.lockTimeoutMs)).toBe(true)
+    assertPollLock(poll)
     expect(member.journal.entries.length).toBeGreaterThanOrEqual(1)
     const held = poll.records.map(({ identity }) => identity)
     expect(new Set(held).size).toBe(held.length)
@@ -1686,10 +1995,35 @@ class ShareInteropCase {
    * @returns {boolean} Every acquired identity reached JS within the recovery bound.
    */
   haltRecovered(poll, haltedAt) {
+    if (
+      poll.lockTimeoutMs !== LOCK_MS ||
+      !Number.isFinite(haltedAt) ||
+      haltedAt < 0 ||
+      poll.records.length < 2
+    ) {
+      return false
+    }
     const deadline = haltedAt + poll.lockTimeoutMs + RECOVERY_SLACK_MS
     return poll.records.every(({ identity }) => {
       const at = this.jsFirst.get(identity)
-      return at >= haltedAt && at <= deadline
+      const acquisitions = this.acquisitions.acquisitions.filter(
+        (source) =>
+          source.groupId === this.group &&
+          source.cohort.topicId === this.topicId &&
+          source.lockTimeoutMs === LOCK_MS &&
+          source.records.some((record) => record.identity === identity)
+      )
+      return (
+        Number.isFinite(at) &&
+        at >= haltedAt &&
+        at <= deadline &&
+        acquisitions.length === 1 &&
+        Number.isFinite(acquisitions[0].exchange.sentAt) &&
+        Number.isFinite(acquisitions[0].observedAt) &&
+        acquisitions[0].exchange.sentAt >= 0 &&
+        acquisitions[0].exchange.sentAt <= acquisitions[0].observedAt &&
+        acquisitions[0].observedAt <= at
+      )
     })
   }
 
@@ -1739,8 +2073,11 @@ class ShareInteropCase {
    */
   async observe(scope) {
     const log = await this.observeLog(scope)
+    for (const poll of this.javaMember.journal.polls) assertPollLock(poll)
+    assertHeartbeatInterval(this.tap.heartbeats, this.group)
     const javaEntries = this.javaMember.journal.entries
     const journal = ShareHandlerLog.read(path.join(this.dir, 'js-handler.jsonl'))
+    this.jsJournal = journal
     const started = journal.rows.filter(({ event }) => event === 'start').map((r) => r.identity)
     expect(started).toEqual(this.jsEntries.map(({ identity }) => identity))
     this.handled = tally([...started, ...javaEntries.map(({ identity }) => identity)])
@@ -1984,6 +2321,7 @@ class ShareInteropCase {
       assignmentChanged: this.facts.assignmentChanged,
       jsBefore: this.facts.jsBefore,
       jsAfter: this.facts.jsAfter,
+      handlerJournal: this.jsJournal,
       jsEntries: this.jsEntries.map(({ identity, deliveryCount, at }) => ({
         identity,
         deliveryCount,
@@ -1997,6 +2335,28 @@ class ShareInteropCase {
       })),
       committedPolls: journal.committed,
       journal: { lines: journal.lines, sha256: journal.sha256() },
+      heartbeats: this.tap.heartbeats,
+      acquisitions: this.acquisitions.acquisitions.map((source) => ({
+        groupId: source.groupId,
+        memberId: source.memberId,
+        topicId: source.cohort.topicId,
+        partition: source.cohort.partition,
+        sentAt: source.exchange.sentAt,
+        observedAt: source.observedAt,
+        lockTimeoutMs: source.lockTimeoutMs,
+        ranges: source.ranges,
+        records: source.records,
+      })),
+      javaExit: exit,
+      javaStartedAt: this.javaMember.startedAt,
+      javaStderr: this.javaMember.stderr,
+      javaStderrHex: Buffer.concat(this.javaMember.stderrChunks).toString('hex'),
+      javaProcess: {
+        nonce: this.javaMember.nonce,
+        pid: this.javaMember.child.pid,
+        argv: javaArgv(this.javaMember.argv),
+        stopRequested: this.javaMember.stopRequested,
+      },
       exitCode: exit?.code ?? null,
       exitSignal: exit?.signal ?? null,
       done: journal.done,
@@ -2316,7 +2676,18 @@ describe('share interop clean-leave proof', () => {
       },
       gauge: { ledgers: new Set([ledger]) },
       acquisitions: {
-        acquisitions: [{ groupId: 'g', memberId: 'm', cohort, ranges, records, socket, exchange }],
+        acquisitions: [
+          {
+            groupId: 'g',
+            memberId: 'm',
+            cohort,
+            ranges,
+            records,
+            socket,
+            exchange,
+            lockTimeoutMs: 30000,
+          },
+        ],
         invocations: [
           { cohort, call: { ledger, batch: false, open: true }, identities: [held.identity] },
         ],
@@ -2335,6 +2706,23 @@ describe('share interop clean-leave proof', () => {
     expect(original.invocations).toEqual([state.held])
     expect(Object.isFrozen(original)).toBe(true)
     expect(Object.isFrozen(original.unstarted)).toBe(true)
+  })
+
+  it('rejects a missing original lock, omitted acquisition or extra JS invocation', () => {
+    const changes = [
+      (state) => (state.acquisitions.acquisitions[0].lockTimeoutMs = null),
+      (state) => {
+        state.acquisitions.acquisitions[0].records =
+          state.acquisitions.acquisitions[0].records.slice(0, 2)
+      },
+      (state) => state.jsEntries.push({ ...state.held, invocation: 2 }),
+    ]
+    for (const change of changes) {
+      const state = leaveState()
+      expect(() => ShareInteropCase.prototype.freezeLeave.call(state, 0, state.held)).not.toThrow()
+      change(state)
+      expect(() => ShareInteropCase.prototype.freezeLeave.call(state, 0, state.held)).toThrow()
+    }
   })
 
   it('requires complete final-epoch Release coverage for the original unstarted identities', () => {
@@ -2412,6 +2800,16 @@ describe('share interop halted-poll proof', () => {
       expected: records.map(({ identity }) => identity),
       jsEntries: records.map(({ identity }) => ({ identity })),
       jsFirst: new Map(records.map(({ identity }) => [identity, 200])),
+      acquisitions: {
+        acquisitions: records.map((record) => ({
+          groupId: 'g',
+          cohort: { topicId: 'id' },
+          lockTimeoutMs: 30000,
+          records: [{ ...record }],
+          exchange: { sentAt: 100 },
+          observedAt: 101,
+        })),
+      },
       acknowledgements,
       javaMember: { journal: { polls: [poll], entries: [records[0]], committed: [] } },
     }
@@ -2426,6 +2824,66 @@ describe('share interop halted-poll proof', () => {
     expect(recovered()).toBe(false)
     state.jsFirst.set(poll.records[1].identity, 100 + LOCK_MS + RECOVERY_SLACK_MS + 1)
     expect(recovered()).toBe(false)
+  })
+
+  it('rejects recovery without its distinct original acquisition and chronology', () => {
+    const changes = [
+      (rows) => rows.pop(),
+      (rows) => rows.push(rows[0]),
+      (rows) => (rows[0].groupId = 'another-group'),
+      (rows) => (rows[0].cohort.topicId = 'another-topic-id'),
+      (rows) => (rows[0].records[0].identity = 'different-bytes'),
+      (rows) => (rows[0].lockTimeoutMs = null),
+      (rows) => (rows[0].observedAt = 201),
+      (rows) => (rows[0].exchange.sentAt = 102),
+    ]
+    for (const change of changes) {
+      const state = haltedState()
+      const [poll] = state.javaMember.journal.polls
+      const check = () => ShareInteropCase.prototype.haltRecovered.call(state, poll, 100)
+      expect(check()).toBe(true)
+      change(state.acquisitions.acquisitions)
+      expect(check()).toBe(false)
+    }
+  })
+
+  it('keeps the original 32000 ms halt boundary through round-tripped primitive receipts', () => {
+    const state = haltedState()
+    const [poll] = state.javaMember.journal.polls
+    const original = JSON.parse(
+      JSON.stringify({
+        haltedAt: 100,
+        poll,
+        entries: poll.records.map(({ identity }) => [identity, 32100]),
+      })
+    )
+    const check = () => {
+      state.jsFirst = new Map(original.entries)
+      return ShareInteropCase.prototype.haltRecovered.call(state, original.poll, original.haltedAt)
+    }
+    expect(check()).toBe(true)
+    original.entries[1][1]++
+    expect(check()).toBe(false)
+    original.streamClosedAt = 50000
+    original.parsedAt = 51000
+    original.assignmentConvergedAt = 52000
+    original.recovered = original.poll.records
+    original.passed = true
+    expect(check()).toBe(false)
+    original.entries[1][1] = 43100
+    expect(check()).toBe(false)
+    original.entries[1][1] = 101
+    expect(check()).toBe(true)
+    original.entries[1][1] = 99
+    expect(check()).toBe(false)
+    original.entries[1][1] = 32100
+    for (const lockTimeoutMs of [null, undefined, 3000, 15000, '30000']) {
+      original.poll.lockTimeoutMs = lockTimeoutMs
+      expect(check()).toBe(false)
+    }
+    original.poll.lockTimeoutMs = 30000
+    original.haltedAt = undefined
+    expect(check()).toBe(false)
   })
 
   it('requires real JS Accepts for printed and unprinted records of an uncommitted poll', () => {
@@ -2454,11 +2912,178 @@ describe('share interop halted-poll proof', () => {
   })
 })
 
+describe('share interop fixture and clocks (scripted primitives, not Kafka captures)', () => {
+  const copy = (value) => JSON.parse(JSON.stringify(value))
+  const digest = 'a'.repeat(64)
+  /** @returns {object} Independent configuration response and ownership primitives. */
+  const fixture = (brokerVersion) => {
+    const entry = (configName, configValue, configSource) => ({
+      configName,
+      configValue,
+      configSource,
+      configSynonyms: [],
+    })
+    return {
+      profile: 'share',
+      compose: { file: 'docker-compose.share.yml', sha256: digest },
+      manifest: {
+        profile: 'share',
+        file: 'docker-compose.share.yml',
+        composeSha256: digest,
+        version: brokerVersion,
+      },
+      brokerVersion,
+      java: { version: brokerVersion, sha256: digest },
+      groupId: 'original-group',
+      response: {
+        resources: [
+          ...['1', '2', '3'].map((resourceName) => ({
+            resourceType: 4,
+            resourceName,
+            errorCode: 0,
+            configEntries: [
+              entry('group.share.session.timeout.ms', '6000', 4),
+              entry('group.share.heartbeat.interval.ms', '1000', 4),
+              entry('group.share.assignment.interval.ms', '1000', 5),
+            ],
+          })),
+          {
+            resourceType: 32,
+            resourceName: 'original-group',
+            errorCode: 0,
+            configEntries: [
+              entry('share.session.timeout.ms', '6000', 5),
+              entry('share.heartbeat.interval.ms', '1000', 5),
+              entry('share.assignment.interval.ms', '1000', 5),
+              entry('share.record.lock.duration.ms', '30000', 8),
+              entry('share.auto.offset.reset', 'earliest', 8),
+            ],
+          },
+        ],
+      },
+    }
+  }
+  const groupEntry = (state, name) =>
+    state.response.resources[3].configEntries.find(({ configName }) => configName === name)
+
+  for (const version of ['4.3.1', '4.4.0']) {
+    it(`${version} resolves original group settings and broker fallback through JSON`, () => {
+      const state = copy(fixture(version))
+      expect(assertInteropFixture(state).assignmentMs).toBe(1000)
+      for (const resource of state.response.resources.slice(0, 3)) {
+        resource.configEntries[2].configValue = '0'
+      }
+      expect(assertInteropFixture(copy(state)).assignmentMs).toBe(0)
+      groupEntry(state, 'share.assignment.interval.ms').configSource = 8
+      groupEntry(state, 'share.assignment.interval.ms').configValue = '0'
+      expect(assertInteropFixture(copy(state)).assignmentMs).toBe(0)
+    })
+
+    it(`${version} rejects false profiles, ownership, sources and fallback without a new allowance`, () => {
+      const changes = [
+        (s) => (s.profile = 'tv2'),
+        (s) => (s.profile = 'share-limit'),
+        (s) => (s.compose.file = 'docker-compose.yml'),
+        (s) => (s.compose.sha256 = null),
+        (s) => (s.manifest.composeSha256 = 'b'.repeat(64)),
+        (s) => (s.manifest.profile = 'tv2'),
+        (s) => (s.manifest = null),
+        (s) => {
+          s.manifest = null
+          s.supplementary = true
+          s.passed = true
+        },
+        (s) => (s.java.version = '4.2.2'),
+        (s) => (s.groupId = 'another-group'),
+        (s) => (s.response.resources[0].errorCode = 1),
+        (s) => (s.response.resources[0].configEntries[0].configValue = '45000'),
+        (s) => (s.response.resources[1].configEntries[1].configValue = '5000'),
+        (s) => (s.response.resources[2].configEntries[2].configValue = '1001'),
+        (s) => s.response.resources[2].configEntries.pop(),
+        (s) => (groupEntry(s, 'share.session.timeout.ms').configValue = '45000'),
+        (s) => (groupEntry(s, 'share.heartbeat.interval.ms').configValue = '5000'),
+        (s) => (groupEntry(s, 'share.assignment.interval.ms').configSource = 0),
+        (s) => (groupEntry(s, 'share.assignment.interval.ms').configValue = '1001'),
+        (s) => {
+          groupEntry(s, 'share.assignment.interval.ms').configSynonyms.push({
+            configName: 'share.assignment.interval.ms',
+            configValue: '1001',
+            configSource: 8,
+          })
+        },
+        (s) => {
+          const entry = groupEntry(s, 'share.assignment.interval.ms')
+          entry.configSource = 8
+          entry.configValue = '1001'
+        },
+        (s) => (groupEntry(s, 'share.record.lock.duration.ms').configValue = '3000'),
+        (s) => (groupEntry(s, 'share.record.lock.duration.ms').configSource = 5),
+      ]
+      for (const change of changes) {
+        const state = fixture(version)
+        change(state)
+        expect(() => assertInteropFixture(copy(state))).toThrow()
+      }
+    })
+  }
+
+  it('checks actual heartbeat and poll observations without replacing an absent lock', () => {
+    expect(() => assertPollLock({ lockTimeoutMs: 30000 })).not.toThrow()
+    for (const lockTimeoutMs of [null, undefined, 3000, 15000, '30000']) {
+      expect(() => assertPollLock(copy({ lockTimeoutMs }))).toThrow()
+    }
+    const rows = [
+      { request: { groupId: 'g' }, response: { errorCode: 0, heartbeatIntervalMs: 1000 } },
+    ]
+    expect(() => assertHeartbeatInterval(copy(rows), 'g')).not.toThrow()
+    rows[0].response.heartbeatIntervalMs = 5000
+    expect(() => assertHeartbeatInterval(copy(rows), 'g')).toThrow()
+    expect(() => assertHeartbeatInterval(copy(rows), 'another-group')).toThrow()
+  })
+
+  it('keeps the original clean-call boundary and separate disconnect settlement', () => {
+    const state = {
+      disconnectAt: 100,
+      settledAt: 1600,
+      releaseWrittenAt: 500,
+      entries: [{ identity: 'sparse-99', at: 2100 }],
+      unstarted: ['sparse-99'],
+    }
+    expect(cleanHandover(copy(state))).toBe(true)
+    state.entries[0].at++
+    expect(cleanHandover(copy(state))).toBe(false)
+    state.disconnectCompletedAt = 9000
+    state.assignmentConvergedAt = 10000
+    state.releaseResponseAt = 11000
+    expect(cleanHandover(copy(state))).toBe(false)
+    state.entries[0].at = 600
+    expect(cleanHandover(copy(state))).toBe(true)
+    state.settledAt++
+    expect(cleanHandover(copy(state))).toBe(false)
+    state.settledAt--
+    state.entries[0].at = 499
+    expect(cleanHandover(copy(state))).toBe(false)
+  })
+
+  it('gives later phases only the remaining original file allowance', () => {
+    expect(remainingAllowance(60000, 240000, 100000, 12000)).toBe(60000)
+    expect(remainingAllowance(60000, 240000, 200000, 12000)).toBe(28000)
+    expect(() => remainingAllowance(60000, 240000, 228000, 12000)).toThrow()
+    expect(remainingAllowance(30000, 240000, 0, 12000)).toBe(30000)
+  })
+})
+
 const JAVA = GATED
   ? preflight()
   : { ok: false, reason: 'the live gate is off', workDir: null, owned: false }
 if (GATED && !JAVA.ok) {
-  writeEvidence(EVIDENCE, { event: 'case-skipped', case: 'java-interop', reason: JAVA.reason })
+  writeEvidence(EVIDENCE, {
+    event: 'case-skipped',
+    case: 'java-interop',
+    profile: PROFILE,
+    reason: JAVA.reason,
+    probe: JAVA.probe,
+  })
 }
 
 enabled('share interop with a Java member', () => {
