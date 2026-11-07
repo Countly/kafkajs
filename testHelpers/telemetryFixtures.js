@@ -594,6 +594,7 @@ class TelemetryWireObserver {
   #records = []
   #blobs = new Map()
   #consumed = new Set()
+  #decoded = new Map()
   #failures = []
   #children = new Set()
   #timers = new Map()
@@ -700,6 +701,8 @@ class TelemetryWireObserver {
 
   /**
    * @param {{uuid?:string,after?:number}} [options] stream and transcript cursor
+   * The assigned UUID in a successful response also matches, so the initial zero-ID request
+   * remains visible; its original request UUID is retained in `uuid`.
    * @returns {object[]} Get requests with their parsed responses, answered or not
    */
   subscriptions({ uuid, after = 0 } = {}) {
@@ -710,7 +713,9 @@ class TelemetryWireObserver {
           r.type === 'request' &&
           r.apiKey === 71 &&
           r.index > after &&
-          (wanted === undefined || r.uuid === wanted)
+          (wanted === undefined ||
+            r.uuid === wanted ||
+            (r.response?.errorCode === 0 && r.response.uuid === wanted))
       )
       .map(copy)
   }
@@ -737,6 +742,27 @@ class TelemetryWireObserver {
   /** @returns {object[]} sockets with no request that classifies them as normal or telemetry */
   undecided() {
     return this.#socketsOf('undecided')
+  }
+
+  /**
+   * Confirms the first foreground socket after public connect succeeds. Core connect precedes
+   * telemetry resume on every factory; other setup-only sockets remain unclassified until 71/72.
+   * @param {number} [socketId=1] first socket of this observed client
+   * @returns {void}
+   * @throws {Error} if the socket is not the first successful foreground bootstrap
+   */
+  confirmForegroundBootstrap(socketId = 1) {
+    const state = this.#sockets.get(socketId)
+    const connects = this.#records.filter((r) => r.type === 'connect')
+    if (
+      socketId !== 1 ||
+      connects[0]?.socketId !== socketId ||
+      !state?.ranges ||
+      state.kind === 'telemetry'
+    )
+      throw new Error('Not a proven foreground bootstrap socket')
+    state.kind = 'normal'
+    state.foregroundBootstrap = true
   }
 
   /**
@@ -784,31 +810,62 @@ class TelemetryWireObserver {
       const record = this.#records.find((r) => r.requestKey === push?.requestKey)
       if (!record || record.apiKey !== 72 || record.response?.errorCode !== 0)
         throw new Error('Not an accepted Push request')
-      const blob = this.#blobs.get(record.requestKey)
-      if (blob.length === 0) throw new Error('A zero-byte Push has no exporter record')
-      if (blob.length > PAYLOAD_CAP) throw new Error('Transmitted telemetry exceeds 4096 bytes')
-      const raw = decompress(record.compressionType, blob)
-      if (raw.length > PAYLOAD_CAP) throw new Error('Raw telemetry exceeds 4096 bytes')
-      const rawSha256 = sha256(raw)
-      const row = await this.#join(record, raw.length, rawSha256, sinkWaitMs)
-      const decoded = await this.decodeRaw(raw, { budgetMs })
-      if (decoded.dataBytes !== raw.length || decoded.dataSha256 !== rawSha256)
-        throw new Error('Independent decode does not match the captured bytes')
-      return {
-        requestKey: record.requestKey,
-        uuid: record.uuid,
-        node: record.node,
-        compressionType: record.compressionType,
-        rawBytes: raw.length,
-        transmittedBytes: blob.length,
-        rawSha256,
-        decoded,
-        exportIdentity: { node: row.node, seq: row.seq },
-      }
+      if (this.#decoded.has(record.requestKey))
+        return copy(await this.#decoded.get(record.requestKey))
+      const result = this.#decodeRecord(record, budgetMs, sinkWaitMs)
+      this.#decoded.set(record.requestKey, result)
+      return copy(await result)
     } catch (error) {
       this.#latch(error)
       throw error
     }
+  }
+
+  /**
+   * Decodes and consumes a request exactly once, retaining the complete result for later uses.
+   * @param {object} record accepted wire record
+   * @param {number} budgetMs independent decoder budget
+   * @param {number} sinkWaitMs sink flush budget
+   * @returns {Promise<object>} decoded result and sidecar identity
+   * @throws {Error} on a failed join or decode
+   */
+  async #decodeRecord(record, budgetMs, sinkWaitMs) {
+    const blob = this.#blobs.get(record.requestKey)
+    if (blob.length === 0) throw new Error('A zero-byte Push has no exporter record')
+    if (blob.length > PAYLOAD_CAP) throw new Error('Transmitted telemetry exceeds 4096 bytes')
+    const raw = decompress(record.compressionType, blob)
+    if (raw.length > PAYLOAD_CAP) throw new Error('Raw telemetry exceeds 4096 bytes')
+    const rawSha256 = sha256(raw)
+    fs.writeFileSync(path.join(this.directory, `push-${record.requestKey}.bin`), blob, {
+      flag: 'wx',
+      mode: 0o600,
+    })
+    const rawFile = path.join(this.directory, `raw-${rawSha256}.bin`)
+    if (!fs.existsSync(rawFile)) fs.writeFileSync(rawFile, raw, { flag: 'wx', mode: 0o600 })
+    const row = await this.#join(record, raw.length, rawSha256, sinkWaitMs)
+    const decoded = await this.decodeRaw(raw, { budgetMs })
+    if (decoded.dataBytes !== raw.length || decoded.dataSha256 !== rawSha256)
+      throw new Error('Independent decode does not match the captured bytes')
+    const result = {
+      requestKey: record.requestKey,
+      uuid: record.uuid,
+      node: record.node,
+      compressionType: record.compressionType,
+      rawBytes: raw.length,
+      transmittedBytes: blob.length,
+      transmittedSha256: sha256(blob),
+      rawSha256,
+      decoded,
+      exportIdentity: { node: row.node, seq: row.seq },
+    }
+    const json = JSON.stringify(result)
+    if (Buffer.byteLength(json) > 1048576) throw new Error('Decoded sidecar exceeds bound')
+    this.#retain(Buffer.byteLength(json))
+    fs.writeFileSync(path.join(this.directory, `decoded-${record.requestKey}.json`), json, {
+      flag: 'wx',
+      mode: 0o600,
+    })
+    return result
   }
 
   /**
@@ -840,6 +897,16 @@ class TelemetryWireObserver {
     const entry = { pid: child.pid, done: collect(child) }
     this.#children.add(entry)
     const result = await entry.done.finally(() => this.#children.delete(entry))
+    fs.writeFileSync(
+      path.join(this.directory, `decoder-${child.pid}.json`),
+      JSON.stringify({
+        ...result,
+        error: result.error?.message,
+        rawSha256: sha256(raw),
+        line: this.#line,
+      }),
+      { flag: 'wx', mode: 0o600 }
+    )
     if (result.error && entry.pid === undefined) throw result.error
     if (!(await this.#groupGone(entry.pid))) {
       this.#signalGroup(entry.pid, 'SIGKILL')
@@ -1102,6 +1169,7 @@ class TelemetryWireObserver {
     if (blob) {
       this.#retain(blob.length)
       record.metricsBytes = blob.length
+      record.metricsSha256 = sha256(blob)
     }
     this.#add(record)
     if (blob) this.#blobs.set(record.requestKey, blob)
@@ -1228,7 +1296,23 @@ class TelemetryWireObserver {
     try {
       fs.writeFileSync(
         path.join(this.directory, 'transcript.json'),
-        JSON.stringify(this.#records.map(copy))
+        JSON.stringify({
+          owner: this.#owner,
+          records: this.#records.map(copy),
+          sockets: [...this.#sockets.values()].map(({ id, kind, node, foregroundBootstrap }) => ({
+            id,
+            kind,
+            node,
+            foregroundBootstrap: !!foregroundBootstrap,
+          })),
+          cleanup: {
+            children: this.#children.size,
+            timers: this.#timers.size,
+            stillOpen: this.#stillOpen,
+            attached: [...this.#sockets.values()].filter((s) => s.attached).length,
+          },
+          failures: this.#failures.map((e) => e.message),
+        })
       )
     } catch (error) {
       this.#latch(error)
@@ -1264,8 +1348,127 @@ const collect = (child) =>
     child.once('close', (code, signal) => resolve({ ...result, code, signal }))
   })
 
+/**
+ * Audits every built-in descriptor and node window against independently joined normal requests.
+ * Bootstrap requests stay in the ledger but cannot introduce a node. Each observed known-node
+ * completion must occur in exactly one compatible, ordered Push window; idle windows have no gauge.
+ * @param {object} input kind, decoded samples, joined requests, physical connects and temporality
+ * @returns {object} exact normal identities, connection arithmetic and node/window allocations
+ * @throws {Error} on a missing/duplicate descriptor, fabricated node, omission or incorrect value
+ */
+const verifyMetricWindows = ({ kind, samples, requests, connects, delta }) => {
+  const fail = (message) => {
+    throw new Error(message)
+  }
+  const prefix = `org.apache.kafka.${kind === 'share' ? 'consumer' : kind}.`
+  const names = [
+    'connection.creation.total',
+    'node.request.latency.avg',
+    'node.request.latency.max',
+  ]
+  if (new Set(requests.map((r) => r.requestKey)).size !== requests.length)
+    fail('Duplicate normal request identity')
+  for (const request of requests)
+    if (!Number.isFinite(request.duration) || request.duration < 0)
+      fail('Invalid observed duration')
+  const gauges = []
+  const sums = []
+  for (const sample of samples) {
+    const seen = new Set()
+    const nodes = [{}, {}]
+    for (const metric of sample.decoded.metrics) {
+      const name = metric.name.slice(prefix.length)
+      if (!metric.name.startsWith(prefix) || !names.includes(name)) fail('Unexpected descriptor')
+      if (seen.has(name)) fail('Duplicate descriptor')
+      seen.add(name)
+      if (name === names[0]) {
+        if (metric.points.length !== 1 || metric.points[0].attrs.length)
+          fail('Invalid connection point')
+        sums.push(BigInt(metric.points[0].asInt))
+      } else {
+        const map = nodes[name === names[1] ? 0 : 1]
+        if (!metric.points.length) fail('Empty gauge descriptor')
+        for (const point of metric.points) {
+          const [attr] = point.attrs
+          if (point.attrs.length !== 1 || attr[0] !== 'node_id' || attr[1] !== 'string')
+            fail('Invalid node identity')
+          if (Object.hasOwn(map, attr[2])) fail('Duplicate node point')
+          const value = Number(point.asDouble)
+          if (!Number.isFinite(value) || value < 0) fail('Invalid gauge value')
+          map[attr[2]] = value
+        }
+      }
+    }
+    if (!seen.has(names[0])) fail('Missing connection descriptor')
+    if (
+      JSON.stringify(Object.keys(nodes[0]).sort()) !== JSON.stringify(Object.keys(nodes[1]).sort())
+    )
+      fail('Mismatched node identity pairs')
+    gauges.push(nodes)
+  }
+  if (!samples.length) fail('Missing metric samples')
+  const expectedNodes = [...new Set(requests.filter((r) => r.knownNode).map((r) => r.node))].sort()
+  const emittedNodes = [...new Set(gauges.flatMap(([nodes]) => Object.keys(nodes)))].sort()
+  if (JSON.stringify(expectedNodes) !== JSON.stringify(emittedNodes))
+    fail('Unexpected or missing node identity')
+  const allocations = expectedNodes.map((node) => {
+    const events = requests.filter((r) => r.knownNode && r.node === node)
+    const visit = (window, offset) => {
+      if (window === samples.length) return offset === events.length ? [] : null
+      const [avg, max] = gauges[window]
+      const previousWrite = window === 0 ? -Infinity : samples[window - 1].writeAt
+      if (!Object.hasOwn(avg, node)) {
+        if (events[offset]?.responseAt <= previousWrite) return null
+        const rest = visit(window + 1, offset)
+        return rest && [[], ...rest]
+      }
+      for (let end = offset + 1; end <= events.length; end++) {
+        const selected = events.slice(offset, end)
+        if (selected.some((r) => r.responseAt > samples[window].writeAt)) break
+        const durations = selected.map((r) => r.duration)
+        const mean = durations.reduce((a, b) => a + b, 0) / durations.length
+        if (
+          Math.abs(avg[node] - mean) > 1e-9 + 1e-12 * Math.abs(mean) ||
+          max[node] !== Math.max(...durations)
+        )
+          continue
+        if (events[end]?.responseAt <= previousWrite) continue
+        const rest = visit(window + 1, end)
+        if (rest) return [selected.map((r) => r.requestKey), ...rest]
+      }
+      return null
+    }
+    const windows = visit(0, 0)
+    if (!windows) fail('Node request arithmetic does not account for every completion')
+    return { node, windows }
+  })
+  const total = delta ? sums.reduce((a, b) => a + b, 0n) : sums[sums.length - 1]
+  const expected = connects.filter((c) => c.at < samples[samples.length - 1].writeAt).length
+  if (total !== BigInt(expected)) fail('Connection arithmetic mismatch')
+  let cumulative = 0n
+  for (let i = 0; i < samples.length; i++) {
+    cumulative = delta ? cumulative + sums[i] : sums[i]
+    if (
+      sums[i] < 0n ||
+      (!delta && i > 0 && sums[i] < sums[i - 1]) ||
+      cumulative > BigInt(connects.filter((c) => c.at < samples[i].writeAt).length)
+    )
+      fail('Connection window exceeds observed successes')
+  }
+  return {
+    requests,
+    connects,
+    allocations,
+    sums: sums.map(String),
+    total: String(total),
+    expected,
+    delta,
+  }
+}
+
 module.exports = {
   canonicalUuid,
+  verifyMetricWindows,
   TelemetryExportReader,
   TelemetryWireObserver,
   readExports,

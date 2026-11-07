@@ -9,6 +9,7 @@ const {
   TelemetryExportReader,
   TelemetryWireObserver,
   withTelemetryResource,
+  verifyMetricWindows,
 } = require('../../../testHelpers/telemetryFixtures')
 const pkg = require('../../../package.json')
 
@@ -25,7 +26,7 @@ const MANIFEST = JSON.parse(
 const PORTS = { configured: [19092, 19095, 19098], base: [9092, 9095, 9098] }
 const NODE_OF_PORT = { 19092: '1', 19095: '2', 19098: '3', 9092: '1', 9095: '2', 9098: '3' }
 const KINDS = ['producer', 'consumer', 'admin', 'share']
-const RACK = 'rack-f07'
+const RACK = 'fixture-rack'
 const WINDOW_MS = 15000
 const PREFIX = 'org.apache.kafka.'
 const ZERO_UUID = '00000000-0000-0000-0000-000000000000'
@@ -74,13 +75,19 @@ const runCase = async (body) => {
   const cleanup = new Cleanup()
   let failed = false
   let primary
+  let evidence
   try {
-    await body(cleanup)
+    await body(cleanup, (value) => {
+      evidence = value
+    })
   } catch (error) {
     failed = true
     primary = error
   }
   await cleanup.run(failed, primary)
+  const { persistEvidence } = require('../../../scripts/e2e/telemetry/evidence')
+  const manifest = persistEvidence(evidence)
+  writeEvidence(evidence.name, { ...evidence.record, status: 'passed', sidecars: manifest })
 }
 
 /**
@@ -177,7 +184,8 @@ const buildClients = ({ mode, stem, line, directory, clock, enabled, suffix = ''
       logLevel: logLevel.NOTHING,
     })
     const common = { enableMetricsPush: enabled }
-    if (kind === 'producer') clients[kind] = kafka.producer({ ...common, rackId: RACK })
+    if (kind === 'producer')
+      clients[kind] = kafka.producer({ ...common, idempotent: false, rackId: RACK })
     if (kind === 'admin') clients[kind] = kafka.admin(common)
     if (kind === 'consumer')
       clients[kind] = kafka.consumer({
@@ -318,45 +326,69 @@ const nodeGauges = (decoded, kind) => {
 }
 
 /**
- * @param {number[]} durations observed completed durations in milliseconds
- * @param {{avg:number,max:number}} pair emitted gauge pair
- * @returns {boolean} whether the pair is exactly their mean and maximum
+ * Joins each ordinary REQUEST event exactly once to this owner's captured socket request.
+ * Only the admin's topology-installing discovery binds nodes in this connect-only scenario.
+ * @param {object} observer socket observer for one client
+ * @param {object[]} events ordinary REQUEST payloads captured before connect
+ * @param {number} knownAfter Metadata response time, or Infinity for bootstrap-only clients
+ * @returns {object[]} complete normal observation ledger including bootstrap requests
  */
-const matches = (durations, pair) => {
-  const mean = durations.reduce((a, b) => a + b, 0) / durations.length
-  return (
-    Math.abs(pair.avg - mean) <= 1e-9 + 1e-12 * Math.abs(mean) &&
-    pair.max === Math.max(...durations)
-  )
-}
-
-/**
- * Requires the emitted gauge pairs of one node over two ordered samples to account for every
- * observed duration of that node, with no event dropped or reused.
- * @param {number[]} durations time-ordered completed durations for the node
- * @param {Array<{avg:number,max:number}>} pairs the node's emitted pairs, oldest first
- * @returns {boolean} whether a feasible time-ordered partition exists
- */
-const accounts = (durations, pairs) => {
-  if (pairs.length === 1) return matches(durations, pairs[0])
-  for (let split = 1; split < durations.length; split++)
-    if (matches(durations.slice(0, split), pairs[0]) && matches(durations.slice(split), pairs[1]))
-      return true
-  return false
+const joinNormal = (observer, events, knownAfter) => {
+  const wire = observer.normalRequests()
+  const used = new Set()
+  const joined = events.map((event) => {
+    const node = NODE_OF_PORT[Number(event.broker.split(':').pop())]
+    const found = wire.filter(
+      (w) =>
+        !used.has(w.requestKey) &&
+        w.node === node &&
+        w.correlation === event.correlationId &&
+        w.apiKey === event.apiKey &&
+        w.apiVersion === event.apiVersion &&
+        w.clientId === event.clientId
+    )
+    expect(found).toHaveLength(1)
+    const [request] = found
+    used.add(request.requestKey)
+    return {
+      ...event,
+      requestKey: request.requestKey,
+      node,
+      socketId: request.socketId,
+      writeAt: request.writeAt,
+      responseAt: request.response.responseAt,
+      knownNode: request.writeAt > knownAfter,
+    }
+  })
+  expect(used.size).toBe(wire.length)
+  return joined.sort((a, b) => a.responseAt - b.responseAt)
 }
 
 live(
   'reporter export',
   () =>
-    runCase(async (cleanup) => {
+    runCase(async (cleanup, publish) => {
       const state = await setup('configured', cleanup)
       const { stem, line, directory, clock, aux } = state
       const reader = new TelemetryExportReader(directory)
       for (const node of ['1', '2', '3']) {
         const proof = JSON.parse(
-          fs.readFileSync(path.join(directory, `reporter-load-proof-${node}.json`), 'utf8')
+          fs.readFileSync(path.join(directory, `reporter-${node}.json`), 'utf8')
         )
-        expect(proof).toMatchObject({ node, class: MANIFEST.classes.reporter, kafkaClients: line })
+        expect(proof).toMatchObject({
+          node,
+          class: MANIFEST.classes.reporter,
+          kafkaClients: line,
+          queueCapacity: 128,
+          maxRecordBytes: 4096,
+          maxFileBytes: 2097152,
+          reporterJar: '/opt/kafka/libs/counting-telemetry-reporter.jar',
+          otlpBindings: '/opt/kafka/libs/counting-telemetry-reporter.jar',
+        })
+        expect(proof.kafkaCommit).toBe(MANIFEST.lines[line].observedCommit.split(' ')[2])
+        expect(proof.protobufJar).toContain('protobuf-java-3.25.5.jar')
+        expect(proof.java).toBeTruthy()
+        expect(proof.loadedAtMs).toBeGreaterThan(0)
       }
       const compose = path.join(ROOT, 'docker-compose.telemetry.yml')
       expect(fileSha(compose)).toBe(MANIFEST.composeSha256['docker-compose.telemetry.yml'])
@@ -368,10 +400,13 @@ live(
         cleanup
       )
       await observers.admin.decodeRaw(Buffer.alloc(0), { budgetMs: 8000 })
-      const events = []
-      cleanup.defer(
-        clients.admin.on(clients.admin.events.REQUEST, (event) => events.push(event.payload))
-      )
+      const events = Object.fromEntries(KINDS.map((kind) => [kind, []]))
+      for (const kind of KINDS)
+        cleanup.defer(
+          clients[kind].on(clients[kind].events.REQUEST, (event) =>
+            events[kind].push(event.payload)
+          )
+        )
       const entries = {
         metrics: PREFIX,
         'interval.ms': '1000',
@@ -389,6 +424,8 @@ live(
             ids[kind] = await clients[kind].clientInstanceId({ timeout: 3000 })
           })
         )
+        expect(new Set(Object.values(ids)).size).toBe(4)
+        for (const kind of KINDS) observers[kind].confirmForegroundBootstrap()
         const inWindow = (kind) =>
           observers[kind]
             .accepted({ uuid: ids[kind] })
@@ -398,7 +435,23 @@ live(
           expect(await clients[kind].clientInstanceId({ timeout: 3000 })).toBe(ids[kind])
           expect(observers[kind].subscriptions({ uuid: ids[kind] })).toHaveLength(gets)
         }
-        await clients.admin.describeCluster({ timeout: 3000 })
+        const discoveryCheckpoint = observers.admin.checkpoint()
+        const config = await clients.admin.describeConfigs({
+          timeout: 3000,
+          resources: [{ type: 4, name: '1', configNames: ['node.id'] }],
+        })
+        expect(config.resources).toEqual([
+          expect.objectContaining({
+            resourceType: 4,
+            resourceName: '1',
+            errorCode: 0,
+          }),
+        ])
+        const discovery = observers.admin.normalRequests({ after: discoveryCheckpoint })
+        const metadata = discovery.filter((r) => r.apiKey === 3)
+        expect(metadata).toHaveLength(1)
+        const knownAfter = metadata[0].response.responseAt
+        expect(discovery.some((r) => r.apiKey === 32 && r.writeAt > knownAfter)).toBe(true)
         const discovered = clock.now()
         const adminAfter = (since) =>
           observers.admin.accepted({ uuid: ids.admin }).filter((p) => p.writeAt > since)
@@ -410,10 +463,15 @@ live(
         )
 
         const checkpoint = observers.admin.checkpoint()
-        const from = events.length
+        const from = events.admin.length
         const controlled = clock.now()
-        await clients.admin.describeCluster({ timeout: 3000 })
-        const requestEvents = events.slice(from)
+        const controlledCluster = await clients.admin.describeCluster({ timeout: 3000 })
+        expect(
+          controlledCluster.brokers
+            .map((broker) => [broker.nodeId, broker.host, broker.port])
+            .sort()
+        ).toEqual(PORTS.configured.map((port, i) => [i + 1, 'localhost', port]))
+        const requestEvents = events.admin.slice(from)
         await pollUntil(
           () =>
             adminAfter(controlled).length >= 3 && KINDS.every((kind) => inWindow(kind).length >= 2),
@@ -423,6 +481,7 @@ live(
         )
         expect(clock.now()).toBeLessThanOrEqual(deadline)
         const controlledPushes = adminAfter(controlled).slice(0, 3)
+        const decodedByRequest = Object.fromEntries(KINDS.map((kind) => [kind, new Map()]))
         const wire = observers.admin.normalRequests({ after: checkpoint })
         await closeAll()
 
@@ -461,7 +520,19 @@ live(
             )
           ).toBe(true)
           const decoded = []
-          for (const push of accepted) decoded.push(await observer.decodeAccepted(push))
+          const allNormalPushes = observer
+            .readTranscript()
+            .filter(
+              (r) => r.apiKey === 72 && !r.terminating && r.writeAt <= accepted.at(-1).writeAt
+            )
+          expect(allNormalPushes.map((r) => r.requestKey)).toEqual(
+            accepted.map((p) => p.requestKey)
+          )
+          for (const push of accepted) {
+            const item = await observer.decodeAccepted(push)
+            decodedByRequest[kind].set(push.requestKey, item)
+            decoded.push({ ...item, writeAt: push.writeAt })
+          }
           const exportsOfKind = reader.readExports({ uuid: id })
           for (const item of decoded) {
             const row = exportsOfKind.find(
@@ -480,30 +551,33 @@ live(
           expect(new Set(decoded.map((p) => JSON.stringify(p.exportIdentity))).size).toBe(
             decoded.length
           )
-          const sums = decoded.map((item) =>
-            BigInt(
-              item.decoded.metrics.find(
-                (m) => m.name === prefixOf(kind) + 'connection.creation.total'
-              ).points[0].asInt
-            )
+          const normal = joinNormal(
+            observer,
+            events[kind],
+            kind === 'admin' ? knownAfter : Infinity
           )
-          const last = accepted[accepted.length - 1]
-          const connects = observer.normalConnects().filter((c) => c.at < last.writeAt).length
-          const total = delta ? sums.reduce((a, b) => a + b, 0n) : sums[sums.length - 1]
-          expect(total).toBe(BigInt(connects))
+          if (kind !== 'admin')
+            expect(normal.every((r) => [17, 18, 36].includes(r.apiKey))).toBe(true)
+          const arithmetic = verifyMetricWindows({
+            kind,
+            samples: decoded,
+            requests: normal,
+            connects: observer.normalConnects(),
+            delta,
+          })
           results[kind] = {
             clientId: `${stem}-${kind}`,
             uuid: id,
             requestKeys: accepted.map((p) => p.requestKey),
             exports: decoded.map((p) => p.exportIdentity),
             rawSha256: decoded.map((p) => p.rawSha256),
-            connects,
+            arithmetic,
           }
         }
 
         const decodedControlled = []
         for (const push of controlledPushes)
-          decodedControlled.push((await observers.admin.decodeAccepted(push)).decoded)
+          decodedControlled.push(decodedByRequest.admin.get(push.requestKey).decoded)
         const samples = decodedControlled.map((d) => nodeGauges(d, 'admin'))
         const joined = requestEvents.map((event) => {
           const node = NODE_OF_PORT[Number(event.broker.split(':').pop())]
@@ -515,31 +589,62 @@ live(
               w.apiVersion === event.apiVersion
           )
           expect(found).toHaveLength(1)
-          return { node, duration: event.duration, sentAt: event.sentAt }
+          expect(found[0].writeAt).toBeGreaterThan(knownAfter)
+          return { ...event, requestKey: found[0].requestKey, node }
         })
         expect(joined).toHaveLength(wire.length)
         const emitted = new Set([...Object.keys(samples[0]), ...Object.keys(samples[1])])
         expect(emitted.size).toBeGreaterThan(0)
-        for (const node of emitted) {
-          const durations = joined
-            .filter((e) => e.node === node)
-            .sort((a, b) => a.sentAt - b.sentAt)
-            .map((e) => e.duration)
-          const pairs = [samples[0][node], samples[1][node]].filter(Boolean)
-          expect(accounts(durations, pairs)).toBe(true)
+        expect([...emitted].sort()).toEqual([...new Set(joined.map((r) => r.node))].sort())
+        const controlSamples = controlledPushes.map((push, i) => ({
+          requestKey: push.requestKey,
+          writeAt: push.writeAt,
+          decoded: decodedControlled[i],
+        }))
+        const controlRequests = joinNormal(observers.admin, events.admin, knownAfter).filter((r) =>
+          joined.some((j) => j.requestKey === r.requestKey)
+        )
+        // The full audit above accounts for every window; this ledger isolates the mandatory control.
+        results.control = {
+          discovery,
+          cluster: controlledCluster,
+          knownAfter,
+          checkpoint,
+          requestEvents,
+          wire,
+          requests: controlRequests,
+          samples: controlSamples.map((p) => p.requestKey),
         }
         expect(samples[2]).toEqual({})
         results.window = { start, deadline }
+        results.resource = { name: stem, entries, deleted: true }
       })
 
-      writeEvidence('telemetry-reporter', {
-        wireVersions: { 71: 0, 72: 0 },
-        run: { stem, line, project: 'kafkajs', composeSha256: fileSha(compose) },
-        fixture: {
-          manifestSha256: fileSha(path.join(ROOT, 'scripts/e2e/telemetry/fixtures/manifest.json')),
-          reporterJar: jar,
+      publish({
+        name: 'telemetry-reporter',
+        directory,
+        observers,
+        record: {
+          wireVersions: { 71: 0, 72: 0 },
+          run: {
+            stem,
+            line,
+            project: process.env.COMPOSE_PROJECT_NAME,
+            composeSha256: fileSha(compose),
+          },
+          fixture: {
+            manifestSha256: fileSha(
+              path.join(ROOT, 'scripts/e2e/telemetry/fixtures/manifest.json')
+            ),
+            reporterJar: jar,
+            client: {
+              packageName: pkg.name,
+              version: pkg.version,
+              rootSha256: fileSha(path.join(ROOT, 'index.js')),
+            },
+          },
+          results,
         },
-        results,
       })
     }),
   90000
@@ -548,7 +653,7 @@ live(
 live(
   'reporter no-resource control',
   () =>
-    runCase(async (cleanup) => {
+    runCase(async (cleanup, publish) => {
       const state = await setup('configured', cleanup)
       const { stem, line, directory, clock, aux } = state
       const { observers, clients, closeAll } = buildClients(
@@ -562,6 +667,7 @@ live(
           ids[kind] = await clients[kind].clientInstanceId({ timeout: 3000 })
         })
       )
+      expect(new Set(Object.values(ids)).size).toBe(4)
       const deadline = clock.now() + 10000
       for (const kind of KINDS)
         await pollUntil(
@@ -590,10 +696,15 @@ live(
       const listed = await aux.listConfigResources({ resourceTypes: [16], timeout: 3000 })
       expect(listed.resources.filter((r) => r.name === stem)).toEqual([])
       await closeAll()
-      writeEvidence('telemetry-reporter-no-resource', {
-        wireVersions: { 71: 0 },
-        run: { stem, line, project: 'kafkajs' },
-        uuids: ids,
+      publish({
+        name: 'telemetry-reporter-no-resource',
+        directory,
+        observers,
+        record: {
+          wireVersions: { 71: 0 },
+          run: { stem, line, project: process.env.COMPOSE_PROJECT_NAME },
+          uuids: ids,
+        },
       })
     }),
   60000
@@ -602,7 +713,7 @@ live(
 live(
   'reporter no-plugin control',
   () =>
-    runCase(async (cleanup) => {
+    runCase(async (cleanup, publish) => {
       const state = await setup('base', cleanup)
       const { stem, line, directory, clock } = state
       const on = buildClients(
@@ -618,7 +729,14 @@ live(
           await client.connect()
           return { status: 'connected' }
         } catch (error) {
-          return { status: 'rejected', name: error?.name, message: error?.message }
+          return {
+            status: 'rejected',
+            name: error?.name,
+            message: error?.message,
+            reason: error?.reason,
+            apiKey: error?.apiKey,
+            shareVersion: error?.shareVersion,
+          }
         }
       }
       const enabled = {}
@@ -636,9 +754,18 @@ live(
       const reasons = {}
       for (const kind of KINDS) {
         expect(enabled[kind]).toEqual(disabled[kind])
-        if (enabled[kind].status !== 'connected') continue
+        const oldShare = kind === 'share' && ['4.0.2', '4.1.2'].includes(line)
+        if (oldShare) {
+          expect(enabled[kind]).toMatchObject({
+            status: 'rejected',
+            name: 'KafkaJSShareGroupsNotSupportedError',
+            reason: line === '4.0.2' ? 'api-not-advertised' : 'api-version-range',
+            apiKey: line === '4.0.2' ? 76 : 78,
+            shareVersion: 0,
+          })
+        } else expect(enabled[kind]).toEqual({ status: 'connected' })
         for (const [group, reason] of [
-          [on, 'unsupported'],
+          [on, oldShare ? 'not-connected' : 'unsupported'],
           [off, 'disabled'],
         ]) {
           const error = await group.clients[kind].clientInstanceId({ timeout: 3000 }).then(
@@ -651,27 +778,42 @@ live(
         const adverts = on.observers[kind].advertisements()
         expect(adverts.length).toBeGreaterThan(0)
         expect(adverts.every((a) => a.ranges[71] === null && a.ranges[72] === null)).toBe(true)
-        reasons[kind] = 'unsupported'
+        reasons[kind] = oldShare ? 'not-connected' : 'unsupported'
       }
       for (const kind of KINDS) {
-        const observer = on.observers[kind]
-        expect(observer.subscriptions()).toEqual([])
-        expect(observer.telemetrySockets()).toEqual([])
-        expect(observer.readTranscript().some((r) => r.apiKey === 71 || r.apiKey === 72)).toBe(
-          false
-        )
+        for (const group of [on, off]) {
+          const observer = group.observers[kind]
+          expect(observer.subscriptions()).toEqual([])
+          expect(observer.telemetrySockets()).toEqual([])
+          expect(observer.readTranscript().some((r) => r.apiKey === 71 || r.apiKey === 72)).toBe(
+            false
+          )
+          const adverts = observer.advertisements()
+          expect(adverts.length).toBeGreaterThan(0)
+          expect(adverts.every((a) => a.ranges[71] === null && a.ranges[72] === null)).toBe(true)
+          observer.assertHealthy()
+        }
         const dials = (group) =>
           group.observers[kind].readTranscript().filter((r) => r.type === 'connect')
+        expect(dials(on).length).toBeGreaterThan(0)
         expect(dials(on)).toHaveLength(dials(off).length)
-        observer.assertHealthy()
       }
       await on.closeAll()
       await off.closeAll()
-      writeEvidence('telemetry-reporter-no-plugin', {
-        wireVersions: {},
-        run: { stem, line, project: 'kafkajs' },
-        outcomes: enabled,
-        reasons,
+      publish({
+        name: 'telemetry-reporter-no-plugin',
+        directory,
+        observers: {
+          ...on.observers,
+          ...Object.fromEntries(KINDS.map((k) => [k + '-off', off.observers[k]])),
+        },
+        record: {
+          wireVersions: {},
+          run: { stem, line, project: process.env.COMPOSE_PROJECT_NAME },
+          outcomes: enabled,
+          disabledOutcomes: disabled,
+          reasons,
+        },
       })
     }),
   60000

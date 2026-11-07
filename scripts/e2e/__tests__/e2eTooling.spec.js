@@ -1111,17 +1111,22 @@ describe('broker telemetry fixture', () => {
       '79293d88513002896afad9a9ad48ec0fc75b57be2db78fb46ba4bef0e590cefc'
     )
     for (const line of ['4.3.1', '4.2.2']) {
-      const jar = manifest.lines[line].reporterJar
-      expect(jar.path).toBe(fixture + 'fixtures/counting-telemetry-reporter-' + line + '.jar')
-      // Jars are built in CI and never committed; a present jar must still match the manifest.
-      if (fs.existsSync(path.join(root, jar.path))) expect(digest(jar.path)).toBe(jar.sha256)
+      for (const kind of ['reporterJar', 'javaClientJar']) {
+        const jar = manifest.lines[line][kind]
+        expect(fs.statSync(path.join(root, jar.path)).isFile()).toBe(true)
+        expect(digest(jar.path)).toBe(jar.sha256)
+      }
     }
     expect(manifest.sink).toMatchObject({
       queueCapacity: 128,
       maxFileBytesPerNode: 2097152,
       maxRecordBytes: 4096,
     })
-    expect(read('.gitignore').toString()).toContain('scripts/e2e/telemetry/fixtures/*.jar')
+    expect(read('.gitignore').toString()).toContain(
+      '!scripts/e2e/telemetry/fixtures/counting-telemetry-reporter-4.3.1.jar'
+    )
+    expect(read('scripts/assertCleanTarball.sh').toString()).toContain('scripts/e2e/telemetry/')
+    expect(read('scripts/assertCleanTarball.sh').toString()).toContain('.*\\.jar$')
   })
 
   test('keeps fixture startup separate from offline verification and decoding', () => {
@@ -1152,7 +1157,7 @@ describe('broker telemetry fixture', () => {
     }
   })
 
-  test('wires the CI lanes to the fixture build and one exact Jest selection each', () => {
+  test('wires retained fixtures and all live combinations through isolated CI ownership', () => {
     const scripts = JSON.parse(read('package.json')).scripts
     const exact = (script, title) => {
       expect(scripts[script]).toContain('TELEMETRY_E2E=1 jest --detectOpenHandles --runInBand')
@@ -1165,20 +1170,49 @@ describe('broker telemetry fixture', () => {
     exact('test:group:telemetry-reporter', '^(reporter export|reporter no-resource control)$')
     exact('test:group:telemetry-base', '^reporter no-plugin control$')
     const ci = read('.github/workflows/ci.yml').toString()
-    for (const row of [
-      '{ node: 24, kafka: 4.3.1, group: telemetry-reporter, compose: docker-compose.telemetry.yml }',
-      '{ node: 24, kafka: 4.2.2, group: telemetry-reporter, compose: docker-compose.telemetry.yml }',
-      '{ node: 24, kafka: 4.3.1, group: telemetry-base, compose: docker-compose.yml }',
-    ])
-      expect(ci).toContain(row)
-    for (const step of [
-      'bash scripts/e2e/telemetry/fetch.sh',
-      'bash scripts/e2e/telemetry/build.sh "$KAFKA_VERSION"',
+    const job = ci.slice(ci.indexOf('\n  telemetry:'))
+    const rows = [
+      ...job.matchAll(
+        /-\s*\{\s*node:\s*(\d+),\s*kafka:\s*([\d.]+),\s*group:\s*([\w-]+),\s*compose:\s*([\w.-]+),?\s*\}/g
+      ),
+    ].map(([, node, kafka, group, compose]) => ({ node: Number(node), kafka, group, compose }))
+    for (const node of [22, 24, 26]) {
+      for (const kafka of ['4.3.1', '4.2.2'])
+        expect(rows).toContainEqual({
+          node,
+          kafka,
+          group: 'telemetry-reporter',
+          compose: 'docker-compose.telemetry.yml',
+        })
+      for (const kafka of ['4.3.1', '4.2.2', '4.1.2', '4.0.2'])
+        expect(rows).toContainEqual({
+          node,
+          kafka,
+          group: 'telemetry-base',
+          compose: 'docker-compose.yml',
+        })
+    }
+    for (const identity of ['github.run_id', 'github.run_attempt', 'strategy.job-index'])
+      expect(job).toContain(identity)
+    expect(job.match(/timeout-minutes:/g).length).toBeGreaterThanOrEqual(
+      job.match(/\brun:/g).length
+    )
+    expect(job).not.toContain('bash scripts/e2e/telemetry/build.sh')
+    expect(job).not.toContain('testWithKafka')
+    for (const command of [
+      'ci.js preflight',
+      'ci.js capture',
+      'ci.js stop',
+      'verifyEvidence(',
       'bash scripts/e2e/telemetry/run.sh verify "$KAFKA_VERSION"',
-      'Verify the mounted reporter on every broker',
-      'Verify telemetry evidence before teardown',
     ])
-      expect(ci).toContain(step)
+      expect(job).toContain(command)
+    const owner = read(fixture + 'ci.js').toString()
+    expect(owner).toContain("'down', '-v', '--remove-orphans'")
+    for (const type of ['containers', 'networks', 'volumes']) expect(owner).toContain(type)
+    expect(ci.indexOf('Verify telemetry evidence before teardown')).toBeLessThan(
+      ci.indexOf('Stop owned project')
+    )
     expect(ci).not.toMatch(/forceExit|docker (pull|system prune)/)
   })
 })

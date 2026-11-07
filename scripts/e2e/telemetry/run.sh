@@ -23,7 +23,10 @@ const manifest = JSON.parse(fs.readFileSync(file, 'utf8'))
 check(path.join(root, 'docker-compose.telemetry.yml'), manifest.composeSha256['docker-compose.telemetry.yml'])
 for (const name of ['CountingTelemetryReporter.java', 'build.sh'])
   check(path.join(here, name), manifest.scripts[name])
-check(path.join(root, manifest.lines[line].reporterJar.path), manifest.lines[line].reporterJar.sha256)
+for (const item of Object.values(manifest.lines)) {
+  for (const kind of ['reporterJar', 'javaClientJar'])
+    check(path.join(root, item[kind].path), item[kind].sha256)
+}
 if (process.env.TELEMETRY_JAVA_CACHE) {
   for (const key of ['kafka-clients-' + line, 'protobuf-java', 'slf4j-api']) {
     const input = manifest.inputs[key]

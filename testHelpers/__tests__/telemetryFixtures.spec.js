@@ -556,6 +556,112 @@ describe('telemetry wire observer', () => {
     expect(observer.undecided()).toEqual([])
   })
 
+  test('rejects fabricated, duplicate and missing per-kind node points', () => {
+    const { verifyMetricWindows } = require('../telemetryFixtures')
+    const metric = (name, points) => ({ name: 'org.apache.kafka.consumer.' + name, points })
+    const pair = (value) => [{ attrs: [['node_id', 'string', '2']], asDouble: String(value) }]
+    const sample = {
+      requestKey: 'push',
+      writeAt: 10,
+      decoded: {
+        metrics: [
+          metric('connection.creation.total', [{ asInt: '1', attrs: [] }]),
+          metric('node.request.latency.avg', pair(7)),
+          metric('node.request.latency.max', pair(7)),
+        ],
+      },
+    }
+    const requests = [
+      { requestKey: 'normal', node: '2', duration: 7, responseAt: 5, knownNode: true },
+    ]
+    const check = (samples, events = requests) =>
+      verifyMetricWindows({
+        kind: 'consumer',
+        samples,
+        requests: events,
+        connects: [{ at: 1 }],
+        delta: true,
+      })
+    expect(check([sample]).allocations).toEqual([{ node: '2', windows: [['normal']] }])
+    expect(() => check([sample], [])).toThrow('node identity')
+    const missing = JSON.parse(JSON.stringify(sample))
+    missing.decoded.metrics.pop()
+    expect(() => check([missing])).toThrow('node identity')
+    const duplicate = JSON.parse(JSON.stringify(sample))
+    duplicate.decoded.metrics[1].points.push(...pair(7))
+    expect(() => check([duplicate])).toThrow('Duplicate')
+    const omitted = JSON.parse(JSON.stringify(sample))
+    omitted.decoded.metrics.splice(1)
+    expect(() => check([omitted])).toThrow('node identity')
+    const wrong = JSON.parse(JSON.stringify(sample))
+    wrong.decoded.metrics[1].points[0].asDouble = '6'
+    expect(() => check([wrong])).toThrow('arithmetic')
+    const descriptor = JSON.parse(JSON.stringify(sample))
+    descriptor.decoded.metrics.push(descriptor.decoded.metrics[0])
+    expect(() => check([descriptor])).toThrow('Duplicate')
+  })
+
+  test('keeps the zero-request Get under its assigned response UUID', async () => {
+    const { observer } = observe()
+    const socket = open(observer)
+    send(socket, get71(1, '00000000-0000-0000-0000-000000000000'))
+    receive(socket, get71Response(1))
+    const gets = observer.subscriptions({ uuid: ID })
+    expect(gets).toHaveLength(1)
+    expect(gets[0].uuid).toBe('00000000-0000-0000-0000-000000000000')
+    expect(gets[0].response.uuid).toBe(ID)
+    expect(observer.subscriptions({ uuid: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' })).toEqual([])
+    socket.emit('close')
+    await observer.dispose()
+    observer.assertClean()
+  })
+
+  test('counts a proven foreground bootstrap without counting dedicated setup', async () => {
+    const { observer } = observe()
+    const foreground = open(observer)
+    send(foreground, apiVersions(1))
+    receive(foreground, apiVersionsResponse(1, [[3, 0, 6]]))
+    const dedicated = open(observer, 19095)
+    send(dedicated, apiVersions(1))
+    receive(
+      dedicated,
+      apiVersionsResponse(1, [
+        [71, 0, 0],
+        [72, 0, 0],
+      ])
+    )
+    observer.confirmForegroundBootstrap()
+    expect(observer.normalConnects().map((c) => c.socketId)).toEqual([1])
+    expect(observer.undecided().map((c) => c.socketId)).toEqual([2])
+    send(dedicated, get71(2))
+    receive(dedicated, get71Response(2))
+    expect(() => observer.confirmForegroundBootstrap(2)).toThrow('foreground bootstrap')
+    expect(observer.telemetrySockets().map((c) => c.socketId)).toEqual([2])
+    expect(observer.undecided()).toEqual([])
+    foreground.emit('close')
+    dedicated.emit('close')
+    await observer.dispose()
+    observer.assertClean()
+  })
+
+  test('decodes once and reuses a result without consuming another request export', async () => {
+    const blob = Buffer.from('cached-payload')
+    writeSink('1', [sinkRow('1', 1, blob)])
+    const { observer } = observe()
+    const socket = open(observer)
+    send(socket, push72(1, blob))
+    receive(socket, push72Response(1))
+    const [push] = observer.accepted({ uuid: ID })
+    const first = await observer.decodeAccepted(push, { sinkWaitMs: 0 })
+    expect(await observer.decodeAccepted(push, { sinkWaitMs: 0 })).toEqual(first)
+    expect(stubDecoder).toHaveBeenCalledTimes(1)
+    const decodedFile = path.join(observer.directory, `decoded-${push.requestKey}.json`)
+    expect(JSON.parse(fs.readFileSync(decodedFile))).toEqual(first)
+    socket.emit('close')
+    await observer.dispose()
+    observer.assertClean()
+  })
+
   test('distinguishes empty selection and zero blob from missing exporter', async () => {
     const empty = observe()
     const first = open(empty.observer)
@@ -790,5 +896,209 @@ describe('telemetry wire observer', () => {
     ).rejects.toBe(readback)
     expect(work).not.toHaveBeenCalled()
     expect(admin.incrementalAlterConfigs).toHaveBeenCalledTimes(2)
+  })
+})
+
+describe('isolated telemetry CI ownership', () => {
+  const { CiOwnership } = require('../../scripts/e2e/telemetry/ci')
+  let directory
+  const environment = () => ({
+    CI: 'true',
+    COMPOSE_PROJECT_NAME: 'telemetry-123-1-4',
+    COMPOSE_FILE: 'docker-compose.telemetry.yml',
+    KAFKA_VERSION: '4.3.1',
+    TELEMETRY_EVIDENCE_DIR: path.join(directory, 'sink'),
+  })
+  const owned = (docker) => {
+    const owner = new CiOwnership({ env: environment(), docker })
+    owner.receiptFile = path.join(directory, 'ownership.json')
+    return owner
+  }
+  beforeEach(() => {
+    directory = fs.mkdtempSync(path.join(os.tmpdir(), 'telemetry-ci-'))
+  })
+  afterEach(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const empty = () => ''
+
+  test('refuses local execution and unsafe project names', () => {
+    expect(() => new CiOwnership({ env: { ...environment(), CI: 'false' } })).toThrow('CI-only')
+    expect(
+      () => new CiOwnership({ env: { ...environment(), COMPOSE_PROJECT_NAME: 'kafkajs' } })
+    ).toThrow('unique')
+  })
+
+  test.each(['ps', 'network', 'volume'])(
+    'refuses a conflicting %s before any mutation',
+    (resource) => {
+      const docker = jest.fn((args) => (args[0] === resource ? 'foreign-resource' : ''))
+      const owner = owned(docker)
+      expect(() => owner.preflight()).toThrow('Project resources remain')
+      expect(fs.existsSync(owner.receiptFile)).toBe(false)
+      expect(
+        docker.mock.calls.every(([args]) => !args.includes('down') && !args.includes('up'))
+      ).toBe(true)
+      owner.stop()
+      expect(docker.mock.calls.every(([args]) => !args.includes('down'))).toBe(true)
+    }
+  )
+
+  test('tears down only an admitted project and preserves removal proof', () => {
+    const docker = jest.fn((args) =>
+      args.includes('config')
+        ? JSON.stringify({
+            services: Object.fromEntries(
+              ['kafka1', 'kafka2', 'kafka3'].map((key) => [
+                key,
+                {
+                  environment: {
+                    KAFKA_TELEMETRY_MAX_BYTES: '4096',
+                    KAFKA_METRIC_REPORTERS:
+                      'org.countly.kafkajs.telemetry.CountingTelemetryReporter',
+                  },
+                },
+              ])
+            ),
+          })
+        : ''
+    )
+    const owner = owned(docker)
+    owner.preflight()
+    owner.stop()
+    expect(() =>
+      require('../../scripts/e2e/telemetry/evidence').verifyCleanup(
+        owner.directory,
+        path.dirname(owner.receiptFile),
+        owner.project
+      )
+    ).not.toThrow()
+    expect(
+      docker.mock.calls.some(
+        ([args]) =>
+          args.join(' ') ===
+          'compose -p telemetry-123-1-4 -f docker-compose.telemetry.yml down -v --remove-orphans --timeout 10'
+      )
+    ).toBe(true)
+    expect(JSON.parse(fs.readFileSync(owner.receiptFile))).toMatchObject({
+      project: environment().COMPOSE_PROJECT_NAME,
+      preflightPassed: true,
+      removalVerified: true,
+      removalProof: { containers: [], networks: [], volumes: [] },
+      stoppedAt: expect.any(String),
+      startedAt: expect.any(String),
+    })
+  })
+
+  test('proves removal of journalled anonymous volumes without project labels', () => {
+    const owner = owned((args) =>
+      args[0] === 'volume' && !args.includes('--filter') ? 'anonymous-owned' : ''
+    )
+    owner.save({
+      project: owner.project,
+      compose: owner.file,
+      preflightPassed: true,
+      owned: { containers: [], networks: [], volumes: ['anonymous-owned'] },
+    })
+    expect(() => owner.stop()).toThrow('Project resources remain')
+    const receipt = JSON.parse(fs.readFileSync(owner.receiptFile))
+    expect(receipt.removalProof.volumes).toEqual([])
+    expect(receipt.ownedRemovalProof.volumes).toEqual(['anonymous-owned'])
+    expect(receipt.removalVerified).not.toBe(true)
+  })
+
+  test('rejects a surviving volume and retains teardown failures', () => {
+    const owner = owned(empty)
+    owner.save({ project: owner.project, compose: owner.file, preflightPassed: true })
+    owner.docker = (args) => {
+      if (args.includes('down')) throw new Error('teardown refused')
+      return args[0] === 'volume' ? 'surviving-volume' : ''
+    }
+    expect(() => owner.stop()).toThrow('teardown refused')
+    const receipt = JSON.parse(fs.readFileSync(owner.receiptFile))
+    expect(receipt.cleanupError).toBe('teardown refused')
+    expect(receipt.removalProof.volumes).toEqual(['surviving-volume'])
+    expect(receipt.removalVerified).not.toBe(true)
+  })
+})
+
+describe('telemetry sidecar verification', () => {
+  const {
+    persistEvidence,
+    verifyScenario,
+    verifyEvidence,
+  } = require('../../scripts/e2e/telemetry/evidence')
+  let directory
+  const kinds = ['producer', 'consumer', 'admin', 'share']
+  beforeEach(() => {
+    directory = fs.mkdtempSync(path.join(os.tmpdir(), 'telemetry-evidence-'))
+  })
+  afterEach(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const create = (plugin = false) => {
+    const observers = {}
+    const record = {
+      status: 'passed',
+      run: { stem: 'sample', line: '4.3.1' },
+      uuids: {},
+      outcomes: {},
+      disabledOutcomes: {},
+    }
+    for (const kind of plugin ? [...kinds, ...kinds.map((k) => k + '-off')] : kinds) {
+      const observer = { directory: path.join(directory, 'observer-' + kind) }
+      fs.mkdirSync(observer.directory)
+      observers[kind] = observer
+      record.uuids[kind] = '11223344-5566-7788-99aa-bbccddeeff00'
+      record.outcomes[kind.replace(/-off$/, '')] = { status: 'connected' }
+      record.disabledOutcomes[kind.replace(/-off$/, '')] = { status: 'connected' }
+      const records = plugin
+        ? [{ type: 'connect', socketId: 1 }]
+        : [
+            {
+              apiKey: 71,
+              response: {
+                uuid: record.uuids[kind],
+                requestedMetrics: [],
+                pushIntervalMs: 300000,
+              },
+            },
+          ]
+      fs.writeFileSync(
+        path.join(observer.directory, 'transcript.json'),
+        JSON.stringify({
+          records,
+          sockets: [{ id: 1, kind: 'normal' }],
+          failures: [],
+          cleanup: { children: 0, timers: 0, stillOpen: [], attached: 0 },
+        })
+      )
+    }
+    const name = plugin ? 'telemetry-reporter-no-plugin' : 'telemetry-reporter-no-resource'
+    record.sidecars = persistEvidence({ name, record, directory, observers })
+    return record
+  }
+
+  test('verifies full immutable archives and rejects tampering or missing cleanup', () => {
+    const record = create()
+    expect(() => verifyScenario(record, directory)).not.toThrow()
+    const file = path.join(directory, record.sidecars.owners.producer)
+    const transcript = JSON.parse(fs.readFileSync(file))
+    transcript.cleanup.stillOpen.push(1)
+    fs.writeFileSync(file, JSON.stringify(transcript))
+    expect(() => verifyScenario(record, directory)).toThrow('Sidecar')
+    const item = record.sidecars.files.find(
+      (entry) => entry.path === record.sidecars.owners.producer
+    )
+    const bytes = fs.readFileSync(file)
+    item.bytes = bytes.length
+    item.sha256 = require('crypto').createHash('sha256').update(bytes).digest('hex')
+    expect(() => verifyScenario(record, directory)).toThrow()
+  })
+
+  test('rejects equal enabled/disabled foreground failures and missing scenarios', () => {
+    const record = create(true)
+    expect(() => verifyScenario(record, directory)).not.toThrow()
+    record.outcomes.producer = record.disabledOutcomes.producer = { status: 'rejected' }
+    expect(() => verifyScenario(record, directory)).toThrow('Ordinary baseline failed')
+    expect(() => verifyEvidence('telemetry-reporter', directory, [])).toThrow(
+      'Scenario catalogue mismatch'
+    )
   })
 })

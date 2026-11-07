@@ -27,5 +27,9 @@ upgrade-ref-index.md
 CODEX_brainstorm.md
 skills-lock.json
 
-# Reporter jars are built in CI from the committed source and verified against the manifest; never committed.
-scripts/e2e/telemetry/fixtures/*.jar
+# Keep binary build outputs ignored, except the four checksum-pinned test fixtures.
+*.jar
+!scripts/e2e/telemetry/fixtures/counting-telemetry-reporter-4.2.2.jar
+!scripts/e2e/telemetry/fixtures/counting-telemetry-reporter-4.3.1.jar
+!scripts/e2e/telemetry/fixtures/java-telemetry-client-4.2.2.jar
+!scripts/e2e/telemetry/fixtures/java-telemetry-client-4.3.1.jar
