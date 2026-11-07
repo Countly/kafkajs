@@ -2924,6 +2924,9 @@ class ShareCycleOracle {
         fail('the terminal proof belongs to another group or topic')
     }
     ShareCycleOracle.verifier(observation.verifier, SHARE_SOAK.quietMs.cycle, fail)
+    ShareCycleOracle.sequence(observation, fail)
+    if (observation.timing?.cycle !== plan.cycle || observation.timing?.kind !== 'cycle')
+      fail('the proof belongs to another cycle')
 
     return violations
   }
@@ -3307,34 +3310,139 @@ class ShareCycleOracle {
       assignment?.length === 1 &&
       assignment[0].topic === verifier.topic &&
       [...assignment[0].partitions].sort().join() === '0,1,2'
+    const times = [verifier.openedAt, start?.at, end?.at, verifier.closedAt]
+    const ordered =
+      times.every(Number.isFinite) &&
+      times.every((at, i) => !i || at >= times[i - 1]) &&
+      Number.isFinite(start?.wallAt) &&
+      Number.isFinite(end?.wallAt) &&
+      end.wallAt >= start.wallAt &&
+      verifier.events.every(
+        ({ at }, i, events) =>
+          Number.isFinite(at) &&
+          at >= verifier.openedAt &&
+          at <= verifier.closedAt &&
+          (!i || at >= events[i - 1].at)
+      )
+    const joined = verifier.events?.filter(({ kind }) => kind === 'GROUP_JOIN') ?? []
+    const covered = new Set()
+    const sessions = new Map()
+    for (const exchange of verifier.provenance?.exchanges ?? []) {
+      const frame = exchange.frames?.[0]
+      if (!frame || exchange.apiKey !== 78 || exchange.memberId !== verifier.memberId) continue
+      const key = `${frame.socket}:${exchange.open}:${exchange.pool}:${exchange.generation}`
+      if (frame.request.shareSessionEpoch === 0) sessions.set(key, new Set())
+      const partitions = sessions.get(key)
+      if (!partitions || exchange.groupId !== verifier.groupId) continue
+      for (const topic of frame.request.topics ?? []) {
+        if (topic.topicId !== verifier.topicId) continue
+        for (const { partitionIndex } of topic.partitions)
+          if (
+            ShareCycleOracle.partitionResponse(exchange, {
+              topicId: verifier.topicId,
+              partition: partitionIndex,
+            })
+          )
+            partitions.add(partitionIndex)
+      }
+      for (const topic of frame.request.forgottenTopicsData ?? [])
+        if (topic.topicId === verifier.topicId)
+          for (const partition of topic.partitions) partitions.delete(partition)
+      if (
+        !ordered ||
+        !Number.isFinite(frame.at) ||
+        !Number.isFinite(frame.answeredAt) ||
+        frame.at < start.at ||
+        frame.answeredAt < frame.at ||
+        frame.answeredAt > end.at ||
+        !Number.isInteger(frame.socket) ||
+        !Number.isInteger(exchange.open) ||
+        !Number.isInteger(exchange.pool) ||
+        !Number.isInteger(exchange.generation) ||
+        !verifier.events.some(
+          ({ kind, payload, at }) =>
+            kind === 'REQUEST' &&
+            payload.apiName === 'ShareFetch' &&
+            payload.correlationId === frame.correlationId &&
+            payload.broker === frame.endpoint &&
+            payload.sentAt >= start.wallAt &&
+            payload.sentAt <= end.wallAt &&
+            at >= frame.answeredAt &&
+            at <= end.at
+        )
+      )
+        continue
+      for (const partition of partitions) {
+        const response = ShareCycleOracle.partitionResponse(exchange, {
+          topicId: verifier.topicId,
+          partition,
+        })
+        if (response && response.acquiredRecords?.length === 0) covered.add(partition)
+      }
+    }
     const active =
-      start &&
-      end &&
+      ordered &&
       end.at - start.at >= windowMs &&
       owns(start.payload) &&
       owns(end.payload) &&
+      [...covered].sort().join() === '0,1,2' &&
+      joined.length === 1 &&
+      joined[0].payload.memberId === verifier.memberId &&
+      joined[0].payload.groupId === verifier.groupId &&
+      joined[0].at <= start.at &&
       verifier.events.some(
-        ({ kind, payload, at }) =>
-          kind === 'REQUEST' &&
-          payload.apiName === 'ShareFetch' &&
-          payload.sentAt >= start.wallAt &&
-          at >= start.at &&
-          at <= end.at
+        ({ kind, at }) => kind === 'DISCONNECT' && at >= end.at && at <= verifier.closedAt
       ) &&
-      verifier.events.some(({ kind, at }) => kind === 'DISCONNECT' && at >= end.at) &&
       !verifier.events
         .slice(verifier.events.indexOf(start), verifier.events.indexOf(end))
         .some(({ kind, payload }) => kind === 'ASSIGNMENT_CHANGED' && !owns(payload.assignment))
     if (
       !active ||
       verifier.windowMs !== windowMs ||
-      verifier.closedAt < end?.at ||
       !verifier.memberId ||
       !verifier.topicId ||
       verifier.active !== true ||
       verifier.delivered?.length !== 0
     )
       fail('the same-group verifier activity or measured observation window is incomplete')
+  }
+
+  /**
+   * Binds original reads, departures and the joined verifier to one enclosing observation.
+   * @param {object} observation Original cycle or final proof.
+   * @param {Function} fail Records a violation.
+   * @returns {void}
+   */
+  static sequence({ timing = {}, positions = [], verifier = {}, members = {} }, fail) {
+    const [before, after] = positions
+    const departures =
+      timing.kind === 'final'
+        ? [members.bRemovedAt, members.aLeftAt, timing.startedAt]
+        : [timing.startedAt, members.bRemovedAt, members.aLeftAt]
+    const times = [
+      ...departures,
+      before?.startedAt,
+      before?.completedAt,
+      members.emptyAt,
+      verifier.openedAt,
+      verifier.closedAt,
+      after?.startedAt,
+      after?.completedAt,
+      timing.completedAt,
+      timing.due,
+    ]
+    if (
+      !times.every(Number.isFinite) ||
+      times.some((at, i) => i && at < times[i - 1]) ||
+      !Number.isInteger(timing.cycle) ||
+      positions.length !== 2 ||
+      [before, after, verifier].some(
+        (part) => part?.cycle !== timing.cycle || part?.kind !== timing.kind
+      )
+    )
+      fail(
+        'the terminal reads, departures and verifier are not bound to their original cycle window'
+      )
   }
 
   /**
@@ -3442,8 +3550,9 @@ const loadSharePorts = () => {
  * original request/answer frames. Sockets are held weakly across destruction.
  */
 class ShareFetchTap {
-  /** @param {number} [limit=64] how many facts are kept */
-  constructor(limit = 64) {
+  /** @param {number} [limit=64] Retained facts. @param {object} [clock] Monotonic clock. */
+  constructor(limit = 64, clock = SHARE_CLOCK) {
+    this.clock = clock
     this.limit = limit
     this.facts = []
     this.sockets = new Map()
@@ -3482,7 +3591,7 @@ class ShareFetchTap {
         const frame = outstanding.get(incoming.readInt32BE(4))
         if (frame) {
           frame.responseBytes = incoming.subarray(0, end).toString('base64')
-          frame.answeredAt = performance.now()
+          frame.answeredAt = this.clock.now()
           outstanding.delete(frame.correlationId)
         }
         incoming = incoming.subarray(end)
@@ -3491,7 +3600,7 @@ class ShareFetchTap {
     socket.on?.('data', receive)
     socket.once?.('close', () => {
       socket.off('data', receive)
-      for (const frame of outstanding.values()) frame.lostAt = performance.now()
+      for (const frame of outstanding.values()) frame.lostAt = this.clock.now()
       outstanding.clear()
     })
     const write = socket.write.bind(socket)
@@ -3539,7 +3648,7 @@ class ShareFetchTap {
         socket,
         endpoint,
         ...header,
-        at: performance.now(),
+        at: this.clock.now(),
         bytes: frame.toString('base64'),
         request: wire.readRequest(frame.subarray(header.byteLength)),
       }
@@ -3551,7 +3660,7 @@ class ShareFetchTap {
       const { readRequest } = require('../../testHelpers/wire/shareFetchV2')
       epoch = readRequest(frame.subarray(header.byteLength)).shareSessionEpoch
     } catch {}
-    this.facts.push({ sequence: ++this.sequence, socket, endpoint, epoch, at: performance.now() })
+    this.facts.push({ sequence: ++this.sequence, socket, endpoint, epoch, at: this.clock.now() })
     if (this.facts.length > this.limit) this.facts.shift()
     return written
   }
@@ -3746,6 +3855,8 @@ class ShareCycleJournal {
         for (const result of results) {
           this.outcomes.push({
             ...result,
+            topic: this.byCohort.get(row)?.topic,
+            partition: this.byCohort.get(row)?.partition,
             acquisition: this.label(row),
             error: result.error ? { name: result.error.name, message: result.error.message } : null,
           })
@@ -4085,6 +4196,7 @@ class ShareSoakDriver {
       reset: null,
       held: [],
       positions: [],
+      timing: { cycle: plan.cycle, kind: 'cycle', startedAt: clock.now(), due },
     }
     const members = []
     stack.add('finalize workload journals', () => {
@@ -4133,6 +4245,7 @@ class ShareSoakDriver {
         await b.stop()
         await this.awaitMembers(scope, [a])
         observation.members.bRemoved = b.entries.length === 0
+        observation.members.bRemovedAt = clock.now()
 
         const mark = this.tap.mark()
         if (plan.reset) await this.awaitEstablished(scope, mark)
@@ -4161,18 +4274,27 @@ class ShareSoakDriver {
         observation.handler = [...a.finalize(), ...b.finalize()]
         observation.accepted = a.accepted()
         observation.provenance = journal.snapshot()
-        observation.positions.push(await this.position(plan, scope))
+        observation.members.aLeftAt = clock.now()
+        observation.positions.push(await this.position(plan, scope, { clock }))
         observation.members.aLeft = a.crashes.length === 0
         await bounded(scope, Infinity, () =>
           fixtures.waitForShareGroupsEmpty(this.admin, [this.group], { signal: scope })
         )
+        observation.members.emptyAt = clock.now()
         if (due - clock.now() < SHARE_SOAK.quietMs.cycle)
           throw new Error('The cycle cannot contain its complete verifier window')
-        observation.verifier = await this.quiet(scope, SHARE_SOAK.quietMs.cycle, { due, clock })
-        const final = await this.position(plan, scope)
+        observation.verifier = await this.quiet(scope, SHARE_SOAK.quietMs.cycle, {
+          due,
+          clock,
+          journal,
+          cycle: plan.cycle,
+        })
+        const final = await this.position(plan, scope, { clock })
         observation.positions.push(final)
         observation.broker = final.rows
         observation.clientsDisconnected = true
+        observation.timing.completedAt = clock.now()
+        this.departures = { ...observation.members }
         return observation
       },
       { budgetMs: 2000 }
@@ -4339,9 +4461,11 @@ class ShareSoakDriver {
    * Polls the broker's terminal position of every partition against the cycle's cumulative end.
    * @param {ReturnType<typeof ShareCycleOracle.plan>} plan the cycle
    * @param {AbortSignal} scope the cycle scope
+   * @param {object} [timing] Monotonic clock and cycle/final observation kind.
    * @returns {Promise<object>} Both raw listings, ownership, independent ends and normalized rows.
    */
-  async position(plan, scope) {
+  async position(plan, scope, { clock = SHARE_CLOCK, kind = 'cycle' } = {}) {
+    const startedAt = clock.now()
     const target = {
       groupId: this.group,
       topic: this.topic,
@@ -4357,7 +4481,16 @@ class ShareSoakDriver {
       timeoutMs: 3000,
       record: (row) => observations.push(JSON.parse(JSON.stringify(row))),
     })
-    return { target, ...result, ...observations.at(-1)?.last, observations }
+    return {
+      target,
+      ...result,
+      ...observations.at(-1)?.last,
+      observations,
+      cycle: plan.cycle,
+      kind,
+      startedAt,
+      completedAt: clock.now(),
+    }
   }
 
   /**
@@ -4402,7 +4535,7 @@ class ShareSoakDriver {
     let primary
     try {
       result = await this.ports.bounded.bounded(scope, Infinity, () =>
-        readLog({ brokers: this.brokers, topic: this.topic, open })
+        (this.ports.readLog ?? readLog)({ brokers: this.brokers, topic: this.topic, open })
       )
     } catch (error) {
       primary = error
@@ -4450,10 +4583,23 @@ class ShareSoakDriver {
    * that was never assigned or never fetched, so silence from an inactive member never counts.
    * @param {AbortSignal} scope the enclosing scope
    * @param {number} windowMs how long the assigned member fetches
-   * @param {{due?: number, clock?: {now: Function}}} [timing] Original slot admission bound.
+   * @param {object} [timing] Original slot, member journal and monotonic clock.
    * @returns {Promise<object>} Joined verifier identity, assignments, fetch chronology and deliveries.
    */
-  async quiet(scope, windowMs, { due = Infinity, clock = SHARE_CLOCK } = {}) {
+  async quiet(
+    scope,
+    windowMs,
+    {
+      due = Infinity,
+      clock = SHARE_CLOCK,
+      journal,
+      cycle = SHARE_SOAK.cycles - 1,
+      kind = 'cycle',
+    } = {}
+  ) {
+    const ownJournal = !journal
+    journal ??= new ShareCycleJournal(this.group, this.tap)
+    if (ownJournal) journal.install()
     const events = []
     let client
     let originalAssignment
@@ -4498,6 +4644,9 @@ class ShareSoakDriver {
       })
       return {
         active: true,
+        cycle,
+        kind,
+        provenance: journal.snapshot(),
         groupId: this.group,
         topic: this.topic,
         topicId: this.topicId,
@@ -4509,6 +4658,7 @@ class ShareSoakDriver {
         delivered: delivered.map(({ identity }) => identity),
       }
     } finally {
+      if (ownJournal) journal.restore()
       removers.forEach((remove) => remove())
       if (client && originalAssignment) client.assignment = originalAssignment
     }
@@ -4518,17 +4668,29 @@ class ShareSoakDriver {
    * The final proof after the last cycle, before any cleanup: the active same-group check for the
    * final window, then the terminal position at the last cumulative end.
    * @param {AbortSignal} scope the scenario scope
+   * @param {object} [timing] Original cleanup cutoff and monotonic clock.
    * @returns {Promise<{ broker: object[], verifier: object }>}
    */
-  async final(scope) {
+  async final(scope, { clock = SHARE_CLOCK, due = Infinity } = {}) {
+    const startedAt = clock.now()
     const plan = ShareCycleOracle.plan(SHARE_SOAK.cycles - 1)
     await this.cleanupAdmin(scope)
-    const before = await this.position(plan, scope)
-    const verifier = await this.quiet(scope, SHARE_SOAK.quietMs.final)
-    const position = await this.position(plan, scope)
+    const members = { ...this.departures }
+    const before = await this.position(plan, scope, { clock, kind: 'final' })
+    await this.ports.fixtures.waitForShareGroupsEmpty(this.admin, [this.group], { signal: scope })
+    members.emptyAt = clock.now()
+    const verifier = await this.quiet(scope, SHARE_SOAK.quietMs.final, {
+      clock,
+      due,
+      cycle: plan.cycle,
+      kind: 'final',
+    })
+    const position = await this.position(plan, scope, { clock, kind: 'final' })
     const raw = this.readLogs(plan, await this.rawLog(scope))
     return {
       verifier,
+      members,
+      timing: { cycle: plan.cycle, kind: 'final', startedAt, completedAt: clock.now(), due },
       broker: position.rows,
       positions: [before, position],
       ...raw,
@@ -4884,7 +5046,15 @@ class ShareSoak {
         remaining + 1,
         async (scope) => {
           const observation = await this.driver.cycle(plan, scope, { due, clock: this.clock })
+          if (this.clock.now() > due)
+            throw new Error(`Cycle ${cycle} completed after its absolute cutoff`)
           const violations = this.verifyCycle(plan, observation)
+          if (
+            observation.timing?.due !== due ||
+            observation.timing?.startedAt < startedAt ||
+            observation.timing?.completedAt > this.clock.now()
+          )
+            violations.push(`cycle ${cycle}: the proof is outside its original slot`)
           this.recordCycle(plan, observation, violations)
           this.driver.lastCycle = null
           if (violations.length > 0) throw new Error(violations.join('; '))
@@ -4955,6 +5125,8 @@ class ShareSoak {
         accepted: observation.accepted ?? [],
       },
       positions: observation.positions ?? [],
+      timing: observation.timing,
+      members,
       provenance: observation.provenance,
       verifier,
       handler,
@@ -4988,7 +5160,7 @@ class ShareSoak {
    */
   async finish() {
     await this.stage('cleanup', async (scope) => {
-      this.final = await this.driver.final(scope)
+      this.final = await this.driver.final(scope, { clock: this.clock, due: this.cleanupDue })
       await this.cleanupStack()
     })
   }
@@ -5105,6 +5277,7 @@ class ShareSoak {
         accepted: row.oracles.accepted,
         broker: row.oracles.broker,
         positions: row.positions,
+        timing: row.timing,
         held: row.held,
         reset: row.reset,
         verifier: row.verifier,
@@ -5112,6 +5285,7 @@ class ShareSoak {
         prefix: row.prefix,
         acknowledgedPrefix: row.acknowledgedPrefix,
         members: {
+          ...row.members,
           aJoined: row.joined,
           aLeft: row.left,
           bAdded: row.memberAdded,
@@ -5119,12 +5293,25 @@ class ShareSoak {
         },
         clientsDisconnected: row.cleanup.clientsDisconnected,
       }
+      const slot = slots.find(({ cycle }) => cycle === row.cycle)
+      if (
+        !slot ||
+        row.timing?.cycle !== row.cycle ||
+        row.timing?.kind !== 'cycle' ||
+        row.timing.startedAt < slot.startedAt ||
+        row.timing.due !== slot.due ||
+        row.timing.completedAt > slot.completedAt
+      )
+        violations.push(`cycle ${row.cycle}: the proof is outside its original slot`)
       violations.push(...ShareCycleOracle.judge(ShareCycleOracle.plan(row.cycle), observation))
       if (JSON.stringify([...prefix].sort()) !== JSON.stringify([...(row.prefix ?? [])].sort()))
         violations.push(
           `cycle ${row.cycle}: archived cumulative prefix differs from original producer receipts`
         )
     }
+    const verifiers = [...rows.map(({ verifier }) => verifier), this.final?.verifier]
+    if (new Set(verifiers.map((verifier) => verifier?.memberId)).size !== expected + 1)
+      violations.push('every cycle and final verifier must be a distinct original member')
     const { cycles, resets, memberAdds, memberRemoves } = this.counts
     if (
       cycles !== expected ||
@@ -5147,6 +5334,15 @@ class ShareSoak {
     }
     const { final = {} } = this
     const last = ShareCycleOracle.plan(expected - 1)
+    ShareCycleOracle.sequence(final, (message) => violations.push(`final: ${message}`))
+    if (
+      final.timing?.kind !== 'final' ||
+      final.timing?.cycle !== last.cycle ||
+      final.timing?.startedAt < phases.at(-1)?.completedAt ||
+      final.timing?.due !== this.cleanupDue ||
+      final.timing?.completedAt > this.clock.now()
+    )
+      violations.push('final: a distinct post-profile observation inside cleanup is required')
     ShareCycleOracle.broker(last, final.broker ?? [], (message) =>
       violations.push(`final: ${message}`)
     )
