@@ -176,6 +176,9 @@ const parseDisconnectOptions = (options) => {
 /**
  * @param {Object} params
  * @param {import("../../types").Cluster} params.cluster
+ * @param {import('../telemetry/factory').TelemetryFactory|null} [params.telemetry=null] private
+ *   telemetry binding: its three public methods are added to the consumer, it resumes once a
+ *   connect or run is usable, is suspended by crash cleanup only and joins the one close
  * @param {String} [params.groupId] required to subscribe and for every group offset API; a
  *                                consumer that only assigns partitions may omit it, and then keeps
  *                                its offsets private, never contacts a coordinator and defaults
@@ -244,6 +247,7 @@ module.exports = (params) => {
 
   const {
     cluster,
+    telemetry = null,
     groupId,
     ownsCluster = true,
     retry,
@@ -630,6 +634,7 @@ module.exports = (params) => {
     registerDiscoveryScope()
     await cluster.connect({ fence: owned.fence })
     owned.fence.check()
+    telemetry?.resume()
     instrumentationEmitter.emit(CONNECT)
   }
 
@@ -648,6 +653,7 @@ module.exports = (params) => {
     { keepResets = false, preserveSetupState = false } = {},
     operation
   ) => {
+    if (keepResets) telemetry?.suspend()
     noteStop()
     const owned = life
 
@@ -742,12 +748,22 @@ module.exports = (params) => {
     const operation = new ConsumerOperation({
       deadlineAt: timeout === undefined ? Infinity : performance.now() + timeout,
     })
+    // Runs concurrently with the core close and never shortens or extends its budget.
+    const finalTelemetry =
+      telemetry?.close({
+        deadline: operation.deadlineAt,
+        remaining: () => operation.remaining(),
+        zero: timeout === 0,
+      }) ?? null
     const record = { operation, promise: null, joins: 0 }
     life.ending = true
-    record.promise = shutDown(options, {}, operation).finally(() => {
-      if (closing === record) closing = null
-      operation.finish()
-    })
+    const cleanup = shutDown(options, {}, operation)
+    record.promise = (finalTelemetry ? cleanup.finally(() => finalTelemetry) : cleanup).finally(
+      () => {
+        if (closing === record) closing = null
+        operation.finish()
+      }
+    )
     closing = record
     return record.promise
   }
@@ -1160,6 +1176,7 @@ module.exports = (params) => {
       const started = runner.start()
       pendingStart = started.catch(() => {})
       await started
+      if (!owned.fence.closed && closing === null) telemetry?.resume()
     }
 
     /**
@@ -1861,7 +1878,35 @@ module.exports = (params) => {
    */
   const getLogger = () => logger
 
+  /**
+   * Gives telemetry the current member values of the active run and the authority they were read
+   * under. A manual run has no group, so every group field is blanked. Equal member strings after a
+   * new membership still invalidate an older snapshot, through the run's membership identity.
+   * @returns {{values: object, isCurrent: () => boolean}|null} null while no run exists
+   */
+  const readTelemetryResources = () => {
+    const group = consumerGroup
+    if (!group) return null
+    if (group.kind === 'manual') {
+      return {
+        values: { group_id: '', group_instance_id: '', group_member_id: '' },
+        isCurrent: () => consumerGroup === group,
+      }
+    }
+    const { memberId } = group
+    const token = group.ownership?.token()
+    return {
+      values: { group_member_id: memberId },
+      isCurrent: () =>
+        consumerGroup === group &&
+        group.memberId === memberId &&
+        group.ownership?.token() === token,
+    }
+  }
+  telemetry?.setResourceReader(readTelemetryResources)
+
   const consumer = {
+    ...telemetry?.methods(),
     connect,
     disconnect,
     subscribe,

@@ -11,6 +11,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - Implement the two flexible telemetry protocol codecs with capability-qualified compatibility output.
 - Add bounded numeric Gauge and monotonic BigInt Sum collection and snapshot registration internally.
+- Expose client telemetry options, stable instance IDs and numeric metric snapshots on all client kinds.
 
 #### Tooling
 
@@ -21,11 +22,15 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Behavior changes
 
-- Telemetry codecs, numeric collection and snapshot registration are internal at this stage. Existing client configuration and foreground operations are unchanged, and returned-client registration methods are not attached yet.
-- The internal telemetry transport uses one dedicated authenticated socket, requires both negotiated telemetry APIs and a successful runtime Get, and leaves unsupported foreground operations usable.
+- Broker client metrics (KIP-714) are available with `enableMetricsPush: true`; the default remains false. Kafka-wide defaults can be overridden on producer, consumer, admin and share consumer.
+- Enabling broker telemetry can open one additional broker connection per client and send GetTelemetrySubscriptions/PushTelemetry traffic. Unsupported brokers quietly leave foreground operations usable.
+- Telemetry includes only applicable rack/group/static-member/current-member/transaction identity attributes, library scope/version and per-node metric labels.
+- Each client exposes an asynchronous stable `clientInstanceId({ timeout })`; disabled/unsupported/closed/unavailable calls reject with `KafkaJSTelemetryError`.
+- Applications may register/unregister finite numeric Gauge and monotonic BigInt Sum snapshots for broker subscriptions.
+- Disconnect sends a best-effort terminating telemetry push on an active connected subscription, for at most 1000 ms within the existing close budget; timeout0 sends no final.
 - Preserve shared foreground SASL renewal when an individual caller expires; contain private telemetry commit and logging failures, retry transient socket failures, and retire expired telemetry work.
 - Positive telemetry push intervals below 100 ms are clamped to 100 ms locally; nonpositive intervals use 300000 ms.
-- Bound raw and transmitted telemetry bodies, omit whole metric groups under small limits, and advance only written included baselines; a rejected written sample can be lost from later deltas.
+- Telemetry buffers, metric identities, labels and timers have fixed bounds; `telemetryMaxBytes` may lower the 1 MiB default. Small limits may omit metrics or send an empty blob. Only written included baselines advance; a rejected written sample can be lost from later deltas.
 - Telemetry payloads over1000 bytes use mutually supported built-in ZSTD/GZIP in broker order; NONE is always available. Producer codec registrations are unchanged.
 
 ### Phase 9E — Share groups

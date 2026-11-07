@@ -90,6 +90,8 @@ module.exports = class BrokerPool {
   /**
    * Owns broker readiness and retained routing responses; optional producer captures fence topic merges.
    * @param {object} options
+   * @param {object|null} [options.telemetryMetrics=null] private numeric observer of this client,
+   *   never shared with the dedicated telemetry transport
    * @param {import("./connectionPoolBuilder").ConnectionPoolBuilder} options.connectionPoolBuilder
    * @param {import("../../types").Logger} options.logger
    * @param {import("./metadataCache")} [options.metadataCache] optional: a `BrokerPool` owns its
@@ -112,6 +114,7 @@ module.exports = class BrokerPool {
    *   fail *continuously* (trigger (a)) before a rebootstrap fires.
    */
   constructor({
+    telemetryMetrics = null,
     connectionPoolBuilder,
     logger,
     metadataCache,
@@ -126,6 +129,8 @@ module.exports = class BrokerPool {
     drainTimeout,
   }) {
     this.captureTopics = captureTopics
+    this.telemetryMetrics = telemetryMetrics
+    this.telemetryNodeRevision = 0n
     this.drainTimeout = drainTimeout
     this.retiredBrokers = new WeakSet()
     this.rootLogger = logger
@@ -155,7 +160,10 @@ module.exports = class BrokerPool {
      */
     this.createBroker = (options) => {
       const broker = new Broker({
-        onReady: () => this.telemetryAdvertisementListener?.(),
+        onReady: () => {
+          this.bindTelemetryNode(broker)
+          this.telemetryAdvertisementListener?.()
+        },
         allowAutoTopicCreation,
         authenticationTimeout,
         metadataRecoveryStrategy: this.metadataRecoveryStrategy,
@@ -166,6 +174,7 @@ module.exports = class BrokerPool {
         onApiVersionsFailure: (error, source) => this.onApiVersionsFailure(error, source),
         ...options,
       })
+      this.bindTelemetryNode(broker)
       return broker
     }
 
@@ -296,6 +305,45 @@ module.exports = class BrokerPool {
   }
 
   /**
+   * Binds a current known node outside response completion; a bootstrap endpoint without a node id
+   * gets a null slot, so successful connects count but no node gauge appears. Each concrete pool
+   * receives one non-reused local endpoint revision.
+   * @param {import('../broker')} broker current broker and its concrete pool
+   * @returns {void} observer failures cannot change metadata publication or core outcomes
+   */
+  bindTelemetryNode(broker) {
+    if (!this.telemetryMetrics) return
+    try {
+      const pool = broker.connectionPool
+      if (pool.telemetryNodeRevision === undefined) {
+        pool.telemetryNodeRevision = ++this.telemetryNodeRevision
+      }
+      const slot = this.telemetryMetrics.bindNode({
+        nodeId: broker.nodeId,
+        endpoint: `${pool.host}:${pool.port}`,
+        endpointRevision: pool.telemetryNodeRevision,
+      })
+      pool.telemetrySlot = slot
+      for (const connection of pool.pool) {
+        connection.setTelemetryObserver(this.telemetryMetrics, slot, pool)
+      }
+    } catch {}
+  }
+
+  /**
+   * Retires a pool's node identity so late responses of its sockets cannot relabel a replacement.
+   * @private
+   * @param {import('../network/connectionPool')} pool pool leaving service
+   * @returns {void} contained; never changes the caller's outcome
+   */
+  retireTelemetryNode(pool) {
+    if (!this.telemetryMetrics || !pool.telemetrySlot) return
+    try {
+      this.telemetryMetrics.retireNode(pool.telemetrySlot)
+    } catch {}
+  }
+
+  /**
    * Builds a connection pool via the injected builder and stamps it with this client's
    * authenticationTimeout and this BrokerPool's shared authenticationBlackout map. Every pool
    * this BrokerPool creates goes through here so a pool rebuilt after a connection error keeps
@@ -413,6 +461,7 @@ module.exports = class BrokerPool {
         !hasBrokerMoved(this.seedBroker, { host, port })
       ) {
         this.seedBroker.nodeId = nodeId
+        this.bindTelemetryNode(this.seedBroker)
         this.seedBroker.connectionPool.rack = rack
         this.brokers[nodeId] = this.seedBroker
         continue
@@ -470,6 +519,7 @@ module.exports = class BrokerPool {
     }
     if (this.retiredBrokers.has(broker)) return
     this.retiredBrokers.add(broker)
+    this.retireTelemetryNode(broker.connectionPool)
     this.closeInBackground(broker.retire({ drainTimeout: this.drainTimeout }))
   }
 
@@ -484,7 +534,10 @@ module.exports = class BrokerPool {
    */
   replacePool(broker, pool) {
     const previous = broker.connectionPool
-    if (broker.replaceConnectionPool(pool)) this.closePool(previous)
+    if (broker.replaceConnectionPool(pool)) {
+      this.closePool(previous)
+      this.bindTelemetryNode(broker)
+    }
   }
 
   /**
@@ -494,6 +547,7 @@ module.exports = class BrokerPool {
    * @returns {void}
    */
   closePool(pool) {
+    this.retireTelemetryNode(pool)
     pool.retire()
     this.closeInBackground(pool.destroy({ drainTimeout: this.drainTimeout }))
   }
@@ -963,6 +1017,7 @@ module.exports = class BrokerPool {
             }
             if (seedBroker && host === seedHost && port === seedPort) {
               seedBroker.nodeId = nodeId
+              this.bindTelemetryNode(seedBroker)
               seedBroker.connectionPool.rack = rack
               this.brokers[nodeId] = seedBroker
               this.closeObsolete(previous)

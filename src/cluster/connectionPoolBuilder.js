@@ -34,6 +34,8 @@ const parseBroker = (text) => {
 
 /**
  * @param {Object} options
+ * @param {object|null} [options.telemetryMetrics=null] private numeric collector of this client,
+ *   installed on the normal sockets before their first dial; never on a dedicated telemetry socket
  * @param {import("../../types").ISocketFactory} [options.socketFactory]
  * @param {string[]|(() => string[])} options.brokers
  * @param {Object} [options.ssl]
@@ -53,6 +55,7 @@ const parseBroker = (text) => {
  * @returns {ConnectionPoolBuilder}
  */
 module.exports = ({
+  telemetryMetrics = null,
   socketFactory,
   brokers,
   ssl,
@@ -200,7 +203,7 @@ module.exports = ({
         port = seed.port
       }
 
-      return new ConnectionPool({
+      const pool = new ConnectionPool({
         host,
         port,
         rack,
@@ -224,6 +227,12 @@ module.exports = ({
         logger,
         reauthenticationThreshold,
       })
+      if (telemetryMetrics) {
+        for (const connection of pool.pool) {
+          connection.setTelemetryObserver(telemetryMetrics, null, pool)
+        }
+      }
+      return pool
     },
   }
 }

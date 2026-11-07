@@ -1444,6 +1444,7 @@ class ShareRun {
   async crash(error) {
     if (this.crashed) return
     this.crashed = true
+    this.options.telemetry?.suspend()
     this.firstJoin.settled || this.firstJoin.reject(error)
     const episode = this.beginClose('crash')
     await episode.done.catch(() => {})
