@@ -10,7 +10,7 @@ const acknowledge = require('../../../testHelpers/wire/shareAcknowledgeV2')
  * Records are skipped as opaque bytes; this oracle never uses the candidate acknowledgement codec.
  * @param {number} apiKey 78 or 79
  * @param {Buffer} bytes complete broker response including size/correlation/header tags
- * @returns {object} group and partition acknowledgement codes
+ * @returns {object} group status, fetch partition status and acknowledgement status
  * @throws {Error} for malformed fields or trailing bytes
  */
 const acknowledgementResponse = (apiKey, bytes) => {
@@ -24,9 +24,9 @@ const acknowledgementResponse = (apiKey, bytes) => {
     const topicId = d.readUuid()
     const partitions = d.readUVarIntArray((d) => {
       const partitionIndex = d.readInt32()
-      const partitionError = d.readInt16()
+      const partitionErrorCode = d.readInt16()
       d.readUVarIntString()
-      const code = apiKey === 78 ? d.readInt16() : partitionError
+      const acknowledgeErrorCode = apiKey === 78 ? d.readInt16() : partitionErrorCode
       if (apiKey === 78) d.readUVarIntString()
       d.readInt32()
       d.readInt32()
@@ -45,7 +45,12 @@ const acknowledgementResponse = (apiKey, bytes) => {
         })
       }
       d.readTaggedFields()
-      return { partitionIndex, errorCode: code, acquired }
+      return {
+        partitionIndex,
+        fetchErrorCode: apiKey === 78 ? partitionErrorCode : null,
+        acknowledgeErrorCode,
+        acquired,
+      }
     })
     d.readTaggedFields()
     return { topicId, partitions }
@@ -90,7 +95,7 @@ const confirmedDecisions = (frames, group) =>
           .filter((t) => t.topicId === topic.topicId)
           .flatMap((t) => t.partitions)
           .filter((p) => p.partitionIndex === partition.partitionIndex)
-        if (replies.length !== 1 || replies[0].errorCode !== 0) return []
+        if (replies.length !== 1 || replies[0].acknowledgeErrorCode !== 0) return []
         return partition.acknowledgementBatches.flatMap((batch) => {
           const facts = []
           for (
@@ -138,7 +143,7 @@ const heldAcquisitions = (frames, group) =>
     if (response.errorCode !== 0) return []
     return response.topics.flatMap((topic) =>
       topic.partitions.flatMap((partition) => {
-        if (partition.errorCode !== 0) return []
+        if (partition.fetchErrorCode !== 0) return []
         return partition.acquired.map((range) => ({
           ...range,
           topicId: topic.topicId,
@@ -171,7 +176,7 @@ const acquisitionStart = (frames, group) => {
     const acquired =
       response.errorCode === 0 &&
       response.topics.some((t) =>
-        t.partitions.some((p) => p.errorCode === 0 && p.acquired.length > 0)
+        t.partitions.some((p) => p.fetchErrorCode === 0 && p.acquired.length > 0)
       )
     if (acquired)
       assert.equal(response.acquisitionLockTimeoutMs, 15000, 'Unexpected share lock duration')

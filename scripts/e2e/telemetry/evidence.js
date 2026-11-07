@@ -666,7 +666,7 @@ const verifyScenario = (record, directory) => {
                 share.keys.map((key) => ({ key, valueHex: Buffer.from(key).toString('hex') }))
               )
               const confirmed = confirmedDecisions(share.frames, share.group)
-              assert.equal(confirmed.length, 10)
+              assert.equal(confirmed.length, 10, 'Incomplete capable share broker settlement')
               assert.deepEqual(
                 confirmed.map((r) => r.offset).sort(),
                 Array.from({ length: 10 }, (_, i) => String(i))
@@ -674,7 +674,8 @@ const verifyScenario = (record, directory) => {
               assert(
                 confirmed.every(
                   (r) => r.type === 1 && r.partition === 0 && r.topicId === share.topicId
-                )
+                ),
+                'Capable share broker settlement identity differs'
               )
               verifyPublicSettlements(share.settlements, share.topic, () => 'accept')
             }
@@ -1225,10 +1226,16 @@ const verifyLive = (record, directory, manifest, read) => {
       }
     }
     if (record.mode === 'configured')
-      verifyShare(results.share, oracles.share, transcripts, `${record.run.stem}-share-topic`)
+      verifyShare(
+        results.share,
+        oracles.share,
+        transcripts,
+        `${record.run.stem}-share-topic`,
+        samples
+      )
     else ordinaryOwnership(transcripts.share)
     for (const recovery of Object.values(results.faults).flat())
-      verifyRecovery(recovery, transcripts[recovery.owner])
+      verifyRecovery(recovery, transcripts[recovery.owner], samples)
     const [control, ...others] = Object.values(results.arms)
     for (const arm of others) {
       assert.deepEqual(arm.rawCommitted, control.rawCommitted)
@@ -1488,10 +1495,11 @@ const verifyCustom = (results, samples, transcript) => {
  * Checks actual post-injection exchange, transport retirement and same-UUID recovery.
  * @param {object} recovery captured fault and recovery identities
  * @param {object} transcript member wire ledger
+ * @param {object} samples complete verified accepted/decode/sink stream, keyed by owner and request
  * @returns {void}
- * @throws {Error} for an unexercised fault or invented replacement
+ * @throws {Error} for an unexercised fault or replacement without a later joined normal Push
  */
-const verifyRecovery = (recovery, transcript) => {
+const verifyRecovery = (recovery, transcript, samples) => {
   assert(recovery && transcript, 'Missing mandatory recovery')
   assertOwnerUuid(transcript, recovery.uuid)
   const request = (key) => transcript.records.find((r) => r.requestKey === key)
@@ -1511,18 +1519,31 @@ const verifyRecovery = (recovery, transcript) => {
   const get = request(recovery.replacementGet)
   assert(
     get &&
+      get.apiKey === 71 &&
       get.uuid === recovery.uuid &&
       get.socketId !== recovery.faultedSocket &&
-      get.response?.errorCode === 0
+      get.response?.errorCode === 0 &&
+      get.response.uuid === recovery.uuid,
+    'Invalid recovery replacement Get'
   )
   assert(get.writeAt >= socket.closedAt)
   const push = request(recovery.recoveredPush)
   assert(
     push &&
+      push.apiKey === 72 &&
       push.socketId === get.socketId &&
       push.uuid === recovery.uuid &&
       push.response?.errorCode === 0 &&
-      !push.terminating
+      !push.terminating &&
+      push.metricsBytes > 0 &&
+      push.index > get.index &&
+      push.writeAt > get.response.responseAt,
+    'Invalid recovered Push'
+  )
+  assert.equal(
+    samples[`${recovery.owner}:${push.requestKey}`]?.request,
+    push,
+    'Missing joined recovered Push'
   )
 }
 
@@ -1561,7 +1582,7 @@ const verifyShareIdentity = (inputs, topic, expected) => {
   assert.deepEqual(inputs.held, held, 'Contradicted held acquisition ranges')
   const offsets = []
   for (const range of held) {
-    assert.equal(range.topicId, inputs.topicId)
+    assert.equal(range.topicId, inputs.topicId, 'Share acquisition topic differs')
     assert.equal(range.partition, 0)
     const first = BigInt(range.firstOffset)
     const last = BigInt(range.lastOffset)
@@ -1586,11 +1607,14 @@ const verifyShareIdentity = (inputs, topic, expected) => {
 const verifyPublicSettlements = (settlements, topic, type) => {
   const offsets = Array.from({ length: 10 }, () => [])
   for (const event of settlements) {
-    assert.equal(event.topic, topic)
+    assert.equal(event.topic, topic, 'Public share settlement topic differs')
     assert.equal(event.partition, 0)
     const first = BigInt(event.firstOffset)
     const last = BigInt(event.lastOffset)
-    assert(first >= 0n && last < 10n && first <= last)
+    assert(
+      first >= 0n && last < 10n && first <= last,
+      'Public share settlement outside owned offsets'
+    )
     for (let n = first; n <= last; n++) offsets[Number(n)].push(event)
   }
   for (const [index, events] of offsets.entries()) {
@@ -1614,17 +1638,18 @@ const verifyPublicSettlements = (settlements, topic, type) => {
  * @param {object} inputs archived independent ledgers
  * @param {object} transcripts owner transcripts
  * @param {string} topic independently configured created topic name
+ * @param {object} samples complete verified accepted/decode/sink streams
  * @returns {void}
  * @throws {Error} for missing confirmations, duplicates, altered records or late release
  */
-const verifyShare = (result, inputs, transcripts, topic) => {
+const verifyShare = (result, inputs, transcripts, topic, samples) => {
   assert(inputs, 'Missing share oracle')
   assert.equal(result.lockMs, 15000)
   assert.equal(inputs.acquiredAt, acquisitionStart(inputs.frames, inputs.group))
   assert(inputs.handlerAt >= inputs.acquiredAt)
   assert.equal(result.recovery?.owner, 'share', 'Missing configured share recovery')
   assert.equal(result.recovery.mode, 'drop')
-  verifyRecovery(result.recovery, transcripts.share)
+  verifyRecovery(result.recovery, transcripts.share, samples)
   verifyShareIdentity(inputs, topic, inputs.expected)
   assert(inputs.held.every((r) => r.lockMs === result.lockMs))
   assert.deepEqual(
@@ -1637,7 +1662,7 @@ const verifyShare = (result, inputs, transcripts, topic) => {
     const decisions = inputs.confirmed.filter((r) => r.offset === String(index))
     assert.equal(decisions.length, 1, 'Share settlement must occur exactly once')
     const [decision] = decisions
-    assert.equal(decision.topicId, inputs.topicId)
+    assert.equal(decision.topicId, inputs.topicId, 'Broker share settlement topic differs')
     assert.equal(decision.partition, 0)
     assert.equal(decision.type, index < 4 ? 1 : 2)
     assert.equal(decision.errorCode, 0)
