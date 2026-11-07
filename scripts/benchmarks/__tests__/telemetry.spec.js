@@ -5,6 +5,9 @@ const path = require('node:path')
 const zlib = require('node:zlib')
 const {
   digest,
+  decodePoints,
+  decodeMetricsData,
+  liveFixture,
   p99,
   exactSet,
   schedule,
@@ -45,6 +48,7 @@ const {
   publicOptions,
   assertPublicOptions,
   TelemetryPushProbe,
+  ExportArchive,
   telemetryEvidence,
   makeValue,
   valueHash,
@@ -762,7 +766,7 @@ describe('telemetry payload workload', () => {
       config: cfg,
       control,
       evidence,
-      hooks: { memory: memoryHooks(), ...hooks },
+      hooks: { memory: memoryHooks(), resourceUsage: () => ({ maxRSS: 40 }), ...hooks },
     })
     try {
       return { result: await workload.run(), evidence }
@@ -1020,6 +1024,49 @@ describe('telemetry payload workload', () => {
     fixture.metrics.abandon(snapshot)
   })
 
+  test('every payload invocation enforces memory ceilings and its actual RSS baseline', async () => {
+    for (const field of ['heap', 'rss', 'baseline']) {
+      const cfg = config({ points: 1 })
+      const { result, evidence } = await execute({ config: cfg })
+      const decl = declaration({ mode: 'payload', config: cfg, root: ROOT })
+      const env = envelopeOf(result, evidence, decl)
+      const file = path.join(evidence.directory, 'payload-memory.json')
+      const memory = JSON.parse(fs.readFileSync(file, 'utf8'))
+      if (field === 'heap') {
+        memory.after.heapUsed = memory.before.heapUsed + 8388609
+        memory.after.external = memory.before.external
+        memory.signed = signedDelta(memory.before, memory.after)
+        env.heapExternalDeltaBytes = 8388609
+      } else {
+        if (field === 'baseline') memory.rssBaselineBytes += 1024
+        else memory.maxRssKiB = Math.ceil(memory.before.rss / 1024) + 65537
+        memory.maxRssBytes = memory.maxRssKiB * 1024
+        memory.rssDeltaBytes = rssDelta(memory.maxRssKiB, memory.rssBaselineBytes)
+        env.rssDeltaBytes = memory.rssDeltaBytes
+      }
+      const bytes = Buffer.from(JSON.stringify(memory))
+      fs.writeFileSync(file, bytes)
+      Object.assign(
+        env.artifacts.find((a) => a.name === 'payload-memory.json'),
+        {
+          bytes: bytes.length,
+          sha256: require('node:crypto').createHash('sha256').update(bytes).digest('hex'),
+        }
+      )
+      expect(() => verifyWorker(env, decl, evidence.directory)).toThrow()
+    }
+    for (const label of ['normal', 'slow', 'normal~AA']) {
+      const { declared, rows } = syntheticRows('payload', ({ label }) =>
+        METRICS.payload(label === 'slow')
+      )
+      rows.find((r) => !r.warmup && r.label === label).result.rssDeltaBytes = 67108865
+      const verdict = evaluate('payload', declared, rows)
+      expect(verdict.failures).toContainEqual(
+        expect.objectContaining({ arm: label, fields: ['rssDeltaBytes'], expected: false })
+      )
+    }
+  })
+
   test('codec availability and resource high water cannot silently become passing zeroes', async () => {
     await expect(
       execute({ config: config({ codec: 'zstd' }), hooks: { zstdSupported: false } })
@@ -1252,6 +1299,12 @@ const literalDelivery = () => {
   const meta = {
     baseOf: { 0: 0, 1: 0 },
     warmup: 2,
+    partitions: 2,
+    handler: 'eachBatch',
+    ends: [
+      { partition: 0, offset: '3' },
+      { partition: 1, offset: '3' },
+    ],
     elapsedNs: 1e6,
     expectedCommits: { p0: '3', p1: '3' },
     finalCommits: { p0: '3', p1: '3' },
@@ -1395,6 +1448,7 @@ describe('telemetry delivery workload', () => {
       const body = Buffer.concat(parts)
       return Buffer.concat([int32(body.length), body])
     }
+    const raw = Buffer.from('0a14121212100a01612a0b0a09310100000000000000', 'hex')
     const uuid = (n) => Buffer.alloc(16, n)
     const header = (apiKey, correlation) =>
       Buffer.concat([
@@ -1431,7 +1485,7 @@ describe('telemetry delivery workload', () => {
           uuid(id),
           int32(7),
           Buffer.from([0, 0]),
-          Buffer.from([4, 1, 2, 3, 0])
+          Buffer.concat([Buffer.from([raw.length + 1]), raw, Buffer.from([0])])
         )
       )
       return frame(int32(correlation), Buffer.from([0]), int32(0), int16(error), Buffer.from([0]))
@@ -1441,8 +1495,8 @@ describe('telemetry delivery workload', () => {
     }
     const dir = tmp()
     const evidence = new EvidenceWriter(dir, { identity: IDENTITY })
-    const probe = new TelemetryPushProbe({ evidence })
-    const tap = probe.open()
+    const probe = new TelemetryPushProbe({ evidence, now: () => 1000 })
+    const tap = probe.open('1')
     for (const id of [1, 2]) {
       feed(tap, subscribe(tap, id * 10, id))
       feed(tap, push(tap, id * 10 + 1, id))
@@ -1458,27 +1512,107 @@ describe('telemetry delivery workload', () => {
       'push:02',
     ])
     expect(records[0]).toMatchObject({ errorCode: 0, subscriptionId: 7, pushIntervalMs: 1000 })
-    expect(records[1]).toMatchObject({ errorCode: 0, metricsBytes: 3, subscriptionId: 7 })
+    expect(records[1]).toMatchObject({ errorCode: 0, metricsBytes: raw.length, subscriptionId: 7 })
     const chunks = readChunks(dir, evidence.artifacts(), 'delivery-telemetry')
     expect(chunks.map((chunk) => chunk.toString().split('\n').filter(Boolean).length)).toEqual([4])
     const exports = records
-      .filter(({ kind }) => kind === 'subscription')
-      .map(({ uuid: id }) => ({ clientInstanceId: id, pushIntervalMs: 1000 }))
-    expect(telemetryEvidence(records, { active: true, intervalMs: 1000, exports })).toEqual({
-      clients: 2,
-      pushes: 2,
-    })
-    expect(() => telemetryEvidence([], { active: true, intervalMs: 1000, exports })).toThrow()
+      .filter(({ kind }) => kind === 'push')
+      .map(({ uuid: id }, i) => ({
+        clientInstanceId: id,
+        pushIntervalMs: 1000,
+        node: '1',
+        seq: i + 1,
+        dataBytes: raw.length,
+        dataSha256: hashBytes(raw),
+        terminating: false,
+        parse: 'ok',
+        v: 1,
+      }))
+    const window = { startMs: 999, endMs: 1001 }
+    for (const change of [
+      (r) => ({ ...r, rawSha256: '0'.repeat(64) }),
+      (r) => ({ ...r, terminating: true }),
+      (r) => ({ ...r, observedMs: 998 }),
+      (r) => ({ ...r, errorCode: 1 }),
+      (r) => ({ ...r, node: '2' }),
+      (r) => ({ ...r, decoded: { points: [] } }),
+    ]) {
+      const changed = records.map((r) => (r.kind === 'push' ? change(r) : r))
+      expect(() =>
+        telemetryEvidence(changed, { active: true, intervalMs: 1000, exports, window })
+      ).toThrow()
+    }
+    const warmSuccess = records
+    const laterWindow = { startMs: 1001, endMs: 1003 }
+    const failedWindow = records
+      .filter((r) => r.kind === 'push')
+      .map((r) => ({ ...r, observedMs: 1002, errorCode: 1 }))
     expect(() =>
-      telemetryEvidence(records, { active: true, intervalMs: 1000, exports: [] })
+      telemetryEvidence([...warmSuccess, ...failedWindow], {
+        active: true,
+        intervalMs: 1000,
+        exports,
+        window: laterWindow,
+      })
+    ).toThrow()
+    const finalOnly = records.map((record) => {
+      if (record.kind !== 'push') return record
+      const body = Buffer.from(record.bodyHex, 'hex')
+      body[20] = 1
+      return {
+        ...record,
+        terminating: true,
+        bodyHex: body.toString('hex'),
+        bodySha256: hashBytes(body),
+      }
+    })
+    expect(() =>
+      telemetryEvidence(finalOnly, {
+        active: true,
+        intervalMs: 1000,
+        exports: exports.map((e) => ({ ...e, terminating: true })),
+        window,
+      })
+    ).toThrow()
+    for (const field of ['node', 'dataSha256']) {
+      const changed = exports.map((e) => ({
+        ...e,
+        [field]: field === 'node' ? '2' : '0'.repeat(64),
+      }))
+      expect(() =>
+        telemetryEvidence(records, { active: true, intervalMs: 1000, exports: changed, window })
+      ).toThrow()
+    }
+    expect(telemetryEvidence(records, { active: true, intervalMs: 1000, exports, window })).toEqual(
+      {
+        clients: 2,
+        pushes: 2,
+      }
+    )
+    expect(() =>
+      telemetryEvidence([], { active: true, intervalMs: 1000, exports, window })
+    ).toThrow()
+    expect(() =>
+      telemetryEvidence(records, { active: true, intervalMs: 1000, exports: [], window })
     ).toThrow()
     const failed = records.map((r) => (r.kind === 'push' ? { ...r, errorCode: 1 } : r))
-    expect(() => telemetryEvidence(failed, { active: true, intervalMs: 1000, exports })).toThrow()
+    expect(() =>
+      telemetryEvidence(failed, { active: true, intervalMs: 1000, exports, window })
+    ).toThrow()
     expect(telemetryEvidence([], { active: false, intervalMs: 1000, exports: [] })).toEqual({
       clients: 0,
       pushes: 0,
     })
     expect(() => telemetryEvidence(records, { active: false, intervalMs: 1000, exports })).toThrow()
+    const bounded = new TelemetryPushProbe({
+      evidence: new EvidenceWriter(tmp()),
+      maxRecords: 8,
+      now: () => 1000,
+    })
+    const boundedTap = bounded.open('1')
+    for (let i = 0; i < 20; i += 1) feed(boundedTap, subscribe(boundedTap, i, 1))
+    expect(bounded.records.length).toBeLessThanOrEqual(8)
+    bounded.finish()
     const overflow = new TelemetryPushProbe({ evidence: new EvidenceWriter(tmp()), maxPending: 1 })
     const other = overflow.open()
     other.outbound(frame(header(71, 1), uuid(1), Buffer.from([0])))
@@ -1525,7 +1659,30 @@ describe('telemetry delivery workload', () => {
   })
 })
 
-const FROZEN = { path: '/frozen/telemetry.js', sha256: 'a'.repeat(64) }
+const hashBytes = (bytes) => require('node:crypto').createHash('sha256').update(bytes).digest('hex')
+const asset = (file) => ({ path: file, sha256: hashBytes(fs.readFileSync(file)) })
+const FROZEN = { path: path.join(ROOT, 'scripts/benchmarks/telemetry.js') }
+
+/** @param {string} label source identity @returns {object} actual frozen source and receipt files */
+const frozenSource = (label) => {
+  const directory = tmp()
+  const root = path.join(directory, 'source')
+  fs.mkdirSync(root)
+  fs.writeFileSync(path.join(root, 'index.js'), label)
+  const consume = 'scripts/benchmarks/consumeThroughput.js'
+  fs.mkdirSync(path.join(root, 'scripts/benchmarks'), { recursive: true })
+  fs.copyFileSync(path.join(ROOT, consume), path.join(root, consume))
+  const files = [
+    { path: 'index.js', sha256: hashBytes(label) },
+    { path: consume, sha256: asset(path.join(root, consume)).sha256 },
+  ]
+  const tree = digest(files)
+  const tarball = path.join(directory, 'source.tgz')
+  fs.writeFileSync(tarball, label)
+  const source = path.join(directory, 'source.json')
+  fs.writeFileSync(source, JSON.stringify({ tree, files, tarballSha256: asset(tarball).sha256 }))
+  return { root, tree, source: asset(source), tarball: asset(tarball) }
+}
 
 /** @param {object} job declared job @param {string} label arm label @returns {string[]} valid worker argv */
 const argvFor = (job, label) => {
@@ -1551,21 +1708,43 @@ const argvFor = (job, label) => {
 /** @param {string} jobName declared job @param {object} [extra] manifest overrides @returns {object} valid manifest */
 const makeManifest = (jobName, extra = {}) => {
   const job = JOBS[jobName]
+  const candidate = frozenSource('candidate')
+  const previous = frozenSource('previous')
+  const proof = path.join(tmp(), 'accepted.json')
+  fs.writeFileSync(
+    proof,
+    JSON.stringify({
+      milestone: '9E',
+      status: 'accepted',
+      tree: previous.tree,
+      sourceSha256: previous.source.sha256,
+      tarballSha256: previous.tarball.sha256,
+    })
+  )
   return {
     schemaVersion: 1,
     job: jobName,
     runId: 'sess',
     directory: '/unused',
-    driver: FROZEN,
-    session: { path: '/frozen/session.js', sha256: 'b'.repeat(64) },
-    consume: { path: '/frozen/consumeThroughput.js', sha256: 'c'.repeat(64) },
-    node: { binary: process.execPath },
+    driver: asset(FROZEN.path),
+    session: asset(path.join(ROOT, 'scripts/benchmarks/session.js')),
+    consume: asset(path.join(ROOT, 'scripts/benchmarks/consumeThroughput.js')),
+    node: {
+      binary: process.execPath,
+      sha256: asset(process.execPath).sha256,
+      version: process.version,
+      platform: process.platform,
+      arch: process.arch,
+    },
+    codecs: { none: true, gzip: true, zstd: false },
+    acceptedBaseline: asset(proof),
     arms: job.roles.map((label) => {
       const argv = argvFor(job, label)
+      if (extra.optionalCodec === 'zstd' && job.mode === 'payload')
+        argv[argv.indexOf('--codec') + 1] = 'zstd'
       return {
         label,
-        root: `/frozen/${label}`,
-        tree: `tree-${label}`,
+        ...(label === 'previous' ? previous : candidate),
         argv,
         configSha256: digest({ mode: job.mode, argv }),
       }
@@ -2054,8 +2233,9 @@ describe('telemetry benchmark session', () => {
       { arms: manifest.arms.map((arm) => ({ ...arm, root: `${arm.root}2` })) },
     ]
     for (const change of changed) {
-      const other = new TelemetrySession({ manifest: { ...manifest, ...change }, directory, io })
-      expect(() => other.verify()).toThrow()
+      expect(() =>
+        new TelemetrySession({ manifest: { ...manifest, ...change }, directory, io }).verify()
+      ).toThrow()
     }
     const file = path.join(directory, 'raw.jsonl')
     const rows = fs
@@ -2072,5 +2252,434 @@ describe('telemetry benchmark session', () => {
     expect(() => session.verify()).toThrow()
     fs.writeFileSync(file, `${rows.map((r) => JSON.stringify(r)).join('\n')}\n`)
     expect(session.verify().exit).toBe(1)
+  })
+})
+
+describe('telemetry review regressions', () => {
+  test('export polling archives full rows with independent node cursors and preserves failures', async () => {
+    const evidence = new EvidenceWriter(tmp())
+    const requests = []
+    let step = 0
+    const read = async (options) => {
+      requests.push(options)
+      step += 1
+      if (step === 1)
+        return [
+          { node: '1', seq: 1, dataSha256: 'a'.repeat(64) },
+          { node: '2', seq: 1 },
+        ]
+      if (step === 2) return [{ node: '1', seq: 2 }]
+      return []
+    }
+    const archive = new ExportArchive(evidence, read)
+    await archive.start()
+    await archive.poll()
+    expect(await archive.finish()).toEqual([
+      { node: '1', seq: 1, dataSha256: 'a'.repeat(64) },
+      { node: '2', seq: 1 },
+      { node: '1', seq: 2 },
+    ])
+    expect(requests).toEqual([{ after: {} }, { after: { 1: 1, 2: 1 } }, { after: { 1: 2, 2: 1 } }])
+    const overflow = new ExportArchive(new EvidenceWriter(tmp()), async () => {
+      throw new Error('sink overflow')
+    })
+    await expect(overflow.start()).rejects.toThrow('sink overflow')
+    await overflow.stop()
+    const gap = new ExportArchive(new EvidenceWriter(tmp()), async () => [{ node: '1', seq: 2 }])
+    await expect(gap.start()).rejects.toThrow(/cursor/)
+    await gap.stop()
+  })
+
+  test('active delivery retains wire bytes and offline in-window payload joins for both clients', async () => {
+    const cluster = fakeCluster()
+    const exports = []
+    const sockets = []
+    const original = cluster.fixture.kafka
+    const raw = Buffer.from('0a14121212100a01612a0b0a09310100000000000000', 'hex')
+    const i16 = (n) => {
+      const b = Buffer.alloc(2)
+      b.writeInt16BE(n)
+      return b
+    }
+    const i32 = (n) => {
+      const b = Buffer.alloc(4)
+      b.writeInt32BE(n)
+      return b
+    }
+    const frame = (...parts) => {
+      const body = Buffer.concat(parts)
+      return Buffer.concat([i32(body.length), body])
+    }
+    const header = (api, correlation) =>
+      Buffer.concat([i16(api), i16(0), i32(correlation), i16(0), Buffer.from([0])])
+    cluster.fixture.nodeFor = () => '1'
+    cluster.fixture.socketFactory = () => () => {
+      const socket = new (require('node:events').EventEmitter)()
+      socket.write = () => true
+      sockets.push(socket)
+      return socket
+    }
+    cluster.fixture.exports = async ({ after }) =>
+      exports.filter((e) => e.seq > (after[e.node] ?? 0))
+    cluster.fixture.kafka = (options) => {
+      const kafka = original(options)
+      if (options.enableMetricsPush) {
+        for (const kind of ['producer', 'consumer']) {
+          const factory = kafka[kind]
+          kafka[kind] = (config) => {
+            const client = factory(config)
+            client.connect = async () => {
+              const id = sockets.length + 1
+              const socket = options.socketFactory({ host: 'localhost', port: 19092 })
+              socket.uuid = Buffer.alloc(16, id)
+              socket.write(frame(header(71, id), socket.uuid, Buffer.from([0])))
+              socket.emit(
+                'data',
+                frame(
+                  i32(id),
+                  Buffer.from([0]),
+                  i32(0),
+                  i16(0),
+                  socket.uuid,
+                  i32(7),
+                  Buffer.from([1]),
+                  i32(1000),
+                  i32(1048576),
+                  Buffer.from([1, 1, 0])
+                )
+              )
+            }
+            return client
+          }
+        }
+      }
+      return kafka
+    }
+    let callbacks = 0
+    const hooks = {
+      control: async () => {
+        callbacks += 1
+        if (callbacks !== 3) return
+        for (let i = 0; i < sockets.length; i += 1) {
+          const socket = sockets[i]
+          const correlation = 10 + i
+          socket.write(
+            frame(
+              header(72, correlation),
+              socket.uuid,
+              i32(7),
+              Buffer.from([0, 0, raw.length + 1]),
+              raw,
+              Buffer.from([0])
+            )
+          )
+          socket.emit(
+            'data',
+            frame(i32(correlation), Buffer.from([0]), i32(0), i16(0), Buffer.from([0]))
+          )
+          const hex = socket.uuid.toString('hex')
+          const uuid = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+          exports.push({
+            v: 1,
+            node: '1',
+            seq: exports.length + 1,
+            clientInstanceId: uuid,
+            pushIntervalMs: 1000,
+            dataBytes: raw.length,
+            dataSha256: hashBytes(raw),
+            terminating: false,
+            parse: 'ok',
+          })
+        }
+      },
+    }
+    const config = deliveryConfig('eachMessage', { telemetry: 'active' })
+    const { result, evidence } = await runDelivery(cluster, config, hooks)
+    const decl = declaration({ mode: 'delivery', config })
+    const env = envelopeOf(result, evidence, decl)
+    expect(() => verifyWorker(env, decl, evidence.directory)).not.toThrow()
+    const metaFile = path.join(evidence.directory, 'delivery-meta.json')
+    const meta = JSON.parse(fs.readFileSync(metaFile, 'utf8'))
+    expect(meta.window).toEqual({ startMs: expect.any(Number), endMs: expect.any(Number) })
+    meta.window.endMs = meta.window.startMs
+    const bytes = Buffer.from(JSON.stringify(meta))
+    fs.writeFileSync(metaFile, bytes)
+    Object.assign(
+      env.artifacts.find((a) => a.name === 'delivery-meta.json'),
+      { bytes: bytes.length, sha256: hashBytes(bytes) }
+    )
+    expect(() => verifyWorker(env, decl, evidence.directory)).toThrow()
+  })
+
+  test('normal manifests vary telemetry only in their declared roles', () => {
+    for (const job of ['requests-normal', 'delivery-normal']) {
+      const manifest = makeManifest(job)
+      expect(() => validateManifest(manifest)).not.toThrow()
+      manifest.arms[1].argv[manifest.arms[1].argv.indexOf('--telemetry') + 1] = 'active'
+      expect(() => validateManifest(manifest)).toThrow()
+    }
+  })
+
+  test('offline CLI opens the run directory and rejects corrupt evidence', async () => {
+    const { session, directory, io } = sessionFixture('requests-normal')
+    session.run()
+    const output = { ...io, log: jest.fn(), error: jest.fn() }
+    expect(await main(['--verify-session', directory], output)).toBe(0)
+    expect(output.error).not.toHaveBeenCalled()
+    const file = path.join(directory, 'raw.jsonl')
+    fs.writeFileSync(file, fs.readFileSync(file, 'utf8').split('\n').slice(1).join('\n'))
+    expect(await main(['--verify-session', directory], output)).toBe(1)
+  })
+
+  test('a consistently shortened rehashed delivery corpus cannot satisfy its declaration', async () => {
+    const config = deliveryConfig('eachMessage')
+    const { result, evidence } = await runDelivery(fakeCluster(), config)
+    const decl = declaration({ mode: 'delivery', config: { ...config, messages: 1000000 } })
+    const envelope = envelopeOf(result, evidence, decl)
+    expect(() => verifyWorker(envelope, decl, evidence.directory)).toThrow()
+    const literal = literalDelivery()
+    for (const mutate of [
+      (m) => {
+        m.warmup = 0
+      },
+      (m) => {
+        m.expectedCommits = { p0: '2', p1: '2' }
+        m.finalCommits = m.expectedCommits
+      },
+      (m) => {
+        m.ends = [
+          { partition: 0, offset: '4' },
+          { partition: 1, offset: '3' },
+        ]
+      },
+    ]) {
+      const meta = JSON.parse(JSON.stringify(literal.meta))
+      mutate(meta)
+      expect(() => deliveryEvidence(literal.config, literal.tables, meta)).toThrow()
+    }
+  })
+
+  test('independent golden framing rejects wrong wire types duplicates and truncated fields', () => {
+    const vectors = require('../../e2e/telemetry/fixtures/golden/vectors.json').vectors
+    for (const name of ['hand-minimal', 'zero']) {
+      const vector = vectors[name]
+      const raw = Buffer.from(vector.hex, 'hex')
+      expect(hashBytes(raw)).toBe(vector.sha256)
+      const decoded = decodeMetricsData(raw)
+      const points = decodePoints(raw)
+      expect(points).toHaveLength(vector.semantic.metrics.length)
+      vector.semantic.metrics.forEach((metric, i) => {
+        expect(points[i]).toMatchObject({
+          name: metric.name,
+          unit: metric.unit,
+          type: metric.kind === 'SUM' ? 'sum' : 'gauge',
+          attributes: [],
+          value: metric.points[0].asInt === '1' ? '1' : '0',
+        })
+        expect(decoded.points[i]).toMatchObject({
+          start: '0',
+          time: '0',
+          temporality:
+            metric.temporality === 'AGGREGATION_TEMPORALITY_DELTA' ? 1 : metric.temporality ? 2 : 0,
+          monotonic: metric.monotonic ?? false,
+        })
+      })
+    }
+    // Literal nested lengths from the independent hand-minimal golden, with one timestamp.
+    const wrap = (point) => {
+      const nested = (tag, bytes) => Buffer.concat([Buffer.from([tag, bytes.length]), bytes])
+      return nested(
+        10,
+        nested(
+          18,
+          nested(18, Buffer.concat([Buffer.from('0a0161', 'hex'), nested(42, nested(10, point))]))
+        )
+      )
+    }
+    const value = Buffer.from('310100000000000000', 'hex')
+    const timestamp = Buffer.from('190100000000000000', 'hex')
+    expect(decodeMetricsData(wrap(Buffer.concat([timestamp, value]))).points[0].time).toBe('1')
+    for (const point of [
+      Buffer.concat([Buffer.from('1a080100000000000000', 'hex'), value]),
+      Buffer.from('32080100000000000000', 'hex'),
+      Buffer.concat([timestamp, timestamp, value]),
+      Buffer.concat([value, value]),
+      Buffer.from('3101', 'hex'),
+    ]) {
+      expect(() => decodePoints(wrap(point))).toThrow()
+      expect(() => decodeMetricsData(wrap(point))).toThrow()
+    }
+  })
+
+  test('telemetry node joins use public cluster discovery instead of topic metadata', async () => {
+    class Kafka {}
+    const fixture = liveFixture(ROOT, { brokers: [], active: false }, 'topology', () => ({
+      Kafka,
+      logLevel: { NOTHING: 0 },
+    }))
+    const admin = {
+      listTopics: async () => [],
+      createTopics: async () => true,
+      fetchTopicMetadata: async () => ({ topics: [{ partitions: Array(6).fill({}) }] }),
+      describeCluster: async () => ({ brokers: [{ nodeId: 1, host: 'localhost', port: 19092 }] }),
+      deleteTopics: async () => {},
+    }
+    await fixture.provision(admin, async () => {
+      expect(fixture.nodeFor({ host: 'localhost', port: 19092 })).toBe('1')
+      expect(() => fixture.nodeFor({ host: 'localhost', port: 19095 })).toThrow()
+    })
+  })
+
+  test('topic setup preserves its primary error beside cleanup failures', async () => {
+    const primary = new Error('ambiguous create')
+    const cleanup = new Error('delete failed')
+    const admin = {
+      listTopics: async () => [],
+      createTopics: async () => {
+        throw primary
+      },
+      deleteTopics: async () => {
+        throw cleanup
+      },
+    }
+    class Kafka {}
+    const fixture = liveFixture(ROOT, { brokers: [], active: false }, 'errors', () => ({
+      Kafka,
+      logLevel: { NOTHING: 0 },
+    }))
+    const work = jest.fn()
+    const error = await fixture.provision(admin, work).catch((error) => error)
+    expect(error).toBeInstanceOf(AggregateError)
+    expect(error.errors).toEqual([primary, cleanup])
+    expect(work).not.toHaveBeenCalled()
+  })
+
+  test('topic ownership covers ambiguous creation and failed metadata readback', async () => {
+    for (const failure of ['create', 'readback', 'layout']) {
+      const calls = []
+      const primary = new Error(failure)
+      const admin = {
+        createTopics: async () => {
+          calls.push('create')
+          if (failure === 'create') throw primary
+        },
+        fetchTopicMetadata: async () => {
+          calls.push('readback')
+          if (failure === 'layout') return { topics: [{ partitions: [] }] }
+          throw primary
+        },
+        deleteTopics: async () => {
+          calls.push('delete')
+        },
+        listTopics: async () => {
+          calls.push('absence')
+          return []
+        },
+        connect: async () => {
+          calls.push('connect')
+        },
+        disconnect: async () => {
+          calls.push('disconnect')
+        },
+      }
+      class Kafka {
+        admin() {
+          return admin
+        }
+      }
+      const fixture = liveFixture(ROOT, { brokers: [], active: false }, 'cleanup', () => ({
+        Kafka,
+        logLevel: { NOTHING: 0 },
+      }))
+      const workload = new DeliveryWorkload({
+        root: ROOT,
+        config: deliveryConfig('eachMessage'),
+        control: 0,
+        evidence: new EvidenceWriter(tmp(), { identity: IDENTITY }),
+        fixture,
+      })
+      if (failure === 'layout') await expect(workload.run()).rejects.toThrow(assert.AssertionError)
+      else await expect(workload.run()).rejects.toBe(primary)
+      await workload.close()
+      expect(calls.slice(-3)).toEqual(['delete', 'absence', 'disconnect'])
+    }
+  })
+})
+
+describe('telemetry frozen provenance', () => {
+  test('supervisor rejects unused assets runtime drift and modified frozen source before spawning', () => {
+    for (const change of [
+      (m) => {
+        m.session = { ...m.session, path: path.join(tmp(), 'unused.js') }
+      },
+      (m) => {
+        m.consume.sha256 = '0'.repeat(64)
+      },
+      (m) => {
+        fs.writeFileSync(
+          path.join(m.arms[0].root, 'scripts/benchmarks/consumeThroughput.js'),
+          'changed consume'
+        )
+      },
+      (m) => {
+        m.driver = { ...m.session }
+      },
+      (m) => {
+        m.node.version = 'v0.0.0'
+      },
+      (m) => {
+        fs.writeFileSync(path.join(m.arms[0].root, 'index.js'), 'modified')
+      },
+      (m) => {
+        fs.writeFileSync(path.join(m.arms[0].root, 'extra.js'), 'extra')
+      },
+      (m) => {
+        m.arms[1] = { ...m.arms[1], ...frozenSource('other') }
+      },
+      (m) => {
+        m.arms[0].source.sha256 = '0'.repeat(64)
+      },
+      (m) => {
+        fs.writeFileSync(m.arms[0].tarball.path, 'wrong archive')
+      },
+    ]) {
+      const manifest = makeManifest('requests-control')
+      change(manifest)
+      const spawnSync = jest.fn()
+      expect(() =>
+        new TelemetrySession({
+          manifest,
+          directory: path.join(tmp(), 'run'),
+          io: { spawnSync },
+        }).run()
+      ).toThrow()
+      expect(spawnSync).not.toHaveBeenCalled()
+    }
+  })
+
+  test('previous source requires a matching accepted baseline receipt', () => {
+    const manifest = makeManifest('requests-normal')
+    expect(() => validateManifest(manifest)).not.toThrow()
+    const proof = manifest.acceptedBaseline.path
+    const receipt = JSON.parse(fs.readFileSync(proof, 'utf8'))
+    receipt.status = 'pending'
+    fs.writeFileSync(proof, JSON.stringify(receipt))
+    manifest.acceptedBaseline = asset(proof)
+    expect(() => validateManifest(manifest)).toThrow()
+  })
+
+  test('optional unavailability belongs only to a declared unavailable ZSTD payload cell', () => {
+    for (const manifest of [
+      makeManifest('payload', { optionalCodec: 'gzip' }),
+      { ...makeManifest('payload'), optionalCodec: 'zstd' },
+      makeManifest('requests-control', { optionalCodec: 'zstd' }),
+      makeManifest('payload', {
+        optionalCodec: 'zstd',
+        codecs: { none: true, gzip: true, zstd: true },
+      }),
+    ])
+      expect(() => validateManifest(manifest)).toThrow()
+    const { session } = sessionFixture('payload', {}, { status: 4, stdout: '' })
+    expect(() => session.run()).toThrow(/required codec/)
   })
 })

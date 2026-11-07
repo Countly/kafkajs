@@ -5,7 +5,7 @@
  *
  * Worker: node --expose-gc telemetry.js --mode requests|payload|delivery --control 0|1 <mode flags>
  * Controller: node --expose-gc telemetry.js --session <manifest> | --verify-session <directory>
- * Exit codes: 0 pass, 1 correctness/gate/child error, 2 usage, 3 void, 4 required codec unavailable.
+ * Exit codes: 0 pass, 1 correctness/gate/child error, 2 usage, 3 void, 4 declared optional ZSTD unavailable.
  */
 const assert = require('node:assert/strict')
 const crypto = require('node:crypto')
@@ -23,6 +23,14 @@ const digest = (value) => crypto.createHash('sha256').update(JSON.stringify(valu
 
 /** @param {Buffer|string} data bytes @returns {string} lowercase SHA-256 */
 const sha256 = (data) => crypto.createHash('sha256').update(data).digest('hex')
+
+const LOADED_SOURCES = Object.fromEntries(
+  [
+    ['driver', __filename],
+    ['session', require.resolve('./session')],
+    ['consume', path.join(__dirname, 'consumeThroughput.js')],
+  ].map(([name, file]) => [name, sha256(fs.readFileSync(file))])
+)
 
 /** @param {unknown} value integer candidate @param {number} min minimum @returns {boolean} valid count */
 const integer = (value, min = 0) => Number.isSafeInteger(value) && value >= min
@@ -275,7 +283,10 @@ const wireFields = (buffer) => {
       assert(offset < buffer.length)
       const byte = buffer[offset++]
       value |= BigInt(byte & 127) << shift
-      if (!(byte & 128)) return value
+      if (!(byte & 128)) {
+        assert(value <= 0xffffffffffffffffn, 'varint overflow')
+        return value
+      }
     }
     assert.fail('invalid varint')
   }
@@ -284,7 +295,7 @@ const wireFields = (buffer) => {
     const tag = readVarint()
     const number = Number(tag >> 3n)
     const wire = Number(tag & 7n)
-    assert(number > 0)
+    assert(number > 0 && number <= 0x1fffffff)
     let value
     if (wire === 0) value = readVarint()
     else {
@@ -298,104 +309,112 @@ const wireFields = (buffer) => {
   return out
 }
 
-/** Independently reads the supported numeric OTLP subset; never imports a production protobuf codec.
- * @param {Buffer} bytes actual raw MetricsData @returns {Array<object>} semantic points with string scalars
- * @throws {AssertionError|RangeError} invalid framing, unsupported point type or duplicate identity
+/** Reads fields against the pinned OTLP wire map, preserving repeated messages only where declared.
+ * @param {Buffer} bytes message bytes @param {object} schema field number to [wire, repeated]
+ * @returns {Function} checked field accessor (missing scalar fields return undefined)
+ * @throws {AssertionError} for unknown fields, wrong wires or duplicate scalar fields
  */
-const decodePoints = (bytes) => {
-  const nested = (list, tag) =>
-    list.filter(({ number }) => number === tag).map(({ value }) => wireFields(value))
-  const scalar = (list, tag) => list.find(({ number }) => number === tag)?.value
-  const points = []
-  for (const resource of nested(wireFields(bytes), 1)) {
-    for (const scope of nested(resource, 2)) {
-      for (const metric of nested(scope, 2)) {
-        const name = scalar(metric, 1).toString('utf8')
-        const unit = scalar(metric, 3)?.toString('utf8') || ''
-        assert(Boolean(scalar(metric, 5)) !== Boolean(scalar(metric, 7)))
-        const sum = scalar(metric, 7)
-        const aggregate = wireFields(sum || scalar(metric, 5))
-        for (const point of nested(aggregate, 1)) {
-          const attributes = nested(point, 7)
-            .map((attribute) => ({
-              key: scalar(attribute, 1).toString('utf8'),
-              value: scalar(wireFields(scalar(attribute, 2)), 1).toString('utf8'),
-            }))
-            .sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0))
-          const int = scalar(point, 6)
-          const double = scalar(point, 4)
-          assert(Boolean(int) !== Boolean(double))
-          const value = int ? int.readBigInt64LE().toString() : double.readDoubleLE().toString()
-          points.push({
-            name,
-            unit,
-            type: sum ? 'sum' : 'gauge',
-            attributes,
-            value,
-          })
-        }
-      }
-    }
+const otlpFields = (bytes, schema) => {
+  const fields = new Map()
+  for (const { number, wire, value } of wireFields(bytes)) {
+    assert(schema[number], `unsupported OTLP field ${number}`)
+    const [expected, repeated] = schema[number]
+    assert.equal(wire, expected, `wrong OTLP wire type for ${number}`)
+    assert(repeated || !fields.has(number), `duplicate OTLP field ${number}`)
+    if (!fields.has(number)) fields.set(number, [])
+    fields.get(number).push(value)
   }
-  const identities = points.map(({ name, attributes }) => JSON.stringify([name, attributes]))
-  assert.equal(new Set(identities).size, identities.length)
-  return points
+  return (number) => (schema[number][1] ? (fields.get(number) ?? []) : fields.get(number)?.[0])
 }
 
-/** Reads the whole supported MetricsData shape: resource, scope, temporality, monotonic flag and times.
- * @param {Buffer} bytes actual raw MetricsData
- * @returns {{resource:object[],dropped:string,scope:{name:string,version:string},points:object[]}}
- * temporal facts of the single resource and scope the encoder writes
- * @throws {AssertionError} for framing errors or more than one resource/scope
+/** Independently reads the supported numeric OTLP subset; never uses the production encoder/decoder.
+ * @param {Buffer} bytes actual MetricsData @returns {object[]} semantic points with decimal scalars
+ * @throws {AssertionError} for invalid framing, cardinality, wire types or duplicate point identities
+ */
+const decodePoints = (bytes) =>
+  decodeMetricsData(bytes).points.map(({ start, time, temporality, monotonic, ...point }) => point)
+
+/** Reads one resource/scope of numeric MetricsData with the pinned field map and protobuf defaults.
+ * @param {Buffer} bytes actual raw MetricsData @returns {object} full supported semantic data
+ * @throws {AssertionError} for unsupported fields, malformed framing or ambiguous scalar values
  */
 const decodeMetricsData = (bytes) => {
-  const nested = (list, tag) =>
-    list.filter(({ number }) => number === tag).map(({ value }) => wireFields(value))
-  const scalar = (list, tag) => list.find(({ number }) => number === tag)?.value
-  const attributeList = (list, tag) =>
-    nested(list, tag)
-      .map((attribute) => ({
-        key: scalar(attribute, 1).toString('utf8'),
-        value: scalar(wireFields(scalar(attribute, 2)), 1).toString('utf8'),
-      }))
+  const text = (value) => value?.toString('utf8') ?? ''
+  const attrs = (buffers) => {
+    const values = buffers
+      .map((bytes) => {
+        const field = otlpFields(bytes, { 1: [2], 2: [2] })
+        assert(field(1) && field(2), 'incomplete attribute')
+        const value = otlpFields(field(2), { 1: [2] })
+        assert(value(1), 'attribute must be a string')
+        return { key: text(field(1)), value: text(value(1)) }
+      })
       .sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0))
-  const resources = nested(wireFields(bytes), 1)
-  assert.equal(resources.length, 1)
-  const [resourceMetrics] = resources
-  const [resource] = nested(resourceMetrics, 1)
-  const scopes = nested(resourceMetrics, 2)
-  assert.equal(scopes.length, 1)
-  const [scopeMetrics] = scopes
-  const [scope] = nested(scopeMetrics, 1)
+    exactSet(
+      values.map(({ key }) => key),
+      values.map(({ key }) => key)
+    )
+    return values
+  }
+  const top = otlpFields(bytes, { 1: [2, true] })
+  assert.equal(top(1).length, 1)
+  const rm = otlpFields(top(1)[0], { 1: [2], 2: [2, true], 3: [2] })
+  const resource = otlpFields(rm(1) ?? Buffer.alloc(0), { 1: [2, true], 2: [0] })
+  assert.equal(rm(2).length, 1)
+  const sm = otlpFields(rm(2)[0], { 1: [2], 2: [2, true], 3: [2] })
+  const scope = otlpFields(sm(1) ?? Buffer.alloc(0), { 1: [2], 2: [2], 3: [2, true], 4: [0] })
+  assert.equal(scope(3).length, 0, 'scope attributes are outside the supported subset')
   const points = []
-  for (const metric of nested(scopeMetrics, 2)) {
-    const sum = scalar(metric, 7)
-    const aggregate = wireFields(sum || scalar(metric, 5))
-    const temporality = sum ? Number(scalar(aggregate, 2) ?? 0n) : 0
-    const monotonic = sum ? Number(scalar(aggregate, 3) ?? 0n) === 1 : false
-    for (const point of nested(aggregate, 1)) {
-      const int = scalar(point, 6)
-      const double = scalar(point, 4)
+  for (const metricBytes of sm(2)) {
+    const metric = otlpFields(metricBytes, { 1: [2], 2: [2], 3: [2], 5: [2], 7: [2] })
+    assert(metric(1)?.length, 'metric name is required')
+    assert(Boolean(metric(5)) !== Boolean(metric(7)), 'exactly one metric type is required')
+    const sum = Boolean(metric(7))
+    const aggregate = otlpFields(
+      metric(7) ?? metric(5),
+      sum ? { 1: [2, true], 2: [0], 3: [0] } : { 1: [2, true] }
+    )
+    assert(aggregate(1).length > 0, 'empty metric')
+    const temporality = sum ? Number(aggregate(2) ?? 0n) : 0
+    const monotonic = sum ? (aggregate(3) ?? 0n) : 0n
+    assert(!sum || [0, 1, 2].includes(temporality))
+    assert(monotonic === 0n || monotonic === 1n)
+    for (const pointBytes of aggregate(1)) {
+      const point = otlpFields(pointBytes, {
+        2: [1],
+        3: [1],
+        4: [1],
+        6: [1],
+        7: [2, true],
+        8: [2, true],
+        9: [0],
+      })
+      assert.equal(point(8).length, 0, 'exemplars are outside the supported subset')
+      assert.equal(point(9) ?? 0n, 0n)
+      assert(Boolean(point(6)) !== Boolean(point(4)), 'exactly one numeric value is required')
+      const value = point(6)
+        ? point(6).readBigInt64LE().toString()
+        : point(4).readDoubleLE().toString()
+      assert(Number.isFinite(Number(value)))
       points.push({
-        name: scalar(metric, 1).toString('utf8'),
-        unit: scalar(metric, 3)?.toString('utf8') || '',
+        name: text(metric(1)),
+        unit: text(metric(3)),
         type: sum ? 'sum' : 'gauge',
-        attributes: attributeList(point, 7),
-        value: int ? int.readBigInt64LE().toString() : double.readDoubleLE().toString(),
-        start: (scalar(point, 2)?.readBigUInt64LE() ?? 0n).toString(),
-        time: (scalar(point, 3)?.readBigUInt64LE() ?? 0n).toString(),
+        attributes: attrs(point(7)),
+        value,
+        start: (point(2)?.readBigUInt64LE() ?? 0n).toString(),
+        time: (point(3)?.readBigUInt64LE() ?? 0n).toString(),
         temporality,
-        monotonic,
+        monotonic: monotonic === 1n,
       })
     }
   }
+  const identities = points.map(({ name, attributes }) => JSON.stringify([name, attributes]))
+  exactSet(identities, identities)
   return {
-    resource: attributeList(resource, 1),
-    dropped: String(scalar(resource, 2) ?? 0n),
-    scope: {
-      name: scalar(scope, 1).toString('utf8'),
-      version: scalar(scope, 2).toString('utf8'),
-    },
+    resource: attrs(resource(1)),
+    dropped: String(resource(2) ?? 0n),
+    scope: { name: text(scope(1)), version: text(scope(2)) },
     points,
   }
 }
@@ -2084,6 +2103,48 @@ class FrameStream {
   }
 }
 
+/** Independently parses the complete flexible PushTelemetry v0 body and decodes its numeric OTLP bytes.
+ * Delivery uses the retained reporter's 4096-byte raw-payload domain; unknown codecs or tags fail closed.
+ * @param {Buffer} body actual 72v0 body @returns {object} raw/transmitted hashes and full decoded values
+ * @throws {AssertionError|Error} for framing, codec, size or OTLP errors
+ */
+const decodePush = (body) => {
+  assert(body.length >= 24)
+  assert(body[20] === 0 || body[20] === 1)
+  const compressionType = body.readInt8(21)
+  const [length, at] = readUVarInt(body, 22)
+  const metricsBytes = length - 1
+  assert(integer(metricsBytes) && metricsBytes <= 4096)
+  assert.equal(at + metricsBytes + 1, body.length)
+  assert.equal(body[body.length - 1], 0, 'unsupported Push tags')
+  const transmitted = body.subarray(at, at + metricsBytes)
+  let raw
+  if (compressionType === 0) raw = transmitted
+  else if (compressionType === 1) raw = zlib.gunzipSync(transmitted, { maxOutputLength: 4096 })
+  else {
+    assert.equal(compressionType, 4)
+    // eslint-disable-next-line n/no-unsupported-features/node-builtins -- feature detection
+    assert.equal(typeof zlib.zstdDecompressSync, 'function')
+    // eslint-disable-next-line n/no-unsupported-features/node-builtins -- feature detection
+    raw = zlib.zstdDecompressSync(transmitted, { maxOutputLength: 4096 })
+  }
+  assert(raw.length <= 4096)
+  return {
+    uuid: uuidText(body.subarray(0, 16)),
+    subscriptionId: body.readInt32BE(16),
+    terminating: body[20] === 1,
+    compressionType,
+    metricsBytes,
+    bodyHex: body.toString('hex'),
+    bodySha256: sha256(body),
+    transmittedSha256: sha256(transmitted),
+    rawHex: raw.toString('hex'),
+    rawBytes: raw.length,
+    rawSha256: sha256(raw),
+    decoded: raw.length ? decodeMetricsData(raw) : null,
+  }
+}
+
 /** One socket's two directions: pairs telemetry requests (APIs 71 and 72) with their responses and
  * retires each correlation when answered. Ordinary frame bodies are discarded as they stream by.
  */
@@ -2092,8 +2153,8 @@ class SocketTap {
   #out
   #in
 
-  /** @param {{emit:(record:object)=>void,fail:(error:Error)=>void,socket:number,maxPending:number,maxFrame:number}} o */
-  constructor({ emit, fail, socket, maxPending, maxFrame }) {
+  /** @param {{emit:(record:object)=>void,fail:(error:Error)=>void,socket:number,node:string,now:Function,maxPending:number,maxFrame:number}} o */
+  constructor({ emit, fail, socket, node, now, maxPending, maxFrame }) {
     const guard = (work) => (frame) => {
       try {
         work(frame)
@@ -2107,17 +2168,16 @@ class SocketTap {
       keeps: (head) => head.length === 2 && [71, 72].includes(head.readInt16BE(0)),
       onFrame: guard((frame) => {
         assert(this.#pending.size < maxPending, 'too many pending telemetry correlations')
+        assert.equal(frame.readInt16BE(2), 0)
         const apiKey = frame.readInt16BE(0)
         const correlation = frame.readInt32BE(4)
-        const [, afterTags] = readUVarInt(frame, 10 + Math.max(0, frame.readInt16BE(8)))
+        const [tags, afterTags] = readUVarInt(frame, 10 + Math.max(0, frame.readInt16BE(8)))
+        assert.equal(tags, 0, 'unsupported request header tags')
         const body = frame.subarray(afterTags)
-        const request = { kind: apiKey === 71 ? 'subscription' : 'push', socket, apiKey }
+        const request = { kind: apiKey === 71 ? 'subscription' : 'push', socket, node, apiKey }
         request.uuid = uuidText(body.subarray(0, 16))
         if (apiKey === 72) {
-          request.subscriptionId = body.readInt32BE(16)
-          request.terminating = body[20] !== 0
-          request.compressionType = body.readInt8(21)
-          request.metricsBytes = readUVarInt(body, 22)[0] - 1
+          Object.assign(request, decodePush(body))
         }
         this.#pending.set(correlation, request)
       }),
@@ -2130,8 +2190,9 @@ class SocketTap {
         const correlation = frame.readInt32BE(0)
         const request = this.#pending.get(correlation)
         this.#pending.delete(correlation)
+        assert.equal(frame[4], 0, 'unsupported response header tags')
         const body = frame.subarray(5)
-        const record = { ...request, errorCode: body.readInt16BE(4) }
+        const record = { ...request, errorCode: body.readInt16BE(4), observedMs: now() }
         if (request.apiKey === 71 && record.errorCode === 0) {
           record.uuid = uuidText(body.subarray(6, 22))
           record.subscriptionId = body.readInt32BE(22)
@@ -2169,6 +2230,8 @@ class TelemetryPushProbe {
   #maxSockets
   #maxPending
   #maxFrame
+  #maxRecords
+  #now
   #open = 0
   #sockets = 0
   #lines = []
@@ -2177,19 +2240,30 @@ class TelemetryPushProbe {
   #errors = []
   #finished = false
 
-  /** @param {{evidence:EvidenceWriter,maxSockets?:number,maxPending?:number,maxFrame?:number}} options
+  /** @param {{evidence:EvidenceWriter,maxSockets?:number,maxPending?:number,maxFrame?:number,
+   * maxRecords?:number,now?:Function}} options
    * bounds: 64 concurrent sockets, 128 pending correlations per socket, 1 MiB retained frame
    */
-  constructor({ evidence, maxSockets = 64, maxPending = 128, maxFrame = MIB }) {
+  constructor({
+    evidence,
+    maxSockets = 64,
+    maxPending = 128,
+    maxFrame = MIB,
+    maxRecords = 256,
+    now = () => performance.now(),
+  }) {
     this.#evidence = evidence
     this.#maxSockets = maxSockets
     this.#maxPending = maxPending
     this.#maxFrame = maxFrame
+    assert(integer(maxRecords, 1))
+    this.#maxRecords = maxRecords
+    this.#now = now
   }
 
   /** @param {Error} error problem to retain @returns {void} latched; the validation fails later */
   #fail(error) {
-    this.#errors.push(error.message)
+    if (this.#errors.length < 16) this.#errors.push(error.message)
   }
 
   /** @returns {void} appends the pending lines as one sealed chunk of at most 2 MiB */
@@ -2206,6 +2280,8 @@ class TelemetryPushProbe {
 
   /** @param {object} record completed telemetry request/response tuple @returns {void} */
   #emit(record) {
+    assert(!this.#finished, 'probe already sealed')
+    if (this.#records.length === this.#maxRecords) this.#records.shift()
     this.#records.push(record)
     const line = `${JSON.stringify(record)}\n`
     if (this.#bytes + line.length > MIB) this.#flush()
@@ -2213,8 +2289,8 @@ class TelemetryPushProbe {
     this.#bytes += line.length
   }
 
-  /** @returns {SocketTap} a tap for one socket; exceeding the concurrent socket bound latches an error */
-  open() {
+  /** @param {string} [node] independently discovered broker id @returns {SocketTap} a tap for one socket; exceeding the concurrent socket bound latches an error */
+  open(node = 'unknown') {
     this.#open += 1
     if (this.#open > this.#maxSockets)
       this.#fail(new Error('too many concurrent telemetry sockets'))
@@ -2222,19 +2298,23 @@ class TelemetryPushProbe {
       emit: (record) => this.#emit(record),
       fail: (error) => this.#fail(error),
       socket: this.#sockets++,
+      node: String(node),
+      now: this.#now,
       maxPending: this.#maxPending,
       maxFrame: this.#maxFrame,
     })
     return Object.assign(tap, { release: () => (this.#open -= 1) })
   }
 
-  /** @param {Function} factory a public `socketFactory` @returns {Function} the same factory, tapped
+  /** @param {Function} factory a public `socketFactory` @param {Function} [nodeFor] endpoint-to-node lookup
+   * @returns {Function} the same factory, tapped
    * (the socket's own `write` and `data` behaviour is preserved, probe errors latch)
    */
-  wrap(factory) {
+  wrap(factory, nodeFor = () => 'unknown') {
     return (options) => {
+      const node = nodeFor(options)
       const socket = factory(options)
-      const tap = this.open()
+      const tap = this.open(node)
       const write = socket.write.bind(socket)
       socket.write = (chunk, ...rest) => {
         try {
@@ -2256,7 +2336,7 @@ class TelemetryPushProbe {
     }
   }
 
-  /** @returns {object[]} completed telemetry tuples so far */
+  /** @returns {object[]} bounded recent telemetry tuples; the complete stream is on disk */
   get records() {
     return this.#records
   }
@@ -2276,45 +2356,206 @@ class TelemetryPushProbe {
       this.#evidence.sealChunks('delivery-telemetry')
     }
     assert.deepEqual(this.#errors, [], 'telemetry probe latched an error')
-    return this.#records
+    return readChunks(
+      this.#evidence.directory,
+      this.#evidence.artifacts(),
+      'delivery-telemetry'
+    ).flatMap((chunk) =>
+      chunk
+        .toString('utf8')
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => JSON.parse(line))
+    )
   }
 }
 
 /** Decides whether the wire tuples and exporter records prove the arm's telemetry state.
  * @param {object[]} records completed 71/72 tuples @param {{active:boolean,intervalMs:number,
- * exports:object[],clients?:number}} options expected state; exporter records carry `clientInstanceId`
+ * exports:object[],clients?:number,window?:{startMs:number,endMs:number}}} options expected state; exporter records carry `clientInstanceId`
  * and `pushIntervalMs` @returns {{clients:number,pushes:number}} what was proven
  * @throws {AssertionError} for any telemetry traffic when off, or for an active arm without an accepted
  * subscription, a successful push response and a matching exporter record per measured client
  */
-const telemetryEvidence = (records, { active, intervalMs, exports, clients = 2 }) => {
+const telemetryEvidence = (records, { active, intervalMs, exports, clients = 2, window }) => {
   if (!active) {
     assert.equal(records.length, 0, 'opt-out client sent telemetry frames')
     return { clients: 0, pushes: 0 }
+  }
+  assert(
+    Number.isFinite(window?.startMs) &&
+      Number.isFinite(window?.endMs) &&
+      window.endMs >= window.startMs,
+    'missing measured Push window'
+  )
+  const cursors = {}
+  for (const row of exports) {
+    const node = String(row.node)
+    assert(['1', '2', '3'].includes(node))
+    assert.equal(row.seq, (cursors[node] ?? 0) + 1, 'archived exporter sequence has a gap')
+    cursors[node] = row.seq
+    assert(
+      row.v === 1 &&
+        row.parse === 'ok' &&
+        !row.stub &&
+        integer(row.dataBytes) &&
+        /^[a-f0-9]{64}$/.test(row.dataSha256),
+      'invalid archived exporter record'
+    )
+  }
+  for (const record of records) {
+    assert(Number.isFinite(record.observedMs) && integer(record.socket))
+    assert(['1', '2', '3'].includes(record.node), 'missing Push broker-node identity')
   }
   const subscriptions = records.filter(
     (r) => r.kind === 'subscription' && r.errorCode === 0 && r.pushIntervalMs === intervalMs
   )
   const ids = new Set(subscriptions.map(({ uuid }) => uuid))
-  assert(ids.size >= clients, 'active clients did not obtain an accepted subscription')
+  assert.equal(ids.size, clients, 'measured clients did not obtain distinct accepted subscriptions')
+  const consumed = new Set()
+  const proven = new Set()
   let pushes = 0
-  for (const uuid of ids) {
-    const mine = records.filter((r) => r.kind === 'push' && r.errorCode === 0 && r.uuid === uuid)
-    assert(mine.length > 0, 'no successful push response joined a client')
-    const accepted = new Set(
-      subscriptions.filter((r) => r.uuid === uuid).map(({ subscriptionId }) => subscriptionId)
-    )
+  for (const record of records.filter((r) => r.kind === 'push')) {
+    const actual = decodePush(Buffer.from(record.bodyHex, 'hex'))
+    for (const key of Object.keys(actual))
+      assert.deepEqual(record[key], actual[key], `Push ${key} differs`)
+    if (record.errorCode !== 0) continue
     assert(
-      mine.every((r) => accepted.has(r.subscriptionId)),
-      'push used an unaccepted subscription'
+      subscriptions.some(
+        (s) =>
+          s.uuid === record.uuid &&
+          s.node === record.node &&
+          s.socket === record.socket &&
+          s.subscriptionId === record.subscriptionId &&
+          s.observedMs <= record.observedMs
+      ),
+      'Push lacks a matching accepted subscription'
     )
-    assert(
-      exports.some((e) => e.clientInstanceId === uuid && e.pushIntervalMs === intervalMs),
-      'no exporter record joined a client'
+    if (actual.rawBytes === 0) continue
+    const matching = exports.find(
+      (e) =>
+        e.clientInstanceId === record.uuid &&
+        e.pushIntervalMs === intervalMs &&
+        String(e.node) === record.node &&
+        e.dataSha256 === actual.rawSha256 &&
+        e.dataBytes === actual.rawBytes &&
+        e.terminating === actual.terminating &&
+        e.parse === 'ok' &&
+        !e.stub &&
+        integer(e.seq, 1) &&
+        !consumed.has(`${e.node}:${e.seq}`)
     )
-    pushes += mine.length
+    assert(matching, 'no exporter record matches the actual Push payload/node')
+    consumed.add(`${matching.node}:${matching.seq}`)
+    if (
+      !actual.terminating &&
+      record.observedMs >= window.startMs &&
+      record.observedMs <= window.endMs
+    ) {
+      proven.add(record.uuid)
+      pushes += 1
+    }
   }
-  return { clients: ids.size, pushes }
+  exactSet([...ids], [...proven])
+  return { clients: proven.size, pushes }
+}
+
+/** Polls the bounded sink with one cursor per broker and archives full rows as immutable chunks.
+ * Polling never clears or rotates an active sink. Overflow, gaps and poll failures remain fatal.
+ */
+class ExportArchive {
+  #evidence
+  #read
+  #timer = null
+  #pending = null
+  #error = null
+  #after = {}
+  #lines = ''
+  #bytes = 0
+
+  /** @param {EvidenceWriter} evidence owned writer @param {Function} read per-node cursor reader */
+  constructor(evidence, read) {
+    this.#evidence = evidence
+    this.#read = read
+  }
+
+  /** @returns {Promise<void>} one serialized poll; repeated requests share the current read */
+  poll() {
+    if (this.#pending) return this.#pending
+    this.#pending = this.#poll()
+      .catch((error) => {
+        this.#error ??= error
+      })
+      .finally(() => {
+        this.#pending = null
+      })
+    return this.#pending
+  }
+
+  /** @returns {Promise<void>} validates node sequences before sealing the newly observed rows */
+  async #poll() {
+    const rows = await this.#read({ after: { ...this.#after } })
+    for (const row of rows) {
+      const node = String(row.node)
+      assert(['1', '2', '3'].includes(node))
+      assert.equal(row.seq, (this.#after[node] ?? 0) + 1, 'export cursor has a gap')
+      this.#after[node] = row.seq
+      const line = `${JSON.stringify(row)}\n`
+      assert(Buffer.byteLength(line) <= 4096)
+      if (this.#bytes + Buffer.byteLength(line) > 65536) this.#flush()
+      this.#lines += line
+      this.#bytes += Buffer.byteLength(line)
+    }
+  }
+
+  /** @returns {void} seals at most 64 KiB of pending exporter rows */
+  #flush() {
+    if (!this.#lines) return
+    this.#evidence.chunk('delivery-exports', Buffer.from(this.#lines))
+    this.#lines = ''
+    this.#bytes = 0
+  }
+
+  /** @returns {Promise<void>} initial poll before the first measured client connects */
+  async start() {
+    await this.poll()
+    this.check()
+    this.#timer = setInterval(() => {
+      this.poll()
+    }, 250)
+  }
+
+  /** @returns {void} throws the first retained poll failure @throws {Error} failed sink evidence */
+  check() {
+    if (this.#error) throw this.#error
+  }
+
+  /** @returns {Promise<void>} stops polling and joins the outstanding read on every exit path */
+  async stop() {
+    if (this.#timer) clearInterval(this.#timer)
+    this.#timer = null
+    if (this.#pending) await this.#pending
+  }
+
+  /** @returns {Promise<object[]>} final archived sink rows @throws {Error} any latched failure */
+  async finish() {
+    await this.stop()
+    await this.poll()
+    this.check()
+    this.#flush()
+    this.#evidence.sealChunks('delivery-exports')
+    return readChunks(
+      this.#evidence.directory,
+      this.#evidence.artifacts(),
+      'delivery-exports'
+    ).flatMap((chunk) =>
+      chunk
+        .toString('utf8')
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => JSON.parse(line))
+    )
+  }
 }
 
 /** Drives the public producer and an ordinary consumer through a prepared fixture and judges delivery by
@@ -2331,6 +2572,7 @@ class DeliveryWorkload {
   #closed = false
   #state
   #main = null
+  #exports = null
 
   /** @param {{root:string,config:object,control:number,evidence:EvidenceWriter,fixture:object,
    * hooks?:object}} options frozen arm root, delivery counts (`minimumGaps` may lower the gap
@@ -2558,7 +2800,7 @@ class DeliveryWorkload {
     const { partitions, handler, telemetry, interval = 1000 } = this.#config
     const fixture = this.#fixture
     const active = telemetry === 'active'
-    const probe = new TelemetryPushProbe({ evidence: this.#evidence })
+    const probe = new TelemetryPushProbe({ evidence: this.#evidence, now: () => fixture.now() })
     const expectedOptions = publicOptions({
       handler,
       active,
@@ -2573,22 +2815,33 @@ class DeliveryWorkload {
     const measuredOptions = {
       clientId: `${fixture.clientId}-measured`,
       ...expectedOptions.kafka,
-      ...(fixture.socketFactory ? { socketFactory: probe.wrap(fixture.socketFactory()) } : {}),
+      ...(fixture.socketFactory
+        ? { socketFactory: probe.wrap(fixture.socketFactory(), fixture.nodeFor) }
+        : {}),
     }
     let result
     const admin = helper.admin()
     this.#clients.push(admin)
     await admin.connect()
-    await fixture.provision(admin, async () => {
-      result = await this.#measure({
-        helper,
-        admin,
-        probe,
-        expectedOptions,
-        measuredOptions,
-        interval,
+    try {
+      await fixture.provision(admin, async () => {
+        if (active) {
+          assert(fixture.exports, 'active fixture must provide the retained sink reader')
+          this.#exports = new ExportArchive(this.#evidence, (options) => fixture.exports(options))
+          await this.#exports.start()
+        }
+        result = await this.#measure({
+          helper,
+          admin,
+          probe,
+          expectedOptions,
+          measuredOptions,
+          interval,
+        })
       })
-    })
+    } finally {
+      if (this.#exports) await this.#exports.stop()
+    }
     return result
   }
 
@@ -2641,18 +2894,14 @@ class DeliveryWorkload {
     )
     this.#state.total = total
     const measuredDone = this.#phase()
-    const pushesBefore = probe.records.filter((r) => r.kind === 'push').length
     const sendLedger = new Table(SEND_COLUMNS, messages)
     const startMs = now()
     await this.#produce((m) => producer.send(m), 'm', messages, sendLedger)
     await this.#within(measuredDone)
     const elapsedNs = Math.round((this.#state.lastDone - startMs) * 1e6)
-    if (active)
-      assert(
-        probe.records.filter((r) => r.kind === 'push').length > pushesBefore,
-        'no accepted push arrived during the measured window'
-      )
-    return this.#judge({ admin, helper, probe, sendLedger, baseOf, elapsedNs, size })
+    const window = deliveryWindow(sendLedger, this.#state.table)
+    if (this.#exports) this.#exports.check()
+    return this.#judge({ admin, helper, probe, sendLedger, baseOf, elapsedNs, size, window })
   }
 
   /** Waits (bounded) until two accepted subscriptions at the declared interval were observed.
@@ -2678,7 +2927,7 @@ class DeliveryWorkload {
    * @param {object} context ledgers and clients @returns {Promise<object>} scalar result
    * @throws {AssertionError} on any failed oracle
    */
-  async #judge({ admin, helper, probe, sendLedger, baseOf, elapsedNs, size }) {
+  async #judge({ admin, helper, probe, sendLedger, baseOf, elapsedNs, size, window }) {
     const { warmup, partitions, handler, telemetry } = this.#config
     const fixture = this.#fixture
     const { topic, groupId } = fixture
@@ -2698,11 +2947,13 @@ class DeliveryWorkload {
       state.next.map((offset, p) => [`p${p}`, String(offset)]).filter(([, o]) => o !== '0')
     )
     const records = probe.finish()
-    const exports = telemetry === 'active' && fixture.exports ? await fixture.exports() : []
+    if (this.#exports) await fixture.wait(250)
+    const exports = this.#exports ? await this.#exports.finish() : []
     telemetryEvidence(records, {
       active: telemetry === 'active',
       intervalMs: this.#config.interval ?? 1000,
       exports,
+      window,
     })
     const tables = { send: sendLedger, handler: state.table, callbacks: state.callbacks, durable }
     const meta = {
@@ -2714,10 +2965,7 @@ class DeliveryWorkload {
       finalCommits,
       expectedCommits,
       ends: ends.map(({ partition, offset }) => ({ partition, offset: String(offset) })),
-      exports: exports.map(({ clientInstanceId, pushIntervalMs }) => ({
-        clientInstanceId,
-        pushIntervalMs,
-      })),
+      window,
     }
     const result = deliveryResult(this.#config, tables, meta)
     validateDelivery(result, deliveryEvidence(this.#config, tables, meta))
@@ -2762,6 +3010,20 @@ class DeliveryWorkload {
   }
 }
 
+/** Derives the conservative measured Push window from actual send and callback-entry clocks.
+ * The window excludes setup/warmup and the final callback's completion; recorded metadata cannot
+ * widen it to borrow a warmup or shutdown Push during offline verification.
+ * @param {Table} send measured send ledger @param {Table} handler measured handler ledger
+ * @returns {{startMs:number,endMs:number}} independently reconstructible window
+ * @throws {AssertionError} for missing or nonfinite observed times
+ */
+const deliveryWindow = (send, handler) => {
+  const startMs = send.column('sendMs').reduce((min, value) => Math.min(min, value), Infinity)
+  const endMs = handler.column('entryMs').reduce((max, value) => Math.max(max, value), -Infinity)
+  assert(Number.isFinite(startMs) && Number.isFinite(endMs) && endMs >= startMs)
+  return { startMs, endMs }
+}
+
 /** @param {object} config delivery counts @param {object} tables send/handler/callbacks/durable ledgers
  * @param {object} meta offsets, commits and elapsed time @returns {object} the scalar result those ledgers imply
  */
@@ -2799,10 +3061,40 @@ const deliveryResult = (config, { send, handler, callbacks }, meta) => {
  */
 const deliveryEvidence = (config, { send, handler, callbacks, durable }, meta) => {
   const { partitions } = config
+  assert.equal(send.length, config.messages, 'delivery corpus is incomplete')
+  assert.equal(handler.length, config.messages)
+  assert.equal(durable.length, config.messages)
+  assert.equal(meta.warmup, config.warmup)
+  assert.equal(meta.partitions, partitions)
+  assert.equal(meta.handler, config.handler)
+  exactSet(
+    Object.keys(meta.baseOf),
+    Array.from({ length: partitions }, (_, p) => String(p))
+  )
+  assert(
+    Object.values(meta.baseOf).every((offset) => offset === 0),
+    'owned topic was not initially empty'
+  )
+  const countFor = (count, p) => Math.floor(count / partitions) + (p < count % partitions ? 1 : 0)
+  const expectedCommits = Object.fromEntries(
+    Array.from({ length: partitions }, (_, p) => [
+      `p${p}`,
+      String(meta.baseOf[p] + countFor(config.warmup, p) + countFor(config.messages, p)),
+    ])
+  )
+  assert.deepEqual(meta.expectedCommits, expectedCommits)
+  assert.deepEqual(meta.finalCommits, expectedCommits)
+  assert.deepEqual(
+    [...meta.ends].sort((a, b) => a.partition - b.partition),
+    Array.from({ length: partitions }, (_, p) => ({
+      partition: p,
+      offset: expectedCommits[`p${p}`],
+    }))
+  )
   const warmCount = (p) =>
     Math.floor(meta.warmup / partitions) + (p < meta.warmup % partitions ? 1 : 0)
   const id = (ordinal, partition, offset, hash) => `m-${ordinal}|${partition}|${offset}|${hash}`
-  const expected = Array.from({ length: send.length }, (_, i) => {
+  const expected = Array.from({ length: config.messages }, (_, i) => {
     assert.equal(send.get(i, 'ordinal'), i, 'send ledger lost its order')
     const p = i % partitions
     const offset = (meta.baseOf[p] ?? 0) + warmCount(p) + Math.floor(i / partitions)
@@ -2836,7 +3128,7 @@ const deliveryEvidence = (config, { send, handler, callbacks, durable }, meta) =
       .column('ordinal')
       .map((ordinal, row) => handler.get(row, 'entryMs') - sendMs.get(ordinal)),
     batchSizes: callbacks.column('size'),
-    expectedCommits: meta.expectedCommits,
+    expectedCommits,
     finalCommits: meta.finalCommits,
     minimumBatchGaps: config.minimumGaps ?? MINIMUM_GAPS.eachBatch,
     minimumMessageGaps: config.minimumGaps ?? MINIMUM_GAPS.eachMessage,
@@ -2983,6 +3275,7 @@ const verifyPayload = (result, declaration, read) => {
   assert.equal(result.discardedWorkloadWarmups, config.warmup)
   assert.equal(result.measuredObservations, config.snapshots)
   assert.deepEqual(result.codecAvailable, { none: true, gzip: true, zstd: meta.zstdSupported })
+  if (declaration.codecs) assert.deepEqual(result.codecAvailable, declaration.codecs)
   assert(config.codec !== 'zstd' || meta.zstdSupported, 'a required codec was unavailable')
   if (declaration.root)
     assert.equal(
@@ -3026,9 +3319,12 @@ const verifyPayload = (result, declaration, read) => {
   const signed = signedDelta(memory.before, memory.after)
   assert.deepEqual(memory.signed, signed)
   assert.equal(result.heapExternalDeltaBytes, Math.max(0, signed.sum))
+  assert.equal(memory.rssBaselineBytes, memory.before.rss)
   assert.equal(memory.maxRssBytes, memory.maxRssKiB * 1024)
   assert.equal(memory.rssDeltaBytes, rssDelta(memory.maxRssKiB, memory.rssBaselineBytes))
   assert.equal(result.rssDeltaBytes, memory.rssDeltaBytes)
+  assert(result.heapExternalDeltaBytes <= 8388608, 'payload heap/external ceiling exceeded')
+  assert(result.rssDeltaBytes <= 67108864, 'payload RSS ceiling exceeded')
   return {}
 }
 
@@ -3048,6 +3344,7 @@ const verifyDelivery = (result, declaration, read, chunks) => {
   const meta = readOwned(read, 'delivery-meta.json', declaration)
   assert.equal(result.handler, config.handler)
   assert.equal(result.telemetry, config.telemetry)
+  assert.deepEqual(meta.window, deliveryWindow(tables.send, tables.handler))
   const derived = deliveryResult(config, tables, meta)
   for (const key of Object.keys(derived)) assert.deepEqual(result[key], derived[key], key)
   validateDelivery(derived, deliveryEvidence(config, tables, meta))
@@ -3058,7 +3355,17 @@ const verifyDelivery = (result, declaration, read, chunks) => {
   telemetryEvidence(records, {
     active: config.telemetry === 'active',
     intervalMs: config.interval,
-    exports: meta.exports ?? [],
+    exports:
+      config.telemetry === 'active'
+        ? chunks('delivery-exports').flatMap((chunk) =>
+            chunk
+              .toString('utf8')
+              .split('\n')
+              .filter(Boolean)
+              .map((line) => JSON.parse(line))
+          )
+        : [],
+    window: meta.window,
   })
   return {}
 }
@@ -3255,6 +3562,110 @@ const childCount = (jobName) => {
 /** @param {string} jobName declared job @returns {number} minimum manifest budget in seconds */
 const minimumBudget = (jobName) => childCount(jobName) * CHILD_SECONDS + RESERVE_SECONDS
 
+/** Verifies a frozen input file without following a substituted symbolic link.
+ * @param {{path:string,sha256:string}} asset manifest file identity @returns {Buffer} checked bytes
+ * @throws {AssertionError|Error} for a missing file, link or digest mismatch
+ */
+const frozenAsset = (asset) => {
+  assert(path.isAbsolute(asset.path) && /^[a-f0-9]{64}$/.test(asset.sha256))
+  const fd = fs.openSync(asset.path, fs.constants.O_RDONLY | NOFOLLOW)
+  try {
+    assert(fs.fstatSync(fd).isFile())
+    const bytes = fs.readFileSync(fd)
+    assert.equal(sha256(bytes), asset.sha256, `frozen asset differs: ${asset.path}`)
+    return bytes
+  } finally {
+    fs.closeSync(fd)
+  }
+}
+
+/** Binds a frozen source snapshot to a complete sorted file catalogue and its archive receipt.
+ * The source receipt is {tree, files:[{path,sha256}], tarballSha256}; tree is the catalogue digest.
+ * Driver/session staging lives outside the source snapshot; .git and node_modules are excluded.
+ * @param {object} arm root/tree/source/tarball declaration @param {string} consumeSha256 inherited driver digest
+ * @returns {void}
+ * @throws {AssertionError|Error} for changed bytes, unlisted source, links or archive identity drift
+ */
+const frozenSource = (arm, consumeSha256) => {
+  const source = JSON.parse(frozenAsset(arm.source))
+  frozenAsset(arm.tarball)
+  assert.equal(source.tarballSha256, arm.tarball.sha256)
+  assert.equal(source.tree, arm.tree)
+  assert.equal(digest(source.files), arm.tree)
+  const files = []
+  const visit = (relative) => {
+    const directory = path.join(arm.root, relative)
+    assert(fs.lstatSync(directory).isDirectory() && !fs.lstatSync(directory).isSymbolicLink())
+    for (const name of fs.readdirSync(directory).sort()) {
+      if (name === '.git' || name === 'node_modules') continue
+      const file = path.join(relative, name)
+      const absolute = path.join(arm.root, file)
+      const stat = fs.lstatSync(absolute)
+      assert(!stat.isSymbolicLink(), 'frozen source cannot contain links')
+      if (stat.isDirectory()) visit(file)
+      else {
+        assert(stat.isFile())
+        files.push({ path: file, sha256: sha256(fs.readFileSync(absolute)) })
+      }
+    }
+  }
+  visit('')
+  assert(files.length > 0)
+  assert.deepEqual(files, source.files, 'frozen source catalogue differs')
+  assert.equal(
+    sha256(fs.readFileSync(path.join(arm.root, 'scripts/benchmarks/consumeThroughput.js'))),
+    consumeSha256,
+    'frozen root has a different inherited consume driver'
+  )
+}
+
+/** Binds this loaded supervisor/session, unchanged consume driver, runtime and source roots before work.
+ * Candidate arms share one snapshot. Previous requires a separately hashed accepted-9E receipt with
+ * {milestone:'9E',status:'accepted',tree,sourceSha256,tarballSha256} matching its frozen inputs.
+ * @param {object} manifest complete session declaration @returns {void}
+ * @throws {AssertionError|Error} when any executable, runtime or frozen identity cannot be verified
+ */
+const verifyProvenance = (manifest) => {
+  for (const name of ['driver', 'session', 'consume']) {
+    frozenAsset(manifest[name])
+    assert.equal(manifest[name].sha256, LOADED_SOURCES[name], `${name} differs from loaded bytes`)
+  }
+  assert.equal(fs.realpathSync(manifest.driver.path), fs.realpathSync(__filename))
+  assert.equal(
+    fs.realpathSync(manifest.session.path),
+    fs.realpathSync(require.resolve('./session'))
+  )
+  assert.equal(path.dirname(manifest.driver.path), path.dirname(manifest.session.path))
+  assert.equal(
+    manifest.consume.sha256,
+    sha256(fs.readFileSync(path.join(__dirname, 'consumeThroughput.js')))
+  )
+  frozenAsset({ path: manifest.node.binary, sha256: manifest.node.sha256 })
+  assert.equal(fs.realpathSync(manifest.node.binary), fs.realpathSync(process.execPath))
+  for (const [key, actual] of Object.entries({
+    version: process.version,
+    platform: process.platform,
+    arch: process.arch,
+  }))
+    assert.equal(manifest.node[key], actual, `runtime ${key} differs`)
+  const candidate = manifest.arms.filter(({ label }) => label !== 'previous')
+  const identity = ({ root, tree, source, tarball }) => ({ root, tree, source, tarball })
+  for (const arm of candidate) assert.deepEqual(identity(arm), identity(candidate[0]))
+  const roots = new Map(manifest.arms.map((arm) => [arm.root, arm]))
+  for (const arm of roots.values()) frozenSource(arm, manifest.consume.sha256)
+  const previous = manifest.arms.find(({ label }) => label === 'previous')
+  if (previous) {
+    assert.notEqual(previous.root, candidate[0].root)
+    assert.notEqual(previous.tree, candidate[0].tree)
+    const accepted = JSON.parse(frozenAsset(manifest.acceptedBaseline))
+    assert.equal(accepted.milestone, '9E')
+    assert.equal(accepted.status, 'accepted')
+    assert.equal(accepted.tree, previous.tree)
+    assert.equal(accepted.sourceSha256, previous.source.sha256)
+    assert.equal(accepted.tarballSha256, previous.tarball.sha256)
+  }
+}
+
 /** Rejects any manifest that is not exactly a declared, balanced, complete session.
  * @param {object} manifest immutable session declaration @param {Function} [parse] argv parser (tests only)
  * @returns {void} @throws {AssertionError|UsageError} for a changed arm, label, reference, run count, control,
@@ -3287,9 +3698,20 @@ const validateManifest = (manifest, parse = parseWorkerArgs) => {
     if (job.telemetry[arm.label] !== undefined)
       assert.equal(parsed.config.telemetry, job.telemetry[arm.label])
     assert.equal(arm.configSha256, digest({ mode: parsed.mode, argv: arm.argv }))
-    configs.push(parsed.config)
+    const { telemetry, ...common } = parsed.config
+    configs.push(common)
   }
   for (const config of configs.slice(1)) assert.deepEqual(config, configs[0])
+  assert.equal(manifest.codecs?.none, true)
+  assert.equal(manifest.codecs?.gzip, true)
+  assert.equal(typeof manifest.codecs?.zstd, 'boolean')
+  if (manifest.optionalCodec !== undefined) {
+    assert.equal(manifest.optionalCodec, 'zstd')
+    assert.equal(job.mode, 'payload')
+    assert(configs.every((config) => config.codec === 'zstd'))
+    assert.equal(manifest.codecs.zstd, false)
+  }
+  verifyProvenance(manifest)
 }
 
 /** @param {number} value finite median @returns {number} the same value @throws {AssertionError} unless positive */
@@ -3349,6 +3771,17 @@ const evaluate = (jobName, declared, rows) => {
     ...(job.mode === 'payload' ? ['fittingPasses', 'heapExternalDeltaBytes', 'rssDeltaBytes'] : []),
   ]
   const failures = []
+  if (job.mode === 'payload')
+    for (const row of rows) {
+      const fields = ['heapExternalDeltaBytes', 'rssDeltaBytes'].filter(
+        (key) =>
+          !Number.isFinite(row.result[key]) ||
+          row.result[key] < 0 ||
+          row.result[key] > (key === 'rssDeltaBytes' ? 67108864 : 8388608)
+      )
+      if (fields.length)
+        failures.push({ arm: row.label, round: row.round, fields, expected: false })
+    }
   const judge = (arm, fields, expect) => {
     if (expect) {
       assert(
@@ -3437,7 +3870,9 @@ class TelemetrySession {
     return path.join(this.#directory, name)
   }
 
-  /** @param {string} runId observation id @param {object} arm manifest arm @returns {object} declaration */
+  /** @param {string} runId observation id @param {object} arm manifest arm
+   * @param {string} manifestSha256 frozen manifest digest @returns {object} declaration
+   */
   #declaration(runId, arm, manifestSha256) {
     const parsed = this.#io.parse(arm.argv.map(String))
     return {
@@ -3450,6 +3885,7 @@ class TelemetrySession {
       control: parsed.control,
       config: parsed.config,
       root: arm.root,
+      codecs: this.#manifest.codecs,
     }
   }
 
@@ -3495,8 +3931,11 @@ class TelemetrySession {
       mode: 0o600,
     })
     if (child.error) throw new Error(`${label} worker did not finish: ${child.error.message}`)
-    if (child.status === 4 && this.#manifest.optionalCodec)
-      throw new CodecUnavailableError(`${label} reported an unavailable codec`)
+    if (child.status === 4) {
+      if (this.#manifest.optionalCodec === 'zstd' && this.#manifest.codecs.zstd === false)
+        throw new CodecUnavailableError(`${label} reported the declared unavailable ZSTD codec`)
+      throw new Error(`${label} required codec prerequisite failed`)
+    }
     if (child.status !== 0 || child.signal)
       throw new Error(`${label} failed (${child.status ?? child.signal}): ${child.stderr}`)
     const lines = child.stdout.trim().split('\n')
@@ -3523,6 +3962,7 @@ class TelemetrySession {
    * @throws {Error|AggregateError} child, verification or write failure; cleanup errors are kept beside it
    */
   run() {
+    verifyProvenance(this.#manifest)
     makeExclusiveDirectory(this.#directory)
     for (const name of ['workers', 'envelopes', 'stderr']) makeExclusiveDirectory(this.#file(name))
     const manifestBytes = Buffer.from(JSON.stringify(this.#manifest))
@@ -3640,6 +4080,7 @@ class TelemetrySession {
    * manifest, driver, configuration, tree or control, a reused worker, or a frozen value mismatch
    */
   verify(frozen = {}) {
+    verifyProvenance(this.#manifest)
     const manifestBytes = fs.readFileSync(this.#file('manifest.json'))
     const manifestSha256 = sha256(manifestBytes)
     const saved = JSON.parse(manifestBytes.toString('utf8'))
@@ -3693,6 +4134,7 @@ const liveFixture = (root, spec, runId, load = require) => {
   const topic = `tbench-${runId}`
   const push = fs.existsSync(path.join(root, 'src/telemetry/metrics.js'))
   const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+  const nodes = new Map()
   return {
     topic,
     clientId,
@@ -3704,23 +4146,33 @@ const liveFixture = (root, spec, runId, load = require) => {
     kafka: (options) =>
       new Kafka({ brokers: spec.brokers, logLevel: logLevel.NOTHING, ...options }),
     socketFactory: () => load(path.join(root, 'src/network/socketFactory'))(),
-    exports: () => load(path.join(root, 'testHelpers/telemetryFixtures')).readExports(),
+    exports: (options) =>
+      load(path.join(root, 'testHelpers/telemetryFixtures')).readExports(options),
+    nodeFor: ({ host, port }) => {
+      const node = nodes.get(`${host}:${port}`)
+      assert(node, 'telemetry socket has no broker-node identity')
+      return node
+    },
     provision: async (admin, work) => {
-      await admin.createTopics({
-        waitForLeaders: true,
-        topics: [
-          {
-            topic,
-            numPartitions: 6,
-            replicationFactor: 3,
-            configEntries: [{ name: 'min.insync.replicas', value: '2' }],
-          },
-        ],
-      })
-      const created = await admin.fetchTopicMetadata({ topics: [topic] })
-      assert.equal(created.topics[0].partitions.length, 6)
+      assert(!(await admin.listTopics()).includes(topic), 'owned topic must be initially absent')
       let primary = null
       try {
+        await admin.createTopics({
+          waitForLeaders: true,
+          topics: [
+            {
+              topic,
+              numPartitions: 6,
+              replicationFactor: 3,
+              configEntries: [{ name: 'min.insync.replicas', value: '2' }],
+            },
+          ],
+        })
+        const created = await admin.fetchTopicMetadata({ topics: [topic] })
+        assert.equal(created.topics[0].partitions.length, 6)
+        const topology = await admin.describeCluster()
+        for (const broker of topology.brokers)
+          nodes.set(`${broker.host}:${broker.port}`, String(broker.nodeId))
         if (spec.active) {
           const { withTelemetryResource } = load(path.join(root, 'testHelpers/telemetryFixtures'))
           const entries = {
@@ -3757,6 +4209,7 @@ const runWorker = async (parsed, argv, io, env) => {
   const manifestPath = env.TELEMETRY_BENCH_MANIFEST
   const manifest = manifestPath ? JSON.parse(fs.readFileSync(manifestPath, 'utf8')) : null
   const manifestSha256 = manifestPath ? sha256(fs.readFileSync(manifestPath)) : sha256('manual')
+  if (manifest) validateManifest(manifest)
   const root = env.TELEMETRY_BENCH_ROOT ?? path.resolve(__dirname, '../..')
   const runId = env.TELEMETRY_BENCH_RUN ?? `manual-${process.pid}`
   const output =
@@ -3801,7 +4254,13 @@ const runWorker = async (parsed, argv, io, env) => {
   }
   if (errors.length) {
     for (const error of errors) io.error(error.stack ?? String(error))
-    return errors.some((error) => error instanceof CodecUnavailableError) ? 4 : 1
+    return manifest?.optionalCodec === 'zstd' &&
+      manifest.codecs.zstd === false &&
+      mode === 'payload' &&
+      config.codec === 'zstd' &&
+      errors.some((error) => error instanceof CodecUnavailableError)
+      ? 4
+      : 1
   }
   io.log(
     JSON.stringify({
@@ -3821,7 +4280,7 @@ const runWorker = async (parsed, argv, io, env) => {
   return 0
 }
 
-/** The command line. 0 pass, 1 correctness/gate/child error, 2 usage, 3 void, 4 required codec unavailable.
+/** The command line. 0 pass, 1 correctness/gate/child error, 2 usage, 3 void, 4 declared optional ZSTD unavailable.
  * It sets nothing global: the caller assigns `process.exitCode` after this settles.
  * @param {string[]} argv `process.argv.slice(2)`
  * @param {{log:Function,error:Function,env?:object}} [io] output functions (tests may inject `env` and more)
@@ -3838,13 +4297,12 @@ async function main(argv, io = console) {
   }
   try {
     if (parsed.kind === 'worker') return await runWorker(parsed, argv, io, io.env ?? process.env)
-    const manifest = JSON.parse(fs.readFileSync(parsed.path, 'utf8'))
+    const manifestPath =
+      parsed.kind === 'session' ? parsed.path : path.join(parsed.path, 'manifest.json')
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
     const directory = parsed.kind === 'session' ? manifest.directory : parsed.path
     const session = new TelemetrySession({
-      manifest:
-        parsed.kind === 'session'
-          ? manifest
-          : JSON.parse(fs.readFileSync(path.join(directory, 'manifest.json'), 'utf8')),
+      manifest,
       directory,
       io,
     })
@@ -3866,6 +4324,7 @@ async function main(argv, io = console) {
 
 module.exports = {
   JOBS,
+  liveFixture,
   expectedSample,
   readChunks,
   deliveryEvidence,
@@ -3918,6 +4377,7 @@ module.exports = {
   publicOptions,
   assertPublicOptions,
   TelemetryPushProbe,
+  ExportArchive,
   telemetryEvidence,
   makeValue,
   tailIntact,
