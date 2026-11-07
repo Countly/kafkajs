@@ -110,6 +110,8 @@ The client telemetry checks use public producer, consumer, admin and share-consu
 
 Observer, serialization, compression and logging failures are checked against the original foreground result or rejection and invocation count. Awaited rebalance hooks keep their documented control-flow behavior. These broker-free schedules complement the configured telemetry, delivery and cleanup tests; they do not prove broker export or native resource bounds.
 
+The mandatory O17–O19 meter/span/context/getter/logger containment matrix runs in `otel/test/failureContainment.test.js` through `npm run test:otel` and the CI `otel` job. The runner installs the packed root candidate and optional dependencies before executing the matrix; a missing or nonidentical candidate fails the lane. The plain unit lane runs the remaining telemetry schedules without requiring an OTel installation.
+
 ## Integration tests
 
 Most of the test suite talks to a real Kafka cluster. `npm test` runs `npm run lint`, `npm run compat:check` and `npm run protocol:check`, boots the cluster, runs everything, and tears the cluster down again — it's a convenient local shortcut, but it is not what CI runs.
