@@ -755,6 +755,8 @@ it.each([true, false])(
       client.suspend()
       await h.pool.destroy({ drainTimeout: 0 })
       await pending
+      // Fake socket destruction defers its close event with queueMicrotask.
+      jest.runAllTicks()
       const timers = jest.getTimerCount()
       jest.useRealTimers()
       expect(timers).toBe(0)
