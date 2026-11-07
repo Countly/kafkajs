@@ -819,15 +819,23 @@ module.exports = class Connection {
    * Shares one bounded SASL episode on this socket; never adopts a replacement token.
    * Holds idle preparation once per episode, including token-provider work. An old
    * episode cannot decrement preparation on the replacement connection.
-   * @param {{ attempt?: SetupAttempt, requestGuard?: Function|null }} [options] original setup or request authority
+   * @param {{ attempt?: SetupAttempt, requestGuard?: Function|null }} [options] original setup;
+   * request authority applies only to the private telemetry authentication owner
    * @returns {Promise<void>}
    * @throws {KafkaJSConnectionError} when the whole SASL phase expires
    */
   authenticate({ attempt = this.setupAttempt, requestGuard = null } = {}) {
     const operation = currentDeadline()
     if (operation)
-      return operation.wait(() => sharedSetup(() => this.authenticate({ attempt, requestGuard })))
+      return operation.wait(() =>
+        sharedSetup(() =>
+          this.authenticationOwner
+            ? this.authenticate({ attempt, requestGuard })
+            : this.authenticate({ attempt })
+        )
+      )
     if (!this.sasl || this.isAuthenticated()) return Promise.resolve()
+    requestGuard = this.authenticationOwner ? requestGuard : null
     const refusal = requestGuard && requestGuard()
     if (refusal) return Promise.reject(refusal)
     if (this.authEpisode) return this.authEpisode.promise
@@ -858,14 +866,12 @@ module.exports = class Connection {
     episode.promise = (async () => {
       try {
         const authenticator = new SASLAuthenticator(this, this.logger, this.versions, guard)
-        const authenticate = () => authenticator.authenticate()
-        const underlying = this.authenticationOwner
-          ? this.authenticationOwner.run(authenticate, guard)
-          : authenticate()
-        await budget.guard(underlying, {
-          phase: 'SASL',
-          cap: this.authenticationTimeout,
-        })
+        await budget.guard(
+          this.authenticationOwner
+            ? this.authenticationOwner.run(() => authenticator.authenticate(), guard)
+            : authenticator.authenticate(),
+          { phase: 'SASL', cap: this.authenticationTimeout }
+        )
         const refusal = guard()
         if (refusal) throw refusal
         this.authenticatedAt = process.hrtime()
@@ -1074,17 +1080,27 @@ module.exports = class Connection {
    * @param {{ request: object, expectResponse: boolean, guard: ((frameLength?: number) => Error|null)|null, establishedOnly: boolean }} options
    * @returns {Promise<{ request: object, expectResponse: boolean, correlationId: number,
    *   requestPayload: object }>}
-   * @throws {Error} the error the guard returns, once the request is authenticated and encoded
+   * @throws {Error} guard refusal after encoding; private requests also check before preparation
+   * and after authentication so obsolete private work cannot enter the encoder
    */
   async [PRIVATE.PREPARE]({ request, expectResponse, guard, establishedOnly }) {
     currentDeadline()?.check()
+    if (this.authenticationOwner && guard) {
+      const refusal = guard()
+      if (refusal) throw refusal
+    }
     if (establishedOnly && this.sasl && (!this.isAuthenticated() || this.authEpisode))
       throw new KafkaJSConnectionError('Telemetry final requires established authentication')
     if (!this.isAuthenticated() && isAuthenticatedRequest(request)) {
-      await this[PRIVATE.AUTHENTICATE]({ requestGuard: guard })
+      if (this.authenticationOwner) await this[PRIVATE.AUTHENTICATE]({ requestGuard: guard })
+      else await this[PRIVATE.AUTHENTICATE]()
     }
 
     currentDeadline()?.check()
+    if (this.authenticationOwner && guard) {
+      const refusal = guard()
+      if (refusal) throw refusal
+    }
     this.failIfNotConnected()
 
     const { clientId } = this
@@ -1154,8 +1170,8 @@ module.exports = class Connection {
           frameLength: requestPayload.buffer.length,
           telemetrySink,
           telemetrySlot,
+          onWrite,
           sendRequest: () => {
-            if (onWrite) onWrite()
             this.socket.write(requestPayload.buffer, 'binary')
           },
         })

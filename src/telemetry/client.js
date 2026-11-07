@@ -252,7 +252,8 @@ module.exports = class ClientTelemetry {
           this.warnedSubscription !== op.subscription.revision
         ) {
           this.warnedSubscription = op.subscription.revision
-          this.warn('Telemetry points omitted')
+          // Application logging must run after the synchronous commit/write section.
+          Promise.resolve().then(() => this.warn('Telemetry points omitted'))
         }
       }
       return op.handle.push(
@@ -295,8 +296,10 @@ module.exports = class ClientTelemetry {
       }
     } catch (error) {
       if (this.owns(op)) {
-        if (this.clock.now() < op.deadline && !current()) return
+        const expired = op.expired || this.clock.now() >= op.deadline
+        if (!expired && !current()) return
         if (
+          !expired &&
           op.resource &&
           (!op.resource.isCurrent() ||
             (op.snapshot && !op.written && !this.metrics.isCurrent(op.snapshot)))
@@ -304,10 +307,7 @@ module.exports = class ClientTelemetry {
           this.schedule('push', this.interval())
           return
         }
-        const failure =
-          this.clock.now() >= op.deadline
-            ? Object.assign(this.error('timeout'), { retriable: true })
-            : error
+        const failure = expired ? Object.assign(this.error('timeout'), { retriable: true }) : error
         this.handleError(failure, action, op)
       }
     } finally {
@@ -426,7 +426,7 @@ module.exports = class ClientTelemetry {
         seen.add(error)
         const field = (name) => Object.getOwnPropertyDescriptor(error, name)?.value
         const code = field('code')
-        if (result.code === undefined && code !== undefined) result.code = code
+        if (result.code === undefined && typeof code === 'number') result.code = code
         result.retriable = result.retriable || field('retriable') === true
         if (depth === 0) result.clientSideThrottleTime = field('clientSideThrottleTime') ?? 0
         error = field('cause')
@@ -443,6 +443,12 @@ module.exports = class ClientTelemetry {
    * @param {object} op original request identity @returns {void} finite local recovery
    */
   handleError(error, action, op) {
+    if (op.expired || this.clock.now() >= op.deadline) {
+      this.retire(op)
+      this.state = 'BACKOFF'
+      this.schedule('get', this.backoff())
+      return
+    }
     const failure = this.classify(error)
     this.throttle(failure)
     const code = failure.code

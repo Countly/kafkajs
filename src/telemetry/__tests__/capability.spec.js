@@ -1,5 +1,13 @@
 const ClientTelemetry = require('../client')
 const TelemetryMetrics = require('../metrics')
+const ConnectionPool = require('../../network/connectionPool')
+const Encoder = require('../../protocol/encoder')
+const {
+  newLogger,
+  createFakeSocketFactory,
+  readRequestHeader,
+  respondWithFrame,
+} = require('testHelpers')
 const ID = '01020304-0506-0708-090a-0b0c0d0e0f10'
 const subscription = (fields = {}) => ({
   clientInstanceId: ID,
@@ -96,7 +104,7 @@ const setup = (options = {}) => {
   }
 }
 beforeEach(() => {
-  jest.useFakeTimers({ now: 0 })
+  jest.useFakeTimers({ now: 0, doNotFake: ['setImmediate', 'nextTick'] })
 })
 afterEach(() => {
   jest.useRealTimers()
@@ -165,7 +173,7 @@ describe('both negotiated telemetry APIs and runtime handshake', () => {
     expect(h.events.filter((e) => e.api === 72)).toEqual([])
     h.client.suspend()
   })
-  it('contains a hostile logger and preserves foreground identities', async () => {
+  it('preserves foreground Connection invocation and result/error identities under a throwing telemetry logger', async () => {
     const value = {}
     const sentinel = new Error('foreground')
     const h = setup({
@@ -175,15 +183,56 @@ describe('both negotiated telemetry APIs and runtime handshake', () => {
         },
       },
     })
-    const success = Promise.resolve(value)
-    const rejection = Promise.reject(sentinel)
-    const observed = rejection.catch((e) => e)
-    h.gets.push(() => Promise.reject(failure(42)))
-    h.client.resume()
-    await jest.advanceTimersByTimeAsync(0)
-    expect(h.client.state).toBe('STOPPED')
-    expect(await success).toBe(value)
-    expect(await observed).toBe(sentinel)
-    expect(jest.getTimerCount()).toBe(0)
+    const fake = createFakeSocketFactory()
+    const pool = new ConnectionPool({
+      host: 'a',
+      port: 9092,
+      logger: newLogger(),
+      clientId: 'foreground',
+      socketFactory: fake.factory,
+      connectionTimeout: 1000,
+      requestTimeout: 5000,
+      enforceRequestTimeout: false,
+      maxInFlightRequests: 2,
+      connectionsMaxIdle: 0,
+      drainTimeout: 0,
+    })
+    const connection = await pool.getConnection(0)
+    const encode = jest.fn(async () => new Encoder())
+    const success = jest.fn(() => value)
+    const reject = jest.fn(() => {
+      throw sentinel
+    })
+    const invoke = (parse) =>
+      connection
+        .send({
+          request: { apiKey: 3, apiVersion: 0, apiName: 'Metadata', encode },
+          response: { decode: async (raw) => raw, parse },
+        })
+        .catch((error) => error)
+    const a = invoke(success)
+    const b = invoke(reject)
+    try {
+      await new Promise((resolve) => setImmediate(resolve))
+      expect(fake.state.writes).toHaveLength(2)
+      h.gets.push(() => Promise.reject(failure(42)))
+      h.client.resume()
+      await jest.advanceTimersByTimeAsync(0)
+      expect(h.client.state).toBe('STOPPED')
+      expect(connection.isConnected()).toBe(true)
+      for (const frame of fake.state.writes)
+        respondWithFrame(fake.state, readRequestHeader(frame).correlationId, 0, Buffer.alloc(0))
+      expect(await a).toBe(value)
+      expect(await b).toBe(sentinel)
+      expect(encode).toHaveBeenCalledTimes(2)
+      expect(success).toHaveBeenCalledTimes(1)
+      expect(reject).toHaveBeenCalledTimes(1)
+      expect(connection.requestQueue.isIdle()).toBe(true)
+      expect(jest.getTimerCount()).toBe(0)
+    } finally {
+      h.client.suspend()
+      await pool.destroy({ drainTimeout: 0 })
+      await Promise.all([a, b])
+    }
   })
 })

@@ -213,12 +213,22 @@ describe('subscription pacing and selection', () => {
     h.client.suspend()
   })
   it('throttles through stepped timers without timer overflow', async () => {
-    const h = setup()
+    const h = setup({ random: 1 })
     h.gets.push(subscription({ pushIntervalMs: 2147483647, clientSideThrottleTime: 2147483647 }))
     h.client.resume()
     await jest.advanceTimersByTimeAsync(0)
     expect(h.events).toHaveLength(1)
     expect(h.client.throttleUntil).toBe(2147483647)
+    await jest.advanceTimersByTimeAsync(2147483647)
+    expect(h.events.map((event) => event.api)).toEqual([71])
+    await jest.advanceTimersByTimeAsync(1073741823)
+    expect(h.events.map((event) => event.api)).toEqual([71])
+    await jest.advanceTimersByTimeAsync(1)
+    expect(h.events.map((event) => event.api)).toEqual([71, 72])
+    await jest.advanceTimersByTimeAsync(2147483646)
+    expect(h.events.map((event) => event.api)).toEqual([71, 72])
+    await jest.advanceTimersByTimeAsync(1)
+    expect(h.events.map((event) => event.api)).toEqual([71, 72, 72])
     h.client.suspend()
     expect(jest.getTimerCount()).toBe(0)
   })
@@ -326,27 +336,22 @@ describe('delayed timer and deadline delivery', () => {
     h.client.suspend()
   })
 
-  it.each(
-    ['connect', 'authentication', 'encode', 'dispatch', 'write'].flatMap((phase) => [
-      [phase, true],
-      [phase, false],
-    ])
-  )(
-    'delayed watchdog delivery cannot extend setup or transmission authority: %s, enforcement %s',
-    async (phase, enforce) => {
-      const h = setup({ config: { enforceRequestTimeout: enforce } })
+  it.each(['before-allocation', 'after-allocation', 'payload', 'pre-commit', 'commit'])(
+    'retires expired machine work with delayed watchdog delivery at %s',
+    async (phase) => {
+      const h = setup()
       const written = jest.spyOn(h.metrics, 'written')
       let release
       const held = new Promise((resolve) => {
         release = resolve
       })
-      const startup = phase === 'connect' || phase === 'authentication'
+      const startup = phase === 'before-allocation' || phase === 'after-allocation'
       if (startup) {
         const open = h.transport.open
         h.transport.open = jest.fn(async (candidate, authority) => {
-          if (phase === 'connect') await held
+          if (phase === 'before-allocation') await held
           const handle = await open(candidate, authority)
-          if (phase === 'authentication') await held
+          if (phase === 'after-allocation') await held
           return handle
         })
       }
@@ -355,7 +360,7 @@ describe('delayed timer and deadline delivery', () => {
       const before = h.client.subscription
       if (!startup) {
         expect(before).not.toBeNull()
-        if (phase === 'encode')
+        if (phase === 'payload')
           h.client.payload.buildPayload = async () => {
             await held
             return {
@@ -367,10 +372,10 @@ describe('delayed timer and deadline delivery', () => {
           }
         else
           h.handles[0].push = jest.fn(async (payload, authority) => {
-            if (phase === 'dispatch') await held
+            if (phase === 'pre-commit') await held
             const refusal = authority.guard()
             if (refusal) throw refusal
-            if (phase === 'write') await held
+            if (phase === 'commit') await held
             authority.onWrite()
             h.events.push({ api: 72, ...payload })
             return { errorCode: 0 }
@@ -386,7 +391,7 @@ describe('delayed timer and deadline delivery', () => {
       expect(h.client.state).toBe('BACKOFF')
       expect(h.transport.open).toHaveBeenCalledTimes(1)
       expect(h.handles).toHaveLength(1)
-      expect(h.handles[0].retired).toBe(phase !== 'encode')
+      expect(h.handles[0].retired).toBe(true)
       expect(h.client.subscription).toBe(before)
       if (startup) {
         expect(h.events).toEqual([])
@@ -397,3 +402,39 @@ describe('delayed timer and deadline delivery', () => {
     }
   )
 })
+
+it.each(['resolve', 'reject'].flatMap((outcome) => [false, true].map((stale) => [outcome, stale])))(
+  'retires a payload transport after late %s with stale resources=%s before watchdog delivery',
+  async (outcome, stale) => {
+    let current = true
+    const h = setup({ config: { resources: () => ({ values: [], isCurrent: () => current }) } })
+    h.client.resume()
+    await jest.advanceTimersByTimeAsync(0)
+    let release
+    h.client.payload.buildPayload = () =>
+      new Promise((resolve, reject) => {
+        release = () =>
+          outcome === 'reject' ? reject(new Error('late codec failure')) : resolve(null)
+      })
+    await jest.advanceTimersByTimeAsync(1000)
+    const revision = h.client.transportRevision
+    const op = h.client.running
+    current = !stale
+    jest.setSystemTime(31001)
+    release()
+    await jest.advanceTimersByTimeAsync(0)
+    expect(h.handles[0].retired).toBe(true)
+    expect(h.client.handle).toBeNull()
+    expect(h.client.transportRevision > revision).toBe(true)
+    expect(h.client.state).toBe('BACKOFF')
+    expect(op.abandoned).toBe(true)
+    expect(h.events.map((event) => event.api)).toEqual([71])
+    expect(h.client.watchdog).toBeNull()
+    current = true
+    await jest.advanceTimersByTimeAsync(1000)
+    expect(h.handles).toHaveLength(2)
+    expect(h.events.at(-1)).toMatchObject({ api: 71, clientInstanceId: ID })
+    h.client.suspend()
+    expect(jest.getTimerCount()).toBe(0)
+  }
+)

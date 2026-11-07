@@ -1,5 +1,10 @@
 const ClientTelemetry = require('../client')
 const TelemetryMetrics = require('../metrics')
+const {
+  KafkaJSConnectionError,
+  KafkaJSError,
+  KafkaJSNumberOfRetriesExceeded,
+} = require('../../errors')
 const ID = '01020304-0506-0708-090a-0b0c0d0e0f10'
 const subscription = (fields = {}) => ({
   clientInstanceId: ID,
@@ -170,14 +175,14 @@ describe('bounded numeric telemetry error recovery', () => {
     expect(h.events.filter((e) => e.api === 71)).toHaveLength(2)
     h.client.suspend()
   })
-  it('caps every backoff after jitter and resets only on push or empty poll', () => {
+  it('caps the exponential backoff sequence after jitter', () => {
     const h = setup({ random: 1 })
     expect(Array.from({ length: 8 }, () => h.client.backoff())).toEqual([
       1200, 2400, 4800, 9600, 19200, 30000, 30000, 30000,
     ])
   })
-  it('expires a held Get at the local budget even when foreground enforcement is off', async () => {
-    const h = setup({ config: { enforceRequestTimeout: false } })
+  it('retires a held Get at the machine watchdog deadline', async () => {
+    const h = setup()
     let release
     h.gets.push(
       () =>
@@ -205,6 +210,7 @@ describe('bounded numeric telemetry error recovery', () => {
     await jest.advanceTimersByTimeAsync(1000)
     expect(h.client.state).toBe('BACKOFF')
     expect(h.events.filter((e) => e.api === 72)).toHaveLength(0)
+    expect(h.handles[0].retired).toBe(false)
     h.client.suspend()
   })
 })
@@ -519,3 +525,73 @@ it.each([0, 20, 1000, 5000])('bounds primitive close with remaining budget %i', 
   await jest.advanceTimersByTimeAsync(0)
   expect(jest.getTimerCount()).toBe(0)
 })
+
+it.each(
+  ['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT'].flatMap((code) =>
+    ['direct', 'wrapped', 'exhausted'].map((wrapper) => [code, wrapper])
+  )
+)('retries %s connection failure with retained UUID through %s error', async (code, wrapper) => {
+  const h = setup()
+  const transportError = new KafkaJSConnectionError('socket failure', { broker: 'a:9092', code })
+  const error =
+    wrapper === 'direct'
+      ? transportError
+      : wrapper === 'wrapped'
+        ? new KafkaJSError(transportError, { cause: transportError })
+        : new KafkaJSNumberOfRetriesExceeded(transportError, { retryCount: 1, retryTime: 0 })
+  h.pushes.push(() => Promise.reject(error))
+  h.client.resume()
+  await jest.advanceTimersByTimeAsync(0)
+  await jest.advanceTimersByTimeAsync(1000)
+  expect(h.client.state).toBe('BACKOFF')
+  expect(h.handles[0].retired).toBe(true)
+  expect(h.client.uuid).toBe(ID)
+  await jest.advanceTimersByTimeAsync(999)
+  expect(h.events.map((event) => event.api)).toEqual([71, 72])
+  await jest.advanceTimersByTimeAsync(1)
+  expect(h.events.at(-1)).toMatchObject({ api: 71, clientInstanceId: ID })
+  expect(h.handles).toHaveLength(2)
+  await jest.advanceTimersByTimeAsync(1000)
+  expect(h.client.state).toBe('READY')
+  h.client.suspend()
+})
+
+it.each([
+  [117, 'READY'],
+  [999, 'STOPPED'],
+])(
+  'honors numeric protocol code %i beneath an OS-coded connection wrapper',
+  async (code, state) => {
+    const h = setup()
+    h.pushes.push(() =>
+      Promise.reject(
+        new KafkaJSConnectionError('wrapped', { code: 'ECONNRESET', cause: failure(code) })
+      )
+    )
+    h.client.resume()
+    await jest.advanceTimersByTimeAsync(0)
+    await jest.advanceTimersByTimeAsync(1001)
+    expect(h.client.state).toBe(state)
+    expect(h.events.map((event) => event.api)).toEqual(code === 117 ? [71, 72, 71] : [71, 72])
+    h.client.suspend()
+  }
+)
+
+it.each(['push', 'empty-poll'])(
+  'resets retry backoff only after a successful %s',
+  async (reset) => {
+    const h = setup()
+    h.gets.push(() => Promise.reject(new KafkaJSConnectionError('reset', { code: 'ECONNRESET' })))
+    h.client.resume()
+    await jest.advanceTimersByTimeAsync(0)
+    expect(h.client.failures).toBe(1)
+    if (reset === 'empty-poll') h.gets.push(subscription({ requestedMetrics: [] }))
+    await jest.advanceTimersByTimeAsync(1000)
+    expect(h.client.failures).toBe(reset === 'empty-poll' ? 0 : 1)
+    if (reset === 'push') {
+      await jest.advanceTimersByTimeAsync(1000)
+      expect(h.client.failures).toBe(0)
+    }
+    h.client.suspend()
+  }
+)
