@@ -292,3 +292,7 @@ payload field. It registers no public event listener. Disabled and dedicated
 telemetry connections use a null sink. The collector never awaits, serializes or
 calls application metric suppliers on this path. Collector failures are contained
 without changing a foreground operation's result, rejection or invocation count.
+
+### Broker telemetry and application instrumentation
+
+Broker telemetry is opt-in and independent of public instrumentation and optional OTel. It adds no event, diagnostics channel, REQUEST payload field or public on() signature. Numeric registration stores snapshots; it invokes no callback or SDK. Existing instrumentation remains available with telemetry disabled. See [Client Telemetry](ClientTelemetry.md).

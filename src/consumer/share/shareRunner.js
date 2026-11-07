@@ -68,10 +68,14 @@ class ShareRunner {
    * @param {object} [options.cluster] This client's own Cluster.
    * @param {number} [options.requestTimeout] Finite root request timeout, the cap of finals and leave.
    * @param {object} [options.retry] Merged retry options, including `restartOnFailure`.
+   * @param {import('../../telemetry/factory').TelemetryFactory|null} [options.telemetry] Private
+   *   telemetry binding: its methods join the public facade, it resumes once a connect or run is
+   *   usable, is suspended by a crash only and joins the first valid disconnect.
    * @returns {ShareRunner} An idle owner; construction creates no sockets or timers.
    */
   constructor(options) {
     this.options = options
+    options.telemetry?.setResourceReader(() => this.readTelemetryResources())
     this.current = null
     this.stopGeneration = 0
     this.subscription = []
@@ -91,6 +95,7 @@ class ShareRunner {
    */
   api() {
     return Object.freeze({
+      ...this.options.telemetry?.methods(),
       connect: () => this.connect(),
       disconnect: (options) => this.disconnect(options),
       subscribe: (subscription) => this.subscribe(subscription),
@@ -224,6 +229,7 @@ class ShareRunner {
       fence.check()
       this.checkCapability(broker, REQUIRED)
       this.connected = true
+      this.options.telemetry?.resume()
     } catch (error) {
       if (this.lifecycle === generation)
         await cluster.disconnect({ drainTimeout: 0 }).catch(() => {})
@@ -335,7 +341,10 @@ class ShareRunner {
       run.finishRun()
       throw error
     }
-    if (!run.stopRequested && this.current === run) run.start()
+    if (!run.stopRequested && this.current === run) {
+      if (!this.disconnecting) this.options.telemetry?.resume()
+      run.start()
+    }
     return run.firstJoin.promise
   }
 
@@ -381,23 +390,37 @@ class ShareRunner {
       run?.beginClose('disconnect', timeout, enteredAt)
       return this.disconnecting
     }
+    // Runs concurrently with the core close and never shortens or extends its budget.
+    const deadline = timeout === undefined ? Infinity : enteredAt + timeout
+    const finalTelemetry =
+      this.options.telemetry?.close({
+        deadline,
+        remaining: () =>
+          deadline === Infinity ? Infinity : Math.max(0, deadline - performance.now()),
+        zero: timeout === 0,
+      }) ?? null
     this.lifecycle++
     this.stopGeneration++
     this.restartOperation?.retire(new KafkaJSNonRetriableError('Share client was disconnected'))
     const episode = run?.beginClose('disconnect', timeout, enteredAt)
-    this.disconnecting = this.closeClient(episode)
+    this.disconnecting = this.closeClient(episode, finalTelemetry)
     return this.disconnecting
   }
 
   /**
    * @private
    * @param {import('./shareCloseEpisode').ShareCloseEpisode} [episode] The run's close, if any.
+   * @param {Promise<void>|null} [finalTelemetry] The contained telemetry close of this episode.
    * @returns {Promise<void>}
    */
-  async closeClient(episode) {
+  async closeClient(episode, finalTelemetry = null) {
     try {
-      await episode?.done
-      await this.options.cluster.disconnect({ drainTimeout: 0 })
+      try {
+        await episode?.done
+        await this.options.cluster.disconnect({ drainTimeout: 0 })
+      } finally {
+        if (finalTelemetry) await finalTelemetry
+      }
       const wasConnected = this.connected
       this.connected = false
       if (wasConnected) this.emit(events.DISCONNECT)
@@ -468,7 +491,26 @@ class ShareRunner {
       if (this.current === run) this.current = null
       return
     }
+    this.options.telemetry?.resume()
     this.newRun(run.handler, run.batch).start()
+  }
+
+  /**
+   * Gives telemetry the member values of the current run and the authority they were read under.
+   * Equal member strings after a rejoin still invalidate an older snapshot, through the
+   * membership's issued identity.
+   * @private
+   * @returns {{values: object, isCurrent: () => boolean}|null} null while no live member exists
+   */
+  readTelemetryResources() {
+    const run = this.current
+    const membership = run?.membership
+    if (!run || run.retired || membership.closed) return null
+    const { memberId, token } = membership
+    return {
+      values: { group_member_id: memberId },
+      isCurrent: () => this.current === run && !run.retired && membership.token === token,
+    }
   }
 
   /**

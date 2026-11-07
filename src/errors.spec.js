@@ -1100,3 +1100,32 @@ describe('compact share acknowledgement errors', () => {
     expect(error.category).toBe('applicationRecoverable')
   })
 })
+
+describe('observational telemetry errors', () => {
+  test('retains root class identity and a readonly observational reason', () => {
+    const { KafkaJSTelemetryError, KafkaJSNonRetriableError } = require('./errors')
+    const cause = new Error('local failure')
+    const error = new KafkaJSTelemetryError('Client telemetry stopped', {
+      reason: 'stopped',
+      apiKey: 72,
+      cause,
+    })
+    expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
+    expect(error.retriable).toBe(false)
+    expect(error.reason).toBe('stopped')
+    expect(error.apiKey).toBe(72)
+    expect(error.cause).toBe(cause)
+    expect(Object.getOwnPropertyDescriptor(error, 'reason').writable).toBe(false)
+    expect(require('../index').KafkaJSTelemetryError).toBe(KafkaJSTelemetryError)
+    expect(error).not.toHaveProperty('outcome')
+    expect(error).not.toHaveProperty('abortable')
+  })
+
+  test('the apiKey is optional and a missing options object is refused', () => {
+    const { KafkaJSTelemetryError } = require('./errors')
+    const error = new KafkaJSTelemetryError('Client telemetry closed', { reason: 'closed' })
+    expect(error).not.toHaveProperty('apiKey')
+    expect(error.name).toBe('KafkaJSTelemetryError')
+    expect(() => new KafkaJSTelemetryError('x')).toThrow(TypeError)
+  })
+})

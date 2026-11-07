@@ -109,6 +109,9 @@ module.exports = class Cluster {
    * @param {import("../../types").RetryOptions} options.retry
    * @param {import("../../types").Logger} options.logger
    * @param {import("../../types").ISocketFactory} options.socketFactory
+   * @param {object|null} [options.telemetryMetrics=null] private numeric collector of the returned
+   *   client, handed to its normal sockets and node slots; the dedicated telemetry socket never
+   *   receives it
    * @param {Map} [options.offsets]
    * @param {Map} [options.operations] the per-group store of offset operations the `Kafka`
    *   instance shares between its clusters; kept as `operationsByGroup`, the way `offsets` is kept
@@ -126,6 +129,7 @@ module.exports = class Cluster {
    */
   constructor({
     logger: rootLogger,
+    telemetryMetrics = null,
     socketFactory,
     brokers,
     ssl,
@@ -159,6 +163,7 @@ module.exports = class Cluster {
     this.retryOptions = { ...retry }
     this.retrier = (action) => retrierOf(this.retryOptions)(action)
     this.connectionPoolBuilder = connectionPoolBuilder({
+      telemetryMetrics,
       logger: rootLogger,
       instrumentationEmitter,
       socketFactory,
@@ -200,6 +205,7 @@ module.exports = class Cluster {
     this.instrumentationEmitter = instrumentationEmitter
     this.metadataCache = new MetadataCache({ logger: rootLogger, instrumentationEmitter })
     this.brokerPool = new BrokerPool({
+      telemetryMetrics,
       connectionPoolBuilder: this.connectionPoolBuilder,
       logger: this.rootLogger,
       metadataCache: this.metadataCache,

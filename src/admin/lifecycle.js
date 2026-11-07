@@ -31,13 +31,16 @@ class AdminLifecycle {
    * @param {object} options.cluster shared admin transport with bounded disconnect
    * @param {object} options.logger admin logger
    * @param {() => void} options.onDisconnect emits the existing disconnect event
+   * @param {import('../telemetry/factory').TelemetryFactory|null} [options.telemetry=null] private
+   *   telemetry binding whose one close joins the first valid disconnect
    * @returns {AdminLifecycle} initially usable lifecycle, retaining implicit first connection
    * @throws Never.
    */
-  constructor({ cluster, logger, onDisconnect }) {
+  constructor({ cluster, logger, onDisconnect, telemetry = null }) {
     this.cluster = cluster
     this.logger = logger
     this.onDisconnect = onDisconnect
+    this.telemetry = telemetry
     this.active = new Set()
     this.closing = null
     this.closed = false
@@ -129,6 +132,13 @@ class AdminLifecycle {
     if (this.closed) return Promise.resolve()
     const generation = this.generation
     const due = timeout === undefined ? Infinity : startedAt + timeout
+    // Runs concurrently with the core close and never shortens or extends its budget.
+    const finalTelemetry =
+      this.telemetry?.close({
+        deadline: due,
+        remaining: () => (due === Infinity ? Infinity : Math.max(0, due - performance.now())),
+        zero: timeout === 0,
+      }) ?? null
     const episode = { generation, due, forced: false, cleanup: null }
     const disconnectCluster = () => {
       if (!episode.cleanup) {
@@ -169,6 +179,7 @@ class AdminLifecycle {
         await disconnectCluster()
       } finally {
         clearTimeout(timer)
+        if (finalTelemetry) await finalTelemetry
         generation.close(
           new KafkaJSNonRetriableError('The admin was disconnected; outcome is unknown')
         )

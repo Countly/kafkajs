@@ -57,6 +57,7 @@ export const {
   KafkaJSInvalidConfigurationError,
   KafkaJSDeliveryTimeout,
   KafkaJSProducerClosedError,
+  KafkaJSTelemetryError,
   KafkaJSInvalidFrameError,
   KafkaJSCorruptRecordError,
   KafkaJSCommitFailedError,

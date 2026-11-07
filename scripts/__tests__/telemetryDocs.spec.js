@@ -37,9 +37,13 @@ describe('telemetry protocol documentation', () => {
 })
 
 describe('numeric telemetry documentation', () => {
-  test('records bounded snapshots before public factory attachment', () => {
+  test('records bounded snapshots on the public client factories', () => {
     const guide = read('docs/ClientTelemetry.md')
-    expect(guide).toContain('The collector is internal at this milestone.')
+    expect(guide).toContain(
+      'Producer, ordinary consumer, admin and ShareConsumer each expose the methods below'
+    )
+    expect(guide).toContain('registerMetricForSubscription')
+    expect(guide).not.toContain('The collector is internal at this milestone.')
     expect(guide).toContain('257 series in total')
     expect(guide).toContain('response loss or rejection does not replay it')
     expect(guide).toContain('### Numeric snapshot registration')
@@ -67,7 +71,8 @@ describe('numeric telemetry documentation', () => {
         'src/network/__tests__/telemetryObservation.spec.js',
       ]) {
         const literal = file.replaceAll('.', '\\.').concat('$')
-        expect(tokens).toContain(literal)
+        expect(tokens.some((pattern) => new RegExp(pattern).test(file))).toBe(true)
+        if (!file.startsWith('src/telemetry/')) expect(tokens).toContain(literal)
         expect(new RegExp(literal).test(file)).toBe(true)
         expect(new RegExp(literal).test(file.replaceAll('.', 'X'))).toBe(false)
       }
@@ -105,7 +110,8 @@ describe('bounded telemetry payload documentation', () => {
         'src/telemetry/__tests__/compression.spec.js',
       ]) {
         const literal = file.replaceAll('.', '\\.').concat('$')
-        expect(tokens).toContain(literal)
+        expect(tokens.some((pattern) => new RegExp(pattern).test(file))).toBe(true)
+        if (!file.startsWith('src/telemetry/')) expect(tokens).toContain(literal)
         expect(new RegExp(literal).test(file)).toBe(true)
         expect(new RegExp(literal).test(file.replaceAll('.', 'X'))).toBe(false)
       }
@@ -142,9 +148,73 @@ describe('telemetry subscription documentation', () => {
       'src/cluster/__tests__/telemetryTransport.spec.js',
     ]) {
       const pattern = file.replaceAll('.', String.fromCharCode(92) + '.') + '$'
-      for (const name of ['test:unit', 'test:coverage:unit'])
-        expect(scripts[name]).toContain("'" + pattern + "'")
+      for (const name of ['test:unit', 'test:coverage:unit']) {
+        const tokens = [...scripts[name].matchAll(/'([^']+)'/g)].map((match) => match[1])
+        expect(tokens.some((entry) => new RegExp(entry).test(file))).toBe(true)
+        if (!file.startsWith('src/telemetry/')) expect(tokens).toContain(pattern)
+      }
       expect(new RegExp(pattern).test(file.replace('.spec', 'Xspec'))).toBe(false)
     }
   })
+})
+
+describe('public telemetry documentation', () => {
+  test('publishes exact options getter reasons registration disclosure and close rules', () => {
+    const text = read('docs/ClientTelemetry.md')
+    for (const token of [
+      'default remains false',
+      '1048576',
+      '60000',
+      '2147483647',
+      '64 waiters',
+      '65th',
+      'KafkaJSTelemetryError',
+      'group_member_id',
+      '512 UTF-8',
+      'dropped_attributes_count',
+      'timeout0 sends no final',
+      'concurrently with core draining',
+      'Get cannot replenish',
+      'registerMetricForSubscription',
+      'unregisterMetricFromSubscription',
+    ]) {
+      expect(text).toContain(token)
+    }
+    expect(text).not.toContain('not yet attached')
+  })
+  test('every client guide and the migration guide publish the public telemetry section', () => {
+    for (const file of [
+      'docs/Producing.md',
+      'docs/Consuming.md',
+      'docs/Admin.md',
+      'docs/ShareConsumer.md',
+    ]) {
+      expect(read(file)).toContain('## Broker client telemetry')
+    }
+    expect(read('docs/Configuration.md')).toContain('## Client telemetry options')
+    expect(read('docs/MigrationGuide-3-0-0.md')).toContain('### Broker client telemetry')
+  })
+  test.each(['test:unit', 'test:coverage:unit'])(
+    '%s includes factory files through the one telemetry wildcard',
+    (lane) => {
+      const tokens = [...pkg.scripts[lane].matchAll(/'([^']+)'/g)].map((m) => m[1])
+      expect(tokens.filter((p) => p === 'src/telemetry/.*')).toHaveLength(1)
+      expect(tokens.some((p) => p.startsWith('src/telemetry/__tests__/'))).toBe(false)
+      for (const file of ['factories', 'clientInstanceId', 'options']) {
+        expect(
+          tokens.some((p) => new RegExp(p).test(`src/telemetry/__tests__/${file}.spec.js`))
+        ).toBe(true)
+      }
+      expect(tokens.some((p) => new RegExp(p).test('src/errors.spec.js'))).toBe(true)
+    }
+  )
+})
+
+test('package smoke creates and checks the alias after the last npm install', () => {
+  const script = read('scripts/packSmoke.sh')
+  const alias = script.indexOf('ln -s @countly/kafkajs node_modules/kafkajs')
+  expect(alias).toBeGreaterThan(script.lastIndexOf('npm install'))
+  expect(script.indexOf('NODE_PATH= node --test')).toBeGreaterThan(alias)
+  expect(script).toContain('require.resolve("kafkajs") !== require.resolve("@countly/kafkajs")')
+  expect(script.indexOf('package-exports.mts')).toBeGreaterThan(alias)
 })

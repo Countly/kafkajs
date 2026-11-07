@@ -134,6 +134,9 @@ const definedKeys = (options) =>
  *
  * @param {Object} params
  * @param {import('../../types').Cluster} params.cluster
+ * @param {import('../telemetry/factory').TelemetryFactory|null} [params.telemetry=null] private
+ *   telemetry binding: its three public methods are added to the producer, it resumes after a
+ *   usable connect and joins the one close; transaction handles have no telemetry surface
  * @param {import('../../types').Logger} params.logger
  * @param {import('../../types').ICustomPartitioner} [params.createPartitioner] the uniform sticky
  *   partitioner, sticking for `batchSize` bytes, when absent; a built-in partitioner with an
@@ -171,6 +174,7 @@ const definedKeys = (options) =>
  */
 const createProducer = ({
   cluster,
+  telemetry = null,
   logger: rootLogger,
   createPartitioner,
   retry = {},
@@ -802,7 +806,15 @@ const createProducer = ({
    */
   const close = async (startedAt, timeout) => {
     const lifecycle = generation
-    const remaining = () => Math.max(0, startedAt + timeout - Date.now())
+    const remaining = () =>
+      timeout === undefined ? Infinity : Math.max(0, startedAt + timeout - Date.now())
+    // Runs concurrently with the core close and never shortens or extends its budget.
+    const finalTelemetry =
+      telemetry?.close({
+        deadline: timeout === undefined ? Infinity : startedAt + timeout,
+        remaining,
+        zero: timeout === 0,
+      }) ?? null
     let cleanup = null
     /** Starts the one cluster disconnect of the episode; later calls share it. */
     const disconnectCluster = (drainTimeout) =>
@@ -846,6 +858,7 @@ const createProducer = ({
       await disconnectCluster(timeout === undefined ? undefined : remaining())
     } finally {
       clearTimeout(timer)
+      if (finalTelemetry) await finalTelemetry
       lifecycle.close(
         new KafkaJSProducerClosedError('The producer was disconnected', { outcome: 'unknown' })
       )
@@ -857,6 +870,7 @@ const createProducer = ({
   }
 
   return {
+    ...telemetry?.methods(),
     /**
      * Connects the producer, starting a new lifecycle after a close: it first joins a close still
      * under way, and opens no connection while that close owns the cleanup. Operations of an
@@ -887,6 +901,7 @@ const createProducer = ({
       // of two (which would otherwise allocate two producer ids and reset sequences underneath
       // in-flight sends).
       await lifecycle.wait(ensureInitialized())
+      if (!lifecycle.closed) telemetry?.resume()
     }),
     /**
      * Resolves once every send made before the call, the producer's own and its transactions',

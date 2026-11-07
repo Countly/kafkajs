@@ -278,3 +278,33 @@ test('the share consumer is additive in CommonJS and ESM', async () => {
     code: 'ERR_PACKAGE_PATH_NOT_EXPORTED',
   })
 })
+
+test('telemetry errors and public stubs share root module identity', async () => {
+  const cjs = require(PKG)
+  const esm = await import(PKG)
+  const alias = require('kafkajs')
+  assert.equal(esm.KafkaJSTelemetryError, cjs.KafkaJSTelemetryError)
+  assert.equal(esm.default.KafkaJSTelemetryError, cjs.KafkaJSTelemetryError)
+  assert.equal(alias.KafkaJSTelemetryError, cjs.KafkaJSTelemetryError)
+  const error = new cjs.KafkaJSTelemetryError('disabled', { reason: 'disabled', apiKey: 71 })
+  assert.ok(error instanceof cjs.KafkaJSNonRetriableError)
+  assert.equal(error.reason, 'disabled')
+  assert.equal(Object.getOwnPropertyDescriptor(error, 'reason').writable, false)
+  const kafka = new cjs.Kafka({ brokers: ['localhost:9092'], logLevel: cjs.logLevel.NOTHING })
+  for (const client of [
+    kafka.producer(),
+    kafka.consumer({ groupId: 'smoke' }),
+    kafka.admin(),
+    kafka.shareConsumer({ groupId: 'smoke' }),
+  ]) {
+    await assert.rejects(
+      client.clientInstanceId(),
+      (e) => e instanceof cjs.KafkaJSTelemetryError && e.reason === 'disabled'
+    )
+    assert.equal(client.unregisterMetricFromSubscription({ name: 'com.example.absent' }), undefined)
+  }
+  assert.equal(kafka.clientInstanceId, undefined)
+  assert.throws(() => require(`${PKG}/src/telemetry/client`), {
+    code: 'ERR_PACKAGE_PATH_NOT_EXPORTED',
+  })
+})

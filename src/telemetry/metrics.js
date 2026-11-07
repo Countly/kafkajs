@@ -141,6 +141,16 @@ module.exports = class TelemetryMetrics {
   #last = null
 
   /**
+   * Validates a removal identity without constructing a disabled client's collector.
+   * @param {object} identity explicit name and attributes
+   * @returns {void} no storage or network effects
+   * @throws {KafkaJSInvalidConfigurationError} invalid identity or throwing getter
+   */
+  static validateIdentity(identity) {
+    descriptor(identity, false)
+  }
+
+  /**
    * @param {{kind:'producer'|'consumer'|'admin'|'shareConsumer',clock?:object,logger?:object}} options
    * clock supplies integer wallMs() and bigint monotonicNs(); the default is anchored once.
    * @throws {KafkaJSInvalidConfigurationError} invalid kind or clock domain

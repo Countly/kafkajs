@@ -201,6 +201,7 @@ module.exports = class Connection {
     this.onAuthenticationFailure = onAuthenticationFailure
     this.telemetrySink = telemetrySink
     this.telemetrySlot = telemetrySlot
+    this.telemetryPool = null
 
     /**
      * Splits what the socket delivers into response frames; reset on every connect and every close.
@@ -322,11 +323,26 @@ module.exports = class Connection {
    * The factory adapter never installs one on a dedicated telemetry transport.
    * @param {object|null} sink owned collector, null when disabled
    * @param {object|null} slot current metadata binding
+   * @param {object|null} [pool=null] private normal pool, used only to release inactivity on teardown
    * @returns {void} requests already created retain their original observer and slot
    */
-  setTelemetryObserver(sink, slot) {
+  setTelemetryObserver(sink, slot, pool = null) {
     this.telemetrySink = sink
     this.telemetrySlot = slot
+    this.telemetryPool = sink ? pool : null
+  }
+
+  /**
+   * Marks the node inactive once no socket of its normal pool is connected, so collector
+   * eviction prefers it. The collector is trusted library code; a failure never reaches teardown.
+   * @private
+   * @returns {void} a no-op without an installed observer
+   */
+  releaseTelemetryNode() {
+    if (!this.telemetrySink || !this.telemetryPool) return
+    try {
+      if (!this.telemetryPool.isConnected()) this.telemetrySink.releaseNode(this.telemetrySlot)
+    } catch {}
   }
 
   setVersions(versions) {
@@ -637,7 +653,8 @@ module.exports = class Connection {
   }
 
   /**
-   * The teardown `failGeneration` and `disconnect()` share, with no observer run.
+   * The teardown `failGeneration` and `disconnect()` share, with no queue observer run; the private
+   * telemetry inactivity release is contained.
    * @private
    * @param {Error} error what the requests left on the connection are rejected with
    * @param {object} [socket=this.socket] the socket of the generation being ended
@@ -654,6 +671,7 @@ module.exports = class Connection {
     this.connectAttempt += 1
     this.authenticatedAt = null
     this.connectionStatus = CONNECTION_STATUS.DISCONNECTED
+    this.releaseTelemetryNode()
     if (abortConnect) {
       abortConnect(error)
     }

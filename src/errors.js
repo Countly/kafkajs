@@ -862,6 +862,23 @@ const isPollIntervalExceeded = (e) => e.type === 'POLL_INTERVAL_EXCEEDED'
 
 const isKafkaJSError = (e) => e instanceof KafkaJSError
 
+/** Observational telemetry failure; it has no producer-fatal or transaction-abort meaning. */
+class KafkaJSTelemetryError extends KafkaJSNonRetriableError {
+  /**
+   * @param {Error|string} e fixed message or safe local cause
+   * @param {{reason: string, apiKey?: number, cause?: Error}} options observational reason and safe metadata
+   * @throws {TypeError} when the options object is missing
+   */
+  constructor(e, { reason, apiKey, cause }) {
+    super(e, { cause })
+    this.name = 'KafkaJSTelemetryError'
+    Object.defineProperty(this, 'reason', { value: reason, enumerable: true })
+    if (apiKey !== undefined) {
+      Object.defineProperty(this, 'apiKey', { value: apiKey, enumerable: true })
+    }
+  }
+}
+
 /** A producer operation ended locally at forced shutdown, without a remote outcome claim. */
 class KafkaJSProducerClosedError extends KafkaJSNonRetriableError {
   /**
@@ -883,6 +900,7 @@ module.exports = {
   KafkaJSNoOffsetError,
   KafkaJSRebalanceListenerError,
   KafkaJSProducerClosedError,
+  KafkaJSTelemetryError,
   KafkaJSError,
   KafkaJSNonRetriableError,
   KafkaJSPartialMessageError,
