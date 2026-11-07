@@ -19,6 +19,7 @@ const {
   ShareHandlerLog,
   assertShareCleanup,
   captureShareCleanupBaseline,
+  waitForShareGroupsEmpty,
   setShareGroupConfigs,
   resetShareGroupConfigs,
   shareRecordIdentity,
@@ -312,11 +313,22 @@ const assertInteropFixture = (fixture, { requireOwnership = true } = {}) => {
     })
     expect(new Set(defaults).size).toBe(1)
     const value = entry(group, `share.${suffix}`)
-    expect([CONFIG_SOURCE.GROUP_CONFIG, CONFIG_SOURCE.DEFAULT_CONFIG]).toContain(value.configSource)
+    const inheritedSources = [
+      CONFIG_SOURCE.DYNAMIC_BROKER_CONFIG,
+      CONFIG_SOURCE.DYNAMIC_DEFAULT_BROKER_CONFIG,
+      CONFIG_SOURCE.STATIC_BROKER_CONFIG,
+    ]
+    expect([
+      CONFIG_SOURCE.GROUP_CONFIG,
+      CONFIG_SOURCE.DEFAULT_CONFIG,
+      ...inheritedSources,
+    ]).toContain(value.configSource)
     expect(value.configValue).toMatch(/^(0|[1-9][0-9]*)$/)
     const override = value.configSource === CONFIG_SOURCE.GROUP_CONFIG
-    const resolved = override ? Number(value.configValue) : defaults[0]
-    if (suffix !== 'assignment.interval.ms' || override) {
+    const inherited = inheritedSources.includes(value.configSource)
+    const resolved = override || inherited ? Number(value.configValue) : defaults[0]
+    if (inherited) expect(resolved).toBe(defaults[0])
+    if (suffix !== 'assignment.interval.ms' || override || inherited) {
       expect(Number(value.configValue)).toBe(resolved)
     } else {
       expect([resolved, 1000]).toContain(Number(value.configValue))
@@ -329,7 +341,12 @@ const assertInteropFixture = (fixture, { requireOwnership = true } = {}) => {
       expect(resolved).toBeGreaterThanOrEqual(0)
       expect(resolved).toBeLessThanOrEqual(1000)
     }
-    effective[suffix] = { value: resolved, override, brokerDefaults: defaults }
+    effective[suffix] = {
+      value: resolved,
+      source: value.configSource,
+      override,
+      brokerDefaults: defaults,
+    }
   }
   for (const [name, required] of Object.entries(GROUP_CONFIG)) {
     const value = entry(group, name)
@@ -2172,7 +2189,7 @@ class ShareInteropCase {
           [this.topic],
           this.baseline,
           this.probe,
-          { signal, disconnectAdmin: true }
+          { signal, disconnectAdmin: true, record: (event, fields) => this.row(event, fields) }
         )
       }
     } finally {
@@ -2181,78 +2198,32 @@ class ShareInteropCase {
   }
 
   /**
-   * Deletes the topic and observes its absence on every advertised broker. A listing from one
-   * broker can precede deletion propagation to the broker used by the final absence proof.
+   * Deletes the topic; the shared final proof waits for absence on every broker.
    * @param {AbortSignal} signal the cleanup scope
    * @returns {Promise<void>}
-   * @throws {Error} when the topic is still listed after deletion
+   * @throws {Error} when deletion fails for a known topic
    */
   async deleteTopic(signal) {
-    await bounded(signal, 10000, async (scope) => {
-      const { brokers } = await bounded(scope, Infinity, () => this.admin.describeCluster())
-      const pending = new Set(brokers.map(({ host, port }) => `${host}:${port}`))
-      if (pending.size === 0) throw new Error('No brokers available to prove topic deletion')
-      await bounded(scope, Infinity, () =>
-        this.admin.deleteTopics({ topics: [this.topic], timeout: 8000 })
-      ).catch((error) => {
-        if (error.type !== 'UNKNOWN_TOPIC_OR_PARTITION') throw error
-      })
-      await pollUntil(
-        scope,
-        Infinity,
-        async (poll) => {
-          const from = this.requests.length
-          const topics = await bounded(poll, Infinity, () => this.admin.listTopics())
-          const request = this.requests
-            .slice(from)
-            .filter(({ apiName }) => apiName === 'Metadata')
-            .pop()
-          if (!request) throw new Error('Missing topic listing request evidence')
-          const present = topics.includes(this.topic)
-          if (present) pending.add(request.broker)
-          else pending.delete(request.broker)
-          this.row('topic-deletion', {
-            topic: this.topic,
-            broker: request.broker,
-            present,
-            pending: [...pending],
-          })
-          return pending.size === 0
-        },
-        { label: 'The topic disappearing on every broker' }
-      )
+    await bounded(signal, 10000, () =>
+      this.admin.deleteTopics({ topics: [this.topic], timeout: 8000 })
+    ).catch((error) => {
+      if (error.type !== 'UNKNOWN_TOPIC_OR_PARTITION') throw error
     })
   }
 
   /**
-   * Waits for all workload and verifier members to leave, then deletes the group and proves it
-   * absent. The Java child and JavaScript clients have already been closed by the cleanup stack.
+   * Waits for all workload and verifier members to leave, then deletes the group. The shared
+   * final proof confirms absence after the cleanup stack has closed the Java and JavaScript clients.
    * @param {AbortSignal} signal the cleanup scope
    * @returns {Promise<void>}
    * @throws {Error} when the group is still listed after deletion
    */
   async deleteGroup(signal) {
     await bounded(signal, 10000, async (scope) => {
-      await pollUntil(
-        scope,
-        Infinity,
-        async (poll) => {
-          const { groups } = await bounded(poll, Infinity, () =>
-            this.admin.describeShareGroups([this.group], { apiTimeout: 6000 })
-          )
-          const [group] = groups
-          if (groups.length !== 1 || group.groupId !== this.group) {
-            throw new Error('Missing owned share group description during cleanup')
-          }
-          this.row('cleanup-members', { group })
-          if (group.errorCode === 69) return true
-          if (group.errorCode !== 0) {
-            throw new Error(`Share group cleanup description failed: ${group.errorCode}`)
-          }
-          return group.state === 'Empty' && group.members.length === 0
-        },
-        { label: 'Every share member leaving' }
-      )
+      await waitForShareGroupsEmpty(this.admin, [this.group], {
+        signal: scope,
+        record: (event, fields) => this.row(event, fields),
+      })
       await pollUntil(
         scope,
         Infinity,
@@ -2268,17 +2239,6 @@ class ShareInteropCase {
           }
         },
         { label: 'The group deletion' }
-      )
-      await pollUntil(
-        scope,
-        Infinity,
-        async (poll) => {
-          const { groups } = await bounded(poll, Infinity, () => this.admin.listGroups())
-          const remaining = groups.filter(({ groupId }) => groupId === this.group)
-          this.row('group-deletion', { remaining })
-          return remaining.length === 0
-        },
-        { label: 'The group disappearing' }
       )
     })
   }
@@ -2979,6 +2939,43 @@ describe('share interop fixture and clocks (scripted primitives, not Kafka captu
       expect(assertInteropFixture(copy(state)).assignmentMs).toBe(0)
     })
 
+    it.each([2, 3, 4])(
+      `${version} resolves inherited broker source %i from the original GROUP value`,
+      (source) => {
+        const state = fixture(version)
+        for (const suffix of [
+          'session.timeout.ms',
+          'heartbeat.interval.ms',
+          'assignment.interval.ms',
+        ]) {
+          groupEntry(state, `share.${suffix}`).configSource = source
+        }
+        groupEntry(state, 'share.assignment.interval.ms').configValue = '0'
+        for (const broker of state.response.resources.slice(0, 3)) {
+          broker.configEntries[2].configValue = '0'
+        }
+        const effective = assertInteropFixture(copy(state))
+        expect(effective.assignmentMs).toBe(0)
+        expect(effective['session.timeout.ms']).toMatchObject({
+          value: 6000,
+          source,
+          override: false,
+        })
+        expect(effective['heartbeat.interval.ms']).toMatchObject({
+          value: 1000,
+          source,
+          override: false,
+        })
+        expect(effective['assignment.interval.ms']).toMatchObject({
+          value: 0,
+          source,
+          override: false,
+        })
+        groupEntry(state, 'share.assignment.interval.ms').configValue = '1000'
+        expect(() => assertInteropFixture(copy(state))).toThrow()
+      }
+    )
+
     it(`${version} rejects false profiles, ownership, sources and fallback without a new allowance`, () => {
       const changes = [
         (s) => (s.profile = 'tv2'),
@@ -3002,7 +2999,9 @@ describe('share interop fixture and clocks (scripted primitives, not Kafka captu
         (s) => s.response.resources[2].configEntries.pop(),
         (s) => (groupEntry(s, 'share.session.timeout.ms').configValue = '45000'),
         (s) => (groupEntry(s, 'share.heartbeat.interval.ms').configValue = '5000'),
-        (s) => (groupEntry(s, 'share.assignment.interval.ms').configSource = 0),
+        ...[0, 1, 6, 7].map(
+          (source) => (s) => (groupEntry(s, 'share.assignment.interval.ms').configSource = source)
+        ),
         (s) => (groupEntry(s, 'share.assignment.interval.ms').configValue = '1001'),
         (s) => {
           groupEntry(s, 'share.assignment.interval.ms').configSynonyms.push({

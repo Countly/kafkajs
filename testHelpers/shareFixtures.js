@@ -530,6 +530,101 @@ const captureShareCleanupBaseline = async (probe, { signal, cleanupStack = true 
 }
 
 /**
+ * Waits for every owned share group to be empty or absent before deletion.
+ * @param {object} admin Connected admin client.
+ * @param {string[]} groups Owned share group ids.
+ * @param {{ signal?: AbortSignal, record?: Function }} [options] Existing cleanup scope and evidence sink.
+ * @returns {Promise<void>} Once no owned group has members.
+ * @throws {Error} On missing/refused descriptions, retained membership or expiry.
+ */
+const waitForShareGroupsEmpty = async (admin, groups, { signal, record } = {}) => {
+  if (groups.length === 0) return
+  const { NEVER, bounded, pollUntil } = require('../src/producer/__tests__/fixtures/bounded')
+  await pollUntil(
+    signal || NEVER,
+    10000,
+    async (scope) => {
+      const described = await bounded(scope, Infinity, () =>
+        admin.describeShareGroups(groups, { apiTimeout: 6000 })
+      )
+      let empty = true
+      for (const groupId of groups) {
+        const matches = described.groups.filter((group) => group.groupId === groupId)
+        if (matches.length !== 1)
+          throw new Error('Missing owned share group description during cleanup')
+        const [group] = matches
+        record?.('cleanup-members', { group })
+        if (group.errorCode === 69) continue
+        if (group.errorCode !== 0) {
+          throw new Error(`Share group cleanup description failed: ${group.errorCode}`)
+        }
+        if (group.state !== 'Empty' || group.members.length !== 0) empty = false
+      }
+      return empty
+    },
+    { label: 'Every share member leaving' }
+  )
+}
+
+/**
+ * Proves owned groups absent and topics absent on every advertised broker within the caller's bound.
+ * Group listings aggregate all brokers; topic listings are attributed through original request events.
+ * @param {object} admin Connected admin client.
+ * @param {string[]} groups Owned share group ids.
+ * @param {string[]} topics Owned topic names.
+ * @param {{ signal: AbortSignal, unrelated: string[], record?: Function }} options Existing cleanup scope and evidence sink.
+ * @returns {Promise<void>} Once all absence and unrelated-presence checks hold.
+ * @throws {Error} On missing evidence, a harmed sibling, retained fixtures or expiry.
+ */
+const waitForShareFixtureAbsence = async (admin, groups, topics, { signal, unrelated, record }) => {
+  const { bounded, pollUntil } = require('../src/producer/__tests__/fixtures/bounded')
+  await waitForShareGroupsEmpty(admin, groups, { signal, record })
+  const pending = new Set()
+  if (topics.length > 0) {
+    const { brokers } = await bounded(signal, Infinity, () => admin.describeCluster())
+    for (const { host, port } of brokers) pending.add(`${host}:${port}`)
+    if (pending.size === 0) throw new Error('No brokers available to prove topic deletion')
+  }
+  let request
+  const remove = topics.length
+    ? admin.on(admin.events.REQUEST, ({ payload }) => {
+        if (payload.apiName === 'Metadata') request = payload
+      })
+    : () => {}
+  try {
+    await pollUntil(
+      signal,
+      Infinity,
+      async (scope) => {
+        const { groups: listed } = await bounded(scope, Infinity, () => admin.listGroups())
+        const names = new Set(listed.map(({ groupId }) => groupId))
+        if (unrelated.some((id) => !names.has(id))) throw new Error('Unrelated group disappeared')
+        const remaining = groups.filter((id) => names.has(id))
+        record?.('group-deletion', { remaining })
+        if (topics.length > 0) {
+          request = undefined
+          const listedTopics = await bounded(scope, Infinity, () => admin.listTopics())
+          if (!request) throw new Error('Missing topic listing request evidence')
+          const present = topics.filter((name) => listedTopics.includes(name))
+          if (present.length) pending.add(request.broker)
+          else pending.delete(request.broker)
+          record?.('topic-deletion', {
+            topics,
+            broker: request.broker,
+            present,
+            pending: [...pending],
+          })
+        }
+        return remaining.length === 0 && pending.size === 0
+      },
+      { label: 'Share fixtures disappearing on every broker' }
+    )
+  } finally {
+    remove()
+  }
+}
+
+/**
  * Proves owned groups/topics absent and measured owners back at baseline after CleanupStack.
  * Unrelated groups are checked for presence only, never whole-cluster list equality.
  * @param {object} admin still-connected admin used to prove fixture absence
@@ -540,6 +635,7 @@ const captureShareCleanupBaseline = async (probe, { signal, cleanupStack = true 
  * @param {object} [options] unrelated group ids and case signal
  * @param {string[]} [options.unrelated=[]] previously observed unrelated groups
  * @param {AbortSignal} [options.signal] enclosing cleanup scope
+ * @param {Function} [options.record] Original cleanup observations for the evidence sink.
  * @param {boolean} [options.disconnectAdmin=false] close admin and fixture propagation
  *   connections before measuring against a client-free baseline
  * @returns {Promise<object>} final measured snapshot
@@ -551,7 +647,7 @@ const assertShareCleanup = async (
   topics,
   baseline,
   probe,
-  { unrelated = [], signal, disconnectAdmin = false } = {}
+  { unrelated = [], signal, disconnectAdmin = false, record } = {}
 ) => {
   const { inspect, isDeepStrictEqual } = require('util')
   const { NEVER, bounded, pollUntil } = require('../src/producer/__tests__/fixtures/bounded')
@@ -559,13 +655,7 @@ const assertShareCleanup = async (
   let after
   try {
     return await bounded(signal || NEVER, 10000, async (scope) => {
-      const { groups: listed } = await bounded(scope, Infinity, () => admin.listGroups())
-      const names = new Set(listed.map(({ groupId }) => groupId))
-      const remaining = await bounded(scope, Infinity, () => admin.listTopics())
-      if (groups.some((id) => names.has(id)) || topics.some((name) => remaining.includes(name))) {
-        throw new Error('Share fixture remains after cleanup')
-      }
-      if (unrelated.some((id) => !names.has(id))) throw new Error('Unrelated group disappeared')
+      await waitForShareFixtureAbsence(admin, groups, topics, { signal: scope, unrelated, record })
       if (disconnectAdmin) {
         await bounded(scope, Infinity, () => admin.disconnect())
         await bounded(scope, Infinity, () => helpers.disconnectPropagationBrokers())
@@ -617,5 +707,6 @@ module.exports = {
   ShareHandlerLog,
   verifierMember,
   captureShareCleanupBaseline,
+  waitForShareGroupsEmpty,
   assertShareCleanup,
 }

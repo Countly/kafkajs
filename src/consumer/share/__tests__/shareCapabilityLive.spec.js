@@ -967,14 +967,7 @@ class CapabilityCase {
       this.admin.fetchTopicMetadata({ topics: [this.topic] })
     )
     this.topicId = metadata.topics.find(({ name }) => name === this.topic).topicId
-    this.sentinelCreated = true
-    await bounded(scope, 10000, () =>
-      this.admin.setOffsets({
-        groupId: this.sentinel,
-        topic: this.topic,
-        partitions: [{ partition: 0, offset: '0' }],
-      })
-    )
+    this.startSentinel(scope)
     await bounded(scope, 15000, () => setShareGroupConfigs(this.admin, this.group, GROUP_CONFIG))
     this.configReadAt = performance.now()
     this.row('config-readback', { group: GROUP_CONFIG, client: CLIENT_CONFIG })
@@ -987,6 +980,28 @@ class CapabilityCase {
     )
     this.stack.add('disconnect producer', () => this.producer.disconnect())
     await bounded(scope, 15000, () => this.producer.connect())
+  }
+
+  /**
+   * Starts the unrelated group alongside the workload and joins its creation before cleanup proof.
+   * The paused temporary member used by setOffsets need not delay the share member's first join.
+   * @param {AbortSignal} scope The case scope, including the sentinel's original creation bound.
+   * @returns {void}
+   */
+  startSentinel(scope) {
+    this.stack.add('join sentinel creation', (signal) =>
+      bounded(signal, Infinity, () => this.sentinelReady)
+    )
+    this.sentinelCreated = true
+    const startedAt = performance.now()
+    this.sentinelReady = bounded(scope, 10000, () =>
+      this.admin.setOffsets({
+        groupId: this.sentinel,
+        topic: this.topic,
+        partitions: [{ partition: 0, offset: '0' }],
+      })
+    ).then(() => this.row('sentinel-created', { elapsedMs: performance.now() - startedAt }))
+    this.sentinelReady.catch(() => {})
   }
 
   /**
@@ -1291,6 +1306,53 @@ class CapabilityCase {
     })
   }
 }
+
+describe('capability sentinel ownership', () => {
+  beforeEach(() => jest.useFakeTimers())
+  afterEach(() => {
+    jest.useRealTimers()
+    liveRun.reset()
+  })
+
+  it.each([false, true])(
+    'joins the concurrent creation and retains its failure: %s',
+    async (fails) => {
+      let resolve
+      let reject
+      const creation = new Promise((yes, no) => {
+        resolve = yes
+        reject = no
+      })
+      const state = new CapabilityCase()
+      const cleanup = new CleanupStack()
+      state.stack = cleanup
+      state.admin = { setOffsets: () => creation }
+      state.row = jest.fn()
+      state.startSentinel(NEVER)
+      let settled = false
+      const pending = cleanup
+        .run(async () => {}, { budgetMs: 10000 })
+        .then(
+          () => {
+            settled = true
+          },
+          (error) => {
+            settled = true
+            return error
+          }
+        )
+      await jest.advanceTimersByTimeAsync(100)
+      expect(settled).toBe(false)
+      const failure = new Error('sentinel refused')
+      if (fails) reject(failure)
+      else resolve()
+      await jest.advanceTimersByTimeAsync(0)
+      if (fails) expect((await pending).errors.map(({ cause }) => cause)).toContain(failure)
+      else await expect(pending).resolves.toBeUndefined()
+      expect(jest.getTimerCount()).toBe(0)
+    }
+  )
+})
 
 describe('share capability expectations', () => {
   it.each([
