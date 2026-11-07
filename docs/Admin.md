@@ -35,6 +35,7 @@ No file's presence proves a live run passed.
 | `fenceProducers` | apiTimeout, transactionTimeout, transactionalIds | transactions |
 | `connect` | none | lifecycle |
 | `disconnect` | timeout | lifecycle |
+| `clientInstanceId` | timeout | lifecycle |
 | `listTopics` | apiTimeout | metadata |
 | `createTopics` | apiTimeout, timeout, topics, validateOnly, waitForLeaders | topics |
 | `deleteTopics` | apiTimeout, timeout, topicIds, topics | topics |
@@ -82,6 +83,8 @@ No file's presence proves a live run passed.
 | `describeDelegationToken` | apiTimeout, owners | delegation tokens |
 | `logger` | none | instrumentation |
 | `on` | none | instrumentation |
+| `registerMetricForSubscription` | attributes, name, type, unit, value | instrumentation |
+| `unregisterMetricFromSubscription` | attributes, name | instrumentation |
 
 ## Admin evidence by family
 
