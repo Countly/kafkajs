@@ -461,7 +461,14 @@ const verifierMember = async (
       })
       const windowStartedAt = Date.now()
       note('window start', { assignment: client.assignment?.(), fetches: fetches.length, windowMs })
+      // Timers run on a cached millisecond loop clock and can wake just before a monotonic
+      // measurement reaches windowMs; top up until the full window has really elapsed.
+      const windowClock = performance.now()
       await delay(owner, windowMs)
+      for (let left = windowMs - (performance.now() - windowClock); left > 0;) {
+        await delay(owner, Math.ceil(left))
+        left = windowMs - (performance.now() - windowClock)
+      }
       note('window end', { assignment: client.assignment?.(), fetches: fetches.length, windowMs })
       if (crashes.length) throw crashes[0]
       if (client.events.REQUEST && !fetches.some(({ sentAt }) => sentAt >= windowStartedAt)) {
