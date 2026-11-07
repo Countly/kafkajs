@@ -220,3 +220,55 @@ test('package smoke creates and checks the alias after the last npm install', ()
   expect(script).toContain('require.resolve("kafkajs") !== require.resolve("@countly/kafkajs")')
   expect(script.indexOf('package-exports.mts')).toBeGreaterThan(alias)
 })
+
+describe('broker telemetry fixture documentation', () => {
+  test('documents the pinned independent fixture and cleanup', () => {
+    expect(read('docs/Testing.md')).toContain('### Broker telemetry fixture and export checks')
+    expect(read('docs/ClientTelemetry.md')).toContain('## Broker reporter fixture')
+    for (const name of ['docs/Testing.md', 'docs/ClientTelemetry.md']) {
+      expect(read(name)).toContain('1000')
+      expect(read(name)).toContain('CLIENT_METRICS')
+      expect(read(name)).toContain('IPv4')
+    }
+    expect(read('scripts/e2e/telemetry/README.md')).toContain('OVERFLOW')
+    const testing = read('docs/Testing.md')
+    expect(testing).toContain('CI never rebuilds')
+    expect(testing).toContain('two top-level tests')
+    expect(testing).toContain('down -v --remove-orphans')
+    expect(testing).toContain('4.0.2, 4.1.2')
+    expect(testing).toContain('only the reporter lane checks mounted reporter jars')
+    expect(testing).not.toContain('built deterministically')
+  })
+
+  test('keeps all nine script selections under the sole guard', () => {
+    const names = [
+      'reporter',
+      'prefix',
+      'custom',
+      'payload',
+      'shutdown',
+      'unsupported',
+      'java',
+      'outcomes',
+      'soak',
+    ]
+    for (const name of names) {
+      const command = pkg.scripts['test:e2e:telemetry-' + name]
+      expect(command).toContain('P9_CLUSTER_GUARD')
+      expect(command).toContain('tv2 TELEMETRY_E2E')
+      expect(command).not.toMatch(/test:kafka|forceExit/)
+    }
+  })
+
+  test('documents the CI lanes and lands the tooling note without a runtime migration claim', () => {
+    const testing = read('docs/Testing.md')
+    expect(testing).toContain('`telemetry-reporter`')
+    expect(testing).toContain('`telemetry-base`')
+    expect(read('CHANGELOG.md')).toContain(
+      'Add a pinned broker metrics reporter fixture with independent OTLP export and push-interval verification.'
+    )
+    expect(read('docs/ClientTelemetry.md')).toContain(
+      'no client runtime dependency or behavior when telemetry is disabled'
+    )
+  })
+})

@@ -1089,3 +1089,130 @@ if (command === 'java') process.stdout.write(JSON.stringify({ args }) + '\\n')
     })
   })
 })
+
+describe('broker telemetry fixture', () => {
+  const { createHash } = require('crypto')
+  const root = path.resolve(__dirname, '../../..')
+  const read = (name) => fs.readFileSync(path.join(root, name))
+  const digest = (name) => createHash('sha256').update(read(name)).digest('hex')
+  const fixture = 'scripts/e2e/telemetry/'
+
+  test('retains the reviewed reporter and corrected host fixture identities', () => {
+    const file = fixture + 'fixtures/manifest.json'
+    expect(digest(file)).toBe('d223d1c271816041b98a8ffcc143d5707f807cbf28a3f8629eb08a8474e7ca74')
+    const manifest = JSON.parse(read(file))
+    expect(digest('docker-compose.telemetry.yml')).toBe(
+      manifest.composeSha256['docker-compose.telemetry.yml']
+    )
+    for (const name of ['CountingTelemetryReporter.java', 'build.sh'])
+      expect(digest(fixture + name)).toBe(manifest.scripts[name])
+    expect(digest(fixture + 'fetch.sh')).toBe(manifest.scripts['fetch.sh'])
+    expect(digest(fixture + 'fixtures/inputs.sha256')).toBe(
+      '79293d88513002896afad9a9ad48ec0fc75b57be2db78fb46ba4bef0e590cefc'
+    )
+    for (const line of ['4.3.1', '4.2.2']) {
+      for (const kind of ['reporterJar', 'javaClientJar']) {
+        const jar = manifest.lines[line][kind]
+        expect(fs.statSync(path.join(root, jar.path)).isFile()).toBe(true)
+        expect(digest(jar.path)).toBe(jar.sha256)
+      }
+    }
+    expect(manifest.sink).toMatchObject({
+      queueCapacity: 128,
+      maxFileBytesPerNode: 2097152,
+      maxRecordBytes: 4096,
+    })
+    expect(read('.gitignore').toString()).toContain(
+      '!scripts/e2e/telemetry/fixtures/counting-telemetry-reporter-4.3.1.jar'
+    )
+    expect(read('scripts/assertCleanTarball.sh').toString()).toContain('scripts/e2e/telemetry/')
+    expect(read('scripts/assertCleanTarball.sh').toString()).toContain('.*\\.jar$')
+  })
+
+  test('keeps fixture startup separate from offline verification and decoding', () => {
+    const runner = read(fixture + 'run.sh').toString()
+    expect(runner).toContain('CountingTelemetryReporter decode --file')
+    expect(runner).toContain('TELEMETRY_JAVA_CACHE')
+    expect(runner).toContain('sha256')
+    expect(runner).not.toMatch(/docker compose|docker pull|curl |wget |npm run test:kafka/)
+    const compose = read('docker-compose.telemetry.yml').toString()
+    for (const port of [19092, 19095, 19098])
+      expect(compose).toContain('PLAINTEXT_HOST://localhost:' + port)
+    expect(compose).not.toContain('container_name:')
+  })
+
+  test('selects one guarded file and title for each telemetry script', () => {
+    const scripts = JSON.parse(read('package.json')).scripts
+    const selected = Object.entries(scripts).filter(([name]) =>
+      name.startsWith('test:e2e:telemetry-')
+    )
+    expect(selected).toHaveLength(9)
+    for (const [, command] of selected) {
+      expect(command).toContain(
+        'timeout -k 10s 600s node "' + '$' + '{P9_CLUSTER_GUARD:?set sole live guard}"'
+      )
+      expect(command).toContain(' tv2 TELEMETRY_E2E src/telemetry/__tests__/')
+      expect(command).not.toMatch(/test:kafka|forceExit|--testPathPatterns/)
+      expect(command.match(/src\/telemetry\/__tests__\/[^ ]+\.spec\.js/g)).toHaveLength(1)
+    }
+  })
+
+  test('wires retained fixtures and all live combinations through isolated CI ownership', () => {
+    const scripts = JSON.parse(read('package.json')).scripts
+    const exact = (script, title) => {
+      expect(scripts[script]).toContain('TELEMETRY_E2E=1 jest --detectOpenHandles --runInBand')
+      expect(scripts[script]).not.toContain('forceExit')
+      expect(scripts[script]).toContain(
+        "--testPathPatterns 'src/telemetry/__tests__/reporterLive\\.spec\\.js'"
+      )
+      expect(scripts[script]).toContain(`--testNamePattern '${title}'`)
+    }
+    exact('test:group:telemetry-reporter', '^(reporter export|reporter no-resource control)$')
+    exact('test:group:telemetry-base', '^reporter no-plugin control$')
+    const ci = read('.github/workflows/ci.yml').toString()
+    const job = ci.slice(ci.indexOf('\n  telemetry:'))
+    const rows = [
+      ...job.matchAll(
+        /-\s*\{\s*node:\s*(\d+),\s*kafka:\s*([\d.]+),\s*group:\s*([\w-]+),\s*compose:\s*([\w.-]+),?\s*\}/g
+      ),
+    ].map(([, node, kafka, group, compose]) => ({ node: Number(node), kafka, group, compose }))
+    for (const node of [22, 24, 26]) {
+      for (const kafka of ['4.3.1', '4.2.2'])
+        expect(rows).toContainEqual({
+          node,
+          kafka,
+          group: 'telemetry-reporter',
+          compose: 'docker-compose.telemetry.yml',
+        })
+      for (const kafka of ['4.3.1', '4.2.2', '4.1.2', '4.0.2'])
+        expect(rows).toContainEqual({
+          node,
+          kafka,
+          group: 'telemetry-base',
+          compose: 'docker-compose.yml',
+        })
+    }
+    for (const identity of ['github.run_id', 'github.run_attempt', 'strategy.job-index'])
+      expect(job).toContain(identity)
+    expect(job.match(/timeout-minutes:/g).length).toBeGreaterThanOrEqual(
+      job.match(/\brun:/g).length
+    )
+    expect(job).not.toContain('bash scripts/e2e/telemetry/build.sh')
+    expect(job).not.toContain('testWithKafka')
+    for (const command of [
+      'ci.js preflight',
+      'ci.js capture',
+      'ci.js stop',
+      'verifyEvidence(',
+      'bash scripts/e2e/telemetry/run.sh verify "$KAFKA_VERSION"',
+    ])
+      expect(job).toContain(command)
+    const owner = read(fixture + 'ci.js').toString()
+    expect(owner).toContain("'down', '-v', '--remove-orphans'")
+    for (const type of ['containers', 'networks', 'volumes']) expect(owner).toContain(type)
+    expect(ci.indexOf('Verify telemetry evidence before teardown')).toBeLessThan(
+      ci.indexOf('Stop owned project')
+    )
+    expect(ci).not.toMatch(/forceExit|docker (pull|system prune)/)
+  })
+})
