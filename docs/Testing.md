@@ -104,6 +104,12 @@ previous and candidate arms, recorded host load, and the fixed A/A controls.
 
 The broker-free telemetry factory, instance-ID and options specs use the unit/coverage telemetry wildcard. They cover independent instances, root/client overrides, default-off traffic, registration storage, getter validation/deadlines/suspension and inherited close budgets. Run one exact physical pattern at a time with --maxWorkers=2 and a private cache. The TypeScript legacy, Node16 and package-export/alias checks preserve constructor and trailing disconnect tuples and signal callbacks. A valid TS2578 unused-expect-error control must fail compilation. All four returned kinds, including actual ShareConsumer declarations, are required before accepting this surface. Live exporter and natural-exit proofs have separate owners; a construction witness is not a live result.
 
+### Telemetry lifecycle and outcome schedules
+
+The client telemetry checks use public producer, consumer, admin and share-consumer factories with deterministic gates on setup, authentication, encoding, queue dispatch, socket writes and results. They compare request bytes and captured identities together, including repeated subscription IDs and delayed timer delivery. Shutdown checks distinguish ordinary work from the captured final push and test the original close budget.
+
+Observer, serialization, compression and logging failures are checked against the original foreground result or rejection and invocation count. Awaited rebalance hooks keep their documented control-flow behavior. These broker-free schedules complement the configured telemetry, delivery and cleanup tests; they do not prove broker export or native resource bounds.
+
 ## Integration tests
 
 Most of the test suite talks to a real Kafka cluster. `npm test` runs `npm run lint`, `npm run compat:check` and `npm run protocol:check`, boots the cluster, runs everything, and tears the cluster down again — it's a convenient local shortcut, but it is not what CI runs.
