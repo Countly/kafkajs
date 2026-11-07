@@ -27,6 +27,10 @@ const {
 } = require('../../../../testHelpers/shareFixtures')
 const { readLog, endOffsets } = require('../../../../testHelpers/rawLog')
 const { createResourceProbe } = require('../../../../testHelpers/resourceProbe')
+const RequestQueue = require('../../../network/requestQueue')
+const InstrumentationEventEmitter = require('../../../instrumentation/emitter')
+const { ShareAckLedger } = require('../shareAckLedger')
+const { ShareFetchLoop } = require('../shareFetchLoop')
 const shareFetchV2 = require('../../../../testHelpers/wire/shareFetchV2')
 const shareAcknowledgeV2 = require('../../../../testHelpers/wire/shareAcknowledgeV2')
 const {
@@ -528,6 +532,118 @@ const causeCodes = (error) => {
   return codes
 }
 
+/** Observes original resource owners without changing method results or receiver identities. */
+class ResourceGauge {
+  /** Retains owners until after the cleanup comparison, including destroyed connections. */
+  constructor() {
+    this.ledgers = new Set()
+    this.queues = new Set()
+    this.emitters = new Set()
+    this.restores = []
+  }
+
+  /** @returns {void} Installs call-through observers before clients are constructed. */
+  install() {
+    this.watch(
+      ShareAckLedger.prototype,
+      [
+        'canStart',
+        'decide',
+        'complete',
+        'completeRange',
+        'dropExpired',
+        'needsFlush',
+        'prepare',
+        'settle',
+        'invalidate',
+      ],
+      this.ledgers
+    )
+    this.watch(
+      RequestQueue.prototype,
+      ['push', 'scheduleRequestTimeoutCheck', 'waitForPendingRequests', 'destroy'],
+      this.queues
+    )
+    this.watch(InstrumentationEventEmitter.prototype, ['addListener', 'emit'], this.emitters)
+  }
+
+  /**
+   * @param {object} prototype Original class prototype.
+   * @param {string[]} names Methods to observe.
+   * @param {Set<object>} seen Original receivers retained for measurement.
+   * @returns {void}
+   */
+  watch(prototype, names, seen) {
+    for (const name of names) {
+      const original = prototype[name]
+      prototype[name] = function (...args) {
+        seen.add(this)
+        return original.apply(this, args)
+      }
+      this.restores.push(() => {
+        prototype[name] = original
+      })
+    }
+  }
+
+  /** @returns {void} Restores observers only after the final resource proof. */
+  uninstall() {
+    for (const restore of this.restores.splice(0).reverse()) restore()
+    this.ledgers.clear()
+    this.queues.clear()
+    this.emitters.clear()
+  }
+
+  /** @returns {number} Entries still held by original ledgers, including retired acquisitions. */
+  ledgerSize() {
+    return [...this.ledgers].reduce((total, ledger) => total + ledger.size, 0)
+  }
+
+  /** @returns {number} Pending and in-flight requests, regardless of socket destruction. */
+  queueDepth() {
+    return [...this.queues].reduce(
+      (total, queue) => total + queue.pending.length + queue.inflight.size,
+      0
+    )
+  }
+
+  /**
+   * @param {Iterable<import('events').EventEmitter>} emitters Original client or queue emitters.
+   * @returns {number} Listeners over every event of every retained emitter.
+   */
+  listenerCount(emitters) {
+    let total = 0
+    for (const emitter of emitters)
+      for (const event of emitter.eventNames()) total += emitter.listenerCount(event)
+    return total
+  }
+
+  /**
+   * @param {object} sources Socket, process-listener and event-loop measurements.
+   * @returns {{ snapshot: () => Promise<object> }} Probe with fixed keys and measured owner totals.
+   */
+  probe(sources) {
+    const probe = createResourceProbe({
+      ...sources,
+      queueDepth: () => this.queueDepth(),
+      ledgerSize: () => this.ledgerSize(),
+    })
+    return {
+      snapshot: async () => {
+        const snapshot = await probe.snapshot()
+        return {
+          ...snapshot,
+          listeners: {
+            ...snapshot.listeners,
+            clients: this.listenerCount([...this.emitters].map(({ emitter }) => emitter)),
+            queues: this.listenerCount(this.queues),
+          },
+        }
+      },
+    }
+  }
+}
+
 /**
  * One live run of a lock scenario: two members share one partition under a three second lock,
  * a first-fetch gate gives member A the targeted acquisition, and the log, broker and handler
@@ -546,16 +662,14 @@ class LockCase {
     this.group = `e2e-p9e-lock-${kind}-group-${this.nonce}`
     this.stack = new CleanupStack()
     this.tap = new ShareWireTap()
-    this.probe = createResourceProbe({
+    this.gauge = new ResourceGauge()
+    this.probe = this.gauge.probe({
       emitters: { process },
       sockets: () => this.tap.socketCounts(),
-      queueDepth: () => this.tap.pending(),
-      ledgerSize: () => this.openHandlers,
       activeResources: true,
     })
     this.members = new Map()
     this.entries = []
-    this.openHandlers = 0
     this.handlerWork = new Set()
     this.startedAt = performance.now()
     this.requests = []
@@ -564,6 +678,8 @@ class LockCase {
     this.renewals = []
     this.renewOutcome = null
     this.fetched = null
+    this.gateAcquisitions = []
+    this.gateExpiry = null
     this.gateB = null
     this.baseline = null
     this.beforeAdmin = null
@@ -639,6 +755,8 @@ class LockCase {
    * @throws {Error} the first assertion or fixture failure, with cleanup failures attached
    */
   async run(scope) {
+    this.gauge.install()
+    if (this.kind === 'gate') this.watchGateAcquisition()
     try {
       const left = FILE_MS - (performance.now() - fileStart)
       if (left < this.scenario.budgetMs + JOIN_MS) {
@@ -672,6 +790,8 @@ class LockCase {
     } catch (error) {
       this.row('case-failed', { error: describeError(error), ...this.progress() })
       throw error
+    } finally {
+      this.gauge.uninstall()
     }
   }
 
@@ -683,8 +803,11 @@ class LockCase {
    */
   async setup(scope) {
     this.admin = this.client('admin').admin()
-    this.admin.on(this.admin.events.REQUEST, ({ payload }) => this.requests.push(payload))
     this.stack.add('prove cleanup and disconnect admin', (signal) => this.cleanup(signal))
+    this.stack.add(
+      'remove admin listeners',
+      this.admin.on(this.admin.events.REQUEST, ({ payload }) => this.requests.push(payload))
+    )
     this.stack.add('delete topic', (signal) => this.deleteTopic(signal))
     this.stack.add('delete group', (signal) => this.deleteGroup(signal))
     this.stack.add('reset group configs', (signal) => this.resetConfigs(signal))
@@ -707,7 +830,10 @@ class LockCase {
     this.row('resource-baseline', { snapshot: this.baseline })
 
     this.producer = this.client('producer').producer({ idempotent: true })
-    this.producer.on(this.producer.events.REQUEST, ({ payload }) => this.requests.push(payload))
+    this.stack.add(
+      'remove producer listeners',
+      this.producer.on(this.producer.events.REQUEST, ({ payload }) => this.requests.push(payload))
+    )
     this.stack.add('disconnect producer', () => this.producer.disconnect())
     await bounded(scope, 10000, () => this.producer.connect())
 
@@ -745,7 +871,10 @@ class LockCase {
       consumer.on(events.ACKNOWLEDGE, ({ payload }) =>
         member.acks.push({ ...payload, at: performance.now() })
       ),
-      consumer.on(events.LOCK_EXPIRED, ({ payload }) => member.expired.push(payload)),
+      consumer.on(events.LOCK_EXPIRED, ({ payload }) => {
+        member.expired.push(payload)
+        this.freezeGateExpiry()
+      }),
       consumer.on(events.CRASH, ({ payload }) => member.crashes.push(payload.error)),
       consumer.on(events.REQUEST, ({ payload }) => this.requests.push(payload)),
       consumer.on(events.FETCH, ({ payload }) => this.onFetch(member, payload)),
@@ -760,6 +889,83 @@ class LockCase {
     await bounded(scope, 10000, () => consumer.connect())
     await bounded(scope, 10000, () => consumer.subscribe({ topics: [this.topic] }))
     await bounded(scope, 15000, () => consumer.run({ eachMessage: this.handler(label, scope) }))
+  }
+
+  /** @returns {void} Records the original acquisition and its conservative expiry boundary. */
+  watchGateAcquisition() {
+    const owner = this
+    const original = ShareFetchLoop.prototype.adopt
+    ShareFetchLoop.prototype.adopt = function (...args) {
+      const cohort = original.apply(this, args)
+      if (
+        this.groupId === owner.group &&
+        this.memberId === owner.members.get('A')?.memberId &&
+        cohort.walk.deliver.records.length > 0
+      ) {
+        const [exchange, , , lockDuration] = args
+        owner.gateAcquisitions.push({
+          cohort,
+          sentAt: exchange.sentAt,
+          lockDuration,
+          deadline: exchange.sentAt + lockDuration,
+          identities: cohort.walk.deliver.records.map((message) =>
+            shareRecordIdentity({ ...message, topic: cohort.topic, partition: cohort.partition })
+          ),
+        })
+      }
+      return cohort
+    }
+    this.gauge.restores.push(() => {
+      ShareFetchLoop.prototype.adopt = original
+    })
+  }
+
+  /**
+   * Freezes original invocation intervals at the first callback crossing acquisition expiry.
+   * Handler entry/return times preserve the exact boundary even if the event loop resumes later.
+   * @returns {void}
+   */
+  freezeGateExpiry() {
+    const acquisition = this.gateAcquisitions[0]
+    if (this.gateExpiry || !acquisition || performance.now() < acquisition.deadline) return
+    const { deadline, identities, sentAt, lockDuration } = acquisition
+    const own = this.entriesOf('A').filter(({ at }) => at <= deadline)
+    const processed = own.map(({ identity }) => identity)
+    const active = own.filter(({ returnedAt }) => returnedAt === null || returnedAt > deadline)
+    this.gateExpiry = Object.freeze({
+      capturedAt: performance.now(),
+      deadline,
+      sentAt,
+      lockDuration,
+      processed: Object.freeze(processed),
+      dropped: Object.freeze(identities.filter((identity) => !processed.includes(identity))),
+      inFlight: Object.freeze(
+        active.map(({ invocation, identity, at }) => Object.freeze({ invocation, identity, at }))
+      ),
+      expected: Object.freeze(
+        [null, ...active.map(({ identity }) => identity)].map((duplicate) =>
+          Object.freeze(
+            identities.map((identity) => Object.freeze([identity, identity === duplicate ? 2 : 1]))
+          )
+        )
+      ),
+    })
+    this.row('held-set', { expiry: this.gateExpiry })
+  }
+
+  /**
+   * @returns {Map<string, number>} The sole matching multiset declared by the original expiry set.
+   * @throws {Error} For any replay or omission outside those predeclared alternatives.
+   */
+  gateExpectation() {
+    const actual = tally(this.entries.map(({ identity }) => identity))
+    const matching = this.gateExpiry.expected
+      .map((entries) => new Map(entries))
+      .filter((expected) =>
+        Object.values(multisetProblems(expected, actual)).every((problems) => problems.length === 0)
+      )
+    expect(matching).toHaveLength(1)
+    return matching[0]
   }
 
   /**
@@ -801,7 +1007,9 @@ class LockCase {
    */
   async handle(label, payload, scope) {
     const { topic, partition, message } = payload
+    this.freezeGateExpiry()
     const entry = {
+      invocation: this.entries.length + 1,
       member: label,
       identity: shareRecordIdentity({ ...message, topic, partition }),
       deliveryCount: message.deliveryCount,
@@ -810,13 +1018,12 @@ class LockCase {
       handled: false,
     }
     this.entries.push(entry)
-    this.openHandlers++
     try {
       await this.behave(entry, payload, scope)
       entry.handled = true
     } finally {
       entry.returnedAt = performance.now()
-      this.openHandlers--
+      this.freezeGateExpiry()
     }
   }
 
@@ -1095,27 +1302,36 @@ class LockCase {
     const a = this.members.get('A')
     const own = this.entriesOf('A')
     const second = this.entriesOf('B')
+    expect(this.gateAcquisitions).toHaveLength(1)
+    expect(this.gateAcquisitions[0].lockDuration).toBe(LOCK_MS)
+    expect([...this.gateAcquisitions[0].identities].sort()).toEqual([...this.expected].sort())
+    expect(this.gateExpiry).not.toBeNull()
+    const { processed: frozenProcessed, dropped, inFlight: frozenInvocations } = this.gateExpiry
+    const inFlight = frozenInvocations.map(({ identity }) => identity)
+    expect(inFlight.length).toBeLessThanOrEqual(1)
     const firstStart = own[0].at
     expect(own.filter(({ at }) => at > firstStart + LOCK_MS)).toEqual([])
     expect(own.every(({ deliveryCount }) => deliveryCount === 1)).toBe(true)
-    const processed = new Set(own.map(({ identity }) => identity))
+    const processed = new Set(frozenProcessed)
     expect(processed.size).toBe(own.length)
-    const dropped = this.expected.filter((identity) => !processed.has(identity))
+    expect([...processed].sort()).toEqual(own.map(({ identity }) => identity).sort())
+    expect([...processed, ...dropped].sort()).toEqual([...this.expected].sort())
     const received = tally(second.map(({ identity }) => identity))
     expect(second.every(({ deliveryCount }) => deliveryCount === 2)).toBe(true)
     expect([...received.values()].every((n) => n === 1)).toBe(true)
-    const inFlight = [...received.keys()].filter((identity) => processed.has(identity))
-    expect(inFlight.length).toBeLessThanOrEqual(1)
+    const duplicated = [...received.keys()].filter((identity) => processed.has(identity))
+    expect(duplicated.filter((identity) => !inFlight.includes(identity))).toEqual([])
+    expect(duplicated.length).toBeLessThanOrEqual(1)
     expect(dropped.filter((identity) => !received.has(identity))).toEqual([])
-    expect(received.size).toBe(dropped.length + inFlight.length)
-    this.expectedHandled = new Map(
-      this.expected.map((identity) => [identity, inFlight.includes(identity) ? 2 : 1])
-    )
+    expect(received.size).toBe(dropped.length + duplicated.length)
+    this.expectedHandled = this.gateExpectation()
     this.row('held-set', {
       acquiredAt: this.acquiredAt('A'),
       processed: [...processed],
       dropped,
       inFlight,
+      duplicated,
+      expiry: this.gateExpiry,
       firstStart,
     })
     const offsetOf = new Map(this.corpus.map(({ identity, offset }) => [identity, offset]))
@@ -1125,7 +1341,7 @@ class LockCase {
     expect(dropped.filter((identity) => !before.has(offsetOf.get(identity)))).toEqual([])
     expect([...processed].filter((identity) => before.has(offsetOf.get(identity)))).toEqual([])
     const accepted = () => a.acks.filter(({ type, error }) => type === 'accept' && error === null)
-    const lapse = this.acquiredAt('A') + LOCK_MS
+    const lapse = this.gateExpiry.deadline
     const lastReturn = Math.max(...own.map(({ returnedAt }) => returnedAt))
     expect(accepted().some(({ at }) => at < Math.min(lapse, lastReturn))).toBe(true)
     await this.observe(scope, 'Every finished record accepted', 15000, () => {
@@ -1544,6 +1760,164 @@ class LockCase {
     })
   }
 }
+
+describe('share gate expiry snapshot', () => {
+  /** @returns {LockCase} Original invocation intervals spanning a past acquisition deadline. */
+  const fixture = () => {
+    const run = new LockCase('gate')
+    const deadline = performance.now() - 100
+    run.row = () => {}
+    run.gateAcquisitions.push({
+      sentAt: deadline - LOCK_MS,
+      lockDuration: LOCK_MS,
+      deadline,
+      identities: ['completed', 'active', 'dropped'],
+    })
+    run.entries.push(
+      {
+        invocation: 1,
+        member: 'A',
+        identity: 'completed',
+        at: deadline - 400,
+        returnedAt: deadline - 200,
+      },
+      {
+        invocation: 2,
+        member: 'A',
+        identity: 'active',
+        at: deadline - 200,
+        returnedAt: deadline + 50,
+      }
+    )
+    run.freezeGateExpiry()
+    return run
+  }
+
+  it('freezes the active original at expiry even when the callback resumes after its return', () => {
+    const run = fixture()
+    const frozen = run.gateExpiry
+    expect(frozen.processed).toEqual(['completed', 'active'])
+    expect(frozen.dropped).toEqual(['dropped'])
+    expect(frozen.inFlight.map(({ invocation, identity }) => [invocation, identity])).toEqual([
+      [2, 'active'],
+    ])
+    run.entries.push({ member: 'B', identity: 'completed' })
+    run.freezeGateExpiry()
+    expect(run.gateExpiry).toBe(frozen)
+    expect(frozen.inFlight.map(({ identity }) => identity)).toEqual(['active'])
+  })
+
+  it.each([null, 'active'])('admits the predeclared optional replay %s', (duplicate) => {
+    const run = fixture()
+    run.entries.push({ member: 'B', identity: 'dropped' })
+    if (duplicate) run.entries.push({ member: 'B', identity: duplicate })
+    expect(run.gateExpectation().get('active')).toBe(duplicate ? 2 : 1)
+  })
+
+  it.each(['completed', 'foreign', 'third-delivery', 'missing-dropped'])(
+    'rejects %s without changing the frozen allowance',
+    (fault) => {
+      const run = fixture()
+      if (fault !== 'missing-dropped') run.entries.push({ member: 'B', identity: 'dropped' })
+      if (fault === 'third-delivery') {
+        run.entries.push({ member: 'B', identity: 'active' }, { member: 'B', identity: 'active' })
+      } else if (fault !== 'missing-dropped') {
+        run.entries.push({ member: 'B', identity: fault })
+      }
+      expect(() => run.gateExpectation()).toThrow()
+      expect(run.gateExpiry.inFlight.map(({ identity }) => identity)).toEqual(['active'])
+    }
+  )
+})
+
+describe('original share resource gauges', () => {
+  let gauge
+  let probe
+
+  beforeEach(() => {
+    gauge = new ResourceGauge()
+    gauge.install()
+    probe = gauge.probe({})
+  })
+
+  afterEach(() => gauge.uninstall())
+
+  it('detects a ledger entry after the application handler has returned', async () => {
+    const before = await probe.snapshot()
+    const ledger = new ShareAckLedger({
+      topic: 'resource-probe',
+      topicId: 'resource-probe-id',
+      partition: 0,
+      token: Symbol('original-acquisition'),
+      sentAt: 0,
+      lockDuration: 3000,
+      walk: {
+        deliver: { records: [{ offset: '0' }], deliveryCounts: [1] },
+        gaps: [],
+        release: [],
+        reject: [],
+      },
+    })
+    ledger.complete(['0'], 'accept')
+    expect((await probe.snapshot()).ledgerSize).toBe(before.ledgerSize + 1)
+    expect(await probe.snapshot()).not.toEqual(before)
+    ledger.invalidate('membership-lost')
+    expect(await probe.snapshot()).toEqual(before)
+  })
+
+  it.each([
+    ['pending', 0],
+    ['inflight', 1],
+  ])(
+    'detects an original %s request after its socket and queue are destroyed',
+    async (population, maxInFlightRequests) => {
+      const before = await probe.snapshot()
+      const socket = new net.Socket()
+      const queue = new RequestQueue({
+        maxInFlightRequests,
+        requestTimeout: 30000,
+        enforceRequestTimeout: false,
+        logger: { debug: () => {}, error: () => {} },
+        isConnected: () => !socket.destroyed,
+      })
+      try {
+        queue.push({
+          entry: { correlationId: 1, resolve: () => {}, reject: () => {} },
+          expectResponse: true,
+          sendRequest: () => {},
+        })
+        socket.destroy()
+        queue.destroy()
+        expect(population === 'pending' ? queue.pending.length : queue.inflight.size).toBe(1)
+        expect((await probe.snapshot()).queueDepth).toBe(before.queueDepth + 1)
+        expect(await probe.snapshot()).not.toEqual(before)
+        queue.settleAll(new Error('cleanup'))
+        expect(await probe.snapshot()).toEqual(before)
+      } finally {
+        socket.destroy()
+        queue.settleAll(new Error('cleanup'))
+        queue.destroy()
+      }
+    }
+  )
+
+  it('detects listeners on original client and destroyed queue emitters', async () => {
+    const before = await probe.snapshot()
+    const emitter = new InstrumentationEventEmitter()
+    const remove = emitter.addListener('client-listener', () => {})
+    expect((await probe.snapshot()).listeners.clients).toBe(before.listeners.clients + 1)
+    expect(await probe.snapshot()).not.toEqual(before)
+    remove()
+    expect(await probe.snapshot()).toEqual(before)
+    const queue = new RequestQueue({})
+    queue.on('queue-listener', () => {})
+    queue.destroy()
+    expect((await probe.snapshot()).listeners.queues).toBe(before.listeners.queues + 1)
+    expect(await probe.snapshot()).not.toEqual(before)
+    queue.removeAllListeners()
+    expect(await probe.snapshot()).toEqual(before)
+  })
+})
 
 describe('share wire tap', () => {
   const frame = (apiKey, payload) => {

@@ -26,6 +26,9 @@ const {
 } = require('../../../../testHelpers/shareFixtures')
 const { readLog } = require('../../../../testHelpers/rawLog')
 const { createResourceProbe } = require('../../../../testHelpers/resourceProbe')
+const RequestQueue = require('../../../network/requestQueue')
+const InstrumentationEventEmitter = require('../../../instrumentation/emitter')
+const { ShareAckLedger } = require('../shareAckLedger')
 const {
   NEVER,
   bounded,
@@ -304,6 +307,118 @@ const normalizeAssignment = (assignment) =>
     assignment.map(({ topic, partitions }) => [topic, [...partitions].sort((a, b) => a - b)]).sort()
   )
 
+/** Observes original resource owners without changing method results or receiver identities. */
+class ResourceGauge {
+  /** Retains owners until after the cleanup comparison, including destroyed connections. */
+  constructor() {
+    this.ledgers = new Set()
+    this.queues = new Set()
+    this.emitters = new Set()
+    this.restores = []
+  }
+
+  /** @returns {void} Installs call-through observers before clients are constructed. */
+  install() {
+    this.watch(
+      ShareAckLedger.prototype,
+      [
+        'canStart',
+        'decide',
+        'complete',
+        'completeRange',
+        'dropExpired',
+        'needsFlush',
+        'prepare',
+        'settle',
+        'invalidate',
+      ],
+      this.ledgers
+    )
+    this.watch(
+      RequestQueue.prototype,
+      ['push', 'scheduleRequestTimeoutCheck', 'waitForPendingRequests', 'destroy'],
+      this.queues
+    )
+    this.watch(InstrumentationEventEmitter.prototype, ['addListener', 'emit'], this.emitters)
+  }
+
+  /**
+   * @param {object} prototype Original class prototype.
+   * @param {string[]} names Methods to observe.
+   * @param {Set<object>} seen Original receivers retained for measurement.
+   * @returns {void}
+   */
+  watch(prototype, names, seen) {
+    for (const name of names) {
+      const original = prototype[name]
+      prototype[name] = function (...args) {
+        seen.add(this)
+        return original.apply(this, args)
+      }
+      this.restores.push(() => {
+        prototype[name] = original
+      })
+    }
+  }
+
+  /** @returns {void} Restores observers only after the final resource proof. */
+  uninstall() {
+    for (const restore of this.restores.splice(0).reverse()) restore()
+    this.ledgers.clear()
+    this.queues.clear()
+    this.emitters.clear()
+  }
+
+  /** @returns {number} Entries still held by original ledgers, including retired acquisitions. */
+  ledgerSize() {
+    return [...this.ledgers].reduce((total, ledger) => total + ledger.size, 0)
+  }
+
+  /** @returns {number} Pending and in-flight requests, regardless of socket destruction. */
+  queueDepth() {
+    return [...this.queues].reduce(
+      (total, queue) => total + queue.pending.length + queue.inflight.size,
+      0
+    )
+  }
+
+  /**
+   * @param {Iterable<import('events').EventEmitter>} emitters Original client or queue emitters.
+   * @returns {number} Listeners over every event of every retained emitter.
+   */
+  listenerCount(emitters) {
+    let total = 0
+    for (const emitter of emitters)
+      for (const event of emitter.eventNames()) total += emitter.listenerCount(event)
+    return total
+  }
+
+  /**
+   * @param {object} sources Socket, process-listener and event-loop measurements.
+   * @returns {{ snapshot: () => Promise<object> }} Probe with fixed keys and measured owner totals.
+   */
+  probe(sources) {
+    const probe = createResourceProbe({
+      ...sources,
+      queueDepth: () => this.queueDepth(),
+      ledgerSize: () => this.ledgerSize(),
+    })
+    return {
+      snapshot: async () => {
+        const snapshot = await probe.snapshot()
+        return {
+          ...snapshot,
+          listeners: {
+            ...snapshot.listeners,
+            clients: this.listenerCount([...this.emitters].map(({ emitter }) => emitter)),
+            queues: this.listenerCount(this.queues),
+          },
+        }
+      },
+    }
+  }
+}
+
 /**
  * One live run of the delivery scenario: two share members read a three-partition topic in one
  * group and must see every record exactly once, with the log, broker and handler checked
@@ -318,16 +433,14 @@ class DeliveryCase {
     this.stack = new CleanupStack()
     this.tap = new ShareWireTap()
     this.acknowledgements = new ShareAcknowledgementObserver()
-    this.probe = createResourceProbe({
+    this.gauge = new ResourceGauge()
+    this.probe = this.gauge.probe({
       emitters: { process },
       sockets: () => this.tap.socketCounts(),
-      queueDepth: () => this.tap.pending(),
-      ledgerSize: () => this.openHandlers,
       activeResources: true,
     })
     this.members = new Map()
     this.entries = []
-    this.openHandlers = 0
     this.requests = []
     this.expected = []
     this.firstAcquirer = null
@@ -395,6 +508,7 @@ class DeliveryCase {
    * @throws {Error} the first assertion or fixture failure, with cleanup failures attached
    */
   async run(scope) {
+    this.gauge.install()
     this.acknowledgements.install()
     try {
       await this.stack.run(
@@ -412,6 +526,7 @@ class DeliveryCase {
       throw error
     } finally {
       this.acknowledgements.restore()
+      this.gauge.uninstall()
     }
   }
 
@@ -426,8 +541,11 @@ class DeliveryCase {
     this.baseline = this.beforeAdmin
     const kafka = this.client('admin')
     this.admin = kafka.admin()
-    this.admin.on(this.admin.events.REQUEST, ({ payload }) => this.requests.push(payload))
     this.stack.add('prove cleanup and disconnect admin', (signal) => this.cleanup(signal))
+    this.stack.add(
+      'remove admin listeners',
+      this.admin.on(this.admin.events.REQUEST, ({ payload }) => this.requests.push(payload))
+    )
     this.stack.add('delete topic', (signal) => this.deleteTopic(signal))
     this.stack.add('delete group', (signal) => this.deleteGroup(signal))
     this.stack.add('reset group configs', (signal) => this.resetConfigs(signal))
@@ -454,7 +572,10 @@ class DeliveryCase {
     this.row('resource-baseline', { snapshot: this.baseline })
 
     this.producer = this.client('producer').producer({ idempotent: true })
-    this.producer.on(this.producer.events.REQUEST, ({ payload }) => this.requests.push(payload))
+    this.stack.add(
+      'remove producer listeners',
+      this.producer.on(this.producer.events.REQUEST, ({ payload }) => this.requests.push(payload))
+    )
     this.stack.add('disconnect producer', () => this.producer.disconnect())
     await bounded(scope, 15000, () => this.producer.connect())
 
@@ -508,12 +629,7 @@ class DeliveryCase {
             identity: shareRecordIdentity({ ...message, topic, partition }),
             deliveryCount: message.deliveryCount,
           })
-          this.openHandlers++
-          try {
-            await delay(scope, HANDLER_MS)
-          } finally {
-            this.openHandlers--
-          }
+          await delay(scope, HANDLER_MS)
           member.handled++
         },
       })
@@ -919,6 +1035,95 @@ class DeliveryCase {
     })
   }
 }
+
+describe('original share resource gauges', () => {
+  let gauge
+  let probe
+
+  beforeEach(() => {
+    gauge = new ResourceGauge()
+    gauge.install()
+    probe = gauge.probe({})
+  })
+
+  afterEach(() => gauge.uninstall())
+
+  it('detects a ledger entry after the application handler has returned', async () => {
+    const before = await probe.snapshot()
+    const ledger = new ShareAckLedger({
+      topic: 'resource-probe',
+      topicId: 'resource-probe-id',
+      partition: 0,
+      token: Symbol('original-acquisition'),
+      sentAt: 0,
+      lockDuration: 3000,
+      walk: {
+        deliver: { records: [{ offset: '0' }], deliveryCounts: [1] },
+        gaps: [],
+        release: [],
+        reject: [],
+      },
+    })
+    ledger.complete(['0'], 'accept')
+    expect((await probe.snapshot()).ledgerSize).toBe(before.ledgerSize + 1)
+    expect(await probe.snapshot()).not.toEqual(before)
+    ledger.invalidate('membership-lost')
+    expect(await probe.snapshot()).toEqual(before)
+  })
+
+  it.each([
+    ['pending', 0],
+    ['inflight', 1],
+  ])(
+    'detects an original %s request after its socket and queue are destroyed',
+    async (population, maxInFlightRequests) => {
+      const before = await probe.snapshot()
+      const socket = new net.Socket()
+      const queue = new RequestQueue({
+        maxInFlightRequests,
+        requestTimeout: 30000,
+        enforceRequestTimeout: false,
+        logger: { debug: () => {}, error: () => {} },
+        isConnected: () => !socket.destroyed,
+      })
+      try {
+        queue.push({
+          entry: { correlationId: 1, resolve: () => {}, reject: () => {} },
+          expectResponse: true,
+          sendRequest: () => {},
+        })
+        socket.destroy()
+        queue.destroy()
+        expect(population === 'pending' ? queue.pending.length : queue.inflight.size).toBe(1)
+        expect((await probe.snapshot()).queueDepth).toBe(before.queueDepth + 1)
+        expect(await probe.snapshot()).not.toEqual(before)
+        queue.settleAll(new Error('cleanup'))
+        expect(await probe.snapshot()).toEqual(before)
+      } finally {
+        socket.destroy()
+        queue.settleAll(new Error('cleanup'))
+        queue.destroy()
+      }
+    }
+  )
+
+  it('detects listeners on original client and destroyed queue emitters', async () => {
+    const before = await probe.snapshot()
+    const emitter = new InstrumentationEventEmitter()
+    const remove = emitter.addListener('client-listener', () => {})
+    expect((await probe.snapshot()).listeners.clients).toBe(before.listeners.clients + 1)
+    expect(await probe.snapshot()).not.toEqual(before)
+    remove()
+    expect(await probe.snapshot()).toEqual(before)
+    const queue = new RequestQueue({})
+    queue.on('queue-listener', () => {})
+    queue.destroy()
+    expect((await probe.snapshot()).listeners.queues).toBe(before.listeners.queues + 1)
+    expect(await probe.snapshot()).not.toEqual(before)
+    queue.removeAllListeners()
+    expect(await probe.snapshot()).toEqual(before)
+  })
+})
 
 describe('share wire tap', () => {
   const frame = (apiKey, payload) => {
