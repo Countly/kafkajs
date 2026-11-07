@@ -171,9 +171,22 @@ public final class JavaTelemetryClient {
                 throw failure;
             }
         }
-        /** @return nothing @throws RuntimeException on poll or commit failure */
+        /**
+         * Brackets each public poll with group metadata, independently of telemetry resource rows.
+         * Kafka's classic coordinator updates the member resource during a successful JoinGroup.
+         * @return nothing
+         * @throws RuntimeException on poll or commit failure
+         */
         @Override void work() {
-            if (!client.poll(Duration.ofMillis(100)).isEmpty()) client.commitSync(Duration.ofSeconds(3));
+            long before = System.currentTimeMillis();
+            String beforeMember = client.groupMetadata().memberId();
+            boolean received = !client.poll(Duration.ofMillis(100)).isEmpty();
+            System.out.println("{\"membership\":true,\"fromEpochMs\":" + before
+                + ",\"epochMs\":" + System.currentTimeMillis()
+                + ",\"beforeMemberId\":\"" + beforeMember
+                + "\",\"memberId\":\"" + client.groupMetadata().memberId() + "\"}");
+            System.out.flush();
+            if (received) client.commitSync(Duration.ofSeconds(3));
         }
         /** @return assigned UUID @throws TimeoutException if not assigned */
         @Override Uuid id() { return client.clientInstanceId(Duration.ZERO); }

@@ -8,6 +8,7 @@ const {
   ShareTrace,
   confirmedDecisions,
   acquisitionStart,
+  heldAcquisitions,
 } = require('../../../scripts/e2e/telemetry/shareEvidence')
 const { runCase } = require('../../../scripts/e2e/telemetry/evidence')
 const {
@@ -821,6 +822,8 @@ class OutcomeCase {
         'share.record.lock.duration.ms': LOCK_MS,
       })
     )
+    const metadata = await this.aux.fetchTopicMetadata({ topics: [topic] })
+    const topicId = metadata.topics.find((t) => t.name === topic).topicId
     const holder = this.build('share', 'share', { enabled: true, faults: true, group })
     this.shareOwned.push(() => holder.observer.closeClient(holder.client, { timeout: 1500 }))
     await this.within(10000, 'The holder connect', () => holder.client.connect())
@@ -842,7 +845,12 @@ class OutcomeCase {
         eachBatch: async ({ batch, acknowledge }) => {
           acquiredAt ??= clock.now()
           for (const message of batch.messages)
-            handled.push({ key: message.key.toString(), offset: message.offset })
+            handled.push({
+              topic: batch.topic,
+              partition: batch.partition,
+              key: message.key.toString(),
+              offset: message.offset,
+            })
           for (const message of batch.messages.slice(0, SHARE_ACCEPTED))
             acknowledge(message, 'accept')
           entered.resolve(batch.messages.length)
@@ -863,20 +871,26 @@ class OutcomeCase {
     const verifiedKeys = verified.map((tuple) => Buffer.from(tuple[3], 'hex').toString())
     expect([...verifiedKeys].sort()).toEqual(keys.slice(SHARE_ACCEPTED))
     expect(delivered.every((d) => d.deliveryCount >= 2)).toBe(true)
-    expect(handled.map((h) => h.key)).toEqual(keys)
+    expect(handled).toEqual(keys.map((key, i) => ({ topic, partition: 0, offset: String(i), key })))
     const log = await readLog({ brokers: [this.brokers[0]], topic })
     const logged = [...log.values()].flatMap(({ records }) => records.map((r) => r.key.toString()))
     expect([...logged].sort()).toEqual(keys)
     return {
       recovery,
       inputs: {
+        topic,
+        topicId,
+        metadata,
+        held: heldAcquisitions(holder.trace.snapshot(), group),
         group,
         acquiredAt: acquisitionStart(holder.trace.snapshot(), group),
         handlerAt: acquiredAt,
         expected: keys.map((key, i) => ({ key, valueHex: value(i).toString('hex') })),
         handled,
-        log: [...log.values()].flatMap(({ records }) =>
+        log: [...log.entries()].flatMap(([partition, { records }]) =>
           records.map((r) => ({
+            topic,
+            partition,
             key: r.key.toString(),
             offset: r.offset,
             valueHex: r.value.toString('hex'),
@@ -885,10 +899,22 @@ class OutcomeCase {
         frames: holder.trace.snapshot(),
         settlements: settlements.map(({ error, ...event }) => ({
           ...event,
-          error: error ? { name: error.name, reason: error.reason } : null,
+          error: error
+            ? {
+                name: error.name,
+                reason: error.reason,
+                retriable: error.retriable,
+                topic: error.topic,
+                partition: error.partition,
+              }
+            : null,
         })),
         confirmed: confirmedDecisions(holder.trace.snapshot(), group),
         redelivered: verifiedKeys.map((key, i) => ({
+          topic: verified[i][0],
+          partition: verified[i][1],
+          offset: verified[i][2],
+          valueHex: verified[i][4],
           key,
           deliveryCount: delivered[i].deliveryCount,
           at: observedAt,

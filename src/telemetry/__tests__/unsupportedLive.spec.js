@@ -4,7 +4,11 @@ const path = require('path')
 const { performance } = require('perf_hooks')
 const { Kafka, logLevel, KafkaJSTelemetryError } = require('../../../index')
 const { ordinaryOwnership } = require('../../../scripts/e2e/telemetry/semantics')
-const { ShareTrace, confirmedDecisions } = require('../../../scripts/e2e/telemetry/shareEvidence')
+const {
+  ShareTrace,
+  confirmedDecisions,
+  heldAcquisitions,
+} = require('../../../scripts/e2e/telemetry/shareEvidence')
 const { setShareGroupConfigs } = require('../../../testHelpers/shareFixtures')
 const { runCase } = require('../../../scripts/e2e/telemetry/evidence')
 const { TelemetryWireObserver } = require('../../../testHelpers/telemetryFixtures')
@@ -575,17 +579,26 @@ class UnsupportedCase {
       acks: -1,
       messages: keys.map((key) => ({ key, value: key, partition: 0 })),
     })
+    const metadata = await aux.fetchTopicMetadata({ topics: [topic] })
+    const topicId = metadata.topics.find((t) => t.name === topic).topicId
     const results = {}
     for (const owner of ['share', 'share-off']) {
       const group = `${this.stem}-share-group${owner.endsWith('-off') ? '-off' : ''}`
       await setShareGroupConfigs(aux, group, { 'share.auto.offset.reset': 'earliest' })
       const client = owner.endsWith('-off') ? this.off.share : this.on.share
       const handled = []
+      const settlements = []
+      this.defer(client.on(client.events.ACKNOWLEDGE, ({ payload }) => settlements.push(payload)))
       await client.subscribe({ topics: [topic] })
       await client.run({
         eachBatch: async ({ batch, acknowledge }) => {
           for (const message of batch.messages) {
-            handled.push({ key: message.key.toString(), offset: message.offset })
+            handled.push({
+              topic: batch.topic,
+              partition: batch.partition,
+              key: message.key.toString(),
+              offset: message.offset,
+            })
             acknowledge(message, 'accept')
           }
         },
@@ -603,14 +616,24 @@ class UnsupportedCase {
       const log = await readLog({ brokers: [`localhost:${PORTS[0]}`], topic })
       results[owner] = {
         group,
+        topic,
+        topicId,
+        metadata,
+        held: heldAcquisitions(this.traces[owner].snapshot(), group),
+        settlements: settlements.map(({ error, ...event }) => ({
+          ...event,
+          error: error ? { name: error.name, reason: error.reason } : null,
+        })),
         keys,
         handled,
         frames: this.traces[owner].snapshot(),
-        log: [...log.values()].flatMap(({ records }) =>
+        log: [...log.entries()].flatMap(([partition, { records }]) =>
           records.map((r) => ({
+            topic,
+            partition,
             key: r.key.toString(),
             offset: r.offset,
-            value: r.value.toString(),
+            valueHex: r.value.toString('hex'),
           }))
         ),
       }

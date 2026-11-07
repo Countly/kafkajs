@@ -1756,3 +1756,962 @@ describe('complete live telemetry archive verification', () => {
     expect(() => verifyScenario(record, directory)).toThrow()
   })
 })
+
+describe('required live archive dimensions and semantics', () => {
+  const { verifyScenario } = require('../../scripts/e2e/telemetry/evidence')
+  const { cacheRetirement } = require('../../scripts/e2e/telemetry/cacheTrace')
+  const {
+    confirmedDecisions,
+    heldAcquisitions,
+  } = require('../../scripts/e2e/telemetry/shareEvidence')
+  const Encoder = require('../../src/protocol/encoder')
+  const hash = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex')
+  const clone = (value) => JSON.parse(JSON.stringify(value))
+  const common = (kind, java = false) => ({
+    name: `org.apache.kafka.${kind === 'share' ? 'consumer' : kind}.connection.creation.total`,
+    kind: 'SUM',
+    unit: java ? '' : '1',
+    monotonic: true,
+    temporality: 'AGGREGATION_TEMPORALITY_DELTA',
+    res: 0,
+    pointsInMessage: 1,
+    points: [
+      {
+        attrs: [],
+        valueKind: java ? 'AS_DOUBLE' : 'AS_INT',
+        ...(java ? { asDouble: '1.0' } : { asInt: '1' }),
+        flags: 0,
+        startNs: '1',
+        timeNs: '2000000',
+      },
+    ],
+  })
+  /** @param {string} role Java kind @param {number} index window @returns {object[]} literal descriptors */
+  const javaMetrics = (role, index) => [
+    common(role, true),
+    ...['gauge.double', 'gauge.long', 'sum.total'].map((suffix) => ({
+      name: `org.apache.kafka.tf1.custom.${suffix}`,
+      unit: '',
+      res: 0,
+      pointsInMessage: 1,
+      kind: suffix === 'sum.total' ? 'SUM' : 'GAUGE',
+      ...(suffix === 'sum.total'
+        ? { monotonic: true, temporality: 'AGGREGATION_TEMPORALITY_DELTA' }
+        : {}),
+      points: [
+        {
+          attrs: [],
+          flags: 0,
+          startNs: '1',
+          timeNs: '2000000',
+          ...(suffix === 'gauge.long'
+            ? { valueKind: 'AS_INT', asInt: '4242' }
+            : {
+                valueKind: 'AS_DOUBLE',
+                asDouble: suffix === 'sum.total' ? (index === 0 ? '7.0' : '0.0') : '42.5',
+                ...(suffix === 'gauge.double' ? { asDoubleBits: '4045400000000000' } : {}),
+              }),
+        },
+      ],
+    })),
+  ]
+  /** Owns a finite full archive; edits regenerate all affected raw/decode/sink receipts and hashes. */
+  class Archive {
+    /** @param {string} scenario selected required scenario */
+    constructor(scenario) {
+      this.directory = fs.mkdtempSync(path.join(os.tmpdir(), 'telemetry-required-'))
+      this.files = {}
+      this.streams = {}
+      this.rows = []
+      this.next = 1
+      this.record = {
+        status: 'passed',
+        mode: 'configured',
+        run: { stem: 'required', line: '4.3.1' },
+        pushes: [],
+        zeroPushes: [],
+        allowed: {},
+        results: {},
+        sidecars: { root: 'case-required', scenario, owners: {}, files: [] },
+      }
+      this.oracles = {}
+    }
+
+    /** @param {string} owner label @param {string} kind public kind @param {object[]} snapshots metric trees @param {string} [fault] fault mode @returns {object} stream identities */
+    owner(owner, kind, snapshots = [], fault) {
+      const uuid = `00112233-4455-6677-8899-${String(this.next++).padStart(12, '0')}`
+      const clientId = `required-${owner}`
+      const get = {
+        type: 'request',
+        apiKey: 71,
+        apiVersion: 0,
+        requestKey: 'r1',
+        index: 1,
+        correlation: 1,
+        node: '1',
+        socketId: 1,
+        uuid: ID,
+        clientId,
+        writeAt: 0,
+        response: {
+          errorCode: 0,
+          uuid,
+          responseAt: 1,
+          subscriptionId: 1,
+          pushIntervalMs: 1000,
+          telemetryMaxBytes: 4096,
+          requestedMetrics: ['org.apache.kafka.', 'com.example.'],
+        },
+      }
+      const transcript = {
+        records: [
+          {
+            type: 'request',
+            apiKey: kind === 'producer' ? 0 : kind === 'consumer' ? 1 : 3,
+            clientId,
+            socketId: 3,
+          },
+          ...(kind === 'consumer' ? [{ type: 'request', apiKey: 8, clientId, socketId: 3 }] : []),
+          ...(snapshots.length ? [get] : []),
+        ],
+        sockets: [
+          { id: 3, kind: 'normal', foregroundBootstrap: true, node: '1' },
+          ...(snapshots.length
+            ? [{ id: 1, kind: 'telemetry', closedAt: fault ? 21 : 100000 }]
+            : []),
+        ],
+        closures: [],
+        faults: [],
+        cancellations: [],
+        failures: [],
+        cleanup: { children: 0, timers: 0, stillOpen: [], attached: 0 },
+      }
+      let recovery
+      if (fault) {
+        transcript.sockets.push({ id: 2, kind: 'telemetry', closedAt: 100000 })
+        transcript.faults.push({ socketId: 1, at: 10 })
+        if (fault !== 'blackhole') {
+          transcript.records.push({
+            type: 'request',
+            requestKey: 'r2',
+            apiKey: 72,
+            apiVersion: 0,
+            index: 2,
+            clientId,
+            socketId: 1,
+            correlation: 2,
+            writeAt: 20,
+            uuid,
+            metricsBytes: 1,
+          })
+          transcript.cancellations.push({
+            requestKey: 'r2',
+            apiKey: 72,
+            socketId: 1,
+            writeAt: 20,
+            at: 10,
+            end: 21,
+            disposition: 'faulted-transport',
+          })
+        }
+        transcript.records.push({
+          ...clone(get),
+          requestKey: 'r3',
+          index: 3,
+          socketId: 2,
+          uuid,
+          writeAt: 22,
+          response: { ...get.response, responseAt: 23 },
+        })
+        recovery = {
+          owner,
+          mode: fault,
+          uuid,
+          injectedAt: 10,
+          checkpoint: 1,
+          faultedSocket: 1,
+          injectedPush: fault === 'blackhole' ? null : 'r2',
+          attempted: { apiKey: 72, at: 20, correlation: 2 },
+          droppedCorrelation: fault === 'drop' ? 2 : null,
+          replacementGet: 'r3',
+          recoveredPush: 'r10',
+        }
+      }
+      const stream = { uuid, clientId, transcript, snapshots, recovery }
+      this.streams[owner] = stream
+      this.record.sidecars.owners[owner] = `case-required/${owner}/transcript.json`
+      for (const [index, decoded] of snapshots.entries()) {
+        const requestKey = `r${(index + 1) * 10}`
+        transcript.records.push({
+          type: 'request',
+          requestKey,
+          index: (index + 1) * 10,
+          apiKey: 72,
+          apiVersion: 0,
+          clientId,
+          uuid,
+          node: '1',
+          socketId: fault ? 2 : 1,
+          subscriptionId: 1,
+          compressionType: 0,
+          terminating: false,
+          writeAt: 1000 + index * 1001,
+          response: { errorCode: 0, responseAt: 1001 + index * 1001 },
+        })
+        this.record.pushes.push({ owner, requestKey })
+        decoded.parse = 'ok'
+        decoded.truncated = false
+      }
+      return stream
+    }
+
+    /** @returns {void} writes a self-consistent archive with refreshed bytes and digests */
+    save() {
+      const files = {}
+      const rows = clone(this.rows)
+      const put = (name, value) => {
+        files[`case-required/${name}`] = Buffer.isBuffer(value)
+          ? value
+          : Buffer.from(JSON.stringify(value))
+      }
+      for (const [owner, stream] of Object.entries(this.streams)) {
+        for (const [index, decoded] of stream.snapshots.entries()) {
+          const requestKey = `r${(index + 1) * 10}`
+          const request = stream.transcript.records.find((r) => r.requestKey === requestKey)
+          const raw = Buffer.from(JSON.stringify(decoded))
+          const digest = hash(raw)
+          Object.assign(request, { metricsBytes: raw.length, metricsSha256: digest })
+          const body = { ...decoded, dataBytes: raw.length, dataSha256: digest }
+          const item = {
+            requestKey,
+            uuid: stream.uuid,
+            node: '1',
+            compressionType: 0,
+            rawBytes: raw.length,
+            rawSha256: digest,
+            transmittedBytes: raw.length,
+            transmittedSha256: digest,
+            decoded: body,
+            exportIdentity: { node: '1', seq: rows.length + 1 },
+          }
+          put(`${owner}/push-${requestKey}.bin`, raw)
+          put(`${owner}/raw-${digest}.bin`, raw)
+          put(`${owner}/decoded-${requestKey}.json`, item)
+          put(`${owner}/decoder-${index}.json`, {
+            code: 0,
+            signal: null,
+            line: '4.3.1',
+            rawSha256: digest,
+            stdout:
+              JSON.stringify({ verified: true, line: '4.3.1' }) +
+              '\n' +
+              JSON.stringify(body) +
+              '\n',
+          })
+          rows.push(
+            row('1', rows.length + 1, {
+              ...body,
+              clientId: stream.clientId,
+              clientInstanceId: stream.uuid,
+              terminating: false,
+            })
+          )
+        }
+        put(`${owner}/transcript.json`, stream.transcript)
+      }
+      put('oracles.json', this.oracles)
+      put(
+        'exports-1.jsonl',
+        Buffer.from(rows.map((r, i) => JSON.stringify({ ...r, seq: i + 1 })).join('\n') + '\n')
+      )
+      for (const [relative, bytes] of Object.entries(files)) {
+        const file = path.join(this.directory, relative)
+        fs.mkdirSync(path.dirname(file), { recursive: true })
+        fs.writeFileSync(file, bytes)
+      }
+      this.record.sidecars.files = Object.entries(files).map(([path, bytes]) => ({
+        path,
+        bytes: bytes.length,
+        sha256: hash(bytes),
+      }))
+    }
+
+    /** @returns {void} full entrypoint, with no helper validator substitution */
+    verify() {
+      this.save()
+      verifyScenario(this.record, this.directory)
+    }
+  }
+  let archive
+  afterEach(() => {
+    if (archive) fs.rmSync(archive.directory, { recursive: true, force: true })
+  })
+  /** @returns {Archive} complete seven-client interop archive */
+  const javaArchive = () => {
+    const a = new Archive('telemetry-java')
+    archive = a
+    const r = a.record.results
+    r.java = {}
+    r.js = {}
+    r.uuids = { java: {}, js: {} }
+    for (const kind of ['producer', 'consumer', 'admin', 'share']) {
+      const stream = a.owner(
+        `js-${kind}`,
+        kind,
+        Array.from({ length: 3 }, () => ({ metrics: [common(kind)], resources: [{ attrs: [] }] }))
+      )
+      r.js[kind] = { uuid: stream.uuid }
+      r.uuids.js[kind] = stream.uuid
+    }
+    for (const role of ['producer', 'consumer', 'admin']) {
+      const uuid = `11223344-4455-6677-8899-${String(a.next++).padStart(12, '0')}`
+      r.uuids.java[role] = uuid
+      const membership = {
+        membership: true,
+        fromEpochMs: 0,
+        epochMs: 1,
+        beforeMemberId: '',
+        memberId: 'member',
+      }
+      r.java[role] = {
+        uuid,
+        assignedId: `required-java-${role}`,
+        closing: { closing: true, epochMs: 30 },
+        closed: { closed: true, epochMs: 40 },
+        exitCode: 0,
+        exitSignal: null,
+        closeToExitMs: 10,
+        liveDescendants: [],
+        stdout: JSON.stringify(membership) + '\n',
+      }
+      for (let index = 0; index < 3; index++)
+        a.rows.push(
+          row('1', a.rows.length + 1, {
+            tsMs: index === 2 ? 35 : 10 + index,
+            clientInstanceId: uuid,
+            clientId: `required-java-${role}`,
+            terminating: index === 2,
+            truncated: false,
+            resourceMetricsCount: 1,
+            metricsTotal: 4,
+            metricsKept: 4,
+            pointsTotal: 4,
+            resources: [
+              {
+                attrs:
+                  role === 'consumer'
+                    ? [
+                        ['group_id', 'string', 'required-java-consumer-group'],
+                        ['group_member_id', 'string', 'member'],
+                      ]
+                    : [],
+                droppedAttributes: 0,
+              },
+            ],
+            metrics: javaMetrics(role, index),
+          })
+        )
+    }
+    const fixture = path.join(__dirname, '../../scripts/e2e/telemetry')
+    const cache = fs
+      .readFileSync(path.join(fixture, 'interop.sha256'), 'utf8')
+      .trim()
+      .split('\n')
+      .map((line) => {
+        const [sha256, name] = line.trim().split(/\s+/)
+        return { name, sha256 }
+      })
+    a.record.fixture = { clientSourceSha256: 'a'.repeat(64), runnerSha256: 'b'.repeat(64) }
+    r.provenance = {
+      sourceSha256: a.record.fixture.clientSourceSha256,
+      runnerSha256: a.record.fixture.runnerSha256,
+      cache,
+      jdk: Object.fromEntries(
+        ['producer', 'consumer', 'admin'].map((role) => [role, { jdk: '21', vendor: 'OpenJDK' }])
+      ),
+    }
+    return a
+  }
+  test('verifies a complete Java archive with independent role resources and every JS export', () => {
+    javaArchive().verify()
+  })
+  test.each(['owner', 'Java role'])(
+    'rejects a deleted required %s from an otherwise complete archive',
+    (dimension) => {
+      const a = javaArchive()
+      a.verify()
+      if (dimension === 'owner') delete a.record.sidecars.owners['js-admin']
+      else delete a.record.results.java.admin
+      expect(() => a.verify()).toThrow(/Required.*catalogue/)
+    }
+  )
+  test('rejects a later JS common counter change with matching raw decode sink and refreshed hashes', () => {
+    const a = javaArchive()
+    a.verify()
+    a.streams['js-admin'].snapshots[2].metrics[0].monotonic = false
+    expect(() => a.verify()).toThrow()
+  })
+  test.each([
+    'missing',
+    'foreign',
+    'inapplicable',
+    'value',
+    'unit',
+    'dynamic-member',
+    'missing-member',
+    'duplicate',
+  ])('rejects Java %s resource or descriptor evidence', (change) => {
+    const a = javaArchive()
+    a.verify()
+    for (const r of a.rows.filter(
+      (r) =>
+        r.clientId ===
+        (change === 'inapplicable' ? 'required-java-admin' : 'required-java-consumer')
+    )) {
+      if (change === 'missing') r.resources[0].attrs.shift()
+      if (change === 'foreign') r.resources[0].attrs.push(['foreign', 'string', 'x'])
+      if (change === 'inapplicable')
+        r.resources[0].attrs.push(['transactional_id', 'string', 'foreign'])
+      if (change === 'value') r.resources[0].attrs[0][2] = 'foreign-group'
+      if (change === 'dynamic-member') r.resources[0].attrs[1][2] = 'foreign-member'
+      if (change === 'missing-member') r.resources[0].attrs.pop()
+      if (change === 'duplicate') r.resources[0].attrs.push(r.resources[0].attrs[0])
+      if (change === 'unit') r.metrics[1].unit = '1'
+    }
+    expect(() => a.verify()).toThrow()
+  })
+  /** @returns {Archive} complete custom lifecycle archive */
+  const customArchive = () => {
+    const a = new Archive('telemetry-custom')
+    archive = a
+    const values = [
+      { anchor: '1.0', negative: '-2.5', zero: '0.0', total: '9007199254740993' },
+      { anchor: '1.0', negative: '-3.5', zero: '6.25', total: '9' },
+      { anchor: '1.0', negative: '-3.5', zero: '6.25', total: '0' },
+      { anchor: '1.0', negative: '-3.5' },
+      { anchor: '1.0', negative: '-3.5', total: '1' },
+    ]
+    const snapshots = values.map((v, index) => ({
+      resourceMetricsCount: 1,
+      resources: [{ attrs: [], droppedAttributes: 0 }],
+      metricsTotal: Object.keys(v).length,
+      metricsKept: Object.keys(v).length,
+      pointsTotal: Object.keys(v).length,
+      metrics: Object.entries(v).map(([name, value]) => ({
+        name: `com.example.${name}`,
+        unit: '1',
+        res: 0,
+        pointsInMessage: 1,
+        kind: name === 'total' ? 'SUM' : 'GAUGE',
+        ...(name === 'total'
+          ? { monotonic: true, temporality: 'AGGREGATION_TEMPORALITY_DELTA' }
+          : {}),
+        points: [
+          {
+            attrs: [['series', 'string', 'live']],
+            startNs: index === 4 ? '100' : '1',
+            timeNs: '200',
+            ...(name === 'total'
+              ? { valueKind: 'AS_INT', asInt: value }
+              : { valueKind: 'AS_DOUBLE', asDouble: value }),
+            ...(name === 'zero' && index === 0 ? { asDoubleBits: '0' } : {}),
+            ...(name === 'negative' && index === 0 ? { asDoubleBits: 'c004000000000000' } : {}),
+          },
+        ],
+      })),
+    }))
+    const stream = a.owner('producer', 'producer', snapshots)
+    a.record.results = {
+      uuid: stream.uuid,
+      firstRequestKey: 'r10',
+      update: { updateFence: 15, requestKeys: ['r20', 'r30'], states: ['updated', 'following'] },
+      removal: {
+        requestKey: 'r40',
+        removeFence: 35,
+        cursor: { 1: 3 },
+        names: ['com.example.anchor', 'com.example.negative'],
+      },
+      readded: { requestKey: 'r50', readdFence: 45, startNs: '100', asInt: '1' },
+      unregisterFence: 55,
+    }
+    return a
+  }
+  test('verifies exact custom resource metric and point cardinalities in every lifecycle window', () => {
+    customArchive().verify()
+  })
+  test.each(['metric', 'series', 'resource', 'point-count'])(
+    'rejects a later custom duplicate %s with consistent raw decode sink and hashes',
+    (change) => {
+      const a = customArchive()
+      a.verify()
+      const d = a.streams.producer.snapshots[2]
+      if (change === 'metric') {
+        d.metrics.push(clone(d.metrics[2]))
+        d.metricsTotal++
+        d.metricsKept++
+        d.pointsTotal++
+      }
+      if (change === 'series') {
+        d.metrics[2].points.push(clone(d.metrics[2].points[0]))
+        d.metrics[2].pointsInMessage++
+        d.pointsTotal++
+      }
+      if (change === 'resource') {
+        d.resources.push(clone(d.resources[0]))
+        d.resourceMetricsCount++
+      }
+      if (change === 'point-count') d.pointsTotal++
+      expect(() => a.verify()).toThrow()
+    }
+  )
+  /** @param {string} topicId owned or deliberately foreign UUID @param {number} [releaseAt] broker confirmation time @returns {object[]} original acquisition and acknowledgements */
+  const shareFrames = (topicId, releaseAt = 301, releaseType = 2) => {
+    const frame = (buffer) => new Encoder().writeInt32(buffer.length).writeBuffer(buffer).buffer
+    const exchange = (apiKey, correlation, batches, acquired, at, responseAt) => {
+      const partition = new Encoder()
+        .writeInt32(0)
+        .writeUVarIntArray(
+          batches.map(([first, last, type]) =>
+            new Encoder()
+              .writeInt64(first)
+              .writeInt64(last)
+              .writeUVarIntArray([new Encoder().writeInt8(type)])
+              .writeTaggedFields([])
+          )
+        )
+        .writeTaggedFields([])
+      const topic = new Encoder()
+        .writeUuid(topicId)
+        .writeUVarIntArray([partition])
+        .writeTaggedFields([])
+      const body = new Encoder()
+        .writeUVarIntString('share-group')
+        .writeUVarIntString('member')
+        .writeInt32(1)
+      if (apiKey === 78)
+        body
+          .writeInt32(100)
+          .writeInt32(1)
+          .writeInt32(4096)
+          .writeInt32(10)
+          .writeInt32(10)
+          .writeInt8(0)
+      body.writeBoolean(false).writeUVarIntArray([topic])
+      if (apiKey === 78) body.writeUVarIntArray([])
+      body.writeTaggedFields([])
+      const request = frame(
+        new Encoder()
+          .writeInt16(apiKey)
+          .writeInt16(2)
+          .writeInt32(correlation)
+          .writeString('holder')
+          .writeTaggedFields([])
+          .writeEncoder(body).buffer
+      )
+      const reply = require(
+        apiKey === 78 ? '../wire/shareFetchV2' : '../wire/shareAcknowledgeV2'
+      ).buildResponse({
+        errorCode: 0,
+        errorMessage: null,
+        throttleTime: 0,
+        acquisitionLockTimeoutMs: 15000,
+        nodeEndpoints: [],
+        responses: [
+          {
+            topicId,
+            partitions: [
+              {
+                partitionIndex: 0,
+                errorCode: 0,
+                errorMessage: null,
+                acknowledgeErrorCode: 0,
+                acknowledgeErrorMessage: null,
+                currentLeader: { leaderId: 1, leaderEpoch: 0 },
+                records: '',
+                acquiredRecords: acquired,
+              },
+            ],
+          },
+        ],
+      })
+      return {
+        at,
+        responseAt,
+        requestHex: request.toString('hex'),
+        responseHex: frame(
+          new Encoder().writeInt32(correlation).writeTaggedFields([]).writeBuffer(reply).buffer
+        ).toString('hex'),
+      }
+    }
+    return [
+      exchange(78, 1, [], [{ firstOffset: '0', lastOffset: '9', deliveryCount: 1 }], 100, 110),
+      exchange(79, 2, [['0', '3', 1]], [], 200, 201),
+      exchange(79, 3, [['4', '9', releaseType]], [], 300, releaseAt),
+    ]
+  }
+  /** @returns {Archive} full configured outcomes archive, including raw share confirmations */
+  const outcomesArchive = () => {
+    const a = new Archive('telemetry-outcomes')
+    archive = a
+    const r = a.record.results
+    r.arms = {}
+    r.faults = {}
+    for (const name of ['control', 'optin', 'drop', 'blackhole', 'late']) {
+      for (const kind of ['producer', 'consumer']) {
+        const stream = a.owner(
+          `${name}-${kind}`,
+          kind,
+          name === 'control' ? [] : [{ metrics: [common(kind)], resources: [{ attrs: [] }] }],
+          ['drop', 'blackhole', 'late'].includes(name) ? name : undefined
+        )
+        if (stream.recovery) (r.faults[name] ??= []).push(stream.recovery)
+      }
+      const ends = { 0: '334', 1: '333', 2: '333' }
+      const offsets = [0, 0, 0]
+      const log = Array.from({ length: 1000 }, (_, i) => ({
+        key: `required-${name}-${String(i).padStart(4, '0')}`,
+        valueHex: '00',
+        partition: i % 3,
+        offset: String(offsets[i % 3]++),
+      }))
+      const digest = hash(
+        Buffer.from(
+          log
+            .map((r) => r.key)
+            .sort()
+            .join('\n')
+        )
+      )
+      r.arms[name] = {
+        count: 1000,
+        expectedSha256: digest,
+        logSha256: digest,
+        handlerSha256: digest,
+        handlerEntries: 1000,
+        rawEnd: ends,
+        rawCommitted: ends,
+        processedNext: ends,
+      }
+      a.oracles[name] = {
+        expected: log.map(({ key, valueHex, partition }) => ({ key, valueHex, partition })),
+        log,
+        handled: clone(log),
+        ends,
+        commits: Object.entries(ends).map(([partition, offset]) => ({
+          partition: Number(partition),
+          offset,
+        })),
+      }
+    }
+    const stream = a.owner(
+      'share',
+      'share',
+      [{ metrics: [common('share')], resources: [{ attrs: [] }] }],
+      'drop'
+    )
+    const topic = 'required-share-topic'
+    const topicId = 'ffeeddcc-bbaa-9988-7766-554433221100'
+    const frames = shareFrames(topicId)
+    const log = Array.from({ length: 10 }, (_, i) => ({
+      topic,
+      partition: 0,
+      offset: String(i),
+      key: `share-${i}`,
+      valueHex: '00',
+    }))
+    a.oracles.share = {
+      topic,
+      topicId,
+      metadata: { topics: [{ name: topic, topicId }] },
+      group: 'share-group',
+      acquiredAt: 100,
+      handlerAt: 120,
+      expected: log.map(({ key, valueHex }) => ({ key, valueHex })),
+      log,
+      handled: clone(log),
+      frames,
+      held: heldAcquisitions(frames, 'share-group'),
+      confirmed: confirmedDecisions(frames, 'share-group'),
+      settlements: [
+        { topic, partition: 0, firstOffset: '0', lastOffset: '3', type: 'accept', error: null },
+        {
+          topic,
+          partition: 0,
+          firstOffset: '4',
+          lastOffset: '9',
+          type: 'release',
+          error: {
+            name: 'KafkaJSShareAcknowledgementError',
+            reason: 'membership-lost',
+            retriable: false,
+            topic,
+            partition: 0,
+          },
+        },
+      ],
+      redelivered: log.slice(4).map((r) => ({ ...r, deliveryCount: 2, at: 400 })),
+    }
+    r.share = {
+      recovery: stream.recovery,
+      lockMs: 15000,
+      redelivered: log
+        .slice(4)
+        .map((r) => r.key)
+        .sort(),
+    }
+    return a
+  }
+  test('verifies configured ordinary fault arms and exact share topic offset handler and settlement identities', () => {
+    outcomesArchive().verify()
+  })
+  test.each(['ordinary arm', 'fault mode'])(
+    'rejects a deleted required %s and its obligations',
+    (dimension) => {
+      const a = outcomesArchive()
+      a.verify()
+      if (dimension === 'ordinary arm') {
+        delete a.record.results.arms.drop
+        delete a.record.results.faults.drop
+      } else delete a.record.results.faults.late
+      expect(() => a.verify()).toThrow(/Required.*catalogue/)
+    }
+  )
+  test.each([
+    'missing-recovery',
+    'unexercised-recovery',
+    'foreign-topic',
+    'handler-offset',
+    'extra-settlement',
+    'duplicate-settlement',
+    'lock-expired-release',
+    'duplicate-broker-settlement',
+    'foreign-acquisition',
+    'public-topic',
+  ])('rejects share %s through the full archive verifier', (change) => {
+    const a = outcomesArchive()
+    a.verify()
+    const inputs = a.oracles.share
+    if (change === 'missing-recovery') delete a.record.results.share.recovery
+    if (change === 'unexercised-recovery') a.record.results.share.recovery.recoveredPush = 'r99'
+    if (change === 'foreign-topic') {
+      inputs.frames.splice(1, 2, ...shareFrames(ID).slice(1))
+      inputs.confirmed = confirmedDecisions(inputs.frames, inputs.group)
+    }
+    if (change === 'handler-offset') inputs.handled[4].offset = '5'
+    if (change === 'extra-settlement')
+      inputs.settlements.push({ ...inputs.settlements[0], firstOffset: '10', lastOffset: '10' })
+    if (change === 'duplicate-settlement') inputs.settlements.push(clone(inputs.settlements[0]))
+    if (change === 'lock-expired-release') {
+      inputs.frames = shareFrames(inputs.topicId, 15100)
+      inputs.confirmed = confirmedDecisions(inputs.frames, inputs.group)
+    }
+    if (change === 'duplicate-broker-settlement') {
+      inputs.frames.push(clone(inputs.frames[1]))
+      inputs.confirmed = confirmedDecisions(inputs.frames, inputs.group)
+    }
+    if (change === 'foreign-acquisition') {
+      inputs.frames[0] = shareFrames(ID)[0]
+      inputs.held = heldAcquisitions(inputs.frames, inputs.group)
+    }
+    if (change === 'public-topic') inputs.settlements[1].topic = 'foreign'
+    expect(() => a.verify()).toThrow()
+  })
+  /** @returns {Archive} all four reopen episodes, three zero-timeout owners and admin blackhole */
+  const shutdownArchive = () => {
+    const a = new Archive('telemetry-shutdown')
+    archive = a
+    const r = a.record.results
+    r.episodes = {}
+    r.timeout0 = {}
+    r.loggerReceipts = []
+    r.originalLevels = {}
+    r.restoredLevels = {}
+    for (const id of ['1', '2', '3']) {
+      r.originalLevels[id] = r.restoredLevels[id] = {
+        'org.apache.kafka.server.ClientMetricsManager': null,
+        'kafka.request.logger': null,
+      }
+      for (let n = 0; n < 3; n++)
+        r.loggerReceipts.push({
+          id,
+          action: ['--describe'],
+          result: { code: 0, stdout: '', truncated: false },
+        })
+    }
+    for (const kind of ['producer', 'consumer', 'admin', 'share']) {
+      const stream = a.owner(`${kind}-ep`, kind, [
+        { metrics: [common(kind)], resources: [{ attrs: [] }] },
+      ])
+      const get = stream.transcript.records.find((r) => r.apiKey === 71)
+      const connectionId = '172.18.0.3:9092-172.18.0.1:54321-3'
+      const trace = {
+        node: '1',
+        localPort: '9092',
+        uuid: stream.uuid,
+        since: '2026-11-07T10:00:00Z',
+        completedAt: '2026-11-07T10:00:05Z',
+        source: {
+          sha256: 'a'.repeat(64),
+          receipt: { code: 0, stdout: 'a'.repeat(64) + ' source' },
+        },
+        get,
+        connect: {
+          socketId: 1,
+          node: '1',
+          localAddress: '127.0.0.1',
+          localPort: 54321,
+          remoteAddress: '127.0.0.1',
+          remotePort: 19092,
+        },
+        loggerReadbacks: r.loggerReceipts,
+        logs: {
+          1: {
+            text: `TRACE Completed request:RequestHeader(apiKey=GET_TELEMETRY_SUBSCRIPTIONS, clientId=${stream.clientId}, correlationId=1) -- GetTelemetrySubscriptionsRequestData(clientInstanceId=${ID}) with response:GetTelemetrySubscriptionsResponseData(clientInstanceId=${stream.uuid}) from connection ${connectionId};totalTime:1\nTRACE Removing client connection id [${connectionId}] from the client instance cache`,
+          },
+          2: { text: '' },
+          3: { text: '' },
+        },
+      }
+      const cacheEvent = cacheRetirement(trace)
+      a.oracles[kind] = trace
+      r.episodes[kind] = {
+        before: { uuid: stream.uuid, serverConnectionIdentity: cacheEvent.connectionIdentity },
+        cacheEvent,
+        reopen: {
+          calledBeforeCacheAwait: true,
+          cachedUuid: stream.uuid,
+          get: { requestUuid: stream.uuid },
+          finalResends: 0,
+          correctiveExtraPushes: 0,
+        },
+        close: { getOrConnectOrAuthFrames: [] },
+      }
+    }
+    for (const kind of ['producer', 'consumer', 'share']) {
+      const stream = a.owner(`${kind}-t0`, kind, [
+        { metrics: [common(kind)], resources: [{ attrs: [] }] },
+      ])
+      r.timeout0[kind] = { uuid: stream.uuid, finalZeroTimeoutWrites: 0 }
+    }
+    const blackhole = a.owner('admin-bh', 'admin', [
+      { metrics: [common('admin')], resources: [{ attrs: [] }] },
+    ])
+    r.blackhole = { uuid: blackhole.uuid, faultedSocket: 1 }
+    return a
+  }
+  test('verifies every shutdown and zero-timeout owner against its required episode', () => {
+    shutdownArchive().verify()
+  })
+  test.each(['episode', 'zero-timeout', 'blackhole'])(
+    'rejects a deleted required shutdown %s from the archive',
+    (dimension) => {
+      const a = shutdownArchive()
+      a.verify()
+      if (dimension === 'episode') delete a.record.results.episodes.admin
+      if (dimension === 'zero-timeout') delete a.record.results.timeout0.share
+      if (dimension === 'blackhole') delete a.record.results.blackhole
+      expect(() => a.verify()).toThrow(/Required|Missing admin blackhole/)
+    }
+  )
+  /** @returns {Archive} capable L6 full archive under both telemetry options */
+  const unsupportedArchive = () => {
+    const a = outcomesArchive()
+    const corpus = a.record.results.arms.control
+    const inputs = a.oracles.control
+    a.streams = {}
+    a.record.pushes = []
+    a.record.sidecars.owners = {}
+    a.record.sidecars.scenario = 'telemetry-unsupported'
+    a.record.corpus = corpus
+    a.record.outcomes = {}
+    a.record.disabledOutcomes = {}
+    a.record.results = { disabledCorpus: corpus, ownership: {} }
+    a.oracles = { corpus: inputs, disabledCorpus: inputs, share: {} }
+    const topic = 'required-share-work'
+    const topicId = 'ffeeddcc-bbaa-9988-7766-554433221100'
+    for (const kind of ['producer', 'consumer', 'admin', 'share']) {
+      for (const owner of [kind, `${kind}-off`]) {
+        const stream = a.owner(owner, kind)
+        stream.transcript.records.push({ type: 'connect', socketId: 3 })
+        a.record.outcomes[kind] = a.record.disabledOutcomes[kind] = { status: 'connected' }
+      }
+      a.record.results.ownership[kind] = { on: ['1:bootstrap'], off: ['1:bootstrap'] }
+    }
+    for (const owner of ['share', 'share-off']) {
+      const frames = shareFrames(topicId, 301, 1)
+      const keys = Array.from({ length: 10 }, (_, i) => `share-${i}`)
+      const log = keys.map((key, i) => ({
+        topic,
+        partition: 0,
+        offset: String(i),
+        key,
+        valueHex: Buffer.from(key).toString('hex'),
+      }))
+      a.oracles.share[owner] = {
+        topic,
+        topicId,
+        metadata: { topics: [{ name: topic, topicId }] },
+        group: 'share-group',
+        keys,
+        frames,
+        held: heldAcquisitions(frames, 'share-group'),
+        log,
+        handled: clone(log),
+        settlements: [
+          { topic, partition: 0, firstOffset: '0', lastOffset: '9', type: 'accept', error: null },
+        ],
+      }
+    }
+    return a
+  }
+  test('verifies capable L6 topic and exact acquisition handler and broker identities for both options', () => {
+    unsupportedArchive().verify()
+  })
+  test.each(['share', 'share-off'])(
+    'rejects capable L6 foreign-topic offsets for %s with refreshed hashes',
+    (owner) => {
+      const a = unsupportedArchive()
+      a.verify()
+      const share = a.oracles.share[owner]
+      share.frames.splice(1, 2, ...shareFrames(ID, 301, 1).slice(1))
+      expect(() => a.verify()).toThrow()
+    }
+  )
+  test('verifies the base outcomes catalogue and rejects a missing ordinary arm', () => {
+    const a = outcomesArchive()
+    a.record.mode = 'base'
+    a.record.run.line = '4.1.2'
+    a.record.results.arms = {
+      control: a.record.results.arms.control,
+      optin: a.record.results.arms.optin,
+    }
+    a.record.results.faults = {}
+    a.oracles = { control: a.oracles.control, optin: a.oracles.optin }
+    a.record.results.inapplicable = {
+      drop: 'absent telemetry transport',
+      blackhole: 'absent telemetry transport',
+      late: 'absent telemetry transport',
+    }
+    a.record.results.share = {
+      status: 'rejected',
+      name: 'KafkaJSShareGroupsNotSupportedError',
+      reason: 'api-version-range',
+      apiKey: 78,
+      shareVersion: 0,
+    }
+    a.streams = {}
+    a.record.pushes = []
+    a.record.sidecars.owners = {}
+    for (const owner of [
+      'control-producer',
+      'control-consumer',
+      'optin-producer',
+      'optin-consumer',
+      'share',
+    ])
+      a.owner(owner, owner.split('-').at(-1))
+    a.verify()
+    delete a.record.results.arms.optin
+    expect(() => a.verify()).toThrow(/Required ordinary arm catalogue/)
+  })
+})

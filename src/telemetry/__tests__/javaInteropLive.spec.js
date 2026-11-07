@@ -6,7 +6,7 @@ const path = require('path')
 const { performance } = require('perf_hooks')
 const { spawn } = require('child_process')
 const { Kafka, logLevel } = require('../../../index')
-const { assertJavaRows } = require('../../../scripts/e2e/telemetry/semantics')
+const { assertJavaRows, assertJsCounter } = require('../../../scripts/e2e/telemetry/semantics')
 const { runCase } = require('../../../scripts/e2e/telemetry/evidence')
 const {
   TelemetryExportReader,
@@ -361,6 +361,12 @@ class JavaInteropCase {
     const child = this.roles[role]
     assertJavaRows(role, rows, {
       clientId: this.ids.java[role],
+      group: `${this.stem}-java-consumer-group`,
+      membership: child.stdout
+        .trim()
+        .split('\n')
+        .map(JSON.parse)
+        .filter((r) => r.membership === true),
       closing: child.marker('closing')?.fields,
       closed: child.marker('closed')?.fields,
     })
@@ -543,8 +549,9 @@ class JavaInteropCase {
       })
       const counter = `org.apache.kafka.${kind === 'share' ? 'consumer' : kind}.connection.creation.total`
       const decodedSamples = []
-      for (const push of jsPushes[kind].slice(0, 2)) {
+      for (const push of jsPushes[kind]) {
         const item = await observer.decodeAccepted(push)
+        assertJsCounter(kind, item.decoded)
         this.pushes.push({ owner: `js-${kind}`, requestKey: push.requestKey })
         decodedSamples.push(item)
         const names = item.decoded.metrics.map((m) => m.name)
@@ -572,6 +579,11 @@ class JavaInteropCase {
       }
     }
     await settle(KINDS.map((kind) => () => js[kind].observer.closeClient(js[kind].client)))
+    for (const kind of KINDS)
+      for (const push of js[kind].observer
+        .accepted({ uuid: jsIds[kind] })
+        .filter((p) => p.metricsBytes > 0))
+        assertJsCounter(kind, (await js[kind].observer.decodeAccepted(push)).decoded)
     this.results.js = jsRows
     this.results.uuids = { java: javaIds, js: jsIds }
     await this.controls(aux)
