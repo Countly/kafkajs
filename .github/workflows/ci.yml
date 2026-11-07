@@ -83,9 +83,48 @@ jobs:
         run: ./scripts/testWithKafka.sh "npm run test:group:${{ matrix.group }} -- --ci"
       - name: Run share soak (natural exit)
         if: matrix.group == 'share-base' && matrix.kafka == '4.3.1'
+        timeout-minutes: 10
         env:
-          DO_NOT_STOP: '1'
-        run: ./scripts/testWithKafka.sh "npm run test:group:share-soak -- --ci"
+          KAFKAJS_LANE: docker
+          KAFKAJS_DEBUG_PROTOCOL_BUFFERS: '1'
+          SHARE_SOAK_E2E: '1'
+        run: |
+          node <<'NODE'
+          const fs = require('fs')
+          const { spawnSync } = require('child_process')
+          const totalMs = 540000
+          const exitMs = 10000
+          const startedAt = Number(process.hrtime.bigint() / 1000000n)
+          const result = spawnSync(process.execPath, [
+            '--expose-gc', 'node_modules/jest/bin/jest.js', '--ci', '--detectOpenHandles',
+            '--runInBand', '--runTestsByPath', 'src/consumer/share/__tests__/shareSoakLive.spec.js',
+          ], { stdio: 'inherit', timeout: totalMs, killSignal: 'SIGKILL' })
+          const exitedAt = Number(process.hrtime.bigint() / 1000000n)
+          fs.writeFileSync('.tmp/e2e/share-soak-exit.json', JSON.stringify({
+            startedAt, exitedAt, status: result.status, signal: result.signal,
+            totalMs, exitMs, watchdogTerminated: result.error?.code === 'ETIMEDOUT',
+            error: result.error?.message,
+          }) + '\n')
+          if (result.error) throw result.error
+          if (result.status !== 0 || result.signal) throw new Error('Soak Jest did not exit successfully')
+          const rows = fs.readFileSync('.tmp/e2e/share-soak.jsonl', 'utf8')
+            .trim().split('\n').map(JSON.parse)
+          const done = rows.filter(row => row.event === 'case-complete')
+          if (done.length !== 1 ||
+              done[0].case !== 'preserves share identities and resources through the short soak' ||
+              rows.some(row => row.event === 'case-failed') ||
+              done.some(row => row.status !== 'passed' || row.tainted !== false ||
+                row.profileMs !== 480000 ||
+                row.cleanup?.groupsAbsent !== true || row.cleanup?.topicsAbsent !== true ||
+                !Number.isSafeInteger(row.cleanup?.completedAt) ||
+                row.cleanup.completedAt < startedAt || row.cleanup.completedAt > exitedAt)) {
+            throw new Error('Soak evidence has incomplete or invalid cleanup timestamps')
+          }
+          const cleanupAt = done[0].cleanup.completedAt
+          if (exitedAt - startedAt > totalMs || exitedAt - cleanupAt > exitMs) {
+            throw new Error('Soak did not exit naturally within its process and cleanup bounds')
+          }
+          NODE
       - name: Prove shutdown exits naturally
         if: matrix.group == 'share'
         env:

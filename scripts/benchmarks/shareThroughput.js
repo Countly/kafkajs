@@ -872,6 +872,41 @@ const until = async (predicate, due, interval = 100) => {
 }
 
 /**
+ * Rounds down an original deadline's remainder for integer-only abort timers.
+ * @param {number} due Original monotonic deadline.
+ * @returns {number} Positive integer milliseconds, never extending the deadline.
+ * @throws {Error} When less than one whole millisecond remains.
+ */
+const remainingMs = (due) => {
+  const remaining = Math.floor(due - performance.now())
+  assert(remaining > 0, 'Benchmark deadline exceeded')
+  return remaining
+}
+
+/**
+ * Loads the shared live predicates for plain Node as well as Jest, whose fixture alias otherwise
+ * leaves their probe dependency unresolved. The synchronous resolver change ends before any I/O.
+ * @returns {object} The unchanged terminal-position and active-verifier helpers.
+ * @throws {Error} For a missing helper or dependency.
+ */
+const loadTerminalHelpers = () => {
+  const Module = require('node:module')
+  const resolve = Module._resolveFilename
+  Module._resolveFilename = function (request, ...args) {
+    return resolve.call(
+      this,
+      request === 'testHelpers' ? path.resolve(__dirname, '../../testHelpers') : request,
+      ...args
+    )
+  }
+  try {
+    return require('../../testHelpers/shareLiveDiagnostics')
+  } finally {
+    Module._resolveFilename = resolve
+  }
+}
+
+/**
  * Appends JSON lines to an exclusive trace file and hashes exactly what it writes, so a large trace
  * is never held in memory.
  */
@@ -1010,6 +1045,9 @@ class ShareThroughput {
     this.failure = null
     this.closed = false
     this.used = false
+    this.partitions = null
+    this.terminal = []
+    this.terminalHelpers = null
     this.handler = async ({ batch }) => {
       try {
         this.handle(batch)
@@ -1060,10 +1098,12 @@ class ShareThroughput {
    */
   async observe({ topic, expected, leaders }, deadline, cleanupDeadline) {
     await this.admit(topic, leaders, deadline)
+    if (this.share) await this.captureEnds(topic, deadline)
     const before = await this.resources.snapshot()
     await this.consume(topic, expected.length, deadline)
     const idle = await this.resources.snapshot()
     assertIdle(idle, { share: this.share })
+    if (this.share) await this.verifyTerminal(topic, deadline)
     const { delivered, metrics } = this.evaluate(expected)
     const traceHash = this.archive(metrics, delivered)
     await this.disconnect(cleanupDeadline)
@@ -1103,6 +1143,92 @@ class ShareThroughput {
         await bounded(() => setShareGroupConfigs(admin, this.groupId, GROUP_CONFIG), deadline)
     } finally {
       await bounded(() => admin.disconnect(), deadline)
+    }
+  }
+
+  /**
+   * Loads fixed verification helpers and captures independent, immutable log ends before the
+   * resource baseline and consumption of the prepared corpus.
+   * @param {string} topic Corpus topic.
+   * @param {number} due Original work deadline.
+   * @returns {Promise<void>}
+   * @throws {Error} For missing, duplicate or invalid partition ends, or a failed read/close.
+   */
+  async captureEnds(topic, due) {
+    this.terminalHelpers = loadTerminalHelpers()
+    const admin = this.kafka.admin()
+    try {
+      await bounded(() => admin.connect(), due)
+      const ends = await bounded(
+        () => admin.fetchTopicOffsets(topic, { isolationLevel: 'read_uncommitted' }),
+        due
+      )
+      assert(
+        ends.length === LIMITS.partitions &&
+          new Set(ends.map(({ partition }) => partition)).size === LIMITS.partitions &&
+          ends.every(
+            ({ partition, high }) =>
+              Number.isInteger(partition) &&
+              partition >= 0 &&
+              partition < LIMITS.partitions &&
+              typeof high === 'string' &&
+              /^(0|[1-9][0-9]*)$/.test(high)
+          ),
+        'Invalid independent log ends'
+      )
+      this.partitions = ends.map(({ partition, high }) => ({ partition, floor: '0', end: high }))
+      this.terminal.push({ stage: 'log-end', groupId: this.groupId, topic, ends })
+    } finally {
+      await bounded(() => admin.disconnect(), due)
+    }
+  }
+
+  /**
+   * Proves both terminal listing forms, joins the workload member, then requires the unchanged
+   * group's active five-second quiet verifier and post-verifier terminal read. All observations
+   * follow the measured acquisitions and precede deletion of the group.
+   * @param {string} topic Corpus topic.
+   * @param {number} due Original work deadline, without spending the cleanup reserve.
+   * @returns {Promise<void>}
+   * @throws {Error} For a terminal, verifier, disconnect or deadline failure.
+   */
+  async verifyTerminal(topic, due) {
+    assert(this.partitions, 'Independent log ends were not captured')
+    const { awaitTerminalSharePosition, assertQuietTerminalGroup } = this.terminalHelpers
+    const admin = this.kafka.admin()
+    const signal = AbortSignal.timeout(remainingMs(due))
+    try {
+      await bounded(() => admin.connect(), due)
+      await bounded(
+        () =>
+          awaitTerminalSharePosition(
+            admin,
+            { groupId: this.groupId, topic, partitions: this.partitions },
+            {
+              signal,
+              timeoutMs: remainingMs(due),
+              record: (fields) => this.terminal.push({ stage: 'terminal', ...fields }),
+            }
+          ),
+        due
+      )
+      await this.disconnect(due)
+      await bounded(
+        () =>
+          assertQuietTerminalGroup({
+            kafka: this.kafka,
+            admin,
+            groupId: this.groupId,
+            topic,
+            partitions: this.partitions,
+            signal,
+            timeoutMs: remainingMs(due),
+            record: (fields) => this.terminal.push({ stage: 'quiet-verifier', ...fields }),
+          }),
+        due
+      )
+    } finally {
+      await bounded(() => admin.disconnect(), due)
     }
   }
 
@@ -1318,6 +1444,7 @@ class ShareThroughput {
         })
       for (const event of this.log.events) trace.write({ kind: 'acknowledge', ...event })
       for (const event of this.fetchEvents) trace.write({ kind: 'fetch', ...event })
+      for (const proof of this.terminal) trace.write({ kind: 'terminal-proof', ...proof })
       if (metrics.identities) trace.write({ kind: 'measured', identities: metrics.identities })
     } finally {
       traceHash = trace.close()
@@ -1327,21 +1454,23 @@ class ShareThroughput {
     this.calls = []
     this.gaps = []
     this.fetchEvents = []
+    this.terminal = []
     this.frames.rows.length = 0
     return traceHash
   }
 
   /**
-   * Removes the listeners and disconnects the consumer.
+   * Disconnects the consumer, observing it until its work has joined, then removes listeners.
    * @param {number} due Original deadline.
    * @returns {Promise<void>}
    * @throws {Error} When the disconnect fails or expires.
    */
   async disconnect(due) {
+    if (!this.closed && this.consumer) {
+      await bounded(() => this.consumer.disconnect({ timeout: 10000 }), due)
+      this.closed = true
+    }
     for (const remove of this.removers.splice(0)) remove()
-    if (this.closed || !this.consumer) return
-    await bounded(() => this.consumer.disconnect({ timeout: 10000 }), due)
-    this.closed = true
   }
 
   /**
@@ -1524,7 +1653,7 @@ class CorpusFixture {
     await bounded(
       () =>
         waitForShareFixtureAbsence(this.admin, [], [topic], {
-          signal: AbortSignal.timeout(Math.max(1, due - performance.now())),
+          signal: AbortSignal.timeout(remainingMs(due)),
           unrelated: [],
         }),
       due

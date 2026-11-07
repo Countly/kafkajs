@@ -21,6 +21,7 @@ const {
   controls,
   produceCorpus,
   ShareThroughput,
+  CorpusFixture,
 } = require('../shareThroughput')
 
 const message = (offset, key = 'k', value = 'v') => ({
@@ -657,6 +658,8 @@ describe('Share throughput driver', () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'share-trace-'))
     try {
       driver.trace = path.join(directory, 'trace.jsonl')
+      const proof = { stage: 'quiet-verifier', status: 'quiet', delivered: [], windowMs: 5000 }
+      driver.terminal.push(proof)
       const metrics = { status: 'valid', identities: ['x'] }
       const hash = driver.archive(metrics, { batches: 1, messages: 2 })
       const text = fs.readFileSync(driver.trace, 'utf8')
@@ -665,14 +668,41 @@ describe('Share throughput driver', () => {
         .trim()
         .split('\n')
         .map((line) => JSON.parse(line))
-      expect(rows.map((row) => row.kind)).toEqual(['summary', 'frame', 'callback', 'measured'])
+      expect(rows.map((row) => row.kind)).toEqual([
+        'summary',
+        'frame',
+        'callback',
+        'terminal-proof',
+        'measured',
+      ])
       expect(rows[2].identities).toHaveLength(2)
+      expect(rows[3]).toEqual({ kind: 'terminal-proof', ...proof })
       expect(metrics).toEqual({ status: 'valid' })
-      expect([driver.calls, frames.rows, driver.log.events]).toEqual([[], [], []])
+      expect([driver.calls, frames.rows, driver.log.events, driver.terminal]).toEqual([
+        [],
+        [],
+        [],
+        [],
+      ])
       expect(() => driver.archive({ status: 'valid' }, { batches: 0, messages: 0 })).toThrow()
     } finally {
       fs.rmSync(directory, { recursive: true, force: true })
     }
+  })
+
+  test('keeps workload observers until disconnect has joined', async () => {
+    const { driver } = drive('share')
+    const steps = []
+    driver.removers.push(() => steps.push('remove'))
+    driver.consumer = {
+      disconnect: async () => {
+        steps.push('disconnect')
+        expect(driver.removers).toHaveLength(1)
+      },
+    }
+    await driver.disconnect(performance.now() + 10000)
+    expect(steps).toEqual(['disconnect', 'remove'])
+    expect(driver.closed).toBe(true)
   })
 
   test('runs one observation per driver and needs a collector', async () => {
@@ -687,6 +717,233 @@ describe('Share throughput driver', () => {
     } finally {
       globalThis.gc = gc
     }
+  })
+})
+
+describe('Share throughput terminal proof', () => {
+  afterEach(() => {
+    jest.restoreAllMocks()
+    jest.useRealTimers()
+  })
+
+  /**
+   * Public-client doubles retain the actual terminal and active-verifier helper behavior.
+   * @param {object} [options] Scripted verifier and post-verifier failures.
+   * @returns {object} Driver and original admin observations, without broker I/O.
+   */
+  const fixture = ({ silent = false, replay = false, drainReplay = false, failedRead } = {}) => {
+    jest.useFakeTimers()
+    const steps = []
+    const frames = new Frames(fakeSocket)
+    const ends = [0, 1, 2].map((partition) => ({ partition, high: '1' }))
+    let verified = false
+    const listing = [
+      {
+        topic: 't',
+        topicId: '11111111-1111-1111-1111-111111111111',
+        partitions: ends.map(({ partition }) => ({
+          partition,
+          startOffset: '0',
+          lag: '0',
+          errorCode: 0,
+          leaderEpoch: 7,
+        })),
+      },
+    ]
+    const admin = {
+      connect: async () => {
+        steps.push('admin-connect')
+      },
+      disconnect: async () => {
+        steps.push('admin-disconnect')
+      },
+      fetchTopicMetadata: async () => ({ topics: [{ name: 't', topicId: listing[0].topicId }] }),
+      fetchTopicOffsets: async () => {
+        steps.push('ends')
+        if (verified && failedRead === 'ends') throw new Error('Post-verifier end unavailable')
+        return ends.map((row) => ({ ...row }))
+      },
+      listShareGroupOffsets: async ({ groupId, topics }) => {
+        expect(groupId).toBe(driver.groupId)
+        steps.push(topics ? 'named' : 'all')
+        if (verified && failedRead === 'listing') throw new Error('Post-verifier listing refused')
+        return listing
+      },
+    }
+    const kafka = {
+      admin: () => admin,
+      shareConsumer: ({ groupId }) => {
+        expect(groupId).toBe(driver.groupId)
+        const emitter = new EventEmitter()
+        let timer
+        let handler
+        return {
+          events: { REQUEST: 'request', CRASH: 'crash' },
+          on: (name, listener) => {
+            emitter.on(name, listener)
+            return () => emitter.off(name, listener)
+          },
+          connect: async () => {
+            steps.push('verifier-connect')
+          },
+          subscribe: async ({ topics }) => {
+            expect(topics).toEqual(['t'])
+          },
+          assignment: () => [{ topic: 't', partitions: [0, 1, 2] }],
+          run: async ({ eachMessage }) => {
+            handler = eachMessage
+            emitter.emit('request', { payload: { apiName: 'ShareFetch', sentAt: Date.now() - 1 } })
+            if (!silent)
+              timer = setInterval(() => {
+                emitter.emit('request', { payload: { apiName: 'ShareFetch', sentAt: Date.now() } })
+              }, 250)
+            if (replay) await eachMessage({ topic: 't', partition: 0, message: message(0) })
+          },
+          disconnect: async () => {
+            clearInterval(timer)
+            if (drainReplay) await handler({ topic: 't', partition: 0, message: message(0) })
+            verified = true
+            steps.push('verifier-disconnect')
+          },
+        }
+      },
+    }
+    const quiet = {
+      shareSessions: 0,
+      shareRecords: 0,
+      shareRanges: 0,
+      queueDepth: 0,
+      heapUsed: 5000,
+    }
+    const driver = new ShareThroughput(
+      { arm: 'share', acquireMode: 'record_limit' },
+      {
+        kafka,
+        frames,
+        trace: '',
+        resources: {
+          snapshot: async () => {
+            steps.push('snapshot')
+            return quiet
+          },
+        },
+      }
+    )
+    driver.consumer = {
+      disconnect: async () => {
+        steps.push('workload-disconnect')
+      },
+    }
+    return { driver, steps, ends, listing }
+  }
+
+  test('captures ends before consumption and archives both terminal reads after an active quiet window', async () => {
+    const { driver, steps, listing } = fixture()
+    jest.spyOn(driver, 'admit').mockResolvedValue()
+    jest.spyOn(driver, 'consume').mockImplementation(async () => {
+      steps.push('consume')
+    })
+    jest
+      .spyOn(driver, 'evaluate')
+      .mockReturnValue({ delivered: { batches: 1, messages: 3 }, metrics: { status: 'valid' } })
+    const archive = jest.spyOn(driver, 'archive').mockImplementation(() => {
+      steps.push('archive')
+      return 'hash'
+    })
+
+    const observation = driver.observe(
+      { topic: 't', expected: ['corpus'], leaders: new Map() },
+      100000,
+      130000
+    )
+    await jest.advanceTimersByTimeAsync(5000)
+    await expect(observation).resolves.toMatchObject({ status: 'valid', traceHash: 'hash' })
+
+    expect(
+      steps.filter((step) =>
+        [
+          'ends',
+          'consume',
+          'named',
+          'all',
+          'workload-disconnect',
+          'verifier-connect',
+          'verifier-disconnect',
+          'archive',
+        ].includes(step)
+      )
+    ).toEqual([
+      'ends',
+      'consume',
+      'named',
+      'all',
+      'ends',
+      'workload-disconnect',
+      'verifier-connect',
+      'verifier-disconnect',
+      'named',
+      'all',
+      'ends',
+      'archive',
+    ])
+    expect(steps.at(-1)).toBe('snapshot')
+    expect(archive).toHaveBeenCalledTimes(1)
+    expect(driver.terminal).toEqual([
+      expect.objectContaining({
+        stage: 'log-end',
+        ends: [0, 1, 2].map((partition) => ({ partition, high: '1' })),
+      }),
+      expect.objectContaining({
+        stage: 'terminal',
+        status: 'settled',
+        last: expect.objectContaining({ named: listing, all: listing }),
+      }),
+      expect.objectContaining({
+        stage: 'quiet-verifier',
+        status: 'quiet',
+        windowMs: 5000,
+        delivered: [],
+      }),
+      expect.objectContaining({
+        stage: 'quiet-verifier',
+        status: 'settled',
+        last: expect.objectContaining({ named: listing, all: listing }),
+      }),
+    ])
+  })
+
+  test.each([
+    [{ replay: true }, 'Same-group verifier delivered'],
+    [{ drainReplay: true }, 'Same-group verifier delivered'],
+    [{ silent: true }, 'completed no active fetch'],
+    [{ failedRead: 'ends' }, 'Post-verifier end unavailable'],
+    [{ failedRead: 'listing' }, 'Post-verifier listing refused'],
+  ])('rejects an incomplete terminal proof: %s', async (options, diagnostic) => {
+    const { driver } = fixture(options)
+    await driver.captureEnds('t', 100000)
+    await Promise.all([
+      expect(driver.verifyTerminal('t', 100000)).rejects.toThrow(diagnostic),
+      jest.advanceTimersByTimeAsync(5000),
+    ])
+  })
+
+  test.each([
+    (ends) => {
+      ends[0].high = null
+    },
+    (ends) => {
+      ends[0].high = '01'
+    },
+    (ends) => {
+      ends[0].partition = 1
+    },
+    (ends) => {
+      ends.pop()
+    },
+  ])('refuses an invalid independent end before consumption', async (mutate) => {
+    const { driver, ends } = fixture()
+    mutate(ends)
+    await expect(driver.captureEnds('t', 100000)).rejects.toThrow('Invalid independent log ends')
   })
 })
 
@@ -917,5 +1174,58 @@ describe('Share throughput corpus and arguments', () => {
     })
     expect(parseCommand(['--cleanup', ...argv]).phase).toBe('cleanup')
     expect(() => parseCommand(['--prepare'])).toThrow()
+  })
+})
+
+describe('Share corpus topic cleanup', () => {
+  afterEach(() => {
+    jest.restoreAllMocks()
+    jest.useRealTimers()
+  })
+
+  test('proves absence on every broker with a fractional remaining duration', async () => {
+    jest.useFakeTimers({ doNotFake: ['performance'] })
+    jest.spyOn(performance, 'now').mockReturnValue(100.25)
+    const timeout = jest.spyOn(AbortSignal, 'timeout')
+    const emitter = new EventEmitter()
+    const brokers = ['a', 'b', 'c'].map((host) => ({ host, port: 9092 }))
+    const visited = []
+    const fixture = Object.create(CorpusFixture.prototype)
+    fixture.admin = {
+      events: { REQUEST: 'request' },
+      on: (name, listener) => {
+        emitter.on(name, listener)
+        return () => emitter.off(name, listener)
+      },
+      deleteTopics: async () => {},
+      describeCluster: async () => ({ brokers }),
+      listGroups: async () => ({ groups: [] }),
+      listTopics: async () => {
+        const broker = `${brokers[visited.length].host}:9092`
+        visited.push(broker)
+        emitter.emit('request', { payload: { apiName: 'Metadata', broker } })
+        return []
+      },
+    }
+
+    const cleanup = fixture.removeTopic('owned', 1100)
+    await jest.advanceTimersByTimeAsync(500)
+    await cleanup
+
+    expect(timeout).toHaveBeenCalledWith(999)
+    expect(visited).toEqual(['a:9092', 'b:9092', 'c:9092'])
+    expect(emitter.listenerCount('request')).toBe(0)
+  })
+
+  test('refuses to extend a submillisecond cleanup remainder', async () => {
+    jest.spyOn(performance, 'now').mockReturnValue(100.25)
+    const timeout = jest.spyOn(AbortSignal, 'timeout')
+    const fixture = Object.create(CorpusFixture.prototype)
+    fixture.admin = { deleteTopics: async () => {} }
+
+    await expect(fixture.removeTopic('owned', 100.75)).rejects.toThrow(
+      'Benchmark deadline exceeded'
+    )
+    expect(timeout).not.toHaveBeenCalled()
   })
 })
