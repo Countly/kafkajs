@@ -106,6 +106,7 @@ docs/OAuth.md:`jwtBearer` sends the JWT-bearer grant (RFC 7523 \u00a72.1): the a
 src/__tests__/equivalentApis.spec.js:  it('R1\u00a7C:listTopics', async () => {
 src/__tests__/equivalentApis.spec.js:  it('R2\u00a75:kadm.Lag', async () => {
 src/__tests__/equivalentApis.spec.js:it('R1\u00a7C:forceTerminateTransaction', async () => {
+src/__tests__/equivalentApis.spec.js:it('R1\u00a7C:deleteShareGroups', async () => {
 src/__tests__/equivalentApis.spec.js:it('R1\u00a7E:poll', async () => {
 src/__tests__/equivalentApis.spec.js:it('R1\u00a7E:commitAsync', async () => {
 src/__tests__/equivalentApis.spec.js:it('R1\u00a7E:ackCallback', async () => {
