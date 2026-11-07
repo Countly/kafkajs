@@ -1111,6 +1111,7 @@ class ShareRun {
    */
   freeze(episode) {
     if (episode.frozen) return
+    this.captureCloseCoordinator(episode)
     const bindings = []
     for (const node of this.nodes.values()) {
       if (!node.loop) continue
@@ -1140,6 +1141,48 @@ class ShareRun {
       if (discarded && (node.session.epoch !== 0 || node.dropped > 0))
         this.onSessionReset(node, 'membership')
     }
+  }
+
+  /**
+   * Recaptures an already reconnected coordinator at the close boundary, only while the same
+   * established membership still owns the same Broker, pool and connection slot. No connection
+   * is opened here; once frozen, the captured generation cannot be replaced again.
+   * @private
+   * @param {ShareCloseEpisode} episode The episode whose authority is about to freeze.
+   * @returns {void}
+   */
+  captureCloseCoordinator(episode) {
+    const coordinator = this.coordinator
+    const { membership } = this
+    if (
+      !coordinator ||
+      coordinator.current() ||
+      episode.guard() ||
+      membership.token !== this.authorityToken ||
+      membership.closed ||
+      membership.state !== MEMBER_STATES.STABLE ||
+      membership.memberEpoch <= 0 ||
+      membership.coordinator !== this.facade ||
+      this.facade?.broker !== coordinator.broker ||
+      coordinator.broker.connectionPool !== coordinator.pool ||
+      coordinator.pool.pool[0] !== coordinator.connection
+    )
+      return
+    const current = this.bindCoordinator(coordinator.broker)
+    if (current.current()) this.coordinator = current
+  }
+
+  /**
+   * Makes an omitted leave visible once, including refusals discovered after the finals.
+   * @private
+   * @param {ShareCloseEpisode} episode The closing episode.
+   * @param {string} reason Why no leave can be sent.
+   * @returns {void}
+   */
+  leaveSkipped(episode, reason) {
+    if (episode.leaveSkipped) return
+    episode.leaveSkipped = true
+    this.options.logger.warn('Share leave skipped', { groupId: this.options.groupId, reason })
   }
 
   /**
@@ -1186,15 +1229,26 @@ class ShareRun {
     const finals = () => (sent ??= this.sendFinals(episode, operation))
     try {
       if (episode.kind === 'fence') {
+        this.leaveSkipped(episode, 'fenced')
         await operation.wait(finals)
         return
       }
       const coordinator = this.coordinator
-      if (coordinator && this.membership.memberEpoch > 0 && episode.claimLeave(coordinator))
-        await this.leave(episode, operation, coordinator, finals)
-      else await operation.wait(finals)
+      let reason = null
+      if (episode.guard()) reason = 'close-deadline'
+      else if (this.membership.memberEpoch <= 0) reason = 'membership-unestablished'
+      else if (
+        !coordinator ||
+        (!this.membership.coordinator && this.membership.state !== MEMBER_STATES.FATAL)
+      )
+        reason = 'coordinator-unknown'
+      else if (!episode.claimLeave(coordinator)) reason = 'coordinator-stale'
+      if (reason) {
+        this.leaveSkipped(episode, reason)
+        await operation.wait(finals)
+      } else await this.leave(episode, operation, coordinator, finals)
     } catch (error) {
-      this.options.logger.debug('Share close traffic ended early', { error: error.message })
+      this.options.logger.warn('Share close traffic ended early', { error: error.message })
     } finally {
       await (sent ?? finals()).catch(() => {})
       episode.guard()
@@ -1213,7 +1267,12 @@ class ShareRun {
    * @returns {Promise<void>}
    */
   async leave(episode, operation, coordinator, finals) {
-    const guard = () => episode.refusal(coordinator)
+    const guard = () => {
+      const refused = episode.refusal(coordinator)
+      if (refused)
+        this.leaveSkipped(episode, episode.guard() ? 'close-deadline' : 'coordinator-stale')
+      return refused
+    }
     const { membership } = this
     if (membership.state !== MEMBER_STATES.FATAL && !(membership.closed && membership.terminal)) {
       await operation.wait(() =>
