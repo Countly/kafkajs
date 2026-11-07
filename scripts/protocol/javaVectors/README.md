@@ -376,3 +376,14 @@ Released share message vectors:
 | DescribeShareGroupOffsets | 1 | Independent request bytes, literal response fields, nested tag buffers |
 | AlterShareGroupOffsets | 0 | Independent request bytes, literal response fields, nested tag buffers |
 | DeleteShareGroupOffsets | 0 | Independent request bytes, literal response fields, nested tag buffers |
+
+## Telemetry message vectors
+
+`GenerateMessageVectors telemetry <output-root>` writes only GetTelemetrySubscriptions v0 and
+PushTelemetry v0 request/response fixtures. Use an already verified Kafka 4.3.1 client jar,
+record its SHA-256 and the JDK version, and compile the generator before invoking this mode.
+The 21 literal cases cover zero/stable UUID, signed subscription limits, empty Metrics and
+arrays, requested prefixes, signed int8 codecs, terminating pushes and numeric refusals.
+Metrics fixture fields are hex; consumers convert them to Buffer only as input to encoding.
+Unknown-tag and malformed controls retain their original vector and record a finite byte edit.
+No broker or runtime dependency is needed to regenerate these development fixtures.

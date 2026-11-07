@@ -2216,3 +2216,92 @@ describe('share profile', () => {
     cluster.assertClean()
   })
 })
+
+describe('telemetry strict frames', () => {
+  const get = require('../../src/protocol/requests/getTelemetrySubscriptions/fixtures/java/getTelemetrySubscriptionsRequest-v0-zero.json')
+  const push = require('../../src/protocol/requests/pushTelemetry/fixtures/java/pushTelemetryRequest-v0-empty.json')
+  test.each([
+    ['GetTelemetrySubscriptions', 71, get],
+    ['PushTelemetry', 72, push],
+  ])('%s reads literal fields through a flexible frame', async (api, key, vector) => {
+    const cluster = createScriptedCluster({ nodes: NODES, profile: 'telemetry' })
+    const body = Buffer.from(vector.hex, 'hex')
+    const { socket, frames } = await exchange(cluster, frameOf(key, 0, body))
+    try {
+      expect(cluster.requests()).toHaveLength(1)
+      expect(cluster.requests()[0]).toMatchObject({
+        api,
+        apiKey: key,
+        version: 0,
+        correlationId: 1,
+        generation: 1,
+        fields: vector.fields,
+      })
+      expect(frames).toHaveLength(1)
+      expect(frames[0].readInt32BE(4)).toBe(1)
+      expect(frames[0][8]).toBe(0)
+      cluster.assertClean()
+    } finally {
+      socket.destroy()
+    }
+  })
+  test.each([
+    ['getTelemetrySubscriptionsV0', get],
+    ['pushTelemetryV0', push],
+  ])('%s skips an unknown request tag and rejects truncated tag values', (module, vector) => {
+    const pair = require(`../wire/${module}`)
+    const body = Buffer.from(vector.hex, 'hex')
+    const tagged = Buffer.concat([body.subarray(0, -1), Buffer.from('010703aabbcc', 'hex')])
+    expect(pair.readRequest(tagged)).toEqual(vector.fields)
+    expect(() => pair.readRequest(tagged.subarray(0, -1))).toThrow()
+  })
+  test('telemetry profile adds exactly two pairs to the default profile', () => {
+    expect(PROFILES.telemetry).toEqual([
+      ...PROFILES.default,
+      ['GetTelemetrySubscriptions', 0],
+      ['PushTelemetry', 0],
+    ])
+  })
+  test('a missing telemetry pair refuses before a response can be built', () => {
+    const cluster = createScriptedCluster({
+      nodes: NODES,
+      profile: 'telemetry',
+      advertise: { PushTelemetry: [1, 1] },
+    })
+    expect(() => cluster.pairFor('PushTelemetry', 1)).toThrow('no response builder')
+    cluster.assertClean()
+  })
+  test('unadvertised v0 refuses before body parsing', () => {
+    const cluster = createScriptedCluster({ nodes: NODES })
+    expect(() => cluster.accept(NODES[0], 1, frameOf(71, 0, Buffer.from(get.hex, 'hex')))).toThrow(
+      'cluster advertises no version'
+    )
+    cluster.assertClean()
+  })
+  test.each([
+    ['GetTelemetrySubscriptions', 71, get],
+    ['PushTelemetry', 72, push],
+  ])('%s refuses trailing bytes and a missing header tag', (_api, key, vector) => {
+    const cluster = createScriptedCluster({ nodes: NODES, profile: 'telemetry' })
+    const body = Buffer.from(vector.hex, 'hex')
+    expect(() =>
+      cluster.accept(NODES[0], 1, frameOf(key, 0, Buffer.concat([body, Buffer.from([0])])))
+    ).toThrow('its tag buffer')
+    const frame = frameOf(key, 0, body)
+    const badHeader = Buffer.concat([frame.subarray(0, 17), frame.subarray(18)])
+    badHeader.writeInt32BE(badHeader.length - 4, 0)
+    expect(() => cluster.accept(NODES[0], 1, badHeader)).toThrow()
+    cluster.assertClean()
+  })
+  test('null Metrics and wrong frame length refuse loudly', () => {
+    const pair = require('../wire/pushTelemetryV0')
+    const body = Buffer.from(push.hex, 'hex')
+    body[22] = 0
+    expect(() => pair.readRequest(body)).toThrow('Metrics cannot be null')
+    const cluster = createScriptedCluster({ nodes: NODES, profile: 'telemetry' })
+    const frame = frameOf(72, 0, Buffer.from(push.hex, 'hex'))
+    frame.writeInt32BE(1, 0)
+    expect(() => cluster.accept(NODES[0], 1, frame)).toThrow('size prefix')
+    cluster.assertClean()
+  })
+})

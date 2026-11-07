@@ -133,12 +133,12 @@
       "since": "2026-10-12"
     },
     "GetTelemetrySubscriptions": {
-      "note": "Client telemetry (KIP-714); deferred.",
-      "since": "2026-09-03"
+      "note": "Client telemetry v0 codec implemented. Runtime use requires both telemetry APIs and a working broker exporter; broker version alone is insufficient.",
+      "since": "2026-10-23"
     },
     "PushTelemetry": {
-      "note": "Client telemetry (KIP-714); deferred.",
-      "since": "2026-09-03"
+      "note": "Client telemetry v0 codec implemented. Runtime use requires both telemetry APIs and a working broker exporter; broker version alone is insufficient.",
+      "since": "2026-10-23"
     },
     "SaslAuthenticate": {
       "note": "v1 adds SessionLifetimeMs (KIP-368 re-authentication), v2 is flexible. The mechanism-provider contract is unchanged at every version: a provider returns INT32-length-prefixed bytes from request.encode() and receives them in response.decode() - v2 strips and re-wraps that prefix inside its own codec.",

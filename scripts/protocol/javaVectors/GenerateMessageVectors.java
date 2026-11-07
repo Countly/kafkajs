@@ -34,6 +34,10 @@ import org.apache.kafka.common.message.AlterShareGroupOffsetsResponseData;
 import org.apache.kafka.common.message.DeleteShareGroupOffsetsRequestData;
 import org.apache.kafka.common.message.DeleteShareGroupOffsetsResponseData;
 import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.message.GetTelemetrySubscriptionsRequestData;
+import org.apache.kafka.common.message.GetTelemetrySubscriptionsResponseData;
+import org.apache.kafka.common.message.PushTelemetryRequestData;
+import org.apache.kafka.common.message.PushTelemetryResponseData;
 import org.apache.kafka.common.message.ElectLeadersRequestData;
 import org.apache.kafka.common.message.ElectLeadersResponseData;
 import org.apache.kafka.common.message.UpdateFeaturesRequestData;
@@ -302,8 +306,9 @@ public final class GenerateMessageVectors {
   }
 
   /**
-   * @param args the repository root, or {@code produce} followed by the root for fixed-record
-   *     Produce vectors; output follows {@code src/protocol/requests/<api>/fixtures/java/}.
+   * @param args the repository root, {@code produce} followed by the root for fixed-record
+   *     Produce vectors, or {@code telemetry} followed by the root for only the two telemetry
+   *     APIs; output follows {@code src/protocol/requests/<api>/fixtures/java/}.
    * @throws IOException if a fixture file cannot be written
    */
   public static void main(String[] args) throws IOException {
@@ -316,10 +321,15 @@ public final class GenerateMessageVectors {
       writeProduceRecords(Paths.get(args[1]));
       return;
     }
-    Path outputDir = Paths.get(args[0]);
+    boolean telemetryOnly = args[0].equals("telemetry");
+    if (telemetryOnly && args.length < 2) {
+      System.err.println("usage: GenerateMessageVectors telemetry <output-dir>");
+      System.exit(1);
+    }
+    Path outputDir = Paths.get(args[telemetryOnly ? 1 : 0]);
     int written = 0;
 
-    for (Vector vector : vectors()) {
+    for (Vector vector : telemetryOnly ? telemetry() : vectors()) {
       Path dir = outputDir.resolve("src/protocol/requests/" + vector.api + "/fixtures/java");
       Files.createDirectories(dir);
       Path path = dir.resolve(vector.fileName());
@@ -328,7 +338,9 @@ public final class GenerateMessageVectors {
       written++;
     }
 
-    scramHiVectors(outputDir);
+    if (!telemetryOnly) {
+      scramHiVectors(outputDir);
+    }
     System.out.println("vectors: " + written);
   }
 
@@ -801,10 +813,190 @@ new ListConfigResourcesResponseData()
     return vectors;
   }
 
+  /**
+   * Builds the two telemetry APIs from literal fields; never reads JavaScript or fixture bytes.
+   * @return the complete request and response vector set, at version zero only
+   */
+  private static List<Vector> telemetry() {
+    List<Vector> out = new ArrayList<>();
+    out.add(new Vector("getTelemetrySubscriptions", "GetTelemetrySubscriptionsRequest", (short) 0, "zero",
+        new GetTelemetrySubscriptionsRequestData()
+        .setClientInstanceId(Uuid.ZERO_UUID),
+        "{\"clientInstanceId\":null}"));
+    out.add(new Vector("getTelemetrySubscriptions", "GetTelemetrySubscriptionsRequest", (short) 0, "stable",
+        new GetTelemetrySubscriptionsRequestData()
+        .setClientInstanceId(uuid("01020304-0506-0708-090a-0b0c0d0e0f10")),
+        "{\"clientInstanceId\":\"01020304-0506-0708-090a-0b0c0d0e0f10\"}"));
+    out.add(new Vector("getTelemetrySubscriptions", "GetTelemetrySubscriptionsResponse", (short) 0, "basic",
+        new GetTelemetrySubscriptionsResponseData()
+        .setThrottleTimeMs(25)
+        .setErrorCode((short) 0)
+        .setClientInstanceId(uuid("01020304-0506-0708-090a-0b0c0d0e0f10"))
+        .setSubscriptionId(-7)
+        .setAcceptedCompressionTypes(Arrays.asList((byte) 4, (byte) 1, (byte) 0, (byte) -1, (byte) 127, (byte) -128))
+        .setPushIntervalMs(1000)
+        .setTelemetryMaxBytes(1048576)
+        .setDeltaTemporality(true)
+        .setRequestedMetrics(Arrays.asList("org.apache.kafka.", "com.example.")),
+        "{\"throttleTime\":25,\"errorCode\":0,\"clientInstanceId\":\"01020304-0506-0708-090a-0b0c0d0e0f10\",\"subscriptionId\":-7,\"acceptedCompressionTypes\":[4,1,0,-1,127,-128],\"pushIntervalMs\":1000,\"telemetryMaxBytes\":1048576,\"deltaTemporality\":true,\"requestedMetrics\":[\"org.apache.kafka.\",\"com.example.\"]}"));
+    out.add(new Vector("getTelemetrySubscriptions", "GetTelemetrySubscriptionsResponse", (short) 0, "empty",
+        new GetTelemetrySubscriptionsResponseData()
+        .setThrottleTimeMs(25)
+        .setErrorCode((short) 0)
+        .setClientInstanceId(Uuid.ZERO_UUID)
+        .setSubscriptionId(0)
+        .setAcceptedCompressionTypes(Arrays.asList())
+        .setPushIntervalMs(300000)
+        .setTelemetryMaxBytes(0)
+        .setDeltaTemporality(false)
+        .setRequestedMetrics(Arrays.asList()),
+        "{\"throttleTime\":25,\"errorCode\":0,\"clientInstanceId\":null,\"subscriptionId\":0,\"acceptedCompressionTypes\":[],\"pushIntervalMs\":300000,\"telemetryMaxBytes\":0,\"deltaTemporality\":false,\"requestedMetrics\":[]}"));
+    out.add(new Vector("getTelemetrySubscriptions", "GetTelemetrySubscriptionsResponse", (short) 0, "min",
+        new GetTelemetrySubscriptionsResponseData()
+        .setThrottleTimeMs(25)
+        .setErrorCode((short) 0)
+        .setClientInstanceId(uuid("01020304-0506-0708-090a-0b0c0d0e0f10"))
+        .setSubscriptionId(-2147483648)
+        .setAcceptedCompressionTypes(Arrays.asList((byte) 4, (byte) 1, (byte) 0, (byte) -1, (byte) 127, (byte) -128))
+        .setPushIntervalMs(-1)
+        .setTelemetryMaxBytes(-1)
+        .setDeltaTemporality(true)
+        .setRequestedMetrics(Arrays.asList("")),
+        "{\"throttleTime\":25,\"errorCode\":0,\"clientInstanceId\":\"01020304-0506-0708-090a-0b0c0d0e0f10\",\"subscriptionId\":-2147483648,\"acceptedCompressionTypes\":[4,1,0,-1,127,-128],\"pushIntervalMs\":-1,\"telemetryMaxBytes\":-1,\"deltaTemporality\":true,\"requestedMetrics\":[\"\"]}"));
+    out.add(new Vector("getTelemetrySubscriptions", "GetTelemetrySubscriptionsResponse", (short) 0, "max",
+        new GetTelemetrySubscriptionsResponseData()
+        .setThrottleTimeMs(25)
+        .setErrorCode((short) 0)
+        .setClientInstanceId(uuid("01020304-0506-0708-090a-0b0c0d0e0f10"))
+        .setSubscriptionId(2147483647)
+        .setAcceptedCompressionTypes(Arrays.asList((byte) 4, (byte) 1, (byte) 0, (byte) -1, (byte) 127, (byte) -128))
+        .setPushIntervalMs(0)
+        .setTelemetryMaxBytes(1048576)
+        .setDeltaTemporality(true)
+        .setRequestedMetrics(Arrays.asList("mé.")),
+        "{\"throttleTime\":25,\"errorCode\":0,\"clientInstanceId\":\"01020304-0506-0708-090a-0b0c0d0e0f10\",\"subscriptionId\":2147483647,\"acceptedCompressionTypes\":[4,1,0,-1,127,-128],\"pushIntervalMs\":0,\"telemetryMaxBytes\":1048576,\"deltaTemporality\":true,\"requestedMetrics\":[\"mé.\"]}"));
+    out.add(new Vector("getTelemetrySubscriptions", "GetTelemetrySubscriptionsResponse", (short) 0, "unsupported",
+        new GetTelemetrySubscriptionsResponseData()
+        .setThrottleTimeMs(25)
+        .setErrorCode((short) 35)
+        .setClientInstanceId(uuid("01020304-0506-0708-090a-0b0c0d0e0f10"))
+        .setSubscriptionId(-7)
+        .setAcceptedCompressionTypes(Arrays.asList((byte) 4, (byte) 1, (byte) 0, (byte) -1, (byte) 127, (byte) -128))
+        .setPushIntervalMs(1000)
+        .setTelemetryMaxBytes(1048576)
+        .setDeltaTemporality(true)
+        .setRequestedMetrics(Arrays.asList("org.apache.kafka.", "com.example.")),
+        "{\"throttleTime\":25,\"errorCode\":35,\"clientInstanceId\":\"01020304-0506-0708-090a-0b0c0d0e0f10\",\"subscriptionId\":-7,\"acceptedCompressionTypes\":[4,1,0,-1,127,-128],\"pushIntervalMs\":1000,\"telemetryMaxBytes\":1048576,\"deltaTemporality\":true,\"requestedMetrics\":[\"org.apache.kafka.\",\"com.example.\"]}"));
+    out.add(new Vector("getTelemetrySubscriptions", "GetTelemetrySubscriptionsResponse", (short) 0, "stale",
+        new GetTelemetrySubscriptionsResponseData()
+        .setThrottleTimeMs(25)
+        .setErrorCode((short) 117)
+        .setClientInstanceId(uuid("01020304-0506-0708-090a-0b0c0d0e0f10"))
+        .setSubscriptionId(-7)
+        .setAcceptedCompressionTypes(Arrays.asList((byte) 4, (byte) 1, (byte) 0, (byte) -1, (byte) 127, (byte) -128))
+        .setPushIntervalMs(1000)
+        .setTelemetryMaxBytes(1048576)
+        .setDeltaTemporality(true)
+        .setRequestedMetrics(Arrays.asList("org.apache.kafka.", "com.example.")),
+        "{\"throttleTime\":25,\"errorCode\":117,\"clientInstanceId\":\"01020304-0506-0708-090a-0b0c0d0e0f10\",\"subscriptionId\":-7,\"acceptedCompressionTypes\":[4,1,0,-1,127,-128],\"pushIntervalMs\":1000,\"telemetryMaxBytes\":1048576,\"deltaTemporality\":true,\"requestedMetrics\":[\"org.apache.kafka.\",\"com.example.\"]}"));
+    out.add(new Vector("getTelemetrySubscriptions", "GetTelemetrySubscriptionsResponse", (short) 0, "tooLarge",
+        new GetTelemetrySubscriptionsResponseData()
+        .setThrottleTimeMs(25)
+        .setErrorCode((short) 118)
+        .setClientInstanceId(uuid("01020304-0506-0708-090a-0b0c0d0e0f10"))
+        .setSubscriptionId(-7)
+        .setAcceptedCompressionTypes(Arrays.asList((byte) 4, (byte) 1, (byte) 0, (byte) -1, (byte) 127, (byte) -128))
+        .setPushIntervalMs(1000)
+        .setTelemetryMaxBytes(1048576)
+        .setDeltaTemporality(true)
+        .setRequestedMetrics(Arrays.asList("org.apache.kafka.", "com.example.")),
+        "{\"throttleTime\":25,\"errorCode\":118,\"clientInstanceId\":\"01020304-0506-0708-090a-0b0c0d0e0f10\",\"subscriptionId\":-7,\"acceptedCompressionTypes\":[4,1,0,-1,127,-128],\"pushIntervalMs\":1000,\"telemetryMaxBytes\":1048576,\"deltaTemporality\":true,\"requestedMetrics\":[\"org.apache.kafka.\",\"com.example.\"]}"));
+    out.add(new Vector("pushTelemetry", "PushTelemetryRequest", (short) 0, "basic",
+        new PushTelemetryRequestData()
+        .setClientInstanceId(uuid("01020304-0506-0708-090a-0b0c0d0e0f10"))
+        .setSubscriptionId(-7)
+        .setTerminating(false)
+        .setCompressionType((byte) 0)
+        .setMetrics(ByteBuffer.wrap(new byte[] {(byte) 0x0a, (byte) 0x00})),
+        "{\"clientInstanceId\":\"01020304-0506-0708-090a-0b0c0d0e0f10\",\"subscriptionId\":-7,\"terminating\":false,\"compressionType\":0,\"metrics\":\"0a00\"}"));
+    out.add(new Vector("pushTelemetry", "PushTelemetryRequest", (short) 0, "empty",
+        new PushTelemetryRequestData()
+        .setClientInstanceId(uuid("01020304-0506-0708-090a-0b0c0d0e0f10"))
+        .setSubscriptionId(-7)
+        .setTerminating(false)
+        .setCompressionType((byte) 0)
+        .setMetrics(ByteBuffer.wrap(new byte[] {})),
+        "{\"clientInstanceId\":\"01020304-0506-0708-090a-0b0c0d0e0f10\",\"subscriptionId\":-7,\"terminating\":false,\"compressionType\":0,\"metrics\":\"\"}"));
+    out.add(new Vector("pushTelemetry", "PushTelemetryRequest", (short) 0, "min",
+        new PushTelemetryRequestData()
+        .setClientInstanceId(uuid("01020304-0506-0708-090a-0b0c0d0e0f10"))
+        .setSubscriptionId(-2147483648)
+        .setTerminating(false)
+        .setCompressionType((byte) -128)
+        .setMetrics(ByteBuffer.wrap(new byte[] {(byte) 0x0a, (byte) 0x00})),
+        "{\"clientInstanceId\":\"01020304-0506-0708-090a-0b0c0d0e0f10\",\"subscriptionId\":-2147483648,\"terminating\":false,\"compressionType\":-128,\"metrics\":\"0a00\"}"));
+    out.add(new Vector("pushTelemetry", "PushTelemetryRequest", (short) 0, "max",
+        new PushTelemetryRequestData()
+        .setClientInstanceId(uuid("01020304-0506-0708-090a-0b0c0d0e0f10"))
+        .setSubscriptionId(2147483647)
+        .setTerminating(false)
+        .setCompressionType((byte) 127)
+        .setMetrics(ByteBuffer.wrap(new byte[] {(byte) 0x0a, (byte) 0x00})),
+        "{\"clientInstanceId\":\"01020304-0506-0708-090a-0b0c0d0e0f10\",\"subscriptionId\":2147483647,\"terminating\":false,\"compressionType\":127,\"metrics\":\"0a00\"}"));
+    out.add(new Vector("pushTelemetry", "PushTelemetryRequest", (short) 0, "terminating",
+        new PushTelemetryRequestData()
+        .setClientInstanceId(uuid("01020304-0506-0708-090a-0b0c0d0e0f10"))
+        .setSubscriptionId(-7)
+        .setTerminating(true)
+        .setCompressionType((byte) 4)
+        .setMetrics(ByteBuffer.wrap(new byte[] {(byte) 0x0a, (byte) 0x00})),
+        "{\"clientInstanceId\":\"01020304-0506-0708-090a-0b0c0d0e0f10\",\"subscriptionId\":-7,\"terminating\":true,\"compressionType\":4,\"metrics\":\"0a00\"}"));
+    out.add(new Vector("pushTelemetry", "PushTelemetryRequest", (short) 0, "zero",
+        new PushTelemetryRequestData()
+        .setClientInstanceId(Uuid.ZERO_UUID)
+        .setSubscriptionId(0)
+        .setTerminating(false)
+        .setCompressionType((byte) 0)
+        .setMetrics(ByteBuffer.wrap(new byte[] {(byte) 0x0a, (byte) 0x00})),
+        "{\"clientInstanceId\":null,\"subscriptionId\":0,\"terminating\":false,\"compressionType\":0,\"metrics\":\"0a00\"}"));
+    out.add(new Vector("pushTelemetry", "PushTelemetryResponse", (short) 0, "ok",
+        new PushTelemetryResponseData()
+        .setThrottleTimeMs(25)
+        .setErrorCode((short) 0),
+        "{\"throttleTime\":25,\"errorCode\":0}"));
+    out.add(new Vector("pushTelemetry", "PushTelemetryResponse", (short) 0, "unsupported",
+        new PushTelemetryResponseData()
+        .setThrottleTimeMs(25)
+        .setErrorCode((short) 35),
+        "{\"throttleTime\":25,\"errorCode\":35}"));
+    out.add(new Vector("pushTelemetry", "PushTelemetryResponse", (short) 0, "invalid",
+        new PushTelemetryResponseData()
+        .setThrottleTimeMs(25)
+        .setErrorCode((short) 42),
+        "{\"throttleTime\":25,\"errorCode\":42}"));
+    out.add(new Vector("pushTelemetry", "PushTelemetryResponse", (short) 0, "throttled",
+        new PushTelemetryResponseData()
+        .setThrottleTimeMs(25)
+        .setErrorCode((short) 89),
+        "{\"throttleTime\":25,\"errorCode\":89}"));
+    out.add(new Vector("pushTelemetry", "PushTelemetryResponse", (short) 0, "stale",
+        new PushTelemetryResponseData()
+        .setThrottleTimeMs(25)
+        .setErrorCode((short) 117),
+        "{\"throttleTime\":25,\"errorCode\":117}"));
+    out.add(new Vector("pushTelemetry", "PushTelemetryResponse", (short) 0, "tooLarge",
+        new PushTelemetryResponseData()
+        .setThrottleTimeMs(25)
+        .setErrorCode((short) 118),
+        "{\"throttleTime\":25,\"errorCode\":118}"));
+    return out;
+  }
+
   /** @return every vector this generator emits, in file order per API */
   private static List<Vector> vectors() {
     List<Vector> transactionVectors = transactionAdmin();
     List<Vector> vectors = new ArrayList<>();
+    vectors.addAll(telemetry());
     vectors.addAll(shareVectors());
     vectors.addAll(transactionVectors);
     vectors.addAll(clusterResources());
