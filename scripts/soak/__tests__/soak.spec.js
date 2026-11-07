@@ -4946,7 +4946,7 @@ describe('Share soak complete original-owner schedules', () => {
       (row, { owner }) => {
         if (row.cycle === 1) owner.driver.onLateEntry([row.handler[0]])
       },
-      'finalized share member',
+      'A joined workload member dispatched later identities',
     ],
     [
       'missing reset',
