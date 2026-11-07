@@ -23,6 +23,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - Telemetry codecs, numeric collection and snapshot registration are internal at this stage. Existing client configuration and foreground operations are unchanged, and returned-client registration methods are not attached yet.
 - The internal telemetry transport uses one dedicated authenticated socket, requires both negotiated telemetry APIs and a successful runtime Get, and leaves unsupported foreground operations usable.
+- Preserve shared foreground SASL renewal when an individual caller expires; contain private telemetry commit and logging failures, retry transient socket failures, and retire expired telemetry work.
 - Positive telemetry push intervals below 100 ms are clamped to 100 ms locally; nonpositive intervals use 300000 ms.
 - Bound raw and transmitted telemetry bodies, omit whole metric groups under small limits, and advance only written included baselines; a rejected written sample can be lost from later deltas.
 - Telemetry payloads over1000 bytes use mutually supported built-in ZSTD/GZIP in broker order; NONE is always available. Producer codec registrations are unchanged.
