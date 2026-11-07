@@ -1508,15 +1508,17 @@ describe('telemetry delivery workload', () => {
     expect(records.map(({ kind, uuid: id }) => `${kind}:${id.slice(0, 2)}`)).toEqual([
       'subscription:01',
       'push:01',
+      'push:01',
       'subscription:02',
+      'push:02',
       'push:02',
     ])
     expect(records[0]).toMatchObject({ errorCode: 0, subscriptionId: 7, pushIntervalMs: 1000 })
-    expect(records[1]).toMatchObject({ errorCode: 0, metricsBytes: raw.length, subscriptionId: 7 })
+    expect(records[2]).toMatchObject({ errorCode: 0, metricsBytes: raw.length, subscriptionId: 7 })
     const chunks = readChunks(dir, evidence.artifacts(), 'delivery-telemetry')
-    expect(chunks.map((chunk) => chunk.toString().split('\n').filter(Boolean).length)).toEqual([4])
+    expect(chunks.map((chunk) => chunk.toString().split('\n').filter(Boolean).length)).toEqual([6])
     const exports = records
-      .filter(({ kind }) => kind === 'push')
+      .filter(({ kind, errorCode }) => kind === 'push' && errorCode === 0)
       .map(({ uuid: id }, i) => ({
         clientInstanceId: id,
         pushIntervalMs: 1000,
@@ -2256,6 +2258,136 @@ describe('telemetry benchmark session', () => {
 })
 
 describe('telemetry review regressions', () => {
+  test('corrupt unanswered Push survives socket close and fails finalization and offline verification', () => {
+    const i16 = (n) => {
+      const b = Buffer.alloc(2)
+      b.writeInt16BE(n)
+      return b
+    }
+    const i32 = (n) => {
+      const b = Buffer.alloc(4)
+      b.writeInt32BE(n)
+      return b
+    }
+    const frame = (...parts) => {
+      const body = Buffer.concat(parts)
+      return Buffer.concat([i32(body.length), body])
+    }
+    const header = (api, correlation) =>
+      Buffer.concat([i16(api), i16(0), i32(correlation), i16(0), Buffer.from([0])])
+    const raw = Buffer.from('0a14121212100a01612a0b0a09310100000000000000', 'hex')
+    const evidence = new EvidenceWriter(tmp())
+    const probe = new TelemetryPushProbe({ evidence, now: () => 1000 })
+    const exports = []
+    const sockets = []
+    const wrap = probe.wrap(
+      () => {
+        const socket = new (require('node:events').EventEmitter)()
+        socket.write = () => true
+        return socket
+      },
+      () => '1'
+    )
+    for (const id of [1, 2]) {
+      const socket = wrap({})
+      sockets.push(socket)
+      const uuid = Buffer.alloc(16, id)
+      socket.write(frame(header(71, 1), uuid, Buffer.from([0])))
+      socket.emit(
+        'data',
+        frame(
+          i32(1),
+          Buffer.from([0]),
+          i32(0),
+          i16(0),
+          uuid,
+          i32(7),
+          Buffer.from([1]),
+          i32(1000),
+          i32(4096),
+          Buffer.from([1, 1, 0])
+        )
+      )
+      socket.write(
+        frame(
+          header(72, 2),
+          uuid,
+          i32(7),
+          Buffer.from([0, 0, raw.length + 1]),
+          raw,
+          Buffer.from([0])
+        )
+      )
+      socket.emit('data', frame(i32(2), Buffer.from([0]), i32(0), i16(0), Buffer.from([0])))
+      exports.push({
+        v: 1,
+        node: '1',
+        seq: id,
+        clientInstanceId:
+          id === 1
+            ? '01010101-0101-0101-0101-010101010101'
+            : '02020202-0202-0202-0202-020202020202',
+        pushIntervalMs: 1000,
+        dataBytes: raw.length,
+        dataSha256: hashBytes(raw),
+        terminating: false,
+        parse: 'ok',
+      })
+    }
+    const options = {
+      active: true,
+      intervalMs: 1000,
+      window: { startMs: 999, endMs: 1001 },
+      exports,
+    }
+    expect(telemetryEvidence(probe.records, options)).toEqual({ clients: 2, pushes: 2 })
+    const socket = sockets[0]
+    socket.write(
+      frame(
+        header(72, 3),
+        Buffer.alloc(16, 1),
+        i32(7),
+        Buffer.from([0, 0, raw.length + 1]),
+        raw,
+        Buffer.from([0])
+      )
+    )
+    expect(telemetryEvidence(probe.records, options)).toEqual({ clients: 2, pushes: 2 })
+    const noResponse = probe.records.map((record) => {
+      const { errorCode, ...unanswered } = record
+      return record.kind === 'push' ? unanswered : record
+    })
+    expect(() => telemetryEvidence(noResponse, options)).toThrow()
+    socket.write(frame(header(72, 4), Buffer.from([0])))
+    expect(probe.records).toContainEqual(
+      expect.objectContaining({ kind: 'push', correlation: 4, bodyHex: '00' })
+    )
+    for (const closed of sockets) closed.emit('close')
+    expect(probe.errors).toEqual([])
+    expect(() => probe.finish()).toThrow(assert.AssertionError)
+    const archived = readChunks(
+      evidence.directory,
+      evidence.artifacts('delivery-telemetry'),
+      'delivery-telemetry'
+    ).flatMap((chunk) =>
+      chunk
+        .toString('utf8')
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => JSON.parse(line))
+    )
+    expect(archived).toContainEqual(
+      expect.objectContaining({ kind: 'push', correlation: 4, bodyHex: '00' })
+    )
+    expect(() => telemetryEvidence(archived, options)).toThrow(assert.AssertionError)
+    expect(
+      telemetryEvidence(
+        archived.filter((record) => record.bodyHex !== '00'),
+        options
+      )
+    ).toEqual({ clients: 2, pushes: 2 })
+  })
+
   test('in-window Push capture forwards unchanged bytes before any independent decoding or hashing', () => {
     const i16 = (n) => {
       const b = Buffer.alloc(2)
@@ -2346,7 +2478,7 @@ describe('telemetry review regressions', () => {
       expect(order).toEqual(['write', 'data'])
       expect(decoder).not.toHaveBeenCalled()
       expect(hasher).not.toHaveBeenCalled()
-      const captured = probe.records.find((r) => r.kind === 'push')
+      const captured = probe.records.find((r) => r.kind === 'push' && r.errorCode === 0)
       expect(Object.keys(captured).sort()).toEqual([
         'apiKey',
         'bodyHex',

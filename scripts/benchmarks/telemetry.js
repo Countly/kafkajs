@@ -2175,7 +2175,8 @@ const decodePush = (body) => {
 
 /** Decodes a retained Push outside timing, checking any previously derived fields on re-verification.
  * Capture records contain only body bytes and socket facts; decoded fields are never needed to forward.
- * @param {object} record captured request/response tuple @returns {object} independently decoded tuple
+ * @param {object} record outbound Push or completed request/response tuple
+ * @returns {object} independently decoded record
  * @throws {AssertionError|Error} for corrupt bytes, payload decoding or inconsistent derived fields
  */
 const decodePushRecord = (record) => {
@@ -2188,8 +2189,8 @@ const decodePushRecord = (record) => {
   return { ...record, ...actual }
 }
 
-/** One socket's two directions: pairs telemetry requests (APIs 71 and 72) with their responses and
- * retires each correlation when answered. Ordinary frame bodies are discarded as they stream by.
+/** One socket's two directions: archives outbound Pushes before pairing telemetry requests (APIs 71
+ * and 72) with their responses. Correlations retire when answered; ordinary frame bodies are discarded.
  */
 class SocketTap {
   #pending = new Map()
@@ -2227,6 +2228,7 @@ class SocketTap {
         if (apiKey === 72) request.bodyHex = body.toString('hex')
         else request.uuid = uuidText(body.subarray(0, 16))
         this.#pending.set(correlation, request)
+        if (apiKey === 72) emit({ ...request, observedMs: now() })
       }),
     })
     this.#in = new FrameStream({
@@ -2327,7 +2329,7 @@ class TelemetryPushProbe {
     this.#bytes = 0
   }
 
-  /** @param {object} record completed telemetry request/response tuple @returns {void} */
+  /** @param {object} record outbound Push or completed telemetry request/response tuple @returns {void} */
   #emit(record) {
     assert(!this.#finished, 'probe already sealed')
     if (this.#records.length === this.#maxRecords) this.#records.shift()
@@ -2385,7 +2387,7 @@ class TelemetryPushProbe {
     }
   }
 
-  /** @returns {object[]} bounded recent telemetry tuples; the complete stream is on disk */
+  /** @returns {object[]} bounded recent outbound Pushes and completed tuples; the full stream is on disk */
   get records() {
     return this.#records
   }
@@ -2395,9 +2397,10 @@ class TelemetryPushProbe {
     return this.#errors
   }
 
-  /** Seals capture and independently decodes Push payloads after the measured window; later records
-   * are refused. No decoder or payload hash runs on the forwarding path.
-   * @returns {object[]} every decoded tuple @throws {AssertionError|Error} on latched or decoding errors
+  /** Seals capture and independently decodes all outbound and answered Push payloads after the measured
+   * window, including requests unanswered when their socket closed. Later records are refused.
+   * No decoder or payload hash runs on the forwarding path.
+   * @returns {object[]} every decoded record @throws {AssertionError|Error} on latched or decoding errors
    */
   finish() {
     if (!this.#finished) {
@@ -2420,8 +2423,10 @@ class TelemetryPushProbe {
   }
 }
 
-/** Decides whether the wire tuples and exporter records prove the arm's telemetry state.
- * @param {object[]} records completed 71/72 tuples @param {{active:boolean,intervalMs:number,
+/** Decides whether the wire records and exporter records prove the arm's telemetry state.
+ * Outbound-only Pushes are decoded but lack response success and cannot prove active clients.
+ * @param {object[]} records outbound Pushes and completed 71/72 tuples
+ * @param {{active:boolean,intervalMs:number,
  * exports:object[],clients?:number,window?:{startMs:number,endMs:number}}} options expected state; exporter records carry `clientInstanceId`
  * and `pushIntervalMs` @returns {{clients:number,pushes:number}} what was proven
  * @throws {AssertionError} for any telemetry traffic when off, or for an active arm without an accepted
