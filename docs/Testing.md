@@ -120,6 +120,18 @@ Each client has an ordinary REQUEST listener joined to its independent socket tr
 
 Delete the test's CLIENT_METRICS resource and verify absence, disconnect every created client, close observer children and sockets naturally, verify the stamped evidence while brokers remain up, then let the owner remove its project resources. Keep failures and cleanup diagnostics. See `scripts/e2e/telemetry/README.md` for the committed artifact identities, the offline verifier and decoder inputs and the bounded sink contract.
 
+### Telemetry benchmark evidence
+
+This is a driver-only delivery. A20/A31 measured acceptance remains pending P10 CI measurements, F08 configured-outcome evidence, an accepted previous baseline, final public lifecycle delivery and the reviewed broker-guard adapter. No measured CI job or measured pass is delivered here.
+
+The telemetry benchmark driver checks observation, bounded serialization and public producer-to-consumer delivery. Its broker-free spec validates schedules, actual work, complete identities, legal metric descriptors, payload bytes and evidence schemas. These correctness tests contain no performance timing assertions.
+
+Planned P10 CI benchmark jobs compare the accepted previous snapshot and candidate with identical driver bytes. Sessions retain every declared observation, rotate arms through every position and add an independent A/A reference. One session warmup per arm is discarded separately from each workload's warmup. CPU or throughput noise above 3%, or p99 noise above 5%, makes the session void. Failed and void evidence remains available.
+
+Request denominators count completed correlated pairs. Payloads use one legal point or 128 validated custom series plus 129 built-ins and report actual raw and transmitted bytes. Delivery counts actual message entries or the sum of batch message lengths, separately from callbacks and observed gaps. Durable-log identities, handler identities and raw broker commits are independent checks. Same-path observer, serializer and handler controls must detect overhead. A unit-test pass does not establish a performance result or baseline.
+
+Run `npm run bench:telemetry --` with explicit request, payload or delivery arguments. Delivery jobs require the controller's reserved broker guard and configured fixture. The driver does not start brokers. A worker timeout, partial session, missing codec prerequisite or incorrect artifact cannot produce a passing benchmark result. Retain the manifest, source and driver hashes, all worker artifacts, noise verdict and cleanup evidence with each result.
+
 ## Integration tests
 
 Most of the test suite talks to a real Kafka cluster. `npm test` runs `npm run lint`, `npm run compat:check` and `npm run protocol:check`, boots the cluster, runs everything, and tears the cluster down again — it's a convenient local shortcut, but it is not what CI runs.
