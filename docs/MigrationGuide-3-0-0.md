@@ -1491,3 +1491,27 @@ The runtime is unchanged by these; they can fail `tsc` on an existing codebase.
   convert the element with `Number(id)`. The runtime is unchanged.
 The declared bases of KafkaJSPartialMessageError, KafkaJSSASLAuthenticationError, KafkaJSGroupCoordinatorNotFound, KafkaJSNotImplemented, KafkaJSTimeout and KafkaJSUnsupportedMagicByteInMessageSet now match KafkaJSNonRetriableError. KafkaJSLockTimeout extends KafkaJSTimeout. Runtime inheritance is unchanged.
 
+### Numeric telemetry snapshots
+
+The internal collector supports finite numeric Gauge and monotonic BigInt Sum
+snapshots. Returned-client registration methods are not attached at this milestone.
+The model updates a value by re-registering the same name and attributes; it does not
+poll a callback or bridge an OTel SDK. Type and unit remain fixed while any identity
+of a name is registered. Unregister before resetting a Sum or changing its metadata.
+Use existing instrumentation or the optional OTel package for application metrics.
+
+### Telemetry payload bounds and codecs
+
+The internal telemetry primitives enforce a 1 MiB default and hard local cap on both
+raw and transmitted Metrics bytes, further reduced by a positive broker limit or
+temporary size penalty. Small limits may omit whole metrics or produce an empty
+blob. Metrics are best effort: a sample already written can be lost without later
+delta replay. The public configuration milestone documents lowering the local cap
+or disabling telemetry; this preparatory primitive adds no returned-client option.
+
+Telemetry payloads over1000 bytes use mutually supported built-in ZSTD/GZIP in broker order; NONE is always available. Producer codec registrations are unchanged.
+
+Snappy, native LZ4 and custom codec callbacks are outside this telemetry sender's
+supported subset. Broker accepted codecs can exclude an unwanted built-in; runtime
+ZSTD unavailability falls back to the next supported codec or NONE. Existing record
+compression and decompression limits retain their own configuration and behavior.

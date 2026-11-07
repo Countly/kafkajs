@@ -1769,6 +1769,51 @@
     "javaClientsJarSha256": null,
     "fixtureSha256": "66b64e1562648baf4e09f56bf428203857bb80f466383d47746f8a6ebc7266eb"
   },
+  "src/protocol/requests/getTelemetrySubscriptions/fixtures/java/getTelemetrySubscriptionsRequest-v0-stable.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "5a206578e795f35121aecae3f5d550ed22c5b2c47b1fef66f8aa1c6a24c398b1"
+  },
+  "src/protocol/requests/getTelemetrySubscriptions/fixtures/java/getTelemetrySubscriptionsRequest-v0-zero.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "aa306efb1f3e82acea1f1f29c1ce4437aa0e50a4ab6111dfc1631327e65be22e"
+  },
+  "src/protocol/requests/getTelemetrySubscriptions/fixtures/java/getTelemetrySubscriptionsResponse-v0-basic.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "3e2b3aaca7e24a538e5c57f47c11050db53eca39fb53cae609c243b27456a867"
+  },
+  "src/protocol/requests/getTelemetrySubscriptions/fixtures/java/getTelemetrySubscriptionsResponse-v0-empty.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "b1ea6ac69e7f6221231a354e629b56e3d97fa64dc08e7f9095e5abd83ef598c1"
+  },
+  "src/protocol/requests/getTelemetrySubscriptions/fixtures/java/getTelemetrySubscriptionsResponse-v0-max.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "65e0062f3f8067b76f4f7f00314cf96d95a247795d3867e7a86d6d3ccbee4b41"
+  },
+  "src/protocol/requests/getTelemetrySubscriptions/fixtures/java/getTelemetrySubscriptionsResponse-v0-min.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "84dc56a6dc0d44fa7812e0f9c7bf394f9a6ec255eb2a622038e6be81aec978a7"
+  },
+  "src/protocol/requests/getTelemetrySubscriptions/fixtures/java/getTelemetrySubscriptionsResponse-v0-stale.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "6ac8f39476e447ed926c220a3142b3ecb8ab7af5c0bab041f23543e26d3495af"
+  },
+  "src/protocol/requests/getTelemetrySubscriptions/fixtures/java/getTelemetrySubscriptionsResponse-v0-tooLarge.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "43f59e6a66eb5655d22235d8c17b7debecc5db8aaacb1c1107cc0d0bd71190c8"
+  },
+  "src/protocol/requests/getTelemetrySubscriptions/fixtures/java/getTelemetrySubscriptionsResponse-v0-unsupported.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "ef6c3f261ad02a8586e8fcdcb3c55148d7c5ecea817dc362a33a0576acdca15c"
+  },
   "src/protocol/requests/heartbeat/fixtures/java/heartbeatRequest-v4-basic.json": {
     "javaClientsJar": "4.3.1",
     "javaClientsJarSha256": null,
@@ -2608,6 +2653,66 @@
     "javaClientsJar": "4.3.1",
     "javaClientsJarSha256": null,
     "fixtureSha256": "fba26a650048d0a1941ae8e1c80139803f2ff68b5abbc5043586266f0fdd8ba8"
+  },
+  "src/protocol/requests/pushTelemetry/fixtures/java/pushTelemetryRequest-v0-basic.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "302c0dfe13177daeeb53e49cc645f7aa509f73af95b7dc7af9bf1305ec2edd04"
+  },
+  "src/protocol/requests/pushTelemetry/fixtures/java/pushTelemetryRequest-v0-empty.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "89ca8dfe39084e5771d1bf4310d6e6701385121a1eda9d42c7188b3982d40f03"
+  },
+  "src/protocol/requests/pushTelemetry/fixtures/java/pushTelemetryRequest-v0-max.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "bb0d1fc47a751f029225bcf465221e7588f4e2c7f58390591aa7430d93c524a7"
+  },
+  "src/protocol/requests/pushTelemetry/fixtures/java/pushTelemetryRequest-v0-min.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "f1954c9e508a0e8e5fcd46e82ad07888e90051409f0e49d0ffffc711fc4c6697"
+  },
+  "src/protocol/requests/pushTelemetry/fixtures/java/pushTelemetryRequest-v0-terminating.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "8af25efe7657c756192ed5f0222c4dd4a0adebf695616895190ace4c82ef6bea"
+  },
+  "src/protocol/requests/pushTelemetry/fixtures/java/pushTelemetryRequest-v0-zero.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "e531c7e21fbbb2226aef43ae2375bd7dd9c19e04f6c42409abc06c94ba871645"
+  },
+  "src/protocol/requests/pushTelemetry/fixtures/java/pushTelemetryResponse-v0-invalid.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "22c286e4951aa532aed951bd76fa18f56bb6d2272745ba59ea4272602f8aafdd"
+  },
+  "src/protocol/requests/pushTelemetry/fixtures/java/pushTelemetryResponse-v0-ok.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "48ba8c0fb68e24ef82847e4bd540b64c64fab6367c0d2b9af8e60921c0865283"
+  },
+  "src/protocol/requests/pushTelemetry/fixtures/java/pushTelemetryResponse-v0-stale.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "5ebe95525828cf7d3598d3937a10bce5a159dd749c9a92797793bb597fe9d068"
+  },
+  "src/protocol/requests/pushTelemetry/fixtures/java/pushTelemetryResponse-v0-throttled.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "9a726917cb68bffd6853c9284f1e604ca751e8ff352000454a2ed9a44e984f49"
+  },
+  "src/protocol/requests/pushTelemetry/fixtures/java/pushTelemetryResponse-v0-tooLarge.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "31fb710fbcd29839facdc0f4b58b2323c7edd86a1aa2bd30166f03a8fb67659e"
+  },
+  "src/protocol/requests/pushTelemetry/fixtures/java/pushTelemetryResponse-v0-unsupported.json": {
+    "javaClientsJar": "4.4.0",
+    "javaClientsJarSha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+    "fixtureSha256": "2f71ec7fb4140a3c642704eedd01d28777ca6e3fa6b153ed86bda38aeadd39ca"
   },
   "src/protocol/requests/renewDelegationToken/fixtures/java/renewDelegationTokenRequest-v1-security.json": {
     "javaClientsJar": "4.3.1",

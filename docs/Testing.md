@@ -45,6 +45,45 @@ The guard starts the full `share-consumer` CLI child with exposed GC. Both guard
 
 Benchmark controls count batch callbacks separately from messages and compare complete record identities. Measured share, record-walk and ordinary-regression benchmark sessions run on CI in a later performance phase, with their declared frame, latency, memory and A/A gates.
 
+### Telemetry wire evidence
+
+The telemetry v0 codecs have independent request and response vectors under each
+protocol directory's `fixtures/java/`. The development Java generator uses a pinned,
+verified Kafka 4.4.0 client jar. Codec tests compare encoded requests to those bytes
+and decoded responses to literal fields. Two strict wire pairs read the same request
+vectors and build the same response vectors; the telemetry profile adds only those
+two versions to the default scripted profile. Finite controls reject null Metrics,
+trailing bytes, truncated fields, missing pairs and unadvertised versions. These
+checks need no broker. Seeded response-corpus controls are separate from these
+deterministic tests and retain their independent source vectors.
+
+### Numeric telemetry evidence
+
+Broker-free collector tests cover metric names, selectors, resource whitelists,
+physical-attempt identity, node retirement, frozen gauge windows, exact BigInt sums,
+uint64 timestamps and bounded numeric registration on four collector kinds. A fake
+socket test follows real Connection preparation, queueing and response completion;
+its held encoder proves an old node slot cannot be relabeled. Public client methods,
+configured broker export and performance gates have separate integration owners.
+
+### Independent OTLP evidence
+
+The telemetry numeric-subset vectors pin OpenTelemetry proto v1.9.0, protoc 25.5,
+protobuf-java 3.25.5 and the independent generated-bindings digest. The separate
+GenerateTelemetryVectors.java uses constant inputs and generated Java builders;
+it never calls the JavaScript writer. Compare its exact bytes with the retained
+fixtures, then decode candidate bodies through the same independent bindings.
+See scripts/protocol/javaVectors/README.md for the offline classpath and commands.
+No tool or dependency is downloaded by these commands or by a client at runtime.
+Java regeneration is a required acceptance check; a hand-computed candidate vector
+or a JavaScript round trip does not replace it.
+
+Broker-free tests cover zero oneofs, non-ASCII nested lengths, signed integer and
+unsigned timestamp domains, whole-point fitting, paired node gauges, both byte caps,
+broker-ordered built-ins and retired native completions. Configured exporter and
+Java GZIP/ZSTD decode remain separate integration checks. A missing independent
+toolchain is an unrun check, never an equivalent pass.
+
 ## Integration tests
 
 Most of the test suite talks to a real Kafka cluster. `npm test` runs `npm run lint`, `npm run compat:check` and `npm run protocol:check`, boots the cluster, runs everything, and tears the cluster down again — it's a convenient local shortcut, but it is not what CI runs.

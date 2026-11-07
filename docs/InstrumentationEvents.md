@@ -283,3 +283,12 @@ What to know before relying on the numbers:
 - **Label cardinality.** The labels are the client kind, the `clientId`, the API name, the topic, the membership protocol and whether the consumer restarts. `kind`, `api`, `protocol` and `restart` take a handful of values; `topic` and `clientId` stay bounded only if your application keeps them so, and a regex subscription over a cluster with many topics, or a `clientId` built per process or per request, breaks that. Each new `topic`, and each new `kind`, `clientId` and API combination, adds 15 time series (1 on the counter and 14 on its histogram with the default buckets) that live until the process ends: drop the `topic` label, or map topics onto a fixed set, when you do not control them, and keep `clientId`s stable. Never label by `correlationId`, `memberId`, `broker` or a partition, which are unbounded or churn.
 - **One process, one set of counters.** A channel is process-wide, so two `Kafka` instances (or a producer and a consumer) feed the same metrics. `kind` and `client_id` keep their request metrics apart as long as the instances use different `clientId`s; the consumer's own metrics (`consumer.end_batch_process`, `consumer.group_join`) carry no `clientId`, so two consumers in one process add up.
 - **A subscriber must not throw.** The recipe's handlers only read documented payload fields; if you add one that can throw, catch inside it.
+
+### Private numeric observation
+
+Broker telemetry uses a private numeric sink beside successful normal socket connect
+and completed response RTT. It adds no public event, diagnostics channel or REQUEST
+payload field. It registers no public event listener. Disabled and dedicated
+telemetry connections use a null sink. The collector never awaits, serializes or
+calls application metric suppliers on this path. Collector failures are contained
+without changing a foreground operation's result, rejection or invocation count.

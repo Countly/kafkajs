@@ -380,7 +380,7 @@ Released share message vectors:
 ## Telemetry message vectors
 
 `GenerateMessageVectors telemetry <output-root>` writes only GetTelemetrySubscriptions v0 and
-PushTelemetry v0 request/response fixtures. Use an already verified Kafka 4.3.1 client jar,
+PushTelemetry v0 request/response fixtures. Use an already verified Kafka 4.4.0 client jar,
 record its SHA-256 and the JDK version, and compile the generator before invoking this mode.
 The 21 literal cases cover zero/stable UUID, signed subscription limits, empty Metrics and
 arrays, requested prefixes, signed int8 codecs, terminating pushes and numeric refusals.
