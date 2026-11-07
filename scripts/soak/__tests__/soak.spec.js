@@ -3447,6 +3447,62 @@ describe('Share soak owner', () => {
     await owner.close()
   })
 
+  test('accepts and counts work completed before the cutoff when the idle pause wakes late', async () => {
+    let now = 0
+    const driver = scripted({
+      alter: (facts) => {
+        now = facts.timing.due - 6000
+        facts.timing.completedAt = now
+      },
+    })
+    const { owner, rows } = build({ driver, clock: { now: () => now } })
+    owner.pause = jest.fn(async (_scope, ms) => {
+      now += ms + 3
+    })
+
+    await expect(owner.runCycle(0)).resolves.toBeUndefined()
+    expect(owner.pause).toHaveBeenCalledTimes(1)
+    expect(owner.pause).toHaveBeenCalledWith(expect.any(AbortSignal), 6000)
+    expect(owner.counts).toEqual({ cycles: 1, resets: 0, memberAdds: 1, memberRemoves: 1 })
+    expect(rows.filter(({ event }) => event === 'soak-cycle')).toEqual([
+      expect.objectContaining({
+        cycle: 0,
+        status: 'passed',
+        timing: expect.objectContaining({ due: 32000, completedAt: 26000 }),
+      }),
+    ])
+    expect(owner.timing.slots).toEqual([{ cycle: 0, startedAt: 0, due: 32000, completedAt: 32003 }])
+  })
+
+  test.each(['before', 'after'])(
+    'rejects work completed after the cutoff %s verification without counting or idling',
+    async (when) => {
+      let now = 0
+      const driver = scripted({
+        alter: (facts) => {
+          now = when === 'before' ? facts.timing.due + 1 : facts.timing.completedAt
+        },
+      })
+      const { owner } = build({ driver, clock: { now: () => now } })
+      const verifyCycle = owner.verifyCycle.bind(owner)
+      const verify = jest.spyOn(owner, 'verifyCycle').mockImplementation((plan, facts) => {
+        const violations = verifyCycle(plan, facts)
+        if (when === 'after') now = facts.timing.due + 1
+        return violations
+      })
+      owner.pause = jest.fn()
+
+      await expect(owner.runCycle(0)).rejects.toThrow('Cycle 0 completed after its absolute cutoff')
+      expect(verify).toHaveBeenCalledTimes(when === 'before' ? 0 : 1)
+      expect(driver.cycle).toHaveBeenCalledTimes(1)
+      expect(owner.counts).toEqual({ cycles: 0, resets: 0, memberAdds: 0, memberRemoves: 0 })
+      expect(owner.pause).not.toHaveBeenCalled()
+      expect(owner.timing.slots).toEqual([
+        { cycle: 0, startedAt: 0, due: 32000, completedAt: 32001 },
+      ])
+    }
+  )
+
   test('several individually small transitions consume one cumulative allowance', async () => {
     let now = 0
     const { owner } = build({ clock: { now: () => now } })
