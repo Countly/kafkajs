@@ -7,7 +7,7 @@
  *
  * Usage: node --expose-gc scripts/soak/soak.js --profile
  *          <idle|member-churn|regex-topic-churn|outage|first-run|producer-churn|consumer-churn|
- *          share-consumer|share-consumer-short> [--phase-seconds <n>]
+ *          share-consumer|share-consumer-short|telemetry> [--phase-seconds <n>]
  *   (= npm run test:kafka -- "node --expose-gc scripts/soak/soak.js --profile first-run" for the
  *   15-minute run, `npm run soak:first-run`)
  * Writes one JSON line per sample and per quiet point to `.tmp/e2e/soak.jsonl` through
@@ -37,6 +37,12 @@
  *                     session reset per cycle; judged by independent log, broker-position and
  *                     handler checks and a per-phase resource screen; see `ShareSoak`
  *   share-consumer-short  the same three phases of 320 s with cycles of 32 s; takes no --phase-seconds
+ *   telemetry         one phase of 360 s (60 s warm-up, 300 s measurement) on the configured telemetry
+ *                     fixture: four one-client worker processes, one per client kind, each held to
+ *                     its own memory and exact resource identities through subscription changes,
+ *                     telemetry reconnects and public close/reopen cycles, with an independent
+ *                     record oracle and natural-exit checks; takes no --phase-seconds; see
+ *                     `TelemetryChurn`
  * Every phase ends by disconnecting its clients, also when it fails; the readings that must be zero
  * are taken there.
  * `--phase-seconds n` shortens every phase to n seconds: a smoke run of the driver, not of memory.
@@ -444,6 +450,11 @@ const privateOf = (kafka, name) => {
  *   also enables per-emitter socket/queue names without changing ordinary listeners.
  * @param {Function} [readings.shareState] the actual share session, record and range counts; a
  *   reading is absent without it
+ * @param {boolean} [readings.publicOnly=false] read no private member of the client: no request
+ *   queue, ledger or obligation reading is taken, and those fields are omitted, never zero
+ * @param {() => Record<string, Iterable<object|Function>>} [readings.identities] owned process
+ *   resources by role, added to the open sockets and their listeners by event
+ * @param {boolean} [readings.memory=false] settled heap plus external and RSS after two collections
  * @returns {{ kafka: object, probe: { snapshot: () => Promise<object> },
  *   socketFactory: Function, listeners: () => Record<string, Record<string, number>> }}
  *   `socketFactory` is the counted factory the client was given: a connection made through it,
@@ -452,7 +463,15 @@ const privateOf = (kafka, name) => {
  */
 const instrument = (
   { socketFactory = defaultSocketFactory(), ...options },
-  { activeResources = true, socketIdentities = false, shareState, originalQueues } = {}
+  {
+    activeResources = true,
+    socketIdentities = false,
+    shareState,
+    originalQueues,
+    publicOnly = false,
+    identities: ownedIdentities,
+    memory = false,
+  } = {}
 ) => {
   const open = new Set()
   const originalSockets = []
@@ -471,13 +490,16 @@ const instrument = (
   }
   const kafka = new Kafka({ ...options, socketFactory: counted })
 
-  const { symbol, value: createCluster } = privateOf(kafka, 'createCluster')
-  kafka[symbol] = (...args) => {
-    const cluster = createCluster(...args)
-    clusters.add(new WeakRef(cluster))
-    return cluster
+  let operations = null
+  if (!publicOnly) {
+    const { symbol, value: createCluster } = privateOf(kafka, 'createCluster')
+    kafka[symbol] = (...args) => {
+      const cluster = createCluster(...args)
+      clusters.add(new WeakRef(cluster))
+      return cluster
+    }
+    operations = privateOf(kafka, 'operations').value
   }
-  const { value: operations } = privateOf(kafka, 'operations')
 
   const openSockets = () => {
     for (const socket of open) {
@@ -496,36 +518,61 @@ const instrument = (
   }
   const queues = () => [
     ...(originalQueues?.() ?? []),
-    ...liveClusters()
+    ...(publicOnly ? [] : liveClusters())
       .flatMap(({ brokerPool }) => [...Object.values(brokerPool.brokers), brokerPool.seedBroker])
       .filter(Boolean)
       .flatMap(({ connectionPool }) => connectionPool.pool.map(({ requestQueue }) => requestQueue)),
   ]
   const unique = (items) => [...new Set(items)]
 
+  /** Open sockets and their listeners by event, plus the caller's owned resources, by role. */
+  const publicIdentities = () => {
+    const roles = { sockets: openSockets() }
+    for (const socket of roles.sockets)
+      for (const event of socket.eventNames())
+        (roles[`listener:sockets:${String(event)}`] ??= []).push(...socket.rawListeners(event))
+    return { ...roles, ...(ownedIdentities?.() ?? {}) }
+  }
+  /** Lets the collection callback's timer be destroyed before identities are read. */
+  const settlingPause = async (ms) => {
+    await sleep(ms)
+    await new Promise((resolve) => setImmediate(resolve))
+    await new Promise((resolve) => setImmediate(resolve))
+  }
   const probe = createResourceProbe({
     emitters: {
-      get requestQueues() {
-        return together(unique(queues()))
-      },
+      ...(publicOnly
+        ? {}
+        : {
+            get requestQueues() {
+              return together(unique(queues()))
+            },
+          }),
       get sockets() {
         return together(openSockets())
       },
     },
     sockets: () => ({ created, destroyed: created - openSockets().length }),
-    queueDepth: () =>
-      unique(queues()).reduce(
-        (total, queue) => total + queue.pending.length + queue.inflight.size,
-        0
-      ),
-    ledgerSize: () => [...operations.values()].reduce((total, ledger) => total + ledger.size(), 0),
-    obligationSize: () =>
-      [...operations.values()]
-        .flatMap((ledger) => [...ledger.attached])
-        .reduce((total, obligations) => total + obligations.size(), 0),
+    ...(publicOnly
+      ? {}
+      : {
+          queueDepth: () =>
+            unique(queues()).reduce(
+              (total, queue) => total + queue.pending.length + queue.inflight.size,
+              0
+            ),
+          ledgerSize: () =>
+            [...operations.values()].reduce((total, ledger) => total + ledger.size(), 0),
+          obligationSize: () =>
+            [...operations.values()]
+              .flatMap((ledger) => [...ledger.attached])
+              .reduce((total, obligations) => total + obligations.size(), 0),
+        }),
     shareState,
     activeResources,
     heap: typeof globalThis.gc === 'function',
+    ...(publicOnly && memory ? { memory: true, pause: settlingPause } : {}),
+    ...(publicOnly ? { identities: publicIdentities } : {}),
   })
 
   if (identities) {
@@ -556,6 +603,7 @@ const instrument = (
       emitter.eventNames().map((name) => [String(name), emitter.listenerCount(name)])
     )
   const listeners = () => {
+    if (publicOnly) return { sockets: named(together(openSockets())) }
     if (!originalQueues) {
       return {
         requestQueues: named(together(unique(queues()))),
@@ -6451,6 +6499,76 @@ const buildShareSoak = ({ brokers, short = false, record, run }) => {
 }
 
 /**
+ * Builds the owner of the telemetry profile. In the parent it holds the broker resource, the four
+ * supervised workers and the independent oracle; in a worker process (named by the development-only
+ * worker environment, with the parent's IPC channel) it is the one-client worker. Either way it
+ * reads no private member of the client and never starts a cluster.
+ * @param {object} options
+ * @param {string[]} options.brokers seed addresses
+ * @param {Array<{ name: string, workload: string, ms: number }>} options.phases exactly the fixed phase
+ * @returns {{ run: () => Promise<{ ok: boolean }>, close: () => Promise<void> }}
+ * @throws {Error} without `--expose-gc`, for another phase list, an unconfigured broker line or
+ *   evidence directory, and for a worker without its kind or IPC channel
+ */
+const buildTelemetryChurn = ({ brokers, phases }) => {
+  if (typeof globalThis.gc !== 'function')
+    throw new Error(
+      'The telemetry profile reads memory after a collection: run node with --expose-gc'
+    )
+  if (JSON.stringify(phases) !== JSON.stringify(PROFILES.telemetry))
+    throw new Error('The telemetry profile runs its one fixed phase')
+  const churn = require('./telemetryChurn')
+  const kind = process.env[churn.WORKER_ENV]
+  if (kind !== undefined) {
+    if (!churn.KINDS.includes(kind) || typeof process.send !== 'function')
+      throw new Error('A telemetry worker needs its kind and its parent channel')
+    const worker = new churn.TelemetryWorkerProcess({
+      kind,
+      soak: {
+        Soak,
+        WORKLOADS,
+        PROFILES,
+        instrument,
+        TELEMETRY,
+        TelemetryResourceVerdict,
+        logLevel,
+        socketFactory: defaultSocketFactory(),
+      },
+    })
+    return { run: () => worker.run(), close: async () => {} }
+  }
+  const line = process.env.KAFKA_VERSION
+  if (
+    !['4.3.1', '4.2.2'].includes(line) ||
+    process.env.COMPOSE_FILE !== 'docker-compose.telemetry.yml' ||
+    !process.env.COMPOSE_PROJECT_NAME ||
+    !path.isAbsolute(process.env.TELEMETRY_EVIDENCE_DIR ?? '')
+  )
+    throw new Error(
+      'The telemetry profile needs the configured broker line, the telemetry compose file, its project and an absolute evidence directory'
+    )
+  const { withTelemetryResource } = require('../../testHelpers/telemetryFixtures')
+  const stem = `telemetry-churn-${Date.now().toString(36)}`
+  const kafka = new Kafka({ clientId: `parent-${stem}`, brokers, logLevel: logLevel.NOTHING })
+  return new churn.TelemetryChurn({
+    fixture: new churn.ParentFixture({
+      brokers,
+      stem,
+      kafka,
+      readLog,
+      withResource: withTelemetryResource,
+    }),
+    processes: new churn.TelemetryProcesses({ script: __filename }),
+    record: (row) => writeEvidence('telemetry-churn', row),
+    clock: REAL_CLOCK,
+    limits: TELEMETRY,
+    verdict: (input) => TelemetryResourceVerdict.evaluate(input),
+    brokers,
+    stem,
+  })
+}
+
+/**
  * Runs a profile against the cluster `brokers` names.
  * @param {string} profile a key of `PROFILES`
  * @param {object} [options]
@@ -6464,6 +6582,8 @@ const buildShareSoak = ({ brokers, short = false, record, run }) => {
  *   builds the owner of the `consumer-churn` profile
  * @param {(options: object) => { run: () => Promise<{ ok: boolean }>, close: () => Promise<void> }} [options.shareSoak=buildShareSoak]
  *   builds the owner of both share-consumer profiles
+ * @param {(options: object) => { run: () => Promise<{ ok: boolean }>, close: () => Promise<void> }} [options.telemetry=buildTelemetryChurn]
+ *   builds the owner of the `telemetry` profile
  * @returns {Promise<{ ok: boolean }>} the verdict: `evaluate`'s for a consumer profile, the
  *   combined verdict of `ProducerChurn` for `producer-churn`, that of `ShareSoak` for a share
  *   profile
@@ -6478,6 +6598,7 @@ const main = async (
     churn = buildProducerChurn,
     consumerChurn = buildConsumerChurn,
     shareSoak = buildShareSoak,
+    telemetry = buildTelemetryChurn,
   } = {}
 ) => {
   if (typeof globalThis.gc !== 'function') {
@@ -6495,6 +6616,24 @@ const main = async (
   }
 
   const phases = phasesOf(profile, phaseSeconds)
+  if (profile === 'telemetry') {
+    const owner = telemetry({ brokers, phases })
+    let outcome
+    try {
+      outcome = { ok: true, value: await owner.run() }
+    } catch (error) {
+      outcome = { ok: false, error }
+    }
+    try {
+      await owner.close()
+    } catch (error) {
+      if (!outcome.ok) throw new AggregateError([outcome.error, error], 'Telemetry cleanup failed')
+      throw error
+    }
+    if (!outcome.ok) throw outcome.error
+    return outcome.value
+  }
+
   if (profile === 'producer-churn') {
     const owner = churn({ brokers, phaseSeconds, phases })
     try {
@@ -6587,6 +6726,7 @@ module.exports = {
   ConsumerChurnOracle,
   buildConsumerChurn,
   buildProducerChurn,
+  buildTelemetryChurn,
   forgettingDestroyed,
   PROFILES,
   SHARE_SOAK,
