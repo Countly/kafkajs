@@ -376,6 +376,7 @@ class BounceEvidence {
     this.brokers = new Set()
     this.epochAuthorities = new Map()
     this.epochSamples = new Map()
+    this.epochProbes = new Set()
     this.epochSignal = null
     this.cohorts = new Map()
     this.originalExchanges = new Map()
@@ -410,6 +411,14 @@ class BounceEvidence {
   /** @returns {void} Installs read-only observers before the workload connects. */
   install() {
     const owns = (loop) => loop.groupId === this.owner.group
+    this.wrap(Broker.prototype, 'connect', async (broker, original, args) => {
+      const result = await original.apply(broker, args)
+      if (broker.connectionPool.clientId === `member-${this.owner.nonce}`) {
+        this.brokers.add(broker)
+        this.sampleEpoch(broker)
+      }
+      return result
+    })
     this.wrap(RequestQueue.prototype, 'push', (queue, original, [request]) => {
       const context = this.owner.tap.context.getStore()
       if (!context) return original.call(queue, request)
@@ -462,6 +471,16 @@ class BounceEvidence {
       if (!fact) return original.call(loop, exchange, response)
       fact.response = response
       fact.responseIdentity = this.label(response)
+      if (
+        fact.apiKey === 78 &&
+        response.errorCode === 0 &&
+        response.responses.some(({ partitions }) =>
+          partitions.some(
+            ({ errorCode, acquiredRecords }) => errorCode === 0 && acquiredRecords.length
+          )
+        )
+      )
+        this.sampleEpoch(loop.broker, { fresh: true })
       return original.call(loop, exchange, response)
     })
     this.wrap(ShareFetchLoop.prototype, 'failExchange', (loop, original, [exchange, error]) => {
@@ -504,7 +523,6 @@ class BounceEvidence {
       }
       this.cohorts.set(row, fact)
       this.acquisitions.push(fact)
-      this.sampleEpoch(loop.broker)
       return row
     })
     this.wrap(ShareRun.prototype, 'invoke', (run, original, args) => {
@@ -567,7 +585,7 @@ class BounceEvidence {
       return this.owner.tap.context.run(fact, async () => {
         const response = await original.apply(broker, args)
         fact.endedAt = performance.now()
-        fact.response = response
+        fact.response = immutable(response)
         if (response.topicMetadata?.some(({ topic }) => topic === this.owner.topic))
           this.epochs.push(fact)
         return response
@@ -631,19 +649,20 @@ class BounceEvidence {
    * Starts independent source-node sampling, coalescing another observation after a pending sample.
    * Acquisition observers request a fresh upper bound without delaying the original dispatch.
    * @param {object} broker Original workload broker.
+   * @param {{fresh?:boolean}} [options] Starts an acquisition observation alongside pending sampling.
    * @returns {void}
    */
-  sampleEpoch(broker) {
+  sampleEpoch(broker, { fresh = false } = {}) {
     const signal = this.epochSignal
     if (!signal || signal.aborted || this.owner.driveFinished) return
     const pending = this.epochSamples.get(broker)
-    if (pending) {
+    if (pending && !fresh) {
       pending.again = true
       return
     }
     if (!broker.connectionPool.isConnected()) return
     const sample = { again: false }
-    this.epochSamples.set(broker, sample)
+    if (!pending) this.epochSamples.set(broker, sample)
     sample.task = (async () => {
       do {
         sample.again = false
@@ -660,7 +679,11 @@ class BounceEvidence {
         !signal.aborted &&
         broker.connectionPool.isConnected()
       )
-    })().finally(() => this.epochSamples.delete(broker))
+    })().finally(() => {
+      if (this.epochSamples.get(broker) === sample) this.epochSamples.delete(broker)
+      this.epochProbes.delete(sample.task)
+    })
+    this.epochProbes.add(sample.task)
     sample.task.catch(() => {})
   }
 
@@ -679,7 +702,7 @@ class BounceEvidence {
       }
     } finally {
       this.epochSignal = null
-      await Promise.all([...this.epochSamples.values()].map(({ task }) => task))
+      await Promise.all([...this.epochProbes])
     }
   }
 
@@ -1395,6 +1418,42 @@ const freezeProblems = (entries, bounces, evidence) =>
   freezeAccounting(entries, bounces, evidence).problems
 
 /**
+ * @param {object} entry Original handler acquisition.
+ * @param {object[]} samples Original Metadata responses and their wire frames.
+ * @returns {object[]} Successful metadata observations from this acquisition's source node/pool.
+ */
+const sourceEpochSamples = (entry, samples) =>
+  samples.flatMap((sample) => {
+    if (!entry.acquisition?.source) return []
+    const topics = sample.response.topicMetadata.filter(({ topicId }) => topicId === entry.topicId)
+    if (topics.length !== 1 || sample.frames.length !== 1) return []
+    const frame = sample.frames[0]
+    if (frame.apiKey !== 3 || frame.apiVersion < 7 || !frame.responseBytes) return []
+    const rows = topics[0].partitionMetadata.filter(
+      ({ partitionId }) => partitionId === entry.partition
+    )
+    if (rows.length !== 1) return []
+    const row = rows[0]
+    return row.partitionErrorCode === 0 &&
+      sample.nodeId === entry.acquisition.source.nodeId &&
+      sample.pool === entry.acquisition.pool &&
+      Number.isInteger(row.leader) &&
+      row.leader >= 0 &&
+      Number.isInteger(row.leaderEpoch) &&
+      row.leaderEpoch >= 0
+      ? [{ sample, frame, row }]
+      : []
+  })
+
+/**
+ * @param {object} entry Original handler acquisition.
+ * @param {object[]} samples Original Metadata responses and their wire frames.
+ * @returns {object[]} Source-node local observations identifying that node as leader.
+ */
+const ownEpochSamples = (entry, samples) =>
+  sourceEpochSamples(entry, samples).filter(({ sample, row }) => row.leader === sample.nodeId)
+
+/**
  * Proves disjoint serving-epoch bounds using source-node local epoch observations and down barriers.
  * A source must itself be the observed leader: a remote cache, batch epoch or CurrentLeader default
  * supplies no bound. Same-node epochs never decrease; samples bracket the original wire intervals.
@@ -1409,30 +1468,8 @@ const freezeProblems = (entries, bounces, evidence) =>
  */
 const epochAdvance = (old, next, bounce, samples, exchanges) => {
   if (!Number.isFinite(bounce.downAt) || bounce.downAt <= bounce.at) return null
-  const ownSamples = (entry) =>
-    samples.flatMap((sample) => {
-      const topics = sample.response.topicMetadata.filter(
-        ({ topicId }) => topicId === entry.topicId
-      )
-      if (topics.length !== 1 || sample.frames.length !== 1) return []
-      const frame = sample.frames[0]
-      if (frame.apiKey !== 3 || frame.apiVersion < 7 || !frame.responseBytes) return []
-      const rows = topics[0].partitionMetadata.filter(
-        ({ partitionId }) => partitionId === entry.partition
-      )
-      if (rows.length !== 1) return []
-      const row = rows[0]
-      return row.partitionErrorCode === 0 &&
-        row.leader === sample.nodeId &&
-        sample.nodeId === entry.acquisition.source.nodeId &&
-        sample.pool === entry.acquisition.pool &&
-        Number.isInteger(row.leaderEpoch) &&
-        row.leaderEpoch >= 0
-        ? [{ sample, frame, row }]
-        : []
-    })
-  for (const before of ownSamples(old))
-    for (const after of ownSamples(next)) {
+  for (const before of ownEpochSamples(old, samples))
+    for (const after of ownEpochSamples(next, samples)) {
       if (
         old.acquisition.source.frames[0].responseAt >= before.frame.at ||
         before.frame.responseAt >= bounce.downAt ||
@@ -1488,7 +1525,20 @@ const epochAdvance = (old, next, bounce, samples, exchanges) => {
         ['stop', 'kill'].includes(bounce.kind) &&
         bounce.at < old.acquisition.source.frames[0].at &&
         before.row.leader !== after.row.leader
-      if (before.frame.responseAt < bounce.at || transition || downBarrier)
+      const metadataTransition = sourceEpochSamples(old, samples).find(
+        ({ frame, row }) =>
+          frame.endpoint === old.acquisition.source.endpoint &&
+          before.frame.responseAt < frame.at &&
+          bounce.at < frame.at &&
+          frame.at < frame.responseAt &&
+          frame.responseAt < bounce.downAt &&
+          frame.responseAt < after.frame.at &&
+          row.leader !== before.row.leader &&
+          row.leaderEpoch > before.row.leaderEpoch &&
+          row.leaderEpoch <= after.row.leaderEpoch &&
+          (row.leader === after.row.leader || row.leaderEpoch < after.row.leaderEpoch)
+      )
+      if (before.frame.responseAt < bounce.at || transition || metadataTransition || downBarrier)
         return {
           upper: before.row.leaderEpoch,
           lower: after.row.leaderEpoch,
@@ -1496,10 +1546,109 @@ const epochAdvance = (old, next, bounce, samples, exchanges) => {
           after: after.frame.id,
           bounce: bounce.index,
           transition: transition?.frames[0].id,
+          metadataTransition: metadataTransition?.frame.id,
           downBarrier: downBarrier ? bounce.downAt : undefined,
         }
     }
   return null
+}
+
+/**
+ * @param {object} entry Failing replay.
+ * @param {object[]} entries Complete original handler journal.
+ * @param {object} bounce Causally matched command and interruption observations.
+ * @param {object} evidence Original epoch and exchange journals.
+ * @returns {string} Identity, every delivery interval and the nearest usable or overlapping epochs.
+ */
+const countProgressionProblem = (entry, entries, bounce, evidence) => {
+  const deliveries = entries
+    .filter(({ identity }) => identity === entry.identity)
+    .map((delivery) => {
+      const acquisition = delivery.acquisition ?? {}
+      const source = acquisition.source ?? {}
+      const frame = source.frames?.[0] ?? {}
+      const samples = ownEpochSamples(delivery, evidence.epochs).sort(
+        (a, b) => a.frame.at - b.frame.at
+      )
+      const fact = (observation) =>
+        observation
+          ? {
+              frame: observation.frame.id,
+              apiVersion: observation.frame.apiVersion,
+              nodeId: observation.sample.nodeId,
+              pool: observation.sample.pool,
+              socket: observation.frame.socket,
+              correlationId: observation.frame.correlationId,
+              requestAt: observation.frame.at,
+              responseAt: observation.frame.responseAt,
+              leaderId: observation.row.leader,
+              leaderEpoch: observation.row.leaderEpoch,
+            }
+          : null
+      const overlapping = samples.filter(
+        ({ frame: sample }) => sample.at <= frame.responseAt && sample.responseAt >= frame.at
+      )
+      return {
+        entry: delivery.id,
+        handlerAt: delivery.at,
+        deliveryCount: delivery.deliveryCount,
+        acquisition: acquisition.id,
+        acquiredRecords: acquisition.acquiredRecords,
+        exchange: source.id,
+        frame: frame.id,
+        apiVersion: frame.apiVersion,
+        correlationId: frame.correlationId,
+        nodeId: source.nodeId,
+        endpoint: source.endpoint,
+        socket: frame.socket,
+        pool: acquisition.pool,
+        generation: acquisition.generation,
+        open: acquisition.open,
+        groupId: delivery.groupId,
+        memberId: delivery.memberId,
+        sessionEpoch: frame.request?.shareSessionEpoch,
+        requestAt: frame.at,
+        responseAt: frame.responseAt,
+        adoptedAt: acquisition.adoptedAt,
+        epochs: {
+          latestBeforeRequest: fact(
+            samples.findLast(({ frame: sample }) => sample.responseAt < frame.at)
+          ),
+          earliestAfterResponse: fact(
+            samples.find(({ frame: sample }) => sample.at > frame.responseAt)
+          ),
+          overlapping: [...new Set([overlapping[0], overlapping.at(-1)])].filter(Boolean).map(fact),
+          transitionsBeforeDown: sourceEpochSamples(delivery, evidence.epochs)
+            .filter(
+              ({ frame: sample, row }) =>
+                row.leader !== source.nodeId &&
+                frame.responseAt < sample.at &&
+                bounce.at < sample.at &&
+                sample.responseAt < bounce.downAt
+            )
+            .slice(0, 2)
+            .map(fact),
+        },
+      }
+    })
+  return `${entry.identity} has no proved delivery-count progression: ${JSON.stringify({
+    topicId: entry.topicId,
+    partition: entry.partition,
+    bounce: {
+      index: bounce.index,
+      nodeId: bounce.nodeId,
+      kind: bounce.kind,
+      at: bounce.at,
+      downAt: bounce.downAt,
+      interruptions: bounce.interruptions.map(({ at, kind, event, scope }) => ({
+        at,
+        kind,
+        event,
+        scope,
+      })),
+    },
+    deliveries,
+  })}`
 }
 
 /**
@@ -1607,7 +1756,7 @@ const auditReplay = (entries, bounces, corpus, evidence) => {
         entry.deliveryCount < old.deliveryCount ||
         (entry.deliveryCount === old.deliveryCount && !witness)
       )
-        problems.push(`${entry.identity} has no proved delivery-count progression`)
+        problems.push(countProgressionProblem(entry, entries, bounce, evidence))
       else if (!dispatched.has(`charged:${entry.id}`)) {
         dispatched.add(`charged:${entry.id}`)
         extras.push({
@@ -4175,6 +4324,161 @@ describe('share bounce acquisition and settlement sensitivity', () => {
     }
   })
 
+  it('starts an acquisition epoch sample without waiting for an overlapping periodic sample', async () => {
+    let complete
+    const broker = {
+      connectionPool: { isConnected: () => true },
+      metadata: jest
+        .fn()
+        .mockImplementationOnce(() => new Promise((resolve) => (complete = resolve)))
+        .mockResolvedValue({}),
+    }
+    const evidence = new BounceEvidence({ topic: 'sampling-control' })
+    evidence.epochSignal = NEVER
+    try {
+      evidence.sampleEpoch(broker)
+      evidence.sampleEpoch(broker, { fresh: true })
+      expect(broker.metadata).toHaveBeenCalledTimes(2)
+    } finally {
+      evidence.owner.driveFinished = true
+      complete?.({})
+      await Promise.all([...evidence.epochProbes])
+    }
+  })
+
+  it('retains original metadata epochs when the routing cache later mutates its response', async () => {
+    const fixture = replayFixture()
+    const response = fixture.evidence.epochs[0].response
+    const original = Broker.prototype.metadata
+    Broker.prototype.metadata = jest.fn().mockResolvedValue(response)
+    const evidence = new BounceEvidence({ topic: fixture.old.topic, tap: new ShareWireTap() })
+    try {
+      evidence.install()
+      const broker = { nodeId: 1, connectionPool: {}, brokerAddress: 'node-1' }
+      const result = await Broker.prototype.metadata.call(broker)
+      expect(result).toBe(response)
+      result.topicMetadata[0].partitionMetadata[0].leaderEpoch = 99
+      expect(evidence.epochs[0].response.topicMetadata[0].partitionMetadata[0].leaderEpoch).toBe(1)
+    } finally {
+      evidence.restore()
+      Broker.prototype.metadata = original
+    }
+  })
+
+  it('starts sampling a connected member broker before its first share exchange', async () => {
+    const original = Broker.prototype.connect
+    Broker.prototype.connect = jest.fn().mockResolvedValue('connected')
+    const evidence = new BounceEvidence({
+      nonce: 'sampling-control',
+      topic: 'sampling-control',
+      tap: new ShareWireTap(),
+    })
+    const broker = {
+      connectionPool: { clientId: 'member-sampling-control', isConnected: () => true },
+      metadata: jest.fn().mockResolvedValue({}),
+    }
+    evidence.epochSignal = NEVER
+    try {
+      evidence.install()
+      await expect(Broker.prototype.connect.call(broker)).resolves.toBe('connected')
+      expect(broker.metadata).toHaveBeenCalledTimes(1)
+      expect(evidence.brokers.has(broker)).toBe(true)
+    } finally {
+      evidence.owner.driveFinished = true
+      await Promise.all([...evidence.epochProbes])
+      evidence.restore()
+      Broker.prototype.connect = original
+    }
+  })
+
+  it('retains both delivery intervals and overlapping epoch facts in a count failure', () => {
+    const fixture = replayFixture()
+    fixture.evidence.epochs[1].frames[0].responseAt = 21
+    const problem = audit(fixture).problems.find((value) =>
+      value.startsWith(`${fixture.old.identity} has no proved delivery-count progression: `)
+    )
+    const facts = JSON.parse(problem.slice(problem.indexOf(': ') + 2))
+    expect(facts.deliveries.map(({ entry, deliveryCount }) => [entry, deliveryCount])).toEqual([
+      [0, 1],
+      [1, 1],
+    ])
+    expect(facts.deliveries[1]).toMatchObject({
+      nodeId: 2,
+      sessionEpoch: 1,
+      requestAt: 20,
+      responseAt: 21,
+      epochs: { overlapping: [{ frame: 11, leaderEpoch: 2 }] },
+    })
+    expect(facts.bounce).toMatchObject({ index: 0, at: 7, downAt: 9 })
+  })
+
+  /** @returns {object} Late original acquisition and a source-local away-and-back transition. */
+  const metadataTransitionFixture = () => {
+    const fixture = replayFixture({ sameLeader: true })
+    fixture.bounces[0].at = 3
+    fixture.old.acquisition.source.frames[0].at = 3.1
+    fixture.old.acquisition.source.frames[0].responseAt = 3.2
+    fixture.old.acquisition.adoptedAt = 3.3
+    fixture.evidence.epochs[1].response.topicMetadata[0].partitionMetadata[0].leaderEpoch = 3
+    const transition = JSON.parse(JSON.stringify(fixture.evidence.epochs[0]))
+    Object.assign(transition.frames[0], {
+      id: 50,
+      endpoint: fixture.old.acquisition.source.endpoint,
+      at: 6.2,
+      responseAt: 6.4,
+    })
+    Object.assign(transition.response.topicMetadata[0].partitionMetadata[0], {
+      leader: 2,
+      leaderEpoch: 2,
+    })
+    fixture.evidence.epochs.push(transition)
+    captureFreezes(fixture)
+    return { ...fixture, transition }
+  }
+
+  it('corroborates a late old epoch with its source node metadata transition before down', () => {
+    const fixture = metadataTransitionFixture()
+    expect(audit(fixture).problems).toEqual([])
+    expect(audit(fixture).extras[0].epochWitness).toMatchObject({
+      upper: 1,
+      lower: 3,
+      metadataTransition: 50,
+    })
+  })
+
+  it.each([
+    ['no old upper bound', (f) => f.evidence.epochs.shift()],
+    ['overlapping new lower bound', (f) => (f.evidence.epochs[1].frames[0].responseAt = 21)],
+    ['another source node', (f) => (f.transition.nodeId = 3)],
+    ['another pool', (f) => (f.transition.pool = 99)],
+    ['another endpoint', (f) => (f.transition.frames[0].endpoint = 'node-3')],
+    [
+      'another partition',
+      (f) => (f.transition.response.topicMetadata[0].partitionMetadata[0].partitionId = 1),
+    ],
+    ['unanswered sample', (f) => delete f.transition.frames[0].responseBytes],
+    ['after down', (f) => (f.transition.frames[0].responseAt = 10)],
+    ['before the upper bound', (f) => (f.transition.frames[0].at = 5.5)],
+    [
+      'unchanged leader',
+      (f) => (f.transition.response.topicMetadata[0].partitionMetadata[0].leader = 1),
+    ],
+    [
+      'unchanged epoch',
+      (f) => (f.transition.response.topicMetadata[0].partitionMetadata[0].leaderEpoch = 1),
+    ],
+    [
+      'different leaders at one epoch',
+      (f) => (f.evidence.epochs[1].response.topicMetadata[0].partitionMetadata[0].leaderEpoch = 2),
+    ],
+  ])('rejects a metadata transition with %s', (_name, mutate) => {
+    const fixture = metadataTransitionFixture()
+    mutate(fixture)
+    expect(audit(fixture).problems).toContainEqual(
+      expect.stringContaining(`${fixture.old.identity} has no proved delivery-count progression`)
+    )
+  })
+
   /** @returns {object} Distinct acquisitions bracketed by source epochs and a completed kill. */
   const downBarrierFixture = () => {
     const fixture = replayFixture()
@@ -4393,8 +4697,8 @@ describe('share bounce acquisition and settlement sensitivity', () => {
     const fixture = replayFixture()
     fixture.old.deliveryCount = 2
     fixture.old.acquisition.acquiredRecords[0].deliveryCount = 2
-    expect(audit(fixture).problems).toContain(
-      `${fixture.old.identity} has no proved delivery-count progression`
+    expect(audit(fixture).problems).toContainEqual(
+      expect.stringContaining(`${fixture.old.identity} has no proved delivery-count progression`)
     )
   })
 
@@ -5121,8 +5425,8 @@ describe('share bounce acquisition and settlement sensitivity', () => {
     expect(audit(fixture).problems).toEqual([])
     fixture.next.deliveryCount = 1
     fixture.next.acquisition.acquiredRecords[0].deliveryCount = 1
-    expect(audit(fixture).problems).toContain(
-      `${fixture.old.identity} has no proved delivery-count progression`
+    expect(audit(fixture).problems).toContainEqual(
+      expect.stringContaining(`${fixture.old.identity} has no proved delivery-count progression`)
     )
     const source = fixture.old.acquisition.source
     const transition = {
@@ -5152,8 +5456,8 @@ describe('share bounce acquisition and settlement sensitivity', () => {
     expect(audit(fixture).problems).toEqual([])
     expect(audit(fixture).extras[0].epochWitness.transition).toBe(50)
     transition.response.responses[0].partitions[0].currentLeader.leaderEpoch = 1
-    expect(audit(fixture).problems).toContain(
-      `${fixture.old.identity} has no proved delivery-count progression`
+    expect(audit(fixture).problems).toContainEqual(
+      expect.stringContaining(`${fixture.old.identity} has no proved delivery-count progression`)
     )
   })
 
