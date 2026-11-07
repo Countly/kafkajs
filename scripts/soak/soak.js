@@ -3183,13 +3183,11 @@ class ShareCycleOracle {
 
   /**
    * @param {object} exchange Original exchange with socket-scoped wire identity.
-   * @param {object} acquisition Original partition acquisition.
-   * @returns {object|null} Sole successful matching partition response, or no receipt.
+   * @returns {object|null} Wire-validated successful response, including empty session deltas.
    */
-  static partitionResponse(exchange, acquisition) {
+  static response(exchange) {
     const frame = exchange?.frames?.[0]
     if (
-      !acquisition ||
       exchange?.error ||
       exchange?.frames?.length !== 1 ||
       ![78, 79].includes(exchange.apiKey) ||
@@ -3224,34 +3222,55 @@ class ShareCycleOracle {
         JSON.stringify(written) !== JSON.stringify(frame.request)
       )
         return null
-      wire = ShareCycleOracle.wireResponse(frame, acquisition)
+      wire = ShareCycleOracle.wireResponse(frame)
+      const fields = (responses) =>
+        responses.map(({ topicId, partitions }) => ({
+          topicId,
+          partitions: partitions.map(
+            ({ partitionIndex, errorCode, acknowledgeErrorCode, acquiredRecords }) => ({
+              partitionIndex,
+              errorCode,
+              acknowledgeErrorCode,
+              acquiredRecords,
+            })
+          ),
+        }))
+      if (
+        wire?.errorCode !== 0 ||
+        JSON.stringify(fields(wire.responses)) !==
+          JSON.stringify(fields(exchange.response.responses))
+      )
+        return null
     } catch {
       return null
     }
-    if (!wire) return null
+    return wire
+  }
+
+  /**
+   * @param {object} exchange Original exchange with socket-scoped wire identity.
+   * @param {object} acquisition Original partition acquisition.
+   * @returns {object|null} Sole successful matching partition response, or no receipt.
+   */
+  static partitionResponse(exchange, acquisition) {
+    if (!acquisition) return null
+    const response = ShareCycleOracle.response(exchange)
     const parts =
-      exchange.response.responses
-        ?.filter((topic) => topic.topicId === acquisition.topicId)
+      response?.responses
+        .filter((topic) => topic.topicId === acquisition.topicId)
         .flatMap((topic) =>
           topic.partitions.filter((part) => part.partitionIndex === acquisition.partition)
         ) ?? []
-    return parts.length === 1 &&
-      parts[0].errorCode === 0 &&
-      parts[0].errorCode === wire.errorCode &&
-      parts[0].acknowledgeErrorCode === wire.acknowledgeErrorCode &&
-      JSON.stringify(parts[0].acquiredRecords) === JSON.stringify(wire.acquiredRecords)
-      ? parts[0]
-      : null
+    return parts.length === 1 && parts[0].errorCode === 0 ? parts[0] : null
   }
 
   /**
    * Reads partition errors/acquisition ranges directly from the matching socket response bytes.
    * @param {object} frame Original request and answer frames.
-   * @param {object} acquisition Owned UUID and partition.
-   * @returns {object|null} The sole successful raw partition result.
+   * @returns {object|null} Raw top-level and partition results, including omitted partitions.
    * @throws {Error} On malformed frame bounds or fields; the receipt predicate rejects it.
    */
-  static wireResponse(frame, acquisition) {
+  static wireResponse(frame) {
     const Decoder = require('../../src/protocol/decoder')
     const bytes = Buffer.from(frame.responseBytes, 'base64')
     const decoder = new Decoder(bytes)
@@ -3292,12 +3311,7 @@ class ShareCycleOracle {
       decoder.readTaggedFields()
       return { topicId, partitions }
     })
-    const parts = (topics ?? [])
-      .filter(({ topicId }) => topicId === acquisition.topicId)
-      .flatMap(({ partitions }) =>
-        partitions.filter(({ partitionIndex }) => partitionIndex === acquisition.partition)
-      )
-    return errorCode === 0 && parts.length === 1 && parts[0].errorCode === 0 ? parts[0] : null
+    return { errorCode, responses: topics }
   }
 
   /**
@@ -3349,84 +3363,133 @@ class ShareCycleOracle {
     const joined = verifier.events?.filter(({ kind }) => kind === 'GROUP_JOIN') ?? []
     const covered = new Set()
     const sessions = new Map()
+    const activity = []
     for (const exchange of verifier.provenance?.exchanges ?? []) {
       const frame = exchange.frames?.[0]
       if (!frame || exchange.apiKey !== 78 || exchange.memberId !== verifier.memberId) continue
       const key = `${frame.socket}:${exchange.open}:${exchange.pool}:${exchange.generation}`
-      if (frame.request.shareSessionEpoch === 0) sessions.set(key, new Set())
-      const partitions = sessions.get(key)
-      if (!partitions || exchange.groupId !== verifier.groupId) continue
+      const epoch = frame.request.shareSessionEpoch
+      const previous = sessions.get(key)
+      const response = ShareCycleOracle.response(exchange)
+      const detail = {
+        exchange: exchange.id,
+        socket: frame.socket,
+        open: exchange.open,
+        pool: exchange.pool,
+        generation: exchange.generation,
+        epoch,
+        at: frame.at,
+        answeredAt: frame.answeredAt,
+        partitions: [],
+      }
+      activity.push(detail)
+      const valid =
+        ordered &&
+        response &&
+        frame.request.isRenewAck === false &&
+        frame.request.maxRecords > 0 &&
+        frame.request.maxBytes > 0 &&
+        exchange.groupId === verifier.groupId &&
+        Number.isFinite(frame.at) &&
+        Number.isFinite(frame.answeredAt) &&
+        frame.at >= verifier.openedAt &&
+        frame.answeredAt >= frame.at &&
+        frame.answeredAt <= verifier.closedAt &&
+        Number.isInteger(frame.socket) &&
+        Number.isInteger(exchange.open) &&
+        Number.isInteger(exchange.pool) &&
+        Number.isInteger(exchange.generation) &&
+        (epoch === 0 ||
+          (previous &&
+            epoch === (previous.epoch === 2147483647 ? 1 : previous.epoch + 1) &&
+            frame.at >= previous.answeredAt))
+      if (!valid) {
+        sessions.delete(key)
+        detail.reason = 'invalid wire ownership, response, session epoch or timestamps'
+        continue
+      }
+      const partitions = epoch === 0 ? new Set() : previous.partitions
+      const parts = (partition) =>
+        response.responses
+          .filter(({ topicId }) => topicId === verifier.topicId)
+          .flatMap(({ partitions }) =>
+            partitions.filter(({ partitionIndex }) => partitionIndex === partition)
+          )
       for (const topic of frame.request.topics ?? []) {
         if (topic.topicId !== verifier.topicId) continue
-        for (const { partitionIndex } of topic.partitions)
-          if (
-            ShareCycleOracle.partitionResponse(exchange, {
-              topicId: verifier.topicId,
-              partition: partitionIndex,
-            })
-          )
-            partitions.add(partitionIndex)
+        for (const { partitionIndex } of topic.partitions) {
+          const rows = parts(partitionIndex)
+          if (rows.length === 1 && rows[0].errorCode === 0) partitions.add(partitionIndex)
+        }
       }
       for (const topic of frame.request.forgottenTopicsData ?? [])
         if (topic.topicId === verifier.topicId)
           for (const partition of topic.partitions) partitions.delete(partition)
-      if (
-        !ordered ||
-        !Number.isFinite(frame.at) ||
-        !Number.isFinite(frame.answeredAt) ||
-        frame.at < start.at ||
-        frame.answeredAt < frame.at ||
-        frame.answeredAt > end.at ||
-        !Number.isInteger(frame.socket) ||
-        !Number.isInteger(exchange.open) ||
-        !Number.isInteger(exchange.pool) ||
-        !Number.isInteger(exchange.generation) ||
-        !verifier.events.some(
-          ({ kind, payload, at }) =>
-            kind === 'REQUEST' &&
-            payload.apiName === 'ShareFetch' &&
-            payload.correlationId === frame.correlationId &&
-            payload.broker === frame.endpoint &&
-            payload.sentAt >= start.wallAt &&
-            payload.sentAt <= end.wallAt &&
-            at >= frame.answeredAt &&
-            at <= end.at
-        )
+      sessions.set(key, { partitions, epoch, answeredAt: frame.answeredAt })
+      detail.partitions = [...partitions]
+      const request = verifier.events.find(
+        ({ kind, payload, at }) =>
+          kind === 'REQUEST' &&
+          payload.apiName === 'ShareFetch' &&
+          payload.correlationId === frame.correlationId &&
+          payload.broker === frame.endpoint &&
+          payload.sentAt >= start.wallAt &&
+          payload.sentAt <= end.wallAt &&
+          at >= frame.answeredAt &&
+          at <= end.at
       )
+      if (frame.at < start.at || frame.answeredAt > end.at || !request) {
+        detail.reason = 'request write, response or public completion outside observation window'
         continue
+      }
+      detail.requestAt = request.at
+      // An empty incremental response still fetches the previously established session model.
       for (const partition of partitions) {
-        const response = ShareCycleOracle.partitionResponse(exchange, {
-          topicId: verifier.topicId,
-          partition,
-        })
-        if (response && response.acquiredRecords?.length === 0) covered.add(partition)
+        const rows = parts(partition)
+        if (
+          rows.length === 0 ||
+          (rows.length === 1 && rows[0].errorCode === 0 && rows[0].acquiredRecords?.length === 0)
+        )
+          covered.add(partition)
       }
     }
-    const active =
-      ordered &&
-      end.at - start.at >= windowMs &&
-      owns(start.payload) &&
-      owns(end.payload) &&
-      [...covered].sort().join() === '0,1,2' &&
-      joined.length === 1 &&
-      joined[0].payload.memberId === verifier.memberId &&
-      joined[0].payload.groupId === verifier.groupId &&
-      joined[0].at <= start.at &&
-      verifier.events.some(
-        ({ kind, at }) => kind === 'DISCONNECT' && at >= end.at && at <= verifier.closedAt
-      ) &&
-      !verifier.events
-        .slice(verifier.events.indexOf(start), verifier.events.indexOf(end))
-        .some(({ kind, payload }) => kind === 'ASSIGNMENT_CHANGED' && !owns(payload.assignment))
-    if (
-      !active ||
-      verifier.windowMs !== windowMs ||
-      !verifier.memberId ||
-      !verifier.topicId ||
-      verifier.active !== true ||
-      verifier.delivered?.length !== 0
-    )
-      fail('the same-group verifier activity or measured observation window is incomplete')
+    const checks = {
+      'ordered timestamps': ordered,
+      'measured duration': ordered && end.at - start.at >= windowMs,
+      'full endpoint assignment': owns(start?.payload) && owns(end?.payload),
+      'all-partition in-window wire activity': [...covered].sort().join() === '0,1,2',
+      'same-group member join':
+        joined.length === 1 &&
+        joined[0].payload.memberId === verifier.memberId &&
+        joined[0].payload.groupId === verifier.groupId &&
+        joined[0].at <= start?.at,
+      'joined leave': verifier.events?.some(
+        ({ kind, at }) => kind === 'DISCONNECT' && at >= end?.at && at <= verifier.closedAt
+      ),
+      'continuous assignment':
+        start &&
+        end &&
+        !verifier.events
+          .slice(verifier.events.indexOf(start), verifier.events.indexOf(end))
+          .some(({ kind, payload }) => kind === 'ASSIGNMENT_CHANGED' && !owns(payload.assignment)),
+      'declared duration': verifier.windowMs === windowMs,
+      'member and topic identity': Boolean(verifier.memberId && verifier.topicId),
+      'active empty verifier': verifier.active === true && verifier.delivered?.length === 0,
+    }
+    const failed = Object.keys(checks).filter((name) => !checks[name])
+    if (failed.length)
+      fail(
+        'the same-group verifier activity or measured observation window is incomplete: ' +
+          `${failed.join(', ')}; ${JSON.stringify({
+            openedAt: verifier.openedAt,
+            window: [start?.at, end?.at],
+            wallWindow: [start?.wallAt, end?.wallAt],
+            closedAt: verifier.closedAt,
+            coveredPartitions: [...covered].sort(),
+            missingPartitions: [0, 1, 2].filter((partition) => !covered.has(partition)),
+            activity,
+          })}`
+      )
   }
 
   /**

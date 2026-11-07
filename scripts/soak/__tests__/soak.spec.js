@@ -2424,7 +2424,7 @@ const sealExchange = (exchange) => {
   const body = new Encoder()
     .writeUVarIntString(request.groupId)
     .writeUVarIntString(request.memberId)
-    .writeInt32(0)
+    .writeInt32(request.shareSessionEpoch ?? 0)
     .writeInt32(250)
     .writeInt32(1)
     .writeInt32(1048576)
@@ -2457,7 +2457,14 @@ const sealExchange = (exchange) => {
           .writeTaggedFields([])
       )
     )
-    .writeUVarIntArray([])
+    .writeUVarIntArray(
+      (request.forgottenTopicsData ?? []).map(({ topicId, partitions }) =>
+        new Encoder()
+          .writeUuid(topicId)
+          .writeUVarIntArray(partitions.map((partition) => new Encoder().writeInt32(partition)))
+          .writeTaggedFields([])
+      )
+    )
     .writeTaggedFields([])
   const header = new Encoder()
     .writeInt16(78)
@@ -2469,7 +2476,7 @@ const sealExchange = (exchange) => {
   frame.bytes = new Encoder().writeInt32(bytes.length).writeBuffer(bytes).buffer.toString('base64')
   frame.request = require('../../../testHelpers/wire/shareFetchV2').readRequest(body.buffer)
   const response = require('../../../testHelpers/wire/shareFetchV2').buildResponse({
-    errorCode: 0,
+    errorCode: exchange.response.errorCode,
     responses: exchange.response.responses.map((topic) => ({
       ...topic,
       partitions: topic.partitions.map((partition) => ({
@@ -2568,6 +2575,153 @@ const verifierFacts = (cycle = 0, base = cycle * 32000 + 1000, kind = 'cycle') =
       { kind: 'DISCONNECT', at: base + 5100, payload: {} },
     ],
   }
+}
+
+/** Three established sessions followed by empty incremental responses across a measured window. */
+const incrementalVerifierFacts = () => {
+  const verifier = verifierFacts()
+  verifier.openedAt = 33522
+  verifier.closedAt = 43871
+  const traces = [
+    {
+      partition: 0,
+      socket: 31,
+      open: 215,
+      pool: 216,
+      times: [
+        [38561, 38813],
+        [38813, 39064],
+        [39064, 39315],
+        [39316, 39568],
+        [39568, 39820],
+        [39820, 40071],
+        [40072, 40323],
+        [40324, 40575],
+        [40576, 40828],
+        [40828, 41081],
+        [41082, 41333],
+        [41334, 41585],
+        [41586, 41837],
+        [41838, 42090],
+        [42091, 42342],
+        [42343, 42594],
+        [42595, 42846],
+        [42847, 43099],
+        [43100, 43352],
+        [43353, 43604],
+        [43605, 43856],
+      ],
+    },
+    {
+      partition: 1,
+      socket: 29,
+      open: 209,
+      pool: 210,
+      times: [
+        [38556, 38809],
+        [38810, 39061],
+        [39062, 39313],
+        [39314, 39566],
+        [39567, 39819],
+        [39819, 40072],
+        [40073, 40324],
+        [40325, 40576],
+        [40577, 40829],
+        [40829, 41082],
+        [41083, 41334],
+        [41334, 41586],
+        [41587, 41838],
+        [41839, 42091],
+        [42091, 42343],
+        [42343, 42595],
+        [42596, 42848],
+        [42848, 43100],
+        [43101, 43353],
+        [43354, 43605],
+        [43606, 43857],
+      ],
+    },
+    {
+      partition: 2,
+      socket: 30,
+      open: 212,
+      pool: 213,
+      times: [
+        [38557, 38810],
+        [38811, 39062],
+        [39063, 39314],
+        [39315, 39567],
+        [39568, 39820],
+        [39821, 40073],
+        [40074, 40325],
+        [40326, 40577],
+        [40578, 40829],
+        [40830, 41083],
+        [41084, 41335],
+        [41336, 41587],
+        [41588, 41839],
+        [41840, 42091],
+        [42092, 42344],
+        [42344, 42596],
+        [42596, 42848],
+        [42849, 43101],
+        [43102, 43354],
+        [43355, 43606],
+        [43607, 43857],
+      ],
+    },
+  ]
+  verifier.provenance.exchanges = traces
+    .flatMap(({ partition, socket, open, pool, times }) =>
+      times.map(([at, answeredAt], epoch) => {
+        const exchange = exchangeFacts(10000 + partition * 100 + epoch, partition, [])
+        Object.assign(exchange, {
+          memberId: verifier.memberId,
+          open,
+          pool,
+          endpoint: `node${partition}:9092`,
+        })
+        const frame = exchange.frames[0]
+        Object.assign(frame, {
+          at,
+          answeredAt,
+          socket,
+          endpoint: exchange.endpoint,
+          correlationId: epoch,
+        })
+        Object.assign(frame.request, { memberId: verifier.memberId, shareSessionEpoch: epoch })
+        if (epoch > 0) {
+          frame.request.topics = []
+          exchange.response.responses = []
+        }
+        return sealExchange(exchange)
+      })
+    )
+    .sort((a, b) => a.frames[0].at - b.frames[0].at)
+  const assignment = [{ topic: TOPIC_NAME, partitions: [0, 1, 2] }]
+  verifier.events = [
+    {
+      kind: 'GROUP_JOIN',
+      at: 33537,
+      payload: { groupId: verifier.groupId, memberId: verifier.memberId },
+    },
+    { kind: 'ASSIGNMENT_CHANGED', at: 38542, payload: { assignment } },
+    { kind: 'window-start', at: 38832, wallAt: 1794039558805, payload: assignment },
+    ...verifier.provenance.exchanges.map(({ frames: [frame] }) => ({
+      kind: 'REQUEST',
+      at: frame.answeredAt,
+      payload: {
+        apiName: 'ShareFetch',
+        correlationId: frame.correlationId,
+        broker: frame.endpoint,
+        sentAt: 1794039519973 + frame.at,
+      },
+    })),
+    { kind: 'window-end', at: 43833, wallAt: 1794039563806, payload: assignment },
+    { kind: 'ASSIGNMENT_CHANGED', at: 43858, payload: { assignment: [] } },
+    { kind: 'DISCONNECT', at: 43868, payload: {} },
+  ].sort((a, b) => a.at - b.at)
+  return verifier
 }
 
 const cycleFacts = (
@@ -3717,6 +3871,205 @@ describe('Share soak archived primitive controls', () => {
   })
 })
 
+describe('Share soak incremental verifier evidence', () => {
+  const violations = (verifier) => {
+    const failures = []
+    ShareCycleOracle.verifier(verifier, 5000, (message) => failures.push(message))
+    return failures
+  }
+  const partitionTwo = (verifier) =>
+    verifier.provenance.exchanges.filter(({ frames: [frame] }) => frame.socket === 30)
+
+  test.each(['cycle', 'final'])(
+    'accepts three established sessions with only empty in-window deltas, %s',
+    (kind) => {
+      const verifier = incrementalVerifierFacts()
+      verifier.kind = kind
+      expect(violations(verifier)).toEqual([])
+      const start = verifier.events.find(({ kind }) => kind === 'window-start')
+      const end = verifier.events.find(({ kind }) => kind === 'window-end')
+      expect(end.at - start.at).toBe(5001)
+      for (const socket of [29, 30, 31]) {
+        const exchanges = verifier.provenance.exchanges.filter((e) => e.frames[0].socket === socket)
+        expect(exchanges).toHaveLength(21)
+        expect(exchanges[0].frames[0].answeredAt).toBeLessThan(start.at)
+        expect(exchanges[1].frames[0].at).toBeLessThan(start.at)
+        expect(exchanges[1].frames[0].answeredAt).toBeGreaterThan(start.at)
+        const inside = exchanges.filter(
+          ({ frames: [frame] }) => frame.at >= start.at && frame.answeredAt <= end.at
+        )
+        expect(inside).toHaveLength(18)
+        for (const exchange of inside) {
+          expect(exchange.frames[0].request.topics).toEqual([])
+          expect(exchange.response.responses).toEqual([])
+          expect(
+            ShareCycleOracle.partitionResponse(exchange, { topicId: SOAK_UUID, partition: 2 })
+          ).toBeNull()
+        }
+      }
+    }
+  )
+
+  test.each([
+    [
+      'no in-window exchange',
+      (v) => {
+        v.provenance.exchanges = v.provenance.exchanges.filter(
+          (e) => e.frames[0].socket !== 30 || e.frames[0].request.shareSessionEpoch < 2
+        )
+      },
+    ],
+    [
+      'missing epoch-zero ownership',
+      (v) => {
+        v.provenance.exchanges = v.provenance.exchanges.filter(
+          (e) => e.frames[0].socket !== 30 || e.frames[0].request.shareSessionEpoch !== 0
+        )
+      },
+    ],
+    [
+      'unobserved session epoch',
+      (v) => {
+        v.provenance.exchanges = v.provenance.exchanges.filter(
+          (e) => e.frames[0].socket !== 30 || e.frames[0].request.shareSessionEpoch !== 1
+        )
+      },
+    ],
+    [
+      'another socket after establishment',
+      (v) => {
+        partitionTwo(v)
+          .slice(1)
+          .forEach((e) => {
+            e.frames[0].socket = 999
+          })
+      },
+    ],
+    [
+      'another open after establishment',
+      (v) => {
+        partitionTwo(v)
+          .slice(1)
+          .forEach((e) => {
+            e.open = 999
+          })
+      },
+    ],
+    [
+      'another pool generation after establishment',
+      (v) => {
+        partitionTwo(v)
+          .slice(1)
+          .forEach((e) => {
+            e.generation++
+          })
+      },
+    ],
+    [
+      'forgotten partition',
+      (v) => {
+        const exchange = partitionTwo(v)[1]
+        exchange.frames[0].request.forgottenTopicsData = [{ topicId: SOAK_UUID, partitions: [2] }]
+        sealExchange(exchange)
+      },
+    ],
+    [
+      'decoded empty response conceals wire error',
+      (v) => {
+        partitionTwo(v)
+          .slice(2)
+          .forEach((e) => {
+            e.response.errorCode = 123
+            sealExchange(e)
+            e.response.errorCode = 0
+          })
+      },
+    ],
+    [
+      'decoded empty response conceals wire partition',
+      (v) => {
+        partitionTwo(v)
+          .slice(2)
+          .forEach((e) => {
+            e.response.responses = [
+              {
+                topicId: SOAK_UUID,
+                partitions: [
+                  {
+                    partitionIndex: 2,
+                    errorCode: 0,
+                    acknowledgeErrorCode: 0,
+                    acquiredRecords: [{ firstOffset: '0', lastOffset: '0', deliveryCount: 2 }],
+                  },
+                ],
+              },
+            ]
+            sealExchange(e)
+            e.response.responses = []
+          })
+      },
+    ],
+    [
+      'answer outside the measured window',
+      (v) => {
+        partitionTwo(v)
+          .slice(2)
+          .forEach((e) => {
+            e.frames[0].answeredAt = 43834
+          })
+      },
+    ],
+    [
+      'public request sent before the window',
+      (v) => {
+        v.events
+          .filter(({ kind, payload }) => kind === 'REQUEST' && payload.broker === 'node2:9092')
+          .forEach(({ payload }) => {
+            payload.sentAt = 1794039558804
+          })
+      },
+    ],
+    [
+      'uncorrelated public completion',
+      (v) => {
+        v.events
+          .filter(({ kind, payload }) => kind === 'REQUEST' && payload.broker === 'node2:9092')
+          .forEach(({ payload }) => {
+            payload.correlationId += 100
+          })
+      },
+    ],
+  ])('rejects %s and identifies the uncovered partition and timestamps', (_name, damage) => {
+    const verifier = incrementalVerifierFacts()
+    damage(verifier)
+    const failures = violations(verifier)
+    expect(failures).toHaveLength(1)
+    expect(failures[0]).toContain('all-partition in-window wire activity')
+    expect(failures[0]).toContain('"missingPartitions":[2]')
+    expect(failures[0]).toContain('"window":[38832,43833]')
+    expect(failures[0]).toContain('"socket":30')
+    expect(failures[0]).toMatch(/"at":\d+,"answeredAt":\d+/)
+  })
+
+  test('names an invalid observation duration separately from successful partition coverage', () => {
+    const verifier = incrementalVerifierFacts()
+    verifier.events.find(({ kind }) => kind === 'window-end').at = 43831
+    const [failure] = violations(verifier)
+    expect(failure).toContain('measured duration')
+    expect(failure).toContain('"coveredPartitions":[0,1,2],"missingPartitions":[]')
+  })
+
+  test('does not treat an omitted partition as an Accept receipt', () => {
+    const facts = cycleFacts(0)
+    const receipt = facts.provenance.exchanges.find((e) => e.tickets.length)
+    receipt.response.responses = []
+    sealExchange(receipt)
+    expect(ShareCycleOracle.judge(ShareCycleOracle.plan(0), facts).join('; ')).toContain(
+      'a successful Accept lacks a unique original request and partition receipt'
+    )
+  })
+})
+
 describe('Share soak natural exit observations', () => {
   const observation = () => ({
     origin: 'parent-monotonic',
@@ -4782,6 +5135,16 @@ describe('Share soak complete original-owner schedules', () => {
         return part({ topicId: SOAK_UUID, partition, acquire, records: bytes })
       })
       const result = fetchAnswer(parts, { acquisitionLockTimeoutMs: 30000 })
+      if (
+        fields.shareSessionEpoch > 0 &&
+        (driver.lastCycle?.members.aLeft || owner.counts.cycles === SHARE_SOAK.cycles)
+      )
+        result.responses = result.responses.flatMap((topic) => {
+          const partitions = topic.partitions.filter(
+            (partition) => partition.errorCode !== 0 || partition.acquiredRecords.length > 0
+          )
+          return partitions.length ? [{ ...topic, partitions }] : []
+        })
       wire({ fields, call, result, owner, records, members })
       return result
     }
