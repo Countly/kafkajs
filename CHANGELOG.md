@@ -5,6 +5,20 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 ## Unreleased — 3.0.0
 
+### Phase 9F — Client telemetry
+
+#### Additions
+
+- Add bounded numeric Gauge and monotonic BigInt Sum collection and snapshot registration internally.
+
+#### Tooling
+
+- Verify normal physical connections and completed-request observations independently.
+
+#### Behavior changes
+
+Numeric collection and snapshot registration are internal at this milestone. Returned-client registration methods are not attached yet.
+
 ### Phase 9E — Share groups
 
 #### Behavior changes

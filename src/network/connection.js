@@ -123,6 +123,8 @@ module.exports = class Connection {
    *                                            max.in.flight.requests.per.connection default).
    *                                            Pass null for unbounded (the pre-3.0 behavior).
    * @param {import("../instrumentation/emitter")} [options.instrumentationEmitter=null]
+   * @param {object|null} [options.telemetrySink=null] private numeric collector; null on telemetry sockets
+   * @param {object|null} [options.telemetrySlot=null] pre-issued node slot, never an endpoint label
    * @param {(errorMessage: string) => void} [options.onAuthenticationFailure=null] Called with a
    *                                            sanitized description (mechanism, broker, stage)
    *                                            when the broker rejects SaslAuthenticate (code 58),
@@ -153,6 +155,8 @@ module.exports = class Connection {
     maxInFlightRequests = 5,
     instrumentationEmitter = null,
     onAuthenticationFailure = null,
+    telemetrySink = null,
+    telemetrySlot = null,
   }) {
     this.host = host
     this.port = port
@@ -192,6 +196,8 @@ module.exports = class Connection {
     this.reauthenticationThreshold = reauthenticationThreshold
     this.instrumentationEmitter = instrumentationEmitter
     this.onAuthenticationFailure = onAuthenticationFailure
+    this.telemetrySink = telemetrySink
+    this.telemetrySlot = telemetrySlot
 
     /**
      * Splits what the socket delivers into response frames; reset on every connect and every close.
@@ -308,6 +314,18 @@ module.exports = class Connection {
     })
   }
 
+  /**
+   * Installs a trusted numeric observer and pre-issued slot outside request completion.
+   * The factory adapter never installs one on a dedicated telemetry transport.
+   * @param {object|null} sink owned collector, null when disabled
+   * @param {object|null} slot current metadata binding
+   * @returns {void} requests already created retain their original observer and slot
+   */
+  setTelemetryObserver(sink, slot) {
+    this.telemetrySink = sink
+    this.telemetrySlot = slot
+  }
+
   setVersions(versions) {
     this.versions = versions
   }
@@ -366,6 +384,8 @@ module.exports = class Connection {
       this.authenticatedAt = null
 
       const attempt = ++this.connectAttempt
+      const telemetrySink = this.telemetrySink
+      const telemetryAttempt = telemetrySink ? {} : null
       this[PRIVATE.QUEUED] = Promise.resolve()
       const isCurrentAttempt = () => this.connectAttempt === attempt
 
@@ -382,6 +402,11 @@ module.exports = class Connection {
         this.connectionStatus = CONNECTION_STATUS.CONNECTED
         this.requestQueue.scheduleRequestTimeoutCheck()
         this.generation += 1
+        if (telemetrySink) {
+          try {
+            telemetrySink.observeConnection(telemetryAttempt)
+          } catch {}
+        }
         resolve(true)
       }
 
@@ -928,13 +953,16 @@ module.exports = class Connection {
   }) {
     const sensitiveResponse = SENSITIVE_API_KEYS.has(request.apiKey)
     const attempt = this.connectAttempt
+    const telemetrySink = this.telemetrySink
+    const telemetrySlot = telemetrySink ? this.telemetrySlot : null
     this.preparing += 1
     let answered
     let expectResponse
     try {
       expectResponse = !request.expectResponse || request.expectResponse()
       const prepared = this[PRIVATE.PREPARE]({ request, expectResponse, guard })
-      const enqueue = (encoded) => this[PRIVATE.ENQUEUE](encoded, requestTimeout, attempt, guard)
+      const enqueue = (encoded) =>
+        this[PRIVATE.ENQUEUE](encoded, requestTimeout, attempt, guard, telemetrySink, telemetrySlot)
 
       let queued
       if (isAuthenticatedRequest(request)) {
@@ -1053,6 +1081,8 @@ module.exports = class Connection {
    * @param {number} attempt the `connectAttempt` the request was sent under; a request of an older
    *   attempt is refused
    * @param {((frameLength?: number) => Error|null)|null} guard checked again by the queue at transmission
+   * @param {object|null} telemetrySink collector captured at send entry
+   * @param {object|null} telemetrySlot slot captured before authentication and encoding
    * @returns {{ answered: Promise<{ correlationId: number, size: number, entry: object,
    *   payload: Buffer }> }} `answered` settles with the response frame; wrapped so that waiting
    *   for the push does not wait for the response
@@ -1061,7 +1091,9 @@ module.exports = class Connection {
     { request, expectResponse, correlationId, requestPayload },
     requestTimeout,
     attempt,
-    guard
+    guard,
+    telemetrySink,
+    telemetrySlot
   ) {
     const { apiKey, apiName, apiVersion } = request
     const answered = new Promise((resolve, reject) => {
@@ -1082,6 +1114,8 @@ module.exports = class Connection {
           requestTimeout,
           guard,
           frameLength: requestPayload.buffer.length,
+          telemetrySink,
+          telemetrySlot,
           sendRequest: () => {
             this.socket.write(requestPayload.buffer, 'binary')
           },

@@ -51,6 +51,8 @@ module.exports = class SocketRequest {
    * @param {RequestEntry} options.entry
    * @param {boolean} options.expectResponse
    * @param {number} [options.frameLength] complete frame bytes, supplied to the transmission guard
+   * @param {object|null} [options.telemetrySink=null] private numeric collector
+   * @param {object|null} [options.telemetrySlot=null] captured slot reference
    * @param {Function} options.send
    * @param {() => void} options.timeout bookkeeping the queue does when this request times out
    * @param {(socketRequest: SocketRequest) => void} [options.afterTimeout] called once the request was rejected with its own
@@ -70,6 +72,8 @@ module.exports = class SocketRequest {
     afterTimeout = null,
     guard = null,
     frameLength,
+    telemetrySink = null,
+    telemetrySlot = null,
     instrumentationEmitter = null,
     logger = null,
   }) {
@@ -86,6 +90,8 @@ module.exports = class SocketRequest {
     this.guard = guard
     this.frameLength = frameLength
     this.logger = logger
+    this.telemetrySink = telemetrySink
+    this.telemetrySlot = telemetrySlot
 
     this.sentAt = null
     this.duration = null
@@ -179,6 +185,12 @@ module.exports = class SocketRequest {
     this[PRIVATE.STATE] = REQUEST_STATE.COMPLETED
     this.duration = Date.now() - this.sentAt
     entry.resolve({ correlationId, entry, size, payload })
+
+    if (this.expectResponse && this.telemetrySink) {
+      try {
+        this.telemetrySink.observeRequest(this.telemetrySlot, this.duration)
+      } catch {}
+    }
 
     this[PRIVATE.EMIT_EVENT](events.NETWORK_REQUEST, {
       broker,
