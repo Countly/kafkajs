@@ -1173,10 +1173,20 @@ module.exports = (params) => {
         maxPrefetchBatches,
       })
 
-      const started = runner.start()
+      const startedRunner = runner
+      const started = startedRunner.start()
       pendingStart = started.catch(() => {})
       await started
-      if (!owned.fence.closed && closing === null) telemetry?.resume()
+      if (
+        runner === startedRunner &&
+        consumerGroup === group &&
+        runSlot === token &&
+        startedRunner.running &&
+        !startedRunner.stopRequested &&
+        !owned.fence.closed &&
+        closing === null
+      )
+        telemetry?.resume()
     }
 
     /**

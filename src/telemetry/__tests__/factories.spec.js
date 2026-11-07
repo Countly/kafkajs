@@ -265,7 +265,10 @@ describe('returned telemetry surfaces', () => {
         ).toBe(0)
       } finally {
         await client.disconnect({ timeout: 0 })
-        owner.suspend()
+        wire.assertClean()
+        expect(wire.sockets().every((socket) => socket.destroyed)).toBe(true)
+        expect(owner.machine.timer).toBeNull()
+        expect(owner.machine.waiters.size).toBe(0)
         bind.mockRestore()
       }
     }
@@ -300,26 +303,70 @@ describe('returned telemetry surfaces', () => {
   })
 
   test.each(kinds)(
-    'enabled %s stores before connect, after close and while stopped without restarting',
+    'enabled public %s retains registration after close and reconnect and stores while stopped',
     async (kind) => {
-      const binding = new TelemetryFactory({
-        kind,
-        config: { enableMetricsPush: true, telemetryMaxBytes: 1048576 },
-      })
-      const open = jest.fn()
-      binding.bind({ createTelemetryTransport: () => ({ candidates: () => [], open }) })
-      const client = binding.methods()
-      client.registerMetricForSubscription({ name: 'com.example.total', type: 'sum', value: 1n })
-      await binding.close({ zero: true })
-      client.registerMetricForSubscription({ name: 'com.example.total', type: 'sum', value: 2n })
-      binding.machine.stop()
-      client.registerMetricForSubscription({ name: 'com.example.total', type: 'sum', value: 3n })
-      client.unregisterMetricFromSubscription({ name: 'com.example.absent' })
-      expect(binding.machine.stopped).toBe(true)
-      expect(open).not.toHaveBeenCalled()
-      expect(() =>
+      const wire = scripted(kind)
+      wire.answer('GetTelemetrySubscriptions', () => ({
+        clientInstanceId: ID,
+        subscriptionId: 1,
+        requestedMetrics: ['com.example.'],
+        pushIntervalMs: 100,
+        acceptedCompressionTypes: [0],
+        deltaTemporality: false,
+      }))
+      const bind = jest.spyOn(TelemetryFactory.prototype, 'bind')
+      const client = make(new Kafka(wire.kafkaOptions({ enableMetricsPush: true })), kind)
+      const owner = bind.mock.contexts.at(-1)
+      try {
+        client.registerMetricForSubscription({ name: 'com.example.total', type: 'sum', value: 1n })
+        await client.connect()
+        await client.clientInstanceId({ timeout: 1000 })
+        await until(
+          () =>
+            owner.machine.state === 'READY' &&
+            wire.requests().some((r) => r.api === 'PushTelemetry')
+        )
+        await client.disconnect({ timeout: 1000 })
+        const beforeReconnect = wire.requests().length
         client.registerMetricForSubscription({ name: 'com.example.total', type: 'sum', value: 2n })
-      ).toThrow(KafkaJSInvalidConfigurationError)
+        await client.connect()
+        await client.clientInstanceId({ timeout: 1000 })
+        await until(() =>
+          wire
+            .requests()
+            .slice(beforeReconnect)
+            .some((r) => r.api === 'PushTelemetry' && !r.fields.terminating)
+        )
+        const push = wire
+          .requests()
+          .slice(beforeReconnect)
+          .find((r) => r.api === 'PushTelemetry' && !r.fields.terminating)
+        const emitted = metrics(Buffer.from(push.fields.metrics, 'hex'))
+        expect(values(emitted[0], 1)[0].toString()).toBe('com.example.total')
+        const point = values(values(emitted[0], 7)[0], 1)[0]
+        expect(values(point, 6)[0].readBigInt64LE()).toBe(2n)
+        wire.answer('PushTelemetry', () => ({ errorCode: 42 }))
+        await until(() => owner.machine.stopped)
+        const before = wire.requests().length
+        client.registerMetricForSubscription({ name: 'com.example.total', type: 'sum', value: 3n })
+        client.unregisterMetricFromSubscription({ name: 'com.example.absent' })
+        expect(() =>
+          client.registerMetricForSubscription({
+            name: 'com.example.total',
+            type: 'sum',
+            value: 2n,
+          })
+        ).toThrow(KafkaJSInvalidConfigurationError)
+        await new Promise((resolve) => setTimeout(resolve, 120))
+        expect(wire.requests()).toHaveLength(before)
+      } finally {
+        await client.disconnect({ timeout: 0 })
+        wire.assertClean()
+        expect(wire.sockets().every((socket) => socket.destroyed)).toBe(true)
+        expect(owner.machine.timer).toBeNull()
+        expect(owner.machine.waiters.size).toBe(0)
+        bind.mockRestore()
+      }
     }
   )
 
@@ -363,7 +410,7 @@ describe('returned telemetry surfaces', () => {
         .methods()
         .registerMetricForSubscription({ name: 'com.example.x', type: 'gauge', value: 1 })
     ).not.toThrow()
-    await expect(binding.close({ zero: true })).resolves.toBeUndefined()
+    expect(binding.close({ zero: true })).toBeNull()
     expect(() => binding.suspend()).not.toThrow()
     expect(() => binding.resume()).not.toThrow()
   })
@@ -517,6 +564,118 @@ describe('returned telemetry surfaces', () => {
     expect(idle.pool[0].telemetrySink).toBeNull()
   })
 
+  test('resume rebinds current pools once and never revives retired brokers or pools', () => {
+    const collector = new TelemetryMetrics({ kind: 'consumer' })
+    const brokers = [1, 2, 3].map((nodeId) => ({
+      nodeId,
+      connectionPool: new ConnectionPool({
+        host: 'a',
+        port: nodeId,
+        clientId: 'c',
+        logger: newLogger(),
+      }),
+    }))
+    const owner = {
+      telemetryMetrics: collector,
+      telemetryNodeRevision: 0n,
+      seedBroker: brokers[0],
+      brokers: Object.fromEntries(brokers.map((broker) => [broker.nodeId, broker])),
+      retiredBrokers: new WeakSet([brokers[1]]),
+      bindTelemetryNode: BrokerPool.prototype.bindTelemetryNode,
+    }
+    for (const broker of brokers) owner.bindTelemetryNode(broker)
+    const old = brokers.map((broker) => broker.connectionPool.telemetrySlot)
+    brokers[2].connectionPool.retire()
+    collector.resetTransient()
+    BrokerPool.prototype.rebindTelemetryNodes.call(owner)
+    expect(brokers[0].connectionPool.telemetrySlot).not.toBe(old[0])
+    expect(brokers[1].connectionPool.telemetrySlot).toBe(old[1])
+    expect(brokers[2].connectionPool.telemetrySlot).toBe(old[2])
+    const subscription = { revision: 1n, requestedMetrics: ['*'], deltaTemporality: true }
+    collector.select(subscription)
+    for (const ref of old) collector.observeRequest(ref, 99)
+    collector.observeRequest(brokers[0].connectionPool.telemetrySlot, 7)
+    const points = collector.snapshot(subscription).points.filter((point) => point.type === 'gauge')
+    expect(points.map((point) => [point.attributes[0].value, point.value])).toEqual([
+      ['1', 7],
+      ['1', 7],
+    ])
+  })
+
+  test('a public ShareConsumer crash restart rebinds a surviving ready broker and fences its old reference', async () => {
+    const { shareClient, A } = require('../../../testHelpers/shareHarness')
+    const bind = jest.spyOn(TelemetryFactory.prototype, 'bind')
+    const api = jest.spyOn(ShareRunner.prototype, 'api')
+    const h = shareClient({
+      nodes: 2,
+      advertise: { GetTelemetrySubscriptions: [0, 0], PushTelemetry: [0, 0] },
+      kafka: { enableMetricsPush: true },
+      share: { retry: { initialRetryTime: 5, restartOnFailure: async () => true } },
+      topics: { 'topic-a': { topicId: A, partitions: [] } },
+      interval: 300000,
+    })
+    h.cluster.answer('GetTelemetrySubscriptions', () => ({
+      clientInstanceId: ID,
+      subscriptionId: 1,
+      requestedMetrics: ['org.apache.kafka.consumer.node.request.latency.'],
+      pushIntervalMs: 300000,
+      acceptedCompressionTypes: [0],
+    }))
+    const owner = bind.mock.contexts.at(-1)
+    const cluster = bind.mock.calls.at(-1)[0]
+    const runner = api.mock.contexts.at(-1)
+    try {
+      await h.consumer.subscribe({ topics: ['topic-a'] })
+      await h.consumer.run({ eachMessage: async () => {} })
+      await h.consumer.clientInstanceId({ timeout: 1000 })
+      const survivor = await cluster.findBroker({ nodeId: 1 })
+      await survivor.connect()
+      const pool = survivor.connectionPool
+      const connection = pool.pool[0]
+      const socket = connection.socket
+      const old = pool.telemetrySlot
+      const crashed = runner.current
+      await crashed.crash(
+        Object.assign(new Error('retry this run'), { retriable: true, retryTime: 5 })
+      )
+      await until(
+        () =>
+          runner.current !== crashed &&
+          runner.current?.membership.memberEpoch > 0 &&
+          owner.machine.subscription !== null
+      )
+      expect(survivor.isConnected()).toBe(true)
+      expect(connection.socket).toBe(socket)
+      expect(pool.telemetrySlot).not.toBe(old)
+      expect(connection.telemetrySlot).toBe(pool.telemetrySlot)
+      const subscription = owner.machine.subscription
+      const previous = owner.metrics.snapshot(subscription)
+      owner.metrics.written(
+        previous,
+        previous.points.map((point) => point.identity)
+      )
+      const observe = jest.spyOn(owner.metrics, 'observeRequest')
+      const staleObserve = TelemetryMetrics.prototype.observeRequest
+      staleObserve.call(owner.metrics, old, 9000)
+      await survivor.metadata()
+      const samples = observe.mock.calls.filter(([slot]) => slot === pool.telemetrySlot)
+      expect(samples).toHaveLength(1)
+      const snapshot = owner.metrics.snapshot(subscription)
+      const gauges = snapshot.points.filter((point) =>
+        point.attributes.some((a) => a.key === 'node_id' && a.value === '1')
+      )
+      expect(gauges.map((point) => point.value)).toEqual([samples[0][1], samples[0][1]])
+      observe.mockRestore()
+    } finally {
+      await h.close()
+      expect(h.cluster.sockets().every((socket) => socket.destroyed)).toBe(true)
+      expect(owner.machine.waiters.size).toBe(0)
+      expect(owner.machine.timer).toBeNull()
+      bind.mockRestore()
+      api.mockRestore()
+    }
+  })
+
   test('a disabled client installs no observer on its normal sockets', () => {
     const cluster = new Cluster({
       logger: newLogger(),
@@ -564,49 +723,114 @@ describe('same-Kafka siblings and reconnect', () => {
         fields.clientInstanceId ||
         `${(++allocations).toString(16).padStart(8, '0')}-0506-0708-090a-0b0c0d0e0f10`,
       subscriptionId: allocations,
-      requestedMetrics: [],
-      pushIntervalMs: 1000,
+      requestedMetrics: ['com.example.'],
+      pushIntervalMs: 100,
       acceptedCompressionTypes: [0],
     })
-    const wire = scripted('producer')
-    const shareWire = scripted('shareConsumer')
+    const wire = createScriptedCluster({
+      nodes: NODES,
+      profile: 'share',
+      advertise: {
+        GetTelemetrySubscriptions: [0, 0],
+        PushTelemetry: [0, 0],
+        InitProducerId: [5, 5],
+        Produce: [13, 13],
+      },
+    })
     wire.answer('GetTelemetrySubscriptions', answer)
-    shareWire.answer('GetTelemetrySubscriptions', answer)
     const bind = jest.spyOn(TelemetryFactory.prototype, 'bind')
     const kafka = new Kafka(wire.kafkaOptions({ enableMetricsPush: true }))
-    const shareKafka = new Kafka(shareWire.kafkaOptions({ enableMetricsPush: true }))
     const clients = [
+      ...kinds.map((kind) => make(kafka, kind)),
       make(kafka, 'producer'),
-      make(kafka, 'consumer'),
-      make(kafka, 'admin'),
       make(kafka, 'producer'),
-      make(shareKafka, 'shareConsumer'),
     ]
     const owners = [...bind.mock.contexts]
     try {
       const ids = []
-      for (const client of clients) {
+      for (const [index, client] of clients.entries()) {
+        client.registerMetricForSubscription({
+          name: 'com.example.sibling',
+          type: 'gauge',
+          value: index + 1,
+        })
         await client.connect()
         ids.push(await client.clientInstanceId({ timeout: 1000 }))
       }
-      expect(new Set(ids).size).toBe(5)
-      expect(allocations).toBe(5)
-      await clients[0].disconnect({ timeout: 0 })
+      expect(new Set(ids).size).toBe(6)
+      expect(allocations).toBe(6)
+      await until(() =>
+        ids.every((id) =>
+          wire
+            .requests()
+            .some(
+              (r) =>
+                r.api === 'PushTelemetry' &&
+                !r.fields.terminating &&
+                r.fields.clientInstanceId === id
+            )
+        )
+      )
+      for (const [index, id] of ids.entries()) {
+        const push = wire
+          .requests()
+          .find((r) => r.api === 'PushTelemetry' && r.fields.clientInstanceId === id)
+        const emitted = metrics(Buffer.from(push.fields.metrics, 'hex'))
+        const point = values(values(emitted[0], 5)[0], 1)[0]
+        expect(values(point, 4)[0].readDoubleLE()).toBe(index + 1)
+      }
+      await clients[0].disconnect({ timeout: 1000 })
+      clients[0].registerMetricForSubscription({
+        name: 'com.example.sibling',
+        type: 'gauge',
+        value: 73,
+      })
+      const reconnectAt = wire.requests().length
       await expect(clients[0].clientInstanceId({ timeout: 0 })).resolves.toBe(ids[0])
       await clients[0].connect()
       await expect(clients[0].clientInstanceId({ timeout: 0 })).resolves.toBe(ids[0])
       await until(
         () =>
-          wire.requests().filter((r) => r.api === 'GetTelemetrySubscriptions').length === 5 &&
+          wire.requests().filter((r) => r.api === 'GetTelemetrySubscriptions').length === 7 &&
           wire
             .requests()
             .filter((r) => r.api === 'GetTelemetrySubscriptions')
             .at(-1).fields.clientInstanceId === ids[0]
       )
-      expect(allocations).toBe(5)
+      expect(allocations).toBe(6)
+      await until(() =>
+        wire
+          .requests()
+          .slice(reconnectAt)
+          .some(
+            (r) =>
+              r.api === 'PushTelemetry' &&
+              !r.fields.terminating &&
+              r.fields.clientInstanceId === ids[0]
+          )
+      )
+      const normal = wire
+        .requests()
+        .slice(reconnectAt)
+        .find(
+          (r) =>
+            r.api === 'PushTelemetry' &&
+            !r.fields.terminating &&
+            r.fields.clientInstanceId === ids[0]
+        )
+      const emitted = metrics(Buffer.from(normal.fields.metrics, 'hex'))
+      expect(values(values(values(emitted[0], 5)[0], 1)[0], 4)[0].readDoubleLE()).toBe(73)
+      await until(() => owners[0].machine.reopen === null)
+      expect(owners[0].machine.reopen).toBeNull()
+      expect(new Set(owners.map((owner) => owner.machine.subscription)).size).toBe(6)
     } finally {
       for (const client of clients) await client.disconnect({ timeout: 0 })
-      for (const owner of owners) owner.suspend()
+      wire.assertClean()
+      expect(wire.sockets().every((socket) => socket.destroyed)).toBe(true)
+      for (const owner of owners) {
+        expect(owner.machine.timer).toBeNull()
+        expect(owner.machine.waiters.size).toBe(0)
+      }
       bind.mockRestore()
     }
   })
@@ -615,83 +839,282 @@ describe('same-Kafka siblings and reconnect', () => {
 describe('owner lifecycle joins', () => {
   afterEach(() => jest.restoreAllMocks())
 
-  test.each(kinds)(
-    'the first public %s disconnect joins one held telemetry close and never holds core cleanup back',
-    async (kind) => {
+  test.each(
+    kinds.flatMap((kind) =>
+      [undefined, 1000, 5000].flatMap((timeout) =>
+        [true, false].map((coreFirst) => [kind, timeout, coreFirst])
+      )
+    )
+  )(
+    'public %s close at %p joins a real final Push independently of core (core first %p)',
+    async (kind, timeout, coreFirst) => {
       const wire = scripted(kind)
       wire.answer('GetTelemetrySubscriptions', () => ({
         clientInstanceId: ID,
         subscriptionId: 1,
-        requestedMetrics: [],
+        requestedMetrics: ['com.example.'],
         pushIntervalMs: 300000,
         acceptedCompressionTypes: [0],
       }))
-      const gate = held()
-      const close = jest.spyOn(TelemetryFactory.prototype, 'close').mockReturnValue(gate.promise)
-      const disconnect = jest.spyOn(Cluster.prototype, 'disconnect')
+      const final = held()
+      const core = held()
+      let finalArrived = false
+      let coreArrived = false
+      wire.answer('PushTelemetry', async (fields) => {
+        if (fields.terminating) {
+          finalArrived = true
+          await final.promise
+        }
+        return {}
+      })
       const bind = jest.spyOn(TelemetryFactory.prototype, 'bind')
-      const client = make(new Kafka(wire.kafkaOptions({ enableMetricsPush: true })), kind)
+      const client = make(
+        new Kafka(wire.kafkaOptions({ enableMetricsPush: true, enforceRequestTimeout: false })),
+        kind
+      )
       const owner = bind.mock.contexts.at(-1)
+      const cluster = bind.mock.calls.at(-1)[0]
+      let closing
+      let coreDisconnect
       try {
+        client.registerMetricForSubscription({ name: 'com.example.close', type: 'gauge', value: 7 })
         await client.connect()
-        const first = client.disconnect({ timeout: 5000 })
-        expect(close).toHaveBeenCalledTimes(1)
-        const [budget] = close.mock.calls[0]
-        expect(budget.zero).toBe(false)
-        expect(Number.isFinite(budget.deadline)).toBe(true)
-        expect(budget.remaining()).toBeGreaterThan(0)
-        expect(budget.remaining()).toBeLessThanOrEqual(5000)
+        await client.clientInstanceId({ timeout: 1000 })
+        const before = wire.requests().filter((r) => r.api === 'GetTelemetrySubscriptions').length
+        const disconnect = cluster.disconnect.bind(cluster)
+        coreDisconnect = jest.spyOn(cluster, 'disconnect').mockImplementation(async (options) => {
+          coreArrived = true
+          await core.promise
+          return disconnect(options)
+        })
+        const events = []
+        client.on(client.events.DISCONNECT, () => events.push('disconnect'))
         let settled = false
-        first.then(() => {
+        closing = client.disconnect(timeout === undefined ? undefined : { timeout })
+        closing.then(() => {
           settled = true
         })
-        await until(() => disconnect.mock.calls.length > 0)
-        await new Promise((resolve) => setTimeout(resolve, 20))
-        expect(settled).toBe(false)
+        await until(() => finalArrived && coreArrived)
+        const episode = owner.machine.closing
+        expect(episode.deadline - owner.machine.clock.now()).toBeLessThanOrEqual(1000)
         const second = client.disconnect({ timeout: 0 })
-        expect(close).toHaveBeenCalledTimes(1)
-        gate.release()
-        await Promise.all([first, second])
+        expect(owner.machine.closing).toBe(episode)
+        if (coreFirst) {
+          core.release()
+          await until(() => wire.sockets().filter((socket) => !socket.destroyed).length === 1)
+        } else {
+          final.release()
+          await until(() => owner.machine.state === 'CLOSED')
+        }
+        expect(settled).toBe(false)
+        core.release()
+        final.release()
+        await Promise.all([closing, second])
+        expect(events).toEqual(['disconnect'])
+        expect(
+          wire.requests().filter((r) => r.api === 'PushTelemetry' && r.fields.terminating)
+        ).toHaveLength(1)
+        expect(wire.requests().filter((r) => r.api === 'GetTelemetrySubscriptions')).toHaveLength(
+          before
+        )
       } finally {
-        gate.release()
-        owner.suspend()
+        core.release()
+        final.release()
+        if (closing) await closing
+        coreDisconnect?.mockRestore()
+        await client.disconnect({ timeout: 0 })
+        wire.assertClean()
+        expect(wire.sockets().every((socket) => socket.destroyed)).toBe(true)
+        expect(owner.machine.timer).toBeNull()
+        expect(owner.machine.waiters.size).toBe(0)
+        bind.mockRestore()
       }
     }
   )
 
-  test.each(kinds)('a zero timeout reaches the %s telemetry close as zero', async (kind) => {
-    const wire = scripted(kind)
-    const close = jest.spyOn(TelemetryFactory.prototype, 'close').mockResolvedValue()
-    const bind = jest.spyOn(TelemetryFactory.prototype, 'bind')
-    const client = make(new Kafka(wire.kafkaOptions({ enableMetricsPush: true })), kind)
-    const owner = bind.mock.contexts.at(-1)
-    try {
-      await client.connect()
-      await client.disconnect({ timeout: 0 })
-      expect(close).toHaveBeenCalledTimes(1)
-      expect(close.mock.calls[0][0].zero).toBe(true)
-    } finally {
-      owner.suspend()
+  test.each(kinds.flatMap((kind) => [0, 20, 1000, 5000].map((timeout) => [kind, timeout])))(
+    'public %s close at %p sends no final after its captured budget expires during encoding',
+    async (kind, timeout) => {
+      const wire = scripted(kind)
+      wire.answer('GetTelemetrySubscriptions', () => ({
+        clientInstanceId: ID,
+        subscriptionId: 1,
+        requestedMetrics: ['com.example.'],
+        pushIntervalMs: 300000,
+        acceptedCompressionTypes: [0],
+      }))
+      const bind = jest.spyOn(TelemetryFactory.prototype, 'bind')
+      const client = make(new Kafka(wire.kafkaOptions({ enableMetricsPush: true })), kind)
+      const owner = bind.mock.contexts.at(-1)
+      const cluster = bind.mock.calls.at(-1)[0]
+      const encode = held()
+      let building = false
+      let clock = owner.machine.clock.now()
+      owner.machine.clock = { ...owner.machine.clock, now: () => clock }
+      let build
+      try {
+        client.registerMetricForSubscription({ name: 'com.example.close', type: 'gauge', value: 7 })
+        await client.connect()
+        await client.clientInstanceId({ timeout: 1000 })
+        const original = owner.machine.payload.buildPayload.bind(owner.machine.payload)
+        build = jest
+          .spyOn(owner.machine.payload, 'buildPayload')
+          .mockImplementation(async (...args) => {
+            building = true
+            await encode.promise
+            return original(...args)
+          })
+        const sockets = wire.sockets().length
+        const gets = wire.requests().filter((r) => r.api === 'GetTelemetrySubscriptions').length
+        const disconnect = jest.spyOn(cluster, 'disconnect')
+        const closing = client.disconnect({ timeout })
+        if (timeout > 0) {
+          await until(() => building)
+          const episode = owner.machine.closing
+          expect(episode.deadline - clock).toBeLessThanOrEqual(Math.min(1000, timeout))
+          clock = episode.deadline
+        }
+        encode.release()
+        await closing
+        expect(disconnect).toHaveBeenCalledTimes(1)
+        expect(wire.requests().filter((r) => r.api === 'PushTelemetry')).toHaveLength(0)
+        expect(wire.requests().filter((r) => r.api === 'GetTelemetrySubscriptions')).toHaveLength(
+          gets
+        )
+        expect(wire.sockets()).toHaveLength(sockets)
+      } finally {
+        encode.release()
+        build?.mockRestore()
+        await client.disconnect({ timeout: 0 })
+        wire.assertClean()
+        expect(wire.sockets().every((socket) => socket.destroyed)).toBe(true)
+        expect(owner.machine.waiters.size).toBe(0)
+        bind.mockRestore()
+      }
     }
-  })
+  )
 
-  test.each(kinds)('a never-timed %s disconnect passes an unbounded budget', async (kind) => {
-    const wire = scripted(kind)
-    const close = jest.spyOn(TelemetryFactory.prototype, 'close').mockResolvedValue()
-    const bind = jest.spyOn(TelemetryFactory.prototype, 'bind')
-    const client = make(new Kafka(wire.kafkaOptions({ enableMetricsPush: true })), kind)
-    const owner = bind.mock.contexts.at(-1)
-    try {
-      await client.connect()
-      await client.disconnect()
-      const [budget] = close.mock.calls[0]
-      expect(budget.deadline).toBe(Infinity)
-      expect(budget.remaining()).toBe(Infinity)
-      expect(budget.zero).toBe(false)
-    } finally {
-      owner.suspend()
+  test.each(['handler', 'hook', 'commit', 'leave'])(
+    'a real consumer close keeps its %s stage independent of the terminating Push',
+    async (stage) => {
+      const { groupScript } = require('../../../testHelpers/scriptedCluster')
+      const {
+        TOPIC,
+        prepareRecordBatches,
+      } = require('../../consumer/__tests__/fixtures/fetchHarness')
+      await prepareRecordBatches()
+      const brokerAnswerTimers = new Set()
+      const wire = groupScript(scripted('consumer'), { brokerAnswerTimers })
+      wire.answer('GetTelemetrySubscriptions', () => ({
+        clientInstanceId: ID,
+        subscriptionId: 1,
+        requestedMetrics: ['com.example.'],
+        pushIntervalMs: 300000,
+        acceptedCompressionTypes: [0],
+      }))
+      const core = held()
+      const final = held()
+      let coreArrived = false
+      let finalArrived = false
+      const deliveries = []
+      const events = []
+      wire.answer('PushTelemetry', async ({ terminating }) => {
+        if (terminating) {
+          finalArrived = true
+          await final.promise
+        }
+        return {}
+      })
+      for (const [name, target] of [
+        ['OffsetCommit', 'commit'],
+        ['LeaveGroup', 'leave'],
+      ]) {
+        const original = wire.answerers.get(name)
+        wire.answer(name, async (...args) => {
+          if (stage === target) {
+            coreArrived = true
+            await core.promise
+          }
+          return original(...args)
+        })
+      }
+      const bind = jest.spyOn(TelemetryFactory.prototype, 'bind')
+      const consumer = make(new Kafka(wire.kafkaOptions({ enableMetricsPush: true })), 'consumer', {
+        maxWaitTimeInMs: 20,
+      })
+      const owner = bind.mock.contexts.at(-1)
+      let closing
+      try {
+        consumer.on(consumer.events.STOP, () => events.push('stop'))
+        consumer.on(consumer.events.DISCONNECT, () => events.push('disconnect'))
+        consumer.registerMetricForSubscription({
+          name: 'com.example.close',
+          type: 'gauge',
+          value: 7,
+        })
+        await consumer.connect()
+        await consumer.subscribe({ topic: TOPIC, fromBeginning: true })
+        await consumer.run({
+          autoCommit: true,
+          autoCommitInterval: 60000,
+          eachMessage: async ({ message }) => {
+            deliveries.push(message.offset)
+            if (stage === 'handler') {
+              coreArrived = true
+              await core.promise
+            }
+          },
+          rebalanceListener: {
+            onPartitionsRevoked: async ({ partitions }) => {
+              if (partitions.length && stage === 'hook') {
+                coreArrived = true
+                await core.promise
+              }
+            },
+          },
+        })
+        await until(() => deliveries.length === 1)
+        await consumer.clientInstanceId({ timeout: 1000 })
+        let settled = false
+        closing = consumer.disconnect({ timeout: 5000, leaveGroup: true })
+        closing.then(() => {
+          settled = true
+        })
+        await until(() => coreArrived && finalArrived)
+        const episode = owner.machine.closing
+        await expect(consumer.disconnect({ timeout: -1 })).rejects.toBeInstanceOf(
+          KafkaJSInvalidConfigurationError
+        )
+        const second = consumer.disconnect({ timeout: 0, leaveGroup: false })
+        expect(owner.machine.closing).toBe(episode)
+        final.release()
+        await until(() => owner.machine.state === 'CLOSED')
+        expect(settled).toBe(false)
+        core.release()
+        await Promise.all([closing, second])
+        expect(events).toEqual(['stop', 'disconnect'])
+        expect(deliveries).toEqual(['0'])
+        const commits = wire.requests().filter((r) => r.api === 'OffsetCommit')
+        expect(commits).toHaveLength(1)
+        expect(commits[0].fields.topics[0].partitions[0].offset).toBe('1')
+        expect(wire.requests().filter((r) => r.api === 'LeaveGroup')).toHaveLength(1)
+        expect(
+          wire.requests().filter((r) => r.api === 'PushTelemetry' && r.fields.terminating)
+        ).toHaveLength(1)
+      } finally {
+        core.release()
+        final.release()
+        if (closing) await closing
+        await consumer.disconnect({ timeout: 0 })
+        for (const timer of brokerAnswerTimers) clearTimeout(timer)
+        wire.assertClean()
+        expect(wire.sockets().every((socket) => socket.destroyed)).toBe(true)
+        expect(owner.machine.timer).toBeNull()
+        expect(owner.machine.waiters.size).toBe(0)
+        bind.mockRestore()
+      }
     }
-  })
+  )
 
   test('disabled disconnects never touch telemetry', async () => {
     const close = jest.spyOn(ClientTelemetry.prototype, 'close')
@@ -703,6 +1126,43 @@ describe('owner lifecycle joins', () => {
     }
     expect(close).not.toHaveBeenCalled()
   })
+
+  test.each(kinds)(
+    'default-off %s disconnect has the same microtask and event ordering as no telemetry work',
+    async (kind) => {
+      const capture = async (noWork) => {
+        const wire = scripted(kind)
+        const client = make(new Kafka(wire.kafkaOptions()), kind)
+        await client.connect()
+        const gate = held()
+        const clusterDisconnect = Cluster.prototype.disconnect
+        const clusters = new Set()
+        const disconnect = jest
+          .spyOn(Cluster.prototype, 'disconnect')
+          .mockImplementation(function () {
+            clusters.add(this)
+            return gate.promise
+          })
+        const close = noWork
+          ? jest.spyOn(TelemetryFactory.prototype, 'close').mockReturnValue(null)
+          : null
+        let turn = 0
+        const trace = []
+        client.on(client.events.DISCONNECT, () => trace.push(['event', turn]))
+        const done = client.disconnect({ timeout: 0 }).then(() => trace.push(['closed', turn]))
+        gate.release()
+        for (; turn < 100; turn++) await Promise.resolve()
+        await done
+        close?.mockRestore()
+        disconnect.mockRestore()
+        for (const cluster of clusters) await clusterDisconnect.call(cluster, { drainTimeout: 0 })
+        wire.assertClean()
+        expect(wire.sockets().every((socket) => socket.destroyed)).toBe(true)
+        return trace
+      }
+      expect(await capture(false)).toEqual(await capture(true))
+    }
+  )
 
   describe.each([false, true])('producer connect racing a close with telemetry %p', (enabled) => {
     test('a lifecycle retired before connect resumes keeps its result and starts no telemetry', async () => {
@@ -800,7 +1260,9 @@ describe('owner lifecycle joins', () => {
       }
     }
     const started = async (telemetry, retry) => {
-      const start = jest.spyOn(Runner.prototype, 'start').mockResolvedValue()
+      const start = jest.spyOn(Runner.prototype, 'start').mockImplementation(async function () {
+        this.running = true
+      })
       jest.spyOn(Runner.prototype, 'stop').mockResolvedValue()
       const built = build(telemetry, retry)
       await built.consumer.subscribe({ topic: 'topic', fromBeginning: true })
@@ -839,6 +1301,68 @@ describe('owner lifecycle joins', () => {
       await consumer.disconnect()
       expect(telemetry.close).toHaveBeenCalledTimes(1)
     })
+
+    test.each(
+      ['connect', 'join'].flatMap((phase) => [false, true].map((restart) => [phase, restart]))
+    )(
+      'a real failed Runner %s stays suspended through restart decision and backoff (%p)',
+      async (phase, restart) => {
+        jest.useFakeTimers()
+        const ConsumerGroup = require('../../consumer/consumerGroup')
+        const telemetry = new TelemetryFactory({
+          kind: 'consumer',
+          config: { enableMetricsPush: true, telemetryMaxBytes: 1048576 },
+        })
+        telemetry.bind({ createTelemetryTransport: () => ({ candidates: () => [] }) })
+        const resume = jest.spyOn(telemetry, 'resume')
+        const decision = held()
+        const deciding = jest.fn(() => decision.promise)
+        const start = jest.spyOn(Runner.prototype, 'start')
+        jest.spyOn(Runner.prototype, 'stop').mockResolvedValue()
+        jest.spyOn(Runner.prototype, 'scheduleFetchManager').mockImplementation(() => {})
+        const initialRound = jest.spyOn(Runner.prototype, 'runInitialRound').mockResolvedValue()
+        const connecting = jest.spyOn(ConsumerGroup.prototype, 'connect').mockResolvedValue()
+        const failure = Object.assign(new Error('initial ' + phase), {
+          retriable: true,
+          retryTime: 25,
+        })
+        if (phase === 'connect') connecting.mockRejectedValueOnce(failure)
+        else initialRound.mockRejectedValueOnce(failure)
+        const { consumer } = build(telemetry, { restartOnFailure: deciding, initialRetryTime: 25 })
+        try {
+          await consumer.subscribe({ topic: 'topic' })
+          const running = consumer.run({ eachMessage: async () => {}, autoCommit: false })
+          for (let turn = 0; turn < 100 && !deciding.mock.calls.length; turn++)
+            await Promise.resolve()
+          expect(deciding).toHaveBeenCalledTimes(1)
+          await expect(consumer.clientInstanceId()).rejects.toMatchObject({
+            reason: 'not-connected',
+          })
+          expect(resume).not.toHaveBeenCalled()
+          decision.release(restart)
+          await running
+          expect(resume).not.toHaveBeenCalled()
+          await expect(consumer.clientInstanceId()).rejects.toMatchObject({
+            reason: 'not-connected',
+          })
+          await jest.advanceTimersByTimeAsync(24)
+          expect(start).toHaveBeenCalledTimes(1)
+          if (restart) {
+            await jest.advanceTimersByTimeAsync(1)
+            expect(start).toHaveBeenCalledTimes(2)
+            expect(resume).toHaveBeenCalledTimes(1)
+          }
+        } finally {
+          decision.release(false)
+          for (const instance of start.mock.instances) {
+            instance.heartbeatManager.shutdown()
+            instance.pollTimer.stop()
+          }
+          await consumer.disconnect({ timeout: 0 })
+          jest.useRealTimers()
+        }
+      }
+    )
 
     test('the first disconnect captures its budget once and joins the held close with core cleanup', async () => {
       const gate = held()

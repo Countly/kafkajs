@@ -39,6 +39,7 @@ module.exports = class ClientTelemetry {
       throw new KafkaJSInvalidConfigurationError('Invalid telemetry byte limit')
     this.state = config.enableMetricsPush === false ? 'DISABLED' : 'DORMANT'
     this.connected = false
+    this.unsupported = false
     this.stopped = false
     this.sequence = 0n
     this.lifecycle = 0n
@@ -104,6 +105,7 @@ module.exports = class ClientTelemetry {
         ? { revision: this.issue(), lifecycle: this.lifecycle, used: false }
         : null
     }
+    this.unsupported = false
     this.schedule('get', 0)
   }
 
@@ -216,6 +218,7 @@ module.exports = class ClientTelemetry {
         )
         if (!candidate) {
           this.state = 'DORMANT'
+          this.unsupported = true
           this.metrics.pauseObservation()
           this.settleWaiters('unsupported')
           return null
@@ -592,7 +595,7 @@ module.exports = class ClientTelemetry {
     if (this.uuid) return this.uuid
     if (['CLOSING', 'CLOSED'].includes(this.state)) throw this.error('closed')
     if (!this.connected) throw this.error('not-connected')
-    if (this.state === 'DORMANT' && this.timer === null) throw this.error('unsupported')
+    if (this.unsupported) throw this.error('unsupported')
     if (this.state === 'STOPPED') throw this.error('stopped')
     const deadline = entered + timeout
     if (!timeout || this.clock.now() >= deadline) throw this.error('timeout')

@@ -22,6 +22,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Behavior changes
 
+- Keep telemetry suspended after failed consumer startup, retain request latency observation across crash restarts, and wait for supported telemetry connection setup when requesting an instance ID. Contain all recognized share option accessors before construction; disabled disconnects retain their original scheduling.
 - Broker client metrics (KIP-714) are available with `enableMetricsPush: true`; the default remains false. Kafka-wide defaults can be overridden on producer, consumer, admin and share consumer.
 - Enabling broker telemetry can open one additional broker connection per client and send GetTelemetrySubscriptions/PushTelemetry traffic. Unsupported brokers quietly leave foreground operations usable.
 - Telemetry includes only applicable rack/group/static-member/current-member/transaction identity attributes, library scope/version and per-node metric labels.

@@ -331,6 +331,25 @@ module.exports = class BrokerPool {
   }
 
   /**
+   * Reissues slots after transient collector reset for current normal pools, including ready
+   * sockets that need no new setup. Retired pools and the dedicated telemetry pool stay fenced.
+   * @returns {void} bounded to the current broker inventory; no network or request-path work
+   */
+  rebindTelemetryNodes() {
+    if (!this.telemetryMetrics) return
+    const brokers = new Set([this.seedBroker, ...Object.values(this.brokers)])
+    for (const broker of brokers) {
+      if (
+        broker &&
+        !this.retiredBrokers.has(broker) &&
+        !broker.retired &&
+        !broker.connectionPool.retired
+      )
+        this.bindTelemetryNode(broker)
+    }
+  }
+
+  /**
    * Retires a pool's node identity so late responses of its sockets cannot relabel a replacement.
    * @private
    * @param {import('../network/connectionPool')} pool pool leaving service

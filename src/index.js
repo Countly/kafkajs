@@ -17,7 +17,11 @@ const RackPreference = require('./producer/partitioners/rackPreference')
 const { minimumRequestSize } = require('./producer/state/recordSize')
 const { MAX_DELAY } = require('./producer/deadline')
 const createConsumer = require('./consumer')
-const { createShareConsumer, validateShareConsumerOptions } = require('./consumer/share')
+const {
+  createShareConsumer,
+  validateShareConsumerOptions,
+  SHARE_CONSUMER_FIELDS,
+} = require('./consumer/share')
 const createAdmin = require('./admin')
 const ISOLATION_LEVEL = require('./protocol/isolationLevel')
 const defaultSocketFactory = require('./network/socketFactory')
@@ -817,18 +821,17 @@ module.exports = class Client {
    * @param {import('../types').ShareConsumerConfig} config Required group and share options.
    * @returns {import('../types').ShareConsumer} The additive run-based share client.
    * @throws {KafkaJSInvalidConfigurationError} Before client state, for invalid share options,
-   *   invalid telemetry options or a throwing telemetry accessor, or a root `requestTimeout` that
+   *   invalid telemetry options or a throwing known option accessor, or a root `requestTimeout` that
    *   is not an integer from 1 to 2147483647.
    * @throws {KafkaJSNonRetriableError} For invalid `maxInFlightRequests`, as for `consumer()`.
    */
   shareConsumer(config) {
     const isOptions = config && typeof config === 'object' && !Array.isArray(config)
-    // Share fields are read once by their own validator, so a throwing share getter keeps its
-    // identity; only the two telemetry scalars are snapshotted here.
-    const telemetryConfig = isOptions
-      ? snapshotOptions(config, [], this[PRIVATE.TELEMETRY]).config
-      : this[PRIVATE.TELEMETRY]
-    const options = validateShareConsumerOptions(config, this[PRIVATE.CLUSTER_RETRY])
+    const snapshot = isOptions
+      ? snapshotOptions(config, SHARE_CONSUMER_FIELDS, this[PRIVATE.TELEMETRY])
+      : { options: config, config: this[PRIVATE.TELEMETRY] }
+    const telemetryConfig = snapshot.config
+    const options = validateShareConsumerOptions(snapshot.options, this[PRIVATE.CLUSTER_RETRY])
     const requestTimeout = this[PRIVATE.REQUEST_TIMEOUT]
     if (!(
       Number.isInteger(requestTimeout) &&

@@ -138,6 +138,47 @@ describe('public instance ID contract', () => {
     expect(jest.getTimerCount()).toBe(0)
   })
 
+  test('a supported held connection setup admits a waiter under its original deadline', async () => {
+    const h = setup()
+    let releaseOpen
+    const opening = new Promise((resolve) => {
+      releaseOpen = resolve
+    })
+    h.transport.open.mockImplementation(async (_, { onAllocated }) => {
+      onAllocated(h.handle)
+      await opening
+      return h.handle
+    })
+    h.client.resume()
+    await jest.advanceTimersByTimeAsync(0)
+    expect(h.transport.open).toHaveBeenCalledTimes(1)
+    expect(h.handle.get).not.toHaveBeenCalled()
+    const result = h.client.clientInstanceId({ timeout: 100 }).catch((e) => e)
+    await settle()
+    expect(h.client.waiters.size).toBe(1)
+    expect([...h.client.waiters][0].deadline).toBe(100)
+    h.advance(40)
+    releaseOpen()
+    await settle()
+    h.resolveGet(h.answer)
+    await expect(result).resolves.toBe(ID)
+    h.client.suspend()
+    expect(jest.getTimerCount()).toBe(0)
+  })
+
+  test('an established unsupported outcome refuses without opening a transport', async () => {
+    const h = setup()
+    h.transport.candidates = () => []
+    h.client.resume()
+    await jest.advanceTimersByTimeAsync(0)
+    await expect(h.client.clientInstanceId({ timeout: 100 })).rejects.toMatchObject({
+      reason: 'unsupported',
+    })
+    expect(h.transport.open).not.toHaveBeenCalled()
+    h.client.suspend()
+    expect(jest.getTimerCount()).toBe(0)
+  })
+
   test('independent waiters detach on expiry without cancelling the shared Get', async () => {
     const h = setup()
     h.client.resume()

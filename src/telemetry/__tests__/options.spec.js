@@ -187,16 +187,53 @@ describe('telemetry option snapshots', () => {
     }
   })
 
-  test('a throwing share getter outside telemetry keeps its identity', () => {
-    const cause = new Error('getter')
-    expect(() =>
-      root().shareConsumer({
-        groupId: 'g',
-        get maxRecords() {
-          throw cause
-        },
+  test.each(['maxRecords', 'fromBeginning'])(
+    'contains a throwing recognized share getter or Proxy for %s',
+    (field) => {
+      const kafka = root()
+      const bind = jest.spyOn(TelemetryFactory.prototype, 'bind')
+      const getter = jest.fn(() => {
+        throw new Error('private share value')
       })
-    ).toThrow(cause)
+      const source = { groupId: 'g', enableMetricsPush: true }
+      Object.defineProperty(source, field, { get: getter })
+      const proxy = new Proxy(
+        { groupId: 'g', enableMetricsPush: true },
+        {
+          get(target, key) {
+            if (key === field) throw new Error('private share value')
+            return target[key]
+          },
+        }
+      )
+      try {
+        for (const input of [source, proxy]) {
+          expect(() => kafka.shareConsumer(input)).toThrow(KafkaJSInvalidConfigurationError)
+          expect(() => kafka.shareConsumer(input)).toThrow('Invalid client telemetry options')
+        }
+        expect(getter).toHaveBeenCalledTimes(2)
+        expect(bind).not.toHaveBeenCalled()
+      } finally {
+        bind.mockRestore()
+      }
+    }
+  )
+
+  test('share recognized fields are read once from inherited accessors and unknown getters are ignored', () => {
+    const reads = jest.fn(() => 42)
+    const source = Object.create({
+      groupId: 'inherited',
+      get maxRecords() {
+        return reads()
+      },
+    })
+    Object.defineProperty(source, 'unknown', {
+      get() {
+        throw new Error('unknown')
+      },
+    })
+    expect(root().shareConsumer(source)).toHaveProperty('run')
+    expect(reads).toHaveBeenCalledTimes(1)
   })
 
   test('disabled clients allocate no collector, machine, adapter or timer', async () => {

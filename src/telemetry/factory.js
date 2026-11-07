@@ -92,6 +92,7 @@ class TelemetryFactory {
     this.finalResources = null
     this.metrics = null
     this.machine = null
+    this.cluster = null
     this.failed = false
     if (config.enableMetricsPush) {
       try {
@@ -117,6 +118,7 @@ class TelemetryFactory {
    */
   bind(cluster) {
     if (!this.metrics || this.machine) return
+    this.cluster = cluster
     try {
       this.machine = new ClientTelemetry({
         kind: this.kind,
@@ -186,7 +188,10 @@ class TelemetryFactory {
    */
   resume() {
     try {
-      if (this.machine && !this.machine.connected) this.finalResources = null
+      if (this.machine && !this.machine.connected) {
+        this.finalResources = null
+        this.cluster?.brokerPool?.rebindTelemetryNodes()
+      }
       this.machine?.resume()
     } catch {
       this.failed = true
@@ -211,11 +216,11 @@ class TelemetryFactory {
    * is reserved from or subtracted from it.
    * @param {{deadline?:number,remaining?:() => number,zero?:boolean}} budget the owner's first
    *   valid close authority, in the owner's own time domain
-   * @returns {Promise<void>} contained and bounded; it never rejects, and repeated calls share the
-   *   one episode
+   * @returns {Promise<void>|null} null when no machine needs closing, preserving the owner's
+   *   synchronous no-work path; otherwise contained and bounded, sharing one episode
    */
   close(budget) {
-    if (!this.machine) return Promise.resolve()
+    if (!this.machine) return null
     if (this.machine.closing) return this.machine.closing.promise
     const resources = this.captureResources()
     let usable = false
