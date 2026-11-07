@@ -667,7 +667,10 @@ const supervise = (kind) =>
     })
   })
 
-test.each(KINDS)(
+// Memory and RSS readings need a quiet host: the unit lane skips them and the dedicated resources
+// job, which runs this file alone with the variable set, owns them.
+const quiet = process.env.TELEMETRY_RESOURCES_QUIET === '1' ? test.each : test.skip.each
+quiet(KINDS)(
   'single client resource memory for %s',
   async (kind) => {
     const { readings, code, signal, stderr, closedAfterReceiptMs } = await supervise(kind)

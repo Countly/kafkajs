@@ -6506,11 +6506,17 @@ const buildShareSoak = ({ brokers, short = false, record, run }) => {
  * @param {object} options
  * @param {string[]} options.brokers seed addresses
  * @param {Array<{ name: string, workload: string, ms: number }>} options.phases exactly the fixed phase
+ * @param {(row: object) => void} [options.record] where the parent's rows go; `.tmp/e2e/telemetry-churn.jsonl`
+ *   by default, a live spec supplies its own sink
  * @returns {{ run: () => Promise<{ ok: boolean }>, close: () => Promise<void> }}
  * @throws {Error} without `--expose-gc`, for another phase list, an unconfigured broker line or
  *   evidence directory, and for a worker without its kind or IPC channel
  */
-const buildTelemetryChurn = ({ brokers, phases }) => {
+const buildTelemetryChurn = ({
+  brokers,
+  phases,
+  record = (row) => writeEvidence('telemetry-churn', row),
+}) => {
   if (typeof globalThis.gc !== 'function')
     throw new Error(
       'The telemetry profile reads memory after a collection: run node with --expose-gc'
@@ -6559,7 +6565,7 @@ const buildTelemetryChurn = ({ brokers, phases }) => {
       withResource: withTelemetryResource,
     }),
     processes: new churn.TelemetryProcesses({ script: __filename }),
-    record: (row) => writeEvidence('telemetry-churn', row),
+    record,
     clock: REAL_CLOCK,
     limits: TELEMETRY,
     verdict: (input) => TelemetryResourceVerdict.evaluate(input),

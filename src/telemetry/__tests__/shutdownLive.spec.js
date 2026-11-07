@@ -2,6 +2,8 @@ const crypto = require('crypto')
 const fs = require('fs')
 const net = require('net')
 const path = require('path')
+const v8 = require('v8')
+const vm = require('vm')
 const { performance } = require('perf_hooks')
 const { spawn } = require('child_process')
 const { Kafka, logLevel } = require('../../../index')
@@ -781,4 +783,99 @@ live(
     })
   ),
   caseTimeout(BUDGET)
+)
+
+const CHURN_BUDGET = 538000
+
+/**
+ * Gives this process a real collection function without `--expose-gc`, for the parent's check only:
+ * every worker is forked with the flag and takes its own readings.
+ * @returns {function():void} restores the previous state
+ */
+const exposeCollection = () => {
+  const had = Object.getOwnPropertyDescriptor(globalThis, 'gc')
+  if (typeof globalThis.gc !== 'function') {
+    v8.setFlagsFromString('--expose-gc')
+    globalThis.gc = vm.runInNewContext('gc')
+  }
+  return () => {
+    if (!had) delete globalThis.gc
+  }
+}
+
+/**
+ * L9: the same `main('telemetry')` owner the CLI runs, with its rows captured into one stamped
+ * scenario record. Four one-client workers are judged on their own memory and exact resource
+ * identities; the parent's independent record oracle and the natural exit of every child are
+ * required. A shortened or forced run cannot satisfy it.
+ */
+live(
+  'telemetry churn',
+  liveCase(CHURN_BUDGET, (scope) =>
+    runCase('telemetry-churn', async (cleanup, publish, attempt) => {
+      const directory = process.env.TELEMETRY_EVIDENCE_DIR
+      if (!process.env.KAFKA_VERSION) throw new Error('KAFKA_VERSION must name the broker line')
+      if (!directory || !path.isAbsolute(directory))
+        throw new Error('TELEMETRY_EVIDENCE_DIR must name the absolute run directory')
+      const {
+        main,
+        buildTelemetryChurn,
+        TelemetryResourceVerdict,
+      } = require('../../../scripts/soak/soak')
+      const rows = []
+      const restore = exposeCollection()
+      cleanup.defer(() => restore())
+      const result = await bounded(
+        scope,
+        CHURN_BUDGET - 10000,
+        () =>
+          main('telemetry', {
+            brokers: PORTS.map((port) => `localhost:${port}`),
+            telemetry: (options) =>
+              buildTelemetryChurn({ ...options, record: (row) => rows.push(row) }),
+          }),
+        { label: 'The telemetry churn' }
+      )
+      attempt.stage = 'verification'
+      expect(result.clientKinds).toEqual(['producer', 'consumer', 'admin', 'shareConsumer'])
+      expect(result.workers).toHaveLength(4)
+      for (const worker of result.workers) {
+        expect(worker.input.clientCount).toBe(1)
+        expect(worker.input.samples.length).toBeGreaterThanOrEqual(10)
+        expect(worker.input.measurementMs).toBeGreaterThanOrEqual(300000)
+        expect(TelemetryResourceVerdict.evaluate(worker.input).ok).toBe(true)
+        expect(worker.exit).toMatchObject({
+          event: 'close',
+          code: 0,
+          signal: null,
+          stderrBytes: 0,
+          unhandled: 0,
+          watchdogExpired: false,
+        })
+        expect(worker.exit.afterDisconnectMs).toBeLessThanOrEqual(10000)
+      }
+      expect(result.oracle.ok).toBe(true)
+      expect(result.cleanupMs).toBeLessThanOrEqual(120000)
+      expect(result.totalMs).toBeLessThanOrEqual(540000)
+      expect(result.ok).toBe(true)
+      attempt.record = {
+        ...attempt.record,
+        run: {
+          ...attempt.record.run,
+          composeSha256: fileSha(path.join(ROOT, 'docker-compose.telemetry.yml')),
+        },
+        results: {
+          rows,
+          verdict: {
+            ok: result.ok,
+            setupMs: result.setupMs,
+            cleanupMs: result.cleanupMs,
+            totalMs: result.totalMs,
+          },
+        },
+      }
+      publish({ name: 'telemetry-churn', directory, observers: {}, record: attempt.record })
+    })
+  ),
+  caseTimeout(CHURN_BUDGET)
 )

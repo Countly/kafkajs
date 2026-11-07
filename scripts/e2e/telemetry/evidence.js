@@ -32,6 +32,8 @@ const LIVE = Object.freeze([
   'telemetry-shutdown',
 ])
 const UNSUPPORTED = 'telemetry-unsupported'
+const CHURN = 'telemetry-churn'
+const CHURN_KINDS = ['producer', 'consumer', 'admin', 'shareConsumer']
 const JAVA_ROLES = ['producer', 'consumer', 'admin']
 const FAULT_MODES = ['drop', 'blackhole', 'late']
 const ZERO_TIMEOUT_KINDS = ['producer', 'consumer', 'share']
@@ -401,11 +403,13 @@ const verifyScenario = (record, directory) => {
   )
   const ownerKeys = LIVE.includes(manifest.scenario)
     ? requiredLiveCatalogue(record)
-    : manifest.scenario === 'telemetry-floor'
-      ? ['producer', 'consumer', 'admin']
-      : noPlugin
-        ? [...KINDS, ...KINDS.map((k) => k + '-off')]
-        : KINDS
+    : manifest.scenario === CHURN
+      ? []
+      : manifest.scenario === 'telemetry-floor'
+        ? ['producer', 'consumer', 'admin']
+        : noPlugin
+          ? [...KINDS, ...KINDS.map((k) => k + '-off')]
+          : KINDS
   assert.deepEqual(
     Object.keys(manifest.owners).sort(),
     [...ownerKeys].sort(),
@@ -429,6 +433,10 @@ const verifyScenario = (record, directory) => {
     }
     assert.deepEqual(transcript.failures, [])
     assert.deepEqual(transcript.cleanup, { children: 0, timers: 0, stillOpen: [], attached: 0 })
+  }
+  if (manifest.scenario === CHURN) {
+    verifyChurn(record)
+    return
   }
   if (manifest.scenario === 'telemetry-reporter') {
     const { results } = record
@@ -1832,6 +1840,45 @@ const verifyControl = (results, transcript, samples) => {
 }
 
 /**
+ * Re-derives the churn verdict from its rows: one resource input per client kind, judged again by
+ * the checked evaluator, one natural close per kind, one oracle and one final verdict inside the
+ * fixed budgets. A boolean in a row is never enough.
+ * @param {object} record the stamped churn record whose `results.rows` holds the soak's rows
+ * @returns {void}
+ * @throws {Error} for a missing, duplicate, substituted, failed or aggregate-only row
+ */
+const verifyChurn = (record) => {
+  const { TelemetryResourceVerdict } = require('../../soak/soak')
+  const rows = record.results?.rows
+  assert(Array.isArray(rows), 'Missing churn rows')
+  const of = (kind) => rows.filter((row) => row.kind === kind)
+  const resources = of('resource-verdict')
+  const exits = of('natural-exit')
+  assert.deepEqual(resources.map((row) => row.clientKind).sort(), [...CHURN_KINDS].sort())
+  assert.deepEqual(exits.map((row) => row.clientKind).sort(), [...CHURN_KINDS].sort())
+  for (const row of resources) {
+    assert.equal(row.input.clientCount, 1, 'A churn input must be one client')
+    assert.equal(TelemetryResourceVerdict.evaluate(row.input).ok, true, `${row.clientKind} memory`)
+    assert(row.uuid && row.clientId, 'Missing client identity')
+  }
+  for (const row of exits) {
+    assert.equal(row.event, 'close')
+    assert.equal(row.code, 0)
+    assert.equal(row.signal, null)
+    assert(Number.isFinite(row.afterDisconnectMs) && row.afterDisconnectMs <= 10000)
+    assert.equal(row.stderrBytes, 0)
+    assert.equal(row.unhandled, 0)
+    assert.equal(row.watchdogExpired, false)
+  }
+  const [oracle, ...extraOracle] = of('oracle')
+  const [verdict, ...extraVerdict] = of('verdict')
+  assert(oracle && verdict && !extraOracle.length && !extraVerdict.length, 'Missing churn verdict')
+  assert.equal(oracle.ok, true)
+  assert.equal(verdict.ok, true)
+  assert(verdict.setupMs <= 48000 && verdict.cleanupMs <= 120000 && verdict.totalMs <= 540000)
+}
+
+/**
  * Requires exactly the scenario catalogue selected by the CI lane, then verifies every sidecar.
  * @param {string} group reporter or base CI group
  * @param {string} directory sidecar directory
@@ -1845,9 +1892,11 @@ const verifyEvidence = (group, directory, files) => {
       ? ['telemetry-reporter', 'telemetry-reporter-no-resource']
       : group === 'telemetry-base'
         ? ['telemetry-reporter-no-plugin']
-        : [...LIVE, UNSUPPORTED].includes(group)
-          ? [group]
-          : []
+        : group === 'telemetry-soak'
+          ? [CHURN]
+          : [...LIVE, UNSUPPORTED].includes(group)
+            ? [group]
+            : []
   assert(expected.length, 'Unknown telemetry lane')
   const records = files.flatMap((file) =>
     fs.readFileSync(file, 'utf8').trim().split('\n').map(JSON.parse)
@@ -1903,6 +1952,7 @@ module.exports = {
   runCase,
   persistEvidence,
   verifyScenario,
+  verifyChurn,
   verifyEvidence,
   verifyCleanup,
   assertStreamAccounted,
