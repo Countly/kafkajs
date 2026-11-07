@@ -367,11 +367,42 @@ class CiOwnership {
             sha256: crypto.createHash('sha256').update(bytes).digest('hex'),
           },
           scenarios,
+          segmented: this.segmentIndexes(),
         },
         null,
         2
       )
     )
+  }
+
+  /**
+   * Lists the root index of every segmented case archive, so the uploaded manifest names each index
+   * with its digest, format and segment count.
+   * @returns {{path:string,bytes:number,sha256:string,format:string,scenario:string,segments:number}[]}
+   *   one entry per `case-*` archive that holds an `index.json`, in name order
+   * @throws {Error} for an index that is not valid JSON
+   */
+  segmentIndexes() {
+    return fs
+      .readdirSync(this.directory)
+      .filter(
+        (name) =>
+          /^case-[a-z0-9-]+$/.test(name) &&
+          fs.existsSync(path.join(this.directory, name, 'index.json'))
+      )
+      .sort()
+      .map((name) => {
+        const content = fs.readFileSync(path.join(this.directory, name, 'index.json'))
+        const index = JSON.parse(content)
+        return {
+          path: `${name}/index.json`,
+          bytes: content.length,
+          sha256: crypto.createHash('sha256').update(content).digest('hex'),
+          format: index.format,
+          scenario: index.scenario,
+          segments: index.segments.length,
+        }
+      })
   }
 }
 

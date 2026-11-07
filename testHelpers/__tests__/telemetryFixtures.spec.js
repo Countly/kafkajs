@@ -220,105 +220,105 @@ describe('client metrics resource ownership', () => {
   })
 })
 
+const i8 = (n) => Buffer.from([n & 0xff])
+const i16 = (n) => {
+  const bytes = Buffer.alloc(2)
+  bytes.writeInt16BE(n)
+  return bytes
+}
+const i32 = (n) => {
+  const bytes = Buffer.alloc(4)
+  bytes.writeInt32BE(n)
+  return bytes
+}
+const uvar = (n) => {
+  const out = []
+  let rest = n
+  while (rest >= 0x80) {
+    out.push((rest & 0x7f) | 0x80)
+    rest = Math.floor(rest / 128)
+  }
+  return Buffer.from([...out, rest])
+}
+const TAGS = Buffer.alloc(1)
+const text16 = (value) => Buffer.concat([i16(value.length), Buffer.from(value)])
+const frame = (...parts) => {
+  const body = Buffer.concat(parts)
+  return Buffer.concat([i32(body.length), body])
+}
+const header1 = (api, version, correlation) =>
+  Buffer.concat([i16(api), i16(version), i32(correlation), text16('client')])
+const header2 = (api, version, correlation) =>
+  Buffer.concat([header1(api, version, correlation), TAGS])
+const uuidBytes = (id) => Buffer.from(id.replace(/-/g, ''), 'hex')
+const sha = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex')
+const get71 = (correlation, id = ID) => frame(header2(71, 0, correlation), uuidBytes(id), TAGS)
+const push72 = (correlation, blob, { id = ID, terminating = false, compression = 0 } = {}) =>
+  frame(
+    header2(72, 0, correlation),
+    uuidBytes(id),
+    i32(7),
+    i8(terminating ? 1 : 0),
+    i8(compression),
+    uvar(blob.length + 1),
+    blob,
+    TAGS
+  )
+const metadata = (correlation) => frame(header1(3, 6, correlation), i32(0))
+const metadataResponse = (correlation) => frame(i32(correlation), Buffer.alloc(8))
+const apiVersions = (correlation) => frame(header1(18, 2, correlation))
+const apiVersionsResponse = (correlation, ranges) =>
+  frame(
+    i32(correlation),
+    i16(0),
+    i32(ranges.length),
+    ...ranges.flatMap(([key, low, high]) => [i16(key), i16(low), i16(high)]),
+    i32(0)
+  )
+const get71Response = (correlation, { interval = 1000, metrics = ['org.apache.kafka.'] } = {}) =>
+  frame(
+    i32(correlation),
+    TAGS,
+    i32(0),
+    i16(0),
+    uuidBytes(ID),
+    i32(7),
+    uvar(2),
+    i8(0),
+    i32(interval),
+    i32(4096),
+    i8(0),
+    uvar(metrics.length + 1),
+    ...metrics.flatMap((metric) => [uvar(metric.length + 1), Buffer.from(metric)]),
+    TAGS
+  )
+const push72Response = (correlation, error = 0) =>
+  frame(i32(correlation), TAGS, i32(0), i16(error), TAGS)
+const sinkRow = (node, seq, raw, extra = {}) =>
+  row(node, seq, { dataBytes: raw.length, dataSha256: sha(raw), ...extra })
+
+const fakeSocket = (port) => {
+  const socket = new EventEmitter()
+  socket.written = []
+  socket.originalWrite = jest.fn((chunk) => {
+    socket.written.push(Buffer.from(chunk))
+    return true
+  })
+  socket.write = socket.originalWrite
+  socket.setKeepAlive = jest.fn()
+  socket.remoteAddress = '127.0.0.1'
+  socket.remotePort = port
+  return socket
+}
+const stubDecoder = jest.fn(async (raw) => ({
+  dataBytes: raw.length,
+  dataSha256: sha(raw),
+  parse: 'ok',
+  resources: [],
+  metrics: [],
+}))
+
 describe('telemetry wire observer', () => {
-  const i8 = (n) => Buffer.from([n & 0xff])
-  const i16 = (n) => {
-    const bytes = Buffer.alloc(2)
-    bytes.writeInt16BE(n)
-    return bytes
-  }
-  const i32 = (n) => {
-    const bytes = Buffer.alloc(4)
-    bytes.writeInt32BE(n)
-    return bytes
-  }
-  const uvar = (n) => {
-    const out = []
-    let rest = n
-    while (rest >= 0x80) {
-      out.push((rest & 0x7f) | 0x80)
-      rest = Math.floor(rest / 128)
-    }
-    return Buffer.from([...out, rest])
-  }
-  const TAGS = Buffer.alloc(1)
-  const text16 = (value) => Buffer.concat([i16(value.length), Buffer.from(value)])
-  const frame = (...parts) => {
-    const body = Buffer.concat(parts)
-    return Buffer.concat([i32(body.length), body])
-  }
-  const header1 = (api, version, correlation) =>
-    Buffer.concat([i16(api), i16(version), i32(correlation), text16('client')])
-  const header2 = (api, version, correlation) =>
-    Buffer.concat([header1(api, version, correlation), TAGS])
-  const uuidBytes = (id) => Buffer.from(id.replace(/-/g, ''), 'hex')
-  const sha = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex')
-  const get71 = (correlation, id = ID) => frame(header2(71, 0, correlation), uuidBytes(id), TAGS)
-  const push72 = (correlation, blob, { id = ID, terminating = false, compression = 0 } = {}) =>
-    frame(
-      header2(72, 0, correlation),
-      uuidBytes(id),
-      i32(7),
-      i8(terminating ? 1 : 0),
-      i8(compression),
-      uvar(blob.length + 1),
-      blob,
-      TAGS
-    )
-  const metadata = (correlation) => frame(header1(3, 6, correlation), i32(0))
-  const metadataResponse = (correlation) => frame(i32(correlation), Buffer.alloc(8))
-  const apiVersions = (correlation) => frame(header1(18, 2, correlation))
-  const apiVersionsResponse = (correlation, ranges) =>
-    frame(
-      i32(correlation),
-      i16(0),
-      i32(ranges.length),
-      ...ranges.flatMap(([key, low, high]) => [i16(key), i16(low), i16(high)]),
-      i32(0)
-    )
-  const get71Response = (correlation, { interval = 1000, metrics = ['org.apache.kafka.'] } = {}) =>
-    frame(
-      i32(correlation),
-      TAGS,
-      i32(0),
-      i16(0),
-      uuidBytes(ID),
-      i32(7),
-      uvar(2),
-      i8(0),
-      i32(interval),
-      i32(4096),
-      i8(0),
-      uvar(metrics.length + 1),
-      ...metrics.flatMap((metric) => [uvar(metric.length + 1), Buffer.from(metric)]),
-      TAGS
-    )
-  const push72Response = (correlation, error = 0) =>
-    frame(i32(correlation), TAGS, i32(0), i16(error), TAGS)
-  const sinkRow = (node, seq, raw, extra = {}) =>
-    row(node, seq, { dataBytes: raw.length, dataSha256: sha(raw), ...extra })
-
-  const fakeSocket = (port) => {
-    const socket = new EventEmitter()
-    socket.written = []
-    socket.originalWrite = jest.fn((chunk) => {
-      socket.written.push(Buffer.from(chunk))
-      return true
-    })
-    socket.write = socket.originalWrite
-    socket.setKeepAlive = jest.fn()
-    socket.remoteAddress = '127.0.0.1'
-    socket.remotePort = port
-    return socket
-  }
-  const stubDecoder = jest.fn(async (raw) => ({
-    dataBytes: raw.length,
-    dataSha256: sha(raw),
-    parse: 'ok',
-    resources: [],
-    metrics: [],
-  }))
-
   let directory
   let observers
   const writeSink = (node, rows) =>
@@ -2836,4 +2836,717 @@ describe('required live archive dimensions and semantics', () => {
     delete a.record.results.arms.optin
     expect(() => a.verify()).toThrow(/Required ordinary arm catalogue/)
   })
+})
+
+describe('telemetry observation segments', () => {
+  const {
+    SCHEDULES,
+    TelemetrySegments,
+    checkSegmentFiles,
+    segmentCatalogue,
+  } = require('../telemetrySegments')
+  let directory
+  let owners
+  let dial
+  const clock = (() => {
+    let tick = 0
+    return { now: () => ++tick }
+  })()
+  const shared = () => ({
+    directory,
+    clock,
+    observer: { line: '4.3.1', dial, decoder: stubDecoder, mode: 'configured' },
+  })
+  const ordinary = (scenario = 'telemetry-shutdown', kind = 'producer') => {
+    const segments = TelemetrySegments.ordinary(scenario, kind, shared())
+    owners.push(segments)
+    return segments
+  }
+  const open = (segments, port = 19092) => {
+    const socket = segments.socketFactory({ host: 'localhost', port, onConnect: jest.fn() })
+    socket.emit('connect')
+    return socket
+  }
+  const send = (socket, ...frames) => socket.write(Buffer.concat(frames))
+  const receive = (socket, ...frames) => socket.emit('data', Buffer.concat(frames))
+  const fakeClient = (segments, order = []) => {
+    const client = {
+      sockets: [],
+      disconnect: jest.fn(async function disconnect() {
+        order.push(`disconnect:${segments.current().id}`)
+        for (const socket of this.sockets.splice(0)) socket.emit('close')
+        setImmediate(() => order.push('immediate'))
+      }),
+      connect: jest.fn(function connect() {
+        order.push('connect')
+        this.sockets.push(open(segments))
+        return Promise.resolve()
+      }),
+    }
+    client.sockets.push(open(segments))
+    return client
+  }
+  const rotate = async (segments, client) => {
+    const cycle = segments.cycle(client, { timeout: 3000 })
+    await Promise.all([cycle.closed, cycle.reopened])
+    return cycle
+  }
+
+  beforeEach(() => {
+    directory = fs.mkdtempSync(path.join(os.tmpdir(), 'telemetry-segments-'))
+    owners = []
+    dial = jest.fn(({ port }) => fakeSocket(port))
+    stubDecoder.mockClear()
+  })
+  afterEach(async () => {
+    await Promise.allSettled(
+      owners.flatMap((owner) => owner.undischarged().map((segment) => segment.observer?.dispose()))
+    )
+    fs.rmSync(directory, { recursive: true, force: true })
+  })
+
+  test('selects the next segment before the close and connects in the close continuation', async () => {
+    const segments = ordinary()
+    const order = []
+    const client = fakeClient(segments, order)
+    const first = segments.current()
+    const cycle = segments.cycle(client, { timeout: 3000 })
+    expect(segments.current().id).toBe('producer-ep-1')
+    expect(client.connect).not.toHaveBeenCalled()
+    await Promise.all([cycle.closed, cycle.reopened])
+    expect(order).toEqual(['disconnect:producer-ep-1', 'connect', 'immediate'])
+    const notes = segments.journal()
+    expect(notes.map((n) => n.type)).toEqual(['select', 'disconnect-resolved', 'connect-called'])
+    expect(notes[2].seq).toBe(notes[1].seq + 1)
+    expect(first.observer.socketOwnership()).toHaveLength(1)
+    expect(cycle.to.observer.socketOwnership()).toHaveLength(1)
+    expect(client.disconnect).toHaveBeenCalledWith({ timeout: 3000 })
+  })
+
+  test('refuses a third undischarged segment without touching the client', async () => {
+    const segments = ordinary()
+    const client = fakeClient(segments)
+    const first = await rotate(segments, client)
+    expect(segments.undischarged().map((s) => s.id)).toEqual(['producer-ep-0', 'producer-ep-1'])
+    const calls = client.disconnect.mock.calls.length
+    expect(() => segments.cycle(client)).toThrow('Two undischarged observer segments exist')
+    expect(client.disconnect).toHaveBeenCalledTimes(calls)
+    expect(segments.current().id).toBe('producer-ep-1')
+    await segments.discharge(first.from)
+    expect(segments.undischarged().map((s) => s.id)).toEqual(['producer-ep-1'])
+    const second = await rotate(segments, client)
+    expect(second.to.id).toBe('producer-ep-2')
+  })
+
+  test('refuses disposal while a segment is active or still owns a socket', async () => {
+    const segments = ordinary()
+    await expect(segments.discharge(segments.current())).rejects.toThrow('is still active')
+    const lingering = open(segments)
+    const cycle = segments.cycle({ disconnect: async () => {}, connect: async () => {} })
+    await cycle.reopened
+    const dispose = jest.spyOn(cycle.from.observer, 'dispose')
+    await expect(segments.discharge(cycle.from, { closeMs: 20 })).rejects.toThrow(
+      'still owns 1 open sockets'
+    )
+    expect(dispose).not.toHaveBeenCalled()
+    lingering.emit('close')
+    const pack = await segments.discharge(cycle.from)
+    expect(pack.id).toBe('producer-ep-0')
+    expect(cycle.from.observer).toBeNull()
+    expect(await segments.discharge(cycle.from)).toBe(pack)
+  })
+
+  test('holds each kind to its fixed schedule and cap', async () => {
+    expect(segmentCatalogue('telemetry-shutdown')).toHaveLength(88)
+    expect(segmentCatalogue('telemetry-churn')).toHaveLength(28)
+    const l5 = ordinary()
+    const client = fakeClient(l5)
+    for (let round = 1; round < SCHEDULES['telemetry-shutdown'].perKind; round++)
+      await l5.discharge((await rotate(l5, client)).from)
+    expect(() => l5.cycle(client)).toThrow('Segment cap of 21')
+    expect(await l5.finish(client, { timeout: 3000 })).toHaveLength(21)
+    const short = ordinary()
+    await expect(short.finish(fakeClient(short))).rejects.toThrow('Expected 21 segments, found 1')
+    const l9 = ordinary('telemetry-churn', 'consumer')
+    const churn = fakeClient(l9)
+    for (let round = 1; round < 16; round++) await l9.discharge((await rotate(l9, churn)).from)
+    expect(() => l9.cycle(churn)).toThrow('Segment cap of 16')
+    await expect(l9.finish(churn)).rejects.toThrow('Expected 7 segments, found 16')
+  })
+
+  test('seals exactly two files holding every payload and proof', async () => {
+    const segments = ordinary()
+    const client = fakeClient(segments)
+    const [socket] = client.sockets
+    const blob = Buffer.from('payload')
+    fs.writeFileSync(
+      path.join(directory, 'exports-1.jsonl'),
+      JSON.stringify(row('1', 1, { dataBytes: blob.length, dataSha256: sha(blob) })) + '\n'
+    )
+    send(socket, get71(1))
+    receive(socket, get71Response(1))
+    send(socket, push72(2, blob))
+    receive(socket, push72Response(2))
+    send(socket, push72(3, Buffer.alloc(0)))
+    receive(socket, push72Response(3))
+    const observerDirectory = segments.current().observer.directory
+    const { from } = await rotate(segments, client)
+    const pack = await segments.discharge(from)
+    expect(fs.readdirSync(path.join(directory, 'segments')).sort()).toEqual([
+      'producer-ep-0.bundle.jsonl',
+      'producer-ep-0.transcript.json',
+    ])
+    expect(fs.existsSync(observerDirectory)).toBe(false)
+    expect(pack.accepted).toHaveLength(1)
+    expect(pack.empty).toHaveLength(1)
+    const files = (name) => fs.readFileSync(path.join(directory, 'segments', name))
+    const input = () => ({
+      id: 'producer-ep-0',
+      transcript: files('producer-ep-0.transcript.json'),
+      bundle: files('producer-ep-0.bundle.jsonl').toString('utf8'),
+    })
+    const checked = checkSegmentFiles(input())
+    expect([...checked.pushes.keys()]).toHaveLength(2)
+    expect(checked.pushes.get(pack.empty[0]).bytes).toBe(0)
+    expect(checked.proofs.get(pack.accepted[0]).raw.equals(blob)).toBe(true)
+    const lines = input().bundle.trim().split('\n')
+    const without = (type) =>
+      lines.filter(
+        (line) => JSON.parse(line).t !== type || JSON.parse(line).key !== pack.accepted[0]
+      )
+    expect(() => checkSegmentFiles({ ...input(), bundle: without('proof').join('\n') })).toThrow(
+      'Missing proof'
+    )
+    expect(() => checkSegmentFiles({ ...input(), id: 'producer-ep-1' })).toThrow('owner differs')
+    const altered = lines.map((line) => {
+      const item = JSON.parse(line)
+      return item.t === 'push' && item.bytes === 0
+        ? JSON.stringify({ ...item, b64: 'AA==', bytes: 1 })
+        : line
+    })
+    expect(() => checkSegmentFiles({ ...input(), bundle: altered.join('\n') })).toThrow(
+      'differs from its bundle entry'
+    )
+  })
+
+  test('bounds the decoder children of every observer through one gate', async () => {
+    const { DecoderGate } = require('../telemetryFixtures')
+    const gate = new DecoderGate(2)
+    let running = 0
+    let peak = 0
+    const task = async (n) => {
+      running++
+      peak = Math.max(peak, running)
+      await new Promise((resolve) => setImmediate(resolve))
+      running--
+      return n
+    }
+    const results = await Promise.all([1, 2, 3, 4, 5].map((n) => gate.run(() => task(n))))
+    expect(results).toEqual([1, 2, 3, 4, 5])
+    expect(peak).toBe(2)
+    await expect(
+      gate.run(async () => {
+        throw new Error('decoder failed')
+      })
+    ).rejects.toThrow('decoder failed')
+    expect(gate.occupancy()).toEqual({ running: 0, queued: 0 })
+    expect(() => new DecoderGate(0)).toThrow('positive decoder concurrency')
+    const gated = new DecoderGate(1)
+    const run = jest.spyOn(gated, 'run')
+    const observer = new TelemetryWireObserver({
+      directory,
+      line: '4.3.1',
+      clock,
+      dial,
+      decoder: stubDecoder,
+      gate: gated,
+    })
+    try {
+      await observer.decodeRaw(Buffer.from('gated'))
+      expect(run).toHaveBeenCalledTimes(1)
+    } finally {
+      await observer.dispose()
+    }
+  })
+
+  test('consumes each sink row once across observers that share a consumed set', async () => {
+    const blob = Buffer.from('shared')
+    fs.writeFileSync(
+      path.join(directory, 'exports-1.jsonl'),
+      JSON.stringify(row('1', 1, { dataBytes: blob.length, dataSha256: sha(blob) })) + '\n'
+    )
+    const consumed = new Set()
+    const observers = [1, 2].map(
+      () =>
+        new TelemetryWireObserver({
+          directory,
+          line: '4.3.1',
+          clock,
+          dial,
+          decoder: stubDecoder,
+          consumed,
+        })
+    )
+    try {
+      const pushes = []
+      for (const observer of observers) {
+        const socket = observer.socketFactory({
+          host: 'localhost',
+          port: 19092,
+          onConnect: jest.fn(),
+        })
+        socket.emit('connect')
+        send(socket, push72(1, blob))
+        receive(socket, push72Response(1))
+        pushes.push(observer.accepted()[0])
+      }
+      expect((await observers[0].decodeAccepted(pushes[0])).exportIdentity).toEqual({
+        node: '1',
+        seq: 1,
+      })
+      expect([...consumed]).toEqual(['1:1'])
+      await expect(observers[1].decodeAccepted(pushes[1], { sinkWaitMs: 60 })).rejects.toThrow(
+        'No unconsumed sink record matches'
+      )
+    } finally {
+      await Promise.allSettled(observers.map((observer) => observer.dispose()))
+    }
+  })
+})
+
+describe('telemetry profile', () => {
+  const { OBSERVER_LIMITS } = require('../telemetryFixtures')
+  const { SCHEDULES, TelemetrySegments, segmentCatalogue } = require('../telemetrySegments')
+  const { buildShutdownModel, writeShutdownArchive } = require('../segmentArchiveFixture')
+  const { verifyScenario } = require('../../scripts/e2e/telemetry/evidence')
+  let directory
+  let owners
+  let dial
+  const clock = (() => {
+    let tick = 0
+    return { now: () => ++tick }
+  })()
+  const segmentsFor = (scenario, kind) => {
+    const segments = TelemetrySegments.ordinary(scenario, kind, {
+      directory,
+      clock,
+      observer: { line: '4.3.1', dial, decoder: stubDecoder, mode: 'configured' },
+    })
+    owners.push(segments)
+    return segments
+  }
+  const open = (segments) => {
+    const socket = segments.socketFactory({ host: 'localhost', port: 19092, onConnect: jest.fn() })
+    socket.emit('connect')
+    return socket
+  }
+  const send = (socket, ...frames) => socket.write(Buffer.concat(frames))
+  const receive = (socket, ...frames) => socket.emit('data', Buffer.concat(frames))
+  const client = (segments, order = []) => {
+    const fake = {
+      sockets: [open(segments)],
+      disconnect: jest.fn(async function disconnect() {
+        order.push(`disconnect:${segments.current().id}`)
+        for (const socket of this.sockets.splice(0)) socket.emit('close')
+        setImmediate(() => order.push('immediate'))
+      }),
+      connect: jest.fn(function connect() {
+        order.push('connect')
+        this.sockets.push(open(segments))
+        return Promise.resolve()
+      }),
+    }
+    return fake
+  }
+  const rotate = async (segments, fake) => {
+    const cycle = segments.cycle(fake)
+    await Promise.all([cycle.closed, cycle.reopened])
+    return cycle
+  }
+  const messages = (error) => [error.message, ...(error.errors ?? []).flatMap(messages)]
+  const copyTree = (from, to) => {
+    for (const entry of fs.readdirSync(from, { withFileTypes: true })) {
+      const source = path.join(from, entry.name)
+      const target = path.join(to, entry.name)
+      if (entry.isDirectory()) {
+        fs.mkdirSync(target)
+        copyTree(source, target)
+      } else fs.copyFileSync(source, target)
+    }
+  }
+  const healthy = (observer) => {
+    observer.assertHealthy()
+  }
+
+  beforeEach(() => {
+    directory = fs.mkdtempSync(path.join(os.tmpdir(), 'telemetry-profile-'))
+    owners = []
+    dial = jest.fn(({ port }) => fakeSocket(port))
+  })
+  afterEach(async () => {
+    await Promise.allSettled(
+      owners.flatMap((owner) => owner.undischarged().map((segment) => segment.observer?.dispose()))
+    )
+    fs.rmSync(directory, { recursive: true, force: true })
+  })
+
+  test('keeps observation segments bounded', async () => {
+    expect(OBSERVER_LIMITS).toMatchObject({ sockets: 64, records: 4096, retained: 2 * 1024 * 1024 })
+
+    // The three observer caps are exact: the last allowed item passes, the next one latches.
+    const sockets = segmentsFor('telemetry-shutdown', 'producer')
+    const crowded = sockets.current().observer
+    const held = Array.from({ length: 64 }, () => open(sockets))
+    expect(() => healthy(crowded)).not.toThrow()
+    held.push(open(sockets))
+    expect(() => healthy(crowded)).toThrow('Observer socket bound exceeded')
+    for (const socket of held) socket.emit('close')
+    const refused = await sockets.discharge(sockets.current(), { force: true }).catch((e) => e)
+    expect(messages(refused)).toContain('Observer socket bound exceeded')
+
+    const records = segmentsFor('telemetry-shutdown', 'consumer')
+    const wire = open(records)
+    for (let index = 1; index <= 4095; index++) {
+      send(wire, metadata(index))
+      receive(wire, metadataResponse(index))
+    }
+    expect(records.current().observer.checkpoint()).toBe(4096)
+    expect(() => healthy(records.current().observer)).not.toThrow()
+    send(wire, metadata(4096))
+    expect(() => healthy(records.current().observer)).toThrow('Observer record bound exceeded')
+
+    const bytes = segmentsFor('telemetry-shutdown', 'admin')
+    const heavy = open(bytes)
+    const big = Buffer.alloc(4096)
+    for (let index = 1; index <= 504; index++) {
+      send(heavy, push72(index, big))
+      receive(heavy, push72Response(index, 42))
+    }
+    expect(() => healthy(bytes.current().observer)).not.toThrow()
+    send(heavy, push72(505, big))
+    expect(() => healthy(bytes.current().observer)).toThrow('Observer retained-byte bound exceeded')
+
+    // Routing precedes the close, connect follows the close continuation, and the limits hold.
+    const l9 = segmentsFor('telemetry-churn', 'producer')
+    const order = []
+    const fake = client(l9, order)
+    const cycle = l9.cycle(fake)
+    expect(l9.current().id).toBe('producer-lc-1')
+    await Promise.all([cycle.closed, cycle.reopened])
+    expect(order).toEqual(['disconnect:producer-lc-1', 'connect', 'immediate'])
+    expect(() => l9.cycle(fake)).toThrow('Two undischarged observer segments exist')
+    await expect(l9.discharge(l9.current())).rejects.toThrow('is still active')
+    await l9.discharge(cycle.from)
+    for (let round = 2; round < 16; round++) await l9.discharge((await rotate(l9, fake)).from)
+    expect(() => l9.cycle(fake)).toThrow('Segment cap of 16')
+    expect(SCHEDULES['telemetry-churn'].perKind).toBe(7)
+    await expect(l9.finish(fake)).rejects.toThrow('Expected 7 segments, found 16')
+
+    // The fixed catalogues, then a complete archive that proves them.
+    const catalogue = segmentCatalogue('telemetry-shutdown')
+    expect(catalogue).toHaveLength(88)
+    for (const kind of ['producer', 'consumer', 'admin', 'share'])
+      expect(catalogue.filter((id) => id.startsWith(`${kind}-ep-`))).toHaveLength(21)
+    expect(catalogue.filter((id) => id.endsWith('-t0') || id.endsWith('-bh'))).toHaveLength(4)
+    const model = buildShutdownModel()
+    const archive = writeShutdownArchive(model)
+    const verify = ({ record, directory: root }) => verifyScenario(record, root)
+    expect(() => verify(archive)).not.toThrow()
+    const keyed = (id) =>
+      model.segments.get(id).transcript.records.filter((r) => r.type === 'request')[0].requestKey
+    expect(keyed('producer-ep-3')).toBe(keyed('producer-ep-4'))
+    expect(archive.record.sidecars.files.length).toBeLessThanOrEqual(512)
+
+    const copies = []
+    const copy = () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'telemetry-profile-copy-'))
+      copies.push(root)
+      copyTree(archive.directory, root)
+      return { directory: root, record: JSON.parse(JSON.stringify(archive.record)) }
+    }
+    const rewrite = (target, suffix, transform) => {
+      const item = target.record.sidecars.files.find((f) => f.path.endsWith(suffix))
+      const file = path.join(target.directory, item.path)
+      const next = Buffer.from(transform(fs.readFileSync(file)))
+      fs.writeFileSync(file, next)
+      item.bytes = next.length
+      item.sha256 = sha(next)
+    }
+    const json = (target, suffix, change) =>
+      rewrite(target, suffix, (bytes) => JSON.stringify(change(JSON.parse(bytes)) ?? undefined))
+    const edit = (target, id, part, change) => {
+      const suffix = part === 'transcript' ? `${id}.transcript.json` : `${id}.bundle.jsonl`
+      if (part === 'transcript')
+        rewrite(target, suffix, (bytes) => {
+          const value = JSON.parse(bytes)
+          change(value)
+          return JSON.stringify(value)
+        })
+      else
+        rewrite(target, suffix, (bytes) =>
+          change(
+            bytes
+              .toString('utf8')
+              .split('\n')
+              .filter(Boolean)
+              .map((line) => JSON.parse(line))
+          )
+            .map((item) => JSON.stringify(item) + '\n')
+            .join('')
+        )
+    }
+    const entries = (target, change) => {
+      change(target.record.sidecars.segments)
+      json(target, '/index.json', (index) => {
+        index.segments = target.record.sidecars.segments
+        return index
+      })
+    }
+    const accepted = (id) =>
+      model.segments
+        .get(id)
+        .transcript.records.filter((r) => r.apiKey === 72 && r.response?.errorCode === 0)
+    const cases = [
+      [
+        'a missing segment',
+        'Required segment catalogue differs',
+        (t) =>
+          entries(t, (list) =>
+            list.splice(
+              list.findIndex((e) => e.id === 'producer-ep-7'),
+              1
+            )
+          ),
+      ],
+      [
+        'an extra segment',
+        'Required segment catalogue differs',
+        (t) =>
+          entries(t, (list) => {
+            list.push({ ...list.find((e) => e.id === 'producer-ep-3'), id: 'producer-ep-21' })
+          }),
+      ],
+      [
+        'a swapped segment file',
+        'Segment owner differs for producer-ep-3',
+        (t) => {
+          const other = fs.readFileSync(
+            path.join(t.directory, t.record.sidecars.root, 'segments/producer-ep-4.transcript.json')
+          )
+          rewrite(t, 'producer-ep-3.transcript.json', () => other)
+        },
+      ],
+      [
+        'a reused segment path',
+        'Segment path does not belong to its identity',
+        (t) =>
+          entries(t, (list) => {
+            const [a, b] = ['producer-ep-5', 'producer-ep-6'].map((id) =>
+              list.find((e) => e.id === id)
+            )
+            b.bundle = a.bundle
+          }),
+      ],
+      [
+        'a missing proof',
+        'Missing proof',
+        (t) => {
+          let dropped = false
+          edit(t, 'producer-ep-5', 'bundle', (lines) =>
+            lines.filter((item) => item.t !== 'proof' || dropped || !(dropped = true))
+          )
+        },
+      ],
+      [
+        'an altered payload',
+        'differs from its bundle entry',
+        (t) =>
+          edit(t, 'consumer-ep-2', 'bundle', (lines) =>
+            lines.map((item) => (item.t === 'push' ? { ...item, b64: 'AA==' } : item))
+          ),
+      ],
+      [
+        'an extra payload',
+        'payload catalogue differs from its requests',
+        (t) =>
+          edit(t, 'admin-ep-2', 'bundle', (lines) => [
+            ...lines,
+            { ...lines.find((item) => item.t === 'push'), key: 'r999' },
+          ]),
+      ],
+      [
+        'a reused sink row',
+        'Reused sink record',
+        (t) => {
+          const taken = accepted('producer-ep-1')[0]
+          const source = model.segments.get('producer-ep-1').decoded.get(taken.requestKey)
+          edit(t, 'share-ep-1', 'bundle', (lines) =>
+            lines.map((item) =>
+              item.t === 'proof' && item.key === accepted('share-ep-1')[0].requestKey
+                ? { ...item, decoded: { ...item.decoded, exportIdentity: source.exportIdentity } }
+                : item
+            )
+          )
+        },
+      ],
+      [
+        'a truncated sink',
+        'Missing sink record',
+        (t) =>
+          rewrite(
+            t,
+            'exports-1.jsonl',
+            (bytes) => bytes.toString('utf8').trimEnd().split('\n').slice(0, -1).join('\n') + '\n'
+          ),
+      ],
+      [
+        'a reset sink cursor',
+        'Telemetry sink sequence or node mismatch',
+        (t) =>
+          rewrite(
+            t,
+            'exports-1.jsonl',
+            (bytes) =>
+              bytes
+                .toString('utf8')
+                .trimEnd()
+                .split('\n')
+                .map((line, index) => (index === 2 ? line.replace('"seq":3', '"seq":1') : line))
+                .join('\n') + '\n'
+          ),
+      ],
+      [
+        'a missing final',
+        'Expected exactly one final at close',
+        (t) => {
+          const [final] = accepted('producer-ep-2').filter((r) => r.terminating)
+          edit(t, 'producer-ep-2', 'transcript', (value) => {
+            value.records = value.records.filter((r) => r.requestKey !== final.requestKey)
+          })
+          edit(t, 'producer-ep-2', 'bundle', (lines) =>
+            lines.filter((item) => item.key !== final.requestKey)
+          )
+          t.record.pushes = t.record.pushes.filter(
+            (p) => !(p.owner === 'producer-ep-2' && p.requestKey === final.requestKey)
+          )
+        },
+      ],
+      [
+        'a swapped round join',
+        'Round segments differ from the schedule',
+        (t) => {
+          t.record.results.rounds.producer[4].to = 'producer-ep-9'
+        },
+      ],
+      [
+        'a connect that was not the next public action',
+        'Connect was not the next public action',
+        (t) => {
+          t.record.results.journal.admin[2].seq += 1
+        },
+      ],
+      [
+        'a segment selected after the close resolved',
+        'The next segment was not selected before the close resolved',
+        (t) => {
+          const notes = t.record.results.journal.share
+          ;[notes[0].seq, notes[1].seq] = [notes[1].seq, notes[0].seq]
+        },
+      ],
+      [
+        'a later cache miss in the episode',
+        'Expected one exact connection retirement, found 0',
+        (t) =>
+          json(t, 'oracles.json', (oracles) => {
+            const { chunks } = oracles.traces
+            const id = /Removing client connection id \[([^\]]+)\]/.exec(
+              chunks[1].logs['1'].text
+            )[1]
+            chunks.at(-1).logs['1'].text +=
+              `\nTRACE Client connection id [${id}] is not found in the client instance cache`
+            return oracles
+          }),
+      ],
+      [
+        'an overspent cleanup',
+        'Cleanup exceeded its budget',
+        (t) => {
+          t.record.timing.cleanupMs = 20001
+        },
+      ],
+      [
+        'an overspent work deadline',
+        'The work exceeded its deadline',
+        (t) => {
+          t.record.results.workMs = 98001
+        },
+      ],
+      [
+        'a surviving event-loop resource',
+        'Quiet resources differ',
+        (t) => {
+          t.record.results.resources.final.activeResources = { Timeout: 3 }
+        },
+      ],
+      [
+        'an omitted resource source',
+        'Required resource source catalogue differs',
+        (t) => {
+          delete t.record.results.resources.baseline.identities.openSockets
+        },
+      ],
+      [
+        'a missing format version',
+        'Missing segmented evidence format',
+        (t) => {
+          delete t.record.sidecars.format
+        },
+      ],
+      [
+        'more files than the archive allows',
+        'Invalid sidecar count',
+        (t) => {
+          t.record.sidecars.files = [
+            ...t.record.sidecars.files,
+            ...Array.from({ length: 400 }, () => t.record.sidecars.files[0]),
+          ]
+        },
+      ],
+    ]
+    try {
+      for (const [name, diagnostic, change] of cases) {
+        const target = copy()
+        change(target)
+        let thrown
+        try {
+          verify(target)
+        } catch (error) {
+          thrown = error
+        }
+        expect({ name, message: thrown?.message }).toEqual({
+          name,
+          message: expect.stringContaining(diagnostic),
+        })
+      }
+    } finally {
+      for (const root of copies) fs.rmSync(root, { recursive: true, force: true })
+    }
+
+    // A sink that shrinks below a held cursor is refused by the reader; overflow fails the archive.
+    const sink = path.join(directory, 'exports-1.jsonl')
+    fs.writeFileSync(
+      sink,
+      [row('1', 1), row('1', 2), row('1', 3)].map((r) => JSON.stringify(r) + '\n').join('')
+    )
+    const reader = new TelemetryExportReader(directory)
+    const cursor = reader.checkpoint()
+    expect(cursor[1]).toBe(3)
+    fs.writeFileSync(sink, JSON.stringify(row('1', 1)) + '\n')
+    expect(() => reader.readExports({ after: cursor })).toThrow('replaced after cursor')
+    const bloated = buildShutdownModel()
+    bloated.padding = 17 * 1024 * 1024
+    expect(() => writeShutdownArchive(bloated)).toThrow('Sidecar archive exceeds bound')
+    fs.rmSync(archive.directory, { recursive: true, force: true })
+    expect(SCHEDULES['telemetry-shutdown'].cap).toBe(21)
+  }, 180000)
 })

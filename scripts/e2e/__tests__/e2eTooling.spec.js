@@ -2088,3 +2088,128 @@ describe('telemetry churn evidence', () => {
     expect(() => verifyEvidence('telemetry-nonexistent', '/', [])).toThrow('Unknown telemetry lane')
   })
 })
+
+describe('segmented evidence in the cleanup manifest', () => {
+  const crypto = require('crypto')
+  const { CiOwnership } = require('../telemetry/ci')
+  const { verifyCleanup } = require('../telemetry/evidence')
+  const { SEGMENT_FORMAT, segmentCatalogue } = require('../../../testHelpers/telemetrySegments')
+  let root
+  let owner
+  const sha = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex')
+  const archive = (
+    segments = segmentCatalogue('telemetry-shutdown').length,
+    format = SEGMENT_FORMAT
+  ) => {
+    const dir = path.join(owner.directory, 'case-telemetry-shutdown-abc')
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(
+      path.join(dir, 'index.json'),
+      JSON.stringify({
+        format,
+        scenario: 'telemetry-shutdown',
+        segments: Array.from({ length: segments }, (_, index) => ({ id: `s${index}` })),
+      })
+    )
+    const record = { sidecars: { format, root: 'case-telemetry-shutdown-abc' } }
+    fs.writeFileSync(
+      path.join(path.dirname(owner.receiptFile), 'telemetry-shutdown.jsonl'),
+      JSON.stringify(record) + '\n'
+    )
+  }
+  const finalize = () => {
+    const receipt = {
+      project: owner.project,
+      compose: owner.file,
+      preflightPassed: true,
+      removalVerified: true,
+      journalComplete: true,
+      startedAt: 'start',
+      removalProof: { containers: [], networks: [], volumes: [] },
+      ownedRemovalProof: { containers: [], networks: [], volumes: [] },
+    }
+    owner.save(receipt)
+    owner.finalize(receipt)
+    return JSON.parse(fs.readFileSync(path.join(owner.directory, 'cleanup-manifest.json')))
+  }
+  const verify = () =>
+    verifyCleanup(owner.directory, path.dirname(owner.receiptFile), owner.project)
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'segment-manifest-'))
+    owner = new CiOwnership({
+      env: {
+        CI: 'true',
+        COMPOSE_PROJECT_NAME: 'telemetry-1-1-1',
+        COMPOSE_FILE: 'docker-compose.telemetry.yml',
+        TELEMETRY_EVIDENCE_DIR: path.join(root, 'sink'),
+        KAFKA_VERSION: '4.3.1',
+      },
+      docker: () => '',
+    })
+    owner.receiptFile = path.join(root, 'stamps', 'ownership.json')
+    fs.mkdirSync(owner.directory, { recursive: true })
+  })
+  afterEach(() => fs.rmSync(root, { recursive: true, force: true }))
+
+  test('names every segment index with its digest, format and count', () => {
+    archive()
+    const manifest = finalize()
+    const bytes = fs.readFileSync(
+      path.join(owner.directory, 'case-telemetry-shutdown-abc/index.json')
+    )
+    expect(manifest.segmented).toEqual([
+      {
+        path: 'case-telemetry-shutdown-abc/index.json',
+        bytes: bytes.length,
+        sha256: sha(bytes),
+        format: SEGMENT_FORMAT,
+        scenario: 'telemetry-shutdown',
+        segments: 88,
+      },
+    ])
+    expect(() => verify()).not.toThrow()
+  })
+
+  test('lists no index for a run without segmented archives', () => {
+    expect(finalize().segmented).toEqual([])
+    expect(() => verify()).not.toThrow()
+  })
+
+  test.each([
+    [
+      'a stamped segmented record whose index the manifest omits',
+      'Segment index catalogue differs',
+      (manifest) => {
+        manifest.segmented = []
+      },
+    ],
+    [
+      'an index that changed after it was listed',
+      'Segment index digest differs',
+      (manifest) => {
+        manifest.segmented[0].sha256 = 'f'.repeat(64)
+      },
+    ],
+    [
+      'an index of another format',
+      'Segment index format differs',
+      (manifest) => {
+        manifest.segmented[0].format = 'legacy'
+      },
+    ],
+    [
+      'an index with fewer segments than the schedule',
+      'Segment index count differs from the schedule',
+      (manifest) => {
+        manifest.segmented[0].segments = 87
+      },
+    ],
+  ])('rejects %s', (_name, diagnostic, change) => {
+    archive()
+    const manifest = finalize()
+    change(manifest)
+    fs.writeFileSync(path.join(owner.directory, 'cleanup-manifest.json'), JSON.stringify(manifest))
+    expect(() => verify()).toThrow(diagnostic)
+  })
+})

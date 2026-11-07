@@ -256,6 +256,52 @@ const DEFAULT_LIMITS = Object.freeze({
 })
 
 /**
+ * Counting limiter for the independent decoder children of every observer that shares it.
+ */
+class DecoderGate {
+  #limit
+  #running = 0
+  #queue = []
+
+  /**
+   * @param {number} limit most tasks running at once
+   * @throws {Error} for a limit that is not a positive integer
+   */
+  constructor(limit) {
+    if (!Number.isSafeInteger(limit) || limit < 1)
+      throw new Error('Expected a positive decoder concurrency')
+    this.#limit = limit
+  }
+
+  /** @returns {{running:number,queued:number}} current occupancy */
+  occupancy() {
+    return { running: this.#running, queued: this.#queue.length }
+  }
+
+  /**
+   * @template T
+   * @param {function():Promise<T>} task started once a slot is free
+   * @returns {Promise<T>} the task's own outcome
+   */
+  run(task) {
+    return new Promise((resolve, reject) => {
+      const start = () => {
+        this.#running++
+        Promise.resolve()
+          .then(task)
+          .then(resolve, reject)
+          .finally(() => {
+            this.#running--
+            this.#queue.shift()?.()
+          })
+      }
+      if (this.#running < this.#limit) start()
+      else this.#queue.push(start)
+    })
+  }
+}
+
+/**
  * Bounds-checked big-endian reader over one captured frame.
  */
 class WireCursor {
@@ -605,6 +651,7 @@ class TelemetryWireObserver {
   #faults = []
   #cancellations = []
   #completeStream
+  #gate
   #captureTail = Promise.resolve()
 
   /**
@@ -620,6 +667,9 @@ class TelemetryWireObserver {
    * @param {function(Buffer, number):Promise<object>} [options.decoder] decoder seam for controls
    * @param {string} [options.decoderScript] runner script, `scripts/e2e/telemetry/run.sh` by default
    * @param {object} [options.env] environment of the decoder child
+   * @param {DecoderGate} [options.gate] shared limiter on concurrently running decoder children
+   * @param {Set<string>} [options.consumed] sink identities (`node:seq`) already joined to a Push;
+   *   share one set across observers so a sink row is consumed once for the whole run
    * @throws {Error} for a relative directory, unsupported line/mode or invalid clock
    */
   constructor({
@@ -634,6 +684,8 @@ class TelemetryWireObserver {
     completeStream = false,
     decoderScript = DECODER_SCRIPT,
     env = process.env,
+    gate,
+    consumed,
   }) {
     if (typeof directory !== 'string' || !path.isAbsolute(directory))
       throw new Error('Expected an absolute observer directory')
@@ -643,6 +695,8 @@ class TelemetryWireObserver {
     if (!allowed) throw new Error('Unsupported broker line for the observer')
     if (typeof clock?.now !== 'function') throw new Error('Expected a monotonic clock')
     this.#completeStream = completeStream
+    this.#gate = gate
+    if (consumed) this.#consumed = consumed
     this.#clock = clock
     this.#endpoints = ENDPOINTS[mode]
     this.#dial = dial
@@ -720,6 +774,16 @@ class TelemetryWireObserver {
   /** @returns {string[]} exact unanswered request identities qualified by close or fault evidence */
   cancellationKeys() {
     return this.#cancellations.map((r) => r.requestKey)
+  }
+
+  /** @returns {number} issued client sockets that have not closed yet */
+  openSockets() {
+    return [...this.#sockets.values()].filter((state) => !state.closed).length
+  }
+
+  /** @returns {Promise<void>} once every socket issued so far has closed */
+  async socketsClosed() {
+    await Promise.all([...this.#sockets.values()].map((state) => state.closedPromise))
   }
 
   /**
@@ -935,7 +999,19 @@ class TelemetryWireObserver {
    * @returns {Promise<object>} the decoded body, after the runner's identity line verified
    * @throws {Error} for missing cache, timeout, nonzero exit, malformed output or a surviving group
    */
-  async decodeRaw(raw, { budgetMs = 3000 } = {}) {
+  decodeRaw(raw, options) {
+    return this.#gate
+      ? this.#gate.run(() => this.#decodeRaw(raw, options))
+      : this.#decodeRaw(raw, options)
+  }
+
+  /**
+   * @param {Buffer} raw decompressed MetricsData of at most 4096 bytes
+   * @param {{budgetMs?:number}} [options] total budget
+   * @returns {Promise<object>} the decoded body
+   * @throws {Error} for any decoder failure
+   */
+  async #decodeRaw(raw, { budgetMs = 3000 } = {}) {
     if (this.#decoder) return this.#decoder(raw, budgetMs)
     const cache = this.#env.TELEMETRY_JAVA_CACHE
     if (!cache) throw new Error('TELEMETRY_JAVA_CACHE is required for independent decoding')
@@ -1630,6 +1706,8 @@ const verifyMetricWindows = ({ kind, samples, requests, connects, delta }) => {
 
 module.exports = {
   canonicalUuid,
+  DecoderGate,
+  OBSERVER_LIMITS: DEFAULT_LIMITS,
   verifyMetricWindows,
   TelemetryExportReader,
   TelemetryWireObserver,
