@@ -118,6 +118,39 @@ const confirmedDecisions = (frames, group) =>
   })
 
 /**
+ * Retains successful raw acquisition ranges with their topic and partition identities.
+ * @param {object[]} frames original same-socket request/response frames
+ * @param {string} group owning group
+ * @returns {object[]} independently acquired ranges, including duplicates
+ * @throws {Error} for correlation mismatch or malformed frames
+ */
+const heldAcquisitions = (frames, group) =>
+  frames.flatMap((frame) => {
+    if (!frame.responseHex) return []
+    const bytes = Buffer.from(frame.requestHex, 'hex')
+    const header = readRequestHeader(bytes)
+    if (header.apiKey !== 78) return []
+    const request = fetch.readRequest(bytes.subarray(header.byteLength))
+    if (request.groupId !== group) return []
+    const reply = Buffer.from(frame.responseHex, 'hex')
+    assert.equal(reply.readInt32BE(4), header.correlationId)
+    const response = acknowledgementResponse(78, reply)
+    if (response.errorCode !== 0) return []
+    return response.topics.flatMap((topic) =>
+      topic.partitions.flatMap((partition) => {
+        if (partition.errorCode !== 0) return []
+        return partition.acquired.map((range) => ({
+          ...range,
+          topicId: topic.topicId,
+          partition: partition.partitionIndex,
+          at: frame.at,
+          lockMs: response.acquisitionLockTimeoutMs,
+        }))
+      })
+    )
+  })
+
+/**
  * Supplies a conservative lock origin before the broker could acquire the held records.
  * @param {object[]} frames original requests and responses
  * @param {string} group owning share group
@@ -216,4 +249,4 @@ class ShareTrace {
   }
 }
 
-module.exports = { ShareTrace, confirmedDecisions, acquisitionStart }
+module.exports = { ShareTrace, confirmedDecisions, acquisitionStart, heldAcquisitions }

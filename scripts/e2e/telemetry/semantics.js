@@ -29,15 +29,112 @@ const assertCadence = (requests, completion, interval) => {
 }
 
 /**
+ * Supplies resource expectations from the fixture's explicit Properties and public group metadata.
+ * Kafka 4.3.1 ClientTelemetryProvider uses original configuration, so rack, static member and
+ * transaction fields are absent here. AbstractCoordinator adds group_member_id after JoinGroup;
+ * a poll that changes membership brackets that transition independently of telemetry rows.
+ * @param {string} role Java role
+ * @param {string} group configured consumer group
+ * @param {object[]} membership public groupMetadata observations bracketing each consumer poll
+ * @param {string} timeNs metric collection epoch, never broker receive time
+ * @returns {Array<Array>} exact permitted catalogues during that source-qualified transition
+ * @throws {Error} for missing or inconsistent consumer observations
+ */
+const javaResources = (role, group, membership, timeNs) => {
+  assert(['producer', 'consumer', 'admin'].includes(role))
+  if (role !== 'consumer') return [[]]
+  assert(typeof group === 'string' && group.length > 0)
+  assert(membership.length > 0, 'Missing public Java membership observations')
+  assert(
+    membership.some((r) => r.memberId.length > 0),
+    'Java consumer never joined'
+  )
+  let member = ''
+  const time = Number(BigInt(timeNs) / 1000000n)
+  const base = [['group_id', 'string', group]]
+  const catalogue = (id) => (id ? [...base, ['group_member_id', 'string', id]] : [...base])
+  for (const observation of membership) {
+    assert.equal(observation.membership, true)
+    assert(
+      Number.isSafeInteger(observation.fromEpochMs) &&
+        observation.epochMs >= observation.fromEpochMs
+    )
+    assert.equal(observation.beforeMemberId, member)
+    assert.equal(typeof observation.memberId, 'string')
+    if (time < observation.fromEpochMs) return [catalogue(member)]
+    if (time <= observation.epochMs) return [catalogue(member), catalogue(observation.memberId)]
+    member = observation.memberId
+  }
+  assert(member, 'Java consumer never joined')
+  return [catalogue(member)]
+}
+
+/**
+ * Requires the common connection counter on every JS interop export, including finals.
+ * @param {string} kind public JS kind
+ * @param {object} decoded complete independently decoded metric tree
+ * @returns {void}
+ * @throws {Error} for a missing, duplicate or altered counter or series
+ */
+const assertJsCounter = (kind, decoded) => {
+  const counter = `org.apache.kafka.${kind === 'share' ? 'consumer' : kind}.connection.creation.total`
+  const metrics = decoded.metrics.filter((m) => m.name === counter)
+  assert.equal(metrics.length, 1, 'Missing or duplicate JS common counter')
+  const [metric] = metrics
+  assert.equal(metric.kind, 'SUM')
+  assert.equal(metric.unit, '1')
+  assert.equal(metric.monotonic, true)
+  assert.equal(metric.temporality, 'AGGREGATION_TEMPORALITY_DELTA')
+  assert.equal(metric.pointsInMessage, metric.points.length)
+  assert.equal(metric.points.length, 1)
+  const identities = metric.points.map((p) => JSON.stringify([...p.attrs].sort()))
+  assert.equal(new Set(identities).size, identities.length, 'Duplicate JS counter series')
+  for (const point of metric.points) {
+    assert.deepEqual(point.attrs, [])
+    assert.equal(point.valueKind, 'AS_INT')
+    assert(BigInt(point.asInt) >= 0n)
+    assert(BigInt(point.startNs) <= BigInt(point.timeNs) && BigInt(point.timeNs) > 0n)
+    assert.equal(point.flags, 0)
+  }
+}
+
+/**
+ * Checks custom cardinalities and identities before any name-to-point projection.
+ * @param {object} decoded complete snapshot
+ * @param {string[]} names independently required metric names for this lifecycle window
+ * @returns {void}
+ * @throws {Error} for duplicate metrics/series, missing resources or incomplete point counts
+ */
+const assertCustomShape = (decoded, names) => {
+  assert.equal(decoded.resourceMetricsCount, 1)
+  assert.equal(decoded.resources.length, 1)
+  assert.equal(decoded.resources[0].droppedAttributes, 0)
+  assert.equal(decoded.metricsTotal, names.length)
+  assert.equal(decoded.metricsKept, names.length)
+  assert.equal(decoded.pointsTotal, names.length)
+  assert.deepEqual(
+    decoded.metrics.map((m) => m.name).sort(),
+    [...names].sort(),
+    'Custom metric catalogue differs'
+  )
+  for (const metric of decoded.metrics) {
+    assert.equal(metric.res, 0)
+    assert.equal(metric.pointsInMessage, 1)
+    assert.equal(metric.points.length, 1)
+    assert.deepEqual(metric.points[0].attrs, [['series', 'string', 'live']])
+  }
+}
+
+/**
  * Validates every complete Java export, including the UUID-specific final in its close episode.
  * Broker sinks and Java markers use epoch milliseconds; receive times are never compared to them.
  * @param {string} role producer, consumer or admin
  * @param {object[]} rows all UUID-selected exports in time order
- * @param {object} episode clientId and literal closing/closed markers
+ * @param {object} episode clientId, closing/closed markers, configured group and public membership observations
  * @returns {void}
  * @throws {Error} for missing, extra, duplicate or altered semantics or missing close evidence
  */
-const assertJavaRows = (role, rows, { clientId, closing, closed }) => {
+const assertJavaRows = (role, rows, { clientId, closing, closed, group, membership = [] }) => {
   assert.equal(closing?.closing, true, 'Missing closing:true')
   assert.equal(closed?.closed, true, 'Missing closed:true')
   assert(Number.isSafeInteger(closing.epochMs) && closed.epochMs >= closing.epochMs)
@@ -64,24 +161,19 @@ const assertJavaRows = (role, rows, { clientId, closing, closed }) => {
     assert.equal(row.pointsTotal, 4)
     assert.equal(row.resources.length, 1)
     assert.equal(row.resources[0].droppedAttributes, 0)
-    assert.deepEqual(
-      row.resources[0].attrs,
-      rows[0].resources[0].attrs,
-      'Java resource catalogue changed'
-    )
     const attrs = row.resources[0].attrs
     assert.equal(new Set(attrs.map(([key]) => key)).size, attrs.length)
+    const expected = javaResources(role, group, membership, row.metrics[0].points[0].timeNs)
     assert(
-      attrs.every(
-        ([key, type]) =>
-          [
-            'client_rack',
-            'group_id',
-            'group_instance_id',
-            'group_member_id',
-            'transactional_id',
-          ].includes(key) && type === 'string'
-      )
+      expected.some((catalogue) => {
+        try {
+          assert.deepEqual([...attrs].sort(), catalogue.sort())
+          return true
+        } catch {
+          return false
+        }
+      }),
+      'Unexpected Java resource catalogue'
     )
     assert.deepEqual(
       row.metrics.map((metric) => metric.name).sort(),
@@ -89,6 +181,7 @@ const assertJavaRows = (role, rows, { clientId, closing, closed }) => {
       'Unexpected Java metric catalogue'
     )
     for (const metric of row.metrics) {
+      assert.equal(metric.unit, '', 'Unexpected Java descriptor unit')
       assert.equal(metric.pointsInMessage, 1)
       assert.equal(metric.res, 0)
       assert.equal(metric.points.length, 1)
@@ -140,4 +233,11 @@ const ordinaryOwnership = ({ records, sockets }) => {
   return [...new Set(roles)].sort()
 }
 
-module.exports = { assertCatalogue, assertCadence, assertJavaRows, ordinaryOwnership }
+module.exports = {
+  assertCatalogue,
+  assertCadence,
+  assertJavaRows,
+  assertJsCounter,
+  assertCustomShape,
+  ordinaryOwnership,
+}

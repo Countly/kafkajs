@@ -1428,7 +1428,7 @@ describe('Java telemetry role runner', () => {
     const fixture = path.join(root, 'scripts/e2e/telemetry')
     const digest = (file) => createHash('sha256').update(fs.readFileSync(file)).digest('hex')
     expect(digest(path.join(fixture, 'JavaTelemetryClient.java'))).toBe(
-      '22453ff50c260d8174d81112d3cc67b0c4ca516226aca2cd2c52fc30e61f523f'
+      'f56062b7ffde5abcc4a95d726da22a8a12f88b8bb60312fbd362241922abc0a4'
     )
     expect(digest(path.join(fixture, 'telemetryWireProbe.js'))).toBe(
       '139afdbec5034f7c1498b90306889fd918ae13097efee1ea9f435b03dcf9b1b1'
@@ -1800,6 +1800,7 @@ describe('complete telemetry evidence controls', () => {
       },
     ].map((m) => ({
       ...m,
+      unit: '',
       res: 0,
       pointsInMessage: 1,
       points: m.points.map((p) => ({ ...p, flags: 0 })),
@@ -1943,6 +1944,17 @@ describe('custom metric archive conclusions', () => {
       sample(40, { anchor: '1.0', negative: '-3.5' }),
       sample(50, { anchor: '1.0', negative: '-3.5', total: '1' }, '100'),
     ]
+    for (const sample of samples) {
+      Object.assign(sample.decoded, {
+        resourceMetricsCount: 1,
+        resources: [{ attrs: [], droppedAttributes: 0 }],
+        metricsTotal: sample.decoded.metrics.length,
+        metricsKept: sample.decoded.metrics.length,
+        pointsTotal: sample.decoded.metrics.length,
+      })
+      for (const metric of sample.decoded.metrics)
+        Object.assign(metric, { res: 0, pointsInMessage: 1 })
+    }
     const results = {
       firstRequestKey: 'r10',
       update: { updateFence: 15, requestKeys: ['r20', 'r30'], states: ['updated', 'following'] },

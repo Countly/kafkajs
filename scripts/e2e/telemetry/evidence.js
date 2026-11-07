@@ -8,8 +8,15 @@ const {
   verifyMetricWindows,
 } = require('../../../testHelpers/telemetryFixtures')
 
-const { assertCatalogue, assertCadence, assertJavaRows, ordinaryOwnership } = require('./semantics')
-const { confirmedDecisions, acquisitionStart } = require('./shareEvidence')
+const {
+  assertCatalogue,
+  assertCadence,
+  assertJavaRows,
+  assertJsCounter,
+  assertCustomShape,
+  ordinaryOwnership,
+} = require('./semantics')
+const { confirmedDecisions, acquisitionStart, heldAcquisitions } = require('./shareEvidence')
 const { cacheRetirement } = require('./cacheTrace')
 
 const sha = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex')
@@ -25,6 +32,9 @@ const LIVE = Object.freeze([
   'telemetry-shutdown',
 ])
 const UNSUPPORTED = 'telemetry-unsupported'
+const JAVA_ROLES = ['producer', 'consumer', 'admin']
+const FAULT_MODES = ['drop', 'blackhole', 'late']
+const ZERO_TIMEOUT_KINDS = ['producer', 'consumer', 'share']
 
 /** @param {string} scenario selected case @returns {string} the only admitted wire-zero exception */
 const zeroDisposition = (scenario) => {
@@ -221,6 +231,97 @@ const persistEvidence = ({ name, record, directory, observers }) => {
 }
 
 /**
+ * Pins scenario dimensions from the fixture contract before any evidence-driven iteration.
+ * @param {object} record stamped scenario and independently selected broker mode
+ * @returns {string[]} required physical observer owners
+ * @throws {Error} for omitted, duplicate, foreign or inapplicable dimensions
+ */
+const requiredLiveCatalogue = (record) => {
+  const scenario = record.sidecars.scenario
+  const results = record.results
+  const exact = (value, keys, label) =>
+    assert.deepEqual(
+      Object.keys(value ?? {}).sort(),
+      [...keys].sort(),
+      `Required ${label} catalogue differs`
+    )
+  if (['telemetry-prefix', 'telemetry-custom'].includes(scenario)) return ['producer']
+  if (scenario === 'telemetry-payload') return ['producer-candidate']
+  if (scenario === 'telemetry-java') {
+    const roles = JAVA_ROLES
+    exact(results.java, roles, 'Java role')
+    exact(results.js, KINDS, 'JS role')
+    exact(results.uuids.java, roles, 'Java UUID')
+    exact(results.uuids.js, KINDS, 'JS UUID')
+    for (const role of roles) assert.equal(results.java[role].uuid, results.uuids.java[role])
+    for (const kind of KINDS) assert.equal(results.js[kind].uuid, results.uuids.js[kind])
+    return KINDS.map((kind) => `js-${kind}`)
+  }
+  if (scenario === 'telemetry-outcomes') {
+    assert(['4.3.1', '4.2.2', '4.1.2'].includes(record.run.line))
+    const configured = record.run.line !== '4.1.2'
+    assert.equal(record.mode, configured ? 'configured' : 'base')
+    const modes = configured ? FAULT_MODES : []
+    const arms = ['control', 'optin', ...modes]
+    exact(results.arms, arms, 'ordinary arm')
+    exact(results.faults, modes, 'fault mode')
+    for (const mode of modes) {
+      const faults = results.faults[mode]
+      assert(Array.isArray(faults))
+      assert.deepEqual(
+        faults.map((f) => f.owner).sort(),
+        [`${mode}-consumer`, `${mode}-producer`],
+        'Required fault owner catalogue differs'
+      )
+      assert(faults.every((f) => f.mode === mode))
+    }
+    if (!configured) {
+      exact(results.inapplicable, ['drop', 'blackhole', 'late'], 'inapplicable fault')
+      assert(Object.values(results.inapplicable).every((v) => v === 'absent telemetry transport'))
+      assert.deepEqual(results.share, {
+        status: 'rejected',
+        name: 'KafkaJSShareGroupsNotSupportedError',
+        reason: 'api-version-range',
+        apiKey: 78,
+        shareVersion: 0,
+      })
+    } else {
+      assert.equal(results.share?.recovery?.owner, 'share', 'Missing configured share recovery')
+      assert.equal(results.share.recovery.mode, 'drop')
+    }
+    return [...arms.flatMap((arm) => [`${arm}-producer`, `${arm}-consumer`]), 'share']
+  }
+  assert.equal(scenario, 'telemetry-shutdown')
+  exact(results.episodes, KINDS, 'shutdown episode')
+  const zero = ZERO_TIMEOUT_KINDS
+  exact(results.timeout0, zero, 'zero-timeout')
+  assert(results.blackhole && results.blackhole.uuid, 'Missing admin blackhole')
+  return [...KINDS.map((kind) => `${kind}-ep`), ...zero.map((kind) => `${kind}-t0`), 'admin-bh']
+}
+
+/**
+ * Requires one owner's accepted subscription and nonempty export for the claimed UUID.
+ * @param {object} transcript actual owner stream
+ * @param {string} uuid expected UUID
+ * @returns {void}
+ * @throws {Error} for a missing or foreign stream
+ */
+const assertOwnerUuid = (transcript, uuid) => {
+  assert(
+    transcript.records.some(
+      (r) => r.apiKey === 71 && r.response?.errorCode === 0 && r.response.uuid === uuid
+    ),
+    'Missing owner subscription'
+  )
+  assert(
+    transcript.records.some(
+      (r) => r.apiKey === 72 && r.uuid === uuid && r.metricsBytes > 0 && r.response?.errorCode === 0
+    ),
+    'Missing owner export'
+  )
+}
+
+/**
  * Verifies a single stamped scenario's entire sidecar catalogue, decode/sink/request joins,
  * independently observed arithmetic and natural cleanup. All referenced paths stay under the run.
  * @param {object} record stamped evidence with a sidecar manifest
@@ -298,16 +399,34 @@ const verifyScenario = (record, directory) => {
   const noPlugin = ['telemetry-reporter-no-plugin', UNSUPPORTED, 'telemetry-floor'].includes(
     manifest.scenario
   )
-  const ownerKeys =
-    manifest.scenario === 'telemetry-floor'
+  const ownerKeys = LIVE.includes(manifest.scenario)
+    ? requiredLiveCatalogue(record)
+    : manifest.scenario === 'telemetry-floor'
       ? ['producer', 'consumer', 'admin']
       : noPlugin
         ? [...KINDS, ...KINDS.map((k) => k + '-off')]
         : KINDS
-  if (LIVE.includes(manifest.scenario)) assert(Object.keys(manifest.owners).length > 0)
-  else assert.deepEqual(Object.keys(manifest.owners).sort(), ownerKeys.sort())
-  for (const relative of Object.values(manifest.owners)) {
+  assert.deepEqual(
+    Object.keys(manifest.owners).sort(),
+    [...ownerKeys].sort(),
+    'Required owner catalogue differs'
+  )
+  assert.equal(
+    new Set(Object.values(manifest.owners)).size,
+    ownerKeys.length,
+    'Reused owner stream'
+  )
+  for (const [owner, relative] of Object.entries(manifest.owners)) {
     const transcript = read(relative)
+    if (
+      ['telemetry-java', 'telemetry-outcomes', 'telemetry-shutdown'].includes(manifest.scenario)
+    ) {
+      const requests = transcript.records.filter((r) => r.type === 'request')
+      assert(
+        requests.length > 0 && requests.every((r) => r.clientId === `${record.run.stem}-${owner}`),
+        'Owner stream client identity differs'
+      )
+    }
     assert.deepEqual(transcript.failures, [])
     assert.deepEqual(transcript.cleanup, { children: 0, timers: 0, stillOpen: [], attached: 0 })
   }
@@ -541,21 +660,23 @@ const verifyScenario = (record, directory) => {
           if (!['4.0.2', '4.1.2'].includes(record.run.line))
             for (const owner of ['share', 'share-off']) {
               const share = oracles.share[owner]
-              assert.deepEqual(
-                share.handled.map((r) => r.key),
-                share.keys
+              verifyShareIdentity(
+                share,
+                `${record.run.stem}-share-work`,
+                share.keys.map((key) => ({ key, valueHex: Buffer.from(key).toString('hex') }))
               )
-              assert.deepEqual(
-                share.log.map((r) => r.key),
-                share.keys
-              )
-              assert(share.log.every((r) => r.key === r.value))
               const confirmed = confirmedDecisions(share.frames, share.group)
+              assert.equal(confirmed.length, 10)
               assert.deepEqual(
                 confirmed.map((r) => r.offset).sort(),
                 Array.from({ length: 10 }, (_, i) => String(i))
               )
-              assert(confirmed.every((r) => r.type === 1 && r.partition === 0))
+              assert(
+                confirmed.every(
+                  (r) => r.type === 1 && r.partition === 0 && r.topicId === share.topicId
+                )
+              )
+              verifyPublicSettlements(share.settlements, share.topic, () => 'accept')
             }
         }
         if (manifest.scenario === 'telemetry-floor') {
@@ -584,8 +705,8 @@ const verifyScenario = (record, directory) => {
  * with an error the case declared for that owner, or an exact request-level cancellation joined
  * to its public-close boundary or one deliberately faulted exchange.
  * @param {Object<string,object>} transcripts observer transcript by owner label
- * @param {{errors?:Object<string,number[]>,faultedSockets?:Object<string,number[]>}} allowed the
- *   case's declared deliberate outcomes
+ * @param {{errors?:Object<string,number[]>}} allowed per-owner deliberate response errors; unanswered
+ *   requests require transcript cancellations joined to closures or declared request-level faults
  * @returns {void}
  * @throws {Error} naming the first undeclared error or unanswered request
  */
@@ -850,7 +971,13 @@ const verifyLive = (record, directory, manifest, read) => {
   )
   const oracles = read(`${manifest.root}/oracles.json`)
   const { results } = record
+  if (['telemetry-prefix', 'telemetry-custom', 'telemetry-payload'].includes(manifest.scenario))
+    assertOwnerUuid(
+      transcripts[manifest.scenario === 'telemetry-payload' ? 'producer-candidate' : 'producer'],
+      results.uuid
+    )
   if (manifest.scenario === 'telemetry-prefix') {
+    assert.equal(results.quiet.owner, 'producer')
     const { owner, from, to } = results.quiet
     const wire = transcripts[owner].records
     const noMatch = wire.find((r) => r.requestKey === results.noMatchGetKey)
@@ -991,14 +1118,41 @@ const verifyLive = (record, directory, manifest, read) => {
       if (rawBytes > 1000) assert.equal(compressionType, results.candidate.expectedCodec)
     }
   } else if (manifest.scenario === 'telemetry-java') {
+    for (const kind of KINDS) {
+      assertOwnerUuid(transcripts[`js-${kind}`], results.uuids.js[kind])
+      assert(
+        transcripts[`js-${kind}`].records.filter(
+          (r) =>
+            r.apiKey === 72 && !r.terminating && r.metricsBytes > 0 && r.response?.errorCode === 0
+        ).length >= 2,
+        'Too few JS interop exports'
+      )
+      for (const sample of Object.entries(samples)
+        .filter(([key]) => key.startsWith(`js-${kind}:`))
+        .map(([, value]) => value)) {
+        assert.equal(sample.request.uuid, results.uuids.js[kind])
+        assertJsCounter(kind, sample.decoded)
+      }
+    }
     for (const [role, java] of Object.entries(results.java)) {
+      assert.equal(java.assignedId, `${record.run.stem}-java-${role}`)
       const rows = reader.readExports({ uuid: java.uuid })
       assert(rows.filter((r) => !r.terminating).length >= 2, `Too few ${role} exports`)
       assert.equal(rows.filter((r) => r.terminating).length, 1, `Missing ${role} final`)
       assertJavaRows(
         role,
         rows.sort((a, b) => a.tsMs - b.tsMs || a.seq - b.seq),
-        { clientId: java.assignedId, closing: java.closing, closed: java.closed }
+        {
+          clientId: `${record.run.stem}-java-${role}`,
+          closing: java.closing,
+          closed: java.closed,
+          group: `${record.run.stem}-java-consumer-group`,
+          membership: java.stdout
+            .trim()
+            .split('\n')
+            .map(JSON.parse)
+            .filter((r) => r.membership === true),
+        }
       )
       assert.equal(java.exitCode, 0)
       assert.equal(java.exitSignal, null)
@@ -1027,11 +1181,52 @@ const verifyLive = (record, directory, manifest, read) => {
       7
     )
   } else if (manifest.scenario === 'telemetry-outcomes') {
+    assert.deepEqual(
+      Object.keys(oracles).sort(),
+      [
+        'control',
+        'optin',
+        ...(record.mode === 'configured' ? [...FAULT_MODES, 'share'] : []),
+      ].sort(),
+      'Required ordinary oracle catalogue differs'
+    )
     for (const [name, arm] of Object.entries(results.arms)) {
       assertCorpus(arm)
       verifyCorpusInputs(arm, oracles[name])
+      assert.deepEqual(
+        oracles[name].expected.map((r) => r.key).sort(),
+        Array.from(
+          { length: 1000 },
+          (_, i) => `${record.run.stem}-${name}-${String(i).padStart(4, '0')}`
+        ).sort(),
+        'Ordinary arm corpus identity differs'
+      )
+      for (const kind of ['producer', 'consumer']) {
+        const wire = transcripts[`${name}-${kind}`]
+        const ordinary = wire.records.filter(
+          (r) => r.type === 'request' && ![17, 18, 36, 71, 72].includes(r.apiKey)
+        )
+        assert(
+          ordinary.length > 0 &&
+            ordinary.every((r) => r.clientId === `${record.run.stem}-${name}-${kind}`),
+          'Missing ordinary arm work'
+        )
+        const requiredApis = kind === 'producer' ? [0] : [1, 8]
+        assert(
+          requiredApis.every((api) => ordinary.some((r) => r.apiKey === api)),
+          'Missing ordinary arm data or commit requests'
+        )
+        if (record.mode === 'base' || name === 'control') ordinaryOwnership(wire)
+        else {
+          const get = wire.records.find((r) => r.apiKey === 71 && r.response?.errorCode === 0)
+          assert(get, 'Missing opted-in arm subscription')
+          assertOwnerUuid(wire, get.response.uuid)
+        }
+      }
     }
-    if (record.run.composeSha256) verifyShare(results.share, oracles.share, transcripts)
+    if (record.mode === 'configured')
+      verifyShare(results.share, oracles.share, transcripts, `${record.run.stem}-share-topic`)
+    else ordinaryOwnership(transcripts.share)
     for (const recovery of Object.values(results.faults).flat())
       verifyRecovery(recovery, transcripts[recovery.owner])
     const [control, ...others] = Object.values(results.arms)
@@ -1040,6 +1235,11 @@ const verifyLive = (record, directory, manifest, read) => {
       assert.deepEqual(arm.rawEnd, control.rawEnd)
     }
   } else if (manifest.scenario === 'telemetry-shutdown') {
+    assert.deepEqual(
+      Object.keys(oracles).sort(),
+      [...KINDS].sort(),
+      'Required shutdown oracle catalogue differs'
+    )
     assert.deepEqual(
       results.restoredLevels,
       results.originalLevels,
@@ -1062,6 +1262,7 @@ const verifyLive = (record, directory, manifest, read) => {
     }
 
     for (const [kind, episode] of Object.entries(results.episodes)) {
+      assertOwnerUuid(transcripts[`${kind}-ep`], episode.before.uuid)
       assert.equal(episode.reopen.calledBeforeCacheAwait, true, `${kind} reopen was delayed`)
       assert.equal(episode.reopen.cachedUuid, episode.before.uuid)
       assert.equal(episode.reopen.get.requestUuid, episode.before.uuid)
@@ -1085,7 +1286,21 @@ const verifyLive = (record, directory, manifest, read) => {
         episode.before.serverConnectionIdentity
       )
     }
-    for (const zero of Object.values(results.timeout0)) assert.equal(zero.finalZeroTimeoutWrites, 0)
+    for (const [kind, zero] of Object.entries(results.timeout0)) {
+      const transcript = transcripts[`${kind}-t0`]
+      assertOwnerUuid(transcript, zero.uuid)
+      assert.equal(zero.finalZeroTimeoutWrites, 0)
+      assert(
+        !transcript.records.some((r) => r.apiKey === 72 && r.terminating),
+        'Zero-timeout final was written'
+      )
+    }
+    assertOwnerUuid(transcripts['admin-bh'], results.blackhole.uuid)
+    assert(
+      transcripts['admin-bh'].sockets.some(
+        (s) => s.id === results.blackhole.faultedSocket && Number.isFinite(s.closedAt)
+      )
+    )
   }
 }
 
@@ -1147,8 +1362,21 @@ const verifyCustom = (results, samples, transcript) => {
     assert(item, 'Missing custom Push')
     return item
   }
-  const points = (key) =>
-    Object.fromEntries(
+  const points = (key) => {
+    const index = sample(key).request.index
+    const names =
+      index <= results.removal.removeFence
+        ? ['anchor', 'negative', 'total', 'zero']
+        : index <= results.readded.readdFence
+          ? ['anchor', 'negative']
+          : index <= results.unregisterFence
+            ? ['anchor', 'negative', 'total']
+            : []
+    assertCustomShape(
+      sample(key).decoded,
+      names.map((name) => `com.example.${name}`)
+    )
+    return Object.fromEntries(
       sample(key).decoded.metrics.map((m) => {
         assert.equal(m.points.length, 1)
         assert.equal(m.unit, '1')
@@ -1166,6 +1394,7 @@ const verifyCustom = (results, samples, transcript) => {
         return [m.name.slice('com.example.'.length), m.points[0]]
       })
     )
+  }
   const first = points(results.firstRequestKey)
   assert.deepEqual(Object.keys(first).sort(), ['anchor', 'negative', 'total', 'zero'])
   assert.equal(first.anchor.asDouble, '1.0')
@@ -1263,6 +1492,8 @@ const verifyCustom = (results, samples, transcript) => {
  * @throws {Error} for an unexercised fault or invented replacement
  */
 const verifyRecovery = (recovery, transcript) => {
+  assert(recovery && transcript, 'Missing mandatory recovery')
+  assertOwnerUuid(transcript, recovery.uuid)
   const request = (key) => transcript.records.find((r) => r.requestKey === key)
   const injected = request(recovery.injectedPush)
   assert(recovery.attempted.apiKey === 72 && recovery.attempted.at >= recovery.injectedAt)
@@ -1296,63 +1527,149 @@ const verifyRecovery = (recovery, transcript) => {
 }
 
 /**
+ * Joins the created topic metadata, raw acquisitions, durable records and exact handler identities.
+ * @param {object} inputs independent share ledgers
+ * @param {string} topic independently configured topic name
+ * @param {object[]} expected pre-produced key/value corpus
+ * @returns {void}
+ * @throws {Error} for a foreign topic, incomplete acquisition or changed handler identity
+ */
+const verifyShareIdentity = (inputs, topic, expected) => {
+  assert.equal(inputs.topic, topic)
+  assert.deepEqual(
+    inputs.metadata.topics.map((t) => [t.name, t.topicId]),
+    [[topic, inputs.topicId]]
+  )
+  assert(/^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(inputs.topicId))
+  assert.notEqual(inputs.topicId, '00000000-0000-0000-0000-000000000000')
+  assert.equal(expected.length, 10)
+  const identities = expected.map(({ key }, index) => ({
+    topic,
+    partition: 0,
+    offset: String(index),
+    key,
+  }))
+  const projection = (rows) =>
+    rows.map(({ topic, partition, offset, key }) => ({ topic, partition, offset, key }))
+  assert.deepEqual(projection(inputs.log), identities, 'Share durable identities differ')
+  assert.deepEqual(
+    inputs.log.map((r) => r.valueHex),
+    expected.map((r) => r.valueHex)
+  )
+  assert.deepEqual(projection(inputs.handled), identities, 'Share handler identities differ')
+  const held = heldAcquisitions(inputs.frames, inputs.group)
+  assert.deepEqual(inputs.held, held, 'Contradicted held acquisition ranges')
+  const offsets = []
+  for (const range of held) {
+    assert.equal(range.topicId, inputs.topicId)
+    assert.equal(range.partition, 0)
+    const first = BigInt(range.firstOffset)
+    const last = BigInt(range.lastOffset)
+    assert(first >= 0n && last < 10n && last >= first)
+    for (let n = first; n <= last; n++) offsets.push(String(n))
+  }
+  assert.deepEqual(
+    offsets.sort(),
+    identities.map((r) => r.offset).sort(),
+    'Incomplete or duplicate held acquisitions'
+  )
+}
+
+/**
+ * Requires one public settlement per exact topic/partition/offset, without discarding duplicates.
+ * @param {object[]} settlements public events
+ * @param {string} topic owned topic name
+ * @param {function(number):string} type independently required decision
+ * @returns {void}
+ * @throws {Error} for extra, duplicate, foreign or incorrect public outcomes
+ */
+const verifyPublicSettlements = (settlements, topic, type) => {
+  const offsets = Array.from({ length: 10 }, () => [])
+  for (const event of settlements) {
+    assert.equal(event.topic, topic)
+    assert.equal(event.partition, 0)
+    const first = BigInt(event.firstOffset)
+    const last = BigInt(event.lastOffset)
+    assert(first >= 0n && last < 10n && first <= last)
+    for (let n = first; n <= last; n++) offsets[Number(n)].push(event)
+  }
+  for (const [index, events] of offsets.entries()) {
+    assert.equal(events.length, 1, 'Public share settlement must occur exactly once')
+    assert.equal(events[0].type, type(index))
+    if (type(index) === 'accept') assert.equal(events[0].error, null)
+    else
+      assert.deepEqual(events[0].error, {
+        name: 'KafkaJSShareAcknowledgementError',
+        reason: 'membership-lost',
+        retriable: false,
+        topic,
+        partition: 0,
+      })
+  }
+}
+
+/**
  * Checks the accepted-prefix/rest-release broker ledger and redelivery before lock expiry.
  * @param {object} result share summary
  * @param {object} inputs archived independent ledgers
  * @param {object} transcripts owner transcripts
+ * @param {string} topic independently configured created topic name
  * @returns {void}
  * @throws {Error} for missing confirmations, duplicates, altered records or late release
  */
-const verifyShare = (result, inputs, transcripts) => {
+const verifyShare = (result, inputs, transcripts, topic) => {
   assert(inputs, 'Missing share oracle')
+  assert.equal(result.lockMs, 15000)
   assert.equal(inputs.acquiredAt, acquisitionStart(inputs.frames, inputs.group))
   assert(inputs.handlerAt >= inputs.acquiredAt)
-  if (result.recovery) verifyRecovery(result.recovery, transcripts.share)
+  assert.equal(result.recovery?.owner, 'share', 'Missing configured share recovery')
+  assert.equal(result.recovery.mode, 'drop')
+  verifyRecovery(result.recovery, transcripts.share)
+  verifyShareIdentity(inputs, topic, inputs.expected)
+  assert(inputs.held.every((r) => r.lockMs === result.lockMs))
   assert.deepEqual(
     confirmedDecisions(inputs.frames, inputs.group),
     inputs.confirmed,
     'Contradicted acknowledgement ledger'
   )
-  assert.deepEqual(
-    inputs.handled.map((r) => r.key),
-    inputs.expected.map((r) => r.key)
-  )
-  assert.deepEqual(inputs.log.map((r) => r.key).sort(), inputs.expected.map((r) => r.key).sort())
-  for (const [index, expected] of inputs.expected.entries()) {
-    const logged = inputs.log.find((r) => r.key === expected.key)
-    assert.equal(logged.valueHex, expected.valueHex)
-    assert.equal(logged.offset, String(index))
+  assert.equal(inputs.confirmed.length, 10, 'Extra or duplicate broker share settlement')
+  for (let index = 0; index < 10; index++) {
     const decisions = inputs.confirmed.filter((r) => r.offset === String(index))
     assert.equal(decisions.length, 1, 'Share settlement must occur exactly once')
-    assert.equal(decisions[0].type, index < 4 ? 1 : 2)
-    assert.equal(decisions[0].errorCode, 0)
-    assert.equal(decisions[0].partition, 0)
-    assert(decisions[0].at < inputs.acquiredAt + result.lockMs, 'Settlement after lock expiry')
+    const [decision] = decisions
+    assert.equal(decision.topicId, inputs.topicId)
+    assert.equal(decision.partition, 0)
+    assert.equal(decision.type, index < 4 ? 1 : 2)
+    assert.equal(decision.errorCode, 0)
+    assert(
+      decision.at >= inputs.acquiredAt && decision.at < inputs.acquiredAt + result.lockMs,
+      'Settlement after lock expiry'
+    )
   }
   const suffix = inputs.expected
     .slice(4)
     .map((r) => r.key)
     .sort()
-  assert.deepEqual(inputs.redelivered.map((r) => r.key).sort(), suffix)
+  const identities = inputs.log.slice(4).map(({ topic, partition, offset, key, valueHex }) => ({
+    topic,
+    partition,
+    offset,
+    key,
+    valueHex,
+  }))
+  const redeliveryIdentities = (rows) =>
+    rows
+      .map(({ topic, partition, offset, key, valueHex }) =>
+        JSON.stringify([topic, partition, offset, key, valueHex])
+      )
+      .sort()
+  assert.deepEqual(redeliveryIdentities(inputs.redelivered), redeliveryIdentities(identities))
   assert(
     inputs.redelivered.every(
       (r) => r.deliveryCount >= 2 && r.at < inputs.acquiredAt + result.lockMs
     )
   )
-  const publicByOffset = Array.from({ length: 10 }, () => [])
-  for (const event of inputs.settlements) {
-    assert.equal(event.partition, 0)
-    for (let offset = BigInt(event.firstOffset); offset <= BigInt(event.lastOffset); offset++) {
-      assert(offset >= 0n && offset < 10n)
-      publicByOffset[Number(offset)].push(event)
-    }
-  }
-  for (const [index, events] of publicByOffset.entries()) {
-    assert.equal(events.length, 1, 'Public share settlement must occur exactly once')
-    assert.equal(events[0].type, index < 4 ? 'accept' : 'release')
-    if (index < 4) assert.equal(events[0].error, null)
-    else assert.equal(events[0].error?.reason, 'membership-lost')
-  }
+  verifyPublicSettlements(inputs.settlements, topic, (index) => (index < 4 ? 'accept' : 'release'))
   assert.deepEqual(result.redelivered, suffix)
 }
 

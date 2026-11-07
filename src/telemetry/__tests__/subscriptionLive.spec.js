@@ -7,7 +7,7 @@ const zlib = require('zlib')
 const { performance } = require('perf_hooks')
 const { spawn } = require('child_process')
 const { Kafka, logLevel } = require('../../../index')
-const { assertCadence } = require('../../../scripts/e2e/telemetry/semantics')
+const { assertCadence, assertCustomShape } = require('../../../scripts/e2e/telemetry/semantics')
 const { runCase } = require('../../../scripts/e2e/telemetry/evidence')
 const {
   TelemetryExportReader,
@@ -229,7 +229,8 @@ class SubscriptionCases {
 
   /**
    * Builds one telemetry-enabled producer on an observed socket factory. Cleanup runs in the fixed
-   * order disconnect, dispose, require clean; unanswered terminating Pushes are the only allowance.
+   * order disconnect, dispose, require clean; each unanswered request needs an exact cancellation
+   * joined to the captured public-close boundary.
    * @param {object} [options] producer options beyond `enableMetricsPush`
    * @param {string} [suffix] client-id and owner suffix
    * @returns {{observer:object,client:object,clientId:string,owner:string}} the observed client
@@ -550,6 +551,7 @@ class SubscriptionCases {
         following: ['6.25', '-3.5', '0'],
       }
       const classify = (sample) => {
+        assertCustomShape(sample.decoded, ['anchor', 'negative', 'total', 'zero'].map(N))
         const triple = [
           point(sample.decoded, N('zero')).asDouble,
           point(sample.decoded, N('negative')).asDouble,
