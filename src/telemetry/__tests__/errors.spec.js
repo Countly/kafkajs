@@ -299,6 +299,69 @@ describe('provisional post-final reopen', () => {
     h.client.handleError(failure(42), 'push', { lifecycle: h.client.lifecycle })
     expect(h.client.state).toBe('STOPPED')
   })
+  it('corrective codec refresh writes fallback under the consumed reopen identity', async () => {
+    for (const ending of ['success', 'repeated42']) {
+      const h = setup()
+      const built = []
+      h.client.payload.buildPayload = async (snapshot, options) => {
+        built.push([...options.acceptedCompressionTypes])
+        return {
+          metrics: Buffer.alloc(0),
+          compressionType: options.acceptedCompressionTypes.includes(1) ? 1 : 0,
+          includedIdentities: snapshot.points.map((point) => point.identity),
+          omittedIdentities: [],
+        }
+      }
+      const codecs = { acceptedCompressionTypes: [1, 0] }
+      h.gets.push(subscription(codecs))
+      h.client.resume()
+      await jest.advanceTimersByTimeAsync(0)
+      await jest.advanceTimersByTimeAsync(1000)
+      await h.client.close({ remaining: () => 1000 })
+      const start = h.events.length
+      for (let get = 0; get < 3; get++)
+        h.gets.push(subscription({ clientInstanceId: null, ...codecs }))
+      h.pushes.push(
+        () => Promise.reject(failure(42)),
+        () => Promise.reject(failure(76)),
+        ...(ending === 'repeated42' ? [() => Promise.reject(failure(42))] : [])
+      )
+      h.client.resume()
+      await jest.advanceTimersByTimeAsync(0)
+      const reopen = h.client.reopen
+      expect(reopen).toMatchObject({ used: false })
+      const tail = () => h.events.slice(start)
+      for (let step = 0; step < 40 && tail().length < 6; step++)
+        await jest.advanceTimersByTimeAsync(500)
+      expect(tail().map((event) => event.api)).toEqual([71, 72, 71, 72, 71, 72])
+      expect(
+        tail()
+          .filter((event) => event.api === 71)
+          .map((event) => event.clientInstanceId)
+      ).toEqual([ID, ID, ID])
+      expect(
+        tail()
+          .filter((event) => event.api === 72)
+          .map((event) => event.compressionType)
+      ).toEqual([1, 1, 0])
+      expect(built.at(-2)).toEqual([1, 0])
+      expect(built.at(-1)).toEqual([0])
+      expect([...h.client.rejectedCodecs]).toEqual([1])
+      expect(reopen.used).toBe(true)
+      expect(h.events.filter((event) => event.terminating)).toHaveLength(1)
+      if (ending === 'success') {
+        expect(h.client.reopen).toBeNull()
+        expect(h.client.hadFinal).toBe(false)
+        expect(h.client.state).toBe('READY')
+      } else {
+        expect(h.client.reopen).toBe(reopen)
+        expect(h.client.state).toBe('STOPPED')
+        await jest.advanceTimersByTimeAsync(60000)
+        expect(tail()).toHaveLength(6)
+      }
+      h.client.suspend()
+    }
+  })
   it('skips another final if close interrupts a provisional reopen', async () => {
     const h = setup()
     h.client.resume()

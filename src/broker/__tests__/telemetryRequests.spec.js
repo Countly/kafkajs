@@ -85,6 +85,38 @@ describe('dedicated broker telemetry requests', () => {
       }
     }
   )
+  it('writes the codec byte and body of a compressed push for the independent reader', async () => {
+    const h = await setup()
+    try {
+      const pending = h.broker.pushTelemetry(
+        {
+          clientInstanceId: ID,
+          subscriptionId: 3,
+          terminating: false,
+          compressionType: 1,
+          metrics: Buffer.from([1, 2, 3]),
+        },
+        { guard: () => null }
+      )
+      await turn()
+      expect(h.fake.state.writes).toHaveLength(1)
+      const frame = h.fake.state.writes[0]
+      const header = readRequestHeader(frame)
+      expect(header).toMatchObject({ apiKey: 72, apiVersion: 0, correlationId: 0 })
+      expect(pushPair.readRequest(frame.subarray(header.byteLength))).toEqual({
+        clientInstanceId: ID,
+        subscriptionId: 3,
+        terminating: false,
+        compressionType: 1,
+        metrics: '010203',
+      })
+      respondWithFrame(h.fake.state, header.correlationId, 1, pushPair.buildResponse())
+      await expect(pending).resolves.toMatchObject({ errorCode: 0 })
+      expect(h.fake.state.sockets).toHaveLength(1)
+    } finally {
+      await h.pool.destroy({ drainTimeout: 0 })
+    }
+  })
   it('refuses before write and before transmission commit when authority expires', async () => {
     const h = await setup()
     const sentinel = new Error('revoked')

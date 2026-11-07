@@ -310,3 +310,90 @@ describe('current metric authority at write', () => {
     h.client.suspend()
   })
 })
+
+describe('delayed timer and deadline delivery', () => {
+  it('late timer delivery sends one operation without a catch-up burst', async () => {
+    const h = setup()
+    h.client.resume()
+    await jest.advanceTimersByTimeAsync(0)
+    jest.setSystemTime(jest.now() + 5500)
+    await jest.advanceTimersByTimeAsync(1000)
+    expect(h.events.filter((e) => e.api === 72)).toHaveLength(1)
+    await jest.advanceTimersByTimeAsync(999)
+    expect(h.events.filter((e) => e.api === 72)).toHaveLength(1)
+    await jest.advanceTimersByTimeAsync(1)
+    expect(h.events.filter((e) => e.api === 72)).toHaveLength(2)
+    h.client.suspend()
+  })
+
+  it.each(
+    ['connect', 'authentication', 'encode', 'dispatch', 'write'].flatMap((phase) => [
+      [phase, true],
+      [phase, false],
+    ])
+  )(
+    'delayed watchdog delivery cannot extend setup or transmission authority: %s, enforcement %s',
+    async (phase, enforce) => {
+      const h = setup({ config: { enforceRequestTimeout: enforce } })
+      const written = jest.spyOn(h.metrics, 'written')
+      let release
+      const held = new Promise((resolve) => {
+        release = resolve
+      })
+      const startup = phase === 'connect' || phase === 'authentication'
+      if (startup) {
+        const open = h.transport.open
+        h.transport.open = jest.fn(async (candidate, authority) => {
+          if (phase === 'connect') await held
+          const handle = await open(candidate, authority)
+          if (phase === 'authentication') await held
+          return handle
+        })
+      }
+      h.client.resume()
+      await jest.advanceTimersByTimeAsync(0)
+      const before = h.client.subscription
+      if (!startup) {
+        expect(before).not.toBeNull()
+        if (phase === 'encode')
+          h.client.payload.buildPayload = async () => {
+            await held
+            return {
+              metrics: Buffer.alloc(0),
+              compressionType: 0,
+              includedIdentities: [],
+              omittedIdentities: [],
+            }
+          }
+        else
+          h.handles[0].push = jest.fn(async (payload, authority) => {
+            if (phase === 'dispatch') await held
+            const refusal = authority.guard()
+            if (refusal) throw refusal
+            if (phase === 'write') await held
+            authority.onWrite()
+            h.events.push({ api: 72, ...payload })
+            return { errorCode: 0 }
+          })
+        await jest.advanceTimersByTimeAsync(1000)
+      }
+      expect(h.client.running).not.toBeNull()
+      jest.setSystemTime(jest.now() + 30001)
+      release()
+      await jest.advanceTimersByTimeAsync(0)
+      expect(h.events.filter((e) => e.api === 72)).toEqual([])
+      expect(written).not.toHaveBeenCalled()
+      expect(h.client.state).toBe('BACKOFF')
+      expect(h.transport.open).toHaveBeenCalledTimes(1)
+      expect(h.handles).toHaveLength(1)
+      expect(h.handles[0].retired).toBe(phase !== 'encode')
+      expect(h.client.subscription).toBe(before)
+      if (startup) {
+        expect(h.events).toEqual([])
+        expect(h.client.uuid).toBeNull()
+      }
+      h.client.suspend()
+      expect(jest.getTimerCount()).toBe(0)
+    }
+  )
+})

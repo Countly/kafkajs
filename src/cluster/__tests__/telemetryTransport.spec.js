@@ -309,6 +309,47 @@ describe('authentication ownership and authority', () => {
     }
   })
 
+  it('a held supplier prevents another telemetry supplier after retirement', async () => {
+    const releases = []
+    const authenticate = jest.fn(() =>
+      authenticate.mock.calls.length === 1
+        ? new Promise((resolve) => releases.push(resolve))
+        : Promise.resolve()
+    )
+    const h = setup({ mechanism: 'PLAIN', authenticationProvider: () => ({ authenticate }) })
+    const first = startOpen(h)
+    let next
+    try {
+      await replySetup(h)
+      expect(authenticate).toHaveBeenCalledTimes(1)
+      await first.handles[0].retire({ drainTimeout: 0 })
+      await first.observed
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const refused = startOpen(h)
+        expect(await refused.observed).toBeInstanceOf(Error)
+        expect(refused.handles).toEqual([])
+      }
+      expect(authenticate).toHaveBeenCalledTimes(1)
+      expect(h.fake.state.sockets).toHaveLength(1)
+      expect(h.pools).toHaveLength(1)
+      releases[0]()
+      await turn()
+      expect(h.pools[0].pool[0].authenticatedAt).toBeNull()
+      expect(h.pools).toHaveLength(1)
+      next = startOpen(h)
+      await replySetup(h)
+      expect(authenticate).toHaveBeenCalledTimes(2)
+      expect(await next.observed).toBe(next.handles[0])
+      expect(h.pools).toHaveLength(2)
+      expect(h.fake.state.sockets).toHaveLength(2)
+    } finally {
+      for (const handle of [...first.handles, ...(next?.handles || [])])
+        await handle.retire({ drainTimeout: 0 })
+      for (const release of releases) release()
+      await Promise.all([first.observed, next?.observed])
+    }
+  })
+
   it('uses live request authority for custom-provider reauthentication', async () => {
     const authenticate = jest.fn(async () => {})
     const h = setup({ mechanism: 'PLAIN', authenticationProvider: () => ({ authenticate }) })
