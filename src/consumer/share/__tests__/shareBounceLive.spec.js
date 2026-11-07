@@ -3453,6 +3453,7 @@ const replayFixture = ({ count = 1, sameLeader = false, offset = '0' } = {}) => 
 
 /**
  * Scripts one real ledger outcome for a written or unwritten terminal decision.
+ * Detaches recorded batches from the immutable ledger ticket before fixture remapping.
  * @param {object} fixture Independent replay fixture.
  * @param {{written?:boolean, applied?:boolean, type?:string, reason?:string, writtenAt?:number, lostAt?:number}} [options] Fault script.
  * @returns {object} Complete independent terminal observations, with the actual outcome journal.
@@ -3556,7 +3557,10 @@ const lostAcceptFixture = (
         cohort: entry.acquisition.id,
         ticket: 100 + entry.id,
         ledger: entry.acquisition.ledger,
-        batches: ticket.acknowledgementBatches,
+        batches: ticket.acknowledgementBatches.map((batch) => ({
+          ...batch,
+          acknowledgeTypes: [...batch.acknowledgeTypes],
+        })),
         isRenewAck: ticket.isRenewAck,
       },
     ],
