@@ -1355,7 +1355,9 @@ class CapabilityCase {
     const consumer = this.client('sentinel').consumer({ groupId: this.sentinel })
     this.sentinelConsumer = consumer
     let joined = false
+    // pause() needs the group that run() creates; GROUP_JOIN fires before the first fetch.
     const remove = consumer.on(consumer.events.GROUP_JOIN, ({ payload }) => {
+      consumer.pause([{ topic: this.topic }])
       joined = true
       this.row('sentinel-joined', { memberId: payload.memberId })
     })
@@ -1369,7 +1371,6 @@ class CapabilityCase {
       signal.throwIfAborted()
       await bounded(signal, Infinity, () => consumer.connect())
       await bounded(signal, Infinity, () => consumer.subscribe({ topics: [this.topic] }))
-      consumer.pause([{ topic: this.topic }])
       await bounded(signal, Infinity, () =>
         consumer.run({
           eachBatchAutoResolve: false,
