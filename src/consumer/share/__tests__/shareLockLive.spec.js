@@ -11,6 +11,7 @@ const { EventEmitter } = require('events')
 const { Kafka, logLevel } = require('../../../../index')
 const {
   createTopic,
+  newLogger,
   plainTextBrokers,
   readRequestHeader,
   secureRandom,
@@ -31,6 +32,8 @@ const RequestQueue = require('../../../network/requestQueue')
 const InstrumentationEventEmitter = require('../../../instrumentation/emitter')
 const { ShareAckLedger } = require('../shareAckLedger')
 const { ShareFetchLoop } = require('../shareFetchLoop')
+const { ShareSession } = require('../shareSession')
+const { ShareRun } = require('../shareRun')
 const shareFetchV2 = require('../../../../testHelpers/wire/shareFetchV2')
 const shareAcknowledgeV2 = require('../../../../testHelpers/wire/shareAcknowledgeV2')
 const {
@@ -1063,13 +1066,21 @@ class LockCase {
     await bounded(scope, 15000, () => consumer.run({ eachMessage: this.handler(label, scope) }))
   }
 
-  /** @returns {void} Observes original acquisition and once-only ticket ownership. */
+  /** @returns {void} Observes validated parallel acquisition counts and once-only ticket ownership. */
   watchExpiryAcquisitions() {
     const owner = this
     const adopt = ShareFetchLoop.prototype.adopt
     ShareFetchLoop.prototype.adopt = function (...args) {
       const cohort = adopt.apply(this, args)
       if (this.groupId === owner.group && cohort.walk.deliver.records.length) {
+        const { records, deliveryCounts } = cohort.walk.deliver
+        if (!deliveryCounts || deliveryCounts.length !== records.length) {
+          throw new Error('Acquisition delivery counts must match records')
+        }
+        const counts = Array.from(deliveryCounts)
+        if (counts.some((count) => !Number.isInteger(count) || count < 1 || count > 32767)) {
+          throw new Error('Acquisition delivery counts must be integers in 1–32767')
+        }
         const [exchange, topicId, partition, lockDuration] = args
         const member = [...owner.members.values()].find(
           ({ memberId }) => memberId === this.memberId
@@ -1084,14 +1095,14 @@ class LockCase {
           sentAt: exchange.sentAt,
           deadline: exchange.sentAt + lockDuration,
           lockDuration,
-          identities: cohort.walk.deliver.records.map((message) =>
+          identities: records.map((message) =>
             shareRecordIdentity({
               ...message,
               topic: cohort.topic,
               partition: cohort.partition,
             })
           ),
-          counts: cohort.walk.deliver.records.map(({ deliveryCount }) => deliveryCount),
+          counts,
           request: JSON.parse(JSON.stringify(exchange.fields)),
           acquiredRecords: partition.acquiredRecords,
           errorCode: partition.errorCode,
@@ -2116,6 +2127,113 @@ class LockCase {
     })
   }
 }
+
+describe('lock acquisition observation', () => {
+  let observer
+  let run
+  let node
+  let partition
+  let exchange
+  let handled
+  const topicId = '00112233-4455-6677-8899-aabbccddeeff'
+
+  beforeEach(() => {
+    handled = []
+    run = new ShareRun({
+      runner: {
+        subscription: ['records'],
+        options: {
+          groupId: 'group',
+          acknowledgementMode: 'implicit',
+          maxPollInterval: 30000,
+          logger: newLogger(),
+          cluster: { topicName: () => 'records', onRoutingChange: () => () => {} },
+        },
+      },
+      handler: ({ message }) => handled.push(message.deliveryCount),
+      batch: false,
+    })
+    node = {
+      issued: run.authorityToken,
+      session: new ShareSession({ operation: run.operation }),
+      keys: new Set([`${topicId}:0`]),
+      lockDuration: LOCK_MS,
+    }
+    node.loop = run.createLoop(node)
+    exchange = { open: node.session.token, sentAt: performance.now(), fields: { groupId: 'group' } }
+    partition = {
+      partitionIndex: 0,
+      errorCode: 0,
+      messages: [
+        { offset: '0', key: null, value: null },
+        { offset: '1', key: null, value: null },
+      ],
+      acquiredRecords: [
+        { firstOffset: '0', lastOffset: '0', deliveryCount: 1 },
+        { firstOffset: '1', lastOffset: '1', deliveryCount: 32767 },
+      ],
+    }
+    observer = new LockCase('expire')
+    observer.group = 'group'
+    observer.members.set('A', { label: 'A', memberId: run.membership.memberId })
+  })
+
+  afterEach(() => {
+    observer.gauge.uninstall()
+    jest.restoreAllMocks()
+    node.session.retire()
+    run.manager.shutdown()
+    run.poll.stop()
+    run.unrouted()
+  })
+
+  it('copies parallel counts before dispatch attaches them to the original records', async () => {
+    observer.watchExpiryAcquisitions()
+    expect(partition.messages.every((message) => !Object.hasOwn(message, 'deliveryCount'))).toBe(
+      true
+    )
+    const cohort = node.loop.adopt(exchange, topicId, partition, LOCK_MS)
+    expect(partition.messages.every((message) => !Object.hasOwn(message, 'deliveryCount'))).toBe(
+      true
+    )
+    expect(observer.acquisitions).toHaveLength(1)
+    const [acquisition] = observer.acquisitions
+    expect(acquisition.identities).toEqual([
+      '["records",0,"0",null,null]',
+      '["records",0,"1",null,null]',
+    ])
+    expect(Array.isArray(acquisition.counts)).toBe(true)
+    expect(acquisition.counts).toEqual([1, 32767])
+    await node.loop.dispatchCohorts([cohort])
+    expect(handled).toEqual([1, 32767])
+    cohort.walk.deliver.deliveryCounts.fill(2)
+    partition.messages.forEach((message) => (message.deliveryCount = 3))
+    expect(JSON.parse(JSON.stringify(acquisition)).counts).toEqual([1, 32767])
+  })
+
+  it.each([
+    ['missing', undefined],
+    ['short', new Uint16Array([1])],
+    ['extra', new Uint16Array([1, 2, 3])],
+    ['zero', [1, 0]],
+    ['over-limit', [1, 32768]],
+    ['fractional', [1, 1.5]],
+    ['non-number', [1, '2']],
+    ['NaN', [1, NaN]],
+  ])('rejects %s parallel counts at adoption', (name, deliveryCounts) => {
+    const adopt = ShareFetchLoop.prototype.adopt
+    jest.spyOn(ShareFetchLoop.prototype, 'adopt').mockImplementation(function (...args) {
+      const cohort = adopt.apply(this, args)
+      cohort.walk.deliver.deliveryCounts = deliveryCounts
+      return cohort
+    })
+    observer.watchExpiryAcquisitions()
+    expect(() => node.loop.adopt(exchange, topicId, partition, LOCK_MS)).toThrow(
+      'Acquisition delivery counts'
+    )
+    expect(observer.acquisitions).toEqual([])
+  })
+})
 
 describe('share gate expiry snapshot', () => {
   /** @returns {LockCase} Original invocation intervals spanning a past acquisition deadline. */
