@@ -22,6 +22,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Add a pinned broker metrics reporter fixture with independent OTLP export and push-interval verification.
 - Retain checksum-pinned telemetry fixtures and verify complete export evidence and isolated CI ownership receipts.
 - Harden telemetry cleanup deadlines, complete Push and controlled RTT evidence verification, failed-capture archives, and development/exit-gate matrix scheduling.
+- Measure telemetry observation, bounded serialization and end-to-end overhead with independent work and identity controls.
 
 #### Behavior changes
 
