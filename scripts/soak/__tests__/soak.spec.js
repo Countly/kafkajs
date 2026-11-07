@@ -2499,35 +2499,61 @@ const positionFacts = (plan) => {
 }
 
 /** Measured assigned interval, with an actual in-window ShareFetch and joined leave. */
-const verifierFacts = () => ({
-  active: true,
-  groupId: 'soak-group',
-  topic: TOPIC_NAME,
-  topicId: SOAK_UUID,
-  memberId: 'verifier',
-  windowMs: 5000,
-  openedAt: 0,
-  closedAt: 5100,
-  delivered: [],
-  events: [
-    {
-      kind: 'window-start',
-      at: 0,
-      wallAt: 10000,
-      payload: [{ topic: TOPIC_NAME, partitions: [0, 1, 2] }],
-    },
-    { kind: 'REQUEST', at: 250, payload: { apiName: 'ShareFetch', sentAt: 10200 } },
-    {
-      kind: 'window-end',
-      at: 5000,
-      wallAt: 15000,
-      payload: [{ topic: TOPIC_NAME, partitions: [0, 1, 2] }],
-    },
-    { kind: 'DISCONNECT', at: 5100, payload: {} },
-  ],
-})
+const verifierFacts = (cycle = 0, base = cycle * 16000 + 1000, kind = 'cycle') => {
+  const memberId = `verifier-${kind}-${cycle}`
+  const exchanges = [0, 1, 2].map((partition) => {
+    const exchange = exchangeFacts(9000 + partition, partition, [])
+    exchange.memberId = memberId
+    Object.assign(exchange.frames[0], { at: base + 100, answeredAt: base + 200 })
+    exchange.frames[0].request.memberId = memberId
+    return sealExchange(exchange)
+  })
+  return {
+    active: true,
+    cycle,
+    kind,
+    groupId: 'soak-group',
+    topic: TOPIC_NAME,
+    topicId: SOAK_UUID,
+    memberId,
+    windowMs: 5000,
+    openedAt: base - 100,
+    closedAt: base + 5100,
+    delivered: [],
+    provenance: { exchanges },
+    events: [
+      { kind: 'GROUP_JOIN', at: base - 50, payload: { memberId, groupId: 'soak-group' } },
+      {
+        kind: 'window-start',
+        at: base,
+        wallAt: base + 10000,
+        payload: [{ topic: TOPIC_NAME, partitions: [0, 1, 2] }],
+      },
+      ...exchanges.map(({ frames: [frame] }) => ({
+        kind: 'REQUEST',
+        at: base + 250,
+        payload: {
+          apiName: 'ShareFetch',
+          sentAt: base + 10100,
+          correlationId: frame.correlationId,
+          broker: frame.endpoint,
+        },
+      })),
+      {
+        kind: 'window-end',
+        at: base + 5000,
+        wallAt: base + 15000,
+        payload: [{ topic: TOPIC_NAME, partitions: [0, 1, 2] }],
+      },
+      { kind: 'DISCONNECT', at: base + 5100, payload: {} },
+    ],
+  }
+}
 
-const cycleFacts = (cycle) => {
+const cycleFacts = (
+  cycle,
+  { startedAt = cycle * 16000, due = startedAt + 16000, kind = 'cycle' } = {}
+) => {
   const plan = ShareCycleOracle.plan(cycle)
   const produced = cycleIdentities(plan)
   const identities = produced.map(({ identity }) => identity)
@@ -2559,7 +2585,16 @@ const cycleFacts = (cycle) => {
       lag: '0',
       errorCode: 0,
     })),
-    members: { aJoined: true, aLeft: true, bAdded: true, bRemoved: true },
+    members: {
+      aJoined: true,
+      aLeft: true,
+      bAdded: true,
+      bRemoved: true,
+      bRemovedAt: startedAt + (kind === 'final' ? -200 : 100),
+      aLeftAt: startedAt + (kind === 'final' ? -100 : 200),
+      emptyAt: startedAt + 500,
+    },
+    timing: { cycle, kind, startedAt, completedAt: startedAt + 6300, due },
     reset: plan.reset
       ? {
           apiKey: 78,
@@ -2571,9 +2606,24 @@ const cycleFacts = (cycle) => {
           nextEpoch: 0,
         }
       : null,
-    verifier: verifierFacts(),
+    verifier: verifierFacts(cycle, startedAt + 1000, kind),
     clientsDisconnected: true,
-    positions: [positionFacts(plan), positionFacts(plan)],
+    positions: [
+      {
+        ...positionFacts(plan),
+        cycle,
+        kind,
+        startedAt: startedAt + 300,
+        completedAt: startedAt + 400,
+      },
+      {
+        ...positionFacts(plan),
+        cycle,
+        kind,
+        startedAt: startedAt + 6200,
+        completedAt: startedAt + 6300,
+      },
+    ],
   }
   facts.acknowledgedPrefix = Array.from({ length: cycle + 1 }, (_, i) =>
     cycleIdentities(ShareCycleOracle.plan(i))
@@ -2940,15 +2990,14 @@ describe('Share soak owner', () => {
     closePhase: jest.fn(async () => {}),
     cycle:
       cycle ??
-      jest.fn(async (plan) => {
-        const facts = cycleFacts(plan.cycle)
+      jest.fn(async (plan, _scope, timing) => {
+        const facts = cycleFacts(plan.cycle, { startedAt: timing.clock.now(), due: timing.due })
         alter(facts, plan)
         return facts
       }),
-    final: jest.fn(async () => ({
-      ...cycleFacts(29),
-      verifier: verifierFacts(),
-    })),
+    final: jest.fn(async (_scope, { clock, due }) =>
+      cycleFacts(29, { startedAt: clock.now(), due, kind: 'final' })
+    ),
   })
 
   const build = ({
@@ -2961,6 +3010,18 @@ describe('Share soak owner', () => {
   } = {}) => {
     let now = 0
     const timer = clock ?? { now: () => now }
+    const cycle = driver.cycle
+    driver.cycle = jest.fn(async (...args) => {
+      const facts = await cycle(...args)
+      if (!clock) now = Math.max(now, facts.timing?.completedAt ?? now)
+      return facts
+    })
+    const final = driver.final
+    driver.final = jest.fn(async (...args) => {
+      const facts = await final(...args)
+      if (!clock) now = Math.max(now, facts.timing?.completedAt ?? now)
+      return facts
+    })
     const rows = []
     const shares = { snapshot: jest.fn(async () => quietShare()), restore: jest.fn() }
     const owner = new ShareSoak({
@@ -3062,9 +3123,9 @@ describe('Share soak owner', () => {
 
   test('joins the sampler before each quiet reading', async () => {
     const driver = scripted({
-      cycle: jest.fn(async (plan) => {
+      cycle: jest.fn(async (plan, _scope, { clock, due }) => {
         await new Promise((resolve) => setTimeout(resolve, 8))
-        return cycleFacts(plan.cycle)
+        return cycleFacts(plan.cycle, { startedAt: clock.now(), due })
       }),
     })
     const { owner, rows } = build({ driver, soak: { sampleMs: 1 } })
@@ -3259,13 +3320,14 @@ describe('Share soak owner', () => {
 
   describe('the combined verdict', () => {
     const complete = (mutate) => {
-      const { owner, rows } = build()
+      const { owner, rows } = build({ clock: { now: () => 487000 } })
       for (let cycle = 0; cycle < 30; cycle++) {
         const facts = cycleFacts(cycle)
         owner.recordCycle(ShareCycleOracle.plan(cycle), facts, [])
       }
       owner.counts = { cycles: 30, resets: 10, memberAdds: 30, memberRemoves: 30 }
-      owner.final = cycleFacts(29)
+      owner.cleanupDue = 500000
+      owner.final = cycleFacts(29, { startedAt: 480000, due: 500000, kind: 'final' })
       owner.elapsedProfileMs = SHARE_SOAK.shortMs
       owner.timing.phases = [0, 1, 2].map((phase) => ({
         phase,
@@ -3293,6 +3355,25 @@ describe('Share soak owner', () => {
     })
 
     test.each([
+      [
+        'thirty replays of an old verifier window',
+        (o, rows) => {
+          const cycles = rows.filter(({ event }) => event === 'soak-cycle')
+          for (const row of cycles) row.verifier = cycles[0].verifier
+          o.final.verifier = cycles[0].verifier
+        },
+        'original cycle window',
+      ],
+      [
+        'a final observation copied from the last cycle',
+        (o, rows) => {
+          const row = rows.filter(({ event }) => event === 'soak-cycle').at(-1)
+          o.final.verifier = row.verifier
+          o.final.positions = row.positions
+          o.final.timing = row.timing
+        },
+        'distinct post-profile',
+      ],
       [
         'an actual slot overrun hidden by a nominal profile total',
         (o) => {
@@ -3501,7 +3582,8 @@ describe('Share soak archived primitive controls', () => {
     'rejects a measured %i ms window even with a 5000 ms declaration',
     (ms) => {
       const facts = cycleFacts(10)
-      facts.verifier.events.find(({ kind }) => kind === 'window-end').at = ms
+      facts.verifier.events.find(({ kind }) => kind === 'window-end').at =
+        facts.verifier.events.find(({ kind }) => kind === 'window-start').at + ms
       expect(violations(facts)).toContain('measured observation window')
     }
   )
@@ -3510,7 +3592,11 @@ describe('Share soak archived primitive controls', () => {
     [
       'pre-window fetch only',
       (v) => {
-        v.events.find(({ kind }) => kind === 'REQUEST').payload.sentAt = 9999
+        v.events
+          .filter(({ kind }) => kind === 'REQUEST')
+          .forEach(({ payload }) => {
+            payload.sentAt = 9999
+          })
       },
     ],
     [
@@ -3522,13 +3608,65 @@ describe('Share soak archived primitive controls', () => {
     [
       'partial assignment',
       (v) => {
-        v.events[0].payload[0].partitions.pop()
+        v.events.find(({ kind }) => kind === 'window-start').payload[0].partitions.pop()
       },
     ],
     [
       'assignment loss',
       (v) => {
-        v.events.splice(2, 0, { kind: 'ASSIGNMENT_CHANGED', at: 500, payload: { assignment: [] } })
+        v.events.splice(2, 0, {
+          kind: 'ASSIGNMENT_CHANGED',
+          at: v.openedAt + 500,
+          payload: { assignment: [] },
+        })
+      },
+    ],
+    [
+      'missing closedAt',
+      (v) => {
+        delete v.closedAt
+      },
+    ],
+    [
+      'nonfinite openedAt',
+      (v) => {
+        v.openedAt = NaN
+      },
+    ],
+    [
+      'reversed close',
+      (v) => {
+        v.closedAt = v.openedAt - 1
+      },
+    ],
+    [
+      'incomplete fetched partitions',
+      (v) => {
+        v.provenance.exchanges.pop()
+      },
+    ],
+    [
+      'mismatched response correlation',
+      (v) => {
+        v.provenance.exchanges[0].frames[0].correlationId++
+      },
+    ],
+    [
+      'wrong original group',
+      (v) => {
+        v.provenance.exchanges[0].groupId = 'other'
+      },
+    ],
+    [
+      'wrong original member',
+      (v) => {
+        v.memberId = 'other'
+      },
+    ],
+    [
+      'wrong original UUID',
+      (v) => {
+        v.topicId = '00000000-0000-4000-8000-000000000002'
       },
     ],
     [
@@ -3801,6 +3939,7 @@ describe('Share soak real cycle adapters', () => {
       const driver = new ShareSoakDriver({
         kafka,
         shares: { track: (client) => client },
+        tap: new ShareFetchTap(),
         ports: { fixtures: require('../../../testHelpers/shareFixtures') },
       })
       driver.group = 'soak-group'
@@ -3811,13 +3950,13 @@ describe('Share soak real cycle adapters', () => {
       return { work, clients }
     }
 
-    test('starts a complete 5000 ms window after delayed assignment and actual fetch activity', async () => {
+    test('records delayed assignment but rejects public requests without original wire evidence', async () => {
       const { work } = verify({ assignmentAt: 2000 })
       await jest.advanceTimersByTimeAsync(7500)
       const evidence = await work
       const failures = []
       ShareCycleOracle.verifier(evidence, 5000, (message) => failures.push(message))
-      expect(failures).toEqual([])
+      expect(failures).toEqual([expect.stringContaining('measured observation window')])
       const start = evidence.events.find(({ kind }) => kind === 'window-start')
       const end = evidence.events.find(({ kind }) => kind === 'window-end')
       expect(start.at).toBeGreaterThanOrEqual(2000)
@@ -3855,6 +3994,7 @@ describe('Share soak original authority adapter', () => {
     const source = sealExchange(
       exchangeFacts(7, 0, [{ firstOffset: '0', lastOffset: '0', deliveryCount: 1 }])
     )
+    let written = source
     const tap = new ShareFetchTap()
     const journal = new ShareCycleJournal('soak-group', tap)
     const originalRow = {
@@ -3866,7 +4006,7 @@ describe('Share soak original authority adapter', () => {
     const sentinel = Symbol('original return')
     const spies = [
       jest.spyOn(ShareFetchLoop.prototype, 'send').mockImplementation(() => {
-        tap.context.getStore().frames.push(source.frames[0])
+        tap.context.getStore().frames.push(written.frames[0])
         return sentinel
       }),
       jest.spyOn(ShareFetchLoop.prototype, 'complete').mockReturnValue(sentinel),
@@ -3903,6 +4043,32 @@ describe('Share soak original authority adapter', () => {
       expect(context).toEqual({ acquisition: journal.acquisitions[0].id, dispatch: 1 })
       expect(loop.emit([{ type: 'accept', firstOffset: '0', lastOffset: '0' }], originalRow)).toBe(
         sentinel
+      )
+      const batch = { firstOffset: '0', lastOffset: '0', acknowledgeTypes: [1] }
+      written = exchangeFacts(8, 0, [])
+      written.frames[0].request.topics[0].partitions[0].acknowledgementBatches = [batch]
+      sealExchange(written)
+      const receipt = {
+        ...exchange,
+        prepared: [
+          { row: originalRow, ticket: { acknowledgementBatches: [batch], isRenewAck: false } },
+        ],
+      }
+      loop.send(receipt)
+      loop.complete(receipt, written.response)
+      const failures = []
+      const corpus = new Map([[cycleFacts(0).produced[0].identity, { partition: 0, offset: 0n }]])
+      const evidence = {
+        accepted: [{ topic: TOPIC_NAME, partition: 0, firstOffset: '0', lastOffset: '0' }],
+        provenance: journal.snapshot(),
+      }
+      ShareCycleOracle.accepts(corpus, evidence, (message) => failures.push(message))
+      expect(failures).toEqual([])
+      expect(evidence.provenance.outcomes[0]).toMatchObject({ topic: TOPIC_NAME, partition: 0 })
+      delete evidence.provenance.outcomes[0].topic
+      ShareCycleOracle.accepts(corpus, evidence, (message) => failures.push(message))
+      expect(failures).toContain(
+        'a successful Accept lacks a unique original request and partition receipt'
       )
       expect(loop.failExchange(exchange, new Error('lost answer'))).toBe(sentinel)
       expect(loop.onSessionReset()).toBe(sentinel)
@@ -4232,4 +4398,760 @@ describe('Share soak owned raw reader', () => {
       shared.shareResources.restore()
     }
   })
+})
+
+describe('Share soak complete original-owner schedules', () => {
+  afterEach(() => liveRun.reset())
+  const {
+    ShareClock,
+    shareClient,
+    fetchAnswer,
+    ackAnswer,
+    part,
+    acquired,
+    flush,
+  } = require('../../../testHelpers/shareHarness')
+  const {
+    batch,
+    record,
+  } = require('../../../src/protocol/requests/fetch/__tests__/fixtures/recordBatchBytes')
+  const fixtures = require('../../../testHelpers/shareFixtures')
+  const diagnostics = require('../../../testHelpers/shareLiveDiagnostics')
+
+  /**
+   * Script only external I/O. Membership, session loss/reopen, acquisition, dispatch, ledger
+   * decisions, acknowledgements, window observation, resource judging and reconstruction call
+   * through their original implementations. The raw corpus is independent of handler evidence.
+   */
+  const schedule = async ({
+    short = true,
+    damage = () => {},
+    wire = () => {},
+    finalDamage = () => {},
+    io = async () => {},
+    assignmentDelay = 0,
+    replayAt,
+    drainReplay = false,
+  } = {}) => {
+    const clock = new ShareClock().install()
+    const exposed = globalThis.gc
+    globalThis.gc = undefined
+    const transport = shareClient({ nodes: 3, topics: {} })
+    const { cluster, table } = transport
+    const tap = new ShareFetchTap(64, { now: () => performance.now() })
+    const instrumented = instrumentShare(
+      cluster.kafkaOptions({
+        socketFactory: tap.factory(cluster.socketFactory),
+        retry: { initialRetryTime: 50, maxRetryTime: 100, factor: 0, retries: 3 },
+      }),
+      { activeResources: false }
+    )
+    const resources = instrumented.shareResources
+    const originalSnapshot = resources.snapshot
+    // Heap and process resources are scripted inputs; original client state is always measured.
+    resources.snapshot = async () => ({
+      ...(await originalSnapshot()),
+      heapUsed: 1024,
+      activeResources: {},
+    })
+    const records = [[], [], []]
+    const members = new Map()
+    const configs = new Map()
+    const sessions = new Map()
+    const rows = []
+    let groupId
+    let topic
+    let groupPresent = false
+    let listingNode = 0
+    let firstWindow
+    const verifierStarts = []
+    const seenMembers = new Map()
+    const assignment = (id) => {
+      const ids = [...members.keys()]
+      return [{ topic, partitions: ids.length < 2 ? [0, 1, 2] : id === ids[0] ? [0, 1] : [2] }]
+    }
+    const wireAssignment = (id) => ({
+      topicPartitions: assignment(id).map(({ partitions }) => ({ topicId: SOAK_UUID, partitions })),
+    })
+    cluster.answer('ShareGroupHeartbeat', (fields) => {
+      if (fields.memberEpoch === -1) {
+        members.delete(fields.memberId)
+        return {
+          errorCode: 0,
+          memberId: fields.memberId,
+          memberEpoch: -1,
+          heartbeatIntervalMs: 1000,
+          assignment: null,
+        }
+      }
+      members.set(fields.memberId, true)
+      if (!seenMembers.has(fields.memberId)) seenMembers.set(fields.memberId, performance.now())
+      const waiting =
+        driver.lastCycle?.members.aLeft &&
+        performance.now() - seenMembers.get(fields.memberId) < assignmentDelay
+      return {
+        errorCode: 0,
+        memberId: fields.memberId,
+        memberEpoch: 1,
+        heartbeatIntervalMs: 1000,
+        assignment: waiting ? null : wireAssignment(fields.memberId),
+      }
+    })
+    const answer = (fields, call) => {
+      const key = `${fields.memberId}:${call.node}:${call.generation}`
+      if (fields.shareSessionEpoch === 0) sessions.set(key, new Set())
+      const wanted = sessions.get(key) ?? new Set()
+      for (const { partitions } of fields.topics)
+        for (const { partitionIndex, acknowledgementBatches } of partitions) {
+          wanted.add(partitionIndex)
+          for (const ack of acknowledgementBatches)
+            for (const row of records[partitionIndex])
+              if (
+                BigInt(row.offset) >= BigInt(ack.firstOffset) &&
+                BigInt(row.offset) <= BigInt(ack.lastOffset) &&
+                row.owner === key &&
+                ack.acknowledgeTypes.every((type) => type === 1)
+              )
+                row.settled = true
+        }
+      sessions.set(key, wanted)
+      for (const { partitions } of fields.forgottenTopicsData ?? [])
+        for (const partition of partitions) wanted.delete(partition)
+      if (call.apiKey === 79)
+        return ackAnswer([...wanted].map((partition) => ({ topicId: SOAK_UUID, partition })))
+      const parts = [...wanted].map((partition) => {
+        const available = records[partition].filter((row) => !row.settled && row.owner !== key)
+        const acquire = []
+        let bytes = ''
+        if (available.length) {
+          for (const row of available) {
+            row.owner = key
+            row.count++
+          }
+          acquire.push(acquired(available[0].offset, available.at(-1).offset, available[0].count))
+          bytes = batch({
+            baseOffset: BigInt(available[0].offset),
+            records: available.map((row, index) =>
+              record({ offsetDelta: index, key: row.key, value: row.value })
+            ),
+          }).toString('hex')
+        }
+        return part({ topicId: SOAK_UUID, partition, acquire, records: bytes })
+      })
+      const result = fetchAnswer(parts, { acquisitionLockTimeoutMs: 30000 })
+      wire({ fields, call, result, owner, records, members })
+      return result
+    }
+    cluster.answer('ShareFetch', answer)
+    cluster.answer('ShareAcknowledge', answer)
+    const admin = () => {
+      const events = new EventEmitter()
+      return {
+        events: { REQUEST: 'request' },
+        on: (event, listener) => {
+          events.on(event, listener)
+          return () => events.off(event, listener)
+        },
+        connect: async () => {},
+        disconnect: async () => {},
+        createTopics: async ({ topics: [created] }) => {
+          topic = created.topic
+          table.set(topic, {
+            topicId: SOAK_UUID,
+            partitions: [0, 1, 2].map((leader) => ({ leader, epoch: 1 })),
+          })
+        },
+        deleteTopics: async () => {
+          await io('delete-topic', { owner, driver, clock })
+          return table.clear()
+        },
+        listTopics: async () => {
+          events.emit('request', {
+            payload: { apiName: 'Metadata', broker: `node${listingNode++ % 3}:9092` },
+          })
+          return [...table.keys()]
+        },
+        fetchTopicMetadata: async () => ({
+          topics: [
+            {
+              name: topic,
+              topicId: SOAK_UUID,
+              partitions: [0, 1, 2].map((partitionId) => ({ partitionId, leader: partitionId })),
+            },
+          ],
+        }),
+        describeCluster: async () => ({
+          brokers: [0, 1, 2].map((nodeId) => ({ nodeId, host: `node${nodeId}`, port: 9092 })),
+        }),
+        listGroups: async () => ({ groups: groupPresent ? [{ groupId }] : [] }),
+        deleteGroups: async () => {
+          groupPresent = false
+        },
+        describeShareGroups: async ([id]) => ({
+          groups: [
+            {
+              groupId: id,
+              errorCode: groupPresent ? 0 : 69,
+              state: members.size ? 'Stable' : 'Empty',
+              members: [...members.keys()].map((memberId) => ({
+                memberId,
+                assignment: assignment(memberId),
+              })),
+            },
+          ],
+        }),
+        listShareGroupOffsets: async () => [
+          {
+            topic,
+            topicId: SOAK_UUID,
+            partitions: records.map((rows, partition) => ({
+              partition,
+              startOffset: '0',
+              lag: String(rows.filter(({ settled }) => !settled).length),
+              errorCode: 0,
+              leaderEpoch: 1,
+            })),
+          },
+        ],
+        fetchTopicOffsets: async () => {
+          await io('terminal-ends', { owner, driver, clock })
+          return records.map((rows, partition) => ({ partition, high: String(rows.length) }))
+        },
+        incrementalAlterConfigs: async ({ resources: [resource] }) => {
+          groupId = resource.name
+          groupPresent = true
+          for (const { name, value, operation } of resource.configEntries)
+            if (operation === 1) configs.delete(name)
+            else configs.set(name, value)
+          return { resources: [{ errorCode: 0 }] }
+        },
+        describeConfigs: async ({ resources: [resource] }) => ({
+          resources: [
+            {
+              resourceName: resource.name,
+              resourceType: resource.type,
+              errorCode: 0,
+              configEntries: [...configs].map(([configName, configValue]) => ({
+                configName,
+                configValue,
+                configSource: 8,
+              })),
+            },
+          ],
+        }),
+      }
+    }
+    const kafka = {
+      shareConsumer: (options) => {
+        const client = instrumented.kafka.shareConsumer(options)
+        if (!driver.lastCycle?.members.aLeft && owner.counts.cycles !== 30) return client
+        const assignment = client.assignment.bind(client)
+        const disconnect = client.disconnect.bind(client)
+        let fetching = false
+        let started = false
+        let gate
+        const remove = client.on(client.events.REQUEST, ({ payload }) => {
+          if (payload.apiName === 'ShareFetch') fetching = true
+        })
+        const replay = () =>
+          fetchAnswer(
+            [
+              part({
+                topicId: SOAK_UUID,
+                partition: 0,
+                acquire: [acquired(0, 0, 2)],
+                records: batch({
+                  baseOffset: 0n,
+                  records: [record({ key: records[0][0].key, value: records[0][0].value })],
+                }).toString('hex'),
+              }),
+            ],
+            { acquisitionLockTimeoutMs: 30000 }
+          )
+        client.assignment = () => {
+          const current = assignment()
+          if (!started && fetching && current[0]?.partitions.length === 3) {
+            started = true
+            verifierStarts.push(performance.now())
+            if (replayAt !== undefined || drainReplay) {
+              gate = transport.hold({ api: 'ShareFetch', node: 0 })
+              if (!drainReplay) setTimeout(() => gate.release(replay()), replayAt)
+            }
+          }
+          return current
+        }
+        client.disconnect = async (options) => {
+          await io('verifier-disconnect', { owner, driver, clock })
+          if (drainReplay && gate?.settle) {
+            gate.release(replay())
+            await flush()
+          }
+          try {
+            return await disconnect(options)
+          } finally {
+            remove()
+          }
+        }
+        return client
+      },
+      admin,
+      producer: () => ({
+        connect: async () => io('phase-open', { owner, driver, clock }),
+        disconnect: async () => {},
+        send: async ({ messages }) => {
+          const partition = messages[0].partition
+          const baseOffset = String(records[partition].length)
+          for (const message of messages)
+            records[partition].push({
+              ...message,
+              offset: String(records[partition].length),
+              settled: false,
+              owner: null,
+              count: 0,
+            })
+          return [{ partition, baseOffset, errorCode: 0 }]
+        },
+      }),
+    }
+    const driver = new ShareSoakDriver({
+      kafka,
+      shares: resources,
+      tap,
+      brokers: ['node0:9092'],
+      socketFactory: instrumented.socketFactory,
+      ports: {
+        fixtures,
+        diagnostics,
+        bounded: require('../../../src/producer/__tests__/fixtures/bounded'),
+        probe: require('../../../src/producer/__tests__/fixtures/liveProbe'),
+        readLog: async () =>
+          new Map(
+            records.map((rows, partition) => [
+              partition,
+              {
+                endOffset: String(rows.length),
+                records: rows.map(({ offset, key, value }) => ({ offset, key, value })),
+              },
+            ])
+          ),
+      },
+    })
+    const owner = new ShareSoak({
+      driver,
+      kafka,
+      shares: resources,
+      short,
+      stack: new CleanupStack(),
+      clock: { now: () => performance.now() },
+      gate: new LiveRun(),
+      evidence: {
+        read: () => rows,
+        write: (row) => {
+          if (row.event === 'soak-cycle') {
+            if (row.verifier) firstWindow ??= JSON.parse(JSON.stringify(row.verifier))
+            if (row.status === 'passed') damage(row, { owner, firstWindow, rows, clock })
+          }
+          if (row.event === 'soak-resources' && row.kind === 'teardown')
+            finalDamage(owner.final, { owner, rows, clock })
+          rows.push(row)
+        },
+      },
+    })
+    let result
+    let error
+    let done = false
+    const work = owner
+      .run()
+      .then(
+        (value) => {
+          result = value
+        },
+        (failure) => {
+          error = failure
+        }
+      )
+      .finally(() => {
+        done = true
+      })
+    const cleanupErrors = []
+    try {
+      for (let tick = 0; tick < 5000; tick++) {
+        if (done) break
+        await clock.advance(250)
+      }
+      if (!done) throw new Error('The scripted schedule did not finish within its frozen envelope')
+      await work
+      cluster.assertClean()
+    } finally {
+      let closed = false
+      const closing = owner
+        .close()
+        .catch((failure) => cleanupErrors.push(failure))
+        .finally(() => {
+          closed = true
+        })
+      for (let tick = 0; tick < 100; tick++) {
+        if (closed) break
+        await clock.advance(250)
+      }
+      try {
+        await closing
+        await transport.close().catch((failure) => cleanupErrors.push(failure))
+        await flush()
+      } finally {
+        resources.restore()
+        globalThis.gc = exposed
+        clock.restore()
+      }
+    }
+    if (cleanupErrors.length) {
+      if (error) error.cleanupErrors = cleanupErrors
+      else if (result?.ok === false) result.cleanupErrors = cleanupErrors
+      else throw cleanupErrors[0]
+    }
+    return {
+      owner,
+      rows,
+      result,
+      error,
+      records,
+      verifierStarts,
+      reason: error?.message ?? result?.violations.join('; '),
+    }
+  }
+
+  test.each([true, false])(
+    'reconstructs thirty real adapter cycles and ten actual socket resets, short=%s',
+    async (short) => {
+      const { owner, rows, result, error, records } = await schedule({ short })
+      expect(error).toBeUndefined()
+      expect(result).toMatchObject({
+        ok: true,
+        violations: [],
+        counts: { cycles: 30, resets: 10, memberAdds: 30, memberRemoves: 30 },
+      })
+      expect(records.map((rows) => rows.length)).toEqual([600, 600, 600])
+      const cycles = rows.filter(({ event }) => event === 'soak-cycle')
+      expect(cycles).toHaveLength(30)
+      expect(
+        new Set([...cycles.map(({ verifier }) => verifier.memberId), owner.final.verifier.memberId])
+          .size
+      ).toBe(31)
+      expect(cycles.map(({ positions }) => positions[1].ends.map(({ high }) => high))).toEqual(
+        Array.from({ length: 30 }, (_, c) => Array(3).fill(String(20 * (c + 1))))
+      )
+      expect(
+        cycles
+          .filter(({ reset }) => reset)
+          .every(
+            ({ reset }) =>
+              reset.oldSocket !== reset.nextSocket && reset.oldEpoch > 0 && reset.nextEpoch === 0
+          )
+      ).toBe(true)
+      expect(rows.filter(({ event }) => event === 'soak-reset')).toHaveLength(10)
+      expect(
+        cycles.every(({ verifier }) => {
+          const start = verifier.events.find(({ kind }) => kind === 'window-start')
+          const end = verifier.events.find(({ kind }) => kind === 'window-end')
+          return end.at - start.at >= 5000
+        })
+      ).toBe(true)
+      expect(owner.final.verifier.openedAt).toBeGreaterThanOrEqual(
+        owner.timing.phases.at(-1).completedAt
+      )
+      expect(result.resources.measured.phases.every(({ heapSamples }) => heapSamples >= 6)).toBe(
+        true
+      )
+      expect(owner.elapsedProfileMs).toBe(short ? 480000 : 960000)
+      expect(owner.budget).toMatchObject({
+        watchdogMs: short ? 540000 : 1020000,
+        lifecycleMs: short ? 600000 : 1080000,
+      })
+    },
+    120000
+  )
+
+  test.each([
+    [
+      'missing original receipt',
+      (row) => {
+        row.provenance.outcomes.pop()
+      },
+      'successful Accept',
+    ],
+    [
+      'misbound receipt',
+      (row) => {
+        row.provenance.exchanges.find((e) => e.tickets.length).generation++
+      },
+      'partition receipt',
+    ],
+    [
+      'same acquisition dispatched twice',
+      (row) => {
+        row.handler.push({ ...row.handler[0] })
+      },
+      'dispatched more than once',
+    ],
+    [
+      'incomplete verifier partition coverage',
+      (row) => {
+        row.verifier.provenance.exchanges = row.verifier.provenance.exchanges.filter(
+          (e) =>
+            !e.response?.responses.some((t) => t.partitions.some((p) => p.partitionIndex === 2))
+        )
+      },
+      'measured observation window',
+    ],
+    [
+      'foreign verifier group',
+      (row) => {
+        row.verifier.provenance.exchanges.forEach((e) => {
+          e.groupId = 'foreign'
+        })
+      },
+      'measured observation window',
+    ],
+    [
+      'missing verifier close',
+      (row) => {
+        delete row.verifier.closedAt
+      },
+      'measured observation window',
+    ],
+    [
+      'shortened primitive window',
+      (row) => {
+        const start = row.verifier.events.find(({ kind }) => kind === 'window-start')
+        row.verifier.events.find(({ kind }) => kind === 'window-end').at = start.at + 4999
+      },
+      'measured observation window',
+    ],
+    [
+      'replayed old window',
+      (row, { firstWindow }) => {
+        if (row.cycle === 1) row.verifier = firstWindow
+      },
+      'original cycle window',
+    ],
+    [
+      'replayed old terminal reads',
+      (row, { rows }) => {
+        if (row.cycle === 1) row.positions = rows.find((r) => r.event === 'soak-cycle').positions
+      },
+      'terminal listings',
+    ],
+    [
+      'late prior-cycle entry',
+      (row, { owner }) => {
+        if (row.cycle === 1) owner.driver.onLateEntry([row.handler[0]])
+      },
+      'finalized share member',
+    ],
+    [
+      'missing reset',
+      (row) => {
+        if (row.cycle === 10) row.reset = null
+      },
+      'no original session reset',
+    ],
+    [
+      'slot completion one millisecond late',
+      (row, { clock }) => {
+        clock.skew(16001)
+      },
+      'absolute cutoff',
+    ],
+  ])(
+    'rejects %s through the same owner and reconstruction',
+    async (_name, damage, message) => {
+      const { result, reason, rows } = await schedule({ damage })
+      expect(result?.ok).not.toBe(true)
+      expect(reason).toContain(message)
+      expect(rows.some(({ event }) => event === 'case-complete')).toBe(false)
+    },
+    120000
+  )
+
+  test.each([1500, 4999])(
+    'a real verifier replay at +%i fails before another cycle can start',
+    async (replayAt) => {
+      const { reason, rows } = await schedule({ replayAt })
+      expect(reason).toContain('verifier')
+      const cycles = rows.filter(({ event }) => event === 'soak-cycle')
+      expect(cycles.map(({ cycle }) => cycle)).toEqual([0])
+      expect(cycles[0].verifier.delivered).toHaveLength(1)
+    },
+    120000
+  )
+
+  test('keeps real verifier observations through its disconnect callback and join', async () => {
+    const { reason, rows } = await schedule({ drainReplay: true })
+    expect(reason).toContain('verifier')
+    expect(rows.find(({ event }) => event === 'soak-cycle').verifier.delivered).toHaveLength(1)
+  }, 120000)
+
+  test('starts each complete window only after delayed original assignment and fetching', async () => {
+    const { result, error, rows } = await schedule({ assignmentDelay: 2000 })
+    expect(error).toBeUndefined()
+    expect(result.ok).toBe(true)
+    for (const { verifier } of rows.filter(({ event }) => event === 'soak-cycle')) {
+      const start = verifier.events.find(({ kind }) => kind === 'window-start')
+      const end = verifier.events.find(({ kind }) => kind === 'window-end')
+      expect(start.at - verifier.openedAt).toBeGreaterThanOrEqual(2000)
+      expect(end.at - start.at).toBeGreaterThanOrEqual(5000)
+    }
+  }, 120000)
+
+  test.each([
+    [
+      'silent wire partitions',
+      ({ owner, result }) => {
+        if (owner.driver.lastCycle?.members.aLeft) result.responses = []
+      },
+    ],
+    [
+      'partial wire coverage',
+      ({ owner, result }) => {
+        if (owner.driver.lastCycle?.members.aLeft)
+          result.responses = result.responses.map((topic) => ({
+            ...topic,
+            partitions: topic.partitions.filter((p) => p.partitionIndex !== 2),
+          }))
+      },
+    ],
+  ])(
+    'rejects %s with original corpus and public requests intact',
+    async (_name, wire) => {
+      const { reason, rows } = await schedule({ wire })
+      expect(reason).toContain('measured observation window')
+      expect(rows.filter(({ event }) => event === 'soak-cycle').map(({ cycle }) => cycle)).toEqual([
+        0,
+      ])
+    },
+    120000
+  )
+
+  test.each([
+    [
+      'slot exhausted before verifier admission',
+      'terminal-ends',
+      ({ driver }) => driver.lastCycle?.positions.length === 0,
+      12000,
+      'complete verifier window',
+    ],
+    [
+      'post-verifier read crosses slot by one',
+      'terminal-ends',
+      ({ driver }) => Boolean(driver.lastCycle?.verifier),
+      null,
+      'absolute cutoff',
+    ],
+    [
+      'verifier leave crosses slot by one',
+      'verifier-disconnect',
+      () => true,
+      null,
+      'absolute cutoff',
+    ],
+    [
+      'cumulative phase transitions',
+      'phase-open',
+      () => true,
+      2000,
+      'shared transition deadline exceeded',
+    ],
+    [
+      'combined final proof and cleanup',
+      'delete-topic',
+      () => true,
+      16000,
+      'shared cleanup deadline exceeded',
+    ],
+  ])(
+    'rejects %s without renewing its original allocation',
+    async (_name, selected, eligible, extra, message) => {
+      const { reason, rows } = await schedule({
+        io: async (event, context) => {
+          if (event !== selected || !eligible(context)) return
+          const { driver, clock } = context
+          clock.skew(extra ?? driver.lastCycle.timing.due - performance.now() + 1)
+        },
+      })
+      expect(reason).toContain(message)
+      expect(rows.some(({ event }) => event === 'case-complete')).toBe(false)
+    },
+    120000
+  )
+
+  test.each(['terminal-ends', 'verifier-disconnect'])(
+    'holds the next cycle while %s is unresolved',
+    async (selected) => {
+      let held = false
+      let unchanged = false
+      const { result, reason } = await schedule({
+        io: async (event, { owner, driver }) => {
+          if (
+            held ||
+            event !== selected ||
+            owner.counts.cycles !== 0 ||
+            (selected === 'terminal-ends' && !driver.lastCycle?.verifier)
+          )
+            return
+          held = true
+          const prefix = [...driver.acknowledged]
+          await new Promise((resolve) => setTimeout(resolve, 1000))
+          unchanged =
+            owner.counts.cycles === 0 &&
+            JSON.stringify(driver.acknowledged) === JSON.stringify(prefix)
+        },
+      })
+      expect(reason).toBe('')
+      expect(held).toBe(true)
+      expect(unchanged).toBe(true)
+      expect(result.ok).toBe(true)
+    },
+    120000
+  )
+
+  test('a final window cannot replace the thirty original cycle windows', async () => {
+    const { reason, rows } = await schedule({
+      damage: (row) => {
+        row.verifier.events = []
+      },
+    })
+    expect(reason).toContain('measured observation window')
+    expect(rows.some(({ event }) => event === 'case-complete')).toBe(false)
+  }, 120000)
+
+  test.each([
+    [
+      'replayed cycle window',
+      (final, { rows }) => {
+        final.verifier = rows.find((row) => row.event === 'soak-cycle').verifier
+      },
+    ],
+    [
+      'missing final response',
+      (final) => {
+        final.verifier.provenance.exchanges.forEach((e) => {
+          e.frames = []
+        })
+      },
+    ],
+    [
+      'missing final close',
+      (final) => {
+        delete final.verifier.closedAt
+      },
+    ],
+  ])(
+    'rejects %s through the final acceptance path',
+    async (_name, finalDamage) => {
+      const { reason, rows } = await schedule({ finalDamage })
+      expect(reason).toContain('final:')
+      expect(rows.some(({ event }) => event === 'case-complete')).toBe(false)
+    },
+    120000
+  )
 })

@@ -51,6 +51,21 @@ enabled('share consumer short soak', () => {
       expect(owner.timing.slots).toHaveLength(SHARE_SOAK.cycles)
       expect(owner.timing.slots.every(({ due, completedAt }) => completedAt <= due)).toBe(true)
       expect(owner.final.verifier.windowMs).toBe(5000)
+      const cycles = owner.evidence.read().filter(({ event }) => event === 'soak-cycle')
+      const verifiers = [...cycles.map(({ verifier }) => verifier), owner.final.verifier]
+      expect(new Set(verifiers.map(({ memberId }) => memberId)).size).toBe(31)
+      expect(
+        verifiers.every(
+          ({ openedAt, closedAt, provenance }) =>
+            Number.isFinite(openedAt) &&
+            Number.isFinite(closedAt) &&
+            closedAt >= openedAt &&
+            provenance.exchanges.some(({ apiKey }) => apiKey === 78)
+        )
+      ).toBe(true)
+      expect(owner.final.timing.startedAt).toBeGreaterThanOrEqual(
+        owner.timing.phases.at(-1).completedAt
+      )
     }),
     caseTimeout(BUDGET_MS)
   )
