@@ -1,0 +1,431 @@
+{
+  "schema": 1,
+  "purpose": "TF1 fixture for Phase 9F: broker-side KIP-714 reporter, independent OTLP decode, golden vectors. Test-only; never in the client tarball.",
+  "generatedAtUtc": "2026-10-18T15:47:56Z",
+  "composeProject": "kafkajs",
+  "composeFiles": {
+    "positive": "docker-compose.telemetry.yml (PLAINTEXT_HOST published and advertised on 19092/19095/19098 since H6a)",
+    "noPlugin": "docker-compose.yml (unchanged) + scripts/e2e/telemetry/base-ports.override.yml (published ports only)"
+  },
+  "configPaths": {
+    "reporterInContainer": "/opt/kafka/libs/counting-telemetry-reporter.jar",
+    "sinkInContainer": "/var/telemetry-evidence",
+    "sinkOnHost": "${TELEMETRY_EVIDENCE_DIR:-./.tmp/telemetry-evidence}",
+    "brokerSettings": {
+      "metric.reporters": "org.countly.kafkajs.telemetry.CountingTelemetryReporter",
+      "telemetry.max.bytes": "4096"
+    }
+  },
+  "classes": {
+    "reporter": "org.countly.kafkajs.telemetry.CountingTelemetryReporter",
+    "javaClient": "org.countly.kafkajs.telemetry.JavaTelemetryClient",
+    "relocatedOtlpPackages": [
+      "org.countly.kafkajs.telemetry.otlp.common.v1",
+      "org.countly.kafkajs.telemetry.otlp.resource.v1",
+      "org.countly.kafkajs.telemetry.otlp.metrics.v1"
+    ],
+    "unrelocatedOtlpPackages (offline generator)": [
+      "io.opentelemetry.proto.common.v1",
+      "io.opentelemetry.proto.resource.v1",
+      "io.opentelemetry.proto.metrics.v1"
+    ],
+    "interfaces": [
+      "org.apache.kafka.common.metrics.MetricsReporter",
+      "org.apache.kafka.server.telemetry.ClientTelemetryExporterProvider",
+      "org.apache.kafka.server.telemetry.ClientTelemetryExporter"
+    ]
+  },
+  "sink": {
+    "queueCapacity": 128,
+    "maxFileBytesPerNode": 2097152,
+    "maxRecordBytes": 4096,
+    "overflow": "writes OVERFLOW-<node>.json; the checkers fail on it"
+  },
+  "toolchain": {
+    "hostJdk": "openjdk version \"21.0.12.1\" 2026-08-18",
+    "javac": "javac 21.0.12.1",
+    "protoc": "libprotoc 25.5",
+    "node": "v26.7.0",
+    "python": "Python 3.13.5",
+    "docker": "Docker version 29.8.1, build 4a63305",
+    "compose": "Docker Compose version v5.5.1",
+    "jarFlags": "--date=2026-01-01T00:00:00Z (reproducible)",
+    "javacFlags": "--release 17 -Xlint:all"
+  },
+  "buildCommand": "TF1_CACHE=<cache> TF1_WORK=<work> TF1_OUT=scripts/e2e/telemetry/fixtures scripts/e2e/telemetry/fetch.sh && scripts/e2e/telemetry/build.sh <4.3.1|4.2.2> && scripts/e2e/telemetry/make-golden.sh",
+  "reproducibility": "two builds of the same inputs gave the same reporter jar SHA-256 (see evidence/build.txt)",
+  "inputs": {
+    "protoc": {
+      "url": "https://repo1.maven.org/maven2/com/google/protobuf/protoc/3.25.5/protoc-3.25.5-linux-x86_64.exe",
+      "cachePath": "tools/protoc-3.25.5-linux-x86_64.exe",
+      "sha256": "d69b0a9ac8264bb3d464ae22742430943aa0a6cdf3734180af5a607c0bf8adaa",
+      "verification": "Maven Central .sha1 601137f5367caaf202a28e3844dd6dbbc77b19af matched the received file (Central publishes no .sha256 for the exe)"
+    },
+    "protobuf-java": {
+      "url": "https://repo1.maven.org/maven2/com/google/protobuf/protobuf-java/3.25.5/protobuf-java-3.25.5.jar",
+      "cachePath": "jars/protobuf-java-3.25.5.jar",
+      "sha256": "8540247fad9e06baefa8fb45eb313802d019f485f14300e0f9d6b556ed88e753",
+      "verification": "Maven Central .sha1 5ae5c9ec39930ae9b5a61b32b93288818ec05ec1 matched; byte-identical to the jar inside both images"
+    },
+    "slf4j-api": {
+      "url": "https://repo1.maven.org/maven2/org/slf4j/slf4j-api/1.7.36/slf4j-api-1.7.36.jar",
+      "cachePath": "jars/slf4j-api-1.7.36.jar",
+      "sha256": "d3ef575e3e4979678dc01bf1dcce51021493b4d11fb7f1be8ad982877c16a1c0",
+      "verification": "Maven Central .sha1 6c62681a2f655b49963a5983b8b0950a6120ae14 matched; byte-identical to the jar inside both images"
+    },
+    "kafka-clients-4.3.1": {
+      "url": "https://repo1.maven.org/maven2/org/apache/kafka/kafka-clients/4.3.1/kafka-clients-4.3.1.jar",
+      "cachePath": "jars/kafka-clients-4.3.1.jar",
+      "sha256": "52501b7b47510c66f898871adaf6d2968ab7246561d44ced43643a8a587f0b36",
+      "verification": "Maven Central .sha256 52501b7b... and .sha1 matched; extracted entries identical to the image jar"
+    },
+    "kafka-clients-4.2.2": {
+      "url": "https://repo1.maven.org/maven2/org/apache/kafka/kafka-clients/4.2.2/kafka-clients-4.2.2.jar",
+      "cachePath": "jars/kafka-clients-4.2.2.jar",
+      "sha256": "109b6c65c134fd65a424563c8377510f4d42e278e9fef0961d0450173e65496a",
+      "verification": "Maven Central .sha256 109b6c65... and .sha1 matched; extracted entries identical to the image jar"
+    }
+  },
+  "otlpProto": {
+    "tag": "v1.9.0",
+    "files": [
+      {
+        "tag": "v1.9.0",
+        "url": "https://github.com/open-telemetry/opentelemetry-proto/raw/refs/tags/v1.9.0/opentelemetry/proto/common/v1/common.proto",
+        "path": "opentelemetry/proto/common/v1/common.proto",
+        "sha256": "354d818af9cb0ed67f7447b9cf8408f1ac8911cedea0db73c5309484ec2bcc04"
+      },
+      {
+        "tag": "v1.9.0",
+        "url": "https://github.com/open-telemetry/opentelemetry-proto/raw/refs/tags/v1.9.0/opentelemetry/proto/resource/v1/resource.proto",
+        "path": "opentelemetry/proto/resource/v1/resource.proto",
+        "sha256": "e0a7cdc0ffcfeffaa2606e8611839735ebffaa2d6acdf33e9356f2c48ae692d3"
+      },
+      {
+        "tag": "v1.9.0",
+        "url": "https://github.com/open-telemetry/opentelemetry-proto/raw/refs/tags/v1.9.0/opentelemetry/proto/metrics/v1/metrics.proto",
+        "path": "opentelemetry/proto/metrics/v1/metrics.proto",
+        "sha256": "d0a53dda45ad100edbf25675f5b339ce8bf689bdc51816f8cf19b0d51464e1a4"
+      }
+    ],
+    "relocation": "sed on option java_package: \"io.opentelemetry.proto.\" -> \"org.countly.kafkajs.telemetry.otlp.\" (broker libs carry their own io.opentelemetry.proto 1.3.2-alpha classes)",
+    "relocatedFiles": [
+      {
+        "path": "opentelemetry/proto/common/v1/common.proto",
+        "sha256": "74b00218af84ebcde0692f6571c743796d80dae493ef6ca124751b6c2e037a22"
+      },
+      {
+        "path": "opentelemetry/proto/resource/v1/resource.proto",
+        "sha256": "4610f9f06b90a861908b9f8d117b3bcee558ea75c348692a114725ecdeca91f1"
+      },
+      {
+        "path": "opentelemetry/proto/metrics/v1/metrics.proto",
+        "sha256": "68d937c5b7c60f9261fde5b607c1ba515524864083fc31680fd907ab6d25d97f"
+      }
+    ],
+    "unrelocatedBindingsJar": {
+      "path": "scripts/e2e/telemetry/fixtures/otlp-v1.9.0-bindings-unrelocated.jar",
+      "sha256": "99676bd7a6eff2b8e068a1ab10fe30cadf27958e82914adc6516699c88e266e7"
+    }
+  },
+  "kafkaSources": [
+    {
+      "kind": "kafka-source",
+      "tag": "4.3.1",
+      "url": "https://raw.githubusercontent.com/apache/kafka/4.3.1/clients/src/main/java/org/apache/kafka/server/telemetry/ClientTelemetry.java",
+      "sha256": "29ac0e665d0379cffefc855701e5b48f415346d23c92efa47897eefc47a18f8a"
+    },
+    {
+      "kind": "kafka-source",
+      "tag": "4.3.1",
+      "url": "https://raw.githubusercontent.com/apache/kafka/4.3.1/clients/src/main/java/org/apache/kafka/server/telemetry/ClientTelemetryContext.java",
+      "sha256": "cdd0792aa2dfa558481ee5e4a7b6a4f3304605c97d2b5ee707f9c00f6b39169b"
+    },
+    {
+      "kind": "kafka-source",
+      "tag": "4.3.1",
+      "url": "https://raw.githubusercontent.com/apache/kafka/4.3.1/clients/src/main/java/org/apache/kafka/server/telemetry/ClientTelemetryExporter.java",
+      "sha256": "2fad315353873187599441a5f61e4c033cec14885f327a71adfc3140813616a1"
+    },
+    {
+      "kind": "kafka-source",
+      "tag": "4.3.1",
+      "url": "https://raw.githubusercontent.com/apache/kafka/4.3.1/clients/src/main/java/org/apache/kafka/server/telemetry/ClientTelemetryExporterProvider.java",
+      "sha256": "6dab47d79e4ec710f0f63e4cc3e87eaa1bce58bf337ec9b982c2a0281b445a2a"
+    },
+    {
+      "kind": "kafka-source",
+      "tag": "4.3.1",
+      "url": "https://raw.githubusercontent.com/apache/kafka/4.3.1/clients/src/main/java/org/apache/kafka/server/telemetry/ClientTelemetryPayload.java",
+      "sha256": "5a1da70c2e9e0cc14e24db7287ee0937bc8eb7fbaf92bb7886807e26c3b03bc7"
+    },
+    {
+      "kind": "kafka-source",
+      "tag": "4.3.1",
+      "url": "https://raw.githubusercontent.com/apache/kafka/4.3.1/clients/src/main/java/org/apache/kafka/server/telemetry/ClientTelemetryReceiver.java",
+      "sha256": "9dc53c1016e75befb89b0cd2e506102a6e11fb3e153b6d87a7c229fb11e28228"
+    },
+    {
+      "kind": "kafka-source",
+      "tag": "4.3.1",
+      "url": "https://raw.githubusercontent.com/apache/kafka/4.3.1/clients/src/main/java/org/apache/kafka/common/metrics/MetricsReporter.java",
+      "sha256": "2186511eca75d0cace11d30e5b1c4ad082a3ab1c06c3a2c2dca3f54898d9da71"
+    },
+    {
+      "kind": "kafka-source",
+      "tag": "4.3.1",
+      "url": "https://raw.githubusercontent.com/apache/kafka/4.3.1/server/src/main/java/org/apache/kafka/server/metrics/ClientTelemetryExporterPlugin.java",
+      "sha256": "3692e21035855059d45658d9091e7040ee199c4b4974f4a42c954f1c741fa771"
+    },
+    {
+      "kind": "kafka-source",
+      "tag": "4.3.1",
+      "url": "https://raw.githubusercontent.com/apache/kafka/4.3.1/server/src/main/java/org/apache/kafka/server/metrics/DefaultClientTelemetryPayload.java",
+      "sha256": "b6570d588e44ce5b1c6b8b28d70f31a217c184128fbe3a8783fbf593511ee0f4"
+    },
+    {
+      "kind": "kafka-source",
+      "tag": "4.3.1",
+      "url": "https://raw.githubusercontent.com/apache/kafka/4.3.1/server/src/main/java/org/apache/kafka/server/metrics/ClientMetricsConfigs.java",
+      "sha256": "58c609870b784107818848c48bf0108df5df2faf4b66d7bd6c797b402a5bcda9"
+    },
+    {
+      "kind": "kafka-source",
+      "tag": "4.3.1",
+      "url": "https://raw.githubusercontent.com/apache/kafka/4.3.1/clients/src/main/resources/common/message/GetTelemetrySubscriptionsRequest.json",
+      "sha256": "8f4a3164b80a772dbf7afe734ef11344eac4c4058c26356ce8d0d88f54e4f892"
+    },
+    {
+      "kind": "kafka-source",
+      "tag": "4.3.1",
+      "url": "https://raw.githubusercontent.com/apache/kafka/4.3.1/clients/src/main/resources/common/message/GetTelemetrySubscriptionsResponse.json",
+      "sha256": "660e884cd04a1d502bb380b33f4eda7338b3369fcfbcef8bb032cf716c253fb1"
+    },
+    {
+      "kind": "kafka-source",
+      "tag": "4.3.1",
+      "url": "https://raw.githubusercontent.com/apache/kafka/4.3.1/clients/src/main/resources/common/message/PushTelemetryRequest.json",
+      "sha256": "e0b8a799925394fbc2af7c7e0e123aff3fb0fa012da0f204f91a3b3b4b232d73"
+    },
+    {
+      "kind": "kafka-source",
+      "tag": "4.3.1",
+      "url": "https://raw.githubusercontent.com/apache/kafka/4.3.1/clients/src/main/resources/common/message/PushTelemetryResponse.json",
+      "sha256": "a1de9c0ba764a2f78f374c87a5b9226cf2200d8658938db4e6e8092945137bae"
+    },
+    {
+      "kind": "kafka-source",
+      "tag": "4.2.2",
+      "url": "https://raw.githubusercontent.com/apache/kafka/4.2.2/clients/src/main/java/org/apache/kafka/server/telemetry/ClientTelemetry.java",
+      "sha256": "29ac0e665d0379cffefc855701e5b48f415346d23c92efa47897eefc47a18f8a"
+    },
+    {
+      "kind": "kafka-source",
+      "tag": "4.2.2",
+      "url": "https://raw.githubusercontent.com/apache/kafka/4.2.2/clients/src/main/java/org/apache/kafka/server/telemetry/ClientTelemetryContext.java",
+      "sha256": "cdd0792aa2dfa558481ee5e4a7b6a4f3304605c97d2b5ee707f9c00f6b39169b"
+    },
+    {
+      "kind": "kafka-source",
+      "tag": "4.2.2",
+      "url": "https://raw.githubusercontent.com/apache/kafka/4.2.2/clients/src/main/java/org/apache/kafka/server/telemetry/ClientTelemetryExporter.java",
+      "sha256": "2fad315353873187599441a5f61e4c033cec14885f327a71adfc3140813616a1"
+    },
+    {
+      "kind": "kafka-source",
+      "tag": "4.2.2",
+      "url": "https://raw.githubusercontent.com/apache/kafka/4.2.2/clients/src/main/java/org/apache/kafka/server/telemetry/ClientTelemetryExporterProvider.java",
+      "sha256": "6dab47d79e4ec710f0f63e4cc3e87eaa1bce58bf337ec9b982c2a0281b445a2a"
+    },
+    {
+      "kind": "kafka-source",
+      "tag": "4.2.2",
+      "url": "https://raw.githubusercontent.com/apache/kafka/4.2.2/clients/src/main/java/org/apache/kafka/server/telemetry/ClientTelemetryPayload.java",
+      "sha256": "5a1da70c2e9e0cc14e24db7287ee0937bc8eb7fbaf92bb7886807e26c3b03bc7"
+    },
+    {
+      "kind": "kafka-source",
+      "tag": "4.2.2",
+      "url": "https://raw.githubusercontent.com/apache/kafka/4.2.2/clients/src/main/java/org/apache/kafka/server/telemetry/ClientTelemetryReceiver.java",
+      "sha256": "9dc53c1016e75befb89b0cd2e506102a6e11fb3e153b6d87a7c229fb11e28228"
+    },
+    {
+      "kind": "kafka-source",
+      "tag": "4.2.2",
+      "url": "https://raw.githubusercontent.com/apache/kafka/4.2.2/clients/src/main/java/org/apache/kafka/common/metrics/MetricsReporter.java",
+      "sha256": "2186511eca75d0cace11d30e5b1c4ad082a3ab1c06c3a2c2dca3f54898d9da71"
+    },
+    {
+      "kind": "kafka-source",
+      "tag": "4.2.2",
+      "url": "https://raw.githubusercontent.com/apache/kafka/4.2.2/server/src/main/java/org/apache/kafka/server/metrics/ClientTelemetryExporterPlugin.java",
+      "sha256": "3692e21035855059d45658d9091e7040ee199c4b4974f4a42c954f1c741fa771"
+    },
+    {
+      "kind": "kafka-source",
+      "tag": "4.2.2",
+      "url": "https://raw.githubusercontent.com/apache/kafka/4.2.2/server/src/main/java/org/apache/kafka/server/metrics/DefaultClientTelemetryPayload.java",
+      "sha256": "b6570d588e44ce5b1c6b8b28d70f31a217c184128fbe3a8783fbf593511ee0f4"
+    },
+    {
+      "kind": "kafka-source",
+      "tag": "4.2.2",
+      "url": "https://raw.githubusercontent.com/apache/kafka/4.2.2/server/src/main/java/org/apache/kafka/server/metrics/ClientMetricsConfigs.java",
+      "sha256": "c2354c927efc1d996e118b2bd542143e1cb091a9143a63b7aa9b61456a388cfc"
+    },
+    {
+      "kind": "kafka-source",
+      "tag": "4.2.2",
+      "url": "https://raw.githubusercontent.com/apache/kafka/4.2.2/clients/src/main/resources/common/message/GetTelemetrySubscriptionsRequest.json",
+      "sha256": "8f4a3164b80a772dbf7afe734ef11344eac4c4058c26356ce8d0d88f54e4f892"
+    },
+    {
+      "kind": "kafka-source",
+      "tag": "4.2.2",
+      "url": "https://raw.githubusercontent.com/apache/kafka/4.2.2/clients/src/main/resources/common/message/GetTelemetrySubscriptionsResponse.json",
+      "sha256": "660e884cd04a1d502bb380b33f4eda7338b3369fcfbcef8bb032cf716c253fb1"
+    },
+    {
+      "kind": "kafka-source",
+      "tag": "4.2.2",
+      "url": "https://raw.githubusercontent.com/apache/kafka/4.2.2/clients/src/main/resources/common/message/PushTelemetryRequest.json",
+      "sha256": "e0b8a799925394fbc2af7c7e0e123aff3fb0fa012da0f204f91a3b3b4b232d73"
+    },
+    {
+      "kind": "kafka-source",
+      "tag": "4.2.2",
+      "url": "https://raw.githubusercontent.com/apache/kafka/4.2.2/clients/src/main/resources/common/message/PushTelemetryResponse.json",
+      "sha256": "a1de9c0ba764a2f78f374c87a5b9226cf2200d8658938db4e6e8092945137bae"
+    },
+    {
+      "kind": "kafka-source",
+      "tag": "4.3.1",
+      "url": "https://raw.githubusercontent.com/apache/kafka/4.3.1/clients/src/main/java/org/apache/kafka/common/telemetry/internals/KafkaMetricsCollector.java",
+      "sha256": "b02b7dd0321ea90f58c6b0bf2db905bf6c56fb3fd092f53a4460edeb4ab9c739"
+    }
+  ],
+  "lines": {
+    "4.3.1": {
+      "image": "apache/kafka:4.3.1",
+      "imageId": "sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837",
+      "repoDigests": [
+        "apache/kafka@sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837"
+      ],
+      "imageJava": "OpenJDK Runtime Environment Temurin-21.0.11+10 (build 21.0.11+10-LTS)",
+      "observedBrokerVersion": "Kafka version: 4.3.1 (org.apache.kafka.common.utils.AppInfoParser)",
+      "observedCommit": "Kafka commitId: 26b251a451ce941d (org.apache.kafka.common.utils.AppInfoParser)",
+      "imageKafkaClientsJarSha256": "dc3d65e3ac811a446184ea1dca0fe9cf957c2d8984dcb4668d01f4b77fc8f50e",
+      "imageProtobufJavaSha256": "8540247fad9e06baefa8fb45eb313802d019f485f14300e0f9d6b556ed88e753",
+      "imageOpenTelemetryProtoJarSha256 (the broker's own, 1.3.2-alpha, not used by the fixture)": "5e5d61a86cbdbc1db8c806894b6e4e253ea151671903ed51c021c705f7c37440",
+      "reporterJar": {
+        "path": "scripts/e2e/telemetry/fixtures/counting-telemetry-reporter-4.3.1.jar",
+        "sha256": "e04798357b0a22babcbb4b55890ebd6a3264c678830e4a06847d6854e4511aa7",
+        "compiledAgainst": "kafka-clients-4.3.1.jar (Maven Central, sha256 52501b7b47510c66f898871adaf6d2968ab7246561d44ced43643a8a587f0b36)"
+      },
+      "javaClientJar": {
+        "path": "scripts/e2e/telemetry/fixtures/java-telemetry-client-4.3.1.jar",
+        "sha256": "8866c6c4f38c163e1c4c328493c95089746abf5fb341d4c0d8f4ae62104b966a"
+      },
+      "evidence": "evidence/telemetry-4.3.1/"
+    },
+    "4.2.2": {
+      "image": "apache/kafka:4.2.2",
+      "imageId": "sha256:1213eb3943d551e5ed1fca7a4e109001cee35770b66a02a0c37a8964efe09b69",
+      "repoDigests": [
+        "apache/kafka@sha256:1213eb3943d551e5ed1fca7a4e109001cee35770b66a02a0c37a8964efe09b69"
+      ],
+      "imageJava": "OpenJDK Runtime Environment Temurin-21.0.12+8 (build 21.0.12+8-LTS)",
+      "observedBrokerVersion": "Kafka version: 4.2.2 (org.apache.kafka.common.utils.AppInfoParser)",
+      "observedCommit": "Kafka commitId: c5e942859576203e (org.apache.kafka.common.utils.AppInfoParser)",
+      "imageKafkaClientsJarSha256": "d010090690da026fb6ea93528a3681b31cd0bc7f85adeb4f4a743f766e7f7b8e",
+      "imageProtobufJavaSha256": "8540247fad9e06baefa8fb45eb313802d019f485f14300e0f9d6b556ed88e753",
+      "imageOpenTelemetryProtoJarSha256 (the broker's own, 1.3.2-alpha, not used by the fixture)": "5e5d61a86cbdbc1db8c806894b6e4e253ea151671903ed51c021c705f7c37440",
+      "reporterJar": {
+        "path": "scripts/e2e/telemetry/fixtures/counting-telemetry-reporter-4.2.2.jar",
+        "sha256": "e04798357b0a22babcbb4b55890ebd6a3264c678830e4a06847d6854e4511aa7",
+        "compiledAgainst": "kafka-clients-4.2.2.jar (Maven Central, sha256 109b6c65c134fd65a424563c8377510f4d42e278e9fef0961d0450173e65496a)"
+      },
+      "javaClientJar": {
+        "path": "scripts/e2e/telemetry/fixtures/java-telemetry-client-4.2.2.jar",
+        "sha256": "8866c6c4f38c163e1c4c328493c95089746abf5fb341d4c0d8f4ae62104b966a"
+      },
+      "evidence": "evidence/telemetry-4.2.2/"
+    }
+  },
+  "noPluginLines": {
+    "4.1.2": {
+      "imageId": "sha256:5cc2a2fd93fa2687b44015eee04fb2c3edd9e526bd64bf8bec5ff1e268772e0e",
+      "repoDigests": [
+        "apache/kafka@sha256:5cc2a2fd93fa2687b44015eee04fb2c3edd9e526bd64bf8bec5ff1e268772e0e"
+      ]
+    },
+    "4.0.2": {
+      "imageId": "sha256:836cafdad9f4825880d7cf1d5a21202915ae2527bd0ef1c3600c526ed7814d1f",
+      "repoDigests": [
+        "apache/kafka@sha256:836cafdad9f4825880d7cf1d5a21202915ae2527bd0ef1c3600c526ed7814d1f"
+      ]
+    }
+  },
+  "golden": {
+    "vectors": {
+      "path": "scripts/e2e/telemetry/fixtures/golden/vectors.json",
+      "sha256": "e928553569c754812d9d952dfbcf1195eac5aa3051486a226bde408dcba1f3e1"
+    },
+    "generator": {
+      "path": "scripts/e2e/telemetry/OtlpGoldenVectors.java",
+      "sha256": "464246d43489c545218e3204aecd89ce193ba9c07def5eb58d346dac53edaa73"
+    },
+    "protocDecodes": {
+      "hand-minimal": "3f5eda061a2ad762fd9141cad7140b168564d30acafbd79a5f876deb80907969",
+      "zero": "4e03ace79a5a320e967e2090ce1d35c4298f2f32042d61c0019f3c49c93f6378",
+      "nonzero": "c68e1c203111439255c19694e7e746340eaa11f53b5a08cf7299cde3fde3fc86",
+      "extremes": "11cb8e0e8ee8252ed62644c6b18dfc8c8ea3575c62cfd234b37ca324bc642cc3"
+    }
+  },
+  "scripts": {
+    "CountingTelemetryReporter.java": "e9dc518682042474b0217883b24ebb0fb75bf2275901c5fa4df15e6487abb96a",
+    "JavaTelemetryClient.java": "27e3fb34c247f514a0e07a07e85448e7c1bd6bc27eaa3fe301af04721f01eab3",
+    "OtlpGoldenVectors.java": "464246d43489c545218e3204aecd89ce193ba9c07def5eb58d346dac53edaa73",
+    "base-ports.override.yml": "945b4b163977dbcdfc05301865fb2771aef8cb1ec40795aed1fff0a951276429",
+    "build.sh": "a9f64eb1e4f4466e009df59dd3d5f4b10425eed7ef37c646bd61d2bea90f2bb0",
+    "check-exports.py": "3b607b9c28b5e855a9f65d9ff82952fe399ca5fac0c1b644a6604faa9c98df67",
+    "check-golden-protoc.py": "047fdb999918513e22cba75164197e5a92d29b40324dd3d2daf5c537fbf4540c",
+    "check-golden.py": "e7734ff4569b0317505238e380f638095b2e6a0edf8ceec2a8d3910116514b83",
+    "fetch.sh": "3d878bb99cdf6cb12173c2c9ed10e902b1ca8c2b0f44d01ac7b000bf010e5b26",
+    "lib.sh": "e439e1d349bb8e2e9f8c7e97d1175a5671c89ca2596f4a3b0e523c756f6d5cdc",
+    "make-golden.sh": "fe81af51242bff3d7c98de7be40911ab1a9a581caaba1fffaba98a6616db12ca",
+    "protoc-text-to-semantic.py": "996dbb4b65a6f128a61d22d614c4f61fc1d467d97b5ca0c3cae4b063be12870f",
+    "run-base-arm.sh": "dde2dbdec29f980a6dba82afe451db10c148ba576f491e536264e4239b0e5028",
+    "run-checker-controls.sh": "592b5e651298a0e37697fed90c0c3eaba40e1adf2f7e450dbd473f4b5ecdc132",
+    "run-java-terminating-repeat.sh": "49912ff502862a357b6b49219dbc51f398dc02d3ec6d92a0f13889ea2569d240",
+    "run-telemetry-arm.sh": "40a193d73372f5d04a0b2a8ad87ce0b4c50f093e04d532c82e8026e04215c683",
+    "telemetryWireProbe.js": "139afdbec5034f7c1498b90306889fd918ae13097efee1ea9f435b03dcf9b1b1",
+    "write-manifest.py": "eec2d6191d622a9bc60470c860192aec9a4db8107ec8ac45de468af1bb7be0a4",
+    "telemetryMetadataFollow.js": "a2b48f78e0721700d2fd8312cf32617ba457da35c3ce995ab84974bdac693cab",
+    "check-metadata-follow.py": "2ef3039b1c7214372fe7f26e818328a7f8bbc9f638f1413ed3c6a899c406c013",
+    "run-h6a-arm.sh": "edc7de09967a45fb3f149ed27f95bbd360a023c222395c5006f78e99470e9fa2"
+  },
+  "composeSha256": {
+    "docker-compose.telemetry.yml": "106c4ff1ad900a6d2351fa5702b23dfcc257023444f0d8bdd6341e6daceb454c"
+  },
+  "amendments": [
+    {
+      "id": "H6a",
+      "date": "2026-10-18",
+      "change": "docker-compose.telemetry.yml: PLAINTEXT_HOST advertised endpoints changed from localhost:9092/9095/9098 to localhost:19092/19095/19098 (the published host ports); header comment updated; nothing else changed",
+      "composeSha256Before": "d7da0f98a1c2c32006e60444ea6e35843bbbc78f7718e9ca5c9ce76138df2754",
+      "composeSha256After": "106c4ff1ad900a6d2351fa5702b23dfcc257023444f0d8bdd6341e6daceb454c",
+      "evidence": [
+        "evidence/h6a-4.3.1/",
+        "evidence/h6a-4.2.2/",
+        "evidence/h6a-control-pre-fix-4.3.1/"
+      ],
+      "preH6aManifest": "evidence/h6a-4.3.1/manifest.pre-h6a.json",
+      "addedScripts": [
+        "telemetryMetadataFollow.js",
+        "check-metadata-follow.py",
+        "run-h6a-arm.sh"
+      ]
+    }
+  ]
+}

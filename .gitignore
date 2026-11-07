@@ -26,3 +26,6 @@ upgrade-ref/
 upgrade-ref-index.md
 CODEX_brainstorm.md
 skills-lock.json
+
+# Reporter jars are built in CI from the committed source and verified against the manifest; never committed.
+scripts/e2e/telemetry/fixtures/*.jar
