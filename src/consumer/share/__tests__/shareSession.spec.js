@@ -579,6 +579,8 @@ describe('share session socket integration', () => {
       ['an acknowledgement request timeout', 79, 'timeout'],
       ['a piggybacked fetch request timeout', 78, 'timeout'],
       ['an acknowledgement in-flight disconnect', 79, 'disconnect'],
+      ['an acknowledgement close-only socket destruction', 79, 'close'],
+      ['a piggybacked fetch close-only socket destruction', 78, 'close'],
     ])('drops %s instead of resending it', async (label, apiKey, failure) => {
       h = await harness()
       const [m] = h.members
@@ -600,7 +602,21 @@ describe('share session socket integration', () => {
       ])
       const connection = m.pool.pool[1]
       if (failure === 'timeout') [...connection.requestQueue.inflight.values()][0].timeoutRequest()
-      else await connection.disconnect({ drainTimeout: 0 })
+      else if (failure === 'disconnect') await connection.disconnect({ drainTimeout: 0 })
+      else {
+        const socket = connection.socket
+        const onEnd = jest.fn()
+        const onError = jest.fn()
+        socket.on('end', onEnd)
+        socket.on('error', onError)
+        socket.destroy()
+        await flush()
+        expect(m.resets).toHaveLength(1)
+        expect(onEnd).not.toHaveBeenCalled()
+        expect(onError).not.toHaveBeenCalled()
+        expect(connection.isConnected()).toBe(false)
+        expect(m.session.epoch).toBe(0)
+      }
       expect((await call).value).toMatchObject({ reset: true, backoff: true })
       expect(m.session.refusal(open)).toBeInstanceOf(Error)
       expect(m.pool.generationFor(78)).toBe(generation)

@@ -1,5 +1,7 @@
 const fetchAcknowledgementResponse = require('../../../protocol/requests/shareFetch/v2/response')
 const acknowledgeResponse = require('../../../protocol/requests/shareAcknowledge/v2/response')
+const Decoder = require('../../../protocol/decoder')
+const { responseHeaderVersion, RESPONSE_HEADER_V1 } = require('../../../protocol/headers')
 const {
   acknowledgementResults,
   acknowledgementRequests,
@@ -21,6 +23,7 @@ const {
 const {
   assertShareCleanup,
   captureShareCleanupBaseline,
+  waitForShareFixtureAbsence,
   setShareGroupConfigs,
   resetShareGroupConfigs,
   shareRecordIdentity,
@@ -65,6 +68,16 @@ const OLD_TIMESTAMP = '1700000000000'
 const SHARE_FETCH = 78
 const SHARE_ACKNOWLEDGE = 79
 const SHARE_APIS = new Set([76, 78, 79])
+const ADMIN_TRACE_APIS = {
+  3: require('../../../protocol/requests/metadata'),
+  10: require('../../../protocol/requests/findCoordinator'),
+  16: require('../../../protocol/requests/listGroups'),
+  18: require('../../../protocol/requests/apiVersions'),
+  20: require('../../../protocol/requests/deleteTopics'),
+  33: require('../../../protocol/requests/describeConfigs'),
+  42: require('../../../protocol/requests/deleteGroups'),
+  44: require('../../../protocol/requests/incrementalAlterConfigs'),
+}
 const RENEW = 4
 const ACCEPT = 1
 const INVALID_RECORD_STATE = 121
@@ -428,6 +441,30 @@ class AcknowledgementTrace {
 let fileStart = 0
 
 /**
+ * Preserves nested cleanup failures and their timings without following repeated causes.
+ * @param {Error} error Original failure.
+ * @param {Set<Error>} [seen] Ancestors already described.
+ * @returns {object|null} Original error details, including aggregate and cleanup failures.
+ */
+const cleanupError = (error, seen = new Set()) => {
+  if (error == null) return null
+  const detail = {
+    ...describeError(error),
+    message: String(error.message),
+    step: error.step,
+    elapsedMs: error.elapsedMs,
+  }
+  if (seen.has(error)) return detail
+  const ancestors = new Set([...seen, error])
+  return {
+    ...detail,
+    cause: error.cause ? cleanupError(error.cause, ancestors) : undefined,
+    errors: error.errors?.map((failure) => cleanupError(failure, ancestors)),
+    cleanupErrors: error.cleanupErrors?.map((failure) => cleanupError(failure, ancestors)),
+  }
+}
+
+/**
  * Splits a byte stream into whole length-prefixed Kafka frames.
  */
 class FrameSplitter {
@@ -506,9 +543,16 @@ class Hold {
 class ShareWireTap {
   /**
    * @param {Function} [connect] opens one socket; replaced by a fake in the offline checks
+   * @param {Function} [recordAdmin] Receives admin request and response frame observations.
    */
-  constructor(connect = ({ host, port, onConnect }) => net.connect({ host, port }, onConnect)) {
+  constructor(
+    connect = ({ host, port, onConnect }) => net.connect({ host, port }, onConnect),
+    recordAdmin = () => {}
+  ) {
     this.connect = connect
+    this.recordAdmin = recordAdmin
+    this.traceAdmin = false
+    this.adminFrames = []
     this.sockets = []
     this.frames = []
     this.holds = []
@@ -523,16 +567,17 @@ class ShareWireTap {
     return (options) => {
       const socket = this.connect(options)
       socket.setKeepAlive?.(true, 60000)
-      return this.wrap(label, this.acknowledgements.wrap(socket, label))
+      return this.wrap(label, this.acknowledgements.wrap(socket, label), options)
     }
   }
 
   /**
    * @param {string} label the owning client
    * @param {object} socket the real socket
+   * @param {{host?:string, port?:number}} [address] Original connection destination.
    * @returns {object} the same socket, observed
    */
-  wrap(label, socket) {
+  wrap(label, socket, address = {}) {
     const entry = {
       label,
       socket,
@@ -540,12 +585,16 @@ class ShareWireTap {
       reader: new FrameSplitter(),
       sent: 0,
       answered: 0,
+      broker: `${address.host}:${address.port}`,
+      pendingAdmin: new Map(),
     }
     this.sockets.push(entry)
     const write = socket.write.bind(socket)
     socket.write = (data, ...rest) => this.write(entry, write, data, rest)
     socket.on('data', (chunk) => {
-      entry.answered += entry.reader.push(chunk).length
+      const frames = entry.reader.push(chunk)
+      entry.answered += frames.length
+      for (const frame of frames) this.adminResponse(entry, frame)
     })
     return socket
   }
@@ -566,19 +615,46 @@ class ShareWireTap {
     const headers = frames.map((frame) => this.record(entry, frame))
     const whole = frames.length === 1 && frames[0].length === bytes.length
     const hold = whole && this.holds.find((h) => h.matches(entry.label, headers[0].apiKey))
-    if (!hold) return write(data, ...rest)
+    if (!hold) {
+      const result = write(data, ...rest)
+      for (const { correlationId } of headers) {
+        const fact = entry.pendingAdmin.get(correlationId)
+        if (!fact) continue
+        fact.writeReturnedAt = performance.now()
+        this.recordAdmin({ status: 'written', ...fact })
+      }
+      return result
+    }
     hold.pending = () => write(data, ...rest)
     return true
   }
 
   /**
-   * Keeps every share request frame with its header facts and write time.
+   * Keeps share frames and cleanup admin frames with their original headers and write times.
    * @param {object} entry the observed socket
    * @param {Buffer} frame one whole request frame
    * @returns {{ apiKey: number }} the decoded request header
    */
   record(entry, frame) {
     const header = readRequestHeader(frame)
+    if (entry.label === 'admin' && this.traceAdmin) {
+      const fact = {
+        broker: entry.broker,
+        socket: this.sockets.indexOf(entry),
+        apiKey: header.apiKey,
+        apiVersion: header.apiVersion,
+        correlationId: header.correlationId,
+        writtenAt: performance.now(),
+        writeReturnedAt: null,
+        answeredAt: null,
+        requestHex: frame.toString('hex'),
+        responseHex: null,
+        response: null,
+      }
+      this.adminFrames.push(fact)
+      entry.pendingAdmin.set(header.correlationId, fact)
+      this.recordAdmin({ status: 'write-started', ...fact })
+    }
     if (SHARE_APIS.has(header.apiKey)) {
       this.frames.push({
         label: entry.label,
@@ -592,6 +668,38 @@ class ShareWireTap {
       })
     }
     return header
+  }
+
+  /**
+   * Pairs an admin answer with its original socket and request, retaining undecoded bytes on error.
+   * @param {object} entry Observed socket and its unanswered admin requests.
+   * @param {Buffer} frame Complete response frame including length and correlation ID.
+   * @returns {void} Decoding is observed without delaying the client.
+   */
+  adminResponse(entry, frame) {
+    const fact = entry.pendingAdmin.get(frame.readInt32BE(4))
+    if (!fact) return
+    entry.pendingAdmin.delete(fact.correlationId)
+    fact.answeredAt = performance.now()
+    fact.responseHex = frame.toString('hex')
+    this.recordAdmin({ status: 'answered', ...fact })
+    Promise.resolve()
+      .then(async () => {
+        const definitions = ADMIN_TRACE_APIS[fact.apiKey]
+        if (!definitions) return
+        const payload = frame.subarray(8)
+        const decoder = new Decoder(payload)
+        if (responseHeaderVersion(fact.apiKey, fact.apiVersion) === RESPONSE_HEADER_V1) {
+          decoder.readTaggedFields()
+        }
+        const { response } = definitions.protocol({ version: fact.apiVersion })({})
+        fact.response = await response.decode(payload.subarray(decoder.offset))
+        this.recordAdmin({ status: 'decoded', ...fact })
+      })
+      .catch((error) => {
+        fact.decodeError = describeError(error)
+        this.recordAdmin({ status: 'decode-failed', ...fact })
+      })
   }
 
   /** @returns {Record<string, Record<number, number>>} written share frames by client and API */
@@ -774,6 +882,33 @@ class ResourceGauge {
     )
   }
 
+  /** @returns {object[]} Original admin queue entries and throttle/timer state without more I/O. */
+  adminQueues() {
+    return [...this.queues]
+      .filter(({ clientId }) => clientId?.startsWith('admin-'))
+      .map((queue) => ({
+        broker: queue.broker,
+        throttledUntil: queue.throttledUntil,
+        pendingCheckScheduled: Boolean(queue.throttleCheckTimeoutId),
+        timeoutCheckScheduled: Boolean(queue.requestTimeoutIntervalId),
+        pending: queue.pending.map(
+          ({ entry: { apiKey, apiVersion, correlationId }, createdAt }) => ({
+            apiKey,
+            apiVersion,
+            correlationId,
+            createdAt,
+          })
+        ),
+        inflight: [...queue.inflight.values()].map(({ entry, createdAt, sentAt }) => ({
+          apiKey: entry.apiKey,
+          apiVersion: entry.apiVersion,
+          correlationId: entry.correlationId,
+          createdAt,
+          sentAt,
+        })),
+      }))
+  }
+
   /**
    * @param {Iterable<import('events').EventEmitter>} emitters Original client or queue emitters.
    * @returns {number} Listeners over every event of every retained emitter.
@@ -828,7 +963,17 @@ class LockCase {
     this.topic = shareTopicName(`lock-${kind}`)
     this.group = `e2e-p9e-lock-${kind}-group-${this.nonce}`
     this.stack = new CleanupStack()
-    this.tap = new ShareWireTap()
+    this.cleanupSteps = []
+    this.tap = new ShareWireTap(undefined, (frame) =>
+      this.row('cleanup-frame', {
+        steps: this.cleanupSteps
+          .filter(({ elapsedMs }) => elapsedMs === null)
+          .map(({ step }) => step),
+        ...frame,
+        writtenAtMs: frame.writtenAt - this.startedAt,
+        answeredAtMs: frame.answeredAt === null ? null : frame.answeredAt - this.startedAt,
+      })
+    )
     this.gauge = new ResourceGauge()
     this.probe = this.gauge.probe({
       emitters: { process },
@@ -898,6 +1043,45 @@ class LockCase {
     })
   }
 
+  /**
+   * Registers a cleanup with its original order, scope and deadline, adding step diagnostics.
+   * @param {string} step Operation name.
+   * @param {Function} close Cleanup operation receiving the stack's signal.
+   * @returns {void}
+   */
+  addCleanup(step, close) {
+    this.stack.add(step, (signal) => this.cleanupStep(step, () => close(signal)))
+  }
+
+  /**
+   * Records the start, duration and original outcome of one cleanup operation.
+   * @param {string} step Operation name.
+   * @param {Function} work Operation to run and join.
+   * @returns {Promise<*>} Original result.
+   */
+  async cleanupStep(step, work) {
+    this.tap.traceAdmin = true
+    const startedAt = performance.now()
+    const entry = { step, startedAtMs: startedAt - this.startedAt, elapsedMs: null, error: null }
+    this.cleanupSteps.push(entry)
+    this.row('cleanup-step', { status: 'started', step, startedAtMs: entry.startedAtMs })
+    try {
+      return await work()
+    } catch (error) {
+      error.step ??= step
+      error.elapsedMs ??= performance.now() - startedAt
+      entry.error = cleanupError(error)
+      throw error
+    } finally {
+      entry.elapsedMs = performance.now() - startedAt
+      this.row('cleanup-step', {
+        status: entry.error ? 'failed' : 'settled',
+        ...entry,
+        adminQueues: this.gauge.adminQueues(),
+      })
+    }
+  }
+
   /** @returns {object} Handler counts, actual outcomes and original wire acknowledgements. */
   progress() {
     return {
@@ -919,6 +1103,8 @@ class LockCase {
       },
       acknowledgementRequests: acknowledgementRequests(this.tap.frames),
       wireAcknowledgements: this.tap.acknowledgements.snapshot(),
+      cleanupSteps: this.cleanupSteps,
+      adminCleanupRequests: this.tap.adminFrames,
     }
   }
 
@@ -963,7 +1149,7 @@ class LockCase {
       )
       await this.complete(scope)
     } catch (error) {
-      this.row('case-failed', { error: describeError(error), ...this.progress() })
+      this.row('case-failed', { error: cleanupError(error), ...this.progress() })
       throw error
     } finally {
       this.gauge.uninstall()
@@ -978,14 +1164,13 @@ class LockCase {
    */
   async setup(scope) {
     this.admin = this.client('admin').admin()
-    this.stack.add('prove cleanup and disconnect admin', (signal) => this.cleanup(signal))
-    this.stack.add(
+    this.addCleanup('prove cleanup and disconnect admin', (signal) => this.cleanup(signal))
+    this.addCleanup(
       'remove admin listeners',
       this.admin.on(this.admin.events.REQUEST, ({ payload }) => this.requests.push(payload))
     )
-    this.stack.add('delete topic', (signal) => this.deleteTopic(signal))
-    this.stack.add('delete group', (signal) => this.deleteGroup(signal))
-    this.stack.add('reset group configs', (signal) => this.resetConfigs(signal))
+    this.addCleanup('delete fixtures', (signal) => this.deleteFixtures(signal))
+    this.addCleanup('reset group configs', (signal) => this.resetConfigs(signal))
     await bounded(scope, 10000, () => this.admin.connect())
     await bounded(scope, 20000, () =>
       createTopic({
@@ -1005,11 +1190,11 @@ class LockCase {
     this.row('resource-baseline', { snapshot: this.baseline })
 
     this.producer = this.client('producer').producer({ idempotent: true })
-    this.stack.add(
+    this.addCleanup(
       'remove producer listeners',
       this.producer.on(this.producer.events.REQUEST, ({ payload }) => this.requests.push(payload))
     )
-    this.stack.add('disconnect producer', () => this.producer.disconnect())
+    this.addCleanup('disconnect producer', () => this.producer.disconnect())
     await bounded(scope, 10000, () => this.producer.connect())
 
     this.gateB = this.tap.hold('B', SHARE_FETCH)
@@ -1054,8 +1239,8 @@ class LockCase {
       consumer.on(events.REQUEST, ({ payload }) => this.requests.push(payload)),
       consumer.on(events.FETCH, ({ payload }) => this.onFetch(member, payload)),
     ]
-    this.stack.add(`remove ${label} listeners`, () => removers.forEach((remove) => remove()))
-    this.stack.add(`disconnect and join ${label}`, async () => {
+    this.addCleanup(`remove ${label} listeners`, () => removers.forEach((remove) => remove()))
+    this.addCleanup(`disconnect and join ${label}`, async () => {
       this.tap.discardHolds()
       await consumer.disconnect({ timeout: 2000 })
       await Promise.allSettled([...this.handlerWork])
@@ -1542,7 +1727,7 @@ class LockCase {
       open = resolve
     })
     this.expiryGate = { promise, openedAt: null }
-    this.stack.add('release the expiry handler', () => {
+    this.addCleanup('release the expiry handler', () => {
       this.expiryGate.openedAt ??= performance.now()
       open()
     })
@@ -1992,28 +2177,68 @@ class LockCase {
    * @returns {Promise<void>}
    */
   async cleanup(signal) {
-    try {
-      if (this.baseline) {
-        signal.throwIfAborted()
-        this.after = await assertShareCleanup(
-          this.admin,
-          [this.group],
-          [this.topic],
-          this.baseline,
-          this.probe,
-          { signal, disconnectAdmin: true }
-        )
+    this.tap.discardHolds()
+    const failures = []
+    const steps = [
+      [
+        'prove fixture absence on every broker',
+        () =>
+          waitForShareFixtureAbsence(this.admin, [this.group], [this.topic], {
+            signal,
+            unrelated: [],
+            delayMs: 50,
+            record: (event, fields) => this.row(event, fields),
+          }),
+      ],
+      [
+        'prove resources',
+        async () => {
+          if (this.baseline) {
+            this.after = await assertShareCleanup(this.admin, [], [], this.baseline, this.probe, {
+              signal,
+              disconnectAdmin: true,
+              record: (event, fields) => this.row(event, fields),
+            })
+          }
+        },
+      ],
+      ['disconnect admin', () => this.admin.disconnect()],
+    ]
+    for (const [step, work] of steps) {
+      try {
+        await this.cleanupStep(step, work)
+      } catch (error) {
+        failures.push(error)
       }
-    } finally {
-      this.tap.discardHolds()
-      await this.admin.disconnect()
     }
+    if (failures.length) throw new AggregateError(failures, 'Cleanup proof failed')
+  }
+
+  /**
+   * Deletes share group state before its topic, then proves their absence together in cleanup.
+   * @param {AbortSignal} signal Cleanup scope shared by both operations.
+   * @returns {Promise<void>} Once both deletion operations have settled.
+   */
+  async deleteFixtures(signal) {
+    const failures = []
+    for (const [step, work] of [
+      ['delete group', () => this.deleteGroup(signal)],
+      ['delete topic', () => this.deleteTopic(signal)],
+    ]) {
+      try {
+        signal.throwIfAborted()
+        await this.cleanupStep(step, work)
+      } catch (error) {
+        failures.push(error)
+      }
+    }
+    if (failures.length) throw new AggregateError(failures, 'Fixture deletion failed')
   }
 
   /**
    * @param {AbortSignal} signal the cleanup scope
    * @returns {Promise<void>}
-   * @throws {Error} when the topic is still listed after deletion
+   * @throws {Error} When deletion is refused; the final cleanup proof checks absence.
    */
   async deleteTopic(signal) {
     await bounded(signal, 10000, () =>
@@ -2021,20 +2246,12 @@ class LockCase {
     ).catch((error) => {
       if (error.type !== 'UNKNOWN_TOPIC_OR_PARTITION') throw error
     })
-    await pollUntil(
-      signal,
-      10000,
-      async () => !(await this.admin.listTopics()).includes(this.topic),
-      {
-        label: 'The topic disappearing',
-      }
-    )
   }
 
   /**
    * @param {AbortSignal} signal the cleanup scope
    * @returns {Promise<void>}
-   * @throws {Error} when the group is still listed after deletion
+   * @throws {Error} When deletion is refused; the final cleanup proof checks absence.
    */
   async deleteGroup(signal) {
     await pollUntil(
@@ -2051,14 +2268,7 @@ class LockCase {
           throw error
         }
       },
-      { label: 'The group deletion' }
-    )
-    await pollUntil(
-      signal,
-      10000,
-      async () =>
-        !(await this.admin.listGroups()).groups.some(({ groupId }) => groupId === this.group),
-      { label: 'The group disappearing' }
+      { delayMs: 50, label: 'The group deletion' }
     )
   }
 

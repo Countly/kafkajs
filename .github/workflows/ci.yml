@@ -37,6 +37,7 @@ jobs:
       - run: npm run test:pack
   integration:
     runs-on: ubuntu-latest
+    timeout-minutes: ${{ matrix.timeout || 360 }}
     needs: [unit]
     strategy:
       fail-fast: false
@@ -53,7 +54,7 @@ jobs:
           - { node: 22, kafka: 4.3.1, group: others }
           - { node: 26, kafka: 4.3.1, group: broker }
           - { node: 26, kafka: 4.3.1, group: others }
-          - { node: 24, kafka: 4.3.1, group: share-base }
+          - { node: 24, kafka: 4.3.1, group: share-base, timeout: 35 }
           - { node: 24, kafka: 4.4.0, group: share-base, clients: 4.4.0 }
           - { node: 24, kafka: 4.3.1, group: share, compose: docker-compose.share.yml }
           - { node: 24, kafka: 4.4.0, group: share, compose: docker-compose.share.yml, clients: 4.4.0 }
@@ -81,43 +82,21 @@ jobs:
         env:
           DO_NOT_STOP: '1'
         run: ./scripts/testWithKafka.sh "npm run test:group:${{ matrix.group }} -- --ci"
+      - name: Run share soak (natural exit)
+        if: matrix.group == 'share-base' && matrix.kafka == '4.3.1'
+        timeout-minutes: 18
+        env:
+          KAFKAJS_LANE: docker
+          KAFKAJS_DEBUG_PROTOCOL_BUFFERS: '1'
+          SHARE_SOAK_E2E: '1'
+        run: node scripts/ci/naturalExit.js soak
       - name: Prove shutdown exits naturally
         if: matrix.group == 'share'
         env:
           KAFKAJS_LANE: docker
           KAFKAJS_DEBUG_PROTOCOL_BUFFERS: '1'
           SHARE_SHUTDOWN_E2E: '1'
-        run: |
-          node <<'NODE'
-          const fs = require('fs')
-          const { spawnSync } = require('child_process')
-          const startedAt = Number(process.hrtime.bigint() / 1000000n)
-          const result = spawnSync(process.execPath, [
-            'node_modules/jest/bin/jest.js', '--ci', '--detectOpenHandles', '--runInBand',
-            '--runTestsByPath', 'src/consumer/share/__tests__/shareShutdownLive.spec.js',
-          ], { stdio: 'inherit', timeout: 120000, killSignal: 'SIGKILL' })
-          const exitedAt = Number(process.hrtime.bigint() / 1000000n)
-          fs.writeFileSync('.tmp/e2e/share-shutdown-exit.json', JSON.stringify({
-            startedAt, exitedAt, status: result.status, signal: result.signal,
-            error: result.error?.message,
-          }) + '\n')
-          if (result.error) throw result.error
-          if (result.status !== 0 || result.signal) throw new Error('Shutdown Jest did not exit successfully')
-          const rows = fs.readFileSync('.tmp/e2e/share-shutdown.jsonl', 'utf8')
-            .trim().split('\n').map(JSON.parse)
-          const done = rows.filter(row => row.event === 'case-complete')
-          if (done.length !== 3 || new Set(done.map(row => row.case)).size !== 3 ||
-              rows.some(row => row.event === 'case-failed') ||
-              done.some(row => row.status !== 'passed' || row.tainted !== false ||
-                !Number.isSafeInteger(row.cleanup?.completedAt) ||
-                row.cleanup.completedAt < startedAt || row.cleanup.completedAt > exitedAt)) {
-            throw new Error('Shutdown evidence has incomplete or invalid cleanup timestamps')
-          }
-          const cleanupAt = Math.max(...done.map(row => row.cleanup.completedAt))
-          if (exitedAt - startedAt > 120000 || exitedAt - cleanupAt > 10000) {
-            throw new Error('Shutdown did not exit naturally within its process and cleanup bounds')
-          }
-          NODE
+        run: node scripts/ci/naturalExit.js shutdown
       - name: Verify share evidence before teardown
         if: always() && startsWith(matrix.group, 'share')
         run: |

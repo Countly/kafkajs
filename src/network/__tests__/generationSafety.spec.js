@@ -169,6 +169,95 @@ describe('Network > generation failure boundaries', () => {
     expect(socket.destroyed).toBe(true)
   })
 
+  it('a close-only socket destruction fails its requests and reconnects the next request', async () => {
+    const { broker, connection, cluster, pending } = await stalledBroker()
+    const socket = cluster.sockets()[0]
+    const generation = connection.generation
+    const onEnd = jest.fn()
+    const onError = jest.fn()
+    socket.on('end', onEnd)
+    socket.on('error', onError)
+    const fail = jest.spyOn(connection, 'failGeneration')
+
+    socket.destroy()
+    await new Promise(setImmediate)
+
+    expect(onEnd).not.toHaveBeenCalled()
+    expect(onError).not.toHaveBeenCalled()
+    expect(connection.isConnected()).toBe(false)
+    expect(connection.socket).toBeNull()
+    expect(fail).toHaveBeenCalledTimes(1)
+    const { error } = await pending
+    expect(error).toBeInstanceOf(KafkaJSConnectionClosedError)
+    expect(error).toMatchObject({ message: 'Closed connection', retriable: true })
+    expect(connection.requestQueue.inflight.size).toBe(0)
+
+    await expect(broker.metadata([])).resolves.toMatchObject({ brokers: expect.any(Array) })
+    expect(connection.generation).toBeGreaterThan(generation)
+    expect(connection.socket).not.toBe(socket)
+    expect(connection.isConnected()).toBe(true)
+    socket.emit('close', false)
+    expect(connection.isConnected()).toBe(true)
+    expect(fail).toHaveBeenCalledTimes(1)
+    cluster.assertClean()
+  })
+
+  it.each(['end', 'ECONNRESET'])(
+    'a close after %s does not fail the generation twice',
+    async (event) => {
+      const { connection, cluster, pending } = await stalledBroker()
+      const socket = cluster.sockets()[0]
+      const fail = jest.spyOn(connection, 'failGeneration')
+      if (event === 'end') socket.emit('end')
+      else socket.destroy(Object.assign(new Error('reset'), { code: 'ECONNRESET' }))
+      await new Promise(setImmediate)
+
+      expect(connection.isConnected()).toBe(false)
+      expect(fail).toHaveBeenCalledTimes(1)
+      expect((await pending).error).toMatchObject({
+        name: event === 'end' ? 'KafkaJSConnectionClosedError' : 'KafkaJSConnectionError',
+        retriable: true,
+      })
+    }
+  )
+
+  it('an intentional disconnect ignores its socket close without another queue event', async () => {
+    const fake = createFakeSocketFactory()
+    const connection = new Connection(
+      connectionOpts({ socketFactory: fake.factory, enforceRequestTimeout: false })
+    )
+    connections.push(connection)
+    await connection.connect()
+    const socket = fake.state.socket
+    const onClose = jest.fn()
+    socket.on('close', onClose)
+    const pending = settle(
+      connection.send({
+        ...noResponseProtocol,
+        request: { ...noResponseProtocol.request, expectResponse: () => true },
+      })
+    )
+    await new Promise(setImmediate)
+    expect(fake.state.writes).toHaveLength(1)
+    expect(connection.requestQueue.inflight.size).toBe(1)
+    const fail = jest.spyOn(connection, 'failGeneration')
+    const queueState = jest.spyOn(connection.requestQueue, 'emitQueueState')
+
+    await connection.disconnect({ drainTimeout: 0 })
+    await new Promise(setImmediate)
+
+    expect(socket.destroyed).toBe(true)
+    expect(onClose).toHaveBeenCalledTimes(1)
+    expect(onClose).toHaveBeenCalledWith(false)
+    expect(connection.isConnected()).toBe(false)
+    expect(connection.socket).toBeNull()
+    expect((await pending).error).toBeInstanceOf(KafkaJSConnectionClosedError)
+    expect(connection.requestQueue.inflight.size).toBe(0)
+    expect(connection.requestQueue.pending).toHaveLength(0)
+    expect(fail).not.toHaveBeenCalled()
+    expect(queueState).toHaveBeenCalledTimes(1)
+  })
+
   it('a frozen guard error remains the request rejection', async () => {
     const { broker } = await stalledBroker()
     const refusal = Object.freeze(new Error('membership lost'))

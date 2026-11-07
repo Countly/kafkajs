@@ -11,6 +11,9 @@ const sleep = require('../src/utils/sleep')
  * @property {number} [queueDepth] requests pending plus in flight
  * @property {number} [ledgerSize] entries the operation ledger holds
  * @property {number} [obligationSize] reset obligations still owed
+ * @property {number} [shareSessions] actual share session-map entries
+ * @property {number} [shareRecords] delivered-record entries still held
+ * @property {number} [shareRanges] compact acknowledgement range entries still held
  * @property {Record<string, number>} [activeResources] what the event loop is still holding, by
  *   type (`Timeout`, `TCPSocketWrap`, ...)
  * @property {number} [heapUsed] bytes of the V8 heap in use after two collections
@@ -67,7 +70,8 @@ const settledHeap = async (gc, pause) => {
 
 /**
  * Builds a probe that measures what a client holds on to: listeners, sockets, queued requests,
- * ledger and obligation entries, event-loop resources and the settled heap. A test compares two
+ * ledger and obligation entries, share session and entry counts, event-loop resources and the
+ * settled heap. A test compares two
  * snapshots, taken before a client is built and after it is torn down, and expects the same
  * figures.
  *
@@ -81,6 +85,9 @@ const settledHeap = async (gc, pause) => {
  * @param {() => number} [sources.queueDepth] requests pending plus in flight
  * @param {() => number} [sources.ledgerSize] `OffsetOperations#size()`
  * @param {() => number} [sources.obligationSize] reset obligations owed
+ * @param {() => { shareSessions: number, shareRecords: number, shareRanges: number }} [sources.shareState]
+ *   the actual session, delivered-record and compact-range counts; a missing or malformed count
+ *   fails the snapshot, so a probe never reports a count it did not read
  * @param {boolean} [sources.activeResources=false] count `process.getActiveResourcesInfo()` by
  *   type; real-timer runs only, a snapshot refuses under fake timers
  * @param {boolean} [sources.heap=false] read the settled heap
@@ -96,6 +103,7 @@ const createResourceProbe = ({
   queueDepth,
   ledgerSize,
   obligationSize,
+  shareState,
   activeResources = false,
   heap = false,
   gc = globalThis.gc,
@@ -128,6 +136,15 @@ const createResourceProbe = ({
       }
       if (obligationSize) {
         snapshot.obligationSize = obligationSize()
+      }
+      if (shareState) {
+        const counts = shareState()
+        for (const name of ['shareSessions', 'shareRecords', 'shareRanges']) {
+          if (!Number.isSafeInteger(counts?.[name]) || counts[name] < 0) {
+            throw new Error(`Missing share resource measurement: ${name}`)
+          }
+          snapshot[name] = counts[name]
+        }
       }
       if (activeResources) {
         snapshot.activeResources = activeResourceCounts()

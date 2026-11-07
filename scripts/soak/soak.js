@@ -6,8 +6,8 @@
  * every 30 s, and checks the readings against the bounds of `bounds.js`.
  *
  * Usage: node --expose-gc scripts/soak/soak.js --profile
- *          <idle|member-churn|regex-topic-churn|outage|first-run|producer-churn|consumer-churn>
- *          [--phase-seconds <n>]
+ *          <idle|member-churn|regex-topic-churn|outage|first-run|producer-churn|consumer-churn|
+ *          share-consumer|share-consumer-short> [--phase-seconds <n>]
  *   (= npm run test:kafka -- "node --expose-gc scripts/soak/soak.js --profile first-run" for the
  *   15-minute run, `npm run soak:first-run`)
  * Writes one JSON line per sample and per quiet point to `.tmp/e2e/soak.jsonl` through
@@ -31,6 +31,12 @@
  *                     churn, pause and topic recreation, and a mostly idle 1000-partition
  *                     assignment, judged by an independent log, broker-offset and handler check;
  *                     see `ConsumerChurnRun`
+ *   share-consumer    three phases of 640 s (steady, reset, members), ten cycles of 64 s each: a share
+ *                     group member and a transient second one join and leave every cycle, sixty
+ *                     fixed records are delivered and acknowledged, and the reset phase forces one
+ *                     session reset per cycle; judged by independent log, broker-position and
+ *                     handler checks and a per-phase resource screen; see `ShareSoak`
+ *   share-consumer-short  the same three phases of 320 s with cycles of 32 s; takes no --phase-seconds
  * Every phase ends by disconnecting its clients, also when it fails; the readings that must be zero
  * are taken there.
  * `--phase-seconds n` shortens every phase to n seconds: a smoke run of the driver, not of memory.
@@ -41,6 +47,7 @@
  */
 const { subscribeNamedTopic } = require('./subscribeNamedTopic')
 const fs = require('node:fs')
+const { AsyncLocalStorage } = require('node:async_hooks')
 const path = require('node:path')
 const { Kafka, KafkaJSBufferExhaustedError, logLevel, PartitionAssigners } = require('../../index')
 const Broker = require('../../src/broker')
@@ -54,14 +61,19 @@ const { createChaosSocketFactory } = require('../../testHelpers/chaosSocket')
 const { assertProbe } = require('../../testHelpers/producerProbe')
 const { endOffsets, readLog } = require('../../testHelpers/rawLog')
 const { createResourceProbe } = require('../../testHelpers/resourceProbe')
-const { evidencePath, writeEvidence } = require('../../testHelpers/e2eEvidence')
+const { evidenceLines, evidencePath, writeEvidence } = require('../../testHelpers/e2eEvidence')
+const { NEVER, bounded, delay } = require('../../src/producer/__tests__/fixtures/bounded')
 const {
+  ENDPOINT_BYTES,
   MIN_PHASE_SAMPLES,
   PHASE_WARMUP_MS,
   SAMPLE_MS,
+  SLOPE_BYTES_PER_MINUTE,
   WARMUP_MS,
   evaluate,
   evaluatePhases,
+  median,
+  slope,
 } = require('./bounds')
 const {
   LATENCY_SAMPLE_EVERY,
@@ -131,8 +143,68 @@ const CHURN_SERVICES = Object.freeze(['kafka1', 'kafka2', 'kafka3'])
 /** The kind of outage each `BrokerBouncer` step is. */
 const OUTAGE_KINDS = Object.freeze({ stop: 'clean', kill: 'hard' })
 
+/**
+ * The declared share soak, fixed before the first run: three phases of ten cycles, sixty records and
+ * one slot per cycle, one forced session reset in each cycle of the middle phase. `budgets` is the
+ * inclusive allowance of the whole child, natural exit included; no stage borrows from another.
+ */
+const SHARE_SOAK = Object.freeze({
+  shortMs: 960000,
+  fullMs: 1920000,
+  phases: Object.freeze(['steady', 'reset', 'members']),
+  cycles: 30,
+  cyclesPerPhase: 10,
+  resets: 10,
+  partitions: 3,
+  recordsPerCycle: 60,
+  maxRecords: 100,
+  nodes: 3,
+  lockMs: 30000,
+  warmupMs: 10000,
+  settleMs: 1000,
+  slotMs: Object.freeze({ short: 32000, full: 64000 }),
+  sampleMs: Object.freeze({ short: 4000, full: 20000 }),
+  quietMs: Object.freeze({ cycle: 5000, final: 5000 }),
+  budgets: Object.freeze({
+    short: Object.freeze({
+      setupMs: 15000,
+      profileMs: 960000,
+      transitionMs: 5000,
+      cleanupMs: 20000,
+      exitMs: 10000,
+      totalMs: 1020000,
+      watchdogMs: 1020000,
+      lifecycleMs: 1440000,
+    }),
+    full: Object.freeze({
+      setupMs: 15000,
+      profileMs: 1920000,
+      transitionMs: 5000,
+      cleanupMs: 20000,
+      exitMs: 10000,
+      totalMs: 1980000,
+      watchdogMs: 1980000,
+      lifecycleMs: 2400000,
+    }),
+  }),
+  endpointBytes: ENDPOINT_BYTES,
+  slopeBytesPerMinute: SLOPE_BYTES_PER_MINUTE,
+})
+/** The group configs the share soak sets, and removes again at cleanup. */
+const GROUP_CONFIG_NAMES = ['share.auto.offset.reset', 'share.record.lock.duration.ms']
+
 /** The phases of each profile: how long each runs and which workload it is. */
 const PROFILES = {
+  'share-consumer': SHARE_SOAK.phases.map((name) => ({
+    name: `share-${name}`,
+    workload: 'shareConsumer',
+    ms: SHARE_SOAK.fullMs / SHARE_SOAK.phases.length,
+  })),
+  'share-consumer-short': SHARE_SOAK.phases.map((name) => ({
+    name: `share-${name}`,
+    workload: 'shareConsumer',
+    ms: SHARE_SOAK.shortMs / SHARE_SOAK.phases.length,
+  })),
   idle: [{ name: 'idle', workload: 'idle', ms: STANDALONE_MS }],
   'member-churn': [{ name: 'member-churn', workload: 'memberChurn', ms: STANDALONE_MS }],
   'regex-topic-churn': [
@@ -163,7 +235,8 @@ const USAGE = `usage: node --expose-gc scripts/soak/soak.js --profile <${Object.
  * @param {string[]} argv
  * @returns {{ profile: string, phaseSeconds: number|null }} `phaseSeconds` shortens every phase to
  *   that long, for a smoke run that checks the driver and proves nothing about memory
- * @throws {Error} the usage line, for a missing or unknown profile or any other argument
+ * @throws {Error} the usage line, for a missing or unknown profile or any other argument, and for
+ *   `--phase-seconds` with a share profile, whose phases and cycles are fixed
  */
 const parseArgs = (argv) => {
   const [flag, profile, ...rest] = argv
@@ -173,7 +246,8 @@ const parseArgs = (argv) => {
     flag === '--profile' &&
     Boolean(PROFILES[profile]) &&
     rest.length === (shortened ? 2 : 0) &&
-    (!shortened || (Number.isInteger(phaseSeconds) && phaseSeconds >= 1))
+    (!shortened || (Number.isInteger(phaseSeconds) && phaseSeconds >= 1)) &&
+    !(shortened && profile.startsWith('share-consumer'))
 
   if (!valid) {
     throw new Error(USAGE)
@@ -239,6 +313,10 @@ const privateOf = (kafka, name) => {
  * @param {boolean} [readings.activeResources=true] count the event loop's resources by type; a run
  *   that shares its process with others, as a spec does, leaves it off
  * @param {boolean} [readings.socketIdentities=false] attach creation IDs and endpoint inventory
+ * @param {() => object[]} [readings.originalQueues] Live original queues, including detached owners;
+ *   also enables per-emitter socket/queue names without changing ordinary listeners.
+ * @param {Function} [readings.shareState] the actual share session, record and range counts; a
+ *   reading is absent without it
  * @returns {{ kafka: object, probe: { snapshot: () => Promise<object> },
  *   socketFactory: Function, listeners: () => Record<string, Record<string, number>> }}
  *   `socketFactory` is the counted factory the client was given: a connection made through it,
@@ -247,9 +325,12 @@ const privateOf = (kafka, name) => {
  */
 const instrument = (
   { socketFactory = defaultSocketFactory(), ...options },
-  { activeResources = true, socketIdentities = false } = {}
+  { activeResources = true, socketIdentities = false, shareState, originalQueues } = {}
 ) => {
   const open = new Set()
+  const originalSockets = []
+  const emitterIds = new WeakMap()
+  let nextEmitterId = 0
   const identities = socketIdentities ? new WeakMap() : null
   let created = 0
   const clusters = new Set()
@@ -258,6 +339,7 @@ const instrument = (
     created += 1
     if (identities) identities.set(socket, { id: created, node: `${args.host}:${args.port}` })
     open.add(socket)
+    if (originalQueues) originalSockets.push(new WeakRef(socket))
     return socket
   }
   const kafka = new Kafka({ ...options, socketFactory: counted })
@@ -285,11 +367,13 @@ const instrument = (
     }
     return live
   }
-  const queues = () =>
-    liveClusters()
+  const queues = () => [
+    ...(originalQueues?.() ?? []),
+    ...liveClusters()
       .flatMap(({ brokerPool }) => [...Object.values(brokerPool.brokers), brokerPool.seedBroker])
       .filter(Boolean)
-      .flatMap(({ connectionPool }) => connectionPool.pool.map(({ requestQueue }) => requestQueue))
+      .flatMap(({ connectionPool }) => connectionPool.pool.map(({ requestQueue }) => requestQueue)),
+  ]
   const unique = (items) => [...new Set(items)]
 
   const probe = createResourceProbe({
@@ -312,6 +396,7 @@ const instrument = (
       [...operations.values()]
         .flatMap((ledger) => [...ledger.attached])
         .reduce((total, obligations) => total + obligations.size(), 0),
+    shareState,
     activeResources,
     heap: typeof globalThis.gc === 'function',
   })
@@ -343,10 +428,28 @@ const instrument = (
     Object.fromEntries(
       emitter.eventNames().map((name) => [String(name), emitter.listenerCount(name)])
     )
-  const listeners = () => ({
-    requestQueues: named(together(unique(queues()))),
-    sockets: named(together(openSockets())),
-  })
+  const listeners = () => {
+    if (!originalQueues) {
+      return {
+        requestQueues: named(together(unique(queues()))),
+        sockets: named(together(openSockets())),
+      }
+    }
+    const live = []
+    for (let i = 0; i < originalSockets.length;) {
+      const socket = originalSockets[i].deref()
+      if (socket) {
+        live.push(socket)
+        i++
+      } else originalSockets.splice(i, 1)
+    }
+    return Object.fromEntries(
+      [...unique(queues()), ...live].map((emitter) => {
+        if (!emitterIds.has(emitter)) emitterIds.set(emitter, ++nextEmitterId)
+        return [`owner${emitterIds.get(emitter)}`, named(emitter)]
+      })
+    )
+  }
 
   return { kafka, probe, socketFactory: counted, listeners }
 }
@@ -482,6 +585,15 @@ class IdleSocketCheck {
  * disconnect never hides the failure of the workload, and does not stop the others.
  */
 const WORKLOADS = {
+  /**
+   * Runs the next phase of the share soak through its owner, which keeps every client public and
+   * disconnects them before it returns. The phase is the owner's own cursor, not an ambient member.
+   * @param {WorkloadContext & { share: { runPhase: Function } }} context
+   * @param {number} ms Phase duration in milliseconds.
+   * @returns {Promise<void>} Resolves once the phase's ten cycles ran and its clients are closed.
+   * @throws {Error} For a cycle, oracle or cleanup failure.
+   */
+  shareConsumer: (context, ms) => context.share.runPhase(ms),
   /**
    * Runs one measured phase of the consumer-churn profile through its owner, which keeps the clients
    * public and disconnects them before it returns.
@@ -2018,6 +2130,8 @@ class Soak {
    * @param {number} [options.settleMs=SETTLE_MS] how long a quiet point waits for closed sockets to go
    * @param {(record: object) => void} [options.record=writeEvidence('soak', ...)] where every line goes
    * @param {Record<string, Function>} [options.workloads=WORKLOADS]
+   * @param {(work: Function, stage?: string) => Promise<*>} [options.transition] Bounds and charges
+   *   matched quiet observations and sampler joins; ordinary profiles call through unchanged.
    * @param {() => Promise<void>} [options.beforeTeardown] runs once every phase has ended, before
    *   the sockets are awaited and the teardown reading is taken
    */
@@ -2033,6 +2147,7 @@ class Soak {
     record = (line) => writeEvidence('soak', line),
     workloads = WORKLOADS,
     beforeTeardown = async () => {},
+    transition = (work) => work(),
   }) {
     Object.assign(this, {
       kafka,
@@ -2046,6 +2161,7 @@ class Soak {
       record,
       workloads,
       beforeTeardown,
+      transition,
     })
     this.samples = []
     this.phaseEnds = []
@@ -2062,28 +2178,36 @@ class Soak {
    */
   async run() {
     const startedAt = Date.now()
-    await this.settle()
-    const baseline = await this.probe.snapshot()
-    this.record({ kind: 'baseline', snapshot: baseline })
+    const baseline = await this.transition(async () => {
+      await this.settle()
+      const snapshot = await this.probe.snapshot()
+      this.record({ kind: 'baseline', snapshot })
+      return snapshot
+    })
 
     for (const { name, workload, ms } of this.phases) {
       await this.runPhase({ name, workload, ms }, startedAt)
     }
 
     await this.beforeTeardown()
-    await this.settle()
-    const teardown = await this.probe.snapshot()
-    this.record({ kind: 'teardown', snapshot: teardown })
+    const teardown = await this.transition(async () => {
+      await this.settle()
+      const snapshot = await this.probe.snapshot()
+      this.record({ kind: 'teardown', snapshot })
+      return snapshot
+    }, 'cleanup')
 
-    const verdict = this.judge({
-      baseline,
-      phaseEnds: this.phaseEnds,
-      samples: this.samples,
-      teardown,
-      warmupMs: this.warmupMs,
-    })
-    this.record({ kind: 'verdict', ...verdict })
-    return verdict
+    return this.transition(() => {
+      const verdict = this.judge({
+        baseline,
+        phaseEnds: this.phaseEnds,
+        samples: this.samples,
+        teardown,
+        warmupMs: this.warmupMs,
+      })
+      this.record({ kind: 'verdict', ...verdict })
+      return verdict
+    }, 'cleanup')
   }
 
   /**
@@ -2122,13 +2246,15 @@ class Soak {
     } finally {
       this.sampling = false
       this.wake()
-      await sampler
+      await this.transition(() => sampler)
     }
 
-    await this.settle()
-    const snapshot = await this.probe.snapshot()
-    this.phaseEnds.push({ phase: name, snapshot })
-    this.record({ kind: 'phase-end', phase: name, snapshot })
+    await this.transition(async () => {
+      await this.settle()
+      const snapshot = await this.probe.snapshot()
+      this.phaseEnds.push({ phase: name, snapshot })
+      this.record({ kind: 'phase-end', phase: name, snapshot })
+    })
   }
 
   /**
@@ -2290,6 +2416,3885 @@ const buildConsumerChurn = ({ brokers, phaseSeconds }) => {
 }
 
 /**
+ * Reduces the listener tables of `instrument` to one flat map, `<owner>:<event>`, so a swapped
+ * listener shows where a total would not.
+ * @param {Record<string, Record<string, number>>} listeners listener counts by owner and event
+ * @returns {Record<string, number>}
+ */
+const flattenListeners = (listeners) =>
+  Object.fromEntries(
+    Object.entries(listeners).flatMap(([owner, events]) =>
+      Object.entries(events).map(([event, count]) => [`${owner}:${event}`, count])
+    )
+  )
+
+/**
+ * Judges a share run phase by phase. Each phase has its own working set, so the heap is fitted
+ * inside a phase and compared across the quiet points, never as one series over the run. A source
+ * that is absent fails: no resource is ever read as zero because nobody measured it.
+ */
+class ShareSoakScreen {
+  /**
+   * Judges one share run inside each phase and across the phase-end quiet points. Samples use the
+   * phase clock of the driver, `phaseMs`.
+   * @param {object} run baseline, phase samples, quiet points and the final teardown
+   * @param {object} run.baseline quiet snapshot taken before the profile's clients
+   * @param {Array<{ phase: string, snapshot: object }>} run.phaseEnds one quiet point per phase
+   * @param {Array<{ phase: string, phaseMs: number, snapshot: object }>} run.samples periodic readings
+   * @param {object} run.teardown snapshot after the last disconnect
+   * @param {number} run.warmupMs how far into a phase its heap samples start to count
+   * @returns {{ ok: boolean, violations: string[], measured: object }} the resource and per-phase
+   *   heap verdicts; never a delivery oracle
+   * @throws {Error} when a heap slope has fewer than two different times
+   */
+  static evaluate(run) {
+    const violations = []
+    const phases = []
+    ShareSoakScreen.quiet(run.baseline, run.baseline, 'baseline', violations)
+    for (const end of run.phaseEnds) {
+      ShareSoakScreen.quiet(end.snapshot, run.baseline, end.phase, violations)
+      const phase = ShareSoakScreen.phase(end.phase, run, violations)
+      if (phase) phases.push(phase)
+    }
+    ShareSoakScreen.quiet(run.teardown, run.baseline, 'teardown', violations)
+    const quiet = [...run.phaseEnds.map((end) => end.snapshot.heapUsed), run.teardown?.heapUsed]
+    if (
+      run.phaseEnds.length !== SHARE_SOAK.phases.length ||
+      !quiet.every(ShareSoakScreen.count) ||
+      quiet.some((heap) => heap - quiet[0] > SHARE_SOAK.endpointBytes)
+    ) {
+      violations.push('phase-end quiet heap screen')
+    }
+
+    return { ok: violations.length === 0, violations, measured: { phases, quietHeap: quiet } }
+  }
+
+  /**
+   * @param {*} value
+   * @returns {boolean} whether it is a measured, nonnegative whole number
+   */
+  static count(value) {
+    return Number.isSafeInteger(value) && value >= 0
+  }
+
+  /**
+   * @param {Record<string, number>|undefined} actual
+   * @param {Record<string, number>|undefined} expected
+   * @returns {boolean} whether both exist and agree on every name, an absent name meaning zero
+   */
+  static same(actual, expected) {
+    if (!actual || !expected) return false
+    return [...new Set([...Object.keys(actual), ...Object.keys(expected)])].every(
+      (name) =>
+        ShareSoakScreen.count(actual[name] ?? 0) &&
+        ShareSoakScreen.count(expected[name] ?? 0) &&
+        (actual[name] ?? 0) === (expected[name] ?? 0)
+    )
+  }
+
+  /**
+   * Checks one quiet point: nothing held, nothing open, and every resource type and named listener
+   * back at the baseline's count.
+   * @param {object|undefined} point snapshot at the quiet point
+   * @param {object|undefined} baseline snapshot before the clients
+   * @param {string} label how a violation names the point
+   * @param {string[]} violations receives one line when the point differs
+   * @returns {void}
+   */
+  static quiet(point, baseline, label, violations) {
+    const held = ['queueDepth', 'shareSessions', 'shareRecords', 'shareRanges']
+    if (
+      !point ||
+      held.some((name) => !ShareSoakScreen.count(point[name]) || point[name] !== 0) ||
+      !ShareSoakScreen.count(point.sockets?.open) ||
+      point.sockets.open !== 0 ||
+      !ShareSoakScreen.same(point.activeResources, baseline?.activeResources) ||
+      !ShareSoakScreen.same(point.namedListeners, baseline?.namedListeners)
+    ) {
+      violations.push(`${label}: resources differ or a source is absent`)
+      const report = (source, before, after) =>
+        violations.push(
+          `${label}: ${source} baseline=${JSON.stringify(before) ?? 'absent'} after=${JSON.stringify(after) ?? 'absent'}`
+        )
+      for (const name of held)
+        if (!ShareSoakScreen.count(point?.[name]) || point[name] !== 0)
+          report(name, baseline?.[name], point?.[name])
+      if (!ShareSoakScreen.count(point?.sockets?.open) || point.sockets.open !== 0)
+        report('sockets.open', baseline?.sockets?.open, point?.sockets?.open)
+      for (const source of ['activeResources', 'namedListeners']) {
+        const before = baseline?.[source]
+        const after = point?.[source]
+        if (!before || !after) report(source, before, after)
+        else
+          for (const name of new Set([...Object.keys(before), ...Object.keys(after)]))
+            if (
+              !ShareSoakScreen.count(before[name] ?? 0) ||
+              !ShareSoakScreen.count(after[name] ?? 0) ||
+              (before[name] ?? 0) !== (after[name] ?? 0)
+            )
+              report(`${source}.${name}`, before[name] ?? 0, after[name] ?? 0)
+      }
+    }
+  }
+
+  /**
+   * Screens the heap and the held-state ceilings of one phase.
+   * @param {string} name phase name
+   * @param {object} run the run being judged
+   * @param {string[]} violations receives every bound that broke
+   * @returns {{ phase: string, heapSamples: number, endpointBytes: number,
+   *   slopeBytesPerMinute: number }|null} the phase's reading, null when it had too few samples
+   */
+  static phase(name, run, violations) {
+    const readings = run.samples.filter(
+      (sample) => sample.phase === name && sample.phaseMs >= run.warmupMs
+    )
+    const heap = readings.map((sample) => sample.snapshot.heapUsed)
+    if (heap.length < MIN_PHASE_SAMPLES || !heap.every(ShareSoakScreen.count)) {
+      violations.push(`${name}: six post-warm-up heap samples are required`)
+      return null
+    }
+    for (const { snapshot } of readings) {
+      if (
+        !ShareSoakScreen.count(snapshot.shareRecords) ||
+        snapshot.shareRecords > SHARE_SOAK.maxRecords * SHARE_SOAK.nodes
+      ) {
+        violations.push(`${name}: held-record ceiling`)
+      }
+      if (
+        !ShareSoakScreen.count(snapshot.shareRanges) ||
+        !ShareSoakScreen.count(snapshot.shareSessions)
+      ) {
+        violations.push(`${name}: missing compact-state measurement`)
+      }
+    }
+    const endpointBytes = median(heap.slice(-3)) - median(heap.slice(0, 3))
+    const slopeBytesPerMinute = slope(
+      readings.map((sample) => [sample.phaseMs / 60000, sample.snapshot.heapUsed])
+    )
+    if (
+      endpointBytes > SHARE_SOAK.endpointBytes ||
+      slopeBytesPerMinute > SHARE_SOAK.slopeBytesPerMinute
+    ) {
+      violations.push(`${name}: retained-heap screen`)
+    }
+
+    return { phase: name, heapSamples: heap.length, endpointBytes, slopeBytesPerMinute }
+  }
+}
+
+/**
+ * Reads what the original share owners of this process retain. It sees them through call-through
+ * wrappers that only remember each receiver, so no argument, decision or result changes, and it
+ * holds every owner weakly, so reading never keeps a disposed run, ledger or emitter alive. It adds
+ * nothing to the fetch, dispatch or settlement paths beyond one set lookup per wrapped call, and
+ * the wrapped methods run once per run or per listener, never per record.
+ */
+class ShareStateObserver {
+  /**
+   * @param {object} [owners] the classes to watch; a spec supplies fakes
+   * @param {Function} [owners.ShareRun] the run, which owns the per-node session map
+   * @param {Function} [owners.ShareAckLedger] the acquisition ledger, which must offer `counts`
+   * @param {Function} [owners.InstrumentationEventEmitter] the client event bus
+   */
+  constructor(owners = ShareStateObserver.originals()) {
+    this.owners = owners
+    this.runs = []
+    this.seenRuns = new WeakSet()
+    this.loops = []
+    this.seenLoops = new WeakSet()
+    this.ledgers = []
+    this.seenLedgers = new WeakSet()
+    this.queues = []
+    this.seenQueues = new WeakSet()
+    this.emitters = []
+    this.seenEmitters = new WeakSet()
+    this.ids = new WeakMap()
+    this.nextId = 1
+    this.tracked = new Set()
+    this.restores = []
+  }
+
+  /** @returns {object} the real classes, loaded only when a share soak is built */
+  static originals() {
+    return {
+      ShareRun: require('../../src/consumer/share/shareRun').ShareRun,
+      ShareFetchLoop: require('../../src/consumer/share/shareFetchLoop').ShareFetchLoop,
+      RequestQueue: require('../../src/network/requestQueue'),
+      ShareAckLedger: require('../../src/consumer/share/shareAckLedger').ShareAckLedger,
+      InstrumentationEventEmitter: require('../../src/instrumentation/emitter'),
+    }
+  }
+
+  /**
+   * Starts remembering original runs and client emitters.
+   * @returns {void}
+   * @throws {Error} when the ledger offers no read-only `counts` accessor: record and range counts
+   *   are never derived from the total size, so the source must exist before anything is wrapped
+   */
+  install() {
+    const { ShareRun, ShareAckLedger, InstrumentationEventEmitter } = this.owners
+    if (
+      typeof Object.getOwnPropertyDescriptor(ShareAckLedger.prototype, 'counts')?.get !== 'function'
+    ) {
+      throw new Error('Missing share resource source: ShareAckLedger#counts')
+    }
+    if (this.owners.ShareFetchLoop) {
+      this.watch(
+        this.owners.ShareFetchLoop.prototype,
+        ['adopt', 'dispose'],
+        this.seenLoops,
+        this.loops
+      )
+    }
+    this.watch(
+      ShareAckLedger.prototype,
+      ['prepare', 'invalidate', 'settle'],
+      this.seenLedgers,
+      this.ledgers
+    )
+    if (this.owners.RequestQueue) {
+      this.watch(
+        this.owners.RequestQueue.prototype,
+        ['push', 'destroy', 'scheduleRequestTimeoutCheck'],
+        this.seenQueues,
+        this.queues
+      )
+    }
+    this.watch(ShareRun.prototype, ['start', 'syncNodes'], this.seenRuns, this.runs)
+    this.watch(
+      InstrumentationEventEmitter.prototype,
+      ['addListener'],
+      this.seenEmitters,
+      this.emitters
+    )
+  }
+
+  /**
+   * Wraps methods so each receiver is remembered once, weakly, and the call goes through unchanged.
+   * @param {object} prototype the class prototype
+   * @param {string[]} names the methods to wrap
+   * @param {WeakSet<object>} seen receivers already remembered
+   * @param {WeakRef<object>[]} refs where a new receiver is remembered
+   * @returns {void}
+   */
+  watch(prototype, names, seen, refs) {
+    for (const name of names) {
+      const original = prototype[name]
+      if (typeof original !== 'function') continue
+      const observer = this
+      const wrapper = function (...args) {
+        if (!seen.has(this)) {
+          seen.add(this)
+          refs.push(new WeakRef(this))
+        }
+        observer.discover()
+        const result = original.apply(this, args)
+        observer.discover()
+        return result
+      }
+      prototype[name] = wrapper
+      this.restores.push(() => {
+        if (prototype[name] === wrapper) prototype[name] = original
+        return prototype[name] === original
+      })
+    }
+  }
+
+  /**
+   * Puts every wrapped method back.
+   * @returns {void}
+   * @throws {Error} when a method could not be restored, because something else wrapped it since
+   */
+  restore() {
+    const failed = this.restores
+      .splice(0)
+      .reverse()
+      .map((restore) => restore())
+      .includes(false)
+    this.runs.length = 0
+    this.emitters.length = 0
+    this.loops.length = 0
+    this.ledgers.length = 0
+    this.queues.length = 0
+    this.tracked.clear()
+    if (failed) throw new Error('A share observer wrapper could not be restored')
+  }
+
+  /**
+   * @param {WeakRef<object>[]} refs remembered owners
+   * @returns {object[]} the ones still alive, in the order they were first seen; collected ones
+   *   are forgotten
+   */
+  live(refs) {
+    const owners = []
+    for (let i = 0; i < refs.length;) {
+      const owner = refs[i].deref()
+      if (owner === undefined) {
+        refs.splice(i, 1)
+      } else {
+        owners.push(owner)
+        i += 1
+      }
+    }
+    return owners
+  }
+
+  /**
+   * Counts the state the original runs retain right now: their node-session map entries and, from
+   * each node's acquisitions, the delivered-record and compact-range entries of their ledgers.
+   * @returns {{ shareSessions: number, shareRecords: number, shareRanges: number }}
+   * @throws {Error} when a run, node or ledger does not show the source it should
+   */
+  counts() {
+    this.discover()
+    const counts = { shareSessions: 0, shareRecords: 0, shareRanges: 0 }
+    for (const run of this.live(this.runs)) {
+      if (!(run.nodes instanceof Map))
+        throw new Error('Missing share resource source: ShareRun#nodes')
+      counts.shareSessions += run.nodes.size
+    }
+    for (const ledger of this.live(this.ledgers)) {
+      const { records, ranges } = ledger.counts ?? {}
+      if (
+        !Number.isSafeInteger(records) ||
+        records < 0 ||
+        !Number.isSafeInteger(ranges) ||
+        ranges < 0
+      )
+        throw new Error('Missing share resource source: ShareAckLedger#counts')
+      counts.shareRecords += records
+      counts.shareRanges += ranges
+    }
+
+    return counts
+  }
+
+  /**
+   * Remembers original loops and ledgers before their ownership maps can detach them.
+   * @returns {void}
+   */
+  discover() {
+    const remember = (owner, seen, refs) => {
+      if (owner && !seen.has(owner)) {
+        seen.add(owner)
+        refs.push(new WeakRef(owner))
+      }
+    }
+    for (const run of this.live(this.runs)) {
+      if (!(run.nodes instanceof Map)) continue
+      for (const node of run.nodes.values()) remember(node.loop, this.seenLoops, this.loops)
+    }
+    for (const loop of this.live(this.loops)) {
+      if (!(loop.cohorts instanceof Map))
+        throw new Error('Missing share resource source: ShareFetchLoop#cohorts')
+      for (const rows of loop.cohorts.values())
+        for (const { ledger } of rows) remember(ledger, this.seenLedgers, this.ledgers)
+    }
+  }
+
+  /**
+   * @returns {Record<string, number>} the listeners of every live client emitter by stable emitter
+   *   id and event, so a swapped listener changes the map where a total would not
+   */
+  named() {
+    const named = {}
+    for (const holder of this.live(this.emitters)) {
+      if (!this.ids.has(holder)) this.ids.set(holder, this.nextId++)
+      for (const event of holder.emitter.eventNames()) {
+        const count = holder.emitter.listenerCount(event)
+        if (count > 0) named[`client${this.ids.get(holder)}:${String(event)}`] = count
+      }
+    }
+
+    return named
+  }
+
+  /**
+   * Tracks a public share client until it reports its disconnect.
+   * @param {{ on: Function, events: Record<string, string> }} client a public share consumer
+   * @returns {object} the same client
+   */
+  track(client) {
+    this.tracked.add(client)
+    const off = client.on(client.events.DISCONNECT, () => {
+      this.tracked.delete(client)
+      off()
+    })
+
+    return client
+  }
+}
+
+/**
+ * Builds a client whose resources, including the share owners' retained state, are measured. It is
+ * `instrument` plus the actual session, delivered-record and compact-range counts, read from the
+ * original owners.
+ * @param {object} options `Kafka` options, as for `instrument`
+ * @param {object} [readings] as for `instrument`
+ * @returns {ReturnType<typeof instrument> & { shareResources: { track: (client: object) => object,
+ *   snapshot: () => Promise<object>, restore: () => void } }} `snapshot` adds the tracked client
+ *   count and the flattened named listeners to the probe's reading; `restore` removes the observer
+ * @throws {Error} when a source of the share counts is missing
+ */
+const instrumentShare = (options, readings = {}) => {
+  const observer = new ShareStateObserver()
+  observer.install()
+  try {
+    const instrumented = instrument(options, {
+      ...readings,
+      originalQueues: () => observer.live(observer.queues),
+      shareState: () => observer.counts(),
+    })
+    const shareResources = {
+      track: (client) => observer.track(client),
+      snapshot: async () => {
+        const namedListeners = {
+          ...flattenListeners(instrumented.listeners()),
+          ...observer.named(),
+        }
+        const shareClients = observer.tracked.size
+        return { ...(await instrumented.probe.snapshot()), shareClients, namedListeners }
+      },
+      restore: () => observer.restore(),
+    }
+
+    return { ...instrumented, shareResources }
+  } catch (error) {
+    observer.restore()
+    throw error
+  }
+}
+
+/** The title every share soak case carries, so the guard verifies one common identity. */
+const SHARE_SOAK_TITLE = 'preserves share identities and resources through the short soak'
+
+/**
+ * The independent oracles of one cycle, as pure functions of what the cycle observed: the producer
+ * acknowledgements, the raw log, the handler journal, the public acknowledgements, the broker's
+ * terminal positions and the membership and reset facts. None of them reads another's output, so
+ * a corrupted observation fails the check that owns it.
+ */
+class ShareCycleOracle {
+  /**
+   * @param {number} cycle zero-based cycle, 0 to 29
+   * @returns {{ cycle: number, phase: string, reset: boolean, records: object[],
+   *   perPartition: number, first: bigint, end: string }} the fixed corpus of the cycle: sixty
+   *   records with explicit partitions `i % 3` and the immutable sequence `cycle * 60 + i`, and
+   *   the cumulative per-partition log end the cycle must reach
+   */
+  static plan(cycle) {
+    const { recordsPerCycle, partitions, cyclesPerPhase, phases } = SHARE_SOAK
+    const kind = phases[Math.floor(cycle / cyclesPerPhase)]
+    const perPartition = recordsPerCycle / partitions
+    return {
+      cycle,
+      phase: `share-${kind}`,
+      reset: kind === 'reset',
+      records: Array.from({ length: recordsPerCycle }, (_, i) => {
+        const sequence = cycle * recordsPerCycle + i
+        return {
+          sequence,
+          partition: i % partitions,
+          key: `soak-key-${sequence}`,
+          value: `soak-value-${sequence}`,
+        }
+      }),
+      perPartition,
+      first: BigInt(perPartition) * BigInt(cycle),
+      end: String(perPartition * (cycle + 1)),
+    }
+  }
+
+  /**
+   * Checks one cycle's observations against its plan.
+   * @param {ReturnType<typeof ShareCycleOracle.plan>} plan the cycle's fixed corpus
+   * @param {object} observation what the cycle saw
+   * @param {Array<{ partition: number, identity: string }>} observation.produced acknowledged records
+   * @param {string[]} observation.log identities of this cycle's offsets in the raw log
+   * @param {Record<number, { end: string, count: number }>} observation.logs each partition's raw
+   *   log end and record count
+   * @param {Array<{ identity: string, deliveryCount: number }>} observation.handler handler entries
+   * @param {string[]} observation.held identities started and held when the reset was forced
+   * @param {Array<{ partition: number, firstOffset: string, lastOffset: string }>} observation.accepted
+   *   successful public Accept results
+   * @param {object[]} observation.broker the three terminal partition rows
+   * @param {object} observation.members join, leave, additional member add and remove facts
+   * @param {object|null} observation.reset the observed reset and reopen, or null
+   * @param {{ active: boolean, delivered: string[] }} observation.verifier the same-group verifier
+   * @param {boolean} observation.clientsDisconnected whether every cycle client left
+   * @returns {string[]} one line for every check that failed; empty when the cycle holds
+   */
+  static judge(plan, observation) {
+    const violations = []
+    const fail = (message) => violations.push(`cycle ${plan.cycle}: ${message}`)
+    const corpus = ShareCycleOracle.corpus(plan, observation.produced ?? [], fail)
+    ShareCycleOracle.log(plan, corpus, observation, fail)
+    ShareCycleOracle.handler(plan, corpus, observation, fail)
+    ShareCycleOracle.accepts(corpus, observation, fail)
+    ShareCycleOracle.broker(plan, observation.broker ?? [], fail)
+    ShareCycleOracle.membership(plan, observation, fail)
+    if (observation.positions?.length !== 2)
+      fail('both terminal position observations are required')
+    for (const position of observation.positions ?? []) {
+      ShareCycleOracle.position(plan, position, fail)
+      if (
+        position.topicId !== observation.verifier?.topicId ||
+        position.target?.groupId !== observation.verifier?.groupId ||
+        position.target?.topic !== JSON.parse(observation.produced?.[0]?.identity ?? '[]')[0]
+      )
+        fail('the terminal proof belongs to another group or topic')
+    }
+    ShareCycleOracle.verifier(observation.verifier, SHARE_SOAK.quietMs.cycle, fail)
+    ShareCycleOracle.sequence(observation, fail)
+    if (observation.timing?.cycle !== plan.cycle || observation.timing?.kind !== 'cycle')
+      fail('the proof belongs to another cycle')
+
+    return violations
+  }
+
+  /**
+   * @param {ReturnType<typeof ShareCycleOracle.plan>} plan the cycle
+   * @param {Array<{ identity: string }>} produced acknowledged records in send order
+   * @param {(message: string) => void} fail
+   * @returns {Map<string, { partition: number, offset: bigint }>} the acknowledged identities
+   */
+  static corpus(plan, produced, fail) {
+    const corpus = new Map()
+    const next = new Map()
+    if (produced.length !== plan.records.length) {
+      fail(`${produced.length} acknowledged records, ${plan.records.length} expected`)
+    }
+    plan.records.forEach((record, i) => {
+      let tuple
+      try {
+        tuple = JSON.parse(produced[i]?.identity)
+      } catch {
+        fail(`acknowledged record ${i} has no identity`)
+        return
+      }
+      const [, partition, offset, key, value] = tuple
+      const index = next.get(record.partition) ?? 0
+      next.set(record.partition, index + 1)
+      const hex = (text) => Buffer.from(text).toString('hex')
+      if (
+        partition !== record.partition ||
+        key !== hex(record.key) ||
+        value !== hex(record.value) ||
+        offset !== String(plan.first + BigInt(index))
+      ) {
+        fail(`acknowledged record ${i} differs from the corpus`)
+      }
+      if (corpus.has(produced[i].identity)) fail(`acknowledged record ${i} repeats an identity`)
+      corpus.set(produced[i].identity, { partition: record.partition, offset: BigInt(offset) })
+    })
+
+    return corpus
+  }
+
+  /**
+   * @param {ReturnType<typeof ShareCycleOracle.plan>} plan the cycle
+   * @param {Map<string, object>} corpus the acknowledged identities
+   * @param {object} observation the cycle's observations
+   * @param {(message: string) => void} fail
+   * @returns {void}
+   */
+  static log(plan, corpus, { log = [], logs = {}, prefix = [], acknowledgedPrefix = [] }, fail) {
+    if (
+      acknowledgedPrefix.length !== (plan.cycle + 1) * SHARE_SOAK.recordsPerCycle ||
+      new Set(acknowledgedPrefix).size !== acknowledgedPrefix.length ||
+      JSON.stringify([...prefix].sort()) !== JSON.stringify([...acknowledgedPrefix].sort())
+    )
+      fail('the cumulative raw log identities differ from the acknowledged prefix')
+    const once = new Map()
+    for (const identity of log) once.set(identity, (once.get(identity) ?? 0) + 1)
+    if (log.length !== corpus.size || [...corpus.keys()].some((id) => once.get(id) !== 1)) {
+      fail('the raw log does not hold the acknowledged corpus exactly once')
+    }
+    for (let partition = 0; partition < SHARE_SOAK.partitions; partition++) {
+      const { end, count } = logs[partition] ?? {}
+      if (end !== plan.end || count !== Number(plan.end)) {
+        fail(`partition ${partition} raw log is not the cumulative prefix ending at ${plan.end}`)
+      }
+    }
+  }
+
+  /**
+   * Every acknowledged identity reaches a handler, and a repeat is allowed only for an identity of
+   * the held set frozen before the reset, with a strictly higher delivery count each time.
+   * @param {ReturnType<typeof ShareCycleOracle.plan>} plan the cycle
+   * @param {Map<string, object>} corpus the acknowledged identities
+   * @param {object} observation the cycle's observations
+   * @param {(message: string) => void} fail
+   * @returns {void}
+   */
+  static handler(plan, corpus, { handler = [], held = [], provenance = {}, verifier = {} }, fail) {
+    const heldSet = new Set(held)
+    if (!plan.reset && heldSet.size > 0) fail('a held set was frozen outside a reset cycle')
+    if (plan.reset && heldSet.size === 0) fail('no held set was frozen before the reset')
+    if ([...heldSet].some((id) => !corpus.has(id))) fail('a held identity is outside the corpus')
+    const entries = new Map()
+    const dispatched = new Set()
+    for (const { identity, deliveryCount, acquisition, dispatch } of handler) {
+      const row = provenance.acquisitions?.find((row) => row.id === acquisition)
+      const exchange = provenance.exchanges?.find((exchange) => exchange.id === row?.exchange)
+      const source = ShareCycleOracle.partitionResponse(exchange, row)
+      const offset = corpus.get(identity)?.offset
+      const ranges =
+        row?.acquiredRecords?.filter(
+          (range) =>
+            offset !== undefined &&
+            BigInt(range.firstOffset) <= offset &&
+            offset <= BigInt(range.lastOffset)
+        ) ?? []
+      const original = `${exchange?.frames?.[0]?.socket}:${exchange?.frames?.[0]?.id}:${row?.topicId}:${row?.partition}:${offset}`
+      if (
+        !row ||
+        !source ||
+        exchange.apiKey !== 78 ||
+        !Number.isInteger(dispatch) ||
+        row.partition !== corpus.get(identity)?.partition ||
+        row.topic !== JSON.parse(identity)[0] ||
+        row.topicId !== verifier.topicId ||
+        exchange.groupId !== verifier.groupId ||
+        ranges.length !== 1 ||
+        ranges[0].deliveryCount !== deliveryCount ||
+        source.acquiredRecords?.every(
+          (range, index) => JSON.stringify(range) === JSON.stringify(row.acquiredRecords[index])
+        ) !== true ||
+        source.acquiredRecords.length !== row.acquiredRecords.length
+      )
+        fail('a handler lacks original successful acquisition provenance')
+      if (dispatched.has(original)) fail('one original acquisition was dispatched more than once')
+      dispatched.add(original)
+      entries.set(identity, [...(entries.get(identity) ?? []), deliveryCount])
+    }
+    if ([...corpus.keys()].some((id) => !entries.has(id)))
+      fail('an identity never reached a handler')
+    for (const [identity, counts] of entries) {
+      const valid = (count) => Number.isInteger(count) && count >= 1 && count <= 32767
+      if (!corpus.has(identity)) fail('a handler received an identity outside the corpus')
+      else if (!counts.every(valid)) fail('a delivery count is not a valid acquisition count')
+      else if (counts.length > 1 && !heldSet.has(identity)) {
+        fail('a duplicate delivery falls outside the frozen held set')
+      } else if (heldSet.has(identity) && !counts.slice(1).every((c, i) => c > counts[i])) {
+        fail('a replay did not raise its delivery count')
+      }
+    }
+    for (const identity of heldSet) {
+      if ((entries.get(identity)?.length ?? 0) < 2) fail('a held identity was not recovered')
+    }
+  }
+
+  /**
+   * @param {Map<string, { partition: number, offset: bigint }>} corpus the acknowledged identities
+   * @param {object} observation Successful public ranges and their original attempt journals.
+   * @param {object[]} observation.accepted Public Accept results.
+   * @param {object} observation.provenance Original acquisitions, tickets and matching wire answers.
+   * @param {(message: string) => void} fail
+   * @returns {void}
+   */
+  static accepts(corpus, { accepted = [], provenance = {} }, fail) {
+    const receipts = []
+    const used = new Set()
+    for (const range of accepted) {
+      const matches = (provenance.outcomes ?? []).filter(
+        (outcome) =>
+          outcome.type === 'accept' &&
+          !outcome.error &&
+          outcome.topic === range.topic &&
+          outcome.partition === range.partition &&
+          outcome.firstOffset === range.firstOffset &&
+          outcome.lastOffset === range.lastOffset
+      )
+      const covered = matches.filter((outcome) => {
+        const acquisition = provenance.acquisitions?.find((row) => row.id === outcome.acquisition)
+        const source = provenance.exchanges?.find(
+          (exchange) => exchange.id === acquisition?.exchange
+        )
+        if (!source || !ShareCycleOracle.partitionResponse(source, acquisition)) return false
+        return (provenance.exchanges ?? []).some((exchange) => {
+          const ticket = exchange.tickets.filter(
+            (ticket) => ticket.acquisition === acquisition.id && !ticket.isRenewAck
+          )
+          if (ticket.length !== 1) return false
+          const result = ShareCycleOracle.partitionResponse(exchange, acquisition)
+          if (
+            !source ||
+            !result ||
+            (exchange.apiKey === 78 && result.acknowledgeErrorCode !== 0) ||
+            exchange.open !== source.open ||
+            exchange.pool !== source.pool ||
+            exchange.generation !== source.generation ||
+            exchange.memberId !== source.memberId ||
+            exchange.frames[0].socket !== source.frames[0].socket ||
+            exchange.request.isRenewAck ||
+            exchange.frames[0].request.isRenewAck
+          )
+            return false
+          const parts =
+            exchange.frames[0].request.topics
+              ?.filter((topic) => topic.topicId === acquisition.topicId)
+              .flatMap((topic) =>
+                topic.partitions.filter((part) => part.partitionIndex === range.partition)
+              ) ?? []
+          return (
+            ticket.length === 1 &&
+            parts.length === 1 &&
+            ticket[0].batches.some(
+              (batch) =>
+                batch.firstOffset === range.firstOffset &&
+                batch.lastOffset === range.lastOffset &&
+                batch.acknowledgeTypes.every((type) => type === 1) &&
+                parts[0].acknowledgementBatches.some(
+                  (written) => JSON.stringify(written) === JSON.stringify(batch)
+                )
+            )
+          )
+        })
+      })
+      if (covered.length !== 1 || used.has(covered[0])) {
+        fail('a successful Accept lacks a unique original request and partition receipt')
+      } else {
+        used.add(covered[0])
+        receipts.push({ ...range, acquisition: covered[0].acquisition })
+      }
+    }
+    const uncovered = [...corpus].filter(
+      ([, { partition, offset }]) =>
+        !receipts.some(
+          (range) =>
+            range.partition === partition &&
+            BigInt(range.firstOffset) <= offset &&
+            offset <= BigInt(range.lastOffset) &&
+            provenance.acquisitions.some(
+              (row) =>
+                row.id === range.acquisition &&
+                row.partition === partition &&
+                row.acquiredRecords.some(
+                  (acquired) =>
+                    BigInt(acquired.firstOffset) <= offset && offset <= BigInt(acquired.lastOffset)
+                )
+            )
+        )
+    )
+    if (uncovered.length > 0) fail(`${uncovered.length} identities lack a successful Accept`)
+  }
+
+  /**
+   * @param {object} exchange Original exchange with socket-scoped wire identity.
+   * @returns {object|null} Wire-validated successful response, including empty session deltas.
+   */
+  static response(exchange) {
+    const frame = exchange?.frames?.[0]
+    if (
+      exchange?.error ||
+      exchange?.frames?.length !== 1 ||
+      ![78, 79].includes(exchange.apiKey) ||
+      frame.apiKey !== exchange.apiKey ||
+      frame.apiVersion !== 2 ||
+      !frame.bytes ||
+      !frame.responseBytes ||
+      !Number.isInteger(exchange.responseIdentity) ||
+      !Number.isInteger(frame.id) ||
+      frame.request.groupId !== exchange.groupId ||
+      frame.request.memberId !== exchange.memberId ||
+      frame.endpoint !== exchange.endpoint ||
+      exchange.response?.errorCode !== 0
+    )
+      return null
+    let wire
+    try {
+      const { readRequestHeader } = require('../../testHelpers/fakeSocket')
+      const bytes = Buffer.from(frame.bytes, 'base64')
+      const header = readRequestHeader(bytes)
+      const reader = require(
+        exchange.apiKey === 78
+          ? '../../testHelpers/wire/shareFetchV2'
+          : '../../testHelpers/wire/shareAcknowledgeV2'
+      )
+      const written = reader.readRequest(bytes.subarray(header.byteLength))
+      if (
+        bytes.readInt32BE(0) !== bytes.length - 4 ||
+        header.apiKey !== exchange.apiKey ||
+        header.apiVersion !== 2 ||
+        header.correlationId !== frame.correlationId ||
+        JSON.stringify(written) !== JSON.stringify(frame.request)
+      )
+        return null
+      wire = ShareCycleOracle.wireResponse(frame)
+      const fields = (responses) =>
+        responses.map(({ topicId, partitions }) => ({
+          topicId,
+          partitions: partitions.map(
+            ({ partitionIndex, errorCode, acknowledgeErrorCode, acquiredRecords }) => ({
+              partitionIndex,
+              errorCode,
+              acknowledgeErrorCode,
+              acquiredRecords,
+            })
+          ),
+        }))
+      if (
+        wire?.errorCode !== 0 ||
+        JSON.stringify(fields(wire.responses)) !==
+          JSON.stringify(fields(exchange.response.responses))
+      )
+        return null
+    } catch {
+      return null
+    }
+    return wire
+  }
+
+  /**
+   * @param {object} exchange Original exchange with socket-scoped wire identity.
+   * @param {object} acquisition Original partition acquisition.
+   * @returns {object|null} Sole successful matching partition response, or no receipt.
+   */
+  static partitionResponse(exchange, acquisition) {
+    if (!acquisition) return null
+    const response = ShareCycleOracle.response(exchange)
+    const parts =
+      response?.responses
+        .filter((topic) => topic.topicId === acquisition.topicId)
+        .flatMap((topic) =>
+          topic.partitions.filter((part) => part.partitionIndex === acquisition.partition)
+        ) ?? []
+    return parts.length === 1 && parts[0].errorCode === 0 ? parts[0] : null
+  }
+
+  /**
+   * Reads partition errors/acquisition ranges directly from the matching socket response bytes.
+   * @param {object} frame Original request and answer frames.
+   * @returns {object|null} Raw top-level and partition results, including omitted partitions.
+   * @throws {Error} On malformed frame bounds or fields; the receipt predicate rejects it.
+   */
+  static wireResponse(frame) {
+    const Decoder = require('../../src/protocol/decoder')
+    const bytes = Buffer.from(frame.responseBytes, 'base64')
+    const decoder = new Decoder(bytes)
+    if (decoder.readInt32() !== bytes.length - 4 || decoder.readInt32() !== frame.correlationId)
+      return null
+    decoder.readTaggedFields()
+    decoder.readInt32()
+    const errorCode = decoder.readInt16()
+    decoder.readUVarIntString()
+    decoder.readInt32()
+    const topics = decoder.readUVarIntArray((decoder) => {
+      const topicId = decoder.readUuid()
+      const partitions = decoder.readUVarIntArray((decoder) => {
+        const row = { partitionIndex: decoder.readInt32(), errorCode: decoder.readInt16() }
+        decoder.readUVarIntString()
+        if (frame.apiKey === 78) {
+          row.acknowledgeErrorCode = decoder.readInt16()
+          decoder.readUVarIntString()
+        }
+        decoder.readInt32()
+        decoder.readInt32()
+        decoder.readTaggedFields()
+        if (frame.apiKey === 78) {
+          decoder.readUVarIntBytes()
+          row.acquiredRecords = decoder.readUVarIntArray((decoder) => {
+            const range = {
+              firstOffset: decoder.readInt64().toString(),
+              lastOffset: decoder.readInt64().toString(),
+              deliveryCount: decoder.readInt16(),
+            }
+            decoder.readTaggedFields()
+            return range
+          })
+        }
+        decoder.readTaggedFields()
+        return row
+      })
+      decoder.readTaggedFields()
+      return { topicId, partitions }
+    })
+    return { errorCode, responses: topics }
+  }
+
+  /**
+   * Decodes a socket-matched heartbeat answer without using the Broker completion as a receipt.
+   * @param {object} frame Original heartbeat request and response bytes.
+   * @returns {object|null} Raw heartbeat fields, or no matched response.
+   * @throws {Error} On malformed/truncated response fields.
+   */
+  static heartbeatResponse(frame) {
+    const Decoder = require('../../src/protocol/decoder')
+    const bytes = Buffer.from(frame.responseBytes, 'base64')
+    const decoder = new Decoder(bytes)
+    if (decoder.readInt32() !== bytes.length - 4 || decoder.readInt32() !== frame.correlationId)
+      return null
+    decoder.readTaggedFields()
+    decoder.readInt32()
+    const errorCode = decoder.readInt16()
+    decoder.readUVarIntString()
+    const memberId = decoder.readUVarIntString()
+    const memberEpoch = decoder.readInt32()
+    const heartbeatIntervalMs = decoder.readInt32()
+    const present = decoder.readInt8()
+    if (present !== -1 && present !== 1) return null
+    if (present === 1) {
+      decoder.readUVarIntArray((entry) => {
+        entry.readUuid()
+        entry.readUVarIntArray((entry) => entry.readInt32())
+        entry.readTaggedFields()
+      })
+      decoder.readTaggedFields()
+    }
+    decoder.readTaggedFields()
+    return decoder.canReadBytes(1)
+      ? null
+      : { errorCode, memberId, memberEpoch, heartbeatIntervalMs }
+  }
+
+  /**
+   * Proves a member's departure from its invoked epoch -1 request and matched successful answer.
+   * @param {object} provenance Original heartbeat call-through and wire archive.
+   * @param {string} groupId Original group.
+   * @param {string} memberId Original member, never inferred from disconnect completion.
+   * @returns {object|null} The successful leave frame, or no departure proof.
+   */
+  static departure(provenance, groupId, memberId) {
+    if (!groupId || !memberId) return null
+    for (const beat of provenance.heartbeats ?? []) {
+      if (
+        beat.groupId !== groupId ||
+        beat.memberId !== memberId ||
+        beat.request?.groupId !== groupId ||
+        beat.request?.memberId !== memberId ||
+        beat.request?.memberEpoch !== -1
+      )
+        continue
+      for (const frame of beat.frames ?? []) {
+        if (
+          frame.apiKey !== 76 ||
+          frame.apiVersion !== 1 ||
+          !Number.isInteger(frame.socket) ||
+          frame.endpoint !== beat.endpoint ||
+          !Number.isInteger(frame.correlationId) ||
+          ![beat.at, frame.at, frame.answeredAt].every(Number.isFinite) ||
+          frame.at < beat.at ||
+          frame.answeredAt < frame.at ||
+          frame.lostAt !== undefined ||
+          !frame.responseBytes
+        )
+          continue
+        try {
+          const { readRequestHeader } = require('../../testHelpers/fakeSocket')
+          const wire = require('../../testHelpers/wire/shareGroupHeartbeatV1')
+          const bytes = Buffer.from(frame.bytes, 'base64')
+          const header = readRequestHeader(bytes)
+          const request = wire.readRequest(bytes.subarray(header.byteLength))
+          const response = ShareCycleOracle.heartbeatResponse(frame)
+          if (
+            bytes.readInt32BE(0) === bytes.length - 4 &&
+            header.apiKey === 76 &&
+            header.apiVersion === 1 &&
+            header.correlationId === frame.correlationId &&
+            JSON.stringify(request) === JSON.stringify(frame.request) &&
+            request.groupId === groupId &&
+            request.memberId === memberId &&
+            request.memberEpoch === -1 &&
+            response?.errorCode === 0 &&
+            response.memberEpoch === -1 &&
+            (response.memberId === null || response.memberId === memberId)
+          )
+            return frame
+        } catch {}
+      }
+    }
+    return null
+  }
+
+  /**
+   * Recomputes terminality from raw named/all listings and independent ends.
+   * @param {object} plan Fixed cumulative end.
+   * @param {object} position Archived primitive observation.
+   * @param {Function} fail Records a violation.
+   * @returns {void}
+   */
+  static position(plan, position, fail) {
+    const { terminalSharePosition } = require('../../testHelpers/shareLiveDiagnostics')
+    if (
+      !position?.target ||
+      position.target.partitions.length !== SHARE_SOAK.partitions ||
+      position.target.partitions.some(({ floor, end }) => floor !== '0' || end !== plan.end) ||
+      !terminalSharePosition(position.target, position).settled
+    )
+      fail('the raw terminal listings or independent ends are incomplete or disagree')
+  }
+
+  /**
+   * Reconstructs verifier activity from assignment reads and actual request chronology.
+   * @param {object} verifier Original member observations.
+   * @param {number} windowMs Required unchanged window.
+   * @param {Function} fail Records a violation.
+   * @returns {void}
+   */
+  static verifier(verifier = {}, windowMs, fail) {
+    const start = verifier.events?.find(({ kind }) => kind === 'window-start')
+    const end = verifier.events?.findLast(({ kind }) => kind === 'window-end')
+    const owns = (assignment) =>
+      assignment?.length === 1 &&
+      assignment[0].topic === verifier.topic &&
+      [...assignment[0].partitions].sort().join() === '0,1,2'
+    const times = [verifier.openedAt, start?.at, end?.at, verifier.closedAt]
+    const ordered =
+      times.every(Number.isFinite) &&
+      times.every((at, i) => !i || at >= times[i - 1]) &&
+      Number.isFinite(start?.wallAt) &&
+      Number.isFinite(end?.wallAt) &&
+      end.wallAt >= start.wallAt &&
+      verifier.events.every(
+        ({ at }, i, events) =>
+          Number.isFinite(at) &&
+          at >= verifier.openedAt &&
+          at <= verifier.closedAt &&
+          (!i || at >= events[i - 1].at)
+      )
+    const joined = verifier.events?.filter(({ kind }) => kind === 'GROUP_JOIN') ?? []
+    const covered = new Set()
+    const sessions = new Map()
+    const activity = []
+    for (const exchange of verifier.provenance?.exchanges ?? []) {
+      const frame = exchange.frames?.[0]
+      if (!frame || exchange.apiKey !== 78 || exchange.memberId !== verifier.memberId) continue
+      const key = `${frame.socket}:${exchange.open}:${exchange.pool}:${exchange.generation}`
+      const epoch = frame.request.shareSessionEpoch
+      const previous = sessions.get(key)
+      const response = ShareCycleOracle.response(exchange)
+      const detail = {
+        exchange: exchange.id,
+        socket: frame.socket,
+        open: exchange.open,
+        pool: exchange.pool,
+        generation: exchange.generation,
+        epoch,
+        at: frame.at,
+        answeredAt: frame.answeredAt,
+        partitions: [],
+      }
+      activity.push(detail)
+      const valid =
+        ordered &&
+        response &&
+        frame.request.isRenewAck === false &&
+        frame.request.maxRecords > 0 &&
+        frame.request.maxBytes > 0 &&
+        exchange.groupId === verifier.groupId &&
+        Number.isFinite(frame.at) &&
+        Number.isFinite(frame.answeredAt) &&
+        frame.at >= verifier.openedAt &&
+        frame.answeredAt >= frame.at &&
+        frame.answeredAt <= verifier.closedAt &&
+        Number.isInteger(frame.socket) &&
+        Number.isInteger(exchange.open) &&
+        Number.isInteger(exchange.pool) &&
+        Number.isInteger(exchange.generation) &&
+        (epoch === 0 ||
+          (previous &&
+            epoch === (previous.epoch === 2147483647 ? 1 : previous.epoch + 1) &&
+            frame.at >= previous.answeredAt))
+      if (!valid) {
+        sessions.delete(key)
+        detail.reason = 'invalid wire ownership, response, session epoch or timestamps'
+        continue
+      }
+      const partitions = epoch === 0 ? new Set() : previous.partitions
+      const parts = (partition) =>
+        response.responses
+          .filter(({ topicId }) => topicId === verifier.topicId)
+          .flatMap(({ partitions }) =>
+            partitions.filter(({ partitionIndex }) => partitionIndex === partition)
+          )
+      for (const topic of frame.request.topics ?? []) {
+        if (topic.topicId !== verifier.topicId) continue
+        for (const { partitionIndex } of topic.partitions) {
+          const rows = parts(partitionIndex)
+          if (rows.length === 1 && rows[0].errorCode === 0) partitions.add(partitionIndex)
+        }
+      }
+      for (const topic of frame.request.forgottenTopicsData ?? [])
+        if (topic.topicId === verifier.topicId)
+          for (const partition of topic.partitions) partitions.delete(partition)
+      sessions.set(key, { partitions, epoch, answeredAt: frame.answeredAt })
+      detail.partitions = [...partitions]
+      const request = verifier.events.find(
+        ({ kind, payload, at }) =>
+          kind === 'REQUEST' &&
+          payload.apiName === 'ShareFetch' &&
+          payload.correlationId === frame.correlationId &&
+          payload.broker === frame.endpoint &&
+          payload.sentAt >= start.wallAt &&
+          payload.sentAt <= end.wallAt &&
+          at >= frame.answeredAt &&
+          at <= end.at
+      )
+      if (frame.at < start.at || frame.answeredAt > end.at || !request) {
+        detail.reason = 'request write, response or public completion outside observation window'
+        continue
+      }
+      detail.requestAt = request.at
+      // An empty incremental response still fetches the previously established session model.
+      for (const partition of partitions) {
+        const rows = parts(partition)
+        if (
+          rows.length === 0 ||
+          (rows.length === 1 && rows[0].errorCode === 0 && rows[0].acquiredRecords?.length === 0)
+        )
+          covered.add(partition)
+      }
+    }
+    const checks = {
+      'ordered timestamps': ordered,
+      'measured duration': ordered && end.at - start.at >= windowMs,
+      'full endpoint assignment': owns(start?.payload) && owns(end?.payload),
+      'all-partition in-window wire activity': [...covered].sort().join() === '0,1,2',
+      'same-group member join':
+        joined.length === 1 &&
+        joined[0].payload.memberId === verifier.memberId &&
+        joined[0].payload.groupId === verifier.groupId &&
+        joined[0].at <= start?.at,
+      'joined leave': verifier.events?.some(
+        ({ kind, at }) => kind === 'DISCONNECT' && at >= end?.at && at <= verifier.closedAt
+      ),
+      'continuous assignment':
+        start &&
+        end &&
+        !verifier.events
+          .slice(verifier.events.indexOf(start), verifier.events.indexOf(end))
+          .some(({ kind, payload }) => kind === 'ASSIGNMENT_CHANGED' && !owns(payload.assignment)),
+      'declared duration': verifier.windowMs === windowMs,
+      'member and topic identity': Boolean(verifier.memberId && verifier.topicId),
+      'active empty verifier': verifier.active === true && verifier.delivered?.length === 0,
+    }
+    const failed = Object.keys(checks).filter((name) => !checks[name])
+    if (failed.length)
+      fail(
+        'the same-group verifier activity or measured observation window is incomplete: ' +
+          `${failed.join(', ')}; ${JSON.stringify({
+            openedAt: verifier.openedAt,
+            window: [start?.at, end?.at],
+            wallWindow: [start?.wallAt, end?.wallAt],
+            closedAt: verifier.closedAt,
+            coveredPartitions: [...covered].sort(),
+            missingPartitions: [0, 1, 2].filter((partition) => !covered.has(partition)),
+            activity,
+          })}`
+      )
+  }
+
+  /**
+   * Binds original reads, departures and the joined verifier to one enclosing observation.
+   * @param {object} observation Original cycle or final proof.
+   * @param {Function} fail Records a violation.
+   * @returns {void}
+   */
+  static sequence({ timing = {}, positions = [], verifier = {}, members = {} }, fail) {
+    const [before, after] = positions
+    const departures =
+      timing.kind === 'final'
+        ? [members.bRemovedAt, members.aLeftAt, timing.startedAt]
+        : [timing.startedAt, members.bRemovedAt, members.aLeftAt]
+    const times = [
+      ...departures,
+      before?.startedAt,
+      before?.completedAt,
+      members.emptyAt,
+      verifier.openedAt,
+      verifier.closedAt,
+      after?.startedAt,
+      after?.completedAt,
+      timing.completedAt,
+      timing.due,
+    ]
+    if (
+      !times.every(Number.isFinite) ||
+      times.some((at, i) => i && at < times[i - 1]) ||
+      !Number.isInteger(timing.cycle) ||
+      positions.length !== 2 ||
+      [before, after, verifier].some(
+        (part) => part?.cycle !== timing.cycle || part?.kind !== timing.kind
+      )
+    )
+      fail(
+        'the terminal reads, departures and verifier are not bound to their original cycle window'
+      )
+  }
+
+  /**
+   * The terminal position oracle: three distinct partition rows, each answered without error,
+   * with zero lag, a canonical start offset inside the log and the independently read end.
+   * @param {ReturnType<typeof ShareCycleOracle.plan>} plan the cycle
+   * @param {object[]} rows the terminal partition rows
+   * @param {(message: string) => void} fail
+   * @returns {void}
+   */
+  static broker(plan, rows, fail) {
+    const partitions = rows.map(({ partition }) => partition).sort()
+    if (partitions.join() !== '0,1,2') fail('three distinct terminal partition rows are required')
+    for (const row of rows) {
+      const decimal = (value) => typeof value === 'string' && /^(0|[1-9][0-9]*)$/.test(value)
+      if (
+        row.errorCode !== 0 ||
+        row.lag !== '0' ||
+        row.logEnd !== plan.end ||
+        !decimal(row.startOffset) ||
+        BigInt(row.startOffset) > BigInt(plan.end)
+      ) {
+        fail(`partition ${row.partition} is not at its terminal position ${plan.end}`)
+      }
+    }
+  }
+
+  /**
+   * @param {ReturnType<typeof ShareCycleOracle.plan>} plan the cycle
+   * @param {object} observation the cycle's observations
+   * @param {(message: string) => void} fail
+   * @returns {void}
+   */
+  static membership(plan, observation, fail) {
+    const { members = {}, reset = null, verifier = {}, provenance = {} } = observation
+    for (const label of ['A', 'B']) {
+      const member = observation.memberObservations?.find((member) => member.member === label)
+      const leave = ShareCycleOracle.departure(provenance, verifier.groupId, member?.memberId)
+      const removedAt = label === 'A' ? members.aLeftAt : members.bRemovedAt
+      if (
+        !leave ||
+        !Number.isFinite(removedAt) ||
+        leave.answeredAt > removedAt ||
+        leave.at < observation.timing?.startedAt
+      )
+        fail(
+          `member ${label} (${member?.memberId ?? 'unknown'}) lacks original successful leave evidence`
+        )
+    }
+    if (!(members.aJoined && members.aLeft && members.bAdded && members.bRemoved)) {
+      fail('the member joins, leaves and the additional member add and remove are incomplete')
+    }
+    if (plan.reset) {
+      const reopened =
+        reset?.apiKey === 78 &&
+        Number.isInteger(reset.oldEpoch) &&
+        reset.oldEpoch > 0 &&
+        reset.nextEpoch === 0 &&
+        Boolean(reset.reason) &&
+        Boolean(reset.oldSocket) &&
+        Boolean(reset.nextSocket) &&
+        reset.oldSocket !== reset.nextSocket
+      if (!reopened) fail('no original session reset and new epoch-zero open was observed')
+    } else if (reset !== null) {
+      fail('a reset was observed outside a reset cycle')
+    }
+    if (
+      verifier.active !== true ||
+      !Array.isArray(verifier.delivered) ||
+      verifier.delivered.length > 0
+    ) {
+      fail('the same-group verifier was inactive or received a record')
+    }
+    if (observation.clientsDisconnected !== true) fail('a cycle client was still connected')
+  }
+}
+
+/** The timestamp of every share soak record: old and fixed, so no clock reading changes a byte. */
+const SHARE_SOAK_TIMESTAMP = '1700000000000'
+/** Monotonic millisecond timestamps for the declared share schedule and its integer boundaries. */
+const SHARE_CLOCK = Object.freeze({ now: () => Math.floor(performance.now()) })
+
+/**
+ * Lets plain `node` resolve the `testHelpers` module name that Jest maps, which the share fixtures
+ * use. A resolver that already knows the name is left alone.
+ * @returns {void}
+ */
+const aliasTestHelpers = () => {
+  try {
+    require.resolve('testHelpers')
+    return
+  } catch {}
+  const Module = require('node:module')
+  const resolve = Module._resolveFilename
+  Module._resolveFilename = function (request, ...rest) {
+    const target =
+      request === 'testHelpers' ? path.resolve(__dirname, '../../testHelpers') : request
+    return resolve.call(this, target, ...rest)
+  }
+}
+
+/**
+ * @returns {object} the share fixtures and live-run helpers the share soak drives, loaded only when
+ *   a share soak is built so the other profiles never load them
+ */
+const loadSharePorts = () => {
+  aliasTestHelpers()
+  return {
+    fixtures: require('../../testHelpers/shareFixtures'),
+    diagnostics: require('../../testHelpers/shareLiveDiagnostics'),
+    probe: require('../../src/producer/__tests__/fixtures/liveProbe'),
+    bounded: require('../../src/producer/__tests__/fixtures/bounded'),
+  }
+}
+
+/**
+ * Observes the ShareFetch requests written on the sockets of one run without changing a byte, a
+ * return value or a callback. Recent reset facts are bounded; an active cycle separately archives
+ * original request/answer frames. Sockets are held weakly across destruction.
+ */
+class ShareFetchTap {
+  /** @param {number} [limit=64] Retained facts. @param {object} [clock] Monotonic clock. */
+  constructor(limit = 64, clock = SHARE_CLOCK) {
+    this.clock = clock
+    this.limit = limit
+    this.facts = []
+    this.sockets = new Map()
+    this.sequence = 0
+    this.created = 0
+    this.frameSequence = 0
+    this.faults = 0
+    this.context = new AsyncLocalStorage()
+    this.observers = new Set()
+    this.socketObservers = new WeakMap()
+  }
+
+  /**
+   * @param {Function} inner a socket factory
+   * @returns {Function} a factory whose sockets this tap observes
+   */
+  factory(inner) {
+    const tap = this
+    return (args) => {
+      const id = ++this.created
+      const endpoint = `${args.host}:${args.port}`
+      this.notify('socket-connect-start', { socket: id, endpoint })
+      const socket = inner({
+        ...args,
+        onConnect(...rest) {
+          tap.notify('socket-connect-end', { socket: id, endpoint })
+          return args.onConnect.apply(this, rest)
+        },
+      })
+      return this.wrap(socket, endpoint, id)
+    }
+  }
+
+  /**
+   * @param {object} socket the socket the product will write to
+   * @param {string} endpoint `host:port` it dialled
+   * @param {number} [id] Identity reserved by the observed factory.
+   * @returns {object} the same socket, observed
+   */
+  wrap(socket, endpoint, id = ++this.created) {
+    for (const [known, ref] of this.sockets)
+      if (ref.deref()?.destroyed !== false) this.sockets.delete(known)
+    this.sockets.set(id, new WeakRef(socket))
+    let carry = Buffer.alloc(0)
+    let incoming = Buffer.alloc(0)
+    const outstanding = new Map()
+    const receive = (chunk) => {
+      incoming = Buffer.concat([incoming, chunk])
+      while (incoming.length >= 4 && incoming.length >= 4 + incoming.readInt32BE(0)) {
+        const end = 4 + incoming.readInt32BE(0)
+        const frame = outstanding.get(incoming.readInt32BE(4))
+        if (frame) {
+          frame.responseBytes = incoming.subarray(0, end).toString('base64')
+          frame.answeredAt = this.clock.now()
+          outstanding.delete(frame.correlationId)
+          if (frame.apiKey === 76 && frame.request.memberEpoch === -1) {
+            let response
+            let error
+            try {
+              response = ShareCycleOracle.heartbeatResponse(frame)
+            } catch (failure) {
+              error = { name: failure.name, message: failure.message }
+            }
+            this.leave(
+              'leave-answer',
+              frame,
+              frame,
+              {
+                errorCode: response?.errorCode ?? null,
+                responseMemberId: response?.memberId ?? null,
+                responseMemberEpoch: response?.memberEpoch ?? null,
+                error,
+              },
+              frame.answeredAt
+            )
+          }
+        }
+        incoming = incoming.subarray(end)
+      }
+    }
+    const ended = () => this.notify('socket-end', { socket: id, endpoint })
+    const errored = (error) =>
+      this.notify('socket-error', {
+        socket: id,
+        endpoint,
+        error: { name: error.name, message: error.message, code: error.code },
+      })
+    socket.on?.('data', receive)
+    this.socketObservers.set(socket, () => {
+      socket.on?.('end', ended)
+      socket.on?.('error', errored)
+    })
+    socket.once?.('close', (hadError) => {
+      this.notify('socket-close', { socket: id, endpoint, hadError, destroyed: socket.destroyed })
+      socket.off('end', ended)
+      socket.off('error', errored)
+      this.socketObservers.delete(socket)
+      socket.off('data', receive)
+      for (const frame of outstanding.values()) {
+        frame.lostAt = this.clock.now()
+        if (frame.apiKey === 76 && frame.request.memberEpoch === -1)
+          this.leave('leave-lost', frame, frame, {}, frame.lostAt)
+      }
+      outstanding.clear()
+    })
+    const write = socket.write.bind(socket)
+    socket.write = (data, ...rest) => {
+      try {
+        const bytes = Buffer.isBuffer(data)
+          ? data
+          : Buffer.from(data, typeof rest[0] === 'string' ? rest[0] : undefined)
+        carry = Buffer.concat([carry, bytes])
+        while (carry.length >= 4 && carry.length >= 4 + carry.readInt32BE(0)) {
+          const end = 4 + carry.readInt32BE(0)
+          const fact = this.observe(id, endpoint, carry.subarray(0, end))
+          if (fact) outstanding.set(fact.correlationId, fact)
+          carry = carry.subarray(end)
+        }
+      } catch {
+        carry = Buffer.alloc(0)
+        this.faults += 1
+      }
+      return write(data, ...rest)
+    }
+
+    return socket
+  }
+
+  /**
+   * @param {number} socket the observed socket's id
+   * @param {string} endpoint the socket's `host:port`
+   * @param {Buffer} frame one whole request frame
+   * @returns {object|undefined} the original wire fact when a journal is active
+   */
+  observe(socket, endpoint, frame) {
+    const { readRequestHeader } = require('../../testHelpers/fakeSocket')
+    const header = readRequestHeader(frame)
+    const context = this.context.getStore()
+    let written
+    if (context && [76, 78, 79].includes(header.apiKey)) {
+      const modules = {
+        76: 'shareGroupHeartbeatV1',
+        78: 'shareFetchV2',
+        79: 'shareAcknowledgeV2',
+      }
+      const wire = require(`../../testHelpers/wire/${modules[header.apiKey]}`)
+      written = {
+        id: ++this.frameSequence,
+        socket,
+        endpoint,
+        ...header,
+        at: this.clock.now(),
+        bytes: frame.toString('base64'),
+        request: wire.readRequest(frame.subarray(header.byteLength)),
+      }
+      context.frames.push(written)
+      if (header.apiKey === 76 && written.request.memberEpoch === -1) {
+        written.invokedAt = context.at
+        this.leave('leave-write', context, written, {}, written.at)
+      }
+    }
+    if (header.apiKey !== 78) return written
+    let epoch = null
+    try {
+      const { readRequest } = require('../../testHelpers/wire/shareFetchV2')
+      epoch = readRequest(frame.subarray(header.byteLength)).shareSessionEpoch
+    } catch {}
+    const fact = {
+      sequence: ++this.sequence,
+      socket,
+      endpoint,
+      epoch,
+      at: written?.at ?? this.clock.now(),
+    }
+    this.facts.push(fact)
+    this.notify(
+      'api78-write',
+      {
+        ...fact,
+        frame: written?.id,
+        exchange: context?.id,
+        memberId: context?.memberId,
+        groupId: context?.groupId,
+        attempted: true,
+      },
+      fact.at
+    )
+    if (this.facts.length > this.limit) this.facts.shift()
+    return written
+  }
+
+  /**
+   * Emits original leave facts; absent transport fields stay explicitly unknown before a write.
+   * @param {string} step Invocation, wire, failure or no-write observation.
+   * @param {object} fact Original heartbeat invocation.
+   * @param {object|null} frame Original socket frame, when one exists.
+   * @param {object} [fields] Decoded response or failure details.
+   * @param {number} [at] Original event timestamp.
+   * @returns {void}
+   */
+  leave(step, fact, frame, fields = {}, at = this.clock.now()) {
+    this.notify(
+      step,
+      {
+        groupId: fact.request.groupId,
+        memberId: fact.request.memberId,
+        memberEpoch: fact.request.memberEpoch,
+        endpoint: frame?.endpoint ?? fact.endpoint,
+        socket: frame?.socket ?? null,
+        correlationId: frame?.correlationId ?? null,
+        frame: frame?.id ?? null,
+        invokedAt: frame?.invokedAt ?? fact.at,
+        writtenAt: frame?.at ?? null,
+        answeredAt: frame?.answeredAt ?? null,
+        lostAt: frame?.lostAt ?? null,
+        ...fields,
+      },
+      at
+    )
+  }
+
+  /**
+   * @param {Function} observer Receives original transport times without retaining sockets.
+   * @returns {Function} Removes this cycle's observer.
+   */
+  listen(observer) {
+    this.observers.add(observer)
+    return () => this.observers.delete(observer)
+  }
+
+  /**
+   * @param {string} step Original socket or frame observation.
+   * @param {object} fields Primitive event details.
+   * @param {number} [at] Original monotonic timestamp.
+   * @returns {void}
+   */
+  notify(step, fields, at = this.clock.now()) {
+    for (const observer of this.observers) observer(step, fields, at)
+  }
+
+  /** @returns {number} a position after which `since` reads only later requests */
+  mark() {
+    return this.sequence
+  }
+
+  /**
+   * @param {number} mark a position from `mark`
+   * @param {string} endpoint `host:port`
+   * @returns {object[]} the ShareFetch requests written to the endpoint since the mark
+   */
+  since(mark, endpoint) {
+    return this.facts.filter((fact) => fact.sequence > mark && fact.endpoint === endpoint)
+  }
+
+  /**
+   * Destroys one original socket.
+   * @param {number} socket the id from a fact
+   * @returns {void}
+   * @throws {Error} when that socket is gone already
+   */
+  destroy(socket) {
+    const target = this.sockets.get(socket)?.deref()
+    if (!target || target.destroyed) throw new Error('The original data socket is already gone')
+    this.socketObservers.get(target)?.()
+    target.destroy()
+  }
+}
+
+/**
+ * Archives original exchange, acquisition, dispatch and settlement authority for one cycle.
+ * Object labels are local to the journal; detached acquisitions remain evidence until archived.
+ */
+class ShareCycleJournal {
+  /** @param {string} group Owned group. @param {ShareFetchTap} tap Original wire observer. */
+  constructor(group, tap) {
+    this.group = group
+    this.tap = tap
+    this.labels = new Map()
+    this.exchanges = []
+    this.heartbeats = []
+    this.groupDescriptions = []
+    this.acquisitions = []
+    this.outcomes = []
+    this.retirements = []
+    this.byExchange = new WeakMap()
+    this.byCohort = new WeakMap()
+    this.handlers = new AsyncLocalStorage()
+    this.restores = []
+    this.dispatch = 0
+  }
+
+  /** @param {*} value Original authority. @returns {number|null} Stable journal identity. */
+  label(value) {
+    if (value === undefined || value === null) return null
+    if (!this.labels.has(value)) this.labels.set(value, this.labels.size + 1)
+    return this.labels.get(value)
+  }
+
+  /**
+   * @param {object} prototype Original prototype.
+   * @param {string} method Observed method.
+   * @param {Function} observe Call-through observer.
+   * @returns {void}
+   */
+  wrap(prototype, method, observe) {
+    const original = prototype[method]
+    const wrapper = function (...args) {
+      return observe(this, original, args)
+    }
+    prototype[method] = wrapper
+    this.restores.push(() => {
+      if (prototype[method] !== wrapper)
+        throw new Error('A share journal wrapper could not be restored')
+      prototype[method] = original
+    })
+  }
+
+  /**
+   * @param {object} loop Original node owner.
+   * @param {object} exchange Original request or captured closing authority.
+   * @returns {object} One archived request with original tickets.
+   */
+  begin(loop, exchange) {
+    const fact = {
+      id: this.label(exchange),
+      apiKey: exchange.apiKey,
+      groupId: exchange.fields.groupId ?? loop.groupId,
+      memberId: exchange.fields.memberId ?? loop.memberId,
+      open: this.label(exchange.open),
+      pool: this.label(exchange.binding?.pool),
+      generation: exchange.binding?.generation,
+      endpoint: loop.broker.brokerAddress,
+      request: exchange.fields,
+      frames: [],
+      tickets: exchange.prepared.map(({ row, ticket }) => ({
+        acquisition: this.label(row),
+        ticket: this.label(ticket),
+        batches: ticket.acknowledgementBatches,
+        isRenewAck: ticket.isRenewAck,
+      })),
+    }
+    this.byExchange.set(exchange, fact)
+    this.exchanges.push(fact)
+    return fact
+  }
+
+  /** @returns {void} Installs observers before any cycle member connects. */
+  install() {
+    const { ShareFetchLoop } = require('../../src/consumer/share/shareFetchLoop')
+    const { ShareRun } = require('../../src/consumer/share/shareRun')
+    const RequestQueue = require('../../src/network/requestQueue')
+    this.wrap(RequestQueue.prototype, 'push', (queue, original, [request]) => {
+      const context = this.tap.context.getStore()
+      return original.call(
+        queue,
+        context
+          ? {
+              ...request,
+              sendRequest: () => this.tap.context.run(context, () => request.sendRequest()),
+            }
+          : request
+      )
+    })
+    this.wrap(Broker.prototype, 'shareGroupHeartbeat', (broker, original, args) => {
+      const [request] = args
+      if (request.groupId !== this.group) return original.apply(broker, args)
+      const fact = {
+        groupId: this.group,
+        memberId: request.memberId,
+        endpoint: broker.brokerAddress,
+        at: this.tap.clock.now(),
+        request: { ...request },
+        frames: [],
+      }
+      this.heartbeats.push(fact)
+      const leaving = request.memberEpoch === -1
+      if (leaving) this.tap.leave('leave-invoked', fact, null, {}, fact.at)
+      const noWrite = () => {
+        if (leaving && fact.frames.length === 0) this.tap.leave('leave-no-write', fact, null)
+      }
+      const failed = (error) => {
+        fact.failedAt = this.tap.clock.now()
+        fact.error = { name: error.name, message: error.message, code: error.code }
+        noWrite()
+        if (leaving) {
+          for (const frame of fact.frames.length ? fact.frames : [null])
+            this.tap.leave('leave-failure', fact, frame, { error: fact.error }, fact.failedAt)
+        }
+      }
+      let pending
+      try {
+        pending = this.tap.context.run(fact, () => original.apply(broker, args))
+      } catch (error) {
+        failed(error)
+        throw error
+      }
+      pending.then((response) => {
+        fact.answeredAt = this.tap.clock.now()
+        fact.response = response
+        noWrite()
+      }, failed)
+      return pending
+    })
+    this.wrap(ShareFetchLoop.prototype, 'send', (loop, original, [exchange]) => {
+      if (loop.groupId !== this.group) return original.call(loop, exchange)
+      const fact = this.begin(loop, exchange)
+      return this.tap.context.run(fact, () => original.call(loop, exchange))
+    })
+    this.wrap(ShareFetchLoop.prototype, 'writeFinal', (loop, original, args) => {
+      if (loop.groupId !== this.group) return original.apply(loop, args)
+      const captured = args[2]
+      const fact = this.begin(loop, { ...captured, apiKey: 79, open: captured.descriptor.token })
+      return this.tap.context.run(fact, () => original.apply(loop, args))
+    })
+    this.wrap(Broker.prototype, 'shareAcknowledge', (broker, original, args) => {
+      const fact = this.tap.context.getStore()
+      const pending = original.apply(broker, args)
+      if (fact?.groupId === this.group)
+        pending.then(
+          (response) => {
+            fact.response = response
+            fact.responseIdentity = this.label(response)
+          },
+          (error) => {
+            fact.error = { name: error.name, message: error.message }
+          }
+        )
+      return pending
+    })
+    this.wrap(ShareFetchLoop.prototype, 'complete', (loop, original, [exchange, response]) => {
+      const fact = this.byExchange.get(exchange)
+      if (fact) {
+        fact.responseIdentity = this.label(response)
+        fact.response = response
+      }
+      return original.call(loop, exchange, response)
+    })
+    this.wrap(ShareFetchLoop.prototype, 'failExchange', (loop, original, [exchange, error]) => {
+      const fact = this.byExchange.get(exchange)
+      if (fact) fact.error = { name: error.name, message: error.message }
+      return original.call(loop, exchange, error)
+    })
+    this.wrap(ShareFetchLoop.prototype, 'adopt', (loop, original, args) => {
+      const row = original.apply(loop, args)
+      if (loop.groupId !== this.group) return row
+      const [exchange, topicId, partition] = args
+      const fact = {
+        id: this.label(row),
+        token: this.label(row.token),
+        ledger: this.label(row.ledger),
+        exchange: this.byExchange.get(exchange)?.id,
+        topicId,
+        topic: row.topic,
+        partition: row.partition,
+        acquiredRecords: partition.acquiredRecords,
+      }
+      this.byCohort.set(row, fact)
+      this.acquisitions.push(fact)
+      return row
+    })
+    this.wrap(ShareRun.prototype, 'invoke', (run, original, args) => {
+      const acquisition = this.byCohort.get(args[1])
+      return acquisition
+        ? this.handlers.run({ acquisition: acquisition.id, dispatch: ++this.dispatch }, () =>
+            original.apply(run, args)
+          )
+        : original.apply(run, args)
+    })
+    this.wrap(ShareFetchLoop.prototype, 'emit', (loop, original, [results, row]) => {
+      if (loop.groupId === this.group)
+        for (const result of results) {
+          this.outcomes.push({
+            ...result,
+            topic: this.byCohort.get(row)?.topic,
+            partition: this.byCohort.get(row)?.partition,
+            acquisition: this.label(row),
+            error: result.error ? { name: result.error.name, message: result.error.message } : null,
+          })
+        }
+      return original.call(loop, results, row)
+    })
+    for (const method of ['onSessionReset', 'retireKey', 'dispose']) {
+      this.wrap(ShareFetchLoop.prototype, method, (loop, original, args) => {
+        if (loop.groupId === this.group)
+          this.retirements.push({
+            method,
+            at: performance.now(),
+            open: this.label(method === 'onSessionReset' ? args[0] : loop.session.token),
+            acquisitions: [...loop.cohorts.values()].flat().map((row) => this.label(row)),
+            reason: typeof args[1] === 'string' ? args[1] : null,
+          })
+        return original.apply(loop, args)
+      })
+    }
+  }
+
+  /** @returns {object} Serializable primitive journals, including failed and retired attempts. */
+  snapshot() {
+    return JSON.parse(
+      JSON.stringify({
+        exchanges: this.exchanges,
+        heartbeats: this.heartbeats,
+        groupDescriptions: this.groupDescriptions,
+        acquisitions: this.acquisitions,
+        outcomes: this.outcomes,
+        retirements: this.retirements,
+      })
+    )
+  }
+
+  /** @returns {void} Restores observers only after all member work has joined. */
+  restore() {
+    for (const restore of this.restores.splice(0).reverse()) restore()
+    this.handlers.disable()
+    this.labels.clear()
+  }
+}
+
+/**
+ * One public share client of a cycle, with the journals that observe it from the outside: the
+ * handler entries, the public acknowledgement results, the session resets and the membership it
+ * reports. It stores identities only, never a delivered message.
+ */
+class ShareMember {
+  /**
+   * @param {object} options
+   * @param {object} options.kafka the counted client
+   * @param {{ track: (client: object) => object }} options.shares resource observer
+   * @param {string} options.label `A` or `B`
+   * @param {string} options.group share group id
+   * @param {string} options.topic
+   * @param {{ shareRecordIdentity: Function }} options.fixtures the share fixtures
+   * @param {ShareCycleJournal} [options.journal] Original acquisition and handler authority.
+   * @param {Function} [options.onLateEntry] Invalidates the run on any post-join callback.
+   * @param {Function} [options.onProgress] Records original membership, delivery and close times.
+   * @param {(entries: object[], partition: number) => Promise<void>} [options.onBatch] awaited after
+   *   a batch's entries are journalled
+   */
+  constructor({
+    kafka,
+    shares,
+    label,
+    group,
+    topic,
+    fixtures,
+    journal,
+    onLateEntry = () => {},
+    onProgress = () => {},
+    onBatch = async () => {},
+  }) {
+    this.label = label
+    this.topic = topic
+    this.fixtures = fixtures
+    this.onBatch = onBatch
+    this.journal = journal
+    this.onLateEntry = onLateEntry
+    this.onProgress = onProgress
+    this.entries = []
+    this.acks = []
+    this.resets = []
+    this.crashes = []
+    this.memberId = null
+    this.assignment = []
+    this.client = shares.track(
+      kafka.shareConsumer({
+        groupId: group,
+        acquireMode: 'record_limit',
+        maxRecords: SHARE_SOAK.maxRecords,
+        maxWaitTimeInMs: 250,
+        acknowledgementMode: 'implicit',
+      })
+    )
+    const { events } = this.client
+    this.removers = [
+      this.client.on(events.GROUP_JOIN, ({ payload }) => {
+        this.memberId = payload.memberId
+        this.onProgress('member-joined', { memberId: this.memberId })
+      }),
+      this.client.on(events.ASSIGNMENT_CHANGED, ({ payload }) => {
+        this.assignment = payload.assignment
+        this.onProgress('assignment-changed', { assignment: this.assignment })
+      }),
+      this.client.on(events.ACKNOWLEDGE, ({ payload }) => {
+        this.acks.push(payload)
+        const { partition, firstOffset, lastOffset, type, error } = payload
+        this.onProgress('acknowledgement', {
+          partition,
+          firstOffset,
+          lastOffset,
+          type,
+          error: error ? { name: error.name, message: error.message } : null,
+        })
+      }),
+      this.client.on(events.SESSION_RESET, ({ payload }) => {
+        this.resets.push(payload)
+        this.onProgress('SESSION_RESET', payload)
+      }),
+      this.client.on(events.CRASH, ({ payload }) => this.crashes.push(payload.error)),
+    ]
+    if (events.HEARTBEAT)
+      this.removers.push(
+        this.client.on(events.HEARTBEAT, ({ payload }) => this.onProgress('heartbeat', payload))
+      )
+  }
+
+  /**
+   * @param {AbortSignal} scope the cycle scope
+   * @param {Function} bounded the live-run bound
+   * @returns {Promise<void>} once the client is running
+   */
+  async start(scope, bounded) {
+    this.onProgress('connect-start')
+    await bounded(scope, Infinity, () => this.client.connect())
+    this.onProgress('connect-end')
+    await bounded(scope, Infinity, () => this.client.subscribe({ topics: [this.topic] }))
+    this.onProgress('join-start')
+    await bounded(scope, Infinity, () =>
+      this.client.run({
+        eachBatch: async ({ batch }) => {
+          const entries = batch.messages.map((message) => ({
+            identity: this.fixtures.shareRecordIdentity({
+              ...message,
+              topic: batch.topic,
+              partition: batch.partition,
+            }),
+            deliveryCount: message.deliveryCount,
+            ...this.journal?.handlers.getStore(),
+          }))
+          const first = this.entries.length === 0 && entries.length > 0
+          this.entries.push(...entries)
+          if (first) this.onProgress('first-delivery', { partition: batch.partition })
+          if (this.finalized) this.onLateEntry(entries)
+          await this.onBatch(entries, batch.partition)
+        },
+      })
+    )
+    this.onProgress('run-ready')
+  }
+
+  /**
+   * Leaves the group and removes the journals' listeners, even if a progress sink fails.
+   * @returns {Promise<void>}
+   */
+  async stop() {
+    this.stopTask ??= (async () => {
+      let status = 'failed'
+      try {
+        try {
+          this.onProgress('disconnect-start')
+        } finally {
+          await this.client.disconnect({ timeout: 2000 })
+          status = 'completed'
+          this.disconnected = true
+        }
+      } finally {
+        try {
+          this.onProgress('disconnect-end', { status })
+        } finally {
+          this.removers.splice(0).forEach((remove) => remove())
+        }
+      }
+    })()
+    return this.stopTask
+  }
+
+  /** @returns {object} Current public observations without declaring the handler joined. */
+  snapshot() {
+    return {
+      member: this.label,
+      memberId: this.memberId,
+      assignment: this.assignment,
+      handler: this.entries,
+      acknowledgements: this.acks.map(({ error, ...ack }) => ({
+        ...ack,
+        error: error ? { name: error.name, message: error.message, code: error.code } : null,
+      })),
+      resets: this.resets,
+      crashes: this.crashes.map(({ name, message }) => ({ name, message })),
+      disconnected: this.disconnected === true,
+      finalized: this.finalized === true,
+    }
+  }
+
+  /** @returns {object[]} The complete joined journal; any later callback invalidates the run. */
+  finalize() {
+    this.finalized = true
+    return this.entries.map((entry) => ({ ...entry }))
+  }
+
+  /** @returns {Array<{ partition: number, firstOffset: string, lastOffset: string }>} successful Accepts */
+  accepted() {
+    return this.acks
+      .filter(({ type, error }) => type === 'accept' && !error)
+      .map(({ topic, partition, firstOffset, lastOffset }) => ({
+        topic,
+        partition,
+        firstOffset,
+        lastOffset,
+      }))
+  }
+
+  /** @returns {Set<string>} the distinct identities this member's handler received */
+  distinct() {
+    return new Set(this.entries.map(({ identity }) => identity))
+  }
+}
+
+/**
+ * The live side of the share soak: every call that touches the cluster. It owns the fixed topic and
+ * group, builds the cycle's clients through the public factory and returns what each independent
+ * oracle saw, never a verdict. It registers each cleanup before the effect it undoes.
+ */
+class ShareSoakDriver {
+  /**
+   * @param {object} options
+   * @param {object} options.kafka the counted client
+   * @param {string[]} options.brokers seed addresses, `host:port`
+   * @param {{ snapshot: () => Promise<object>, track: (client: object) => object }} options.shares
+   * @param {ShareFetchTap} options.tap observer of the ShareFetch writes
+   * @param {object} options.ports share fixtures, diagnostics and live-run helpers
+   * @param {Function} options.socketFactory Counted original socket factory for raw broker ownership.
+   * @param {Function} [options.onProgress] Archives cycle steps as they occur, including failures.
+   */
+  constructor({ kafka, brokers, shares, tap, ports, socketFactory, onProgress = () => {} }) {
+    Object.assign(this, { kafka, brokers, shares, tap, ports, socketFactory, onProgress })
+    this.admin = null
+    this.producer = null
+    this.leaders = new Map()
+    this.nodes = new Map()
+    this.completedAt = null
+    this.acknowledged = []
+  }
+
+  /**
+   * Creates the topic and group, reads the group configuration back, captures routing and the
+   * unrelated groups, closes the setup clients and takes the client-free baseline.
+   * @param {{ add: Function }} stack cleanup stack; every cleanup is registered before its effect
+   * @param {AbortSignal} scope the scenario scope
+   * @returns {Promise<{ topic: string, group: string }>}
+   * @throws {Error} the first setup failure
+   */
+  async prepare(stack, scope) {
+    const { bounded } = this.ports.bounded
+    const { fixtures } = this.ports
+    const nonce = Date.now().toString(36)
+    this.topic = `soak-share-${nonce}`
+    this.group = `soak-share-group-${nonce}`
+    stack.add('prove the share soak cleanup', (signal) => this.proveCleanup(signal))
+    stack.add('delete the share soak topic', (signal) => this.deleteTopic(signal))
+    stack.add('delete the share soak group', (signal) => this.deleteGroup(signal))
+    stack.add('reset the share soak group configs', async (signal) => {
+      await fixtures.resetShareGroupConfigs(
+        await this.cleanupAdmin(signal),
+        this.group,
+        GROUP_CONFIG_NAMES,
+        { signal }
+      )
+    })
+    stack.add('disconnect the share soak phase clients', () => this.closePhase())
+
+    const admin = this.kafka.admin()
+    this.admin = admin
+    await bounded(scope, Infinity, () => admin.connect())
+    await bounded(scope, Infinity, () =>
+      admin.createTopics({
+        topics: [
+          {
+            topic: this.topic,
+            numPartitions: SHARE_SOAK.partitions,
+            replicationFactor: 3,
+            configEntries: [
+              { name: 'min.insync.replicas', value: '2' },
+              { name: 'retention.ms', value: '-1' },
+              { name: 'cleanup.policy', value: 'delete' },
+            ],
+          },
+        ],
+        waitForLeaders: true,
+      })
+    )
+    await bounded(scope, Infinity, () =>
+      fixtures.setShareGroupConfigs(admin, this.group, {
+        'share.auto.offset.reset': 'earliest',
+        'share.record.lock.duration.ms': SHARE_SOAK.lockMs,
+      })
+    )
+    const metadata = await bounded(scope, Infinity, () =>
+      admin.fetchTopicMetadata({ topics: [this.topic] })
+    )
+    const [topic] = metadata.topics.filter(({ name }) => name === this.topic)
+    const { brokers } = await bounded(scope, Infinity, () => admin.describeCluster())
+    this.nodes = new Map(brokers.map(({ host, port, nodeId }) => [`${host}:${port}`, nodeId]))
+    for (const { partitionId, leader } of topic.partitions) {
+      const node = brokers.find(({ nodeId }) => nodeId === leader)
+      if (!node) throw new Error(`Partition ${partitionId} has no known leader`)
+      this.leaders.set(partitionId, `${node.host}:${node.port}`)
+    }
+    this.topicId = topic.topicId
+    this.configuration = await this.readConfiguration(admin, brokers, scope)
+    const { groups } = await bounded(scope, Infinity, () => admin.listGroups())
+    this.unrelated = groups.map(({ groupId }) => groupId).filter((id) => id !== this.group)
+    await bounded(scope, Infinity, () => admin.disconnect())
+    this.admin = null
+    this.baseline = await fixtures.captureShareCleanupBaseline(this.shares, { signal: scope })
+
+    return { topic: this.topic, group: this.group }
+  }
+
+  /**
+   * Reads effective group timings and each owned broker's defaults and bounds without changing
+   * them. Missing group values fall back only to that broker's observed value, never a constant.
+   * Raw resources retain configuration sources and synonyms for independent reconstruction.
+   * @param {object} admin Connected owned admin.
+   * @param {object[]} brokers Original cluster node identities and endpoints.
+   * @param {AbortSignal} scope Original setup scope.
+   * @returns {Promise<object>} Original reads, effective values and their fallback sources.
+   * @throws {Error} On failed, missing or unusable configuration readback.
+   */
+  async readConfiguration(admin, brokers, scope) {
+    const { GROUP, BROKER } = require('../../src/protocol/configResourceTypes')
+    const timings = ['heartbeat.interval.ms', 'session.timeout.ms', 'assignment.interval.ms']
+    const groupNames = [...GROUP_CONFIG_NAMES, ...timings.map((key) => `share.${key}`)]
+    const brokerNames = [
+      ...timings.flatMap((key) => [
+        `group.share.${key}`,
+        `group.share.min.${key}`,
+        `group.share.max.${key}`,
+      ]),
+      'group.share.assignors',
+    ]
+    const queries = [
+      { type: GROUP, name: this.group, configNames: groupNames },
+      ...brokers.map(({ nodeId }) => ({
+        type: BROKER,
+        name: String(nodeId),
+        configNames: brokerNames,
+      })),
+    ]
+    const startedAt = SHARE_CLOCK.now()
+    const results = await Promise.allSettled(
+      queries.map(async (query) => {
+        const response = await this.ports.bounded.bounded(scope, Infinity, () =>
+          admin.describeConfigs({ resources: [query], includeSynonyms: true })
+        )
+        const resource = response.resources.find(
+          ({ resourceType, resourceName }) =>
+            resourceType === query.type && resourceName === query.name
+        )
+        if (!resource || resource.errorCode !== 0)
+          throw new Error('The share soak configuration readback failed')
+        return { query, resource, completedAt: SHARE_CLOCK.now() }
+      })
+    )
+    const failed = results.find(({ status }) => status === 'rejected')
+    if (failed) throw failed.reason
+    const reads = results.map(({ value }) => value)
+    const entry = (read, name) =>
+      read.resource.configEntries.find(({ configName }) => configName === name)
+    const usable = (value) => value?.configValue != null && Number.isInteger(value.configSource)
+    const effective = brokers.map((broker, index) => {
+      const read = reads[index + 1]
+      if (brokerNames.some((name) => !usable(entry(read, name))))
+        throw new Error('The share soak broker configuration is incomplete')
+      return {
+        ...broker,
+        timings: Object.fromEntries(
+          timings.map((key) => {
+            const group = entry(reads[0], `share.${key}`)
+            const fallback = !usable(group)
+            return [
+              key,
+              {
+                ...(fallback ? entry(read, `group.share.${key}`) : group),
+                resourceType: fallback ? BROKER : GROUP,
+                resourceName: fallback ? String(broker.nodeId) : this.group,
+                fallback,
+              },
+            ]
+          })
+        ),
+      }
+    })
+    return {
+      groupId: this.group,
+      topic: this.topic,
+      topicId: this.topicId,
+      startedAt,
+      completedAt: SHARE_CLOCK.now(),
+      reads,
+      effective,
+    }
+  }
+
+  /**
+   * @param {AbortSignal} signal cleanup scope
+   * @returns {Promise<object>} a connected admin, opened when none is
+   */
+  async cleanupAdmin(signal) {
+    if (!this.admin) {
+      this.admin = this.kafka.admin()
+      await this.ports.bounded.bounded(signal, Infinity, () => this.admin.connect())
+    }
+
+    return this.admin
+  }
+
+  /**
+   * Connects the admin and the producer a phase's cycles share.
+   * @param {AbortSignal} scope the scenario scope
+   * @returns {Promise<void>}
+   */
+  async openPhase(scope) {
+    const { bounded } = this.ports.bounded
+    this.admin = this.kafka.admin()
+    this.producer = this.kafka.producer({ idempotent: true })
+    await bounded(scope, Infinity, () => this.admin.connect())
+    await bounded(scope, Infinity, () => this.producer.connect())
+  }
+
+  /**
+   * Disconnects what `openPhase` connected; safe when nothing is open.
+   * @returns {Promise<void>}
+   */
+  async closePhase() {
+    const { admin, producer } = this
+    this.admin = null
+    this.producer = null
+    const failures = []
+    for (const client of [producer, admin]) {
+      if (client) await client.disconnect().catch((error) => failures.push(error))
+    }
+    if (failures.length > 0) throw failures[0]
+  }
+
+  /**
+   * Runs one cycle: A joins, a transient B joins and leaves, the corpus is produced and delivered
+   * (with held identities redelivered after a reset before A closes), and every independent oracle
+   * is read.
+   * @param {ReturnType<typeof ShareCycleOracle.plan>} plan the cycle
+   * @param {AbortSignal} scope the cycle's slot; every await below ends with it
+   * @param {{due?: number, clock?: {now: Function}}} [timing] Original absolute slot cutoff and clock.
+   * @returns {Promise<object>} the observations `ShareCycleOracle.judge` checks
+   * @throws {Error} a setup, reset or observation failure, after the cycle's clients are closed
+   */
+  async cycle(plan, scope, { due = Infinity, clock = SHARE_CLOCK } = {}) {
+    const { bounded, pollUntil } = this.ports.bounded
+    const { fixtures, probe } = this.ports
+    const hold = { entries: null, partition: null, release: null }
+    const stack = new probe.CleanupStack()
+    const journal = new ShareCycleJournal(this.group, this.tap)
+    journal.install()
+    stack.add('restore the cycle journal', () => {
+      try {
+        observation.provenance = journal.snapshot()
+        observation.memberObservations = members.map((member) => member.snapshot())
+        observation.snapshot = {
+          at: clock.now(),
+          workloadJoined:
+            members.length === 2 &&
+            members.every((member) => member.disconnected && member.finalized),
+        }
+        if (active.failureArchived) this.onCycleCleanup?.(capture())
+      } finally {
+        unlisten()
+        journal.restore()
+        active.restored = true
+      }
+    })
+    const observation = {
+      members: { aJoined: false, aLeft: false, bAdded: false, bRemoved: false },
+      reset: null,
+      held: [],
+      positions: [],
+      steps: [],
+      timing: { cycle: plan.cycle, kind: 'cycle', startedAt: clock.now(), due },
+    }
+    const note = (step, fields = {}, at = clock.now()) => {
+      const row = {
+        cycle: plan.cycle,
+        step,
+        at,
+        elapsedMs: at - observation.timing.startedAt,
+        due,
+        remainingMs: due - at,
+        ...fields,
+      }
+      observation.steps.push(row)
+      this.onProgress(row)
+    }
+    const members = []
+    const capture = () =>
+      JSON.parse(
+        JSON.stringify({
+          ...observation,
+          provenance: journal.snapshot(),
+          handler: members.flatMap((member) => member.entries),
+          accepted: members.flatMap((member) => member.accepted()),
+          memberObservations: members.map((member) => member.snapshot()),
+          snapshot: {
+            at: clock.now(),
+            workloadJoined:
+              members.length === 2 &&
+              members.every((member) => member.disconnected && member.finalized),
+          },
+        })
+      )
+    const active = { capture, observation, failureArchived: false }
+    this.activeCycle = active
+    const postResetNodes = new Set()
+    const unlisten = this.tap.listen((step, fields, at) => {
+      if (step.startsWith('leave-') && fields.groupId === this.group) {
+        const member = members.find((member) => member.memberId === fields.memberId)
+        note(step, { member: member?.label ?? null, ...fields }, at)
+        return
+      }
+      const target = observation.resetTarget
+      if (!target) return
+      const nodeId = this.nodes.get(fields.endpoint)
+      if (step === 'api78-write') {
+        if (
+          fields.memberId !== target.memberId ||
+          fields.groupId !== this.group ||
+          postResetNodes.has(fields.endpoint)
+        )
+          return
+        postResetNodes.add(fields.endpoint)
+        note('post-reset-api78', { ...fields, nodeId }, at)
+      } else if (fields.socket === target.socket) {
+        note(step, { ...fields, nodeId }, at)
+      } else if (fields.endpoint === target.endpoint && step.startsWith('socket-connect-')) {
+        note(step.replace('socket-connect-', 'reconnect-'), { ...fields, nodeId }, at)
+      }
+    })
+    let allAcknowledged = false
+    const noteAcknowledgements = () => {
+      if (allAcknowledged || !observation.produced) return
+      const accepted = members.flatMap((member) => member.accepted())
+      if (
+        observation.produced.every(({ partition, identity }) => {
+          const offset = BigInt(JSON.parse(identity)[2])
+          return accepted.some(
+            (range) =>
+              range.topic === this.topic &&
+              range.partition === partition &&
+              BigInt(range.firstOffset) <= offset &&
+              BigInt(range.lastOffset) >= offset
+          )
+        })
+      ) {
+        allAcknowledged = true
+        note('all-acks', { identities: observation.produced.length })
+      }
+    }
+    stack.add('finalize workload journals', () => {
+      observation.handler = members.flatMap((member) => member.finalize())
+      observation.accepted = members.flatMap((member) => member.accepted())
+    })
+    const member = (label, onBatch) =>
+      new ShareMember({
+        kafka: this.kafka,
+        shares: this.shares,
+        label,
+        group: this.group,
+        topic: this.topic,
+        fixtures,
+        journal,
+        onLateEntry: (entries) => this.onLateEntry?.(entries),
+        onProgress: (step, fields) => {
+          note(step, { member: label, ...fields })
+          if (step === 'acknowledgement') noteAcknowledgements()
+          if (
+            step === 'disconnect-end' &&
+            active.restored &&
+            active.failureArchived &&
+            members.every((member) => member.disconnected && member.finalized)
+          )
+            this.onCycleCleanup?.(capture())
+        },
+        onBatch,
+      })
+    const track = (client) => {
+      members.push(client)
+      stack.add(`disconnect ${client.label}`, () => client.stop())
+      return client
+    }
+
+    this.lastCycle = observation
+    return stack.run(
+      async () => {
+        note('cycle-start')
+        const a = track(
+          member('A', async (entries, partition) => {
+            if (observation.resetTarget)
+              for (const entry of entries)
+                if (observation.held.includes(entry.identity))
+                  note('held-redelivery', { member: 'A', partition, ...entry })
+            if (!plan.reset || hold.entries) return
+            hold.entries = entries.map(({ identity }) => identity)
+            hold.partition = partition
+            hold.acquisition = entries[0]?.acquisition
+            hold.dispatch = entries[0]?.dispatch
+            await new Promise((resolve) => {
+              hold.release = resolve
+            })
+          })
+        )
+        stack.add('release the held handler', () => hold.release?.())
+        await a.start(scope, bounded)
+        note('a-membership-start')
+        await this.awaitMembers(scope, [a])
+        observation.members.aJoined = true
+        note('a-membership-end')
+        const b = track(member('B', async () => {}))
+        note('member-add-start')
+        await b.start(scope, bounded)
+        await this.awaitMembers(scope, [a, b])
+        observation.members.bAdded = true
+        note('member-add-end')
+        note('member-remove-start')
+        await b.stop()
+        if (!ShareCycleOracle.departure(journal, this.group, b.memberId))
+          throw new Error(`Member B (${b.memberId}) has no original successful leave exchange`)
+        await this.awaitMembers(scope, [a])
+        observation.members.bRemoved = b.entries.length === 0
+        observation.members.bRemovedAt = clock.now()
+        note('member-remove-end')
+
+        const mark = this.tap.mark()
+        if (plan.reset) {
+          note('sessions-start')
+          await this.awaitEstablished(scope, mark)
+          note('sessions-end')
+        }
+        note('produce-start')
+        observation.produced = await this.produce(plan, scope)
+        note('produce-end')
+        noteAcknowledgements()
+        this.acknowledged.push(...observation.produced.map(({ identity }) => identity))
+        observation.acknowledgedPrefix = [...this.acknowledged]
+        if (plan.reset) {
+          await pollUntil(scope, Infinity, () => hold.entries !== null, {
+            delayMs: 25,
+            label: 'The first batch reaching its handler',
+          })
+          note('reset-start')
+          observation.reset = await this.forceReset(scope, a, hold, mark, observation)
+          note('reset-end')
+        }
+        await pollUntil(
+          scope,
+          Infinity,
+          () => {
+            if (a.crashes.length > 0) throw a.crashes[0]
+            const counts = new Map()
+            for (const { identity } of a.entries)
+              counts.set(identity, (counts.get(identity) ?? 0) + 1)
+            return (
+              counts.size >= plan.records.length &&
+              observation.held.every((identity) => counts.get(identity) >= 2)
+            )
+          },
+          { delayMs: 25, label: 'Every identity delivered' }
+        )
+        note('all-delivered')
+        const reads = await Promise.allSettled([
+          (async () => {
+            note('raw-log-start')
+            const log = await this.rawLog(scope)
+            Object.assign(observation, this.readLogs(plan, log))
+            note('raw-log-end')
+          })(),
+          (async () => {
+            await a.stop()
+            const leave = ShareCycleOracle.departure(journal, this.group, a.memberId)
+            observation.members.aLeft = Boolean(leave) && a.crashes.length === 0
+            if (leave) observation.members.aLeftAt = leave.answeredAt
+            noteAcknowledgements()
+          })(),
+        ])
+        const failures = reads
+          .filter(({ status }) => status === 'rejected')
+          .map(({ reason }) => reason)
+        if (failures.length === 1) throw failures[0]
+        if (failures.length > 1) throw new AggregateError(failures, 'Cycle read and close failed')
+        observation.handler = [...a.finalize(), ...b.finalize()]
+        observation.accepted = a.accepted()
+        observation.provenance = journal.snapshot()
+        note('position-before-start')
+        observation.positions.push(await this.position(plan, scope, { clock }))
+        note('position-before-end')
+        note('group-empty-start')
+        try {
+          await bounded(scope, Infinity, () =>
+            fixtures.waitForShareGroupsEmpty(this.admin, [this.group], {
+              signal: scope,
+              record: (step, { group }) => {
+                const at = clock.now()
+                const described = JSON.parse(JSON.stringify(group))
+                journal.groupDescriptions.push({ at, group: described })
+                note(step, { group: described }, at)
+              },
+            })
+          )
+        } catch (error) {
+          const latest = journal.groupDescriptions.at(-1)?.group
+          const retained = latest?.members?.map(({ memberId }) => memberId) ?? []
+          throw new Error(
+            `${error.message}; last described members still listed in ${this.group}: ` +
+              (retained.length ? retained.join(', ') : '(none observed)'),
+            { cause: error }
+          )
+        }
+        if (!observation.members.aLeft)
+          throw new Error(`Member A (${a.memberId}) has no original successful leave exchange`)
+        observation.members.emptyAt = clock.now()
+        note('group-empty-end', { emptyAt: observation.members.emptyAt })
+        if (due - clock.now() < SHARE_SOAK.quietMs.cycle)
+          throw new Error('The cycle cannot contain its complete verifier window')
+        note('verifier-start')
+        observation.verifier = await this.quiet(scope, SHARE_SOAK.quietMs.cycle, {
+          due,
+          clock,
+          journal,
+          cycle: plan.cycle,
+          onProgress: (step) => note(`verifier-${step.replaceAll(' ', '-')}`),
+        })
+        note('verifier-end')
+        note('position-after-start')
+        const final = await this.position(plan, scope, { clock })
+        observation.positions.push(final)
+        note('position-after-end')
+        observation.broker = final.rows
+        observation.clientsDisconnected = true
+        observation.timing.completedAt = clock.now()
+        note('cycle-end')
+        this.departures = { ...observation.members }
+        return observation
+      },
+      { budgetMs: 2000 }
+    )
+  }
+
+  /**
+   * Freezes active provenance and partial public observations at the failure archive boundary.
+   * Cleanup may still be running; its later snapshot is archived separately.
+   * @returns {object|undefined} Detached evidence without finalizing a member.
+   */
+  snapshotCycle() {
+    if (!this.activeCycle || this.activeCycle.observation !== this.lastCycle) return this.lastCycle
+    this.activeCycle.failureArchived = true
+    return this.activeCycle.capture()
+  }
+
+  /**
+   * Waits until the admin API and the clients report the same members, each with the assignment it
+   * reports publicly, and the three partitions are covered.
+   * @param {AbortSignal} scope the cycle scope
+   * @param {ShareMember[]} members the members that must be present, and only them
+   * @returns {Promise<void>}
+   */
+  async awaitMembers(scope, members) {
+    const { bounded, pollUntil } = this.ports.bounded
+    const normal = (assignment) =>
+      JSON.stringify(
+        assignment
+          .map(({ topic, partitions }) => [topic, [...partitions].sort((a, b) => a - b)])
+          .sort()
+      )
+    await pollUntil(
+      scope,
+      Infinity,
+      async (poll) => {
+        if (members.some((member) => member.memberId === null || member.assignment.length === 0))
+          return false
+        const { groups } = await bounded(poll, Infinity, () =>
+          this.admin.describeShareGroups([this.group], { apiTimeout: 3000 })
+        )
+        const described = groups[0]?.members ?? []
+        const covered = new Set(
+          members.flatMap(({ assignment }) => assignment.flatMap((a) => a.partitions))
+        )
+        return (
+          described.length === members.length &&
+          covered.size === SHARE_SOAK.partitions &&
+          members.every((member) => {
+            const found = described.find(({ memberId }) => memberId === member.memberId)
+            return found && normal(found.assignment) === normal(member.assignment)
+          })
+        )
+      },
+      { delayMs: 25, label: 'The member and assignment barrier' }
+    )
+  }
+
+  /**
+   * Waits until A's ShareFetch to every leader has an established session, so the reset has an
+   * original data slot to select.
+   * @param {AbortSignal} scope the cycle scope
+   * @param {number} mark the tap position after B left
+   * @returns {Promise<void>}
+   */
+  async awaitEstablished(scope, mark) {
+    await this.ports.bounded.pollUntil(
+      scope,
+      Infinity,
+      () =>
+        [...new Set(this.leaders.values())].every((endpoint) =>
+          this.tap.since(mark, endpoint).some(({ epoch }) => epoch > 0)
+        ),
+      { delayMs: 25, label: 'Established share sessions on every leader' }
+    )
+  }
+
+  /**
+   * Produces the cycle's corpus with concurrent partition sends, joins every send, and derives
+   * each identity from the acknowledged base offset and the known ordered payloads.
+   * @param {ReturnType<typeof ShareCycleOracle.plan>} plan the cycle
+   * @param {AbortSignal} scope the cycle scope
+   * @returns {Promise<Array<{ partition: number, identity: string }>>} one entry per record, in plan order
+   * @throws {Error} when an acknowledgement is not exactly one clean batch at the cycle's offset
+   */
+  async produce(plan, scope) {
+    const { bounded } = this.ports.bounded
+    const produced = new Array(plan.records.length)
+    const sends = await Promise.allSettled(
+      Array.from({ length: SHARE_SOAK.partitions }, async (_, partition) => {
+        const rows = plan.records
+          .map((record, index) => ({ record, index }))
+          .filter(({ record }) => record.partition === partition)
+        const messages = rows.map(({ record }) => ({
+          partition,
+          key: Buffer.from(record.key),
+          value: Buffer.from(record.value),
+          timestamp: SHARE_SOAK_TIMESTAMP,
+        }))
+        const sent = await bounded(scope, Infinity, () =>
+          this.producer.send({ topic: this.topic, acks: -1, messages })
+        )
+        if (
+          sent.length !== 1 ||
+          sent[0].errorCode !== 0 ||
+          sent[0].partition !== partition ||
+          BigInt(sent[0].baseOffset) !== plan.first
+        ) {
+          throw new Error(
+            `Partition ${partition} was not acknowledged as one batch at offset ${plan.first}`
+          )
+        }
+        rows.forEach(({ index }, position) => {
+          produced[index] = {
+            partition,
+            identity: this.ports.fixtures.shareRecordIdentity({
+              topic: this.topic,
+              partition,
+              offset: String(plan.first + BigInt(position)),
+              key: messages[position].key,
+              value: messages[position].value,
+            }),
+          }
+        })
+      })
+    )
+    const failures = sends.filter(({ status }) => status === 'rejected').map(({ reason }) => reason)
+    if (failures.length === 1) throw failures[0]
+    if (failures.length > 1) throw new AggregateError(failures, 'Cycle partition sends failed')
+
+    return produced
+  }
+
+  /**
+   * Destroys A's original established data socket while its first batch is held, releases the
+   * handler, and observes the session reset and the new epoch-zero open on a new socket.
+   * @param {AbortSignal} scope the cycle scope
+   * @param {ShareMember} member A
+   * @param {{ entries: string[], partition: number, acquisition: number, dispatch: number,
+   *   release: Function }} hold the held batch
+   * @param {number} mark the tap position after B left
+   * @param {object} observation receives the frozen held set before the fault
+   * @returns {Promise<object>} the observed reset and reopen
+   * @throws {Error} when no established slot exists or no reset follows
+   */
+  async forceReset(scope, member, hold, mark, observation) {
+    const endpoint = this.leaders.get(hold.partition)
+    const old = this.tap
+      .since(mark, endpoint)
+      .filter(({ epoch }) => epoch > 0)
+      .at(-1)
+    if (!old) throw new Error(`No established ShareFetch slot on ${endpoint}`)
+    observation.held = [...hold.entries]
+    observation.resetTarget = {
+      socket: old.socket,
+      endpoint,
+      nodeId: this.nodes.get(endpoint),
+      memberId: member.memberId,
+      epoch: old.epoch,
+      partition: hold.partition,
+      acquisition: hold.acquisition,
+      dispatch: hold.dispatch,
+      held: observation.held,
+    }
+    const target = observation.resetTarget
+    this.tap.notify('reset-target', target)
+    this.tap.destroy(old.socket)
+    hold.release()
+    let next
+    await this.ports.bounded.pollUntil(
+      scope,
+      Infinity,
+      () => {
+        next = this.tap
+          .since(old.sequence, endpoint)
+          .find(({ epoch, socket }) => epoch === 0 && socket !== old.socket)
+        return member.resets.length > 0 && next !== undefined
+      },
+      { delayMs: 25, label: 'The session reset and its epoch-zero reopen' }
+    )
+
+    return {
+      apiKey: 78,
+      nodeId: member.resets[0].nodeId,
+      reason: member.resets[0].reason,
+      oldSocket: old.socket,
+      oldEpoch: old.epoch,
+      nextSocket: next.socket,
+      nextEpoch: next.epoch,
+    }
+  }
+
+  /**
+   * Polls the broker's terminal position of every partition against the cycle's cumulative end.
+   * @param {ReturnType<typeof ShareCycleOracle.plan>} plan the cycle
+   * @param {AbortSignal} scope the cycle scope
+   * @param {object} [timing] Monotonic clock and cycle/final observation kind.
+   * @returns {Promise<object>} Both raw listings, ownership, independent ends and normalized rows.
+   */
+  async position(plan, scope, { clock = SHARE_CLOCK, kind = 'cycle' } = {}) {
+    const startedAt = clock.now()
+    const target = {
+      groupId: this.group,
+      topic: this.topic,
+      partitions: Array.from({ length: SHARE_SOAK.partitions }, (_, partition) => ({
+        partition,
+        floor: '0',
+        end: plan.end,
+      })),
+    }
+    const observations = []
+    const result = await this.ports.diagnostics.awaitTerminalSharePosition(this.admin, target, {
+      signal: scope,
+      timeoutMs: 3000,
+      record: (row) => observations.push(JSON.parse(JSON.stringify(row))),
+    })
+    return {
+      target,
+      ...result,
+      ...observations.at(-1)?.last,
+      observations,
+      cycle: plan.cycle,
+      kind,
+      startedAt,
+      completedAt: clock.now(),
+    }
+  }
+
+  /**
+   * Reads through counted original raw brokers and reports disconnect failures the reader suppresses.
+   * @param {AbortSignal} scope Original cycle or cleanup deadline.
+   * @returns {Promise<Map<number, object>>} Independent cumulative raw log.
+   * @throws {Error} On a read, connect or disconnect failure.
+   */
+  async rawLog(scope) {
+    const failures = []
+    const owned = []
+    const open = async ({ host, port }) => {
+      const logger = createLogger({ level: logLevel.NOTHING, logCreator: LoggerConsole })
+      const broker = new Broker({
+        connectionPool: new ConnectionPool({
+          host,
+          port,
+          logger,
+          socketFactory: this.socketFactory,
+          connectionTimeout: 3000,
+          requestTimeout: 30000,
+        }),
+        logger,
+      })
+      const disconnect = broker.disconnect.bind(broker)
+      let attempted = false
+      broker.disconnect = async () => {
+        if (attempted) return
+        attempted = true
+        try {
+          await this.ports.bounded.bounded(scope, Infinity, () => disconnect())
+        } catch (error) {
+          failures.push(error)
+          throw error
+        }
+      }
+      owned.push(broker)
+      await this.ports.bounded.bounded(scope, Infinity, () => broker.connect())
+      return broker
+    }
+    let result
+    let primary
+    try {
+      result = await this.ports.bounded.bounded(scope, Infinity, () =>
+        (this.ports.readLog ?? readLog)({ brokers: this.brokers, topic: this.topic, open })
+      )
+    } catch (error) {
+      primary = error
+    } finally {
+      for (const broker of owned) await broker.disconnect().catch(() => {})
+    }
+    if (primary) {
+      primary.cleanupErrors = failures
+      throw primary
+    }
+    if (failures.length) throw new AggregateError(failures, 'Raw reader cleanup failed')
+    return result
+  }
+
+  /**
+   * @param {ReturnType<typeof ShareCycleOracle.plan>} plan the cycle
+   * @param {Map<number, { endOffset: string, records: object[] }>} log the raw log by partition
+   * @returns {{ log: string[], prefix: string[], logs: Record<number, { end: string, count: number }> }}
+   *   Current-cycle identities, every cumulative raw identity, and independently read ends/counts.
+   */
+  readLogs(plan, log) {
+    const identities = []
+    const prefix = []
+    const logs = {}
+    for (const [partition, { endOffset, records }] of log) {
+      logs[partition] = { end: endOffset, count: records.length }
+      for (const record of records) {
+        const identity = this.ports.fixtures.shareRecordIdentity({
+          topic: this.topic,
+          partition,
+          offset: String(record.offset),
+          key: record.key,
+          value: record.value,
+        })
+        prefix.push(identity)
+        if (BigInt(record.offset) >= plan.first) identities.push(identity)
+      }
+    }
+
+    return { log: identities, logs, prefix }
+  }
+
+  /**
+   * Reads the group with one fresh assigned member for `windowMs`; the fixture refuses a member
+   * that was never assigned or never fetched, so silence from an inactive member never counts.
+   * @param {AbortSignal} scope the enclosing scope
+   * @param {number} windowMs how long the assigned member fetches
+   * @param {object} [timing] Original slot, member journal, monotonic clock and progress callback.
+   * @returns {Promise<object>} Joined verifier identity, assignments, fetch chronology and deliveries.
+   */
+  async quiet(
+    scope,
+    windowMs,
+    {
+      due = Infinity,
+      clock = SHARE_CLOCK,
+      journal,
+      cycle = SHARE_SOAK.cycles - 1,
+      kind = 'cycle',
+      onProgress = () => {},
+    } = {}
+  ) {
+    const ownJournal = !journal
+    journal ??= new ShareCycleJournal(this.group, this.tap)
+    if (ownJournal) journal.install()
+    const events = []
+    let client
+    const removers = []
+    const record = (kind, payload) =>
+      events.push({ kind, at: clock.now(), wallAt: Date.now(), payload })
+    const kafka = {
+      shareConsumer: (options) => {
+        client = this.shares.track(this.kafka.shareConsumer(options))
+        for (const kind of ['GROUP_JOIN', 'ASSIGNMENT_CHANGED', 'REQUEST', 'FETCH', 'DISCONNECT']) {
+          if (client.events[kind])
+            removers.push(client.on(client.events[kind], ({ payload }) => record(kind, payload)))
+        }
+        const assignment = client.assignment
+        // The public consumer is frozen: observe through a copy, never by mutating it.
+        return {
+          ...client,
+          assignment: () => {
+            const current = assignment()
+            record('assignment', current)
+            return current
+          },
+        }
+      },
+    }
+    const openedAt = clock.now()
+    try {
+      const delivered = await this.ports.fixtures.verifierMember(this.group, this.topic, {
+        kafka,
+        signal: scope,
+        windowMs,
+        record: ({ step, assignment }) => {
+          onProgress(step)
+          if (step === 'window start') {
+            if (due - clock.now() < windowMs)
+              throw new Error('The cycle cannot contain its complete assigned verifier window')
+            record('window-start', assignment)
+          } else if (step === 'window end') record('window-end', assignment)
+        },
+      })
+      return {
+        active: true,
+        cycle,
+        kind,
+        provenance: journal.snapshot(),
+        groupId: this.group,
+        topic: this.topic,
+        topicId: this.topicId,
+        memberId: events.find(({ kind }) => kind === 'GROUP_JOIN')?.payload.memberId,
+        windowMs,
+        openedAt,
+        closedAt: clock.now(),
+        events,
+        delivered: delivered.map(({ identity }) => identity),
+      }
+    } finally {
+      if (ownJournal) journal.restore()
+      removers.forEach((remove) => remove())
+    }
+  }
+
+  /**
+   * The final proof after the last cycle, before any cleanup: the active same-group check for the
+   * final window, then the terminal position at the last cumulative end.
+   * @param {AbortSignal} scope the scenario scope
+   * @param {object} [timing] Original cleanup cutoff and monotonic clock.
+   * @returns {Promise<{ broker: object[], verifier: object }>}
+   */
+  async final(scope, { clock = SHARE_CLOCK, due = Infinity } = {}) {
+    const startedAt = clock.now()
+    const plan = ShareCycleOracle.plan(SHARE_SOAK.cycles - 1)
+    await this.cleanupAdmin(scope)
+    const members = { ...this.departures }
+    const before = await this.position(plan, scope, { clock, kind: 'final' })
+    await this.ports.fixtures.waitForShareGroupsEmpty(this.admin, [this.group], { signal: scope })
+    members.emptyAt = clock.now()
+    const verifier = await this.quiet(scope, SHARE_SOAK.quietMs.final, {
+      clock,
+      due,
+      cycle: plan.cycle,
+      kind: 'final',
+    })
+    const position = await this.position(plan, scope, { clock, kind: 'final' })
+    const raw = this.readLogs(plan, await this.rawLog(scope))
+    return {
+      verifier,
+      members,
+      timing: { cycle: plan.cycle, kind: 'final', startedAt, completedAt: clock.now(), due },
+      broker: position.rows,
+      positions: [before, position],
+      ...raw,
+      acknowledgedPrefix: [...this.acknowledged],
+    }
+  }
+
+  /**
+   * Deletes the fixed topic and waits until no broker lists it.
+   * @param {AbortSignal} signal cleanup scope
+   * @returns {Promise<void>}
+   */
+  async deleteTopic(signal) {
+    const { bounded, pollUntil } = this.ports.bounded
+    const admin = await this.cleanupAdmin(signal)
+    await bounded(signal, 10000, () =>
+      admin.deleteTopics({ topics: [this.topic], timeout: 8000 })
+    ).catch((error) => {
+      if (error.type !== 'UNKNOWN_TOPIC_OR_PARTITION') throw error
+    })
+    await pollUntil(signal, 10000, async () => !(await admin.listTopics()).includes(this.topic), {
+      label: 'The topic disappearing',
+    })
+  }
+
+  /**
+   * Deletes the fixed group once its members are gone.
+   * @param {AbortSignal} signal cleanup scope
+   * @returns {Promise<void>}
+   */
+  async deleteGroup(signal) {
+    const { pollUntil } = this.ports.bounded
+    const admin = await this.cleanupAdmin(signal)
+    await pollUntil(
+      signal,
+      10000,
+      async () => {
+        try {
+          await admin.deleteGroups([this.group])
+          return true
+        } catch (error) {
+          const code = error.groups?.[0]?.error?.code
+          if (code === 69) return true
+          if (code === 68) return false
+          throw error
+        }
+      },
+      { label: 'The group deletion' }
+    )
+  }
+
+  /**
+   * Proves the owned group and topic are absent on every broker and the measured owners are back at
+   * the client-free baseline, then disconnects the admin. It is the last cleanup to run.
+   * @param {AbortSignal} signal cleanup scope
+   * @returns {Promise<void>}
+   */
+  async proveCleanup(signal) {
+    const admin = await this.cleanupAdmin(signal)
+    try {
+      this.after = await this.ports.fixtures.assertShareCleanup(
+        admin,
+        [this.group],
+        [this.topic],
+        this.baseline,
+        this.shares,
+        { signal, unrelated: this.unrelated, disconnectAdmin: true }
+      )
+      this.completedAt = Number(process.hrtime.bigint() / 1000000n)
+      this.cleanupClock = {
+        origin: 'hrtime',
+        completedAt: this.completedAt,
+        performanceAt: performance.now(),
+      }
+    } finally {
+      this.admin = null
+      await admin.disconnect().catch(() => {})
+    }
+  }
+}
+
+/**
+ * @param {object} snapshot a resource reading
+ * @returns {object} its evidence form: open sockets, timers, listeners, queue depth, ledger size
+ */
+const resourceSummary = (snapshot) => ({
+  openSockets: snapshot.sockets.open,
+  timers: snapshot.activeResources.Timeout ?? 0,
+  listeners: Object.values(snapshot.listeners).reduce((sum, count) => sum + count, 0),
+  queueDepth: snapshot.queueDepth,
+  ledgerSize: snapshot.ledgerSize,
+})
+
+/**
+ * Validates independently observed natural child exit on one established monotonic clock origin.
+ * @param {object} observation Parent facts: origin, child entry, cleanup completion and exit.
+ * @param {object} budget Frozen selector allocation.
+ * @returns {boolean} Whether status, order, watchdog and both inclusive elapsed bounds hold.
+ */
+const shareSoakNaturalExit = (observation, budget) => {
+  const {
+    origin,
+    cleanupOrigin,
+    enteredAt,
+    completedAt,
+    exitedAt,
+    code,
+    signal,
+    watchdog,
+    forced,
+  } = observation
+  return (
+    typeof origin === 'string' &&
+    origin.length > 0 &&
+    cleanupOrigin === origin &&
+    [enteredAt, completedAt, exitedAt].every(Number.isFinite) &&
+    enteredAt <= completedAt &&
+    completedAt <= exitedAt &&
+    code === 0 &&
+    signal === null &&
+    watchdog === false &&
+    forced === false &&
+    exitedAt - completedAt <= budget.exitMs &&
+    exitedAt - enteredAt <= budget.totalMs
+  )
+}
+
+/**
+ * The owner of the share soak: three phases of ten cycles, each cycle inside its own slot, judged
+ * by independent per-cycle oracles and, through the `Soak` driver, by the per-phase resource
+ * screen. It owns the cleanup stack, the phase and cycle cursor and the evidence; every cluster
+ * effect belongs to its driver, so each rule here runs against a scripted driver.
+ *
+ * A failure of any kind, an expired bound included, taints the live run, so a later case refuses
+ * before it issues anything.
+ */
+class ShareSoak {
+  /**
+   * @param {object} options
+   * @param {ShareSoakDriver} options.driver every cluster effect and observation
+   * @param {object} options.kafka the counted client, handed to `Soak`
+   * @param {{ snapshot: () => Promise<object>, restore: () => void }} options.shares the resource
+   *   observer; `snapshot` is the probe every reading goes through
+   * @param {{ add: Function, run: Function }} options.stack the cleanup stack the driver registers on
+   * @param {boolean} options.short whether this is the 960 s profile rather than the 1920 s one
+   * @param {{ write: (row: object) => void, read: () => object[] }} options.evidence where every row
+   *   goes, and the rows the run wrote, in order
+   * @param {{ taint: Function, assertClean: Function }} options.gate the live run's taint gate
+   * @param {(scope: AbortSignal, ms: number) => Promise<void>} [options.pause] waits `ms` under a scope
+   * @param {{ now: () => number }} [options.clock] the monotonic clock
+   * @param {number} [options.slotMs] one cycle's slot; a spec shortens it
+   * @param {object} [options.soak] `Soak` options a spec overrides
+   */
+  constructor({
+    driver,
+    kafka,
+    shares,
+    stack,
+    short,
+    evidence,
+    gate,
+    pause = delay,
+    clock = SHARE_CLOCK,
+    slotMs,
+    soak = {},
+  }) {
+    const mode = short ? 'short' : 'full'
+    Object.assign(this, {
+      driver,
+      kafka,
+      shares,
+      stack,
+      short,
+      evidence,
+      gate,
+      pause,
+      clock,
+      soakOptions: soak,
+    })
+    this.budget = SHARE_SOAK.budgets[mode]
+    const { totalMs, setupMs, profileMs, transitionMs, cleanupMs, exitMs } = this.budget
+    // Only idle-wake overhead may use the unallocated margin; cycle work keeps its fixed cutoff.
+    this.profileMarginMs = totalMs - (setupMs + profileMs + transitionMs + cleanupMs + exitMs)
+    this.slotMs = slotMs ?? SHARE_SOAK.slotMs[mode]
+    this.phaseMs = (short ? SHARE_SOAK.shortMs : SHARE_SOAK.fullMs) / SHARE_SOAK.phases.length
+    this.stem = short ? 'share-soak' : 'share-soak-full'
+    this.nonce = Date.now().toString(36)
+    this.scope = NEVER
+    this.phasesDone = 0
+    this.elapsedProfileMs = 0
+    this.counts = { cycles: 0, resets: 0, memberAdds: 0, memberRemoves: 0 }
+    this.closed = false
+    this.spent = { setup: 0, transition: 0, profile: 0, cleanup: 0 }
+    this.timing = { stages: [], phases: [], slots: [] }
+    this.workDue = Infinity
+    this.driver.onLateEntry = (entries) =>
+      this.fail(
+        new Error(
+          `A joined workload member dispatched later identities: ${JSON.stringify(entries)}`
+        )
+      )
+    this.driver.onProgress = ({ at, ...row }) =>
+      this.row('soak-cycle-step', { ...row, monotonicAt: at })
+    this.driver.onCycleCleanup = (observation) =>
+      this.row('soak-cycle-cleanup', { cycle: observation.timing.cycle, observation })
+  }
+
+  /**
+   * Runs setup, the three phases, the final proof and the cleanup inside the whole child's bound.
+   * @returns {Promise<{ ok: boolean, violations: string[], resources: object, counts: object }>}
+   *   the combined verdict; `ok` only when every cycle, oracle and resource check held
+   * @throws {Error} a refusal of a tainted run, a failed or expired step, or a failed cleanup
+   */
+  async run() {
+    this.gate.assertClean()
+    this.startedAt = this.clock.now()
+    this.workDue = this.startedAt + this.budget.totalMs - this.budget.exitMs
+    try {
+      const verdict = await bounded(
+        NEVER,
+        this.workDue - this.startedAt + 1,
+        async (scope) => {
+          this.scope = scope
+          await this.prepare()
+          const resources = await this.soak().run()
+          return this.stage('cleanup', () => {
+            this.restore()
+            return this.complete(resources)
+          })
+        },
+        { label: 'The share soak' }
+      )
+      if (!verdict.ok) this.fail(new Error(verdict.violations.join('; ')), verdict.violations)
+      return verdict
+    } catch (error) {
+      this.fail(error)
+      throw error
+    }
+  }
+
+  /**
+   * Records the failure and taints the run.
+   * @private
+   * @param {Error} error what failed
+   * @param {string[]} [violations] the broken checks, when the failure is a verdict
+   * @returns {void}
+   */
+  fail(error, violations = []) {
+    this.gate.taint(error)
+    try {
+      this.row('case-failed', {
+        error: { name: error.name, message: String(error.message).slice(0, 600) },
+        violations,
+        counts: this.counts,
+      })
+    } catch {}
+  }
+
+  /**
+   * Creates the fixed topic and group and the client-free baseline, inside the setup bound.
+   * @returns {Promise<void>}
+   * @throws {Error} the setup failure; its cleanups are registered already and run on `close`
+   */
+  async prepare() {
+    await this.stage('setup', async (scope) => {
+      const digest = (file) =>
+        require('node:crypto').createHash('sha256').update(fs.readFileSync(file)).digest('hex')
+      this.row('soak-schedule', {
+        schedule: { slotMs: this.slotMs, ...this.budget },
+        config: {
+          compose: (process.env.COMPOSE_FILE || 'docker-compose.yml')
+            .split(path.delimiter)
+            .map((file) => ({ file, sha256: digest(file) })),
+          source: { file: 'scripts/soak/soak.js', sha256: digest(__filename) },
+          brokers: this.driver.brokers,
+        },
+      })
+      await this.driver.prepare(this.stack, scope)
+      if (this.driver.configuration)
+        this.row('soak-configuration', { config: this.driver.configuration })
+    })
+  }
+
+  /**
+   * @private
+   * @returns {Soak} the landed driver, with the per-phase screen as its judge and this owner's
+   *   workload, final proof and evidence
+   */
+  soak() {
+    const mode = this.short ? 'short' : 'full'
+    return new Soak({
+      kafka: this.kafka,
+      probe: { snapshot: () => this.snapshot() },
+      phases: PROFILES[this.short ? 'share-consumer-short' : 'share-consumer'],
+      context: { share: this },
+      sampleMs: SHARE_SOAK.sampleMs[mode],
+      warmupMs: SHARE_SOAK.warmupMs,
+      settleMs: SHARE_SOAK.settleMs,
+      judge: ShareSoakScreen.evaluate,
+      record: (line) => this.recordResources(line),
+      beforeTeardown: () => this.finish(),
+      transition: (work, stage = 'transition') => this.stage(stage, work),
+      ...this.soakOptions,
+    })
+  }
+
+  /** @returns {Promise<object>} one resource reading through the original owners */
+  snapshot() {
+    return this.shares.snapshot()
+  }
+
+  /**
+   * Runs the next phase of the fixed cursor: its ten cycles, in order, with the phase's admin and
+   * producer connected around them.
+   * @param {number} ms the phase length the `Soak` driver passes; it must be the declared one
+   * @returns {Promise<void>}
+   * @throws {Error} for a wrong length, a fourth phase or a failed cycle, after the phase's
+   *   clients are disconnected
+   */
+  async runPhase(ms) {
+    const index = this.phasesDone
+    if (index >= SHARE_SOAK.phases.length) throw new Error('Every share phase already ran')
+    if (ms !== this.phaseMs) {
+      throw new Error(`Phase length ${ms} ms is not the declared ${this.phaseMs} ms`)
+    }
+    try {
+      await this.stage('transition', (scope) => this.driver.openPhase(scope))
+    } catch (error) {
+      await this.stage('transition', () => this.driver.closePhase()).catch(() => {})
+      throw error
+    }
+    const startedAt = this.clock.now()
+    this.phaseStartedAt = startedAt
+    this.phaseDue = startedAt + ms
+    try {
+      await this.stage('profile', async (scope) => {
+        for (let i = 0; i < SHARE_SOAK.cyclesPerPhase; i++) {
+          await this.runCycle(index * SHARE_SOAK.cyclesPerPhase + i, scope)
+        }
+      })
+    } finally {
+      const completedAt = this.clock.now()
+      this.timing.phases.push({ phase: index, startedAt, due: this.phaseDue, completedAt })
+      this.elapsedProfileMs += completedAt - startedAt
+      await this.stage('transition', () => this.driver.closePhase())
+    }
+    this.phasesDone++
+  }
+
+  /**
+   * Runs one cycle inside its slot, judges it, records it, and sleeps the rest of the slot. A cycle
+   * that cannot finish inside its slot fails the scenario; the cycle count never shrinks to fit.
+   * @param {number} cycle zero-based cycle
+   * @param {AbortSignal} [idleScope] enclosing profile scope for boundary padding
+   * @returns {Promise<void>}
+   * @throws {Error} the slot's expiry, or every broken check of the cycle
+   */
+  async runCycle(cycle, idleScope = this.scope) {
+    const plan = ShareCycleOracle.plan(cycle)
+    const startedAt = this.clock.now()
+    const slotIndex = cycle % SHARE_SOAK.cyclesPerPhase
+    const due = Math.min(
+      this.phaseDue ?? Infinity,
+      (this.phaseStartedAt ?? startedAt) + (slotIndex + 1) * this.slotMs,
+      this.workDue
+    )
+    const remaining = due - startedAt
+    if (remaining <= 0) throw new Error(`Cycle ${cycle} deadline exhausted`)
+    try {
+      // The timer contains failure after the inclusive boundary; uncapped timestamps decide acceptance.
+      await this.within(
+        remaining + 1,
+        async (scope) => {
+          const observation = await this.driver.cycle(plan, scope, { due, clock: this.clock })
+          if (this.clock.now() > due)
+            throw new Error(`Cycle ${cycle} completed after its absolute cutoff`)
+          const violations = this.verifyCycle(plan, observation)
+          if (
+            observation.timing?.due !== due ||
+            observation.timing?.startedAt < startedAt ||
+            observation.timing?.completedAt > this.clock.now()
+          )
+            violations.push(`cycle ${cycle}: the proof is outside its original slot`)
+          this.recordCycle(plan, observation, violations)
+          this.driver.lastCycle = null
+          this.driver.activeCycle = null
+          if (violations.length > 0) throw new Error(violations.join('; '))
+          if (this.clock.now() > due)
+            throw new Error(`Cycle ${cycle} completed after its absolute cutoff`)
+          this.counts.cycles += 1
+          this.counts.memberAdds += 1
+          this.counts.memberRemoves += 1
+          if (observation.reset) this.counts.resets += 1
+        },
+        `Cycle ${cycle}`
+      )
+      // Boundary padding uses the profile's cumulative margin, outside the cycle-work timer.
+      while (this.clock.now() < due) await this.pause(idleScope, due - this.clock.now())
+    } catch (error) {
+      if (this.driver.lastCycle) {
+        const observation = this.driver.snapshotCycle?.() ?? this.driver.lastCycle
+        this.recordCycle(plan, observation, [error.message])
+      }
+      throw error
+    } finally {
+      this.timing.slots.push({ cycle, startedAt, due, completedAt: this.clock.now() })
+    }
+  }
+
+  /**
+   * @param {ReturnType<typeof ShareCycleOracle.plan>} plan the cycle
+   * @param {object} observation what the cycle saw
+   * @returns {string[]} every check of the cycle that failed
+   */
+  verifyCycle(plan, observation) {
+    return ShareCycleOracle.judge(plan, observation)
+  }
+
+  /**
+   * Archives the cycle's complete identities and proofs, and the reset beside it, to the evidence.
+   * The evidence sink owns the archive; the next cycle drops the in-memory attempt journal.
+   * @private
+   * @param {ReturnType<typeof ShareCycleOracle.plan>} plan the cycle
+   * @param {object} observation what the cycle saw
+   * @param {string[]} violations the cycle's broken checks
+   * @returns {void}
+   */
+  recordCycle(plan, observation, violations) {
+    const { members = {}, verifier = {}, produced = [], handler = [] } = observation
+    const reset = observation.reset ?? null
+    this.row('soak-cycle', {
+      cycle: plan.cycle,
+      phase: plan.phase,
+      status: violations.length === 0 ? 'passed' : 'failed',
+      violations,
+      joined: members.aJoined === true,
+      left: members.aLeft === true,
+      memberAdded: members.bAdded === true,
+      memberRemoved: members.bRemoved === true,
+      held: observation.held ?? [],
+      resetTarget: observation.resetTarget,
+      snapshot: observation.snapshot,
+      memberObservations: observation.memberObservations,
+      resetObserved: reset !== null,
+      reset,
+      cleanup: {
+        clientsDisconnected: observation.clientsDisconnected === true,
+        verifierEmpty: verifier.active === true && verifier.delivered?.length === 0,
+      },
+      oracles: {
+        log: { expected: produced.map(({ identity }) => identity), actual: observation.log ?? [] },
+        handler: {
+          expected: produced.map(({ identity }) => identity),
+          actual: handler.map(({ identity }) => identity),
+        },
+        broker: observation.broker ?? [],
+        accepted: observation.accepted ?? [],
+      },
+      positions: observation.positions ?? [],
+      steps: observation.steps ?? [],
+      timing: observation.timing,
+      members,
+      provenance: observation.provenance,
+      verifier,
+      handler,
+      prefix: observation.prefix,
+      acknowledgedPrefix: observation.acknowledgedPrefix,
+      logs: observation.logs,
+    })
+    if (reset) this.row('soak-reset', { cycle: plan.cycle, ...reset })
+  }
+
+  /**
+   * Records one `Soak` line as a resource row; the generic phase verdict keeps its own kind.
+   * @private
+   * @param {object} line a `Soak` line
+   * @returns {void}
+   */
+  recordResources(line) {
+    if (line.kind === 'baseline') this.baseline = line.snapshot
+    if (line.kind === 'teardown') this.teardown = line.snapshot
+    this.row('soak-resources', {
+      ...line,
+      kind: line.kind === 'verdict' ? 'resource-verdict' : line.kind,
+    })
+  }
+
+  /**
+   * The final proof, then the strict cleanup, once every phase has ended and before the teardown
+   * reading: the cleanups run here, so the reading compares what a finished run leaves.
+   * @returns {Promise<void>}
+   * @throws {Error} a failed proof or cleanup
+   */
+  async finish() {
+    await this.stage('cleanup', async (scope) => {
+      this.final = await this.driver.final(scope, { clock: this.clock, due: this.cleanupDue })
+      await this.cleanupStack()
+    })
+  }
+
+  /**
+   * Runs the remaining cleanups against the original shared final deadline, even on failure.
+   * @returns {Promise<void>}
+   */
+  async cleanupStack() {
+    this.cleanupDue ??= Math.min(this.clock.now() + this.budget.cleanupMs, this.workDue)
+    const remaining = this.cleanupDue - this.clock.now()
+    if (remaining <= 0) throw new Error('The shared cleanup deadline exhausted')
+    await this.stack.run(async () => {}, { budgetMs: remaining })
+    if (this.clock.now() > this.cleanupDue) throw new Error('The shared cleanup deadline exceeded')
+  }
+
+  /**
+   * Charges actual monotonic time to a cumulative allocation and its original enclosing deadline.
+   * @template T
+   * @param {'setup'|'transition'|'profile'|'cleanup'} name Shared allocation.
+   * @param {(scope: AbortSignal) => T|Promise<T>} work Lazy operation.
+   * @returns {Promise<T>} Original result, only within all applicable cutoffs.
+   * @throws {Error} On exhaustion, including a late timer whose abort has not fired yet.
+   */
+  async stage(name, work) {
+    const startedAt = this.clock.now()
+    const margin = name === 'profile' ? this.profileMarginMs : 0
+    const allowance = this.budget[`${name}Ms`] + margin - this.spent[name]
+    const previousOvershoot = this.elapsedProfileMs - this.phasesDone * this.phaseMs
+    if (name === 'cleanup') this.cleanupDue ??= Math.min(startedAt + allowance, this.workDue)
+    const due = Math.min(
+      startedAt + allowance,
+      this.workDue,
+      name === 'cleanup' ? this.cleanupDue : Infinity,
+      name === 'profile' ? this.phaseDue + margin - previousOvershoot : Infinity
+    )
+    if (startedAt >= due) throw new Error(`The shared ${name} deadline exhausted`)
+    try {
+      const result = await this.within(due - startedAt + 1, work, `The shared ${name}`)
+      if (this.clock.now() > due) throw new Error(`The shared ${name} deadline exceeded`)
+      return result
+    } finally {
+      const completedAt = this.clock.now()
+      this.spent[name] += completedAt - startedAt
+      this.timing.stages.push({ name, startedAt, due, completedAt })
+    }
+  }
+
+  /**
+   * Combines the cycle rows, the final proof and the resource verdict into one verdict, and
+   * records the single completion row only when every check held.
+   * @private
+   * @param {{ ok: boolean, violations: string[] }} resources the screen's verdict
+   * @returns {{ ok: boolean, violations: string[], resources: object, counts: object }}
+   */
+  complete(resources) {
+    this.gate?.assertClean()
+    const rows = this.evidence
+      .read()
+      .filter(({ event, scenario }) => event === 'soak-cycle' && scenario === this.nonce)
+      .sort((a, b) => a.cycle - b.cycle)
+    const violations = [...resources.violations]
+    if (!Number.isFinite(this.elapsedProfileMs) || this.elapsedProfileMs < this.budget.profileMs)
+      violations.push('the actual uncapped profile duration does not reach the declared schedule')
+    if (this.elapsedProfileMs > this.budget.profileMs + this.profileMarginMs)
+      violations.push(
+        `the actual uncapped profile overshoot exceeds the ${this.profileMarginMs} ms unallocated margin`
+      )
+    const expected = SHARE_SOAK.cycles
+    const { slots, phases, stages } = this.timing
+    if (
+      slots.length !== expected ||
+      phases.length !== SHARE_SOAK.phases.length ||
+      slots.some((slot, index) => {
+        const phase = phases[Math.floor(index / SHARE_SOAK.cyclesPerPhase)]
+        return (
+          slot.cycle !== index ||
+          !phase ||
+          ![slot.startedAt, slot.due, slot.completedAt].every(Number.isFinite) ||
+          slot.due !== phase.startedAt + ((index % SHARE_SOAK.cyclesPerPhase) + 1) * this.slotMs ||
+          slot.completedAt < slot.due ||
+          slot.startedAt < phase.startedAt ||
+          slot.startedAt >= slot.due ||
+          slot.completedAt > phase.completedAt ||
+          (index > 0 && slot.startedAt < slots[index - 1].completedAt)
+        )
+      }) ||
+      phases.some(
+        (phase, index) =>
+          phase.phase !== index ||
+          ![phase.startedAt, phase.due, phase.completedAt].every(Number.isFinite) ||
+          phase.due !== phase.startedAt + this.phaseMs ||
+          phase.completedAt < phase.due ||
+          (index > 0 && phase.startedAt < phases[index - 1].completedAt)
+      ) ||
+      phases.reduce((total, phase) => total + (phase.completedAt - phase.startedAt), 0) !==
+        this.elapsedProfileMs ||
+      stages.some(
+        ({ startedAt, completedAt, due }) =>
+          ![startedAt, completedAt, due].every(Number.isFinite) ||
+          completedAt < startedAt ||
+          completedAt > due
+      )
+    )
+      violations.push(
+        'the original slot, phase or stage timestamps do not prove the fixed schedule'
+      )
+    for (const name of ['setup', 'transition', 'profile', 'cleanup']) {
+      const spent = stages
+        .filter((stage) => stage.name === name)
+        .reduce((total, stage) => total + stage.completedAt - stage.startedAt, 0)
+      if (spent > this.budget[`${name}Ms`] + (name === 'profile' ? this.profileMarginMs : 0))
+        violations.push(`the cumulative ${name} allocation exceeded`)
+    }
+    if (
+      rows.length !== expected ||
+      rows.some((row, i) => row.cycle !== i || row.status !== 'passed')
+    ) {
+      violations.push(`${rows.length} passed cycle rows, ${expected} are required`)
+    }
+    const prefix = []
+    for (const row of rows) {
+      const produced = row.oracles.log.expected.map((identity) => ({
+        identity,
+        partition: JSON.parse(identity)[1],
+      }))
+      prefix.push(...produced.map(({ identity }) => identity))
+      const observation = {
+        produced,
+        log: row.oracles.log.actual,
+        logs: row.logs,
+        handler: row.handler,
+        accepted: row.oracles.accepted,
+        broker: row.oracles.broker,
+        positions: row.positions,
+        timing: row.timing,
+        held: row.held,
+        reset: row.reset,
+        verifier: row.verifier,
+        provenance: row.provenance,
+        memberObservations: row.memberObservations,
+        prefix: row.prefix,
+        acknowledgedPrefix: row.acknowledgedPrefix,
+        members: {
+          ...row.members,
+          aJoined: row.joined,
+          aLeft: row.left,
+          bAdded: row.memberAdded,
+          bRemoved: row.memberRemoved,
+        },
+        clientsDisconnected: row.cleanup.clientsDisconnected,
+      }
+      const slot = slots.find(({ cycle }) => cycle === row.cycle)
+      if (
+        !slot ||
+        row.timing?.cycle !== row.cycle ||
+        row.timing?.kind !== 'cycle' ||
+        row.timing.startedAt < slot.startedAt ||
+        row.timing.due !== slot.due ||
+        row.timing.completedAt > slot.due
+      )
+        violations.push(`cycle ${row.cycle}: the proof is outside its original slot`)
+      violations.push(...ShareCycleOracle.judge(ShareCycleOracle.plan(row.cycle), observation))
+      if (JSON.stringify([...prefix].sort()) !== JSON.stringify([...(row.prefix ?? [])].sort()))
+        violations.push(
+          `cycle ${row.cycle}: archived cumulative prefix differs from original producer receipts`
+        )
+    }
+    const verifiers = [...rows.map(({ verifier }) => verifier), this.final?.verifier]
+    if (new Set(verifiers.map((verifier) => verifier?.memberId)).size !== expected + 1)
+      violations.push('every cycle and final verifier must be a distinct original member')
+    const { cycles, resets, memberAdds, memberRemoves } = this.counts
+    if (
+      cycles !== expected ||
+      resets !== SHARE_SOAK.resets ||
+      memberAdds !== expected ||
+      memberRemoves !== expected
+    ) {
+      violations.push(
+        `counted ${cycles} cycles, ${resets} resets, ${memberAdds} adds and ${memberRemoves} removes`
+      )
+    }
+    const corpus = rows.flatMap((row) => row.oracles.log.expected)
+    const physical = rows.flatMap((row) => row.oracles.log.actual)
+    const handled = rows.flatMap((row) => row.oracles.handler.actual)
+    if (
+      new Set(corpus).size !== expected * SHARE_SOAK.recordsPerCycle ||
+      physical.length !== corpus.length
+    ) {
+      violations.push('the acknowledged corpus is not 1800 distinct physical identities')
+    }
+    const { final = {} } = this
+    const last = ShareCycleOracle.plan(expected - 1)
+    ShareCycleOracle.sequence(final, (message) => violations.push(`final: ${message}`))
+    if (
+      final.timing?.kind !== 'final' ||
+      final.timing?.cycle !== last.cycle ||
+      final.timing?.startedAt < phases.at(-1)?.completedAt ||
+      final.timing?.due !== this.cleanupDue ||
+      final.timing?.completedAt > this.clock.now()
+    )
+      violations.push('final: a distinct post-profile observation inside cleanup is required')
+    ShareCycleOracle.broker(last, final.broker ?? [], (message) =>
+      violations.push(`final: ${message}`)
+    )
+    if (final.verifier?.active !== true || final.verifier.delivered?.length !== 0) {
+      violations.push('the final same-group verifier was inactive or received a record')
+    }
+    for (const position of final.positions ?? []) {
+      ShareCycleOracle.position(last, position, (message) => violations.push(`final: ${message}`))
+      if (
+        position.target?.groupId !== final.verifier?.groupId ||
+        position.topicId !== final.verifier?.topicId ||
+        position.target?.topic !== final.verifier?.topic
+      )
+        violations.push('final: terminal and verifier ownership disagree')
+    }
+    if (final.positions?.length !== 2)
+      violations.push('final: both terminal observations are required')
+    ShareCycleOracle.verifier(final.verifier, SHARE_SOAK.quietMs.final, (message) =>
+      violations.push(`final: ${message}`)
+    )
+    ShareCycleOracle.log(
+      last,
+      new Map(rows.at(-1)?.oracles.log.expected.map((id) => [id, {}])),
+      final,
+      (message) => violations.push(`final: ${message}`)
+    )
+    if (JSON.stringify([...(final.prefix ?? [])].sort()) !== JSON.stringify([...corpus].sort()))
+      violations.push('final: the raw prefix differs from the original producer receipts')
+    const completedAt = this.driver.completedAt
+    if (!Number.isFinite(completedAt)) violations.push('the final cleanup proof never completed')
+    const verdict = {
+      ok: violations.length === 0,
+      violations,
+      resources,
+      counts: { ...this.counts },
+    }
+    if (verdict.ok) {
+      this.row('case-complete', {
+        status: 'passed',
+        tainted: false,
+        schedule: { slotMs: this.slotMs, ...this.budget },
+        profileMs: this.short ? SHARE_SOAK.shortMs : SHARE_SOAK.fullMs,
+        elapsedProfileMs: this.elapsedProfileMs,
+        memberAdds,
+        memberRemoves,
+        oracles: {
+          log: { expected: [...corpus].sort(), actual: [...physical].sort() },
+          handler: { expected: [...corpus].sort(), actual: [...handled].sort() },
+          broker: final.broker,
+        },
+        resources: {
+          before: resourceSummary(this.baseline),
+          after: resourceSummary(this.teardown),
+        },
+        final: this.final,
+        timing: {
+          ...this.timing,
+          origin: 'performance-ms',
+          startedAt: this.startedAt,
+          workDue: this.workDue,
+          observedAt: this.clock.now(),
+          spent: { ...this.spent },
+        },
+        cleanup: {
+          groupsAbsent: true,
+          topicsAbsent: true,
+          completedAt,
+          clock: this.driver.cleanupClock,
+        },
+      })
+    }
+
+    return verdict
+  }
+
+  /**
+   * Runs a lazy step under the scenario's own bound, so nothing starts once the scenario's time is
+   * spent and an expiry taints the live run.
+   * @private
+   * @template T
+   * @param {number} ms the step's own allowance
+   * @param {(scope: AbortSignal) => Promise<T>} thunk the step; it is not called under an aborted scope
+   * @param {string} label names the step in its time-out message
+   * @returns {Promise<T>}
+   */
+  within(ms, thunk, label) {
+    return bounded(this.scope, ms, thunk, { label })
+  }
+
+  /**
+   * @private
+   * @param {string} event the row kind
+   * @param {object} [fields] the measured facts
+   * @returns {void}
+   */
+  row(event, fields = {}) {
+    this.evidence.write({
+      event,
+      case: SHARE_SOAK_TITLE,
+      profile: 'tv2',
+      scenario: this.nonce,
+      stem: this.stem,
+      selector: this.short ? 'SHARE_SOAK_E2E' : 'SHARE_SOAK_FULL',
+      soakProfile: this.short ? 'share-consumer-short' : 'share-consumer',
+      ...fields,
+    })
+  }
+
+  /** @returns {void} Restores original owner observers once, before a passing completion. */
+  restore() {
+    if (this.restored) return
+    this.shares.restore()
+    this.restored = true
+  }
+
+  /**
+   * Runs what is left of the cleanup and puts the observer's wrappers back. Safe to call twice.
+   * @returns {Promise<void>}
+   * @throws {Error} the first failure of the cleanup or of the restore; the run is tainted
+   */
+  async close() {
+    if (this.closed) return
+    this.closed = true
+    const failures = []
+    try {
+      await this.cleanupStack()
+    } catch (error) {
+      failures.push(error)
+    }
+    try {
+      this.restore()
+    } catch (error) {
+      this.gate.taint(error)
+      failures.push(error)
+    }
+    if (failures.length > 0) {
+      this.gate.taint(failures[0])
+      throw failures[0]
+    }
+  }
+}
+
+/**
+ * Builds the owner of a share-consumer profile for a real cluster: the counted client over the
+ * chaos and tap socket factories, the live driver and the cleanup stack. Rows go to
+ * `.tmp/e2e/share-soak.jsonl` (`share-soak-full.jsonl` for the full profile), which is also where
+ * the final summary reads each cycle's archived identities back from.
+ * @param {object} options
+ * @param {string[]} options.brokers seed addresses, `host:port`
+ * @param {boolean} [options.short=false] the 960 s profile rather than the 1920 s one
+ * @param {(row: object) => void} [options.record] a second sink beside the evidence file
+ * @param {{ taint: Function, assertClean: Function }} [options.run] the live run's gate; the
+ *   run of this process by default
+ * @returns {ShareSoak}
+ * @throws {Error} when the share resource sources are missing
+ */
+const buildShareSoak = ({ brokers, short = false, record, run }) => {
+  const ports = loadSharePorts()
+  const stem = short ? 'share-soak' : 'share-soak-full'
+  const chaos = createChaosSocketFactory(defaultSocketFactory())
+  const tap = new ShareFetchTap()
+  const { kafka, shareResources, socketFactory } = instrumentShare({
+    clientId: 'soak-share',
+    brokers,
+    logLevel: logLevel.NOTHING,
+    socketFactory: tap.factory(forgettingDestroyed(chaos)),
+  })
+  return new ShareSoak({
+    driver: new ShareSoakDriver({
+      kafka,
+      brokers,
+      shares: shareResources,
+      tap,
+      ports,
+      socketFactory,
+    }),
+    kafka,
+    shares: shareResources,
+    stack: new ports.probe.CleanupStack(),
+    short,
+    evidence: {
+      write: (row) => {
+        writeEvidence(stem, row)
+        record?.(row)
+      },
+      read: () => evidenceLines(stem),
+    },
+    gate: run ?? ports.bounded.liveRun,
+  })
+}
+
+/**
  * Runs a profile against the cluster `brokers` names.
  * @param {string} profile a key of `PROFILES`
  * @param {object} [options]
@@ -2301,9 +6306,13 @@ const buildConsumerChurn = ({ brokers, phaseSeconds }) => {
  *   builds the owner of the `producer-churn` profile; a spec supplies its own
  * @param {(options: object) => { run: () => Promise<{ ok: boolean }>, close: () => Promise<void> }} [options.consumerChurn=buildConsumerChurn]
  *   builds the owner of the `consumer-churn` profile
+ * @param {(options: object) => { run: () => Promise<{ ok: boolean }>, close: () => Promise<void> }} [options.shareSoak=buildShareSoak]
+ *   builds the owner of both share-consumer profiles
  * @returns {Promise<{ ok: boolean }>} the verdict: `evaluate`'s for a consumer profile, the
- *   combined verdict of `ProducerChurn` for `producer-churn`
- * @throws {Error} unless the process runs with `--expose-gc`
+ *   combined verdict of `ProducerChurn` for `producer-churn`, that of `ShareSoak` for a share
+ *   profile
+ * @throws {Error} unless the process runs with `--expose-gc`, and for a share profile given a phase
+ *   length: its phases and cycles are fixed
  */
 const main = async (
   profile,
@@ -2312,10 +6321,21 @@ const main = async (
     phaseSeconds = null,
     churn = buildProducerChurn,
     consumerChurn = buildConsumerChurn,
+    shareSoak = buildShareSoak,
   } = {}
 ) => {
   if (typeof globalThis.gc !== 'function') {
     throw new Error('The soak reads the heap after a collection: run node with --expose-gc')
+  }
+
+  if (profile.startsWith('share-consumer')) {
+    if (phaseSeconds !== null) throw new Error('A share profile takes no phase length')
+    const owner = shareSoak({ brokers, short: profile === 'share-consumer-short' })
+    try {
+      return await owner.run()
+    } finally {
+      await owner.close()
+    }
   }
 
   const phases = phasesOf(profile, phaseSeconds)
@@ -2411,15 +6431,28 @@ module.exports = {
   buildProducerChurn,
   forgettingDestroyed,
   PROFILES,
+  SHARE_SOAK,
+  SHARE_SOAK_TITLE,
   WORKLOADS,
   IdleSocketCheck,
   ProducerChurn,
   RawProducerReader,
+  shareSoakNaturalExit,
+  ShareCycleOracle,
+  ShareCycleJournal,
+  ShareFetchTap,
+  ShareMember,
+  ShareSoak,
+  ShareSoakDriver,
+  ShareSoakScreen,
+  ShareStateObserver,
   Soak,
   WriteDelay,
+  buildShareSoak,
   createTopic,
   parseArgs,
   privateOf,
   instrument,
+  instrumentShare,
   main,
 }

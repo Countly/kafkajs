@@ -168,3 +168,48 @@ describe('createResourceProbe', () => {
     })
   })
 })
+
+describe('share resource sources', () => {
+  test('reports actual sessions, records and compact ranges separately', async () => {
+    const probe = createResourceProbe({
+      shareState: () => ({ shareSessions: 2, shareRecords: 3, shareRanges: 1 }),
+    })
+    expect(await probe.snapshot()).toEqual({ shareSessions: 2, shareRecords: 3, shareRanges: 1 })
+  })
+
+  test('does not invent zero counts when the source is absent', async () => {
+    expect(await createResourceProbe().snapshot()).toEqual({})
+  })
+
+  test.each([undefined, null, -1, 0.5, NaN, '1'])(
+    'refuses a malformed share count %s',
+    async (value) => {
+      const probe = createResourceProbe({
+        shareState: () => ({ shareSessions: 0, shareRecords: 0, shareRanges: value }),
+      })
+      await expect(probe.snapshot()).rejects.toThrow(
+        'Missing share resource measurement: shareRanges'
+      )
+    }
+  )
+
+  test('refuses a source that returns no counts at all', async () => {
+    const probe = createResourceProbe({ shareState: () => undefined })
+    await expect(probe.snapshot()).rejects.toThrow(
+      'Missing share resource measurement: shareSessions'
+    )
+  })
+
+  test('keeps every other measurement beside the share counts', async () => {
+    const probe = createResourceProbe({
+      queueDepth: () => 4,
+      shareState: () => ({ shareSessions: 0, shareRecords: 0, shareRanges: 0 }),
+    })
+    expect(await probe.snapshot()).toEqual({
+      queueDepth: 4,
+      shareSessions: 0,
+      shareRecords: 0,
+      shareRanges: 0,
+    })
+  })
+})

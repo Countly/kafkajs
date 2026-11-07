@@ -1,4 +1,9 @@
 const net = require('net')
+const { createHash } = require('crypto')
+const Decoder = require('../../../protocol/decoder')
+const ProducerStateManager = require('../../../producer/state')
+const PartitionSequencer = require('../../../producer/state/partitionSequencer')
+const ProducerIdAndEpoch = require('../../../producer/state/producerIdAndEpoch')
 const { EventEmitter } = require('events')
 const { AsyncLocalStorage } = require('async_hooks')
 const Broker = require('../../../broker')
@@ -13,6 +18,8 @@ const ackWire = require('../../../../testHelpers/wire/shareAcknowledgeV2')
 const { Kafka, logLevel, ConfigResourceTypes } = require('../../../../index')
 const {
   createTopic,
+  createConnectionPool,
+  newLogger,
   plainTextBrokers,
   readRequestHeader,
   secureRandom,
@@ -81,6 +88,17 @@ const SERVICES = ['kafka1', 'kafka2', 'kafka3']
 const SHARE_STATE_TOPIC = '__share_group_state'
 const OFFSETS_TOPIC = '__consumer_offsets'
 const SHARE_APIS = new Set([76, 78, 79])
+const ARCHIVE_APIS = new Set([0, 1, 2, 3, 19, 22, 32, 61, 75, 76, 78, 79])
+const WIRE_BYTES = 96 * 1024 * 1024
+const PRODUCER_EVIDENCE_BYTES = 64 * 1024 * 1024
+const PRODUCER_CONFIGS = [
+  'producer.id.expiration.ms',
+  'producer.id.expiration.check.interval.ms',
+  'transactional.id.expiration.ms',
+  'log.producer.snapshot.interval.ms',
+  'unclean.leader.election.enable',
+  'min.insync.replicas',
+]
 const SESSION_TIMEOUT = { name: 'group.share.session.timeout.ms', value: '45000' }
 const HEARTBEAT_INTERVAL = { name: 'group.share.heartbeat.interval.ms', value: '5000' }
 const GROUP_CONFIG = {
@@ -138,6 +156,8 @@ class ShareWireTap {
     this.context = new AsyncLocalStorage()
     this.socketEvents = []
     this.order = 0
+    this.byteCount = 0
+    this.problems = []
   }
 
   /** @returns {object} A case-monotonic timestamp and a total observation order. */
@@ -180,11 +200,18 @@ class ShareWireTap {
           socket: this.sockets.indexOf(entry),
           event,
           ...this.stamp(),
+          label: entry.label,
+          endpoint: entry.endpoint,
           outstanding: [...entry.outstanding.values()].map(({ id }) => id),
           error: error instanceof Error ? describeError(error) : null,
         }
-        this.socketEvents.push(fact)
-        for (const frame of entry.outstanding.values()) frame.lostAt ??= fact.at
+        if (this.socketEvents.length < 100000) this.socketEvents.push(fact)
+        else this.problem('Socket event archive exceeded 100000 events')
+        for (const frame of entry.outstanding.values()) {
+          frame.lostAt ??= fact.at
+          frame.lossOrder ??= fact.order
+          frame.lossEvent ??= fact.id
+        }
         this.onInterruption?.('socket', fact)
       })
     const write = socket.write.bind(socket)
@@ -193,15 +220,16 @@ class ShareWireTap {
         ? data
         : Buffer.from(data, typeof rest[0] === 'string' ? rest[0] : undefined)
       const frames = entry.writer.push(bytes)
+      const written = this.stamp()
       const result = write(data, ...rest)
-      frames.forEach((frame) => this.record(entry, frame))
+      frames.forEach((frame) => this.record(entry, frame, written))
       return result
     }
     socket.on('data', (chunk) => {
       entry.reader.push(chunk).forEach((bytes) => {
         const request = entry.outstanding.get(bytes.readInt32BE(4))
         if (!request) return
-        request.responseBytes = bytes.toString('base64')
+        if (this.reserve(bytes.length)) request.responseBytes = bytes.toString('base64')
         const stamp = this.stamp()
         request.responseAt = stamp.at
         request.responseOrder = stamp.order
@@ -215,15 +243,24 @@ class ShareWireTap {
    * Retains the complete written frame and its socket-scoped request identity before any answer.
    * @param {object} entry the observed socket
    * @param {Buffer} frame one whole request frame
+   * @param {object} [written] Original socket-write start.
    * @returns {void}
    */
-  record(entry, frame) {
+  record(entry, frame, written = this.stamp()) {
+    if (this.allFrames.length >= 100000 || !this.reserve(frame.length)) {
+      this.problem('Wire archive exhausted; original attempts are missing')
+      return
+    }
     const { apiKey, apiVersion, correlationId, clientId, byteLength } = readRequestHeader(frame)
     const fact = {
       id: this.allFrames.length,
       label: entry.label,
       socket: this.sockets.indexOf(entry),
       endpoint: entry.endpoint,
+      nodeId:
+        Object.values(NODES).find(({ host, port }) => `${host}:${port}` === entry.endpoint)
+          ?.nodeId ?? null,
+      writeStarted: written,
       apiKey,
       apiVersion,
       correlationId,
@@ -244,6 +281,21 @@ class ShareWireTap {
     const context = this.context.getStore()
     if (context && context.apiKey === apiKey) context.frames.push(fact)
     if (SHARE_APIS.has(apiKey)) this.frames.push(fact)
+  }
+
+  /** @param {string} problem Missing evidence, recorded once. @returns {void} */
+  problem(problem) {
+    if (!this.problems.includes(problem)) this.problems.push(problem)
+  }
+
+  /** @param {number} bytes Original wire bytes. @returns {boolean} Whether they fit losslessly. */
+  reserve(bytes) {
+    if (this.byteCount + bytes > WIRE_BYTES) {
+      this.problem('Wire byte archive exceeded its bound')
+      return false
+    }
+    this.byteCount += bytes
+    return true
   }
 
   /** @returns {{ created: number, destroyed: number }} sockets opened and sockets since destroyed */
@@ -376,7 +428,10 @@ class BounceEvidence {
     this.brokers = new Set()
     this.epochAuthorities = new Map()
     this.epochSamples = new Map()
+    this.epochProbes = new Set()
     this.epochSignal = null
+    this.brokerStates = []
+    this.brokerStateKeys = new Map()
     this.cohorts = new Map()
     this.originalExchanges = new Map()
     this.restores = []
@@ -410,6 +465,14 @@ class BounceEvidence {
   /** @returns {void} Installs read-only observers before the workload connects. */
   install() {
     const owns = (loop) => loop.groupId === this.owner.group
+    this.wrap(Broker.prototype, 'connect', async (broker, original, args) => {
+      const result = await original.apply(broker, args)
+      if (broker.connectionPool.clientId === `member-${this.owner.nonce}`) {
+        this.brokers.add(broker)
+        this.sampleEpoch(broker)
+      }
+      return result
+    })
     this.wrap(RequestQueue.prototype, 'push', (queue, original, [request]) => {
       const context = this.owner.tap.context.getStore()
       if (!context) return original.call(queue, request)
@@ -462,6 +525,16 @@ class BounceEvidence {
       if (!fact) return original.call(loop, exchange, response)
       fact.response = response
       fact.responseIdentity = this.label(response)
+      if (
+        fact.apiKey === 78 &&
+        response.errorCode === 0 &&
+        response.responses.some(({ partitions }) =>
+          partitions.some(
+            ({ errorCode, acquiredRecords }) => errorCode === 0 && acquiredRecords.length
+          )
+        )
+      )
+        this.sampleEpoch(loop.broker, { fresh: true })
       return original.call(loop, exchange, response)
     })
     this.wrap(ShareFetchLoop.prototype, 'failExchange', (loop, original, [exchange, error]) => {
@@ -504,7 +577,6 @@ class BounceEvidence {
       }
       this.cohorts.set(row, fact)
       this.acquisitions.push(fact)
-      this.sampleEpoch(loop.broker)
       return row
     })
     this.wrap(ShareRun.prototype, 'invoke', (run, original, args) => {
@@ -567,7 +639,7 @@ class BounceEvidence {
       return this.owner.tap.context.run(fact, async () => {
         const response = await original.apply(broker, args)
         fact.endedAt = performance.now()
-        fact.response = response
+        fact.response = immutable(response)
         if (response.topicMetadata?.some(({ topic }) => topic === this.owner.topic))
           this.epochs.push(fact)
         return response
@@ -631,26 +703,35 @@ class BounceEvidence {
    * Starts independent source-node sampling, coalescing another observation after a pending sample.
    * Acquisition observers request a fresh upper bound without delaying the original dispatch.
    * @param {object} broker Original workload broker.
+   * @param {{fresh?:boolean}} [options] Starts an acquisition observation alongside pending sampling.
    * @returns {void}
    */
-  sampleEpoch(broker) {
+  sampleEpoch(broker, { fresh = false } = {}) {
     const signal = this.epochSignal
     if (!signal || signal.aborted || this.owner.driveFinished) return
     const pending = this.epochSamples.get(broker)
-    if (pending) {
+    if (pending && !fresh) {
       pending.again = true
       return
     }
     if (!broker.connectionPool.isConnected()) return
     const sample = { again: false }
-    this.epochSamples.set(broker, sample)
+    if (!pending) this.epochSamples.set(broker, sample)
     sample.task = (async () => {
       do {
         sample.again = false
         await bounded(signal, Infinity, (scope) =>
-          broker.metadata([this.owner.topic], {
-            guard: () => (scope.aborted ? scope.reason : null),
-          })
+          (async () => {
+            const response = await broker.metadata([this.owner.topic], {
+              guard: () => (scope.aborted ? scope.reason : null),
+            })
+            const topic = response.topicMetadata?.find(({ topic }) => topic === this.owner.topic)
+            const key = JSON.stringify(topic)
+            if (this.brokerStateKeys.get(broker) !== key) {
+              this.brokerStateKeys.set(broker, key)
+              await this.captureBrokerState(broker, scope)
+            }
+          })()
         ).catch((error) => {
           if (signal.aborted) throw error
         })
@@ -660,8 +741,63 @@ class BounceEvidence {
         !signal.aborted &&
         broker.connectionPool.isConnected()
       )
-    })().finally(() => this.epochSamples.delete(broker))
+    })().finally(() => {
+      if (this.epochSamples.get(broker) === sample) this.epochSamples.delete(broker)
+      this.epochProbes.delete(sample.task)
+    })
+    this.epochProbes.add(sample.task)
     sample.task.catch(() => {})
+  }
+
+  /**
+   * Captures exposed producer timestamps and ends when a node observes changed leadership/ISR.
+   * @param {object} broker Existing source broker.
+   * @param {AbortSignal} signal Original sampling scope.
+   * @returns {Promise<void>} Both original observations, including item errors.
+   */
+  async captureBrokerState(broker, signal) {
+    for (const [method, apiKey, options] of [
+      ['describeProducers', 61, { topics: [{ topic: this.owner.topic, partitions: [0, 1, 2] }] }],
+      [
+        'listOffsets',
+        2,
+        {
+          replicaId: -1,
+          isolationLevel: 0,
+          topics: [
+            {
+              topic: this.owner.topic,
+              partitions: [0, 1, 2].map((partition) => ({ partition, timestamp: -1 })),
+            },
+          ],
+        },
+      ],
+    ]) {
+      signal.throwIfAborted()
+      if (this.brokerStates.length >= 2000) {
+        this.owner.tap.problem('Broker-state archive exceeded 2000 observations')
+        return
+      }
+      const fact = {
+        apiKey,
+        method,
+        nodeId: broker.nodeId,
+        endpoint: broker.brokerAddress,
+        frames: [],
+        started: this.owner.tap.stamp(),
+      }
+      this.brokerStates.push(fact)
+      try {
+        const response = await this.owner.tap.context.run(fact, () => broker[method](options))
+        fact.response = this.owner.producerEvidence
+          ? (this.owner.producerEvidence.retain([], { response })?.response ?? null)
+          : immutable(response)
+        if (fact.response === null) fact.captureError = 'Producer evidence byte bound exhausted'
+      } catch (error) {
+        fact.error = describeError(error, 8)
+      }
+      fact.ended = this.owner.tap.stamp()
+    }
   }
 
   /**
@@ -679,7 +815,7 @@ class BounceEvidence {
       }
     } finally {
       this.epochSignal = null
-      await Promise.all([...this.epochSamples.values()].map(({ task }) => task))
+      await Promise.all([...this.epochProbes])
     }
   }
 
@@ -1395,6 +1531,42 @@ const freezeProblems = (entries, bounces, evidence) =>
   freezeAccounting(entries, bounces, evidence).problems
 
 /**
+ * @param {object} entry Original handler acquisition.
+ * @param {object[]} samples Original Metadata responses and their wire frames.
+ * @returns {object[]} Successful metadata observations from this acquisition's source node/pool.
+ */
+const sourceEpochSamples = (entry, samples) =>
+  samples.flatMap((sample) => {
+    if (!entry.acquisition?.source) return []
+    const topics = sample.response.topicMetadata.filter(({ topicId }) => topicId === entry.topicId)
+    if (topics.length !== 1 || sample.frames.length !== 1) return []
+    const frame = sample.frames[0]
+    if (frame.apiKey !== 3 || frame.apiVersion < 7 || !frame.responseBytes) return []
+    const rows = topics[0].partitionMetadata.filter(
+      ({ partitionId }) => partitionId === entry.partition
+    )
+    if (rows.length !== 1) return []
+    const row = rows[0]
+    return row.partitionErrorCode === 0 &&
+      sample.nodeId === entry.acquisition.source.nodeId &&
+      sample.pool === entry.acquisition.pool &&
+      Number.isInteger(row.leader) &&
+      row.leader >= 0 &&
+      Number.isInteger(row.leaderEpoch) &&
+      row.leaderEpoch >= 0
+      ? [{ sample, frame, row }]
+      : []
+  })
+
+/**
+ * @param {object} entry Original handler acquisition.
+ * @param {object[]} samples Original Metadata responses and their wire frames.
+ * @returns {object[]} Source-node local observations identifying that node as leader.
+ */
+const ownEpochSamples = (entry, samples) =>
+  sourceEpochSamples(entry, samples).filter(({ sample, row }) => row.leader === sample.nodeId)
+
+/**
  * Proves disjoint serving-epoch bounds using source-node local epoch observations and down barriers.
  * A source must itself be the observed leader: a remote cache, batch epoch or CurrentLeader default
  * supplies no bound. Same-node epochs never decrease; samples bracket the original wire intervals.
@@ -1409,30 +1581,8 @@ const freezeProblems = (entries, bounces, evidence) =>
  */
 const epochAdvance = (old, next, bounce, samples, exchanges) => {
   if (!Number.isFinite(bounce.downAt) || bounce.downAt <= bounce.at) return null
-  const ownSamples = (entry) =>
-    samples.flatMap((sample) => {
-      const topics = sample.response.topicMetadata.filter(
-        ({ topicId }) => topicId === entry.topicId
-      )
-      if (topics.length !== 1 || sample.frames.length !== 1) return []
-      const frame = sample.frames[0]
-      if (frame.apiKey !== 3 || frame.apiVersion < 7 || !frame.responseBytes) return []
-      const rows = topics[0].partitionMetadata.filter(
-        ({ partitionId }) => partitionId === entry.partition
-      )
-      if (rows.length !== 1) return []
-      const row = rows[0]
-      return row.partitionErrorCode === 0 &&
-        row.leader === sample.nodeId &&
-        sample.nodeId === entry.acquisition.source.nodeId &&
-        sample.pool === entry.acquisition.pool &&
-        Number.isInteger(row.leaderEpoch) &&
-        row.leaderEpoch >= 0
-        ? [{ sample, frame, row }]
-        : []
-    })
-  for (const before of ownSamples(old))
-    for (const after of ownSamples(next)) {
+  for (const before of ownEpochSamples(old, samples))
+    for (const after of ownEpochSamples(next, samples)) {
       if (
         old.acquisition.source.frames[0].responseAt >= before.frame.at ||
         before.frame.responseAt >= bounce.downAt ||
@@ -1488,7 +1638,20 @@ const epochAdvance = (old, next, bounce, samples, exchanges) => {
         ['stop', 'kill'].includes(bounce.kind) &&
         bounce.at < old.acquisition.source.frames[0].at &&
         before.row.leader !== after.row.leader
-      if (before.frame.responseAt < bounce.at || transition || downBarrier)
+      const metadataTransition = sourceEpochSamples(old, samples).find(
+        ({ frame, row }) =>
+          frame.endpoint === old.acquisition.source.endpoint &&
+          before.frame.responseAt < frame.at &&
+          bounce.at < frame.at &&
+          frame.at < frame.responseAt &&
+          frame.responseAt < bounce.downAt &&
+          frame.responseAt < after.frame.at &&
+          row.leader !== before.row.leader &&
+          row.leaderEpoch > before.row.leaderEpoch &&
+          row.leaderEpoch <= after.row.leaderEpoch &&
+          (row.leader === after.row.leader || row.leaderEpoch < after.row.leaderEpoch)
+      )
+      if (before.frame.responseAt < bounce.at || transition || metadataTransition || downBarrier)
         return {
           upper: before.row.leaderEpoch,
           lower: after.row.leaderEpoch,
@@ -1496,10 +1659,109 @@ const epochAdvance = (old, next, bounce, samples, exchanges) => {
           after: after.frame.id,
           bounce: bounce.index,
           transition: transition?.frames[0].id,
+          metadataTransition: metadataTransition?.frame.id,
           downBarrier: downBarrier ? bounce.downAt : undefined,
         }
     }
   return null
+}
+
+/**
+ * @param {object} entry Failing replay.
+ * @param {object[]} entries Complete original handler journal.
+ * @param {object} bounce Causally matched command and interruption observations.
+ * @param {object} evidence Original epoch and exchange journals.
+ * @returns {string} Identity, every delivery interval and the nearest usable or overlapping epochs.
+ */
+const countProgressionProblem = (entry, entries, bounce, evidence) => {
+  const deliveries = entries
+    .filter(({ identity }) => identity === entry.identity)
+    .map((delivery) => {
+      const acquisition = delivery.acquisition ?? {}
+      const source = acquisition.source ?? {}
+      const frame = source.frames?.[0] ?? {}
+      const samples = ownEpochSamples(delivery, evidence.epochs).sort(
+        (a, b) => a.frame.at - b.frame.at
+      )
+      const fact = (observation) =>
+        observation
+          ? {
+              frame: observation.frame.id,
+              apiVersion: observation.frame.apiVersion,
+              nodeId: observation.sample.nodeId,
+              pool: observation.sample.pool,
+              socket: observation.frame.socket,
+              correlationId: observation.frame.correlationId,
+              requestAt: observation.frame.at,
+              responseAt: observation.frame.responseAt,
+              leaderId: observation.row.leader,
+              leaderEpoch: observation.row.leaderEpoch,
+            }
+          : null
+      const overlapping = samples.filter(
+        ({ frame: sample }) => sample.at <= frame.responseAt && sample.responseAt >= frame.at
+      )
+      return {
+        entry: delivery.id,
+        handlerAt: delivery.at,
+        deliveryCount: delivery.deliveryCount,
+        acquisition: acquisition.id,
+        acquiredRecords: acquisition.acquiredRecords,
+        exchange: source.id,
+        frame: frame.id,
+        apiVersion: frame.apiVersion,
+        correlationId: frame.correlationId,
+        nodeId: source.nodeId,
+        endpoint: source.endpoint,
+        socket: frame.socket,
+        pool: acquisition.pool,
+        generation: acquisition.generation,
+        open: acquisition.open,
+        groupId: delivery.groupId,
+        memberId: delivery.memberId,
+        sessionEpoch: frame.request?.shareSessionEpoch,
+        requestAt: frame.at,
+        responseAt: frame.responseAt,
+        adoptedAt: acquisition.adoptedAt,
+        epochs: {
+          latestBeforeRequest: fact(
+            samples.findLast(({ frame: sample }) => sample.responseAt < frame.at)
+          ),
+          earliestAfterResponse: fact(
+            samples.find(({ frame: sample }) => sample.at > frame.responseAt)
+          ),
+          overlapping: [...new Set([overlapping[0], overlapping.at(-1)])].filter(Boolean).map(fact),
+          transitionsBeforeDown: sourceEpochSamples(delivery, evidence.epochs)
+            .filter(
+              ({ frame: sample, row }) =>
+                row.leader !== source.nodeId &&
+                frame.responseAt < sample.at &&
+                bounce.at < sample.at &&
+                sample.responseAt < bounce.downAt
+            )
+            .slice(0, 2)
+            .map(fact),
+        },
+      }
+    })
+  return `${entry.identity} has no proved delivery-count progression: ${JSON.stringify({
+    topicId: entry.topicId,
+    partition: entry.partition,
+    bounce: {
+      index: bounce.index,
+      nodeId: bounce.nodeId,
+      kind: bounce.kind,
+      at: bounce.at,
+      downAt: bounce.downAt,
+      interruptions: bounce.interruptions.map(({ at, kind, event, scope }) => ({
+        at,
+        kind,
+        event,
+        scope,
+      })),
+    },
+    deliveries,
+  })}`
 }
 
 /**
@@ -1607,7 +1869,7 @@ const auditReplay = (entries, bounces, corpus, evidence) => {
         entry.deliveryCount < old.deliveryCount ||
         (entry.deliveryCount === old.deliveryCount && !witness)
       )
-        problems.push(`${entry.identity} has no proved delivery-count progression`)
+        problems.push(countProgressionProblem(entry, entries, bounce, evidence))
       else if (!dispatched.has(`charged:${entry.id}`)) {
         dispatched.add(`charged:${entry.id}`)
         extras.push({
@@ -2040,6 +2302,447 @@ class ResourceGauge {
 }
 
 /**
+ * @param {Error|null} error Original public or internal error.
+ * @param {number} [depth] Maximum causal depth retained.
+ * @returns {object|null} Structured error, without truncating its message.
+ */
+const producerError = (error, depth = 8) =>
+  error == null
+    ? null
+    : {
+        ...describeError(error, 0),
+        message: String(error.message),
+        retryCount: error.retryCount ?? null,
+        retryTime: error.retryTime ?? null,
+        recordErrors: error.recordErrors ?? null,
+        currentLeader: error.currentLeader ?? null,
+        nodeEndpoints: error.nodeEndpoints ?? null,
+        cause: depth > 0 ? producerError(error.cause, depth - 1) : { status: 'causal-depth-limit' },
+      }
+
+/** @param {Buffer|string|null} bytes Original bytes. @returns {string|null} Lossless base64. */
+const originalBytes = (bytes) => (bytes == null ? null : Buffer.from(bytes).toString('base64'))
+
+/** @param {object} message Original record. @returns {object} Ordered, lossless input fields. */
+const originalMessage = ({ partition, key, value, timestamp, headers }) => ({
+  partition,
+  key: originalBytes(key),
+  value: originalBytes(value),
+  timestamp: timestamp == null ? null : String(timestamp),
+  headers:
+    headers === undefined
+      ? null
+      : Object.entries(headers).flatMap(([key, values]) =>
+          (Array.isArray(values) ? values : [values]).map((value) => ({
+            key: originalBytes(key),
+            value: originalBytes(value),
+          }))
+        ),
+})
+
+/**
+ * Reads magic-2 batch stamps directly from original record-set bytes, without decoding records.
+ * @param {Buffer} records Complete Records field.
+ * @returns {object[]} Batch boundaries, exact stamps and body hashes; bytes remain in the frame.
+ * @throws {Error} An incomplete or unsupported batch.
+ */
+const originalBatchStamps = (records) => {
+  const batches = []
+  for (let position = 0; position < records.length;) {
+    if (records.length - position < 61) throw new Error('Incomplete diagnostic batch header')
+    const size = records.readInt32BE(position + 8) + 12
+    if (size < 61 || position + size > records.length || records[position + 16] !== 2)
+      throw new Error('Incomplete or non-magic-2 diagnostic batch')
+    const batch = records.subarray(position, position + size)
+    batches.push({
+      baseOffset: batch.readBigInt64BE(0).toString(),
+      leaderEpoch: batch.readInt32BE(12),
+      producerId: batch.readBigInt64BE(43).toString(),
+      producerEpoch: batch.readInt16BE(51),
+      firstSequence: batch.readInt32BE(53),
+      count: batch.readInt32BE(57),
+      attributes: batch.readInt16BE(21),
+      firstTimestamp: batch.readBigInt64BE(27).toString(),
+      maxTimestamp: batch.readBigInt64BE(35).toString(),
+      payloadHash: createHash('sha256').update(batch.subarray(21)).digest('hex'),
+      lastOffsetDelta: batch.readInt32BE(23),
+      bodyHash: createHash('sha256').update(batch.subarray(61)).digest('hex'),
+      recordsPosition: position,
+      byteLength: size,
+    })
+    position += size
+  }
+  return batches
+}
+
+/**
+ * Projects original Produce requests and ShareFetch responses for diagnostic joins only.
+ * @param {object} frame Archived complete wire exchange.
+ * @returns {object[]} Topic/partition batch stamps, or an empty array when no response exists.
+ * @throws {Error} Incomplete or unsupported evidence, never a substituted stamp.
+ */
+const wireBatchStamps = (frame) => {
+  const batches = []
+  if (frame.apiKey === 0) {
+    const bytes = Buffer.from(frame.bytes, 'base64')
+    const { byteLength } = readRequestHeader(bytes)
+    const reader = new Decoder(bytes.subarray(byteLength))
+    const flexible = frame.apiVersion >= 9
+    if (flexible) reader.readUVarIntString()
+    else reader.readString()
+    reader.readInt16()
+    reader.readInt32()
+    const array = (read) =>
+      flexible ? reader.readUVarIntArray(() => read()) : reader.readArray(() => read())
+    array(() => {
+      const topic =
+        frame.apiVersion >= 13 ? null : flexible ? reader.readUVarIntString() : reader.readString()
+      const topicId = frame.apiVersion >= 13 ? reader.readUuid() : null
+      array(() => {
+        const partition = reader.readInt32()
+        const records = flexible ? reader.readUVarIntBytes() : reader.readBytes()
+        for (const batch of originalBatchStamps(records ?? Buffer.alloc(0)))
+          batches.push({ topic, topicId, partition, ...batch })
+        if (flexible) reader.readTaggedFields()
+      })
+      if (flexible) reader.readTaggedFields()
+    })
+    if (flexible) reader.readTaggedFields()
+  } else if (frame.apiKey === 78 && frame.apiVersion === 2 && frame.responseBytes) {
+    const reader = new Decoder(Buffer.from(frame.responseBytes, 'base64').subarray(8))
+    reader.readTaggedFields()
+    reader.readInt32()
+    const topError = reader.readInt16()
+    reader.readUVarIntString()
+    reader.readInt32()
+    reader.readUVarIntArray(() => {
+      const topicId = reader.readUuid()
+      reader.readUVarIntArray(() => {
+        const partition = reader.readInt32()
+        const partitionError = reader.readInt16()
+        reader.readUVarIntString()
+        reader.readInt16()
+        reader.readUVarIntString()
+        reader.readInt32()
+        reader.readInt32()
+        reader.readTaggedFields()
+        const records = reader.readUVarIntBytes()
+        for (const batch of originalBatchStamps(records ?? Buffer.alloc(0)))
+          batches.push({ topicId, partition, topError, partitionError, ...batch })
+        reader.readUVarIntArray(() => {
+          reader.readInt64()
+          reader.readInt64()
+          reader.readInt16()
+          reader.readTaggedFields()
+        })
+        reader.readTaggedFields()
+      })
+      reader.readTaggedFields()
+    })
+  }
+  return batches.map((batch) => ({ frame: frame.id, ...batch }))
+}
+
+/** Test-local, call-through producer observations; no batch or producer state is changed. */
+class BounceProducerEvidence {
+  /** @param {ShareBounceCase} owner Original workload. */
+  constructor(owner) {
+    this.owner = owner
+    this.managers = new Map()
+    this.batchIds = new WeakMap()
+    this.retryCounts = new Map()
+    this.batches = []
+    this.transitions = []
+    this.attempts = []
+    this.bytes = 0
+    this.problems = []
+    this.causes = new AsyncLocalStorage()
+  }
+
+  /** @param {Array} stream Destination. @param {object} fact Original observation. @returns {object|null} Stored snapshot. */
+  retain(stream, fact) {
+    const size = Buffer.byteLength(JSON.stringify(fact))
+    if (this.bytes + size > PRODUCER_EVIDENCE_BYTES) {
+      if (!this.problems.length) this.problems.push('Producer evidence exceeded its byte bound')
+      return null
+    }
+    this.bytes += size
+    const copy = immutable(fact)
+    stream.push(copy)
+    return copy
+  }
+
+  /** @param {object} batch Original batch. @returns {number|null} Stable label and original membership. */
+  batchId(batch) {
+    if (!this.batchIds.has(batch)) {
+      const fact = this.retain(this.batches, {
+        id: this.batches.length,
+        productId: batch.id,
+        topic: batch.topic,
+        topicId: this.owner.topicId,
+        partition: batch.partition,
+        messages: (batch.messages ?? []).map(originalMessage),
+        ...this.owner.tap.stamp(),
+      })
+      if (!fact) return null
+      this.batchIds.set(batch, fact.id)
+    }
+    return this.batchIds.get(batch)
+  }
+
+  /** @param {object} batch Original batch. @returns {object} Stamp and prior transmission facts. */
+  batch(batch) {
+    const delivery = batch.settlers?.[batch.settlers.length - 1]
+    const id = this.batchId(batch)
+    this.retryCounts.set(id, Math.max(this.retryCounts.get(id) ?? 0, batch.attempt ?? 0))
+    return {
+      id,
+      topic: batch.topic,
+      partition: batch.partition,
+      producerId: batch.producerId == null ? null : String(batch.producerId),
+      producerEpoch: batch.producerEpoch,
+      firstSequence: batch.firstSequence,
+      count: batch.recordCount ?? batch.messages?.length,
+      attempt: batch.attempt,
+      sequenceReset: batch.sequenceReset,
+      acks: batch.acks,
+      timeout: batch.timeout,
+      compression: batch.compression,
+      createdAt: batch.createdAt,
+      incarnation: batch.incarnation,
+      child: this.owner.evidence.label(batch.child),
+      membershipHash:
+        batch.messages == null
+          ? null
+          : createHash('sha256')
+              .update(JSON.stringify(batch.messages.map(originalMessage)))
+              .digest('hex'),
+      everWritten: delivery?.everWritten ?? null,
+      dispatched: delivery?.dispatched ?? null,
+      settled: delivery?.settled ?? null,
+      routingFailures: delivery?.routingFailures ?? null,
+      backoffUntil: batch.backoffUntil,
+    }
+  }
+
+  /** @param {object} manager Original manager. @returns {object} Current identity and partition queues. */
+  state(manager) {
+    return {
+      producerId: String(manager.producerId),
+      producerEpoch: manager.producerEpoch,
+      partitions: Array.from({ length: PARTITIONS }, (_, partition) => {
+        const entry = manager.sequencer.entry(this.owner.topic, partition)
+        return {
+          partition,
+          ...(entry && {
+            ...entry,
+            queued: entry.queued.map((batch) => this.batchId(batch)),
+            inFlight: entry.inFlight.map((batch) => this.batch(batch)),
+          }),
+        }
+      }),
+    }
+  }
+
+  /** @returns {void} Installs observations using the existing shared restore stack. */
+  install() {
+    const wrap = (...args) => this.owner.evidence.wrap(...args)
+    wrap(ProducerStateManager.prototype, 'enqueue', (manager, original, args) => {
+      if (args[0].some(({ topic }) => topic === this.owner.topic))
+        this.managers.set(manager.sequencer, manager)
+      return original.apply(manager, args)
+    })
+    for (const method of [
+      'enqueue',
+      'drain',
+      'complete',
+      'fail',
+      'requeue',
+      'verdict',
+      'rebase',
+      'restoreUnsent',
+      'restartPartition',
+      'markStaleExcept',
+      'markAllStale',
+      'resetPartition',
+      'resetAll',
+      'markUnresolved',
+      'resolveUnresolved',
+      'abortQueued',
+    ]) {
+      wrap(PartitionSequencer.prototype, method, (sequencer, original, args) => {
+        const manager = this.managers.get(sequencer)
+        if (!manager) return original.apply(sequencer, args)
+        const before = this.state(manager)
+        const started = this.owner.tap.stamp()
+        const result = original.apply(sequencer, args)
+        const after = this.state(manager)
+        if (JSON.stringify(before) !== JSON.stringify(after) || method === 'verdict')
+          this.retain(this.transitions, {
+            method,
+            started,
+            ...this.owner.tap.stamp(),
+            before,
+            after,
+            trigger: this.causes.getStore() ?? null,
+            batch: args[0]?.topic ? this.batch(args[0]) : null,
+            verdict: method === 'verdict' ? result : null,
+            failure: method === 'verdict' ? args[1] : null,
+            route: method === 'drain' ? { nodeId: args[0], leaders: args[1] } : null,
+          })
+        return result
+      })
+    }
+    for (const method of [
+      'fail',
+      'resolveSequences',
+      'initialize',
+      'ensureProducerId',
+      'reinitialize',
+      'adopt',
+    ]) {
+      wrap(ProducerStateManager.prototype, method, (manager, original, args) => {
+        if (!this.managers.has(manager.sequencer)) return original.apply(manager, args)
+        const before = this.state(manager)
+        const trigger = {
+          method,
+          batch: args[0]?.topic ? this.batch(args[0]) : null,
+          error: method === 'fail' ? producerError(args[1]) : null,
+          response: args[2] ?? null,
+          ...this.owner.tap.stamp(),
+        }
+        const observe = (result, error) => {
+          const after = this.state(manager)
+          if (method === 'fail' || JSON.stringify(before) !== JSON.stringify(after) || error)
+            this.retain(this.transitions, {
+              ...trigger,
+              ended: this.owner.tap.stamp(),
+              before,
+              after,
+              verdict: typeof result === 'string' ? result : null,
+              error: error ? producerError(error) : trigger.error,
+            })
+        }
+        const result = this.causes.run(trigger, () => original.apply(manager, args))
+        if (result?.then)
+          result.then(
+            (value) => observe(value),
+            (error) => observe(null, error)
+          )
+        else observe(result)
+        return result
+      })
+    }
+    wrap(ProducerIdAndEpoch.prototype, 'bumpEpoch', (identity, original, args) => {
+      const trigger = this.causes.getStore()
+      if (!trigger) return original.apply(identity, args)
+      const before = {
+        producerId: String(identity.producerId),
+        producerEpoch: identity.producerEpoch,
+      }
+      const started = this.owner.tap.stamp()
+      const result = original.apply(identity, args)
+      this.retain(this.transitions, {
+        method: 'identity.bumpEpoch',
+        trigger,
+        started,
+        ...this.owner.tap.stamp(),
+        before,
+        after: { producerId: String(identity.producerId), producerEpoch: identity.producerEpoch },
+      })
+      return result
+    })
+    wrap(Broker.prototype, 'produce', (broker, original, [options]) => {
+      if (broker.connectionPool.clientId !== `producer-${this.owner.nonce}`)
+        return original.call(broker, options)
+      const partitions = options.topicData.flatMap(({ topic, partitions }) =>
+        partitions.map(({ partition, firstSequence, messages }) => ({
+          topic,
+          topicId: options.topicIds?.get(topic) ?? this.owner.topicId,
+          partition,
+          firstSequence,
+          count: messages.length,
+          membership: messages.map(({ key }) => originalBytes(key)),
+        }))
+      )
+      const fact = {
+        id: this.attempts.length,
+        apiKey: 0,
+        frames: [],
+        nodeId: broker.nodeId,
+        endpoint: broker.brokerAddress,
+        pool: this.owner.evidence.label(broker.connectionPool),
+        started: this.owner.tap.stamp(),
+        producerId: String(options.producerId),
+        producerEpoch: options.producerEpoch,
+        acks: options.acks,
+        timeout: options.timeout,
+        compression: options.compression,
+        partitions,
+        batchStates: [...this.managers.values()].map((manager) => this.state(manager)),
+        metadataSources: this.owner.evidence.epochs
+          .slice(-Object.keys(NODES).length)
+          .map((source) => ({
+            nodeId: source.nodeId,
+            frames: source.frames.map(({ id }) => id),
+          })),
+      }
+      if (!this.retain([], { ...fact, frames: [] })) return original.call(broker, options)
+      fact.partitions = immutable(fact.partitions)
+      fact.batchStates = immutable(fact.batchStates)
+      this.attempts.push(fact)
+      const result = this.owner.tap.context.run(fact, () => original.call(broker, options))
+      result.then(
+        (results) => {
+          fact.settlement = this.retain([], {
+            results: results?.map((result) => ({ ...result, error: producerError(result.error) })),
+            ...this.owner.tap.stamp(),
+          })
+        },
+        (error) => {
+          fact.settlement = this.retain([], {
+            error: producerError(error),
+            ...this.owner.tap.stamp(),
+          })
+        }
+      )
+      return result
+    })
+  }
+
+  /** @returns {object[]} Original send links derived from immutable record membership, never offset admission. */
+  links() {
+    const keys = new Map(
+      this.owner.sends.flatMap((send) =>
+        send.original.messages.map((message) => [message.key, send.id])
+      )
+    )
+    const batchesByKey = new Map()
+    const links = this.batches.map((batch) => {
+      for (const { key } of batch.messages) {
+        if (!batchesByKey.has(key)) batchesByKey.set(key, [])
+        batchesByKey.get(key).push(batch.id)
+      }
+      return {
+        batch: batch.id,
+        sends: [...new Set(batch.messages.map(({ key }) => keys.get(key) ?? null))],
+        attempts: [],
+        retryCount: this.retryCounts.get(batch.id) ?? 0,
+      }
+    })
+    for (const attempt of this.attempts) {
+      const batches = new Set(
+        attempt.partitions.flatMap(({ membership }) =>
+          membership.flatMap((key) => batchesByKey.get(key) ?? [])
+        )
+      )
+      for (const batch of batches) links[batch].attempts.push(attempt.id)
+    }
+    return links
+  }
+}
+
+/**
  * One live run of the bounce scenario: a share member reads three partitions of a replication
  * factor three, min-ISR two topic while a producer appends 30000 records, and every broker is taken
  * down in turn, cleanly and then hard. The log, the broker position and the handler entries are
@@ -2054,6 +2757,7 @@ class ShareBounceCase {
     this.stack = new CleanupStack()
     this.tap = new ShareWireTap()
     this.evidence = new BounceEvidence(this)
+    this.producerEvidence = new BounceProducerEvidence(this)
     this.gauge = new ResourceGauge()
     this.probe = this.gauge.probe({
       emitters: { process },
@@ -2173,10 +2877,11 @@ class ShareBounceCase {
     this.deadline = deadline - CASE_JOIN_MS
     this.gauge.install()
     this.evidence.install()
+    this.producerEvidence.install()
     try {
       let primary
+      const bodyDeadline = performance.now() + this.window(BODY_MS)
       try {
-        const bodyDeadline = performance.now() + this.window(BODY_MS)
         this.beforeAdmin = await captureShareCleanupBaseline(this.probe, { signal: scope })
         this.baseline = this.beforeAdmin
         const remaining = bodyDeadline - performance.now()
@@ -2195,6 +2900,10 @@ class ShareBounceCase {
         })
       } catch (error) {
         primary = error
+        this.appendAnomalies = this.diagnoseAppends()
+        if (this.appendAnomalies.length && !primary.message.includes('Log/idempotency anomaly'))
+          primary.message += `; Log/idempotency anomaly: ${this.appendFailure()}`
+        await this.captureFailureLog(scope, bodyDeadline)
       }
       const cleanupErrors = await this.stack.closeAll({
         budgetMs: Math.max(0, Math.min(CLEANUP_MS, this.deadline - performance.now() - FINAL_MS)),
@@ -2211,6 +2920,7 @@ class ShareBounceCase {
       throw error
     } finally {
       this.evidence.restore()
+      this.producerEvidence.causes.disable()
       this.gauge.uninstall()
     }
   }
@@ -2308,9 +3018,32 @@ class ShareBounceCase {
             SESSION_TIMEOUT.name,
             HEARTBEAT_INTERVAL.name,
             'group.share.delivery.count.limit',
+            ...PRODUCER_CONFIGS,
           ],
         })),
       ],
+    })
+    this.brokerConfigs = immutable({
+      resources,
+      ...this.tap.stamp(),
+      producerState: Object.values(NODES).map(({ nodeId }) => ({
+        nodeId,
+        configs: PRODUCER_CONFIGS.map((name) => {
+          const entry = resources
+            .find(
+              ({ resourceType, resourceName }) =>
+                resourceType === ConfigResourceTypes.BROKER && resourceName === String(nodeId)
+            )
+            ?.configEntries.find(({ configName }) => configName === name)
+          return (
+            entry ?? {
+              configName: name,
+              status: 'unverified',
+              reason: 'Not returned by DescribeConfigs',
+            }
+          )
+        }),
+      })),
     })
     const valueOf = (type, name, config) =>
       resources
@@ -2666,17 +3399,46 @@ class ShareBounceCase {
     const messages = Array.from({ length: BURST_SIZE }, (_, n) =>
       this.message(burst * BURST_SIZE + n)
     )
-    const send = { burst, startedAt: performance.now(), settledAt: null, error: null }
+    const send = {
+      id: this.sends.length,
+      burst,
+      startedAt: performance.now(),
+      started: this.tap.stamp(),
+      settledAt: null,
+      outcome: 'pending',
+      error: null,
+      original: immutable({
+        topic: this.topic,
+        topicId: this.topicId,
+        options: {
+          acks: -1,
+          timeout: null,
+          compression: null,
+          idempotent: true,
+          maxInFlightRequests: 5,
+          retry: RETRY,
+        },
+        omittedOptions: ['timeout', 'compression'],
+        messages: messages.map(originalMessage),
+      }),
+      results: null,
+      receiptIdentities: [],
+    }
     this.sends.push(send)
     this.pendingSends.push(
       this.producer.send({ topic: this.topic, acks: -1, messages }).then(
         (results) => {
-          send.settledAt = performance.now()
-          send.error = this.recordAppends(messages, results)
+          send.settlement = this.tap.stamp()
+          send.settledAt = send.settlement.at
+          send.outcome = 'success'
+          send.results = immutable(results)
+          send.error = this.recordAppends(messages, results, send)
         },
         (error) => {
-          send.settledAt = performance.now()
-          send.error = describeError(error)
+          send.settlement = this.tap.stamp()
+          send.settledAt = send.settlement.at
+          send.outcome = error.outcome === 'unknown' ? 'unknown' : 'failure'
+          send.error = immutable(producerError(error))
         }
       )
     )
@@ -2687,9 +3449,10 @@ class ShareBounceCase {
    * consecutive offsets from the acknowledged base offset.
    * @param {object[]} messages the burst
    * @param {object[]} results the send's per-partition outcomes
+   * @param {object} [send] Original public send ledger.
    * @returns {object|null} what was not acknowledged, or null when every record was
    */
-  recordAppends(messages, results) {
+  recordAppends(messages, results, send) {
     const next = new Map()
     for (const { partition, errorCode, baseOffset } of results) {
       if (errorCode === 0) next.set(partition, BigInt(baseOffset))
@@ -2702,9 +3465,21 @@ class ShareBounceCase {
         continue
       }
       next.set(partition, offset + 1n)
-      this.expected.push(
-        shareRecordIdentity({ topic: this.topic, partition, offset: String(offset), key, value })
-      )
+      const identity = shareRecordIdentity({
+        topic: this.topic,
+        partition,
+        offset: String(offset),
+        key,
+        value,
+      })
+      this.expected.push(identity)
+      send?.receiptIdentities.push({
+        identity,
+        partition,
+        offset: String(offset),
+        key: originalBytes(key),
+        value: originalBytes(value),
+      })
       this.appended++
     }
     return missing.size ? { name: 'NotAcknowledged', partitions: [...missing] } : null
@@ -2873,9 +3648,7 @@ class ShareBounceCase {
    */
   async observe(scope) {
     this.checkBounces()
-    const log = await bounded(scope, 40000, () =>
-      readLog({ brokers: plainTextBrokers(), topic: this.topic })
-    )
+    const log = await bounded(scope, 40000, (signal) => this.readRawLog(signal))
     this.log = log
     const raw = []
     for (const [partition, { endOffset, records }] of log) {
@@ -2961,7 +3734,15 @@ class ShareBounceCase {
     expect(this.joins).toHaveLength(1)
     for (const { index, held } of this.snapshots)
       expect(held.size).toBeLessThanOrEqual(MAX_HELD * (index + 1))
-    expect(this.captureProblems).toEqual([])
+    expect([
+      ...this.captureProblems,
+      ...this.tap.problems,
+      ...this.producerEvidence.problems,
+    ]).toEqual([])
+    this.appendAnomalies = this.diagnoseAppends()
+    if (this.appendAnomalies.length) {
+      throw new Error(`Log/idempotency anomaly: ${this.appendFailure()}`)
+    }
     this.replay = auditReplay(this.entries, this.snapshots, new Set(this.expected), this.evidence)
     expect(this.replay.problems).toEqual([])
   }
@@ -3077,12 +3858,246 @@ class ShareBounceCase {
     expect(this.settlement.successful.length + this.settlement.unknown.length).toBe(RECORDS)
     expect(this.settlement.successful.length).toBeGreaterThanOrEqual(RECORDS - MAX_REPLAY)
     expect(this.crashes.map((error) => error.message)).toEqual([])
+    expect([...this.tap.problems, ...this.producerEvidence.problems]).toEqual([])
     this.terminalVerified = true
     this.archive()
   }
 
+  /**
+   * Joins outside-corpus physical identities to original sends, all receipt offsets and wire batches.
+   * These links explain anomalies and never add an identity to the corpus.
+   * @returns {object[]} Complete diagnostic joins for the observed outside-corpus identities.
+   */
+  diagnoseAppends() {
+    const corpus = new Set(this.expected)
+    const outside = [
+      ...new Map(
+        this.entries
+          .filter(({ identity }) => !corpus.has(identity))
+          .map((entry) => [entry.identity, entry])
+      ).values(),
+    ]
+    if (!outside.length) return []
+    const batches = []
+    for (const frame of this.tap.allFrames) {
+      if (![0, 78].includes(frame.apiKey)) continue
+      try {
+        batches.push(...wireBatchStamps(frame))
+      } catch (error) {
+        this.tap.problem(`Batch diagnostic frame ${frame.id}: ${error.message}`)
+      }
+    }
+    const frames = new Map(this.tap.allFrames.map((frame) => [frame.id, frame]))
+    const stampKey = ({
+      topicId,
+      partition,
+      producerId,
+      producerEpoch,
+      firstSequence,
+      count,
+      bodyHash,
+      payloadHash,
+    }) =>
+      JSON.stringify([
+        topicId ?? this.topicId,
+        partition,
+        producerId,
+        producerEpoch,
+        firstSequence,
+        count,
+        bodyHash,
+        payloadHash,
+      ])
+    let diagnosticBytes = 0
+    const joins = []
+    for (const entry of outside) {
+      const key = entry.keyBytes == null ? null : originalBytes(Buffer.from(entry.keyBytes, 'hex'))
+      const value =
+        entry.valueBytes == null ? null : originalBytes(Buffer.from(entry.valueBytes, 'hex'))
+      const sends = this.sends.filter((send) =>
+        send.original.messages.some(
+          (message) =>
+            message.partition === entry.partition && message.key === key && message.value === value
+        )
+      )
+      const received = batches.filter(
+        (batch) =>
+          frames.get(batch.frame).apiKey === 78 &&
+          batch.topicId === entry.topicId &&
+          batch.partition === entry.partition &&
+          batch.topError === 0 &&
+          batch.partitionError === 0 &&
+          BigInt(batch.baseOffset) <= BigInt(entry.offset) &&
+          BigInt(batch.baseOffset) + BigInt(batch.lastOffsetDelta) >= BigInt(entry.offset)
+      )
+      const stamps = new Set(received.map(stampKey))
+      const matching = batches.filter(
+        (batch) =>
+          (batch.topic == null || batch.topic === this.topic) && stamps.has(stampKey(batch))
+      )
+      const join = {
+        identity: entry.identity,
+        offset: entry.offset,
+        partition: entry.partition,
+        sends: sends.map(({ id }) => id),
+        receiptIdentities: sends.flatMap((send) =>
+          send.receiptIdentities.filter(
+            (receipt) =>
+              receipt.partition === entry.partition &&
+              receipt.key === key &&
+              receipt.value === value
+          )
+        ),
+        batches: received,
+        copies: matching
+          .filter((batch) => frames.get(batch.frame).apiKey === 78)
+          .map((batch) => ({
+            offset: String(
+              BigInt(batch.baseOffset) + BigInt(entry.offset) - BigInt(received[0].baseOffset)
+            ),
+            ...batch,
+          })),
+        produceAttempts: matching
+          .filter((batch) => frames.get(batch.frame).apiKey === 0)
+          .map((batch) => {
+            const frame = frames.get(batch.frame)
+            return {
+              ...batch,
+              socket: frame.socket,
+              correlationId: frame.correlationId,
+              nodeId: frame.nodeId,
+              endpoint: frame.endpoint,
+              writtenAt: frame.at,
+              responseAt: frame.responseAt ?? null,
+              lostAt: frame.lostAt ?? null,
+              attempt:
+                this.producerEvidence.attempts.find(({ frames }) =>
+                  frames.some(({ id }) => id === frame.id)
+                )?.id ?? null,
+            }
+          }),
+        evidenceStatus: received.length ? 'original-wire-batches' : 'missing-wire-batch',
+      }
+      diagnosticBytes += Buffer.byteLength(JSON.stringify(join))
+      if (diagnosticBytes > 16 * 1024 * 1024) {
+        this.tap.problem(
+          'Append diagnostic joins exceeded 16 MiB; remaining identities are unverified'
+        )
+        break
+      }
+      joins.push(join)
+    }
+    return joins
+  }
+
+  /** @returns {string} Both physical offsets, the original stamp and matching attempt/frame IDs. */
+  appendFailure() {
+    const anomaly = this.appendAnomalies[0]
+    const batch = anomaly.batches[0]
+    const stamp = batch
+      ? {
+          producerId: batch.producerId,
+          producerEpoch: batch.producerEpoch,
+          baseSequence: batch.firstSequence,
+          count: batch.count,
+        }
+      : { status: 'missing' }
+    const offsets = [...new Set([anomaly.offset, ...anomaly.copies.map(({ offset }) => offset)])]
+    return `partition ${anomaly.partition} offsets ${offsets.join('/')} batch ${JSON.stringify(stamp)} Produce attempts ${JSON.stringify(anomaly.produceAttempts.map(({ attempt, frame }) => ({ attempt, frame })))}`
+  }
+
+  /**
+   * Opens independent raw-log readers whose original Fetch/ListOffsets frames also enter the tap.
+   * @param {AbortSignal} signal Existing observation scope.
+   * @returns {Promise<Map>} Independent raw log, without a consumer group or retry helper.
+   */
+  async readRawLog(signal) {
+    const brokers = []
+    const disconnect = () => {
+      for (const broker of brokers) broker.disconnect().catch(() => {})
+    }
+    signal.addEventListener('abort', disconnect, { once: true })
+    try {
+      return await readLog({
+        brokers: plainTextBrokers(),
+        topic: this.topic,
+        open: async ({ host, port }) => {
+          signal.throwIfAborted()
+          const broker = new Broker({
+            connectionPool: createConnectionPool({
+              host,
+              port,
+              connectionTimeout: 3000,
+              requestTimeout: 30000,
+              socketFactory: this.tap.factory('raw-log'),
+            }),
+            logger: newLogger(),
+          })
+          brokers.push(broker)
+          try {
+            await broker.connect()
+            signal.throwIfAborted()
+            return broker
+          } catch (error) {
+            await broker.disconnect()
+            throw error
+          }
+        },
+      })
+    } finally {
+      signal.removeEventListener('abort', disconnect)
+      await Promise.all(brokers.map((broker) => broker.disconnect()))
+    }
+  }
+
+  /**
+   * Preserves the primary failure while attempting raw-log capture before owned topic deletion.
+   * @param {AbortSignal} scope Original case scope.
+   * @param {number} bodyDeadline Original body deadline, never extended for diagnosis.
+   * @returns {Promise<void>} A snapshot or an explicit reason it could not be captured.
+   */
+  async captureFailureLog(scope, bodyDeadline) {
+    this.failureLog = { started: this.tap.stamp(), status: 'unverified' }
+    try {
+      if (!this.readiness || liveRun.tainted || scope.aborted)
+        throw new Error(
+          'Raw-log diagnosis unavailable: no ready fixture, expired scope or tainted run'
+        )
+      const remaining = Math.min(40000, bodyDeadline - performance.now(), this.window(40000))
+      if (remaining <= 0)
+        throw new Error('No original body allowance remains for raw-log diagnosis')
+      const log = await bounded(scope, remaining, async (signal) => {
+        const log = this.log ?? (await this.readRawLog(signal))
+        for (const broker of this.evidence.brokers) {
+          if (broker.connectionPool.isConnected())
+            await this.evidence.captureBrokerState(broker, signal)
+        }
+        return log
+      })
+      const partitions = [...log].map(([partition, { endOffset, records }]) => ({
+        partition,
+        endOffset,
+        records: records.map((record) => ({
+          offset: String(record.offset),
+          ...originalMessage(record),
+          batchContext: record.batchContext,
+        })),
+      }))
+      if (Buffer.byteLength(JSON.stringify(partitions)) > PRODUCER_EVIDENCE_BYTES)
+        throw new Error(
+          'Raw-log snapshot exceeded its byte bound; original wire frames retained within their bound'
+        )
+      this.failureLog.partitions = immutable(partitions)
+      this.failureLog.status = 'captured'
+    } catch (error) {
+      this.failureLog.error = describeError(error, 8)
+    }
+    this.failureLog.ended = this.tap.stamp()
+  }
+
   /** @returns {void} Archives original streams on success and failure, without success summaries. */
   archive() {
+    const producerLinks = this.producerEvidence.links()
     this.row('acquisition-journal', {
       topic: this.topic,
       topicId: this.topicId,
@@ -3106,7 +4121,58 @@ class ShareBounceCase {
       socketEvents: this.tap.socketEvents,
       provisionalUnknownCandidates: this.settlement?.unknown ?? [],
       terminalUnknown: this.terminalVerified ? (this.settlement?.unknown ?? []) : [],
-      wire: this.tap.allFrames.filter(({ apiKey }) => [3, 76, 78, 79].includes(apiKey)),
+      producerSchema: 1,
+      sends: this.sends.map((send) => ({
+        ...send,
+        outcome: send.outcome === 'pending' ? 'unknown' : send.outcome,
+        retryCount: producerLinks
+          .filter(({ sends }) => sends.includes(send.id))
+          .map(({ batch, retryCount, attempts }) => ({
+            batch,
+            retryCount,
+            rpcAttempts: attempts.length,
+            writtenAttempts: attempts.filter(
+              (id) => this.producerEvidence.attempts[id].frames.length
+            ).length,
+          })),
+      })),
+      producerBatches: this.producerEvidence.batches,
+      producerLinks,
+      producerTransitions: this.producerEvidence.transitions,
+      produceAttempts: this.producerEvidence.attempts.map(({ frames, ...attempt }) => ({
+        ...attempt,
+        frames: frames.map(({ id }) => id),
+      })),
+      producerBrokerStates: this.evidence.brokerStates.map(({ frames, ...state }) => ({
+        ...state,
+        frames: frames.map(({ id }) => id),
+      })),
+      brokerConfigs: this.brokerConfigs,
+      brokerMechanism: {
+        status: 'unverified',
+        unavailable: [
+          'image digest/build',
+          'on-disk producer snapshots',
+          'log truncation/recovery history',
+          'continuous high-watermark/ELR/election history',
+        ],
+        reason:
+          'Client APIs expose sampled metadata, ends and DescribeProducers; controller broker artifacts are required for the remaining facts',
+      },
+      appendAnomalies: this.appendAnomalies ?? this.diagnoseAppends(),
+      failureLog: this.failureLog,
+      captureBounds: {
+        wireBytes: WIRE_BYTES,
+        wireUsed: this.tap.byteCount,
+        producerBytes: PRODUCER_EVIDENCE_BYTES,
+        producerUsed: this.producerEvidence.bytes,
+      },
+      captureProblems: [
+        ...this.captureProblems,
+        ...this.tap.problems,
+        ...this.producerEvidence.problems,
+      ],
+      wire: this.tap.allFrames.filter(({ apiKey }) => ARCHIVE_APIS.has(apiKey)),
       frozen: this.snapshots.map(({ held, ...rest }) => ({ ...rest, held: [...held] })),
       uncertainty: freezeAccounting(this.entries, this.snapshots, this.evidence),
       replay: this.replay,
@@ -3257,6 +4323,7 @@ class ShareBounceCase {
    */
   async complete(scope) {
     expect(this.terminalVerified).toBe(true)
+    expect([...this.tap.problems, ...this.producerEvidence.problems]).toEqual([])
     await pollUntil(
       scope,
       5000,
@@ -4175,6 +5242,161 @@ describe('share bounce acquisition and settlement sensitivity', () => {
     }
   })
 
+  it('starts an acquisition epoch sample without waiting for an overlapping periodic sample', async () => {
+    let complete
+    const broker = {
+      connectionPool: { isConnected: () => true },
+      metadata: jest
+        .fn()
+        .mockImplementationOnce(() => new Promise((resolve) => (complete = resolve)))
+        .mockResolvedValue({}),
+    }
+    const evidence = new BounceEvidence({ topic: 'sampling-control' })
+    evidence.epochSignal = NEVER
+    try {
+      evidence.sampleEpoch(broker)
+      evidence.sampleEpoch(broker, { fresh: true })
+      expect(broker.metadata).toHaveBeenCalledTimes(2)
+    } finally {
+      evidence.owner.driveFinished = true
+      complete?.({})
+      await Promise.all([...evidence.epochProbes])
+    }
+  })
+
+  it('retains original metadata epochs when the routing cache later mutates its response', async () => {
+    const fixture = replayFixture()
+    const response = fixture.evidence.epochs[0].response
+    const original = Broker.prototype.metadata
+    Broker.prototype.metadata = jest.fn().mockResolvedValue(response)
+    const evidence = new BounceEvidence({ topic: fixture.old.topic, tap: new ShareWireTap() })
+    try {
+      evidence.install()
+      const broker = { nodeId: 1, connectionPool: {}, brokerAddress: 'node-1' }
+      const result = await Broker.prototype.metadata.call(broker)
+      expect(result).toBe(response)
+      result.topicMetadata[0].partitionMetadata[0].leaderEpoch = 99
+      expect(evidence.epochs[0].response.topicMetadata[0].partitionMetadata[0].leaderEpoch).toBe(1)
+    } finally {
+      evidence.restore()
+      Broker.prototype.metadata = original
+    }
+  })
+
+  it('starts sampling a connected member broker before its first share exchange', async () => {
+    const original = Broker.prototype.connect
+    Broker.prototype.connect = jest.fn().mockResolvedValue('connected')
+    const evidence = new BounceEvidence({
+      nonce: 'sampling-control',
+      topic: 'sampling-control',
+      tap: new ShareWireTap(),
+    })
+    const broker = {
+      connectionPool: { clientId: 'member-sampling-control', isConnected: () => true },
+      metadata: jest.fn().mockResolvedValue({}),
+    }
+    evidence.epochSignal = NEVER
+    try {
+      evidence.install()
+      await expect(Broker.prototype.connect.call(broker)).resolves.toBe('connected')
+      expect(broker.metadata).toHaveBeenCalledTimes(1)
+      expect(evidence.brokers.has(broker)).toBe(true)
+    } finally {
+      evidence.owner.driveFinished = true
+      await Promise.all([...evidence.epochProbes])
+      evidence.restore()
+      Broker.prototype.connect = original
+    }
+  })
+
+  it('retains both delivery intervals and overlapping epoch facts in a count failure', () => {
+    const fixture = replayFixture()
+    fixture.evidence.epochs[1].frames[0].responseAt = 21
+    const problem = audit(fixture).problems.find((value) =>
+      value.startsWith(`${fixture.old.identity} has no proved delivery-count progression: `)
+    )
+    const facts = JSON.parse(problem.slice(problem.indexOf(': ') + 2))
+    expect(facts.deliveries.map(({ entry, deliveryCount }) => [entry, deliveryCount])).toEqual([
+      [0, 1],
+      [1, 1],
+    ])
+    expect(facts.deliveries[1]).toMatchObject({
+      nodeId: 2,
+      sessionEpoch: 1,
+      requestAt: 20,
+      responseAt: 21,
+      epochs: { overlapping: [{ frame: 11, leaderEpoch: 2 }] },
+    })
+    expect(facts.bounce).toMatchObject({ index: 0, at: 7, downAt: 9 })
+  })
+
+  /** @returns {object} Late original acquisition and a source-local away-and-back transition. */
+  const metadataTransitionFixture = () => {
+    const fixture = replayFixture({ sameLeader: true })
+    fixture.bounces[0].at = 3
+    fixture.old.acquisition.source.frames[0].at = 3.1
+    fixture.old.acquisition.source.frames[0].responseAt = 3.2
+    fixture.old.acquisition.adoptedAt = 3.3
+    fixture.evidence.epochs[1].response.topicMetadata[0].partitionMetadata[0].leaderEpoch = 3
+    const transition = JSON.parse(JSON.stringify(fixture.evidence.epochs[0]))
+    Object.assign(transition.frames[0], {
+      id: 50,
+      endpoint: fixture.old.acquisition.source.endpoint,
+      at: 6.2,
+      responseAt: 6.4,
+    })
+    Object.assign(transition.response.topicMetadata[0].partitionMetadata[0], {
+      leader: 2,
+      leaderEpoch: 2,
+    })
+    fixture.evidence.epochs.push(transition)
+    captureFreezes(fixture)
+    return { ...fixture, transition }
+  }
+
+  it('corroborates a late old epoch with its source node metadata transition before down', () => {
+    const fixture = metadataTransitionFixture()
+    expect(audit(fixture).problems).toEqual([])
+    expect(audit(fixture).extras[0].epochWitness).toMatchObject({
+      upper: 1,
+      lower: 3,
+      metadataTransition: 50,
+    })
+  })
+
+  it.each([
+    ['no old upper bound', (f) => f.evidence.epochs.shift()],
+    ['overlapping new lower bound', (f) => (f.evidence.epochs[1].frames[0].responseAt = 21)],
+    ['another source node', (f) => (f.transition.nodeId = 3)],
+    ['another pool', (f) => (f.transition.pool = 99)],
+    ['another endpoint', (f) => (f.transition.frames[0].endpoint = 'node-3')],
+    [
+      'another partition',
+      (f) => (f.transition.response.topicMetadata[0].partitionMetadata[0].partitionId = 1),
+    ],
+    ['unanswered sample', (f) => delete f.transition.frames[0].responseBytes],
+    ['after down', (f) => (f.transition.frames[0].responseAt = 10)],
+    ['before the upper bound', (f) => (f.transition.frames[0].at = 5.5)],
+    [
+      'unchanged leader',
+      (f) => (f.transition.response.topicMetadata[0].partitionMetadata[0].leader = 1),
+    ],
+    [
+      'unchanged epoch',
+      (f) => (f.transition.response.topicMetadata[0].partitionMetadata[0].leaderEpoch = 1),
+    ],
+    [
+      'different leaders at one epoch',
+      (f) => (f.evidence.epochs[1].response.topicMetadata[0].partitionMetadata[0].leaderEpoch = 2),
+    ],
+  ])('rejects a metadata transition with %s', (_name, mutate) => {
+    const fixture = metadataTransitionFixture()
+    mutate(fixture)
+    expect(audit(fixture).problems).toContainEqual(
+      expect.stringContaining(`${fixture.old.identity} has no proved delivery-count progression`)
+    )
+  })
+
   /** @returns {object} Distinct acquisitions bracketed by source epochs and a completed kill. */
   const downBarrierFixture = () => {
     const fixture = replayFixture()
@@ -4393,8 +5615,8 @@ describe('share bounce acquisition and settlement sensitivity', () => {
     const fixture = replayFixture()
     fixture.old.deliveryCount = 2
     fixture.old.acquisition.acquiredRecords[0].deliveryCount = 2
-    expect(audit(fixture).problems).toContain(
-      `${fixture.old.identity} has no proved delivery-count progression`
+    expect(audit(fixture).problems).toContainEqual(
+      expect.stringContaining(`${fixture.old.identity} has no proved delivery-count progression`)
     )
   })
 
@@ -5121,8 +6343,8 @@ describe('share bounce acquisition and settlement sensitivity', () => {
     expect(audit(fixture).problems).toEqual([])
     fixture.next.deliveryCount = 1
     fixture.next.acquisition.acquiredRecords[0].deliveryCount = 1
-    expect(audit(fixture).problems).toContain(
-      `${fixture.old.identity} has no proved delivery-count progression`
+    expect(audit(fixture).problems).toContainEqual(
+      expect.stringContaining(`${fixture.old.identity} has no proved delivery-count progression`)
     )
     const source = fixture.old.acquisition.source
     const transition = {
@@ -5152,8 +6374,8 @@ describe('share bounce acquisition and settlement sensitivity', () => {
     expect(audit(fixture).problems).toEqual([])
     expect(audit(fixture).extras[0].epochWitness.transition).toBe(50)
     transition.response.responses[0].partitions[0].currentLeader.leaderEpoch = 1
-    expect(audit(fixture).problems).toContain(
-      `${fixture.old.identity} has no proved delivery-count progression`
+    expect(audit(fixture).problems).toContainEqual(
+      expect.stringContaining(`${fixture.old.identity} has no proved delivery-count progression`)
     )
   })
 
