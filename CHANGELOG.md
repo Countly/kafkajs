@@ -26,6 +26,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Add deterministic lifecycle, shutdown and observer-failure schedules for client telemetry.
 - Bound telemetry schedule cleanup and await operation settlement before lifecycle assertions.
 - Measure telemetry observation, bounded serialization and end-to-end overhead with independent work and identity controls.
+- Defer telemetry benchmark payload decoding and capture hashing until after delivery timing, and verify inherited consume bytes through frozen manifest inputs.
 
 #### Behavior changes
 

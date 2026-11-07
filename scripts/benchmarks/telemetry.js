@@ -28,7 +28,6 @@ const LOADED_SOURCES = Object.fromEntries(
   [
     ['driver', __filename],
     ['session', require.resolve('./session')],
-    ['consume', path.join(__dirname, 'consumeThroughput.js')],
   ].map(([name, file]) => [name, sha256(fs.readFileSync(file))])
 )
 
@@ -697,7 +696,8 @@ const makeExclusiveDirectory = (directory) => {
 }
 
 /** Writes sealed, immutable evidence files into one private empty directory.
- * Every file is created exclusively without following links, hashed while written and fsynced.
+ * Files are created exclusively without following links and fsynced. Capture chunks can defer hashing
+ * until their series is sealed outside the measured window.
  */
 class EvidenceWriter {
   #directory
@@ -728,10 +728,11 @@ class EvidenceWriter {
   }
 
   /** Opens one append-only artifact; it is immutable once sealed.
-   * @param {string} name simple basename @returns {{append:(data:Buffer)=>void,seal:()=>object}} stream
+   * @param {string} name simple basename @param {{deferHash?:boolean}} [options] hash at series sealing
+   * @returns {{append:(data:Buffer)=>void,seal:()=>object}} stream
    * @throws {AssertionError} for a bad or repeated name, or when a byte/artifact cap would be exceeded
    */
-  stream(name) {
+  stream(name, { deferHash = false } = {}) {
     assert(ARTIFACT_NAME.test(name) && !this.#names.has(name), `bad artifact name ${name}`)
     assert(this.#names.size < this.maxArtifacts, 'too many artifacts')
     this.#names.add(name)
@@ -740,7 +741,7 @@ class EvidenceWriter {
       fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | NOFOLLOW,
       0o600
     )
-    const hash = crypto.createHash('sha256')
+    const hash = deferHash ? null : crypto.createHash('sha256')
     let bytes = 0
     let open = true
     const close = () => {
@@ -753,7 +754,7 @@ class EvidenceWriter {
           assert(open && this.#bytes + data.length <= this.maxBytes, 'evidence byte cap exceeded')
           for (let written = 0; written < data.length;)
             written += fs.writeSync(fd, data, written, data.length - written)
-          hash.update(data)
+          hash?.update(data)
           bytes += data.length
           this.#bytes += data.length
         } catch (error) {
@@ -764,7 +765,7 @@ class EvidenceWriter {
       seal: () => {
         fs.fsyncSync(fd)
         close()
-        const artifact = { name, bytes, sha256: hash.digest('hex') }
+        const artifact = { name, bytes, sha256: hash?.digest('hex') ?? null }
         this.#sealed.push(artifact)
         return artifact
       },
@@ -772,40 +773,67 @@ class EvidenceWriter {
   }
 
   /** @param {string} name basename @param {Buffer|string} data complete contents
-   * @returns {{name:string,bytes:number,sha256:string}} the sealed artifact @throws {AssertionError} caps
+   * @param {{deferHash?:boolean}} [options] hash at series sealing
+   * @returns {{name:string,bytes:number,sha256:string|null}} the artifact; deferred hashes await series sealing
+   * @throws {AssertionError} caps
    */
-  write(name, data) {
+  write(name, data, options) {
     const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data)
-    const stream = this.stream(name)
+    const stream = this.stream(name, options)
     stream.append(buffer)
     return stream.seal()
   }
 
   /** Seals one bounded numbered chunk of a series that is read back in order.
    * @param {string} prefix series name @param {Buffer} data at most 2 MiB; a series holds at most 32 MiB
+   * @param {{deferHash?:boolean}} [options] defer capture hashing until `sealChunks`, outside timing
    * @returns {object} the sealed chunk @throws {AssertionError} when a chunk or series cap is exceeded
    */
-  chunk(prefix, data) {
-    const series = this.#chunks.get(prefix) ?? { count: 0, bytes: 0 }
+  chunk(prefix, data, options) {
+    const series = this.#chunks.get(prefix) ?? { count: 0, bytes: 0, deferred: [] }
     assert(data.length <= 2 * MIB && series.bytes + data.length <= 32 * MIB, 'chunk cap exceeded')
     this.#chunks.set(prefix, series)
-    const artifact = this.write(`${prefix}.${String(series.count).padStart(6, '0')}`, data)
+    const artifact = this.write(`${prefix}.${String(series.count).padStart(6, '0')}`, data, options)
+    if (artifact.sha256 === null) series.deferred.push(artifact)
     series.count += 1
     series.bytes += data.length
     return artifact
   }
 
-  /** @param {string} prefix chunk series @returns {object} the sealed index artifact recording its count */
+  /** Hashes deferred chunks and writes the series index; callers keep this outside measured windows.
+   * @param {string} prefix chunk series @returns {object} sealed index artifact recording its count
+   * @throws {AssertionError|Error} if a captured chunk is no longer a regular file of its recorded size
+   */
   sealChunks(prefix) {
-    return this.write(
-      `${prefix}.index`,
-      JSON.stringify({ count: this.#chunks.get(prefix)?.count ?? 0 })
-    )
+    const series = this.#chunks.get(prefix)
+    for (const artifact of series?.deferred ?? []) {
+      const fd = fs.openSync(
+        path.join(this.#directory, artifact.name),
+        fs.constants.O_RDONLY | NOFOLLOW
+      )
+      try {
+        const stat = fs.fstatSync(fd)
+        assert(stat.isFile() && stat.size === artifact.bytes, 'captured chunk differs')
+        artifact.sha256 = sha256(fs.readFileSync(fd))
+      } finally {
+        fs.closeSync(fd)
+      }
+    }
+    if (series) series.deferred = []
+    return this.write(`${prefix}.index`, JSON.stringify({ count: series?.count ?? 0 }))
   }
 
-  /** @returns {Array<{name:string,bytes:number,sha256:string}>} every sealed artifact, in creation order */
-  artifacts() {
-    return [...this.#sealed]
+  /** @param {string} [prefix] restrict to one independently sealed chunk series
+   * @returns {Array<{name:string,bytes:number,sha256:string}>} sealed artifacts, in creation order
+   * @throws {AssertionError} while selected capture chunks still await their post-window hashes
+   */
+  artifacts(prefix) {
+    const artifacts = this.#sealed.filter(({ name }) => !prefix || name.startsWith(`${prefix}.`))
+    assert(
+      artifacts.every((artifact) => artifact.sha256 !== null),
+      'unsealed capture chunks'
+    )
+    return artifacts
   }
 }
 
@@ -2145,6 +2173,21 @@ const decodePush = (body) => {
   }
 }
 
+/** Decodes a retained Push outside timing, checking any previously derived fields on re-verification.
+ * Capture records contain only body bytes and socket facts; decoded fields are never needed to forward.
+ * @param {object} record captured request/response tuple @returns {object} independently decoded tuple
+ * @throws {AssertionError|Error} for corrupt bytes, payload decoding or inconsistent derived fields
+ */
+const decodePushRecord = (record) => {
+  if (record.kind !== 'push') return record
+  assert(typeof record.bodyHex === 'string' && /^(?:[a-f0-9]{2})+$/.test(record.bodyHex))
+  const actual = decodePush(Buffer.from(record.bodyHex, 'hex'))
+  for (const key of Object.keys(actual))
+    if (Object.hasOwn(record, key))
+      assert.deepEqual(record[key], actual[key], `Push ${key} differs`)
+  return { ...record, ...actual }
+}
+
 /** One socket's two directions: pairs telemetry requests (APIs 71 and 72) with their responses and
  * retires each correlation when answered. Ordinary frame bodies are discarded as they stream by.
  */
@@ -2174,11 +2217,15 @@ class SocketTap {
         const [tags, afterTags] = readUVarInt(frame, 10 + Math.max(0, frame.readInt16BE(8)))
         assert.equal(tags, 0, 'unsupported request header tags')
         const body = frame.subarray(afterTags)
-        const request = { kind: apiKey === 71 ? 'subscription' : 'push', socket, node, apiKey }
-        request.uuid = uuidText(body.subarray(0, 16))
-        if (apiKey === 72) {
-          Object.assign(request, decodePush(body))
+        const request = {
+          kind: apiKey === 71 ? 'subscription' : 'push',
+          socket,
+          node,
+          apiKey,
+          correlation,
         }
+        if (apiKey === 72) request.bodyHex = body.toString('hex')
+        else request.uuid = uuidText(body.subarray(0, 16))
         this.#pending.set(correlation, request)
       }),
     })
@@ -2270,7 +2317,9 @@ class TelemetryPushProbe {
   #flush() {
     if (!this.#lines.length) return
     try {
-      this.#evidence.chunk('delivery-telemetry', Buffer.from(this.#lines.join('')))
+      this.#evidence.chunk('delivery-telemetry', Buffer.from(this.#lines.join('')), {
+        deferHash: true,
+      })
     } catch (error) {
       this.#fail(error)
     }
@@ -2346,8 +2395,9 @@ class TelemetryPushProbe {
     return this.#errors
   }
 
-  /** Seals the remaining chunk and the series index; later records are refused.
-   * @returns {object[]} every completed tuple @throws {AssertionError} when the probe latched an error
+  /** Seals capture and independently decodes Push payloads after the measured window; later records
+   * are refused. No decoder or payload hash runs on the forwarding path.
+   * @returns {object[]} every decoded tuple @throws {AssertionError|Error} on latched or decoding errors
    */
   finish() {
     if (!this.#finished) {
@@ -2358,14 +2408,14 @@ class TelemetryPushProbe {
     assert.deepEqual(this.#errors, [], 'telemetry probe latched an error')
     return readChunks(
       this.#evidence.directory,
-      this.#evidence.artifacts(),
+      this.#evidence.artifacts('delivery-telemetry'),
       'delivery-telemetry'
     ).flatMap((chunk) =>
       chunk
         .toString('utf8')
         .split('\n')
         .filter(Boolean)
-        .map((line) => JSON.parse(line))
+        .map((line) => decodePushRecord(JSON.parse(line)))
     )
   }
 }
@@ -2415,10 +2465,8 @@ const telemetryEvidence = (records, { active, intervalMs, exports, clients = 2, 
   const consumed = new Set()
   const proven = new Set()
   let pushes = 0
-  for (const record of records.filter((r) => r.kind === 'push')) {
-    const actual = decodePush(Buffer.from(record.bodyHex, 'hex'))
-    for (const key of Object.keys(actual))
-      assert.deepEqual(record[key], actual[key], `Push ${key} differs`)
+  for (const captured of records.filter((r) => r.kind === 'push')) {
+    const record = decodePushRecord(captured)
     if (record.errorCode !== 0) continue
     assert(
       subscriptions.some(
@@ -2431,15 +2479,15 @@ const telemetryEvidence = (records, { active, intervalMs, exports, clients = 2, 
       ),
       'Push lacks a matching accepted subscription'
     )
-    if (actual.rawBytes === 0) continue
+    if (record.rawBytes === 0) continue
     const matching = exports.find(
       (e) =>
         e.clientInstanceId === record.uuid &&
         e.pushIntervalMs === intervalMs &&
         String(e.node) === record.node &&
-        e.dataSha256 === actual.rawSha256 &&
-        e.dataBytes === actual.rawBytes &&
-        e.terminating === actual.terminating &&
+        e.dataSha256 === record.rawSha256 &&
+        e.dataBytes === record.rawBytes &&
+        e.terminating === record.terminating &&
         e.parse === 'ok' &&
         !e.stub &&
         integer(e.seq, 1) &&
@@ -2448,7 +2496,7 @@ const telemetryEvidence = (records, { active, intervalMs, exports, clients = 2, 
     assert(matching, 'no exporter record matches the actual Push payload/node')
     consumed.add(`${matching.node}:${matching.seq}`)
     if (
-      !actual.terminating &&
+      !record.terminating &&
       record.observedMs >= window.startMs &&
       record.observedMs <= window.endMs
     ) {
@@ -2511,7 +2559,7 @@ class ExportArchive {
   /** @returns {void} seals at most 64 KiB of pending exporter rows */
   #flush() {
     if (!this.#lines) return
-    this.#evidence.chunk('delivery-exports', Buffer.from(this.#lines))
+    this.#evidence.chunk('delivery-exports', Buffer.from(this.#lines), { deferHash: true })
     this.#lines = ''
     this.#bytes = 0
   }
@@ -2546,7 +2594,7 @@ class ExportArchive {
     this.#evidence.sealChunks('delivery-exports')
     return readChunks(
       this.#evidence.directory,
-      this.#evidence.artifacts(),
+      this.#evidence.artifacts('delivery-exports'),
       'delivery-exports'
     ).flatMap((chunk) =>
       chunk
@@ -3626,7 +3674,7 @@ const frozenSource = (arm, consumeSha256) => {
  * @throws {AssertionError|Error} when any executable, runtime or frozen identity cannot be verified
  */
 const verifyProvenance = (manifest) => {
-  for (const name of ['driver', 'session', 'consume']) {
+  for (const name of ['driver', 'session']) {
     frozenAsset(manifest[name])
     assert.equal(manifest[name].sha256, LOADED_SOURCES[name], `${name} differs from loaded bytes`)
   }
@@ -3636,10 +3684,7 @@ const verifyProvenance = (manifest) => {
     fs.realpathSync(require.resolve('./session'))
   )
   assert.equal(path.dirname(manifest.driver.path), path.dirname(manifest.session.path))
-  assert.equal(
-    manifest.consume.sha256,
-    sha256(fs.readFileSync(path.join(__dirname, 'consumeThroughput.js')))
-  )
+  frozenAsset(manifest.consume)
   frozenAsset({ path: manifest.node.binary, sha256: manifest.node.sha256 })
   assert.equal(fs.realpathSync(manifest.node.binary), fs.realpathSync(process.execPath))
   for (const [key, actual] of Object.entries({
