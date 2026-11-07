@@ -4602,7 +4602,6 @@ class ShareSoakDriver {
     if (ownJournal) journal.install()
     const events = []
     let client
-    let originalAssignment
     const removers = []
     const record = (kind, payload) =>
       events.push({ kind, at: clock.now(), wallAt: Date.now(), payload })
@@ -4613,26 +4612,28 @@ class ShareSoakDriver {
           if (client.events[kind])
             removers.push(client.on(client.events[kind], ({ payload }) => record(kind, payload)))
         }
-        originalAssignment = client.assignment
-        const assignment = originalAssignment.bind(client)
-        client.assignment = () => {
-          const current = assignment()
-          record('assignment', current)
-          const assigned = current.some(
-            (row) => row.topic === this.topic && row.partitions.length > 0
-          )
-          const fetching = events.some(
-            ({ kind, payload }) => kind === 'REQUEST' && payload.apiName === 'ShareFetch'
-          )
-          if (assigned && fetching && !events.some(({ kind }) => kind === 'window-start')) {
-            if (due - clock.now() < windowMs)
-              throw new Error('The cycle cannot contain its complete assigned verifier window')
-            record('window-start', current)
-          } else if (events.some(({ kind }) => kind === 'window-start'))
-            record('window-end', current)
-          return current
+        const assignment = client.assignment
+        // The public consumer is frozen: observe through a copy, never by mutating it.
+        return {
+          ...client,
+          assignment: () => {
+            const current = assignment()
+            record('assignment', current)
+            const assigned = current.some(
+              (row) => row.topic === this.topic && row.partitions.length > 0
+            )
+            const fetching = events.some(
+              ({ kind, payload }) => kind === 'REQUEST' && payload.apiName === 'ShareFetch'
+            )
+            if (assigned && fetching && !events.some(({ kind }) => kind === 'window-start')) {
+              if (due - clock.now() < windowMs)
+                throw new Error('The cycle cannot contain its complete assigned verifier window')
+              record('window-start', current)
+            } else if (events.some(({ kind }) => kind === 'window-start'))
+              record('window-end', current)
+            return current
+          },
         }
-        return client
       },
     }
     const openedAt = clock.now()
@@ -4660,7 +4661,6 @@ class ShareSoakDriver {
     } finally {
       if (ownJournal) journal.restore()
       removers.forEach((remove) => remove())
-      if (client && originalAssignment) client.assignment = originalAssignment
     }
   }
 

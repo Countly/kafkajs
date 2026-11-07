@@ -30,7 +30,8 @@ const monotonicMs = () => Number(process.hrtime.bigint() / 1000000n)
  * @returns {number} The last completed cleanup timestamp.
  */
 const cleanupTimestamp = (lane, text, { startedAt, exitedAt }) => {
-  const rows = text.trim().split('\n').map(JSON.parse)
+  const body = text.trim()
+  const rows = body ? body.split('\n').map(JSON.parse) : []
   const done = rows.filter((row) => row?.event === 'case-complete')
   const cases = LANES[lane].cases
   let previousAt = startedAt

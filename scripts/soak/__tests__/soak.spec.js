@@ -4645,8 +4645,10 @@ describe('Share soak complete original-owner schedules', () => {
       shareConsumer: (options) => {
         const client = instrumented.kafka.shareConsumer(options)
         if (!driver.lastCycle?.members.aLeft && owner.counts.cycles !== 30) return client
-        const assignment = client.assignment.bind(client)
-        const disconnect = client.disconnect.bind(client)
+        const assignment = client.assignment
+        const disconnect = client.disconnect
+        // The public consumer is frozen: wrap a copy instead of mutating it.
+        const observed = { ...client }
         let fetching = false
         let started = false
         let gate
@@ -4668,7 +4670,7 @@ describe('Share soak complete original-owner schedules', () => {
             ],
             { acquisitionLockTimeoutMs: 30000 }
           )
-        client.assignment = () => {
+        observed.assignment = () => {
           const current = assignment()
           if (!started && fetching && current[0]?.partitions.length === 3) {
             started = true
@@ -4680,7 +4682,7 @@ describe('Share soak complete original-owner schedules', () => {
           }
           return current
         }
-        client.disconnect = async (options) => {
+        observed.disconnect = async (options) => {
           await io('verifier-disconnect', { owner, driver, clock })
           if (drainReplay && gate?.settle) {
             gate.release(replay())
@@ -4692,7 +4694,7 @@ describe('Share soak complete original-owner schedules', () => {
             remove()
           }
         }
-        return client
+        return observed
       },
       admin,
       producer: () => ({
