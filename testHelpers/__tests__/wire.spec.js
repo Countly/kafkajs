@@ -31,6 +31,8 @@ const structured = (folder, version, direction) => {
  * `expected`, whose fields come from the Java generator's constructors.
  */
 const STRUCTURED = [
+  ['getTelemetrySubscriptionsV0', 'getTelemetrySubscriptions', 'GetTelemetrySubscriptions', 0],
+  ['pushTelemetryV0', 'pushTelemetry', 'PushTelemetry', 0],
   ['apiVersionsV5', 'apiVersions', 'ApiVersions', 5],
   ['describeProducersV0', 'describeProducers', 'DescribeProducers', 0],
   ['describeTransactionsV0', 'describeTransactions', 'DescribeTransactions', 0],

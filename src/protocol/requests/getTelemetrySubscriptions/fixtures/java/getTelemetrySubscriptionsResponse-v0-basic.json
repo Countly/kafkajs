@@ -1,0 +1,27 @@
+{
+  "message": "GetTelemetrySubscriptionsResponse",
+  "version": 0,
+  "case": "basic",
+  "hex": "0000001900000102030405060708090a0b0c0d0e0f10fffffff907040100ff7f80000003e8001000000103126f72672e6170616368652e6b61666b612e0d636f6d2e6578616d706c652e00",
+  "fields": {
+    "throttleTime": 25,
+    "errorCode": 0,
+    "clientInstanceId": "01020304-0506-0708-090a-0b0c0d0e0f10",
+    "subscriptionId": -7,
+    "acceptedCompressionTypes": [
+      4,
+      1,
+      0,
+      -1,
+      127,
+      -128
+    ],
+    "pushIntervalMs": 1000,
+    "telemetryMaxBytes": 1048576,
+    "deltaTemporality": true,
+    "requestedMetrics": [
+      "org.apache.kafka.",
+      "com.example."
+    ]
+  }
+}

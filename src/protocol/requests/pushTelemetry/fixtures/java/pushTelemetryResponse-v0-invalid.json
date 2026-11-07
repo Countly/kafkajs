@@ -1,0 +1,10 @@
+{
+  "message": "PushTelemetryResponse",
+  "version": 0,
+  "case": "invalid",
+  "hex": "00000019002a00",
+  "fields": {
+    "throttleTime": 25,
+    "errorCode": 42
+  }
+}

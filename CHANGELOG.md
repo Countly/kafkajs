@@ -5,6 +5,20 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 ## Unreleased — 3.0.0
 
+### Phase 9F — Client telemetry
+
+#### Additions
+
+- Implement the two flexible telemetry protocol codecs with capability-qualified compatibility output.
+
+#### Tooling
+
+- Add independent telemetry request/response vectors and strict wire fixtures.
+
+#### Behavior changes
+
+None in this protocol-only milestone. Existing client configuration and foreground operations are unchanged.
+
 ### Phase 9E — Share groups
 
 #### Behavior changes

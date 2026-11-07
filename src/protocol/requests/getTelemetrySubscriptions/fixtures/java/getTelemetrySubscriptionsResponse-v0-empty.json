@@ -1,0 +1,17 @@
+{
+  "message": "GetTelemetrySubscriptionsResponse",
+  "version": 0,
+  "case": "empty",
+  "hex": "000000190000000000000000000000000000000000000000000001000493e000000000000100",
+  "fields": {
+    "throttleTime": 25,
+    "errorCode": 0,
+    "clientInstanceId": null,
+    "subscriptionId": 0,
+    "acceptedCompressionTypes": [],
+    "pushIntervalMs": 300000,
+    "telemetryMaxBytes": 0,
+    "deltaTemporality": false,
+    "requestedMetrics": []
+  }
+}

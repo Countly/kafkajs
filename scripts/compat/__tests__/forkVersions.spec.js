@@ -205,7 +205,16 @@ describe('scripts/compat/forkVersions', () => {
       expect(result.apis.DescribeGroups.forkVersions).toEqual([0, 1, 2, 3, 4, 5, 6])
       expect(result.apis.ConsumerGroupDescribe.forkVersions).toEqual([0, 1])
       expect(result.apis.ConsumerGroupDescribe.stub).toBe(false)
-      expect(result.apis.GetTelemetrySubscriptions.hasCodec).toBe(false)
+      expect(result.apis.GetTelemetrySubscriptions).toMatchObject({
+        hasCodec: true,
+        stub: false,
+        forkVersions: [0],
+      })
+      expect(result.apis.PushTelemetry).toMatchObject({
+        hasCodec: true,
+        stub: false,
+        forkVersions: [0],
+      })
     })
   })
 })

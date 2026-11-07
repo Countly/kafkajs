@@ -91,6 +91,8 @@ const requests = {
   ListTransactions: require('./listTransactions'),
   ConsumerGroupHeartbeat: require('./consumerGroupHeartbeat'),
   ConsumerGroupDescribe: require('./consumerGroupDescribe'),
+  GetTelemetrySubscriptions: require('./getTelemetrySubscriptions'),
+  PushTelemetry: require('./pushTelemetry'),
   ListConfigResources: require('./listConfigResources'),
   DescribeTopicPartitions: require('./describeTopicPartitions'),
   ShareGroupHeartbeat: require('./shareGroupHeartbeat'),

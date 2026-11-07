@@ -58,7 +58,7 @@ const DEFAULT = [...CLASSIC, ...PRODUCER]
  * which also sends no AddPartitionsToTxn and no AddOffsetsToTxn. The `share` profile advertises the
  * bootstrap pairs and the seven released share-group APIs at their one implemented version each;
  * every one of them has a wire file.
- * @type {Record<'default'|'sasl'|'consumer'|'tv1'|'tv2'|'offsets'|'transactions'|'storage'|'securityAdmin'|'clusterAdmin'|'share', Array<[string, number]>>}
+ * @type {Record<'default'|'sasl'|'consumer'|'tv1'|'tv2'|'offsets'|'transactions'|'storage'|'securityAdmin'|'clusterAdmin'|'share'|'telemetry', Array<[string, number]>>}
  */
 const PROFILES = {
   share: [
@@ -90,6 +90,7 @@ const PROFILES = {
     ['WriteTxnMarkers', 2],
   ],
   default: DEFAULT,
+  telemetry: [...DEFAULT, ['GetTelemetrySubscriptions', 0], ['PushTelemetry', 0]],
   securityAdmin: [
     ...DEFAULT,
     ['DescribeClientQuotas', 1],
@@ -286,7 +287,7 @@ class ScriptedCluster {
    * @param {Array<{ id: number, host: string, port: number }>} options.nodes the endpoints the
    *   client may dial; a dial to any other endpoint fails
    * @param {Schedule} [options.schedule] routes the calls; one is made when omitted
-   * @param {'default'|'sasl'|'consumer'|'tv1'|'tv2'|'offsets'|'transactions'|'storage'|'securityAdmin'|'clusterAdmin'|'share'} [options.profile='default'] what the cluster advertises
+   * @param {'default'|'sasl'|'consumer'|'tv1'|'tv2'|'offsets'|'transactions'|'storage'|'securityAdmin'|'clusterAdmin'|'share'|'telemetry'} [options.profile='default'] what the cluster advertises
    * @param {Record<string, [number, number]>} [options.advertise] `[version, version]` per API
    *   name, over the profile's: how a test makes the client negotiate another single version, the
    *   only one the cluster then accepts; a non-singleton range is rejected

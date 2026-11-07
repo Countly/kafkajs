@@ -18,6 +18,32 @@
  * numbers below are that file's.
  */
 module.exports = {
+  getTelemetrySubscriptionsV0: {
+    source: 'GenerateMessageVectors.telemetry: zero/stable UUIDs and basic response constants',
+    request: { clientInstanceId: null },
+    response: {
+      throttleTime: 25,
+      errorCode: 0,
+      clientInstanceId: '01020304-0506-0708-090a-0b0c0d0e0f10',
+      subscriptionId: -7,
+      acceptedCompressionTypes: [4, 1, 0, -1, 127, -128],
+      pushIntervalMs: 1000,
+      telemetryMaxBytes: 1048576,
+      deltaTemporality: true,
+      requestedMetrics: ['org.apache.kafka.', 'com.example.'],
+    },
+  },
+  pushTelemetryV0: {
+    source: 'GenerateMessageVectors.telemetry: basic request and ok response constants',
+    request: {
+      clientInstanceId: '01020304-0506-0708-090a-0b0c0d0e0f10',
+      subscriptionId: -7,
+      terminating: false,
+      compressionType: 0,
+      metrics: '0a00',
+    },
+    response: { throttleTime: 25, errorCode: 0 },
+  },
   shareGroupHeartbeatV1: {
     source:
       'GenerateMessageVectors.java shareVectors, Apache Kafka 4.4.0 ShareGroupHeartbeat v1 join/assigned; literal wire layout and inputs',

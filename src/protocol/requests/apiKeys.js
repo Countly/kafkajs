@@ -58,6 +58,8 @@ module.exports = {
   ListTransactions: 66,
   ConsumerGroupHeartbeat: 68, // KIP-848; the whole membership protocol is this one API
   ConsumerGroupDescribe: 69, // KIP-848 admin counterpart
+  GetTelemetrySubscriptions: 71,
+  PushTelemetry: 72,
   ListConfigResources: 74,
   DescribeTopicPartitions: 75, // KIP-966 admin describe, paginated
   ShareGroupHeartbeat: 76, // KIP-932; keys 83-87 are the broker-internal share coordinator

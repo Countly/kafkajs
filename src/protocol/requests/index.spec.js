@@ -45,6 +45,24 @@ describe('Protocol > Requests', () => {
     })
   })
 
+  describe('telemetry registration', () => {
+    test.each([
+      ['GetTelemetrySubscriptions', 71],
+      ['PushTelemetry', 72],
+    ])('%s selects only v0 with flexible headers', (name, key) => {
+      const { requestHeaderVersion, responseHeaderVersion } = require('../headers')
+      expect(apiKeys[name]).toBe(key)
+      expect(requests[name].versions).toEqual(['0'])
+      const { request } = lookup({ [key]: { minVersion: 0, maxVersion: 0 } })(key, requests[name])()
+      expect(request).toMatchObject({ apiName: name, apiKey: key, apiVersion: 0 })
+      expect(requestHeaderVersion(key, 0)).toBe(2)
+      expect(responseHeaderVersion(key, 0)).toBe(1)
+      expect(() => lookup({})(key, requests[name])).toThrow(KafkaJSServerDoesNotSupportApiKey)
+      expect(() =>
+        lookup({ [key]: { minVersion: 1, maxVersion: 1 } })(key, requests[name])
+      ).toThrow(KafkaJSServerDoesNotSupportApiKey)
+    })
+  })
   describe('apiKeys and requests', () => {
     test.each(Object.keys(apiKeys))('%s has an entry in requests', (apiName) => {
       expect(requests[apiName]).toBeDefined()
