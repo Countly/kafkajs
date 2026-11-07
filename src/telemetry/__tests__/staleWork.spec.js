@@ -289,6 +289,111 @@ describe('public round oracle controls', () => {
     expect(process.listeners('unhandledRejection')).toEqual(listeners)
   })
 
+  test.each(['unreachable arrival', 'never-settling startup'])(
+    '%s timeout restores clocks prototypes and process listeners',
+    async (failure) => {
+      const Connection = require('../../network/connection')
+      const Factory = require('../factory').TelemetryFactory
+      const identities = () => [
+        Date.now,
+        process.hrtime.bigint,
+        require('node:perf_hooks').performance.now,
+        Connection.prototype.send,
+        Factory.prototype.bind,
+      ]
+      const originals = identities()
+      const listeners = process.listeners('unhandledRejection')
+      const round = new PublicTelemetryRound({ kind: 'producer' })
+      let gate
+      try {
+        if (failure === 'never-settling startup') {
+          await expect(
+            round.start({
+              beforeConnect: () => {
+                round.waitTimeout = 25
+                round.patch(round.client, 'connect', () => () => new Promise(() => {}))
+              },
+            })
+          ).rejects.toThrow('Telemetry wait exceeded its bound')
+        } else {
+          await round.start()
+          await round.ready()
+          gate = round.trace.hold({ boundary: 'cleanup-only' })
+          round.gates.push(gate)
+          round.patch(
+            round.client,
+            'disconnect',
+            (original) =>
+              async function (...args) {
+                await round.trace.enter({ boundary: 'cleanup-only' }, () => undefined)
+                return original.apply(this, args)
+              }
+          )
+          await expect(round.wait(() => gate.arrived(), 25)).rejects.toThrow(
+            'Telemetry wait exceeded its bound'
+          )
+        }
+      } finally {
+        if (failure === 'never-settling startup')
+          await expect(round.dispose(25)).rejects.toThrow('Telemetry wait exceeded its bound')
+        else await round.dispose()
+      }
+      expect(identities()).toEqual(originals)
+      expect(process.listeners('unhandledRejection')).toEqual(listeners)
+      if (gate) {
+        expect(gate.call).toBeNull()
+        expect(round.trace.schedule.rules).toEqual([])
+      }
+    },
+    60000
+  )
+
+  test('release waits for actual codec delivery and payload settlement', async () => {
+    const gzip = require('../../protocol/message/compression/gzip')
+    const schedule = new (require('../../../testHelpers/schedule').Schedule)()
+    const delivery = schedule.hold({ boundary: 'codec-delivery' })
+    const round = new PublicTelemetryRound({ kind: 'producer' })
+    round.gates.push(delivery)
+    let draining
+    try {
+      await round.start({
+        points: 'large',
+        subscription: { acceptedCompressionTypes: [1, 0] },
+      })
+      await round.ready()
+      round.patch(gzip, 'compress', (original) => async (...args) => {
+        const compressed = await original(...args)
+        await schedule.run({ boundary: 'codec-delivery' }, () => undefined)
+        return compressed
+      })
+      const gate = round.hold('S12')
+      const pushes = round.pushes().length
+      round.arm()
+      round.tick()
+      await round.wait(() => gate.arrived())
+      draining = round.drainReleased(gate)
+      round.pending.push(draining.catch(() => {}))
+      await round.wait(() => delivery.arrived())
+      await expect(round.wait(() => draining, 25)).rejects.toThrow(
+        'Telemetry wait exceeded its bound'
+      )
+      expect(round.codecJobs[0].settled).toBe(false)
+      expect(round.pushes()).toHaveLength(pushes)
+      delivery.release()
+      await draining
+      expect(round.codecJobs[0].settled).toBe(true)
+      expect(round.machine.running).toBeNull()
+      expect(round.pushes()).toHaveLength(pushes + 1)
+      expect(round.pushes().at(-1).answeredOrder).toBeDefined()
+      expect(round.pushes().at(-1).fields.compressionType).toBe(1)
+      expect(round.decodedLatestPoint({ name: 'com.example.total' }).value).toBe(0n)
+    } finally {
+      if (delivery.settle) delivery.release()
+      if (draining) await round.wait(() => draining).catch(() => {})
+      await round.dispose()
+    }
+  }, 60000)
+
   test('a throwing remover cannot prevent the remaining restoration', async () => {
     const listeners = process.listeners('unhandledRejection')
     const original = Date.now
@@ -879,7 +984,7 @@ describe.each([false, true])('telemetry and public commits enforce=%s', (enforce
         const joining = round.rejoin()
         round.pending.push(joining.catch(() => {}))
         await round.until(() => round.runner.consumerGroup.ownership.refusal(token) !== null)
-        await round.drainReleased(gate)
+        await round.drainReleased(gate, undefined, () => pending)
         const result = await pending
         expect(result.kind).toBe('reject')
         expect(result.reason).toBeInstanceOf(require('../../errors').KafkaJSCommitFailedError)

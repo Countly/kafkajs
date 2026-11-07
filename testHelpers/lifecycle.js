@@ -98,6 +98,7 @@ module.exports = {
 
 const telemetryAssert = require('node:assert/strict')
 const { Schedule: TelemetrySchedule } = require('./schedule')
+const realMonotonicNs = process.hrtime.bigint.bind(process.hrtime)
 
 /** Supplies deterministic telemetry time without coupling timer delivery to clock movement. */
 class TelemetryClock {
@@ -529,8 +530,7 @@ class DialGate {
   /** @returns {Promise<void>} resolves once a dial to the node is held @throws {Error} never held */
   async arrived() {
     const { wire, node } = this.round
-    for (let step = 0; step < 4000 && wire.heldDialsTo(node) === 0; step++) await turn()
-    if (wire.heldDialsTo(node) === 0) throw new Error('Dial hold was not reached')
+    await this.round.until(() => wire.heldDialsTo(node) > 0)
     this.settle = true
   }
 
@@ -568,6 +568,8 @@ class PublicTelemetryRound {
     this.wireSchedule = new TelemetrySchedule()
     this.restores = []
     this.pending = []
+    this.work = new Set()
+    this.waitTimeout = 10000
     this.gates = []
     this.unhandled = []
     this.bindings = []
@@ -614,32 +616,80 @@ class PublicTelemetryRound {
   }
 
   /**
-   * Waits for a real condition with a bounded number of event-loop turns.
-   * @param {() => boolean} predicate independent observation @param {number} [limit=4000] turns
+   * Waits for an observed condition until a real monotonic deadline, independent of the fake clock.
+   * @param {() => boolean} predicate independent observation @param {number} [timeout=10000] milliseconds
    * @returns {Promise<void>} @throws {Error} when the boundary is never reached
    */
-  async until(predicate, limit = 4000) {
-    for (let step = 0; step < limit && !predicate(); step++) await turn()
-    if (!predicate()) throw new Error('Telemetry boundary did not settle')
+  async until(predicate, timeout = 10000) {
+    const deadline = realMonotonicNs() + BigInt(timeout) * 1000000n
+    while (!predicate()) {
+      if (realMonotonicNs() >= deadline) throw new Error('Telemetry boundary did not settle')
+      await turn()
+    }
   }
 
   /**
-   * Starts an action, observes its promise at once and returns it; a boundary that never arrives
-   * is a setup failure, not a product red.
-   * @param {Function} thunk invoked only now @returns {Promise<*>} the action's own outcome
+   * Bounds an observation without retaining its underlying arrival promise as owned work.
+   * Rejections are observed immediately, including after timeout; the original outcome is preserved.
+   * @param {Function} thunk invoked only now @param {number} [timeout=this.waitTimeout] real milliseconds
+   * @returns {Promise<*>} the action's own outcome
+   * @throws {Error} the original failure or a setup timeout, never a product refusal oracle
    */
-  async wait(thunk) {
+  async wait(thunk, timeout = this.waitTimeout) {
     const promise = Promise.resolve().then(thunk)
-    this.pending.push(promise.catch(() => {}))
     let timer
     const limit = new Promise((resolve, reject) => {
-      timer = setTimeout(() => reject(new Error('Telemetry wait exceeded its bound')), 10000)
+      timer = setTimeout(() => reject(new Error('Telemetry wait exceeded its bound')), timeout)
     })
     try {
       return await Promise.race([promise, limit])
     } finally {
       clearTimeout(timer)
     }
+  }
+
+  /**
+   * Observes actual work through its full settlement, including cancelled native/provider shells.
+   * @param {Promise<*>} promise original operation @returns {Promise<*>} the same promise
+   */
+  trackWork(promise) {
+    const settled = Promise.resolve(promise).then(
+      () => this.work.delete(settled),
+      () => this.work.delete(settled)
+    )
+    this.work.add(settled)
+    return promise
+  }
+
+  /**
+   * Wraps a real operation without replacing its result, rejection or receiver.
+   * @param {object} target owner @param {string} key operation
+   * @param {(receiver:object,args:Array<*>) => boolean} [selected] whether this is owned work
+   * @returns {void} restores the wrapper with the round's other patches
+   */
+  watchWork(target, key, selected = () => true) {
+    const round = this
+    this.patch(
+      target,
+      key,
+      (original) =>
+        function (...args) {
+          const result = original.apply(this, args)
+          return selected(this, args) ? round.trackWork(result) : result
+        }
+    )
+  }
+
+  /**
+   * Joins owned work, including work admitted by an earlier operation's continuation.
+   * Arrival observers and public ID waiters are deliberately excluded.
+   * @param {number} [timeout=10000] real milliseconds @returns {Promise<void>}
+   * @throws {Error} when a shell never settles
+   */
+  async settleWork(timeout = 10000) {
+    await this.wait(async () => {
+      while (this.work.size) await Promise.all([...this.work])
+    }, timeout)
   }
 
   /** @returns {Array<object>} wire records of the telemetry APIs, oldest first */
@@ -772,7 +822,7 @@ class PublicTelemetryRound {
                 kindOf(request.entry.apiKey, closing()) === mode)
             if (!selected) return original.call(this, request)
             const continuation = round.enter(boundary).then(() => original.call(this, request))
-            round.pending.push(continuation.catch((error) => request.entry.reject(error)))
+            round.trackWork(continuation.catch((error) => request.entry.reject(error)))
           }
       )
     }
@@ -799,8 +849,16 @@ class PublicTelemetryRound {
           }
       )
     }
-    const traced = () => this.trace.hold({ boundary })
-    const wired = (selector) => this.wireSchedule.hold(selector)
+    const traced = () => {
+      const gate = this.trace.hold({ boundary })
+      this.gates.push(gate)
+      return gate
+    }
+    const wired = (selector) => {
+      const gate = this.wireSchedule.hold(selector)
+      this.gates.push(gate)
+      return gate
+    }
     const holds = {
       S01: traced,
       S02: () => new DialGate(this),
@@ -906,7 +964,7 @@ class PublicTelemetryRound {
                 })()
                 const pending = original.call(this, { ...definition, guard: options.guard })
                 round.pending.push(pending.catch(() => {}))
-                await blocker.arrived()
+                await round.wait(() => blocker.arrived())
               }
               return original.call(this, options)
             }
@@ -916,7 +974,7 @@ class PublicTelemetryRound {
             return blocker.settle
           },
           arrived: async () => {
-            await blocker.arrived()
+            await round.wait(() => blocker.arrived())
             await round.until(() =>
               round.dedicatedConnection.requestQueue.pending.some(
                 (request) => request.entry.apiKey === (mode === 'get' ? 71 : 72)
@@ -968,8 +1026,11 @@ class PublicTelemetryRound {
     }
     if (!holds[boundary]) throw new Error(`Unknown telemetry boundary ${boundary}`)
     const gate = holds[boundary]()
+    this.watchWork(TelemetryPayload.prototype, 'buildPayload')
+    this.watchWork(Connection.prototype, 'send', dedicated)
+    this.watchWork(Broker.prototype, 'sendTelemetry')
     this.held = { boundary, mode, gate, position }
-    this.gates.push(gate)
+    if (!this.gates.includes(gate)) this.gates.push(gate)
     return gate
   }
 
@@ -1016,6 +1077,7 @@ class PublicTelemetryRound {
                   if (selected) await round.enter('S18')
                   return result
                 }
+                round.watchWork(handle, 'retire')
                 // Retain the real build while its caller's publication callback is held.
                 if (selected && round.held.position === 'after') allocation = handle
                 else options.onAllocated(handle)
@@ -1027,6 +1089,7 @@ class PublicTelemetryRound {
             }
             return result
           }
+          round.watchWork(transport, 'open')
           return transport
         }
     )
@@ -1039,6 +1102,12 @@ class PublicTelemetryRound {
     this.socketOwners ??= new Set()
     if (this.socketOwners.has(connection)) return
     this.socketOwners.add(connection)
+    this.supplierOwners ??= new WeakSet()
+    const supplier = connection.authenticationOwner
+    if (supplier && !this.supplierOwners.has(supplier)) {
+      this.supplierOwners.add(supplier)
+      this.watchWork(supplier, 'run')
+    }
     const descriptor = Object.getOwnPropertyDescriptor(connection, 'socket')
     let current = connection.socket
     const round = this
@@ -1068,6 +1137,17 @@ class PublicTelemetryRound {
     const Connection = require('../src/network/connection')
     const Broker = require('../src/broker')
     const round = this
+    this.watchWork(this.machine, 'run')
+    this.watchWork(this.machine, 'close')
+    this.watchWork(require('../src/telemetry/payload').prototype, 'buildPayload')
+    this.watchWork(
+      this.wireSchedule,
+      'run',
+      (_receiver, [call]) =>
+        ['GetTelemetrySubscriptions', 'PushTelemetry'].includes(call.api) ||
+        (['ApiVersions', 'SaslHandshake', 'SaslAuthenticate'].includes(call.api) &&
+          call.generation > round.foregroundSockets)
+    )
     this.patch(
       Connection.prototype,
       symbolOf(Connection.prototype, 'private:Connection:prepare'),
@@ -1313,6 +1393,7 @@ class PublicTelemetryRound {
       if (hold === 'S19f') await this.enter(hold)
       return token
     }
+    this.watchWork(this, 'provider')
     const advertise = {
       GetTelemetrySubscriptions: [0, 0],
       PushTelemetry: [0, 0],
@@ -1359,7 +1440,7 @@ class PublicTelemetryRound {
     }))
     this.wire.answer('PushTelemetry', () => ({}))
     if (sasl) this.wire.answer('SaslHandshake', () => ({ enabledMechanisms: ['OAUTHBEARER'] }))
-    if (this.kind !== 'shareConsumer') await this.createClient(client)
+    if (this.kind !== 'shareConsumer') await this.wait(() => this.createClient(client))
     if (this.kind === 'producer') scripted.producerScript(this.wire)
     this.binding = this.bindings.at(-1) ?? null
     this.machine = this.binding?.machine ?? null
@@ -1369,8 +1450,8 @@ class PublicTelemetryRound {
       this.observe()
     }
     beforeConnect?.(this)
-    await this.connectForeground()
-    if (this.coreProof) await this.prepareCoreProof()
+    await this.wait(() => this.trackWork(this.connectForeground()))
+    if (this.coreProof) await this.wait(() => this.prepareCoreProof())
     this.foregroundSockets = this.wire.sockets().length
     if (!this.machine || drive === 'connected') return this
     if (drive === 'get') {
@@ -1406,7 +1487,7 @@ class PublicTelemetryRound {
     const count = this.pushes().length
     this.tick()
     await this.until(() => this.pushes().length > count)
-    await this.held.gate.arrived()
+    await this.wait(() => this.held.gate.arrived())
   }
 
   /** Expires a written operation so background retirement can remain held after public close.
@@ -1414,13 +1495,13 @@ class PublicTelemetryRound {
    * @returns {Promise<void>} the retirement result hold has arrived
    */
   async expireForRetirement() {
-    await this.retirementAnswer.arrived()
+    await this.wait(() => this.retirementAnswer.arrived())
     const machine = this.machine
     const id = machine.closing ? this.closeTimer : machine.watchdog
     const entry = this.clock.pending.get(id)
     this.clock.jump(entry.due)
     this.clock.deliver(id)
-    await this.held.gate.arrived()
+    await this.wait(() => this.held.gate.arrived())
     if (!machine.closing) await this.until(() => machine.timer !== null && !machine.running)
   }
 
@@ -2063,14 +2144,17 @@ class PublicTelemetryRound {
   }
 
   /**
-   * Releases an arrived gate once and lets its captured call settle or be refused.
+   * Releases a gate and joins real operation/shell settlement before checking its final trace.
+   * A deliberately unanswered response instead supplies its own write/settlement observation, so
+   * delayed watchdog delivery remains under the caller's control.
    * @param {object} gate hold gate @param {*} [value] the captured original answer
-   * @returns {Promise<void>}
+   * @param {Function} [completion] scenario-specific bounded observation; defaults to owned settlement
+   * @returns {Promise<void>} @throws {Error} when the selected work never completes
    */
-  async drainReleased(gate, value) {
+  async drainReleased(gate, value, completion = () => this.settleWork()) {
     if (gate.settle) gate.release(value)
     if (this.retirementAnswer?.settle) this.retirementAnswer.release()
-    for (let step = 0; step < 20; step++) await turn()
+    await this.wait(completion)
   }
 
   /**
@@ -2243,26 +2327,40 @@ class PublicTelemetryRound {
   }
 
   /**
-   * Releases only arrived gates, finishes every owned promise, disconnects through the public
-   * client, proves the round owns no work, then restores every patch.
-   * @returns {Promise<void>} @throws {Error} when the round leaves timers, sockets or failures
+   * Cancels unconsumed holds before disconnect, releases arrived work, and bounds all draining.
+   * Every patch and listener is restored even if startup, disconnect or a native shell never settles.
+   * @param {number} [timeout=10000] total real cleanup budget in milliseconds
+   * @returns {Promise<void>} @throws {Error} the first cleanup failure or deadline expiry
    */
-  async dispose() {
+  async dispose(timeout = 10000) {
     let failure = null
+    const restore = (call) => {
+      try {
+        call()
+      } catch (error) {
+        failure ??= error
+      }
+    }
+    const deadline = realMonotonicNs() + BigInt(timeout) * 1000000n
+    const remaining = () => Math.max(0, Number(deadline - realMonotonicNs()) / 1000000)
+    const drain = (thunk) => this.wait(thunk, remaining())
     try {
-      for (const gate of this.gates) if (gate.settle) gate.release()
+      this.armed = false
+      this.trace.schedule.rules.length = 0
+      this.wireSchedule.rules.length = 0
+      for (const gate of this.gates) {
+        // External schedules can still call their unconsumed gate during disconnect.
+        if (typeof gate.hold === 'function') gate.hold = () => Promise.resolve()
+        if ((gate instanceof DialGate && this.wire) || gate.settle) restore(() => gate.release())
+      }
+      if (this.client) await drain(() => this.client.disconnect(this.closeOptions(0)))
+      await drain(() => Promise.all(this.pending))
+      await this.settleWork(remaining())
+      for (const pool of this.retiredCorePools) await drain(() => pool.destroy({ drainTimeout: 0 }))
       if (this.client) {
-        await this.wait(() => this.client.disconnect(this.closeOptions(0)))
-        await Promise.all(this.pending)
-        for (const pool of this.retiredCorePools) await pool.destroy({ drainTimeout: 0 })
-        for (let step = 0; step < 4 && this.machine && this.clock.pending.size; step++) {
-          for (const [id, entry] of [...this.clock.pending])
-            if (entry.due <= this.clock.time) this.clock.deliver(id)
-          await turn()
-        }
+        for (const [id, entry] of [...this.clock.pending])
+          if (entry.due <= this.clock.time) this.clock.deliver(id)
         for (const timer of this.brokerAnswerTimers) clearTimeout(timer)
-        await turn()
-        await turn()
         this.wire.assertClean()
         telemetryAssert.ok(this.wire.sockets().every((socket) => socket.destroyed))
         if (this.machine) {
@@ -2275,14 +2373,10 @@ class PublicTelemetryRound {
     } catch (error) {
       failure = error
     } finally {
-      const restore = (call) => {
-        try {
-          call()
-        } catch (error) {
-          failure ??= error
-        }
-      }
       for (const timer of this.brokerAnswerTimers) clearTimeout(timer)
+      if (failure) {
+        for (const socket of this.wire?.sockets() ?? []) restore(() => socket.destroy())
+      }
       for (const remove of this.eventRemovers.splice(0)) restore(remove)
       restore(() => process.off('unhandledRejection', this.listener))
       while (this.restores.length) restore(this.restores.pop())

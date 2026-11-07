@@ -649,6 +649,9 @@ test.each(TELEMETRY_KINDS)(
           })
           expect(hits).toBe(1)
           expect(round.machine).toBeNull()
+          expect(round.binding.metrics).toBeNull()
+          expect(round.binding.cluster).toBeNull()
+          expect(round.cluster).not.toBeNull()
           expect(round.telemetryRequests()).toEqual([])
           await exerciseOperations(round)
           if (kind === 'producer' || kind === 'admin')
@@ -682,7 +685,7 @@ test.each(TELEMETRY_KINDS)(
  */
 async function exerciseRefusal(round, operation, outcome) {
   const reason = new (require('../../errors').KafkaJSNonRetriableError)('unique original refusal')
-  const broker = await round.binding.cluster.findConnectedBroker()
+  const broker = await round.cluster.findConnectedBroker()
   const transaction = operation.startsWith('transaction.') ? await round.client.transaction() : null
   const key = operation.split('.').at(-1)
   if (transaction && ['commit', 'abort'].includes(key))
