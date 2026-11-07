@@ -330,7 +330,13 @@ describe.each([false, true])('captured close with enforcement %s', (enforceReque
           if (fault === 'transport-refused') round.faultDedicated()
           if (fault === 'response-lost') socket.dropResponses(1, { apiKey: 72 })
           if (fault === 'blackhole') socket.blackhole()
-          await round.drainReleased(gate)
+          await round.drainReleased(
+            gate,
+            undefined,
+            fault === 'response-lost' || fault === 'blackhole'
+              ? () => round.until(() => round.machine.closing.attempted)
+              : undefined
+          )
           if (fault === 'response-lost' || fault === 'blackhole') {
             expect(round.closeDone).toBe(false)
             expect(round.machine.closing.attempted).toBe(true)
