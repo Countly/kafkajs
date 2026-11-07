@@ -27,6 +27,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Bound telemetry schedule cleanup and await operation settlement before lifecycle assertions.
 - Measure telemetry observation, bounded serialization and end-to-end overhead with independent work and identity controls.
 - Defer telemetry benchmark payload decoding and capture hashing until after delivery timing, and verify inherited consume bytes through frozen manifest inputs.
+- Verify client telemetry updates, custom metrics, payload limits, Java interoperability, unsupported brokers and unchanged foreground outcomes.
+- Verify every captured telemetry exchange, exact close cancellations, broker-qualified cache retirement, share acknowledgements and complete Java export semantics.
 
 #### Behavior changes
 

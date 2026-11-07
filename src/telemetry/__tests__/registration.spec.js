@@ -320,3 +320,67 @@ describe('public final reentrancy', () => {
     60000
   )
 })
+
+describe('live custom snapshot proof assumptions', () => {
+  const attributes = { series: 'live' }
+  const subscription = { revision: 1n, requestedMetrics: ['com.example.'], deltaTemporality: true }
+
+  /** @param {object} metrics collector @param {string} suffix series name suffix @param {string} type gauge or sum @param {number|bigint} value new value @returns {void} */
+  const set = (metrics, suffix, type, value) =>
+    metrics.register({ name: `com.example.${suffix}`, type, value, unit: '1', attributes })
+
+  /** @param {object} metrics collector @param {object} snapshot issued sample @returns {object} the sample, written as the machine writes it */
+  const write = (metrics, snapshot) => {
+    expect(metrics.isCurrent(snapshot)).toBe(true)
+    metrics.written(
+      snapshot,
+      snapshot.points.map((point) => point.identity)
+    )
+    return snapshot
+  }
+
+  /** @param {object} snapshot issued sample @returns {{zero:number,negative:number,total:bigint}} the values the live proof classifies */
+  const values = (snapshot) => {
+    const value = (suffix) => snapshot.points.find((p) => p.name === `com.example.${suffix}`).value
+    return { zero: value('zero'), negative: value('negative'), total: value('total') }
+  }
+
+  test('a sample frozen before an update stays current and is written, then the update and a zero delta follow', () => {
+    const metrics = new TelemetryMetrics({ kind: 'producer' })
+    set(metrics, 'anchor', 'gauge', 1)
+    set(metrics, 'zero', 'gauge', 0)
+    set(metrics, 'negative', 'gauge', -2.5)
+    set(metrics, 'total', 'sum', 9007199254740993n)
+    metrics.select(subscription)
+
+    const first = write(metrics, metrics.snapshot(subscription))
+    expect(values(first)).toEqual({ zero: 0, negative: -2.5, total: 9007199254740993n })
+
+    const frozen = metrics.snapshot(subscription)
+    set(metrics, 'zero', 'gauge', 6.25)
+    set(metrics, 'negative', 'gauge', -3.5)
+    set(metrics, 'total', 'sum', 9007199254741002n)
+    expect(metrics.isCurrent(frozen)).toBe(true)
+
+    expect(values(write(metrics, frozen))).toEqual({ zero: 0, negative: -2.5, total: 0n })
+    const updated = write(metrics, metrics.snapshot(subscription))
+    expect(values(updated)).toEqual({ zero: 6.25, negative: -3.5, total: 9n })
+    const following = write(metrics, metrics.snapshot(subscription))
+    expect(values(following)).toEqual({ zero: 6.25, negative: -3.5, total: 0n })
+  })
+
+  test('unregistering retires the frozen sample, so a removal can only be proved by a later write', () => {
+    const metrics = new TelemetryMetrics({ kind: 'producer' })
+    set(metrics, 'anchor', 'gauge', 1)
+    set(metrics, 'zero', 'gauge', 0)
+    set(metrics, 'negative', 'gauge', -2.5)
+    set(metrics, 'total', 'sum', 5n)
+    metrics.select(subscription)
+    const frozen = metrics.snapshot(subscription)
+    metrics.unregister({ name: 'com.example.zero', attributes })
+    expect(metrics.isCurrent(frozen)).toBe(false)
+    const after = write(metrics, metrics.snapshot(subscription))
+    expect(after.points.map((p) => p.name)).not.toContain('com.example.zero')
+    expect(after.points.map((p) => p.name)).toContain('com.example.anchor')
+  })
+})

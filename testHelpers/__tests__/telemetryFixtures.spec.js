@@ -359,6 +359,37 @@ describe('telemetry wire observer', () => {
     fs.rmSync(directory, { recursive: true, force: true })
   })
 
+  test('accounts precisely for a held periodic response cancelled by public close', async () => {
+    const { observer } = observe({ completeStream: true })
+    const socket = open(observer)
+    send(socket, push72(1, Buffer.alloc(0)))
+    await observer.closeClient({ disconnect: async () => socket.emit('close') })
+    await observer.dispose()
+    observer.assertClean({ allowUnanswered: observer.cancellationKeys() })
+    const transcript = JSON.parse(fs.readFileSync(path.join(observer.directory, 'transcript.json')))
+    expect(transcript.cancellations).toEqual([
+      expect.objectContaining({
+        requestKey: requests(observer)[0].requestKey,
+        apiKey: 72,
+        socketId: 1,
+        disposition: 'close-in-flight',
+      }),
+    ])
+    require('../../scripts/e2e/telemetry/evidence').assertStreamAccounted({ producer: transcript })
+  })
+
+  test('rejects an unrelated unanswered request on a socket closed by the client', async () => {
+    const { observer } = observe()
+    const socket = open(observer)
+    send(socket, metadata(1))
+    await observer.closeClient({ disconnect: async () => socket.emit('close') })
+    await observer.dispose()
+    expect(observer.cancellationKeys()).toEqual([])
+    expect(() => observer.assertClean({ allowUnanswered: observer.cancellationKeys() })).toThrow(
+      'Unanswered'
+    )
+  })
+
   test('rejects a foreign fixture endpoint before dialing', () => {
     const { observer, dial } = observe()
     const onConnect = jest.fn()
@@ -1478,5 +1509,250 @@ describe('telemetry sidecar verification', () => {
     expect(() => verifyEvidence('telemetry-reporter', directory, [])).toThrow(
       'Scenario catalogue mismatch'
     )
+  })
+})
+
+describe('complete live telemetry archive verification', () => {
+  const { persistEvidence, verifyScenario } = require('../../scripts/e2e/telemetry/evidence')
+  let directory
+  const digest = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex')
+  beforeEach(() => {
+    directory = fs.mkdtempSync(path.join(os.tmpdir(), 'telemetry-complete-'))
+  })
+  afterEach(() => fs.rmSync(directory, { recursive: true, force: true }))
+
+  /** @returns {object} complete three-Push finite archive with independent raw/decode/sink inputs */
+  const fixture = () => {
+    const owner = 'producer-candidate'
+    const observer = { directory: path.join(directory, 'observer-candidate') }
+    fs.mkdirSync(observer.directory)
+    const rawUuid = '11223344-5566-7788-99aa-bbccddeeff00'
+    const get = {
+      type: 'request',
+      requestKey: 'r1',
+      apiKey: 71,
+      apiVersion: 0,
+      socketId: 1,
+      node: '1',
+      uuid: ID,
+      response: {
+        errorCode: 0,
+        responseAt: 0,
+        uuid: ID,
+        subscriptionId: 1,
+        telemetryMaxBytes: 4096,
+        requestedMetrics: ['com.example.payload.'],
+        acceptedCompressionTypes: [0],
+        pushIntervalMs: 1000,
+      },
+    }
+    const rows = []
+    const writes = [1000, 2001, 3002]
+    const pushes = writes.map((writeAt, index) => {
+      const requestKey = `r${index + 2}`
+      const raw = Buffer.from(`raw-payload-${index}`)
+      const hash = digest(raw)
+      const metric = {
+        name: 'com.example.payload.0',
+        kind: 'GAUGE',
+        unit: '1',
+        points: [
+          {
+            attrs: [
+              ['series', 'string', '0'],
+              ['pad', 'string', 'x'.repeat(128)],
+            ],
+            valueKind: 'AS_DOUBLE',
+            asDouble: '0.0',
+          },
+        ],
+      }
+      const decoded = {
+        requestKey,
+        uuid: ID,
+        node: '1',
+        compressionType: 0,
+        transmittedBytes: raw.length,
+        transmittedSha256: hash,
+        rawBytes: raw.length,
+        rawSha256: hash,
+        decoded: {
+          dataSha256: hash,
+          dataBytes: raw.length,
+          parse: 'ok',
+          truncated: false,
+          metrics: [metric],
+          resources: [{ attrs: [] }],
+        },
+        exportIdentity: { node: '1', seq: index + 1 },
+      }
+      fs.writeFileSync(path.join(observer.directory, `push-${requestKey}.bin`), raw)
+      fs.writeFileSync(path.join(observer.directory, `raw-${hash}.bin`), raw)
+      fs.writeFileSync(
+        path.join(observer.directory, `decoded-${requestKey}.json`),
+        JSON.stringify(decoded)
+      )
+      fs.writeFileSync(
+        path.join(observer.directory, `decoder-${index + 1}.json`),
+        JSON.stringify({
+          rawSha256: hash,
+          code: 0,
+          signal: null,
+          line: '4.3.1',
+          stdout:
+            JSON.stringify({ verified: true, line: '4.3.1' }) +
+            '\n' +
+            JSON.stringify(decoded.decoded) +
+            '\n',
+        })
+      )
+      rows.push(
+        row('1', index + 1, {
+          clientId: 'candidate',
+          dataBytes: raw.length,
+          dataSha256: hash,
+          truncated: false,
+        })
+      )
+      return {
+        type: 'request',
+        requestKey,
+        apiKey: 72,
+        apiVersion: 0,
+        uuid: ID,
+        clientId: 'candidate',
+        socketId: 1,
+        node: '1',
+        subscriptionId: 1,
+        terminating: false,
+        compressionType: 0,
+        metricsBytes: raw.length,
+        metricsSha256: hash,
+        writeAt,
+        response: { errorCode: 0, responseAt: writeAt + 1 },
+      }
+    })
+    fs.writeFileSync(
+      path.join(observer.directory, 'transcript.json'),
+      JSON.stringify({
+        records: [get, ...pushes],
+        sockets: [{ id: 1, kind: 'telemetry', closedAt: 4000 }],
+        failures: [],
+        cleanup: { children: 0, timers: 0, stillOpen: [], attached: 0 },
+      })
+    )
+    fs.writeFileSync(
+      path.join(directory, 'exports-1.jsonl'),
+      rows.map(JSON.stringify).join('\n') + '\n'
+    )
+    const rawControl = { uuid: rawUuid, transmittedBytes: 4097, errorCode: 118 }
+    const record = {
+      status: 'passed',
+      run: { stem: 'complete', line: '4.3.1' },
+      allowed: {},
+      zeroPushes: [],
+      pushes: pushes.map(({ requestKey }) => ({ owner, requestKey })),
+      results: {
+        uuid: ID,
+        rawControl,
+        candidate: {
+          expectedCodec: 0,
+          offered: [0],
+          samples: pushes.map((p) => ({
+            requestKey: p.requestKey,
+            rawBytes: p.metricsBytes,
+            transmittedBytes: p.metricsBytes,
+            compressionType: 0,
+            partialPoints: [],
+            pointIds: [0],
+          })),
+        },
+      },
+      oracles: {
+        rawControl: {
+          probeSha256: '139afdbec5034f7c1498b90306889fd918ae13097efee1ea9f435b03dcf9b1b1',
+          advertisement: { code: 0 },
+          vector: { vectors: { oversize: { hex: '00'.repeat(4097) } } },
+          control: {
+            code: 4,
+            signal: null,
+            lines: [
+              { errorCode: 0, fullyConsumed: true, clientInstanceId: rawUuid },
+              {
+                errorCode: 118,
+                fullyConsumed: true,
+                clientInstanceId: rawUuid,
+                sentBytes: 4097,
+                rawSha256: digest(Buffer.alloc(4097)),
+              },
+            ],
+          },
+        },
+      },
+    }
+    record.oracles.rawControl.advertisement.lines = [{ key71: [0, 0], key72: [0, 0] }]
+    for (const child of [
+      record.oracles.rawControl.advertisement,
+      record.oracles.rawControl.control,
+    ])
+      child.stdout = child.lines.map(JSON.stringify).join('\n') + '\n'
+    record.sidecars = persistEvidence({
+      name: 'telemetry-payload',
+      record,
+      directory,
+      observers: { [owner]: observer },
+    })
+    return record
+  }
+  /** @param {object} record archive @param {string} suffix JSON file suffix @param {Function} mutate change @returns {void} */
+  const rewrite = (record, suffix, mutate) => {
+    const item = record.sidecars.files.find((f) => f.path.endsWith(suffix))
+    const file = path.join(directory, item.path)
+    const json = JSON.parse(fs.readFileSync(file))
+    mutate(json)
+    const bytes = Buffer.from(JSON.stringify(json))
+    fs.writeFileSync(file, bytes)
+    item.bytes = bytes.length
+    item.sha256 = digest(bytes)
+  }
+  test('verifies all accepted Pushes and their byte/decode/sink relationships', () => {
+    expect(() => verifyScenario(fixture(), directory)).not.toThrow()
+  })
+  test.each([
+    'omitted',
+    'extra',
+    'extra-successful',
+    'raw-decode',
+    'transmitted-raw',
+    'contradicted-size',
+    'contradicted-point',
+    'early-push',
+  ])('rejects %s with otherwise valid refreshed sidecar hashes', (change) => {
+    const record = fixture()
+    if (change === 'omitted') record.pushes.pop()
+    else if (change === 'extra')
+      record.pushes.push({ owner: 'producer-candidate', requestKey: 'r99' })
+    else if (change === 'extra-successful')
+      rewrite(record, '/transcript.json', (t) => {
+        t.records.push({ ...t.records.find((r) => r.apiKey === 72), requestKey: 'r99' })
+      })
+    else if (change === 'raw-decode')
+      rewrite(record, '/decoded-r3.json', (d) => {
+        d.decoded.dataSha256 = 'f'.repeat(64)
+      })
+    else if (change === 'transmitted-raw')
+      rewrite(record, '/decoded-r3.json', (d) => {
+        d.rawSha256 = 'f'.repeat(64)
+      })
+    else if (change === 'contradicted-size') record.results.candidate.samples[1].rawBytes++
+    else if (change === 'contradicted-point')
+      rewrite(record, '/decoded-r3.json', (d) => {
+        d.decoded.metrics[0].points[0].asDouble = '1.0'
+      })
+    else
+      rewrite(record, '/transcript.json', (t) => {
+        t.records.find((r) => r.requestKey === 'r3').writeAt = 1950
+      })
+    expect(() => verifyScenario(record, directory)).toThrow()
   })
 })

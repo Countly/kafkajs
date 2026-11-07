@@ -308,3 +308,41 @@ Telemetry is opt-in through `enableMetricsPush`. Benchmark evidence compares dis
 A20/A31 measured acceptance is pending P10 CI measurements. This driver-only delivery still requires F08 configured-outcome evidence, an accepted previous baseline, final public lifecycle delivery and the reviewed broker-guard adapter.
 
 The benchmark suite uses separate request, serialization and delivery workloads. It keeps message counts separate from batch callbacks and actual delivery-gap samples. Noise controls, full identity checks and same-path overhead controls must pass before a measured comparison is valid. The driver spec checks correctness without asserting elapsed-time limits. See the Testing guide for session evidence and CI execution. No measured tuning recommendation follows from a broker-free test pass.
+
+## Configured checks and Java interoperability
+
+Telemetry remains disabled unless enableMetricsPush is true. The configured
+reporter fixture exercises subscription replacement, literal prefix selection,
+empty polling, custom numeric snapshots and bounded compressed payloads.
+An empty matching subscription and a broker without an exporter are different
+conditions. A nonmatching prefix can send a zero-byte Push with no export row;
+an empty requested list polls without Push. Wire evidence distinguishes them.
+
+| Designated fixture | Evidence required |
+|---|---|
+| Configured Kafka 4.3.1 and 4.2.2 | Accepted JS wire requests, complete independent decoding and matching reporter exports |
+| Base Kafka 4.3.1, 4.2.2, 4.1.2 and 4.0.2 without exporter (4.4.0 as additional coverage) | Actual missing telemetry advertisements and no extra telemetry traffic or connection; supported foreground operations remain usable |
+| Java client 4.3.1 producer, consumer and admin | Distinct stable instance IDs, common subscription semantics, each role's independently decoded final and natural child exit |
+
+These are fixture-specific checks, not a claim that an older broker version can
+never support telemetry. Unsupported ShareConsumer connections retain their own
+capability error. Tests of telemetry do not require unsupported share success.
+The designated lines, the 4.0.2 floor and Node 22, 24 and 26 are judged by the
+CI lanes. Only retained CI receipts establish an observed result; readiness or
+a listed scenario is not a passing result.
+
+Java roles submit active foreground work before close, and each role's own UUID
+must have a terminating export. Process exit alone is insufficient. Java and JS
+need not emit identical values, windows, scopes or timestamps. JS payloads use
+captured successful responses plus a full independent decode and sink join;
+the narrow Java comparison uses complete independent broker exports and the
+broker's validation-before-export acceptance path. No Java response capture or
+compressed size is inferred from an export.
+
+Foreground checks compare the durable log, raw committed next offsets and
+handler invocations independently. Share checks use broker acknowledgements:
+the accepted prefix remains terminal and the released remainder follows its
+existing redelivery rules. Telemetry loss does not grant extra ordinary handler
+replay. Immediate public reconnect retains the object's UUID and requires new
+accepted normal pushes; a successful subscription Get alone is insufficient.
+Full repeated-close resource and soak acceptance is a separate check.
