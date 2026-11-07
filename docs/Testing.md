@@ -128,6 +128,47 @@ Observer, serialization, compression and logging failures are checked against th
 
 The mandatory O17–O19 meter/span/context/getter/logger containment matrix runs in `otel/test/failureContainment.test.js` through `npm run test:otel` and the CI `otel` job. The runner installs the packed root candidate and optional dependencies before executing the matrix; a missing or nonidentical candidate fails the lane. The plain unit lane runs the remaining telemetry schedules without requiring an OTel installation.
 
+### Telemetry scenario evidence
+
+Each telemetry scenario runs in its own CI lane, `npm run test:group:telemetry-prefix`,
+`-custom`, `-payload`, `-unsupported`, `-java`, `-outcomes` or `-shutdown`, which
+selects one exact file and one top-level title. Every lane owns one selected
+Compose file and a unique project under the isolated ownership contract; no raw
+broker wrapper or second cleanup authority is used. Filtered sibling titles may
+be pending, but the selected title must pass exactly once. Java and shutdown
+children must exit naturally; watchdog termination is failure.
+
+Capture zero-byte Push on the wire, prefix replacement through its actual
+subscription error/Get cycle, later write-fenced snapshots after unregistration,
+and both raw and transmitted payload sizes. The 4096-byte fixture also uses an
+independent 4097-byte raw control with its own UUID to verify size refusal.
+Strict seam recovery receipts remain labelled separately from live responses.
+
+Java producer, consumer and admin roles use the pinned 4.3.1 client and codec
+cache, a 1000 ms common subscription and complete independent decoding. Each
+role requires its own terminating export across all broker sinks and natural
+exit within 10000 ms of closing. An absent JDK or missing final cannot be a
+passing interoperability check. Offline client-check opens no network and does
+not replace this evidence.
+
+Foreground evidence has three independent dimensions: durable record identities,
+raw broker commits or share acknowledgements, and actual handler entries. Stable
+telemetry-only faults permit no extra ordinary delivery. Socket faults select
+the captured telemetry transport, never every connection to a broker endpoint.
+Immediate public reconnect runs before any wait for broker cache retirement;
+new normal pushes and independent broker disconnect/cache evidence are required.
+
+Any expiry, abort or cleanup failure taints the spec run and prevents later
+cases from passing. The lane verifies the stamped evidence while the brokers are
+up, then removes only its recorded project resources and proves their absence.
+Keep the existing share shutdown case and its own fixture, lock and
+acknowledgement contract. The ordinary telemetry quiet-path floor case belongs
+in the existing broker floor file after the earlier cases.
+
+Other broker lines, the 4.0.2 floor, Node 22, 24 and 26 and measured benchmarks
+are judged by the CI lanes. Twenty-cycle resource, short-soak and the program's
+long-run evidence retain their separate owners.
+
 ## Integration tests
 
 Most of the test suite talks to a real Kafka cluster. `npm test` runs `npm run lint`, `npm run compat:check` and `npm run protocol:check`, boots the cluster, runs everything, and tears the cluster down again — it's a convenient local shortcut, but it is not what CI runs.

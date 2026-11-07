@@ -300,3 +300,41 @@ The local live guard owns its reserved project. Ephemeral CI uses a unique proje
 Telemetry work belongs to the connection episode that created it. Disconnect invalidates ordinary telemetry work immediately. An eligible captured close may send one final push on its already connected telemetry socket, within the original remaining close budget and the telemetry limit of 1000 ms. A zero close budget sends no final push. This best-effort attempt has no delivery guarantee and does not reconnect or retry.
 
 An explicit reconnect keeps the accepted client instance ID and uses fresh local authority. A successful subscription response alone does not establish a reopened stream; the normal push must succeed. Telemetry observers, encoders, codecs and loggers do not change foreground results, rejections or handler invocation counts. The lifecycle checks include late callbacks and repeated identity values. Application rebalance-hook failures retain their documented behavior.
+
+## Configured checks and Java interoperability
+
+Telemetry remains disabled unless enableMetricsPush is true. The configured
+reporter fixture exercises subscription replacement, literal prefix selection,
+empty polling, custom numeric snapshots and bounded compressed payloads.
+An empty matching subscription and a broker without an exporter are different
+conditions. A nonmatching prefix can send a zero-byte Push with no export row;
+an empty requested list polls without Push. Wire evidence distinguishes them.
+
+| Designated fixture | Evidence required |
+|---|---|
+| Configured Kafka 4.3.1 and 4.2.2 | Accepted JS wire requests, complete independent decoding and matching reporter exports |
+| Base Kafka 4.3.1, 4.2.2, 4.1.2 and 4.0.2 without exporter (4.4.0 as additional coverage) | Actual missing telemetry advertisements and no extra telemetry traffic or connection; supported foreground operations remain usable |
+| Java client 4.3.1 producer, consumer and admin | Distinct stable instance IDs, common subscription semantics, each role's independently decoded final and natural child exit |
+
+These are fixture-specific checks, not a claim that an older broker version can
+never support telemetry. Unsupported ShareConsumer connections retain their own
+capability error. Tests of telemetry do not require unsupported share success.
+The designated lines, the 4.0.2 floor and Node 22, 24 and 26 are judged by the
+CI lanes. Only retained CI receipts establish an observed result; readiness or
+a listed scenario is not a passing result.
+
+Java roles submit active foreground work before close, and each role's own UUID
+must have a terminating export. Process exit alone is insufficient. Java and JS
+need not emit identical values, windows, scopes or timestamps. JS payloads use
+captured successful responses plus a full independent decode and sink join;
+the narrow Java comparison uses complete independent broker exports and the
+broker's validation-before-export acceptance path. No Java response capture or
+compressed size is inferred from an export.
+
+Foreground checks compare the durable log, raw committed next offsets and
+handler invocations independently. Share checks use broker acknowledgements:
+the accepted prefix remains terminal and the released remainder follows its
+existing redelivery rules. Telemetry loss does not grant extra ordinary handler
+replay. Immediate public reconnect retains the object's UUID and requires new
+accepted normal pushes; a successful subscription Get alone is insufficient.
+Full repeated-close resource and soak acceptance is a separate check.

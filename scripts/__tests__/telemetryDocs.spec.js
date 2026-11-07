@@ -298,3 +298,35 @@ describe('telemetry lifecycle documentation', () => {
     )
   })
 })
+
+describe('configured telemetry evidence documentation', () => {
+  const squeeze = (file) => read(file).replace(/\s+/g, ' ')
+
+  test('documents configured and unsupported fixtures without changing the opt-in', () => {
+    const document = squeeze('docs/ClientTelemetry.md')
+    expect(document).toContain('## Configured checks and Java interoperability')
+    expect(document).toContain('disabled unless enableMetricsPush is true')
+    expect(document).toContain('4.3.1, 4.2.2, 4.1.2 and 4.0.2 without exporter')
+    expect(document).toContain('raw committed next offsets')
+    expect(document).toContain('successful subscription Get alone is insufficient')
+  })
+
+  test('keeps Java final, natural exit and independent evidence as separate conditions', () => {
+    const fixture = squeeze('scripts/e2e/telemetry/README.md')
+    expect(fixture).toContain('A missing final fails the scenario')
+    expect(fixture).toContain('natural exit within 10000 ms')
+    expect(fixture).toContain('TELEMETRY_INTEROP_CACHE')
+    expect(fixture).toContain('Keep the retained fixture manifest unchanged')
+    const testing = squeeze('docs/Testing.md')
+    expect(testing).toContain('### Telemetry scenario evidence')
+    expect(testing).toContain('independent 4097-byte raw control')
+    expect(testing).toContain('taints the spec run')
+  })
+
+  test('lands the interoperability tooling note with no runtime migration item', () => {
+    expect(squeeze('CHANGELOG.md')).toContain(
+      'Verify client telemetry updates, custom metrics, payload limits, Java interoperability, unsupported brokers and unchanged foreground outcomes.'
+    )
+    expect(squeeze('docs/ClientTelemetry.md')).toContain('Telemetry remains disabled')
+  })
+})
