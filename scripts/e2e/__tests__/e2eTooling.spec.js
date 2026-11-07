@@ -1169,50 +1169,122 @@ describe('broker telemetry fixture', () => {
     }
     exact('test:group:telemetry-reporter', '^(reporter export|reporter no-resource control)$')
     exact('test:group:telemetry-base', '^reporter no-plugin control$')
-    const ci = read('.github/workflows/ci.yml').toString()
-    const job = ci.slice(ci.indexOf('\n  telemetry:'))
-    const rows = [
-      ...job.matchAll(
-        /-\s*\{\s*node:\s*(\d+),\s*kafka:\s*([\d.]+),\s*group:\s*([\w-]+),\s*compose:\s*([\w.-]+),?\s*\}/g
-      ),
-    ].map(([, node, kafka, group, compose]) => ({ node: Number(node), kafka, group, compose }))
-    for (const node of [22, 24, 26]) {
-      for (const kafka of ['4.3.1', '4.2.2'])
-        expect(rows).toContainEqual({
-          node,
-          kafka,
-          group: 'telemetry-reporter',
-          compose: 'docker-compose.telemetry.yml',
-        })
-      for (const kafka of ['4.3.1', '4.2.2', '4.1.2', '4.0.2'])
-        expect(rows).toContainEqual({
-          node,
-          kafka,
-          group: 'telemetry-base',
-          compose: 'docker-compose.yml',
-        })
-    }
-    for (const identity of ['github.run_id', 'github.run_attempt', 'strategy.job-index'])
-      expect(job).toContain(identity)
-    expect(job.match(/timeout-minutes:/g).length).toBeGreaterThanOrEqual(
-      job.match(/\brun:/g).length
+    // eslint-disable-next-line n/no-extraneous-require -- YAML parser is pinned by the ESLint/Jest toolchain
+    const yaml = require('js-yaml')
+    const parse = (file) => yaml.load(read(file).toString())
+    const ci = parse('.github/workflows/ci.yml')
+    const gate = parse('.github/workflows/gate.yml')
+    const workflow = parse('.github/workflows/telemetry.yml')
+    expect(ci.jobs.telemetry.uses).toBe('./.github/workflows/telemetry.yml')
+    expect(ci.jobs.telemetry.with.full).toBe(false)
+    expect(gate.jobs.telemetry.uses).toBe('./.github/workflows/telemetry.yml')
+    expect(gate.jobs.telemetry.with.full).toBe(true)
+    expect(gate.jobs.telemetry.needs).toBe('plan')
+    expect(gate.jobs.verdict.needs).toContain('telemetry')
+    const summary = gate.jobs.verdict.steps.find((step) => step.name === 'Summarize results')
+    expect(summary.env.TELEMETRY_RESULT).toBe('$' + '{{ needs.telemetry.result }}')
+    expect(summary.run).toContain(
+      "rows.push({ id: 'telemetry-full', result: process.env.TELEMETRY_RESULT })"
     )
-    expect(job).not.toContain('bash scripts/e2e/telemetry/build.sh')
-    expect(job).not.toContain('testWithKafka')
-    for (const command of [
-      'ci.js preflight',
-      'ci.js capture',
-      'ci.js stop',
-      'verifyEvidence(',
-      'bash scripts/e2e/telemetry/run.sh verify "$KAFKA_VERSION"',
+    expect(gate.jobs.plan.if).toBe(
+      "github.event_name != 'pull_request' || !github.event.pull_request.draft"
+    )
+    expect(gate.on.pull_request.types).toEqual([
+      'opened',
+      'synchronize',
+      'reopened',
+      'ready_for_review',
     ])
-      expect(job).toContain(command)
+    expect(gate.on.push.branches).toEqual(['master'])
+    expect(gate.on).toHaveProperty('workflow_dispatch')
+    const plan = workflow.jobs.plan.steps.find((step) => step.id === 'plan')
+    const source = plan.run.match(/node <<'NODE'\n([\s\S]*?)\nNODE/)[1]
+    const vm = require('vm')
+    const verdictSource = summary.run.match(/node <<'NODE'\n([\s\S]*?)\nNODE/)[1]
+    for (const [status, expected] of [
+      ['success', undefined],
+      ['failure', 1],
+      ['skipped', 1],
+    ]) {
+      const process = {
+        env: {
+          MATRIX: '{"include":[]}',
+          PLAN_RESULT: 'success',
+          CHECK_RESULT: 'success',
+          TELEMETRY_RESULT: status,
+        },
+      }
+      vm.runInNewContext(verdictSource, { process, require: () => ({ appendFileSync: () => {} }) })
+      expect(process.exitCode).toBe(expected)
+    }
+    const catalogue = (full) => {
+      let output
+      vm.runInNewContext(source, {
+        process: { env: { FULL: String(full), GITHUB_OUTPUT: 'output' } },
+        require: () => ({
+          appendFileSync: (file, value) => {
+            output = value
+          },
+        }),
+      })
+      return JSON.parse(output.trim().slice('matrix='.length)).include
+    }
+    expect(catalogue(false)).toEqual([
+      {
+        node: 24,
+        kafka: '4.3.1',
+        group: 'telemetry-reporter',
+        compose: 'docker-compose.telemetry.yml',
+      },
+      { node: 24, kafka: '4.3.1', group: 'telemetry-base', compose: 'docker-compose.yml' },
+      { node: 24, kafka: '4.4.0', group: 'telemetry-base', compose: 'docker-compose.yml' },
+    ])
+    const required = [22, 24, 26].flatMap((node) => [
+      ...['4.3.1', '4.2.2'].map((kafka) => ({
+        node,
+        kafka,
+        group: 'telemetry-reporter',
+        compose: 'docker-compose.telemetry.yml',
+      })),
+      ...['4.3.1', '4.2.2', '4.1.2', '4.0.2', '4.4.0'].map((kafka) => ({
+        node,
+        kafka,
+        group: 'telemetry-base',
+        compose: 'docker-compose.yml',
+      })),
+    ])
+    expect(catalogue(true)).toEqual(required)
+    expect(new Set(catalogue(true).map(JSON.stringify)).size).toBe(21)
+    const job = workflow.jobs.telemetry
+    for (const identity of ['github.run_id', 'github.run_attempt', 'strategy.job-index'])
+      expect(job.env.COMPOSE_PROJECT_NAME).toContain(identity)
+    const steps = job.steps.filter((step) => step.run)
+    for (const step of steps) expect(step['timeout-minutes']).toBeGreaterThan(0)
+    const position = (text) => steps.findIndex((step) => step.run.includes(text))
+    const ordered = [
+      'run.sh verify',
+      'ci.js preflight',
+      'docker compose -f "$COMPOSE_FILE" pull',
+      'docker compose -f "$COMPOSE_FILE" up',
+      'ci.js capture',
+      'test:group:',
+      'verifyEvidence(',
+      'ci.js stop',
+    ]
+    const positions = ordered.map(position)
+    expect(positions.every((index) => index >= 0)).toBe(true)
+    expect([...positions].sort((a, b) => a - b)).toEqual(positions)
+    const stop = steps[position('ci.js stop')]
+    expect(stop.if).toBe('always()')
+    expect(stop.run).toContain('timeout -k 5s 150s')
+    expect(job.steps.at(-1).if).toBe('always()')
+    expect(steps[position('run.sh verify')]['timeout-minutes']).toBeGreaterThanOrEqual(5)
+    const serialized = JSON.stringify(job)
+    expect(serialized).not.toContain('build.sh')
+    expect(serialized).not.toContain('testWithKafka')
     const owner = read(fixture + 'ci.js').toString()
     expect(owner).toContain("'down', '-v', '--remove-orphans'")
     for (const type of ['containers', 'networks', 'volumes']) expect(owner).toContain(type)
-    expect(ci.indexOf('Verify telemetry evidence before teardown')).toBeLessThan(
-      ci.indexOf('Stop owned project')
-    )
-    expect(ci).not.toMatch(/forceExit|docker (pull|system prune)/)
+    expect(serialized).not.toMatch(/forceExit|docker (pull|system prune)/)
   })
 })

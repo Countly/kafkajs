@@ -4,7 +4,7 @@ const net = require('net')
 const path = require('path')
 const { performance } = require('perf_hooks')
 const { Kafka, logLevel, KafkaJSTelemetryError } = require('../../../index')
-const { writeEvidence } = require('../../../testHelpers/e2eEvidence')
+const { runCase } = require('../../../scripts/e2e/telemetry/evidence')
 const {
   TelemetryExportReader,
   TelemetryWireObserver,
@@ -32,63 +32,6 @@ const PREFIX = 'org.apache.kafka.'
 const ZERO_UUID = '00000000-0000-0000-0000-000000000000'
 const UUID_FORMAT = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const UINT64_MAX = 2n ** 64n - 1n
-
-/**
- * Owns the resources of one case: tasks run last-in first-out, all of them, whatever fails.
- */
-class Cleanup {
-  #tasks = []
-
-  /**
-   * @param {function():Promise<void>|void} task released when the case ends
-   */
-  defer(task) {
-    this.#tasks.push(task)
-  }
-
-  /**
-   * Runs every task and rethrows the case failure first, then the cleanup failures in order.
-   * @param {boolean} failed whether the case body threw
-   * @param {*} primary what the body threw, possibly a falsy value
-   * @returns {Promise<void>} when the case and its cleanup both succeeded
-   * @throws {*} the single failure, or an AggregateError of all of them
-   */
-  async run(failed, primary) {
-    const errors = failed ? [primary] : []
-    while (this.#tasks.length) {
-      try {
-        await this.#tasks.pop()()
-      } catch (error) {
-        errors.push(error)
-      }
-    }
-    if (errors.length === 1) throw errors[0]
-    if (errors.length) throw new AggregateError(errors, 'Telemetry case and cleanup failed')
-  }
-}
-
-/**
- * @param {function(Cleanup):Promise<void>} body the case
- * @returns {Promise<void>} after the body and all its cleanup
- */
-const runCase = async (body) => {
-  const cleanup = new Cleanup()
-  let failed = false
-  let primary
-  let evidence
-  try {
-    await body(cleanup, (value) => {
-      evidence = value
-    })
-  } catch (error) {
-    failed = true
-    primary = error
-  }
-  await cleanup.run(failed, primary)
-  const { persistEvidence } = require('../../../scripts/e2e/telemetry/evidence')
-  const manifest = persistEvidence(evidence)
-  writeEvidence(evidence.name, { ...evidence.record, status: 'passed', sidecars: manifest })
-}
 
 /**
  * @param {Array<function():Promise<*>>} tasks started together
@@ -141,7 +84,7 @@ const setup = async (mode, cleanup) => {
   if (!line) throw new Error('KAFKA_VERSION must name the broker line')
   if (!directory || !path.isAbsolute(directory))
     throw new Error('TELEMETRY_EVIDENCE_DIR must name the absolute run directory')
-  const stem = 'telemetry-reporter-' + crypto.randomBytes(8).toString('hex')
+  const stem = cleanup.evidence.record.run.stem
   const kafka = new Kafka({
     clientId: stem + '-aux',
     brokers: PORTS[mode].map((port) => `localhost:${port}`),
@@ -168,6 +111,22 @@ const setup = async (mode, cleanup) => {
 const buildClients = ({ mode, stem, line, directory, clock, enabled, suffix = '' }, cleanup) => {
   const observers = {}
   const clients = {}
+  cleanup.defer(() =>
+    settle(
+      Object.values(observers).map((observer) => () => {
+        const unanswered = observer
+          .readTranscript()
+          .filter((r) => r.apiKey === 72 && r.terminating && !r.response)
+          .map((r) => r.requestKey)
+        observer.assertClean({ allowUnanswered: unanswered })
+      })
+    )
+  )
+  cleanup.defer(() => settle(Object.values(observers).map((observer) => () => observer.dispose())))
+  let closing
+  const closeAll = () =>
+    (closing ??= settle(Object.values(clients).map((client) => () => client.disconnect())))
+  cleanup.defer(closeAll)
   for (const kind of KINDS) {
     const observer = new TelemetryWireObserver({
       directory,
@@ -177,6 +136,7 @@ const buildClients = ({ mode, stem, line, directory, clock, enabled, suffix = ''
       owner: kind + suffix,
     })
     observers[kind] = observer
+    cleanup.evidence.observers[kind + suffix] = observer
     const kafka = new Kafka({
       clientId: `${stem}-${kind}${suffix}`,
       brokers: PORTS[mode].map((port) => `localhost:${port}`),
@@ -203,22 +163,6 @@ const buildClients = ({ mode, stem, line, directory, clock, enabled, suffix = ''
         rackId: RACK,
       })
   }
-  cleanup.defer(() =>
-    settle(
-      KINDS.map((kind) => async () => {
-        const observer = observers[kind]
-        const unanswered = observer
-          .readTranscript()
-          .filter((r) => r.type === 'request' && r.apiKey === 72 && r.terminating && !r.response)
-          .map((r) => r.requestKey)
-        observer.assertClean({ allowUnanswered: unanswered })
-      })
-    )
-  )
-  cleanup.defer(() => settle(KINDS.map((kind) => () => observers[kind].dispose())))
-  let closing
-  const closeAll = () => (closing ??= settle(KINDS.map((kind) => () => clients[kind].disconnect())))
-  cleanup.defer(closeAll)
   return { observers, clients, closeAll }
 }
 
@@ -367,7 +311,7 @@ const joinNormal = (observer, events, knownAfter) => {
 live(
   'reporter export',
   () =>
-    runCase(async (cleanup, publish) => {
+    runCase('telemetry-reporter', async (cleanup, publish, attempt) => {
       const state = await setup('configured', cleanup)
       const { stem, line, directory, clock, aux } = state
       const reader = new TelemetryExportReader(directory)
@@ -413,12 +357,16 @@ live(
         match: `client_id=^${stem}-(producer|consumer|admin|share)$`,
       }
       const results = {}
+      attempt.record.results = results
 
       await withTelemetryResource(aux, { name: stem, entries }, async () => {
+        attempt.stage = 'capture'
         const start = clock.now()
         const deadline = start + WINDOW_MS
+        results.window = { start, deadline }
         await settle(KINDS.map((kind) => () => clients[kind].connect()))
         const ids = {}
+        attempt.record.uuids = ids
         await settle(
           KINDS.map((kind) => async () => {
             ids[kind] = await clients[kind].clientInstanceId({ timeout: 3000 })
@@ -481,6 +429,7 @@ live(
         )
         expect(clock.now()).toBeLessThanOrEqual(deadline)
         const controlledPushes = adminAfter(controlled).slice(0, 3)
+        attempt.stage = 'verification'
         const decodedByRequest = Object.fromEntries(KINDS.map((kind) => [kind, new Map()]))
         const wire = observers.admin.normalRequests({ after: checkpoint })
         await closeAll()
@@ -610,6 +559,7 @@ live(
           cluster: controlledCluster,
           knownAfter,
           checkpoint,
+          controlledAt: controlled,
           requestEvents,
           wire,
           requests: controlRequests,
@@ -653,7 +603,7 @@ live(
 live(
   'reporter no-resource control',
   () =>
-    runCase(async (cleanup, publish) => {
+    runCase('telemetry-reporter-no-resource', async (cleanup, publish, attempt) => {
       const state = await setup('configured', cleanup)
       const { stem, line, directory, clock, aux } = state
       const { observers, clients, closeAll } = buildClients(
@@ -661,7 +611,9 @@ live(
         cleanup
       )
       await settle(KINDS.map((kind) => () => clients[kind].connect()))
+      attempt.stage = 'capture'
       const ids = {}
+      attempt.record.uuids = ids
       await settle(
         KINDS.map((kind) => async () => {
           ids[kind] = await clients[kind].clientInstanceId({ timeout: 3000 })
@@ -713,7 +665,7 @@ live(
 live(
   'reporter no-plugin control',
   () =>
-    runCase(async (cleanup, publish) => {
+    runCase('telemetry-reporter-no-plugin', async (cleanup, publish, attempt) => {
       const state = await setup('base', cleanup)
       const { stem, line, directory, clock } = state
       const on = buildClients(
@@ -739,8 +691,11 @@ live(
           }
         }
       }
+      attempt.stage = 'capture'
       const enabled = {}
       const disabled = {}
+      attempt.record.outcomes = enabled
+      attempt.record.disabledOutcomes = disabled
       await settle(
         KINDS.flatMap((kind) => [
           async () => {

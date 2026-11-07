@@ -3,6 +3,7 @@ const crypto = require('crypto')
 const fs = require('fs')
 const path = require('path')
 const { execFileSync } = require('child_process')
+const { performance } = require('perf_hooks')
 
 /**
  * Owns one unique Compose project on an ephemeral CI runner. Preflight must succeed before any
@@ -13,7 +14,7 @@ class CiOwnership {
    * @param {object} [options] environment and Docker execution seam for offline controls
    * @throws {Error} outside CI, for an unsafe project name or an unregistered Compose file
    */
-  constructor({ env = process.env, docker } = {}) {
+  constructor({ env = process.env, docker, now = () => performance.now() } = {}) {
     assert.equal(env.CI, 'true', 'Isolated ownership is CI-only')
     assert(
       /^telemetry-[a-z0-9-]+$/.test(env.COMPOSE_PROJECT_NAME),
@@ -25,33 +26,51 @@ class CiOwnership {
     this.file = env.COMPOSE_FILE
     this.directory = env.TELEMETRY_EVIDENCE_DIR
     this.receiptFile = path.resolve('.tmp/e2e/telemetry-ownership.json')
+    this.now = now
+    this.commandDeadline = Infinity
     this.docker =
       docker ||
-      ((args) =>
-        execFileSync('timeout', ['-k', '5s', '30s', 'docker', ...args], {
+      ((args, { timeoutMs }) =>
+        execFileSync('timeout', ['-k', '5s', `${(timeoutMs - 5000) / 1000}s`, 'docker', ...args], {
           encoding: 'utf8',
-          timeout: 36000,
+          timeout: timeoutMs,
           maxBuffer: 4 * 1024 * 1024,
           env,
         }))
   }
 
   /**
+   * Executes within the current shared phase budget, including process kill grace.
+   * @param {string[]} args Docker arguments
+   * @returns {string} bounded command output
+   * @throws {Error} when no command budget remains or Docker fails
+   */
+  run(args) {
+    const timeoutMs = Math.min(35000, Math.floor(this.commandDeadline - this.now()))
+    assert(timeoutMs > 5000, 'Cleanup command budget exhausted')
+    return this.docker(args, { timeoutMs })
+  }
+
+  /**
+   * @param {function(string,string[]):void} [onKind] persists partial inventories
    * @returns {object} all containers, networks and volumes with this exact Compose project label
    * @throws {Error} if any bounded Docker query fails
    */
-  inventory() {
+  inventory(onKind = () => {}) {
     const filter = ['--filter', `label=com.docker.compose.project=${this.project}`]
-    const list = (args) =>
-      this.docker([...args, ...filter])
+    const list = (kind, args) => {
+      const values = this.run([...args, ...filter])
         .trim()
         .split(/\s+/)
         .filter(Boolean)
         .sort()
+      onKind(kind, values)
+      return values
+    }
     return {
-      containers: list(['ps', '-aq', '--no-trunc']),
-      networks: list(['network', 'ls', '-q', '--no-trunc']),
-      volumes: list(['volume', 'ls', '-q']),
+      containers: list('containers', ['ps', '-aq', '--no-trunc']),
+      networks: list('networks', ['network', 'ls', '-q', '--no-trunc']),
+      volumes: list('volumes', ['volume', 'ls', '-q']),
     }
   }
 
@@ -91,11 +110,11 @@ class CiOwnership {
     const inventory = this.inventory()
     this.empty(inventory)
     assert.equal(
-      this.docker(['ps', '-aq', '--filter', 'label=custom.project=kafkajs']).trim(),
+      this.run(['ps', '-aq', '--filter', 'label=custom.project=kafkajs']).trim(),
       '',
       'Conflicting broker labels'
     )
-    const config = this.docker([
+    const config = this.run([
       'compose',
       '-p',
       this.project,
@@ -138,30 +157,45 @@ class CiOwnership {
    * @throws {Error} on a failed inventory or inspection; recorded identities are never discarded
    */
   journal(receipt) {
-    const inventory = this.inventory()
-    const containers = inventory.containers.length
-      ? JSON.parse(this.docker(['inspect', ...inventory.containers]))
-      : []
-    const volumes = containers.flatMap((container) =>
-      (container.Mounts || []).filter((mount) => mount.Type === 'volume').map((mount) => mount.Name)
-    )
-    const networks = containers.flatMap((container) =>
-      Object.values(container.NetworkSettings?.Networks || {}).map((network) => network.NetworkID)
-    )
-    receipt.owned = Object.fromEntries(
-      Object.entries(inventory).map(([kind, values]) => [
-        kind,
-        [
-          ...new Set([
-            ...(receipt.owned?.[kind] || []),
-            ...values,
-            ...(kind === 'volumes' ? volumes : kind === 'networks' ? networks : []),
-          ]),
-        ].sort(),
-      ])
-    )
+    receipt.journalComplete = false
     this.save(receipt)
-    return containers
+    try {
+      const inventory = this.inventory((kind, values) => {
+        receipt.owned ||= { containers: [], networks: [], volumes: [] }
+        receipt.owned[kind] = [...new Set([...receipt.owned[kind], ...values])].sort()
+        this.save(receipt)
+      })
+      const containers = inventory.containers.length
+        ? JSON.parse(this.run(['inspect', ...inventory.containers]))
+        : []
+      const volumes = containers.flatMap((container) =>
+        (container.Mounts || [])
+          .filter((mount) => mount.Type === 'volume')
+          .map((mount) => mount.Name)
+      )
+      const networks = containers.flatMap((container) =>
+        Object.values(container.NetworkSettings?.Networks || {}).map((network) => network.NetworkID)
+      )
+      receipt.owned = Object.fromEntries(
+        Object.entries(inventory).map(([kind, values]) => [
+          kind,
+          [
+            ...new Set([
+              ...(receipt.owned?.[kind] || []),
+              ...values,
+              ...(kind === 'volumes' ? volumes : kind === 'networks' ? networks : []),
+            ]),
+          ].sort(),
+        ])
+      )
+      receipt.journalComplete = true
+      this.save(receipt)
+      return containers
+    } catch (error) {
+      receipt.journalError ||= error.message
+      this.save(receipt)
+      throw error
+    }
   }
 
   /**
@@ -185,7 +219,7 @@ class CiOwnership {
     for (const container of containers) {
       assert.equal(container.Config.Labels['com.docker.compose.project'], this.project)
       assert.equal(container.State.Running, true)
-      const [image] = JSON.parse(this.docker(['image', 'inspect', container.Image]))
+      const [image] = JSON.parse(this.run(['image', 'inspect', container.Image]))
       assert.equal(image.Id, container.Image)
       if (configured)
         assert(
@@ -194,13 +228,13 @@ class CiOwnership {
           ),
           'Broker image digest mismatch'
         )
-      const digest = this.docker([
+      const digest = this.run([
         'exec',
         container.Id,
         'sha256sum',
         '/opt/kafka/config/server.properties',
       ]).split(/\s+/)[0]
-      const version = this.docker([
+      const version = this.run([
         'exec',
         container.Id,
         '/opt/kafka/bin/kafka-broker-api-versions.sh',
@@ -212,7 +246,7 @@ class CiOwnership {
       )
       let reporterSha256
       if (configured) {
-        reporterSha256 = this.docker([
+        reporterSha256 = this.run([
           'exec',
           container.Id,
           'sha256sum',
@@ -247,26 +281,32 @@ class CiOwnership {
     if (!fs.existsSync(this.receiptFile)) return
     const receipt = this.read()
     const compose = ['compose', '-p', this.project, '-f', this.file]
+    const start = this.now()
+    let failure = receipt.journalError ? new Error(receipt.journalError) : undefined
+    receipt.removalVerified = false
+    this.commandDeadline = start + 25000
     try {
       this.journal(receipt)
     } catch (error) {
+      failure = error
       receipt.journalError = error.message
     }
     try {
       fs.writeFileSync(
         path.join(path.dirname(this.receiptFile), 'compose.log'),
-        this.docker([...compose, 'logs', '--no-color'])
+        this.run([...compose, 'logs', '--no-color'])
       )
     } catch (error) {
       receipt.logError = error.message
     }
-    let failure
+    this.commandDeadline = start + 65000
     try {
-      this.docker([...compose, 'down', '-v', '--remove-orphans', '--timeout', '10'])
+      this.run([...compose, 'down', '-v', '--remove-orphans', '--timeout', '10'])
     } catch (error) {
-      failure = error
+      failure ||= error
       receipt.cleanupError = error.message
     }
+    this.commandDeadline = start + 130000
     try {
       receipt.removalProof = this.inventory()
       this.empty(receipt.removalProof)
@@ -277,16 +317,28 @@ class CiOwnership {
       }
       receipt.ownedRemovalProof = Object.fromEntries(
         Object.entries(all).map(([kind, args]) => {
-          const remaining = new Set(this.docker(args).trim().split(/\s+/).filter(Boolean))
+          const remaining = new Set(this.run(args).trim().split(/\s+/).filter(Boolean))
           return [kind, (receipt.owned?.[kind] || []).filter((id) => remaining.has(id))]
         })
       )
       this.empty(receipt.ownedRemovalProof)
-      receipt.removalVerified = true
+      assert.equal(receipt.journalComplete, true, 'Ownership journal incomplete')
+      receipt.removalVerified = !failure
     } catch (error) {
       failure ||= error
       receipt.removalError = error.message
     }
+    this.finalize(receipt)
+    if (failure) throw failure
+  }
+
+  /**
+   * Persists the final receipt without further subprocesses; twenty seconds remain before the outer kill.
+   * @param {object} receipt successful or failed removal result
+   * @returns {void}
+   * @throws {Error} on an evidence filesystem failure
+   */
+  finalize(receipt) {
     receipt.stoppedAt = new Date().toISOString()
     this.save(receipt)
     const bytes = fs.readFileSync(this.receiptFile)
@@ -320,7 +372,6 @@ class CiOwnership {
         2
       )
     )
-    if (failure) throw failure
   }
 }
 
