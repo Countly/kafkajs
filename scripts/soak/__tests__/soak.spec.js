@@ -12,6 +12,8 @@ const {
 } = require('../bounds')
 const {
   PROFILES,
+  TELEMETRY,
+  TelemetryResourceVerdict,
   WORKLOADS,
   Soak,
   createTopic,
@@ -571,7 +573,7 @@ describe('Soak > profiles', () => {
 
   describe('a profile of one phase', () => {
     const standalone = Object.entries(PROFILES)
-      .filter(([, phases]) => phases.length === 1)
+      .filter(([name, phases]) => name !== 'telemetry' && phases.length === 1)
       .map(([name, [{ ms }]]) => [name, ms])
 
     test.each(standalone)('%s runs long enough for six samples after the warm-up', (_, ms) => {
@@ -6631,4 +6633,320 @@ describe('Share soak complete original-owner schedules', () => {
     },
     120000
   )
+})
+
+describe('telemetry resource evidence', () => {
+  const snapshot = (bytes = 10000000, overrides = {}) => ({
+    memory: { retainedBytes: bytes },
+    registryDigest: 'retained-four-client-state',
+    identities: { timers: [], sockets: [], listeners: [1] },
+    ...overrides,
+  })
+  const run = () => ({
+    clientCount: 4,
+    baseline: snapshot(),
+    samples: Array.from({ length: 11 }, (_, i) => ({
+      atMs: 60000 + i * 30000,
+      snapshot: snapshot(),
+    })),
+    teardown: snapshot(),
+    cleanupMs: 120000,
+    measurementMs: 300000,
+  })
+  const evaluate = (input) => TelemetryResourceVerdict.evaluate(input)
+
+  test('registers the fixed telemetry profile and refuses shortened acceptance', () => {
+    expect(parseArgs(['--profile', 'telemetry'])).toEqual({
+      profile: 'telemetry',
+      phaseSeconds: null,
+    })
+    expect(PROFILES.telemetry).toEqual([{ name: 'telemetry', workload: 'telemetry', ms: 360000 }])
+    expect(() => parseArgs(['--profile', 'telemetry', '--phase-seconds', '1'])).toThrow('usage:')
+    expect(parseArgs(['--profile', 'producer-churn', '--phase-seconds', '1']).phaseSeconds).toBe(1)
+  })
+
+  test('holds the literal memory and timing limits and accepts complete flat evidence', () => {
+    expect(TELEMETRY).toEqual({
+      warmupMs: 60000,
+      measureMs: 300000,
+      cleanupMs: 120000,
+      caseMs: 540000,
+      exitMs: 10000,
+      sampleMs: 30000,
+      minSamples: 10,
+      slopeBytesPerMinute: 65536,
+      endpointBytes: 1048576,
+      activeBytes: 8388608,
+      closedBytes: 262144,
+      nativeBytes: 67108864,
+    })
+    expect(evaluate(run())).toMatchObject({
+      ok: true,
+      violations: [],
+      measured: { samples: 11, slopeBytesPerMinute: 0, endpointBytes: 0 },
+    })
+  })
+
+  test.each([
+    [
+      'missing memory',
+      (r) => {
+        delete r.samples[2].snapshot.memory
+      },
+      'post-GC sample shape or retained state',
+    ],
+    [
+      'missing baseline',
+      (r) => {
+        delete r.baseline.memory
+      },
+      'settled baseline and teardown',
+    ],
+    [
+      'missing identities',
+      (r) => {
+        delete r.teardown.identities
+      },
+      'identity roles',
+    ],
+    [
+      'same-count replacement',
+      (r) => {
+        r.teardown.identities.listeners = [2]
+      },
+      'quiet identity listeners',
+    ],
+    [
+      'extra event role',
+      (r) => {
+        r.teardown.identities.unexpected = []
+      },
+      'identity roles',
+    ],
+    [
+      'retained state changed',
+      (r) => {
+        r.teardown.registryDigest = 'other'
+      },
+      'retained descriptor and UUID baseline',
+    ],
+    [
+      'sample state changed',
+      (r) => {
+        r.samples[2].snapshot.registryDigest = 'other'
+      },
+      'post-GC sample shape or retained state',
+    ],
+    [
+      'too few samples',
+      (r) => {
+        r.samples.length = 9
+      },
+      'post-GC sample count',
+    ],
+    [
+      'short run',
+      (r) => {
+        r.samples.forEach((s, i) => {
+          s.atMs = 60000 + i
+        })
+      },
+      'measurement span',
+    ],
+    [
+      'duplicate timestamp',
+      (r) => {
+        r.samples[2].atMs = r.samples[1].atMs
+      },
+      'post-GC sample shape or retained state',
+    ],
+    [
+      'cleanup overflow',
+      (r) => {
+        r.cleanupMs = 120001
+      },
+      'cleanup budget',
+    ],
+    [
+      'closed transient overflow',
+      (r) => {
+        r.teardown.memory.retainedBytes += 4 * 262144 + 1
+      },
+      'closed transient ceiling',
+    ],
+    [
+      'active overflow',
+      (r) => {
+        r.samples[5].snapshot.memory.retainedBytes += 4 * 8388608 + 1
+      },
+      'active retained ceiling',
+    ],
+    [
+      'steep slope',
+      (r) => {
+        r.samples.forEach((s, i) => {
+          s.snapshot.memory.retainedBytes += i * (4 * 32768 + 1)
+        })
+      },
+      'retained slope',
+    ],
+    [
+      'last endpoint',
+      (r) => {
+        r.samples.at(-1).snapshot.memory.retainedBytes += 4 * 1048576 + 1
+      },
+      'retained endpoint',
+    ],
+  ])('rejects %s', (_name, change, label) => {
+    const input = run()
+    change(input)
+    expect(evaluate(input).violations).toContain(label)
+    expect(evaluate(input).ok).toBe(false)
+  })
+
+  test('accepts the closed transient and active ceilings at equality', () => {
+    const input = run()
+    input.teardown.memory.retainedBytes += 4 * 262144
+    input.samples.forEach((s) => {
+      s.snapshot.memory.retainedBytes += 4 * 8388608
+    })
+    expect(evaluate(input).ok).toBe(true)
+  })
+
+  test('does not change inherited profile definitions', () => {
+    expect(Object.keys(PROFILES)).toEqual([
+      'share-consumer',
+      'share-consumer-short',
+      'idle',
+      'member-churn',
+      'regex-topic-churn',
+      'outage',
+      'producer-churn',
+      'consumer-churn',
+      'first-run',
+      'telemetry',
+    ])
+    expect(PROFILES['producer-churn'].map(({ name, ms }) => [name, ms])).toEqual([
+      ['steady', 300000],
+      ['outage', 300000],
+      ['buffer-pressure', 300000],
+    ])
+  })
+})
+
+describe('single-client telemetry attribution', () => {
+  const make = () => {
+    const snapshot = () => ({
+      memory: { retainedBytes: 10000000, peakRss: 67108864 },
+      registryDigest: 'one-kind',
+      identities: { timers: [], sockets: [] },
+    })
+    return {
+      clientCount: 1,
+      baseline: snapshot(),
+      samples: Array.from({ length: 11 }, (_, i) => ({
+        atMs: 60000 + i * 30000,
+        snapshot: snapshot(),
+      })),
+      teardown: snapshot(),
+      cleanupMs: 120000,
+      measurementMs: 300000,
+    }
+  }
+
+  test('accepts the single-client peak at equality and rejects one byte over', () => {
+    const input = make()
+    expect(TelemetryResourceVerdict.evaluate(input).ok).toBe(true)
+    input.samples[4].snapshot.memory.peakRss++
+    expect(TelemetryResourceVerdict.evaluate(input).violations).toContain('single-client RSS peak')
+  })
+
+  test('refuses a missing native peak instead of treating it as zero', () => {
+    const input = make()
+    delete input.samples[4].snapshot.memory.peakRss
+    expect(TelemetryResourceVerdict.evaluate(input).violations).toContain('single-client RSS peak')
+  })
+})
+
+describe('telemetry sampler ownership', () => {
+  test('joins the existing teardown hook before applying the supplied verdict', async () => {
+    const order = []
+    const verdict = { ok: false, violations: ['held timer'] }
+    const soak = new Soak({
+      kafka: {},
+      phases: [],
+      context: {},
+      settleMs: 0,
+      probe: {
+        snapshot: async () => {
+          order.push('snapshot')
+          return { sockets: { open: 0 } }
+        },
+      },
+      clock: { now: () => 7 },
+      record: () => {},
+      beforeTeardown: async () => {
+        order.push('teardown')
+      },
+      judge: () => {
+        order.push('judge')
+        return verdict
+      },
+    })
+    expect(await soak.run()).toBe(verdict)
+    expect(order).toEqual(['snapshot', 'teardown', 'snapshot', 'judge'])
+  })
+
+  test('stops and joins the sampler at the workload boundary before its cleanup runs', async () => {
+    const rows = []
+    let tick = 0
+    let atBoundary
+    const soak = new Soak({
+      kafka: {},
+      phases: [{ name: 'telemetry', workload: 'telemetry', ms: 1 }],
+      context: {},
+      settleMs: 0,
+      sampleMs: 1,
+      warmupMs: 0,
+      probe: { snapshot: async () => ({ sockets: { open: 0 } }) },
+      clock: { now: () => ++tick },
+      record: (row) => rows.push(row),
+      workloads: {
+        telemetry: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 30))
+          await soak.endSampling()
+          atBoundary = rows.filter(({ kind }) => kind === 'sample').length
+          await new Promise((resolve) => setTimeout(resolve, 30))
+        },
+      },
+      judge: () => ({ ok: true, violations: [] }),
+    })
+    await soak.run()
+    expect(atBoundary).toBeGreaterThan(0)
+    expect(rows.filter(({ kind }) => kind === 'sample')).toHaveLength(atBoundary)
+  })
+})
+
+describe('telemetry measurement duration', () => {
+  test('refuses a shortened measurement even with eleven plausible samples', () => {
+    const snapshot = () => ({
+      memory: { retainedBytes: 10, peakRss: 20 },
+      registryDigest: 'same',
+      identities: { sockets: [] },
+    })
+    const input = {
+      clientCount: 1,
+      baseline: snapshot(),
+      teardown: snapshot(),
+      cleanupMs: 0,
+      measurementMs: 299999,
+      samples: Array.from({ length: 11 }, (_, i) => ({
+        atMs: 60000 + i * 30000,
+        snapshot: snapshot(),
+      })),
+    }
+    expect(TelemetryResourceVerdict.evaluate(input).violations).toContain('measurement duration')
+    input.measurementMs = 300000
+    expect(TelemetryResourceVerdict.evaluate(input).ok).toBe(true)
+  })
 })

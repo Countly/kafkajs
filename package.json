@@ -51,6 +51,7 @@
     "soak:first-run": "npm run test:kafka -- \"node --expose-gc scripts/soak/soak.js --profile first-run\"",
     "soak:producer-churn": "npm run test:kafka -- \"node --expose-gc scripts/soak/soak.js --profile producer-churn\"",
     "soak:consumer-churn": "npm run test:kafka -- \"node --expose-gc scripts/soak/soak.js --profile consumer-churn\"",
+    "soak:telemetry": "node --expose-gc scripts/soak/soak.js --profile telemetry",
     "test:group:broker": "jest --forceExit --testPathPatterns 'src/broker/.*'",
     "test:group:admin": "jest --forceExit --testPathPatterns 'src/admin/.*'",
     "test:group:producer": "jest --forceExit --testPathPatterns 'src/producer/.*'",

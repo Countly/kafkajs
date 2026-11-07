@@ -17,6 +17,10 @@ const sleep = require('../src/utils/sleep')
  * @property {Record<string, number>} [activeResources] what the event loop is still holding, by
  *   type (`Timeout`, `TCPSocketWrap`, ...)
  * @property {number} [heapUsed] bytes of the V8 heap in use after two collections
+ * @property {Record<string, number[]>} [identities] stable weak object IDs by caller-owned role;
+ *   repeated entries represent multiple registrations and are not deduplicated
+ * @property {{ heapUsed: number, external: number, retainedBytes: number,
+ *   rss: number, peakRss: number }} [memory] settled heap plus external, with separate RSS readings
  */
 
 /** The gap between the two collections that precede a heap reading, so finalizers have run. */
@@ -90,6 +94,10 @@ const settledHeap = async (gc, pause) => {
  *   fails the snapshot, so a probe never reports a count it did not read
  * @param {boolean} [sources.activeResources=false] count `process.getActiveResourcesInfo()` by
  *   type; real-timer runs only, a snapshot refuses under fake timers
+ * @param {() => Record<string, Iterable<object|Function>>} [sources.identities] currently owned
+ *   objects by role or emitter/event; sources own their bounded populations, not the probe
+ * @param {boolean} [sources.memory=false] collect twice and read heap plus external and RSS;
+ *   arrayBuffers is already included in external and is not added again
  * @param {boolean} [sources.heap=false] read the settled heap
  * @param {(() => void)|undefined} [sources.gc] a full collection; defaults to `global.gc`, which
  *   needs `node --expose-gc`
@@ -105,13 +113,38 @@ const createResourceProbe = ({
   obligationSize,
   shareState,
   activeResources = false,
+  identities,
+  memory = false,
   heap = false,
   gc = globalThis.gc,
   pause = sleep,
 } = {}) => {
-  if (heap && typeof gc !== 'function') {
+  if ((heap || memory) && typeof gc !== 'function') {
     throw new Error('Reading the heap needs a gc function: run node with --expose-gc')
   }
+
+  const issued = new WeakMap()
+  let nextIdentity = 0
+
+  /**
+   * Copies current resource identities without keeping their objects alive.
+   * @returns {Record<string, number[]>} sorted IDs with multiplicity preserved
+   * @throws {TypeError} for primitive entries, which cannot carry weak identity
+   */
+  const readIdentities = () =>
+    Object.fromEntries(
+      Object.entries(identities()).map(([role, objects]) => [
+        role,
+        [...objects]
+          .map((object) => {
+            if ((typeof object !== 'object' || object === null) && typeof object !== 'function')
+              throw new TypeError('Resource identity must be an object')
+            if (!issued.has(object)) issued.set(object, ++nextIdentity)
+            return issued.get(object)
+          })
+          .sort((a, b) => a - b),
+      ])
+    )
 
   return {
     /**
@@ -149,9 +182,21 @@ const createResourceProbe = ({
       if (activeResources) {
         snapshot.activeResources = activeResourceCounts()
       }
-      if (heap) {
-        snapshot.heapUsed = await settledHeap(gc, pause)
+      if (heap || memory) {
+        const heapUsed = await settledHeap(gc, pause)
+        if (heap) snapshot.heapUsed = heapUsed
+        if (memory) {
+          const usage = process.memoryUsage()
+          snapshot.memory = {
+            heapUsed: usage.heapUsed,
+            external: usage.external,
+            retainedBytes: usage.heapUsed + usage.external,
+            rss: usage.rss,
+            peakRss: process.resourceUsage().maxRSS * 1024,
+          }
+        }
       }
+      if (identities) snapshot.identities = readIdentities()
 
       return snapshot
     },

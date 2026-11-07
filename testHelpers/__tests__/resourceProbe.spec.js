@@ -213,3 +213,74 @@ describe('share resource sources', () => {
     })
   })
 })
+
+describe('resource identity and settled memory sources', () => {
+  test('detects replacement at the same resource count without retaining source objects', async () => {
+    let socket = {}
+    const probe = createResourceProbe({ identities: () => ({ sockets: [socket] }) })
+    const first = await probe.snapshot()
+    expect(first.identities.sockets).toHaveLength(1)
+    expect((await probe.snapshot()).identities).toEqual(first.identities)
+    socket = {}
+    const replacement = await probe.snapshot()
+    expect(replacement.identities.sockets).toHaveLength(1)
+    expect(replacement.identities.sockets).not.toEqual(first.identities.sockets)
+    expect(typeof replacement.identities.sockets[0]).toBe('number')
+  })
+
+  test('keeps multiplicity and event ownership while ignoring enumeration order', async () => {
+    const fn = () => {}
+    const other = () => {}
+    let sources = { 'listener:data': [fn, other, fn], 'listener:close': [fn] }
+    const probe = createResourceProbe({ identities: () => sources })
+    const first = await probe.snapshot()
+    expect(first.identities['listener:data']).toHaveLength(3)
+    sources = { 'listener:close': [fn], 'listener:data': [fn, fn, other] }
+    expect((await probe.snapshot()).identities).toEqual(first.identities)
+    sources = { 'listener:close': [other], 'listener:data': [fn, fn, other] }
+    expect((await probe.snapshot()).identities).not.toEqual(first.identities)
+  })
+
+  test('copies identity readings and refuses an unobservable primitive', async () => {
+    const list = [{}]
+    const probe = createResourceProbe({ identities: () => ({ jobs: list }) })
+    const first = await probe.snapshot()
+    list.length = 0
+    expect(first.identities.jobs).toHaveLength(1)
+    expect((await probe.snapshot()).identities.jobs).toEqual([])
+    list.push(1)
+    await expect(probe.snapshot()).rejects.toThrow('Resource identity must be an object')
+  })
+
+  test('reads heap and external together after the second collection', async () => {
+    const events = []
+    const readMemory = jest.spyOn(process, 'memoryUsage').mockImplementation(() => {
+      events.push('memory')
+      return { heapUsed: 11, external: 13, arrayBuffers: 7, rss: 101 }
+    })
+    const readUsage = jest.spyOn(process, 'resourceUsage').mockReturnValue({ maxRSS: 2 })
+    try {
+      const probe = createResourceProbe({
+        memory: true,
+        gc: () => events.push('gc'),
+        pause: async (ms) => events.push(`pause ${ms}`),
+      })
+      expect((await probe.snapshot()).memory).toEqual({
+        heapUsed: 11,
+        external: 13,
+        retainedBytes: 24,
+        rss: 101,
+        peakRss: 2048,
+      })
+      expect(events).toEqual(['gc', 'pause 100', 'gc', 'memory'])
+    } finally {
+      readMemory.mockRestore()
+      readUsage.mockRestore()
+    }
+  })
+
+  test('requires gc for memory and preserves omitted measurements', async () => {
+    expect(() => createResourceProbe({ memory: true, gc: null })).toThrow('--expose-gc')
+    expect(await createResourceProbe().snapshot()).toEqual({})
+  })
+})
