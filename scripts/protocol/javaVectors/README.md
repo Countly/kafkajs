@@ -376,3 +376,35 @@ Released share message vectors:
 | DescribeShareGroupOffsets | 1 | Independent request bytes, literal response fields, nested tag buffers |
 | AlterShareGroupOffsets | 0 | Independent request bytes, literal response fields, nested tag buffers |
 | DeleteShareGroupOffsets | 0 | Independent request bytes, literal response fields, nested tag buffers |
+
+## Independent OTLP numeric vectors
+
+GenerateTelemetryVectors.java is separate from the Kafka message generator. It
+uses the unrelocated OpenTelemetry proto v1.9.0 Java bindings and protobuf-java
+3.25.5, compiled with JDK 21 using --release 17. protoc 25.5 generated those bindings.
+Nothing here adds a runtime dependency, fetches a jar or modifies the producer codec
+registry. Verify the manifest and SHA-256 before compiling, including the generator,
+the three original proto files, protoc and both classpath jars. Preserve the original
+unrelocated offline package and the relocated reporter package independently.
+
+The bindings jar SHA-256 is
+99676bd7a6eff2b8e068a1ab10fe30cadf27958e82914adc6516699c88e266e7;
+protobuf-java 3.25.5 is
+8540247fad9e06baefa8fb45eb313802d019f485f14300e0f9d6b556ed88e753.
+The fixture manifest records protoc, original proto and toolchain source digests.
+
+Compile the generator offline against those two verified jars. Its arguments are
+an output directory, this source file, the bindings jar and the protobuf jar. It
+emits eight structured MetricsData vectors with literal fields, independently
+encoded hex, a generator digest and independently parsed text. Compare hex and
+fields with src/telemetry/__tests__/fixtures/otlp/*.json; an encoding mismatch fails
+acceptance. The primitive signed-int extrema do not describe legal negative public
+Sum registrations. The empty input emits zero bytes; explicit zero-valued numeric
+oneofs, unsigned timestamps and negative zero retain their required presence/bits.
+
+For candidate bytes, invoke the same class with --decode input.bin output.txt, or
+with --verify candidateDir decodedDir to check all eight vectors at once.
+Compare every decoded name/type/unit, resource/drop count, scope, point identity,
+timestamp, exact signed integer and double bits with the literal fixture semantics.
+Java decompression of configured GZIP/ZSTD exports remains an integration check.
+No JavaScript encoder or inverse JavaScript codec supplies the Java expected bytes.

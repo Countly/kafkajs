@@ -5,6 +5,17 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 ## Unreleased — 3.0.0
 
+### Phase 9F — Client telemetry
+
+#### Tooling
+
+- Add independently generated and decoded OTLP metric vectors.
+
+#### Behavior changes
+
+- Bound raw and transmitted telemetry bodies, omit whole metric groups under small limits, and advance only written included baselines; a rejected written sample can be lost from later deltas.
+- Telemetry payloads over1000 bytes use mutually supported built-in ZSTD/GZIP in broker order; NONE is always available. Producer codec registrations are unchanged.
+
 ### Phase 9E — Share groups
 
 #### Behavior changes
