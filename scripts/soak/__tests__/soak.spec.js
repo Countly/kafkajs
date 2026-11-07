@@ -3805,6 +3805,49 @@ describe('Share soak natural exit observations', () => {
 })
 
 describe('Share soak real cycle adapters', () => {
+  test.each([false, true])(
+    'starts all partition sends together and joins them after a failure=%s',
+    async (failFirst) => {
+      const pending = []
+      const error = new Error('partition send failed')
+      const driver = new ShareSoakDriver({
+        ports: { bounded: { bounded }, fixtures: { shareRecordIdentity } },
+      })
+      driver.topic = TOPIC_NAME
+      driver.producer = {
+        send: ({ messages }) =>
+          new Promise((resolve, reject) => {
+            const partition = messages[0].partition
+            pending.push({
+              partition,
+              finish: () =>
+                failFirst && partition === 0
+                  ? reject(error)
+                  : resolve([{ partition, errorCode: 0, baseOffset: '0' }]),
+            })
+          }),
+      }
+      let finished = false
+      const work = driver.produce(ShareCycleOracle.plan(0), NEVER)
+      work.then(
+        () => {
+          finished = true
+        },
+        () => {
+          finished = true
+        }
+      )
+      expect(pending.map(({ partition }) => partition)).toEqual([0, 1, 2])
+      pending[0].finish()
+      await Promise.resolve()
+      expect(finished).toBe(false)
+      pending[2].finish()
+      pending[1].finish()
+      if (failFirst) await expect(work).rejects.toBe(error)
+      else expect(await work).toEqual(cycleFacts(0).produced)
+    }
+  )
+
   /** Public client double with actual emitters and joined handler callbacks during disconnect. */
   const publicClient = () => {
     const emitter = new EventEmitter()
@@ -3840,6 +3883,29 @@ describe('Share soak real cycle adapters', () => {
     }
     return client
   }
+
+  test.each(['disconnect-start', 'disconnect-end'])(
+    'joins disconnect and removes listeners when the progress sink fails at %s',
+    async (failedStep) => {
+      const client = publicClient()
+      const disconnect = jest.spyOn(client, 'disconnect')
+      const member = new ShareMember({
+        kafka: { shareConsumer: () => client },
+        shares: { track: (c) => c },
+        label: 'A',
+        group: 'soak-group',
+        topic: TOPIC_NAME,
+        fixtures: { shareRecordIdentity },
+        onProgress: (step) => {
+          if (step === failedStep) throw new Error('progress sink failed')
+        },
+      })
+      await member.start(NEVER, bounded)
+      await expect(member.stop()).rejects.toThrow('progress sink failed')
+      expect(disconnect).toHaveBeenCalledTimes(1)
+      expect(member.removers).toEqual([])
+    }
+  )
 
   test('keeps the workload handler and acknowledgement journals through joined disconnect', async () => {
     const client = publicClient()
@@ -4159,6 +4225,8 @@ describe('Share soak cycle finalization and isolation adapter', () => {
     lateDuringClose = false,
     remaining = 16000,
     holdPost = false,
+    holdRaw = false,
+    failRaw = false,
   } = {}) => {
     const plan = ShareCycleOracle.plan(reset ? 10 : 0)
     const clients = []
@@ -4232,7 +4300,14 @@ describe('Share soak cycle finalization and isolation adapter', () => {
         },
       },
     }
-    const driver = new ShareSoakDriver({ kafka, shares: { track: (client) => client }, tap, ports })
+    const steps = []
+    const driver = new ShareSoakDriver({
+      kafka,
+      shares: { track: (client) => client },
+      tap,
+      ports,
+      onProgress: (row) => steps.push(row),
+    })
     Object.assign(driver, {
       topic: TOPIC_NAME,
       topicId: SOAK_UUID,
@@ -4275,8 +4350,19 @@ describe('Share soak cycle finalization and isolation adapter', () => {
         }
       return facts.produced
     }
-    driver.rawLog = async () =>
-      new Map(
+    let releaseRaw
+    let rawArrived
+    const raw = new Promise((resolve) => {
+      rawArrived = resolve
+    })
+    driver.rawLog = async () => {
+      rawArrived()
+      if (holdRaw)
+        await new Promise((resolve) => {
+          releaseRaw = resolve
+        })
+      if (failRaw) throw new Error('raw read failed')
+      return new Map(
         [0, 1, 2].map((partition) => [
           partition,
           {
@@ -4292,6 +4378,7 @@ describe('Share soak cycle finalization and isolation adapter', () => {
           },
         ])
       )
+    }
     let release
     let postArrived
     const post = new Promise((resolve) => {
@@ -4309,8 +4396,68 @@ describe('Share soak cycle finalization and isolation adapter', () => {
     driver.quiet = jest.fn(async () => verifierFacts())
     const work = driver.cycle(plan, NEVER, { due: remaining, clock: { now: () => 0 } })
     work.catch(() => {})
-    return { driver, work, clients, post, release: () => release?.() }
+    return {
+      driver,
+      work,
+      clients,
+      steps,
+      raw,
+      post,
+      releaseRaw: () => releaseRaw?.(),
+      release: () => release?.(),
+    }
   }
+
+  test.each([false, true])(
+    'starts member disconnect during the independent raw read, failing read=%s',
+    async (failRaw) => {
+      const state = await cycle({ holdRaw: true, failRaw })
+      await state.raw
+      const closing = state.steps.some(
+        ({ step, member }) => step === 'disconnect-start' && member === 'A'
+      )
+      state.releaseRaw()
+      if (failRaw) {
+        await expect(state.work).rejects.toThrow('raw read failed')
+        expect(state.driver.quiet).not.toHaveBeenCalled()
+      } else await state.work
+      expect(closing).toBe(true)
+      expect(state.steps).toEqual(state.driver.lastCycle.steps)
+      expect(state.steps).toContainEqual(
+        expect.objectContaining({ step: 'disconnect-end', member: 'A', status: 'completed' })
+      )
+    }
+  )
+
+  test('archives cycle milestones before the verifier and retains them on slot exhaustion', async () => {
+    const { driver, work, steps } = await cycle({ remaining: 4999 })
+    await expect(work).rejects.toThrow('complete verifier window')
+    expect(steps.map(({ step }) => step)).toEqual(
+      expect.arrayContaining([
+        'cycle-start',
+        'produce-start',
+        'produce-end',
+        'first-delivery',
+        'all-delivered',
+        'all-acks',
+        'member-add-start',
+        'member-add-end',
+        'member-remove-start',
+        'member-remove-end',
+        'disconnect-start',
+        'disconnect-end',
+        'group-empty-end',
+      ])
+    )
+    expect(steps).toEqual(driver.lastCycle.steps)
+    expect(
+      steps.every(
+        ({ at, elapsedMs, due, remainingMs }) =>
+          at === 0 && elapsedMs === 0 && due === 4999 && remainingMs === 4999
+      )
+    ).toBe(true)
+    expect(driver.quiet).not.toHaveBeenCalled()
+  })
 
   test.each([false, true])(
     'the real cycle captures handler drain and original reset/reopen, reset=%s',

@@ -52,6 +52,43 @@ enabled('share consumer short soak', () => {
       expect(owner.timing.slots.every(({ due, completedAt }) => completedAt <= due)).toBe(true)
       expect(owner.final.verifier.windowMs).toBe(5000)
       const cycles = owner.evidence.read().filter(({ event }) => event === 'soak-cycle')
+      const steps = owner.evidence.read().filter(({ event }) => event === 'soak-cycle-step')
+      for (const cycle of cycles) {
+        expect(steps.filter((row) => row.cycle === cycle.cycle)).toEqual(
+          expect.arrayContaining(
+            cycle.steps.map(({ at, ...step }) =>
+              expect.objectContaining({ ...step, monotonicAt: at })
+            )
+          )
+        )
+        expect(cycle.steps.map(({ step }) => step)).toEqual(
+          expect.arrayContaining([
+            'produce-start',
+            'produce-end',
+            'member-joined',
+            'first-delivery',
+            'all-delivered',
+            'all-acks',
+            'member-add-end',
+            'member-remove-end',
+            'disconnect-start',
+            'disconnect-end',
+            'group-empty-end',
+            'verifier-start',
+            'verifier-end',
+            'cycle-end',
+          ])
+        )
+        expect(
+          cycle.steps.every(
+            ({ at, elapsedMs, due, remainingMs }) =>
+              Number.isFinite(at) &&
+              elapsedMs === at - cycle.timing.startedAt &&
+              due === cycle.timing.due &&
+              remainingMs === due - at
+          )
+        ).toBe(true)
+      }
       const verifiers = [...cycles.map(({ verifier }) => verifier), owner.final.verifier]
       expect(new Set(verifiers.map(({ memberId }) => memberId)).size).toBe(31)
       expect(

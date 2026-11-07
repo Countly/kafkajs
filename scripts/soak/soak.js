@@ -3936,6 +3936,7 @@ class ShareMember {
    * @param {{ shareRecordIdentity: Function }} options.fixtures the share fixtures
    * @param {ShareCycleJournal} [options.journal] Original acquisition and handler authority.
    * @param {Function} [options.onLateEntry] Invalidates the run on any post-join callback.
+   * @param {Function} [options.onProgress] Records original membership, delivery and close times.
    * @param {(entries: object[], partition: number) => Promise<void>} [options.onBatch] awaited after
    *   a batch's entries are journalled
    */
@@ -3948,6 +3949,7 @@ class ShareMember {
     fixtures,
     journal,
     onLateEntry = () => {},
+    onProgress = () => {},
     onBatch = async () => {},
   }) {
     this.label = label
@@ -3956,6 +3958,7 @@ class ShareMember {
     this.onBatch = onBatch
     this.journal = journal
     this.onLateEntry = onLateEntry
+    this.onProgress = onProgress
     this.entries = []
     this.acks = []
     this.resets = []
@@ -3975,14 +3978,30 @@ class ShareMember {
     this.removers = [
       this.client.on(events.GROUP_JOIN, ({ payload }) => {
         this.memberId = payload.memberId
+        this.onProgress('member-joined', { memberId: this.memberId })
       }),
       this.client.on(events.ASSIGNMENT_CHANGED, ({ payload }) => {
         this.assignment = payload.assignment
+        this.onProgress('assignment-changed', { assignment: this.assignment })
       }),
-      this.client.on(events.ACKNOWLEDGE, ({ payload }) => this.acks.push(payload)),
+      this.client.on(events.ACKNOWLEDGE, ({ payload }) => {
+        this.acks.push(payload)
+        const { partition, firstOffset, lastOffset, type, error } = payload
+        this.onProgress('acknowledgement', {
+          partition,
+          firstOffset,
+          lastOffset,
+          type,
+          error: error ? { name: error.name, message: error.message } : null,
+        })
+      }),
       this.client.on(events.SESSION_RESET, ({ payload }) => this.resets.push(payload)),
       this.client.on(events.CRASH, ({ payload }) => this.crashes.push(payload.error)),
     ]
+    if (events.HEARTBEAT)
+      this.removers.push(
+        this.client.on(events.HEARTBEAT, ({ payload }) => this.onProgress('heartbeat', payload))
+      )
   }
 
   /**
@@ -3991,8 +4010,11 @@ class ShareMember {
    * @returns {Promise<void>} once the client is running
    */
   async start(scope, bounded) {
+    this.onProgress('connect-start')
     await bounded(scope, Infinity, () => this.client.connect())
+    this.onProgress('connect-end')
     await bounded(scope, Infinity, () => this.client.subscribe({ topics: [this.topic] }))
+    this.onProgress('join-start')
     await bounded(scope, Infinity, () =>
       this.client.run({
         eachBatch: async ({ batch }) => {
@@ -4005,24 +4027,37 @@ class ShareMember {
             deliveryCount: message.deliveryCount,
             ...this.journal?.handlers.getStore(),
           }))
+          const first = this.entries.length === 0 && entries.length > 0
           this.entries.push(...entries)
+          if (first) this.onProgress('first-delivery', { partition: batch.partition })
           if (this.finalized) this.onLateEntry(entries)
           await this.onBatch(entries, batch.partition)
         },
       })
     )
+    this.onProgress('run-ready')
   }
 
   /**
-   * Leaves the group and removes the journals' listeners.
+   * Leaves the group and removes the journals' listeners, even if a progress sink fails.
    * @returns {Promise<void>}
    */
   async stop() {
     this.stopTask ??= (async () => {
+      let status = 'failed'
       try {
-        await this.client.disconnect({ timeout: 2000 })
+        try {
+          this.onProgress('disconnect-start')
+        } finally {
+          await this.client.disconnect({ timeout: 2000 })
+          status = 'completed'
+        }
       } finally {
-        this.removers.splice(0).forEach((remove) => remove())
+        try {
+          this.onProgress('disconnect-end', { status })
+        } finally {
+          this.removers.splice(0).forEach((remove) => remove())
+        }
       }
     })()
     return this.stopTask
@@ -4066,9 +4101,10 @@ class ShareSoakDriver {
    * @param {ShareFetchTap} options.tap observer of the ShareFetch writes
    * @param {object} options.ports share fixtures, diagnostics and live-run helpers
    * @param {Function} options.socketFactory Counted original socket factory for raw broker ownership.
+   * @param {Function} [options.onProgress] Archives cycle steps as they occur, including failures.
    */
-  constructor({ kafka, brokers, shares, tap, ports, socketFactory }) {
-    Object.assign(this, { kafka, brokers, shares, tap, ports, socketFactory })
+  constructor({ kafka, brokers, shares, tap, ports, socketFactory, onProgress = () => {} }) {
+    Object.assign(this, { kafka, brokers, shares, tap, ports, socketFactory, onProgress })
     this.admin = null
     this.producer = null
     this.leaders = new Map()
@@ -4219,9 +4255,44 @@ class ShareSoakDriver {
       reset: null,
       held: [],
       positions: [],
+      steps: [],
       timing: { cycle: plan.cycle, kind: 'cycle', startedAt: clock.now(), due },
     }
+    const note = (step, fields = {}) => {
+      const at = clock.now()
+      const row = {
+        cycle: plan.cycle,
+        step,
+        at,
+        elapsedMs: at - observation.timing.startedAt,
+        due,
+        remainingMs: due - at,
+        ...fields,
+      }
+      observation.steps.push(row)
+      this.onProgress(row)
+    }
     const members = []
+    let allAcknowledged = false
+    const noteAcknowledgements = () => {
+      if (allAcknowledged || !observation.produced) return
+      const accepted = members.flatMap((member) => member.accepted())
+      if (
+        observation.produced.every(({ partition, identity }) => {
+          const offset = BigInt(JSON.parse(identity)[2])
+          return accepted.some(
+            (range) =>
+              range.topic === this.topic &&
+              range.partition === partition &&
+              BigInt(range.firstOffset) <= offset &&
+              BigInt(range.lastOffset) >= offset
+          )
+        })
+      ) {
+        allAcknowledged = true
+        note('all-acks', { identities: observation.produced.length })
+      }
+    }
     stack.add('finalize workload journals', () => {
       observation.handler = members.flatMap((member) => member.finalize())
       observation.accepted = members.flatMap((member) => member.accepted())
@@ -4236,6 +4307,10 @@ class ShareSoakDriver {
         fixtures,
         journal,
         onLateEntry: (entries) => this.onLateEntry?.(entries),
+        onProgress: (step, fields) => {
+          note(step, { member: label, ...fields })
+          if (step === 'acknowledgement') noteAcknowledgements()
+        },
         onBatch,
       })
     const track = (client) => {
@@ -4247,6 +4322,7 @@ class ShareSoakDriver {
     this.lastCycle = observation
     return stack.run(
       async () => {
+        note('cycle-start')
         const a = track(
           member('A', async (entries, partition) => {
             if (!plan.reset || hold.entries) return
@@ -4259,20 +4335,33 @@ class ShareSoakDriver {
         )
         stack.add('release the held handler', () => hold.release?.())
         await a.start(scope, bounded)
+        note('a-membership-start')
         await this.awaitMembers(scope, [a])
         observation.members.aJoined = true
+        note('a-membership-end')
         const b = track(member('B', async () => {}))
+        note('member-add-start')
         await b.start(scope, bounded)
         await this.awaitMembers(scope, [a, b])
         observation.members.bAdded = true
+        note('member-add-end')
+        note('member-remove-start')
         await b.stop()
         await this.awaitMembers(scope, [a])
         observation.members.bRemoved = b.entries.length === 0
         observation.members.bRemovedAt = clock.now()
+        note('member-remove-end')
 
         const mark = this.tap.mark()
-        if (plan.reset) await this.awaitEstablished(scope, mark)
+        if (plan.reset) {
+          note('sessions-start')
+          await this.awaitEstablished(scope, mark)
+          note('sessions-end')
+        }
+        note('produce-start')
         observation.produced = await this.produce(plan, scope)
+        note('produce-end')
+        noteAcknowledgements()
         this.acknowledged.push(...observation.produced.map(({ identity }) => identity))
         observation.acknowledgedPrefix = [...this.acknowledged]
         if (plan.reset) {
@@ -4280,7 +4369,9 @@ class ShareSoakDriver {
             delayMs: 25,
             label: 'The first batch reaching its handler',
           })
+          note('reset-start')
           observation.reset = await this.forceReset(scope, a, hold, mark, observation)
+          note('reset-end')
         }
         await pollUntil(
           scope,
@@ -4297,32 +4388,57 @@ class ShareSoakDriver {
           },
           { delayMs: 25, label: 'Every identity delivered' }
         )
-        const log = await this.rawLog(scope)
-        Object.assign(observation, this.readLogs(plan, log))
-        await a.stop()
+        note('all-delivered')
+        const reads = await Promise.allSettled([
+          (async () => {
+            note('raw-log-start')
+            const log = await this.rawLog(scope)
+            Object.assign(observation, this.readLogs(plan, log))
+            note('raw-log-end')
+          })(),
+          (async () => {
+            await a.stop()
+            observation.members.aLeftAt = clock.now()
+            noteAcknowledgements()
+          })(),
+        ])
+        const failures = reads
+          .filter(({ status }) => status === 'rejected')
+          .map(({ reason }) => reason)
+        if (failures.length === 1) throw failures[0]
+        if (failures.length > 1) throw new AggregateError(failures, 'Cycle read and close failed')
         observation.handler = [...a.finalize(), ...b.finalize()]
         observation.accepted = a.accepted()
         observation.provenance = journal.snapshot()
-        observation.members.aLeftAt = clock.now()
+        note('position-before-start')
         observation.positions.push(await this.position(plan, scope, { clock }))
+        note('position-before-end')
         observation.members.aLeft = a.crashes.length === 0
+        note('group-empty-start')
         await bounded(scope, Infinity, () =>
           fixtures.waitForShareGroupsEmpty(this.admin, [this.group], { signal: scope })
         )
         observation.members.emptyAt = clock.now()
+        note('group-empty-end', { emptyAt: observation.members.emptyAt })
         if (due - clock.now() < SHARE_SOAK.quietMs.cycle)
           throw new Error('The cycle cannot contain its complete verifier window')
+        note('verifier-start')
         observation.verifier = await this.quiet(scope, SHARE_SOAK.quietMs.cycle, {
           due,
           clock,
           journal,
           cycle: plan.cycle,
+          onProgress: (step) => note(`verifier-${step.replaceAll(' ', '-')}`),
         })
+        note('verifier-end')
+        note('position-after-start')
         const final = await this.position(plan, scope, { clock })
         observation.positions.push(final)
+        note('position-after-end')
         observation.broker = final.rows
         observation.clientsDisconnected = true
         observation.timing.completedAt = clock.now()
+        note('cycle-end')
         this.departures = { ...observation.members }
         return observation
       },
@@ -4391,8 +4507,8 @@ class ShareSoakDriver {
   }
 
   /**
-   * Produces the cycle's corpus, one acknowledged send per partition, and derives each identity
-   * from the acknowledged base offset and the known ordered payloads.
+   * Produces the cycle's corpus with concurrent partition sends, joins every send, and derives
+   * each identity from the acknowledged base offset and the known ordered payloads.
    * @param {ReturnType<typeof ShareCycleOracle.plan>} plan the cycle
    * @param {AbortSignal} scope the cycle scope
    * @returns {Promise<Array<{ partition: number, identity: string }>>} one entry per record, in plan order
@@ -4401,42 +4517,47 @@ class ShareSoakDriver {
   async produce(plan, scope) {
     const { bounded } = this.ports.bounded
     const produced = new Array(plan.records.length)
-    for (let partition = 0; partition < SHARE_SOAK.partitions; partition++) {
-      const rows = plan.records
-        .map((record, index) => ({ record, index }))
-        .filter(({ record }) => record.partition === partition)
-      const messages = rows.map(({ record }) => ({
-        partition,
-        key: Buffer.from(record.key),
-        value: Buffer.from(record.value),
-        timestamp: SHARE_SOAK_TIMESTAMP,
-      }))
-      const sent = await bounded(scope, Infinity, () =>
-        this.producer.send({ topic: this.topic, acks: -1, messages })
-      )
-      if (
-        sent.length !== 1 ||
-        sent[0].errorCode !== 0 ||
-        sent[0].partition !== partition ||
-        BigInt(sent[0].baseOffset) !== plan.first
-      ) {
-        throw new Error(
-          `Partition ${partition} was not acknowledged as one batch at offset ${plan.first}`
-        )
-      }
-      rows.forEach(({ index }, position) => {
-        produced[index] = {
+    const sends = await Promise.allSettled(
+      Array.from({ length: SHARE_SOAK.partitions }, async (_, partition) => {
+        const rows = plan.records
+          .map((record, index) => ({ record, index }))
+          .filter(({ record }) => record.partition === partition)
+        const messages = rows.map(({ record }) => ({
           partition,
-          identity: this.ports.fixtures.shareRecordIdentity({
-            topic: this.topic,
-            partition,
-            offset: String(plan.first + BigInt(position)),
-            key: messages[position].key,
-            value: messages[position].value,
-          }),
+          key: Buffer.from(record.key),
+          value: Buffer.from(record.value),
+          timestamp: SHARE_SOAK_TIMESTAMP,
+        }))
+        const sent = await bounded(scope, Infinity, () =>
+          this.producer.send({ topic: this.topic, acks: -1, messages })
+        )
+        if (
+          sent.length !== 1 ||
+          sent[0].errorCode !== 0 ||
+          sent[0].partition !== partition ||
+          BigInt(sent[0].baseOffset) !== plan.first
+        ) {
+          throw new Error(
+            `Partition ${partition} was not acknowledged as one batch at offset ${plan.first}`
+          )
         }
+        rows.forEach(({ index }, position) => {
+          produced[index] = {
+            partition,
+            identity: this.ports.fixtures.shareRecordIdentity({
+              topic: this.topic,
+              partition,
+              offset: String(plan.first + BigInt(position)),
+              key: messages[position].key,
+              value: messages[position].value,
+            }),
+          }
+        })
       })
-    }
+    )
+    const failures = sends.filter(({ status }) => status === 'rejected').map(({ reason }) => reason)
+    if (failures.length === 1) throw failures[0]
+    if (failures.length > 1) throw new AggregateError(failures, 'Cycle partition sends failed')
 
     return produced
   }
@@ -4612,7 +4733,7 @@ class ShareSoakDriver {
    * that was never assigned or never fetched, so silence from an inactive member never counts.
    * @param {AbortSignal} scope the enclosing scope
    * @param {number} windowMs how long the assigned member fetches
-   * @param {object} [timing] Original slot, member journal and monotonic clock.
+   * @param {object} [timing] Original slot, member journal, monotonic clock and progress callback.
    * @returns {Promise<object>} Joined verifier identity, assignments, fetch chronology and deliveries.
    */
   async quiet(
@@ -4624,6 +4745,7 @@ class ShareSoakDriver {
       journal,
       cycle = SHARE_SOAK.cycles - 1,
       kind = 'cycle',
+      onProgress = () => {},
     } = {}
   ) {
     const ownJournal = !journal
@@ -4660,6 +4782,7 @@ class ShareSoakDriver {
         signal: scope,
         windowMs,
         record: ({ step, assignment }) => {
+          onProgress(step)
           if (step === 'window start') {
             if (due - clock.now() < windowMs)
               throw new Error('The cycle cannot contain its complete assigned verifier window')
@@ -4913,6 +5036,8 @@ class ShareSoak {
           `A joined workload member dispatched later identities: ${JSON.stringify(entries)}`
         )
       )
+    this.driver.onProgress = ({ at, ...row }) =>
+      this.row('soak-cycle-step', { ...row, monotonicAt: at })
   }
 
   /**
@@ -5149,6 +5274,7 @@ class ShareSoak {
         accepted: observation.accepted ?? [],
       },
       positions: observation.positions ?? [],
+      steps: observation.steps ?? [],
       timing: observation.timing,
       members,
       provenance: observation.provenance,
