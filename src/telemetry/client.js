@@ -6,6 +6,25 @@ const UUID =
   /^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const CLOCK = { now: () => performance.now(), random: Math.random, setTimeout, clearTimeout }
 
+/**
+ * Validates the public getter options once, reading the timeout property a single time.
+ * @param {{timeout?:number}|undefined} options caller options; omitted or empty selects 60000
+ * @returns {number} integer milliseconds from 0 to 2147483647
+ * @throws {KafkaJSInvalidConfigurationError} fixed text for any invalid shape, including a throwing accessor
+ */
+const waitTimeout = (options) => {
+  try {
+    if (options === undefined) return 60000
+    if (options === null || typeof options !== 'object' || Array.isArray(options)) throw Error()
+    const value = options.timeout
+    const timeout = value === undefined ? 60000 : value
+    if (!Number.isInteger(timeout) || timeout < 0 || timeout > MAX_TIMER) throw Error()
+    return timeout
+  } catch {
+    throw new KafkaJSInvalidConfigurationError('Invalid telemetry timeout')
+  }
+}
+
 /** Owns one bounded subscription loop. Foreground operations never await this class. */
 module.exports = class ClientTelemetry {
   /**
@@ -49,6 +68,15 @@ module.exports = class ClientTelemetry {
     this.transport.onCandidatesChanged?.(() => {
       if (this.connected && this.state === 'DORMANT') this.resume()
     })
+  }
+
+  /**
+   * @param {{timeout?:number}|undefined} options public getter options
+   * @returns {number} validated timeout in milliseconds
+   * @throws {KafkaJSInvalidConfigurationError} invalid options; used by a client that owns no machine
+   */
+  static waitTimeout(options) {
+    return waitTimeout(options)
   }
 
   /** @returns {bigint} non-reused local issuance, including across reopen */
@@ -550,37 +578,27 @@ module.exports = class ClientTelemetry {
   }
 
   /**
-   * Resolves a cached accepted ID, otherwise waits under an independent original deadline.
-   * @param {{timeout?:number}} [options] timeout defaults to30000; zero reads cache only
-   * @returns {Promise<string>} bounded to64 waiters; no implicit connection
+   * Resolves a cached accepted ID, otherwise waits under an independent original deadline measured
+   * from entry, so a slow options accessor consumes the same budget.
+   * Precedence: validation, disabled, cached ID, closed, not connected, unsupported, stopped, timeout.
+   * @param {{timeout?:number}} [options] timeout defaults to 60000; zero reads the cache only
+   * @returns {Promise<string>} bounded to 64 waiters; no implicit connection
    * @throws {Error} asynchronous validation or typed telemetry refusal
    */
-  async clientInstanceId(options = {}) {
-    let timeout
-    try {
-      if (options === null || typeof options !== 'object' || Array.isArray(options)) throw Error()
-      const value = options.timeout
-      timeout = value === undefined ? 30000 : value
-    } catch {
-      throw new KafkaJSInvalidConfigurationError('Invalid telemetry timeout')
-    }
-    if (!Number.isInteger(timeout) || timeout < 0 || timeout > MAX_TIMER)
-      throw new KafkaJSInvalidConfigurationError('Invalid telemetry timeout')
+  async clientInstanceId(options) {
+    const entered = this.clock.now()
+    const timeout = waitTimeout(options)
     if (this.config.enableMetricsPush === false) throw this.error('disabled')
     if (this.uuid) return this.uuid
-    if (this.state === 'STOPPED') throw this.error('stopped')
-    if (!this.connected || ['CLOSING', 'CLOSED'].includes(this.state))
-      throw this.error(['CLOSING', 'CLOSED'].includes(this.state) ? 'closed' : 'not-connected')
+    if (['CLOSING', 'CLOSED'].includes(this.state)) throw this.error('closed')
+    if (!this.connected) throw this.error('not-connected')
     if (this.state === 'DORMANT' && this.timer === null) throw this.error('unsupported')
-    if (!timeout) throw this.error('timeout')
+    if (this.state === 'STOPPED') throw this.error('stopped')
+    const deadline = entered + timeout
+    if (!timeout || this.clock.now() >= deadline) throw this.error('timeout')
     if (this.waiters.size === 64) throw this.error('limit')
     return new Promise((resolve, reject) => {
-      this.waiters.add({
-        resolve,
-        reject,
-        deadline: this.clock.now() + timeout,
-        lifecycle: this.lifecycle,
-      })
+      this.waiters.add({ resolve, reject, deadline, lifecycle: this.lifecycle })
       this.armWaiters()
     })
   }
