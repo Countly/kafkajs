@@ -1,7 +1,3 @@
-const { execFile } = require('node:child_process')
-const fs = require('node:fs')
-const path = require('node:path')
-const { promisify } = require('node:util')
 const {
   PublicTelemetryRound,
   TELEMETRY_KINDS,
@@ -550,6 +546,18 @@ describe.each(TELEMETRY_KINDS)('%s private failure preserves foreground identity
             if (spec.close) await exerciseOperations(round)
             counter = spec.inject(round, reason)
             await drive(round, spec)
+            if (['O05 snapshot', 'O05 select', 'O11', 'O15'].includes(_id)) {
+              const stopped = _id !== 'O05 snapshot'
+              expect(round.machine.state).toBe(stopped ? 'STOPPED' : 'BACKOFF')
+              expect(round.machine.running).toBeNull()
+              expect(round.machine.watchdog).toBeNull()
+              if (stopped) expect(round.machine.timer).toBeNull()
+              else expect(round.clock.pending.has(round.machine.timer)).toBe(true)
+              const sent = round.telemetryRequests().length
+              await settle()
+              expect(round.telemetryRequests()).toHaveLength(sent)
+              if (_id === 'O11') expect(round.pushes()).toHaveLength(1)
+            }
             if (['O06', 'O07', 'O08'].includes(_id)) {
               expect(round.written).toHaveLength(written)
               expect(counter.hits).toBeGreaterThan(0)
@@ -643,6 +651,18 @@ test.each(TELEMETRY_KINDS)(
           expect(round.machine).toBeNull()
           expect(round.telemetryRequests()).toEqual([])
           await exerciseOperations(round)
+          if (kind === 'producer' || kind === 'admin')
+            for (const operation of kind === 'admin'
+              ? ['admin']
+              : [
+                  'send',
+                  'sendBatch',
+                  'transaction.send',
+                  'transaction.commit',
+                  'transaction.abort',
+                ])
+              for (const outcome of ['throw', 'reject'])
+                await exerciseRefusal(round, operation, outcome)
           await expect(round.client.disconnect(round.closeOptions(0))).resolves.toBeUndefined()
         } finally {
           await round.dispose()
@@ -655,99 +675,92 @@ test.each(TELEMETRY_KINDS)(
   60000
 )
 
-test('O17 O18 O19 rerun the existing meter/span/context/getter/logger containment matrix on the packed candidate', async () => {
-  const cwd = path.resolve(__dirname, '../../../otel')
-  const candidate = path.join(cwd, 'node_modules/@countly/kafkajs')
-  expect(fs.lstatSync(candidate).isSymbolicLink()).toBe(false)
-  for (const file of [
-    'src/telemetry/client.js',
-    'src/telemetry/payload.js',
-    'src/telemetry/factory.js',
-    'src/network/connection.js',
-  ])
-    expect(fs.readFileSync(path.join(candidate, file))).toEqual(
-      fs.readFileSync(path.resolve(__dirname, '../../..', file))
-    )
-  const { stdout, stderr } = await promisify(execFile)(
-    process.execPath,
-    ['--test', 'test/failureContainment.test.js'],
-    {
-      cwd,
-      timeout: 600000,
-      maxBuffer: 16 * 1024 * 1024,
-      env: { ...process.env, NO_UPDATE_NOTIFIER: '1' },
-    }
-  )
-  expect(stdout).toMatch(/# fail 0/)
-  expect(stdout).toMatch(/the meters throw/)
-  expect(stdout).toMatch(/context/)
-  expect(stdout).toMatch(/message cannot be read/)
-  expect(stderr).not.toMatch(/unhandledRejection|uncaughtException/)
-}, 610000)
+/** Exercises a real public refusal at its broker origin; public async methods normalize throws.
+ * @param {PublicTelemetryRound} round started client @param {string} operation public operation
+ * @param {'throw'|'reject'} outcome original broker outcome @returns {Promise<void>} exact identity asserted
+ * @throws {Error} an unexpected wrapper outcome or transaction cleanup failure
+ */
+async function exerciseRefusal(round, operation, outcome) {
+  const reason = new (require('../../errors').KafkaJSNonRetriableError)('unique original refusal')
+  const broker = await round.binding.cluster.findConnectedBroker()
+  const transaction = operation.startsWith('transaction.') ? await round.client.transaction() : null
+  const key = operation.split('.').at(-1)
+  if (transaction && ['commit', 'abort'].includes(key))
+    await transaction.send({ topic: TOPIC, messages: [{ value: 'before end' }] })
+  const method =
+    operation === 'admin' ? 'metadata' : key === 'commit' || key === 'abort' ? 'endTxn' : 'produce'
+  const target = transaction ?? round.client
+  let args = []
+  if (key === 'send') args = [{ topic: TOPIC, messages: [{ value: 'original' }] }]
+  if (key === 'sendBatch')
+    args = [{ topicMessages: [{ topic: TOPIC, messages: [{ value: 'original' }] }] }]
+  if (operation === 'admin') args = [{ topics: [TOPIC] }]
+  const restoreAt = round.restores.length
+  const result = await round.exerciseForeground({
+    target: broker,
+    key: method,
+    identity: reason,
+    outcome,
+    run: () => target[operation === 'admin' ? 'fetchTopicMetadata' : key](...args),
+  })
+  if (key === 'abort') expect(result.actual).toEqual({ kind: 'return', value: undefined })
+  else {
+    // Public async methods normalize a synchronous broker throw to a rejection.
+    expect(result.actual.kind).toBe('reject')
+    expect(result.actual.reason).toBe(reason)
+  }
+  expect(result.expected.reason).toBe(reason)
+  expect(result.expected.kind).toBe(outcome)
+  expect(result.log[0].receiver).toBe(broker)
+  expect(result.log).toHaveLength(1)
+  if (method === 'metadata') expect(result.log[0].args[0]).toEqual([TOPIC])
+  else if (method === 'endTxn')
+    expect(result.log[0].args[0].transactionResult).toBe(key === 'commit')
+  else {
+    const topics = result.log[0].args[0].topicData
+    expect(topics.map((topic) => topic.topic)).toEqual([TOPIC])
+    expect(topics[0].partitions).toHaveLength(1)
+  }
+  while (round.restores.length > restoreAt) round.restores.pop()()
+  if (transaction && key !== 'abort') await transaction.abort()
+}
 
-describe('original public rejection under observer failure', () => {
-  test.each([
+describe('original public rejection crossed with each private failure', () => {
+  const operations = [
     'send',
     'sendBatch',
     'transaction.send',
     'transaction.commit',
     'transaction.abort',
     'admin',
-  ])(
-    '%s preserves a unique original rejection once',
-    async (operation) => {
-      const kind = operation === 'admin' ? 'admin' : 'producer'
-      const reason = new (require('../../errors').KafkaJSNonRetriableError)(
-        'original foreground refusal'
+  ]
+  test.each(
+    Object.entries(INJECTORS).flatMap(([id, spec]) =>
+      operations.flatMap((operation) =>
+        ['throw', 'reject'].map((outcome) => ({ id, spec, operation, outcome }))
       )
+    )
+  )(
+    '$id with original $operation $outcome',
+    async ({ id, spec, operation, outcome }) => {
+      const kind = operation === 'admin' ? 'admin' : 'producer'
+      const privateReason = Object.freeze({ private: Symbol('fault') })
       const round = new PublicTelemetryRound({ kind })
+      let fault
       try {
         await round.start({
+          points: 'large',
+          sasl: spec.sasl,
+          subscription: { acceptedCompressionTypes: id.startsWith('O10') ? [4, 1, 0] : [1, 0] },
           client: kind === 'producer' ? { transactionalId: 'foreground-tx', linger: 0 } : {},
+          beforeConnect: (r) => {
+            if (spec.early) fault = spec.inject(r, privateReason)
+          },
         })
         await round.ready()
-        const fault = failing(
-          round,
-          round.metrics,
-          'observeRequest',
-          Object.freeze({ private: true })
-        )
-        const broker = await round.binding.cluster.findConnectedBroker()
-        const transaction = operation.startsWith('transaction.')
-          ? await round.client.transaction()
-          : null
-        const key = operation.split('.').at(-1)
-        if (transaction && ['commit', 'abort'].includes(key))
-          await transaction.send({ topic: TOPIC, messages: [{ value: 'before end' }] })
-        const method =
-          operation === 'admin'
-            ? 'metadata'
-            : key === 'commit' || key === 'abort'
-              ? 'endTxn'
-              : 'produce'
-        const target = transaction ?? round.client
-        let args = []
-        if (key === 'send') args = [{ topic: TOPIC, messages: [{ value: 'original' }] }]
-        if (key === 'sendBatch')
-          args = [{ topicMessages: [{ topic: TOPIC, messages: [{ value: 'original' }] }] }]
-        if (operation === 'admin') args = [{ topics: [TOPIC] }]
-        const result = await round.exerciseForeground({
-          target: broker,
-          key: method,
-          identity: reason,
-          outcome: 'reject',
-          run: () => target[operation === 'admin' ? 'fetchTopicMetadata' : key](...args),
-        })
-        if (key === 'abort') expect(result.actual).toEqual({ kind: 'return', value: undefined })
-        else {
-          expect(result.actual.kind).toBe('reject')
-          expect(result.actual.reason).toBe(reason)
-        }
-        expect(result.expected.reason).toBe(reason)
-        expect(result.log[0].receiver).toBe(broker)
-        expect(result.log).toHaveLength(1)
-        // An ordinary successful core request reaches the private observer independently.
-        await broker.apiVersions()
+        if (!spec.early) fault = spec.inject(round, privateReason)
+        await exerciseRefusal(round, operation, outcome)
+        await drive(round, spec)
         expect(fault.hits).toBeGreaterThan(0)
         expect(round.unhandled).toEqual([])
       } finally {
@@ -776,4 +789,49 @@ test.each([undefined, null, false, 0, ''])(
       await round.dispose()
     }
   }
+)
+
+test.each([false, true])(
+  'awaited rebalance-hook rejection retains control flow enabled=%s',
+  async (enabled) => {
+    const reason = new Error('unique awaited hook refusal')
+    const round = new PublicTelemetryRound({ kind: 'consumer', enabled })
+    let calls = 0
+    try {
+      await round.start({
+        beforeConnect: (r) => {
+          r.runOptions = {
+            rebalanceListener: {
+              onPartitionsRevoked: async () => {
+                calls++
+                throw reason
+              },
+            },
+          }
+        },
+      })
+      if (enabled) {
+        await round.ready()
+        const fault = failing(
+          round,
+          round.metrics,
+          'observeRequest',
+          new Error('optional observer')
+        )
+        await (await round.cluster.findConnectedBroker()).apiVersions()
+        expect(fault.hits).toBeGreaterThan(0)
+      }
+      await expect(round.rejoin()).rejects.toMatchObject({
+        name: 'KafkaJSRebalanceListenerError',
+        reason: 'threw',
+        cause: reason,
+        thrownValue: reason,
+      })
+      expect(calls).toBe(1)
+      expect(round.unhandled).toEqual([])
+    } finally {
+      await round.dispose()
+    }
+  },
+  60000
 )

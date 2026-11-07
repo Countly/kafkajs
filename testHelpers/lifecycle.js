@@ -289,6 +289,8 @@ const actionsFor = (boundary, mode) => {
  * @returns {Array<'G'|'P'|'F'>} Get, ordinary Push and final Push in write order
  */
 const prewritten = (boundary, mode, position = 'before') => {
+  if (boundary === 'S18' && position === 'result')
+    return mode === 'get' ? ['G'] : ['G', 'P', mode === 'final' ? 'F' : 'P']
   const base = mode === 'get' ? [] : ['G', 'P']
   if (boundary === 'S14' && position === 'after')
     return [...base, { get: 'G', normal: 'P', final: 'F' }[mode]]
@@ -317,7 +319,16 @@ const manifestOf =
       uuid: kind === 'G' && fresh ? null : TELEMETRY_UUID,
       subscriptionId: kind === 'G' ? null : DEFAULT_SUBSCRIPTION.subscriptionId,
       socket,
-      ...(held && kind !== 'F' ? { lifecycle: old.lifecycle } : {}),
+      compressionType: kind === 'G' ? null : boundary === 'S12' ? 1 : 0,
+      ...(held
+        ? {
+            lifecycle: old.lifecycle,
+            transport: old.transport,
+            subscription: kind === 'G' ? 0n : old.subscription,
+            request: kind === 'F' ? old.closeRevision : old.running,
+            closeRevision: kind === 'F' ? old.closeRevision : 0n,
+          }
+        : {}),
     })
     const before = prewritten(boundary, mode, options.position)
     const expected = before.map((kind, index) =>
@@ -329,7 +340,7 @@ const manifestOf =
             (boundary === 'S14' && options.position === 'after'))
       )
     )
-    const successor = boundary === 'S01' && fresh ? 1n : 2n
+    const successor = boundary === 'S01' && fresh && options.position === 'before' ? 1n : 2n
     const reconnect = () => [frame('G', successor), frame('P', successor)]
     if (action === RELEASE_ACTIONS[0]) {
       if (
@@ -338,7 +349,11 @@ const manifestOf =
       )
         expected.push(frame({ get: 'G', normal: 'P', final: 'F' }[mode], 1n, true))
     } else if (action === RELEASE_ACTIONS[1] && mode !== 'final') expected.push(...reconnect())
-    else if (action === RELEASE_ACTIONS[2] && mode === 'normal' && boundary !== 'S18')
+    else if (
+      action === RELEASE_ACTIONS[2] &&
+      mode === 'normal' &&
+      (boundary !== 'S18' || options.position === 'result')
+    )
       expected.push(frame('F', 1n))
     else if (action === RELEASE_ACTIONS[5]) expected.push(...reconnect())
     return expected
@@ -374,7 +389,15 @@ const telemetryReleaseCells = () => {
       for (const [boundary, modes] of ledger)
         for (const mode of modes)
           for (const action of actionsFor(boundary, mode))
-            for (const position of boundary === 'S14' ? ['before', 'after'] : ['before']) {
+            for (const position of boundary === 'S01' || boundary === 'S14'
+              ? ['before', 'after']
+              : boundary === 'S08' || boundary === 'S09'
+                ? ['before', 'decode', 'parse']
+                : boundary === 'S17'
+                  ? ['decode', 'parse']
+                  : boundary === 'S18'
+                    ? ['retire', 'result']
+                    : ['before']) {
               const cell = {
                 name: `${kind}/${enforceRequestTimeout ? 'enforced' : 'natural'}/${boundary}/${mode}/${position}/${action}`,
                 kind,
@@ -457,6 +480,7 @@ Object.assign(module.exports, {
   DEFAULT_SUBSCRIPTION,
 })
 
+const ISSUED_REQUEST = Symbol('issued telemetry request')
 const BULK_POINTS = 30
 const turn = () => new Promise((resolve) => setImmediate(resolve))
 const symbolOf = (target, name) =>
@@ -556,6 +580,9 @@ class PublicTelemetryRound {
     this.written = []
     this.abandoned = []
     this.snapshots = []
+    this.codecJobs = []
+    this.expectedFrames = []
+    this.builtHandles = []
     this.guards = { ordinary: null, closing: null }
     this.setupCalls = []
     this.socketWrites = []
@@ -567,6 +594,7 @@ class PublicTelemetryRound {
     this.brokerAnswerTimers = new Set()
     this.deliveries = []
     this.eventRemovers = []
+    this.retiredCorePools = []
     this.core = { handlers: [], commits: [], leaves: [], losses: [], joins: [] }
     this.listener = (reason) => this.unhandled.push(reason)
     process.on('unhandledRejection', this.listener)
@@ -638,7 +666,7 @@ class PublicTelemetryRound {
    * Installs exactly one hold. Its wrapper selects the dedicated telemetry connection by its
    * private authentication owner, never by endpoint, and runs only while the round is armed.
    * @param {string} boundary ledger id S01-S19f
-   * @param {{mode?:'get'|'normal'|'final',retirementResultOnly?:boolean,position?:'before'|'after'}} [options] operation;
+   * @param {{mode?:'get'|'normal'|'final',retirementResultOnly?:boolean,position?:string}} [options] operation;
    *   retirementResultOnly selects a naturally triggered retirement without expiring a held answer
    * @returns {object} a Schedule gate, or a dial gate for S02
    * @throws {Error} duplicate or unknown boundary
@@ -793,12 +821,23 @@ class PublicTelemetryRound {
         dispatchHold([36])
         return traced()
       },
-      S08: () =>
-        wired({
+      S08: () => {
+        if (position !== 'before') {
+          responseHold(18, position)
+          return traced()
+        }
+        return wired({
           api: 'ApiVersions',
           match: (call) => round.armed && call.generation > round.foregroundSockets,
-        }),
-      S09: () => wired({ api: 'GetTelemetrySubscriptions', match: () => round.armed }),
+        })
+      },
+      S09: () => {
+        if (position !== 'before') {
+          responseHold(71, position)
+          return traced()
+        }
+        return wired({ api: 'GetTelemetrySubscriptions', match: () => round.armed })
+      },
       S10: () => {
         payloadHold('before')
         return traced()
@@ -808,9 +847,28 @@ class PublicTelemetryRound {
         return traced()
       },
       S12: () => {
-        this.patch(gzip, 'compress', (original) => async (...args) => {
-          if (round.armed && closing() === (mode === 'final')) await round.enter(boundary)
-          return original(...args)
+        const codec =
+          this.codecType === 4 ? require('../src/protocol/message/compression/zstd') : gzip
+        this.patch(codec, 'compress', (original) => async (...args) => {
+          const selected = round.armed && closing() === (mode === 'final')
+          const job = {
+            raw: Buffer.from(args[0].buffer),
+            promise: original(...args),
+            settled: false,
+          }
+          // Observe rejection immediately, while retaining the actual native result.
+          const outcome = job.promise.then(
+            (value) => ({ value }),
+            (error) => ({ error })
+          )
+          if (selected) {
+            round.codecJobs.push(job)
+            await round.enter(boundary)
+          }
+          const result = await outcome
+          job.settled = true
+          if ('error' in result) throw result.error
+          return result.value
         })
         return traced()
       },
@@ -873,10 +931,14 @@ class PublicTelemetryRound {
         return traced()
       },
       S17: () => {
-        brokerHold()
+        responseHold(mode === 'get' ? 71 : 72, position === 'decode' ? 'decode' : 'parse')
         return traced()
       },
       S18: () => {
+        if (position === 'result') {
+          brokerHold()
+          return traced()
+        }
         if (retirementResultOnly) return traced()
         this.retirementAnswer = wired({
           api: mode === 'get' ? 'GetTelemetrySubscriptions' : 'PushTelemetry',
@@ -906,7 +968,7 @@ class PublicTelemetryRound {
     }
     if (!holds[boundary]) throw new Error(`Unknown telemetry boundary ${boundary}`)
     const gate = holds[boundary]()
-    this.held = { boundary, mode, gate }
+    this.held = { boundary, mode, gate, position }
     this.gates.push(gate)
     return gate
   }
@@ -933,23 +995,37 @@ class PublicTelemetryRound {
           }
           transport.open = async (candidate, options) => {
             round.setupCalls.push('open')
-            if (round.armed && round.held?.boundary === 'S01') await round.enter('S01')
-            return open(candidate, {
+            const selected = round.armed && round.held?.boundary === 'S01'
+            if (selected && round.held.position === 'before') await round.enter('S01')
+            let allocation = null
+            const result = await open(candidate, {
               ...options,
               onAllocated: (handle) => {
+                round.builtHandles.push(handle)
                 const retire = handle.retire
                 let heldRetirement = false
                 handle.retire = async (...args) => {
                   round.retirements.push(handle)
-                  const selected = round.armed && round.held?.boundary === 'S18' && !heldRetirement
+                  const selected =
+                    round.armed &&
+                    round.held?.boundary === 'S18' &&
+                    round.held.position !== 'result' &&
+                    !heldRetirement
                   if (selected) heldRetirement = true
                   const result = await retire(...args)
                   if (selected) await round.enter('S18')
                   return result
                 }
-                options.onAllocated(handle)
+                // Retain the real build while its caller's publication callback is held.
+                if (selected && round.held.position === 'after') allocation = handle
+                else options.onAllocated(handle)
               },
             })
+            if (selected && round.held.position === 'after') {
+              await round.enter('S01')
+              options.onAllocated(allocation)
+            }
+            return result
           }
           return transport
         }
@@ -994,6 +1070,29 @@ class PublicTelemetryRound {
     const round = this
     this.patch(
       Connection.prototype,
+      symbolOf(Connection.prototype, 'private:Connection:prepare'),
+      (original) =>
+        async function (...args) {
+          const encoded = await original.apply(this, args)
+          const issued = encoded.request[ISSUED_REQUEST]
+          if (issued) {
+            const bytes = encoded.requestPayload.buffer
+            const clientLength = bytes.readInt16BE(12)
+            const bodyAt = 15 + Math.max(0, clientLength)
+            round.expectedFrames.push({
+              ...issued,
+              correlation: encoded.correlationId,
+              connection: this.socket?.inner ?? this.socket,
+              hex: Buffer.concat([bytes.subarray(0, bodyAt), round.requestBody(issued)]).toString(
+                'hex'
+              ),
+            })
+          }
+          return encoded
+        }
+    )
+    this.patch(
+      Connection.prototype,
       'connect',
       (original) =>
         function (...args) {
@@ -1036,6 +1135,11 @@ class PublicTelemetryRound {
               )
             }
           }
+          if (this.authenticationOwner && [71, 72].includes(options.request.apiKey)) {
+            const issued = round.admittedRequest
+            telemetryAssert.ok(issued, 'telemetry request must have an issuing owner')
+            options = { ...options, request: { ...options.request, [ISSUED_REQUEST]: issued } }
+          }
           return original.call(this, options)
         }
     )
@@ -1044,6 +1148,27 @@ class PublicTelemetryRound {
       'sendTelemetry',
       (original) =>
         function (apiKey, definition, payload, options) {
+          const machine = round.machine
+          const final = payload.terminating === true
+          const owner = final ? machine.closing : machine.running
+          round.admittedRequest = {
+            apiKey,
+            lifecycle: final ? machine.lifecycle : owner.lifecycle,
+            transport: final ? machine.transportRevision : owner.transport,
+            subscription: owner.subscription?.revision ?? 0n,
+            request: owner.revision,
+            closeRevision: final ? owner.revision : 0n,
+            payload: {
+              ...payload,
+              ...(payload.metrics ? { metrics: Buffer.from(payload.metrics) } : {}),
+            },
+            points: (final ? round.finalSnapshotIdentity() : owner.snapshot)?.points.map(
+              (point) => ({
+                name: point.name,
+                value: point.value,
+              })
+            ),
+          }
           if (apiKey === 72 && this.connectionPool.pool[0].authenticationOwner != null) {
             if (!payload.terminating) round.guards.ordinary = options.guard
             else {
@@ -1076,8 +1201,15 @@ class PublicTelemetryRound {
           attempt: BigInt(generation),
           lifecycle: machine.lifecycle,
           transport: machine.transportRevision,
-          subscription: machine.subscription?.revision ?? 0n,
-          request: machine.running?.revision ?? machine.closing?.revision ?? 0n,
+          subscription: apiKey === 71 ? 0n : (machine.subscription?.revision ?? 0n),
+          request:
+            apiKey === 72 && this.wire.log.at(-1).fields.terminating
+              ? (machine.closing?.revision ?? 0n)
+              : (machine.running?.revision ?? 0n),
+          closeRevision:
+            apiKey === 72 && this.wire.log.at(-1).fields.terminating
+              ? (machine.closing?.revision ?? 0n)
+              : 0n,
           correlation: frame.readInt32BE(8),
           apiKey,
           hex: frame.toString('hex'),
@@ -1238,12 +1370,14 @@ class PublicTelemetryRound {
     }
     beforeConnect?.(this)
     await this.connectForeground()
+    if (this.coreProof) await this.prepareCoreProof()
     this.foregroundSockets = this.wire.sockets().length
     if (!this.machine || drive === 'connected') return this
     if (drive === 'get') {
       this.arm()
       this.tick()
-      if (this.held?.boundary === 'S18') await this.expireForRetirement()
+      if (this.held?.boundary === 'S18' && this.held.position !== 'result')
+        await this.expireForRetirement()
       return this
     }
     await this.ready()
@@ -1260,7 +1394,8 @@ class PublicTelemetryRound {
           )
         )
     }
-    if (this.held?.boundary === 'S18') await this.expireForRetirement()
+    if (this.held?.boundary === 'S18' && this.held.position !== 'result')
+      await this.expireForRetirement()
     return this
   }
 
@@ -1475,6 +1610,12 @@ class PublicTelemetryRound {
     const machine = this.machine
     return Object.freeze({
       lifecycle: machine.lifecycle,
+      uuid: machine.uuid,
+      resourceRevision: this.binding.resourceRevision,
+      payloadOwner: machine.payload,
+      subscriptionOwner: machine.subscription,
+      runningOwner: machine.running,
+      waiterOwners: [...machine.waiters],
       transport: machine.transportRevision,
       subscription: machine.subscription?.revision ?? 0n,
       running: machine.running?.revision ?? 0n,
@@ -1551,7 +1692,8 @@ class PublicTelemetryRound {
       this.faultDedicated()
       if (machine.closing) return undefined
       const watchdog = machine.watchdog
-      if (this.held?.boundary !== 'S18') this.clock.jump(this.clock.time + 30000)
+      if (this.held?.boundary !== 'S18' || this.held.position === 'result')
+        this.clock.jump(this.clock.time + 30000)
       if (watchdog && this.clock.pending.has(watchdog)) this.clock.deliver(watchdog)
       await this.until(() => machine.state === 'BACKOFF' && machine.timer !== null)
       if (['S03', 'S12', 'S19b', 'S19f'].includes(this.held?.boundary)) {
@@ -1609,6 +1751,37 @@ class PublicTelemetryRound {
     telemetryAssert.notEqual(group.ownership.token(), token)
   }
 
+  /** Admits a real public commit after the exact fixture record reached its handler.
+   * @returns {Promise<void>} durable offset and handler evidence captured before telemetry revocation
+   * @throws {Error} public commit or handler readiness failure
+   */
+  async prepareCoreProof() {
+    await this.until(() => this.core.handlers.length === 1)
+    telemetryAssert.deepStrictEqual(this.core.handlers, ['0'])
+    this.core.token = this.runner.consumerGroup.ownership.token()
+    this.core.joinsBefore = this.core.joins.length
+    if (this.membership === 'no-group') {
+      const result = await telemetryOutcome(() =>
+        this.client.commitOffsets([{ topic: 'test-topic', partition: 0, offset: '1' }])
+      )
+      telemetryAssert.equal(result.kind, 'reject')
+      return
+    }
+    this.wire.answer('OffsetCommit', ({ topics }) => {
+      this.core.durable = topics.flatMap((topic) =>
+        topic.partitions.map(({ partition, offset }) => ({ partition, offset }))
+      )
+      return {
+        topics: topics.map((topic) => ({
+          ...topic,
+          partitions: topic.partitions.map(({ partition }) => ({ partition, errorCode: 0 })),
+        })),
+      }
+    })
+    await this.client.commitOffsets([{ topic: 'test-topic', partition: 0, offset: '1' }])
+    this.core.commits.push([{ partition: 0, offset: '1' }])
+  }
+
   /** Asserts original commit/leave and handler identity invariants independently of telemetry.
    * @param {number} from first core request index @param {string} event actual transition
    * @returns {void} @throws {import('node:assert').AssertionError} changed core behavior
@@ -1616,8 +1789,14 @@ class PublicTelemetryRound {
   assertCore(from, event) {
     const rows = this.wire.requests().slice(from)
     telemetryAssert.deepStrictEqual(
-      rows.filter((r) => r.api === 'OffsetCommit'),
-      []
+      rows
+        .filter((r) => r.api === 'OffsetCommit')
+        .map((row) =>
+          row.fields.topics.flatMap((topic) =>
+            topic.partitions.map(({ partition, offset }) => ({ partition, offset }))
+          )
+        ),
+      this.core.commits
     )
     const leaves = rows.filter(
       (r) =>
@@ -1642,6 +1821,16 @@ class PublicTelemetryRound {
         []
       )
     telemetryAssert.equal(new Set(this.core.handlers).size, this.core.handlers.length)
+    if (this.coreProof) {
+      telemetryAssert.deepStrictEqual(this.core.handlers, ['0'])
+      if (this.membership !== 'no-group')
+        telemetryAssert.deepStrictEqual(this.core.durable, [{ partition: 0, offset: '1' }])
+      if (['crash', 'rejoin'].includes(event) && this.protocol !== 'manual') {
+        telemetryAssert.ok(this.core.joins.length > this.core.joinsBefore, 'owed rejoin completed')
+        telemetryAssert.equal(this.runner.running, true)
+        telemetryAssert.notEqual(this.runner.consumerGroup.ownership.token(), this.core.token)
+      }
+    }
   }
 
   /** Suspends through the actual crash owner, or closes a non-running public client.
@@ -1658,7 +1847,12 @@ class PublicTelemetryRound {
   async restartForeground() {
     if (this.kind === 'consumer') {
       await this.client.connect()
-      await this.client.run({ autoCommit: false, eachMessage: async () => {} })
+      await this.client.run({
+        autoCommit: false,
+        eachMessage: async ({ message }) => {
+          this.core.handlers.push(message.offset)
+        },
+      })
       return
     }
     if (this.kind === 'shareConsumer') {
@@ -1784,7 +1978,7 @@ class PublicTelemetryRound {
    * @throws {Error} when the point is absent
    */
   decodedLatestPoint({ name }) {
-    const bytes = Buffer.from(this.pushes().at(-1).fields.metrics, 'hex')
+    const bytes = this.decodedMetrics(this.pushes().at(-1))
     const list = protoValues(protoValues(protoValues(bytes, 1)[0], 2)[0], 2)
     for (const metric of list) {
       if (protoValues(metric, 1)[0]?.toString() !== name) continue
@@ -1798,6 +1992,66 @@ class PublicTelemetryRound {
       }
     }
     throw new Error('Point absent')
+  }
+
+  /** Decompresses a real wire body with the platform decoder, independently of payload fitting.
+   * @param {object} record decoded wire request @returns {Buffer} raw MetricsData bytes
+   * @throws {Error} invalid compression data or a codec unavailable on this platform
+   */
+  decodedMetrics(record) {
+    const bytes = Buffer.from(record.fields.metrics, 'hex')
+    const zlib = require('node:zlib')
+    if (record.fields.compressionType === 1) return zlib.gunzipSync(bytes)
+    if (record.fields.compressionType === 4) {
+      // eslint-disable-next-line n/no-unsupported-features/node-builtins -- codec 4 is emitted only when the platform supports it
+      return zlib.zstdDecompressSync(bytes)
+    }
+    telemetryAssert.equal(record.fields.compressionType, 0)
+    return bytes
+  }
+
+  /** Builds expected Kafka telemetry body bytes independently of the production request encoder.
+   * @param {object} issued admitted body @returns {Buffer} complete body including terminal tags
+   */
+  requestBody({ apiKey, payload }) {
+    const uuid = payload.clientInstanceId
+      ? Buffer.from(payload.clientInstanceId.replace(/-/g, ''), 'hex')
+      : Buffer.alloc(16)
+    if (apiKey === 71) return Buffer.concat([uuid, Buffer.from([0])])
+    const fixed = Buffer.alloc(6)
+    fixed.writeInt32BE(payload.subscriptionId)
+    fixed[4] = payload.terminating ? 1 : 0
+    fixed.writeInt8(payload.compressionType, 5)
+    const length = []
+    let remaining = payload.metrics.length + 1
+    do {
+      const byte = remaining & 127
+      remaining = Math.floor(remaining / 128)
+      length.push(byte | (remaining ? 128 : 0))
+    } while (remaining)
+    return Buffer.concat([uuid, fixed, Buffer.from(length), payload.metrics, Buffer.from([0])])
+  }
+
+  /** Independently decodes every point in a complete, uncompressed MetricsData body.
+   * @param {Buffer} bytes OTLP bytes @returns {Array<{name:string,value:number|bigint}>} wire order
+   * @throws {Error} malformed OTLP body
+   */
+  decodePoints(bytes) {
+    const result = []
+    for (const resource of protoValues(bytes, 1))
+      for (const scope of protoValues(resource, 2))
+        for (const metric of protoValues(scope, 2)) {
+          const name = protoValues(metric, 1)[0].toString()
+          const body = protoValues(metric, 7)[0] ?? protoValues(metric, 5)[0]
+          for (const point of protoValues(body, 1)) {
+            const integer = protoValues(point, 6)[0]
+            result.push({
+              name,
+              value: integer ? integer.readBigInt64LE() : protoValues(point, 4)[0].readDoubleLE(),
+            })
+          }
+        }
+    return result
   }
 
   /** @returns {bigint|undefined} start time the collector issued to the re-registered descriptor */
@@ -1816,13 +2070,13 @@ class PublicTelemetryRound {
   async drainReleased(gate, value) {
     if (gate.settle) gate.release(value)
     if (this.retirementAnswer?.settle) this.retirementAnswer.release()
-    for (let step = 0; step < 200; step++) await turn()
+    for (let step = 0; step < 20; step++) await turn()
   }
 
   /**
    * Compares the complete ordered frame list with an independent manifest: api, flags, UUID,
-   * subscription and dedicated socket, plus the held operation's lifecycle where predeclared; each
-   * frame must pair with a real wire record by connection generation and correlation.
+   * subscription and dedicated socket. Every frame must match its pre-encode issued authority,
+   * independently built full body, decoded point set and actual socket bytes.
    * @param {Array<object>} expected predeclared frames @returns {void}
    * @throws {import('node:assert').AssertionError} any missing, extra, reordered or substituted frame
    */
@@ -1850,8 +2104,49 @@ class PublicTelemetryRound {
     frames.forEach((frame, index) => {
       telemetryAssert.equal(records[index].correlationId, frame.correlation)
       telemetryAssert.equal(BigInt(records[index].generation), frame.attempt)
-      if (expected[index].lifecycle !== undefined)
-        telemetryAssert.equal(frame.lifecycle, expected[index].lifecycle)
+      const issued = this.expectedFrames.find(
+        (entry) =>
+          entry.correlation === frame.correlation &&
+          this.dedicatedSockets.indexOf(entry.connection) + 1 === Number(frame.connection)
+      )
+      telemetryAssert.ok(issued, 'frame must match an admitted request')
+      for (const key of [
+        'apiKey',
+        'lifecycle',
+        'transport',
+        'subscription',
+        'request',
+        'closeRevision',
+      ])
+        telemetryAssert.equal(frame[key] ?? 0n, issued[key], key)
+      telemetryAssert.equal(frame.hex, issued.hex, 'issued complete body and bytes')
+      const fields = this.frameFields[index]
+      telemetryAssert.equal(
+        fields.clientInstanceId ?? null,
+        issued.payload.clientInstanceId ?? null
+      )
+      if (frame.apiKey === 72) {
+        for (const key of ['subscriptionId', 'terminating', 'compressionType'])
+          telemetryAssert.equal(fields[key], issued.payload[key], key)
+        telemetryAssert.equal(fields.metrics, issued.payload.metrics.toString('hex'))
+        const raw = this.decodedMetrics(records[index])
+        const order = (points) => [...points].sort((a, b) => a.name.localeCompare(b.name))
+        telemetryAssert.deepStrictEqual(order(this.decodePoints(raw)), order(issued.points))
+      }
+      const write = this.socketWrites.find(
+        (entry) =>
+          (entry.socket.inner ?? entry.socket) === issued.connection &&
+          entry.bytes.readInt32BE(8) === frame.correlation
+      )
+      telemetryAssert.equal(frame.hex, write?.bytes.toString('hex'), 'complete frame bytes')
+      for (const key of ['lifecycle', 'transport', 'subscription', 'request', 'closeRevision'])
+        if (expected[index][key] !== undefined)
+          telemetryAssert.equal(frame[key], expected[index][key], key)
+      if (expected[index].compressionType !== undefined)
+        telemetryAssert.equal(
+          frame.apiKey === 71 ? null : fields.compressionType,
+          expected[index].compressionType
+        )
     })
   }
 
@@ -1863,8 +2158,26 @@ class PublicTelemetryRound {
    */
   assertReplacementUnchanged(before) {
     const now = this.capture()
-    for (const key of ['lifecycle', 'transport', 'subscription', 'timerRevision'])
+    for (const key of [
+      'lifecycle',
+      'uuid',
+      'resourceRevision',
+      'payloadOwner',
+      'subscriptionOwner',
+      'runningOwner',
+      'transport',
+      'subscription',
+      'timerRevision',
+      'running',
+      'closeRevision',
+      'timer',
+      'watchdog',
+      'waiters',
+      'timers',
+      'metricRevision',
+    ])
       telemetryAssert.equal(now[key], before[key], key)
+    telemetryAssert.deepStrictEqual(now.waiterOwners, before.waiterOwners)
     telemetryAssert.equal(now.handle, before.handle)
     telemetryAssert.deepStrictEqual(now.reopen, before.reopen)
     telemetryAssert.equal(now.written, before.written)
@@ -1941,6 +2254,7 @@ class PublicTelemetryRound {
       if (this.client) {
         await this.wait(() => this.client.disconnect(this.closeOptions(0)))
         await Promise.all(this.pending)
+        for (const pool of this.retiredCorePools) await pool.destroy({ drainTimeout: 0 })
         for (let step = 0; step < 4 && this.machine && this.clock.pending.size; step++) {
           for (const [id, entry] of [...this.clock.pending])
             if (entry.due <= this.clock.time) this.clock.deliver(id)
@@ -1961,9 +2275,17 @@ class PublicTelemetryRound {
     } catch (error) {
       failure = error
     } finally {
-      for (const remove of this.eventRemovers) remove()
-      process.off('unhandledRejection', this.listener)
-      while (this.restores.length) this.restores.pop()()
+      const restore = (call) => {
+        try {
+          call()
+        } catch (error) {
+          failure ??= error
+        }
+      }
+      for (const timer of this.brokerAnswerTimers) clearTimeout(timer)
+      for (const remove of this.eventRemovers.splice(0)) restore(remove)
+      restore(() => process.off('unhandledRejection', this.listener))
+      while (this.restores.length) restore(this.restores.pop())
     }
     if (failure) throw failure
   }
@@ -2000,6 +2322,7 @@ const runTelemetryLifecycleCell = async (cell) => {
     protocol: cell.protocol,
     membership: cell.membership,
   })
+  round.coreProof = true
   const by = (name) => cell.boundary === `telemetry:${name}`
   try {
     if (by('final-encode') || by('final-dispatch') || by('deadline') || by('old-final-result')) {
@@ -2058,6 +2381,9 @@ const runTelemetryLifecycleCell = async (cell) => {
         await round.until(() => settled.length === 2)
         telemetryAssert.deepStrictEqual(settled, ['timeout', 'not-connected'])
       }
+      await round.restartForeground()
+      if (round.protocol !== 'manual')
+        await round.until(() => round.core.joins.length > round.core.joinsBefore)
     } else if (by('active-push')) {
       await round.start({ drive: 'connected' })
       await round.ready()

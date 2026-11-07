@@ -55,22 +55,39 @@ const resourceOf = (record) => {
  */
 const closing = async (cell, { boundary, mode = 'final', timeout = 1000, start } = {}) => {
   const round = new PublicTelemetryRound(cell)
-  const gate = boundary ? round.hold(boundary, { mode }) : null
-  await round.start(start)
-  await round.ready()
-  round.arm()
-  const before = round.capture()
-  if (boundary === 'S15') await round.occupyFinalQueue()
-  round.closePromise = round.beginClose(
-    timeout === undefined ? undefined : round.closeOptions(timeout)
-  )
-  if (boundary === 'S18') await round.expireForRetirement()
-  if (gate) await round.wait(() => gate.arrived())
-  if (boundary === 'S15')
-    await round.until(() =>
-      round.dedicatedConnection.requestQueue.pending.some((request) => request.entry.apiKey === 72)
+  try {
+    const gate = boundary ? round.hold(boundary, { mode }) : null
+    await round.start({
+      ...(boundary === 'S12'
+        ? { points: 'large', subscription: { acceptedCompressionTypes: [1, 0] } }
+        : {}),
+      ...start,
+    })
+    await round.ready()
+    round.arm()
+    const before = round.capture()
+    if (boundary === 'S15') await round.occupyFinalQueue()
+    round.closePromise = round.beginClose(
+      timeout === undefined ? undefined : round.closeOptions(timeout)
     )
-  return { round, gate, before }
+    if (boundary === 'S18') await round.expireForRetirement()
+    if (gate) await round.wait(() => gate.arrived())
+    if (boundary === 'S15')
+      await round.until(() =>
+        round.dedicatedConnection.requestQueue.pending.some(
+          (request) => request.entry.apiKey === 72
+        )
+      )
+    if (boundary === 'S12') {
+      expect(round.codecJobs).toHaveLength(1)
+      expect(round.codecJobs[0].raw.length).toBeGreaterThan(1000)
+      expect(gate.settle).not.toBeNull()
+    }
+    return { round, gate, before }
+  } catch (error) {
+    await round.dispose().catch(() => {})
+    throw error
+  }
 }
 
 describe.each([false, true])('captured close with enforcement %s', (enforceRequestTimeout) => {
@@ -191,7 +208,10 @@ describe.each([false, true])('captured close with enforcement %s', (enforceReque
         const round = new PublicTelemetryRound(cell)
         try {
           await round.start(start)
-          if (start.subscription) await round.ready().catch(() => {})
+          if (start.subscription) {
+            round.tick()
+            await round.until(() => round.machine.subscription !== null && !round.machine.running)
+          }
           await round.wait(() => round.beginClose(round.closeOptions(1000)))
           expect(round.finalFrames()).toEqual([])
         } finally {
@@ -384,6 +404,51 @@ describe.each([false, true])('captured close with enforcement %s', (enforceReque
       }
     }, 60000)
 
+    test.each(['disabled', 'dormant', 'stopped', 'disconnected'])(
+      'C03 %s skips final encoding and setup',
+      async (state) => {
+        const round = new PublicTelemetryRound({ ...cell, enabled: state !== 'disabled' })
+        try {
+          await round.start()
+          if (state === 'stopped' || state === 'disconnected') await round.ready()
+          if (state === 'stopped') {
+            round.wire.answer('PushTelemetry', () => ({ errorCode: 42 }))
+            round.tick()
+            await round.until(() => round.machine.state === 'STOPPED')
+          }
+          if (state === 'disconnected') await round.wait(() => round.beginClose({ timeout: 0 }))
+          const frames = round.finalFrames().length
+          const setup = round.setupCalls.length
+          const samples = round.snapshots.length
+          await round.wait(() => round.beginClose({ timeout: 1000 }))
+          expect(round.finalFrames()).toHaveLength(frames)
+          expect(round.setupCalls).toHaveLength(setup)
+          expect(round.snapshots).toHaveLength(samples)
+        } finally {
+          await round.dispose()
+        }
+      },
+      60000
+    )
+
+    test.each(['S14', 'S16'])(
+      'C10 authentication becomes due after final encoding at %s',
+      async (boundary) => {
+        const { round, gate, before } = await closing(cell, { boundary, start: { sasl: true } })
+        try {
+          expect(round.savedClosingGuard()).toBeNull()
+          round.armRenewal()
+          await round.drainReleased(gate)
+          await round.settleClose()
+          expect(round.finalFrames()).toEqual([])
+          expect(round.newSetupCallsSince(before)).toEqual([])
+        } finally {
+          await round.dispose()
+        }
+      },
+      60000
+    )
+
     test('C12 close frees all owned work with the original result', async () => {
       const round = new PublicTelemetryRound(cell)
       try {
@@ -562,6 +627,20 @@ describe.each([false, true])('captured close with enforcement %s', (enforceReque
         await pending
         expect(calls).toBe(1)
         expect(round.finalFrames()).toHaveLength(enabled ? 1 : 0)
+        if (kind === 'consumer' && stage === 'commit') {
+          const rows = round.wire.requests()
+          const commits = rows.filter((row) => row.api === 'OffsetCommit')
+          expect(commits).toHaveLength(1)
+          expect(
+            commits[0].fields.topics.flatMap((topic) =>
+              topic.partitions.map(({ partition, offset }) => ({ partition, offset }))
+            )
+          ).toEqual([{ partition: 0, offset: '1' }])
+          const leave = rows.find((row) => row.api === 'LeaveGroup')
+          expect(leave).toBeDefined()
+          expect(commits[0].order).toBeLessThan(leave.order)
+          expect(commits[0].answeredOrder).toBeLessThan(leave.order)
+        }
         expect(round.unhandled).toEqual([])
       } finally {
         await round.dispose()

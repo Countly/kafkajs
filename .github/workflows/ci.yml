@@ -35,6 +35,14 @@ jobs:
         with: { node-version: 24, cache: npm }
       - run: npm ci
       - run: npm run test:pack
+  otel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 24, cache: npm }
+      - run: npm ci
+      - run: npm run test:otel
   integration:
     runs-on: ubuntu-latest
     timeout-minutes: ${{ matrix.timeout || 360 }}
@@ -57,7 +65,13 @@ jobs:
           - { node: 24, kafka: 4.3.1, group: share-base, timeout: 35 }
           - { node: 24, kafka: 4.4.0, group: share-base, clients: 4.4.0 }
           - { node: 24, kafka: 4.3.1, group: share, compose: docker-compose.share.yml }
-          - { node: 24, kafka: 4.4.0, group: share, compose: docker-compose.share.yml, clients: 4.4.0 }
+          - {
+              node: 24,
+              kafka: 4.4.0,
+              group: share,
+              compose: docker-compose.share.yml,
+              clients: 4.4.0,
+            }
           - { node: 24, kafka: 4.3.1, group: share-limit, compose: docker-compose.share-limit.yml }
     env:
       KAFKA_VERSION: ${{ matrix.kafka }}
