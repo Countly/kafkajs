@@ -3974,6 +3974,11 @@ describe('Share soak real cycle adapters', () => {
       const failures = []
       ShareCycleOracle.verifier(evidence, 5000, (message) => failures.push(message))
       expect(failures).toEqual([expect.stringContaining('measured observation window')])
+      expect(
+        evidence.events
+          .filter(({ kind }) => kind === 'window-start' || kind === 'window-end')
+          .map(({ kind }) => kind)
+      ).toEqual(['window-start', 'window-end'])
       const start = evidence.events.find(({ kind }) => kind === 'window-start')
       const end = evidence.events.find(({ kind }) => kind === 'window-end')
       expect(start.at).toBeGreaterThanOrEqual(2000)
@@ -4932,6 +4937,12 @@ describe('Share soak complete original-owner schedules', () => {
           )
       ).toBe(true)
       expect(rows.filter(({ event }) => event === 'soak-reset')).toHaveLength(10)
+      for (const verifier of [...cycles.map(({ verifier }) => verifier), owner.final.verifier])
+        expect(
+          verifier.events
+            .filter(({ kind }) => kind === 'window-start' || kind === 'window-end')
+            .map(({ kind }) => kind)
+        ).toEqual(['window-start', 'window-end'])
       for (const { held, handler, reset } of cycles) {
         if (!reset) continue
         expect(held).toHaveLength(20)

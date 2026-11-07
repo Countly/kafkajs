@@ -838,11 +838,49 @@ describe('Share throughput terminal proof', () => {
         steps.push('workload-disconnect')
       },
     }
-    return { driver, steps, ends, listing, deadline, cleanupDeadline: deadline + LIMITS.cleanup }
+    return {
+      driver,
+      steps,
+      ends,
+      listing,
+      startedAt,
+      deadline,
+      cleanupDeadline: deadline + LIMITS.cleanup,
+    }
+  }
+
+  /**
+   * @param {object} fixture Original group and wall-clock origin of the scripted verifier.
+   * @param {boolean} [silent=false] Whether only the pre-window fetch completes.
+   * @returns {object[]} Exact inherited verifier sub-steps for the five-second observation.
+   */
+  const verifierProgress = ({ driver, startedAt }, silent = false) => {
+    const row = (step, elapsedMs = 0, fields = {}) => ({
+      stage: 'quiet-verifier',
+      status: 'progress',
+      groupId: driver.groupId,
+      topic: 't',
+      step,
+      elapsedMs,
+      ...fields,
+    })
+    const assignment = [{ topic: 't', partitions: [0, 1, 2] }]
+    return [
+      row('connect start'),
+      row('connected'),
+      row('join start'),
+      row('first fetch', 0, { payload: { apiName: 'ShareFetch', sentAt: startedAt - 1 } }),
+      row('run resolved'),
+      row('window start', 0, { assignment, fetches: 1, windowMs: 5000 }),
+      row('window end', 5000, { assignment, fetches: silent ? 1 : 20, windowMs: 5000 }),
+      row('disconnect start', 5000),
+      row('disconnected', 5000),
+    ]
   }
 
   test('captures ends before consumption and archives both terminal reads after an active quiet window', async () => {
-    const { driver, steps, listing, deadline, cleanupDeadline } = fixture()
+    const setup = fixture()
+    const { driver, steps, listing, deadline, cleanupDeadline } = setup
     jest.spyOn(driver, 'admit').mockResolvedValue()
     jest.spyOn(driver, 'consume').mockImplementation(async () => {
       steps.push('consume')
@@ -913,6 +951,7 @@ describe('Share throughput terminal proof', () => {
         status: 'settled',
         last: expect.objectContaining({ named: listing, all: listing }),
       }),
+      ...verifierProgress(setup),
       expect.objectContaining({
         stage: 'quiet-verifier',
         status: 'quiet',
@@ -934,7 +973,8 @@ describe('Share throughput terminal proof', () => {
     [{ failedRead: 'ends' }, 'Post-verifier end unavailable'],
     [{ failedRead: 'listing' }, 'Post-verifier listing refused'],
   ])('rejects an incomplete terminal proof: %s', async (options, diagnostic) => {
-    const { driver, steps, deadline } = fixture(options)
+    const setup = fixture(options)
+    const { driver, steps, deadline } = setup
     await driver.captureEnds('t', deadline)
     await Promise.all([
       expect(driver.verifyTerminal('t', deadline)).rejects.toThrow(diagnostic),
@@ -945,15 +985,17 @@ describe('Share throughput terminal proof', () => {
     const proof = driver.terminal.filter(({ stage }) => stage === 'quiet-verifier')
     if (options.replay || options.drainReplay) {
       expect(proof).toEqual([
+        ...verifierProgress(setup),
         expect.objectContaining({
           status: 'failed',
           delivered: ['["t",0,"0","6b","76"]'],
         }),
       ])
     } else if (options.silent) {
-      expect(proof).toEqual([])
+      expect(proof).toEqual(verifierProgress(setup, true))
     } else {
       expect(proof).toEqual([
+        ...verifierProgress(setup),
         expect.objectContaining({ status: 'quiet', delivered: [] }),
         expect.objectContaining({ status: 'failed' }),
       ])
