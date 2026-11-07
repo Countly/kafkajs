@@ -31,12 +31,16 @@ const {
 } = require('../../../../testHelpers/shareLiveDiagnostics')
 const { readLog } = require('../../../../testHelpers/rawLog')
 const { createResourceProbe } = require('../../../../testHelpers/resourceProbe')
+const RequestQueue = require('../../../network/requestQueue')
+const InstrumentationEventEmitter = require('../../../instrumentation/emitter')
+const { ShareAckLedger } = require('../shareAckLedger')
 const {
   SHARE_VERSION,
   featuresOf,
   readApiVersions,
 } = require('../../../../scripts/e2e/apiVersionsProbe')
 const {
+  CASE_JOIN_MS,
   NEVER,
   bounded,
   caseTimeout,
@@ -58,8 +62,11 @@ const PROFILE = 'tv2'
 const LINE = process.env.KAFKA_VERSION
 const TITLE_DEFAULT = 'reports the designated share capability or completes one round trip'
 const TITLE_DISABLED = 'reports a disabled share feature and restores its original level'
-const DEFAULT_BUDGET_MS = 25000
-const DISABLED_BUDGET_MS = 40000
+const DEFAULT_BUDGET_MS = 18000
+const DISABLED_BUDGET_MS = 18000
+const FILE_BUDGET_MS = 60000
+const FINAL_MS = 10000
+let fileDeadline = null
 const HOOK_MS = 10000
 const CLEANUP_MS = 10000
 const OLD_TIMESTAMP = '1700000000000'
@@ -68,6 +75,23 @@ const CLIENT_CONFIG = { acquireMode: 'record_limit', maxRecords: 1, maxWaitTimeI
 const GROUP_CONFIG = { 'share.auto.offset.reset': 'earliest' }
 const FEATURE_TABLE = path.join(__dirname, '../../../../scripts/protocol/brokerFeatures.json')
 const FEATURES_TOOL = ['/opt/kafka/bin/kafka-features.sh', '--bootstrap-server', 'kafka1:29092']
+
+/**
+ * Limits every selected phase to the original file deadline, including its remaining reserves.
+ * @param {number} limit The phase limit in milliseconds.
+ * @param {number} [reserve] Time retained for joins and later phases.
+ * @returns {number} The phase's remaining allowance.
+ * @throws {Error} When the selection has no time left outside its reserves.
+ */
+const capabilityBudget = (limit, reserve = CASE_JOIN_MS) => {
+  const remaining = fileDeadline - performance.now() - reserve
+  if (!(remaining > 0)) {
+    const error = new Error('The capability file deadline has expired')
+    liveRun.taint(error)
+    throw error
+  }
+  return Math.min(limit, remaining)
+}
 
 /** What a client of a broker that does not advertise share groups, or only an older range, sees. */
 const UNSUPPORTED = {
@@ -166,8 +190,8 @@ const resourceDifferences = (before, after) =>
     .map(([name, was, now]) => `${name}: ${JSON.stringify(was)} -> ${JSON.stringify(now)}`)
 
 /**
- * Logs every request frame the clients of one case write and counts their sockets and unanswered
- * requests from the bytes actually written and read. Every byte passes through untouched.
+ * Logs every request frame the clients of one case write and counts their original sockets.
+ * Every byte passes through untouched.
  */
 class SocketLedger {
   /** Starts with no sockets. */
@@ -189,24 +213,8 @@ class SocketLedger {
    */
   open(host, port, onConnect) {
     const socket = net.connect({ host, port }, onConnect)
-    const entry = { socket, answered: 0, carry: Buffer.alloc(0) }
-    socket.on('data', (chunk) => this.read(entry, chunk))
-    this.entries.push(entry)
+    this.entries.push({ socket })
     return socket
-  }
-
-  /**
-   * @param {{ answered: number, carry: Buffer }} entry the socket's bookkeeping
-   * @param {Buffer} chunk the next bytes the broker sent on it
-   * @returns {void} counts the response frames the chunk completed
-   */
-  read(entry, chunk) {
-    let bytes = Buffer.concat([entry.carry, chunk])
-    while (bytes.length >= 4 && bytes.length >= 4 + bytes.readInt32BE(0)) {
-      bytes = bytes.subarray(4 + bytes.readInt32BE(0))
-      entry.answered++
-    }
-    entry.carry = bytes
   }
 
   /** @returns {{ created: number, destroyed: number }} sockets opened and since destroyed */
@@ -215,19 +223,6 @@ class SocketLedger {
       created: this.entries.length,
       destroyed: this.entries.filter(({ socket }) => socket.destroyed).length,
     }
-  }
-
-  /** @returns {number} requests written on live sockets that have no response yet */
-  pending() {
-    return this.entries.reduce(
-      (total, { socket, answered }, index) =>
-        socket.destroyed
-          ? total
-          : total +
-            this.log.frames.filter(({ connection }) => connection === index + 1).length -
-            answered,
-      0
-    )
   }
 
   /** @returns {object[]} every share request frame written, with its header facts */
@@ -318,6 +313,136 @@ class FeatureOffRun {
   }
 }
 
+/** Runs strict cleanup with the allowance left when cleanup actually begins. */
+class FileCleanupStack extends CleanupStack {
+  /**
+   * @returns {Promise<Error[]>} Failed cleanups, including an exhausted file deadline, so the
+   *   original work failure remains primary. No cleanup starts after the file allowance expires.
+   */
+  async closeAll() {
+    try {
+      return await super.closeAll({
+        budgetMs: capabilityBudget(CLEANUP_MS, FINAL_MS + CASE_JOIN_MS),
+      })
+    } catch (error) {
+      liveRun.taint(error)
+      return [error]
+    }
+  }
+}
+
+/** Observes original resource owners without changing method results or receiver identities. */
+class ResourceGauge {
+  /** Retains owners until after the cleanup comparison, including destroyed connections. */
+  constructor() {
+    this.ledgers = new Set()
+    this.queues = new Set()
+    this.emitters = new Set()
+    this.restores = []
+  }
+
+  /** @returns {void} Installs call-through observers before clients are constructed. */
+  install() {
+    this.watch(
+      ShareAckLedger.prototype,
+      [
+        'canStart',
+        'decide',
+        'complete',
+        'completeRange',
+        'dropExpired',
+        'needsFlush',
+        'prepare',
+        'settle',
+        'invalidate',
+      ],
+      this.ledgers
+    )
+    this.watch(
+      RequestQueue.prototype,
+      ['push', 'scheduleRequestTimeoutCheck', 'waitForPendingRequests', 'destroy'],
+      this.queues
+    )
+    this.watch(InstrumentationEventEmitter.prototype, ['addListener', 'emit'], this.emitters)
+  }
+
+  /**
+   * @param {object} prototype Original class prototype.
+   * @param {string[]} names Methods to observe.
+   * @param {Set<object>} seen Original receivers retained for measurement.
+   * @returns {void}
+   */
+  watch(prototype, names, seen) {
+    for (const name of names) {
+      const original = prototype[name]
+      prototype[name] = function (...args) {
+        seen.add(this)
+        return original.apply(this, args)
+      }
+      this.restores.push(() => {
+        prototype[name] = original
+      })
+    }
+  }
+
+  /** @returns {void} Restores observers only after the final resource proof. */
+  uninstall() {
+    for (const restore of this.restores.splice(0).reverse()) restore()
+    this.ledgers.clear()
+    this.queues.clear()
+    this.emitters.clear()
+  }
+
+  /** @returns {number} Entries still held by original ledgers, including retired acquisitions. */
+  ledgerSize() {
+    return [...this.ledgers].reduce((total, ledger) => total + ledger.size, 0)
+  }
+
+  /** @returns {number} Pending and in-flight requests, regardless of socket destruction. */
+  queueDepth() {
+    return [...this.queues].reduce(
+      (total, queue) => total + queue.pending.length + queue.inflight.size,
+      0
+    )
+  }
+
+  /**
+   * @param {Iterable<import('events').EventEmitter>} emitters Original client or queue emitters.
+   * @returns {number} Listeners over every event of every retained emitter.
+   */
+  listenerCount(emitters) {
+    let total = 0
+    for (const emitter of emitters)
+      for (const event of emitter.eventNames()) total += emitter.listenerCount(event)
+    return total
+  }
+
+  /**
+   * @param {object} sources Socket, process-listener and event-loop measurements.
+   * @returns {{ snapshot: () => Promise<object> }} Probe with fixed keys and measured owner totals.
+   */
+  probe(sources) {
+    const probe = createResourceProbe({
+      ...sources,
+      queueDepth: () => this.queueDepth(),
+      ledgerSize: () => this.ledgerSize(),
+    })
+    return {
+      snapshot: async () => {
+        const snapshot = await probe.snapshot()
+        return {
+          ...snapshot,
+          listeners: {
+            ...snapshot.listeners,
+            clients: this.listenerCount([...this.emitters].map(({ emitter }) => emitter)),
+            queues: this.listenerCount(this.queues),
+          },
+        }
+      },
+    }
+  }
+}
+
 /**
  * One live run of the capability scenario on the designated broker line: the line decides whether
  * the public client must refuse share groups, and with which reason, or complete one round trip.
@@ -334,21 +459,19 @@ class CapabilityCase {
     this.sentinel = `e2e-p9e-capability-sentinel-${this.nonce}`
     this.title = null
     this.budgetMs = null
-    this.stack = new CleanupStack()
+    this.stack = new FileCleanupStack()
     this.ledger = new SocketLedger()
     this.acknowledgements = new ShareAcknowledgementObserver()
-    this.probe = createResourceProbe({
+    this.gauge = new ResourceGauge()
+    this.probe = this.gauge.probe({
       emitters: { process },
       sockets: () => this.ledger.counts(),
-      queueDepth: () => this.ledger.pending(),
-      ledgerSize: () => this.openHandlers,
       activeResources: true,
     })
     this.requests = []
     this.crashes = []
     this.acks = []
     this.entries = []
-    this.openHandlers = 0
     this.connects = 0
     this.disconnects = 0
     this.connectAttempts = 0
@@ -498,6 +621,7 @@ class CapabilityCase {
   async default(scope) {
     this.title = TITLE_DEFAULT
     this.budgetMs = DEFAULT_BUDGET_MS
+    this.gauge.install()
     this.acknowledgements.install()
     try {
       const expected = expectedOutcome(this.line)
@@ -509,6 +633,7 @@ class CapabilityCase {
       throw error
     } finally {
       this.acknowledgements.restore()
+      this.gauge.uninstall()
     }
   }
 
@@ -522,6 +647,7 @@ class CapabilityCase {
   async disabled(scope) {
     this.title = TITLE_DISABLED
     this.budgetMs = DISABLED_BUDGET_MS
+    this.gauge.install()
     try {
       this.baseline = await captureShareCleanupBaseline(this.probe, {
         signal: scope,
@@ -530,18 +656,20 @@ class CapabilityCase {
       this.row('resource-baseline', { snapshot: this.baseline })
       const run = new FeatureOffRun({
         capture: () => this.captureOriginal(scope),
-        downgrade: () => this.switchOff(),
+        downgrade: () => bounded(scope, Infinity, () => this.switchOff()),
         observeOff: () => this.observeOff(scope),
         attempt: () => this.attempt(scope),
-        restore: (original) => this.restore(original),
+        restore: (original) =>
+          bounded(
+            NEVER,
+            capabilityBudget(CLEANUP_MS, CLEANUP_MS + FINAL_MS + CASE_JOIN_MS),
+            (signal) => this.restore(original, signal)
+          ),
       })
       let state
-      await this.stack.run(
-        async () => {
-          state = await run.run((outcome) => this.checkRefusal(outcome, FEATURE_DISABLED))
-        },
-        { budgetMs: CLEANUP_MS }
-      )
+      await this.stack.run(async () => {
+        state = await run.run((outcome) => this.checkRefusal(outcome, FEATURE_DISABLED))
+      })
       await this.settleResources(scope)
       this.complete({
         outcome: this.outcomeOf(state.attempt.error),
@@ -554,6 +682,8 @@ class CapabilityCase {
     } catch (error) {
       this.row('case-failed', { error: describeError(error), ...this.progress() })
       throw error
+    } finally {
+      this.gauge.uninstall()
     }
   }
 
@@ -604,13 +734,10 @@ class CapabilityCase {
     this.row('resource-baseline', { snapshot: this.baseline })
     const capture = await this.capture(scope)
     let attempt
-    await this.stack.run(
-      async () => {
-        attempt = await this.attempt(scope)
-        this.checkRefusal({ attempt, retained: {} }, expected)
-      },
-      { budgetMs: CLEANUP_MS }
-    )
+    await this.stack.run(async () => {
+      attempt = await this.attempt(scope)
+      this.checkRefusal({ attempt, retained: {} }, expected)
+    })
     await this.settleResources(scope)
     this.complete({ outcome: this.outcomeOf(attempt.error), capture })
   }
@@ -641,6 +768,8 @@ class CapabilityCase {
    * @returns {void}
    */
   complete(facts) {
+    liveRun.assertClean()
+    capabilityBudget(Infinity)
     this.row('case-complete', {
       status: 'passed',
       tainted: false,
@@ -672,7 +801,9 @@ class CapabilityCase {
     const entry = { argv, output: null, error: null }
     this.feature.transcripts.push(entry)
     try {
+      capabilityBudget(Infinity)
       entry.output = String(execInKafka1(argv)).slice(0, 2000)
+      capabilityBudget(Infinity)
       return entry.output
     } catch (error) {
       entry.error = String(error.message).slice(0, 300)
@@ -731,11 +862,12 @@ class CapabilityCase {
    * Puts the captured level back, proves it by an independent read and, for a level that allows
    * share groups, by one public control connection that is closed again.
    * @param {number|undefined} original the level captured before the change
+   * @param {AbortSignal} scope The restoration scope, bounded by the file deadline.
    * @returns {Promise<void>}
    * @throws {Error} when the level is unknown, the tool fails, the level is not read back or the
    *   control connection is refused
    */
-  async restore(original) {
+  async restore(original, scope) {
     const restore = {
       attempted: true,
       original: original ?? null,
@@ -746,14 +878,16 @@ class CapabilityCase {
     if (original === undefined) {
       throw new Error('The original share.version level is unknown, so none is restored')
     }
-    if ((await this.capture(NEVER)).shareVersion !== original) {
+    const observed = await this.capture(scope)
+    scope.throwIfAborted()
+    if (observed.shareVersion !== original) {
       this.command(original >= 1 ? featureArgv('upgrade', original) : featureArgv('downgrade', 0))
     }
     await pollTolerating(
-      NEVER,
+      scope,
       20000,
-      async () => {
-        restore.observed = (await this.capture(NEVER)).shareVersion
+      async (signal) => {
+        restore.observed = (await this.capture(signal)).shareVersion
         return restore.observed === original
       },
       { delayMs: 250, label: 'The share.version restoration' }
@@ -763,11 +897,12 @@ class CapabilityCase {
         groupId: this.group,
         ...CLIENT_CONFIG,
       })
+      this.stack.add('disconnect feature control', () => control.disconnect({ timeout: 2000 }))
       try {
-        await bounded(NEVER, 10000, () => control.connect())
+        await bounded(scope, 10000, () => control.connect())
         restore.control = 'connected'
       } finally {
-        await bounded(NEVER, 5000, () => control.disconnect({ timeout: 2000 }))
+        await bounded(scope, 5000, () => control.disconnect({ timeout: 2000 }))
       }
     }
     restore.succeeded = true
@@ -781,24 +916,21 @@ class CapabilityCase {
    * @returns {Promise<void>}
    */
   async roundTrip(scope, expected) {
-    await this.stack.run(
-      async () => {
-        this.phase = 'setup'
-        await this.setup(scope)
-        this.phase = 'capture-before'
-        this.before = await this.capture(scope)
-        this.phase = 'delivery'
-        await this.connectAndReceive(scope)
-        this.phase = 'capture-after'
-        this.afterCapture = await this.capture(scope)
-        this.phase = 'observation'
-        await this.observe(scope, expected)
-        this.phase = 'verification'
-        await this.finish(scope)
-        this.phase = 'cleanup'
-      },
-      { budgetMs: CLEANUP_MS }
-    )
+    await this.stack.run(async () => {
+      this.phase = 'setup'
+      await this.setup(scope)
+      this.phase = 'capture-before'
+      this.before = await this.capture(scope)
+      this.phase = 'delivery'
+      await this.connectAndReceive(scope)
+      this.phase = 'capture-after'
+      this.afterCapture = await this.capture(scope)
+      this.phase = 'observation'
+      await this.observe(scope, expected)
+      this.phase = 'verification'
+      await this.finish(scope)
+      this.phase = 'cleanup'
+    })
     await this.completeConnected(scope, expected)
   }
 
@@ -812,8 +944,11 @@ class CapabilityCase {
     this.beforeAdmin = await captureShareCleanupBaseline(this.probe, { signal: scope })
     this.baseline = this.beforeAdmin
     this.admin = this.client('admin').admin()
-    this.admin.on(this.admin.events.REQUEST, ({ payload }) => this.requests.push(payload))
     this.stack.add('prove cleanup and disconnect admin', (signal) => this.cleanup(signal))
+    this.stack.add(
+      'remove admin listeners',
+      this.admin.on(this.admin.events.REQUEST, ({ payload }) => this.requests.push(payload))
+    )
     this.stack.add('delete topic', (signal) => this.deleteTopic(signal))
     this.stack.add('delete group', (signal) => this.deleteGroup(signal, this.group))
     this.stack.add('reset group configs', (signal) => this.resetConfigs(signal))
@@ -846,7 +981,10 @@ class CapabilityCase {
     this.row('resource-baseline', { snapshot: this.baseline })
 
     this.producer = this.client('producer').producer({ idempotent: true })
-    this.producer.on(this.producer.events.REQUEST, ({ payload }) => this.requests.push(payload))
+    this.stack.add(
+      'remove producer listeners',
+      this.producer.on(this.producer.events.REQUEST, ({ payload }) => this.requests.push(payload))
+    )
     this.stack.add('disconnect producer', () => this.producer.disconnect())
     await bounded(scope, 15000, () => this.producer.connect())
   }
@@ -871,15 +1009,10 @@ class CapabilityCase {
     await bounded(scope, 15000, () =>
       consumer.run({
         eachMessage: async ({ topic, partition, message }) => {
-          this.openHandlers++
-          try {
-            this.entries.push({
-              identity: shareRecordIdentity({ ...message, topic, partition }),
-              deliveryCount: message.deliveryCount,
-            })
-          } finally {
-            this.openHandlers--
-          }
+          this.entries.push({
+            identity: shareRecordIdentity({ ...message, topic, partition }),
+            deliveryCount: message.deliveryCount,
+          })
         },
       })
     )
@@ -1129,6 +1262,8 @@ class CapabilityCase {
       { delayMs: 50, label: 'The admin sockets closing' }
     )
     this.row('cleanup', { snapshot: await this.measure(scope) })
+    liveRun.assertClean()
+    capabilityBudget(Infinity)
     this.row('case-complete', {
       status: 'passed',
       tainted: false,
@@ -1288,24 +1423,35 @@ describe('feature-off run', () => {
 })
 
 enabled('share capability on a live broker', () => {
-  beforeAll(
-    () =>
-      bounded(NEVER, HOOK_MS - 2000, () => {
-        liveRun.assertClean()
-      }),
-    HOOK_MS
-  )
+  beforeAll(() => {
+    fileDeadline = performance.now() + FILE_BUDGET_MS
+    return bounded(NEVER, capabilityBudget(HOOK_MS - CASE_JOIN_MS), () => {
+      liveRun.assertClean()
+    })
+  }, HOOK_MS)
 
   it(
     TITLE_DEFAULT,
-    liveCase(DEFAULT_BUDGET_MS, (scope) => new CapabilityCase().default(scope)),
+    liveCase(DEFAULT_BUDGET_MS, (scope) =>
+      bounded(
+        scope,
+        capabilityBudget(DEFAULT_BUDGET_MS, CLEANUP_MS + FINAL_MS + CASE_JOIN_MS),
+        (signal) => new CapabilityCase().default(signal)
+      )
+    ),
     caseTimeout(DEFAULT_BUDGET_MS)
   )
 
   if (LINE === '4.3.1') {
     it(
       TITLE_DISABLED,
-      liveCase(DISABLED_BUDGET_MS, (scope) => new CapabilityCase().disabled(scope)),
+      liveCase(DISABLED_BUDGET_MS, (scope) =>
+        bounded(
+          scope,
+          capabilityBudget(DISABLED_BUDGET_MS, CLEANUP_MS + FINAL_MS + CASE_JOIN_MS),
+          (signal) => new CapabilityCase().disabled(signal)
+        )
+      ),
       caseTimeout(DISABLED_BUDGET_MS)
     )
   }
