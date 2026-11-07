@@ -3,6 +3,8 @@ const { EventEmitter } = require('events')
 const { AsyncLocalStorage } = require('async_hooks')
 const Broker = require('../../../broker')
 const RequestQueue = require('../../../network/requestQueue')
+const InstrumentationEventEmitter = require('../../../instrumentation/emitter')
+const { ShareAckLedger } = require('../shareAckLedger')
 const { ShareFetchLoop } = require('../shareFetchLoop')
 const { ShareRun } = require('../shareRun')
 const { KafkaJSShareAcknowledgementError } = require('../../../errors')
@@ -35,6 +37,7 @@ const {
   acknowledgementResults,
 } = require('../../../../testHelpers/shareLiveDiagnostics')
 const {
+  CASE_JOIN_MS,
   NEVER,
   bounded,
   caseTimeout,
@@ -54,15 +57,18 @@ const enabled = process.env.SHARE_BOUNCE_E2E === '1' ? describe : describe.skip
 const EVIDENCE = 'share-bounce'
 const PROFILE = 'tv2'
 const TITLE = 'preserves share records across clean and hard rolling restarts'
+const FILE_MS = 540000
 const BODY_MS = 500000
 const HOOK_MS = 10000
-const CLEANUP_MS = 45000
-const BUDGET_MS = BODY_MS + CLEANUP_MS
+const CLEANUP_MS = 18000
+const FINAL_MS = 10000
+const BUDGET_MS = FILE_MS - HOOK_MS - CASE_JOIN_MS
 const PARTITIONS = 3
 const RECORDS = 30000
 const BURST_SIZE = 100
 const BURSTS = RECORDS / BURST_SIZE
 const BURST_INTERVAL_MS = 400
+const PRODUCER_MS = 120000
 const LATE_BURST_MS = 1000
 const WARMUP_APPENDS = 2000
 const MAX_OUTAGE_MS = 45000
@@ -1874,6 +1880,118 @@ const auditTerminal = ({
   return { settlement, replay, problems }
 }
 
+/** Observes original resource owners without changing method results or receiver identities. */
+class ResourceGauge {
+  /** Retains owners until after the cleanup comparison, including destroyed connections. */
+  constructor() {
+    this.ledgers = new Set()
+    this.queues = new Set()
+    this.emitters = new Set()
+    this.restores = []
+  }
+
+  /** @returns {void} Installs call-through observers before clients are constructed. */
+  install() {
+    this.watch(
+      ShareAckLedger.prototype,
+      [
+        'canStart',
+        'decide',
+        'complete',
+        'completeRange',
+        'dropExpired',
+        'needsFlush',
+        'prepare',
+        'settle',
+        'invalidate',
+      ],
+      this.ledgers
+    )
+    this.watch(
+      RequestQueue.prototype,
+      ['push', 'scheduleRequestTimeoutCheck', 'waitForPendingRequests', 'destroy'],
+      this.queues
+    )
+    this.watch(InstrumentationEventEmitter.prototype, ['addListener', 'emit'], this.emitters)
+  }
+
+  /**
+   * @param {object} prototype Original class prototype.
+   * @param {string[]} names Methods to observe.
+   * @param {Set<object>} seen Original receivers retained for measurement.
+   * @returns {void}
+   */
+  watch(prototype, names, seen) {
+    for (const name of names) {
+      const original = prototype[name]
+      prototype[name] = function (...args) {
+        seen.add(this)
+        return original.apply(this, args)
+      }
+      this.restores.push(() => {
+        prototype[name] = original
+      })
+    }
+  }
+
+  /** @returns {void} Restores observers only after the final resource proof. */
+  uninstall() {
+    for (const restore of this.restores.splice(0).reverse()) restore()
+    this.ledgers.clear()
+    this.queues.clear()
+    this.emitters.clear()
+  }
+
+  /** @returns {number} Entries still held by original ledgers, including retired acquisitions. */
+  ledgerSize() {
+    return [...this.ledgers].reduce((total, ledger) => total + ledger.size, 0)
+  }
+
+  /** @returns {number} Pending and in-flight requests, regardless of socket destruction. */
+  queueDepth() {
+    return [...this.queues].reduce(
+      (total, queue) => total + queue.pending.length + queue.inflight.size,
+      0
+    )
+  }
+
+  /**
+   * @param {Iterable<import('events').EventEmitter>} emitters Original client or queue emitters.
+   * @returns {number} Listeners over every event of every retained emitter.
+   */
+  listenerCount(emitters) {
+    let total = 0
+    for (const emitter of emitters)
+      for (const event of emitter.eventNames()) total += emitter.listenerCount(event)
+    return total
+  }
+
+  /**
+   * @param {object} sources Socket, process-listener and event-loop measurements.
+   * @returns {{ snapshot: () => Promise<object> }} Probe with fixed keys and measured owner totals.
+   */
+  probe(sources) {
+    const probe = createResourceProbe({
+      ...sources,
+      queueDepth: () => this.queueDepth(),
+      ledgerSize: () => this.ledgerSize(),
+    })
+    return {
+      snapshot: async () => {
+        const snapshot = await probe.snapshot()
+        return {
+          ...snapshot,
+          listeners: {
+            ...snapshot.listeners,
+            clients: this.listenerCount([...this.emitters].map(({ emitter }) => emitter)),
+            queues: this.listenerCount(this.queues),
+          },
+        }
+      },
+    }
+  }
+}
+
 /**
  * One live run of the bounce scenario: a share member reads three partitions of a replication
  * factor three, min-ISR two topic while a producer appends 30000 records, and every broker is taken
@@ -1889,15 +2007,13 @@ class ShareBounceCase {
     this.stack = new CleanupStack()
     this.tap = new ShareWireTap()
     this.evidence = new BounceEvidence(this)
-    this.probe = createResourceProbe({
+    this.gauge = new ResourceGauge()
+    this.probe = this.gauge.probe({
       emitters: { process },
       sockets: () => this.tap.socketCounts(),
-      queueDepth: () => this.tap.pending(),
-      ledgerSize: () => this.openHandlers,
       activeResources: true,
     })
     this.bouncer = new BrokerBouncer({ now: () => performance.now() })
-    this.openHandlers = 0
     this.requests = []
     this.expected = []
     this.sends = []
@@ -1954,7 +2070,13 @@ class ShareBounceCase {
       profile: PROFILE,
       scenario: this.nonce,
       groups: { bounce: this.group },
-      budgets: { caseMs: BUDGET_MS, cleanupMs: CLEANUP_MS },
+      budgets: {
+        fileMs: FILE_MS,
+        caseMs: BUDGET_MS,
+        bodyMs: BODY_MS,
+        cleanupMs: CLEANUP_MS,
+        finalMs: FINAL_MS,
+      },
       wireVersions: wireVersionsOf(this.requests),
       ...fields,
     })
@@ -1983,62 +2105,86 @@ class ShareBounceCase {
   /**
    * @param {number} limit the phase's own allowance, ms
    * @param {number} [reserve] what later phases still need, ms
-   * @returns {number} the allowance, cut to what the case budget has left
+   * @returns {number} the allowance, cut to what the selection has left
+   * @throws {Error} when no phase time remains after reserving later work
    */
-  window(limit, reserve = CLEANUP_MS) {
-    return Math.max(1000, Math.min(limit, this.deadline - performance.now() - reserve))
+  window(limit, reserve = CLEANUP_MS + FINAL_MS) {
+    const remaining = this.deadline - performance.now() - reserve
+    if (remaining <= 0) throw new Error('The selection deadline has no phase time left')
+    return Math.min(limit, remaining)
   }
 
   /**
    * Runs the whole case: setup, the concurrent produce and bounce, settlement, the three oracles
    * and strict cleanup.
    * @param {AbortSignal} scope the case scope
+   * @param {number} deadline Absolute selection deadline, including the join reserve.
    * @returns {Promise<void>}
    * @throws {Error} the first assertion or fixture failure, with cleanup failures attached
    */
-  async run(scope) {
-    this.deadline = performance.now() + BUDGET_MS
+  async run(scope, deadline) {
+    this.deadline = deadline - CASE_JOIN_MS
+    this.gauge.install()
     this.evidence.install()
-    this.stack.add('restore test observers', () => this.evidence.restore())
     try {
-      await this.stack.run(
-        async () => {
-          await this.setup(scope)
-          await bounded(scope, this.window(330000, 100000), (inner) => this.drive(inner), {
+      let primary
+      try {
+        const bodyDeadline = performance.now() + this.window(BODY_MS)
+        this.beforeAdmin = await captureShareCleanupBaseline(this.probe, { signal: scope })
+        this.baseline = this.beforeAdmin
+        const remaining = bodyDeadline - performance.now()
+        if (remaining <= 0) throw new Error('The body deadline passed during baseline capture')
+        await bounded(scope, remaining, async (body) => {
+          await this.setup(body)
+          await bounded(body, this.window(330000, 100000), (inner) => this.drive(inner), {
             label: 'The produce and bounce',
           })
-          await bounded(scope, this.window(60000, 70000), (inner) => this.drain(inner), {
+          await bounded(body, this.window(60000, 70000), (inner) => this.drain(inner), {
             label: 'The settlement',
           })
-          await this.observe(scope)
-          await this.finish(scope)
-        },
-        { budgetMs: CLEANUP_MS }
-      )
-      await this.complete(scope)
+          await this.observe(body)
+          await this.finish(body)
+          if (performance.now() > bodyDeadline) throw new Error('The body deadline passed')
+        })
+      } catch (error) {
+        primary = error
+      }
+      const cleanupErrors = await this.stack.closeAll({
+        budgetMs: Math.max(0, Math.min(CLEANUP_MS, this.deadline - performance.now() - FINAL_MS)),
+      })
+      if (primary) {
+        primary.cleanupErrors = cleanupErrors
+        throw primary
+      }
+      if (cleanupErrors.length) throw new AggregateError(cleanupErrors, 'Cleanup failed')
+      await bounded(scope, this.window(FINAL_MS, 0), (inner) => this.complete(inner))
     } catch (error) {
       this.archive()
       this.row('case-failed', { error: describeError(error), ...this.progress() })
       throw error
+    } finally {
+      this.evidence.restore()
+      this.gauge.uninstall()
     }
   }
 
   /**
    * Checks the cluster shape, creates the replication factor three topic, applies and reads back
-   * the group config, measures the baseline, and starts a producer and the member, waiting until the
-   * member and the admin API agree on its membership.
+   * the group config, and starts a producer and the member, waiting until the member and the admin
+   * API agree on its membership.
    * @param {AbortSignal} scope the case scope
    * @returns {Promise<void>}
    * @throws {Error} when the cluster does not match the scenario or the member never joins
    */
   async setup(scope) {
-    this.beforeAdmin = await captureShareCleanupBaseline(this.probe, { signal: scope })
-    this.baseline = this.beforeAdmin
     this.assertOwnership()
     await bounded(scope, 30000, () => this.bouncer.assertAllUp())
     this.admin = this.client('admin').admin()
-    this.admin.on(this.admin.events.REQUEST, ({ payload }) => this.requests.push(payload))
+    const removeAdmin = this.admin.on(this.admin.events.REQUEST, ({ payload }) =>
+      this.requests.push(payload)
+    )
     this.stack.add('prove cleanup and disconnect admin', (signal) => this.cleanup(signal))
+    this.stack.add('remove admin listeners', removeAdmin)
     this.stack.add('delete topic', (signal) => this.deleteTopic(signal))
     this.stack.add('delete group', (signal) => this.deleteGroup(signal))
     this.stack.add('reset group configs', (signal) => this.resetConfigs(signal))
@@ -2068,7 +2214,10 @@ class ShareBounceCase {
       maxInFlightRequests: 5,
       retry: RETRY,
     })
-    this.producer.on(this.producer.events.REQUEST, ({ payload }) => this.requests.push(payload))
+    this.stack.add(
+      'remove producer listeners',
+      this.producer.on(this.producer.events.REQUEST, ({ payload }) => this.requests.push(payload))
+    )
     this.stack.add('disconnect producer', () => this.producer.disconnect())
     await bounded(scope, 15000, () => this.producer.connect())
     await this.startMember(scope)
@@ -2206,7 +2355,6 @@ class ShareBounceCase {
     await bounded(scope, 20000, () =>
       consumer.run({
         eachMessage: async ({ topic, partition, message }) => {
-          this.openHandlers++
           const identity = shareRecordIdentity({ ...message, topic, partition })
           this.seen.add(identity)
           const acquisition = this.evidence.handlers.getStore()
@@ -2232,7 +2380,6 @@ class ShareBounceCase {
             ),
             ...this.tap.stamp(),
           })
-          this.openHandlers--
         },
       })
     )
@@ -2344,6 +2491,9 @@ class ShareBounceCase {
       if (kind !== 'stop' && kind !== 'kill') return run(kind, service)
       this.freeze(kind, service)
       const frozen = this.snapshots[this.snapshots.length - 1]
+      if (frozen.at < this.produceStart || performance.now() >= this.produceStart + PRODUCER_MS) {
+        throw new Error('A down action would start outside the producer interval')
+      }
       const result = await run(kind, service)
       frozen.downAt = performance.now()
       return result
@@ -2397,24 +2547,43 @@ class ShareBounceCase {
    * send before the next burst is due. A late burst fails the run rather than change the duration.
    * @param {AbortSignal} scope the phase scope
    * @returns {Promise<void>}
-   * @throws {Error} when a burst starts more than a second late
+   * @throws {Error} when a burst starts more than a second late or a send exceeds the deadline
    */
   async produce(scope) {
     const start = performance.now()
+    const deadline = start + PRODUCER_MS
     this.produceStart = start
-    for (let burst = 0; burst < BURSTS; burst++) {
-      const wait = start + burst * BURST_INTERVAL_MS - performance.now()
-      if (wait > 0) await delay(scope, wait)
-      scope.throwIfAborted()
-      const late = Math.max(0, -wait)
-      if (late > LATE_BURST_MS) {
-        throw new Error(`Burst ${burst} started ${Math.round(late)} ms late`)
-      }
-      this.lateness = Math.max(this.lateness, late)
-      this.sendBurst(burst)
-    }
-    await Promise.all(this.pendingSends)
-    this.produceEnd = performance.now()
+    this.produceEnd = deadline
+    await bounded(
+      scope,
+      deadline - performance.now(),
+      async (phase) => {
+        for (let burst = 0; burst < BURSTS; burst++) {
+          const scheduledAt = start + burst * BURST_INTERVAL_MS
+          const wait = scheduledAt - performance.now()
+          if (wait > 0) await delay(phase, wait)
+          phase.throwIfAborted()
+          const now = performance.now()
+          const late = Math.max(0, now - scheduledAt)
+          if (late > LATE_BURST_MS) {
+            throw new Error(`Burst ${burst} started ${Math.round(late)} ms late`)
+          }
+          if (now >= deadline) throw new Error('The producer deadline passed before a burst')
+          this.lateness = Math.max(this.lateness, late)
+          this.sendBurst(burst)
+        }
+        await Promise.all(this.pendingSends)
+        if (
+          performance.now() > deadline ||
+          this.sends.some(({ settledAt }) => settledAt === null || settledAt > deadline)
+        ) {
+          throw new Error('A send did not settle within the producer interval')
+        }
+      },
+      { label: 'The producer appends' }
+    )
+    while (performance.now() < deadline) await delay(scope, deadline - performance.now())
+    scope.throwIfAborted()
   }
 
   /**
@@ -2720,9 +2889,12 @@ class ShareBounceCase {
         assignmentChanges: this.changes.filter(inside).length,
       }
     })
+    const producerDeadline = this.produceStart + PRODUCER_MS
+    expect(this.produceEnd).toBe(producerDeadline)
     for (const fact of this.bounceFacts) {
       expect(fact.outageMs).toBeLessThan(MAX_OUTAGE_MS)
-      expect(fact.frozenAt).toBeLessThanOrEqual(this.produceEnd)
+      expect(fact.frozenAt).toBeGreaterThanOrEqual(this.produceStart)
+      expect(fact.frozenAt).toBeLessThan(producerDeadline)
       expect({ index: fact.index, joins: fact.joins }).toEqual({ index: fact.index, joins: 0 })
       expect({ index: fact.index, changes: fact.assignmentChanges }).toEqual({
         index: fact.index,
@@ -3037,6 +3209,8 @@ class ShareBounceCase {
     const final = await bounded(scope, 10000, () => this.probe.snapshot())
     this.row('cleanup', { snapshot: final })
     const { extras, perBounce } = this.replay
+    scope.throwIfAborted()
+    if (performance.now() >= this.deadline) throw new Error('The selection deadline passed')
     this.row('case-complete', {
       status: 'passed',
       tainted: false,
@@ -5333,17 +5507,17 @@ describe('share bounce acquisition and settlement sensitivity', () => {
 })
 
 enabled('share bounce on a live group', () => {
-  beforeAll(
-    () =>
-      bounded(NEVER, HOOK_MS - 2000, () => {
-        liveRun.assertClean()
-      }),
-    HOOK_MS
-  )
+  let deadline
+  beforeAll(() => {
+    deadline = performance.now() + FILE_MS
+    return bounded(NEVER, HOOK_MS - CASE_JOIN_MS, () => {
+      liveRun.assertClean()
+    })
+  }, HOOK_MS)
 
   it(
     TITLE,
-    liveCase(BUDGET_MS, (scope) => new ShareBounceCase().run(scope)),
+    liveCase(BUDGET_MS, (scope) => new ShareBounceCase().run(scope, deadline)),
     caseTimeout(BUDGET_MS)
   )
 
