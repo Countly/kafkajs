@@ -1260,7 +1260,7 @@ describe('broker telemetry fixture', () => {
       )
     const base = (node, group, kafkas) =>
       kafkas.map((kafka) => ({ node, kafka, group, compose: 'docker-compose.yml' }))
-    const noPlugin = ['4.3.1', '4.2.2', '4.1.2', '4.0.2', '4.4.0']
+    const noPlugin = ['4.3.1', '4.2.2', '4.1.2', '4.0.2']
     const rowsOf = (node, full) => {
       const rows = []
       for (const group of configuredGroups)
@@ -1270,16 +1270,16 @@ describe('broker telemetry fixture', () => {
           )
         )
       rows.push(...base(node, 'telemetry-base', full ? noPlugin : ['4.3.1', '4.4.0']))
-      rows.push(...base(node, 'telemetry-unsupported', full ? noPlugin : ['4.3.1', '4.4.0']))
+      rows.push(...base(node, 'telemetry-unsupported', full ? noPlugin : ['4.3.1']))
       if (full) rows.push(...base(node, 'telemetry-outcomes', ['4.1.2']))
       return rows
     }
     expect(catalogue(false)).toEqual(rowsOf(24, false))
-    expect(catalogue(false)).toHaveLength(11)
+    expect(catalogue(false)).toHaveLength(10)
     const required = [22, 24, 26].flatMap((node) => rowsOf(node, true))
     expect(catalogue(true)).toEqual(required)
-    expect(new Set(catalogue(true).map(JSON.stringify)).size).toBe(75)
-    expect(new Set(catalogue(true).map((r) => `${r.group}-${r.kafka}-${r.node}`)).size).toBe(75)
+    expect(new Set(catalogue(true).map(JSON.stringify)).size).toBe(69)
+    expect(new Set(catalogue(true).map((r) => `${r.group}-${r.kafka}-${r.node}`)).size).toBe(69)
     const job = workflow.jobs.telemetry
     for (const identity of ['github.run_id', 'github.run_attempt', 'strategy.job-index'])
       expect(job.env.COMPOSE_PROJECT_NAME).toContain(identity)
@@ -1428,7 +1428,7 @@ describe('Java telemetry role runner', () => {
     const fixture = path.join(root, 'scripts/e2e/telemetry')
     const digest = (file) => createHash('sha256').update(fs.readFileSync(file)).digest('hex')
     expect(digest(path.join(fixture, 'JavaTelemetryClient.java'))).toBe(
-      'd3ed209142b991ed9c2f1a61c92ed98fec83c9daa796175af117cf95dcd27031'
+      '22453ff50c260d8174d81112d3cc67b0c4ca516226aca2cd2c52fc30e61f523f'
     )
     expect(digest(path.join(fixture, 'telemetryWireProbe.js'))).toBe(
       '139afdbec5034f7c1498b90306889fd918ae13097efee1ea9f435b03dcf9b1b1'
@@ -1461,77 +1461,112 @@ describe('Java telemetry role runner', () => {
 })
 
 describe('broker cache retirement trace', () => {
-  const { cacheRetirement, retirementsOf } = require('../telemetry/cacheTrace')
-  const removing = (id) =>
-    `[2026-11-07 10:00:00,000] TRACE Removing client connection id [${id}] from the client instance cache (org.apache.kafka.server.ClientMetricsManager)`
-  const missing = (id) =>
-    `[2026-11-07 10:00:00,001] TRACE Client connection id [${id}] is not found in the client instance cache (org.apache.kafka.server.ClientMetricsManager)`
+  const { cacheRetirement } = require('../telemetry/cacheTrace')
+  const uuid = '00112233-4455-6677-8899-aabbccddeeff'
   const registered = '172.18.0.3:9092-172.18.0.1:54321-3'
-  const plain = '172.18.0.3:9092-172.18.0.1:54999-4'
-  const logs = (overrides = {}) => ({
-    1: { text: [removing(plain), missing(plain), removing(registered)].join('\n') },
-    2: { text: '' },
-    3: { text: '' },
-    ...overrides,
-  })
-
-  test('accepts one registered connection retired on the expected node and listener', () => {
-    expect(cacheRetirement({ logs: logs(), node: '1', localPort: '9092' })).toEqual({
-      source: 'broker-disconnect-trace',
+  const removing = (id) =>
+    `TRACE Removing client connection id [${id}] from the client instance cache`
+  const input = () => ({
+    node: '1',
+    localPort: '9092',
+    uuid,
+    since: '2026-11-07T10:00:00Z',
+    completedAt: '2026-11-07T10:00:05Z',
+    source: { sha256: 'a'.repeat(64) },
+    get: {
+      socketId: 1,
       node: '1',
-      connectionIdentity: { node: '1', localPort: '9092' },
+      requestKey: 'r1',
+      clientId: 'candidate',
+      correlation: 7,
+      uuid: '00000000-0000-0000-0000-000000000000',
+      response: { errorCode: 0, uuid },
+    },
+    connect: {
+      socketId: 1,
+      node: '1',
+      localAddress: '127.0.0.1',
+      localPort: 54321,
+      remoteAddress: '127.0.0.1',
+      remotePort: 19092,
+    },
+    logs: {
+      1: {
+        text: `TRACE Completed request:RequestHeader(apiKey=GET_TELEMETRY_SUBSCRIPTIONS, clientId=candidate, correlationId=7) -- GetTelemetrySubscriptionsRequestData(clientInstanceId=00000000-0000-0000-0000-000000000000) with response:GetTelemetrySubscriptionsResponseData(clientInstanceId=${uuid}) from connection ${registered};totalTime:1\n${removing(registered)}`,
+      },
+      2: { text: '' },
+      3: { text: '' },
+    },
+  })
+  test('joins the captured Get, UUID and client endpoints through the exact server connection', () => {
+    expect(cacheRetirement(input())).toMatchObject({
       connectionId: registered,
-      line: expect.stringContaining(registered),
+      connectionIdentity: { uuid, connectionId: registered, client: { localPort: 54321 } },
     })
   })
-
-  test('does not count a removal followed by not-found for the same connection', () => {
-    expect(retirementsOf([removing(plain), missing(plain)].join('\n'))).toEqual([])
-    expect(() =>
-      cacheRetirement({
-        logs: logs({ 1: { text: [removing(plain), missing(plain)].join('\n') } }),
-        node: '1',
-        localPort: '9092',
-      })
-    ).toThrow('No client instance cache retirement was logged')
-  })
-
   test.each([
-    ['an absent event', { 1: { text: '' } }, 'No client instance cache retirement was logged'],
     [
-      'a truncated log',
-      { 3: { text: '', truncated: true } },
-      'Broker 3 log is unavailable or truncated',
+      'a duplicate exact retirement',
+      (i) => {
+        i.logs[1].text += `\n${removing(registered)}`
+      },
     ],
-    ['an unavailable log', { 2: undefined }, 'Broker 2 log is unavailable or truncated'],
+    [
+      'another connection on the same listener',
+      (i) => {
+        i.logs[1].text = i.logs[1].text.replace(
+          removing(registered),
+          removing('172.18.0.3:9092-172.18.0.1:54322-4')
+        )
+      },
+    ],
+    [
+      'another UUID',
+      (i) => {
+        i.uuid = '11223344-4455-6677-8899-aabbccddeeff'
+      },
+    ],
     [
       'another node',
-      { 2: { text: removing('172.18.0.4:9095-172.18.0.1:50000-1') }, 1: { text: '' } },
-      'Retirement on node 2, expected 1',
+      (i) => {
+        i.logs[2] = i.logs[1]
+        i.logs[1] = { text: '' }
+      },
     ],
     [
-      'another listener',
-      { 1: { text: removing('172.18.0.3:9093-172.18.0.1:50000-1') } },
-      'Retirement on listener 9093, expected 9092',
+      'a delayed not-found line',
+      (i) => {
+        i.logs[1].text += `\nTRACE Client connection id [${registered}] is not found in the client instance cache`
+      },
     ],
     [
-      'a second retirement',
-      { 2: { text: removing('172.18.0.4:9095-172.18.0.1:50001-2') } },
-      'Expected one cache retirement, found 2',
+      'a truncated log',
+      (i) => {
+        i.logs[3].truncated = true
+      },
     ],
-  ])('rejects %s', (_name, overrides, message) => {
-    expect(() => cacheRetirement({ logs: logs(overrides), node: '1', localPort: '9092' })).toThrow(
-      message
-    )
-  })
-
-  test('rejects a missing broker log and a malformed connection id', () => {
-    expect(() =>
-      cacheRetirement({ logs: { 1: { text: '' } }, node: '1', localPort: '9092' })
-    ).toThrow('Expected the logs of brokers 1, 2 and 3')
-    expect(() => retirementsOf(removing('not-a-connection'))).toThrow(
-      'Unrecognized broker connection id'
-    )
+    [
+      'an unavailable log',
+      (i) => {
+        delete i.logs[2]
+      },
+    ],
+    [
+      'an incomplete episode',
+      (i) => {
+        i.completedAt = i.since
+      },
+    ],
+    [
+      'a wrong correlation',
+      (i) => {
+        i.get.correlation = 8
+      },
+    ],
+  ])('rejects %s', (_name, change) => {
+    const value = input()
+    change(value)
+    expect(() => cacheRetirement(value)).toThrow()
   })
 })
 
@@ -1541,6 +1576,7 @@ describe('live telemetry scenario evidence accounting', () => {
     type: 'request',
     requestKey: 'r1',
     apiKey: 72,
+    apiVersion: 0,
     socketId: 1,
     terminating: false,
     response: { errorCode: 0 },
@@ -1548,22 +1584,59 @@ describe('live telemetry scenario evidence accounting', () => {
   })
   const owners = (record) => ({ producer: { records: [record] } })
 
-  test('accepts successes, declared errors, cut-off finals and faulted-socket requests', () => {
-    expect(() =>
-      evidence.assertStreamAccounted(
+  test('allows only the exact request captured at a public-close boundary', () => {
+    const r = request({ writeAt: 10, response: undefined })
+    const transcript = {
+      records: [r],
+      sockets: [{ id: 1, closedAt: 13 }],
+      closures: [{ at: 11, end: 12, pending: ['r1'] }],
+      cancellations: [
         {
-          producer: {
-            records: [
-              request(),
-              request({ requestKey: 'r2', response: { errorCode: 117 } }),
-              request({ requestKey: 'r3', terminating: true, response: undefined }),
-              request({ requestKey: 'r4', apiKey: 71, socketId: 2, response: undefined }),
-            ],
-          },
+          requestKey: 'r1',
+          apiKey: 72,
+          socketId: 1,
+          writeAt: 10,
+          at: 11,
+          end: 13,
+          disposition: 'close-in-flight',
         },
-        { errors: { producer: [117] }, faultedSockets: { producer: [2] } }
-      )
-    ).not.toThrow()
+      ],
+    }
+    expect(() => evidence.assertStreamAccounted({ producer: transcript })).not.toThrow()
+    expect(() =>
+      evidence.assertStreamAccounted({
+        producer: {
+          ...transcript,
+          records: [
+            ...transcript.records,
+            request({ requestKey: 'r2', apiKey: 71, writeAt: 9, response: undefined }),
+          ],
+        },
+      })
+    ).toThrow('Unanswered')
+    for (const field of [
+      'requestKey',
+      'apiKey',
+      'socketId',
+      'writeAt',
+      'at',
+      'end',
+      'disposition',
+    ]) {
+      const bad = JSON.parse(JSON.stringify(transcript))
+      bad.cancellations[0][field] = 'foreign'
+      expect(() => evidence.assertStreamAccounted({ producer: bad })).toThrow()
+    }
+  })
+  test('does not allow an unanswered final or all requests of a faulted socket implicitly', () => {
+    expect(() =>
+      evidence.assertStreamAccounted(owners(request({ terminating: true, response: undefined })))
+    ).toThrow('Unanswered')
+    expect(() =>
+      evidence.assertStreamAccounted(owners(request({ response: undefined })), {
+        faultedSockets: { producer: [1] },
+      })
+    ).toThrow('Unanswered')
   })
 
   test.each([
@@ -1579,12 +1652,12 @@ describe('live telemetry scenario evidence accounting', () => {
       { errors: { admin: [117] } },
       'Undeclared error 117',
     ],
-    ['an unanswered normal Push', request({ response: undefined }), {}, 'Unanswered 72 request r1'],
+    ['an unanswered normal Push', request({ response: undefined }), {}, 'Unanswered'],
     [
       'an unanswered Get off a faulted socket',
       request({ apiKey: 71, socketId: 3, response: undefined }),
       { faultedSockets: { producer: [2] } },
-      'Unanswered 71 request r1',
+      'Unanswered',
     ],
   ])('rejects %s', (_name, record, allowed, message) => {
     expect(() => evidence.assertStreamAccounted(owners(record), allowed)).toThrow(message)
@@ -1636,4 +1709,278 @@ describe('live telemetry scenario evidence accounting', () => {
       )
     }
   )
+})
+
+describe('complete telemetry evidence controls', () => {
+  const { assertCatalogue, assertCadence, assertJavaRows } = require('../telemetry/semantics')
+  const pushes = [
+    { owner: 'a', requestKey: 'r1' },
+    { owner: 'a', requestKey: 'r2' },
+  ]
+  test('rejects an omitted, invented or duplicated accepted Push', () => {
+    expect(() => assertCatalogue(pushes, pushes)).not.toThrow()
+    for (const bad of [
+      pushes.slice(0, 1),
+      [...pushes, { owner: 'a', requestKey: 'r3' }],
+      [pushes[0], pushes[0]],
+    ])
+      expect(() => assertCatalogue(bad, pushes)).toThrow('Incomplete Push catalogue')
+  })
+  test('rejects the first premature poll even when a later poll is on time', () => {
+    expect(() => assertCadence([{ writeAt: 1100 }, { writeAt: 2100 }], 100, 1000)).not.toThrow()
+    expect(() => assertCadence([{ writeAt: 200 }, { writeAt: 1100 }], 100, 1000)).toThrow(
+      'Early telemetry request'
+    )
+  })
+  test('rejects a Push before the full response-relative interval', () => {
+    expect(() =>
+      assertCadence([{ writeAt: 1000, response: { responseAt: 1050 } }, { writeAt: 2000 }], 0, 1000)
+    ).toThrow('Early telemetry request')
+  })
+  const row = (final = false, later = false) => ({
+    clientId: 'java-producer',
+    pushIntervalMs: 1000,
+    parse: 'ok',
+    truncated: false,
+    terminating: final,
+    tsMs: final ? 35 : later ? 20 : 10,
+    resourceMetricsCount: 1,
+    metricsTotal: 4,
+    metricsKept: 4,
+    pointsTotal: 4,
+    resources: [{ attrs: [], droppedAttributes: 0 }],
+    metrics: [
+      {
+        name: 'org.apache.kafka.producer.connection.creation.total',
+        kind: 'SUM',
+        monotonic: true,
+        temporality: 'AGGREGATION_TEMPORALITY_DELTA',
+        points: [
+          {
+            attrs: [],
+            valueKind: 'AS_DOUBLE',
+            asDouble: later ? '0.0' : '1.0',
+            startNs: '1',
+            timeNs: '2',
+          },
+        ],
+      },
+      {
+        name: 'org.apache.kafka.tf1.custom.gauge.double',
+        kind: 'GAUGE',
+        points: [
+          {
+            attrs: [],
+            valueKind: 'AS_DOUBLE',
+            asDouble: '42.5',
+            asDoubleBits: '4045400000000000',
+            timeNs: '2',
+          },
+        ],
+      },
+      {
+        name: 'org.apache.kafka.tf1.custom.gauge.long',
+        kind: 'GAUGE',
+        points: [{ attrs: [], valueKind: 'AS_INT', asInt: '4242', timeNs: '2' }],
+      },
+      {
+        name: 'org.apache.kafka.tf1.custom.sum.total',
+        kind: 'SUM',
+        monotonic: true,
+        temporality: 'AGGREGATION_TEMPORALITY_DELTA',
+        points: [
+          {
+            attrs: [],
+            valueKind: 'AS_DOUBLE',
+            asDouble: later ? '0.0' : '7.0',
+            startNs: '1',
+            timeNs: '2',
+          },
+        ],
+      },
+    ].map((m) => ({
+      ...m,
+      res: 0,
+      pointsInMessage: 1,
+      points: m.points.map((p) => ({ ...p, flags: 0 })),
+    })),
+  })
+  const episode = {
+    clientId: 'java-producer',
+    closing: { closing: true, epochMs: 30 },
+    closed: { closed: true, epochMs: 40 },
+  }
+  test('checks every Java row and the actual closed marker', () => {
+    const rows = [row(), row(false, true), row(true, true)]
+    expect(() => assertJavaRows('producer', rows, episode)).not.toThrow()
+    for (const mutate of [
+      (r) => {
+        r[1].metrics[1].points[0].asDouble = '41.0'
+      },
+      (r) => {
+        r[1].metrics.shift()
+      },
+      (r) => {
+        r[1].metrics.push(r[1].metrics[0])
+      },
+      (r) => {
+        r[1].metrics.push({ ...r[1].metrics[0], name: 'org.apache.kafka.tf1.custom.extra' })
+      },
+    ]) {
+      const bad = JSON.parse(JSON.stringify(rows))
+      mutate(bad)
+      expect(() => assertJavaRows('producer', bad, episode)).toThrow()
+    }
+    expect(() =>
+      assertJavaRows('producer', rows, { ...episode, closed: { closed: false, epochMs: 40 } })
+    ).toThrow()
+  })
+})
+
+describe('physical telemetry absence controls', () => {
+  const { ordinaryOwnership } = require('../telemetry/semantics')
+  test('rejects an additional socket that sent only setup frames', () => {
+    const baseline = {
+      records: [{ type: 'request', apiKey: 18, socketId: 1 }],
+      sockets: [{ id: 1, node: '1', kind: 'normal', foregroundBootstrap: true }],
+    }
+    expect(ordinaryOwnership(baseline)).toEqual(['1:bootstrap'])
+    for (const kind of ['undecided', 'normal', 'telemetry'])
+      expect(() =>
+        ordinaryOwnership({
+          ...baseline,
+          sockets: [...baseline.sockets, { id: 2, node: '1', kind }],
+        })
+      ).toThrow()
+  })
+})
+
+describe('raw share acknowledgement evidence', () => {
+  const { confirmedDecisions } = require('../telemetry/shareEvidence')
+  const Encoder = require('../../../src/protocol/encoder')
+  const request = require('../../../src/protocol/requests/shareAcknowledge/fixtures/java/shareAcknowledgeRequest-v2-uniform10.json')
+  const response = require('../../../src/protocol/requests/shareAcknowledge/fixtures/java/shareAcknowledgeResponse-v2-mixed.json')
+  const frame = (bytes) => new Encoder().writeInt32(bytes.length).writeBuffer(bytes).buffer
+  const raw = () => ({
+    requestHex: frame(
+      new Encoder()
+        .writeInt16(79)
+        .writeInt16(2)
+        .writeInt32(7)
+        .writeString('tap')
+        .writeTaggedFields([])
+        .writeBuffer(Buffer.from(request.hex, 'hex')).buffer
+    ).toString('hex'),
+    responseHex: frame(
+      new Encoder()
+        .writeInt32(7)
+        .writeTaggedFields([])
+        .writeBuffer(Buffer.from(response.hex, 'hex')).buffer
+    ).toString('hex'),
+    responseAt: 12,
+  })
+  test('joins original request ranges and successful broker partition responses without losing int64 precision', () => {
+    const decisions = confirmedDecisions([raw()], 'share-group')
+    expect(decisions.map((d) => [d.offset, d.type])).toEqual(
+      Array.from({ length: 10 }, (_, i) => [String(9007199254740993n + BigInt(i)), 1])
+    )
+  })
+  test('rejects a foreign correlation and refuses unsuccessful broker confirmations', () => {
+    const foreign = raw()
+    const bytes = Buffer.from(foreign.responseHex, 'hex')
+    bytes.writeInt32BE(8, 4)
+    foreign.responseHex = bytes.toString('hex')
+    expect(() => confirmedDecisions([foreign], 'share-group')).toThrow()
+    const refused = raw()
+    const error = Buffer.from(refused.responseHex, 'hex')
+    error.writeInt16BE(121, 13)
+    refused.responseHex = error.toString('hex')
+    expect(confirmedDecisions([refused], 'share-group')).toEqual([])
+  })
+})
+
+describe('custom metric archive conclusions', () => {
+  const { verifyCustom } = require('../telemetry/evidence')
+  const fixture = () => {
+    const sample = (index, values, startNs = '1') => ({
+      request: {
+        requestKey: `r${index}`,
+        apiKey: 72,
+        index,
+        response: { errorCode: 0 },
+        metricsBytes: 10,
+      },
+      exportIdentity: { node: '1', seq: index / 10 },
+      decoded: {
+        metrics: Object.entries(values).map(([name, value]) => ({
+          name: `com.example.${name}`,
+          unit: '1',
+          kind: name === 'total' ? 'SUM' : 'GAUGE',
+          ...(name === 'total'
+            ? { monotonic: true, temporality: 'AGGREGATION_TEMPORALITY_DELTA' }
+            : {}),
+          points: [
+            {
+              attrs: [['series', 'string', 'live']],
+              startNs,
+              timeNs: '200',
+              valueKind: name === 'total' ? 'AS_INT' : 'AS_DOUBLE',
+              ...(name === 'total' ? { asInt: value } : { asDouble: value }),
+              ...(name === 'zero'
+                ? { asDoubleBits: '0' }
+                : name === 'negative' && value === '-2.5'
+                  ? { asDoubleBits: 'c004000000000000' }
+                  : {}),
+            },
+          ],
+        })),
+      },
+    })
+    const samples = [
+      sample(10, { anchor: '1.0', zero: '0.0', negative: '-2.5', total: '9007199254740993' }),
+      sample(20, { anchor: '1.0', zero: '6.25', negative: '-3.5', total: '9' }),
+      sample(30, { anchor: '1.0', zero: '6.25', negative: '-3.5', total: '0' }),
+      sample(40, { anchor: '1.0', negative: '-3.5' }),
+      sample(50, { anchor: '1.0', negative: '-3.5', total: '1' }, '100'),
+    ]
+    const results = {
+      firstRequestKey: 'r10',
+      update: { updateFence: 15, requestKeys: ['r20', 'r30'], states: ['updated', 'following'] },
+      removal: {
+        requestKey: 'r40',
+        removeFence: 35,
+        cursor: { 1: 3 },
+        names: ['com.example.anchor', 'com.example.negative'],
+      },
+      readded: { requestKey: 'r50', readdFence: 45, startNs: '100', asInt: '1' },
+      unregisterFence: 55,
+    }
+    return {
+      results,
+      samples: Object.fromEntries(samples.map((s) => [`producer:${s.request.requestKey}`, s])),
+      transcript: { records: samples.map((s) => s.request) },
+    }
+  }
+  test('replays update, removal and new-origin fences from the complete sample stream', () => {
+    const { results, samples, transcript } = fixture()
+    expect(() => verifyCustom(results, samples, transcript)).not.toThrow()
+  })
+  test.each([
+    'changed-update',
+    'missing-update',
+    'stale-removal',
+    'reused-origin',
+    'contradicted-result',
+  ])('rejects %s', (change) => {
+    const { results, samples, transcript } = fixture()
+    if (change === 'changed-update')
+      samples['producer:r20'].decoded.metrics[1].points[0].asDouble = '8.0'
+    if (change === 'missing-update') results.update.requestKeys.pop()
+    if (change === 'stale-removal')
+      samples['producer:r40'].decoded.metrics.push(samples['producer:r30'].decoded.metrics.at(-1))
+    if (change === 'reused-origin')
+      samples['producer:r50'].decoded.metrics.at(-1).points[0].startNs = '1'
+    if (change === 'contradicted-result') results.removal.names.push('com.example.zero')
+    expect(() => verifyCustom(results, samples, transcript)).toThrow()
+  })
 })

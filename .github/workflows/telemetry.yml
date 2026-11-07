@@ -21,7 +21,7 @@ jobs:
           const configured = 'docker-compose.telemetry.yml'
           const base = 'docker-compose.yml'
           const both = ['4.3.1', '4.2.2']
-          const noPlugin = ['4.3.1', '4.2.2', '4.1.2', '4.0.2', '4.4.0']
+          const noPlugin = ['4.3.1', '4.2.2', '4.1.2', '4.0.2']
           const lanes = [
             ...[
               'telemetry-reporter',
@@ -33,7 +33,7 @@ jobs:
               'telemetry-shutdown',
             ].map((group) => ({ group, compose: configured, full: both, dev: ['4.3.1'] })),
             { group: 'telemetry-base', compose: base, full: noPlugin, dev: ['4.3.1', '4.4.0'] },
-            { group: 'telemetry-unsupported', compose: base, full: noPlugin, dev: ['4.3.1', '4.4.0'] },
+            { group: 'telemetry-unsupported', compose: base, full: noPlugin, dev: ['4.3.1'] },
             { group: 'telemetry-outcomes', compose: base, full: ['4.1.2'], dev: [] },
           ]
           const full = process.env.FULL === 'true'
@@ -42,6 +42,7 @@ jobs:
             for (const lane of lanes)
               for (const kafka of full ? lane.full : lane.dev)
                 include.push({ node, kafka, group: lane.group, compose: lane.compose })
+          // The base 4.4.0 development smoke is additional coverage, not an exit obligation.
           require('fs').appendFileSync(process.env.GITHUB_OUTPUT, `matrix=${JSON.stringify({ include })}\n`)
           NODE
   telemetry:

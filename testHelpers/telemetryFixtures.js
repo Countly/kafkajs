@@ -601,6 +601,11 @@ class TelemetryWireObserver {
   #retained = 0
   #disposal = null
   #stillOpen = []
+  #closures = []
+  #faults = []
+  #cancellations = []
+  #completeStream
+  #captureTail = Promise.resolve()
 
   /**
    * @param {object} options observer configuration
@@ -610,6 +615,7 @@ class TelemetryWireObserver {
    * @param {'configured'|'base'} [options.mode] selects the exact fixture endpoint allowlist
    * @param {string} [options.owner] label of the observed client, kept in the evidence
    * @param {function(object, function):object} [options.dial] socket dialer, `net.connect` by default
+   * @param {boolean} [options.completeStream=false] decode every accepted nonempty Push before disposal
    * @param {Partial<typeof DEFAULT_LIMITS>} [options.limits] lower bounds for controls
    * @param {function(Buffer, number):Promise<object>} [options.decoder] decoder seam for controls
    * @param {string} [options.decoderScript] runner script, `scripts/e2e/telemetry/run.sh` by default
@@ -625,6 +631,7 @@ class TelemetryWireObserver {
     dial = net.connect,
     limits = {},
     decoder,
+    completeStream = false,
     decoderScript = DECODER_SCRIPT,
     env = process.env,
   }) {
@@ -635,6 +642,7 @@ class TelemetryWireObserver {
       mode === 'configured' ? ['4.3.1', '4.2.2'].includes(line) : /^\d+\.\d+\.\d+$/.test(line)
     if (!allowed) throw new Error('Unsupported broker line for the observer')
     if (typeof clock?.now !== 'function') throw new Error('Expected a monotonic clock')
+    this.#completeStream = completeStream
     this.#clock = clock
     this.#endpoints = ENDPOINTS[mode]
     this.#dial = dial
@@ -666,6 +674,52 @@ class TelemetryWireObserver {
     socket.setKeepAlive(true, KEEP_ALIVE_DELAY)
     this.#attach(socket, port, this.#endpoints[key])
     return socket
+  }
+
+  /**
+   * Captures the synchronous public-close boundary and its exact in-flight exchange. New normal
+   * requests after this boundary receive no allowance; only a final issued by this close may join.
+   * @param {object} client public client
+   * @param {object} [options] public disconnect arguments
+   * @returns {Promise<void>} after the original disconnect settles
+   * @throws {*} the original disconnect failure
+   */
+  async closeClient(client, options) {
+    const close = {
+      at: this.#clock.now(),
+      pending: this.#records
+        .filter(
+          (r) =>
+            r.type === 'request' &&
+            TELEMETRY_APIS.has(r.apiKey) &&
+            !r.response &&
+            !this.#sockets.get(r.socketId).closed
+        )
+        .map((r) => r.requestKey),
+    }
+    this.#closures.push(close)
+    try {
+      await client.disconnect(options)
+    } finally {
+      close.end = this.#clock.now()
+    }
+  }
+
+  /**
+   * Declares a deliberately faulted captured transport before arming its one selected exchange.
+   * @param {number} socketId observed transport identity
+   * @returns {void}
+   * @throws {Error} if no telemetry transport owns this identity
+   */
+  declareFault(socketId) {
+    if (this.#sockets.get(socketId)?.kind !== 'telemetry')
+      throw new Error('Unknown faulted transport')
+    this.#faults.push({ socketId, at: this.#clock.now() })
+  }
+
+  /** @returns {string[]} exact unanswered request identities qualified by close or fault evidence */
+  cancellationKeys() {
+    return this.#cancellations.map((r) => r.requestKey)
   }
 
   /**
@@ -732,6 +786,16 @@ class TelemetryWireObserver {
         telemetry: state.kind === 'telemetry',
         ranges: { 71: state.ranges[71] ?? null, 72: state.ranges[72] ?? null },
       }))
+  }
+
+  /** @returns {object[]} all issued physical sockets, including setup-only and undecided ones */
+  socketOwnership() {
+    return [...this.#sockets.values()].map(({ id, kind, node, foregroundBootstrap }) => ({
+      id,
+      kind,
+      node,
+      foregroundBootstrap: !!foregroundBootstrap,
+    }))
   }
 
   /** @returns {object[]} sockets that carried API 71 or 72 */
@@ -952,6 +1016,11 @@ class TelemetryWireObserver {
   assertClean({ allowUnanswered = [] } = {}) {
     const errors = [...this.#failures]
     if (!this.#disposal) errors.push(new Error('The telemetry observer was not disposed'))
+    if (
+      this.#completeStream &&
+      JSON.stringify([...allowUnanswered].sort()) !== JSON.stringify(this.cancellationKeys().sort())
+    )
+      errors.push(new Error('Cleanup allowance differs from exact cancellation ledger'))
     const unanswered = this.#records.filter(
       (r) => r.type === 'request' && !r.response && !allowUnanswered.includes(r.requestKey)
     )
@@ -1048,8 +1117,14 @@ class TelemetryWireObserver {
     state.in = stream((frame) => this.#response(state, frame))
     state.onData = (chunk) => this.#capture(state, 'in', chunk)
     state.onConnect = () => this.#connected(state, socket)
+    let resolveClosed
+    state.closedPromise = new Promise((resolve) => {
+      resolveClosed = resolve
+    })
     state.onClose = () => {
       state.closed = true
+      state.closedAt = this.#clock.now()
+      resolveClosed()
     }
     state.detach = () => {
       socket.removeListener('data', state.onData)
@@ -1107,6 +1182,8 @@ class TelemetryWireObserver {
         socketId: state.id,
         node: state.node,
         port: state.port,
+        localAddress: socket.localAddress,
+        localPort: socket.localPort,
         remoteAddress: socket.remoteAddress,
         remotePort: socket.remotePort,
         at: this.#clock.now(),
@@ -1201,6 +1278,15 @@ class TelemetryWireObserver {
       ...parsed,
     }
     if (record.apiKey === 18 && parsed.ranges) state.ranges = parsed.ranges
+    if (
+      this.#completeStream &&
+      record.apiKey === 72 &&
+      parsed.errorCode === 0 &&
+      record.metricsBytes > 0
+    )
+      this.#captureTail = this.#captureTail
+        .then(() => this.decodeAccepted(record))
+        .catch((error) => this.#latch(error))
   }
 
   /**
@@ -1233,7 +1319,7 @@ class TelemetryWireObserver {
       if (attempt >= attempts)
         throw new Error(`No unconsumed sink record matches Push ${record.requestKey}`)
       await this.#sleep(50)
-      if (this.#disposal) throw new Error('The telemetry observer was disposed')
+      if (this.#blobs.size === 0) throw new Error('The telemetry observer was disposed')
     }
   }
 
@@ -1281,6 +1367,74 @@ class TelemetryWireObserver {
 
   /** @returns {Promise<void>} the disposal body */
   async #dispose() {
+    if (this.#closures.length && [...this.#sockets.values()].some((s) => !s.closed)) {
+      await new Promise((resolve) => {
+        const timer = setTimeout(() => {
+          this.#timers.delete(timer)
+          resolve()
+        }, 1000)
+        this.#timers.set(timer, resolve)
+        Promise.all([...this.#sockets.values()].map((s) => s.closedPromise)).then(() => {
+          clearTimeout(timer)
+          this.#timers.delete(timer)
+          resolve()
+        })
+      })
+    }
+    await this.#captureTail
+    for (const record of this.#records.filter(
+      (r) =>
+        this.#completeStream && r.apiKey === 72 && r.response?.errorCode === 0 && r.metricsBytes > 0
+    )) {
+      try {
+        await this.decodeAccepted(record)
+      } catch (error) {
+        this.#latch(error)
+      }
+    }
+    for (const record of this.#records.filter(
+      (r) => r.type === 'request' && TELEMETRY_APIS.has(r.apiKey) && !r.response
+    )) {
+      const socket = this.#sockets.get(record.socketId)
+      const close = this.#closures.find(
+        (c) =>
+          c.pending.includes(record.requestKey) ||
+          (record.apiKey === 72 &&
+            record.terminating &&
+            record.writeAt >= c.at &&
+            record.writeAt <= c.end)
+      )
+      const fault = this.#faults.find(
+        (f) => f.socketId === record.socketId && record.writeAt >= f.at
+      )
+      if (!socket.closed || (!close && !fault)) continue
+      if (
+        fault &&
+        this.#records.filter(
+          (r) =>
+            r.type === 'request' &&
+            TELEMETRY_APIS.has(r.apiKey) &&
+            r.socketId === fault.socketId &&
+            r.writeAt >= fault.at
+        ).length > 1
+      ) {
+        this.#latch(new Error('Fault covered more than one telemetry exchange'))
+        continue
+      }
+      this.#cancellations.push({
+        requestKey: record.requestKey,
+        apiKey: record.apiKey,
+        socketId: record.socketId,
+        writeAt: record.writeAt,
+        at: fault?.at ?? close.at,
+        end: socket.closedAt,
+        disposition: fault
+          ? 'faulted-transport'
+          : record.terminating
+            ? 'close-final'
+            : 'close-in-flight',
+      })
+    }
     for (const [timer, resolve] of this.#timers) {
       clearTimeout(timer)
       resolve()
@@ -1300,13 +1454,19 @@ class TelemetryWireObserver {
         path.join(this.directory, 'transcript.json'),
         JSON.stringify({
           owner: this.#owner,
+          closures: this.#closures,
+          faults: this.#faults,
+          cancellations: this.#cancellations,
           records: this.#records.map(copy),
-          sockets: [...this.#sockets.values()].map(({ id, kind, node, foregroundBootstrap }) => ({
-            id,
-            kind,
-            node,
-            foregroundBootstrap: !!foregroundBootstrap,
-          })),
+          sockets: [...this.#sockets.values()].map(
+            ({ id, kind, node, foregroundBootstrap, closedAt }) => ({
+              id,
+              kind,
+              node,
+              foregroundBootstrap: !!foregroundBootstrap,
+              closedAt,
+            })
+          ),
           cleanup: {
             children: this.#children.size,
             timers: this.#timers.size,

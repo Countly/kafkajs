@@ -1,71 +1,143 @@
+const assert = require('assert/strict')
+const crypto = require('crypto')
+const { canonicalUuid } = require('../../../testHelpers/telemetryFixtures')
 const REMOVING = /TRACE Removing client connection id \[([^\]\s]+)\] from the client instance cache/
 const MISSING =
   /TRACE Client connection id \[([^\]\s]+)\] is not found in the client instance cache/
 const CONNECTION = /^(\S+):(\d+)-(\S+):(\d+)-(\d+)$/
 
 /**
- * Finds the connections whose disconnect removed a client instance from the broker cache.
- * Kafka's ClientMetricsManager logs "Removing client connection id [...]" for every closed
- * connection, then "is not found" for the ones that never registered a client instance, so a
- * removal counts only when no not-found line follows it for the same connection.
- * @param {string} text broker log text covering one observation window
- * @returns {{connectionId:string,localPort:string,line:string}[]} successful cache removals
- * @throws {Error} for a connection id that does not have the broker's `local-remote-index` shape
+ * Reads complete disconnect windows, excluding removals followed by a cache miss anywhere in it.
+ * @param {string} text complete bounded broker log
+ * @returns {object[]} registered retirements with exact server-local/remote tuple and index
+ * @throws {Error} for an unrecognized connection identity
  */
 const retirementsOf = (text) => {
-  const lines = text.split('\n')
-  const missing = new Set()
-  for (const line of lines) {
-    const hit = MISSING.exec(line)
-    if (hit) missing.add(hit[1])
-  }
-  const found = []
-  for (const line of lines) {
-    const hit = REMOVING.exec(line)
-    if (!hit || missing.has(hit[1])) continue
-    const parts = CONNECTION.exec(hit[1])
-    if (!parts) throw new Error(`Unrecognized broker connection id ${hit[1]}`)
-    found.push({ connectionId: hit[1], localPort: parts[2], line: line.trim() })
-  }
-  return found
+  const missing = new Set(text.split('\n').flatMap((line) => MISSING.exec(line)?.[1] ?? []))
+  return text.split('\n').flatMap((line) => {
+    const id = REMOVING.exec(line)?.[1]
+    if (!id || missing.has(id)) return []
+    const parts = CONNECTION.exec(id)
+    if (!parts) throw new Error(`Unrecognized broker connection id ${id}`)
+    return [
+      {
+        connectionId: id,
+        localAddress: parts[1],
+        localPort: parts[2],
+        remoteAddress: parts[3],
+        remotePort: parts[4],
+        index: parts[5],
+        line: line.trim(),
+      },
+    ]
+  })
 }
 
 /**
- * Proves, from the three brokers' logs of one episode, that exactly one registered client
- * connection was retired, on the expected node and listener. Every broker log must be complete:
- * an unavailable or capped log cannot prove the absence of another retirement.
- * @param {object} options the episode
- * @param {Object<string,{text:string,truncated?:boolean}>} options.logs log of each broker node
- * @param {string} options.node node of the client's captured telemetry socket
- * @param {string} options.localPort broker-side listener port of that socket
- * @returns {{source:string,node:string,connectionIdentity:{node:string,localPort:string},connectionId:string,line:string}}
- *   the source-qualified retirement
- * @throws {Error} for an unavailable log, no retirement, another or several retirements, or a
- *   retirement on another node or listener
+ * Joins one successful captured Get to its broker request/response TRACE. The request's unique
+ * client id, correlation and returned UUID identify the physical connection through Docker NAT;
+ * the complete server connection tuple and index are retained, rather than guessing NAT ports.
+ * @param {object} options logs, captured Get, connect event and node/listener
+ * @returns {object} broker-qualified identity with original client endpoints and successful UUID
+ * @throws {Error} for absent/ambiguous request trace, another UUID, node or listener
  */
-const cacheRetirement = ({ logs, node, localPort }) => {
-  const nodes = Object.keys(logs).sort()
-  if (nodes.join() !== '1,2,3') throw new Error('Expected the logs of brokers 1, 2 and 3')
+const connectionIdentity = ({ logs, get, connect, node, localPort }) => {
+  assert.equal(get.socketId, connect.socketId)
+  assert.equal(get.node, node)
+  assert.equal(connect.node, node)
+  assert.equal(get.response.errorCode, 0)
+  assert(Number.isInteger(connect.localPort) && typeof connect.localAddress === 'string')
+  const uuid = canonicalUuid(get.response.uuid)
+  const lines = logs[node].text
+    .split('\n')
+    .filter(
+      (line) =>
+        line.includes('Completed request:') &&
+        line.includes('GET_TELEMETRY_SUBSCRIPTIONS') &&
+        line.includes(`clientId=${get.clientId},`) &&
+        new RegExp(`correlationId=${get.correlation}[,)\\s]`).test(line) &&
+        canonicalUuid(/clientInstanceId=([^,\s)]+)/.exec(line.split('with response:')[0])?.[1]) ===
+          get.uuid
+    )
+  assert.equal(lines.length, 1, 'Missing or ambiguous Get connection trace')
+  const [line] = lines
+  const responseId = /clientInstanceId=([^,\s)]+)/.exec(line.split('with response:')[1] ?? '')?.[1]
+  assert.equal(canonicalUuid(responseId), uuid, 'Connection trace UUID differs')
+  const id = /from connection ([^;\s]+)/.exec(line)?.[1]
+  const tuple = CONNECTION.exec(id)
+  assert(tuple, 'Missing broker connection tuple')
+  assert.equal(tuple[2], localPort, 'Wrong broker listener')
+  return {
+    node,
+    localPort,
+    connectionId: id,
+    uuid,
+    client: {
+      localAddress: connect.localAddress,
+      localPort: connect.localPort,
+      remoteAddress: connect.remoteAddress,
+      remotePort: connect.remotePort,
+    },
+    getRequestKey: get.requestKey,
+  }
+}
+
+/**
+ * Re-derives exact UUID-qualified retirement over a complete bounded disconnect episode. The
+ * window is read only after close and replacement work finish, so a later flushed miss rejects.
+ * @param {object} options three complete logs, Get/connect, node/listener, UUID and episode bounds
+ * @returns {object} exact source-qualified retirement and connection identity
+ * @throws {Error} for wrong connection/UUID/node, delayed miss, unavailable logs or incomplete episode
+ */
+const cacheRetirement = ({
+  logs,
+  node,
+  localPort,
+  get,
+  connect,
+  uuid,
+  since,
+  completedAt,
+  source,
+}) => {
+  assert.deepEqual(
+    Object.keys(logs).sort(),
+    ['1', '2', '3'],
+    'Expected the logs of brokers 1, 2 and 3'
+  )
+  assert(Date.parse(completedAt) > Date.parse(since), 'Incomplete disconnect episode')
+  assert(source && /^[a-f0-9]{64}$/.test(source.sha256), 'Missing broker source identity')
   const all = []
-  for (const name of nodes) {
+  for (const name of Object.keys(logs)) {
     const log = logs[name]
     if (typeof log?.text !== 'string' || log.truncated)
       throw new Error(`Broker ${name} log is unavailable or truncated`)
     for (const found of retirementsOf(log.text)) all.push({ ...found, node: name })
   }
-  if (all.length === 0) throw new Error('No client instance cache retirement was logged')
-  if (all.length > 1) throw new Error(`Expected one cache retirement, found ${all.length}`)
-  const [only] = all
-  if (only.node !== node) throw new Error(`Retirement on node ${only.node}, expected ${node}`)
-  if (only.localPort !== localPort)
-    throw new Error(`Retirement on listener ${only.localPort}, expected ${localPort}`)
+  const identity = connectionIdentity({ logs, get, connect, node, localPort })
+  assert.equal(identity.uuid, uuid, 'Captured UUID differs')
+  const selected = all.filter(
+    (entry) => entry.node === node && entry.connectionId === identity.connectionId
+  )
+  assert.equal(
+    selected.length,
+    1,
+    `Expected one exact connection retirement, found ${selected.length}`
+  )
+  const [only] = selected
   return {
     source: 'broker-disconnect-trace',
     node,
-    connectionIdentity: { node, localPort },
+    connectionIdentity: identity,
     connectionId: only.connectionId,
     line: only.line,
+    windowsSha256: Object.fromEntries(
+      Object.entries(logs).map(([id, log]) => [
+        id,
+        crypto.createHash('sha256').update(log.text).digest('hex'),
+      ])
+    ),
   }
 }
 
-module.exports = { cacheRetirement, retirementsOf }
+module.exports = { cacheRetirement, retirementsOf, connectionIdentity }

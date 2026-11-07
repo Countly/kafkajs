@@ -22281,6 +22281,7 @@
         "floor-core"
       ],
       "titles": [
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Share groups on the broker floor telemetry remains quiet on an unsupported broker",
         "src/broker/__tests__/floorCoreLive.spec.js \u203a Floor core expectations the expected version is the highest implemented one inside the offered range",
         "src/broker/__tests__/floorCoreLive.spec.js \u203a Floor core expectations on the 4.0.2 floor the recorded ranges and the implemented codecs give these versions",
         "src/broker/__tests__/floorCoreLive.spec.js \u203a Floor core expectations a coordinator selects transaction version 2 only at level 2 with a valid epoch",

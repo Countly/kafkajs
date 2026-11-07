@@ -59,7 +59,6 @@ const {
 const net = require('net')
 const { isDeepStrictEqual } = require('util')
 const fs = require('fs')
-const os = require('os')
 const path = require('path')
 const { TelemetryWireObserver } = require('../../../testHelpers/telemetryFixtures')
 const { KafkaJSShareGroupsNotSupportedError } = require('../../../index')
@@ -1708,6 +1707,15 @@ class FloorShareCase {
   }
 }
 
+const { ordinaryOwnership } = require('../../../scripts/e2e/telemetry/semantics')
+const { persistEvidence, verifyScenario } = require('../../../scripts/e2e/telemetry/evidence')
+
+const digestFloor = (keys) =>
+  require('crypto')
+    .createHash('sha256')
+    .update([...keys].sort().join('\n'))
+    .digest('hex')
+
 const F24_TITLE = 'telemetry remains quiet on an unsupported broker'
 const F24_BUDGET_MS = 58000
 const F24_RECORDS = 1000
@@ -1759,10 +1767,8 @@ class FloorTelemetryCase {
   async run(scope) {
     try {
       expect(process.env.KAFKA_VERSION).toBe('4.0.2')
-      const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'floor-telemetry-'))
-      this.stack.add('remove observer directory', () =>
-        fs.rmSync(directory, { recursive: true, force: true })
-      )
+      const directory = path.resolve('.tmp/e2e', this.arm)
+      fs.mkdirSync(directory, { recursive: true })
       let evidence
       await this.stack.run(
         async () => {
@@ -1770,8 +1776,26 @@ class FloorTelemetryCase {
         },
         { budgetMs: 8000 }
       )
+      const record = {
+        status: 'passed',
+        run: { stem: this.arm, line: process.env.KAFKA_VERSION },
+        corpus: evidence.corpus,
+        oracles: { corpus: evidence.corpus.inputs },
+        outcomes: Object.fromEntries(
+          ['producer', 'consumer', 'admin'].map((kind) => [kind, { status: 'connected' }])
+        ),
+      }
+      record.sidecars = persistEvidence({
+        name: 'telemetry-floor',
+        record,
+        directory,
+        observers: this.observers,
+      })
+      verifyScenario(record, directory)
       writeEvidence(EVIDENCE, {
         case: 'F24',
+        archiveDirectory: path.relative(path.resolve('.tmp/e2e'), directory),
+        archive: record,
         ...evidence,
         wireVersions: {},
         config: { line: process.env.KAFKA_VERSION },
@@ -1824,7 +1848,7 @@ class FloorTelemetryCase {
             })
     this.stack.add(`require ${kind} observer clean`, () => observer.assertClean())
     this.stack.add(`dispose ${kind} observer`, () => observer.dispose())
-    this.stack.add(`disconnect ${kind}`, () => client.disconnect())
+    this.stack.add(`disconnect ${kind}`, () => observer.closeClient(client))
     return client
   }
 
@@ -1855,6 +1879,7 @@ class FloorTelemetryCase {
     await live.bounded(scope, 10000, () =>
       Promise.all([producer.connect(), consumer.connect(), admin.connect(), raw.connect()])
     )
+    for (const observer of Object.values(this.observers)) observer.confirmForegroundBootstrap()
     await live.bounded(scope, 15000, () =>
       producer.send({
         topic: this.topic,
@@ -1933,6 +1958,8 @@ class FloorTelemetryCase {
     expect(offered.some(({ apiKey }) => apiKey === 71 || apiKey === 72)).toBe(false)
     expect(observedTelemetryRequests).toEqual([])
     expect(observedTelemetryConnections).toEqual([])
+    for (const observer of Object.values(this.observers))
+      ordinaryOwnership({ records: observer.readTranscript(), sockets: observer.socketOwnership() })
     expect(sortedDurableIds).toEqual(expected1000Ids)
     expect(sortedHandlerIds).toEqual(expected1000Ids)
     expect(new Set(handlerIds).size).toBe(F24_RECORDS)
@@ -1948,6 +1975,34 @@ class FloorTelemetryCase {
       this.observers[kind].assertHealthy()
     }
     return {
+      corpus: {
+        count: F24_RECORDS,
+        expectedSha256: digestFloor(expected1000Ids),
+        logSha256: digestFloor(durableIds),
+        handlerSha256: digestFloor(handlerIds),
+        handlerEntries: this.handled.length,
+        rawCommitted: rawCommittedNextByPartition,
+        processedNext: processedNextByPartition,
+        rawEnd: rawEndByPartition,
+        inputs: {
+          expected: this.expected1000Ids.map((key, i) => ({
+            key,
+            partition: i % F24_PARTITIONS,
+            valueHex: this.value(i).toString('hex'),
+          })),
+          log: [...log].flatMap(([partition, { records }]) =>
+            records.map((r) => ({
+              partition,
+              offset: r.offset,
+              key: r.key.toString(),
+              valueHex: r.value.toString('hex'),
+            }))
+          ),
+          handled: this.handled,
+          commits: fetched,
+          ends: rawEndByPartition,
+        },
+      },
       records: F24_RECORDS,
       handlerEntries: this.handled.length,
       rawCommittedNextByPartition,

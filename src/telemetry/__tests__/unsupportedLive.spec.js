@@ -3,6 +3,9 @@ const net = require('net')
 const path = require('path')
 const { performance } = require('perf_hooks')
 const { Kafka, logLevel, KafkaJSTelemetryError } = require('../../../index')
+const { ordinaryOwnership } = require('../../../scripts/e2e/telemetry/semantics')
+const { ShareTrace, confirmedDecisions } = require('../../../scripts/e2e/telemetry/shareEvidence')
+const { setShareGroupConfigs } = require('../../../testHelpers/shareFixtures')
 const { runCase } = require('../../../scripts/e2e/telemetry/evidence')
 const { TelemetryWireObserver } = require('../../../testHelpers/telemetryFixtures')
 const { readLog } = require('../../../testHelpers/rawLog')
@@ -216,6 +219,24 @@ class OrdinaryCorpus {
     }
     expect(digestOf(this.handled.map((h) => h.key))).toBe(digestOf(this.ids))
     return {
+      inputs: {
+        expected: this.ids.map((key, i) => ({
+          key,
+          valueHex: this.value(i).toString('hex'),
+          partition: i % PARTITIONS,
+        })),
+        log: [...log].flatMap(([partition, { records }]) =>
+          records.map((r) => ({
+            partition,
+            offset: r.offset,
+            key: r.key.toString(),
+            valueHex: r.value.toString('hex'),
+          }))
+        ),
+        handled: this.handled,
+        commits: fetched,
+        ends: rawEnd,
+      },
       count: RECORDS,
       expectedSha256: digestOf(this.ids),
       logSha256: digestOf(logged),
@@ -319,10 +340,16 @@ class UnsupportedCase {
     })
     this.observers[owner] = observer
     this.attempt.observers[owner] = observer
+    const trace = kind === 'share' ? new ShareTrace() : null
+    this.traces ??= {}
+    this.traces[owner] = trace
     const kafka = new Kafka({
       clientId: `${this.stem}-${owner}`,
       brokers: PORTS.map((port) => `localhost:${port}`),
-      socketFactory: (options) => observer.socketFactory(options),
+      socketFactory: (options) => {
+        const socket = observer.socketFactory(options)
+        return trace ? trace.wrap(socket) : socket
+      },
       logLevel: logLevel.NOTHING,
     })
     const common = { enableMetricsPush: enabled }
@@ -332,7 +359,13 @@ class UnsupportedCase {
         : kind === 'admin'
           ? kafka.admin(common)
           : kind === 'share'
-            ? kafka.shareConsumer({ ...common, groupId: `${this.stem}-share-group${suffix}` })
+            ? kafka.shareConsumer({
+                ...common,
+                groupId: `${this.stem}-share-group${suffix}`,
+                acknowledgementMode: 'explicit',
+                maxRecords: 10,
+                maxWaitTimeInMs: 250,
+              })
             : kafka.consumer({
                 ...common,
                 groupId: enabled ? `${this.stem}-group` : `${this.stem}-off-group`,
@@ -341,15 +374,9 @@ class UnsupportedCase {
                 maxWaitTimeInMs: 500,
                 readUncommitted: false,
               })
-    this.defer(() => {
-      const unanswered = observer
-        .readTranscript()
-        .filter((r) => r.apiKey === 72 && r.terminating && !r.response)
-        .map((r) => r.requestKey)
-      observer.assertClean({ allowUnanswered: unanswered })
-    })
+    this.defer(() => observer.assertClean({ allowUnanswered: observer.cancellationKeys() }))
     this.defer(() => observer.dispose())
-    this.defer(() => client.disconnect())
+    this.defer(() => observer.closeClient(client))
     ;(enabled ? this.on : this.off)[kind] = client
     return client
   }
@@ -447,6 +474,7 @@ class UnsupportedCase {
       else expect(outcomes[kind]).toEqual({ status: 'connected' })
     }
 
+    for (const observer of Object.values(this.observers)) observer.confirmForegroundBootstrap()
     const corpus = new OrdinaryCorpus({
       arm: this.stem,
       brokers: [`localhost:${PORTS[0]}`],
@@ -462,6 +490,35 @@ class UnsupportedCase {
     await this.within(10000, 'The opt-out admin work', () => this.off.admin.describeCluster())
     results.corpus = await this.within(20000, 'The three oracles', () => corpus.verify(aux))
 
+    const disabledCorpus = new OrdinaryCorpus({
+      arm: `${this.stem}-off`,
+      brokers: [`localhost:${PORTS[0]}`],
+    })
+    await this.within(15000, 'The disabled ordinary workload', async () => {
+      await disabledCorpus.create(aux)
+      await disabledCorpus.produce(this.off.producer)
+      await disabledCorpus.consume(this.off.consumer, (ms, check) =>
+        pollUntil(this.signal, ms, check, { delayMs: 100, label: 'Disabled handlers' })
+      )
+    })
+    results.disabledCorpus = await this.within(10000, 'Disabled independent ledgers', () =>
+      disabledCorpus.verify(aux)
+    )
+    if (!oldShare) results.share = await this.shareWork(aux)
+    results.ownership = {}
+    for (const kind of KINDS) {
+      const roles = (owner) =>
+        ordinaryOwnership({
+          records: this.observers[owner].readTranscript(),
+          sockets: this.observers[owner].socketOwnership(),
+        })
+      const on = roles(kind)
+      const off = roles(`${kind}-off`)
+      expect(on.map((r) => r.split(':').at(-1)).sort()).toEqual(
+        off.map((r) => r.split(':').at(-1)).sort()
+      )
+      results.ownership[kind] = { on, off }
+    }
     const adverts = (owner) => this.observers[owner].advertisements()
     const firstAdvert = Math.min(
       ...KINDS.flatMap((kind) =>
@@ -501,6 +558,67 @@ class UnsupportedCase {
   }
 
   /**
+   * Requires actual capable-share acquisition, handlers and successful broker acknowledgements
+   * under both telemetry options; the older broker refusal path never calls this method.
+   * @param {object} aux disabled administration client
+   * @returns {Promise<object>} raw per-member acknowledgement and handler evidence
+   */
+  async shareWork(aux) {
+    const topic = `${this.stem}-share-work`
+    const keys = Array.from({ length: 10 }, (_, i) => `${this.stem}-share-${i}`)
+    await aux.createTopics({
+      topics: [{ topic, numPartitions: 1, replicationFactor: 3 }],
+      waitForLeaders: true,
+    })
+    await this.on.producer.send({
+      topic,
+      acks: -1,
+      messages: keys.map((key) => ({ key, value: key, partition: 0 })),
+    })
+    const results = {}
+    for (const owner of ['share', 'share-off']) {
+      const group = `${this.stem}-share-group${owner.endsWith('-off') ? '-off' : ''}`
+      await setShareGroupConfigs(aux, group, { 'share.auto.offset.reset': 'earliest' })
+      const client = owner.endsWith('-off') ? this.off.share : this.on.share
+      const handled = []
+      await client.subscribe({ topics: [topic] })
+      await client.run({
+        eachBatch: async ({ batch, acknowledge }) => {
+          for (const message of batch.messages) {
+            handled.push({ key: message.key.toString(), offset: message.offset })
+            acknowledge(message, 'accept')
+          }
+        },
+      })
+      await pollUntil(
+        this.signal,
+        10000,
+        () =>
+          confirmedDecisions(this.traces[owner].snapshot(), group).filter((r) => r.type === 1)
+            .length === 10,
+        { delayMs: 50, label: 'Supported share acknowledgements' }
+      )
+      await client.stop()
+      expect(handled.map((r) => r.key)).toEqual(keys)
+      const log = await readLog({ brokers: [`localhost:${PORTS[0]}`], topic })
+      results[owner] = {
+        group,
+        keys,
+        handled,
+        frames: this.traces[owner].snapshot(),
+        log: [...log.values()].flatMap(({ records }) =>
+          records.map((r) => ({
+            key: r.key.toString(),
+            offset: r.offset,
+            value: r.value.toString(),
+          }))
+        ),
+      }
+    }
+    return results
+  }
+
+  /**
    * Closes every client, then hands the case record to the shared persistence and verification.
    * @returns {void}
    */
@@ -512,6 +630,12 @@ class UnsupportedCase {
       disabledOutcomes: this.attempt.record.disabledOutcomes,
       reasons: this.attempt.record.results.reasons,
       corpus: this.attempt.record.results.corpus,
+      results: this.attempt.record.results,
+      oracles: {
+        corpus: this.attempt.record.results.corpus.inputs,
+        disabledCorpus: this.attempt.record.results.disabledCorpus.inputs,
+        share: this.attempt.record.results.share,
+      },
       pushes: [],
       allowed: { errors: {}, faultedSockets: {} },
     }

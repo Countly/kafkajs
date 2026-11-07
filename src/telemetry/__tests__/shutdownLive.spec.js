@@ -6,7 +6,7 @@ const { performance } = require('perf_hooks')
 const { spawn } = require('child_process')
 const { Kafka, logLevel } = require('../../../index')
 const { runCase } = require('../../../scripts/e2e/telemetry/evidence')
-const { cacheRetirement, retirementsOf } = require('../../../scripts/e2e/telemetry/cacheTrace')
+const { cacheRetirement, connectionIdentity } = require('../../../scripts/e2e/telemetry/cacheTrace')
 const {
   TelemetryWireObserver,
   withTelemetryResource,
@@ -67,6 +67,7 @@ class BrokerLogs {
   constructor({ project, file }) {
     this.project = project
     this.file = file
+    this.receipts = []
   }
 
   /**
@@ -139,33 +140,44 @@ class BrokerLogs {
       throw new Error(
         `kafka-configs ${action[0]} failed on ${service}: ${result.stderr.slice(0, 300)}`
       )
+    this.receipts.push({ service, id, action, result })
     return result.stdout
   }
 
   /**
-   * @param {string} service broker service
-   * @param {string} id broker id
-   * @returns {Promise<string|null>} the manager's current logger level, or null when not listed
+   * Reads both owned logger overrides in one CLI invocation, retaining the full readback.
+   * @param {string} service owned broker service
+   * @param {string} id broker node
+   * @returns {Promise<object>} exact listed levels, null for absent overrides
    */
-  async level(service, id) {
+  async snapshot(service, id) {
     const text = await this.configs(service, id, ['--describe'])
-    return new RegExp(`^\\s*${LOGGER.replaceAll('.', '\\.')}=(\\w+)`, 'm').exec(text)?.[1] ?? null
+    return Object.fromEntries(
+      [LOGGER, 'kafka.request.logger'].map((logger) => [
+        logger,
+        new RegExp(`^\\s*${logger.replaceAll('.', '\\.')}=(\\w+)`, 'm').exec(text)?.[1] ?? null,
+      ])
+    )
   }
 
   /**
-   * @param {string} service broker service
-   * @param {string} id broker id
-   * @param {string|null} level level to set, or null to delete only this override
-   * @returns {Promise<void>} once the change command succeeded
+   * Changes only the two owned logger overrides in one bounded invocation.
+   * @param {string} service owned broker service
+   * @param {string} id broker node
+   * @param {object} levels exact overrides to set or delete
+   * @returns {Promise<void>} after the CLI succeeded
    */
-  async set(service, id, level) {
-    await this.configs(
-      service,
-      id,
-      level === null
-        ? ['--alter', '--delete-config', LOGGER]
-        : ['--alter', '--add-config', `${LOGGER}=${level}`]
-    )
+  async configure(service, id, levels) {
+    const action = ['--alter']
+    const set = Object.entries(levels)
+      .filter(([, level]) => level !== null)
+      .map(([logger, level]) => `${logger}=${level}`)
+    const remove = Object.entries(levels)
+      .filter(([, level]) => level === null)
+      .map(([logger]) => logger)
+    if (set.length) action.push('--add-config', set.join(','))
+    if (remove.length) action.push('--delete-config', remove.join(','))
+    await this.configs(service, id, action)
   }
 
   /**
@@ -346,6 +358,7 @@ class ReopenCase {
   build(kind, suffix) {
     const owner = `${kind}-${suffix}`
     const observer = new TelemetryWireObserver({
+      completeStream: true,
       directory: this.directory,
       line: this.line,
       clock,
@@ -375,13 +388,7 @@ class ReopenCase {
                 heartbeatInterval: 3000,
                 maxWaitTimeInMs: 500,
               })
-    this.defer(() => {
-      const unanswered = observer
-        .readTranscript()
-        .filter((r) => r.apiKey === 72 && r.terminating && !r.response)
-        .map((r) => r.requestKey)
-      observer.assertClean({ allowUnanswered: unanswered })
-    })
+    this.defer(() => observer.assertClean({ allowUnanswered: observer.cancellationKeys() }))
     this.defer(() => observer.dispose())
     this.defer(() => faults.restore())
     this.defer(async () => {
@@ -397,7 +404,7 @@ class ReopenCase {
           []
         )
     })
-    this.defer(() => client.disconnect())
+    this.defer(() => observer.closeClient(client))
     const member = { client, observer, faults, kind, owner }
     this.members.push(member)
     return member
@@ -410,6 +417,7 @@ class ReopenCase {
    */
   async establish(member) {
     const { client, observer, faults } = member
+    const since = new Date().toISOString()
     await this.within(10000, `The ${member.kind} connect`, () => client.connect())
     const uuid = await client.clientInstanceId({ timeout: 5000 })
     const accepted = await this.find(`two ${member.kind} accepted Pushes`, 15000, () => {
@@ -419,49 +427,70 @@ class ReopenCase {
     expect(faults.telemetry()).toHaveLength(1)
     const [captured] = faults.telemetry()
     const port = observer.telemetrySockets().find((s) => s.socketId === captured.ordinal).port
+    const get = observer
+      .subscriptions({ uuid })
+      .find((r) => r.socketId === captured.ordinal && r.response?.errorCode === 0)
+    const connect = observer
+      .readTranscript()
+      .find((r) => r.type === 'connect' && r.socketId === captured.ordinal)
+    const logs = await this.readLogs(since)
+    const identity = connectionIdentity({
+      logs,
+      get,
+      connect,
+      node: get.node,
+      localPort: LISTENER[port],
+    })
     return {
       uuid,
       ordinal: captured.ordinal,
       node: accepted.at(-1).node,
       port,
-      serverConnectionIdentity: { node: accepted.at(-1).node, localPort: LISTENER[port] },
+      serverConnectionIdentity: identity,
+      get,
+      connect,
+      since,
     }
   }
 
   /**
-   * Starts observing broker-side cache retirement before the close, independently of the client.
+   * Reads the complete broker-side disconnect episode after immediate reopen and recovery.
    * @param {object} before the captured connection from `establish`
    * @returns {Promise<object>} the source-qualified retirement; rejects at its own bound
    */
-  observeCacheRetirement(before) {
-    const since = new Date().toISOString()
-    const read = async () => {
-      const logs = {}
-      for (const [index, service] of ['kafka1', 'kafka2', 'kafka3'].entries())
-        logs[String(index + 1)] = await this.logs.since(service, since)
-      return logs
+  async observeCacheRetirement(before) {
+    const logs = await this.readLogs(before.since)
+    const input = {
+      logs,
+      node: before.node,
+      localPort: before.serverConnectionIdentity.localPort,
+      get: before.get,
+      connect: before.connect,
+      uuid: before.uuid,
+      since: before.since,
+      completedAt: new Date().toISOString(),
+      source: this.source,
+      loggerReadbacks: this.logs.receipts,
     }
-    return bounded(
-      this.signal,
-      20000,
-      async (scope) => {
-        let logs
-        await pollUntil(
-          scope,
-          Infinity,
-          async () => {
-            logs = await read()
-            return retirementsOf(logs[before.node].text).length > 0
-          },
-          { delayMs: 300, label: 'The broker cache retirement' }
-        )
-        return cacheRetirement({
-          logs,
-          node: before.node,
-          localPort: before.serverConnectionIdentity.localPort,
-        })
-      },
-      { label: 'The broker cache retirement' }
+    this.attempt.record.oracles ??= {}
+    this.attempt.record.oracles[this.cacheKind] = input
+    return cacheRetirement(input)
+  }
+
+  /**
+   * Reads the complete bounded three-node log window without returning on a removal prefix.
+   * @param {string} since epoch window start
+   * @returns {Promise<object>} full broker logs
+   * @throws {Error} for unavailable or truncated inputs
+   */
+  async readLogs(since) {
+    return Object.fromEntries(
+      await Promise.all(
+        ['kafka1', 'kafka2', 'kafka3'].map(async (service, index) => [
+          String(index + 1),
+          await this.logs.since(service, since),
+        ])
+      )
     )
   }
 
@@ -475,11 +504,16 @@ class ReopenCase {
     const { client, observer } = member
     const before = await this.establish(member)
     const preClose = observer.checkpoint()
-    const cache = this.observeCacheRetirement(before)
-    cache.catch(() => {})
+    this.cacheKind = kind
+    const cacheObservation = {
+      since: before.since,
+      start: clock.now(),
+      connect: before.connect,
+      get: before.get,
+    }
     const order = []
     await this.within(8000, `The ${kind} close`, () =>
-      kind === 'admin' ? client.disconnect() : client.disconnect({ timeout: 3000 })
+      observer.closeClient(client, kind === 'admin' ? undefined : { timeout: 3000 })
     )
     const closeEnd = observer.checkpoint()
     order.push('closed')
@@ -516,7 +550,13 @@ class ReopenCase {
       .readTranscript({ after: closeEnd })
       .filter((r) => r.apiKey === 72 && r.terminating)
     order.push('cache-awaited')
-    const cacheEvent = await cache
+    // Replacement work and both logger readbacks fence the complete disconnect episode.
+    expect(await this.logs.snapshot(`kafka${before.node}`, before.node)).toEqual({
+      [LOGGER]: 'TRACE',
+      'kafka.request.logger': 'TRACE',
+    })
+    const cacheEvent = await this.observeCacheRetirement(before)
+    expect(cacheObservation.start).toBeLessThanOrEqual(get.writeAt)
     const reopen = {
       calledBeforeCacheAwait: order.indexOf('connect-called') < order.indexOf('cache-awaited'),
       cachedUuid,
@@ -539,6 +579,7 @@ class ReopenCase {
     expect(cacheEvent.source).toBe('broker-disconnect-trace')
     expect(cacheEvent.connectionIdentity).toEqual(before.serverConnectionIdentity)
     expect(member.faults.telemetry()).toHaveLength(1)
+    await observer.closeClient(client, kind === 'admin' ? undefined : { timeout: 3000 })
     return {
       before,
       reopen,
@@ -558,7 +599,7 @@ class ReopenCase {
     const before = await this.establish(member)
     const preClose = member.observer.checkpoint()
     await this.within(8000, `The ${kind} zero-timeout close`, () =>
-      member.client.disconnect({ timeout: 0 })
+      member.observer.closeClient(member.client, { timeout: 0 })
     )
     const finalZeroTimeoutWrites = member.observer
       .readTranscript({ after: preClose })
@@ -576,18 +617,19 @@ class ReopenCase {
     const member = this.build('admin', 'bh')
     const before = await this.establish(member)
     const [captured] = member.faults.telemetry()
+    member.observer.declareFault(captured.ordinal)
     captured.socket.blackhole()
     const cluster = await this.within(8000, 'The foreground metadata work', () =>
       member.client.describeCluster({ timeout: 3000 })
     )
     expect(cluster.brokers.map((b) => b.port).sort()).toEqual(PORTS)
     const started = clock.now()
-    await this.within(10000, 'The admin close', () => member.client.disconnect())
+    await this.within(10000, 'The admin close', () => member.observer.closeClient(member.client))
     const coreCloseMs = clock.now() - started
     await this.find('the blackholed telemetry socket close', 3000, () => captured.closed)
     const telemetryCleanupMs = captured.closedAt - started
     expect(telemetryCleanupMs).toBeLessThanOrEqual(FINAL_CAP_MS + SCHEDULING_MS)
-    return { uuid: before.uuid, coreCloseMs, telemetryCleanupMs }
+    return { uuid: before.uuid, faultedSocket: before.ordinal, coreCloseMs, telemetryCleanupMs }
   }
 
   /**
@@ -616,24 +658,51 @@ class ReopenCase {
     expect(cluster.brokers.map((b) => [b.nodeId, b.host, b.port]).sort()).toEqual(
       PORTS.map((port, index) => [index + 1, 'localhost', port])
     )
-    const levels = {}
-    for (const [index, service] of ['kafka1', 'kafka2', 'kafka3'].entries()) {
-      const id = String(index + 1)
-      levels[id] = await this.within(25000, `The ${service} logger level`, () =>
-        this.logs.level(service, id)
-      )
-      this.defer(() =>
-        this.release(25000, `The ${service} logger restore`, () =>
-          this.logs.set(service, id, levels[id])
-        )
-      )
-      await this.within(25000, `The ${service} trace level`, () =>
-        this.logs.set(service, id, 'TRACE')
-      )
-      expect(
-        await this.within(25000, `The ${service} readback`, () => this.logs.level(service, id))
-      ).toBe('TRACE')
+    const sourceResult = await this.logs.run([
+      'exec',
+      '-T',
+      'kafka1',
+      'sha256sum',
+      `/opt/kafka/libs/kafka-server-${this.line}.jar`,
+    ])
+    expect(sourceResult.code).toBe(0)
+    this.source = {
+      artifact: `kafka-server-${this.line}.jar`,
+      sha256: sourceResult.stdout.split(/\s+/)[0],
+      receipt: sourceResult,
+      className: 'org.apache.kafka.server.ClientMetricsManager',
     }
+    const levels = {}
+    const services = ['kafka1', 'kafka2', 'kafka3']
+    const traced = { [LOGGER]: 'TRACE', 'kafka.request.logger': 'TRACE' }
+    this.defer(() =>
+      this.release(18000, 'The logger restoration and readbacks', async () => {
+        const outcomes = await Promise.allSettled(
+          services.map(async (service, index) => {
+            const id = String(index + 1)
+            if (!levels[id]) return
+            await this.logs.configure(service, id, levels[id])
+            const restored = await this.logs.snapshot(service, id)
+            expect(restored).toEqual(levels[id])
+            this.results.restoredLevels ??= {}
+            this.results.restoredLevels[id] = restored
+          })
+        )
+        const errors = outcomes.filter((r) => r.status === 'rejected').map((r) => r.reason)
+        if (errors.length) throw new AggregateError(errors, 'Logger restoration failed')
+      })
+    )
+    const outcomes = await Promise.allSettled(
+      services.map(async (service, index) => {
+        const id = String(index + 1)
+        levels[id] = await this.logs.snapshot(service, id)
+        await this.logs.configure(service, id, traced)
+        expect(await this.logs.snapshot(service, id)).toEqual(traced)
+      })
+    )
+    const errors = outcomes.filter((r) => r.status === 'rejected').map((r) => r.reason)
+    if (errors.length) throw new AggregateError(errors, 'Logger setup failed')
+    this.results.loggerReceipts = this.logs.receipts
     this.results.originalLevels = levels
     const entries = {
       metrics: 'org.apache.kafka.',
@@ -652,6 +721,7 @@ class ReopenCase {
   finishRecord() {
     const manifest = JSON.parse(fs.readFileSync(MANIFEST_FILE, 'utf8'))
     this.attempt.record = {
+      oracles: this.attempt.record.oracles,
       wireVersions: { 71: 0, 72: 0 },
       run: {
         stem: this.stem,
@@ -667,7 +737,7 @@ class ReopenCase {
       pushes: this.pushes,
       allowed: {
         errors: Object.fromEntries(KINDS.map((kind) => [`${kind}-ep`, [42]])),
-        faultedSockets: {},
+        faultedSockets: { 'admin-bh': [this.results.blackhole.faultedSocket] },
       },
     }
   }

@@ -7,6 +7,7 @@ const zlib = require('zlib')
 const { performance } = require('perf_hooks')
 const { spawn } = require('child_process')
 const { Kafka, logLevel } = require('../../../index')
+const { assertCadence } = require('../../../scripts/e2e/telemetry/semantics')
 const { runCase } = require('../../../scripts/e2e/telemetry/evidence')
 const {
   TelemetryExportReader,
@@ -236,6 +237,7 @@ class SubscriptionCases {
   producer(options = {}, suffix = '') {
     const owner = `producer${suffix}`
     const observer = new TelemetryWireObserver({
+      completeStream: true,
       directory: this.directory,
       line: this.line,
       clock,
@@ -251,15 +253,9 @@ class SubscriptionCases {
       logLevel: logLevel.NOTHING,
     })
     const client = kafka.producer({ enableMetricsPush: true, idempotent: false, ...options })
-    this.defer(() => {
-      const unanswered = observer
-        .readTranscript()
-        .filter((r) => r.apiKey === 72 && r.terminating && !r.response)
-        .map((r) => r.requestKey)
-      observer.assertClean({ allowUnanswered: unanswered })
-    })
+    this.defer(() => observer.assertClean({ allowUnanswered: observer.cancellationKeys() }))
     this.defer(() => observer.dispose())
-    this.defer(() => client.disconnect())
+    this.defer(() => observer.closeClient(client))
     return { observer, client, clientId, owner }
   }
 
@@ -371,6 +367,7 @@ class SubscriptionCases {
       expect(noMatch.push.terminating).toBe(false)
       expect(noMatch.push.subscriptionId).toBe(noMatch.get.subscriptionId)
       results.noMatch = noMatch
+      results.noMatchGetKey = noMatchGet.requestKey
 
       const beforeUpdate = observer.checkpoint()
       await this.alter({ metrics: PRODUCER_PREFIX })
@@ -412,7 +409,13 @@ class SubscriptionCases {
       expect(update.names).toContain(CONNECTION_TOTAL)
       expect(update.names.every((name) => name.startsWith(PRODUCER_PREFIX))).toBe(true)
       expect(await client.clientInstanceId({ timeout: 0 })).toBe(uuid)
-      results.update = update
+      results.update = {
+        ...update,
+        getKey: replacement.requestKey,
+        refusedKey: refused.requestKey,
+        pushKey: pushed.requestKey,
+        readbackAt,
+      }
 
       const beforeEmpty = observer.checkpoint()
       await this.alter({ metrics: '' })
@@ -437,8 +440,9 @@ class SubscriptionCases {
         () =>
           observer
             .subscriptions({ uuid, after: emptyGet.index })
-            .find((r) => r.writeAt >= q0 + 1000 && r.response?.errorCode === 0)
+            .find((r) => r.response?.errorCode === 0)
       )
+      assertCadence(observer.subscriptions({ uuid, after: emptyGet.index }), q0, 1000)
       const pushesSince = observer
         .readTranscript({ after: emptyGet.index })
         .filter((r) => r.apiKey === 72 && r.index < nextGet.index)
@@ -533,6 +537,7 @@ class SubscriptionCases {
       expect(firstPoints.negative.asDoubleBits).toBe('c004000000000000')
       expect(firstPoints.anchor.asDouble).toBe('1.0')
       results.first = firstPoints
+      results.firstRequestKey = first.push.requestKey
 
       client.registerMetricForSubscription(metric(N('zero'), 'gauge', 6.25))
       client.registerMetricForSubscription(metric(N('negative'), 'gauge', -3.5))
@@ -565,7 +570,7 @@ class SubscriptionCases {
       expect(updated.push.responseAt - updatedAt).toBeLessThanOrEqual(10000)
       expect(point(updated.decoded, N('total')).asInt).toBe('9')
       expect(point(post[states.indexOf('updated') + 1].decoded, N('total')).asInt).toBe('0')
-      results.update = { states, updateFence }
+      results.update = { states, updateFence, requestKeys: post.map((s) => s.push.requestKey) }
 
       client.unregisterMetricFromSubscription({ name: N('zero'), attributes: attrs })
       client.unregisterMetricFromSubscription({ name: N('total'), attributes: attrs })
@@ -588,7 +593,13 @@ class SubscriptionCases {
         expect(laterNames).not.toContain(N('zero'))
         expect(laterNames).not.toContain(N('total'))
       }
-      results.removal = { writeOrdinal: removal.push.index, removeFence, names: removalNames }
+      results.removal = {
+        requestKey: removal.push.requestKey,
+        cursor,
+        writeOrdinal: removal.push.index,
+        removeFence,
+        names: removalNames,
+      }
 
       client.registerMetricForSubscription(metric(N('total'), 'sum', 1n))
       const readdFence = observer.checkpoint()
@@ -601,7 +612,13 @@ class SubscriptionCases {
       expect(again.asInt).toBe('1')
       expect(BigInt(again.startNs)).toBeGreaterThan(BigInt(firstPoints.total.startNs))
       expect(await client.clientInstanceId({ timeout: 0 })).toBe(uuid)
-      results.readded = { startNs: again.startNs, asInt: again.asInt }
+      results.readded = {
+        requestKey: readded.push.requestKey,
+        readdFence,
+        startNs: again.startNs,
+        asInt: again.asInt,
+      }
+      results.unregisterFence = observer.checkpoint()
       for (const name of ['anchor', 'negative', 'total'])
         client.unregisterMetricFromSubscription({ name: N(name), attributes: attrs })
     })
@@ -683,6 +700,12 @@ class SubscriptionCases {
         advertisement: advert.lines[0],
       }
       results.rawControl = rawControl
+      results.rawOracle = {
+        advertisement: advert,
+        control,
+        vector: JSON.parse(fs.readFileSync(vector)),
+        probeSha256: fileSha(PROBE_FILE),
+      }
 
       await this.within(10000, 'The candidate connect', () => client.connect())
       const uuid = (results.uuid = await client.clientInstanceId({ timeout: 10000 }))
@@ -743,7 +766,7 @@ class SubscriptionCases {
       const stream = observer.readTranscript().filter((r) => r.apiKey === 72 && r.uuid === uuid)
       const extraIntervalPushes = stream.filter(
         (r, i) =>
-          i > 0 && r.writeAt - (stream[i - 1].response?.responseAt ?? stream[i - 1].writeAt) < 900
+          i > 0 && r.writeAt - (stream[i - 1].response?.responseAt ?? stream[i - 1].writeAt) < 1000
       )
       expect(extraIntervalPushes).toEqual([])
       expect(stream.every((r) => r.response?.errorCode === 0)).toBe(true)

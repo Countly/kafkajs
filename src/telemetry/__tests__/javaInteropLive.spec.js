@@ -6,6 +6,7 @@ const path = require('path')
 const { performance } = require('perf_hooks')
 const { spawn } = require('child_process')
 const { Kafka, logLevel } = require('../../../index')
+const { assertJavaRows } = require('../../../scripts/e2e/telemetry/semantics')
 const { runCase } = require('../../../scripts/e2e/telemetry/evidence')
 const {
   TelemetryExportReader,
@@ -153,7 +154,12 @@ class JavaRole {
       } catch {
         continue
       }
-      if (fields && Object.hasOwn(fields, key)) return { at, fields }
+      if (
+        fields &&
+        Object.hasOwn(fields, key) &&
+        (!['closing', 'closed'].includes(key) || fields[key] === true)
+      )
+        return { at, fields }
     }
     return undefined
   }
@@ -266,6 +272,7 @@ class JavaInteropCase {
    */
   buildJs(kind) {
     const observer = new TelemetryWireObserver({
+      completeStream: true,
       directory: this.directory,
       line: this.line,
       clock,
@@ -294,15 +301,9 @@ class JavaInteropCase {
                 heartbeatInterval: 3000,
                 maxWaitTimeInMs: 500,
               })
-    this.defer(() => {
-      const unanswered = observer
-        .readTranscript()
-        .filter((r) => r.apiKey === 72 && r.terminating && !r.response)
-        .map((r) => r.requestKey)
-      observer.assertClean({ allowUnanswered: unanswered })
-    })
+    this.defer(() => observer.assertClean({ allowUnanswered: observer.cancellationKeys() }))
     this.defer(() => observer.dispose())
-    this.defer(() => client.disconnect())
+    this.defer(() => observer.closeClient(client))
     return { client, observer }
   }
 
@@ -357,34 +358,15 @@ class JavaInteropCase {
     expect(rows.every((r) => r.clientId === this.ids.java[role] && r.pushIntervalMs === 1000)).toBe(
       true
     )
-    const counter = `org.apache.kafka.${role}.connection.creation.total`
-    const first = normal[0]
-    const byName = (row, suffix) => row.metrics.find((m) => m.name.endsWith(suffix))
-    const sum = byName(first, counter)
-    expect(sum).toMatchObject({ kind: 'SUM', monotonic: true })
-    expect(sum.temporality).toBe('AGGREGATION_TEMPORALITY_DELTA')
-    for (const row of rows) {
-      const names = row.metrics.map((m) => m.name)
-      expect(
-        names.every((name) => name === counter || name.startsWith('org.apache.kafka.tf1.custom.'))
-      ).toBe(true)
-      for (const point of row.metrics.find((m) => m.name === counter)?.points ?? [])
-        expect(
-          Number(point.valueKind === 'AS_INT' ? point.asInt : point.asDouble)
-        ).toBeGreaterThanOrEqual(0)
-      expect(
-        row.resources
-          .flatMap((r) => r.attrs.map(([key]) => key))
-          .every((k) => WHITELIST.includes(k))
-      ).toBe(true)
-    }
-    const gaugeDouble = byName(first, 'gauge.double').points[0]
-    expect(gaugeDouble.asDouble).toBe('42.5')
-    expect(gaugeDouble.asDoubleBits).toBe('4045400000000000')
-    expect(byName(first, 'gauge.long').points[0].asInt).toBe('4242')
-    const total = (row) => Number(byName(row, 'sum.total').points[0].asDouble)
-    expect(total(first)).toBe(7)
-    for (const row of rows.slice(1)) expect(total(row)).toBe(0)
+    const child = this.roles[role]
+    assertJavaRows(role, rows, {
+      clientId: this.ids.java[role],
+      closing: child.marker('closing')?.fields,
+      closed: child.marker('closed')?.fields,
+    })
+    const sum = normal[0].metrics.find(
+      (m) => m.name === `org.apache.kafka.${role}.connection.creation.total`
+    )
     return {
       uuid,
       normalExports: normal.length,
@@ -445,6 +427,21 @@ class JavaInteropCase {
       match: `client_id=^(${all.join('|')})$`,
     }
     await withTelemetryResource(aux, { name: this.stem, entries }, () => this.interop(aux))
+    this.results.provenance = {
+      jdk: Object.fromEntries(ROLES.map((role) => [role, this.roles[role].marker('jdk')?.fields])),
+      cache: fs
+        .readFileSync(path.join(ROOT, 'scripts/e2e/telemetry/interop.sha256'), 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => {
+          const [expected, name] = line.trim().split(/\s+/)
+          const actual = fileSha(path.join(cache, name))
+          expect(actual).toBe(expected)
+          return { name, sha256: actual, bytes: fs.statSync(path.join(cache, name)).size }
+        }),
+      sourceSha256: fileSha(path.join(ROOT, 'scripts/e2e/telemetry/JavaTelemetryClient.java')),
+      runnerSha256: fileSha(RUNNER),
+    }
     this.results.readback = { metrics: REQUESTED, interval: 1000, ids: all }
   }
 
@@ -454,7 +451,9 @@ class JavaInteropCase {
    * @returns {Promise<void>} when every assertion on all seven clients holds
    */
   async interop(aux) {
-    const roles = Object.fromEntries(ROLES.map((role) => [role, this.startRole(role)]))
+    const roles = (this.roles = Object.fromEntries(
+      ROLES.map((role) => [role, this.startRole(role)])
+    ))
     const js = Object.fromEntries(KINDS.map((kind) => [kind, this.buildJs(kind)]))
     await this.within(15000, 'The JS connects', () =>
       settle(KINDS.map((kind) => () => js[kind].client.connect()))
@@ -523,6 +522,9 @@ class JavaInteropCase {
         exitSignal: exits[role].signal,
         closeToExitMs,
         liveDescendants,
+        closing: closing.fields,
+        closed: closed.fields,
+        markers: child.markers,
         stdout: child.stdout,
         stderr: child.stderr,
       }
@@ -569,6 +571,7 @@ class JavaInteropCase {
         })
       }
     }
+    await settle(KINDS.map((kind) => () => js[kind].observer.closeClient(js[kind].client)))
     this.results.js = jsRows
     this.results.uuids = { java: javaIds, js: jsIds }
     await this.controls(aux)

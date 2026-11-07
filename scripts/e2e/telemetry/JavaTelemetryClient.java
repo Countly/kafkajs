@@ -263,6 +263,7 @@ public final class JavaTelemetryClient {
             System.out.println("{\"ready\":true,\"role\":\"" + options.role() + "\",\"network\":false}");
             return;
         }
+        System.out.println("{\"jdk\":\"" + System.getProperty("java.runtime.version") + "\",\"vendor\":\"" + System.getProperty("java.vendor") + "\"}");
         try (Role role = switch (options.role()) {
             case "producer" -> new ProducerRole(options);
             case "consumer" -> new ConsumerRole(options);
@@ -280,9 +281,9 @@ public final class JavaTelemetryClient {
             long end = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(options.runMs());
             while (System.nanoTime() < end) role.work();
             if (!id.equals(role.id())) throw new IllegalStateException("Instance ID changed");
-            System.out.println("{\"role\":\"" + options.role() + "\",\"closing\":true}");
+            System.out.println("{\"role\":\"" + options.role() + "\",\"closing\":true,\"epochMs\":" + System.currentTimeMillis() + "}");
             role.armClose();
         }
-        System.out.println("{\"role\":\"" + options.role() + "\",\"closed\":true}");
+        System.out.println("{\"role\":\"" + options.role() + "\",\"closed\":true,\"epochMs\":" + System.currentTimeMillis() + "}");
     }
 }

@@ -4,6 +4,11 @@ const net = require('net')
 const path = require('path')
 const { performance } = require('perf_hooks')
 const { Kafka, logLevel, KafkaJSTelemetryError } = require('../../../index')
+const {
+  ShareTrace,
+  confirmedDecisions,
+  acquisitionStart,
+} = require('../../../scripts/e2e/telemetry/shareEvidence')
 const { runCase } = require('../../../scripts/e2e/telemetry/evidence')
 const {
   TelemetryWireObserver,
@@ -248,6 +253,24 @@ class OrdinaryCorpus {
     }
     expect(digestOf(this.handled.map((h) => h.key))).toBe(digestOf(this.ids))
     return {
+      inputs: {
+        expected: this.ids.map((key, i) => ({
+          key,
+          valueHex: this.value(i).toString('hex'),
+          partition: i % PARTITIONS,
+        })),
+        log: [...log].flatMap(([partition, { records }]) =>
+          records.map((r) => ({
+            partition,
+            offset: r.offset,
+            key: r.key.toString(),
+            valueHex: r.value.toString('hex'),
+          }))
+        ),
+        handled: this.handled,
+        commits: fetched,
+        ends: rawEnd,
+      },
       count: RECORDS,
       expectedSha256: digestOf(this.ids),
       logSha256: digestOf(logged),
@@ -279,12 +302,24 @@ class TelemetryFaults {
    * @returns {object} the same socket
    */
   track(socket) {
-    const record = { ordinal: this.records.length + 1, socket, telemetry: false, closed: false }
+    const record = {
+      ordinal: this.records.length + 1,
+      socket,
+      telemetry: false,
+      closed: false,
+      attempts: [],
+    }
     const classifier = new FrameFilter({
       headerBytes: 12,
       decide: (header) => {
-        if (header.length >= 12 && TELEMETRY_APIS.includes(header.readInt16BE(4)))
+        if (header.length >= 12 && TELEMETRY_APIS.includes(header.readInt16BE(4))) {
           record.telemetry = true
+          record.attempts.push({
+            apiKey: header.readInt16BE(4),
+            correlation: header.readInt32BE(8),
+            at: clock.now(),
+          })
+        }
         return false
       },
     })
@@ -426,6 +461,7 @@ class OutcomeCase {
    */
   build(owner, kind, { enabled, faults, group }) {
     const observer = new TelemetryWireObserver({
+      completeStream: true,
       directory: this.directory,
       line: this.line,
       clock,
@@ -434,10 +470,14 @@ class OutcomeCase {
     })
     this.attempt.observers[owner] = observer
     const chaos = faults ? new TelemetryFaults(observer) : null
+    const trace = kind === 'share' ? new ShareTrace() : null
     const kafka = new Kafka({
       clientId: `${this.stem}-${owner}`,
       brokers: this.brokers,
-      socketFactory: chaos ? chaos.factory : (options) => observer.socketFactory(options),
+      socketFactory: (options) => {
+        const socket = chaos ? chaos.factory(options) : observer.socketFactory(options)
+        return trace ? trace.wrap(socket) : socket
+      },
       logLevel: logLevel.NOTHING,
     })
     const common = { enableMetricsPush: enabled }
@@ -461,22 +501,10 @@ class OutcomeCase {
               readUncommitted: false,
             })
     if (chaos) this.defer(() => chaos.restore())
-    this.defer(() => {
-      const faultedSockets = this.faulted[owner] ?? []
-      const allowed = observer
-        .readTranscript()
-        .filter(
-          (r) =>
-            !r.response &&
-            ((r.apiKey === 72 && r.terminating) ||
-              (TELEMETRY_APIS.includes(r.apiKey) && faultedSockets.includes(r.socketId)))
-        )
-        .map((r) => r.requestKey)
-      observer.assertClean({ allowUnanswered: allowed })
-    })
+    this.defer(() => observer.assertClean({ allowUnanswered: observer.cancellationKeys() }))
     this.defer(() => observer.dispose())
-    this.defer(() => client.disconnect())
-    return { client, observer, faults: chaos }
+    this.defer(() => observer.closeClient(client))
+    return { client, observer, faults: chaos, trace }
   }
 
   /**
@@ -515,8 +543,10 @@ class OutcomeCase {
       ordinal: telemetry.ordinal,
       normalOpen: normal,
       checkpoint: member.observer.checkpoint(),
+      injectedAt: clock.now(),
     }
     this.faulted[owner] = [...(this.faulted[owner] ?? []), telemetry.ordinal]
+    member.observer.declareFault(telemetry.ordinal)
     member.faults.arm(telemetry, mode)
     return fault
   }
@@ -530,6 +560,29 @@ class OutcomeCase {
    */
   async recover(member, fault) {
     const { observer } = member
+    const attempted = await this.find(`the post-injection ${fault.mode} Push attempt`, 8000, () =>
+      fault.record.attempts.find((r) => r.apiKey === 72 && r.at >= fault.injectedAt)
+    )
+    const injected =
+      fault.mode === 'blackhole'
+        ? null
+        : await this.find(`the post-injection ${fault.mode} Push`, 8000, () =>
+            observer
+              .readTranscript({ after: fault.checkpoint })
+              .find(
+                (r) =>
+                  r.apiKey === 72 &&
+                  !r.terminating &&
+                  r.socketId === fault.ordinal &&
+                  r.correlation === attempted.correlation
+              )
+          )
+    if (fault.mode === 'drop')
+      await this.find(
+        'the actual response drop',
+        8000,
+        () => fault.record.socket.responseRule.count === 0
+      )
     await this.find(`the ${fault.mode} socket retirement`, 15000, () => fault.record.closed)
     const get = await this.find(`the replacement Get after ${fault.mode}`, 15000, () =>
       observer
@@ -548,6 +601,11 @@ class OutcomeCase {
     this.pushes.push({ owner: fault.owner, requestKey: push.requestKey })
     expect(fault.normalOpen.every((r) => !r.closed && !r.socket.destroyed)).toBe(true)
     return {
+      injectedPush: injected?.requestKey ?? null,
+      attempted,
+      injectedAt: fault.injectedAt,
+      checkpoint: fault.checkpoint,
+      droppedCorrelation: fault.mode === 'drop' ? injected.correlation : null,
       owner: fault.owner,
       mode: fault.mode,
       faultedSocket: fault.ordinal,
@@ -634,8 +692,8 @@ class OutcomeCase {
     try {
       await bounded(this.signal, 2000, () =>
         settle([
-          () => producer.client.disconnect({ timeout: 1500 }),
-          () => consumer.client.disconnect({ timeout: 1500 }),
+          () => producer.observer.closeClient(producer.client, { timeout: 1500 }),
+          () => consumer.observer.closeClient(consumer.client, { timeout: 1500 }),
         ])
       )
     } catch (error) {
@@ -679,6 +737,52 @@ class OutcomeCase {
       liveRun.taint(error)
       throw error
     }
+    const previous = this.signal
+    this.shareOwned = []
+    try {
+      return await bounded(
+        previous,
+        20000,
+        async (scope) => {
+          let result
+          const errors = []
+          try {
+            result = await bounded(
+              scope,
+              18000,
+              (work) => {
+                this.signal = work
+                return this.shareWork()
+              },
+              { label: 'The share fault and oracle work' }
+            )
+          } catch (error) {
+            errors.push(error)
+          }
+          try {
+            await bounded(scope, 2000, () => settle(this.shareOwned), {
+              label: 'The share local cleanup reserve',
+            })
+          } catch (error) {
+            liveRun.taint(error)
+            errors.push(error)
+          }
+          if (errors.length === 1) throw errors[0]
+          if (errors.length) throw new AggregateError(errors, 'The share oracle and cleanup failed')
+          return result
+        },
+        { label: 'The complete share oracle envelope' }
+      )
+    } finally {
+      this.signal = previous
+    }
+  }
+
+  /**
+   * Executes fault/recovery before acquisition, then the accepted-prefix and release episode.
+   * @returns {Promise<object>} independently replayable raw acknowledgement and delivery ledgers
+   */
+  async shareWork() {
     const topic = `${this.stem}-share-topic`
     const group = `${this.stem}-share-group`
     const keys = Array.from(
@@ -693,6 +797,7 @@ class OutcomeCase {
       logLevel: logLevel.NOTHING,
     })
     const feeder = plain.producer({ enableMetricsPush: false, idempotent: true })
+    this.shareOwned.push(() => feeder.disconnect({ timeout: 1500 }))
     this.defer(() => feeder.disconnect())
     expect(
       await this.within(10000, 'The share topic', () =>
@@ -717,10 +822,17 @@ class OutcomeCase {
       })
     )
     const holder = this.build('share', 'share', { enabled: true, faults: true, group })
+    this.shareOwned.push(() => holder.observer.closeClient(holder.client, { timeout: 1500 }))
     await this.within(10000, 'The holder connect', () => holder.client.connect())
     const uuid = await this.establish(holder)
     const fault = this.inject(holder, 'share', 'drop', uuid)
+    const recovery = await this.recover(holder, fault)
     const handled = []
+    let acquiredAt
+    const settlements = []
+    this.defer(
+      holder.client.on(holder.client.events.ACKNOWLEDGE, ({ payload }) => settlements.push(payload))
+    )
     const entered = deferred()
     const gate = deferred()
     this.defer(() => gate.resolve())
@@ -728,6 +840,7 @@ class OutcomeCase {
       await holder.client.subscribe({ topics: [topic] })
       await holder.client.run({
         eachBatch: async ({ batch, acknowledge }) => {
+          acquiredAt ??= clock.now()
           for (const message of batch.messages)
             handled.push({ key: message.key.toString(), offset: message.offset })
           for (const message of batch.messages.slice(0, SHARE_ACCEPTED))
@@ -738,11 +851,14 @@ class OutcomeCase {
       })
     })
     expect(await this.within(15000, 'The held batch', () => entered.promise)).toBe(SHARE_RECORDS)
-    await this.within(8000, 'The holder close', () => holder.client.disconnect({ timeout: 5000 }))
+    await this.within(8000, 'The holder close', () =>
+      holder.observer.closeClient(holder.client, { timeout: 2000 })
+    )
     gate.resolve()
     const delivered = await this.within(15000, 'The verifier member', (scope) =>
       verifierMember(group, topic, { kafka: plain, signal: scope, windowMs: 3000 })
     )
+    const observedAt = clock.now()
     const verified = delivered.map((d) => JSON.parse(d.identity))
     const verifiedKeys = verified.map((tuple) => Buffer.from(tuple[3], 'hex').toString())
     expect([...verifiedKeys].sort()).toEqual(keys.slice(SHARE_ACCEPTED))
@@ -752,6 +868,32 @@ class OutcomeCase {
     const logged = [...log.values()].flatMap(({ records }) => records.map((r) => r.key.toString()))
     expect([...logged].sort()).toEqual(keys)
     return {
+      recovery,
+      inputs: {
+        group,
+        acquiredAt: acquisitionStart(holder.trace.snapshot(), group),
+        handlerAt: acquiredAt,
+        expected: keys.map((key, i) => ({ key, valueHex: value(i).toString('hex') })),
+        handled,
+        log: [...log.values()].flatMap(({ records }) =>
+          records.map((r) => ({
+            key: r.key.toString(),
+            offset: r.offset,
+            valueHex: r.value.toString('hex'),
+          }))
+        ),
+        frames: holder.trace.snapshot(),
+        settlements: settlements.map(({ error, ...event }) => ({
+          ...event,
+          error: error ? { name: error.name, reason: error.reason } : null,
+        })),
+        confirmed: confirmedDecisions(holder.trace.snapshot(), group),
+        redelivered: verifiedKeys.map((key, i) => ({
+          key,
+          deliveryCount: delivered[i].deliveryCount,
+          at: observedAt,
+        })),
+      },
       keys: keys.length,
       accepted: SHARE_ACCEPTED,
       redelivered: verifiedKeys.sort(),
