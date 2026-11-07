@@ -1,5 +1,7 @@
 const fetchAcknowledgementResponse = require('../../../protocol/requests/shareFetch/v2/response')
 const acknowledgeResponse = require('../../../protocol/requests/shareAcknowledge/v2/response')
+const Decoder = require('../../../protocol/decoder')
+const { responseHeaderVersion, RESPONSE_HEADER_V1 } = require('../../../protocol/headers')
 const {
   acknowledgementResults,
   acknowledgementRequests,
@@ -66,6 +68,16 @@ const OLD_TIMESTAMP = '1700000000000'
 const SHARE_FETCH = 78
 const SHARE_ACKNOWLEDGE = 79
 const SHARE_APIS = new Set([76, 78, 79])
+const ADMIN_TRACE_APIS = {
+  3: require('../../../protocol/requests/metadata'),
+  10: require('../../../protocol/requests/findCoordinator'),
+  16: require('../../../protocol/requests/listGroups'),
+  18: require('../../../protocol/requests/apiVersions'),
+  20: require('../../../protocol/requests/deleteTopics'),
+  33: require('../../../protocol/requests/describeConfigs'),
+  42: require('../../../protocol/requests/deleteGroups'),
+  44: require('../../../protocol/requests/incrementalAlterConfigs'),
+}
 const RENEW = 4
 const ACCEPT = 1
 const INVALID_RECORD_STATE = 121
@@ -531,9 +543,16 @@ class Hold {
 class ShareWireTap {
   /**
    * @param {Function} [connect] opens one socket; replaced by a fake in the offline checks
+   * @param {Function} [recordAdmin] Receives admin request and response frame observations.
    */
-  constructor(connect = ({ host, port, onConnect }) => net.connect({ host, port }, onConnect)) {
+  constructor(
+    connect = ({ host, port, onConnect }) => net.connect({ host, port }, onConnect),
+    recordAdmin = () => {}
+  ) {
     this.connect = connect
+    this.recordAdmin = recordAdmin
+    this.traceAdmin = false
+    this.adminFrames = []
     this.sockets = []
     this.frames = []
     this.holds = []
@@ -548,16 +567,17 @@ class ShareWireTap {
     return (options) => {
       const socket = this.connect(options)
       socket.setKeepAlive?.(true, 60000)
-      return this.wrap(label, this.acknowledgements.wrap(socket, label))
+      return this.wrap(label, this.acknowledgements.wrap(socket, label), options)
     }
   }
 
   /**
    * @param {string} label the owning client
    * @param {object} socket the real socket
+   * @param {{host?:string, port?:number}} [address] Original connection destination.
    * @returns {object} the same socket, observed
    */
-  wrap(label, socket) {
+  wrap(label, socket, address = {}) {
     const entry = {
       label,
       socket,
@@ -565,12 +585,16 @@ class ShareWireTap {
       reader: new FrameSplitter(),
       sent: 0,
       answered: 0,
+      broker: `${address.host}:${address.port}`,
+      pendingAdmin: new Map(),
     }
     this.sockets.push(entry)
     const write = socket.write.bind(socket)
     socket.write = (data, ...rest) => this.write(entry, write, data, rest)
     socket.on('data', (chunk) => {
-      entry.answered += entry.reader.push(chunk).length
+      const frames = entry.reader.push(chunk)
+      entry.answered += frames.length
+      for (const frame of frames) this.adminResponse(entry, frame)
     })
     return socket
   }
@@ -591,19 +615,46 @@ class ShareWireTap {
     const headers = frames.map((frame) => this.record(entry, frame))
     const whole = frames.length === 1 && frames[0].length === bytes.length
     const hold = whole && this.holds.find((h) => h.matches(entry.label, headers[0].apiKey))
-    if (!hold) return write(data, ...rest)
+    if (!hold) {
+      const result = write(data, ...rest)
+      for (const { correlationId } of headers) {
+        const fact = entry.pendingAdmin.get(correlationId)
+        if (!fact) continue
+        fact.writeReturnedAt = performance.now()
+        this.recordAdmin({ status: 'written', ...fact })
+      }
+      return result
+    }
     hold.pending = () => write(data, ...rest)
     return true
   }
 
   /**
-   * Keeps every share request frame with its header facts and write time.
+   * Keeps share frames and cleanup admin frames with their original headers and write times.
    * @param {object} entry the observed socket
    * @param {Buffer} frame one whole request frame
    * @returns {{ apiKey: number }} the decoded request header
    */
   record(entry, frame) {
     const header = readRequestHeader(frame)
+    if (entry.label === 'admin' && this.traceAdmin) {
+      const fact = {
+        broker: entry.broker,
+        socket: this.sockets.indexOf(entry),
+        apiKey: header.apiKey,
+        apiVersion: header.apiVersion,
+        correlationId: header.correlationId,
+        writtenAt: performance.now(),
+        writeReturnedAt: null,
+        answeredAt: null,
+        requestHex: frame.toString('hex'),
+        responseHex: null,
+        response: null,
+      }
+      this.adminFrames.push(fact)
+      entry.pendingAdmin.set(header.correlationId, fact)
+      this.recordAdmin({ status: 'write-started', ...fact })
+    }
     if (SHARE_APIS.has(header.apiKey)) {
       this.frames.push({
         label: entry.label,
@@ -617,6 +668,38 @@ class ShareWireTap {
       })
     }
     return header
+  }
+
+  /**
+   * Pairs an admin answer with its original socket and request, retaining undecoded bytes on error.
+   * @param {object} entry Observed socket and its unanswered admin requests.
+   * @param {Buffer} frame Complete response frame including length and correlation ID.
+   * @returns {void} Decoding is observed without delaying the client.
+   */
+  adminResponse(entry, frame) {
+    const fact = entry.pendingAdmin.get(frame.readInt32BE(4))
+    if (!fact) return
+    entry.pendingAdmin.delete(fact.correlationId)
+    fact.answeredAt = performance.now()
+    fact.responseHex = frame.toString('hex')
+    this.recordAdmin({ status: 'answered', ...fact })
+    Promise.resolve()
+      .then(async () => {
+        const definitions = ADMIN_TRACE_APIS[fact.apiKey]
+        if (!definitions) return
+        const payload = frame.subarray(8)
+        const decoder = new Decoder(payload)
+        if (responseHeaderVersion(fact.apiKey, fact.apiVersion) === RESPONSE_HEADER_V1) {
+          decoder.readTaggedFields()
+        }
+        const { response } = definitions.protocol({ version: fact.apiVersion })({})
+        fact.response = await response.decode(payload.subarray(decoder.offset))
+        this.recordAdmin({ status: 'decoded', ...fact })
+      })
+      .catch((error) => {
+        fact.decodeError = describeError(error)
+        this.recordAdmin({ status: 'decode-failed', ...fact })
+      })
   }
 
   /** @returns {Record<string, Record<number, number>>} written share frames by client and API */
@@ -799,6 +882,33 @@ class ResourceGauge {
     )
   }
 
+  /** @returns {object[]} Original admin queue entries and throttle/timer state without more I/O. */
+  adminQueues() {
+    return [...this.queues]
+      .filter(({ clientId }) => clientId?.startsWith('admin-'))
+      .map((queue) => ({
+        broker: queue.broker,
+        throttledUntil: queue.throttledUntil,
+        pendingCheckScheduled: Boolean(queue.throttleCheckTimeoutId),
+        timeoutCheckScheduled: Boolean(queue.requestTimeoutIntervalId),
+        pending: queue.pending.map(
+          ({ entry: { apiKey, apiVersion, correlationId }, createdAt }) => ({
+            apiKey,
+            apiVersion,
+            correlationId,
+            createdAt,
+          })
+        ),
+        inflight: [...queue.inflight.values()].map(({ entry, createdAt, sentAt }) => ({
+          apiKey: entry.apiKey,
+          apiVersion: entry.apiVersion,
+          correlationId: entry.correlationId,
+          createdAt,
+          sentAt,
+        })),
+      }))
+  }
+
   /**
    * @param {Iterable<import('events').EventEmitter>} emitters Original client or queue emitters.
    * @returns {number} Listeners over every event of every retained emitter.
@@ -854,7 +964,16 @@ class LockCase {
     this.group = `e2e-p9e-lock-${kind}-group-${this.nonce}`
     this.stack = new CleanupStack()
     this.cleanupSteps = []
-    this.tap = new ShareWireTap()
+    this.tap = new ShareWireTap(undefined, (frame) =>
+      this.row('cleanup-frame', {
+        steps: this.cleanupSteps
+          .filter(({ elapsedMs }) => elapsedMs === null)
+          .map(({ step }) => step),
+        ...frame,
+        writtenAtMs: frame.writtenAt - this.startedAt,
+        answeredAtMs: frame.answeredAt === null ? null : frame.answeredAt - this.startedAt,
+      })
+    )
     this.gauge = new ResourceGauge()
     this.probe = this.gauge.probe({
       emitters: { process },
@@ -941,6 +1060,7 @@ class LockCase {
    * @returns {Promise<*>} Original result.
    */
   async cleanupStep(step, work) {
+    this.tap.traceAdmin = true
     const startedAt = performance.now()
     const entry = { step, startedAtMs: startedAt - this.startedAt, elapsedMs: null, error: null }
     this.cleanupSteps.push(entry)
@@ -954,7 +1074,11 @@ class LockCase {
       throw error
     } finally {
       entry.elapsedMs = performance.now() - startedAt
-      this.row('cleanup-step', { status: entry.error ? 'failed' : 'settled', ...entry })
+      this.row('cleanup-step', {
+        status: entry.error ? 'failed' : 'settled',
+        ...entry,
+        adminQueues: this.gauge.adminQueues(),
+      })
     }
   }
 
@@ -980,6 +1104,7 @@ class LockCase {
       acknowledgementRequests: acknowledgementRequests(this.tap.frames),
       wireAcknowledgements: this.tap.acknowledgements.snapshot(),
       cleanupSteps: this.cleanupSteps,
+      adminCleanupRequests: this.tap.adminFrames,
     }
   }
 
@@ -2090,18 +2215,23 @@ class LockCase {
   }
 
   /**
-   * Joins independent group and topic deletion before proving their absence together.
+   * Deletes share group state before its topic, then proves their absence together in cleanup.
    * @param {AbortSignal} signal Cleanup scope shared by both operations.
    * @returns {Promise<void>} Once both deletion operations have settled.
    */
   async deleteFixtures(signal) {
-    const results = await Promise.allSettled([
-      this.cleanupStep('delete group', () => this.deleteGroup(signal)),
-      this.cleanupStep('delete topic', () => this.deleteTopic(signal)),
-    ])
-    const failures = results
-      .filter(({ status }) => status === 'rejected')
-      .map(({ reason }) => reason)
+    const failures = []
+    for (const [step, work] of [
+      ['delete group', () => this.deleteGroup(signal)],
+      ['delete topic', () => this.deleteTopic(signal)],
+    ]) {
+      try {
+        signal.throwIfAborted()
+        await this.cleanupStep(step, work)
+      } catch (error) {
+        failures.push(error)
+      }
+    }
     if (failures.length) throw new AggregateError(failures, 'Fixture deletion failed')
   }
 
