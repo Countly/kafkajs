@@ -78,6 +78,7 @@ class ShareRun {
     this.applying = 0
     this.committed = []
     this.tap = null
+    this.heartbeatRevision = Symbol('heartbeat')
     this.coordinator = null
     this.facade = null
     this.waiters = new Set()
@@ -202,7 +203,7 @@ class ShareRun {
 
   /**
    * Retires every coordinator lookup in flight, so none can outlive the membership it served.
-   * Callers run it only once that membership is closed or replaced.
+   * Callers run it once that membership is closed, replaced or frozen for captured traffic.
    * @private
    * @returns {void}
    */
@@ -229,7 +230,8 @@ class ShareRun {
         response,
         current: !options?.guard || options.guard() === null,
       }
-      if (response.errorCode === 0) this.coordinator = this.bindCoordinator(broker)
+      if (this.tap.current && response.errorCode === 0)
+        this.coordinator = this.bindCoordinator(broker)
     }
     return response
   }
@@ -275,9 +277,14 @@ class ShareRun {
    * @throws {Error} The classified failure of a current heartbeat, as `ShareMembership#heartbeat`.
    */
   async heartbeat() {
+    const revision = this.heartbeatRevision
+    const guard = () =>
+      this.retired || revision === null || revision !== this.heartbeatRevision
+        ? new KafkaJSNonRetriableError('Share heartbeat is no longer current')
+        : null
     this.applying++
     try {
-      await this.membership.heartbeat()
+      await this.membership.heartbeat({ guard })
     } finally {
       this.applying--
       if (this.applying === 0) this.publishCommitted()
@@ -1111,6 +1118,7 @@ class ShareRun {
    */
   freeze(episode) {
     if (episode.frozen) return
+    this.captureCloseCoordinator(episode)
     const bindings = []
     for (const node of this.nodes.values()) {
       if (!node.loop) continue
@@ -1123,6 +1131,8 @@ class ShareRun {
     }
     episode.freeze(bindings)
     this.authorityToken = null
+    this.heartbeatRevision = null
+    this.retireLookups()
     this.admitting = false
     if (episode.kind === 'poll' || episode.kind === 'fence') this.manager.stop()
     else {
@@ -1140,6 +1150,55 @@ class ShareRun {
       if (discarded && (node.session.epoch !== 0 || node.dropped > 0))
         this.onSessionReset(node, 'membership')
     }
+  }
+
+  /**
+   * Recaptures an already reconnected coordinator at the close boundary, only while the same
+   * established membership still owns the same Broker, pool and connection slot. No connection
+   * is opened here; once frozen, the captured generation cannot be replaced again.
+   * @private
+   * @param {ShareCloseEpisode} episode The episode whose authority is about to freeze.
+   * @returns {void}
+   */
+  captureCloseCoordinator(episode) {
+    const coordinator = this.coordinator
+    const { membership } = this
+    if (
+      !coordinator ||
+      coordinator.current() ||
+      episode.guard() ||
+      membership.token !== this.authorityToken ||
+      membership.closed ||
+      membership.state !== MEMBER_STATES.STABLE ||
+      membership.memberEpoch <= 0 ||
+      membership.coordinator !== this.facade ||
+      this.facade?.broker !== coordinator.broker ||
+      coordinator.broker.connectionPool !== coordinator.pool ||
+      coordinator.pool.pool[0] !== coordinator.connection
+    )
+      return
+    const current = this.bindCoordinator(coordinator.broker)
+    if (current.current()) this.coordinator = current
+  }
+
+  /**
+   * Reports a leave refusal once, distinguishing an omission from a written, unknown outcome.
+   * @private
+   * @param {ShareCloseEpisode} episode The closing episode.
+   * @param {string} reason Why the leave could not complete.
+   * @returns {void}
+   */
+  leaveSkipped(episode, reason) {
+    if (episode.leaveReported) return
+    episode.leaveReported = true
+    this.options.logger.warn(
+      episode.leaveWritten ? 'Share leave outcome unknown' : 'Share leave skipped',
+      {
+        groupId: this.options.groupId,
+        reason,
+        outcome: episode.leaveWritten ? 'sent-unknown' : 'not-sent',
+      }
+    )
   }
 
   /**
@@ -1186,15 +1245,33 @@ class ShareRun {
     const finals = () => (sent ??= this.sendFinals(episode, operation))
     try {
       if (episode.kind === 'fence') {
+        this.leaveSkipped(episode, 'fenced')
         await operation.wait(finals)
         return
       }
       const coordinator = this.coordinator
-      if (coordinator && this.membership.memberEpoch > 0 && episode.claimLeave(coordinator))
-        await this.leave(episode, operation, coordinator, finals)
-      else await operation.wait(finals)
+      let reason = null
+      if (episode.guard()) reason = 'close-deadline'
+      else if (this.membership.memberEpoch <= 0) reason = 'membership-unestablished'
+      else if (
+        !coordinator ||
+        (!this.membership.coordinator && this.membership.state !== MEMBER_STATES.FATAL)
+      )
+        reason = 'coordinator-unknown'
+      else if (!episode.claimLeave(coordinator)) reason = 'coordinator-stale'
+      if (reason) {
+        this.leaveSkipped(episode, reason)
+        if (episode.kind === 'poll')
+          this.membership.leave({
+            stale: true,
+            guard: () => new KafkaJSNonRetriableError('Share leave was omitted'),
+          })
+        await operation.wait(finals)
+      } else await this.leave(episode, operation, coordinator, finals)
     } catch (error) {
-      this.options.logger.debug('Share close traffic ended early', { error: error.message })
+      if (episode.leaveWritten)
+        this.leaveSkipped(episode, episode.guard() ? 'close-deadline' : 'leave-failed')
+      this.options.logger.warn('Share close traffic ended early', { error: error.message })
     } finally {
       await (sent ?? finals()).catch(() => {})
       episode.guard()
@@ -1213,7 +1290,13 @@ class ShareRun {
    * @returns {Promise<void>}
    */
   async leave(episode, operation, coordinator, finals) {
-    const guard = () => episode.refusal(coordinator)
+    const guard = (frameLength) => {
+      const refused = episode.refusal(coordinator)
+      if (refused)
+        this.leaveSkipped(episode, episode.guard() ? 'close-deadline' : 'coordinator-stale')
+      else if (frameLength !== undefined) episode.leaveWritten = true
+      return refused
+    }
     const { membership } = this
     if (membership.state !== MEMBER_STATES.FATAL && !(membership.closed && membership.terminal)) {
       await operation.wait(() =>
@@ -1308,6 +1391,7 @@ class ShareRun {
       this.closing = null
       this.closed = false
       this.admitting = true
+      this.heartbeatRevision = Symbol('heartbeat')
       episode.finish()
       if (kind === 'fence') {
         this.manager.ensureStarted()
