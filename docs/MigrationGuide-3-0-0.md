@@ -1494,7 +1494,8 @@ The declared bases of KafkaJSPartialMessageError, KafkaJSSASLAuthenticationError
 ### Numeric telemetry snapshots
 
 The internal collector supports finite numeric Gauge and monotonic BigInt Sum
-snapshots. Returned-client registration methods are not attached at this milestone.
+snapshots, and all four returned client kinds expose the registration methods (see
+[Broker client telemetry](#broker-client-telemetry) below).
 The model updates a value by re-registering the same name and attributes; it does not
 poll a callback or bridge an OTel SDK. Type and unit remain fixed while any identity
 of a name is registered. Unregister before resetting a Sum or changing its metadata.
@@ -1506,8 +1507,8 @@ The internal telemetry primitives enforce a 1 MiB default and hard local cap on 
 raw and transmitted Metrics bytes, further reduced by a positive broker limit or
 temporary size penalty. Small limits may omit whole metrics or produce an empty
 blob. Metrics are best effort: a sample already written can be lost without later
-delta replay. The public configuration milestone documents lowering the local cap
-or disabling telemetry; this preparatory primitive adds no returned-client option.
+delta replay. `telemetryMaxBytes` lowers the local cap on each client, and disabling
+telemetry removes the traffic.
 
 Telemetry payloads over1000 bytes use mutually supported built-in ZSTD/GZIP in broker order; NONE is always available. Producer codec registrations are unchanged.
 
@@ -1528,3 +1529,17 @@ is the escape from this traffic. Broker intervals below 100 ms are clamped to
 100 ms locally; nonpositive intervals use 300000 ms. See
 [Client Telemetry](ClientTelemetry.md#subscription-transport-and-recovery) for
 capability, error, throttle and best-effort delivery behavior.
+
+### Broker client telemetry
+
+Broker client telemetry (KIP-714) is opt-in on every client. The table gives each public change, its impact and its escape.
+
+| Change | Impact / migration | Escape |
+|---|---|---|
+| “Broker client metrics (KIP-714) are available with `enableMetricsPush: true`; the default remains false. Kafka-wide defaults can be overridden on producer, consumer, admin and share consumer.” | Existing configurations send no telemetry by default. Enable globally or per client after configuring a broker metrics reporter/subscription. Explicit false always opts out. The default-off difference from Java/franz-go is intentional. | `enableMetricsPush: false`. |
+| “Enabling broker telemetry can open one additional broker connection per client and send GetTelemetrySubscriptions/PushTelemetry traffic. Unsupported brokers quietly leave foreground operations usable.” | Account for one dedicated socket, interval requests and their TLS/SASL authentication. Missing exporter is different from no matching CLIENT_METRICS resource; no-resource clients poll and do not push. | Disable telemetry; the dedicated connection keeps its own failure state and shares none with foreground traffic. |
+| “Telemetry includes only applicable rack/group/static-member/current-member/transaction identity attributes, library scope/version and per-node metric labels.” | Treat group/transaction identity as information disclosed to the configured broker telemetry receiver. Over-512-byte resource values are omitted intact, with dropped count. No credentials, records, arbitrary config or environment is sent by this feature. | Disable telemetry; no extra opt-out option for individual standard attributes. |
+| “Telemetry buffers, metric identities, labels and timers have fixed bounds; `telemetryMaxBytes` may lower the 1 MiB default. Small limits may omit metrics or send an empty blob.” | Both raw and compressed Metrics bytes respect the broker/local maximum. At most 64 node slots and 128 custom series; custom overflow rejects explicitly. Metrics are best-effort and a lost/rejected written sample may be omitted from later deltas. Local intervals below 100 ms clamp to 100 ms. | Lower `telemetryMaxBytes` or disable; no unbounded mode. Decompression and response-frame limits are unchanged. |
+| “Each client exposes an asynchronous stable `clientInstanceId({ timeout })`; disabled/unsupported/closed/unavailable calls reject with `KafkaJSTelemetryError`.” | UUID is per returned client, stable through reconnect, not a group instance ID. Cached IDs are available without a new network request. Call after connect; timeout0 means cached-only. | Do not call getter or disable metrics; ordinary Kafka calls keep their old error/result identity. |
+| “Applications may register/unregister finite numeric Gauge and monotonic BigInt Sum snapshots for broker subscriptions.” | Re-register the same identity to update its value; there is no callback invocation or OTel SDK bridge. Unregister before resetting a Sum or changing immutable name type/unit. All four client kinds have this API. | Use existing instrumentation/optional OTel instead of registering; registered data only transmits when telemetry is enabled and selected. |
+| “Disconnect sends a best-effort terminating telemetry push on an active connected subscription, for at most 1000 ms within the existing close budget; timeout0 sends no final.” | Final failure cannot delay core close past its inherited deadline or change its result. No reconnect/Get occurs for a final. Internal crash recovery and stop alone are not terminal. Explicit reconnect retains UUID and stays provisional through Get until its first successful normal Push. Only a first-Push 42 in that captured post-final reopen permits one corrective telemetry-transport retirement, ordinary backoff, nonzero-ID Get and additional normal Push; Get cannot replenish the allowance. A second 42 or other fatal result stops only telemetry; close/expiry tears down under existing limits. No UUID rotation, final resend, foreground reconnect or exception for established streams. | `disconnect({ timeout: 0 })` where inherited, or disable metrics; no new close overload/default. |

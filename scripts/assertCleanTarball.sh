@@ -21,16 +21,23 @@ if echo "$FILES" | grep -E '^package/otel(/|$)'; then
   exit 1
 fi
 
-# Ship exactly the public share guide from docs/.
-if ! echo "$FILES" | grep -Fxq 'package/docs/ShareConsumer.md'; then
-  echo "tarball is missing the share consumer guide" >&2
-  exit 1
-fi
-if echo "$FILES" | grep -E '^package/docs/' | grep -Ev '^package/docs/ShareConsumer\.md$'; then
+# Ship exactly the public share and client telemetry guides from docs/.
+for guide in ShareConsumer ClientTelemetry; do
+  if ! echo "$FILES" | grep -Fxq "package/docs/$guide.md"; then
+    echo "tarball is missing the $guide guide" >&2
+    exit 1
+  fi
+  if tar -xOf "$1" "package/docs/$guide.md" | grep -E '/var/tmp/|/home/[^ /]+/|\.superpowers/'; then
+    echo "$guide guide contains a local path" >&2
+    exit 1
+  fi
+done
+if echo "$FILES" | grep -E '^package/docs/' | grep -Ev '^package/docs/(ShareConsumer|ClientTelemetry)\.md$'; then
   echo "tarball contains unintended documentation" >&2
   exit 1
 fi
-if tar -xOf "$1" package/docs/ShareConsumer.md | grep -E '/var/tmp/|/home/[^ /]+/|\.superpowers/'; then
-  echo "share consumer guide contains a local path" >&2
+# Telemetry tooling and the package-export witness stay out of the tarball.
+if echo "$FILES" | grep -E '^package/(scripts/e2e/telemetry/|.*\.jar$|.*\.proto$|types/package-exports\.mts$)'; then
+  echo "tarball contains telemetry tooling" >&2
   exit 1
 fi

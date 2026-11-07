@@ -11,6 +11,7 @@ scripts/
 examples/
 docs/*
 !docs/ShareConsumer.md
+!docs/ClientTelemetry.md
 docker-compose.yml
 docker-compose.*.yml
 jest.config.js
@@ -26,6 +27,7 @@ types/tests.ts
 types/tsconfig.json
 types/tests.node16.ts
 types/tsconfig.node16.json
+types/package-exports.mts
 .github/
 .agents/
 .claude/

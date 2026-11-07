@@ -383,6 +383,21 @@ Take a look at [Retry](Configuration.md#retry) for more information.
 
 The retries of a send run until its [delivery deadline](#delivery-timeout) unless you set `retry.retries`: the producer retries a retriable answer, backing off from 100 ms up to 1000 ms with the retrier's jitter, for as long as the deadline lasts, and then rejects with `KafkaJSDeliveryTimeout` whose `cause` is the last error. An explicit `retry.retries`, `retry.maxTotalTime`, `retry.initialRetryTime` or `retry.maxRetryTime` is honoured, each key on its own, and `retry.retries` ends a send with `KafkaJSNumberOfRetriesExceeded` as before. The requests of a transaction (`initTransactions`, `commit`, `abort`, `sendOffsets`) and the producer id and partition registrations keep the retrier's own defaults.
 
+## Broker client telemetry
+
+Producer config inherits Kafka's `enableMetricsPush: false` and `telemetryMaxBytes: 1048576`; explicit client values override them. The returned producer has `clientInstanceId({ timeout: 60000 })`, `registerMetricForSubscription(metric)` and `unregisterMetricFromSubscription(identity)`. Transaction handles have no telemetry API. Connect before requesting an uncached ID; timeout0 is cached-only. Enabled reconnect retains the UUID and numeric registrations.
+
+```js
+const producer = kafka.producer({ enableMetricsPush: true, telemetryMaxBytes: 4096 })
+await producer.connect()
+const id = await producer.clientInstanceId({ timeout: 60000 })
+producer.registerMetricForSubscription({ name: 'com.example.produced.total', type: 'sum', value: 1n })
+producer.unregisterMetricFromSubscription({ name: 'com.example.produced.total' })
+await producer.disconnect({ timeout: 0 })
+```
+
+The inherited close overloads and signal callback remain unchanged. A final telemetry push joins core draining concurrently, for at most min(1000 ms, original remaining budget); timeout0 sends none. It cannot change send/transaction outcomes or producer fatal state. Telemetry discloses an applicable transactional_id to the configured receiver. Disable it with explicit false. See [Client Telemetry](ClientTelemetry.md) for the readonly observational error reasons, complete disclosure, bounds/losses and corrective-reopen conditions.
+
 ## <a name="compression"></a> Compression
 
 GZIP, Snappy, LZ4 and ZSTD are built in — no configuration is needed to consume their compressed messages. LZ4 needs the optional `lz4-napi` dependency, and ZSTD needs support in `node:zlib`. A codec you register under `CompressionCodecs` always takes priority over a built-in one.

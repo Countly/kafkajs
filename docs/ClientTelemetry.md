@@ -10,15 +10,13 @@ including request header version 2 and response header version 1. Their structur
 request and response vectors record independent bytes and literal fields.
 
 Runtime use requires both telemetry APIs and a working broker exporter. A broker
-version number alone does not establish telemetry support. This protocol milestone
-adds no public client configuration, subscription loop or metric registration API.
+version number alone does not establish telemetry support. The options and methods below enable the subscription loop and numeric registration API.
 See [Testing](Testing.md#telemetry-wire-evidence) for the broker-free wire checks.
 
 ## Numeric metric model
 
-The collector is internal at this milestone. Public registration methods are not yet
-attached to returned clients. Producer, ordinary consumer, admin and ShareConsumer
-collectors keep independent numeric state; ShareConsumer uses the consumer names.
+Producer, ordinary consumer, admin and ShareConsumer each expose the methods below
+and own independent numeric state; ShareConsumer uses the consumer names.
 
 | Name | Type | Unit | Measurement |
 |---|---|---|---|
@@ -86,7 +84,7 @@ Unregistration of an absent valid identity is a no-op. Unregistration invalidate
 unsent snapshot; an already written sample cannot be retracted. Descriptions survive
 explicit disconnect/reconnect while transient snapshots and latency windows clear.
 
-These primitives prepare the later public registration integration. Existing
+All four returned client kinds expose numeric registration methods. Existing
 instrumentation and the optional OTel package remain available for application
 metrics; no callback equivalence or SDK bridge is claimed here.
 
@@ -143,8 +141,7 @@ an authorized socket write advance them; response loss or rejection does not rep
 already written data. Omitted or unsent points retain their unsent baseline. Metrics
 are best effort and a rejected written sample can therefore be absent from a later
 delta. Omission counts are local diagnostics, with at most one sanitized warning per
-subscription revision. These are internal primitives; returned-client configuration
-and lifecycle attachment have separate implementation milestones.
+subscription revision. The options below configure these bounds on each returned client.
 
 ## Subscription transport and recovery
 
@@ -155,7 +152,7 @@ only current connected broker advertisements, requires version 0 of both telemet
 APIs, then negotiates again on the dedicated socket and completes a successful Get.
 A missing exporter leaves telemetry dormant. A successful Get with no matching
 CLIENT_METRICS resource keeps its UUID and polls without sending Push requests.
-This transport milestone does not activate a public factory option.
+Telemetry remains opt-in through the public factory options below.
 
 Each accepted Get replaces filters, codecs, cap, interval and temporality together.
 The first Get uses a zero UUID until a current successful response assigns one; all
@@ -212,3 +209,78 @@ A terminating Push is established-only: it never dials or starts authentication.
 If authentication is due at preparation or becomes due while the final waits in
 the queue, the final is abandoned and only its captured transport is retired.
 An already-authenticated final can write once within the original close budget.
+
+## Configuration and public methods
+
+Broker client metrics (KIP-714) are available with `enableMetricsPush: true`; the default remains false. Kafka-wide defaults can be overridden on producer, consumer, admin and share consumer.
+
+| Option | Kafka default | Per-client override | Validation |
+|---|---|---|---|
+| `enableMetricsPush` | `false` | Explicit `true` or `false` wins; omitted/undefined inherits. | Boolean only; null and coercible values reject. |
+| `telemetryMaxBytes` | `1048576` | Explicit byte limit wins; omitted/undefined inherits. | Integer 1..1048576, even when telemetry is disabled. |
+
+Both options are copied and validated at construction/factory entry. Invalid values or throwing option accessors produce `KafkaJSInvalidConfigurationError` before core or telemetry objects are constructed. Changing the original options later cannot enable traffic or change the limits. `telemetryMaxBytes` is independent of consumer fetch limits and response/decompression caps.
+
+Enabling broker telemetry can open one additional broker connection per client and send GetTelemetrySubscriptions/PushTelemetry traffic. Unsupported brokers quietly leave foreground operations usable.
+
+Budget for that dedicated connection's TLS/SASL authentication and interval requests. A missing exporter differs from a valid empty subscription: the latter keeps polling without pushes. Explicit false disables the additional connection and all telemetry collection.
+
+```js
+const { Kafka, KafkaJSTelemetryError } = require('@countly/kafkajs')
+const kafka = new Kafka({
+  brokers: ['localhost:9092'],
+  enableMetricsPush: true,
+  telemetryMaxBytes: 1048576,
+})
+const producer = kafka.producer()
+const consumer = kafka.consumer({ groupId: 'orders', enableMetricsPush: false })
+const admin = kafka.admin({ enableMetricsPush: true, telemetryMaxBytes: 4096 })
+const share = kafka.shareConsumer({ groupId: 'workers', enableMetricsPush: true })
+await producer.connect()
+try {
+  const id = await producer.clientInstanceId({ timeout: 60000 })
+  console.log(id)
+} catch (error) {
+  if (!(error instanceof KafkaJSTelemetryError)) throw error
+  console.log(error.reason)
+}
+```
+
+Each client exposes an asynchronous stable `clientInstanceId({ timeout })`; disabled/unsupported/closed/unavailable calls reject with `KafkaJSTelemetryError`.
+
+The getter is available on producer, consumer, admin and share consumer, and is absent from the Kafka factory and transaction handles. It returns a lowercase canonical UUID belonging to that returned object. Siblings have independent IDs even with the same client ID, group or transaction ID. It never enables telemetry, connects, starts a stopped loop or resets a lifecycle.
+
+Omitted options or timeout use 60000 ms. Timeout is an integer 0..2147483647; 0 is cached-only. Invalid options, including null, arrays, signal strings and throwing accessors, return a rejected Promise with `KafkaJSInvalidConfigurationError`; the call never throws synchronously. Validation precedes state checks. After validation: disabled wins; then a cached ID resolves even while closed, suspended or stopped; otherwise closed rejects `closed`, suspended or not foreground connected rejects `not-connected`, established unsupported rejects `unsupported`, and a fatally stopped telemetry stream rejects `stopped`. Eligible uncached callers wait independently and can reject `timeout`; a 65th concurrent waiter rejects `limit`. There are at most 64 waiters and one earliest-deadline timer. Expiry detaches only that caller and does not cancel the shared Get.
+
+`KafkaJSTelemetryError` extends `KafkaJSNonRetriableError`. Its readonly `reason` is one of `disabled`, `not-connected`, `closed`, `unsupported`, `timeout`, `stopped` or `limit`; `apiKey` is optional. It does not indicate a producer-fatal or abortable transaction. Retrying a getter after a timeout is allowed. Only the error class is a runtime export; import types and the error from the root entry point. CommonJS, ESM named/default imports and the supported package alias use the same error constructor within their module instance. Internal telemetry modules have no exported deep paths.
+
+### Registration on returned clients
+
+Applications may register/unregister finite numeric Gauge and monotonic BigInt Sum snapshots for broker subscriptions.
+
+```js
+producer.registerMetricForSubscription({ name: 'com.example.queue.depth', type: 'gauge', value: 3 })
+producer.registerMetricForSubscription({ name: 'com.example.processed.total', type: 'sum', value: 5n })
+producer.registerMetricForSubscription({ name: 'com.example.processed.total', type: 'sum', value: 8n })
+producer.unregisterMetricFromSubscription({ name: 'com.example.queue.depth' })
+```
+
+The methods are synchronous and return void. They work on all four kinds. Registering while disabled throws telemetry `disabled`; unregistering an absent valid identity remains a no-op while disabled. Enabled registration stores bounded values before connect, after disconnect and while stopped; it opens no socket, restarts no machine, and survives explicit reconnect. Invalid descriptors throw `KafkaJSInvalidConfigurationError` before mutation. No callback or OTel SDK is sampled. Use existing instrumentation or optional OTel instead if you do not want to register broker metrics.
+
+Telemetry buffers, metric identities, labels and timers have fixed bounds; `telemetryMaxBytes` may lower the 1 MiB default. Small limits may omit metrics or send an empty blob.
+
+At most 64 node slots and 128 custom series are retained. The 65th ID waiter's refusal is independent of those series limits. Both raw and transmitted bytes respect the smaller local/broker maximum. Custom overflow explicitly rejects; there is no unbounded setting. Lost or rejected written samples may be absent from subsequent deltas. Intervals below 100 ms clamp locally to 100 ms. Lower `telemetryMaxBytes` or disable telemetry to reduce resource/traffic costs; existing response and decompression limits are unchanged.
+
+### Resource disclosure and lifecycle
+
+Telemetry includes only applicable rack/group/static-member/current-member/transaction identity attributes, library scope/version and per-node metric labels.
+
+The whitelist is `client_rack`, `group_id`, `group_instance_id`, `group_member_id`, `transactional_id`. Consumer without a group omits all group fields; ShareConsumer has no ordinary static-member field; admin omits group and transaction fields. Current membership comes from the lifecycle owner, with issued revision checks. Values over 512 UTF-8 bytes are omitted intact and increase `dropped_attributes_count`. Scope name is `countly-kafkajs`, with the package version. Node IDs label the destination broker's RTT, separately from broker exporter context. Credentials, records, headers, arbitrary options, environment and principal are never collected. Treat group/transaction identities as information disclosed to the configured receiver. Disable telemetry to opt out of the standard attributes; no per-attribute opt-out is added.
+
+Disconnect sends a best-effort terminating telemetry push on an active connected subscription, for at most 1000 ms within the existing close budget; timeout0 sends no final.
+
+Telemetry cleanup starts concurrently with core draining, under the first valid inherited close deadline. It never reserves or subtracts core drain time or changes the original close result/error. Existing close overloads, signal callbacks and natural/unbounded core behavior remain as documented for each client; no new disconnect timeout option is introduced. Use `disconnect({ timeout: 0 })` only on a client whose inherited close supports it, or disable telemetry, to omit the final.
+
+A final never reconnects, authenticates, gets a subscription or retries. Public reconnect retains UUID and registrations and uses nonzero-ID Get; the first successful normal Push establishes the reopened stream. Only its first provisional Push 42 permits one corrective retirement/backoff/Get/additional normal Push. Get cannot replenish this allowance; a second 42 or other fatal result stops only telemetry. No UUID rotation, terminating resend or foreground reconnect is authorized. A provisional close skips another final.
+
+Internal consumer/share crash cleanup suspends telemetry without a final. Expired uncached waiters reject `timeout`, remaining pending waiters reject `not-connected`, and none transfer to a replacement lifecycle. Ordinary transport retry preserves waiter deadlines. `stop()` alone keeps connected telemetry active. Seek, rejoin, topic recreation and reassignment retain the UUID. Existing instrumentation events and diagnostics channels keep their names and payloads; broker telemetry is distinct from the optional OTel integration.

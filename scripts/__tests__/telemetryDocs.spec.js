@@ -148,3 +148,55 @@ describe('telemetry subscription documentation', () => {
     }
   })
 })
+
+describe('public telemetry documentation', () => {
+  test('publishes exact options getter reasons registration disclosure and close rules', () => {
+    const text = read('docs/ClientTelemetry.md')
+    for (const token of [
+      'default remains false',
+      '1048576',
+      '60000',
+      '2147483647',
+      '64 waiters',
+      '65th',
+      'KafkaJSTelemetryError',
+      'group_member_id',
+      '512 UTF-8',
+      'dropped_attributes_count',
+      'timeout0 sends no final',
+      'concurrently with core draining',
+      'Get cannot replenish',
+      'registerMetricForSubscription',
+      'unregisterMetricFromSubscription',
+    ]) {
+      expect(text).toContain(token)
+    }
+    expect(text).not.toContain('not yet attached')
+  })
+  test('every client guide and the migration guide publish the public telemetry section', () => {
+    for (const file of [
+      'docs/Producing.md',
+      'docs/Consuming.md',
+      'docs/Admin.md',
+      'docs/ShareConsumer.md',
+    ]) {
+      expect(read(file)).toContain('## Broker client telemetry')
+    }
+    expect(read('docs/Configuration.md')).toContain('## Client telemetry options')
+    expect(read('docs/MigrationGuide-3-0-0.md')).toContain('### Broker client telemetry')
+  })
+  test.each(['test:unit', 'test:coverage:unit'])(
+    '%s includes factory files through the one telemetry wildcard',
+    (lane) => {
+      const tokens = [...pkg.scripts[lane].matchAll(/'([^']+)'/g)].map((m) => m[1])
+      expect(tokens.filter((p) => p === 'src/telemetry/.*')).toHaveLength(1)
+      expect(tokens.some((p) => p.startsWith('src/telemetry/__tests__/'))).toBe(false)
+      for (const file of ['factories', 'clientInstanceId', 'options']) {
+        expect(
+          tokens.some((p) => new RegExp(p).test(`src/telemetry/__tests__/${file}.spec.js`))
+        ).toBe(true)
+      }
+      expect(tokens.some((p) => new RegExp(p).test('src/errors.spec.js'))).toBe(true)
+    }
+  )
+})

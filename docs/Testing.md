@@ -100,6 +100,10 @@ guard and transmission-callback checks on the ordinary request path must be
 measured with the actual Connection prepare/queue/fulfill driver, interleaved
 previous and candidate arms, recorded host load, and the fixed A/A controls.
 
+### Public telemetry factories and types
+
+The broker-free telemetry factory, instance-ID and options specs use the unit/coverage telemetry wildcard. They cover independent instances, root/client overrides, default-off traffic, registration storage, getter validation/deadlines/suspension and inherited close budgets. Run one exact physical pattern at a time with --maxWorkers=2 and a private cache. The TypeScript legacy, Node16 and package-export/alias checks preserve constructor and trailing disconnect tuples and signal callbacks. A valid TS2578 unused-expect-error control must fail compilation. All four returned kinds, including actual ShareConsumer declarations, are required before accepting this surface. Live exporter and natural-exit proofs have separate owners; a construction witness is not a live result.
+
 ## Integration tests
 
 Most of the test suite talks to a real Kafka cluster. `npm test` runs `npm run lint`, `npm run compat:check` and `npm run protocol:check`, boots the cluster, runs everything, and tears the cluster down again — it's a convenient local shortcut, but it is not what CI runs.

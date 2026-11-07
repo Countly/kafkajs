@@ -207,6 +207,21 @@ Retry counts and backoff remain unchanged. The call ends at the earlier of retry
 
 For example, `createTopics({ topics, timeout: 30000, apiTimeout: 5000 })` can time out locally while the broker continues creating the topics. The error names the method and the API budget.
 
+## Broker client telemetry
+
+Admin config inherits Kafka's `enableMetricsPush: false` and `telemetryMaxBytes: 1048576`; explicit client values override them. The returned admin exposes `clientInstanceId({ timeout: 60000 })`, `registerMetricForSubscription(metric)` and `unregisterMetricFromSubscription(identity)`.
+
+```js
+const admin = kafka.admin({ enableMetricsPush: true, telemetryMaxBytes: 4096 })
+await admin.connect()
+const id = await admin.clientInstanceId({ timeout: 60000 })
+admin.registerMetricForSubscription({ name: 'com.example.admin.depth', type: 'gauge', value: 1 })
+admin.unregisterMetricFromSubscription({ name: 'com.example.admin.depth' })
+await admin.disconnect()
+```
+
+No group or transaction identity is emitted for admin. The three admin connection/RTT metrics are documented extensions. Existing apiTimeout and broker-side timeout meanings stay unchanged, and telemetry adds no disconnect option. Telemetry cleanup runs concurrently with the first valid close, for at most min(1000 ms, its remaining budget); `disconnect({ timeout: 0 })` sends no final. It cannot replace the close result or error. Disable it with explicit false. See [Client Telemetry](ClientTelemetry.md) for limits, loss, errors and corrective-reopen behavior.
+
 ## Authorized operations
 
 `describeGroups(groupIds, { includeAuthorizedOperations: true })` and `fetchTopicMetadata({ topics, includeTopicAuthorizedOperations: true })` can return `authorizedOperations?: number | null`. A requested supported value is the raw signed INT32 mask, including unknown bits. The sentinel `-2147483648`, an absent or unsupported field, and a field not requested are `null`. Metadata supports its request flag from v8; v7 completes with a null mask. No conversion to an operation-name array is performed.
