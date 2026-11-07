@@ -21,6 +21,18 @@ module.exports = class InstrumentationEventEmitter {
   }
 
   /**
+   * Checks both observer paths before a caller prepares a notification.
+   * @param {string} eventName the internal event name
+   * @returns {boolean} whether a listener or diagnostics subscriber can receive this event
+   */
+  hasListeners(eventName) {
+    return (
+      this.channels?.[eventName]?.hasSubscribers === true ||
+      this.emitter.listenerCount(eventName) > 0
+    )
+  }
+
+  /**
    * Delivers an event to the `diagnostics_channel` subscribers of its channel, then to the
    * listeners added with `addListener`, as one `InstrumentationEvent` whose `type` is the public
    * event name. Allocates nothing when neither has anybody listening. A channel subscriber that

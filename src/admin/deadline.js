@@ -355,9 +355,10 @@ const checked = (value) => {
 const waitOf = (work) => currentDeadline()?.wait(work) ?? work()
 
 /**
- * Starts shared physical setup outside caller ownership. The caller still waits under its scope.
+ * Runs shared physical setup or observer notifications outside caller ownership.
+ * The caller's continuation retains its original scope.
  * @template T
- * @param {() => T|Promise<T>} work setup whose separate budget owns cancellation
+ * @param {() => T|Promise<T>} work shared setup or observers with an independent lifetime
  * @returns {Promise<T>|T} shared work's result
  */
 const sharedSetup = (work) => context.exit(work)

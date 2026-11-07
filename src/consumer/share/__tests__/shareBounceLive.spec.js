@@ -1166,7 +1166,7 @@ const admissionAccounting = (bounces) => {
  * @param {object[]} bounces Admissions captured before or at this observation.
  * @param {BounceEvidence} evidence Primitive loss and outcome journals.
  * @param {object} cut Original observation boundary.
- * @returns {object} Independent live/history/admitted counts and unexplained retired attempts.
+ * @returns {object} Live/history/admitted counts and unattributed attempts with original loss evidence.
  */
 const historyAccounting = (entries, bounces, evidence, cut) => {
   const history = unresolvedAt(entries, evidence, cut)
@@ -1194,8 +1194,54 @@ const historyAccounting = (entries, bounces, evidence, cut) => {
   const retainedIdentities = new Set(retained.map(({ identity }) => identity))
   const historyIdentities = new Set(history.map(({ identity }) => identity))
   const problems = []
-  if (history.some(({ id }) => !pendingIds.has(id) && !admissions.has(id)))
-    problems.push('Unresolved retired history has no original admission')
+  const unattributed = history
+    .filter(({ id }) => !pendingIds.has(id) && !admissions.has(id))
+    .map((entry) => ({
+      entry: entry.id,
+      identity: entry.identity,
+      cohort: entry.acquisition?.id,
+      authority: authority(entry),
+      handler: { at: entry.at, order: entry.order },
+      admissionSnapshots: bounces.flatMap((bounce) =>
+        (bounce.interruptions ?? []).flatMap((snapshot) =>
+          snapshot.obligations
+            .filter((held) => held.entry === entry.id)
+            .map((held) => ({
+              bounce: bounce.index,
+              at: snapshot.at,
+              order: snapshot.order,
+              kind: snapshot.kind,
+              event: snapshot.event,
+              obligation: held,
+            }))
+        )
+      ),
+      interruptions: losses
+        .filter(
+          ({ kind, event }) =>
+            precedes(interruptionEvent(kind, event), cut) &&
+            interrupts(kind, event, authority(entry))
+        )
+        .map(({ kind, event }) => ({
+          kind,
+          event: event.id,
+          ...interruptionEvent(kind, event),
+          reason: event.reason,
+          cause: event.cause,
+          error: event.error,
+        })),
+      retirements: evidence.retirements.filter(
+        (event) =>
+          precedes(event, cut) &&
+          event.nodeId === entry.acquisition?.source?.nodeId &&
+          event.groupId === entry.groupId &&
+          event.memberId === entry.memberId &&
+          event.open === entry.acquisition?.open &&
+          (!event.key || event.key === `${entry.topicId}:${entry.partition}`)
+      ),
+      outcomes: evidence.results(entry).filter((outcome) => precedes(outcome, cut)),
+    }))
+  if (unattributed.length) problems.push('Unresolved retired history has no original admission')
   if (liveIdentities.size > MAX_HELD) problems.push('Live pending work exceeds its allowance')
   if (historyIdentities.size > MAX_HELD + retainedIdentities.size)
     problems.push('Unresolved history exceeds its live plus admitted allowance')
@@ -1208,6 +1254,7 @@ const historyAccounting = (entries, bounces, evidence, cut) => {
     retained: retained.map(({ id }) => admissions.get(id)),
     historyCount: historyIdentities.size,
     history: history.map(({ id }) => id),
+    unattributed,
     problems,
   }
 }
@@ -2536,7 +2583,17 @@ class ShareBounceCase {
     const problems = [...accounting.problems, ...admissionAccounting(this.snapshots).problems]
     if (held.size > MAX_HELD * (index + 1))
       problems.push(`Command history has ${held.size} identities`)
-    if (problems.length) throw new Error(problems.join('; '))
+    if (problems.length) {
+      this.row('freeze-failed', {
+        index,
+        kind,
+        service,
+        accounting,
+        problems,
+        crashes: this.crashes.map((error) => describeError(error)),
+      })
+      throw new Error(problems.join('; '))
+    }
     if (unresolved.some(({ identity }) => !corpus.has(identity))) {
       this.row('unresolved-before-producer-receipt', { identities: [...held] })
     }

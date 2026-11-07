@@ -1,6 +1,8 @@
 const Cluster = require('../index')
 const Encoder = require('../../protocol/encoder')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
+const RequestQueue = require('../../network/requestQueue')
+const { currentDeadline } = require('../../admin/deadline')
 const apiKeys = require('../../protocol/requests/apiKeys')
 const { CLUSTER_REBOOTSTRAP } = require('../instrumentationEvents')
 const {
@@ -779,6 +781,67 @@ describe('BrokerPool > rebootstrap', () => {
       await expect(pool.rebootstrap('timeout')).resolves.toBeUndefined()
       expect(seedOf()).not.toBe(previousSeed)
       expect(events).toEqual([{ reason: 'timeout' }])
+    })
+
+    test('a REBOOTSTRAP listener can start independent work after rebootstrap settles', async () => {
+      const { cluster } = createCluster()
+      const pool = cluster.brokerPool
+      stubSeed(pool, async () => ok)
+      const queue = new RequestQueue({
+        maxInFlightRequests: 1,
+        requestTimeout: 1000,
+        enforceRequestTimeout: false,
+        clientId: 'rebootstrap-listener',
+        broker: 'localhost:9092',
+        logger: newLogger(),
+      })
+      let resume
+      const gate = new Promise((resolve) => {
+        resume = resolve
+      })
+      let discovery, listenerScope, request
+      const sent = []
+      const buildSeed = pool.createSeedBroker
+      pool.createSeedBroker = async (...args) => {
+        discovery = currentDeadline()
+        return buildSeed(...args)
+      }
+      const emit = pool.emit
+      pool.emit = (...args) => {
+        emit.call(pool, ...args)
+        expect(currentDeadline()).toBe(discovery)
+        discovery.check()
+      }
+      const unsubscribe = cluster.instrumentationEmitter.addListener(CLUSTER_REBOOTSTRAP, () => {
+        listenerScope = currentDeadline()
+        request = gate.then(
+          () =>
+            new Promise((resolve, reject) => {
+              queue.push({
+                entry: { correlationId: 1, resolve, reject },
+                expectResponse: false,
+                sendRequest: () => sent.push(1),
+              })
+            })
+        )
+      })
+
+      try {
+        await pool.rebootstrap('timeout')
+        expect(discovery.guard()).toMatchObject({ message: 'Metadata discovery completed' })
+        expect(request).toBeDefined()
+        resume()
+        await expect(request).resolves.toMatchObject({ size: 0, payload: null })
+        expect(listenerScope).toBeUndefined()
+        expect(sent).toEqual([1])
+        expect(queue.isIdle()).toBe(true)
+      } finally {
+        resume()
+        await request?.catch(() => {})
+        unsubscribe()
+        queue.destroy()
+        await cluster.disconnect()
+      }
     })
 
     test('retains old brokers when the replacement seed cannot be built', async () => {
