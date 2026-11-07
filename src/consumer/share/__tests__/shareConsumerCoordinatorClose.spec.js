@@ -1,4 +1,5 @@
 const { ShareRun } = require('../shareRun')
+const { createErrorFromCode } = require('../shareErrorContract')
 const {
   A,
   ShareClock,
@@ -42,9 +43,10 @@ describe('share disconnect after coordinator transport recovery', () => {
    * acquisition's handler blocks, so disconnect can capture that recovered session's final.
    * @param {number} [dataNode=0] The data leader; the coordinator is always node 0.
    * @param {boolean} [holdFirst=false] Hold the initial handler instead of a later fetch.
+   * @param {number} [nodes=dataNode+1] Broker count, including unused discovery targets.
    * @returns {Promise<object>} The held fetch and the original membership and transport identities.
    */
-  const begin = async (dataNode = 0, holdFirst = false) => {
+  const begin = async (dataNode = 0, holdFirst = false, nodes = dataNode + 1) => {
     clock = new ShareClock().install()
     const start = ShareRun.prototype.start
     jest.spyOn(ShareRun.prototype, 'start').mockImplementation(function () {
@@ -52,7 +54,7 @@ describe('share disconnect after coordinator transport recovery', () => {
       return start.call(this)
     })
     h = shareClient({
-      nodes: dataNode + 1,
+      nodes,
       interval: 600000,
       kafka: { requestTimeout: 1000, enforceRequestTimeout: false },
       topics: { 'topic-a': { topicId: A, partitions: [{ leader: dataNode, epoch: 1 }] } },
@@ -223,6 +225,122 @@ describe('share disconnect after coordinator transport recovery', () => {
     )
   })
 
+  test('retires a held coordinator lookup before an omitted leave finishes its final', async () => {
+    const original = await begin(1, true, 3)
+    h.script('ShareGroupHeartbeat', [{ errorCode: 16 }])
+    await expect(run.heartbeat()).rejects.toHaveProperty('code', 16)
+    await clock.advance(50)
+    const lookup = h.hold({ api: 'FindCoordinator' })
+    let heartbeatDone = false
+    const heartbeat = run.heartbeat().finally(() => {
+      heartbeatDone = true
+    })
+    await until(() => lookup.call !== null, 'the ordinary coordinator lookup')
+    const final = h.hold({ api: 'ShareAcknowledge' })
+    handler.resolve()
+    let disconnected = false
+    const closing = h.consumer.disconnect({ timeout: 400 }).then(() => {
+      disconnected = true
+    })
+    await until(() => final.call !== null, 'the captured final')
+    const membership = run.membership.snapshot()
+    const facade = run.facade
+    const sockets = h.cluster.sockets().length
+    const frames = h.frames(76).length
+    const publish = jest.spyOn(run.runner, 'emit')
+    lookup.release({
+      coordinators: [
+        { key: 'group', nodeId: 2, host: 'node2', port: 9092, errorCode: 0, errorMessage: null },
+      ],
+    })
+    await until(() => heartbeatDone, 'the retired heartbeat completion')
+    await heartbeat
+    await flush()
+    expect(disconnected).toBe(false)
+    expect(final.call.answeredOrder).toBeUndefined()
+    expect(h.frames(76)).toHaveLength(frames)
+    expect(h.cluster.sockets()).toHaveLength(sockets)
+    expect(run.facade).toBe(facade)
+    expect(run.coordinator).toBe(original.binding)
+    expect(run.membership.snapshot()).toEqual(membership)
+    expect(publish).not.toHaveBeenCalled()
+    expect(warning).toHaveBeenCalledWith(
+      'Share leave skipped',
+      expect.objectContaining({ reason: 'coordinator-unknown', outcome: 'not-sent' })
+    )
+    final.release()
+    await until(() => disconnected, 'the disconnect after the captured final')
+    await closing
+    expect(leaves()).toHaveLength(0)
+  })
+
+  test('discards an ordinary heartbeat answer held over a coordinator-unknown close', async () => {
+    const original = await begin(1, true)
+    const ordinary = h.hold({
+      api: 'ShareGroupHeartbeat',
+      match: ({ fields }) => fields.memberEpoch > 0,
+    })
+    let heartbeatDone = false
+    const heartbeat = run.heartbeat().finally(() => {
+      heartbeatDone = true
+    })
+    await until(() => ordinary.call !== null, 'the written ordinary heartbeat')
+    run.membership.onMembershipError(createErrorFromCode(16), original.token)
+    expect(run.membership.coordinator).toBeNull()
+    const final = h.hold({ api: 'ShareAcknowledge' })
+    handler.resolve()
+    let disconnected = false
+    const closing = h.consumer.disconnect({ timeout: 400 }).then(() => {
+      disconnected = true
+    })
+    await until(() => final.call !== null, 'the captured final')
+    const membership = run.membership.snapshot()
+    const sockets = h.cluster.sockets().length
+    const frames = h.frames(76).length
+    const publish = jest.spyOn(run.runner, 'emit')
+    ordinary.release({
+      errorCode: 0,
+      memberId: original.memberId,
+      memberEpoch: original.memberEpoch + 1,
+      heartbeatIntervalMs: 600000,
+      assignment: { topicPartitions: [] },
+    })
+    await until(() => heartbeatDone, 'the retired heartbeat answer')
+    await heartbeat
+    expect(final.call.answeredOrder).toBeUndefined()
+    expect(h.frames(76)).toHaveLength(frames)
+    expect(h.cluster.sockets()).toHaveLength(sockets)
+    expect(run.coordinator).toBe(original.binding)
+    expect(run.membership.snapshot()).toEqual(membership)
+    expect(publish).not.toHaveBeenCalled()
+    final.release()
+    await until(() => disconnected, 'the disconnect after the captured final')
+    await closing
+    expect(leaves()).toHaveLength(0)
+  })
+
+  test('rejoins after a poll close omits leave for an unknown coordinator', async () => {
+    const original = await begin(1, true)
+    run.membership.onMembershipError(createErrorFromCode(16), original.token)
+    clock.skew(run.options.maxPollInterval + 1)
+    let recovered = false
+    const recovery = run.onPollExpired().then(() => {
+      recovered = true
+    })
+    await until(() => run.closing === null, 'the poll close completion')
+    expect(run.membership.state).toBe('STALE')
+    expect(leaves()).toHaveLength(0)
+    expect(recovered).toBe(false)
+    handler.resolve()
+    await until(() => recovered, 'the drained poll recovery')
+    await recovery
+    await clock.advance(0)
+    await until(() => run.membership.memberEpoch > 0, 'the fresh join')
+    expect(run.membership.memberId).toBe(original.memberId)
+    expect(run.membership.token).not.toBe(original.token)
+    expect(h.frames(76).map(({ fields }) => fields.memberEpoch)).toEqual([0, 1, 0])
+  })
+
   test('refuses a coordinator replacement after the close boundary and reports the omission', async () => {
     const original = await begin()
     await recover(original)
@@ -241,4 +359,54 @@ describe('share disconnect after coordinator transport recovery', () => {
       expect.objectContaining({ reason: 'coordinator-stale' })
     )
   })
+
+  test.each(['deadline', 'late response', 'coordinator replacement'])(
+    'reports a written leave with a held response as unknown after %s',
+    async (refusal) => {
+      const original = await begin(1, true)
+      const leave = h.hold({
+        api: 'ShareGroupHeartbeat',
+        match: ({ fields }) => fields.memberEpoch === -1,
+      })
+      handler.resolve()
+      let disconnected = false
+      const closing = h.consumer.disconnect({ timeout: 400 }).then(() => {
+        disconnected = true
+      })
+      await until(() => leave.call !== null, 'the written leave')
+      expect(disconnected).toBe(false)
+      expect(warning).not.toHaveBeenCalledWith('Share leave skipped', expect.anything())
+      if (refusal === 'deadline') {
+        await clock.advance(400)
+        expect(disconnected).toBe(true)
+      } else if (refusal === 'late response') clock.skew(400)
+      else {
+        await original.binding.connection.disconnect({ drainTimeout: 0 })
+        await original.binding.connection.connect()
+      }
+      leave.release({
+        errorCode: 0,
+        memberId: original.memberId,
+        memberEpoch: -1,
+        heartbeatIntervalMs: 0,
+        assignment: null,
+      })
+      await until(() => disconnected, 'the bounded disconnect completion')
+      await closing
+      await flush()
+      expect(leaves()).toHaveLength(1)
+      expect(warning).not.toHaveBeenCalledWith('Share leave skipped', expect.anything())
+      expect(
+        warning.mock.calls.filter(([message]) => message === 'Share leave outcome unknown')
+      ).toEqual([
+        [
+          'Share leave outcome unknown',
+          expect.objectContaining({
+            reason: refusal === 'coordinator replacement' ? 'coordinator-stale' : 'close-deadline',
+            outcome: 'sent-unknown',
+          }),
+        ],
+      ])
+    }
+  )
 })

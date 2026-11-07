@@ -124,17 +124,19 @@ class ShareMembership {
 
   /**
    * Sends at most one current heartbeat; concurrent callers share the operation, and a call made
-   * while a failed beat's backoff is armed sends nothing. HeartbeatManager's `{ interval, guard }`
-   * argument is ignored: the broker's interval wins and retirement is judged by this membership's
-   * own token.
+   * while a failed beat's backoff is armed sends nothing. The broker's interval wins; both the
+   * membership token and the caller's ordinary authority must remain current.
+   * @param {object} [options] Ordinary request authority.
+   * @param {() => Error|null} [options.guard] The run's refusal after its freeze boundary.
    * @returns {Promise<void>} Settles without waiting for metadata resolution.
    * @throws {Error} The classified failure of a current heartbeat; a retired one has no effect.
    */
-  heartbeat() {
-    if (this.closed || this.state === S.FATAL || this.state === S.STALE) return Promise.resolve()
+  heartbeat({ guard = () => null } = {}) {
+    if (this.closed || this.state === S.FATAL || this.state === S.STALE || guard())
+      return Promise.resolve()
     if (this.inFlight) return this.inFlight
     if (this.backoff.pending(performance.now())) return Promise.resolve()
-    const operation = this.sendHeartbeat()
+    const operation = this.sendHeartbeat(guard)
     this.inFlight = operation
     const clear = () => {
       if (this.inFlight === operation) this.inFlight = null
@@ -148,12 +150,14 @@ class ShareMembership {
    * by the Broker before the write. Fields are remembered only after a current, non-regressing,
    * successful answer; every epoch-zero payload is full.
    * @private
+   * @param {() => Error|null} ordinaryGuard The caller's captured ordinary authority.
    * @returns {Promise<void>}
    * @throws {Error} The current membership failure, after its policy has been applied.
    */
-  async sendHeartbeat() {
+  async sendHeartbeat(ordinaryGuard) {
     const token = this.token
-    const current = () => !this.closed && this.token === token && this.state !== S.FATAL
+    const current = () =>
+      !this.closed && this.token === token && this.state !== S.FATAL && !ordinaryGuard()
     const guard = () =>
       current() ? null : new KafkaJSNonRetriableError('Share membership retired')
     const topics = this.topics.slice()
@@ -198,7 +202,7 @@ class ShareMembership {
       if (this.memberEpoch > 0) this.state = transition(this.state, S.STABLE)
       if (response.assignment !== null) this.adoptTarget(response.assignment.topicPartitions)
       this.publishAssignment()
-      this.refreshUnresolved()
+      this.refreshUnresolved(ordinaryGuard)
     } catch (error) {
       if (!current()) return
       throw this.onMembershipError(error, token)
@@ -294,9 +298,10 @@ class ShareMembership {
    * same predicate goes to the cluster helper, so a retired flight cannot install, follow up or
    * publish. Misses and failures both advance the backoff.
    * @private
+   * @param {() => Error|null} [ordinaryGuard] The authority of the heartbeat that started this work.
    * @returns {void}
    */
-  refreshUnresolved() {
+  refreshUnresolved(ordinaryGuard = () => null) {
     if (
       this.closed ||
       this.state === S.FATAL ||
@@ -311,6 +316,7 @@ class ShareMembership {
     const isCurrent = () =>
       !this.closed &&
       this.state !== S.FATAL &&
+      !ordinaryGuard() &&
       this.token === token &&
       this.targetRevision === revision
     this.resolution = flight
@@ -404,6 +410,7 @@ class ShareMembership {
           if (membershipAction(error) !== 'groupNotFound') throw error
         }
       } catch (error) {
+        guard()
         this.logger.error('Share leave failed', { error: error.message })
       } finally {
         this.state = transition(this.state, stale ? S.STALE : S.UNSUBSCRIBED)
