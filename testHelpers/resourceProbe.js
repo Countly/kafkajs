@@ -237,6 +237,8 @@ const compareSnapshots = (before, after, required = {}) => {
  *   role whose every event keeps its raw listener identities with multiplicity, so a swapped
  *   emitter, a swapped listener or a duplicate registration changes the reading
  * @param {ResourceRoles} [sources.resources] a started observer of live async resources by role
+ * @param {{issued: WeakMap<object, number>, next: number}} [sources.identityScope] explicitly shared
+ *   weak identity issuer for readings compared across probes; defaults to a private issuer
  * @param {boolean} [sources.memory=false] collect twice and read heap plus external and RSS;
  *   arrayBuffers is already included in external and is not added again
  * @param {boolean} [sources.heap=false] read the settled heap
@@ -255,6 +257,7 @@ const createResourceProbe = ({
   shareState,
   activeResources = false,
   identities,
+  identityScope = { issued: new WeakMap(), next: 0 },
   registrations,
   resources,
   memory = false,
@@ -266,8 +269,7 @@ const createResourceProbe = ({
     throw new Error('Reading the heap needs a gc function: run node with --expose-gc')
   }
 
-  const issued = new WeakMap()
-  let nextIdentity = 0
+  const { issued } = identityScope
 
   /**
    * @param {object|Function} object a currently owned object
@@ -277,7 +279,7 @@ const createResourceProbe = ({
   const identify = (object) => {
     if ((typeof object !== 'object' || object === null) && typeof object !== 'function')
       throw new TypeError('Resource identity must be an object')
-    if (!issued.has(object)) issued.set(object, ++nextIdentity)
+    if (!issued.has(object)) issued.set(object, ++identityScope.next)
     return issued.get(object)
   }
 

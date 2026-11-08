@@ -407,7 +407,11 @@ class CycleLedger {
    */
   constructor(round, shell) {
     this.round = round
-    this.shellProbe = createResourceProbe({ identities: shell })
+    round.shellIdentityScope ??= { issued: new WeakMap(), next: 0 }
+    this.shellProbe = createResourceProbe({
+      identities: shell,
+      identityScope: round.shellIdentityScope,
+    })
     this.churnProbe = createResourceProbe({
       identities: () => this.churnOwners(),
       registrations: () => this.registrations(),
@@ -856,9 +860,14 @@ class NativeResultFamily {
     round.assertReplacementUnchanged(replacement)
     assert.equal(round.writeCount, writes, 'a write followed the late completion')
     assert.deepEqual(
-      compareSnapshots(shell, await ledger.baseline(), { identities: ['builder'] }),
+      compareSnapshots(
+        { ...shell, identities: { ...shell.identities, nativeInput: [] } },
+        await ledger.baseline(),
+        { identities: this.roles }
+      ),
       []
     )
+    assert.equal(heldJob.input, null, 'the settled hold retained its native input')
     assert.equal(round.machine.uuid, TELEMETRY_UUID)
     await round.ready()
     assert.ok(round.pushesRequested() > blocked, 'no fresh Push followed the late completion')
@@ -914,7 +923,13 @@ class SupplierFamily {
       sasl.authenticationProvider = (args) => oauthBearerAuthenticator(sasl)(args)
     this.gate = round.hold('S19b', { mode: 'normal' })
     await round.wait(() =>
-      round.start({ sasl: true, kafka: { sasl }, beforeConnect: () => this.watch.install() })
+      round.start({
+        sasl: true,
+        beforeConnect: () => {
+          round.patch(round.cluster.connectionPoolBuilder, 'telemetrySasl', () => () => sasl)
+          this.watch.install()
+        },
+      })
     )
     await round.ready()
     this.owner = round.dedicatedConnection.authenticationOwner

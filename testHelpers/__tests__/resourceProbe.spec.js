@@ -234,6 +234,21 @@ describe('share resource sources', () => {
 })
 
 describe('resource identity and settled memory sources', () => {
+  test('shares weak identities only when probes explicitly share a scope', async () => {
+    const identityScope = { issued: new WeakMap(), next: 0 }
+    const owner = {}
+    const first = createResourceProbe({ identityScope, identities: () => ({ owner: [owner] }) })
+    const same = createResourceProbe({ identityScope, identities: () => ({ owner: [owner] }) })
+    const other = createResourceProbe({ identityScope, identities: () => ({ owner: [{}] }) })
+    const before = await first.snapshot()
+    expect(compareSnapshots(before, await same.snapshot())).toEqual([])
+    expect(compareSnapshots(before, await other.snapshot())).toEqual(['identities owner changed'])
+    const independent = await createResourceProbe({
+      identities: () => ({ owner: [{}] }),
+    }).snapshot()
+    expect(independent.identities.owner).toEqual([1])
+  })
+
   test('detects replacement at the same resource count without retaining source objects', async () => {
     let socket = {}
     const probe = createResourceProbe({ identities: () => ({ sockets: [socket] }) })

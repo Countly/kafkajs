@@ -30,6 +30,7 @@ const {
   RELEASE_ACTIONS,
   TELEMETRY_KINDS,
   TELEMETRY_UUID,
+  telemetryReleaseCells,
 } = require('../../../testHelpers/lifecycle')
 const { KafkaJSTelemetryError } = require('../../errors')
 
@@ -303,8 +304,9 @@ describe('public telemetry resources', () => {
     const round = new PublicTelemetryRound({ kind: 'producer' })
     const watch = new IndexOneWatch(round)
     try {
-      await round.wait(() => round.start({ beforeConnect: () => watch.install() }))
-      await round.ready()
+      const gate = round.hold('S09', { mode: 'get' })
+      await round.wait(() => round.start({ drive: 'get', beforeConnect: () => watch.install() }))
+      await round.wait(() => gate.arrived())
       expect(watch.pools).toBeGreaterThanOrEqual(1)
       expect(watch.opens).toBe(0)
       const connected = await round.wait(() => watch.last.getConnection(1))
@@ -787,6 +789,145 @@ describe.each([
 })
 
 describe('bounded capture of the round', () => {
+  test.each(['get', 'normal', 'final'])(
+    'the %s manifest starts with the zero UUID sentinel',
+    (mode) => {
+      const cell = telemetryReleaseCells().find(
+        (cell) =>
+          cell.mode === mode &&
+          cell.action === RELEASE_ACTIONS[0] &&
+          cell.options.position === 'before'
+      )
+      expect(cell.expectation({ running: 1n, closeRevision: 2n })[0].uuid).toBeNull()
+    }
+  )
+
+  test('restores shared clocks when overlapping rounds finish out of order', async () => {
+    const imported = require('node:perf_hooks').performance
+    const originals = [Date.now, process.hrtime.bigint, imported.now, global.performance.now]
+    const first = new PublicTelemetryRound({ kind: 'producer' })
+    const second = new PublicTelemetryRound({ kind: 'producer' })
+    try {
+      first.installClocks()
+      first.clock.jump(10)
+      second.installClocks()
+      second.clock.jump(20)
+      await first.dispose()
+      expect(Date.now()).toBe(1020)
+      expect(process.hrtime.bigint()).toBe(20000000n)
+      expect(imported.now()).toBe(20)
+    } finally {
+      await first.dispose()
+      await second.dispose()
+    }
+    expect([Date.now, process.hrtime.bigint, imported.now, global.performance.now]).toEqual(
+      originals
+    )
+  })
+
+  test('preserves a performance spy owned by the enclosing fake-clock fixture', async () => {
+    const imported = require('node:perf_hooks').performance
+    const enclosing = jest.spyOn(imported, 'now').mockReturnValue(37)
+    const round = new PublicTelemetryRound({ kind: 'producer' })
+    try {
+      round.installClocks()
+      round.clock.jump(20)
+      expect(imported.now()).toBe(20)
+      await round.dispose()
+      expect(imported.now).toBe(enclosing)
+      expect(imported.now()).toBe(37)
+    } finally {
+      await round.dispose()
+      enclosing.mockRestore()
+    }
+  })
+
+  test('restores its clocks even when a collaborator restoration throws', async () => {
+    const imported = require('node:perf_hooks').performance
+    const originals = [Date.now, process.hrtime.bigint, imported.now]
+    const round = new PublicTelemetryRound({ kind: 'producer' })
+    const reason = new Error('restore failed')
+    round.installClocks()
+    round.restores.push(() => {
+      throw reason
+    })
+    await expect(round.dispose()).rejects.toBe(reason)
+    expect([Date.now, process.hrtime.bigint, imported.now]).toEqual(originals)
+  })
+
+  test.each([false, true])(
+    'restores an initially absent socket as writable bounded=%s',
+    async (bounded) => {
+      const round = new PublicTelemetryRound({ kind: 'producer', bounded })
+      const connection = {}
+      const socket = { destroyed: false }
+      try {
+        round.watchSocket(connection)
+        connection.socket = socket
+        socket.destroyed = true
+        if (bounded) expect(round.releaseCompleted()).toBe(1)
+      } finally {
+        await round.dispose()
+      }
+      expect(Object.getOwnPropertyDescriptor(connection, 'socket')).toEqual({
+        value: socket,
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      })
+      expect(() => {
+        connection.socket = null
+      }).not.toThrow()
+      expect(connection.socket).toBeNull()
+    }
+  )
+
+  test.each([false, true])('restores an existing socket descriptor bounded=%s', async (bounded) => {
+    const round = new PublicTelemetryRound({ kind: 'producer', bounded })
+    const connection = {}
+    Object.defineProperty(connection, 'socket', {
+      value: null,
+      writable: true,
+      enumerable: false,
+      configurable: true,
+    })
+    const socket = { destroyed: false }
+    try {
+      round.watchSocket(connection)
+      connection.socket = socket
+    } finally {
+      await round.dispose()
+    }
+    expect(Object.getOwnPropertyDescriptor(connection, 'socket')).toEqual({
+      value: socket,
+      writable: true,
+      enumerable: false,
+      configurable: true,
+    })
+  })
+
+  test('keeps the native hold input copy for default callers', async () => {
+    const round = new PublicTelemetryRound({ kind: 'producer' })
+    const input = Buffer.alloc(1001, 7)
+    const codec = jest.spyOn(gzip, 'compress').mockResolvedValue(Buffer.from('compressed'))
+    try {
+      const gate = round.hold('S12', { mode: 'normal' })
+      round.arm()
+      const compressing = gzip.compress({ buffer: input })
+      round.trackWork(compressing)
+      await gate.arrived()
+      expect(round.codecJobs[0].raw).toEqual(input)
+      expect(round.codecJobs[0].raw).not.toBe(input)
+      input[0] = 8
+      expect(round.codecJobs[0].raw[0]).toBe(7)
+      gate.release()
+      await compressing
+    } finally {
+      await round.dispose()
+      codec.mockRestore()
+    }
+  })
+
   test('keeps every default round history and counts the same work', async () => {
     const round = new PublicTelemetryRound({ kind: 'producer' })
     try {
@@ -1246,9 +1387,8 @@ describe('public telemetry resources', () => {
         expect({ name, last: events.at(-1) }).toEqual({ name, last: 'decoded' })
         const previous = round.machine.subscription
         events.length = 0
-        await round.wait(() => round.beginClose(round.closeOptions(0)))
-        await round.wait(() => round.client.connect())
         round.subscription = { ...round.subscription, ...fields }
+        round.machine.schedule('get', 0)
         round.tick()
         await round.until(() => round.machine.state === 'STOPPED')
         expect({ name, events }).toEqual({ name, events: ['decode', 'refused'] })
