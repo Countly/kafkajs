@@ -4845,6 +4845,57 @@ describe('Share soak original authority adapter', () => {
 })
 
 describe('Share soak original queue and socket listener adapter', () => {
+  test.each([false, true])(
+    'measures closed socket error listeners after collection, retained=%s',
+    async (retained) => {
+      const exposed = globalThis.gc
+      require('v8').setFlagsFromString('--expose-gc')
+      globalThis.gc = require('vm').runInNewContext('gc')
+      const createSocket = require('../../../src/network/socket')
+      const kept = []
+      const shared = instrumentShare(
+        {
+          clientId: 'soak',
+          brokers: ['localhost:1'],
+          socketFactory: () => Object.assign(new EventEmitter(), { destroyed: false }),
+        },
+        { activeResources: false }
+      )
+      try {
+        const baseline = await shared.shareResources.snapshot()
+        let socket = createSocket({
+          socketFactory: shared.socketFactory,
+          host: 'localhost',
+          port: 1,
+          onData: () => {},
+          onEnd: () => {},
+          onError: () => {},
+          onTimeout: () => {},
+        })
+        createSocket.detachSocket(socket)
+        socket.destroyed = true
+        if (retained) kept.push(socket)
+        socket = null
+
+        const after = await shared.shareResources.snapshot()
+        expect(after.sockets).toEqual({ created: 1, destroyed: 1, open: 0 })
+        expect(Object.values(after.namedListeners)).toEqual(retained ? [1] : [])
+        const violations = []
+        ShareSoakScreen.quiet(
+          { ...after, activeResources: {} },
+          { ...baseline, activeResources: {} },
+          'closed',
+          violations
+        )
+        expect(violations.length > 0).toBe(retained)
+        if (retained) expect(kept[0].listenerCount('error')).toBe(1)
+      } finally {
+        shared.shareResources.restore()
+        globalThis.gc = exposed
+      }
+    }
+  )
+
   test('distinguishes a same-event listener moved between original queues or destroyed sockets', async () => {
     const shared = instrumentShare(
       { clientId: 'soak', brokers: ['localhost:1'], socketFactory: () => new EventEmitter() },
