@@ -1318,16 +1318,23 @@ describe('Consumer > seam fault episodes', () => {
     () =>
       withEpisode({ step: 'steady', hideIds: true }, async (episode) => {
         await episode.holdBoundary('steady')
+        let acknowledged
+        await episode.settled(() => {
+          acknowledged = episode.cluster
+            .requests()
+            .find(
+              (call) =>
+                call.api === HEARTBEAT &&
+                episode.isA(call) &&
+                call.fields.memberEpoch > 0 &&
+                call.fields.topicPartitions?.length > 0
+            )
+          return Boolean(acknowledged) && episode.states.at(-1) === 'STABLE'
+        }, 'member A to acknowledge its assignment and be stable')
         const requests = episode.cluster.requests()
         const named = requests.find(
           ({ api, fields }) =>
             api === 'Metadata' && fields.topics?.some(({ topicId }) => topicId === TOPIC_ID)
-        )
-        const acknowledged = requests.find(
-          ({ api, fields }) =>
-            api === 'ConsumerGroupHeartbeat' &&
-            fields.memberEpoch > 0 &&
-            fields.topicPartitions?.length
         )
         const facts = episode.facts()
         expect(named).toBeDefined()
