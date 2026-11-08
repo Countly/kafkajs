@@ -1399,14 +1399,17 @@ const indexedEvidenceWork = function* (entries, original, bounces) {
     if (!entry.acquisition?.source?.frames[0]) continue
     const scope = authority(entry)
     const key = JSON.stringify(scope)
-    const prior = authorities.get(key)
-    if (!prior || entry.acquisition.adoptedAt < prior.acquisition.adoptedAt)
-      authorities.set(key, entry)
+    indexMember(authorities, key, entry)
   }
-  for (const entry of authorities.values()) {
-    const scope = authority(entry)
-    indexMember(evidence.auditIndex.scopes, scope.socket, entry)
-    indexMember(evidence.auditIndex.opens, `${scope.nodeId}:${scope.open}`, entry)
+  for (const history of authorities.values()) {
+    // Scope order at a shared loss depends on its newest adoption before that cut.
+    const ordered = yield* sortedAuditWork(
+      history,
+      (a, b) => b.acquisition.adoptedAt - a.acquisition.adoptedAt
+    )
+    const scope = authority(ordered[0])
+    indexMember(evidence.auditIndex.scopes, scope.socket, ordered)
+    indexMember(evidence.auditIndex.opens, `${scope.nodeId}:${scope.open}`, ordered)
   }
   const journal = interruptionJournal(evidence)
   for (const item of journal) {
@@ -1540,10 +1543,18 @@ const scopedLosses = (scope, evidence) =>
  */
 const interruptedScopes = (entries, evidence, kind, event, bounce) => {
   const cut = interruptionEvent(kind, event)
-  const candidates = evidence.auditIndex
+  const histories = evidence.auditIndex
     ? kind === 'socket'
       ? (evidence.auditIndex.scopes.get(event.socket) ?? [])
       : (evidence.auditIndex.opens.get(`${event.nodeId}:${event.open}`) ?? [])
+    : null
+  const candidates = histories
+    ? histories.flatMap((history) => {
+        const entry = history.find((entry) =>
+          precedes({ at: entry.acquisition.adoptedAt, order: entry.acquisition.adoptedOrder }, cut)
+        )
+        return entry ? [entry] : []
+      })
     : [
         ...entries,
         ...evidence.acquisitions.map((acquisition) => ({
@@ -4944,11 +4955,12 @@ class ShareBounceCase {
           const current = JSON.stringify(counts)
           if (current !== previous) this.row('settlement-progress', counts)
           previous = current
+          if (this.settlement.problems.length)
+            throw new Error(`Settlement audit failed: ${this.settlement.problems.join('; ')}`)
           return (
             this.expected.length === RECORDS &&
             this.expected.every((identity) => this.seen.has(identity)) &&
-            this.settlement.missing.length === 0 &&
-            this.settlement.problems.length === 0
+            this.settlement.missing.length === 0
           )
         },
         { label: 'Every identity settling', delayMs: 500 }
@@ -8600,6 +8612,96 @@ describe('share bounce acquisition and settlement sensitivity', () => {
     expect(turns).toBeGreaterThan(0)
     expect(result).toEqual(audit(fixture))
     await heartbeat
+  })
+
+  it.each([
+    ['4.3.1', 1, 0, 112258.762064, 112365.944801],
+    ['4.4.0', 0, 2, 173307.778536, 173419.027305],
+  ])(
+    'preserves the shared-socket hard-kill snapshot order on %s',
+    (_version, primary, secondary, adoptedAt, cutAt) => {
+      const fixture = replayFixture()
+      const { old, next, evidence, bounces } = fixture
+      const acquisition = old.acquisition
+      old.partition = acquisition.partition = primary
+      acquisition.adoptedAt = adoptedAt
+      acquisition.source.model[0].partition = primary
+      const frame = acquisition.source.frames[0]
+      frame.at = adoptedAt - 2
+      frame.responseAt = adoptedAt - 1
+      frame.request.topics[0].partitions[0].partitionIndex = primary
+      acquisition.source.response.responses[0].partitions[0].partitionIndex = primary
+      acquisition.acquiredRecords[0].lastOffset = '32'
+      next.acquisition.adoptedAt = adoptedAt
+      next.partition = next.acquisition.partition = (primary + 1) % PARTITIONS
+      fixture.entries = Array.from({ length: 67 }, (_, id) => {
+        const original = id < 33 ? old : next
+        const offset = String(id < 33 ? id : id - 33)
+        const entry = { ...original, id, offset, at: adoptedAt + 1 + id / 1000 }
+        entry.identity = shareRecordIdentity({
+          topic: entry.topic,
+          partition: entry.partition,
+          offset,
+          key: Buffer.from(entry.keyBytes, 'hex'),
+          value: Buffer.from(entry.valueBytes, 'hex'),
+        })
+        return entry
+      })
+      evidence.acquisitions = [
+        { ...acquisition, id: 100, adoptedAt: adoptedAt - 4 },
+        { ...acquisition, id: 101, partition: secondary, adoptedAt: adoptedAt - 3 },
+        acquisition,
+        next.acquisition,
+        { ...acquisition, id: 102, partition: secondary, adoptedAt: cutAt + 1 },
+      ]
+      Object.assign(bounces[0], { kind: 'kill', service: 'kafka1', at: adoptedAt - 10 })
+      Object.assign(evidence.retirements[0], { at: cutAt + 1 })
+      evidence.owner.tap.socketEvents = [
+        { id: 30, socket: frame.socket, at: cutAt, order: 20801, outstanding: [] },
+      ]
+      captureFreezes(fixture)
+      const cuts = bounces[0].interruptions
+      expect(cuts.map(({ scope }) => scope.partition)).toEqual([primary, secondary])
+      expect(cuts.map(({ obligations }) => obligations.length)).toEqual([33, 0])
+      expect(cuts.map(({ history }) => history.length)).toEqual([67, 67])
+      const original = finishAudit(reconstructFreezes(fixture.entries, bounces, evidence))
+      expect(original[0].interruptions).toEqual(cuts)
+      const indexed = finishAudit(indexedEvidenceWork(fixture.entries, evidence, bounces))
+      const reconstructed = finishAudit(reconstructFreezes(indexed.auditEntries, bounces, indexed))
+      expect(reconstructed[0].interruptions).toEqual(cuts)
+      expect(freezeProblems(fixture.entries, bounces, evidence)).toEqual([])
+      bounces[0].interruptions = [...cuts].reverse()
+      expect(freezeProblems(fixture.entries, bounces, evidence)).toContain(
+        'bounce 0 interruption snapshot disagrees with the journal'
+      )
+    }
+  )
+
+  it('fails settlement immediately with the immutable snapshot diagnostic', async () => {
+    const fixture = replayFixture()
+    const proof = lostAcceptFixture(fixture)
+    fixture.bounces[0].at = 3
+    captureFreezes(fixture)
+    expect(
+      settlementCandidates(proof.entries, new Set(proof.corpus), proof.bounces, proof.evidence)
+        .problems
+    ).toEqual([])
+    proof.evidence.exchanges.at(-1).tickets[0].ticket++
+    const instance = new ShareBounceCase()
+    const rows = []
+    Object.assign(instance, {
+      entries: proof.entries,
+      expected: proof.corpus,
+      seen: new Set(proof.corpus),
+      snapshots: proof.bounces,
+      evidence: proof.evidence,
+      row: (event, fields) => rows.push({ event, ...fields }),
+    })
+    await expect(instance.drain(NEVER)).rejects.toThrow(
+      'Settlement audit failed: bounce 0 interruption snapshot disagrees with the journal'
+    )
+    expect(rows.filter(({ event }) => event === 'settlement-progress')).toHaveLength(1)
+    expect(rows.at(-1).event).toBe('unresolved-settlement')
   })
 
   it('audits 30000 records with Metadata and count resets through drain, terminal, archive and completion work', async () => {
