@@ -433,6 +433,61 @@ describe('returned telemetry surfaces', () => {
     expect(binding.finalResources).toBeNull()
   })
 
+  test('a rejected cached machine close is contained for first, concurrent and subsequent factory closes', async () => {
+    const binding = new TelemetryFactory({
+      kind: 'consumer',
+      config: { enableMetricsPush: true, telemetryMaxBytes: 1 },
+    })
+    let rejectClose
+    binding.machine = {
+      closing: null,
+      close: jest.fn((budget) => {
+        const promise = new Promise((resolve, reject) => {
+          rejectClose = reject
+        })
+        binding.machine.closing = { budget, promise }
+        return promise
+      }),
+    }
+    binding.updateResources({ group_id: 'g', group_member_id: 'old' })
+    const captureResources = jest.spyOn(binding, 'captureResources')
+    const budget = { deadline: 1000, remaining: () => 1000, zero: false }
+    const first = binding.close(budget)
+    const closing = binding.machine.closing
+    const promise = closing.promise
+    const finalResources = binding.finalResources
+    expect(captureResources).toHaveBeenCalledTimes(1)
+    expect(finalResources.values.group_member_id).toBe('old')
+    expect(finalResources.isCurrent()).toBe(true)
+    expect(closing.budget).toBe(budget)
+
+    binding.updateResources({ group_id: 'g', group_member_id: 'new' })
+    const concurrent = binding.close({ zero: true })
+    expect(binding.machine.closing).toBe(closing)
+    expect(closing.promise).toBe(promise)
+    expect(closing.budget).toBe(budget)
+    expect(binding.finalResources).toBe(finalResources)
+    expect(captureResources).toHaveBeenCalledTimes(1)
+    const outcomes = Promise.allSettled([first, concurrent])
+    rejectClose(new Error('private'))
+    const [firstOutcome, concurrentOutcome] = await outcomes
+    const [subsequentOutcome] = await Promise.allSettled([
+      binding.close({ deadline: 5000, remaining: () => 5000, zero: false }),
+    ])
+
+    expect(firstOutcome).toEqual({ status: 'fulfilled', value: undefined })
+    expect(concurrentOutcome).toEqual({ status: 'fulfilled', value: undefined })
+    expect(subsequentOutcome).toEqual({ status: 'fulfilled', value: undefined })
+    expect(binding.machine.close).toHaveBeenCalledTimes(1)
+    expect(binding.machine.close.mock.calls[0][0]).toBe(budget)
+    expect(binding.machine.closing).toBe(closing)
+    expect(closing.promise).toBe(promise)
+    expect(closing.budget).toBe(budget)
+    expect(captureResources).toHaveBeenCalledTimes(1)
+    expect(binding.finalResources).toBeNull()
+    expect(finalResources.isCurrent()).toBe(false)
+  })
+
   test('captured final resources stay frozen when core membership is cleared', async () => {
     const binding = new TelemetryFactory({
       kind: 'consumer',
