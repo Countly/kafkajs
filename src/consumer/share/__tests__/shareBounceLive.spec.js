@@ -89,7 +89,12 @@ const MAX_HELD = 300
 const BOUNCE_COUNT = 6
 const MAX_REPLAY = BOUNCE_COUNT * MAX_HELD
 const MEMBERSHIP_QUIET_MS = 3000
-const OLD_TIMESTAMP = '1700000000000'
+/**
+ * One wall-clock timestamp taken when the run starts. Brokers expire idempotent producer state by
+ * record timestamp (producer.id.expiration.ms, 24 h by default), so a fixed old timestamp would let
+ * a restarted leader drop the producer and accept a duplicate retry.
+ */
+const RUN_TIMESTAMP = String(Date.now())
 const SERVICES = ['kafka1', 'kafka2', 'kafka3']
 const SHARE_STATE_TOPIC = '__share_group_state'
 const OFFSETS_TOPIC = '__consumer_offsets'
@@ -4613,7 +4618,7 @@ class ShareBounceCase {
       partition: index % PARTITIONS,
       key: Buffer.from(`bounce:${String(index).padStart(5, '0')}`),
       value: Buffer.from(`bounce:value:${index}`),
-      timestamp: OLD_TIMESTAMP,
+      timestamp: RUN_TIMESTAMP,
     }
   }
 
@@ -7442,7 +7447,7 @@ describe('share bounce acquisition and settlement sensitivity', () => {
       partition: 0,
       key: Buffer.from('k'),
       value: Buffer.from('v'),
-      timestamp: OLD_TIMESTAMP,
+      timestamp: RUN_TIMESTAMP,
       headers: { source: Buffer.from('original') },
     }
     /** @param {object} [changes] One mutation. @returns {Promise<Buffer>} Complete checksummed batch. */
@@ -7450,8 +7455,8 @@ describe('share bounce acquisition and settlement sensitivity', () => {
       (
         await RecordBatch({
           firstOffset: '0',
-          firstTimestamp: Number(OLD_TIMESTAMP),
-          maxTimestamp: Number(OLD_TIMESTAMP),
+          firstTimestamp: Number(RUN_TIMESTAMP),
+          maxTimestamp: Number(RUN_TIMESTAMP),
           producerId: '0',
           producerEpoch: changes.producerEpoch ?? 0,
           firstSequence: 0,
