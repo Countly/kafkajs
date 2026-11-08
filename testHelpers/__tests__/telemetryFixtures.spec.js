@@ -918,6 +918,19 @@ describe('telemetry wire observer', () => {
         dataSha256: sha(raw),
         parse: 'ok',
       })
+      const [receipt] = fs
+        .readdirSync(observer.directory)
+        .filter((name) => /^decoder-\d+\.json$/.test(name))
+        .map((name) => JSON.parse(fs.readFileSync(path.join(observer.directory, name), 'utf8')))
+      expect(receipt.memory).toMatchObject({
+        source: 'proc-pid-status',
+        units: 'bytes',
+        capability: 'available',
+        intervalMs: 20,
+      })
+      expect(receipt.memory.samples).toBeGreaterThanOrEqual(1)
+      expect(receipt.memory.peakHwmBytes).toBeGreaterThan(0)
+      expect(receipt.memory.peakRssBytes).toBeGreaterThan(0)
       await observer.dispose()
       observer.assertClean()
     })
@@ -3260,10 +3273,12 @@ describe('telemetry profile', () => {
 
     // The fixed catalogues, then a complete archive that proves them.
     const catalogue = segmentCatalogue('telemetry-shutdown')
-    expect(catalogue).toHaveLength(88)
-    for (const kind of ['producer', 'consumer', 'admin', 'share'])
+    expect(catalogue).toHaveLength(89)
+    for (const kind of ['producer', 'consumer', 'admin', 'share']) {
       expect(catalogue.filter((id) => id.startsWith(`${kind}-ep-`))).toHaveLength(21)
-    expect(catalogue.filter((id) => id.endsWith('-t0') || id.endsWith('-bh'))).toHaveLength(4)
+      expect(catalogue).toContain(`${kind}-t0`)
+    }
+    expect(catalogue.filter((id) => id.endsWith('-t0') || id.endsWith('-bh'))).toHaveLength(5)
     const model = buildShutdownModel()
     const archive = writeShutdownArchive(model)
     scratch.push(archive.directory)
@@ -3485,6 +3500,41 @@ describe('telemetry profile', () => {
           }),
       ],
       [
+        'a blackholed close without a finite budget',
+        'The blackholed close needs a finite remaining budget below the final cap',
+        (t) => {
+          delete t.record.results.blackhole.remainingT
+        },
+      ],
+      [
+        'a blackholed close whose budget does not bind below the final cap',
+        'The blackholed close needs a finite remaining budget below the final cap',
+        (t) => {
+          t.record.results.blackhole.remainingT = 1000
+        },
+      ],
+      [
+        'a blackholed transport released after min(1000, T) + 100 ms',
+        'The blackholed transport outlived its cap',
+        (t) => {
+          t.record.results.blackhole.remainingT = 799
+        },
+      ],
+      [
+        'a missing strict-seam link',
+        'Strict-seam links differ from the fixed catalogue',
+        (t) => {
+          t.record.results.seams.pop()
+        },
+      ],
+      [
+        'a strict-seam link to another title',
+        'Strict-seam links differ from the fixed catalogue',
+        (t) => {
+          t.record.results.seams[1].title = 'bounds nothing'
+        },
+      ],
+      [
         'an overspent cleanup',
         'Cleanup exceeded its budget',
         (t) => {
@@ -3576,4 +3626,94 @@ describe('telemetry profile', () => {
     )
     expect(SCHEDULES['telemetry-shutdown'].cap).toBe(21)
   }, 180000)
+})
+
+describe('decoder child memory', () => {
+  const { DecoderMemory } = require('../telemetryFixtures')
+  const HOUR = 3600000
+  /** A supervisor, its shell and the Java decoder, as `/proc` would list them. */
+  const tree = () => ({
+    statuses: {
+      10: { name: 'timeout', hwm: 1000, rss: 900 },
+      11: { name: 'bash', hwm: 3000, rss: 2000 },
+      12: { name: 'java', hwm: 50000, rss: 40000 },
+    },
+    kids: { 10: [11], 11: [12], 12: [] },
+  })
+  const watch = ({ statuses, kids }, pid = 10) =>
+    new DecoderMemory(pid, {
+      read: (p) => statuses[p] ?? null,
+      children: (p) => kids[p] ?? null,
+      intervalMs: HOUR,
+    })
+
+  test('reports the largest process high water and summed resident size of the group', () => {
+    const procs = tree()
+    const memory = watch(procs)
+    procs.statuses[12] = { name: 'java', hwm: 80000, rss: 30000 }
+    memory.sample()
+    memory.stop()
+    expect(memory.facts()).toEqual({
+      source: 'proc-pid-status',
+      units: 'bytes',
+      capability: 'available',
+      intervalMs: HOUR,
+      samples: 2,
+      peakHwmBytes: 80000,
+      peakRssBytes: 42900,
+      processes: [
+        { pid: 12, name: 'java', hwmBytes: 80000, rssBytes: 40000 },
+        { pid: 11, name: 'bash', hwmBytes: 3000, rssBytes: 2000 },
+        { pid: 10, name: 'timeout', hwmBytes: 1000, rssBytes: 900 },
+      ],
+    })
+  })
+
+  test('describes at most eight processes and keeps the largest high waters', () => {
+    const statuses = { 1: { name: 'timeout', hwm: 1, rss: 1 } }
+    const kids = { 1: [] }
+    for (let pid = 2; pid <= 12; pid++) {
+      kids[1].push(pid)
+      kids[pid] = []
+      statuses[pid] = { name: `p${pid}`, hwm: pid * 100, rss: 1 }
+    }
+    const memory = watch({ statuses, kids }, 1)
+    memory.stop()
+    const facts = memory.facts()
+    expect(facts.processes.map((p) => p.pid)).toEqual([12, 11, 10, 9, 8, 7, 6, 5])
+    expect(facts.peakHwmBytes).toBe(1200)
+    expect(facts.peakRssBytes).toBe(12)
+  })
+
+  test.each([
+    [
+      'a child that never started',
+      () => new DecoderMemory(undefined),
+      'no process status could be read',
+    ],
+    [
+      'a status the kernel does not offer',
+      () => watch({ statuses: {}, kids: { 10: [] } }),
+      'no process status could be read',
+    ],
+    [
+      'a process tree the kernel cannot list',
+      () => watch({ statuses: tree().statuses, kids: {} }),
+      'the process tree could not be listed',
+    ],
+  ])('writes an explicit unavailable fact for %s', (_name, make, reason) => {
+    const memory = make()
+    memory.stop()
+    expect(memory.facts()).toEqual({
+      source: 'proc-pid-status',
+      units: 'bytes',
+      capability: 'unavailable',
+      reason,
+      intervalMs: null,
+      samples: 0,
+      peakHwmBytes: null,
+      peakRssBytes: null,
+      processes: [],
+    })
+  })
 })

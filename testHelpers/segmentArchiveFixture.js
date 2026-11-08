@@ -5,6 +5,7 @@ const path = require('path')
 const { SCHEDULES, packSegment } = require('./telemetrySegments')
 const { cacheRetirement } = require('../scripts/e2e/telemetry/cacheTrace')
 const {
+  SHUTDOWN_SEAMS,
   episodeLogs,
   persistEvidence,
   stableCacheEvent,
@@ -197,7 +198,7 @@ const makeSegment = (model, spec) => {
 }
 
 /**
- * Builds a complete, valid, mutable model of the segmented shutdown scenario: 88 segments, shared
+ * Builds a complete, valid, mutable model of the segmented shutdown scenario: 89 segments, shared
  * trace windows, round and journal records, the arms, budgets and quiet resources.
  * @param {object} [options] `stem` of the run
  * @returns {object} the model: segments, sink rows, results, chunks and source; set `padding` to bloat the oracle file
@@ -314,7 +315,7 @@ const buildShutdownModel = ({ stem = 'telemetry-shutdown-0a1b2c3d' } = {}) => {
     }
   }
   model.rebuildRounds()
-  ;['producer', 'consumer', 'share'].forEach((kind, n) => {
+  ;['producer', 'consumer', 'share', 'admin'].forEach((kind, n) => {
     const id = `${kind}-t0`
     const uuid = uuidFor(10 + n)
     model.segments.set(
@@ -351,9 +352,15 @@ const buildShutdownModel = ({ stem = 'telemetry-shutdown-0a1b2c3d' } = {}) => {
     uuid: holeUuid,
     faultedSocket: 1,
     coreCloseMs: 40,
+    remainingT: 800,
     telemetryCleanupMs: 900,
     core: { sameResult: true },
   }
+  model.results.seams = SHUTDOWN_SEAMS.map(([file, title]) => ({
+    file,
+    title,
+    lane: 'strict seam, unit lane',
+  }))
   const describe = (id, levels) => ({
     service: `kafka${id}`,
     id,
