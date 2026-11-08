@@ -2900,10 +2900,11 @@ describe('telemetry review regressions', () => {
           return admin
         }
       }
-      const fixture = liveFixture(ROOT, { brokers: [], active: false }, 'cleanup', () => ({
-        Kafka,
-        logLevel: { NOTHING: 0 },
-      }))
+      const fixture = liveFixture(ROOT, { brokers: [], active: false }, 'cleanup', (file) => {
+        if (file === path.join(ROOT, 'index.js')) return { Kafka, logLevel: { NOTHING: 0 } }
+        if (file === path.join(ROOT, 'src/network/socketFactory')) return () => () => {}
+        throw new Error(`Unexpected fixture module: ${file}`)
+      })
       const workload = new DeliveryWorkload({
         root: ROOT,
         config: deliveryConfig('eachMessage'),

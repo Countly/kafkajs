@@ -235,8 +235,9 @@ describe('broker telemetry fixture documentation', () => {
     expect(testing).toContain('CI never rebuilds')
     expect(testing).toContain('two top-level tests')
     expect(testing).toContain('down -v --remove-orphans')
-    expect(testing).toContain('4.0.2, 4.1.2')
-    expect(testing).toContain('only the reporter lane checks mounted reporter jars')
+    expect(testing).toContain('4.3.1/4.2.2/4.1.2/4.0.2')
+    expect(testing).toContain('Configured telemetry lanes check mounted reporter jars')
+    expect(testing).toContain('base lanes verify broker identity without requiring a reporter jar')
     expect(testing).not.toContain('built deterministically')
   })
 

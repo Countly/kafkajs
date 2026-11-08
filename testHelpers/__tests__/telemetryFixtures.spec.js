@@ -1772,7 +1772,6 @@ describe('complete live telemetry archive verification', () => {
 
 describe('required live archive dimensions and semantics', () => {
   const { verifyScenario } = require('../../scripts/e2e/telemetry/evidence')
-  const { cacheRetirement } = require('../../scripts/e2e/telemetry/cacheTrace')
   const {
     confirmedDecisions,
     heldAcquisitions,
@@ -2615,101 +2614,28 @@ describe('required live archive dimensions and semantics', () => {
       expect(() => a.verify()).toThrow('Invalid recovered Push')
     }
   )
-  /** @returns {Archive} all four reopen episodes, three zero-timeout owners and admin blackhole */
+  /** @returns {object} complete segmented archive for all four kinds and every shutdown arm */
   const shutdownArchive = () => {
-    const a = new Archive('telemetry-shutdown')
+    const { buildShutdownModel, writeShutdownArchive } = require('../segmentArchiveFixture')
+    const a = writeShutdownArchive(buildShutdownModel())
     archive = a
-    const r = a.record.results
-    r.episodes = {}
-    r.timeout0 = {}
-    r.loggerReceipts = []
-    r.originalLevels = {}
-    r.restoredLevels = {}
-    for (const id of ['1', '2', '3']) {
-      r.originalLevels[id] = r.restoredLevels[id] = {
-        'org.apache.kafka.server.ClientMetricsManager': null,
-        'kafka.request.logger': null,
-      }
-      for (let n = 0; n < 3; n++)
-        r.loggerReceipts.push({
-          id,
-          action: ['--describe'],
-          result: { code: 0, stdout: '', truncated: false },
-        })
-    }
-    for (const kind of ['producer', 'consumer', 'admin', 'share']) {
-      const stream = a.owner(`${kind}-ep`, kind, [
-        { metrics: [common(kind)], resources: [{ attrs: [] }] },
-      ])
-      const get = stream.transcript.records.find((r) => r.apiKey === 71)
-      const connectionId = '172.18.0.3:9092-172.18.0.1:54321-3'
-      const trace = {
-        node: '1',
-        localPort: '9092',
-        uuid: stream.uuid,
-        since: '2026-11-07T10:00:00Z',
-        completedAt: '2026-11-07T10:00:05Z',
-        source: {
-          sha256: 'a'.repeat(64),
-          receipt: { code: 0, stdout: 'a'.repeat(64) + ' source' },
-        },
-        get,
-        connect: {
-          socketId: 1,
-          node: '1',
-          localAddress: '127.0.0.1',
-          localPort: 54321,
-          remoteAddress: '127.0.0.1',
-          remotePort: 19092,
-        },
-        loggerReadbacks: r.loggerReceipts,
-        logs: {
-          1: {
-            text: `TRACE Completed request:RequestHeader(apiKey=GET_TELEMETRY_SUBSCRIPTIONS, clientId=${stream.clientId}, correlationId=1) -- GetTelemetrySubscriptionsRequestData(clientInstanceId=${ID}) with response:GetTelemetrySubscriptionsResponseData(clientInstanceId=${stream.uuid}) from connection ${connectionId};totalTime:1\nTRACE Removing client connection id [${connectionId}] from the client instance cache`,
-          },
-          2: { text: '' },
-          3: { text: '' },
-        },
-      }
-      const cacheEvent = cacheRetirement(trace)
-      a.oracles[kind] = trace
-      r.episodes[kind] = {
-        before: { uuid: stream.uuid, serverConnectionIdentity: cacheEvent.connectionIdentity },
-        cacheEvent,
-        reopen: {
-          calledBeforeCacheAwait: true,
-          cachedUuid: stream.uuid,
-          get: { requestUuid: stream.uuid },
-          finalResends: 0,
-          correctiveExtraPushes: 0,
-        },
-        close: { getOrConnectOrAuthFrames: [] },
-      }
-    }
-    for (const kind of ['producer', 'consumer', 'share']) {
-      const stream = a.owner(`${kind}-t0`, kind, [
-        { metrics: [common(kind)], resources: [{ attrs: [] }] },
-      ])
-      r.timeout0[kind] = { uuid: stream.uuid, finalZeroTimeoutWrites: 0 }
-    }
-    const blackhole = a.owner('admin-bh', 'admin', [
-      { metrics: [common('admin')], resources: [{ attrs: [] }] },
-    ])
-    r.blackhole = { uuid: blackhole.uuid, faultedSocket: 1 }
-    return a
+    return { ...a, verify: () => verifyScenario(a.record, a.directory) }
   }
   test('verifies every shutdown and zero-timeout owner against its required episode', () => {
     shutdownArchive().verify()
   })
-  test.each(['episode', 'zero-timeout', 'blackhole'])(
+  test.each([
+    ['episode', (r) => delete r.rounds.admin, 'Missing admin rounds'],
+    ['zero-timeout', (r) => delete r.timeout0.share, 'Missing owner subscription'],
+    ['admin zero-timeout', (r) => delete r.timeout0.admin, 'Missing owner subscription'],
+    ['blackhole', (r) => delete r.blackhole, 'Missing owner subscription'],
+  ])(
     'rejects a deleted required shutdown %s from the archive',
-    (dimension) => {
+    (_dimension, remove, diagnostic) => {
       const a = shutdownArchive()
       a.verify()
-      if (dimension === 'episode') delete a.record.results.episodes.admin
-      if (dimension === 'zero-timeout') delete a.record.results.timeout0.share
-      if (dimension === 'blackhole') delete a.record.results.blackhole
-      expect(() => a.verify()).toThrow(/Required|Missing admin blackhole/)
+      remove(a.record.results)
+      expect(() => a.verify()).toThrow(diagnostic)
     }
   )
   /** @returns {Archive} capable L6 full archive under both telemetry options */
@@ -2977,7 +2903,7 @@ describe('telemetry observation segments', () => {
   })
 
   test('holds each kind to its fixed schedule and cap', async () => {
-    expect(segmentCatalogue('telemetry-shutdown')).toHaveLength(88)
+    expect(segmentCatalogue('telemetry-shutdown')).toHaveLength(89)
     expect(segmentCatalogue('telemetry-churn')).toHaveLength(28)
     const l5 = ordinary()
     const client = fakeClient(l5)
