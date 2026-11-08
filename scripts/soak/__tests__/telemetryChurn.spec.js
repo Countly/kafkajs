@@ -3,6 +3,7 @@ const crypto = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
+const zlib = require('node:zlib')
 const {
   CORPUS,
   DecoderCoordinator,
@@ -32,9 +33,18 @@ const {
   valueOf,
   writeFence,
 } = require('../telemetryChurn')
-const { checkSegmentFiles } = require('../../../testHelpers/telemetrySegments')
-const { PROFILES, buildTelemetryChurn, instrument, main, parseArgs } = require('../soak')
+const { DecoderMemory } = require('../../../testHelpers/telemetryFixtures')
+const { SEGMENT_FORMAT, checkSegmentFiles } = require('../../../testHelpers/telemetrySegments')
 const {
+  PROFILES,
+  TelemetryResourceVerdict,
+  buildTelemetryChurn,
+  instrument,
+  main,
+  parseArgs,
+} = require('../soak')
+const {
+  verifyChurn,
   verifyChurnFence,
   verifyChurnHandshakes,
   verifyChurnLifecycles,
@@ -44,6 +54,7 @@ const {
   verifyChurnStages,
   verifyChurnStream,
   verifyChurnTransition,
+  verifyDecoderMemory,
 } = require('../../e2e/telemetry/evidence')
 
 const mockReads = { symbols: 0 }
@@ -1765,7 +1776,7 @@ describe('telemetry profile worker', () => {
     }
     const limits = { warmupMs: 60000, measureMs: 300000 }
     const worker = new TelemetryWorker({
-      kind: 'producer',
+      kind: over.kind ?? 'producer',
       client,
       tap: over.tap ?? { telemetry: () => [] },
       segments,
@@ -2005,6 +2016,43 @@ describe('telemetry profile worker', () => {
     expect(receipts).toHaveLength(at === 'close' ? 0 : 1)
     expect(worker.send).toHaveBeenCalledWith({ type: 'progress', sealed: { id: 'producer-lc-2' } })
   })
+
+  test.each(KINDS)(
+    'closes the %s setup, reopen and terminal lifecycles with the same 3000 ms budget',
+    async (kind) => {
+      const budget = { timeout: 3000 }
+      const records = [getRecord(1, 3)]
+      const setup = make({
+        kind,
+        current: {
+          id: 'producer-lc-0',
+          observer: { ...observerOf(records), subscriptions: () => records },
+        },
+      })
+      setup.worker.registry.fill = jest.fn()
+      setup.worker.client.connect = jest.fn(async () => {})
+      setup.segments.close = jest.fn(async () => {})
+      setup.segments.advance = jest.fn()
+      await setup.worker.prepare()
+      expect(setup.segments.close).toHaveBeenCalledWith(setup.worker.client, budget)
+
+      const lifecycle = make({ kind })
+      await lifecycle.worker.reopen({ tick: 5 })
+      await lifecycle.worker.sealing.promise
+      expect(lifecycle.segments.cycle).toHaveBeenCalledWith(lifecycle.worker.client, budget)
+
+      const terminal = make({ kind, tap: { telemetry: () => [], restore: jest.fn() } })
+      terminal.worker.timing.phaseAt = 0
+      terminal.worker.sampler = { endSampling: jest.fn(async () => {}) }
+      terminal.ordinary.stop = jest.fn(async () => {})
+      terminal.worker.registry.restore = jest.fn()
+      terminal.segments.close = jest.fn(async () => {})
+      const errors = []
+      await terminal.worker.cleanup(errors)
+      expect(errors).toEqual([])
+      expect(terminal.segments.close).toHaveBeenCalledWith(terminal.worker.client, budget)
+    }
+  )
 
   test('binds every worker message to the handshake and answers decode requests by identity', async () => {
     const handlers = {}
@@ -3431,5 +3479,497 @@ describe('telemetry churn worker identity', () => {
     ])('refuses %s', (_name, change, message) => {
       expect(verify(change)).toThrow(message)
     })
+  })
+})
+
+describe('telemetry churn decoder memory', () => {
+  /** A labelled peak as a decoder child that was sampled reports it. */
+  const available = () => ({
+    source: 'proc-pid-status',
+    units: 'bytes',
+    capability: 'available',
+    samples: 3,
+    peakHwmBytes: 8192,
+    peakRssBytes: 4096,
+    processes: [],
+  })
+
+  test('accepts a labelled peak and an explicit unavailable fact', () => {
+    expect(() => verifyDecoderMemory(available())).not.toThrow()
+    expect(() =>
+      verifyDecoderMemory(DecoderMemory.unavailable('no process status could be read'))
+    ).not.toThrow()
+  })
+
+  test.each([
+    ['a missing fact', () => undefined],
+    ['another source', (m) => ({ ...m, source: 'ps' })],
+    ['other units', (m) => ({ ...m, units: 'kB' })],
+    ['an unknown capability', (m) => ({ ...m, capability: 'partial' })],
+  ])('refuses %s as unlabelled', (_name, change) => {
+    expect(() => verifyDecoderMemory(change(available()))).toThrow(
+      'A decoder child memory fact is missing or unlabelled'
+    )
+  })
+
+  test.each([
+    ['a null high-water peak', { peakHwmBytes: null }],
+    ['a fractional resident peak', { peakRssBytes: 1.5 }],
+    ['a negative resident peak', { peakRssBytes: -1 }],
+    ['zero samples', { samples: 0 }],
+  ])('refuses an available fact with %s', (_name, over) => {
+    expect(() => verifyDecoderMemory({ ...available(), ...over })).toThrow(
+      'A decoder child memory fact is malformed'
+    )
+  })
+})
+
+describe('telemetry churn archive replay', () => {
+  const churnModule = require('../telemetryChurn')
+  const LINE = '4.3.1'
+  const ROOT = 'case-telemetry-churn-s'
+  const NODE = '1'
+  const NONE = { subscription: 0, retire: 0, reopen: 0 }
+  const VERDICT = { ok: true, violations: [], inconclusive: [] }
+  const MEMORY = {
+    source: 'proc-pid-status',
+    units: 'bytes',
+    capability: 'available',
+    samples: 3,
+    peakHwmBytes: 8192,
+    peakRssBytes: 4096,
+    processes: [],
+  }
+  const TIMELINE = { t0: 0, epochAt: 1000, boundaryAt: 361000, cleanupEndAt: 362000 }
+  const CODECS = {
+    0: (raw) => raw,
+    1: (raw) => zlib.gzipSync(raw),
+    // eslint-disable-next-line n/no-unsupported-features/node-builtins -- the verifier's own zstd codec
+    4: (raw) => zlib.zstdCompressSync(raw),
+  }
+  let directory
+
+  beforeEach(() => {
+    directory = fs.mkdtempSync(path.join(os.tmpdir(), 'churn-replay-'))
+    jest.spyOn(churnModule, 'TelemetrySchedule').mockImplementation(() => ({
+      ticks: [],
+      warmupMs: 60000,
+      required: () => ({ ...NONE }),
+    }))
+    jest.replaceProperty(churnModule, 'MINIMUMS', NONE)
+    jest
+      .spyOn(churnModule.OrdinaryOracle, 'check')
+      .mockImplementation(({ kind }) => ({ violations: [], hashes: `${kind}-sets` }))
+    jest
+      .spyOn(churnModule.ShareOracle, 'check')
+      .mockReturnValue({ violations: [], hashes: 'share-sets' })
+    jest.spyOn(TelemetryResourceVerdict, 'evaluate').mockReturnValue(VERDICT)
+  })
+
+  afterEach(() => {
+    jest.restoreAllMocks()
+    fs.rmSync(directory, { recursive: true, force: true })
+  })
+
+  /**
+   * A complete churn archive with an empty tick table, so no stage, reopen, retirement or
+   * transition is claimed and the resource, oracle and stage arithmetic is stubbed: per kind, seven
+   * lifecycles (a setup Get; the initial custom Get, its proving Push and an empty readback; plain
+   * Gets after), with the sink rows, decoder receipts, worker facts, handshakes and parent rows that
+   * join them. The producer's initial lifecycle also writes two gzip and one zstd Push, each resolved
+   * by its native journal; the share capture is archived once and named by hash.
+   * @returns {{record:object, archive:object, segments:object[], transcripts:object,
+   *   bundles:object, sink:object[]}}
+   */
+  const world = () => {
+    const sink = []
+    const segments = []
+    const transcripts = {}
+    const bundles = {}
+    const calls = []
+    const receipts = []
+    const workers = {}
+    const resources = []
+    const source = sourceStamp(path.resolve(__dirname, '../soak.js'))
+    KINDS.forEach((kind, k) => {
+      const uuid = `${'abcd'[k].repeat(8)}-1111-4111-8111-111111111111`
+      const clientId = `${STEM}-${kind}`
+      const name = (n) => `${kind}-lc-${n}`
+      const get = (index, requestedMetrics, at) => ({
+        type: 'request',
+        apiKey: 71,
+        apiVersion: 0,
+        index,
+        requestKey: `r${index}`,
+        socketId: 1,
+        uuid,
+        clientId,
+        writeAt: at,
+        response: {
+          errorCode: 0,
+          uuid,
+          subscriptionId: requestedMetrics.length ? 7 : 8,
+          pushIntervalMs: 1000,
+          telemetryMaxBytes: 4096,
+          requestedMetrics,
+          responseAt: at + 5,
+        },
+      })
+      for (let n = 0; n < 7; n++) {
+        const id = name(n)
+        const records = [get(1, n === 1 ? ['com.example.'] : [], 10)]
+        const lines = []
+        const types = n !== 1 ? [] : kind === 'producer' ? [0, 1, 1, 4] : [0]
+        types.forEach((type, i) => {
+          const index = i + 2
+          const raw = Buffer.from(`${kind} metrics ${index}`)
+          const blob = CODECS[type](raw)
+          sink.push({
+            v: 1,
+            node: NODE,
+            seq: sink.length + 1,
+            clientInstanceId: uuid,
+            clientId,
+            dataSha256: sha(raw),
+            dataBytes: raw.length,
+            terminating: false,
+            pushIntervalMs: 1000,
+            parse: 'ok',
+          })
+          records.push({
+            type: 'request',
+            apiKey: 72,
+            apiVersion: 0,
+            index,
+            requestKey: `r${index}`,
+            socketId: 1,
+            uuid,
+            clientId,
+            node: NODE,
+            writeAt: index * 10,
+            subscriptionId: 7,
+            terminating: false,
+            compressionType: type,
+            metricsBytes: blob.length,
+            metricsSha256: sha(blob),
+            response: { errorCode: 0, responseAt: index * 10 + 5 },
+          })
+          lines.push({
+            t: 'push',
+            key: `r${index}`,
+            b64: blob.toString('base64'),
+            bytes: blob.length,
+            sha256: sha(blob),
+          })
+          if (index > 2) return
+          const body = {
+            dataSha256: sha(raw),
+            dataBytes: raw.length,
+            parse: 'ok',
+            truncated: false,
+            metrics: [
+              {
+                name: `com.example.soak.${kind}.000`,
+                points: [
+                  {
+                    attrs: [
+                      ['slot', 'string', '0'],
+                      ['variant', 'string', 'a'],
+                    ],
+                    asInt: 1,
+                  },
+                ],
+              },
+            ],
+          }
+          lines.push({
+            t: 'proof',
+            key: 'r2',
+            rawB64: raw.toString('base64'),
+            rawSha256: sha(raw),
+            receipts: [],
+            decoded: {
+              requestKey: 'r2',
+              uuid,
+              node: NODE,
+              compressionType: 0,
+              transmittedSha256: sha(blob),
+              transmittedBytes: blob.length,
+              rawSha256: sha(raw),
+              rawBytes: raw.length,
+              decoded: body,
+              exportIdentity: { node: NODE, seq: sink.length },
+            },
+          })
+          calls.push({ kind, rawSha256: sha(raw) })
+          receipts.push({
+            rawSha256: sha(raw),
+            bodySha256: sha(JSON.stringify(body)),
+            line: LINE,
+            code: 0,
+            signal: null,
+            identity: { verified: true, line: LINE },
+            memory: MEMORY,
+          })
+        })
+        if (types.length) records.push(get(types.length + 2, [], 60))
+        transcripts[id] = {
+          owner: id,
+          records,
+          sockets: [{ id: 1, kind: 'telemetry', closedAt: 100 }],
+          faults: [],
+          cancellations: [],
+          failures: [],
+          cleanup: { children: 0, timers: 0, stillOpen: [], attached: 0 },
+          closures: [{ at: 90, end: 95, pending: [] }],
+        }
+        bundles[id] = lines
+        segments.push({
+          id,
+          kind,
+          role: 'ordinary',
+          transcript: `${ROOT}/segments/${id}.transcript.json`,
+          bundle: `${ROOT}/segments/${id}.bundle.jsonl`,
+        })
+      }
+      workers[kind] = {
+        kind,
+        uuid,
+        requirements: { ok: true, violations: [] },
+        claims: {
+          setup: { segment: name(0), uuid, get: 'r1' },
+          initial: { segment: name(1), cachedUuid: uuid, get: 'r1', push: 'r2' },
+          reopens: [],
+          retirements: [],
+          transitions: [],
+          proofs: [],
+        },
+        journal: Array.from({ length: 6 }, (_, n) => ({
+          seq: n + 1,
+          type: 'select',
+          from: name(n),
+          to: name(n + 1),
+        })),
+        replacements: [],
+        stages: [],
+        timing: { phaseAt: 0, goAt: 0, boundaryAt: 360000, measurementMs: 300000, receiptAt: 95 },
+        ordinary: { handled: [`${kind} handled`], offered: [`${kind} offered`] },
+        share: null,
+      }
+      const registry = new Registry(
+        { registerMetricForSubscription() {}, unregisterMetricFromSubscription() {} },
+        kind
+      )
+      registry.fill()
+      const digest = registry.digest(uuid)
+      const manifest = controlManifest(kind, {
+        topic: `${STEM}-${labelOf(kind)}`,
+        ctl: `${STEM}-ctl`,
+      })
+      const native = (codec) => ({ codec, outcome: 'resolved' })
+      resources.push({
+        kind: 'resource-verdict',
+        clientKind: kind,
+        clientId,
+        uuid,
+        result: VERDICT,
+        input: {
+          clientCount: 1,
+          baseline: { registryDigest: digest },
+          teardown: { registryDigest: digest },
+          reference: {
+            control: { kind, manifest },
+            foreground: manifest.operations.map((o) => ({ n: o.n, status: 'fulfilled' })),
+            native: {
+              journal: {
+                rows: kind === 'producer' ? ['gzip', 'gzip', 'zstd'].map(native) : [],
+              },
+            },
+          },
+        },
+      })
+    })
+    const exchanges = [
+      { n: 1, acknowledged: 2 },
+      { n: 2, acknowledged: 1 },
+    ]
+    const share = {
+      group: `${STEM}-share-group`,
+      exchanges,
+      exchangesSha256: sha(JSON.stringify(exchanges)),
+      settled: [1, 2],
+    }
+    workers.shareConsumer.share = share
+    const archive = {
+      stem: STEM,
+      workers,
+      handshakes: KINDS.map((kind, i) => ({
+        kind,
+        origin: 1000 + i,
+        pid: 100 + i,
+        node: 'v26.0.0',
+        v8: '13.0',
+        platform: 'linux',
+        arch: 'x64',
+        execArgv: ['--expose-gc'],
+        codecs: { gzip: true, zstd: true },
+        source,
+        parentAt: 5 + i,
+      })),
+      source,
+      inputs: {
+        producer: { offered: workers.producer.ordinary.offered },
+        consumer: { handled: workers.consumer.ordinary.handled },
+        shareConsumer: {
+          group: share.group,
+          closures: Array.from({ length: 7 }, () => ({ at: 90, end: 95 })),
+          handled: workers.shareConsumer.ordinary.handled,
+          exchangesSha256: share.exchangesSha256,
+          settled: share.settled,
+        },
+        parentOffered: {
+          consumer: [...Array(10000).keys()],
+          shareConsumer: [...Array(10000).keys()],
+        },
+      },
+      decoder: { receipts, calls },
+      missed: [],
+      stages: [],
+      tickStarts: [],
+      rotations: [],
+    }
+    const exits = KINDS.map((kind) => ({
+      kind: 'natural-exit',
+      clientKind: kind,
+      event: 'close',
+      code: 0,
+      signal: null,
+      stderrBytes: 0,
+      unhandled: 0,
+      receipts: 1,
+      killed: false,
+      watchdogExpired: false,
+      receiptAt: 2000,
+      closedAt: 2100,
+      afterDisconnectMs: 100,
+    }))
+    const oracle = {
+      kind: 'oracle',
+      ok: true,
+      independentSetHashes: {
+        producer: 'producer-sets',
+        consumer: 'consumer-sets',
+        shareConsumer: 'share-sets',
+      },
+    }
+    const verdict = {
+      kind: 'verdict',
+      ok: true,
+      violations: [],
+      timeline: TIMELINE,
+      measured: NONE,
+      setupMs: 1000,
+      cleanupMs: 1000,
+      totalMs: 362000,
+    }
+    const record = {
+      run: { line: LINE },
+      results: { rows: [...resources, ...exits, oracle, verdict] },
+    }
+    return { record, archive, segments, transcripts, bundles, sink }
+  }
+
+  /**
+   * Writes the index, segment files, sink and oracle sidecar of one archive under the run directory.
+   * @param {object} made a `world()` @returns {object} its sidecar manifest
+   */
+  const write = ({ archive, segments, transcripts, bundles, sink }) => {
+    const put = (relative, text) => {
+      const file = path.join(directory, relative)
+      fs.mkdirSync(path.dirname(file), { recursive: true })
+      fs.writeFileSync(file, text)
+    }
+    const jsonl = (rows) => rows.map((row) => JSON.stringify(row) + '\n').join('')
+    put(
+      `${ROOT}/index.json`,
+      JSON.stringify({ format: SEGMENT_FORMAT, scenario: 'telemetry-churn', segments })
+    )
+    for (const entry of segments) {
+      put(entry.transcript, JSON.stringify(transcripts[entry.id]))
+      put(entry.bundle, jsonl(bundles[entry.id]))
+    }
+    put(`${ROOT}/exports-${NODE}.jsonl`, jsonl(sink))
+    put(`${ROOT}/oracles.json`, JSON.stringify({ churn: archive }))
+    return {
+      root: ROOT,
+      segments,
+      files: [`${ROOT}/index.json`, ...segments.flatMap((s) => [s.transcript, s.bundle])].map(
+        (file) => ({ path: file })
+      ),
+    }
+  }
+
+  const verify = (change = () => {}) => {
+    const made = world()
+    change(made)
+    const manifest = write(made)
+    const read = (file) => JSON.parse(fs.readFileSync(path.join(directory, file), 'utf8'))
+    return () => verifyChurn(made.record, directory, manifest, read)
+  }
+  const journalOf = (made) =>
+    made.record.results.rows.find((r) => r.clientKind === 'producer' && r.input).input.reference
+      .native.journal.rows
+
+  test('replays an archive whose journal resolves every compressed Push and whose share capture is kept once', () => {
+    const made = world()
+    expect(
+      made.transcripts['producer-lc-1'].records
+        .filter((r) => r.apiKey === 72)
+        .map((r) => r.compressionType)
+    ).toEqual([0, 1, 1, 4])
+    expect(journalOf(made).map((r) => r.codec)).toEqual(['gzip', 'gzip', 'zstd'])
+    expect(Object.hasOwn(made.archive.inputs.shareConsumer, 'exchanges')).toBe(false)
+    expect(verify()).not.toThrow()
+    expect(churnModule.ShareOracle.check).toHaveBeenCalledTimes(1)
+    expect(churnModule.ShareOracle.check).toHaveBeenCalledWith(
+      expect.objectContaining({ exchanges: made.archive.workers.shareConsumer.share.exchanges })
+    )
+  })
+
+  test.each([
+    [
+      'fewer resolved gzip rows than gzip Pushes',
+      (rows) => rows.splice(rows.indexOf(rows.find((r) => r.codec === 'gzip')), 1),
+      'gzip',
+    ],
+    [
+      'a zstd Push whose only native row was rejected',
+      (rows) => (rows.find((r) => r.codec === 'zstd').outcome = 'rejected'),
+      'zstd',
+    ],
+  ])('refuses a native journal with %s', (_name, change, codec) => {
+    expect(verify((made) => change(journalOf(made)))).toThrow(
+      `The producer native journal lacks the ${codec} compression of its Pushes`
+    )
+  })
+
+  test.each([
+    [
+      'a second copy of the exchanges in the oracle inputs',
+      (a) => (a.inputs.shareConsumer.exchanges = a.workers.shareConsumer.share.exchanges),
+      'Share exchanges are archived twice',
+    ],
+    [
+      'captured exchanges that differ from their capture hash',
+      (a) => (a.workers.shareConsumer.share.exchanges[1].acknowledged = 3),
+      'Share exchange facts differ from their capture hash',
+    ],
+    [
+      'oracle inputs that name another capture',
+      (a) => (a.inputs.shareConsumer.exchangesSha256 = sha('other exchanges')),
+      'The share oracle inputs name other exchanges',
+    ],
+  ])('refuses %s', (_name, change, message) => {
+    expect(verify((made) => change(made.archive))).toThrow(message)
   })
 })
