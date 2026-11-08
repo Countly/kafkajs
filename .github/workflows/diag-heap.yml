@@ -1,0 +1,86 @@
+name: Diagnostic share heap (never acceptance)
+on:
+  push:
+    branches: ['diag/heap-*']
+permissions:
+  contents: read
+concurrency:
+  group: diag-heap-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  heap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    env:
+      KAFKA_VERSION: 4.3.1
+      COMPOSE_FILE: docker-compose.yml
+      KAFKAJS_LANE: docker
+      KAFKAJS_DEBUG_PROTOCOL_BUFFERS: '1'
+      SHARE_SOAK_HEAP_DIAG: '1'
+      SHARE_SOAK_HEAP_EXTRA_CYCLES: '10'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 24, cache: npm }
+      - run: npm ci
+      - run: docker compose version
+      - name: Prepare diagnostic evidence
+        run: |
+          echo "KAFKAJS_TREE=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          rm -rf .tmp/e2e
+          mkdir -p .tmp/e2e
+      - name: Run diagnostic share short soak and matched repetitions
+        timeout-minutes: 40
+        env:
+          DO_NOT_STOP: '1'
+        run: ./scripts/testWithKafka.sh "node --expose-gc scripts/diag/shareHeap.js"
+      - name: Analyse strong retainers offline
+        if: always()
+        timeout-minutes: 10
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs')
+          const path = require('node:path')
+          const { spawnSync } = require('node:child_process')
+          const directory = '.tmp/e2e/diag-heap'
+          const rows = fs.readFileSync(path.join(directory, 'snapshots.jsonl'), 'utf8')
+            .trim().split('\n').map(JSON.parse)
+          if (rows[0]?.label !== 'baseline' || rows.length < 2) throw new Error('Missing matched captures')
+          const result = spawnSync(process.execPath, [
+            '--max-old-space-size=4096', 'scripts/diag/heapDiff.js',
+            ...rows.map(({ file }) => path.join(directory, file)),
+            '--out', path.join(directory, 'analysis'),
+          ], { stdio: 'inherit' })
+          if (result.error) throw result.error
+          process.exitCode = result.status ?? 1
+          NODE
+      - name: Stop share cluster
+        if: always()
+        run: docker compose -f "$COMPOSE_FILE" down --remove-orphans
+      - name: Compress and bound diagnostic artifact
+        id: pack
+        if: always()
+        run: |
+          cp scripts/diag/README.md .tmp/e2e/README.md
+          find .tmp/e2e -name '*.heapsnapshot' -exec gzip -9 {} +
+          node <<'NODE'
+          const fs = require('node:fs')
+          const path = require('node:path')
+          const size = directory => fs.readdirSync(directory, { withFileTypes: true })
+            .reduce((bytes, entry) => bytes + (entry.isDirectory()
+              ? size(path.join(directory, entry.name))
+              : fs.statSync(path.join(directory, entry.name)).size), 0)
+          const bytes = size('.tmp/e2e')
+          console.log(`Diagnostic artifact: ${bytes} bytes`)
+          if (bytes >= 1900000000) throw new Error('Diagnostic payload exceeds 1.9 GB archive allowance; upload refused')
+          NODE
+      - name: Upload diagnostic snapshots and analysis
+        if: always() && steps.pack.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: diag-share-heap-kafka431-node24-${{ github.run_id }}
+          path: .tmp/e2e/
+          if-no-files-found: error
+          include-hidden-files: true
+          compression-level: 0
+          retention-days: 7
