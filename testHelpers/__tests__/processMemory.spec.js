@@ -185,6 +185,8 @@ describe('ProcessMemory', () => {
   test('counts the collections the engine reported while it settled', async () => {
     const owner = {}
     owner.memory = meter({ gc: () => (owner.memory.collections += 1) }).memory
+    // Only the two scripted collections may be reported; a real engine collection is not ours.
+    owner.memory.observer.disconnect()
 
     expect((await owner.memory.settled()).gc.observed).toBe(2)
   })
