@@ -30,6 +30,56 @@ const {
   registryFingerprint,
 } = require(path.join(ROOT, 'scripts', 'e2e', 'telemetry', 'resourceArtifact.js'))
 
+/**
+ * The finite protocol population this wire advertises, including both discovery attempts and
+ * enabled-only APIs. Loading both directions does not build a request, collect a sample or run a
+ * codec. Plain children do not use Jest's eager protocol imports.
+ */
+const MEMORY_PROTOCOLS = Object.freeze([
+  ['apiVersions', 5],
+  ['apiVersions', 4],
+  ['metadata', 13],
+  ['findCoordinator', 6],
+  ['listOffsets', 9],
+  ['fetch', 18],
+  ['offsetForLeaderEpoch', 4],
+  ['joinGroup', 8],
+  ['syncGroup', 5],
+  ['heartbeat', 4],
+  ['leaveGroup', 5],
+  ['offsetFetch', 9],
+  ['offsetCommit', 9],
+  ['initProducerId', 5],
+  ['produce', 13],
+  ['shareGroupHeartbeat', 1],
+  ['shareGroupDescribe', 1],
+  ['shareFetch', 2],
+  ['shareAcknowledge', 2],
+  ['describeShareGroupOffsets', 1],
+  ['alterShareGroupOffsets', 0],
+  ['deleteShareGroupOffsets', 0],
+  ['getTelemetrySubscriptions', 0],
+  ['pushTelemetry', 0],
+])
+
+/**
+ * Loads the same finite core/telemetry wire and production modules before either mode constructs
+ * a client. The discovery fallback's v0 response is a separate lazy production import.
+ * @param {(file: string) => *} [load] module loader, replaceable for a catalogue unit test
+ * @returns {void} all modules are loaded, without invoking protocol or native operations
+ * @throws {Error} when a declared module cannot load; a missing fixture cannot certify a run
+ */
+const preloadProtocols = (load = require) => {
+  for (const [api, version] of MEMORY_PROTOCOLS) {
+    for (const direction of ['request', 'response'])
+      load(path.join(ROOT, 'src', 'protocol', 'requests', api, `v${version}`, `${direction}.js`))
+    load(path.join(ROOT, 'testHelpers', 'wire', `${api}V${version}.js`))
+  }
+  load(path.join(ROOT, 'src', 'protocol', 'requests', 'apiVersions', 'v0', 'response.js'))
+}
+
+preloadProtocols()
+
 /** The UUID the scripted broker assigns, and the sizes of the maximum descriptor population. */
 const MEMORY_UUID = '01020304-0506-0708-090a-0b0c0d0e0f10'
 const DESCRIPTORS = 128
@@ -405,6 +455,7 @@ module.exports = {
   descriptor,
   foregroundCatalogue,
   runControl,
+  preloadProtocols,
   until,
   within,
 }

@@ -4,9 +4,10 @@ const crypto = require('node:crypto')
 const path = require('node:path')
 const TelemetryPayload = require('../payload')
 const gzip = require('../../protocol/message/compression/gzip')
+const zstd = require('../../protocol/message/compression/zstd')
 const Connection = require('../../network/connection')
 const Decoder = require('../../protocol/decoder')
-const { maximum } = require('./fixtures/maximum')
+const { maximum, bindNodes } = require('./fixtures/maximum')
 const {
   AckProof,
   BoundedAudit,
@@ -38,6 +39,56 @@ const KINDS = TELEMETRY_KINDS
 
 describe('bounded telemetry resource structures', () => {
   afterEach(() => jest.restoreAllMocks())
+
+  test.each(KINDS)(
+    'restores 257 observed points after the disconnected baseline for %s',
+    (kind) => {
+      const { metrics, subscription, slots } = maximum(kind)
+      slots.forEach((slot) => metrics.retireNode(slot))
+      metrics.resetTransient()
+      const matched = metrics.snapshot(subscription)
+      expect(matched.points).toHaveLength(129)
+      metrics.abandon(matched)
+
+      const active = bindNodes(metrics, subscription)
+      expect(active.revision).not.toBe(subscription.revision)
+      const snapshot = metrics.snapshot(active)
+      expect(snapshot.points).toHaveLength(257)
+      expect(
+        snapshot.points.filter((point) => point.attributes.some((a) => a.key === 'node_id'))
+      ).toHaveLength(128)
+      metrics.abandon(snapshot)
+      metrics.resetTransient()
+    }
+  )
+
+  test.each(KINDS)(
+    'builds current and retired maximum payloads after reset for %s',
+    async (kind) => {
+      const { metrics, subscription, slots } = maximum(kind)
+      slots.forEach((slot) => metrics.retireNode(slot))
+      slots.length = 0
+      metrics.resetTransient()
+      const active = bindNodes(metrics, subscription)
+      const snapshot = metrics.snapshot(active)
+      const builder = new TelemetryPayload(1n)
+      for (const type of [1, ...(zstd.isSupported ? [4] : [])]) {
+        const options = { acceptedCompressionTypes: [type, 0], isCurrent: () => true }
+        const current = await builder.buildPayload(snapshot, options)
+        expect(current.includedIdentities).toHaveLength(257)
+        expect(current.compressionType).toBe(type)
+        expect(current.rawBytes).toBeLessThanOrEqual(1048576)
+        expect(current.transmittedBytes).toBeLessThan(current.rawBytes)
+        let valid = true
+        const retiring = builder.buildPayload(snapshot, { ...options, isCurrent: () => valid })
+        valid = false
+        expect(await retiring).toBeNull()
+      }
+      metrics.abandon(snapshot)
+      builder.retire()
+      metrics.resetTransient()
+    }
+  )
 
   test.each(KINDS)('caps series and replaces node identities for %s', (kind) => {
     const { metrics, subscription, slots } = maximum(kind)

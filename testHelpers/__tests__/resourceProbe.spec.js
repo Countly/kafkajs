@@ -585,6 +585,35 @@ describe('resource roles and snapshot comparison', () => {
   })
 })
 
+describe('memory fixture module loading', () => {
+  test('loads both directions of the declared core and telemetry protocols before any client', () => {
+    const { preloadProtocols } = require('../../src/telemetry/__tests__/fixtures/memoryForeground')
+    const load = jest.fn()
+    preloadProtocols(load)
+
+    for (const [api, version] of [
+      ['apiVersions', 5],
+      ['apiVersions', 4],
+      ['metadata', 13],
+      ['produce', 13],
+      ['leaveGroup', 5],
+      ['shareFetch', 2],
+      ['shareAcknowledge', 2],
+      ['getTelemetrySubscriptions', 0],
+      ['pushTelemetry', 0],
+    ]) {
+      for (const direction of ['request', 'response'])
+        expect(load).toHaveBeenCalledWith(
+          expect.stringContaining(`/src/protocol/requests/${api}/v${version}/${direction}.js`)
+        )
+      expect(load).toHaveBeenCalledWith(
+        expect.stringContaining(`/testHelpers/wire/${api}V${version}.js`)
+      )
+    }
+    expect(load.mock.calls.every(([file]) => !file.endsWith('.spec.js'))).toBe(true)
+  })
+})
+
 describe('resource artifact validation', () => {
   const TREE = 'a'.repeat(40)
   const NODE = 'v26.7.0'
@@ -637,6 +666,7 @@ describe('resource artifact validation', () => {
       maxRss: 357744640,
       covered: covered * MIB,
       coveredExternal: external,
+      imports: phase === 'startup' ? null : { count: 400, late: [] },
     }
   }
 
@@ -855,6 +885,12 @@ describe('resource artifact validation', () => {
   })
 
   describe('the schema and the shape of the evidence', () => {
+    test.each([1, 2, 3])('rejects schema %s without frozen module evidence', (schema) => {
+      const old = record('public')
+      old.schema = schema
+      expect(judgeMemoryArm(old)).toEqual({ verdict: 'fail', problems: ['unknown schema'] })
+    })
+
     test('rejects the earlier schema and an aggregate-only record', () => {
       const old = {
         schema: 1,
@@ -1367,6 +1403,43 @@ describe('resource artifact validation', () => {
       expect(judged('public', (r) => delete r.samples.maxGapMs).problems).toContain(
         'sampling facts are incomplete'
       )
+    })
+  })
+
+  describe('the frozen module population', () => {
+    test('keeps late protocol imports inconclusive instead of attributing them to telemetry', () => {
+      expect(
+        judged('public', (r) => {
+          markOf(r, 'enabled:gzip').imports = { count: 401, late: ['wire/pushTelemetryV0.js'] }
+        })
+      ).toEqual({
+        verdict: 'inconclusive',
+        problems: ['modules loaded after the disabled reference'],
+      })
+    })
+
+    test.each([
+      ['no loaded population', (r) => (markOf(r, 'loaded').imports = null)],
+      ['a negative count', (r) => (markOf(r, 'control:c0').imports.count = -1)],
+      ['no late-module list', (r) => delete markOf(r, 'control:c0').imports.late],
+      ['an empty module name', (r) => (markOf(r, 'control:c0').imports.late = [''])],
+      ['duplicate names', (r) => (markOf(r, 'control:c0').imports.late = ['same', 'same'])],
+    ])('fails malformed module facts: %s', (_name, change) => {
+      expect(judged('public', change).verdict).toBe('fail')
+    })
+
+    test('fails missing module facts and never lets late imports erase a retained violation', () => {
+      expect(judged('public', (r) => delete markOf(r, 'control:c0').imports).verdict).toBe('fail')
+      const result = judged('public', (r) => {
+        markOf(r, 'enabled:gzip').imports = { count: 401, late: ['wire/pushTelemetryV0.js'] }
+        r.closed.heapUsed += LIMITS.closedTransient
+        r.closed.retained += LIMITS.closedTransient
+      })
+      expect(result.verdict).toBe('fail')
+      expect(result.problems).toEqual([
+        'closed transient bytes exceed 256 KiB',
+        'modules loaded after the disabled reference',
+      ])
     })
   })
 
