@@ -8654,7 +8654,13 @@ describe('share bounce acquisition and settlement sensitivity', () => {
         next.acquisition,
         { ...acquisition, id: 102, partition: secondary, adoptedAt: cutAt + 1 },
       ]
-      Object.assign(bounces[0], { kind: 'kill', service: 'kafka1', at: adoptedAt - 10 })
+      Object.assign(bounces[0], {
+        kind: 'kill',
+        service: 'kafka1',
+        at: adoptedAt - 10,
+        downAt: cutAt - 1,
+        restoredAt: cutAt + 2,
+      })
       Object.assign(evidence.retirements[0], { at: cutAt + 1 })
       evidence.owner.tap.socketEvents = [
         { id: 30, socket: frame.socket, at: cutAt, order: 20801, outstanding: [] },
