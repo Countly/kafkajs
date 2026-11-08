@@ -2,19 +2,28 @@ const crypto = require('crypto')
 const fs = require('fs')
 const net = require('net')
 const path = require('path')
+const v8 = require('v8')
+const vm = require('vm')
 const { performance } = require('perf_hooks')
 const { spawn } = require('child_process')
 const { Kafka, logLevel } = require('../../../index')
-const { runCase } = require('../../../scripts/e2e/telemetry/evidence')
-const { cacheRetirement, connectionIdentity } = require('../../../scripts/e2e/telemetry/cacheTrace')
 const {
-  TelemetryWireObserver,
-  withTelemetryResource,
-} = require('../../../testHelpers/telemetryFixtures')
+  episodeLogs,
+  joinChunks,
+  runCase,
+  stableCacheEvent,
+  traceChunk,
+  verifyQuietResources,
+} = require('../../../scripts/e2e/telemetry/evidence')
+const { cacheRetirement, connectionIdentity } = require('../../../scripts/e2e/telemetry/cacheTrace')
+const { DecoderGate, withTelemetryResource } = require('../../../testHelpers/telemetryFixtures')
+const { SCHEDULES, TelemetrySegments } = require('../../../testHelpers/telemetrySegments')
+const { createResourceProbe, ResourceRoles } = require('../../../testHelpers/resourceProbe')
 const { createChaosSocketFactory, FrameFilter } = require('../../../testHelpers/chaosSocket')
 const {
   bounded,
   caseTimeout,
+  delay,
   liveCase,
   liveRun,
   pollUntil,
@@ -34,7 +43,9 @@ const SUPPORTED_TIMEOUT0 = ['producer', 'consumer', 'share']
 const LOGGER = 'org.apache.kafka.server.ClientMetricsManager'
 const PROPERTIES =
   'enable.metrics.push=false\nrequest.timeout.ms=3000\ndefault.api.timeout.ms=5000\n'
-const SETUP_AND_TELEMETRY_APIS = [17, 18, 36, 71]
+const SCENARIO = 'telemetry-shutdown'
+const ROUNDS = 20
+const DECODERS = 4
 const FINAL_CAP_MS = 1000
 const SCHEDULING_MS = 100
 const QUIET_MS = 1000
@@ -183,16 +194,18 @@ class BrokerLogs {
   /**
    * @param {string} service broker service
    * @param {string} sinceIso RFC 3339 start of the window
-   * @returns {Promise<{text:string,truncated:boolean}>} the service log since then
+   * @param {string} [untilIso] RFC 3339 end of the window; open-ended when omitted
+   * @returns {Promise<{text:string,truncated:boolean}>} the service log in that window
    * @throws {Error} for a failed log command
    */
-  async since(service, sinceIso) {
+  async since(service, sinceIso, untilIso) {
     const result = await this.run([
       'logs',
       '--no-color',
       '--no-log-prefix',
       '--since',
       sinceIso,
+      ...(untilIso ? ['--until', untilIso] : []),
       service,
     ])
     if (result.code !== 0 || result.error)
@@ -204,22 +217,31 @@ class BrokerLogs {
 /**
  * Chaos sockets for one observed client, with a passive frame classifier on each: the first
  * request frame of API 71 or 72 marks that very socket object as the telemetry transport. A fault
- * is armed on the classified object only, and every patch is removed again.
+ * is armed on the classified object only, every patch is removed again, and a closed socket is
+ * released at once so only scalar facts outlive it.
  */
 class TelemetryFaults {
-  /** @param {object} observer the wire observer whose real sockets the chaos layer wraps */
-  constructor(observer) {
-    const inner = createChaosSocketFactory((options) => observer.socketFactory(options))
+  /** @param {TelemetrySegments} segments the owner whose selected segment receives every socket */
+  constructor(segments) {
+    const inner = createChaosSocketFactory((options) => segments.socketFactory(options))
+    this.segments = segments
     this.records = []
-    this.factory = (options) => this.track(inner(options))
+    this.factory = (options) => this.track(inner(options), segments.current())
   }
 
   /**
    * @param {object} socket the chaos socket just issued
+   * @param {object} segment the segment whose observer received it
    * @returns {object} the same socket, now classified and timed
    */
-  track(socket) {
-    const record = { ordinal: this.records.length + 1, socket, telemetry: false, closed: false }
+  track(socket, segment) {
+    const record = {
+      segment: segment.id,
+      ordinal: segment.observer.socketOwnership().length,
+      socket,
+      telemetry: false,
+      closed: false,
+    }
     const classifier = new FrameFilter({
       headerBytes: 12,
       decide: (header) => {
@@ -238,9 +260,21 @@ class TelemetryFaults {
     socket.on('close', () => {
       record.closed = true
       record.closedAt = clock.now()
+      this.release(record)
     })
     this.records.push(record)
     return socket
+  }
+
+  /**
+   * @param {object} record a socket record
+   * @returns {void} removes its patch; the socket itself is dropped only once it has closed, so a
+   *   socket that stays open remains visible as an owned identity
+   */
+  release(record) {
+    record.restore?.()
+    record.restore = null
+    if (record.closed) record.socket = null
   }
 
   /** @returns {object[]} open sockets proven by an actual 71/72 frame to be the telemetry transport */
@@ -248,17 +282,119 @@ class TelemetryFaults {
     return this.records.filter((r) => r.telemetry && !r.closed)
   }
 
-  /** @returns {void} removes every classifier patch */
+  /** @returns {object[]} every socket still open, whatever it carries */
+  openSockets() {
+    return this.records.filter((r) => !r.closed).map((r) => r.socket)
+  }
+
+  /** @returns {void} removes every classifier patch still installed */
   restore() {
-    for (const record of this.records) record.restore()
+    for (const record of this.records) this.release(record)
   }
 }
 
 /**
- * L5 contribution: per public kind one close, an immediate public reconnect on the same object,
- * a new accepted normal Push under the same UUID, and an independent broker-side proof that the
- * old connection's cache entry was retired. Also the inherited zero-timeout close and one
- * blackholed telemetry transport. Twenty-cycle resource and soak acceptance belongs to J.
+ * Reads the broker logs once for all four kinds at each round: contiguous, non-overlapping windows
+ * whose first window opens before the first connect. A member that arrives waits for the others;
+ * the last arrival reads, and a failure anywhere releases every waiter.
+ */
+class TraceWindows {
+  #waiting = new Map()
+  #failure = null
+
+  /**
+   * @param {object} options window source
+   * @param {BrokerLogs} options.logs bounded broker log access
+   * @param {number} options.members arrivals that trigger one read
+   * @param {function(number,string,function(AbortSignal):Promise<*>):Promise<*>} options.within bounded runner
+   */
+  constructor({ logs, members, within }) {
+    this.logs = logs
+    this.members = members
+    this.within = within
+    this.chunks = []
+    this.start = null
+  }
+
+  /** @returns {void} opens the first window now */
+  open() {
+    this.start = new Date().toISOString()
+  }
+
+  /**
+   * @param {number} round ordinal of the window within the run
+   * @returns {Promise<object>} the retained chunk, once every member has arrived and it was read
+   * @throws {Error} the failure that released the waiters
+   */
+  arrive(round) {
+    if (this.#failure) return Promise.reject(this.#failure)
+    let entry = this.#waiting.get(round)
+    if (!entry) {
+      entry = { count: 0 }
+      entry.promise = new Promise((resolve, reject) => {
+        entry.resolve = resolve
+        entry.reject = reject
+      })
+      this.#waiting.set(round, entry)
+    }
+    entry.count++
+    if (entry.count === this.members) this.read(round).then(entry.resolve, entry.reject)
+    return entry.promise
+  }
+
+  /**
+   * @param {Error} error the failure to deliver to every current and later waiter
+   * @returns {void}
+   */
+  fail(error) {
+    this.#failure ??= error
+    for (const entry of this.#waiting.values()) entry.reject(error)
+  }
+
+  /**
+   * @param {number} round ordinal of the window to read
+   * @returns {Promise<object>} its retained chunk
+   */
+  async read(round) {
+    const since = round === 0 ? this.start : this.chunks[round - 1].until
+    const until = new Date().toISOString()
+    const logs = Object.fromEntries(
+      await this.within(20000, `The trace window ${round}`, () =>
+        Promise.all(
+          ['kafka1', 'kafka2', 'kafka3'].map(async (service, index) => [
+            String(index + 1),
+            await this.logs.since(service, since, until),
+          ])
+        )
+      )
+    )
+    this.chunks[round] = traceChunk({ index: round, since, until, logs })
+    return this.chunks[round]
+  }
+
+  /**
+   * @param {number} ordinal the window to take whole
+   * @returns {Object<string,{text:string,truncated:boolean}>} that window's per-node log
+   */
+  window(ordinal) {
+    return joinChunks(this.chunks, ordinal, ordinal)
+  }
+
+  /**
+   * @param {number} ordinal the window that holds an old connection's Get
+   * @param {number} last last window to include, inclusive
+   * @returns {Object<string,{text:string,truncated:boolean}>} that connection's episode log
+   */
+  episode(ordinal, last) {
+    return episodeLogs(this.chunks, ordinal, last)
+  }
+}
+
+/**
+ * L5 contribution: per public kind twenty close/immediate-reconnect rounds on one returned object,
+ * each with a new accepted normal Push under the same UUID and an independent broker-side proof that
+ * the old connection's cache entry was retired. Also the inherited zero-timeout close and one
+ * blackholed telemetry transport. Every lifecycle is one sealed observer segment.
  */
 class ReopenCase {
   #tasks = []
@@ -279,9 +415,40 @@ class ReopenCase {
     this.directory = directory
     this.stem = stem
     this.attempt = attempt
-    this.results = { episodes: {}, timeout0: {} }
-    this.pushes = []
+    this.results = { initial: {}, rounds: {}, journal: {}, timeout0: {}, blackhole: null }
     this.members = []
+    this.gate = new DecoderGate(DECODERS)
+    this.consumed = new Set()
+    attempt.segments = []
+    this.pending = new Set()
+    // The process's own stdio handles exist before the case, never as a case-time survivor.
+    if (!process.stdout || !process.stderr) throw new Error('The case needs process stdio')
+    this.roles = new ResourceRoles({ roles: ['case', 'quiet'] }).start()
+    this.probe = createResourceProbe({
+      activeResources: true,
+      resources: this.roles,
+      registrations: () => ({ process }),
+      identities: () => ({
+        openSockets: this.members.flatMap((m) => m.faults.openSockets()),
+        pending: [...this.pending],
+        undischarged: this.members.flatMap((m) => m.segments.undischarged()),
+      }),
+    })
+  }
+
+  /**
+   * Counts one bounded case operation as a pending public call until it settles.
+   * @template T
+   * @param {function():Promise<T>} work the operation @returns {Promise<T>} its own outcome
+   */
+  async track(work) {
+    const token = {}
+    this.pending.add(token)
+    try {
+      return await work()
+    } finally {
+      this.pending.delete(token)
+    }
   }
 
   /** @param {function():Promise<void>|void} task release attempted by `close` @returns {void} */
@@ -318,7 +485,7 @@ class ReopenCase {
    * @returns {Promise<*>} its result
    */
   within(ms, label, op) {
-    return bounded(this.signal, ms, op, { label })
+    return this.track(() => bounded(this.signal, ms, op, { label }))
   }
 
   /**
@@ -329,7 +496,7 @@ class ReopenCase {
    * @returns {Promise<*>} its result
    */
   release(ms, label, op) {
-    return bounded(this.owner, ms, op, { label })
+    return this.track(() => bounded(this.owner, ms, op, { label }))
   }
 
   /**
@@ -349,24 +516,33 @@ class ReopenCase {
   }
 
   /**
-   * Builds one observed client of a kind whose sockets pass through the classifying chaos layer.
-   * Release order: disconnect, a quiet window with no owned socket or final, dispose, require clean.
    * @param {string} kind producer, consumer, admin or share
-   * @param {string} suffix owner and client-id suffix
-   * @returns {object} `{ client, observer, faults, kind }`
+   * @returns {object|undefined} the inherited close arguments of that kind; admin has none
+   */
+  closeOptions(kind) {
+    return kind === 'admin' ? undefined : { timeout: 3000 }
+  }
+
+  /**
+   * Builds one observed client of a kind. Its sockets pass through the classifying chaos layer into
+   * the segment the owner has selected; every release is registered, nothing is attempted here.
+   * @param {string} kind producer, consumer, admin or share
+   * @param {string} suffix ep, t0 or bh
+   * @returns {object} `{ client, segments, faults, kind, owner }`
    */
   build(kind, suffix) {
     const owner = `${kind}-${suffix}`
-    const observer = new TelemetryWireObserver({
-      completeStream: true,
+    const shared = {
       directory: this.directory,
-      line: this.line,
       clock,
-      mode: 'configured',
-      owner,
-    })
-    this.attempt.observers[owner] = observer
-    const faults = new TelemetryFaults(observer)
+      observer: { line: this.line, mode: 'configured', gate: this.gate, consumed: this.consumed },
+    }
+    const segments =
+      suffix === 'ep'
+        ? TelemetrySegments.ordinary(SCENARIO, kind, shared)
+        : TelemetrySegments.single(SCENARIO, owner, shared)
+    this.attempt.segments.push(segments)
+    const faults = new TelemetryFaults(segments)
     const kafka = new Kafka({
       clientId: `${this.stem}-${owner}`,
       brokers: PORTS.map((port) => `localhost:${port}`),
@@ -388,248 +564,287 @@ class ReopenCase {
                 heartbeatInterval: 3000,
                 maxWaitTimeInMs: 500,
               })
-    this.defer(() => observer.assertClean({ allowUnanswered: observer.cancellationKeys() }))
-    this.defer(() => observer.dispose())
-    this.defer(() => faults.restore())
-    this.defer(async () => {
-      await this.release(
-        QUIET_MS + 2000,
-        'The quiet window',
-        () => new Promise((r) => setTimeout(r, QUIET_MS))
-      )
-      expect(faults.records.every((r) => r.closed)).toBe(true)
-      expect(faults.telemetry()).toEqual([])
-      if (suffix === 't0')
-        expect(observer.readTranscript().filter((r) => r.apiKey === 72 && r.terminating)).toEqual(
-          []
-        )
-    })
-    this.defer(() => observer.closeClient(client))
-    const member = { client, observer, faults, kind, owner }
+    const member = { client, segments, faults, kind, owner, draining: null }
     this.members.push(member)
+    this.defer(() => faults.restore())
     return member
   }
 
   /**
    * Connects a client and waits until two normal Pushes were accepted on its telemetry stream.
    * @param {object} member the observed client
-   * @returns {Promise<object>} its UUID, captured telemetry socket and node
+   * @returns {Promise<object>} its UUID, telemetry socket, node, port and first successful Get
    */
   async establish(member) {
-    const { client, observer, faults } = member
-    const since = new Date().toISOString()
-    await this.within(10000, `The ${member.kind} connect`, () => client.connect())
+    const { client, segments, faults, kind } = member
+    const { observer } = segments.current()
+    await this.within(10000, `The ${kind} connect`, () => client.connect())
     const uuid = await client.clientInstanceId({ timeout: 5000 })
-    const accepted = await this.find(`two ${member.kind} accepted Pushes`, 15000, () => {
+    await this.find(`two ${kind} accepted Pushes`, 15000, () => {
       const list = observer.accepted({ uuid }).filter((p) => p.metricsBytes > 0)
       return list.length >= 2 && list
     })
     expect(faults.telemetry()).toHaveLength(1)
     const [captured] = faults.telemetry()
-    const port = observer.telemetrySockets().find((s) => s.socketId === captured.ordinal).port
+    return this.lifecycle(observer, uuid, captured.ordinal)
+  }
+
+  /**
+   * @param {object} observer the segment observer of the lifecycle
+   * @param {string} uuid the client's instance UUID
+   * @param {number} socketId the telemetry socket of the lifecycle
+   * @returns {object} the successful Get, the connect of its socket, node and port
+   */
+  lifecycle(observer, uuid, socketId) {
     const get = observer
       .subscriptions({ uuid })
-      .find((r) => r.socketId === captured.ordinal && r.response?.errorCode === 0)
+      .find((r) => r.socketId === socketId && r.response?.errorCode === 0)
     const connect = observer
       .readTranscript()
-      .find((r) => r.type === 'connect' && r.socketId === captured.ordinal)
-    const logs = await this.readLogs(since)
-    const identity = connectionIdentity({
-      logs,
-      get,
-      connect,
-      node: get.node,
-      localPort: LISTENER[port],
+      .find((r) => r.type === 'connect' && r.socketId === socketId)
+    return { uuid, ordinal: socketId, node: get.node, port: connect.port, get, connect }
+  }
+
+  /**
+   * @param {object} lifecycle a lifecycle from `establish` or a round
+   * @param {number} ordinal the shared window that holds the lifecycle's Get
+   * @param {TraceWindows} windows shared windows
+   * @returns {object} the exact broker connection the lifecycle's Get arrived on
+   */
+  serverIdentity(lifecycle, ordinal, windows) {
+    return connectionIdentity({
+      logs: windows.window(ordinal),
+      get: lifecycle.get,
+      connect: lifecycle.connect,
+      node: lifecycle.node,
+      localPort: LISTENER[lifecycle.port],
     })
-    return {
+  }
+
+  /**
+   * At a boundary fails the fixture, rather than queueing, when the previous segment has not
+   * drained; at the end of the schedule waits for it. Either way surfaces a sealing failure.
+   * @param {object} member the client whose previous segment is checked
+   * @param {boolean} [last=false] whether no further boundary follows
+   * @returns {Promise<void>} once the previous segment is sealed
+   * @throws {Error} when it is still draining at a boundary or failed to seal
+   */
+  async drained(member, last = false) {
+    const { draining } = member
+    if (!draining) return
+    if (last) await draining.promise
+    if (!draining.settled) throw new Error(`The previous ${member.kind} segment has not drained`)
+    if (draining.error) throw draining.error
+  }
+
+  /**
+   * Starts sealing a closed segment while the next lifecycle is established.
+   * @param {object} member the client that owns the segment
+   * @param {object} segment the closed segment
+   * @returns {void}
+   */
+  drain(member, segment) {
+    const draining = { settled: false, error: null }
+    draining.promise = member.segments.discharge(segment).then(
+      () => {
+        draining.settled = true
+      },
+      (error) => {
+        draining.settled = true
+        draining.error = error
+      }
+    )
+    member.draining = draining
+  }
+
+  /**
+   * Twenty rounds of close and immediate public reopen on one returned object. The next segment is
+   * selected before each close, the connect call follows the close's own continuation, and the old
+   * connection's cache retirement is proved from the shared windows before the next round starts.
+   * @param {object} member the observed client of an ordinary kind
+   * @param {TraceWindows} windows the shared broker log windows
+   * @returns {Promise<void>} after the twentieth round and the terminal close are complete
+   */
+  async rounds(member, windows) {
+    const { client, segments, faults, kind } = member
+    let current = await this.establish(member)
+    const { uuid } = current
+    this.results.initial[kind] = {
+      segment: segments.current().id,
       uuid,
-      ordinal: captured.ordinal,
-      node: accepted.at(-1).node,
-      port,
-      serverConnectionIdentity: identity,
-      get,
-      connect,
-      since,
+      get: current.get.requestKey,
     }
-  }
-
-  /**
-   * Reads the complete broker-side disconnect episode after immediate reopen and recovery.
-   * @param {object} before the captured connection from `establish`
-   * @returns {Promise<object>} the source-qualified retirement; rejects at its own bound
-   */
-  async observeCacheRetirement(before) {
-    const logs = await this.readLogs(before.since)
-    const input = {
-      logs,
-      node: before.node,
-      localPort: before.serverConnectionIdentity.localPort,
-      get: before.get,
-      connect: before.connect,
-      uuid: before.uuid,
-      since: before.since,
-      completedAt: new Date().toISOString(),
-      source: this.source,
-      loggerReadbacks: this.logs.receipts,
-    }
-    this.attempt.record.oracles ??= {}
-    this.attempt.record.oracles[this.cacheKind] = input
-    return cacheRetirement(input)
-  }
-
-  /**
-   * Reads the complete bounded three-node log window without returning on a removal prefix.
-   * @param {string} since epoch window start
-   * @returns {Promise<object>} full broker logs
-   * @throws {Error} for unavailable or truncated inputs
-   */
-  async readLogs(since) {
-    return Object.fromEntries(
-      await Promise.all(
-        ['kafka1', 'kafka2', 'kafka3'].map(async (service, index) => [
-          String(index + 1),
-          await this.logs.since(service, since),
-        ])
+    await windows.arrive(0)
+    current.identity = this.serverIdentity(current, 0, windows)
+    const rounds = (this.results.rounds[kind] = [])
+    for (let round = 1; round <= ROUNDS; round++) {
+      await this.drained(member)
+      const observedAt = clock.now()
+      const cycle = segments.cycle(client, this.closeOptions(kind))
+      await this.within(8000, `The ${kind} close`, () => cycle.closed)
+      this.drain(member, cycle.from)
+      await this.within(10000, `The ${kind} reconnect`, () => cycle.reopened)
+      const cachedUuid = await client.clientInstanceId({ timeout: 0 })
+      const { observer } = cycle.to
+      const get = await this.find(`the ${kind} nonzero-ID Get`, 15000, () =>
+        observer.subscriptions({ uuid }).find((r) => r.uuid === uuid && r.response?.errorCode === 0)
       )
-    )
-  }
-
-  /**
-   * One close and immediate reopen on the same public object.
-   * @param {string} kind producer, consumer, admin or share
-   * @returns {Promise<object>} compact episode evidence
-   */
-  async episode(kind) {
-    const member = this.build(kind, 'ep')
-    const { client, observer } = member
-    const before = await this.establish(member)
-    const preClose = observer.checkpoint()
-    this.cacheKind = kind
-    const cacheObservation = {
-      since: before.since,
-      start: clock.now(),
-      connect: before.connect,
-      get: before.get,
-    }
-    const order = []
-    await this.within(8000, `The ${kind} close`, () =>
-      observer.closeClient(client, kind === 'admin' ? undefined : { timeout: 3000 })
-    )
-    const closeEnd = observer.checkpoint()
-    order.push('closed')
-    const reconnecting = client.connect()
-    order.push('connect-called')
-    await this.within(10000, `The ${kind} reconnect`, () => reconnecting)
-    const cachedUuid = await client.clientInstanceId({ timeout: 0 })
-    const closeFrames = observer
-      .readTranscript({ after: preClose })
-      .filter(
-        (r) =>
-          r.index <= closeEnd &&
-          (r.type === 'connect' || SETUP_AND_TELEMETRY_APIS.includes(r.apiKey))
+      const push = await this.find(`the ${kind} new accepted Push`, 15000, () =>
+        observer
+          .accepted({ uuid, after: get.index })
+          .find(
+            (p) =>
+              p.socketId === get.socketId &&
+              p.metricsBytes > 0 &&
+              p.writeAt > get.response.responseAt
+          )
       )
-    const get = await this.find(`the ${kind} nonzero-ID Get`, 15000, () =>
-      observer
-        .subscriptions({ uuid: before.uuid, after: closeEnd })
-        .find((r) => r.uuid === before.uuid && r.response?.errorCode === 0)
-    )
-    const push = await this.find(`the ${kind} new accepted Push`, 15000, () =>
-      observer
-        .accepted({ uuid: before.uuid, after: get.index })
-        .find((p) => p.socketId === get.socketId && p.metricsBytes > 0)
-    )
-    await observer.decodeAccepted(push)
-    this.pushes.push({ owner: member.owner, requestKey: push.requestKey })
-    const rejected = observer
-      .readTranscript({ after: closeEnd })
-      .filter((r) => r.apiKey === 72 && !r.terminating && r.response?.errorCode)
-    const finalsAtClose = observer
-      .readTranscript({ after: preClose })
-      .filter((r) => r.apiKey === 72 && r.terminating && r.index <= closeEnd)
-    const finalResends = observer
-      .readTranscript({ after: closeEnd })
-      .filter((r) => r.apiKey === 72 && r.terminating)
-    order.push('cache-awaited')
-    // Replacement work and both logger readbacks fence the complete disconnect episode.
-    expect(await this.logs.snapshot(`kafka${before.node}`, before.node)).toEqual({
-      [LOGGER]: 'TRACE',
-      'kafka.request.logger': 'TRACE',
-    })
-    const cacheEvent = await this.observeCacheRetirement(before)
-    expect(cacheObservation.start).toBeLessThanOrEqual(get.writeAt)
-    const reopen = {
-      calledBeforeCacheAwait: order.indexOf('connect-called') < order.indexOf('cache-awaited'),
-      cachedUuid,
-      get: { requestUuid: get.uuid, socketId: get.socketId },
-      acceptedNormalPushes: [push.requestKey],
-      correctiveExtraPushes: rejected.length,
-      finalResends: finalResends.length,
+      const rejected = observer
+        .readTranscript()
+        .filter((r) => r.apiKey === 72 && !r.terminating && r.response?.errorCode)
+      const notes = segments.journal().slice(-3)
+      expect(notes.map((n) => n.type)).toEqual(['select', 'disconnect-resolved', 'connect-called'])
+      expect(notes[2].seq).toBe(notes[1].seq + 1)
+      expect(cachedUuid).toBe(uuid)
+      expect(observedAt).toBeLessThanOrEqual(get.writeAt)
+      expect(rejected.length).toBeLessThanOrEqual(1)
+      expect(rejected.every((r) => r.response.errorCode === 42)).toBe(true)
+      expect(faults.telemetry()).toHaveLength(1)
+      expect(faults.telemetry()[0].segment).toBe(cycle.to.id)
+      await windows.arrive(round)
+      const next = this.lifecycle(observer, uuid, get.socketId)
+      const retired = cacheRetirement({
+        logs: windows.episode(round - 1, round),
+        node: current.node,
+        localPort: LISTENER[current.port],
+        get: current.get,
+        connect: current.connect,
+        uuid,
+        since: windows.chunks[round - 1].since,
+        completedAt: new Date().toISOString(),
+        source: this.source,
+      })
+      expect(retired.source).toBe('broker-disconnect-trace')
+      expect(retired.connectionIdentity).toEqual(current.identity)
+      rounds.push({
+        round,
+        from: cycle.from.id,
+        to: cycle.to.id,
+        cachedUuid,
+        observedAt,
+        get: get.requestKey,
+        push: push.requestKey,
+        cacheEvent: stableCacheEvent(retired),
+      })
+      next.identity = this.serverIdentity(next, round, windows)
+      current = next
     }
-    const close = { getOrConnectOrAuthFrames: closeFrames.filter((r) => r.apiKey !== 72) }
-    expect(reopen.calledBeforeCacheAwait).toBe(true)
-    expect(reopen.cachedUuid).toBe(before.uuid)
-    expect(reopen.get.requestUuid).toBe(before.uuid)
-    expect(reopen.get.socketId).not.toBe(before.ordinal)
-    expect(reopen.acceptedNormalPushes.length).toBeGreaterThanOrEqual(1)
-    expect(reopen.correctiveExtraPushes).toBeLessThanOrEqual(1)
-    expect(rejected.every((r) => r.response.errorCode === 42)).toBe(true)
-    expect(reopen.finalResends).toBe(0)
-    expect(close.getOrConnectOrAuthFrames).toEqual([])
-    expect(finalsAtClose.map((r) => r.response?.errorCode)).toEqual([0])
-    expect(cacheEvent.source).toBe('broker-disconnect-trace')
-    expect(cacheEvent.connectionIdentity).toEqual(before.serverConnectionIdentity)
-    expect(member.faults.telemetry()).toHaveLength(1)
-    await observer.closeClient(client, kind === 'admin' ? undefined : { timeout: 3000 })
-    return {
-      before,
-      reopen,
-      close,
-      cacheEvent,
-      finalRequestKeys: finalsAtClose.map((r) => r.requestKey),
-    }
+    await this.drained(member, true)
+    this.results.journal[kind] = segments.journal()
   }
 
   /**
    * A zero-timeout close of a supported kind sends no final.
-   * @param {string} kind producer, consumer or share
-   * @returns {Promise<object>} compact evidence
+   * @param {object} member the observed client of a supported kind
+   * @returns {Promise<void>} after the close and its evidence checks
    */
-  async timeoutZero(kind) {
-    const member = this.build(kind, 't0')
+  async timeoutZero(member) {
+    const { kind, segments } = member
     const before = await this.establish(member)
-    const preClose = member.observer.checkpoint()
     await this.within(8000, `The ${kind} zero-timeout close`, () =>
-      member.observer.closeClient(member.client, { timeout: 0 })
+      segments.close(member.client, { timeout: 0 })
     )
-    const finalZeroTimeoutWrites = member.observer
-      .readTranscript({ after: preClose })
-      .filter((r) => r.apiKey === 72 && r.terminating)
-    expect(finalZeroTimeoutWrites).toEqual([])
-    return { uuid: before.uuid, finalZeroTimeoutWrites: finalZeroTimeoutWrites.length }
+    this.results.timeout0[kind] = { uuid: before.uuid, finalZeroTimeoutWrites: 0 }
   }
 
   /**
-   * The captured telemetry socket of an admin is blackholed: foreground metadata work still
-   * succeeds and the telemetry cleanup closes within its own cap plus the scheduling allowance.
-   * @returns {Promise<object>} compact evidence
+   * The captured telemetry socket of an admin is blackholed while foreground metadata work runs
+   * beside the close: that work succeeds with its original result, and the telemetry cleanup closes
+   * within its own cap plus the scheduling allowance. The admin close has no finite budget, so the
+   * cap is the inherited final cap.
+   * @returns {Promise<void>} after the blackholed close and its evidence checks
    */
   async blackhole() {
     const member = this.build('admin', 'bh')
     const before = await this.establish(member)
     const [captured] = member.faults.telemetry()
-    member.observer.declareFault(captured.ordinal)
+    member.segments.current().observer.declareFault(captured.ordinal)
     captured.socket.blackhole()
-    const cluster = await this.within(8000, 'The foreground metadata work', () =>
-      member.client.describeCluster({ timeout: 3000 })
-    )
-    expect(cluster.brokers.map((b) => b.port).sort()).toEqual(PORTS)
+    const { client } = member
+    const original = client.describeCluster
+    const options = { timeout: 3000 }
+    let witnessed
+    client.describeCluster = function (...args) {
+      witnessed = { thisArg: this, args, result: Reflect.apply(original, this, args) }
+      return witnessed.result
+    }
     const started = clock.now()
-    await this.within(10000, 'The admin close', () => member.observer.closeClient(member.client))
+    let core
+    let closing
+    try {
+      core = client.describeCluster(options)
+      closing = member.segments.close(client)
+    } finally {
+      client.describeCluster = original
+    }
+    const [cluster] = await this.within(10000, 'The core work and the admin close', () =>
+      Promise.all([core, closing])
+    )
     const coreCloseMs = clock.now() - started
     await this.find('the blackholed telemetry socket close', 3000, () => captured.closed)
     const telemetryCleanupMs = captured.closedAt - started
+    expect(cluster.brokers.map((b) => b.port).sort()).toEqual(PORTS)
     expect(telemetryCleanupMs).toBeLessThanOrEqual(FINAL_CAP_MS + SCHEDULING_MS)
-    return { uuid: before.uuid, faultedSocket: before.ordinal, coreCloseMs, telemetryCleanupMs }
+    this.results.blackhole = {
+      uuid: before.uuid,
+      faultedSocket: before.ordinal,
+      coreCloseMs,
+      telemetryCleanupMs,
+      core: {
+        sameResult:
+          witnessed.thisArg === client &&
+          witnessed.args[0] === options &&
+          witnessed.result === core &&
+          (await witnessed.result) === cluster,
+      },
+    }
+  }
+
+  /**
+   * Closes every client's terminal segment and seals every segment, all kinds concurrently.
+   * @returns {Promise<void>} when every segment is sealed
+   * @throws {Error|AggregateError} every failure, after all were attempted
+   */
+  async finishAll() {
+    const outcomes = await Promise.allSettled(
+      this.members.map((m) => m.segments.finish(m.client, this.closeOptions(m.kind)))
+    )
+    const errors = outcomes.filter((r) => r.status === 'rejected').map((r) => r.reason)
+    if (errors.length === 1) throw errors[0]
+    if (errors.length) throw new AggregateError(errors, 'Segment cleanup failed')
+  }
+
+  /**
+   * Waits the quiet window after every client and observer is gone, lets the destroy hooks of what
+   * ended run, then requires exact quiet identities: no owned socket, segment or pending call, no
+   * case-created resource of any type, no unknown-owner resource the baseline did not hold, the
+   * same process listener registrations with multiplicity and the same event-loop counts.
+   * @param {object} baseline the snapshot taken before anything was built
+   * @returns {Promise<void>} after the comparison; the readings are kept in the case results
+   */
+  async quiet(baseline) {
+    await this.roles.run('quiet', () =>
+      bounded(this.owner, QUIET_MS + 2000, (scope) => delay(scope, QUIET_MS), {
+        label: 'The quiet window',
+      })
+    )
+    await new Promise((resolve) => setImmediate(resolve))
+    await new Promise((resolve) => setImmediate(resolve))
+    const final = await this.probe.snapshot()
+    this.results.resources = { baseline, final }
+    expect(this.members.every((m) => m.faults.records.every((r) => r.closed))).toBe(true)
+    expect(this.gate.occupancy()).toEqual({ running: 0, queued: 0 })
+    verifyQuietResources({ baseline, final })
   }
 
   /**
@@ -642,6 +857,7 @@ class ReopenCase {
       throw new Error(
         'The cache observer needs the isolated CI project and the telemetry Compose file'
       )
+    const runStart = clock.now()
     this.logs = new BrokerLogs({ project, file })
     const kafka = new Kafka({
       clientId: `${this.stem}-aux`,
@@ -709,19 +925,44 @@ class ReopenCase {
       'interval.ms': '1000',
       match: `client_id=^${this.stem}-`,
     }
-    await withTelemetryResource(aux, { name: this.stem, entries }, async () => {
-      for (const kind of KINDS) this.results.episodes[kind] = await this.episode(kind)
-      for (const kind of SUPPORTED_TIMEOUT0)
-        this.results.timeout0[kind] = await this.timeoutZero(kind)
-      this.results.blackhole = await this.blackhole()
+    const windows = new TraceWindows({
+      logs: this.logs,
+      members: KINDS.length,
+      within: (ms, label, op) => this.within(ms, label, op),
     })
+    this.windows = windows
+    await withTelemetryResource(aux, { name: this.stem, entries }, async () => {
+      windows.open()
+      const ordinary = KINDS.map((kind) => this.build(kind, 'ep'))
+      const zero = SUPPORTED_TIMEOUT0.map((kind) => this.build(kind, 't0'))
+      this.defer(() => this.finishAll())
+      try {
+        await Promise.all([
+          ...ordinary.map((member) => this.rounds(member, windows)),
+          ...zero.map((member) => this.timeoutZero(member)),
+        ])
+      } catch (error) {
+        windows.fail(error)
+        throw error
+      }
+      await this.blackhole()
+      await this.finishAll()
+    })
+    this.results.workMs = clock.now() - runStart
   }
 
   /** @returns {void} hands the case record to the shared persistence and verification */
   finishRecord() {
     const manifest = JSON.parse(fs.readFileSync(MANIFEST_FILE, 'utf8'))
+    const { name } = SCHEDULES[SCENARIO]
     this.attempt.record = {
-      oracles: this.attempt.record.oracles,
+      oracles: {
+        traces: {
+          source: this.source,
+          loggerReadbacks: this.logs.receipts,
+          chunks: this.windows.chunks,
+        },
+      },
       wireVersions: { 71: 0, 72: 0 },
       run: {
         stem: this.stem,
@@ -734,9 +975,15 @@ class ReopenCase {
         reporterJar: manifest.lines[this.line].reporterJar,
       },
       results: this.results,
-      pushes: this.pushes,
       allowed: {
-        errors: Object.fromEntries(KINDS.map((kind) => [`${kind}-ep`, [42]])),
+        errors: Object.fromEntries(
+          KINDS.flatMap((kind) =>
+            Array.from({ length: SCHEDULES[SCENARIO].perKind }, (_, index) => [
+              name(kind, index),
+              [42],
+            ])
+          )
+        ),
         faultedSockets: { 'admin-bh': [this.results.blackhole.faultedSocket] },
       },
     }
@@ -747,7 +994,7 @@ const BUDGET = 118000
 live(
   'close and reopen',
   liveCase(BUDGET, (scope) =>
-    runCase('telemetry-shutdown', async (cleanup, publish, attempt) => {
+    runCase(SCENARIO, async (cleanup, publish, attempt) => {
       const line = process.env.KAFKA_VERSION
       const directory = process.env.TELEMETRY_EVIDENCE_DIR
       if (!line) throw new Error('KAFKA_VERSION must name the broker line')
@@ -760,25 +1007,156 @@ live(
         stem: attempt.record.run.stem,
         attempt,
       })
-      cleanup.defer(() => scenario.close())
+      cleanup.defer(() => scenario.roles.stop())
+      const baseline = await scenario.probe.snapshot()
+      cleanup.defer(() => scenario.quiet(baseline))
+      cleanup.defer(() => scenario.roles.run('case', () => scenario.close()))
       await bounded(
         scope,
         BUDGET - 20000,
         (inner) => {
           scenario.signal = inner
-          return scenario.run()
+          return scenario.roles.run('case', () => scenario.run())
         },
         { label: 'The close and reopen scenario' }
       )
       attempt.stage = 'verification'
       scenario.finishRecord()
       publish({
-        name: 'telemetry-shutdown',
+        name: SCENARIO,
         directory,
-        observers: attempt.observers,
+        observers: {},
         record: attempt.record,
       })
     })
   ),
   caseTimeout(BUDGET)
+)
+
+const CHURN_BUDGET = 538000
+
+/**
+ * Gives this process a real collection function without `--expose-gc`, for the parent's check only:
+ * every worker is forked with the flag and takes its own readings.
+ * @returns {function():void} restores the previous state
+ */
+const exposeCollection = () => {
+  const had = Object.getOwnPropertyDescriptor(globalThis, 'gc')
+  if (typeof globalThis.gc !== 'function') {
+    v8.setFlagsFromString('--expose-gc')
+    globalThis.gc = vm.runInNewContext('gc')
+  }
+  return () => {
+    if (!had) delete globalThis.gc
+  }
+}
+
+/**
+ * L9: the same `main('telemetry')` owner the CLI runs, with its rows captured into one stamped
+ * scenario record. Four one-client workers are judged on their own memory and exact resource
+ * identities, every lifecycle is a sealed observer segment, and the parent's independent decode,
+ * ordinary and share oracles and the natural exit of every child are archived with every input,
+ * so the verifier recomputes the verdict instead of trusting it. A shortened or forced run cannot
+ * satisfy it.
+ */
+live(
+  'telemetry churn',
+  liveCase(CHURN_BUDGET, (scope) =>
+    runCase('telemetry-churn', async (cleanup, publish, attempt) => {
+      const directory = process.env.TELEMETRY_EVIDENCE_DIR
+      const line = process.env.KAFKA_VERSION
+      if (!line) throw new Error('KAFKA_VERSION must name the broker line')
+      if (!directory || !path.isAbsolute(directory))
+        throw new Error('TELEMETRY_EVIDENCE_DIR must name the absolute run directory')
+      const {
+        main,
+        buildTelemetryChurn,
+        TelemetryResourceVerdict,
+      } = require('../../../scripts/soak/soak')
+      const rows = []
+      const restore = exposeCollection()
+      cleanup.defer(() => restore())
+      attempt.segments = []
+      attempt.record.results = { rows }
+      // Everything the run produced is attached before any assertion, failed or not.
+      const attach = (result) => {
+        attempt.segments = result.workers.map((worker) => ({
+          sealed: () => worker.facts?.sealed ?? worker.sealed ?? [],
+        }))
+        const manifest = JSON.parse(fs.readFileSync(MANIFEST_FILE, 'utf8'))
+        attempt.record = {
+          ...attempt.record,
+          wireVersions: { 71: 0, 72: 0 },
+          run: {
+            ...attempt.record.run,
+            composeSha256: fileSha(path.join(ROOT, 'docker-compose.telemetry.yml')),
+          },
+          fixture: {
+            manifestSha256: fileSha(MANIFEST_FILE),
+            reporterJar: manifest.lines[line].reporterJar,
+          },
+          oracles: { churn: result.archive },
+          results: {
+            rows,
+            verdict: {
+              ok: result.ok,
+              setupMs: result.setupMs,
+              cleanupMs: result.cleanupMs,
+              totalMs: result.totalMs,
+            },
+          },
+        }
+      }
+      let parent
+      let result
+      try {
+        result = await bounded(
+          scope,
+          CHURN_BUDGET,
+          () =>
+            main('telemetry', {
+              brokers: PORTS.map((port) => `localhost:${port}`),
+              telemetry: (options) =>
+                (parent = buildTelemetryChurn({ ...options, record: (row) => rows.push(row) })),
+            }),
+          { label: 'The telemetry churn' }
+        )
+      } catch (error) {
+        if (!parent?.lastResult) throw error
+        try {
+          attach(parent.lastResult)
+        } catch (attachError) {
+          throw new AggregateError([error, attachError], 'The failed churn could not be attached')
+        }
+        throw error
+      }
+      attach(result)
+      attempt.stage = 'verification'
+      expect(result.clientKinds).toEqual(['producer', 'consumer', 'admin', 'shareConsumer'])
+      expect(result.workers).toHaveLength(4)
+      for (const worker of result.workers) {
+        expect(worker.input.clientCount).toBe(1)
+        expect(worker.input.samples.length).toBeGreaterThanOrEqual(10)
+        expect(worker.input.measurementMs).toBeGreaterThanOrEqual(300000)
+        expect(TelemetryResourceVerdict.evaluate(worker.input).ok).toBe(true)
+        expect(worker.exit).toMatchObject({
+          event: 'close',
+          code: 0,
+          signal: null,
+          stderrBytes: 0,
+          unhandled: 0,
+          watchdogExpired: false,
+        })
+        expect(worker.exit.afterDisconnectMs).toBeLessThanOrEqual(10000)
+      }
+      expect(result.oracle.ok).toBe(true)
+      expect(result.setupMs).toBeLessThanOrEqual(48000)
+      expect(result.cleanupMs).toBeLessThanOrEqual(120000)
+      expect(result.totalMs).toBeLessThanOrEqual(CHURN_BUDGET)
+      expect(result.ok).toBe(true)
+
+      publish({ name: 'telemetry-churn', directory, observers: {}, record: attempt.record })
+    })
+  ),
+  caseTimeout(CHURN_BUDGET)
 )

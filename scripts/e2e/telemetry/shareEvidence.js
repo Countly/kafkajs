@@ -254,4 +254,10 @@ class ShareTrace {
   }
 }
 
-module.exports = { ShareTrace, confirmedDecisions, acquisitionStart, heldAcquisitions }
+module.exports = {
+  ShareTrace,
+  acknowledgementResponse,
+  confirmedDecisions,
+  acquisitionStart,
+  heldAcquisitions,
+}

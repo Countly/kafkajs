@@ -1177,6 +1177,7 @@ describe('broker telemetry fixture', () => {
       ['java', 'javaInteropLive', 'java telemetry interoperability'],
       ['outcomes', 'outcomesLive', 'foreground outcomes'],
       ['shutdown', 'shutdownLive', 'close and reopen'],
+      ['soak', 'shutdownLive', 'telemetry churn'],
     ]
     for (const [name, file, title] of live) {
       const script = scripts['test:group:telemetry-' + name]
@@ -1253,6 +1254,7 @@ describe('broker telemetry fixture', () => {
       'telemetry-java',
       'telemetry-outcomes',
       'telemetry-shutdown',
+      'telemetry-soak',
     ]
     const configured = (node, kafkas) =>
       configuredGroups.flatMap((group) =>
@@ -1275,11 +1277,40 @@ describe('broker telemetry fixture', () => {
       return rows
     }
     expect(catalogue(false)).toEqual(rowsOf(24, false))
-    expect(catalogue(false)).toHaveLength(10)
+    expect(catalogue(false)).toHaveLength(11)
     const required = [22, 24, 26].flatMap((node) => rowsOf(node, true))
     expect(catalogue(true)).toEqual(required)
-    expect(new Set(catalogue(true).map(JSON.stringify)).size).toBe(69)
-    expect(new Set(catalogue(true).map((r) => `${r.group}-${r.kafka}-${r.node}`)).size).toBe(69)
+    expect(new Set(catalogue(true).map(JSON.stringify)).size).toBe(75)
+    expect(new Set(catalogue(true).map((r) => `${r.group}-${r.kafka}-${r.node}`)).size).toBe(75)
+    const resources = workflow.jobs.resources
+    expect(resources.needs).toBeUndefined()
+    const alone = resources.steps.find((step) => step.run?.includes('resources\\.spec'))
+    expect(alone.run).toContain('--runInBand')
+    expect(alone.run).toContain('--expose-gc')
+    expect(alone.run).not.toContain('forceExit')
+    expect(alone.env.TELEMETRY_RESOURCES_QUIET).toBe('1')
+    expect(alone['timeout-minutes']).toBeGreaterThan(0)
+    const names = resources.steps.map((step) => step.name ?? step.uses)
+    expect(names).toEqual([
+      'actions/checkout@v4',
+      'actions/setup-node@v4',
+      undefined,
+      'Stamp the run and prepare the artifact directory',
+      'Measure single-client memory alone on the idle runner',
+      'Run the bounded-resource schedules',
+      'Validate the recorded measurements for this tree and Node',
+      'actions/upload-artifact@v4',
+    ])
+    const validate = resources.steps.find((step) => step.run?.includes('resourceArtifact.js'))
+    expect(validate.if).toBe('always()')
+    const upload = resources.steps.find((step) => step.uses === 'actions/upload-artifact@v4')
+    expect(upload.if).toBe('always()')
+    expect(upload.with['if-no-files-found']).toBe('error')
+    expect(resources.env.TELEMETRY_RESOURCES_ARTIFACT_DIR).toContain('telemetry-resources')
+    const soakLane = workflow.jobs.telemetry.steps.find((step) => step.name?.includes('churn soak'))
+    expect(soakLane.if).toBe("matrix.group == 'telemetry-soak'")
+    expect(soakLane.run).toContain('timeout -k 10s 600s npm run test:group:telemetry-soak')
+    expect(soakLane['timeout-minutes']).toBeGreaterThanOrEqual(10)
     const job = workflow.jobs.telemetry
     for (const identity of ['github.run_id', 'github.run_attempt', 'strategy.job-index'])
       expect(job.env.COMPOSE_PROJECT_NAME).toContain(identity)
@@ -1994,5 +2025,223 @@ describe('custom metric archive conclusions', () => {
       samples['producer:r50'].decoded.metrics.at(-1).points[0].startNs = '1'
     if (change === 'contradicted-result') results.removal.names.push('com.example.zero')
     expect(() => verifyCustom(results, samples, transcript)).toThrow()
+  })
+})
+
+describe('telemetry churn evidence', () => {
+  const { verifyEvidence } = require('../telemetry/evidence')
+
+  test('knows the soak lane and refuses an unknown one with a different diagnostic', () => {
+    expect(() => verifyEvidence('telemetry-soak', '/', [])).toThrow('Scenario catalogue mismatch')
+    expect(() => verifyEvidence('telemetry-nonexistent', '/', [])).toThrow('Unknown telemetry lane')
+  })
+})
+
+describe('segmented evidence in the cleanup manifest', () => {
+  const crypto = require('crypto')
+  const { CiOwnership } = require('../telemetry/ci')
+  const { verifyCleanup } = require('../telemetry/evidence')
+  const { SEGMENT_FORMAT, segmentCatalogue } = require('../../../testHelpers/telemetrySegments')
+  let root
+  let owner
+  const sha = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex')
+  const archive = (
+    segments = segmentCatalogue('telemetry-shutdown').length,
+    format = SEGMENT_FORMAT
+  ) => {
+    const dir = path.join(owner.directory, 'case-telemetry-shutdown-abc')
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(
+      path.join(dir, 'index.json'),
+      JSON.stringify({
+        format,
+        scenario: 'telemetry-shutdown',
+        segments: Array.from({ length: segments }, (_, index) => ({ id: `s${index}` })),
+      })
+    )
+    const record = { sidecars: { format, root: 'case-telemetry-shutdown-abc' } }
+    fs.writeFileSync(
+      path.join(path.dirname(owner.receiptFile), 'telemetry-shutdown.jsonl'),
+      JSON.stringify(record) + '\n'
+    )
+  }
+  const finalize = () => {
+    const receipt = {
+      project: owner.project,
+      compose: owner.file,
+      preflightPassed: true,
+      removalVerified: true,
+      journalComplete: true,
+      startedAt: 'start',
+      removalProof: { containers: [], networks: [], volumes: [] },
+      ownedRemovalProof: { containers: [], networks: [], volumes: [] },
+    }
+    owner.save(receipt)
+    owner.finalize(receipt)
+    return JSON.parse(fs.readFileSync(path.join(owner.directory, 'cleanup-manifest.json')))
+  }
+  const verify = () =>
+    verifyCleanup(owner.directory, path.dirname(owner.receiptFile), owner.project)
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'segment-manifest-'))
+    owner = new CiOwnership({
+      env: {
+        CI: 'true',
+        COMPOSE_PROJECT_NAME: 'telemetry-1-1-1',
+        COMPOSE_FILE: 'docker-compose.telemetry.yml',
+        TELEMETRY_EVIDENCE_DIR: path.join(root, 'sink'),
+        KAFKA_VERSION: '4.3.1',
+      },
+      docker: () => '',
+    })
+    owner.receiptFile = path.join(root, 'stamps', 'ownership.json')
+    fs.mkdirSync(owner.directory, { recursive: true })
+  })
+  afterEach(() => fs.rmSync(root, { recursive: true, force: true }))
+
+  test('names every segment index with its digest, format and count', () => {
+    archive()
+    const manifest = finalize()
+    const bytes = fs.readFileSync(
+      path.join(owner.directory, 'case-telemetry-shutdown-abc/index.json')
+    )
+    expect(manifest.segmented).toEqual([
+      {
+        path: 'case-telemetry-shutdown-abc/index.json',
+        bytes: bytes.length,
+        sha256: sha(bytes),
+        format: SEGMENT_FORMAT,
+        scenario: 'telemetry-shutdown',
+        segments: 88,
+      },
+    ])
+    expect(() => verify()).not.toThrow()
+  })
+
+  test('lists no index for a run without segmented archives', () => {
+    expect(finalize().segmented).toEqual([])
+    expect(() => verify()).not.toThrow()
+  })
+
+  test.each([
+    [
+      'a stamped segmented record whose index the manifest omits',
+      'Segment index catalogue differs',
+      (manifest) => {
+        manifest.segmented = []
+      },
+    ],
+    [
+      'an index that changed after it was listed',
+      'Segment index digest differs',
+      (manifest) => {
+        manifest.segmented[0].sha256 = 'f'.repeat(64)
+      },
+    ],
+    [
+      'an index of another format',
+      'Segment index format differs',
+      (manifest) => {
+        manifest.segmented[0].format = 'legacy'
+      },
+    ],
+    [
+      'an index with fewer segments than the schedule',
+      'Segment index count differs from the schedule',
+      (manifest) => {
+        manifest.segmented[0].segments = 87
+      },
+    ],
+  ])('rejects %s', (_name, diagnostic, change) => {
+    archive()
+    const manifest = finalize()
+    change(manifest)
+    fs.writeFileSync(path.join(owner.directory, 'cleanup-manifest.json'), JSON.stringify(manifest))
+    expect(() => verify()).toThrow(diagnostic)
+  })
+})
+
+describe('quiet-window resource identities', () => {
+  const { verifyQuietResources } = require('../telemetry/evidence')
+  /** Baseline and final readings of a case that left exactly what it found. */
+  const readings = () => {
+    const reading = () => ({
+      activeResources: { Timeout: 2, TCPWRAP: 0 },
+      identities: { openSockets: [], pending: [], undischarged: [] },
+      resources: { case: {}, quiet: {}, unknown: { Timeout: [4, 9] } },
+      registrations: { process: { id: 1, events: { exit: [2], warning: [3] } } },
+    })
+    return { baseline: reading(), final: reading() }
+  }
+  const verify = (change = () => {}) => {
+    const input = readings()
+    change(input)
+    return () => verifyQuietResources(input)
+  }
+
+  test('accepts a case that left exactly the baseline identities', () => {
+    expect(verify()).not.toThrow()
+    expect(verify(({ final }) => (final.resources.unknown.Timeout = [9]))).not.toThrow()
+  })
+
+  test.each([
+    [
+      'a same-count substituted timer',
+      ({ final }) => (final.resources.unknown.Timeout = [4, 12]),
+      'An unknown-owner resource created during the case survives',
+    ],
+    [
+      'a surviving unknown-owner handle',
+      ({ final }) => (final.resources.unknown.TCPWRAP = [30]),
+      'An unknown-owner resource created during the case survives',
+    ],
+    [
+      'a surviving case timer',
+      ({ final }) => (final.resources.case = { Timeout: [17] }),
+      'A case resource survives the quiet window',
+    ],
+    [
+      'a surviving quiet-window timer',
+      ({ final }) => (final.resources.quiet = { Timeout: [18] }),
+      'A quiet resource survives the quiet window',
+    ],
+    [
+      'a duplicate listener registration',
+      ({ final }) => (final.registrations.process.events.exit = [2, 2]),
+      'Listener registrations differ from the baseline',
+    ],
+    [
+      'a substituted listener at the same count',
+      ({ final }) => (final.registrations.process.events.warning = [5]),
+      'Listener registrations differ from the baseline',
+    ],
+    [
+      'a pending public call',
+      ({ final }) => (final.identities.pending = [3]),
+      'Owned resources survive the quiet window',
+    ],
+    [
+      'a missing identity source',
+      ({ baseline }) => delete baseline.identities.pending,
+      'Required resource source catalogue differs',
+    ],
+    [
+      'a missing role source',
+      ({ final }) => delete final.resources.quiet,
+      'Required resource role catalogue differs',
+    ],
+    [
+      'a missing registration source',
+      ({ final }) => delete final.registrations,
+      'Required registration source differs',
+    ],
+    [
+      'a changed event-loop count',
+      ({ final }) => (final.activeResources.Timeout = 3),
+      'Quiet resources differ',
+    ],
+  ])('refuses %s', (_name, change, message) => {
+    expect(verify(change)).toThrow(message)
   })
 })

@@ -7,7 +7,7 @@
  *
  * Usage: node --expose-gc scripts/soak/soak.js --profile
  *          <idle|member-churn|regex-topic-churn|outage|first-run|producer-churn|consumer-churn|
- *          share-consumer|share-consumer-short> [--phase-seconds <n>]
+ *          share-consumer|share-consumer-short|telemetry> [--phase-seconds <n>]
  *   (= npm run test:kafka -- "node --expose-gc scripts/soak/soak.js --profile first-run" for the
  *   15-minute run, `npm run soak:first-run`)
  * Writes one JSON line per sample and per quiet point to `.tmp/e2e/soak.jsonl` through
@@ -37,6 +37,12 @@
  *                     session reset per cycle; judged by independent log, broker-position and
  *                     handler checks and a per-phase resource screen; see `ShareSoak`
  *   share-consumer-short  the same three phases of 320 s with cycles of 32 s; takes no --phase-seconds
+ *   telemetry         one phase of 360 s (60 s warm-up, 300 s measurement) on the configured telemetry
+ *                     fixture: four one-client worker processes, one per client kind, each held to
+ *                     its own memory and exact resource identities through subscription changes,
+ *                     telemetry reconnects and public close/reopen cycles, with an independent
+ *                     record oracle and natural-exit checks; takes no --phase-seconds; see
+ *                     `TelemetryChurn`
  * Every phase ends by disconnecting its clients, also when it fails; the readings that must be zero
  * are taken there.
  * `--phase-seconds n` shortens every phase to n seconds: a smoke run of the driver, not of memory.
@@ -45,6 +51,26 @@
  * The gauges read internals: the clusters a `Kafka` builds, their request queues, and the
  * operation ledgers and reset obligations of its `operations` store.
  */
+/**
+ * The memory of a telemetry worker before any application module is loaded, read only in a worker
+ * process: current sizes and the kernel's lifetime peak of this executable image.
+ */
+const STARTUP = (() => {
+  if (process.env.TELEMETRY_WORKER_KIND === undefined) return null
+  const usage = process.memoryUsage()
+  const hwm = require('../../testHelpers/processMemory').readProcStatus()?.vmhwm ?? null
+  return {
+    phase: 'startup',
+    at: performance.now(),
+    rss: usage.rss,
+    heapUsed: usage.heapUsed,
+    external: usage.external,
+    arrayBuffers: usage.arrayBuffers,
+    retained: usage.heapUsed + usage.external,
+    hwm,
+    rawMaxRss: process.resourceUsage().maxRSS * 1024,
+  }
+})()
 const { subscribeNamedTopic } = require('./subscribeNamedTopic')
 const fs = require('node:fs')
 const { AsyncLocalStorage } = require('node:async_hooks')
@@ -90,6 +116,9 @@ const { ClosingProbe } = require('./closingProbe')
 const { ConsumerChurnOracle } = require('./consumerChurn')
 
 const PARTITIONS = 6
+/** The seed brokers of the CLI, and of the configured telemetry fixture, which publishes others. */
+const DEFAULT_BROKERS = Object.freeze(['localhost:9092', 'localhost:9095', 'localhost:9098'])
+const TELEMETRY_BROKERS = Object.freeze(['localhost:19092', 'localhost:19095', 'localhost:19098'])
 const MEMBER_CHURN_MS = 15000
 const OUTAGE_SERVICE = 'kafka3'
 const TOPIC_NAMES = 50
@@ -227,6 +256,372 @@ const PROFILES = {
     { name: 'member-churn', workload: 'memberChurn', ms: PHASE_MS },
     { name: 'outage', workload: 'outage', ms: PHASE_MS },
   ],
+  telemetry: [{ name: 'telemetry', workload: 'telemetry', ms: 360000 }],
+}
+
+/** Fixed telemetry resource limits; consumer and producer profiles keep their own bounds. */
+const TELEMETRY = Object.freeze({
+  warmupMs: 60000,
+  measureMs: 300000,
+  cleanupMs: 120000,
+  caseMs: 540000,
+  exitMs: 10000,
+  sampleMs: 30000,
+  /** Phase-anchored admission times of the post-collection readings: 60 s to 330 s every 30 s, then 359 s. */
+  sampleAt: Object.freeze([...Array.from({ length: 10 }, (_, i) => 60000 + i * 30000), 359000]),
+  minSamples: 10,
+  minSpanMs: 270000,
+  slopeBytesPerMinute: 64 * 1024,
+  endpointBytes: 1024 * 1024,
+  activeBytes: 8 * 1024 * 1024,
+  closedBytes: 256 * 1024,
+  rssDeltaBytes: 64 * 1024 * 1024,
+  externalDeltaBytes: 64 * 1024 * 1024,
+  setupPeakBytes: 96 * 1024 * 1024,
+  peakBytes: 160 * 1024 * 1024,
+  controlRssDriftBytes: 2 * 1024 * 1024,
+  controlRetainedDriftBytes: 262144,
+  noiseLoadPerCpu: 0.75,
+  noiseFreeBytes: 268435456,
+  noisePressure: 5,
+})
+
+/** The quiet-identity roles every telemetry reading must carry, whatever they hold. */
+const TELEMETRY_ROLES = Object.freeze([
+  'resources:fixture',
+  'resources:target',
+  'resources:unknown',
+  'sockets',
+])
+
+/**
+ * Judges telemetry process memory and exact quiet identities without changing inherited bounds.
+ * Each client keeps its own allowance. clientCount scales the retained allowance; the live profile
+ * passes 1. Resident-size gates are measured against the worker's own telemetry-disabled control
+ * and its recorded peak source, never against an absolute ceiling set by the interpreter.
+ */
+class TelemetryResourceVerdict {
+  /**
+   * @param {object} run observed, serializable evidence, never expected input counts
+   * @param {number} run.clientCount clients measured in this process, 1 on the live profile
+   * @param {object} run.baseline disconnected descriptor/UUID baseline after warm-up
+   * @param {Array<{admittedAtMs:number, completedAtMs:number, snapshot:object}>} run.samples
+   *   post-GC process readings with the monotonic times their admission and completion had
+   * @param {object} run.teardown disconnected reading at the same retained-state sizes
+   * @param {number} run.cleanupMs cleanup elapsed time within the original case deadline
+   * @param {number} run.measurementMs how long the measurement window lasted
+   * @param {object} run.reference the replayable resident-size reference: peak source and
+   *   capability, startup, loaded and control readings, host contexts and the final reading
+   * @param {{skipped:number[], readFailures:object[]}} [run.sampler] the sampler's own facts: fixed
+   *   grid times skipped and readings that failed after they were admitted
+   * @returns {{ok:boolean, outcome:'passed'|'failed'|'inconclusive', violations:string[],
+   *   inconclusive:string[], measured:object}} the verdict: failures take precedence over an
+   *   inconclusive measurement, and only a passed outcome is `ok`
+   * @throws {TypeError} for a missing evidence container; callers fail the run
+   */
+  static evaluate({
+    clientCount,
+    baseline,
+    samples,
+    teardown,
+    cleanupMs,
+    measurementMs,
+    reference,
+    sampler,
+  }) {
+    const violations = []
+    const measured = {
+      samples: samples.length,
+      skippedSamples: sampler?.skipped?.length ?? 0,
+      slopeBytesPerMinute: null,
+      endpointBytes: null,
+    }
+    const fail = (condition, label) => {
+      if (!condition) violations.push(label)
+    }
+    const bytes = (snapshot) => snapshot?.memory?.retainedBytes
+    const finiteBytes = (value) => Number.isSafeInteger(value) && value >= 0
+    const baselineBytes = bytes(baseline)
+    const closedBytes = bytes(teardown)
+    fail(Number.isInteger(clientCount) && clientCount >= 1 && clientCount <= 4, 'client count')
+    fail(finiteBytes(baselineBytes) && finiteBytes(closedBytes), 'settled baseline and teardown')
+    fail(
+      Number.isFinite(cleanupMs) && cleanupMs >= 0 && cleanupMs <= TELEMETRY.cleanupMs,
+      'cleanup budget'
+    )
+    fail(samples.length >= TELEMETRY.minSamples, 'post-GC sample count')
+    fail(!sampler?.readFailures?.length, 'sampler read failure')
+    fail(
+      Number.isFinite(measurementMs) && measurementMs >= TELEMETRY.measureMs,
+      'measurement duration'
+    )
+    fail(
+      typeof baseline?.registryDigest === 'string' &&
+        baseline.registryDigest.length > 0 &&
+        baseline.registryDigest === teardown?.registryDigest,
+      'retained descriptor and UUID baseline'
+    )
+
+    const beforeRoles = Object.keys(baseline?.identities ?? {}).sort()
+    const afterRoles = Object.keys(teardown?.identities ?? {}).sort()
+    fail(
+      TELEMETRY_ROLES.every((role) => beforeRoles.includes(role) && afterRoles.includes(role)) &&
+        JSON.stringify(beforeRoles) === JSON.stringify(afterRoles),
+      'identity roles'
+    )
+    for (const role of beforeRoles) {
+      const before = baseline.identities[role]
+      const after = teardown.identities?.[role]
+      fail(
+        Array.isArray(before) &&
+          Array.isArray(after) &&
+          before.every(Number.isSafeInteger) &&
+          after.every(Number.isSafeInteger) &&
+          JSON.stringify(before) === JSON.stringify(after),
+        `quiet identity ${role}`
+      )
+    }
+
+    const windowEnd = TELEMETRY.warmupMs + TELEMETRY.measureMs
+    let validSeries = samples.length >= TELEMETRY.minSamples
+    let previous = -Infinity
+    const points = []
+    for (const { admittedAtMs, completedAtMs, snapshot } of samples) {
+      const value = bytes(snapshot)
+      const valid =
+        Number.isFinite(admittedAtMs) &&
+        Number.isFinite(completedAtMs) &&
+        admittedAtMs >= TELEMETRY.warmupMs &&
+        completedAtMs >= admittedAtMs &&
+        completedAtMs <= windowEnd &&
+        admittedAtMs > previous &&
+        finiteBytes(value) &&
+        snapshot.registryDigest === baseline.registryDigest
+      fail(valid, 'post-GC sample shape or retained state')
+      if (!valid) validSeries = false
+      fail(value - baselineBytes <= TELEMETRY.activeBytes * clientCount, 'active retained ceiling')
+      previous = admittedAtMs
+      points.push([completedAtMs / 60000, value])
+    }
+    if (validSeries) {
+      fail(
+        samples[0].admittedAtMs <= TELEMETRY.warmupMs + TELEMETRY.sampleMs &&
+          samples.at(-1).admittedAtMs >= windowEnd - 2 * TELEMETRY.sampleMs &&
+          samples.at(-1).admittedAtMs - samples[0].admittedAtMs >= TELEMETRY.minSpanMs,
+        'measurement span'
+      )
+      measured.slopeBytesPerMinute = slope(points)
+      measured.endpointBytes = points.at(-1)[1] - points[0][1]
+      fail(
+        measured.slopeBytesPerMinute <= TELEMETRY.slopeBytesPerMinute * clientCount,
+        'retained slope'
+      )
+      fail(measured.endpointBytes <= TELEMETRY.endpointBytes * clientCount, 'retained endpoint')
+    }
+    fail(
+      closedBytes - baselineBytes <= TELEMETRY.closedBytes * clientCount,
+      'closed transient ceiling'
+    )
+    const inconclusive = TelemetryResourceVerdict.reference(reference, {
+      baseline,
+      samples,
+      teardown,
+      violations,
+      measured,
+    })
+    const outcome = violations.length ? 'failed' : inconclusive.length ? 'inconclusive' : 'passed'
+    return { ok: outcome === 'passed', outcome, violations, inconclusive, measured }
+  }
+
+  /**
+   * Validates one memory reading of the versioned catalogue: its phase, monotonic time, every
+   * counter as a nonnegative safe integer, `retained = heapUsed + external` with `arrayBuffers`
+   * inside `external` (never added again), and for a settled reading real collections admitted
+   * before it completed. A missing peak (`hwm` null) is a capability fact, not a malformed reading.
+   * @param {object} reading the reading @param {string} phase the catalogue name it must carry
+   * @param {boolean} settled whether it must carry its collection facts
+   * @returns {string|null} what is wrong with it, or null
+   */
+  static malformed(reading, phase, settled) {
+    const counter = (value) => Number.isSafeInteger(value) && value >= 0
+    if (reading?.phase !== phase) return 'resident-size reading phase'
+    if (!Number.isFinite(reading.at)) return 'resident-size reading time'
+    const values = ['rss', 'heapUsed', 'external', 'arrayBuffers', 'rawMaxRss']
+    if (!values.every((key) => counter(reading[key]))) return 'resident-size counters'
+    if (reading.hwm !== null && !counter(reading.hwm)) return 'resident-size counters'
+    const retained = reading.retainedBytes ?? reading.retained
+    if (
+      retained !== reading.heapUsed + reading.external ||
+      (reading.retainedBytes !== undefined &&
+        reading.retained !== undefined &&
+        reading.retainedBytes !== reading.retained) ||
+      reading.arrayBuffers > reading.external
+    )
+      return 'resident-size arithmetic'
+    if (settled) {
+      const gc = reading.gc
+      if (
+        !Number.isFinite(gc?.admittedAt) ||
+        gc.completedAt !== reading.at ||
+        gc.admittedAt > gc.completedAt ||
+        !Number.isSafeInteger(gc.observed) ||
+        gc.observed < 2
+      )
+        return 'resident-size collection facts'
+    }
+    return null
+  }
+
+  /**
+   * Judges the resident-size gates against the worker's own disabled control, over every reading
+   * of the versioned catalogue and the native work journal. Failures are pushed into `violations`;
+   * what only makes the measurement uninformative is returned.
+   * @param {object} reference the replayable reference facts
+   * @param {object} run `baseline`, `samples`, `teardown`, `violations` to append to and `measured`
+   * @returns {string[]} the reasons the measurement is inconclusive
+   */
+  static reference(reference, { baseline, samples, teardown, violations, measured }) {
+    const inconclusive = []
+    const fail = (condition, label) => {
+      if (!condition) violations.push(label)
+    }
+    if (reference?.version !== 'rss-reference-2') {
+      violations.push('resident-size reference facts')
+      return inconclusive
+    }
+    fail(
+      reference.source === 'proc-status-vmhwm' && reference.units === 'bytes',
+      'resident-size peak source'
+    )
+    if (reference.capability?.gc !== true || reference.capability?.peak !== true)
+      inconclusive.push('collection or peak capability')
+    const control = reference.control
+    const catalogue = [
+      [reference.startup, 'startup', false],
+      [reference.loaded, 'loaded', false],
+      [control?.c0, 'c0', true],
+      [control?.c1, 'c1', true],
+      [control?.released, 'control-released', true],
+      [baseline?.memory, 'settled', true],
+      ...samples.map((s) => [s.snapshot?.memory, 'settled', true]),
+      [teardown?.memory, 'settled', true],
+      [reference.final, 'final', false],
+    ]
+    const problems = catalogue
+      .map(([reading, phase, settled]) =>
+        TelemetryResourceVerdict.malformed(reading, phase, settled && reference.capability?.gc)
+      )
+      .filter(Boolean)
+    for (const problem of new Set(problems)) violations.push(problem)
+    if (problems.length) return inconclusive
+    const readings = catalogue.map(([reading]) => reading)
+    fail(
+      readings.every((r, i) => i === 0 || r.at >= readings[i - 1].at),
+      'resident-size reading order'
+    )
+    const native = reference.native
+    const rows = native?.journal?.rows
+    const nativeReadings = Array.isArray(rows)
+      ? rows.flatMap((row) => [row.submitted, row.settled])
+      : []
+    fail(
+      Array.isArray(rows) &&
+        native.journal.overflow === false &&
+        native.journal.live === 0 &&
+        rows.every((row) => ['resolved', 'rejected'].includes(row.outcome)) &&
+        nativeReadings.every(
+          (r) => Number.isSafeInteger(r?.rss) && r.rss >= 0 && Number.isSafeInteger(r.external)
+        ) &&
+        Number.isSafeInteger(native.sampler?.count) &&
+        native.sampler.count >= 2 * rows.length &&
+        Number.isSafeInteger(native.sampler.peak?.rss) &&
+        Number.isSafeInteger(native.sampler.peak?.external),
+      'native work journal'
+    )
+    if (readings.some((r) => r.hwm === null)) {
+      inconclusive.push('resident-size peak capability')
+    } else {
+      let high = -Infinity
+      let covered = -Infinity
+      for (const reading of readings) {
+        covered = Math.max(covered, reading.rss)
+        fail(reading.hwm >= high && reading.hwm >= covered, 'resident-size peak series')
+        high = Math.max(high, reading.hwm)
+      }
+    }
+    fail(
+      control.telemetryFrames === 0 &&
+        control.openSockets === 0 &&
+        control.leftoverHandles === 0 &&
+        Array.isArray(control.manifest?.operations) &&
+        Array.isArray(control.outcomes) &&
+        control.outcomes.length === control.manifest.operations.length &&
+        control.outcomes.every((o, n) => o.n === n && o.status === 'fulfilled'),
+      'telemetry-disabled control'
+    )
+    fail(
+      Array.isArray(reference.foreground) &&
+        reference.foreground.length === control.manifest?.operations?.length &&
+        reference.foreground.every((o, n) => o.n === n && o.status === 'fulfilled'),
+      'enabled replay of the control catalogue'
+    )
+    const rssDrift = Math.abs(control.c1.rss - control.c0.rss)
+    const retainedDrift = Math.abs(control.c1.retained - control.c0.retained)
+    if (
+      rssDrift > TELEMETRY.controlRssDriftBytes ||
+      retainedDrift > TELEMETRY.controlRetainedDriftBytes
+    )
+      inconclusive.push('unstable control')
+    const peakOf = (list) => Math.max(...list.flatMap((r) => [r.hwm ?? 0, r.rss]))
+    const setupPeak = peakOf(readings.slice(0, 5))
+    if (setupPeak > TELEMETRY.setupPeakBytes) inconclusive.push('setup peak above its allowance')
+    const base = Math.min(control.c0.rss, control.c1.rss)
+    const externalReference = Math.min(control.c0.external, control.c1.external)
+    const sampled = native?.sampler?.peak ?? { rss: 0, external: 0 }
+    const peak = Math.max(
+      peakOf(readings),
+      ...nativeReadings.map((r) => r?.rss ?? 0),
+      sampled.rss ?? 0
+    )
+    const externalPeak = Math.max(
+      ...readings.map((r) => r.external),
+      ...nativeReadings.map((r) => r?.external ?? 0),
+      sampled.external ?? 0
+    )
+    Object.assign(measured, {
+      controlBaseRss: base,
+      controlExternal: externalReference,
+      setupPeak,
+      peak,
+      rssDelta: peak - base,
+      externalPeak,
+      externalDelta: externalPeak - externalReference,
+      nativeJobs: Array.isArray(rows) ? rows.length : null,
+    })
+    fail(peak - base <= TELEMETRY.rssDeltaBytes, 'telemetry resident-size increase')
+    fail(peak <= TELEMETRY.peakBytes, 'absolute resident-size peak')
+    fail(
+      externalPeak - externalReference <= TELEMETRY.externalDeltaBytes,
+      'external-memory increase'
+    )
+    for (const [name, host] of Object.entries(reference.host ?? {})) {
+      const finite = (value) => Number.isFinite(value) && value >= 0
+      const known = finite(host?.cpus) && finite(host?.load1) && finite(host?.freeBytes)
+      fail(known, `host context ${name}`)
+      if (
+        known &&
+        (host.load1 / host.cpus > TELEMETRY.noiseLoadPerCpu ||
+          host.freeBytes < TELEMETRY.noiseFreeBytes ||
+          (host.pressure?.available && host.pressure.someAvg10 > TELEMETRY.noisePressure))
+      )
+        inconclusive.push(`host noise ${name}`)
+    }
+    fail(
+      ['before', 'boundary', 'after'].every((name) => reference.host?.[name]),
+      'host contexts'
+    )
+    return inconclusive
+  }
 }
 
 const USAGE = `usage: node --expose-gc scripts/soak/soak.js --profile <${Object.keys(PROFILES).join('|')}> [--phase-seconds <n>]`
@@ -236,7 +631,7 @@ const USAGE = `usage: node --expose-gc scripts/soak/soak.js --profile <${Object.
  * @returns {{ profile: string, phaseSeconds: number|null }} `phaseSeconds` shortens every phase to
  *   that long, for a smoke run that checks the driver and proves nothing about memory
  * @throws {Error} the usage line, for a missing or unknown profile or any other argument, and for
- *   `--phase-seconds` with a share profile, whose phases and cycles are fixed
+ *   `--phase-seconds` with a share or telemetry profile, whose phases and cycles are fixed
  */
 const parseArgs = (argv) => {
   const [flag, profile, ...rest] = argv
@@ -247,7 +642,7 @@ const parseArgs = (argv) => {
     Boolean(PROFILES[profile]) &&
     rest.length === (shortened ? 2 : 0) &&
     (!shortened || (Number.isInteger(phaseSeconds) && phaseSeconds >= 1)) &&
-    !(shortened && profile.startsWith('share-consumer'))
+    !(shortened && (profile.startsWith('share-consumer') || profile === 'telemetry'))
 
   if (!valid) {
     throw new Error(USAGE)
@@ -317,6 +712,11 @@ const privateOf = (kafka, name) => {
  *   also enables per-emitter socket/queue names without changing ordinary listeners.
  * @param {Function} [readings.shareState] the actual share session, record and range counts; a
  *   reading is absent without it
+ * @param {boolean} [readings.publicOnly=false] read no private member of the client: no request
+ *   queue, ledger or obligation reading is taken, and those fields are omitted, never zero
+ * @param {() => Record<string, Iterable<object|Function>>} [readings.identities] owned process
+ *   resources by role, added to the open sockets and their listeners by event
+ * @param {boolean} [readings.memory=false] settled heap plus external and RSS after two collections
  * @returns {{ kafka: object, probe: { snapshot: () => Promise<object> },
  *   socketFactory: Function, listeners: () => Record<string, Record<string, number>> }}
  *   `socketFactory` is the counted factory the client was given: a connection made through it,
@@ -325,7 +725,15 @@ const privateOf = (kafka, name) => {
  */
 const instrument = (
   { socketFactory = defaultSocketFactory(), ...options },
-  { activeResources = true, socketIdentities = false, shareState, originalQueues } = {}
+  {
+    activeResources = true,
+    socketIdentities = false,
+    shareState,
+    originalQueues,
+    publicOnly = false,
+    identities: ownedIdentities,
+    memory = false,
+  } = {}
 ) => {
   const open = new Set()
   const originalSockets = []
@@ -344,13 +752,16 @@ const instrument = (
   }
   const kafka = new Kafka({ ...options, socketFactory: counted })
 
-  const { symbol, value: createCluster } = privateOf(kafka, 'createCluster')
-  kafka[symbol] = (...args) => {
-    const cluster = createCluster(...args)
-    clusters.add(new WeakRef(cluster))
-    return cluster
+  let operations = null
+  if (!publicOnly) {
+    const { symbol, value: createCluster } = privateOf(kafka, 'createCluster')
+    kafka[symbol] = (...args) => {
+      const cluster = createCluster(...args)
+      clusters.add(new WeakRef(cluster))
+      return cluster
+    }
+    operations = privateOf(kafka, 'operations').value
   }
-  const { value: operations } = privateOf(kafka, 'operations')
 
   const openSockets = () => {
     for (const socket of open) {
@@ -369,36 +780,65 @@ const instrument = (
   }
   const queues = () => [
     ...(originalQueues?.() ?? []),
-    ...liveClusters()
+    ...(publicOnly ? [] : liveClusters())
       .flatMap(({ brokerPool }) => [...Object.values(brokerPool.brokers), brokerPool.seedBroker])
       .filter(Boolean)
       .flatMap(({ connectionPool }) => connectionPool.pool.map(({ requestQueue }) => requestQueue)),
   ]
   const unique = (items) => [...new Set(items)]
 
+  /** Open sockets and their listeners by event, plus the caller's owned resources, by role. */
+  const publicIdentities = () => {
+    const roles = { sockets: openSockets() }
+    for (const socket of roles.sockets) {
+      if (!emitterIds.has(socket)) emitterIds.set(socket, ++nextEmitterId)
+      for (const event of socket.eventNames())
+        (roles[`listener:socket${emitterIds.get(socket)}:${String(event)}`] ??= []).push(
+          ...socket.rawListeners(event)
+        )
+    }
+    return { ...roles, ...(ownedIdentities?.() ?? {}) }
+  }
+  /** Lets the collection callback's timer be destroyed before identities are read. */
+  const settlingPause = async (ms) => {
+    await sleep(ms)
+    await new Promise((resolve) => setImmediate(resolve))
+    await new Promise((resolve) => setImmediate(resolve))
+  }
   const probe = createResourceProbe({
     emitters: {
-      get requestQueues() {
-        return together(unique(queues()))
-      },
+      ...(publicOnly
+        ? {}
+        : {
+            get requestQueues() {
+              return together(unique(queues()))
+            },
+          }),
       get sockets() {
         return together(openSockets())
       },
     },
     sockets: () => ({ created, destroyed: created - openSockets().length }),
-    queueDepth: () =>
-      unique(queues()).reduce(
-        (total, queue) => total + queue.pending.length + queue.inflight.size,
-        0
-      ),
-    ledgerSize: () => [...operations.values()].reduce((total, ledger) => total + ledger.size(), 0),
-    obligationSize: () =>
-      [...operations.values()]
-        .flatMap((ledger) => [...ledger.attached])
-        .reduce((total, obligations) => total + obligations.size(), 0),
+    ...(publicOnly
+      ? {}
+      : {
+          queueDepth: () =>
+            unique(queues()).reduce(
+              (total, queue) => total + queue.pending.length + queue.inflight.size,
+              0
+            ),
+          ledgerSize: () =>
+            [...operations.values()].reduce((total, ledger) => total + ledger.size(), 0),
+          obligationSize: () =>
+            [...operations.values()]
+              .flatMap((ledger) => [...ledger.attached])
+              .reduce((total, obligations) => total + obligations.size(), 0),
+        }),
     shareState,
     activeResources,
     heap: typeof globalThis.gc === 'function',
+    ...(publicOnly && memory ? { memory: true, pause: settlingPause } : {}),
+    ...(publicOnly ? { identities: publicIdentities } : {}),
   })
 
   if (identities) {
@@ -429,6 +869,7 @@ const instrument = (
       emitter.eventNames().map((name) => [String(name), emitter.listenerCount(name)])
     )
   const listeners = () => {
+    if (publicOnly) return { sockets: named(together(openSockets())) }
     if (!originalQueues) {
       return {
         requestQueues: named(together(unique(queues()))),
@@ -585,6 +1026,15 @@ class IdleSocketCheck {
  * disconnect never hides the failure of the workload, and does not stop the others.
  */
 const WORKLOADS = {
+  /**
+   * Runs the telemetry-only workload under its existing Soak owner.
+   * @param {WorkloadContext & { telemetryChurn: { work: (ms: number) => Promise<void> } }} context
+   *   worker ownership
+   * @param {number} ms fixed warm-up and measurement duration
+   * @returns {Promise<void>} settles after public cleanup; failures remain failures
+   * @throws {Error} for any phase or cleanup failure
+   */
+  telemetry: (context, ms) => context.telemetryChurn.work(ms),
   /**
    * Runs the next phase of the share soak through its owner, which keeps every client public and
    * disconnects them before it returns. The phase is the owner's own cursor, not an ambient member.
@@ -792,6 +1242,8 @@ const PARTITION_MAX_BYTES = 1048576
 
 /** @type {{ now: () => number }} the monotonic clock of a run; a spec supplies its own */
 const REAL_CLOCK = Object.freeze({ now: () => performance.now() })
+/** The default Soak clock; it looks `Date` up at each reading, as the sampler always did. */
+const WALL_CLOCK = Object.freeze({ now: () => Date.now() })
 
 /**
  * Connects one broker through `socketFactory`, with no client around it: no retry, no metadata
@@ -2122,6 +2574,9 @@ class Soak {
    * @param {Array<{ name: string, workload: keyof typeof WORKLOADS, ms: number }>} options.phases
    * @param {WorkloadContext} options.context handed to every workload
    * @param {number} [options.sampleMs=SAMPLE_MS]
+   * @param {number[]} [options.sampleAt] fixed admission times, in ms after each phase began; the
+   *   sampler waits for the next one instead of napping `sampleMs`, and a time already past when it
+   *   looks is skipped, never taken late in a burst
    * @param {number} [options.warmupMs=WARMUP_MS] how long the heap series is left to settle; for a
    *   `judge` that reads a phase on its own, how long into each phase
    * @param {(run: object) => { ok: boolean, violations: string[] }} [options.judge=evaluate] holds
@@ -2130,6 +2585,8 @@ class Soak {
    * @param {number} [options.settleMs=SETTLE_MS] how long a quiet point waits for closed sockets to go
    * @param {(record: object) => void} [options.record=writeEvidence('soak', ...)] where every line goes
    * @param {Record<string, Function>} [options.workloads=WORKLOADS]
+   * @param {{now: () => number}} [options.clock] defaults to the wall clock, read on every call so a
+   *   faked `Date` is honoured; telemetry uses monotonic elapsed time
    * @param {(work: Function, stage?: string) => Promise<*>} [options.transition] Bounds and charges
    *   matched quiet observations and sampler joins; ordinary profiles call through unchanged.
    * @param {() => Promise<void>} [options.beforeTeardown] runs once every phase has ended, before
@@ -2141,11 +2598,13 @@ class Soak {
     phases,
     context,
     sampleMs = SAMPLE_MS,
+    sampleAt = null,
     warmupMs = WARMUP_MS,
     judge = evaluate,
     settleMs = SETTLE_MS,
     record = (line) => writeEvidence('soak', line),
     workloads = WORKLOADS,
+    clock = WALL_CLOCK,
     beforeTeardown = async () => {},
     transition = (work) => work(),
   }) {
@@ -2155,18 +2614,26 @@ class Soak {
       phases,
       context,
       sampleMs,
+      sampleAt,
       warmupMs,
       judge,
       settleMs,
       record,
       workloads,
+      clock,
       beforeTeardown,
       transition,
     })
     this.samples = []
     this.phaseEnds = []
     this.sampling = false
+    this.sampler = Promise.resolve()
     this.wake = () => {}
+    /** When the latest phase began, on this Soak's clock; null before the first one. */
+    this.phaseStartedAt = null
+    /** Fixed sample times skipped because they were already past, and readings that failed late. */
+    this.skipped = []
+    this.readFailures = []
   }
 
   /**
@@ -2177,7 +2644,7 @@ class Soak {
    * @throws {Error} the failure of a workload, after its sampler is stopped
    */
   async run() {
-    const startedAt = Date.now()
+    const startedAt = this.clock.now()
     const baseline = await this.transition(async () => {
       await this.settle()
       const snapshot = await this.probe.snapshot()
@@ -2220,26 +2687,51 @@ class Soak {
    *   phase's workload has ended and its clients are disconnected
    */
   async runPhase({ name, workload, ms }, startedAt) {
-    const phaseStartedAt = Date.now()
+    const phaseStartedAt = this.clock.now()
+    this.phaseStartedAt = phaseStartedAt
     this.sampling = true
     const sampler = (async () => {
+      let planned = 0
       while (this.sampling) {
-        await this.nap()
+        let delayMs = this.sampleMs
+        if (this.sampleAt) {
+          const elapsed = this.clock.now() - phaseStartedAt
+          while (planned < this.sampleAt.length && this.sampleAt[planned] < elapsed) {
+            this.skipped.push(this.sampleAt[planned])
+            planned += 1
+          }
+          delayMs = planned < this.sampleAt.length ? this.sampleAt[planned] - elapsed : 2 ** 31 - 1
+        }
+        await this.nap(delayMs)
         if (this.sampling) {
-          const snapshot = await this.probe.snapshot()
-          const now = Date.now()
+          const admitted = this.clock.now()
+          let snapshot
+          try {
+            snapshot = await this.probe.snapshot()
+          } catch (error) {
+            this.readFailures.push({
+              admittedPhaseMs: admitted - phaseStartedAt,
+              message: String(error?.message ?? error),
+            })
+            throw error
+          }
+          const now = this.clock.now()
           const sample = {
             phase: name,
             atMs: now - startedAt,
             phaseMs: now - phaseStartedAt,
+            admittedAtMs: admitted - startedAt,
+            admittedPhaseMs: admitted - phaseStartedAt,
             snapshot,
           }
+          if (this.sampleAt) planned += 1
           this.samples.push(sample)
           this.record({ kind: 'sample', ...sample })
         }
       }
     })()
     sampler.catch(() => {})
+    this.sampler = sampler
 
     try {
       await this.workloads[workload](this.context, ms)
@@ -2258,13 +2750,26 @@ class Soak {
   }
 
   /**
+   * Stops the sampler of the running phase and joins it, so no later reading is admitted. A
+   * workload may call it at its measurement boundary, before its own cleanup; the phase then
+   * stops and joins the same sampler again when the workload ends.
+   * @returns {Promise<void>} settles once the sampler has stopped; a failed reading rejects
+   */
+  endSampling() {
+    this.sampling = false
+    this.wake()
+    return this.sampler
+  }
+
+  /**
    * Waits one sample interval, or until `wake()` ends the wait, and leaves no timer behind.
    * @private
+   * @param {number} [ms=this.sampleMs] how long to wait
    * @returns {Promise<void>}
    */
-  nap() {
+  nap(ms = this.sampleMs) {
     return new Promise((resolve) => {
-      const timer = setTimeout(resolve, this.sampleMs)
+      const timer = setTimeout(resolve, ms)
       this.wake = () => {
         clearTimeout(timer)
         resolve()
@@ -2278,8 +2783,8 @@ class Soak {
    * @returns {Promise<void>}
    */
   async settle() {
-    const deadline = Date.now() + this.settleMs
-    while (Date.now() < deadline && (await this.probe.snapshot()).sockets.open > 0) {
+    const deadline = this.clock.now() + this.settleMs
+    while (this.clock.now() < deadline && (await this.probe.snapshot()).sockets.open > 0) {
       await sleep(100)
     }
   }
@@ -6295,6 +6800,93 @@ const buildShareSoak = ({ brokers, short = false, record, run }) => {
 }
 
 /**
+ * Builds the owner of the telemetry profile. In the parent it holds the broker resource, the four
+ * supervised workers and the independent oracle; in a worker process (named by the development-only
+ * worker environment, with the parent's IPC channel) it is the one-client worker. Either way it
+ * reads no private member of the client and never starts a cluster.
+ * @param {object} options
+ * @param {string[]} options.brokers seed addresses
+ * @param {Array<{ name: string, workload: string, ms: number }>} options.phases exactly the fixed phase
+ * @param {(row: object) => void} [options.record] where the parent's rows go; `.tmp/e2e/telemetry-churn.jsonl`
+ *   by default, a live spec supplies its own sink
+ * @returns {{ run: () => Promise<{ ok: boolean }>, close: () => Promise<void> }}
+ * @throws {Error} without `--expose-gc`, for another phase list, an unconfigured broker line or
+ *   evidence directory, and for a worker without its kind or IPC channel
+ */
+const buildTelemetryChurn = ({
+  brokers: requested,
+  phases,
+  record = (row) => writeEvidence('telemetry-churn', row),
+}) => {
+  if (typeof globalThis.gc !== 'function')
+    throw new Error(
+      'The telemetry profile reads memory after a collection: run node with --expose-gc'
+    )
+  if (JSON.stringify(phases) !== JSON.stringify(PROFILES.telemetry))
+    throw new Error('The telemetry profile runs its one fixed phase')
+  const churn = require('./telemetryChurn')
+  const kind = process.env[churn.WORKER_ENV]
+  if (kind !== undefined) {
+    if (!churn.KINDS.includes(kind) || typeof process.send !== 'function')
+      throw new Error('A telemetry worker needs its kind and its parent channel')
+    const worker = new churn.TelemetryWorkerProcess({
+      kind,
+      soak: {
+        Soak,
+        WORKLOADS,
+        PROFILES,
+        instrument,
+        TELEMETRY,
+        TelemetryResourceVerdict,
+        logLevel,
+        Kafka,
+        startup: STARTUP,
+        socketFactory: defaultSocketFactory(),
+      },
+    })
+    return { run: () => worker.run(), close: async () => {} }
+  }
+  const line = process.env.KAFKA_VERSION
+  const directory = process.env.TELEMETRY_EVIDENCE_DIR ?? ''
+  if (
+    !['4.3.1', '4.2.2'].includes(line) ||
+    process.env.COMPOSE_FILE !== 'docker-compose.telemetry.yml' ||
+    !process.env.COMPOSE_PROJECT_NAME ||
+    !path.isAbsolute(directory) ||
+    !process.env.TELEMETRY_JAVA_CACHE
+  )
+    throw new Error(
+      'The telemetry profile needs the configured broker line, the telemetry compose file, its project, an absolute evidence directory and the independent decoder cache'
+    )
+  const brokers =
+    JSON.stringify(requested) === JSON.stringify(DEFAULT_BROKERS) ? TELEMETRY_BROKERS : requested
+  const { withTelemetryResource } = require('../../testHelpers/telemetryFixtures')
+  const stem = `telemetry-churn-${Date.now().toString(36)}`
+  const kafka = new Kafka({ clientId: `parent-${stem}`, brokers, logLevel: logLevel.NOTHING })
+  const clock = { now: () => performance.now() }
+  return new churn.TelemetryChurn({
+    fixture: new churn.ParentFixture({
+      brokers,
+      stem,
+      kafka,
+      readLog,
+      withResource: withTelemetryResource,
+      clock,
+    }),
+    processes: new churn.TelemetryProcesses({ script: __filename }),
+    decoder: new churn.DecoderCoordinator({ directory, line, clock }),
+    record,
+    clock,
+    limits: TELEMETRY,
+    verdict: (input) => TelemetryResourceVerdict.evaluate(input),
+    brokers,
+    stem,
+    line,
+    directory,
+  })
+}
+
+/**
  * Runs a profile against the cluster `brokers` names.
  * @param {string} profile a key of `PROFILES`
  * @param {object} [options]
@@ -6308,6 +6900,8 @@ const buildShareSoak = ({ brokers, short = false, record, run }) => {
  *   builds the owner of the `consumer-churn` profile
  * @param {(options: object) => { run: () => Promise<{ ok: boolean }>, close: () => Promise<void> }} [options.shareSoak=buildShareSoak]
  *   builds the owner of both share-consumer profiles
+ * @param {(options: object) => { run: () => Promise<{ ok: boolean }>, close: () => Promise<void> }} [options.telemetry=buildTelemetryChurn]
+ *   builds the owner of the `telemetry` profile
  * @returns {Promise<{ ok: boolean }>} the verdict: `evaluate`'s for a consumer profile, the
  *   combined verdict of `ProducerChurn` for `producer-churn`, that of `ShareSoak` for a share
  *   profile
@@ -6317,11 +6911,12 @@ const buildShareSoak = ({ brokers, short = false, record, run }) => {
 const main = async (
   profile,
   {
-    brokers = ['localhost:9092', 'localhost:9095', 'localhost:9098'],
+    brokers = [...DEFAULT_BROKERS],
     phaseSeconds = null,
     churn = buildProducerChurn,
     consumerChurn = buildConsumerChurn,
     shareSoak = buildShareSoak,
+    telemetry = buildTelemetryChurn,
   } = {}
 ) => {
   if (typeof globalThis.gc !== 'function') {
@@ -6339,6 +6934,24 @@ const main = async (
   }
 
   const phases = phasesOf(profile, phaseSeconds)
+  if (profile === 'telemetry') {
+    const owner = telemetry({ brokers, phases })
+    let outcome
+    try {
+      outcome = { ok: true, value: await owner.run() }
+    } catch (error) {
+      outcome = { ok: false, error }
+    }
+    try {
+      await owner.close()
+    } catch (error) {
+      if (!outcome.ok) throw new AggregateError([outcome.error, error], 'Telemetry cleanup failed')
+      throw error
+    }
+    if (!outcome.ok) throw outcome.error
+    return outcome.value
+  }
+
   if (profile === 'producer-churn') {
     const owner = churn({ brokers, phaseSeconds, phases })
     try {
@@ -6426,9 +7039,12 @@ if (require.main === module) {
 
 module.exports = {
   CHURN,
+  TELEMETRY,
+  TelemetryResourceVerdict,
   ConsumerChurnOracle,
   buildConsumerChurn,
   buildProducerChurn,
+  buildTelemetryChurn,
   forgettingDestroyed,
   PROFILES,
   SHARE_SOAK,

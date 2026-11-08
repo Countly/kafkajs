@@ -292,6 +292,14 @@ describe('telemetry lifecycle documentation', () => {
       'do not change foreground results, rejections or handler invocation counts'
     )
   })
+  test('testing documents the segmented close-and-reopen evidence', () => {
+    const text = read('docs/Testing.md')
+    expect(text).toContain('`segmented-1`')
+    expect(text).toContain('88 in all')
+    expect(text).toContain('#### Close and reopen (`telemetry-shutdown`)')
+    expect(text).toContain('no checkpoint, read or await in between')
+    expect(read('scripts/e2e/telemetry/README.md')).toContain('## Segmented evidence')
+  })
   test('creator changelog is present', () => {
     expect(read('CHANGELOG.md')).toContain(
       'Add deterministic lifecycle, shutdown and observer-failure schedules for client telemetry.'
@@ -376,5 +384,68 @@ describe('configured telemetry evidence documentation', () => {
       'Verify client telemetry updates, custom metrics, payload limits, Java interoperability, unsupported brokers and unchanged foreground outcomes.'
     )
     expect(squeeze('docs/ClientTelemetry.md')).toContain('Telemetry remains disabled')
+  })
+})
+
+describe('telemetry resource documentation', () => {
+  const squeeze = (file) => read(file).replace(/\s+/g, ' ')
+  const testing = squeeze('docs/Testing.md')
+  const telemetry = squeeze('docs/ClientTelemetry.md')
+
+  test('keeps the exact telemetry profile and inherited runner selections', () => {
+    const { scripts } = pkg
+    expect(scripts['soak:telemetry']).toBe(
+      'node --expose-gc scripts/soak/soak.js --profile telemetry'
+    )
+    expect(scripts['soak:producer-churn']).toBeDefined()
+    expect(scripts['test:group:telemetry-soak']).toContain("--testNamePattern '^telemetry churn$'")
+    for (const name of ['shutdown', 'soak']) {
+      const command = scripts['test:e2e:telemetry-' + name]
+      expect(command).toContain('P9_CLUSTER_GUARD')
+      expect(command).toContain('tv2 TELEMETRY_E2E src/telemetry/__tests__/shutdownLive.spec.js')
+      expect(command).not.toMatch(/test:kafka|forceExit/)
+    }
+  })
+
+  test('documents per-client memory and natural exit without claiming measured passes', () => {
+    expect(telemetry).toContain('## Resource bounds and natural shutdown')
+    expect(testing).toContain('### Telemetry resource and churn evidence')
+    for (const value of ['64 KiB/min', '1 MiB', '8 MiB', '256 KiB', '64 MiB'])
+      expect(telemetry).toContain(value)
+    expect(telemetry).toContain('not measured results from a unit test')
+    expect(telemetry).toContain('one occupied shell')
+    expect(testing).toContain('arrayBuffers is already included in external')
+    expect(testing).toContain('Four one-client workers prevent memory averaging')
+  })
+
+  test('documents the control-relative memory gates and the recorded evidence', () => {
+    expect(testing).toContain('resourceArtifact.js')
+    expect(testing).toContain('resources-<arm>-<kind>.json')
+    expect(testing).toContain('collector only resource memory for')
+    expect(testing).toContain('telemetry-disabled control')
+    expect(testing).toContain('/proc/self/status')
+    expect(testing).toContain('bounded capture controls')
+    expect(testing).not.toMatch(/absolute lifetime peak RSS at most 64 MiB/)
+    expect(telemetry).toContain('refused before either selection array is built')
+    expect(telemetry).toContain('64 MiB above')
+  })
+
+  test('documents the churn method and the CI rows', () => {
+    expect(testing).toContain('### Telemetry churn (`telemetry churn`)')
+    expect(testing).toContain('selected by a rule over the transcript alone')
+    expect(testing).toContain('eleven distinct Node 24 rows')
+    expect(testing).toContain('required exit catalogue has 75 rows')
+    expect(telemetry).toContain('35 subscription transitions')
+  })
+
+  test('retains the long-run obligation and the changelog lines', () => {
+    expect(telemetry).toContain('final 24-hour idle/churn obligation')
+    expect(testing).toContain('never closes the final 24-hour idle/churn gate')
+    const changelog = read('CHANGELOG.md').replace(/\s+/g, ' ')
+    expect(changelog).toContain(
+      'Verify bounded telemetry resources, repeated reopen and natural shutdown under subscription and connection churn.'
+    )
+    expect(changelog).toContain('resourceArtifact.js')
+    expect(changelog).toContain('parent-coordinated, segmented run')
   })
 })
