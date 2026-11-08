@@ -3586,6 +3586,78 @@ describe('Share soak owner', () => {
     }
   })
 
+  test('archives timer attribution but retains only the share screen inputs in sample history', async () => {
+    const { ShareTimerObserver } = require('../shareTimerObserver')
+    const observer = new ShareTimerObserver()
+    const driver = scripted({
+      cycle: async (plan, _scope, { clock, due }) => {
+        await new Promise((resolve) => setTimeout(resolve, 8))
+        return cycleFacts(plan.cycle, { startedAt: clock.now(), due })
+      },
+    })
+    const { owner, rows, shares } = build({ driver, soak: { sampleMs: 1 } })
+    observer.install()
+    const timer = setTimeout(() => {}, 60000)
+    let reading = 0
+    shares.snapshot = async () => ({
+      ...quietShare(),
+      heapUsed: 10000000 + reading++ * 1048576,
+      shareRecords: 301,
+      shareRanges: 7,
+      shareSessions: 2,
+      timerOwners: {
+        beforeCollection: observer.snapshot(),
+        afterCollection: observer.snapshot(),
+      },
+    })
+    const soak = owner.soak()
+    owner.soak = () => soak
+    try {
+      await owner.run()
+      const archived = rows.filter(({ kind }) => kind === 'sample')
+      expect(archived.length).toBeGreaterThanOrEqual(6)
+      expect(soak.samples).toHaveLength(archived.length)
+      for (const [i, sample] of soak.samples.entries()) {
+        expect(sample).toEqual({
+          phase: archived[i].phase,
+          atMs: archived[i].atMs,
+          phaseMs: archived[i].phaseMs,
+          snapshot: {
+            heapUsed: archived[i].snapshot.heapUsed,
+            shareRecords: 301,
+            shareRanges: 7,
+            shareSessions: 2,
+          },
+        })
+        expect(archived[i].snapshot.timerOwners.beforeCollection.rows).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              type: 'Timeout',
+              durationMs: 60000,
+              stack: expect.stringContaining('soak.spec.js'),
+            }),
+          ])
+        )
+      }
+      for (const { phase } of soak.phaseEnds) {
+        const fullViolations = []
+        const retainedViolations = []
+        const run = { samples: archived, warmupMs: 0 }
+        expect(
+          ShareSoakScreen.phase(phase, { ...run, samples: soak.samples }, retainedViolations)
+        ).toEqual(ShareSoakScreen.phase(phase, run, fullViolations))
+        expect(retainedViolations).toEqual(fullViolations)
+        expect(retainedViolations).toContain(`${phase}: held-record ceiling`)
+        expect(retainedViolations).toContain(`${phase}: retained-heap screen`)
+      }
+      expect(soak.phaseEnds[0].snapshot.timerOwners.beforeCollection.rows.length).toBeGreaterThan(0)
+    } finally {
+      clearTimeout(timer)
+      observer.restore()
+      await owner.close()
+    }
+  })
+
   test('judges the run with the per-phase screen by default', () => {
     const { owner } = build()
     owner.soakOptions = {}
