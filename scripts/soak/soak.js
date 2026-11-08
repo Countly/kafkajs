@@ -61,6 +61,7 @@ const { createChaosSocketFactory } = require('../../testHelpers/chaosSocket')
 const { assertProbe } = require('../../testHelpers/producerProbe')
 const { endOffsets, readLog } = require('../../testHelpers/rawLog')
 const { createResourceProbe } = require('../../testHelpers/resourceProbe')
+const { ShareTimerObserver } = require('./shareTimerObserver')
 const { evidenceLines, evidencePath, writeEvidence } = require('../../testHelpers/e2eEvidence')
 const { NEVER, bounded, delay } = require('../../src/producer/__tests__/fixtures/bounded')
 const {
@@ -312,20 +313,28 @@ const privateOf = (kafka, name) => {
  * @param {object} [readings]
  * @param {boolean} [readings.activeResources=true] count the event loop's resources by type; a run
  *   that shares its process with others, as a spec does, leaves it off
+ * @param {boolean} [readings.heap] collect before reading heap; defaults to whether GC is exposed
  * @param {boolean} [readings.socketIdentities=false] attach creation IDs and endpoint inventory
  * @param {() => object[]} [readings.originalQueues] Live original queues, including detached owners;
  *   also enables per-emitter socket/queue names without changing ordinary listeners.
  * @param {Function} [readings.shareState] the actual share session, record and range counts; a
  *   reading is absent without it
  * @returns {{ kafka: object, probe: { snapshot: () => Promise<object> },
- *   socketFactory: Function, listeners: () => Record<string, Record<string, number>> }}
+ *   socketFactory: Function, pruneSockets: () => void,
+ *   listeners: () => Record<string, Record<string, number>> }}
  *   `socketFactory` is the counted factory the client was given: a connection made through it,
  *   such as a raw reader's, is measured like the client's own. `listeners` names the listeners of
  *   each tracked emitter by event, so a swapped listener shows where a total would not.
  */
 const instrument = (
   { socketFactory = defaultSocketFactory(), ...options },
-  { activeResources = true, socketIdentities = false, shareState, originalQueues } = {}
+  {
+    activeResources = true,
+    socketIdentities = false,
+    shareState,
+    originalQueues,
+    heap = typeof globalThis.gc === 'function',
+  } = {}
 ) => {
   const open = new Set()
   const originalSockets = []
@@ -398,19 +407,8 @@ const instrument = (
         .reduce((total, obligations) => total + obligations.size(), 0),
     shareState,
     activeResources,
-    heap: typeof globalThis.gc === 'function',
+    heap,
   })
-
-  if (originalQueues) {
-    const snapshot = probe.snapshot.bind(probe)
-    /** Releases destroyed sockets before collection without dereferencing weak owners.
-     * @returns {Promise<object>} the settled resource reading
-     */
-    probe.snapshot = () => {
-      openSockets()
-      return snapshot()
-    }
-  }
 
   if (identities) {
     const snapshot = probe.snapshot.bind(probe)
@@ -462,7 +460,14 @@ const instrument = (
     )
   }
 
-  return { kafka, probe, socketFactory: counted, listeners }
+  /** Releases destroyed sockets without reading weak owners.
+   * @returns {void}
+   */
+  const pruneSockets = () => {
+    openSockets()
+  }
+
+  return { kafka, probe, socketFactory: counted, listeners, pruneSockets }
 }
 
 /**
@@ -2520,6 +2525,8 @@ class ShareSoakScreen {
       !ShareSoakScreen.count(point.sockets?.open) ||
       point.sockets.open !== 0 ||
       !ShareSoakScreen.same(point.activeResources, baseline?.activeResources) ||
+      !ShareSoakScreen.same(point.activeResourcesBeforeCollection, baseline?.activeResources) ||
+      Object.values(point.timerOwners ?? {}).some(({ dropped }) => dropped !== 0) ||
       !ShareSoakScreen.same(point.namedListeners, baseline?.namedListeners)
     ) {
       violations.push(`${label}: resources differ or a source is absent`)
@@ -2532,8 +2539,13 @@ class ShareSoakScreen {
           report(name, baseline?.[name], point?.[name])
       if (!ShareSoakScreen.count(point?.sockets?.open) || point.sockets.open !== 0)
         report('sockets.open', baseline?.sockets?.open, point?.sockets?.open)
-      for (const source of ['activeResources', 'namedListeners']) {
-        const before = baseline?.[source]
+      for (const source of [
+        'activeResources',
+        'activeResourcesBeforeCollection',
+        'namedListeners',
+      ]) {
+        const before =
+          baseline?.[source === 'activeResourcesBeforeCollection' ? 'activeResources' : source]
         const after = point?.[source]
         if (!before || !after) report(source, before, after)
         else
@@ -2545,6 +2557,8 @@ class ShareSoakScreen {
             )
               report(`${source}.${name}`, before[name] ?? 0, after[name] ?? 0)
       }
+      for (const [when, owners] of Object.entries(point?.timerOwners ?? {}))
+        if (owners.dropped !== 0) report(`timerOwners.${when}.dropped`, 0, owners.dropped)
     }
   }
 
@@ -2843,36 +2857,69 @@ class ShareStateObserver {
  * original owners.
  * @param {object} options `Kafka` options, as for `instrument`
  * @param {object} [readings] as for `instrument`
+ * @param {Function} [readings.gc=globalThis.gc] collection for share-only settled observations
+ * @param {Function} [readings.pause] the collection gap; defaults to the real sleep
  * @returns {ReturnType<typeof instrument> & { shareResources: { track: (client: object) => object,
  *   snapshot: () => Promise<object>, restore: () => void } }} `snapshot` adds the tracked client
  *   count and the flattened named listeners to the probe's reading; `restore` removes the observer
  * @throws {Error} when a source of the share counts is missing
  */
-const instrumentShare = (options, readings = {}) => {
+const instrumentShare = (options, { gc = globalThis.gc, pause, ...readings } = {}) => {
   const observer = new ShareStateObserver()
-  observer.install()
+  const timers = new ShareTimerObserver()
   try {
+    timers.install()
+    observer.install()
     const instrumented = instrument(options, {
       ...readings,
+      heap: false,
       originalQueues: () => observer.live(observer.queues),
       shareState: () => observer.counts(),
     })
+    const resources = createResourceProbe({ activeResources: readings.activeResources ?? true })
+    const heap = createResourceProbe({ heap: typeof gc === 'function', gc, pause })
     const shareResources = {
       track: (client) => observer.track(client),
       snapshot: async () => {
-        const snapshot = await instrumented.probe.snapshot()
+        // Prune without dereferencing weak owners; all owner readings belong after collection.
+        instrumented.pruneSockets()
+        const before = resources.snapshot()
+        const beforeOwners = timers.snapshot()
+        const { activeResources: activeResourcesBeforeCollection } = await before
+        const settled = await heap.snapshot()
+        // These synchronous reads share one observation point, including identities and endpoints.
+        const reading = instrumented.probe.snapshot()
         const namedListeners = {
           ...flattenListeners(instrumented.listeners()),
           ...observer.named(),
         }
         const shareClients = observer.tracked.size
-        return { ...snapshot, shareClients, namedListeners }
+        const afterOwners = timers.snapshot()
+        const snapshot = await reading
+        return {
+          ...settled,
+          ...snapshot,
+          shareClients,
+          namedListeners,
+          activeResourcesBeforeCollection,
+          timerOwners: {
+            beforeCollection: ShareTimerObserver.evidence(
+              beforeOwners,
+              activeResourcesBeforeCollection
+            ),
+            afterCollection: ShareTimerObserver.evidence(afterOwners, snapshot.activeResources),
+          },
+        }
       },
-      restore: () => observer.restore(),
+      restore: () => {
+        timers.restore()
+        observer.restore()
+      },
     }
 
     return { ...instrumented, shareResources }
   } catch (error) {
+    timers.restore()
     observer.restore()
     throw error
   }
