@@ -70,6 +70,19 @@ describe('ProcessMemory', () => {
 
   afterEach(() => instances.splice(0).forEach((memory) => memory.stop()))
 
+  test('freezes application imports at the loaded boundary and preserves later module names', () => {
+    const files = ['probe.js']
+    const { memory } = meter({ modules: () => [...files] })
+    expect(memory.mark('startup').imports).toBeNull()
+    files.push('client.js')
+    memory.mark('loaded')
+    expect(memory.mark('control:start').imports).toEqual({ count: 2, late: [] })
+    files.push('lazy-wire.js')
+    expect(memory.mark('control:c0').imports).toEqual({ count: 3, late: ['lazy-wire.js'] })
+    expect(memory.mark('final').imports).toEqual({ count: 3, late: ['lazy-wire.js'] })
+    expect(memory.mark('loaded').imports.late).toEqual(['lazy-wire.js'])
+  })
+
   test('reads heap, external and RSS, and never adds the array buffers to the external bytes', () => {
     const { memory } = meter()
 
@@ -100,6 +113,7 @@ describe('ProcessMemory', () => {
       maxRss: 9999,
       covered: 300,
       coveredExternal: 40,
+      imports: null,
     })
     expect(memory.mark('second')).toMatchObject({
       phase: 'second',

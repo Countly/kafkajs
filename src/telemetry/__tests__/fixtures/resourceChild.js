@@ -41,24 +41,13 @@ const { phaseCatalogue } = require(
 const TelemetryPayload = require('../../payload')
 const gzipModule = require('../../../protocol/message/compression/gzip')
 const zstd = require('../../../protocol/message/compression/zstd')
-const { maximum } = require('./maximum')
+const { maximum, bindNodes } = require('./maximum')
 
 const loaded = { ...memory.current(), modules: process.moduleLoadList.length }
 memory.mark('loaded')
 
 /** @type {import('./memoryForeground').MemoryForeground[]} the clients a failed run still has to close */
 const live = []
-
-/**
- * @param {object} metrics the collector @returns {void} binds 64 node pairs with one observation each
- */
-const bindNodes = (metrics) => {
-  for (let nodeId = 0; nodeId < 64; nodeId++)
-    metrics.observeRequest(
-      metrics.bindNode({ nodeId, endpoint: `b${nodeId}:9092`, endpointRevision: {} }),
-      nodeId
-    )
-}
 
 /**
  * Builds the readings of one kind.
@@ -118,12 +107,13 @@ const measure = async (kind) => {
     memory.mark('collector:start')
     const { metrics, subscription, slots } = maximum(kind)
     slots.forEach((slot) => metrics.retireNode(slot))
+    slots.length = 0
     metrics.resetTransient()
     const matched = await settled()
     memory.mark('collector:matched')
     const builder = new TelemetryPayload(1n)
-    bindNodes(metrics)
-    let snapshot = metrics.snapshot(subscription)
+    const active = bindNodes(metrics, subscription)
+    let snapshot = metrics.snapshot(active)
     const builds = []
     const actives = []
     for (const codec of codecs) {

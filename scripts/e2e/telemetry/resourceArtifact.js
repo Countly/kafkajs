@@ -29,7 +29,7 @@ const { StringDecoder } = require('node:string_decoder')
 const { compareSnapshots } = require('../../../testHelpers/resourceProbe')
 
 /** The version of the recorded shape; an older artifact is not evidence for the current gate. */
-const SCHEMA = 3
+const SCHEMA = 4
 
 const KINDS = Object.freeze(['producer', 'consumer', 'admin', 'shareConsumer'])
 const ARMS = Object.freeze(['public', 'collector'])
@@ -451,6 +451,7 @@ class MemoryArmJudge {
       return
     }
     if (!this.structure()) return
+    this.imports()
     const peaks = this.peaks()
     const admitted = this.control(peaks)
     this.limits(peaks, admitted)
@@ -547,6 +548,33 @@ class MemoryArmJudge {
         return Math.max(previous, reading.at)
       }, 0)
     return this.failures.length === before
+  }
+
+  /**
+   * @returns {void} rejects missing module facts and keeps late imports inconclusive; their heap
+   *   cost cannot be attributed to telemetry or removed from an observed limit violation
+   */
+  imports() {
+    const { marks } = this.readings
+    const loaded = marks.find((mark) => mark.phase === 'loaded')?.imports
+    if (!count(loaded?.count) || loaded.count === 0 || !same(loaded.late, [])) {
+      this.fail('loaded module population is incomplete')
+      return
+    }
+    for (const mark of marks.slice(2)) {
+      const imports = mark.imports
+      if (
+        !count(imports?.count) ||
+        !Array.isArray(imports.late) ||
+        imports.late.some((file) => typeof file !== 'string' || file.length === 0) ||
+        new Set(imports.late).size !== imports.late.length
+      ) {
+        this.fail('module population facts are incomplete')
+        continue
+      }
+      if (imports.count !== loaded.count || imports.late.length)
+        this.wait('modules loaded after the disabled reference')
+    }
   }
 
   /**

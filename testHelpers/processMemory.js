@@ -98,6 +98,7 @@ class ProcessMemory {
    * @param {(() => void)|undefined} [sources.gc] a full collection; defaults to `globalThis.gc`
    * @param {() => object} [sources.usage] `process.memoryUsage`
    * @param {() => number} [sources.maxRss] raw lifetime `maxRSS` in bytes
+   * @param {() => string[]} [sources.modules] loaded CommonJS module filenames
    * @param {() => number} [sources.now] monotonic milliseconds
    * @param {(ms: number) => Promise<void>} [sources.sleep] the pause between collections
    * @param {() => Promise<void>} [sources.settleTurn] one turn after the second collection, in
@@ -110,10 +111,12 @@ class ProcessMemory {
     usage = () => process.memoryUsage(),
     maxRss = () => process.resourceUsage().maxRSS * KIB,
     now = () => performance.now(),
+    modules = () => Object.keys(require.cache),
     sleep = pause,
     settleTurn = turn,
   } = {}) {
-    Object.assign(this, { read, gc, usage, maxRss, now, sleep, settleTurn })
+    Object.assign(this, { read, gc, usage, maxRss, now, modules, sleep, settleTurn })
+    this.loadedModules = null
     this.source = selectPeakSource(read)
     this.marks = []
     this.covered = 0
@@ -162,10 +165,16 @@ class ProcessMemory {
    * current reading is taken before the kernel's, so the high water can never read below it.
    * @param {string} phase the fixed catalogue name of the boundary
    * @returns {{phase:string, at:number, rss:number, vmhwm:number|null, maxRss:number,
-   *   covered:number, coveredExternal:number}} the mark, also kept in `marks`; `vmhwm` is null
-   *   when no peak source was selected
+   *   covered:number, coveredExternal:number, imports:{count:number,late:string[]}|null}} the mark, also kept in `marks`; `vmhwm` is null
+   *   when no peak source was selected. `imports` freezes the loaded module filenames at `loaded`
+   *   and records every later addition without keeping module exports alive.
    */
   mark(phase) {
+    const files = this.modules()
+    if (phase === 'loaded' && this.loadedModules === null) this.loadedModules = new Set(files)
+    const imports = this.loadedModules
+      ? { count: files.length, late: files.filter((file) => !this.loadedModules.has(file)).sort() }
+      : null
     const usage = this.usage()
     const status = this.source ? this.read() : null
     const mark = {
@@ -176,6 +185,7 @@ class ProcessMemory {
       maxRss: this.maxRss(),
       covered: Math.max(this.covered, usage.rss),
       coveredExternal: Math.max(this.coveredExternal, usage.external),
+      imports,
     }
     this.covered = 0
     this.coveredExternal = 0

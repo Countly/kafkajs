@@ -32,4 +32,21 @@ const maximum = (kind) => {
   return { metrics, subscription, slots }
 }
 
-module.exports = { maximum }
+/**
+ * Restores the node population after a matched disconnected reading.
+ * @param {object} metrics the collector
+ * @param {object} subscription the accepted subscription
+ * @returns {object} a freshly accepted subscription, which resumes observation after reset
+ */
+const bindNodes = (metrics, subscription) => {
+  const active = { ...subscription, revision: subscription.revision + 1n }
+  metrics.select(active)
+  for (let nodeId = 0; nodeId < 64; nodeId++)
+    metrics.observeRequest(
+      metrics.bindNode({ nodeId, endpoint: `b${nodeId}:9092`, endpointRevision: {} }),
+      nodeId
+    )
+  return active
+}
+
+module.exports = { maximum, bindNodes }
