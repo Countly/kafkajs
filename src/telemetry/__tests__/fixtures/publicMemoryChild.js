@@ -7,20 +7,26 @@
  * through the fixed foreground workload, releases it, and measures the enabled client: the 128
  * maximum descriptors through the public API, the assigned UUID, accepted ordinary pushes with
  * real GZIP and detected ZSTD, a retired native completion with an immediate same-object reopen
- * per codec, and a final public close. It prints an explicit disconnect receipt the moment that
- * close resolves and then, once everything is released, one JSON line with every reading. It never
- * calls `process.exit`: a handle it leaves behind keeps the process alive, which the parent fails.
+ * per codec, and a final public close. Each reopen calls connect, and the final close prints its
+ * explicit disconnect receipt, in the public disconnect's own resolution continuation, with the
+ * observed order recorded for replay; then, once everything is released, it prints one JSON line
+ * with every reading. The run, tree and child identity come from the parent. It never calls
+ * `process.exit`: a handle it leaves behind keeps the process alive, which the parent fails.
  */
 const path = require('node:path')
 const Module = require('node:module')
-const crypto = require('node:crypto')
 const zlib = require('node:zlib')
 const inspector = require('node:inspector')
 
 const ROOT = path.join(__dirname, '..', '..', '..', '..')
-const { ProcessMemory, PendingSampler, NativeJournal, hostContext, SAMPLE_MS } = require(
-  path.join(ROOT, 'testHelpers', 'processMemory.js')
-)
+const {
+  BoundaryWitness,
+  NativeJournal,
+  PendingSampler,
+  ProcessMemory,
+  SAMPLE_MS,
+  hostContext,
+} = require(path.join(ROOT, 'testHelpers', 'processMemory.js'))
 
 // Everything above is a builtin or the builtin-only probe: the startup reading precedes any import
 // of the application.
@@ -47,6 +53,7 @@ const {
   foregroundCatalogue,
   runControl,
   until,
+  within,
 } = require('./memoryForeground')
 const { ResourceRoles } = require(path.join(ROOT, 'testHelpers', 'resourceProbe.js'))
 const { phaseCatalogue } = require(
@@ -96,7 +103,9 @@ const measure = async (kind) => {
   const manifest = {
     arm: 'public',
     kind,
-    childId: crypto.randomUUID(),
+    childId: process.env.RESOURCE_CHILD_ID,
+    tree: process.env.RESOURCE_TREE,
+    runId: process.env.RESOURCE_RUN_ID,
     pid: process.pid,
     node: process.version,
     v8: process.versions.v8,
@@ -159,21 +168,26 @@ const measure = async (kind) => {
         epoch += 1
         // Called from inside the submission: the close starts while the native job is in flight
         // and the same object's next call is the connect in the close's own continuation.
-        reopen = enabled.close(0).then(() => {
-          const started = memory.now()
-          const connecting = enabled.client.connect()
-          reopens.push({ codec: row.codec, immediate: true, connectGapMs: memory.now() - started })
-          return connecting
-        })
+        const witness = new BoundaryWitness(() => memory.now())
+        reopens.push({ codec: row.codec, events: witness.events })
+        reopen = enabled
+          .close(0)
+          .then(() => {
+            witness.resolved()
+            witness.call('connect')
+            return enabled.client.connect()
+          })
+          .then(() => enabled.drain())
       }
-      for (let index = 0; index < DESCRIPTORS; index++)
-        enabled.client.registerMetricForSubscription(descriptor(index))
+      for (let index = 0; index < DESCRIPTORS; index++) enabled.register(descriptor(index))
       await enabled.open()
       const uuid = await enabled.client.clientInstanceId({ timeout: 30000 })
       memory.mark('enabled:registered')
       epoch += 1
       await enabled.close(0)
-      const matched = await settled()
+      await enabled.drain()
+      const settledMatched = await settled()
+      const matched = { ...settledMatched, registry: enabled.fingerprint(uuid) }
       memory.mark('enabled:matched')
       const matchedResources = roles.read()
 
@@ -185,26 +199,37 @@ const measure = async (kind) => {
         const before = enabled.accepted(codec.type)
         armed = codec.name
         await until(() => reopen !== null, `${codec.name} retired work`)
-        await reopen
+        await within(reopen, `${codec.name} close and reopen`)
         reopen = null
         await enabled.resume()
         await enabled.work()
         await until(() => journal.live.size === 0, `${codec.name} retired completion`)
         await until(() => enabled.accepted(codec.type) > before, `${codec.name} push after reopen`)
-        actives.push({ phase: codec.name, ...(await settled()) })
+        const active = await settled()
+        actives.push({ phase: codec.name, ...active, registry: enabled.fingerprint(uuid) })
         memory.mark(`enabled:${codec.name}`)
         if (codec !== codecs.at(-1)) {
           epoch += 1
           await enabled.close(0)
+          await enabled.drain()
         }
       }
-      const held = { phase: 'held', ...(await settled()) }
+      const settledHeld = await settled()
+      const held = { phase: 'held', ...settledHeld, registry: enabled.fingerprint(uuid) }
       memory.mark('enabled:held')
       actives.push(held)
       const uuidHeld = await enabled.client.clientInstanceId({ timeout: 0 })
       epoch += 1
-      await enabled.close(3000)
-      process.stdout.write(`${JSON.stringify({ receipt: 'disconnect', kind, uuid })}\n`)
+      const disconnect = new BoundaryWitness(() => memory.now())
+      const closing = enabled.close(3000).then(() => {
+        disconnect.resolved()
+        disconnect.call('receipt')
+        const at = disconnect.events[1].at
+        const receipt = { receipt: 'disconnect', kind, uuid, childId: manifest.childId, at }
+        process.stdout.write(`${JSON.stringify(receipt)}\n`)
+      })
+      await within(closing, 'the final public close')
+      await enabled.drain()
       sampler.stop()
 
       const pushes = {}
@@ -218,9 +243,11 @@ const measure = async (kind) => {
       await turn()
       await turn()
       const facts = enabled.facts()
-      const closed = await settled()
+      const settledClosed = await settled()
+      const closed = { ...settledClosed, registry: enabled.fingerprint(uuid) }
       memory.mark('enabled:closed')
       const closedResources = roles.read()
+      const registry = enabled.registry.map((entry) => ({ ...entry }))
       enabled.release()
       live.splice(live.indexOf(enabled), 1)
       return {
@@ -235,6 +262,8 @@ const measure = async (kind) => {
         pushes,
         decoded,
         reopens,
+        disconnect: disconnect.summary(),
+        registry,
       }
     })
 
@@ -256,6 +285,8 @@ const measure = async (kind) => {
       pushes: arm.pushes,
       decoded: arm.decoded,
       reopens: arm.reopens,
+      disconnect: arm.disconnect,
+      registry: arm.registry,
       uuid: arm.uuid,
       uuidHeld: arm.uuidHeld,
       descriptors: DESCRIPTORS,

@@ -20,9 +20,15 @@ const { createScriptedCluster, groupScript, producerScript } = require(
 const share = require(path.join(ROOT, 'testHelpers', 'shareHarness.js'))
 const { TOPIC } = require('../../../consumer/__tests__/fixtures/fetchHarness')
 
-const { OPERATION, OPS_PER_LIFECYCLE, RECORD_BYTES, foregroundCatalogue } = require(
-  path.join(ROOT, 'scripts', 'e2e', 'telemetry', 'resourceArtifact.js')
-)
+const {
+  OPERATION,
+  OPS_PER_LIFECYCLE,
+  RECORD_BYTES,
+  foregroundCatalogue,
+  maximumDescriptor,
+  registryEntry,
+  registryFingerprint,
+} = require(path.join(ROOT, 'scripts', 'e2e', 'telemetry', 'resourceArtifact.js'))
 
 /** The UUID the scripted broker assigns, and the sizes of the maximum descriptor population. */
 const MEMORY_UUID = '01020304-0506-0708-090a-0b0c0d0e0f10'
@@ -48,19 +54,23 @@ const until = async (predicate, what) => {
 }
 
 /**
- * @param {number} index descriptor number
- * @returns {object} the largest descriptor the public fields allow: name 200, unit 16, eight
- *   63-byte keys and eight 256-byte values
+ * @param {Promise<*>} promise work that must settle
+ * @param {string} what names the work in the failure
+ * @returns {Promise<*>} its own outcome, or a rejection once the bound passes
  */
-const descriptor = (index) => ({
-  name: `com.example.resource.${index}`.padEnd(200, 'x'),
-  unit: 'u'.repeat(16),
-  type: 'sum',
-  value: 9007199254740993n,
-  attributes: Object.fromEntries(
-    Array.from({ length: 8 }, (_, a) => [`a${a}`.padEnd(63, 'k'), 'x'.repeat(256)])
-  ),
-})
+const within = (promise, what) => {
+  let timer
+  const limit = new Promise((resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`Timed out waiting for ${what}`)), WAIT_MS)
+  })
+  return Promise.race([promise, limit]).finally(() => clearTimeout(timer))
+}
+
+/**
+ * @param {number} index descriptor number
+ * @returns {object} the largest descriptor the public fields allow, with a Sum value above 2^53
+ */
+const descriptor = (index) => ({ ...maximumDescriptor(index), value: 9007199254740993n })
 
 /**
  * One public client of a kind over a bounded scripted wire that answers the core protocol and the
@@ -85,6 +95,7 @@ class MemoryForeground {
     this.handled = null
     this.removers = []
     this.pushes = {}
+    this.registry = []
     this.client = null
     this.wire = null
   }
@@ -151,6 +162,42 @@ class MemoryForeground {
     if (this.kind === 'consumer')
       this.removers.push(this.client.on(this.client.events.GROUP_JOIN, () => (this.joins += 1)))
     return this
+  }
+
+  /**
+   * Registers one descriptor through the public API and journals it only once that call returned.
+   * @param {object} metric the descriptor
+   * @returns {void}
+   * @throws {Error} the public refusal, with nothing journaled
+   */
+  register(metric) {
+    this.client.registerMetricForSubscription(metric)
+    this.registry.push(registryEntry(metric))
+  }
+
+  /**
+   * Fingerprints the journaled registrations and probes the production client for them: a new
+   * identity must be refused at the registry limit and the first registered identity must still
+   * update in place. Call it after a settled reading, so the probe is not measured.
+   * @param {string} uuid the assigned client instance id
+   * @returns {{uuid: string, descriptors: number, charge: number, hash: string,
+   *   overflow: string|null, first: string}} what the retained comparison must keep
+   */
+  fingerprint(uuid) {
+    const outcome = (metric) => {
+      try {
+        this.client.registerMetricForSubscription(metric)
+        return 'updated'
+      } catch (error) {
+        return error.reason ?? 'refused'
+      }
+    }
+    const overflow = outcome(descriptor(DESCRIPTORS))
+    return {
+      ...registryFingerprint(this.registry, uuid),
+      overflow: overflow === 'updated' ? null : overflow,
+      first: outcome(descriptor(0)),
+    }
   }
 
   /** @returns {number} accepted ordinary Pushes of a codec so far @param {number} type codec id */
@@ -239,15 +286,21 @@ class MemoryForeground {
   }
 
   /**
-   * Closes the public client and waits for the scripted broker's own answer timers to fire, so no
-   * fixture timer or unanswered request outlives the close.
+   * Starts the public close and returns its own promise, so a caller can continue in its
+   * resolution; the scripted broker's answer timers are joined separately by `drain`.
    * @param {number|undefined} timeout the public close budget; the admin client takes none
-   * @returns {Promise<void>} the public close has resolved and the broker side is quiet
+   * @returns {Promise<void>} the original public disconnect promise
    */
-  async close(timeout) {
-    if (this.kind === 'admin') await this.client.disconnect()
-    else await this.client.disconnect({ timeout })
-    await until(() => this.timers.size === 0, 'the broker answer timers')
+  close(timeout) {
+    return this.kind === 'admin' ? this.client.disconnect() : this.client.disconnect({ timeout })
+  }
+
+  /**
+   * @returns {Promise<void>} resolves once the scripted broker's answer timers have fired, so no
+   *   fixture timer or unanswered request outlives a close
+   */
+  drain() {
+    return until(() => this.timers.size === 0, 'the broker answer timers')
   }
 
   /**
@@ -314,6 +367,7 @@ const runControl = async ({ kind, lifecycles, memory, roles, journal, live }) =>
     memory.mark('control:c0')
     for (let index = 1; index < lifecycles; index++) {
       await client.close(0)
+      await client.drain()
       await client.open()
     }
     const c1 = await settled()
@@ -323,6 +377,7 @@ const runControl = async ({ kind, lifecycles, memory, roles, journal, live }) =>
       (error) => error.reason
     )
     await client.close(0)
+    await client.drain()
     await turn()
     await turn()
     const facts = { ...client.facts(), nativeSubmissions: journal.rows.length, probe }
@@ -344,4 +399,5 @@ module.exports = {
   foregroundCatalogue,
   runControl,
   until,
+  within,
 }

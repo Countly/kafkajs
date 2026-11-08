@@ -13,8 +13,9 @@
  *
  * ```
  * B       = min(C0.rss, C1.rss)               Eref = min(C0.external, C1.external)
- * P       = max over marks of max(high water, current RSS covered by the mark)
- * Epeak   = max over marks of the external bytes covered by the mark
+ * P       = max over marks of max(high water, current RSS covered by the mark), every recorded
+ *           current reading (native submission and settlement included) and the sampled peak
+ * Epeak   = the same maximum over the external bytes
  * RSS     delta P - B <= 64 MiB,  P <= 160 MiB,  external delta Epeak - Eref <= 64 MiB
  * control C1 and C0 settled readings within 2 MiB RSS and 256 KiB retained; setup peak <= 96 MiB
  * ```
@@ -23,10 +24,12 @@
  */
 const fs = require('node:fs')
 const path = require('node:path')
+const crypto = require('node:crypto')
+const { StringDecoder } = require('node:string_decoder')
 const { compareSnapshots } = require('../../../testHelpers/resourceProbe')
 
 /** The version of the recorded shape; an older artifact is not evidence for the current gate. */
-const SCHEMA = 2
+const SCHEMA = 3
 
 const KINDS = Object.freeze(['producer', 'consumer', 'admin', 'shareConsumer'])
 const ARMS = Object.freeze(['public', 'collector'])
@@ -69,6 +72,22 @@ const OPERATION = Object.freeze({
   shareConsumer: 'handle',
 })
 
+/** The child declarations every arm records, and those its stamp must repeat. */
+const CHILD_CONTEXT = Object.freeze([
+  'childId',
+  'pid',
+  'tree',
+  'runId',
+  'node',
+  'v8',
+  'platform',
+  'arch',
+])
+const STAMPED_CONTEXT = Object.freeze(['tree', 'runId', 'node', 'platform', 'arch'])
+
+/** The sampling period while native work is pending, in milliseconds. */
+const SAMPLE_MS = 20
+
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const READING_FIELDS = Object.freeze(['heapUsed', 'external', 'arrayBuffers', 'retained', 'rss'])
 const MARK_FIELDS = Object.freeze(['rss', 'maxRss', 'covered', 'coveredExternal'])
@@ -89,6 +108,188 @@ const time = (value) => Number.isFinite(value) && value >= 0
  * @param {*} a @param {*} b @returns {boolean} whether two JSON values are the same
  */
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b)
+
+/**
+ * @param {number} index descriptor number
+ * @returns {{name: string, unit: string, type: string, attributes: Record<string, string>}} the
+ *   metadata of the largest descriptor the public fields allow: name 200, unit 16, eight 63-byte
+ *   keys and eight 256-byte values, 2768 bytes in all
+ */
+const maximumDescriptor = (index) => ({
+  name: `com.example.resource.${index}`.padEnd(200, 'x'),
+  unit: 'u'.repeat(16),
+  type: 'sum',
+  attributes: Object.fromEntries(
+    Array.from({ length: 8 }, (_, a) => [`a${a}`.padEnd(63, 'k'), 'x'.repeat(256)])
+  ),
+})
+
+/**
+ * @param {{name: string, type: string, unit?: string, attributes?: Record<string, string>}} metric
+ *   a descriptor the public API accepted
+ * @returns {{identity: string, charge: number}} a hash of its identity and metadata, and the bytes
+ *   the registry charges for it (name, unit, keys and values)
+ */
+const registryEntry = (metric) => {
+  const attributes = Object.entries(metric.attributes ?? {}).sort(([a], [b]) => a.localeCompare(b))
+  const unit = metric.unit ?? ''
+  const charge = attributes.reduce(
+    (sum, [key, value]) => sum + Buffer.byteLength(key) + Buffer.byteLength(value),
+    Buffer.byteLength(metric.name) + Buffer.byteLength(unit)
+  )
+  const metadata = JSON.stringify([metric.name, metric.type, unit, attributes])
+  return { identity: crypto.createHash('sha256').update(metadata).digest('hex'), charge }
+}
+
+/** @returns {Array<{identity: string, charge: number}>} the fixed maximum registration catalogue */
+const registryCatalogue = () =>
+  Array.from({ length: LIMITS.descriptors }, (_, index) => registryEntry(maximumDescriptor(index)))
+
+/**
+ * @param {Array<{identity: string, charge: number}>} entries successful registrations, in order
+ * @param {string} uuid the assigned client instance id
+ * @returns {{uuid: string, descriptors: number, charge: number, hash: string}} the fingerprint of
+ *   the registered population a retained comparison must keep
+ */
+const registryFingerprint = (entries, uuid) => ({
+  uuid,
+  descriptors: entries.length,
+  charge: entries.reduce((sum, entry) => sum + entry.charge, 0),
+  hash: crypto.createHash('sha256').update(JSON.stringify(entries)).digest('hex'),
+})
+
+/** What the registry probe of a retained checkpoint must observe on the production client. */
+const REGISTRY_PROBE = Object.freeze({ overflow: 'limit', first: 'updated' })
+
+/**
+ * @param {Array<{action: string, at: number}>} events what a disconnect continuation observed
+ * @param {string} action the call that must come next
+ * @returns {boolean} whether the public disconnect resolved, `action` ran next and only then did
+ *   the continuation first yield, at nondecreasing times
+ */
+const immediateBoundary = (events, action) =>
+  Array.isArray(events) &&
+  same(
+    events.map((event) => event?.action),
+    ['disconnect', action, 'yield']
+  ) &&
+  events.every(
+    (event, index) => time(event.at) && (index === 0 || event.at >= events[index - 1].at)
+  )
+
+/**
+ * Reads a memory child's stdout incrementally, within the output bound, and keeps only its fixed
+ * message catalogue: at most one explicit disconnect receipt from the public arm, then exactly one
+ * readings message. A malformed, foreign, duplicate, out-of-order or unterminated line is a failure,
+ * never skipped. The first failure is kept.
+ */
+class MemoryOutput {
+  /**
+   * @param {{arm: string, kind: string, childId: string}} expected the identity the parent issued
+   * @param {() => number} [now] the parent's clock, in milliseconds
+   * @returns {MemoryOutput} a reader that has seen nothing
+   */
+  constructor(expected, now = Date.now) {
+    Object.assign(this, { expected, now })
+    this.decoder = new StringDecoder('utf8')
+    this.pending = ''
+    this.bytes = 0
+    this.failure = null
+    this.receipt = null
+    this.receiptAt = null
+    this.readings = null
+    this.readingsAt = null
+    this.results = 0
+  }
+
+  /** @param {string} problem what went wrong @returns {void} keeps the first failure only */
+  fail(problem) {
+    this.failure ??= problem
+  }
+
+  /**
+   * @param {Buffer} chunk bytes from the pipe
+   * @returns {void} consumes every complete line; past the bound nothing more is read
+   */
+  write(chunk) {
+    this.bytes += chunk.length
+    if (this.bytes > LIMITS.outputBytes) {
+      this.fail('child output exceeded its bound')
+      return
+    }
+    this.pending += this.decoder.write(chunk)
+    let end
+    while ((end = this.pending.indexOf('\n')) !== -1) {
+      const line = this.pending.slice(0, end)
+      this.pending = this.pending.slice(end + 1)
+      this.line(line)
+    }
+  }
+
+  /** @param {string} line one complete message @returns {void} checks its identity and order */
+  line(line) {
+    let message
+    try {
+      message = JSON.parse(line)
+    } catch {
+      this.fail('unreadable output line')
+      return
+    }
+    if (message?.receipt === 'disconnect') this.disconnect(message)
+    else if (message && same(Object.keys(message), ['readings'])) {
+      this.results += 1
+      if (this.results !== 1) this.fail('duplicate readings message')
+      else {
+        this.readings = message.readings
+        this.readingsAt = this.now()
+      }
+    } else this.fail('foreign output message')
+  }
+
+  /** @param {object} message a disconnect receipt @returns {void} admits it once, before readings */
+  disconnect(message) {
+    const valid =
+      this.expected.arm === 'public' &&
+      same(Object.keys(message).sort(), ['at', 'childId', 'kind', 'receipt', 'uuid']) &&
+      message.kind === this.expected.kind &&
+      message.childId === this.expected.childId &&
+      UUID.test(message.uuid) &&
+      time(message.at)
+    if (!valid) this.fail('foreign disconnect receipt')
+    else if (this.receipt || this.results) this.fail('duplicate or late disconnect receipt')
+    else {
+      this.receipt = message
+      this.receiptAt = this.now()
+    }
+  }
+
+  /**
+   * Ends the stream once the child closed.
+   * @returns {{failure: string|null, receipt: object|null, receipts: number, results: number,
+   *   readings: object|null, disconnectObservedAt: number|null, closedAfterMarkMs: number|null}}
+   *   the catalogue facts; the close is timed from the receipt, or from the readings where the
+   *   child owes no receipt
+   */
+  finish() {
+    this.pending += this.decoder.end()
+    if (this.pending) this.fail('unterminated output line')
+    const owed = this.expected.arm === 'public' && this.readings?.manifest?.gc?.available !== false
+    if (this.results !== 1) this.fail('missing readings message')
+    if (Boolean(this.receipt) !== owed) this.fail('missing or unexpected disconnect receipt')
+    if (this.receipt && this.receipt.uuid !== this.readings?.uuid)
+      this.fail('disconnect receipt UUID differs from the readings')
+    const mark = owed ? this.receiptAt : this.readingsAt
+    return {
+      failure: this.failure,
+      receipt: this.receipt,
+      receipts: this.receipt ? 1 : 0,
+      results: this.results,
+      readings: this.readings,
+      disconnectObservedAt: this.receiptAt,
+      closedAfterMarkMs: mark === null ? null : this.now() - mark,
+    }
+  }
+}
 
 /**
  * The fixed order of the phases an arm passes, independent of what a run recorded.
@@ -219,7 +420,9 @@ class MemoryArmJudge {
     const ran = this.readings?.manifest?.gc?.available !== false
     if (exit?.receipts !== (arm === 'public' && ran ? 1 : 0))
       this.fail('child sent the wrong number of disconnect receipts')
-    if (!(exit?.closedAfterMarkMs <= LIMITS.closeAfterMarkMs))
+    if (exit?.failure !== null) this.fail('child output or spawn failed')
+    if (exit?.results !== 1) this.fail('child sent the wrong number of readings messages')
+    if (!time(exit?.closedAfterMarkMs) || !(exit.closedAfterMarkMs <= LIMITS.closeAfterMarkMs))
       this.fail('child did not close within 10 s of its receipt')
 
     const current = schema === SCHEMA && this.readings
@@ -294,6 +497,7 @@ class MemoryArmJudge {
       this.fail('peak marks are missing: aggregate evidence is not accepted')
     if (this.failures.length > before) return false
 
+    this.childContext(manifest)
     if (manifest.kind !== this.record.kind || manifest.arm !== this.record.arm)
       this.fail('manifest is for another kind or arm')
     if (Object.values(manifest.instrumented ?? { missing: true }).some(Boolean))
@@ -343,12 +547,59 @@ class MemoryArmJudge {
   }
 
   /**
+   * Binds the child's declared run, build and platform to the process the parent spawned and to
+   * the record's stamp, so one child's evidence cannot stand in for another's.
+   * @param {object} manifest the child's manifest
+   * @returns {void}
+   */
+  childContext(manifest) {
+    const { stamp, exit } = this.record
+    const declared = (key) =>
+      key === 'pid'
+        ? Number.isSafeInteger(manifest[key]) && manifest[key] > 0
+        : typeof manifest[key] === 'string' && manifest[key].length > 0
+    if (!CHILD_CONTEXT.every(declared)) this.fail('child context declarations are incomplete')
+    const producer = exit?.producer
+    if (
+      !producer ||
+      producer.arm !== this.record.arm ||
+      producer.kind !== this.record.kind ||
+      !CHILD_CONTEXT.every((key) => manifest[key] === producer[key]) ||
+      !STAMPED_CONTEXT.every((key) => manifest[key] === stamp?.[key])
+    )
+      this.fail('child context differs from the producing process or stamp')
+  }
+
+  /**
+   * @returns {object[]} every recorded current reading: the settled checkpoints and the reading
+   *   at each native submission and settlement
+   */
+  allReadings() {
+    const r = this.readings
+    const edges = Array.isArray(r.native?.rows)
+      ? r.native.rows.flatMap((row) => [row?.submitted, row?.settled])
+      : []
+    return [
+      r.startup,
+      r.loaded,
+      r.c0,
+      r.c1,
+      r.released,
+      r.matched,
+      ...r.actives,
+      r.closed,
+      ...edges,
+    ]
+  }
+
+  /**
    * Validates the marks and recomputes the peaks and baselines from them.
    * @returns {{B:number, Eref:number, P:number, Epeak:number, setupPeak:number,
    *   usable:boolean}|null} the quantities every gate uses, or null when the marks are unusable
    */
   peaks() {
     const { marks, c0, c1, manifest } = this.readings
+    const readings = this.allReadings()
     const claimed = manifest.peakSource !== null
     let usable = claimed
     let previous = null
@@ -377,11 +628,14 @@ class MemoryArmJudge {
       0,
       marks.findIndex((mark) => mark.phase === 'control:released') + 1
     )
+    const sampled = this.readings.samples?.peak
+    const largest = (field) =>
+      Math.max(0, sampled?.[field] ?? 0, ...readings.map((r) => r?.[field] ?? 0))
     return {
       B: Math.min(c0.rss, c1.rss),
       Eref: Math.min(c0.external, c1.external),
-      P: Math.max(...marks.map(peakOf)),
-      Epeak: Math.max(...marks.map((mark) => mark.coveredExternal)),
+      P: Math.max(...marks.map(peakOf), largest('rss')),
+      Epeak: Math.max(...marks.map((mark) => mark.coveredExternal), largest('external')),
       setupPeak: Math.max(...upToSetup.map(peakOf)),
       usable,
     }
@@ -489,16 +743,25 @@ class MemoryArmJudge {
    */
   native() {
     const { native, samples, manifest } = this.readings
+    if (manifest.sampleMs !== SAMPLE_MS || samples?.intervalMs !== SAMPLE_MS)
+      this.fail('native sampling interval is not 20 ms')
     if (!native || !Array.isArray(native.rows)) {
       this.fail('native journal is missing')
       return
     }
+    if (
+      !Array.isArray(samples?.pendingWindows) ||
+      samples.overflow !== false ||
+      samples.windows !== samples.pendingWindows.length ||
+      samples.windows !== native.rows.length
+    )
+      this.fail('native pending windows are incomplete')
     if (native.overflow !== false) this.fail('native journal overflowed')
     if (native.live !== 0) this.fail('native work is still pending')
     if (native.maxLive > 1) this.fail('more than one native job was occupied at once')
     const positive = (value) => Number.isSafeInteger(value) && value > 0
     let last = 0
-    for (const row of native.rows) {
+    native.rows.forEach((row, index) => {
       const name = `${row?.codec} job ${row?.id}`
       if (!(row?.id > last)) this.fail(`${name} is out of order`)
       last = row?.id
@@ -523,12 +786,15 @@ class MemoryArmJudge {
         if (row.inputBackingBytes < row.inputBytes || row.resultBackingBytes < row.resultBytes)
           this.fail(`${name} backing capacity is below its bytes`)
       }
-      for (const edge of [row?.submitted, row?.settled])
-        if (!edge || !READING_FIELDS.every((field) => count(edge[field])) || !time(edge.at))
-          this.fail(`${name} lacks a reading at submission or settlement`)
-      if (row?.submitted?.at > row?.settled?.at)
-        this.fail(`${name} settled before it was submitted`)
-    }
+      const edges = [row?.submitted, row?.settled]
+      if (!edges.every((edge) => edge && this.checkReading(name, edge, false))) {
+        this.fail(`${name} lacks a reading at submission or settlement`)
+        return
+      }
+      for (const edge of edges) this.covered(name, edge)
+      if (row.submitted.at > row.settled.at) this.fail(`${name} settled before it was submitted`)
+      this.pendingWindow(name, row, samples?.pendingWindows?.[index], samples?.peak)
+    })
     for (const codec of ['gzip', ...(manifest.codecs?.zstd === true ? ['zstd'] : [])]) {
       const rows = native.rows.filter((row) => row.codec === codec && row.outcome === 'resolved')
       if (!rows.some((row) => row.retired === false) || !rows.some((row) => row.retired === true))
@@ -536,6 +802,44 @@ class MemoryArmJudge {
     }
     if (samples && samples.count < 2 * native.rows.length)
       this.fail('too few current readings around native work')
+  }
+
+  /**
+   * @param {string} name the job in a problem @param {object} edge a native submission or
+   *   settlement reading
+   * @returns {void} fails a reading outside the measured interval, or one the next mark misses
+   */
+  covered(name, edge) {
+    const mark = this.readings.marks.find((candidate) => candidate.at >= edge.at)
+    if (!mark || edge.at < this.readings.loaded.at)
+      this.fail(`${name} is outside chronological peak coverage`)
+    else if (mark.covered < edge.rss || mark.coveredExternal < edge.external)
+      this.fail('a peak mark understates a native reading')
+  }
+
+  /**
+   * @param {string} name the job in a problem @param {object} row its journal row
+   * @param {object|undefined} window the sampler's window for it
+   * @param {object|undefined} peak the sampled peak
+   * @returns {void} fails a window that does not span the job from submission to settlement, holds
+   *   fewer than its two edge readings, misses an edge, or exceeds the sampled peak
+   */
+  pendingWindow(name, row, window, peak) {
+    const { submitted, settled } = row
+    if (
+      !window ||
+      window.begin !== submitted.at ||
+      window.end !== settled.at ||
+      !count(window.count) ||
+      window.count < 2 ||
+      !count(window.rss) ||
+      !count(window.external) ||
+      window.rss < Math.max(submitted.rss, settled.rss) ||
+      window.external < Math.max(submitted.external, settled.external)
+    )
+      this.fail(`${name} pending window does not cover its native work`)
+    else if (!(window.rss <= peak?.rss) || !(window.external <= peak?.external))
+      this.fail('sampled peak understates a pending window')
   }
 
   /** @returns {void} judges what only the public-client arm records */
@@ -552,6 +856,23 @@ class MemoryArmJudge {
       this.fail('descriptor population is not the maximum')
     if (!same(r.matchedState, { connected: false, descriptors: LIMITS.descriptors, uuid: r.uuid }))
       this.fail('matched baseline is not the disconnected registry')
+    const catalogue = registryCatalogue()
+    const retained = { ...registryFingerprint(catalogue, r.uuid), ...REGISTRY_PROBE }
+    if (
+      !same(r.registry, catalogue) ||
+      ![r.matched, ...r.actives, r.closed].every((reading) => same(reading.registry, retained))
+    )
+      this.fail('retained registry fingerprint differs from successful public registrations')
+    const receipt = this.record.exit?.receipt
+    if (
+      receipt?.kind !== this.record.kind ||
+      receipt.childId !== r.manifest.childId ||
+      receipt.uuid !== r.uuid ||
+      receipt.at !== r.disconnect?.[1]?.at ||
+      !time(this.record.exit.disconnectObservedAt) ||
+      !immediateBoundary(r.disconnect, 'receipt')
+    )
+      this.fail('disconnect receipt is not at the public boundary')
     if (!(r.enabled?.api71 >= 1) || !(r.enabled?.api72 >= 1))
       this.fail('enabled client made no telemetry request')
     for (const codec of codecs) {
@@ -560,7 +881,11 @@ class MemoryArmJudge {
       const decoded = r.decoded?.find((entry) => entry.codec === codec)
       if (!(pushes?.accepted >= LIMITS.acceptedPushes))
         this.fail(`${codec} accepted pushes are fewer than required`)
-      if (!r.reopens?.some((reopen) => reopen.codec === codec && reopen.immediate === true))
+      if (
+        !r.reopens?.some(
+          (reopen) => reopen.codec === codec && immediateBoundary(reopen.events, 'connect')
+        )
+      )
         this.fail(`${codec} has no immediate reopen from the close continuation`)
       if (!decoded || decoded.format !== true)
         this.fail(`${codec} payload is not in its codec format`)
@@ -643,13 +968,16 @@ const validateResourceArtifacts = (directory, { tree, node }) => {
           const record = JSON.parse(fs.readFileSync(file, 'utf8'))
           const childNode = record.readings?.manifest?.node
           const stamped =
-            record.stamp?.tree === tree &&
-            record.stamp?.node === node &&
-            (childNode === undefined || childNode === node)
+            record.stamp?.tree === tree && record.stamp?.node === node && childNode === node
           verdict = judgeMemoryArm(record)
           const child = record.readings?.manifest?.childId
-          if (child !== undefined)
+          if (typeof child === 'string' && child.length > 0)
             children.set(child, [...(children.get(child) ?? []), results.length])
+          else
+            verdict = {
+              verdict: 'fail',
+              problems: ['artifact has no child identity', ...verdict.problems],
+            }
           if (!stamped || record.arm !== arm || record.kind !== kind)
             verdict = {
               verdict: 'fail',
@@ -699,15 +1027,22 @@ module.exports = {
   ARMS,
   KINDS,
   LIMITS,
+  MemoryOutput,
   NOISE,
   OPERATION,
   OPS_PER_LIFECYCLE,
   PEAK_SOURCE,
   RECORD_BYTES,
+  REGISTRY_PROBE,
   SCHEMA,
   foregroundCatalogue,
+  immediateBoundary,
   judgeMemoryArm,
+  maximumDescriptor,
   phaseCatalogue,
+  registryCatalogue,
+  registryEntry,
+  registryFingerprint,
   validateResourceArtifacts,
 }
 

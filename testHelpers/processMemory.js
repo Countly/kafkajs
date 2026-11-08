@@ -24,6 +24,9 @@ const SAMPLE_MS = 20
 /** The pause between the two collections of a settled reading, in milliseconds. */
 const GC_PAUSE_MS = 100
 
+/** The most pending windows a sampler describes one by one; a further window sets `overflow`. */
+const WINDOW_CAPACITY = 32
+
 /**
  * @param {string} text the contents of `/proc/self/status`
  * @param {string} name a field such as `VmHWM`
@@ -97,6 +100,8 @@ class ProcessMemory {
    * @param {() => number} [sources.maxRss] raw lifetime `maxRSS` in bytes
    * @param {() => number} [sources.now] monotonic milliseconds
    * @param {(ms: number) => Promise<void>} [sources.sleep] the pause between collections
+   * @param {() => Promise<void>} [sources.settleTurn] one turn after the second collection, in
+   *   which the engine's collection callbacks run; a settled reading waits for two
    * @returns {ProcessMemory} an observer with no marks yet
    */
   constructor({
@@ -106,8 +111,9 @@ class ProcessMemory {
     maxRss = () => process.resourceUsage().maxRSS * KIB,
     now = () => performance.now(),
     sleep = pause,
+    settleTurn = turn,
   } = {}) {
-    Object.assign(this, { read, gc, usage, maxRss, now, sleep })
+    Object.assign(this, { read, gc, usage, maxRss, now, sleep, settleTurn })
     this.source = selectPeakSource(read)
     this.marks = []
     this.covered = 0
@@ -191,8 +197,8 @@ class ProcessMemory {
     this.gc()
     await this.sleep(GC_PAUSE_MS)
     this.gc()
-    await turn()
-    await turn()
+    await this.settleTurn()
+    await this.settleTurn()
     const reading = this.current()
     return {
       ...reading,
@@ -208,7 +214,8 @@ class ProcessMemory {
 
 /**
  * Reads current memory every 20 ms while at least one native job is pending and keeps a bounded
- * summary: the count, the largest gap between readings of one pending window, and the peaks.
+ * summary: the count, the largest gap between readings of one pending window, the peaks, and per
+ * pending window its first and last reading time, reading count and RSS and external peaks.
  */
 class PendingSampler {
   /**
@@ -225,6 +232,9 @@ class PendingSampler {
     this.windowLast = null
     this.count = 0
     this.windows = 0
+    this.windowRows = []
+    this.window = null
+    this.overflow = false
     this.maxGapMs = 0
     this.peak = { rss: 0, heapUsed: 0, external: 0, arrayBuffers: 0 }
   }
@@ -236,6 +246,12 @@ class PendingSampler {
   take() {
     const reading = this.memory.current()
     this.count += 1
+    if (this.window) {
+      this.window.count += 1
+      this.window.end = reading.at
+      this.window.rss = Math.max(this.window.rss, reading.rss)
+      this.window.external = Math.max(this.window.external, reading.external)
+    }
     for (const key of Object.keys(this.peak))
       this.peak[key] = Math.max(this.peak[key], reading[key])
     if (this.windowLast !== null)
@@ -251,11 +267,16 @@ class PendingSampler {
   begin() {
     if (this.pending === 0) {
       this.windows += 1
+      this.window = { begin: null, end: null, count: 0, rss: 0, external: 0 }
+      if (this.windowRows.length < WINDOW_CAPACITY) this.windowRows.push(this.window)
+      else this.overflow = true
       this.windowLast = null
       this.handle = this.set(() => this.take(), SAMPLE_MS)
     }
     this.pending += 1
-    return this.take()
+    const reading = this.take()
+    this.window.begin ??= reading.at
+    return reading
   }
 
   /**
@@ -268,6 +289,7 @@ class PendingSampler {
     if (this.pending === 0) {
       this.clear(this.handle)
       this.handle = null
+      this.window = null
     }
     return reading
   }
@@ -276,17 +298,22 @@ class PendingSampler {
   stop() {
     if (this.handle !== null) this.clear(this.handle)
     this.handle = null
+    this.window = null
     this.pending = 0
   }
 
   /**
-   * @returns {{count:number, windows:number, maxGapMs:number, intervalMs:number,
-   *   peak:{rss:number,heapUsed:number,external:number,arrayBuffers:number}}} bounded facts
+   * @returns {{count:number, windows:number, pendingWindows:Array<{begin:number, end:number,
+   *   count:number, rss:number, external:number}>, overflow:boolean, maxGapMs:number,
+   *   intervalMs:number, peak:{rss:number,heapUsed:number,external:number,arrayBuffers:number}}}
+   *   bounded facts; `overflow` says more windows ran than are described
    */
   summary() {
     return {
       count: this.count,
       windows: this.windows,
+      pendingWindows: this.windowRows.map((window) => ({ ...window })),
+      overflow: this.overflow,
       maxGapMs: this.maxGapMs,
       intervalMs: SAMPLE_MS,
       peak: { ...this.peak },
@@ -441,10 +468,45 @@ class NativeJournal {
   }
 }
 
+/**
+ * Witnesses what a public disconnect's resolution continuation does before it first yields. Call
+ * `resolved` first thing in that continuation and `call` for each action it then takes: a
+ * microtask queued at resolution records `yield`, so an action taken after any await is recorded
+ * after `yield`, and one taken synchronously before it.
+ */
+class BoundaryWitness {
+  /**
+   * @param {() => number} now monotonic milliseconds
+   * @returns {BoundaryWitness} a witness with no events
+   */
+  constructor(now) {
+    this.now = now
+    this.events = []
+  }
+
+  /** @returns {void} records the resolution and queues the record of the first yield */
+  resolved() {
+    this.call('disconnect')
+    queueMicrotask(() => this.call('yield'))
+  }
+
+  /** @param {string} action the call the continuation makes now @returns {void} */
+  call(action) {
+    this.events.push({ action, at: this.now() })
+  }
+
+  /** @returns {Array<{action: string, at: number}>} a copy of the events, in order */
+  summary() {
+    return this.events.map((event) => ({ ...event }))
+  }
+}
+
 module.exports = {
   PEAK_SOURCE,
   SAMPLE_MS,
   GC_PAUSE_MS,
+  WINDOW_CAPACITY,
+  BoundaryWitness,
   ProcessMemory,
   PendingSampler,
   NativeJournal,
