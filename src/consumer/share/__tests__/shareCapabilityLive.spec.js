@@ -1,5 +1,5 @@
 // eslint-disable-next-line n/no-unsupported-features/node-builtins -- Test-only timer allocation diagnostics; the hook is disabled after cleanup.
-const { createHook } = require('async_hooks')
+const { AsyncResource, createHook } = require('async_hooks')
 const fs = require('fs')
 const net = require('net')
 const path = require('path')
@@ -34,6 +34,10 @@ const {
 } = require('../../../../testHelpers/shareLiveDiagnostics')
 const { readLog } = require('../../../../testHelpers/rawLog')
 const { createResourceProbe } = require('../../../../testHelpers/resourceProbe')
+const Broker = require('../../../broker')
+const Cluster = require('../../../cluster')
+const { currentDeadline, runWithDeadline, wrapAdmin } = require('../../../admin/deadline')
+const { createErrorFromCode } = require('../../../protocol/error')
 const RequestQueue = require('../../../network/requestQueue')
 const InstrumentationEventEmitter = require('../../../instrumentation/emitter')
 const { ShareAckLedger } = require('../shareAckLedger')
@@ -343,6 +347,252 @@ const cleanupError = (error, seen = new Set()) => {
   }
 }
 
+/** Records original deletion calls without replacing their retries, results or deadlines. */
+class GroupDeletionEvidence {
+  /**
+   * @param {CapabilityCase} owner The case writing stamped evidence.
+   * @param {AbortSignal} signal The existing cleanup scope.
+   * @param {string} groupId The owned group being deleted.
+   */
+  constructor(owner, signal, groupId) {
+    this.owner = owner
+    this.signal = signal
+    this.groupId = groupId
+    this.deadline = Math.min(
+      owner.cleanupDeadline ?? Infinity,
+      owner.deadline,
+      performance.now() + 10000
+    )
+    this.context = new AsyncResource('capability-group-deletion-evidence')
+    this.sequence = 0
+    this.omitted = 0
+    this.pending = new Set()
+    this.descriptions = new Set()
+    this.restores = []
+    this.closed = false
+    this.onAbort = () => this.expire(signal.reason)
+    signal.addEventListener('abort', this.onAbort, { once: true })
+  }
+
+  /**
+   * Detaches compact protocol facts from either an original response or a thrown wrapper.
+   * @param {object|null} response The original response.
+   * @param {Error} [error] The original error.
+   * @returns {object} Actual error code, name and retriable flag; no inferred success on expiry.
+   */
+  outcome(response, error) {
+    const row = (
+      response?.results ??
+      (Array.isArray(response) ? response : error?.groups) ??
+      []
+    ).find(({ groupId }) => groupId === this.groupId)
+    let failure = row?.error ?? error
+    for (let depth = 0; depth < 3 && failure?.code == null && failure?.cause; depth++) {
+      failure = failure.cause
+    }
+    const errorCode = row?.errorCode ?? failure?.code ?? (error ? null : 0)
+    if (!failure && errorCode) failure = createErrorFromCode(errorCode)
+    return {
+      errorCode,
+      errorName: failure?.name ?? null,
+      errorType: failure?.type ?? null,
+      retriable: failure?.retriable ?? (errorCode === 0 ? false : null),
+      error: describeError(failure),
+    }
+  }
+
+  /**
+   * Writes both boundaries, including an unfinished call's expiry before transport teardown.
+   * @param {string} event The evidence event.
+   * @param {object} fields Call identity and destination.
+   * @returns {Function} An idempotent completion writer.
+   */
+  begin(event, fields) {
+    if (this.closed || this.sequence >= 1024) {
+      this.omitted++
+      return () => {}
+    }
+    const entry = {
+      groupId: this.groupId,
+      sequence: ++this.sequence,
+      startedAt: performance.now(),
+      ...fields,
+    }
+    this.owner.row(event, { ...entry, status: 'started', endedAt: null })
+    const finish = (result) => {
+      if (!this.pending.delete(finish)) return
+      this.owner.row(event, { ...entry, endedAt: performance.now(), ...result })
+    }
+    this.pending.add(finish)
+    return finish
+  }
+
+  /**
+   * Observes one original call and rethrows the identical failure.
+   * @param {string} event The evidence event.
+   * @param {object} fields Call identity.
+   * @param {Function} work Original call-through thunk.
+   * @returns {Promise<*>} The unchanged original result.
+   */
+  async observe(event, fields, work) {
+    const finish = this.begin(event, fields)
+    try {
+      const response = await work()
+      const outcome = this.outcome(response)
+      finish({
+        status: outcome.errorCode ? 'failed' : 'succeeded',
+        ...outcome,
+        ...(event === 'group-deletion-coordinator' && {
+          coordinatorNode: response?.coordinator?.nodeId ?? response?.nodeId ?? null,
+          coordinator: response?.coordinator ?? null,
+        }),
+      })
+      if (outcome.errorCode && fields.layer === 'broker') this.describe('after-failed-attempt')
+      return response
+    } catch (error) {
+      finish({ status: 'failed', ...this.outcome(null, error) })
+      if (fields.layer === 'broker') this.describe('after-failed-attempt')
+      throw error
+    }
+  }
+
+  /** @returns {void} Installs group-filtered observers for actual requests and cached routing. */
+  install() {
+    const observer = this
+    for (const [prototype, method, event, layer] of [
+      [Broker.prototype, 'deleteGroups', 'group-deletion-attempt', 'broker'],
+      [Broker.prototype, 'findGroupCoordinator', 'group-deletion-coordinator', 'rpc'],
+      [Cluster.prototype, 'findGroupCoordinator', 'group-deletion-coordinator', 'route'],
+    ]) {
+      const original = prototype[method]
+      prototype[method] = function observed(...args) {
+        const matches =
+          method === 'deleteGroups'
+            ? args[0].includes(observer.groupId)
+            : args[0].groupId === observer.groupId
+        if (!matches || observer.closed) return original.apply(this, args)
+        return observer.observe(
+          event,
+          {
+            layer,
+            operation: currentDeadline()?.method ?? 'deleteGroups',
+            coordinatorNode: layer === 'broker' ? (this.nodeId ?? null) : null,
+            requestNode: layer === 'rpc' ? (this.nodeId ?? null) : null,
+            endpoint: this.brokerAddress ?? null,
+          },
+          () => original.apply(this, args)
+        )
+      }
+      this.restores.push(() => {
+        prototype[method] = original
+      })
+    }
+  }
+
+  /**
+   * Starts a read without delaying a deletion or its existing retry cadence.
+   * The admin call spends at most one existing poll interval from the original remaining time.
+   * @param {string} reason The boundary that requested this description.
+   * @returns {void}
+   */
+  describe(reason) {
+    if (this.closed) return
+    if (this.sequence >= 1024) {
+      this.omitted++
+      return
+    }
+    const apiTimeout = Math.floor(Math.min(50, this.deadline - performance.now()))
+    if (this.signal.aborted || this.expired || apiTimeout < 1) {
+      this.owner.row('group-deletion-state', {
+        groupId: this.groupId,
+        sequence: ++this.sequence,
+        reason,
+        status: 'unavailable',
+        at: performance.now(),
+        error: describeError(
+          this.signal.reason ?? this.expired ?? new Error('The cleanup deadline has expired')
+        ),
+        lastDescription: this.lastDescription ?? null,
+      })
+      return
+    }
+    const finish = this.begin('group-deletion-state', { reason, apiTimeout })
+    const work = this.context
+      .runInAsyncScope(() =>
+        bounded(
+          this.signal,
+          Infinity,
+          () => this.owner.admin.describeShareGroups([this.groupId], { apiTimeout }),
+          { graceMs: 0 }
+        )
+      )
+      .then(({ groups }) => {
+        const group = groups.find(({ groupId }) => groupId === this.groupId)
+        const description = {
+          state: group?.state ?? null,
+          groupEpoch: group?.groupEpoch ?? null,
+          assignmentEpoch: group?.assignmentEpoch ?? null,
+          errorCode: group?.errorCode ?? null,
+          errorMessage: group?.errorMessage?.slice(0, 300) ?? null,
+          memberCount: group?.members?.length ?? null,
+          members: (group?.members ?? []).slice(0, 16).map((member) => ({
+            memberId: String(member.memberId).slice(0, 200),
+            memberEpoch: member.memberEpoch,
+            clientId: String(member.clientId).slice(0, 200),
+            clientHost: String(member.clientHost).slice(0, 200),
+          })),
+          membersTruncated: (group?.members?.length ?? 0) > 16,
+        }
+        this.lastDescription = description
+        finish({ status: group?.errorCode === 0 ? 'succeeded' : 'failed', ...description })
+      })
+      .catch((error) => {
+        finish({
+          status: this.signal.aborted ? 'expired' : 'failed',
+          error: describeError(error),
+        })
+      })
+    this.descriptions.add(work)
+    work.then(
+      () => this.descriptions.delete(work),
+      () => this.descriptions.delete(work)
+    )
+  }
+
+  /**
+   * Closes pending observations without claiming that an unfinished RPC completed.
+   * @param {Error} reason The original scope or poll expiry.
+   * @returns {void}
+   */
+  expire(reason) {
+    if (this.closed || this.expired) return
+    this.expired = reason
+    for (const finish of [...this.pending]) {
+      finish({ status: 'expired', outcomeUnknown: true, ...this.outcome(null, reason) })
+    }
+    this.describe('after-expired-attempt')
+  }
+
+  /** @returns {Promise<void>} Joins bounded reads and restores every observer on all exits. */
+  async close() {
+    try {
+      await Promise.allSettled([...this.descriptions])
+    } finally {
+      this.closed = true
+      this.signal.removeEventListener('abort', this.onAbort)
+      for (const restore of this.restores.reverse()) restore()
+      this.context.emitDestroy()
+      this.owner.row('group-deletion-finished', {
+        groupId: this.groupId,
+        at: performance.now(),
+        captured: this.sequence,
+        omitted: this.omitted,
+        expired: this.signal.aborted || Boolean(this.expired),
+      })
+    }
+  }
+}
+
 /** Runs and joins every cleanup inside the case and file deadlines. */
 class FileCleanupStack extends CleanupStack {
   /** @param {CapabilityCase} owner The case owning these cleanup operations. */
@@ -382,6 +632,7 @@ class FileCleanupStack extends CleanupStack {
       fileDeadline - FINAL_MS - CASE_JOIN_MS,
       performance.now() + CLEANUP_MS
     )
+    this.owner.cleanupDeadline = deadline
     const failures = []
     for (const { name, close } of this.cleanups.splice(0).reverse()) {
       let work
@@ -765,7 +1016,7 @@ class CapabilityCase {
    */
   async cleanupStep(step, work) {
     const startedAt = performance.now()
-    const entry = { step, elapsedMs: null, error: null }
+    const entry = { step, startedAt, endedAt: null, elapsedMs: null, error: null }
     this.cleanupSteps.push(entry)
     try {
       return await work()
@@ -775,7 +1026,8 @@ class CapabilityCase {
       entry.error = cleanupError(error)
       throw error
     } finally {
-      entry.elapsedMs = performance.now() - startedAt
+      entry.endedAt = performance.now()
+      entry.elapsedMs = entry.endedAt - startedAt
       this.row('cleanup-step', entry)
     }
   }
@@ -1610,10 +1862,22 @@ class CapabilityCase {
    * @returns {Promise<void>} Once both deletion operations have settled.
    */
   async deleteFixtures(signal) {
+    const firstStep = this.cleanupSteps.length
     const results = await Promise.allSettled([
       this.cleanupStep('delete group', () => this.deleteGroup(signal, this.group)),
       this.cleanupStep('delete topic', () => this.deleteTopic(signal)),
     ])
+    const steps = this.cleanupSteps.slice(firstStep)
+    const group = steps.find(({ step }) => step === 'delete group')
+    const topic = steps.find(({ step }) => step === 'delete topic')
+    this.row('fixture-deletion-overlap', {
+      groupId: this.group,
+      topic: this.topic,
+      group: { startedAt: group.startedAt, endedAt: group.endedAt },
+      topicDeletion: { startedAt: topic.startedAt, endedAt: topic.endedAt },
+      overlapped:
+        Math.max(group.startedAt, topic.startedAt) < Math.min(group.endedAt, topic.endedAt),
+    })
     const failures = results
       .filter(({ status }) => status === 'rejected')
       .map(({ reason }) => reason)
@@ -1641,22 +1905,39 @@ class CapabilityCase {
    * @throws {Error} When group deletion is refused; the shared proof checks absence.
    */
   async deleteGroup(signal, groupId) {
-    await pollUntil(
-      signal,
-      10000,
-      async () => {
-        try {
-          await this.admin.deleteGroups([groupId])
-          return true
-        } catch (error) {
-          const code = error.groups?.[0]?.error?.code
-          if (code === 69) return true
-          if (code === 68) return false
-          throw error
-        }
-      },
-      { delayMs: 50, label: 'The group deletion' }
-    )
+    const evidence = new GroupDeletionEvidence(this, signal, groupId)
+    evidence.install()
+    let attempted = false
+    try {
+      await pollUntil(
+        signal,
+        10000,
+        async () => {
+          if (!attempted) {
+            attempted = true
+            evidence.describe('before-first-attempt')
+          }
+          try {
+            await evidence.observe('group-deletion-attempt', { layer: 'admin' }, () =>
+              this.admin.deleteGroups([groupId])
+            )
+            return true
+          } catch (error) {
+            evidence.describe('after-failed-attempt')
+            const code = error.groups?.[0]?.error?.code
+            if (code === 69) return true
+            if (code === 68) return false
+            throw error
+          }
+        },
+        { delayMs: 50, label: 'The group deletion' }
+      )
+    } catch (error) {
+      if (signal.aborted || performance.now() >= evidence.deadline) evidence.expire(error)
+      throw error
+    } finally {
+      await evidence.close()
+    }
   }
 
   /**
@@ -1712,6 +1993,333 @@ class CapabilityCase {
     })
   }
 }
+
+describe('capability group deletion evidence', () => {
+  beforeEach(() => jest.useFakeTimers())
+  afterEach(() => {
+    jest.restoreAllMocks()
+    jest.useRealTimers()
+    liveRun.reset()
+  })
+
+  /**
+   * Scripts real observer boundaries without opening a connection.
+   * @param {Function} remove The broker's scripted deletion result.
+   * @returns {object} The case, broker spies and original methods to check restoration.
+   */
+  const harness = (remove) => {
+    const broker = Object.assign(Object.create(Broker.prototype), {
+      nodeId: 2,
+      brokerAddress: 'coordinator:9092',
+    })
+    const deletion = jest
+      .spyOn(Broker.prototype, 'deleteGroups')
+      .mockImplementation(async (...args) => {
+        await new Promise((resolve) => setTimeout(resolve, 1))
+        return remove(...args)
+      })
+    const lookup = jest.spyOn(Broker.prototype, 'findGroupCoordinator').mockResolvedValue({
+      coordinator: { nodeId: 2, host: 'coordinator', port: 9092 },
+    })
+    const route = jest
+      .spyOn(Cluster.prototype, 'findGroupCoordinator')
+      .mockImplementation(async (request) => {
+        await broker.findGroupCoordinator(request)
+        return broker
+      })
+    const state = Object.assign(Object.create(CapabilityCase.prototype), {
+      group: 'owned-group',
+      topic: 'owned-topic',
+      deadline: performance.now() + 10000,
+      cleanupSteps: [],
+      row: jest.fn(),
+    })
+    state.admin = {
+      describeShareGroups: jest.fn(async () => ({
+        groups: [{ groupId: state.group, state: 'Empty', errorCode: 0, members: [] }],
+      })),
+      deleteGroups: jest.fn(async (ids) => {
+        const coordinator = await Cluster.prototype.findGroupCoordinator({ groupId: ids[0] })
+        const answer = await coordinator.deleteGroups(ids)
+        const failed = answer.results.filter(({ errorCode }) => errorCode !== 0)
+        if (failed.length) {
+          throw Object.assign(new Error('DeleteGroups failed'), {
+            groups: failed.map((row) => ({ ...row, error: createErrorFromCode(row.errorCode) })),
+          })
+        }
+        return answer.results
+      }),
+    }
+    state.deleteTopic = jest.fn(() => new Promise((resolve) => setTimeout(resolve, 10)))
+    const rows = (event) =>
+      state.row.mock.calls.filter(([kind]) => kind === event).map(([, row]) => row)
+    return { state, rows, deletion, lookup, route }
+  }
+
+  it('writes successful attempts, coordinator lookups, pre-state and topic overlap', async () => {
+    const { state, rows, deletion, lookup, route } = harness(async () => ({
+      results: [{ groupId: 'owned-group', errorCode: 0 }],
+    }))
+    const work = state.deleteFixtures(NEVER)
+    await jest.advanceTimersByTimeAsync(10)
+    await work
+    expect(rows('group-deletion-attempt')).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ layer: 'admin', status: 'succeeded', errorCode: 0 }),
+        expect.objectContaining({
+          layer: 'broker',
+          status: 'succeeded',
+          coordinatorNode: 2,
+          errorCode: 0,
+          retriable: false,
+        }),
+      ])
+    )
+    expect(rows('group-deletion-coordinator')).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ layer: 'route', status: 'succeeded', coordinatorNode: 2 }),
+        expect.objectContaining({ layer: 'rpc', status: 'succeeded', coordinatorNode: 2 }),
+      ])
+    )
+    expect(rows('group-deletion-state')).toContainEqual(
+      expect.objectContaining({
+        reason: 'before-first-attempt',
+        status: 'succeeded',
+        state: 'Empty',
+        members: [],
+      })
+    )
+    expect(state.admin.describeShareGroups.mock.invocationCallOrder[0]).toBeLessThan(
+      state.admin.deleteGroups.mock.invocationCallOrder[0]
+    )
+    for (const row of rows('group-deletion-attempt').filter(({ status }) => status !== 'started')) {
+      expect(row.endedAt).toBeGreaterThanOrEqual(row.startedAt)
+    }
+    expect(rows('fixture-deletion-overlap')).toEqual([
+      expect.objectContaining({ overlapped: true }),
+    ])
+    expect(Broker.prototype.deleteGroups).toBe(deletion)
+    expect(Broker.prototype.findGroupCoordinator).toBe(lookup)
+    expect(Cluster.prototype.findGroupCoordinator).toBe(route)
+    expect(jest.getTimerCount()).toBe(0)
+  })
+
+  it('records an internal retriable failure and coordinator lookup before success', async () => {
+    let attempt = 0
+    const { state, rows } = harness(async () => {
+      if (++attempt === 1) throw createErrorFromCode(16)
+      return { results: [{ groupId: 'owned-group', errorCode: 0 }] }
+    })
+    const original = state.admin.deleteGroups.getMockImplementation()
+    state.admin.deleteGroups.mockImplementation(async (ids) => {
+      try {
+        return await original(ids)
+      } catch (error) {
+        if (error.code !== 16) throw error
+        return original(ids)
+      }
+    })
+    const work = state.deleteGroup(NEVER, state.group)
+    await jest.advanceTimersByTimeAsync(10)
+    await work
+    expect(state.admin.deleteGroups).toHaveBeenCalledTimes(1)
+    expect(rows('group-deletion-attempt')).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          layer: 'broker',
+          status: 'failed',
+          errorCode: 16,
+          retriable: true,
+        }),
+        expect.objectContaining({ layer: 'broker', status: 'succeeded', errorCode: 0 }),
+      ])
+    )
+    expect(
+      rows('group-deletion-coordinator').filter(
+        ({ layer, status }) => layer === 'route' && status === 'succeeded'
+      )
+    ).toHaveLength(2)
+    expect(rows('group-deletion-state')).toContainEqual(
+      expect.objectContaining({
+        reason: 'after-failed-attempt',
+        status: 'succeeded',
+      })
+    )
+    expect(liveRun.tainted).toBe(false)
+    expect(jest.getTimerCount()).toBe(0)
+  })
+
+  it('retains NON_EMPTY_GROUP and the failed-attempt state before a successful retry', async () => {
+    let attempt = 0
+    const { state, rows } = harness(async () => ({
+      results: [{ groupId: 'owned-group', errorCode: ++attempt === 1 ? 68 : 0 }],
+    }))
+    state.admin.describeShareGroups.mockResolvedValueOnce({
+      groups: [
+        {
+          groupId: state.group,
+          state: 'Stable',
+          errorCode: 0,
+          members: [
+            {
+              memberId: 'leaving-member',
+              memberEpoch: 3,
+              clientId: 'workload',
+              clientHost: 'host',
+            },
+          ],
+        },
+      ],
+    })
+    const work = state.deleteGroup(NEVER, state.group)
+    await jest.advanceTimersByTimeAsync(55)
+    await work
+    expect(state.admin.deleteGroups).toHaveBeenCalledTimes(2)
+    expect(rows('group-deletion-state')).toContainEqual(
+      expect.objectContaining({
+        reason: 'before-first-attempt',
+        state: 'Stable',
+        memberCount: 1,
+        members: [expect.objectContaining({ memberId: 'leaving-member', memberEpoch: 3 })],
+      })
+    )
+    expect(rows('group-deletion-attempt')).toContainEqual(
+      expect.objectContaining({
+        layer: 'broker',
+        status: 'failed',
+        errorCode: 68,
+        errorName: 'KafkaJSProtocolError',
+        errorType: 'NON_EMPTY_GROUP',
+        retriable: false,
+      })
+    )
+    expect(rows('group-deletion-state')).toContainEqual(
+      expect.objectContaining({
+        reason: 'after-failed-attempt',
+        status: 'succeeded',
+        state: 'Empty',
+      })
+    )
+    expect(rows('group-deletion-attempt')).toContainEqual(
+      expect.objectContaining({
+        layer: 'broker',
+        status: 'succeeded',
+        errorCode: 0,
+      })
+    )
+    expect(liveRun.tainted).toBe(false)
+    expect(jest.getTimerCount()).toBe(0)
+  })
+
+  it('closes pending rows on expiry without issuing a post-expiry describe or late rows', async () => {
+    let resolve
+    const { state, rows, deletion, lookup, route } = harness(
+      () =>
+        new Promise((done) => {
+          resolve = done
+        })
+    )
+    const owner = new AbortController()
+    state.deadline = performance.now() + 20
+    const work = state.deleteFixtures(owner.signal).catch((error) => error)
+    await jest.advanceTimersByTimeAsync(10)
+    const expiry = new Error('original cleanup deadline')
+    owner.abort(expiry)
+    await jest.advanceTimersByTimeAsync(CASE_JOIN_MS)
+    const failure = await work
+    expect(failure).toBeInstanceOf(AggregateError)
+    expect(rows('group-deletion-attempt')).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ layer: 'admin', status: 'expired', outcomeUnknown: true }),
+        expect.objectContaining({ layer: 'broker', status: 'expired', coordinatorNode: 2 }),
+      ])
+    )
+    expect(rows('group-deletion-state')).toContainEqual(
+      expect.objectContaining({
+        reason: 'after-expired-attempt',
+        status: 'unavailable',
+        error: expect.objectContaining({ message: expiry.message }),
+      })
+    )
+    expect(state.admin.describeShareGroups).toHaveBeenCalledTimes(1)
+    expect(state.admin.describeShareGroups.mock.calls[0][1].apiTimeout).toBeLessThanOrEqual(20)
+    expect(rows('fixture-deletion-overlap')[0].overlapped).toBe(true)
+    expect(liveRun.tainted).toBe(true)
+    expect(Broker.prototype.deleteGroups).toBe(deletion)
+    expect(Broker.prototype.findGroupCoordinator).toBe(lookup)
+    expect(Cluster.prototype.findGroupCoordinator).toBe(route)
+    const count = state.row.mock.calls.length
+    resolve({ results: [{ groupId: state.group, errorCode: 0 }] })
+    await jest.advanceTimersByTimeAsync(0)
+    expect(state.row).toHaveBeenCalledTimes(count)
+    expect(state.admin.deleteGroups).toHaveBeenCalledTimes(1)
+    expect(jest.getTimerCount()).toBe(0)
+  })
+
+  it('records expiry of the unchanged deletion poll even when the parent scope is live', async () => {
+    let resolve
+    const { state, rows } = harness(
+      () =>
+        new Promise((done) => {
+          resolve = done
+        })
+    )
+    const work = state.deleteGroup(NEVER, state.group).catch((error) => error)
+    await jest.advanceTimersByTimeAsync(10000 + CASE_JOIN_MS)
+    expect((await work).message).toContain('The group deletion did not settle within 10000 ms')
+    expect(NEVER.aborted).toBe(false)
+    expect(rows('group-deletion-attempt')).toContainEqual(
+      expect.objectContaining({
+        layer: 'broker',
+        status: 'expired',
+        outcomeUnknown: true,
+      })
+    )
+    expect(rows('group-deletion-state')).toContainEqual(
+      expect.objectContaining({
+        reason: 'after-expired-attempt',
+        status: 'unavailable',
+      })
+    )
+    expect(state.admin.describeShareGroups).toHaveBeenCalledTimes(1)
+    resolve({ results: [{ groupId: state.group, errorCode: 0 }] })
+    await jest.advanceTimersByTimeAsync(0)
+    expect(jest.getTimerCount()).toBe(0)
+  })
+
+  it('bounds diagnostic reads independently of an enclosing admin retry deadline', async () => {
+    const { state, rows } = harness(async () => ({}))
+    const tokens = []
+    const methods = {
+      describeShareGroups: jest.fn(() => {
+        tokens.push(currentDeadline())
+        return new Promise(() => {})
+      }),
+    }
+    state.admin = wrapAdmin(methods, { describeShareGroups: 1 }, 60000)
+    const evidence = new GroupDeletionEvidence(state, NEVER, state.group)
+    const failure = createErrorFromCode(16)
+    const attempt = runWithDeadline('deleteGroups', 10000, () =>
+      evidence.observe('group-deletion-attempt', { layer: 'broker' }, async () => {
+        throw failure
+      })
+    ).catch((error) => error)
+    await jest.advanceTimersByTimeAsync(50)
+    expect(await attempt).toBe(failure)
+    await evidence.close()
+    expect(tokens[0].method).toBe('describeShareGroups')
+    expect(tokens[0].timeoutMs).toBe(50)
+    expect(rows('group-deletion-state')).toContainEqual(
+      expect.objectContaining({
+        reason: 'after-failed-attempt',
+        status: 'failed',
+        apiTimeout: 50,
+      })
+    )
+    expect(liveRun.tainted).toBe(false)
+    expect(jest.getTimerCount()).toBe(0)
+  })
+})
 
 describe('capability sentinel ownership', () => {
   beforeEach(() => jest.useFakeTimers())
