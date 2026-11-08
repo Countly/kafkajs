@@ -170,6 +170,25 @@ describe('client metrics resource ownership', () => {
       Object.keys(config.entries).map((name) => ({ name, operation: 1 }))
     )
   })
+  test('returns a deletion receipt with the successful readback, response and absent listing', async () => {
+    let tick = 0
+    const receipt = await withTelemetryResource(fixture(), config, async () => {}, {
+      now: () => ++tick,
+    })
+    expect(receipt).toEqual({
+      name: config.name,
+      entries: config.entries,
+      createdAt: 1,
+      readback: expect.objectContaining({ resourceName: 'fixture', errorCode: 0 }),
+      deletion: {
+        startedAt: 2,
+        responseAt: 3,
+        response: { resources: [{ resourceType: 16, resourceName: 'fixture', errorCode: 0 }] },
+        listedAt: 4,
+        listing: { resources: [] },
+      },
+    })
+  })
   test('preserves the exact work rejection after cleanup', async () => {
     const sentinel = new Error('original')
     const admin = fixture()
@@ -1989,7 +2008,7 @@ describe('required live archive dimensions and semantics', () => {
 
     /** @returns {void} writes a self-consistent archive with refreshed bytes and digests */
     save() {
-      const files = {}
+      const files = { ...this.files }
       const rows = clone(this.rows)
       const put = (name, value) => {
         files[`case-required/${name}`] = Buffer.isBuffer(value)
@@ -2261,6 +2280,57 @@ describe('required live archive dimensions and semantics', () => {
   test('verifies exact custom resource metric and point cardinalities in every lifecycle window', () => {
     customArchive().verify()
   })
+  test('verifies a deleted-subscription final through the full archive and requires its admin receipt', () => {
+    const a = customArchive()
+    const transcript = a.streams.producer.transcript
+    const get = transcript.records.find((r) => r.apiKey === 71)
+    const last = transcript.records.at(-1)
+    transcript.closures = [{ at: 6000, end: 6010, pending: [] }]
+    a.files['case-required/producer/push-r60.bin'] = Buffer.alloc(0)
+    a.record.zeroPushes = [
+      { owner: 'producer', requestKey: 'r60', disposition: 'all-custom-points-unregistered' },
+    ]
+    transcript.records.push({
+      ...clone(last),
+      requestKey: 'r60',
+      index: 60,
+      metricsBytes: 0,
+      metricsSha256: hash(Buffer.alloc(0)),
+      terminating: true,
+      writeAt: 6001,
+      response: { errorCode: 117, responseAt: 6002 },
+    })
+    const entries = {
+      metrics: get.response.requestedMetrics.join(','),
+      'interval.ms': '1000',
+      match: 'client_id=^required-producer$',
+    }
+    const resource = { resourceType: 16, resourceName: 'required', errorCode: 0 }
+    a.oracles.subscriptionDeletions = {
+      producer: {
+        name: 'required',
+        entries,
+        createdAt: 0,
+        readback: {
+          ...resource,
+          configEntries: Object.entries(entries).map(([configName, configValue]) => ({
+            configName,
+            configValue,
+          })),
+        },
+        deletion: {
+          startedAt: 5900,
+          responseAt: 5901,
+          response: { resources: [resource] },
+          listedAt: 5902,
+          listing: { resources: [] },
+        },
+      },
+    }
+    a.verify()
+    delete a.oracles.subscriptionDeletions
+    expect(() => a.verify()).toThrow('Unqualified final subscription error')
+  })
   test.each([
     ['metric', 'Custom metric count differs'],
     ['series', 'Custom total point count differs'],
@@ -2321,8 +2391,8 @@ describe('required live archive dimensions and semantics', () => {
         .writeTaggedFields([])
       const body = new Encoder()
         .writeUVarIntString('share-group')
-        .writeUVarIntString('member')
-        .writeInt32(1)
+        .writeUVarIntString(correlation === 2 ? (statuses.finalMember ?? 'member') : 'member')
+        .writeInt32(correlation === 2 ? (statuses.settlementEpoch ?? 1) : 1)
       if (apiKey === 78)
         body
           .writeInt32(100)
@@ -2394,6 +2464,12 @@ describe('required live archive dimensions and semantics', () => {
       exchange(79, 3, [['4', '9', releaseType]], [], 300, releaseAt),
     ]
   }
+  /** @param {string} topicId owned UUID @param {number} [at] final response time @param {object} [statuses] broker controls @returns {object[]} acquisition and final accepted-prefix acknowledgement */
+  const outcomesFrames = (topicId, at = 201, statuses = {}) =>
+    shareFrames(topicId, 301, 2, { settlementEpoch: -1, ...statuses })
+      .slice(0, 2)
+      .map((frame, index) => (index === 1 ? { ...frame, responseAt: at } : frame))
+
   /** @returns {Archive} full configured outcomes archive, including raw share confirmations */
   const outcomesArchive = () => {
     const a = new Archive('telemetry-outcomes')
@@ -2478,7 +2554,7 @@ describe('required live archive dimensions and semantics', () => {
     Object.assign(stream.recovery, { checkpoint: 2, recoveredPush: 'r20' })
     const topic = 'required-share-topic'
     const topicId = 'ffeeddcc-bbaa-9988-7766-554433221100'
-    const frames = shareFrames(topicId)
+    const frames = outcomesFrames(topicId)
     const log = Array.from({ length: 10 }, (_, i) => ({
       topic,
       partition: 0,
@@ -2531,6 +2607,36 @@ describe('required live archive dimensions and semantics', () => {
   test('verifies configured ordinary fault arms and exact share topic offset handler and settlement identities', () => {
     outcomesArchive().verify()
   })
+  test.each([
+    ['non-final acknowledgement', { settlementEpoch: 1 }],
+    ['fetch acknowledgement in place of final', { settlementApi: 78 }],
+    ['failed final acknowledgement', { settlementFetchError: 7 }],
+    ['foreign final member', { finalMember: 'foreign' }],
+    ['failed acquisition', { acquisitionFetchError: 7 }],
+  ])('rejects %s as proof of releasing the held suffix', (_name, statuses) => {
+    const a = outcomesArchive()
+    a.oracles.share.frames = outcomesFrames(a.oracles.share.topicId, 201, statuses)
+    a.oracles.share.confirmed = confirmedDecisions(a.oracles.share.frames, 'share-group')
+    expect(() => a.verify()).toThrow()
+  })
+  test('keeps acquisition fetch status independent of its acknowledgement status', () => {
+    const a = outcomesArchive()
+    a.oracles.share.frames = outcomesFrames(a.oracles.share.topicId, 201, {
+      acquisitionAckError: 7,
+    })
+    a.verify()
+  })
+  test('requires redelivery after successful final acknowledgement and before lock expiry', () => {
+    const a = outcomesArchive()
+    a.oracles.share.redelivered[0].at = 199
+    expect(() => a.verify()).toThrow('Redelivery outside final-release window')
+  })
+  test('rejects explicit suffix acknowledgements in the forced-close oracle', () => {
+    const a = outcomesArchive()
+    a.oracles.share.frames = shareFrames(a.oracles.share.topicId)
+    a.oracles.share.confirmed = confirmedDecisions(a.oracles.share.frames, 'share-group')
+    expect(() => a.verify()).toThrow('Extra or duplicate broker share settlement')
+  })
   test.each(['ordinary arm', 'fault mode'])(
     'rejects a deleted required %s and its obligations',
     (dimension) => {
@@ -2561,7 +2667,7 @@ describe('required live archive dimensions and semantics', () => {
     if (change === 'missing-recovery') delete a.record.results.share.recovery
     if (change === 'unexercised-recovery') a.record.results.share.recovery.recoveredPush = 'r99'
     if (change === 'foreign-topic') {
-      inputs.frames.splice(1, 2, ...shareFrames(ID).slice(1))
+      inputs.frames.splice(1, 2, ...outcomesFrames(ID).slice(1))
       inputs.confirmed = confirmedDecisions(inputs.frames, inputs.group)
     }
     if (change === 'handler-offset') inputs.handled[4].offset = '5'
@@ -2569,7 +2675,7 @@ describe('required live archive dimensions and semantics', () => {
       inputs.settlements.push({ ...inputs.settlements[0], firstOffset: '10', lastOffset: '10' })
     if (change === 'duplicate-settlement') inputs.settlements.push(clone(inputs.settlements[0]))
     if (change === 'lock-expired-release') {
-      inputs.frames = shareFrames(inputs.topicId, 15100)
+      inputs.frames = outcomesFrames(inputs.topicId, 15100)
       inputs.confirmed = confirmedDecisions(inputs.frames, inputs.group)
     }
     if (change === 'duplicate-broker-settlement') {
@@ -2712,7 +2818,7 @@ describe('required live archive dimensions and semantics', () => {
       expect(() => a.verify()).toThrow('Capable share broker settlement identity differs')
     }
   )
-  test.each(['configured share', 'share', 'share-off'])(
+  test.each(['share', 'share-off'])(
     'verifies independent fetch and acknowledgement statuses for %s',
     (owner) => {
       const a = owner === 'configured share' ? outcomesArchive() : unsupportedArchive()
@@ -2728,8 +2834,6 @@ describe('required live archive dimensions and semantics', () => {
     }
   )
   test.each([
-    ['configured share', 'fetch error + ack ok', 'Missing raw share acquisition'],
-    ['configured share', 'fetch ok + ack error', 'Contradicted acknowledgement ledger'],
     ['share', 'fetch error + ack ok', 'Contradicted held acquisition ranges'],
     ['share', 'fetch ok + ack error', 'Incomplete capable share broker settlement'],
     ['share-off', 'fetch error + ack ok', 'Contradicted held acquisition ranges'],

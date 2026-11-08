@@ -24,7 +24,12 @@ const {
   assertCustomShape,
   ordinaryOwnership,
 } = require('./semantics')
-const { confirmedDecisions, acquisitionStart, heldAcquisitions } = require('./shareEvidence')
+const {
+  confirmedDecisions,
+  finalAcknowledgement,
+  acquisitionStart,
+  heldAcquisitions,
+} = require('./shareEvidence')
 const { cacheRetirement, connectionIdentity } = require('./cacheTrace')
 
 const sha = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex')
@@ -173,6 +178,9 @@ const runCase = async (
   if ([...LIVE, UNSUPPORTED].includes(name)) {
     record.oracles = {
       ...record.oracles,
+      ...(record.results?.subscriptionDeletions
+        ? { subscriptionDeletions: record.results.subscriptionDeletions }
+        : {}),
       ...(record.results?.rawOracle ? { rawControl: record.results.rawOracle } : {}),
       ...Object.fromEntries(
         Object.entries(record.results?.arms ?? {}).map(([key, value]) => [key, value.inputs])
@@ -850,17 +858,94 @@ const isRefreshThrottle = (transcript, request) => {
 }
 
 /**
+ * Qualifies the sole best-effort final rejected after deletion of its active subscription.
+ * Kafka recomputes the subscription before validating even a terminating Push. Close must keep
+ * the last accepted ID, send no Get/retry, and use its captured existing socket and boundary.
+ * @param {object} transcript complete owner ledger
+ * @param {object} request terminating Push answered with 117
+ * @param {object} receipt independent admin readback, deletion response and absent listing
+ * @returns {boolean} whether the receipt and complete stream prove this exact cleanup race
+ */
+const isDeletedSubscriptionFinal = (transcript, request, receipt) => {
+  try {
+    const telemetry = transcript.records.filter(
+      (r) => r.type === 'request' && [71, 72].includes(r.apiKey)
+    )
+    const index = telemetry.indexOf(request)
+    const prior = telemetry[index - 1]
+    const get = telemetry.slice(0, index).findLast((r) => r.apiKey === 71)
+    const close = transcript.closures.find(
+      (c) => request.writeAt >= c.at && request.response.responseAt <= c.end
+    )
+    assert(request.apiKey === 72 && request.terminating && index === telemetry.length - 1)
+    assert(close && close.pending.length === 0)
+    assert.equal(telemetry.filter((r) => r.terminating && r.writeAt >= close.at).length, 1)
+    assert(
+      get?.response?.errorCode === 0 &&
+        prior?.apiKey === 72 &&
+        !prior.terminating &&
+        prior.response?.errorCode === 0
+    )
+    for (const r of [get, prior]) {
+      for (const key of ['node', 'socketId', 'clientId']) assert.equal(r[key], request[key])
+    }
+    assert(typeof request.clientId === 'string' && request.clientId.length > 0)
+    assert(
+      Number.isInteger(request.subscriptionId) &&
+        request.subscriptionId >= -2147483648 &&
+        request.subscriptionId <= 2147483647
+    )
+    assert(get.response.responseAt <= prior.writeAt && prior.writeAt <= prior.response.responseAt)
+    assert.equal(get.response.uuid, request.uuid)
+    assert.equal(prior.uuid, request.uuid)
+    assert.equal(request.subscriptionId, get.response.subscriptionId)
+    assert.equal(prior.subscriptionId, request.subscriptionId)
+    const { name, entries, readback, createdAt, deletion } = receipt
+    const success = (r) => r.resourceType === 16 && r.resourceName === name && r.errorCode === 0
+    assert(success(readback))
+    assert.deepEqual(
+      Object.fromEntries(readback.configEntries.map((e) => [e.configName, e.configValue])),
+      entries
+    )
+    assert.deepEqual(get.response.requestedMetrics, entries.metrics.split(','))
+    assert(get.response.pushIntervalMs > 0)
+    assert.equal(get.response.pushIntervalMs, Number(entries['interval.ms']))
+    assert(
+      entries.match.startsWith('client_id=') &&
+        new RegExp(entries.match.slice(10)).test(request.clientId)
+    )
+    assert(Number.isFinite(createdAt) && createdAt <= get.writeAt)
+    assert(Number.isFinite(deletion.startedAt) && prior.response.responseAt <= deletion.startedAt)
+    assert(
+      deletion.startedAt <= deletion.responseAt &&
+        deletion.responseAt <= deletion.listedAt &&
+        deletion.listedAt <= close.at
+    )
+    assert.equal(deletion.response.resources.length, 1)
+    assert(success(deletion.response.resources[0]))
+    assert(!deletion.listing.resources.some((r) => r.type === 16 && r.name === name))
+    const socket = transcript.sockets.find((s) => s.id === request.socketId)
+    assert(socket.closedAt >= close.end)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
  * Requires every Push and Get of every owner to be accounted for: answered with success, answered
- * with an error the case declared for that owner, the source-qualified refresh throttle,
+ * with an error the case declared for that owner, the source-qualified refresh throttle or
+ * subscription-deletion final,
  * or an exact request-level cancellation joined
  * to its public-close boundary or one deliberately faulted exchange.
  * @param {Object<string,object>} transcripts observer transcript by owner label
  * @param {{errors?:Object<string,number[]>}} allowed per-owner deliberate response errors; unanswered
  *   requests require transcript cancellations joined to closures or declared request-level faults
+ * @param {{subscriptionDeletions?:Object<string,object>}} context archived admin deletion receipts
  * @returns {void}
  * @throws {Error} naming the first undeclared error or unanswered request
  */
-const assertStreamAccounted = (transcripts, allowed = {}) => {
+const assertStreamAccounted = (transcripts, allowed = {}, context = {}) => {
   for (const [owner, transcript] of Object.entries(transcripts)) {
     let acceptedUuid
     for (const get of transcript.records.filter((r) => r.apiKey === 71)) {
@@ -932,7 +1017,12 @@ const assertStreamAccounted = (transcripts, allowed = {}) => {
             assert(r.apiKey === 72 && r.terminating && r.writeAt >= c.at && r.writeAt <= close.end)
           }
         }
-      } else if (r.response.errorCode === 89)
+      } else if (r.response.errorCode === 117 && r.terminating)
+        assert(
+          isDeletedSubscriptionFinal(transcript, r, context.subscriptionDeletions?.[owner]),
+          `Unqualified final subscription error for ${r.requestKey} of ${owner}`
+        )
+      else if (r.response.errorCode === 89)
         assert(
           isRefreshThrottle(transcript, r),
           `Unqualified broker throttle for ${r.requestKey} of ${owner}`
@@ -1068,7 +1158,17 @@ const verifyLive = (record, directory, manifest, read) => {
   const transcripts = Object.fromEntries(
     Object.entries(manifest.owners).map(([owner, relative]) => [owner, read(relative)])
   )
-  assertStreamAccounted(transcripts, record.allowed)
+  const oracles = read(`${manifest.root}/oracles.json`)
+  let subscriptionDeletions
+  if (['telemetry-custom', 'telemetry-payload'].includes(manifest.scenario)) {
+    subscriptionDeletions = oracles.subscriptionDeletions
+    if (subscriptionDeletions) {
+      const owner = manifest.scenario === 'telemetry-custom' ? 'producer' : 'producer-candidate'
+      assert.deepEqual(Object.keys(subscriptionDeletions), [owner])
+      assert.equal(subscriptionDeletions[owner].name, record.run.stem)
+    }
+  }
+  assertStreamAccounted(transcripts, record.allowed, { subscriptionDeletions })
   const reader = new TelemetryExportReader(path.join(directory, manifest.root))
   const consumed = new Set()
   const actual = Object.entries(transcripts).flatMap(([owner, transcript]) =>
@@ -1170,7 +1270,6 @@ const verifyLive = (record, directory, manifest, read) => {
       .sort(),
     'Extra decoded Push sidecar'
   )
-  const oracles = read(`${manifest.root}/oracles.json`)
   const { results } = record
   if (['telemetry-prefix', 'telemetry-custom', 'telemetry-payload'].includes(manifest.scenario))
     assertOwnerUuid(
@@ -2380,20 +2479,30 @@ const verifyShare = (result, inputs, transcripts, topic, samples) => {
     inputs.confirmed,
     'Contradicted acknowledgement ledger'
   )
-  assert.equal(inputs.confirmed.length, 10, 'Extra or duplicate broker share settlement')
-  for (let index = 0; index < 10; index++) {
+  assert.equal(inputs.confirmed.length, 4, 'Extra or duplicate broker share settlement')
+  for (let index = 0; index < 4; index++) {
     const decisions = inputs.confirmed.filter((r) => r.offset === String(index))
     assert.equal(decisions.length, 1, 'Share settlement must occur exactly once')
     const [decision] = decisions
     assert.equal(decision.topicId, inputs.topicId, 'Broker share settlement topic differs')
     assert.equal(decision.partition, 0)
-    assert.equal(decision.type, index < 4 ? 1 : 2)
+    assert.equal(decision.type, 1)
     assert.equal(decision.errorCode, 0)
     assert(
       decision.at >= inputs.acquiredAt && decision.at < inputs.acquiredAt + result.lockMs,
       'Settlement after lock expiry'
     )
   }
+  const final = finalAcknowledgement(inputs.frames, inputs.group, inputs.topicId)
+  assert.deepEqual(
+    confirmedDecisions([final], inputs.group),
+    inputs.confirmed,
+    'Accepted prefix must be confirmed by the final acknowledgement'
+  )
+  assert(
+    final.at >= inputs.handlerAt && final.responseAt < inputs.acquiredAt + result.lockMs,
+    'Settlement after lock expiry'
+  )
   const suffix = inputs.expected
     .slice(4)
     .map((r) => r.key)
@@ -2414,8 +2523,10 @@ const verifyShare = (result, inputs, transcripts, topic, samples) => {
   assert.deepEqual(redeliveryIdentities(inputs.redelivered), redeliveryIdentities(identities))
   assert(
     inputs.redelivered.every(
-      (r) => r.deliveryCount >= 2 && r.at < inputs.acquiredAt + result.lockMs
-    )
+      (r) =>
+        r.deliveryCount >= 2 && r.at >= final.responseAt && r.at < inputs.acquiredAt + result.lockMs
+    ),
+    'Redelivery outside final-release window'
   )
   verifyPublicSettlements(inputs.settlements, topic, (index) => (index < 4 ? 'accept' : 'release'))
   assert.deepEqual(result.redelivered, suffix)
