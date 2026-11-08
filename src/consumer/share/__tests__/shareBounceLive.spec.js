@@ -1429,37 +1429,51 @@ const indexedEvidenceWork = function* (entries, original, bounces) {
     if (cutKeys.has(`${interruptionEvent(kind, event).at}:${interruptionEvent(kind, event).order}`))
       timeline.push({ kind: 'cut', event: interruptionEvent(kind, event) })
   const entryPosition = new Map(entries.map((entry, position) => [entry, position]))
-  const orderedTimeline = yield* sortedAuditWork(
-    timeline,
-    (a, b) =>
-      a.event.at - b.event.at ||
-      (a.event.order ?? 0) - (b.event.order ?? 0) ||
-      Number(b.kind === 'cut') - Number(a.kind === 'cut')
-  )
+  const orderedTimeline = yield* sortedAuditWork(timeline, (a, b) => a.event.at - b.event.at)
   const active = new Map()
-  for (const item of orderedTimeline) {
-    if (visited++ % 100 === 0) yield
-    if (item.kind === 'handler') indexMember(active, item.event.identity, item.event)
-    else if (item.kind === 'success') {
-      const remaining = (active.get(item.entry.identity) ?? []).filter((entry) =>
-        precedes(item.entry, entry)
-      )
-      if (remaining.length) active.set(item.entry.identity, remaining)
-      else active.delete(item.entry.identity)
-    } else {
-      const key = `${item.event.at}:${item.event.order}`
-      if (!evidence.auditIndex.history.has(key)) {
-        const history = []
-        for (const group of active.values())
-          for (const entry of group) {
-            if (visited++ % 100 === 0) yield
-            if (precedes(entry, item.event)) history.push(entry)
-          }
-        evidence.auditIndex.history.set(
-          key,
-          yield* sortedAuditWork(history, (a, b) => entryPosition.get(a) - entryPosition.get(b))
-        )
+  let position = 0
+  while (position < orderedTimeline.length) {
+    const at = orderedTimeline[position].event.at
+    const successes = []
+    const cuts = []
+    while (position < orderedTimeline.length && orderedTimeline[position].event.at === at) {
+      if (visited++ % 100 === 0) yield
+      const item = orderedTimeline[position++]
+      if (item.kind === 'handler') indexMember(active, item.event.identity, item.event)
+      else if (item.kind === 'success') successes.push(item)
+      else cuts.push(item.event)
+    }
+    // Equal clocks are a partial order. Apply receipts to each cut only with strict evidence.
+    for (const cut of cuts) {
+      const key = `${cut.at}:${cut.order}`
+      if (evidence.auditIndex.history.has(key)) continue
+      const lastSuccess = new Map()
+      for (const { entry, event } of successes) {
+        if (visited++ % 100 === 0) yield
+        if (!precedes(entry, cut) || !precedes(event, cut)) continue
+        const prior = lastSuccess.get(entry.identity)
+        if (!prior || entryPosition.get(prior) < entryPosition.get(entry))
+          lastSuccess.set(entry.identity, entry)
       }
+      const history = []
+      for (const [identity, group] of active) {
+        const success = lastSuccess.get(identity)
+        for (const entry of group) {
+          if (visited++ % 100 === 0) yield
+          if (precedes(entry, cut) && (!success || precedes(success, entry))) history.push(entry)
+        }
+      }
+      evidence.auditIndex.history.set(
+        key,
+        yield* sortedAuditWork(history, (a, b) => entryPosition.get(a) - entryPosition.get(b))
+      )
+    }
+    // Every later clock strictly follows these receipts, even when their sequence is unavailable.
+    for (const { entry } of successes) {
+      if (visited++ % 100 === 0) yield
+      const remaining = (active.get(entry.identity) ?? []).filter((later) => precedes(entry, later))
+      if (remaining.length) active.set(entry.identity, remaining)
+      else active.delete(entry.identity)
     }
   }
   return evidence
@@ -1837,14 +1851,17 @@ const historyAccounting = (entries, bounces, evidence, cut) => {
  */
 const reconstructFreezes = function* (entries, bounces, evidence) {
   const reconstructed = []
-  const journal = [
-    ...interruptionJournal(evidence),
-    ...evidence.commands.map((event) => ({ kind: 'command', event })),
-  ].sort((a, b) => {
-    const first = interruptionEvent(a.kind, a.event)
-    const second = interruptionEvent(b.kind, b.event)
-    return first.at - second.at || first.order - second.order
-  })
+  const journal = yield* sortedAuditWork(
+    [
+      ...interruptionJournal(evidence),
+      ...evidence.commands.map((event) => ({ kind: 'command', event })),
+    ],
+    (a, b) => {
+      const first = interruptionEvent(a.kind, a.event)
+      const second = interruptionEvent(b.kind, b.event)
+      return first.at - second.at || first.order - second.order
+    }
+  )
   let primitiveCount = 0
   for (const { kind, event } of journal) {
     if (primitiveCount++ % 100 === 0) yield
@@ -2670,7 +2687,8 @@ const auditReplay = (entries, bounces, corpus, evidence) =>
  * @param {Set<string>} corpus Exact immutable append corpus.
  * @param {object[]} bounces Frozen original obligations.
  * @param {BounceEvidence} evidence Original requests, results and authority losses.
- * @returns {object} Disjoint successful/candidate identity sets and missing identities.
+ * @param {object} [frozen] Precomputed freeze accounting over the same sealed journals.
+ * @returns {Generator<void, object, unknown>} Audit steps completing with disjoint successful/candidate sets and missing identities.
  */
 const settlementCandidatesWork = function* (entries, corpus, bounces, evidence, frozen) {
   entries = [...entries]
@@ -2831,7 +2849,7 @@ const settlementCandidates = (...args) => finishAudit(settlementCandidatesWork(.
  * @param {object[]} entries Complete handler entries.
  * @param {object[]} exchanges Every original exchange, including lost responses.
  * @param {number[]} limits Actual readback from every broker.
- * @returns {string[]} Unproven archival exclusions.
+ * @returns {Generator<void, string[], unknown>} Audit steps completing with unproven archival exclusions.
  */
 const archivalProblemsWork = function* (entries, exchanges, limits) {
   const problems = []
@@ -2921,7 +2939,7 @@ const archivalProblemsWork = function* (entries, exchanges, limits) {
 /**
  * Recomputes final acceptance from original identity, receipt, terminal and verifier streams.
  * @param {object} proof Independent corpus, original journals and raw terminal observations.
- * @returns {object} Settlement classes and every violated obligation; candidates alone never pass.
+ * @returns {Generator<void, object, unknown>} Audit steps completing with settlement classes and violated obligations; candidates alone never pass.
  */
 const auditTerminalWork = function* ({
   corpus,
@@ -5607,10 +5625,12 @@ class ShareBounceCase {
       if (historyEntries.has(entry.id)) identities.add(entry.identity)
     for (const extra of this.replay?.extras ?? []) identities.add(extra.identity)
     for (const candidate of this.settlement?.unknown ?? []) identities.add(candidate.identity)
-    this.archiveFailureIdentities(identities, frameIds, emit)
+    yield* this.archiveFailureIdentities(identities, frameIds, emit)
     if (failed) emit('failure-log', this.failureLog)
     const bulkFrames = []
+    let planned = 0
     for (const frame of this.tap.allFrames) {
+      if (planned++ % 100 === 0) yield
       const producerFrame = [0, 22].includes(frame.apiKey)
       if (failed && !producerFrame && !frameIds.has(frame.id)) continue
       const { bytes, responseBytes, ...fact } = frame
@@ -5737,22 +5757,33 @@ class ShareBounceCase {
       this.archiveIncomplete = true
       this.captureProblems.push(...problems)
     }
-    this.row('witness-closure', {
-      evidenceSchema: 3,
-      identities: [...identities],
-      frames: [...frameIds].sort((a, b) => a - b),
-      rows: rows.map((fact, index) => ({
+    const manifest = []
+    for (const [index, fact] of rows.entries()) {
+      if (index % 100 === 0) yield
+      manifest.push({
         index,
         event: fact.event,
         id: fact.fields?.id,
+        fields: Object.keys(fact.fields ?? {}),
+        sha256: createHash('sha256')
+          .update(JSON.stringify(fact.fields ?? {}))
+          .digest('hex'),
         required: priority(fact) < 4,
         evidenceId: `${this.nonce}:${(this.archiveSequence ?? 0) + 1 + index + (priority(fact) >= 4 ? 1 : 0)}`,
-      })),
+      })
+    }
+    const closure = {
+      evidenceSchema: 3,
+      identities: [...identities],
+      frames: [...frameIds].sort((a, b) => a - b),
+      rows: manifest,
       omitted: {
         epochSources:
           this.evidence.epochs.length - rows.filter(({ event }) => event === 'epoch-source').length,
       },
-    })
+    }
+    this.archiveClosure.sha256 = createHash('sha256').update(JSON.stringify(closure)).digest('hex')
+    this.row('witness-closure', closure)
     const requiredRows = rows.filter((fact) => priority(fact) < 4)
     const optionalRows = rows.filter((fact) => priority(fact) >= 4)
     for (const fact of requiredRows) {
@@ -5796,6 +5827,7 @@ class ShareBounceCase {
       ...(byEvent.get('exchange-history') ?? []).flatMap(({ exchanges }) => exchanges),
     ]
     for (const row of referenced) for (const id of row.frames ?? []) frameIds.add(id)
+    problems.push(...this.archiveLifecycleProblems(byEvent))
     const controls = new Map(
       (byEvent.get('bounce-control') ?? []).map((control) => [control.id, control])
     )
@@ -5886,7 +5918,123 @@ class ShareBounceCase {
     return problems
   }
 
-  /** @returns {void} Rejects missing references and persisted chunks before completion. */
+  /**
+   * Requires original command, process and restoration evidence regardless of replay selection.
+   * @param {Map<string, object[]>} byEvent Decoded archive components.
+   * @returns {string[]} Missing lifecycle results, references, availability or ordering.
+   */
+  archiveLifecycleProblems(byEvent) {
+    const problems = []
+    const commands = byEvent.get('bounce-command') ?? []
+    const bounces = byEvent.get('frozen-bounce') ?? []
+    const controls = byEvent.get('bounce-control') ?? []
+    const restorations = byEvent.get('bounce-restoration') ?? []
+    const mappings = byEvent.get('lifecycle-mapping') ?? []
+    const episodes = new Set([
+      ...this.snapshots.map(({ index }) => index),
+      ...this.evidence.commands.map(({ index }) => index),
+      ...this.evidence.controls.map(({ episode }) => episode),
+    ])
+    for (const index of episodes) {
+      const commandRows = commands.filter((command) => command.index === index)
+      const bounceRows = bounces.filter((bounce) => bounce.index === index)
+      const command = commandRows[0]
+      const bounce = bounceRows[0]
+      if (commandRows.length !== 1 || !['stop', 'kill'].includes(command?.kind)) {
+        problems.push(`lifecycle-reference: missing original command ${index}`)
+        continue
+      }
+      if (
+        bounceRows.length !== 1 ||
+        ['index', 'kind', 'service', 'nodeId', 'at', 'order'].some(
+          (key) => command[key] !== bounce[key]
+        )
+      )
+        problems.push(`lifecycle-reference: missing original episode ${index}`)
+      const downs = controls.filter(
+        (control) => control.episode === index && control.kind !== 'start'
+      )
+      const starts = controls.filter(
+        (control) => control.episode === index && control.kind === 'start'
+      )
+      const down = downs[0]
+      const start = starts[0]
+      for (const [name, rows] of [
+        ['down', downs],
+        ['start', starts],
+      ]) {
+        const control = rows[0]
+        if (rows.length !== 1) {
+          problems.push(`lifecycle-reference: missing original ${name} ${index}`)
+          continue
+        }
+        if (
+          control.status !== 'fulfilled' ||
+          control.exitCode !== 0 ||
+          !commandResult(control.result)
+        )
+          problems.push(`lifecycle-result: missing successful ${name} ${control.id}`)
+        if (
+          control.kind !== (name === 'down' ? command.kind : 'start') ||
+          control.service !== command.service ||
+          control.nodeId !== command.nodeId ||
+          (name === 'start' && control.replaces !== down?.id)
+        )
+          problems.push(`lifecycle-reference: invalid original ${name} ${index}`)
+        const mapping = mappings.length === 1 && mappings[0].nodes?.[command.service]
+        if (
+          control.semantics !== 'awaited-compose-service-process' ||
+          !mapping ||
+          !isDeepStrictEqual(mapping, control.mapping) ||
+          mapping.service !== command.service ||
+          mapping.nodeId !== command.nodeId ||
+          !mapping.endpoint ||
+          !mapping.containerId ||
+          !['', 'no'].includes(mapping.restartPolicy) ||
+          !Number.isInteger(mapping.process?.pid) ||
+          mapping.process.pid <= 0 ||
+          typeof mapping.process.startedAt !== 'string' ||
+          !mapping.process.startedAt ||
+          !mapping.observed ||
+          !control.invoked ||
+          !precedes(mapping.observed, control.invoked)
+        )
+          problems.push(`lifecycle-availability: missing original ${name} ${index}`)
+        if (!control.invoked || !control.settled || !precedes(control.invoked, control.settled))
+          problems.push(`lifecycle-order: invalid original ${name} ${index}`)
+      }
+      if (
+        !down?.invoked ||
+        down.invoked.at !== command.at ||
+        down.invoked.order !== command.order ||
+        !down.settled ||
+        !start?.invoked ||
+        !precedes(down.settled, start.invoked) ||
+        bounce?.downAt !== down.settled.at
+      )
+        problems.push(`lifecycle-order: invalid original episode ${index}`)
+      const restored = restorations.filter(({ episode }) => episode === index)
+      const restoration = restored[0]
+      const result = restoration?.result
+      if (
+        restored.length !== 1 ||
+        restoration.error ||
+        result?.service !== command.service ||
+        result?.kind !== command.kind ||
+        !Number.isFinite(result?.tDown) ||
+        !Number.isFinite(result?.tRestored) ||
+        result.tDown < (down?.settled?.at ?? Infinity) ||
+        result.tRestored < (start?.settled?.at ?? Infinity) ||
+        result.outageMs !== result.tRestored - result.tDown ||
+        bounce?.restoredAt !== result.tRestored ||
+        !(restoration?.settled?.at >= result.tRestored)
+      )
+        problems.push(`lifecycle-restoration: missing successful original ${index}`)
+    }
+    return problems
+  }
+
+  /** @returns {void} Revalidates decoded persisted closure, membership and sealed contents before completion. */
   requireArchive() {
     if (!this.archived || !this.archiveClosure || this.archiveIncomplete)
       throw new Error(
@@ -5905,13 +6053,37 @@ class ShareBounceCase {
     const end = rows.findLast(({ event }) => event === 'witness-closure-end')
     if (!closureRow || !end?.complete)
       throw new Error('archive-read: missing complete closure/footer')
-    const closure = readEvidenceRows(groups.get(closureRow.evidenceId))
+    const decodedClosure = readEvidenceRows(groups.get(closureRow.evidenceId))
+    const closure = Object.fromEntries(
+      ['evidenceSchema', 'identities', 'frames', 'rows', 'omitted'].map((key) => [
+        key,
+        decodedClosure[key],
+      ])
+    )
+    if (
+      createHash('sha256').update(JSON.stringify(closure)).digest('hex') !==
+      this.archiveClosure.sha256
+    )
+      throw new Error('archive-read: closure manifest changed')
+    const decoded = []
+    const changed = []
     for (const required of closure.rows.filter(({ required }) => required)) {
       const members = groups.get(required.evidenceId)
       if (!members || members[0].event !== required.event)
         throw new Error(`archive-read: missing required ${required.event} ${required.evidenceId}`)
-      readEvidenceRows(members)
+      const original = readEvidenceRows(members)
+      const fields = Object.fromEntries(required.fields.map((key) => [key, original[key]]))
+      decoded.push({ event: required.event, fields })
+      if (createHash('sha256').update(JSON.stringify(fields)).digest('hex') !== required.sha256)
+        changed.push(`archive-content: changed required ${required.event} ${required.evidenceId}`)
     }
+    const bounces = decoded
+      .filter(({ event }) => event === 'frozen-bounce')
+      .map(({ fields }) => ({ ...fields, held: new Set(fields.held) }))
+    const accounting = finishAudit(freezeAccountingWork(this.entries, bounces, this.evidence))
+    const problems = this.archiveProblems(decoded, new Set(closure.frames), accounting)
+    if (problems.length || changed.length)
+      throw new Error(`archive-read: ${[...problems, ...changed].join('; ')}`)
   }
 
   /**
@@ -5919,12 +6091,14 @@ class ShareBounceCase {
    * @param {Set<string>} identities Failure identities and their matching public receipts.
    * @param {Set<number>} frameIds Relevant frames, extended with acquisition/receipt/epoch sources.
    * @param {Function} emit Collects rows for closure ordering.
-   * @returns {void}
+   * @returns {Generator<void, void, unknown>} Steps emitting the original reference closure.
    */
-  archiveFailureIdentities(identities, frameIds, emit) {
+  *archiveFailureIdentities(identities, frameIds, emit) {
+    let visited = 0
     const cohorts = new Set()
     const exchanges = new Set()
     for (const { acquisition, ...entry } of this.entries) {
+      if (visited++ % 100 === 0) yield
       if (!identities.has(entry.identity)) continue
       cohorts.add(acquisition?.id)
       exchanges.add(acquisition?.exchange)
@@ -5949,6 +6123,7 @@ class ShareBounceCase {
       }
     }
     for (const { frames, response, ...exchange } of this.evidence.exchanges) {
+      if (visited++ % 100 === 0) yield
       if (
         !exchange.tickets.some(({ cohort }) => cohorts.has(cohort)) &&
         !exchanges.has(exchange.id)
@@ -6004,6 +6179,7 @@ class ShareBounceCase {
         ])
     )
     for (const entry of involvedSources.values()) {
+      if (visited++ % 100 === 0) yield
       const frame = entry.acquisition?.source?.frames[0]
       if (!frame) continue
       const samples = sourceEpochSamples(entry, this.evidence.epochs, false)
@@ -6028,6 +6204,7 @@ class ShareBounceCase {
           chosen.add(sample.frame.id)
     }
     for (const { frames, ...source } of this.evidence.epochs) {
+      if (visited++ % 100 === 0) yield
       if (!frames.some(({ id }) => chosen.has(id))) continue
       for (const { id } of frames) frameIds.add(id)
       emit('epoch-source', { ...source, frames: frames.map(({ id }) => id) })
@@ -6040,12 +6217,14 @@ class ShareBounceCase {
     for (const frame of this.tap.allFrames) if (frameIds.has(frame.id)) sockets.add(frame.socket)
     const omittedEvents = []
     for (const event of this.tap.socketEvents) {
+      if (visited++ % 100 === 0) yield
       if (!sockets.has(event.socket)) {
         omittedEvents.push(event)
         continue
       }
       for (const id of event.outstanding) frameIds.add(id)
-      emit('socket-event', { ...event, socketEvent: event.event })
+      const { event: socketEvent, ...original } = event
+      emit('socket-event', { ...original, socketEvent })
     }
     emit('socket-history', { events: omittedEvents })
     for (const retirement of this.evidence.retirements) emit('retirement', retirement)
@@ -7755,10 +7934,21 @@ describe('share bounce acquisition and settlement sensitivity', () => {
     )
   })
 
-  /** @returns {object} Archive through the actual writer with an in-memory file boundary. */
-  const archiveFixture = () => {
+  /** @param {string} [mode] Replay history. @returns {object} Actual writer with a detached in-memory file boundary. */
+  const archiveFixture = (mode = 'reset') => {
     const fixture = restartFixture()
-    successfulAcceptFixture(fixture.evidence, fixture.next, 24)
+    if (mode === 'no-replay') fixture.entries = [fixture.old]
+    if (mode === 'growth') {
+      fixture.next.deliveryCount = 2
+      fixture.next.acquisition.acquiredRecords[0].deliveryCount = 2
+    }
+    successfulAcceptFixture(fixture.evidence, mode === 'no-replay' ? fixture.old : fixture.next, 24)
+    captureFreezes(fixture)
+    fixture.evidence.restorations.push({
+      episode: 0,
+      result: { service: 'kafka1', kind: 'stop', tDown: 9, tRestored: 18, outageMs: 9 },
+      settled: { at: 18.1 },
+    })
     const instance = new ShareBounceCase()
     Object.assign(instance, {
       entries: fixture.entries,
@@ -7786,7 +7976,7 @@ describe('share bounce acquisition and settlement sensitivity', () => {
       read: () => rows,
       size: () => bytes,
       write: (row) => {
-        rows.push(row)
+        rows.push(JSON.parse(JSON.stringify(row)))
         bytes += Buffer.byteLength(JSON.stringify(row)) + 1
       },
       truncate: (size) => {
@@ -7900,13 +8090,18 @@ describe('share bounce acquisition and settlement sensitivity', () => {
     [
       'interruption membership',
       ({ fixture }) => {
-        fixture.bounces[0].interruptions[0].obligations = []
+        const cut = fixture.bounces[0].interruptions[0]
+        fixture.bounces[0].interruptions[0] = { ...cut, obligations: [] }
       },
       'interruption-membership: bounce 0 interruption snapshot disagrees with the journal',
     ],
   ])(
     'blocks completion after deletion of %s from archive input',
     async (_name, mutate, component) => {
+      const baseline = archiveFixture()
+      baseline.instance.archive()
+      expect(baseline.instance.archiveClosure.problems).toEqual([])
+      expect(() => baseline.instance.requireArchive()).not.toThrow()
       const context = archiveFixture()
       mutate(context)
       context.instance.archive()
@@ -7916,6 +8111,182 @@ describe('share bounce acquisition and settlement sensitivity', () => {
       )
       expect(context.rows.find(({ event }) => event === 'witness-closure-end').complete).toBe(false)
       expect(context.rows.some(({ event }) => event === 'case-complete')).toBe(false)
+    }
+  )
+
+  it.each([
+    [
+      'request bytes',
+      'wire-exchange',
+      (row) => delete row.bytes,
+      'request-bytes: missing required original 0',
+    ],
+    [
+      'response bytes',
+      'wire-exchange',
+      (row) => delete row.responseBytes,
+      'response-bytes: missing completed original 0',
+    ],
+    [
+      'down result',
+      'bounce-control',
+      (row) => delete row.result,
+      'lifecycle-result: missing successful down 0',
+    ],
+    [
+      'interruption membership',
+      'frozen-bounce',
+      (row) => {
+        row.interruptions[0].obligations = []
+      },
+      'interruption-membership: bounce 0 interruption snapshot disagrees with the journal',
+    ],
+    [
+      'required control reference',
+      'bounce-control',
+      (row) => {
+        row.episode = 99
+      },
+      'lifecycle-reference: missing original down 0',
+    ],
+  ])(
+    'rejects persisted plain-row deletion of %s through completion',
+    async (_name, event, mutate, component) => {
+      const { instance, rows } = archiveFixture()
+      readyCompletion(instance)
+      instance.archive()
+      expect(instance.archiveClosure.problems).toEqual([])
+      expect(() => instance.requireArchive()).not.toThrow()
+      const row = rows.find((row) => row.event === event)
+      expect(row.encoding).toBeUndefined()
+      mutate(row)
+      await expect(instance.complete(NEVER)).rejects.toThrow(component)
+      expect(rows.some(({ event }) => event === 'case-complete')).toBe(false)
+    }
+  )
+
+  it('binds required plain-row contents to the sealed closure manifest', async () => {
+    const { instance, rows } = archiveFixture()
+    readyCompletion(instance)
+    instance.archive()
+    expect(() => instance.requireArchive()).not.toThrow()
+    rows.find(({ event }) => event === 'wire-exchange').bytes = 'substituted-request'
+    await expect(instance.complete(NEVER)).rejects.toThrow(
+      'archive-content: changed required wire-exchange'
+    )
+    expect(rows.some(({ event }) => event === 'case-complete')).toBe(false)
+  })
+
+  it('rejects a persisted closure manifest that drops a required component', async () => {
+    const { instance, rows } = archiveFixture()
+    readyCompletion(instance)
+    instance.archive()
+    expect(() => instance.requireArchive()).not.toThrow()
+    const manifest = rows.find(({ event }) => event === 'witness-closure')
+    const closure = readEvidenceRows(
+      rows.filter(({ evidenceId }) => evidenceId === manifest.evidenceId)
+    )
+    const fields = Object.fromEntries(
+      ['evidenceSchema', 'identities', 'frames', 'rows', 'omitted'].map((key) => [
+        key,
+        closure[key],
+      ])
+    )
+    fields.rows = fields.rows.filter(({ event }) => event !== 'bounce-control')
+    const first = rows.indexOf(manifest)
+    const count = rows.filter(({ evidenceId }) => evidenceId === manifest.evidenceId).length
+    rows.splice(first, count, ...evidenceRows('witness-closure', manifest.evidenceId, fields))
+    await expect(instance.complete(NEVER)).rejects.toThrow('archive-read: closure manifest changed')
+    expect(rows.some(({ event }) => event === 'case-complete')).toBe(false)
+  })
+
+  it.each(['no-replay', 'growth'])(
+    'requires every original lifecycle component in %s histories',
+    async (mode) => {
+      const mutations = [
+        [
+          'down result',
+          ({ fixture }) => delete fixture.evidence.controls[0].result,
+          'lifecycle-result: missing successful down 0',
+        ],
+        [
+          'start result',
+          ({ fixture }) => delete fixture.evidence.controls[1].result,
+          'lifecycle-result: missing successful start 1',
+        ],
+        [
+          'down reference',
+          ({ fixture }) => fixture.evidence.controls.shift(),
+          'lifecycle-reference: missing original down 0',
+        ],
+        [
+          'start reference',
+          ({ fixture }) => fixture.evidence.controls.pop(),
+          'lifecycle-reference: missing original start 0',
+        ],
+        [
+          'command reference',
+          ({ fixture }) => {
+            fixture.evidence.commands = []
+          },
+          'lifecycle-reference: missing original command 0',
+        ],
+        [
+          'restoration reference',
+          ({ fixture }) => {
+            fixture.evidence.restorations = []
+          },
+          'lifecycle-restoration: missing successful original 0',
+        ],
+        [
+          'lifecycle availability',
+          ({ instance }) => delete instance.lifecycle,
+          'lifecycle-availability: missing original down 0',
+        ],
+      ]
+      for (const [, mutate, component] of mutations) {
+        const baseline = archiveFixture(mode)
+        readyCompletion(baseline.instance)
+        expect(baseline.instance.replay.problems).toEqual([])
+        if (mode === 'no-replay') expect(baseline.instance.replay.extras).toHaveLength(0)
+        else expect(baseline.instance.replay.extras[0].incarnationWitness).toBeNull()
+        baseline.instance.archive()
+        expect(baseline.instance.archiveClosure.problems).toEqual([])
+        await baseline.instance.complete(NEVER)
+        expect(baseline.rows.filter(({ event }) => event === 'case-complete')).toHaveLength(1)
+        const context = archiveFixture(mode)
+        readyCompletion(context.instance)
+        mutate(context)
+        context.instance.archive()
+        expect(context.instance.archiveClosure.problems).toContain(component)
+        await expect(context.instance.complete(NEVER)).rejects.toThrow(component)
+        expect(context.rows.some(({ event }) => event === 'case-complete')).toBe(false)
+      }
+    }
+  )
+
+  it.each(['no-replay', 'growth'])(
+    'revalidates persisted unreferenced down/start results and references in %s histories',
+    async (mode) => {
+      for (const kind of ['stop', 'start']) {
+        for (const field of ['result', 'episode']) {
+          const { instance, rows } = archiveFixture(mode)
+          readyCompletion(instance)
+          instance.archive()
+          expect(instance.archiveClosure.problems).toEqual([])
+          expect(() => instance.requireArchive()).not.toThrow()
+          const control = rows.find((row) => row.event === 'bounce-control' && row.kind === kind)
+          expect(control.encoding).toBeUndefined()
+          const name = kind === 'stop' ? 'down' : 'start'
+          const component =
+            field === 'result'
+              ? `lifecycle-result: missing successful ${name} ${control.id}`
+              : `lifecycle-reference: missing original ${name} 0`
+          delete control[field]
+          await expect(instance.complete(NEVER)).rejects.toThrow(component)
+          expect(rows.some(({ event }) => event === 'case-complete')).toBe(false)
+        }
+      }
     }
   )
 
@@ -7946,8 +8317,8 @@ describe('share bounce acquisition and settlement sensitivity', () => {
   it('rejects required closure above 10 MiB through the archive writer', async () => {
     const { instance, rows } = archiveFixture()
     const original = instance.archiveFailureIdentities.bind(instance)
-    instance.archiveFailureIdentities = (...args) => {
-      original(...args)
+    instance.archiveFailureIdentities = function* (...args) {
+      yield* original(...args)
       const emit = args[2]
       // Separate incompressible, bounded rows exercise aggregate accounting, not row truncation.
       for (let index = 0; index < 700; index++)
@@ -8051,8 +8422,80 @@ describe('share bounce acquisition and settlement sensitivity', () => {
     await heartbeat
   })
 
-  it('audits 30000 records cooperatively through drain and terminal finalization', async () => {
+  it('audits 30000 records with Metadata and count resets through drain, terminal and archive work', async () => {
     const proof = terminalBudgetFixture()
+    const replay = replayFixture({ sameLeader: true })
+    replay.next.acquisition.acquiredRecords[0].lastOffset = '99'
+    for (let offset = 0; offset < 100; offset++) {
+      const original = proof.entries[offset]
+      proof.entries.push({
+        ...replay.next,
+        id: 2 * offset + 1,
+        offset: original.offset,
+        identity: original.identity,
+      })
+    }
+    proof.evidence.acquisitions.push(replay.next.acquisition)
+    proof.evidence.exchanges.push(replay.next.acquisition.source)
+    successfulAcceptFixture(proof.evidence, replay.next, 24)
+    const receipt = proof.evidence.exchanges.at(-1)
+    receipt.tickets[0].batches[0].lastOffset = '99'
+    proof.evidence.outcomes.at(-1).lastOffset = '99'
+    for (let index = 0; index < 2000; index++) {
+      const sample = JSON.parse(JSON.stringify(replay.evidence.epochs[index % 2]))
+      sample.frames[0].id = 200000000 + index
+      proof.evidence.epochs.push(sample)
+    }
+    const mapping = restartFixture().evidence.owner.lifecycle.kafka1
+    proof.evidence.owner.lifecycle = { kafka1: mapping }
+    for (const bounce of proof.bounces) {
+      Object.assign(bounce, { kind: 'stop', service: 'kafka1' })
+      const shift = bounce.index * 100
+      const down = 2 * bounce.index
+      proof.evidence.controls.push(
+        {
+          id: down,
+          episode: bounce.index,
+          kind: 'stop',
+          service: 'kafka1',
+          nodeId: 1,
+          mapping,
+          semantics: 'awaited-compose-service-process',
+          status: 'fulfilled',
+          exitCode: 0,
+          result: { stdout: '', stderr: 'Stopped' },
+          invoked: { at: bounce.at },
+          settled: { at: 9 + shift },
+        },
+        {
+          id: down + 1,
+          episode: bounce.index,
+          kind: 'start',
+          service: 'kafka1',
+          nodeId: 1,
+          mapping,
+          semantics: 'awaited-compose-service-process',
+          status: 'fulfilled',
+          exitCode: 0,
+          result: { stdout: '', stderr: 'Started' },
+          replaces: down,
+          invoked: { at: 10 + shift },
+          settled: { at: 11 + shift },
+        }
+      )
+      proof.evidence.restorations.push({
+        episode: bounce.index,
+        result: {
+          service: 'kafka1',
+          kind: 'stop',
+          tDown: bounce.downAt,
+          tRestored: bounce.restoredAt,
+          outageMs: bounce.restoredAt - bounce.downAt,
+        },
+        settled: { at: bounce.restoredAt + 0.1 },
+      })
+    }
+    captureFreezes(proof)
     let turns = 0
     let maxStepMs = 0
     /** @param {Generator} work Actual audit. @returns {Generator} Identical steps with runtime observations. */
@@ -8080,13 +8523,94 @@ describe('share bounce acquisition and settlement sensitivity', () => {
     )
     const terminal = await cooperativeAudit(measured(auditTerminalWork(proof)), NEVER)
     expect(proof.corpus).toHaveLength(RECORDS)
+    expect(proof.evidence.epochs).toHaveLength(2000)
     expect(candidates.problems).toEqual([])
     expect(terminal.problems).toEqual([])
+    expect(terminal.replay.extras).toHaveLength(100)
+    expect(
+      terminal.replay.extras.every(
+        ({ incarnationWitness }) => incarnationWitness.kind === 'partition-transition'
+      )
+    ).toBe(true)
     expect(terminal.settlement.successful).toEqual(candidates.successful)
+    const { instance, rows } = archiveFixture()
+    const socketEvents = proof.evidence.owner.tap.socketEvents
+    Object.assign(instance, {
+      entries: proof.entries,
+      snapshots: proof.bounces,
+      expected: proof.corpus,
+      evidence: proof.evidence,
+      replay: terminal.replay,
+      settlement: terminal.settlement,
+      lifecycle: proof.evidence.owner.lifecycle,
+    })
+    instance.evidence.owner = instance
+    instance.tap.socketEvents = socketEvents
+    instance.tap.allFrames = [
+      ...new Map(
+        [...proof.evidence.exchanges, ...proof.evidence.epochs]
+          .flatMap(({ frames }) => frames)
+          .map((frame) => [frame.id, frame])
+      ).values(),
+    ]
+    for (const frame of instance.tap.allFrames) frame.bytes = 'original-request'
+    await cooperativeAudit(measured(instance.archiveWork()), NEVER)
+    expect(instance.archiveClosure.problems).toEqual([])
+    expect(instance.archiveIncomplete).not.toBe(true)
+    expect(() => instance.requireArchive()).not.toThrow()
+    expect(rows.some(({ event }) => event === 'witness-closure-end')).toBe(true)
     expect(turns).toBeGreaterThan(RECORDS / 100)
     expect(maxStepMs).toBeLessThan(1000)
     expect(performance.now() - started).toBeLessThan(FINAL_MS)
   })
+
+  it.each([
+    ['receipt before cut', 9, 10, false],
+    ['receipt after cut', 11, 10, true],
+    ['same sequence', 10, 10, true],
+    ['missing receipt sequence', undefined, 10, true],
+    ['missing cut sequence', 9, undefined, true],
+    ['both sequences missing', undefined, undefined, true],
+  ])(
+    'preserves strict equal-clock membership for %s',
+    (_name, receiptOrder, cutOrder, unresolved) => {
+      const fixture = restartFixture()
+      successfulAcceptFixture(fixture.evidence, fixture.old, 7)
+      const receipt = fixture.evidence.results(fixture.old)[0]
+      receipt.order = receiptOrder
+      const cut = fixture.evidence.retirements[0]
+      cut.order = cutOrder
+      expect(receipt.at).toBe(cut.at)
+      expect(precedes(receipt, cut)).toBe(!unresolved)
+      captureFreezes(fixture)
+      const expected = unresolved ? [fixture.old.id] : []
+      expect(unresolvedAt(fixture.entries, fixture.evidence, cut).map(({ id }) => id)).toEqual(
+        expected
+      )
+      const indexed = finishAudit(
+        indexedEvidenceWork(fixture.entries, fixture.evidence, fixture.bounces)
+      )
+      expect(unresolvedAt(indexed.auditEntries, indexed, cut).map(({ id }) => id)).toEqual(expected)
+      const original = finishAudit(
+        reconstructFreezes(fixture.entries, fixture.bounces, fixture.evidence)
+      )
+      const reconstructed = finishAudit(
+        reconstructFreezes(indexed.auditEntries, fixture.bounces, indexed)
+      )
+      expect(reconstructed).toEqual(original)
+      expect(fixture.bounces[0].interruptions[0].history).toEqual(expected)
+      expect(freezeAccounting(fixture.entries, fixture.bounces, fixture.evidence).problems).toEqual(
+        []
+      )
+      if (unresolved) {
+        const cut = fixture.bounces[0].interruptions[0]
+        fixture.bounces[0].interruptions[0] = { ...cut, obligations: [] }
+        expect(
+          freezeAccounting(fixture.entries, fixture.bounces, fixture.evidence).problems
+        ).toContain('bounce 0 interruption snapshot disagrees with the journal')
+      }
+    }
+  )
 
   it('seals audit journal membership before yielding to concurrent live additions', async () => {
     const fixture = restartFixture()
@@ -8710,8 +9234,12 @@ describe('share bounce acquisition and settlement sensitivity', () => {
     const proof = lostAcceptFixture(fixture)
     fixture.bounces[0].at = 3
     captureFreezes(fixture)
-    fixture.evidence.exchanges.at(-1).failedAt = 8
-    expect(auditTerminal(proof).problems).toContain(`Unsettled ${proof.corpus[0]}`)
+    expect(auditTerminal(proof).problems).toEqual([])
+    const frame = fixture.evidence.exchanges.at(-1).frames[0]
+    frame.at = fixture.bounces[0].interruptions[0].at
+    expect(precedes(frame, fixture.bounces[0].interruptions[0])).toBe(false)
+    expect(freezeProblems(fixture.entries, fixture.bounces, fixture.evidence)).toEqual([])
+    expect(auditTerminal(proof).problems).toEqual([`Unsettled ${proof.corpus[0]}`])
   })
 
   it.each([8.4, 9, 17])('keeps late eligibility independent of command return at %s', (downAt) => {
@@ -8758,11 +9286,15 @@ describe('share bounce acquisition and settlement sensitivity', () => {
       const proof = lostAcceptFixture(fixture)
       fixture.bounces[0].at = 3
       captureFreezes(fixture)
+      expect(auditTerminal(proof).problems).toEqual([])
       const exchange = fixture.evidence.exchanges.at(-1)
       if (field === 'cause') exchange.cause++
       else if (field === 'correlation') exchange.frames[0].socket++
+      else if (field === 'ticket') delete exchange.tickets[0].ticket
       else exchange.tickets[0][field]++
-      expect(auditTerminal(proof).problems).toContain(`Unsettled ${proof.corpus[0]}`)
+      captureFreezes(fixture)
+      expect(freezeProblems(fixture.entries, fixture.bounces, fixture.evidence)).toEqual([])
+      expect(auditTerminal(proof).problems).toEqual([`Unsettled ${proof.corpus[0]}`])
     }
   )
 
