@@ -295,7 +295,7 @@ describe('telemetry lifecycle documentation', () => {
   test('testing documents the segmented close-and-reopen evidence', () => {
     const text = read('docs/Testing.md')
     expect(text).toContain('`segmented-1`')
-    expect(text).toContain('88 in all')
+    expect(text).toContain('89 in all')
     expect(text).toContain('#### Close and reopen (`telemetry-shutdown`)')
     expect(text).toContain('no checkpoint, read or await in between')
     expect(read('scripts/e2e/telemetry/README.md')).toContain('## Segmented evidence')
