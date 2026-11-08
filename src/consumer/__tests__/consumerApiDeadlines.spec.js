@@ -52,11 +52,19 @@ describe.each([true, false])(
     /** @type {CloseRig} */
     let rig
     let fakeClock = false
+    const heldLookups = []
+    /** @returns {object} a lookup gate released even when an assertion fails */
+    const holdLookup = () => {
+      const held = rig.lookup().hold()
+      heldLookups.push(held)
+      return held
+    }
     /** @param {object} [options] rig options @returns {Promise<void>} a fresh rig, read as `rig` */
     const open = async (options) => {
       rig = await CloseRig.open({ enforce, retry: bounded, ...options })
     }
     afterEach(async () => {
+      for (const held of heldLookups.splice(0)) held.release()
       try {
         if (fakeClock) await drive(rig.dispose(), 'the rig to dispose')
         else await rig.dispose()
@@ -77,7 +85,7 @@ describe.each([true, false])(
         const committed = []
         consumer.on(consumer.events.COMMIT_OFFSETS, ({ payload }) => committed.push(payload))
         lookup.makeStale()
-        const held = lookup.hold()
+        const held = holdLookup()
         const startedAt = Date.now()
         const settled = consumer
           .commitOffsets([{ topic: TOPIC, partition: 0, offset: '2' }])
@@ -101,7 +109,7 @@ describe.each([true, false])(
         consumer.on(consumer.events.COMMIT_OFFSETS, ({ payload }) => committed.push(payload))
         const commitsBefore = rig.frames('OffsetCommit').length
         lookup.makeStale()
-        const held = lookup.hold()
+        const held = holdLookup()
         consumer.seek({ ...CELL, offset: '1' })
         const settled = consumer.position(CELL).catch((error) => error)
         await held.entered
@@ -117,7 +125,7 @@ describe.each([true, false])(
         await open()
         const consumer = rig.consumer()
         await consumer.connect()
-        const held = rig.lookup().hold()
+        const held = holdLookup()
         const settled = consumer.committed([CELL]).catch((error) => error)
         await held.entered
         expect(await settled).toBeInstanceOf(KafkaJSDeliveryTimeout)
