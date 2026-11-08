@@ -115,17 +115,12 @@ const createResourceProbe = ({
 
   return {
     /**
-     * Takes every measurement after heap collection, when enabled, so weak owners are not pinned
-     * by the reading and transient resources in the collection gap are not reported as retained.
+     * Takes every measurement the probe was given a source for.
      * @returns {Promise<ResourceSnapshot>}
      */
     async snapshot() {
       const snapshot = {}
 
-      // Read weak owners only after collection: dereferencing them would keep them alive through it.
-      if (heap) {
-        snapshot.heapUsed = await settledHeap(gc, pause)
-      }
       if (emitters) {
         snapshot.listeners = listenerCounts(emitters)
       }
@@ -154,6 +149,10 @@ const createResourceProbe = ({
       if (activeResources) {
         snapshot.activeResources = activeResourceCounts()
       }
+      if (heap) {
+        snapshot.heapUsed = await settledHeap(gc, pause)
+      }
+
       return snapshot
     },
   }

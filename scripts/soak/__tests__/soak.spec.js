@@ -1753,6 +1753,7 @@ const shareScreenRun = () => {
     shareRanges: 0,
     sockets: { open: 0 },
     activeResources: { Timeout: 1 },
+    activeResourcesBeforeCollection: { Timeout: 1 },
     namedListeners: {},
     heapUsed,
   })
@@ -1825,6 +1826,16 @@ describe('Share soak resource screen', () => {
     const extra = shareScreenRun()
     extra.teardown.activeResources.TCPSocketWrap = 1
     expect(ShareSoakScreen.evaluate(extra).ok).toBe(false)
+  })
+
+  test('refuses a pre-collection surplus even when the post-collection reading matches', () => {
+    const run = shareScreenRun()
+    run.teardown.activeResourcesBeforeCollection.Timeout = 2
+    expect(ShareSoakScreen.evaluate(run).violations).toContain(
+      'teardown: activeResourcesBeforeCollection.Timeout baseline=1 after=2'
+    )
+    delete run.teardown.activeResourcesBeforeCollection
+    expect(ShareSoakScreen.evaluate(run).ok).toBe(false)
   })
 
   test('names each differing source with its baseline and quiet-point reading', () => {
@@ -3303,6 +3314,7 @@ const quietShare = () => ({
   queueDepth: 0,
   ledgerSize: 0,
   activeResources: {},
+  activeResourcesBeforeCollection: {},
   shareSessions: 0,
   shareRecords: 0,
   shareRanges: 0,
@@ -4845,6 +4857,198 @@ describe('Share soak original authority adapter', () => {
 })
 
 describe('Share soak original queue and socket listener adapter', () => {
+  test('reads share identities, endpoints, counters and listeners together after the collection gap', async () => {
+    let socket
+    let cluster
+    const shared = instrumentShare(
+      {
+        clientId: 'soak',
+        brokers: ['localhost:1'],
+        socketFactory: () => Object.assign(new EventEmitter(), { destroyed: false }),
+      },
+      {
+        activeResources: false,
+        socketIdentities: true,
+        gc: () => {},
+        pause: async () => {
+          socket.destroyed = true
+          socket.removeAllListeners()
+          cluster.brokerPool.metadata.brokers = [{ host: 'after', port: 2 }]
+        },
+      }
+    )
+    try {
+      cluster = privateOf(shared.kafka, 'createCluster').value({})
+      cluster.brokerPool.metadata = { brokers: [{ host: 'before', port: 1 }] }
+      socket = shared.socketFactory({ host: 'before', port: 1 })
+      socket.on('error', () => {})
+      const row = await shared.shareResources.snapshot()
+      expect(row.sockets).toEqual({ created: 1, destroyed: 1, open: 0, live: [] })
+      expect(row.socketNodes).toContain('after:2')
+      expect(row.socketNodes).not.toContain('before:1')
+      expect(row.namedListeners).toEqual({})
+      expect(row.listeners.sockets).toBe(0)
+    } finally {
+      shared.shareResources.restore()
+    }
+  })
+
+  test.each([false, true])(
+    'rejects a timer present before collection, retained across the gap=%s',
+    async (retained) => {
+      let timer
+      const shared = instrumentShare(
+        { clientId: 'soak', brokers: ['localhost:1'] },
+        {
+          gc: () => {},
+          pause: async () => {
+            if (!retained && timer) clearTimeout(timer)
+          },
+        }
+      )
+      try {
+        const baseline = await shared.shareResources.snapshot()
+        timer = setTimeout(() => {}, 60000)
+        const after = await shared.shareResources.snapshot()
+        expect(after.activeResourcesBeforeCollection.Timeout || 0).toBe(
+          (baseline.activeResources.Timeout || 0) + 1
+        )
+        expect(after.activeResources.Timeout || 0).toBe(
+          (baseline.activeResources.Timeout || 0) + Number(retained)
+        )
+        const violations = []
+        ShareSoakScreen.quiet(after, baseline, 'timer', violations)
+        expect(violations).toContain(
+          `timer: activeResourcesBeforeCollection.Timeout baseline=${baseline.activeResources.Timeout || 0} after=${(baseline.activeResources.Timeout || 0) + 1}`
+        )
+        expect(after.timerOwners.beforeCollection.rows).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ type: 'Timeout', durationMs: 60000, hasRef: true }),
+          ])
+        )
+        expect(
+          after.timerOwners.afterCollection.rows.some(({ durationMs }) => durationMs === 60000)
+        ).toBe(retained)
+      } finally {
+        clearTimeout(timer)
+        shared.shareResources.restore()
+      }
+    }
+  )
+
+  test('writes bounded timer owners in quiet-point evidence, including intervals and unrefed timers', async () => {
+    const shared = instrumentShare(
+      { clientId: 'soak', brokers: ['localhost:1'] },
+      { gc: () => {}, pause: async () => {} }
+    )
+    /** Schedules a timer through a stack longer than the evidence limit.
+     * @param {number} depth remaining recursive calls
+     * @returns {NodeJS.Timeout} the real timer to clear
+     */
+    const deepTimer = (depth) => (depth === 0 ? setTimeout(() => {}, 60000) : deepTimer(depth - 1))
+    const stackLimit = Error.stackTraceLimit
+    let timer
+    try {
+      Error.stackTraceLimit = 100
+      timer = deepTimer(60)
+    } finally {
+      Error.stackTraceLimit = stackLimit
+    }
+    const RequestQueue = require('../../../src/network/requestQueue')
+    const queue = new RequestQueue({
+      maxInFlightRequests: 1,
+      requestTimeout: 1000,
+      enforceRequestTimeout: true,
+      clientId: 'soak',
+      broker: 'localhost:1',
+      logger: { debug: () => {} },
+    })
+    queue.scheduleRequestTimeoutCheck()
+    const immediate = setImmediate(() => {})
+    timer.unref()
+    const rows = []
+    try {
+      const snapshot = await shared.shareResources.snapshot()
+      ShareSoak.prototype.recordResources.call(
+        { row: (event, line) => rows.push({ event, ...JSON.parse(JSON.stringify(line)) }) },
+        { kind: 'phase-end', phase: 'share-steady', snapshot }
+      )
+      expect(rows[0]).toMatchObject({ event: 'soak-resources', kind: 'phase-end' })
+      for (const owners of Object.values(rows[0].snapshot.timerOwners)) {
+        expect(owners.dropped).toBe(0)
+        expect(owners.rows.length).toBeLessThanOrEqual(4096)
+        expect(owners.rows).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              type: 'Timeout',
+              durationMs: 60000,
+              repeatMs: null,
+              hasRef: false,
+              stack: expect.stringContaining('deepTimer'),
+            }),
+            expect.objectContaining({
+              type: 'Timeout',
+              durationMs: 100,
+              repeatMs: 100,
+              stack: expect.stringContaining('scheduleRequestTimeoutCheck'),
+              hasRef: true,
+            }),
+            expect.objectContaining({ type: 'Immediate', hasRef: true }),
+          ])
+        )
+        expect(owners.rows.find(({ durationMs }) => durationMs === 60000).stack).toHaveLength(2048)
+        for (const owner of owners.rows) {
+          expect(owner.asyncId).toEqual(expect.any(Number))
+          expect(owner.triggerAsyncId).toEqual(expect.any(Number))
+          expect(owner.stack.length).toBeLessThanOrEqual(2048)
+          expect(owner.stack).toEqual(expect.any(String))
+        }
+      }
+    } finally {
+      clearTimeout(timer)
+      queue.destroy()
+      clearImmediate(immediate)
+      shared.shareResources.restore()
+    }
+  })
+
+  test('bounds owner storage and fails quiet screening when allocation evidence overflows', async () => {
+    const { ShareTimerObserver } = require('../shareTimerObserver')
+    const observer = new ShareTimerObserver()
+    const timers = []
+    observer.install()
+    try {
+      for (let i = 0; i < 4097; i++) timers.push(setTimeout(() => {}, 60000))
+      const owners = observer.snapshot()
+      expect(owners.rows).toHaveLength(4096)
+      expect(owners.dropped).toBe(1)
+      const violations = []
+      ShareSoakScreen.quiet(
+        { ...quietShare(), timerOwners: { beforeCollection: owners, afterCollection: owners } },
+        quietShare(),
+        'overflow',
+        violations
+      )
+      expect(violations).toContain(
+        'overflow: timerOwners.beforeCollection.dropped baseline=0 after=1'
+      )
+      expect(violations).toContain(
+        'overflow: timerOwners.afterCollection.dropped baseline=0 after=1'
+      )
+      timers.forEach(clearTimeout)
+      expect(observer.snapshot().rows).toEqual([])
+    } finally {
+      timers.forEach(clearTimeout)
+      observer.restore()
+    }
+    const later = setTimeout(() => {}, 60000)
+    try {
+      expect(observer.snapshot().rows).toEqual([])
+    } finally {
+      clearTimeout(later)
+    }
+  }, 30000)
+
   test.each([false, true])(
     'measures closed socket error listeners after collection, retained=%s',
     async (retained) => {
@@ -4882,8 +5086,8 @@ describe('Share soak original queue and socket listener adapter', () => {
         expect(Object.values(after.namedListeners)).toEqual(retained ? [1] : [])
         const violations = []
         ShareSoakScreen.quiet(
-          { ...after, activeResources: {} },
-          { ...baseline, activeResources: {} },
+          { ...after, activeResources: {}, activeResourcesBeforeCollection: {} },
+          { ...baseline, activeResources: {}, activeResourcesBeforeCollection: {} },
           'closed',
           violations
         )
@@ -5570,6 +5774,7 @@ describe('Share soak complete original-owner schedules', () => {
       ...(await originalSnapshot()),
       heapUsed: 1024,
       activeResources: {},
+      activeResourcesBeforeCollection: {},
     })
     const records = [[], [], []]
     const members = new Map()
