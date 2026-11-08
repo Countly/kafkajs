@@ -2314,13 +2314,24 @@ const phasesOf = (profile, phaseSeconds) =>
 
 /**
  * @param {ReturnType<typeof createChaosSocketFactory>} chaos
+ * @param {object} [options] Socket inventory ownership.
+ * @param {boolean} [options.releaseOnClose=false] Release each closed socket immediately, so a
+ *   share observer's collection does not depend on another connection being created.
  * @returns {Function} a socket factory that makes chaos sockets and first forgets the destroyed
  *   ones, so the list of sockets a long outage reconnects through does not grow
  */
-const forgettingDestroyed = (chaos) => (args) => {
-  chaos.sockets = chaos.sockets.filter(({ destroyed }) => !destroyed)
-  return chaos(args)
-}
+const forgettingDestroyed =
+  (chaos, { releaseOnClose = false } = {}) =>
+  (args) => {
+    chaos.sockets = chaos.sockets.filter(({ destroyed }) => !destroyed)
+    const socket = chaos(args)
+    if (releaseOnClose) {
+      socket.once('close', () => {
+        chaos.sockets = chaos.sockets.filter((known) => known !== socket)
+      })
+    }
+    return socket
+  }
 
 /**
  * Builds the producer-churn owner for a real cluster: the counted client over a chaos socket
@@ -2519,13 +2530,27 @@ class ShareSoakScreen {
    */
   static quiet(point, baseline, label, violations) {
     const held = ['queueDepth', 'shareSessions', 'shareRecords', 'shareRanges']
+    const expectedResources = ShareTimerObserver.comparableResources(
+      baseline?.activeResources,
+      baseline?.timerOwners?.afterCollection
+    )
+    const resources = {
+      activeResources: ShareTimerObserver.comparableResources(
+        point?.activeResources,
+        point?.timerOwners?.afterCollection
+      ),
+      activeResourcesBeforeCollection: ShareTimerObserver.comparableResources(
+        point?.activeResourcesBeforeCollection,
+        point?.timerOwners?.beforeCollection
+      ),
+    }
     if (
       !point ||
       held.some((name) => !ShareSoakScreen.count(point[name]) || point[name] !== 0) ||
       !ShareSoakScreen.count(point.sockets?.open) ||
       point.sockets.open !== 0 ||
-      !ShareSoakScreen.same(point.activeResources, baseline?.activeResources) ||
-      !ShareSoakScreen.same(point.activeResourcesBeforeCollection, baseline?.activeResources) ||
+      !ShareSoakScreen.same(resources.activeResources, expectedResources) ||
+      !ShareSoakScreen.same(resources.activeResourcesBeforeCollection, expectedResources) ||
       Object.values(point.timerOwners ?? {}).some(({ dropped }) => dropped !== 0) ||
       !ShareSoakScreen.same(point.namedListeners, baseline?.namedListeners)
     ) {
@@ -2544,9 +2569,8 @@ class ShareSoakScreen {
         'activeResourcesBeforeCollection',
         'namedListeners',
       ]) {
-        const before =
-          baseline?.[source === 'activeResourcesBeforeCollection' ? 'activeResources' : source]
-        const after = point?.[source]
+        const before = source === 'namedListeners' ? baseline?.namedListeners : expectedResources
+        const after = source === 'namedListeners' ? point?.namedListeners : resources[source]
         if (!before || !after) report(source, before, after)
         else
           for (const name of new Set([...Object.keys(before), ...Object.keys(after)]))
@@ -6327,7 +6351,7 @@ const buildShareSoak = ({ brokers, short = false, record, run }) => {
     clientId: 'soak-share',
     brokers,
     logLevel: logLevel.NOTHING,
-    socketFactory: tap.factory(forgettingDestroyed(chaos)),
+    socketFactory: tap.factory(forgettingDestroyed(chaos, { releaseOnClose: true })),
   })
   return new ShareSoak({
     driver: new ShareSoakDriver({
