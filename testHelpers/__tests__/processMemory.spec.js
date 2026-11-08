@@ -302,6 +302,23 @@ describe('PendingSampler', () => {
     expect(intervals.size).toBe(0)
     memory.stop()
   })
+
+  test('takes a reading without a window when work settles and starts after a stop', () => {
+    const { subject, intervals, memory } = sampler()
+    subject.begin()
+    subject.stop()
+
+    subject.end()
+    const reading = subject.begin()
+
+    expect(reading).toMatchObject({ at: 60, rss: 30, external: 3 })
+    expect(intervals.size).toBe(0)
+    expect(subject.summary()).toMatchObject({ windows: 1, count: 3 })
+    expect(subject.summary().pendingWindows).toEqual([
+      { begin: 20, end: 20, count: 1, rss: 10, external: 1 },
+    ])
+    memory.stop()
+  })
 })
 
 describe('BoundaryWitness', () => {

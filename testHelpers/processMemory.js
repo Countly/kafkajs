@@ -262,6 +262,7 @@ class PendingSampler {
 
   /**
    * One more piece of native work is pending: reads now and starts the 20 ms interval if idle.
+   * Once `stop` has dropped work still pending, a submission can find no window; it is still read.
    * @returns {object} the reading taken at submission
    */
   begin() {
@@ -275,7 +276,7 @@ class PendingSampler {
     }
     this.pending += 1
     const reading = this.take()
-    this.window.begin ??= reading.at
+    if (this.window) this.window.begin ??= reading.at
     return reading
   }
 

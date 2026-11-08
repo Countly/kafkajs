@@ -96,6 +96,7 @@ class MemoryForeground {
     this.removers = []
     this.pushes = {}
     this.registry = []
+    this.registered = []
     this.client = null
     this.wire = null
   }
@@ -173,15 +174,20 @@ class MemoryForeground {
   register(metric) {
     this.client.registerMetricForSubscription(metric)
     this.registry.push(registryEntry(metric))
+    this.registered.push(metric)
   }
 
   /**
-   * Fingerprints the journaled registrations and probes the production client for them: a new
-   * identity must be refused at the registry limit and the first registered identity must still
-   * update in place. Call it after a settled reading, so the probe is not measured.
+   * Fingerprints the population the production client holds, from its own answers. A new
+   * identity must be refused at the registry limit; then every journaled descriptor is registered
+   * again, and only those the client updated in place enter the fingerprint. At the limit, all of
+   * them updating proves the client holds exactly the journaled population, so a descriptor
+   * swapped for another of the same size leaves the fingerprint one short. Call it after a settled
+   * reading, so the probe is not measured.
    * @param {string} uuid the assigned client instance id
    * @returns {{uuid: string, descriptors: number, charge: number, hash: string,
-   *   overflow: string|null, first: string}} what the retained comparison must keep
+   *   overflow: string|null}} what the retained comparison must keep; `descriptors` counts the
+   *   journaled descriptors the client updated in place
    */
   fingerprint(uuid) {
     const outcome = (metric) => {
@@ -193,10 +199,10 @@ class MemoryForeground {
       }
     }
     const overflow = outcome(descriptor(DESCRIPTORS))
+    const present = this.registered.filter((metric) => outcome(metric) === 'updated')
     return {
-      ...registryFingerprint(this.registry, uuid),
+      ...registryFingerprint(present.map(registryEntry), uuid),
       overflow: overflow === 'updated' ? null : overflow,
-      first: outcome(descriptor(0)),
     }
   }
 
@@ -286,13 +292,14 @@ class MemoryForeground {
   }
 
   /**
-   * Starts the public close and returns its own promise, so a caller can continue in its
-   * resolution; the scripted broker's answer timers are joined separately by `drain`.
-   * @param {number|undefined} timeout the public close budget; the admin client takes none
+   * Starts the public close with the same budget for every kind, and returns its own promise, so
+   * a caller can continue in its resolution; the scripted broker's answer timers are joined
+   * separately by `drain`.
+   * @param {number} timeout the public close budget, passed as `disconnect({ timeout })`
    * @returns {Promise<void>} the original public disconnect promise
    */
   close(timeout) {
-    return this.kind === 'admin' ? this.client.disconnect() : this.client.disconnect({ timeout })
+    return this.client.disconnect({ timeout })
   }
 
   /**

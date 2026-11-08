@@ -733,6 +733,7 @@ class NativeResultFamily {
     this.expected = { sockets: 1 }
     this.failNext = false
     this.compressCalls = 0
+    this.submitted = null
   }
 
   /**
@@ -745,6 +746,7 @@ class NativeResultFamily {
     this.watch = new IndexOneWatch(round)
     round.patch(gzip, 'compress', (original) => (...args) => {
       this.compressCalls += 1
+      this.submitted = new WeakRef(args[0].buffer)
       return this.failNext ? Promise.reject(new Error('late codec failure')) : original(...args)
     })
     this.gate = round.hold('S12', { mode: 'normal' })
@@ -763,11 +765,12 @@ class NativeResultFamily {
     this.failNext = false
     assert.equal(round.codecJobs.length, 1, 'exactly one native job is held')
     this.heldJob = round.codecJobs[0]
+    assert.equal(this.heldJob.input, this.submitted.deref(), 'the held input is the payload input')
     this.callsAtHold = this.compressCalls
     this.ledger = new CycleLedger(round, () => ({
       builder: [round.machine.payload],
       nativeJob: round.codecJobs.slice(0, 1),
-      nativeInput: round.codecJobs.slice(0, 1).flatMap((job) => (job.raw ? [job.raw] : [])),
+      nativeInput: round.codecJobs.slice(0, 1).flatMap((job) => (job.input ? [job.input] : [])),
       nativeResult: round.codecJobs.slice(0, 1).map((job) => job.promise),
     }))
     this.shell = await this.ledger.baseline()
