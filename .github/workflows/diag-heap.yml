@@ -33,22 +33,24 @@ jobs:
         timeout-minutes: 40
         env:
           DO_NOT_STOP: '1'
-        run: ./scripts/testWithKafka.sh "node --expose-gc scripts/diag/shareHeap.js"
+        run: |
+          export SHARE_SOAK_HEAP_STEP_STARTED_AT=$(node -p 'Date.now()')
+          set -o pipefail
+          ./scripts/testWithKafka.sh "node --expose-gc scripts/diag/shareHeap.js" 2>&1 | tee .tmp/e2e/diag-error.log
       - name: Analyse strong retainers offline
+        env:
+          NODE_PATH: .
         if: always()
         timeout-minutes: 10
         run: |
           node <<'NODE'
-          const fs = require('node:fs')
           const path = require('node:path')
           const { spawnSync } = require('node:child_process')
           const directory = '.tmp/e2e/diag-heap'
-          const rows = fs.readFileSync(path.join(directory, 'snapshots.jsonl'), 'utf8')
-            .trim().split('\n').map(JSON.parse)
-          if (rows[0]?.label !== 'baseline' || rows.length < 2) throw new Error('Missing matched captures')
           const result = spawnSync(process.execPath, [
             '--max-old-space-size=4096', 'scripts/diag/heapDiff.js',
-            ...rows.map(({ file }) => path.join(directory, file)),
+            '--manifest', path.join(directory, 'snapshots.jsonl'),
+            '--evidence', '.tmp/e2e/diag-share-heap.jsonl',
             '--out', path.join(directory, 'analysis'),
           ], { stdio: 'inherit' })
           if (result.error) throw result.error

@@ -157,3 +157,138 @@ test('matches deletion-based retained sizes on deterministic graphs with joins a
     }
   }
 })
+
+/** Builds labelled property owners and feedback holding a retired generic object. */
+const ownershipFixture = (grown = false) => {
+  const definitions = [
+    [
+      'synthetic',
+      'root',
+      1,
+      0,
+      [
+        ['owner', 1],
+        ['module', 7],
+        ['method', 9],
+        ['soak', 15],
+      ],
+    ],
+    ['object', 'ShareSoak', 3, 10, [['driver', 2], ...(grown ? [['final', 12]] : [])]],
+    ['object', 'ShareSoakDriver', 5, 10, [['acknowledged', 3]]],
+    ['object', 'Array', 7, 10, [['0', 4], ...(grown ? [['1', 11]] : [])]],
+    ['string', 'identity-0', 9, 20, []],
+    ['object', 'Array', 11, 10, [['0', 6]]],
+    ['object', 'Object', 13, grown ? 40 : 20, []],
+    ['object', 'Module', 15, 10, [['source', 8, 'internal']]],
+    ['string', 'module text', 17, 50, []],
+    [
+      'closure',
+      'ShareRun',
+      19,
+      10,
+      [
+        ['feedback', 10, 'internal'],
+        ['prototype', 13],
+      ],
+    ],
+    [
+      'code',
+      'system / FeedbackVector',
+      21,
+      grown ? 50 : 30,
+      grown ? [['retired', 14, 'context']] : [],
+    ],
+    ['string', 'identity-1', 23, 30, []],
+    ['object', 'Object', 25, 60, []],
+    ['object', 'Object', 27, 10, []],
+    ['object', 'Client', 29, 70, []],
+    ['object', 'Soak', 31, 10, [['samples', 5]]],
+  ]
+  const active = grown
+    ? definitions
+    : definitions.slice(0, 11).concat(definitions.slice(13, 14), definitions.slice(15))
+  const positions = new Map(active.map((definition, i) => [definition[2], i]))
+  const strings = []
+  const intern = (name) => {
+    if (!strings.includes(name)) strings.push(name)
+    return strings.indexOf(name)
+  }
+  const types = ['synthetic', 'object', 'string', 'closure', 'code']
+  const edgeTypes = ['property', 'internal', 'context']
+  const edges = []
+  const nodes = active.flatMap(([type, name, id, bytes, outgoing]) => {
+    for (const [label, target, kind = 'property'] of outgoing) {
+      edges.push(edgeTypes.indexOf(kind), intern(label), positions.get(definitions[target][2]) * 5)
+    }
+    return [types.indexOf(type), intern(name), id, bytes, outgoing.length]
+  })
+  return {
+    snapshot: {
+      node_count: active.length,
+      meta: {
+        node_fields: ['type', 'name', 'id', 'self_size', 'edge_count'],
+        node_types: [types],
+        edge_fields: ['type', 'name_or_index', 'to_node'],
+        edge_types: [edgeTypes],
+      },
+    },
+    nodes,
+    edges,
+    strings,
+  }
+}
+
+test('accounts disjoint incremental owner bytes, source targets, final proof and feedback-held data', () => {
+  const before = analyseSnapshot(ownershipFixture())
+  const after = analyseSnapshot(ownershipFixture(true))
+  const { ownership } = compareSnapshots(before, after)
+  expect(ownership.categories['acknowledged-identities'].delta.selfBytes).toBe(30)
+  expect(ownership.categories['compact-samples'].delta.selfBytes).toBe(20)
+  expect(ownership.categories['original-final-proof'].delta.selfBytes).toBe(60)
+  expect(ownership.categories['feedback-storage'].delta.selfBytes).toBe(20)
+  expect(ownership.categories['module-source'].delta.selfBytes).toBe(0)
+  expect(ownership.total.delta.selfBytes).toBe(200)
+  expect(
+    Object.values(ownership.categories).reduce((sum, category) => sum + category.delta.selfBytes, 0)
+  ).toBe(200)
+  const client = ownership.incrementalSamples.find(({ id }) => id === 29)
+  expect(client.ownerTrace.incoming.some(({ edge }) => edge.name === 'retired')).toBe(true)
+  const feedback = ownership.referenceAudits.find(({ node }) => node.id === 21)
+  expect(feedback.applicationReferences.some(({ target }) => target.id === 29)).toBe(true)
+  expect(feedback).toMatchObject({ retirementProven: false })
+  expect(
+    ownership.anchors.some(({ owner, property }) => owner.id === 19 && property === 'prototype')
+  ).toBe(true)
+})
+
+test('separates script nodes from compiled storage and identifies diagnostic state by script edges', () => {
+  const snapshot = {
+    snapshot: {
+      node_count: 5,
+      meta: {
+        node_fields: ['type', 'name', 'id', 'self_size', 'edge_count'],
+        node_types: [['synthetic', 'closure', 'code', 'object']],
+        edge_fields: ['type', 'name_or_index', 'to_node'],
+        edge_types: [['property', 'internal']],
+      },
+    },
+    strings: [
+      'root',
+      'capture',
+      '/repo/scripts/diag/shareHeap.js',
+      'system / Context',
+      'diag',
+      'shared',
+      'context',
+      'script',
+    ],
+    nodes: [0, 0, 1, 0, 1, 1, 1, 3, 56, 2, 2, 1, 5, 100, 1, 2, 2, 7, 200, 0, 3, 3, 9, 40, 0],
+    edges: [0, 4, 5, 1, 5, 10, 1, 6, 20, 1, 7, 15],
+  }
+  const graph = analyseSnapshot(snapshot)
+  const { ownership } = compareSnapshots(graph, graph)
+  expect(ownership.categories['script-storage'].after.selfBytes).toBe(200)
+  expect(ownership.categories['compiled-method-storage'].after.selfBytes).toBe(100)
+  expect(ownership.categories['diagnostic-capture-state'].after.selfBytes).toBe(96)
+  expect(ownership.categories['compiled-method-storage'].diagnosticSelfBytes.after).toBe(100)
+})

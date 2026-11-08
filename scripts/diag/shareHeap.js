@@ -16,9 +16,8 @@ const BLOCK_TRANSITION_MS = 15000
  */
 const diagnosticOptions = (env) => {
   if (env.SHARE_SOAK_HEAP_DIAG !== '1') return null
-  const count = env.SHARE_SOAK_HEAP_EXTRA_CYCLES ?? '0'
-  if (!/^(0|[1-9][0-9]*)$/.test(count) || Number(count) > 60)
-    throw new Error('Diagnostic extra cycles must be an integer from 0 to 60')
+  const count = env.SHARE_SOAK_HEAP_EXTRA_CYCLES ?? '10'
+  if (count !== '10') throw new Error('Diagnostic extra cycles must be exactly 10')
   const extraCycles = Number(count)
   const blocks = Math.ceil(extraCycles / BLOCK_CYCLES)
   return {
@@ -84,17 +83,30 @@ const repeatSteady = async (owner, count, capture, soak) => {
   for (let first = 0; first < count; first += BLOCK_CYCLES) {
     const end = Math.min(count, first + BLOCK_CYCLES)
     const runBlock = async () => {
+      let primary
       try {
         await bounded(owner.scope, BLOCK_TRANSITION_MS, (scope) => owner.driver.openPhase(scope))
         const blockStartedAt = owner.clock.now()
         for (let extra = first; extra < end; extra++) {
           const cycle = SHARE_SOAK.cycles + extra
           const plan = { ...ShareCycleOracle.plan(cycle), phase: 'share-steady', reset: false }
+          const startedAt = owner.clock.now()
           const due = blockStartedAt + (extra - first + 1) * owner.slotMs
           await bounded(owner.scope, due - owner.clock.now(), async (scope) => {
             const observation = await owner.driver.cycle(plan, scope, { due, clock: owner.clock })
             const violations = owner.verifyCycle(plan, observation)
-            owner.row('diag-extra-cycle', { extra: extra + 1, plan, observation, violations })
+            owner.row('diag-extra-cycle', {
+              extra: extra + 1,
+              plan: { ...plan, first: String(plan.first) },
+              observation,
+              violations,
+              slot: {
+                windowStart: due - owner.slotMs,
+                startedAt,
+                due,
+                completedAt: owner.clock.now(),
+              },
+            })
             owner.driver.lastCycle = null
             owner.driver.activeCycle = null
             if (violations.length) throw new Error(violations.join('; '))
@@ -103,9 +115,19 @@ const repeatSteady = async (owner, count, capture, soak) => {
           })
           while (owner.clock.now() < due) await owner.pause(owner.scope, due - owner.clock.now())
         }
-      } finally {
-        await bounded(owner.scope, BLOCK_TRANSITION_MS, () => owner.driver.closePhase())
+      } catch (error) {
+        primary = error
       }
+      try {
+        await bounded(owner.scope, BLOCK_TRANSITION_MS, () => owner.driver.closePhase())
+      } catch (cleanupError) {
+        if (!primary) primary = cleanupError
+        else {
+          primary.cleanupErrors = [...(primary.cleanupErrors ?? []), cleanupError]
+          recordFailure(owner, 'diag-cleanup-failed', cleanupError)
+        }
+      }
+      if (primary) throw primary
     }
     const repetition = new Soak({
       probe: soak.probe,
@@ -133,6 +155,35 @@ const repeatSteady = async (owner, count, capture, soak) => {
 }
 
 /**
+ * Archives nested cleanup causes separately without replacing the error if the sink also fails.
+ * @param {object} owner Original diagnostic owner and taint gate.
+ * @param {string} event Failure event.
+ * @param {Error} error Original exception.
+ * @returns {void}
+ */
+const recordFailure = (owner, event, error) => {
+  const describe = (failure, seen = new Set()) => {
+    if (seen.has(failure)) return { message: 'Circular error reference' }
+    seen.add(failure)
+    return {
+      name: failure?.name,
+      message: String(failure?.message ?? failure),
+      stack: failure?.stack,
+      errors: failure?.errors?.map((child) => describe(child, seen)),
+      cause: failure?.cause ? describe(failure.cause, seen) : undefined,
+      cleanupErrors: failure?.cleanupErrors?.map((child) => describe(child, seen)),
+    }
+  }
+  owner.fail(error)
+  try {
+    owner.row(event, { error: describe(error), status: 'failed', tainted: true })
+  } catch (archiveError) {
+    owner.fail(archiveError)
+    error.archiveErrors = [...(error.archiveErrors ?? []), archiveError]
+  }
+}
+
+/**
  * Opt-in standalone diagnostic runner. Reuses the real short workload and resource screen,
  * but never invokes the acceptance completion writer or natural-exit receipt generator.
  * Captures run after the timed transitions; only this process's enclosing bound is larger.
@@ -143,13 +194,22 @@ const runDiagnostic = async ({ env = process.env } = {}) => {
   const options = diagnosticOptions(env)
   if (!options) return null
   if (typeof globalThis.gc !== 'function') throw new Error('Heap diagnostics require --expose-gc')
+  const stepStartedAt = Number(env.SHARE_SOAK_HEAP_STEP_STARTED_AT)
+  if (
+    !Number.isFinite(stepStartedAt) ||
+    stepStartedAt > Date.now() ||
+    Date.now() - stepStartedAt + options.totalMs > 40 * 60000
+  )
+    throw new Error('Diagnostic setup, work and exit cannot fit the 40-minute step')
   const { buildShareSoak } = require('../soak/soak')
+  const { evidenceStatus } = require('./evidence')
   const { evidencePath, writeEvidence } = require('../../testHelpers/e2eEvidence')
   const { bounded, NEVER } = require('../../src/producer/__tests__/fixtures/bounded')
   const directory = path.join(path.dirname(evidencePath('diag-share-heap')), 'diag-heap')
   fs.mkdirSync(directory, { recursive: true })
   const manifest = path.join(directory, 'snapshots.jsonl')
-  if (fs.existsSync(manifest)) throw new Error('Use a fresh diagnostic evidence directory')
+  if (fs.existsSync(manifest) || fs.existsSync(evidencePath('diag-share-heap')))
+    throw new Error('Use a fresh diagnostic evidence directory')
   const owner = buildShareSoak({
     brokers: ['localhost:9092', 'localhost:9095', 'localhost:9098'],
     short: true,
@@ -190,21 +250,44 @@ const runDiagnostic = async ({ env = process.env } = {}) => {
     },
     beforeTeardown: async () => {
       // Preserve the original final proof at the original corpus end before extending it.
-      owner.final = await bounded(owner.scope, owner.budget.cleanupMs, (scope) =>
-        owner.driver.final(scope, {
-          clock: owner.clock,
-          due: owner.clock.now() + owner.budget.cleanupMs,
-        })
-      )
+      const finalStartedAt = owner.clock.now()
+      const remaining = owner.budget.cleanupMs - owner.spent.cleanup
+      try {
+        owner.final = await bounded(owner.scope, remaining, (scope) =>
+          owner.driver.final(scope, { clock: owner.clock, due: finalStartedAt + remaining })
+        )
+      } finally {
+        owner.spent.cleanup += owner.clock.now() - finalStartedAt
+      }
+      owner.row('diag-original-timing', { timing: owner.timing })
       owner.row('diag-original-final', { final: owner.final })
       await bounded(owner.scope, BLOCK_TRANSITION_MS, () => owner.driver.closePhase())
       await repeatSteady(owner, options.extraCycles, capture, soak)
       await owner.stage('cleanup', () => owner.cleanupStack())
+      owner.row('diag-cleanup', {
+        status: 'passed',
+        completedAt: owner.driver.completedAt,
+        spentMs: owner.spent.cleanup,
+        budgetMs: owner.budget.cleanupMs,
+        baseline: owner.driver.baseline,
+        after: owner.driver.after,
+        clock: owner.driver.cleanupClock,
+      })
     },
   }
   const soak = owner.soak()
+  let primary
+  let result
   try {
     owner.gate.assertClean()
+    const digest = (file) =>
+      require('node:crypto').createHash('sha256').update(fs.readFileSync(file)).digest('hex')
+    owner.row('diag-source', {
+      harness: 'standalone-short-share',
+      sources: [__filename, require.resolve('./evidence'), require.resolve('../soak/soak')].map(
+        (file) => ({ file: path.relative(process.cwd(), file), sha256: digest(file) })
+      ),
+    })
     owner.row('diag-envelope', { ...options, acceptanceBudgets: owner.budget })
     const resources = await bounded(
       NEVER,
@@ -216,19 +299,34 @@ const runDiagnostic = async ({ env = process.env } = {}) => {
       },
       { label: 'Diagnostic share heap envelope' }
     )
-    const result = {
+    result = {
       diagnostic: true,
       acceptanceEligible: false,
       resources,
       extraCycles: options.extraCycles,
     }
+  } catch (error) {
+    primary = error
+    recordFailure(owner, 'diag-failed', error)
+  }
+  try {
+    await owner.close()
+  } catch (cleanupError) {
+    recordFailure(owner, 'diag-cleanup-failed', cleanupError)
+    if (primary) primary.cleanupErrors = [...(primary.cleanupErrors ?? []), cleanupError]
+    else primary = cleanupError
+  }
+  if (primary) throw primary
+  try {
+    const read = (file) => fs.readFileSync(file, 'utf8').trim().split('\n').map(JSON.parse)
+    const status = evidenceStatus(read(evidencePath('diag-share-heap')), read(manifest), false)
+    if (!status.complete)
+      throw new Error(`Incomplete diagnostic evidence: ${status.violations.join('; ')}`)
     owner.row('diag-complete', result)
     return result
   } catch (error) {
-    owner.fail(error)
+    recordFailure(owner, 'diag-failed', error)
     throw error
-  } finally {
-    await owner.close()
   }
 }
 

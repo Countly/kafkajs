@@ -173,6 +173,7 @@ const analyseSnapshot = ({ snapshot, nodes, edges, strings }) => {
   }
   // In dominator preorder, each subtree is one interval. Merge same-group nested intervals.
   const lastEnd = new Uint32Array(groups.length)
+  const ordinalIndex = new Uint32Array(n)
   let ordinal = 0
   top = 0
   stack[0] = root
@@ -183,6 +184,7 @@ const analyseSnapshot = ({ snapshot, nodes, edges, strings }) => {
       groups[g].retainedBytes += retained[v]
       lastEnd[g] = ordinal + subtreeCount[v]
     }
+    ordinalIndex[v] = ordinal
     ordinal++
     for (let child = firstChild[v]; child !== -1; child = nextChild[child]) stack[++top] = child
   }
@@ -223,7 +225,52 @@ const analyseSnapshot = ({ snapshot, nodes, edges, strings }) => {
     }
     return result.reverse()
   }
-  return { n, groups, unreachable, retained, idom, describe, rootPath, groupIndex }
+  const outgoing = (v, includeWeak = false) => {
+    const result = []
+    for (let e = starts[v]; e < starts[v + 1]; e += ef) {
+      const type = edgeTypes[edges[e + et]]
+      if (type === 'weak' && !includeWeak) continue
+      result.push({
+        target: edges[e + to] / nf,
+        edge: {
+          type,
+          name: ['element', 'hidden'].includes(type) ? edges[e + en] : strings[edges[e + en]],
+        },
+      })
+    }
+    return result
+  }
+  const incoming = (v) => {
+    const result = []
+    const visitedParents = new Set()
+    for (let i = predStarts[v]; i < predStarts[v + 1]; i++) {
+      const parent = predecessors[i]
+      if (visitedParents.has(parent)) continue
+      visitedParents.add(parent)
+      for (const entry of outgoing(parent))
+        if (entry.target === v) result.push({ owner: describe(parent), edge: entry.edge })
+    }
+    return result
+  }
+  const dominates = (owner, v) =>
+    ordinalIndex[v] >= ordinalIndex[owner] &&
+    ordinalIndex[v] < ordinalIndex[owner] + subtreeCount[owner]
+  return {
+    n,
+    root,
+    groups,
+    unreachable,
+    retained,
+    idom,
+    describe,
+    rootPath,
+    groupIndex,
+    outgoing,
+    incoming,
+    dominates,
+    vertex,
+    visited,
+  }
 }
 
 /**
@@ -333,7 +380,340 @@ const compareSnapshots = (baseline, end) => {
       })
     }
   }
-  return { top, groups }
+  return { top, groups, ownership: compareOwnership(baseline, end) }
+}
+
+/**
+ * Finds actual named owning properties and labels only dominated storage. Code/source labels
+ * apply to their own bytes, never exempt application descendants reached through feedback.
+ * @param {object} graph Analysed strong graph.
+ * @returns {object} Disjoint per-node categories and explicit property anchors.
+ */
+const ownershipIndex = (graph) => {
+  if (graph.ownership) return graph.ownership
+  const anchors = []
+  const anchorAt = new Map()
+  const sourceTargets = new Set()
+  const scriptTargets = new Set()
+  const diagnosticNodes = new Set()
+  const diagnosticEffects = []
+  for (let v = 0; v < graph.n; v++) {
+    if (graph.groupIndex[v] < 0) continue
+    const owner = graph.describe(v)
+    for (const { target, edge } of graph.outgoing(v)) {
+      let category
+      if (edge.type === 'internal' && edge.name === 'script') scriptTargets.add(target)
+      if (
+        edge.type === 'internal' &&
+        edge.name === 'source' &&
+        /string/.test(graph.describe(target).type)
+      )
+        sourceTargets.add(target)
+      if (edge.type !== 'property') continue
+      if (owner.type === 'object') {
+        if (owner.name === 'ShareSoakDriver' && edge.name === 'acknowledged')
+          category = 'acknowledged-identities'
+        if (owner.name === 'ShareSoak' && edge.name === 'final') category = 'original-final-proof'
+        if (owner.name === 'Soak' && edge.name === 'samples') category = 'compact-samples'
+        if (owner.name === 'Soak' && edge.name === 'phaseEnds') category = 'phase-end-summaries'
+        if (owner.name === 'ShareSoak' && ['timing', 'counts', 'spent'].includes(edge.name))
+          category = 'timing-summaries'
+        if (owner.name === 'ShareTimerObserver' && edge.name === 'owners')
+          category = 'timer-observer'
+        if (owner.name === 'Module') category = 'module-cache'
+        if (
+          ['ShareSoak', 'ShareSoakDriver'].includes(owner.name) &&
+          ['admin', 'producer', 'lastCycle', 'activeCycle'].includes(edge.name) &&
+          graph.describe(target).type === 'object'
+        )
+          category = 'connection-session-metadata'
+      }
+      if (owner.name === 'Module' && edge.name === '_cache') category = 'module-cache'
+      const prototype =
+        owner.type === 'closure' &&
+        ['ShareRun', 'ShareFetchLoop', 'ShareSoakDriver', 'ShareMember', 'ShareSession'].includes(
+          owner.name
+        ) &&
+        edge.name === 'prototype'
+      if (!category && !prototype) continue
+      const anchor = {
+        owner,
+        property: edge.name,
+        target: graph.describe(target),
+        category: category ?? 'prototype-inspection',
+        index: target,
+      }
+      anchors.push(anchor)
+      if (category) {
+        const existing = anchorAt.get(target)
+        anchorAt.set(
+          target,
+          existing && existing !== category ? 'shared-owner-unclassified' : category
+        )
+      }
+    }
+  }
+  for (let v = 0; v < graph.n; v++) {
+    if (graph.groupIndex[v] < 0 || graph.describe(v).type !== 'closure') continue
+    const outgoing = graph.outgoing(v)
+    const shared = outgoing.find(({ edge }) => edge.type === 'internal' && edge.name === 'shared')
+    if (!shared) continue
+    const script = graph
+      .outgoing(shared.target)
+      .find(({ edge }) => edge.type === 'internal' && edge.name === 'script')
+    if (
+      !script ||
+      !/[/\\]scripts[/\\]diag[/\\]shareHeap\.js$/.test(graph.describe(script.target).name)
+    )
+      continue
+    const context = outgoing.find(({ edge }) => edge.type === 'internal' && edge.name === 'context')
+    for (const node of [v, shared.target, script.target, context?.target])
+      if (node !== undefined) diagnosticNodes.add(node)
+    for (const { target, edge } of graph.outgoing(script.target))
+      if (edge.type === 'internal' && edge.name === 'source') diagnosticNodes.add(target)
+    diagnosticEffects.push({
+      function: graph.describe(v),
+      script: graph.describe(script.target),
+      context: context ? graph.describe(context.target) : null,
+    })
+  }
+  const inherited = new Array(graph.n)
+  const categories = new Array(graph.n)
+  for (let i = 1; i <= graph.visited; i++) {
+    const v = graph.vertex[i]
+    const node = graph.describe(v)
+    // DFS order visits each dominator before its descendants.
+    inherited[v] = anchorAt.get(v) ?? inherited[graph.idom[v]]
+    let category = inherited[v] ?? 'unclassified'
+    if (sourceTargets.has(v)) category = 'module-source'
+    else if (/FeedbackVector|FeedbackCell/.test(node.name)) category = 'feedback-storage'
+    else if (scriptTargets.has(v)) category = 'script-storage'
+    else if (node.type === 'code') category = 'compiled-method-storage'
+    else if (/^(system \/ )?Script$/.test(node.name)) category = 'script-storage'
+    else if (
+      node.type === 'object' &&
+      /^(ShareRun|ShareFetchLoop|ShareMember|ShareSession|Connection|Socket|Broker|Cluster|Client)$/.test(
+        node.name
+      )
+    )
+      category = 'connection-session-metadata'
+    if (diagnosticNodes.has(v) && ['closure', 'object'].includes(node.type))
+      category = 'diagnostic-capture-state'
+    categories[v] = category
+  }
+  graph.ownership = { anchors, categories, sourceTargets, diagnosticNodes, diagnosticEffects }
+  return graph.ownership
+}
+
+/**
+ * Traces all direct retainers plus concrete root and dominator owning properties for one sample.
+ * @param {object} graph Analysed snapshot.
+ * @param {number} v Node index.
+ * @returns {object} Paths are evidence, not exclusive ownership or retirement proofs.
+ */
+const traceOwner = (graph, v) => ({
+  rootPath: graph.rootPath(v),
+  incoming: graph.incoming(v),
+  owningProperties: ownershipIndex(graph)
+    .anchors.filter((anchor) => graph.dominates(anchor.index, v))
+    .map(({ index, ...anchor }) => anchor),
+})
+
+/**
+ * Inspects feedback/prototype descendants through contexts, arrays, Maps and internal links.
+ * Work is explicitly capped; truncated or weak/ephemeron paths keep the attribution gate open.
+ * @param {object} graph Analysed snapshot.
+ * @param {number} start Feedback or prototype node.
+ * @returns {object} Application targets and their labelled reference chains.
+ */
+const auditReferences = (graph, start) => {
+  const queue = [{ v: start, path: [] }]
+  const seen = new Set([start])
+  const applicationReferences = []
+  let weakEdges = 0
+  let truncated = false
+  for (let cursor = 0; cursor < queue.length && cursor < 1000; cursor++) {
+    const { v, path } = queue[cursor]
+    for (const { target, edge } of graph.outgoing(v, true)) {
+      if (edge.type === 'weak') {
+        weakEdges++
+        continue
+      }
+      const node = graph.describe(target)
+      const chain = [...path, { owner: graph.describe(v), edge, target: node }]
+      if (
+        node.type === 'object' &&
+        !['Array', 'Map', 'WeakMap', 'Set'].includes(node.name) &&
+        applicationReferences.length < 128
+      )
+        applicationReferences.push({ target: node, path: chain })
+      if (applicationReferences.length >= 128) truncated = true
+      if (
+        seen.has(target) ||
+        /string/.test(node.type) ||
+        node.type === 'synthetic' ||
+        edge.name === '__proto__'
+      )
+        continue
+      seen.add(target)
+      if (chain.length >= 6 || queue.length >= 1000) {
+        truncated = true
+        continue
+      }
+      queue.push({ v: target, path: chain })
+    }
+  }
+  return {
+    node: graph.describe(start),
+    ownerTrace: traceOwner(graph, start),
+    applicationReferences,
+    weakEdges,
+    truncated,
+    retirementProven: false,
+  }
+}
+
+/**
+ * Accounts every reachable node once, including releases and category transfers of stable IDs.
+ * Samples are selected for each growing category/type, independently of constructor rankings.
+ * @param {object} before Previous capture (or baseline for a cumulative comparison).
+ * @param {object} after Current capture.
+ * @returns {object} Additive self-byte ledger, property traces and feedback/prototype inspections.
+ */
+const compareOwnership = (before, after) => {
+  const b = ownershipIndex(before)
+  const a = ownershipIndex(after)
+  const categories = {}
+  const totals = (graph, index, side) => {
+    for (let v = 0; v < graph.n; v++) {
+      if (graph.groupIndex[v] < 0) continue
+      const category = index.categories[v]
+      categories[category] ??= {
+        before: { count: 0, selfBytes: 0 },
+        after: { count: 0, selfBytes: 0 },
+        addedSelfBytes: 0,
+        removedSelfBytes: 0,
+        survivorSelfDelta: 0,
+        transferSelfBytes: 0,
+      }
+      categories[category].diagnosticSelfBytes ??= { before: 0, after: 0 }
+      if (index.diagnosticNodes.has(v))
+        categories[category].diagnosticSelfBytes[side] += graph.describe(v).selfBytes
+      categories[category][side].count++
+      categories[category][side].selfBytes += graph.describe(v).selfBytes
+      categories[category].types ??= { before: {}, after: {} }
+      const type = graph.describe(v).type
+      categories[category].types[side][type] ??= { count: 0, selfBytes: 0 }
+      categories[category].types[side][type].count++
+      categories[category].types[side][type].selfBytes += graph.describe(v).selfBytes
+    }
+  }
+  totals(before, b, 'before')
+  totals(after, a, 'after')
+  const beforeIds = new Map()
+  const afterIds = new Set()
+  for (let v = 0; v < before.n; v++)
+    if (before.groupIndex[v] >= 0) beforeIds.set(before.describe(v).id, v)
+  const selected = new Map()
+  const audit = new Set(
+    a.anchors
+      .filter(({ category }) => category === 'prototype-inspection')
+      .map(({ index }) => index)
+  )
+  for (let v = 0; v < after.n; v++) {
+    if (after.groupIndex[v] < 0) continue
+    const node = after.describe(v)
+    const old = beforeIds.get(node.id)
+    afterIds.add(node.id)
+    const category = a.categories[v]
+    const ledger = categories[category]
+    if (old === undefined) ledger.addedSelfBytes += node.selfBytes
+    else {
+      const oldCategory = b.categories[old]
+      if (oldCategory === category)
+        ledger.survivorSelfDelta += node.selfBytes - before.describe(old).selfBytes
+      else {
+        categories[oldCategory].transferSelfBytes -= before.describe(old).selfBytes
+        ledger.transferSelfBytes += node.selfBytes
+      }
+    }
+    const retainedDelta = node.retainedBytes - (old === undefined ? 0 : before.retained[old])
+    if (old !== undefined && retainedDelta <= 0 && node.selfBytes <= before.describe(old).selfBytes)
+      continue
+    const kind = /Buffer|ArrayBuffer|Uint8Array/.test(node.name)
+      ? 'buffer'
+      : /Feedback/.test(node.name)
+        ? 'feedback'
+        : node.type === 'array' || node.name === 'Array'
+          ? 'array'
+          : /Map/.test(node.name)
+            ? 'map'
+            : node.type
+    const key = `${category}/${kind}`
+    const candidates = selected.get(key) ?? []
+    candidates.push({ v, retainedDelta })
+    candidates.sort((x, y) => y.retainedDelta - x.retainedDelta)
+    if (candidates.length > 3) candidates.pop()
+    selected.set(key, candidates)
+  }
+  for (const [id, v] of beforeIds)
+    if (!afterIds.has(id))
+      categories[b.categories[v]].removedSelfBytes += before.describe(v).selfBytes
+  const incrementalSamples = []
+  for (const candidates of selected.values())
+    for (const { v, retainedDelta } of candidates) {
+      const node = after.describe(v)
+      const old = beforeIds.get(node.id)
+      incrementalSamples.push({
+        ...node,
+        category: a.categories[v],
+        previousNode: old === undefined ? null : before.describe(old),
+        retainedDeltaBytes: retainedDelta,
+        ownerTrace: traceOwner(after, v),
+      })
+      if (/Feedback|Map|Buffer|ArrayBuffer/.test(node.name) || node.type === 'closure') audit.add(v)
+    }
+  // The originally investigated vector is kept visible if it survives even without growth.
+  for (let v = 0; v < after.n; v++)
+    if (
+      after.groupIndex[v] >= 0 &&
+      after.describe(v).id === 274123 &&
+      /Feedback/.test(after.describe(v).name)
+    )
+      audit.add(v)
+  const total = {
+    before: { count: 0, selfBytes: 0 },
+    after: { count: 0, selfBytes: 0 },
+    delta: { count: 0, selfBytes: 0 },
+  }
+  for (const ledger of Object.values(categories)) {
+    ledger.delta = {
+      count: ledger.after.count - ledger.before.count,
+      selfBytes: ledger.after.selfBytes - ledger.before.selfBytes,
+    }
+    if (
+      ledger.delta.selfBytes !==
+      ledger.addedSelfBytes -
+        ledger.removedSelfBytes +
+        ledger.survivorSelfDelta +
+        ledger.transferSelfBytes
+    )
+      throw new Error('Ownership byte ledger does not reconcile')
+    for (const side of ['before', 'after', 'delta'])
+      for (const metric of ['count', 'selfBytes']) total[side][metric] += ledger[side][metric]
+  }
+  return {
+    total,
+    categories,
+    incrementalSamples,
+    anchors: a.anchors.map(({ index, ...anchor }) => anchor),
+    sourceTargets: { before: b.sourceTargets.size, after: a.sourceTargets.size },
+    referenceAudits: [...audit].map((v) => auditReferences(after, v)),
+    diagnosticEffects: a.diagnosticEffects,
+    attributionComplete: false,
+    openGate:
+      'Review unclassified/shared bytes, all material incremental owners, truncated references and conditional ephemerons; sampled paths do not prove retired data absent.',
+  }
 }
 
 /** Reads one raw or gzipped V8 snapshot. @param {string} file Snapshot path. */
@@ -352,16 +732,52 @@ const readSnapshot = (file) =>
  * @returns {void}
  */
 const main = (argv) => {
-  const outAt = argv.indexOf('--out')
-  if (outAt < 2 || outAt !== argv.length - 2)
+  const args = [...argv]
+  const option = (name) => {
+    const at = args.indexOf(name)
+    if (at < 0) return null
+    const value = args[at + 1]
+    if (!value || value.startsWith('--')) throw new Error(`Missing ${name} value`)
+    args.splice(at, 2)
+    return value
+  }
+  const evidenceFile = option('--evidence')
+  const manifestFile = option('--manifest')
+  let status = {
+    complete: false,
+    violations: ['No full diagnostic evidence/manifest supplied; partial analysis only'],
+  }
+  let captures
+  if (manifestFile) {
+    const read = (file) => fs.readFileSync(file, 'utf8').trim().split('\n').map(JSON.parse)
+    captures = read(manifestFile)
+    if (evidenceFile) status = require('./evidence').evidenceStatus(read(evidenceFile), captures)
+    const snapshotFiles = captures.map(({ file, sizeBytes }) => {
+      const raw = path.join(path.dirname(manifestFile), file)
+      const resolved = fs.existsSync(raw) ? raw : `${raw}.gz`
+      const bytes = resolved.endsWith('.gz')
+        ? zlib.gunzipSync(fs.readFileSync(resolved)).length
+        : fs.statSync(resolved).size
+      if (bytes !== sizeBytes) {
+        status.complete = false
+        status.violations.push(`Snapshot size mismatch: ${file}`)
+      }
+      return resolved
+    })
+    args.unshift(...snapshotFiles)
+  }
+  const outAt = args.indexOf('--out')
+  if (outAt < 2 || outAt !== args.length - 2)
     throw new Error(
       'Usage: node heapDiff.js baseline.heapsnapshot end.heapsnapshot [...] --out output-prefix'
     )
-  const files = argv.slice(0, outAt)
-  const output = argv[outAt + 1]
+  const files = args.slice(0, outAt)
+  const output = args[outAt + 1]
   const baseline = readSnapshot(files[0])
   const notes = [
     'DIAGNOSTIC ONLY — not a soak acceptance receipt.',
+    `Evidence status: ${status.complete ? 'COMPLETE diagnostic workload/captures/cleanup' : 'INCOMPLETE — partial analysis only'}.`,
+    ...status.violations,
     'Retained bytes are strong-edge dominator subtree unions within each constructor/type; groups overlap and must not be summed.',
     'Self bytes are additive. Weak edges are excluded; conditional ephemeron liveness is not reconstructed.',
     'Stable IDs indicate survival only in this process. Names and owner hints are not attribution verdicts.',
@@ -378,13 +794,21 @@ const main = (argv) => {
     json,
     JSON.stringify({
       notes,
+      evidence: status,
+      analysisSource: {
+        file: 'scripts/diag/heapDiff.js',
+        sha256: require('node:crypto')
+          .createHash('sha256')
+          .update(fs.readFileSync(__filename))
+          .digest('hex'),
+      },
       baseline: { file: files[0], groups: baseline.groups, unreachable: baseline.unreachable },
     }).slice(0, -1) + ',"comparisons":['
   )
   try {
     for (const note of notes) print(note)
     let previousFile = files[0]
-    let previousGroups = new Map(baseline.groups.map((g) => [g.key, g]))
+    let previous = baseline
     const firstSeen = new Map()
     for (let v = 0; v < baseline.n; v++) firstSeen.set(baseline.describe(v).id, files[0])
     for (const [index, file] of files.slice(1).entries()) {
@@ -394,22 +818,47 @@ const main = (argv) => {
         previousFile,
         unreachable: end.unreachable,
         ...compareSnapshots(baseline, end),
+        sincePrevious: compareSnapshots(previous, end),
+        comparability: {
+          intentionalCorpus: /repeat-010/.test(file) ? { before: 1800, after: 2400 } : null,
+          changingOwners: [
+            'acknowledged-identities',
+            'original-final-proof',
+            'compact-samples',
+            'phase-end-summaries',
+            'timing-summaries',
+            'timer-observer',
+          ],
+          conclusion:
+            'Compare added/released stable-ID self bytes in each ledger. Total heap alone establishes neither saturation nor a product leak; material unclassified ownership remains open.',
+        },
       }
       for (let v = 0; v < end.n; v++) {
         const id = end.describe(v).id
         if (!firstSeen.has(id)) firstSeen.set(id, file)
       }
       for (const group of comparison.groups) {
-        const previous = previousGroups.get(group.key)
+        const previousGroup = previous.groups.find((g) => g.key === group.key)
         group.sincePrevious = Object.fromEntries(
           Object.keys(group.end).map((field) => [
             field,
-            group.end[field] - (previous?.[field] ?? 0),
+            group.end[field] - (previousGroup?.[field] ?? 0),
           ])
         )
         for (const sample of group.samples) sample.firstSeenCapture = firstSeen.get(sample.id)
       }
       fs.writeSync(json, (index ? ',' : '') + JSON.stringify(comparison))
+      print(`PAIRWISE ${previousFile} -> ${file}`)
+      print(
+        `Disjoint self-byte ledger: ${JSON.stringify(comparison.sincePrevious.ownership.categories)}`
+      )
+      for (const sample of comparison.sincePrevious.ownership.incrementalSamples) {
+        print(
+          `OWNER id=${sample.id} category=${sample.category} previous=${sample.previousNode?.id ?? 'new'} self=${sample.selfBytes} retained delta=${sample.retainedDeltaBytes} ${JSON.stringify(sample.ownerTrace)}`
+        )
+      }
+      for (const audit of comparison.sincePrevious.ownership.referenceAudits)
+        print(`REFERENCE AUDIT ${JSON.stringify(audit)}`)
       print(`\nBASELINE ${files[0]} -> ${file}`)
       for (const field of ['count', 'selfBytes', 'retainedBytes']) {
         print(`Top growing groups by ${field}:`)
@@ -439,12 +888,14 @@ const main = (argv) => {
         }
       }
       previousFile = file
-      previousGroups = new Map(end.groups.map((g) => [g.key, g]))
+      previous = end
     }
     fs.writeSync(json, ']}\n')
   } finally {
     fs.closeSync(json)
   }
+  if ((manifestFile || evidenceFile) && !status.complete)
+    throw new Error('Incomplete diagnostic evidence; partial analysis retained')
 }
 
 if (require.main === module) {
