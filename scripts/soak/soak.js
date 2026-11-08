@@ -2145,6 +2145,8 @@ class Soak {
    *   `warmupMs`, and each sample names its phase and how long into it it was taken
    * @param {number} [options.settleMs=SETTLE_MS] how long a quiet point waits for closed sockets to go
    * @param {(record: object) => void} [options.record=writeEvidence('soak', ...)] where every line goes
+   * @param {(snapshot: object) => object} [options.sampleSnapshot] Selects the snapshot fields kept
+   *   for the judge. Evidence always receives the complete original snapshot.
    * @param {Record<string, Function>} [options.workloads=WORKLOADS]
    * @param {(work: Function, stage?: string) => Promise<*>} [options.transition] Bounds and charges
    *   matched quiet observations and sampler joins; ordinary profiles call through unchanged.
@@ -2161,6 +2163,7 @@ class Soak {
     judge = evaluate,
     settleMs = SETTLE_MS,
     record = (line) => writeEvidence('soak', line),
+    sampleSnapshot = (snapshot) => snapshot,
     workloads = WORKLOADS,
     beforeTeardown = async () => {},
     transition = (work) => work(),
@@ -2175,6 +2178,7 @@ class Soak {
       judge,
       settleMs,
       record,
+      sampleSnapshot,
       workloads,
       beforeTeardown,
       transition,
@@ -2250,7 +2254,7 @@ class Soak {
             phaseMs: now - phaseStartedAt,
             snapshot,
           }
-          this.samples.push(sample)
+          this.samples.push({ ...sample, snapshot: this.sampleSnapshot(snapshot) })
           this.record({ kind: 'sample', ...sample })
         }
       }
@@ -5787,6 +5791,13 @@ class ShareSoak {
       warmupMs: SHARE_SOAK.warmupMs,
       settleMs: SHARE_SOAK.settleMs,
       judge: ShareSoakScreen.evaluate,
+      // Archive full diagnostics, but do not keep retired owners and listener names in the heap series.
+      sampleSnapshot: ({ heapUsed, shareRecords, shareRanges, shareSessions }) => ({
+        heapUsed,
+        shareRecords,
+        shareRanges,
+        shareSessions,
+      }),
       record: (line) => this.recordResources(line),
       beforeTeardown: () => this.finish(),
       transition: (work, stage = 'transition') => this.stage(stage, work),
