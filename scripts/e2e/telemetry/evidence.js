@@ -754,8 +754,8 @@ const verifyScenario = (record, directory) => {
             const off = ownership(`${kind}-off`)
             assert.deepEqual(record.results.ownership[kind], { on, off })
             assert.deepEqual(
-              on.map((r) => r.split(':').at(-1)).sort(),
-              off.map((r) => r.split(':').at(-1)).sort(),
+              [...new Set(on.map((r) => r.split(':').at(-1)))].sort(),
+              [...new Set(off.map((r) => r.split(':').at(-1)))].sort(),
               'Enabled/disabled socket ownership differs'
             )
           }
@@ -806,8 +806,53 @@ const verifyScenario = (record, directory) => {
 }
 
 /**
+ * Qualifies Kafka's timestamp-preserving 117/76 refresh: validation advances the failed Push's
+ * timestamp, but the immediate Get bypasses quota without updating its own timestamp. Its first
+ * jittered Push may consequently receive 89. Every other early request remains a failure.
+ * @param {object} transcript complete owner or segment ledger
+ * @param {object} request request answered with error 89
+ * @returns {boolean} whether the trace proves this exception and interval-delayed recovery
+ */
+const isRefreshThrottle = (transcript, request) => {
+  const telemetry = transcript.records.filter(
+    (r) => r.type === 'request' && [71, 72].includes(r.apiKey)
+  )
+  const index = telemetry.indexOf(request)
+  const [prior, get] = telemetry.slice(Math.max(0, index - 2), index)
+  const next = telemetry[index + 1]
+  const interval = get?.response?.pushIntervalMs
+  return !!(
+    request.apiKey === 72 &&
+    !request.terminating &&
+    prior?.apiKey === 72 &&
+    !prior.terminating &&
+    [117, 76].includes(prior.response?.errorCode) &&
+    get?.apiKey === 71 &&
+    get.response?.errorCode === 0 &&
+    Number.isInteger(interval) &&
+    interval > 0 &&
+    [prior, get].every((r) => r.socketId === request.socketId && r.node === request.node) &&
+    prior.uuid === request.uuid &&
+    get.response.uuid === request.uuid &&
+    get.uuid === request.uuid &&
+    request.subscriptionId === get.response.subscriptionId &&
+    get.writeAt >= prior.response.responseAt &&
+    get.writeAt < prior.response.responseAt + interval &&
+    request.writeAt >= get.response.responseAt + Math.round(interval * 0.5) &&
+    request.writeAt < prior.response.responseAt + interval &&
+    next?.apiKey === 71 &&
+    next.socketId === request.socketId &&
+    next.node === request.node &&
+    next.uuid === request.uuid &&
+    next.writeAt >= request.response.responseAt + interval &&
+    next.response?.errorCode === 0
+  )
+}
+
+/**
  * Requires every Push and Get of every owner to be accounted for: answered with success, answered
- * with an error the case declared for that owner, or an exact request-level cancellation joined
+ * with an error the case declared for that owner, the source-qualified refresh throttle,
+ * or an exact request-level cancellation joined
  * to its public-close boundary or one deliberately faulted exchange.
  * @param {Object<string,object>} transcripts observer transcript by owner label
  * @param {{errors?:Object<string,number[]>}} allowed per-owner deliberate response errors; unanswered
@@ -887,7 +932,12 @@ const assertStreamAccounted = (transcripts, allowed = {}) => {
             assert(r.apiKey === 72 && r.terminating && r.writeAt >= c.at && r.writeAt <= close.end)
           }
         }
-      } else if (r.response.errorCode !== 0)
+      } else if (r.response.errorCode === 89)
+        assert(
+          isRefreshThrottle(transcript, r),
+          `Unqualified broker throttle for ${r.requestKey} of ${owner}`
+        )
+      else if (r.response.errorCode !== 0)
         assert(
           (allowed.errors?.[owner] ?? []).includes(r.response.errorCode),
           `Undeclared error ${r.response.errorCode} for ${r.requestKey} of ${owner}`

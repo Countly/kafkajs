@@ -36,7 +36,13 @@ if (process.env.TELEMETRY_JAVA_CACHE) {
     check(path.join(process.env.TELEMETRY_JAVA_CACHE, input.cachePath), input.sha256)
   }
 }
-process.stdout.write(JSON.stringify({ verified: true, line, compose: manifest.composeSha256 }) + '\n')
+const decoder = {
+  source: 'e2c0e1856b402d645368844b100ba00a1f11c1c1b8120c990adde1cf98ef1c1f',
+  jar: '179e47004f17d9d9ce7b379364a4d9f19b95aa8c1d4e10bb1277521935e3887b',
+}
+check(path.join(here, 'FullTelemetryDecoder.java'), decoder.source)
+check(path.join(here, 'fixtures/full-telemetry-decoder.jar'), decoder.jar)
+process.stdout.write(JSON.stringify({ verified: true, line, compose: manifest.composeSha256, decoder }) + '\n')
 NODE
 if [ "$MODE" = verify ]; then exit 0; fi
 if [ "$MODE" = client ] || [ "$MODE" = client-check ]; then
@@ -73,5 +79,5 @@ RAW=${3:?absolute raw MetricsData file}
 case "$RAW" in /*) ;; *) exit 2 ;; esac
 [ -f "$RAW" ] && [ ! -L "$RAW" ]
 [ "$(wc -c < "$RAW")" -le 4096 ]
-CP="$HERE/fixtures/counting-telemetry-reporter-$LINE.jar:$TELEMETRY_JAVA_CACHE/jars/kafka-clients-$LINE.jar:$TELEMETRY_JAVA_CACHE/jars/protobuf-java-3.25.5.jar:$TELEMETRY_JAVA_CACHE/jars/slf4j-api-1.7.36.jar"
-exec timeout --foreground -k 5s 20s java -Djava.io.tmpdir="$TMPDIR" -cp "$CP" org.countly.kafkajs.telemetry.CountingTelemetryReporter decode --file "$RAW"
+CP="$HERE/fixtures/full-telemetry-decoder.jar:$HERE/fixtures/counting-telemetry-reporter-$LINE.jar:$TELEMETRY_JAVA_CACHE/jars/kafka-clients-$LINE.jar:$TELEMETRY_JAVA_CACHE/jars/protobuf-java-3.25.5.jar:$TELEMETRY_JAVA_CACHE/jars/slf4j-api-1.7.36.jar"
+exec timeout --foreground -k 5s 20s java -Djava.io.tmpdir="$TMPDIR" -cp "$CP" org.countly.kafkajs.telemetry.FullTelemetryDecoder "$RAW"

@@ -108,10 +108,14 @@ class TelemetryExportReader {
       const end = bytes.lastIndexOf(10)
       if (bytes.length - end - 1 > RECORD_CAP) throw new Error('Telemetry sink record cap')
       const lines = end < 0 ? [] : bytes.subarray(0, end).toString('utf8').split('\n')
-      let previous = 0
-      for (const line of lines) {
+      const rows = lines.map((line) => {
         if (Buffer.byteLength(line) > RECORD_CAP) throw new Error('Telemetry sink record cap')
-        const row = JSON.parse(line)
+        return JSON.parse(line)
+      })
+      // Reporter callbacks assign identities before concurrently enqueueing their rows.
+      rows.sort((a, b) => a.seq - b.seq)
+      let previous = 0
+      for (const row of rows) {
         if (
           row.v !== 1 ||
           String(row.node) !== node ||

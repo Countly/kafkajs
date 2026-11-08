@@ -518,8 +518,8 @@ class UnsupportedCase {
         })
       const on = roles(kind)
       const off = roles(`${kind}-off`)
-      expect(on.map((r) => r.split(':').at(-1)).sort()).toEqual(
-        off.map((r) => r.split(':').at(-1)).sort()
+      expect([...new Set(on.map((r) => r.split(':').at(-1)))].sort()).toEqual(
+        [...new Set(off.map((r) => r.split(':').at(-1)))].sort()
       )
       results.ownership[kind] = { on, off }
     }

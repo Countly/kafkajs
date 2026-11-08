@@ -54,6 +54,16 @@ describe('independent telemetry evidence', () => {
     ])
     expect(reader.checkpoint()).toEqual({ 1: 2, 2: 1, 3: 1 })
   })
+  test('reads concurrent reporter exports by sequence identity, independent of enqueue order', () => {
+    write('1', [row('1', 2), row('1', 1), row('1', 4), row('1', 3)])
+    expect(reader.readExports().map((r) => r.seq)).toEqual([1, 2, 3, 4])
+    const cursor = reader.checkpoint()
+    expect(cursor).toEqual({ 1: 4, 2: 0, 3: 0 })
+    write('1', [row('1', 2), row('1', 1), row('1', 4), row('1', 3), row('1', 6), row('1', 5)])
+    expect(reader.readExports({ after: cursor }).map((r) => r.seq)).toEqual([5, 6])
+    write('1', [row('1', 2), row('1', 1), row('1', 2)])
+    expect(() => reader.readExports({ uuid: 'AAAAAAAAAAAAAAAAAAAAAA' })).toThrow('sequence')
+  })
   test('matches Kafka UUIDs while preserving source identities', () => {
     write('2', [row('2', 1, { clientInstanceId: 'ABEiM0RVZneImaq7zN3u_w' })])
     expect(reader.readExports({ uuid: ID })[0]).toMatchObject({
@@ -3642,5 +3652,58 @@ describe('decoder child memory', () => {
       peakRssBytes: null,
       processes: [],
     })
+  })
+})
+
+describe('broker throttle evidence', () => {
+  const { assertStreamAccounted } = require('../../scripts/e2e/telemetry/evidence')
+  const stream = (code = 117) => {
+    const request = (apiKey, writeAt, responseAt, errorCode, fields = {}) => ({
+      type: 'request',
+      apiKey,
+      apiVersion: 0,
+      socketId: 1,
+      node: '1',
+      uuid: ID,
+      terminating: false,
+      requestKey: `r${writeAt}`,
+      writeAt,
+      ...fields,
+      response: { responseAt, errorCode, ...fields.response },
+    })
+    return {
+      records: [
+        request(72, 1000, 1002, code),
+        request(71, 1003, 1004, 0, {
+          response: { uuid: ID, subscriptionId: 2, pushIntervalMs: 1000 },
+        }),
+        request(72, 1800, 1802, 89, { subscriptionId: 2 }),
+        request(71, 2802, 2803, 0, {
+          response: { uuid: ID, subscriptionId: 2, pushIntervalMs: 1000 },
+        }),
+        request(72, 3803, 3804, 0, { subscriptionId: 2 }),
+      ],
+    }
+  }
+  const verify = (transcript) =>
+    assertStreamAccounted({ producer: transcript }, { errors: { producer: [117, 76, 89] } })
+
+  test.each([117, 76])('accounts for the broker timestamp retained across a %s refresh', (code) => {
+    expect(() => verify(stream(code))).not.toThrow()
+  })
+  test.each([
+    ['an ordinary early Push', (t) => (t.records[0].response.errorCode = 0)],
+    ['an early first-jitter write', (t) => (t.records[2].writeAt = 1400)],
+    ['a different UUID', (t) => (t.records[2].uuid = '11111111-2222-3333-4444-555555555555')],
+    ['a different socket', (t) => (t.records[2].socketId = 2)],
+    ['a different subscription', (t) => (t.records[2].subscriptionId = 3)],
+    ['a final', (t) => (t.records[2].terminating = true)],
+    ['a throttled Get', (t) => (t.records[2].apiKey = 71)],
+    ['an on-time Push', (t) => (t.records[2].writeAt = 2100)],
+    ['an early recovery', (t) => (t.records[3].writeAt = 2000)],
+  ])('rejects %s even with an owner-wide 89 allowance', (_name, mutate) => {
+    const transcript = stream()
+    mutate(transcript)
+    expect(() => verify(transcript)).toThrow()
   })
 })
