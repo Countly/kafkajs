@@ -64,9 +64,9 @@ const NATURAL_EXIT_MS = 10000
 const KILL_JOIN_MS = 5000
 /**
  * The part of the 120 s cleanup kept back from the wait for worker results: joining or killing the
- * workers (10 s + 5 s), the parent's terminal decodes (4 x 8 s) and its own releases.
+ * workers (10 s + 5 s), the parent's terminal decodes (4 x 8 s) and 3 s for its own releases.
  */
-const RESULT_RESERVE_MS = 45000
+const RESULT_RESERVE_MS = 50000
 const STAGE_MS = Object.freeze({ lifecycle: 12000, retire: 8000, confirm: 10000 })
 const DECODER_SLOTS = 4
 const DECODE_BUDGET_MS = 6000
