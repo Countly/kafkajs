@@ -5,6 +5,8 @@ const path = require('path')
 const v8 = require('v8')
 const vm = require('vm')
 const { performance } = require('perf_hooks')
+// eslint-disable-next-line n/no-extraneous-require -- YAML parser is pinned by the ESLint/Jest toolchain
+const yaml = require('js-yaml')
 const { spawn } = require('child_process')
 const { Kafka, logLevel } = require('../../../index')
 const {
@@ -234,7 +236,7 @@ class BrokerLogs {
     const config = await this.run(['exec', '-T', service, 'cat', '/opt/kafka/config/log4j2.yaml'])
     if (config.code !== 0 || config.error || config.truncated)
       throw new Error(`Request logger configuration unavailable for ${service}`)
-    assertRequestLogConfig(config.stdout)
+    assertRequestLogConfig(yaml.load(config.stdout))
     const now = new Date().toISOString()
     const read = await this.run(requestTraceArgs(service, now, now))
     if (read.code !== 0 || read.error || read.truncated)

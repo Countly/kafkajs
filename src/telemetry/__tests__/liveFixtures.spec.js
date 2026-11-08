@@ -5,6 +5,8 @@ const os = require('os')
 const path = require('path')
 const { execFileSync } = require('child_process')
 const { performance } = require('perf_hooks')
+// eslint-disable-next-line n/no-extraneous-require -- YAML parser is pinned by the ESLint/Jest toolchain
+const yaml = require('js-yaml')
 const { TelemetrySegments } = require('../../../testHelpers/telemetrySegments')
 const { requestTraceArgs, assertRequestLogConfig } = require('./fixtures/requestTrace')
 
@@ -59,12 +61,43 @@ describe('broker request appender capture', () => {
   })
 
   test('fails for a missing or changed request-appender route', () => {
-    const config = `name: RequestAppender\nfileName: "\${sys:kafka.logs.dir}/kafka-request.log"\nname: kafka.request.logger\nlevel: WARN\nadditivity: false\nAppenderRef:\n  ref: RequestAppender\n`
-    expect(() => assertRequestLogConfig(config)).not.toThrow()
-    expect(() => assertRequestLogConfig(config.replace('kafka-request.log', 'other.log'))).toThrow()
+    const config = `Configuration:
+  Appenders:
+    RollingFile:
+      - name: RequestAppender
+        fileName: "\${sys:kafka.logs.dir}/kafka-request.log"
+  Loggers:
+    Logger:
+      - name: kafka.request.logger
+        level: WARN
+        additivity: false
+        AppenderRef:
+          ref: RequestAppender
+`
+    expect(() => assertRequestLogConfig(yaml.load(config))).not.toThrow()
     expect(() =>
-      assertRequestLogConfig(config.replace('ref: RequestAppender', 'ref: STDOUT'))
+      assertRequestLogConfig(yaml.load(config.replace('kafka-request.log', 'other.log')))
     ).toThrow()
+    expect(() =>
+      assertRequestLogConfig(yaml.load(config.replace('ref: RequestAppender', 'ref: STDOUT')))
+    ).toThrow()
+  })
+
+  test('binds the Docker-rewritten YAML route regardless of field order and scalar quoting', () => {
+    const config = `Configuration:
+  Appenders:
+    RollingFile:
+      - fileName: "\${sys:kafka.logs.dir}/kafka-request.log"
+        name: "RequestAppender"
+  Loggers:
+    Logger:
+      - AppenderRef:
+          ref: "RequestAppender"
+        additivity: false
+        level: "WARN"
+        name: "kafka.request.logger"
+`
+    expect(() => assertRequestLogConfig(yaml.load(config))).not.toThrow()
   })
 })
 
