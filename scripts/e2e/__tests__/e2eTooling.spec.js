@@ -1290,6 +1290,23 @@ describe('broker telemetry fixture', () => {
     expect(alone.run).not.toContain('forceExit')
     expect(alone.env.TELEMETRY_RESOURCES_QUIET).toBe('1')
     expect(alone['timeout-minutes']).toBeGreaterThan(0)
+    const names = resources.steps.map((step) => step.name ?? step.uses)
+    expect(names).toEqual([
+      'actions/checkout@v4',
+      'actions/setup-node@v4',
+      undefined,
+      'Stamp the run and prepare the artifact directory',
+      'Measure single-client memory alone on the idle runner',
+      'Run the bounded-resource schedules',
+      'Validate the recorded measurements for this tree and Node',
+      'actions/upload-artifact@v4',
+    ])
+    const validate = resources.steps.find((step) => step.run?.includes('resourceArtifact.js'))
+    expect(validate.if).toBe('always()')
+    const upload = resources.steps.find((step) => step.uses === 'actions/upload-artifact@v4')
+    expect(upload.if).toBe('always()')
+    expect(upload.with['if-no-files-found']).toBe('error')
+    expect(resources.env.TELEMETRY_RESOURCES_ARTIFACT_DIR).toContain('telemetry-resources')
     const soakLane = workflow.jobs.telemetry.steps.find((step) => step.name?.includes('churn soak'))
     expect(soakLane.if).toBe("matrix.group == 'telemetry-soak'")
     expect(soakLane.run).toContain('timeout -k 10s 600s npm run test:group:telemetry-soak')
