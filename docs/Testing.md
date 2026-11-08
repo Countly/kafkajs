@@ -417,7 +417,7 @@ written before any assertion, and the job uploads the directory even when a step
 
 | Arm | What it measures |
 |---|---|
-| `single client resource memory for <kind>` | An actual public producer, consumer, admin or share consumer. The child takes its startup memory before importing anything, loads every module either mode needs, then runs a **telemetry-disabled control** of the same kind in the same process (the same scripted wire and the same fixed foreground operations, three per public open), releases it, and only then builds the enabled client: 128 maximum-size custom descriptors registered through the public API, the assigned client instance id, a matched disconnected reading, real GZIP and, where supported, ZSTD pushes, one retired native completion per codec with a public close and an immediate same-object reopen, and a final public close. Each reopen's connect and the final close's disconnect receipt run in the public disconnect's own resolution continuation, and the observed order (the resolution, that call, then the continuation's first yield) is recorded for replay. The registered descriptors are journaled from the public calls that succeeded; their fingerprint, with a probe that the client still refuses a 129th descriptor and updates the first in place, is kept at every retained checkpoint. The child must close by itself within 10 s of the receipt. |
+| `single client resource memory for <kind>` | An actual public producer, consumer, admin or share consumer. The child takes its startup memory before importing anything, loads every module either mode needs, then runs a **telemetry-disabled control** of the same kind in the same process (the same scripted wire and the same fixed foreground operations, three per public open), releases it, and only then builds the enabled client: 128 maximum-size custom descriptors registered through the public API, the assigned client instance id, a matched disconnected reading, real GZIP and, where supported, ZSTD pushes, one retired native completion per codec with a public close and an immediate same-object reopen, and a final public close. Each reopen's connect and the final close's disconnect receipt run in the public disconnect's own resolution continuation, and the observed order (the resolution, that call, then the continuation's first yield) is recorded for replay. The registered descriptors are journaled from the public calls that succeeded. At every retained checkpoint the client must still refuse a 129th descriptor, and every journaled descriptor is registered again: the fingerprint covers only those the client updated in place, so a descriptor swapped for another of the same size leaves it one short. The child must close by itself within 10 s of the receipt. |
 | `collector only resource memory for <kind>` | Supplementary only. The strict 64-node, 257-point collector and one persistent payload builder with a current and a retired native build for each codec, judged against its own same-kind disabled control in its own child. It reaches sizes a one-node public client cannot and never stands in for the public arm. |
 
 Telemetry memory is judged as an increment over the disabled control, never as an absolute number. The
@@ -473,18 +473,21 @@ continuation and reaches its checkpoint through an observed settlement (the repl
 for the supplier its setup attempted and refused behind the held call). It journals a fixed-shape scalar row:
 the witnessed reconnect order, weak-issued owner identities by role, the dedicated socket's emitter and raw
 listener identities, the pending telemetry timers by owning role, and the populations of every capture root.
-The held shell must be the same objects in all 100 cycles; owners that live across cycles must be the very
-ones of the first cycle; owners each lifecycle replaces must be as many and all issued after the previous
-cycle; the only pending timer is the scheduler's, issued in the cycle; and the second connection of every
-dedicated pool is counted and must never have been opened. `bounded capture controls` run both families
-for every kind and late outcome and require a specific diagnostic for a substituted owner of the same count,
-a stale or unowned timer, a retired socket, emitter or listener, a reconnect deferred by one await, a share
-acknowledgement the broker rejects, a completed owner left in the restore table, a duplicated listener, a
-held late outcome released early, a write to a closed socket, a live bound that is exceeded and an issued
-number that falls. For each kind with a public close budget, a held final that crosses its close deadline
-while the close timer is withheld writes no byte and records no final, and the reopened client still
-completes a Get and a Push. Disabled clients, from the root option and from a client override, do the same
-ordinary work and open nothing.
+The held shell must be the same objects in all 100 cycles, its native input being the payload's own buffer;
+owners that live across cycles (a sample, an operation, a queued request) must repeat the first cycle's,
+which has none, since every checkpoint is reached with no telemetry operation running; owners each lifecycle
+replaces must be as many and all issued after the previous cycle; the only pending timer is the scheduler's,
+issued in the cycle; and the second connection of every dedicated pool is counted and must never have been
+opened. `bounded capture controls` run both families for every kind and late outcome and require a specific
+diagnostic for a substituted owner of the same count, a stale or unowned timer, a reconnect deferred by one
+await, a share acknowledgement the broker rejects, a completed owner left in the restore table, a held late
+outcome released early, a write to a closed socket, a live bound that is exceeded and an issued number that
+falls. The native family, whose checkpoints hold one dedicated socket, also requires one for a retired
+socket, emitter or listener and for a duplicated listener; the supplier family's checkpoints hold no socket.
+Every kind, the admin client included, bounds its close with a public `disconnect({ timeout })`: for each, a
+held final that crosses its close deadline while the close timer is withheld writes no byte and records no
+final, and the reopened client still completes a Get and a Push. Disabled clients, from the root option and
+from a client override, do the same ordinary work and open nothing.
 
 ### Telemetry churn (`telemetry churn`)
 
