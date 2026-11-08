@@ -401,6 +401,17 @@ const instrument = (
     heap: typeof globalThis.gc === 'function',
   })
 
+  if (originalQueues) {
+    const snapshot = probe.snapshot.bind(probe)
+    /** Releases destroyed sockets before collection without dereferencing weak owners.
+     * @returns {Promise<object>} the settled resource reading
+     */
+    probe.snapshot = () => {
+      openSockets()
+      return snapshot()
+    }
+  }
+
   if (identities) {
     const snapshot = probe.snapshot.bind(probe)
     /** Reads counters and identities in one turn before heap sampling can await.
@@ -2849,12 +2860,13 @@ const instrumentShare = (options, readings = {}) => {
     const shareResources = {
       track: (client) => observer.track(client),
       snapshot: async () => {
+        const snapshot = await instrumented.probe.snapshot()
         const namedListeners = {
           ...flattenListeners(instrumented.listeners()),
           ...observer.named(),
         }
         const shareClients = observer.tracked.size
-        return { ...(await instrumented.probe.snapshot()), shareClients, namedListeners }
+        return { ...snapshot, shareClients, namedListeners }
       },
       restore: () => observer.restore(),
     }
