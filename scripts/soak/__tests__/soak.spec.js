@@ -1760,7 +1760,7 @@ const shareScreenRun = () => {
   })
   const phases = ['share-steady', 'share-reset', 'share-members']
   return {
-    baseline: quietShare(),
+    baseline: { ...quietShare(), heapAtMs: 0 },
     warmupMs: 10000,
     samples: phases.flatMap((phase, index) =>
       Array.from({ length: 6 }, (_, i) => ({
@@ -1769,8 +1769,11 @@ const shareScreenRun = () => {
         snapshot: quietShare(10000000 + index * 10000000),
       }))
     ),
-    phaseEnds: phases.map((phase) => ({ phase, snapshot: quietShare() })),
-    teardown: quietShare(),
+    phaseEnds: phases.map((phase, index) => ({
+      phase,
+      snapshot: { ...quietShare(), heapAtMs: (index + 1) * 320000 },
+    })),
+    teardown: { ...quietShare(), heapAtMs: 970000 },
   }
 }
 
@@ -1785,6 +1788,7 @@ describe('Share soak resource screen', () => {
       fullMs: 1920000,
       endpointBytes: 2097152,
       slopeBytesPerMinute: 262144,
+      quietSlopeBytesPerMinute: 98304,
     })
   })
 
@@ -1960,6 +1964,255 @@ describe('Share soak resource screen', () => {
     short.phaseEnds.pop()
     expect(ShareSoakScreen.evaluate(short).violations).toContain('phase-end quiet heap screen')
   })
+})
+
+/**
+ * Builds complete periodic evidence over the declared scored spans, with a common quiet set.
+ * @param {{ short?: boolean, rate: number, firstUseBytes?: number }} options elapsed growth in B/min
+ * @returns {object} original-source-shaped quiet and active observations with distinct working sets
+ */
+const retainedShareRun = ({ short = true, rate, firstUseBytes = 0 }) => {
+  const run = shareScreenRun()
+  const mode = short ? 'short' : 'full'
+  const phaseMs = (short ? SHARE_SOAK.shortMs : SHARE_SOAK.fullMs) / 3
+  const retained = (atMs) => 10000000 + firstUseBytes + (rate * atMs) / 60000
+  // Integral heap bytes on a 1/32-minute grid; phase work retains its declared span.
+  const observationTime = (atMs) => Math.ceil(atMs / 1875) * 1875
+  let startedAt = 0
+  run.samples = run.phaseEnds.flatMap(({ phase, snapshot: end }, index) => {
+    const start = startedAt
+    const samples = Array.from(
+      { length: Math.floor(phaseMs / SHARE_SOAK.sampleMs[mode]) - 1 },
+      (_, i) => {
+        const atMs = observationTime(start + (i + 1) * SHARE_SOAK.sampleMs[mode])
+        return {
+          phase,
+          phaseMs: atMs - start,
+          atMs,
+          snapshot: {
+            ...run.baseline,
+            heapAtMs: atMs,
+            heapUsed: retained(atMs) + index * 12000000,
+          },
+        }
+      }
+    )
+    end.heapAtMs = observationTime(start + phaseMs + SHARE_SOAK.settleMs)
+    end.heapUsed = retained(end.heapAtMs)
+    startedAt = end.heapAtMs
+    return samples
+  })
+  run.teardown.heapAtMs = observationTime(startedAt + SHARE_SOAK.settleMs)
+  run.teardown.heapUsed = retained(run.teardown.heapAtMs)
+  return run
+}
+
+describe('Share quiet heap slope', () => {
+  const failure = 'phase-end quiet heap slope screen'
+
+  test.each([true, false])('detects sustained 128 KiB/min, short=%s', (short) => {
+    const result = ShareSoakScreen.evaluate(retainedShareRun({ short, rate: 128 * 1024 }))
+    expect(result.measured.quietSlope.bytesPerMinute).toBe(131072)
+    expect(result.violations).toContain(failure)
+    expect(
+      result.measured.phases.every(
+        ({ slopeBytesPerMinute, endpointBytes }) =>
+          slopeBytesPerMinute < 262144 && endpointBytes < 2097152
+      )
+    ).toBe(true)
+    expect(result.violations).toEqual(short ? [failure] : ['phase-end quiet heap screen', failure])
+  })
+
+  test.each([true, false])('rejects 256 and above 256 KiB/min, short=%s', (short) => {
+    for (const rate of [256 * 1024, 384 * 1024]) {
+      const result = ShareSoakScreen.evaluate(retainedShareRun({ short, rate }))
+      expect(result.measured.quietSlope.bytesPerMinute).toBe(rate)
+      expect(result.violations).toContain(failure)
+      if (rate > 262144)
+        expect(result.violations).toEqual(
+          expect.arrayContaining(
+            SHARE_SOAK.phases.map((phase) => `share-${phase}: retained-heap screen`)
+          )
+        )
+    }
+  })
+
+  test.each([true, false])('a first-use constant step cannot change the fit, short=%s', (short) => {
+    const plain = ShareSoakScreen.evaluate(retainedShareRun({ short, rate: 131072 }))
+    const stepped = ShareSoakScreen.evaluate(
+      retainedShareRun({ short, rate: 131072, firstUseBytes: 8000000 })
+    )
+    expect(stepped.measured.quietSlope.bytesPerMinute).toBe(
+      plain.measured.quietSlope.bytesPerMinute
+    )
+    expect(stepped.violations).toContain(failure)
+  })
+
+  test('keeps first-phase periodic growth failing when all later quiet heaps plateau', () => {
+    const run = retainedShareRun({ rate: 384 * 1024 })
+    const plateau = run.phaseEnds[0].snapshot.heapUsed
+    run.phaseEnds.forEach(({ snapshot }) => {
+      snapshot.heapUsed = plateau
+    })
+    run.teardown.heapUsed = plateau
+    run.samples
+      .filter(({ phase }) => phase !== 'share-steady')
+      .forEach(({ snapshot }) => {
+        snapshot.heapUsed = plateau
+      })
+    const result = ShareSoakScreen.evaluate(run)
+    expect(result.measured.quietSlope.bytesPerMinute).toBe(0)
+    expect(result.violations).toEqual(['share-steady: retained-heap screen'])
+  })
+
+  test.each([0, -98304, 98304])(
+    'accepts %s B/min at irregular, translated elapsed times',
+    (rate) => {
+      const run = shareScreenRun()
+      const shift = 1234560000
+      run.baseline.heapAtMs = shift
+      run.phaseEnds.forEach(({ snapshot }, i) => {
+        const minutes = [1, 3, 8][i]
+        snapshot.heapAtMs = shift + minutes * 60000
+        snapshot.heapUsed = 10000000 + rate * minutes
+      })
+      run.teardown.heapAtMs = shift + 9 * 60000
+      const result = ShareSoakScreen.evaluate(run)
+      expect(result.ok).toBe(true)
+      expect(result.measured.quietSlope.bytesPerMinute).toBe(rate)
+    }
+  )
+
+  test('compares an above-bound fractional slope without rounding', () => {
+    const run = shareScreenRun()
+    run.phaseEnds.forEach(({ snapshot }, i) => {
+      const minutes = [1, 3, 8][i]
+      snapshot.heapAtMs = minutes * 60000
+      snapshot.heapUsed = 10000000 + 98304 * minutes + (i === 2 ? 1 : 0)
+    })
+    const result = ShareSoakScreen.evaluate(run)
+    const rate = result.measured.quietSlope.bytesPerMinute
+    expect(rate).toBeGreaterThan(98304)
+    expect(Math.round(rate)).toBe(98304)
+    expect(result.violations).toEqual([failure])
+    expect(result.measured.quietSlope.points).toEqual(
+      run.phaseEnds.map(({ phase, snapshot }) => ({
+        phase,
+        heapAtMs: snapshot.heapAtMs,
+        heapUsed: snapshot.heapUsed,
+      }))
+    )
+  })
+
+  test.each([undefined, null, NaN, Infinity, -Infinity, -1, '320000'])(
+    'rejects invalid observation time %s at every quiet point',
+    (time) => {
+      for (let index = 0; index < 5; index++) {
+        const run = shareScreenRun()
+        const points = [
+          run.baseline,
+          ...run.phaseEnds.map(({ snapshot }) => snapshot),
+          run.teardown,
+        ]
+        points[index].heapAtMs = time
+        const result = ShareSoakScreen.evaluate(run)
+        expect(result.violations).toContain(failure)
+        expect(result.measured.quietSlope.bytesPerMinute).toBeNull()
+        expect(result.measured.quietSlope.points).toHaveLength(3)
+      }
+    }
+  )
+
+  test.each([undefined, null, NaN, Infinity, -1, 0.5, Number.MAX_SAFE_INTEGER + 1])(
+    'rejects invalid heap source %s at every quiet point',
+    (heap) => {
+      for (let index = 0; index < 5; index++) {
+        const run = shareScreenRun()
+        const points = [
+          run.baseline,
+          ...run.phaseEnds.map(({ snapshot }) => snapshot),
+          run.teardown,
+        ]
+        points[index].heapUsed = heap
+        const result = ShareSoakScreen.evaluate(run)
+        expect(result.violations).toContain(failure)
+        expect(result.measured.quietSlope.bytesPerMinute).toBeNull()
+      }
+    }
+  )
+
+  test.each([0, -1])(
+    'rejects duplicate or reversed adjacent observation times, delta=%s',
+    (delta) => {
+      for (let index = 1; index < 5; index++) {
+        const run = shareScreenRun()
+        const points = [
+          run.baseline,
+          ...run.phaseEnds.map(({ snapshot }) => snapshot),
+          run.teardown,
+        ]
+        points[index].heapAtMs = points[index - 1].heapAtMs + delta
+        const result = ShareSoakScreen.evaluate(run)
+        expect(result.violations).toContain(failure)
+        expect(result.measured.quietSlope.bytesPerMinute).toBeNull()
+      }
+    }
+  )
+
+  test.each(['missing', 'duplicate', 'reordered', 'wrong name', 'absent source'])(
+    'rejects %s phase ends',
+    (damage) => {
+      const run = shareScreenRun()
+      if (damage === 'missing') run.phaseEnds.pop()
+      if (damage === 'duplicate') run.phaseEnds.push(run.phaseEnds[2])
+      if (damage === 'reordered') run.phaseEnds.reverse()
+      if (damage === 'wrong name') run.phaseEnds[1].phase = 'share-steady'
+      if (damage === 'absent source') delete run.phaseEnds[1].snapshot
+      const result = ShareSoakScreen.evaluate(run)
+      expect(result.violations).toContain(failure)
+      expect(result.measured.quietSlope.bytesPerMinute).toBeNull()
+    }
+  )
+
+  test('keeps teardown endpoint and resource failures independent of a flat quiet slope', () => {
+    const run = shareScreenRun()
+    run.baseline.heapUsed = 1
+    run.teardown.heapUsed = run.phaseEnds[0].snapshot.heapUsed + 2097153
+    run.teardown.shareRecords = 1
+    const result = ShareSoakScreen.evaluate(run)
+    expect(result.measured.quietSlope.bytesPerMinute).toBe(0)
+    expect(result.violations).toContain('phase-end quiet heap screen')
+    expect(result.violations).toContain('teardown: resources differ or a source is absent')
+    expect(result.violations).not.toContain(failure)
+  })
+
+  test.each(require('./fixtures/shareHeapReplays.json'))(
+    'replays frozen screen inputs $sha256',
+    (receipt) => {
+      const { run, measured } = receipt
+      const result = ShareSoakScreen.evaluate(run)
+      const compact = {
+        ...run,
+        samples: run.samples.map((sample) => ({
+          ...sample,
+          snapshot: {
+            heapUsed: sample.snapshot.heapUsed,
+            shareRecords: sample.snapshot.shareRecords,
+            shareRanges: sample.snapshot.shareRanges,
+            shareSessions: sample.snapshot.shareSessions,
+          },
+        })),
+      }
+      expect(ShareSoakScreen.evaluate(compact)).toEqual(result)
+      expect(result.measured.phases).toEqual(measured.phases)
+      expect(result.measured.quietHeap).toEqual(measured.quietHeap)
+      expect(result.violations).toEqual(['share-steady: retained-heap screen', failure])
+      expect(result.measured.quietSlope.bytesPerMinute).toBeNull()
+      expect(result.measured.quietSlope.points.every(({ heapAtMs }) => heapAtMs === null)).toBe(
+        true
+      )
+    }
+  )
 })
 
 describe('Share soak profiles', () => {
@@ -3617,6 +3870,7 @@ describe('Share soak owner', () => {
       const archived = rows.filter(({ kind }) => kind === 'sample')
       expect(archived.length).toBeGreaterThanOrEqual(6)
       expect(soak.samples).toHaveLength(archived.length)
+      expect(archived.every(({ snapshot }) => Number.isFinite(snapshot.heapAtMs))).toBe(true)
       for (const [i, sample] of soak.samples.entries()) {
         expect(sample).toEqual({
           phase: archived[i].phase,
@@ -3656,6 +3910,48 @@ describe('Share soak owner', () => {
       observer.restore()
       await owner.close()
     }
+  })
+
+  test('archives observation times from the translated original owner clock, including a failed verdict', async () => {
+    const origin = 7654321
+    let now = origin
+    const elapsed = [17, 343711, 691553, 1021727, 1023819]
+    const { owner, rows, shares } = build({ clock: { now: () => now } })
+    owner.startedAt = origin
+    let reading = 0
+    shares.snapshot = async () => {
+      now = origin + elapsed[reading++]
+      await Promise.resolve()
+      return { ...quietShare(), heapUsed: 10000000 + reading * 2000000 }
+    }
+    const soak = owner.soak()
+    soak.phases = SHARE_SOAK.phases.map((phase) => ({
+      name: `share-${phase}`,
+      workload: 'observed',
+      ms: 1,
+    }))
+    soak.workloads = { observed: async () => {} }
+    soak.transition = (work) => work()
+    soak.beforeTeardown = async () => {}
+    soak.settleMs = 0
+    soak.judge = ShareSoakScreen.evaluate
+    const result = await soak.run()
+    const observations = rows.filter(({ kind }) =>
+      ['baseline', 'phase-end', 'teardown'].includes(kind)
+    )
+    expect(observations.map(({ snapshot }) => snapshot.heapAtMs)).toEqual(elapsed)
+    expect(owner.startedAt).toBe(origin)
+    expect(result.ok).toBe(false)
+    expect(result.violations).toContain('phase-end quiet heap slope screen')
+    expect(rows.find(({ kind }) => kind === 'resource-verdict').measured.quietSlope).toEqual({
+      points: observations.slice(1, 4).map(({ phase, snapshot }) => ({
+        phase,
+        heapAtMs: snapshot.heapAtMs,
+        heapUsed: snapshot.heapUsed,
+      })),
+      bytesPerMinute: result.measured.quietSlope.bytesPerMinute,
+    })
+    expect(result.measured.quietSlope.bytesPerMinute).toBeGreaterThan(98304)
   })
 
   test('judges the run with the per-phase screen by default', () => {

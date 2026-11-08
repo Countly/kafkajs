@@ -12,6 +12,7 @@
 const fs = require('fs')
 const { execFileSync } = require('child_process')
 const { STAMP_FIELDS } = require('../../testHelpers/e2eEvidence')
+const { verifyShareQuietHeap } = require('./shareQuietHeap')
 
 const USAGE = 'Usage: node scripts/evidence/verify.js --broker <version> <evidence.jsonl...>'
 
@@ -107,6 +108,7 @@ const verifyFiles = (files, verified, readFile = (file) => fs.readFileSync(file,
       continue
     }
 
+    const shareScenarios = new Map()
     const rows = text.split('\n')
     if (rows.every((row) => !row.trim())) {
       problems.push(`${file}: holds no evidence lines`)
@@ -126,12 +128,30 @@ const verifyFiles = (files, verified, readFile = (file) => fs.readFileSync(file,
         return
       }
 
+      if (
+        isPlainObject(line) &&
+        (['SHARE_SOAK_E2E', 'SHARE_SOAK_FULL'].includes(line.selector) ||
+          ['share-consumer-short', 'share-consumer'].includes(line.soakProfile) ||
+          ['share-soak', 'share-soak-full'].includes(line.stem))
+      ) {
+        if (typeof line.scenario !== 'string' || !line.scenario)
+          problems.push(`${file}:${index + 1}: share scenario is absent`)
+        const key = line.scenario
+        if (!shareScenarios.has(key)) shareScenarios.set(key, [])
+        if (['baseline', 'phase-end', 'teardown', 'resource-verdict'].includes(line.kind))
+          shareScenarios.get(key).push(line)
+      }
+
       for (const problem of isPlainObject(line)
         ? problemsOf(line, verified)
         : ['is not an object']) {
         problems.push(`${file}:${index + 1}: ${problem}`)
       }
     })
+    for (const [scenario, original] of shareScenarios) {
+      for (const problem of verifyShareQuietHeap(original).problems)
+        problems.push(`${file}: share scenario ${scenario}: ${problem}`)
+    }
   }
 
   return { lines, problems }
