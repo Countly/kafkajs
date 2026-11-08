@@ -1671,7 +1671,7 @@ class ParentFixture {
     Object.assign(this, { brokers, stem, kafka, readLog, withResource, clock })
     this.admin = kafka.admin({ enableMetricsPush: false })
     this.producer = kafka.producer({ enableMetricsPush: false, idempotent: true })
-    this.rotationEntries = { 'interval.ms': '1000', match: `client_id=^${stem}-` }
+    this.rotationEntries = { 'interval.ms': '1000', match: `client_id=^${stem}-.*$` }
   }
 
   /** @param {string} kind the client kind @returns {string} its corpus topic */
@@ -2770,7 +2770,8 @@ class TelemetryWorker {
     this.timing.measurementMs = this.timing.boundaryAt - this.timing.phaseAt - this.limits.warmupMs
     await attempt(() => this.sampler.endSampling())
     const cleanupAt = this.clock.now()
-    await attempt(() => this.target(() => this.ordinary.stop()))
+    // A failed run cannot finish a corpus whose parent has already stopped producing it.
+    await attempt(() => this.target(() => this.ordinary.stop(errors.length ? 1 : undefined)))
     await attempt(() => this.registry.restore())
     const last = this.segments.current()
     await attempt(async () => {

@@ -11,6 +11,7 @@ const {
   KINDS,
   OrdinaryOracle,
   OrdinaryWork,
+  ParentFixture,
   ProcessResources,
   Registry,
   ShareOracle,
@@ -1176,6 +1177,23 @@ describe('telemetry profile oracles', () => {
 })
 
 describe('telemetry profile ordinary work', () => {
+  test('subscribes every owned worker suffix and excludes another run', async () => {
+    let config
+    const fixture = new ParentFixture({
+      stem: 'telemetry-churn-owned',
+      kafka: { admin: () => ({}), producer: () => ({}) },
+      withResource: async (_admin, resource, work) => {
+        config = resource
+        await work()
+      },
+    })
+    await fixture.inResource(async () => {})
+    const pattern = new RegExp(`^(?:${config.entries.match.slice('client_id='.length)})$`)
+    for (const kind of KINDS) expect(pattern.test(`telemetry-churn-owned-${kind}`)).toBe(true)
+    expect(pattern.test('telemetry-churn-other-producer')).toBe(false)
+    expect(pattern.test('foreign-telemetry-churn-owned-producer')).toBe(false)
+  })
+
   const consumer = () => {
     const calls = []
     const handlers = []
@@ -2033,6 +2051,35 @@ describe('telemetry profile worker', () => {
     expect(receipts).toHaveLength(at === 'close' ? 0 : 1)
     expect(worker.send).toHaveBeenCalledWith({ type: 'progress', sealed: { id: 'producer-lc-2' } })
   })
+
+  test.each(['consumer', 'shareConsumer'])(
+    'joins a failed %s without waiting for the unproduced corpus',
+    async (kind) => {
+      const { worker, segments } = make({
+        kind,
+        tap: { telemetry: () => [], restore: () => {} },
+      })
+      let now = 0
+      worker.ordinary = new OrdinaryWork({
+        kind,
+        client: {},
+        clock: { now: () => now },
+        sleep: async (ms) => {
+          now += ms
+        },
+      })
+      worker.sampler = { endSampling: async () => {} }
+      worker.registry.restore = () => {}
+      segments.close = async () => {}
+      const primary = new Error('No initial proving Push')
+      const errors = [primary]
+      await worker.cleanup(errors)
+      expect(now).toBeLessThan(10000)
+      expect(errors[0]).toBe(primary)
+      expect(errors[1].message).toBe('The corpus was not fully handled before the close')
+      expect(worker.send).toHaveBeenCalledWith({ type: 'receipt', at: expect.any(Number) })
+    }
+  )
 
   test.each(KINDS)(
     'closes the %s setup, reopen and terminal lifecycles with the same 3000 ms budget',

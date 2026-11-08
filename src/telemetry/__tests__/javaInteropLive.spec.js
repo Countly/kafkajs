@@ -15,6 +15,7 @@ const {
   withTelemetryResource,
 } = require('../../../testHelpers/telemetryFixtures')
 const { readLog } = require('../../../testHelpers/rawLog')
+const { unexpectedJavaStderr } = require('./fixtures/javaStderr')
 const {
   bounded,
   caseTimeout,
@@ -46,8 +47,6 @@ const WHITELIST = [
   'group_member_id',
   'transactional_id',
 ]
-const EXPECTED_STDERR =
-  /^(SLF4J: .*|WARNING: .*(deprecat|will be removed).*|Note: .*(unchecked|unsafe|Xlint).*)$/
 const OUTPUT_CAP = 65536
 const CLOSE_TO_EXIT_MS = 10000
 const clock = { now: () => performance.now() }
@@ -203,6 +202,7 @@ class JavaInteropCase {
     this.attempt = attempt
     this.reader = new TelemetryExportReader(directory)
     this.results = { java: {}, js: {} }
+    this.attempt.record.results = this.results
     this.pushes = []
     this.topics = Object.fromEntries(ROLES.map((role) => [role, `${stem}-j${role[0]}`]))
     this.ids = {
@@ -498,17 +498,24 @@ class JavaInteropCase {
     const exits = {}
     for (const role of ROLES)
       exits[role] = await this.within(45000, `The ${role} exit`, () => roles[role].done)
+    this.results.children = Object.fromEntries(
+      ROLES.map((role) => [
+        role,
+        {
+          ...exits[role],
+          overflow: roles[role].overflow,
+          stdout: roles[role].stdout,
+          stderr: roles[role].stderr,
+          markers: roles[role].markers,
+        },
+      ])
+    )
     for (const role of ROLES) {
       const child = roles[role]
       const closing = child.marker('closing')
       const closed = child.marker('closed')
       expect(child.overflow).toBe(false)
-      expect(
-        child.stderr
-          .split('\n')
-          .filter(Boolean)
-          .every((line) => EXPECTED_STDERR.test(line))
-      ).toBe(true)
+      expect(unexpectedJavaStderr(child.stderr)).toEqual([])
       expect(exits[role].error).toBeUndefined()
       expect(exits[role].code).toBe(0)
       expect(exits[role].signal).toBeNull()

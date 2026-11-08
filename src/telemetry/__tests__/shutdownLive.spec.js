@@ -418,6 +418,7 @@ class ReopenCase {
     this.stem = stem
     this.attempt = attempt
     this.results = { initial: {}, rounds: {}, journal: {}, timeout0: {}, blackhole: null }
+    this.attempt.record.results = this.results
     this.members = []
     this.gate = new DecoderGate(DECODERS)
     this.consumed = new Set()
@@ -829,6 +830,22 @@ class ReopenCase {
   }
 
   /**
+   * Takes both readings after the same quiet window and destroy-hook turns. The baseline must not
+   * count the test loader's pending filesystem callback, immediate or transient timeout.
+   * @returns {Promise<object>} the unfiltered resource snapshot
+   */
+  async settledResources() {
+    await this.roles.run('quiet', () =>
+      bounded(this.owner, QUIET_MS + 2000, (scope) => delay(scope, QUIET_MS), {
+        label: 'The quiet window',
+      })
+    )
+    await new Promise((resolve) => setImmediate(resolve))
+    await new Promise((resolve) => setImmediate(resolve))
+    return this.probe.snapshot()
+  }
+
+  /**
    * Waits the quiet window after every client and observer is gone, lets the destroy hooks of what
    * ended run, then requires exact quiet identities: no owned socket, segment or pending call, no
    * case-created resource of any type, no unknown-owner resource the baseline did not hold, the
@@ -837,14 +854,7 @@ class ReopenCase {
    * @returns {Promise<void>} after the comparison; the readings are kept in the case results
    */
   async quiet(baseline) {
-    await this.roles.run('quiet', () =>
-      bounded(this.owner, QUIET_MS + 2000, (scope) => delay(scope, QUIET_MS), {
-        label: 'The quiet window',
-      })
-    )
-    await new Promise((resolve) => setImmediate(resolve))
-    await new Promise((resolve) => setImmediate(resolve))
-    const final = await this.probe.snapshot()
+    const final = await this.settledResources()
     this.results.resources = { baseline, final }
     expect(this.members.every((m) => m.faults.records.every((r) => r.closed))).toBe(true)
     expect(this.gate.occupancy()).toEqual({ running: 0, queued: 0 })
@@ -927,7 +937,7 @@ class ReopenCase {
     const entries = {
       metrics: 'org.apache.kafka.',
       'interval.ms': '1000',
-      match: `client_id=^${this.stem}-`,
+      match: `client_id=^${this.stem}-.*$`,
     }
     const windows = new TraceWindows({
       logs: this.logs,
@@ -1024,7 +1034,7 @@ live(
         attempt,
       })
       cleanup.defer(() => scenario.roles.stop())
-      const baseline = await scenario.probe.snapshot()
+      const baseline = await scenario.settledResources()
       cleanup.defer(() => scenario.quiet(baseline))
       cleanup.defer(() => scenario.roles.run('case', () => scenario.close()))
       await bounded(
