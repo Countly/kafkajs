@@ -2097,6 +2097,7 @@ describe('segmented evidence in the cleanup manifest', () => {
     })
     owner.receiptFile = path.join(root, 'stamps', 'ownership.json')
     fs.mkdirSync(owner.directory, { recursive: true })
+    fs.mkdirSync(path.dirname(owner.receiptFile), { recursive: true })
   })
   afterEach(() => fs.rmSync(root, { recursive: true, force: true }))
 

@@ -1310,62 +1310,79 @@ describe('telemetry profile ordinary work', () => {
 })
 
 describe('telemetry profile decoder', () => {
-  test('forwards bounded raw input and reduces the real receipts to replayable facts', async () => {
-    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'decoder-spec-'))
-    try {
-      const body = { parse: 'ok', metrics: [] }
-      fs.writeFileSync(
-        path.join(directory, 'decoder-123.json'),
-        JSON.stringify({
-          code: 0,
-          signal: null,
+  test.each(['available', 'unavailable'])(
+    'forwards bounded raw input and reduces receipts with %s decoder memory to replayable facts',
+    async (capability) => {
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'decoder-spec-'))
+      try {
+        const body = { parse: 'ok', metrics: [] }
+        const memory = {
+          source: 'proc-pid-status',
+          units: 'bytes',
+          capability,
+          ...(capability === 'unavailable' && { reason: 'not recorded by the observer' }),
+          intervalMs: capability === 'available' ? 20 : null,
+          samples: capability === 'available' ? 2 : 0,
+          peakHwmBytes: capability === 'available' ? 8192 : null,
+          peakRssBytes: capability === 'available' ? 4096 : null,
+          processes:
+            capability === 'available' ? [{ pid: 123, hwmBytes: 8192, rssBytes: 4096 }] : [],
+        }
+        fs.writeFileSync(
+          path.join(directory, 'decoder-123.json'),
+          JSON.stringify({
+            code: 0,
+            signal: null,
+            line: '4.3.1',
+            rawSha256: 'ab'.repeat(32),
+            stdout: `${JSON.stringify({ verified: true, line: '4.3.1' })}\n${JSON.stringify(body)}\n`,
+            stderr: '',
+            ...(capability === 'available' && { memory }),
+          })
+        )
+        const observer = {
+          directory,
+          decodeRaw: jest.fn(async () => body),
+          dispose: jest.fn(async () => {}),
+          assertClean: jest.fn(),
+        }
+        const decoder = new DecoderCoordinator({
+          directory,
           line: '4.3.1',
-          rawSha256: 'ab'.repeat(32),
-          stdout: `${JSON.stringify({ verified: true, line: '4.3.1' })}\n${JSON.stringify(body)}\n`,
-          stderr: '',
+          clock: { now: () => 0 },
+          make: () => observer,
         })
-      )
-      const observer = {
-        directory,
-        decodeRaw: jest.fn(async () => body),
-        dispose: jest.fn(async () => {}),
-        assertClean: jest.fn(),
+        await expect(
+          decoder.decode('producer', Buffer.alloc(10, 1).toString('base64'))
+        ).resolves.toBe(body)
+        await expect(decoder.decode('producer', '')).rejects.toThrow('outside its bound')
+        await expect(
+          decoder.decode('admin', Buffer.alloc(4097).toString('base64'))
+        ).rejects.toThrow('outside its bound')
+        const closed = await decoder.close()
+        expect(await decoder.close()).toBe(closed)
+        expect(observer.dispose).toHaveBeenCalledTimes(1)
+        expect(closed.calls).toEqual([
+          { kind: 'producer', rawSha256: sha(Buffer.alloc(10, 1)), bytes: 10 },
+        ])
+        expect(closed.receipts).toEqual([
+          {
+            pid: 123,
+            code: 0,
+            signal: null,
+            line: '4.3.1',
+            rawSha256: 'ab'.repeat(32),
+            identity: { verified: true, line: '4.3.1' },
+            bodySha256: sha(JSON.stringify(body)),
+            stderrBytes: 0,
+            memory,
+          },
+        ])
+      } finally {
+        fs.rmSync(directory, { recursive: true, force: true })
       }
-      const decoder = new DecoderCoordinator({
-        directory,
-        line: '4.3.1',
-        clock: { now: () => 0 },
-        make: () => observer,
-      })
-      await expect(
-        decoder.decode('producer', Buffer.alloc(10, 1).toString('base64'))
-      ).resolves.toBe(body)
-      await expect(decoder.decode('producer', '')).rejects.toThrow('outside its bound')
-      await expect(decoder.decode('admin', Buffer.alloc(4097).toString('base64'))).rejects.toThrow(
-        'outside its bound'
-      )
-      const closed = await decoder.close()
-      expect(await decoder.close()).toBe(closed)
-      expect(observer.dispose).toHaveBeenCalledTimes(1)
-      expect(closed.calls).toEqual([
-        { kind: 'producer', rawSha256: sha(Buffer.alloc(10, 1)), bytes: 10 },
-      ])
-      expect(closed.receipts).toEqual([
-        {
-          pid: 123,
-          code: 0,
-          signal: null,
-          line: '4.3.1',
-          rawSha256: 'ab'.repeat(32),
-          identity: { verified: true, line: '4.3.1' },
-          bodySha256: sha(JSON.stringify(body)),
-          stderrBytes: 0,
-        },
-      ])
-    } finally {
-      fs.rmSync(directory, { recursive: true, force: true })
     }
-  })
+  )
 })
 
 describe('telemetry terminal final proof', () => {
