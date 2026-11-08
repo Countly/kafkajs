@@ -33,7 +33,7 @@ Module._resolveFilename = function (request, ...rest) {
   return nativeResolve.call(this, target, ...rest)
 }
 
-const { foregroundCatalogue, runControl } = require('./memoryForeground')
+const { foregroundCatalogue, nativePair, runControl } = require('./memoryForeground')
 const { ResourceRoles } = require(path.join(ROOT, 'testHelpers', 'resourceProbe.js'))
 const { phaseCatalogue } = require(
   path.join(ROOT, 'scripts', 'e2e', 'telemetry', 'resourceArtifact.js')
@@ -109,32 +109,15 @@ const measure = async (kind) => {
     slots.forEach((slot) => metrics.retireNode(slot))
     slots.length = 0
     metrics.resetTransient()
+    const builder = new TelemetryPayload(1n)
     const matched = await settled()
     memory.mark('collector:matched')
-    const builder = new TelemetryPayload(1n)
     const active = bindNodes(metrics, subscription)
     let snapshot = metrics.snapshot(active)
     const builds = []
     const actives = []
     for (const codec of codecs) {
-      const options = {
-        telemetryMaxBytes: 1048576,
-        acceptedCompressionTypes: [codec.type, 0],
-        isCurrent: () => true,
-      }
-      const current = await builder.buildPayload(snapshot, options)
-      let valid = true
-      const retiring = builder.buildPayload(snapshot, { ...options, isCurrent: () => valid })
-      epoch += 1
-      valid = false
-      builds.push({
-        codec: codec.name,
-        compressionType: current.compressionType,
-        rawBytes: current.rawBytes,
-        transmittedBytes: current.transmittedBytes,
-        points: current.includedIdentities.length,
-        retiredCompletion: (await retiring) === null,
-      })
+      builds.push(await nativePair(builder, snapshot, codec, () => epoch++))
       actives.push({ phase: codec.name, ...(await settled()) })
       memory.mark(`collector:${codec.name}`)
     }
