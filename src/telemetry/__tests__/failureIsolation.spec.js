@@ -272,7 +272,7 @@ async function settle() {
 
 /** Reaches the selected fault through the existing scheduler or original public close.
  * @param {PublicTelemetryRound} round owner @param {object} spec injector metadata
- * @returns {Promise<void>} attempted private work has settled
+ * @returns {Promise<void>} attempted private work has settled, including native compression and auth
  */
 async function drive(round, spec) {
   if (spec.setup) round.armRenewal()
@@ -287,7 +287,7 @@ async function drive(round, spec) {
     expect(record.actual).toEqual({ kind: 'return', value: undefined })
   } else {
     round.tick()
-    await settle()
+    await round.until(() => !round.machine.running)
   }
 }
 
@@ -588,6 +588,7 @@ describe.each(TELEMETRY_KINDS)('%s private failure preserves foreground identity
           if (arm === 'fault' && !spec.early) {
             const restoreAt = round.restores.length
             const written = round.written.length
+            const pushes = round.pushes().length
             if (['O06', 'O07', 'O08'].includes(_id))
               round.client.registerMetricForSubscription({
                 name: 'com.example.total',
@@ -620,8 +621,10 @@ describe.each(TELEMETRY_KINDS)('%s private failure preserves foreground identity
               await round.establish()
               expect(round.decodedLatestPoint({ name: 'com.example.total' }).value).toBe(6n)
             }
-            if (_id === 'O09' || _id === 'O10 unavailable zstd')
+            if (_id === 'O09' || _id === 'O10 unavailable zstd') {
+              expect(round.pushes()).toHaveLength(pushes + 1)
               expect(round.pushes().at(-1).fields.compressionType).toBe(_id === 'O09' ? 0 : 1)
+            }
             if (_id === 'O16') expect(counter.hits).toBe(1)
           }
           // Cleanup faults are checked against the actual original close, not a second new close.
