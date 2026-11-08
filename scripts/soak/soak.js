@@ -190,6 +190,7 @@ const SHARE_SOAK = Object.freeze({
   }),
   endpointBytes: ENDPOINT_BYTES,
   slopeBytesPerMinute: SLOPE_BYTES_PER_MINUTE,
+  quietSlopeBytesPerMinute: 96 * 1024,
 })
 /** The group configs the share soak sets, and removes again at cleanup. */
 const GROUP_CONFIG_NAMES = ['share.auto.offset.reset', 'share.record.lock.duration.ms']
@@ -2460,9 +2461,11 @@ const flattenListeners = (listeners) =>
   )
 
 /**
- * Judges a share run phase by phase. Each phase has its own working set, so the heap is fitted
- * inside a phase and compared across the quiet points, never as one series over the run. A source
- * that is absent fails: no resource is ever read as zero because nobody measured it.
+ * Fit post-warm-up heap samples separately inside each scored phase. Independently compare the
+ * three disconnected phase-end heaps using their original monotonic observation times, with an
+ * additional 98304-byte/minute slope limit. Keep the existing quiet-heap endpoint, resource,
+ * source-validity and minimum-sample checks. Do not fit active samples from different phases as
+ * one working set.
  */
 class ShareSoakScreen {
   /**
@@ -2488,7 +2491,7 @@ class ShareSoakScreen {
       if (phase) phases.push(phase)
     }
     ShareSoakScreen.quiet(run.teardown, run.baseline, 'teardown', violations)
-    const quiet = [...run.phaseEnds.map((end) => end.snapshot.heapUsed), run.teardown?.heapUsed]
+    const quiet = [...run.phaseEnds.map((end) => end.snapshot?.heapUsed), run.teardown?.heapUsed]
     if (
       run.phaseEnds.length !== SHARE_SOAK.phases.length ||
       !quiet.every(ShareSoakScreen.count) ||
@@ -2497,7 +2500,52 @@ class ShareSoakScreen {
       violations.push('phase-end quiet heap screen')
     }
 
-    return { ok: violations.length === 0, violations, measured: { phases, quietHeap: quiet } }
+    const quietSlope = ShareSoakScreen.quietSlope(run, violations)
+    return {
+      ok: violations.length === 0,
+      violations,
+      measured: { phases, quietHeap: quiet, quietSlope },
+    }
+  }
+
+  /**
+   * Fits only the three ordered disconnected phase ends on the original owner's elapsed clock.
+   * Baseline and teardown must surround them, but neither belongs to the fitted working set.
+   * @param {object} run original baseline, phase ends and teardown
+   * @param {string[]} violations receives a failure for invalid sources, chronology or slope
+   * @returns {{ points: object[], bytesPerMinute: number|null }} original points even on failure
+   */
+  static quietSlope(run, violations) {
+    const points = run.phaseEnds.map(({ phase, snapshot }) => ({
+      phase,
+      heapAtMs: snapshot?.heapAtMs ?? null,
+      heapUsed: snapshot?.heapUsed ?? null,
+    }))
+    const observations = [run.baseline, ...run.phaseEnds.map((end) => end.snapshot), run.teardown]
+    const valid =
+      points.length === SHARE_SOAK.phases.length &&
+      points.every(({ phase }, index) => phase === `share-${SHARE_SOAK.phases[index]}`) &&
+      observations.every(
+        (point, index) =>
+          ShareSoakScreen.count(point?.heapUsed) &&
+          Number.isFinite(point?.heapAtMs) &&
+          point.heapAtMs >= 0 &&
+          (index === 0 || point.heapAtMs > observations[index - 1].heapAtMs)
+      )
+    let bytesPerMinute = null
+    if (valid) {
+      try {
+        bytesPerMinute = slope(points.map(({ heapAtMs, heapUsed }) => [heapAtMs / 60000, heapUsed]))
+      } catch {}
+    }
+    if (
+      bytesPerMinute === null ||
+      !Number.isFinite(bytesPerMinute) ||
+      bytesPerMinute > SHARE_SOAK.quietSlopeBytesPerMinute
+    ) {
+      violations.push('phase-end quiet heap slope screen')
+    }
+    return { points, bytesPerMinute: Number.isFinite(bytesPerMinute) ? bytesPerMinute : null }
   }
 
   /**
@@ -5805,9 +5853,15 @@ class ShareSoak {
     })
   }
 
-  /** @returns {Promise<object>} one resource reading through the original owners */
-  snapshot() {
-    return this.shares.snapshot()
+  /**
+   * Timestamps the completed resource observation against the original monotonic run origin.
+   * @returns {Promise<object>} complete share snapshot, including elapsed `heapAtMs`
+   * @throws {Error} when the original resource probe fails
+   */
+  async snapshot() {
+    const snapshot = await this.shares.snapshot()
+    snapshot.heapAtMs = this.clock.now() - this.startedAt
+    return snapshot
   }
 
   /**
