@@ -158,8 +158,11 @@ const registryFingerprint = (entries, uuid) => ({
   hash: crypto.createHash('sha256').update(JSON.stringify(entries)).digest('hex'),
 })
 
-/** What the registry probe of a retained checkpoint must observe on the production client. */
-const REGISTRY_PROBE = Object.freeze({ overflow: 'limit', first: 'updated' })
+/**
+ * What the registry probe of a retained checkpoint must observe on the production client besides
+ * the fingerprint of the descriptors it updated in place: a new identity refused at the limit.
+ */
+const REGISTRY_PROBE = Object.freeze({ overflow: 'limit' })
 
 /**
  * @param {Array<{action: string, at: number}>} events what a disconnect continuation observed

@@ -497,8 +497,7 @@ describe('public telemetry resources', () => {
     90000
   )
 
-  // The admin client's disconnect takes no close budget, so it has no public close deadline.
-  test.each(KINDS.filter((kind) => kind !== 'admin'))(
+  test.each(KINDS)(
     'refuses late final work once a delayed close deadline has passed for %s',
     async (kind) => {
       const responsive = new PublicTelemetryRound({ kind })

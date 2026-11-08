@@ -199,6 +199,9 @@ measure(kind).then(
   async (error) => {
     process.stderr.write(`${error.stack}\n`)
     process.exitCode = 1
-    for (const client of live.splice(0)) await client.close(0).catch(() => {})
+    for (const client of live.splice(0)) {
+      await client.close(0).catch(() => {})
+      await client.drain().catch(() => {})
+    }
   }
 )
