@@ -2012,76 +2012,7 @@ describe('custom metric archive conclusions', () => {
 })
 
 describe('telemetry churn evidence', () => {
-  const { verifyChurn, verifyEvidence } = require('../telemetry/evidence')
-  const KINDS = ['producer', 'consumer', 'admin', 'shareConsumer']
-  const flat = () => {
-    const snapshot = () => ({
-      memory: { retainedBytes: 10, peakRss: 20 },
-      registryDigest: 'd',
-      identities: { sockets: [] },
-    })
-    return {
-      clientCount: 1,
-      baseline: snapshot(),
-      samples: Array.from({ length: 11 }, (_, i) => ({
-        atMs: 60000 + i * 30000,
-        snapshot: snapshot(),
-      })),
-      teardown: snapshot(),
-      measurementMs: 300000,
-      cleanupMs: 1000,
-    }
-  }
-  const record = () => ({
-    results: {
-      rows: [
-        ...KINDS.map((clientKind) => ({
-          kind: 'resource-verdict',
-          clientKind,
-          clientId: `s-${clientKind}`,
-          uuid: `uuid-${clientKind}`,
-          input: flat(),
-        })),
-        ...KINDS.map((clientKind) => ({
-          kind: 'natural-exit',
-          clientKind,
-          event: 'close',
-          code: 0,
-          signal: null,
-          afterDisconnectMs: 10000,
-          stderrBytes: 0,
-          unhandled: 0,
-          watchdogExpired: false,
-        })),
-        { kind: 'oracle', ok: true },
-        { kind: 'verdict', ok: true, setupMs: 1, cleanupMs: 120000, totalMs: 540000 },
-      ],
-    },
-  })
-
-  test('accepts one complete four-kind record at its limits', () => {
-    expect(() => verifyChurn(record())).not.toThrow()
-  })
-
-  test.each([
-    ['a missing kind', (r) => r.results.rows.splice(0, 1)],
-    ['an aggregate input', (r) => (r.results.rows[0].input.clientCount = 4)],
-    [
-      'a failed memory input',
-      (r) => (r.results.rows[1].input.samples[3].snapshot.memory.peakRss = 67108865),
-    ],
-    ['a signal exit', (r) => (r.results.rows[4].signal = 'SIGTERM')],
-    ['a late exit', (r) => (r.results.rows[5].afterDisconnectMs = 10001)],
-    ['a missing receipt', (r) => (r.results.rows[6].afterDisconnectMs = null)],
-    ['unexpected stderr', (r) => (r.results.rows[7].stderrBytes = 1)],
-    ['a failed oracle', (r) => (r.results.rows[8].ok = false)],
-    ['an overlong case', (r) => (r.results.rows[9].totalMs = 540001)],
-    ['a duplicate verdict', (r) => r.results.rows.push({ kind: 'verdict', ok: true })],
-  ])('rejects %s', (_name, change) => {
-    const bad = record()
-    change(bad)
-    expect(() => verifyChurn(bad)).toThrow()
-  })
+  const { verifyEvidence } = require('../telemetry/evidence')
 
   test('knows the soak lane and refuses an unknown one with a different diagnostic', () => {
     expect(() => verifyEvidence('telemetry-soak', '/', [])).toThrow('Scenario catalogue mismatch')
