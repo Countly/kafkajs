@@ -1,6 +1,8 @@
 const fs = require('fs')
 const {
   PEAK_SOURCE,
+  WINDOW_CAPACITY,
+  BoundaryWitness,
   ProcessMemory,
   PendingSampler,
   NativeJournal,
@@ -156,12 +158,25 @@ describe('ProcessMemory', () => {
     const { memory } = meter({
       gc: () => events.push('gc'),
       sleep: async (ms) => events.push(`sleep ${ms}`),
+      settleTurn: async () => events.push('collection callbacks'),
+      usage: () => {
+        events.push('read')
+        return { rss: 100, heapUsed: 10, external: 7, arrayBuffers: 3 }
+      },
     })
     const settled = memory.settled()
     events.push('first await')
     const reading = await settled
 
-    expect(events).toEqual(['gc', 'sleep 100', 'first await', 'gc'])
+    expect(events).toEqual([
+      'gc',
+      'sleep 100',
+      'first await',
+      'gc',
+      'collection callbacks',
+      'collection callbacks',
+      'read',
+    ])
     expect(reading).toMatchObject({ retained: 17, rss: 100 })
     expect(reading.gc.completedAt).toBe(reading.at)
     expect(reading.gc.admittedAt).toBeLessThan(reading.gc.completedAt)
@@ -228,10 +243,42 @@ describe('PendingSampler', () => {
     expect(subject.summary()).toEqual({
       count: 4,
       windows: 1,
+      pendingWindows: [{ begin: 20, end: 80, count: 4, rss: 40, external: 4 }],
+      overflow: false,
       maxGapMs: 20,
       intervalMs: 20,
       peak: { rss: 40, heapUsed: 1, external: 4, arrayBuffers: 0 },
     })
+    memory.stop()
+  })
+
+  test('describes each pending window from its submission to its settlement', () => {
+    const { subject, intervals, memory } = sampler()
+
+    const submitted = subject.begin()
+    ;[...intervals.values()][0].fn()
+    const settled = subject.end()
+    subject.begin()
+    subject.end()
+
+    const [first, second] = subject.summary().pendingWindows
+    expect(first).toEqual({ begin: submitted.at, end: settled.at, count: 3, rss: 30, external: 3 })
+    expect(second).toEqual({ begin: 80, end: 100, count: 2, rss: 50, external: 5 })
+    memory.stop()
+  })
+
+  test('reports more windows than it describes as an overflow instead of growing', () => {
+    const { subject, memory } = sampler()
+
+    for (let window = 0; window <= WINDOW_CAPACITY; window++) {
+      subject.begin()
+      subject.end()
+    }
+
+    const summary = subject.summary()
+    expect(summary.windows).toBe(WINDOW_CAPACITY + 1)
+    expect(summary.pendingWindows).toHaveLength(WINDOW_CAPACITY)
+    expect(summary.overflow).toBe(true)
     memory.stop()
   })
 
@@ -254,6 +301,50 @@ describe('PendingSampler', () => {
 
     expect(intervals.size).toBe(0)
     memory.stop()
+  })
+})
+
+describe('BoundaryWitness', () => {
+  /** @returns {{witness: BoundaryWitness, settle: () => void, closed: Promise<void>}} */
+  const disconnect = () => {
+    let tick = 0
+    let settle
+    const closed = new Promise((resolve) => (settle = resolve))
+    return { witness: new BoundaryWitness(() => ++tick), settle, closed }
+  }
+
+  test('records an action taken in the resolution continuation before its first yield', async () => {
+    const { witness, settle, closed } = disconnect()
+    const done = closed.then(() => {
+      witness.resolved()
+      witness.call('connect')
+    })
+    settle()
+    await done
+    await Promise.resolve()
+
+    expect(witness.summary()).toEqual([
+      { action: 'disconnect', at: 1 },
+      { action: 'connect', at: 2 },
+      { action: 'yield', at: 3 },
+    ])
+  })
+
+  test('records an action behind an await after the first yield', async () => {
+    const { witness, settle, closed } = disconnect()
+    const done = closed.then(async () => {
+      witness.resolved()
+      await Promise.resolve()
+      witness.call('connect')
+    })
+    settle()
+    await done
+
+    expect(witness.summary().map((event) => event.action)).toEqual([
+      'disconnect',
+      'yield',
+      'connect',
+    ])
   })
 })
 
@@ -317,14 +408,31 @@ describe('NativeJournal', () => {
     expect(row.distinctBackingBytes).toBe(4096)
   })
 
-  test('issues the same identity to the same object and never keeps it alive', () => {
-    const { journal } = journalOf(async () => Buffer.alloc(1))
+  test('issues the same identity to the same object and never keeps it alive', async () => {
+    const { journal, module } = journalOf(async () => Buffer.alloc(1))
     const object = {}
 
     expect(journal.idOf(object)).toBe(journal.idOf(object))
     expect(journal.idOf({})).not.toBe(journal.idOf(object))
     expect(journal.idOf(null)).toBeNull()
     expect(journal.idOf(3)).toBeNull()
+
+    const job = { buffer: Buffer.alloc(2000) }
+    await module.compress(job)
+    expect(journal.issued).toBeInstanceOf(WeakMap)
+    const roots = []
+    const visit = (value, depth) => {
+      if (value === null || typeof value !== 'object' || value instanceof WeakMap || depth > 4)
+        return
+      roots.push(value)
+      for (const child of value instanceof Set || value instanceof Map
+        ? value
+        : Object.values(value))
+        visit(child, depth + 1)
+    }
+    visit({ rows: journal.rows, live: journal.live, summary: journal.summary() }, 0)
+    for (const held of [object, job, job.buffer, job.buffer.buffer])
+      expect(roots.includes(held)).toBe(false)
   })
 
   test('preserves a rejection and records the job as rejected', async () => {

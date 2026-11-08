@@ -404,14 +404,20 @@ inconclusive.
 
 Each memory arm runs in its own `node --expose-gc` child, one per kind, with no Jest, coverage or
 inspector inside it, and is recorded as `resources-<arm>-<kind>.json` under
-`TELEMETRY_RESOURCES_ARTIFACT_DIR`. The record is stamped with the tree (`KAFKAJS_TREE`), Node, platform
-and run, carries the child's exit facts (code, signal, timeout, stdout and stderr bytes, receipts, time to
-close after its receipt) and every reading the verdict is computed from. The file is written before any
-assertion, and the job uploads the directory even when a step fails.
+`TELEMETRY_RESOURCES_ARTIFACT_DIR`. The parent issues each child's identity, run and tree and records the
+process it spawned; the child declares them with its Node, V8, platform and architecture, and the verdict
+binds those declarations to the producing process and to the record's stamp (tree from `KAFKAJS_TREE`,
+Node, platform and run). The parent reads the child's output incrementally against a fixed catalogue: at
+most one explicit disconnect receipt, from the public arm only, then exactly one readings message. A
+malformed, foreign, duplicate, late or unterminated line, output past 64 KiB, or a receipt for another kind,
+child or client instance id is a recorded failure. The record carries the exit facts (code, signal, timeout,
+stdout and stderr bytes, the output verdict, the receipt and when the parent saw it, time to close after it,
+or after the readings where no receipt is owed) and every reading the verdict is computed from. The file is
+written before any assertion, and the job uploads the directory even when a step fails.
 
 | Arm | What it measures |
 |---|---|
-| `single client resource memory for <kind>` | An actual public producer, consumer, admin or share consumer. The child takes its startup memory before importing anything, loads every module either mode needs, then runs a **telemetry-disabled control** of the same kind in the same process (the same scripted wire and the same fixed foreground operations, three per public open), releases it, and only then builds the enabled client: 128 maximum-size custom descriptors registered through the public API, the assigned client instance id, a matched disconnected reading, real GZIP and, where supported, ZSTD pushes, one retired native completion per codec with a public close and an immediate same-object reopen from the close's own continuation, and a final public close that prints one disconnect receipt before the closed reading. The child must close by itself within 10 s of that receipt. |
+| `single client resource memory for <kind>` | An actual public producer, consumer, admin or share consumer. The child takes its startup memory before importing anything, loads every module either mode needs, then runs a **telemetry-disabled control** of the same kind in the same process (the same scripted wire and the same fixed foreground operations, three per public open), releases it, and only then builds the enabled client: 128 maximum-size custom descriptors registered through the public API, the assigned client instance id, a matched disconnected reading, real GZIP and, where supported, ZSTD pushes, one retired native completion per codec with a public close and an immediate same-object reopen, and a final public close. Each reopen's connect and the final close's disconnect receipt run in the public disconnect's own resolution continuation, and the observed order (the resolution, that call, then the continuation's first yield) is recorded for replay. The registered descriptors are journaled from the public calls that succeeded; their fingerprint, with a probe that the client still refuses a 129th descriptor and updates the first in place, is kept at every retained checkpoint. The child must close by itself within 10 s of the receipt. |
 | `collector only resource memory for <kind>` | Supplementary only. The strict 64-node, 257-point collector and one persistent payload builder with a current and a retired native build for each codec, judged against its own same-kind disabled control in its own child. It reaches sizes a one-node public client cannot and never stands in for the public arm. |
 
 Telemetry memory is judged as an increment over the disabled control, never as an absolute number. The
@@ -420,7 +426,8 @@ real collection, a 100 ms pause, a second collection and the callbacks of both. 
 RSS readings and Eref the lower of the two external readings. The absolute peak is the kernel's nonresetting
 high water of the child, `/proc/self/status` `VmHWM`, read before the first import and at every phase
 boundary through cleanup; the raw `maxRSS` is recorded beside it and never substituted for it or subtracted.
-P is the largest of those high-water readings and of every current reading they cover.
+P is the largest of those high-water readings, of every recorded current reading (each native submission
+and settlement included) and of the sampled peak; the external peak is taken the same way.
 
 | Gate | Limit |
 |---|---|
@@ -435,7 +442,9 @@ The matched baseline is a separate reading: the enabled client disconnected with
 its UUID and its counters retained. It is not the control, and it supplies only the last row. Native work is
 journaled from the production codec calls (weak-issued job, input and result identities, byte lengths,
 distinct backing stores counted once, a reading at each submission and settlement, readings every 20 ms
-while work is pending) and at most one job may be occupied at a time. An unstable or inflated control, a
+while work is pending, and per pending window its first and last reading time, reading count and peaks) and
+at most one job may be occupied at a time. Each window must span its job from submission to settlement, the
+next phase mark must cover each native reading, and the sampled peak must cover each window. An unstable or inflated control, a
 setup above 96 MiB, a missing exposed collection function, a missing or incoherent peak source, collections
 that were not observed or a noisy host make the result inconclusive and are never rescued by subtraction. A
 broken fact (a control that performed telemetry, a wrong phase, a replaced collection function, a decreasing
@@ -446,8 +455,8 @@ appear, by async resource role and trigger ancestry.
 `node scripts/e2e/telemetry/resourceArtifact.js <directory> --tree <hash> --node <version>` re-judges the
 directory by recomputing every difference and ceiling from the recorded readings: one stamped artifact per
 arm and kind, the current schema version only (an older or aggregate-only record is rejected), a child that
-ran on the stamped Node, no child identity shared by two artifacts, the fixed phase and foreground
-catalogues, and the gates above. A missing, malformed, foreign or noisy artifact fails or is inconclusive and
+ran on the stamped Node, a child identity on every artifact and none shared by two, the fixed phase and
+foreground catalogues, and the gates above. A missing, malformed, foreign or noisy artifact fails or is inconclusive and
 the job fails.
 
 The hundred-cycle schedules (`holds the native result through public cycles ...`, `holds the auth supplier
@@ -458,14 +467,24 @@ restored when their owner completes, closed fake sockets are dropped with their 
 counters keep their numbers, completed requests are kept as counts, and a live bound that is exceeded is a
 recorded failure. After every reconnect one ordinary action of the kind completes through the real client (a
 producer send, a consumer message, an admin metadata request, a share record with its acknowledgement) with
-its original receiver, arguments and outcome. Each cycle journals fixed-shape scalar rows (issued
-identities and the populations of every capture root); the held shell must be the same object in all 100
-cycles, and the second connection of every dedicated pool is counted and must never have been opened.
-`bounded capture controls` run both families for every kind and late outcome and require a specific
-diagnostic for a substituted owner of the same count, a completed owner left in the restore table, a
-duplicated listener, a held late outcome released early, a write to a closed socket, a live bound that is
-exceeded and an issued number that falls. Disabled clients, from the root option and from a client override,
-do the same ordinary work and open nothing.
+its original receiver, arguments and outcome; a share record counts only once the broker has answered its
+Accept and the client has confirmed it. Each cycle calls connect in the public disconnect's own resolution
+continuation and reaches its checkpoint through an observed settlement (the replacement's Get answered, or
+for the supplier its setup attempted and refused behind the held call). It journals a fixed-shape scalar row:
+the witnessed reconnect order, weak-issued owner identities by role, the dedicated socket's emitter and raw
+listener identities, the pending telemetry timers by owning role, and the populations of every capture root.
+The held shell must be the same objects in all 100 cycles; owners that live across cycles must be the very
+ones of the first cycle; owners each lifecycle replaces must be as many and all issued after the previous
+cycle; the only pending timer is the scheduler's, issued in the cycle; and the second connection of every
+dedicated pool is counted and must never have been opened. `bounded capture controls` run both families
+for every kind and late outcome and require a specific diagnostic for a substituted owner of the same count,
+a stale or unowned timer, a retired socket, emitter or listener, a reconnect deferred by one await, a share
+acknowledgement the broker rejects, a completed owner left in the restore table, a duplicated listener, a
+held late outcome released early, a write to a closed socket, a live bound that is exceeded and an issued
+number that falls. For each kind with a public close budget, a held final that crosses its close deadline
+while the close timer is withheld writes no byte and records no final, and the reopened client still
+completes a Get and a Push. Disabled clients, from the root option and from a client override, do the same
+ordinary work and open nothing.
 
 ### Telemetry churn (`telemetry churn`)
 

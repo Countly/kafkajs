@@ -10,10 +10,16 @@ const {
   ARMS,
   KINDS,
   LIMITS,
+  MemoryOutput,
+  REGISTRY_PROBE,
   SCHEMA,
   foregroundCatalogue,
   judgeMemoryArm,
+  maximumDescriptor,
   phaseCatalogue,
+  registryCatalogue,
+  registryEntry,
+  registryFingerprint,
   validateResourceArtifacts,
 } = require('../../scripts/e2e/telemetry/resourceArtifact')
 
@@ -580,7 +586,14 @@ describe('resource artifact validation', () => {
     retained: 11e6,
   })
 
-  const job = (id, retired) => ({
+  /** The submission time of each job: inside the interval its codec mark covers. */
+  const jobAt = (arm, id) =>
+    100 +
+    phaseCatalogue(arm, false).indexOf(`${arm === 'public' ? 'enabled' : 'collector'}:gzip`) * 100 -
+    60 +
+    id * 20
+
+  const job = (id, retired, at) => ({
     id,
     codec: 'gzip',
     jobId: id * 10 + 1,
@@ -589,8 +602,8 @@ describe('resource artifact validation', () => {
     inputBackingId: id * 10 + 3,
     inputBackingBytes: 350000,
     epoch: 0,
-    submitted: edge(id * 100),
-    settled: edge(id * 100 + 5),
+    submitted: edge(at),
+    settled: edge(at + 5),
     outcome: 'resolved',
     resultId: id * 10 + 4,
     resultBytes: 4000,
@@ -600,36 +613,64 @@ describe('resource artifact validation', () => {
     retired,
   })
 
+  /** The receipt and reopen orders a public arm witnesses in its disconnect continuations. */
+  const witnessed = (at, action) => [
+    { action: 'disconnect', at },
+    { action, at: at + 0.25 },
+    { action: 'yield', at: at + 0.5 },
+  ]
+  const retainedRegistry = () => ({
+    ...registryFingerprint(registryCatalogue(), UUID),
+    ...REGISTRY_PROBE,
+  })
+
   /** A passing record of one arm, built fresh so each test can break exactly one fact. */
   const record = (arm, kind = 'producer') => {
     const phases = phaseCatalogue(arm, false)
     const foreground = foregroundCatalogue(kind, 3)
     const roles = () => ({ target: {}, fixture: {}, unknown: {} })
+    const childId = `child-${arm}-${kind}`
+    const child = {
+      childId,
+      pid: 100,
+      tree: TREE,
+      runId: 'run-1',
+      node: NODE,
+      v8: '14.0',
+      platform: 'linux',
+      arch: 'x64',
+    }
+    const jobs = [job(1, false, jobAt(arm, 1)), job(2, true, jobAt(arm, 2))]
+    const registry = arm === 'public' ? { registry: retainedRegistry() } : {}
+    const disconnect = witnessed(6500, 'receipt')
     return {
       schema: SCHEMA,
       arm,
       kind,
-      stamp: { tree: TREE, node: NODE },
+      stamp: { tree: TREE, node: NODE, runId: 'run-1', platform: 'linux', arch: 'x64', at: 'now' },
       context: { before: context(), after: context() },
       exit: {
         code: 0,
         signal: null,
         timedOut: false,
+        failure: null,
         stdoutBytes: 900,
         stderrBytes: 0,
         receipts: arm === 'public' ? 1 : 0,
+        results: 1,
+        receipt:
+          arm === 'public'
+            ? { receipt: 'disconnect', kind, uuid: UUID, childId, at: disconnect[1].at }
+            : null,
+        disconnectObservedAt: arm === 'public' ? 9000 : null,
         closedAfterMarkMs: 250,
+        producer: { arm, kind, ...child },
       },
       readings: {
         manifest: {
           arm,
           kind,
-          childId: `child-${arm}-${kind}`,
-          pid: 100,
-          node: NODE,
-          v8: '14.0',
-          platform: 'linux',
-          arch: 'x64',
+          ...child,
           execArgv: ['--expose-gc'],
           instrumented: { inspector: false, coverage: false, jest: false },
           peakSource: { name: 'proc-self-status-vmhwm', units: 'bytes' },
@@ -658,21 +699,29 @@ describe('resource artifact validation', () => {
           liveRequests: 0,
           ops: foreground.ops,
         },
-        matched: settled(4000, 80 * MIB, 4e6, 30e6),
+        matched: { ...settled(4000, 80 * MIB, 4e6, 30e6), ...registry },
         actives: [
-          { phase: 'gzip', ...settled(5000, 118 * MIB, 20e6, 31e6) },
-          { phase: 'held', ...settled(6000, 85 * MIB, 6e6, 31.5e6) },
+          { phase: 'gzip', ...settled(5000, 118 * MIB, 20e6, 31e6), ...registry },
+          { phase: 'held', ...settled(6000, 85 * MIB, 6e6, 31.5e6), ...registry },
         ],
-        closed: settled(7000, 76 * MIB, 4e6, 30.1e6),
+        closed: { ...settled(7000, 76 * MIB, 4e6, 30.1e6), ...registry },
         marks: phases.map(mark),
         samples: {
           count: 20,
           windows: 2,
+          pendingWindows: jobs.map((row) => ({
+            begin: row.submitted.at,
+            end: row.settled.at,
+            count: 2,
+            rss: 100 * MIB,
+            external: 10e6,
+          })),
+          overflow: false,
           maxGapMs: 40,
           intervalMs: 20,
           peak: { rss: 100 * MIB, heapUsed: 1e6, external: 10e6, arrayBuffers: 0 },
         },
-        native: { rows: [job(1, false), job(2, true)], maxLive: 1, live: 0, overflow: false },
+        native: { rows: jobs, maxLive: 1, live: 0, overflow: false },
         contexts: { control: context(), boundary: context(), final: context() },
         resources: {
           released: { control: {}, ...roles() },
@@ -692,7 +741,9 @@ describe('resource artifact validation', () => {
               },
               pushes: { gzip: { accepted: 4, transmittedBytes: 4000 } },
               decoded: [{ codec: 'gzip', format: true, rawBytes: 350000, transmittedBytes: 4000 }],
-              reopens: [{ codec: 'gzip', immediate: true, connectGapMs: 0.2 }],
+              reopens: [{ codec: 'gzip', events: witnessed(4500, 'connect') }],
+              disconnect,
+              registry: registryCatalogue(),
               uuid: UUID,
               uuidHeld: UUID,
               descriptors: 128,
@@ -876,6 +927,157 @@ describe('resource artifact validation', () => {
     })
   })
 
+  describe('the child context', () => {
+    test.each(['childId', 'pid', 'tree', 'runId', 'node', 'v8', 'platform', 'arch'])(
+      'fails a manifest without its %s declaration',
+      (key) => {
+        const result = judged('public', (r) => delete r.manifest[key])
+        expect(result.verdict).toBe('fail')
+        expect(result.problems).toContain('child context declarations are incomplete')
+      }
+    )
+
+    test.each([
+      ['a child the parent did not spawn', (r, whole) => (whole.exit.producer.childId = 'other')],
+      ['another process', (r, whole) => (whole.exit.producer.pid = 101)],
+      ['another run in the stamp', (r, whole) => (whole.stamp.runId = 'run-2')],
+      ['another build', (r) => (r.manifest.v8 = '13.9')],
+      ['no producing process', (r, whole) => delete whole.exit.producer],
+      ['a producer of another arm', (r, whole) => (whole.exit.producer.arm = 'collector')],
+    ])('fails %s', (_name, change) => {
+      expect(judged('public', change)).toEqual({
+        verdict: 'fail',
+        problems: ['child context differs from the producing process or stamp'],
+      })
+    })
+  })
+
+  describe('the child output catalogue', () => {
+    const OTHER = '01020304-0506-0708-090a-0b0c0d0e0f11'
+    const receipt = (overrides = {}) =>
+      `${JSON.stringify({ receipt: 'disconnect', kind: 'producer', uuid: UUID, childId: 'child-1', at: 12.5, ...overrides })}\n`
+    const readings = (extra = {}) =>
+      `${JSON.stringify({ readings: { uuid: UUID, manifest: { gc: { available: true } }, ...extra } })}\n`
+    /** Feeds lines to a reader whose clock moves 300 ms between the last byte and the close. */
+    const read = (lines, { arm = 'public', bytewise = false } = {}) => {
+      let now = 1000
+      const output = new MemoryOutput({ arm, kind: 'producer', childId: 'child-1' }, () => now)
+      const bytes = Buffer.from(lines.join(''))
+      if (bytewise) for (const byte of bytes) output.write(Buffer.from([byte]))
+      else output.write(bytes)
+      now += 300
+      return output.finish()
+    }
+
+    test('reads one receipt then one readings message, even split inside a character', () => {
+      const result = read([receipt(), readings({ note: 'é' })], { bytewise: true })
+
+      expect(result).toMatchObject({
+        failure: null,
+        receipts: 1,
+        results: 1,
+        receipt: { at: 12.5, childId: 'child-1' },
+        disconnectObservedAt: 1000,
+        closedAfterMarkMs: 300,
+      })
+      expect(result.readings.note).toBe('é')
+    })
+
+    test('times a child that owes no receipt from its readings', () => {
+      expect(read([readings()], { arm: 'collector' })).toMatchObject({
+        failure: null,
+        receipts: 0,
+        results: 1,
+        closedAfterMarkMs: 300,
+      })
+    })
+
+    test.each([
+      [
+        'a receipt of another kind',
+        [receipt({ kind: 'admin' }), readings()],
+        'public',
+        'foreign disconnect receipt',
+      ],
+      [
+        'a receipt of another child',
+        [receipt({ childId: 'child-2' }), readings()],
+        'public',
+        'foreign disconnect receipt',
+      ],
+      [
+        'a receipt without a UUID',
+        [receipt({ uuid: 'x' }), readings()],
+        'public',
+        'foreign disconnect receipt',
+      ],
+      [
+        'a receipt with an extra field',
+        [receipt({ extra: 1 }), readings()],
+        'public',
+        'foreign disconnect receipt',
+      ],
+      [
+        'a receipt from a child that owes none',
+        [receipt(), readings()],
+        'collector',
+        'foreign disconnect receipt',
+      ],
+      [
+        'a second receipt',
+        [receipt(), receipt(), readings()],
+        'public',
+        'duplicate or late disconnect receipt',
+      ],
+      [
+        'a receipt after the readings',
+        [readings(), receipt()],
+        'public',
+        'duplicate or late disconnect receipt',
+      ],
+      [
+        'a second readings message',
+        [receipt(), readings(), readings()],
+        'public',
+        'duplicate readings message',
+      ],
+      [
+        'a foreign message',
+        [receipt(), '{"hello":1}\n', readings()],
+        'public',
+        'foreign output message',
+      ],
+      [
+        'a malformed line',
+        [receipt(), 'not json\n', readings()],
+        'public',
+        'unreadable output line',
+      ],
+      [
+        'an unterminated line',
+        [receipt(), readings().trim()],
+        'public',
+        'unterminated output line',
+      ],
+      ['no readings', [receipt()], 'public', 'missing readings message'],
+      ['no receipt', [readings()], 'public', 'missing or unexpected disconnect receipt'],
+      [
+        'a receipt for another client',
+        [receipt({ uuid: OTHER }), readings()],
+        'public',
+        'disconnect receipt UUID differs from the readings',
+      ],
+      [
+        'output past its bound',
+        [`${'x'.repeat(LIMITS.outputBytes + 1)}\n`],
+        'public',
+        'child output exceeded its bound',
+      ],
+    ])('fails %s', (_name, lines, arm, failure) => {
+      expect(read(lines, { arm }).failure).toBe(failure)
+    })
+  })
+
   describe('the child and the host', () => {
     test.each([
       [
@@ -908,6 +1110,31 @@ describe('resource artifact validation', () => {
         'a late close',
         (r, whole) => (whole.exit.closedAfterMarkMs = 10001),
         'child did not close within 10 s of its receipt',
+      ],
+      [
+        'a negative close interval',
+        (r, whole) => (whole.exit.closedAfterMarkMs = -1),
+        'child did not close within 10 s of its receipt',
+      ],
+      [
+        'an untimed close',
+        (r, whole) => (whole.exit.closedAfterMarkMs = null),
+        'child did not close within 10 s of its receipt',
+      ],
+      [
+        'an unreadable output line',
+        (r, whole) => (whole.exit.failure = 'unreadable output line'),
+        'child output or spawn failed',
+      ],
+      [
+        'no output verdict at all',
+        (r, whole) => delete whole.exit.failure,
+        'child output or spawn failed',
+      ],
+      [
+        'a second readings message',
+        (r, whole) => (whole.exit.results = 2),
+        'child sent the wrong number of readings messages',
       ],
       [
         'incomplete host context',
@@ -1372,6 +1599,105 @@ describe('resource artifact validation', () => {
 
       expect(result).toEqual({ verdict: 'pass', problems: [] })
     })
+
+    test.each([
+      [
+        'a missing sampling period',
+        (r) => delete r.manifest.sampleMs,
+        'native sampling interval is not 20 ms',
+      ],
+      [
+        'a changed sampling period',
+        (r) => (r.samples.intervalMs = 40),
+        'native sampling interval is not 20 ms',
+      ],
+      [
+        'missing pending windows',
+        (r) => delete r.samples.pendingWindows,
+        'native pending windows are incomplete',
+      ],
+      [
+        'a missing window count',
+        (r) => delete r.samples.windows,
+        'native pending windows are incomplete',
+      ],
+      [
+        'undescribed windows',
+        (r) => (r.samples.overflow = true),
+        'native pending windows are incomplete',
+      ],
+      [
+        'a window that ends before its job settles',
+        (r) => (r.samples.pendingWindows[0].end -= 1),
+        'gzip job 1 pending window does not cover its native work',
+      ],
+      [
+        'a window without both edge readings',
+        (r) => (r.samples.pendingWindows[0].count = 1),
+        'gzip job 1 pending window does not cover its native work',
+      ],
+      [
+        'a window above the sampled peak',
+        (r) => (r.samples.pendingWindows[1].rss = 101 * MIB),
+        'sampled peak understates a pending window',
+      ],
+      [
+        'native retained bytes that are not heap plus external',
+        (r) => (r.native.rows[0].submitted.retained += 1),
+        'gzip job 1 retained bytes are not heap plus external',
+      ],
+      [
+        'native array buffers above external bytes',
+        (r) => (r.native.rows[1].settled.arrayBuffers = 11e6),
+        'gzip job 2 array buffers exceed external bytes',
+      ],
+      [
+        'a native reading before the loaded mark',
+        (r) => (r.native.rows[0].submitted.at = 10),
+        'gzip job 1 is outside chronological peak coverage',
+      ],
+      [
+        'a mark that understates a native reading',
+        (r) => (r.native.rows[0].settled.rss = 119 * MIB),
+        'a peak mark understates a native reading',
+      ],
+    ])('fails %s', (_name, change, problem) => {
+      for (const arm of ARMS) {
+        const result = judged(arm, change)
+        expect(result.verdict).toBe('fail')
+        expect(result.problems).toContain(problem)
+      }
+    })
+
+    test('folds a native reading into the external gate, whatever the marks say', () => {
+      const raise = (r) => {
+        const reading = r.native.rows[0].submitted
+        reading.external = 104857600
+        reading.retained = reading.heapUsed + reading.external
+      }
+
+      const understated = judged('public', raise)
+      expect(understated.verdict).toBe('fail')
+      expect(understated.problems).toEqual(
+        expect.arrayContaining([
+          'external memory peak exceeds 64 MiB above the disabled control',
+          'a peak mark understates a native reading',
+          'gzip job 1 pending window does not cover its native work',
+        ])
+      )
+      expect(understated.problems).toHaveLength(3)
+      expect(
+        judged('public', (r) => {
+          raise(r)
+          markOf(r, 'enabled:gzip').coveredExternal = 104857600
+          r.samples.pendingWindows[0].external = 104857600
+          r.samples.peak.external = 104857600
+        })
+      ).toEqual({
+        verdict: 'fail',
+        problems: ['external memory peak exceeds 64 MiB above the disabled control'],
+      })
+    })
   })
 
   describe('the public client facts', () => {
@@ -1400,9 +1726,67 @@ describe('resource artifact validation', () => {
         'gzip accepted pushes are fewer than required',
       ],
       [
-        'no immediate reopen',
-        (r) => (r.reopens[0].immediate = false),
+        'a reopen whose connect followed a fixture await',
+        (r) =>
+          (r.reopens[0].events = [
+            { action: 'disconnect', at: 4500 },
+            { action: 'yield', at: 4500.25 },
+            { action: 'connect', at: 4500.5 },
+          ]),
         'gzip has no immediate reopen from the close continuation',
+      ],
+      [
+        'a reopen without its witnessed order',
+        (r) => delete r.reopens[0].events,
+        'gzip has no immediate reopen from the close continuation',
+      ],
+      [
+        'a receipt sent after a fixture await',
+        (r) =>
+          (r.disconnect = [
+            { action: 'disconnect', at: 6500 },
+            { action: 'yield', at: 6500.25 },
+            { action: 'receipt', at: 6500.5 },
+          ]),
+        'disconnect receipt is not at the public boundary',
+      ],
+      [
+        'a receipt timed elsewhere',
+        (r, whole) => (whole.exit.receipt.at = 7000),
+        'disconnect receipt is not at the public boundary',
+      ],
+      [
+        'a receipt of another kind',
+        (r, whole) => (whole.exit.receipt.kind = 'admin'),
+        'disconnect receipt is not at the public boundary',
+      ],
+      [
+        'no recorded receipt',
+        (r, whole) => (whole.exit.receipt = null),
+        'disconnect receipt is not at the public boundary',
+      ],
+      [
+        'a same-count substitution of one registration',
+        (r) => {
+          const metric = maximumDescriptor(5)
+          r.registry[5] = registryEntry({ ...metric, name: `y${metric.name.slice(1)}` })
+        },
+        'retained registry fingerprint differs from successful public registrations',
+      ],
+      [
+        'a registration charged below its metadata',
+        (r) => (r.registry[0].charge -= 1),
+        'retained registry fingerprint differs from successful public registrations',
+      ],
+      [
+        'a checkpoint whose registered population changed',
+        (r) => (r.actives[0].registry.hash = 'x'),
+        'retained registry fingerprint differs from successful public registrations',
+      ],
+      [
+        'a checkpoint where the client admitted a 129th descriptor',
+        (r) => (r.closed.registry.overflow = null),
+        'retained registry fingerprint differs from successful public registrations',
       ],
       [
         'a payload that is not in its codec format',
@@ -1553,6 +1937,21 @@ describe('resource artifact validation', () => {
         ['public', 'producer', 'artifact shares a child identity with another'],
         ['public', 'admin', 'artifact shares a child identity with another'],
       ])
+    })
+
+    test('fails an artifact without a child identity before checking for shared ones', () => {
+      writeAll()
+      const anonymous = record('public', 'admin')
+      delete anonymous.readings.manifest.childId
+      write('public', 'admin', anonymous)
+
+      const checked = validateResourceArtifacts(directory, { tree: TREE, node: NODE })
+
+      expect(
+        checked.results
+          .filter((result) => result.verdict !== 'pass')
+          .map(({ arm, kind, problems }) => [arm, kind, problems[0]])
+      ).toEqual([['public', 'admin', 'artifact has no child identity']])
     })
 
     test('fails the old schema in a directory even when everything else is in place', () => {

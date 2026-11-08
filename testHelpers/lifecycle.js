@@ -686,6 +686,7 @@ class PublicTelemetryRound {
     this.abandonedCount = 0
     this.abandonOrdinals = []
     this.handlesIssued = 0
+    this.opensAttempted = 0
     this.retiredCount = 0
     this.retiredHandles = new WeakSet()
     this.pushTotals = { requested: 0, answered: 0, finalRequested: 0, finalAnswered: 0 }
@@ -748,12 +749,13 @@ class PublicTelemetryRound {
    * @param {object} owner the patched object @param {string|symbol} key property
    * @param {(original: *) => *} make builds the replacement from the original
    * @param {() => boolean} [done] whether the owner has completed (bounded rounds only)
-   * @returns {void} @throws {Error} when a bounded round already has its live owners
+   * @returns {void} @throws {Error} when a bounded round already has its live owners; the owner
+   *   is then left unpatched
    */
   patchFor(owner, key, make, done) {
     if (!this.bounded) return this.patch(owner, key, make)
     const original = owner[key]
-    owner[key] = make(original)
+    const replacement = make(original)
     this.owners.add(
       owner,
       () => {
@@ -761,6 +763,7 @@ class PublicTelemetryRound {
       },
       done
     )
+    owner[key] = replacement
   }
 
   /**
@@ -1394,7 +1397,8 @@ class PublicTelemetryRound {
 
   /**
    * Wraps every telemetry transport the real factory creates so setup, forced retirement and the
-   * S01/S18 holds are observed at the real `open` and `retire` calls.
+   * S01/S18 holds are observed at the real `open` and `retire` calls. Every `open` call, admitted
+   * or refused, is counted in `opensAttempted` in every capture mode.
    * @returns {void}
    */
   watchTransport() {
@@ -1413,6 +1417,7 @@ class PublicTelemetryRound {
             return candidates()
           }
           transport.open = async (candidate, options) => {
+            round.opensAttempted += 1
             round.setupCalls.push('open')
             const selected = round.armed && round.held?.boundary === 'S01'
             if (selected && round.held.position === 'before') await round.enter('S01')
@@ -1464,6 +1469,7 @@ class PublicTelemetryRound {
    * round deduplicates by weak identity and keeps the connection's restoration in the live-owner
    * table only until its socket has closed.
    * @param {object} connection actual private Connection @returns {void} never changes socket identity
+   * @throws {Error} when a bounded round already has its live owners; no accessor is then installed
    */
   watchSocket(connection) {
     if (this.bounded) {
@@ -1483,6 +1489,14 @@ class PublicTelemetryRound {
     let current = connection.socket
     let hadSocket = Boolean(current)
     const round = this
+    const restore = () =>
+      Object.defineProperty(connection, 'socket', { ...descriptor, value: current })
+    if (this.bounded)
+      this.owners.add(connection, restore, () => {
+        const raw = current?.inner ?? current
+        return hadSocket && (!raw || raw.destroyed === true)
+      })
+    else this.restores.push(restore)
     Object.defineProperty(connection, 'socket', {
       configurable: true,
       enumerable: true,
@@ -1496,14 +1510,6 @@ class PublicTelemetryRound {
         round.trackSocket(raw)
       },
     })
-    const restore = () =>
-      Object.defineProperty(connection, 'socket', { ...descriptor, value: current })
-    if (this.bounded)
-      this.owners.add(connection, restore, () => {
-        const raw = current?.inner ?? current
-        return hadSocket && (!raw || raw.destroyed === true)
-      })
-    else this.restores.push(restore)
   }
 
   /**

@@ -12,7 +12,6 @@
  */
 const path = require('node:path')
 const Module = require('node:module')
-const crypto = require('node:crypto')
 const inspector = require('node:inspector')
 
 const ROOT = path.join(__dirname, '..', '..', '..', '..')
@@ -75,7 +74,9 @@ const measure = async (kind) => {
   const manifest = {
     arm: 'collector',
     kind,
-    childId: crypto.randomUUID(),
+    childId: process.env.RESOURCE_CHILD_ID,
+    tree: process.env.RESOURCE_TREE,
+    runId: process.env.RESOURCE_RUN_ID,
     pid: process.pid,
     node: process.version,
     v8: process.versions.v8,

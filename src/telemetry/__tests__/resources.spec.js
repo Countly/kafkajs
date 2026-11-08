@@ -1,5 +1,6 @@
 const { spawn } = require('node:child_process')
 const fs = require('node:fs')
+const crypto = require('node:crypto')
 const path = require('node:path')
 const TelemetryPayload = require('../payload')
 const gzip = require('../../protocol/message/compression/gzip')
@@ -7,15 +8,22 @@ const Connection = require('../../network/connection')
 const Decoder = require('../../protocol/decoder')
 const { maximum } = require('./fixtures/maximum')
 const {
+  AckProof,
   BoundedAudit,
   CycleLedger,
+  IMMEDIATE,
   IndexOneWatch,
   KindForeground,
   NativeResultFamily,
   SupplierFamily,
 } = require('./fixtures/cycleKit')
 const { hostContext } = require('../../../testHelpers/processMemory')
-const { SCHEMA, judgeMemoryArm } = require('../../../scripts/e2e/telemetry/resourceArtifact')
+const { A: SHARE_TOPIC_ID, B: OTHER_TOPIC_ID } = require('../../../testHelpers/shareHarness')
+const {
+  MemoryOutput,
+  SCHEMA,
+  judgeMemoryArm,
+} = require('../../../scripts/e2e/telemetry/resourceArtifact')
 const {
   BOUNDED_LIMITS,
   PublicTelemetryRound,
@@ -299,7 +307,9 @@ describe('public telemetry resources', () => {
       await round.ready()
       expect(watch.pools).toBeGreaterThanOrEqual(1)
       expect(watch.opens).toBe(0)
-      await round.wait(() => watch.last.getConnection(1)).catch(() => {})
+      const connected = await round.wait(() => watch.last.getConnection(1))
+      expect(connected).toBe(watch.last.pool[1])
+      expect(connected.isConnected()).toBe(true)
       expect(watch.opens).toBe(1)
     } finally {
       await round.dispose()
@@ -486,6 +496,69 @@ describe('public telemetry resources', () => {
     },
     90000
   )
+
+  // The admin client's disconnect takes no close budget, so it has no public close deadline.
+  test.each(KINDS.filter((kind) => kind !== 'admin'))(
+    'refuses late final work once a delayed close deadline has passed for %s',
+    async (kind) => {
+      const responsive = new PublicTelemetryRound({ kind })
+      try {
+        const gate = responsive.hold('S13', { mode: 'final' })
+        await responsive.start()
+        await responsive.ready()
+        responsive.arm()
+        responsive.beginClose(responsive.closeOptions(30000))
+        await responsive.wait(() => gate.arrived())
+        const writes = responsive.writeCount
+        await responsive.drainReleased(gate)
+        await responsive.settleClose()
+        expect(responsive.finalFrames()).toHaveLength(1)
+        expect(responsive.pushTotals.finalAnswered).toBe(1)
+        expect(responsive.writeCount).toBeGreaterThan(writes)
+        expect(responsive.machine.hadFinal).toBe(true)
+      } finally {
+        await responsive.dispose()
+      }
+
+      const late = new PublicTelemetryRound({ kind })
+      try {
+        const gate = late.hold('S13', { mode: 'final' })
+        await late.start()
+        await late.ready()
+        late.arm()
+        late.beginClose(late.closeOptions(500))
+        await late.wait(() => gate.arrived())
+        const { machine, clock } = late
+        const { deadline } = machine.closing
+        expect(deadline - late.closeEntry).toBeGreaterThan(0)
+        expect(deadline - late.closeEntry).toBeLessThanOrEqual(500)
+        const closeTimer = late.closeTimer
+        expect(clock.pending.get(closeTimer).due).toBe(deadline)
+        const withheld = clock.callback(closeTimer)
+        const writes = late.writeCount
+        clock.jump(deadline + 1)
+        await late.drainReleased(gate)
+        await late.settleClose()
+        expect(late.writeCount).toBe(writes)
+        expect(late.finalFrames()).toEqual([])
+        expect(late.pushTotals).toMatchObject({ finalRequested: 0, finalAnswered: 0 })
+        expect(machine.hadFinal).toBe(false)
+        expect(machine.state).toBe('CLOSED')
+        expect(clock.pending.has(closeTimer)).toBe(false)
+
+        await late.client.connect()
+        const before = late.capture()
+        withheld()
+        late.assertReplacementUnchanged(before)
+        await late.establish()
+        expect(machine.uuid).toBe(TELEMETRY_UUID)
+        expect(late.pushTotals.finalRequested).toBe(0)
+      } finally {
+        await late.dispose()
+      }
+    },
+    90000
+  )
 })
 
 const CYCLES = 100
@@ -560,12 +633,97 @@ describe.each([
         const row = ledger.rows.at(-1)
         const rows = ledger.rows.map((entry) => ({ ...entry }))
         expect(BoundedAudit.journal(rows, CONTROL_CYCLES)).toEqual([])
+        expect(row.reopen).toEqual(IMMEDIATE)
 
         // The same number of owners, none of them the held shell.
         const decoy = new CycleLedger(round, () => family.decoyShell())
         expect(family.audit({ ...row, shell: await decoy.baseline() })).toEqual(
           family.roles.map((role) => `identities ${role} changed`)
         )
+
+        // Same-count substitutions of one owner in an otherwise valid row.
+        const changed = (change) => {
+          const copy = JSON.parse(JSON.stringify(row))
+          change(copy)
+          return family.audit(copy)
+        }
+        const previous = ledger.rows.at(-2)
+        expect(changed((copy) => (copy.timers.scheduler = [copy.timers.floor]))).toEqual([
+          'a timer from a retired lifecycle survives',
+        ])
+        expect(
+          changed((copy) => {
+            copy.timers.unknown = copy.timers.scheduler
+            copy.timers.scheduler = []
+          })
+        ).toEqual(['the scheduler timer is not exactly one', 'an unowned timer is pending'])
+        const owned = family.roles.includes('nativeInput') ? 'nativeInput' : 'pending'
+        expect(
+          changed((copy) => (copy.shell.identities[owned] = [Number.MAX_SAFE_INTEGER]))
+        ).toEqual([`identities ${owned} changed`])
+        expect(
+          changed((copy) => (copy.churn.identities.queue = [Number.MAX_SAFE_INTEGER]))
+        ).toEqual(['queue owners changed'])
+        expect(row.churn.identities.sockets).toHaveLength(family.expected.sockets)
+        if (family.expected.sockets) {
+          const events = row.churn.registrations['dedicated-socket'].events
+          const ids = Object.values(events).flat()
+          const event = Object.keys(events).find(
+            (name) =>
+              events[name].length === 1 && ids.filter((id) => id === events[name][0]).length === 1
+          )
+          const retiredSocket = previous.churn.identities.sockets[0]
+          expect(
+            changed((copy) => {
+              copy.churn.identities.sockets = [retiredSocket]
+              copy.churn.registrations['dedicated-socket'].id = retiredSocket
+            })
+          ).toEqual([
+            'a retired sockets owner is still held',
+            'a retired emitter or listener is still registered',
+          ])
+          expect(
+            changed(
+              (copy) =>
+                (copy.churn.registrations['dedicated-socket'].id = copy.churn.identities.handles[0])
+            )
+          ).toEqual(['the listeners are on another emitter'])
+          expect(
+            changed(
+              (copy) =>
+                (copy.churn.registrations['dedicated-socket'].events[event] =
+                  previous.churn.registrations['dedicated-socket'].events[event])
+            )
+          ).toEqual(['a retired emitter or listener is still registered'])
+
+          // One registration twice on the open dedicated socket.
+          const [socket] = round.openDedicated()
+          const [listener] = socket.rawListeners(event)
+          socket.on(event, listener)
+          try {
+            ledger.current = [{}]
+            const churn = await ledger.churnProbe.snapshot()
+            ledger.current = []
+            expect(family.audit({ ...row, churn })).toEqual(['dedicated socket listeners changed'])
+          } finally {
+            socket.off(event, listener)
+          }
+        }
+
+        // A reconnect deferred by one await is not the disconnect continuation's next call.
+        const deferred = await family.cycle(CONTROL_CYCLES, { defer: true })
+        expect(deferred.reopen).toEqual(['disconnect', 'yield', 'connect'])
+        expect(family.audit(deferred)).toEqual([
+          'the reconnect did not run in the disconnect continuation',
+        ])
+
+        // A share record whose acknowledgement the broker rejects does not prove progress.
+        if (kind === 'shareConsumer') {
+          const offset = family.foreground.nextOffset
+          await expect(
+            round.wait(() => family.foreground.act(CONTROL_CYCLES + 1, { ackError: 121 }), 30000)
+          ).rejects.toThrow(`the acknowledgement of offset ${offset} was not confirmed`)
+        }
 
         // A completed owner left in the restore table survives until it is released.
         const retired = {}
@@ -579,20 +737,6 @@ describe.each([
         ])
         round.releaseCompleted()
         expect(BoundedAudit.state(round.boundedState(), ledger.base)).toEqual([])
-
-        // One registration twice on the open dedicated socket.
-        const [socket] = round.openDedicated()
-        const event = socket.eventNames().find((name) => typeof name === 'string')
-        const [listener] = socket.rawListeners(event)
-        socket.on(event, listener)
-        try {
-          ledger.current = [{}]
-          const churn = await ledger.churnProbe.snapshot()
-          ledger.current = []
-          expect(family.audit({ ...row, churn })).toEqual(['dedicated socket listeners changed'])
-        } finally {
-          socket.off(event, listener)
-        }
 
         // Issued numbers that fall are a reset after pruning, not a continuation.
         const reset = rows.map((entry, index) =>
@@ -729,12 +873,103 @@ describe('bounded capture of the round', () => {
     expect(live.write()).toBe('original')
     expect(round.owners.size).toBe(0)
   })
+
+  test('installs no patch or socket accessor that the full owner table cannot admit', async () => {
+    const round = new PublicTelemetryRound({ kind: 'producer', bounded: true })
+    const fillers = Array.from({ length: BOUNDED_LIMITS.owners }, () => ({
+      write: () => 'original',
+    }))
+    const original = () => 'original'
+    const victim = { write: original }
+    const raw = { destroyed: false }
+    const connection = { socket: raw }
+    const descriptor = Object.getOwnPropertyDescriptor(connection, 'socket')
+    try {
+      for (const filler of fillers) round.patchFor(filler, 'write', () => () => 'patched')
+      const overflow = `Bounded capture overflow: more than ${BOUNDED_LIMITS.owners} live owners`
+      expect(() => round.patchFor(victim, 'write', () => () => 'patched')).toThrow(overflow)
+      expect(victim.write).toBe(original)
+      expect(() => round.watchSocket(connection)).toThrow(overflow)
+      expect(Object.getOwnPropertyDescriptor(connection, 'socket')).toEqual(descriptor)
+      expect(round.owners.has(victim) || round.owners.has(connection)).toBe(false)
+      expect(fillers.every((filler) => filler.write() === 'patched')).toBe(true)
+    } finally {
+      await round.dispose()
+    }
+    expect(fillers.every((filler) => filler.write() === 'original')).toBe(true)
+    expect(victim.write).toBe(original)
+    expect(Object.getOwnPropertyDescriptor(connection, 'socket')).toEqual(descriptor)
+    expect(round.owners.size).toBe(0)
+  })
+})
+
+describe('share acknowledgement proof', () => {
+  /** A share request carrying one acknowledgement batch. */
+  const request = (api, first, last, types, { topicId = SHARE_TOPIC_ID, partition = 0 } = {}) => ({
+    api,
+    fields: {
+      topics: [
+        {
+          topicId,
+          partitions: [
+            {
+              partitionIndex: partition,
+              acknowledgementBatches: [
+                { firstOffset: String(first), lastOffset: String(last), acknowledgeTypes: types },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+  })
+  /** A public acknowledgement outcome. */
+  const outcome = (first, last, type, error = null, topic = 'topic-a', partition = 0) => ({
+    topic,
+    partition,
+    firstOffset: String(first),
+    lastOffset: String(last),
+    type,
+    error,
+  })
+  const proofFor = (offset) =>
+    new AckProof({ topic: 'topic-a', topicId: SHARE_TOPIC_ID, partition: 0, offset })
+
+  test('joins only the Accept of its own record and its successful outcome', () => {
+    const proof = proofFor(105)
+    proof.wire('request', request('ShareFetch', 104, 104, [1]))
+    proof.wire('request', request('ShareFetch', 105, 105, [2]))
+    proof.wire('request', request('ShareFetch', 105, 105, [1], { topicId: OTHER_TOPIC_ID }))
+    proof.wire('request', request('ShareFetch', 105, 105, [1], { partition: 1 }))
+    proof.wire('answered', request('Metadata', 105, 105, [1]))
+    proof.settle(outcome(104, 104, 'accept'))
+    proof.settle(outcome(105, 105, 'accept', null, 'topic-b'))
+    proof.settle(outcome(105, 105, 'accept', null, 'topic-a', 1))
+    expect(proof.facts()).toEqual({ written: 0, answered: 0, outcome: null })
+
+    proof.wire('request', request('ShareAcknowledge', 100, 110, [1]))
+    proof.wire('answered', request('ShareAcknowledge', 100, 110, [1]))
+    proof.settle(outcome(100, 110, 'accept'))
+    expect(proof.facts()).toEqual({ written: 1, answered: 1, outcome: 'accept' })
+  })
+
+  test('refuses a release, a rejected acknowledgement and a mixed batch that does not accept it', () => {
+    const proof = proofFor(102)
+    proof.settle(outcome(102, 102, 'release'))
+    expect(proof.facts().outcome).toBe('release')
+    proof.settle(outcome(102, 102, 'accept', new Error('rejected by the broker')))
+    expect(proof.facts().outcome).toBe('error')
+    expect(proof.covers(request('ShareFetch', 100, 103, [1, 1, 2, 1]).fields)).toBe(false)
+    expect(proofFor(101).covers(request('ShareFetch', 100, 103, [1, 1, 2, 1]).fields)).toBe(true)
+    expect(proof.covers(null)).toBe(false)
+  })
 })
 
 /**
- * Runs one single-client memory child under the parent's supervision, with bounded output. A child
- * that overruns is killed and still joined; the facts come back whatever happened, so a failure
- * leaves its evidence.
+ * Runs one single-client memory child under the parent's supervision. The parent issues the child's
+ * identity, run and tree, reads its output incrementally against the fixed message catalogue and
+ * records the producing process. A child that overruns is killed and still joined; the facts come
+ * back whatever happened, so a failure leaves its evidence.
  * @param {string} script fixture file name @param {string} kind public client kind
  * @returns {Promise<object>} exit, output and receipt facts and the readings line
  */
@@ -742,17 +977,33 @@ const supervise = (script, kind) =>
   new Promise((resolve) => {
     const file = path.join(__dirname, 'fixtures', script)
     // The child runs without coverage, inspector or Jest, so none of them can add to its memory.
-    const env = { ...process.env }
+    const producer = {
+      arm: script === 'publicMemoryChild.js' ? 'public' : 'collector',
+      kind,
+      childId: crypto.randomUUID(),
+      tree: process.env.KAFKAJS_TREE || 'unfrozen',
+      runId: process.env.GITHUB_RUN_ID || 'local-resource-run',
+      node: process.version,
+      v8: process.versions.v8,
+      platform: process.platform,
+      arch: process.arch,
+    }
+    const output = new MemoryOutput(producer)
+    const env = {
+      ...process.env,
+      RESOURCE_CHILD_ID: producer.childId,
+      RESOURCE_TREE: producer.tree,
+      RESOURCE_RUN_ID: producer.runId,
+    }
     delete env.NODE_V8_COVERAGE
     const child = spawn(process.execPath, ['--expose-gc', file, kind], {
       env,
       stdio: ['ignore', 'pipe', 'pipe'],
     })
-    let stdout = ''
+    producer.pid = child.pid
     let stderr = ''
     let stdoutBytes = 0
     let stderrBytes = 0
-    let mark = null
     let timedOut = false
     let failure = null
     const limit = setTimeout(() => {
@@ -761,8 +1012,7 @@ const supervise = (script, kind) =>
     }, 90000)
     child.stdout.on('data', (chunk) => {
       stdoutBytes += chunk.length
-      if (stdout.length < 65536) stdout += chunk
-      if (mark === null && stdout.includes('\n')) mark = Date.now()
+      output.write(chunk)
     })
     child.stderr.on('data', (chunk) => {
       stderrBytes += chunk.length
@@ -773,25 +1023,17 @@ const supervise = (script, kind) =>
     })
     child.on('close', (code, signal) => {
       clearTimeout(limit)
-      const lines = []
-      for (const line of stdout.split('\n').filter(Boolean)) {
-        try {
-          lines.push(JSON.parse(line))
-        } catch (error) {
-          failure = `unreadable output line: ${error.message}`
-        }
-      }
+      const parsed = output.finish()
       resolve({
         code,
         signal,
         timedOut,
-        failure,
         stdoutBytes,
         stderrBytes,
         stderr,
-        receipts: lines.filter((line) => line.receipt === 'disconnect').length,
-        readings: lines.find((line) => line.readings)?.readings ?? null,
-        closedAfterMarkMs: mark === null ? null : Date.now() - mark,
+        ...parsed,
+        producer,
+        failure: failure ?? parsed.failure,
       })
     })
   })
@@ -815,7 +1057,7 @@ const record = (arm, kind, run, before, after) => {
       node: process.version,
       platform: process.platform,
       arch: process.arch,
-      runId: process.env.GITHUB_RUN_ID ?? null,
+      runId: process.env.GITHUB_RUN_ID || 'local-resource-run',
       at: new Date().toISOString(),
     },
     context: { before, after },
