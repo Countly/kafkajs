@@ -3662,14 +3662,20 @@ const verifyCleanup = (directory, stamps, project) => {
   assert.deepEqual(receipt.removalProof, { containers: [], networks: [], volumes: [] })
   assert.deepEqual(receipt.ownedRemovalProof, { containers: [], networks: [], volumes: [] })
   const indexes = []
+  const failedIndexes = new Set()
   for (const item of manifest.scenarios) {
     assert(/^[a-z0-9-]+\.jsonl$/.test(item.path))
     const content = fs.readFileSync(path.join(stamps, item.path))
     assert.equal(content.length, item.bytes)
     assert.equal(sha(content), item.sha256)
     for (const line of content.toString('utf8').split('\n').filter(Boolean)) {
-      const sidecars = JSON.parse(line).sidecars
-      if (sidecars?.format === SEGMENT_FORMAT) indexes.push(`${sidecars.root}/index.json`)
+      const record = JSON.parse(line)
+      const sidecars = record.sidecars
+      if (sidecars?.format === SEGMENT_FORMAT) {
+        const index = `${sidecars.root}/index.json`
+        indexes.push(index)
+        if (record.status === 'failed') failedIndexes.add(index)
+      }
     }
   }
   const listed = manifest.segmented ?? []
@@ -3685,11 +3691,18 @@ const verifyCleanup = (directory, stamps, project) => {
       'Segment index digest differs'
     )
     assert.equal(item.format, SEGMENT_FORMAT, 'Segment index format differs')
+    const index = JSON.parse(bytes)
+    assert.equal(index.format, SEGMENT_FORMAT, 'Segment index format differs')
+    assert.equal(index.scenario, item.scenario, 'Segment index scenario differs')
     assert.equal(
       item.segments,
-      segmentCatalogue(item.scenario).length,
+      index.segments.length,
       'Segment index count differs from the schedule'
     )
+    const planned = segmentCatalogue(item.scenario).length
+    if (failedIndexes.has(item.path))
+      assert(item.segments <= planned, 'Failed segment index exceeds the schedule')
+    else assert.equal(item.segments, planned, 'Segment index count differs from the schedule')
   }
 }
 

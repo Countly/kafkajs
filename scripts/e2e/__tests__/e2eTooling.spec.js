@@ -1131,7 +1131,9 @@ describe('broker telemetry fixture', () => {
 
   test('keeps fixture startup separate from offline verification and decoding', () => {
     const runner = read(fixture + 'run.sh').toString()
-    expect(runner).toContain('CountingTelemetryReporter decode --file')
+    expect(runner).toContain('FullTelemetryDecoder "$RAW"')
+    expect(runner).toContain('FullTelemetryDecoder.java')
+    expect(runner).toContain('fixtures/full-telemetry-decoder.jar')
     expect(runner).toContain('TELEMETRY_JAVA_CACHE')
     expect(runner).toContain('sha256')
     expect(runner).not.toMatch(/docker compose|docker pull|curl |wget |npm run test:kafka/)
