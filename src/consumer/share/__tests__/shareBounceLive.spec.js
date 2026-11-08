@@ -104,6 +104,20 @@ const WIRE_BYTES = 96 * 1024 * 1024
 const PRODUCER_EVIDENCE_BYTES = 64 * 1024 * 1024
 const ARCHIVE_BYTES = 10 * 1024 * 1024
 const ARCHIVE_ROW_BYTES = 256 * 1024
+const ARCHIVE_HISTORIES = new Map([
+  ['handler-entry', ['handler-history', 'entries']],
+  ['acquisition', ['acquisition-history', 'acquisitions']],
+  ['share-exchange', ['exchange-history', 'exchanges']],
+  ['wire-exchange', ['wire-history', 'frames']],
+  ['original-send', ['send-history', 'sends']],
+  ['producer-batch', ['producer-batch-history', 'batches']],
+  ['produce-attempt', ['produce-attempt-history', 'attempts']],
+  ['producer-transition', ['producer-transition-history', 'transitions']],
+  ['producer-broker-state', ['producer-broker-state-history', 'states']],
+])
+const ARCHIVE_HISTORY_MEMBERS = new Map(
+  [...ARCHIVE_HISTORIES].map(([event, [history, key]]) => [history, { event, key }])
+)
 const RAW_PRODUCE_BYTES = 2 * 1024 * 1024
 const RAW_PRODUCE_PER_PARTITION = 32
 const PRODUCER_CONFIGS = [
@@ -1228,6 +1242,25 @@ const interrupts = (kind, event, scope) => {
   )
 }
 
+/**
+ * A partition retirement invalidates existing cohorts; later cohorts can reuse the same open.
+ * Socket loss and whole-session retirement still end that authority permanently.
+ * @param {string} kind Primitive observation type.
+ * @param {object} event Original loss observation.
+ * @param {object} entry Original acquisition or handler.
+ * @returns {boolean} Whether this loss can affect this acquisition.
+ */
+const interruptsAcquisition = (kind, event, entry) =>
+  interrupts(kind, event, authority(entry)) &&
+  !(
+    kind === 'retirement' &&
+    event.key &&
+    precedes(event, {
+      at: entry.acquisition.adoptedAt,
+      order: entry.acquisition.adoptedOrder,
+    })
+  )
+
 /** @param {Map} index Join index. @param {*} key Key. @param {*} value Member. @returns {void} */
 const indexMember = (index, key, value) => {
   if (!index.has(key)) index.set(key, [])
@@ -1580,7 +1613,9 @@ const interruptedScopes = (entries, evidence, kind, event, bounce) => {
       !interrupts(kind, event, scope) ||
       scopedLosses(scope, evidence).some(
         ({ kind: lossKind, event: loss }) =>
-          lossKind !== 'failure' && interrupts(lossKind, loss, scope) && precedes(loss, cut)
+          lossKind !== 'failure' &&
+          interruptsAcquisition(lossKind, loss, entry) &&
+          precedes(loss, cut)
       )
     )
       continue
@@ -1813,7 +1848,7 @@ const historyAccounting = (entries, bounces, evidence, cut) => {
     (entry) =>
       !scopedLosses(authority(entry), evidence).some(
         ({ kind, event }) =>
-          precedes(interruptionEvent(kind, event), cut) && interrupts(kind, event, authority(entry))
+          precedes(interruptionEvent(kind, event), cut) && interruptsAcquisition(kind, event, entry)
       ) &&
       !evidence.results(entry).some((outcome) => outcome.type !== 'renew' && precedes(outcome, cut))
   )
@@ -1858,7 +1893,7 @@ const historyAccounting = (entries, bounces, evidence, cut) => {
         .filter(
           ({ kind, event }) =>
             precedes(interruptionEvent(kind, event), cut) &&
-            interrupts(kind, event, authority(entry))
+            interruptsAcquisition(kind, event, entry)
         )
         .map(({ kind, event }) => ({
           kind,
@@ -3983,10 +4018,14 @@ class ShareBounceCase {
     )
     if (this.archiveFull || before + bytes > ceiling) {
       if (!required) return false
+      const alreadyFull = Boolean(this.archiveFull)
       this.archiveFull = true
-      this.archiveIncomplete = true
       const problem = 'Required evidence does not fit the archive byte bound'
-      if (!this.captureProblems.includes(problem)) this.captureProblems.push(problem)
+      this.archiveProblem(problem)
+      if (!alreadyFull)
+        this.archiveProblem(
+          `archive-write: ${event} requires ${bytes} bytes with ${before} used and ${Math.max(0, ceiling - before)} available below ${ceiling} (${ARCHIVE_BYTES} total)`
+        )
       if (!this.archiveLimitRecorded || final) {
         storage.write({
           ...envelope,
@@ -3994,6 +4033,10 @@ class ShareBounceCase {
           originalEvent: event,
           evidenceId: id,
           requiredBytes: bytes,
+          usedBytes: before,
+          availableBytes: Math.max(0, ceiling - before),
+          ceilingBytes: ceiling,
+          archiveFull: alreadyFull,
           archiveLimit: ARCHIVE_BYTES,
           error: problem,
         })
@@ -4006,8 +4049,9 @@ class ShareBounceCase {
     if (storage.size() > ceiling) {
       storage.truncate(before)
       this.archiveFull = true
-      this.archiveIncomplete = true
-      this.captureProblems.push('Evidence envelope exceeded its reserved byte bound')
+      this.archiveProblem(
+        `archive-write: ${event}: Evidence envelope exceeded its reserved byte bound`
+      )
       return false
     }
     if (
@@ -4018,6 +4062,14 @@ class ShareBounceCase {
       throw new Error('deadline: finalization overrun')
     }
     return true
+  }
+
+  /** @param {string} problem Original archive failure. @returns {void} Retains it in capture and closure diagnostics. */
+  archiveProblem(problem) {
+    this.archiveIncomplete = true
+    if (!this.captureProblems.includes(problem)) this.captureProblems.push(problem)
+    if (this.archiveClosure && !this.archiveClosure.problems.includes(problem))
+      this.archiveClosure.problems.push(problem)
   }
 
   /** @returns {object} Progress and public outcomes before cleanup can change them. */
@@ -5711,10 +5763,7 @@ class ShareBounceCase {
       const { bytes, responseBytes, ...fact } = frame
       const raw = this.tap.rawProduce.get(frame.id)
       if (frameIds.has(frame.id) && !(bytes || raw)) {
-        this.archiveIncomplete = true
-        this.captureProblems.push(
-          `Required original request bytes unavailable for frame ${frame.id}`
-        )
+        this.archiveProblem(`Required original request bytes unavailable for frame ${frame.id}`)
       }
       const original = {
         ...fact,
@@ -5826,6 +5875,9 @@ class ShareBounceCase {
       if (event === 'wire-history')
         return fields.frames.some(({ id }) => frameIds.has(id)) ? 1 : failed ? 4 : 3
       if (event === 'socket-history') return failed ? 4 : 3
+      const history = ARCHIVE_HISTORY_MEMBERS.get(event)
+      if (history && fields[history.key].length)
+        return priority({ event: history.event, fields: fields[history.key][0] })
       if (required.has(event)) return 2
       if (event === 'original-send') return sendIds.has(fields.id) ? 2 : failed ? 4 : 3
       if (event === 'producer-batch') return batchIds.has(fields.id) ? 2 : 4
@@ -5833,20 +5885,14 @@ class ShareBounceCase {
       return 3
     }
     // Use the existing lossless history schema to avoid thousands of duplicate row envelopes.
-    const histories = new Map([
-      ['handler-entry', ['handler-history', 'entries']],
-      ['acquisition', ['acquisition-history', 'acquisitions']],
-      ['share-exchange', ['exchange-history', 'exchanges']],
-      ['wire-exchange', ['wire-history', 'frames']],
-    ])
     const counts = new Map()
     for (const row of rows) {
       if (planned++ % 100 === 0) yield
-      indexMember(counts, row.event, row)
+      indexMember(counts, `${row.event}:${priority(row)}`, row)
     }
     const packed = []
-    for (const [event, members] of counts) {
-      const history = histories.get(event)
+    for (const members of counts.values()) {
+      const history = ARCHIVE_HISTORIES.get(members[0].event)
       if (!history || members.length < 100) {
         packed.push(...members)
         continue
@@ -5862,6 +5908,8 @@ class ShareBounceCase {
     const orderedRows = yield* sortedAuditWork(packed, (a, b) => priority(a) - priority(b))
     const accounting = yield* freezeAccountingWork(this.entries, this.snapshots, this.evidence)
     const problems = yield* this.archiveProblemsWork(orderedRows, frameIds, accounting)
+    for (const problem of this.captureProblems)
+      if (this.archiveIncomplete && !problems.includes(problem)) problems.push(problem)
     this.archiveClosure = { frames: [...frameIds], problems }
     if (problems.length) {
       this.archiveIncomplete = true
@@ -5925,7 +5973,13 @@ class ShareBounceCase {
     let visited = 0
     for (const { event, fields } of rows) {
       if (visited++ % 100 === 0) yield
-      indexMember(byEvent, event, fields)
+      const history = ARCHIVE_HISTORY_MEMBERS.get(event)
+      if (history) {
+        for (const member of fields[history.key]) {
+          if (visited++ % 100 === 0) yield
+          indexMember(byEvent, history.event, member)
+        }
+      } else indexMember(byEvent, event, fields)
     }
     /** @param {string} plain Individual row event. @param {string} bulk History event. @param {string} key History membership. @returns {Generator} Indexed originals. */
     const originals = function* (plain, bulk, key) {
@@ -6153,10 +6207,14 @@ class ShareBounceCase {
   /** @param {AbortSignal} scope Original final scope. @returns {Promise<void>} Validates persisted evidence once at completion. */
   async requireArchive(scope) {
     scope.throwIfAborted()
-    if (!this.archived || !this.archiveClosure || this.archiveIncomplete)
-      throw new Error(
-        `Required witness closure is incomplete: ${(this.archiveClosure?.problems ?? ['closure: unavailable']).join('; ')}`
-      )
+    if (!this.archived || !this.archiveClosure || this.archiveIncomplete) {
+      const problems = [
+        ...new Set([...(this.archiveClosure?.problems ?? []), ...this.captureProblems]),
+      ]
+      if (!problems.length)
+        problems.push(this.archiveClosure ? 'closure: archive incomplete' : 'closure: unavailable')
+      throw new Error(`Required witness closure is incomplete: ${problems.join('; ')}`)
+    }
     const rows = this.archiveStorage?.read
       ? this.archiveStorage.read()
       : await readFile(evidencePath(EVIDENCE), 'utf8')
@@ -8506,6 +8564,129 @@ describe('share bounce acquisition and settlement sensitivity', () => {
     }
   )
 
+  it('retains the full producer streams in lossless histories within the archive bound', async () => {
+    const { instance, rows } = archiveFixture()
+    const producer = instance.producerEvidence
+    producer.batches = Array.from({ length: 720 }, (_, id) => ({
+      id,
+      topic: instance.topic,
+      topicId: instance.topicId,
+      partition: id % 3,
+      count: 34,
+      membershipHash: createHash('sha256').update(String(id)).digest('hex'),
+      sends: [Math.floor(id / 3)],
+    }))
+    const state = {
+      producerId: '0',
+      producerEpoch: 0,
+      partitions: Array.from({ length: 3 }, (_, partition) => ({
+        partition,
+        nextSequence: 2433,
+        lastAckedSequence: 2399,
+        lastAckedOffset: '2399',
+        stale: false,
+        unresolvedNextSequence: null,
+        queued: [],
+        inFlight: [
+          {
+            ...producer.batches[partition],
+            producerId: '0',
+            producerEpoch: 0,
+            firstSequence: 2433,
+            attempt: 1,
+            sequenceReset: false,
+            acks: -1,
+            createdAt: Number(RUN_TIMESTAMP),
+            incarnation: partition + 1,
+            child: null,
+            everWritten: true,
+            dispatched: true,
+            settled: false,
+            routingFailures: 0,
+            backoffUntil: 0,
+          },
+        ],
+      })),
+    }
+    producer.attempts = Array.from({ length: 536 }, (_, id) => ({
+      id,
+      apiKey: 0,
+      producerId: '0',
+      producerEpoch: 0,
+      acks: -1,
+      frames: [],
+      batchStates: [state],
+    }))
+    producer.transitions = Array.from({ length: 1635 }, (_, order) => ({
+      order,
+      method: 'enqueue',
+      started: { at: order, order },
+      before: state,
+      after: state,
+      trigger: null,
+      batch: null,
+      verdict: null,
+      failure: null,
+      route: null,
+    }))
+    producer.links = () =>
+      producer.batches.map(({ id, sends }) => ({
+        batch: id,
+        sends,
+        attempts: [id % producer.attempts.length],
+        retryCount: 0,
+      }))
+    instance.archive()
+    expect(instance.archiveClosure.problems).toEqual([])
+    expect(instance.archiveIncomplete).not.toBe(true)
+    expect(instance.archiveStorage.size()).toBeLessThan(ARCHIVE_BYTES - 2 * ARCHIVE_ROW_BYTES)
+    for (const [event, key, expected] of [
+      ['producer-transition-history', 'transitions', producer.transitions],
+      [
+        'producer-batch-history',
+        'batches',
+        producer.batches.map((batch) => ({ ...batch, link: producer.links()[batch.id] })),
+      ],
+      ['produce-attempt-history', 'attempts', producer.attempts],
+    ]) {
+      const restored = rows
+        .filter((row) => row.event === event)
+        .flatMap(
+          (manifest) =>
+            readEvidenceRows(rows.filter(({ evidenceId }) => evidenceId === manifest.evidenceId))[
+              key
+            ]
+        )
+      expect(restored).toEqual(expected)
+    }
+    await expect(instance.requireArchive(NEVER)).resolves.toBeUndefined()
+    const manifest = rows.find(({ event }) => event === 'producer-transition-history')
+    rows.splice(rows.indexOf(manifest), 1)
+    await expect(instance.requireArchive(NEVER)).rejects.toThrow(
+      'archive-read: missing required producer-transition-history'
+    )
+  })
+
+  it('reports the first exhausted row and remaining budget after the archive becomes full', async () => {
+    const { instance, rows } = archiveFixture()
+    instance.archive()
+    expect(instance.archiveClosure.problems).toEqual([])
+    instance.archiveStorage.size = () => 9956973
+    expect(instance.row('producer-transition', { retained: 'x'.repeat(8059) })).toBe(false)
+    expect(instance.row('case-failed', { retained: 'x'.repeat(556159) })).toBe(false)
+    const failure = rows.at(-1)
+    expect(failure).toMatchObject({
+      event: 'case-failed',
+      usedBytes: 9956973,
+      availableBytes: ARCHIVE_BYTES - 9956973,
+      archiveFull: true,
+    })
+    expect(instance.archiveClosure.problems.join('; ')).toContain('producer-transition')
+    await expect(instance.requireArchive(NEVER)).rejects.toThrow(
+      'archive-write: producer-transition'
+    )
+  })
+
   it('rejects required closure above 10 MiB through the archive writer', async () => {
     const { instance, rows } = archiveFixture()
     const original = instance.archiveFailureIdentities.bind(instance)
@@ -8523,11 +8704,13 @@ describe('share bounce acquisition and settlement sensitivity', () => {
         })
     }
     instance.archive()
-    expect(instance.archiveClosure.problems).toEqual([])
+    expect(instance.archiveClosure.problems).toContain(
+      'Required evidence does not fit the archive byte bound'
+    )
     expect(instance.captureProblems).toContain(
       'Required evidence does not fit the archive byte bound'
     )
-    await expect(instance.complete(NEVER)).rejects.toThrow('Required witness closure is incomplete')
+    await expect(instance.complete(NEVER)).rejects.toThrow('archive-write: handler-history')
     expect(rows.some(({ event }) => event === 'case-complete')).toBe(false)
   })
 
@@ -8682,6 +8865,128 @@ describe('share bounce acquisition and settlement sensitivity', () => {
       )
     }
   )
+
+  it('keeps acquisitions after a partition retirement live on the same session open', () => {
+    const fixture = replayFixture()
+    const { old, next, evidence, bounces } = fixture
+    for (const [entry, partition, at, offset] of [
+      [old, 2, 123194.918176, '2433'],
+      [next, 0, 123205.838606, '2434'],
+    ]) {
+      const acquisition = entry.acquisition
+      entry.partition = acquisition.partition = partition
+      acquisition.adoptedAt = at
+      acquisition.source.model[0].partition = partition
+      acquisition.acquiredRecords[0].firstOffset = offset
+      acquisition.acquiredRecords[0].lastOffset = String(Number(offset) + 32)
+      const frame = acquisition.source.frames[0]
+      frame.at = at - 2
+      frame.responseAt = at - 1
+      frame.request.topics[0].partitions[0].partitionIndex = partition
+      acquisition.source.response.responses[0].partitions[0].partitionIndex = partition
+    }
+    old.acquisition.open = old.acquisition.source.open = 1294
+    next.acquisition.source.nodeId = 3
+    next.acquisition.source.endpoint = 'node-3'
+    Object.assign(next.acquisition.source.frames[0], { nodeId: 3, endpoint: 'node-3' })
+    fixture.entries = Array.from({ length: 66 }, (_, id) => {
+      const original = id < 33 ? old : next
+      const offset = String(Number(original.acquisition.acquiredRecords[0].firstOffset) + (id % 33))
+      const entry = {
+        ...original,
+        id,
+        offset,
+        at: original.acquisition.adoptedAt + 0.2 + id / 1000,
+      }
+      entry.identity = shareRecordIdentity({
+        topic: entry.topic,
+        partition: entry.partition,
+        offset,
+        key: Buffer.from(entry.keyBytes, 'hex'),
+        value: Buffer.from(entry.valueBytes, 'hex'),
+      })
+      return entry
+    })
+    const retirement = evidence.retirements[0]
+    Object.assign(retirement, {
+      at: 116896.956926,
+      open: 1294,
+      key: `${old.topicId}:2`,
+      reason: 'session-lost',
+    })
+    const prior = JSON.parse(JSON.stringify(old.acquisition))
+    Object.assign(prior, {
+      id: 100,
+      exchange: 100,
+      responseIdentity: 100,
+      adoptedAt: retirement.at - 1,
+    })
+    prior.source.id = 100
+    Object.assign(prior.source.frames[0], {
+      id: 100,
+      at: retirement.at - 3,
+      responseAt: retirement.at - 2,
+    })
+    evidence.acquisitions.unshift(prior)
+    expect(fixture.entries.every(validAcquisition)).toBe(true)
+    Object.assign(bounces[0], {
+      at: 123418.534596,
+      downAt: 123420,
+      restoredAt: 123430,
+      nodeId: 3,
+      kind: 'stop',
+      service: 'kafka3',
+    })
+    captureFreezes(fixture)
+    const history = historyAccounting(fixture.entries, bounces, evidence, bounces[0])
+    expect(history).toMatchObject({
+      liveCount: 66,
+      historyCount: 66,
+      retainedCount: 0,
+      problems: [],
+    })
+    expect(bounces[0].carried).toEqual([])
+    expect(
+      bounces[0].obligations.every(({ originatingEpisode }) => originatingEpisode === null)
+    ).toBe(true)
+    expect(freezeProblems(fixture.entries, bounces, evidence)).toEqual([])
+
+    retirement.key = null
+    expect(
+      historyAccounting(fixture.entries, bounces, evidence, bounces[0]).unattributed
+    ).toHaveLength(33)
+    retirement.key = `${old.topicId}:2`
+
+    // A later loss still retires these acquisitions, even before their handlers start.
+    retirement.at = old.acquisition.adoptedAt + 0.1
+    const retired = historyAccounting(fixture.entries, bounces, evidence, bounces[0])
+    expect(retired.liveCount).toBe(33)
+    expect(retired.unattributed).toHaveLength(33)
+    expect(retired.problems).toContain('Unresolved retired history has no original admission')
+
+    retirement.at = 116896.956926
+    bounces.push({ index: 1, nodeId: 1, at: 123440, downAt: 123450, restoredAt: 123460 })
+    evidence.owner.tap.socketEvents.push({
+      id: 20,
+      socket: old.acquisition.source.frames[0].socket,
+      at: 123445,
+      outstanding: [],
+    })
+    captureFreezes(fixture)
+    expect(bounces[1].interruptions).toHaveLength(1)
+    expect(bounces[1].interruptions[0].obligations).toHaveLength(33)
+    const reconstructed = finishAudit(reconstructFreezes(fixture.entries, bounces, evidence))
+    expect(reconstructed[1].interruptions).toEqual(bounces[1].interruptions)
+    const indexed = finishAudit(indexedEvidenceWork(fixture.entries, evidence, bounces))
+    expect(
+      finishAudit(reconstructFreezes(indexed.auditEntries, bounces, indexed))[1].interruptions
+    ).toEqual(bounces[1].interruptions)
+    expect(freezeProblems(fixture.entries, bounces, evidence)).toEqual([])
+    bounces[1].interruptions = []
+    expect(freezeProblems(fixture.entries, bounces, evidence)).toContain(
+      'bounce 1 interruption snapshot disagrees with the journal'
+    )
+  })
 
   it('fails settlement immediately with the immutable snapshot diagnostic', async () => {
     const fixture = replayFixture()
