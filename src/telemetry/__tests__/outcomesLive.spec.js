@@ -1009,7 +1009,7 @@ class OutcomeCase {
           entries: {
             metrics: 'org.apache.kafka.',
             'interval.ms': '1000',
-            match: `client_id=^${this.stem}-`,
+            match: `client_id=^${this.stem}-.*$`,
           },
         },
         sequence
