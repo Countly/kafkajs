@@ -3,6 +3,7 @@ const { execFile } = require('child_process')
 const { deflateRawSync, inflateRawSync } = require('zlib')
 const { createHash } = require('crypto')
 const { readFileSync, statSync, truncateSync } = require('fs')
+const { readFile } = require('fs/promises')
 const { isDeepStrictEqual, promisify } = require('util')
 const Decoder = require('../../../protocol/decoder')
 const Encoder = require('../../../protocol/encoder')
@@ -1233,6 +1234,17 @@ const indexMember = (index, key, value) => {
   index.get(key).push(value)
 }
 
+/** @param {Iterable} values Source membership. @param {Function} project Row projection. @returns {Generator} Projected rows with bounded steps. */
+const mappedAuditWork = function* (values, project) {
+  const rows = []
+  let visited = 0
+  for (const value of values) {
+    if (visited++ % 100 === 0) yield
+    rows.push(project(value))
+  }
+  return rows
+}
+
 /** @param {object[]} values Rows. @param {Function} compare Ordering. @returns {Generator} Sorted rows with a yield per 100 comparisons. */
 const sortedAuditWork = function* (values, compare) {
   let source = [...values]
@@ -1258,7 +1270,7 @@ const sortedAuditWork = function* (values, compare) {
 }
 
 /**
- * Seals audit inputs and builds joins once, yielding at most every 100 source rows.
+ * Seals reference membership before yielding, then copies rows and builds joins cooperatively.
  * Previously each primitive scanned/sorted all handlers and each obligation scanned all exchanges.
  * Index/sweep cost is O((H+A+J+X) log(H+A+J+X) + K*L log L), plus scoped joins;
  * previously reconstruction cost O(J*(H+A)*log(H+A) + J*H*(J+X)). K contains only
@@ -1272,6 +1284,17 @@ const sortedAuditWork = function* (values, compare) {
  */
 const indexedEvidenceWork = function* (entries, original, bounces) {
   const evidence = Object.create(original)
+  const journals = Object.fromEntries(
+    ['exchanges', 'acquisitions', 'epochs', 'outcomes', 'retirements', 'commands', 'controls'].map(
+      (key) => [key, [...original[key]]]
+    )
+  )
+  const originalEntries = [...entries]
+  const socketEvents = [...original.owner.tap.socketEvents]
+  const cohortExchanges = new Map(original.exchangesByCohort)
+  const cohortOutcomes = new Map(original.outcomesByCohort)
+  const originalExchanges = new Set(journals.exchanges)
+  const originalOutcomes = new Set(journals.outcomes)
   const frames = new Map()
   const exchanges = new Map()
   const acquisitions = new Map()
@@ -1298,27 +1321,32 @@ const indexedEvidenceWork = function* (entries, original, bounces) {
       acquisitions.set(acquisition, { ...acquisition, source: exchangeCopy(acquisition.source) })
     return acquisitions.get(acquisition)
   }
-  evidence.exchanges = original.exchanges.map(exchangeCopy)
-  evidence.acquisitions = original.acquisitions.map(acquisitionCopy)
-  evidence.epochs = original.epochs.map((sample) => ({
+  evidence.exchanges = yield* mappedAuditWork(journals.exchanges, exchangeCopy)
+  evidence.acquisitions = yield* mappedAuditWork(journals.acquisitions, acquisitionCopy)
+  evidence.epochs = yield* mappedAuditWork(journals.epochs, (sample) => ({
     ...sample,
     frames: sample.frames.map(frameCopy),
   }))
   for (const key of ['outcomes', 'retirements', 'commands', 'controls'])
-    evidence[key] = [...original[key]]
+    evidence[key] = journals[key]
   evidence.owner = {
     ...original.owner,
-    tap: { socketEvents: [...original.owner.tap.socketEvents] },
+    tap: { socketEvents },
   }
-  const cohortExchanges = [...original.exchangesByCohort].map(([cohort, members]) => [
-    cohort,
-    members.map(exchangeCopy),
-  ])
   evidence.exchangesByCohort = new Map()
-  evidence.outcomesByCohort = new Map(
-    [...original.outcomesByCohort].map(([cohort, outcomes]) => [cohort, [...outcomes]])
-  )
-  entries = entries.map((entry) => ({ ...entry, acquisition: acquisitionCopy(entry.acquisition) }))
+  evidence.outcomesByCohort = new Map()
+  let visited = 0
+  for (const [cohort, outcomes] of cohortOutcomes) {
+    if (visited++ % 100 === 0) yield
+    evidence.outcomesByCohort.set(
+      cohort,
+      outcomes.filter((row) => originalOutcomes.has(row))
+    )
+  }
+  entries = yield* mappedAuditWork(originalEntries, (entry) => ({
+    ...entry,
+    acquisition: acquisitionCopy(entry.acquisition),
+  }))
   evidence.auditEntries = entries
   evidence.auditIndex = {
     scopes: new Map(),
@@ -1329,7 +1357,6 @@ const indexedEvidenceWork = function* (entries, original, bounces) {
     receipts: new Map(),
     boundaries: new Map(),
   }
-  let visited = 0
   for (const exchange of evidence.exchanges) {
     if (visited++ % 100 === 0) yield
     const cohorts = new Set(exchange.tickets.map(({ cohort }) => cohort))
@@ -1337,22 +1364,32 @@ const indexedEvidenceWork = function* (entries, original, bounces) {
   }
   // Preserve cohort membership even for scripted empty-ticket acquisitions.
   for (const [cohort, exchanges] of cohortExchanges)
-    for (const exchange of exchanges)
-      if (!(evidence.exchangesByCohort.get(cohort) ?? []).includes(exchange))
-        indexMember(evidence.exchangesByCohort, cohort, exchange)
-  const originals = evidence.acquisitions.map((acquisition) => ({
+    for (const exchange of exchanges) {
+      if (visited++ % 100 === 0) yield
+      if (!originalExchanges.has(exchange)) continue
+      const copied = exchangeCopy(exchange)
+      if (!(evidence.exchangesByCohort.get(cohort) ?? []).includes(copied))
+        indexMember(evidence.exchangesByCohort, cohort, copied)
+    }
+  const originals = yield* mappedAuditWork(evidence.acquisitions, (acquisition) => ({
     groupId: acquisition.source?.groupId,
     memberId: acquisition.source?.memberId,
     topicId: acquisition.topicId,
     partition: acquisition.partition,
     acquisition,
   }))
-  const seenAcquisitions = new Set(originals.map(({ acquisition }) => acquisition))
-  for (const entry of entries)
+  const seenAcquisitions = new Set()
+  for (const { acquisition } of originals) {
+    if (visited++ % 100 === 0) yield
+    seenAcquisitions.add(acquisition)
+  }
+  for (const entry of entries) {
+    if (visited++ % 100 === 0) yield
     if (!seenAcquisitions.has(entry.acquisition)) {
       seenAcquisitions.add(entry.acquisition)
       originals.push(entry)
     }
+  }
   const authorities = new Map()
   for (const entry of originals) {
     if (visited++ % 100 === 0) yield
@@ -1476,6 +1513,7 @@ const indexedEvidenceWork = function* (entries, original, bounces) {
       else active.delete(entry.identity)
     }
   }
+  yield* epochSampleIndexWork(evidence.epochs)
   return evidence
 }
 
@@ -2027,17 +2065,14 @@ const freezeProblems = (entries, bounces, evidence) =>
 
 const epochSampleCache = new WeakMap()
 
-/**
- * @param {object} entry Original handler acquisition.
- * @param {object[]} samples Original Metadata responses and their wire frames.
- * @param {boolean} [requireBytes] Whether only byte-backed samples can supply a witness.
- * @returns {object[]} Successful metadata observations from this acquisition's source node/pool.
- */
-const sourceEpochSamples = (entry, samples, requireBytes = true) => {
+/** @param {object[]} samples Original Metadata membership. @returns {Generator} Cooperatively built source/partition index. */
+const epochSampleIndexWork = function* (samples) {
   let cached = epochSampleCache.get(samples)
   if (!cached || cached.length !== samples.length) {
     cached = { length: samples.length, rows: new Map() }
+    let visited = 0
     for (const sample of samples) {
+      if (visited++ % 100 === 0) yield
       if (sample.frames.length !== 1) continue
       const frame = sample.frames[0]
       if (frame.apiKey !== 3 || frame.apiVersion < 7) continue
@@ -2069,9 +2104,23 @@ const sourceEpochSamples = (entry, samples, requireBytes = true) => {
         }
       }
     }
-    for (const rows of cached.rows.values()) rows.sort((a, b) => a.frame.at - b.frame.at)
+    for (const [key, rows] of cached.rows)
+      cached.rows.set(key, yield* sortedAuditWork(rows, (a, b) => a.frame.at - b.frame.at))
     epochSampleCache.set(samples, cached)
   }
+  return cached
+}
+
+/**
+ * @param {object} entry Original handler acquisition.
+ * @param {object[]} samples Original Metadata responses and their wire frames.
+ * @param {boolean} [requireBytes] Whether only byte-backed samples can supply a witness.
+ * @returns {object[]} Successful metadata observations from this acquisition's source node/pool.
+ */
+const sourceEpochSamples = (entry, samples, requireBytes = true) => {
+  let cached = epochSampleCache.get(samples)
+  if (!cached || cached.length !== samples.length)
+    cached = finishAudit(epochSampleIndexWork(samples))
   const rows = entry.acquisition?.source
     ? (cached.rows.get(
         `${entry.topicId}:${entry.partition}:${entry.acquisition.source.nodeId}:${entry.acquisition.pool}`
@@ -4030,7 +4079,6 @@ class ShareBounceCase {
       this.finalDeadline = performance.now() + finalWindow
       await bounded(scope, finalWindow, async (inner) => {
         await cooperativeAudit(this.archiveWork(), inner)
-        this.requireArchive()
         await this.complete(inner)
       })
     } catch (error) {
@@ -5699,19 +5747,25 @@ class ShareBounceCase {
     }
     if (!failed) {
       emit('handler-history', {
-        entries: this.entries.map(({ acquisition, ...entry }) => ({
+        entries: yield* mappedAuditWork(this.entries, ({ acquisition, ...entry }) => ({
           ...entry,
           acquisition: acquisition?.id,
         })),
       })
       emit('acquisition-history', {
-        acquisitions: this.evidence.acquisitions.map(({ source, ...acquisition }) => acquisition),
+        acquisitions: yield* mappedAuditWork(
+          this.evidence.acquisitions,
+          ({ source, ...acquisition }) => acquisition
+        ),
       })
       emit('exchange-history', {
-        exchanges: this.evidence.exchanges.map(({ frames, response, ...exchange }) => ({
-          ...exchange,
-          frames: frames.map(({ id }) => id),
-        })),
+        exchanges: yield* mappedAuditWork(
+          this.evidence.exchanges,
+          ({ frames, response, ...exchange }) => ({
+            ...exchange,
+            frames: frames.map(({ id }) => id),
+          })
+        ),
       })
     }
     emit('broker-configs', { configs: this.brokerConfigs })
@@ -5742,23 +5796,52 @@ class ShareBounceCase {
     const priority = ({ event, fields }) => {
       if (first.has(event)) return 0
       if (event === 'wire-exchange') return frameIds.has(fields.id) ? 1 : 4
-      if (event === 'wire-history' || event === 'socket-history') return failed ? 4 : 3
+      if (event === 'wire-history')
+        return fields.frames.some(({ id }) => frameIds.has(id)) ? 1 : failed ? 4 : 3
+      if (event === 'socket-history') return failed ? 4 : 3
       if (required.has(event)) return 2
       if (event === 'original-send') return sendIds.has(fields.id) ? 2 : failed ? 4 : 3
       if (event === 'producer-batch') return batchIds.has(fields.id) ? 2 : 4
       if (event === 'produce-attempt') return attemptIds.has(fields.id) ? 2 : 4
       return 3
     }
-    rows.sort((a, b) => priority(a) - priority(b))
+    // Use the existing lossless history schema to avoid thousands of duplicate row envelopes.
+    const histories = new Map([
+      ['handler-entry', ['handler-history', 'entries']],
+      ['acquisition', ['acquisition-history', 'acquisitions']],
+      ['share-exchange', ['exchange-history', 'exchanges']],
+      ['wire-exchange', ['wire-history', 'frames']],
+    ])
+    const counts = new Map()
+    for (const row of rows) {
+      if (planned++ % 100 === 0) yield
+      indexMember(counts, row.event, row)
+    }
+    const packed = []
+    for (const [event, members] of counts) {
+      const history = histories.get(event)
+      if (!history || members.length < 100) {
+        packed.push(...members)
+        continue
+      }
+      for (let first = 0; first < members.length; first += 100) {
+        yield
+        packed.push({
+          event: history[0],
+          fields: { [history[1]]: members.slice(first, first + 100).map(({ fields }) => fields) },
+        })
+      }
+    }
+    const orderedRows = yield* sortedAuditWork(packed, (a, b) => priority(a) - priority(b))
     const accounting = yield* freezeAccountingWork(this.entries, this.snapshots, this.evidence)
-    const problems = this.archiveProblems(rows, frameIds, accounting)
+    const problems = yield* this.archiveProblemsWork(orderedRows, frameIds, accounting)
     this.archiveClosure = { frames: [...frameIds], problems }
     if (problems.length) {
       this.archiveIncomplete = true
       this.captureProblems.push(...problems)
     }
     const manifest = []
-    for (const [index, fact] of rows.entries()) {
+    for (const [index, fact] of orderedRows.entries()) {
       if (index % 100 === 0) yield
       manifest.push({
         index,
@@ -5784,8 +5867,8 @@ class ShareBounceCase {
     }
     this.archiveClosure.sha256 = createHash('sha256').update(JSON.stringify(closure)).digest('hex')
     this.row('witness-closure', closure)
-    const requiredRows = rows.filter((fact) => priority(fact) < 4)
-    const optionalRows = rows.filter((fact) => priority(fact) >= 4)
+    const requiredRows = orderedRows.filter((fact) => priority(fact) < 4)
+    const optionalRows = orderedRows.filter((fact) => priority(fact) >= 4)
     for (const fact of requiredRows) {
       yield
       this.row(fact.event, fact.fields)
@@ -5807,18 +5890,30 @@ class ShareBounceCase {
    * @param {object[]} rows Planned lossless archive rows.
    * @param {Set<number>} frameIds Complete required frame closure.
    * @param {object} accounting Independently reconstructed interruption membership.
-   * @returns {string[]} Missing acceptance-bearing evidence components.
+   * @returns {Generator} Missing acceptance-bearing evidence components, with bounded traversal steps.
    */
-  archiveProblems(rows, frameIds, accounting) {
+  *archiveProblemsWork(rows, frameIds, accounting) {
     const problems = []
     const byEvent = new Map()
-    for (const { event, fields } of rows) indexMember(byEvent, event, fields)
-    const frames = new Map(
-      [
-        ...(byEvent.get('wire-exchange') ?? []),
-        ...(byEvent.get('wire-history') ?? []).flatMap(({ frames }) => frames),
-      ].map((frame) => [frame.id, frame])
-    )
+    let visited = 0
+    for (const { event, fields } of rows) {
+      if (visited++ % 100 === 0) yield
+      indexMember(byEvent, event, fields)
+    }
+    /** @param {string} plain Individual row event. @param {string} bulk History event. @param {string} key History membership. @returns {Generator} Indexed originals. */
+    const originals = function* (plain, bulk, key) {
+      const index = new Map()
+      for (const group of [
+        byEvent.get(plain) ?? [],
+        ...(byEvent.get(bulk) ?? []).map((row) => row[key]),
+      ])
+        for (const row of group) {
+          if (visited++ % 100 === 0) yield
+          index.set(row.id, row)
+        }
+      return index
+    }
+    const frames = yield* originals('wire-exchange', 'wire-history', 'frames')
     const referenced = [
       ...(byEvent.get('share-exchange') ?? []),
       ...(byEvent.get('epoch-source') ?? []),
@@ -5826,12 +5921,16 @@ class ShareBounceCase {
       ...(byEvent.get('member-close') ?? []),
       ...(byEvent.get('exchange-history') ?? []).flatMap(({ exchanges }) => exchanges),
     ]
-    for (const row of referenced) for (const id of row.frames ?? []) frameIds.add(id)
+    for (const row of referenced) {
+      if (visited++ % 100 === 0) yield
+      for (const id of row.frames ?? []) frameIds.add(id)
+    }
     problems.push(...this.archiveLifecycleProblems(byEvent))
     const controls = new Map(
       (byEvent.get('bounce-control') ?? []).map((control) => [control.id, control])
     )
     for (const extra of byEvent.get('replay-entry') ?? []) {
+      if (visited++ % 100 === 0) yield
       const witness = extra.incarnationWitness
       if (!witness) continue
       for (const key of [
@@ -5855,9 +5954,12 @@ class ShareBounceCase {
       ...this.evidence.exchanges,
       ...this.evidence.epochs,
       ...this.evidence.brokerStates,
-    ])
+    ]) {
+      if (visited++ % 100 === 0) yield
       if (source.response) for (const { id } of source.frames) completed.add(id)
+    }
     for (const id of frameIds) {
+      if (visited++ % 100 === 0) yield
       const frame = frames.get(id)
       if (!frame) problems.push(`frame: missing required original ${id}`)
       else {
@@ -5866,50 +5968,37 @@ class ShareBounceCase {
           problems.push(`response-bytes: missing completed original ${id}`)
       }
     }
-    const entries = new Map(
-      [
-        ...(byEvent.get('handler-entry') ?? []),
-        ...(byEvent.get('handler-history') ?? []).flatMap(({ entries }) => entries),
-      ].map((entry) => [entry.id, entry])
-    )
-    const acquisitions = new Map(
-      [
-        ...(byEvent.get('acquisition') ?? []),
-        ...(byEvent.get('acquisition-history') ?? []).flatMap(({ acquisitions }) => acquisitions),
-      ].map((a) => [a.id, a])
-    )
-    const exchanges = new Map(
-      [
-        ...(byEvent.get('share-exchange') ?? []),
-        ...(byEvent.get('exchange-history') ?? []).flatMap(({ exchanges }) => exchanges),
-      ].map((x) => [x.id, x])
-    )
+    const entries = yield* originals('handler-entry', 'handler-history', 'entries')
+    const acquisitions = yield* originals('acquisition', 'acquisition-history', 'acquisitions')
+    const exchanges = yield* originals('share-exchange', 'exchange-history', 'exchanges')
     for (const entry of entries.values()) {
+      if (visited++ % 100 === 0) yield
       const acquisition = acquisitions.get(entry.acquisition)
       if (!acquisition || !exchanges.has(acquisition.exchange))
         problems.push(`acquisition-reference: missing original for ${entry.id}`)
     }
     for (const bounce of byEvent.get('frozen-bounce') ?? []) {
-      for (const held of [...bounce.obligations, ...bounce.carried])
+      for (const held of [...bounce.obligations, ...bounce.carried]) {
+        if (visited++ % 100 === 0) yield
         if (!entries.has(held.entry))
           problems.push(`interruption-member: missing original ${held.entry}`)
+      }
       for (const cut of bounce.interruptions) {
         for (const id of [
           ...cut.history,
           ...cut.lateEntries,
           ...cut.obligations.map(({ entry }) => entry),
           ...cut.carried.map(({ entry }) => entry),
-        ])
+        ]) {
+          if (visited++ % 100 === 0) yield
           if (!entries.has(id)) problems.push(`interruption-member: missing original ${id}`)
-        const event = (
-          byEvent.get(
-            cut.kind === 'socket'
-              ? 'socket-event'
-              : cut.kind === 'failure'
-                ? 'share-exchange'
-                : 'retirement'
-          ) ?? []
-        ).find(({ id }) => id === cut.event)
+        }
+        const event =
+          cut.kind === 'failure'
+            ? exchanges.get(cut.event)
+            : (byEvent.get(cut.kind === 'socket' ? 'socket-event' : 'retirement') ?? []).find(
+                ({ id }) => id === cut.event
+              )
         if (!event) problems.push(`interruption-reference: missing ${cut.kind} ${cut.event}`)
       }
     }
@@ -6034,21 +6123,31 @@ class ShareBounceCase {
     return problems
   }
 
-  /** @returns {void} Revalidates decoded persisted closure, membership and sealed contents before completion. */
-  requireArchive() {
+  /** @param {AbortSignal} scope Original final scope. @returns {Promise<void>} Validates persisted evidence once at completion. */
+  async requireArchive(scope) {
+    scope.throwIfAborted()
     if (!this.archived || !this.archiveClosure || this.archiveIncomplete)
       throw new Error(
         `Required witness closure is incomplete: ${(this.archiveClosure?.problems ?? ['closure: unavailable']).join('; ')}`
       )
     const rows = this.archiveStorage?.read
       ? this.archiveStorage.read()
-      : readFileSync(evidencePath(EVIDENCE), 'utf8')
-          .trim()
-          .split('\n')
-          .filter(Boolean)
-          .map((line) => JSON.parse(line))
+      : await readFile(evidencePath(EVIDENCE), 'utf8')
+    await cooperativeAudit(this.requireArchiveWork(rows), scope)
+  }
+
+  /** @param {object[]|string} stored Persisted rows or JSONL. @returns {Generator<void, void, unknown>} Decoded closure, membership and content checks. */
+  *requireArchiveWork(stored) {
+    const rows = []
     const groups = new Map()
-    for (const row of rows) if (row.evidenceId) indexMember(groups, row.evidenceId, row)
+    let visited = 0
+    for (const original of typeof stored === 'string' ? stored.split('\n') : stored) {
+      if (visited++ % 100 === 0) yield
+      if (!original) continue
+      const row = typeof original === 'string' ? JSON.parse(original) : original
+      rows.push(row)
+      if (row.evidenceId) indexMember(groups, row.evidenceId, row)
+    }
     const closureRow = rows.findLast(({ event }) => event === 'witness-closure')
     const end = rows.findLast(({ event }) => event === 'witness-closure-end')
     if (!closureRow || !end?.complete)
@@ -6067,7 +6166,9 @@ class ShareBounceCase {
       throw new Error('archive-read: closure manifest changed')
     const decoded = []
     const changed = []
-    for (const required of closure.rows.filter(({ required }) => required)) {
+    for (const required of closure.rows) {
+      yield
+      if (!required.required) continue
       const members = groups.get(required.evidenceId)
       if (!members || members[0].event !== required.event)
         throw new Error(`archive-read: missing required ${required.event} ${required.evidenceId}`)
@@ -6080,8 +6181,8 @@ class ShareBounceCase {
     const bounces = decoded
       .filter(({ event }) => event === 'frozen-bounce')
       .map(({ fields }) => ({ ...fields, held: new Set(fields.held) }))
-    const accounting = finishAudit(freezeAccountingWork(this.entries, bounces, this.evidence))
-    const problems = this.archiveProblems(decoded, new Set(closure.frames), accounting)
+    const accounting = yield* freezeAccountingWork(this.entries, bounces, this.evidence)
+    const problems = yield* this.archiveProblemsWork(decoded, new Set(closure.frames), accounting)
     if (problems.length || changed.length)
       throw new Error(`archive-read: ${[...problems, ...changed].join('; ')}`)
   }
@@ -6094,6 +6195,7 @@ class ShareBounceCase {
    * @returns {Generator<void, void, unknown>} Steps emitting the original reference closure.
    */
   *archiveFailureIdentities(identities, frameIds, emit) {
+    yield* epochSampleIndexWork(this.evidence.epochs)
     let visited = 0
     const cohorts = new Set()
     const exchanges = new Set()
@@ -6390,7 +6492,7 @@ class ShareBounceCase {
    * @returns {Promise<void>}
    */
   async complete(scope) {
-    this.requireArchive()
+    await this.requireArchive(scope)
     if (!this.cleanupProof?.completed) throw new Error('cleanup: missing completed evidence')
     if (this.cleanupProof.tainted !== false)
       throw new Error('taint: missing or failed cleanup evidence')
@@ -8021,6 +8123,69 @@ describe('share bounce acquisition and settlement sensitivity', () => {
     expect(rows.filter(({ event }) => event === 'case-complete')).toHaveLength(1)
   })
 
+  it('stops completion when the final scope aborts between persisted validation steps', async () => {
+    const baseline = archiveFixture()
+    readyCompletion(baseline.instance)
+    baseline.instance.archive()
+    await baseline.instance.complete(NEVER)
+    expect(baseline.rows.filter(({ event }) => event === 'case-complete')).toHaveLength(1)
+    const { instance, rows } = archiveFixture()
+    readyCompletion(instance)
+    instance.archive()
+    const controller = new AbortController()
+    const read = instance.requireArchiveWork.bind(instance)
+    let finished = false
+    instance.requireArchiveWork = function* (...args) {
+      const work = read(...args)
+      try {
+        for (;;) {
+          const step = work.next()
+          if (step.done) {
+            finished = true
+            return step.value
+          }
+          setImmediate(() => controller.abort(new Error('archive-control: interrupted validation')))
+          yield
+        }
+      } finally {
+        work.return()
+      }
+    }
+    await expect(instance.complete(controller.signal)).rejects.toThrow(
+      'archive-control: interrupted validation'
+    )
+    expect(finished).toBe(false)
+    expect(rows.some(({ event }) => event === 'case-complete')).toBe(false)
+  })
+
+  it('checks original bytes inside losslessly packed required wire histories', async () => {
+    const { instance, rows } = archiveFixture()
+    readyCompletion(instance)
+    for (let id = 1000; id < 1100; id++) {
+      const frame = { id, bytes: 'original-request', responseBytes: 'original-response' }
+      instance.tap.allFrames.push(frame)
+      instance.evidence.brokerStates.push({ frames: [frame], response: {} })
+    }
+    instance.archive()
+    expect(instance.archiveClosure.problems).toEqual([])
+    await expect(instance.requireArchive(NEVER)).resolves.toBeUndefined()
+    const manifest = rows.find(({ event }) => event === 'wire-history')
+    const members = rows.filter(({ evidenceId }) => evidenceId === manifest.evidenceId)
+    const { frames } = readEvidenceRows(members)
+    expect(frames).toHaveLength(100)
+    const id = frames[0].id
+    delete frames[0].bytes
+    rows.splice(
+      rows.indexOf(manifest),
+      members.length,
+      ...evidenceRows('wire-history', manifest.evidenceId, { frames })
+    )
+    await expect(instance.complete(NEVER)).rejects.toThrow(
+      `request-bytes: missing required original ${id}`
+    )
+    expect(rows.some(({ event }) => event === 'case-complete')).toBe(false)
+  })
+
   it('rejects an original deadline overrun during the completion write and rolls the pass row back', async () => {
     const { instance, rows } = archiveFixture()
     readyCompletion(instance)
@@ -8034,11 +8199,11 @@ describe('share bounce acquisition and settlement sensitivity', () => {
     expect(rows.some(({ event }) => event === 'case-complete')).toBe(false)
   })
 
-  it('validates the intact reference closure through archive and the completion gate', () => {
+  it('validates the intact reference closure through archive and the completion gate', async () => {
     const { instance, rows } = archiveFixture()
     instance.archive()
     expect(instance.archiveClosure.problems).toEqual([])
-    expect(() => instance.requireArchive()).not.toThrow()
+    await expect(instance.requireArchive(NEVER)).resolves.toBeUndefined()
     expect(rows.find(({ event }) => event === 'witness-closure-end').complete).toBe(true)
   })
 
@@ -8101,7 +8266,7 @@ describe('share bounce acquisition and settlement sensitivity', () => {
       const baseline = archiveFixture()
       baseline.instance.archive()
       expect(baseline.instance.archiveClosure.problems).toEqual([])
-      expect(() => baseline.instance.requireArchive()).not.toThrow()
+      await expect(baseline.instance.requireArchive(NEVER)).resolves.toBeUndefined()
       const context = archiveFixture()
       mutate(context)
       context.instance.archive()
@@ -8156,7 +8321,7 @@ describe('share bounce acquisition and settlement sensitivity', () => {
       readyCompletion(instance)
       instance.archive()
       expect(instance.archiveClosure.problems).toEqual([])
-      expect(() => instance.requireArchive()).not.toThrow()
+      await expect(instance.requireArchive(NEVER)).resolves.toBeUndefined()
       const row = rows.find((row) => row.event === event)
       expect(row.encoding).toBeUndefined()
       mutate(row)
@@ -8169,7 +8334,7 @@ describe('share bounce acquisition and settlement sensitivity', () => {
     const { instance, rows } = archiveFixture()
     readyCompletion(instance)
     instance.archive()
-    expect(() => instance.requireArchive()).not.toThrow()
+    await expect(instance.requireArchive(NEVER)).resolves.toBeUndefined()
     rows.find(({ event }) => event === 'wire-exchange').bytes = 'substituted-request'
     await expect(instance.complete(NEVER)).rejects.toThrow(
       'archive-content: changed required wire-exchange'
@@ -8181,7 +8346,7 @@ describe('share bounce acquisition and settlement sensitivity', () => {
     const { instance, rows } = archiveFixture()
     readyCompletion(instance)
     instance.archive()
-    expect(() => instance.requireArchive()).not.toThrow()
+    await expect(instance.requireArchive(NEVER)).resolves.toBeUndefined()
     const manifest = rows.find(({ event }) => event === 'witness-closure')
     const closure = readEvidenceRows(
       rows.filter(({ evidenceId }) => evidenceId === manifest.evidenceId)
@@ -8274,7 +8439,7 @@ describe('share bounce acquisition and settlement sensitivity', () => {
           readyCompletion(instance)
           instance.archive()
           expect(instance.archiveClosure.problems).toEqual([])
-          expect(() => instance.requireArchive()).not.toThrow()
+          await expect(instance.requireArchive(NEVER)).resolves.toBeUndefined()
           const control = rows.find((row) => row.event === 'bounce-control' && row.kind === kind)
           expect(control.encoding).toBeUndefined()
           const name = kind === 'stop' ? 'down' : 'start'
@@ -8299,7 +8464,7 @@ describe('share bounce acquisition and settlement sensitivity', () => {
         createHash('sha256').update(String(index)).digest('hex')
       ).join('')
       instance.archive()
-      expect(() => instance.requireArchive()).not.toThrow()
+      await expect(instance.requireArchive(NEVER)).resolves.toBeUndefined()
       const manifest = rows.find(({ event }) => event === 'frozen-bounce')
       expect(manifest.chunkCount).toBeGreaterThan(2)
       const first = rows.findIndex(
@@ -8422,7 +8587,7 @@ describe('share bounce acquisition and settlement sensitivity', () => {
     await heartbeat
   })
 
-  it('audits 30000 records with Metadata and count resets through drain, terminal and archive work', async () => {
+  it('audits 30000 records with Metadata and count resets through drain, terminal, archive and completion work', async () => {
     const proof = terminalBudgetFixture()
     const replay = replayFixture({ sameLeader: true })
     replay.next.acquisition.acquiredRecords[0].lastOffset = '99'
@@ -8534,6 +8699,7 @@ describe('share bounce acquisition and settlement sensitivity', () => {
     ).toBe(true)
     expect(terminal.settlement.successful).toEqual(candidates.successful)
     const { instance, rows } = archiveFixture()
+    readyCompletion(instance)
     const socketEvents = proof.evidence.owner.tap.socketEvents
     Object.assign(instance, {
       entries: proof.entries,
@@ -8543,6 +8709,16 @@ describe('share bounce acquisition and settlement sensitivity', () => {
       replay: terminal.replay,
       settlement: terminal.settlement,
       lifecycle: proof.evidence.owner.lifecycle,
+      deadline: started + FINAL_MS,
+      rawIdentities: proof.raw,
+      handled: tally(proof.entries.map(({ identity }) => identity)),
+      expectedHandled: tally([
+        ...proof.corpus,
+        ...terminal.replay.extras.map(({ identity }) => identity),
+      ]),
+      beforeTerminal: proof.before,
+      afterTerminal: proof.after,
+      quiet: proof.quiet,
     })
     instance.evidence.owner = instance
     instance.tap.socketEvents = socketEvents
@@ -8554,10 +8730,24 @@ describe('share bounce acquisition and settlement sensitivity', () => {
       ).values(),
     ]
     for (const frame of instance.tap.allFrames) frame.bytes = 'original-request'
+    let validationRuns = 0
+    let validationTurns = 0
+    const read = instance.requireArchiveWork.bind(instance)
+    instance.requireArchiveWork = function* (...args) {
+      validationRuns++
+      const before = turns
+      const result = yield* measured(read(...args))
+      validationTurns += turns - before
+      return result
+    }
     await cooperativeAudit(measured(instance.archiveWork()), NEVER)
     expect(instance.archiveClosure.problems).toEqual([])
+    expect(instance.captureProblems).toEqual([])
     expect(instance.archiveIncomplete).not.toBe(true)
-    expect(() => instance.requireArchive()).not.toThrow()
+    await instance.complete(NEVER)
+    expect(validationRuns).toBe(1)
+    expect(validationTurns).toBeGreaterThan(RECORDS / 100)
+    expect(rows.filter(({ event }) => event === 'case-complete')).toHaveLength(1)
     expect(rows.some(({ event }) => event === 'witness-closure-end')).toBe(true)
     expect(turns).toBeGreaterThan(RECORDS / 100)
     expect(maxStepMs).toBeLessThan(1000)
@@ -9290,13 +9480,33 @@ describe('share bounce acquisition and settlement sensitivity', () => {
       const exchange = fixture.evidence.exchanges.at(-1)
       if (field === 'cause') exchange.cause++
       else if (field === 'correlation') exchange.frames[0].socket++
-      else if (field === 'ticket') delete exchange.tickets[0].ticket
       else exchange.tickets[0][field]++
-      captureFreezes(fixture)
-      expect(freezeProblems(fixture.entries, fixture.bounces, fixture.evidence)).toEqual([])
-      expect(auditTerminal(proof).problems).toEqual([`Unsettled ${proof.corpus[0]}`])
+      if (field === 'ticket') {
+        const problem = 'bounce 0 interruption snapshot disagrees with the journal'
+        expect(exchange.tickets[0].ticket).toBeDefined()
+        expect(freezeProblems(fixture.entries, fixture.bounces, fixture.evidence)).toEqual([
+          problem,
+        ])
+        expect(auditTerminal(proof).problems).toEqual([problem, problem])
+      } else {
+        captureFreezes(fixture)
+        expect(freezeProblems(fixture.entries, fixture.bounces, fixture.evidence)).toEqual([])
+        expect(auditTerminal(proof).problems).toEqual([`Unsettled ${proof.corpus[0]}`])
+      }
     }
   )
+
+  it('rejects late Accept evidence with a missing ticket link', () => {
+    const fixture = replayFixture({ count: 2 })
+    const proof = lostAcceptFixture(fixture)
+    fixture.bounces[0].at = 3
+    captureFreezes(fixture)
+    expect(auditTerminal(proof).problems).toEqual([])
+    delete fixture.evidence.exchanges.at(-1).tickets[0].ticket
+    captureFreezes(fixture)
+    expect(freezeProblems(fixture.entries, fixture.bounces, fixture.evidence)).toEqual([])
+    expect(auditTerminal(proof).problems).toEqual([`Unsettled ${proof.corpus[0]}`])
+  })
 
   it('uses an original exchange failure when no earlier relevant socket loss was observed', () => {
     const fixture = replayFixture({ count: 2 })
