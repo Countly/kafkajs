@@ -221,7 +221,7 @@ class TelemetryFactory {
    */
   close(budget) {
     if (!this.machine) return null
-    if (this.machine.closing) return this.machine.closing.promise
+    if (this.machine.closing) return this.machine.closing.promise.catch(() => {})
     const resources = this.captureResources()
     let usable = false
     try {

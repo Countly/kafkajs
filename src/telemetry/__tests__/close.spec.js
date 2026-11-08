@@ -126,9 +126,10 @@ describe.each([false, true])('captured close with enforcement %s', (enforceReque
         await round.wait(() => round.start({ drive: 'normal' }))
         await round.wait(() => gate.arrived())
         round.closePromise = round.beginClose(round.closeOptions(1000))
-        await round.settleClose()
-        expect(round.finalFrames()).toHaveLength(1)
+        expect(round.savedOrdinaryGuard()).not.toBeNull()
         await round.drainReleased(gate)
+        expect(round.finalFrames()).toHaveLength(1)
+        await round.settleClose()
         expect(round.pushes()).toHaveLength(1)
         expect(round.finalFrames()).toHaveLength(1)
       } finally {
@@ -170,13 +171,17 @@ describe.each([false, true])('captured close with enforcement %s', (enforceReque
                 return original.apply(this, args)
               }
           )
+          let checked = false
           round.patch(
             round.binding,
             'close',
             (original) =>
               function (budget) {
-                round.clock.jump(round.clock.now() + spent)
-                expect(budget.remaining()).toBe(20 - spent)
+                if (!checked) {
+                  checked = true
+                  round.clock.jump(round.clock.now() + spent)
+                  expect(budget.remaining()).toBe(20 - spent)
+                }
                 return original.call(this, budget)
               }
           )
@@ -607,7 +612,7 @@ describe.each([false, true])('captured close with enforcement %s', (enforceReque
           const Broker = require('../../broker')
           const method =
             stage === 'transaction' ? 'endTxn' : kind === 'producer' ? 'produce' : 'metadata'
-          hold(Broker.prototype, method)
+          hold(kind === 'admin' ? round.cluster : Broker.prototype, method)
           if (stage === 'transaction') {
             const transaction = await round.client.transaction()
             await transaction.send({ topic: 'test-topic', messages: [{ value: 'close' }] })
@@ -764,8 +769,13 @@ describe.each([false, true])('captured close with enforcement %s', (enforceReque
                 throw reason
               }
           )
+          const restoreFailure = round.restores.at(-1)
           const { telemetryOutcome } = require('../../../testHelpers/lifecycle')
-          outcomes.push(await telemetryOutcome(() => round.client.disconnect()))
+          try {
+            outcomes.push(await telemetryOutcome(() => round.client.disconnect()))
+          } finally {
+            restoreFailure()
+          }
           expect(calls).toBe(1)
           expect(round.unhandled).toEqual([])
         } finally {

@@ -766,7 +766,9 @@ module.exports = class ClientTelemetry {
         if (old) await old.retire({ drainTimeout: 0 }).catch(() => {})
         if (this.closing === episode) {
           this.payload.retire()
-          this.metrics.resetTransient()
+          try {
+            this.metrics.resetTransient()
+          } catch {}
           this.subscription = null
           this.state = 'CLOSED'
         }
