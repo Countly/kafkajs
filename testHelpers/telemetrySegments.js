@@ -455,10 +455,12 @@ class TelemetrySegments {
    * together. Calling it again after success only returns the sealed summaries.
    * @param {object} client public client
    * @param {object} [closeOptions] public disconnect arguments
+   * @param {object} [options] primary scenario failure for incomplete-schedule diagnostics
+   * @param {Error} [options.cause] failure that prevented the remaining lifecycles from opening
    * @returns {Promise<object[]>} sealed summaries of all segments, in lifecycle order
    * @throws {Error|AggregateError} every failure, after all releases were attempted
    */
-  async finish(client, closeOptions) {
+  async finish(client, closeOptions, { cause } = {}) {
     const errors = []
     const attempt = async (work) => {
       try {
@@ -474,7 +476,13 @@ class TelemetrySegments {
     for (const segment of this.undischarged())
       await attempt(() => this.discharge(segment, { force: errors.length > 0 }))
     if (!errors.length && this.#segments.length !== this.#planned)
-      errors.push(new Error(`Expected ${this.#planned} segments, found ${this.#segments.length}`))
+      errors.push(
+        new Error(
+          `Expected ${this.#planned} segments, found ${this.#segments.length}` +
+            (cause ? ` after scenario failure: ${cause.message}` : ''),
+          { cause }
+        )
+      )
     if (errors.length === 1) throw errors[0]
     if (errors.length) throw new AggregateError(errors, 'Segment cleanup failed')
     return this.#segments.map((segment) => segment.pack)
