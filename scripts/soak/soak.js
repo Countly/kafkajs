@@ -58,15 +58,7 @@
 const STARTUP = (() => {
   if (process.env.TELEMETRY_WORKER_KIND === undefined) return null
   const usage = process.memoryUsage()
-  let hwm = null
-  try {
-    const found = /^VmHWM:\s+(\d+)\s+kB$/m.exec(
-      require('node:fs').readFileSync('/proc/self/status', 'utf8')
-    )
-    hwm = found ? Number(found[1]) * 1024 : null
-  } catch {
-    hwm = null
-  }
+  const hwm = require('../../testHelpers/processMemory').readProcStatus()?.vmhwm ?? null
   return {
     phase: 'startup',
     at: performance.now(),

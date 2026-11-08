@@ -20,6 +20,7 @@ const { fork } = require('node:child_process')
 const { createChaosSocketFactory, FrameFilter } = require('../../testHelpers/chaosSocket')
 const { DecoderGate, TelemetryWireObserver } = require('../../testHelpers/telemetryFixtures')
 const { TelemetrySegments } = require('../../testHelpers/telemetrySegments')
+const { readProcStatus } = require('../../testHelpers/processMemory')
 const {
   ShareTrace,
   confirmedDecisions,
@@ -149,14 +150,7 @@ const within = async (work, ms, label) => {
  * Reads the kernel's lifetime peak resident size of this executable image.
  * @returns {number|null} bytes, or null where the source does not exist or cannot be parsed
  */
-const readHighWater = () => {
-  try {
-    const found = /^VmHWM:\s+(\d+)\s+kB$/m.exec(fs.readFileSync('/proc/self/status', 'utf8'))
-    return found ? Number(found[1]) * 1024 : null
-  } catch {
-    return null
-  }
-}
+const readHighWater = () => readProcStatus()?.vmhwm ?? null
 
 /**
  * One unsettled memory reading: current and peak sizes in bytes, never rebased or clamped.
