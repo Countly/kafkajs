@@ -1823,6 +1823,42 @@ describe('resource artifact validation', () => {
       expect(result.verdict).toBe('fail')
       expect(result.problems).toContain(problem)
     })
+
+    test('fails a descriptor a production client swapped for one of the same size', () => {
+      const {
+        DESCRIPTORS,
+        MemoryForeground,
+        descriptor,
+      } = require('../../src/telemetry/__tests__/fixtures/memoryForeground')
+      const foreground = new MemoryForeground('producer', { enabled: true }).build()
+      try {
+        for (let index = 0; index < DESCRIPTORS; index++) foreground.register(descriptor(index))
+        const kept = foreground.fingerprint(UUID)
+        expect(kept).toEqual(retainedRegistry())
+        expect(judged('public', (r) => (r.closed.registry = kept))).toEqual({
+          verdict: 'pass',
+          problems: [],
+        })
+
+        const original = descriptor(5)
+        const substitute = { ...original, name: `y${original.name.slice(1)}` }
+        expect(registryEntry(substitute).charge).toBe(registryEntry(original).charge)
+        foreground.client.unregisterMetricFromSubscription({
+          name: original.name,
+          attributes: original.attributes,
+        })
+        foreground.client.registerMetricForSubscription(substitute)
+        const swapped = foreground.fingerprint(UUID)
+        expect(swapped).toMatchObject({ descriptors: DESCRIPTORS - 1, overflow: 'limit' })
+        const result = judged('public', (r) => (r.closed.registry = swapped))
+        expect(result.verdict).toBe('fail')
+        expect(result.problems).toContain(
+          'retained registry fingerprint differs from successful public registrations'
+        )
+      } finally {
+        foreground.release()
+      }
+    })
   })
 
   describe('the collector facts', () => {

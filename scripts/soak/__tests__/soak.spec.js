@@ -7246,6 +7246,19 @@ describe('telemetry resident-size reference', () => {
     ],
     ['a missing native journal', (r) => delete r.reference.native, 'native work journal'],
     [
+      'an empty native journal',
+      (r) => {
+        r.reference.native.journal.rows = []
+        r.reference.native.journal.maxLive = 0
+      },
+      'native work journal',
+    ],
+    [
+      'a native journal with only rejected work',
+      (r) => (r.reference.native.journal.rows[0].outcome = 'rejected'),
+      'native work journal',
+    ],
+    [
       'an external spike only the native sampler saw',
       (r) => (r.reference.native.sampler.peak.external = 4 * MIB + 64 * MIB + 1),
       'external-memory increase',

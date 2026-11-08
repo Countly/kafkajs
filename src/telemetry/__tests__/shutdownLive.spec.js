@@ -8,6 +8,7 @@ const { performance } = require('perf_hooks')
 const { spawn } = require('child_process')
 const { Kafka, logLevel } = require('../../../index')
 const {
+  SHUTDOWN_SEAMS: STRICT_SEAMS,
   episodeLogs,
   joinChunks,
   runCase,
@@ -39,7 +40,6 @@ const MANIFEST_FILE = path.join(ROOT, 'scripts/e2e/telemetry/fixtures/manifest.j
 const PORTS = [19092, 19095, 19098]
 const LISTENER = { 19092: '9092', 19095: '9095', 19098: '9098' }
 const KINDS = ['producer', 'consumer', 'admin', 'share']
-const SUPPORTED_TIMEOUT0 = ['producer', 'consumer', 'share']
 const LOGGER = 'org.apache.kafka.server.ClientMetricsManager'
 const PROPERTIES =
   'enable.metrics.push=false\nrequest.timeout.ms=3000\ndefault.api.timeout.ms=5000\n'
@@ -48,6 +48,8 @@ const ROUNDS = 20
 const DECODERS = 4
 const FINAL_CAP_MS = 1000
 const SCHEDULING_MS = 100
+/** The admin blackhole arm's close budget, below the final cap so the remaining budget binds. */
+const BLACKHOLE_TIMEOUT_MS = 800
 const QUIET_MS = 1000
 const clock = { now: () => performance.now() }
 
@@ -516,11 +518,10 @@ class ReopenCase {
   }
 
   /**
-   * @param {string} kind producer, consumer, admin or share
-   * @returns {object|undefined} the inherited close arguments of that kind; admin has none
+   * @returns {{timeout:number}} the inherited 3000 ms close every kind takes, admin included
    */
-  closeOptions(kind) {
-    return kind === 'admin' ? undefined : { timeout: 3000 }
+  closeOptions() {
+    return { timeout: 3000 }
   }
 
   /**
@@ -680,7 +681,7 @@ class ReopenCase {
     for (let round = 1; round <= ROUNDS; round++) {
       await this.drained(member)
       const observedAt = clock.now()
-      const cycle = segments.cycle(client, this.closeOptions(kind))
+      const cycle = segments.cycle(client, this.closeOptions())
       await this.within(8000, `The ${kind} close`, () => cycle.closed)
       this.drain(member, cycle.from)
       await this.within(10000, `The ${kind} reconnect`, () => cycle.reopened)
@@ -744,8 +745,8 @@ class ReopenCase {
   }
 
   /**
-   * A zero-timeout close of a supported kind sends no final.
-   * @param {object} member the observed client of a supported kind
+   * A zero-timeout close sends no final; every kind, admin included, takes a zero timeout.
+   * @param {object} member the observed client
    * @returns {Promise<void>} after the close and its evidence checks
    */
   async timeoutZero(member) {
@@ -759,9 +760,9 @@ class ReopenCase {
 
   /**
    * The captured telemetry socket of an admin is blackholed while foreground metadata work runs
-   * beside the close: that work succeeds with its original result, and the telemetry cleanup closes
-   * within its own cap plus the scheduling allowance. The admin close has no finite budget, so the
-   * cap is the inherited final cap.
+   * beside a close with a finite budget below the final cap: that work succeeds with its original
+   * result, and the telemetry cleanup closes within `min(1000, T) + 100` ms of the close, where T
+   * is the close's remaining budget.
    * @returns {Promise<void>} after the blackholed close and its evidence checks
    */
   async blackhole() {
@@ -783,7 +784,7 @@ class ReopenCase {
     let closing
     try {
       core = client.describeCluster(options)
-      closing = member.segments.close(client)
+      closing = member.segments.close(client, { timeout: BLACKHOLE_TIMEOUT_MS })
     } finally {
       client.describeCluster = original
     }
@@ -794,11 +795,14 @@ class ReopenCase {
     await this.find('the blackholed telemetry socket close', 3000, () => captured.closed)
     const telemetryCleanupMs = captured.closedAt - started
     expect(cluster.brokers.map((b) => b.port).sort()).toEqual(PORTS)
-    expect(telemetryCleanupMs).toBeLessThanOrEqual(FINAL_CAP_MS + SCHEDULING_MS)
+    expect(telemetryCleanupMs).toBeLessThanOrEqual(
+      Math.min(FINAL_CAP_MS, BLACKHOLE_TIMEOUT_MS) + SCHEDULING_MS
+    )
     this.results.blackhole = {
       uuid: before.uuid,
       faultedSocket: before.ordinal,
       coreCloseMs,
+      remainingT: BLACKHOLE_TIMEOUT_MS,
       telemetryCleanupMs,
       core: {
         sameResult:
@@ -817,7 +821,7 @@ class ReopenCase {
    */
   async finishAll() {
     const outcomes = await Promise.allSettled(
-      this.members.map((m) => m.segments.finish(m.client, this.closeOptions(m.kind)))
+      this.members.map((m) => m.segments.finish(m.client, this.closeOptions()))
     )
     const errors = outcomes.filter((r) => r.status === 'rejected').map((r) => r.reason)
     if (errors.length === 1) throw errors[0]
@@ -934,7 +938,7 @@ class ReopenCase {
     await withTelemetryResource(aux, { name: this.stem, entries }, async () => {
       windows.open()
       const ordinary = KINDS.map((kind) => this.build(kind, 'ep'))
-      const zero = SUPPORTED_TIMEOUT0.map((kind) => this.build(kind, 't0'))
+      const zero = KINDS.map((kind) => this.build(kind, 't0'))
       this.defer(() => this.finishAll())
       try {
         await Promise.all([
@@ -948,7 +952,19 @@ class ReopenCase {
       await this.blackhole()
       await this.finishAll()
     })
+    this.results.seams = this.seamLinks()
     this.results.workMs = clock.now() - runStart
+  }
+
+  /**
+   * Links each strict seam to the unit title that holds it, so a deleted title fails here.
+   * @returns {{file:string,title:string,lane:string}[]} labelled links, never live responses
+   */
+  seamLinks() {
+    return STRICT_SEAMS.map(([file, title]) => {
+      expect(fs.readFileSync(path.join(ROOT, file), 'utf8')).toContain(title)
+      return { file, title, lane: 'strict seam, unit lane' }
+    })
   }
 
   /** @returns {void} hands the case record to the shared persistence and verification */
@@ -1122,9 +1138,12 @@ live(
           { label: 'The telemetry churn' }
         )
       } catch (error) {
-        if (!parent?.lastResult) throw error
+        // Without a verdict (the bound expired first) the received progress rows, sealed segment
+        // receipts and exits are still attached, and the run is stopped.
+        if (!parent) throw error
+        parent.fail(error)
         try {
-          attach(parent.lastResult)
+          attach(parent.evidence())
         } catch (attachError) {
           throw new AggregateError([error, attachError], 'The failed churn could not be attached')
         }

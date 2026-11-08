@@ -14,6 +14,7 @@
 const crypto = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
+const path = require('node:path')
 const zlib = require('node:zlib')
 // eslint-disable-next-line n/no-unsupported-features/node-builtins -- development driver; only the resource lifetime hooks are used
 const { AsyncLocalStorage, createHook } = require('node:async_hooks')
@@ -21,6 +22,7 @@ const { fork } = require('node:child_process')
 const { createChaosSocketFactory, FrameFilter } = require('../../testHelpers/chaosSocket')
 const {
   DecoderGate,
+  DecoderMemory,
   TelemetryWireObserver,
   readExports,
 } = require('../../testHelpers/telemetryFixtures')
@@ -58,6 +60,13 @@ const DESCRIPTORS = 128
 const CORPUS = Object.freeze({ records: 10000, batch: 100, batchMs: 3000, bytes: 200 })
 const SETUP_MS = 48000
 const NATURAL_EXIT_MS = 10000
+/** How long a killed worker's close and drained pipes are awaited before its row is final. */
+const KILL_JOIN_MS = 5000
+/**
+ * The part of the 120 s cleanup kept back from the wait for worker results: joining or killing the
+ * workers (10 s + 5 s), the parent's terminal decodes (4 x 8 s) and its own releases.
+ */
+const RESULT_RESERVE_MS = 45000
 const STAGE_MS = Object.freeze({ lifecycle: 12000, retire: 8000, confirm: 10000 })
 const DECODER_SLOTS = 4
 const DECODE_BUDGET_MS = 6000
@@ -72,6 +81,7 @@ const CUSTOM_PREFIX = SUBSCRIPTIONS[0]
 const PUSH_INTERVAL_MS = 1000
 const TICK_PROOF_MS = 5000
 const MIB = 1048576
+const ROOT = path.resolve(__dirname, '../..')
 /** Native compression rows one worker journals: one per Push of a 360 s run at 1 s, with room. */
 const NATIVE_ROWS = 1024
 const CONTROL = Object.freeze({
@@ -143,6 +153,17 @@ const valueOf = (id) => Buffer.from(id.padEnd(CORPUS.bytes, '.'))
  * @param {Buffer|string} bytes data @returns {string} lower-case SHA-256 hex
  */
 const sha = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex')
+
+/**
+ * The driver source a run is bound to: this module and the forked driver, each by its
+ * repository-relative path and digest, so a verifier at the run's tree can join both.
+ * @param {string} driver absolute path of the driver the workers are forked from
+ * @returns {{churn:{file:string, sha256:string}, driver:{file:string, sha256:string}}} the stamp
+ */
+const sourceStamp = (driver) => ({
+  churn: { file: path.relative(ROOT, __filename), sha256: sha(fs.readFileSync(__filename)) },
+  driver: { file: path.relative(ROOT, driver), sha256: sha(fs.readFileSync(driver)) },
+})
 
 /**
  * @param {number} type the Push compression type: 0 none, 1 GZIP, 4 ZSTD
@@ -615,6 +636,36 @@ class TelemetryProofs {
           r.response.responseAt <= push.writeAt
       )
       .at(-1)
+  }
+
+  /**
+   * @param {object[]} records one segment's transcript records @param {number} at monotonic time
+   * @returns {object|undefined} the Get whose selection is in force then: the last successful Get
+   *   answered at or before that time
+   */
+  static inForce(records, at) {
+    return records
+      .filter(
+        (r) =>
+          r.type === 'request' &&
+          r.apiKey === 71 &&
+          r.response?.errorCode === 0 &&
+          r.response.responseAt <= at
+      )
+      .at(-1)
+  }
+
+  /**
+   * @param {{records:object[], closures:object[]}} transcript one segment's transcript
+   * @returns {boolean} whether its one public close owes a final: the selection in force when the
+   *   close began is nonempty
+   */
+  static owesFinal({ records, closures }) {
+    const [closure] = closures ?? []
+    if (!closure) return false
+    return (
+      (TelemetryProofs.inForce(records, closure.at)?.response.requestedMetrics?.length ?? 0) > 0
+    )
   }
 
   /**
@@ -1812,11 +1863,13 @@ class DecoderCoordinator {
 
   /**
    * Decodes the actual terminal final from a closed worker's immutable capture. The worker's
-   * receipt-to-exit interval has already ended; this work belongs to parent cleanup and memory.
+   * receipt-to-exit interval has already ended; this work belongs to parent cleanup and memory. A
+   * close under a nonempty selection must hold exactly one accepted final to decode.
    * @param {string} directory scenario directory @param {string} kind worker kind
    * @param {object} pack terminal segment receipt, updated after the proof is persisted
    * @returns {Promise<void>} after bounded independent decode, sink join and bundle validation
-   * @throws {Error} for missing bytes, decoder/sink mismatch or a bundle bound violation
+   * @throws {Error} for a missing owed final, missing bytes, decoder/sink mismatch or a bundle
+   *   bound violation
    */
   async terminal(directory, kind, pack) {
     const prefix = `${directory}/segments/`
@@ -1834,6 +1887,8 @@ class DecoderCoordinator {
         r.response?.errorCode === 0 &&
         r.metricsBytes > 0
     )
+    if (TelemetryProofs.owesFinal(parsed) && finals.length !== 1)
+      throw new Error(`The terminal segment ${pack.id} owes one accepted final`)
     const keys = new Set(finals.map((r) => r.requestKey))
     const checked = checkSegmentFiles({
       id: pack.id,
@@ -1916,7 +1971,8 @@ class DecoderCoordinator {
   }
 
   /**
-   * Joins the decoder children and reduces their receipts. Calling it again returns the first result.
+   * Joins the decoder children and reduces their receipts, each with the child's separately
+   * reported memory. Calling it again returns the first result.
    * @returns {Promise<{receipts:object[], calls:object[]}>} one compact receipt per decoder child
    * @throws {Error} when the observer is not clean
    */
@@ -1941,6 +1997,7 @@ class DecoderCoordinator {
             identity: identity ? JSON.parse(identity) : null,
             bodySha256: body ? sha(JSON.stringify(JSON.parse(body))) : null,
             stderrBytes: Buffer.byteLength(receipt.stderr ?? ''),
+            memory: receipt.memory ?? DecoderMemory.unavailable('not recorded by the observer'),
           }
         })
         .sort((a, b) => a.pid - b.pid)
@@ -2008,6 +2065,7 @@ class TelemetryProcesses {
       exit: null,
       error: null,
       aborted: false,
+      killed: false,
       waiters: [],
     }
     const capture = (name) => (chunk) => {
@@ -2130,24 +2188,16 @@ class TelemetryProcesses {
   }
 
   /**
-   * Waits for the natural close of one worker and reports the facts the acceptance needs, all of
-   * them raw so a replay recomputes the interval itself.
-   * @param {string} kind the worker @param {number} [ms] the bound after the receipt
-   * @returns {Promise<object>} the natural-exit row; a timeout is reported, never turned into success
+   * The exit facts of one worker, all of them raw so a replay recomputes the interval itself.
+   * @param {object} worker the supervised record
+   * @param {object|null} closed its close facts, or null when it did not close within the bound
+   * @returns {object} the exit row; a missed bound or a kill is reported, never turned into success
    */
-  async join(kind, ms = NATURAL_EXIT_MS) {
-    const worker = this.workers.get(kind)
-    const receipt = worker.receiptAt
-    const limit = receipt === null ? ms : Math.max(0, ms - (this.now() - receipt))
-    let timer
-    const timeout = new Promise((resolve) => {
-      timer = setTimeout(() => resolve(null), limit)
-    })
-    const closed = await Promise.race([worker.closed, timeout])
-    clearTimeout(timer)
+  facts(worker, closed) {
     const exit = closed ?? { event: 'timeout', code: null, signal: null }
+    const receipt = worker.receiptAt
     return {
-      kind,
+      kind: worker.kind,
       event: exit.event,
       code: exit.code,
       signal: exit.signal,
@@ -2155,8 +2205,8 @@ class TelemetryProcesses {
       stdoutBytes: Buffer.byteLength(worker.stdout),
       unhandled: worker.messages.filter((m) => m.type === 'unhandled').length,
       receipts: worker.counts.get('receipt') ?? 0,
-      watchdogExpired: closed === null,
-      killed: false,
+      watchdogExpired: closed === null || worker.killed,
+      killed: worker.killed,
       aborted: worker.aborted,
       receiptAt: receipt,
       closedAt: exit.closedAt ?? null,
@@ -2165,26 +2215,55 @@ class TelemetryProcesses {
   }
 
   /**
+   * @param {object} worker the supervised record @param {number} ms the bound from now
+   * @returns {Promise<object|null>} its close facts, or null when it did not close in time
+   */
+  async settle(worker, ms) {
+    let timer
+    const timeout = new Promise((resolve) => {
+      timer = setTimeout(() => resolve(null), ms)
+    })
+    try {
+      return await Promise.race([worker.closed, timeout])
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  /**
+   * Waits for the natural close of one worker, at most the bound after its explicit-disconnect
+   * receipt (or after the call, without a receipt).
+   * @param {string} kind the worker @param {number} [ms] the bound after the receipt
+   * @returns {Promise<object>} the natural-exit row; a timeout is reported, never turned into success
+   */
+  async join(kind, ms = NATURAL_EXIT_MS) {
+    const worker = this.workers.get(kind)
+    const receipt = worker.receiptAt
+    const limit = receipt === null ? ms : Math.max(0, ms - (this.now() - receipt))
+    return this.facts(worker, await this.settle(worker, limit))
+  }
+
+  /**
    * Asks a worker to stop admission and release its public client, then joins its process and
-   * drained pipes. Nothing is killed: a worker that misses the natural-exit bound is still awaited
-   * until it actually closes, and its row stays failed with `watchdogExpired`; containing an
-   * unresponsive process tree belongs to the CI runner's ownership authority.
-   * @param {string} kind the worker @returns {Promise<object>} the actual close facts
+   * drained pipes within the remaining natural-exit bound. A worker still alive after that bound is
+   * killed and joined for a further bounded time; its row stays failed with `killed` and
+   * `watchdogExpired`, and a worker that never closes even then is reported as a timeout, so
+   * cancellation always ends. The abort is sent only over a connected channel, and a send that
+   * still finds it closed is discarded rather than reported as the worker's failure.
+   * @param {string} kind the worker @returns {Promise<object>} the actual exit facts
    */
   async cancel(kind) {
     const worker = this.workers.get(kind)
+    if (worker.killed) return this.facts(worker, worker.exit)
     if (!worker.exit && !worker.aborted) {
       worker.aborted = true
-      try {
-        worker.child.send({ type: 'abort' })
-      } catch {
-        // a closed channel means the child is already leaving; its close is still joined below
-      }
+      if (worker.child.connected) worker.child.send({ type: 'abort' }, () => {})
     }
     const exit = await this.join(kind)
     if (exit.event === 'close') return exit
-    await worker.closed
-    return { ...(await this.join(kind)), watchdogExpired: true }
+    worker.killed = true
+    worker.child.kill('SIGKILL')
+    return this.facts(worker, await this.settle(worker, KILL_JOIN_MS))
   }
 }
 
@@ -2315,9 +2394,9 @@ class TelemetryWorker {
     this.sampler = null
   }
 
-  /** @returns {object|undefined} the close arguments of this kind; an admin has none */
+  /** @returns {{timeout: number}} the same finite close budget for every kind, admin included */
   closeOptions() {
-    return this.kind === 'admin' ? undefined : { timeout: 3000 }
+    return { timeout: 3000 }
   }
 
   /**
@@ -3012,6 +3091,8 @@ class TelemetryChurn {
    * @param {Function} options.verdict `TelemetryResourceVerdict.evaluate`
    * @param {string[]} options.brokers seed addresses @param {string} options.stem run prefix
    * @param {string} options.line broker line @param {string} options.directory absolute run directory
+   * @param {object|null} [options.source] the `sourceStamp` of the driver the workers fork from,
+   *   archived so a verifier joins every worker's own stamp to the run's tree
    */
   constructor({
     fixture,
@@ -3026,6 +3107,7 @@ class TelemetryChurn {
     stem,
     line,
     directory,
+    source = null,
   }) {
     Object.assign(this, {
       fixture,
@@ -3040,6 +3122,7 @@ class TelemetryChurn {
       stem,
       line,
       directory,
+      source,
     })
     this.closed = null
     this.failed = false
@@ -3257,8 +3340,9 @@ class TelemetryChurn {
         timeline.boundaryAt = this.clock.now()
         await corpus
         for (const kind of KINDS) this.processes.send(kind, { type: 'finish' })
+        const resultMs = cleanupBound - RESULT_RESERVE_MS
         results = await Promise.race([
-          Promise.all(KINDS.map((kind) => this.processes.message(kind, 'result', cleanupBound))),
+          Promise.all(KINDS.map((kind) => this.processes.message(kind, 'result', resultMs))),
           this.abort,
         ])
       } catch (error) {
@@ -3363,15 +3447,15 @@ class TelemetryChurn {
   }
 
   /**
-   * Joins every owned resource, all-settled: each worker's natural close (a worker that does not
-   * close naturally is killed and stays failed), the oracle readings while the parent clients are
-   * open, the independent decoder, and the parent's own clients. Nothing here starts new churn.
+   * Joins every owned resource, all-settled: every worker's natural close, all workers at once (a
+   * worker that does not close naturally is killed within a bound and stays failed), the oracle
+   * readings while the parent clients are open, the independent decoder, and the parent's own
+   * clients. Nothing here starts new churn.
    * @param {object[]} results the worker results, possibly empty after a failure
    * @returns {Promise<{exits:object, oracle:object|null, decoder:object|null, errors:Error[]}>}
    */
   async shutdown(results) {
     const errors = []
-    const exits = {}
     const attempt = async (work) => {
       try {
         return await work()
@@ -3380,15 +3464,20 @@ class TelemetryChurn {
         return null
       }
     }
-    for (const kind of KINDS) {
-      if (!this.processes.workers.has(kind)) continue
-      let exit = await attempt(() =>
-        this.failed ? this.processes.cancel(kind) : this.processes.join(kind)
-      )
-      if (exit && exit.event !== 'close')
-        exit = { ...(await attempt(() => this.processes.cancel(kind))), watchdogExpired: true }
+    const joined = await Promise.all(
+      KINDS.filter((kind) => this.processes.workers.has(kind)).map(async (kind) => {
+        const exit = await attempt(() =>
+          this.failed ? this.processes.cancel(kind) : this.processes.join(kind)
+        )
+        if (!exit || exit.event === 'close') return [kind, exit]
+        const cancelled = await attempt(() => this.processes.cancel(kind))
+        return [kind, cancelled && { ...cancelled, watchdogExpired: true }]
+      })
+    )
+    const exits = {}
+    for (const [kind, exit] of joined) {
       if (exit) exits[kind] = exit
-      if (!exit || exit.event !== 'close' || exit.watchdogExpired)
+      if (!exit || exit.event !== 'close' || exit.watchdogExpired || exit.killed)
         errors.push(new Error(`Telemetry worker ${kind} did not close naturally`))
     }
     const parentMemory = [
@@ -3410,6 +3499,8 @@ class TelemetryChurn {
   /**
    * Compares the independent raw logs, raw committed offsets and the share acknowledgements with
    * each worker's own ledgers, and keeps every input so a replay recomputes the same conclusions.
+   * The share exchanges stay only in the share worker's archived facts; the inputs name them by
+   * their capture hash.
    * @param {object[]} results the four worker results @returns {Promise<object>} the oracle row and inputs
    */
   async oracle(results) {
@@ -3438,7 +3529,7 @@ class TelemetryChurn {
         topicId,
         group: this.fixture.group('shareConsumer'),
         handled: byKind.shareConsumer.ordinary.handled,
-        exchanges: byKind.shareConsumer.share.exchanges,
+        exchangesSha256: byKind.shareConsumer.share.exchangesSha256,
         settled: byKind.shareConsumer.share.settled,
         closures,
       },
@@ -3447,7 +3538,11 @@ class TelemetryChurn {
     const checks = {
       producer: OrdinaryOracle.check({ kind: 'producer', stem: this.stem, ...inputs.producer }),
       consumer: OrdinaryOracle.check({ kind: 'consumer', stem: this.stem, ...inputs.consumer }),
-      shareConsumer: ShareOracle.check({ stem: this.stem, ...inputs.shareConsumer }),
+      shareConsumer: ShareOracle.check({
+        stem: this.stem,
+        ...inputs.shareConsumer,
+        exchanges: byKind.shareConsumer.share.exchanges,
+      }),
     }
     const violations = Object.entries(checks).flatMap(([kind, check]) =>
       check.violations.map((v) => `${kind}: ${v}`)
@@ -3618,6 +3713,7 @@ class TelemetryChurn {
         tickStarts: this.tickStarts,
         missed: this.missed,
         handshakes: this.handshakes ?? [],
+        source: this.source,
         decoder: shutdown.decoder,
         parentMemory: shutdown.parentMemory,
         workers: Object.fromEntries(workers.map((w) => [w.kind, w.facts])),
@@ -3647,22 +3743,54 @@ class TelemetryChurn {
   }
 
   /**
-   * Idempotent safety net for what `run` already released: joins every child it started, kills no
-   * clean worker, and closes the parent's clients and decoder if a failure stopped `run` early.
+   * What the run can show at this moment, for an owner whose own bound expired before `run`
+   * returned: the judged result once it exists, otherwise a failed result built from every message
+   * the workers sent so far (progress rows, sealed segment receipts, failure facts) and every exit
+   * already observed. Nothing is awaited, released or recorded here.
+   * @returns {object} a result of the shape `run` returns, with the partial worker entries under
+   *   `archive.workers`
+   */
+  evidence() {
+    if (this.lastResult) return this.lastResult
+    const workers = KINDS.map((kind) => {
+      const worker = this.processes.workers.get(kind)
+      const exit = worker?.exit ? this.processes.facts(worker, worker.exit) : null
+      return this.partial(kind, worker?.messages ?? [], exit)
+    })
+    return {
+      ok: false,
+      violations: ['the run ended before its verdict'],
+      clientKinds: [...KINDS],
+      workers,
+      archive: {
+        stem: this.stem,
+        stages: this.stages,
+        rotations: this.rotations,
+        tickStarts: this.tickStarts,
+        missed: this.missed,
+        handshakes: this.handshakes ?? [],
+        source: this.source,
+        parentMemory: this.parentMemory ?? [],
+        workers: Object.fromEntries(workers.map((w) => [w.kind, w])),
+      },
+    }
+  }
+
+  /**
+   * Idempotent safety net for what `run` already released: cancels every child still running, all
+   * at once (one that ignores the abort is killed within a bound), and closes the parent's clients
+   * and decoder if a failure stopped `run` early.
    * @returns {Promise<void>} @throws {Error|AggregateError} every cleanup failure, first one first
    */
   close() {
     this.closed ??= (async () => {
-      const errors = []
-      for (const kind of KINDS) {
-        const worker = this.processes.workers.get(kind)
-        if (worker && !worker.exit)
-          try {
-            await this.processes.cancel(kind)
-          } catch (error) {
-            errors.push(error)
-          }
-      }
+      const cancelled = await Promise.allSettled(
+        KINDS.filter((kind) => {
+          const worker = this.processes.workers.get(kind)
+          return worker && !worker.exit
+        }).map((kind) => this.processes.cancel(kind))
+      )
+      const errors = cancelled.filter((r) => r.status === 'rejected').map((r) => r.reason)
       for (const work of [() => this.decoder.close(), () => this.fixture.close()])
         try {
           await work()
@@ -3790,7 +3918,7 @@ class TelemetryWorkerProcess {
 
   /**
    * The stamps a parent binds this worker to: its clock origin, process, Node build and flags, the
-   * loaded module count, codec capability and the source of this driver.
+   * loaded module count, codec capability and the path and digest of this module and its driver.
    * @returns {object} plain data sent with `hello`
    */
   stamps() {
@@ -3804,10 +3932,7 @@ class TelemetryWorkerProcess {
       execArgv: process.execArgv,
       modules: Object.keys(require.cache).length,
       codecs: { gzip: true, zstd: zstdCodec.isSupported === true },
-      source: {
-        churn: sha(fs.readFileSync(__filename)),
-        driver: sha(fs.readFileSync(require.main?.filename ?? __filename)),
-      },
+      source: sourceStamp(require.main?.filename ?? __filename),
     }
   }
 
@@ -4039,6 +4164,7 @@ module.exports = {
   CONTROL,
   SETUP_MS,
   NATURAL_EXIT_MS,
+  KILL_JOIN_MS,
   WORKER_ENV,
   WORKER_TOKEN,
   SUBSCRIPTIONS,
@@ -4073,6 +4199,7 @@ module.exports = {
   readMemory,
   recordId,
   settledReading,
+  sourceStamp,
   valueOf,
   wait,
   within,

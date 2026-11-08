@@ -1269,11 +1269,8 @@ class PublicTelemetryRound {
           this.codecType === 4 ? require('../src/protocol/message/compression/zstd') : gzip
         this.patch(codec, 'compress', (original) => async (...args) => {
           const selected = round.armed && closing() === (mode === 'final')
-          const job = {
-            raw: Buffer.from(args[0].buffer),
-            promise: original(...args),
-            settled: false,
-          }
+          // The payload's own input, never a copy, so a held input's identity is production's.
+          const job = { input: args[0].buffer, promise: original(...args), settled: false }
           // Observe rejection immediately, while retaining the actual native result.
           const outcome = job.promise.then(
             (value) => ({ value }),
@@ -1285,7 +1282,7 @@ class PublicTelemetryRound {
           }
           const result = await outcome
           job.settled = true
-          if (round.bounded) job.raw = null
+          if (round.bounded) job.input = null
           if ('error' in result) throw result.error
           return result.value
         })

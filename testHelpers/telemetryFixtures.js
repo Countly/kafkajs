@@ -1030,9 +1030,13 @@ class TelemetryWireObserver {
         stdio: ['ignore', 'pipe', 'pipe'],
       }
     )
+    const memory = new DecoderMemory(child.pid)
     const entry = { pid: child.pid, done: collect(child) }
     this.#children.add(entry)
-    const result = await entry.done.finally(() => this.#children.delete(entry))
+    const result = await entry.done.finally(() => {
+      memory.stop()
+      this.#children.delete(entry)
+    })
     fs.writeFileSync(
       path.join(this.directory, `decoder-${child.pid}.json`),
       JSON.stringify({
@@ -1040,6 +1044,7 @@ class TelemetryWireObserver {
         error: result.error?.message,
         rawSha256: sha256(raw),
         line: this.#line,
+        memory: memory.facts(),
       }),
       { flag: 'wx', mode: 0o600 }
     )
@@ -1587,6 +1592,155 @@ const collect = (child) =>
   })
 
 /**
+ * @param {number} pid a process
+ * @returns {{name:string, hwm:number, rss:number}|null} its name and kernel high-water and current
+ *   resident bytes from `/proc/<pid>/status`, or null when unreadable or without either field
+ */
+const readPidStatus = (pid) => {
+  try {
+    const text = fs.readFileSync(`/proc/${pid}/status`, 'utf8')
+    const kib = (field) => {
+      const match = new RegExp(`^${field}:\\s+(\\d+) kB$`, 'm').exec(text)
+      return match ? Number(match[1]) * 1024 : null
+    }
+    const hwm = kib('VmHWM')
+    const rss = kib('VmRSS')
+    if (hwm === null || rss === null) return null
+    return { name: /^Name:\s+(.*)$/m.exec(text)?.[1] ?? '', hwm, rss }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * @param {number} pid a process
+ * @returns {number[]|null} its children from `/proc/<pid>/task/<pid>/children`, or null when the
+ *   kernel offers no such list for it
+ */
+const readPidChildren = (pid) => {
+  try {
+    return fs
+      .readFileSync(`/proc/${pid}/task/${pid}/children`, 'utf8')
+      .split(/\s+/)
+      .filter(Boolean)
+      .map(Number)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * The separately reported memory of one decoder child, kept out of the measured worker. While the
+ * child runs it samples `VmHWM` and `VmRSS` of the supervisor and every descendant (the Java
+ * decoder among them) every 20 ms, and reports the largest single-process high water, the largest
+ * summed resident size of one sample and the few largest processes. Where the kernel offers no
+ * status or child list the fact says `unavailable` instead of claiming a measurement. It is a
+ * report, never a gate or a subtraction.
+ */
+class DecoderMemory {
+  /** The labels every fact carries. */
+  static LABEL = Object.freeze({ source: 'proc-pid-status', units: 'bytes' })
+  /** The most processes described one by one, the largest high waters kept. */
+  static PROCESSES = 8
+
+  #timer = null
+  #processes = new Map()
+  #samples = 0
+  #peakRss = 0
+  #peakHwm = 0
+  #walked = false
+
+  /**
+   * Starts sampling at once; `stop` ends it.
+   * @param {number|undefined} pid the decoder supervisor, which leads its process group
+   * @param {object} [options] seams for controls
+   * @param {function(number):object|null} [options.read] reads one process status
+   * @param {function(number):number[]|null} [options.children] lists one process's children
+   * @param {number} [options.intervalMs] sampling period
+   */
+  constructor(pid, { read = readPidStatus, children = readPidChildren, intervalMs = 20 } = {}) {
+    Object.assign(this, { pid, read, children, intervalMs })
+    if (!Number.isInteger(pid)) return
+    this.sample()
+    this.#timer = setInterval(() => this.sample(), intervalMs)
+    this.#timer.unref?.()
+  }
+
+  /**
+   * @param {string} reason why nothing could be read
+   * @returns {object} the explicit fact of a decoder child whose memory could not be read
+   */
+  static unavailable(reason) {
+    return {
+      ...DecoderMemory.LABEL,
+      capability: 'unavailable',
+      reason,
+      intervalMs: null,
+      samples: 0,
+      peakHwmBytes: null,
+      peakRssBytes: null,
+      processes: [],
+    }
+  }
+
+  /** @returns {void} reads every process of the tree once, at most 64 of them */
+  sample() {
+    const queue = [this.pid]
+    let rss = 0
+    let seen = false
+    for (let visited = 0; queue.length && visited < 64; visited++) {
+      const pid = queue.shift()
+      const kids = this.children(pid)
+      if (kids) {
+        if (pid === this.pid) this.#walked = true
+        queue.push(...kids)
+      }
+      const status = this.read(pid)
+      if (!status) continue
+      seen = true
+      rss += status.rss
+      this.#peakHwm = Math.max(this.#peakHwm, status.hwm)
+      const known = this.#processes.get(pid) ?? { pid, name: status.name, hwmBytes: 0, rssBytes: 0 }
+      known.hwmBytes = Math.max(known.hwmBytes, status.hwm)
+      known.rssBytes = Math.max(known.rssBytes, status.rss)
+      this.#processes.set(pid, known)
+      if (this.#processes.size > DecoderMemory.PROCESSES) {
+        const smallest = [...this.#processes.values()].reduce((a, b) =>
+          b.hwmBytes < a.hwmBytes ? b : a
+        )
+        this.#processes.delete(smallest.pid)
+      }
+    }
+    if (!seen) return
+    this.#samples++
+    this.#peakRss = Math.max(this.#peakRss, rss)
+  }
+
+  /** @returns {void} ends sampling; idempotent */
+  stop() {
+    clearInterval(this.#timer)
+    this.#timer = null
+  }
+
+  /** @returns {object} the labelled peak fact, or the explicit `unavailable` one */
+  facts() {
+    if (!this.#samples) return DecoderMemory.unavailable('no process status could be read')
+    if (!this.#walked) return DecoderMemory.unavailable('the process tree could not be listed')
+    return {
+      ...DecoderMemory.LABEL,
+      capability: 'available',
+      intervalMs: this.intervalMs,
+      samples: this.#samples,
+      peakHwmBytes: this.#peakHwm,
+      peakRssBytes: this.#peakRss,
+      processes: [...this.#processes.values()]
+        .sort((a, b) => b.hwmBytes - a.hwmBytes)
+        .map((p) => ({ ...p })),
+    }
+  }
+}
+
+/**
  * Audits every built-in descriptor and node window against independently joined normal requests.
  * Bootstrap requests stay in the ledger but cannot introduce a node. Each observed known-node
  * completion must occur in exactly one compatible, ordered Push window; idle windows have no gauge.
@@ -1707,6 +1861,7 @@ const verifyMetricWindows = ({ kind, samples, requests, connects, delta }) => {
 module.exports = {
   canonicalUuid,
   DecoderGate,
+  DecoderMemory,
   OBSERVER_LIMITS: DEFAULT_LIMITS,
   verifyMetricWindows,
   TelemetryExportReader,

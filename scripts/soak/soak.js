@@ -474,8 +474,9 @@ class TelemetryResourceVerdict {
 
   /**
    * Judges the resident-size gates against the worker's own disabled control, over every reading
-   * of the versioned catalogue and the native work journal. Failures are pushed into `violations`;
-   * what only makes the measurement uninformative is returned.
+   * of the versioned catalogue and the native work journal, which must hold at least one resolved
+   * production compression. Failures are pushed into `violations`; what only makes the measurement
+   * uninformative is returned.
    * @param {object} reference the replayable reference facts
    * @param {object} run `baseline`, `samples`, `teardown`, `violations` to append to and `measured`
    * @returns {string[]} the reasons the measurement is inconclusive
@@ -528,6 +529,7 @@ class TelemetryResourceVerdict {
       Array.isArray(rows) &&
         native.journal.overflow === false &&
         native.journal.live === 0 &&
+        rows.some((row) => row.outcome === 'resolved') &&
         rows.every((row) => ['resolved', 'rejected'].includes(row.outcome)) &&
         nativeReadings.every(
           (r) => Number.isSafeInteger(r?.rss) && r.rss >= 0 && Number.isSafeInteger(r.external)
@@ -6883,6 +6885,7 @@ const buildTelemetryChurn = ({
     stem,
     line,
     directory,
+    source: churn.sourceStamp(__filename),
   })
 }
 

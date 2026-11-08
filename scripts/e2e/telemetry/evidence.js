@@ -47,6 +47,31 @@ const FAULT_MODES = ['drop', 'blackhole', 'late']
 const SHUTDOWN = 'telemetry-shutdown'
 const SHUTDOWN_ROUNDS = 20
 const FINAL_WINDOW_MS = 1100
+const FINAL_CAP_MS = 1000
+const SCHEDULING_MS = 100
+/**
+ * The unit titles that hold what the close-and-reopen case cannot observe through the public API:
+ * private waiter, queue and snapshot release and internal listener identity.
+ */
+const SHUTDOWN_SEAMS = Object.freeze([
+  [
+    'src/telemetry/__tests__/resources.spec.js',
+    'bounds timers queues listeners and sockets for %s',
+  ],
+  ['src/telemetry/__tests__/resources.spec.js', 'bounds independent id waiters for %s'],
+  [
+    'src/telemetry/__tests__/resources.spec.js',
+    'holds one native job across one hundred retirements for %s with late %s',
+  ],
+  [
+    'src/telemetry/__tests__/resources.spec.js',
+    'holds the native result through public cycles for %s with late %s',
+  ],
+  [
+    'src/telemetry/__tests__/resources.spec.js',
+    'fails each deliberate fault with its own diagnostic for %s with late %s',
+  ],
+])
 const SHUTDOWN_WORK_MS = 98000
 const SHUTDOWN_CLEANUP_MS = 20000
 const SHUTDOWN_TOTAL_MS = 118000
@@ -1614,8 +1639,9 @@ const verifyBoundary = ({
 
 /**
  * Re-derives the complete close-and-reopen proof from the sealed segments: the fixed catalogue,
- * per-segment wire, payload, decode and sink joins, each lifecycle boundary, the timeout-zero and
- * blackhole arms, budgets and the quiet resources. Advertised summaries are never trusted.
+ * per-segment wire, payload, decode and sink joins, each lifecycle boundary, the four timeout-zero
+ * arms, the blackhole arm's cap of `min(1000, T) + 100` ms for its finite remaining budget T,
+ * budgets, the quiet resources and the strict-seam links. Advertised summaries are never trusted.
  * @param {object} record stamped evidence
  * @param {string} directory absolute run directory
  * @param {object} manifest sidecar manifest of the segmented archive
@@ -1822,7 +1848,7 @@ const verifyShutdown = (record, directory, manifest, read) => {
       assert.equal(new Set(keys).size, keys.length, `Duplicate request identity in ${id}`)
     }
   }
-  for (const kind of ['producer', 'consumer', 'share']) {
+  for (const kind of ['producer', 'consumer', 'admin', 'share']) {
     const transcript = transcripts[`${kind}-t0`]
     const zero = results.timeout0?.[kind]
     assertOwnerUuid(transcript, zero?.uuid)
@@ -1850,10 +1876,12 @@ const verifyShutdown = (record, directory, manifest, read) => {
     'Blackholed transport survived'
   )
   assert(
-    faulted.closedAt - close.at <= FINAL_WINDOW_MS,
-    'The blackholed transport outlived its cap'
+    Number.isFinite(hole.remainingT) && hole.remainingT > 0 && hole.remainingT < FINAL_CAP_MS,
+    'The blackholed close needs a finite remaining budget below the final cap'
   )
-  assert(hole.telemetryCleanupMs <= FINAL_WINDOW_MS)
+  const cap = Math.min(FINAL_CAP_MS, hole.remainingT) + SCHEDULING_MS
+  assert(faulted.closedAt - close.at <= cap, 'The blackholed transport outlived its cap')
+  assert(hole.telemetryCleanupMs <= cap, 'The blackholed telemetry cleanup outlived its cap')
   assert(blackhole.records.filter((r) => r.apiKey === 72 && r.terminating).length <= 1)
   assert.deepEqual(
     blackhole.records.filter(
@@ -1884,6 +1912,26 @@ const verifyShutdown = (record, directory, manifest, read) => {
     'The case exceeded its total budget'
   )
   verifyQuietResources(results.resources ?? {})
+  verifySeams(results.seams)
+}
+
+/**
+ * Requires the close-and-reopen case's links to its fixed strict-seam catalogue, each title still
+ * present in its unit file of this tree.
+ * @param {object[]} seams the archived links
+ * @returns {void} @throws {Error} for a missing, extra, reordered or deleted link
+ */
+const verifySeams = (seams) => {
+  assert.deepEqual(
+    seams,
+    SHUTDOWN_SEAMS.map(([file, title]) => ({ file, title, lane: 'strict seam, unit lane' })),
+    'Strict-seam links differ from the fixed catalogue'
+  )
+  for (const [file, title] of SHUTDOWN_SEAMS)
+    assert(
+      fs.readFileSync(path.resolve(__dirname, '../../..', file), 'utf8').includes(title),
+      `The strict seam "${title}" no longer exists`
+    )
 }
 
 /**
@@ -2624,36 +2672,65 @@ const verifyChurnSegments = (record, directory, manifest, archive) => {
       )
     }
   }
-  verifyChurnStream(transcripts)
+  const faulted = {}
+  for (const kind of CHURN_KINDS)
+    for (const claim of archive.workers?.[kind]?.claims?.retirements ?? [])
+      (faulted[claim.segment] ??= []).push(claim.faulted)
+  verifyChurnStream(transcripts, faulted)
   return { transcripts, bundles, hashes }
 }
 
 /**
  * The complete-stream accounting of the churn segments: F08's request, error and cancellation
- * predicate over every segment with the allowance fixed by the catalogue (error 42 only), no Get
- * error at all, at most one final per segment that is never rejected, and no telemetry request
- * after it.
+ * predicate over every segment with allowances fixed by the catalogue and the schedule, never by
+ * the transcript itself (error 42 only, and faults exactly on the sockets the segment's scheduled
+ * retirements faulted); no Get error at all; and the final of each segment's one close. Under a
+ * nonempty selection in force when the close began, the close owes exactly one final, written
+ * inside it, answered with error 0 and named by the full-proof selection; under an empty one it
+ * owes none. No telemetry request follows a final.
  * @param {Object<string,object>} transcripts every segment transcript by segment ID
+ * @param {Object<string,number[]>} [faulted] the socket each scheduled retirement faulted, by
+ *   segment ID
  * @returns {void}
- * @throws {Error} naming the first unaccounted, undeclared, retried or late request
+ * @throws {Error} naming the first unaccounted, undeclared, missing, cancelled, retried or late
+ *   request
  */
-const verifyChurnStream = (transcripts) => {
+const verifyChurnStream = (transcripts, faulted = {}) => {
+  const { TelemetryProofs } = require('../../soak/telemetryChurn')
   const errors = Object.fromEntries(segmentCatalogue(CHURN).map((id) => [id, [42]]))
-  for (const id of Object.keys(transcripts))
+  const order = (ids) => [...ids].sort((a, b) => a - b)
+  for (const [id, transcript] of Object.entries(transcripts)) {
     assert(errors[id], `Segment ${id} is outside the catalogue`)
+    assert.deepEqual(
+      order(transcript.faults.map((f) => f.socketId)),
+      order(faulted[id] ?? []),
+      `Declared faults of ${id} differ from its scheduled retirements`
+    )
+  }
   assertStreamAccounted(transcripts, { errors })
-  for (const transcript of Object.values(transcripts)) {
+  for (const [id, transcript] of Object.entries(transcripts)) {
     const telemetry = transcript.records.filter(
       (r) => r.type === 'request' && [71, 72].includes(r.apiKey)
     )
     for (const get of telemetry.filter((r) => r.apiKey === 71 && r.response))
       assert.equal(get.response.errorCode, 0, 'Unexpected Get error')
     const finals = telemetry.filter((r) => r.apiKey === 72 && r.terminating)
-    assert(finals.length <= 1, 'A final cannot retry or fail')
-    for (const final of finals) {
-      if (final.response) assert.equal(final.response.errorCode, 0, 'A final cannot retry or fail')
+    if (TelemetryProofs.owesFinal(transcript)) {
+      assert.equal(finals.length, 1, `The close of ${id} owes exactly one final`)
+      const [closure] = transcript.closures
+      const [final] = finals
+      assert(
+        final.writeAt >= closure.at && final.writeAt <= closure.end,
+        `The final of ${id} was not written inside its close`
+      )
+      assert.equal(final.response?.errorCode, 0, `The final of ${id} was not answered with error 0`)
+      assert(
+        TelemetryProofs.selection(transcript.records).includes(final.requestKey),
+        `The final of ${id} is outside the full-proof selection`
+      )
+    } else assert.equal(finals.length, 0, `${id} sent a final under an empty selection`)
+    for (const final of finals)
       assert(!telemetry.some((r) => r.index > final.index), 'Telemetry work followed the final')
-    }
   }
 }
 
@@ -3232,13 +3309,21 @@ const verifyChurnReference = ({ kind, uuid, stem, input }) => {
 }
 
 /**
- * Requires one hello per kind from four distinct processes of one Node build, flags, platform,
- * codec capability and driver source.
+ * Requires one hello per kind from four distinct processes of one Node build, flags, platform and
+ * codec capability, each carrying the driver source the parent recorded, and that recorded source
+ * to be this module tree's own `scripts/soak/telemetryChurn.js` and `scripts/soak/soak.js`, by path
+ * and digest. Workers that agree only with each other cannot stand in for the run's driver.
  * @param {object[]} handshakes the parent's archived hello facts
- * @returns {void} @throws {Error} for a missing, duplicate or foreign handshake
+ * @param {object} source the parent's archived `sourceStamp` of the driver
+ * @returns {void} @throws {Error} for a missing, duplicate or foreign handshake or source
  */
-const verifyChurnHandshakes = (handshakes) => {
-  const { KINDS } = require('../../soak/telemetryChurn')
+const verifyChurnHandshakes = (handshakes, source) => {
+  const { KINDS, sourceStamp } = require('../../soak/telemetryChurn')
+  assert.deepEqual(
+    source,
+    sourceStamp(path.resolve(__dirname, '../../soak/soak.js')),
+    'The recorded driver source differs from the verified tree'
+  )
   assert.deepEqual(
     (handshakes ?? []).map((h) => h.kind),
     [...KINDS],
@@ -3248,18 +3333,42 @@ const verifyChurnHandshakes = (handshakes) => {
   const [first] = handshakes
   for (const hello of handshakes) {
     assert(Number.isFinite(hello.origin) && Number.isFinite(hello.parentAt), 'Handshake time')
-    for (const key of ['node', 'v8', 'platform', 'arch', 'execArgv', 'codecs', 'source'])
+    for (const key of ['node', 'v8', 'platform', 'arch', 'execArgv', 'codecs'])
       assert.deepEqual(hello[key], first[key], `Worker ${hello.kind} ${key} differs`)
+    assert.deepEqual(hello.source, source, `Worker ${hello.kind} source differs from the driver`)
   }
   assert(first.execArgv.includes('--expose-gc'), 'Workers ran without real collection')
 }
 
 /**
+ * Requires the separately reported memory of one decoder child to be labelled: the kernel status
+ * source, byte units and capability, with nonnegative integer peaks when the source was read and
+ * an explicit `unavailable` otherwise. It is reported, never gated or subtracted.
+ * @param {object} memory the receipt's `memory` fact
+ * @returns {void} @throws {Error} for a missing, unlabelled or malformed fact
+ */
+const verifyDecoderMemory = (memory) => {
+  const counter = (value) => Number.isSafeInteger(value) && value >= 0
+  assert(
+    memory?.source === 'proc-pid-status' &&
+      memory.units === 'bytes' &&
+      ['available', 'unavailable'].includes(memory.capability),
+    'A decoder child memory fact is missing or unlabelled'
+  )
+  if (memory.capability === 'available')
+    assert(
+      counter(memory.peakHwmBytes) && counter(memory.peakRssBytes) && memory.samples > 0,
+      'A decoder child memory fact is malformed'
+    )
+}
+
+/**
  * Re-derives the whole churn verdict from the sealed archive and the stamped rows, never from an
  * advertised boolean: every segment and Push, every lifecycle claim of every worker, the four
- * resource inputs judged again, the four natural exits and the final budgets from their raw
- * stamps, the ordinary and share oracles from their archived inputs, and the parent's decoder
- * receipts.
+ * resource inputs judged again with a native journal that covers every compressed Push, the four
+ * natural exits and the final budgets from their raw stamps, the ordinary and share oracles from
+ * their archived inputs (the share exchanges kept once and joined by hash), the worker sources
+ * joined to this tree, and the parent's decoder receipts with each child's reported memory.
  * @param {object} record the stamped churn record whose `results.rows` holds the soak's rows
  * @param {string} directory absolute run directory @param {object} manifest sidecar manifest
  * @param {function(string):object} read verified JSON sidecar reader
@@ -3310,6 +3419,23 @@ const verifyChurn = (record, directory, manifest, read) => {
     assert.equal(facts.kind, row.clientKind)
     assert.equal(facts.uuid, row.uuid, 'A worker identity differs from its resource row')
     assert(facts.requirements.ok, `${row.clientKind} requirements`)
+    const names = Array.from({ length: schedule.perKind }, (_, i) =>
+      schedule.name(row.clientKind, i)
+    )
+    const journal = row.input.reference?.native?.journal?.rows ?? []
+    for (const [codec, type] of [
+      ['gzip', 1],
+      ['zstd', 4],
+    ]) {
+      const written = names
+        .flatMap((id) => transcripts[id].records)
+        .filter((r) => r.type === 'request' && r.apiKey === 72 && r.compressionType === type)
+      assert(
+        journal.filter((r) => r.codec === codec && r.outcome === 'resolved').length >=
+          written.length,
+        `The ${row.clientKind} native journal lacks the ${codec} compression of its Pushes`
+      )
+    }
     verifyChurnWorker({
       kind: row.clientKind,
       uuid: row.uuid,
@@ -3319,13 +3445,7 @@ const verifyChurn = (record, directory, manifest, read) => {
       archive,
     })
     assert(
-      verifyChurnFence(
-        row.clientKind,
-        facts,
-        bundles,
-        transcripts,
-        Array.from({ length: schedule.perKind }, (_, i) => schedule.name(row.clientKind, i))
-      ) > 0,
+      verifyChurnFence(row.clientKind, facts, bundles, transcripts, names) > 0,
       'No custom Push was decoded for the fence'
     )
     const last = transcripts[schedule.name(row.clientKind, schedule.perKind - 1)]
@@ -3336,7 +3456,7 @@ const verifyChurn = (record, directory, manifest, read) => {
     )
   }
   assert.equal(uuids.size, 4, 'The four workers must hold four distinct instance IDs')
-  verifyChurnHandshakes(archive.handshakes)
+  verifyChurnHandshakes(archive.handshakes, archive.source)
   for (const row of exits) {
     assert.equal(row.event, 'close')
     assert.equal(row.code, 0)
@@ -3367,22 +3487,27 @@ const verifyChurn = (record, directory, manifest, read) => {
   assert.deepEqual(inputs.producer.offered, archive.workers.producer.ordinary.offered)
   const captured = archive.workers.shareConsumer.share
   assert.equal(share.group, captured.group, 'Share group differs from the capture')
+  assert(!Object.hasOwn(share, 'exchanges'), 'Share exchanges are archived twice')
   assert.equal(
-    sha(JSON.stringify(share.exchanges)),
+    sha(JSON.stringify(captured.exchanges)),
     captured.exchangesSha256,
     'Share exchange facts differ from their capture hash'
   )
-  assert.deepEqual(share.exchanges, captured.exchanges, 'Share exchange facts differ')
+  assert.equal(
+    share.exchangesSha256,
+    captured.exchangesSha256,
+    'The share oracle inputs name other exchanges'
+  )
   assert.deepEqual(
-    share.exchanges.map((e) => e.n),
-    share.exchanges.map((_, i) => i + 1),
+    captured.exchanges.map((e) => e.n),
+    captured.exchanges.map((_, i) => i + 1),
     'Share exchanges are missing or reordered'
   )
   assert.deepEqual(share.settled, captured.settled)
   const checks = {
     producer: churn.OrdinaryOracle.check({ kind: 'producer', stem, ...inputs.producer }),
     consumer: churn.OrdinaryOracle.check({ kind: 'consumer', stem, ...inputs.consumer }),
-    shareConsumer: churn.ShareOracle.check({ stem, ...share }),
+    shareConsumer: churn.ShareOracle.check({ stem, ...share, exchanges: captured.exchanges }),
   }
   for (const [kind, check] of Object.entries(checks))
     assert.deepEqual(check.violations, [], `${kind} oracle: ${check.violations}`)
@@ -3410,6 +3535,7 @@ const verifyChurn = (record, directory, manifest, read) => {
     assert.equal(receipt.line, record.run.line)
     assert.equal(receipt.identity?.verified, true)
     assert.equal(receipt.identity.line, record.run.line)
+    verifyDecoderMemory(receipt.memory)
   }
   const { timeline } = verdict
   assert(timeline.boundaryAt - timeline.epochAt >= 360000, 'The measurement boundary came early')
@@ -3526,14 +3652,19 @@ module.exports = {
   verifyScenario,
   verifyChurn,
   verifyChurnFence,
+  verifyChurnHandshakes,
   verifyChurnLifecycles,
+  verifyChurnReference,
   verifyChurnReopen,
   verifyChurnRetirement,
   verifyChurnStages,
   verifyChurnStream,
   verifyChurnTransition,
   verifyChurnWorker,
+  verifyDecoderMemory,
   verifyShutdown,
+  verifySeams,
+  SHUTDOWN_SEAMS,
   traceChunk,
   joinChunks,
   episodeLogs,

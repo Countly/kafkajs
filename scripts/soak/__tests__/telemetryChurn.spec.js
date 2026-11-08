@@ -6,6 +6,7 @@ const path = require('node:path')
 const {
   CORPUS,
   DecoderCoordinator,
+  KILL_JOIN_MS,
   KINDS,
   OrdinaryOracle,
   OrdinaryWork,
@@ -23,9 +24,11 @@ const {
   WORKER_TOKEN,
   compactRuns,
   controlManifest,
+  labelOf,
   logInputs,
   recordId,
   runCatalogue,
+  sourceStamp,
   valueOf,
   writeFence,
 } = require('../telemetryChurn')
@@ -33,7 +36,9 @@ const { checkSegmentFiles } = require('../../../testHelpers/telemetrySegments')
 const { PROFILES, buildTelemetryChurn, instrument, main, parseArgs } = require('../soak')
 const {
   verifyChurnFence,
+  verifyChurnHandshakes,
   verifyChurnLifecycles,
+  verifyChurnReference,
   verifyChurnReopen,
   verifyChurnRetirement,
   verifyChurnStages,
@@ -110,6 +115,7 @@ const fakeChild = () =>
   Object.assign(new EventEmitter(), {
     stdout: new EventEmitter(),
     stderr: new EventEmitter(),
+    connected: true,
     send: jest.fn(),
     kill: jest.fn(),
   })
@@ -1380,20 +1386,36 @@ describe('telemetry terminal final proof', () => {
     dataBytes: raw.length,
     parse: 'ok',
   }
+  /** The successful Get whose selection is in force when the close begins. */
+  const get = (requestedMetrics = ['org.apache.kafka.']) => ({
+    type: 'request',
+    apiKey: 71,
+    index: 1,
+    requestKey: 'r1',
+    socketId: 1,
+    uuid: U,
+    writeAt: 5,
+    response: { errorCode: 0, uuid: U, requestedMetrics, responseAt: 8 },
+  })
   /** One sealed terminal segment whose bundle holds the final's bytes but not yet its proof. */
-  const sealed = () => {
+  const sealed = (records = [get(), final]) => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'terminal-'))
     fs.mkdirSync(path.join(directory, 'segments'))
     fs.mkdirSync(path.join(directory, 'decoder'))
-    const transcript = JSON.stringify({ owner: ID, records: [final] })
-    const bundle =
-      JSON.stringify({
-        t: 'push',
-        key: 'r2',
-        bytes: raw.length,
-        sha256: sha(raw),
-        b64: raw.toString('base64'),
-      }) + '\n'
+    const transcript = JSON.stringify({
+      owner: ID,
+      records,
+      closures: [{ at: 18, end: 30, pending: [] }],
+    })
+    const bundle = records.some((r) => r.apiKey === 72)
+      ? JSON.stringify({
+          t: 'push',
+          key: 'r2',
+          bytes: raw.length,
+          sha256: sha(raw),
+          b64: raw.toString('base64'),
+        }) + '\n'
+      : ''
     fs.writeFileSync(path.join(directory, 'segments', `${ID}.transcript.json`), transcript)
     fs.writeFileSync(path.join(directory, 'segments', `${ID}.bundle.jsonl`), bundle)
     const receipt = { rawSha256: sha(raw), code: 0, line: '4.3.1', stdout: '' }
@@ -1502,6 +1524,33 @@ describe('telemetry terminal final proof', () => {
       fs.rmSync(t.directory, { recursive: true, force: true })
     }
   })
+
+  test.each([
+    ['no final', [get()]],
+    ['a cancelled final', [get(), { ...final, response: undefined }]],
+    ['a rejected final', [get(), { ...final, response: { errorCode: 42, responseAt: 25 } }]],
+  ])('refuses a close under a nonempty selection with %s', async (_name, records) => {
+    const t = sealed(records)
+    try {
+      await expect(
+        coordinator(t.observer, [sinkRow]).terminal(t.directory, 'producer', t.pack)
+      ).rejects.toThrow(`The terminal segment ${ID} owes one accepted final`)
+      expect(t.observer.decodeRaw).not.toHaveBeenCalled()
+    } finally {
+      fs.rmSync(t.directory, { recursive: true, force: true })
+    }
+  })
+
+  test('decodes nothing for a close under an empty selection that sent no final', async () => {
+    const t = sealed([get([])])
+    try {
+      await coordinator(t.observer, []).terminal(t.directory, 'producer', t.pack)
+      expect(t.pack.terminalProofs).toEqual([])
+      expect(t.observer.decodeRaw).not.toHaveBeenCalled()
+    } finally {
+      fs.rmSync(t.directory, { recursive: true, force: true })
+    }
+  })
 })
 
 describe('telemetry profile natural exit', () => {
@@ -1561,28 +1610,81 @@ describe('telemetry profile natural exit', () => {
     })
   })
 
-  test('cancels by abort and keeps awaiting a worker past its bound, killing nothing', async () => {
+  test('kills a worker still alive after the abort and its natural-exit bound, then joins its close', async () => {
     const cancelled = natural()
     const joining = cancelled.processes.cancel('producer')
     let settled = false
     joining.then(() => {
       settled = true
     })
-    expect(cancelled.child.send).toHaveBeenCalledWith({ type: 'abort' })
-    await jest.advanceTimersByTimeAsync(10001)
-    expect(settled).toBe(false)
+    expect(cancelled.child.send).toHaveBeenCalledWith({ type: 'abort' }, expect.any(Function))
+    await jest.advanceTimersByTimeAsync(9999)
     expect(cancelled.child.kill).not.toHaveBeenCalled()
-    expect(cancelled.processes.workers.get('producer').error).toBeNull()
-    cancelled.child.emit('close', 0, null)
+    await jest.advanceTimersByTimeAsync(2)
+    expect(cancelled.child.kill).toHaveBeenCalledTimes(1)
+    expect(cancelled.child.kill).toHaveBeenCalledWith('SIGKILL')
+    expect(settled).toBe(false)
+    cancelled.child.emit('close', null, 'SIGKILL')
     await expect(joining).resolves.toMatchObject({
       event: 'close',
+      code: null,
+      signal: 'SIGKILL',
       watchdogExpired: true,
-      killed: false,
+      killed: true,
       aborted: true,
     })
     expect(cancelled.processes.workers.get('producer').error).toBeNull()
-    await expect(cancelled.processes.cancel('producer')).resolves.toMatchObject({ event: 'close' })
+    await expect(cancelled.processes.cancel('producer')).resolves.toMatchObject({
+      event: 'close',
+      killed: true,
+      watchdogExpired: true,
+    })
     expect(cancelled.child.send).toHaveBeenCalledTimes(1)
+    expect(cancelled.child.kill).toHaveBeenCalledTimes(1)
+  })
+
+  test('reports a killed worker that never closes as a failed timeout row and still returns', async () => {
+    const stuck = natural()
+    stuck.say('producer', { type: 'receipt' })
+    const joining = stuck.processes.cancel('producer')
+    await jest.advanceTimersByTimeAsync(10001)
+    expect(stuck.child.kill).toHaveBeenCalledWith('SIGKILL')
+    await jest.advanceTimersByTimeAsync(KILL_JOIN_MS)
+    await expect(joining).resolves.toMatchObject({
+      event: 'timeout',
+      closedAt: null,
+      killed: true,
+      watchdogExpired: true,
+      receipts: 1,
+    })
+    await expect(stuck.processes.cancel('producer')).resolves.toMatchObject({
+      event: 'timeout',
+      killed: true,
+    })
+    expect(stuck.child.kill).toHaveBeenCalledTimes(1)
+  })
+
+  test('sends the abort only over a connected channel and discards a send to a closed one', async () => {
+    const onFailure = jest.fn()
+    const gone = natural()
+    gone.processes.onFailure = onFailure
+    gone.child.connected = false
+    const quiet = gone.processes.cancel('producer')
+    expect(gone.child.send).not.toHaveBeenCalled()
+    gone.child.emit('close', 0, null)
+    await expect(quiet).resolves.toMatchObject({ event: 'close', aborted: true, killed: false })
+
+    const closing = natural()
+    closing.processes.onFailure = onFailure
+    closing.child.send.mockImplementation((message, callback) =>
+      callback(Object.assign(new Error('Channel closed'), { code: 'ERR_IPC_CHANNEL_CLOSED' }))
+    )
+    const cancelled = closing.processes.cancel('producer')
+    expect(closing.child.send).toHaveBeenCalledTimes(1)
+    closing.child.emit('close', 0, null)
+    await expect(cancelled).resolves.toMatchObject({ event: 'close', killed: false })
+    expect(closing.processes.workers.get('producer').error).toBeNull()
+    expect(onFailure).not.toHaveBeenCalled()
   })
 
   test('rejects a second explicit-disconnect receipt and output beyond its bound', async () => {
@@ -2646,14 +2748,24 @@ describe('telemetry churn complete-stream accounting', () => {
     response: { errorCode: 0, uuid: U, responseAt: index * 10 + 5 },
     ...over,
   })
+  const selected = (index, over = {}) =>
+    request(index, 71, {
+      response: {
+        errorCode: 0,
+        uuid: U,
+        requestedMetrics: ['org.apache.kafka.'],
+        responseAt: index * 10 + 5,
+      },
+      ...over,
+    })
   /** A Get, an accepted Push, a faulted exchange on a retired socket and an answered final. */
   const segment = () => ({
     records: [
-      request(1, 71, { socketId: 1 }),
-      request(2, 72, { socketId: 1 }),
+      selected(1, { socketId: 1 }),
+      request(2, 72, { socketId: 1, metricsBytes: 10 }),
       request(3, 72, { socketId: 1, response: undefined, writeAt: 31 }),
-      request(4, 71, { socketId: 2 }),
-      request(5, 72, { socketId: 2, terminating: true }),
+      selected(4, { socketId: 2 }),
+      request(5, 72, { socketId: 2, terminating: true, metricsBytes: 10 }),
     ],
     sockets: [
       { id: 1, kind: 'telemetry', closedAt: 40 },
@@ -2673,14 +2785,77 @@ describe('telemetry churn complete-stream accounting', () => {
     ],
     closures: [{ at: 50, end: 55, pending: [] }],
   })
-  const verify = (change = () => {}) => {
+  const verify = (change = () => {}, faulted = { [ID]: [1] }) => {
     const transcript = segment()
     change(transcript)
-    return () => verifyChurnStream({ [ID]: transcript })
+    return () => verifyChurnStream({ [ID]: transcript }, faulted)
   }
 
   test('accounts for every request, the faulted exchange and the one final', () => {
     expect(verify()).not.toThrow()
+  })
+
+  test.each([
+    ['an unscheduled fault', {}],
+    ['a scheduled fault the segment never declared', { [ID]: [1, 2] }],
+    ['a fault on another socket than the scheduled one', { [ID]: [2] }],
+  ])('refuses %s', (_name, faulted) => {
+    expect(verify(() => {}, faulted)).toThrow(
+      `Declared faults of ${ID} differ from its scheduled retirements`
+    )
+  })
+
+  describe.each(['producer-lc-2', 'producer-lc-6'])('the final of %s', (id) => {
+    const check = (change = () => {}) => {
+      const transcript = segment()
+      change(transcript)
+      return () => verifyChurnStream({ [id]: transcript }, { [id]: [1] })
+    }
+    const drop = (t) => (t.records = t.records.filter((r) => r.requestKey !== 'r5'))
+    const empty = (t) => (t.records[3].response.requestedMetrics = [])
+
+    test('passes with one accepted final under a nonempty selection, and none under an empty one', () => {
+      expect(check()).not.toThrow()
+      expect(
+        check((t) => {
+          empty(t)
+          drop(t)
+        })
+      ).not.toThrow()
+    })
+
+    test.each([
+      ['a missing final', drop, `The close of ${id} owes exactly one final`],
+      [
+        'a cancelled final',
+        (t) => {
+          t.records[4].response = undefined
+          t.cancellations.push({
+            requestKey: 'r5',
+            apiKey: 72,
+            socketId: 2,
+            writeAt: 50,
+            at: 50,
+            end: 60,
+            disposition: 'close-final',
+          })
+        },
+        `The final of ${id} was not answered with error 0`,
+      ],
+      [
+        'a final written before its close',
+        (t) => (t.records[4].writeAt = 49),
+        `The final of ${id} was not written inside its close`,
+      ],
+      [
+        'an empty final outside the full-proof selection',
+        (t) => (t.records[4].metricsBytes = 0),
+        `The final of ${id} is outside the full-proof selection`,
+      ],
+      ['a final under an empty selection', empty, `${id} sent a final under an empty selection`],
+    ])('refuses %s', (_name, change, message) => {
+      expect(check(change)).toThrow(message)
+    })
   })
 
   test.each([
@@ -2703,12 +2878,12 @@ describe('telemetry churn complete-stream accounting', () => {
     [
       'a rejected final',
       (t) => (t.records[4].response.errorCode = 42),
-      'A final cannot retry or fail',
+      `The final of ${ID} was not answered with error 0`,
     ],
     [
       'a second final',
-      (t) => t.records.push(request(6, 72, { socketId: 2, terminating: true })),
-      'A final cannot retry or fail',
+      (t) => t.records.push(request(6, 72, { socketId: 2, terminating: true, writeAt: 52 })),
+      `The close of ${ID} owes exactly one final`,
     ],
     [
       'telemetry after the final',
@@ -3016,5 +3191,245 @@ describe('telemetry churn coordinated stage replay', () => {
     ],
   ])('refuses %s', (_name, change, message) => {
     expect(replay(change)).toThrow(message)
+  })
+})
+
+describe('telemetry profile evidence after an expired bound', () => {
+  test('keeps every received progress row, sealed receipt, failure fact and exit without a verdict', () => {
+    const made = rig()
+    const source = { churn: { file: 'c', sha256: 'a' }, driver: { file: 'd', sha256: 'b' } }
+    const churn = new TelemetryChurn({
+      fixture: {},
+      processes: made.processes,
+      decoder: {},
+      record: jest.fn(),
+      clock: { now: () => 0 },
+      limits: {},
+      verdict: jest.fn(),
+      brokers: [],
+      stem: STEM,
+      line: '4.3.1',
+      directory: '/evidence',
+      source,
+    })
+    made.processes.start('producer')
+    made.processes.start('consumer')
+    made.say('producer', { type: 'hello' })
+    made.say('producer', { type: 'progress', row: { kind: 'sample', n: 1 } })
+    made.say('producer', { type: 'progress', sealed: { id: 'producer-lc-0' } })
+    made.say('consumer', { type: 'hello' })
+    made.say('consumer', {
+      type: 'failure',
+      message: 'boom',
+      facts: { sealed: [{ id: 'consumer-lc-0' }] },
+      failures: [{ name: 'Error', message: 'boom' }],
+    })
+    made.children[1].emit('close', 1, null)
+    const result = churn.evidence()
+    expect(result).toMatchObject({ ok: false, violations: ['the run ended before its verdict'] })
+    expect(result.workers.map((w) => w.kind)).toEqual([...KINDS])
+    const [producer, consumer, admin] = result.workers
+    expect(producer).toEqual({
+      kind: 'producer',
+      facts: null,
+      sealed: [{ id: 'producer-lc-0' }],
+      rows: [{ kind: 'sample', n: 1 }],
+      failures: [],
+      exit: null,
+    })
+    expect(consumer).toMatchObject({
+      facts: { sealed: [{ id: 'consumer-lc-0' }] },
+      sealed: [{ id: 'consumer-lc-0' }],
+      failures: [{ name: 'Error', message: 'boom' }],
+      exit: { kind: 'consumer', event: 'close', code: 1, killed: false, watchdogExpired: false },
+    })
+    expect(admin).toMatchObject({ sealed: [], rows: [], exit: null })
+    expect(result.archive.workers.producer).toBe(producer)
+    expect(result.archive.source).toBe(source)
+    const judged = { ok: true, marker: 'verdict' }
+    churn.lastResult = judged
+    expect(churn.evidence()).toBe(judged)
+  })
+})
+
+describe('telemetry churn worker identity', () => {
+  const stub = { registerMetricForSubscription() {}, unregisterMetricFromSubscription() {} }
+  const digestOf = (kind, uuid, count) => {
+    const registry = new Registry(stub, kind, count)
+    registry.fill()
+    return registry.digest(uuid)
+  }
+  const config = { topic: `${STEM}-producer`, ctl: `${STEM}-ctl` }
+
+  describe('reference', () => {
+    /** The producer worker's baseline, teardown, control and enabled replay of that control. */
+    const row = () => {
+      const digest = digestOf('producer', U)
+      const manifest = controlManifest('producer', config)
+      return {
+        kind: 'producer',
+        uuid: U,
+        stem: STEM,
+        input: {
+          baseline: { registryDigest: digest },
+          teardown: { registryDigest: digest },
+          reference: {
+            control: { kind: 'producer', manifest },
+            foreground: manifest.operations.map((o) => ({ n: o.n, status: 'fulfilled' })),
+          },
+        },
+      }
+    }
+    const verify = (change = () => {}) => {
+      const input = row()
+      change(input)
+      return () => verifyChurnReference(input)
+    }
+
+    test('binds the population, the control catalogue and its replay to the worker', () => {
+      expect(labelOf('producer')).toBe('producer')
+      expect(row().input.reference.foreground.length).toBeGreaterThan(0)
+      expect(verify()).not.toThrow()
+    })
+
+    test.each([
+      [
+        'a manifest of another kind',
+        (r) => (r.input.reference.control.manifest = controlManifest('admin', config)),
+        'The control ran another frozen catalogue',
+      ],
+      [
+        'a manifest of another topic',
+        (r) =>
+          (r.input.reference.control.manifest = controlManifest('producer', {
+            ...config,
+            topic: `${STEM}-consumer`,
+          })),
+        'The control ran another frozen catalogue',
+      ],
+      [
+        'a control of another kind',
+        (r) => (r.input.reference.control.kind = 'admin'),
+        'The control is of another kind',
+      ],
+      [
+        'a digest of another UUID',
+        (r) => (r.input.baseline.registryDigest = digestOf('producer', U.replace('a', 'f'))),
+        'The retained registry and UUID population differs from the worker',
+      ],
+      [
+        'a digest of another population',
+        (r) => (r.input.baseline.registryDigest = digestOf('producer', U, 64)),
+        'The retained registry and UUID population differs from the worker',
+      ],
+      [
+        'a teardown of another population',
+        (r) => (r.input.teardown.registryDigest = digestOf('consumer', U)),
+        'The teardown population differs',
+      ],
+      [
+        'a missing enabled replay',
+        (r) => delete r.input.reference.foreground,
+        'The enabled worker did not replay the control catalogue',
+      ],
+      [
+        'a short enabled replay',
+        (r) => r.input.reference.foreground.pop(),
+        'The enabled worker did not replay the control catalogue',
+      ],
+      [
+        'a replay with a failed operation',
+        (r) => (r.input.reference.foreground[0].status = 'rejected'),
+        'The enabled worker did not replay the control catalogue',
+      ],
+    ])('refuses %s', (_name, change, message) => {
+      expect(verify(change)).toThrow(message)
+    })
+  })
+
+  describe('handshakes', () => {
+    /** Four hellos of one build and flags, all carrying the source the parent recorded. */
+    const run = () => {
+      const source = sourceStamp(path.resolve(__dirname, '../soak.js'))
+      return {
+        source,
+        handshakes: KINDS.map((kind, i) => ({
+          kind,
+          origin: 1000 + i,
+          pid: 100 + i,
+          node: 'v26.0.0',
+          v8: '13.0',
+          platform: 'linux',
+          arch: 'x64',
+          execArgv: ['--expose-gc'],
+          modules: 300,
+          codecs: { gzip: true, zstd: true },
+          source,
+          parentAt: 5 + i,
+        })),
+      }
+    }
+    const verify = (change = () => {}) => {
+      const input = run()
+      change(input)
+      return () => verifyChurnHandshakes(input.handshakes, input.source)
+    }
+    const foreign = (source) => ({
+      ...source,
+      driver: { ...source.driver, sha256: 'f'.repeat(64) },
+    })
+
+    test('joins four distinct workers to the driver source of this tree', () => {
+      expect(run().source.driver.file).toBe('scripts/soak/soak.js')
+      expect(run().source.churn.file).toBe('scripts/soak/telemetryChurn.js')
+      expect(verify()).not.toThrow()
+    })
+
+    test.each([
+      ['a missing kind', (r) => r.handshakes.pop(), 'Worker handshakes differ from the four kinds'],
+      [
+        'a duplicate pid',
+        (r) => (r.handshakes[1].pid = r.handshakes[0].pid),
+        'Two workers share one process',
+      ],
+      [
+        'a differing node',
+        (r) => (r.handshakes[1].node = 'v24.0.0'),
+        'Worker consumer node differs',
+      ],
+      [
+        'differing flags',
+        (r) => (r.handshakes[2].execArgv = ['--expose-gc', '--inspect']),
+        'Worker admin execArgv differs',
+      ],
+      [
+        'no exposed collection',
+        (r) => r.handshakes.forEach((h) => (h.execArgv = [])),
+        'Workers ran without real collection',
+      ],
+      [
+        'one worker of another source',
+        (r) => (r.handshakes[3].source = foreign(r.source)),
+        'Worker shareConsumer source differs from the driver',
+      ],
+      [
+        'four consistent workers of a foreign driver',
+        (r) => {
+          r.source = foreign(r.source)
+          r.handshakes.forEach((h) => (h.source = r.source))
+        },
+        'The recorded driver source differs from the verified tree',
+      ],
+      [
+        'a driver at another path',
+        (r) => {
+          r.source = { ...r.source, driver: { ...r.source.driver, file: 'scripts/soak/other.js' } }
+          r.handshakes.forEach((h) => (h.source = r.source))
+        },
+        'The recorded driver source differs from the verified tree',
+      ],
+    ])('refuses %s', (_name, change, message) => {
+      expect(verify(change)).toThrow(message)
+    })
   })
 })
