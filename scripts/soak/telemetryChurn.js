@@ -2394,9 +2394,9 @@ class TelemetryWorker {
     this.sampler = null
   }
 
-  /** @returns {object|undefined} the close arguments of this kind; an admin has none */
+  /** @returns {{timeout: number}} the same finite close budget for every kind, admin included */
   closeOptions() {
-    return this.kind === 'admin' ? undefined : { timeout: 3000 }
+    return { timeout: 3000 }
   }
 
   /**
