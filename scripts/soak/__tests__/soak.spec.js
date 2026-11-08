@@ -3624,6 +3624,8 @@ describe('Share soak owner', () => {
           phase: archived[i].phase,
           atMs: archived[i].atMs,
           phaseMs: archived[i].phaseMs,
+          admittedAtMs: archived[i].admittedAtMs,
+          admittedPhaseMs: archived[i].admittedPhaseMs,
           snapshot: {
             heapUsed: archived[i].snapshot.heapUsed,
             shareRecords: 301,
