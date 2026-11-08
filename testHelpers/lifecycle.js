@@ -98,7 +98,14 @@ module.exports = {
 
 const telemetryAssert = require('node:assert/strict')
 const { Schedule: TelemetrySchedule } = require('./schedule')
-const realMonotonicNs = process.hrtime.bigint.bind(process.hrtime)
+const realHrtime = process.hrtime.bind(process)
+const CLOCK_PATCH = Symbol.for('kafkajs:test:telemetry-clock')
+
+/** @returns {bigint} real monotonic nanoseconds, independent of a round's patched bigint clock */
+const realMonotonicNs = () => {
+  const [seconds, nanoseconds] = realHrtime()
+  return BigInt(seconds) * 1000000000n + BigInt(nanoseconds)
+}
 
 /** Supplies deterministic telemetry time without coupling timer delivery to clock movement. */
 class TelemetryClock {
@@ -416,10 +423,10 @@ const manifestOf =
   ({ boundary, mode, action, options }) =>
   (old) => {
     const fresh = mode === 'get'
-    const frame = (kind, socket, held) => ({
+    const frame = (kind, socket, held, initial = false) => ({
       api: kind === 'G' ? 71 : 72,
       terminating: kind === 'G' ? null : kind === 'F',
-      uuid: kind === 'G' && fresh ? null : TELEMETRY_UUID,
+      uuid: kind === 'G' && (initial || fresh) ? null : TELEMETRY_UUID,
       subscriptionId: kind === 'G' ? null : DEFAULT_SUBSCRIPTION.subscriptionId,
       socket,
       compressionType: kind === 'G' ? null : boundary === 'S12' ? 1 : 0,
@@ -440,7 +447,8 @@ const manifestOf =
         1n,
         index === before.length - 1 &&
           (['S09', 'S17'].includes(boundary) ||
-            (boundary === 'S14' && options.position === 'after'))
+            (boundary === 'S14' && options.position === 'after')),
+        index === 0
       )
     )
     const successor = boundary === 'S01' && fresh && options.position === 'before' ? 1n : 2n
@@ -694,6 +702,7 @@ class PublicTelemetryRound {
     this.trace = new TelemetryTrace({ bounded })
     this.wireSchedule = new TelemetrySchedule()
     this.restores = []
+    this.clockRestores = []
     this.pending = []
     this.work = new Set()
     this.waitTimeout = 10000
@@ -727,6 +736,52 @@ class PublicTelemetryRound {
     this.core = { handlers: [], commits: [], leaves: [], losses: [], joins: [] }
     this.listener = (reason) => this.unhandled.push(reason)
     process.on('unhandledRejection', this.listener)
+  }
+
+  /**
+   * Installs one deterministic clock with restoration owned by this round. Inactive older patches
+   * are skipped when the current owner restores, so an out-of-order cleanup cannot revive a clock
+   * whose round has already ended. Property descriptors are restored without Jest spy state.
+   * @param {object} target clock owner @param {string} key clock method
+   * @param {Function} replacement deterministic reading
+   * @returns {void}
+   * @throws {TypeError} if the clock property cannot be replaced
+   */
+  patchClock(target, key, replacement) {
+    const patch = {
+      active: true,
+      descriptor: Object.getOwnPropertyDescriptor(target, key),
+      previous: target[key]?.[CLOCK_PATCH],
+    }
+    Object.defineProperty(replacement, CLOCK_PATCH, { value: patch })
+    Object.defineProperty(target, key, {
+      value: replacement,
+      writable: true,
+      configurable: true,
+      enumerable: patch.descriptor?.enumerable ?? false,
+    })
+    this.clockRestores.push(() => {
+      patch.active = false
+      let current = target[key]?.[CLOCK_PATCH]
+      if (!current || current.active) return
+      let descriptor
+      while (current && !current.active) {
+        descriptor = current.descriptor
+        current = current.previous
+      }
+      if (descriptor) Object.defineProperty(target, key, descriptor)
+      else delete target[key]
+    })
+  }
+
+  /** @returns {void} installs the round's deterministic readings with independent cleanup ownership */
+  installClocks() {
+    this.patchClock(Date, 'now', () => 1000 + this.clock.now())
+    this.patchClock(process.hrtime, 'bigint', () => BigInt(this.clock.now()) * 1000000n)
+    const imported = require('node:perf_hooks').performance
+    this.patchClock(imported, 'now', () => this.clock.now())
+    if (global.performance !== imported)
+      this.patchClock(global.performance, 'now', () => this.clock.now())
   }
 
   /**
@@ -915,7 +970,7 @@ class PublicTelemetryRound {
       this.trace.frames.reduce((total, frame) => total + frame.hex.length / 2, 0) +
       this.expectedFrames.reduce((total, frame) => total + frame.hex.length / 2, 0)
     return Object.freeze({
-      restorers: this.restores.length,
+      restorers: this.restores.length + this.clockRestores.length,
       owners: this.owners.size,
       ownersIssued: this.owners.issued,
       ownersCompleted: this.owners.completed(),
@@ -1269,8 +1324,12 @@ class PublicTelemetryRound {
           this.codecType === 4 ? require('../src/protocol/message/compression/zstd') : gzip
         this.patch(codec, 'compress', (original) => async (...args) => {
           const selected = round.armed && closing() === (mode === 'final')
-          // The payload's own input, never a copy, so a held input's identity is production's.
-          const job = { input: args[0].buffer, promise: original(...args), settled: false }
+          // Only bounded capture keeps the production input; default callers retain their byte copy.
+          const job = {
+            ...(round.bounded ? { input: args[0].buffer } : { raw: Buffer.from(args[0].buffer) }),
+            promise: original(...args),
+            settled: false,
+          }
           // Observe rejection immediately, while retaining the actual native result.
           const outcome = job.promise.then(
             (value) => ({ value }),
@@ -1318,7 +1377,7 @@ class PublicTelemetryRound {
               ) {
                 round.blockingDispatch = true
                 const definition = require('../src/protocol/requests/apiVersions').protocol({
-                  version: 0,
+                  version: round.wire.advertised.get('ApiVersions')[0],
                 })()
                 const pending = original.call(this, { ...definition, guard: options.guard })
                 round.pending.push(pending.catch(() => {}))
@@ -1486,8 +1545,16 @@ class PublicTelemetryRound {
     let current = connection.socket
     let hadSocket = Boolean(current)
     const round = this
-    const restore = () =>
-      Object.defineProperty(connection, 'socket', { ...descriptor, value: current })
+    const restore = () => {
+      if (!descriptor && current === undefined) {
+        delete connection.socket
+        return
+      }
+      Object.defineProperty(connection, 'socket', {
+        ...(descriptor ?? { writable: true, enumerable: true, configurable: true }),
+        value: current,
+      })
+    }
     if (this.bounded)
       this.owners.add(connection, restore, () => {
         const raw = current?.inner ?? current
@@ -1731,17 +1798,7 @@ class PublicTelemetryRound {
     const scripted = require('./scriptedCluster')
     const round = this
     this.subscription = { ...DEFAULT_SUBSCRIPTION, ...subscription }
-    this.patch(Date, 'now', () => () => 1000 + round.clock.now())
-    this.patch(process.hrtime, 'bigint', () => () => BigInt(round.clock.now()) * 1000000n)
-    const importedClock = require('node:perf_hooks').performance
-    const clockSpy = jest.spyOn(importedClock, 'now').mockImplementation(() => round.clock.now())
-    this.restores.push(() => clockSpy.mockRestore())
-    if (global.performance !== importedClock) {
-      const globalSpy = jest
-        .spyOn(global.performance, 'now')
-        .mockImplementation(() => round.clock.now())
-      this.restores.push(() => globalSpy.mockRestore())
-    }
+    this.installClocks()
     this.patch(
       TelemetryFactory.prototype,
       'bind',
@@ -1821,7 +1878,7 @@ class PublicTelemetryRound {
     this.wire.answer('PushTelemetry', () => ({}))
     if (sasl) this.wire.answer('SaslHandshake', () => ({ enabledMechanisms: ['OAUTHBEARER'] }))
     if (this.kind !== 'shareConsumer') await this.wait(() => this.createClient(client))
-    if (this.kind === 'producer') scripted.producerScript(this.wire)
+    if (this.kind === 'producer' || this.kind === 'admin') scripted.producerScript(this.wire)
     this.binding = this.bindings.at(-1) ?? null
     this.machine = this.binding?.machine ?? null
     this.metrics = this.binding?.metrics ?? null
@@ -1948,7 +2005,11 @@ class PublicTelemetryRound {
    * @returns {Promise<void>}
    */
   async connectForeground() {
-    if (this.kind === 'producer' || this.kind === 'admin') return this.client.connect()
+    if (this.kind === 'producer' || this.kind === 'admin') {
+      await this.client.connect()
+      await this.cluster.refreshMetadata()
+      return
+    }
     if (this.kind === 'shareConsumer') {
       const { ShareRunner } = require('../src/consumer/share/shareRunner')
       const round = this
@@ -2087,7 +2148,7 @@ class PublicTelemetryRound {
       closeEntry: this.closeEntry,
       reopen: machine.reopen ? { ...machine.reopen } : null,
       sequence: machine.sequence,
-      handle: machine.handle,
+      handle: machine.closing?.handle ?? machine.handle,
       telemetryHandleIdentity: machine.handle,
       dedicated: this.dedicatedCount(),
       frames: this.trace.count,
@@ -2162,6 +2223,7 @@ class PublicTelemetryRound {
         this.deferredReplacement = true
         return
       }
+      if (this.held?.gate instanceof DialGate) this.wire.up(this.node)
       return this.establish()
     }
     if (name === RELEASE_ACTIONS[2] || name === RELEASE_ACTIONS[3]) {
@@ -2179,6 +2241,7 @@ class PublicTelemetryRound {
         this.deliverCloseWatchdog()
       } else this.closePromise = this.beginClose(this.closeOptions(0))
       await this.settleClose()
+      if (this.held?.gate instanceof DialGate) this.wire.up(this.node)
       await this.client.connect()
       if (['S03', 'S12', 'S19b', 'S19f'].includes(this.held?.boundary)) {
         this.deferredReplacement = true
@@ -2781,6 +2844,7 @@ class PublicTelemetryRound {
       restore(() => process.off('unhandledRejection', this.listener))
       for (const undo of this.owners.drain()) restore(undo)
       while (this.restores.length) restore(this.restores.pop())
+      while (this.clockRestores.length) restore(this.clockRestores.pop())
     }
     if (failure) throw failure
   }
