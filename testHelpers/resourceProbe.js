@@ -323,33 +323,12 @@ const createResourceProbe = ({
 
   return {
     /**
-     * Takes every measurement after heap collection, when enabled, so weak owners are not pinned
-     * by the reading and transient resources in the collection gap are not reported as retained.
+     * Takes every measurement the probe was given a source for.
      * @returns {Promise<ResourceSnapshot>}
      */
     async snapshot() {
       const snapshot = {}
 
-      // Read weak owners only after collection: dereferencing them would keep them alive through it.
-      if (heap || memory) {
-        const heapUsed = await settledHeap(gc, pause)
-        if (heap) snapshot.heapUsed = heapUsed
-        if (memory) {
-          const usage = process.memoryUsage()
-          const rawMaxRss = process.resourceUsage().maxRSS * 1024
-          const status = readProcStatus()
-          snapshot.memory = {
-            heapUsed: usage.heapUsed,
-            external: usage.external,
-            retainedBytes: usage.heapUsed + usage.external,
-            rss: usage.rss,
-            peakRss: rawMaxRss,
-            rawMaxRss,
-            highWaterRss: status ? status.vmhwm : null,
-            highWaterSource: selectPeakSource(() => status)?.name ?? null,
-          }
-        }
-      }
       if (emitters) {
         snapshot.listeners = listenerCounts(emitters)
       }
@@ -378,9 +357,29 @@ const createResourceProbe = ({
       if (activeResources) {
         snapshot.activeResources = activeResourceCounts()
       }
+      if (heap || memory) {
+        const heapUsed = await settledHeap(gc, pause)
+        if (heap) snapshot.heapUsed = heapUsed
+        if (memory) {
+          const usage = process.memoryUsage()
+          const rawMaxRss = process.resourceUsage().maxRSS * 1024
+          const status = readProcStatus()
+          snapshot.memory = {
+            heapUsed: usage.heapUsed,
+            external: usage.external,
+            retainedBytes: usage.heapUsed + usage.external,
+            rss: usage.rss,
+            peakRss: rawMaxRss,
+            rawMaxRss,
+            highWaterRss: status ? status.vmhwm : null,
+            highWaterSource: selectPeakSource(() => status)?.name ?? null,
+          }
+        }
+      }
       if (identities) snapshot.identities = readIdentities()
       if (registrations) snapshot.registrations = readRegistrations()
       if (resources) snapshot.resources = resources.read()
+
       return snapshot
     },
   }
