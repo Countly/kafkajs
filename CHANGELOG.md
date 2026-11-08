@@ -81,6 +81,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Add deterministic share membership, session and acknowledgement fault matrices, with captured shutdown authority, exact record outcomes and resource cleanup checks.
 - Verify share delivery, acknowledgement types, locks, isolation, membership, recovery, shutdown and administration against live brokers.
 - Verify share capability refusals, broker-bounce recovery, Java interoperability and diagnostics channels.
+- Verify that an idempotent batch whose answer is lost across a leader change is re-sent with the same producer ID, epoch, sequence and bytes, and that no later batch of the partition is written before it is acknowledged. A broker that lost the producer's state can still append that re-send a second time; the client cannot detect it, as with the Java producer.
 
 #### Fixes
 
