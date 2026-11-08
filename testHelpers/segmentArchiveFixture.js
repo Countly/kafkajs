@@ -379,7 +379,9 @@ const buildShutdownModel = ({ stem = 'telemetry-shutdown-0a1b2c3d' } = {}) => {
   model.results.workMs = 60000
   const quiet = {
     activeResources: { Timeout: 2 },
-    identities: { openSockets: [], undischarged: [] },
+    identities: { openSockets: [], pending: [], undischarged: [] },
+    resources: { case: {}, quiet: {}, unknown: { Timeout: [3, 4] } },
+    registrations: { process: { id: 1, events: { exit: [2] } } },
   }
   model.results.resources = { baseline: quiet, final: JSON.parse(JSON.stringify(quiet)) }
   model.timing = { bodyMs: 60000, cleanupMs: 8000 }

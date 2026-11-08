@@ -13,11 +13,12 @@ const {
   runCase,
   stableCacheEvent,
   traceChunk,
+  verifyQuietResources,
 } = require('../../../scripts/e2e/telemetry/evidence')
 const { cacheRetirement, connectionIdentity } = require('../../../scripts/e2e/telemetry/cacheTrace')
 const { DecoderGate, withTelemetryResource } = require('../../../testHelpers/telemetryFixtures')
 const { SCHEDULES, TelemetrySegments } = require('../../../testHelpers/telemetrySegments')
-const { createResourceProbe } = require('../../../testHelpers/resourceProbe')
+const { createResourceProbe, ResourceRoles } = require('../../../testHelpers/resourceProbe')
 const { createChaosSocketFactory, FrameFilter } = require('../../../testHelpers/chaosSocket')
 const {
   bounded,
@@ -419,13 +420,35 @@ class ReopenCase {
     this.gate = new DecoderGate(DECODERS)
     this.consumed = new Set()
     attempt.segments = []
+    this.pending = new Set()
+    // The process's own stdio handles exist before the case, never as a case-time survivor.
+    if (!process.stdout || !process.stderr) throw new Error('The case needs process stdio')
+    this.roles = new ResourceRoles({ roles: ['case', 'quiet'] }).start()
     this.probe = createResourceProbe({
       activeResources: true,
+      resources: this.roles,
+      registrations: () => ({ process }),
       identities: () => ({
         openSockets: this.members.flatMap((m) => m.faults.openSockets()),
+        pending: [...this.pending],
         undischarged: this.members.flatMap((m) => m.segments.undischarged()),
       }),
     })
+  }
+
+  /**
+   * Counts one bounded case operation as a pending public call until it settles.
+   * @template T
+   * @param {function():Promise<T>} work the operation @returns {Promise<T>} its own outcome
+   */
+  async track(work) {
+    const token = {}
+    this.pending.add(token)
+    try {
+      return await work()
+    } finally {
+      this.pending.delete(token)
+    }
   }
 
   /** @param {function():Promise<void>|void} task release attempted by `close` @returns {void} */
@@ -462,7 +485,7 @@ class ReopenCase {
    * @returns {Promise<*>} its result
    */
   within(ms, label, op) {
-    return bounded(this.signal, ms, op, { label })
+    return this.track(() => bounded(this.signal, ms, op, { label }))
   }
 
   /**
@@ -473,7 +496,7 @@ class ReopenCase {
    * @returns {Promise<*>} its result
    */
   release(ms, label, op) {
-    return bounded(this.owner, ms, op, { label })
+    return this.track(() => bounded(this.owner, ms, op, { label }))
   }
 
   /**
@@ -802,19 +825,26 @@ class ReopenCase {
   }
 
   /**
-   * Waits the quiet window after every client and observer is gone, then requires the event-loop
-   * and owned-socket identities of the baseline, and no owned socket or segment left.
+   * Waits the quiet window after every client and observer is gone, lets the destroy hooks of what
+   * ended run, then requires exact quiet identities: no owned socket, segment or pending call, no
+   * case-created resource of any type, no unknown-owner resource the baseline did not hold, the
+   * same process listener registrations with multiplicity and the same event-loop counts.
    * @param {object} baseline the snapshot taken before anything was built
    * @returns {Promise<void>} after the comparison; the readings are kept in the case results
    */
   async quiet(baseline) {
-    await this.release(QUIET_MS + 2000, 'The quiet window', (scope) => delay(scope, QUIET_MS))
+    await this.roles.run('quiet', () =>
+      bounded(this.owner, QUIET_MS + 2000, (scope) => delay(scope, QUIET_MS), {
+        label: 'The quiet window',
+      })
+    )
+    await new Promise((resolve) => setImmediate(resolve))
+    await new Promise((resolve) => setImmediate(resolve))
     const final = await this.probe.snapshot()
     this.results.resources = { baseline, final }
     expect(this.members.every((m) => m.faults.records.every((r) => r.closed))).toBe(true)
     expect(this.gate.occupancy()).toEqual({ running: 0, queued: 0 })
-    expect(final.identities).toEqual({ openSockets: [], undischarged: [] })
-    expect(final.activeResources).toEqual(baseline.activeResources)
+    verifyQuietResources({ baseline, final })
   }
 
   /**
@@ -977,15 +1007,16 @@ live(
         stem: attempt.record.run.stem,
         attempt,
       })
+      cleanup.defer(() => scenario.roles.stop())
       const baseline = await scenario.probe.snapshot()
       cleanup.defer(() => scenario.quiet(baseline))
-      cleanup.defer(() => scenario.close())
+      cleanup.defer(() => scenario.roles.run('case', () => scenario.close()))
       await bounded(
         scope,
         BUDGET - 20000,
         (inner) => {
           scenario.signal = inner
-          return scenario.run()
+          return scenario.roles.run('case', () => scenario.run())
         },
         { label: 'The close and reopen scenario' }
       )
@@ -1045,17 +1076,61 @@ live(
       const rows = []
       const restore = exposeCollection()
       cleanup.defer(() => restore())
-      const result = await bounded(
-        scope,
-        CHURN_BUDGET,
-        () =>
-          main('telemetry', {
-            brokers: PORTS.map((port) => `localhost:${port}`),
-            telemetry: (options) =>
-              buildTelemetryChurn({ ...options, record: (row) => rows.push(row) }),
-          }),
-        { label: 'The telemetry churn' }
-      )
+      attempt.segments = []
+      attempt.record.results = { rows }
+      // Everything the run produced is attached before any assertion, failed or not.
+      const attach = (result) => {
+        attempt.segments = result.workers.map((worker) => ({
+          sealed: () => worker.facts?.sealed ?? worker.sealed ?? [],
+        }))
+        const manifest = JSON.parse(fs.readFileSync(MANIFEST_FILE, 'utf8'))
+        attempt.record = {
+          ...attempt.record,
+          wireVersions: { 71: 0, 72: 0 },
+          run: {
+            ...attempt.record.run,
+            composeSha256: fileSha(path.join(ROOT, 'docker-compose.telemetry.yml')),
+          },
+          fixture: {
+            manifestSha256: fileSha(MANIFEST_FILE),
+            reporterJar: manifest.lines[line].reporterJar,
+          },
+          oracles: { churn: result.archive },
+          results: {
+            rows,
+            verdict: {
+              ok: result.ok,
+              setupMs: result.setupMs,
+              cleanupMs: result.cleanupMs,
+              totalMs: result.totalMs,
+            },
+          },
+        }
+      }
+      let parent
+      let result
+      try {
+        result = await bounded(
+          scope,
+          CHURN_BUDGET,
+          () =>
+            main('telemetry', {
+              brokers: PORTS.map((port) => `localhost:${port}`),
+              telemetry: (options) =>
+                (parent = buildTelemetryChurn({ ...options, record: (row) => rows.push(row) })),
+            }),
+          { label: 'The telemetry churn' }
+        )
+      } catch (error) {
+        if (!parent?.lastResult) throw error
+        try {
+          attach(parent.lastResult)
+        } catch (attachError) {
+          throw new AggregateError([error, attachError], 'The failed churn could not be attached')
+        }
+        throw error
+      }
+      attach(result)
       attempt.stage = 'verification'
       expect(result.clientKinds).toEqual(['producer', 'consumer', 'admin', 'shareConsumer'])
       expect(result.workers).toHaveLength(4)
@@ -1079,30 +1154,7 @@ live(
       expect(result.cleanupMs).toBeLessThanOrEqual(120000)
       expect(result.totalMs).toBeLessThanOrEqual(CHURN_BUDGET)
       expect(result.ok).toBe(true)
-      const manifest = JSON.parse(fs.readFileSync(MANIFEST_FILE, 'utf8'))
-      attempt.segments = result.workers.map((worker) => ({ sealed: () => worker.facts.sealed }))
-      attempt.record = {
-        ...attempt.record,
-        wireVersions: { 71: 0, 72: 0 },
-        run: {
-          ...attempt.record.run,
-          composeSha256: fileSha(path.join(ROOT, 'docker-compose.telemetry.yml')),
-        },
-        fixture: {
-          manifestSha256: fileSha(MANIFEST_FILE),
-          reporterJar: manifest.lines[line].reporterJar,
-        },
-        oracles: { churn: result.archive },
-        results: {
-          rows,
-          verdict: {
-            ok: result.ok,
-            setupMs: result.setupMs,
-            cleanupMs: result.cleanupMs,
-            totalMs: result.totalMs,
-          },
-        },
-      }
+
       publish({ name: 'telemetry-churn', directory, observers: {}, record: attempt.record })
     })
   ),

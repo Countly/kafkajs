@@ -2875,7 +2875,12 @@ describe('telemetry observation segments', () => {
       disconnect: jest.fn(async function disconnect() {
         order.push(`disconnect:${segments.current().id}`)
         for (const socket of this.sockets.splice(0)) socket.emit('close')
-        setImmediate(() => order.push('immediate'))
+        this.immediate = new Promise((resolve) =>
+          setImmediate(() => {
+            order.push('immediate')
+            resolve()
+          })
+        )
       }),
       connect: jest.fn(function connect() {
         order.push('connect')
@@ -2914,6 +2919,8 @@ describe('telemetry observation segments', () => {
     expect(segments.current().id).toBe('producer-ep-1')
     expect(client.connect).not.toHaveBeenCalled()
     await Promise.all([cycle.closed, cycle.reopened])
+    expect(order).toEqual(['disconnect:producer-ep-1', 'connect'])
+    await client.immediate
     expect(order).toEqual(['disconnect:producer-ep-1', 'connect', 'immediate'])
     const notes = segments.journal()
     expect(notes.map((n) => n.type)).toEqual(['select', 'disconnect-resolved', 'connect-called'])
@@ -3149,7 +3156,12 @@ describe('telemetry profile', () => {
       disconnect: jest.fn(async function disconnect() {
         order.push(`disconnect:${segments.current().id}`)
         for (const socket of this.sockets.splice(0)) socket.emit('close')
-        setImmediate(() => order.push('immediate'))
+        this.immediate = new Promise((resolve) =>
+          setImmediate(() => {
+            order.push('immediate')
+            resolve()
+          })
+        )
       }),
       connect: jest.fn(function connect() {
         order.push('connect')
@@ -3235,6 +3247,8 @@ describe('telemetry profile', () => {
     const cycle = l9.cycle(fake)
     expect(l9.current().id).toBe('producer-lc-1')
     await Promise.all([cycle.closed, cycle.reopened])
+    expect(order).toEqual(['disconnect:producer-lc-1', 'connect'])
+    await fake.immediate
     expect(order).toEqual(['disconnect:producer-lc-1', 'connect', 'immediate'])
     expect(() => l9.cycle(fake)).toThrow('Two undischarged observer segments exist')
     await expect(l9.discharge(l9.current())).rejects.toThrow('is still active')
@@ -3496,6 +3510,13 @@ describe('telemetry profile', () => {
         'Required resource source catalogue differs',
         (t) => {
           delete t.record.results.resources.baseline.identities.openSockets
+        },
+      ],
+      [
+        'a case-created timer that survives the quiet window',
+        'A case resource survives the quiet window',
+        (t) => {
+          t.record.results.resources.final.resources.case = { Timeout: [11] }
         },
       ],
       [

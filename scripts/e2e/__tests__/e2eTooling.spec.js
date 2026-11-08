@@ -2161,3 +2161,87 @@ describe('segmented evidence in the cleanup manifest', () => {
     expect(() => verify()).toThrow(diagnostic)
   })
 })
+
+describe('quiet-window resource identities', () => {
+  const { verifyQuietResources } = require('../telemetry/evidence')
+  /** Baseline and final readings of a case that left exactly what it found. */
+  const readings = () => {
+    const reading = () => ({
+      activeResources: { Timeout: 2, TCPWRAP: 0 },
+      identities: { openSockets: [], pending: [], undischarged: [] },
+      resources: { case: {}, quiet: {}, unknown: { Timeout: [4, 9] } },
+      registrations: { process: { id: 1, events: { exit: [2], warning: [3] } } },
+    })
+    return { baseline: reading(), final: reading() }
+  }
+  const verify = (change = () => {}) => {
+    const input = readings()
+    change(input)
+    return () => verifyQuietResources(input)
+  }
+
+  test('accepts a case that left exactly the baseline identities', () => {
+    expect(verify()).not.toThrow()
+    expect(verify(({ final }) => (final.resources.unknown.Timeout = [9]))).not.toThrow()
+  })
+
+  test.each([
+    [
+      'a same-count substituted timer',
+      ({ final }) => (final.resources.unknown.Timeout = [4, 12]),
+      'An unknown-owner resource created during the case survives',
+    ],
+    [
+      'a surviving unknown-owner handle',
+      ({ final }) => (final.resources.unknown.TCPWRAP = [30]),
+      'An unknown-owner resource created during the case survives',
+    ],
+    [
+      'a surviving case timer',
+      ({ final }) => (final.resources.case = { Timeout: [17] }),
+      'A case resource survives the quiet window',
+    ],
+    [
+      'a surviving quiet-window timer',
+      ({ final }) => (final.resources.quiet = { Timeout: [18] }),
+      'A quiet resource survives the quiet window',
+    ],
+    [
+      'a duplicate listener registration',
+      ({ final }) => (final.registrations.process.events.exit = [2, 2]),
+      'Listener registrations differ from the baseline',
+    ],
+    [
+      'a substituted listener at the same count',
+      ({ final }) => (final.registrations.process.events.warning = [5]),
+      'Listener registrations differ from the baseline',
+    ],
+    [
+      'a pending public call',
+      ({ final }) => (final.identities.pending = [3]),
+      'Owned resources survive the quiet window',
+    ],
+    [
+      'a missing identity source',
+      ({ baseline }) => delete baseline.identities.pending,
+      'Required resource source catalogue differs',
+    ],
+    [
+      'a missing role source',
+      ({ final }) => delete final.resources.quiet,
+      'Required resource role catalogue differs',
+    ],
+    [
+      'a missing registration source',
+      ({ final }) => delete final.registrations,
+      'Required registration source differs',
+    ],
+    [
+      'a changed event-loop count',
+      ({ final }) => (final.activeResources.Timeout = 3),
+      'Quiet resources differ',
+    ],
+  ])('refuses %s', (_name, change, message) => {
+    expect(verify(change)).toThrow(message)
+  })
+})

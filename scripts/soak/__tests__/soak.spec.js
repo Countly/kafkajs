@@ -6636,16 +6636,40 @@ describe('Share soak complete original-owner schedules', () => {
 })
 
 /**
- * A complete, flat telemetry resident-size reference: the control agrees with itself, every peak
- * covers its own current reading and no later peak is lower, so only a deliberate change fails.
+ * A complete, flat telemetry resident-size reference of the versioned catalogue: every reading has
+ * its phase, time and counters with `retained = heapUsed + external`, settled readings carry real
+ * collection facts, the control agrees with itself and replays its frozen catalogue, every peak
+ * covers its own and every earlier current reading, so only a deliberate change fails.
  */
-const reading = (over = {}) => ({
-  rss: 70 * MIB,
-  external: 4 * MIB,
-  retained: 20 * MIB,
-  hwm: 80 * MIB,
-  ...over,
-})
+const AT = { startup: 0, loaded: 1, c0: 2, c1: 3, 'control-released': 4, settled: 10, final: 20 }
+const SETTLED = new Set(['c0', 'c1', 'control-released', 'settled'])
+const reading = (phase, over = {}) => {
+  const r = {
+    phase,
+    at: AT[phase],
+    rss: 70 * MIB,
+    heapUsed: 16 * MIB,
+    external: 4 * MIB,
+    arrayBuffers: 1 * MIB,
+    hwm: 80 * MIB,
+    rawMaxRss: 300 * MIB,
+    ...over,
+  }
+  r.retained = r.heapUsed + r.external
+  if (SETTLED.has(phase)) r.gc = { admittedAt: r.at - 1, completedAt: r.at, observed: 2 }
+  return r
+}
+/** A settled probe reading whose `retainedBytes` is the given value. */
+const settledMemory = (retainedBytes = 10000000, over = {}) => {
+  const r = reading('settled', { heapUsed: retainedBytes - 4 * MIB, ...over })
+  return { ...r, retainedBytes: r.retained }
+}
+/** Grows the heap of one settled reading by `bytes`, keeping its arithmetic. */
+const grow = (memory, bytes) => {
+  memory.heapUsed += bytes
+  memory.retained += bytes
+  memory.retainedBytes += bytes
+}
 const host = () => ({
   cpus: 4,
   load1: 0.4,
@@ -6653,27 +6677,62 @@ const host = () => ({
   freeBytes: 1024 * MIB,
   pressure: { available: true, someAvg10: 0 },
 })
+const operations = [0, 1].map((n) => ({
+  n,
+  op: 'send',
+  topic: 'ctl',
+  valueBytes: 7,
+  expected: 'fulfilled',
+}))
+const outcomes = () => [0, 1].map((n) => ({ n, status: 'fulfilled', at: 2 + n / 10 }))
 const reference = () => ({
-  version: 'rss-reference-1',
+  version: 'rss-reference-2',
   source: 'proc-status-vmhwm',
+  units: 'bytes',
   capability: { gc: true, peak: true },
-  startup: reading({ rss: 40 * MIB, hwm: 41 * MIB }),
-  loaded: reading({ rss: 68 * MIB, hwm: 70 * MIB }),
+  startup: reading('startup', { rss: 40 * MIB, hwm: 41 * MIB }),
+  loaded: reading('loaded', { rss: 68 * MIB, hwm: 70 * MIB }),
   control: {
+    manifest: { kind: 'producer', topic: 't', joins: false, operations, lifecycles: 1 },
+    outcomes: outcomes(),
     telemetryFrames: 0,
     openSockets: 0,
     leftoverHandles: 0,
-    c0: reading(),
-    c1: reading(),
-    released: reading(),
+    c0: reading('c0'),
+    c1: reading('c1'),
+    released: reading('control-released'),
   },
-  final: reading(),
+  foreground: outcomes(),
+  native: {
+    journal: {
+      rows: [
+        {
+          id: 1,
+          codec: 'gzip',
+          outcome: 'resolved',
+          submitted: { rss: 70 * MIB, external: 4 * MIB },
+          settled: { rss: 70 * MIB, external: 4 * MIB },
+        },
+      ],
+      maxLive: 1,
+      live: 0,
+      overflow: false,
+    },
+    sampler: {
+      count: 2,
+      windows: 1,
+      maxGapMs: 0,
+      intervalMs: 20,
+      peak: { rss: 70 * MIB, heapUsed: 16 * MIB, external: 4 * MIB, arrayBuffers: MIB },
+    },
+  },
+  final: reading('final'),
   host: { before: host(), boundary: host(), after: host() },
 })
 
 describe('telemetry resource evidence', () => {
   const snapshot = (bytes = 10000000, overrides = {}) => ({
-    memory: { retainedBytes: bytes, rss: 70 * MIB, external: 4 * MIB, hwm: 80 * MIB },
+    memory: settledMemory(bytes),
     registryDigest: 'retained-state',
     identities: {
       sockets: [],
@@ -6880,14 +6939,14 @@ describe('telemetry resource evidence', () => {
     [
       'closed transient overflow',
       (r) => {
-        r.teardown.memory.retainedBytes += 262144 + 1
+        grow(r.teardown.memory, 262144 + 1)
       },
       'closed transient ceiling',
     ],
     [
       'active overflow',
       (r) => {
-        r.samples[5].snapshot.memory.retainedBytes += 8388608 + 1
+        grow(r.samples[5].snapshot.memory, 8388608 + 1)
       },
       'active retained ceiling',
     ],
@@ -6895,7 +6954,7 @@ describe('telemetry resource evidence', () => {
       'steep slope',
       (r) => {
         r.samples.forEach((s, i) => {
-          s.snapshot.memory.retainedBytes += i * 32769
+          grow(s.snapshot.memory, i * 32769)
         })
       },
       'retained slope',
@@ -6903,7 +6962,7 @@ describe('telemetry resource evidence', () => {
     [
       'last endpoint',
       (r) => {
-        r.samples.at(-1).snapshot.memory.retainedBytes += 1048576 + 1
+        grow(r.samples.at(-1).snapshot.memory, 1048576 + 1)
       },
       'retained endpoint',
     ],
@@ -6916,10 +6975,8 @@ describe('telemetry resource evidence', () => {
 
   test('accepts the closed transient and active ceilings at equality', () => {
     const input = run()
-    input.teardown.memory.retainedBytes += 262144
-    input.samples.forEach((s) => {
-      s.snapshot.memory.retainedBytes += 8388608
-    })
+    grow(input.teardown.memory, 262144)
+    input.samples.forEach((s) => grow(s.snapshot.memory, 8388608))
     expect(evaluate(input).ok).toBe(true)
   })
 
@@ -6946,7 +7003,7 @@ describe('telemetry resource evidence', () => {
 
 describe('telemetry resident-size reference', () => {
   const snapshot = (memory = {}) => ({
-    memory: { retainedBytes: 10000000, rss: 70 * MIB, external: 4 * MIB, hwm: 80 * MIB, ...memory },
+    memory: settledMemory(10000000, memory),
     registryDigest: 'one-kind',
     identities: {
       sockets: [],
@@ -6969,17 +7026,22 @@ describe('telemetry resident-size reference', () => {
     reference: reference(),
   })
   const evaluate = (input) => TelemetryResourceVerdict.evaluate(input)
+  /** Sets external memory and keeps `retained = heapUsed + external`. */
+  const setExternal = (memory, external) => {
+    memory.external = external
+    memory.retained = memory.heapUsed + external
+    if (memory.retainedBytes !== undefined) memory.retainedBytes = memory.retained
+  }
   /** Raises the peak of one mid-run reading and everything after it, as a real high water would. */
   const raise = (input, hwm, external) => {
-    input.samples.slice(4).forEach((s) => {
-      s.snapshot.memory.hwm = hwm
-      if (external !== undefined) s.snapshot.memory.external = external
-    })
-    input.teardown.memory.hwm = hwm
-    input.reference.final.hwm = hwm
-    if (external !== undefined) {
-      input.teardown.memory.external = external
-      input.reference.final.external = external
+    const later = [
+      ...input.samples.slice(4).map((s) => s.snapshot.memory),
+      input.teardown.memory,
+      input.reference.final,
+    ]
+    for (const memory of later) {
+      memory.hwm = hwm
+      if (external !== undefined) setExternal(memory, external)
     }
   }
 
@@ -7037,6 +7099,7 @@ describe('telemetry resident-size reference', () => {
     expect(evaluate(drift)).toMatchObject({ ok: false, outcome: 'inconclusive' })
     expect(evaluate(drift).inconclusive).toContain('unstable control')
     const retained = make()
+    retained.reference.control.c1.heapUsed += 262145
     retained.reference.control.c1.retained += 262145
     expect(evaluate(retained).inconclusive).toContain('unstable control')
     const steady = make()
@@ -7104,7 +7167,108 @@ describe('telemetry resident-size reference', () => {
       (r) => {
         delete r.reference.loaded.external
       },
-      'resident-size reading shape',
+      'resident-size counters',
+    ],
+    [
+      'the first schema',
+      (r) => (r.reference.version = 'rss-reference-1'),
+      'resident-size reference facts',
+    ],
+    ['missing units', (r) => delete r.reference.units, 'resident-size peak source'],
+    [
+      'a missing arrayBuffers',
+      (r) => delete r.samples[3].snapshot.memory.arrayBuffers,
+      'resident-size counters',
+    ],
+    [
+      'a missing raw maxRSS',
+      (r) => delete r.reference.control.c0.rawMaxRss,
+      'resident-size counters',
+    ],
+    ['a negative counter', (r) => (r.reference.final.rss = -1), 'resident-size counters'],
+    [
+      'retained that is not heapUsed plus external',
+      (r) => (r.baseline.memory.retainedBytes += 1),
+      'resident-size arithmetic',
+    ],
+    [
+      'arrayBuffers outside external',
+      (r) => (r.reference.loaded.arrayBuffers = r.reference.loaded.external + 1),
+      'resident-size arithmetic',
+    ],
+    [
+      'a nonfinite control retained value',
+      (r) => (r.reference.control.c1.retained = NaN),
+      'resident-size arithmetic',
+    ],
+    ['a missing phase label', (r) => delete r.teardown.memory.phase, 'resident-size reading phase'],
+    [
+      'a swapped phase label',
+      (r) => (r.reference.control.c0.phase = 'c1'),
+      'resident-size reading phase',
+    ],
+    ['a missing reading time', (r) => delete r.reference.startup.at, 'resident-size reading time'],
+    [
+      'readings out of chronological order',
+      (r) => (r.reference.loaded.at = r.reference.control.c0.at + 1),
+      'resident-size reading order',
+    ],
+    [
+      'a settled reading without collection facts',
+      (r) => delete r.samples[2].snapshot.memory.gc,
+      'resident-size collection facts',
+    ],
+    [
+      'a settled reading with one collection',
+      (r) => (r.reference.control.released.gc.observed = 1),
+      'resident-size collection facts',
+    ],
+    [
+      'a collection completed elsewhere',
+      (r) => (r.baseline.memory.gc.completedAt = r.baseline.memory.at + 1),
+      'resident-size collection facts',
+    ],
+    [
+      'a native journal overflow',
+      (r) => (r.reference.native.journal.overflow = true),
+      'native work journal',
+    ],
+    ['pending native work', (r) => (r.reference.native.journal.live = 1), 'native work journal'],
+    [
+      'an unsettled native job',
+      (r) => (r.reference.native.journal.rows[0].outcome = null),
+      'native work journal',
+    ],
+    [
+      'native work the sampler did not cover',
+      (r) => (r.reference.native.sampler.count = 1),
+      'native work journal',
+    ],
+    ['a missing native journal', (r) => delete r.reference.native, 'native work journal'],
+    [
+      'an external spike only the native sampler saw',
+      (r) => (r.reference.native.sampler.peak.external = 4 * MIB + 64 * MIB + 1),
+      'external-memory increase',
+    ],
+    [
+      'a resident spike at a native settlement',
+      (r) => (r.reference.native.journal.rows[0].settled.rss = 70 * MIB + 64 * MIB + 1),
+      'telemetry resident-size increase',
+    ],
+    [
+      'a control operation that failed',
+      (r) => (r.reference.control.outcomes[1].status = 'rejected'),
+      'telemetry-disabled control',
+    ],
+    [
+      'a control without its frozen manifest',
+      (r) => delete r.reference.control.manifest,
+      'telemetry-disabled control',
+    ],
+    [
+      'an enabled worker that did not replay the control catalogue',
+      (r) => r.reference.foreground.pop(),
+      'enabled replay of the control catalogue',
     ],
     ['a missing host context', (r) => delete r.reference.host.boundary, 'host contexts'],
   ])('fails %s', (_name, change, label) => {
@@ -7112,6 +7276,16 @@ describe('telemetry resident-size reference', () => {
     change(input)
     expect(evaluate(input).violations).toContain(label)
     expect(evaluate(input).ok).toBe(false)
+  })
+
+  test('keeps an unavailable peak source inconclusive rather than a malformed reading', () => {
+    const input = make()
+    for (const memory of [input.reference.startup, input.reference.final, input.baseline.memory])
+      memory.hwm = null
+    const verdict = evaluate(input)
+    expect(verdict.violations).toEqual([])
+    expect(verdict).toMatchObject({ ok: false, outcome: 'inconclusive' })
+    expect(verdict.inconclusive).toContain('resident-size peak capability')
   })
 
   test('is inconclusive on a noisy host and keeps the unavailable pressure capability visible', () => {
@@ -7159,95 +7333,118 @@ describe('telemetry sampler ownership', () => {
     expect(order).toEqual(['snapshot', 'teardown', 'snapshot', 'judge'])
   })
 
-  test('stops and joins the sampler at the workload boundary before its cleanup runs', async () => {
-    const rows = []
-    let tick = 0
-    let atBoundary
-    const soak = new Soak({
-      kafka: {},
-      phases: [{ name: 'telemetry', workload: 'telemetry', ms: 1 }],
-      context: {},
-      settleMs: 0,
-      sampleMs: 1,
-      warmupMs: 0,
-      probe: { snapshot: async () => ({ sockets: { open: 0 } }) },
-      clock: { now: () => ++tick },
-      record: (row) => rows.push(row),
-      workloads: {
-        telemetry: async () => {
-          await new Promise((resolve) => setTimeout(resolve, 30))
-          await soak.endSampling()
-          atBoundary = rows.filter(({ kind }) => kind === 'sample').length
-          await new Promise((resolve) => setTimeout(resolve, 30))
-        },
-      },
-      judge: () => ({ ok: true, violations: [] }),
+  /** A scheduler barrier and an admitted read controlled independently of the wall clock. */
+  const deferred = () => {
+    let resolve
+    let reject
+    const promise = new Promise((yes, no) => {
+      resolve = yes
+      reject = no
     })
-    await soak.run()
-    expect(atBoundary).toBeGreaterThan(0)
-    expect(rows.filter(({ kind }) => kind === 'sample')).toHaveLength(atBoundary)
-  })
-
-  test('records admission and completion times on the fixed grid, skipping a time already past', async () => {
+    return { promise, resolve, reject }
+  }
+  const controlled = () => {
+    let now = 0
+    const held = deferred()
+    const admitted = deferred()
+    const workload = deferred()
     const rows = []
+    let first = true
     const soak = new Soak({
       kafka: {},
-      phases: [{ name: 'telemetry', workload: 'telemetry', ms: 1 }],
       context: {},
+      phases: [],
       settleMs: 0,
       sampleAt: [0, 20, 40, 60],
-      warmupMs: 0,
+      clock: { now: () => now },
       probe: {
         snapshot: async () => {
-          await new Promise((resolve) => setTimeout(resolve, 5))
-          return { sockets: { open: 0 } }
+          if (!first) return { sockets: { open: 0 } }
+          first = false
+          admitted.resolve()
+          return held.promise
         },
       },
       record: (row) => rows.push(row),
-      workloads: {
-        telemetry: async () => {
-          expect(soak.phaseStartedAt).not.toBeNull()
-          await new Promise((resolve) => setTimeout(resolve, 100))
-          await soak.endSampling()
-        },
+      workloads: { telemetry: () => workload.promise },
+    })
+    const naps = []
+    soak.nap = (ms) => {
+      const next = deferred()
+      naps.push({ ms, wake: next.resolve })
+      soak.wake = next.resolve
+      return next.promise
+    }
+    const running = soak.runPhase({ name: 'telemetry', workload: 'telemetry', ms: 100 }, 0)
+    running.catch(() => {})
+    return {
+      soak,
+      held,
+      admitted,
+      workload,
+      rows,
+      naps,
+      running,
+      at: (value) => {
+        now = value
       },
-      judge: () => ({ ok: true, violations: [] }),
+    }
+  }
+
+  test('endSampling joins a held admitted read and admits nothing after its boundary', async () => {
+    const c = controlled()
+    c.naps[0].wake()
+    await c.admitted.promise
+    c.at(50)
+    let joined = false
+    const joining = c.soak.endSampling().then(() => {
+      joined = true
     })
-    await soak.run()
-    const samples = rows.filter(({ kind }) => kind === 'sample')
-    expect(samples.length).toBeGreaterThanOrEqual(3)
-    samples.forEach((sample, index) => {
-      expect(sample.admittedPhaseMs).toBeGreaterThanOrEqual([0, 20, 40, 60][index] - 2)
-      expect(sample.phaseMs).toBeGreaterThanOrEqual(sample.admittedPhaseMs + 3)
-      expect(sample.atMs).toBeGreaterThanOrEqual(sample.admittedAtMs)
-    })
+    await Promise.resolve()
+    expect(joined).toBe(false)
+    c.held.resolve({ sockets: { open: 0 } })
+    await joining
+    expect(c.soak.samples).toMatchObject([{ admittedPhaseMs: 0, phaseMs: 50 }])
+    expect(c.naps).toHaveLength(1)
+    c.workload.resolve()
+    await c.running
+    expect(c.soak.samples).toHaveLength(1)
   })
 
-  test('keeps a late read failure as a fact and rejects the join', async () => {
-    const soak = new Soak({
-      kafka: {},
-      phases: [{ name: 'telemetry', workload: 'telemetry', ms: 1 }],
-      context: {},
-      settleMs: 0,
-      sampleAt: [5],
-      warmupMs: 0,
-      probe: {
-        snapshot: async () => {
-          if (soak.phaseStartedAt !== null) throw new Error('late read')
-          return { sockets: { open: 0 } }
-        },
-      },
-      record: () => {},
-      workloads: {
-        telemetry: async () => {
-          await new Promise((resolve) => setTimeout(resolve, 30))
-          await soak.endSampling()
-        },
-      },
-      judge: () => ({ ok: true, violations: [] }),
-    })
-    await expect(soak.run()).rejects.toThrow('late read')
-    expect(soak.readFailures).toHaveLength(1)
-    expect(soak.readFailures[0].message).toBe('late read')
+  test('records an overrun at its actual times and skips exactly the elapsed grid slots', async () => {
+    const c = controlled()
+    c.naps[0].wake()
+    await c.admitted.promise
+    c.at(50)
+    const sampled = deferred()
+    c.soak.record = (row) => {
+      c.rows.push(row)
+      if (row.kind === 'sample') sampled.resolve()
+    }
+    c.held.resolve({ sockets: { open: 0 } })
+    await sampled.promise
+    expect(c.soak.skipped).toEqual([20, 40])
+    expect(c.naps[1].ms).toBe(10)
+    expect(c.soak.samples[0]).toMatchObject({ admittedPhaseMs: 0, phaseMs: 50 })
+    await c.soak.endSampling()
+    c.workload.resolve()
+    await c.running
+    expect(c.soak.samples).toHaveLength(1)
+  })
+
+  test('preserves a held read rejection when stopping and joins without another admission', async () => {
+    const c = controlled()
+    c.naps[0].wake()
+    await c.admitted.promise
+    const error = new Error('late read')
+    const joining = c.soak.endSampling()
+    joining.catch(() => {})
+    c.at(50)
+    c.held.reject(error)
+    await expect(joining).rejects.toBe(error)
+    expect(c.soak.readFailures).toEqual([{ admittedPhaseMs: 0, message: 'late read' }])
+    c.workload.resolve()
+    await expect(c.running).rejects.toBe(error)
+    expect(c.naps).toHaveLength(1)
   })
 })

@@ -14,18 +14,38 @@
 const crypto = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
+const zlib = require('node:zlib')
 // eslint-disable-next-line n/no-unsupported-features/node-builtins -- development driver; only the resource lifetime hooks are used
 const { AsyncLocalStorage, createHook } = require('node:async_hooks')
 const { fork } = require('node:child_process')
 const { createChaosSocketFactory, FrameFilter } = require('../../testHelpers/chaosSocket')
-const { DecoderGate, TelemetryWireObserver } = require('../../testHelpers/telemetryFixtures')
-const { TelemetrySegments } = require('../../testHelpers/telemetrySegments')
-const { readProcStatus } = require('../../testHelpers/processMemory')
+const {
+  DecoderGate,
+  TelemetryWireObserver,
+  readExports,
+} = require('../../testHelpers/telemetryFixtures')
+const {
+  TelemetrySegments,
+  checkSegmentFiles,
+  FILE_BOUND,
+} = require('../../testHelpers/telemetrySegments')
+const {
+  NativeJournal,
+  PendingSampler,
+  ProcessMemory,
+  readProcStatus,
+} = require('../../testHelpers/processMemory')
+const gzipCodec = require('../../src/protocol/message/compression/gzip')
+const zstdCodec = require('../../src/protocol/message/compression/zstd')
 const {
   ShareTrace,
+  acknowledgementResponse,
   confirmedDecisions,
   heldAcquisitions,
 } = require('../e2e/telemetry/shareEvidence')
+const { readRequestHeader } = require('../../testHelpers/fakeSocket')
+const shareFetchWire = require('../../testHelpers/wire/shareFetchV2')
+const shareAckWire = require('../../testHelpers/wire/shareAcknowledgeV2')
 
 const SCENARIO = 'telemetry-churn'
 const KINDS = Object.freeze(['producer', 'consumer', 'admin', 'shareConsumer'])
@@ -52,12 +72,15 @@ const CUSTOM_PREFIX = SUBSCRIPTIONS[0]
 const PUSH_INTERVAL_MS = 1000
 const TICK_PROOF_MS = 5000
 const MIB = 1048576
+/** Native compression rows one worker journals: one per Push of a 360 s run at 1 s, with room. */
+const NATIVE_ROWS = 1024
 const CONTROL = Object.freeze({
   rssDriftBytes: 2 * MIB,
   retainedDriftBytes: 262144,
   idleMs: 2000,
   setupPeakBytes: 96 * MIB,
   catalogue: Object.freeze({ producer: 20, consumer: 0, admin: 10, shareConsumer: 0 }),
+  valueBytes: 7,
 })
 const TRACKED = new Set([
   'Timeout',
@@ -79,6 +102,7 @@ const MESSAGE_TYPES = Object.freeze({
     'failure',
     'receipt',
     'unhandled',
+    'progress',
   ],
   once: ['hello', 'ready', 'phase', 'result', 'receipt'],
 })
@@ -119,6 +143,20 @@ const valueOf = (id) => Buffer.from(id.padEnd(CORPUS.bytes, '.'))
  * @param {Buffer|string} bytes data @returns {string} lower-case SHA-256 hex
  */
 const sha = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex')
+
+/**
+ * @param {number} type the Push compression type: 0 none, 1 GZIP, 4 ZSTD
+ * @param {Buffer} blob the transmitted bytes
+ * @returns {Buffer} the raw MetricsData, at most 4096 bytes @throws {Error} for another type
+ */
+const decompressBounded = (type, blob) => {
+  const options = { maxOutputLength: 4096 }
+  if (type === 0) return blob
+  if (type === 1) return zlib.gunzipSync(blob, options)
+  // eslint-disable-next-line n/no-unsupported-features/node-builtins -- required live Node lines provide the built-in codec
+  if (type === 4) return zlib.zstdDecompressSync(blob, options)
+  throw new Error('Unsupported captured compression')
+}
 
 /**
  * @param {string[]|number[]} ids identities @returns {string} hash of the sorted identity list
@@ -176,17 +214,23 @@ const readMemory = (phase, now = () => performance.now()) => {
 /**
  * Two collections 100 ms apart with the collection callbacks left to settle, then a reading.
  * @param {string} phase the reading's place in the fixed catalogue
- * @param {object} io `{gc, pause, now}`; the pause must let timers and immediates run
- * @returns {Promise<object>} the settled reading, with the admission and completion times
+ * @param {object} io `{gc, pause, now, collections}`; the pause must let timers and immediates run,
+ *   `collections` counts the collections the engine reported so far
+ * @returns {Promise<object>} the settled reading with `gc: {admittedAt, completedAt, observed}`
  */
-const settledReading = async (phase, { gc, pause, now }) => {
+const settledReading = async (phase, { gc, pause, now, collections = () => 0 }) => {
   const admittedAt = now()
+  const before = collections()
   gc()
   await pause(100)
   gc()
   await new Promise((resolve) => setImmediate(resolve))
   await new Promise((resolve) => setImmediate(resolve))
-  return { ...readMemory(phase, now), admittedAt }
+  const reading = readMemory(phase, now)
+  return {
+    ...reading,
+    gc: { admittedAt, completedAt: reading.at, observed: collections() - before },
+  }
 }
 
 /**
@@ -229,6 +273,7 @@ const compactRuns = (facts) => {
       last.type === fact.type &&
       last.at === fact.at &&
       last.errorCode === fact.errorCode &&
+      last.exchange === fact.exchange &&
       BigInt(last.lastOffset) + 1n === BigInt(fact.offset)
     if (joins) last.lastOffset = fact.offset
     else
@@ -236,6 +281,22 @@ const compactRuns = (facts) => {
   }
   return runs.map(({ offset, ...run }) => run)
 }
+
+/**
+ * The write fence of one registry call: the observer cursor of every segment that can still record a
+ * request. A request recorded after the cursor of its own segment, or in a segment created after all
+ * of them, was written after the call returned.
+ * @param {TelemetrySegments} segments the owner of the client's observer segments
+ * @returns {{cursors:Object<string,number>}} cursor by segment ID
+ */
+const writeFence = (segments) => ({
+  cursors: Object.fromEntries(
+    segments
+      .undischarged()
+      .filter((segment) => segment.observer)
+      .map((segment) => [segment.id, segment.observer.checkpoint()])
+  ),
+})
 
 /**
  * The deterministic action table of one run, derived from the fixed schedule alone: what happens at
@@ -384,11 +445,18 @@ class Registry {
    * @param {number} [count] canonical descriptors
    * @param {{now:function():number}} [clock] monotonic time for the replacement journal
    */
-  constructor(client, kind, count = DESCRIPTORS, clock = { now: () => performance.now() }) {
+  constructor(
+    client,
+    kind,
+    count = DESCRIPTORS,
+    clock = { now: () => performance.now() },
+    fence = () => null
+  ) {
     this.client = client
     this.kind = kind
     this.count = count
     this.clock = clock
+    this.fence = fence
     this.variant = 'a'
     this.registered = []
     this.bytes = 0
@@ -450,17 +518,26 @@ class Registry {
   }
 
   /**
-   * Swaps slot 0 for an identity of the same charge and journals both calls.
+   * Swaps slot 0 for another attribute identity of the same charge: an unregistration followed by a
+   * registration, never a same-identity update. Both write fences are journalled, each the
+   * observer cursors of every live segment at the moment the call returned, so a replay places
+   * every later Push on the correct side of each call without any elapsed-time grace.
    * @param {number} [tick] the tick that asked for the swap
-   * @returns {{tick:number|null, removedVariant:string, addedVariant:string, at:number}} the entry
+   * @returns {{type:'replace', tick:number|null, removedVariant:string, addedVariant:string,
+   *   unregisteredAt:number, registeredAt:number, unregisterFence:object, registerFence:object,
+   *   at:number}} the journal entry
    */
   replace(tick = null) {
     const next = this.variant === 'a' ? 'b' : 'a'
-    const entry = { tick, removedVariant: this.variant, addedVariant: next, at: null }
+    const entry = { type: 'replace', tick, removedVariant: this.variant, addedVariant: next }
     this.remove(this.registered.find((d) => d.name === this.descriptor(0).name))
+    entry.unregisteredAt = this.clock.now()
+    entry.unregisterFence = this.fence()
     this.add(this.descriptor(0, next))
+    entry.registeredAt = this.clock.now()
+    entry.registerFence = this.fence()
     this.variant = next
-    entry.at = this.clock.now()
+    entry.at = entry.registeredAt
     this.replacements.push(entry)
     return entry
   }
@@ -576,14 +653,13 @@ class TelemetryProofs {
   /**
    * The declared proof selection: a pure function of one segment's transcript. It names the first
    * accepted nonempty Push of every telemetry socket that had a successful Get, the first accepted
-   * Push governed by each successful custom-prefix Get, and the accepted final of a segment that is
-   * not the terminal one. Every other accepted Push keeps its bytes, response, node, subscription and sink
-   * join but is not fully decoded.
+   * Push governed by each successful custom-prefix Get, and the segment's accepted nonempty final,
+   * the terminal segment's included. Every other accepted Push keeps its bytes, response, node,
+   * subscription and sink join but is not fully decoded.
    * @param {object[]} records one segment's transcript records
-   * @param {{terminal:boolean}} options whether this is the kind's last segment
    * @returns {string[]} the request keys to decode, sorted
    */
-  static selection(records, { terminal }) {
+  static selection(records) {
     const keys = new Set()
     const pushes = TelemetryProofs.accepted(records)
     const seenSockets = new Set()
@@ -604,16 +680,15 @@ class TelemetryProofs {
         keys.add(push.requestKey)
       }
     }
-    if (!terminal)
-      for (const r of records)
-        if (
-          r.type === 'request' &&
-          r.apiKey === 72 &&
-          r.terminating &&
-          r.response?.errorCode === 0 &&
-          r.metricsBytes > 0
-        )
-          keys.add(r.requestKey)
+    for (const r of records)
+      if (
+        r.type === 'request' &&
+        r.apiKey === 72 &&
+        r.terminating &&
+        r.response?.errorCode === 0 &&
+        r.metricsBytes > 0
+      )
+        keys.add(r.requestKey)
     return [...keys].sort()
   }
 }
@@ -741,50 +816,200 @@ class OrdinaryOracle {
 }
 
 /**
- * Recomputes the share conclusions from archived inputs: the delivered accepted-prefix and
- * rest-release behaviour. Every offset is accepted exactly once at the broker and publicly; releases
- * may precede the accept and are the only reason for a second delivery; no accepted work is
- * delivered again; and at every public close each offset still unsettled ends in the decision its
- * handler progress demands. Fetch status and acknowledgement status stay separate facts.
+ * Pure re-derivations over archived share exchange facts: the lossless protocol facts of every
+ * captured ShareFetch and ShareAcknowledge exchange (socket, correlation, request batches, response
+ * and per-partition fetch and acknowledgement statuses, acquired ranges, frame hashes). Fetch
+ * status and acknowledgement status stay separate: only a successful fetch partition acquires and
+ * only a successful acknowledgement partition settles.
+ */
+class ShareExchanges {
+  /**
+   * Reads one completed or unanswered captured exchange into its protocol facts.
+   * @param {{requestHex:string, responseHex?:string, at:number, responseAt?:number}} frame the
+   *   captured frame pair @param {{segment:string|null, socket:number|null}} owner its socket
+   * @param {number} n the exchange's ordinal in this worker
+   * @returns {object} the exchange facts, never the record bytes
+   * @throws {Error} for a correlation mismatch or an unreadable frame
+   */
+  static fact(frame, owner, n) {
+    const requestBytes = Buffer.from(frame.requestHex, 'hex')
+    const header = readRequestHeader(requestBytes)
+    const wire = header.apiKey === 78 ? shareFetchWire : shareAckWire
+    const request = wire.readRequest(requestBytes.subarray(header.byteLength))
+    const fact = {
+      n,
+      segment: owner.segment,
+      socket: owner.socket,
+      apiKey: header.apiKey,
+      apiVersion: header.apiVersion,
+      correlationId: header.correlationId,
+      at: frame.at,
+      responseAt: frame.responseAt ?? null,
+      requestSha256: sha(requestBytes),
+      responseSha256: null,
+      request: {
+        groupId: request.groupId,
+        isRenewAck: request.isRenewAck === true,
+        topics: request.topics.map((topic) => ({
+          topicId: topic.topicId,
+          partitions: topic.partitions.map((p) => ({
+            partition: p.partitionIndex,
+            batches: (p.acknowledgementBatches ?? []).map((b) => ({
+              firstOffset: String(b.firstOffset),
+              lastOffset: String(b.lastOffset),
+              types: [...b.acknowledgeTypes],
+            })),
+          })),
+        })),
+      },
+      response: null,
+    }
+    if (!frame.responseHex) return fact
+    const responseBytes = Buffer.from(frame.responseHex, 'hex')
+    if (responseBytes.readInt32BE(4) !== header.correlationId)
+      throw new Error('A share response answers another request')
+    const response = acknowledgementResponse(header.apiKey, responseBytes)
+    fact.responseSha256 = sha(responseBytes)
+    fact.response = {
+      errorCode: response.errorCode,
+      lockMs: response.acquisitionLockTimeoutMs,
+      topics: response.topics.map((topic) => ({
+        topicId: topic.topicId,
+        partitions: topic.partitions.map((p) => ({
+          partition: p.partitionIndex,
+          fetchErrorCode: p.fetchErrorCode,
+          acknowledgeErrorCode: p.acknowledgeErrorCode,
+          acquired: p.acquired.map((a) => ({ ...a })),
+        })),
+      })),
+    }
+    return fact
+  }
+
+  /**
+   * @param {object[]} exchanges archived exchange facts @param {string} group the share group
+   * @returns {object[]} every range acquired by a successful fetch partition, with the request and
+   *   response times and the exchange it belongs to
+   */
+  static acquisitions(exchanges, group) {
+    return exchanges
+      .filter((e) => e.apiKey === 78 && e.request.groupId === group && e.response?.errorCode === 0)
+      .flatMap((e) =>
+        e.response.topics.flatMap((topic) =>
+          topic.partitions
+            .filter((p) => p.fetchErrorCode === 0)
+            .flatMap((p) =>
+              p.acquired.map((range) => ({
+                ...range,
+                topicId: topic.topicId,
+                partition: p.partition,
+                at: e.at,
+                responseAt: e.responseAt,
+                exchange: e.n,
+              }))
+            )
+        )
+      )
+  }
+
+  /**
+   * @param {object[]} exchanges archived exchange facts @param {string} group the share group
+   * @returns {{settled:object[], failed:object[]}} per-offset decisions the broker confirmed, as
+   *   ranges, and the acknowledgement batches whose partition status or exchange failed
+   */
+  static decisions(exchanges, group) {
+    const settled = []
+    const failed = []
+    for (const e of exchanges) {
+      if (e.request.groupId !== group || e.request.isRenewAck) continue
+      for (const topic of e.request.topics)
+        for (const p of topic.partitions) {
+          if (!p.batches.length) continue
+          const replies = (e.response?.topics ?? [])
+            .filter((t) => t.topicId === topic.topicId)
+            .flatMap((t) => t.partitions)
+            .filter((r) => r.partition === p.partition)
+          const ok = e.response?.errorCode === 0 && replies.length === 1
+          if (!ok || replies[0].acknowledgeErrorCode !== 0) {
+            failed.push({
+              exchange: e.n,
+              topicId: topic.topicId,
+              partition: p.partition,
+              errorCode: ok ? replies[0].acknowledgeErrorCode : (e.response?.errorCode ?? null),
+            })
+            continue
+          }
+          const facts = []
+          for (const b of p.batches)
+            for (let o = BigInt(b.firstOffset); o <= BigInt(b.lastOffset); o++) {
+              if (facts.length >= CORPUS.records) throw new Error('Unbounded share range')
+              facts.push({
+                topicId: topic.topicId,
+                partition: p.partition,
+                offset: String(o),
+                type:
+                  b.types.length === 1 ? b.types[0] : b.types[Number(o - BigInt(b.firstOffset))],
+                errorCode: 0,
+                at: e.responseAt,
+                exchange: e.n,
+              })
+            }
+          settled.push(...compactRuns(facts))
+        }
+    }
+    return { settled, failed }
+  }
+}
+
+/**
+ * Recomputes the share conclusions from archived exchange facts: the delivered accepted-prefix and
+ * rest-release behaviour. Acquisitions and broker settlements are re-derived, never copied. Every
+ * handler entry joins the raw log at its own offset and the one acquisition it ran under; every
+ * decision settles the acquisition it follows and precedes the next; every offset is accepted once
+ * at the broker and publicly; releases are the only reason for a second delivery; no accepted work
+ * is delivered again; at every public close each unsettled offset ends in the decision its handler
+ * progress demands; and nothing names work outside the corpus.
  */
 class ShareOracle {
   /**
    * @param {object} input archived share inputs
    * @param {string} input.stem run prefix @param {object} input.log `logInputs` output
-   * @param {string} input.topicId the corpus topic's ID
+   * @param {string} input.topicId the corpus topic's ID @param {string} input.group the share group
    * @param {number[][]} input.handled `[partition, offset, index, enteredAt, exitedAt]`
-   * @param {object[]} input.acquisitions raw acquired ranges of successful fetch partitions
-   * @param {object[]} input.settlements broker-confirmed acknowledgement ranges, type 1/2/3
+   * @param {object[]} input.exchanges the archived exchange facts
    * @param {object[]} input.settled public acknowledge events with their time
    * @param {Array<{at:number,end:number}>} input.closures captured public close boundaries
    * @returns {{ok:boolean, violations:string[], hashes:object}} the verdict with set hashes
    */
-  static check({ stem, log, topicId, handled, acquisitions, settlements, settled, closures }) {
+  static check({ stem, log, topicId, group, handled, exchanges, settled, closures }) {
     const durable = checkLog({ ...log, stem, kind: 'shareConsumer' })
     const violations = [...durable.violations]
     const offsets = [...durable.byOffset.keys()]
+    const corpus = new Set(offsets)
     const each = (ranges, work) => {
       for (const range of ranges) {
         let count = 0
         for (let n = BigInt(range.firstOffset); n <= BigInt(range.lastOffset); n++) {
           if (++count > CORPUS.records) throw new Error('Unbounded share range')
-          work(`${range.partition}:${n}`, range)
+          const key = `${range.partition}:${n}`
+          if (!corpus.has(key)) violations.push('a share fact names an offset outside the corpus')
+          work(key, range)
         }
       }
     }
+    const { settled: settlements, failed } = ShareExchanges.decisions(exchanges, group)
     const acquired = new Map()
     const accepted = new Map()
     const released = new Map()
     const decided = new Map()
     const publics = new Map()
     const push = (map, key, value) => map.set(key, [...(map.get(key) ?? []), value])
-    each(acquisitions, (key, r) => {
+    each(ShareExchanges.acquisitions(exchanges, group), (key, r) => {
       if (r.topicId !== topicId) violations.push('an acquisition names a foreign topic')
       push(acquired, key, r)
     })
     each(settlements, (key, r) => {
       if (r.topicId !== topicId) violations.push('a settlement names a foreign topic')
-      if (r.errorCode !== 0) violations.push('a failed acknowledgement counted as a settlement')
       push(decided, key, r)
       if (r.type === 1) push(accepted, key, r)
       else if (r.type === 2) push(released, key, r)
@@ -798,8 +1023,13 @@ class ShareOracle {
       }
     )
     const entries = new Map()
-    for (const [partition, offset, index, enteredAt, exitedAt] of handled)
-      push(entries, `${partition}:${offset}`, { index, enteredAt, exitedAt })
+    for (const [partition, offset, index, enteredAt, exitedAt] of handled) {
+      const key = `${partition}:${offset}`
+      if (!corpus.has(key)) violations.push('a handler entry names foreign work')
+      else if (durable.byOffset.get(key) !== index)
+        violations.push('a handler entry differs from the raw log at its offset')
+      push(entries, key, { index, enteredAt, exitedAt })
+    }
     for (const key of offsets) {
       const deliveries = (acquired.get(key) ?? []).sort((a, b) => a.at - b.at)
       const decisions = (decided.get(key) ?? []).sort((a, b) => a.at - b.at)
@@ -814,7 +1044,25 @@ class ShareOracle {
         violations.push('deliveries differ from one plus the releases')
       deliveries.forEach((r, position) => {
         if (r.deliveryCount !== position + 1) violations.push('a delivery count is not sequential')
+        const decision = decisions[position]
+        const next = deliveries[position + 1]
+        const crosses = next && decision?.at > next.at && decision.exchange !== next.exchange
+        if (decision && (decision.at < r.responseAt || crosses))
+          violations.push('a decision is attached to another acquisition')
+        const window = seen.filter(
+          (e) => e.enteredAt >= r.responseAt && (!decision || e.enteredAt <= decision.at)
+        )
+        if (window.length > 1) violations.push('an acquisition was handled twice')
       })
+      for (const e of seen)
+        if (
+          !deliveries.some(
+            (r, position) =>
+              e.enteredAt >= r.responseAt &&
+              (!decisions[position] || e.enteredAt <= decisions[position].at)
+          )
+        )
+          violations.push('a handler entry is not joined to its acquisition')
       if (events.filter((e) => e.type === 'accept').length !== 1)
         violations.push('an offset lacks exactly one public accept')
       if (events.filter((e) => e.type === 'release').length !== releases.length)
@@ -842,7 +1090,9 @@ class ShareOracle {
       hashes: {
         durable: hashIds(durable.indexes.map(String)),
         handled: hashIds(handled.map((e) => `${e[0]}:${e[1]}:${e[2]}`)),
+        exchanges: sha(JSON.stringify(exchanges)),
       },
+      failedAcknowledgements: failed.length,
     }
   }
 }
@@ -908,7 +1158,7 @@ class TelemetryTap {
     record.restore = () => {
       delete socket.write
     }
-    if (this.share) this.share.wrap(socket)
+    if (this.share) this.share.wrap(socket, { segment: segment.id, ordinal: record.ordinal })
     socket.on('close', () => {
       record.closed = true
       record.closedAt = this.clock.now()
@@ -964,12 +1214,11 @@ class TelemetryTap {
 }
 
 /**
- * The share consumer's raw acknowledgement facts, read by the existing independent readers one
- * completed exchange at a time so the trace never grows with the corpus. What is kept is what the
- * readers derive: acquired ranges of successful fetch partitions with their delivery counts, and
- * broker-confirmed acknowledgement ranges, each with its response time; plus the public
- * acknowledge events and the handler progress the caller records. Fetch status and acknowledgement
- * status are separate facts.
+ * The share consumer's raw exchange facts. Every socket gets its own existing trace; each
+ * completed exchange is read into lossless protocol facts (see `ShareExchanges.fact`), checked
+ * against the existing independent 9E readers, and its frames are forgotten, so the trace never
+ * grows with the corpus. An exchange still unanswered when its socket closed is kept with no
+ * response. The public acknowledge events and the handler progress are separate facts.
  */
 class ShareLedger {
   /**
@@ -979,34 +1228,82 @@ class ShareLedger {
   constructor({ group, clock }) {
     this.group = group
     this.clock = clock
-    this.trace = new ShareTrace()
-    this.acquisitions = []
-    this.settlements = []
+    this.traces = []
+    this.exchanges = []
     this.settled = []
-    this.frames = 0
-    this.failures = []
   }
 
   /**
-   * @param {object} socket one socket of the share consumer @returns {object} the same socket
+   * @param {object} socket one socket of the share consumer
+   * @param {{segment?:string, ordinal?:number}} [owner] the segment and socket it belongs to
+   * @returns {object} the same socket
    */
-  wrap(socket) {
-    return this.trace.wrap(socket)
+  wrap(socket, owner = {}) {
+    const entry = {
+      segment: owner.segment ?? null,
+      socket: owner.ordinal ?? null,
+      trace: new ShareTrace(),
+      closed: false,
+    }
+    entry.trace.wrap(socket)
+    socket.once('close', () => {
+      entry.closed = true
+    })
+    this.traces.push(entry)
+    return socket
   }
 
   /**
-   * Reads every completed exchange and forgets its frames.
-   * @returns {void} @throws {Error} for a capture failure or an unreadable acknowledgement frame
+   * Reads every completed exchange into its facts and forgets its frames; a closed socket's
+   * unanswered exchanges are kept without a response and its trace is released.
+   * @returns {void}
+   * @throws {Error} for a capture failure, an unreadable frame, or facts that differ from what the
+   *   existing readers derive from the same frame
    */
   drain() {
-    if (this.trace.failures.length) throw new Error(this.trace.failures[0])
-    const done = this.trace.frames.filter((frame) => frame.responseHex)
-    this.trace.frames = this.trace.frames.filter((frame) => !frame.responseHex)
-    for (const frame of done) {
-      this.frames += 1
-      this.acquisitions.push(...heldAcquisitions([frame], this.group))
-      this.settlements.push(...compactRuns(confirmedDecisions([frame], this.group)))
+    for (const entry of this.traces) {
+      if (entry.trace.failures.length) throw new Error(entry.trace.failures[0])
+      const done = entry.trace.frames.filter((frame) => frame.responseHex || entry.closed)
+      entry.trace.frames = entry.trace.frames.filter((frame) => !done.includes(frame))
+      for (const frame of done) {
+        const fact = ShareExchanges.fact(frame, entry, this.exchanges.length + 1)
+        if (frame.responseHex) this.agree(frame, fact)
+        this.exchanges.push(fact)
+      }
     }
+    this.traces = this.traces.filter((entry) => !entry.closed)
+  }
+
+  /**
+   * @param {object} frame a completed frame pair @param {object} fact its exchange facts
+   * @returns {void} @throws {Error} unless the facts re-derive exactly what the 9E readers read
+   */
+  agree(frame, fact) {
+    const strip = (rows) =>
+      rows.map(({ topicId, partition, firstOffset, lastOffset, deliveryCount, offset, type }) => ({
+        topicId,
+        partition,
+        firstOffset,
+        lastOffset,
+        deliveryCount,
+        offset,
+        type,
+      }))
+    const held = strip(heldAcquisitions([frame], this.group))
+    const derived = strip(ShareExchanges.acquisitions([fact], this.group))
+    const confirmed = strip(confirmedDecisions([frame], this.group))
+    const settled = strip(
+      ShareExchanges.decisions([fact], this.group).settled.flatMap((range) => {
+        const out = []
+        for (let o = BigInt(range.firstOffset); o <= BigInt(range.lastOffset); o++)
+          out.push({ ...range, offset: String(o), firstOffset: undefined, lastOffset: undefined })
+        return out
+      })
+    )
+    if (JSON.stringify(held) !== JSON.stringify(derived))
+      throw new Error('Share acquisition facts differ from the raw reader')
+    if (JSON.stringify(confirmed) !== JSON.stringify(settled))
+      throw new Error('Share settlement facts differ from the raw reader')
   }
 
   /**
@@ -1026,14 +1323,13 @@ class ShareLedger {
     })
   }
 
-  /** @returns {object} the archived facts, after a final drain */
+  /** @returns {object} the archived facts, after a final drain, with the hash of the exchanges */
   facts() {
     this.drain()
     return {
       group: this.group,
-      frames: this.frames,
-      acquisitions: this.acquisitions,
-      settlements: this.settlements,
+      exchanges: this.exchanges,
+      exchangesSha256: sha(JSON.stringify(this.exchanges)),
       settled: this.settled,
     }
   }
@@ -1477,6 +1773,7 @@ class DecoderCoordinator {
    * @param {object} [options.env] environment of the decoder child
    * @param {DecoderGate} [options.gate] the concurrency limiter, four by default
    * @param {Function} [options.make] builds the observer; a spec supplies a fake
+   * @param {function():object[]} [options.exports] reads the broker sink rows
    */
   constructor({
     directory,
@@ -1485,7 +1782,9 @@ class DecoderCoordinator {
     env = process.env,
     gate = new DecoderGate(DECODER_SLOTS),
     make = (options) => new TelemetryWireObserver(options),
+    exports = readExports,
   }) {
+    this.exports = exports
     this.observer = make({
       directory,
       line,
@@ -1509,6 +1808,111 @@ class DecoderCoordinator {
     if (raw.length === 0 || raw.length > 4096) throw new Error('Decoder input is outside its bound')
     this.calls.push({ kind, rawSha256: sha(raw), bytes: raw.length })
     return this.observer.decodeRaw(raw, { budgetMs: DECODE_BUDGET_MS })
+  }
+
+  /**
+   * Decodes the actual terminal final from a closed worker's immutable capture. The worker's
+   * receipt-to-exit interval has already ended; this work belongs to parent cleanup and memory.
+   * @param {string} directory scenario directory @param {string} kind worker kind
+   * @param {object} pack terminal segment receipt, updated after the proof is persisted
+   * @returns {Promise<void>} after bounded independent decode, sink join and bundle validation
+   * @throws {Error} for missing bytes, decoder/sink mismatch or a bundle bound violation
+   */
+  async terminal(directory, kind, pack) {
+    const prefix = `${directory}/segments/`
+    const transcript = fs.readFileSync(prefix + pack.transcript.name)
+    const bundle = fs.readFileSync(prefix + pack.bundle.name, 'utf8')
+    if (sha(transcript) !== pack.transcript.sha256 || sha(bundle) !== pack.bundle.sha256)
+      throw new Error(`The sealed terminal segment ${pack.id} changed before its final was decoded`)
+    const parsed = JSON.parse(transcript)
+    const required = TelemetryProofs.selection(parsed.records)
+    const finals = parsed.records.filter(
+      (r) =>
+        r.type === 'request' &&
+        r.apiKey === 72 &&
+        r.terminating &&
+        r.response?.errorCode === 0 &&
+        r.metricsBytes > 0
+    )
+    const keys = new Set(finals.map((r) => r.requestKey))
+    const checked = checkSegmentFiles({
+      id: pack.id,
+      transcript,
+      bundle,
+      proofs: required.filter((key) => !keys.has(key)),
+    })
+    const lines = []
+    for (const request of finals) {
+      const blob = checked.pushes.get(request.requestKey).blob
+      const raw = decompressBounded(request.compressionType, blob)
+      const rawSha256 = sha(raw)
+      const decoded = await this.decode(kind, raw.toString('base64'))
+      if (decoded.dataSha256 !== rawSha256 || decoded.dataBytes !== raw.length)
+        throw new Error('Terminal decode differs from captured bytes')
+      const row = await this.sinkRow(request, raw.length, rawSha256)
+      const receipts = this.receipts().filter((receipt) => receipt.rawSha256 === rawSha256)
+      if (!receipts.length) throw new Error('Missing original terminal decoder receipt')
+      lines.push({
+        t: 'proof',
+        key: request.requestKey,
+        rawSha256,
+        rawB64: raw.toString('base64'),
+        receipts,
+        decoded: {
+          requestKey: request.requestKey,
+          uuid: request.uuid,
+          node: request.node,
+          compressionType: request.compressionType,
+          rawBytes: raw.length,
+          transmittedBytes: blob.length,
+          transmittedSha256: sha(blob),
+          rawSha256,
+          decoded,
+          exportIdentity: { node: row.node, seq: row.seq },
+        },
+      })
+    }
+    const complete = bundle + lines.map((line) => JSON.stringify(line) + '\n').join('')
+    if (Buffer.byteLength(complete) > FILE_BOUND)
+      throw new Error('Terminal proof bundle exceeds bound')
+    checkSegmentFiles({ id: pack.id, transcript, bundle: complete, proofs: required })
+    fs.writeFileSync(prefix + pack.bundle.name, complete, { mode: 0o600 })
+    pack.bundle.bytes = Buffer.byteLength(complete)
+    pack.bundle.sha256 = sha(complete)
+    pack.terminalProofs = lines.map((line) => line.key)
+  }
+
+  /**
+   * @param {object} request the accepted final @param {number} bytes its raw length
+   * @param {string} rawSha256 its raw hash
+   * @returns {Promise<object>} the one sink row of exactly that final, waiting at most 2000 ms for
+   *   the broker to flush it @throws {Error} unless exactly one row matches
+   */
+  async sinkRow(request, bytes, rawSha256) {
+    for (let waited = 0; ; waited += 50) {
+      const rows = this.exports().filter(
+        (r) =>
+          r.terminating &&
+          r.node === request.node &&
+          r.clientId === request.clientId &&
+          r.clientInstanceId === request.uuid &&
+          r.dataSha256 === rawSha256 &&
+          r.dataBytes === bytes &&
+          r.parse === 'ok'
+      )
+      if (rows.length === 1) return rows[0]
+      if (rows.length > 1 || waited >= 2000)
+        throw new Error('Terminal final lacks a unique sink join')
+      await wait(50)
+    }
+  }
+
+  /** @returns {object[]} the receipts of every decoder child this coordinator ran so far */
+  receipts() {
+    return fs
+      .readdirSync(this.observer.directory)
+      .filter((name) => /^decoder-\d+\.json$/.test(name))
+      .map((name) => JSON.parse(fs.readFileSync(`${this.observer.directory}/${name}`, 'utf8')))
   }
 
   /**
@@ -1603,7 +2007,7 @@ class TelemetryProcesses {
       receiptAt: null,
       exit: null,
       error: null,
-      tainted: false,
+      aborted: false,
       waiters: [],
     }
     const capture = (name) => (chunk) => {
@@ -1620,7 +2024,7 @@ class TelemetryProcesses {
     worker.closed = new Promise((resolve) => {
       child.once('close', (code, signal) => {
         worker.exit = { event: 'close', code, signal, closedAt: this.now() }
-        if (!worker.messages.some((m) => m.type === 'result') && !worker.tainted)
+        if (!worker.messages.some((m) => m.type === 'result') && !worker.aborted)
           this.fail(worker, new Error(`Telemetry worker ${kind} exited before its result`))
         this.wake(worker)
         resolve(worker.exit)
@@ -1734,7 +2138,7 @@ class TelemetryProcesses {
   async join(kind, ms = NATURAL_EXIT_MS) {
     const worker = this.workers.get(kind)
     const receipt = worker.receiptAt
-    const limit = receipt === null ? 0 : Math.max(0, ms - (this.now() - receipt))
+    const limit = receipt === null ? ms : Math.max(0, ms - (this.now() - receipt))
     let timer
     const timeout = new Promise((resolve) => {
       timer = setTimeout(() => resolve(null), limit)
@@ -1752,7 +2156,8 @@ class TelemetryProcesses {
       unhandled: worker.messages.filter((m) => m.type === 'unhandled').length,
       receipts: worker.counts.get('receipt') ?? 0,
       watchdogExpired: closed === null,
-      killed: worker.tainted,
+      killed: false,
+      aborted: worker.aborted,
       receiptAt: receipt,
       closedAt: exit.closedAt ?? null,
       afterDisconnectMs: receipt === null || !exit.closedAt ? null : exit.closedAt - receipt,
@@ -1760,15 +2165,26 @@ class TelemetryProcesses {
   }
 
   /**
-   * Kills a worker that must not outlive a failed run. Its natural-exit row stays failed.
-   * @param {string} kind the worker @returns {void}
+   * Asks a worker to stop admission and release its public client, then joins its process and
+   * drained pipes. Nothing is killed: a worker that misses the natural-exit bound is still awaited
+   * until it actually closes, and its row stays failed with `watchdogExpired`; containing an
+   * unresponsive process tree belongs to the CI runner's ownership authority.
+   * @param {string} kind the worker @returns {Promise<object>} the actual close facts
    */
-  taint(kind) {
+  async cancel(kind) {
     const worker = this.workers.get(kind)
-    if (worker && !worker.exit) {
-      worker.tainted = true
-      worker.child.kill('SIGKILL')
+    if (!worker.exit && !worker.aborted) {
+      worker.aborted = true
+      try {
+        worker.child.send({ type: 'abort' })
+      } catch {
+        // a closed channel means the child is already leaving; its close is still joined below
+      }
     }
+    const exit = await this.join(kind)
+    if (exit.event === 'close') return exit
+    await worker.closed
+    return { ...(await this.join(kind)), watchdogExpired: true }
   }
 }
 
@@ -1778,11 +2194,13 @@ class Inbox {
   constructor() {
     this.items = []
     this.waiting = []
+    this.cancelled = false
   }
 
   /** @param {object} message a parent message @returns {void} */
   push(message) {
-    this.items.push(message)
+    if (message.type === 'abort') this.cancelled = true
+    else this.items.push(message)
     this.waiting = this.waiting.filter((take) => !take())
   }
 
@@ -1790,8 +2208,12 @@ class Inbox {
    * @param {function(object):boolean} match which message @returns {Promise<object>} the first one
    */
   take(match) {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       const take = () => {
+        if (this.cancelled) {
+          reject(new Error('Telemetry worker cancelled'))
+          return true
+        }
         const index = this.items.findIndex(match)
         if (index < 0) return false
         resolve(this.items.splice(index, 1)[0])
@@ -1826,6 +2248,8 @@ class TelemetryWorker {
    * @param {function(Function):*} [options.target] runs a public client call under the target role
    * @param {ShareLedger} [options.ledger] the share ledger of a share consumer
    * @param {object} [options.schedule] a `TelemetrySchedule`
+   * @param {{manifest:object, prefix:string}} [options.foreground] the control's frozen catalogue,
+   *   replayed once by the enabled client during setup
    */
   constructor({
     kind,
@@ -1842,6 +2266,7 @@ class TelemetryWorker {
     target = (work) => work(),
     ledger = null,
     schedule,
+    foreground = null,
   }) {
     Object.assign(this, {
       kind,
@@ -1857,6 +2282,7 @@ class TelemetryWorker {
       send,
       target,
       ledger,
+      foreground,
     })
     this.schedule = schedule ?? new TelemetrySchedule(limits)
     this.uuid = null
@@ -1866,6 +2292,7 @@ class TelemetryWorker {
     }
     this.claims = {
       setup: null,
+      foreground: null,
       initial: null,
       reopens: [],
       retirements: [],
@@ -1909,9 +2336,9 @@ class TelemetryWorker {
   }
 
   /**
-   * Registers the descriptors, obtains the UUID in the setup lifecycle, disconnects and leaves the
-   * client disconnected with exactly that state retained, the next lifecycle's segment selected and
-   * the setup segment sealed.
+   * Registers the descriptors, obtains the UUID in the setup lifecycle, replays the control's frozen
+   * foreground catalogue with telemetry on, disconnects and leaves the client disconnected with
+   * exactly that state retained, the next lifecycle's segment selected and the setup segment sealed.
    * @returns {Promise<string>} the retained instance ID
    * @throws {Error} a failed registration, connect, UUID wait or seal
    */
@@ -1920,6 +2347,12 @@ class TelemetryWorker {
     const first = this.segments.current()
     await this.target(() => this.client.connect())
     this.uuid = await this.target(() => this.client.clientInstanceId({ timeout: 15000 }))
+    if (this.foreground)
+      this.claims.foreground = await this.target(() =>
+        runCatalogue(this.client, this.foreground.manifest, this.foreground.prefix, () =>
+          this.clock.now()
+        )
+      )
     const get = await this.find('setup Get', 15000, () =>
       first.observer
         .subscriptions({ uuid: this.uuid })
@@ -1934,7 +2367,10 @@ class TelemetryWorker {
 
   /**
    * Seals one closed segment: decodes exactly its declared proof selection through the parent, then
-   * discharges it. The previous seal must have finished by the next boundary.
+   * discharges it. The previous seal must have finished by the next boundary. The terminal
+   * segment's final is the one exception decoded here: it is sent by the explicit public close,
+   * after which the process must exit within its natural-exit bound, so the parent decodes it from
+   * the sealed bytes once this process has exited and completes the same bundle.
    * @param {object} segment a closed segment @param {boolean} terminal whether it is the last one
    * @returns {Promise<object>} its sealed summary
    * @throws {Error} for a claimed proof outside the declared selection, a decode failure or a seal failure
@@ -1943,7 +2379,9 @@ class TelemetryWorker {
     const { observer } = segment
     await within(observer.socketsClosed(), 5000, `${segment.id} sockets closing`)
     const records = observer.readTranscript()
-    const keys = TelemetryProofs.selection(records, { terminal })
+    const isFinal = (key) => records.find((r) => r.requestKey === key).terminating
+    const required = TelemetryProofs.selection(records)
+    const keys = terminal ? required.filter((key) => !isFinal(key)) : required
     const claimed = this.claims.proofs.filter((p) => p.segment === segment.id).map((p) => p.push)
     for (const key of claimed)
       if (!keys.includes(key))
@@ -1955,7 +2393,9 @@ class TelemetryWorker {
     )
     const failed = outcomes.find((o) => o.status === 'rejected')
     if (failed) throw failed.reason
-    return this.segments.discharge(segment, { proofs: keys })
+    const pack = await this.segments.discharge(segment, { proofs: keys })
+    this.send({ type: 'progress', sealed: pack })
+    return pack
   }
 
   /**
@@ -2080,12 +2520,12 @@ class TelemetryWorker {
     const after = segment.observer.checkpoint()
     const fault = this.tap.retire()
     const working = this.target(() => this.ordinary.core(this.coreN++)).then(
-      () => null,
-      (error) => error
+      () => ({ status: 'fulfilled' }),
+      (reason) => ({ status: 'rejected', reason })
     )
     const faultedAt = await within(fault.hit, 8000, `The ${this.kind} telemetry fault`)
-    const coreError = await working
-    if (coreError) throw coreError
+    const coreResult = await working
+    if (coreResult.status === 'rejected') throw coreResult.reason
     const core = await this.find('core request beside the fault', 8000, () =>
       segment.observer
         .normalRequests({ after })
@@ -2257,7 +2697,7 @@ class TelemetryWorker {
     await attempt(async () => {
       if (errors.length) return
       await this.drained()
-      const keys = TelemetryProofs.selection(last.observer.readTranscript(), { terminal: true })
+      const keys = TelemetryProofs.selection(last.observer.readTranscript())
       const outcomes = await Promise.allSettled(
         keys.map((key) =>
           last.observer.decodeAccepted({ requestKey: key }, { budgetMs: DECODE_BUDGET_MS })
@@ -2279,7 +2719,6 @@ class TelemetryWorker {
       await closing
     })
     await attempt(async () => {
-      if (!closing) return
       await this.sealing?.promise
       if (this.sealing?.error) throw this.sealing.error
       await this.seal(last, true)
@@ -2377,9 +2816,60 @@ class FrameCounter {
 }
 
 /**
- * The telemetry-disabled reference of one worker: the same kind, the same process and loaded
- * modules, a bounded foreground catalogue, two settled readings that must agree, and a complete
- * release before the enabled client exists. It performs no telemetry work and proves that.
+ * The fixed foreground of one kind, frozen before either mode runs: the client options, the topic
+ * and group it joins, the bounded operations with their input sizes, the one public lifecycle and
+ * the expected outcome of every operation. The disabled control and the enabled worker run the
+ * same catalogue, each with its own record identities.
+ * @param {string} kind the client kind @param {object} config the parent's configuration
+ * @returns {object} the manifest, plain data
+ */
+const controlManifest = (kind, config) => ({
+  kind,
+  topic: config.topic,
+  joins: kind === 'consumer' || kind === 'shareConsumer',
+  operations: Array.from({ length: CONTROL.catalogue[kind] }, (_, n) => ({
+    n,
+    op: kind === 'producer' ? 'send' : 'describeCluster',
+    topic: kind === 'producer' ? config.ctl : null,
+    valueBytes: kind === 'producer' ? CONTROL.valueBytes : 0,
+    expected: 'fulfilled',
+  })),
+  lifecycles: 1,
+})
+
+/**
+ * Runs the frozen foreground operations of a manifest on one client and records every outcome.
+ * @param {object} client the public client @param {object} manifest `controlManifest` output
+ * @param {string} prefix the record identity prefix of this mode
+ * @param {function():number} now monotonic milliseconds
+ * @returns {Promise<object[]>} `{n, status, at}` per operation, in order
+ * @throws {*} the first operation's own rejection, after its outcome was recorded
+ */
+const runCatalogue = async (client, manifest, prefix, now) => {
+  const outcomes = []
+  for (const { n, op, topic } of manifest.operations) {
+    try {
+      if (op === 'send')
+        await client.send({
+          topic,
+          acks: -1,
+          messages: [{ key: `${prefix}:${n}`, value: Buffer.alloc(CONTROL.valueBytes, 99) }],
+        })
+      else await client.describeCluster({ timeout: 3000 })
+      outcomes.push({ n, status: 'fulfilled', at: now() })
+    } catch (error) {
+      outcomes.push({ n, status: 'rejected', at: now() })
+      throw error
+    }
+  }
+  return outcomes
+}
+
+/**
+ * The telemetry-disabled reference of one worker: the same kind, process, loaded modules, topic
+ * and resident subscription as the enabled client, running the frozen foreground catalogue between
+ * two settled readings that bracket it at the same idle resident state, then a complete release
+ * before the enabled client exists. It performs no telemetry work and proves that.
  */
 class ReferenceControl {
   /**
@@ -2390,6 +2880,7 @@ class ReferenceControl {
    * @param {{now:function():number}} options.clock monotonic time
    * @param {(ms:number)=>Promise<void>} [options.sleep] real delay
    * @param {function():void} [options.gc] a full collection, `global.gc` by default
+   * @param {function():number} [options.collections] collections the engine reported so far
    */
   constructor({
     kind,
@@ -2401,6 +2892,7 @@ class ReferenceControl {
     clock,
     sleep = wait,
     gc = globalThis.gc,
+    collections = () => 0,
   }) {
     Object.assign(this, {
       kind,
@@ -2412,17 +2904,25 @@ class ReferenceControl {
       clock,
       sleep,
       gc,
+      collections,
     })
+    this.manifest = controlManifest(kind, config)
   }
 
   /**
-   * @returns {Promise<object>} the control facts: both settled readings, the release reading, the
-   *   telemetry frames it sent (none), the handles it left (none) and its own peak
+   * @returns {Promise<object>} the control facts: the frozen manifest and every outcome, both
+   *   settled readings bracketing the catalogue, the release reading, the telemetry frames it sent
+   *   (none), the sockets and handles it left (none)
    * @throws {Error} a failed foreground operation or a control that is still holding something
    */
   async run() {
-    const { kind, config, clock } = this
-    const io = { gc: this.gc, pause: (ms) => this.sleep(ms), now: () => clock.now() }
+    const { kind, config, clock, manifest } = this
+    const io = {
+      gc: this.gc,
+      pause: (ms) => this.sleep(ms),
+      now: () => clock.now(),
+      collections: this.collections,
+    }
     const counter = new FrameCounter(this.socketFactory)
     return this.resources.as('fixture:control', async () => {
       const kafka = new this.Kafka({
@@ -2432,7 +2932,7 @@ class ReferenceControl {
         socketFactory: counter.factory,
       })
       const off = { enableMetricsPush: false }
-      const group = `${config.stem}-ctl-${kind}-group`
+      const group = `${config.group}-ctl`
       const client =
         kind === 'producer'
           ? kafka.producer({ ...off, idempotent: true })
@@ -2448,30 +2948,22 @@ class ReferenceControl {
                   maxWaitTimeInMs: 500,
                   readUncommitted: false,
                 })
-      const catalogue = CONTROL.catalogue[kind]
       let c0
       let c1
+      let outcomes = []
       try {
         await client.connect()
-        if (kind === 'producer')
-          for (let i = 0; i < catalogue; i++)
-            await client.send({
-              topic: config.ctl,
-              acks: -1,
-              messages: [{ key: `${config.stem}:ctl:${i}`, value: Buffer.from('control') }],
-            })
-        if (kind === 'admin')
-          for (let i = 0; i < catalogue; i++) await client.describeCluster({ timeout: 3000 })
         if (kind === 'consumer') {
-          await client.subscribe({ topic: config.ctl, fromBeginning: false })
+          await client.subscribe({ topic: manifest.topic, fromBeginning: true })
           await client.run({ autoCommit: false, eachMessage: async () => {} })
         }
         if (kind === 'shareConsumer') {
-          await client.subscribe({ topics: [config.ctl] })
+          await client.subscribe({ topics: [manifest.topic] })
           await client.run({ eachMessage: async () => {} })
         }
-        await this.sleep(3000)
+        await this.sleep(CONTROL.idleMs)
         c0 = await settledReading('c0', io)
+        outcomes = await runCatalogue(client, manifest, `${config.stem}:ctl-off`, io.now)
         await this.sleep(CONTROL.idleMs)
         c1 = await settledReading('c1', io)
       } catch (error) {
@@ -2487,7 +2979,9 @@ class ReferenceControl {
       ).length
       return {
         kind,
-        catalogue,
+        manifest,
+        outcomes,
+        catalogue: manifest.operations.length,
         telemetryFrames: counter.frames,
         openSockets: counter.open,
         leftoverHandles: leftover,
@@ -2552,8 +3046,10 @@ class TelemetryChurn {
     this.cause = undefined
     this.stages = []
     this.rotations = []
+    this.tickStarts = []
     this.missed = []
     this.offered = { consumer: [], shareConsumer: [] }
+    this.outstanding = new Set()
     this.abort = new Promise((_, reject) => {
       this.rejectAbort = reject
     })
@@ -2576,6 +3072,39 @@ class TelemetryChurn {
   /** @returns {void} @throws {*} the run's first failure, even a falsy one, so no later work starts */
   guard() {
     if (this.failed) throw this.cause
+  }
+
+  /**
+   * Retains one concurrently started driver operation until it settles, so a failure path can join
+   * it instead of unwinding past it.
+   * @template T
+   * @param {Promise<T>} work the started operation @returns {Promise<T>} the same operation
+   */
+  own(work) {
+    this.outstanding.add(work)
+    const forget = () => this.outstanding.delete(work)
+    work.then(forget, forget)
+    return work
+  }
+
+  /**
+   * Stops every worker after a failure and joins them with every outstanding driver operation.
+   * @param {*} primary the failure that stopped the run
+   * @returns {Promise<void>} once nothing owned is outstanding
+   * @throws {*} the primary failure alone, or with every failure the joins reported
+   */
+  async contain(primary) {
+    this.fail(primary)
+    const joined = await Promise.allSettled([
+      ...this.outstanding,
+      ...[...this.processes.workers.keys()].map((kind) => this.processes.cancel(kind)),
+    ])
+    const failures = joined
+      .filter((r) => r.status === 'rejected' && r.reason !== primary)
+      .map((r) => r.reason)
+    if (failures.length)
+      throw new AggregateError([primary, ...failures], 'Churn containment failed')
+    throw primary
   }
 
   /**
@@ -2628,6 +3157,7 @@ class TelemetryChurn {
    */
   async run() {
     const timeline = { t0: this.clock.now(), epochAt: null, boundaryAt: null, cleanupEndAt: null }
+    this.parentMemory = [readMemory('parent-start', () => this.clock.now())]
     const schedule = new TelemetrySchedule(this.limits)
     let results = []
     let primary
@@ -2642,11 +3172,16 @@ class TelemetryChurn {
     timeline.boundaryAt ??= this.clock.now()
     const shutdown = await this.shutdown(results)
     timeline.cleanupEndAt = this.clock.now()
+    try {
+      this.lastResult = this.judge(results, shutdown, timeline, schedule)
+    } catch (error) {
+      shutdown.errors.push(error)
+    }
     if (failed || shutdown.errors.length) {
       const errors = [...(failed ? [primary] : []), ...shutdown.errors]
       throw errors.length === 1 ? errors[0] : new AggregateError(errors, 'Telemetry churn failed')
     }
-    return this.judge(results, shutdown, timeline, schedule)
+    return this.lastResult
   }
 
   /**
@@ -2663,37 +3198,72 @@ class TelemetryChurn {
     let results = []
     await this.fixture.open()
     await this.fixture.inResource(async () => {
-      for (const kind of KINDS) this.processes.start(kind)
-      await Promise.all(KINDS.map((kind) => this.processes.message(kind, 'hello', left())))
-      for (const kind of KINDS)
-        this.processes.send(kind, {
-          type: 'config',
-          stem: this.stem,
-          brokers: this.brokers,
-          topic: this.fixture.topic(kind),
-          group: this.fixture.group(kind),
-          ctl: this.fixture.ctl,
-          line: this.line,
-          directory: this.directory,
-        })
-      await Promise.all(KINDS.map((kind) => this.processes.message(kind, 'ready', left())))
-      for (const kind of KINDS) this.processes.send(kind, { type: 'start' })
-      await Promise.all(KINDS.map((kind) => this.processes.message(kind, 'phase', left())))
-      timeline.epochAt = this.clock.now()
-      timeline.setupMs = timeline.epochAt - timeline.t0
-      if (timeline.setupMs > SETUP_MS) throw new Error('The setup exceeded its budget')
-      for (const kind of KINDS) this.processes.send(kind, { type: 'go' })
-      const corpus = this.offerCorpus(timeline.epochAt, schedule)
-      corpus.catch((error) => this.fail(error))
-      await this.ticks(timeline.epochAt, schedule)
-      await this.until(timeline.epochAt + warmupMs + measureMs)
-      timeline.boundaryAt = this.clock.now()
-      await corpus
-      for (const kind of KINDS) this.processes.send(kind, { type: 'finish' })
-      results = await Promise.race([
-        Promise.all(KINDS.map((kind) => this.processes.message(kind, 'result', cleanupBound))),
-        this.abort,
-      ])
+      try {
+        for (const kind of KINDS) this.processes.start(kind)
+        const hellos = await Promise.all(
+          KINDS.map((kind) => this.processes.message(kind, 'hello', left()))
+        )
+        this.handshakes = hellos.map(
+          ({
+            kind,
+            origin,
+            pid,
+            node,
+            v8,
+            platform,
+            arch,
+            execArgv,
+            modules,
+            codecs,
+            source,
+            parentAt,
+          }) => ({
+            kind,
+            origin,
+            pid,
+            node,
+            v8,
+            platform,
+            arch,
+            execArgv,
+            modules,
+            codecs,
+            source,
+            parentAt,
+          })
+        )
+        for (const kind of KINDS)
+          this.processes.send(kind, {
+            type: 'config',
+            stem: this.stem,
+            brokers: this.brokers,
+            topic: this.fixture.topic(kind),
+            group: this.fixture.group(kind),
+            ctl: this.fixture.ctl,
+            line: this.line,
+            directory: this.directory,
+          })
+        await Promise.all(KINDS.map((kind) => this.processes.message(kind, 'ready', left())))
+        for (const kind of KINDS) this.processes.send(kind, { type: 'start' })
+        await Promise.all(KINDS.map((kind) => this.processes.message(kind, 'phase', left())))
+        timeline.epochAt = this.clock.now()
+        timeline.setupMs = timeline.epochAt - timeline.t0
+        if (timeline.setupMs > SETUP_MS) throw new Error('The setup exceeded its budget')
+        for (const kind of KINDS) this.processes.send(kind, { type: 'go' })
+        const corpus = this.own(this.offerCorpus(timeline.epochAt, schedule))
+        corpus.catch((error) => this.fail(error))
+        await this.ticks(timeline.epochAt, schedule)
+        await this.until(timeline.epochAt + warmupMs + measureMs)
+        timeline.boundaryAt = this.clock.now()
+        await corpus
+        for (const kind of KINDS) this.processes.send(kind, { type: 'finish' })
+        results = await Promise.race([
+          Promise.all(KINDS.map((kind) => this.processes.message(kind, 'result', cleanupBound))),
+          this.abort,
+        ])
+      } catch (error) {
+        await this.contain(error)
+      }
     })
     return results
   }
@@ -2711,8 +3281,10 @@ class TelemetryChurn {
       await this.until(epoch + slots[batch])
       if (batch === 0) for (const kind of KINDS) this.processes.send(kind, { type: 'corpus' })
       const from = batch * CORPUS.batch
-      for (const kind of ['consumer', 'shareConsumer'])
-        this.offered[kind].push(...(await this.fixture.produce(kind, from, CORPUS.batch)))
+      for (const kind of ['consumer', 'shareConsumer']) {
+        this.guard()
+        this.offered[kind].push(...(await this.own(this.fixture.produce(kind, from, CORPUS.batch))))
+      }
     }
   }
 
@@ -2728,7 +3300,8 @@ class TelemetryChurn {
   async ticks(epoch, schedule) {
     for (const tick of schedule.ticks) {
       await this.until(epoch + tick.at)
-      const late = this.clock.now() - (epoch + tick.at)
+      const beganAt = this.clock.now()
+      const late = beganAt - (epoch + tick.at)
       if (late > LATE_MS) {
         this.missed.push({
           tick: tick.number,
@@ -2740,16 +3313,17 @@ class TelemetryChurn {
           throw new Error(`The measured tick at ${tick.at} ms was missed`)
         continue
       }
+      this.tickStarts.push({ tick: tick.number, at: tick.at, beganAt })
       for (const stage of schedule.stages(tick)) {
         this.guard()
-        let rotation = null
         if (stage === 'confirm') {
-          rotation = await within(
-            this.fixture.rotate(tick.index, schedule.selection(tick.index)),
+          const requestedAt = this.clock.now()
+          const rotation = await within(
+            this.own(this.fixture.rotate(tick.index, schedule.selection(tick.index))),
             STAGE_MS.confirm - 1000,
             'The subscription set and readback'
           )
-          this.rotations.push({ tick: tick.number, ...rotation })
+          this.rotations.push({ tick: tick.number, requestedAt, ...rotation })
         }
         const sentAt = this.clock.now()
         for (const kind of KINDS)
@@ -2807,18 +3381,30 @@ class TelemetryChurn {
       }
     }
     for (const kind of KINDS) {
-      const worker = this.processes.workers.get(kind)
-      if (!worker) continue
-      const exit = await attempt(() => this.processes.join(kind))
-      if (exit === null || exit.event !== 'close') this.processes.taint(kind)
-      if (exit) exits[kind] = exit
+      if (!this.processes.workers.has(kind)) continue
+      let exit = await attempt(() =>
+        this.failed ? this.processes.cancel(kind) : this.processes.join(kind)
+      )
       if (exit && exit.event !== 'close')
+        exit = { ...(await attempt(() => this.processes.cancel(kind))), watchdogExpired: true }
+      if (exit) exits[kind] = exit
+      if (!exit || exit.event !== 'close' || exit.watchdogExpired)
         errors.push(new Error(`Telemetry worker ${kind} did not close naturally`))
     }
+    const parentMemory = [
+      ...(this.parentMemory ?? []),
+      readMemory('parent-after-workers', () => this.clock.now()),
+    ]
+    for (const result of results)
+      if (exits[result.kind]?.event === 'close')
+        await attempt(() =>
+          this.decoder.terminal(this.directory, result.kind, result.facts.sealed.at(-1))
+        )
+    parentMemory.push(readMemory('parent-after-terminal-decodes', () => this.clock.now()))
     const oracle = results.length && !this.failed ? await attempt(() => this.oracle(results)) : null
     const decoder = await attempt(() => this.decoder.close())
     await attempt(() => this.fixture.close())
-    return { exits, oracle, decoder, errors }
+    return { exits, oracle, decoder, parentMemory, errors }
   }
 
   /**
@@ -2850,9 +3436,9 @@ class TelemetryChurn {
       shareConsumer: {
         log: logs.shareConsumer,
         topicId,
+        group: this.fixture.group('shareConsumer'),
         handled: byKind.shareConsumer.ordinary.handled,
-        acquisitions: byKind.shareConsumer.share.acquisitions,
-        settlements: byKind.shareConsumer.share.settlements,
+        exchanges: byKind.shareConsumer.share.exchanges,
         settled: byKind.shareConsumer.share.settled,
         closures,
       },
@@ -2917,10 +3503,29 @@ class TelemetryChurn {
    */
   judge(results, shutdown, timeline, schedule) {
     const { warmupMs, measureMs, cleanupMs: cleanupBound, caseMs } = this.limits
-    const violations = []
+    const violations = this.failed ? [String(this.cause?.message ?? this.cause)] : []
+    violations.push(...shutdown.errors.map((error) => String(error?.message ?? error)))
     const workers = []
-    for (const result of results) {
-      const exit = shutdown.exits[result.kind]
+    for (const kind of KINDS) {
+      const messages = this.processes.workers.get(kind)?.messages ?? []
+      const result =
+        results.find((r) => r.kind === kind) ?? messages.find((m) => m.type === 'result')
+      if (!result) {
+        const partial = this.partial(kind, messages, shutdown.exits[kind] ?? null)
+        workers.push(partial)
+        this.record({
+          kind: 'resource-verdict',
+          clientKind: kind,
+          partial: true,
+          rows: partial.rows,
+          failures: partial.failures,
+          result: { ok: false, outcome: 'failed', violations: ['incomplete worker evidence'] },
+        })
+        this.record({ kind: 'natural-exit', clientKind: kind, ...(partial.exit ?? {}) })
+        violations.push(`${kind}: incomplete worker evidence`)
+        continue
+      }
+      const exit = shutdown.exits[result.kind] ?? {}
       const input = { ...result.input, clientCount: 1 }
       const evaluated = this.verdict(input)
       workers.push({
@@ -2954,6 +3559,7 @@ class TelemetryChurn {
         exit.unhandled !== 0 ||
         exit.receipts !== 1 ||
         exit.killed ||
+        exit.aborted ||
         exit.watchdogExpired ||
         !(Number.isFinite(exit.afterDisconnectMs) && exit.afterDisconnectMs >= 0) ||
         exit.afterDisconnectMs > this.limits.exitMs
@@ -3009,10 +3615,34 @@ class TelemetryChurn {
         inputs,
         stages: this.stages,
         rotations: this.rotations,
+        tickStarts: this.tickStarts,
         missed: this.missed,
+        handshakes: this.handshakes ?? [],
         decoder: shutdown.decoder,
+        parentMemory: shutdown.parentMemory,
         workers: Object.fromEntries(workers.map((w) => [w.kind, w.facts])),
       },
+    }
+  }
+
+  /**
+   * The evidence a worker published before it failed without a result: its raw progress rows, its
+   * sealed segment receipts, its failure facts and its exit, nothing summarised away.
+   * @param {string} kind the worker @param {object[]} messages its received messages
+   * @param {object|null} exit its joined exit facts
+   * @returns {{kind:string, facts:object|null, sealed:object[], rows:object[], failures:object[],
+   *   exit:object|null}} the partial worker entry
+   */
+  partial(kind, messages, exit) {
+    const progress = messages.filter((m) => m.type === 'progress')
+    const failure = messages.find((m) => m.type === 'failure')
+    return {
+      kind,
+      facts: failure?.facts ?? null,
+      sealed: failure?.facts?.sealed ?? progress.filter((m) => m.sealed).map((m) => m.sealed),
+      rows: progress.filter((m) => m.row).map((m) => m.row),
+      failures: failure?.failures ?? [],
+      exit,
     }
   }
 
@@ -3026,11 +3656,12 @@ class TelemetryChurn {
       const errors = []
       for (const kind of KINDS) {
         const worker = this.processes.workers.get(kind)
-        if (worker && !worker.exit) {
-          const exit = await this.processes.join(kind).catch((error) => error)
-          if (exit instanceof Error || exit.event !== 'close') this.processes.taint(kind)
-          if (exit instanceof Error) errors.push(exit)
-        }
+        if (worker && !worker.exit)
+          try {
+            await this.processes.cancel(kind)
+          } catch (error) {
+            errors.push(error)
+          }
       }
       for (const work of [() => this.decoder.close(), () => this.fixture.close()])
         try {
@@ -3138,23 +3769,51 @@ class TelemetryWorkerProcess {
   /**
    * @param {object} parts what the reference holds when the run is judged
    * @returns {object} the replayable reference facts: source and capability, every reading, the
-   *   control, and the host before the control, at the boundary and after the run
+   *   control with its frozen catalogue, the enabled replay of that catalogue, the native work
+   *   journal and its sampler, and the host before the control, at the boundary and after the run
    */
-  reference({ loaded, control, host }) {
+  reference({ loaded, control, host, memory, journal, sampler, foreground }) {
     return {
-      version: 'rss-reference-1',
-      source: 'proc-status-vmhwm',
-      capability: { gc: typeof globalThis.gc === 'function', peak: readHighWater() !== null },
+      version: 'rss-reference-2',
+      source: memory.source ? 'proc-status-vmhwm' : null,
+      units: 'bytes',
+      capability: { gc: memory.gcCapability().native, peak: readHighWater() !== null },
       startup: this.soak.startup ?? null,
       loaded,
       control,
+      foreground,
+      native: { journal: journal.summary(), sampler: sampler.summary() },
       final: readMemory('final', () => this.clock.now()),
       host: { ...host, after: hostContext(() => this.clock.now()) },
     }
   }
 
   /**
-   * Runs the worker to its receipt and result.
+   * The stamps a parent binds this worker to: its clock origin, process, Node build and flags, the
+   * loaded module count, codec capability and the source of this driver.
+   * @returns {object} plain data sent with `hello`
+   */
+  stamps() {
+    return {
+      origin: performance.timeOrigin,
+      pid: process.pid,
+      node: process.version,
+      v8: process.versions.v8,
+      platform: process.platform,
+      arch: process.arch,
+      execArgv: process.execArgv,
+      modules: Object.keys(require.cache).length,
+      codecs: { gzip: true, zstd: zstdCodec.isSupported === true },
+      source: {
+        churn: sha(fs.readFileSync(__filename)),
+        driver: sha(fs.readFileSync(require.main?.filename ?? __filename)),
+      },
+    }
+  }
+
+  /**
+   * Runs the worker to its receipt and result. An `abort` from the parent rejects whatever message
+   * the worker waits for, so a setup or run in progress unwinds through its own cleanup.
    * @returns {Promise<{ok:boolean, violations:string[]}>} the resource verdict of this one client
    * @throws {Error} a failed setup or run, after the failure message was still sent
    */
@@ -3163,15 +3822,27 @@ class TelemetryWorkerProcess {
     if (typeof proc.send !== 'function')
       throw new Error('A telemetry worker needs its parent channel')
     this.listen()
-    this.send({ type: 'hello' })
-    const config = await this.inbox.take((m) => m.type === 'config')
+    this.send({ type: 'hello', ...this.stamps() })
     const resources = new ProcessResources()
-    resources.start()
+    const memory = new ProcessMemory({ now: () => this.clock.now() })
+    const sampler = new PendingSampler(memory, {
+      set: (fn, ms) => resources.as('fixture:native-sampler', () => setInterval(fn, ms)),
+    })
+    let segments = null
+    const journal = new NativeJournal({
+      memory,
+      sampler,
+      capacity: NATIVE_ROWS,
+      epoch: () => segments?.current().index ?? 0,
+    })
     const target = (work) => resources.as('target', work)
     let verdict
     let failure
+    let failed = false
     let worker = null
     try {
+      const config = await this.inbox.take((m) => m.type === 'config')
+      resources.start()
       const loaded = readMemory('loaded', () => this.clock.now())
       const host = { before: hostContext(() => this.clock.now()) }
       const control = await new ReferenceControl({
@@ -3183,13 +3854,16 @@ class TelemetryWorkerProcess {
         resources,
         clock: this.clock,
         sleep: this.sleep,
+        collections: () => memory.collections,
       }).run()
       host.boundary = hostContext(() => this.clock.now())
+      journal.observe('gzip', gzipCodec)
+      journal.observe('zstd', zstdCodec)
       const ledger =
         kind === 'shareConsumer'
           ? new ShareLedger({ group: config.group, clock: this.clock })
           : null
-      const segments = TelemetrySegments.ordinary(SCENARIO, kind, {
+      segments = TelemetrySegments.ordinary(SCENARIO, kind, {
         directory: config.directory,
         clock: this.clock,
         observer: {
@@ -3212,12 +3886,13 @@ class TelemetryWorkerProcess {
       )
       const client = this.create(kafka, config)
       const schedule = new TelemetrySchedule(soak.TELEMETRY)
+      const owned = segments
       worker = new TelemetryWorker({
         kind,
         client,
         tap,
         segments,
-        registry: new Registry(client, kind, DESCRIPTORS, this.clock),
+        registry: new Registry(client, kind, DESCRIPTORS, this.clock, () => writeFence(owned)),
         clock: this.clock,
         sleep: this.sleep,
         limits: soak.TELEMETRY,
@@ -3226,6 +3901,7 @@ class TelemetryWorkerProcess {
         send: (message) => this.send(message),
         target,
         ledger,
+        foreground: { manifest: control.manifest, prefix: `${config.stem}:ctl-on` },
         ordinary: new OrdinaryWork({
           kind,
           client,
@@ -3242,16 +3918,28 @@ class TelemetryWorkerProcess {
       const measured = {
         snapshot: async () => {
           worker.registry.restore()
+          const admittedAt = this.clock.now()
+          const before = memory.collections
           const snapshot = await probe.snapshot()
+          await new Promise((resolve) => setImmediate(resolve))
+          await new Promise((resolve) => setImmediate(resolve))
+          const reading = readMemory('settled', () => this.clock.now())
           return {
             ...snapshot,
-            memory: snapshot.memory && { ...snapshot.memory, hwm: readHighWater() },
+            memory: snapshot.memory && {
+              ...reading,
+              retainedBytes: reading.retained,
+              probe: snapshot.memory,
+              gc: { admittedAt, completedAt: reading.at, observed: memory.collections - before },
+            },
             registryDigest: worker.registry.digest(uuid),
           }
         },
       }
       let input
       const judge = (run) => {
+        sampler.stop()
+        journal.restoreAll()
         input = {
           clientCount: 1,
           baseline: run.baseline,
@@ -3264,12 +3952,20 @@ class TelemetryWorkerProcess {
           teardown: run.teardown,
           measurementMs: worker.timing.measurementMs,
           cleanupMs: worker.timing.cleanupMs,
-          reference: this.reference({ loaded, control, host }),
-          sampler: { skipped: sampler.skipped, readFailures: sampler.readFailures },
+          reference: this.reference({
+            loaded,
+            control,
+            host,
+            memory,
+            journal,
+            sampler,
+            foreground: worker.claims.foreground,
+          }),
+          sampler: { skipped: run.skipped, readFailures: run.readFailures },
         }
         return soak.TelemetryResourceVerdict.evaluate(input)
       }
-      const sampler = new soak.Soak({
+      const soakRun = new soak.Soak({
         kafka,
         probe: measured,
         phases: soak.PROFILES.telemetry,
@@ -3277,15 +3973,16 @@ class TelemetryWorkerProcess {
         sampleMs: soak.TELEMETRY.sampleMs,
         sampleAt: soak.TELEMETRY.sampleAt,
         warmupMs: soak.TELEMETRY.warmupMs,
-        judge,
-        record: () => {},
+        judge: (run) =>
+          judge({ ...run, skipped: soakRun.skipped, readFailures: soakRun.readFailures }),
+        record: (row) => this.send({ type: 'progress', row }),
         workloads: soak.WORKLOADS,
         clock: this.clock,
       })
-      worker.sampler = sampler
+      worker.sampler = soakRun
       this.send({ type: 'ready', uuid, clientId: `${config.stem}-${kind}` })
       await this.inbox.take((m) => m.type === 'start')
-      verdict = await resources.as('fixture:sampler', () => sampler.run())
+      verdict = await resources.as('fixture:sampler', () => soakRun.run())
       this.send({
         type: 'result',
         clientId: `${config.stem}-${kind}`,
@@ -3295,6 +3992,7 @@ class TelemetryWorkerProcess {
         facts: worker.facts(),
       })
     } catch (error) {
+      failed = true
       failure = error
       const causes = [error]
       try {
@@ -3302,17 +4000,32 @@ class TelemetryWorkerProcess {
       } catch (abortError) {
         causes.push(abortError)
       }
+      let facts = null
+      try {
+        facts = worker?.facts() ?? null
+      } catch (factError) {
+        causes.push(factError)
+      }
       this.send({
         type: 'failure',
+        facts,
+        native: { journal: journal.summary(), sampler: sampler.summary() },
+        failures: causes.map((cause) => ({
+          name: cause?.name ?? typeof cause,
+          message: String(cause?.message ?? cause).slice(0, 2048),
+        })),
         message: causes
           .map((c) => String(c?.message ?? c))
           .join('; ')
           .slice(0, 2048),
       })
     }
+    sampler.stop()
+    journal.restoreAll()
+    memory.stop()
     resources.stop()
     proc.disconnect?.()
-    if (failure) throw failure
+    if (failed) throw failure
     return verdict
   }
 }
@@ -3338,6 +4051,7 @@ module.exports = {
   ProcessResources,
   ReferenceControl,
   Registry,
+  ShareExchanges,
   ShareLedger,
   ShareOracle,
   TelemetryChurn,
@@ -3349,6 +4063,8 @@ module.exports = {
   TelemetryWorkerProcess,
   checkLog,
   compactRuns,
+  controlManifest,
+  runCatalogue,
   hostContext,
   indexOf,
   labelOf,
@@ -3360,4 +4076,5 @@ module.exports = {
   valueOf,
   wait,
   within,
+  writeFence,
 }

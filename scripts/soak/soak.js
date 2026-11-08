@@ -434,8 +434,48 @@ class TelemetryResourceVerdict {
   }
 
   /**
-   * Judges the resident-size gates against the worker's own disabled control. Failures are pushed
-   * into `violations`; what only makes the measurement uninformative is returned.
+   * Validates one memory reading of the versioned catalogue: its phase, monotonic time, every
+   * counter as a nonnegative safe integer, `retained = heapUsed + external` with `arrayBuffers`
+   * inside `external` (never added again), and for a settled reading real collections admitted
+   * before it completed. A missing peak (`hwm` null) is a capability fact, not a malformed reading.
+   * @param {object} reading the reading @param {string} phase the catalogue name it must carry
+   * @param {boolean} settled whether it must carry its collection facts
+   * @returns {string|null} what is wrong with it, or null
+   */
+  static malformed(reading, phase, settled) {
+    const counter = (value) => Number.isSafeInteger(value) && value >= 0
+    if (reading?.phase !== phase) return 'resident-size reading phase'
+    if (!Number.isFinite(reading.at)) return 'resident-size reading time'
+    const values = ['rss', 'heapUsed', 'external', 'arrayBuffers', 'rawMaxRss']
+    if (!values.every((key) => counter(reading[key]))) return 'resident-size counters'
+    if (reading.hwm !== null && !counter(reading.hwm)) return 'resident-size counters'
+    const retained = reading.retainedBytes ?? reading.retained
+    if (
+      retained !== reading.heapUsed + reading.external ||
+      (reading.retainedBytes !== undefined &&
+        reading.retained !== undefined &&
+        reading.retainedBytes !== reading.retained) ||
+      reading.arrayBuffers > reading.external
+    )
+      return 'resident-size arithmetic'
+    if (settled) {
+      const gc = reading.gc
+      if (
+        !Number.isFinite(gc?.admittedAt) ||
+        gc.completedAt !== reading.at ||
+        gc.admittedAt > gc.completedAt ||
+        !Number.isSafeInteger(gc.observed) ||
+        gc.observed < 2
+      )
+        return 'resident-size collection facts'
+    }
+    return null
+  }
+
+  /**
+   * Judges the resident-size gates against the worker's own disabled control, over every reading
+   * of the versioned catalogue and the native work journal. Failures are pushed into `violations`;
+   * what only makes the measurement uninformative is returned.
    * @param {object} reference the replayable reference facts
    * @param {object} run `baseline`, `samples`, `teardown`, `violations` to append to and `measured`
    * @returns {string[]} the reasons the measurement is inconclusive
@@ -445,40 +485,85 @@ class TelemetryResourceVerdict {
     const fail = (condition, label) => {
       if (!condition) violations.push(label)
     }
-    const finite = (value) => Number.isFinite(value) && value >= 0
-    if (reference?.version !== 'rss-reference-1') {
+    if (reference?.version !== 'rss-reference-2') {
       violations.push('resident-size reference facts')
       return inconclusive
     }
-    fail(reference.source === 'proc-status-vmhwm', 'resident-size peak source')
+    fail(
+      reference.source === 'proc-status-vmhwm' && reference.units === 'bytes',
+      'resident-size peak source'
+    )
     if (reference.capability?.gc !== true || reference.capability?.peak !== true)
       inconclusive.push('collection or peak capability')
     const control = reference.control
-    const timeline = [
-      reference.startup,
-      reference.loaded,
-      control?.c0,
-      control?.c1,
-      control?.released,
-      baseline?.memory,
-      ...samples.map((s) => s.snapshot?.memory),
-      teardown?.memory,
-      reference.final,
+    const catalogue = [
+      [reference.startup, 'startup', false],
+      [reference.loaded, 'loaded', false],
+      [control?.c0, 'c0', true],
+      [control?.c1, 'c1', true],
+      [control?.released, 'control-released', true],
+      [baseline?.memory, 'settled', true],
+      ...samples.map((s) => [s.snapshot?.memory, 'settled', true]),
+      [teardown?.memory, 'settled', true],
+      [reference.final, 'final', false],
     ]
-    const readings = timeline.filter(Boolean)
-    const complete =
-      timeline.every(Boolean) &&
-      readings.every((r) => finite(r.rss) && finite(r.external) && finite(r.hwm))
-    fail(complete, 'resident-size reading shape')
-    if (!complete) return inconclusive
-    let high = -Infinity
-    for (const reading of readings) {
-      fail(reading.hwm >= high && reading.hwm >= reading.rss, 'resident-size peak series')
-      high = Math.max(high, reading.hwm)
+    const problems = catalogue
+      .map(([reading, phase, settled]) =>
+        TelemetryResourceVerdict.malformed(reading, phase, settled && reference.capability?.gc)
+      )
+      .filter(Boolean)
+    for (const problem of new Set(problems)) violations.push(problem)
+    if (problems.length) return inconclusive
+    const readings = catalogue.map(([reading]) => reading)
+    fail(
+      readings.every((r, i) => i === 0 || r.at >= readings[i - 1].at),
+      'resident-size reading order'
+    )
+    const native = reference.native
+    const rows = native?.journal?.rows
+    const nativeReadings = Array.isArray(rows)
+      ? rows.flatMap((row) => [row.submitted, row.settled])
+      : []
+    fail(
+      Array.isArray(rows) &&
+        native.journal.overflow === false &&
+        native.journal.live === 0 &&
+        rows.every((row) => ['resolved', 'rejected'].includes(row.outcome)) &&
+        nativeReadings.every(
+          (r) => Number.isSafeInteger(r?.rss) && r.rss >= 0 && Number.isSafeInteger(r.external)
+        ) &&
+        Number.isSafeInteger(native.sampler?.count) &&
+        native.sampler.count >= 2 * rows.length &&
+        Number.isSafeInteger(native.sampler.peak?.rss) &&
+        Number.isSafeInteger(native.sampler.peak?.external),
+      'native work journal'
+    )
+    if (readings.some((r) => r.hwm === null)) {
+      inconclusive.push('resident-size peak capability')
+    } else {
+      let high = -Infinity
+      let covered = -Infinity
+      for (const reading of readings) {
+        covered = Math.max(covered, reading.rss)
+        fail(reading.hwm >= high && reading.hwm >= covered, 'resident-size peak series')
+        high = Math.max(high, reading.hwm)
+      }
     }
     fail(
-      control.telemetryFrames === 0 && control.openSockets === 0 && control.leftoverHandles === 0,
+      control.telemetryFrames === 0 &&
+        control.openSockets === 0 &&
+        control.leftoverHandles === 0 &&
+        Array.isArray(control.manifest?.operations) &&
+        Array.isArray(control.outcomes) &&
+        control.outcomes.length === control.manifest.operations.length &&
+        control.outcomes.every((o, n) => o.n === n && o.status === 'fulfilled'),
       'telemetry-disabled control'
+    )
+    fail(
+      Array.isArray(reference.foreground) &&
+        reference.foreground.length === control.manifest?.operations?.length &&
+        reference.foreground.every((o, n) => o.n === n && o.status === 'fulfilled'),
+      'enabled replay of the control catalogue'
     )
     const rssDrift = Math.abs(control.c1.rss - control.c0.rss)
     const retainedDrift = Math.abs(control.c1.retained - control.c0.retained)
@@ -487,19 +572,22 @@ class TelemetryResourceVerdict {
       retainedDrift > TELEMETRY.controlRetainedDriftBytes
     )
       inconclusive.push('unstable control')
-    const peakOf = (list) => Math.max(...list.flatMap((r) => [r.hwm, r.rss]))
-    const setupPeak = peakOf([
-      reference.startup,
-      reference.loaded,
-      control.c0,
-      control.c1,
-      control.released,
-    ])
+    const peakOf = (list) => Math.max(...list.flatMap((r) => [r.hwm ?? 0, r.rss]))
+    const setupPeak = peakOf(readings.slice(0, 5))
     if (setupPeak > TELEMETRY.setupPeakBytes) inconclusive.push('setup peak above its allowance')
     const base = Math.min(control.c0.rss, control.c1.rss)
     const externalReference = Math.min(control.c0.external, control.c1.external)
-    const peak = peakOf(readings)
-    const externalPeak = Math.max(...readings.map((r) => r.external))
+    const sampled = native?.sampler?.peak ?? { rss: 0, external: 0 }
+    const peak = Math.max(
+      peakOf(readings),
+      ...nativeReadings.map((r) => r?.rss ?? 0),
+      sampled.rss ?? 0
+    )
+    const externalPeak = Math.max(
+      ...readings.map((r) => r.external),
+      ...nativeReadings.map((r) => r?.external ?? 0),
+      sampled.external ?? 0
+    )
     Object.assign(measured, {
       controlBaseRss: base,
       controlExternal: externalReference,
@@ -508,6 +596,7 @@ class TelemetryResourceVerdict {
       rssDelta: peak - base,
       externalPeak,
       externalDelta: externalPeak - externalReference,
+      nativeJobs: Array.isArray(rows) ? rows.length : null,
     })
     fail(peak - base <= TELEMETRY.rssDeltaBytes, 'telemetry resident-size increase')
     fail(peak <= TELEMETRY.peakBytes, 'absolute resident-size peak')
@@ -516,6 +605,7 @@ class TelemetryResourceVerdict {
       'external-memory increase'
     )
     for (const [name, host] of Object.entries(reference.host ?? {})) {
+      const finite = (value) => Number.isFinite(value) && value >= 0
       const known = finite(host?.cpus) && finite(host?.load1) && finite(host?.freeBytes)
       fail(known, `host context ${name}`)
       if (
