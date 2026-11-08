@@ -198,15 +198,6 @@ describe('dedicated broker telemetry requests', () => {
       await h.pool.destroy({ drainTimeout: 0 })
     }
   })
-  it.each([
-    { acceptedCompressionTypes: Array(129).fill(0) },
-    { requestedMetrics: Array(257).fill('') },
-    { requestedMetrics: ['é'.repeat(129)] },
-    { requestedMetrics: Array(65).fill('x'.repeat(256)) },
-  ])('refuses bounded metadata before array decoding: %j', (fields) => {
-    const broker = Object.create(Broker.prototype)
-    expect(() => broker.validateTelemetryMetadata(getPair.buildResponse(fields))).toThrow()
-  })
 })
 
 it('never begins authentication for a terminating push', async () => {

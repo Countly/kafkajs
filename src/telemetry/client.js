@@ -583,10 +583,11 @@ module.exports = class ClientTelemetry {
   /**
    * Resolves a cached accepted ID, otherwise waits under an independent original deadline measured
    * from entry, so a slow options accessor consumes the same budget.
-   * Precedence: validation, disabled, cached ID, closed, not connected, unsupported, stopped, timeout.
+   * Precedence: validation, disabled, cached ID, closed, not connected, unsupported, stopped, timeout,
+   * then admission, which first rejects waiters already past their own deadline.
    * @param {{timeout?:number}} [options] timeout defaults to 60000; zero reads the cache only
-   * @returns {Promise<string>} bounded to 64 waiters; no implicit connection
-   * @throws {Error} asynchronous validation or typed telemetry refusal
+   * @returns {Promise<string>} bounded to 64 live waiters; no implicit connection
+   * @throws {Error} asynchronous validation or typed telemetry refusal, including `limit`
    */
   async clientInstanceId(options) {
     const entered = this.clock.now()
@@ -599,11 +600,26 @@ module.exports = class ClientTelemetry {
     if (this.state === 'STOPPED') throw this.error('stopped')
     const deadline = entered + timeout
     if (!timeout || this.clock.now() >= deadline) throw this.error('timeout')
+    this.reclaimExpiredWaiters()
     if (this.waiters.size === 64) throw this.error('limit')
     return new Promise((resolve, reject) => {
       this.waiters.add({ resolve, reject, deadline, lifecycle: this.lifecycle })
       this.armWaiters()
     })
+  }
+
+  /**
+   * Frees the slots of waiters whose own deadline has passed without waiting for timer delivery.
+   * Synchronous and local: no Get, transport or timer is touched; the admitting caller arms once.
+   * @returns {void} each expired waiter is rejected with a timeout; live waiters are untouched
+   */
+  reclaimExpiredWaiters() {
+    const now = this.clock.now()
+    for (const waiter of this.waiters) {
+      if (now < waiter.deadline) continue
+      this.waiters.delete(waiter)
+      waiter.reject(this.error('timeout'))
+    }
   }
 
   /** @returns {void} one earliest waiter deadline timer */

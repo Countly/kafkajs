@@ -155,12 +155,25 @@ describe('stable instance identity and absolute subscription replacement', () =>
     { requestedMetrics: null },
     { acceptedCompressionTypes: Array(129).fill(0) },
     { requestedMetrics: ['é'.repeat(129)] },
+    { requestedMetrics: Array(257).fill('a') },
+    { requestedMetrics: ['a'.repeat(257)] },
+    { requestedMetrics: [...Array(255).fill('a'.repeat(64)), 'a'.repeat(65)] },
     { deltaTemporality: 1 },
   ])('refuses invalid fields atomically: %j', (fields) => {
     const h = setup()
-    expect(() => h.client.install(subscription(fields))).toThrow()
+    expect(() => h.client.install(subscription(fields))).toThrow('Telemetry stopped')
     expect(h.client.uuid).toBeNull()
     expect(h.client.subscription).toBeNull()
+  })
+  it('installs the exact codec, prefix and total-byte limits', () => {
+    const h = setup()
+    const requestedMetrics = Array.from({ length: 256 }, (_, i) => String(i).padEnd(64, 'x'))
+    h.client.install(
+      subscription({ acceptedCompressionTypes: Array(128).fill(0), requestedMetrics })
+    )
+    expect(h.client.subscription.acceptedCompressionTypes).toHaveLength(128)
+    expect(h.client.subscription.requestedMetrics).toEqual(requestedMetrics)
+    h.client.suspend()
   })
   it('rejects a changed nonzero UUID without changing accepted fields', () => {
     const h = setup()
