@@ -147,6 +147,54 @@ describe('createResourceProbe', () => {
   })
 
   describe('heap', () => {
+    test('reads resources after collection and its finalizer gap, like the heap', async () => {
+      const socket = Object.assign(new EventEmitter(), { destroyed: false })
+      socket.on('error', () => {})
+      let depth = 1
+      const probe = createResourceProbe({
+        emitters: { socket },
+        sockets: () => ({ created: 1, destroyed: Number(socket.destroyed) }),
+        queueDepth: () => depth,
+        heap: true,
+        gc: () => {},
+        pause: async () => {
+          socket.destroyed = true
+          socket.removeAllListeners()
+          depth = 0
+        },
+      })
+
+      expect(await probe.snapshot()).toMatchObject({
+        listeners: { socket: 0 },
+        sockets: { created: 1, destroyed: 1, open: 0 },
+        queueDepth: 0,
+      })
+    })
+
+    test.each([false, true])(
+      'counts only timers still alive after the collection gap, retained=%s',
+      async (retained) => {
+        const baseline = await createResourceProbe({ activeResources: true }).snapshot()
+        const timer = setTimeout(() => {}, 60000)
+        const probe = createResourceProbe({
+          activeResources: true,
+          heap: true,
+          gc: () => {},
+          pause: async () => {
+            if (!retained) clearTimeout(timer)
+          },
+        })
+        try {
+          const snapshot = await probe.snapshot()
+          expect(snapshot.activeResources.Timeout || 0).toBe(
+            (baseline.activeResources.Timeout || 0) + Number(retained)
+          )
+        } finally {
+          clearTimeout(timer)
+        }
+      }
+    )
+
     test('collects twice, 100 ms apart, before it reads', async () => {
       const events = []
       const probe = createResourceProbe({
