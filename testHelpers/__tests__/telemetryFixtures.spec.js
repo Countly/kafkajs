@@ -2796,8 +2796,8 @@ describe('telemetry observation segments', () => {
     clock,
     observer: { line: '4.3.1', dial, decoder: stubDecoder, mode: 'configured' },
   })
-  const ordinary = (scenario = 'telemetry-shutdown', kind = 'producer') => {
-    const segments = TelemetrySegments.ordinary(scenario, kind, shared())
+  const ordinary = (scenario = 'telemetry-shutdown', kind = 'producer', options = {}) => {
+    const segments = TelemetrySegments.ordinary(scenario, kind, { ...shared(), ...options })
     owners.push(segments)
     return segments
   }
@@ -2911,7 +2911,8 @@ describe('telemetry observation segments', () => {
       await l5.discharge((await rotate(l5, client)).from)
     expect(() => l5.cycle(client)).toThrow('Segment cap of 21')
     expect(await l5.finish(client, { timeout: 3000 })).toHaveLength(21)
-    const short = ordinary()
+    const shortDirectory = fs.mkdtempSync(path.join(directory, 'short-'))
+    const short = ordinary('telemetry-shutdown', 'producer', { directory: shortDirectory })
     await expect(short.finish(fakeClient(short))).rejects.toThrow('Expected 21 segments, found 1')
     const l9 = ordinary('telemetry-churn', 'consumer')
     const churn = fakeClient(l9)
