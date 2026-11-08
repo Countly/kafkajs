@@ -2113,7 +2113,7 @@ describe('segmented evidence in the cleanup manifest', () => {
         sha256: sha(bytes),
         format: SEGMENT_FORMAT,
         scenario: 'telemetry-shutdown',
-        segments: 88,
+        segments: segmentCatalogue('telemetry-shutdown').length,
       },
     ])
     expect(() => verify()).not.toThrow()
