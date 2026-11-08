@@ -114,18 +114,20 @@ const buildClients = ({ mode, stem, line, directory, clock, enabled, suffix = ''
   cleanup.defer(() =>
     settle(
       Object.values(observers).map((observer) => () => {
-        const unanswered = observer
-          .readTranscript()
-          .filter((r) => r.apiKey === 72 && r.terminating && !r.response)
-          .map((r) => r.requestKey)
-        observer.assertClean({ allowUnanswered: unanswered })
+        observer.assertClean({ allowUnanswered: observer.cancellationKeys() })
       })
     )
   )
   cleanup.defer(() => settle(Object.values(observers).map((observer) => () => observer.dispose())))
   let closing
   const closeAll = () =>
-    (closing ??= settle(Object.values(clients).map((client) => () => client.disconnect())))
+    (closing ??= settle(
+      Object.entries(clients).map(
+        ([kind, client]) =>
+          () =>
+            observers[kind].closeClient(client)
+      )
+    ))
   cleanup.defer(closeAll)
   for (const kind of KINDS) {
     const observer = new TelemetryWireObserver({

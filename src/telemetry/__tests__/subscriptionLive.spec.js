@@ -551,7 +551,7 @@ class SubscriptionCases {
         following: ['6.25', '-3.5', '0'],
       }
       const classify = (sample) => {
-        assertCustomShape(sample.decoded, ['anchor', 'negative', 'total', 'zero'].map(N))
+        assertCustomShape(sample.decoded.decoded, ['anchor', 'negative', 'total', 'zero'].map(N))
         const triple = [
           point(sample.decoded, N('zero')).asDouble,
           point(sample.decoded, N('negative')).asDouble,
