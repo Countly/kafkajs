@@ -1292,9 +1292,10 @@ const indexedEvidenceWork = function* (entries, original, bounces) {
   const originalEntries = [...entries]
   const socketEvents = [...original.owner.tap.socketEvents]
   const cohortExchanges = new Map(original.exchangesByCohort)
-  const cohortOutcomes = new Map(original.outcomesByCohort)
+  const cohortOutcomes = new Map(
+    [...original.outcomesByCohort].map(([cohort, outcomes]) => [cohort, [...outcomes]])
+  )
   const originalExchanges = new Set(journals.exchanges)
-  const originalOutcomes = new Set(journals.outcomes)
   const frames = new Map()
   const exchanges = new Map()
   const acquisitions = new Map()
@@ -1338,10 +1339,7 @@ const indexedEvidenceWork = function* (entries, original, bounces) {
   let visited = 0
   for (const [cohort, outcomes] of cohortOutcomes) {
     if (visited++ % 100 === 0) yield
-    evidence.outcomesByCohort.set(
-      cohort,
-      outcomes.filter((row) => originalOutcomes.has(row))
-    )
+    evidence.outcomesByCohort.set(cohort, outcomes)
   }
   entries = yield* mappedAuditWork(originalEntries, (entry) => ({
     ...entry,
@@ -1356,6 +1354,11 @@ const indexedEvidenceWork = function* (entries, original, bounces) {
     deliveries: new Map(),
     receipts: new Map(),
     boundaries: new Map(),
+    obligations: new Map(),
+  }
+  for (const bounce of bounces) {
+    yield
+    evidence.auditIndex.obligations.set(bounce, effectiveObligations(bounce))
   }
   for (const exchange of evidence.exchanges) {
     if (visited++ % 100 === 0) yield
@@ -1617,9 +1620,10 @@ const effectiveObligations = (bounce) => {
  * @param {BounceEvidence} evidence Original ticket journal.
  * @param {object} cut Observation boundary.
  * @param {boolean} [admit] Whether this observation is a qualifying interruption.
+ * @param {Map<number, number>} [origins] Earlier admission owners for this reconstruction step.
  * @returns {object} Original attempt and tickets, retaining the first interruption attribution.
  */
-const obligation = (entry, bounces, index, evidence, cut, admit = false) => ({
+const obligation = (entry, bounces, index, evidence, cut, admit = false, origins) => ({
   identity: entry.identity,
   entry: entry.id,
   cohort: entry.acquisition?.id,
@@ -1639,10 +1643,12 @@ const obligation = (entry, bounces, index, evidence, cut, admit = false) => ({
       : []
   ),
   originatingEpisode:
-    bounces.find(
-      (episode) =>
-        episode.index < index && newObligations(episode).some((held) => held.entry === entry.id)
-    )?.index ?? (admit ? index : null),
+    (origins
+      ? origins.get(entry.id)
+      : bounces.find(
+          (episode) =>
+            episode.index < index && newObligations(episode).some((held) => held.entry === entry.id)
+        )?.index) ?? (admit ? index : null),
 })
 
 /**
@@ -1681,8 +1687,9 @@ const interruptionJournal = (evidence) => [
  */
 const matchingInterruption = (entry, bounce, evidence, after = Infinity) => {
   const scope = authority(entry)
-  if (scope.nodeId !== bounce.nodeId || !effectiveObligations(bounce).has(entry.identity))
-    return null
+  if (scope.nodeId !== bounce.nodeId) return null
+  const obligations = evidence.auditIndex?.obligations.get(bounce) ?? effectiveObligations(bounce)
+  if (!obligations.has(entry.identity)) return null
   for (const cut of bounce.interruptions ?? []) {
     if (
       !sameAuthority(cut.scope, scope) ||
@@ -1889,6 +1896,7 @@ const historyAccounting = (entries, bounces, evidence, cut) => {
  */
 const reconstructFreezes = function* (entries, bounces, evidence) {
   const reconstructed = []
+  let origins = new Map()
   const journal = yield* sortedAuditWork(
     [
       ...interruptionJournal(evidence),
@@ -1905,12 +1913,19 @@ const reconstructFreezes = function* (entries, bounces, evidence) {
     if (primitiveCount++ % 100 === 0) yield
     const cut = interruptionEvent(kind, event)
     if (kind === 'command') {
+      origins = new Map()
+      for (const prior of reconstructed)
+        if (prior.index < event.index)
+          for (const held of newObligations(prior)) {
+            if (primitiveCount++ % 100 === 0) yield
+            if (!origins.has(held.entry)) origins.set(held.entry, prior.index)
+          }
       const history = unresolvedAt(entries, evidence, cut)
       const bounce = {
         ...event,
         held: new Set(history.map(({ identity }) => identity)),
         obligations: history.map((entry) =>
-          obligation(entry, reconstructed, event.index, evidence, cut)
+          obligation(entry, reconstructed, event.index, evidence, cut, false, origins)
         ),
         carried: carriedAt(reconstructed, event, history),
         interruptions: [],
@@ -1937,7 +1952,7 @@ const reconstructFreezes = function* (entries, bounces, evidence) {
         event: event.id,
         scope,
         obligations: scoped.map((entry) =>
-          obligation(entry, reconstructed, bounce.index, evidence, cut, true)
+          obligation(entry, reconstructed, bounce.index, evidence, cut, true, origins)
         ),
         carried: carriedAt(reconstructed, bounce, history),
         lateEntries: scoped.filter((entry) => precedes(bounce, entry)).map(({ id }) => id),
@@ -10469,10 +10484,29 @@ describe('share bounce acquisition and settlement sensitivity', () => {
     expect(auditTerminal(proof).problems).toContain(component)
   })
 
-  it('rejects duplicate terminal outcomes without converting an unknown into success', () => {
+  it.each(['original', 'copy'])(
+    'rejects duplicate terminal outcomes (%s) without converting an unknown into success',
+    (kind) => {
+      const proof = lostAcceptFixture(replayFixture())
+      expect(auditTerminal(proof).problems).toEqual([])
+      const original = proof.evidence.outcomes[0]
+      proof.evidence.outcomesByCohort.get(0).push(kind === 'copy' ? { ...original } : original)
+      const result = auditTerminal(proof)
+      expect(result.problems).toContain(
+        `${proof.corpus[0]} has duplicate terminal outcomes for one acquisition`
+      )
+      expect(result.settlement.successful).toEqual([])
+      expect(result.settlement.unknown.map(({ identity }) => identity)).toEqual(proof.corpus)
+    }
+  )
+
+  it('seals cohort outcome membership before cooperative terminal validation yields', async () => {
     const proof = lostAcceptFixture(replayFixture())
-    const original = proof.evidence.outcomes[0]
-    proof.evidence.outcomesByCohort.get(0).push({ ...original })
+    const expected = auditTerminal(proof)
+    const work = auditTerminalWork(proof)
+    expect(work.next().done).toBe(false)
+    proof.evidence.outcomesByCohort.get(0).push({ ...proof.evidence.outcomes[0] })
+    expect(await cooperativeAudit(work, NEVER)).toEqual(expected)
     expect(auditTerminal(proof).problems).toContain(
       `${proof.corpus[0]} has duplicate terminal outcomes for one acquisition`
     )
