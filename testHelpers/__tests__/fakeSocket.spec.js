@@ -128,6 +128,117 @@ describe('socketCounts', () => {
   })
 })
 
+describe('createFakeSocketFactory with bounded capture', () => {
+  const bounded = (options = {}) => createFakeSocketFactory({ bounded: options })
+
+  test('keeps the default factory unchanged: every socket and write is still retained', async () => {
+    const { factory, state } = createFakeSocketFactory()
+    const socket = await dial(factory)
+    socket.write(Buffer.from([1, 2]))
+    socket.destroy()
+    await microtasks()
+    await microtasks()
+
+    expect(state.bounded).toBe(false)
+    expect(state.sockets).toEqual([socket])
+    expect(state.writes).toEqual([Buffer.from([1, 2])])
+    expect(socket.writes).toEqual([Buffer.from([1, 2])])
+    expect({ issued: state.issued, closed: state.closed, writeCount: state.writeCount }).toEqual({
+      issued: 1,
+      closed: 1,
+      writeCount: 1,
+    })
+  })
+
+  test('drops a closed socket only after its close callbacks have run', async () => {
+    const closed = []
+    const { factory, state } = bounded({ onClosed: (socket) => closed.push(socket) })
+    const socket = await dial(factory)
+    const events = []
+    socket.on('error', () => events.push('error'))
+    socket.on('close', () => events.push(`close live=${state.sockets.length}`))
+
+    socket.destroy(new Error('lost'))
+    expect(state.sockets).toEqual([socket])
+    await microtasks()
+    await microtasks()
+
+    expect(events).toEqual(['error', 'close live=1'])
+    expect(state.sockets).toEqual([])
+    expect(closed).toEqual([socket])
+    expect(state.closed).toBe(1)
+  })
+
+  test('keeps counters, not writes, and counts a write after close as a scalar fact', async () => {
+    const { factory, state } = bounded()
+    const socket = await dial(factory)
+    socket.write(Buffer.alloc(3))
+    socket.destroy()
+    await microtasks()
+    await microtasks()
+    socket.write(Buffer.alloc(5))
+
+    expect(state.writes).toEqual([])
+    expect(socket.writes).toEqual([])
+    expect({
+      count: state.writeCount,
+      bytes: state.writeBytes,
+      afterClose: state.writesAfterClose,
+    }).toEqual({ count: 2, bytes: 8, afterClose: 1 })
+  })
+
+  test('numbers sockets by issued counters, so pruning never reuses a generation', async () => {
+    const { factory, state } = bounded()
+    const seen = []
+    for (let i = 0; i < 5; i++) {
+      const socket = await dial(factory, 'a', 9092)
+      seen.push(state.issuedByEndpoint.get('a:9092'))
+      socket.destroy()
+      await microtasks()
+      await microtasks()
+    }
+
+    expect(seen).toEqual([1, 2, 3, 4, 5])
+    expect(state.sockets).toEqual([])
+    expect(state.issued).toBe(5)
+    expect(socketCounts(state)).toEqual({ created: 5, destroyed: 5 })
+  })
+
+  test('counts a destroyed socket whose close has not been emitted yet', async () => {
+    const { factory, state } = bounded()
+    const first = await dial(factory)
+    await dial(factory)
+    first.destroy()
+
+    expect(socketCounts(state)).toEqual({ created: 2, destroyed: 1 })
+  })
+
+  test('refuses a socket past the live bound, reports it and builds nothing', async () => {
+    const overflow = jest.fn()
+    const { factory, state } = bounded({ maxLiveSockets: 2, onOverflow: overflow })
+    await dial(factory)
+    await dial(factory)
+
+    expect(() => factory({ host: 'a', port: 1, onConnect: () => {} })).toThrow(
+      'Fake socket capture overflow: more than 2 live sockets'
+    )
+    expect(overflow).toHaveBeenCalledTimes(1)
+    expect(state.issued).toBe(2)
+    expect(state.sockets).toHaveLength(2)
+  })
+
+  test('admits a new socket once a closed one has been dropped', async () => {
+    const { factory, state } = bounded({ maxLiveSockets: 1 })
+    const first = await dial(factory)
+    first.destroy()
+    await microtasks()
+    await microtasks()
+
+    await expect(dial(factory)).resolves.toBeInstanceOf(EventEmitter)
+    expect(state.issued).toBe(2)
+  })
+})
+
 describe('respondWithFrame', () => {
   const framed = (headerVersion, body, headerTags) => {
     const state = { socket: new EventEmitter() }

@@ -142,12 +142,21 @@ class TelemetryClock {
   }
 }
 
-/** Captures independently observed frames and delegates every hold to the existing Schedule. */
+/**
+ * Captures independently observed frames and delegates every hold to the existing Schedule. A
+ * bounded trace validates and counts each frame but keeps neither it nor the schedule's call
+ * history.
+ */
 class TelemetryTrace {
-  /** @returns {TelemetryTrace} an empty finite observation round */
-  constructor() {
+  /**
+   * @param {{bounded?: boolean}} [options] `bounded` keeps counts instead of frames
+   * @returns {TelemetryTrace} an empty finite observation round
+   */
+  constructor({ bounded = false } = {}) {
     this.schedule = new TelemetrySchedule()
     this.frames = []
+    this.bounded = bounded
+    this.count = 0
   }
 
   /** @param {object} selector exact existing Schedule selector @returns {object} existing Gate */
@@ -158,12 +167,15 @@ class TelemetryTrace {
   /** @param {object} call captured call data @param {Function} original lazy original invocation
    * @returns {Promise<*>} original result after the selected existing gate */
   async enter(call, original) {
-    await this.schedule.run(call, () => undefined)
+    const held = this.schedule.run(call, () => undefined)
+    if (this.bounded) this.schedule.calls.length = 0
+    await held
     return original()
   }
 
-  /** @param {{connection:bigint,attempt:bigint,lifecycle:bigint,transport:bigint,subscription:bigint,request:bigint,correlation:number,apiKey:number,hex:string}} frame actual complete socket frame
-   * @returns {void} retains immutable bytes and issued identities
+  /** @param {{connection:bigint,attempt:bigint,lifecycle:bigint,transport:bigint,subscription:bigint,request:bigint,correlation:number,apiKey:number,hex?:string,bytes?:Buffer}} frame actual complete socket frame;
+   *   a bounded trace takes `bytes` and never builds the hex text
+   * @returns {void} retains immutable bytes and issued identities, or only counts in bounded mode
    * @throws {TypeError} when an observation is incomplete */
   write(frame) {
     for (const key of [
@@ -177,9 +189,9 @@ class TelemetryTrace {
       if (typeof frame[key] !== 'bigint') throw new TypeError('Missing issued identity')
     if (!Number.isInteger(frame.correlation) || ![71, 72].includes(frame.apiKey))
       throw new TypeError('Missing wire identity')
-    if (typeof frame.hex !== 'string' || !/^(?:[0-9a-f]{2})+$/.test(frame.hex))
+    if (!frame.bytes && (typeof frame.hex !== 'string' || !/^(?:[0-9a-f]{2})+$/.test(frame.hex)))
       throw new TypeError('Missing frame bytes')
-    const bytes = Buffer.from(frame.hex, 'hex')
+    const bytes = frame.bytes ?? Buffer.from(frame.hex, 'hex')
     if (
       bytes.length < 12 ||
       bytes.readInt32BE(0) !== bytes.length - 4 ||
@@ -187,7 +199,8 @@ class TelemetryTrace {
       bytes.readInt32BE(8) !== frame.correlation
     )
       throw new TypeError('Frame identity differs from bytes')
-    this.frames.push(Object.freeze({ ...frame }))
+    this.count += 1
+    if (!this.bounded) this.frames.push(Object.freeze({ ...frame }))
   }
 
   /** @param {Array<object>} expected independent literal identities and bytes
@@ -195,6 +208,92 @@ class TelemetryTrace {
    * @throws {import('node:assert').AssertionError} missing, extra, reordered or substituted frame */
   assertFrames(expected) {
     telemetryAssert.deepStrictEqual(this.frames, expected)
+  }
+}
+
+/**
+ * The per-object patch state of a bounded round. An owner (a connection, a socket, a transport
+ * handle) is held here only while it is live; its restoration lives with it and not in the round's
+ * fixed restorer list, and a weak set deduplicates by identity. A completed owner is restored and
+ * forgotten as soon as its `done` predicate holds, so no completed object stays reachable. Going
+ * past the live bound fails instead of growing.
+ */
+class LiveOwners {
+  /**
+   * @param {number} limit the most live owners at once
+   * @returns {LiveOwners} an empty table
+   */
+  constructor(limit) {
+    this.limit = limit
+    this.entries = new Map()
+    this.seen = new WeakSet()
+    this.issued = 0
+  }
+
+  /** @returns {number} owners that are live now */
+  get size() {
+    return this.entries.size
+  }
+
+  /**
+   * @param {object} owner a candidate owner @returns {boolean} whether it is live in the table
+   */
+  has(owner) {
+    return this.seen.has(owner)
+  }
+
+  /**
+   * Adds one restoration for an owner, admitting the owner on its first.
+   * @param {object} owner the patched object
+   * @param {() => void} restore undoes one patch
+   * @param {() => boolean} [done] whether the owner has completed; fixed by the first call
+   * @returns {void}
+   * @throws {Error} when a new owner would exceed the live bound
+   */
+  add(owner, restore, done = () => false) {
+    const entry = this.entries.get(owner)
+    if (entry) {
+      entry.restores.push(restore)
+      return
+    }
+    if (this.entries.size >= this.limit)
+      throw new Error(`Bounded capture overflow: more than ${this.limit} live owners`)
+    this.seen.add(owner)
+    this.entries.set(owner, { restores: [restore], done })
+    this.issued += 1
+  }
+
+  /** @returns {number} live owners that have already completed, which must be none after a release */
+  completed() {
+    return [...this.entries.values()].filter((entry) => entry.done()).length
+  }
+
+  /**
+   * Restores and forgets one owner.
+   * @param {object} owner the owner @returns {boolean} whether it was live
+   */
+  release(owner) {
+    const entry = this.entries.get(owner)
+    if (!entry) return false
+    this.entries.delete(owner)
+    this.seen.delete(owner)
+    for (const restore of entry.restores.reverse()) restore()
+    return true
+  }
+
+  /** @returns {number} how many completed owners were restored and forgotten */
+  releaseCompleted() {
+    let released = 0
+    for (const [owner, entry] of [...this.entries])
+      if (entry.done() && this.release(owner)) released += 1
+    return released
+  }
+
+  /** @returns {Array<() => void>} every live restoration, newest first; the table is then empty */
+  drain() {
+    const calls = [...this.entries.values()].flatMap((entry) => entry.restores.reverse())
+    this.entries.clear()
+    return calls
   }
 }
 
@@ -228,6 +327,9 @@ const assertTelemetryOutcome = (actual, expected, invocations) => {
 }
 
 const TELEMETRY_UUID = '01020304-0506-0708-090a-0b0c0d0e0f10'
+
+/** The live bounds of a bounded round: owners, dedicated sockets and recent abandoned samples. */
+const BOUNDED_LIMITS = Object.freeze({ owners: 16, sockets: 8, abandoned: 64 })
 const TELEMETRY_KINDS = ['producer', 'consumer', 'admin', 'shareConsumer']
 const DEFAULT_SUBSCRIPTION = Object.freeze({
   clientInstanceId: TELEMETRY_UUID,
@@ -552,7 +654,13 @@ class DialGate {
 class PublicTelemetryRound {
   /**
    * @param {{kind:'producer'|'consumer'|'admin'|'shareConsumer',enforceRequestTimeout?:boolean,
-   *   enabled?:boolean,protocol?:string,membership?:string}} options the actual client and variant
+   *   enabled?:boolean,protocol?:string,membership?:string,bounded?:boolean}} options the actual
+   *   client and variant. `bounded` opts in to bounded development capture for a long schedule:
+   *   per-object patches live in a live-owner table, dedicated sockets are tracked live beside
+   *   monotonic counters, completed work is kept only as scalars and counters, and the cluster
+   *   and fake sockets are bounded too. A bounded round refuses the assertions that need the whole
+   *   history (`assertTrace`, `writtenFor`, `finalSnapshotIdentity`, `replacementMetricOrigin`,
+   *   `forcedRetirements`, `newSetupCallsSince`); every default is unchanged.
    * @returns {PublicTelemetryRound} configuration only; no client exists until `start`
    */
   constructor({
@@ -561,10 +669,28 @@ class PublicTelemetryRound {
     enabled = true,
     protocol = 'classic-eager',
     membership = 'dynamic',
+    bounded = false,
   }) {
-    Object.assign(this, { kind, enforceRequestTimeout, enabled, protocol, membership })
+    Object.assign(this, { kind, enforceRequestTimeout, enabled, protocol, membership, bounded })
+    this.owners = new LiveOwners(BOUNDED_LIMITS.owners)
+    this.liveSockets = new Set()
+    this.socketIds = new WeakMap()
+    this.socketsIssued = 0
+    this.writeCount = 0
+    this.writeBytes = 0
+    this.snapshotCount = 0
+    this.snapshotOrdinals = new WeakMap()
+    this.revisions = new Map()
+    this.frameFields = []
+    this.writtenCount = 0
+    this.abandonedCount = 0
+    this.abandonOrdinals = []
+    this.handlesIssued = 0
+    this.retiredCount = 0
+    this.retiredHandles = new WeakSet()
+    this.pushTotals = { requested: 0, answered: 0, finalRequested: 0, finalAnswered: 0 }
     this.clock = new TelemetryClock()
-    this.trace = new TelemetryTrace()
+    this.trace = new TelemetryTrace({ bounded })
     this.wireSchedule = new TelemetrySchedule()
     this.restores = []
     this.pending = []
@@ -612,6 +738,236 @@ class PublicTelemetryRound {
     target[key] = make(original)
     this.restores.push(() => {
       target[key] = original
+    })
+  }
+
+  /**
+   * Replaces one property of an object whose life is shorter than the round's. A default round
+   * keeps the restoration with its other patches; a bounded round keeps it in the live-owner
+   * table until `done` holds and `releaseCompleted` restores it.
+   * @param {object} owner the patched object @param {string|symbol} key property
+   * @param {(original: *) => *} make builds the replacement from the original
+   * @param {() => boolean} [done] whether the owner has completed (bounded rounds only)
+   * @returns {void} @throws {Error} when a bounded round already has its live owners
+   */
+  patchFor(owner, key, make, done) {
+    if (!this.bounded) return this.patch(owner, key, make)
+    const original = owner[key]
+    owner[key] = make(original)
+    this.owners.add(
+      owner,
+      () => {
+        owner[key] = original
+      },
+      done
+    )
+  }
+
+  /**
+   * Like `watchWork` for a per-object operation: joins its settlement without replacing its result.
+   * @param {object} owner the object @param {string} key operation
+   * @param {() => boolean} [done] whether the owner has completed (bounded rounds only)
+   * @returns {void}
+   */
+  watchWorkFor(owner, key, done) {
+    const round = this
+    this.patchFor(
+      owner,
+      key,
+      (original) =>
+        function (...args) {
+          return round.trackWork(original.apply(this, args))
+        },
+      done
+    )
+  }
+
+  /**
+   * Remembers one dedicated raw socket: an issued number and, while it is open, its live entry.
+   * A default round keeps every socket in `dedicatedSockets`.
+   * @param {object} raw the raw socket @returns {void}
+   * @throws {Error} when a bounded round already has its live sockets
+   */
+  trackSocket(raw) {
+    if (!raw) return
+    if (!this.bounded) {
+      if (!this.dedicatedSockets.includes(raw)) this.dedicatedSockets.push(raw)
+      return
+    }
+    if (this.socketIds.has(raw)) return
+    if (this.liveSockets.size >= BOUNDED_LIMITS.sockets)
+      throw new Error(`Bounded capture overflow: more than ${BOUNDED_LIMITS.sockets} live sockets`)
+    this.socketIds.set(raw, ++this.socketsIssued)
+    this.liveSockets.add(raw)
+  }
+
+  /**
+   * @param {object} raw a dedicated raw socket
+   * @returns {number} its issued number counting from 1, or 0 when it was never tracked
+   */
+  socketNumber(raw) {
+    return this.bounded ? (this.socketIds.get(raw) ?? 0) : this.dedicatedSockets.indexOf(raw) + 1
+  }
+
+  /** @returns {object[]} the dedicated raw sockets that are still open */
+  openDedicated() {
+    const sockets = this.bounded ? [...this.liveSockets] : this.dedicatedSockets
+    return sockets.filter((socket) => !socket.destroyed)
+  }
+
+  /**
+   * Counts one write of a watched dedicated socket.
+   * @param {Buffer|string} bytes what was written @returns {void}
+   */
+  noteWrite(bytes) {
+    this.writeCount += 1
+    this.writeBytes += bytes.length
+  }
+
+  /**
+   * Watches the writes of one dedicated socket without replacing what it does. A default round
+   * records each write; a bounded one only counts it, and keeps the wrapper in the live-owner
+   * table until the socket is destroyed.
+   * @param {object} socket the product's socket object @returns {void}
+   */
+  watchWrites(socket) {
+    const round = this
+    if (this.bounded) {
+      if (this.owners.has(socket)) return
+      this.patchFor(
+        socket,
+        'write',
+        (write) =>
+          function (bytes, ...args) {
+            round.noteWrite(bytes)
+            return write.call(this, bytes, ...args)
+          },
+        () => Boolean((socket.inner ?? socket).destroyed)
+      )
+      return
+    }
+    if (this.observedSockets?.has(socket)) return
+    this.observedSockets ??= new Set()
+    this.observedSockets.add(socket)
+    this.patch(
+      socket,
+      'write',
+      (write) =>
+        function (bytes, ...args) {
+          round.noteWrite(bytes)
+          round.socketWrites.push({
+            socket: this,
+            bytes: Buffer.from(bytes),
+            time: round.clock.now(),
+          })
+          return write.call(this, bytes, ...args)
+        }
+    )
+  }
+
+  /**
+   * Keeps the work promise of one asynchronous action until it settles, then forgets it. A default
+   * round keeps every one, as before.
+   * @param {Promise<*>} settled the observed promise @returns {void}
+   */
+  keepPending(settled) {
+    this.pending.push(settled)
+    if (!this.bounded) return
+    const forget = () => {
+      const at = this.pending.indexOf(settled)
+      if (at !== -1) this.pending.splice(at, 1)
+    }
+    settled.then(forget, forget)
+  }
+
+  /**
+   * Restores and forgets every completed per-object patch and drops closed sockets. Call it at a
+   * verified settlement boundary, before the next checkpoint. A default round has none.
+   * @returns {number} the owners restored
+   */
+  releaseCompleted() {
+    if (!this.bounded) return 0
+    for (const socket of [...this.liveSockets])
+      if (socket.destroyed) this.liveSockets.delete(socket)
+    return this.owners.releaseCompleted()
+  }
+
+  /**
+   * @param {string} what the history-reading method
+   * @returns {void} @throws {Error} in a bounded round, which keeps no whole history
+   */
+  assertFull(what) {
+    if (this.bounded) throw new Error(`${what}() needs the full capture, not a bounded round`)
+  }
+
+  /**
+   * The populations of every capture root of this round, as plain numbers, so a bounded schedule
+   * can assert that none of them grows with the number of cycles.
+   * @returns {Readonly<Record<string, number>>} fixed restorers, live owners, restoration entries
+   *   already completed, live sockets and wire state, retained histories and bytes
+   */
+  boundedState() {
+    const retainedBytes =
+      this.socketWrites.reduce((total, write) => total + write.bytes.length, 0) +
+      this.trace.frames.reduce((total, frame) => total + frame.hex.length / 2, 0) +
+      this.expectedFrames.reduce((total, frame) => total + frame.hex.length / 2, 0)
+    return Object.freeze({
+      restorers: this.restores.length,
+      owners: this.owners.size,
+      ownersIssued: this.owners.issued,
+      ownersCompleted: this.owners.completed(),
+      liveSockets: this.liveSockets.size,
+      socketsIssued: this.socketsIssued,
+      wireSockets: this.wire.sockets().length,
+      wireLive: this.wire.requests().length,
+      handles: this.builtHandles.length,
+      pending: this.pending.length,
+      work: this.work.size,
+      history:
+        this.snapshots.length +
+        this.written.length +
+        this.abandoned.length +
+        this.retirements.length +
+        this.socketWrites.length +
+        this.trace.frames.length +
+        this.frameFields.length +
+        this.expectedFrames.length +
+        this.wireSchedule.calls.length +
+        this.trace.schedule.calls.length,
+      abandonedRing: this.abandonOrdinals.length,
+      retainedBytes,
+      writes: this.writeCount,
+      writesAfterClose: this.wire.fake.state.writesAfterClose,
+    })
+  }
+
+  /** @returns {number} ordinary Pushes written so far, counted whatever the history holds */
+  pushesRequested() {
+    return this.pushTotals.requested
+  }
+
+  /** @returns {number} ordinary Pushes that were answered, counted whatever the history holds */
+  pushesAnswered() {
+    return this.pushTotals.answered
+  }
+
+  /** @returns {number} Get and Push requests written so far, counted whatever the history holds */
+  telemetryRequestCount() {
+    return this.wire.tally('GetTelemetrySubscriptions') + this.wire.tally('PushTelemetry')
+  }
+
+  /**
+   * Counts the ordinary and final Pushes from the wire's own notifications, in every mode.
+   * @returns {void}
+   */
+  watchWire() {
+    this.wire.watch((event, record) => {
+      if (record.api !== 'PushTelemetry' || event === 'cancelled') return
+      const names =
+        record.fields.terminating === true
+          ? { request: 'finalRequested', answered: 'finalAnswered' }
+          : { request: 'requested', answered: 'answered' }
+      this.pushTotals[names[event]] += 1
     })
   }
 
@@ -694,14 +1050,15 @@ class PublicTelemetryRound {
 
   /** @returns {Array<object>} wire records of the telemetry APIs, oldest first */
   telemetryRequests() {
+    this.assertFull('telemetryRequests')
     return this.wire
       .requests()
       .filter((r) => r.api === 'GetTelemetrySubscriptions' || r.api === 'PushTelemetry')
   }
 
-  /** @returns {number} dedicated sockets opened so far */
+  /** @returns {number} dedicated sockets opened so far, from the issued counter in a bounded round */
   dedicatedCount() {
-    return this.dedicatedSockets.length
+    return this.bounded ? this.socketsIssued : this.dedicatedSockets.length
   }
 
   /**
@@ -925,6 +1282,7 @@ class PublicTelemetryRound {
           }
           const result = await outcome
           job.settled = true
+          if (round.bounded) job.raw = null
           if ('error' in result) throw result.error
           return result.value
         })
@@ -1063,10 +1421,12 @@ class PublicTelemetryRound {
               ...options,
               onAllocated: (handle) => {
                 round.builtHandles.push(handle)
+                round.handlesIssued += 1
                 const retire = handle.retire
                 let heldRetirement = false
                 handle.retire = async (...args) => {
-                  round.retirements.push(handle)
+                  if (round.bounded) round.retiredCount += 1
+                  else round.retirements.push(handle)
                   const selected =
                     round.armed &&
                     round.held?.boundary === 'S18' &&
@@ -1074,10 +1434,15 @@ class PublicTelemetryRound {
                     !heldRetirement
                   if (selected) heldRetirement = true
                   const result = await retire(...args)
+                  if (round.bounded) {
+                    round.retiredHandles.add(handle)
+                    const at = round.builtHandles.indexOf(handle)
+                    if (at !== -1) round.builtHandles.splice(at, 1)
+                  }
                   if (selected) await round.enter('S18')
                   return result
                 }
-                round.watchWork(handle, 'retire')
+                round.watchWorkFor(handle, 'retire', () => round.retiredHandles.has(handle))
                 // Retain the real build while its caller's publication callback is held.
                 if (selected && round.held.position === 'after') allocation = handle
                 else options.onAllocated(handle)
@@ -1095,13 +1460,19 @@ class PublicTelemetryRound {
     )
   }
 
-  /** Observes socket allocation before a dial can be held, including repeated attempts.
+  /** Observes socket allocation before a dial can be held, including repeated attempts. A bounded
+   * round deduplicates by weak identity and keeps the connection's restoration in the live-owner
+   * table only until its socket has closed.
    * @param {object} connection actual private Connection @returns {void} never changes socket identity
    */
   watchSocket(connection) {
-    this.socketOwners ??= new Set()
-    if (this.socketOwners.has(connection)) return
-    this.socketOwners.add(connection)
+    if (this.bounded) {
+      if (this.owners.has(connection)) return
+    } else {
+      this.socketOwners ??= new Set()
+      if (this.socketOwners.has(connection)) return
+      this.socketOwners.add(connection)
+    }
     this.supplierOwners ??= new WeakSet()
     const supplier = connection.authenticationOwner
     if (supplier && !this.supplierOwners.has(supplier)) {
@@ -1110,6 +1481,7 @@ class PublicTelemetryRound {
     }
     const descriptor = Object.getOwnPropertyDescriptor(connection, 'socket')
     let current = connection.socket
+    let hadSocket = Boolean(current)
     const round = this
     Object.defineProperty(connection, 'socket', {
       configurable: true,
@@ -1120,12 +1492,18 @@ class PublicTelemetryRound {
       set(socket) {
         current = socket
         const raw = socket?.inner ?? socket
-        if (raw && !round.dedicatedSockets.includes(raw)) round.dedicatedSockets.push(raw)
+        if (raw) hadSocket = true
+        round.trackSocket(raw)
       },
     })
-    this.restores.push(() =>
+    const restore = () =>
       Object.defineProperty(connection, 'socket', { ...descriptor, value: current })
-    )
+    if (this.bounded)
+      this.owners.add(connection, restore, () => {
+        const raw = current?.inner ?? current
+        return hadSocket && (!raw || raw.destroyed === true)
+      })
+    else this.restores.push(restore)
   }
 
   /**
@@ -1155,7 +1533,7 @@ class PublicTelemetryRound {
         async function (...args) {
           const encoded = await original.apply(this, args)
           const issued = encoded.request[ISSUED_REQUEST]
-          if (issued) {
+          if (issued && !round.bounded) {
             const bytes = encoded.requestPayload.buffer
             const clientLength = bytes.readInt16BE(12)
             const bodyAt = 15 + Math.max(0, clientLength)
@@ -1180,9 +1558,7 @@ class PublicTelemetryRound {
           const result = original.apply(this, args)
           if (this.authenticationOwner) {
             round.dedicatedConnection = this
-            const socket = this.socket?.inner ?? this.socket
-            if (socket && !round.dedicatedSockets.includes(socket))
-              round.dedicatedSockets.push(socket)
+            round.trackSocket(this.socket?.inner ?? this.socket)
           }
           return result
         }
@@ -1193,27 +1569,9 @@ class PublicTelemetryRound {
       (original) =>
         function (options) {
           if (this.authenticationOwner) {
-            const socket = this.socket?.inner ?? this.socket
-            if (socket && !round.dedicatedSockets.includes(socket))
-              round.dedicatedSockets.push(socket)
+            round.trackSocket(this.socket?.inner ?? this.socket)
             round.dedicatedConnection = this
-            if (this.socket && !round.observedSockets?.has(this.socket)) {
-              round.observedSockets ??= new Set()
-              round.observedSockets.add(this.socket)
-              round.patch(
-                this.socket,
-                'write',
-                (write) =>
-                  function (bytes, ...args) {
-                    round.socketWrites.push({
-                      socket: this,
-                      bytes: Buffer.from(bytes),
-                      time: round.clock.now(),
-                    })
-                    return write.call(this, bytes, ...args)
-                  }
-              )
-            }
+            if (this.socket) round.watchWrites(this.socket)
           }
           if (this.authenticationOwner && [71, 72].includes(options.request.apiKey)) {
             const issued = round.admittedRequest
@@ -1238,16 +1596,20 @@ class PublicTelemetryRound {
             subscription: owner.subscription?.revision ?? 0n,
             request: owner.revision,
             closeRevision: final ? owner.revision : 0n,
-            payload: {
-              ...payload,
-              ...(payload.metrics ? { metrics: Buffer.from(payload.metrics) } : {}),
-            },
-            points: (final ? round.finalSnapshotIdentity() : owner.snapshot)?.points.map(
-              (point) => ({
-                name: point.name,
-                value: point.value,
-              })
-            ),
+            ...(round.bounded
+              ? {}
+              : {
+                  payload: {
+                    ...payload,
+                    ...(payload.metrics ? { metrics: Buffer.from(payload.metrics) } : {}),
+                  },
+                  points: (final ? round.finalSnapshotIdentity() : owner.snapshot)?.points.map(
+                    (point) => ({
+                      name: point.name,
+                      value: point.value,
+                    })
+                  ),
+                }),
           }
           if (apiKey === 72 && this.connectionPool.pool[0].authenticationOwner != null) {
             if (!payload.terminating) round.guards.ordinary = options.guard
@@ -1277,7 +1639,7 @@ class PublicTelemetryRound {
       if (this.machine && (apiKey === 71 || apiKey === 72)) {
         const machine = this.machine
         this.trace.write({
-          connection: BigInt(this.dedicatedSockets.indexOf(socket) + 1),
+          connection: BigInt(this.socketNumber(socket)),
           attempt: BigInt(generation),
           lifecycle: machine.lifecycle,
           transport: machine.transportRevision,
@@ -1292,24 +1654,37 @@ class PublicTelemetryRound {
               : 0n,
           correlation: frame.readInt32BE(8),
           apiKey,
-          hex: frame.toString('hex'),
+          ...(this.bounded ? { bytes: frame } : { hex: frame.toString('hex') }),
         })
-        this.frameFields.push(this.wire.log.at(-1).fields)
+        if (!this.bounded) this.frameFields.push(this.wire.log.at(-1).fields)
       }
       return result
     })
     const metrics = this.metrics
     this.patch(metrics, 'snapshot', (original) => (subscription, resources) => {
       const snapshot = original.call(metrics, subscription, resources)
-      this.snapshots.push({ snapshot, closing: this.machine.closing != null })
+      if (this.bounded) {
+        this.snapshotOrdinals.set(snapshot, ++this.snapshotCount)
+        const named = new Set()
+        for (const point of snapshot?.points ?? [])
+          if (!named.has(point.name)) {
+            named.add(point.name)
+            this.revisions.set(point.name, point.identity.revision)
+          }
+      } else this.snapshots.push({ snapshot, closing: this.machine.closing != null })
       return snapshot
     })
     this.patch(metrics, 'written', (original) => (snapshot, included) => {
-      this.written.push({ snapshot, included })
+      if (this.bounded) this.writtenCount += 1
+      else this.written.push({ snapshot, included })
       return original.call(metrics, snapshot, included)
     })
     this.patch(metrics, 'abandon', (original) => (snapshot) => {
-      this.abandoned.push(snapshot)
+      if (this.bounded) {
+        this.abandonedCount += 1
+        this.abandonOrdinals.push(this.snapshotOrdinals.get(snapshot) ?? 0)
+        if (this.abandonOrdinals.length > BOUNDED_LIMITS.abandoned) this.abandonOrdinals.shift()
+      } else this.abandoned.push(snapshot)
       return original.call(metrics, snapshot)
     })
   }
@@ -1434,6 +1809,8 @@ class PublicTelemetryRound {
       this.kafka = new Kafka(this.wire.kafkaOptions(kafkaOptions))
     }
     this.node = this.wire.nodes[0].id
+    if (this.bounded) this.wire.bound()
+    this.watchWire()
     this.wire.answer('GetTelemetrySubscriptions', (fields) => ({
       ...this.subscription,
       clientInstanceId: fields.clientInstanceId ?? this.subscription.clientInstanceId,
@@ -1484,9 +1861,9 @@ class PublicTelemetryRound {
    * @returns {Promise<void>} the response hold and its exact request have arrived
    */
   async occupyFinalQueue() {
-    const count = this.pushes().length
+    const count = this.pushesRequested()
     this.tick()
-    await this.until(() => this.pushes().length > count)
+    await this.until(() => this.pushesRequested() > count)
     await this.wait(() => this.held.gate.arrived())
   }
 
@@ -1652,6 +2029,7 @@ class PublicTelemetryRound {
 
   /** @returns {Array<object>} ordinary Push records, oldest first */
   pushes() {
+    this.assertFull('pushes')
     return this.wire.requests().filter((r) => r.api === 'PushTelemetry' && !r.fields.terminating)
   }
 
@@ -1677,7 +2055,7 @@ class PublicTelemetryRound {
       this.tick()
       await this.until(() => machine.subscription !== null)
     }
-    const answered = () => this.pushes().filter((r) => r.answeredOrder !== undefined).length
+    const answered = () => this.pushesAnswered()
     const before = answered()
     this.tick()
     await this.until(() => answered() > before && !machine.running)
@@ -1709,12 +2087,12 @@ class PublicTelemetryRound {
       handle: machine.handle,
       telemetryHandleIdentity: machine.handle,
       dedicated: this.dedicatedCount(),
-      frames: this.trace.frames.length,
-      requests: this.wire.requests().length,
+      frames: this.trace.count,
+      requests: this.bounded ? this.wire.requestCount() : this.wire.requests().length,
       setupCalls: this.setupCalls.length,
-      written: this.written.length,
-      abandoned: this.abandoned.length,
-      snapshots: this.snapshots.length,
+      written: this.bounded ? this.writtenCount : this.written.length,
+      abandoned: this.bounded ? this.abandonedCount : this.abandoned.length,
+      snapshots: this.bounded ? this.snapshotCount : this.snapshots.length,
       waiters: machine.waiters.size,
       timers: this.clock.pending.size,
       timer: machine.timer,
@@ -1728,6 +2106,7 @@ class PublicTelemetryRound {
    *   of that name, or 0n before any sample
    */
   pointRevision(name) {
+    if (this.bounded) return this.revisions.get(name) ?? 0n
     for (const { snapshot } of [...this.snapshots].reverse()) {
       const point = snapshot?.points.find((candidate) => candidate.name === name)
       if (point) return point.identity.revision
@@ -1749,8 +2128,7 @@ class PublicTelemetryRound {
    */
   async establish() {
     const machine = this.machine
-    const answered = (api) =>
-      this.wire.requests().filter((r) => r.api === api && r.answeredOrder !== undefined).length
+    const answered = (api) => this.wire.tally(api, 'answered')
     const gets = answered('GetTelemetrySubscriptions')
     this.tick()
     await this.until(() => answered('GetTelemetrySubscriptions') > gets && !machine.running)
@@ -1966,7 +2344,7 @@ class PublicTelemetryRound {
     const promise = this.client.disconnect(options)
     this.closePromise = promise
     for (const id of this.clock.pending.keys()) if (!before.has(id)) this.closeTimer = id
-    this.pending.push(
+    this.keepPending(
       promise.then(
         () => {
           this.closeDone = true
@@ -2013,6 +2391,7 @@ class PublicTelemetryRound {
    *   open, dial, Get, handshake and authenticate events since it
    */
   newSetupCallsSince(record) {
+    this.assertFull('newSetupCallsSince')
     const wire = this.wire
       .requests()
       .slice(record.requests)
@@ -2027,6 +2406,7 @@ class PublicTelemetryRound {
 
   /** @returns {Array<object>} actual dedicated handles retired so far, forced and captured */
   forcedRetirements() {
+    this.assertFull('forcedRetirements')
     return [...this.retirements]
   }
 
@@ -2037,18 +2417,20 @@ class PublicTelemetryRound {
   atFinalPrewrite(call) {
     this.finalHook = () => {
       this.reregisteredAt = this.clock.time
-      this.snapshotsAtHook = this.snapshots.length
+      this.snapshotsAtHook = this.bounded ? this.snapshotCount : this.snapshots.length
       call()
     }
   }
 
   /** @returns {object|undefined} the snapshot the final sampled, never a new sample */
   finalSnapshotIdentity() {
+    this.assertFull('finalSnapshotIdentity')
     return this.snapshots.filter((entry) => entry.closing).at(-1)?.snapshot
   }
 
   /** @param {object} snapshot a captured snapshot @returns {number} commits recorded for it */
   writtenFor(snapshot) {
+    this.assertFull('writtenFor')
     return this.written.filter((entry) => entry.snapshot === snapshot).length
   }
 
@@ -2137,6 +2519,7 @@ class PublicTelemetryRound {
 
   /** @returns {bigint|undefined} start time the collector issued to the re-registered descriptor */
   replacementMetricOrigin() {
+    this.assertFull('replacementMetricOrigin')
     return this.snapshots
       .slice(this.snapshotsAtHook ?? 0)
       .flatMap((entry) => entry.snapshot?.points ?? [])
@@ -2165,6 +2548,7 @@ class PublicTelemetryRound {
    * @throws {import('node:assert').AssertionError} any missing, extra, reordered or substituted frame
    */
   assertTrace(expected) {
+    this.assertFull('assertTrace')
     const frames = this.trace.frames
     const records = this.telemetryRequests()
     telemetryAssert.equal(records.length, frames.length)
@@ -2265,6 +2649,19 @@ class PublicTelemetryRound {
     telemetryAssert.equal(now.handle, before.handle)
     telemetryAssert.deepStrictEqual(now.reopen, before.reopen)
     telemetryAssert.equal(now.written, before.written)
+    if (this.bounded) {
+      const since = this.abandonedCount - before.abandoned
+      telemetryAssert.ok(
+        since <= this.abandonOrdinals.length,
+        'abandoned samples exceed the bounded record'
+      )
+      for (const ordinal of this.abandonOrdinals.slice(this.abandonOrdinals.length - since))
+        telemetryAssert.ok(
+          ordinal >= 1 && ordinal <= before.snapshots,
+          'only an older sample may be abandoned late'
+        )
+      return
+    }
     const owned = new Set(this.snapshots.slice(0, before.snapshots).map((entry) => entry.snapshot))
     for (const snapshot of this.abandoned.slice(before.abandoned))
       telemetryAssert.ok(owned.has(snapshot), 'only an older sample may be abandoned late')
@@ -2379,6 +2776,7 @@ class PublicTelemetryRound {
       }
       for (const remove of this.eventRemovers.splice(0)) restore(remove)
       restore(() => process.off('unhandledRejection', this.listener))
+      for (const undo of this.owners.drain()) restore(undo)
       while (this.restores.length) restore(this.restores.pop())
     }
     if (failure) throw failure
@@ -2504,4 +2902,10 @@ const runTelemetryLifecycleCell = async (cell) => {
   }
 }
 
-Object.assign(module.exports, { PublicTelemetryRound, runTelemetryLifecycleCell, DialGate })
+Object.assign(module.exports, {
+  PublicTelemetryRound,
+  runTelemetryLifecycleCell,
+  DialGate,
+  LiveOwners,
+  BOUNDED_LIMITS,
+})

@@ -1,8 +1,21 @@
+const fs = require('fs')
+const os = require('os')
+const path = require('path')
 const { EventEmitter } = require('events')
 const v8 = require('v8')
 const vm = require('vm')
-const { createResourceProbe } = require('../resourceProbe')
+const { createResourceProbe, compareSnapshots, ResourceRoles } = require('../resourceProbe')
 const { createFakeSocketFactory, socketCounts } = require('../fakeSocket')
+const {
+  ARMS,
+  KINDS,
+  LIMITS,
+  SCHEMA,
+  foregroundCatalogue,
+  judgeMemoryArm,
+  phaseCatalogue,
+  validateResourceArtifacts,
+} = require('../../scripts/e2e/telemetry/resourceArtifact')
 
 /** A real full collection, without starting node with --expose-gc (the flag stays set for this process). */
 const realGc = () => {
@@ -259,6 +272,9 @@ describe('resource identity and settled memory sources', () => {
       return { heapUsed: 11, external: 13, arrayBuffers: 7, rss: 101 }
     })
     const readUsage = jest.spyOn(process, 'resourceUsage').mockReturnValue({ maxRSS: 2 })
+    const readStatus = jest
+      .spyOn(fs, 'readFileSync')
+      .mockReturnValue('Name:\tnode\nVmHWM:\t    4096 kB\nVmRSS:\t    2048 kB\n')
     try {
       const probe = createResourceProbe({
         memory: true,
@@ -271,16 +287,1288 @@ describe('resource identity and settled memory sources', () => {
         retainedBytes: 24,
         rss: 101,
         peakRss: 2048,
+        rawMaxRss: 2048,
+        highWaterRss: 4194304,
+        highWaterSource: 'proc-self-status-vmhwm',
       })
       expect(events).toEqual(['gc', 'pause 100', 'gc', 'memory'])
     } finally {
       readMemory.mockRestore()
       readUsage.mockRestore()
+      readStatus.mockRestore()
+    }
+  })
+
+  test('reports no high water, and keeps the raw maximum apart, where the kernel gives none', async () => {
+    const readUsage = jest.spyOn(process, 'resourceUsage').mockReturnValue({ maxRSS: 7 })
+    const readStatus = jest.spyOn(fs, 'readFileSync').mockImplementation(() => {
+      throw new Error('ENOENT')
+    })
+    try {
+      const probe = createResourceProbe({ memory: true, gc: () => {}, pause: async () => {} })
+      expect((await probe.snapshot()).memory).toMatchObject({
+        peakRss: 7168,
+        rawMaxRss: 7168,
+        highWaterRss: null,
+        highWaterSource: null,
+      })
+    } finally {
+      readUsage.mockRestore()
+      readStatus.mockRestore()
     }
   })
 
   test('requires gc for memory and preserves omitted measurements', async () => {
     expect(() => createResourceProbe({ memory: true, gc: null })).toThrow('--expose-gc')
     expect(await createResourceProbe().snapshot()).toEqual({})
+  })
+})
+
+describe('emitter, event and listener registrations', () => {
+  const take = async (emitters) =>
+    (await createResourceProbe({ registrations: () => emitters }).snapshot()).registrations
+
+  test('reports the emitter, each event and its raw listeners with multiplicity', async () => {
+    const socket = new EventEmitter()
+    const onClose = () => {}
+    socket.on('close', onClose)
+    socket.on('data', onClose)
+    socket.on('data', onClose)
+    socket.once('error', () => {})
+    const probe = createResourceProbe({ registrations: () => ({ socket }) })
+    const first = (await probe.snapshot()).registrations.socket
+
+    expect(Object.keys(first.events).sort()).toEqual(['close', 'data', 'error'])
+    expect(first.events.data).toHaveLength(2)
+    expect(first.events.data[0]).toBe(first.events.data[1])
+    expect(first.events.close[0]).toBe(first.events.data[0])
+    expect((await probe.snapshot()).registrations.socket).toEqual(first)
+    expect(await createResourceProbe().snapshot()).toEqual({})
+  })
+
+  test('changes when a listener is swapped at the same count', async () => {
+    const socket = new EventEmitter()
+    const kept = () => {}
+    socket.on('data', kept)
+    socket.on('data', () => {})
+    const probe = createResourceProbe({ registrations: () => ({ socket }) })
+    const before = await probe.snapshot()
+    socket.removeAllListeners('data')
+    socket.on('data', kept)
+    socket.on('data', () => {})
+
+    const after = await probe.snapshot()
+
+    expect(after.registrations.socket.events.data).toHaveLength(2)
+    expect(compareSnapshots(before, await probe.snapshot(), {})).toEqual([
+      'registrations socket changed',
+    ])
+    expect(compareSnapshots(after, await probe.snapshot(), {})).toEqual([])
+  })
+
+  test('changes when the emitter is swapped for another with the same listeners', async () => {
+    const listener = () => {}
+    const a = new EventEmitter()
+    const b = new EventEmitter()
+    a.on('data', listener)
+    b.on('data', listener)
+    const probe = createResourceProbe({ registrations: () => ({ socket: current }) })
+    let current = a
+    const first = await probe.snapshot()
+    current = b
+
+    expect((await probe.snapshot()).registrations.socket.events).toEqual(
+      first.registrations.socket.events
+    )
+    expect(compareSnapshots(first, await probe.snapshot(), {})).toEqual([
+      'registrations socket changed',
+    ])
+  })
+
+  test('sees a duplicate registration of one function', async () => {
+    const emitter = new EventEmitter()
+    const listener = () => {}
+    emitter.on('data', listener)
+    const probe = createResourceProbe({ registrations: () => ({ emitter }) })
+    const before = await probe.snapshot()
+    emitter.on('data', listener)
+
+    expect(compareSnapshots(before, await probe.snapshot(), {})).toEqual([
+      'registrations emitter changed',
+    ])
+  })
+
+  test('refuses a source that is not an emitter', async () => {
+    await expect(take({ socket: {} })).rejects.toThrow(TypeError)
+  })
+})
+
+describe('resource roles and snapshot comparison', () => {
+  test('gives a followed timer the role of its creator and the unknown role otherwise', async () => {
+    const roles = new ResourceRoles({ types: ['Timeout'] }).start()
+    const timers = []
+    try {
+      timers.push(roles.run('target', () => setTimeout(() => {}, 60000)))
+      timers.push(roles.run('fixture', () => setTimeout(() => {}, 60000)))
+      timers.push(setTimeout(() => {}, 60000))
+      const read = roles.read()
+
+      expect(Object.keys(read).sort()).toEqual(['fixture', 'target', 'unknown'])
+      expect(read.target.Timeout).toHaveLength(1)
+      expect(read.fixture.Timeout).toHaveLength(1)
+      expect(read.unknown.Timeout).toHaveLength(1)
+      expect(
+        new Set([...read.target.Timeout, ...read.fixture.Timeout, ...read.unknown.Timeout]).size
+      ).toBe(3)
+    } finally {
+      timers.forEach(clearTimeout)
+      roles.stop()
+    }
+  })
+
+  test('forgets a destroyed timer and every entry once stopped', async () => {
+    const roles = new ResourceRoles({ types: ['Timeout'] }).start()
+    try {
+      const timer = roles.run('target', () => setTimeout(() => {}, 60000))
+      expect(roles.read().target.Timeout).toHaveLength(1)
+      clearTimeout(timer)
+      await new Promise((resolve) => setImmediate(resolve))
+      expect(roles.read()).toEqual({ unknown: {} })
+    } finally {
+      roles.stop()
+    }
+    expect(roles.read()).toEqual({ unknown: {} })
+  })
+
+  test('carries declared roles while empty so an absent role is a missing source', () => {
+    const roles = new ResourceRoles({ types: ['Timeout'], roles: ['target', 'fixture'] })
+    expect(roles.read()).toEqual({ target: {}, fixture: {}, unknown: {} })
+    const empty = { resources: roles.read() }
+    expect(compareSnapshots(empty, empty, { resources: ['target', 'fixture'] })).toEqual([])
+    expect(
+      compareSnapshots({ resources: {} }, { resources: {} }, { resources: ['target'] })
+    ).toEqual(['missing resources source target'])
+  })
+
+  test('records which followed resource triggered another, and inherits its role', async () => {
+    const roles = new ResourceRoles({ types: ['Timeout'] }).start()
+    const timers = []
+    try {
+      const seen = await new Promise((resolve) => {
+        timers.push(
+          roles.run('target', () =>
+            setTimeout(() => {
+              timers.push(setTimeout(() => {}, 60000))
+              resolve(roles.ancestry())
+            }, 1)
+          )
+        )
+      })
+      const outer = seen.find((entry) => entry.role === 'target' && entry.parent === null)
+      const inner = seen.find((entry) => entry.parent !== null)
+
+      expect(outer).toMatchObject({ type: 'Timeout', role: 'target' })
+      expect(inner).toMatchObject({ type: 'Timeout', role: 'target', parent: outer.id })
+    } finally {
+      timers.forEach(clearTimeout)
+      roles.stop()
+    }
+  })
+
+  const reading = (sockets, timers, extra = {}) => ({
+    identities: { sockets },
+    resources: { target: { Timeout: timers }, ...extra },
+  })
+  const required = { identities: ['sockets'], resources: ['target'] }
+
+  test('passes an identical reading and fails each substitution it must notice', () => {
+    const base = reading([1], [10])
+    expect(compareSnapshots(base, reading([1], [10]), required)).toEqual([])
+    expect(compareSnapshots(base, reading([2], [10]), required)).toEqual([
+      'identities sockets changed',
+    ])
+    expect(compareSnapshots(base, reading([1], [11]), required)).toEqual([
+      'resources target changed',
+    ])
+    expect(compareSnapshots(base, reading([1, 1], [10]), required)).toEqual([
+      'identities sockets changed',
+    ])
+  })
+
+  test('fails an omitted source even when everything present is equal', () => {
+    expect(
+      compareSnapshots({ identities: {} }, { identities: {} }, { identities: ['sockets'] })
+    ).toEqual(['missing identities source sockets'])
+    expect(
+      compareSnapshots(reading([1], [10]), { identities: { sockets: [1] } }, required)
+    ).toEqual(['missing resources source target'])
+    expect(compareSnapshots({}, {}, {})).toEqual([])
+  })
+
+  test('fails an unknown handle that survives and allows one the baseline already had', () => {
+    const base = reading([1], [10], { unknown: { Timeout: [5] } })
+    expect(
+      compareSnapshots(base, reading([1], [10], { unknown: { Timeout: [5] } }), required)
+    ).toEqual([])
+    expect(
+      compareSnapshots(base, reading([1], [10], { unknown: { Timeout: [5, 6] } }), required)
+    ).toEqual(['resources unknown changed', 'unknown Timeout resource survives'])
+  })
+})
+
+describe('resource artifact validation', () => {
+  const TREE = 'a'.repeat(40)
+  const NODE = 'v26.7.0'
+  const MIB = 1048576
+  const UUID = '01020304-0506-0708-090a-0b0c0d0e0f10'
+  const context = () => ({
+    cpus: 4,
+    load: [0.2, 0.2, 0.2],
+    freeBytes: 4e9,
+    totalBytes: 8e9,
+    psi: { memorySomeAvg10: 0.1 },
+  })
+
+  /** One settled reading: heap is whatever makes heap plus external the retained bytes. */
+  const settled = (at, rss, external, retained) => ({
+    at,
+    rss,
+    heapUsed: retained - external,
+    external,
+    arrayBuffers: 1000,
+    retained,
+    gc: { admittedAt: at - 150, completedAt: at, observed: 2 },
+  })
+
+  /** The high water, covered current RSS (MiB) and covered external bytes at each phase. */
+  const PEAKS = {
+    startup: [41, 41, 1e6],
+    loaded: [75, 70, 3e6],
+    'control:start': [75, 70, 3e6],
+    'control:c0': [80, 74, 3e6],
+    'control:c1': [80, 74, 3e6],
+    'control:released': [80, 72, 3e6],
+    start: [80, 72, 3e6],
+    registered: [110, 100, 12e6],
+    matched: [110, 80, 4e6],
+    gzip: [120, 118, 20e6],
+    held: [120, 85, 6e6],
+    closed: [120, 76, 4e6],
+    final: [120, 76, 4e6],
+  }
+
+  const mark = (phase, index) => {
+    const key = /^(enabled|collector):/.test(phase) ? phase.split(':')[1] : phase
+    const [high, covered, external] = PEAKS[key]
+    return {
+      phase,
+      at: 100 + index * 100,
+      rss: covered * MIB,
+      vmhwm: high * MIB,
+      maxRss: 357744640,
+      covered: covered * MIB,
+      coveredExternal: external,
+    }
+  }
+
+  const edge = (at) => ({
+    at,
+    rss: 100 * MIB,
+    heapUsed: 1e6,
+    external: 10e6,
+    arrayBuffers: 0,
+    retained: 11e6,
+  })
+
+  const job = (id, retired) => ({
+    id,
+    codec: 'gzip',
+    jobId: id * 10 + 1,
+    inputId: id * 10 + 2,
+    inputBytes: 350000,
+    inputBackingId: id * 10 + 3,
+    inputBackingBytes: 350000,
+    epoch: 0,
+    submitted: edge(id * 100),
+    settled: edge(id * 100 + 5),
+    outcome: 'resolved',
+    resultId: id * 10 + 4,
+    resultBytes: 4000,
+    resultBackingId: id * 10 + 5,
+    resultBackingBytes: 4000,
+    distinctBackingBytes: 354000,
+    retired,
+  })
+
+  /** A passing record of one arm, built fresh so each test can break exactly one fact. */
+  const record = (arm, kind = 'producer') => {
+    const phases = phaseCatalogue(arm, false)
+    const foreground = foregroundCatalogue(kind, 3)
+    const roles = () => ({ target: {}, fixture: {}, unknown: {} })
+    return {
+      schema: SCHEMA,
+      arm,
+      kind,
+      stamp: { tree: TREE, node: NODE },
+      context: { before: context(), after: context() },
+      exit: {
+        code: 0,
+        signal: null,
+        timedOut: false,
+        stdoutBytes: 900,
+        stderrBytes: 0,
+        receipts: arm === 'public' ? 1 : 0,
+        closedAfterMarkMs: 250,
+      },
+      readings: {
+        manifest: {
+          arm,
+          kind,
+          childId: `child-${arm}-${kind}`,
+          pid: 100,
+          node: NODE,
+          v8: '14.0',
+          platform: 'linux',
+          arch: 'x64',
+          execArgv: ['--expose-gc'],
+          instrumented: { inspector: false, coverage: false, jest: false },
+          peakSource: { name: 'proc-self-status-vmhwm', units: 'bytes' },
+          gc: { available: true, native: true },
+          codecs: { gzip: true, zstd: false },
+          fixture:
+            arm === 'public'
+              ? { descriptors: 128, descriptorBytes: 354304, uuid: UUID }
+              : { nodes: 64, points: 257 },
+          foreground,
+          phases,
+          sampleMs: 20,
+        },
+        startup: settled(10, 41 * MIB, 1e6, 2e6),
+        loaded: settled(50, 70 * MIB, 3e6, 5e6),
+        c0: settled(1000, 73 * MIB, 3e6, 6e6),
+        c1: settled(2000, 74 * MIB, 3e6, 6.1e6),
+        released: settled(3000, 72 * MIB, 3e6, 5.9e6),
+        control: {
+          enabled: false,
+          api71: 0,
+          api72: 0,
+          nativeSubmissions: 0,
+          probe: 'disabled',
+          liveSockets: 0,
+          liveRequests: 0,
+          ops: foreground.ops,
+        },
+        matched: settled(4000, 80 * MIB, 4e6, 30e6),
+        actives: [
+          { phase: 'gzip', ...settled(5000, 118 * MIB, 20e6, 31e6) },
+          { phase: 'held', ...settled(6000, 85 * MIB, 6e6, 31.5e6) },
+        ],
+        closed: settled(7000, 76 * MIB, 4e6, 30.1e6),
+        marks: phases.map(mark),
+        samples: {
+          count: 20,
+          windows: 2,
+          maxGapMs: 40,
+          intervalMs: 20,
+          peak: { rss: 100 * MIB, heapUsed: 1e6, external: 10e6, arrayBuffers: 0 },
+        },
+        native: { rows: [job(1, false), job(2, true)], maxLive: 1, live: 0, overflow: false },
+        contexts: { control: context(), boundary: context(), final: context() },
+        resources: {
+          released: { control: {}, ...roles() },
+          matched: roles(),
+          closed: roles(),
+        },
+        ...(arm === 'public'
+          ? {
+              matchedState: { connected: false, descriptors: 128, uuid: UUID },
+              enabled: {
+                enabled: true,
+                api71: 5,
+                api72: 9,
+                liveSockets: 0,
+                liveRequests: 0,
+                ops: foreground.ops,
+              },
+              pushes: { gzip: { accepted: 4, transmittedBytes: 4000 } },
+              decoded: [{ codec: 'gzip', format: true, rawBytes: 350000, transmittedBytes: 4000 }],
+              reopens: [{ codec: 'gzip', immediate: true, connectGapMs: 0.2 }],
+              uuid: UUID,
+              uuidHeld: UUID,
+              descriptors: 128,
+            }
+          : {
+              builds: [
+                {
+                  codec: 'gzip',
+                  compressionType: 1,
+                  rawBytes: 350000,
+                  transmittedBytes: 4000,
+                  points: 257,
+                  retiredCompletion: true,
+                },
+              ],
+            }),
+      },
+    }
+  }
+
+  /** Judges a record after a change, from a fresh passing one. */
+  const judged = (arm, change, kind = 'producer') => {
+    const broken = record(arm, kind)
+    change(broken.readings, broken)
+    return judgeMemoryArm(broken)
+  }
+  const markOf = (r, phase) => r.marks.find((candidate) => candidate.phase === phase)
+  /** Raises the high water from a phase onward, keeping it monotonic. */
+  const raiseFrom = (r, phase, bytes) => {
+    let reached = false
+    for (const candidate of r.marks) {
+      reached ||= candidate.phase === phase
+      if (reached) candidate.vmhwm = bytes
+    }
+  }
+  const B = 73 * MIB
+
+  describe('a complete record', () => {
+    test.each(ARMS)('passes for the %s arm', (arm) => {
+      expect(judgeMemoryArm(record(arm))).toEqual({ verdict: 'pass', problems: [] })
+    })
+
+    test.each(KINDS)('passes for the %s kind', (kind) => {
+      expect(judgeMemoryArm(record('public', kind))).toEqual({ verdict: 'pass', problems: [] })
+    })
+  })
+
+  describe('the schema and the shape of the evidence', () => {
+    test('rejects the earlier schema and an aggregate-only record', () => {
+      const old = {
+        schema: 1,
+        arm: 'public',
+        kind: 'producer',
+        stamp: { tree: TREE, node: NODE },
+        context: { before: context(), after: context() },
+        exit: record('public').exit,
+        readings: {
+          baseline: settled(1, 5e6, 1, 5e6),
+          matched: settled(1, 6e6, 1, 6e6),
+          held: settled(1, 7e6, 1, 7e6),
+          closed: settled(1, 6e6, 1, 6e6),
+          baselinePeakRss: 55000000,
+          peakRss: 60000000,
+          rssPeakSample: 59000000,
+        },
+      }
+
+      expect(judgeMemoryArm(old)).toEqual({ verdict: 'fail', problems: ['unknown schema'] })
+      const stripped = record('public')
+      delete stripped.readings.marks
+      expect(judgeMemoryArm(stripped)).toEqual({
+        verdict: 'fail',
+        problems: ['peak marks are missing: aggregate evidence is not accepted'],
+      })
+    })
+
+    test.each([
+      ['an unknown arm', (_r, whole) => (whole.arm = 'both'), 'unknown arm'],
+      ['an unknown kind', (_r, whole) => (whole.kind = 'streams'), 'unknown kind'],
+      ['no readings', (_r, whole) => (whole.readings = null), 'readings are missing'],
+    ])('fails %s', (_name, change, problem) => {
+      const broken = record('public')
+      change(broken.readings, broken)
+      expect(judgeMemoryArm(broken).problems).toContain(problem)
+    })
+
+    test.each([
+      ['another kind', (r) => (r.manifest.kind = 'admin'), 'manifest is for another kind or arm'],
+      [
+        'an instrumented child',
+        (r) => (r.manifest.instrumented.inspector = true),
+        'child ran under an inspector, coverage or Jest',
+      ],
+      ['no exposed GC flag', (r) => (r.manifest.execArgv = []), 'child did not expose GC'],
+      [
+        'a replaced GC function',
+        (r) => (r.manifest.gc.native = false),
+        'GC function is not the engine collection',
+      ],
+      [
+        'a changed phase list',
+        (r) => r.manifest.phases.reverse(),
+        'manifest phases are not the fixed catalogue',
+      ],
+      [
+        'a missing mark',
+        (r) => r.marks.splice(3, 1),
+        'peak marks are not the fixed phase catalogue',
+      ],
+      [
+        'marks in another order',
+        (r) => r.marks.reverse(),
+        'peak marks are not the fixed phase catalogue',
+      ],
+      [
+        'a changed foreground catalogue',
+        (r) => (r.manifest.foreground.ops[0].bytes = 1),
+        'foreground catalogue is not the fixed one',
+      ],
+      [
+        'a peak source that is not the selected one',
+        (r) => (r.manifest.peakSource = { name: 'max-rss', units: 'bytes' }),
+        'peak source is not the selected one',
+      ],
+      [
+        'a peak source claimed without a reading',
+        (r) => (markOf(r, 'enabled:held').vmhwm = null),
+        'peak source is claimed but a mark has no reading',
+      ],
+      [
+        'a decreasing authoritative peak',
+        (r) => (markOf(r, 'enabled:held').vmhwm = 100 * MIB),
+        'authoritative peak decreased',
+      ],
+      [
+        'a decreasing raw maximum',
+        (r) => (markOf(r, 'enabled:held').maxRss = 1),
+        'raw maximum decreased',
+      ],
+      [
+        'marks out of time order',
+        (r) => (markOf(r, 'enabled:held').at = 1),
+        'marks are out of order',
+      ],
+      [
+        'an incomplete mark',
+        (r) => delete markOf(r, 'enabled:held').covered,
+        'enabled:held mark is incomplete',
+      ],
+      ['an incomplete reading', (r) => delete r.c0.rss, 'c0 reading is incomplete'],
+      [
+        'retained bytes that are not heap plus external',
+        (r) => (r.matched.retained += 1),
+        'matched retained bytes are not heap plus external',
+      ],
+      [
+        'array buffers above external bytes',
+        (r) => (r.closed.arrayBuffers = r.closed.external + 1),
+        'closed array buffers exceed external bytes',
+      ],
+      [
+        'a shortened collection pause',
+        (r) => (r.c0.gc.admittedAt = r.c0.at - 99),
+        'c0 collection pause was shortened',
+      ],
+      [
+        'collection facts that do not end at the reading',
+        (r) => (r.c1.gc.completedAt += 1),
+        'c1 collection facts are incomplete',
+      ],
+      ['readings out of order', (r) => (r.c0.at = r.c1.at + 1), 'readings are out of order'],
+      [
+        'too few active readings',
+        (r) => r.actives.pop(),
+        'active readings are not one per codec and one held',
+      ],
+    ])('fails %s with its own diagnostic', (_name, change, problem) => {
+      const result = judged('public', change)
+      expect(result.verdict).toBe('fail')
+      expect(result.problems).toContain(problem)
+    })
+  })
+
+  describe('the child and the host', () => {
+    test.each([
+      [
+        'a child that exceeded its bound',
+        (r, whole) => (whole.exit.timedOut = true),
+        'child exceeded its bound',
+      ],
+      [
+        'a nonzero exit',
+        (r, whole) => (whole.exit.code = 1),
+        'child did not exit with code 0 and no signal',
+      ],
+      [
+        'a killed child',
+        (r, whole) => (whole.exit.signal = 'SIGKILL'),
+        'child did not exit with code 0 and no signal',
+      ],
+      ['stderr output', (r, whole) => (whole.exit.stderrBytes = 3), 'child wrote to stderr'],
+      [
+        'unbounded output',
+        (r, whole) => (whole.exit.stdoutBytes = 65537),
+        'child output exceeded its bound',
+      ],
+      [
+        'a missing receipt',
+        (r, whole) => (whole.exit.receipts = 0),
+        'child sent the wrong number of disconnect receipts',
+      ],
+      [
+        'a late close',
+        (r, whole) => (whole.exit.closedAfterMarkMs = 10001),
+        'child did not close within 10 s of its receipt',
+      ],
+      [
+        'incomplete host context',
+        (r, whole) => delete whole.context.before.load,
+        'host context is incomplete',
+      ],
+      [
+        'a missing pressure field rather than an explicit null',
+        (r, whole) => delete whole.context.after.psi,
+        'host context is incomplete after cleanup',
+      ],
+      [
+        'incomplete child context',
+        (r) => delete r.contexts.boundary.freeBytes,
+        'host context is incomplete at the control boundary',
+      ],
+    ])('fails %s', (_name, change, problem) => {
+      const result = judged('public', change)
+      expect(result.verdict).toBe('fail')
+      expect(result.problems).toContain(problem)
+    })
+
+    test('accepts an explicitly unavailable pressure source', () => {
+      const result = judged('public', (r, whole) => {
+        whole.context.before.psi = null
+        r.contexts.final.psi = null
+      })
+      expect(result).toEqual({ verdict: 'pass', problems: [] })
+    })
+
+    test.each([
+      ['load', (c) => (c.load = [4, 1, 1]), 'host load was high'],
+      ['free memory', (c) => (c.freeBytes = 1e6), 'free memory was low'],
+      ['memory pressure', (c) => (c.psi = { memorySomeAvg10: 9 }), 'memory pressure was high'],
+    ])('is inconclusive on a noisy host: %s, at every point it is read', (_name, change, text) => {
+      for (const [where, label] of [
+        [(r, whole) => whole.context.before, ''],
+        [(r, whole) => whole.context.after, ' after cleanup'],
+        [(r) => r.contexts.control, ' before the control'],
+        [(r) => r.contexts.boundary, ' at the control boundary'],
+        [(r) => r.contexts.final, ' at the end'],
+      ])
+        expect(judged('collector', (r, whole) => change(where(r, whole)), 'admin')).toEqual({
+          verdict: 'inconclusive',
+          problems: [`${text}${label}`],
+        })
+    })
+
+    test('lets a failure take precedence over noise, and keeps both in the artifact', () => {
+      const result = judged('public', (r, whole) => {
+        whole.exit.code = 1
+        whole.context.before.load = [4, 1, 1]
+      })
+
+      expect(result).toEqual({
+        verdict: 'fail',
+        problems: ['child did not exit with code 0 and no signal', 'host load was high'],
+      })
+    })
+  })
+
+  describe('the capabilities the numbers need', () => {
+    test('is inconclusive, not a pass, without the real exposed GC', () => {
+      const result = judged('public', (r, whole) => {
+        r.manifest.gc = { available: false, native: false }
+        whole.exit.receipts = 0
+      })
+
+      expect(result).toEqual({
+        verdict: 'inconclusive',
+        problems: ['real exposed GC is unavailable'],
+      })
+    })
+
+    test('is inconclusive without a usable absolute peak source, whatever the readings say', () => {
+      const result = judged('public', (r) => {
+        r.manifest.peakSource = null
+        for (const candidate of r.marks) candidate.vmhwm = null
+      })
+
+      expect(result).toEqual({
+        verdict: 'inconclusive',
+        problems: ['no usable absolute peak source'],
+      })
+    })
+
+    test('is inconclusive when the high water does not cover a current reading', () => {
+      const result = judged('public', (r) => {
+        markOf(r, 'enabled:gzip').vmhwm = markOf(r, 'enabled:gzip').covered - 1
+        for (const phase of ['enabled:held', 'enabled:closed', 'final'])
+          markOf(r, phase).vmhwm = markOf(r, 'enabled:gzip').vmhwm
+      })
+
+      expect(result).toEqual({
+        verdict: 'inconclusive',
+        problems: ['peak source does not cover a current reading'],
+      })
+    })
+
+    test('is inconclusive when the collections were not observed', () => {
+      const result = judged('public', (r) => (r.c0.gc.observed = 1))
+
+      expect(result).toEqual({
+        verdict: 'inconclusive',
+        problems: ['c0 collections were not observed'],
+      })
+    })
+  })
+
+  describe('the disabled control', () => {
+    test.each([
+      ['a telemetry Get', (r) => (r.control.api71 = 1)],
+      ['a telemetry Push', (r) => (r.control.api72 = 1)],
+      ['a native compression call', (r) => (r.control.nativeSubmissions = 1)],
+      ['a client that is not disabled', (r) => (r.control.enabled = true)],
+      ['a probe that did not refuse as disabled', (r) => (r.control.probe = 'resolved')],
+    ])('fails a control that performed %s', (_name, change) => {
+      const result = judged('public', change)
+      expect(result.verdict).toBe('fail')
+      expect(result.problems).toContain('control performed telemetry')
+    })
+
+    test.each([
+      ['a socket left open', (r) => (r.control.liveSockets = 1), 'control was not released'],
+      ['a request left pending', (r) => (r.control.liveRequests = 1), 'control was not released'],
+      [
+        'a handle that survives',
+        (r) => (r.resources.released.control = { Timeout: [7] }),
+        'control handles survive its release',
+      ],
+      [
+        'no control role at all',
+        (r) => delete r.resources.released.control,
+        'control resource role is missing',
+      ],
+    ])('fails a control with %s', (_name, change, problem) => {
+      const result = judged('public', change)
+      expect(result.verdict).toBe('fail')
+      expect(result.problems).toContain(problem)
+    })
+
+    test('fails a control whose foreground differs from the fixed catalogue, or from the enabled arm', () => {
+      expect(judged('public', (r) => (r.control.ops = r.control.ops.slice(1))).problems).toContain(
+        'control foreground differs from the fixed catalogue'
+      )
+      expect(
+        judged('public', (r) => (r.enabled.ops = [...r.enabled.ops].reverse())).problems
+      ).toContain('enabled foreground differs from the fixed catalogue')
+      expect(
+        judged('collector', (r) => (r.control.ops = foregroundCatalogue('admin', 3).ops)).problems
+      ).toContain('control foreground differs from the fixed catalogue')
+    })
+
+    test('fails a mark that understates a reading, or the sampled peak', () => {
+      expect(judged('public', (r) => (markOf(r, 'control:c0').covered = 1)).problems).toContain(
+        'a peak mark understates a reading'
+      )
+      expect(
+        judged('public', (r) => (markOf(r, 'enabled:gzip').coveredExternal = 1)).problems
+      ).toContain('a peak mark understates a reading')
+      expect(judged('public', (r) => (r.samples.peak.rss = 1000 * MIB)).problems).toContain(
+        'a peak mark understates the sampled peak'
+      )
+      expect(judged('public', (r) => (r.samples.peak.external = 1e9)).problems).toContain(
+        'a peak mark understates the sampled peak'
+      )
+      expect(judged('public', (r) => delete r.samples.maxGapMs).problems).toContain(
+        'sampling facts are incomplete'
+      )
+    })
+  })
+
+  describe('control admission, on both sides of every bound', () => {
+    test.each([
+      [
+        'RSS',
+        LIMITS.controlRss,
+        (r, extra) => (r.c0.rss = r.c1.rss - extra),
+        (r, extra) => (r.c1.rss = r.c0.rss - extra),
+        'control RSS is unstable',
+      ],
+      [
+        'retained bytes',
+        LIMITS.controlRetained,
+        (r, extra) => {
+          r.c1.retained = r.c0.retained + extra
+          r.c1.heapUsed = r.c1.retained - r.c1.external
+        },
+        (r, extra) => {
+          r.c1.retained = r.c0.retained - extra
+          r.c1.heapUsed = r.c1.retained - r.c1.external
+        },
+        'control retained bytes are unstable',
+      ],
+    ])(
+      'admits a control whose %s differ by the bound in either direction and not by one more',
+      (_name, bound, higher, lower, problem) => {
+        for (const set of [higher, lower]) {
+          expect(judged('public', (r) => set(r, bound))).toEqual({ verdict: 'pass', problems: [] })
+          expect(judged('public', (r) => set(r, bound + 1))).toEqual({
+            verdict: 'inconclusive',
+            problems: [problem],
+          })
+        }
+      }
+    )
+
+    test('admits a setup peak of 96 MiB and not a byte more, whatever follows', () => {
+      const setup = (bytes) => (r) => {
+        markOf(r, 'control:released').vmhwm = bytes
+        raiseFrom(r, 'enabled:start', Math.max(bytes, 120 * MIB))
+      }
+
+      expect(LIMITS.setupPeak).toBe(100663296)
+      expect(judged('public', setup(LIMITS.setupPeak))).toEqual({ verdict: 'pass', problems: [] })
+      expect(judged('public', setup(LIMITS.setupPeak + 1))).toEqual({
+        verdict: 'inconclusive',
+        problems: ['setup exceeds the 96 MiB admission allowance'],
+      })
+    })
+
+    test('does not let a subtraction rescue an inflated control', () => {
+      const result = judged('public', (r) => {
+        for (const reading of [r.c0, r.c1, r.released]) reading.rss = 140 * MIB
+        for (const phase of ['control:c0', 'control:c1', 'control:released']) {
+          markOf(r, phase).rss = 140 * MIB
+          markOf(r, phase).covered = 140 * MIB
+        }
+        raiseFrom(r, 'control:c0', 140 * MIB)
+      })
+
+      expect(result).toEqual({
+        verdict: 'inconclusive',
+        problems: ['setup exceeds the 96 MiB admission allowance'],
+      })
+    })
+
+    test('counts an earlier peak: a high water set before the enabled arm still dominates it', () => {
+      const result = judged('public', (r) => {
+        raiseFrom(r, 'enabled:registered', 150 * MIB)
+      })
+
+      expect(result).toEqual({
+        verdict: 'fail',
+        problems: ['telemetry RSS peak exceeds 64 MiB above the disabled control'],
+      })
+    })
+  })
+
+  describe('the incremental and absolute limits, on both sides', () => {
+    test('allows the RSS peak to be exactly 64 MiB above the control and not a byte more', () => {
+      const peak = (bytes) => (r) => raiseFrom(r, 'enabled:gzip', bytes)
+
+      expect(judged('public', peak(B + LIMITS.rssDelta))).toEqual({ verdict: 'pass', problems: [] })
+      expect(judged('public', peak(B + LIMITS.rssDelta + 1))).toEqual({
+        verdict: 'fail',
+        problems: ['telemetry RSS peak exceeds 64 MiB above the disabled control'],
+      })
+    })
+
+    test('allows the whole arm to reach 160 MiB with a control of 96 MiB, and not a byte more', () => {
+      const arm = (peak) => (r) => {
+        for (const reading of [r.c0, r.c1, r.released]) reading.rss = LIMITS.setupPeak
+        for (const phase of ['control:c0', 'control:c1', 'control:released']) {
+          markOf(r, phase).rss = LIMITS.setupPeak
+          markOf(r, phase).covered = LIMITS.setupPeak
+        }
+        raiseFrom(r, 'control:c0', LIMITS.setupPeak)
+        raiseFrom(r, 'enabled:start', peak)
+      }
+
+      expect(LIMITS.absolutePeak).toBe(167772160)
+      expect(judged('public', arm(LIMITS.setupPeak + LIMITS.rssDelta))).toEqual({
+        verdict: 'pass',
+        problems: [],
+      })
+      expect(judged('public', arm(LIMITS.setupPeak + LIMITS.rssDelta + 1)).problems).toEqual([
+        'absolute current-image peak exceeds 160 MiB',
+        'telemetry RSS peak exceeds 64 MiB above the disabled control',
+      ])
+    })
+
+    test('judges the absolute backstop even when the control is inadmissible, and never passes it', () => {
+      const inadmissible = (peak) => (r) => {
+        markOf(r, 'control:released').vmhwm = LIMITS.setupPeak + 1
+        raiseFrom(r, 'enabled:start', peak)
+      }
+
+      expect(judged('public', inadmissible(LIMITS.absolutePeak))).toEqual({
+        verdict: 'inconclusive',
+        problems: ['setup exceeds the 96 MiB admission allowance'],
+      })
+      expect(judged('public', inadmissible(LIMITS.absolutePeak + 1))).toEqual({
+        verdict: 'fail',
+        problems: [
+          'absolute current-image peak exceeds 160 MiB',
+          'setup exceeds the 96 MiB admission allowance',
+        ],
+      })
+    })
+
+    test('allows external memory to be exactly 64 MiB above the control and not a byte more', () => {
+      const external = (bytes) => (r) => {
+        markOf(r, 'enabled:gzip').coveredExternal = bytes
+      }
+
+      expect(judged('public', external(3e6 + LIMITS.externalDelta))).toEqual({
+        verdict: 'pass',
+        problems: [],
+      })
+      expect(judged('public', external(3e6 + LIMITS.externalDelta + 1))).toEqual({
+        verdict: 'fail',
+        problems: ['external memory peak exceeds 64 MiB above the disabled control'],
+      })
+    })
+
+    test('takes the lower control reading as the baseline, never the higher or the control peak', () => {
+      const reference = (r) => {
+        r.c0.rss = 76 * MIB
+        r.c1.rss = 74 * MIB
+        markOf(r, 'control:c0').covered = 76 * MIB
+        raiseFrom(r, 'enabled:gzip', 74 * MIB + LIMITS.rssDelta + 1)
+      }
+
+      expect(judged('public', reference).problems).toEqual([
+        'telemetry RSS peak exceeds 64 MiB above the disabled control',
+      ])
+    })
+
+    test.each([
+      [
+        'active retained bytes',
+        LIMITS.retained,
+        (r, extra) => {
+          r.actives[0].retained = r.matched.retained + extra
+          r.actives[0].heapUsed = r.actives[0].retained - r.actives[0].external
+        },
+        'active retained bytes exceed the matched baseline by more than 8 MiB',
+      ],
+      [
+        'closed transient bytes',
+        LIMITS.closedTransient,
+        (r, extra) => {
+          r.closed.retained = r.matched.retained + extra
+          r.closed.heapUsed = r.closed.retained - r.closed.external
+        },
+        'closed transient bytes exceed 256 KiB',
+      ],
+    ])('allows %s exactly at the bound and fails one more', (_name, bound, set, problem) => {
+      expect(judged('public', (r) => set(r, bound))).toEqual({ verdict: 'pass', problems: [] })
+      expect(judged('public', (r) => set(r, bound + 1))).toEqual({
+        verdict: 'fail',
+        problems: [problem],
+      })
+    })
+
+    test('keeps a retained violation as a failure on a noisy host and against an unstable control', () => {
+      const result = judged('public', (r, whole) => {
+        r.closed.retained = r.matched.retained + LIMITS.closedTransient + 1
+        r.closed.heapUsed = r.closed.retained - r.closed.external
+        r.c0.rss = r.c1.rss - LIMITS.controlRss - 1
+        whole.context.before.load = [4, 1, 1]
+      })
+
+      expect(result).toEqual({
+        verdict: 'fail',
+        problems: [
+          'closed transient bytes exceed 256 KiB',
+          'host load was high',
+          'control RSS is unstable',
+        ],
+      })
+    })
+  })
+
+  describe('the native work', () => {
+    test.each([
+      ['an overflowed journal', (r) => (r.native.overflow = true), 'native journal overflowed'],
+      ['work still pending', (r) => (r.native.live = 1), 'native work is still pending'],
+      [
+        'two jobs occupied at once',
+        (r) => (r.native.maxLive = 2),
+        'more than one native job was occupied at once',
+      ],
+      ['no journal', (r) => delete r.native, 'native journal is missing'],
+      [
+        'a job without issued identities',
+        (r) => (r.native.rows[0].jobId = null),
+        'gzip job 1 lacks issued identities',
+      ],
+      ['a job out of order', (r) => (r.native.rows[1].id = 1), 'gzip job 1 is out of order'],
+      [
+        'raw bytes out of range',
+        (r) => (r.native.rows[0].inputBytes = LIMITS.rawBytes + 1),
+        'gzip job 1 raw bytes are out of range',
+      ],
+      [
+        'an uncompressed result',
+        (r) => (r.native.rows[0].resultBytes = r.native.rows[0].inputBytes),
+        'gzip job 1 payload was not compressed',
+      ],
+      [
+        'a job that did not resolve',
+        (r) => (r.native.rows[0].outcome = 'rejected'),
+        'gzip job 1 did not resolve',
+      ],
+      [
+        'a backing store counted twice',
+        (r) => (r.native.rows[0].distinctBackingBytes += 4000),
+        'gzip job 1 backing stores are not counted once each',
+      ],
+      [
+        'a capacity below the bytes it holds',
+        (r) => {
+          r.native.rows[0].inputBackingBytes = 1
+          r.native.rows[0].distinctBackingBytes = 4001
+        },
+        'gzip job 1 backing capacity is below its bytes',
+      ],
+      [
+        'a job without a settlement reading',
+        (r) => (r.native.rows[0].settled = null),
+        'gzip job 1 lacks a reading at submission or settlement',
+      ],
+      [
+        'a job that settled before it was submitted',
+        (r) => (r.native.rows[0].settled.at = 1),
+        'gzip job 1 settled before it was submitted',
+      ],
+      [
+        'no retired completion',
+        (r) => r.native.rows.pop(),
+        'gzip native work lacks a current or a retired completion',
+      ],
+      [
+        'work of another codec substituted for the codec the arm claims',
+        (r) => r.native.rows.forEach((row) => (row.codec = 'zstd')),
+        'gzip native work lacks a current or a retired completion',
+      ],
+      [
+        'too few readings around the work',
+        (r) => (r.samples.count = 3),
+        'too few current readings around native work',
+      ],
+    ])('fails %s', (_name, change, problem) => {
+      for (const arm of ARMS) {
+        const result = judged(arm, change)
+        expect(result.verdict).toBe('fail')
+        expect(result.problems).toContain(problem)
+      }
+    })
+
+    test('counts a backing store that the input and the result share once', () => {
+      const result = judged('public', (r) => {
+        for (const row of r.native.rows) {
+          row.resultBackingId = row.inputBackingId
+          row.inputBackingBytes = 354000
+          row.resultBackingBytes = 354000
+          row.distinctBackingBytes = 354000
+        }
+      })
+
+      expect(result).toEqual({ verdict: 'pass', problems: [] })
+    })
+  })
+
+  describe('the public client facts', () => {
+    test.each([
+      ['a changed UUID', (r) => (r.uuidHeld = 'x'), 'client instance id is missing or changed'],
+      ['a missing UUID', (r) => (r.uuid = null), 'client instance id is missing or changed'],
+      ['a short descriptor set', (r) => (r.descriptors = 127), 'descriptor count is not 128'],
+      [
+        'another descriptor population',
+        (r) => (r.manifest.fixture.descriptorBytes = 1),
+        'descriptor population is not the maximum',
+      ],
+      [
+        'a matched baseline that is not the disconnected registry',
+        (r) => (r.matchedState.connected = true),
+        'matched baseline is not the disconnected registry',
+      ],
+      [
+        'no telemetry request',
+        (r) => (r.enabled.api72 = 0),
+        'enabled client made no telemetry request',
+      ],
+      [
+        'too few accepted pushes',
+        (r) => (r.pushes.gzip.accepted = 2),
+        'gzip accepted pushes are fewer than required',
+      ],
+      [
+        'no immediate reopen',
+        (r) => (r.reopens[0].immediate = false),
+        'gzip has no immediate reopen from the close continuation',
+      ],
+      [
+        'a payload that is not in its codec format',
+        (r) => (r.decoded[0].format = false),
+        'gzip payload is not in its codec format',
+      ],
+      [
+        'a decoded size that differs from the native input',
+        (r) => (r.decoded[0].rawBytes = 1),
+        'gzip decoded payload differs from the native evidence',
+      ],
+      [
+        'a pushed size that is not a native result',
+        (r) => (r.pushes.gzip.transmittedBytes = 1),
+        'gzip decoded payload differs from the native evidence',
+      ],
+      [
+        'resource roles that are missing',
+        (r) => delete r.resources.closed,
+        'resource roles are missing',
+      ],
+      [
+        'a target handle that survives the close',
+        (r) => (r.resources.closed.target = { Timeout: [9] }),
+        'target handles survive the public close',
+      ],
+      [
+        'an unknown handle that appears',
+        (r) => (r.resources.closed.unknown = { Timeout: [9] }),
+        'resource roles: unknown Timeout resource survives',
+      ],
+    ])('fails %s', (_name, change, problem) => {
+      const result = judged('public', change)
+      expect(result.verdict).toBe('fail')
+      expect(result.problems).toContain(problem)
+    })
+  })
+
+  describe('the collector facts', () => {
+    test.each([
+      [
+        'the wrong codecs',
+        (r) => (r.builds[0].codec = 'zstd'),
+        'native builds are not the expected codecs',
+      ],
+      [
+        'another compression type',
+        (r) => (r.builds[0].compressionType = 4),
+        'gzip build used another codec',
+      ],
+      [
+        'raw bytes out of range',
+        (r) => (r.builds[0].rawBytes = 10),
+        'gzip raw bytes are out of range',
+      ],
+      [
+        'an uncompressed payload',
+        (r) => (r.builds[0].transmittedBytes = 350000),
+        'gzip payload was not compressed',
+      ],
+      [
+        'fewer than 257 points',
+        (r) => (r.builds[0].points = 256),
+        'gzip collector build is incomplete',
+      ],
+      [
+        'no retired completion',
+        (r) => (r.builds[0].retiredCompletion = false),
+        'gzip collector build is incomplete',
+      ],
+    ])('fails %s', (_name, change, problem) => {
+      const result = judged('collector', change)
+      expect(result.verdict).toBe('fail')
+      expect(result.problems).toContain(problem)
+    })
+  })
+
+  describe('a directory of artifacts', () => {
+    let directory
+    const write = (arm, kind, value = record(arm, kind)) =>
+      fs.writeFileSync(path.join(directory, `resources-${arm}-${kind}.json`), JSON.stringify(value))
+    const writeAll = () => ARMS.forEach((arm) => KINDS.forEach((kind) => write(arm, kind)))
+
+    beforeEach(() => {
+      directory = fs.mkdtempSync(path.join(os.tmpdir(), 'resource-artifacts-'))
+    })
+    afterEach(() => fs.rmSync(directory, { recursive: true, force: true }))
+
+    test('accepts one stamped artifact for every arm and kind', () => {
+      writeAll()
+      const checked = validateResourceArtifacts(directory, { tree: TREE, node: NODE })
+      expect(checked.results).toHaveLength(8)
+      expect(checked.ok).toBe(true)
+    })
+
+    test('fails a missing kind even when the rest pass', () => {
+      writeAll()
+      fs.rmSync(path.join(directory, 'resources-public-admin.json'))
+      const checked = validateResourceArtifacts(directory, { tree: TREE, node: NODE })
+      expect(checked.ok).toBe(false)
+      expect(checked.results.filter((result) => result.verdict !== 'pass')).toEqual([
+        { arm: 'public', kind: 'admin', verdict: 'fail', problems: ['artifact is missing'] },
+      ])
+    })
+
+    test('fails an artifact stamped for another tree, Node, arm or kind', () => {
+      writeAll()
+      for (const change of [
+        (r) => (r.stamp.tree = 'b'.repeat(40)),
+        (r) => (r.stamp.node = 'v22.0.0'),
+        (r) => (r.readings.manifest.node = 'v22.0.0'),
+        (r) => (r.kind = 'admin'),
+      ]) {
+        const forged = record('collector', 'producer')
+        change(forged)
+        write('collector', 'producer', forged)
+        const checked = validateResourceArtifacts(directory, { tree: TREE, node: NODE })
+        const result = checked.results.find((r) => r.arm === 'collector' && r.kind === 'producer')
+        expect(result.verdict).toBe('fail')
+        expect(result.problems[0]).toContain('not stamped for this tree, Node, arm and kind')
+      }
+    })
+
+    test('fails an artifact that is not JSON', () => {
+      writeAll()
+      fs.writeFileSync(path.join(directory, 'resources-public-producer.json'), '{')
+      const checked = validateResourceArtifacts(directory, { tree: TREE, node: NODE })
+      expect(checked.results[0]).toMatchObject({
+        verdict: 'fail',
+        problems: [expect.stringContaining('artifact is not valid JSON')],
+      })
+    })
+
+    test('fails two artifacts that claim one child, so a control cannot serve another arm', () => {
+      writeAll()
+      const borrowed = record('public', 'admin')
+      borrowed.readings.manifest.childId = 'child-public-producer'
+      write('public', 'admin', borrowed)
+
+      const checked = validateResourceArtifacts(directory, { tree: TREE, node: NODE })
+
+      expect(checked.ok).toBe(false)
+      expect(
+        checked.results
+          .filter((result) => result.verdict !== 'pass')
+          .map(({ arm, kind, problems }) => [arm, kind, problems[0]])
+      ).toEqual([
+        ['public', 'producer', 'artifact shares a child identity with another'],
+        ['public', 'admin', 'artifact shares a child identity with another'],
+      ])
+    })
+
+    test('fails the old schema in a directory even when everything else is in place', () => {
+      writeAll()
+      const old = record('public', 'consumer')
+      old.schema = 1
+      write('public', 'consumer', old)
+
+      const checked = validateResourceArtifacts(directory, { tree: TREE, node: NODE })
+
+      expect(
+        checked.results.find((r) => r.arm === 'public' && r.kind === 'consumer')
+      ).toMatchObject({
+        verdict: 'fail',
+        problems: ['unknown schema'],
+      })
+    })
   })
 })
