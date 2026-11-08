@@ -15,6 +15,7 @@ const {
   WORKLOADS,
   Soak,
   createTopic,
+  forgettingDestroyed,
   instrument,
   parseArgs,
   privateOf,
@@ -1836,6 +1837,60 @@ describe('Share soak resource screen', () => {
     )
     delete run.teardown.activeResourcesBeforeCollection
     expect(ShareSoakScreen.evaluate(run).ok).toBe(false)
+  })
+
+  test('compares quiet resources without the attributed Jest status debounce in either inventory', () => {
+    const { ShareTimerObserver } = require('../shareTimerObserver')
+    const reporter = {
+      type: 'Timeout',
+      asyncId: 35619,
+      triggerAsyncId: 4246,
+      stack:
+        'Error: \n' +
+        '    at emitInitNative (node:internal/async_hooks:207:43)\n' +
+        '    at setTimeout (node:timers:125:19)\n' +
+        '    at Status._debouncedEmit (/ci/node_modules/@jest/reporters/build/index.js:1507:7)\n' +
+        '    at Status._tick (/ci/node_modules/@jest/reporters/build/index.js:1514:10)',
+      hasRef: true,
+      durationMs: 100,
+      repeatMs: null,
+    }
+    const owners = (rows) => ShareTimerObserver.evidence({ rows, dropped: 0 }, { Timeout: 2 })
+    const run = shareScreenRun()
+    run.baseline.activeResourcesBeforeCollection.Timeout = 2
+    run.baseline.timerOwners = {
+      beforeCollection: owners([reporter]),
+      afterCollection: owners([]),
+    }
+    run.teardown.activeResources.Timeout = 2
+    run.teardown.timerOwners = {
+      beforeCollection: owners([]),
+      afterCollection: owners([reporter]),
+    }
+    expect(run.baseline.timerOwners.beforeCollection.harnessAsyncIds).toEqual([35619])
+    expect(ShareSoakScreen.evaluate(run).violations).toEqual([])
+
+    // A product timeout with the same duration and a reporter ancestor is still a surplus.
+    const product = {
+      ...reporter,
+      asyncId: 35620,
+      stack: reporter.stack.replace(
+        '    at Status._debouncedEmit',
+        '    at RequestQueue.scheduleRequestTimeoutCheck (/ci/src/network/requestQueue/index.js:88:7)\n' +
+          '    at Status._debouncedEmit'
+      ),
+    }
+    run.teardown.activeResourcesBeforeCollection.Timeout = 2
+    run.teardown.timerOwners.beforeCollection = owners([product])
+    expect(run.teardown.timerOwners.beforeCollection.harnessAsyncIds).toEqual([])
+    expect(ShareSoakScreen.evaluate(run).violations).toContain(
+      'teardown: activeResourcesBeforeCollection.Timeout baseline=1 after=2'
+    )
+    run.teardown.activeResources.Timeout = 3
+    run.teardown.timerOwners.afterCollection = owners([reporter, product])
+    expect(ShareSoakScreen.evaluate(run).violations).toContain(
+      'teardown: activeResources.Timeout baseline=1 after=2'
+    )
   })
 
   test('names each differing source with its baseline and quiet-point reading', () => {
@@ -5050,18 +5105,21 @@ describe('Share soak original queue and socket listener adapter', () => {
   }, 30000)
 
   test.each([false, true])(
-    'measures closed socket error listeners after collection, retained=%s',
+    'releases closed chaos sockets but rejects a product owner retaining one, retained=%s',
     async (retained) => {
       const exposed = globalThis.gc
       require('v8').setFlagsFromString('--expose-gc')
       globalThis.gc = require('vm').runInNewContext('gc')
       const createSocket = require('../../../src/network/socket')
-      const kept = []
+      const { createChaosSocketFactory } = require('../../../testHelpers/chaosSocket')
+      const chaos = createChaosSocketFactory(() => new (require('net').Socket)())
+      const tap = new ShareFetchTap()
+      const productOwner = { retiredSocket: null }
       const shared = instrumentShare(
         {
           clientId: 'soak',
           brokers: ['localhost:1'],
-          socketFactory: () => Object.assign(new EventEmitter(), { destroyed: false }),
+          socketFactory: tap.factory(forgettingDestroyed(chaos, { releaseOnClose: true })),
         },
         { activeResources: false }
       )
@@ -5077,11 +5135,12 @@ describe('Share soak original queue and socket listener adapter', () => {
           onTimeout: () => {},
         })
         createSocket.detachSocket(socket)
-        socket.destroyed = true
-        if (retained) kept.push(socket)
+        socket.destroy()
+        if (retained) productOwner.retiredSocket = socket
         socket = null
 
         const after = await shared.shareResources.snapshot()
+        expect(chaos.sockets).toEqual([])
         expect(after.sockets).toEqual({ created: 1, destroyed: 1, open: 0 })
         expect(Object.values(after.namedListeners)).toEqual(retained ? [1] : [])
         const violations = []
@@ -5092,7 +5151,9 @@ describe('Share soak original queue and socket listener adapter', () => {
           violations
         )
         expect(violations.length > 0).toBe(retained)
-        if (retained) expect(kept[0].listenerCount('error')).toBe(1)
+        if (retained) expect(productOwner.retiredSocket.listenerCount('error')).toBe(1)
+        productOwner.retiredSocket = null
+        expect((await shared.shareResources.snapshot()).namedListeners).toEqual({})
       } finally {
         shared.shareResources.restore()
         globalThis.gc = exposed

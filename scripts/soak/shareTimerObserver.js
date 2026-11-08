@@ -61,11 +61,52 @@ class ShareTimerObserver {
   }
 
   /**
+   * Recognizes only Jest's 100 ms status debounce at its allocating frame. A product allocation
+   * with a reporter further down its stack is not a reporter-owned timer.
+   * @param {object} owner Captured allocation and snapshot-time timer metadata.
+   * @returns {boolean} Whether this referenced, one-shot timer belongs to the status reporter.
+   */
+  static isStatusDebounce(owner) {
+    if (
+      owner.type !== 'Timeout' ||
+      owner.hasRef !== true ||
+      owner.durationMs !== 100 ||
+      owner.repeatMs !== null ||
+      !Number.isSafeInteger(owner.asyncId) ||
+      owner.asyncId < 1
+    )
+      return false
+    const allocatingFrame = owner.stack
+      ?.split('\n')
+      .find((line) => /^\s+at /.test(line) && !line.includes('(node:'))
+    return /^\s+at Status\._debouncedEmit \(.*[/\\]node_modules[/\\]@jest[/\\]reporters[/\\]build[/\\]index\.js:\d+:\d+\)$/.test(
+      allocatingFrame ?? ''
+    )
+  }
+
+  /**
+   * Compares product resources with the same harness population at each observation. Raw process
+   * counts and full allocation rows remain in the evidence. No unattributed timer is excluded.
+   * @param {Record<string, number>|undefined} counts Original same-turn process inventory.
+   * @param {{ rows: object[] }|undefined} owners Original same-turn allocation inventory.
+   * @returns {Record<string, number>|undefined} Counts excluding exactly attributed status timers.
+   */
+  static comparableResources(counts, owners) {
+    if (!counts) return counts
+    const harness = new Set(
+      (owners?.rows ?? []).filter(ShareTimerObserver.isStatusDebounce).map(({ asyncId }) => asyncId)
+    )
+    if (!harness.size) return counts
+    return { ...counts, Timeout: (counts.Timeout ?? 0) - harness.size }
+  }
+
+  /**
    * Reconciles an already captured owner inventory with its independent same-turn counts.
    * @param {{ rows: object[], dropped: number }} owners Captured owner inventory.
    * @param {Record<string, number>} [counts] Independent event-loop counts, when enabled.
    * @returns {object} Evidence with pre-installation or dropped resource counts explicitly
-   *   unattributed. These counts never subtract from the quiet screen's resource comparison.
+   *   unattributed. Only the precisely attributed Jest status debounce is excluded from resource
+   *   comparisons; its raw count, allocation row and id remain evidence.
    */
   static evidence(owners, counts) {
     const unattributed = counts
@@ -80,7 +121,13 @@ class ShareTimerObserver {
           ])
         )
       : null
-    return { ...owners, unattributed }
+    return {
+      ...owners,
+      unattributed,
+      harnessAsyncIds: owners.rows
+        .filter(ShareTimerObserver.isStatusDebounce)
+        .map(({ asyncId }) => asyncId),
+    }
   }
 
   /** @returns {void} Disables the hook and releases all observer storage. */
