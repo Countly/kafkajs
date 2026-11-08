@@ -9,6 +9,54 @@ const otlp = require('../otlp')
 const Connection = require('../../network/connection')
 const { TOPIC } = require('../../consumer/__tests__/fixtures/fetchHarness')
 
+test.each([false, true])(
+  'ordinary response decode errors retain their original identity and log messages with error logging=%s',
+  async (logResponseError) => {
+    const round = new PublicTelemetryRound({ kind: 'producer', enabled: false })
+    const reason = new Error('original ordinary decode message')
+    const logs = { logError: [], logDebug: [] }
+    try {
+      await round.start()
+      const broker = await round.cluster.findConnectedBroker()
+      for (const connection of broker.connectionPool.pool)
+        for (const key of Object.keys(logs))
+          round.patch(
+            connection,
+            key,
+            (original) =>
+              function (message, fields) {
+                if (fields?.error) logs[key].push(fields.error)
+                return original.call(this, message, fields)
+              }
+          )
+      round.patch(
+        Connection.prototype,
+        'send',
+        (original) =>
+          function (options) {
+            if (options.request.apiKey === 18)
+              options = {
+                ...options,
+                logResponseError,
+                response: {
+                  ...options.response,
+                  decode: async () => {
+                    throw reason
+                  },
+                },
+              }
+            return original.call(this, options)
+          }
+      )
+      await expect(broker.apiVersions()).rejects.toBe(reason)
+      expect(logs.logError).toEqual(logResponseError ? ['original ordinary decode message'] : [])
+      expect(logs.logDebug).toEqual(['original ordinary decode message'])
+    } finally {
+      await round.dispose()
+    }
+  }
+)
+
 /** Installs one counted private failure; restoration belongs to the round.
  * @param {PublicTelemetryRound} round owner @param {object} target function owner
  * @param {string} key method @param {*} reason private sentinel
@@ -124,19 +172,21 @@ const INJECTORS = {
   O08: {
     inject: (r, s) => {
       const counter = { hits: 0 }
-      r.patch(r.metrics, 'snapshot', (original) => (...args) => {
-        const sample = original.apply(r.metrics, args)
-        return {
-          ...sample,
-          points: sample.points.map((point) => ({
-            ...point,
-            get name() {
-              counter.hits++
-              throw s
-            },
-          })),
-        }
-      })
+      r.patch(
+        otlp,
+        'measureMetricsData',
+        (original) => (sample, points) =>
+          original(
+            sample,
+            points.map((point) => ({
+              ...point,
+              get name() {
+                counter.hits++
+                throw s
+              },
+            }))
+          )
+      )
       return counter
     },
   },
@@ -188,12 +238,12 @@ const INJECTORS = {
   'O13 supplier throw': {
     sasl: true,
     setup: true,
-    inject: (r, s) => failing(r, r.dedicatedConnection.sasl, 'oauthBearerProvider', s),
+    inject: (r, s) => failing(r, r, 'provider', s),
   },
   'O13 supplier reject': {
     sasl: true,
     setup: true,
-    inject: (r, s) => failing(r, r.dedicatedConnection.sasl, 'oauthBearerProvider', s, true),
+    inject: (r, s) => failing(r, r, 'provider', s, true),
   },
   'O14 Get decode': { get: true, inject: (r, s) => decodeFailure(r, s, 71) },
   'O14 Push decode': { inject: (r, s) => decodeFailure(r, s, 72) },
@@ -264,7 +314,7 @@ async function publicOutcome(round, key, args, target = round.client) {
     originalKey = 'wait'
     const entered = new Set()
     select = (receiver) => {
-      if (entered.has(receiver)) return false
+      if (receiver.method !== 'fetchTopicMetadata' || entered.has(receiver)) return false
       entered.add(receiver)
       return true
     }
@@ -532,6 +582,7 @@ describe.each(TELEMETRY_KINDS)('%s private failure preserves foreground identity
           if (round.machine) await round.ready()
           if (_id.startsWith('O10') && arm === 'control')
             expect(round.pushes()[0].fields.compressionType).toBe(zstd.isSupported ? 4 : 1)
+          await exerciseOperations(round)
           const normalPools = round.binding?.cluster?.brokerPool.brokers
           const normalBrokers = normalPools ? Object.values(normalPools) : []
           if (arm === 'fault' && !spec.early) {
@@ -546,6 +597,10 @@ describe.each(TELEMETRY_KINDS)('%s private failure preserves foreground identity
             if (spec.close) await exerciseOperations(round)
             counter = spec.inject(round, reason)
             await drive(round, spec)
+            if (spec.close) {
+              expect(round.machine.state).toBe('CLOSED')
+              await expect(round.client.disconnect(round.closeOptions(0))).resolves.toBeUndefined()
+            }
             if (['O05 snapshot', 'O05 select', 'O11', 'O15'].includes(_id)) {
               const stopped = _id !== 'O05 snapshot'
               expect(round.machine.state).toBe(stopped ? 'STOPPED' : 'BACKOFF')
@@ -684,7 +739,10 @@ test.each(TELEMETRY_KINDS)(
  * @throws {Error} an unexpected wrapper outcome or transaction cleanup failure
  */
 async function exerciseRefusal(round, operation, outcome) {
-  const reason = new (require('../../errors').KafkaJSNonRetriableError)('unique original refusal')
+  const ErrorClass = operation.startsWith('transaction.')
+    ? require('../../errors').KafkaJSTransactionAbortableError
+    : require('../../errors').KafkaJSNonRetriableError
+  const reason = new ErrorClass('unique original refusal')
   const broker = await round.cluster.findConnectedBroker()
   const transaction = operation.startsWith('transaction.') ? await round.client.transaction() : null
   const key = operation.split('.').at(-1)
@@ -798,6 +856,7 @@ test.each([false, true])(
   'awaited rebalance-hook rejection retains control flow enabled=%s',
   async (enabled) => {
     const reason = new Error('unique awaited hook refusal')
+    let armed = false
     const round = new PublicTelemetryRound({ kind: 'consumer', enabled })
     let calls = 0
     try {
@@ -806,6 +865,7 @@ test.each([false, true])(
           r.runOptions = {
             rebalanceListener: {
               onPartitionsRevoked: async () => {
+                if (!armed) return
                 calls++
                 throw reason
               },
@@ -824,6 +884,7 @@ test.each([false, true])(
         await (await round.cluster.findConnectedBroker()).apiVersions()
         expect(fault.hits).toBeGreaterThan(0)
       }
+      armed = true
       await expect(round.rejoin()).rejects.toMatchObject({
         name: 'KafkaJSRebalanceListenerError',
         reason: 'threw',

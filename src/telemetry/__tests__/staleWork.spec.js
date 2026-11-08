@@ -218,8 +218,17 @@ describe('stale work release matrix', () => {
         if (
           !round.deferredReplacement &&
           (cell.action.includes('replacement') || cell.action.includes('reopen'))
-        )
-          round.assertReplacementUnchanged(replacement)
+        ) {
+          if (cell.mode === 'final' && cell.action.includes('replacement')) {
+            expect(round.machine.state).toBe('CLOSED')
+            expect(round.machine.closing.revision).toBe(replacement.closeRevision)
+            expect(round.machine.uuid).toBe(replacement.uuid)
+            expect(round.machine.subscription).toBeNull()
+            expect(round.machine.handle).toBeNull()
+            expect(round.machine.timer).toBeNull()
+            expect(round.openDedicated()).toEqual([])
+          } else round.assertReplacementUnchanged(replacement)
+        }
         if (
           (cell.action.includes('replacement') || cell.action.includes('reopen')) &&
           round.machine.connected &&
@@ -261,6 +270,7 @@ describe('public round oracle controls', () => {
     const Connection = require('../../network/connection')
     const Factory = require('../factory').TelemetryFactory
     const originals = [
+      require('node:crypto').randomBytes,
       Date.now,
       process.hrtime.bigint,
       require('node:perf_hooks').performance.now,
@@ -280,6 +290,7 @@ describe('public round oracle controls', () => {
       )
     ).rejects.toBe(reason)
     expect([
+      require('node:crypto').randomBytes,
       Date.now,
       process.hrtime.bigint,
       require('node:perf_hooks').performance.now,
@@ -295,6 +306,7 @@ describe('public round oracle controls', () => {
       const Connection = require('../../network/connection')
       const Factory = require('../factory').TelemetryFactory
       const identities = () => [
+        require('node:crypto').randomBytes,
         Date.now,
         process.hrtime.bigint,
         require('node:perf_hooks').performance.now,
@@ -891,6 +903,11 @@ describe('numeric authority', () => {
         { subscription: { requestedMetrics: ['com.example.', 'org.apache.kafka.'] } }
       )
       try {
+        if (kind === 'producer')
+          await round.client.send({
+            topic: 'test-topic',
+            messages: [{ value: 'node observation' }],
+          })
         await round.cluster.refreshMetadata()
         const poolOwner = round.cluster.brokerPool
         const broker = Object.values(poolOwner.brokers)[0]
@@ -1266,7 +1283,7 @@ describe('corrective public reopen and suspension', () => {
         await expect(round.client.clientInstanceId({ timeout: 10 })).rejects.toMatchObject({
           reason: 'not-connected',
         })
-        await round.wait(() => round.client.connect())
+        await round.wait(() => round.restartForeground())
         const caller = round.client.clientInstanceId({ timeout: 1000 })
         await round.drainReleased(gate)
         round.tick()

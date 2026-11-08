@@ -1071,7 +1071,11 @@ module.exports = class Connection {
       attachResponseSource(e, request.apiKey)
       if (logResponseError) {
         this.logError(`Response ${requestInfo(entry)}`, {
-          error: sensitiveResponse ? 'Sensitive response failed' : e.message,
+          error: sensitiveResponse
+            ? 'Sensitive response failed'
+            : this.authenticationOwner
+              ? 'Telemetry response failed'
+              : e.message,
           correlationId,
           size,
         })
@@ -1079,7 +1083,11 @@ module.exports = class Connection {
 
       const isBuffer = Buffer.isBuffer(payload)
       this.logDebug(`Response ${requestInfo(entry)}`, {
-        error: sensitiveResponse ? 'Sensitive response failed' : e.message,
+        error: sensitiveResponse
+          ? 'Sensitive response failed'
+          : this.authenticationOwner
+            ? 'Telemetry response failed'
+            : e.message,
         correlationId,
         payload: sensitiveResponse
           ? '[filtered]'

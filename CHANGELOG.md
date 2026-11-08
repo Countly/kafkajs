@@ -40,6 +40,9 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Behavior changes
 
+- Refuse obsolete telemetry connection opens before they can retire the current connection, preserving healthy telemetry after replacement or reconnect.
+- Log fixed diagnostics for private telemetry response failures without reading properties of arbitrary thrown values; ordinary request diagnostics retain their existing messages.
+- Contain private telemetry cleanup failures on repeated disconnects and complete the closed-state transition when metric cleanup fails.
 - Keep observational telemetry errors in the `applicationRecoverable` category regardless of a wrapped cause's transaction or configuration category; foreground clients remain usable.
 - Keep telemetry suspended after failed consumer startup, retain request latency observation across crash restarts, and wait for supported telemetry connection setup when requesting an instance ID. Contain all recognized share option accessors before construction; disabled disconnects retain their original scheduling.
 - Broker client metrics (KIP-714) are available with `enableMetricsPush: true`; the default remains false. Kafka-wide defaults can be overridden on producer, consumer, admin and share consumer.

@@ -290,7 +290,7 @@ class KindForeground {
       key: 'wait',
       tap: true,
       select: (receiver) => {
-        if (entered.has(receiver)) return false
+        if (receiver.method !== 'fetchTopicMetadata' || entered.has(receiver)) return false
         entered.add(receiver)
         return true
       },
@@ -495,6 +495,17 @@ class CycleLedger {
    */
   async record(cycle, foreground, { reopen, floor }) {
     const { round } = this
+    await round.until(() => {
+      const live = new Set(
+        round.wire
+          .sockets()
+          .filter((socket) => !socket.destroyed)
+          .map((socket) => round.wire.socketKeys.get(socket))
+      )
+      return round.wire
+        .requests()
+        .every((request) => live.has(`${request.node}/${request.generation}`))
+    })
     this.current = [foreground]
     const row = {
       cycle,
@@ -698,7 +709,7 @@ class BoundedAudit {
     })
     if (rows.length > 1)
       check(
-        rows.at(-1).state.socketsIssued > rows[0].state.socketsIssued,
+        rows.at(-1).state.physicalSocketsIssued > rows[0].state.physicalSocketsIssued,
         'issued socket numbers never advanced'
       )
     return problems

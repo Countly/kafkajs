@@ -354,6 +354,8 @@ module.exports = class Cluster {
        */
       open: (candidate, { guard, deadline, onAllocated }) =>
         sharedSetup(async () => {
+          const entryRefusal = guard()
+          if (entryRefusal) throw entryRefusal
           if (supplier.pending)
             throw new KafkaJSConnectionError('Telemetry authentication remains pending')
           if (active) await active.retire({ drainTimeout: 0 })

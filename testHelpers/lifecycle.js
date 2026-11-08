@@ -463,7 +463,9 @@ const manifestOf =
     else if (
       action === RELEASE_ACTIONS[2] &&
       mode === 'normal' &&
-      (boundary !== 'S18' || options.position === 'result')
+      (boundary !== 'S18' || options.position === 'result') &&
+      boundary !== 'S12' &&
+      !RENEWAL_BOUNDARIES.includes(boundary)
     )
       expected.push(frame('F', 1n))
     else if (action === RELEASE_ACTIONS[5]) expected.push(...reconnect())
@@ -976,6 +978,7 @@ class PublicTelemetryRound {
       ownersCompleted: this.owners.completed(),
       liveSockets: this.liveSockets.size,
       socketsIssued: this.socketsIssued,
+      physicalSocketsIssued: this.wire.fake.state.issued,
       wireSockets: this.wire.sockets().length,
       wireLive: this.wire.requests().length,
       handles: this.builtHandles.length,
@@ -1037,6 +1040,7 @@ class PublicTelemetryRound {
   async until(predicate, timeout = 10000) {
     const deadline = realMonotonicNs() + BigInt(timeout) * 1000000n
     while (!predicate()) {
+      this.wire?.assertClean()
       if (realMonotonicNs() >= deadline) throw new Error('Telemetry boundary did not settle')
       await turn()
     }
@@ -1050,10 +1054,11 @@ class PublicTelemetryRound {
    * @throws {Error} the original failure or a setup timeout, never a product refusal oracle
    */
   async wait(thunk, timeout = this.waitTimeout) {
+    const diagnostic = new Error('Telemetry wait exceeded its bound')
     const promise = Promise.resolve().then(thunk)
     let timer
     const limit = new Promise((resolve, reject) => {
-      timer = setTimeout(() => reject(new Error('Telemetry wait exceeded its bound')), timeout)
+      timer = setTimeout(() => reject(diagnostic), timeout)
     })
     try {
       return await Promise.race([promise, limit])
@@ -1145,6 +1150,12 @@ class PublicTelemetryRound {
     const gzip = require('../src/protocol/message/compression/gzip')
     const round = this
     const dedicated = (connection) => connection.authenticationOwner != null
+    const dedicatedCall = (call) => {
+      const socket = round.dedicatedConnection?.socket
+      return (
+        round.wire.socketKeys.get(socket?.inner ?? socket) === `${call.node}/${call.generation}`
+      )
+    }
     const closing = () => round.machine?.closing != null
     const kindOf = (apiKey, final) => (apiKey === 71 ? 'get' : final ? 'final' : 'normal')
     const encodeHold = (apiKeys, position, byMode) =>
@@ -1301,7 +1312,7 @@ class PublicTelemetryRound {
         }
         return wired({
           api: 'ApiVersions',
-          match: (call) => round.armed && call.generation > round.foregroundSockets,
+          match: (call) => round.armed && dedicatedCall(call),
         })
       },
       S09: () => {
@@ -1361,7 +1372,10 @@ class PublicTelemetryRound {
             api: 'PushTelemetry',
             match: (call) => round.armed && !call.fields.terminating,
           })
-        const blocker = wired({ api: 'ApiVersions', match: () => round.blockingDispatch === true })
+        const blocker = wired({
+          api: 'ApiVersions',
+          match: (call) => round.blockingDispatch === true && dedicatedCall(call),
+        })
         this.patch(
           Connection.prototype,
           'send',
@@ -1837,10 +1851,42 @@ class PublicTelemetryRound {
     const kafkaOptions = {
       enableMetricsPush: this.enabled,
       enforceRequestTimeout: this.enforceRequestTimeout,
-      ...(sasl ? { sasl: { mechanism: 'oauthbearer', oauthBearerProvider: this.provider } } : {}),
+      ...(sasl
+        ? {
+            sasl: {
+              mechanism: 'oauthbearer',
+              oauthBearerProvider: (...args) => this.provider(...args),
+            },
+          }
+        : {}),
       ...kafka,
     }
     if (this.kind === 'shareConsumer') {
+      const { ShareRunner } = require('../src/consumer/share/shareRunner')
+      const { ShareRun } = require('../src/consumer/share/shareRun')
+      // Empty-fetch pacing must advance independently of deterministic telemetry time.
+      const foregroundNow = () => Number(realMonotonicNs()) / 1000000
+      this.patch(
+        ShareRun.prototype,
+        'createLoop',
+        (original) =>
+          function (node, ...args) {
+            const loop = original.call(this, node, ...args)
+            const done = () => node.session.closed
+            round.patchFor(loop, 'now', () => foregroundNow, done)
+            round.patchFor(node.operation, 'now', () => foregroundNow, done)
+            return loop
+          }
+      )
+      this.patch(
+        ShareRunner.prototype,
+        'api',
+        (original) =>
+          function (...args) {
+            round.runner = this
+            return original.apply(this, args)
+          }
+      )
       const { shareClient } = require('./shareHarness')
       const harness = shareClient({
         advertise,
@@ -1870,6 +1916,13 @@ class PublicTelemetryRound {
     }
     this.node = this.wire.nodes[0].id
     if (this.bounded) this.wire.bound()
+    // Vector throttle examples cannot elapse while the round's wall clock is frozen.
+    this.patch(this.wire, 'defaultAnswer', (original) => (...args) => {
+      const unthrottled = (answer) =>
+        Buffer.isBuffer(answer) ? answer : { throttleTime: 0, ...answer }
+      const answer = original.apply(this.wire, args)
+      return answer?.then ? answer.then(unthrottled) : unthrottled(answer)
+    })
     this.watchWire()
     this.wire.answer('GetTelemetrySubscriptions', (fields) => ({
       ...this.subscription,
@@ -1879,6 +1932,11 @@ class PublicTelemetryRound {
     if (sasl) this.wire.answer('SaslHandshake', () => ({ enabledMechanisms: ['OAUTHBEARER'] }))
     if (this.kind !== 'shareConsumer') await this.wait(() => this.createClient(client))
     if (this.kind === 'producer' || this.kind === 'admin') scripted.producerScript(this.wire)
+    if (this.kind === 'producer' && client.transactionalId)
+      this.wire.answer('InitProducerId', ({ producerId, producerEpoch }) => ({
+        producerId: producerId === '-1' ? '1000' : producerId,
+        producerEpoch: producerEpoch + 1,
+      }))
     this.binding = this.bindings.at(-1) ?? null
     this.machine = this.binding?.machine ?? null
     this.metrics = this.binding?.metrics ?? null
@@ -2011,17 +2069,6 @@ class PublicTelemetryRound {
       return
     }
     if (this.kind === 'shareConsumer') {
-      const { ShareRunner } = require('../src/consumer/share/shareRunner')
-      const round = this
-      this.patch(
-        ShareRunner.prototype,
-        'api',
-        (original) =>
-          function (...args) {
-            round.runner = this
-            return original.apply(this, args)
-          }
-      )
       await this.client.subscribe({ topics: ['topic-a'] })
       await this.client.run({
         eachMessage: async (payload) => {
@@ -2029,7 +2076,8 @@ class PublicTelemetryRound {
         },
         ...this.runOptions,
       })
-      return this.until(() => this.runner?.current?.membership.memberEpoch > 0)
+      await this.until(() => this.runner?.current?.membership.memberEpoch > 0)
+      return this.until(() => this.wire.tally('ShareFetch', 'answered') > 0)
     }
     const { TOPIC } = require('../src/consumer/__tests__/fixtures/fetchHarness')
     const Runner = require('../src/consumer/runner')
@@ -2043,10 +2091,21 @@ class PublicTelemetryRound {
           return original.apply(this, args)
         }
     )
+    this.patch(
+      Runner.prototype,
+      'processEachMessage',
+      (original) =>
+        function (...args) {
+          round.foregroundReady = true
+          return original.apply(this, args)
+        }
+    )
     await this.client.connect()
     if (this.protocol === 'manual')
       await this.client.assign([{ topic: TOPIC, partitions: [0] }], { offsetReset: 'earliest' })
     else await this.client.subscribe({ topic: TOPIC, fromBeginning: true })
+    this.core.crashes = 0
+    this.eventRemovers.push(this.client.on(this.client.events.CRASH, () => this.core.crashes++))
     this.eventRemovers.push(
       this.client.on(this.client.events.PARTITIONS_LOST, () =>
         this.core.losses.push(this.wire.requests().length)
@@ -2064,6 +2123,7 @@ class PublicTelemetryRound {
       },
       ...this.runOptions,
     })
+    await this.until(() => this.foregroundReady)
   }
 
   /** @returns {void} activates the hold and, for S02, blackholes the next dial */
@@ -2115,9 +2175,13 @@ class PublicTelemetryRound {
    */
   async ready() {
     const machine = this.machine
+    telemetryAssert.ok(machine, 'Enabled round must construct its telemetry machine')
     if (!machine.subscription) {
       this.tick()
-      await this.until(() => machine.subscription !== null)
+      await this.until(() => {
+        telemetryAssert.notEqual(machine.state, 'STOPPED', 'Initial telemetry Get must be accepted')
+        return machine.subscription !== null
+      })
     }
     const answered = () => this.pushesAnswered()
     const before = answered()
@@ -2219,7 +2283,7 @@ class PublicTelemetryRound {
         this.clock.jump(this.clock.time + 30000)
       if (watchdog && this.clock.pending.has(watchdog)) this.clock.deliver(watchdog)
       await this.until(() => machine.state === 'BACKOFF' && machine.timer !== null)
-      if (['S03', 'S12', 'S19b', 'S19f'].includes(this.held?.boundary)) {
+      if (this.held?.boundary === 'S12' || SASL_BOUNDARIES.has(this.held?.boundary)) {
         this.deferredReplacement = true
         return
       }
@@ -2229,7 +2293,8 @@ class PublicTelemetryRound {
     if (name === RELEASE_ACTIONS[2] || name === RELEASE_ACTIONS[3]) {
       if (!this.closePromise)
         this.closePromise = this.beginClose(this.closeOptions(name === RELEASE_ACTIONS[2] ? 20 : 0))
-      return lateArrival ? this.until(() => this.held.gate.settle != null) : this.settleClose()
+      this.deferredClose = true
+      return lateArrival ? this.until(() => this.held.gate.settle != null) : undefined
     }
     if (name === RELEASE_ACTIONS[4]) {
       this.clock.jump(machine.closing ? machine.closing.deadline + 1 : this.clock.time + 30001)
@@ -2243,7 +2308,7 @@ class PublicTelemetryRound {
       await this.settleClose()
       if (this.held?.gate instanceof DialGate) this.wire.up(this.node)
       await this.client.connect()
-      if (['S03', 'S12', 'S19b', 'S19f'].includes(this.held?.boundary)) {
+      if (this.held?.boundary === 'S12' || SASL_BOUNDARIES.has(this.held?.boundary)) {
         this.deferredReplacement = true
         return
       }
@@ -2266,6 +2331,7 @@ class PublicTelemetryRound {
       return
     }
     if (this.protocol === 'manual') throw new Error('Manual runs have no rejoin')
+    await this.until(() => this.core.handlers.length === 1)
     const group = this.runner.consumerGroup
     const token = group.ownership.token()
     await this.runner.handleRebalanceError({
@@ -2283,7 +2349,9 @@ class PublicTelemetryRound {
   async prepareCoreProof() {
     await this.until(() => this.core.handlers.length === 1)
     telemetryAssert.deepStrictEqual(this.core.handlers, ['0'])
-    this.core.token = this.runner.consumerGroup.ownership.token()
+    this.core.ownership = this.runner.consumerGroup.ownership
+    this.core.token = this.core.ownership.token()
+    if (this.protocol !== 'manual') await this.until(() => this.core.joins.length > 0)
     this.core.joinsBefore = this.core.joins.length
     if (this.membership === 'no-group') {
       const result = await telemetryOutcome(() =>
@@ -2353,7 +2421,12 @@ class PublicTelemetryRound {
       if (['crash', 'rejoin'].includes(event) && this.protocol !== 'manual') {
         telemetryAssert.ok(this.core.joins.length > this.core.joinsBefore, 'owed rejoin completed')
         telemetryAssert.equal(this.runner.running, true)
-        telemetryAssert.notEqual(this.runner.consumerGroup.ownership.token(), this.core.token)
+        const ownership = this.runner.consumerGroup.ownership
+        telemetryAssert.ok(
+          ownership !== this.core.ownership || ownership.token() !== this.core.token,
+          'replacement membership must have a new issuing owner or token'
+        )
+        telemetryAssert.equal(ownership.refusal(ownership.token()), null)
       }
     }
   }
@@ -2604,6 +2677,10 @@ class PublicTelemetryRound {
     if (gate.settle) gate.release(value)
     if (this.retirementAnswer?.settle) this.retirementAnswer.release()
     await this.wait(completion)
+    if (this.deferredClose) {
+      this.deferredClose = false
+      await this.settleClose()
+    }
   }
 
   /**
@@ -2784,7 +2861,7 @@ class PublicTelemetryRound {
           return outcome === 'reject' ? Promise.reject(identity) : identity
         }
     )
-    const actual = await telemetryOutcome(run)
+    const actual = await this.wait(() => telemetryOutcome(run))
     telemetryAssert.equal(log.length, 1)
     return { actual, expected: originalOutcome, log }
   }
@@ -2858,12 +2935,13 @@ class PublicTelemetryRound {
 const crashRound = async (round) => {
   if (round.kind === 'shareConsumer')
     return round.runner.current.crash(
-      Object.assign(new Error('telemetry crash'), { retriable: true, retryTime: 5 })
+      Object.assign(new Error('telemetry crash'), { retriable: false })
     )
+  const crashes = round.core.crashes
   round.runner.fetch = async () => {
     throw Object.assign(new Error('telemetry crash'), { retriable: false })
   }
-  return round.until(() => !round.machine.connected, 4000)
+  return round.until(() => !round.machine.connected && round.core.crashes > crashes, 4000)
 }
 
 /**
@@ -2892,6 +2970,7 @@ const runTelemetryLifecycleCell = async (cell) => {
       const before = round.capture()
       telemetryAssert.notEqual(round.savedOrdinaryGuard(), null)
       telemetryAssert.equal(round.savedClosingGuard(), null)
+      await round.until(() => !round.cluster.isConnected())
       if (by('deadline')) {
         round.clock.jump(before.closeDeadline)
         telemetryAssert.notEqual(round.savedClosingGuard(), null)
