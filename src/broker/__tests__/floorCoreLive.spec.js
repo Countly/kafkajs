@@ -57,7 +57,6 @@ const {
   withTimeout,
 } = require('../../consumer/__tests__/fixtures/liveScenario')
 const net = require('net')
-const { isDeepStrictEqual } = require('util')
 const { KafkaJSShareGroupsNotSupportedError } = require('../../../index')
 const { createResourceProbe } = require('../../../testHelpers/resourceProbe')
 const { FrameLog } = require('../../producer/__tests__/fixtures/liveWire')
@@ -1523,9 +1522,33 @@ const shareFloorResources = (snapshot) => ({
 })
 
 /**
+ * Compares exactly the five counts written into F23 evidence. Socket ownership comes from the
+ * case ledger; unrelated handles in the process-wide inventory are not case resources. Every
+ * Timeout still counts, so a retained product timer cannot be excluded as harness activity.
+ * @param {object} baseline the measurement before the client exists
+ * @param {object} after the measurement after disconnect
+ * @returns {void}
+ * @throws {Error} when the measured resources have not returned to baseline
+ */
+const assertShareFloorResources = (baseline, after) => {
+  const beforeResources = shareFloorResources(baseline)
+  const afterResources = shareFloorResources(after)
+  const differing = Object.keys(beforeResources).filter(
+    (key) => beforeResources[key] !== afterResources[key]
+  )
+  if (differing.length) {
+    // Name the differences first: pollTolerating truncates its summary but retains this cause.
+    throw new Error(
+      `Resources differ (${differing.join(', ')}): ${JSON.stringify(beforeResources)} -> ${JSON.stringify(afterResources)}`
+    )
+  }
+}
+
+/**
  * The share refusal of the floor: a public share client connects once to the 4.0.2 broker, which
  * does not advertise the share APIs, and must be refused before it writes any share frame. It
- * creates no topic, group or record, and leaves every measured resource where it found it.
+ * creates no topic, group or record, and returns the five resource counts in its evidence to
+ * their baseline.
  */
 class FloorShareCase {
   /** Builds a case with fresh names; nothing is created until `run`. */
@@ -1625,7 +1648,7 @@ class FloorShareCase {
   }
 
   /**
-   * Waits for the sockets and event-loop resources to be back at the baseline.
+   * Waits for case sockets, timers, listeners and pending work to return to baseline.
    * @param {AbortSignal} scope the case scope
    * @returns {Promise<void>}
    * @throws {Error} naming the last measurement when they are not back at the deadline
@@ -1636,18 +1659,7 @@ class FloorShareCase {
       8000,
       async () => {
         this.after = await this.probe.snapshot()
-        const same = ['sockets', 'queueDepth', 'ledgerSize', 'listeners', 'activeResources'].every(
-          (key) =>
-            isDeepStrictEqual(
-              key === 'sockets' ? this.baseline.sockets.open : this.baseline[key],
-              key === 'sockets' ? this.after.sockets.open : this.after[key]
-            )
-        )
-        if (!same) {
-          throw new Error(
-            `Resources differ: ${JSON.stringify(shareFloorResources(this.baseline))} -> ${JSON.stringify(shareFloorResources(this.after))}`
-          )
-        }
+        assertShareFloorResources(this.baseline, this.after)
         return true
       },
       { delayMs: 50, label: 'The resources returning to baseline' }
@@ -1703,6 +1715,72 @@ class FloorShareCase {
     })
   }
 }
+
+describeFakeLane('Floor share resource comparison', () => {
+  /** @returns {object} the five measured resource counts, plus raw process/socket history */
+  const measurement = () => ({
+    sockets: { created: 0, destroyed: 0, open: 0 },
+    activeResources: { PipeWrap: 2, Timeout: 7 },
+    listeners: { process: 0 },
+    queueDepth: 0,
+    ledgerSize: 0,
+  })
+
+  test('accepts equal evidence projections despite unrelated process and socket history changes', () => {
+    const before = measurement()
+    const after = {
+      ...measurement(),
+      sockets: { created: 1, destroyed: 1, open: 0 },
+      activeResources: { Timeout: 7, PipeWrap: 1 },
+    }
+
+    expect(shareFloorResources(after)).toEqual(shareFloorResources(before))
+    expect(() => assertShareFloorResources(before, after)).not.toThrow()
+  })
+
+  test('treats an absent Timeout entry as the measured zero printed in evidence', () => {
+    const before = { ...measurement(), activeResources: {} }
+    const after = { ...measurement(), activeResources: { Timeout: 0 } }
+
+    expect(() => assertShareFloorResources(before, after)).not.toThrow()
+  })
+
+  test.each([
+    ['openSockets', { sockets: { created: 1, destroyed: 0, open: 1 } }],
+    ['timers', { activeResources: { PipeWrap: 2, Timeout: 8 } }],
+    ['listeners', { listeners: { process: 1 } }],
+    ['queueDepth', { queueDepth: 1 }],
+    ['ledgerSize', { ledgerSize: 1 }],
+  ])('rejects a retained %s and names it before the full compared projections', (field, change) => {
+    const before = measurement()
+    const after = { ...measurement(), ...change }
+
+    expect(() => assertShareFloorResources(before, after)).toThrow(
+      `Resources differ (${field}): ${JSON.stringify(shareFloorResources(before))} -> ${JSON.stringify(shareFloorResources(after))}`
+    )
+  })
+
+  test('still detects a real retained timer through the resource probe', async () => {
+    const probe = createResourceProbe({
+      sockets: () => ({ created: 0, destroyed: 0 }),
+      activeResources: true,
+      emitters: { process },
+      queueDepth: () => 0,
+      ledgerSize: () => 0,
+    })
+    const before = await probe.snapshot()
+    const timer = setTimeout(() => {}, 60000)
+    try {
+      const after = await probe.snapshot()
+      expect(shareFloorResources(after).timers).toBe(shareFloorResources(before).timers + 1)
+      expect(() => assertShareFloorResources(before, after)).toThrow('Resources differ (timers)')
+    } finally {
+      clearTimeout(timer)
+    }
+    const cleared = await probe.snapshot()
+    expect(() => assertShareFloorResources(before, cleared)).not.toThrow()
+  })
+})
 
 describeFloor('Share groups on the broker floor', () => {
   beforeAll(
