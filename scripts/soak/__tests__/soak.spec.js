@@ -4187,7 +4187,15 @@ describe('Share soak owner', () => {
   })
 
   describe('the combined verdict', () => {
-    const complete = (mutate, now = 967000) => {
+    /**
+     * Supplies complete original cycle, timing and final evidence to the real completion decision.
+     * @param {Function} [mutate] optional evidence corruption before the decision
+     * @param {number} [now=967000] original monotonic decision time
+     * @param {object} [resources=settled] resource verdict from the selected screen
+     * @returns {{ verdict: object, rows: object[] }} actual verdict and archived rows
+     * @throws {Error} when the original completion decision or evidence sink throws
+     */
+    const complete = (mutate, now = 967000, resources = settled) => {
       const { owner, rows } = build({ clock: { now: () => now } })
       for (let cycle = 0; cycle < 30; cycle++) {
         const facts = cycleFacts(cycle)
@@ -4213,7 +4221,7 @@ describe('Share soak owner', () => {
       owner.baseline = quietShare()
       owner.teardown = quietShare()
       mutate?.(owner, rows)
-      return { verdict: owner.complete(settled), rows }
+      return { verdict: owner.complete(resources), rows }
     }
 
     test('passes only when every count, identity and final proof holds', () => {
@@ -4221,6 +4229,47 @@ describe('Share soak owner', () => {
       expect(verdict.ok).toBe(true)
       expect(rows.filter(({ event }) => event === 'case-complete')).toHaveLength(1)
     })
+
+    test.each(['clean', 'destroyed-socket listener', 'dropped inventory'])(
+      'the real completion decision handles a %s resource verdict with complete cycle evidence',
+      (damage) => {
+        const baseline = quietShare()
+        const teardown = quietShare()
+        if (damage === 'destroyed-socket listener') teardown.namedListeners['socket1:retained'] = 1
+        if (damage === 'dropped inventory')
+          teardown.timerOwners = {
+            beforeCollection: { rows: [], dropped: 1 },
+            afterCollection: { rows: [], dropped: 1 },
+          }
+        expect(teardown.activeResources).toEqual(baseline.activeResources)
+        expect(teardown.sockets.open).toBe(0)
+        const violations = []
+        ShareSoakScreen.quiet(teardown, baseline, 'teardown', violations)
+        const resources = { ok: violations.length === 0, violations, measured: {} }
+        const { verdict, rows } = complete(
+          (owner) => {
+            owner.baseline = baseline
+            owner.teardown = teardown
+          },
+          967000,
+          resources
+        )
+        expect(verdict.resources).toBe(resources)
+        expect(rows.filter(({ event }) => event === 'soak-cycle')).toHaveLength(30)
+        expect(verdict.ok).toBe(damage === 'clean')
+        expect(verdict.violations).toEqual(violations)
+        const receipts = rows.filter(({ event }) => event === 'case-complete')
+        if (damage === 'clean') {
+          expect(violations).toEqual([])
+          expect(receipts).toHaveLength(1)
+          expect(receipts[0]).toMatchObject({ status: 'passed', tainted: false })
+          expect(receipts[0].oracles.log.actual).toHaveLength(1800)
+        } else {
+          expect(violations).toContain('teardown: resources differ or a source is absent')
+          expect(receipts).toEqual([])
+        }
+      }
+    )
 
     test('accepts exactly the unallocated margin with original anchored deadlines', () => {
       const { verdict, rows } = complete((o) => {

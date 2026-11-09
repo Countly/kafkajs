@@ -6,7 +6,8 @@ const { LiveRun } = require('../../../src/producer/__tests__/fixtures/bounded')
 /** Replays source observations through the original timestamp owner and serializing recorder. */
 class AcceptanceRecording {
   /**
-   * @param {boolean} short selects the unchanged declared phase spans and sample cadence
+   * Starts with an original clock origin and a serializing evidence sink.
+   * @param {boolean} [short=true] selects the declared short phase spans and sample cadence
    */
   constructor(short = true) {
     this.now = 7654321
@@ -53,6 +54,7 @@ class AcceptanceRecording {
    * @param {number} heap measured retained bytes
    * @param {object} [fields] phase and original periodic times
    * @returns {Promise<object>} original complete snapshot
+   * @throws {Error} when the source read or archive fails
    */
   async observe(kind, elapsed, heap, fields = {}) {
     this.elapsed = elapsed
@@ -75,6 +77,7 @@ class AcceptanceRecording {
    * @param {boolean} [options.irregular] irregular translated elapsed observations
    * @param {number} [options.lastByte] extra byte at the last quiet point
    * @returns {Promise<void>} all observations archived
+   * @throws {Error} when an observation or archive fails
    */
   async record({ rate, firstOnly = false, irregular = false, lastByte = 0 }) {
     const mode = this.owner.short ? 'short' : 'full'
@@ -104,6 +107,7 @@ class AcceptanceRecording {
   /**
    * Runs the selected owner's unchanged judge and archives its original verdict.
    * @returns {object} original resource verdict
+   * @throws {Error} when the judge or evidence sink fails
    */
   verdict() {
     const verdict = this.owner.soak().judge(this.run)
@@ -114,6 +118,7 @@ class AcceptanceRecording {
   /**
    * Validates serialized resource rows through the authenticated stamp/scenario entrypoint.
    * @returns {string[]} independently recomputed problems
+   * @throws {Error} when evidence serialization fails
    */
   verify() {
     const verified = { tree: 'a'.repeat(40), node: process.version, brokerVersion: '4.3.1' }
