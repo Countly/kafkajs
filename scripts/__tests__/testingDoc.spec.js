@@ -1,6 +1,7 @@
 const fs = require('fs')
 const path = require('path')
 const { scripts } = require('../../package.json')
+const { integrationPlan } = require('../ci/integrationPlan')
 
 const root = path.join(__dirname, '..', '..')
 const read = (...parts) => fs.readFileSync(path.join(root, ...parts), 'utf8')
@@ -55,10 +56,14 @@ describe('docs/Testing.md', () => {
       captures(text, /run: (npm run [^\s"$]+|\.\/scripts\/[^\s"$]+)/g)
     )
     // Matrix rows are `group: broker` or `group: oauthbearer, …`; the weekly matrix is a list.
-    const groups = workflows.flatMap((text) => [
-      ...captures(text, /\bgroup: (\w+)[ ,}]/g),
-      ...captures(text, /\bgroup: \[([\w, ]+)\]/g).flatMap((list) => list.split(/, */)),
-    ])
+    const groups = integrationPlan('pull_request')
+      .include.map(({ group }) => group)
+      .concat(
+        workflows.flatMap((text) => [
+          ...captures(text, /\bgroup: (\w+)[ ,}]/g),
+          ...captures(text, /\bgroup: \[([\w, ]+)\]/g).flatMap((list) => list.split(/, */)),
+        ])
+      )
 
     expect(commands).toEqual(
       expect.arrayContaining(['npm run lint', 'npm run test:unit', './scripts/testWithKafka.sh'])
@@ -71,7 +76,11 @@ describe('docs/Testing.md', () => {
 
   it('states the Node and Kafka matrices of the workflows', () => {
     expect(workflows[0]).toContain('matrix: { node: [22, 24, 26] }')
-    expect(workflows[0]).toContain('{ node: 26, kafka: 4.3.1, group: others }')
+    expect(integrationPlan('pull_request').include).toContainEqual({
+      node: 26,
+      kafka: '4.3.1',
+      group: 'others',
+    })
     expect(workflows[1]).toContain("kafka: ['4.1.2', '4.2.2', '4.3.1']")
     expect(workflows[1]).toContain("- { node: 26, kafka: '4.2.2' }")
     expect(workflows[1]).toContain("cron: '0 3 * * 1'")
