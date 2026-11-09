@@ -1899,16 +1899,25 @@ class CapabilityCase {
   }
 
   /**
-   * Overlaps independent group and topic removal, retaining both outcomes before the proof.
+   * Deletes the group before its topic: share-state deletion still needs the topic metadata.
+   * Attempts both cleanups within the existing scope and retains their failures for the caller.
    * @param {AbortSignal} signal The cleanup scope.
    * @returns {Promise<void>} Once both deletion operations have settled.
+   * @throws {AggregateError} When either deletion fails; both original failures are retained.
    */
   async deleteFixtures(signal) {
     const firstStep = this.cleanupSteps.length
-    const results = await Promise.allSettled([
-      this.cleanupStep('delete group', () => this.deleteGroup(signal, this.group)),
-      this.cleanupStep('delete topic', () => this.deleteTopic(signal)),
-    ])
+    const failures = []
+    for (const [step, work] of [
+      ['delete group', () => this.deleteGroup(signal, this.group)],
+      ['delete topic', () => this.deleteTopic(signal)],
+    ]) {
+      try {
+        await this.cleanupStep(step, work)
+      } catch (error) {
+        failures.push(error)
+      }
+    }
     const steps = this.cleanupSteps.slice(firstStep)
     const group = steps.find(({ step }) => step === 'delete group')
     const topic = steps.find(({ step }) => step === 'delete topic')
@@ -1920,9 +1929,6 @@ class CapabilityCase {
       overlapped:
         Math.max(group.startedAt, topic.startedAt) < Math.min(group.endedAt, topic.endedAt),
     })
-    const failures = results
-      .filter(({ status }) => status === 'rejected')
-      .map(({ reason }) => reason)
     if (failures.length) throw new AggregateError(failures, 'Fixture deletion failed')
   }
 
@@ -2150,7 +2156,7 @@ describe('capability group deletion evidence', () => {
   })
 
   it.each([100, 12])(
-    'starts subsequent fixture cleanup at 10 ms with a pending describe and %i ms remaining',
+    'starts subsequent fixture cleanup at 11 ms with a pending describe and %i ms remaining',
     async (allowance) => {
       const { state, rows, deletion, lookup, route } = harness(async () => ({
         results: [{ groupId: 'owned-group', errorCode: 0 }],
@@ -2167,8 +2173,8 @@ describe('capability group deletion evidence', () => {
           signal.throwIfAborted()
         })
       })
-      await jest.advanceTimersByTimeAsync(10)
-      expect(nextAt).toBe(10)
+      await jest.advanceTimersByTimeAsync(11)
+      expect(nextAt).toBe(11)
       expect(result).toBeUndefined()
       await work
       expect(state.cleanupSteps.map(({ step }) => step)).toEqual([
@@ -2362,12 +2368,77 @@ describe('capability group deletion evidence', () => {
     expect(liveRun.tainted).toBe(false)
   })
 
-  it('writes successful attempts, coordinator lookups, pre-state and topic overlap', async () => {
+  it('keeps topic metadata until the share group deletion has settled', async () => {
+    let complete
+    const { state, rows } = harness(() => new Promise((resolve) => (complete = resolve)))
+    const start = performance.now()
+    const work = state.deleteFixtures(NEVER)
+    await jest.advanceTimersByTimeAsync(1)
+    expect(state.deleteTopic).not.toHaveBeenCalled()
+    complete({ results: [{ groupId: state.group, errorCode: 0 }] })
+    await jest.advanceTimersByTimeAsync(0)
+    expect(state.deleteTopic).toHaveBeenCalledTimes(1)
+    expect(state.cleanupSteps[1].startedAt).toBe(start + 1)
+    await jest.advanceTimersByTimeAsync(10)
+    await expect(work).resolves.toBeUndefined()
+    expect(rows('fixture-deletion-overlap')).toEqual([
+      expect.objectContaining({ overlapped: false }),
+    ])
+    expect(jest.getTimerCount()).toBe(0)
+    expect(liveRun.tainted).toBe(false)
+  })
+
+  it('keeps the topic through a nonempty-group retry under the original poll bound', async () => {
+    let attempt = 0
+    const { state } = harness(async () => ({
+      results: [{ groupId: 'owned-group', errorCode: ++attempt === 1 ? 68 : 0 }],
+    }))
+    const start = performance.now()
+    const work = state.deleteFixtures(NEVER)
+    await jest.advanceTimersByTimeAsync(51)
+    expect(state.deleteTopic).not.toHaveBeenCalled()
+    await jest.advanceTimersByTimeAsync(1)
+    expect(state.deleteTopic).toHaveBeenCalledTimes(1)
+    expect(state.cleanupSteps[1].startedAt).toBe(start + 52)
+    await jest.advanceTimersByTimeAsync(10)
+    await expect(work).resolves.toBeUndefined()
+    expect(state.admin.deleteGroups).toHaveBeenCalledTimes(2)
+    expect(jest.getTimerCount()).toBe(0)
+    expect(liveRun.tainted).toBe(false)
+  })
+
+  it('still attempts topic cleanup after group failure and retains both original failures', async () => {
+    const groupError = createErrorFromCode(30)
+    const topicError = new Error('Topic deletion refused')
+    const { state, rows } = harness(async () => {
+      throw groupError
+    })
+    state.deleteTopic.mockRejectedValue(topicError)
+    const start = performance.now()
+    const work = state.deleteFixtures(NEVER).catch((error) => error)
+    await jest.advanceTimersByTimeAsync(0)
+    expect(state.deleteTopic).not.toHaveBeenCalled()
+    await jest.advanceTimersByTimeAsync(1)
+    const failure = await work
+    expect(failure.message).toBe('Fixture deletion failed')
+    expect(failure.errors).toEqual([groupError, topicError])
+    expect(failure.errors[0]).toBe(groupError)
+    expect(failure.errors[1]).toBe(topicError)
+    expect(state.deleteTopic).toHaveBeenCalledTimes(1)
+    expect(state.cleanupSteps[1].startedAt).toBe(start + 1)
+    expect(rows('fixture-deletion-overlap')).toEqual([
+      expect.objectContaining({ overlapped: false }),
+    ])
+    expect(jest.getTimerCount()).toBe(0)
+    expect(liveRun.tainted).toBe(false)
+  })
+
+  it('writes successful attempts, coordinator lookups, pre-state and ordered topic deletion', async () => {
     const { state, rows, deletion, lookup, route } = harness(async () => ({
       results: [{ groupId: 'owned-group', errorCode: 0 }],
     }))
     const work = state.deleteFixtures(NEVER)
-    await jest.advanceTimersByTimeAsync(10)
+    await jest.advanceTimersByTimeAsync(11)
     await work
     expect(rows('group-deletion-attempt')).toEqual(
       expect.arrayContaining([
@@ -2402,7 +2473,7 @@ describe('capability group deletion evidence', () => {
       expect(row.endedAt).toBeGreaterThanOrEqual(row.startedAt)
     }
     expect(rows('fixture-deletion-overlap')).toEqual([
-      expect.objectContaining({ overlapped: true }),
+      expect.objectContaining({ overlapped: false }),
     ])
     expect(Broker.prototype.deleteGroups).toBe(deletion)
     expect(Broker.prototype.findGroupCoordinator).toBe(lookup)
@@ -2549,7 +2620,7 @@ describe('capability group deletion evidence', () => {
     )
     expect(state.admin.describeShareGroups).toHaveBeenCalledTimes(1)
     expect(state.admin.describeShareGroups.mock.calls[0][1].apiTimeout).toBeLessThanOrEqual(20)
-    expect(rows('fixture-deletion-overlap')[0].overlapped).toBe(true)
+    expect(rows('fixture-deletion-overlap')[0].overlapped).toBe(false)
     expect(liveRun.tainted).toBe(true)
     expect(Broker.prototype.deleteGroups).toBe(deletion)
     expect(Broker.prototype.findGroupCoordinator).toBe(lookup)
