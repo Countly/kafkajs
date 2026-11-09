@@ -4,6 +4,7 @@ const net = require('net')
 const path = require('path')
 const zlib = require('zlib')
 const { spawn } = require('child_process')
+const { performance } = require('perf_hooks')
 const FLEXIBLE_FROM = require('../src/protocol/flexibleVersions')
 
 const NODES = Object.freeze(['1', '2', '3'])
@@ -172,10 +173,17 @@ const checkedResource = (answer, name) => {
  * @param {object} admin completed configuration-resource admin API
  * @param {{name:string,entries:Object<string,string>}} config exact resource values
  * @param {function():Promise<void>} work lazy body after successful readback
- * @returns {Promise<void>} after work and deletion complete
+ * @param {{now?:function():number}} [options] monotonic receipt clock
+ * @returns {Promise<object>} readback and verified deletion receipt, after work completes
  * @throws {Error|AggregateError} setup, work or cleanup failure
  */
-const withTelemetryResource = async (admin, { name, entries }, work) => {
+const withTelemetryResource = async (
+  admin,
+  { name, entries },
+  work,
+  { now = () => performance.now() } = {}
+) => {
+  const receipt = { name, entries: { ...entries } }
   const names = Object.keys(entries)
   const listed = () => admin.listConfigResources({ resourceTypes: [16], timeout: 3000 })
   const has = (answer) => answer.resources.some((r) => r.type === 16 && r.name === name)
@@ -209,6 +217,8 @@ const withTelemetryResource = async (admin, { name, entries }, work) => {
     const actual = Object.fromEntries(read.configEntries.map((e) => [e.configName, e.configValue]))
     if (names.some((key) => actual[key] !== entries[key]) || !has(await listed()))
       throw new Error('Client metrics resource readback mismatch')
+    receipt.readback = read
+    receipt.createdAt = now()
     await work()
   } catch (error) {
     primary = error
@@ -217,8 +227,13 @@ const withTelemetryResource = async (admin, { name, entries }, work) => {
   let cleanup
   let cleanupFailed = false
   try {
-    checkedResource(await alter(1), name)
-    if (has(await listed())) throw new Error('Client metrics resource deletion not observed')
+    const deletion = (receipt.deletion = { startedAt: now() })
+    deletion.response = await alter(1)
+    deletion.responseAt = now()
+    checkedResource(deletion.response, name)
+    deletion.listing = await listed()
+    deletion.listedAt = now()
+    if (has(deletion.listing)) throw new Error('Client metrics resource deletion not observed')
   } catch (error) {
     cleanup = error
     cleanupFailed = true
@@ -227,6 +242,7 @@ const withTelemetryResource = async (admin, { name, entries }, work) => {
     throw new AggregateError([primary, cleanup], 'Telemetry resource work and cleanup failed')
   if (failed) throw primary
   if (cleanupFailed) throw cleanup
+  return receipt
 }
 
 /**

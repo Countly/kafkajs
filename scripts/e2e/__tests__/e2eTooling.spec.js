@@ -2248,3 +2248,166 @@ describe('quiet-window resource identities', () => {
     expect(verify(change)).toThrow(message)
   })
 })
+
+describe('subscription deletion final telemetry outcome', () => {
+  const { assertStreamAccounted } = require('../telemetry/evidence')
+  const uuid = '11223344-5566-7788-9900-aabbccddeeff'
+  const fixture = () => {
+    const request = (apiKey, requestKey, writeAt, responseAt, fields) => ({
+      type: 'request',
+      apiKey,
+      apiVersion: 0,
+      requestKey,
+      writeAt,
+      socketId: 2,
+      node: '1',
+      uuid,
+      clientId: 'candidate',
+      ...fields,
+      response: { errorCode: 0, responseAt, ...fields.response },
+    })
+    const entries = {
+      metrics: 'com.example.',
+      'interval.ms': '1000',
+      match: 'client_id=^candidate$',
+    }
+    const resource = { resourceType: 16, resourceName: 'subscription', errorCode: 0 }
+    return {
+      transcript: {
+        records: [
+          request(71, 'r1', 10, 11, {
+            response: {
+              uuid,
+              subscriptionId: -7,
+              pushIntervalMs: 1000,
+              requestedMetrics: ['com.example.'],
+            },
+          }),
+          request(72, 'r2', 1011, 1012, { subscriptionId: -7, terminating: false }),
+          request(72, 'r3', 1201, 1202, {
+            subscriptionId: -7,
+            terminating: true,
+            response: { errorCode: 117 },
+          }),
+        ],
+        sockets: [{ id: 2, closedAt: 1204 }],
+        closures: [{ at: 1200, end: 1203, pending: [] }],
+      },
+      receipt: {
+        name: 'subscription',
+        entries,
+        createdAt: 1,
+        readback: {
+          ...resource,
+          configEntries: Object.entries(entries).map(([configName, configValue]) => ({
+            configName,
+            configValue,
+          })),
+        },
+        deletion: {
+          startedAt: 1100,
+          responseAt: 1101,
+          response: { resources: [resource] },
+          listedAt: 1102,
+          listing: { resources: [] },
+        },
+      },
+    }
+  }
+  const verify = ({ transcript, receipt }) =>
+    assertStreamAccounted(
+      { producer: transcript },
+      { errors: { producer: [117] } },
+      { subscriptionDeletions: { producer: receipt } }
+    )
+  test('qualifies only the current subscription final after verified resource deletion', () => {
+    const { transcript, receipt } = fixture()
+    expect(() =>
+      assertStreamAccounted(
+        { producer: transcript },
+        {},
+        {
+          subscriptionDeletions: { producer: receipt },
+        }
+      )
+    ).not.toThrow()
+  })
+  test.each([
+    [
+      'missing deletion receipt',
+      (f) => {
+        delete f.receipt
+      },
+    ],
+    [
+      'failed deletion',
+      (f) => {
+        f.receipt.deletion.response.resources[0].errorCode = 7
+      },
+    ],
+    [
+      'resource still listed',
+      (f) => {
+        f.receipt.deletion.listing.resources.push({ type: 16, name: 'subscription' })
+      },
+    ],
+    [
+      'deletion after close',
+      (f) => {
+        f.receipt.deletion.listedAt = 1201
+      },
+    ],
+    [
+      'foreign readback',
+      (f) => {
+        f.receipt.readback.resourceName = 'foreign'
+      },
+    ],
+    [
+      'foreign subscription',
+      (f) => {
+        f.transcript.records[2].subscriptionId = -8
+      },
+    ],
+    [
+      'foreign UUID',
+      (f) => {
+        f.transcript.records[2].uuid = '22334455-6677-8899-0011-aabbccddeeff'
+      },
+    ],
+    [
+      'foreign socket',
+      (f) => {
+        f.transcript.records[2].socketId = 3
+      },
+    ],
+    [
+      'outside close boundary',
+      (f) => {
+        f.transcript.records[2].writeAt = 1199
+      },
+    ],
+    [
+      'no successful preceding Push',
+      (f) => {
+        f.transcript.records.splice(1, 1)
+      },
+    ],
+    [
+      'refresh after final',
+      (f) => {
+        f.transcript.records.push({ ...f.transcript.records[0], requestKey: 'r4', writeAt: 1203 })
+      },
+    ],
+    [
+      'duplicate final',
+      (f) => {
+        f.transcript.records.push({ ...f.transcript.records[2], requestKey: 'r4' })
+      },
+    ],
+  ])('rejects %s despite an owner-wide 117 allowance', (_name, mutate) => {
+    const value = fixture()
+    mutate(value)
+    expect(() => verify(value)).toThrow('Unqualified final subscription error')
+  })
+})

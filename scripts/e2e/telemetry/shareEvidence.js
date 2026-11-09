@@ -123,6 +123,60 @@ const confirmedDecisions = (frames, group) =>
   })
 
 /**
+ * Joins the holder's acquisition member to its single successful final acknowledgement.
+ * A final share session releases undecided locks; it does not acknowledge those offsets.
+ * @param {object[]} frames original holder exchanges
+ * @param {string} group owning group
+ * @param {string} topicId independently created topic
+ * @returns {object} final raw exchange, after all successful acquisitions
+ * @throws {Error} for missing, duplicate, foreign, failed or non-final acknowledgement
+ */
+const finalAcknowledgement = (frames, group, topicId) => {
+  const requests = frames.map((frame) => {
+    const bytes = Buffer.from(frame.requestHex, 'hex')
+    const header = readRequestHeader(bytes)
+    assert.equal(header.apiVersion, 2)
+    assert([78, 79].includes(header.apiKey))
+    const request = (header.apiKey === 78 ? fetch : acknowledge).readRequest(
+      bytes.subarray(header.byteLength)
+    )
+    assert.equal(request.groupId, group, 'Foreign share final group')
+    return { frame, header, request }
+  })
+  const finals = requests.filter((r) => r.request.shareSessionEpoch === -1)
+  assert.equal(finals.length, 1, 'Missing or duplicate share final acknowledgement')
+  const [final] = finals
+  assert.equal(final, requests.at(-1), 'Share exchange after final acknowledgement')
+  assert.equal(final.header.apiKey, 79, 'Share final must be an acknowledgement')
+  assert.equal(final.request.isRenewAck, false)
+  assert(final.request.memberId, 'Missing share final member')
+  assert(final.frame.responseHex, 'Missing share final response')
+  const bytes = Buffer.from(final.frame.responseHex, 'hex')
+  assert.equal(bytes.readInt32BE(4), final.header.correlationId)
+  const response = acknowledgementResponse(79, bytes)
+  assert.equal(response.errorCode, 0, 'Failed share final acknowledgement')
+  assert.deepEqual(
+    response.topics.map((t) => [
+      t.topicId,
+      t.partitions.map((p) => [p.partitionIndex, p.acknowledgeErrorCode]),
+    ]),
+    [[topicId, [[0, 0]]]],
+    'Failed or foreign share final partition'
+  )
+  assert.deepEqual(
+    final.request.topics.map((t) => [t.topicId, t.partitions.map((p) => p.partitionIndex)]),
+    [[topicId, [0]]],
+    'Foreign share final request'
+  )
+  assert(Number.isFinite(final.frame.at) && final.frame.responseAt >= final.frame.at)
+  for (const { frame, request } of requests.slice(0, -1)) {
+    assert.equal(request.memberId, final.request.memberId, 'Share final member differs from holder')
+    assert(frame.responseAt <= final.frame.at, 'Share final precedes acquisition response')
+  }
+  return final.frame
+}
+
+/**
  * Retains successful raw acquisition ranges with their topic and partition identities.
  * @param {object[]} frames original same-socket request/response frames
  * @param {string} group owning group
@@ -258,6 +312,7 @@ module.exports = {
   ShareTrace,
   acknowledgementResponse,
   confirmedDecisions,
+  finalAcknowledgement,
   acquisitionStart,
   heldAcquisitions,
 }
