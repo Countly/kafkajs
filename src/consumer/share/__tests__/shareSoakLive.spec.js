@@ -1,6 +1,7 @@
 const { plainTextBrokers } = require('testHelpers')
 const { SHARE_SOAK, ShareCycleOracle, buildShareSoak } = require('../../../../scripts/soak/soak')
 const { caseTimeout, liveCase, liveRun } = require('../../../producer/__tests__/fixtures/bounded')
+const { verifySharePriming } = require('../../../../scripts/evidence/sharePriming')
 const { CleanupStack } = require('../../../producer/__tests__/fixtures/liveProbe')
 
 // Gated: it needs the share-enabled base cluster (docker-compose.yml, three nodes) and runs through
@@ -31,8 +32,8 @@ enabled('share consumer short soak', () => {
         cycles: 30,
         resets: 10,
         budgets: {
-          short: { profileMs: 960000, totalMs: 1020000, watchdogMs: 1020000, lifecycleMs: 1440000 },
-          full: { profileMs: 1920000, totalMs: 1980000, watchdogMs: 1980000, lifecycleMs: 2400000 },
+          short: { profileMs: 960000, totalMs: 2040000, watchdogMs: 2040000, lifecycleMs: 2460000 },
+          full: { profileMs: 1920000, totalMs: 3000000, watchdogMs: 3000000, lifecycleMs: 3420000 },
         },
       })
       if (typeof globalThis.gc !== 'function') {
@@ -70,8 +71,19 @@ enabled('share consumer short soak', () => {
         expect(slot.completedAt).toBeGreaterThanOrEqual(slot.due)
       }
       expect(owner.final.verifier.windowMs).toBe(5000)
-      const cycles = owner.evidence.read().filter(({ event }) => event === 'soak-cycle')
-      const steps = owner.evidence.read().filter(({ event }) => event === 'soak-cycle-step')
+      const rows = owner.evidence.read()
+      expect(verifySharePriming(rows)).toEqual([])
+      expect(owner.priming).toMatchObject({
+        passes: 1,
+        cycles: 30,
+        resets: 10,
+        verifiers: 31,
+        status: 'passed',
+      })
+      const cycles = rows.filter(({ event, scope }) => event === 'soak-cycle' && scope === 'scored')
+      const steps = owner.evidence
+        .read()
+        .filter(({ event, scope }) => event === 'soak-cycle-step' && scope === 'scored')
       for (const cycle of cycles) {
         expect(cycle.verifier.windowMs).toBe(5000)
         expect(steps.filter((row) => row.cycle === cycle.cycle)).toEqual(
@@ -208,7 +220,7 @@ enabled('share consumer short soak', () => {
       const verifiers = [...cycles.map(({ verifier }) => verifier), owner.final.verifier]
       const configuration = owner.evidence
         .read()
-        .find(({ event }) => event === 'soak-configuration')
+        .find(({ event, scope }) => event === 'soak-configuration' && scope === 'scored')
       expect(configuration.config.groupId).toBe(owner.driver.group)
       expect(configuration.config.effective).toHaveLength(3)
       for (const verifier of verifiers) {

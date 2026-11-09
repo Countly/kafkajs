@@ -130,6 +130,7 @@ class AcceptanceRecording {
       wireVersions: {},
       config: {},
       ...row,
+      schema: undefined,
     }))
     return verifyFiles(['share.jsonl'], verified, () =>
       rows.map((row) => JSON.stringify(row)).join('\n')

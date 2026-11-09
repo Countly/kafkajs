@@ -31,12 +31,14 @@
  *                     churn, pause and topic recreation, and a mostly idle 1000-partition
  *                     assignment, judged by an independent log, broker-offset and handler check;
  *                     see `ConsumerChurnRun`
- *   share-consumer    three phases of 640 s (steady, reset, members), ten cycles of 64 s each: a share
+ *   share-consumer    one fixed 960 s first-use pass, then three scored phases of 640 s (steady, reset, members), ten cycles of 64 s each: a share
  *                     group member and a transient second one join and leave every cycle, sixty
  *                     fixed records are delivered and acknowledged, and the reset phase forces one
  *                     session reset per cycle; judged by independent log, broker-position and
  *                     handler checks and a per-phase resource screen; see `ShareSoak`
- *   share-consumer-short  the same three phases of 320 s with cycles of 32 s; takes no --phase-seconds
+ *   share-consumer-short  the same first-use pass, then three scored phases of 320 s with cycles
+ *                     of 32 s; takes no --phase-seconds. Inclusive child bounds are 2040/3000 s;
+ *                     cold guard caps are 2460/3420 s for short/full, respectively.
  * Every phase ends by disconnecting its clients, also when it fails; the readings that must be zero
  * are taken there.
  * `--phase-seconds n` shortens every phase to n seconds: a smoke run of the driver, not of memory.
@@ -145,9 +147,28 @@ const CHURN_SERVICES = Object.freeze(['kafka1', 'kafka2', 'kafka3'])
 const OUTAGE_KINDS = Object.freeze({ stop: 'clean', kill: 'hard' })
 
 /**
- * The declared share soak, fixed before the first run: three phases of ten cycles, sixty records and
- * one slot per cycle, one forced session reset in each cycle of the middle phase. `budgets` is the
- * inclusive allowance of the whole child, natural exit included; no stage borrows from another.
+ * One immutable first-use pass, always short-shaped, before the separate scored workload.
+ * Its final boundary reserve follows successful joined cleanup; no allocation is borrowed.
+ */
+const SHARE_SOAK_PRIMING = Object.freeze({
+  passes: 1,
+  cycles: 30,
+  cyclesPerPhase: 10,
+  resets: 10,
+  slotMs: 32000,
+  phaseMs: 320000,
+  profileMs: 960000,
+  setupMs: 15000,
+  transitionMs: 5000,
+  cleanupMs: 20000,
+  idleWakeMarginMs: 10000,
+  boundaryMs: 10000,
+  totalMs: 1020000,
+})
+
+/**
+ * The scored thirty-cycle workload and inclusive child allocations. First-use work has a separate
+ * allocation and contributes nothing to scored cycles, identities, baselines or heap fits.
  */
 const SHARE_SOAK = Object.freeze({
   shortMs: 960000,
@@ -173,9 +194,10 @@ const SHARE_SOAK = Object.freeze({
       transitionMs: 5000,
       cleanupMs: 20000,
       exitMs: 10000,
-      totalMs: 1020000,
-      watchdogMs: 1020000,
-      lifecycleMs: 1440000,
+      primingMs: SHARE_SOAK_PRIMING.totalMs,
+      totalMs: 2040000,
+      watchdogMs: 2040000,
+      lifecycleMs: 2460000,
     }),
     full: Object.freeze({
       setupMs: 15000,
@@ -183,9 +205,10 @@ const SHARE_SOAK = Object.freeze({
       transitionMs: 5000,
       cleanupMs: 20000,
       exitMs: 10000,
-      totalMs: 1980000,
-      watchdogMs: 1980000,
-      lifecycleMs: 2400000,
+      primingMs: SHARE_SOAK_PRIMING.totalMs,
+      totalMs: 3000000,
+      watchdogMs: 3000000,
+      lifecycleMs: 3420000,
     }),
   }),
   endpointBytes: ENDPOINT_BYTES,
@@ -352,14 +375,17 @@ const instrument = (
     if (originalQueues) originalSockets.push(new WeakRef(socket))
     return socket
   }
-  const kafka = new Kafka({ ...options, socketFactory: counted })
-
-  const { symbol, value: createCluster } = privateOf(kafka, 'createCluster')
-  kafka[symbol] = (...args) => {
-    const cluster = createCluster(...args)
-    clusters.add(new WeakRef(cluster))
-    return cluster
+  const createKafka = (configuration = {}) => {
+    const client = new Kafka({ ...options, ...configuration, socketFactory: counted })
+    const { symbol, value: createCluster } = privateOf(client, 'createCluster')
+    client[symbol] = (...args) => {
+      const cluster = createCluster(...args)
+      clusters.add(new WeakRef(cluster))
+      return cluster
+    }
+    return client
   }
+  const kafka = createKafka()
   const { value: operations } = privateOf(kafka, 'operations')
 
   const openSockets = () => {
@@ -468,7 +494,7 @@ const instrument = (
     openSockets()
   }
 
-  return { kafka, probe, socketFactory: counted, listeners, pruneSockets }
+  return { kafka, createKafka, probe, socketFactory: counted, listeners, pruneSockets }
 }
 
 /**
@@ -2515,7 +2541,7 @@ class ShareSoakScreen {
    * @param {string[]} violations receives a failure for invalid sources, chronology or slope
    * @returns {{ points: object[], bytesPerMinute: number|null }} original points even on failure
    */
-  static quietSlope(run, violations) {
+  static quietSlopeObservations(run, violations) {
     const points = run.phaseEnds.map(({ phase, snapshot }) => ({
       phase,
       heapAtMs: snapshot?.heapAtMs ?? null,
@@ -2538,14 +2564,70 @@ class ShareSoakScreen {
         bytesPerMinute = slope(points.map(({ heapAtMs, heapUsed }) => [heapAtMs / 60000, heapUsed]))
       } catch {}
     }
-    if (
-      bytesPerMinute === null ||
-      !Number.isFinite(bytesPerMinute) ||
-      bytesPerMinute > SHARE_SOAK.quietSlopeBytesPerMinute
-    ) {
+    if (bytesPerMinute === null || !Number.isFinite(bytesPerMinute)) {
       violations.push('phase-end quiet heap slope screen')
     }
     return { points, bytesPerMinute: Number.isFinite(bytesPerMinute) ? bytesPerMinute : null }
+  }
+
+  /**
+   * Applies the scored quiet growth limit to the original elapsed-time fit.
+   * @param {object} run Original quiet observations.
+   * @param {string[]} violations Original failure list.
+   * @returns {object} Original points and measured slope.
+   */
+  static quietSlope(run, violations) {
+    const measured = ShareSoakScreen.quietSlopeObservations(run, violations)
+    if (measured.bytesPerMinute > SHARE_SOAK.quietSlopeBytesPerMinute)
+      violations.push('phase-end quiet heap slope screen')
+    return measured
+  }
+
+  /**
+   * Validates every first-use source and resource while archiving growth measurements separately.
+   * Only growth predicates are measurement-only; invalid readings and missing samples still fail.
+   * @param {object} run Original first-use observations.
+   * @returns {object} Structural verdict with the complete measured scored growth assessment.
+   * @throws {Error} Invalid original regression times.
+   */
+  static priming(run) {
+    const violations = []
+    ShareSoakScreen.quiet(run.baseline, run.baseline, 'baseline', violations)
+    for (const end of run.phaseEnds) {
+      ShareSoakScreen.quiet(end.snapshot, run.baseline, end.phase, violations)
+      ShareSoakScreen.phaseObservations(end.phase, run, violations)
+    }
+    ShareSoakScreen.quiet(run.teardown, run.baseline, 'teardown', violations)
+    ShareSoakScreen.quietSlopeObservations(run, violations)
+    for (const point of [run.baseline, ...run.phaseEnds.map((end) => end.snapshot), run.teardown]) {
+      for (const when of ['beforeCollection', 'afterCollection']) {
+        const owners = point?.timerOwners?.[when]
+        if (
+          !owners ||
+          !Array.isArray(owners.rows) ||
+          owners.dropped !== 0 ||
+          !ShareSoakScreen.same(
+            owners.unattributed,
+            run.baseline?.timerOwners?.[when]?.unattributed
+          )
+        )
+          violations.push('priming: missing or changed timer inventory source')
+      }
+    }
+    if (
+      run.samples.some(
+        (sample) =>
+          !ShareSoakScreen.count(sample.snapshot?.heapUsed) ||
+          !Number.isFinite(sample.phaseMs) ||
+          !Number.isFinite(sample.atMs)
+      )
+    )
+      violations.push('priming: invalid periodic source')
+    return {
+      ok: violations.length === 0,
+      violations,
+      measurementOnly: ShareSoakScreen.evaluate(run),
+    }
   }
 
   /**
@@ -2646,7 +2728,7 @@ class ShareSoakScreen {
    * @returns {{ phase: string, heapSamples: number, endpointBytes: number,
    *   slopeBytesPerMinute: number }|null} the phase's reading, null when it had too few samples
    */
-  static phase(name, run, violations) {
+  static phaseObservations(name, run, violations) {
     const readings = run.samples.filter(
       (sample) => sample.phase === name && sample.phaseMs >= run.warmupMs
     )
@@ -2673,6 +2755,21 @@ class ShareSoakScreen {
     const slopeBytesPerMinute = slope(
       readings.map((sample) => [sample.phaseMs / 60000, sample.snapshot.heapUsed])
     )
+    return { phase: name, heapSamples: heap.length, endpointBytes, slopeBytesPerMinute }
+  }
+
+  /**
+   * Applies the scored growth predicates to the original structural phase measurement.
+   * @param {string} name Original phase.
+   * @param {object} run Original source observations.
+   * @param {string[]} violations Original failure list.
+   * @returns {object|null} Measurement, including failures.
+   * @throws {Error} Invalid original regression times.
+   */
+  static phase(name, run, violations) {
+    const measured = ShareSoakScreen.phaseObservations(name, run, violations)
+    if (!measured) return null
+    const { endpointBytes, slopeBytesPerMinute } = measured
     if (
       endpointBytes > SHARE_SOAK.endpointBytes ||
       slopeBytesPerMinute > SHARE_SOAK.slopeBytesPerMinute
@@ -2680,7 +2777,7 @@ class ShareSoakScreen {
       violations.push(`${name}: retained-heap screen`)
     }
 
-    return { phase: name, heapSamples: heap.length, endpointBytes, slopeBytesPerMinute }
+    return measured
   }
 }
 
@@ -3889,6 +3986,9 @@ class ShareFetchTap {
     this.frameSequence = 0
     this.faults = 0
     this.context = new AsyncLocalStorage()
+    this.operations = new AsyncLocalStorage()
+    this.operationSequence = 0
+    this.archive = null
     this.observers = new Set()
     this.socketObservers = new WeakMap()
   }
@@ -3936,7 +4036,17 @@ class ShareFetchTap {
           frame.responseBytes = incoming.subarray(0, end).toString('base64')
           frame.answeredAt = this.clock.now()
           outstanding.delete(frame.correlationId)
-          if (frame.apiKey === 76 && frame.request.memberEpoch === -1) {
+          this.archive?.({
+            kind: 'response',
+            frame: frame.id,
+            socket: id,
+            generation: id,
+            endpoint,
+            correlationId: frame.correlationId,
+            at: frame.answeredAt,
+            bytes: frame.responseBytes,
+          })
+          if (frame.apiKey === 76 && frame.request?.memberEpoch === -1) {
             let response
             let error
             try {
@@ -3981,7 +4091,16 @@ class ShareFetchTap {
       socket.off('data', receive)
       for (const frame of outstanding.values()) {
         frame.lostAt = this.clock.now()
-        if (frame.apiKey === 76 && frame.request.memberEpoch === -1)
+        this.archive?.({
+          kind: 'lost',
+          frame: frame.id,
+          socket: id,
+          generation: id,
+          endpoint,
+          correlationId: frame.correlationId,
+          at: frame.lostAt,
+        })
+        if (frame.apiKey === 76 && frame.request?.memberEpoch === -1)
           this.leave('leave-lost', frame, frame, {}, frame.lostAt)
       }
       outstanding.clear()
@@ -4042,6 +4161,23 @@ class ShareFetchTap {
         this.leave('leave-write', context, written, {}, written.at)
       }
     }
+    const operation = this.operations.getStore()
+    written ??= { id: ++this.frameSequence, socket, endpoint, ...header, at: this.clock.now() }
+    const codecs = header.apiKey === 0 ? require('./shareProtocol').produceCodecs(frame) : undefined
+    this.archive?.({
+      kind: 'request',
+      frame: written.id,
+      socket,
+      generation: socket,
+      endpoint,
+      ...header,
+      at: written.at,
+      operation: operation?.name ?? 'share-loop',
+      operationId: operation?.id ?? null,
+      role: operation?.role ?? 'share',
+      bytes: frame.toString('base64'),
+      codecs,
+    })
     if (header.apiKey !== 78) return written
     let epoch = null
     try {
@@ -4099,6 +4235,70 @@ class ShareFetchTap {
         ...fields,
       },
       at
+    )
+  }
+
+  /**
+   * Observes a public call without altering its return value, rejection or arguments.
+   * Completed call facts corroborate the encoded request/response inventory, including fallbacks.
+   * @template T
+   * @param {string} role Client role.
+   * @param {string} name Public operation and concrete option shape.
+   * @param {Function} work Original invocation.
+   * @returns {T} Original return value.
+   * @throws {Error} Original synchronous error.
+   */
+  operation(role, name, work) {
+    const context = { role, name, id: ++this.operationSequence }
+    return this.operations.run(context, () => {
+      const record = (status) =>
+        this.archive?.({ kind: 'operation', ...context, at: this.clock.now(), status })
+      record('started')
+      let result
+      try {
+        result = work()
+      } catch (error) {
+        record('failed')
+        throw error
+      }
+      if (result?.then)
+        result
+          .then(
+            () => record('passed'),
+            () => record('failed')
+          )
+          .catch(() => {
+            this.faults++
+          })
+      else record('passed')
+      return result
+    })
+  }
+
+  /**
+   * Copies the frozen public facade and observes calls through its original methods.
+   * @param {string} role Separate client role.
+   * @param {object} client Original public facade.
+   * @returns {object} Facade with unchanged call arguments, receivers and return values.
+   */
+  client(role, client) {
+    return Object.fromEntries(
+      Object.entries(client).map(([name, value]) => [
+        name,
+        typeof value !== 'function'
+          ? value
+          : (...args) => {
+              let operation = name
+              if (name === 'listShareGroupOffsets') operation += args[0]?.topics ? ':named' : ':all'
+              if (name === 'incrementalAlterConfigs') {
+                const operations = args[0]?.resources?.flatMap((r) =>
+                  r.configEntries.map((e) => e.operation)
+                )
+                operation += `:${[...new Set(operations)].sort().join(',')}`
+              }
+              return this.operation(role, operation, () => value.apply(client, args))
+            },
+      ])
     )
   }
 
@@ -4604,8 +4804,17 @@ class ShareSoakDriver {
    * @param {Function} options.socketFactory Counted original socket factory for raw broker ownership.
    * @param {Function} [options.onProgress] Archives cycle steps as they occur, including failures.
    */
-  constructor({ kafka, brokers, shares, tap, ports, socketFactory, onProgress = () => {} }) {
-    Object.assign(this, { kafka, brokers, shares, tap, ports, socketFactory, onProgress })
+  constructor({
+    kafka,
+    brokers,
+    shares,
+    tap,
+    ports,
+    socketFactory,
+    onProgress = () => {},
+    prefix = 'soak-share',
+  }) {
+    Object.assign(this, { kafka, brokers, shares, tap, ports, socketFactory, onProgress, prefix })
     this.admin = null
     this.producer = null
     this.leaders = new Map()
@@ -4625,9 +4834,9 @@ class ShareSoakDriver {
   async prepare(stack, scope) {
     const { bounded } = this.ports.bounded
     const { fixtures } = this.ports
-    const nonce = Date.now().toString(36)
-    this.topic = `soak-share-${nonce}`
-    this.group = `soak-share-group-${nonce}`
+    const nonce = require('node:crypto').randomUUID()
+    this.topic = `${this.prefix}-${nonce}`
+    this.group = `${this.prefix}-group-${nonce}`
     stack.add('prove the share soak cleanup', (signal) => this.proveCleanup(signal))
     stack.add('delete the share soak topic', (signal) => this.deleteTopic(signal))
     stack.add('delete the share soak group', (signal) => this.deleteGroup(signal))
@@ -5352,6 +5561,18 @@ class ShareSoakDriver {
    * @throws {Error} On a read, connect or disconnect failure.
    */
   async rawLog(scope) {
+    return this.tap?.operation
+      ? this.tap.operation('raw', 'readLog', () => this.readRawLog(scope))
+      : this.readRawLog(scope)
+  }
+
+  /**
+   * Joins independent original raw-broker connections, including failure paths.
+   * @param {AbortSignal} scope Original enclosing cutoff.
+   * @returns {Promise<Map<number, object>>} Original cumulative raw log.
+   * @throws {Error} Read or joined disconnect failure.
+   */
+  async readRawLog(scope) {
     const failures = []
     const owned = []
     const open = async ({ host, port }) => {
@@ -5692,6 +5913,7 @@ class ShareSoak {
    * @param {{ now: () => number }} [options.clock] the monotonic clock
    * @param {number} [options.slotMs] one cycle's slot; a spec shortens it
    * @param {object} [options.soak] `Soak` options a spec overrides
+   * @param {Function} options.createPriming Builds the separate fixed first-use scope.
    */
   constructor({
     driver,
@@ -5705,6 +5927,7 @@ class ShareSoak {
     clock = SHARE_CLOCK,
     slotMs,
     soak = {},
+    createPriming,
   }) {
     const mode = short ? 'short' : 'full'
     Object.assign(this, {
@@ -5718,21 +5941,23 @@ class ShareSoak {
       pause,
       clock,
       soakOptions: soak,
+      createPriming,
     })
     this.budget = SHARE_SOAK.budgets[mode]
-    const { totalMs, setupMs, profileMs, transitionMs, cleanupMs, exitMs } = this.budget
+    const { totalMs, primingMs, setupMs, profileMs, transitionMs, cleanupMs, exitMs } = this.budget
     // Only idle-wake overhead may use the unallocated margin; cycle work keeps its fixed cutoff.
-    this.profileMarginMs = totalMs - (setupMs + profileMs + transitionMs + cleanupMs + exitMs)
+    this.profileMarginMs =
+      totalMs - (primingMs + setupMs + profileMs + transitionMs + cleanupMs + exitMs)
     this.slotMs = slotMs ?? SHARE_SOAK.slotMs[mode]
     this.phaseMs = (short ? SHARE_SOAK.shortMs : SHARE_SOAK.fullMs) / SHARE_SOAK.phases.length
     this.stem = short ? 'share-soak' : 'share-soak-full'
-    this.nonce = Date.now().toString(36)
+    this.nonce = require('node:crypto').randomUUID()
     this.scope = NEVER
     this.phasesDone = 0
     this.elapsedProfileMs = 0
     this.counts = { cycles: 0, resets: 0, memberAdds: 0, memberRemoves: 0 }
     this.closed = false
-    this.spent = { setup: 0, transition: 0, profile: 0, cleanup: 0 }
+    this.spent = { priming: 0, setup: 0, transition: 0, profile: 0, cleanup: 0 }
     this.timing = { stages: [], phases: [], slots: [] }
     this.workDue = Infinity
     this.driver.onLateEntry = (entries) =>
@@ -5755,6 +5980,11 @@ class ShareSoak {
    */
   async run() {
     this.gate.assertClean()
+    if (this.startedAt !== undefined) {
+      const error = new Error('The original share soak owner cannot be restarted')
+      this.fail(error)
+      throw error
+    }
     this.startedAt = this.clock.now()
     this.workDue = this.startedAt + this.budget.totalMs - this.budget.exitMs
     try {
@@ -5763,6 +5993,7 @@ class ShareSoak {
         this.workDue - this.startedAt + 1,
         async (scope) => {
           this.scope = scope
+          await this.stage('priming', (primeScope) => this.prime(primeScope))
           await this.prepare()
           const resources = await this.soak().run()
           return this.stage('cleanup', () => {
@@ -5778,6 +6009,57 @@ class ShareSoak {
       this.fail(error)
       throw error
     }
+  }
+
+  /**
+   * Executes one fixed first-use scope in this realm and releases its strong roots before the
+   * boundary observation. Global observation history remains installed until scored cleanup.
+   * @param {AbortSignal} scope Original nested priming bound.
+   * @returns {Promise<void>} Only a scalar completion link survives in this owner.
+   * @throws {Error} Any priming or boundary failure; scored setup has not started.
+   */
+  async prime(scope) {
+    if (this.priming || !this.createPriming)
+      throw new Error('Exactly one priming scope is required')
+    const due = Math.min(this.startedAt + SHARE_SOAK_PRIMING.totalMs, this.workDue)
+    let prime = this.createPriming()
+    this.row('priming-start', { ...SHARE_SOAK_PRIMING, startedAt: this.startedAt, due })
+    const original = await bounded(
+      scope,
+      SHARE_SOAK_PRIMING.boundaryMs + 1,
+      () => this.shares.snapshot(),
+      { label: 'The priming boundary baseline' }
+    )
+    this.row('priming-boundary-reference', { snapshot: original })
+    try {
+      this.priming = await prime.execute(scope, this.startedAt, due - SHARE_SOAK_PRIMING.boundaryMs)
+    } finally {
+      prime = null
+    }
+    await bounded(
+      scope,
+      Math.min(SHARE_SOAK_PRIMING.boundaryMs, due - this.clock.now()) + 1,
+      async () => {
+        await new Promise((resolve) => setImmediate(resolve))
+        const snapshot = await this.snapshot()
+        const violations = []
+        ShareSoakScreen.quiet(snapshot, original, 'priming boundary', violations)
+        for (const when of ['beforeCollection', 'afterCollection']) {
+          if (
+            !ShareSoakScreen.same(
+              snapshot.timerOwners?.[when]?.unattributed,
+              original.timerOwners?.[when]?.unattributed
+            )
+          )
+            violations.push('priming boundary: timer attribution differs')
+        }
+        if (violations.length) throw new Error(violations.join('; '))
+        this.priming = Object.freeze({ ...this.priming, boundaryAt: this.clock.now() })
+        this.row('priming-boundary', { priming: this.priming, snapshot })
+      },
+      { label: 'The priming boundary' }
+    )
+    if (this.clock.now() > due) throw new Error('The priming deadline exceeded')
   }
 
   /**
@@ -5805,6 +6087,7 @@ class ShareSoak {
    */
   async prepare() {
     await this.stage('setup', async (scope) => {
+      if (this.driver.tap) this.driver.tap.archive = (fact) => this.row('soak-wire', fact)
       const digest = (file) =>
         require('node:crypto').createHash('sha256').update(fs.readFileSync(file)).digest('hex')
       this.row('soak-schedule', {
@@ -5814,12 +6097,32 @@ class ShareSoak {
             .split(path.delimiter)
             .map((file) => ({ file, sha256: digest(file) })),
           source: { file: 'scripts/soak/soak.js', sha256: digest(__filename) },
+          sources: [
+            'scripts/soak/soak.js',
+            'scripts/soak/shareProtocol.js',
+            'scripts/soak/shareTimerObserver.js',
+            'scripts/evidence/sharePriming.js',
+            'scripts/evidence/sharePrimingLink.js',
+            'scripts/evidence/shareQuietHeap.js',
+            'testHelpers/shareFixtures.js',
+            'testHelpers/shareLiveDiagnostics.js',
+            'testHelpers/resourceProbe.js',
+            'testHelpers/rawLog.js',
+          ].map((file) => ({ file, sha256: digest(file) })),
           brokers: this.driver.brokers,
         },
       })
       await this.driver.prepare(this.stack, scope)
-      if (this.driver.configuration)
+      if (this.driver.configuration) {
+        if (
+          this.priming &&
+          ['topic', 'groupId', 'topicId'].some(
+            (key) => !this.priming[key] || this.priming[key] === this.driver.configuration[key]
+          )
+        )
+          throw new Error('Priming and scored resource identities must be disjoint')
         this.row('soak-configuration', { config: this.driver.configuration })
+      }
     })
   }
 
@@ -6106,11 +6409,14 @@ class ShareSoak {
    */
   complete(resources) {
     this.gate?.assertClean()
+    if (this.driver.tap?.faults) throw new Error('The protocol observer lost source observations')
     const rows = this.evidence
       .read()
       .filter(({ event, scenario }) => event === 'soak-cycle' && scenario === this.nonce)
       .sort((a, b) => a.cycle - b.cycle)
     const violations = [...resources.violations]
+    if (!(this instanceof SharePriming) && this.priming?.status !== 'passed')
+      violations.push('A successful joined priming boundary is required')
     if (!Number.isFinite(this.elapsedProfileMs) || this.elapsedProfileMs < this.budget.profileMs)
       violations.push('the actual uncapped profile duration does not reach the declared schedule')
     if (this.elapsedProfileMs > this.budget.profileMs + this.profileMarginMs)
@@ -6156,7 +6462,7 @@ class ShareSoak {
       violations.push(
         'the original slot, phase or stage timestamps do not prove the fixed schedule'
       )
-    for (const name of ['setup', 'transition', 'profile', 'cleanup']) {
+    for (const name of ['priming', 'setup', 'transition', 'profile', 'cleanup']) {
       const spent = stages
         .filter((stage) => stage.name === name)
         .reduce((total, stage) => total + stage.completedAt - stage.startedAt, 0)
@@ -6279,6 +6585,15 @@ class ShareSoak {
     )
     if (JSON.stringify([...(final.prefix ?? [])].sort()) !== JSON.stringify([...corpus].sort()))
       violations.push('final: the raw prefix differs from the original producer receipts')
+    if (this.driver.tap?.archive) {
+      const { verifyShareProtocol } = require('../evidence/sharePriming')
+      const manifest = verifyShareProtocol(
+        this.evidence.read().filter((r) => r.scenario === this.nonce)
+      )
+      violations.push(...manifest.problems)
+      this.protocolSha256 = manifest.sha256
+      this.row('soak-protocol-manifest', { inventory: manifest.inventory, sha256: manifest.sha256 })
+    }
     const completedAt = this.driver.completedAt
     if (!Number.isFinite(completedAt)) violations.push('the final cleanup proof never completed')
     const verdict = {
@@ -6289,6 +6604,8 @@ class ShareSoak {
     }
     if (verdict.ok) {
       this.row('case-complete', {
+        priming: this.priming,
+        protocolSha256: this.protocolSha256,
         status: 'passed',
         tainted: false,
         schedule: { slotMs: this.slotMs, ...this.budget },
@@ -6353,6 +6670,8 @@ class ShareSoak {
       profile: 'tv2',
       scenario: this.nonce,
       stem: this.stem,
+      scope: this instanceof SharePriming ? 'priming' : 'scored',
+      schema: 'share-soak-scopes-v1',
       selector: this.short ? 'SHARE_SOAK_E2E' : 'SHARE_SOAK_FULL',
       soakProfile: this.short ? 'share-consumer-short' : 'share-consumer',
       ...fields,
@@ -6364,6 +6683,32 @@ class ShareSoak {
     if (this.restored) return
     this.shares.restore()
     this.restored = true
+  }
+
+  /**
+   * Joins the owned cleanup and validates its original observation before global observer restore.
+   * @param {Error[]} failures Receives a joined stack failure without hiding resource failures.
+   * @returns {Promise<void>} Both normal and exceptional scopes use the same original sources.
+   * @throws {Error} Invalid resources, lost inventory or changed attribution.
+   */
+  async cleanupObserved(failures) {
+    try {
+      await this.cleanupStack()
+    } catch (error) {
+      failures.push(error)
+    }
+    if (this.driver.baseline && this.driver.after) {
+      const { after, baseline } = this.driver
+      const violations = []
+      ShareSoakScreen.quiet(after, baseline, 'cleanup', violations)
+      for (const when of ['beforeCollection', 'afterCollection']) {
+        const before = baseline.timerOwners?.[when]?.unattributed
+        const observed = after?.timerOwners?.[when]?.unattributed
+        if (!ShareSoakScreen.same(observed, before))
+          violations.push(`cleanup: timerOwners.${when}.unattributed differs from baseline`)
+      }
+      if (violations.length > 0) throw new Error(violations.join('; '))
+    }
   }
 
   /**
@@ -6386,25 +6731,7 @@ class ShareSoak {
           async (scope) => {
             this.scope = scope
             await this.stage('cleanup', async () => {
-              try {
-                await this.cleanupStack()
-              } catch (error) {
-                failures.push(error)
-              }
-              if (this.driver.baseline && this.driver.after) {
-                const { after, baseline } = this.driver
-                const violations = []
-                ShareSoakScreen.quiet(after, baseline, 'cleanup', violations)
-                for (const when of ['beforeCollection', 'afterCollection']) {
-                  const before = baseline.timerOwners?.[when]?.unattributed
-                  const observed = after?.timerOwners?.[when]?.unattributed
-                  if (!ShareSoakScreen.same(observed, before))
-                    violations.push(
-                      `cleanup: timerOwners.${when}.unattributed differs from baseline`
-                    )
-                }
-                if (violations.length > 0) throw new Error(violations.join('; '))
-              }
+              await this.cleanupObserved(failures)
             })
           },
           { label: 'The share soak cleanup' }
@@ -6429,6 +6756,124 @@ class ShareSoak {
   }
 }
 
+/** Internal fixed first-use runner; it never calls the scored owner's run method. */
+class SharePriming extends ShareSoak {
+  /**
+   * @param {object} options Original driver, shared observations and separate client/stack.
+   */
+  constructor(options) {
+    super({ ...options, short: true })
+    this.stem = 'share-soak-prime'
+    this.budget = Object.freeze({
+      ...SHARE_SOAK_PRIMING,
+      primingMs: 0,
+      exitMs: 0,
+      totalMs: SHARE_SOAK_PRIMING.totalMs - SHARE_SOAK_PRIMING.boundaryMs,
+    })
+    this.profileMarginMs = SHARE_SOAK_PRIMING.idleWakeMarginMs
+  }
+
+  /**
+   * Uses the original schedule/oracles, with a structural first-use judge and separate archive.
+   * @returns {Soak} Original sampler and workload primitives.
+   */
+  soak() {
+    const soak = super.soak()
+    soak.judge = ShareSoakScreen.priming
+    return soak
+  }
+
+  /**
+   * Archives a distinct completion type; a first-use pass is never a scored receipt.
+   * @param {string} event Original event kind.
+   * @param {object} [fields] Original evidence fields.
+   * @returns {void}
+   */
+  row(event, fields = {}) {
+    if (event === 'case-complete')
+      this.receiptSha256 = require('../evidence/sharePrimingLink').primingReceiptHash({
+        scenario: this.nonce,
+        ...fields,
+      })
+    super.row(event === 'case-complete' ? 'priming-complete' : event, fields)
+  }
+
+  /** @returns {void} Leaves the shared global observers installed for the scored owner. */
+  restore() {
+    this.restored = true
+  }
+
+  /**
+   * Joins exceptional cleanup inside the still-active original priming envelope. Adding another
+   * envelope here would change the raw wrapper population captured by original preparation.
+   * @returns {Promise<void>} Safe to call twice; global observations remain installed.
+   * @throws {Error} All joined cleanup failures, archived before rethrow.
+   */
+  async close() {
+    if (this.closed) return
+    this.closed = true
+    const failures = []
+    try {
+      await this.stage('cleanup', () => this.cleanupObserved(failures))
+    } catch (error) {
+      failures.push(error)
+    }
+    this.restore()
+    if (failures.length) {
+      for (const failure of failures)
+        for (const error of failure.errors ?? [failure]) this.fail(error)
+      throw failures.length === 1
+        ? failures[0]
+        : new AggregateError(failures, 'Priming cleanup failed')
+    }
+  }
+
+  /**
+   * Runs exactly one fixed short pass under the parent's original clock and nested cutoff.
+   * Cleanup is joined on failure; primary and secondary failures remain separately archived.
+   * @param {AbortSignal} scope Original priming scope.
+   * @param {number} startedAt Original scored-owner entry, before first-use work.
+   * @param {number} due Absolute first-use cutoff excluding the boundary reserve.
+   * @returns {Promise<object>} Bounded scalar completion linkage; full evidence stays on disk.
+   * @throws {Error} Any workload, source, resource, deadline or joined cleanup failure.
+   */
+  async execute(scope, startedAt, due) {
+    this.scope = scope
+    this.startedAt = startedAt
+    this.workDue = due
+    try {
+      await this.prepare()
+      const resources = await this.soak().run()
+      const verdict = await this.stage('cleanup', () => this.complete(resources))
+      if (!verdict.ok) throw new Error(verdict.violations.join('; '))
+      this.restore()
+      return Object.freeze({
+        scenario: this.nonce,
+        receiptSha256: this.receiptSha256,
+        topic: this.driver.configuration?.topic,
+        groupId: this.driver.configuration?.groupId,
+        topicId: this.driver.configuration?.topicId,
+        passes: 1,
+        cycles: 30,
+        resets: 10,
+        verifiers: 31,
+        completedAt: this.clock.now(),
+        status: 'passed',
+      })
+    } catch (error) {
+      this.fail(error)
+      try {
+        await this.close()
+      } catch (cleanup) {
+        error.cleanupErrors = [...(error.cleanupErrors ?? []), cleanup]
+      }
+      throw error
+    } finally {
+      if (this.driver.tap) this.driver.tap.archive = null
+    }
+  }
+}
+
 /**
  * Builds the owner of a share-consumer profile for a real cluster: the counted client over the
  * chaos and tap socket factories, the live driver and the cleanup stack. Rows go to
@@ -6448,21 +6893,53 @@ const buildShareSoak = ({ brokers, short = false, record, run }) => {
   const stem = short ? 'share-soak' : 'share-soak-full'
   const chaos = createChaosSocketFactory(defaultSocketFactory())
   const tap = new ShareFetchTap()
-  const { kafka, shareResources, socketFactory } = instrumentShare({
+  const { kafka, createKafka, shareResources, socketFactory } = instrumentShare({
     clientId: 'soak-share',
     brokers,
     logLevel: logLevel.NOTHING,
     socketFactory: tap.factory(forgettingDestroyed(chaos, { releaseOnClose: true })),
   })
+  const observedKafka = (client) => ({
+    admin: (...args) => tap.client('admin', client.admin(...args)),
+    producer: (...args) => tap.client('producer', client.producer(...args)),
+    shareConsumer: (...args) => tap.client('share', client.shareConsumer(...args)),
+  })
+  const scoredKafka = observedKafka(kafka)
   return new ShareSoak({
     driver: new ShareSoakDriver({
-      kafka,
+      kafka: scoredKafka,
       brokers,
       shares: shareResources,
       tap,
       ports,
       socketFactory,
     }),
+    createPriming: () => {
+      const primeKafka = observedKafka(createKafka({ clientId: 'soak-share-prime' }))
+      return new SharePriming({
+        driver: new ShareSoakDriver({
+          kafka: primeKafka,
+          brokers,
+          shares: shareResources,
+          tap,
+          ports,
+          socketFactory,
+          prefix: 'soak-share-prime',
+        }),
+        kafka: primeKafka,
+        shares: shareResources,
+        stack: new ports.probe.CleanupStack(),
+        short: true,
+        gate: run ?? ports.bounded.liveRun,
+        evidence: {
+          write: (row) => {
+            writeEvidence(stem, row)
+            record?.(row)
+          },
+          read: () => evidenceLines(stem),
+        },
+      })
+    },
     kafka,
     shares: shareResources,
     stack: new ports.probe.CleanupStack(),
@@ -6627,6 +7104,8 @@ module.exports = {
   forgettingDestroyed,
   PROFILES,
   SHARE_SOAK,
+  SHARE_SOAK_PRIMING,
+  SharePriming,
   SHARE_SOAK_TITLE,
   WORKLOADS,
   IdleSocketCheck,

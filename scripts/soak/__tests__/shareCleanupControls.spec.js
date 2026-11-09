@@ -1,5 +1,12 @@
 const { EventEmitter } = require('events')
-const { ShareSoak, ShareSoakDriver, ShareSoakScreen, instrumentShare, main } = require('../soak')
+const {
+  ShareSoak,
+  SharePriming,
+  ShareSoakDriver,
+  ShareSoakScreen,
+  instrumentShare,
+  main,
+} = require('../soak')
 const fixtures = require('../../../testHelpers/shareFixtures')
 const helpers = require('../../../testHelpers')
 const bounded = require('../../../src/producer/__tests__/fixtures/bounded')
@@ -27,6 +34,7 @@ const cleanupOwner = ({
   shortFailureBound = true,
   primary = new Error('workload failed'),
   deletionError = new Error('topic deletion failed'),
+  Owner = ShareSoak,
 } = {}) => {
   const rows = []
   const observations = []
@@ -87,7 +95,7 @@ const cleanupOwner = ({
   })
   driver.readConfiguration = async () => ({})
   driver.final = jest.fn(async () => ({}))
-  const owner = new ShareSoak({
+  const owner = new Owner({
     driver,
     kafka: {},
     shares,
@@ -112,6 +120,9 @@ const cleanupOwner = ({
       return { ok: violations.length === 0, violations, measured: {} }
     },
   })
+  owner.prime = async () => {
+    owner.priming = { status: 'passed', topic: 'primed', groupId: 'primed', topicId: 'primed' }
+  }
   owner.complete = (resources) => resources
   return { owner, driver, admin, shares, rows, observations }
 }
@@ -133,6 +144,71 @@ describe('share owner cleanup populations', () => {
     jest.restoreAllMocks()
     bounded.liveRun.reset()
   })
+
+  test.each([false, true])(
+    'matches original nested priming populations inside real Jest liveCase and outer cleanup, exceptional=%s',
+    bounded.liveCase(30000, async (_scope, exceptional) => {
+      const {
+        owner: prime,
+        driver,
+        shares,
+        rows,
+      } = cleanupOwner({ Owner: SharePriming, exceptional, shortFailureBound: false })
+      const parent = new ShareSoak({
+        driver: {},
+        kafka: {},
+        shares,
+        short: true,
+        stack: new CleanupStack(),
+        gate: prime.gate,
+        evidence: { read: () => rows, write: (row) => rows.push(JSON.parse(JSON.stringify(row))) },
+        createPriming: () => prime,
+      })
+      parent.prepare = jest.fn(async () => {})
+      parent.soak = () => ({ run: async () => ({ ok: true, violations: [] }) })
+      parent.complete = (resources) => resources
+      const outer = new CleanupStack()
+      outer.add('close the original two-scope owner', () => parent.close())
+      let failure
+      try {
+        await outer.run(
+          async () => {
+            try {
+              await parent.run()
+            } catch (error) {
+              failure = error
+            }
+          },
+          { budgetMs: 20000 }
+        )
+        if (exceptional) {
+          expect(failure?.message).toBe('workload failed')
+          expect(failure.cleanupErrors).toBeUndefined()
+          expect(parent.prepare).not.toHaveBeenCalled()
+          expect(rows.some((r) => r.event === 'priming-complete')).toBe(false)
+        } else {
+          expect(failure).toBeUndefined()
+          expect(parent.prepare).toHaveBeenCalledTimes(1)
+          expect(parent.priming.status).toBe('passed')
+        }
+        expect(driver.after.activeResources).toEqual(driver.baseline.activeResources)
+        expect(driver.after.activeResourcesBeforeCollection).toEqual(
+          driver.baseline.activeResourcesBeforeCollection
+        )
+        expect(wrappers(driver.after)).toHaveLength(wrappers(driver.baseline).length)
+        expect(wrappers(driver.after).length).toBeGreaterThan(4)
+        expect(driver.after.timerOwners.afterCollection.dropped).toBe(0)
+        expect(driver.after.timerOwners.afterCollection.unattributed).toEqual(
+          driver.baseline.timerOwners.afterCollection.unattributed
+        )
+        expect(prime.stack.cleanups).toEqual([])
+        expect(parent.closed).toBe(true)
+      } finally {
+        shares.restore()
+      }
+    }),
+    bounded.caseTimeout(30000)
+  )
 
   test.each([false, true])(
     'restores raw resources with individually observed wrapper owners, exceptional=%s',
