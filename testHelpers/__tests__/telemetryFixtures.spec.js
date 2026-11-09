@@ -748,6 +748,87 @@ describe('telemetry wire observer', () => {
     observer.assertClean()
   })
 
+  test('proves the foreground negotiation socket paired with a share fetch connection', async () => {
+    const { ordinaryOwnership } = require('../../scripts/e2e/telemetry/semantics')
+    const { observer } = observe()
+    const setup = open(observer, 19095)
+    send(setup, apiVersions(1))
+    receive(setup, apiVersionsResponse(1, [[78, 0, 0]]))
+    const fetch = open(observer, 19095)
+    send(fetch, frame(header2(78, 0, 2)))
+    receive(fetch, metadataResponse(2))
+    expect(observer.undecided()).toHaveLength(1)
+    observer.confirmForegroundFetchSetup()
+    expect(observer.undecided()).toEqual([])
+    expect(
+      ordinaryOwnership({
+        records: observer.readTranscript(),
+        sockets: observer.socketOwnership(),
+      })
+    ).toEqual(['2:bootstrap', '2:ordinary'])
+    setup.emit('close')
+    fetch.emit('close')
+    await observer.dispose()
+    observer.assertClean()
+  })
+
+  test.each([
+    'extra socket',
+    'other node',
+    'ordinary sibling',
+    'unanswered fetch',
+    'missing negotiation',
+    'telemetry advertised',
+  ])('rejects an unproven foreground fetch setup: %s', (defect) => {
+    const { observer } = observe()
+    const setup = open(observer, 19095)
+    if (defect !== 'missing negotiation') {
+      send(setup, apiVersions(1))
+      receive(
+        setup,
+        apiVersionsResponse(
+          1,
+          defect === 'telemetry advertised'
+            ? [
+                [78, 0, 0],
+                [71, 0, 0],
+                [72, 0, 0],
+              ]
+            : [[78, 0, 0]]
+        )
+      )
+    }
+    const fetch = open(observer, defect === 'other node' ? 19098 : 19095)
+    send(fetch, defect === 'ordinary sibling' ? metadata(2) : frame(header2(78, 0, 2)))
+    if (defect !== 'unanswered fetch') receive(fetch, metadataResponse(2))
+    if (defect === 'extra socket') open(observer, 19095)
+    expect(() => observer.confirmForegroundFetchSetup()).toThrow('foreground fetch setup')
+    expect(observer.undecided().some((s) => s.socketId === 1)).toBe(true)
+  })
+
+  test('retains a decoder timeout after detaching every observer listener', async () => {
+    const decoder = jest.fn(async () => {
+      throw new Error('Decoder failed (124)')
+    })
+    const { observer } = observe({ completeStream: true, decoder })
+    const blob = Buffer.from('timed-out')
+    writeSink('1', [sinkRow('1', 1, blob)])
+    const socket = open(observer)
+    send(socket, push72(1, blob))
+    receive(socket, push72Response(1))
+    await observer.closeClient({ disconnect: async () => socket.emit('close') })
+    await observer.dispose()
+    expect(socket.listenerCount('data')).toBe(0)
+    expect(socket.listenerCount('connect')).toBe(0)
+    expect(socket.listenerCount('close')).toBe(0)
+    expect(socket.write).toBe(socket.originalWrite)
+    expect(() => observer.assertClean()).toThrow('observer is not clean')
+    const transcript = JSON.parse(fs.readFileSync(path.join(observer.directory, 'transcript.json')))
+    expect(transcript.cleanup).toEqual({ attached: 0, children: 0, timers: 0, stillOpen: [] })
+    expect(transcript.failures).toContain('Decoder failed (124)')
+    expect(decoder).toHaveBeenCalledTimes(1)
+  })
+
   test('decodes once and reuses a result without consuming another request export', async () => {
     const blob = Buffer.from('cached-payload')
     writeSink('1', [sinkRow('1', 1, blob)])

@@ -872,7 +872,7 @@ class TelemetryWireObserver {
       }))
   }
 
-  /** @returns {object[]} all issued physical sockets, including setup-only and undecided ones */
+  /** @returns {object[]} all physical sockets; foregroundBootstrap marks proven foreground negotiation */
   socketOwnership() {
     return [...this.#sockets.values()].map(({ id, kind, node, foregroundBootstrap }) => ({
       id,
@@ -894,7 +894,8 @@ class TelemetryWireObserver {
 
   /**
    * Confirms the first foreground socket after public connect succeeds. Core connect precedes
-   * telemetry resume on every factory; other setup-only sockets remain unclassified until 71/72.
+   * telemetry resume on every factory. Other setup-only sockets require foreground fetch proof
+   * or actual ordinary/telemetry traffic.
    * @param {number} [socketId=1] first socket of this observed client
    * @returns {void}
    * @throws {Error} if the socket is not the first successful foreground bootstrap
@@ -911,6 +912,45 @@ class TelemetryWireObserver {
       throw new Error('Not a proven foreground bootstrap socket')
     state.kind = 'normal'
     state.foregroundBootstrap = true
+  }
+
+  /**
+   * Proves a broker's setup-only foreground socket from its paired Fetch/ShareFetch socket.
+   * The pool negotiates on index zero before opening its dedicated fetch connection. Only one
+   * such pair per node is permitted; telemetry advertisements, extra sockets, missing negotiation
+   * or an unanswered fetch cannot establish ownership. Validate all candidates before relabelling.
+   * @returns {void}
+   * @throws {Error} if any undecided socket lacks exact foreground fetch setup evidence
+   */
+  confirmForegroundFetchSetup() {
+    const candidates = [...this.#sockets.values()].filter((s) => s.kind === 'undecided')
+    for (const setup of candidates) {
+      const peers = [...this.#sockets.values()].filter((s) => s.node === setup.node)
+      const sibling = peers.find((s) => s.id !== setup.id)
+      const requests = this.#records.filter((r) => r.type === 'request' && r.socketId === setup.id)
+      const negotiated = requests.findLast((r) => r.apiKey === 18 && r.response?.errorCode === 0)
+      const fetch = this.#records.find(
+        (r) => r.socketId === sibling?.id && [1, 78].includes(r.apiKey) && r.response
+      )
+      if (
+        peers.length !== 2 ||
+        sibling?.kind !== 'normal' ||
+        !negotiated ||
+        requests.some((r) => r.apiKey !== 18 || !r.response) ||
+        setup.ranges[71] ||
+        setup.ranges[72] ||
+        !fetch ||
+        !setup.ranges[fetch.apiKey] ||
+        negotiated.response.responseAt >= fetch.writeAt ||
+        setup.id >= sibling.id ||
+        requests.some((r) => r.clientId !== fetch.clientId)
+      )
+        throw new Error('Not a proven foreground fetch setup socket')
+    }
+    for (const setup of candidates) {
+      setup.kind = 'normal'
+      setup.foregroundBootstrap = true
+    }
   }
 
   /**
