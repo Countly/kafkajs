@@ -3236,3 +3236,55 @@ describe('subscription deletion final telemetry outcome', () => {
     expect(() => verify(value)).toThrow('Unqualified final subscription error')
   })
 })
+
+describe('Java node export capture', () => {
+  const crypto = require('crypto')
+  const { assertJavaCaptures, readNodeExports } = require('../telemetry/semantics')
+  const sha256 = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex')
+  const line = (node, seq) => JSON.stringify({ node, seq }) + '\n'
+  /** @returns {string} an evidence directory where node 3 has not exported yet */
+  const directory = () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'java-capture-'))
+    fs.writeFileSync(path.join(dir, 'exports-1.jsonl'), line(1, 1))
+    fs.writeFileSync(path.join(dir, 'exports-2.jsonl'), line(2, 1))
+    return dir
+  }
+  /** @returns {object} a capture receipt over the given per-node byte prefixes */
+  const receipt = (prefixes) => ({
+    nodes: Object.fromEntries(
+      Object.entries(prefixes).map(([node, bytes]) => [
+        node,
+        { bytes: bytes.length, sha256: sha256(bytes) },
+      ])
+    ),
+    cursors: Object.fromEntries(
+      Object.entries(prefixes).map(([node, bytes]) => [node, bytes.length ? 1 : 0])
+    ),
+  })
+
+  test('reads a node that has not exported yet as empty', () => {
+    const dir = directory()
+    expect(readNodeExports(dir, '3')).toEqual(Buffer.alloc(0))
+    expect(readNodeExports(dir, '1').toString()).toBe(line(1, 1))
+  })
+
+  test('accepts an absent node file captured with zero bytes', () => {
+    const dir = directory()
+    const prefixes = {
+      1: Buffer.from(line(1, 1)),
+      2: Buffer.from(line(2, 1)),
+      3: Buffer.alloc(0),
+    }
+    expect(() => assertJavaCaptures([receipt(prefixes)], dir)).not.toThrow()
+  })
+
+  test('rejects an absent node file whose capture recorded bytes', () => {
+    const dir = directory()
+    const prefixes = {
+      1: Buffer.from(line(1, 1)),
+      2: Buffer.from(line(2, 1)),
+      3: Buffer.from(line(3, 1)),
+    }
+    expect(() => assertJavaCaptures([receipt(prefixes)], dir)).toThrow('Invalid capture length')
+  })
+})

@@ -12,6 +12,7 @@ const {
   javaClosePolicy,
   assertJavaEvidence,
   assertJavaCaptures,
+  readNodeExports,
   assertJavaSubscription,
   JAVA_REQUESTED,
   JavaAdminHandshake,
@@ -434,7 +435,7 @@ class JavaInteropCase {
     const nodes = {}
     const cursors = {}
     for (const node of ['1', '2', '3']) {
-      const bytes = fs.readFileSync(path.join(this.directory, `exports-${node}.jsonl`))
+      const bytes = readNodeExports(this.directory, node)
       if (bytes.length && bytes.at(-1) !== 10) throw new Error('Partial Java node capture')
       const rows = bytes.length ? bytes.toString().trimEnd().split('\n').map(JSON.parse) : []
       nodes[node] = {

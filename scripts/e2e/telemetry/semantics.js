@@ -733,6 +733,23 @@ class JavaAdminHandshake {
 }
 
 /**
+ * Reads one broker's reporter export file. The reporter creates the file on that broker's first
+ * export, so a node that has not exported yet has no file.
+ * @param {string} directory evidence directory
+ * @param {string} node broker node id
+ * @returns {Buffer} the file bytes, empty when the node has not exported yet
+ * @throws {Error} for any read failure other than an absent file
+ */
+const readNodeExports = (directory, node) => {
+  try {
+    return fs.readFileSync(path.join(directory, `exports-${node}.jsonl`))
+  } catch (error) {
+    if (error.code === 'ENOENT') return Buffer.alloc(0)
+    throw error
+  }
+}
+
+/**
  * Joins every timed capture to full archived node prefixes before using any UUID filter.
  * @param {object[]} receipts all-node timed capture receipts
  * @param {string} directory archived sink directory
@@ -753,7 +770,7 @@ const assertJavaCaptures = (receipts, directory) => {
     )
     for (const node of ['1', '2', '3']) {
       const { bytes, sha256 } = receipt.nodes[node]
-      const full = fs.readFileSync(path.join(directory, `exports-${node}.jsonl`))
+      const full = readNodeExports(directory, node)
       assert(
         Number.isSafeInteger(bytes) && bytes >= 0 && bytes <= full.length,
         'Invalid capture length'
@@ -812,6 +829,7 @@ module.exports = {
   javaMarker,
   assertJavaEvidence,
   assertJavaCaptures,
+  readNodeExports,
   assertJavaSubscription,
   JAVA_REQUESTED,
   unexpectedPinnedJavaStderr,

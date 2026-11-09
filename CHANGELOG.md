@@ -21,6 +21,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Read hourly rolled telemetry request traces with bounded rotation retries, prove foreground fetch setup ownership, and exercise every discovered reporter broker without weakening socket or cleanup checks.
 - Verify pinned Java admin close with completed work, a fresh four-metric export and bounded acknowledged close/cessation evidence; retain mandatory producer/consumer finals and replay versioned raw receipts.
 - Compare the complete Java interoperability subscription without prefix-order assumptions in live checks and archive replay, retaining both admin counter names and rejecting missing, extra or duplicate prefixes.
+- Read a broker node that has not exported yet as an empty Java capture, while still rejecting a missing file whose capture recorded bytes.
 - Add an isolated Node-24 retained-ownership diagnostic with bounded captures, scalar counterparts, source archives and broker-free failure controls; diagnostic evidence cannot satisfy resource acceptance.
 - Reserve retained-diagnostic weak history before measurement, retire dead observation wrappers, and attribute observer storage separately from product state.
 - Qualify telemetry final subscription-deletion errors with archived admin evidence, and verify forced share shutdown using final acknowledgements and exact suffix redelivery.
