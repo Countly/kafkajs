@@ -1908,35 +1908,6 @@ describe('required live archive dimensions and semantics', () => {
       },
     ],
   })
-  /** @param {string} role Java kind @param {number} index window @returns {object[]} literal descriptors */
-  const javaMetrics = (role, index) => [
-    common(role === 'admin' ? 'admin.client' : role, true),
-    ...['gauge.double', 'gauge.long', 'sum.total'].map((suffix) => ({
-      name: `org.apache.kafka.tf1.custom.${suffix}`,
-      unit: '',
-      res: 0,
-      pointsInMessage: 1,
-      kind: suffix === 'sum.total' ? 'SUM' : 'GAUGE',
-      ...(suffix === 'sum.total'
-        ? { monotonic: true, temporality: 'AGGREGATION_TEMPORALITY_DELTA' }
-        : {}),
-      points: [
-        {
-          attrs: [],
-          flags: 0,
-          startNs: '1',
-          timeNs: '2000000',
-          ...(suffix === 'gauge.long'
-            ? { valueKind: 'AS_INT', asInt: '4242' }
-            : {
-                valueKind: 'AS_DOUBLE',
-                asDouble: suffix === 'sum.total' ? (index === 0 ? '7.0' : '0.0') : '42.5',
-                ...(suffix === 'gauge.double' ? { asDoubleBits: '4045400000000000' } : {}),
-              }),
-        },
-      ],
-    })),
-  ]
   /** Owns a finite full archive; edits regenerate all affected raw/decode/sink receipts and hashes. */
   class Archive {
     /** @param {string} scenario selected required scenario */
@@ -2104,6 +2075,7 @@ describe('required live archive dimensions and semantics', () => {
           const digest = hash(raw)
           Object.assign(request, { metricsBytes: raw.length, metricsSha256: digest })
           const body = { ...decoded, dataBytes: raw.length, dataSha256: digest }
+          const seq = rows.filter((r) => r.node === '1').length + 1
           const item = {
             requestKey,
             uuid: stream.uuid,
@@ -2114,7 +2086,7 @@ describe('required live archive dimensions and semantics', () => {
             transmittedBytes: raw.length,
             transmittedSha256: digest,
             decoded: body,
-            exportIdentity: { node: '1', seq: rows.length + 1 },
+            exportIdentity: { node: '1', seq },
           }
           put(`${owner}/push-${requestKey}.bin`, raw)
           put(`${owner}/raw-${digest}.bin`, raw)
@@ -2131,7 +2103,7 @@ describe('required live archive dimensions and semantics', () => {
               '\n',
           })
           rows.push(
-            row('1', rows.length + 1, {
+            row('1', seq, {
               ...body,
               clientId: stream.clientId,
               clientInstanceId: stream.uuid,
@@ -2142,10 +2114,36 @@ describe('required live archive dimensions and semantics', () => {
         put(`${owner}/transcript.json`, stream.transcript)
       }
       put('oracles.json', this.oracles)
-      put(
-        'exports-1.jsonl',
-        Buffer.from(rows.map((r, i) => JSON.stringify({ ...r, seq: i + 1 })).join('\n') + '\n')
-      )
+      const nodes = this.record.results.javaEvidenceVersion === 2 ? ['1', '2', '3'] : ['1']
+      for (const node of nodes)
+        put(
+          `exports-${node}.jsonl`,
+          Buffer.from(
+            rows
+              .filter((r) => r.node === node)
+              .map((r) => JSON.stringify(r) + '\n')
+              .join('')
+          )
+        )
+      const admin = this.record.results.java?.admin
+      if (admin) {
+        // Semantic mutations must reach their validator with consistent capture-byte receipts.
+        for (const receipt of [
+          admin.checkpoint.proof,
+          ...admin.cessation.drain,
+          ...admin.cessation.quiet,
+        ])
+          for (const node of nodes) {
+            const bytes = Buffer.from(
+              rows
+                .filter((r) => r.node === node)
+                .slice(0, receipt.cursors[node])
+                .map((r) => JSON.stringify(r) + '\n')
+                .join('')
+            )
+            receipt.nodes[node] = { bytes: bytes.length, sha256: hash(bytes) }
+          }
+      }
       for (const [relative, bytes] of Object.entries(files)) {
         const file = path.join(this.directory, relative)
         fs.mkdirSync(path.dirname(file), { recursive: true })
@@ -2168,14 +2166,18 @@ describe('required live archive dimensions and semantics', () => {
   afterEach(() => {
     if (archive) fs.rmSync(archive.directory, { recursive: true, force: true })
   })
-  /** @returns {Archive} complete seven-client interop archive */
-  const javaArchive = () => {
+  /** @param {boolean} [final=false] optional admin final @returns {Archive} complete seven-client interop archive */
+  const javaArchive = (final = false) => {
+    const { createJavaInteropArchive } = require('../javaTelemetryArchive')
     const a = new Archive('telemetry-java')
     archive = a
-    const r = a.record.results
-    r.java = {}
-    r.js = {}
-    r.uuids = { java: {}, js: {} }
+    const inputs = createJavaInteropArchive(final, {
+      stem: a.record.run.stem,
+      directory: path.join(a.directory, a.record.sidecars.root),
+    })
+    a.record.fixture = inputs.record.fixture
+    const r = (a.record.results = inputs.record.results)
+    a.rows = Object.values(inputs.rows).flat()
     for (const kind of ['producer', 'consumer', 'admin', 'share']) {
       const stream = a.owner(
         `js-${kind}`,
@@ -2184,85 +2186,30 @@ describe('required live archive dimensions and semantics', () => {
       )
       r.js[kind] = { uuid: stream.uuid }
       r.uuids.js[kind] = stream.uuid
-    }
-    for (const role of ['producer', 'consumer', 'admin']) {
-      const uuid = `11223344-4455-6677-8899-${String(a.next++).padStart(12, '0')}`
-      r.uuids.java[role] = uuid
-      const membership = {
-        membership: true,
-        fromEpochMs: 0,
-        epochMs: 1,
-        beforeMemberId: '',
-        memberId: 'member',
-      }
-      r.java[role] = {
-        uuid,
-        assignedId: `required-java-${role}`,
-        closing: { closing: true, epochMs: 30 },
-        closed: { closed: true, epochMs: 40 },
-        exitCode: 0,
-        exitSignal: null,
-        closeToExitMs: 10,
-        liveDescendants: [],
-        stdout: JSON.stringify(membership) + '\n',
-      }
-      for (let index = 0; index < 3; index++)
-        a.rows.push(
-          row('1', a.rows.length + 1, {
-            tsMs: index === 2 ? 35 : 10 + index,
-            clientInstanceId: uuid,
-            clientId: `required-java-${role}`,
-            terminating: index === 2,
-            truncated: false,
-            resourceMetricsCount: 4,
-            metricsTotal: 4,
-            metricsKept: 4,
-            pointsTotal: 4,
-            resources: Array.from({ length: 4 }, () => ({
-              attrs:
-                role === 'consumer'
-                  ? [
-                      ['group_id', 'string', 'required-java-consumer-group'],
-                      ['group_member_id', 'string', 'member'],
-                    ]
-                  : [],
-              droppedAttributes: 0,
-            })),
-            metrics: javaMetrics(role, index).map((metric, res) => ({ ...metric, res })),
-          })
-        )
-    }
-    const fixture = path.join(__dirname, '../../scripts/e2e/telemetry')
-    const cache = fs
-      .readFileSync(path.join(fixture, 'interop.sha256'), 'utf8')
-      .trim()
-      .split('\n')
-      .map((line) => {
-        const [sha256, name] = line.trim().split(/\s+/)
-        return { name, sha256 }
-      })
-    a.record.fixture = { clientSourceSha256: 'a'.repeat(64), runnerSha256: 'b'.repeat(64) }
-    r.provenance = {
-      sourceSha256: a.record.fixture.clientSourceSha256,
-      runnerSha256: a.record.fixture.runnerSha256,
-      cache,
-      jdk: Object.fromEntries(
-        ['producer', 'consumer', 'admin'].map((role) => [role, { jdk: '21', vendor: 'OpenJDK' }])
-      ),
+      Object.assign(
+        stream.transcript.records.find((request) => request.apiKey === 71).response,
+        inputs.transcripts[`js-${kind}`].records[0].response
+      )
     }
     return a
   }
-  test('verifies a complete Java archive with independent role resources and every JS export', () => {
-    javaArchive().verify()
-  })
-  test.each(['owner', 'Java role'])(
+  test.each([false, true])(
+    'verifies a complete Java archive with independent role resources and every JS export (admin final=%s)',
+    (final) => {
+      javaArchive(final).verify()
+    }
+  )
+  test.each([
+    ['owner', 'Required owner catalogue differs'],
+    ['Java role', 'Required Java role catalogue differs'],
+  ])(
     'rejects a deleted required %s from an otherwise complete archive',
-    (dimension) => {
+    (dimension, diagnostic) => {
       const a = javaArchive()
       a.verify()
       if (dimension === 'owner') delete a.record.sidecars.owners['js-admin']
       else delete a.record.results.java.admin
-      expect(() => a.verify()).toThrow(/Required.*catalogue/)
+      expect(() => a.verify()).toThrow(diagnostic)
     }
   )
   test('rejects a later JS common counter change with matching raw decode sink and refreshed hashes', () => {
