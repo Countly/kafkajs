@@ -26,7 +26,7 @@ const CAPTURES = Object.freeze([
   'closed-5',
   'all-released',
 ])
-const METHOD = '9f-F10-r4-cold-ownership-v1'
+const METHOD = 'retained-cold-ownership-v1'
 const CATALOGUE = Object.freeze(
   ARMS.flatMap((arm) =>
     KINDS.flatMap((kind) => ['capture', 'scalar'].map((variant) => ({ arm, kind, variant })))
