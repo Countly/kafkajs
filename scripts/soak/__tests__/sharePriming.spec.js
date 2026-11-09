@@ -243,6 +243,13 @@ const recording = async ({
       return prime
     },
   })
+  const snapshot = owner.snapshot.bind(owner)
+  owner.snapshot = async () => {
+    const point = await snapshot()
+    if (damageBoundary && rows.some((r) => r.event === 'priming-complete') && !armedAt)
+      damageBoundary(point)
+    return point
+  }
   let result
   let error
   let done = false
@@ -523,6 +530,57 @@ describe('fixed same-realm share priming', () => {
     30000
   )
 
+  test.each([
+    [
+      'missing heap',
+      (p) => {
+        delete p.heapUsed
+      },
+    ],
+    [
+      'NaN heap',
+      (p) => {
+        p.heapUsed = NaN
+      },
+    ],
+    [
+      'negative heap',
+      (p) => {
+        p.heapUsed = -1
+      },
+    ],
+    [
+      'missing elapsed time',
+      (p) => {
+        delete p.heapAtMs
+      },
+    ],
+    [
+      'NaN elapsed time',
+      (p) => {
+        p.heapAtMs = NaN
+      },
+    ],
+    [
+      'negative elapsed time',
+      (p) => {
+        p.heapAtMs = -1
+      },
+    ],
+  ])(
+    'rejects a boundary-only %s before admitting scored setup',
+    async (_name, damageBoundary) => {
+      const { error, scoredDriver, rows, owner } = await recording({ damageBoundary })
+      expect(error).toBeInstanceOf(Error)
+      expect(owner.gate.tainted).toBe(true)
+      expect(scoredDriver.prepare).not.toHaveBeenCalled()
+      expect(rows.some((r) => r.event === 'priming-complete')).toBe(true)
+      expect(rows.some((r) => r.event === 'priming-boundary')).toBe(false)
+      expect(rows.some((r) => r.event === 'case-complete')).toBe(false)
+    },
+    30000
+  )
+
   test('the fixed allocations preserve both distinct idle margins', () => {
     expect(Object.isFrozen(SHARE_SOAK_PRIMING)).toBe(true)
     expect(SHARE_SOAK_PRIMING).toEqual({
@@ -587,6 +645,47 @@ describe('recorded priming integrity', () => {
         rows.find((r) => r.event === 'priming-boundary').snapshot.queueDepth = 1
       },
     ],
+    ...[
+      [
+        'missing heap',
+        (p) => {
+          delete p.heapUsed
+        },
+      ],
+      [
+        'nonfinite heap',
+        (p) => {
+          p.heapUsed = Infinity
+        },
+      ],
+      [
+        'negative heap',
+        (p) => {
+          p.heapUsed = -1
+        },
+      ],
+      [
+        'missing timestamp',
+        (p) => {
+          delete p.heapAtMs
+        },
+      ],
+      [
+        'negative timestamp',
+        (p) => {
+          p.heapAtMs = -1
+        },
+      ],
+      [
+        'late timestamp',
+        (p) => {
+          p.heapAtMs += 1020000
+        },
+      ],
+    ].map(([name, damage]) => [
+      `boundary ${name}`,
+      (rows) => damage(rows.find((r) => r.event === 'priming-boundary').snapshot),
+    ]),
     [
       'operation mismatch',
       (rows) => {

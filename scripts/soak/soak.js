@@ -6043,6 +6043,14 @@ class ShareSoak {
         await new Promise((resolve) => setImmediate(resolve))
         const snapshot = await this.snapshot()
         const violations = []
+        if (
+          !Number.isSafeInteger(snapshot.heapUsed) ||
+          snapshot.heapUsed < 0 ||
+          !Number.isFinite(snapshot.heapAtMs) ||
+          snapshot.heapAtMs < this.priming.completedAt - this.startedAt ||
+          snapshot.heapAtMs > this.clock.now() - this.startedAt
+        )
+          violations.push('priming boundary: invalid heap source or elapsed timestamp')
         ShareSoakScreen.quiet(snapshot, original, 'priming boundary', violations)
         for (const when of ['beforeCollection', 'afterCollection']) {
           if (

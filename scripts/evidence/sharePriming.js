@@ -358,6 +358,10 @@ const verifySharePriming = (rows) => {
     references.length !== 1 ||
     rows.indexOf(references[0]) >= rows.indexOf(prime) ||
     !Number.isSafeInteger(observed?.heapUsed) ||
+    observed.heapUsed < 0 ||
+    !Number.isFinite(observed?.heapAtMs) ||
+    observed.heapAtMs < prime.timing?.observedAt - start.startedAt ||
+    observed.heapAtMs > boundary.priming?.boundaryAt - start.startedAt ||
     !['queueDepth', 'shareSessions', 'shareRecords', 'shareRanges'].every(
       (k) => observed?.[k] === 0
     ) ||
