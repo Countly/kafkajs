@@ -19,7 +19,10 @@ const {
 const {
   assertCatalogue,
   assertCadence,
-  assertJavaRows,
+  assertJavaEvidence,
+  assertJavaCaptures,
+  JAVA_REQUESTED,
+  unexpectedPinnedJavaStderr,
   assertJsCounter,
   assertCustomShape,
   ordinaryOwnership,
@@ -356,6 +359,7 @@ const requiredLiveCatalogue = (record) => {
   if (['telemetry-prefix', 'telemetry-custom'].includes(scenario)) return ['producer']
   if (scenario === 'telemetry-payload') return ['producer-candidate']
   if (scenario === 'telemetry-java') {
+    assert.equal(results.javaEvidenceVersion, 2, 'Missing Java evidence version 2')
     const roles = JAVA_ROLES
     exact(results.java, roles, 'Java role')
     exact(results.js, KINDS, 'JS role')
@@ -1144,6 +1148,173 @@ const assertPushProof = ({
 }
 
 /**
+ * Replays the version-2 Java contract from complete sink files and raw process receipts. JS wire
+ * and independent decoder joins remain mandatory in the enclosing scenario verifier.
+ * @param {object} record candidate and result stamps
+ * @param {string} directory full all-node sink archive
+ * @param {object} transcripts four JS subscription confirmation streams
+ * @returns {void}
+ * @throws {Error} for old format, unqualified inputs or any invalid role close proof
+ */
+const verifyJavaInterop = (record, directory, transcripts) => {
+  const { results } = record
+  requiredLiveCatalogue(record)
+  const reader = new TelemetryExportReader(directory)
+  assert.equal(results.javaEvidenceVersion, 2, 'Missing Java evidence version 2')
+  assert.deepEqual(
+    Object.keys(results.children).sort(),
+    [...JAVA_ROLES].sort(),
+    'Missing Java child catalogue'
+  )
+  const provenance = results.provenance
+  assert.equal(provenance.sourceSha256, record.fixture.clientSourceSha256)
+  assert.equal(provenance.runnerSha256, record.fixture.runnerSha256)
+  const pins = fs
+    .readFileSync(path.join(__dirname, 'interop.sha256'), 'utf8')
+    .trim()
+    .split('\n')
+    .map((line) => {
+      const [sha256, name] = line.trim().split(/\s+/)
+      return { name, sha256 }
+    })
+  assert.deepEqual(
+    provenance.cache.map(({ name, sha256 }) => ({ name, sha256 })),
+    pins,
+    'Wrong Java pinned input catalogue'
+  )
+  for (const role of ['producer', 'consumer', 'admin'])
+    assert(provenance.jdk[role]?.jdk && provenance.jdk[role]?.vendor)
+  assert.equal(results.readback.metrics, JAVA_REQUESTED, 'Wrong narrow Java subscription')
+  assert.deepEqual(
+    [...results.readback.ids].sort(),
+    [
+      ...JAVA_ROLES.map((role) => `${record.run.stem}-java-${role}`),
+      ...KINDS.map((kind) => `${record.run.stem}-js-${kind}`),
+    ].sort(),
+    'Wrong Java subscription client catalogue'
+  )
+  for (const kind of KINDS) {
+    const gets = transcripts[`js-${kind}`].records.filter(
+      (r) => r.apiKey === 71 && r.response?.errorCode === 0
+    )
+    assert(gets.length > 0, 'Missing Java subscription Get confirmation')
+    for (const get of gets) {
+      assert.deepEqual(get.response.requestedMetrics, JAVA_REQUESTED.split(','))
+      assert.equal(get.response.pushIntervalMs, 1000)
+      assert.equal(get.response.deltaTemporality, true)
+    }
+  }
+  assert(
+    results.java.admin.checkpoint && results.java.admin.cessation,
+    'Missing admin checkpoint/cessation'
+  )
+  const subscription = results.subscription
+  const expectedEntries = {
+    metrics: JAVA_REQUESTED,
+    'interval.ms': '1000',
+    match: `client_id=^(${results.readback.ids.join('|')})$`,
+  }
+  assert.equal(
+    results.subscriptionOperations.length,
+    2,
+    'Missing public Java subscription operations'
+  )
+  for (const [index, operation] of results.subscriptionOperations.entries()) {
+    assert.deepEqual(
+      operation.request,
+      {
+        timeout: 3000,
+        resources: [
+          {
+            type: 16,
+            name: record.run.stem,
+            configEntries: Object.entries(expectedEntries).map(([name, value]) => ({
+              name,
+              operation: index,
+              ...(index === 0 ? { value } : {}),
+            })),
+          },
+        ],
+      },
+      'Wrong public Java subscription operation'
+    )
+    assert.equal(operation.response.resources.length, 1)
+    assert.equal(operation.response.resources[0].resourceType, 16)
+    assert.equal(operation.response.resources[0].resourceName, record.run.stem)
+    assert.equal(operation.response.resources[0].errorCode, 0)
+    assert(
+      Number.isFinite(operation.startedAt) &&
+        operation.startedAt >= 0 &&
+        operation.completedAt >= operation.startedAt
+    )
+  }
+  assert(subscription.createdAt >= results.subscriptionOperations[0].completedAt)
+  assert(
+    results.subscriptionOperations[1].startedAt >= results.java.admin.cessation.quiet.at(-1).at,
+    'Java subscription removed before cessation'
+  )
+  assert.equal(subscription.readback.configEntries.length, 3)
+  assert.equal(subscription.name, record.run.stem)
+  assert.deepEqual(subscription.entries, expectedEntries, 'Wrong actual Java subscription')
+  assert.equal(subscription.readback.resourceType, 16)
+  assert.equal(subscription.readback.resourceName, record.run.stem)
+  assert.equal(subscription.readback.errorCode, 0)
+  assert.deepEqual(
+    Object.fromEntries(
+      subscription.readback.configEntries.map((e) => [e.configName, e.configValue])
+    ),
+    expectedEntries,
+    'Wrong actual Java readback'
+  )
+  assert(subscription.createdAt <= results.java.admin.checkpoint.proof.at)
+  assert(
+    subscription.deletion.startedAt >= results.java.admin.cessation.quiet.at(-1).at,
+    'Java subscription removed before cessation'
+  )
+  assert.equal(subscription.deletion.response.resources[0].errorCode, 0)
+  assert(
+    !subscription.deletion.listing.resources.some(
+      (r) => r.type === 16 && r.name === record.run.stem
+    )
+  )
+  assert.deepEqual(results.controls, { producerRecords: 2, seedCommit: '1' })
+  assert(
+    [...Object.values(results.uuids.java), ...Object.values(results.uuids.js)].every(
+      (uuid) =>
+        /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(uuid) &&
+        uuid !== '00000000-0000-0000-0000-000000000000'
+    ),
+    'Invalid Java interop UUID'
+  )
+  for (const [role, java] of Object.entries(results.java)) {
+    assert.equal(java.assignedId, `${record.run.stem}-java-${role}`)
+    const rows = reader
+      .readExports({ uuid: java.uuid })
+      .sort(
+        (a, b) => a.tsMs - b.tsMs || Number(a.terminating) - Number(b.terminating) || a.seq - b.seq
+      )
+    const child = results.children[role]
+    assert.deepEqual(unexpectedPinnedJavaStderr(child.stderr), [], 'Unexpected Java stderr')
+    if (role === 'admin') {
+      assertJavaCaptures(
+        [java.checkpoint?.proof, ...java.cessation.drain, ...java.cessation.quiet],
+        directory
+      )
+    }
+    assertJavaEvidence(role, rows, java, child, {
+      provenance,
+      fixture: record.fixture,
+      readback: results.readback,
+      group: `${record.run.stem}-java-consumer-group`,
+    })
+  }
+  assert.equal(
+    new Set([...Object.values(results.uuids.java), ...Object.values(results.uuids.js)]).size,
+    7
+  )
+}
+
+/**
  * Re-derives, from the archived transcripts and sink files, what the L2–L8 scenarios proved: the
  * complete stream is accounted for, every claimed Push joins its decode, transmitted bytes and a
  * once-consumed sink record, and each scenario's own wire or sink conclusion still holds.
@@ -1434,52 +1605,7 @@ const verifyLive = (record, directory, manifest, read) => {
         assertJsCounter(kind, sample.decoded)
       }
     }
-    for (const [role, java] of Object.entries(results.java)) {
-      assert.equal(java.assignedId, `${record.run.stem}-java-${role}`)
-      const rows = reader.readExports({ uuid: java.uuid })
-      assert(rows.filter((r) => !r.terminating).length >= 2, `Too few ${role} exports`)
-      assert.equal(rows.filter((r) => r.terminating).length, 1, `Missing ${role} final`)
-      assertJavaRows(
-        role,
-        rows.sort((a, b) => a.tsMs - b.tsMs || a.seq - b.seq),
-        {
-          clientId: `${record.run.stem}-java-${role}`,
-          closing: java.closing,
-          closed: java.closed,
-          group: `${record.run.stem}-java-consumer-group`,
-          membership: java.stdout
-            .trim()
-            .split('\n')
-            .map(JSON.parse)
-            .filter((r) => r.membership === true),
-        }
-      )
-      assert.equal(java.exitCode, 0)
-      assert.equal(java.exitSignal, null)
-      assert(java.closeToExitMs <= 10000)
-      assert.deepEqual(java.liveDescendants, [])
-    }
-    const provenance = results.provenance
-    assert.equal(provenance.sourceSha256, record.fixture.clientSourceSha256)
-    assert.equal(provenance.runnerSha256, record.fixture.runnerSha256)
-    const pins = fs
-      .readFileSync(path.join(__dirname, 'interop.sha256'), 'utf8')
-      .trim()
-      .split('\n')
-      .map((line) => {
-        const [sha256, name] = line.trim().split(/\s+/)
-        return { name, sha256 }
-      })
-    assert.deepEqual(
-      provenance.cache.map(({ name, sha256 }) => ({ name, sha256 })),
-      pins
-    )
-    for (const role of ['producer', 'consumer', 'admin'])
-      assert(provenance.jdk[role]?.jdk && provenance.jdk[role]?.vendor)
-    assert.equal(
-      new Set([...Object.values(results.uuids.java), ...Object.values(results.uuids.js)]).size,
-      7
-    )
+    verifyJavaInterop(record, path.join(directory, manifest.root), transcripts)
   } else if (manifest.scenario === 'telemetry-outcomes') {
     assert.deepEqual(
       Object.keys(oracles).sort(),
@@ -3824,6 +3950,7 @@ module.exports = {
   runCase,
   persistEvidence,
   verifyScenario,
+  verifyJavaInterop,
   verifyChurn,
   verifyChurnFence,
   verifyChurnHandshakes,

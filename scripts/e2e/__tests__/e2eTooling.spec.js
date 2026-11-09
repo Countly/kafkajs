@@ -1461,7 +1461,7 @@ describe('Java telemetry role runner', () => {
     const fixture = path.join(root, 'scripts/e2e/telemetry')
     const digest = (file) => createHash('sha256').update(fs.readFileSync(file)).digest('hex')
     expect(digest(path.join(fixture, 'JavaTelemetryClient.java'))).toBe(
-      'b6e5c3aa29dc2fdd33a37b7a5efc14e06d9119f3946b7a511f0bfd67a1ff95e6'
+      '1145746dfeadc7d315e42b1c9d3b3468d819929324cc7701cbddbb423f66b580'
     )
     expect(digest(path.join(fixture, 'telemetryWireProbe.js'))).toBe(
       '139afdbec5034f7c1498b90306889fd918ae13097efee1ea9f435b03dcf9b1b1'
@@ -1877,6 +1877,1011 @@ describe('complete telemetry evidence controls', () => {
     expect(() =>
       assertJavaRows('producer', rows, { ...episode, closed: { closed: false, epochMs: 40 } })
     ).toThrow()
+  })
+  describe('pinned Java admin checkpoint and replay', () => {
+    const { createHash } = require('crypto')
+    const { verifyJavaInterop } = require('../telemetry/evidence')
+    const {
+      JavaAdminHandshake,
+      selectJavaCheckpoint,
+      JAVA_REQUESTED,
+      javaSampleSummary,
+    } = require('../telemetry/semantics')
+    const { canonicalUuid } = require('../../../testHelpers/telemetryFixtures')
+    const root = path.resolve(__dirname, '../../..')
+    const digest = (bytes) => createHash('sha256').update(bytes).digest('hex')
+    const clone = (value) => JSON.parse(JSON.stringify(value))
+
+    /**
+     * Builds all three Java roles, four JS Get confirmations and complete three-node sink files.
+     * The enclosing scenario verifier separately owns the existing JS wire/decode joins.
+     * @param {boolean} final whether a real optional admin final is represented
+     * @returns {object} version-2 Java replay inputs and bounded cleanup
+     */
+    const archive = (final = false) => {
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'java-checkpoint-'))
+      const roles = ['producer', 'consumer', 'admin']
+      const kinds = [...roles, 'share']
+      const uuid = (n) => `00112233-4455-6677-8899-aabbccddee0${n}`
+      const compact = (id) => Buffer.from(id.replaceAll('-', ''), 'hex').toString('base64url')
+      const fixture = {
+        clientSourceSha256: digest(
+          fs.readFileSync(path.join(root, 'scripts/e2e/telemetry/JavaTelemetryClient.java'))
+        ),
+        runnerSha256: digest(fs.readFileSync(path.join(root, 'scripts/e2e/telemetry/run.sh'))),
+      }
+      const provenance = {
+        clientVersion: '4.3.1',
+        sourceSha256: fixture.clientSourceSha256,
+        runnerSha256: fixture.runnerSha256,
+        jdk: Object.fromEntries(roles.map((r) => [r, { jdk: '21-test', vendor: 'test' }])),
+        cache: fs
+          .readFileSync(path.join(root, 'scripts/e2e/telemetry/interop.sha256'), 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => {
+            const [sha256, name] = line.split(/\s+/)
+            return { name, sha256 }
+          }),
+      }
+      const results = {
+        javaEvidenceVersion: 2,
+        provenance,
+        java: {},
+        js: {},
+        children: {},
+        uuids: {
+          java: Object.fromEntries(roles.map((r, i) => [r, uuid(i + 1)])),
+          js: Object.fromEntries(kinds.map((r, i) => [r, uuid(i + 4)])),
+        },
+        controls: { producerRecords: 2, seedCommit: '1' },
+        readback: {
+          metrics: JAVA_REQUESTED,
+          interval: 1000,
+          ids: [...roles.map((r) => `case-java-${r}`), ...kinds.map((r) => `case-js-${r}`)],
+        },
+      }
+      const rows = {}
+      for (const [i, role] of roles.entries()) {
+        const id = results.uuids.java[role]
+        const list = [
+          row(),
+          row(false, true),
+          ...(role !== 'admin' || final ? [row(true, true)] : []),
+        ]
+        for (const [index, sample] of list.entries()) {
+          Object.assign(sample, {
+            v: 1,
+            node: String(i + 1),
+            seq: index + 1,
+            dataBytes: 500,
+            dataSha256: digest(`${role}-${index}`),
+            clientId: `case-java-${role}`,
+            clientInstanceId: id,
+            tsMs: [100, 250, role === 'admin' ? 320 : 305][index],
+          })
+          sample.metrics[0].name = `org.apache.kafka.${role === 'admin' ? 'admin.client' : role}.connection.creation.total`
+          for (const metric of sample.metrics)
+            metric.points[0].timeNs = String(BigInt([100, 250, 305][index]) * 1000000n)
+          if (role === 'consumer')
+            for (const resource of sample.resources)
+              resource.attrs = [
+                ['group_id', 'string', 'case-java-consumer-group'],
+                ['group_member_id', 'string', 'member'],
+              ]
+        }
+        rows[role] = list
+        fs.writeFileSync(
+          path.join(directory, `exports-${i + 1}.jsonl`),
+          list.map((r) => JSON.stringify(r) + '\n').join('')
+        )
+        const markers = [
+          { at: 10, fields: provenance.jdk[role] },
+          { at: 50, fields: { role, clientInstanceId: compact(id), closed: false } },
+          ...(role === 'consumer'
+            ? [
+                {
+                  at: 51,
+                  fields: {
+                    membership: true,
+                    fromEpochMs: 0,
+                    epochMs: 1,
+                    beforeMemberId: '',
+                    memberId: 'member',
+                  },
+                },
+              ]
+            : []),
+          ...(role === 'admin'
+            ? [
+                {
+                  at: 200,
+                  fields: {
+                    closeReady: true,
+                    role,
+                    clientId: `case-java-${role}`,
+                    clientInstanceId: compact(id),
+                    checkpointId: 'q'.repeat(22),
+                    epochMs: 200,
+                    operation: {
+                      api: 'listTopics',
+                      success: true,
+                      startedEpochMs: 190,
+                      completedEpochMs: 195,
+                    },
+                  },
+                },
+                {
+                  at: 270,
+                  fields: {
+                    closeReleased: true,
+                    role,
+                    clientId: `case-java-${role}`,
+                    clientInstanceId: compact(id),
+                    checkpointId: 'q'.repeat(22),
+                    epochMs: 270,
+                    node: '3',
+                    seq: 2,
+                    dataSha256: list[1].dataSha256,
+                  },
+                },
+              ]
+            : []),
+          { at: 300, fields: { role, closing: true, epochMs: 300, requestedCloseMs: 3000 } },
+          { at: 310, fields: { role, closed: true, epochMs: 310, closeElapsedNs: '10000000' } },
+        ].map(({ at, fields }) => ({ at, line: JSON.stringify(fields) }))
+        const child = (results.children[role] = {
+          code: 0,
+          signal: null,
+          exitAt: 320,
+          overflow: false,
+          pipesDrained: true,
+          supervisorFailure: false,
+          liveDescendants: [],
+          markers,
+          stdout: markers.map((m) => m.line + '\n').join(''),
+          stderr: '',
+        })
+        results.java[role] = {
+          uuid: id,
+          assignedId: `case-java-${role}`,
+          closePolicy: role === 'admin' ? 'preclose-checkpoint-v1' : 'required-final-v1',
+          timing: javaSampleSummary(list),
+          normalExports: 2,
+          finalExports: list.length - 2,
+          exports: list.map(({ node, seq, terminating, dataSha256 }) => ({
+            node,
+            seq,
+            terminating,
+            dataSha256,
+          })),
+          closing: JSON.parse(markers.at(-2).line),
+          closed: JSON.parse(markers.at(-1).line),
+          exitCode: 0,
+          exitSignal: null,
+          closeToExitMs: 20,
+          liveDescendants: [],
+          markers: child.markers,
+          stdout: child.stdout,
+          stderr: '',
+        }
+      }
+      const capture = (at, prefix = false) => ({
+        at,
+        cursors: Object.fromEntries(
+          roles.map((r, i) => [String(i + 1), prefix ? 2 : rows[r].length])
+        ),
+        nodes: Object.fromEntries(
+          roles.map((r, i) => {
+            const bytes = Buffer.from(
+              (prefix ? rows[r].slice(0, 2) : rows[r]).map((r) => JSON.stringify(r) + '\n').join('')
+            )
+            return [String(i + 1), { bytes: bytes.length, sha256: digest(bytes) }]
+          })
+        ),
+      })
+      const admin = results.java.admin
+      admin.checkpoint = {
+        proof: capture(260, true),
+        command: {
+          raw: `CLOSE ${'q'.repeat(22)} ${compact(admin.uuid)} 3 2 ${rows.admin[1].dataSha256}\n`,
+          sentAt: 261,
+          completedAt: 262,
+        },
+      }
+      admin.cessation = {
+        drain: Array.from({ length: 11 }, (_, i) => capture(320 + i * 200)),
+        quiet: Array.from({ length: 11 }, (_, i) => capture(2320 + i * 200)),
+      }
+      const entries = {
+        metrics: JAVA_REQUESTED,
+        'interval.ms': '1000',
+        match: `client_id=^(${results.readback.ids.join('|')})$`,
+      }
+      results.subscription = {
+        name: 'case',
+        entries,
+        createdAt: 0,
+        readback: {
+          resourceType: 16,
+          resourceName: 'case',
+          errorCode: 0,
+          configEntries: Object.entries(entries).map(([configName, configValue]) => ({
+            configName,
+            configValue,
+          })),
+        },
+        deletion: {
+          startedAt: 4400,
+          response: { resources: [{ errorCode: 0 }] },
+          listing: { resources: [] },
+        },
+      }
+      results.subscriptionOperations = [0, 1].map((index) => ({
+        request: {
+          timeout: 3000,
+          resources: [
+            {
+              type: 16,
+              name: 'case',
+              configEntries: Object.entries(entries).map(([name, value]) => ({
+                name,
+                operation: index,
+                ...(index === 0 ? { value } : {}),
+              })),
+            },
+          ],
+        },
+        response: { resources: [{ resourceType: 16, resourceName: 'case', errorCode: 0 }] },
+        startedAt: index ? 4400 : 0,
+        completedAt: index ? 4401 : 0,
+      }))
+      for (const kind of kinds) results.js[kind] = { uuid: results.uuids.js[kind] }
+      const transcripts = Object.fromEntries(
+        kinds.map((kind) => [
+          `js-${kind}`,
+          {
+            records: [
+              {
+                apiKey: 71,
+                response: {
+                  errorCode: 0,
+                  requestedMetrics: JAVA_REQUESTED.split(','),
+                  pushIntervalMs: 1000,
+                  deltaTemporality: true,
+                },
+              },
+            ],
+          },
+        ])
+      )
+      const record = {
+        fixture,
+        results,
+        run: { stem: 'case' },
+        sidecars: { scenario: 'telemetry-java' },
+      }
+      return {
+        directory,
+        record,
+        transcripts,
+        rows,
+        capture,
+        close: () => fs.rmSync(directory, { recursive: true, force: true }),
+      }
+    }
+
+    test.each([false, true])(
+      'verifies the complete version-2 scenario sidecar archive (admin final=%s)',
+      (final) => {
+        const a = archive(final)
+        try {
+          const { verifyScenario } = require('../telemetry/evidence')
+          const { record, directory } = a
+          const archiveRoot = 'case-case'
+          const target = path.join(directory, archiveRoot)
+          fs.mkdirSync(target)
+          const files = []
+          const retain = (relative, value) => {
+            const bytes = Buffer.isBuffer(value) ? value : Buffer.from(JSON.stringify(value))
+            const file = path.join(target, relative)
+            fs.mkdirSync(path.dirname(file), { recursive: true })
+            fs.writeFileSync(file, bytes)
+            files.push({
+              path: `${archiveRoot}/${relative}`,
+              bytes: bytes.length,
+              sha256: digest(bytes),
+            })
+          }
+          const owners = {}
+          record.pushes = []
+          record.zeroPushes = []
+          record.allowed = {}
+          record.status = 'passed'
+          record.run.line = '4.3.1'
+          retain('oracles.json', {})
+          const nodeOne = [...a.rows.producer]
+          // Fixed OTLP sums, checked offline with the retained independent Java decoder.
+          const rawHex = {
+            producer:
+              '0a5f125d125b0a336f72672e6170616368652e6b61666b612e70726f64756365722e636f6e6e656374696f6e2e6372656174696f6e2e746f74616c1a01313a210a1b11010000000000000019020000000000000031010000000000000010011801',
+            consumer:
+              '0a5f125d125b0a336f72672e6170616368652e6b61666b612e636f6e73756d65722e636f6e6e656374696f6e2e6372656174696f6e2e746f74616c1a01313a210a1b11010000000000000019020000000000000031010000000000000010011801',
+            admin:
+              '0a5c125a12580a306f72672e6170616368652e6b61666b612e61646d696e2e636f6e6e656374696f6e2e6372656174696f6e2e746f74616c1a01313a210a1b11010000000000000019020000000000000031010000000000000010011801',
+          }
+          for (const kind of ['producer', 'consumer', 'admin', 'share']) {
+            const owner = `js-${kind}`
+            const suffix = kind === 'share' ? 'consumer' : kind
+            const raw = Buffer.from(rawHex[suffix], 'hex')
+            const hash = digest(raw)
+            const body = {
+              dataBytes: raw.length,
+              dataSha256: hash,
+              parse: 'ok',
+              unknownFieldBytes: 0,
+              resourceMetricsCount: 1,
+              metricsTotal: 1,
+              pointsTotal: 1,
+              metricsKept: 1,
+              truncated: false,
+              resources: [{ attrs: [], droppedAttributes: 0, hasResource: false, schemaUrl: '' }],
+              metrics: [
+                {
+                  res: 0,
+                  scope: 0,
+                  scopeName: '',
+                  scopeVersion: '',
+                  scopeDroppedAttributes: 0,
+                  name: `org.apache.kafka.${suffix}.connection.creation.total`,
+                  unit: '1',
+                  kind: 'SUM',
+                  temporality: 'AGGREGATION_TEMPORALITY_DELTA',
+                  monotonic: true,
+                  points: [
+                    {
+                      attrs: [],
+                      startNs: '1',
+                      timeNs: '2',
+                      flags: 0,
+                      valueKind: 'AS_INT',
+                      asInt: '1',
+                    },
+                  ],
+                  pointsInMessage: 1,
+                },
+              ],
+            }
+            const uuid = record.results.uuids.js[kind]
+            const get = {
+              type: 'request',
+              apiKey: 71,
+              apiVersion: 0,
+              requestKey: 'g1',
+              clientId: `case-${owner}`,
+              socketId: 1,
+              uuid: '00000000-0000-0000-0000-000000000000',
+              writeAt: 10,
+              response: {
+                ...a.transcripts[owner].records[0].response,
+                uuid,
+                subscriptionId: 1,
+                telemetryMaxBytes: 4096,
+                responseAt: 20,
+              },
+            }
+            const requests = [get]
+            retain(`${owner}/raw-${hash}.bin`, raw)
+            retain(`${owner}/decoder-${hash}.json`, {
+              rawSha256: hash,
+              code: 0,
+              signal: null,
+              line: '4.3.1',
+              stdout:
+                JSON.stringify({ verified: true, line: '4.3.1' }) +
+                '\n' +
+                JSON.stringify(body) +
+                '\n',
+            })
+            for (let index = 0; index < 3; index++) {
+              const requestKey = `r${index + 2}`
+              const terminating = index === 2
+              const seq = nodeOne.length + 1
+              const request = {
+                type: 'request',
+                apiKey: 72,
+                apiVersion: 0,
+                requestKey,
+                socketId: 1,
+                node: '1',
+                clientId: `case-${owner}`,
+                uuid,
+                subscriptionId: 1,
+                terminating,
+                compressionType: 0,
+                metricsBytes: raw.length,
+                metricsSha256: hash,
+                writeAt: 100 + index * 1000,
+                response: { errorCode: 0, responseAt: 101 + index * 1000 },
+              }
+              requests.push(request)
+              nodeOne.push({
+                ...body,
+                v: 1,
+                node: '1',
+                seq,
+                clientId: `case-${owner}`,
+                clientInstanceId: uuid,
+                terminating,
+                pushIntervalMs: 1000,
+                tsMs: 5000 + seq,
+              })
+              retain(`${owner}/push-${requestKey}.bin`, raw)
+              retain(`${owner}/decoded-${requestKey}.json`, {
+                requestKey,
+                uuid,
+                node: '1',
+                compressionType: 0,
+                transmittedSha256: hash,
+                transmittedBytes: raw.length,
+                rawSha256: hash,
+                rawBytes: raw.length,
+                decoded: body,
+                exportIdentity: { node: '1', seq },
+              })
+              record.pushes.push({ owner, requestKey })
+            }
+            retain(`${owner}/transcript.json`, {
+              records: requests,
+              failures: [],
+              cleanup: { children: 0, timers: 0, stillOpen: [], attached: 0 },
+            })
+            owners[owner] = `${archiveRoot}/${owner}/transcript.json`
+          }
+          for (const [node, rows] of [
+            ['1', nodeOne],
+            ['2', a.rows.consumer],
+            ['3', a.rows.admin],
+          ])
+            retain(
+              `exports-${node}.jsonl`,
+              Buffer.from(rows.map((r) => JSON.stringify(r) + '\n').join(''))
+            )
+          record.sidecars = { scenario: 'telemetry-java', root: archiveRoot, files, owners }
+          expect(() => verifyScenario(record, directory)).not.toThrow()
+          record.results.java.admin.normalExports++
+          expect(() => verifyScenario(record, directory)).toThrow('Forged Java normal count')
+        } finally {
+          a.close()
+        }
+      }
+    )
+
+    test.each([false, true])(
+      'replays a complete version-2 Java archive with optional admin final=%s',
+      (final) => {
+        const a = archive(final)
+        try {
+          expect(() => verifyJavaInterop(a.record, a.directory, a.transcripts)).not.toThrow()
+        } finally {
+          a.close()
+        }
+      }
+    )
+
+    test.each([
+      [
+        'old format',
+        (a) => {
+          a.record.results.javaEvidenceVersion = 1
+        },
+        'version 2',
+      ],
+      [
+        'another client version',
+        (a) => {
+          a.record.results.provenance.clientVersion = '4.4.0'
+        },
+        'Unqualified Java client version',
+      ],
+      [
+        'wrong jar',
+        (a) => {
+          a.record.results.provenance.cache[0].sha256 = '0'.repeat(64)
+        },
+        'Wrong Java pinned input catalogue',
+      ],
+      [
+        'wrong source',
+        (a) => {
+          a.record.results.provenance.sourceSha256 = '0'.repeat(64)
+          a.record.fixture.clientSourceSha256 = '0'.repeat(64)
+        },
+        'Wrong Java candidate source',
+      ],
+      [
+        'bare final switch',
+        (a) => {
+          delete a.record.results.java.admin.checkpoint
+          a.record.results.java.admin.finalRequired = false
+        },
+        'Missing admin checkpoint/cessation',
+      ],
+      [
+        'forged normal count',
+        (a) => {
+          a.record.results.java.admin.normalExports = 3
+        },
+        'Forged Java normal count',
+      ],
+      [
+        'forged final count',
+        (a) => {
+          a.record.results.java.admin.finalExports = 1
+        },
+        'Forged Java final count',
+      ],
+      [
+        'wrong command row hash',
+        (a) => {
+          a.record.results.java.admin.checkpoint.command.raw =
+            a.record.results.java.admin.checkpoint.command.raw.replace(
+              a.rows.admin[1].dataSha256,
+              '0'.repeat(64)
+            )
+        },
+        'Wrong admin close command',
+      ],
+      [
+        'negative exit interval',
+        (a) => {
+          a.record.results.children.admin.exitAt = 299
+        },
+        'Invalid Java close-to-exit interval',
+      ],
+      [
+        'short drain',
+        (a) => {
+          a.record.results.java.admin.cessation.drain.pop()
+        },
+        'Short admin drain',
+      ],
+      [
+        'short quiet',
+        (a) => {
+          a.record.results.java.admin.cessation.quiet.pop()
+        },
+        'Short admin quiet',
+      ],
+      [
+        'untimed quiet',
+        (a) => {
+          delete a.record.results.java.admin.cessation.quiet[3].at
+        },
+        'Incomplete admin timed capture',
+      ],
+      [
+        'missing node',
+        (a) => {
+          fs.unlinkSync(path.join(a.directory, 'exports-2.jsonl'))
+        },
+        '',
+      ],
+      [
+        'missing capture node',
+        (a) => {
+          delete a.record.results.java.admin.checkpoint.proof.nodes[2]
+        },
+        'Missing Java node capture',
+      ],
+      [
+        'stderr',
+        (a) => {
+          a.record.results.children.admin.stderr = 'unexpected failure'
+        },
+        'Unexpected Java stderr',
+      ],
+      [
+        'overflow',
+        (a) => {
+          a.record.results.children.admin.overflow = true
+        },
+        'Java output overflow',
+      ],
+      [
+        'killed child',
+        (a) => {
+          a.record.results.children.admin.signal = 'SIGKILL'
+        },
+        '',
+      ],
+      [
+        'failed close',
+        (a) => {
+          a.record.results.children.admin.code = 1
+        },
+        'Java child did not exit naturally',
+      ],
+      [
+        'undrained pipes',
+        (a) => {
+          a.record.results.children.admin.pipesDrained = false
+        },
+        'Java pipes not drained',
+      ],
+      [
+        'surviving descendant',
+        (a) => {
+          a.record.results.children.admin.liveDescendants = [1]
+        },
+        'Surviving Java descendant',
+      ],
+      [
+        'missing producer final',
+        (a) => {
+          a.rows.producer.pop()
+          a.record.results.java.producer.finalExports = 0
+          a.record.results.java.producer.exports.pop()
+          fs.writeFileSync(
+            path.join(a.directory, 'exports-1.jsonl'),
+            a.rows.producer.map((r) => JSON.stringify(r) + '\n').join('')
+          )
+        },
+        'Missing Java final',
+      ],
+      [
+        'admin policy for producer',
+        (a) => {
+          a.record.results.java.producer.closePolicy = 'preclose-checkpoint-v1'
+        },
+        'Wrong Java close policy',
+      ],
+      [
+        'changed Get selection',
+        (a) => {
+          a.transcripts['js-admin'].records[0].response.requestedMetrics.pop()
+        },
+        '',
+      ],
+      [
+        'early subscription removal',
+        (a) => {
+          a.record.results.subscription.deletion.startedAt = 1000
+        },
+        'Java subscription removed before cessation',
+      ],
+    ])('rejects %s at the intended replay gate', (_name, mutate, diagnostic) => {
+      const a = archive()
+      try {
+        mutate(a)
+        expect(() => verifyJavaInterop(a.record, a.directory, a.transcripts)).toThrow(diagnostic)
+      } finally {
+        a.close()
+      }
+    })
+
+    test.each([
+      [
+        'three metrics',
+        (r) => {
+          r[1].metrics.pop()
+        },
+      ],
+      [
+        'JS admin name',
+        (r) => {
+          r[1].metrics[0].name = 'org.apache.kafka.admin.connection.creation.total'
+        },
+      ],
+      [
+        'wrong Java name',
+        (r) => {
+          r[1].metrics[0].name = 'org.apache.kafka.admin.client.connection.creation.rate'
+        },
+      ],
+      [
+        'duplicate counter',
+        (r) => {
+          r[1].metrics.push(r[1].metrics[0])
+        },
+      ],
+      [
+        'duplicate resource',
+        (r) => {
+          r[1].metrics[2].res = 0
+        },
+      ],
+      [
+        'duplicate point',
+        (r) => {
+          r[1].metrics[1].points.push(r[1].metrics[1].points[0])
+        },
+      ],
+      [
+        'double bits',
+        (r) => {
+          r[1].metrics[1].points[0].asDoubleBits = '0'.repeat(16)
+        },
+      ],
+      [
+        'integer value',
+        (r) => {
+          r[1].metrics[2].points[0].asInt = '4243'
+        },
+      ],
+      [
+        'sum history',
+        (r) => {
+          r[1].metrics[3].points[0].asDouble = '7'
+        },
+      ],
+      [
+        'foreign UUID',
+        (r) => {
+          r[1].clientInstanceId = '10112233-4455-6677-8899-aabbccddee03'
+        },
+      ],
+    ])('never releases on %s', async (_name, mutate) => {
+      const a = archive()
+      try {
+        const rows = clone(a.rows.admin)
+        mutate(rows)
+        const ready = JSON.parse(a.record.results.children.admin.markers[2].line)
+        expect(() => selectJavaCheckpoint(rows, ready, { clientId: 'case-java-admin' })).toThrow()
+      } finally {
+        a.close()
+      }
+    })
+
+    /** @param {object} a archive inputs @returns {void} updates byte receipts without changing cursors */
+    const reseal = (a) => {
+      for (const rows of Object.values(a.rows))
+        fs.writeFileSync(
+          path.join(a.directory, `exports-${rows[0].node}.jsonl`),
+          rows.map((r) => JSON.stringify(r) + '\n').join('')
+        )
+      const admin = a.record.results.java.admin
+      for (const receipt of [
+        admin.checkpoint.proof,
+        ...admin.cessation.drain,
+        ...admin.cessation.quiet,
+      ]) {
+        for (const node of ['1', '2', '3']) {
+          const bytes = Buffer.from(
+            Object.values(a.rows)
+              .find((r) => r[0].node === node)
+              .slice(0, receipt.cursors[node])
+              .map((r) => JSON.stringify(r) + '\n')
+              .join('')
+          )
+          receipt.nodes[node] = { bytes: bytes.length, sha256: digest(bytes) }
+        }
+      }
+      for (const role of ['producer', 'consumer', 'admin']) {
+        const java = a.record.results.java[role]
+        const child = a.record.results.children[role]
+        java.timing = javaSampleSummary(a.rows[role])
+        java.normalExports = a.rows[role].filter((r) => !r.terminating).length
+        java.finalExports = a.rows[role].filter((r) => r.terminating).length
+        java.exports = a.rows[role].map(({ node, seq, terminating, dataSha256 }) => ({
+          node,
+          seq,
+          terminating,
+          dataSha256,
+        }))
+        child.stdout = child.markers.map((m) => m.line + '\n').join('')
+        java.markers = child.markers
+        java.stdout = child.stdout
+      }
+    }
+
+    test.each([
+      [
+        'stale checkpoint',
+        (a) => {
+          const m = a.record.results.children.admin.markers[2]
+          const f = JSON.parse(m.line)
+          f.epochMs = 250
+          m.line = JSON.stringify(f)
+        },
+        'Missing fresh admin checkpoint',
+      ],
+      [
+        'future checkpoint',
+        (a) => {
+          const m = a.record.results.children.admin.markers[2]
+          const f = JSON.parse(m.line)
+          f.epochMs = 280
+          m.line = JSON.stringify(f)
+        },
+        'Admin epoch order',
+      ],
+      [
+        'duplicate ready',
+        (a) => {
+          const m = a.record.results.children.admin.markers
+          m.splice(3, 0, m[2])
+        },
+        'Missing or duplicate Java closeReady',
+      ],
+      [
+        'missing release',
+        (a) => {
+          a.record.results.children.admin.markers.splice(3, 1)
+        },
+        'Missing or duplicate Java closeReleased',
+      ],
+      [
+        'reordered markers',
+        (a) => {
+          const m = a.record.results.children.admin.markers
+          ;[m[3].line, m[4].line] = [m[4].line, m[3].line]
+          a.record.results.java.admin.closeToExitMs = 50
+        },
+        'Admin checkpoint marker order',
+      ],
+      [
+        'late collection',
+        (a) => {
+          a.rows.admin[1].metrics[0].points[0].timeNs = '311000000'
+        },
+        'Sample collected after Java close',
+      ],
+      [
+        'two admin finals',
+        (a) => {
+          a.rows.admin.push({ ...clone(a.rows.admin[2]), seq: 4, tsMs: 330 })
+          for (const r of [
+            ...a.record.results.java.admin.cessation.drain,
+            ...a.record.results.java.admin.cessation.quiet,
+          ])
+            r.cursors[3] = 4
+        },
+        'Two admin finals',
+      ],
+      [
+        'final before close',
+        (a) => {
+          for (const m of a.rows.admin[2].metrics) m.points[0].timeNs = '299000000'
+        },
+        'Final outside Java close episode',
+      ],
+      [
+        'collection after final',
+        (a) => {
+          for (const m of a.rows.admin[1].metrics) m.points[0].timeNs = '306000000'
+        },
+        'Further collection after admin final',
+      ],
+      [
+        'reused sequence',
+        (a) => {
+          a.rows.admin[1].seq = 1
+        },
+        'sequence or node mismatch',
+      ],
+      [
+        'activity during quiet',
+        (a) => {
+          const late = clone(a.rows.admin[1])
+          late.seq = 4
+          late.tsMs = 2400
+          a.rows.admin.push(late)
+          for (const r of a.record.results.java.admin.cessation.quiet.slice(1)) r.cursors[3] = 4
+        },
+        'Admin activity during quiet window',
+      ],
+    ])('rejects resealed %s at its diagnostic', (_name, mutate, diagnostic) => {
+      const a = archive(true)
+      try {
+        mutate(a)
+        reseal(a)
+        expect(() => verifyJavaInterop(a.record, a.directory, a.transcripts)).toThrow(diagnostic)
+      } finally {
+        a.close()
+      }
+    })
+
+    test('keeps the KafkaJS admin spelling on the real collector', () => {
+      const TelemetryMetrics = require('../../../src/telemetry/metrics')
+      const metrics = new TelemetryMetrics({ kind: 'admin' })
+      metrics.observeConnection({})
+      const subscription = {
+        revision: 1n,
+        requestedMetrics: ['org.apache.kafka.admin.connection.creation.total'],
+        deltaTemporality: true,
+      }
+      metrics.select(subscription)
+      const points = metrics.snapshot(subscription).points
+      expect(points).toHaveLength(1)
+      expect(points[0]).toMatchObject({
+        name: 'org.apache.kafka.admin.connection.creation.total',
+        type: 'sum',
+        unit: '1',
+        value: 1n,
+      })
+    })
+
+    test.each(['old sample', 'broker time only', 'one normal'])(
+      'does not acknowledge %s',
+      (mode) => {
+        const a = archive()
+        try {
+          const rows = clone(a.rows.admin)
+          if (mode === 'one normal') rows.pop()
+          else for (const m of rows[1].metrics) m.points[0].timeNs = '200000000'
+          if (mode === 'broker time only') rows[1].tsMs = 999999
+          const ready = JSON.parse(a.record.results.children.admin.markers[2].line)
+          expect(selectJavaCheckpoint(rows, ready, { clientId: 'case-java-admin' })).toBeUndefined()
+        } finally {
+          a.close()
+        }
+      }
+    )
+
+    test.each(['valid', 'early exit', 'source timeout', 'malformed row', 'wrong ready UUID'])(
+      'joins the parent handshake for %s',
+      async (mode) => {
+        const a = archive()
+        const writes = []
+        let pending = 0
+        try {
+          const childRecord = a.record.results.children.admin
+          const marker = (key) =>
+            childRecord.markers
+              .map((r) => ({ ...r, fields: JSON.parse(r.line) }))
+              .find((m) => (key === 'clientInstanceId' ? m.fields.closed === false : m.fields[key]))
+          if (mode === 'wrong ready UUID')
+            marker('closeReady').fields.clientInstanceId = 'x'.repeat(22)
+          const ready = marker('closeReady')
+          if (mode === 'wrong ready UUID') ready.fields.clientInstanceId = 'x'.repeat(22)
+          const handshake = new JavaAdminHandshake({
+            child: {
+              marker: (key) => (key === 'closeReady' ? ready : marker(key)),
+              done: mode === 'early exit' ? Promise.resolve({ code: 0 }) : new Promise(() => {}),
+            },
+            signal: new AbortController().signal,
+            clientId: 'case-java-admin',
+            now: () => 261,
+            find: async (signal, _label, _ms, lookup) => {
+              pending++
+              try {
+                await Promise.resolve()
+                if (signal.aborted) throw signal.reason
+                if (mode === 'source timeout') throw new Error('source timeout')
+                const found = lookup()
+                if (!found) throw new Error('checkpoint timeout')
+                return found
+              } finally {
+                pending--
+              }
+            },
+            capture: () => a.capture(260, true),
+            rowsOf: (id) => {
+              expect(id).toBe(canonicalUuid(ready.fields.clientInstanceId))
+              const rows = clone(a.rows.admin)
+              if (mode === 'malformed row') rows[1].metrics.pop()
+              return rows
+            },
+            send: async (raw) => {
+              writes.push(raw)
+            },
+          })
+          if (mode === 'valid') {
+            await expect(handshake.run()).resolves.toMatchObject({
+              command: { raw: a.record.results.java.admin.checkpoint.command.raw },
+            })
+            expect(writes).toHaveLength(1)
+          } else {
+            await expect(handshake.run()).rejects.toThrow()
+            expect(writes).toHaveLength(0)
+          }
+          expect(pending).toBe(0)
+        } finally {
+          a.close()
+        }
+      }
+    )
   })
 })
 

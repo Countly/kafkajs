@@ -322,7 +322,7 @@ an empty requested list polls without Push. Wire evidence distinguishes them.
 |---|---|
 | Configured Kafka 4.3.1 and 4.2.2 | Accepted JS wire requests, complete independent decoding and matching reporter exports |
 | Base Kafka 4.3.1, 4.2.2, 4.1.2 and 4.0.2 without exporter (4.4.0 as additional coverage) | Actual missing telemetry advertisements and no extra telemetry traffic or connection; supported foreground operations remain usable |
-| Java client 4.3.1 producer, consumer and admin | Distinct stable instance IDs, common subscription semantics, each role's independently decoded final and natural child exit |
+| Java client 4.3.1 producer, consumer and admin | Distinct stable instance IDs, four-metric exports, producer/consumer finals and the pinned admin checkpoint/close/cessation proof |
 
 These are fixture-specific checks, not a claim that an older broker version can
 never support telemetry. Unsupported ShareConsumer connections retain their own
@@ -331,8 +331,11 @@ The designated lines, the 4.0.2 floor and Node 22, 24 and 26 are judged by the
 CI lanes. Only retained CI receipts establish an observed result; readiness or
 a listed scenario is not a passing result.
 
-Java roles submit active foreground work before close, and each role's own UUID
-must have a terminating export. Process exit alone is insufficient. Java and JS
+Java producer and consumer each require at least two complete accepted normal exports and exactly one complete UUID-specific terminating export within their close episode. Java admin requires at least two complete accepted normal exports, including a fresh normal export collected after a successful public admin operation at its explicit pre-close checkpoint. The parent must independently validate that export before allowing admin close. Admin then calls public `close(Duration.ofSeconds(3))`, returns, exits naturally within the existing 10000 ms close-to-exit bound with drained pipes, and passes the fixed all-node drain/quiescence observation. Report every observed admin final, permitting zero or one; validate its complete payload and lifecycle if present. The admin exception is qualified by the pinned Java client identity and shutdown sources. Every Java role still exports exactly its connection counter and the three unchanged custom controls in four ResourceMetrics. All KafkaJS final/timeout/reopen requirements remain unchanged.
+
+Pinned Java 4.3.1 admin closes its metrics reporter before awaiting network shutdown, so public close supplies no guaranteed terminating push. The parent requires completed listTopics work, a strictly fresh four-metric export, one UUID/checkpoint/row-hash-bound close acknowledgement, natural exit and fixed 2000 ms drain plus 2000 ms quiet capture across all nodes. Optional finals are fully validated; exporter time is separate from collection time. Version-2 evidence replays the raw checkpoint, public close and cessation facts and validates the pinned jar/source identity. The Java `admin.client` counter and KafkaJS `admin` counter retain their respective double/empty-unit and integer/unit-1 encodings. Old evidence cannot pass this amended gate retroactively. CI still owes the corrected four-metric Java admin export and the complete same-candidate proof.
+
+Java and JS
 need not emit identical values, windows, scopes or timestamps. JS payloads use
 captured successful responses plus a full independent decode and sink join;
 the narrow Java comparison uses complete independent broker exports and the
