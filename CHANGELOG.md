@@ -21,6 +21,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Verify pinned Java admin close with completed work, a fresh four-metric export and bounded acknowledged close/cessation evidence; retain mandatory producer/consumer finals and replay versioned raw receipts.
 - Compare the complete Java interoperability subscription without prefix-order assumptions in live checks and archive replay, retaining both admin counter names and rejecting missing, extra or duplicate prefixes.
 - Add an isolated Node-24 retained-ownership diagnostic with bounded captures, scalar counterparts, source archives and broker-free failure controls; diagnostic evidence cannot satisfy resource acceptance.
+- Reserve retained-diagnostic weak history before measurement, retire dead observation wrappers, and attribute observer storage separately from product state.
 - Qualify telemetry final subscription-deletion errors with archived admin evidence, and verify forced share shutdown using final acknowledgements and exact suffix redelivery.
 - Use the non-deprecated bounded Java consumer close API, select the Java admin counter by its source name, and read Kafka JSON connection traces from the request appender. Retain the primary shutdown failure with partial-segment diagnostics.
 - Settle resource measurements with recorded collection convergence, release native result references before closed readings, and preserve sampling through native settlement.
