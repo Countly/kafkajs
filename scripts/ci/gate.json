@@ -18976,6 +18976,7 @@
         "src/consumer/__tests__/regexSubscriptionLive.spec.js \u203a Consumer > regex subscription (live) honours fromBeginning on a topic that was produced to before it was assigned",
         "src/consumer/__tests__/regexSubscriptionLive.spec.js \u203a Consumer > regex subscription (live) picks up a topic created after run(), without polling metadata for it",
         "src/consumer/__tests__/regexSubscriptionLive.spec.js \u203a Consumer > regex subscription (live) starts cleanly with no target topics and reaches its first assignment",
+        "src/instrumentation/__tests__/diagnosticsChannelLive.spec.js \u203a Instrumentation > share diagnostics channels (live) publishes live share events to the eighteen named channels",
         "src/instrumentation/__tests__/diagnosticsChannelLive.spec.js \u203a Instrumentation > diagnostics channels (live) a round trip reaches the channels with public event names, and the recipe counts what was consumed",
         "src/network/__tests__/connectionSetupLive.spec.js \u203a Connection setup live an explicit setup timeout stays flat without a maximum",
         "src/network/__tests__/connectionSetupLive.spec.js \u203a Connection setup live setup budgets grow on one node and ready resets the next attempt",
@@ -19643,6 +19644,7 @@
       "capMinutes": 48,
       "allowedSkips": [
         "src/cluster/__tests__/rebootstrapLive.spec.js \u203a Cluster > rebootstrap (live, cluster replaced on new ports) a client whose entire cluster is replaced rebootstraps and resumes producing and consuming",
+        "src/instrumentation/__tests__/diagnosticsChannelLive.spec.js \u203a Instrumentation > share diagnostics channels (live) publishes live share events to the eighteen named channels",
         "src/instrumentation/__tests__/diagnosticsChannelLive.spec.js \u203a Instrumentation > diagnostics channels (live) a round trip reaches the channels with public event names, and the recipe counts what was consumed",
         "src/network/__tests__/requestTimeoutCloseLive.spec.js \u203a Request timeout closes its connection over real TCP (live) the timed-out connection is closed and the idempotent batches are resent in order, each once",
         "src/network/__tests__/requestTimeoutCloseLive.spec.js \u203a Request timeout closes its connection over real TCP (live) every evidence line of this run carries the stamps a verifier checks",
@@ -22054,6 +22056,7 @@
         "src/consumer/__tests__/topicRecreatedLive.spec.js \u203a Consumer > topic recreation (live) a recreation before the first confirmed commit resets again after stop and run",
         "src/network/__tests__/requestTimeoutCloseLive.spec.js \u203a Request timeout closes its connection over real TCP (live) the timed-out connection is closed and the idempotent batches are resent in order, each once",
         "src/network/__tests__/requestTimeoutCloseLive.spec.js \u203a Request timeout closes its connection over real TCP (live) every evidence line of this run carries the stamps a verifier checks",
+        "src/instrumentation/__tests__/diagnosticsChannelLive.spec.js \u203a Instrumentation > share diagnostics channels (live) publishes live share events to the eighteen named channels",
         "src/instrumentation/__tests__/diagnosticsChannelLive.spec.js \u203a Instrumentation > diagnostics channels (live) a round trip reaches the channels with public event names, and the recipe counts what was consumed",
         "src/producer/__tests__/idempotentPipeliningLive.spec.js \u203a Producer > idempotent pipelining (live) maxInFlightRequests: 5 the producer keeps 5 requests unanswered per broker, the wire carries up to the in-flight limit, a partition has one batch in flight, and every record lands once, in order",
         "src/producer/__tests__/idempotentPipeliningLive.spec.js \u203a Producer > idempotent pipelining (live) maxInFlightRequests: 2 the producer keeps 5 requests unanswered per broker, the wire carries up to the in-flight limit, a partition has one batch in flight, and every record lands once, in order",
