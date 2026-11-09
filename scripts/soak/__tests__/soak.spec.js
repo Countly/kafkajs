@@ -5796,6 +5796,8 @@ describe('Share soak complete original-owner schedules', () => {
     const transport = shareClient({ nodes: 3, topics: {} })
     const { cluster, table } = transport
     const tap = new ShareFetchTap(64, { now: () => performance.now() })
+    const { SoakTransport } = require('./fixtures/soakTransport')
+    const external = new SoakTransport(tap)
     /**
      * Models transport reset and close even though the wire archive retains destroyed sockets.
      * Rejects destroyed-stream writes before they can apply acknowledgements at the broker.
@@ -6147,24 +6149,25 @@ describe('Share soak complete original-owner schedules', () => {
         }
         return observed
       },
-      admin,
-      producer: () => ({
-        connect: async () => io('phase-open', { owner, driver, clock }),
-        disconnect: async () => {},
-        send: async ({ messages }) => {
-          const partition = messages[0].partition
-          const baseOffset = String(records[partition].length)
-          for (const message of messages)
-            records[partition].push({
-              ...message,
-              offset: String(records[partition].length),
-              settled: false,
-              owner: null,
-              count: 0,
-            })
-          return [{ partition, baseOffset, errorCode: 0 }]
-        },
-      }),
+      admin: () => external.admin(admin()),
+      producer: () =>
+        external.producer({
+          connect: async () => io('phase-open', { owner, driver, clock }),
+          disconnect: async () => {},
+          send: async ({ messages }) => {
+            const partition = messages[0].partition
+            const baseOffset = String(records[partition].length)
+            for (const message of messages)
+              records[partition].push({
+                ...message,
+                offset: String(records[partition].length),
+                settled: false,
+                owner: null,
+                count: 0,
+              })
+            return [{ partition, baseOffset, errorCode: 0 }]
+          },
+        }),
     }
     const driver = new ShareSoakDriver({
       kafka,
@@ -6177,16 +6180,18 @@ describe('Share soak complete original-owner schedules', () => {
         diagnostics,
         bounded: require('../../../src/producer/__tests__/fixtures/bounded'),
         probe: require('../../../src/producer/__tests__/fixtures/liveProbe'),
-        readLog: async () =>
-          new Map(
-            records.map((rows, partition) => [
-              partition,
-              {
-                endOffset: String(rows.length),
-                records: rows.map(({ offset, key, value }) => ({ offset, key, value })),
-              },
-            ])
-          ),
+        readLog: external.reader(
+          async () =>
+            new Map(
+              records.map((rows, partition) => [
+                partition,
+                {
+                  endOffset: String(rows.length),
+                  records: rows.map(({ offset, key, value }) => ({ offset, key, value })),
+                },
+              ])
+            )
+        ),
       },
     })
     const owner = new ShareSoak({
@@ -6263,6 +6268,7 @@ describe('Share soak complete original-owner schedules', () => {
         await transport.close().catch((failure) => cleanupErrors.push(failure))
         await flush()
       } finally {
+        external.close()
         resources.restore()
         globalThis.gc = exposed
         clock.restore()
