@@ -6,6 +6,7 @@ import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.TimeUnit;
 import org.apache.kafka.clients.admin.Admin;
+import org.apache.kafka.clients.consumer.CloseOptions;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.producer.KafkaProducer;
@@ -196,7 +197,7 @@ public final class JavaTelemetryClient {
             client.commitAsync();
         }
         /** @return nothing @throws RuntimeException on close failure */
-        @Override public void close() { client.close(Duration.ofSeconds(3)); }
+        @Override public void close() { client.close(CloseOptions.timeout(Duration.ofSeconds(3))); }
     }
 
     /** Admin with a pending external metadata call immediately before close. */

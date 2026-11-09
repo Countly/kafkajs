@@ -4,12 +4,12 @@ const { canonicalUuid } = require('../../../testHelpers/telemetryFixtures')
 const REMOVING = /TRACE Removing client connection id \[([^\]\s]+)\] from the client instance cache/
 const MISSING =
   /TRACE Client connection id \[([^\]\s]+)\] is not found in the client instance cache/
-const CONNECTION = /^(\S+):(\d+)-(\S+):(\d+)-(\d+)$/
+const CONNECTION = /^(\S+):(\d+)-(\S+):(\d+)-(\d+)(?:-(\d+))?$/
 
 /**
  * Reads complete disconnect windows, excluding removals followed by a cache miss anywhere in it.
  * @param {string} text complete bounded broker log
- * @returns {object[]} registered retirements with exact server-local/remote tuple and index
+ * @returns {object[]} registered retirements with exact server-local/remote tuple, processor and index
  * @throws {Error} for an unrecognized connection identity
  */
 const retirementsOf = (text) => {
@@ -26,7 +26,8 @@ const retirementsOf = (text) => {
         localPort: parts[2],
         remoteAddress: parts[3],
         remotePort: parts[4],
-        index: parts[5],
+        processor: parts[6] === undefined ? undefined : parts[5],
+        index: parts[6] ?? parts[5],
         line: line.trim(),
       },
     ]
@@ -34,7 +35,7 @@ const retirementsOf = (text) => {
 }
 
 /**
- * Joins one successful captured Get to its broker request/response TRACE. The request's unique
+ * Joins one successful captured Get to its broker's completed-request JSON (or legacy text). The request's unique
  * client id, correlation and returned UUID identify the physical connection through Docker NAT;
  * the complete server connection tuple and index are retained, rather than guessing NAT ports.
  * @param {object} options logs, captured Get, connect event and node/listener
@@ -48,22 +49,55 @@ const connectionIdentity = ({ logs, get, connect, node, localPort }) => {
   assert.equal(get.response.errorCode, 0)
   assert(Number.isInteger(connect.localPort) && typeof connect.localAddress === 'string')
   const uuid = canonicalUuid(get.response.uuid)
+  assert(typeof logs[node]?.text === 'string' && !logs[node].truncated, 'Get trace unavailable')
   const lines = logs[node].text
     .split('\n')
     .filter(
-      (line) =>
-        line.includes('Completed request:') &&
-        line.includes('GET_TELEMETRY_SUBSCRIPTIONS') &&
-        line.includes(`clientId=${get.clientId},`) &&
-        new RegExp(`correlationId=${get.correlation}[,)\\s]`).test(line) &&
-        canonicalUuid(/clientInstanceId=([^,\s)]+)/.exec(line.split('with response:')[0])?.[1]) ===
-          get.uuid
+      (line) => line.includes('Completed request:') && line.includes('GET_TELEMETRY_SUBSCRIPTIONS')
+    )
+    .map((line) => {
+      const body = line.split('Completed request:')[1].trim()
+      if (body.startsWith('{')) {
+        const end = body.lastIndexOf('}')
+        const record = JSON.parse(body.slice(0, end + 1))
+        return {
+          header: record.requestHeader,
+          request: record.request,
+          response: record.response,
+          connection: record.connection,
+        }
+      }
+      // Older broker traces use generated message toString rather than JSON.
+      return {
+        header: {
+          requestApiKey: 71,
+          requestApiVersion: get.apiVersion,
+          clientId: /clientId=([^,]+)/.exec(body)?.[1],
+          correlationId: Number(/correlationId=(\d+)/.exec(body)?.[1]),
+        },
+        request: { clientInstanceId: /clientInstanceId=([^,\s)]+)/.exec(body)?.[1] },
+        response: {
+          errorCode: 0,
+          clientInstanceId: /clientInstanceId=([^,\s)]+)/.exec(
+            body.split('with response:')[1] ?? ''
+          )?.[1],
+        },
+        connection: /from connection ([^;\s]+)/.exec(body)?.[1],
+      }
+    })
+    .filter(
+      ({ header, request }) =>
+        header.requestApiKey === 71 &&
+        header.requestApiVersion === get.apiVersion &&
+        header.clientId === get.clientId &&
+        header.correlationId === get.correlation &&
+        canonicalUuid(request.clientInstanceId) === get.uuid
     )
   assert.equal(lines.length, 1, 'Missing or ambiguous Get connection trace')
   const [line] = lines
-  const responseId = /clientInstanceId=([^,\s)]+)/.exec(line.split('with response:')[1] ?? '')?.[1]
-  assert.equal(canonicalUuid(responseId), uuid, 'Connection trace UUID differs')
-  const id = /from connection ([^;\s]+)/.exec(line)?.[1]
+  assert.equal(line.response.errorCode, 0, 'Connection trace Get failed')
+  assert.equal(canonicalUuid(line.response.clientInstanceId), uuid, 'Connection trace UUID differs')
+  const id = line.connection
   const tuple = CONNECTION.exec(id)
   assert(tuple, 'Missing broker connection tuple')
   assert.equal(tuple[2], localPort, 'Wrong broker listener')

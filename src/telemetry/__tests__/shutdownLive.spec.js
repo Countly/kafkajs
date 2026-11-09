@@ -5,6 +5,8 @@ const path = require('path')
 const v8 = require('v8')
 const vm = require('vm')
 const { performance } = require('perf_hooks')
+// eslint-disable-next-line n/no-extraneous-require -- YAML parser is pinned by the ESLint/Jest toolchain
+const yaml = require('js-yaml')
 const { spawn } = require('child_process')
 const { Kafka, logLevel } = require('../../../index')
 const {
@@ -21,6 +23,7 @@ const { DecoderGate, withTelemetryResource } = require('../../../testHelpers/tel
 const { SCHEDULES, TelemetrySegments } = require('../../../testHelpers/telemetrySegments')
 const { createResourceProbe, ResourceRoles } = require('../../../testHelpers/resourceProbe')
 const { createChaosSocketFactory, FrameFilter } = require('../../../testHelpers/chaosSocket')
+const { assertRequestLogConfig, requestTraceArgs } = require('./fixtures/requestTrace')
 const {
   bounded,
   caseTimeout,
@@ -196,23 +199,49 @@ class BrokerLogs {
   /**
    * @param {string} service broker service
    * @param {string} sinceIso RFC 3339 start of the window
-   * @param {string} [untilIso] RFC 3339 end of the window; open-ended when omitted
+   * @param {string} untilIso RFC 3339 end of the window
    * @returns {Promise<{text:string,truncated:boolean}>} the service log in that window
    * @throws {Error} for a failed log command
    */
   async since(service, sinceIso, untilIso) {
-    const result = await this.run([
-      'logs',
-      '--no-color',
-      '--no-log-prefix',
-      '--since',
-      sinceIso,
-      ...(untilIso ? ['--until', untilIso] : []),
-      service,
+    const [result, requests] = await Promise.all([
+      this.run([
+        'logs',
+        '--no-color',
+        '--no-log-prefix',
+        '--since',
+        sinceIso,
+        '--until',
+        untilIso,
+        service,
+      ]),
+      this.run(requestTraceArgs(service, sinceIso, untilIso)),
     ])
-    if (result.code !== 0 || result.error)
-      throw new Error(`Broker log unavailable for ${service}: ${result.stderr.slice(0, 300)}`)
-    return { text: result.stdout, truncated: result.truncated }
+    const failed = [result, requests].find((r) => r.code !== 0 || r.error)
+    if (failed)
+      throw new Error(`Broker log unavailable for ${service}: ${failed.stderr.slice(0, 300)}`)
+    return {
+      text: `${result.stdout}\n${requests.stdout}`,
+      truncated: result.truncated || requests.truncated,
+    }
+  }
+
+  /**
+   * Binds the runtime request-appender route and checks that its file is readable before work.
+   * @param {string} service owned broker service
+   * @returns {Promise<object>} configuration and bounded empty-window read receipts
+   * @throws {Error} for a changed route, unreadable file or failed/capped command
+   */
+  async requestLog(service) {
+    const config = await this.run(['exec', '-T', service, 'cat', '/opt/kafka/config/log4j2.yaml'])
+    if (config.code !== 0 || config.error || config.truncated)
+      throw new Error(`Request logger configuration unavailable for ${service}`)
+    assertRequestLogConfig(yaml.load(config.stdout))
+    const now = new Date().toISOString()
+    const read = await this.run(requestTraceArgs(service, now, now))
+    if (read.code !== 0 || read.error || read.truncated)
+      throw new Error(`Request appender unavailable for ${service}: ${read.stderr.slice(0, 300)}`)
+    return { config, read }
   }
 }
 
@@ -822,7 +851,9 @@ class ReopenCase {
    */
   async finishAll() {
     const outcomes = await Promise.allSettled(
-      this.members.map((m) => m.segments.finish(m.client, this.closeOptions()))
+      this.members.map((m) =>
+        m.segments.finish(m.client, this.closeOptions(), { cause: this.failure })
+      )
     )
     const errors = outcomes.filter((r) => r.status === 'rejected').map((r) => r.reason)
     if (errors.length === 1) throw errors[0]
@@ -934,6 +965,11 @@ class ReopenCase {
     if (errors.length) throw new AggregateError(errors, 'Logger setup failed')
     this.results.loggerReceipts = this.logs.receipts
     this.results.originalLevels = levels
+    this.results.requestLogs = Object.fromEntries(
+      await Promise.all(
+        services.map(async (service) => [service, await this.logs.requestLog(service)])
+      )
+    )
     const entries = {
       metrics: 'org.apache.kafka.',
       'interval.ms': '1000',
@@ -945,6 +981,13 @@ class ReopenCase {
       within: (ms, label, op) => this.within(ms, label, op),
     })
     this.windows = windows
+    this.attempt.record.oracles = {
+      traces: {
+        source: this.source,
+        loggerReadbacks: this.logs.receipts,
+        chunks: windows.chunks,
+      },
+    }
     await withTelemetryResource(aux, { name: this.stem, entries }, async () => {
       windows.open()
       const ordinary = KINDS.map((kind) => this.build(kind, 'ep'))
@@ -956,6 +999,7 @@ class ReopenCase {
           ...zero.map((member) => this.timeoutZero(member)),
         ])
       } catch (error) {
+        this.failure = error
         windows.fail(error)
         throw error
       }

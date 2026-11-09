@@ -38,6 +38,7 @@ const REQUESTED = [
   'org.apache.kafka.producer.connection.creation.total',
   'org.apache.kafka.consumer.connection.creation.total',
   'org.apache.kafka.admin.connection.creation.total',
+  'org.apache.kafka.admin.client.connection.creation.total',
   'org.apache.kafka.tf1.custom.',
 ].join(',')
 const WHITELIST = [
@@ -371,7 +372,9 @@ class JavaInteropCase {
       closed: child.marker('closed')?.fields,
     })
     const sum = normal[0].metrics.find(
-      (m) => m.name === `org.apache.kafka.${role}.connection.creation.total`
+      (m) =>
+        m.name ===
+        `org.apache.kafka.${role === 'admin' ? 'admin.client' : role}.connection.creation.total`
     )
     return {
       uuid,
