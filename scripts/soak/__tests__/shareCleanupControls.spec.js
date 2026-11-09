@@ -1,5 +1,4 @@
 const { EventEmitter } = require('events')
-const { performance } = require('perf_hooks')
 const { ShareSoak, ShareSoakDriver, ShareSoakScreen, instrumentShare, main } = require('../soak')
 const fixtures = require('../../../testHelpers/shareFixtures')
 const helpers = require('../../../testHelpers')
@@ -7,19 +6,27 @@ const bounded = require('../../../src/producer/__tests__/fixtures/bounded')
 const { CleanupStack } = require('../../../src/producer/__tests__/fixtures/liveProbe')
 
 /**
- * Scripts admin I/O only; original owner stages, cleanup stack, probes and fixture proofs run.
+ * Focuses on original cleanup stages, stack, probes and fixture proofs with scripted admin I/O.
+ * Completion is bypassed here; complete-evidence receipt controls live in the owner spec.
  * @param {object} [options] injected workload and cleanup failures
  * @param {boolean} [options.exceptional] fail immediately after setup's baseline
  * @param {boolean} [options.cleanupFailure] fail deletion after a workload failure
  * @param {Function} [options.afterSetup] inject retained resources after the original baseline
  * @param {boolean} [options.screen] apply the original quiet-resource screen after cleanup
+ * @param {boolean} [options.shortFailureBound=true] keep resource-negative polling short
+ * @param {Error} [options.primary] original workload failure
+ * @param {Error} [options.deletionError] original deletion failure
  * @returns {object} original owner, serializing archive, observations and owned admin
+ * @throws {Error} when an original instrumentation source is unavailable
  */
 const cleanupOwner = ({
   exceptional = false,
   cleanupFailure = false,
   afterSetup = () => {},
   screen = false,
+  shortFailureBound = true,
+  primary = new Error('workload failed'),
+  deletionError = new Error('topic deletion failed'),
 } = {}) => {
   const rows = []
   const observations = []
@@ -34,7 +41,7 @@ const cleanupOwner = ({
     disconnect: jest.fn(async () => {}),
     createTopics: jest.fn(async () => {}),
     deleteTopics: jest.fn(async () => {
-      if (cleanupFailure) throw new Error('topic deletion failed')
+      if (cleanupFailure) throw deletionError
     }),
     deleteGroups: jest.fn(async () => {}),
     listGroups: jest.fn(async () => ({ groups: [] })),
@@ -96,8 +103,8 @@ const cleanupOwner = ({
     run: async () => {
       await afterSetup({ owner, driver, instrumented })
       if (exceptional) {
-        owner.workDue = Math.min(owner.workDue, performance.now() + 1000)
-        throw new Error('workload failed')
+        if (shortFailureBound) owner.workDue = Math.min(owner.workDue, owner.clock.now() + 1000)
+        throw primary
       }
       await owner.finish()
       const violations = []
@@ -175,7 +182,7 @@ describe('share owner cleanup populations', () => {
     }
   )
 
-  test.each(['product timer', 'unattributed timer', 'open socket'])(
+  test.each(['product timer', 'open socket'])(
     'rejects a surviving %s on exceptional owner cleanup',
     async (damage) => {
       let timer
@@ -186,25 +193,9 @@ describe('share owner cleanup populations', () => {
           if (damage.includes('timer')) timer = setTimeout(() => {}, 60000)
           else {
             socket = instrumented.socketFactory({ host: 'scripted', port: 1 })
-            if (damage === 'retained listener') {
-              socket.on('retained', () => {})
-              socket.destroyed = true
-            }
           }
         },
       })
-      if (damage === 'unattributed timer') {
-        const snapshot = shares.snapshot
-        shares.snapshot = async () => {
-          const reading = await snapshot()
-          if (driver.baseline)
-            for (const owners of Object.values(reading.timerOwners)) {
-              owners.rows = owners.rows.filter(({ durationMs }) => durationMs !== 60000)
-              owners.unattributed.Timeout++
-            }
-          return reading
-        }
-      }
       try {
         await expect(owner.run()).rejects.toThrow('workload failed')
         const failure = await owner.close().catch((error) => error)
@@ -213,15 +204,10 @@ describe('share owner cleanup populations', () => {
           failure.errors.some(({ message }) => message.includes('prove the share soak cleanup'))
         ).toBe(true)
         expect(rows.filter(({ event }) => event === 'case-failed')).toHaveLength(2)
-        expect(rows.some(({ event }) => event === 'case-complete')).toBe(false)
         expect(owner.gate.tainted).toBe(true)
         expect(owner.stack.cleanups).toEqual([])
         expect(wrappers(driver.baseline)).toHaveLength(4)
         expect(observations.length).toBeGreaterThan(3)
-        if (damage === 'unattributed timer')
-          expect(
-            observations.at(-1).timerOwners.afterCollection.unattributed.Timeout
-          ).toBeGreaterThan(driver.baseline.timerOwners.afterCollection.unattributed.Timeout)
       } finally {
         clearTimeout(timer)
         if (socket) {
@@ -233,9 +219,9 @@ describe('share owner cleanup populations', () => {
     }
   )
 
-  test('fails the actual owner verdict for a listener on an archived destroyed socket', async () => {
+  test('screens a listener on an archived destroyed socket after normal cleanup', async () => {
     let socket
-    const { owner, driver, shares, rows } = cleanupOwner({
+    const { owner, driver, shares } = cleanupOwner({
       screen: true,
       afterSetup: ({ instrumented }) => {
         socket = instrumented.socketFactory({ host: 'scripted', port: 1 })
@@ -250,7 +236,6 @@ describe('share owner cleanup populations', () => {
       expect(result.ok).toBe(false)
       expect(result.violations).toContain('teardown: resources differ or a source is absent')
       expect(owner.gate.tainted).toBe(true)
-      expect(rows.some(({ event }) => event === 'case-complete')).toBe(false)
       await owner.close()
     } finally {
       socket?.removeAllListeners()
@@ -258,9 +243,9 @@ describe('share owner cleanup populations', () => {
     }
   })
 
-  test('fails the actual owner resource verdict after dropped timer allocations even with equal raw counts', async () => {
+  test('screens dropped timer allocations after normal cleanup even with equal raw counts', async () => {
     const timers = []
-    const { owner, driver, shares, rows } = cleanupOwner({
+    const { owner, driver, shares } = cleanupOwner({
       screen: true,
       afterSetup: () => {
         for (let i = 0; i < 4097; i++) timers.push(setTimeout(() => {}, 60000))
@@ -274,7 +259,6 @@ describe('share owner cleanup populations', () => {
       expect(result.ok).toBe(false)
       expect(result.violations).toContain('teardown: resources differ or a source is absent')
       expect(owner.gate.tainted).toBe(true)
-      expect(rows.some(({ event }) => event === 'case-complete')).toBe(false)
       await owner.close()
     } finally {
       timers.forEach(clearTimeout)
@@ -282,23 +266,185 @@ describe('share owner cleanup populations', () => {
     }
   })
 
+  test.each(['destroyed-socket listener', 'dropped inventory', 'unattributed inventory'])(
+    'archives and returns a secondary %s failure on exceptional close at equal raw counts',
+    async (damage) => {
+      let socket
+      const timers = []
+      const primary = new Error('workload failed')
+      const { owner, driver, shares, rows, admin } = cleanupOwner({
+        exceptional: true,
+        primary,
+        afterSetup: ({ instrumented }) => {
+          if (damage === 'destroyed-socket listener') {
+            socket = instrumented.socketFactory({ host: 'scripted', port: 1 })
+            socket.on('retained', () => {})
+            socket.destroyed = true
+          } else if (damage === 'dropped inventory') {
+            for (let i = 0; i < 4097; i++) timers.push(setTimeout(() => {}, 60000))
+            timers.forEach(clearTimeout)
+          }
+        },
+      })
+      if (damage === 'unattributed inventory') {
+        const snapshot = shares.snapshot
+        shares.snapshot = async () => {
+          const reading = await snapshot()
+          if (driver.baseline) {
+            for (const owners of Object.values(reading.timerOwners)) {
+              const index = owners.rows.findIndex(({ stack }) =>
+                stack.includes('/fixtures/bounded.js:')
+              )
+              owners.rows.splice(index, 1)
+              owners.unattributed.Timeout++
+            }
+          }
+          return reading
+        }
+      }
+      const restore = jest.spyOn(shares, 'restore')
+      const quiet = jest.spyOn(ShareSoakScreen, 'quiet')
+      try {
+        await expect(owner.run()).rejects.toBe(primary)
+        const failure = await owner.close().catch((error) => error)
+        expect(failure).toBeInstanceOf(Error)
+        expect(failure.message).toContain(
+          damage === 'unattributed inventory'
+            ? 'unattributed'
+            : 'resources differ or a source is absent'
+        )
+        expect(driver.after.activeResources).toEqual(driver.baseline.activeResources)
+        expect(driver.after.activeResourcesBeforeCollection).toEqual(
+          driver.baseline.activeResourcesBeforeCollection
+        )
+        expect(driver.after.sockets.open).toBe(0)
+        if (damage === 'destroyed-socket listener')
+          expect(driver.after.namedListeners).not.toEqual(driver.baseline.namedListeners)
+        if (damage === 'dropped inventory')
+          expect(driver.after.timerOwners.afterCollection.dropped).toBeGreaterThan(0)
+        if (damage === 'unattributed inventory') {
+          expect(wrappers(driver.baseline)).toHaveLength(4)
+          expect(wrappers(driver.after)).toHaveLength(3)
+          expect(driver.after.timerOwners.beforeCollection.dropped).toBe(0)
+          expect(driver.after.timerOwners.afterCollection.dropped).toBe(0)
+          expect(driver.after.timerOwners.afterCollection.unattributed.Timeout).toBe(
+            driver.baseline.timerOwners.afterCollection.unattributed.Timeout + 1
+          )
+        }
+        expect(quiet).toHaveBeenCalledWith(
+          driver.after,
+          driver.baseline,
+          'cleanup',
+          expect.any(Array)
+        )
+        expect(quiet.mock.invocationCallOrder.at(-1)).toBeLessThan(
+          restore.mock.invocationCallOrder[0]
+        )
+        expect(restore).toHaveBeenCalledTimes(1)
+        expect(
+          rows.filter(({ event }) => event === 'case-failed').map(({ error }) => error.message)
+        ).toEqual([primary.message, failure.message.slice(0, 600)])
+        expect(owner.gate.cause).toBe(primary)
+        expect(owner.stack.cleanups).toEqual([])
+        expect(admin.deleteGroups).toHaveBeenCalled()
+        expect(admin.deleteTopics).toHaveBeenCalled()
+        expect(admin.listTopics).toHaveBeenCalled()
+        expect(owner.closed).toBe(true)
+      } finally {
+        socket?.removeAllListeners()
+        timers.forEach(clearTimeout)
+        shares.restore()
+      }
+    }
+  )
+
+  test.each([0, 1])(
+    'exceptional close retains a partly spent original cleanup cutoff, late ms=%s',
+    async (lateMs) => {
+      let now = 100000
+      const { owner, shares, rows } = cleanupOwner({
+        exceptional: true,
+        shortFailureBound: false,
+        afterSetup: async ({ owner }) => {
+          await owner.stage('cleanup', async () => {
+            now += 12000
+          })
+        },
+      })
+      owner.clock = { now: () => now }
+      try {
+        await expect(owner.run()).rejects.toThrow('workload failed')
+        const workDue = owner.workDue
+        const cleanupDue = owner.cleanupDue
+        const spent = owner.spent.cleanup
+        now += 3000
+        const entered = []
+        owner.stack.add('consume the original remaining allowance', async () => {
+          entered.push(now)
+          now = cleanupDue + lateMs
+        })
+        const result = await owner.close().catch((error) => error)
+        expect(entered).toEqual([115000])
+        expect(owner.workDue).toBe(workDue)
+        expect(owner.cleanupDue).toBe(cleanupDue)
+        expect(cleanupDue).toBe(120000)
+        expect(spent).toBe(12000)
+        expect(owner.spent.cleanup).toBe(17000 + lateMs)
+        expect(
+          owner.timing.stages.filter(({ name }) => name === 'cleanup').map(({ due }) => due)
+        ).toEqual([cleanupDue, cleanupDue])
+        if (lateMs) {
+          expect(result).toBeInstanceOf(Error)
+          expect(result).toBeInstanceOf(AggregateError)
+          expect(result.errors.map(({ message }) => message)).toEqual([
+            'The shared cleanup deadline exceeded',
+            'The shared cleanup deadline exceeded',
+          ])
+          expect(rows.filter(({ event }) => event === 'case-failed')).toHaveLength(3)
+        } else expect(result).toBeUndefined()
+        const next = jest.fn()
+        await expect(owner.stage('cleanup', next)).rejects.toThrow('deadline exhausted')
+        expect(next).not.toHaveBeenCalled()
+      } finally {
+        shares.restore()
+      }
+    }
+  )
+
   test('keeps the primary error and archives joined cleanup errors through the acceptance entrypoint', async () => {
     const exposed = globalThis.gc
     globalThis.gc = () => {}
-    const { owner, rows, shares, admin } = cleanupOwner({ exceptional: true, cleanupFailure: true })
+    const existing = new Error('earlier cleanup failed')
+    const primary = Object.assign(new Error('workload failed'), { cleanupErrors: [existing] })
+    const deletionError = new Error('topic deletion failed')
+    const { owner, rows, shares, admin } = cleanupOwner({
+      exceptional: true,
+      cleanupFailure: true,
+      primary,
+      deletionError,
+    })
+    const close = jest.spyOn(owner, 'close')
     try {
       const failure = await main('share-consumer-short', { shareSoak: () => owner }).catch(
         (error) => error
       )
-      expect(failure.message).toBe('workload failed')
-      expect(failure.cleanupErrors).toEqual(expect.arrayContaining([expect.any(Error)]))
+      expect(failure).toBe(primary)
+      expect(close).toHaveBeenCalledTimes(1)
+      const cleanup = await close.mock.results[0].value.catch((error) => error)
+      expect(cleanup).toBeInstanceOf(AggregateError)
+      expect(cleanup.errors).toHaveLength(1)
+      expect(cleanup.errors[0].message).toBe('delete the share soak topic: topic deletion failed')
+      expect(cleanup.errors[0].cause).toBe(deletionError)
+      expect(failure.cleanupErrors).toEqual([existing, cleanup])
+      expect(failure.cleanupErrors[0]).toBe(existing)
+      expect(failure.cleanupErrors[1]).toBe(cleanup)
+      expect(owner.gate.cause).toBe(primary)
       expect(
         rows
           .filter(({ event }) => event === 'case-failed')
           .map(({ error }) => error.message)
           .join('\n')
       ).toContain('topic deletion failed')
-      expect(rows.some(({ event }) => event === 'case-complete')).toBe(false)
       expect(owner.gate.tainted).toBe(true)
       expect(admin.disconnect).toHaveBeenCalled()
       expect(owner.stack.cleanups).toEqual([])

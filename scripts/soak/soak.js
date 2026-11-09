@@ -6369,9 +6369,10 @@ class ShareSoak {
   /**
    * Runs remaining cleanup under the original child and cleanup-stage deadlines, then restores
    * observers. Matching the setup's enclosing bounds preserves raw cleanup populations on failure;
-   * no timer is discounted and no deadline is renewed. Safe to call twice.
+   * no timer is discounted and no deadline is renewed. The complete cleanup observation is checked
+   * against the original baseline before observers are restored. Safe to call twice.
    * @returns {Promise<void>}
-   * @throws {Error} the first failure of the cleanup or of the restore; the run is tainted
+   * @throws {Error} a cleanup or restore failure, or their aggregate; every failure is archived
    */
   async close() {
     if (this.closed) return
@@ -6384,7 +6385,27 @@ class ShareSoak {
           this.workDue - this.clock.now() + 1,
           async (scope) => {
             this.scope = scope
-            await this.stage('cleanup', () => this.cleanupStack())
+            await this.stage('cleanup', async () => {
+              try {
+                await this.cleanupStack()
+              } catch (error) {
+                failures.push(error)
+              }
+              if (this.driver.baseline && this.driver.after) {
+                const { after, baseline } = this.driver
+                const violations = []
+                ShareSoakScreen.quiet(after, baseline, 'cleanup', violations)
+                for (const when of ['beforeCollection', 'afterCollection']) {
+                  const before = baseline.timerOwners?.[when]?.unattributed
+                  const observed = after?.timerOwners?.[when]?.unattributed
+                  if (!ShareSoakScreen.same(observed, before))
+                    violations.push(
+                      `cleanup: timerOwners.${when}.unattributed differs from baseline`
+                    )
+                }
+                if (violations.length > 0) throw new Error(violations.join('; '))
+              }
+            })
           },
           { label: 'The share soak cleanup' }
         )
@@ -6401,7 +6422,9 @@ class ShareSoak {
     if (failures.length > 0) {
       for (const failure of failures)
         for (const error of failure.errors ?? [failure]) this.fail(error)
-      throw failures[0]
+      throw failures.length === 1
+        ? failures[0]
+        : new AggregateError(failures, 'Share cleanup failed')
     }
   }
 }
@@ -6473,7 +6496,8 @@ const buildShareSoak = ({ brokers, short = false, record, run }) => {
  *   combined verdict of `ProducerChurn` for `producer-churn`, that of `ShareSoak` for a share
  *   profile
  * @throws {Error} unless the process runs with `--expose-gc`, and for a share profile given a phase
- *   length: its phases and cycles are fixed
+ *   length: its phases and cycles are fixed. A share workload failure is rethrown unchanged, with
+ *   any joined close failure appended to its existing `cleanupErrors`; a close-only failure is thrown
  */
 const main = async (
   profile,
