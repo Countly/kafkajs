@@ -57,11 +57,18 @@ describe('Admin', () => {
       await producer.send({ acks: 1, topic: topicName, messages })
     }
 
+    // Record timestamps are millisecond Date.now() values; a lookup boundary must be strictly after the previous batch.
+    const nextMillisecond = async () => {
+      const start = Date.now()
+      await waitFor(() => Date.now() > start, { delay: 1 })
+      return Date.now()
+    }
+
     test('returns the offsets from timestamp', async () => {
       await sendMessages(10)
-      const fromTimestamp = Date.now()
+      const fromTimestamp = await nextMillisecond()
       await sendMessages(10)
-      const futureTimestamp = Date.now()
+      const futureTimestamp = await nextMillisecond()
       const offsetsFromTimestamp = await admin.fetchTopicOffsetsByTimestamp(
         topicName,
         fromTimestamp

@@ -2,6 +2,12 @@ name: CI
 on:
   push: { branches: [master] }
   pull_request:
+  workflow_dispatch:
+    inputs:
+      lanes:
+        description: 'Integration groups, comma-separated (empty runs all; e.g. share-base,admin)'
+        required: false
+        type: string
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -26,7 +32,20 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: '${{ matrix.node }}', cache: npm }
       - run: npm ci
-      - run: npm run test:unit
+      - run: npm run test:unit -- --testPathIgnorePatterns 'scripts/soak/__tests__/soak\.spec\.js$'
+  unit-soak:
+    runs-on: ubuntu-latest
+    # 800–1300 seconds / 3 = 267–434 seconds; 10 minutes leaves at least 166 seconds for setup.
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix: { node: [22, 24, 26], shard: [1, 2, 3] }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '${{ matrix.node }}', cache: npm }
+      - run: npm ci
+      - run: npm run test:unit:soak -- --ci --shard=${{ matrix.shard }}/3
   pack:
     runs-on: ubuntu-latest
     steps:
@@ -35,29 +54,27 @@ jobs:
         with: { node-version: 24, cache: npm }
       - run: npm ci
       - run: npm run test:pack
+  integration-plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 24 }
+      - id: plan
+        env:
+          CI_EVENT: ${{ github.event_name }}
+          CI_LANES: ${{ inputs.lanes }}
+        run: node scripts/ci/integrationPlan.js >> "$GITHUB_OUTPUT"
   integration:
     runs-on: ubuntu-latest
-    needs: [unit]
+    timeout-minutes: ${{ matrix.timeout || 360 }}
+    needs: [unit, integration-plan]
     strategy:
       fail-fast: false
       max-parallel: 6
-      matrix:
-        include:
-          - { node: 24, kafka: 4.3.1, group: broker }
-          - { node: 24, kafka: 4.3.1, group: admin }
-          - { node: 24, kafka: 4.3.1, group: producer }
-          - { node: 24, kafka: 4.3.1, group: consumer }
-          - { node: 24, kafka: 4.3.1, group: others }
-          - { node: 24, kafka: 4.3.1, group: oauthbearer, compose: docker-compose.oauthbearer.yml }
-          - { node: 22, kafka: 4.3.1, group: broker }
-          - { node: 22, kafka: 4.3.1, group: others }
-          - { node: 26, kafka: 4.3.1, group: broker }
-          - { node: 26, kafka: 4.3.1, group: others }
-          - { node: 24, kafka: 4.3.1, group: share-base }
-          - { node: 24, kafka: 4.4.0, group: share-base, clients: 4.4.0 }
-          - { node: 24, kafka: 4.3.1, group: share, compose: docker-compose.share.yml }
-          - { node: 24, kafka: 4.4.0, group: share, compose: docker-compose.share.yml, clients: 4.4.0 }
-          - { node: 24, kafka: 4.3.1, group: share-limit, compose: docker-compose.share-limit.yml }
+      matrix: ${{ fromJSON(needs.integration-plan.outputs.matrix) }}
     env:
       KAFKA_VERSION: ${{ matrix.kafka }}
       COMPOSE_FILE: ${{ matrix.compose || 'docker-compose.yml' }}
@@ -87,37 +104,7 @@ jobs:
           KAFKAJS_LANE: docker
           KAFKAJS_DEBUG_PROTOCOL_BUFFERS: '1'
           SHARE_SHUTDOWN_E2E: '1'
-        run: |
-          node <<'NODE'
-          const fs = require('fs')
-          const { spawnSync } = require('child_process')
-          const startedAt = Number(process.hrtime.bigint() / 1000000n)
-          const result = spawnSync(process.execPath, [
-            'node_modules/jest/bin/jest.js', '--ci', '--detectOpenHandles', '--runInBand',
-            '--runTestsByPath', 'src/consumer/share/__tests__/shareShutdownLive.spec.js',
-          ], { stdio: 'inherit', timeout: 120000, killSignal: 'SIGKILL' })
-          const exitedAt = Number(process.hrtime.bigint() / 1000000n)
-          fs.writeFileSync('.tmp/e2e/share-shutdown-exit.json', JSON.stringify({
-            startedAt, exitedAt, status: result.status, signal: result.signal,
-            error: result.error?.message,
-          }) + '\n')
-          if (result.error) throw result.error
-          if (result.status !== 0 || result.signal) throw new Error('Shutdown Jest did not exit successfully')
-          const rows = fs.readFileSync('.tmp/e2e/share-shutdown.jsonl', 'utf8')
-            .trim().split('\n').map(JSON.parse)
-          const done = rows.filter(row => row.event === 'case-complete')
-          if (done.length !== 3 || new Set(done.map(row => row.case)).size !== 3 ||
-              rows.some(row => row.event === 'case-failed') ||
-              done.some(row => row.status !== 'passed' || row.tainted !== false ||
-                !Number.isSafeInteger(row.cleanup?.completedAt) ||
-                row.cleanup.completedAt < startedAt || row.cleanup.completedAt > exitedAt)) {
-            throw new Error('Shutdown evidence has incomplete or invalid cleanup timestamps')
-          }
-          const cleanupAt = Math.max(...done.map(row => row.cleanup.completedAt))
-          if (exitedAt - startedAt > 120000 || exitedAt - cleanupAt > 10000) {
-            throw new Error('Shutdown did not exit naturally within its process and cleanup bounds')
-          }
-          NODE
+        run: node scripts/ci/naturalExit.js shutdown
       - name: Verify share evidence before teardown
         if: always() && startsWith(matrix.group, 'share')
         run: |

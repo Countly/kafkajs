@@ -32,12 +32,15 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Add deterministic share membership, session and acknowledgement fault matrices, with captured shutdown authority, exact record outcomes and resource cleanup checks.
 - Verify share delivery, acknowledgement types, locks, isolation, membership, recovery, shutdown and administration against live brokers.
 - Verify share capability refusals, broker-bounce recovery, Java interoperability and diagnostics channels.
+- Verify that an idempotent batch whose answer is lost across a leader change is re-sent with the same producer ID, epoch, sequence and bytes, and that no later batch of the partition is written before it is acknowledged. A broker that lost the producer's state can still append that re-send a second time; the client cannot detect it, as with the Java producer.
 
 #### Fixes
 
+- A connection closed without an error is now detected immediately instead of after the request timeout. In-flight requests fail with the same retriable connection-closed error as a socket end, and share sessions reopen on the next round.
 - A broker restart no longer crashes a share consumer with "Metadata discovery completed" when a metadata notification starts a new fetch loop. Rebootstrap and request-queue-size listeners, and the queue's pending-check timer, also run independently of the publishing discovery or admin invocation.
 - A share answer that arrives from a replaced connection pool is discarded and the session reopens on the next round, instead of ending the run and losing unrelated acquisitions.
 - A failed share heartbeat preserves the healthy data socket and its acquisitions while the coordinator reconnects.
+- A share consumer now leaves its group on disconnect even after its coordinator connection was re-established.
 
 - Prepared share renewals retain their own compact acknowledgement error when a routing change or shutdown retires their wait; callers retired before preparing a ticket receive a local refusal.
 
@@ -46,6 +49,10 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Unimplemented request slots throw `KafkaJSNotImplemented` with a diagnostic message instead of a `TypeError`.
 
 #### Tooling
+
+- Move short share-soak memory acceptance to the separate `Memory gates` workflow required before 3.0.0, add a manual integration lane selector, and run the soak unit spec in three case shards per supported Node version.
+
+- Add share-consumer soak and benchmark gates with separate batch and message identity controls. The short/full soak profiles use 32/64-second slots and 960/1920-second profiles, 1020/1980-second inclusive child budgets and 1440/2400-second cold caps. Both retain thirty cycles, ten resets and separate 5000 ms per-cycle and final observations, with configuration, heartbeat and cycle-step evidence. These are declared bounds; live acceptance and measured performance remain unverified.
 
 - Track the seven released share-group APIs (keys 76–79 and 90–92) in the Kafka 4.4.0 and 4.3.1 message snapshots and regenerate their protocol compatibility inventory. Source inventory alone does not add share-group support.
 - Add a Java share-consumer interoperability member and classpath probe.

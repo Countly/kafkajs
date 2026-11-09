@@ -11,6 +11,8 @@ const {
   readRequestHeader,
 } = require('testHelpers')
 const { CloseRig, TOPIC, gate, pause, until } = require('./fixtures/closeRig')
+const { pump } = require('./fixtures/lifecycleCase')
+const { useSharedFakeClock } = require('./fixtures/sharedFakeClock')
 const {
   TOPIC: HARNESS_TOPIC,
   NEW_ID,
@@ -23,17 +25,48 @@ const BOUND_MS = 500
 const CELL = { topic: TOPIC, partition: 0 }
 const bounded = { maxTotalTime: BOUND_MS }
 
+/**
+ * @template T
+ * @param {Promise<T>} promise work driven by fake timers and real socket turns
+ * @param {string} label the completion being awaited
+ * @returns {Promise<T>} the work's result
+ */
+const drive = async (promise, label) => {
+  let outcome
+  promise.then(
+    (value) => {
+      outcome = { value }
+    },
+    (error) => {
+      outcome = { error }
+    }
+  )
+  await pump(() => outcome !== undefined, label)
+  if ('error' in outcome) throw outcome.error
+  return outcome.value
+}
+
 describe.each([true, false])(
   'a public API call under request timeout enforcement %p',
   (enforce) => {
     /** @type {CloseRig} */
     let rig
+    let fakeClock = false
     /** @param {object} [options] rig options @returns {Promise<void>} a fresh rig, read as `rig` */
     const open = async (options) => {
       rig = await CloseRig.open({ enforce, retry: bounded, ...options })
     }
     afterEach(async () => {
-      await rig.dispose()
+      try {
+        if (fakeClock) await drive(rig.dispose(), 'the rig to dispose')
+        else await rig.dispose()
+      } finally {
+        if (fakeClock) {
+          jest.useRealTimers()
+          jest.restoreAllMocks()
+          fakeClock = false
+        }
+      }
     })
 
     describe('whose first coordinator lookup is held', () => {
@@ -121,18 +154,40 @@ describe.each([true, false])(
       })
 
       test('commitOffsets expires at the entry deadline, not a new duration from the final stage', async () => {
+        fakeClock = true
+        useSharedFakeClock()
         await open()
         const lookup = rig.lookup()
-        const { consumer } = await rig.started({ run: { autoCommit: false } })
+        const { consumer } = await drive(
+          rig.started({ run: { autoCommit: false } }),
+          'the consumer to start'
+        )
         lookup.makeStale()
         lookup.failAfter(150)
         lookup.answerAfter(150)
         const response = rig.hold('OffsetCommit')
         const startedAt = Date.now()
-        await expect(
-          consumer.commitOffsets([{ topic: TOPIC, partition: 0, offset: '2' }])
-        ).rejects.toBeInstanceOf(KafkaJSDeliveryTimeout)
+        let settled = false
+        const committing = consumer
+          .commitOffsets([{ topic: TOPIC, partition: 0, offset: '2' }])
+          .then(
+            () => {
+              settled = true
+            },
+            (error) => {
+              settled = true
+              return error
+            }
+          )
+        await pump(() => response.hits === 1 || settled, 'the held OffsetCommit response')
+        expect(response.hits).toBe(1)
+        expect(Date.now() - startedAt).toBeLessThan(BOUND_MS)
+        await jest.advanceTimersByTimeAsync(BOUND_MS - 1 - (Date.now() - startedAt))
+        expect(settled).toBe(false)
+        await jest.advanceTimersByTimeAsync(1)
+        expect(await committing).toBeInstanceOf(KafkaJSDeliveryTimeout)
         expectAtOriginalDeadline(300, startedAt)
+        expect(Date.now() - startedAt).toBe(BOUND_MS)
         expect(response.hits).toBe(1)
       })
 

@@ -423,26 +423,26 @@ describe('Consumer > broker outages', () => {
         retry: { ...RETRY, restartOnFailure: async () => false },
       })
       endlessRecords(cluster)
-      // Only a heartbeat the handler awaits is answered, so the error always reaches the handler.
-      let handlerHeartbeating = false
-      let answered = 0
       let rethrown = 0
-      cluster.answer('Heartbeat', () => {
-        const moved = handlerHeartbeating && answered < 2
-        if (moved) answered++
-        return { errorCode: moved ? NOT_COORDINATOR : 0 }
-      })
       await start(events, {
         eachMessage: async ({ message, heartbeat }) => {
           events.records.push(message.offset)
-          handlerHeartbeating = true
           try {
-            await heartbeat()
+            if (rethrown < 2) {
+              const held = cluster.schedule.hold({ api: 'Heartbeat' })
+              await held.arrived()
+              // Share the pending wire request before releasing its answer: a fresh call can
+              // otherwise be throttled after an automatic heartbeat renews the interval.
+              const heartbeating = heartbeat()
+              held.release({ errorCode: NOT_COORDINATOR })
+              await heartbeating
+            } else {
+              await heartbeat()
+            }
           } catch (e) {
+            expect(e.code).toBe(NOT_COORDINATOR)
             rethrown++
             throw e
-          } finally {
-            handlerHeartbeating = false
           }
         },
       })
