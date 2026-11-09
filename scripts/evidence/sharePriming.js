@@ -166,6 +166,17 @@ const verifyShareProtocol = (rows) => {
 }
 
 /**
+ * Projects authenticated operation/client roles and negotiated implementations across placements.
+ * Literal endpoints remain in each manifest; independent groups may select different brokers.
+ * @param {object[]} inventory Validated original manifest entries.
+ * @returns {string[]} Distinct corresponding implementations in a stable order.
+ */
+const correspondingImplementations = (inventory) =>
+  [
+    ...new Set(inventory.map(({ endpoint, ...implementation }) => JSON.stringify(implementation))),
+  ].sort()
+
+/**
  * Independently fits every eligible periodic reading; a forged passing summary cannot mask growth.
  * Priming measurements are returned without applying growth limits, but invalid sources fail.
  * @param {object[]} rows Original scope rows, including full periodic observations.
@@ -483,7 +494,7 @@ const verifySharePriming = (rows) => {
   )
   if ([...sockets[0]].some((id) => sockets[1].has(id)))
     problems.push('priming/scored socket collision')
-  if (!same(inventories[0], inventories[1]))
+  if (!same(...inventories.map(correspondingImplementations)))
     problems.push('priming/scored negotiated implementations differ')
   for (const field of ['topic', 'groupId', 'topicId'])
     if (!configurations[0]?.[field] || configurations[0][field] === configurations[1]?.[field])

@@ -80,13 +80,13 @@ const request = async (apiKey, apiVersion, correlationId, compression = 0) => {
  * @param {ShareFetchTap} tap Original call-through transport observer.
  * @returns {Promise<void>} Complete fixed header/codec coverage.
  */
-const coverage = async (tap) => {
+const coverage = async (tap, endpoint = 'node:1', metadataVersion = 13) => {
   const calls = [
     ['send', 0, 9, 'producer'],
     ['send', 22, 4, 'producer'],
     ['readLog', 1, 12, 'raw'],
     ['fetchTopicOffsets', 2, 7],
-    ['fetchTopicMetadata', 3, 13],
+    ['fetchTopicMetadata', 3, metadataVersion],
     ['connect', 10, 6],
     ['listGroups', 16, 5],
     ['connect', 18, 5],
@@ -104,10 +104,10 @@ const coverage = async (tap) => {
     ['disconnect', 79, 2, 'share'],
     ['listShareGroupOffsets:named', 90, 1],
     ['listShareGroupOffsets:all', 90, 1],
-    ['listTopics', 3, 13],
+    ['listTopics', 3, metadataVersion],
   ]
   const socket = Object.assign(new EventEmitter(), { destroyed: false, write: () => false })
-  tap.wrap(socket, 'node:1')
+  tap.wrap(socket, endpoint)
   for (const [index, [operation, apiKey, version, role = 'admin']] of calls.entries()) {
     const bytes = await request(apiKey, version, index)
     tap.operation(role, operation, () => {
@@ -143,6 +143,8 @@ const recording = async ({
   heapOffset = 0,
   translatedMs = 0,
   damagePrime,
+  separateCoordinators = false,
+  scoredMetadataVersion = 13,
 } = {}) => {
   jest.useFakeTimers({ now: 1700000000000, doNotFake: ['setImmediate'] })
   const rows = []
@@ -163,8 +165,6 @@ const recording = async ({
       )
       if (armedAt === null) point.heapUsed += Math.round((primeRate * now) / 60000)
       if (damagePrime && !rows.some((r) => r.event === 'priming-complete')) damagePrime(point)
-      if (damageBoundary && rows.some((r) => r.event === 'priming-complete') && !armedAt)
-        damageBoundary(point)
       return point
     },
     restore: jest.fn(),
@@ -192,7 +192,11 @@ const recording = async ({
           this.cleanupClock = { origin: 'hrtime', completedAt: this.completedAt }
           if (priming && failCleanup) throw new Error('priming deletion failed')
         })
-        await coverage(tap)
+        await coverage(
+          tap,
+          separateCoordinators ? (priming ? 'node-a:9092' : 'node-b:9092') : 'node:1',
+          priming ? 13 : scoredMetadataVersion
+        )
       }),
       openPhase: async () => {
         if (!priming && phase++ === 0) armedAt = performance.now()
@@ -296,6 +300,24 @@ const recording = async ({
 }
 
 describe('fixed same-realm share priming', () => {
+  test('accepts separate coordinator endpoints with corresponding negotiated versions', async () => {
+    const { rows, result, problems } = await recording({ separateCoordinators: true })
+    expect(result.ok).toBe(true)
+    expect(problems).toEqual([])
+    const inventories = rows.filter((r) => r.event === 'soak-protocol-manifest')
+    expect(inventories[0].inventory.every((r) => r.endpoint === 'node-a:9092')).toBe(true)
+    expect(inventories[1].inventory.every((r) => r.endpoint === 'node-b:9092')).toBe(true)
+  }, 30000)
+
+  test('rejects a corresponding negotiated version mismatch across separate coordinators', async () => {
+    const { result, problems } = await recording({
+      separateCoordinators: true,
+      scoredMetadataVersion: 12,
+    })
+    expect(result.ok).toBe(true)
+    expect(problems).toContain('share.jsonl: priming/scored negotiated implementations differ')
+  }, 30000)
+
   test.each([true, false])(
     'executes one complete disjoint pass before scoring, short=%s',
     async (short) => {
