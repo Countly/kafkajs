@@ -52,6 +52,11 @@ const LIFETIMES = Object.freeze({
     expected:
       '128 custom descriptors and lifetime connection counter persist through disconnected ends; 64 node slots and 257-point snapshots retire to 129 disconnected points; snapshots, points, raw/result views and native contexts must be attributed, never exempted by a code label.',
   },
+  'WeakOwners.rows': {
+    source: 'scripts/e2e/telemetry/retained/weakOwners.js',
+    expected:
+      'Scalar slots are reserved before C0. Issued IDs/kinds remain through all-released; dead WeakRef wrappers retire at read, live targets remain observed. Labels cover only row storage, kind strings and WeakRefs, never arbitrary strong row descendants or weak targets.',
+  },
   'NativeJournal/DiagnosticLog/ProcessMemory': {
     source: 'scripts/e2e/telemetry/retained/observer.js',
     expected:

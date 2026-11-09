@@ -1,12 +1,21 @@
 'use strict'
 
-/** Weak-only development observation; neither restoration tables nor journals hold observed targets. */
+/**
+ * Weak-only development observation with scalar history reserved before the first checkpoint.
+ * Neither restoration tables nor journals hold observed targets. WeakRef wrappers for dead
+ * targets retire at each read; an issued ID and its final dead result remain in the history.
+ */
 class WeakOwners {
   /** @param {number} [capacity] finite issued-target capacity @returns {WeakOwners} empty observer */
   constructor(capacity = 32768) {
     this.capacity = capacity
     this.ids = new WeakMap()
-    this.rows = []
+    this.count = 0
+    this.rows = Array.from({ length: capacity }, (_, index) => ({
+      id: index + 1,
+      kind: null,
+      weak: null,
+    }))
     this.restores = []
   }
 
@@ -15,11 +24,12 @@ class WeakOwners {
     if (!target || !['object', 'function'].includes(typeof target))
       throw new Error('missing target issuance')
     if (this.ids.has(target)) return this.ids.get(target)
-    if (this.rows.length >= this.capacity) throw new Error('weak observation overflow')
-    const id = this.rows.length + 1
-    this.ids.set(target, id)
-    this.rows.push({ id, kind, weak: new WeakRef(target) })
-    return id
+    if (this.count >= this.capacity) throw new Error('weak observation overflow')
+    const row = this.rows[this.count++]
+    row.kind = kind
+    row.weak = new WeakRef(target)
+    this.ids.set(target, row.id)
+    return row.id
   }
 
   /** @param {object} prototype production prototype @param {string} method synchronous factory @param {string} kind result category @param {string[]} [stateFields] source-owned episode fields @returns {void} wrapper returns exactly the original result */
@@ -48,9 +58,20 @@ class WeakOwners {
     })
   }
 
-  /** @returns {object[]} scalar results; call once after distinct jobs and completed real GC, never in a polling loop */
+  /**
+   * Archives dead observations without keeping their WeakRef wrappers. IDs and kinds survive in
+   * the slots reserved at construction; live targets remain observable at subsequent checkpoints.
+   * @returns {object[]} scalar results for issued targets only; call after distinct jobs and real GC
+   */
   read() {
-    return this.rows.map(({ id, kind, weak }) => ({ id, kind, alive: weak.deref() !== undefined }))
+    const observations = []
+    for (let index = 0; index < this.count; index++) {
+      const row = this.rows[index]
+      const alive = row.weak !== null && row.weak.deref() !== undefined
+      if (!alive) row.weak = null
+      observations.push({ id: row.id, kind: row.kind, alive })
+    }
+    return observations
   }
 
   /** @param {string[]} required issued categories @returns {object} missing issuance or live targets never certify release */

@@ -92,12 +92,58 @@ const ephemeronLiveness = (raw, excludedIds = []) => {
 }
 
 /**
+ * Identifies only the observer's row array, element storage, rows, kind strings and WeakRefs.
+ * Strong additions to a row or wrapper remain unclassified, even when the history dominates
+ * them. Weak target edges never transfer the observer label to a production object.
+ * @param {object} graph analysed heap graph
+ * @returns {Set<number>} node indices whose self bytes belong to weak-observation history
+ */
+const weakHistoryNodes = (graph) => {
+  const nodes = new Set()
+  for (let v = 0; v < graph.n; v++) {
+    const owner = graph.describe(v)
+    if (owner.type !== 'object' || owner.name !== 'WeakOwners') continue
+    for (const { target: rows, edge } of graph.outgoing(v)) {
+      if (edge.type !== 'property' || edge.name !== 'rows') continue
+      nodes.add(rows)
+      const add = (target) => {
+        if (graph.dominates(rows, target)) nodes.add(target)
+      }
+      for (const { target, edge } of graph.outgoing(rows)) {
+        if (edge.type === 'internal' && edge.name === 'elements') add(target)
+        if (!(edge.type === 'element' || (edge.type === 'property' && /^\d+$/.test(edge.name))))
+          continue
+        if (graph.describe(target).name !== 'Object') continue
+        add(target)
+        for (const child of graph.outgoing(target)) {
+          if (child.edge.type !== 'property') continue
+          if (child.edge.name === 'weak' && graph.describe(child.target).name === 'WeakRef')
+            add(child.target)
+          if (child.edge.name !== 'kind') continue
+          const pending = [child.target]
+          const seen = new Set()
+          while (pending.length) {
+            const string = pending.pop()
+            if (seen.has(string) || !/string/.test(graph.describe(string).type)) continue
+            seen.add(string)
+            add(string)
+            for (const link of graph.outgoing(string)) pending.push(link.target)
+          }
+        }
+      }
+    }
+  }
+  return nodes
+}
+
+/**
  * Refines ONLY the former unclassified bucket. Each rule labels a node's self
  * bytes. Named property regions require domination, and ties are left shared.
  * Runtime labels never exempt arbitrary application descendants of code nodes.
  */
 const refineOwnership = (graph) => {
   const original = ownershipIndex(graph)
+  const weakHistory = weakHistoryNodes(graph)
   const anchors = new Map()
   const sharedCorpus = new Set()
   const internedStrings = new Set()
@@ -183,6 +229,7 @@ const refineOwnership = (graph) => {
       if (/string/.test(node.type) && internedStrings.has(v)) label = 'runtime:internalized-strings'
     }
     if (node.type === 'object' && node.name === 'Module') label = 'node:commonjs-module-records'
+    if (weakHistory.has(v)) label = 'harness:weak-observation-history'
     labels[v] = label
   }
   return { labels, original: original.categories }
