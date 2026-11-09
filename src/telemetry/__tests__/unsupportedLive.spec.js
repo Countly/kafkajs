@@ -509,6 +509,7 @@ class UnsupportedCase {
       disabledCorpus.verify(aux)
     )
     if (!oldShare) results.share = await this.shareWork(aux)
+    for (const owner of ['share', 'share-off']) this.observers[owner].confirmForegroundFetchSetup()
     results.ownership = {}
     for (const kind of KINDS) {
       const roles = (owner) =>

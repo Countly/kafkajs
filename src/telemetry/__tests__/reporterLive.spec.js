@@ -388,15 +388,17 @@ live(
         const discoveryCheckpoint = observers.admin.checkpoint()
         const config = await clients.admin.describeConfigs({
           timeout: 3000,
-          resources: [{ type: 4, name: '1', configNames: ['node.id'] }],
+          resources: ['1', '2', '3'].map((name) => ({ type: 4, name, configNames: ['node.id'] })),
         })
-        expect(config.resources).toEqual([
-          expect.objectContaining({
-            resourceType: 4,
-            resourceName: '1',
-            errorCode: 0,
-          }),
-        ])
+        expect(config.resources).toHaveLength(3)
+        for (const name of ['1', '2', '3'])
+          expect(config.resources).toContainEqual(
+            expect.objectContaining({
+              resourceType: 4,
+              resourceName: name,
+              errorCode: 0,
+            })
+          )
         const discovery = observers.admin.normalRequests({ after: discoveryCheckpoint })
         const metadata = discovery.filter((r) => r.apiKey === 3)
         expect(metadata).toHaveLength(1)

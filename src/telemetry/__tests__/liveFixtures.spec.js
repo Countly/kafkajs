@@ -1,5 +1,9 @@
 const { unexpectedJavaStderr } = require('./fixtures/javaStderr')
-const { connectionIdentity, cacheRetirement } = require('../../../scripts/e2e/telemetry/cacheTrace')
+const {
+  connectionIdentity,
+  cacheRetirement,
+  retirementsOf,
+} = require('../../../scripts/e2e/telemetry/cacheTrace')
 const fs = require('fs')
 const os = require('os')
 const path = require('path')
@@ -60,12 +64,84 @@ describe('broker request appender capture', () => {
     }
   })
 
+  test.each([false, true])(
+    'reads a rollover window exactly once (rotate during read: %s)',
+    (race) => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'request-rollover-'))
+      try {
+        const args = requestTraceArgs(
+          'kafka1',
+          '2026-11-08T19:59:59.000Z',
+          '2026-11-08T20:00:01.000Z'
+        )
+        const file = path.join(dir, 'kafka-request.log')
+        const get = (stamp, id) =>
+          `[2026-11-08 ${stamp}] DEBUG Completed request:GET_TELEMETRY_SUBSCRIPTIONS ${id}`
+        const before = get('19:59:59,999', 'before')
+        const after = get('20:00:00,000', 'after')
+        const duplicate = get('19:59:59,500', 'genuine-duplicate')
+        const old = `${get('19:59:58,999', 'outside')}\n${before}\n${duplicate}\n${duplicate}\n`
+        const active = `${after}\n${get('20:00:01,000', 'outside')}\n`
+        fs.writeFileSync(file, race ? old : active)
+        if (!race) fs.writeFileSync(`${file}.2026-11-08-19`, old)
+        fs.writeFileSync(`${file}.2026-11-08-18`, get('19:59:59,100', 'irrelevant-file') + '\n')
+        fs.writeFileSync(`${file}.next`, active)
+        if (race) {
+          // Replace the active path after its first identity snapshot, before the reader commits it.
+          fs.writeFileSync(
+            path.join(dir, 'stat'),
+            `#!/bin/bash
+if [[ "\${!#}" == "${file}" ]]; then
+  if [[ -f "${file}.seen" && -f "${file}.next" ]]; then
+    mv "${file}" "${file}.2026-11-08-19"
+    mv "${file}.next" "${file}"
+  fi
+  touch "${file}.seen"
+fi
+exec /usr/bin/stat "$@"
+`,
+            { mode: 0o700 }
+          )
+        }
+        const text = execFileSync('bash', [...args.slice(6, -1), file], {
+          encoding: 'utf8',
+          env: { ...process.env, PATH: `${dir}:${process.env.PATH}` },
+        })
+        expect(text.trim().split('\n').sort()).toEqual([before, duplicate, duplicate, after].sort())
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true })
+      }
+    }
+  )
+
+  test('fails instead of silently returning an empty trace when the active file is absent', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'missing-request-log-'))
+    try {
+      const args = requestTraceArgs(
+        'kafka1',
+        '2026-11-08T19:10:27.000Z',
+        '2026-11-08T19:10:28.000Z'
+      )
+      expect(() =>
+        execFileSync('bash', [...args.slice(6, -1), path.join(dir, 'kafka-request.log')], {
+          stdio: 'pipe',
+        })
+      ).toThrow()
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   test('fails for a missing or changed request-appender route', () => {
     const config = `Configuration:
   Appenders:
     RollingFile:
       - name: RequestAppender
         fileName: "\${sys:kafka.logs.dir}/kafka-request.log"
+        filePattern: "\${sys:kafka.logs.dir}/kafka-request.log.%d{yyyy-MM-dd-HH}"
+        TimeBasedTriggeringPolicy:
+          modulate: true
+          interval: 1
   Loggers:
     Logger:
       - name: kafka.request.logger
@@ -81,6 +157,12 @@ describe('broker request appender capture', () => {
     expect(() =>
       assertRequestLogConfig(yaml.load(config.replace('ref: RequestAppender', 'ref: STDOUT')))
     ).toThrow()
+    expect(() =>
+      assertRequestLogConfig(yaml.load(config.replace('yyyy-MM-dd-HH', 'yyyy-MM-dd')))
+    ).toThrow()
+    expect(() =>
+      assertRequestLogConfig(yaml.load(config.replace('interval: 1', 'interval: 2')))
+    ).toThrow()
   })
 
   test('binds the Docker-rewritten YAML route regardless of field order and scalar quoting', () => {
@@ -88,6 +170,10 @@ describe('broker request appender capture', () => {
   Appenders:
     RollingFile:
       - fileName: "\${sys:kafka.logs.dir}/kafka-request.log"
+        TimeBasedTriggeringPolicy:
+          interval: 1
+          modulate: true
+        filePattern: "\${sys:kafka.logs.dir}/kafka-request.log.%d{yyyy-MM-dd-HH}"
         name: "RequestAppender"
   Loggers:
     Logger:
@@ -176,6 +262,22 @@ describe('Kafka JSON connection traces', () => {
     options.logs[1].text = `${line(request)}\nTRACE Removing client connection id [${connection}] from the client instance cache`
     expect(connectionIdentity(options)).toMatchObject({ connectionId: connection, uuid })
     expect(cacheRetirement(options)).toMatchObject({ connectionId: connection })
+    expect(retirementsOf(options.logs[1].text)).toEqual([
+      expect.objectContaining({
+        connectionId: connection,
+        processor: '9',
+        index: '8',
+      }),
+    ])
+  })
+
+  test('keeps the index of a five-component legacy connection ID', () => {
+    const legacy = '172.18.0.4:9092-172.18.0.1:54321-8'
+    expect(
+      retirementsOf(
+        `TRACE Removing client connection id [${legacy}] from the client instance cache`
+      )
+    ).toEqual([expect.objectContaining({ connectionId: legacy, processor: undefined, index: '8' })])
   })
 
   test.each([
