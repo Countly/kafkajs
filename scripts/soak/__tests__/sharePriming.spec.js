@@ -630,6 +630,85 @@ describe('streamed share protocol evidence', () => {
   })
 })
 
+describe.each([true, false])('original work deadlines, short=%s', (short) => {
+  let accepted
+  beforeAll(async () => {
+    const value = await recording({ short })
+    expect(value.problems).toEqual([])
+    accepted = value.rows
+  }, 30000)
+
+  test.each(
+    ['priming', 'scored'].flatMap((scope) =>
+      ['cycle', 'verifier', 'final', 'final verifier'].map((kind) => [scope, kind])
+    )
+  )('binds %s %s actual completion to its unchanged deadline', (scope, kind) => {
+    const rows = JSON.parse(JSON.stringify(accepted))
+    const cycle = rows.find((r) => r.scope === scope && r.event === 'soak-cycle')
+    const done = rows.find(
+      (r) => r.scope === scope && ['priming-complete', 'case-complete'].includes(r.event)
+    )
+    const target = kind.startsWith('final') ? done.final : cycle
+    const due = target.timing.due
+    target.timing.completedAt = due
+    if (kind.includes('verifier')) target.verifier.closedAt = due
+    const reseal = () => {
+      const prime = rows.find((r) => r.event === 'priming-complete')
+      for (const row of rows) if (row.priming) row.priming.receiptSha256 = primingReceiptHash(prime)
+    }
+    reseal()
+    if (kind.startsWith('final')) {
+      const { verifyShareWorkTiming } = require('../../evidence/sharePriming')
+      done.timing.observedAt = due
+      const cycles = rows.filter((r) => r.scenario === done.scenario && r.event === 'soak-cycle')
+      expect(
+        verifyShareWorkTiming(
+          done,
+          cycles,
+          done.timing.startedAt,
+          done.timing.workDue,
+          done.timing.workDue + 10000
+        )
+      ).toEqual([])
+    } else expect(verifySharePriming(rows)).toEqual([])
+    if (kind.includes('verifier')) target.verifier.closedAt++
+    else target.timing.completedAt++
+    reseal()
+    expect(verifySharePriming(rows)).toContain(
+      `${scope}: original ${kind.startsWith('final') ? 'final' : 'cycle 0'} work exceeds its unchanged deadline or scope`
+    )
+    expect(target.timing.due).toBe(due)
+  })
+
+  test.each(['priming', 'scored'])(
+    'checks %s actual scope completion against its absolute bound',
+    (scope) => {
+      const { verifyShareWorkTiming } = require('../../evidence/sharePriming')
+      const rows = JSON.parse(JSON.stringify(accepted))
+      const done = rows.find(
+        (r) => r.scope === scope && ['priming-complete', 'case-complete'].includes(r.event)
+      )
+      const cycles = rows.filter((r) => r.scenario === done.scenario && r.event === 'soak-cycle')
+      const start = rows.find((r) => r.event === 'priming-start').startedAt
+      const workDue = start + (scope === 'priming' ? 1010000 : short ? 2030000 : 2990000)
+      const childDue = start + (short ? 2040000 : 3000000)
+      done.timing.observedAt = workDue
+      expect(verifyShareWorkTiming(done, cycles, start, workDue, childDue)).toEqual([])
+      done.timing.observedAt++
+      expect(verifyShareWorkTiming(done, cycles, start, workDue, childDue)).toContain(
+        'original scope completion exceeds its absolute bound'
+      )
+      expect(done.timing.workDue).toBe(workDue)
+      done.timing.observedAt = childDue
+      expect(verifyShareWorkTiming(done, cycles, start, childDue, childDue)).toEqual([])
+      done.timing.observedAt++
+      expect(verifyShareWorkTiming(done, cycles, start, childDue, childDue)).toContain(
+        'original scope completion exceeds its absolute bound'
+      )
+    }
+  )
+})
+
 describe('recorded priming integrity', () => {
   let accepted
   beforeAll(async () => {
@@ -739,13 +818,13 @@ describe('recorded priming integrity', () => {
       },
     ],
     [
-      'late child cutoff',
+      'changed declared child cutoff',
       (rows) => {
         rows.find((r) => r.event === 'case-complete').timing.workDue++
       },
     ],
     [
-      'late original slot',
+      'changed declared original slot',
       (rows) => {
         rows.find((r) => r.event === 'case-complete').timing.slots[0].due++
       },

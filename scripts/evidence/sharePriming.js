@@ -177,6 +177,63 @@ const correspondingImplementations = (inventory) =>
   ].sort()
 
 /**
+ * Binds actual cycle/verifier work to its original slot, cleanup and absolute scope cutoffs.
+ * Padded idle-wake slot summaries are deliberately separate from actual work completion.
+ * @param {object} done Original scope completion.
+ * @param {object[]} cycles Original ordered cycle rows.
+ * @param {number} startedAt Original process entry.
+ * @param {number} workDue Immutable absolute scope work cutoff.
+ * @param {number} childDue Immutable absolute child cutoff.
+ * @returns {string[]} Invalid original work observations.
+ */
+const verifyShareWorkTiming = (done, cycles, startedAt, workDue, childDue) => {
+  const problems = []
+  const observedAt = done.timing?.observedAt
+  if (
+    !Number.isFinite(observedAt) ||
+    observedAt < startedAt ||
+    observedAt > Math.min(workDue, childDue)
+  )
+    problems.push('original scope completion exceeds its absolute bound')
+  const check = (work, kind, cycle, floor, due, label) => {
+    const timing = work?.timing
+    const verifier = work?.verifier
+    if (
+      ![
+        floor,
+        due,
+        timing?.startedAt,
+        timing?.completedAt,
+        verifier?.openedAt,
+        verifier?.closedAt,
+      ].every(Number.isFinite) ||
+      timing.kind !== kind ||
+      timing.cycle !== cycle ||
+      timing.due !== due ||
+      timing.startedAt < Math.max(startedAt, floor) ||
+      timing.completedAt < timing.startedAt ||
+      timing.completedAt > Math.min(due, workDue, childDue, observedAt) ||
+      verifier.kind !== kind ||
+      verifier.cycle !== cycle ||
+      verifier.openedAt < timing.startedAt ||
+      verifier.closedAt < verifier.openedAt ||
+      verifier.closedAt > timing.completedAt ||
+      verifier.events?.some(
+        (r) => !Number.isFinite(r.at) || r.at < verifier.openedAt || r.at > verifier.closedAt
+      )
+    )
+      problems.push(`original ${label} work exceeds its unchanged deadline or scope`)
+  }
+  for (const [i, work] of cycles.entries()) {
+    const slot = done.timing?.slots?.[i]
+    check(work, 'cycle', i, slot?.startedAt, slot?.due, `cycle ${i}`)
+  }
+  const cleanup = done.timing?.stages?.find((s) => s.name === 'cleanup')
+  check(done.final, 'final', 29, done.timing?.phases?.at(-1)?.completedAt, cleanup?.due, 'final')
+  return problems
+}
+
+/**
  * Independently fits every eligible periodic reading; a forged passing summary cannot mask growth.
  * Priming measurements are returned without applying growth limits, but invalid sources fail.
  * @param {object[]} rows Original scope rows, including full periodic observations.
@@ -440,6 +497,15 @@ const verifySharePriming = (rows) => {
       done.final?.verifier?.windowMs !== 5000
     )
       problems.push(`${scope}: invalid fixed schedule, workload or cleanup`)
+    problems.push(
+      ...verifyShareWorkTiming(
+        done,
+        cycles,
+        start.startedAt,
+        start.startedAt + budget,
+        start.startedAt + (score.selector === 'SHARE_SOAK_E2E' ? 2040000 : 3000000)
+      ).map((p) => `${scope}: ${p}`)
+    )
     const corpus = cycles.flatMap((r) => r.oracles?.log?.expected ?? [])
     identities.push(corpus)
     members.push([...cycles.map((r) => r.verifier?.memberId), done.final?.verifier?.memberId])
@@ -513,4 +579,9 @@ const verifySharePriming = (rows) => {
   return problems
 }
 
-module.exports = { verifyShareProtocol, verifySharePeriodic, verifySharePriming }
+module.exports = {
+  verifyShareProtocol,
+  verifySharePeriodic,
+  verifySharePriming,
+  verifyShareWorkTiming,
+}
