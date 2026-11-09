@@ -921,6 +921,9 @@ module.exports = class Runner extends EventEmitter {
    */
   async heartbeat() {
     if (this.retirement) throw this.retirement
+    // Stop ends ordinary heartbeats; eligible commits retain their own coordinator lookup.
+    if (!this.running) return
+
     try {
       await this.consumerGroup.heartbeat({
         interval: this.consumerGroup.heartbeatInterval(),
@@ -1332,9 +1335,8 @@ module.exports = class Runner extends EventEmitter {
     })
 
     if (batches.length === 0) {
-      // An in-flight Fetch can finish empty after stop retired its run. Starting a heartbeat
-      // here would create a coordinator lookup after stop released the pending lookup's waiters,
-      // holding fetchManager.stop() open through another lookup retry budget.
+      // An in-flight Fetch can finish empty after stop. The heartbeat checks the run itself,
+      // but this guard also keeps a late fetch from advancing the stopped poll timer.
       if (!this.running) return batches
 
       // A round that produced nothing is still a poll: an idle consumer must not be evicted for

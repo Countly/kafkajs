@@ -101,6 +101,7 @@ describe('the heartbeat guard is forwarded from the runner', () => {
       eachBatch: async () => {},
       onCrash: () => {},
     })
+    runner.running = true
     await runner.heartbeat()
     const { guard } = heartbeat.mock.calls[0][0]
     expect(guard()).toBeNull()

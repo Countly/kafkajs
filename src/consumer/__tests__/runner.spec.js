@@ -124,6 +124,35 @@ describe('Consumer > Runner', () => {
     await runner.stop()
   })
 
+  describe('heartbeat after stop', () => {
+    it.each(['classic', 'consumer'])(
+      'skips the ordinary %s heartbeat once stop is latched',
+      async (kind) => {
+        consumerGroup.kind = kind
+        runner.running = true
+        runner.latchStop()
+
+        await expect(runner.heartbeat()).resolves.toBeUndefined()
+
+        expect(consumerGroup.heartbeat).not.toHaveBeenCalled()
+      }
+    )
+
+    it.each(['classic', 'consumer'])(
+      'still rejects the %s heartbeat with the retirement reason',
+      async (kind) => {
+        consumerGroup.kind = kind
+        runner.running = true
+        const reason = new Error('the run was retired')
+        runner.retire(reason)
+
+        await expect(runner.heartbeat()).rejects.toBe(reason)
+
+        expect(consumerGroup.heartbeat).not.toHaveBeenCalled()
+      }
+    )
+  })
+
   describe('when the group is rebalancing before the new consumer has joined', () => {
     it('recovers from rebalance in progress and re-join the group', async () => {
       consumerGroup.sync
@@ -713,6 +742,7 @@ describe('Consumer > Runner', () => {
 
     it.each(['classic', 'consumer'])('handles heartbeat authorization under %s', async (kind) => {
       consumerGroup.kind = kind
+      runner.running = true
       const error = new KafkaJSProtocolError(createErrorFromCode(29))
       consumerGroup.heartbeat.mockRejectedValue(error)
       if (kind === 'consumer') await expect(runner.heartbeat()).resolves.toBeUndefined()
@@ -724,6 +754,7 @@ describe('Consumer > Runner', () => {
     it('heartbeats at the membership interval', async () => {
       asConsumerProtocol()
       const runner = createTestRunner()
+      runner.running = true
 
       await runner.heartbeat()
 
