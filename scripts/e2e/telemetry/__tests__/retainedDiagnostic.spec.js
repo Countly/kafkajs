@@ -592,7 +592,7 @@ test('does not turn a fixture assertion closure retaining a target into a releas
   await turn()
   expect(weak.retirement(['store']).outcome).toBe('unreleased')
   expect(accidentalClosure()).toBe(1048576)
-  expect(weak.rows.every((row) => row.weak instanceof WeakRef)).toBe(true)
+  expect(weak.rows.slice(0, weak.count).every((row) => row.weak instanceof WeakRef)).toBe(true)
   expect(weak.ids).toBeInstanceOf(WeakMap)
   expect(weak.restores).toEqual([])
   expect(() => weak.issue(null, 'store')).toThrow('missing target')
@@ -622,4 +622,45 @@ test('verifies actual archived source bytes and rejects missing and wrong digest
   expect(() => verifySources(dir, sources)).toThrow('wrong source digest')
   fs.unlinkSync(path.join(dir, 'sources', 'fixture.js'))
   expect(() => verifySources(dir, sources)).toThrow()
+})
+
+test('reserves weak scalar history before issuance and fails before exceeding its capacity', () => {
+  const weak = new WeakOwners(2)
+  const slots = [...weak.rows]
+  expect(slots).toHaveLength(2)
+  expect(weak.read()).toEqual([])
+  const first = {}
+  const second = {}
+  expect(weak.issue(first, 'snapshot')).toBe(1)
+  expect(weak.issue(first, 'snapshot')).toBe(1)
+  expect(weak.issue(second, 'point')).toBe(2)
+  expect(() => weak.issue({}, 'point')).toThrow('weak observation overflow')
+  expect(weak.rows).toEqual(slots)
+  expect(weak.rows.every((row, index) => row === slots[index])).toBe(true)
+  expect(weak.read()).toEqual([
+    { id: 1, kind: 'snapshot', alive: true },
+    { id: 2, kind: 'point', alive: true },
+  ])
+})
+
+test('archives dead weak observations as scalars while continuing to detect a held target', async () => {
+  v8.setFlagsFromString('--expose-gc')
+  const gc = vm.runInNewContext('gc')
+  const weak = new WeakOwners(8)
+  const held = {}
+  weak.issue(held, 'held')
+  for (let index = 0; index < 6; index++) {
+    weak.issue({}, 'point')
+    await turn()
+    gc()
+    await turn()
+    gc()
+    await turn()
+    const observations = weak.read()
+    expect(observations[0]).toEqual({ id: 1, kind: 'held', alive: true })
+    expect(observations.slice(1).every((row) => !row.alive)).toBe(true)
+    expect(weak.rows.slice(1, index + 2).every((row) => row.weak === null)).toBe(true)
+  }
+  expect(weak.retirement(['held', 'point']).outcome).toBe('unreleased')
+  expect(held).toEqual({})
 })

@@ -240,3 +240,43 @@ test('indexed incoming edges preserve distinct property labels from the same par
       .map(({ edge }) => edge.name)
   ).toEqual(['left', 'right'])
 })
+
+test('attributes weak observation history without exempting strongly retained product data', () => {
+  const raw = fixture([
+    [
+      'synthetic',
+      'root',
+      1,
+      0,
+      [
+        ['property', 'observer', 1],
+        ['property', 'live', 5],
+      ],
+    ],
+    ['object', 'WeakOwners', 3, 32, [['property', 'rows', 2]]],
+    ['object', 'Array', 5, 32, [['property', '0', 3]]],
+    [
+      'object',
+      'Object',
+      7,
+      48,
+      [
+        ['property', 'weak', 4],
+        ['property', 'accidental', 6],
+        ['property', 'kind', 7],
+      ],
+    ],
+    ['object', 'WeakRef', 9, 32, [['weak', 'target', 5]]],
+    ['object', 'TelemetryMetrics', 11, 80, []],
+    ['object', 'Object', 13, 96, []],
+    ['string', 'running:handle', 15, 40, []],
+  ])
+  const graph = analyseSnapshot(raw)
+  const { labels } = refineOwnership(graph)
+  expect(labels[2]).toBe('harness:weak-observation-history')
+  expect(labels[3]).toBe('harness:weak-observation-history')
+  expect(labels[4]).toBe('harness:weak-observation-history')
+  expect(labels[5]).not.toBe('harness:weak-observation-history')
+  expect(labels[6]).not.toBe('harness:weak-observation-history')
+  expect(labels[7]).toBe('harness:weak-observation-history')
+})
