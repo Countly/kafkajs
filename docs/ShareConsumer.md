@@ -128,7 +128,9 @@ Use `run({ eachMessage })` or `run({ eachBatch })` for Java's polling role. The 
 | `acquisitionLockTimeoutMs()` | `acquisitionLockTimeoutMs()`, `null` until a broker answer carries it |
 | `close()`, `close(Duration)` | `disconnect()`, `disconnect({ timeout })` |
 | `wakeup()` | none; use `stop()` |
-| `metrics()`, `clientInstanceId(Duration)`, metric registration | none on this surface |
+| `clientInstanceId(Duration)` | `clientInstanceId({ timeout })` |
+| `registerMetricForSubscription(...)`, `unregisterMetricFromSubscription(...)` | `registerMetricForSubscription(metric)`, `unregisterMetricFromSubscription(identity)` |
+| `metrics()` | none on this surface |
 
 There is no callable synchronous flush-and-wait, no clear-subscription method and no subscription replacement while running. stop retains the subscribed names; use stop → subscribe → run to replace them. Automatic acknowledgement sending reports each homogeneous terminal range once; renew results are nonterminal. This sequence does not preserve running-replacement semantics.
 
@@ -155,7 +157,7 @@ The payload has exactly `topic`, `partition`, `firstOffset`, `lastOffset`, `type
 
 There are 43 ordinary channels and 18 share channels. ShareConsumer emits instrumentation events and diagnostics channels; this package does not create share-consumer spans.
 
-There is no built-in metrics registry or `metrics()` method on this surface. Use the instrumentation events and their diagnostics channels for counters and timing; the event contract supplies observations without creating an OpenTelemetry span. Client instance identity and metric subscription APIs are separate telemetry work; no ShareConsumer telemetry method is added here.
+There is no built-in metrics registry or `metrics()` method on this surface. Use the instrumentation events and their diagnostics channels for counters and timing; the event contract supplies observations without creating an OpenTelemetry span. Client instance identity and metric subscription APIs are available through `clientInstanceId({ timeout })`, `registerMetricForSubscription(metric)` and `unregisterMetricFromSubscription(identity)`. See [Broker client telemetry](#broker-client-telemetry) for their configuration and lifecycle.
 
 ## Administration and resetting offsets
 

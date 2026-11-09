@@ -121,9 +121,20 @@ describe('Share guide API boundaries', () => {
     expect(read('otel/README.md')).toContain(sentence)
     expect(guide).toContain('43 ordinary channels and 18 share channels')
     expect(guide).toContain('no built-in metrics registry')
-    expect(guide).toContain(
-      'Client instance identity and metric subscription APIs are separate telemetry work'
+    expect(guide).toContain('no built-in metrics registry or `metrics()` method')
+    const table = guide.slice(
+      guide.indexOf('| Java `KafkaShareConsumer` |'),
+      guide.indexOf('## Administration and resetting offsets')
     )
+    for (const method of [
+      'clientInstanceId({ timeout })',
+      'registerMetricForSubscription(metric)',
+      'unregisterMetricFromSubscription(identity)',
+    ]) {
+      expect(table.split(method)).toHaveLength(3)
+    }
+    expect(table).toContain('| `metrics()` | none on this surface |')
+    expect(table).not.toContain('no ShareConsumer telemetry method')
   })
 
   test('documents the additive public surface and test doubles', () => {
