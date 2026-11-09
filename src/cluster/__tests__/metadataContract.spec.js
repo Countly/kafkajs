@@ -422,19 +422,40 @@ describe('Cluster > metadata contract', () => {
   })
 
   describe('stage 3: the call on a broker', () => {
-    test('a connection failure followed by a callback failure preserves the callback error', async () => {
+    test('a connection failure followed by a callback failure retries the connection error', async () => {
       const { cluster, brokers } = build()
+      const unreachable = new KafkaJSConnectionError('connect ECONNREFUSED')
       brokers[0].isConnected = () => false
       brokers[0].connect = async () => {
-        throw new KafkaJSConnectionError('connect ECONNREFUSED')
+        throw unreachable
       }
       const denied = createErrorFromCode(29)
       brokers[1].metadata.mockRejectedValue(denied)
 
-      await expect(cluster.metadata({ topics: [TOPIC] })).rejects.toBe(denied)
+      const error = await cluster.metadata({ topics: [TOPIC] }).catch((e) => e)
 
+      expect(error).toBeInstanceOf(KafkaJSNumberOfRetriesExceeded)
+      expect(error.cause).toBe(unreachable)
       expect(brokers[0].metadata).not.toHaveBeenCalled()
-      expect(brokers[1].metadata).toHaveBeenCalledTimes(1)
+      expect(brokers[1].metadata).toHaveBeenCalledTimes(RETRY.retries + 1)
+    })
+
+    test('coordinator discovery keeps a skipped connection error retriable when the surviving broker reports it unavailable', async () => {
+      const { cluster, brokers } = build()
+      const unreachable = new KafkaJSConnectionError('connect ECONNREFUSED')
+      brokers[0].isConnected = () => false
+      brokers[0].connect = async () => {
+        throw unreachable
+      }
+      brokers[1].findGroupCoordinator = jest.fn().mockRejectedValue(createErrorFromCode(15))
+
+      const error = await cluster
+        .findGroupCoordinatorMetadata({ groupId: 'outage-group' })
+        .catch((e) => e)
+
+      expect(error).toBe(unreachable)
+      expect(error.retriable).toBe(true)
+      expect(brokers[1].findGroupCoordinator).toHaveBeenCalledTimes(RETRY.retries + 1)
     })
 
     test('returns the first answer: a failure on one broker is swallowed and the next is asked', async () => {

@@ -1,7 +1,8 @@
-const { Kafka, PartitionAssigners, logLevel } = require('../../../index')
+const { Kafka, PartitionAssigners } = require('../../../index')
 const { KafkaJSConnectionError } = require('../../errors')
 const createConsumer = require('../index')
 const Runner = require('../runner')
+const ClassicMembership = require('../groupProtocol/classic')
 const { createCluster, newLogger } = require('testHelpers')
 const {
   createScriptedCluster,
@@ -238,6 +239,55 @@ describe('Consumer > broker outages', () => {
       expect(events.rebalancing.map(({ reason }) => reason)).toEqual(['rebalance-in-progress'])
     }
   )
+
+  it('recovers after a lost heartbeat when the skipped coordinator is refused and the surviving broker reports it unavailable', async () => {
+    jest.spyOn(Math, 'random').mockReturnValue(0)
+    const { cluster, breaker, events } = scenario()
+    await start(events)
+    await until(() => events.records.length === 1, 'the first record')
+
+    const heartbeat = cluster.schedule.hold({ api: 'Heartbeat', node: COORDINATOR })
+    await heartbeat.arrived()
+    let unavailable = true
+    cluster.answer('FindCoordinator', ({ coordinatorKeys }) => ({
+      coordinators: coordinatorKeys.map((key) => ({
+        key,
+        nodeId: COORDINATOR,
+        host: NODES[COORDINATOR].host,
+        port: NODES[COORDINATOR].port,
+        errorCode: unavailable ? 15 : 0,
+        errorMessage: null,
+      })),
+    }))
+    const outageAt = cluster.requests().length
+    breaker.take(COORDINATOR, 'refused')
+    heartbeat.release()
+    await sleep(OUTAGE_MS)
+    const unavailableLookups = wire(cluster, 'FindCoordinator', outageAt).filter(
+      ({ node, answeredOrder }) => node === LEADER && answeredOrder !== undefined
+    )
+    const restoredAt = cluster.requests().length
+    unavailable = false
+    breaker.restore(COORDINATOR)
+    await until(
+      () =>
+        events.crashes.length > 0 ||
+        wire(cluster, 'Heartbeat', restoredAt).some(
+          ({ node, answeredOrder }) => node === COORDINATOR && answeredOrder !== undefined
+        ),
+      'a heartbeat answered after coordinator restoration or a crash'
+    )
+
+    expect(events.crashes).toEqual([])
+    expect(unavailableLookups.length).toBeGreaterThan(0)
+    expect(
+      wire(cluster, 'Heartbeat', restoredAt).some(
+        ({ node, answeredOrder }) => node === COORDINATOR && answeredOrder !== undefined
+      )
+    ).toBe(true)
+    expect(wire(cluster, 'JoinGroup')).toHaveLength(1)
+    expect(events.rebalancing).toEqual([])
+  })
 
   it.each([['refused'], ['reset']])(
     'a coordinator %s at the first join costs no crash: the consumer joins once it is back',
@@ -637,41 +687,51 @@ describe('Consumer > broker outages', () => {
     expect(restart).toBe(true)
   })
 
-  it('a disconnect after a heartbeat lost the coordinator sends no leave and looks for no coordinator', async () => {
-    const retry = { retries: 5, initialRetryTime: 300, maxRetryTime: 2000 }
-    const lines = []
-    const { cluster, breaker, events } = scenario(
-      { heartbeatInterval: 1000, sessionTimeout: 6000, retry },
-      { retry, logLevel: logLevel.DEBUG, logCreator: () => (entry) => lines.push(entry) },
-      { batches: 0 }
-    )
-    const held = cluster.schedule.hold({ api: 'Heartbeat' })
-    await start(events)
-    await held.arrived()
-    breaker.take(COORDINATOR, 'refused')
-    // The fetch loop and background timer share the heartbeat. Either can observe its failure
-    // first; waiting only for the timer can instead wait for a later coordinator lookup to exhaust
-    // its retries. Both paths below report after the failed heartbeat marked its coordinator lost.
-    await until(
-      () =>
-        lines.some(
-          ({ log }) =>
-            /Background heartbeat failed/.test(log.message) ||
-            (log.message === 'Lost a connection while fetching, trying again' &&
-              log.requestClass === 'heartbeat')
-        ),
-      'the heartbeat that lost the coordinator'
-    )
+  it.each([
+    ['coordinator first', 0],
+    ['leader first', 0.99],
+  ])(
+    'a disconnect after a heartbeat lost the coordinator sends no leave and looks for no coordinator (%s)',
+    async (_order, random) => {
+      jest.spyOn(Math, 'random').mockReturnValue(random)
+      const retry = { retries: 5, initialRetryTime: 300, maxRetryTime: 2000 }
+      let heartbeatFailure
+      const heartbeat = ClassicMembership.prototype.heartbeat
+      jest
+        .spyOn(ClassicMembership.prototype, 'heartbeat')
+        .mockImplementation(async function (options) {
+          try {
+            return await heartbeat.call(this, options)
+          } catch (error) {
+            heartbeatFailure ??= error
+            throw error
+          }
+        })
+      const { cluster, breaker, events } = scenario(
+        { heartbeatInterval: 1000, sessionTimeout: 6000, retry },
+        { retry },
+        { batches: 0 }
+      )
+      const held = cluster.schedule.hold({ api: 'Heartbeat' })
+      await start(events)
+      await held.arrived()
+      breaker.take(COORDINATOR, 'refused')
+      // Observe the real rejection before fetch-manager draining can delay its log behind a lookup.
+      await until(() => heartbeatFailure !== undefined, 'the heartbeat that lost the coordinator')
+      held.release()
 
-    const lostAt = cluster.requests().length
-    const disconnectedAt = performance.now()
-    await consumer.disconnect()
+      const lostAt = cluster.requests().length
+      const disconnectedAt = performance.now()
+      await consumer.disconnect()
 
-    expect(wire(cluster, 'FindCoordinator', lostAt)).toEqual([])
-    expect(wire(cluster, 'LeaveGroup', lostAt)).toEqual([])
-    expect(performance.now() - disconnectedAt).toBeLessThan(1000)
-    expect(events.crashes).toEqual([])
-  }, 20000)
+      expect(lostConnection(heartbeatFailure)).toBe(true)
+      expect(wire(cluster, 'FindCoordinator', lostAt)).toEqual([])
+      expect(wire(cluster, 'LeaveGroup', lostAt)).toEqual([])
+      expect(performance.now() - disconnectedAt).toBeLessThan(1000)
+      expect(events.crashes).toEqual([])
+    },
+    20000
+  )
 
   it('a stop while the first join rides out an outage ends the join without a crash', async () => {
     const { breaker, events } = scenario()

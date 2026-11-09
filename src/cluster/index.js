@@ -600,16 +600,17 @@ module.exports = class Cluster {
    *    `KafkaJSNonRetriableError` whose `cause` is the broker's error. A raw `LEADER_NOT_AVAILABLE`
    *    that escapes the refresh would be retried here. Any other refresh error is thrown as it is.
    * 2. Broker selection, `withBroker`: a connection failure skips to the next broker within the
-   *    same attempt. If the final broker cannot connect, or a broker cannot be found, the
-   *    retriable error is retried within the `retry` budget, ending in
+   *    same attempt. If no call succeeds and any broker failed to connect, or a broker cannot be
+   *    found, the retriable error is retried within the `retry` budget, ending in
    *    `KafkaJSNumberOfRetriesExceeded`, or `KafkaJSDeliveryTimeout` when `retry.maxTotalTime`
    *    passes first. A selection or connection error that cannot succeed, a SASL authentication
    *    failure for example, rejects at once with a `KafkaJSNonRetriableError`.
    * 3. The call on each broker in turn: a failure moves on to the next broker, and the first
    *    answer is returned. When every broker is connected to and every call fails, the last
    *    broker's error is thrown as it is (class and cause kept) after that one pass, never retried
-   *    here. When some calls fail and the final broker cannot be connected to, the attempt ends as
-   *    in stage 2 (`KafkaJSNumberOfRetriesExceeded` after the budget) and the call errors are lost.
+   *    here. When no call succeeds and any broker failed to connect, the last connection failure
+   *    ends the attempt as in stage 2 (`KafkaJSNumberOfRetriesExceeded` after the budget), and the
+   *    call errors are lost.
    *
    * The answer is a snapshot: it is never merged into the metadata cache, never emits
    * `TOPIC_RECREATED` and never changes the target topics.

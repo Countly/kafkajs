@@ -1177,15 +1177,15 @@ module.exports = class BrokerPool {
 
   /**
    * Tries brokers in shuffled order, skipping connection failures as well as callback failures.
-   * Other lookup failures propagate immediately. If no callback succeeds, a final connection
-   * failure is thrown; a final callback failure returns null, as before.
+   * Other lookup failures propagate immediately. If no callback succeeds, the last connection
+   * failure is thrown if any broker failed to connect; otherwise returns null.
    * @public
    * @param {(params: { nodeId: string, broker: Broker }) => Promise<T>} callback
    * @param {object} [options]
    * @param {import('../producer/generation')} [options.fence] the producer lifecycle asking: once
    *   it closed, no further broker is tried
    * @returns {Promise<T|null>}
-   * @throws {Error} a lookup failure, the final connection failure or the lifecycle's close error
+   * @throws {Error} a lookup failure, the last connection failure or the lifecycle's close error
    * @template T
    */
   async withBroker(callback, { fence } = {}) {
@@ -1206,7 +1206,6 @@ module.exports = class BrokerPool {
         connectionError = e
         continue
       }
-      connectionError = null
       try {
         return await callback({ nodeId, broker })
       } catch (e) {

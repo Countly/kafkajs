@@ -484,40 +484,6 @@ describe('Cluster > BrokerPool', () => {
     })
   })
 
-  describe('#withBroker', () => {
-    beforeEach(async () => {
-      await brokerPool.refreshMetadata([topicName])
-    })
-
-    it('throws an error if there are no brokers configured', async () => {
-      brokerPool.brokers = {}
-      await expect(brokerPool.withBroker(jest.fn())).rejects.toHaveProperty(
-        'message',
-        'No brokers in the broker pool'
-      )
-    })
-
-    it('returns the result of the callback', async () => {
-      const output = 'return-from-callback'
-      const callback = jest.fn(() => output)
-      await expect(brokerPool.withBroker(callback)).resolves.toEqual(output)
-      expect(callback).toHaveBeenCalledWith(
-        expect.objectContaining({
-          nodeId: expect.any(String),
-          broker: expect.any(Broker),
-        })
-      )
-    })
-
-    it('returns null if the callback never resolves', async () => {
-      const callback = jest.fn(() => {
-        throw new Error('never again!')
-      })
-
-      await expect(brokerPool.withBroker(callback)).resolves.toEqual(null)
-    })
-  })
-
   describe('#findConnectedBroker', () => {
     beforeEach(async () => {
       await brokerPool.refreshMetadata([topicName])
@@ -553,5 +519,77 @@ describe('Cluster > BrokerPool', () => {
       expect(broker).toEqual(brokerPool.seedBroker)
       expect(broker.isConnected()).toEqual(true)
     })
+  })
+})
+
+describe('Cluster > BrokerPool > #withBroker', () => {
+  let brokerPool, brokers
+
+  beforeEach(() => {
+    jest.spyOn(Math, 'random').mockReturnValue(0.99)
+    brokerPool = new BrokerPool({
+      connectionPoolBuilder: createConnectionBuilder(),
+      logger: newLogger(),
+    })
+    brokers = [0, 1].map((nodeId) => {
+      const broker = new Broker({
+        nodeId,
+        connectionPool: createConnectionPool(),
+        logger: newLogger(),
+      })
+      jest.spyOn(broker, 'isConnected').mockReturnValue(true)
+      return broker
+    })
+    brokerPool.brokers = Object.fromEntries(brokers.map((broker) => [broker.nodeId, broker]))
+  })
+
+  afterEach(async () => {
+    await brokerPool.disconnect()
+    jest.restoreAllMocks()
+  })
+
+  it('throws an error if there are no brokers configured', async () => {
+    brokerPool.brokers = {}
+    await expect(brokerPool.withBroker(jest.fn())).rejects.toHaveProperty(
+      'message',
+      'No brokers in the broker pool'
+    )
+  })
+
+  it('returns the result of the callback', async () => {
+    const output = 'return-from-callback'
+    const callback = jest.fn(() => output)
+    await expect(brokerPool.withBroker(callback)).resolves.toEqual(output)
+    expect(callback).toHaveBeenCalledWith(
+      expect.objectContaining({
+        nodeId: expect.any(String),
+        broker: expect.any(Broker),
+      })
+    )
+  })
+
+  it('returns null if every broker connects but every callback fails', async () => {
+    const callback = jest.fn(() => {
+      throw new Error('never again!')
+    })
+
+    await expect(brokerPool.withBroker(callback)).resolves.toEqual(null)
+    expect(callback).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps a skipped connection error retriable when a later callback fails', async () => {
+    const unreachable = new KafkaJSConnectionError('connect ECONNREFUSED')
+    brokers[0].isConnected.mockReturnValue(false)
+    jest.spyOn(brokers[0], 'connect').mockRejectedValue(unreachable)
+    const callback = jest.fn(async () => {
+      throw createErrorFromCode(15)
+    })
+
+    const error = await brokerPool.withBroker(callback).catch((e) => e)
+
+    expect(error).toBe(unreachable)
+    expect(error.retriable).toBe(true)
+    expect(callback).toHaveBeenCalledTimes(1)
+    expect(callback).toHaveBeenCalledWith({ nodeId: '1', broker: brokers[1] })
   })
 })
