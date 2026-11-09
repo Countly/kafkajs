@@ -76,6 +76,7 @@ const cleanupOwner = ({
   const snapshot = shares.snapshot
   shares.snapshot = async () => {
     const reading = await snapshot()
+    reading.heapUsed ??= process.memoryUsage().heapUsed
     observations.push(reading)
     return reading
   }
@@ -148,6 +149,14 @@ describe('share owner cleanup populations', () => {
   test.each([false, true])(
     'matches original nested priming populations inside real Jest liveCase and outer cleanup, exceptional=%s',
     bounded.liveCase(30000, async (_scope, exceptional) => {
+      await bounded.pollUntil(
+        _scope,
+        2000,
+        // eslint-disable-next-line n/no-unsupported-features/node-builtins -- tests observe the original resource source on Node 22+
+        () => !process.getActiveResourcesInfo().includes('ProcessWrap'),
+        { delayMs: 10, label: 'Jest bootstrap children closing before resource ownership' }
+      )
+      await new Promise(setImmediate)
       const {
         owner: prime,
         driver,

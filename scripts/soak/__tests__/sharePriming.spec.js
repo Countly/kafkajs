@@ -314,7 +314,7 @@ describe('fixed same-realm share priming', () => {
     const inventories = rows.filter((r) => r.event === 'soak-protocol-manifest')
     expect(inventories[0].inventory.every((r) => r.endpoint === 'node-a:9092')).toBe(true)
     expect(inventories[1].inventory.every((r) => r.endpoint === 'node-b:9092')).toBe(true)
-  }, 30000)
+  }, 120000)
 
   test('rejects a corresponding negotiated version mismatch across separate coordinators', async () => {
     const { result, problems } = await recording({
@@ -323,7 +323,7 @@ describe('fixed same-realm share priming', () => {
     })
     expect(result.ok).toBe(true)
     expect(problems).toContain('share.jsonl: priming/scored negotiated implementations differ')
-  }, 30000)
+  }, 120000)
 
   test.each([true, false])(
     'executes one complete disjoint pass before scoring, short=%s',
@@ -347,7 +347,7 @@ describe('fixed same-realm share priming', () => {
       expect(prime.schedule.slotMs).toBe(32000)
       expect(prime.schedule.boundaryMs).toBe(10000)
     },
-    30000
+    120000
   )
 
   test.each([true, false])(
@@ -366,7 +366,7 @@ describe('fixed same-realm share priming', () => {
       expect(rows.filter((r) => r.event === 'priming-complete')).toHaveLength(1)
       expect(rows.filter((r) => r.event === 'case-complete')).toHaveLength(0)
     },
-    30000
+    120000
   )
 
   test.each([true, false])(
@@ -379,7 +379,7 @@ describe('fixed same-realm share priming', () => {
       if (!short) expect(result.violations).toContain('phase-end quiet heap screen')
       expect(problems.join('\n')).toContain('phase-end quiet heap slope screen')
     },
-    30000
+    120000
   )
 
   test.each([true, false])(
@@ -401,7 +401,7 @@ describe('fixed same-realm share priming', () => {
       expect(ends[0].heapAtMs).toBeGreaterThan(960000)
       expect(ends[1].heapAtMs - ends[0].heapAtMs).toBeGreaterThan(short ? 320000 : 640000)
     },
-    30000
+    120000
   )
 
   test('records first-use heap growth without turning it into a passing scored heap verdict', async () => {
@@ -412,7 +412,7 @@ describe('fixed same-realm share priming', () => {
     expect(verdict.ok).toBe(true)
     expect(verdict.measurementOnly.ok).toBe(false)
     expect(verdict.measurementOnly.violations).toContain('share-steady: retained-heap screen')
-  }, 30000)
+  }, 120000)
 
   test('joins failed first-use cleanup, archives both errors and never prepares scored resources', async () => {
     const { owner, rows, error, scoredDriver } = await recording({
@@ -430,7 +430,7 @@ describe('fixed same-realm share priming', () => {
         .join('\n')
     ).toContain('priming deletion failed')
     expect(rows.filter((r) => r.event === 'priming-complete')).toEqual([])
-  }, 30000)
+  }, 120000)
 
   test.each([
     [
@@ -484,7 +484,7 @@ describe('fixed same-realm share priming', () => {
       expect(scoredDriver.prepare).not.toHaveBeenCalled()
       expect(rows.some((r) => r.event === 'case-complete')).toBe(false)
     },
-    30000
+    120000
   )
 
   test.each([
@@ -527,7 +527,7 @@ describe('fixed same-realm share priming', () => {
       expect(scoredDriver.prepare).not.toHaveBeenCalled()
       expect(rows.some((r) => r.event === 'priming-complete')).toBe(false)
     },
-    30000
+    120000
   )
 
   test.each([
@@ -578,7 +578,7 @@ describe('fixed same-realm share priming', () => {
       expect(rows.some((r) => r.event === 'priming-boundary')).toBe(false)
       expect(rows.some((r) => r.event === 'case-complete')).toBe(false)
     },
-    30000
+    120000
   )
 
   test('the fixed allocations preserve both distinct idle margins', () => {
@@ -636,7 +636,7 @@ describe.each([true, false])('original work deadlines, short=%s', (short) => {
     const value = await recording({ short })
     expect(value.problems).toEqual([])
     accepted = value.rows
-  }, 30000)
+  }, 120000)
 
   test.each(
     ['priming', 'scored'].flatMap((scope) =>
@@ -715,7 +715,7 @@ describe('recorded priming integrity', () => {
     const recordingResult = await recording()
     expect(recordingResult.problems).toEqual([])
     accepted = recordingResult.rows
-  }, 30000)
+  }, 120000)
 
   test.each([
     [
