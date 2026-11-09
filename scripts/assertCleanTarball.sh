@@ -30,7 +30,7 @@ if echo "$FILES" | grep -E '^package/docs/' | grep -Ev '^package/docs/ShareConsu
   echo "tarball contains unintended documentation" >&2
   exit 1
 fi
-if tar -xOf "$1" package/docs/ShareConsumer.md | grep -E '/var/tmp/|/home/[^ /]+/|\.superpowers/'; then
+if tar -xOf "$1" package/docs/ShareConsumer.md | grep -E '[/]var[/]tmp[/]|/home/[^ /]+/|\.superpowers/'; then
   echo "share consumer guide contains a local path" >&2
   exit 1
 fi

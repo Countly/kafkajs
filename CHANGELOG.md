@@ -50,6 +50,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Tooling
 
+- Register the share broker-floor refusal checks in the exit gate (required on the 4.0.2 floor, tolerated skips elsewhere) and enumerate the new tarball and docs path guards in the exit sweeps.
 - Move short share-soak memory acceptance to the separate `Memory gates` workflow required before 3.0.0, add a manual integration lane selector, and run the soak unit spec in three case shards per supported Node version.
 
 - Add share-consumer soak and benchmark gates with separate batch and message identity controls. The short/full soak profiles use 32/64-second slots and 960/1920-second profiles, 1020/1980-second inclusive child budgets and 1440/2400-second cold caps. Both retain thirty cycles, ten resets and separate 5000 ms per-cycle and final observations, with configuration, heartbeat and cycle-step evidence. These are declared bounds; live acceptance and measured performance remain unverified.
