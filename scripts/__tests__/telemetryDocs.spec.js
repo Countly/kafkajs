@@ -449,8 +449,8 @@ describe('telemetry resource documentation', () => {
   test('documents the churn method and the CI rows', () => {
     expect(testing).toContain('### Telemetry churn (`telemetry churn`)')
     expect(testing).toContain('selected by a rule over the transcript alone')
-    expect(testing).toContain('eleven distinct Node 24 rows')
-    expect(testing).toContain('required exit catalogue has 75 rows')
+    expect(testing).toContain('ten distinct Node 24 rows')
+    expect(testing).toContain('required functional exit catalogue has 69 rows')
     expect(telemetry).toContain('35 subscription transitions')
   })
 
