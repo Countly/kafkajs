@@ -411,6 +411,8 @@ class MemoryArmJudge {
   /** @returns {void} judges the schema, the child's exit and the host contexts */
   envelope() {
     const { schema, arm, kind, exit, context } = this.record
+    if (this.record.diagnostic === true || this.record.acceptanceEligible === false)
+      this.fail('diagnostic records are ineligible for acceptance')
     if (schema !== SCHEMA) this.fail('unknown schema')
     if (!ARMS.includes(arm)) this.fail('unknown arm')
     if (!KINDS.includes(kind)) this.fail('unknown kind')

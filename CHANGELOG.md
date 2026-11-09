@@ -18,6 +18,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Flush terminal telemetry worker messages before IPC disconnect, retain failed-worker exit, output and phase diagnostics, and hold planned soak samples until their admission time.
 - Read hourly rolled telemetry request traces with bounded rotation retries, prove foreground fetch setup ownership, and exercise every discovered reporter broker without weakening socket or cleanup checks.
 - Verify pinned Java admin close with completed work, a fresh four-metric export and bounded acknowledged close/cessation evidence; retain mandatory producer/consumer finals and replay versioned raw receipts.
+- Add an isolated Node-24 retained-ownership diagnostic with bounded captures, scalar counterparts, source archives and broker-free failure controls; diagnostic evidence cannot satisfy resource acceptance.
 - Qualify telemetry final subscription-deletion errors with archived admin evidence, and verify forced share shutdown using final acknowledgements and exact suffix redelivery.
 - Use the non-deprecated bounded Java consumer close API, select the Java admin counter by its source name, and read Kafka JSON connection traces from the request appender. Retain the primary shutdown failure with partial-segment diagnostics.
 - Settle resource measurements with recorded collection convergence, release native result references before closed readings, and preserve sampling through native settlement.
