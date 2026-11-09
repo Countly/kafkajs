@@ -116,6 +116,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Tooling
 
+- Move short share-soak memory acceptance to the separate `Memory gates` workflow required before 3.0.0, add a manual integration lane selector, and run the soak unit spec in three case shards per supported Node version.
+
 - Add share-consumer soak and benchmark gates with separate batch and message identity controls. The short/full soak profiles use 32/64-second slots and 960/1920-second profiles, 1020/1980-second inclusive child budgets and 1440/2400-second cold caps. Both retain thirty cycles, ten resets and separate 5000 ms per-cycle and final observations, with configuration, heartbeat and cycle-step evidence. These are declared bounds; live acceptance and measured performance remain unverified.
 
 - Track the seven released share-group APIs (keys 76–79 and 90–92) in the Kafka 4.4.0 and 4.3.1 message snapshots and regenerate their protocol compatibility inventory. Source inventory alone does not add share-group support.

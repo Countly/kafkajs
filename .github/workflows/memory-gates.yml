@@ -1,0 +1,64 @@
+name: Memory gates
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+concurrency:
+  group: memory-gates-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  share-soak-short:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    env:
+      KAFKA_VERSION: 4.3.1
+      COMPOSE_FILE: docker-compose.yml
+      KAFKA_CLIENTS_VERSION: ''
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 24, cache: npm }
+      - run: npm ci
+      - run: docker compose version
+      - name: Prepare share evidence
+        run: |
+          echo "KAFKAJS_TREE=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          rm -rf .tmp/e2e
+          mkdir -p .tmp/e2e
+      - name: Start cold base cluster
+        env:
+          DO_NOT_STOP: '1'
+        run: ./scripts/testWithKafka.sh "true"
+      - name: Run share soak (natural exit)
+        timeout-minutes: 35
+        env:
+          KAFKAJS_LANE: docker
+          KAFKAJS_DEBUG_PROTOCOL_BUFFERS: '1'
+          SHARE_SOAK_E2E: '1'
+        run: node scripts/ci/naturalExit.js soak
+      - name: Verify share evidence before teardown
+        if: always()
+        run: |
+          node <<'NODE'
+          const fs = require('fs')
+          const { spawnSync } = require('child_process')
+          const { readBrokerVersion } = require('./testHelpers/brokerVersion')
+          const files = fs.readdirSync('.tmp/e2e').filter(name => name.endsWith('.jsonl'))
+            .map(name => `.tmp/e2e/${name}`)
+          const result = spawnSync(process.execPath, [
+            'scripts/evidence/verify.js', '--broker', readBrokerVersion(), ...files,
+          ], { stdio: 'inherit' })
+          if (result.error) throw result.error
+          process.exitCode = result.status ?? 1
+          NODE
+      - name: Stop share cluster
+        if: always()
+        run: docker compose -f "$COMPOSE_FILE" down --remove-orphans
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-share-soak-short-4.3.1-node24
+          path: .tmp/e2e/
+          if-no-files-found: ignore
+          include-hidden-files: true
