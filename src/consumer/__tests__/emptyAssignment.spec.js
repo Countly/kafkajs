@@ -8,7 +8,7 @@ const {
   createCluster,
   createTopic,
   newLogger,
-  waitForConsumerToJoinGroup,
+  waitFor,
   waitForNextEvent,
 } = require('testHelpers')
 
@@ -87,14 +87,42 @@ describe('Consumer', () => {
     consumer1.subscribe({ topic })
     consumer2.subscribe({ topic })
 
-    consumer1.run({ eachMessage: () => {} })
-    consumer2.run({ eachMessage: () => {} })
-
-    // Ensure that both consumers manage to join
-    const groupJoinEvents = await Promise.all([
-      waitForConsumerToJoinGroup(consumer1),
-      waitForConsumerToJoinGroup(consumer2),
+    // A first join can belong to a solo generation, before the other member joins and
+    // changes which member sorts first. Compare assignments from the same generation.
+    const joins = [new Map(), new Map()]
+    let crash, groupJoinEvents
+    const removeListeners = [consumer1, consumer2].flatMap((consumer, index) => [
+      consumer.on(consumer.events.GROUP_JOIN, (event) => {
+        // GROUP_JOIN has no generation field; groupMetadata() is recorded before its delivery.
+        joins[index].set(consumer.groupMetadata().generationId, event)
+      }),
+      consumer.on(consumer.events.CRASH, ({ payload }) => {
+        crash = payload.error
+      }),
     ])
+
+    try {
+      consumer1.run({ eachMessage: () => {} })
+      consumer2.run({ eachMessage: () => {} })
+
+      groupJoinEvents = await waitFor(
+        () => {
+          if (crash) throw crash
+          for (const [generationId, event1] of joins[0]) {
+            const event2 = joins[1].get(generationId)
+            if (event2) return [event1, event2]
+          }
+          return false
+        },
+        {
+          ignoreTimeout: false,
+          maxWait: 10000,
+          timeoutMessage: `Timeout waiting for both consumers in ${groupId} to join the same generation`,
+        }
+      )
+    } finally {
+      removeListeners.forEach((remove) => remove())
+    }
 
     const emptyAssignments = groupJoinEvents.filter(
       ({ payload }) => Object.entries(payload.memberAssignment).length === 0
