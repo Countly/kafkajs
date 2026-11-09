@@ -1,6 +1,6 @@
 # Retained-memory ownership diagnostic
 
-RCA-RES7 supports substantial engine first-use growth but does not establish that the retained gate is unreachable for a correct client. Ruling 9f-F10-r4 retains C0/C1 admission, the original M and the 256-KiB closed-transient gate; it authorizes no additional acceptance warm-up or baseline exclusion. Cold ownership, backing-store lifetime and peak-source attribution remain open. Diagnostic-only repetition is ineligible for acceptance. Existing resource failures remain failed; A19/A32 are incomplete.
+Use this diagnostic when the telemetry resource arms fail their retained-memory checks. It records where retained memory grows (engine code and metadata, module caches, harness state, client state) so that growth can be attributed to an owner. It is diagnostic only: its records are marked `diagnostic: true, acceptanceEligible: false`, the resource acceptance gate rejects them, and it changes no acceptance limit, schedule or baseline.
 
 The separate `retained-diagnostic` CI job selects Node 24 and runs the six broker-free control groups before invoking:
 
@@ -21,5 +21,3 @@ The artifact contains source copies and digests, parent-issued identities, per-c
 The offline `retained/analyse.js` command emits `ownership.json` and per-capture ownership detail. It compares consecutive snapshots, C0 and original M using stable IDs and additive self bytes, including additions/removals, resizing and category transfers. It enumerates backing-store identities and aliases, material named retaining properties and uncapped consequential code/feedback/prototype references. Labelled WeakMap dependencies use a separate AND(table,key) fixed-point liveness analysis and dependency-removal controls; ordinary dominators alone cannot prove ephemeron release. Runtime/code labels classify their own storage and do not exempt instance descendants. Residual/unclassified bytes remain explicitly quantified.
 
 Graph generation is not a reviewed owner verdict. The reports deliberately leave `attributionComplete:false`: review the material cold increments, old/new stores and aliases, expected block-0/block-5/all-released lifetimes, intentional factory/close state and unknown remainder before proposing any later method amendment. A later plateau corroborates boundedness but does not explain first-use ownership. CI must preserve partial and failed evidence and always upload `retained-diagnostic-node24`. The normal resource gate, live matrix, acceptance schema 5, limits and schedules remain independent.
-
-The status paragraph above is also the exact append-only hand-off text for the controller-owned header and part J. Preserve their existing amendments and method.
