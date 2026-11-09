@@ -133,13 +133,18 @@ describe.each(['classic', 'consumer'])('an old-incarnation batch, %s protocol', 
       expect(rec.offset).toBe('5')
     })
 
+    /**
+     * A forced close may skip its final commit; wait for graceful shutdown to flush the new batch.
+     * @returns {Promise<void>} resolves after shutdown and the exact commit assertions
+     * @throws {Error} if progress stalls, shutdown fails or the committed offsets differ
+     */
     test('the new incarnation commits only its own records', async () => {
       const { rec, consumer } = await open()
       await rec.recreate()
 
-      await scenario.release()
+      scenario.gate.resolve()
       await until(() => NEW.every((value) => scenario.seen.includes(value)), 'the new records')
-      await consumer.disconnect({ timeout: BOUND_MS })
+      await consumer.disconnect()
 
       expect(scenario.committed()).toEqual(['3'])
       expect(rec.offset).toBe('3')
