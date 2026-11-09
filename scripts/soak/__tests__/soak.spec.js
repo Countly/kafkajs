@@ -5770,11 +5770,18 @@ describe('Share soak complete original-owner schedules', () => {
   } = require('../../../src/protocol/requests/fetch/__tests__/fixtures/recordBatchBytes')
   const fixtures = require('../../../testHelpers/shareFixtures')
   const diagnostics = require('../../../testHelpers/shareLiveDiagnostics')
+  const { ShareTimerObserver } = require('../shareTimerObserver')
+  const { setTimeout: realSetTimeout, clearTimeout: realClearTimeout } = require('node:timers')
 
   /**
    * Script only external I/O. Membership, session loss/reopen, acquisition, dispatch, ledger
    * decisions, acknowledgements, window observation, resource judging and reconstruction call
    * through their original implementations. The raw corpus is independent of handler evidence.
+   * @param {object} [options] Scripted I/O and observation controls.
+   * @param {Function} [options.processResources] Supplies coherent process counts and timer owners
+   *   for both sides of the collection boundary; receives the original measured snapshot.
+   * @returns {Promise<object>} Original owner, evidence, corpus and verdict or failure.
+   * @throws {Error} The schedule exceeds its frozen envelope or cleanup fails after success.
    */
   const schedule = async ({
     short = true,
@@ -5789,6 +5796,7 @@ describe('Share soak complete original-owner schedules', () => {
     socketClosed = () => {},
     closeOnly = false,
     observeRow = () => {},
+    processResources = () => ({ counts: {}, owners: { rows: [], dropped: 0 } }),
   } = {}) => {
     const clock = new ShareClock().install()
     const exposed = globalThis.gc
@@ -5847,13 +5855,21 @@ describe('Share soak complete original-owner schedules', () => {
     )
     const resources = instrumented.shareResources
     const originalSnapshot = resources.snapshot
-    // Heap and process resources are scripted inputs; original client state is always measured.
-    resources.snapshot = async () => ({
-      ...(await originalSnapshot()),
-      heapUsed: 1024,
-      activeResources: {},
-      activeResourcesBeforeCollection: {},
-    })
+    // Process counts and timer attribution share one script; original client state is measured.
+    resources.snapshot = async () => {
+      const original = await originalSnapshot()
+      const { counts, owners } = processResources(original)
+      return {
+        ...original,
+        heapUsed: 1024,
+        activeResources: { ...counts },
+        activeResourcesBeforeCollection: { ...counts },
+        timerOwners: {
+          beforeCollection: ShareTimerObserver.evidence(owners, counts),
+          afterCollection: ShareTimerObserver.evidence(owners, counts),
+        },
+      }
+    }
     const records = [[], [], []]
     const members = new Map()
     const configs = new Map()
@@ -6372,6 +6388,97 @@ describe('Share soak complete original-owner schedules', () => {
       )
     }
   }
+
+  test.each([
+    ['status debounce alone', null, true],
+    ['status debounce with an attributed product timer', 'attributed', false],
+    ['status debounce with an unattributed product timer', 'unattributed', false],
+  ])(
+    'judges a quiet observation containing %s',
+    async (_name, product, ok) => {
+      const reporter = {
+        type: 'Timeout',
+        asyncId: Number.MAX_SAFE_INTEGER,
+        triggerAsyncId: 1,
+        stack:
+          'Error:\n' +
+          '    at setTimeout (node:timers:125:19)\n' +
+          '    at Status._debouncedEmit (/ci/node_modules/@jest/reporters/build/index.js:1507:7)',
+        hasRef: true,
+        durationMs: 100,
+        repeatMs: null,
+      }
+      let observing = false
+      let timer
+      let phaseEnds = 0
+      const snapshot = ShareTimerObserver.prototype.snapshot
+      const injected = jest
+        .spyOn(ShareTimerObserver.prototype, 'snapshot')
+        .mockImplementation(function () {
+          const inventory = snapshot.call(this)
+          return observing ? { ...inventory, rows: [...inventory.rows, reporter] } : inventory
+        })
+      try {
+        const { result, error, reason, rows } = await schedule({
+          observeRow: (row) => {
+            // Final cleanup independently requires the raw process counts to return to baseline.
+            if (row.event === 'soak-resources' && row.kind === 'phase-end' && ++phaseEnds === 3) {
+              if (product) expect(timer.hasRef()).toBe(true)
+              observing = false
+              realClearTimeout(timer)
+            }
+            if (row.event !== 'soak-cycle' || row.cycle !== 9) return
+            observing = true
+            if (product) timer = realSetTimeout(() => {}, 600000)
+          },
+          processResources: (original) => {
+            const captured = original.timerOwners.afterCollection.rows
+            const status = captured.find(({ asyncId }) => asyncId === reporter.asyncId)
+            const owners = { rows: status ? [status] : [], dropped: 0 }
+            if (status && product) {
+              const retained = original.timerOwners.afterCollection.rows.find(
+                ({ durationMs }) => durationMs === 600000
+              )
+              expect(retained).toMatchObject({ type: 'Timeout', hasRef: true })
+              expect(ShareTimerObserver.isStatusDebounce(retained)).toBe(false)
+              if (product === 'attributed') owners.rows.push(retained)
+            }
+            return { counts: status ? { Timeout: product ? 2 : 1 } : {}, owners }
+          },
+        })
+        expect(error).toBeUndefined()
+        expect(result.ok).toBe(ok)
+        const points = rows.filter(
+          ({ event, kind }) => event === 'soak-resources' && kind === 'phase-end'
+        )
+        expect(points).toHaveLength(3)
+        for (const { snapshot: point } of points) {
+          expect(point.activeResources).toEqual({ Timeout: product ? 2 : 1 })
+          expect(point.activeResourcesBeforeCollection).toEqual({ Timeout: product ? 2 : 1 })
+          for (const owners of Object.values(point.timerOwners)) {
+            expect(owners.harnessAsyncIds).toEqual([reporter.asyncId])
+            expect(owners.rows).toContainEqual(reporter)
+            expect(owners.unattributed.Timeout).toBe(product === 'unattributed' ? 1 : 0)
+          }
+        }
+        if (product) {
+          expect(reason).toContain('share-steady: activeResources.Timeout baseline=0 after=1')
+          expect(reason).toContain(
+            'share-steady: activeResourcesBeforeCollection.Timeout baseline=0 after=1'
+          )
+          expect(rows.some(({ event }) => event === 'case-complete')).toBe(false)
+        } else {
+          expect(result.violations).toEqual([])
+          expect(result.counts).toMatchObject({ cycles: 30, resets: 10 })
+          expect(rows.some(({ event }) => event === 'case-complete')).toBe(true)
+        }
+      } finally {
+        realClearTimeout(timer)
+        injected.mockRestore()
+      }
+    },
+    120000
+  )
 
   test.each([true, false])(
     'recovers ten reset cycles with original close-only fake sockets, short=%s',
