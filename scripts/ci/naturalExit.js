@@ -1,9 +1,10 @@
 const fs = require('fs')
 const { spawnSync } = require('child_process')
+const { verifySharePrimingLink } = require('../evidence/sharePrimingLink')
 
 const LANES = {
   soak: {
-    totalMs: 1020000,
+    totalMs: 2040000,
     spec: 'shareSoakLive.spec.js',
     cases: ['preserves share identities and resources through the short soak'],
   },
@@ -32,6 +33,8 @@ const monotonicMs = () => Number(process.hrtime.bigint() / 1000000n)
 const cleanupTimestamp = (lane, text, { startedAt, exitedAt }) => {
   const body = text.trim()
   const rows = body ? body.split('\n').map(JSON.parse) : []
+  if (lane === 'soak' && verifySharePrimingLink(rows).length)
+    throw new Error('soak: incomplete or invalid priming cleanup evidence')
   const done = rows.filter((row) => row?.event === 'case-complete')
   const cases = LANES[lane].cases
   let previousAt = startedAt

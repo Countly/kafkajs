@@ -13,6 +13,7 @@ const fs = require('fs')
 const { execFileSync } = require('child_process')
 const { STAMP_FIELDS } = require('../../testHelpers/e2eEvidence')
 const { verifyShareQuietHeap } = require('./shareQuietHeap')
+const { verifySharePriming, verifySharePeriodic } = require('./sharePriming')
 
 const USAGE = 'Usage: node scripts/evidence/verify.js --broker <version> <evidence.jsonl...>'
 
@@ -109,6 +110,7 @@ const verifyFiles = (files, verified, readFile = (file) => fs.readFileSync(file,
     }
 
     const shareScenarios = new Map()
+    const acceptanceRows = []
     const rows = text.split('\n')
     if (rows.every((row) => !row.trim())) {
       problems.push(`${file}: holds no evidence lines`)
@@ -136,10 +138,10 @@ const verifyFiles = (files, verified, readFile = (file) => fs.readFileSync(file,
       ) {
         if (typeof line.scenario !== 'string' || !line.scenario)
           problems.push(`${file}:${index + 1}: share scenario is absent`)
+        acceptanceRows.push(line)
         const key = line.scenario
         if (!shareScenarios.has(key)) shareScenarios.set(key, [])
-        if (['baseline', 'phase-end', 'teardown', 'resource-verdict'].includes(line.kind))
-          shareScenarios.get(key).push(line)
+        shareScenarios.get(key).push(line)
       }
 
       for (const problem of isPlainObject(line)
@@ -149,9 +151,28 @@ const verifyFiles = (files, verified, readFile = (file) => fs.readFileSync(file,
       }
     })
     for (const [scenario, original] of shareScenarios) {
-      for (const problem of verifyShareQuietHeap(original).problems)
-        problems.push(`${file}: share scenario ${scenario}: ${problem}`)
+      const quiet = original.filter(
+        (r) =>
+          r.event === 'soak-resources' &&
+          ['baseline', 'phase-end', 'teardown', 'resource-verdict'].includes(r.kind)
+      )
+      if (original[0]?.scope !== 'priming') {
+        for (const problem of verifyShareQuietHeap(quiet).problems)
+          problems.push(`${file}: share scenario ${scenario}: ${problem}`)
+        if (original.some((r) => r.kind === 'sample'))
+          for (const problem of verifySharePeriodic(original))
+            problems.push(`${file}: share scenario ${scenario}: ${problem}`)
+      }
     }
+    if (
+      acceptanceRows.some(
+        (r) =>
+          r.schema === 'share-soak-scopes-v1' ||
+          r.scope === 'priming' ||
+          r.event?.startsWith('priming-')
+      )
+    )
+      for (const problem of verifySharePriming(acceptanceRows)) problems.push(`${file}: ${problem}`)
   }
 
   return { lines, problems }
