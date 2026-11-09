@@ -4743,6 +4743,8 @@
         "src/consumer/__tests__/brokerBounceLive.spec.js \u203a Broker bounce oracle the delivery verdict lists an acked record no member delivered",
         "src/consumer/__tests__/brokerBounceLive.spec.js \u203a Broker bounce oracle the log verdict finds an acked value missing and a value written twice",
         "src/consumer/__tests__/brokerBounceLive.spec.js \u203a Broker bounce oracle the position verdict finds a committed offset behind, and a commit ahead of delivery",
+        "src/consumer/__tests__/brokerOutage.spec.js \u203a Consumer > broker outages a classic stop-time final commit looks up a coordinator lost after stop, commits pending progress and then leaves",
+        "src/consumer/__tests__/brokerOutage.spec.js \u203a Consumer > broker outages a consumer stop-time final commit looks up a coordinator lost after stop, commits pending progress and then leaves",
         "src/consumer/__tests__/brokerOutage.spec.js \u203a Consumer > broker outages a held eachMessage returning after disconnect with autoCommit=false sends no leave and looks for no coordinator",
         "src/consumer/__tests__/brokerOutage.spec.js \u203a Consumer > broker outages a held eachBatch returning after disconnect with autoCommit=false sends no leave and looks for no coordinator",
         "src/consumer/__tests__/brokerOutage.spec.js \u203a Consumer > broker outages a held eachMessage returning after disconnect with autoCommit=true sends no leave and looks for no coordinator",
