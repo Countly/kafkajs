@@ -1609,6 +1609,63 @@ describe('telemetry profile natural exit', () => {
   }
   afterEach(() => jest.useRealTimers())
 
+  test.each(['result', 'failure'])(
+    'drains a large terminal %s before disconnecting IPC',
+    async (type) => {
+      jest.useRealTimers()
+      const processes = new TelemetryProcesses({
+        script: path.join(__dirname, 'fixtures/telemetryIpc.js'),
+        args: [type],
+      })
+      const worker = processes.start('producer')
+      try {
+        const closed = await processes.settle(worker, 10000)
+        expect(closed).toMatchObject({ event: 'close', code: 1, signal: null })
+        expect(worker.stderr).toBe('')
+        expect(worker.messages.map((message) => message.type)).toEqual(['hello', 'progress', type])
+        expect(worker.messages.at(-1).facts.ledger).toHaveLength(2 * 1024 * 1024)
+      } finally {
+        if (!worker.exit) await processes.cancel('producer')
+      }
+    }
+  )
+
+  test('archives drained output, last message and IPC disconnect on an early exit', async () => {
+    const made = natural()
+    made.say('producer', { type: 'progress', row: { kind: 'verdict', ok: false } })
+    made.child.emit('disconnect')
+    made.child.emit('exit', 1, null)
+    made.child.stdout.emit('data', 'resource verdict failed\n')
+    made.child.stderr.emit('data', 'last stderr\n')
+    made.child.emit('close', 1, null)
+    const exit = await made.processes.join('producer')
+    expect(exit).toMatchObject({
+      code: 1,
+      signal: null,
+      stdoutTail: 'resource verdict failed\n',
+      stderrTail: 'last stderr\n',
+      disconnectedAt: expect.any(Number),
+      exitedAt: expect.any(Number),
+      lastMessage: { type: 'progress', rowKind: 'verdict' },
+    })
+    expect(exit.lastMessage).not.toHaveProperty('token')
+  })
+
+  test('keeps the output tail and actual byte count after rejecting overflow', () => {
+    const made = natural()
+    made.child.stderr.emit('data', 'x'.repeat(65536))
+    made.child.stderr.emit('data', 'fatal at end\n')
+    made.child.emit('close', 1, null)
+    const facts = made.processes.facts(
+      made.processes.workers.get('producer'),
+      made.processes.workers.get('producer').exit
+    )
+    expect(facts.stderrBytes).toBe(65549)
+    expect(Buffer.byteLength(facts.stderrTail)).toBeLessThanOrEqual(65536)
+    expect(facts.stderrTail.endsWith('fatal at end\n')).toBe(true)
+    expect(made.processes.workers.get('producer').error.message).toContain('stderr overflow')
+  })
+
   test('joins children naturally and treats timeouts as failures', async () => {
     const clean = natural()
     clean.say('producer', { type: 'receipt' })
@@ -2282,6 +2339,7 @@ describe('telemetry profile parent', () => {
     expect(churn.missed[0].measured).toBe(true)
     expect(fixture.rotate.mock.calls.length).toBeLessThan(35)
     expect(() => churn.guard()).toThrow('The measured tick at')
+    expect(churn.failureStage).toBe('measurement')
   })
 
   test('refuses a setup over its budget', async () => {
@@ -2291,6 +2349,20 @@ describe('telemetry profile parent', () => {
     await expect(
       churn.measure({ t0 }, new TelemetrySchedule({ warmupMs: 60000, measureMs: 300000 }))
     ).rejects.toThrow('The setup exceeded its budget')
+    expect(churn.failureStage).toBe('setup')
+  })
+
+  test('labels a missing terminal result as cleanup after the full measured schedule', async () => {
+    const { churn, processes } = make()
+    const message = processes.message
+    processes.message = jest.fn(async (kind, type, ms) => {
+      if (type === 'result') throw new Error('terminal result missing')
+      return message(kind, type, ms)
+    })
+    await churn.run().catch(() => {})
+    expect(churn.cause.message).toBe('terminal result missing')
+    expect(churn.failureStage).toBe('cleanup')
+    expect(churn.lastResult.archive.failureStage).toBe('cleanup')
   })
 
   test('restores owned resources after every failure stage and keeps every failure', async () => {
@@ -3357,7 +3429,25 @@ describe('telemetry profile evidence after an expired bound', () => {
     })
     expect(admin).toMatchObject({ sealed: [], rows: [], exit: null })
     expect(result.archive.workers.producer).toBe(producer)
+    expect(result.archive.processes.consumer).toMatchObject({
+      code: 1,
+      lastMessage: { type: 'failure', message: 'boom' },
+    })
     expect(result.archive.source).toBe(source)
+    const judgedFailure = churn.judge(
+      [],
+      { errors: [], exits: { consumer: consumer.exit }, oracle: null },
+      { t0: 0, epochAt: 1, boundaryAt: 2, cleanupEndAt: 3 },
+      new TelemetrySchedule({ warmupMs: 60000, measureMs: 300000 })
+    )
+    expect(judgedFailure.archive.workers.producer).toMatchObject({
+      rows: [{ kind: 'sample', n: 1 }],
+      sealed: [{ id: 'producer-lc-0' }],
+    })
+    expect(judgedFailure.archive.processes.consumer).toMatchObject({ code: 1 })
+    expect(
+      churn.record.mock.calls.map(([row]) => row).filter((r) => r.kind === 'natural-exit')
+    ).toHaveLength(4)
     const judged = { ok: true, marker: 'verdict' }
     churn.lastResult = judged
     expect(churn.evidence()).toBe(judged)

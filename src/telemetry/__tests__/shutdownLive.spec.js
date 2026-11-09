@@ -1195,6 +1195,7 @@ live(
         // Without a verdict (the bound expired first) the received progress rows, sealed segment
         // receipts and exits are still attached, and the run is stopped.
         if (!parent) throw error
+        attempt.stage = parent.failureStage ?? parent.stage
         parent.fail(error)
         try {
           attach(parent.evidence())
