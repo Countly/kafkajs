@@ -715,18 +715,26 @@ describe('share live fixture observations', () => {
     expect(jest.getTimerCount()).toBe(0)
   })
 
-  it('rejects a persistent foreign socket within the existing baseline bound', async () => {
-    jest.useFakeTimers()
-    const pending = captureShareCleanupBaseline(
-      {
-        snapshot: async () => ({ ...snapshot(), activeResources: { TCPSocketWrap: 1 } }),
-      },
-      { cleanupStack: false }
-    ).catch((e) => e)
-    await jest.advanceTimersByTimeAsync(10500)
-    expect((await pending).message).toContain('did not settle within 10000 ms')
-    expect(jest.getTimerCount()).toBe(0)
-  })
+  it.each([false, true])(
+    'reports the last foreign resource when the baseline expires, cleanup stack: %s',
+    async (cleanupStack) => {
+      jest.useFakeTimers()
+      const pending = captureShareCleanupBaseline(
+        {
+          snapshot: async () => ({ ...snapshot(), activeResources: { TCPSocketWrap: 1 } }),
+        },
+        { cleanupStack }
+      ).catch((e) => e)
+      await jest.advanceTimersByTimeAsync(10500)
+      const failure = await pending
+      const cause = cleanupStack ? failure.errors[0].cause : failure
+      expect(cause.message).toContain('did not settle within 10000 ms')
+      expect(cause.resourceBaseline).toMatchObject({ activeResources: { TCPSocketWrap: 1 } })
+      expect(cause.message).toContain('TCPSocketWrap: 1')
+      if (cleanupStack) expect(failure.errors[0].message).toContain('TCPSocketWrap: 1')
+      expect(jest.getTimerCount()).toBe(0)
+    }
+  )
 
   it.each(['Timeout', 'socket', 'listener', 'queued request', 'ledger entry'])(
     'rejects one extra client resource under identical sampling bounds: %s',
