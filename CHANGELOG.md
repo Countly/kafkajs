@@ -36,6 +36,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Fixes
 
+- A Fetch that finishes empty after consumer stop no longer starts a heartbeat and a new coordinator lookup, preventing coordinator retries from delaying disconnect after coordinator loss.
+
 - All-topic metadata calls (`describeCluster`, `listTopics` and `fetchTopicMetadata`) now try the remaining brokers when a cached broker cannot reconnect after a socket close, preserving immediate close detection without exhausting retries on the stopped broker. If no broker's call succeeds, a skipped connection failure stays retriable, keeping consumer recovery through coordinator outages. Socket errors with an empty message report their error code, or a descriptive fallback.
 
 - A share consumer close no longer prints Node's `TimeoutNegativeWarning` when its handler deadline passes between checking the clock and arming the timer: a consumer-operation sleep with an already elapsed delay now schedules an immediate timer.

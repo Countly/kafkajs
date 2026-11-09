@@ -262,6 +262,13 @@ describe('Consumer > broker outages', () => {
     const outageAt = cluster.requests().length
     breaker.take(COORDINATOR, 'refused')
     heartbeat.release()
+    await until(
+      () =>
+        wire(cluster, 'FindCoordinator', outageAt).some(
+          ({ node, answeredOrder }) => node === LEADER && answeredOrder !== undefined
+        ),
+      'an unavailable coordinator answer from the surviving broker'
+    )
     await sleep(OUTAGE_MS)
     const unavailableLookups = wire(cluster, 'FindCoordinator', outageAt).filter(
       ({ node, answeredOrder }) => node === LEADER && answeredOrder !== undefined
@@ -714,6 +721,10 @@ describe('Consumer > broker outages', () => {
       )
       const held = cluster.schedule.hold({ api: 'Heartbeat' })
       await start(events)
+      // Make a Fetch straddle the stop: its late empty result must not start a heartbeat
+      // (and a fresh coordinator lookup) after stop released the existing lookup waiters.
+      const fetch = cluster.schedule.hold({ api: 'Fetch', node: LEADER })
+      await fetch.arrived()
       await held.arrived()
       breaker.take(COORDINATOR, 'refused')
       // Observe the real rejection before fetch-manager draining can delay its log behind a lookup.
@@ -722,7 +733,9 @@ describe('Consumer > broker outages', () => {
 
       const lostAt = cluster.requests().length
       const disconnectedAt = performance.now()
-      await consumer.disconnect()
+      const disconnecting = consumer.disconnect()
+      fetch.release()
+      await disconnecting
 
       expect(lostConnection(heartbeatFailure)).toBe(true)
       expect(wire(cluster, 'FindCoordinator', lostAt)).toEqual([])

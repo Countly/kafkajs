@@ -1332,6 +1332,11 @@ module.exports = class Runner extends EventEmitter {
     })
 
     if (batches.length === 0) {
+      // An in-flight Fetch can finish empty after stop retired its run. Starting a heartbeat
+      // here would create a coordinator lookup after stop released the pending lookup's waiters,
+      // holding fetchManager.stop() open through another lookup retry budget.
+      if (!this.running) return batches
+
       // A round that produced nothing is still a poll: an idle consumer must not be evicted for
       // not having handed a handler anything.
       this.pollTimer.poll()
