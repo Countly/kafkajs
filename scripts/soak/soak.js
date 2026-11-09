@@ -6367,7 +6367,9 @@ class ShareSoak {
   }
 
   /**
-   * Runs what is left of the cleanup and puts the observer's wrappers back. Safe to call twice.
+   * Runs remaining cleanup under the original child and cleanup-stage deadlines, then restores
+   * observers. Matching the setup's enclosing bounds preserves raw cleanup populations on failure;
+   * no timer is discounted and no deadline is renewed. Safe to call twice.
    * @returns {Promise<void>}
    * @throws {Error} the first failure of the cleanup or of the restore; the run is tainted
    */
@@ -6376,7 +6378,17 @@ class ShareSoak {
     this.closed = true
     const failures = []
     try {
-      await this.cleanupStack()
+      if (!this.restored) {
+        await bounded(
+          NEVER,
+          this.workDue - this.clock.now() + 1,
+          async (scope) => {
+            this.scope = scope
+            await this.stage('cleanup', () => this.cleanupStack())
+          },
+          { label: 'The share soak cleanup' }
+        )
+      }
     } catch (error) {
       failures.push(error)
     }
@@ -6387,7 +6399,8 @@ class ShareSoak {
       failures.push(error)
     }
     if (failures.length > 0) {
-      this.gate.taint(failures[0])
+      for (const failure of failures)
+        for (const error of failure.errors ?? [failure]) this.fail(error)
       throw failures[0]
     }
   }
@@ -6479,11 +6492,21 @@ const main = async (
   if (profile.startsWith('share-consumer')) {
     if (phaseSeconds !== null) throw new Error('A share profile takes no phase length')
     const owner = shareSoak({ brokers, short: profile === 'share-consumer-short' })
+    let verdict
+    let primary
     try {
-      return await owner.run()
-    } finally {
-      await owner.close()
+      verdict = await owner.run()
+    } catch (error) {
+      primary = error
     }
+    try {
+      await owner.close()
+    } catch (error) {
+      if (!primary) throw error
+      primary.cleanupErrors = [...(primary.cleanupErrors ?? []), error]
+    }
+    if (primary) throw primary
+    return verdict
   }
 
   const phases = phasesOf(profile, phaseSeconds)
