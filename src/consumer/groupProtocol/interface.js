@@ -325,7 +325,9 @@ class ConsumerOperation {
 
   /**
    * Sleeps on a client-owned timer that retirement removes as well as settling the caller.
-   * @param {number} delay nonnegative milliseconds
+   * A delay computed from a deadline that has just passed may be slightly negative; it is
+   * scheduled as an immediate timer.
+   * @param {number} delay milliseconds; a negative value sleeps for 0
    * @returns {Promise<void>}
    * @throws {Error} expiry, original identity refusal or explicit retirement
    */
@@ -334,10 +336,13 @@ class ConsumerOperation {
       () =>
         new Promise((resolve) => {
           let unown = () => {}
-          const timer = setTimeout(() => {
-            unown()
-            resolve()
-          }, delay)
+          const timer = setTimeout(
+            () => {
+              unown()
+              resolve()
+            },
+            Math.max(0, delay)
+          )
           unown = this.register(() => clearTimeout(timer))
         })
     )

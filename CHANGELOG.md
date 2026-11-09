@@ -36,6 +36,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Fixes
 
+- A share consumer close no longer prints Node's `TimeoutNegativeWarning` when its handler deadline passes between checking the clock and arming the timer: a consumer-operation sleep with an already elapsed delay now schedules an immediate timer.
 - A connection closed without an error is now detected immediately instead of after the request timeout. In-flight requests fail with the same retriable connection-closed error as a socket end, and share sessions reopen on the next round.
 - A broker restart no longer crashes a share consumer with "Metadata discovery completed" when a metadata notification starts a new fetch loop. Rebootstrap and request-queue-size listeners, and the queue's pending-check timer, also run independently of the publishing discovery or admin invocation.
 - A share answer that arrives from a replaced connection pool is discarded and the session reopens on the next round, instead of ending the run and losing unrelated acquisitions.
