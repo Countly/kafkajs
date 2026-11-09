@@ -334,22 +334,27 @@ describe('Cluster > metadata contract', () => {
       expect(withBroker).toHaveBeenCalledTimes(RETRY.retries + 1)
     })
 
-    test('retries a broker that cannot be connected to as a retriable error', async () => {
+    test('retries when no broker can be connected to, retaining the last connection error', async () => {
       const { cluster, brokers } = build()
-      const unreachable = new KafkaJSConnectionError('connect ECONNREFUSED', {
-        broker: '127.0.0.1:9092',
-      })
-      brokers[0].isConnected = () => false
-      brokers[0].connect = jest.fn(async () => {
-        throw unreachable
+      const failures = NODES.map(
+        ({ host, port }) =>
+          new KafkaJSConnectionError('connect ECONNREFUSED', { broker: `${host}:${port}` })
+      )
+      brokers.forEach((broker, index) => {
+        broker.isConnected = () => false
+        broker.connect = jest.fn(async () => {
+          throw failures[index]
+        })
       })
 
       const error = await cluster.metadata({ topics: [TOPIC] }).catch((e) => e)
 
       expect(error).toBeInstanceOf(KafkaJSNumberOfRetriesExceeded)
-      expect(error.cause).toBe(unreachable)
-      expect(brokers[0].connect).toHaveBeenCalledTimes(RETRY.retries + 1)
-      expect(brokers[0].metadata).not.toHaveBeenCalled()
+      expect(error.cause).toBe(failures[1])
+      brokers.forEach((broker) => {
+        expect(broker.connect).toHaveBeenCalledTimes(RETRY.retries + 1)
+        expect(broker.metadata).not.toHaveBeenCalled()
+      })
     })
 
     test('ends in KafkaJSDeliveryTimeout when retry.maxTotalTime passes before the budget is spent', async () => {
@@ -374,9 +379,13 @@ describe('Cluster > metadata contract', () => {
     const failLookup = (cluster, failure) =>
       jest.spyOn(cluster.brokerPool, 'findBroker').mockRejectedValue(failure)
 
-    test.each(RETRIABLE)(
+    test.each([
+      [...CODE_3, 1],
+      [...CODE_5, 1],
+      [...TRANSPORT, 2],
+    ])(
       'retries %s raised while finding the broker, then gives up with the original cause',
-      async (_name, make) => {
+      async (_name, make, lookupsPerAttempt) => {
         const { cluster, brokers, recreated } = build()
         const before = cacheState(cluster)
         const failure = make()
@@ -386,7 +395,7 @@ describe('Cluster > metadata contract', () => {
 
         expect(error).toBeInstanceOf(KafkaJSNumberOfRetriesExceeded)
         expect(error.cause).toBe(failure)
-        expect(lookup).toHaveBeenCalledTimes(RETRY.retries + 1)
+        expect(lookup).toHaveBeenCalledTimes(lookupsPerAttempt * (RETRY.retries + 1))
         brokers.forEach(({ metadata }) => expect(metadata).not.toHaveBeenCalled())
         expectUntouched(cluster, before, recreated)
       }
@@ -413,6 +422,21 @@ describe('Cluster > metadata contract', () => {
   })
 
   describe('stage 3: the call on a broker', () => {
+    test('a connection failure followed by a callback failure preserves the callback error', async () => {
+      const { cluster, brokers } = build()
+      brokers[0].isConnected = () => false
+      brokers[0].connect = async () => {
+        throw new KafkaJSConnectionError('connect ECONNREFUSED')
+      }
+      const denied = createErrorFromCode(29)
+      brokers[1].metadata.mockRejectedValue(denied)
+
+      await expect(cluster.metadata({ topics: [TOPIC] })).rejects.toBe(denied)
+
+      expect(brokers[0].metadata).not.toHaveBeenCalled()
+      expect(brokers[1].metadata).toHaveBeenCalledTimes(1)
+    })
+
     test('returns the first answer: a failure on one broker is swallowed and the next is asked', async () => {
       const { cluster, brokers } = build()
       brokers[0].metadata.mockRejectedValue(createErrorFromCode(5))
