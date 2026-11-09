@@ -685,10 +685,13 @@ says so, `groupProtocol: 'consumer'`.
   at `heartbeatInterval`, so a handler that *awaits* no longer risks a session timeout while it
   works. A handler that blocks the event loop without awaiting still blocks them, because Node has
   one thread; that case is unchanged from 2.2.4, and such a handler also cannot trigger its own
-  poll-interval eviction. The `heartbeat()` callback keeps working exactly as before: it and the
-  timer share one in-flight request and one interval gate, so neither sends twice. Because the timer
-  is a second source of heartbeats, a test that counts `consumer.heartbeat` events over a run will
-  see more of them than it did in 2.2.4.
+  poll-interval eviction. While running, the `heartbeat()` callback and the timer share one
+  in-flight request and one interval gate, so neither sends twice. After `consumer.stop()` or
+  `disconnect()` requests stop, the callback resolves without sending a heartbeat; in 2.2.4 it
+  could still send. A handler that needs heartbeats to keep its membership while draining must
+  finish before stop is requested (see the [stop-time policy](Consuming.md#leaving-the-group)).
+  Because the timer is a second source of heartbeats, a test that counts `consumer.heartbeat`
+  events over a run will see more of them than it did in 2.2.4.
 
 - **Cooperative rebalancing is available, opt-in, and needs two deploys.**
   `PartitionAssigners.cooperativeSticky` implements KIP-429, where a member keeps the partitions it

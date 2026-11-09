@@ -816,6 +816,95 @@ describe('Consumer > broker outages', () => {
     20000
   )
 
+  it.each(['classic', 'consumer'])(
+    'a %s stop-time final commit looks up a coordinator lost after stop, commits pending progress and then leaves',
+    async (groupProtocol) => {
+      const script = groupProtocol === 'classic' ? groupScript : consumerProtocolScript
+      const cluster = script(
+        createScriptedCluster({
+          nodes: NODES,
+          profile: groupProtocol === 'classic' ? 'default' : 'consumer',
+        }),
+        { coordinator: COORDINATOR, batches: 1 }
+      )
+      const breaker = outages(cluster)
+      consumer = new Kafka(cluster.kafkaOptions({ retry: RETRY })).consumer({
+        groupId: 'outage-group',
+        groupProtocol,
+        ...(groupProtocol === 'classic' && {
+          sessionTimeout: SESSION_TIMEOUT,
+          heartbeatInterval: 100,
+        }),
+        maxWaitTimeInMs: 20,
+        retry: RETRY,
+      })
+      const events = { crashes: [] }
+      consumer.on(consumer.events.CRASH, ({ payload }) => events.crashes.push(payload))
+      let runner
+      const fetch = Runner.prototype.fetch
+      jest.spyOn(Runner.prototype, 'fetch').mockImplementation(function (nodeId) {
+        runner = this
+        return fetch.call(this, nodeId)
+      })
+      let releaseHandler
+      const heldHandler = new Promise((resolve) => (releaseHandler = resolve))
+      let handlerEntered = false
+      await start(events, {
+        autoCommit: true,
+        eachBatchAutoResolve: false,
+        eachMessage: undefined,
+        eachBatch: async ({ batch, resolveOffset }) => {
+          resolveOffset(batch.lastOffset())
+          handlerEntered = true
+          await heldHandler
+        },
+      })
+      await until(() => handlerEntered, 'the handler with uncommitted progress')
+      expect(wire(cluster, 'OffsetCommit')).toEqual([])
+      expect(runner.consumerGroup.offsetManager.coordinator.isConnected()).toBe(true)
+
+      const disconnecting = consumer.disconnect()
+      let stoppedAt
+      try {
+        await until(() => runner.stopRequested, 'the latched stop')
+        stoppedAt = cluster.requests().length
+        // Only now lose the cached coordinator: ordinary heartbeats have stopped, but the
+        // eligible final commit must still discover a coordinator under the close's authority.
+        breaker.take(COORDINATOR, 'reset')
+        await until(
+          () => !runner.consumerGroup.offsetManager.coordinator.isConnected(),
+          'the disconnected coordinator after stop'
+        )
+        breaker.restore(COORDINATOR)
+      } finally {
+        releaseHandler()
+        await disconnecting
+      }
+
+      const leaveApi = groupProtocol === 'classic' ? 'LeaveGroup' : 'ConsumerGroupHeartbeat'
+      const closing = cluster
+        .requests()
+        .slice(stoppedAt)
+        .filter(({ api }) => ['FindCoordinator', 'OffsetCommit', leaveApi].includes(api))
+      expect(closing.map(({ api }) => api)).toEqual(['FindCoordinator', 'OffsetCommit', leaveApi])
+      const [lookup, commit, leave] = closing
+      expect(lookup.answeredOrder).toBeLessThan(commit.order)
+      expect(commit.answeredOrder).toBeLessThan(leave.order)
+      expect(commit.node).toBe(COORDINATOR)
+      expect(commit.fields).toMatchObject({
+        groupId: 'outage-group',
+        groupGenerationId: 1,
+        topics: [{ partitions: [{ partition: 0, offset: '1' }] }],
+      })
+      expect(leave.node).toBe(COORDINATOR)
+      if (groupProtocol === 'consumer') expect(leave.fields.memberEpoch).toBe(-1)
+      expect(leave.answeredOrder).toBeDefined()
+      expect(events.crashes).toEqual([])
+      consumer = undefined
+      cluster.assertClean()
+    }
+  )
+
   it('a stop while the first join rides out an outage ends the join without a crash', async () => {
     const { breaker, events } = scenario()
     breaker.take(COORDINATOR, 'refused')

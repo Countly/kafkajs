@@ -11,6 +11,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - For all clients, a socket that closes without an error now fails pending requests immediately with the retriable connection-closed error, instead of waiting for the request timeout.
 
+- After `consumer.stop()` or `disconnect()` requests stop, the `heartbeat()` callback given to `eachMessage` and `eachBatch` handlers resolves without sending; in 2.2.4 it could still send. Finish handlers that need heartbeats before requesting stop.
+
 #### Additions
 
 - Implement the seven released share-group wire codecs: ShareGroupHeartbeat v1, ShareGroupDescribe v1, ShareFetch v2, ShareAcknowledge v2, DescribeShareGroupOffsets v1, AlterShareGroupOffsets v0 and DeleteShareGroupOffsets v0. Each is flexible with nested tag buffers, keeps int64 offsets and lag as exact decimal strings and passes broker error codes through as data. They are checked against independent Apache Kafka message vectors.
@@ -36,7 +38,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Fixes
 
-- An empty Fetch or an `eachMessage`/`eachBatch` handler that returns after consumer stop no longer starts an ordinary heartbeat or a new coordinator lookup, preventing heartbeat retries from delaying disconnect after coordinator loss. Eligible stop-time commits retain their coordinator lookups.
+- Heartbeat retries after an empty Fetch or a handler returns during stop no longer delay disconnect after coordinator loss. Eligible stop-time commits retain their coordinator lookups.
 
 - All-topic metadata calls (`describeCluster`, `listTopics` and `fetchTopicMetadata`) now try the remaining brokers when a cached broker cannot reconnect after a socket close, preserving immediate close detection without exhausting retries on the stopped broker. If no broker's call succeeds, a skipped connection failure stays retriable, keeping consumer recovery through coordinator outages. Socket errors with an empty message report their error code, or a descriptive fallback.
 
