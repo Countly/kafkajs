@@ -248,6 +248,26 @@ describe('ProcessMemory', () => {
     expect(reading.retained).toBe(3600000)
   })
 
+  test.each(['heapUsed', 'external', 'arrayBuffers'])(
+    'uses the exact 16384-byte convergence boundary for %s',
+    async (field) => {
+      for (const increment of [16384, 16385]) {
+        let pair = 0
+        const { memory } = meter({
+          usage: () => ({
+            rss: 1,
+            heapUsed: 1,
+            external: 1,
+            arrayBuffers: 1,
+            [field]: ++pair * increment,
+          }),
+        })
+        const reading = await memory.settled()
+        expect(reading.gc.checkpoints).toHaveLength(increment === 16384 ? 2 : 6)
+      }
+    }
+  )
+
   test('declares eager compilation without invoking telemetry or warming native work', () => {
     expect(MEMORY_FLAGS).toEqual(['--expose-gc', '--no-lazy', '--no-lazy-feedback-allocation'])
   })

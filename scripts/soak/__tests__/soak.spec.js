@@ -7149,6 +7149,28 @@ describe('telemetry resource evidence', () => {
   })
   const evaluate = (input) => TelemetryResourceVerdict.evaluate(input)
 
+  test('detects 131072 B/min at actual irregular observation times while a pre-M0 constant escapes slope', () => {
+    const input = run()
+    input.samples.forEach((sample, index) => {
+      const jitter = index === 0 ? 0 : index % 2 ? 37 : -19
+      sample.admittedAtMs += jitter
+      sample.completedAtMs += jitter
+      grow(
+        sample.snapshot.memory,
+        Math.round((131072 * (sample.completedAtMs - input.samples[0].completedAtMs)) / 60000)
+      )
+    })
+    const result = evaluate(input)
+    expect(result.violations).toContain('retained slope')
+    expect(result.measured.slopeBytesPerMinute).toBeCloseTo(131072, 0)
+    expect(result.violations).not.toContain('retained endpoint')
+    const plateau = run()
+    grow(plateau.baseline.memory, 1048576)
+    grow(plateau.teardown.memory, 1048576)
+    plateau.samples.forEach((sample) => grow(sample.snapshot.memory, 1048576))
+    expect(evaluate(plateau).measured.slopeBytesPerMinute).toBeCloseTo(0, 5)
+  })
+
   test('registers the fixed telemetry profile and refuses shortened acceptance', () => {
     expect(parseArgs(['--profile', 'telemetry'])).toEqual({
       profile: 'telemetry',

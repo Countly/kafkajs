@@ -943,6 +943,54 @@ describe('resource artifact validation', () => {
   }
   const B = 73 * MIB
 
+  describe('diagnostic acceptance isolation and recorded boundary replay', () => {
+    test.each([{ diagnostic: true }, { acceptanceEligible: false }])(
+      'rejects diagnostic marker %p even in a schema-5 envelope',
+      (marker) => {
+        expect(judgeMemoryArm({ ...record('public'), ...marker })).toEqual({
+          verdict: 'fail',
+          problems: ['diagnostic records are ineligible for acceptance'],
+        })
+      }
+    )
+
+    test.each([262144, 262145, 8388608, 8388609])(
+      'replays actual recorder bytes for retained boundary %s',
+      (delta) => {
+        const whole = record('public')
+        const reading = delta < 8388608 ? whole.readings.closed : whole.readings.actives[0]
+        reading.retained = whole.readings.matched.retained + delta
+        reading.heapUsed = reading.retained - reading.external
+        for (const point of reading.gc.checkpoints) {
+          point.retained = reading.retained
+          point.heapUsed = reading.heapUsed
+        }
+        const output = new MemoryOutput(
+          { arm: 'public', kind: 'producer', childId: whole.readings.manifest.childId },
+          () => 1000
+        )
+        output.write(
+          Buffer.from(
+            JSON.stringify({
+              receipt: 'disconnect',
+              kind: 'producer',
+              uuid: whole.readings.uuid,
+              childId: whole.readings.manifest.childId,
+              at: whole.readings.disconnect[1].at,
+            }) + '\n'
+          )
+        )
+        output.write(Buffer.from(JSON.stringify({ readings: whole.readings }) + '\n'))
+        const parsed = output.finish()
+        expect(parsed.failure).toBeNull()
+        const copy = JSON.parse(JSON.stringify({ ...whole, readings: parsed.readings }))
+        expect(judgeMemoryArm(copy).verdict).toBe(
+          delta === 262145 || delta === 8388609 ? 'fail' : 'pass'
+        )
+      }
+    )
+  })
+
   describe('a complete record', () => {
     test.each(ARMS)('passes for the %s arm', (arm) => {
       expect(judgeMemoryArm(record(arm))).toEqual({ verdict: 'pass', problems: [] })

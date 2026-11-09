@@ -16,7 +16,10 @@ const { performance, PerformanceObserver } = require('node:perf_hooks')
 
 const KIB = 1024
 
-/** Compile loaded JavaScript before the reference, without executing telemetry or native work. */
+/**
+ * Request eager JavaScript bytecode and feedback allocation for this measurement tuple.
+ * Execution can still grow compiled code and metadata; these flags do not establish retained stability.
+ */
 const MEMORY_FLAGS = Object.freeze(['--expose-gc', '--no-lazy', '--no-lazy-feedback-allocation'])
 
 /** Collection convergence is stricter than any retained gate; it never changes an acceptance value. */

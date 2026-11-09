@@ -89,6 +89,45 @@ jobs:
           path: .tmp/telemetry-resources/
           if-no-files-found: error
           include-hidden-files: true
+  retained-diagnostic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      TELEMETRY_RESOURCES_QUIET: '1'
+      RETAINED_DIAGNOSTIC_DIR: ${{ github.workspace }}/.tmp/retained-diagnostic/run
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '24', cache: npm }
+      - name: Prepare diagnostic evidence and install dependencies
+        timeout-minutes: 5
+        run: |
+          mkdir -p .tmp/retained-diagnostic/controls
+          node -p 'JSON.stringify(process.versions)' > .tmp/retained-diagnostic/controls/runtime.json
+          npm ci
+      - name: Run six broker-free retained diagnostic control groups
+        timeout-minutes: 3
+        env:
+          TELEMETRY_RESOURCES_QUIET: '0'
+        shell: bash
+        run: |
+          mkdir -p .tmp/retained-diagnostic/controls
+          timeout -k 5s 110s npx jest --maxWorkers=2 --ci --testPathPatterns 'testHelpers/__tests__/(processMemory|resourceProbe)\.spec\.js$' 'scripts/e2e/telemetry/__tests__/retained.*\.spec\.js$' 2>&1 | tee .tmp/retained-diagnostic/controls/memory.log
+          timeout -k 5s 50s npx jest --maxWorkers=2 --ci --testPathPatterns 'src/telemetry/__tests__/resources\.spec\.js$' 'scripts/soak/__tests__/soak\.spec\.js$' --testNamePattern 'requires fresh authority|detects 131072|holds one native job across one hundred retirements' 2>&1 | tee .tmp/retained-diagnostic/controls/lifecycle.log
+      - name: Diagnose retained ownership on Node 24 alone (sixteen serial children)
+        timeout-minutes: 30
+        run: timeout -k 10s 1750s node scripts/e2e/telemetry/retainedDiagnostic.js --diagnostic-only "$RETAINED_DIAGNOSTIC_DIR"
+      - name: Analyse cold ownership and conditional ephemerons offline
+        if: always()
+        timeout-minutes: 5
+        run: timeout -k 5s 290s node --max-old-space-size=6144 scripts/e2e/telemetry/retained/analyse.js "$RETAINED_DIAGNOSTIC_DIR"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: retained-diagnostic-node24
+          path: .tmp/retained-diagnostic/
+          if-no-files-found: error
+          include-hidden-files: true
   telemetry:
     runs-on: ubuntu-latest
     timeout-minutes: 45

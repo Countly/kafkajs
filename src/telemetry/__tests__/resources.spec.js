@@ -90,6 +90,38 @@ describe('bounded telemetry resource structures', () => {
     }
   )
 
+  test.each(KINDS)(
+    'requires fresh authority for repeated diagnostic native work for %s',
+    async (kind) => {
+      const { nativePair } = require('./fixtures/memoryForeground')
+      const { metrics, subscription, slots } = maximum(kind)
+      const builder = new TelemetryPayload(1n)
+      const codec = { name: 'gzip', type: 1 }
+      const snapshot = metrics.snapshot(subscription)
+      await nativePair(builder, snapshot, codec, () => {})
+      builder.retire()
+      expect(
+        await builder.buildPayload(snapshot, {
+          acceptedCompressionTypes: [1],
+          isCurrent: () => true,
+        })
+      ).toBeNull()
+      builder.resetTransport(2n)
+      const proof = await nativePair(builder, snapshot, codec, () => {})
+      expect(proof).toMatchObject({
+        codec: 'gzip',
+        compressionType: 1,
+        points: 257,
+        retiredCompletion: true,
+      })
+      expect(proof.transmittedBytes).toBeGreaterThan(0)
+      metrics.abandon(snapshot)
+      builder.retire()
+      slots.forEach((slot) => metrics.retireNode(slot))
+      metrics.resetTransient()
+    }
+  )
+
   test.each(KINDS)('caps series and replaces node identities for %s', (kind) => {
     const { metrics, subscription, slots } = maximum(kind)
     let snapshot = metrics.snapshot(subscription)

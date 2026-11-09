@@ -73,8 +73,8 @@ const ZSTD_MAGIC = 0xfd2fb528
 const live = []
 
 /**
- * Decompresses the first accepted payload of a codec and checks its format, after the closed
- * reading's window and counted in the child's own final peak.
+ * Decompresses the first accepted payload of a codec and checks its format, after final public
+ * close and before the closed retained reading, inside peak coverage.
  * @param {{name: string, type: number}} codec the codec
  * @param {Buffer} first the transmitted bytes
  * @returns {Promise<{codec: string, format: boolean, rawBytes: number, transmittedBytes: number}>}
