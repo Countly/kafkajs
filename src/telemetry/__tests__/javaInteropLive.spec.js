@@ -12,6 +12,8 @@ const {
   javaClosePolicy,
   assertJavaEvidence,
   assertJavaCaptures,
+  assertJavaSubscription,
+  JAVA_REQUESTED,
   JavaAdminHandshake,
   unexpectedPinnedJavaStderr,
   javaSampleSummary,
@@ -42,13 +44,6 @@ const MANIFEST_FILE = path.join(ROOT, 'scripts/e2e/telemetry/fixtures/manifest.j
 const PORTS = [19092, 19095, 19098]
 const ROLES = ['producer', 'consumer', 'admin']
 const KINDS = ['producer', 'consumer', 'admin', 'share']
-const REQUESTED = [
-  'org.apache.kafka.producer.connection.creation.total',
-  'org.apache.kafka.consumer.connection.creation.total',
-  'org.apache.kafka.admin.connection.creation.total',
-  'org.apache.kafka.admin.client.connection.creation.total',
-  'org.apache.kafka.tf1.custom.',
-].join(',')
 const WHITELIST = [
   'client_rack',
   'group_id',
@@ -568,7 +563,7 @@ class JavaInteropCase {
     })
     const all = [...Object.values(this.ids.java), ...Object.values(this.ids.js)]
     const entries = {
-      metrics: REQUESTED,
+      metrics: JAVA_REQUESTED,
       'interval.ms': '1000',
       match: `client_id=^(${all.join('|')})$`,
     }
@@ -611,7 +606,7 @@ class JavaInteropCase {
       runnerSha256: fileSha(RUNNER),
     }
     this.results.readback = {
-      metrics: REQUESTED,
+      metrics: JAVA_REQUESTED,
       interval: 1000,
       ids: [...Object.values(this.ids.java), ...Object.values(this.ids.js)],
     }
@@ -750,13 +745,9 @@ class JavaInteropCase {
     for (const kind of KINDS) {
       const { observer } = js[kind]
       observer.assertHealthy()
-      const get = observer.subscriptions({ uuid: jsIds[kind] }).find((r) => r.response)
-      expect(get.response).toMatchObject({
-        errorCode: 0,
-        pushIntervalMs: 1000,
-        requestedMetrics: REQUESTED.split(','),
-        deltaTemporality: true,
-      })
+      const gets = observer.subscriptions({ uuid: jsIds[kind] }).filter((r) => r.response)
+      expect(gets.length).toBeGreaterThan(0)
+      for (const get of gets) assertJavaSubscription(get.response)
       const counter = `org.apache.kafka.${kind === 'share' ? 'consumer' : kind}.connection.creation.total`
       const decodedSamples = []
       for (const push of jsPushes[kind]) {
@@ -767,7 +758,7 @@ class JavaInteropCase {
         const names = item.decoded.metrics.map((m) => m.name)
         expect(names).toContain(counter)
         expect(
-          names.every((name) => REQUESTED.split(',').some((prefix) => name.startsWith(prefix)))
+          names.every((name) => JAVA_REQUESTED.split(',').some((prefix) => name.startsWith(prefix)))
         ).toBe(true)
         expect(
           item.decoded.resources
