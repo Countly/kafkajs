@@ -2024,6 +2024,56 @@ describe('complete telemetry evidence controls', () => {
       }
     )
 
+    test('replays the exact Java subscription in any broker prefix order for every JS kind', () => {
+      const a = archive()
+      try {
+        for (const [index, transcript] of Object.values(a.transcripts).entries()) {
+          const prefixes = transcript.records[0].response.requestedMetrics
+          transcript.records[0].response.requestedMetrics = [
+            ...prefixes.slice(index + 1),
+            ...prefixes.slice(0, index + 1),
+          ].reverse()
+        }
+        const before = clone(a.transcripts)
+        expect(() => verifyJavaInterop(a.record, a.directory, a.transcripts)).not.toThrow()
+        expect(a.transcripts).toEqual(before)
+      } finally {
+        a.close()
+      }
+    })
+
+    test.each(['producer', 'consumer', 'admin', 'share'])(
+      'rejects an altered Java subscription on any successful Get for JS %s',
+      (kind) => {
+        const a = archive()
+        try {
+          const transcript = a.transcripts[`js-${kind}`]
+          const first = transcript.records[0]
+          const prefixes = first.response.requestedMetrics
+          const altered = clone(first)
+          transcript.records.push(altered)
+          for (const requestedMetrics of [
+            prefixes.slice(1),
+            prefixes.filter((p) => p !== 'org.apache.kafka.admin.connection.creation.total'),
+            prefixes.filter((p) => p !== 'org.apache.kafka.admin.client.connection.creation.total'),
+            [...prefixes, 'org.apache.kafka.'],
+            [...prefixes, prefixes[0]],
+            prefixes.map((p, i) => (i === 0 ? prefixes[1] : p)),
+            prefixes.map((p) => p.replace('admin.client.', 'admin-client.')),
+          ]) {
+            altered.response.requestedMetrics = requestedMetrics
+            expect(() => verifyJavaInterop(a.record, a.directory, a.transcripts)).toThrow(
+              'Wrong narrow Java requested metrics'
+            )
+          }
+          altered.response.requestedMetrics = [...prefixes].reverse()
+          expect(() => verifyJavaInterop(a.record, a.directory, a.transcripts)).not.toThrow()
+        } finally {
+          a.close()
+        }
+      }
+    )
+
     test.each([
       [
         'old format',

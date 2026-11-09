@@ -21,6 +21,7 @@ const {
   assertCadence,
   assertJavaEvidence,
   assertJavaCaptures,
+  assertJavaSubscription,
   JAVA_REQUESTED,
   unexpectedPinnedJavaStderr,
   assertJsCounter,
@@ -1198,11 +1199,7 @@ const verifyJavaInterop = (record, directory, transcripts) => {
       (r) => r.apiKey === 71 && r.response?.errorCode === 0
     )
     assert(gets.length > 0, 'Missing Java subscription Get confirmation')
-    for (const get of gets) {
-      assert.deepEqual(get.response.requestedMetrics, JAVA_REQUESTED.split(','))
-      assert.equal(get.response.pushIntervalMs, 1000)
-      assert.equal(get.response.deltaTemporality, true)
-    }
+    for (const get of gets) assertJavaSubscription(get.response)
   }
   assert(
     results.java.admin.checkpoint && results.java.admin.cessation,

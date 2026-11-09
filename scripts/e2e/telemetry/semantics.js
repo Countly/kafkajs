@@ -351,6 +351,25 @@ const JAVA_REQUESTED = [
 ].join(',')
 
 /**
+ * Requires the complete narrow selection shared by all seven interop clients. Kafka 4.3.1
+ * ClientMetricsManager unions matching prefixes in a HashSet, then returns an ArrayList of it;
+ * its response is neither client-kind filtered nor ordered like the configuration.
+ * @param {object} response decoded successful GetTelemetrySubscriptions response
+ * @returns {void}
+ * @throws {Error} for altered fields or missing, extra, duplicate or changed prefixes
+ */
+const assertJavaSubscription = (response) => {
+  assert.equal(response.errorCode, 0)
+  assert.equal(response.pushIntervalMs, 1000)
+  assert.equal(response.deltaTemporality, true)
+  assert.deepEqual(
+    [...response.requestedMetrics].sort(),
+    JAVA_REQUESTED.split(',').sort(),
+    'Wrong narrow Java requested metrics'
+  )
+}
+
+/**
  * Admits the admin exception only for the pinned candidate and actual cache identity.
  * @param {string} role fixed Java role
  * @param {object} provenance actual input hashes and JDK observations
@@ -793,6 +812,7 @@ module.exports = {
   javaMarker,
   assertJavaEvidence,
   assertJavaCaptures,
+  assertJavaSubscription,
   JAVA_REQUESTED,
   unexpectedPinnedJavaStderr,
   javaSampleSummary,
