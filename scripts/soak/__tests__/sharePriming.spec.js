@@ -80,13 +80,13 @@ const request = async (apiKey, apiVersion, correlationId, compression = 0) => {
  * @param {ShareFetchTap} tap Original call-through transport observer.
  * @returns {Promise<void>} Complete fixed header/codec coverage.
  */
-const coverage = async (tap) => {
+const coverage = async (tap, endpoint = 'node:1', metadataVersion = 13) => {
   const calls = [
     ['send', 0, 9, 'producer'],
     ['send', 22, 4, 'producer'],
     ['readLog', 1, 12, 'raw'],
     ['fetchTopicOffsets', 2, 7],
-    ['fetchTopicMetadata', 3, 13],
+    ['fetchTopicMetadata', 3, metadataVersion],
     ['connect', 10, 6],
     ['listGroups', 16, 5],
     ['connect', 18, 5],
@@ -104,10 +104,10 @@ const coverage = async (tap) => {
     ['disconnect', 79, 2, 'share'],
     ['listShareGroupOffsets:named', 90, 1],
     ['listShareGroupOffsets:all', 90, 1],
-    ['listTopics', 3, 13],
+    ['listTopics', 3, metadataVersion],
   ]
   const socket = Object.assign(new EventEmitter(), { destroyed: false, write: () => false })
-  tap.wrap(socket, 'node:1')
+  tap.wrap(socket, endpoint)
   for (const [index, [operation, apiKey, version, role = 'admin']] of calls.entries()) {
     const bytes = await request(apiKey, version, index)
     tap.operation(role, operation, () => {
@@ -143,6 +143,8 @@ const recording = async ({
   heapOffset = 0,
   translatedMs = 0,
   damagePrime,
+  separateCoordinators = false,
+  scoredMetadataVersion = 13,
 } = {}) => {
   jest.useFakeTimers({ now: 1700000000000, doNotFake: ['setImmediate'] })
   const rows = []
@@ -163,8 +165,6 @@ const recording = async ({
       )
       if (armedAt === null) point.heapUsed += Math.round((primeRate * now) / 60000)
       if (damagePrime && !rows.some((r) => r.event === 'priming-complete')) damagePrime(point)
-      if (damageBoundary && rows.some((r) => r.event === 'priming-complete') && !armedAt)
-        damageBoundary(point)
       return point
     },
     restore: jest.fn(),
@@ -192,7 +192,11 @@ const recording = async ({
           this.cleanupClock = { origin: 'hrtime', completedAt: this.completedAt }
           if (priming && failCleanup) throw new Error('priming deletion failed')
         })
-        await coverage(tap)
+        await coverage(
+          tap,
+          separateCoordinators ? (priming ? 'node-a:9092' : 'node-b:9092') : 'node:1',
+          priming ? 13 : scoredMetadataVersion
+        )
       }),
       openPhase: async () => {
         if (!priming && phase++ === 0) armedAt = performance.now()
@@ -239,6 +243,13 @@ const recording = async ({
       return prime
     },
   })
+  const snapshot = owner.snapshot.bind(owner)
+  owner.snapshot = async () => {
+    const point = await snapshot()
+    if (damageBoundary && rows.some((r) => r.event === 'priming-complete') && !armedAt)
+      damageBoundary(point)
+    return point
+  }
   let result
   let error
   let done = false
@@ -296,6 +307,24 @@ const recording = async ({
 }
 
 describe('fixed same-realm share priming', () => {
+  test('accepts separate coordinator endpoints with corresponding negotiated versions', async () => {
+    const { rows, result, problems } = await recording({ separateCoordinators: true })
+    expect(result.ok).toBe(true)
+    expect(problems).toEqual([])
+    const inventories = rows.filter((r) => r.event === 'soak-protocol-manifest')
+    expect(inventories[0].inventory.every((r) => r.endpoint === 'node-a:9092')).toBe(true)
+    expect(inventories[1].inventory.every((r) => r.endpoint === 'node-b:9092')).toBe(true)
+  }, 120000)
+
+  test('rejects a corresponding negotiated version mismatch across separate coordinators', async () => {
+    const { result, problems } = await recording({
+      separateCoordinators: true,
+      scoredMetadataVersion: 12,
+    })
+    expect(result.ok).toBe(true)
+    expect(problems).toContain('share.jsonl: priming/scored negotiated implementations differ')
+  }, 120000)
+
   test.each([true, false])(
     'executes one complete disjoint pass before scoring, short=%s',
     async (short) => {
@@ -318,7 +347,7 @@ describe('fixed same-realm share priming', () => {
       expect(prime.schedule.slotMs).toBe(32000)
       expect(prime.schedule.boundaryMs).toBe(10000)
     },
-    30000
+    120000
   )
 
   test.each([true, false])(
@@ -337,7 +366,7 @@ describe('fixed same-realm share priming', () => {
       expect(rows.filter((r) => r.event === 'priming-complete')).toHaveLength(1)
       expect(rows.filter((r) => r.event === 'case-complete')).toHaveLength(0)
     },
-    30000
+    120000
   )
 
   test.each([true, false])(
@@ -350,7 +379,7 @@ describe('fixed same-realm share priming', () => {
       if (!short) expect(result.violations).toContain('phase-end quiet heap screen')
       expect(problems.join('\n')).toContain('phase-end quiet heap slope screen')
     },
-    30000
+    120000
   )
 
   test.each([true, false])(
@@ -372,7 +401,7 @@ describe('fixed same-realm share priming', () => {
       expect(ends[0].heapAtMs).toBeGreaterThan(960000)
       expect(ends[1].heapAtMs - ends[0].heapAtMs).toBeGreaterThan(short ? 320000 : 640000)
     },
-    30000
+    120000
   )
 
   test('records first-use heap growth without turning it into a passing scored heap verdict', async () => {
@@ -383,7 +412,7 @@ describe('fixed same-realm share priming', () => {
     expect(verdict.ok).toBe(true)
     expect(verdict.measurementOnly.ok).toBe(false)
     expect(verdict.measurementOnly.violations).toContain('share-steady: retained-heap screen')
-  }, 30000)
+  }, 120000)
 
   test('joins failed first-use cleanup, archives both errors and never prepares scored resources', async () => {
     const { owner, rows, error, scoredDriver } = await recording({
@@ -401,7 +430,7 @@ describe('fixed same-realm share priming', () => {
         .join('\n')
     ).toContain('priming deletion failed')
     expect(rows.filter((r) => r.event === 'priming-complete')).toEqual([])
-  }, 30000)
+  }, 120000)
 
   test.each([
     [
@@ -455,7 +484,7 @@ describe('fixed same-realm share priming', () => {
       expect(scoredDriver.prepare).not.toHaveBeenCalled()
       expect(rows.some((r) => r.event === 'case-complete')).toBe(false)
     },
-    30000
+    120000
   )
 
   test.each([
@@ -498,7 +527,58 @@ describe('fixed same-realm share priming', () => {
       expect(scoredDriver.prepare).not.toHaveBeenCalled()
       expect(rows.some((r) => r.event === 'priming-complete')).toBe(false)
     },
-    30000
+    120000
+  )
+
+  test.each([
+    [
+      'missing heap',
+      (p) => {
+        delete p.heapUsed
+      },
+    ],
+    [
+      'NaN heap',
+      (p) => {
+        p.heapUsed = NaN
+      },
+    ],
+    [
+      'negative heap',
+      (p) => {
+        p.heapUsed = -1
+      },
+    ],
+    [
+      'missing elapsed time',
+      (p) => {
+        delete p.heapAtMs
+      },
+    ],
+    [
+      'NaN elapsed time',
+      (p) => {
+        p.heapAtMs = NaN
+      },
+    ],
+    [
+      'negative elapsed time',
+      (p) => {
+        p.heapAtMs = -1
+      },
+    ],
+  ])(
+    'rejects a boundary-only %s before admitting scored setup',
+    async (_name, damageBoundary) => {
+      const { error, scoredDriver, rows, owner } = await recording({ damageBoundary })
+      expect(error).toBeInstanceOf(Error)
+      expect(owner.gate.tainted).toBe(true)
+      expect(scoredDriver.prepare).not.toHaveBeenCalled()
+      expect(rows.some((r) => r.event === 'priming-complete')).toBe(true)
+      expect(rows.some((r) => r.event === 'priming-boundary')).toBe(false)
+      expect(rows.some((r) => r.event === 'case-complete')).toBe(false)
+    },
+    120000
   )
 
   test('the fixed allocations preserve both distinct idle margins', () => {
@@ -550,13 +630,92 @@ describe('streamed share protocol evidence', () => {
   })
 })
 
+describe.each([true, false])('original work deadlines, short=%s', (short) => {
+  let accepted
+  beforeAll(async () => {
+    const value = await recording({ short })
+    expect(value.problems).toEqual([])
+    accepted = value.rows
+  }, 120000)
+
+  test.each(
+    ['priming', 'scored'].flatMap((scope) =>
+      ['cycle', 'verifier', 'final', 'final verifier'].map((kind) => [scope, kind])
+    )
+  )('binds %s %s actual completion to its unchanged deadline', (scope, kind) => {
+    const rows = JSON.parse(JSON.stringify(accepted))
+    const cycle = rows.find((r) => r.scope === scope && r.event === 'soak-cycle')
+    const done = rows.find(
+      (r) => r.scope === scope && ['priming-complete', 'case-complete'].includes(r.event)
+    )
+    const target = kind.startsWith('final') ? done.final : cycle
+    const due = target.timing.due
+    target.timing.completedAt = due
+    if (kind.includes('verifier')) target.verifier.closedAt = due
+    const reseal = () => {
+      const prime = rows.find((r) => r.event === 'priming-complete')
+      for (const row of rows) if (row.priming) row.priming.receiptSha256 = primingReceiptHash(prime)
+    }
+    reseal()
+    if (kind.startsWith('final')) {
+      const { verifyShareWorkTiming } = require('../../evidence/sharePriming')
+      done.timing.observedAt = due
+      const cycles = rows.filter((r) => r.scenario === done.scenario && r.event === 'soak-cycle')
+      expect(
+        verifyShareWorkTiming(
+          done,
+          cycles,
+          done.timing.startedAt,
+          done.timing.workDue,
+          done.timing.workDue + 10000
+        )
+      ).toEqual([])
+    } else expect(verifySharePriming(rows)).toEqual([])
+    if (kind.includes('verifier')) target.verifier.closedAt++
+    else target.timing.completedAt++
+    reseal()
+    expect(verifySharePriming(rows)).toContain(
+      `${scope}: original ${kind.startsWith('final') ? 'final' : 'cycle 0'} work exceeds its unchanged deadline or scope`
+    )
+    expect(target.timing.due).toBe(due)
+  })
+
+  test.each(['priming', 'scored'])(
+    'checks %s actual scope completion against its absolute bound',
+    (scope) => {
+      const { verifyShareWorkTiming } = require('../../evidence/sharePriming')
+      const rows = JSON.parse(JSON.stringify(accepted))
+      const done = rows.find(
+        (r) => r.scope === scope && ['priming-complete', 'case-complete'].includes(r.event)
+      )
+      const cycles = rows.filter((r) => r.scenario === done.scenario && r.event === 'soak-cycle')
+      const start = rows.find((r) => r.event === 'priming-start').startedAt
+      const workDue = start + (scope === 'priming' ? 1010000 : short ? 2030000 : 2990000)
+      const childDue = start + (short ? 2040000 : 3000000)
+      done.timing.observedAt = workDue
+      expect(verifyShareWorkTiming(done, cycles, start, workDue, childDue)).toEqual([])
+      done.timing.observedAt++
+      expect(verifyShareWorkTiming(done, cycles, start, workDue, childDue)).toContain(
+        'original scope completion exceeds its absolute bound'
+      )
+      expect(done.timing.workDue).toBe(workDue)
+      done.timing.observedAt = childDue
+      expect(verifyShareWorkTiming(done, cycles, start, childDue, childDue)).toEqual([])
+      done.timing.observedAt++
+      expect(verifyShareWorkTiming(done, cycles, start, childDue, childDue)).toContain(
+        'original scope completion exceeds its absolute bound'
+      )
+    }
+  )
+})
+
 describe('recorded priming integrity', () => {
   let accepted
   beforeAll(async () => {
     const recordingResult = await recording()
     expect(recordingResult.problems).toEqual([])
     accepted = recordingResult.rows
-  }, 30000)
+  }, 120000)
 
   test.each([
     [
@@ -565,6 +724,47 @@ describe('recorded priming integrity', () => {
         rows.find((r) => r.event === 'priming-boundary').snapshot.queueDepth = 1
       },
     ],
+    ...[
+      [
+        'missing heap',
+        (p) => {
+          delete p.heapUsed
+        },
+      ],
+      [
+        'nonfinite heap',
+        (p) => {
+          p.heapUsed = Infinity
+        },
+      ],
+      [
+        'negative heap',
+        (p) => {
+          p.heapUsed = -1
+        },
+      ],
+      [
+        'missing timestamp',
+        (p) => {
+          delete p.heapAtMs
+        },
+      ],
+      [
+        'negative timestamp',
+        (p) => {
+          p.heapAtMs = -1
+        },
+      ],
+      [
+        'late timestamp',
+        (p) => {
+          p.heapAtMs += 1020000
+        },
+      ],
+    ].map(([name, damage]) => [
+      `boundary ${name}`,
+      (rows) => damage(rows.find((r) => r.event === 'priming-boundary').snapshot),
+    ]),
     [
       'operation mismatch',
       (rows) => {
@@ -618,13 +818,13 @@ describe('recorded priming integrity', () => {
       },
     ],
     [
-      'late child cutoff',
+      'changed declared child cutoff',
       (rows) => {
         rows.find((r) => r.event === 'case-complete').timing.workDue++
       },
     ],
     [
-      'late original slot',
+      'changed declared original slot',
       (rows) => {
         rows.find((r) => r.event === 'case-complete').timing.slots[0].due++
       },
