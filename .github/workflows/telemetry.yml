@@ -141,6 +141,7 @@ jobs:
       COMPOSE_PROJECT_NAME: telemetry-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
       TF1_CACHE: ${{ github.workspace }}/.tmp/telemetry-cache
       TELEMETRY_JAVA_CACHE: ${{ github.workspace }}/.tmp/telemetry-cache
+      TELEMETRY_DECODER_ARCHIVE: ${{ github.workspace }}/.tmp/telemetry-cache/decoder-${{ matrix.kafka }}.jsa
       TELEMETRY_INTEROP_CACHE: ${{ github.workspace }}/.tmp/telemetry-interop
       TELEMETRY_EVIDENCE_DIR: ${{ github.workspace }}/.tmp/telemetry-evidence
       KAFKAJS_LANE: docker
@@ -168,6 +169,7 @@ jobs:
           timeout -k 5s 30s env -u TELEMETRY_JAVA_CACHE bash scripts/e2e/telemetry/run.sh verify "$KAFKA_VERSION"
           timeout -k 5s 180s bash scripts/e2e/telemetry/fetch.sh
           timeout -k 5s 30s bash scripts/e2e/telemetry/run.sh verify "$KAFKA_VERSION"
+          timeout -k 5s 60s node scripts/e2e/telemetry/prepareDecoder.js
       - name: Fetch and verify the pinned Java interop jars
         if: matrix.group == 'telemetry-java'
         timeout-minutes: 4
@@ -235,5 +237,6 @@ jobs:
           path: |
             .tmp/e2e/
             .tmp/telemetry-evidence/
+            .tmp/telemetry-cache/decoder-*.jsa.json
           if-no-files-found: error
           include-hidden-files: true

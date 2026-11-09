@@ -3837,3 +3837,200 @@ describe('broker throttle evidence', () => {
     expect(() => verify(transcript)).toThrow()
   })
 })
+
+describe('offline decoder preparation', () => {
+  const { spawnSync } = require('child_process')
+  let directory
+  let script
+  let archive
+  let env
+  const calls = () =>
+    fs.existsSync(env.DECODER_TEST_CALLS)
+      ? fs.readFileSync(env.DECODER_TEST_CALLS, 'utf8').trim().split('\n')
+      : []
+  const prepare = () =>
+    require('../../scripts/e2e/telemetry/prepareDecoder').prepareDecoder({
+      line: '4.3.1',
+      archive,
+      script,
+      env,
+    })
+
+  beforeEach(() => {
+    directory = fs.mkdtempSync(path.join(os.tmpdir(), 'decoder-preparation-'))
+    archive = path.join(directory, 'decoder.jsa')
+    script = path.join(directory, 'runner.sh')
+    env = {
+      ...process.env,
+      DECODER_TEST_NODE: process.execPath,
+      DECODER_TEST_CALLS: path.join(directory, 'calls'),
+      DECODER_TEST_PROGRAM: path.join(directory, 'runner.js'),
+    }
+    fs.writeFileSync(script, '#!/bin/sh\nexec "$DECODER_TEST_NODE" "$DECODER_TEST_PROGRAM" "$@"\n')
+    fs.writeFileSync(
+      env.DECODER_TEST_PROGRAM,
+      `
+      const fs = require('fs')
+      const crypto = require('crypto')
+      const [mode, line, raw] = process.argv.slice(2)
+      fs.appendFileSync(process.env.DECODER_TEST_CALLS, mode + '\\n')
+      if (process.env.DECODER_TEST_FAIL === mode) process.exit(124)
+      const bytes = fs.readFileSync(raw)
+      const body = {
+        dataBytes: bytes.length,
+        dataSha256: crypto.createHash('sha256').update(bytes).digest('hex'),
+        parse: 'ok', truncated: false, metrics: [], resources: [],
+      }
+      if (mode === 'prepare' && !process.env.DECODER_TEST_NO_ARCHIVE)
+        fs.writeFileSync(process.env.TELEMETRY_DECODER_ARCHIVE, 'prepared classes')
+      if (mode === 'decode' && process.env.DECODER_TEST_CHANGED) body.metrics.push({ name: 'changed' })
+      if (process.env.DECODER_TEST_STDERR) console.error('retained JVM diagnostic')
+      console.log(JSON.stringify({ verified: !process.env.DECODER_TEST_UNVERIFIED, line }))
+      console.log(JSON.stringify(body))
+    `
+    )
+  })
+  afterEach(() => fs.rmSync(directory, { recursive: true, force: true }))
+
+  test('publishes only an archive whose first supervised decode matches preparation', () => {
+    const result = prepare()
+    expect(calls()).toEqual(['prepare', 'decode'])
+    expect(fs.readFileSync(archive, 'utf8')).toBe('prepared classes')
+    expect(result).toMatchObject({ line: '4.3.1', archive, verified: true })
+    expect(result.archiveSha256).toBe(
+      crypto.createHash('sha256').update('prepared classes').digest('hex')
+    )
+    expect(fs.readdirSync(directory).some((name) => name.startsWith('decoder-prepare-'))).toBe(
+      false
+    )
+  })
+
+  test.each(['prepare', 'decode'])(
+    'retains a %s timeout without retrying or publishing',
+    (mode) => {
+      env.DECODER_TEST_FAIL = mode
+      expect(prepare).toThrow('124')
+      expect(calls()).toEqual(mode === 'prepare' ? ['prepare'] : ['prepare', 'decode'])
+      expect(fs.existsSync(archive)).toBe(false)
+      expect(fs.readdirSync(directory).some((name) => name.startsWith('decoder-prepare-'))).toBe(
+        false
+      )
+    }
+  )
+
+  test.each([
+    ['DECODER_TEST_NO_ARCHIVE', 'archive'],
+    ['DECODER_TEST_UNVERIFIED', 'identity'],
+    ['DECODER_TEST_CHANGED', 'match'],
+  ])('refuses %s rather than publishing unusable preparation', (key, diagnostic) => {
+    env[key] = '1'
+    expect(prepare).toThrow(diagnostic)
+    expect(fs.existsSync(archive)).toBe(false)
+  })
+
+  test('retains preparation and readiness JVM diagnostics in its receipt', () => {
+    env.DECODER_TEST_STDERR = '1'
+    expect(prepare()).toMatchObject({
+      preparationStderr: 'retained JVM diagnostic\n',
+      readinessStderr: 'retained JVM diagnostic\n',
+    })
+  })
+
+  test('refuses to overwrite an existing archive', () => {
+    fs.writeFileSync(archive, 'original')
+    expect(prepare).toThrow('exists')
+    expect(fs.readFileSync(archive, 'utf8')).toBe('original')
+    expect(calls()).toEqual([])
+  })
+
+  test.each([
+    ['decode', 'missing'],
+    ['decode', 'symlink'],
+    ['decode', 'relative'],
+    ['prepare', 'existing'],
+  ])('rejects %s with a %s archive before invoking Java', (mode, kind) => {
+    const raw = path.join(directory, 'raw.bin')
+    fs.writeFileSync(raw, '')
+    const javaMarker = path.join(directory, 'java-called')
+    fs.writeFileSync(path.join(directory, 'node'), '#!/bin/sh\ncat >/dev/null\n', { mode: 0o700 })
+    fs.writeFileSync(path.join(directory, 'java'), '#!/bin/sh\ntouch "$DECODER_TEST_MARKER"\n', {
+      mode: 0o700,
+    })
+    if (kind === 'symlink') fs.symlinkSync(raw, archive)
+    if (kind === 'existing') fs.writeFileSync(archive, 'original')
+    const result = spawnSync(
+      'timeout',
+      [
+        '-k',
+        '1s',
+        '5s',
+        'bash',
+        path.resolve(__dirname, '../../scripts/e2e/telemetry/run.sh'),
+        mode,
+        '4.3.1',
+        raw,
+      ],
+      {
+        encoding: 'utf8',
+        env: {
+          ...env,
+          PATH: directory + path.delimiter + process.env.PATH,
+          TMPDIR: directory,
+          TELEMETRY_JAVA_CACHE: directory,
+          TELEMETRY_DECODER_ARCHIVE: kind === 'relative' ? 'decoder.jsa' : archive,
+          DECODER_TEST_MARKER: javaMarker,
+        },
+      }
+    )
+    expect(result.status).not.toBe(0)
+    expect(fs.existsSync(javaMarker)).toBe(false)
+    if (kind === 'existing') expect(fs.readFileSync(archive, 'utf8')).toBe('original')
+  })
+
+  test('runs the decoder with mandatory sharing and the prepared archive', () => {
+    const argv = path.join(directory, 'java-argv.json')
+    const raw = path.join(directory, 'raw.bin')
+    fs.writeFileSync(raw, '')
+    fs.writeFileSync(archive, 'prepared classes')
+    fs.writeFileSync(path.join(directory, 'node'), '#!/bin/sh\ncat >/dev/null\n', { mode: 0o700 })
+    fs.writeFileSync(
+      path.join(directory, 'java'),
+      '#!/bin/sh\nexec "$DECODER_TEST_NODE" -e \'require("fs").writeFileSync(process.env.DECODER_TEST_ARGV, JSON.stringify(process.argv.slice(1)))\' -- "$@"\n',
+      { mode: 0o700 }
+    )
+    const result = spawnSync(
+      'timeout',
+      [
+        '-k',
+        '1s',
+        '5s',
+        'bash',
+        path.resolve(__dirname, '../../scripts/e2e/telemetry/run.sh'),
+        'decode',
+        '4.3.1',
+        raw,
+      ],
+      {
+        encoding: 'utf8',
+        env: {
+          ...env,
+          PATH: directory + path.delimiter + process.env.PATH,
+          TMPDIR: directory,
+          TELEMETRY_JAVA_CACHE: directory,
+          TELEMETRY_DECODER_ARCHIVE: archive,
+          DECODER_TEST_ARGV: argv,
+        },
+      }
+    )
+    expect(result.status).toBe(0)
+    const args = JSON.parse(fs.readFileSync(argv, 'utf8'))
+    expect(args).toEqual(
+      expect.arrayContaining([
+        '-Xshare:on',
+        '-XX:TieredStopAtLevel=1',
+        '-XX:SharedArchiveFile=' + archive,
+      ])
+    )
+    expect(args.slice(-2)).toEqual(['org.countly.kafkajs.telemetry.FullTelemetryDecoder', raw])
+  })
+})
