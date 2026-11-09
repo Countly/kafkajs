@@ -649,8 +649,17 @@ describe('Consumer > broker outages', () => {
     await start(events)
     await held.arrived()
     breaker.take(COORDINATOR, 'refused')
+    // The fetch loop and background timer share the heartbeat. Either can observe its failure
+    // first; waiting only for the timer can instead wait for a later coordinator lookup to exhaust
+    // its retries. Both paths below report after the failed heartbeat marked its coordinator lost.
     await until(
-      () => lines.some(({ log }) => /Background heartbeat failed/.test(log.message)),
+      () =>
+        lines.some(
+          ({ log }) =>
+            /Background heartbeat failed/.test(log.message) ||
+            (log.message === 'Lost a connection while fetching, trying again' &&
+              log.requestClass === 'heartbeat')
+        ),
       'the heartbeat that lost the coordinator'
     )
 
