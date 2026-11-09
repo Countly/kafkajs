@@ -134,9 +134,11 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 #### Tooling
 
 - Register the share broker-floor refusal checks in the exit gate (required on the 4.0.2 floor, tolerated skips elsewhere) and enumerate the new tarball and docs path guards in the exit sweeps.
-- Move share-soak memory acceptance to the separate `Memory gates` workflow on `p9m/` pull requests and manual dispatch, required before 3.0.0 rather than phase merges. CI jobs replace the local guard for these demonstrations. Only the short job currently ships; the full-profile job and complete independent acceptance validator remain owed to the memory-gates follow-up. Add a manual integration lane selector and run the soak unit spec in three case shards per supported Node version.
+- Move share-soak memory acceptance to the separate `Memory gates` workflow on `p9m/` pull requests and manual dispatch, required before 3.0.0 rather than phase merges. CI jobs replace the local guard for these demonstrations. Add a manual integration lane selector and run the soak unit spec in three case shards per supported Node version.
 
 - Add share-consumer soak and benchmark gates with separate batch and message identity controls. Before scored setup, both soak profiles execute one fixed same-process, same-realm 30-cycle priming pass with separate resources and joined cleanup, funded by a separate 1020000-ms allocation. The short/full scored profiles retain 32/64-second slots, 960/1920-second spans, thirty cycles, ten resets and separate 5000 ms per-cycle and final observations, with unchanged scored clocks and heap/resource screens. Inclusive child budgets and watchdogs are 2040/3000 seconds. These are declared bounds; live acceptance and measured performance remain unverified.
+
+- Add isolated short/full share-soak CI jobs with 35/51-minute fixed parent steps and 55/71-minute job limits, original lifecycle admission, independent validation, owned cleanup, sealed artifacts and broker-free archive rechecks. Require the aggregate share-soak verdict alongside the existing Exit gate for the tested commit. Historical local guard caps are superseded for these demonstrations.
 
 - Track the seven released share-group APIs (keys 76–79 and 90–92) in the Kafka 4.4.0 and 4.3.1 message snapshots and regenerate their protocol compatibility inventory. Source inventory alone does not add share-group support.
 - Add a Java share-consumer interoperability member and classpath probe.

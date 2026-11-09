@@ -1,4 +1,5 @@
 const { runNaturalExit } = require('../naturalExit')
+const { PROFILES, childArgs, childEnvironment } = require('../shareSoakContract')
 const { primingReceiptHash } = require('../../evidence/sharePrimingLink')
 
 const SOAK_CASE = 'preserves share identities and resources through the short soak'
@@ -68,9 +69,10 @@ const withPriming = (rows) => {
  * @returns {object} Mutable original timestamps, child result, evidence and captured artifacts.
  */
 const fixture = (lane) => {
-  const totalMs = lane === 'soak' ? 2040000 : 120000
+  const profile = lane === 'soak' ? PROFILES.short : PROFILES.full
+  const totalMs = lane === 'shutdown' ? 120000 : profile.totalMs
   const completedAt = 1000 + totalMs - 10000
-  const cases = lane === 'soak' ? [SOAK_CASE] : SHUTDOWN_CASES
+  const cases = lane === 'shutdown' ? SHUTDOWN_CASES : [SOAK_CASE]
   const state = {
     startedAt: 1000,
     exitedAt: 1000 + totalMs,
@@ -82,18 +84,18 @@ const fixture = (lane) => {
         case: title,
         status: 'passed',
         tainted: false,
-        ...(lane === 'soak' && {
-          profileMs: 960000,
-          selector: 'SHARE_SOAK_E2E',
-          soakProfile: 'share-consumer-short',
-          stem: 'share-soak',
-          schedule: { slotMs: 32000, totalMs },
+        ...(lane !== 'shutdown' && {
+          profileMs: profile.profileMs,
+          selector: profile.selector,
+          soakProfile: profile.profile,
+          stem: profile.stem,
+          schedule: { slotMs: profile.slotMs, totalMs },
         }),
         cleanup: {
           groupsAbsent: true,
           topicsAbsent: true,
           completedAt: at,
-          ...(lane === 'soak' && { clock: { origin: 'hrtime', completedAt: at } }),
+          ...(lane !== 'shutdown' && { clock: { origin: 'hrtime', completedAt: at } }),
         },
       }
     }),
@@ -107,13 +109,30 @@ const fixture = (lane) => {
   const run = () =>
     runNaturalExit(lane, {
       spawn,
+      env: {},
       now: () => (childReturned ? state.exitedAt : state.startedAt),
       readFile: (file, encoding) => {
+        if (file === '.tmp/e2e/share-soak-jest.json')
+          return JSON.stringify({
+            success: true,
+            numTotalTests: 1,
+            numPassedTests: 1,
+            numFailedTests: 0,
+            numPendingTests: 0,
+            numTodoTests: 0,
+            testResults: [
+              {
+                name: '/repo/src/consumer/share/__tests__/shareSoakLive.spec.js',
+                status: 'passed',
+                assertionResults: [{ title: SOAK_CASE, status: 'passed' }],
+              },
+            ],
+          })
         if (file !== `.tmp/e2e/share-${lane}.jsonl` || encoding !== 'utf8')
           throw new Error('Wrong evidence input')
         return (
           state.text ??
-          (lane === 'soak' ? withPriming(state.rows) : state.rows)
+          (lane !== 'shutdown' ? withPriming(state.rows) : state.rows)
             .map((row) => JSON.stringify(row))
             .join('\n') + '\n'
         )
@@ -123,19 +142,19 @@ const fixture = (lane) => {
   return { state, artifacts, spawn, run }
 }
 
-describe.each(['soak', 'shutdown'])('CI natural exit > %s', (lane) => {
+describe.each(['soak', 'soak-full', 'shutdown'])('CI natural exit > %s', (lane) => {
   test('accepts cleanup +10000 ms and the inclusive total exactly', () => {
     const { state, artifacts, run } = fixture(lane)
     state.rows.unshift({ event: 'progress', cleanup: { completedAt: state.exitedAt } })
 
     expect(run()).toMatchObject({
       startedAt: 1000,
-      exitedAt: lane === 'soak' ? 2041000 : 121000,
-      cleanupAt: lane === 'soak' ? 2031000 : 111000,
+      exitedAt: lane === 'soak' ? 2041000 : lane === 'soak-full' ? 3001000 : 121000,
+      cleanupAt: lane === 'soak' ? 2031000 : lane === 'soak-full' ? 2991000 : 111000,
       status: 0,
       signal: null,
       origin: 'hrtime',
-      totalMs: lane === 'soak' ? 2040000 : 120000,
+      totalMs: lane === 'soak' ? 2040000 : lane === 'soak-full' ? 3000000 : 120000,
       exitMs: 10000,
       watchdogTerminated: false,
     })
@@ -168,16 +187,25 @@ describe.each(['soak', 'shutdown'])('CI natural exit > %s', (lane) => {
     run()
     expect(spawn).toHaveBeenCalledWith(
       process.execPath,
-      [
-        ...(lane === 'soak' ? ['--expose-gc'] : []),
-        'node_modules/jest/bin/jest.js',
-        '--ci',
-        '--detectOpenHandles',
-        '--runInBand',
-        '--runTestsByPath',
-        `src/consumer/share/__tests__/share${lane === 'soak' ? 'Soak' : 'Shutdown'}Live.spec.js`,
-      ],
-      { stdio: 'inherit', timeout: lane === 'soak' ? 2040000 : 120000, killSignal: 'SIGKILL' }
+      lane !== 'shutdown'
+        ? childArgs(lane === 'soak' ? 'short' : 'full')
+        : [
+            ...(lane === 'soak' ? ['--expose-gc'] : []),
+            'node_modules/jest/bin/jest.js',
+            '--ci',
+            '--detectOpenHandles',
+            '--runInBand',
+            '--runTestsByPath',
+            `src/consumer/share/__tests__/share${lane === 'soak' ? 'Soak' : 'Shutdown'}Live.spec.js`,
+          ],
+      {
+        stdio: 'inherit',
+        timeout: lane === 'soak' ? 2040000 : lane === 'soak-full' ? 3000000 : 120000,
+        killSignal: 'SIGKILL',
+        ...(lane !== 'shutdown' && {
+          env: childEnvironment(lane === 'soak' ? 'short' : 'full', {}),
+        }),
+      }
     )
   })
 
@@ -407,4 +435,72 @@ describe('CI natural exit > sealed priming link', () => {
     state.text = rows.map((row) => JSON.stringify(row)).join('\n')
     expect(run).toThrow(/priming cleanup evidence/)
   })
+})
+
+describe('CI natural exit > actual fixed CLI subprocess observation', () => {
+  test.each([false, true])(
+    'observes the actual fixed child PID and refuses event-loop retention, retained=%s',
+    (retained) => {
+      const fs = require('node:fs')
+      const os = require('node:os')
+      const path = require('node:path')
+      const { spawnSync } = require('node:child_process')
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fixed-soak-parent-'))
+      const artifact = new Map()
+      try {
+        fs.mkdirSync(path.join(root, 'scripts/soak'), { recursive: true })
+        fs.mkdirSync(path.join(root, '.tmp/e2e'), { recursive: true })
+        fs.writeFileSync(
+          path.join(root, 'rows.json'),
+          JSON.stringify(withPriming(fixture('soak-full').state.rows))
+        )
+        fs.writeFileSync(
+          path.join(root, 'scripts/soak/soak.js'),
+          `
+        const fs = require('node:fs')
+        const rows = JSON.parse(fs.readFileSync('rows.json'))
+        const at = Number(process.hrtime.bigint() / 1000000n)
+        rows.at(-1).cleanup.completedAt = at
+        rows.at(-1).cleanup.clock.completedAt = at
+        fs.writeFileSync('.tmp/e2e/share-soak-full.jsonl', rows.map(JSON.stringify).join('\\n') + '\\n')
+        ${retained ? 'setInterval(() => {}, 10)' : 'setImmediate(() => {})'}
+      `
+        )
+        const run = () =>
+          runNaturalExit('soak-full', {
+            env: {},
+            // The shortened OS port is only the bounded failure control; accepted argv/watchdog remain fixed.
+            spawn: (executable, argv, options) =>
+              spawnSync(executable, argv, {
+                ...options,
+                cwd: root,
+                timeout: retained ? 200 : options.timeout,
+              }),
+            readFile: (name) => fs.readFileSync(path.join(root, name), 'utf8'),
+            writeFile: (name, bytes) => artifact.set(name, JSON.parse(bytes)),
+          })
+        if (retained) expect(run).toThrow(/child exit/)
+        else expect(run()).toMatchObject({ status: 0, signal: null, accepted: true })
+        const exit = artifact.get('.tmp/e2e/share-soak-full-exit.json')
+        expect(exit.childPid).toBeGreaterThan(0)
+        expect(exit.parentPid).toBe(process.pid)
+        expect(exit.argv).toEqual(childArgs('full'))
+        expect(exit.watchdogTerminated).toBe(retained)
+        expect(exit.accepted).toBe(!retained)
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true })
+      }
+    }
+  )
+})
+
+test('CI natural exit > refuses the CLI outside its original frozen lifecycle', () => {
+  const { spawnSync } = require('node:child_process')
+  const result = spawnSync(process.execPath, ['scripts/ci/naturalExit.js', 'soak-full'], {
+    env: {},
+    encoding: 'utf8',
+    timeout: 3000,
+  })
+  expect(result.status).toBe(1)
+  expect(result.stderr).toContain('Share soak requires its frozen CI lifecycle')
 })

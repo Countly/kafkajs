@@ -7,61 +7,187 @@ concurrency:
   group: memory-gates-${{ github.ref }}
   cancel-in-progress: true
 jobs:
-  share-soak-short:
+  unit:
+    name: share-soak-controls
     if: github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/')
     runs-on: ubuntu-latest
-    timeout-minutes: 55
-    env:
-      KAFKA_VERSION: 4.3.1
-      COMPOSE_FILE: docker-compose.yml
-      KAFKA_CLIENTS_VERSION: ''
+    timeout-minutes: 30
+    permissions: { contents: read }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: 24, cache: npm }
       - run: npm ci
-      - run: docker compose version
-      - name: Prepare share evidence
-        run: |
-          echo "KAFKAJS_TREE=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
-          rm -rf .tmp/e2e
-          mkdir -p .tmp/e2e
-      - name: Start cold base cluster
+      - name: Run broker-free acceptance and retained sensitivity controls
+        run: npm run test:unit -- --ci --maxWorkers=2
+  share-soak:
+    name: share-soak-${{ matrix.profile }}
+    runs-on: ubuntu-latest
+    permissions: { contents: read }
+    needs: [unit]
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/')
+    timeout-minutes: ${{ matrix.jobMinutes }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { profile: short, jobMinutes: 55, parentMinutes: 35 }
+          - { profile: full, jobMinutes: 71, parentMinutes: 51 }
+    env:
+      KAFKA_VERSION: 4.3.1
+      KAFKAJS_LANE: docker
+      KAFKAJS_DEBUG_PROTOCOL_BUFFERS: '1'
+      COMPOSE_FILE: docker-compose.yml
+    steps:
+      - name: Record original lifecycle before setup
+        timeout-minutes: 1
         env:
-          DO_NOT_STOP: '1'
-        run: ./scripts/testWithKafka.sh "true"
-      - name: Run share soak (natural exit)
-        timeout-minutes: 35
-        env:
-          KAFKAJS_LANE: docker
-          KAFKAJS_DEBUG_PROTOCOL_BUFFERS: '1'
-          SHARE_SOAK_E2E: '1'
-        run: node scripts/ci/naturalExit.js soak
-      - name: Verify share evidence before teardown
-        if: always()
+          SOAK_PROFILE: ${{ matrix.profile }}
         run: |
           node <<'NODE'
-          const fs = require('fs')
-          const { spawnSync } = require('child_process')
-          const { readBrokerVersion } = require('./testHelpers/brokerVersion')
-          const files = fs.readdirSync('.tmp/e2e').filter(name => name.endsWith('.jsonl'))
-            .map(name => `.tmp/e2e/${name}`)
-          const result = spawnSync(process.execPath, [
-            'scripts/evidence/verify.js', '--broker', readBrokerVersion(), ...files,
-          ], { stdio: 'inherit' })
-          if (result.error) throw result.error
-          process.exitCode = result.status ?? 1
+          const fs = require('node:fs')
+          const file = `${process.env.RUNNER_TEMP}/share-soak-origin.json`
+          fs.writeFileSync(file, JSON.stringify({
+            origin: Number(process.hrtime.bigint() / 1000000n), wallAt: Date.now(),
+            profile: process.env.SOAK_PROFILE, runId: process.env.GITHUB_RUN_ID,
+            attempt: process.env.GITHUB_RUN_ATTEMPT,
+          }) + '\n', { flag: 'wx' })
+          fs.appendFileSync(process.env.GITHUB_ENV, `KAFKAJS_SOAK_ORIGIN_FILE=${file}\n`)
           NODE
-      - name: Stop share cluster
+      - uses: actions/checkout@v4
+        timeout-minutes: 1
+      - uses: actions/setup-node@v4
+        timeout-minutes: 1
+        with: { node-version: 24, cache: npm }
+      - run: npm ci
+        timeout-minutes: 4
+      - name: Freeze contract and start owned cold base cluster
+        timeout-minutes: 4
+        run: |
+          mkdir -p .tmp/e2e
+          node scripts/ci/shareSoakJob.js freeze ${{ matrix.profile }}
+          node scripts/ci/shareSoakJob.js startup
+      - name: Run share soak (natural exit)
+        if: matrix.profile == 'short'
+        timeout-minutes: 35
+        run: node scripts/ci/naturalExit.js soak
+      - name: Run full share soak (natural exit)
+        if: matrix.profile == 'full'
+        timeout-minutes: 51
+        run: node scripts/ci/naturalExit.js soak-full
+      - name: Independently verify originals before teardown
         if: always()
-        run: docker compose -f "$COMPOSE_FILE" down --remove-orphans
+        timeout-minutes: 3
+        run: node scripts/ci/shareSoakJob.js verify
+      - name: Preserve owned broker logs and partial receipts
+        if: always()
+        timeout-minutes: 1
+        run: node scripts/ci/shareSoakJob.js logs
+      - name: Stop owned cluster and prove absence
+        if: always()
+        timeout-minutes: 2
+        run: node scripts/ci/shareSoakJob.js teardown
+      - name: Recheck frozen source and seal final archive
+        if: always()
+        timeout-minutes: 1
+        run: node scripts/ci/shareSoakJob.js seal
+      - name: Upload complete or failed evidence
+        id: evidence
+        if: always()
+        timeout-minutes: 2
+        uses: actions/upload-artifact@v4
+        with:
+          name: share-soak-${{ matrix.profile }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/e2e/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+  share-soak-verify:
+    name: share-soak-verify-${{ matrix.profile }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions: { contents: read, actions: read }
+    needs: [share-soak]
+    if: always() && (github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/'))
+    strategy:
+      fail-fast: false
+      matrix: { profile: [short, full] }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 24, cache: npm }
+      - run: npm ci
+      - name: Authenticate completed producer and exact artifact bytes
+        uses: actions/github-script@v7
+        env:
+          SOAK_PROFILE: ${{ matrix.profile }}
+        with:
+          script: |
+            const fs = require('node:fs')
+            const { createHash } = require('node:crypto')
+            const { execFileSync } = require('node:child_process')
+            const profile = process.env.SOAK_PROFILE
+            const attempt = Number(process.env.GITHUB_RUN_ATTEMPT)
+            const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRunAttempt, {
+              ...context.repo, run_id: context.runId, attempt_number: attempt,
+            })
+            const matched = jobs.filter(job => job.name === `share-soak-${profile}`)
+            if (matched.length !== 1 || matched[0].status !== 'completed' || matched[0].conclusion !== 'success')
+              throw new Error('Missing successful producer for this profile and attempt')
+            const name = `share-soak-${profile}-${context.runId}-${attempt}`
+            const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, {
+              ...context.repo, run_id: context.runId,
+            })
+            const selected = artifacts.filter(artifact => artifact.name === name)
+            if (selected.length !== 1 || selected[0].expired) throw new Error('Missing unique unexpired profile artifact')
+            const artifact = selected[0]
+            const response = await github.rest.actions.downloadArtifact({
+              ...context.repo, artifact_id: artifact.id, archive_format: 'zip',
+            })
+            const bytes = Buffer.from(response.data)
+            const downloadDigest = `sha256:${createHash('sha256').update(bytes).digest('hex')}`
+            if (downloadDigest !== artifact.digest) throw new Error('Platform artifact digest mismatch')
+            const zip = `${process.env.RUNNER_TEMP}/share-soak.zip`
+            fs.writeFileSync(zip, bytes)
+            const entries = execFileSync('unzip', ['-Z1', zip], { encoding: 'utf8' }).trim().split('\n')
+            if (entries.some(name => name.startsWith('/') || name.split('/').includes('..'))) throw new Error('Unsafe archive path')
+            execFileSync('unzip', ['-q', zip, '-d', '.tmp/download'])
+            fs.writeFileSync(`${process.env.RUNNER_TEMP}/share-soak-provenance.json`, JSON.stringify({
+              repository: `${context.repo.owner}/${context.repo.repo}`, runId: context.runId, attempt,
+              head: context.payload.pull_request?.head?.sha ?? process.env.GITHUB_SHA,
+              base: context.payload.pull_request?.base?.sha ?? null,
+              workflowRef: process.env.GITHUB_WORKFLOW_REF, workflowSha: process.env.GITHUB_WORKFLOW_SHA,
+              job: matched[0].name, jobId: matched[0].id, producerSteps: matched[0].steps, conclusion: matched[0].conclusion,
+              artifact: name, artifactId: artifact.id, artifactDigest: artifact.digest,
+              artifactExpired: artifact.expired, downloadDigest, testedSha: process.env.GITHUB_SHA,
+              runUrl: `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${context.runId}/attempts/${attempt}`,
+            }) + '\n')
+      - name: Reconstruct sealed originals without brokers
+        timeout-minutes: 3
+        run: |
+          mkdir -p .tmp/recheck
+          node scripts/evidence/shareSoakAcceptance.js --contract .tmp/download/contract.json --archive .tmp/download --provenance "$RUNNER_TEMP/share-soak-provenance.json" > .tmp/recheck/result.json
       - if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: e2e-share-soak-short-4.3.1-node24
-          path: .tmp/e2e/
-          if-no-files-found: ignore
+          name: share-soak-recheck-${{ matrix.profile }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/recheck/
           include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+  share-soak-verdict:
+    name: share-soak-verdict
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: { contents: read }
+    needs: [share-soak, share-soak-verify]
+    if: always() && (github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/'))
+    steps:
+      - name: Require both producing and archived reconstruction matrices
+        env:
+          PRODUCED: ${{ needs.share-soak.result }}
+          RECHECKED: ${{ needs.share-soak-verify.result }}
+        run: test "$PRODUCED" = success && test "$RECHECKED" = success
   resources:
     if: github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/')
     runs-on: ubuntu-latest
