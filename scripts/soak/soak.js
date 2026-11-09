@@ -2720,6 +2720,14 @@ class Soak {
           delayMs = planned < this.sampleAt.length ? this.sampleAt[planned] - elapsed : 2 ** 31 - 1
         }
         await this.nap(delayMs)
+        while (
+          this.sampling &&
+          this.sampleAt &&
+          planned < this.sampleAt.length &&
+          this.clock.now() - phaseStartedAt < this.sampleAt[planned]
+        ) {
+          await this.nap(this.sampleAt[planned] - (this.clock.now() - phaseStartedAt))
+        }
         if (this.sampling) {
           const admitted = this.clock.now()
           let snapshot

@@ -2062,6 +2062,9 @@ class TelemetryProcesses {
       stdout: '',
       stdoutBytes: 0,
       receiptAt: null,
+      disconnectedAt: null,
+      exitedAt: null,
+      lastMessage: null,
       exit: null,
       error: null,
       aborted: false,
@@ -2071,14 +2074,22 @@ class TelemetryProcesses {
     const capture = (name) => (chunk) => {
       const size = Buffer.byteLength(chunk)
       worker[`${name}Bytes`] = (worker[`${name}Bytes`] ?? 0) + size
+      const tail = Buffer.concat([Buffer.from(worker[name]), Buffer.from(chunk)])
+      worker[name] = tail.subarray(Math.max(0, tail.length - MAX_STDERR)).toString('utf8')
+      while (Buffer.byteLength(worker[name]) > MAX_STDERR) worker[name] = worker[name].slice(1)
       if (worker[`${name}Bytes`] > MAX_STDERR)
         this.fail(worker, new Error(`Worker ${name} overflow`))
-      else worker[name] += chunk
     }
     worker.stderrBytes = 0
     child.stdout?.on('data', capture('stdout'))
     child.stderr?.on('data', capture('stderr'))
     child.on('message', (message) => this.receive(kind, message))
+    child.once('disconnect', () => {
+      worker.disconnectedAt = this.now()
+    })
+    child.once('exit', () => {
+      worker.exitedAt = this.now()
+    })
     worker.closed = new Promise((resolve) => {
       child.once('close', (code, signal) => {
         worker.exit = { event: 'close', code, signal, closedAt: this.now() }
@@ -2118,7 +2129,7 @@ class TelemetryProcesses {
    */
   receive(kind, message) {
     const worker = this.workers.get(kind)
-    if (!worker || worker.error) return
+    if (!worker) return
     const bad = (why) => this.fail(worker, new Error(`Telemetry worker ${kind}: ${why}`))
     if (typeof message !== 'object' || message === null) return bad('a non-object message')
     if (!MESSAGE_TYPES.worker.includes(message.type)) return bad(`unknown message ${message.type}`)
@@ -2133,9 +2144,18 @@ class TelemetryProcesses {
       return bad(`a duplicate ${message.type}`)
     if (message.type !== 'hello' && !worker.counts.has('hello'))
       return bad('a message before hello')
+    worker.lastMessage = {
+      type: message.type,
+      bytes: size,
+      parentAt: this.now(),
+      ...(message.tick !== undefined && { tick: message.tick }),
+      ...(message.stage !== undefined && { stage: message.stage }),
+      ...(message.row && { rowKind: message.row.kind }),
+      ...(message.message && { message: String(message.message).slice(0, 2048) }),
+    }
     if (message.type === 'receipt') worker.receiptAt = this.now()
     if (message.type === 'decode') {
-      this.onDecode(kind, message)
+      if (!worker.error) this.onDecode(kind, message)
       return
     }
     worker.messages.push({ ...message, parentAt: this.now() })
@@ -2201,8 +2221,15 @@ class TelemetryProcesses {
       event: exit.event,
       code: exit.code,
       signal: exit.signal,
-      stderrBytes: Buffer.byteLength(worker.stderr),
-      stdoutBytes: Buffer.byteLength(worker.stdout),
+      stderrBytes: worker.stderrBytes,
+      stdoutBytes: worker.stdoutBytes,
+      stderrTail: worker.stderr,
+      stdoutTail: worker.stdout,
+      lastMessage: worker.lastMessage,
+      messages: Object.fromEntries(worker.counts),
+      error: worker.error && { name: worker.error.name, message: worker.error.message },
+      disconnectedAt: worker.disconnectedAt,
+      exitedAt: worker.exitedAt,
       unhandled: worker.messages.filter((m) => m.type === 'unhandled').length,
       receipts: worker.counts.get('receipt') ?? 0,
       watchdogExpired: closed === null || worker.killed,
@@ -3128,6 +3155,8 @@ class TelemetryChurn {
     this.closed = null
     this.failed = false
     this.cause = undefined
+    this.stage = 'setup'
+    this.failureStage = null
     this.stages = []
     this.rotations = []
     this.tickStarts = []
@@ -3149,6 +3178,7 @@ class TelemetryChurn {
     if (!this.failed) {
       this.failed = true
       this.cause = error
+      this.failureStage = this.stage
     }
     this.rejectAbort(error)
   }
@@ -3254,8 +3284,10 @@ class TelemetryChurn {
       this.fail(error)
     }
     timeline.boundaryAt ??= this.clock.now()
+    this.stage = 'cleanup'
     const shutdown = await this.shutdown(results)
     timeline.cleanupEndAt = this.clock.now()
+    this.stage = 'verification'
     try {
       this.lastResult = this.judge(results, shutdown, timeline, schedule)
     } catch (error) {
@@ -3333,12 +3365,14 @@ class TelemetryChurn {
         timeline.epochAt = this.clock.now()
         timeline.setupMs = timeline.epochAt - timeline.t0
         if (timeline.setupMs > SETUP_MS) throw new Error('The setup exceeded its budget')
+        this.stage = 'warmup'
         for (const kind of KINDS) this.processes.send(kind, { type: 'go' })
         const corpus = this.own(this.offerCorpus(timeline.epochAt, schedule))
         corpus.catch((error) => this.fail(error))
         await this.ticks(timeline.epochAt, schedule)
         await this.until(timeline.epochAt + warmupMs + measureMs)
         timeline.boundaryAt = this.clock.now()
+        this.stage = 'cleanup'
         await corpus
         for (const kind of KINDS) this.processes.send(kind, { type: 'finish' })
         const resultMs = cleanupBound - RESULT_RESERVE_MS
@@ -3385,6 +3419,7 @@ class TelemetryChurn {
   async ticks(epoch, schedule) {
     for (const tick of schedule.ticks) {
       await this.until(epoch + tick.at)
+      if (schedule.measured(tick)) this.stage = 'measurement'
       const beganAt = this.clock.now()
       const late = beganAt - (epoch + tick.at)
       if (late > LATE_MS) {
@@ -3617,7 +3652,7 @@ class TelemetryChurn {
           failures: partial.failures,
           result: { ok: false, outcome: 'failed', violations: ['incomplete worker evidence'] },
         })
-        this.record({ kind: 'natural-exit', clientKind: kind, ...(partial.exit ?? {}) })
+        this.record({ ...(partial.exit ?? {}), kind: 'natural-exit', clientKind: kind })
         violations.push(`${kind}: incomplete worker evidence`)
         continue
       }
@@ -3640,7 +3675,7 @@ class TelemetryChurn {
         input,
         result: evaluated,
       })
-      this.record({ kind: 'natural-exit', clientKind: result.kind, ...exit })
+      this.record({ ...exit, kind: 'natural-exit', clientKind: result.kind })
       if (!evaluated.ok)
         violations.push(
           `${result.kind}: ${[...evaluated.violations, ...(evaluated.inconclusive ?? [])].join(', ')}`
@@ -3717,7 +3752,9 @@ class TelemetryChurn {
         source: this.source,
         decoder: shutdown.decoder,
         parentMemory: shutdown.parentMemory,
-        workers: Object.fromEntries(workers.map((w) => [w.kind, w.facts])),
+        failureStage: this.failureStage,
+        processes: shutdown.exits,
+        workers: Object.fromEntries(workers.map((w) => [w.kind, w.facts ?? w])),
       },
     }
   }
@@ -3772,6 +3809,8 @@ class TelemetryChurn {
         handshakes: this.handshakes ?? [],
         source: this.source,
         parentMemory: this.parentMemory ?? [],
+        failureStage: this.failureStage,
+        processes: Object.fromEntries(workers.map((w) => [w.kind, w.exit])),
         workers: Object.fromEntries(workers.map((w) => [w.kind, w])),
       },
     }
@@ -3838,10 +3877,18 @@ class TelemetryWorkerProcess {
   }
 
   /**
-   * @param {object} message what to tell the parent @returns {void} named and token-bound
+   * @param {object} message what to tell the parent
+   * @param {object} [options] delivery options
+   * @param {boolean} [options.flush] wait for the IPC write before disconnecting the channel
+   * @returns {boolean|Promise<void>} the send status, or the completion of a requested flush
+   * @throws {Error} when the IPC channel cannot accept the message
    */
-  send(message) {
-    this.proc.send({ ...message, kind: this.kind, token: this.env[WORKER_TOKEN] })
+  send(message, { flush = false } = {}) {
+    const envelope = { ...message, kind: this.kind, token: this.env[WORKER_TOKEN] }
+    if (!flush) return this.proc.send(envelope)
+    return new Promise((resolve, reject) => {
+      this.proc.send(envelope, (error) => (error ? reject(error) : resolve()))
+    })
   }
 
   /** @returns {void} routes parent messages: decode answers settle their request, the rest wait */
@@ -4109,14 +4156,17 @@ class TelemetryWorkerProcess {
       this.send({ type: 'ready', uuid, clientId: `${config.stem}-${kind}` })
       await this.inbox.take((m) => m.type === 'start')
       verdict = await resources.as('fixture:sampler', () => soakRun.run())
-      this.send({
-        type: 'result',
-        clientId: `${config.stem}-${kind}`,
-        uuid,
-        verdict,
-        input,
-        facts: worker.facts(),
-      })
+      await this.send(
+        {
+          type: 'result',
+          clientId: `${config.stem}-${kind}`,
+          uuid,
+          verdict,
+          input,
+          facts: worker.facts(),
+        },
+        { flush: true }
+      )
     } catch (error) {
       failed = true
       failure = error
@@ -4132,25 +4182,29 @@ class TelemetryWorkerProcess {
       } catch (factError) {
         causes.push(factError)
       }
-      this.send({
-        type: 'failure',
-        facts,
-        native: { journal: journal.summary(), sampler: sampler.summary() },
-        failures: causes.map((cause) => ({
-          name: cause?.name ?? typeof cause,
-          message: String(cause?.message ?? cause).slice(0, 2048),
-        })),
-        message: causes
-          .map((c) => String(c?.message ?? c))
-          .join('; ')
-          .slice(0, 2048),
-      })
+      await this.send(
+        {
+          type: 'failure',
+          facts,
+          native: { journal: journal.summary(), sampler: sampler.summary() },
+          failures: causes.map((cause) => ({
+            name: cause?.name ?? typeof cause,
+            message: String(cause?.message ?? cause).slice(0, 2048),
+          })),
+          message: causes
+            .map((c) => String(c?.message ?? c))
+            .join('; ')
+            .slice(0, 2048),
+        },
+        { flush: true }
+      )
+    } finally {
+      sampler.stop()
+      journal.restoreAll()
+      memory.stop()
+      resources.stop()
+      if (proc.connected) proc.disconnect?.()
     }
-    sampler.stop()
-    journal.restoreAll()
-    memory.stop()
-    resources.stop()
-    proc.disconnect?.()
     if (failed) throw failure
     return verdict
   }
