@@ -1829,7 +1829,7 @@ describe('required live archive dimensions and semantics', () => {
   })
   /** @param {string} role Java kind @param {number} index window @returns {object[]} literal descriptors */
   const javaMetrics = (role, index) => [
-    common(role, true),
+    common(role === 'admin' ? 'admin.client' : role, true),
     ...['gauge.double', 'gauge.long', 'sum.total'].map((suffix) => ({
       name: `org.apache.kafka.tf1.custom.${suffix}`,
       unit: '',
@@ -2133,23 +2133,21 @@ describe('required live archive dimensions and semantics', () => {
             clientId: `required-java-${role}`,
             terminating: index === 2,
             truncated: false,
-            resourceMetricsCount: 1,
+            resourceMetricsCount: 4,
             metricsTotal: 4,
             metricsKept: 4,
             pointsTotal: 4,
-            resources: [
-              {
-                attrs:
-                  role === 'consumer'
-                    ? [
-                        ['group_id', 'string', 'required-java-consumer-group'],
-                        ['group_member_id', 'string', 'member'],
-                      ]
-                    : [],
-                droppedAttributes: 0,
-              },
-            ],
-            metrics: javaMetrics(role, index),
+            resources: Array.from({ length: 4 }, () => ({
+              attrs:
+                role === 'consumer'
+                  ? [
+                      ['group_id', 'string', 'required-java-consumer-group'],
+                      ['group_member_id', 'string', 'member'],
+                    ]
+                  : [],
+              droppedAttributes: 0,
+            })),
+            metrics: javaMetrics(role, index).map((metric, res) => ({ ...metric, res })),
           })
         )
     }

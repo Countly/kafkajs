@@ -312,8 +312,10 @@ class SubscriptionCases {
    * @param {function():Promise<void>} work scenario body run after verified creation
    * @returns {Promise<void>} after the resource is deleted and absence is read back
    */
-  withResource(entries, work) {
-    return withTelemetryResource(this.aux, { name: this.stem, entries }, work)
+  async withResource(entries, work) {
+    const receipt = await withTelemetryResource(this.aux, { name: this.stem, entries }, work)
+    const [owner] = Object.keys(this.attempt.observers)
+    this.attempt.record.results.subscriptionDeletions = { [owner]: receipt }
   }
 
   /**

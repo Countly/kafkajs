@@ -145,7 +145,7 @@ const assertJavaRows = (role, rows, { clientId, closing, closed, group, membersh
     rows.at(-1).tsMs >= closing.epochMs && rows.at(-1).tsMs <= closed.epochMs,
     'Final outside Java close episode'
   )
-  const counter = `org.apache.kafka.${role}.connection.creation.total`
+  const counter = `org.apache.kafka.${role === 'admin' ? 'admin.client' : role}.connection.creation.total`
   const names = [
     counter,
     ...['gauge.double', 'gauge.long', 'sum.total'].map((s) => `org.apache.kafka.tf1.custom.${s}`),
@@ -155,30 +155,34 @@ const assertJavaRows = (role, rows, { clientId, closing, closed, group, membersh
     assert.equal(row.truncated, false)
     assert.equal(row.clientId, clientId)
     assert.equal(row.pushIntervalMs, 1000)
-    assert.equal(row.resourceMetricsCount, 1)
+    assert.equal(row.resourceMetricsCount, 4)
     assert.equal(row.metricsTotal, 4)
     assert.equal(row.metricsKept, 4)
     assert.equal(row.pointsTotal, 4)
-    assert.equal(row.resources.length, 1)
-    assert.equal(row.resources[0].droppedAttributes, 0)
-    const attrs = row.resources[0].attrs
-    assert.equal(
-      new Set(attrs.map(([key]) => key)).size,
-      attrs.length,
-      'Duplicate Java resource key'
-    )
-    const expected = javaResources(role, group, membership, row.metrics[0].points[0].timeNs)
-    assert(
-      expected.some((catalogue) => {
-        try {
-          assert.deepEqual([...attrs].sort(), catalogue.sort())
-          return true
-        } catch {
-          return false
-        }
-      }),
-      'Unexpected Java resource catalogue'
-    )
+    assert.equal(row.resources.length, 4)
+    assert.deepEqual(row.metrics.map((metric) => metric.res).sort(), [0, 1, 2, 3])
+    for (const metric of row.metrics) {
+      const resource = row.resources[metric.res]
+      assert.equal(resource.droppedAttributes, 0)
+      const attrs = resource.attrs
+      assert.equal(
+        new Set(attrs.map(([key]) => key)).size,
+        attrs.length,
+        'Duplicate Java resource key'
+      )
+      const expected = javaResources(role, group, membership, metric.points[0].timeNs)
+      assert(
+        expected.some((catalogue) => {
+          try {
+            assert.deepEqual([...attrs].sort(), catalogue.sort())
+            return true
+          } catch {
+            return false
+          }
+        }),
+        'Unexpected Java resource catalogue'
+      )
+    }
     assert.deepEqual(
       row.metrics.map((metric) => metric.name).sort(),
       [...names].sort(),
@@ -187,7 +191,6 @@ const assertJavaRows = (role, rows, { clientId, closing, closed, group, membersh
     for (const metric of row.metrics) {
       assert.equal(metric.unit, '', 'Unexpected Java descriptor unit')
       assert.equal(metric.pointsInMessage, 1)
-      assert.equal(metric.res, 0)
       assert.equal(metric.points.length, 1)
       const [point] = metric.points
       assert.deepEqual(point.attrs, [])

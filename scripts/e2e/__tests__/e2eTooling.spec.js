@@ -1777,11 +1777,11 @@ describe('complete telemetry evidence controls', () => {
     truncated: false,
     terminating: final,
     tsMs: final ? 35 : later ? 20 : 10,
-    resourceMetricsCount: 1,
+    resourceMetricsCount: 4,
     metricsTotal: 4,
     metricsKept: 4,
     pointsTotal: 4,
-    resources: [{ attrs: [], droppedAttributes: 0 }],
+    resources: Array.from({ length: 4 }, () => ({ attrs: [], droppedAttributes: 0 })),
     metrics: [
       {
         name: 'org.apache.kafka.producer.connection.creation.total',
@@ -1831,10 +1831,10 @@ describe('complete telemetry evidence controls', () => {
           },
         ],
       },
-    ].map((m) => ({
+    ].map((m, res) => ({
       ...m,
       unit: '',
-      res: 0,
+      res,
       pointsInMessage: 1,
       points: m.points.map((p) => ({ ...p, flags: 0 })),
     })),
@@ -1850,6 +1850,15 @@ describe('complete telemetry evidence controls', () => {
     for (const mutate of [
       (r) => {
         r[1].metrics[1].points[0].asDouble = '41.0'
+      },
+      (r) => {
+        r[1].resources[2].attrs.push(['unexpected', 'string', 'value'])
+      },
+      (r) => {
+        r[1].resources[2].droppedAttributes = 1
+      },
+      (r) => {
+        r[1].metrics[2].res = 0
       },
       (r) => {
         r[1].metrics.shift()
