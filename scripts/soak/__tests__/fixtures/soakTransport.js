@@ -29,7 +29,38 @@ class SoakTransport {
     if (requestHeaderVersion(request.apiKey, request.apiVersion) === 2) header.writeTaggedFields()
     header.writeEncoder(await request.encode())
     socket.write(new Encoder().writeInt32(header.size()).writeEncoder(header).buffer)
-    const response = new Encoder().writeInt32(correlation).writeInt16(errorCode)
+    const response = new Encoder().writeInt32(correlation)
+    if (request.apiKey === 18) {
+      if (errorCode)
+        response.writeInt16(errorCode).writeInt32(1).writeInt16(18).writeInt16(0).writeInt16(4)
+      else
+        response.writeBuffer(
+          require('../../../../testHelpers/wire/apiVersionsV4').buildResponse({
+            apiKeys: [
+              [0, 9],
+              [1, 12],
+              [2, 7],
+              [3, 13],
+              [10, 6],
+              [16, 5],
+              [18, 4],
+              [19, 7],
+              [20, 6],
+              [22, 4],
+              [32, 4],
+              [42, 2],
+              [44, 1],
+              [60, 2],
+              [76, 1],
+              [77, 1],
+              [78, 2],
+              [79, 2],
+              [90, 1],
+            ].map(([apiKey, version]) => ({ apiKey, minVersion: version, maxVersion: version })),
+            finalizedFeatures: [{ name: 'share.version', minVersionLevel: 1, maxVersionLevel: 1 }],
+          })
+        )
+    } else response.writeInt16(errorCode)
     socket.emit('data', new Encoder().writeInt32(response.size()).writeEncoder(response).buffer)
   }
 
@@ -173,13 +204,22 @@ class SoakTransport {
    * @returns {Function} Observed reader with unchanged data.
    */
   reader(read) {
-    return this.client('raw', { readLog: read }, () =>
+    return this.client('raw', { readLog: read }, (_name, [options]) =>
       require('../../../../src/protocol/requests/fetch/v12/request')({
         replicaId: -1,
         maxWaitTime: 0,
         minBytes: 1,
         maxBytes: 1048576,
-        topics: [],
+        topics: [
+          {
+            topic: options.topic,
+            partitions: [0, 1, 2].map((partition) => ({
+              partition,
+              fetchOffset: '0',
+              maxBytes: 1048576,
+            })),
+          },
+        ],
       })
     ).readLog
   }
