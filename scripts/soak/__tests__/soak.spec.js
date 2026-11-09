@@ -7836,6 +7836,33 @@ describe('telemetry sampler ownership', () => {
     expect(c.soak.samples).toHaveLength(1)
   })
 
+  test('waits out an early timer wake before admitting a planned sample', async () => {
+    const c = controlled()
+    const settle = async () => {
+      for (let i = 0; i < 10; i++) await new Promise(setImmediate)
+    }
+    c.naps[0].wake()
+    await c.admitted.promise
+    c.held.resolve({ sockets: { open: 0 } })
+    await settle()
+    expect(c.naps[1].ms).toBe(20)
+    c.at(19)
+    c.naps[1].wake()
+    await settle()
+    expect(c.naps).toHaveLength(3)
+    expect(c.naps[2].ms).toBe(1)
+    expect(c.soak.samples).toHaveLength(1)
+    c.at(20)
+    c.naps[2].wake()
+    await settle()
+    expect(c.soak.samples).toHaveLength(2)
+    expect(c.soak.samples[1]).toMatchObject({ admittedPhaseMs: 20 })
+    expect(c.soak.skipped).toEqual([])
+    await c.soak.endSampling()
+    c.workload.resolve()
+    await c.running
+  })
+
   test('preserves a held read rejection when stopping and joins without another admission', async () => {
     const c = controlled()
     c.naps[0].wake()
