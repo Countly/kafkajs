@@ -62,7 +62,7 @@ jobs:
           - { node: 22, kafka: 4.3.1, group: others }
           - { node: 26, kafka: 4.3.1, group: broker }
           - { node: 26, kafka: 4.3.1, group: others }
-          - { node: 24, kafka: 4.3.1, group: share-base, timeout: 35 }
+          - { node: 24, kafka: 4.3.1, group: share-base, timeout: 55 }
           - { node: 24, kafka: 4.4.0, group: share-base, clients: 4.4.0 }
           - { node: 24, kafka: 4.3.1, group: share, compose: docker-compose.share.yml }
           - {
@@ -98,7 +98,7 @@ jobs:
         run: ./scripts/testWithKafka.sh "npm run test:group:${{ matrix.group }} -- --ci"
       - name: Run share soak (natural exit)
         if: matrix.group == 'share-base' && matrix.kafka == '4.3.1'
-        timeout-minutes: 18
+        timeout-minutes: 35
         env:
           KAFKAJS_LANE: docker
           KAFKAJS_DEBUG_PROTOCOL_BUFFERS: '1'

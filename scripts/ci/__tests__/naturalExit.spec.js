@@ -1,4 +1,5 @@
 const { runNaturalExit } = require('../naturalExit')
+const { primingReceiptHash } = require('../../evidence/sharePrimingLink')
 
 const SOAK_CASE = 'preserves share identities and resources through the short soak'
 const SHUTDOWN_CASES = [
@@ -8,12 +9,66 @@ const SHUTDOWN_CASES = [
 ]
 
 /**
+ * Adds the independently sealed first-use completion before the original scored cleanup row.
+ * Parent tests exercise completion linkage; complete source reconstruction has separate controls.
+ * @param {object[]} rows Original scored case rows.
+ * @returns {object[]} Serialized first-use linkage followed by original scored observations.
+ */
+const withPriming = (rows) => {
+  const prime = {
+    event: 'priming-complete',
+    scenario: 'prime',
+    scope: 'priming',
+    status: 'passed',
+    tainted: false,
+    schedule: { slotMs: 32000 },
+    profileMs: 960000,
+    elapsedProfileMs: 960000,
+    protocolSha256: 'a'.repeat(64),
+    timing: { startedAt: 0, workDue: 1010000, observedAt: 970000 },
+    cleanup: {
+      groupsAbsent: true,
+      topicsAbsent: true,
+      completedAt: 971000,
+      clock: { origin: 'hrtime', completedAt: 971000 },
+    },
+  }
+  const link = {
+    scenario: 'prime',
+    status: 'passed',
+    passes: 1,
+    cycles: 30,
+    resets: 10,
+    verifiers: 31,
+    completedAt: 970000,
+    boundaryAt: 971000,
+    receiptSha256: primingReceiptHash(prime),
+  }
+  return [
+    { event: 'priming-start', startedAt: 0, totalMs: 1020000, passes: 1, cycles: 30, resets: 10 },
+    prime,
+    { event: 'priming-boundary', priming: link },
+    ...rows.map((row) =>
+      row.event !== 'case-complete'
+        ? row
+        : {
+            ...row,
+            scenario: 'score',
+            scope: 'scored',
+            priming: link,
+            timing: { startedAt: 0, stages: [{ name: 'setup', startedAt: 972000 }] },
+          }
+    ),
+  ]
+}
+
+/**
  * Supplies only the OS boundary: the production parent still parses and validates the JSONL.
  * @param {'soak'|'shutdown'} lane CI lane.
  * @returns {object} Mutable original timestamps, child result, evidence and captured artifacts.
  */
 const fixture = (lane) => {
-  const totalMs = lane === 'soak' ? 1020000 : 120000
+  const totalMs = lane === 'soak' ? 2040000 : 120000
   const completedAt = 1000 + totalMs - 10000
   const cases = lane === 'soak' ? [SOAK_CASE] : SHUTDOWN_CASES
   const state = {
@@ -56,7 +111,12 @@ const fixture = (lane) => {
       readFile: (file, encoding) => {
         if (file !== `.tmp/e2e/share-${lane}.jsonl` || encoding !== 'utf8')
           throw new Error('Wrong evidence input')
-        return state.text ?? state.rows.map((row) => JSON.stringify(row)).join('\n') + '\n'
+        return (
+          state.text ??
+          (lane === 'soak' ? withPriming(state.rows) : state.rows)
+            .map((row) => JSON.stringify(row))
+            .join('\n') + '\n'
+        )
       },
       writeFile: (file, text) => artifacts.set(file, JSON.parse(text)),
     })
@@ -70,12 +130,12 @@ describe.each(['soak', 'shutdown'])('CI natural exit > %s', (lane) => {
 
     expect(run()).toMatchObject({
       startedAt: 1000,
-      exitedAt: lane === 'soak' ? 1021000 : 121000,
-      cleanupAt: lane === 'soak' ? 1011000 : 111000,
+      exitedAt: lane === 'soak' ? 2041000 : 121000,
+      cleanupAt: lane === 'soak' ? 2031000 : 111000,
       status: 0,
       signal: null,
       origin: 'hrtime',
-      totalMs: lane === 'soak' ? 1020000 : 120000,
+      totalMs: lane === 'soak' ? 2040000 : 120000,
       exitMs: 10000,
       watchdogTerminated: false,
     })
@@ -117,7 +177,7 @@ describe.each(['soak', 'shutdown'])('CI natural exit > %s', (lane) => {
         '--runTestsByPath',
         `src/consumer/share/__tests__/share${lane === 'soak' ? 'Soak' : 'Shutdown'}Live.spec.js`,
       ],
-      { stdio: 'inherit', timeout: lane === 'soak' ? 1020000 : 120000, killSignal: 'SIGKILL' }
+      { stdio: 'inherit', timeout: lane === 'soak' ? 2040000 : 120000, killSignal: 'SIGKILL' }
     )
   })
 
@@ -253,7 +313,7 @@ describe('CI natural exit > soak cleanup contract', () => {
       },
     ],
     ['unbound selector', { selector: undefined }],
-    ['old slot', { schedule: { slotMs: 16000, totalMs: 1020000 } }],
+    ['old slot', { schedule: { slotMs: 16000, totalMs: 2040000 } }],
     ['old total', { schedule: { slotMs: 32000, totalMs: 540000 } }],
   ])('rejects %s evidence', (_name, change) => {
     const { state, run } = fixture('soak')
@@ -323,4 +383,28 @@ test('rejects an unknown lane before spawning any child', () => {
   const spawn = jest.fn()
   expect(() => runNaturalExit('other', { spawn })).toThrow(/lane/)
   expect(spawn).not.toHaveBeenCalled()
+})
+
+describe('CI natural exit > sealed priming link', () => {
+  test.each([
+    'missing',
+    'duplicate',
+    'failed',
+    'false cleanup',
+    'wrong seal',
+    'late boundary',
+    'reordered',
+  ])('rejects %s first-use evidence without selecting its cleanup as scored cleanup', (damage) => {
+    const { state, run } = fixture('soak')
+    const rows = withPriming(state.rows)
+    if (damage === 'missing') rows.splice(1, 1)
+    if (damage === 'duplicate') rows.splice(1, 0, rows[1])
+    if (damage === 'failed') rows[1].status = 'failed'
+    if (damage === 'false cleanup') rows[1].cleanup.groupsAbsent = false
+    if (damage === 'wrong seal') rows.at(-1).priming.receiptSha256 = 'b'.repeat(64)
+    if (damage === 'late boundary') rows.at(-1).priming.boundaryAt = 1020001
+    if (damage === 'reordered') [rows[1], rows[2]] = [rows[2], rows[1]]
+    state.text = rows.map((row) => JSON.stringify(row)).join('\n')
+    expect(run).toThrow(/priming cleanup evidence/)
+  })
 })

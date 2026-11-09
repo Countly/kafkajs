@@ -1762,7 +1762,7 @@ const shareScreenRun = () => {
   })
   const phases = ['share-steady', 'share-reset', 'share-members']
   return {
-    baseline: quietShare(),
+    baseline: { ...quietShare(), heapAtMs: 0 },
     warmupMs: 10000,
     samples: phases.flatMap((phase, index) =>
       Array.from({ length: 6 }, (_, i) => ({
@@ -1771,8 +1771,11 @@ const shareScreenRun = () => {
         snapshot: quietShare(10000000 + index * 10000000),
       }))
     ),
-    phaseEnds: phases.map((phase) => ({ phase, snapshot: quietShare() })),
-    teardown: quietShare(),
+    phaseEnds: phases.map((phase, index) => ({
+      phase,
+      snapshot: { ...quietShare(), heapAtMs: (index + 1) * 320000 },
+    })),
+    teardown: { ...quietShare(), heapAtMs: 970000 },
   }
 }
 
@@ -1787,6 +1790,7 @@ describe('Share soak resource screen', () => {
       fullMs: 1920000,
       endpointBytes: 2097152,
       slopeBytesPerMinute: 262144,
+      quietSlopeBytesPerMinute: 98304,
     })
   })
 
@@ -1964,6 +1968,255 @@ describe('Share soak resource screen', () => {
   })
 })
 
+/**
+ * Builds complete periodic evidence over the declared scored spans, with a common quiet set.
+ * @param {{ short?: boolean, rate: number, firstUseBytes?: number }} options elapsed growth in B/min
+ * @returns {object} original-source-shaped quiet and active observations with distinct working sets
+ */
+const retainedShareRun = ({ short = true, rate, firstUseBytes = 0 }) => {
+  const run = shareScreenRun()
+  const mode = short ? 'short' : 'full'
+  const phaseMs = (short ? SHARE_SOAK.shortMs : SHARE_SOAK.fullMs) / 3
+  const retained = (atMs) => 10000000 + firstUseBytes + (rate * atMs) / 60000
+  // Integral heap bytes on a 1/32-minute grid; phase work retains its declared span.
+  const observationTime = (atMs) => Math.ceil(atMs / 1875) * 1875
+  let startedAt = 0
+  run.samples = run.phaseEnds.flatMap(({ phase, snapshot: end }, index) => {
+    const start = startedAt
+    const samples = Array.from(
+      { length: Math.floor(phaseMs / SHARE_SOAK.sampleMs[mode]) - 1 },
+      (_, i) => {
+        const atMs = observationTime(start + (i + 1) * SHARE_SOAK.sampleMs[mode])
+        return {
+          phase,
+          phaseMs: atMs - start,
+          atMs,
+          snapshot: {
+            ...run.baseline,
+            heapAtMs: atMs,
+            heapUsed: retained(atMs) + index * 12000000,
+          },
+        }
+      }
+    )
+    end.heapAtMs = observationTime(start + phaseMs + SHARE_SOAK.settleMs)
+    end.heapUsed = retained(end.heapAtMs)
+    startedAt = end.heapAtMs
+    return samples
+  })
+  run.teardown.heapAtMs = observationTime(startedAt + SHARE_SOAK.settleMs)
+  run.teardown.heapUsed = retained(run.teardown.heapAtMs)
+  return run
+}
+
+describe('Share quiet heap slope', () => {
+  const failure = 'phase-end quiet heap slope screen'
+
+  test.each([true, false])('detects sustained 128 KiB/min, short=%s', (short) => {
+    const result = ShareSoakScreen.evaluate(retainedShareRun({ short, rate: 128 * 1024 }))
+    expect(result.measured.quietSlope.bytesPerMinute).toBe(131072)
+    expect(result.violations).toContain(failure)
+    expect(
+      result.measured.phases.every(
+        ({ slopeBytesPerMinute, endpointBytes }) =>
+          slopeBytesPerMinute < 262144 && endpointBytes < 2097152
+      )
+    ).toBe(true)
+    expect(result.violations).toEqual(short ? [failure] : ['phase-end quiet heap screen', failure])
+  })
+
+  test.each([true, false])('rejects 256 and above 256 KiB/min, short=%s', (short) => {
+    for (const rate of [256 * 1024, 384 * 1024]) {
+      const result = ShareSoakScreen.evaluate(retainedShareRun({ short, rate }))
+      expect(result.measured.quietSlope.bytesPerMinute).toBe(rate)
+      expect(result.violations).toContain(failure)
+      if (rate > 262144)
+        expect(result.violations).toEqual(
+          expect.arrayContaining(
+            SHARE_SOAK.phases.map((phase) => `share-${phase}: retained-heap screen`)
+          )
+        )
+    }
+  })
+
+  test.each([true, false])('a first-use constant step cannot change the fit, short=%s', (short) => {
+    const plain = ShareSoakScreen.evaluate(retainedShareRun({ short, rate: 131072 }))
+    const stepped = ShareSoakScreen.evaluate(
+      retainedShareRun({ short, rate: 131072, firstUseBytes: 8000000 })
+    )
+    expect(stepped.measured.quietSlope.bytesPerMinute).toBe(
+      plain.measured.quietSlope.bytesPerMinute
+    )
+    expect(stepped.violations).toContain(failure)
+  })
+
+  test('keeps first-phase periodic growth failing when all later quiet heaps plateau', () => {
+    const run = retainedShareRun({ rate: 384 * 1024 })
+    const plateau = run.phaseEnds[0].snapshot.heapUsed
+    run.phaseEnds.forEach(({ snapshot }) => {
+      snapshot.heapUsed = plateau
+    })
+    run.teardown.heapUsed = plateau
+    run.samples
+      .filter(({ phase }) => phase !== 'share-steady')
+      .forEach(({ snapshot }) => {
+        snapshot.heapUsed = plateau
+      })
+    const result = ShareSoakScreen.evaluate(run)
+    expect(result.measured.quietSlope.bytesPerMinute).toBe(0)
+    expect(result.violations).toEqual(['share-steady: retained-heap screen'])
+  })
+
+  test.each([0, -98304, 98304])(
+    'accepts %s B/min at irregular, translated elapsed times',
+    (rate) => {
+      const run = shareScreenRun()
+      const shift = 1234560000
+      run.baseline.heapAtMs = shift
+      run.phaseEnds.forEach(({ snapshot }, i) => {
+        const minutes = [1, 3, 8][i]
+        snapshot.heapAtMs = shift + minutes * 60000
+        snapshot.heapUsed = 10000000 + rate * minutes
+      })
+      run.teardown.heapAtMs = shift + 9 * 60000
+      const result = ShareSoakScreen.evaluate(run)
+      expect(result.ok).toBe(true)
+      expect(result.measured.quietSlope.bytesPerMinute).toBe(rate)
+    }
+  )
+
+  test('compares an above-bound fractional slope without rounding', () => {
+    const run = shareScreenRun()
+    run.phaseEnds.forEach(({ snapshot }, i) => {
+      const minutes = [1, 3, 8][i]
+      snapshot.heapAtMs = minutes * 60000
+      snapshot.heapUsed = 10000000 + 98304 * minutes + (i === 2 ? 1 : 0)
+    })
+    const result = ShareSoakScreen.evaluate(run)
+    const rate = result.measured.quietSlope.bytesPerMinute
+    expect(rate).toBeGreaterThan(98304)
+    expect(Math.round(rate)).toBe(98304)
+    expect(result.violations).toEqual([failure])
+    expect(result.measured.quietSlope.points).toEqual(
+      run.phaseEnds.map(({ phase, snapshot }) => ({
+        phase,
+        heapAtMs: snapshot.heapAtMs,
+        heapUsed: snapshot.heapUsed,
+      }))
+    )
+  })
+
+  test.each([undefined, null, NaN, Infinity, -Infinity, -1, '320000'])(
+    'rejects invalid observation time %s at every quiet point',
+    (time) => {
+      for (let index = 0; index < 5; index++) {
+        const run = shareScreenRun()
+        const points = [
+          run.baseline,
+          ...run.phaseEnds.map(({ snapshot }) => snapshot),
+          run.teardown,
+        ]
+        points[index].heapAtMs = time
+        const result = ShareSoakScreen.evaluate(run)
+        expect(result.violations).toContain(failure)
+        expect(result.measured.quietSlope.bytesPerMinute).toBeNull()
+        expect(result.measured.quietSlope.points).toHaveLength(3)
+      }
+    }
+  )
+
+  test.each([undefined, null, NaN, Infinity, -1, 0.5, Number.MAX_SAFE_INTEGER + 1])(
+    'rejects invalid heap source %s at every quiet point',
+    (heap) => {
+      for (let index = 0; index < 5; index++) {
+        const run = shareScreenRun()
+        const points = [
+          run.baseline,
+          ...run.phaseEnds.map(({ snapshot }) => snapshot),
+          run.teardown,
+        ]
+        points[index].heapUsed = heap
+        const result = ShareSoakScreen.evaluate(run)
+        expect(result.violations).toContain(failure)
+        expect(result.measured.quietSlope.bytesPerMinute).toBeNull()
+      }
+    }
+  )
+
+  test.each([0, -1])(
+    'rejects duplicate or reversed adjacent observation times, delta=%s',
+    (delta) => {
+      for (let index = 1; index < 5; index++) {
+        const run = shareScreenRun()
+        const points = [
+          run.baseline,
+          ...run.phaseEnds.map(({ snapshot }) => snapshot),
+          run.teardown,
+        ]
+        points[index].heapAtMs = points[index - 1].heapAtMs + delta
+        const result = ShareSoakScreen.evaluate(run)
+        expect(result.violations).toContain(failure)
+        expect(result.measured.quietSlope.bytesPerMinute).toBeNull()
+      }
+    }
+  )
+
+  test.each(['missing', 'duplicate', 'reordered', 'wrong name', 'absent source'])(
+    'rejects %s phase ends',
+    (damage) => {
+      const run = shareScreenRun()
+      if (damage === 'missing') run.phaseEnds.pop()
+      if (damage === 'duplicate') run.phaseEnds.push(run.phaseEnds[2])
+      if (damage === 'reordered') run.phaseEnds.reverse()
+      if (damage === 'wrong name') run.phaseEnds[1].phase = 'share-steady'
+      if (damage === 'absent source') delete run.phaseEnds[1].snapshot
+      const result = ShareSoakScreen.evaluate(run)
+      expect(result.violations).toContain(failure)
+      expect(result.measured.quietSlope.bytesPerMinute).toBeNull()
+    }
+  )
+
+  test('keeps teardown endpoint and resource failures independent of a flat quiet slope', () => {
+    const run = shareScreenRun()
+    run.baseline.heapUsed = 1
+    run.teardown.heapUsed = run.phaseEnds[0].snapshot.heapUsed + 2097153
+    run.teardown.shareRecords = 1
+    const result = ShareSoakScreen.evaluate(run)
+    expect(result.measured.quietSlope.bytesPerMinute).toBe(0)
+    expect(result.violations).toContain('phase-end quiet heap screen')
+    expect(result.violations).toContain('teardown: resources differ or a source is absent')
+    expect(result.violations).not.toContain(failure)
+  })
+
+  test.each(require('./fixtures/shareHeapReplays.json'))(
+    'replays frozen screen inputs $sha256',
+    (receipt) => {
+      const { run, measured } = receipt
+      const result = ShareSoakScreen.evaluate(run)
+      const compact = {
+        ...run,
+        samples: run.samples.map((sample) => ({
+          ...sample,
+          snapshot: {
+            heapUsed: sample.snapshot.heapUsed,
+            shareRecords: sample.snapshot.shareRecords,
+            shareRanges: sample.snapshot.shareRanges,
+            shareSessions: sample.snapshot.shareSessions,
+          },
+        })),
+      }
+      expect(ShareSoakScreen.evaluate(compact)).toEqual(result)
+      expect(result.measured.phases).toEqual(measured.phases)
+      expect(result.measured.quietHeap).toEqual(measured.quietHeap)
+      expect(result.violations).toEqual(['share-steady: retained-heap screen', failure])
+      expect(result.measured.quietSlope.bytesPerMinute).toBeNull()
+      expect(result.measured.quietSlope.points.every(({ heapAtMs }) => heapAtMs === null)).toBe(
+        true
+      )
+    }
+  )
+})
+
 describe('Share soak profiles', () => {
   const OLD_PROFILES = {
     idle: [['idle', 'idle', 420000]],
@@ -2028,18 +2281,20 @@ describe('Share soak profiles', () => {
 
   test.each(['short', 'full'])('the %s budget holds its stages and its cycles', (mode) => {
     const budget = SHARE_SOAK.budgets[mode]
-    const { setupMs, profileMs, transitionMs, cleanupMs, exitMs, totalMs } = budget
+    const { primingMs, setupMs, profileMs, transitionMs, cleanupMs, exitMs, totalMs } = budget
     expect(setupMs + profileMs + transitionMs + cleanupMs + exitMs).toBeLessThanOrEqual(totalMs)
     expect(profileMs).toBe(mode === 'short' ? SHARE_SOAK.shortMs : SHARE_SOAK.fullMs)
     expect(SHARE_SOAK.cycles * SHARE_SOAK.slotMs[mode]).toBe(profileMs)
     const phaseMs = profileMs / SHARE_SOAK.phases.length
     const readings = Math.floor((phaseMs - SHARE_SOAK.warmupMs) / SHARE_SOAK.sampleMs[mode])
     expect(readings).toBeGreaterThanOrEqual(6)
-    expect(totalMs).toBe(mode === 'short' ? 1020000 : 1980000)
-    expect(totalMs - profileMs).toBe(60000)
-    expect(totalMs - (setupMs + profileMs + transitionMs + cleanupMs + exitMs)).toBe(10000)
+    expect(totalMs).toBe(mode === 'short' ? 2040000 : 3000000)
+    expect(totalMs - primingMs - profileMs).toBe(60000)
+    expect(totalMs - (primingMs + setupMs + profileMs + transitionMs + cleanupMs + exitMs)).toBe(
+      10000
+    )
     expect(budget.watchdogMs).toBe(totalMs)
-    expect(budget.lifecycleMs).toBe(mode === 'short' ? 1440000 : 2400000)
+    expect(budget.lifecycleMs).toBe(mode === 'short' ? 2460000 : 3420000)
     expect(budget.lifecycleMs - totalMs).toBe(420000)
   })
 })
@@ -2465,295 +2720,16 @@ describe('Share soak ShareFetch tap', () => {
   })
 })
 
-const TOPIC_NAME = 'soak-share-spec'
-
-/** Every identity of one cycle, as the producer acknowledged it. */
-const cycleIdentities = (plan) => {
-  const next = [0, 0, 0]
-  return plan.records.map((record) => ({
-    partition: record.partition,
-    identity: shareRecordIdentity({
-      topic: TOPIC_NAME,
-      partition: record.partition,
-      offset: String(plan.first + BigInt(next[record.partition]++)),
-      key: Buffer.from(record.key),
-      value: Buffer.from(record.value),
-    }),
-  }))
-}
-
-/** What a correct cycle observes, including the held set and replays of a reset cycle. */
-const SOAK_UUID = '00000000-0000-4000-8000-000000000001'
-
-/** Primitive original request/response observations for one successful acquisition. */
-const exchangeFacts = (id, partition, acquiredRecords) => ({
-  id,
-  apiKey: 78,
-  groupId: 'soak-group',
-  memberId: 'member-A',
-  endpoint: 'node:1',
-  open: 1,
-  pool: 1,
-  generation: 1,
-  responseIdentity: id,
-  tickets: [],
-  request: {},
-  frames: [
-    {
-      id,
-      socket: 1,
-      correlationId: id,
-      apiKey: 78,
-      apiVersion: 2,
-      endpoint: 'node:1',
-      bytes: 'request',
-      responseBytes: 'response',
-      request: {
-        groupId: 'soak-group',
-        memberId: 'member-A',
-        topics: [
-          {
-            topicId: SOAK_UUID,
-            partitions: [{ partitionIndex: partition, acknowledgementBatches: [] }],
-          },
-        ],
-      },
-    },
-  ],
-  response: {
-    errorCode: 0,
-    responses: [
-      {
-        topicId: SOAK_UUID,
-        partitions: [
-          { partitionIndex: partition, errorCode: 0, acknowledgeErrorCode: 0, acquiredRecords },
-        ],
-      },
-    ],
-  },
-})
-
-/** Encodes independent primitive request/answer bytes after the scripted exchange is assembled. */
-const sealExchange = (exchange) => {
-  const frame = exchange.frames[0]
-  const request = frame.request
-  const body = new Encoder()
-    .writeUVarIntString(request.groupId)
-    .writeUVarIntString(request.memberId)
-    .writeInt32(request.shareSessionEpoch ?? 0)
-    .writeInt32(250)
-    .writeInt32(1)
-    .writeInt32(1048576)
-    .writeInt32(100)
-    .writeInt32(0)
-    .writeInt8(1)
-    .writeBoolean(false)
-    .writeUVarIntArray(
-      request.topics.map((topic) =>
-        new Encoder()
-          .writeUuid(topic.topicId)
-          .writeUVarIntArray(
-            topic.partitions.map((partition) =>
-              new Encoder()
-                .writeInt32(partition.partitionIndex)
-                .writeUVarIntArray(
-                  partition.acknowledgementBatches.map((batch) =>
-                    new Encoder()
-                      .writeInt64(batch.firstOffset)
-                      .writeInt64(batch.lastOffset)
-                      .writeUVarIntArray(
-                        batch.acknowledgeTypes.map((type) => new Encoder().writeInt8(type))
-                      )
-                      .writeTaggedFields([])
-                  )
-                )
-                .writeTaggedFields([])
-            )
-          )
-          .writeTaggedFields([])
-      )
-    )
-    .writeUVarIntArray(
-      (request.forgottenTopicsData ?? []).map(({ topicId, partitions }) =>
-        new Encoder()
-          .writeUuid(topicId)
-          .writeUVarIntArray(partitions.map((partition) => new Encoder().writeInt32(partition)))
-          .writeTaggedFields([])
-      )
-    )
-    .writeTaggedFields([])
-  const header = new Encoder()
-    .writeInt16(78)
-    .writeInt16(2)
-    .writeInt32(frame.correlationId)
-    .writeString('soak')
-    .writeTaggedFields([])
-  const bytes = Buffer.concat([header.buffer, body.buffer])
-  frame.bytes = new Encoder().writeInt32(bytes.length).writeBuffer(bytes).buffer.toString('base64')
-  frame.request = require('../../../testHelpers/wire/shareFetchV2').readRequest(body.buffer)
-  const response = require('../../../testHelpers/wire/shareFetchV2').buildResponse({
-    errorCode: exchange.response.errorCode,
-    responses: exchange.response.responses.map((topic) => ({
-      ...topic,
-      partitions: topic.partitions.map((partition) => ({
-        ...partition,
-        errorMessage: null,
-        acknowledgeErrorMessage: null,
-        currentLeader: { leaderId: -1, leaderEpoch: -1 },
-        records: '',
-      })),
-    })),
-    nodeEndpoints: [],
-  })
-  const inner = new Encoder()
-    .writeInt32(frame.correlationId)
-    .writeTaggedFields([])
-    .writeBuffer(response)
-  frame.responseBytes = new Encoder()
-    .writeInt32(inner.buffer.length)
-    .writeBuffer(inner.buffer)
-    .buffer.toString('base64')
-  return exchange
-}
-
-/**
- * Independent heartbeat request bytes, including the original socket correlation header.
- * @param {object} request Original group/member/epoch fields.
- * @param {number} correlationId Socket correlation.
- * @returns {Buffer} Complete request frame.
- */
-const heartbeatBytes = (request, correlationId) => {
-  const bytes = new Encoder()
-    .writeInt16(76)
-    .writeInt16(1)
-    .writeInt32(correlationId)
-    .writeString('soak')
-    .writeTaggedFields([])
-    .writeUVarIntString(request.groupId)
-    .writeUVarIntString(request.memberId)
-    .writeInt32(request.memberEpoch)
-    .writeUVarIntString(null)
-    .writeUVarIntArray(null)
-    .writeTaggedFields([])
-  return new Encoder().writeInt32(bytes.size()).writeEncoder(bytes).buffer
-}
-
-/**
- * A matched original leave exchange for the pure reconstruction controls.
- * @param {string} memberId Original cycle member.
- * @param {number} at Original invocation/write/answer timestamp.
- * @param {number} socket Original socket identity and correlation.
- * @returns {object} Heartbeat invocation with matched request and response bytes.
- */
-const leaveFacts = (memberId, at, socket) => {
-  const request = { groupId: 'soak-group', memberId, memberEpoch: -1 }
-  const response = { errorCode: 0, memberId, memberEpoch: -1, assignment: null }
-  const body = require('../../../testHelpers/wire/shareGroupHeartbeatV1').buildResponse(response)
-  const answer = new Encoder().writeInt32(socket).writeTaggedFields([]).writeBuffer(body)
-  return {
-    ...request,
-    endpoint: 'node:1',
-    at,
-    request,
-    answeredAt: at,
-    response,
-    frames: [
-      {
-        id: socket,
-        apiKey: 76,
-        apiVersion: 1,
-        correlationId: socket,
-        socket,
-        endpoint: 'node:1',
-        at,
-        answeredAt: at,
-        request: { ...request, rackId: null, subscribedTopicNames: null },
-        bytes: heartbeatBytes(request, socket).toString('base64'),
-        responseBytes: new Encoder()
-          .writeInt32(answer.size())
-          .writeEncoder(answer)
-          .buffer.toString('base64'),
-      },
-    ],
-  }
-}
-
-/** Both actual listing forms and independent ends, kept separate from normalized rows. */
-const positionFacts = (plan) => {
-  const partitions = [0, 1, 2].map((partition) => ({ partition, floor: '0', end: plan.end }))
-  const listing = [
-    {
-      topic: TOPIC_NAME,
-      topicId: SOAK_UUID,
-      partitions: partitions.map(({ partition }) => ({
-        partition,
-        startOffset: '0',
-        lag: '0',
-        errorCode: 0,
-        leaderEpoch: 1,
-      })),
-    },
-  ]
-  return {
-    target: { groupId: 'soak-group', topic: TOPIC_NAME, partitions },
-    named: JSON.parse(JSON.stringify(listing)),
-    all: JSON.parse(JSON.stringify(listing)),
-    topicId: SOAK_UUID,
-    ends: partitions.map(({ partition, end }) => ({ partition, high: end })),
-  }
-}
-
-/** Measured assigned interval, with an actual in-window ShareFetch and joined leave. */
-const verifierFacts = (cycle = 0, base = cycle * 32000 + 1000, kind = 'cycle') => {
-  const memberId = `verifier-${kind}-${cycle}`
-  const exchanges = [0, 1, 2].map((partition) => {
-    const exchange = exchangeFacts(9000 + partition, partition, [])
-    exchange.memberId = memberId
-    Object.assign(exchange.frames[0], { at: base + 100, answeredAt: base + 200 })
-    exchange.frames[0].request.memberId = memberId
-    return sealExchange(exchange)
-  })
-  return {
-    active: true,
-    cycle,
-    kind,
-    groupId: 'soak-group',
-    topic: TOPIC_NAME,
-    topicId: SOAK_UUID,
-    memberId,
-    windowMs: 5000,
-    openedAt: base - 100,
-    closedAt: base + 5100,
-    delivered: [],
-    provenance: { exchanges },
-    events: [
-      { kind: 'GROUP_JOIN', at: base - 50, payload: { memberId, groupId: 'soak-group' } },
-      {
-        kind: 'window-start',
-        at: base,
-        wallAt: base + 10000,
-        payload: [{ topic: TOPIC_NAME, partitions: [0, 1, 2] }],
-      },
-      ...exchanges.map(({ frames: [frame] }) => ({
-        kind: 'REQUEST',
-        at: base + 250,
-        payload: {
-          apiName: 'ShareFetch',
-          sentAt: base + 10100,
-          correlationId: frame.correlationId,
-          broker: frame.endpoint,
-        },
-      })),
-      {
-        kind: 'window-end',
-        at: base + 5000,
-        wallAt: base + 15000,
-        payload: [{ topic: TOPIC_NAME, partitions: [0, 1, 2] }],
-      },
-      { kind: 'DISCONNECT', at: base + 5100, payload: {} },
-    ],
-  }
-}
+const {
+  TOPIC_NAME,
+  SOAK_UUID,
+  exchangeFacts,
+  sealExchange,
+  heartbeatBytes,
+  positionFacts,
+  verifierFacts,
+  cycleFacts,
+} = require('./fixtures/shareCycleFacts')
 
 /** Three established sessions followed by empty incremental responses across a measured window. */
 const incrementalVerifierFacts = () => {
@@ -2900,143 +2876,6 @@ const incrementalVerifierFacts = () => {
     { kind: 'DISCONNECT', at: 43868, payload: {} },
   ].sort((a, b) => a.at - b.at)
   return verifier
-}
-
-const cycleFacts = (
-  cycle,
-  { startedAt = cycle * 32000, due = startedAt + 32000, kind = 'cycle' } = {}
-) => {
-  const plan = ShareCycleOracle.plan(cycle)
-  const produced = cycleIdentities(plan)
-  const identities = produced.map(({ identity }) => identity)
-  const last = plan.first + BigInt(plan.perPartition) - 1n
-  const held = plan.reset
-    ? produced.filter(({ partition }) => partition === 0).map(({ identity }) => identity)
-    : []
-  const facts = {
-    produced,
-    log: [...identities],
-    logs: Object.fromEntries(
-      [0, 1, 2].map((partition) => [partition, { end: plan.end, count: Number(plan.end) }])
-    ),
-    handler: [
-      ...identities.map((identity) => ({ identity, deliveryCount: 1 })),
-      ...held.map((identity) => ({ identity, deliveryCount: 2 })),
-    ],
-    held,
-    accepted: [0, 1, 2].map((partition) => ({
-      topic: TOPIC_NAME,
-      partition,
-      firstOffset: String(plan.first),
-      lastOffset: String(last),
-    })),
-    broker: [0, 1, 2].map((partition) => ({
-      partition,
-      startOffset: '0',
-      logEnd: plan.end,
-      lag: '0',
-      errorCode: 0,
-    })),
-    members: {
-      aJoined: true,
-      aLeft: true,
-      bAdded: true,
-      bRemoved: true,
-      bRemovedAt: startedAt + (kind === 'final' ? -200 : 100),
-      aLeftAt: startedAt + (kind === 'final' ? -100 : 200),
-      emptyAt: startedAt + 500,
-    },
-    timing: { cycle, kind, startedAt, completedAt: startedAt + 6300, due },
-    reset: plan.reset
-      ? {
-          apiKey: 78,
-          nodeId: 1,
-          reason: 'connection',
-          oldSocket: 3,
-          oldEpoch: 4,
-          nextSocket: 7,
-          nextEpoch: 0,
-        }
-      : null,
-    verifier: verifierFacts(cycle, startedAt + 1000, kind),
-    clientsDisconnected: true,
-    positions: [
-      {
-        ...positionFacts(plan),
-        cycle,
-        kind,
-        startedAt: startedAt + 300,
-        completedAt: startedAt + 400,
-      },
-      {
-        ...positionFacts(plan),
-        cycle,
-        kind,
-        startedAt: startedAt + 6200,
-        completedAt: startedAt + 6300,
-      },
-    ],
-  }
-  facts.acknowledgedPrefix = Array.from({ length: cycle + 1 }, (_, i) =>
-    cycleIdentities(ShareCycleOracle.plan(i))
-  )
-    .flat()
-    .map(({ identity }) => identity)
-  facts.prefix = [...facts.acknowledgedPrefix]
-  const provenance = { exchanges: [], acquisitions: [], outcomes: [], retirements: [] }
-  for (const [index, entry] of facts.handler.entries()) {
-    const [, partition, offset] = JSON.parse(entry.identity)
-    const acquisition = index + 1
-    entry.acquisition = acquisition
-    entry.dispatch = acquisition
-    const range = { firstOffset: offset, lastOffset: offset, deliveryCount: entry.deliveryCount }
-    const row = {
-      id: acquisition,
-      exchange: acquisition,
-      topic: TOPIC_NAME,
-      topicId: SOAK_UUID,
-      partition,
-      acquiredRecords: [range],
-    }
-    const exchange = exchangeFacts(acquisition, partition, [range])
-    provenance.acquisitions.push(row)
-    provenance.exchanges.push(exchange)
-  }
-  facts.accepted = []
-  for (const [index, entry] of facts.handler.entries()) {
-    if (facts.handler.slice(index + 1).some((other) => other.identity === entry.identity)) continue
-    const [, partition, offset] = JSON.parse(entry.identity)
-    const acquisition = entry.acquisition
-    const source = provenance.exchanges.find(({ id }) => id === acquisition)
-    const batch = { firstOffset: offset, lastOffset: offset, acknowledgeTypes: [1] }
-    const exchange = exchangeFacts(1000 + index, partition, [])
-    exchange.open = source.open
-    exchange.tickets = [{ acquisition, ticket: index, isRenewAck: false, batches: [batch] }]
-    exchange.frames[0].request.topics[0].partitions[0].acknowledgementBatches = [batch]
-    provenance.exchanges.push(exchange)
-    const result = {
-      acquisition,
-      topic: TOPIC_NAME,
-      partition,
-      firstOffset: offset,
-      lastOffset: offset,
-      type: 'accept',
-      error: null,
-    }
-    provenance.outcomes.push(result)
-    facts.accepted.push({ topic: TOPIC_NAME, partition, firstOffset: offset, lastOffset: offset })
-  }
-  provenance.exchanges.forEach(sealExchange)
-  provenance.heartbeats = [
-    leaveFacts('member-B', facts.members.bRemovedAt, 101),
-    leaveFacts('member-A', facts.members.aLeftAt, 102),
-  ]
-  facts.memberObservations = [
-    { member: 'A', memberId: 'member-A' },
-    { member: 'B', memberId: 'member-B' },
-  ]
-  facts.provenance = provenance
-  return facts
 }
 
 describe('Share soak cycle oracle', () => {
@@ -3444,6 +3283,9 @@ describe('Share soak owner', () => {
       slotMs,
       soak: { sampleMs: 1000, warmupMs: 0, settleMs: 1, judge: () => settled, ...soak },
     })
+    owner.prime = async () => {
+      owner.priming = { status: 'passed', topic: 'primed', groupId: 'primed', topicId: 'primed' }
+    }
     return { owner, driver, rows, shares, gate }
   }
 
@@ -3619,6 +3461,7 @@ describe('Share soak owner', () => {
       const archived = rows.filter(({ kind }) => kind === 'sample')
       expect(archived.length).toBeGreaterThanOrEqual(6)
       expect(soak.samples).toHaveLength(archived.length)
+      expect(archived.every(({ snapshot }) => Number.isFinite(snapshot.heapAtMs))).toBe(true)
       for (const [i, sample] of soak.samples.entries()) {
         expect(sample).toEqual({
           phase: archived[i].phase,
@@ -3660,6 +3503,48 @@ describe('Share soak owner', () => {
       observer.restore()
       await owner.close()
     }
+  })
+
+  test('archives observation times from the translated original owner clock, including a failed verdict', async () => {
+    const origin = 7654321
+    let now = origin
+    const elapsed = [17, 343711, 691553, 1021727, 1023819]
+    const { owner, rows, shares } = build({ clock: { now: () => now } })
+    owner.startedAt = origin
+    let reading = 0
+    shares.snapshot = async () => {
+      now = origin + elapsed[reading++]
+      await Promise.resolve()
+      return { ...quietShare(), heapUsed: 10000000 + reading * 2000000 }
+    }
+    const soak = owner.soak()
+    soak.phases = SHARE_SOAK.phases.map((phase) => ({
+      name: `share-${phase}`,
+      workload: 'observed',
+      ms: 1,
+    }))
+    soak.workloads = { observed: async () => {} }
+    soak.transition = (work) => work()
+    soak.beforeTeardown = async () => {}
+    soak.settleMs = 0
+    soak.judge = ShareSoakScreen.evaluate
+    const result = await soak.run()
+    const observations = rows.filter(({ kind }) =>
+      ['baseline', 'phase-end', 'teardown'].includes(kind)
+    )
+    expect(observations.map(({ snapshot }) => snapshot.heapAtMs)).toEqual(elapsed)
+    expect(owner.startedAt).toBe(origin)
+    expect(result.ok).toBe(false)
+    expect(result.violations).toContain('phase-end quiet heap slope screen')
+    expect(rows.find(({ kind }) => kind === 'resource-verdict').measured.quietSlope).toEqual({
+      points: observations.slice(1, 4).map(({ phase, snapshot }) => ({
+        phase,
+        heapAtMs: snapshot.heapAtMs,
+        heapUsed: snapshot.heapUsed,
+      })),
+      bytesPerMinute: result.measured.quietSlope.bytesPerMinute,
+    })
+    expect(result.measured.quietSlope.bytesPerMinute).toBeGreaterThan(98304)
   })
 
   test('judges the run with the per-phase screen by default', () => {
@@ -3895,7 +3780,15 @@ describe('Share soak owner', () => {
   })
 
   describe('the combined verdict', () => {
-    const complete = (mutate, now = 967000) => {
+    /**
+     * Supplies complete original cycle, timing and final evidence to the real completion decision.
+     * @param {Function} [mutate] optional evidence corruption before the decision
+     * @param {number} [now=967000] original monotonic decision time
+     * @param {object} [resources=settled] resource verdict from the selected screen
+     * @returns {{ verdict: object, rows: object[] }} actual verdict and archived rows
+     * @throws {Error} when the original completion decision or evidence sink throws
+     */
+    const complete = (mutate, now = 967000, resources = settled) => {
       const { owner, rows } = build({ clock: { now: () => now } })
       for (let cycle = 0; cycle < 30; cycle++) {
         const facts = cycleFacts(cycle)
@@ -3920,15 +3813,65 @@ describe('Share soak owner', () => {
       owner.timing.stages = owner.timing.phases.map((phase) => ({ ...phase, name: 'profile' }))
       owner.baseline = quietShare()
       owner.teardown = quietShare()
+      owner.priming = { status: 'passed' }
       mutate?.(owner, rows)
-      return { verdict: owner.complete(settled), rows }
+      return { verdict: owner.complete(resources), rows }
     }
+
+    test('a complete scored trace cannot pass without its first-use boundary', () => {
+      const { verdict, rows } = complete((owner) => {
+        delete owner.priming
+      })
+      expect(verdict.violations).toContain('A successful joined priming boundary is required')
+      expect(rows.filter(({ event }) => event === 'case-complete')).toHaveLength(0)
+    })
 
     test('passes only when every count, identity and final proof holds', () => {
       const { verdict, rows } = complete()
       expect(verdict.ok).toBe(true)
       expect(rows.filter(({ event }) => event === 'case-complete')).toHaveLength(1)
     })
+
+    test.each(['clean', 'destroyed-socket listener', 'dropped inventory'])(
+      'the real completion decision handles a %s resource verdict with complete cycle evidence',
+      (damage) => {
+        const baseline = quietShare()
+        const teardown = quietShare()
+        if (damage === 'destroyed-socket listener') teardown.namedListeners['socket1:retained'] = 1
+        if (damage === 'dropped inventory')
+          teardown.timerOwners = {
+            beforeCollection: { rows: [], dropped: 1 },
+            afterCollection: { rows: [], dropped: 1 },
+          }
+        expect(teardown.activeResources).toEqual(baseline.activeResources)
+        expect(teardown.sockets.open).toBe(0)
+        const violations = []
+        ShareSoakScreen.quiet(teardown, baseline, 'teardown', violations)
+        const resources = { ok: violations.length === 0, violations, measured: {} }
+        const { verdict, rows } = complete(
+          (owner) => {
+            owner.baseline = baseline
+            owner.teardown = teardown
+          },
+          967000,
+          resources
+        )
+        expect(verdict.resources).toBe(resources)
+        expect(rows.filter(({ event }) => event === 'soak-cycle')).toHaveLength(30)
+        expect(verdict.ok).toBe(damage === 'clean')
+        expect(verdict.violations).toEqual(violations)
+        const receipts = rows.filter(({ event }) => event === 'case-complete')
+        if (damage === 'clean') {
+          expect(violations).toEqual([])
+          expect(receipts).toHaveLength(1)
+          expect(receipts[0]).toMatchObject({ status: 'passed', tainted: false })
+          expect(receipts[0].oracles.log.actual).toHaveLength(1800)
+        } else {
+          expect(violations).toContain('teardown: resources differ or a source is absent')
+          expect(receipts).toEqual([])
+        }
+      }
+    )
 
     test('accepts exactly the unallocated margin with original anchored deadlines', () => {
       const { verdict, rows } = complete((o) => {
@@ -4545,8 +4488,8 @@ describe('Share soak natural exit observations', () => {
   })
 
   test.each([
-    ['short', 1020000],
-    ['full', 1980000],
+    ['short', 2040000],
+    ['full', 3000000],
   ])('rejects inclusive total +1 regardless of passing summary values for %s', (mode, totalMs) => {
     const facts = observation()
     facts.completedAt = totalMs - 1
@@ -6276,6 +6219,9 @@ describe('Share soak complete original-owner schedules', () => {
         },
       },
     })
+    owner.prime = async () => {
+      owner.priming = { status: 'passed', topic: 'primed', groupId: 'primed', topicId: 'primed' }
+    }
     let result
     let error
     let done = false
@@ -6626,8 +6572,8 @@ describe('Share soak complete original-owner schedules', () => {
           expect(phase.startedAt).toBeGreaterThanOrEqual(owner.timing.phases[index - 1].completedAt)
       }
       expect(owner.budget).toMatchObject({
-        watchdogMs: short ? 1020000 : 1980000,
-        lifecycleMs: short ? 1440000 : 2400000,
+        watchdogMs: short ? 2040000 : 3000000,
+        lifecycleMs: short ? 2460000 : 3420000,
       })
     },
     120000
