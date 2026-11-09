@@ -27,9 +27,10 @@ const path = require('node:path')
 const crypto = require('node:crypto')
 const { StringDecoder } = require('node:string_decoder')
 const { compareSnapshots } = require('../../../testHelpers/resourceProbe')
+const { MEMORY_FLAGS, SETTLE, collectionsSettled } = require('../../../testHelpers/processMemory')
 
 /** The version of the recorded shape; an older artifact is not evidence for the current gate. */
-const SCHEMA = 4
+const SCHEMA = 5
 
 const KINDS = Object.freeze(['producer', 'consumer', 'admin', 'shareConsumer'])
 const ARMS = Object.freeze(['public', 'collector'])
@@ -476,6 +477,7 @@ class MemoryArmJudge {
     if (reading.arrayBuffers > reading.external)
       this.fail(`${name} array buffers exceed external bytes`)
     if (settled) {
+      this.collectionHistory(name, reading)
       const gc = reading.gc
       if (!gc || !time(gc.admittedAt) || gc.completedAt !== reading.at || !count(gc.observed))
         this.fail(`${name} collection facts are incomplete`)
@@ -486,6 +488,44 @@ class MemoryArmJudge {
       }
     }
     return true
+  }
+
+  /**
+   * Replays every collection pair and convergence, without trusting a declared settled flag.
+   * @param {string} name checkpoint name @param {object} reading the final reading and GC journal
+   * @returns {void} records incomplete facts or an unconverged measurement
+   */
+  collectionHistory(name, reading) {
+    const gc = reading.gc
+    const points = gc?.checkpoints
+    if (!Array.isArray(points) || points.length < 2 || points.length > SETTLE.rounds) {
+      this.fail(`${name} collection checkpoints are incomplete`)
+      return
+    }
+    let previous = gc.admittedAt
+    let observed = 0
+    for (const [index, point] of points.entries()) {
+      if (!this.checkReading(`${name} collection`, point, false)) return
+      if (
+        !time(point.admittedAt) ||
+        point.admittedAt < previous ||
+        point.at - point.admittedAt < LIMITS.gcPauseMs ||
+        !count(point.observed) ||
+        !count(point.engine?.bytecode) ||
+        !count(point.engine?.code)
+      )
+        this.fail(`${name} collection checkpoint facts are incomplete`)
+      if (point.observed < LIMITS.minCollections) this.wait(`${name} collections were not observed`)
+      if (index > 0 && index < points.length - 1 && collectionsSettled(points[index - 1], point))
+        this.fail(`${name} collection continued after convergence`)
+      observed += point.observed
+      previous = point.at
+    }
+    if (observed !== gc.observed) this.fail(`${name} collection totals differ from its checkpoints`)
+    const last = points.at(-1)
+    if (last.at !== reading.at || READING_FIELDS.some((field) => last[field] !== reading[field]))
+      this.fail(`${name} final reading differs from its collection checkpoint`)
+    if (!collectionsSettled(points.at(-2), last)) this.wait(`${name} collections did not settle`)
   }
 
   /**
@@ -507,6 +547,8 @@ class MemoryArmJudge {
     if (Object.values(manifest.instrumented ?? { missing: true }).some(Boolean))
       this.fail('child ran under an inspector, coverage or Jest')
     if (!manifest.execArgv?.includes('--expose-gc')) this.fail('child did not expose GC')
+    if (!MEMORY_FLAGS.slice(1).every((flag) => manifest.execArgv?.includes(flag)))
+      this.fail('child did not declare eager JavaScript compilation')
     if (manifest.gc?.native !== true) this.fail('GC function is not the engine collection')
     const codecCount = manifest.codecs?.zstd === true ? 2 : 1
     const catalogue = phaseCatalogue(this.record.arm, manifest.codecs?.zstd === true)
@@ -610,7 +652,9 @@ class MemoryArmJudge {
     const edges = Array.isArray(r.native?.rows)
       ? r.native.rows.flatMap((row) => [row?.submitted, row?.settled])
       : []
+    const checkpoints = [r.c0, r.c1, r.released, r.matched, ...r.actives, r.closed]
     return [
+      ...checkpoints.flatMap((reading) => reading.gc?.checkpoints ?? []),
       r.startup,
       r.loaded,
       r.c0,
@@ -716,7 +760,10 @@ class MemoryArmJudge {
     ]
     for (const [phase, reading] of covers) {
       const mark = byPhase.get(phase)
-      if (mark.covered < reading.rss || mark.coveredExternal < reading.external)
+      const readings = [reading, ...(reading.gc?.checkpoints ?? [])]
+      if (
+        readings.some((point) => mark.covered < point.rss || mark.coveredExternal < point.external)
+      )
         this.fail('a peak mark understates a reading')
     }
     const covered = Math.max(...r.marks.map((mark) => mark.covered))
@@ -727,7 +774,10 @@ class MemoryArmJudge {
     else if (samples.peak.rss > covered || samples.peak.external > coveredExternal)
       this.fail('a peak mark understates the sampled peak')
 
-    let admitted = peaks.usable && manifest.gc.available === true
+    let admitted =
+      peaks.usable &&
+      manifest.gc.available === true &&
+      !['c0', 'c1'].some((name) => this.inconclusive.includes(`${name} collections did not settle`))
     if (Math.abs(r.c1.rss - r.c0.rss) > LIMITS.controlRss) {
       this.wait('control RSS is unstable')
       admitted = false
@@ -760,7 +810,7 @@ class MemoryArmJudge {
           this.fail('external memory peak exceeds 64 MiB above the disabled control')
       }
     }
-    for (const active of r.actives)
+    for (const active of r.actives.flatMap((reading) => [reading, ...reading.gc.checkpoints]))
       if (active.retained - r.matched.retained > LIMITS.retained)
         this.fail('active retained bytes exceed the matched baseline by more than 8 MiB')
     if (r.closed.retained - r.matched.retained > LIMITS.closedTransient)

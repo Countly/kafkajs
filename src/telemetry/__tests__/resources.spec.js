@@ -18,7 +18,7 @@ const {
   NativeResultFamily,
   SupplierFamily,
 } = require('./fixtures/cycleKit')
-const { hostContext } = require('../../../testHelpers/processMemory')
+const { MEMORY_FLAGS, hostContext } = require('../../../testHelpers/processMemory')
 const { A: SHARE_TOPIC_ID, B: OTHER_TOPIC_ID } = require('../../../testHelpers/shareHarness')
 const {
   MemoryOutput,
@@ -1187,7 +1187,7 @@ const supervise = (script, kind) =>
       RESOURCE_RUN_ID: producer.runId,
     }
     delete env.NODE_V8_COVERAGE
-    const child = spawn(process.execPath, ['--expose-gc', file, kind], {
+    const child = spawn(process.execPath, [...MEMORY_FLAGS, file, kind], {
       env,
       stdio: ['ignore', 'pipe', 'pipe'],
     })

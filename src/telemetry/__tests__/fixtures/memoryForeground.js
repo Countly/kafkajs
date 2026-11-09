@@ -446,6 +446,38 @@ const runControl = async ({ kind, lifecycles, memory, roles, journal, live }) =>
   })
 }
 
+/**
+ * Builds one current payload and one actually retired native completion in a separate async
+ * scope. Only scalar proof leaves this scope: neither the successful Buffer nor the resolved
+ * promises can remain in the caller's loop frame through its closed memory checkpoint.
+ * @param {object} builder the persistent production payload builder
+ * @param {object} snapshot the strict maximum collector sample
+ * @param {{name:string,type:number}} codec the real codec to select
+ * @param {() => void} retire advances the journal's lifecycle while the second job is pending
+ * @returns {Promise<object>} the byte/point/retirement facts, with no payload references
+ * @throws {Error} preserves a failed native build
+ */
+const nativePair = async (builder, snapshot, codec, retire) => {
+  const options = {
+    telemetryMaxBytes: 1048576,
+    acceptedCompressionTypes: [codec.type, 0],
+    isCurrent: () => true,
+  }
+  const current = await builder.buildPayload(snapshot, options)
+  let valid = true
+  const retiring = builder.buildPayload(snapshot, { ...options, isCurrent: () => valid })
+  retire()
+  valid = false
+  return {
+    codec: codec.name,
+    compressionType: current.compressionType,
+    rawBytes: current.rawBytes,
+    transmittedBytes: current.transmittedBytes,
+    points: current.includedIdentities.length,
+    retiredCompletion: (await retiring) === null,
+  }
+}
+
 module.exports = {
   DESCRIPTORS,
   DESCRIPTOR_BYTES,
@@ -455,6 +487,7 @@ module.exports = {
   descriptor,
   foregroundCatalogue,
   runControl,
+  nativePair,
   preloadProtocols,
   until,
   within,

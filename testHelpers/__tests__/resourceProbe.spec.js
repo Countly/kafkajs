@@ -614,6 +614,46 @@ describe('memory fixture module loading', () => {
   })
 })
 
+describe('native memory fixture result ownership', () => {
+  test('returns only scalar facts after current and retired result scopes finish', async () => {
+    const { nativePair } = require('../../src/telemetry/__tests__/fixtures/memoryForeground')
+    const input = { points: [{}] }
+    const payload = {
+      compressionType: 4,
+      rawBytes: 376306,
+      transmittedBytes: 1505,
+      includedIdentities: Array.from({ length: 257 }, () => ({})),
+      metrics: Buffer.alloc(65536),
+    }
+    let epoch = 0
+    const builder = {
+      buildPayload: jest.fn(async (_snapshot, options) => {
+        if (options.isCurrent()) {
+          await Promise.resolve()
+          return options.isCurrent() ? payload : null
+        }
+        return null
+      }),
+    }
+
+    const facts = await nativePair(builder, input, { name: 'zstd', type: 4 }, () => epoch++)
+
+    expect(epoch).toBe(1)
+    expect(builder.buildPayload.mock.calls.map(([snapshot]) => snapshot)).toEqual([input, input])
+    expect(facts).toEqual({
+      codec: 'zstd',
+      compressionType: 4,
+      rawBytes: 376306,
+      transmittedBytes: 1505,
+      points: 257,
+      retiredCompletion: true,
+    })
+    expect(Object.values(facts).every((value) => value === null || typeof value !== 'object')).toBe(
+      true
+    )
+  })
+})
+
 describe('resource artifact validation', () => {
   const TREE = 'a'.repeat(40)
   const NODE = 'v26.7.0'
@@ -628,15 +668,27 @@ describe('resource artifact validation', () => {
   })
 
   /** One settled reading: heap is whatever makes heap plus external the retained bytes. */
-  const settled = (at, rss, external, retained) => ({
-    at,
-    rss,
-    heapUsed: retained - external,
-    external,
-    arrayBuffers: 1000,
-    retained,
-    gc: { admittedAt: at - 150, completedAt: at, observed: 2 },
-  })
+  const settled = (at, rss, external, retained) => {
+    const reading = {
+      at,
+      rss,
+      heapUsed: retained - external,
+      external,
+      arrayBuffers: 1000,
+      retained,
+    }
+    const checkpoints = [at - 150, at].map((completedAt) => ({
+      ...reading,
+      at: completedAt,
+      admittedAt: completedAt - 100,
+      observed: 2,
+      engine: { bytecode: 100, code: 100 },
+    }))
+    return {
+      ...reading,
+      gc: { admittedAt: at - 250, completedAt: at, observed: 4, checkpoints },
+    }
+  }
 
   /** The high water, covered current RSS (MiB) and covered external bytes at each phase. */
   const PEAKS = {
@@ -764,7 +816,7 @@ describe('resource artifact validation', () => {
           arm,
           kind,
           ...child,
-          execArgv: ['--expose-gc'],
+          execArgv: ['--expose-gc', '--no-lazy', '--no-lazy-feedback-allocation'],
           instrumented: { inspector: false, coverage: false, jest: false },
           peakSource: { name: 'proc-self-status-vmhwm', units: 'bytes' },
           gc: { available: true, native: true },
@@ -860,7 +912,24 @@ describe('resource artifact validation', () => {
   /** Judges a record after a change, from a fresh passing one. */
   const judged = (arm, change, kind = 'producer') => {
     const broken = record(arm, kind)
+    const checkpoints = [
+      broken.readings.c0,
+      broken.readings.c1,
+      broken.readings.released,
+      broken.readings.matched,
+      ...broken.readings.actives,
+      broken.readings.closed,
+    ]
+    const previous = checkpoints.map((reading) => ({ ...reading }))
     change(broken.readings, broken)
+    // A scalar gate control changes the same final value in its otherwise unchanged GC history.
+    checkpoints.forEach((reading, index) => {
+      for (const point of reading.gc?.checkpoints ?? []) {
+        if (point === null || typeof point !== 'object') continue
+        for (const field of ['rss', 'heapUsed', 'external', 'arrayBuffers', 'retained'])
+          if (point[field] === previous[index][field]) point[field] = reading[field]
+      }
+    })
     return judgeMemoryArm(broken)
   }
   const markOf = (r, phase) => r.marks.find((candidate) => candidate.phase === phase)
@@ -885,7 +954,7 @@ describe('resource artifact validation', () => {
   })
 
   describe('the schema and the shape of the evidence', () => {
-    test.each([1, 2, 3])('rejects schema %s without frozen module evidence', (schema) => {
+    test.each([1, 2, 3, 4])('rejects schema %s without frozen module evidence', (schema) => {
       const old = record('public')
       old.schema = schema
       expect(judgeMemoryArm(old)).toEqual({ verdict: 'fail', problems: ['unknown schema'] })
@@ -1334,13 +1403,145 @@ describe('resource artifact validation', () => {
     })
 
     test('is inconclusive when the collections were not observed', () => {
-      const result = judged('public', (r) => (r.c0.gc.observed = 1))
+      const result = judged('public', (r) => {
+        r.c0.gc.observed = 1
+        r.c0.gc.checkpoints[0].observed = 0
+        r.c0.gc.checkpoints[1].observed = 1
+      })
 
       expect(result).toEqual({
         verdict: 'inconclusive',
         problems: ['c0 collections were not observed'],
       })
     })
+  })
+
+  describe('collection convergence', () => {
+    test('rejects a checkpoint without its successive post-GC readings', () => {
+      const result = judged('public', (r) => delete r.closed.gc.checkpoints)
+      expect(result.verdict).toBe('fail')
+      expect(result.problems).toContain('closed collection checkpoints are incomplete')
+    })
+
+    test.each([null, 1, {}])('rejects a malformed collection checkpoint %p', (point) => {
+      const result = judged('public', (r) => {
+        r.closed.gc.checkpoints[0] = point
+      })
+      expect(result.verdict).toBe('fail')
+      expect(result.problems).toContain('closed collection reading is incomplete')
+    })
+
+    test('does not let an unsettled control become an admitted reference', () => {
+      const result = judged('public', (r) => {
+        r.c0.gc.checkpoints[0].heapUsed -= 300000
+        r.c0.gc.checkpoints[0].retained -= 300000
+      })
+      expect(result.verdict).toBe('inconclusive')
+      expect(result.problems).toContain('c0 collections did not settle')
+    })
+
+    test('keeps earlier collection peaks even when the last reading is smaller', () => {
+      const result = judged('public', (r) => {
+        r.closed.gc.checkpoints[0].external += 70 * MIB
+        r.closed.gc.checkpoints[0].retained += 70 * MIB
+      })
+      expect(result.verdict).toBe('fail')
+      expect(result.problems).toContain(
+        'external memory peak exceeds 64 MiB above the disabled control'
+      )
+    })
+
+    test('does not discard an active retained violation found before convergence', () => {
+      const result = judged('public', (r) => {
+        r.actives[0].gc.checkpoints[0].heapUsed += 9 * MIB
+        r.actives[0].gc.checkpoints[0].retained += 9 * MIB
+      })
+      expect(result.verdict).toBe('fail')
+      expect(result.problems).toContain(
+        'active retained bytes exceed the matched baseline by more than 8 MiB'
+      )
+    })
+
+    test('rejects continued collection after an already converged pair', () => {
+      const result = judged('public', (r) => {
+        const point = r.closed.gc.checkpoints[0]
+        r.closed.gc.checkpoints.unshift({
+          ...point,
+          at: point.at - 150,
+          admittedAt: point.admittedAt - 150,
+        })
+        r.closed.gc.admittedAt -= 150
+        r.closed.gc.observed += 2
+      })
+      expect(result.verdict).toBe('fail')
+      expect(result.problems).toContain('closed collection continued after convergence')
+    })
+
+    test('rejects a child that can compile loaded functions lazily after its reference', () => {
+      const result = judged('public', (r) => {
+        r.manifest.execArgv = ['--expose-gc']
+      })
+      expect(result.verdict).toBe('fail')
+      expect(result.problems).toContain('child did not declare eager JavaScript compilation')
+    })
+  })
+
+  describe('recorded retained growth', () => {
+    test.each([
+      ['producer', 785472, 969696, 131072],
+      ['consumer', 732000, 1343984, 130560],
+      ['admin', 477456, 759880, 131072],
+      ['shareConsumer', 820760, 1025512, 131072],
+    ])(
+      'preserves the public %s failure even with an unstable disabled control',
+      (kind, controlHeap, heap, backing) => {
+        const result = judged(
+          'public',
+          (r) => {
+            r.c1.heapUsed = r.c0.heapUsed + controlHeap
+            r.c1.retained = r.c1.heapUsed + r.c1.external
+            r.closed.heapUsed = r.matched.heapUsed + heap
+            r.closed.external = r.matched.external + backing
+            r.closed.arrayBuffers = r.matched.arrayBuffers + backing
+            r.closed.retained = r.closed.heapUsed + r.closed.external
+            markOf(r, 'enabled:closed').coveredExternal = r.closed.external
+          },
+          kind
+        )
+        expect(result.verdict).toBe('fail')
+        expect(result.problems).toContain('closed transient bytes exceed 256 KiB')
+        expect(result.problems).toContain('control retained bytes are unstable')
+      }
+    )
+
+    test.each([
+      ['producer', 793544, 0, 300536, 65536],
+      ['consumer', 734896, 0, 287296, 65536],
+      ['admin', 479832, 0, 298128, 65536],
+      ['shareConsumer', 824976, 4608, 283392, 131072],
+    ])(
+      'preserves the collector %s failure even with an unstable disabled control',
+      (kind, controlHeap, controlExternal, heap, backing) => {
+        const result = judged(
+          'collector',
+          (r) => {
+            r.c1.heapUsed = r.c0.heapUsed + controlHeap
+            r.c1.external = r.c0.external + controlExternal
+            r.c1.retained = r.c1.heapUsed + r.c1.external
+            markOf(r, 'control:c1').coveredExternal = r.c1.external
+            r.closed.heapUsed = r.matched.heapUsed + heap
+            r.closed.external = r.matched.external + backing
+            r.closed.arrayBuffers = r.matched.arrayBuffers + backing
+            r.closed.retained = r.closed.heapUsed + r.closed.external
+            markOf(r, 'collector:closed').coveredExternal = r.closed.external
+          },
+          kind
+        )
+        expect(result.verdict).toBe('fail')
+        expect(result.problems).toContain('closed transient bytes exceed 256 KiB')
+        expect(result.problems).toContain('control retained bytes are unstable')
+      }
+    )
   })
 
   describe('the disabled control', () => {

@@ -1,5 +1,6 @@
 const fs = require('fs')
 const {
+  MEMORY_FLAGS,
   PEAK_SOURCE,
   WINDOW_CAPACITY,
   BoundaryWitness,
@@ -167,7 +168,7 @@ describe('ProcessMemory', () => {
     })
   })
 
-  test('settles with two collections around a 100 ms pause and two turns before the reading', async () => {
+  test('settles successive collection pairs with callbacks delivered before every reading', async () => {
     const events = []
     const { memory } = meter({
       gc: () => events.push('gc'),
@@ -190,6 +191,12 @@ describe('ProcessMemory', () => {
       'collection callbacks',
       'collection callbacks',
       'read',
+      'gc',
+      'sleep 100',
+      'gc',
+      'collection callbacks',
+      'collection callbacks',
+      'read',
     ])
     expect(reading).toMatchObject({ retained: 17, rss: 100 })
     expect(reading.gc.completedAt).toBe(reading.at)
@@ -199,10 +206,50 @@ describe('ProcessMemory', () => {
   test('counts the collections the engine reported while it settled', async () => {
     const owner = {}
     owner.memory = meter({ gc: () => (owner.memory.collections += 1) }).memory
-    // Only the two scripted collections may be reported; a real engine collection is not ours.
+    // Only the scripted collections may be reported; a real engine collection is not ours.
     owner.memory.observer.disconnect()
 
-    expect((await owner.memory.settled()).gc.observed).toBe(2)
+    expect((await owner.memory.settled()).gc.observed).toBe(4)
+  })
+
+  test('keeps collecting past a delayed backing-store release and preserves every reading', async () => {
+    let calls = 0
+    const { memory } = meter({
+      gc: () => (calls += 1),
+      usage: () => ({
+        rss: 100,
+        heapUsed: calls < 4 ? 969696 : calls < 6 ? 900000 : 100,
+        external: calls < 4 ? 131072 : calls < 6 ? 65536 : 0,
+        arrayBuffers: calls < 4 ? 131072 : calls < 6 ? 65536 : 0,
+      }),
+    })
+    const reading = await memory.settled()
+
+    expect(calls).toBeGreaterThanOrEqual(8)
+    expect(reading.gc.checkpoints.map((point) => point.retained)).toEqual([
+      1100768, 965536, 100, 100,
+    ])
+    expect(reading.retained).toBe(100)
+    expect(reading.gc.observed).toBeGreaterThanOrEqual(0)
+    expect(memory.coveredExternal).toBe(131072)
+  })
+
+  test('bounds collection even when retained bytes never settle', async () => {
+    let calls = 0
+    const { memory } = meter({
+      gc: () => (calls += 1),
+      usage: () => ({ rss: 100, heapUsed: calls * 300000, external: 0, arrayBuffers: 0 }),
+    })
+
+    const reading = await memory.settled()
+
+    expect(calls).toBe(12)
+    expect(reading.gc.checkpoints).toHaveLength(6)
+    expect(reading.retained).toBe(3600000)
+  })
+
+  test('declares eager compilation without invoking telemetry or warming native work', () => {
+    expect(MEMORY_FLAGS).toEqual(['--expose-gc', '--no-lazy', '--no-lazy-feedback-allocation'])
   })
 
   test('refuses a settled reading without a collection function', async () => {
@@ -309,29 +356,20 @@ describe('PendingSampler', () => {
     memory.stop()
   })
 
-  test('releases its interval whatever is pending', () => {
+  test('keeps sampling a short native completion after cleanup requests a stop', () => {
     const { subject, intervals, memory } = sampler()
-    subject.begin()
-
+    memory.now = () => [3035.622099, 3043.31565][subject.count]
+    const submitted = subject.begin()
     subject.stop()
 
+    expect(intervals.size).toBe(1)
+    const settled = subject.end()
+
     expect(intervals.size).toBe(0)
-    memory.stop()
-  })
-
-  test('takes a reading without a window when work settles and starts after a stop', () => {
-    const { subject, intervals, memory } = sampler()
-    subject.begin()
-    subject.stop()
-
-    subject.end()
-    const reading = subject.begin()
-
-    expect(reading).toMatchObject({ at: 60, rss: 30, external: 3 })
-    expect(intervals.size).toBe(0)
-    expect(subject.summary()).toMatchObject({ windows: 1, count: 3 })
+    expect(subject.pending).toBe(0)
+    expect(settled.at - submitted.at).toBeLessThan(20)
     expect(subject.summary().pendingWindows).toEqual([
-      { begin: 20, end: 20, count: 1, rss: 10, external: 1 },
+      { begin: submitted.at, end: settled.at, count: 2, rss: 20, external: 2 },
     ])
     memory.stop()
   })

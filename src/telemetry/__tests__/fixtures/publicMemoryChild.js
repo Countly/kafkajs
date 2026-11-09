@@ -230,6 +230,7 @@ const measure = async (kind) => {
       })
       await within(closing, 'the final public close')
       await enabled.drain()
+      await until(() => journal.live.size === 0, 'the final native completion')
       sampler.stop()
 
       const pushes = {}

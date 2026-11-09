@@ -11,9 +11,27 @@
  */
 const fs = require('node:fs')
 const os = require('node:os')
+const v8 = require('node:v8')
 const { performance, PerformanceObserver } = require('node:perf_hooks')
 
 const KIB = 1024
+
+/** Compile loaded JavaScript before the reference, without executing telemetry or native work. */
+const MEMORY_FLAGS = Object.freeze(['--expose-gc', '--no-lazy', '--no-lazy-feedback-allocation'])
+
+/** Collection convergence is stricter than any retained gate; it never changes an acceptance value. */
+const SETTLE = Object.freeze({ rounds: 6, bytes: 16384 })
+
+/**
+ * @param {object|undefined} before preceding post-GC reading
+ * @param {object} after latest post-GC reading
+ * @returns {boolean} whether heap and backing-store accounting have stopped changing materially
+ */
+const collectionsSettled = (before, after) =>
+  before !== undefined &&
+  ['heapUsed', 'external', 'arrayBuffers'].every(
+    (field) => Math.abs(after[field] - before[field]) <= SETTLE.bytes
+  )
 
 /** What the selected absolute peak source is called and measures. */
 const PEAK_SOURCE = Object.freeze({ name: 'proc-self-status-vmhwm', units: 'bytes' })
@@ -194,25 +212,48 @@ class ProcessMemory {
   }
 
   /**
-   * Takes a settled reading: a real collection, a 100 ms pause, a second collection, two turns for
-   * collection callbacks, then the reading. Records when the collections were admitted and when
-   * the reading completed, and how many collections the engine reported.
-   * @returns {Promise<object>} the current reading plus `gc: { admittedAt, completedAt, observed }`
+   * Repeats the two-collection/100 ms protocol until two successive readings converge, with at
+   * most six pairs. Every reading remains in the evidence and contributes to peak coverage. The
+   * last reading is returned even when convergence fails; no minimum or favourable endpoint is
+   * selected. Engine code sizes diagnose first-use compilation separately, without subtracting it.
+   * @returns {Promise<object>} the final reading and all GC admission/completion/engine facts
    * @throws {Error} when no collection function exists
    */
   async settled() {
     if (typeof this.gc !== 'function') throw new Error('A settled reading needs node --expose-gc')
     const admittedAt = this.now()
     const before = this.collections
-    this.gc()
-    await this.sleep(GC_PAUSE_MS)
-    this.gc()
-    await this.settleTurn()
-    await this.settleTurn()
-    const reading = this.current()
+    const checkpoints = []
+    for (let round = 0; round < SETTLE.rounds; round++) {
+      const started = this.now()
+      const observed = this.collections
+      this.gc()
+      await this.sleep(GC_PAUSE_MS)
+      this.gc()
+      await this.settleTurn()
+      await this.settleTurn()
+      const code = v8.getHeapCodeStatistics()
+      const reading = this.current()
+      const checkpoint = {
+        ...reading,
+        admittedAt: started,
+        observed: this.collections - observed,
+        engine: { bytecode: code.bytecode_and_metadata_size, code: code.code_and_metadata_size },
+      }
+      const previous = checkpoints.at(-1)
+      checkpoints.push(checkpoint)
+      if (collectionsSettled(previous, checkpoint)) break
+    }
+    const last = checkpoints.at(-1)
+    const reading = Object.fromEntries(
+      ['at', 'rss', 'heapUsed', 'external', 'arrayBuffers', 'retained'].map((key) => [
+        key,
+        last[key],
+      ])
+    )
     return {
       ...reading,
-      gc: { admittedAt, completedAt: reading.at, observed: this.collections - before },
+      gc: { admittedAt, completedAt: reading.at, observed: this.collections - before, checkpoints },
     }
   }
 
@@ -305,8 +346,13 @@ class PendingSampler {
     return reading
   }
 
-  /** @returns {void} releases the interval whatever is pending */
+  /**
+   * Requests cleanup without discarding a pending window. An outstanding job's `end` owns the
+   * interval until settlement, including work shorter than the 20 ms sampling period.
+   * @returns {void}
+   */
   stop() {
+    if (this.pending > 0) return
     if (this.handle !== null) this.clear(this.handle)
     this.handle = null
     this.window = null
@@ -513,6 +559,9 @@ class BoundaryWitness {
 }
 
 module.exports = {
+  MEMORY_FLAGS,
+  SETTLE,
+  collectionsSettled,
   PEAK_SOURCE,
   SAMPLE_MS,
   GC_PAUSE_MS,
