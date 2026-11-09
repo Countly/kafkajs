@@ -15,6 +15,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Tooling
 
+- Move telemetry memory arms and their validated artifacts, the retained-ownership diagnostic and full Node/broker churn-soak coverage into the guarded Memory gates workflow; keep functional telemetry and non-memory resource schedules on phase PRs with unchanged acceptance checks.
 - Prepare a verified runner-local AppCDS archive for the pinned telemetry decoder before timed observer work, retain preparation diagnostics, and require archive-backed decoding under unchanged time limits.
 - Flush terminal telemetry worker messages before IPC disconnect, retain failed-worker exit, output and phase diagnostics, and hold planned soak samples until their admission time.
 - Read hourly rolled telemetry request traces with bounded rotation retries, prove foreground fetch setup ownership, and exercise every discovered reporter broker without weakening socket or cleanup checks.
