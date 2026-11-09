@@ -368,9 +368,24 @@ describe('configured telemetry evidence documentation', () => {
     expect(document).toContain('successful subscription Get alone is insufficient')
   })
 
-  test('keeps Java final, natural exit and independent evidence as separate conditions', () => {
+  test('keeps pinned Java admin checkpoint, final policies and natural exit independently required', () => {
     const fixture = squeeze('scripts/e2e/telemetry/README.md')
-    expect(fixture).toContain('A missing final fails the scenario')
+    expect(fixture).toContain('a missing producer or consumer final fails the scenario')
+    for (const text of [fixture, squeeze('docs/Testing.md'), squeeze('docs/ClientTelemetry.md')]) {
+      expect(text).toContain(
+        'Java producer and consumer each require at least two complete accepted normal exports'
+      )
+      expect(text).toContain(
+        'The parent must independently validate that export before allowing admin close'
+      )
+      expect(text).toContain('Every Java role still exports exactly its connection counter')
+      expect(text).toContain('All KafkaJS final/timeout/reopen requirements remain unchanged')
+      expect(text).toContain('2000 ms drain')
+      expect(text).toContain('2000 ms quiet')
+    }
+    expect(fixture).toContain('results.javaEvidenceVersion = 2')
+    expect(fixture).toContain('preclose-checkpoint-v1')
+    expect(fixture).toContain('required-final-v1')
     expect(fixture).toContain('natural exit within 10000 ms')
     expect(fixture).toContain('TELEMETRY_INTEROP_CACHE')
     expect(fixture).toContain('Keep the retained fixture manifest unchanged')

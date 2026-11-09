@@ -6,7 +6,16 @@ const path = require('path')
 const { performance } = require('perf_hooks')
 const { spawn } = require('child_process')
 const { Kafka, logLevel } = require('../../../index')
-const { assertJavaRows, assertJsCounter } = require('../../../scripts/e2e/telemetry/semantics')
+const {
+  assertJavaRows,
+  assertJsCounter,
+  javaClosePolicy,
+  assertJavaEvidence,
+  assertJavaCaptures,
+  JavaAdminHandshake,
+  unexpectedPinnedJavaStderr,
+  javaSampleSummary,
+} = require('../../../scripts/e2e/telemetry/semantics')
 const { runCase } = require('../../../scripts/e2e/telemetry/evidence')
 const {
   TelemetryExportReader,
@@ -15,7 +24,6 @@ const {
   withTelemetryResource,
 } = require('../../../testHelpers/telemetryFixtures')
 const { readLog } = require('../../../testHelpers/rawLog')
-const { unexpectedJavaStderr } = require('./fixtures/javaStderr')
 const {
   bounded,
   caseTimeout,
@@ -100,8 +108,19 @@ class JavaRole {
     this.overflow = false
     let partial = ''
     this.child = spawn(
-      'timeout',
+      role === 'admin' ? 'bash' : 'timeout',
       [
+        ...(role === 'admin'
+          ? [
+              '-o',
+              'pipefail',
+              '-c',
+              'cat | "$@"',
+              'telemetry-admin-input',
+              'timeout',
+              '--foreground',
+            ]
+          : []),
         '-k',
         '3s',
         '45s',
@@ -119,7 +138,8 @@ class JavaRole {
       ],
       {
         env: { ...process.env, TMPDIR: tmp },
-        stdio: ['ignore', 'pipe', 'pipe'],
+        stdio: [role === 'admin' ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+        detached: true,
       }
     )
     this.child.stdout.setEncoding('utf8')
@@ -127,6 +147,7 @@ class JavaRole {
     this.child.stdout.on('data', (data) => {
       if (this.stdout.length + data.length > OUTPUT_CAP) this.overflow = true
       else this.stdout += data
+      if (this.overflow) return
       partial += data
       const lines = partial.split('\n')
       partial = lines.pop()
@@ -136,9 +157,20 @@ class JavaRole {
       if (this.stderr.length + data.length > OUTPUT_CAP) this.overflow = true
       else this.stderr += data
     })
+    this.child.stdin?.on('error', (error) => {
+      this.inputError = error
+    })
     this.done = new Promise((resolve) => {
       this.child.once('error', (error) => resolve({ code: null, signal: null, error }))
-      this.child.once('close', (code, signal) => resolve({ code, signal, exitAt: clock.now() }))
+      this.child.once('close', (code, signal) =>
+        resolve({
+          code,
+          signal,
+          exitAt: clock.now(),
+          pipesDrained: !partial,
+          supervisorFailure: code !== 0 || signal !== null,
+        })
+      )
     })
   }
 
@@ -147,21 +179,16 @@ class JavaRole {
    * @returns {{at:number,fields:object}|undefined} the first stdout JSON line that carries it
    */
   marker(key) {
-    for (const { at, line } of this.markers) {
-      let fields
-      try {
-        fields = JSON.parse(line)
-      } catch {
-        continue
-      }
-      if (
-        fields &&
-        Object.hasOwn(fields, key) &&
-        (!['closing', 'closed'].includes(key) || fields[key] === true)
+    const found = this.markers
+      .map(({ at, line }) => ({ at, fields: JSON.parse(line) }))
+      .filter(
+        ({ fields }) =>
+          Object.hasOwn(fields, key) &&
+          (key !== 'clientInstanceId' || fields.closed === false) &&
+          (!['closing', 'closed'].includes(key) || fields[key] === true)
       )
-        return { at, fields }
-    }
-    return undefined
+    if (found.length > 1) throw new Error(`Duplicate Java ${key}`)
+    return found[0]
   }
 
   /** @returns {Promise<boolean>} whether the supervising group has gone, probed for one second */
@@ -180,8 +207,8 @@ class JavaRole {
 
 /**
  * L7: seven distinct clients under one subscription, three of them Java 4.3.1 roles whose own
- * UUID must show complete exports and exactly one final across all brokers, independent of the
- * JS wire joins and of each child's natural exit.
+ * UUID must show complete exports across all brokers. Producer/consumer require a final; admin
+ * requires its acknowledged fresh checkpoint, public close, natural exit and all-node cessation.
  */
 class JavaInteropCase {
   #tasks = []
@@ -202,7 +229,7 @@ class JavaInteropCase {
     this.stem = stem
     this.attempt = attempt
     this.reader = new TelemetryExportReader(directory)
-    this.results = { java: {}, js: {} }
+    this.results = { javaEvidenceVersion: 2, java: {}, js: {} }
     this.attempt.record.results = this.results
     this.pushes = []
     this.topics = Object.fromEntries(ROLES.map((role) => [role, `${stem}-j${role[0]}`]))
@@ -324,8 +351,19 @@ class JavaInteropCase {
       tmp,
     })
     this.defer(async () => {
-      await javaRole.done
-      if (!(await javaRole.groupGone())) throw new Error(`The ${role} process group survived`)
+      javaRole.child.stdin?.destroy()
+      const exit = await javaRole.done
+      const gone = await javaRole.groupGone()
+      this.results.children ??= {}
+      this.results.children[role] = {
+        ...exit,
+        liveDescendants: gone ? [] : [javaRole.child.pid],
+        overflow: javaRole.overflow,
+        stdout: javaRole.stdout,
+        stderr: javaRole.stderr,
+        markers: javaRole.markers,
+      }
+      if (!gone) throw new Error(`The ${role} process group survived`)
     })
     return javaRole
   }
@@ -353,8 +391,6 @@ class JavaInteropCase {
     const normal = rows.filter((r) => !r.terminating)
     const finals = rows.filter((r) => r.terminating)
     expect(normal.length).toBeGreaterThanOrEqual(2)
-    expect(finals).toHaveLength(1)
-    expect(rows.at(-1)).toBe(finals[0])
     expect(rows.every((r) => r.parse === 'ok' && r.truncated === false)).toBe(true)
     expect(rows.every((r) => r.clientId === this.ids.java[role] && r.pushIntervalMs === 1000)).toBe(
       true
@@ -370,6 +406,8 @@ class JavaInteropCase {
         .filter((r) => r.membership === true),
       closing: child.marker('closing')?.fields,
       closed: child.marker('closed')?.fields,
+      checkpoint: role === 'admin' ? this.adminProof.checkpoint : undefined,
+      cessation: role === 'admin' ? this.adminProof.cessation : undefined,
     })
     const sum = normal[0].metrics.find(
       (m) =>
@@ -380,9 +418,108 @@ class JavaInteropCase {
       uuid,
       normalExports: normal.length,
       finalExports: finals.length,
-      exports: rows.map((r) => ({ node: r.node, seq: r.seq, terminating: r.terminating })),
+      timing: javaSampleSummary(rows),
+      exports: rows.map(({ node, seq, terminating, dataSha256 }) => ({
+        node,
+        seq,
+        terminating,
+        dataSha256,
+      })),
       counter: { kind: sum.kind, monotonic: sum.monotonic, temporality: sum.temporality },
     }
+  }
+
+  /**
+   * Captures all sink prefixes after reader integrity checks, including other clients' rows.
+   * @returns {object} timed read receipt, node byte hashes and sequence cursors
+   * @throws {Error} for a missing, partial or corrupt node capture
+   */
+  capture() {
+    this.reader.readExports()
+    const nodes = {}
+    const cursors = {}
+    for (const node of ['1', '2', '3']) {
+      const bytes = fs.readFileSync(path.join(this.directory, `exports-${node}.jsonl`))
+      if (bytes.length && bytes.at(-1) !== 10) throw new Error('Partial Java node capture')
+      const rows = bytes.length ? bytes.toString().trimEnd().split('\n').map(JSON.parse) : []
+      nodes[node] = {
+        bytes: bytes.length,
+        sha256: crypto.createHash('sha256').update(bytes).digest('hex'),
+      }
+      cursors[node] = rows.length
+    }
+    return { at: clock.now(), nodes, cursors }
+  }
+
+  /**
+   * Releases the admin only after a completed operation and a fresh complete accepted export.
+   * Started immediately with the child; an early exit rejects the checkpoint without a later wait.
+   * @returns {Promise<void>} after the single command is flushed and its input pipe is closed
+   * @throws {Error} for child failure, deadline, capture failure or invalid checkpoint
+   */
+  async adminCheckpoint() {
+    const child = this.roles.admin
+    const handshake = new JavaAdminHandshake({
+      child,
+      clientId: this.ids.java.admin,
+      signal: this.signal,
+      now: clock.now,
+      find: async (signal, label, ms, lookup) => {
+        let found
+        await pollUntil(signal, ms, async () => (found = await lookup()), { delayMs: 100, label })
+        return found
+      },
+      capture: () => this.capture(),
+      rowsOf: (uuid) => this.rowsOf(uuid),
+      send: (raw) =>
+        this.within(
+          1000,
+          'The admin close command',
+          () =>
+            new Promise((resolve, reject) => {
+              child.child.stdin.end(raw, (error) => (error ? reject(error) : resolve()))
+            })
+        ),
+    })
+    this.adminHandshake = handshake
+    const task = handshake.run()
+    this.defer(async () => {
+      handshake.abort()
+      child.child.stdin.destroy()
+      await task.catch(() => {})
+    })
+    try {
+      this.adminProof = { checkpoint: await task }
+      this.results.adminProof = this.adminProof
+      if (child.inputError) throw child.inputError
+    } catch (error) {
+      child.child.stdin.destroy()
+      throw error
+    }
+  }
+
+  /**
+   * Observes fixed drain and quiet windows with the subscription and reporter still installed.
+   * @returns {Promise<void>} after both windows, charged to the existing case budget
+   * @throws {Error} for incomplete capture or a row during quiet
+   */
+  async adminCessation() {
+    const window = async (start) => {
+      const reads = [start]
+      while (clock.now() - start.at < 2000) {
+        await this.within(
+          300,
+          'The admin capture interval',
+          () => new Promise((resolve) => setTimeout(resolve, 100))
+        )
+        reads.push(this.capture())
+      }
+      return reads
+    }
+    const drain = await window(this.capture())
+    const quiet = await window(drain.at(-1))
+    this.adminProof.cessation = { drain, quiet }
+    assertJavaCaptures([this.adminProof.checkpoint.proof, ...drain, ...quiet], this.directory)
   }
 
   /**
@@ -435,8 +572,30 @@ class JavaInteropCase {
       'interval.ms': '1000',
       match: `client_id=^(${all.join('|')})$`,
     }
-    await withTelemetryResource(aux, { name: this.stem, entries }, () => this.interop(aux))
+    this.results.subscriptionOperations = []
+    const resourceAdmin = {
+      listConfigResources: (options) => aux.listConfigResources(options),
+      describeConfigs: (options) => aux.describeConfigs(options),
+      incrementalAlterConfigs: async (request) => {
+        const operation = { request, startedAt: clock.now() }
+        this.results.subscriptionOperations.push(operation)
+        operation.response = await aux.incrementalAlterConfigs(request)
+        operation.completedAt = clock.now()
+        return operation.response
+      },
+    }
+    this.results.subscription = await withTelemetryResource(
+      resourceAdmin,
+      { name: this.stem, entries },
+      () => this.interop(aux)
+    )
+  }
+
+  /** @returns {void} validates actual pinned cache and records candidate/JDK identities */
+  provenance() {
+    const cache = process.env.TELEMETRY_INTEROP_CACHE
     this.results.provenance = {
+      clientVersion: '4.3.1',
       jdk: Object.fromEntries(ROLES.map((role) => [role, this.roles[role].marker('jdk')?.fields])),
       cache: fs
         .readFileSync(path.join(ROOT, 'scripts/e2e/telemetry/interop.sha256'), 'utf8')
@@ -451,7 +610,11 @@ class JavaInteropCase {
       sourceSha256: fileSha(path.join(ROOT, 'scripts/e2e/telemetry/JavaTelemetryClient.java')),
       runnerSha256: fileSha(RUNNER),
     }
-    this.results.readback = { metrics: REQUESTED, interval: 1000, ids: all }
+    this.results.readback = {
+      metrics: REQUESTED,
+      interval: 1000,
+      ids: [...Object.values(this.ids.java), ...Object.values(this.ids.js)],
+    }
   }
 
   /**
@@ -463,6 +626,16 @@ class JavaInteropCase {
     const roles = (this.roles = Object.fromEntries(
       ROLES.map((role) => [role, this.startRole(role)])
     ))
+    const checkpointTask = this.adminCheckpoint().then(async () => {
+      await roles.admin.done
+      await this.adminCessation()
+    })
+    checkpointTask.catch(() => {})
+    this.defer(async () => {
+      this.adminHandshake.abort()
+      roles.admin.child.stdin.destroy()
+      await checkpointTask.catch(() => {})
+    })
     const js = Object.fromEntries(KINDS.map((kind) => [kind, this.buildJs(kind)]))
     await this.within(15000, 'The JS connects', () =>
       settle(KINDS.map((kind) => () => js[kind].client.connect()))
@@ -498,9 +671,14 @@ class JavaInteropCase {
         return list.length >= 2 && list
       })
     }
+    await checkpointTask
+    this.provenance()
     const exits = {}
     for (const role of ROLES)
       exits[role] = await this.within(45000, `The ${role} exit`, () => roles[role].done)
+    for (const role of ROLES) {
+      exits[role].liveDescendants = (await roles[role].groupGone()) ? [] : [roles[role].child.pid]
+    }
     this.results.children = Object.fromEntries(
       ROLES.map((role) => [
         role,
@@ -518,21 +696,28 @@ class JavaInteropCase {
       const closing = child.marker('closing')
       const closed = child.marker('closed')
       expect(child.overflow).toBe(false)
-      expect(unexpectedJavaStderr(child.stderr)).toEqual([])
+      expect(unexpectedPinnedJavaStderr(child.stderr)).toEqual([])
       expect(exits[role].error).toBeUndefined()
       expect(exits[role].code).toBe(0)
       expect(exits[role].signal).toBeNull()
       expect(closing).toBeDefined()
       expect(closed).toBeDefined()
       const closeToExitMs = exits[role].exitAt - closing.at
+      expect(closeToExitMs).toBeGreaterThanOrEqual(0)
       expect(closeToExitMs).toBeLessThanOrEqual(CLOSE_TO_EXIT_MS)
       const liveDescendants = (await child.groupGone()) ? [] : [child.child.pid]
       expect(liveDescendants).toEqual([])
-      await this.find(`the ${role} final export`, 10000, () =>
-        this.rowsOf(javaIds[role]).some((r) => r.terminating)
-      )
+      if (role !== 'admin')
+        await this.find(`the ${role} final export`, 10000, () =>
+          this.rowsOf(javaIds[role]).some((r) => r.terminating)
+        )
       this.results.java[role] = {
         assignedId: this.ids.java[role],
+        closePolicy: javaClosePolicy(role, this.results.provenance, {
+          clientSourceSha256: this.results.provenance.sourceSha256,
+          runnerSha256: this.results.provenance.runnerSha256,
+        }),
+        ...(role === 'admin' ? this.adminProof : {}),
         ...this.checkRows(role, javaIds[role]),
         exitCode: exits[role].code,
         exitSignal: exits[role].signal,
@@ -544,6 +729,21 @@ class JavaInteropCase {
         stdout: child.stdout,
         stderr: child.stderr,
       }
+      assertJavaEvidence(
+        role,
+        this.rowsOf(javaIds[role]),
+        this.results.java[role],
+        this.results.children[role],
+        {
+          provenance: this.results.provenance,
+          fixture: {
+            clientSourceSha256: this.results.provenance.sourceSha256,
+            runnerSha256: this.results.provenance.runnerSha256,
+          },
+          readback: this.results.readback,
+          group: `${this.stem}-java-consumer-group`,
+        }
+      )
     }
 
     const jsRows = {}
