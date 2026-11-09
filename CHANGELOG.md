@@ -17,6 +17,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - Qualify telemetry final subscription-deletion errors with archived admin evidence, and verify forced share shutdown using final acknowledgements and exact suffix redelivery.
 - Use the non-deprecated bounded Java consumer close API, select the Java admin counter by its source name, and read Kafka JSON connection traces from the request appender. Retain the primary shutdown failure with partial-segment diagnostics.
+- Settle resource measurements with recorded collection convergence, release native result references before closed readings, and preserve sampling through native settlement.
 - Add independent telemetry request/response vectors and strict wire fixtures.
 - Verify normal physical connections and completed-request observations independently.
 - Add independently generated and decoded OTLP metric vectors.
