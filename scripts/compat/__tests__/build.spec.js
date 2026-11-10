@@ -114,7 +114,13 @@ describe('scripts/compat/build', () => {
     it('keeps the 4.3.1 snapshots beside it, with the same files as the pinned one', () => {
       const names = (tag) => fs.readdirSync(path.join(__dirname, '..', 'messages', tag)).sort()
 
-      expect(names('4.3.1')).toEqual(names(config.kafkaTag))
+      const addedAfter431 = [
+        'UnregisterControllerRequest.json',
+        'UnregisterControllerResponse.json',
+      ]
+      expect(names('4.3.1')).toEqual(
+        names(config.kafkaTag).filter((n) => !addedAfter431.includes(n))
+      )
       expect(fs.existsSync(path.join(__dirname, '..', 'errors', '4.3.1.json'))).toBe(true)
     })
 

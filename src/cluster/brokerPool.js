@@ -110,6 +110,8 @@ module.exports = class BrokerPool {
    *   the same recovery on a `REBOOTSTRAP_REQUIRED` answer to ApiVersions (KIP-1242);
    *   `'none'` disables them, sends no cluster or node id in ApiVersions and leaves
    *   `REBOOTSTRAP_REQUIRED` (129) as a plain protocol error.
+   * @param {boolean} [options.metadataClusterCheck=true] `false` makes every broker of this pool
+   *   send no cluster or node id in ApiVersions v5; recovery on `REBOOTSTRAP_REQUIRED` is unchanged.
    * @param {number} [options.metadataRecoveryRebootstrapTriggerMs=300000] how long metadata must
    *   fail *continuously* (trigger (a)) before a rebootstrap fires.
    */
@@ -125,6 +127,7 @@ module.exports = class BrokerPool {
     authenticationTimeout,
     metadataMaxAge,
     metadataRecoveryStrategy,
+    metadataClusterCheck,
     metadataRecoveryRebootstrapTriggerMs,
     drainTimeout,
   }) {
@@ -167,6 +170,7 @@ module.exports = class BrokerPool {
         allowAutoTopicCreation,
         authenticationTimeout,
         metadataRecoveryStrategy: this.metadataRecoveryStrategy,
+        metadataClusterCheck: this.metadataClusterCheck,
         metadataIdentity: () => ({
           clusterId: this.metadata?.clusterId ?? null,
           nodeId: broker.nodeId ?? -1,
@@ -195,6 +199,7 @@ module.exports = class BrokerPool {
     this.versions = null
 
     this.metadataRecoveryStrategy = metadataRecoveryStrategy ?? 'rebootstrap'
+    this.metadataClusterCheck = metadataClusterCheck ?? true
     this.metadataRecoveryRebootstrapTriggerMs = metadataRecoveryRebootstrapTriggerMs ?? 300000
 
     /** Failures `onApiVersionsFailure` already recovered from, so a surrounding catch skips them. */

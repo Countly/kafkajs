@@ -1,0 +1,9 @@
+{
+  "construction": "Hand-assembled from the UnregisterController response definition (flexible version): an int32 throttle time, an int16 error code, a compact nullable error message (null) and an empty tag buffer, with struct packing and no codec of this repository.",
+  "hex": "0000001900000000",
+  "fields": {
+    "throttleTimeMs": 25,
+    "errorCode": 0,
+    "errorMessage": null
+  }
+}

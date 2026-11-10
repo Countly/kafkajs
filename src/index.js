@@ -77,6 +77,7 @@ const KAFKA_FIELDS = [
   'logLevel',
   'logCreator',
   'metadataRecoveryStrategy',
+  'metadataClusterCheck',
   'metadataRecoveryRebootstrapTriggerMs',
 ]
 const PRODUCER_FIELDS = [
@@ -186,6 +187,19 @@ const validateMetadataRecoveryStrategy = (value) => {
   if (METADATA_RECOVERY_STRATEGIES.includes(value)) return value
   throw new KafkaJSNonRetriableError(
     `metadataRecoveryStrategy must be one of ${METADATA_RECOVERY_STRATEGIES.join(', ')}, got ${inspect(value)}`
+  )
+}
+
+/**
+ * Accepts only a boolean for metadataClusterCheck; a string or number is never coerced.
+ * @param {boolean} value
+ * @returns {boolean}
+ * @throws {KafkaJSInvalidConfigurationError} on a non-boolean
+ */
+const validateMetadataClusterCheck = (value) => {
+  if (typeof value === 'boolean') return value
+  throw new KafkaJSInvalidConfigurationError(
+    `metadataClusterCheck must be a boolean, got ${inspect(value)}`
   )
 }
 
@@ -423,6 +437,10 @@ module.exports = class Client {
    *   list when metadata is unreachable or a broker answers `REBOOTSTRAP_REQUIRED`, including to
    *   an ApiVersions v5 request that names the intended cluster and node (KIP-1242); `'none'`
    *   names no identity in ApiVersions and restores pre-3.0 behavior.
+   * @param {boolean} [options.metadataClusterCheck=true] `false` names no intended cluster or node
+   *   in ApiVersions v5, so a broker that is not the one the client expects is not refused with
+   *   `REBOOTSTRAP_REQUIRED`; rebootstrap on that answer and the other triggers are unchanged.
+   *   Only `true` with `metadataRecoveryStrategy: 'rebootstrap'` names an identity
    * @param {number} [options.metadataRecoveryRebootstrapTriggerMs=300000] how long metadata must
    *   fail *continuously* before a rebootstrap is triggered. Must be an integer >= 1.
    * @param {boolean} [options.enableMetricsPush=false] default broker client telemetry opt-in of
@@ -449,6 +467,7 @@ module.exports = class Client {
       logLevel = INFO,
       logCreator = LoggerConsole,
       metadataRecoveryStrategy = DEFAULT_METADATA_RECOVERY_STRATEGY,
+      metadataClusterCheck = true,
       metadataRecoveryRebootstrapTriggerMs = DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER_MS,
     } = options
     let {
@@ -492,6 +511,7 @@ module.exports = class Client {
     this[PRIVATE.MAX_RESPONSE_SIZE] = validatedMaxResponseSize
     const validatedMetadataRecoveryStrategy =
       validateMetadataRecoveryStrategy(metadataRecoveryStrategy)
+    const validatedMetadataClusterCheck = validateMetadataClusterCheck(metadataClusterCheck)
     const validatedMetadataRecoveryRebootstrapTriggerMs =
       validateMetadataRecoveryRebootstrapTriggerMs(metadataRecoveryRebootstrapTriggerMs)
 
@@ -535,6 +555,7 @@ module.exports = class Client {
         allowAutoTopicCreation,
         isolationLevel,
         metadataRecoveryStrategy: validatedMetadataRecoveryStrategy,
+        metadataClusterCheck: validatedMetadataClusterCheck,
         metadataRecoveryRebootstrapTriggerMs: validatedMetadataRecoveryRebootstrapTriggerMs,
       })
   }

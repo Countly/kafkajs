@@ -80,4 +80,5 @@ module.exports = {
   90: 0, // DescribeShareGroupOffsets
   91: 0, // AlterShareGroupOffsets
   92: 0, // DeleteShareGroupOffsets
+  94: 0, // UnregisterController
 }

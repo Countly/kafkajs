@@ -461,6 +461,13 @@
       "forkName": "deleteShareGroupOffsets",
       "apiKeysName": "DeleteShareGroupOffsets",
       "planned": "done"
+    },
+    {
+      "kafkaName": "UnregisterController",
+      "apiKey": 94,
+      "forkName": "unregisterController",
+      "apiKeysName": "UnregisterController",
+      "planned": "done"
     }
   ],
   "untracked": [

@@ -4,6 +4,7 @@ const createScramCredentials = require('./scramCredentials')
 const createTransactions = require('./transactions')
 const createClusterAdmin = require('./clusterAdmin')
 const createConfigResources = require('./configResources')
+const createUnregisterController = require('./unregisterController')
 const { inspect } = require('util')
 const AdminLifecycle = require('./lifecycle')
 const {
@@ -2789,6 +2790,7 @@ module.exports = ({
       fetchTopicMetadata,
       ...createClusterAdmin({ cluster, retry }),
       ...createConfigResources({ cluster, retry }),
+      ...createUnregisterController({ cluster, retry }),
       events,
       ...createOffsets({ cluster, retry }),
       ...createLogDirs({ cluster, retry }),
@@ -2841,6 +2843,7 @@ module.exports = ({
       describeFeatures: 0,
       updateFeatures: 0,
       listConfigResources: 0,
+      unregisterController: 0,
       fetchOffsets: 0,
       setOffsets: 0,
       resetOffsets: 0,

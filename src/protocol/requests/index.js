@@ -102,6 +102,7 @@ const requests = {
   DescribeShareGroupOffsets: require('./describeShareGroupOffsets'),
   AlterShareGroupOffsets: require('./alterShareGroupOffsets'),
   DeleteShareGroupOffsets: require('./deleteShareGroupOffsets'),
+  UnregisterController: require('./unregisterController'),
 }
 
 const names = Object.keys(apiKeys)
