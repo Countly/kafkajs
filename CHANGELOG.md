@@ -54,6 +54,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Every churn lifecycle whose selection is nonempty when its close begins must hold exactly one final, written inside the close, answered with error 0 and fully decoded; one under an empty selection must hold none. Cancellation allowances come from the scheduled retirements, not the transcript; each worker's driver source is joined to the run's tree; the share exchanges are archived once and joined by hash; each worker's native journal must cover every compressed Push; and each parent decoder child's memory is reported separately from `/proc`, or explicitly as unavailable. The close-and-reopen lane closes every kind, admin included, with the inherited 3000 ms budget, adds an admin zero-timeout arm (89 segments), bounds the admin blackhole cleanup by the smaller of 1000 ms and its finite remaining budget plus 100 ms, and links its fixed strict seams for private waiter, queue, snapshot and listener release.
 - The frozen coverage check can name the owner (test file, test, creation stack, endpoints) of every socket left open when a share cleanup baseline cannot settle; opt-in via `KAFKAJS_SOCKET_OWNERS=1`, enabled only in that check.
 - Client-metrics fixtures retry their creation readback for up to 3 s while broker metadata converges, keeping the exact configuration and listing checks and reporting the last observed mismatch on timeout.
+- The sharded soak CI job has 15 minutes instead of 10; its slowest shard already needed almost 10.
 
 #### Behavior changes
 
@@ -78,7 +79,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Fixes
 
-- A consumer that stops while an in-flight heartbeat loses the coordinator now still leaves its group (classic and consumer protocol): a coordinator rediscovered by the final offset commit is kept for the leave, without restarting heartbeats after stop. Previously the leave was skipped and the group waited a full session timeout (a regression from an earlier 3.0.0 pre-release).
+- A consumer that stops while an in-flight heartbeat loses the coordinator now still leaves its group (classic and consumer protocol): a coordinator rediscovered by the final offset commit is kept for the leave, without restarting heartbeats after stop. Previously the leave was skipped and the group waited a full session timeout (a regression from an earlier 3.0.0 pre-release). Coordinator recovery from a stale offset commit cannot overwrite the coordinator of a replacement membership.
 
 ### Phase 9E — Share groups
 
