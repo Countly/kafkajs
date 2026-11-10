@@ -1,11 +1,23 @@
 const net = require('net')
+const { Kafka, logLevel } = require('../index')
 const Decoder = require('../src/protocol/decoder')
+const { RESPONSE_HEADER_V1, responseHeaderVersion } = require('../src/protocol/headers')
 const CONFIG_RESOURCE_TYPES = require('../src/protocol/configResourceTypes')
 const CONFIG_SOURCE = require('../src/protocol/configSource')
 const ALTER_CONFIG_OP_TYPES = require('../src/protocol/alterConfigOpTypes')
 const sleep = require('../src/utils/sleep')
+const { plainTextBrokers, secureRandom } = require('./index')
 const { readRequestHeader } = require('./fakeSocket')
-const { setShareGroupConfigs } = require('./shareFixtures')
+const shareFetch = require('./wire/shareFetchV2')
+const shareAcknowledge = require('./wire/shareAcknowledgeV2')
+const {
+  setShareGroupConfigs,
+  resetShareGroupConfigs,
+  shareTopicName,
+  waitForShareFixtureAbsence,
+} = require('./shareFixtures')
+const { bounded, pollUntil } = require('../src/producer/__tests__/fixtures/bounded')
+const { CleanupStack } = require('../src/producer/__tests__/fixtures/liveProbe')
 
 /** The feature a Kafka 4.4 share cluster must have finalized before a dead-letter scenario runs. */
 const SHARE_VERSION_FEATURE = 'share.version'
@@ -212,6 +224,8 @@ class FrameSplitter {
  * @property {number} correlationId
  * @property {Buffer} request the request body, without its header
  * @property {Buffer|null} response the response body, without its header; null until it arrives
+ * @property {number} requestedAt `performance.now()` when the request was written
+ * @property {number|null} answeredAt `performance.now()` when the answer arrived; null until then
  */
 
 /**
@@ -222,7 +236,8 @@ class FrameSplitter {
 class ShareWireTap {
   /**
    * @param {object} [options]
-   * @param {number[]} [options.apiKeys] the APIs to record; the three share APIs by default
+   * @param {number[]} [options.apiKeys] the APIs to record; the three share APIs by default,
+   *   with the response header read for the version each request used
    * @param {Function} [options.connect] opens one socket from a Kafka socket factory's options;
    *   replaced by a fake in the broker-free checks
    */
@@ -269,6 +284,8 @@ class ShareWireTap {
           correlationId: header.correlationId,
           request: frame.subarray(header.byteLength),
           response: null,
+          requestedAt: performance.now(),
+          answeredAt: null,
         }
         this.exchanges.push(exchange)
         pending.set(header.correlationId, exchange)
@@ -281,8 +298,11 @@ class ShareWireTap {
         if (!exchange) continue
         pending.delete(exchange.correlationId)
         const header = new Decoder(frame.subarray(8))
-        header.readTaggedFields()
+        if (responseHeaderVersion(exchange.apiKey, exchange.apiVersion) === RESPONSE_HEADER_V1) {
+          header.readTaggedFields()
+        }
         exchange.response = frame.subarray(8 + header.offset)
+        exchange.answeredAt = performance.now()
       }
     })
     return socket
@@ -300,6 +320,303 @@ class ShareWireTap {
   }
 }
 
+/**
+ * @param {WireExchange} exchange a recorded ShareFetch (78) or ShareAcknowledge (79) exchange
+ * @returns {object} its request, decoded independently of the client's own codec
+ * @throws {Error} when the exchange is another API or its body does not parse
+ */
+const readShareRequest = ({ apiKey, request }) => {
+  if (apiKey !== 78 && apiKey !== 79) throw new Error(`API ${apiKey} is not a share fetch`)
+  return (apiKey === 78 ? shareFetch : shareAcknowledge).readRequest(request)
+}
+
+/**
+ * Lists, for every offset, the acknowledge types the client wrote for it, in request order. A
+ * batch with one type applies it to every offset it covers; otherwise the types line up with the
+ * offsets. Offsets are exact decimal strings.
+ * @param {object[]} requests decoded ShareFetch or ShareAcknowledge requests, oldest first
+ * @param {string} topicId the topic to read
+ * @param {number} partition the partition to read
+ * @returns {Map<string, number[]>} acknowledge types by decimal offset
+ */
+const acknowledgeTypesByOffset = (requests, topicId, partition) => {
+  const types = new Map()
+  for (const request of requests) {
+    for (const topic of request.topics.filter((entry) => entry.topicId === topicId)) {
+      for (const row of topic.partitions.filter((entry) => entry.partitionIndex === partition)) {
+        for (const { firstOffset, lastOffset, acknowledgeTypes } of row.acknowledgementBatches) {
+          for (let offset = BigInt(firstOffset); offset <= BigInt(lastOffset); offset++) {
+            const type =
+              acknowledgeTypes.length === 1
+                ? acknowledgeTypes[0]
+                : acknowledgeTypes[Number(offset - BigInt(firstOffset))]
+            const key = String(offset)
+            types.set(key, [...(types.get(key) ?? []), type])
+          }
+        }
+      }
+    }
+  }
+  return types
+}
+
+/**
+ * Where one partition appears in a client's ShareFetch requests, as indexes into the given list:
+ * the first request carrying acknowledgements for it, the requests that name it in the forgotten
+ * set, and the last request that lists it. This is what shows whether a partition left the
+ * session in the very request that carried its last acknowledgements.
+ * @param {object[]} requests decoded ShareFetch requests of one client, oldest first
+ * @param {string} topicId the topic to read
+ * @param {number} partition the partition to read
+ * @returns {{ firstAcknowledged: number, forgotten: number[], lastListed: number }} indexes, -1
+ *   when absent
+ */
+const partitionLifecycle = (requests, topicId, partition) => {
+  const lifecycle = { firstAcknowledged: -1, forgotten: [], lastListed: -1 }
+  requests.forEach((request, index) => {
+    for (const topic of request.topics.filter((entry) => entry.topicId === topicId)) {
+      for (const row of topic.partitions.filter((entry) => entry.partitionIndex === partition)) {
+        lifecycle.lastListed = index
+        if (lifecycle.firstAcknowledged === -1 && row.acknowledgementBatches.length > 0) {
+          lifecycle.firstAcknowledged = index
+        }
+      }
+    }
+    for (const topic of request.forgottenTopicsData.filter((entry) => entry.topicId === topicId)) {
+      if (topic.partitions.includes(partition)) lifecycle.forgotten.push(index)
+    }
+  })
+  return lifecycle
+}
+
+/**
+ * The partitions of one topic that a member's heartbeat answers assigned, as each answer that
+ * carried an assignment stated them; answers with no assignment change nothing.
+ * @param {object[]} answers decoded ShareGroupHeartbeat answers of one member, oldest first
+ * @param {string} topicId the topic to read
+ * @returns {number[][]} the sorted partitions of every distinct stated assignment, in order
+ */
+const assignedPartitions = (answers, topicId) => {
+  const history = []
+  for (const { assignment } of answers) {
+    if (!assignment) continue
+    const partitions = assignment.topicPartitions
+      .filter((entry) => entry.topicId === topicId)
+      .flatMap((entry) => entry.partitions)
+      .sort((a, b) => a - b)
+    const last = history[history.length - 1]
+    if (!last || last.join() !== partitions.join()) history.push(partitions)
+  }
+  return history
+}
+
+/** The Metadata API, recorded next to the share APIs so a scenario can see a metadata refresh. */
+const METADATA_API_KEY = 3
+
+/** Fixed budgets, in ms, of the fixture's own steps. */
+const STEP_MS = 15000
+const CLEANUP_MS = 40000
+
+/**
+ * The shared body of a live Kafka 4.4 share scenario: one admin, one wire tap that sees every
+ * client of the scenario, and a cleanup stack that deletes what the scenario created and proves
+ * it gone. A scenario creates topics, groups, a producer and consumers through it, so nothing is
+ * left behind whatever the outcome.
+ */
+class ShareKafka44Fixture {
+  /**
+   * @param {string} scenario lower-case kebab-case scenario name, part of every topic name
+   */
+  constructor(scenario) {
+    this.scenario = scenario
+    this.nonce = secureRandom(4)
+    this.tap = new ShareWireTap({ apiKeys: [...SHARE_API_KEYS, METADATA_API_KEY] })
+    this.stack = new CleanupStack()
+    this.groups = []
+    this.topics = []
+    this.admin = null
+  }
+
+  /**
+   * @param {string} label names the client; its sockets are tagged with it in the tap
+   * @param {object} [config] extra Kafka options
+   * @returns {Kafka} a client whose sockets go through the tap
+   */
+  client(label, config = {}) {
+    return new Kafka({
+      clientId: `${label}-${this.nonce}`,
+      brokers: plainTextBrokers(),
+      logLevel: logLevel.NOTHING,
+      socketFactory: this.tap.factory(label),
+      ...config,
+    })
+  }
+
+  /**
+   * Runs `work`, then every cleanup, whatever `work` did.
+   * @param {() => Promise<void>} work the scenario body
+   * @returns {Promise<void>}
+   * @throws {Error} the body's failure first, else the first cleanup failure
+   */
+  run(work) {
+    return this.stack.run(work, { budgetMs: CLEANUP_MS })
+  }
+
+  /**
+   * Connects the admin client and proves the cluster finalized `share.version` at 2. Registers the
+   * last cleanup: the proof that every owned group and topic is gone, then the admin's close.
+   * @param {AbortSignal} scope the case scope
+   * @returns {Promise<void>}
+   */
+  async open(scope) {
+    this.admin = this.client('admin').admin()
+    this.stack.add('prove fixtures gone and disconnect admin', async (signal) => {
+      try {
+        await waitForShareFixtureAbsence(this.admin, this.groups, this.topics, {
+          signal,
+          unrelated: [],
+        })
+      } finally {
+        await this.admin.disconnect()
+      }
+    })
+    await bounded(scope, STEP_MS, () => this.admin.connect())
+    await bounded(scope, STEP_MS, () => prepareShareKafka44({ admin: this.admin }))
+  }
+
+  /**
+   * Creates a topic whose name starts with the share scenario prefix and registers its deletion.
+   * @param {AbortSignal} scope the case scope
+   * @param {object} [options]
+   * @param {number} [options.partitions=1] partition count, ignored with `assignment`
+   * @param {number[][]} [options.assignment] replica ids per partition, which fixes the leaders
+   * @param {string} [options.name] the whole topic name, for a name the broker constrains
+   * @returns {Promise<string>} the topic name
+   */
+  async topic(scope, { partitions = 1, assignment, name } = {}) {
+    const topic = name ?? shareTopicName(this.scenario)
+    this.topics.push(topic)
+    this.stack.add(`delete topic ${topic}`, (signal) => this.deleteTopic(topic, signal))
+    await bounded(scope, STEP_MS, () =>
+      this.admin.createTopics({
+        waitForLeaders: true,
+        timeout: 10000,
+        topics: [
+          assignment
+            ? {
+                topic,
+                replicaAssignment: assignment.map((replicas, partition) => ({
+                  partition,
+                  replicas,
+                })),
+              }
+            : { topic, numPartitions: partitions, replicationFactor: 1 },
+        ],
+      })
+    )
+    return topic
+  }
+
+  /**
+   * @param {string} topic an owned topic
+   * @param {AbortSignal} signal the cleanup scope
+   * @returns {Promise<void>}
+   */
+  async deleteTopic(topic, signal) {
+    await bounded(signal, 10000, () =>
+      this.admin.deleteTopics({ topics: [topic], timeout: 8000 })
+    ).catch((error) => {
+      if (error.type !== 'UNKNOWN_TOPIC_OR_PARTITION') throw error
+    })
+  }
+
+  /**
+   * Registers a group id for deletion and, when `configs` is given, sets those group configs and
+   * waits for their readback before any member can join.
+   * @param {AbortSignal} scope the case scope
+   * @param {string} topic an owned topic, which names the group
+   * @param {Record<string, string|number|boolean>} [configs] GROUP configs to set
+   * @returns {Promise<string>} the group id
+   */
+  async group(scope, topic, configs) {
+    const group = `${topic}-group`
+    this.groups.push(group)
+    this.stack.add(`delete group ${group}`, (signal) => this.deleteGroup(group, signal))
+    if (configs) {
+      this.stack.add(`reset group configs of ${group}`, (signal) =>
+        resetShareGroupConfigs(this.admin, group, Object.keys(configs), { signal })
+      )
+      await bounded(scope, STEP_MS, () => setShareGroupConfigs(this.admin, group, configs))
+    }
+    return group
+  }
+
+  /**
+   * @param {string} group an owned group id
+   * @param {AbortSignal} signal the cleanup scope
+   * @returns {Promise<void>} once the broker no longer lists the group
+   */
+  async deleteGroup(group, signal) {
+    await pollUntil(
+      signal,
+      15000,
+      async () => {
+        try {
+          await this.admin.deleteGroups([group])
+          return true
+        } catch (error) {
+          const code = error.groups?.[0]?.error?.code
+          if (code === 69) return true
+          if (code === 68) return false
+          throw error
+        }
+      },
+      { label: `Deleting group ${group}` }
+    )
+  }
+
+  /**
+   * @param {AbortSignal} scope the case scope
+   * @returns {Promise<object>} a connected producer that never creates topics, closed on cleanup
+   */
+  async producer(scope) {
+    const producer = this.client('producer').producer({ allowAutoTopicCreation: false })
+    this.stack.add('disconnect producer', () => producer.disconnect())
+    await bounded(scope, STEP_MS, () => producer.connect())
+    return producer
+  }
+
+  /**
+   * @param {AbortSignal} scope the case scope
+   * @param {string} label names the member in the tap
+   * @param {object} config shareConsumer options; `groupId` is required
+   * @param {string[]} topics the topics to subscribe
+   * @param {object} handlers the `run` options, `eachMessage` or `eachBatch`
+   * @returns {Promise<{ consumer: object, crashes: Error[], acknowledgements: object[] }>} a
+   *   running member and what its events reported; closed on cleanup
+   */
+  async member(scope, label, config, topics, handlers) {
+    const consumer = this.client(label).shareConsumer({
+      acquireMode: 'record_limit',
+      maxRecords: 100,
+      maxWaitTimeInMs: 250,
+      ...config,
+    })
+    const member = { label, consumer, crashes: [], acknowledgements: [] }
+    const { events } = consumer
+    const removers = [
+      consumer.on(events.CRASH, ({ payload }) => member.crashes.push(payload.error)),
+      consumer.on(events.ACKNOWLEDGE, ({ payload }) => member.acknowledgements.push(payload)),
+    ]
+    this.stack.add(`remove ${label} listeners`, () => removers.forEach((remove) => remove()))
+    this.stack.add(`disconnect ${label}`, () => consumer.disconnect({ timeout: 8000 }))
+    await bounded(scope, STEP_MS, () => consumer.connect())
+    await bounded(scope, STEP_MS, () => consumer.subscribe({ topics }))
+    await bounded(scope, STEP_MS, () => consumer.run(handlers))
+    return member
+  }
+}
+
 module.exports = {
   SHARE_VERSION_LEVEL,
   SHARE_API_KEYS,
@@ -307,4 +624,10 @@ module.exports = {
   configureShareDlq,
   resetShareDlqClusterConfigs,
   ShareWireTap,
+  ShareKafka44Fixture,
+  METADATA_API_KEY,
+  readShareRequest,
+  acknowledgeTypesByOffset,
+  partitionLifecycle,
+  assignedPartitions,
 }

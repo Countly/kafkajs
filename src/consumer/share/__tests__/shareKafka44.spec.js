@@ -3,8 +3,14 @@ const Encoder = require('../../../protocol/encoder')
 const shareFetch = require('../../../../testHelpers/wire/shareFetchV2')
 const shareHeartbeat = require('../../../../testHelpers/wire/shareGroupHeartbeatV1')
 const expected = require('../../../../testHelpers/wire/expected')
-const { A, acquired, fetchAnswer, part } = require('../../../../testHelpers/shareHarness')
-const { prepareShareKafka44, ShareWireTap } = require('../../../../testHelpers/shareKafka44')
+const { A, B, acquired, fetchAnswer, part } = require('../../../../testHelpers/shareHarness')
+const {
+  acknowledgeTypesByOffset,
+  assignedPartitions,
+  partitionLifecycle,
+  prepareShareKafka44,
+  ShareWireTap,
+} = require('../../../../testHelpers/shareKafka44')
 
 /** @param {Record<string, number>} levels finalized levels by feature name. @returns {object} An admin whose `describeFeatures` reports them. */
 const adminWith = (levels) => ({
@@ -185,5 +191,86 @@ describe('Share Kafka 4.4 wire observation', () => {
         Buffer.concat([Buffer.from(vector.responseHex, 'hex'), Buffer.from([1])])
       )
     ).toThrow('its tag buffer')
+  })
+
+  test('lists the acknowledge types of every offset in request order', () => {
+    const batch = (firstOffset, lastOffset, acknowledgeTypes) => ({
+      firstOffset,
+      lastOffset,
+      acknowledgeTypes,
+    })
+    const request = (partitionIndex, acknowledgementBatches, topicId = A) => ({
+      topics: [{ topicId, partitions: [{ partitionIndex, acknowledgementBatches }] }],
+    })
+    const types = acknowledgeTypesByOffset(
+      [
+        request(0, [batch('0', '2', [2]), batch('5', '6', [1, 3])]),
+        request(1, [batch('0', '0', [1])]),
+        request(0, [batch('0', '1', [1]), batch('7', '7', [0])], B),
+        request(0, [batch('0', '2', [1])]),
+      ],
+      A,
+      0
+    )
+    expect(types).toEqual(
+      new Map([
+        ['0', [2, 1]],
+        ['1', [2, 1]],
+        ['2', [2, 1]],
+        ['5', [1]],
+        ['6', [3]],
+      ])
+    )
+  })
+
+  test('finds the request that carries the last acknowledgements and forgets the partition', () => {
+    const fetch = (listed, forgotten = []) => ({
+      topics: [
+        {
+          topicId: A,
+          partitions: listed.map(([partitionIndex, acknowledged]) => ({
+            partitionIndex,
+            acknowledgementBatches: acknowledged
+              ? [{ firstOffset: '0', lastOffset: '0', acknowledgeTypes: [1] }]
+              : [],
+          })),
+        },
+      ],
+      forgottenTopicsData: forgotten.length ? [{ topicId: A, partitions: forgotten }] : [],
+    })
+    const requests = [fetch([[0], [1]]), fetch([[1]]), fetch([[0, true], [1]], [0]), fetch([[1]])]
+    expect(partitionLifecycle(requests, A, 0)).toEqual({
+      firstAcknowledged: 2,
+      forgotten: [2],
+      lastListed: 2,
+    })
+    expect(partitionLifecycle(requests, A, 1)).toEqual({
+      firstAcknowledged: -1,
+      forgotten: [],
+      lastListed: 3,
+    })
+    expect(partitionLifecycle(requests, B, 0)).toEqual({
+      firstAcknowledged: -1,
+      forgotten: [],
+      lastListed: -1,
+    })
+  })
+
+  test('lists each distinct stated assignment and ignores answers that state none', () => {
+    const answer = (partitions) => ({
+      assignment: partitions && {
+        topicPartitions: [
+          { topicId: A, partitions },
+          { topicId: B, partitions: [9] },
+        ],
+      },
+    })
+    expect(
+      assignedPartitions(
+        [answer([1, 0]), answer(null), answer([0, 1]), answer([1]), answer(null), answer([1])],
+        A
+      )
+    ).toEqual([[0, 1], [1]])
+    expect(assignedPartitions([answer(null)], A)).toEqual([])
   })
 })
