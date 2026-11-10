@@ -64,9 +64,13 @@ describe('scripts/compat/fetch', () => {
       expect(files).toContain('ProduceResponse.json')
     })
 
+    // Tracked APIs that first ship after 4.3.1 have no 4.3.1 message files.
+    const addedAfter431 = ['UnregisterControllerRequest.json', 'UnregisterControllerResponse.json']
+
     it.each(['4.3.1', '4.4.0'])('matches the committed %s snapshot exactly', (tag) => {
       const snapshot = fs.readdirSync(path.join(__dirname, '..', 'messages', tag)).sort()
-      expect(files).toEqual(snapshot)
+      const expected = tag === '4.3.1' ? files.filter((n) => !addedAfter431.includes(n)) : files
+      expect(expected).toEqual(snapshot)
     })
   })
 
