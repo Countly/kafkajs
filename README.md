@@ -66,6 +66,8 @@ Compression is selected per `send()` or `sendBatch()` call; there is no producer
 
 On Kafka 4.4 or newer, [`admin.unregisterController({ controllerId })`](./docs/Admin.md#unregister-a-controller) removes a controller registration, and [`metadataClusterCheck`](./docs/Configuration.md#metadata-recovery) controls whether reconnects name the expected cluster and node.
 
+[`bootstrapResolveTimeout`](./docs/Configuration.md#bootstrapresolvetimeout) optionally waits for bootstrap DNS readiness before the first connection.
+
 ## Migrating from `kafkajs`
 
 Replace the package name for the preserved API plus documented semantic differences. Read the [migration guide](./docs/MigrationGuide-3-0-0.md) for the changed defaults and behavior, and the [CHANGELOG](./CHANGELOG.md) for release details.

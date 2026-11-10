@@ -98,6 +98,14 @@ const kafka = new Kafka({
 
 An address without a reverse name stays an address, as in Java.
 
+### `bootstrapResolveTimeout`
+
+`bootstrapResolveTimeout` is an integer timeout in milliseconds, from 0 to 2147483647, with a default of `0` (disabled). A positive value makes the first connection wait until at least one bootstrap hostname resolves. The connection then dials the original hostname, preserving the TLS server name and the hostname passed to a custom `socketFactory`.
+
+Each client owns its readiness check, and concurrent connection attempts share that check. It applies both to an explicit `connect()` and to initial metadata discovery, including `subscribe()` before `connect()`. If `brokers` is a dynamic function, its first returned, validated list is used for both the readiness check and the initial connection.
+
+If the deadline expires, the check fails with a terminal `KafkaJSBootstrapResolutionError`. Later attempts on that client reject with the same error; create a new client to try again. Disconnect cancels a pending check, and the next connection attempt checks again. After the first readiness success, the check is never repeated, including on reconnect.
+
 ## SSL
 
 The `ssl` option can be used to configure the TLS sockets. The options are passed directly to [`tls.connect`](https://nodejs.org/api/tls.html#tls_tls_connect_options_callback) and used to create the TLS Secure Context, all options are accepted.
