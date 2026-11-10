@@ -280,3 +280,38 @@ test('attributes weak observation history without exempting strongly retained pr
   expect(labels[6]).not.toBe('harness:weak-observation-history')
   expect(labels[7]).toBe('harness:weak-observation-history')
 })
+
+test('cold backing ledger preserves store identities, aliases, replacements and release paths', () => {
+  const { backingInventory, backingComparison } = require('../retained/coldOwnership')
+  const snapshot = (id, size, alias = true) => {
+    const graph = analyseSnapshot(
+      fixture([
+        ['synthetic', 'root', 1, 0, [['property', 'client', 1]]],
+        [
+          'object',
+          'TelemetryPayload',
+          3,
+          40,
+          [['property', 'retainedOnce', 2], ...(alias ? [['property', 'alias', 3]] : [])],
+        ],
+        ['object', 'Buffer', 5, 32, [['internal', 'buffer', 4]]],
+        ['object', 'Buffer', 7, 32, alias ? [['internal', 'buffer', 4]] : []],
+        ['object', 'ArrayBuffer', 9, 32, [['internal', 'backing_store', 5]]],
+        ['object', 'system / JSArrayBufferData', id, size, []],
+      ])
+    )
+    return { graph, labels: refineOwnership(graph).labels }
+  }
+  const old = backingInventory(snapshot(11, 1048576))
+  expect(old).toHaveLength(1)
+  expect(old[0]).toMatchObject({ id: 11, selfBytes: 1048576 })
+  expect(old[0].aliases.map((entry) => entry.id)).toEqual([5, 7])
+  expect(old[0].rootPath.map((entry) => entry.edge?.name)).toContain('retainedOnce')
+  const next = backingInventory(snapshot(13, 65536, false))
+  const replaced = backingComparison(old, next)
+  expect(replaced.removed.map((row) => row.id)).toEqual([11])
+  expect(replaced.added.map((row) => row.id)).toEqual([13])
+  expect(replaced.delta).toBe(65536 - 1048576)
+  expect(backingComparison(next, []).removed.map((row) => row.id)).toEqual([13])
+  expect(backingComparison(old, old).surviving[0].id).toBe(11)
+})

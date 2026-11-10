@@ -219,10 +219,13 @@ class ProcessMemory {
    * most six pairs. Every reading remains in the evidence and contributes to peak coverage. The
    * last reading is returned even when convergence fails; no minimum or favourable endpoint is
    * selected. Engine code sizes diagnose first-use compilation separately, without subtracting it.
+   * @param {Function|null} [observe] diagnostic-only synchronous (round, stage) scalar observer;
+   *   omitted in acceptance, with no additional reads, collections or turns
+   * @param {Function|null} [completed] diagnostic-only synchronous observer of the final reading
    * @returns {Promise<object>} the final reading and all GC admission/completion/engine facts
    * @throws {Error} when no collection function exists
    */
-  async settled() {
+  async settled(observe = null, completed = null) {
     if (typeof this.gc !== 'function') throw new Error('A settled reading needs node --expose-gc')
     const admittedAt = this.now()
     const before = this.collections
@@ -233,8 +236,13 @@ class ProcessMemory {
       this.gc()
       await this.sleep(GC_PAUSE_MS)
       this.gc()
+      if (observe) observe(round, 'after-second-gc')
+      if (observe) observe(round, 'before-turn-1')
       await this.settleTurn()
+      if (observe) observe(round, 'after-turn-1')
+      if (observe) observe(round, 'before-turn-2')
       await this.settleTurn()
+      if (observe) observe(round, 'after-turn-2')
       const code = v8.getHeapCodeStatistics()
       const reading = this.current()
       const checkpoint = {
@@ -254,10 +262,12 @@ class ProcessMemory {
         last[key],
       ])
     )
-    return {
+    const result = {
       ...reading,
       gc: { admittedAt, completedAt: reading.at, observed: this.collections - before, checkpoints },
     }
+    if (completed) completed(result)
+    return result
   }
 
   /** @returns {void} stops watching collections */

@@ -21,6 +21,7 @@ const { DiagnosticMemory, DiagnosticSampler } = require('../retained/observer')
 const TelemetryPayload = require('../../../../src/telemetry/payload')
 const { MEMORY_FLAGS } = require('../../../../testHelpers/processMemory')
 const { foregroundCatalogue } = require('../resourceArtifact')
+const { STAGES } = require('../retained/settlement')
 const {
   MemoryForeground,
   descriptor,
@@ -130,27 +131,53 @@ const evidence = (dir, id = identity()) => {
       },
     })
   let tick = 1000
-  const checkpoint = (name) => {
+  let measurementId = 0
+  const measured = () => {
     tick += 1000
+    const result = reading(tick)
+    result.gc.diagnosticId = ++measurementId
+    log.write('settlement', {
+      id: measurementId,
+      phase: 'fixture',
+      readingAt: tick,
+      checkpoints: result.gc.checkpoints,
+      observations: result.gc.checkpoints.flatMap((point, round) =>
+        STAGES.map((stage, index) => ({
+          ...point,
+          round,
+          stage,
+          at: point.at - 90 + index * 10,
+          submittedId: 0,
+          submittedJobId: 0,
+          submittedCodec: 0,
+          settledId: 0,
+          settledJobId: 0,
+          settledCodec: 0,
+          pending: 0,
+        }))
+      ),
+    })
+    return result
+  }
+  const checkpoint = (name, pre = measured()) => {
     log.write('checkpoint', {
       name,
-      observedAt: tick,
-      startedAt: tick + 1,
-      endedAt: tick + 2,
-      pre: reading(tick),
-      post: { at: tick + 3 },
+      observedAt: pre.at,
+      startedAt: pre.at + 1,
+      endedAt: pre.at + 2,
+      pre,
+      post: { at: pre.at + 3 },
       file: null,
       bytes: 0,
       sha256: null,
     })
+    return pre
   }
-  for (const name of CAPTURES.slice(0, 3)) checkpoint(name)
-  const c0 = reading(2000)
-  const c1 = reading(3000)
+  const [c0, c1, released] = CAPTURES.slice(0, 3).map((name) => checkpoint(name))
   log.write('control', {
     c0,
     c1,
-    released: reading(4000),
+    released,
     facts: {
       enabled: false,
       api71: 0,
@@ -164,7 +191,9 @@ const evidence = (dir, id = identity()) => {
   })
   checkpoint('M')
   for (let index = 0; index < 6; index++) {
-    if (index === 0 || index === 5) checkpoint(`closed-${index}`)
+    const actives = [measured(), measured()]
+    const closed = measured()
+    if (index === 0 || index === 5) checkpoint(`closed-${index}`, closed)
     const rows = ['gzip', 'zstd'].flatMap((codec, c) =>
       [false, true].map((retired, r) => ({
         id: c * 2 + r + 1,
@@ -184,8 +213,8 @@ const evidence = (dir, id = identity()) => {
     )
     log.write('block', {
       index,
-      closed: reading(tick),
-      actives: [reading(tick - 500), reading(tick - 250)],
+      closed,
+      actives,
       delta: 0,
       matchedRetained: 1000000,
       ops: foregroundCatalogue(id.kind, 5).ops,

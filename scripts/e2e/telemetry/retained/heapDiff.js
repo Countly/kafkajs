@@ -318,6 +318,7 @@ const ownershipIndex = (graph) => {
         if (
           [
             'ProcessMemory',
+            'DiagnosticMemory',
             'NativeJournal',
             'PendingSampler',
             'DiagnosticSampler',

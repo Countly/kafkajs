@@ -7,6 +7,7 @@ const { analyseSnapshot, ownershipIndex, auditReferences } = require('./heapDiff
 const { ephemeronLiveness, refineOwnership, selfLedger } = require('./ownership')
 const { replay, verifySources } = require('../retainedDiagnostic')
 const { CAPTURES, CATALOGUE, validateCatalogue, digest } = require('./contract')
+const { backingInventory, backingComparison } = require('./coldOwnership')
 
 /**
  * Reads one authenticated graph and records semantic liveness independently of ordinary dominators.
@@ -185,6 +186,8 @@ const main = async (directory) => {
     let matched
     let previous
     const snapshots = []
+    const cold = []
+    const coldOwners = []
     for (const name of CAPTURES) {
       const capture = captures.find((row) => row.name === name)
       if (!capture) continue
@@ -192,6 +195,29 @@ const main = async (directory) => {
       if (current.bytes !== capture.bytes || current.sha256 !== capture.sha256)
         throw new Error('offline capture authentication failed')
       const report = details(previous, current)
+      if (['M', 'closed-0', 'closed-5', 'all-released'].includes(name)) {
+        cold.push({ name, sha256: current.sha256, backingStores: backingInventory(current) })
+        if (name === 'closed-0')
+          for (const owner of report.material)
+            if (!owner.previous || owner.selfBytes !== owner.previous.selfBytes)
+              coldOwners.push({ id: owner.id, first: owner, endpoints: [] })
+        if (coldOwners.length) {
+          const ids = new Map()
+          for (let v = 0; v < current.graph.n; v++) ids.set(current.graph.describe(v).id, v)
+          for (const owner of coldOwners) {
+            const v = ids.get(owner.id)
+            owner.endpoints.push({
+              name,
+              present: v !== undefined,
+              semanticLive: current.semantic.reachableIds.has(owner.id),
+              node: v === undefined ? null : current.graph.describe(v),
+              category: v === undefined ? null : current.labels[v],
+              rootPath:
+                v === undefined || current.graph.groupIndex[v] < 0 ? [] : current.graph.rootPath(v),
+            })
+          }
+        }
+      }
       const semantic = current.semantic
       const conditional = semantic.pairs.filter(
         (pair) => pair.active && !pair.independentlyReachableValue
@@ -264,7 +290,31 @@ const main = async (directory) => {
       })
       previous = current
     }
-    analyses.push({ arm: result.arm, kind: result.kind, analysisComplete: snapshots.length === 7 })
+    const coldReport = {
+      schema: 1,
+      diagnostic: true,
+      acceptanceEligible: false,
+      attributionComplete: false,
+      captures: cold,
+      stores: cold.slice(1).map((capture, index) => ({
+        before: cold[index].name,
+        after: capture.name,
+        ...backingComparison(cold[index].backingStores, capture.backingStores),
+      })),
+      coldOwners,
+      selfBytes: comparisons
+        .filter((row) => ['closed-0', 'closed-5', 'all-released'].includes(row.name))
+        .map((row) => ({ name: row.name, originalM: row.originalM, consecutive: row.consecutive })),
+      limitations:
+        'Cold owners are material new/resized nodes at closed-0 relative to M; retained sizes and root paths overlap and are not added. Self-byte ledgers retain unknown additions/removals and transfers. Store IDs describe snapshot-visible backing storage, not unobserved native allocator scratch. A reviewer must attribute material unknowns and confirm lifetimes; capture counters cannot be subtracted from pre-GC readings.',
+    }
+    fs.writeFileSync(path.join(child, 'cold-ownership.json'), JSON.stringify(coldReport))
+    analyses.push({
+      arm: result.arm,
+      kind: result.kind,
+      analysisComplete: snapshots.length === 7,
+      coldReport: 'cold-ownership.json',
+    })
     fs.writeFileSync(
       path.join(child, 'ownership.json'),
       JSON.stringify({
@@ -276,6 +326,7 @@ const main = async (directory) => {
         attributionComplete: false,
         snapshots,
         comparisons,
+        coldReport: 'cold-ownership.json',
         lifetimeExpectations: LIFETIMES,
         limitations:
           'Self bytes are additive; retained subtrees overlap and are never summed. Ordinary dominators conservatively include labelled pair edges; semantic AND(table,key) liveness and dependency-removal facts are separate. No subtraction from pre-capture heapUsed. Every residual/unclassified bucket and material named path requires owner review; flat later bytes do not establish cold ownership.',

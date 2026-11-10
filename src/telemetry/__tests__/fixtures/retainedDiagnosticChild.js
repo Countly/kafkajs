@@ -72,7 +72,12 @@ const journal = new NativeJournal({
   capacity: CAPACITY.native,
   epoch: () => epoch,
   onSubmit: (row) => {
-    memory.mark(`native:${row.codec}:submitted`)
+    memory.mark(`native:${row.codec}:submitted`, {
+      event: 'submitted',
+      id: row.id,
+      jobId: row.jobId,
+      codec: row.codec,
+    })
     submitted(row)
   },
 })
@@ -90,16 +95,22 @@ journal.idOf = (object) => {
 const nativeEnd = journal.end.bind(journal)
 journal.end = (row, value) => {
   nativeEnd(row, value)
-  memory.mark(`native:${row?.codec}:settled`)
+  if (row)
+    memory.mark(`native:${row.codec}:settled`, {
+      event: 'settled',
+      id: row.id,
+      jobId: row.jobId,
+      codec: row.codec,
+    })
 }
 for (const codec of codecs) journal.observe(codec.name, codec.module)
 const live = new Set()
 const turn = () => new Promise((resolve) => setImmediate(resolve))
-const settled = () => roles.run('fixture', () => memory.settled())
+const settled = (phase) => roles.run('fixture', () => memory.settled(phase))
 
 /** @param {string} name checkpoint name @returns {Promise<object>} scalar reading and ordered capture */
 const point = async (name) => {
-  const reading = await settled()
+  const reading = await settled(name)
   memory.mark(name)
   await memory.checkpoint(name, reading)
   return reading
@@ -164,8 +175,8 @@ const decode = async (enabled, codec) => {
   }
 }
 
-/** Executes the original two-codec retirement/reopen catalogue. @param {object} enabled same returned object @returns {Promise<object>} scalar facts, with all payload scopes released */
-const publicCatalogue = async (enabled) => {
+/** Executes the original two-codec retirement/reopen catalogue. @param {object} enabled same returned object @param {number} index block number @returns {Promise<object>} scalar facts, with all payload scopes released */
+const publicCatalogue = async (enabled, index) => {
   const reopens = []
   let armed = null
   let reopen = null
@@ -186,6 +197,7 @@ const publicCatalogue = async (enabled) => {
   }
   const actives = []
   for (const codec of codecs) {
+    memory.operationPhase = `public:block:${index}:${codec.name}`
     enabled.codecs = [codec.type, 0]
     await enabled.open()
     await until(() => enabled.accepted(codec.type) >= 2, `${codec.name} pushes`)
@@ -199,7 +211,7 @@ const publicCatalogue = async (enabled) => {
     await until(() => journal.live.size === 0, 'native settlement')
     memory.mark(`native:${codec.name}:settled`)
     await until(() => enabled.accepted(codec.type) > before, 'post-reopen push')
-    actives.push({ phase: codec.name, ...(await settled()) })
+    actives.push({ phase: codec.name, ...(await settled(memory.operationPhase)) })
     memory.mark(`public:${codec.name}`)
     if (codec.type === 1) {
       epoch++
@@ -207,7 +219,8 @@ const publicCatalogue = async (enabled) => {
       await enabled.drain()
     }
   }
-  actives.push({ phase: 'held', ...(await settled()) })
+  actives.push({ phase: 'held', ...(await settled(`${identity.arm}:block:${index}:held`)) })
+  memory.operationPhase = `public:block:${index}:close-decode`
   const uuid = await enabled.client.clientInstanceId({ timeout: 0 })
   epoch++
   const witness = new BoundaryWitness(() => memory.now())
@@ -248,8 +261,8 @@ const publicRun = async () => {
       await enabled.close(0)
       await enabled.drain()
     }
-    const facts = await roles.run('target', () => publicCatalogue(enabled))
-    const closed = await settled()
+    const facts = await roles.run('target', () => publicCatalogue(enabled, index))
+    const closed = await settled(`${identity.arm}:block:${index}:closed`)
     memory.mark(`closed:${index}`)
     if (index === 0 || index === 5) await memory.checkpoint(`closed-${index}`, closed)
     const registry = enabled.fingerprint(uuid)
@@ -292,11 +305,12 @@ const collectorCatalogue = async (state, index) => {
   const builds = []
   const actives = []
   for (const codec of codecs) {
+    memory.operationPhase = `collector:block:${index}:${codec.name}`
     builds.push(await nativePair(state.builder, snapshot, codec, () => epoch++))
     memory.mark(`native:${codec.name}:settled`)
-    actives.push({ phase: codec.name, ...(await settled()) })
+    actives.push({ phase: codec.name, ...(await settled(memory.operationPhase)) })
   }
-  actives.push({ phase: 'held', ...(await settled()) })
+  actives.push({ phase: 'held', ...(await settled(`${identity.arm}:block:${index}:held`)) })
   state.metrics.abandon(snapshot)
   snapshot = null
   state.builder.retire()
@@ -319,7 +333,7 @@ const collectorRun = async () => {
     memory.reserve()
     const firstNative = journal.rows.length
     const facts = await collectorCatalogue(state, index)
-    const closed = await settled()
+    const closed = await settled(`${identity.arm}:block:${index}:closed`)
     memory.mark(`closed:${index}`)
     if (index === 0 || index === 5) await memory.checkpoint(`closed-${index}`, closed)
     log.write('weak', { index, observations: weak.read() })

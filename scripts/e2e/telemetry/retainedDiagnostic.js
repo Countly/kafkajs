@@ -21,6 +21,8 @@ const {
   validateCatalogue,
 } = require('./retained/contract')
 
+const { settlementReport } = require('./retained/settlement')
+
 const ROOT = path.resolve(__dirname, '../../..')
 
 /**
@@ -229,6 +231,7 @@ const replay = async (directory, identity, exit) => {
     exit,
     problems,
     screens: screen(events),
+    settlement: problems.length === 0 ? settlementReport(events) : null,
   }
 }
 
