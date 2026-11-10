@@ -331,20 +331,29 @@ module.exports = class ClassicGroupProtocol {
    * Resolves the group coordinator. Re-run on every join, so a coordinator that moved is
    * re-discovered rather than reused, but it waits for the membership's pending lookup when there
    * is one instead of starting another. With a round, its fence ends this caller's wait, and the
-   * lookup itself when no other caller is left.
-   * @param {object} [round] the join's round; absent for a lookup outside a rebalance
-   * @returns {Promise<void>}
-   * @throws {KafkaJSError} the retriable join-deadline error when the membership was retired while
-   *   the lookup ran: its answer is installed for no one
+   * lookup itself when no other caller is left. Offset-manager discovery uses the same path so
+   * a commit restores the coordinator known to membership, including for a later leave.
+   * @param {{ fence?: import('../../producer/generation')|import('./interface').ConsumerOperation }} [round]
+   *   the join's round or an offset operation's fence; absent for an unfenced lookup
+   * @returns {Promise<import('../../../types').Broker>} the discovered coordinator
+   * @throws {KafkaJSError} the retriable join-deadline error when the membership was retired or
+   *   replaced while the lookup ran: its answer is installed for no one
+   * @throws {Error} the lookup's failure or caller fence's refusal
    */
   async connect(round) {
     const { membershipRevision } = this
+    const ownershipToken = this.ownership?.token()
     const coordinator = await this.coordinatorLookup.find(round?.fence)
-    if (this.membershipRevision !== membershipRevision) {
+    round?.fence?.check()
+    if (
+      this.membershipRevision !== membershipRevision ||
+      this.ownership?.token() !== ownershipToken
+    ) {
       throw joinDeadlineError({ rebalanceTimeoutMs: this.rebalanceTimeout })
     }
     this.coordinator = coordinator
     this.coordinatorUnknown = false
+    return coordinator
   }
 
   /**
@@ -352,8 +361,8 @@ module.exports = class ClassicGroupProtocol {
    * it, or its connection is no longer open: a retired broker refuses every request, a dead or
    * moved coordinator answers nothing useful, and a broker another user of the cluster disconnected
    * would reconnect outside the cluster's broker pool, where no later disconnect closes it. Between
-   * joins nothing else looks the coordinator up. Otherwise it is returned untouched. The Java
-   * client checks the coordinator's connection the same way (`checkAndGetCoordinator`).
+   * joins offset operations can also rediscover it through `connect()`. Otherwise it is returned
+   * untouched. The Java client checks the connection the same way (`checkAndGetCoordinator`).
    * @see https://github.com/apache/kafka/blob/4.3.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractCoordinator.java
    * @private
    * @param {import('./interface').ConsumerOperation} [operation] a caller operation whose close ends

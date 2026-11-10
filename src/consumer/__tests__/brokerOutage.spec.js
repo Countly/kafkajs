@@ -863,20 +863,26 @@ describe('Consumer > broker outages', () => {
       expect(wire(cluster, 'OffsetCommit')).toEqual([])
       expect(runner.consumerGroup.offsetManager.coordinator.isConnected()).toBe(true)
 
+      const heartbeatApi = groupProtocol === 'classic' ? 'Heartbeat' : 'ConsumerGroupHeartbeat'
+      const heldHeartbeat = cluster.schedule.hold({ api: heartbeatApi })
+      await heldHeartbeat.arrived()
       const disconnecting = consumer.disconnect()
       let stoppedAt
       try {
         await until(() => runner.stopRequested, 'the latched stop')
         stoppedAt = cluster.requests().length
-        // Only now lose the cached coordinator: ordinary heartbeats have stopped, but the
-        // eligible final commit must still discover a coordinator under the close's authority.
+        // The in-flight heartbeat must lose the membership's coordinator as well as the offset
+        // manager's connection, before the pending commit rediscovers it under close authority.
         breaker.take(COORDINATOR, 'reset')
-        await until(
-          () => !runner.consumerGroup.offsetManager.coordinator.isConnected(),
-          'the disconnected coordinator after stop'
-        )
+        await until(() => {
+          const membership = runner.consumerGroup.groupMembership
+          return groupProtocol === 'classic'
+            ? membership.coordinatorUnknown
+            : membership.coordinator === null
+        }, 'the heartbeat that lost the membership coordinator after stop')
         breaker.restore(COORDINATOR)
       } finally {
+        heldHeartbeat.release()
         releaseHandler()
         await disconnecting
       }

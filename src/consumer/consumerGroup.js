@@ -1162,7 +1162,11 @@ module.exports = class ConsumerGroup {
           coordinator: this.coordinator,
           revision: this.groupMembership.membershipRevision,
         }),
-        findCoordinator: (fence) => this.coordinatorLookup.find(fence),
+        findCoordinator: (fence) => {
+          if (this.kind === 'classic') return this.groupMembership.connect({ fence })
+          if (this.kind === 'consumer') return this.groupMembership.connect(undefined, fence)
+          return this.coordinatorLookup.find(fence)
+        },
         isStopping: () => this.isStopping(),
         isRebalancePending: () => Boolean(this.rebalanceCoordinator?.verdict),
         markPolled: () => this.rebalanceCoordinator?.pollTimer.poll(),

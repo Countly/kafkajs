@@ -6,6 +6,8 @@ const { COOPERATIVE } = require('../groupProtocol/interface')
 const { createErrorFromCode } = require('../../protocol/error')
 const { KafkaJSConnectionError } = require('../../errors')
 const { newLogger } = require('testHelpers')
+const Generation = require('../../producer/generation')
+const GroupOwnership = require('../groupOwnership')
 
 const {
   UNSUBSCRIBED,
@@ -115,6 +117,7 @@ const build = ({
   metadataMaxAge = 300000,
   retry = {},
   commitBeforeRelease = null,
+  ownership = null,
 } = {}) => {
   const sent = []
   const queue = [...answers]
@@ -168,6 +171,7 @@ const build = ({
     subscribedTopicRegex,
     metadataMaxAge,
     retry,
+    ownership,
     instrumentationEmitter,
     logger,
   })
@@ -248,6 +252,64 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
     await new Promise((resolve) => setImmediate(resolve))
     process.removeListener('unhandledRejection', trackUnhandled)
     expect(unhandled).toEqual([])
+  })
+
+  describe('coordinator publication', () => {
+    /** @returns {object} a real membership and lookup held at the cluster boundary */
+    const heldLookup = () => {
+      let resolve
+      const answer = new Promise((done) => (resolve = done))
+      const ownership = new GroupOwnership()
+      const { protocol, cluster } = build({ ownership })
+      cluster.findGroupCoordinator.mockImplementation(({ fence }) => fence.wait(answer))
+      return { protocol, ownership, resolve }
+    }
+
+    it.each(['caller fence', 'lookup retirement'])(
+      'publishes no coordinator after %s refuses a pending lookup',
+      async (reason) => {
+        const { protocol, resolve } = heldLookup()
+        const fence = new Generation()
+        const refusal = new Error('lookup refused')
+        const pending = protocol.connect(undefined, fence).catch((error) => error)
+        if (reason === 'caller fence') fence.close(refusal)
+        else protocol.coordinatorLookup.retire(refusal)
+        resolve({ nodeId: 'obsolete' })
+
+        expect(await pending).toBe(refusal)
+        expect(protocol.coordinator).toBeNull()
+      }
+    )
+
+    it('checks the caller fence again after the lookup resolves before publishing', async () => {
+      const { protocol, resolve } = heldLookup()
+      const fence = new Generation()
+      const refusal = new Error('caller retired before publication')
+      const find = protocol.coordinatorLookup.find.bind(protocol.coordinatorLookup)
+      jest.spyOn(protocol.coordinatorLookup, 'find').mockImplementation(async (caller) => {
+        const coordinator = await find(caller)
+        fence.close(refusal)
+        return coordinator
+      })
+      const pending = protocol.connect(undefined, fence).catch((error) => error)
+      resolve({ nodeId: 'obsolete' })
+
+      expect(await pending).toBe(refusal)
+      expect(protocol.coordinator).toBeNull()
+    })
+
+    it('keeps the replacement coordinator when ownership replacement overtakes a lookup', async () => {
+      const { protocol, ownership, resolve } = heldLookup()
+      const pending = protocol.connect(undefined, new Generation())
+      ownership.renew()
+      const current = { nodeId: 'current' }
+      protocol.coordinator = current
+      const obsolete = { nodeId: 'obsolete' }
+      resolve(obsolete)
+
+      await expect(pending).resolves.toBe(obsolete)
+      expect(protocol.coordinator).toBe(current)
+    })
   })
 
   describe('The join', () => {
