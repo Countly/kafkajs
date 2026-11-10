@@ -140,6 +140,7 @@ class BootstrapResolution {
   dispatch(round, hosts) {
     if (!this.isCurrent(round)) return
     for (const host of new Set(hosts)) {
+      if (!this.isCurrent(round)) return
       round.hosts.set(host, { delay: null, timer: null })
       this.attempt(round, host)
     }
