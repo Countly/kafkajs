@@ -32,6 +32,8 @@ const diagnostics = require('../../../../testHelpers/shareLiveDiagnostics')
  * decisions, acknowledgements, window observation, resource judging and reconstruction call
  * through their original implementations. The raw corpus is independent of handler evidence.
  * @param {object} [options] Selector, one/two scopes and bounded external fault controls.
+ * @param {Function} [options.processResources] Scripts process gauges from real timer ownership; omitted gauges are empty.
+ * @param {boolean} [options.twoScopes=false] Runs paced priming/archive controls instead of the original immediate-reply fault schedule.
  * @param {boolean} [options.correlateCleanup=false] Scripts the OS clock port from the fake schedule for archive controls.
  * @returns {Promise<object>} Original owner/evidence and weak first-use roots only.
  * @throws {Error} A scripted transport, cleanup or schedule failure.
@@ -53,7 +55,7 @@ const originalShareSchedule = async ({
   socketClosed = () => {},
   closeOnly = false,
   observeRow = () => {},
-  processResources = () => ({ counts: {}, owners: { rows: [], dropped: 0 } }),
+  processResources,
 } = {}) => {
   const clock = new ShareClock().install()
   const osOrigin = process.hrtime.bigint()
@@ -109,10 +111,10 @@ const originalShareSchedule = async ({
     }
     return socket
   }
-  // Jest owns application timers; only process gauges are scripted, while client sources call through.
-  const installTimers = jest
-    .spyOn(ShareTimerObserver.prototype, 'install')
-    .mockImplementation(() => {})
+  // Timer attribution must call through when a resource script consumes the original owners.
+  const installTimers = processResources
+    ? null
+    : jest.spyOn(ShareTimerObserver.prototype, 'install').mockImplementation(() => {})
   let instrumented
   try {
     instrumented = instrumentShare(
@@ -123,14 +125,16 @@ const originalShareSchedule = async ({
       { activeResources: false }
     )
   } finally {
-    installTimers.mockRestore()
+    installTimers?.mockRestore()
   }
   const resources = instrumented.shareResources
   const originalSnapshot = resources.snapshot
   // Heap and process resources are scripted inputs; original client state is always measured.
   resources.snapshot = async () => {
     const original = await originalSnapshot()
-    const { counts, owners } = processResources(original)
+    const { counts, owners } = processResources
+      ? processResources(original)
+      : { counts: {}, owners: { rows: [], dropped: 0 } }
     return {
       ...original,
       heapUsed: 1024,
@@ -268,6 +272,7 @@ const originalShareSchedule = async ({
         })
       wire({ fields, call, result, owner, records, members })
       if (
+        twoScopes &&
         fields.maxWaitMs > 0 &&
         fields.shareSessionEpoch >= 0 &&
         result.responses.every((t) => t.partitions.every((p) => p.acquiredRecords.length === 0))
