@@ -803,6 +803,9 @@ void (nodeIds[0] === 1)
 
 // The client option for the response-size limit.
 new Kafka({ brokers: ['localhost:9092'], maxResponseSize: 1048576 })
+new Kafka({ brokers: ['localhost:9092'], metadataClusterCheck: false })
+// @ts-expect-error the cluster check is a boolean
+new Kafka({ brokers: ['localhost:9092'], metadataClusterCheck: 'false' })
 
 // KafkaJSLockTimeout stays exported.
 new KafkaJSLockTimeout()

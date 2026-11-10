@@ -219,6 +219,8 @@ module.exports = class Broker {
    * @param {() => {clusterId: string|null, nodeId: number}} [options.metadataIdentity] private
    *   getter of the cluster and node this broker is meant to be (KIP-1242), read when each
    *   ApiVersions request is built and never cached; without one the requests name no identity
+   * @param {boolean} [options.metadataClusterCheck=true] `false` sends no identity in ApiVersions
+   *   v5 whatever the strategy; it does not change how a `REBOOTSTRAP_REQUIRED` answer is handled
    * @param {'rebootstrap'|'none'} [options.metadataRecoveryStrategy='rebootstrap'] `'none'` sends no
    *   identity and ignores `REBOOTSTRAP_REQUIRED` as a recovery trigger
    * @param {(error: Error, source: {broker: Broker, pool: object, guard?: (frameLength?: number) => Error|null}) => Promise<void>} [options.onApiVersionsFailure]
@@ -235,6 +237,7 @@ module.exports = class Broker {
     authenticationTimeout = 10000,
     allowAutoTopicCreation = true,
     metadataIdentity = null,
+    metadataClusterCheck = true,
     metadataRecoveryStrategy = 'rebootstrap',
     onApiVersionsFailure = null,
   }) {
@@ -278,6 +281,7 @@ module.exports = class Broker {
     this.authenticationTimeout = authenticationTimeout
     this.allowAutoTopicCreation = allowAutoTopicCreation
     this.metadataIdentity = metadataIdentity
+    this.metadataClusterCheck = metadataClusterCheck
     this.metadataRecoveryStrategy = metadataRecoveryStrategy
     this.onApiVersionsFailure = onApiVersionsFailure
 
@@ -708,11 +712,17 @@ module.exports = class Broker {
    * has since learned or replaced is the one a later request names. Versions below 5 take no
    * identity, so what this returns never reaches their bytes.
    * @private
-   * @returns {{clusterId: string|null, nodeId: number}|undefined} undefined under the `none`
-   *   strategy and for a broker built without a getter, which name no identity
+   * @returns {{clusterId: string|null, nodeId: number}|undefined} undefined when the cluster check
+   *   is off, under the `none` strategy and for a broker built without a getter, which name no
+   *   identity
    */
   [PRIVATE.IDENTITY]() {
-    if (this.metadataRecoveryStrategy === 'none' || !this.metadataIdentity) return undefined
+    if (
+      !this.metadataClusterCheck ||
+      this.metadataRecoveryStrategy === 'none' ||
+      !this.metadataIdentity
+    )
+      return undefined
     return this.metadataIdentity()
   }
 
