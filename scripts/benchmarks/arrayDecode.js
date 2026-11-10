@@ -1,6 +1,7 @@
 /**
  * Array-reader decode microbenchmark: decodes one real response, built once in setup, whose widest
- * array is read by a given `Decoder` array reader, and reports ns/op. Where `frameDecode.js` times
+ * array is read by a given `Decoder` array reader (or, for `record-headers`, is the header set of
+ * a record, which the record decoder reads itself), and reports ns/op. Where `frameDecode.js` times
  * the frame loop and `recordBatchDecode.js` decodes responses whose arrays hold a handful of
  * elements, every arm here is dominated by one array of thousands of elements, so a change to a
  * reader's count check or element loop is a measured number rather than an assumption.
@@ -10,7 +11,7 @@
  * | arm                     | codec          | widest array                                      |
  * | ----------------------- | -------------- | ------------------------------------------------- |
  * | `readArray`             | Produce v7     | one topic, 2000 partitions                        |
- * | `readVarIntArray`       | Fetch v11      | 4 records of 1000 headers each, in one batch      |
+ * | `record-headers`        | Fetch v11      | 4 records of 1000 headers each, in one batch      |
  * | `readUVarIntArray`      | Produce v11    | one topic, 2000 partitions (flexible)             |
  * | `readArrayAsync`        | Fetch v11      | one topic, 2000 partitions with empty record sets |
  * | `readUVarIntArrayAsync` | Fetch v12      | one topic, 2000 partitions (flexible)             |
@@ -161,10 +162,11 @@ const fetchCompactWide = () =>
  * @property {(raw: Buffer, options: object) => Promise<object>} decode the production decoder
  * @property {(decoded: object) => number} count the elements of the widest array in a decode
  * @property {number} elements what `count` must return, or the arm is not built as described
- * @property {number} widest elements of the widest single array the arm's reader returns in a decode
+ * @property {number} widest elements of the widest single array the arm's reader returns in a decode;
+ *   for `record-headers`, the headers of the widest record
  */
 
-/** @type {Record<string, ArrayArm>} keyed by the `Decoder` reader the widest array goes through */
+/** @type {Record<string, ArrayArm>} keyed by the `Decoder` reader the widest array goes through, or `record-headers` */
 const ARMS = {
   readArray: {
     build: produceClassic,
@@ -173,7 +175,7 @@ const ARMS = {
     elements: PARTITIONS,
     widest: PARTITIONS,
   },
-  readVarIntArray: {
+  'record-headers': {
     build: fetchHeaders,
     decode: decodeFetchV11,
     count: (decoded) =>

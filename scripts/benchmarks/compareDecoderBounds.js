@@ -46,9 +46,9 @@ const USAGE =
 const FRAME_SHAPES = ['64b', '64k', '1m', 'coalesced', 'byte-chunks']
 const COMPRESSED_ARMS = ['gzip', 'zstd', 'lz4', 'snappy']
 const ARRAY_DECODE_SCRIPT = 'scripts/benchmarks/arrayDecode.js'
-const ARRAY_READERS = [
+const ARRAY_DECODE_ARMS = [
   'readArray',
-  'readVarIntArray',
+  'record-headers',
   'readUVarIntArray',
   'readArrayAsync',
   'readUVarIntArrayAsync',
@@ -85,10 +85,10 @@ const ARMS = [
     ],
     metric: 'nsPerOp',
   })),
-  ...ARRAY_READERS.map((reader) => ({
-    name: `array-decode:${reader}`,
+  ...ARRAY_DECODE_ARMS.map((arm) => ({
+    name: `array-decode:${arm}`,
     required: true,
-    argv: ['node', ARRAY_DECODE_SCRIPT, '--arm', reader],
+    argv: ['node', ARRAY_DECODE_SCRIPT, '--arm', arm],
     metric: 'nsPerOp',
     overlay: ARRAY_DECODE_SCRIPT,
   })),

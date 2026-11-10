@@ -344,29 +344,6 @@ module.exports = class Decoder {
   }
 
   /**
-   * Signed-varint-counted array; a count of -1 reads as an empty array.
-   * @param {(decoder: Decoder) => *} reader reads one element
-   * @returns {Array}
-   * @throws {KafkaJSPartialMessageError} when the count is above the limit or the bytes are short
-   */
-  readVarIntArray(reader) {
-    const length = this.readVarInt()
-
-    if (length === -1) {
-      return []
-    }
-
-    this.assertCount(length, 'readVarIntArray')
-    this.ensureReadable(length, 'readVarIntArray')
-    const array = []
-    for (let i = 0; i < length; i++) {
-      array.push(reader(this))
-    }
-
-    return array
-  }
-
-  /**
    * COMPACT_ARRAY: an unsigned varint holding the count + 1. According to the protocol type
    * documentation: https://kafka.apache.org/protocol#protocol_types, a compact array with length
    * zero is a null array. An array with length 1 is an empty array.

@@ -25,14 +25,10 @@ const uvarint = (value) => {
   return Buffer.from(bytes)
 }
 
-/** @param {number} value @returns {Buffer} the value as a zigzag signed varint */
-const varint = (value) => uvarint(value >= 0 ? value * 2 : -value * 2 - 1)
-
 const compactPrefix = (count) => uvarint(count + 1)
 
 const READERS = [
   { name: 'readArray', prefix: int32, nullBytes: int32(-1), nullResult: [] },
-  { name: 'readVarIntArray', prefix: varint, nullBytes: varint(-1), nullResult: [] },
   { name: 'readUVarIntArray', prefix: compactPrefix, nullBytes: uvarint(0), nullResult: null },
   { name: 'readArrayAsync', prefix: int32, nullBytes: int32(-1), nullResult: [] },
   {

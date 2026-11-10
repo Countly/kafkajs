@@ -16,6 +16,9 @@ const TimestampTypes = require('../../../timestampTypes')
  *     HeaderValue => VarInt|Bytes
  */
 
+/** A header count of -1 reads as an empty header set; every other negative count is rejected. */
+const NULL_HEADER_COUNT = -1
+
 /**
  * Stores one header value as an own property of the header object.
  * A plain assignment would be intercepted by the inherited `__proto__` setter when a record carries
@@ -53,6 +56,10 @@ const setHeader = (headers, key, value) => {
  *   from `Long`, never from `Number#toString`.
  * @returns {object} the decoded record: `{ magicByte, attributes, timestamp, offset, key, value,
  *   headers, isControlRecord, batchContext }`, with `timestamp` and `offset` as decimal strings
+ * @throws {KafkaJSPartialMessageError} when the header count is negative (other than -1, an empty
+ *   set) or above the bytes left in the record, before any header is read, or when a header runs
+ *   past the record. The count is bounded by those bytes only, not by the 1,000,000 limit of the
+ *   protocol array readers, and headers go straight into the result with no intermediate array.
  */
 module.exports = (decoder, batchContext = {}, firstOffsetNumber) => {
   const {
@@ -89,7 +96,13 @@ module.exports = (decoder, batchContext = {}, firstOffsetNumber) => {
   // semantics are unchanged: the first occurrence stores the value, the second turns it into a
   // two-element array, later ones push onto it.
   const headers = {}
-  for (const { key: headerKey, value: headerValue } of decoder.readVarIntArray(HeaderDecoder)) {
+  const headerCount = decoder.readVarInt()
+  if (headerCount !== NULL_HEADER_COUNT) {
+    decoder.ensureReadable(headerCount, 'readHeaders')
+  }
+
+  for (let i = 0; i < headerCount; i++) {
+    const { key: headerKey, value: headerValue } = HeaderDecoder(decoder)
     const existing = Object.hasOwn(headers, headerKey) ? headers[headerKey] : undefined
 
     if (existing === undefined) {

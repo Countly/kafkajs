@@ -203,22 +203,22 @@ describe('Decoder performance comparison', () => {
     expect(runInput(input).status).toBe(1)
   })
 
-  it('measures a real response through each array reader the decoder bounds, in both trees', () => {
+  it('measures a real response through each array reader the decoder bounds and through record headers, in both trees', () => {
     const arrayArms = ARMS.filter((arm) => arm.name.startsWith('array-decode:'))
 
     expect(arrayArms.map((arm) => arm.name)).toEqual([
       'array-decode:readArray',
-      'array-decode:readVarIntArray',
+      'array-decode:record-headers',
       'array-decode:readUVarIntArray',
       'array-decode:readArrayAsync',
       'array-decode:readUVarIntArrayAsync',
     ])
     for (const arm of arrayArms) {
-      const reader = arm.name.split(':')[1]
+      const armName = arm.name.split(':')[1]
       expect(arm.required).toBe(true)
       expect(arm.metric).toBe('nsPerOp')
       expect(arm.argv.slice(0, 2)).toEqual(['node', 'scripts/benchmarks/arrayDecode.js'])
-      expect(arm.argv).toContain(reader)
+      expect(arm.argv).toContain(armName)
       expect(arm.overlay).toBe('scripts/benchmarks/arrayDecode.js')
       expect(fs.existsSync(path.join(__dirname, '..', '..', '..', arm.overlay))).toBe(true)
     }
