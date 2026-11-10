@@ -77,9 +77,13 @@ describe('Utils > Lock', () => {
       }
     }
 
-    await expect(
-      Promise.all([callResource(), callResource(), callResource()])
-    ).rejects.toHaveProperty('message', 'Timeout while acquiring lock (2 waiting locks)')
+    const calls = [callResource(), callResource(), callResource()]
+    await expect(Promise.all(calls)).rejects.toHaveProperty(
+      'message',
+      'Timeout while acquiring lock (2 waiting locks)'
+    )
+    // The holder still sleeps when the waiters time out; acquire once every call has settled.
+    await Promise.allSettled(calls)
 
     await expect(callResource()).resolves.toBeUndefined()
   })
