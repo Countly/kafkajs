@@ -288,6 +288,8 @@ jobs:
             ${{ runner.temp }}/node-tests.tap
             .tmp/gate-sweeps/
             .tmp/e2e/
+            .tmp/decoder-comparison.json
+            .tmp/decoder-comparison/raw/
             coverage/coverage-summary.json
             coverage/lcov.info
             ${{ runner.temp }}/compose.log
