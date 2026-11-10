@@ -64,6 +64,8 @@ Documentation lives in the [`docs/`](./docs) folder of this repository:
 
 Compression is selected per `send()` or `sendBatch()` call; there is no producer-level default. An omitted codec sends uncompressed, and setting a codec on one send does not change later sends. See [compression](./docs/Producing.md#compression).
 
+On Kafka 4.4 or newer, [`admin.unregisterController({ controllerId })`](./docs/Admin.md#unregister-a-controller) removes a controller registration, and [`metadataClusterCheck`](./docs/Configuration.md#metadata-recovery) controls whether reconnects name the expected cluster and node.
+
 ## Migrating from `kafkajs`
 
 Replace the package name for the preserved API plus documented semantic differences. Read the [migration guide](./docs/MigrationGuide-3-0-0.md) for the changed defaults and behavior, and the [CHANGELOG](./CHANGELOG.md) for release details.
