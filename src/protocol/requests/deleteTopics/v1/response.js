@@ -2,7 +2,8 @@ const Decoder = require('../../../decoder')
 const { failure, createErrorFromCode } = require('../../../error')
 
 /**
- * Starting in version 1, on quota violation, brokers send out responses before throttling.
+ * Version 1 carries a throttle the broker already served; the client throttles from version 2
+ * (`DeleteTopicsResponse#shouldClientThrottle`, KIP-219).
  * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-219+-+Improve+quota+communication
  *
  * DeleteTopics Response (Version: 1) => throttle_time_ms [topic_error_codes]
@@ -24,8 +25,7 @@ const decode = async (rawData) => {
   const throttleTime = decoder.readInt32()
 
   return {
-    throttleTime: 0,
-    clientSideThrottleTime: throttleTime,
+    throttleTime,
     topicErrors: decoder.readArray(topicErrors).sort(topicNameComparator),
   }
 }
