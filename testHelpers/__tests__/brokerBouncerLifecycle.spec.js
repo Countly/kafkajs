@@ -258,6 +258,7 @@ describe('BrokerBouncer lifecycle', () => {
     })
     try {
       await expect(h.bouncer.step({ service: 'kafka2', kind: 'stop' }, cluster)).rejects.toBe(first)
+      expect(write).toHaveBeenCalled()
     } finally {
       write.mockRestore()
     }
