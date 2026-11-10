@@ -21959,6 +21959,7 @@
       "titles": [],
       "capMinutes": 93,
       "allowedSkips": [
+        "testHelpers/__tests__/telemetryFixtures.spec.js \u203a telemetry wire observer independently decodes all details behind a capped export",
         "src/telemetry/__tests__/javaInteropLive.spec.js \u203a java telemetry interoperability",
         "src/telemetry/__tests__/outcomesLive.spec.js \u203a foreground outcomes",
         "src/telemetry/__tests__/reporterLive.spec.js \u203a reporter export",
