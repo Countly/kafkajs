@@ -150,97 +150,95 @@ describe('Decoder performance comparison', () => {
     }
   })
 
-  describe('measurement collector', () => {
-    /** @returns {{ collector: MeasurementCollector, calls: string[], saved: Map<string, string> }} */
-    const collect = ({ reply, pairs = 5 }) => {
-      const calls = []
-      const saved = new Map()
-      const collector = new MeasurementCollector({
-        trees: { old: 'OLD', new: 'NEW' },
-        rawDir: 'raw',
-        pairs,
-        run: (cwd, argv) => {
-          calls.push(`${cwd} ${argv.join(' ')}`)
-          return reply(cwd, argv)
-        },
-        save: (file, text) => saved.set(file, text),
-      })
-      return { collector, calls, saved }
+  /** @returns {{ collector: MeasurementCollector, calls: string[], saved: Map<string, string> }} */
+  const collect = ({ reply, pairs = 5 }) => {
+    const calls = []
+    const saved = new Map()
+    const collector = new MeasurementCollector({
+      trees: { old: 'OLD', new: 'NEW' },
+      rawDir: 'raw',
+      pairs,
+      run: (cwd, argv) => {
+        calls.push(`${cwd} ${argv.join(' ')}`)
+        return reply(cwd, argv)
+      },
+      save: (file, text) => saved.set(file, text),
+    })
+    return { collector, calls, saved }
+  }
+
+  const ok = (value) => ({ status: 0, stdout: `banner\n${JSON.stringify(value)}\n`, stderr: '' })
+  const valueFor = (cwd, argv) => {
+    const arm = ARMS.find((candidate) => candidate.argv.join(' ') === argv.join(' '))
+    return ok({ available: 1, [arm.metric]: cwd === 'OLD' ? 100 : 101 })
+  }
+
+  it('collector runs each arm in both trees, alternates their order and keeps every raw invocation', () => {
+    const { collector, calls, saved } = collect({ reply: valueFor })
+
+    const { arms, unavailable } = collector.collect()
+
+    expect(unavailable).toEqual([])
+    expect(arms.map((arm) => arm.name)).toEqual(ARMS.map((arm) => arm.name))
+    for (const arm of arms) {
+      expect(arm.oldNsPerOp).toEqual(constant(100))
+      expect(arm.newNsPerOp).toEqual(constant(101))
     }
+    expect(compare(completeInput({ arms }), NO_EXCEPTIONS).pass).toBe(true)
 
-    const ok = (value) => ({ status: 0, stdout: `banner\n${JSON.stringify(value)}\n`, stderr: '' })
-    const valueFor = (cwd, argv) => {
-      const arm = ARMS.find((candidate) => candidate.argv.join(' ') === argv.join(' '))
-      return ok({ available: 1, [arm.metric]: cwd === 'OLD' ? 100 : 101 })
-    }
+    const first = ARMS[0].argv.join(' ')
+    const forFirst = calls.filter((call) => call.endsWith(first))
+    expect(forFirst.map((call) => call.split(' ')[0])).toEqual([
+      'OLD',
+      'NEW',
+      'NEW',
+      'OLD',
+      'OLD',
+      'NEW',
+      'NEW',
+      'OLD',
+      'OLD',
+      'NEW',
+    ])
+    expect(saved.size).toBe(ARMS.length * 5 * 2)
+    expect(saved.get(path.join('raw', 'frame-decode-64b', '1-new.txt'))).toContain(
+      `$ ${first}\nexit 0\n--- stdout\nbanner\n{"available":1,"nsPerFrame":101}`
+    )
+  })
 
-    it('runs each arm in both trees, alternates their order and keeps every raw invocation', () => {
-      const { collector, calls, saved } = collect({ reply: valueFor })
+  it('collector names an arm that neither tree has and leaves an arm one tree lacks incomplete', () => {
+    const lacking = (name, trees) => (cwd, argv) =>
+      argv.includes(name) && trees.includes(cwd) ? ok({ available: 0 }) : valueFor(cwd, argv)
 
-      const { arms, unavailable } = collector.collect()
+    const both = collect({ reply: lacking('zstd', ['OLD', 'NEW']) })
+    const bothResult = both.collector.collect()
+    expect(bothResult.unavailable).toEqual([OPTIONAL])
+    expect(bothResult.arms.map((arm) => arm.name)).not.toContain(OPTIONAL)
+    expect(both.calls.filter((call) => call.includes('zstd'))).toHaveLength(2)
+    expect(compare(completeInput(bothResult), NO_EXCEPTIONS).pass).toBe(true)
 
-      expect(unavailable).toEqual([])
-      expect(arms.map((arm) => arm.name)).toEqual(ARMS.map((arm) => arm.name))
-      for (const arm of arms) {
-        expect(arm.oldNsPerOp).toEqual(constant(100))
-        expect(arm.newNsPerOp).toEqual(constant(101))
-      }
-      expect(compare(completeInput({ arms }), NO_EXCEPTIONS).pass).toBe(true)
+    const one = collect({ reply: lacking('zstd', ['OLD']) })
+    const oneResult = one.collector.collect()
+    expect(oneResult.unavailable).toEqual([])
+    const zstd = oneResult.arms.find((arm) => arm.name === OPTIONAL)
+    expect(zstd.oldNsPerOp).toEqual([])
+    const result = compare(completeInput(oneResult), NO_EXCEPTIONS)
+    expect(result.pass).toBe(false)
+    expect(result.problems.join('\n')).toContain(`${OPTIONAL}: oldNsPerOp needs at least 5`)
+  })
 
-      const first = ARMS[0].argv.join(' ')
-      const forFirst = calls.filter((call) => call.endsWith(first))
-      expect(forFirst.map((call) => call.split(' ')[0])).toEqual([
-        'OLD',
-        'NEW',
-        'NEW',
-        'OLD',
-        'OLD',
-        'NEW',
-        'NEW',
-        'OLD',
-        'OLD',
-        'NEW',
-      ])
-      expect(saved.size).toBe(ARMS.length * 5 * 2)
-      expect(saved.get(path.join('raw', 'frame-decode-64b', '1-new.txt'))).toContain(
-        `$ ${first}\nexit 0\n--- stdout\nbanner\n{"available":1,"nsPerFrame":101}`
-      )
-    })
+  it('collector fails on a benchmark that exits non-zero or prints no usable number', () => {
+    const failing = (reply) => collect({ reply: () => reply })
 
-    it('names an arm that neither tree has and leaves an arm one tree lacks incomplete', () => {
-      const lacking = (name, trees) => (cwd, argv) =>
-        argv.includes(name) && trees.includes(cwd) ? ok({ available: 0 }) : valueFor(cwd, argv)
-
-      const both = collect({ reply: lacking('zstd', ['OLD', 'NEW']) })
-      const bothResult = both.collector.collect()
-      expect(bothResult.unavailable).toEqual([OPTIONAL])
-      expect(bothResult.arms.map((arm) => arm.name)).not.toContain(OPTIONAL)
-      expect(both.calls.filter((call) => call.includes('zstd'))).toHaveLength(2)
-      expect(compare(completeInput(bothResult), NO_EXCEPTIONS).pass).toBe(true)
-
-      const one = collect({ reply: lacking('zstd', ['OLD']) })
-      const oneResult = one.collector.collect()
-      expect(oneResult.unavailable).toEqual([])
-      const zstd = oneResult.arms.find((arm) => arm.name === OPTIONAL)
-      expect(zstd.oldNsPerOp).toEqual([])
-      const result = compare(completeInput(oneResult), NO_EXCEPTIONS)
-      expect(result.pass).toBe(false)
-      expect(result.problems.join('\n')).toContain(`${OPTIONAL}: oldNsPerOp needs at least 5`)
-    })
-
-    it('fails on a benchmark that exits non-zero or prints no usable number', () => {
-      const failing = (reply) => collect({ reply: () => reply })
-
-      expect(() => failing({ status: 1, stdout: '', stderr: 'boom' }).collector.collect()).toThrow(
-        /frame-decode:64b failed in the old tree \(exit 1\)/
-      )
-      expect(() =>
-        failing({ status: 0, stdout: 'no json', stderr: '' }).collector.collect()
-      ).toThrow(/printed no JSON line/)
-      expect(() => failing(ok({ available: 1, nsPerFrame: 0 })).collector.collect()).toThrow(
-        /no usable nsPerFrame/
-      )
-      expect(() => failing(ok({ available: 1 })).collector.collect()).toThrow(/no usable/)
-    })
+    expect(() => failing({ status: 1, stdout: '', stderr: 'boom' }).collector.collect()).toThrow(
+      /frame-decode:64b failed in the old tree \(exit 1\)/
+    )
+    expect(() => failing({ status: 0, stdout: 'no json', stderr: '' }).collector.collect()).toThrow(
+      /printed no JSON line/
+    )
+    expect(() => failing(ok({ available: 1, nsPerFrame: 0 })).collector.collect()).toThrow(
+      /no usable nsPerFrame/
+    )
+    expect(() => failing(ok({ available: 1 })).collector.collect()).toThrow(/no usable/)
   })
 })

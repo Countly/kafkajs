@@ -16,7 +16,7 @@ const OTHER_BITS = 0x7f // 127
 
 const UUID_SIZE = 16
 
-/** Largest decoded array count accepted; matches the Apache Kafka 4.4 client's `MessageUtil`. */
+/** Largest decoded array count accepted by any array reader. */
 const MAX_ARRAY_COUNT = 1000000
 
 /** Largest tagged-field count accepted in one tag section. */
