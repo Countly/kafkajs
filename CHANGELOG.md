@@ -78,7 +78,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Fixes
 
-- A consumer that stops while an in-flight heartbeat loses the coordinator now still leaves its group (classic and consumer protocol): a coordinator rediscovered by the final offset commit is kept for the leave, without restarting heartbeats after stop. Previously the leave was skipped and the group waited a full session timeout (a regression of the 9E stopped-heartbeat guard).
+- A consumer that stops while an in-flight heartbeat loses the coordinator now still leaves its group (classic and consumer protocol): a coordinator rediscovered by the final offset commit is kept for the leave, without restarting heartbeats after stop. Previously the leave was skipped and the group waited a full session timeout (a regression from an earlier 3.0.0 pre-release).
 
 ### Phase 9E — Share groups
 
