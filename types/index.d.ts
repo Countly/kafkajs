@@ -89,6 +89,13 @@ export interface KafkaConfig extends ClientTelemetryConfig {
    */
   metadataClusterCheck?: boolean
   metadataRecoveryRebootstrapTriggerMs?: number
+  /**
+   * Milliseconds the first connection waits for at least one bootstrap hostname to resolve in DNS,
+   * an integer from 0 to 2147483647. `0` (the default) disables the check. After the deadline every
+   * connect of that client rejects with `KafkaJSBootstrapResolutionError`; create a new client to
+   * check again. Connections still dial the original hostname.
+   */
+  bootstrapResolveTimeout?: number
 }
 
 export interface ISocketFactoryArgs {
@@ -2912,6 +2919,11 @@ export class KafkaJSTransactionAbortableError extends KafkaJSNonRetriableError {
 
 /** The producer cannot continue: create a new one. */
 export class KafkaJSApplicationRecoverableError extends KafkaJSNonRetriableError {
+  constructor(e: Error | string, options?: { cause?: Error })
+}
+
+/** No bootstrap hostname resolved within `bootstrapResolveTimeout`: the client keeps failing; create a new one. */
+export class KafkaJSBootstrapResolutionError extends KafkaJSNonRetriableError {
   constructor(e: Error | string, options?: { cause?: Error })
 }
 

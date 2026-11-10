@@ -11,6 +11,7 @@ const InstrumentationEventEmitter = require('./instrumentation/emitter')
 const channels = require('./instrumentation/channels')
 const LoggerConsole = require('./loggers/console')
 const Cluster = require('./cluster')
+const BootstrapResolution = require('./cluster/bootstrapResolution')
 const { ConnectionSetupPolicy } = require('./network/connectionSetup')
 const createProducer = require('./producer')
 const RackPreference = require('./producer/partitioners/rackPreference')
@@ -79,6 +80,7 @@ const KAFKA_FIELDS = [
   'metadataRecoveryStrategy',
   'metadataClusterCheck',
   'metadataRecoveryRebootstrapTriggerMs',
+  'bootstrapResolveTimeout',
 ]
 const PRODUCER_FIELDS = [
   'createPartitioner',
@@ -443,12 +445,16 @@ module.exports = class Client {
    *   Only `true` with `metadataRecoveryStrategy: 'rebootstrap'` names an identity
    * @param {number} [options.metadataRecoveryRebootstrapTriggerMs=300000] how long metadata must
    *   fail *continuously* before a rebootstrap is triggered. Must be an integer >= 1.
+   * @param {number} [options.bootstrapResolveTimeout=0] milliseconds the first connection of each
+   *   client waits for a bootstrap hostname to resolve in DNS, an integer from 0 to 2147483647; 0
+   *   disables the check. After the deadline that client's connects reject with
+   *   `KafkaJSBootstrapResolutionError`; connections still dial the original hostname.
    * @param {boolean} [options.enableMetricsPush=false] default broker client telemetry opt-in of
    *   every client; a factory option overrides it
    * @param {number} [options.telemetryMaxBytes=1048576] default raw and transmitted metric-byte
    *   ceiling, an integer from 1 to 1048576
-   * @throws {KafkaJSInvalidConfigurationError} for an invalid `maxResponseSize`, a throwing option
-   *   accessor, a non-boolean `enableMetricsPush` or an invalid `telemetryMaxBytes`
+   * @throws {KafkaJSInvalidConfigurationError} for an invalid `maxResponseSize` or
+   *   `bootstrapResolveTimeout`, a throwing option accessor, a non-boolean `enableMetricsPush` or an invalid `telemetryMaxBytes`
    */
   constructor(source) {
     const { options, config: telemetryConfig } = snapshotOptions(source, KAFKA_FIELDS)
@@ -469,6 +475,7 @@ module.exports = class Client {
       metadataRecoveryStrategy = DEFAULT_METADATA_RECOVERY_STRATEGY,
       metadataClusterCheck = true,
       metadataRecoveryRebootstrapTriggerMs = DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER_MS,
+      bootstrapResolveTimeout = 0,
     } = options
     let {
       connectionTimeout,
@@ -514,6 +521,8 @@ module.exports = class Client {
     const validatedMetadataClusterCheck = validateMetadataClusterCheck(metadataClusterCheck)
     const validatedMetadataRecoveryRebootstrapTriggerMs =
       validateMetadataRecoveryRebootstrapTriggerMs(metadataRecoveryRebootstrapTriggerMs)
+    const validatedBootstrapResolveTimeout =
+      BootstrapResolution.validateTimeout(bootstrapResolveTimeout)
 
     this[PRIVATE.CREATE_CLUSTER] = ({
       telemetryMetrics = null,
@@ -557,6 +566,7 @@ module.exports = class Client {
         metadataRecoveryStrategy: validatedMetadataRecoveryStrategy,
         metadataClusterCheck: validatedMetadataClusterCheck,
         metadataRecoveryRebootstrapTriggerMs: validatedMetadataRecoveryRebootstrapTriggerMs,
+        bootstrapResolveTimeout: validatedBootstrapResolveTimeout,
       })
   }
 

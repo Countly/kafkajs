@@ -47,7 +47,8 @@ const decode = async (rawData) => {
   const errorCode = decoder.readInt16()
   decoder.readUVarIntString()
   return {
-    throttleTime,
+    throttleTime: 0,
+    clientSideThrottleTime: throttleTime,
     errorCode,
     responses: Decoder.requireArray(
       decoder.readUVarIntArray(decodeResponses),

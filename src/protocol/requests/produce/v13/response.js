@@ -43,7 +43,8 @@ const decode = async (rawData, options = {}) => {
 
   return {
     topics,
-    throttleTime,
+    throttleTime: 0,
+    clientSideThrottleTime: throttleTime,
     nodeEndpoints: decodeNodeEndpoints(tags),
   }
 }
