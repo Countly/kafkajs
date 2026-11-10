@@ -550,7 +550,7 @@ const shareCleanupResources = (snapshot) => {
  * @throws {Error} on abort, failed fixture disconnect or measurement
  */
 const captureShareCleanupBaseline = async (probe, { signal, cleanupStack = true } = {}) => {
-  const { isDeepStrictEqual } = require('util')
+  const { inspect, isDeepStrictEqual } = require('util')
   const { NEVER, bounded, pollUntil } = require('../src/producer/__tests__/fixtures/bounded')
   const { CleanupStack } = require('../src/producer/__tests__/fixtures/liveProbe')
   const owner = signal || NEVER
@@ -579,6 +579,16 @@ const captureShareCleanupBaseline = async (probe, { signal, cleanupStack = true 
         { delayMs: 50, label: 'Share resource baseline becoming quiet' }
       )
       return baseline
+    }).catch((error) => {
+      // Keep the last raw inventory (including timer owners) when no quiet baseline was possible.
+      // CleanupStack copies this message into its named error, so CI's aggregate exposes it too.
+      const failure = error instanceof Error ? error : new Error(String(error))
+      failure.resourceBaseline = baseline
+      failure.message += `; resource baseline ${inspect(
+        { lastSample: baseline },
+        { depth: null, breakLength: Infinity, sorted: true }
+      )}`
+      throw failure
     })
   if (!cleanupStack) return capture(owner)
   const cleanup = new CleanupStack()

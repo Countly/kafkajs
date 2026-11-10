@@ -81,21 +81,15 @@ suite('admin configured remote storage', () => {
         const partitionDirectories = [`${topic}-0-${uuid}`, `${topic}-0-${compactUuid}`]
         const localRoot = `/tmp/kraft-combined-logs/${topic}-0`
         // The broker image has BusyBox `find`, which has no -printf; `stat` prints each size.
+        // Segments the broker deletes mid-listing make find exit non-zero; the poll retries.
         const files = async (directory) =>
           (
             await probe.host('kafka1', [
-              'find',
-              directory,
-              '-type',
-              'f',
-              '-name',
-              '*.log',
-              '-exec',
-              'stat',
+              'sh',
               '-c',
-              '%s %n',
-              '{}',
-              ';',
+              'find "$1" -type f -name "*.log" -exec stat -c "%s %n" {} \\; 2>/dev/null; true',
+              'sh',
+              directory,
             ])
           )
             .trim()

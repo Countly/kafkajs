@@ -468,10 +468,10 @@ module.exports = class Connection {
 
       const onError = (e) => {
         if (!isCurrentAttempt()) return
-        const error = new KafkaJSConnectionError(`Connection error: ${e.message}`, {
-          broker: this.broker,
-          code: e.code,
-        })
+        const error = new KafkaJSConnectionError(
+          `Connection error: ${describeThrown(e) || e.code || 'Socket error'}`,
+          { broker: this.broker, code: e.code }
+        )
         const beforeHandshake = this.ssl && !this.isConnected() && e.code === 'ECONNRESET'
         this.failGeneration(error)
         try {

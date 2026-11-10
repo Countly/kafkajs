@@ -80,6 +80,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - For all clients, a socket that closes without an error now fails pending requests immediately with the retriable connection-closed error, instead of waiting for the request timeout.
 
+- After `consumer.stop()` or `disconnect()` requests stop, the `heartbeat()` callback given to `eachMessage` and `eachBatch` handlers resolves without sending; in 2.2.4 it could still send. Finish handlers that need heartbeats before requesting stop.
+
 #### Additions
 
 - Implement the seven released share-group wire codecs: ShareGroupHeartbeat v1, ShareGroupDescribe v1, ShareFetch v2, ShareAcknowledge v2, DescribeShareGroupOffsets v1, AlterShareGroupOffsets v0 and DeleteShareGroupOffsets v0. Each is flexible with nested tag buffers, keeps int64 offsets and lag as exact decimal strings and passes broker error codes through as data. They are checked against independent Apache Kafka message vectors.
@@ -105,6 +107,11 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Fixes
 
+- Heartbeat retries after an empty Fetch or a handler returns during stop no longer delay disconnect after coordinator loss. Eligible stop-time commits retain their coordinator lookups.
+
+- All-topic metadata calls (`describeCluster`, `listTopics` and `fetchTopicMetadata`) now try the remaining brokers when a cached broker cannot reconnect after a socket close, preserving immediate close detection without exhausting retries on the stopped broker. If no broker's call succeeds, a skipped connection failure stays retriable, keeping consumer recovery through coordinator outages. Socket errors with an empty message report their error code, or a descriptive fallback.
+
+- A share consumer close no longer prints Node's `TimeoutNegativeWarning` when its handler deadline passes between checking the clock and arming the timer: a consumer-operation sleep with an already elapsed delay now schedules an immediate timer.
 - A connection closed without an error is now detected immediately instead of after the request timeout. In-flight requests fail with the same retriable connection-closed error as a socket end, and share sessions reopen on the next round.
 - A broker restart no longer crashes a share consumer with "Metadata discovery completed" when a metadata notification starts a new fetch loop. Rebootstrap and request-queue-size listeners, and the queue's pending-check timer, also run independently of the publishing discovery or admin invocation.
 - A share answer that arrives from a replaced connection pool is discarded and the session reopens on the next round, instead of ending the run and losing unrelated acquisitions.

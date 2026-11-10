@@ -12,6 +12,40 @@ const {
   unpauseBroker,
 } = require('../leaderElection')
 
+/** Compose state alongside the control recorder; all probes remain broker-free. */
+const composeRunner = (control) => {
+  const running = new Map()
+  const starts = new Map()
+  return (command, ...args) => {
+    const service = args[args.length - 1]
+    if (command === 'inspect') {
+      const up = running.get(service) !== false
+      return {
+        stdout: JSON.stringify({
+          Id: `container-${service}`,
+          Status: up ? 'running' : 'exited',
+          Running: up,
+          Paused: false,
+          Restarting: false,
+          StartedAt: `2026-11-09T12:00:${String(starts.get(service) || 0).padStart(2, '0')}Z`,
+          FinishedAt: '0001-01-01T00:00:00Z',
+          ExitCode: 0,
+          OOMKilled: false,
+          Error: '',
+        }),
+        stderr: '',
+      }
+    }
+    if (command === 'logs') return { stdout: '', stderr: '' }
+    if (['stop', 'kill'].includes(command)) running.set(service, false)
+    if (command === 'start') {
+      running.set(service, true)
+      starts.set(service, (starts.get(service) || 0) + 1)
+    }
+    return control(command, service)
+  }
+}
+
 /**
  * A bouncer over a recorded `docker compose`, a scripted set of answering nodes and a clock that
  * moves only when the bouncer waits.
@@ -26,10 +60,10 @@ const harness = ({ onRun = () => {}, up = () => true } = {}) => {
   const probes = new Map()
   let clock = 1000
   const bouncer = new BrokerBouncer({
-    run: (command, service) => {
+    run: composeRunner((command, service) => {
       commands.push(`${command} ${service}`)
       onRun(command, service)
-    },
+    }),
     answers: async (node) => {
       const service = Object.keys(NODES).find((name) => NODES[name] === node)
       const probe = (probes.get(service) || 0) + 1
@@ -47,6 +81,7 @@ const harness = ({ onRun = () => {}, up = () => true } = {}) => {
       clock += ms
     },
   })
+  bouncer.read = bouncer.run
   return { bouncer, commands, waits, isrWaits, probes }
 }
 
@@ -242,12 +277,13 @@ describe('broker bounce helpers', () => {
         release = resolve
       })
       const bouncer = new BrokerBouncer({
-        run: (command, service) => commands.push(`${command} ${service}`),
+        run: composeRunner((command, service) => commands.push(`${command} ${service}`)),
         answers: async () => true,
         sleep: async () => holding,
         waitForFullIsr: async () => {},
       })
 
+      bouncer.read = bouncer.run
       const outcomes = Promise.allSettled([
         bouncer.step({ service: 'kafka1', kind: 'stop' }, cluster),
         bouncer.step({ service: 'kafka2', kind: 'stop' }, cluster),
