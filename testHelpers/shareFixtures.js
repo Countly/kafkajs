@@ -588,6 +588,7 @@ const captureShareCleanupBaseline = async (probe, { signal, cleanupStack = true 
         { lastSample: baseline },
         { depth: null, breakLength: Infinity, sorted: true }
       )}`
+      failure.message += require('./socketOwners').describeSocketOwners()
       throw failure
     })
   if (!cleanupStack) return capture(owner)

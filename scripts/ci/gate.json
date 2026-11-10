@@ -21980,7 +21980,7 @@
       "id": "coverage-frozen",
       "kind": "cluster",
       "compose": "docker-compose.yml",
-      "env": {},
+      "env": { "KAFKAJS_SOCKET_OWNERS": "1" },
       "jest": [
         "--ci",
         "--coverage",
