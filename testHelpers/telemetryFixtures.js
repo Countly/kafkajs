@@ -197,13 +197,75 @@ const checkedResource = (answer, name) => {
 }
 
 /**
+ * Waits for a created CLIENT_METRICS resource's values and listing to converge together.
+ * API errors fail immediately; only successful but stale readbacks are retried.
+ * @param {object} admin connected, telemetry-disabled fixture admin
+ * @param {{type:number,name:string}} resource newly created resource
+ * @param {Object<string,string>} entries exact expected configuration values
+ * @param {AbortSignal} signal enclosing scenario scope
+ * @returns {Promise<object>} successful resource readback within three seconds
+ * @throws {Error} API failure, cancellation or deadline with the last observed mismatches
+ */
+const readCreatedTelemetryResource = async (admin, resource, entries, signal) => {
+  const { pollUntil } = require('../src/producer/__tests__/fixtures/bounded')
+  const names = Object.keys(entries)
+  const label = 'Client metrics resource readback'
+  const deadline = performance.now() + 3000
+  const timeout = () => Math.max(1, Math.ceil(deadline - performance.now()))
+  let read
+  let actual
+  let listing
+  const differences = () => [
+    ...names
+      .filter((key) => actual?.[key] !== entries[key])
+      .map(
+        (key) =>
+          `${key}: expected ${JSON.stringify(entries[key])}, got ${JSON.stringify(actual?.[key])}`
+      ),
+    ...(listing?.resources.some((r) => r.type === 16 && r.name === resource.name)
+      ? []
+      : ['missing from listing']),
+  ]
+  try {
+    await pollUntil(
+      signal,
+      3000,
+      async (scope) => {
+        read = checkedResource(
+          await admin.describeConfigs({
+            timeout: timeout(),
+            resources: [{ ...resource, configNames: names }],
+          }),
+          resource.name
+        )
+        actual = Object.fromEntries(read.configEntries.map((e) => [e.configName, e.configValue]))
+        scope.throwIfAborted()
+        listing = await admin.listConfigResources({ resourceTypes: [16], timeout: timeout() })
+        scope.throwIfAborted()
+        return differences().length === 0
+      },
+      { delayMs: 50, label }
+    )
+  } catch (error) {
+    if (signal.aborted || error?.message !== `${label} did not settle within 3000 ms`) throw error
+    throw new Error(
+      `${error.message}; ${differences().join('; ')}; ` +
+        `last config=${JSON.stringify(actual)}; last listing=${JSON.stringify(listing?.resources)}`,
+      { cause: error }
+    )
+  }
+  return read
+}
+
+/**
  * Owns one initially absent CLIENT_METRICS resource through readback and verified deletion.
  * The supplied connected admin has telemetry disabled. Deletion is attempted after an
- * ambiguous create result; a primary failure remains first if cleanup also fails.
+ * ambiguous create result; a primary failure remains first if cleanup also fails. Creation
+ * readback polls for up to three seconds; deletion keeps its independent one-second window.
  * @param {object} admin completed configuration-resource admin API
  * @param {{name:string,entries:Object<string,string>}} config exact resource values
  * @param {function():Promise<void>} work lazy body after successful readback
- * @param {{now?:function():number}} [options] monotonic receipt clock
+ * @param {{now?:function():number,signal?:AbortSignal}} [options] receipt clock and creation scope
  * @returns {Promise<object>} readback and verified deletion receipt, after work completes
  * @throws {Error|AggregateError} setup, work or cleanup failure
  */
@@ -211,13 +273,17 @@ const withTelemetryResource = async (
   admin,
   { name, entries },
   work,
-  { now = () => performance.now() } = {}
+  { now = () => performance.now(), signal } = {}
 ) => {
+  const { NEVER } = require('../src/producer/__tests__/fixtures/bounded')
+  signal ||= NEVER
+  signal.throwIfAborted()
   const receipt = { name, entries: { ...entries } }
   const names = Object.keys(entries)
   const listed = (timeout = 3000) => admin.listConfigResources({ resourceTypes: [16], timeout })
   const has = (answer) => answer.resources.some((r) => r.type === 16 && r.name === name)
   if (has(await listed())) throw new Error('Client metrics resource already exists')
+  signal.throwIfAborted()
   const resource = { type: 16, name }
   const alter = (operation, values) =>
     admin.incrementalAlterConfigs({
@@ -237,17 +303,8 @@ const withTelemetryResource = async (
   let failed = false
   try {
     checkedResource(await alter(0, entries), name)
-    const read = checkedResource(
-      await admin.describeConfigs({
-        timeout: 3000,
-        resources: [{ ...resource, configNames: names }],
-      }),
-      name
-    )
-    const actual = Object.fromEntries(read.configEntries.map((e) => [e.configName, e.configValue]))
-    if (names.some((key) => actual[key] !== entries[key]) || !has(await listed()))
-      throw new Error('Client metrics resource readback mismatch')
-    receipt.readback = read
+    receipt.readback = await readCreatedTelemetryResource(admin, resource, entries, signal)
+    signal.throwIfAborted()
     receipt.createdAt = now()
     await work()
   } catch (error) {

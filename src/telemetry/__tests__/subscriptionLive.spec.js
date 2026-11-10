@@ -313,7 +313,9 @@ class SubscriptionCases {
    * @returns {Promise<void>} after the resource is deleted and absence is read back
    */
   async withResource(entries, work) {
-    const receipt = await withTelemetryResource(this.aux, { name: this.stem, entries }, work)
+    const receipt = await withTelemetryResource(this.aux, { name: this.stem, entries }, work, {
+      signal: this.signal,
+    })
     const [owner] = Object.keys(this.attempt.observers)
     this.attempt.record.results.subscriptionDeletions = { [owner]: receipt }
   }

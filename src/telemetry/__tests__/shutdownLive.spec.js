@@ -984,24 +984,29 @@ class ReopenCase {
         chunks: windows.chunks,
       },
     }
-    await withTelemetryResource(aux, { name: this.stem, entries }, async () => {
-      windows.open()
-      const ordinary = KINDS.map((kind) => this.build(kind, 'ep'))
-      const zero = KINDS.map((kind) => this.build(kind, 't0'))
-      this.defer(() => this.finishAll())
-      try {
-        await Promise.all([
-          ...ordinary.map((member) => this.rounds(member, windows)),
-          ...zero.map((member) => this.timeoutZero(member)),
-        ])
-      } catch (error) {
-        this.failure = error
-        windows.fail(error)
-        throw error
-      }
-      await this.blackhole()
-      await this.finishAll()
-    })
+    await withTelemetryResource(
+      aux,
+      { name: this.stem, entries },
+      async () => {
+        windows.open()
+        const ordinary = KINDS.map((kind) => this.build(kind, 'ep'))
+        const zero = KINDS.map((kind) => this.build(kind, 't0'))
+        this.defer(() => this.finishAll())
+        try {
+          await Promise.all([
+            ...ordinary.map((member) => this.rounds(member, windows)),
+            ...zero.map((member) => this.timeoutZero(member)),
+          ])
+        } catch (error) {
+          this.failure = error
+          windows.fail(error)
+          throw error
+        }
+        await this.blackhole()
+        await this.finishAll()
+      },
+      { signal: this.signal }
+    )
     this.results.seams = this.seamLinks()
     this.results.workMs = clock.now() - runStart
   }

@@ -985,7 +985,8 @@ class OutcomeCase {
             match: `client_id=^${this.stem}-.*$`,
           },
         },
-        sequence
+        sequence,
+        { signal: this.signal }
       )
     else await sequence()
     this.results.seams = STRICT_SEAMS.map(([file, title]) => {

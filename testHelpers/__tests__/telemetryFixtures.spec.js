@@ -176,6 +176,10 @@ describe('new topic config propagation', () => {
 })
 
 describe('client metrics resource ownership', () => {
+  afterEach(() => {
+    jest.useRealTimers()
+    require('../../src/producer/__tests__/fixtures/bounded').liveRun.reset()
+  })
   const config = {
     name: 'fixture',
     entries: { metrics: 'org.apache.kafka.', 'interval.ms': '1000', match: 'client_id=^fixture$' },
@@ -284,14 +288,119 @@ describe('client metrics resource ownership', () => {
     expect(work).not.toHaveBeenCalled()
   })
   test('cleans up readback mismatch without entering work', async () => {
+    jest.useFakeTimers()
     const admin = fixture()
     admin.describeConfigs.mockResolvedValue({
       resources: [{ resourceType: 16, resourceName: 'fixture', errorCode: 0, configEntries: [] }],
     })
     const work = jest.fn()
-    await expect(withTelemetryResource(admin, config, work)).rejects.toThrow('readback')
+    const pending = withTelemetryResource(admin, config, work).catch((error) => error)
+    await jest.advanceTimersByTimeAsync(3000)
+    expect(await pending).toMatchObject({ message: expect.stringContaining('readback') })
     expect(admin.incrementalAlterConfigs).toHaveBeenCalledTimes(2)
     expect(work).not.toHaveBeenCalled()
+  })
+  describe('bounded creation readback', () => {
+    const absent = { resources: [] }
+    const present = { resources: [{ type: 16, name: 'fixture' }] }
+    const stale = {
+      resources: [
+        {
+          resourceType: 16,
+          resourceName: 'fixture',
+          errorCode: 0,
+          configEntries: [{ configName: 'metrics', configValue: 'stale' }],
+        },
+      ],
+    }
+    beforeEach(() => jest.useFakeTimers())
+
+    test('waits for both configuration and listing to converge before entering work', async () => {
+      const admin = fixture()
+      const ready = await admin.describeConfigs()
+      admin.describeConfigs
+        .mockClear()
+        .mockResolvedValueOnce(stale)
+        .mockResolvedValueOnce(ready)
+        .mockResolvedValueOnce(stale)
+      admin.listConfigResources
+        .mockResolvedValueOnce(absent)
+        .mockResolvedValueOnce(absent)
+        .mockResolvedValueOnce(absent)
+      const work = jest.fn(async () => {})
+      const pending = withTelemetryResource(admin, config, work).then(
+        (receipt) => ({ receipt }),
+        (error) => ({ error })
+      )
+      await jest.advanceTimersByTimeAsync(100)
+      expect(work).not.toHaveBeenCalled()
+      await jest.advanceTimersByTimeAsync(50)
+      expect(await pending).toMatchObject({ receipt: { readback: ready.resources[0] } })
+      expect(work).toHaveBeenCalledTimes(1)
+      expect(admin.describeConfigs).toHaveBeenCalledTimes(4)
+      expect(admin.listConfigResources).toHaveBeenCalledTimes(6)
+      expect(jest.getTimerCount()).toBe(0)
+    })
+
+    test.each([
+      ['configuration', stale, present, ['metrics', 'stale', 'interval.ms', 'undefined']],
+      ['listing', null, absent, ['missing from listing']],
+      ['configuration and listing', stale, absent, ['metrics', 'stale', 'missing from listing']],
+    ])(
+      'reports the last %s mismatch at the readback deadline',
+      async (_part, read, listing, details) => {
+        const admin = fixture()
+        if (read) admin.describeConfigs.mockResolvedValue(read)
+        admin.listConfigResources
+          .mockResolvedValueOnce(absent)
+          .mockImplementation(async () =>
+            admin.incrementalAlterConfigs.mock.calls.length === 1 ? listing : absent
+          )
+        const work = jest.fn()
+        let settled = false
+        const pending = withTelemetryResource(admin, config, work).catch((error) => {
+          settled = true
+          return error
+        })
+        await jest.advanceTimersByTimeAsync(2999)
+        expect(settled).toBe(false)
+        await jest.advanceTimersByTimeAsync(1)
+        const error = await pending
+        expect(error).toBeInstanceOf(Error)
+        expect(error.message).toContain('Client metrics resource readback')
+        expect(error.message).toContain('3000 ms')
+        for (const detail of details) expect(error.message).toContain(detail)
+        expect(error.message).toContain('last config=')
+        expect(error.message).toContain(`last listing=${JSON.stringify(listing.resources)}`)
+        expect(work).not.toHaveBeenCalled()
+        expect(admin.incrementalAlterConfigs).toHaveBeenCalledTimes(2)
+        const reads = admin.describeConfigs.mock.calls.length
+        await jest.advanceTimersByTimeAsync(3000)
+        expect(admin.describeConfigs).toHaveBeenCalledTimes(reads)
+        expect(jest.getTimerCount()).toBe(0)
+      }
+    )
+
+    test('stops readback on scenario cancellation and still deletes the resource', async () => {
+      const admin = fixture()
+      admin.describeConfigs.mockResolvedValue(stale)
+      const controller = new AbortController()
+      const cancelled = new Error('scenario cancelled')
+      const work = jest.fn()
+      const pending = withTelemetryResource(admin, config, work, {
+        signal: controller.signal,
+      }).catch((error) => error)
+      await jest.advanceTimersByTimeAsync(0)
+      controller.abort(cancelled)
+      await jest.advanceTimersByTimeAsync(0)
+      expect(await pending).toBe(cancelled)
+      expect(work).not.toHaveBeenCalled()
+      expect(admin.incrementalAlterConfigs).toHaveBeenCalledTimes(2)
+      const reads = admin.describeConfigs.mock.calls.length
+      await jest.advanceTimersByTimeAsync(3000)
+      expect(admin.describeConfigs).toHaveBeenCalledTimes(reads)
+      expect(jest.getTimerCount()).toBe(0)
+    })
   })
   test('waits for a stale broker listing to observe the acknowledged deletion', async () => {
     const admin = fixture()

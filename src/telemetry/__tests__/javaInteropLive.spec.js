@@ -583,7 +583,8 @@ class JavaInteropCase {
     this.results.subscription = await withTelemetryResource(
       resourceAdmin,
       { name: this.stem, entries },
-      () => this.interop(aux)
+      () => this.interop(aux),
+      { signal: this.signal }
     )
   }
 
