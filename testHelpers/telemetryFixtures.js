@@ -148,6 +148,36 @@ class TelemetryExportReader {
 }
 
 /**
+ * Reads a just-created topic's config once the serving broker has published its metadata.
+ * Only topic-propagation refusals are retried; configuration contents are checked by the caller.
+ * @param {object} admin connected, telemetry-disabled fixture admin
+ * @param {object} resource the newly created TOPIC resource and requested config names
+ * @param {AbortSignal} [signal] enclosing scenario scope
+ * @returns {Promise<object>} the DescribeConfigs response
+ * @throws {Error} for a permanent refusal, cancellation or propagation deadline
+ */
+const readCreatedTopicConfig = async (admin, resource, signal) => {
+  const { NEVER, pollUntil } = require('../src/producer/__tests__/fixtures/bounded')
+  let response
+  await pollUntil(
+    signal || NEVER,
+    3000,
+    async () => {
+      try {
+        response = await admin.describeConfigs({ resources: [resource] })
+        return true
+      } catch (error) {
+        if (!['UNKNOWN_TOPIC_OR_PARTITION', 'NOT_LEADER_FOR_PARTITION'].includes(error.type))
+          throw error
+        return false
+      }
+    },
+    { delayMs: 50, label: 'New topic configuration propagation' }
+  )
+  return response
+}
+
+/**
  * @param {object} answer admin response
  * @param {string} name exact resource name
  * @returns {object} one successful resource
@@ -185,7 +215,7 @@ const withTelemetryResource = async (
 ) => {
   const receipt = { name, entries: { ...entries } }
   const names = Object.keys(entries)
-  const listed = () => admin.listConfigResources({ resourceTypes: [16], timeout: 3000 })
+  const listed = (timeout = 3000) => admin.listConfigResources({ resourceTypes: [16], timeout })
   const has = (answer) => answer.resources.some((r) => r.type === 16 && r.name === name)
   if (has(await listed())) throw new Error('Client metrics resource already exists')
   const resource = { type: 16, name }
@@ -231,9 +261,17 @@ const withTelemetryResource = async (
     deletion.response = await alter(1)
     deletion.responseAt = now()
     checkedResource(deletion.response, name)
-    deletion.listing = await listed()
-    deletion.listedAt = now()
-    if (has(deletion.listing)) throw new Error('Client metrics resource deletion not observed')
+    // The controller acknowledgement can precede a broker's metadata publication. Keep the
+    // absence proof, but allow a bounded propagation window; API errors still fail immediately.
+    const deadline = performance.now() + 1000
+    for (;;) {
+      deletion.listing = await listed(Math.max(1, Math.ceil(deadline - performance.now())))
+      deletion.listedAt = now()
+      if (!has(deletion.listing)) break
+      const remaining = deadline - performance.now()
+      if (remaining <= 0) throw new Error('Client metrics resource deletion not observed')
+      await new Promise((resolve) => setTimeout(resolve, Math.min(50, remaining)))
+    }
   } catch (error) {
     cleanup = error
     cleanupFailed = true
@@ -1919,6 +1957,7 @@ const verifyMetricWindows = ({ kind, samples, requests, connects, delta }) => {
 }
 
 module.exports = {
+  readCreatedTopicConfig,
   canonicalUuid,
   DecoderGate,
   DecoderMemory,

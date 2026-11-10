@@ -11,7 +11,10 @@ const {
 } = require('../../../scripts/e2e/telemetry/shareEvidence')
 const { setShareGroupConfigs } = require('../../../testHelpers/shareFixtures')
 const { runCase } = require('../../../scripts/e2e/telemetry/evidence')
-const { TelemetryWireObserver } = require('../../../testHelpers/telemetryFixtures')
+const {
+  TelemetryWireObserver,
+  readCreatedTopicConfig,
+} = require('../../../testHelpers/telemetryFixtures')
 const { readLog } = require('../../../testHelpers/rawLog')
 const {
   bounded,
@@ -110,9 +113,10 @@ class OrdinaryCorpus {
   /**
    * Creates the 3-partition RF3 topic with minimum in-sync replicas 2 and reads that config back.
    * @param {object} admin telemetry-disabled admin
+   * @param {AbortSignal} signal enclosing scenario scope
    * @returns {Promise<void>} when the topic exists with the configuration
    */
-  async create(admin) {
+  async create(admin, signal) {
     const created = await admin.createTopics({
       topics: [
         {
@@ -125,9 +129,11 @@ class OrdinaryCorpus {
       waitForLeaders: true,
     })
     expect(created).toBe(true)
-    const { resources } = await admin.describeConfigs({
-      resources: [{ type: 2, name: this.topic, configNames: ['min.insync.replicas'] }],
-    })
+    const { resources } = await readCreatedTopicConfig(
+      admin,
+      { type: 2, name: this.topic, configNames: ['min.insync.replicas'] },
+      signal
+    )
     expect(resources[0].configEntries.map((e) => [e.configName, e.configValue])).toEqual([
       ['min.insync.replicas', '2'],
     ])
@@ -483,7 +489,7 @@ class UnsupportedCase {
       arm: this.stem,
       brokers: [`localhost:${PORTS[0]}`],
     })
-    await this.within(15000, 'The corpus topic', () => corpus.create(aux))
+    await this.within(15000, 'The corpus topic', (scope) => corpus.create(aux, scope))
     await this.within(15000, 'The acknowledged send', () => corpus.produce(this.on.producer))
     await this.within(40000, 'The ordinary consume', (scope) =>
       corpus.consume(this.on.consumer, (ms, check) =>
@@ -498,8 +504,8 @@ class UnsupportedCase {
       arm: `${this.stem}-off`,
       brokers: [`localhost:${PORTS[0]}`],
     })
-    await this.within(15000, 'The disabled ordinary workload', async () => {
-      await disabledCorpus.create(aux)
+    await this.within(15000, 'The disabled ordinary workload', async (scope) => {
+      await disabledCorpus.create(aux, scope)
       await disabledCorpus.produce(this.off.producer)
       await disabledCorpus.consume(this.off.consumer, (ms, check) =>
         pollUntil(this.signal, ms, check, { delayMs: 100, label: 'Disabled handlers' })

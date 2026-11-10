@@ -1,10 +1,12 @@
 const crypto = require('crypto')
+const { createErrorFromCode } = require('../../src/protocol/error')
 const { EventEmitter } = require('events')
 const fs = require('fs')
 const os = require('os')
 const path = require('path')
 const {
   canonicalUuid,
+  readCreatedTopicConfig,
   TelemetryExportReader,
   TelemetryWireObserver,
   withTelemetryResource,
@@ -122,6 +124,57 @@ describe('independent telemetry evidence', () => {
   })
 })
 
+describe('new topic config propagation', () => {
+  const resource = { type: 2, name: 'new-topic', configNames: ['min.insync.replicas'] }
+  test.each([3, 6])('reads the config after topic propagation refusal code %i', async (code) => {
+    const response = {
+      resources: [
+        {
+          resourceType: 2,
+          resourceName: 'new-topic',
+          errorCode: 0,
+          configEntries: [{ configName: 'min.insync.replicas', configValue: '2' }],
+        },
+      ],
+    }
+    let ready = false
+    const admin = {
+      describeConfigs: async ({ resources }) => {
+        expect(resources).toEqual([resource])
+        if (!ready) {
+          ready = true
+          throw createErrorFromCode(code)
+        }
+        return response
+      },
+    }
+    await expect(readCreatedTopicConfig(admin, resource)).resolves.toEqual(response)
+  })
+  test('does not issue config reads after the enclosing scenario is cancelled', async () => {
+    const controller = new AbortController()
+    const error = new Error('scenario cancelled')
+    controller.abort(error)
+    let calls = 0
+    const admin = {
+      describeConfigs: async () => {
+        calls++
+        return { resources: [] }
+      },
+    }
+    await expect(readCreatedTopicConfig(admin, resource, controller.signal)).rejects.toBe(error)
+    expect(calls).toBe(0)
+  })
+  test('preserves a permanent config failure', async () => {
+    const error = Object.assign(new Error('denied'), { type: 'TOPIC_AUTHORIZATION_FAILED' })
+    const admin = {
+      describeConfigs: async () => {
+        throw error
+      },
+    }
+    await expect(readCreatedTopicConfig(admin, resource)).rejects.toBe(error)
+  })
+})
+
 describe('client metrics resource ownership', () => {
   const config = {
     name: 'fixture',
@@ -164,7 +217,7 @@ describe('client metrics resource ownership', () => {
     expect(work).toHaveBeenCalledTimes(1)
     expect(admin.listConfigResources).toHaveBeenLastCalledWith({
       resourceTypes: [16],
-      timeout: 3000,
+      timeout: expect.any(Number),
     })
     expect(admin.incrementalAlterConfigs.mock.calls[1][0].resources[0].configEntries).toEqual(
       Object.keys(config.entries).map((name) => ({ name, operation: 1 }))
@@ -239,6 +292,27 @@ describe('client metrics resource ownership', () => {
     await expect(withTelemetryResource(admin, config, work)).rejects.toThrow('readback')
     expect(admin.incrementalAlterConfigs).toHaveBeenCalledTimes(2)
     expect(work).not.toHaveBeenCalled()
+  })
+  test('waits for a stale broker listing to observe the acknowledged deletion', async () => {
+    const admin = fixture()
+    admin.listConfigResources
+      .mockResolvedValueOnce({ resources: [] })
+      .mockResolvedValueOnce({ resources: [{ type: 16, name: 'fixture' }] })
+      .mockResolvedValueOnce({ resources: [{ type: 16, name: 'fixture' }] })
+      .mockResolvedValueOnce({ resources: [{ type: 16, name: 'fixture' }] })
+      .mockResolvedValue({ resources: [] })
+    const receipt = await withTelemetryResource(admin, config, async () => {})
+    expect(receipt.deletion.listing).toEqual({ resources: [] })
+    expect(receipt.deletion.listedAt).toBeGreaterThanOrEqual(receipt.deletion.responseAt)
+  })
+  test('preserves a deletion listing error instead of retrying it as propagation lag', async () => {
+    const admin = fixture()
+    const error = new Error('listing failed')
+    admin.listConfigResources
+      .mockResolvedValueOnce({ resources: [] })
+      .mockResolvedValueOnce({ resources: [{ type: 16, name: 'fixture' }] })
+      .mockRejectedValue(error)
+    await expect(withTelemetryResource(admin, config, async () => {})).rejects.toBe(error)
   })
   test('fails a deletion that remains visible', async () => {
     const admin = fixture()
