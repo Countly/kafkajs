@@ -6602,6 +6602,10 @@ class ShareSoak {
    * @throws {Error} the setup failure; its cleanups are registered already and run on `close`
    */
   async prepare() {
+    if (this.driver instanceof ShareSoakDriver)
+      require('./shareSoakEvidence').observeShareSoakDriver(this.driver, (event, fields) =>
+        this.row(event, fields)
+      )
     await this.stage('setup', async (scope) => {
       if (this.driver.tap) this.driver.tap.archive = (fact) => this.row('soak-wire', fact)
       const digest = (file) =>
@@ -7188,6 +7192,11 @@ class ShareSoak {
       stem: this.stem,
       scope: this instanceof SharePriming ? 'priming' : 'scored',
       schema: 'share-soak-scopes-v1',
+      ci: {
+        runId: process.env.GITHUB_RUN_ID ?? null,
+        attempt: process.env.GITHUB_RUN_ATTEMPT ?? null,
+        profile: process.env.KAFKAJS_SOAK_PROFILE ?? null,
+      },
       selector: this.short ? 'SHARE_SOAK_E2E' : 'SHARE_SOAK_FULL',
       soakProfile: this.short ? 'share-consumer-short' : 'share-consumer',
       ...fields,

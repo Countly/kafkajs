@@ -389,3 +389,19 @@ jobs:
           path: .tmp/telemetry-verdict-controls/
           if-no-files-found: error
           include-hidden-files: true
+  verdict:
+    name: memory-gates-verdict
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [unit, share-soak-verdict, resources, retained-diagnostic, telemetry-soak, telemetry-verdicts, telemetry-verdict-controls]
+    if: always() && (github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/'))
+    steps:
+      - name: Require every relocated memory gate
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          node <<'NODE'
+          const results = JSON.parse(process.env.RESULTS)
+          for (const [name, job] of Object.entries(results))
+            if (job.result !== 'success') throw new Error(`${name}: ${job.result}`)
+          NODE

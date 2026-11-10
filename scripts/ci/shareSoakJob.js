@@ -221,7 +221,7 @@ class ShareSoakJob {
         ['scripts/ci/__tests__/naturalExit.spec.js', 'CI natural exit'],
         [
           'scripts/ci/__tests__/shareSoakJob.spec.js',
-          'share soak CI lifecycle controls|share soak CI owned lifecycle serialization',
+          'share soak CI lifecycle controls|share soak CI owned lifecycle serialization|required memory gate composition',
         ],
         [
           'scripts/evidence/__tests__/shareSoakAcceptance.spec.js',
@@ -231,6 +231,7 @@ class ShareSoakJob {
           'scripts/soak/__tests__/sharePriming.spec.js',
           'fixed same-realm share priming|recorded priming integrity|original absolute priming allocations|streamed share protocol evidence',
         ],
+        ['scripts/soak/__tests__/originalSharePriming.spec.js', 'two-scope original share driver'],
         ['scripts/soak/__tests__/shareCleanupControls.spec.js', 'share owner cleanup populations'],
         [
           'scripts/evidence/__tests__/shareQuietHeap.spec.js',

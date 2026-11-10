@@ -330,3 +330,45 @@ describe('share soak CI owned lifecycle serialization', () => {
     }
   )
 })
+
+describe('required memory gate composition', () => {
+  test('requires both share profiles and every relocated telemetry verdict without optional jobs', () => {
+    const workflow = fs.readFileSync('.github/workflows/memory-gates.yml', 'utf8')
+    const jobs = {}
+    let current
+    for (const line of workflow.split('\n')) {
+      const name = /^ {2}([\w-]+):$/.exec(line)
+      if (name) current = name[1]
+      if (current) jobs[current] = (jobs[current] ?? '') + line + '\n'
+    }
+    const required = [
+      'unit',
+      'share-soak-verdict',
+      'resources',
+      'retained-diagnostic',
+      'telemetry-soak',
+      'telemetry-verdicts',
+      'telemetry-verdict-controls',
+    ]
+    expect(jobs.verdict).toContain('needs: [' + required.join(', ') + ']')
+    expect(jobs.verdict).toContain('if: always()')
+    expect(jobs.verdict).toContain("job.result !== 'success'")
+    expect(jobs['share-soak']).toContain('profile: short, jobMinutes: 55, parentMinutes: 35')
+    expect(jobs['share-soak']).toContain('profile: full, jobMinutes: 71, parentMinutes: 51')
+    expect(jobs['share-soak-verify']).toContain('profile: [short, full]')
+    expect(jobs['share-soak-verdict']).toContain('needs: [share-soak, share-soak-verify]')
+    expect(jobs.resources).toContain('node: [22, 24, 26]')
+    expect(jobs['telemetry-soak']).toContain('node: [22, 24, 26]')
+    expect(jobs['telemetry-soak']).toContain("kafka: ['4.3.1', '4.2.2']")
+    expect(jobs['telemetry-verdicts']).toContain('full: true')
+    expect(jobs['telemetry-verdicts']).toContain('memory-verdicts: true')
+    expect(workflow).not.toContain('continue-on-error:')
+    const telemetry = fs.readFileSync('.github/workflows/telemetry.yml', 'utf8')
+    const start = telemetry.indexOf('- name: Require archived socket ownership')
+    expect(start).toBeGreaterThanOrEqual(0)
+    const memory = telemetry.slice(start, telemetry.indexOf('- name:', start + 1))
+    expect(memory).toContain('always() && inputs.memory-verdicts')
+    expect(memory).toContain('verifyMemoryEvidence')
+    expect(telemetry).not.toContain('continue-on-error:')
+  })
+})

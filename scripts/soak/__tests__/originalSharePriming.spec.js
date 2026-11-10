@@ -1,3 +1,13 @@
+jest.mock('../../ci/shareSoakJob', () => ({
+  ...jest.requireActual('../../ci/shareSoakJob'),
+  sourceIdentity: jest.fn(),
+}))
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
+const { sourceIdentity } = require('../../ci/shareSoakJob')
+const { validateArchive } = require('../../evidence/shareSoakAcceptance')
+const { shareArchive } = require('./fixtures/shareArchive')
 // eslint-disable-next-line n/no-unsupported-features/node-builtins -- count-only collection checks original weak roots on the supported Node 22+ test lane
 const { queryObjects } = require('node:v8')
 const { ShareSoakDriver } = require('../soak')
@@ -52,11 +62,12 @@ describe('two-scope original share driver', () => {
   })
 
   test.each([true, false])(
-    'derives both complete workloads and cleanup from original operations, short=%s',
+    'derives both complete workloads, cleanup and sealed archive verdicts from original operations, short=%s',
     async (short) => {
       let boundaryRoots
       const { owner, rows, result, error, primeRoots } = await originalShareSchedule({
         short,
+        correlateCleanup: true,
         twoScopes: true,
         checkBoundaryRoots: async (roots) => {
           boundaryRoots = await retainedRoots(roots)
@@ -113,6 +124,101 @@ describe('two-scope original share driver', () => {
       }
       expect([...workloadSockets[0]].some((s) => workloadSockets[1].has(s))).toBe(false)
       expect(owner.priming).toMatchObject({ passes: 1, cycles: 30, resets: 10, verifiers: 31 })
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'share-archive-'))
+      const previous = { ...process.env }
+      try {
+        const archive = shareArchive(root, rows, short)
+        sourceIdentity.mockReturnValue(archive.contract.source)
+        Object.assign(process.env, archive.platform)
+        const first = await validateArchive(archive.contract, root, { sealed: false })
+        expect(first.problems).toEqual([])
+        archive.finish(first)
+        const replay = await validateArchive(archive.contract, root, {
+          provenance: archive.provenance,
+        })
+        expect(replay.problems).toEqual([])
+        expect(replay.semanticSha256).toBe(first.semanticSha256)
+        const cases = [
+          [
+            'soak-producer',
+            (r) => {
+              r.sent[0].baseOffset = '1'
+            },
+            /producer acknowledgement/,
+          ],
+          [
+            'soak-raw-log',
+            (r) => {
+              r.records.pop()
+            },
+            /raw records\/end reads/,
+          ],
+          [
+            'soak-membership',
+            (r) => {
+              r.members = []
+            },
+            /assignment barriers|ownership differs/,
+          ],
+          [
+            'soak-reset',
+            (r) => {
+              r.oldSocket = -1
+            },
+            /reset rows/,
+          ],
+          [
+            'soak-configuration',
+            (r) => {
+              r.config.topicMetadata.topics[0].partitions[0].replicas.pop()
+            },
+            /replication\/retention/,
+          ],
+          [
+            'soak-cleanup',
+            (r) => {
+              r.after.queueDepth++
+            },
+            /cleanup populations/,
+          ],
+        ]
+        for (const [event, mutate, expected] of cases) {
+          const index = archive.rows.findIndex(
+            (r) =>
+              r.scope === 'scored' &&
+              r.event === event &&
+              (event !== 'soak-cleanup' || r.step === 'cleanup-resources')
+          )
+          expect(index).toBeGreaterThanOrEqual(0)
+          const before = archive.rows[index]
+          archive.rows[index] = JSON.parse(JSON.stringify(before))
+          mutate(archive.rows[index])
+          archive.writeRows()
+          archive.seal()
+          const rejected = await validateArchive(archive.contract, root, {
+            provenance: archive.provenance,
+          })
+          expect(rejected.problems.join('; ')).toMatch(expected)
+          expect(rejected.problems).not.toContain('Changed/incomplete artifact seal')
+          archive.rows[index] = before
+        }
+        archive.writeRows()
+        archive.seal()
+        const foreign = await validateArchive(archive.contract, root, {
+          provenance: { ...archive.provenance, attempt: '2' },
+        })
+        expect(foreign.problems).toContain(
+          'Missing or mismatched GitHub producer/artifact provenance'
+        )
+        sourceIdentity.mockReturnValue({ ...archive.contract.source, commit: 'f'.repeat(40) })
+        expect(
+          (await validateArchive(archive.contract, root, { provenance: archive.provenance }))
+            .problems
+        ).toContain('Frozen source identity differs')
+      } finally {
+        process.env = previous
+        fs.rmSync(root, { recursive: true, force: true })
+      }
     },
     600000
   )

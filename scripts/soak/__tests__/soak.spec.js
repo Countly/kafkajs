@@ -5759,6 +5759,8 @@ describe('Share soak owned raw reader', () => {
 describe('Share soak complete original-owner schedules', () => {
   afterEach(() => liveRun.reset())
   const { originalShareSchedule: schedule } = require('./fixtures/originalShareSchedule')
+  const { ShareTimerObserver } = require('../shareTimerObserver')
+  const { setTimeout: realSetTimeout, clearTimeout: realClearTimeout } = require('node:timers')
 
   /**
    * Checks original reset observations against primitive frames and immediate evidence rows.

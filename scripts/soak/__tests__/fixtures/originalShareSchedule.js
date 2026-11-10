@@ -32,11 +32,13 @@ const diagnostics = require('../../../../testHelpers/shareLiveDiagnostics')
  * decisions, acknowledgements, window observation, resource judging and reconstruction call
  * through their original implementations. The raw corpus is independent of handler evidence.
  * @param {object} [options] Selector, one/two scopes and bounded external fault controls.
+ * @param {boolean} [options.correlateCleanup=false] Scripts the OS clock port from the fake schedule for archive controls.
  * @returns {Promise<object>} Original owner/evidence and weak first-use roots only.
  * @throws {Error} A scripted transport, cleanup or schedule failure.
  */
 const originalShareSchedule = async ({
   short = true,
+  correlateCleanup = false,
   twoScopes = false,
   retainPrime,
   checkBoundaryRoots = async () => {},
@@ -51,8 +53,15 @@ const originalShareSchedule = async ({
   socketClosed = () => {},
   closeOnly = false,
   observeRow = () => {},
+  processResources = () => ({ counts: {}, owners: { rows: [], dropped: 0 } }),
 } = {}) => {
   const clock = new ShareClock().install()
+  const osOrigin = process.hrtime.bigint()
+  const cleanupClock = correlateCleanup
+    ? jest
+        .spyOn(process.hrtime, 'bigint')
+        .mockImplementation(() => osOrigin + BigInt(Math.floor(performance.now() * 1000000)))
+    : null
   const exposed = globalThis.gc
   globalThis.gc = undefined
   const transport = shareClient({ nodes: 3, topics: {} })
@@ -120,15 +129,16 @@ const originalShareSchedule = async ({
   const originalSnapshot = resources.snapshot
   // Heap and process resources are scripted inputs; original client state is always measured.
   resources.snapshot = async () => {
-    const point = await originalSnapshot()
+    const original = await originalSnapshot()
+    const { counts, owners } = processResources(original)
     return {
-      ...point,
+      ...original,
       heapUsed: 1024,
-      activeResources: {},
-      activeResourcesBeforeCollection: {},
+      activeResources: { ...counts },
+      activeResourcesBeforeCollection: { ...counts },
       timerOwners: {
-        beforeCollection: { ...point.timerOwners.beforeCollection, unattributed: {} },
-        afterCollection: { ...point.timerOwners.afterCollection, unattributed: {} },
+        beforeCollection: ShareTimerObserver.evidence(owners, counts),
+        afterCollection: ShareTimerObserver.evidence(owners, counts),
       },
     }
   }
@@ -302,7 +312,11 @@ const originalShareSchedule = async ({
             {
               name: topic,
               topicId: SOAK_UUID,
-              partitions: [0, 1, 2].map((partitionId) => ({ partitionId, leader: partitionId })),
+              partitions: [0, 1, 2].map((partitionId) => ({
+                partitionId,
+                leader: partitionId,
+                replicas: [0, 1, 2],
+              })),
             },
           ],
         }),
@@ -351,28 +365,36 @@ const originalShareSchedule = async ({
           for (const { name, value, operation } of resource.configEntries)
             if (operation === 1) configs.delete(name)
             else configs.set(name, value)
-          return { resources: [{ errorCode: 0 }] }
+          return {
+            resources: [{ errorCode: 0, resourceName: resource.name, resourceType: resource.type }],
+          }
         },
         describeConfigs: async ({ resources: [resource] }) => {
           const values =
-            resource.type === 32
+            resource.type === 2
               ? new Map([
-                  ['share.heartbeat.interval.ms', '5000'],
-                  ['share.session.timeout.ms', '45000'],
-                  ...configs,
+                  ['min.insync.replicas', '2'],
+                  ['retention.ms', '-1'],
+                  ['cleanup.policy', 'delete'],
                 ])
-              : new Map([
-                  ['group.share.heartbeat.interval.ms', '5000'],
-                  ['group.share.min.heartbeat.interval.ms', '5000'],
-                  ['group.share.max.heartbeat.interval.ms', '15000'],
-                  ['group.share.session.timeout.ms', '45000'],
-                  ['group.share.min.session.timeout.ms', '45000'],
-                  ['group.share.max.session.timeout.ms', '60000'],
-                  ['group.share.assignment.interval.ms', '1000'],
-                  ['group.share.min.assignment.interval.ms', '0'],
-                  ['group.share.max.assignment.interval.ms', '15000'],
-                  ['group.share.assignors', 'simple'],
-                ])
+              : resource.type === 32
+                ? new Map([
+                    ['share.heartbeat.interval.ms', '5000'],
+                    ['share.session.timeout.ms', '45000'],
+                    ...configs,
+                  ])
+                : new Map([
+                    ['group.share.heartbeat.interval.ms', '5000'],
+                    ['group.share.min.heartbeat.interval.ms', '5000'],
+                    ['group.share.max.heartbeat.interval.ms', '15000'],
+                    ['group.share.session.timeout.ms', '45000'],
+                    ['group.share.min.session.timeout.ms', '45000'],
+                    ['group.share.max.session.timeout.ms', '60000'],
+                    ['group.share.assignment.interval.ms', '1000'],
+                    ['group.share.min.assignment.interval.ms', '0'],
+                    ['group.share.max.assignment.interval.ms', '15000'],
+                    ['group.share.assignors', 'simple'],
+                  ])
           return {
             resources: [
               {
@@ -608,6 +630,7 @@ const originalShareSchedule = async ({
       external.close()
       resources.restore()
       globalThis.gc = exposed
+      cleanupClock?.mockRestore()
       clock.restore()
     }
   }

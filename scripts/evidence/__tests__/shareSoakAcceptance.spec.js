@@ -182,6 +182,63 @@ describe('share soak independent acceptance controls', () => {
     expect(result.problems).toContain('No decoded successful API 19')
   })
 
+  test('decodes original scripted admin and producer replies rather than placeholder success bytes', async () => {
+    const { ShareFetchTap } = require('../../soak/soak')
+    const { SoakTransport } = require('../../soak/__tests__/fixtures/soakTransport')
+    const tap = new ShareFetchTap()
+    const rows = []
+    tap.archive = (row) => rows.push(original({ event: 'soak-wire', ...row }))
+    const transport = new SoakTransport(tap)
+    try {
+      const admin = transport.admin({
+        listGroups: async () => ({ groups: [{ groupId: 'unrelated' }] }),
+        describeConfigs: async () => ({
+          resources: [
+            {
+              errorCode: 0,
+              resourceType: 32,
+              resourceName: 'owned',
+              configEntries: [
+                {
+                  configName: 'share.auto.offset.reset',
+                  configValue: 'earliest',
+                  configSource: 8,
+                },
+              ],
+            },
+          ],
+        }),
+      })
+      await admin.listGroups()
+      await admin.describeConfigs({ resources: [{ type: 32, name: 'owned' }] })
+      const producer = transport.producer({
+        send: async () => [{ partition: 0, errorCode: 0, baseOffset: '20' }],
+      })
+      await producer.send({
+        topic: 'topic',
+        acks: -1,
+        messages: [
+          {
+            partition: 0,
+            key: Buffer.from('k'),
+            value: Buffer.from('v'),
+            timestamp: '1700000000000',
+          },
+        ],
+      })
+      const result = await verifyProtocolAnswers(rows)
+      expect(result.problems.filter((p) => p.startsWith('Original protocol answer'))).toEqual([])
+      expect(result.groupListings).toEqual([
+        expect.objectContaining({ groups: [expect.objectContaining({ groupId: 'unrelated' })] }),
+      ])
+      expect(result.successes).toEqual(
+        expect.arrayContaining([0, 16, 18, 32].map((apiKey) => expect.objectContaining({ apiKey })))
+      )
+    } finally {
+      transport.close()
+    }
+  })
+
   test('observes the real producer adapter and decoded raw-log adapter through serialization', async () => {
     const rows = []
     const sent = [{ partition: 0, errorCode: 0, baseOffset: '0' }]
