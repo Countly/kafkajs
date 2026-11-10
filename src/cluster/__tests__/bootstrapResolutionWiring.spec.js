@@ -1,6 +1,9 @@
 const dns = require('dns')
 const { Kafka } = require('../../../index')
-const { KafkaJSBootstrapResolutionError } = require('../../errors')
+const {
+  KafkaJSBootstrapResolutionError,
+  KafkaJSInvalidConfigurationError,
+} = require('../../errors')
 const {
   createScriptedCluster,
   groupScript,
@@ -223,6 +226,105 @@ describe('Bootstrap DNS resolution', () => {
 
     expect(dnsStub.calls).toHaveLength(2 * NODES.length)
     expect(scripted.sockets().length).toBeGreaterThan(0)
+  })
+
+  test.each(KINDS)(
+    'a %s subscribing before connect waits for bootstrap DNS through the public client',
+    async (kind) => {
+      const { consumer } = startConsumer(kind)
+      plan.current = () => 'hold'
+      let subscribed = false
+      const subscribing = consumer.subscribe({ topic: TOPIC }).then(() => (subscribed = true))
+      subscribing.catch(() => {})
+      await advance(STEP)
+
+      expect(dnsStub.calls).toHaveLength(NODES.length)
+      expect(scripted.sockets()).toHaveLength(0)
+      expect(subscribed).toBe(false)
+
+      dnsStub.calls[0].callback(null, ADDRESSES)
+      await until(subscribing)
+      expect(subscribed).toBe(true)
+      expect(scripted.requests().map(({ api }) => api)).toContain('Metadata')
+    }
+  )
+
+  test.each(KINDS)(
+    'a %s subscribing concurrently with connect shares bootstrap DNS through the public client',
+    async (kind) => {
+      const { consumer } = startConsumer(kind)
+      plan.current = () => 'hold'
+      const subscribing = consumer.subscribe({ topic: TOPIC })
+      subscribing.catch(() => {})
+      const connecting = consumer.connect()
+      connecting.catch(() => {})
+      await advance(STEP)
+
+      expect(dnsStub.calls).toHaveLength(NODES.length)
+      expect(scripted.sockets()).toHaveLength(0)
+      dnsStub.calls[0].callback(null, ADDRESSES)
+      await until(Promise.all([subscribing, connecting]))
+      expect(dnsStub.calls).toHaveLength(NODES.length)
+
+      await until(consumer.disconnect())
+      await until(consumer.connect())
+      expect(dnsStub.calls).toHaveLength(NODES.length)
+    }
+  )
+
+  test.each(KINDS)(
+    'a %s subscribing cannot bypass terminal bootstrap DNS failure through the public client',
+    async (kind) => {
+      const { consumer } = startConsumer(kind)
+      const connecting = consumer.connect().catch((error) => error)
+      await advance(DEADLINE)
+      const terminal = await connecting
+      expect(terminal).toBeInstanceOf(KafkaJSBootstrapResolutionError)
+      const lookups = dnsStub.calls.length
+
+      await expect(until(consumer.subscribe({ topic: TOPIC }))).rejects.toBe(terminal)
+      expect(dnsStub.calls).toHaveLength(lookups)
+      expect(scripted.sockets()).toHaveLength(0)
+    }
+  )
+
+  test('admin disconnect cancels bootstrap DNS before draining admitted work through the public client', async () => {
+    const admin = track(newKafka().admin({ retry: RETRY }))
+    plan.current = () => 'hold'
+    const connecting = admin.connect().catch((error) => error)
+    await advance(STEP)
+    const oldCalls = [...dnsStub.calls]
+    expect(oldCalls).toHaveLength(NODES.length)
+
+    await expect(admin.disconnect({ timeout: -1 })).rejects.toBeInstanceOf(
+      KafkaJSInvalidConfigurationError
+    )
+    expect(jest.getTimerCount()).toBe(1)
+    let closed = false
+    const closing = admin.disconnect().then(() => (closed = true))
+    await advance(STEP)
+    expect(closed).toBe(true)
+    await closing
+    const error = await connecting
+    expect(error).toBeInstanceOf(Error)
+    expect(error).not.toBeInstanceOf(KafkaJSBootstrapResolutionError)
+    expect(jest.getTimerCount()).toBe(0)
+
+    for (const call of oldCalls) call.callback(null, ADDRESSES)
+    await advance(DEADLINE)
+    expect(scripted.sockets()).toHaveLength(0)
+    expect(dnsStub.calls).toHaveLength(NODES.length)
+    expect(jest.getTimerCount()).toBe(0)
+
+    const reconnecting = admin.connect()
+    await advance(STEP)
+    expect(dnsStub.calls).toHaveLength(2 * NODES.length)
+    expect(scripted.sockets()).toHaveLength(0)
+    dnsStub.calls[NODES.length].callback(null, ADDRESSES)
+    await until(reconnecting)
+    await until(admin.disconnect())
+    scripted.assertClean()
+    expect(jest.getTimerCount()).toBe(0)
   })
 
   test('TLS and custom factories receive the original hostname through the public client', async () => {

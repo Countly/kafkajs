@@ -9,6 +9,10 @@ const { decode: decodeV1, parse } = require('../v1/response')
  *
  * The v1 body, decoded and parsed as v1 is: the topics sorted by name, and the error of the first
  * failed topic thrown. From this version the client throttles (KIP-219).
+ * @param {Buffer} rawData encoded response body
+ * @returns {Promise<{ throttleTime: number, clientSideThrottleTime: number,
+ *   topicErrors: { topic: string, errorCode: number }[] }>} sorted topic results and client delay
+ * @throws {KafkaJSPartialMessageError} when the response body is truncated or malformed
  * @see clients/src/main/resources/common/message/DeleteTopicsResponse.json (Apache Kafka 4.3.1)
  */
 const decode = async (rawData) => {

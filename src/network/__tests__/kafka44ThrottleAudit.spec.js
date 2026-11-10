@@ -1,5 +1,14 @@
 const fs = require('fs')
 const path = require('path')
+const Connection = require('../connection')
+const Encoder = require('../../protocol/encoder')
+const apiKeys = require('../../protocol/requests/apiKeys')
+const {
+  newLogger,
+  createFakeSocketFactory,
+  readRequestHeader,
+  respondWithFrame,
+} = require('testHelpers')
 const { parseMessage } = require('../../../scripts/compat/parse')
 
 const ROOT = path.join(__dirname, '../..')
@@ -182,5 +191,82 @@ describe('Kafka 4.4 client fix audit', () => {
     expect(wrong).toEqual([])
     expect(throttled).toBeGreaterThan(150)
     expect(notThrottled).toBeGreaterThan(30)
+
+    jest.useFakeTimers()
+    try {
+      for (const api of ['DeleteTopics', 'Metadata', 'Fetch']) {
+        const boundary = FIRST_CLIENT_THROTTLED[api]
+        for (const [version, sent, delay] of [
+          [boundary, THROTTLE, THROTTLE],
+          [boundary, 0, 0],
+          [boundary - 1, THROTTLE, 0],
+        ]) {
+          const { codec, message } = cases.find((row) => row.api === api && row.version === version)
+          const fake = createFakeSocketFactory()
+          const connection = new Connection({
+            host: 'node',
+            port: 9092,
+            logger: newLogger(),
+            socketFactory: fake.factory,
+            clientId: 'throttle-audit',
+            connectionTimeout: 1000,
+            requestTimeout: 1000,
+            enforceRequestTimeout: false,
+          })
+          try {
+            const connecting = connection.connect()
+            await jest.advanceTimersByTimeAsync(0)
+            await connecting
+            const send = () =>
+              connection.send({
+                request: {
+                  apiKey: apiKeys[api],
+                  apiName: api,
+                  apiVersion: version,
+                  encode: async () => new Encoder(),
+                },
+                response: { decode: codec.decode, parse: async (decoded) => decoded },
+              })
+            const first = send()
+            await jest.advanceTimersByTimeAsync(0)
+            expect(fake.state.writes).toHaveLength(1)
+            respondWithFrame(
+              fake.state,
+              readRequestHeader(fake.state.writes[0]).correlationId,
+              0,
+              minimalBody(message, version, sent)
+            )
+            await first
+            const startedAt = Date.now()
+            const second = send()
+            second.catch(() => {})
+            await jest.advanceTimersByTimeAsync(0)
+            if (delay > 0) {
+              expect(fake.state.writes).toHaveLength(1)
+              await jest.advanceTimersByTimeAsync(THROTTLE - 1)
+              expect(fake.state.writes).toHaveLength(1)
+              await jest.advanceTimersByTimeAsync(1)
+            }
+            expect(Date.now() - startedAt).toBe(delay)
+            expect(fake.state.writes).toHaveLength(2)
+            respondWithFrame(
+              fake.state,
+              readRequestHeader(fake.state.writes[1]).correlationId,
+              0,
+              minimalBody(message, version, 0)
+            )
+            await second
+          } finally {
+            await connection.disconnect({ drainTimeout: 0 })
+            await jest.advanceTimersByTimeAsync(0)
+          }
+          expect(fake.state.writesAfterClose).toBe(0)
+          expect(fake.state.sockets.every((socket) => socket.destroyed)).toBe(true)
+          expect(jest.getTimerCount()).toBe(0)
+        }
+      }
+    } finally {
+      jest.useRealTimers()
+    }
   })
 })
