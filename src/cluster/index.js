@@ -218,6 +218,7 @@ module.exports = class Cluster {
     this.brokerPool = new BrokerPool({
       telemetryMetrics,
       connectionPoolBuilder: this.connectionPoolBuilder,
+      bootstrapResolution: bootstrapResolveTimeout > 0 ? this.bootstrapResolution : null,
       logger: this.rootLogger,
       metadataCache: this.metadataCache,
       captureTopics:
@@ -241,12 +242,6 @@ module.exports = class Cluster {
     const fenceOf = ({ fence } = {}) => fence
 
     this[PRIVATE.CONNECT] = shareMetadata(async ({ fence } = {}) => {
-      try {
-        await this.bootstrapResolution.wait()
-      } catch (error) {
-        fence?.check()
-        throw error
-      }
       return await this.brokerPool.connect(...fenceArgs(fence))
     }, fenceOf)
 
@@ -456,15 +451,25 @@ module.exports = class Cluster {
    * @returns {Promise<void>}
    */
   async disconnect(options) {
-    this.bootstrapResolution.cancel(
-      new KafkaJSConnectionError('Disconnected while waiting for bootstrap DNS resolution')
-    )
+    this.cancelPendingBootstrapResolution()
     try {
       await this.brokerPool.disconnect(...(options ? [options] : []))
     } finally {
       for (const groupId of this.groupEntries.keys()) this.groupRegistry.release(groupId, this)
       this.groupEntries.clear()
     }
+  }
+
+  /**
+   * Cancels bootstrap readiness before a client drains calls waiting for it. Transport draining
+   * remains the disconnect caller's responsibility; an open or terminal gate is unchanged.
+   * @returns {void}
+   * @throws Never.
+   */
+  cancelPendingBootstrapResolution() {
+    this.bootstrapResolution.cancel(
+      new KafkaJSConnectionError('Disconnected while waiting for bootstrap DNS resolution')
+    )
   }
 
   /**

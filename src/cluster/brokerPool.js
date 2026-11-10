@@ -93,6 +93,8 @@ module.exports = class BrokerPool {
    * @param {object|null} [options.telemetryMetrics=null] private numeric observer of this client,
    *   never shared with the dedicated telemetry transport
    * @param {import("./connectionPoolBuilder").ConnectionPoolBuilder} options.connectionPoolBuilder
+   * @param {import("./bootstrapResolution")|null} [options.bootstrapResolution] Cluster-owned
+   *   readiness gate; omitted when disabled to preserve the synchronous connection path
    * @param {import("../../types").Logger} options.logger
    * @param {import("./metadataCache")} [options.metadataCache] optional: a `BrokerPool` owns its
    *   metadata and is usable standalone, so it defaults to a private cache rather than requiring
@@ -116,6 +118,7 @@ module.exports = class BrokerPool {
   constructor({
     telemetryMetrics = null,
     connectionPoolBuilder,
+    bootstrapResolution = null,
     logger,
     metadataCache,
     captureTopics,
@@ -135,6 +138,7 @@ module.exports = class BrokerPool {
     this.retiredBrokers = new WeakSet()
     this.rootLogger = logger
     this.connectionPoolBuilder = connectionPoolBuilder
+    this.bootstrapResolution = bootstrapResolution
     this.metadataMaxAge = metadataMaxAge || 0
     this.logger = logger.namespace('BrokerPool')
     this.retryOptions = assign({}, retry)
@@ -714,6 +718,19 @@ module.exports = class BrokerPool {
    * @throws {Error} the lifecycle's close error
    */
   async connect({ fence } = {}) {
+    fence?.check()
+    checked(null)
+    if (this.bootstrapResolution) {
+      try {
+        await this.bootstrapResolution.wait()
+      } catch (error) {
+        fence?.check()
+        checked(null)
+        throw error
+      }
+      fence?.check()
+      checked(null)
+    }
     if (this.hasConnectedBrokers()) {
       return
     }
