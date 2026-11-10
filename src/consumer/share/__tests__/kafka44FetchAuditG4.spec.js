@@ -1,3 +1,5 @@
+const { ShareRun } = require('../shareRun')
+const { newLogger } = require('../../../../testHelpers')
 const {
   A,
   acquire,
@@ -228,6 +230,158 @@ describe('Kafka 4.4 client fix audit', () => {
     expect(delivered).toEqual([])
     expect(m.loop.cohorts.size).toBe(0)
     expect(m.loop.exchanges.size).toBe(0)
+  })
+
+  test('KAFKA-21106 a late old-leader acquisition of a moved partition is released without a handler call while the node keeps another partition', async () => {
+    for (const batch of [false, true]) {
+      h = await harness({ nodes: 3 })
+      const outcomes = []
+      const delivered = []
+      let moved = false
+      const runner = {
+        subscription: ['topic-a'],
+        options: {
+          groupId: 'group',
+          acknowledgementMode: 'implicit',
+          maxPollInterval: 30000,
+          minBytes: 1,
+          maxBytes: 1048576,
+          maxRecords: 100,
+          acquireMode: 'record_limit',
+          logger: newLogger(),
+          cluster: {
+            ...h.metadata,
+            onRoutingChange: () => () => {},
+            cachedLeader: (_, partition) => (moved && partition === 0 ? 2 : 0),
+          },
+        },
+        emit: jest.fn(),
+        publishResults: (row, results) => outcomes.push({ row, results }),
+      }
+      const run = new ShareRun({
+        runner,
+        batch,
+        handler: async (payload) => {
+          const partition = batch ? payload.batch.partition : payload.partition
+          const messages = batch ? payload.batch.messages : [payload.message]
+          delivered.push(
+            ...messages.map(({ offset, value }) => ({ partition, offset, value: value.toString() }))
+          )
+        },
+      })
+      runner.current = run
+      // The test drives rounds explicitly; routing, sessions, transport and dispatch stay real.
+      jest.spyOn(run, 'driveNode').mockImplementation(async (node) => {
+        node.session = h.members[node.id].session
+        node.loop = run.createLoop(node, h.members[node.id].broker)
+      })
+      const adopted = []
+      const loopClass = require('../shareFetchLoop').ShareFetchLoop
+      const adoptOriginal = loopClass.prototype.adopt
+      const capture = jest.spyOn(loopClass.prototype, 'adopt').mockImplementation(function (
+        ...args
+      ) {
+        const row = adoptOriginal.apply(this, args)
+        if (row) adopted.push(row)
+        return row
+      })
+      let late
+      let gate
+      try {
+        run.assignment.set(A, { topic: 'topic-a', partitions: [0, 1] })
+        run.syncNodes()
+        const old = run.nodes.get(0)
+        h.scriptNodes('ShareFetch', {
+          0: [fetchAnswer([acquire(0, 10, ['retired', 'retired-next'])])],
+          2: [fetchAnswer([acquire(0, 10, ['replacement', 'replacement-next'])])],
+        })
+        await run.pollNode(old)
+        const retired = adopted[0]
+        gate = h.hold({ api: 'ShareFetch', node: 0 })
+        late = run.pollNode(old)
+        await gate.arrived()
+        moved = true
+        run.syncNodes()
+        expect(run.nodes.get(0)).toBe(old)
+        expect(old.keys).toEqual(new Set([`${A}:1`]))
+        const replacement = run.nodes.get(2)
+        await run.pollNode(replacement)
+        await run.pollNode(replacement)
+        expect(delivered.slice(-2)).toEqual([
+          { partition: 0, offset: '10', value: 'replacement' },
+          { partition: 0, offset: '11', value: 'replacement-next' },
+        ])
+        const afterRetirement = outcomes.filter(({ row }) => row === retired)
+        expect(afterRetirement).toHaveLength(1)
+        expect(
+          afterRetirement[0].results.every(({ error }) => error?.reason === 'session-lost')
+        ).toBe(true)
+
+        delivered.length = 0
+        gate.release(fetchAnswer([acquire(0, 10, ['late', 'late-next']), acquire(1, 30, ['kept'])]))
+        await late
+        expect(delivered).toEqual([{ partition: 1, offset: '30', value: 'kept' }])
+        await run.pollNode(old)
+        const release = fetchFrames(h, 0)[2].fields
+        expect(release.forgottenTopicsData).toEqual([{ topicId: A, partitions: [0] }])
+        expect(release.topics).toEqual([
+          {
+            topicId: A,
+            partitions: [
+              { partitionIndex: 0, acknowledgementBatches: [batchOf(10, 11, 2)] },
+              { partitionIndex: 1, acknowledgementBatches: [batchOf(30, 30, 1)] },
+            ],
+          },
+        ])
+        await run.pollNode(old)
+        await run.pollNode(replacement)
+        const lateRow = adopted.find(
+          (row) => row.walk.deliver.records[0]?.value.toString() === 'late'
+        )
+        const replacementRow = adopted.find(
+          (row) => row.walk.deliver.records[0]?.value.toString() === 'replacement'
+        )
+        const keptRow = adopted.find((row) => row.partition === 1)
+        expect(byOffset(outcomes.filter(({ row }) => row === keptRow))).toEqual(
+          new Map([['30', [{ row: keptRow, type: 'accept', error: null }]]])
+        )
+        expect(outcomes).toHaveLength(4)
+        expect(lateRow.token).not.toBe(replacementRow.token)
+        expect(lateRow.ledger).not.toBe(replacementRow.ledger)
+        for (const [row, type] of [
+          [lateRow, 'release'],
+          [replacementRow, 'accept'],
+        ]) {
+          expect(byOffset(outcomes.filter((entry) => entry.row === row))).toEqual(
+            new Map([
+              ['10', [{ row, type, error: null }]],
+              ['11', [{ row, type, error: null }]],
+            ])
+          )
+        }
+        expect(outcomes.filter(({ row }) => row === retired)).toEqual(afterRetirement)
+        expect(fetchFrames(h, 0).slice(3).flatMap(acknowledgementsOf)).toEqual([])
+        for (const node of run.nodes.values()) {
+          expect(node.loop.cohorts.size).toBe(0)
+          expect(node.loop.exchanges.size).toBe(0)
+          expect(node.session.busy).toBe(false)
+          expect(node.queue).toBe(null)
+          expect(node.active).toBe(null)
+        }
+        for (const row of adopted) expect(row.ledger.size).toBe(0)
+        expect(run.poll.calls.size).toBe(0)
+      } finally {
+        if (gate?.settle) gate.release()
+        if (late) await late
+        capture.mockRestore()
+        for (const node of run.nodes.values()) node.loop.dispose()
+        run.manager.shutdown()
+        run.poll.stop()
+        run.unrouted()
+        await h.close()
+        h = null
+      }
+    }
   })
 
   test('KAFKA-21106 a late old-leader response cannot restore retired ownership', async () => {

@@ -62,6 +62,9 @@ const runCase = async (scope, { scenario, copyRecord, release }) => {
     await f.open(scope)
     const source = await f.topic(scope)
     const dlqTopic = await f.topic(scope, { name: `dlq.${source}` })
+    const {
+      topics: [metadata],
+    } = await bounded(scope, 10000, () => f.admin.fetchTopicMetadata({ topics: [source] }))
     const group = await f.group(scope, source, {
       'share.auto.offset.reset': 'earliest',
       ...(release && { 'share.delivery.count.limit': DELIVERY_LIMIT }),
@@ -88,7 +91,12 @@ const runCase = async (scope, { scenario, copyRecord, release }) => {
     const key = Buffer.from(`key-${f.nonce}`)
     const value = Buffer.from(`value-${f.nonce}`)
     const producer = await f.producer(scope)
-    await bounded(scope, 15000, () => producer.send({ topic: source, messages: [{ key, value }] }))
+    await bounded(scope, 15000, () =>
+      producer.send({
+        topic: source,
+        messages: [{ key, value, headers: { 'source-only': Buffer.from('must-not-copy') } }],
+      })
+    )
 
     const readerGroup = await f.group(scope, `${source}-reader`)
     const reader = f.client('reader').consumer({ groupId: readerGroup })
@@ -137,6 +145,7 @@ const runCase = async (scope, { scenario, copyRecord, release }) => {
     expect(delivered.identity).toBe(
       shareRecordIdentity({ topic: source, partition: 0, offset: '0', key, value })
     )
+    expect(Object.keys(record.headers).sort()).toEqual(Object.values(HEADERS).sort())
     expect(text(record.headers[HEADERS.topic])).toBe(source)
     expect(text(record.headers[HEADERS.partition])).toBe(String(delivered.partition))
     expect(text(record.headers[HEADERS.offset])).toBe(delivered.offset)
@@ -158,6 +167,28 @@ const runCase = async (scope, { scenario, copyRecord, release }) => {
     )
     expect(member.crashes).toEqual([])
     await bounded(scope, 15000, () => member.consumer.disconnect({ timeout: 8000 }))
+    f.observe({
+      group,
+      topicId: metadata.topicId,
+      quietMs: SETTLE_MS,
+      source: {
+        topic: source,
+        identity: shareRecordIdentity({ topic: source, partition: 0, offset: '0', key, value }),
+        key: key.toString('hex'),
+        value: value.toString('hex'),
+        headers: { 'source-only': Buffer.from('must-not-copy').toString('hex') },
+      },
+      deliveryCounts: deliveries.map(({ deliveryCount }) => deliveryCount),
+      identities: deliveries.map(({ identity }) => identity),
+      records: dead.map(({ key, value, headers }) => ({
+        key: key?.toString('hex') ?? null,
+        value: value?.toString('hex') ?? null,
+        headers: Object.fromEntries(
+          Object.entries(headers).map(([name, value]) => [name, Buffer.from(value).toString('hex')])
+        ),
+      })),
+      crashes: member.crashes,
+    })
   })
 }
 

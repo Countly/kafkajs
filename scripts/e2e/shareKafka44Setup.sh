@@ -35,4 +35,15 @@ until docker exec "${container}" "${FEATURES}" --bootstrap-server "${BOOTSTRAP}"
   sleep 2
 done
 
-docker exec "${container}" "${FEATURES}" --bootstrap-server "${BOOTSTRAP}" describe
+description="$(docker exec "${container}" "${FEATURES}" --bootstrap-server "${BOOTSTRAP}" describe)" || exit "$?"
+printf '%s\n' "${description}"
+if ! awk '
+  $1 == "Feature:" && $2 == "share.version" {
+    for (i = 3; i < NF; i++)
+      if ($i == "FinalizedVersionLevel:" && $(i + 1) == "2") found++
+  }
+  END { exit found == 1 ? 0 : 1 }
+' <<< "${description}"; then
+  echo "share.version is not finalized at level 2" >&2
+  exit 1
+fi

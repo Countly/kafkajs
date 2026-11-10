@@ -119,7 +119,7 @@ A Kafka 4.4 broker can write the records that a share group rejects, or releases
 | Cluster | `errors.deadletterqueue.topic.name.prefix` | `dlq.` | The destination topic name must start with it; an empty value lifts the restriction. |
 | Cluster | `errors.deadletterqueue.auto.create.topics.enable` | `false` | When `true` the broker creates a missing destination topic with the topic setting enabled. |
 
-The broker lists the cluster settings among its dynamically reconfigurable defaults, so a `BROKER` resource with the empty name sets them; that needs the cluster-alter permission, and an operator can set them in the broker configuration instead. Create the destination topic first, then configure the group before any member joins:
+An operator sets the cluster prefix and auto-create policy in the broker configuration. Dynamic reconfiguration of these two settings through a `BROKER` resource has not been verified. With those operator settings in place, create the destination topic first, then configure the group before any member joins:
 
 ```js
 const { ConfigResourceTypes, AlterConfigOpTypes } = require('@countly/kafkajs')
@@ -133,10 +133,6 @@ const alter = async (type, name, configEntries) => {
 }
 
 await admin.createTopics({ topics: [{ topic: 'dlq.orders', numPartitions: 1 }] })
-await alter(ConfigResourceTypes.BROKER, '', [
-  set('errors.deadletterqueue.topic.name.prefix', 'dlq.'),
-  set('errors.deadletterqueue.auto.create.topics.enable', 'false'),
-])
 await alter(ConfigResourceTypes.TOPIC, 'dlq.orders', [set('errors.deadletterqueue.group.enable', 'true')])
 await alter(ConfigResourceTypes.GROUP, 'orders', [
   set('errors.deadletterqueue.topic.name', 'dlq.orders'),

@@ -1,4 +1,6 @@
 const net = require('net')
+const { writeEvidence } = require('./e2eEvidence')
+const { assertScenario } = require('../scripts/evidence/shareKafka44')
 const { Kafka, logLevel } = require('../index')
 const Decoder = require('../src/protocol/decoder')
 const { RESPONSE_HEADER_V1, responseHeaderVersion } = require('../src/protocol/headers')
@@ -435,6 +437,9 @@ class ShareKafka44Fixture {
     this.groups = []
     this.topics = []
     this.admin = null
+    this.evidence = scenario.startsWith('dlq-') ? 'share-dlq-kafka44' : 'share-kafka44'
+    this.features = null
+    this.cleanup = { groupsAbsent: false, topicsAbsent: false, adminDisconnected: false }
   }
 
   /**
@@ -458,8 +463,45 @@ class ShareKafka44Fixture {
    * @returns {Promise<void>}
    * @throws {Error} the body's failure first, else the first cleanup failure
    */
-  run(work) {
-    return this.stack.run(work, { budgetMs: CLEANUP_MS })
+  async run(work) {
+    try {
+      await this.stack.run(work, { budgetMs: CLEANUP_MS })
+      this.row('case-complete', {
+        status: 'passed',
+        cleanup: this.cleanup,
+        groups: this.groups,
+        topics: this.topics,
+      })
+    } catch (error) {
+      this.row('case-failed', { error: { message: error.message }, cleanup: this.cleanup })
+      throw error
+    }
+  }
+
+  /** @param {string} event Row kind. @param {object} fields Original observations. @returns {void} Appends a stamped row synchronously. */
+  row(event, fields) {
+    const wireVersions = Object.fromEntries(
+      this.tap.exchanges.map(({ apiKey, apiVersion }) => [apiKey, apiVersion])
+    )
+    writeEvidence(this.evidence, {
+      event,
+      case: this.scenario,
+      scenario: this.nonce,
+      wireVersions,
+      config: { featureLevel: SHARE_VERSION_LEVEL },
+      ...fields,
+    })
+  }
+
+  /** @param {object} proof Scenario-specific observations. @returns {void} Archives raw frames before validating the scenario. @throws {Error} A missing or violated oracle. */
+  observe(proof) {
+    const wire = this.tap.exchanges.map(({ request, response, ...entry }) => ({
+      ...entry,
+      requestHex: request.toString('hex'),
+      responseHex: response?.toString('hex') ?? null,
+    }))
+    this.row('observations', { proof, wire, features: this.features })
+    assertScenario(this.scenario, proof, wire)
   }
 
   /**
@@ -476,12 +518,16 @@ class ShareKafka44Fixture {
           signal,
           unrelated: [],
         })
+        this.cleanup.groupsAbsent = true
+        this.cleanup.topicsAbsent = true
       } finally {
         await this.admin.disconnect()
+        this.cleanup.adminDisconnected = true
       }
     })
     await bounded(scope, STEP_MS, () => this.admin.connect())
     await bounded(scope, STEP_MS, () => prepareShareKafka44({ admin: this.admin }))
+    this.features = await bounded(scope, STEP_MS, () => this.admin.describeFeatures())
   }
 
   /**

@@ -1,3 +1,7 @@
+const fs = require('fs')
+const os = require('os')
+const path = require('path')
+const { spawnSync } = require('child_process')
 const { EventEmitter } = require('events')
 const Encoder = require('../../../protocol/encoder')
 const shareFetch = require('../../../../testHelpers/wire/shareFetchV2')
@@ -27,6 +31,44 @@ const adminWith = (levels) => ({
 })
 
 describe('Share Kafka 4.4 setup', () => {
+  test('setup rejects an unfinalized level and preserves CLI failures before Jest', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'share-feature-'))
+    const docker = path.join(directory, 'docker')
+    fs.writeFileSync(
+      docker,
+      `#!/bin/bash
+if [ "$1" = ps ]; then echo fake-container; exit 0; fi
+if [ "\${!#}" = describe ]; then
+  echo "Feature: share.version SupportedMinVersion: 0 SupportedMaxVersion: 2 FinalizedVersionLevel: $TEST_LEVEL Epoch: 7"
+  exit "$TEST_STATUS"
+fi
+exit 0
+`,
+      { mode: 0o755 }
+    )
+    try {
+      for (const [level, status, expected] of [
+        ['1', '0', 1],
+        ['0', '0', 1],
+        ['2', '0', 0],
+        ['2', '7', 7],
+      ]) {
+        const result = spawnSync('bash', ['scripts/e2e/shareKafka44Setup.sh'], {
+          env: {
+            ...process.env,
+            PATH: `${directory}:${process.env.PATH}`,
+            TEST_LEVEL: level,
+            TEST_STATUS: status,
+          },
+          encoding: 'utf8',
+        })
+        expect({ level, status, exit: result.status }).toEqual({ level, status, exit: expected })
+      }
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
   test('requires finalized share.version two', async () => {
     await expect(prepareShareKafka44({ admin: adminWith({ 'share.version': 2 }) })).resolves.toBe(
       undefined
@@ -272,5 +314,261 @@ describe('Share Kafka 4.4 wire observation', () => {
       )
     ).toEqual([[0, 1], [1]])
     expect(assignedPartitions([answer(null)], A)).toEqual([])
+  })
+})
+
+describe('Share Kafka 4.4 archived evidence', () => {
+  test('requires all scenarios and cleanup instead of accepting a stamped success line', () => {
+    const { verifyFiles } = require('../../../../scripts/evidence/verify')
+    const verified = { tree: 'a'.repeat(40), node: process.version, brokerVersion: '4.4.0' }
+    const stamp = {
+      ...verified,
+      at: new Date().toISOString(),
+      lane: 'docker',
+      config: {},
+      wireVersions: {},
+    }
+    for (const name of ['share-kafka44', 'share-dlq-kafka44']) {
+      const result = verifyFiles([`${name}.jsonl`], verified, () =>
+        JSON.stringify({ ...stamp, status: 'passed' })
+      )
+      expect(result.problems.length).toBe(name === 'share-kafka44' ? 5 : 4)
+      expect(
+        result.problems.every((message) => message.includes('needs one observation row'))
+      ).toBe(true)
+    }
+  })
+
+  test('validates DLQ copy and metadata receipts and rejects duplicate records headers and failed acknowledgements', async () => {
+    const {
+      assertScenario,
+      verifyShareKafka44,
+    } = require('../../../../scripts/evidence/shareKafka44')
+    const acknowledge = require('../../../../testHelpers/wire/shareAcknowledgeV2')
+    const rows = []
+    for (const release of [false, true]) {
+      for (const copy of [false, true]) {
+        const scenario = `dlq-${release ? 'release' : 'reject'}-${copy ? 'copy' : 'metadata'}`
+        const fields = {
+          groupId: 'group',
+          memberId: A,
+          topics: [
+            {
+              topicId: A,
+              partitions: [
+                {
+                  partitionIndex: 0,
+                  acknowledgementBatches: [
+                    { firstOffset: '0', lastOffset: '0', acknowledgeTypes: [release ? 2 : 3] },
+                  ],
+                },
+              ],
+            },
+          ],
+        }
+        const proof = {
+          deliveryCounts: release ? [1, 2] : [1],
+          identities: release ? ['identity', 'identity'] : ['identity'],
+          group: 'group',
+          topicId: A,
+          quietMs: 3000,
+          crashes: [],
+          source: {
+            topic: 'source',
+            identity: 'identity',
+            key: '6b',
+            value: '76',
+            headers: { 'source-only': Buffer.from('must-not-copy').toString('hex') },
+          },
+          records: [
+            {
+              key: copy ? '6b' : null,
+              value: copy ? '76' : null,
+              headers: Object.fromEntries(
+                Object.entries({
+                  '__dlq.errors.topic': 'source',
+                  '__dlq.errors.partition': '0',
+                  '__dlq.errors.offset': '0',
+                  '__dlq.errors.group': 'group',
+                  '__dlq.errors.delivery.count': release ? '2' : '1',
+                  '__dlq.errors.message': release
+                    ? 'Offset delivery count exceeded the threshold.'
+                    : 'Offset rejected by client.',
+                }).map(([key, value]) => [key, Buffer.from(value).toString('hex')])
+              ),
+            },
+          ],
+        }
+        const wire = []
+        for (const apiKey of release ? [78, 79] : [79]) {
+          const codec = apiKey === 78 ? shareFetch : acknowledge
+          const request = require(
+            `../../../protocol/requests/${apiKey === 78 ? 'shareFetch' : 'shareAcknowledge'}/v2/request`
+          )(fields)
+          wire.push({
+            apiKey,
+            label: 'member',
+            requestHex: (await request.encode()).buffer.toString('hex'),
+            responseHex: codec
+              .buildResponse({
+                responses: [
+                  {
+                    topicId: A,
+                    partitions: [
+                      {
+                        partitionIndex: 0,
+                        errorCode: 0,
+                        acknowledgeErrorCode: 0,
+                        errorMessage: null,
+                        acknowledgeErrorMessage: null,
+                        currentLeader: { leaderId: 0, leaderEpoch: 1 },
+                        records: '',
+                        acquiredRecords: [],
+                      },
+                    ],
+                  },
+                ],
+              })
+              .toString('hex'),
+          })
+        }
+        expect(() => assertScenario(scenario, proof, wire)).not.toThrow()
+        for (const mutate of [
+          (p) => p.records.push(p.records[0]),
+          (p) => {
+            p.records[0].headers['source-only'] = '78'
+          },
+          (p) => {
+            delete p.records[0].headers['__dlq.errors.offset']
+          },
+          (p) => {
+            p.records[0].key = copy ? null : '6b'
+          },
+          (p) => {
+            p.deliveryCounts = [1, 1]
+          },
+        ]) {
+          const broken = JSON.parse(JSON.stringify(proof))
+          mutate(broken)
+          expect(() => assertScenario(scenario, broken, wire)).toThrow()
+        }
+        const failed = wire.map((entry) => ({
+          ...entry,
+          responseHex: (entry.apiKey === 78 ? shareFetch : acknowledge)
+            .buildResponse({ errorCode: 30 })
+            .toString('hex'),
+        }))
+        expect(() => assertScenario(scenario, proof, failed)).toThrow()
+        rows.push(
+          {
+            case: scenario,
+            scenario,
+            event: 'observations',
+            proof,
+            wire,
+            wireVersions: { 78: 2 },
+            features: { finalizedFeatures: { 'share.version': { maxVersionLevel: 2 } } },
+          },
+          {
+            case: scenario,
+            scenario,
+            event: 'case-complete',
+            status: 'passed',
+            groups: ['group'],
+            topics: ['source', 'dlq.source'],
+            cleanup: { groupsAbsent: true, topicsAbsent: true, adminDisconnected: true },
+          }
+        )
+      }
+    }
+    expect(verifyShareKafka44('share-dlq-kafka44', rows)).toEqual([])
+    for (const mutate of [
+      (rows) => rows.pop(),
+      (rows) => {
+        rows[1].cleanup.groupsAbsent = false
+      },
+      (rows) => {
+        rows[0].features.finalizedFeatures['share.version'].maxVersionLevel = 1
+      },
+      (rows) => {
+        rows[0].wireVersions = {}
+      },
+      (rows) => {
+        rows[0].wire[0].requestHex = '00'
+      },
+      (rows) => rows.push(rows[0]),
+    ]) {
+      const broken = JSON.parse(JSON.stringify(rows))
+      mutate(broken)
+      expect(verifyShareKafka44('share-dlq-kafka44', broken).length).toBeGreaterThan(0)
+    }
+  })
+})
+
+describe('Share Kafka 4.4 forget evidence', () => {
+  test('requires settled acknowledgements and a later successful fetch without reintroducing lost partitions', async () => {
+    const { assertScenario } = require('../../../../scripts/evidence/shareKafka44')
+    const request = require('../../../protocol/requests/shareFetch/v2/request')
+    const frame = async (partitions, forgotten, time) => ({
+      apiKey: 78,
+      label: 'A',
+      requestedAt: time,
+      answeredAt: time + 1,
+      requestHex: (
+        await request({
+          groupId: 'group',
+          memberId: A,
+          topics: [{ topicId: A, partitions }],
+          forgottenTopicsData: forgotten,
+        }).encode()
+      ).buffer.toString('hex'),
+      responseHex: shareFetch.buildResponse().toString('hex'),
+    })
+    const keep = { partitionIndex: 1, acknowledgementBatches: [] }
+    const wire = [
+      await frame(
+        [
+          {
+            partitionIndex: 0,
+            acknowledgementBatches: [{ firstOffset: '0', lastOffset: '0', acknowledgeTypes: [2] }],
+          },
+          keep,
+        ],
+        [{ topicId: A, partitions: [0] }],
+        10
+      ),
+      await frame([keep], [], 30),
+    ]
+    const proof = {
+      topicId: A,
+      lost: [0],
+      kept: [1],
+      settledAt: 20,
+      crashes: [],
+      acknowledgements: [{ partition: 0, type: 'release', error: null }],
+    }
+    expect(() => assertScenario('forget', proof, wire)).not.toThrow()
+    expect(() => assertScenario('forget', proof, wire.slice(0, 1))).toThrow(
+      'no later successful fetch'
+    )
+    expect(() => assertScenario('forget', { ...proof, acknowledgements: [] }, wire)).toThrow()
+    expect(() => assertScenario('forget', { ...proof, settledAt: 40 }, wire)).toThrow(
+      'no later successful fetch'
+    )
+    expect(() => assertScenario('forget', proof, [...wire, wire[0]])).toThrow()
+    const reintroduced = await frame(
+      [{ partitionIndex: 0, acknowledgementBatches: [] }, keep],
+      [],
+      40
+    )
+    expect(() => assertScenario('forget', proof, [...wire, reintroduced])).toThrow(
+      'lost partition reappeared'
+    )
+    expect(() =>
+      assertScenario('forget', proof, [
+        wire[0],
+        { ...wire[1], responseHex: shareFetch.buildResponse({ errorCode: 30 }).toString('hex') },
+      ])
+    ).toThrow('no later successful fetch')
   })
 })

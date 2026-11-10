@@ -174,6 +174,12 @@ enabled('Share Kafka 4.4 (live)', () => {
           memberEpoch: -1,
         })
         expect(member.crashes).toEqual([])
+        f.observe({
+          handled,
+          identity: shareRecordIdentity({ topic, partition: 0, offset: '0', key, value }),
+          topicId: (await topicIdentity(f.admin, topic)).topicId,
+          crashes: member.crashes,
+        })
       })
     }),
     caseTimeout(CASE_MS)
@@ -241,6 +247,11 @@ enabled('Share Kafka 4.4 (live)', () => {
         const { groups } = await bounded(scope, 10000, () => f.admin.describeGroups([group]))
         expect(groups[0].members).toHaveLength(1)
         expect(f.tap.of(78, MEMBER)).toEqual([])
+        f.observe({
+          group,
+          failure: { code: failure.code ?? failure.cause?.code, retriable: failure.retriable },
+          classicMembers: groups[0].members.length,
+        })
       })
     }),
     caseTimeout(CASE_MS)
@@ -351,6 +362,15 @@ enabled('Share Kafka 4.4 (live)', () => {
           member.acknowledgements.filter(({ topic, error }) => topic === kept && error)
         ).toEqual([])
         await bounded(scope, 15000, () => member.consumer.disconnect({ timeout: 8000 }))
+        f.observe({
+          doomedId,
+          deletedAt,
+          kept,
+          value: value.toString('hex'),
+          handled: handled.map((entry) => ({ ...entry, value: entry.value.toString('hex') })),
+          acknowledgements: member.acknowledgements,
+          crashes: member.crashes,
+        })
       })
     }),
     caseTimeout(CASE_MS)
@@ -398,6 +418,7 @@ enabled('Share Kafka 4.4 (live)', () => {
             },
           }
         )
+        f.stack.add('release the held handler', () => release())
         await pollUntil(scope, POLL_MS, () => held.length > 0, { label: 'A holding a record' })
         await pollUntil(
           scope,
@@ -434,6 +455,37 @@ enabled('Share Kafka 4.4 (live)', () => {
           { label: 'A acknowledging every lost partition' }
         )
 
+        await pollUntil(
+          scope,
+          POLL_MS,
+          () =>
+            lostBy(assignments()).every((partition) =>
+              memberA.acknowledgements.some(
+                (entry) =>
+                  entry.topic === topic &&
+                  entry.partition === partition &&
+                  ['accept', 'release'].includes(entry.type) &&
+                  entry.error === null
+              )
+            ),
+          { label: 'The broker settling every lost partition acknowledgement' }
+        )
+        const settledAt = performance.now()
+        const settledThrough = f.tap.of(78, 'A').length
+        await pollUntil(
+          scope,
+          POLL_MS,
+          () =>
+            f.tap
+              .of(78, 'A')
+              .slice(settledThrough)
+              .some(
+                ({ response }) => response && shareFetch.readResponse(response).errorCode === 0
+              ),
+          {
+            label: 'A later completed fetch after acknowledgement settlement',
+          }
+        )
         const requests = fetchRequests(f, 'A')
         const history = assignments()
         const lost = lostBy(history)
@@ -448,6 +500,14 @@ enabled('Share Kafka 4.4 (live)', () => {
         }
         expect(memberA.crashes).toEqual([])
         expect(memberB.crashes).toEqual([])
+        f.observe({
+          topicId,
+          lost,
+          kept: history[history.length - 1],
+          settledAt,
+          acknowledgements: memberA.acknowledgements,
+          crashes: [...memberA.crashes, ...memberB.crashes],
+        })
       })
     }),
     caseTimeout(CASE_MS)
@@ -536,6 +596,12 @@ enabled('Share Kafka 4.4 (live)', () => {
         expect(member.acknowledgements.filter(({ error }) => error)).toEqual([])
         expect(member.crashes).toEqual([])
         await bounded(scope, 15000, () => member.consumer.disconnect({ timeout: 8000 }))
+        f.observe({
+          topicId,
+          deliveries,
+          identities: sent.map((_, offset) => identityOf(offset)),
+          crashes: member.crashes,
+        })
       })
     }),
     caseTimeout(CASE_MS)
