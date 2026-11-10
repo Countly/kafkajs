@@ -365,6 +365,131 @@ describe('share node socket integration', () => {
     jest.restoreAllMocks()
   })
 
+  test('omitted hooks support idle polling and invalidate acquisitions on a session reset', async () => {
+    h = await harness({
+      loop: {
+        now: undefined,
+        wanted: undefined,
+        dispatch: undefined,
+        onResults: undefined,
+        onReset: undefined,
+      },
+    })
+    jest.spyOn(performance, 'now').mockImplementation(() => h.clock.time)
+    const [m] = h.members
+    const idle = await m.loop.poll()
+    expect(idle).toMatchObject({ empty: true, sentAt: 1000, answeredAt: 1000 })
+    expect(fetchFrames(h)).toEqual([])
+    expect(m.sleeps).toEqual([50])
+    expect(m.session.epoch).toBe(0)
+
+    m.loop.wanted = () => [A0]
+    h.script('ShareFetch', [fetchAnswer([acquire(0, 10, ['a', 'b'])])])
+    const result = await m.loop.poll()
+    expect(fetchFrames(h).map(({ fields }) => fields.shareSessionEpoch)).toEqual([0])
+    expect(result.reply).toHaveLength(1)
+    const [row] = result.reply
+    expect(row.walk.deliver.records.map(({ offset }) => offset)).toEqual(['10', '11'])
+    expect(row.pendingHandlers).toBe(false)
+    expect(row.ledger.size).toBe(2)
+    expect(m.session.epoch).toBe(1)
+
+    const old = m.session.token
+    m.session.reset('session-not-found')
+    expect(m.session.token).not.toBe(old)
+    expect(m.session.epoch).toBe(0)
+    expect(row.ledger.size).toBe(0)
+    expect(m.loop.cohorts.size).toBe(0)
+    expect(m.loop.isLive(row)).toBe(false)
+  })
+
+  test('a pool replaced during connection selection sends nothing and reopens under fresh authority', async () => {
+    h = await harness({ loop: { logger: undefined } })
+    const [m] = h.members
+    m.want = [A0]
+    const oldPool = m.broker.connectionPool
+    const select = oldPool.getConnectionByRequest.bind(oldPool)
+    const selected = deferred()
+    const release = deferred()
+    jest.spyOn(oldPool, 'getConnectionByRequest').mockImplementationOnce(async (...args) => {
+      const connection = await select(...args)
+      selected.resolve()
+      await release.promise
+      return connection
+    })
+    const oldOpen = m.session.token
+    const polling = settled(m.loop.poll())
+    try {
+      await selected.promise
+      m.broker.connectionPool = h.newPool(m.node)
+      release.resolve()
+      const { value } = await polling
+      expect(value).toMatchObject({ reset: true, backoff: true })
+      expect(value.error.message).toBe('Broker pool of node0:9092 was replaced')
+      expect(fetchFrames(h)).toEqual([])
+      expect(m.session.token).not.toBe(oldOpen)
+      expect(m.session.binding).toBeNull()
+      expect(m.session.epoch).toBe(0)
+
+      h.script('ShareFetch', [fetchAnswer([acquire(0, 10, ['fresh-pool'])])])
+      await m.loop.poll()
+      expect(m.handled.map(({ value }) => value)).toEqual(['fresh-pool'])
+      expect(m.session.binding.pool).toBe(m.broker.connectionPool)
+      expect(m.session.binding.pool).not.toBe(oldPool)
+      expect(fetchFrames(h).map(({ fields }) => fields.shareSessionEpoch)).toEqual([0])
+    } finally {
+      release.resolve()
+      await polling
+    }
+  })
+
+  test('a fatal broker reply still rejects when the fatal observer is omitted', async () => {
+    h = await harness({ loop: { onFatal: undefined } })
+    const [m] = h.members
+    m.want = [A0]
+    h.script('ShareFetch', [topError(30)])
+
+    await expect(m.loop.poll()).rejects.toMatchObject({
+      code: 30,
+      type: 'GROUP_AUTHORIZATION_FAILED',
+      retriable: false,
+    })
+
+    expect(fetchFrames(h)).toHaveLength(1)
+    expect(m.handled).toEqual([])
+    expect(m.loop.cohorts.size).toBe(0)
+    expect(m.loop.exchanges.size).toBe(0)
+  })
+
+  test('a failed data socket close is logged after disposal retires the unanswered fetch', async () => {
+    const logger = keepLog()
+    h = await harness({ loop: { logger } })
+    const [m] = h.members
+    m.want = [A0]
+    const held = h.hold({ api: 'ShareFetch' })
+    const polling = settled(m.loop.poll())
+    await held.arrived()
+    const { connection } = m.session.binding
+    const disconnect = connection.disconnect.bind(connection)
+    const failure = new Error('data close failed')
+    jest.spyOn(connection, 'disconnect').mockImplementationOnce(async (options) => {
+      await disconnect(options)
+      throw failure
+    })
+    const cause = new Error('node disposed')
+
+    m.loop.dispose(cause)
+
+    expect((await polling).error).toBe(cause)
+    await until(() => logger.lines.length > 0, 'the failed close diagnostic')
+    expect(logger.lines).toEqual([
+      { level: 'error', message: 'Share data connection close failed', error: 'data close failed' },
+    ])
+    expect(connection.isConnected()).toBe(false)
+    expect(m.loop.exchanges.size).toBe(0)
+    expect([m.operation.waiters.size, m.operation.disposers.size]).toEqual([0, 0])
+  })
+
   test('waits for every node handler before fetching that node again', async () => {
     h = await harness({ nodes: 3 })
     const [n0, n1, n2] = h.members

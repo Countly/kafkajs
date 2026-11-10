@@ -18823,7 +18823,14 @@
         "testHelpers/__tests__/telemetryFixtures.spec.js \u203a required live archive dimensions and semantics requires archived unsupported ownership only in memory-gates",
         "testHelpers/__tests__/telemetryFixtures.spec.js \u203a telemetry observation segments seals shutdown resource ledgers without applying memory acceptance",
         "testHelpers/__tests__/telemetryFixtures.spec.js \u203a telemetry wire observer functional cleanup records surviving sockets without applying memory acceptance",
-        "testHelpers/__tests__/telemetryFixtures.spec.js \u203a telemetry wire observer functional cleanup still fails a latched sink sequence error"
+        "testHelpers/__tests__/telemetryFixtures.spec.js \u203a telemetry wire observer functional cleanup still fails a latched sink sequence error",
+        "src/consumer/share/__tests__/shareFetchLoop.spec.js \u203a share node socket integration a failed data socket close is logged after disposal retires the unanswered fetch",
+        "src/consumer/share/__tests__/shareFetchLoop.spec.js \u203a share node socket integration a fatal broker reply still rejects when the fatal observer is omitted",
+        "src/consumer/share/__tests__/shareFetchLoop.spec.js \u203a share node socket integration a pool replaced during connection selection sends nothing and reopens under fresh authority",
+        "src/consumer/share/__tests__/shareFetchLoop.spec.js \u203a share node socket integration omitted hooks support idle polling and invalidate acquisitions on a session reset",
+        "src/telemetry/__tests__/subscription.spec.js \u203a telemetry default dependencies close without an outer budget bounds a held final to one second",
+        "src/telemetry/__tests__/subscription.spec.js \u203a telemetry default dependencies the default monotonic clock includes options access in the getter timeout",
+        "src/telemetry/__tests__/subscription.spec.js \u203a telemetry default dependencies unregistering through the client removes only the selected metric identity"
       ],
       "capMinutes": 85,
       "allowedSkips": [
@@ -21985,7 +21992,15 @@
       "command": null,
       "needs": {},
       "evidence": [],
-      "titles": [],
+      "titles": [
+        "src/consumer/share/__tests__/shareFetchLoop.spec.js \u203a share node socket integration a failed data socket close is logged after disposal retires the unanswered fetch",
+        "src/consumer/share/__tests__/shareFetchLoop.spec.js \u203a share node socket integration a fatal broker reply still rejects when the fatal observer is omitted",
+        "src/consumer/share/__tests__/shareFetchLoop.spec.js \u203a share node socket integration a pool replaced during connection selection sends nothing and reopens under fresh authority",
+        "src/consumer/share/__tests__/shareFetchLoop.spec.js \u203a share node socket integration omitted hooks support idle polling and invalidate acquisitions on a session reset",
+        "src/telemetry/__tests__/subscription.spec.js \u203a telemetry default dependencies close without an outer budget bounds a held final to one second",
+        "src/telemetry/__tests__/subscription.spec.js \u203a telemetry default dependencies the default monotonic clock includes options access in the getter timeout",
+        "src/telemetry/__tests__/subscription.spec.js \u203a telemetry default dependencies unregistering through the client removes only the selected metric identity"
+      ],
       "capMinutes": 93,
       "allowedSkips": [
         "testHelpers/__tests__/telemetryFixtures.spec.js \u203a telemetry wire observer independently decodes all details behind a capped export",

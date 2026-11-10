@@ -1,3 +1,4 @@
+const { performance } = require('node:perf_hooks')
 const ClientTelemetry = require('../client')
 const TelemetryMetrics = require('../metrics')
 const ID = '01020304-0506-0708-090a-0b0c0d0e0f10'
@@ -100,6 +101,104 @@ beforeEach(() => {
 })
 afterEach(() => {
   jest.useRealTimers()
+})
+
+describe('telemetry default dependencies', () => {
+  test('the default monotonic clock includes options access in the getter timeout', async () => {
+    let now = 100
+    const reading = jest.spyOn(performance, 'now').mockImplementation(() => now)
+    const client = new ClientTelemetry({
+      kind: 'producer',
+      metrics: new TelemetryMetrics({ kind: 'producer' }),
+      transport: { candidates: () => [] },
+    })
+    client.connected = true
+    try {
+      await expect(
+        client.clientInstanceId({
+          get timeout() {
+            now = 111
+            return 10
+          },
+        })
+      ).rejects.toMatchObject({ reason: 'timeout' })
+      expect(client.waiters.size).toBe(0)
+      expect(client.waiterTimer).toBeNull()
+    } finally {
+      client.suspend()
+      reading.mockRestore()
+    }
+  })
+
+  test('unregistering through the client removes only the selected metric identity', () => {
+    const { client, metrics } = setup()
+    const name = 'com.example.queue'
+    client.registerMetricForSubscription({
+      name,
+      type: 'gauge',
+      value: 3,
+      attributes: { node: 'a' },
+    })
+    client.registerMetricForSubscription({
+      name,
+      type: 'gauge',
+      value: 7,
+      attributes: { node: 'b' },
+    })
+
+    client.unregisterMetricFromSubscription({ name, attributes: { node: 'a' } })
+
+    const selected = { revision: 1n, requestedMetrics: ['com.example.'], deltaTemporality: true }
+    metrics.select(selected)
+    const snapshot = metrics.snapshot(selected)
+    try {
+      expect(
+        snapshot.points.map(({ name, value, attributes }) => ({ name, value, attributes }))
+      ).toEqual([
+        { name: 'com.example.queue', value: 7, attributes: [{ key: 'node', value: 'b' }] },
+      ])
+    } finally {
+      metrics.abandon(snapshot)
+    }
+  })
+
+  test('close without an outer budget bounds a held final to one second', async () => {
+    const h = setup()
+    let release
+    const held = new Promise((resolve) => {
+      release = resolve
+    })
+    h.pushes.push(() => held)
+    h.client.resume()
+    await jest.advanceTimersByTimeAsync(0)
+    expect(h.client.uuid).toBe(ID)
+    expect(h.events.map(({ api }) => api)).toEqual([71])
+
+    const closing = h.client.close()
+    try {
+      await jest.advanceTimersByTimeAsync(0)
+      expect(h.events.map(({ api, terminating }) => ({ api, terminating }))).toEqual([
+        { api: 71, terminating: undefined },
+        { api: 72, terminating: true },
+      ])
+      expect(h.events[1]).toMatchObject({ clientInstanceId: ID, subscriptionId: -7 })
+      await jest.advanceTimersByTimeAsync(999)
+      expect(h.client.state).toBe('CLOSING')
+      expect(h.handles.map(({ retired }) => retired)).toEqual([false])
+
+      await jest.advanceTimersByTimeAsync(1)
+      await closing
+
+      expect(h.client.state).toBe('CLOSED')
+      expect(h.handles.map(({ retired }) => retired)).toEqual([true])
+      expect(jest.getTimerCount()).toBe(0)
+    } finally {
+      release({ errorCode: 0, clientSideThrottleTime: 0 })
+      await jest.advanceTimersByTimeAsync(1000)
+      await closing
+      h.client.suspend()
+    }
+  })
 })
 
 describe('stable instance identity and absolute subscription replacement', () => {
