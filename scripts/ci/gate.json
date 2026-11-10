@@ -18832,6 +18832,7 @@
         "testHelpers/__tests__/socketOwners.spec.js \u203a socket owner diagnostics attributes a TCP client to its test and enriches a failed share baseline with live endpoints",
         "testHelpers/__tests__/socketOwners.spec.js \u203a socket owner diagnostics attributes a TLS client to its test and enriches a failed share baseline with live endpoints",
         "testHelpers/__tests__/socketOwners.spec.js \u203a socket owner diagnostics keeps one connect hook across Jest module registries",
+        "testHelpers/__tests__/socketOwners.spec.js \u203a socket owner diagnostics keeps the hook and retained ownership data outside file realms when files change",
         "src/consumer/share/__tests__/shareFetchLoop.spec.js \u203a share node socket integration a failed data socket close is logged after disposal retires the unanswered fetch",
         "src/consumer/share/__tests__/shareFetchLoop.spec.js \u203a share node socket integration a fatal broker reply still rejects when the fatal observer is omitted",
         "src/consumer/share/__tests__/shareFetchLoop.spec.js \u203a share node socket integration a pool replaced during connection selection sends nothing and reopens under fresh authority",
