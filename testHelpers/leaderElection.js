@@ -1,6 +1,7 @@
 const { execFile, execFileSync } = require('child_process')
 const { promisify } = require('util')
 const path = require('path')
+const fs = require('fs')
 
 const BOOTSTRAP_SERVER = 'kafka1:29092'
 // Suffixed with this process's pid so two overlapping runs (there should never be one, but the
@@ -10,9 +11,44 @@ const KAFKA_BIN = '/opt/kafka/bin'
 // Resolved against the repository root, not the working directory, so a script run from another
 // directory (the OpenTelemetry package's tests run from `otel/`) reaches the same cluster.
 const COMPOSE_FILE = path.resolve(__dirname, '..', process.env.COMPOSE_FILE || 'docker-compose.yml')
+const DIAGNOSTICS_FILE = path.resolve(
+  __dirname,
+  '../.tmp/e2e',
+  `broker-bouncer-${process.pid}.jsonl`
+)
+const STATE_FIELDS = [
+  'Status',
+  'Running',
+  'Paused',
+  'Restarting',
+  'StartedAt',
+  'FinishedAt',
+  'ExitCode',
+  'OOMKilled',
+  'Error',
+]
+// Ask Docker for state only: a full inspect also contains credentials in Config.Env.
+const STATE_FORMAT = `{"Id":{{json .Id}},${STATE_FIELDS.map(
+  (field) => `"${field}":{{json .State.${field}}}`
+).join(',')}}`
+
+/** @param {*} value @returns {string} bounded diagnostic text */
+const diagnosticText = (value) => String(value ?? '').slice(0, 16384)
+
+/**
+ * Normalises Docker's UTC timestamps without losing their nanosecond precision.
+ * @param {string} value State.StartedAt
+ * @returns {string} a lexically comparable timestamp
+ * @throws {Error} if Docker did not supply a valid timestamp
+ */
+const startTime = (value) => {
+  const match = /^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d{1,9}))?Z$/.exec(value)
+  if (!match || !Number.isFinite(Date.parse(value))) throw new Error('Invalid container StartedAt')
+  return `${match[1]}.${(match[2] || '').padEnd(9, '0')}Z`
+}
 
 /** Builds a guarded controller call when the test harness supplies an ownership manifest.
- * @param {string} operation control or exec
+ * @param {string} operation control, exec, inspect or logs
  * @param {string[]} args exact service/action or container command operands
  * @returns {string[]|null} timeout argv, or null for the ordinary standalone harness
  * @throws {Error} incomplete ownership environment or invalid control shape
@@ -59,15 +95,34 @@ const compose = (...args) => {
  * so it still never races its container, while the clients under test in the same process keep
  * heartbeating through a stop that takes seconds.
  *
- * @param {...string} args
+ * `inspect <service>` resolves the Compose container id and reads state-only Docker fields.
+ * Reads have a 5 s child budget; controls have a 120 s budget, with no retries.
+ * @param {...string} args Compose operands, or `inspect <service>`
  * @returns {Promise<{ stdout: string, stderr: string }>}
  * @throws {Error} if the `docker` CLI exits non-zero
  */
-const composeAsync = (...args) => {
-  const guarded = guardedCommand('control', args)
-  return guarded
-    ? promisify(execFile)('timeout', guarded)
-    : promisify(execFile)('docker', composeArgs(args))
+const composeAsync = async (...args) => {
+  const inspecting = args[0] === 'inspect'
+  const reading = inspecting || args[0] === 'logs'
+  // Guarded reads fail closed if the controller does not support them; never bypass ownership.
+  const guarded = guardedCommand(reading ? args[0] : 'control', reading ? args.slice(1) : args)
+  const run = (file, operands) =>
+    promisify(execFile)(
+      'timeout',
+      ['--kill-after=1s', reading ? '5s' : '120s', file, ...operands],
+      { maxBuffer: 256 * 1024 }
+    )
+  if (guarded) {
+    if (reading) guarded[1] = '5s'
+    return promisify(execFile)('timeout', guarded, { maxBuffer: 256 * 1024 })
+  }
+  if (inspecting) {
+    const { stdout } = await run('docker', composeArgs(['ps', '--all', '--quiet', args[1]]))
+    const id = stdout.trim()
+    if (!/^[a-f0-9]{12,64}$/.test(id)) throw new Error(`Expected one container for ${args[1]}`)
+    return run('docker', ['inspect', '--format', STATE_FORMAT, id])
+  }
+  return run('docker', composeArgs(args))
 }
 
 /**
@@ -240,15 +295,18 @@ const waitForFullIsr = async (admin, topics, { budgetMs = 60000, delayMs = 250 }
 /**
  * Takes compose nodes down and brings them back one at a time. Before every step it checks that no
  * node is down and that every node answers, and refuses the step otherwise, so the three KRaft
- * controllers never lose two voters at once. Every step restores its node in a `finally` (start or
- * unpause) and waits until it answers again, and after a restart until the ISR is full, even when
+ * controllers never lose two voters at once. A restart waits for exit before start, then proves a
+ * newer running instance. Every step attempts restoration in a `finally` and waits until the node
+ * answers again, and after a restart until the ISR is full, even when
  * the step failed. An outage is measured through restored communication: from the moment the
  * down command returned to the first answer after the restore (and, for a restart, the full ISR).
  */
 class BrokerBouncer {
   /**
    * @param {object} [boundary] the outside world; a unit spec replaces it
-   * @param {(...args: string[]) => *} [boundary.run] runs `docker compose <args>`
+   * @param {(...args: string[]) => *} [boundary.run] runs Compose control commands
+   * @param {(...args: string[]) => *} [boundary.read] runs state-only `inspect <service>` or
+   *   bounded Compose logs, separately from any scenario's control wrapper
    * @param {(node: { host: string, port: number }) => Promise<boolean>} [boundary.answers]
    * @param {(admin: object, topics: string[]) => Promise<void>} [boundary.waitForFullIsr]
    * @param {() => number} [boundary.now]
@@ -257,13 +315,14 @@ class BrokerBouncer {
    */
   constructor({
     run = composeAsync,
+    read = composeAsync,
     answers: probe = answers,
     waitForFullIsr: isr = waitForFullIsr,
     now = Date.now,
     sleep: wait = sleep,
     nodes = NODES,
   } = {}) {
-    Object.assign(this, { run, probe, isr, now, wait, nodes })
+    Object.assign(this, { run, read, probe, isr, now, wait, nodes })
     this.down = new Set()
   }
 
@@ -302,6 +361,96 @@ class BrokerBouncer {
   }
 
   /**
+   * Reads only the container identity and state, even if a guarded runner returns a full inspect.
+   * @param {string} service Compose service
+   * @returns {Promise<object>} allow-listed state fields
+   * @throws {Error} on a missing container, malformed state or failed inspection
+   */
+  async inspect(service) {
+    const { stdout } = await this.read('inspect', service)
+    const parsed = JSON.parse(stdout)
+    const item = Array.isArray(parsed) ? parsed[0] : parsed
+    const state = item?.State || item
+    if (!item?.Id || typeof state?.Running !== 'boolean') {
+      throw new Error(`Missing container state for ${service}`)
+    }
+    return {
+      Id: item.Id,
+      ...Object.fromEntries(STATE_FIELDS.map((key) => [key, state[key]])),
+      Error: diagnosticText(state.Error),
+    }
+  }
+
+  /**
+   * Waits for exit before start, or proves that start made a new running instance. A new instance
+   * that has already exited fails immediately; neither condition ever retries a control command.
+   * @param {string} service Compose service
+   * @param {object} evidence this step's bounded state snapshots
+   * @param {string} [previousStart] omitted for the exit barrier, otherwise the pre-outage start
+   * @returns {Promise<void>}
+   * @throws {Error} on inspection failure, a new instance's exit, or the 30 s deadline
+   */
+  async waitForState(service, evidence, previousStart) {
+    const deadline = this.now() + 30000
+    const expired = () =>
+      new Error(`${service} ${previousStart ? 'restart' : 'exit'} not observed within 30000 ms`)
+    for (;;) {
+      const state = await this.inspect(service)
+      evidence.states[previousStart ? 'afterStart' : 'afterDown'] = state
+      if (this.now() > deadline) throw expired()
+      if (!previousStart && !state.Running) return
+      if (previousStart && startTime(state.StartedAt) > startTime(previousStart)) {
+        if (!state.Running && ['exited', 'dead'].includes(state.Status)) {
+          throw new Error(`${service} new instance exited: ${JSON.stringify(state)}`)
+        }
+        if (state.Running && !state.Paused && !state.Restarting) return
+      }
+      if (this.now() >= deadline) throw expired()
+      await this.wait(Math.min(200, deadline - this.now()))
+    }
+  }
+
+  /**
+   * Saves restore-failure state and the last 200 timestamped log lines before teardown. Each read
+   * is bounded by the runner, each text field is capped, and no diagnostic failure escapes.
+   * @param {string} service Compose service
+   * @param {object} evidence control results and snapshots accumulated by the step
+   * @param {Error[]} failures errors in their original order
+   * @returns {Promise<void>}
+   */
+  async diagnose(service, evidence, failures) {
+    try {
+      evidence.failures = failures.map((error) => diagnosticText(error.message))
+      evidence.diagnosticErrors = []
+      try {
+        const state = await this.inspect(service)
+        const restored = evidence.commands.some(({ args }) =>
+          ['start', 'unpause'].includes(args[0])
+        )
+        const stage = restored ? 'afterStart' : 'afterDown'
+        evidence.states[stage] ||= state
+        evidence.states.failure = state
+      } catch (error) {
+        evidence.diagnosticErrors.push(diagnosticText(error.message))
+      }
+      try {
+        const { stdout, stderr } = await this.read('logs', '--timestamps', '--tail', '200', service)
+        evidence.logs = { stdout: diagnosticText(stdout), stderr: diagnosticText(stderr) }
+      } catch (error) {
+        evidence.logs = {
+          stdout: diagnosticText(error.stdout),
+          stderr: diagnosticText(error.stderr),
+        }
+        evidence.diagnosticErrors.push(diagnosticText(error.message))
+      }
+      fs.mkdirSync(path.dirname(DIAGNOSTICS_FILE), { recursive: true })
+      fs.appendFileSync(DIAGNOSTICS_FILE, `${JSON.stringify(evidence)}\n`)
+    } catch {
+      // Preserve the first failure even if the evidence directory cannot be written.
+    }
+  }
+
+  /**
    * One outage of one node.
    * @param {{ service: string, kind: 'pause'|'stop'|'kill', holdMs?: number }} step `pause` is
    *   restored by `unpause`, `stop` and `kill` by `start`; the node stays down at least `holdMs`
@@ -322,18 +471,50 @@ class BrokerBouncer {
       throw new Error(`Refusing a bounce step while ${[...this.down].join(', ')} is down`)
     }
     const failures = []
+    const evidence = { service, kind, commands: [], states: {} }
+    const control = async (action) => {
+      const command = { args: [action, service], startedAt: this.now() }
+      evidence.commands.push(command)
+      try {
+        const result = await this.run(action, service)
+        Object.assign(command, { status: 0, stderr: diagnosticText(result?.stderr) })
+      } catch (error) {
+        Object.assign(command, {
+          status: error.code ?? error.status ?? 'failed',
+          stderr: diagnosticText(error.stderr),
+          error: diagnosticText(error.message),
+        })
+        throw error
+      } finally {
+        command.finishedAt = this.now()
+      }
+    }
     let tDown = null
     let tRestored = null
     this.down.add(service)
     try {
-      await this.run(kind, service)
+      if (kind !== 'pause') {
+        evidence.states.beforeDown = await this.inspect(service)
+        startTime(evidence.states.beforeDown.StartedAt)
+      }
+      signal?.throwIfAborted()
+    } catch (error) {
+      this.down.delete(service)
+      throw error
+    }
+    try {
+      await control(kind)
       tDown = this.now()
       await this.wait(holdMs)
     } catch (error) {
       failures.push(error)
     } finally {
       try {
-        await this.run(kind === 'pause' ? 'unpause' : 'start', service)
+        if (kind !== 'pause') await this.waitForState(service, evidence)
+        await control(kind === 'pause' ? 'unpause' : 'start')
+        if (kind !== 'pause') {
+          await this.waitForState(service, evidence, evidence.states.beforeDown.StartedAt)
+        }
         tRestored = await this.waitForReachable(service)
         if (kind !== 'pause') {
           await this.isr(admin, topics)
@@ -342,6 +523,7 @@ class BrokerBouncer {
         this.down.delete(service)
       } catch (error) {
         failures.push(error)
+        await this.diagnose(service, evidence, failures)
       }
     }
     if (failures.length) throw failures[0]
