@@ -1,5 +1,15 @@
 const OffsetManager = require('../index')
 const InstrumentationEventEmitter = require('../../../instrumentation/emitter')
+const { createErrorFromCode } = require('../../../protocol/error')
+const Generation = require('../../../producer/generation')
+const { createPatternGroup } = require('../../__tests__/fixtures/patternGroup')
+
+/** @returns {{promise: Promise<void>, resolve: Function}} an explicitly released boundary */
+const gate = () => {
+  let resolve
+  const promise = new Promise((done) => (resolve = done))
+  return { promise, resolve }
+}
 
 describe('Consumer > OffsetManager > getCoordinator', () => {
   let offsetManager, mockCluster, mockCoordinator, mockNewCoordinator
@@ -47,3 +57,92 @@ describe('Consumer > OffsetManager > getCoordinator', () => {
     expect(mockCluster.findGroupCoordinator).toHaveBeenCalledWith({ groupId: 'test-group-id' })
   })
 })
+
+describe.each(['classic', 'consumer'])(
+  'Consumer > OffsetManager > coordinator publication > %s',
+  (groupProtocol) => {
+    const offsets = { topics: [{ topic: 'orders-a', partitions: [{ partition: 0, offset: '7' }] }] }
+
+    /**
+     * Builds the real membership-to-offset-manager discovery callback through an assignment.
+     * @returns {Promise<object>} the group, cluster and manager, before any commit discovery
+     */
+    const assigned = async () => {
+      const harness = createPatternGroup({
+        declarations: ['orders-a'],
+        catalog: { 'orders-a': 'AAAAAAAAAAAAAAAAAAAAAg' },
+        group: { groupProtocol },
+      })
+      await harness.refresh()
+      await harness.round()
+      const { group, cluster } = harness
+      const manager = group.offsetManager
+      manager.committedOffsets()['orders-a'][0] = '1'
+      return { group, cluster, manager }
+    }
+
+    it.each(['ownership replacement', 'caller fence'])(
+      'keeps the replacement coordinator when %s overtakes recovery metadata refresh',
+      async (reason) => {
+        const { group, cluster, manager } = await assigned()
+        const original = createErrorFromCode(16)
+        group.coordinator.offsetCommit.mockRejectedValue(original)
+        group.coordinator = null
+        const arrived = gate()
+        const refresh = gate()
+        cluster.refreshMetadata.mockImplementation(async () => {
+          arrived.resolve()
+          await refresh.promise
+        })
+        const obsolete = { nodeId: 'late-recovery', isConnected: () => true }
+        cluster.findGroupCoordinator.mockResolvedValue(obsolete)
+        const fence = new Generation()
+        const pending = manager.commitOffsets(offsets, { fence }).catch((error) => error)
+        await arrived.promise
+        if (reason === 'ownership replacement') group.ownership.renew()
+        else fence.close(new Error('commit caller retired'))
+        const replacement = { nodeId: 'replacement', isConnected: () => true }
+        group.coordinator = replacement
+        manager.coordinator = replacement
+        refresh.resolve()
+
+        expect(await pending).toBe(original)
+        expect(group.coordinator).toBe(replacement)
+        expect(manager.coordinator).toBe(replacement)
+        expect(manager.committedOffsets()['orders-a'][0]).toBe('1')
+        expect(cluster.findGroupCoordinator).not.toHaveBeenCalled()
+      }
+    )
+
+    it.each(['initial', 'recovery'])(
+      'publishes no coordinator when the originating commit guard refuses the %s lookup',
+      async (stage) => {
+        const { group, cluster, manager } = await assigned()
+        const original = createErrorFromCode(16)
+        if (stage === 'recovery') group.coordinator.offsetCommit.mockRejectedValue(original)
+        else manager.coordinator = null
+        group.coordinator = null
+        const arrived = gate()
+        const lookup = gate()
+        const obsolete = { nodeId: 'obsolete', isConnected: () => true }
+        cluster.findGroupCoordinator.mockImplementation(async () => {
+          arrived.resolve()
+          await lookup.promise
+          return obsolete
+        })
+        let refusal = null
+        const pending = manager.commitOffsets(offsets, { guard: () => refusal }).catch((e) => e)
+        await arrived.promise
+        refusal = new Error('commit caller retired')
+        const cached = manager.coordinator
+        lookup.resolve()
+
+        expect(await pending).toBe(stage === 'initial' ? refusal : original)
+        expect(group.coordinator).toBeNull()
+        expect(manager.coordinator).toBe(cached)
+        expect(manager.committedOffsets()['orders-a'][0]).toBe('1')
+        expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(1)
+      }
+    )
+  }
+)

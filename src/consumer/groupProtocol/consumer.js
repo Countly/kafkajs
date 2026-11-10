@@ -459,13 +459,18 @@ module.exports = class ConsumerGroupProtocol {
    *   await; defaults to the current one
    * @param {import('../../producer/generation')|import('./interface').ConsumerOperation} [fence]
    *   the caller's fence; its refusal ends the wait and prevents publication
+   * @param {() => Error|null} [guard] the originating offset operation's immutable guard,
+   *   retained through recovery and checked immediately before publication
    * @returns {Promise<import('../../../types').Broker>} the discovered coordinator, even if the
    *   membership was replaced and the caller must refuse it under its own ownership guard
-   * @throws {Error} the lookup's failure or caller fence's refusal; the caller stamps membership
+   * @throws {Error} the lookup's failure or caller fence's or guard's refusal; the caller stamps
+   *   membership
    */
-  async connect(ownershipToken = this.ownership?.token(), fence) {
+  async connect(ownershipToken = this.ownership?.token(), fence, guard) {
     const coordinator = await this.coordinatorLookup.find(fence)
     fence?.check()
+    const refusal = guard?.()
+    if (refusal) throw refusal
     if (!this.ownershipReplaced(ownershipToken)) this.coordinator = coordinator
     return coordinator
   }

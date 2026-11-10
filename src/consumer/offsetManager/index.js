@@ -142,9 +142,10 @@ module.exports = class OffsetManager {
    *                                resolution awaits anything; it travels with a `none` refusal so
    *                                the group can tell a current answer from a stale one. Absent in
    *                                isolated managers, whose refusals then carry no context.
-   * @param {(fence?: object) => Promise<import("../../../types").Broker>} [options.findCoordinator]
+   * @param {(fence?: object, guard?: Function) => Promise<import("../../../types").Broker>} [options.findCoordinator]
    *                                the membership's single-flight coordinator lookup, shared with
-   *                                its heartbeat, joins and other commits. Absent in isolated
+   *                                its heartbeat, joins and other commits. The originating caller's
+   *                                guard must allow publication to membership. Absent in isolated
    *                                managers, which ask the cluster directly.
    * @param {import('../../../types').Logger} [options.logger] where this manager reports a stale
    *                                member epoch and why an offset fetch is re-sent. Optional and
@@ -317,7 +318,7 @@ module.exports = class OffsetManager {
     try {
       let refusal = check()
       if (refusal) throw refusal
-      const coordinator = await this.getCoordinator(fence && { guard: check, fence })
+      const coordinator = await this.getCoordinator({ guard: check, fence })
       refusal = check()
       if (refusal) throw refusal
       const request = { ...payload, topics: this.withTopicIds(payload.topics) }
@@ -393,18 +394,20 @@ module.exports = class OffsetManager {
   }
 
   /**
-   * @param {{guard: () => Error|null, fence: import('../../producer/generation')}} [preparation]
-   *   a caller's identity: its fence binds the discovery's connections, retries and refreshes, and
+   * @param {{guard: () => Error|null, fence?: import('../../producer/generation')}} [preparation]
+   *   a caller's identity: its optional fence binds discovery's connections, retries and refreshes, and
    *   its guard is checked before the answer is published, so a retired caller installs nothing
    * @returns {Promise<import("../../../types").Broker>}
-   * @throws {Error} the preparation's refusal; absent, nothing changes
+   * @throws {Error} the lookup's failure or the caller's guard or fence refusal
    */
   async getCoordinator(preparation) {
     if (!this.coordinator?.isConnected()) {
       // findBroker() would resolve the same (stale) node after a failover; ask the cluster
       // which broker currently owns the group instead. Upstream PR #1779.
-      const coordinator = await this.findCoordinator(preparation?.fence)
       this.refuse(preparation)
+      const coordinator = await this.findCoordinator(preparation?.fence, preparation?.guard)
+      this.refuse(preparation)
+      preparation?.fence?.check()
       this.coordinator = coordinator
     }
 
@@ -993,7 +996,8 @@ module.exports = class OffsetManager {
    * @private
    * @param {object} offsets the selected offsets
    * @param {{partitions?: object[], auto?: boolean, guard: Function, fence?: object}} options the
-   *   immutable guard and the caller's optional terminal fence
+   *   immutable guard and the caller's optional terminal fence, retained through recovery so a
+   *   replaced caller publishes no coordinator to either the manager or membership
    * @returns {Promise<void>} automatic refusals resolve without publishing
    * @throws {Error} explicit refusals or the original broker error
    */
@@ -1042,8 +1046,13 @@ module.exports = class OffsetManager {
       // the caller is waiting for -- the next retry of `e` will attempt discovery again anyway.
       if (isStaleCoordinator(e)) {
         try {
-          await this.cluster.refreshMetadata()
-          this.coordinator = await this.findCoordinator()
+          await this.cluster.refreshMetadata(...(fence ? [{ fence }] : []))
+          this.refuse(guard && { guard })
+          fence?.check()
+          const coordinator = await this.findCoordinator(fence, guard)
+          this.refuse(guard && { guard })
+          fence?.check()
+          this.coordinator = coordinator
         } catch (_) {
           // best-effort recovery, see above -- fall through to rethrow the original `e`
         }

@@ -1162,9 +1162,9 @@ module.exports = class ConsumerGroup {
           coordinator: this.coordinator,
           revision: this.groupMembership.membershipRevision,
         }),
-        findCoordinator: (fence) => {
-          if (this.kind === 'classic') return this.groupMembership.connect({ fence })
-          if (this.kind === 'consumer') return this.groupMembership.connect(undefined, fence)
+        findCoordinator: (fence, guard) => {
+          if (this.kind === 'classic') return this.groupMembership.connect({ fence, guard })
+          if (this.kind === 'consumer') return this.groupMembership.connect(undefined, fence, guard)
           return this.coordinatorLookup.find(fence)
         },
         isStopping: () => this.isStopping(),

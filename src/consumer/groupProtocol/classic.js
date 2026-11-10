@@ -333,18 +333,21 @@ module.exports = class ClassicGroupProtocol {
    * is one instead of starting another. With a round, its fence ends this caller's wait, and the
    * lookup itself when no other caller is left. Offset-manager discovery uses the same path so
    * a commit restores the coordinator known to membership, including for a later leave.
-   * @param {{ fence?: import('../../producer/generation')|import('./interface').ConsumerOperation }} [round]
-   *   the join's round or an offset operation's fence; absent for an unfenced lookup
+   * @param {{ fence?: import('../../producer/generation')|import('./interface').ConsumerOperation,
+   *   guard?: () => Error|null }} [round] the join's round or an offset operation's fence and
+   *   originating guard, checked before publication; absent for an unfenced lookup
    * @returns {Promise<import('../../../types').Broker>} the discovered coordinator
    * @throws {KafkaJSError} the retriable join-deadline error when the membership was retired or
    *   replaced while the lookup ran: its answer is installed for no one
-   * @throws {Error} the lookup's failure or caller fence's refusal
+   * @throws {Error} the lookup's failure or caller fence's or guard's refusal
    */
   async connect(round) {
     const { membershipRevision } = this
     const ownershipToken = this.ownership?.token()
     const coordinator = await this.coordinatorLookup.find(round?.fence)
     round?.fence?.check()
+    const refusal = round?.guard?.()
+    if (refusal) throw refusal
     if (
       this.membershipRevision !== membershipRevision ||
       this.ownership?.token() !== ownershipToken
