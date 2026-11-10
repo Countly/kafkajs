@@ -1,7 +1,10 @@
 const net = require('net')
 const tls = require('tls')
 const { once } = require('events')
-const { _load } = require('module')
+const { readFileSync } = require('fs')
+const path = require('path')
+const vm = require('vm')
+const { _load, createRequire } = require('module')
 const { installSocketOwners } = require('../socketOwners')
 const { captureShareCleanupBaseline } = require('../shareFixtures')
 
@@ -89,5 +92,71 @@ describe('socket owner diagnostics', () => {
     const connect = net.Socket.prototype.connect
     jest.isolateModules(() => require('../socketOwners').installSocketOwners(expect.getState))
     expect(net.Socket.prototype.connect).toBe(connect)
+  })
+
+  test('keeps the hook and retained ownership data outside file realms when files change', () => {
+    const savedRegistry = workerProcess[registryKey]
+    const savedConnect = net.Socket.prototype.connect
+    const native = _load('vm').runInThisContext('({ Function, Object, Array, WeakMap })')
+    const helperPath = require.resolve('../socketOwners')
+    const source = readFileSync(helperPath, 'utf8')
+    const nativeRequire = createRequire(helperPath)
+    const files = ['first.spec.js', 'second.spec.js', 'third.spec.js'].map((file) =>
+      path.join(__dirname, file)
+    )
+    try {
+      delete workerProcess[registryKey]
+      net.Socket.prototype.connect = previousConnect
+      let connect
+      for (const file of files) {
+        const context = vm.createContext({
+          require: nativeRequire,
+          module: { exports: {} },
+          __dirname: path.dirname(helperPath),
+          process: { env: { KAFKAJS_SOCKET_OWNERS: '1' } },
+        })
+        vm.runInContext(
+          `${source}\nmodule.exports.installSocketOwners(() => ({
+            testPath: ${JSON.stringify(file)}, currentTestName: 'realm test'
+          }))`,
+          context,
+          { filename: helperPath }
+        )
+        connect ||= net.Socket.prototype.connect
+        expect(net.Socket.prototype.connect).toBe(connect)
+        const registry = workerProcess[registryKey]
+        expect(registry.getState).toBeInstanceOf(vm.runInContext('Function', context))
+      }
+
+      const registry = workerProcess[registryKey]
+      // File-realm functions or containers retain their realm even after its reader is replaced.
+      expect(connect).toBeInstanceOf(native.Function)
+      expect(registry).toBeInstanceOf(native.Object)
+      expect(registry.enterFile).toBeInstanceOf(native.Function)
+      expect(registry.record).toBeInstanceOf(native.Function)
+      expect(registry.describe).toBeInstanceOf(native.Function)
+      expect(registry.owners).toBeInstanceOf(native.WeakMap)
+      expect(registry.testFiles).toBeInstanceOf(native.Array)
+      expect(registry.testFiles).toEqual(files)
+
+      const socket = new net.Socket()
+      try {
+        registry.record(socket, registry.record)
+        const owner = registry.owners.get(socket)
+        expect(owner).toBeInstanceOf(native.Object)
+        expect(owner.stack).toBeInstanceOf(native.Array)
+        expect(owner).toMatchObject({ file: files[2], test: 'realm test' })
+        expect(
+          Object.values(owner)
+            .flat()
+            .every((value) => typeof value === 'string' || typeof value === 'number')
+        ).toBe(true)
+      } finally {
+        socket.destroy()
+      }
+    } finally {
+      net.Socket.prototype.connect = savedConnect
+      workerProcess[registryKey] = savedRegistry
+    }
   })
 })
