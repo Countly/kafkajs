@@ -37,10 +37,10 @@ const ZERO = (length) => Buffer.alloc(length)
  * - `element`: bytes of the smallest valid top-level element
  * - `malformAt`: offset in the first element of an array count that is overwritten with an invalid length
  * - `nullable`: whether the top-level array may be null on the wire
- * - `nested`: each nested array, as the bytes of one top-level element before its count (`before`),
- *   the bytes of the nested array's own smallest element (`element`), the bytes after the nested
- *   array in the element (`after`), and the `readString` calls the element makes before the count
- *   (`strings`)
+ * - `nested`: each nested array, by schema field `name`, as the bytes of one top-level element
+ *   before its count (`before`), the bytes of the nested array's own smallest element (`element`),
+ *   the bytes after the nested array in the element (`after`), and the `readString` calls the
+ *   element makes before the count (`strings`)
  */
 const CODECS = [
   {
@@ -52,7 +52,7 @@ const CODECS = [
     element: 38,
     malformAt: 34,
     nullable: false,
-    nested: [{ before: 34, element: 4, after: 0, strings: 3 }],
+    nested: [{ name: 'renewers', before: 34, element: 4, after: 0, strings: 3 }],
   },
   {
     api: 'describeClientQuotas',
@@ -64,8 +64,8 @@ const CODECS = [
     malformAt: 0,
     nullable: true,
     nested: [
-      { before: 0, element: 4, after: 4, strings: 0 },
-      { before: 4, element: 10, after: 0, strings: 0 },
+      { name: 'entity', before: 0, element: 4, after: 4, strings: 0 },
+      { name: 'values', before: 4, element: 10, after: 0, strings: 0 },
     ],
   },
   {
@@ -77,7 +77,7 @@ const CODECS = [
     element: 8,
     malformAt: 4,
     nullable: false,
-    nested: [{ before: 4, element: 4, after: 0, strings: 1 }],
+    nested: [{ name: 'entity', before: 4, element: 4, after: 0, strings: 1 }],
   },
   {
     api: 'electLeaders',
@@ -88,7 +88,7 @@ const CODECS = [
     element: 6,
     malformAt: 2,
     nullable: false,
-    nested: [{ before: 2, element: 8, after: 0, strings: 1 }],
+    nested: [{ name: 'partitionResult', before: 2, element: 8, after: 0, strings: 1 }],
   },
   {
     api: 'electLeaders',
@@ -99,7 +99,7 @@ const CODECS = [
     element: 6,
     malformAt: 2,
     nullable: false,
-    nested: [{ before: 2, element: 8, after: 0, strings: 1 }],
+    nested: [{ name: 'partitionResult', before: 2, element: 8, after: 0, strings: 1 }],
   },
 ]
 
@@ -213,10 +213,10 @@ describe('Codec-local count bounds', () => {
       BIG_TIMEOUT
     )
 
-    it(
-      `${label} response rejects ${MAX_COUNT + 1} nested entries before reading an element`,
-      async () => {
-        for (const nested of codec.nested) {
+    for (const nested of codec.nested) {
+      it(
+        `${label} response rejects ${MAX_COUNT + 1} nested ${nested.name} entries before reading an element`,
+        async () => {
           const body = nestedBodyOf(codec, nested, MAX_COUNT + 1)
 
           const { outcome, strings } = countStrings(() => settle(() => decode(body)))
@@ -224,10 +224,19 @@ describe('Codec-local count bounds', () => {
 
           expectNonRetriableLimit(error, MAX_COUNT + 1)
           expect(strings).toBe(codec.headStrings + nested.strings)
-        }
-      },
-      BIG_TIMEOUT
-    )
+        },
+        BIG_TIMEOUT
+      )
+
+      it(`${label} response preserves truncated nested ${nested.name} array behaviour`, async () => {
+        const body = Buffer.concat([codec.head, int32(1), ZERO(nested.before), int32(3), ZERO(2)])
+
+        const error = await failureOf(() => decode(body))
+
+        expect(error).toBeInstanceOf(KafkaJSPartialMessageError)
+        expect(error.message).toContain('remain')
+      })
+    }
 
     it(
       `${label} response accepts ${MAX_COUNT} entries`,
@@ -272,14 +281,6 @@ describe('Codec-local count bounds', () => {
       )
       expect(truncated).toBeInstanceOf(KafkaJSPartialMessageError)
       expect(truncated.message).toContain('remain')
-
-      const nestedTruncated = await failureOf(() =>
-        decode(
-          Buffer.concat([codec.head, int32(1), ZERO(codec.nested[0].before), int32(3), ZERO(2)])
-        )
-      )
-      expect(nestedTruncated).toBeInstanceOf(KafkaJSPartialMessageError)
-      expect(nestedTruncated.message).toContain('remain')
     })
   }
 
