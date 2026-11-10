@@ -803,18 +803,86 @@ const assertJavaCaptures = (receipts, directory) => {
  * Proves ownership of every physical connection, including setup-only sockets. The initial
  * foreground bootstrap is explicit; every other socket must carry actual ordinary work.
  * @param {object} transcript records and physical sockets
+ * @param {object} [options] independently recorded share capability refusal
  * @returns {object[]} node/role ownership baseline (counts deliberately excluded)
  * @throws {Error} for telemetry, an undecided extra connection or an unowned setup-only socket
  */
-const ordinaryOwnership = ({ records, sockets }) => {
+const ordinaryOwnership = ({ records, sockets }, { refusal } = {}) => {
+  if (refusal?.status === 'rejected') {
+    assert.equal(refusal.name, 'KafkaJSShareGroupsNotSupportedError')
+    assert.equal(refusal.shareVersion, 0)
+    assert(['api-not-advertised', 'api-version-range'].includes(refusal.reason))
+    assert.equal(refusal.apiKey, refusal.reason === 'api-not-advertised' ? 76 : 78)
+    assert.equal(sockets.length, 1, 'Additional refused bootstrap socket')
+    const [socket] = sockets
+    const [connect, rejected, negotiated] = records
+    assert.equal(socket.id, 1, 'Refusal is not the first physical socket')
+    assert(['normal', 'undecided'].includes(socket.kind), 'Telemetry refused bootstrap socket')
+    assert.equal(records.length, 3, 'Extra refused bootstrap traffic')
+    assert.equal(connect.type, 'connect')
+    assert.equal(connect.socketId, socket.id)
+    assert.equal(connect.node, socket.node)
+    for (const request of [rejected, negotiated]) {
+      assert.equal(request.type, 'request')
+      assert.equal(request.apiKey, 18)
+      assert.equal(request.socketId, socket.id)
+      assert.equal(request.node, socket.node)
+    }
+    assert.equal(rejected.apiVersion, 5)
+    assert.equal(rejected.response?.errorCode, 35)
+    assert.equal(negotiated.apiVersion, 4)
+    assert.equal(negotiated.response?.errorCode, 0)
+    assert.equal(negotiated.clientId, rejected.clientId)
+    assert(connect.at < rejected.writeAt && rejected.writeAt <= rejected.response.responseAt)
+    assert(rejected.response.responseAt < negotiated.writeAt)
+    assert(negotiated.writeAt <= negotiated.response.responseAt)
+    assert(
+      Number.isFinite(socket.closedAt) && socket.closedAt >= negotiated.response.responseAt,
+      'Refused bootstrap socket never closed'
+    )
+    const range = negotiated.response.ranges?.[refusal.apiKey]
+    if (refusal.reason === 'api-not-advertised') assert.equal(range, undefined)
+    else
+      assert(
+        Array.isArray(range) && (range[0] > 0 || range[1] < 0),
+        'Compatible refused capability'
+      )
+    return [`${socket.node}:refused-bootstrap`]
+  }
   const roles = []
   for (const socket of sockets) {
-    assert.equal(socket.kind, 'normal', 'Unowned or additional quiet socket')
+    let fetchSetup = false
+    if (socket.kind === 'undecided') {
+      const peers = sockets.filter((s) => s.node === socket.node)
+      const sibling = peers.find((s) => s.id !== socket.id)
+      const requests = records.filter((r) => r.type === 'request' && r.socketId === socket.id)
+      const negotiated = requests.findLast((r) => r.apiKey === 18 && r.response?.errorCode === 0)
+      const ranges = negotiated?.response.ranges
+      const fetch = records.find(
+        (r) => r.socketId === sibling?.id && [1, 78].includes(r.apiKey) && r.response
+      )
+      fetchSetup = !!(
+        peers.length === 2 &&
+        sibling?.kind === 'normal' &&
+        negotiated &&
+        requests.every((r) => r.apiKey === 18 && r.response) &&
+        !ranges[71] &&
+        !ranges[72] &&
+        fetch &&
+        ranges[fetch.apiKey] &&
+        negotiated.response.responseAt < fetch.writeAt &&
+        socket.id < sibling.id &&
+        requests.every((r) => r.clientId === fetch.clientId)
+      )
+    }
+    assert(socket.kind === 'normal' || fetchSetup, 'Unowned or additional quiet socket')
     const work = records.filter(
       (r) => r.type === 'request' && r.socketId === socket.id && ![17, 18, 36].includes(r.apiKey)
     )
-    assert(socket.foregroundBootstrap || work.length > 0, 'Unowned setup-only socket')
-    roles.push(`${socket.node}:${socket.foregroundBootstrap ? 'bootstrap' : 'ordinary'}`)
+    assert(socket.foregroundBootstrap || fetchSetup || work.length > 0, 'Unowned setup-only socket')
+    roles.push(
+      `${socket.node}:${socket.foregroundBootstrap || fetchSetup ? 'bootstrap' : 'ordinary'}`
+    )
   }
   return [...new Set(roles)].sort()
 }

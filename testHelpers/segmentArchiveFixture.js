@@ -383,6 +383,7 @@ const buildShutdownModel = ({ stem = 'telemetry-shutdown-0a1b2c3d' } = {}) => {
     describe(id, traced),
     describe(id, original),
   ])
+  model.results.decoderOccupancy = { running: 0, queued: 0 }
   model.results.workMs = 60000
   const quiet = {
     activeResources: { Timeout: 2 },

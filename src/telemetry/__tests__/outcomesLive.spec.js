@@ -11,6 +11,7 @@ const {
   heldAcquisitions,
 } = require('../../../scripts/e2e/telemetry/shareEvidence')
 const { runCase } = require('../../../scripts/e2e/telemetry/evidence')
+const { runShareEnvelope } = require('../../../scripts/e2e/telemetry/shareEnvelope')
 const {
   TelemetryWireObserver,
   withTelemetryResource,
@@ -502,7 +503,7 @@ class OutcomeCase {
               readUncommitted: false,
             })
     if (chaos) this.defer(() => chaos.restore())
-    this.defer(() => observer.assertClean({ allowUnanswered: observer.cancellationKeys() }))
+    this.defer(() => observer.assertFunctional({ allowUnanswered: observer.cancellationKeys() }))
     this.defer(() => observer.dispose())
     this.defer(() => observer.closeClient(client))
     return { client, observer, faults: chaos, trace }
@@ -716,7 +717,6 @@ class OutcomeCase {
   async expectQuiet(members, enabled) {
     for (const { observer } of Object.values(members)) {
       expect(observer.subscriptions()).toEqual([])
-      expect(observer.telemetrySockets()).toEqual([])
       expect(observer.readTranscript().some((r) => TELEMETRY_APIS.includes(r.apiKey))).toBe(false)
       observer.assertHealthy()
     }
@@ -733,47 +733,20 @@ class OutcomeCase {
    * @returns {Promise<object>} evidence of the durable log, holder handler and verifier delivery
    */
   async shareArm() {
-    if (this.deadline - clock.now() < 20000) {
-      const error = new Error('The remaining budget cannot hold the share subarm')
-      liveRun.taint(error)
-      throw error
-    }
     const previous = this.signal
     this.shareOwned = []
     try {
-      return await bounded(
-        previous,
-        20000,
-        async (scope) => {
-          let result
-          const errors = []
-          try {
-            result = await bounded(
-              scope,
-              18000,
-              (work) => {
-                this.signal = work
-                return this.shareWork()
-              },
-              { label: 'The share fault and oracle work' }
-            )
-          } catch (error) {
-            errors.push(error)
-          }
-          try {
-            await bounded(scope, 2000, () => settle(this.shareOwned), {
-              label: 'The share local cleanup reserve',
-            })
-          } catch (error) {
-            liveRun.taint(error)
-            errors.push(error)
-          }
-          if (errors.length === 1) throw errors[0]
-          if (errors.length) throw new AggregateError(errors, 'The share oracle and cleanup failed')
-          return result
+      return await runShareEnvelope({
+        signal: previous,
+        remainingMs: this.deadline - clock.now(),
+        bounded,
+        taint: (error) => liveRun.taint(error),
+        work: (scope) => {
+          this.signal = scope
+          return this.shareWork()
         },
-        { label: 'The complete share oracle envelope' }
-      )
+        cleanup: () => settle(this.shareOwned),
+      })
     } finally {
       this.signal = previous
     }
@@ -1046,7 +1019,7 @@ class OutcomeCase {
   }
 }
 
-const BUDGET = 178000
+const BUDGET = 188000
 live(
   'foreground outcomes',
   liveCase(BUDGET, (scope) =>

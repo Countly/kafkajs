@@ -5,6 +5,9 @@ on:
       full:
         type: boolean
         required: true
+      memory-verdicts:
+        type: boolean
+        default: false
 permissions:
   contents: read
 jobs:
@@ -16,6 +19,7 @@ jobs:
       - id: plan
         env:
           FULL: ${{ inputs.full }}
+          MEMORY_VERDICTS: ${{ inputs.memory-verdicts }}
         run: |
           node <<'NODE'
           const configured = 'docker-compose.telemetry.yml'
@@ -36,16 +40,20 @@ jobs:
             { group: 'telemetry-unsupported', compose: base, full: noPlugin, dev: ['4.3.1'] },
             { group: 'telemetry-outcomes', compose: base, full: ['4.1.2'], dev: [] },
           ]
+          const memory = process.env.MEMORY_VERDICTS === 'true'
+          const selected = memory ? lanes.filter((lane) =>
+            ['telemetry-outcomes', 'telemetry-unsupported', 'telemetry-shutdown'].includes(lane.group)) : lanes
           const full = process.env.FULL === 'true'
           const include = []
           for (const node of full ? [22, 24, 26] : [24])
-            for (const lane of lanes)
+            for (const lane of selected)
               for (const kafka of full ? lane.full : lane.dev)
                 include.push({ node, kafka, group: lane.group, compose: lane.compose })
           // The base 4.4.0 development smoke is additional coverage, not an exit obligation.
           require('fs').appendFileSync(process.env.GITHUB_OUTPUT, `matrix=${JSON.stringify({ include })}\n`)
           NODE
   resources:
+    if: ${{ !inputs.memory-verdicts }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
@@ -154,6 +162,17 @@ jobs:
           if (result.error) throw result.error
           if (result.status !== 0) throw new Error('Evidence stamp verification failed')
           verifyEvidence('${{ matrix.group }}', process.env.TELEMETRY_EVIDENCE_DIR, files)
+          NODE
+      - name: Require archived socket ownership and shutdown resource acceptance
+        if: ${{ always() && inputs.memory-verdicts }}
+        timeout-minutes: 3
+        run: |
+          timeout -k 5s 150s node <<'NODE'
+          const fs = require('fs')
+          const { verifyMemoryEvidence } = require('./scripts/e2e/telemetry/memoryVerdicts')
+          const files = fs.readdirSync('.tmp/e2e').filter(name => name.endsWith('.jsonl'))
+            .map(name => `.tmp/e2e/${name}`)
+          verifyMemoryEvidence('${{ matrix.group }}', process.env.TELEMETRY_EVIDENCE_DIR, files)
           NODE
       - name: Stop owned project and prove container network volume removal
         if: always()

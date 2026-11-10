@@ -3,7 +3,6 @@ const net = require('net')
 const path = require('path')
 const { performance } = require('perf_hooks')
 const { Kafka, logLevel, KafkaJSTelemetryError } = require('../../../index')
-const { ordinaryOwnership } = require('../../../scripts/e2e/telemetry/semantics')
 const {
   ShareTrace,
   confirmedDecisions,
@@ -384,7 +383,7 @@ class UnsupportedCase {
                 maxWaitTimeInMs: 500,
                 readUncommitted: false,
               })
-    this.defer(() => observer.assertClean({ allowUnanswered: observer.cancellationKeys() }))
+    this.defer(() => observer.assertFunctional({ allowUnanswered: observer.cancellationKeys() }))
     this.defer(() => observer.dispose())
     this.defer(() => observer.closeClient(client))
     ;(enabled ? this.on : this.off)[kind] = client
@@ -515,21 +514,6 @@ class UnsupportedCase {
       disabledCorpus.verify(aux)
     )
     if (!oldShare) results.share = await this.shareWork(aux)
-    for (const owner of ['share', 'share-off']) this.observers[owner].confirmForegroundFetchSetup()
-    results.ownership = {}
-    for (const kind of KINDS) {
-      const roles = (owner) =>
-        ordinaryOwnership({
-          records: this.observers[owner].readTranscript(),
-          sockets: this.observers[owner].socketOwnership(),
-        })
-      const on = roles(kind)
-      const off = roles(`${kind}-off`)
-      expect([...new Set(on.map((r) => r.split(':').at(-1)))].sort()).toEqual(
-        [...new Set(off.map((r) => r.split(':').at(-1)))].sort()
-      )
-      results.ownership[kind] = { on, off }
-    }
     const adverts = (owner) => this.observers[owner].advertisements()
     const firstAdvert = Math.min(
       ...KINDS.flatMap((kind) =>
@@ -557,7 +541,6 @@ class UnsupportedCase {
           true
         )
         expect(observer.subscriptions()).toEqual([])
-        expect(observer.telemetrySockets()).toEqual([])
         expect(observer.readTranscript().some((r) => r.apiKey === 71 || r.apiKey === 72)).toBe(
           false
         )

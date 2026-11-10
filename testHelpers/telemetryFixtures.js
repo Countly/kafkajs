@@ -1172,12 +1172,17 @@ class TelemetryWireObserver {
     if (this.#failures.length === 1) throw this.#failures[0]
     if (this.#failures.length > 1)
       throw new AggregateError(this.#failures, 'Telemetry observer failures')
-    this.#reader.readExports()
+    try {
+      this.#reader.readExports()
+    } catch (error) {
+      this.#latch(error)
+      throw error
+    }
   }
 
   /**
    * Detaches every listener and write wrapper, joins decoder children and cancels retry timers.
-   * It never destroys a client socket: a socket still open is recorded as a failure first.
+   * It never destroys a client socket: surviving sockets are retained in the resource ledger.
    * Idempotent; later calls return the first disposal.
    * @returns {Promise<void>} when no owned child, timer or listener remains
    */
@@ -1189,10 +1194,11 @@ class TelemetryWireObserver {
   /**
    * @param {{allowUnanswered?:string[]}} [options] request keys that were deliberately left
    *   unanswered, such as a final Push cut off by close
-   * @throws {Error|AggregateError} for a latched failure, a missing disposal, a still-open client
-   *   socket, an unanswered request not explicitly allowed, or a surviving child/timer
+   * Functional health only; ownership acceptance is replayed separately in memory-gates.
+   * @throws {Error|AggregateError} for a latched failure, missing disposal or an unanswered
+   *   request not explicitly allowed by the exact cancellation ledger
    */
-  assertClean({ allowUnanswered = [] } = {}) {
+  assertFunctional({ allowUnanswered = [] } = {}) {
     const errors = [...this.#failures]
     if (!this.#disposal) errors.push(new Error('The telemetry observer was not disposed'))
     if (
@@ -1205,6 +1211,20 @@ class TelemetryWireObserver {
     )
     if (unanswered.length)
       errors.push(new Error(`Unanswered requests: ${unanswered.map((r) => r.requestKey)}`))
+    if (errors.length === 1) throw errors[0]
+    if (errors.length) throw new AggregateError(errors, 'The telemetry observer is not clean')
+  }
+
+  /**
+   * Requires functional health and memory acceptance. Functional lanes call assertFunctional.
+   * @param {object} [options] exact cancellation allowance
+   * @throws {Error|AggregateError} for functional corruption or surviving owned resources
+   */
+  assertClean(options) {
+    this.assertFunctional(options)
+    const errors = this.#stillOpen.map(
+      (id) => new Error(`Observed client socket ${id} is still open`)
+    )
     if (this.#children.size || this.#timers.size)
       errors.push(new Error('The telemetry observer still owns a child or timer'))
     for (const state of this.#sockets.values())
@@ -1624,7 +1644,6 @@ class TelemetryWireObserver {
     for (const state of this.#sockets.values()) {
       if (!state.closed) {
         this.#stillOpen.push(state.id)
-        this.#latch(new Error(`Observed client socket ${state.id} is still open`))
       }
       state.detach()
     }

@@ -217,6 +217,7 @@ const packSegment = ({ id, source, target, proofs = 'all' }) => {
  * stay with their original observer. A closed segment is sealed independently of the next one.
  */
 class TelemetrySegments {
+  #scenario
   #id
   #planned
   #cap
@@ -234,10 +235,12 @@ class TelemetrySegments {
    * @param {number} options.cap most lifecycles that may be opened
    * @param {string} options.directory absolute run directory, also receiving sealed files
    * @param {{now:function():number}} options.clock monotonic milliseconds
+   * @param {string} [options.scenario] scheduled scenario selecting functional or memory sealing
    * @param {object} options.observer options passed to every `TelemetryWireObserver`
    * @throws {Error} for a plan that exceeds its cap
    */
-  constructor({ id, planned, cap, directory, clock, observer = {} }) {
+  constructor({ id, planned, cap, directory, clock, observer = {}, scenario }) {
+    this.#scenario = scenario
     if (!Number.isSafeInteger(planned) || planned < 1 || cap < planned)
       throw new Error('A segment plan must be positive and within its cap')
     this.#id = id
@@ -261,6 +264,7 @@ class TelemetrySegments {
     if (!schedule.kinds.includes(kind)) throw new Error(`Unknown scheduled kind ${kind}`)
     return new TelemetrySegments({
       ...shared,
+      scenario,
       id: (index) => schedule.name(kind, index),
       planned: schedule.perKind,
       cap: schedule.cap,
@@ -275,7 +279,7 @@ class TelemetrySegments {
    */
   static single(scenario, id, shared) {
     if (!scheduleOf(scenario).extras.includes(id)) throw new Error(`Unscheduled segment ${id}`)
-    return new TelemetrySegments({ ...shared, id: () => id, planned: 1, cap: 1 })
+    return new TelemetrySegments({ ...shared, scenario, id: () => id, planned: 1, cap: 1 })
   }
 
   /** @returns {object} the selected segment: `id`, `index`, `observer` and `state` */
@@ -381,8 +385,9 @@ class TelemetrySegments {
   }
 
   /**
-   * Seals one closed segment: after its client sockets closed, dispose its observer, require a clean
-   * cleanup, pack its files and release the observer. Sealing starts once; repeats share it.
+   * Seals one closed lifecycle: dispose its observer, require functional health, pack its files
+   * and release the observer. Shutdown archives resource acceptance for memory-gates; churn
+   * requires it here. Sealing starts once; repeats share it.
    * @param {object} segment a segment returned by `cycle` or `current`
    * @param {object} [options] `closeMs` bound for its sockets to close; `force` seals whatever remains
    * @param {'all'|string[]} [options.proofs='all'] proof rule of the packed bundle
@@ -393,7 +398,7 @@ class TelemetrySegments {
     if (segment.sealing) return segment.sealing
     if (!force && segment.state !== 'closed')
       throw new Error(`Segment ${segment.id} is still ${segment.state}`)
-    if (!force) {
+    if (!force && this.#scenario !== 'telemetry-shutdown') {
       const { observer } = segment
       let timer
       await Promise.race([
@@ -419,7 +424,9 @@ class TelemetrySegments {
   async #seal(segment, proofs) {
     const { observer } = segment
     await observer.dispose()
-    observer.assertClean({ allowUnanswered: observer.cancellationKeys() })
+    if (this.#scenario === 'telemetry-shutdown')
+      observer.assertFunctional({ allowUnanswered: observer.cancellationKeys() })
+    else observer.assertClean({ allowUnanswered: observer.cancellationKeys() })
     segment.pack = packSegment({
       id: segment.id,
       source: observer.directory,

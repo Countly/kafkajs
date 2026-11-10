@@ -235,3 +235,31 @@ jobs:
             .tmp/telemetry-cache/decoder-*.jsa.json
           if-no-files-found: error
           include-hidden-files: true
+  telemetry-verdicts:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/')
+    uses: ./.github/workflows/telemetry.yml
+    with:
+      full: true
+      memory-verdicts: true
+  telemetry-verdict-controls:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 24, cache: npm }
+      - run: npm ci
+        timeout-minutes: 5
+      - name: Require broker-free ownership, resource, health and share-envelope controls
+        timeout-minutes: 3
+        run: |
+          mkdir -p .tmp/telemetry-verdict-controls
+          timeout -k 5s 150s node node_modules/jest/bin/jest.js --runInBand --ci --detectOpenHandles --runTestsByPath scripts/e2e/telemetry/__tests__/memoryVerdicts.spec.js testHelpers/__tests__/telemetryFixtures.spec.js --json --outputFile=.tmp/telemetry-verdict-controls/results.json
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: telemetry-verdict-controls-node24
+          path: .tmp/telemetry-verdict-controls/
+          if-no-files-found: error
+          include-hidden-files: true

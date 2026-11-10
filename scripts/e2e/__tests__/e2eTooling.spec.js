@@ -1359,12 +1359,20 @@ describe('broker telemetry fixture', () => {
       'resources',
       'retained-diagnostic',
       'telemetry-soak',
+      'telemetry-verdicts',
+      'telemetry-verdict-controls',
     ])
     for (const job of Object.values(workflow.jobs)) {
       expect(job.if).toBe(
         "github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/')"
       )
       expect(job.needs).toBeUndefined()
+      if (job.uses) {
+        expect(job.uses).toBe('./.github/workflows/telemetry.yml')
+        expect(job.with).toEqual({ full: true, 'memory-verdicts': true })
+        expect(job['continue-on-error']).toBeUndefined()
+        continue
+      }
       expect(job.steps[0].uses).toBe('actions/checkout@v4')
       expect(job.steps[1].uses).toBe('actions/setup-node@v4')
       expect(job.steps.at(-1)).toMatchObject({
@@ -1373,6 +1381,49 @@ describe('broker telemetry fixture', () => {
         with: { 'include-hidden-files': true },
       })
     }
+    const shared = yaml.load(read('.github/workflows/telemetry.yml').toString())
+    const plan = shared.jobs.plan.steps[0]
+    const source = plan.run.match(/node <<'NODE'\n([\s\S]*?)\nNODE/)[1]
+    let output
+    require('vm').runInNewContext(source, {
+      process: { env: { FULL: 'true', MEMORY_VERDICTS: 'true', GITHUB_OUTPUT: 'output' } },
+      require: () => ({
+        appendFileSync: (_file, value) => {
+          output = value
+        },
+      }),
+    })
+    const rows = JSON.parse(output.trim().slice('matrix='.length)).include
+    const expected = [22, 24, 26].flatMap((node) => [
+      ...['telemetry-outcomes', 'telemetry-shutdown'].flatMap((group) =>
+        ['4.3.1', '4.2.2'].map((kafka) => ({
+          node,
+          kafka,
+          group,
+          compose: 'docker-compose.telemetry.yml',
+        }))
+      ),
+      ...['4.3.1', '4.2.2', '4.1.2', '4.0.2'].map((kafka) => ({
+        node,
+        kafka,
+        group: 'telemetry-unsupported',
+        compose: 'docker-compose.yml',
+      })),
+      { node, kafka: '4.1.2', group: 'telemetry-outcomes', compose: 'docker-compose.yml' },
+    ])
+    expect(rows).toEqual(expected)
+    const verdict = shared.jobs.telemetry.steps.find((step) =>
+      step.run?.includes('verifyMemoryEvidence')
+    )
+    expect(verdict.if).toBe('$' + '{{ always() && inputs.memory-verdicts }}')
+    expect(verdict['continue-on-error']).toBeUndefined()
+    expect(shared.on.workflow_call.inputs['memory-verdicts'].default).toBe(false)
+    const mutationControls = workflow.jobs['telemetry-verdict-controls']
+    const controlsRun = mutationControls.steps.find((step) =>
+      step.run?.includes('memoryVerdicts.spec.js')
+    )
+    expect(controlsRun.run).toContain('testHelpers/__tests__/telemetryFixtures.spec.js')
+    expect(controlsRun['continue-on-error']).toBeUndefined()
     const resources = workflow.jobs.resources
     expect(resources.strategy).toEqual({ 'fail-fast': false, matrix: { node: [22, 24, 26] } })
     expect(resources.env.TELEMETRY_RESOURCES_ARTIFACT_DIR).toContain('telemetry-resources')

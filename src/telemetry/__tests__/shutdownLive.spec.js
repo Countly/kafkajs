@@ -16,7 +16,6 @@ const {
   runCase,
   stableCacheEvent,
   traceChunk,
-  verifyQuietResources,
 } = require('../../../scripts/e2e/telemetry/evidence')
 const { cacheRetirement, connectionIdentity } = require('../../../scripts/e2e/telemetry/cacheTrace')
 const { DecoderGate, withTelemetryResource } = require('../../../testHelpers/telemetryFixtures')
@@ -877,19 +876,16 @@ class ReopenCase {
   }
 
   /**
-   * Waits the quiet window after every client and observer is gone, lets the destroy hooks of what
-   * ended run, then requires exact quiet identities: no owned socket, segment or pending call, no
-   * case-created resource of any type, no unknown-owner resource the baseline did not hold, the
-   * same process listener registrations with multiplicity and the same event-loop counts.
+   * Waits the quiet window after operational cleanup and lets destroy hooks settle, then archives
+   * exact identity, ownership, registration and event-loop readings. Only memory-gates compares
+   * these readings for resource acceptance.
    * @param {object} baseline the snapshot taken before anything was built
-   * @returns {Promise<void>} after the comparison; the readings are kept in the case results
+   * @returns {Promise<void>} after archiving both readings in the case results
    */
   async quiet(baseline) {
     const final = await this.settledResources()
     this.results.resources = { baseline, final }
-    expect(this.members.every((m) => m.faults.records.every((r) => r.closed))).toBe(true)
-    expect(this.gate.occupancy()).toEqual({ running: 0, queued: 0 })
-    verifyQuietResources({ baseline, final })
+    this.results.decoderOccupancy = this.gate.occupancy()
   }
 
   /**

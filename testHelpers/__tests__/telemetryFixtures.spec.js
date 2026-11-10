@@ -1138,6 +1138,23 @@ describe('telemetry wire observer', () => {
     })
   })
 
+  test('functional cleanup records surviving sockets without applying memory acceptance', async () => {
+    const { observer } = observe()
+    open(observer)
+    await observer.dispose()
+    expect(() => observer.assertFunctional()).not.toThrow()
+    expect(() => observer.assertClean()).toThrow('Observed client socket 1 is still open')
+  })
+
+  test('functional cleanup still fails a latched sink sequence error', async () => {
+    const { observer } = observe()
+    writeSink('1', [row('1', 2)])
+    expect(() => observer.assertHealthy()).toThrow('sequence')
+    writeSink('1', [row('1', 1), row('1', 2)])
+    await observer.dispose()
+    expect(() => observer.assertFunctional()).toThrow('sequence')
+  })
+
   test('closes listeners and reports a still-open client socket on disposal', async () => {
     const { observer } = observe()
     const open1 = open(observer)
@@ -2905,6 +2922,22 @@ describe('required live archive dimensions and semantics', () => {
     }
     return a
   }
+  test.each(['outcomes', 'unsupported'])(
+    'requires archived %s ownership only in memory-gates',
+    (scenario) => {
+      const { verifyMemoryScenario } = require('../../scripts/e2e/telemetry/memoryVerdicts')
+      const a = scenario === 'outcomes' ? outcomesArchive() : unsupportedArchive()
+      a.verify()
+      expect(() => verifyMemoryScenario(a.record, a.directory)).not.toThrow()
+      const owner = scenario === 'outcomes' ? 'control-producer' : 'producer'
+      a.streams[owner].transcript.sockets.push({ id: 999, node: '1', kind: 'undecided' })
+      a.verify()
+      expect(() => verifyMemoryScenario(a.record, a.directory)).toThrow(
+        'Unowned or additional quiet socket'
+      )
+    }
+  )
+
   test('verifies capable L6 topic and exact acquisition handler and broker identities for both options', () => {
     unsupportedArchive().verify()
   })
@@ -3098,20 +3131,19 @@ describe('telemetry observation segments', () => {
     expect(second.to.id).toBe('producer-ep-2')
   })
 
-  test('refuses disposal while a segment is active or still owns a socket', async () => {
+  test('seals shutdown resource ledgers without applying memory acceptance', async () => {
     const segments = ordinary()
     await expect(segments.discharge(segments.current())).rejects.toThrow('is still active')
     const lingering = open(segments)
     const cycle = segments.cycle({ disconnect: async () => {}, connect: async () => {} })
     await cycle.reopened
-    const dispose = jest.spyOn(cycle.from.observer, 'dispose')
-    await expect(segments.discharge(cycle.from, { closeMs: 20 })).rejects.toThrow(
-      'still owns 1 open sockets'
-    )
-    expect(dispose).not.toHaveBeenCalled()
-    lingering.emit('close')
     const pack = await segments.discharge(cycle.from)
-    expect(pack.id).toBe('producer-ep-0')
+    const transcript = JSON.parse(
+      fs.readFileSync(path.join(directory, 'segments', pack.transcript.name))
+    )
+    expect(transcript.cleanup.stillOpen).toEqual([1])
+    expect(transcript.failures).toEqual([])
+    lingering.emit('close')
     expect(cycle.from.observer).toBeNull()
     expect(await segments.discharge(cycle.from)).toBe(pack)
   })
@@ -3734,7 +3766,13 @@ describe('telemetry profile', () => {
         change(target)
         let thrown
         try {
-          verify(target)
+          if (/resource|timer/.test(name)) {
+            expect(() => verify(target)).not.toThrow()
+            require('../../scripts/e2e/telemetry/memoryVerdicts').verifyMemoryScenario(
+              target.record,
+              target.directory
+            )
+          } else verify(target)
         } catch (error) {
           thrown = error
         }

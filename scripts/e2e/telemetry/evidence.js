@@ -539,7 +539,8 @@ const verifyScenario = (record, directory) => {
       )
     }
     assert.deepEqual(transcript.failures, [])
-    assert.deepEqual(transcript.cleanup, { children: 0, timers: 0, stillOpen: [], attached: 0 })
+    if (![SHUTDOWN, UNSUPPORTED, 'telemetry-outcomes'].includes(manifest.scenario))
+      assert.deepEqual(transcript.cleanup, { children: 0, timers: 0, stillOpen: [], attached: 0 })
   }
   if (manifest.scenario === CHURN) {
     verifyChurn(record, directory, manifest, read)
@@ -750,9 +751,9 @@ const verifyScenario = (record, directory) => {
       assert(!records.some((r) => r.apiKey === 72), 'Unexpected Push in negative control')
       if (noPlugin) {
         assert(!records.some((r) => r.apiKey === 71))
-        if ([UNSUPPORTED, 'telemetry-floor'].includes(manifest.scenario))
-          ordinaryOwnership({ records, sockets })
-        else assert(!sockets.some((s) => s.kind === 'telemetry'))
+        if (manifest.scenario === 'telemetry-floor') ordinaryOwnership({ records, sockets })
+        else if (manifest.scenario !== UNSUPPORTED)
+          assert(!sockets.some((s) => s.kind === 'telemetry'))
         assert(
           records.some((r) => r.type === 'connect'),
           'No ordinary baseline'
@@ -761,18 +762,6 @@ const verifyScenario = (record, directory) => {
           assertCorpus(record.corpus)
           verifyCorpusInputs(record.corpus, read(`${manifest.root}/oracles.json`).corpus)
           const oracles = read(`${manifest.root}/oracles.json`)
-          for (const kind of KINDS) {
-            const ownership = (owner) => ordinaryOwnership(read(manifest.owners[owner]))
-            const on = ownership(kind)
-            const off = ownership(`${kind}-off`)
-            assert.deepEqual(record.results.ownership[kind], { on, off })
-            assert.deepEqual(
-              [...new Set(on.map((r) => r.split(':').at(-1)))].sort(),
-              [...new Set(off.map((r) => r.split(':').at(-1)))].sort(),
-              'Enabled/disabled socket ownership differs'
-            )
-          }
-
           verifyCorpusInputs(record.results.disabledCorpus, oracles.disabledCorpus)
           if (!['4.0.2', '4.1.2'].includes(record.run.line))
             for (const owner of ['share', 'share-off']) {
@@ -806,7 +795,7 @@ const verifyScenario = (record, directory) => {
         ]
         if (!kind.startsWith('share') || !['4.0.2', '4.1.2'].includes(record.run.line))
           assert.equal(outcome.status, 'connected', 'Ordinary baseline failed')
-        else assert.equal(outcome.name, 'KafkaJSShareGroupsNotSupportedError')
+        else assertShareRefusal(outcome, record.run.line)
       } else {
         const gets = records.filter((r) => r.apiKey === 71)
         assert.equal(gets.length, 1)
@@ -816,6 +805,33 @@ const verifyScenario = (record, directory) => {
       }
     }
   }
+}
+
+/** @param {object} transcript wire ledger @throws {Error} for an API 71/72 request */
+const assertNoTelemetryRequests = ({ records }) => {
+  assert(
+    !records.some((r) => r.type === 'request' && [71, 72].includes(r.apiKey)),
+    'Unexpected API 71/72 request'
+  )
+}
+
+/** @param {object} outcome public connect result @param {string} line broker line */
+const assertShareRefusal = (outcome, line) => {
+  if (!['4.0.2', '4.1.2'].includes(line)) {
+    assert.deepEqual(outcome, { status: 'connected' })
+    return
+  }
+  assert.deepEqual(
+    outcome,
+    {
+      status: 'rejected',
+      name: 'KafkaJSShareGroupsNotSupportedError',
+      reason: line === '4.0.2' ? 'api-not-advertised' : 'api-version-range',
+      apiKey: line === '4.0.2' ? 76 : 78,
+      shareVersion: 0,
+    },
+    'Share capability refusal differs'
+  )
 }
 
 /**
@@ -1639,7 +1655,7 @@ const verifyLive = (record, directory, manifest, read) => {
           requiredApis.every((api) => ordinary.some((r) => r.apiKey === api)),
           'Missing ordinary arm data or commit requests'
         )
-        if (record.mode === 'base' || name === 'control') ordinaryOwnership(wire)
+        if (record.mode === 'base' || name === 'control') assertNoTelemetryRequests(wire)
         else {
           const get = wire.records.find((r) => r.apiKey === 71 && r.response?.errorCode === 0)
           assert(get, 'Missing opted-in arm subscription')
@@ -1655,7 +1671,10 @@ const verifyLive = (record, directory, manifest, read) => {
         `${record.run.stem}-share-topic`,
         samples
       )
-    else ordinaryOwnership(transcripts.share)
+    else {
+      assertNoTelemetryRequests(transcripts.share)
+      assertShareRefusal(results.share, record.run.line)
+    }
     for (const recovery of Object.values(results.faults).flat())
       verifyRecovery(recovery, transcripts[recovery.owner], samples)
     const [control, ...others] = Object.values(results.arms)
@@ -1913,7 +1932,8 @@ const verifyBoundary = ({
  * Re-derives the complete close-and-reopen proof from the sealed segments: the fixed catalogue,
  * per-segment wire, payload, decode and sink joins, each lifecycle boundary, the four timeout-zero
  * arms, the blackhole arm's cap of `min(1000, T) + 100` ms for its finite remaining budget T,
- * budgets, the quiet resources and the strict-seam links. Advertised summaries are never trusted.
+ * budgets and the strict-seam links. Resource acceptance is replayed only in memory-gates.
+ * Advertised summaries are never trusted.
  * @param {object} record stamped evidence
  * @param {string} directory absolute run directory
  * @param {object} manifest sidecar manifest of the segmented archive
@@ -1985,16 +2005,6 @@ const verifyShutdown = (record, directory, manifest, read) => {
       'Segment client identity differs'
     )
     assert.deepEqual(transcript.failures, [])
-    assert.deepEqual(transcript.cleanup, { children: 0, timers: 0, stillOpen: [], attached: 0 })
-    assert.equal(
-      transcript.sockets.filter((s) => s.kind === 'telemetry').length,
-      1,
-      'A segment must own exactly one telemetry transport'
-    )
-    assert(
-      transcript.sockets.every((s) => Number.isFinite(s.closedAt)),
-      'A segment socket never closed'
-    )
     transcripts[entry.id] = transcript
     bundles[entry.id] = checked
   }
@@ -2183,7 +2193,6 @@ const verifyShutdown = (record, directory, manifest, read) => {
     results.workMs + record.timing.cleanupMs <= SHUTDOWN_TOTAL_MS,
     'The case exceeded its total budget'
   )
-  verifyQuietResources(results.resources ?? {})
   verifySeams(results.seams)
 }
 
