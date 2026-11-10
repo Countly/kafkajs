@@ -10,6 +10,7 @@ const Lock = require('../utils/lock')
 const { isConnectionFailure } = require('../network/connectionFailure')
 const createRetry = require('../retry')
 const connectionPoolBuilder = require('./connectionPoolBuilder')
+const BootstrapResolution = require('./bootstrapResolution')
 const GroupRegistry = require('./groupRegistry')
 const { EARLIEST_OFFSET, LATEST_OFFSET } = require('../constants')
 const {
@@ -122,6 +123,9 @@ module.exports = class Cluster {
    *   unchanged; `Cluster` stores neither this nor the trigger window.
    * @param {number} [options.metadataRecoveryRebootstrapTriggerMs] forwarded to `BrokerPool`
    *   unchanged.
+   * @param {number} [options.bootstrapResolveTimeout=0] milliseconds `connect()` waits for a
+   *   bootstrap hostname to resolve in DNS before dialing; 0 skips the check. The gate belongs to
+   *   this cluster, so each client has its own; `disconnect()` cancels a pending wait.
    * @param {import("../instrumentation/emitter")} [options.instrumentationEmitter=null] stored on
    *   the instance (`this.instrumentationEmitter`) and shared with the `MetadataCache` and the
    *   `BrokerPool`, so a topic recreation seen by either surfaces on the same emitter the client
@@ -157,6 +161,7 @@ module.exports = class Cluster {
     maxResponseSize,
     metadataRecoveryStrategy,
     metadataRecoveryRebootstrapTriggerMs,
+    bootstrapResolveTimeout = 0,
   }) {
     this.rootLogger = rootLogger
     this.logger = rootLogger.namespace('Cluster')
@@ -184,6 +189,12 @@ module.exports = class Cluster {
       maxInFlightRequests,
       maxResponseSize,
       reauthenticationThreshold,
+    })
+
+    this.bootstrapResolution = new BootstrapResolution({
+      timeout: bootstrapResolveTimeout,
+      resolveHosts: () => this.connectionPoolBuilder.bootstrapHosts(),
+      retry,
     })
 
     this.targetTopics = new Set()
@@ -230,6 +241,12 @@ module.exports = class Cluster {
     const fenceOf = ({ fence } = {}) => fence
 
     this[PRIVATE.CONNECT] = shareMetadata(async ({ fence } = {}) => {
+      try {
+        await this.bootstrapResolution.wait()
+      } catch (error) {
+        fence?.check()
+        throw error
+      }
       return await this.brokerPool.connect(...fenceArgs(fence))
     }, fenceOf)
 
@@ -439,6 +456,9 @@ module.exports = class Cluster {
    * @returns {Promise<void>}
    */
   async disconnect(options) {
+    this.bootstrapResolution.cancel(
+      new KafkaJSConnectionError('Disconnected while waiting for bootstrap DNS resolution')
+    )
     try {
       await this.brokerPool.disconnect(...(options ? [options] : []))
     } finally {
