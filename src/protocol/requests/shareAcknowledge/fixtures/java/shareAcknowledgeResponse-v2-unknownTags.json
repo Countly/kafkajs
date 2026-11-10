@@ -1,0 +1,7 @@
+{
+  "message": "ShareAcknowledgeResponse",
+  "version": 2,
+  "case": "unknownTags",
+  "hex": "0000001d00000000003a98020102030405060708090a0b0c0d0e0f100300000000000000000000027fffffff010a0161010a0161000000010079096e6f742068656c640000000300000008010a0161010a0161010a01610200000003076e6f64652d330000238500010a0161010a0161",
+  "fields": {"throttleTime":29,"errorCode":0,"errorMessage":null,"acquisitionLockTimeoutMs":15000,"responses":[{"topicId":"01020304-0506-0708-090a-0b0c0d0e0f10","partitions":[{"partitionIndex":0,"errorCode":0,"errorMessage":null,"currentLeader":{"leaderId":2,"leaderEpoch":2147483647}},{"partitionIndex":1,"errorCode":121,"errorMessage":"not held","currentLeader":{"leaderId":3,"leaderEpoch":8}}]}],"nodeEndpoints":[{"nodeId":3,"host":"node-3","port":9093,"rack":null}]}
+}

@@ -1604,3 +1604,151 @@ describe('security admin pairs', () => {
     }
   )
 })
+
+const SHARE_PAIRS = [
+  ['shareGroupHeartbeatV1', 'shareGroupHeartbeat', 1, 'assigned'],
+  ['shareFetchV2', 'shareFetch', 2, 'recordsAndErrors'],
+  ['shareAcknowledgeV2', 'shareAcknowledge', 2, 'mixed'],
+]
+
+/** The Java vector cases each share pair must cover, as the generator's constructors define them. */
+const SHARE_CASES = {
+  shareGroupHeartbeatV1: {
+    request: ['join', 'steady', 'emptyTopics', 'leave'],
+    response: ['assigned', 'unchanged', 'emptyAssignment', 'error', 'unknownTags'],
+  },
+  shareFetchV2: {
+    request: ['open', 'incremental', 'renew', 'close'],
+    response: ['recordsAndErrors', 'empty', 'error', 'unknownTags'],
+  },
+  shareAcknowledgeV2: {
+    request: [
+      'renew',
+      'final',
+      'mixed10',
+      'mixed11',
+      'uniform1',
+      'uniform2',
+      'uniform10',
+      'uniform11',
+      'uniform64',
+    ],
+    response: ['mixed', 'error', 'unknownTags'],
+  },
+}
+
+describe.each(SHARE_PAIRS)('share wire pair %s', (name, folder, version, defaultCase) => {
+  const pair = require('../wire/' + name)
+  const literal = expected[name]
+
+  test('matches independently declared literal bodies in both directions', () => {
+    expect(pair.buildResponse().toString('hex')).toBe(literal.responseHex)
+    expect(pair.readRequest(Buffer.from(literal.requestHex, 'hex'))).toEqual(literal.request)
+  })
+
+  test('refuses trailing and truncated literal request bodies', () => {
+    const body = Buffer.from(literal.requestHex, 'hex')
+    expect(() => pair.readRequest(Buffer.concat([body, Buffer.from([0xff])]))).toThrow(
+      'its tag buffer'
+    )
+    expect(() => pair.readRequest(body.subarray(0, -1))).toThrow()
+  })
+
+  test('matches every canonical Java vector and its literal fields', () => {
+    const responses = structured(folder, version, 'Response')
+    const requests = structured(folder, version, 'Request')
+    const cases = SHARE_CASES[name]
+    expect(responses.map(([caseName]) => caseName).sort()).toEqual(cases.response.slice().sort())
+    expect(requests.map(([caseName]) => caseName).sort()).toEqual(cases.request.slice().sort())
+    for (const [caseName, vector] of responses) {
+      expect(
+        pair.buildResponse(vector.fields, { tagged: caseName === 'unknownTags' }).toString('hex')
+      ).toBe(vector.hex)
+    }
+    for (const [, vector] of requests) {
+      expect(pair.readRequest(bytesOf(vector))).toEqual(vector.fields)
+    }
+    expect(pair.buildResponse().toString('hex')).toBe(
+      responses.find(([caseName]) => caseName === defaultCase)[1].hex
+    )
+  })
+})
+
+/** Share administration pairs: name, request folder, version, then the Java request and response cases each must cover. */
+const SHARE_ADMIN_PAIRS = [
+  [
+    'shareGroupDescribeV1',
+    'shareGroupDescribe',
+    1,
+    ['basic', 'authorized'],
+    ['mixed', 'unknownTags'],
+  ],
+  [
+    'describeShareGroupOffsetsV1',
+    'describeShareGroupOffsets',
+    1,
+    ['nullTopics', 'emptyTopics', 'namedTopics'],
+    ['knownAndUnknownLag', 'unknownTags'],
+  ],
+  [
+    'alterShareGroupOffsetsV0',
+    'alterShareGroupOffsets',
+    0,
+    ['offsets'],
+    ['mixed', 'error', 'unknownTags'],
+  ],
+  [
+    'deleteShareGroupOffsetsV0',
+    'deleteShareGroupOffsets',
+    0,
+    ['topics'],
+    ['mixed', 'error', 'unknownTags'],
+  ],
+]
+
+describe.each(SHARE_ADMIN_PAIRS)(
+  'share admin wire pair %s',
+  (name, folder, version, requestCases, responseCases) => {
+    const pair = require('../wire/' + name)
+    const literal = expected[name]
+
+    test('matches independent literal bodies and released codecs in both directions', async () => {
+      const request = require(`../../src/protocol/requests/${folder}/v${version}/request`)
+      const response = require(`../../src/protocol/requests/${folder}/v${version}/response`)
+      expect(pair.buildResponse().toString('hex')).toBe(literal.responseHex)
+      expect(pair.readRequest(Buffer.from(literal.requestHex, 'hex'))).toEqual(literal.request)
+      expect((await request(literal.request).encode()).buffer.toString('hex')).toBe(
+        literal.requestHex
+      )
+      const { throttleTime, ...fields } = literal.response
+      expect(await response.decode(Buffer.from(literal.responseHex, 'hex'))).toEqual({
+        throttleTime: 0,
+        clientSideThrottleTime: throttleTime,
+        ...fields,
+      })
+    })
+
+    test('refuses trailing and truncated literal request bodies', () => {
+      const body = Buffer.from(literal.requestHex, 'hex')
+      expect(() => pair.readRequest(Buffer.concat([body, Buffer.from([0xff])]))).toThrow(
+        'its tag buffer'
+      )
+      expect(() => pair.readRequest(body.subarray(0, -1))).toThrow()
+    })
+
+    test('matches every canonical Java vector and its literal fields', () => {
+      const requests = structured(folder, version, 'Request')
+      const responses = structured(folder, version, 'Response')
+      expect(requests.map(([caseName]) => caseName).sort()).toEqual(requestCases.slice().sort())
+      expect(responses.map(([caseName]) => caseName).sort()).toEqual(responseCases.slice().sort())
+      for (const [, vector] of requests) {
+        expect(pair.readRequest(bytesOf(vector))).toEqual(vector.fields)
+      }
+      for (const [caseName, vector] of responses) {
+        expect(
+          pair.buildResponse(vector.fields, { tagged: caseName === 'unknownTags' }).toString('hex')
+        ).toBe(vector.hex)
+      }
+    })
+  }
+)

@@ -19,6 +19,20 @@ import java.util.List;
 import java.util.UUID;
 import java.util.function.Function;
 
+import org.apache.kafka.common.message.ShareGroupHeartbeatRequestData;
+import org.apache.kafka.common.message.ShareGroupHeartbeatResponseData;
+import org.apache.kafka.common.message.ShareGroupDescribeRequestData;
+import org.apache.kafka.common.message.ShareGroupDescribeResponseData;
+import org.apache.kafka.common.message.ShareFetchRequestData;
+import org.apache.kafka.common.message.ShareFetchResponseData;
+import org.apache.kafka.common.message.ShareAcknowledgeRequestData;
+import org.apache.kafka.common.message.ShareAcknowledgeResponseData;
+import org.apache.kafka.common.message.DescribeShareGroupOffsetsRequestData;
+import org.apache.kafka.common.message.DescribeShareGroupOffsetsResponseData;
+import org.apache.kafka.common.message.AlterShareGroupOffsetsRequestData;
+import org.apache.kafka.common.message.AlterShareGroupOffsetsResponseData;
+import org.apache.kafka.common.message.DeleteShareGroupOffsetsRequestData;
+import org.apache.kafka.common.message.DeleteShareGroupOffsetsResponseData;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.message.ElectLeadersRequestData;
 import org.apache.kafka.common.message.ElectLeadersResponseData;
@@ -791,6 +805,7 @@ new ListConfigResourcesResponseData()
   private static List<Vector> vectors() {
     List<Vector> transactionVectors = transactionAdmin();
     List<Vector> vectors = new ArrayList<>();
+    vectors.addAll(shareVectors());
     vectors.addAll(transactionVectors);
     vectors.addAll(clusterResources());
     vectors.addAll(consumerGroupHeartbeat());
@@ -5430,4 +5445,751 @@ new ListConfigResourcesResponseData()
     }
   }
 
+  /** @return released share message cases with independent literal field expectations */
+  private static List<Vector> shareVectors() {
+    List<Vector> vectors = new ArrayList<>();
+    vectors.add(new Vector("shareGroupHeartbeat","ShareGroupHeartbeatRequest",(short) 1,"join",
+        new ShareGroupHeartbeatRequestData()
+        .setGroupId("share-group")
+        .setMemberId("share-member")
+        .setMemberEpoch(0)
+        .setRackId("rack-a")
+        .setSubscribedTopicNames(Arrays.asList("alpha","\u03b2eta")),
+        "{\"groupId\":\"share-group\",\"memberId\":\"share-member\",\"memberEpoch\":0,\"rackId\":\"rack-a\",\"subscribedTopicNames\":[\"alpha\",\"\u03b2eta\"]}"));
+    vectors.add(new Vector("shareGroupHeartbeat","ShareGroupHeartbeatRequest",(short) 1,"steady",
+        new ShareGroupHeartbeatRequestData()
+        .setGroupId("share-group")
+        .setMemberId("share-member")
+        .setMemberEpoch(7)
+        .setRackId(null)
+        .setSubscribedTopicNames(null),
+        "{\"groupId\":\"share-group\",\"memberId\":\"share-member\",\"memberEpoch\":7,\"rackId\":null,\"subscribedTopicNames\":null}"));
+    vectors.add(new Vector("shareGroupHeartbeat","ShareGroupHeartbeatRequest",(short) 1,"emptyTopics",
+        new ShareGroupHeartbeatRequestData()
+        .setGroupId("share-group")
+        .setMemberId("share-member")
+        .setMemberEpoch(7)
+        .setRackId(null)
+        .setSubscribedTopicNames(Collections.emptyList()),
+        "{\"groupId\":\"share-group\",\"memberId\":\"share-member\",\"memberEpoch\":7,\"rackId\":null,\"subscribedTopicNames\":[]}"));
+    vectors.add(new Vector("shareGroupHeartbeat","ShareGroupHeartbeatRequest",(short) 1,"leave",
+        new ShareGroupHeartbeatRequestData()
+        .setGroupId("share-group")
+        .setMemberId("share-member")
+        .setMemberEpoch(-1)
+        .setRackId(null)
+        .setSubscribedTopicNames(null),
+        "{\"groupId\":\"share-group\",\"memberId\":\"share-member\",\"memberEpoch\":-1,\"rackId\":null,\"subscribedTopicNames\":null}"));
+    vectors.add(new Vector("shareGroupHeartbeat","ShareGroupHeartbeatResponse",(short) 1,"assigned",
+        new ShareGroupHeartbeatResponseData()
+        .setThrottleTimeMs(17)
+        .setErrorCode((short) 0)
+        .setErrorMessage(null)
+        .setMemberId("share-member")
+        .setMemberEpoch(2147483647)
+        .setHeartbeatIntervalMs(500)
+        .setAssignment(new ShareGroupHeartbeatResponseData.Assignment()
+        .setTopicPartitions(Arrays.asList(new ShareGroupHeartbeatResponseData.TopicPartitions()
+        .setTopicId(shareUuid("01020304-0506-0708-090a-0b0c0d0e0f10"))
+        .setPartitions(Arrays.asList(0,2))))),
+        "{\"throttleTime\":17,\"errorCode\":0,\"errorMessage\":null,\"memberId\":\"share-member\",\"memberEpoch\":2147483647,\"heartbeatIntervalMs\":500,\"assignment\":{\"topicPartitions\":[{\"topicId\":\"01020304-0506-0708-090a-0b0c0d0e0f10\",\"partitions\":[0,2]}]}}"));
+    vectors.add(new Vector("shareGroupHeartbeat","ShareGroupHeartbeatResponse",(short) 1,"unchanged",
+        new ShareGroupHeartbeatResponseData()
+        .setThrottleTimeMs(0)
+        .setErrorCode((short) 0)
+        .setErrorMessage(null)
+        .setMemberId("share-member")
+        .setMemberEpoch(7)
+        .setHeartbeatIntervalMs(500)
+        .setAssignment(null),
+        "{\"throttleTime\":0,\"errorCode\":0,\"errorMessage\":null,\"memberId\":\"share-member\",\"memberEpoch\":7,\"heartbeatIntervalMs\":500,\"assignment\":null}"));
+    vectors.add(new Vector("shareGroupHeartbeat","ShareGroupHeartbeatResponse",(short) 1,"emptyAssignment",
+        new ShareGroupHeartbeatResponseData()
+        .setThrottleTimeMs(0)
+        .setErrorCode((short) 0)
+        .setErrorMessage(null)
+        .setMemberId("share-member")
+        .setMemberEpoch(0)
+        .setHeartbeatIntervalMs(0)
+        .setAssignment(new ShareGroupHeartbeatResponseData.Assignment()
+        .setTopicPartitions(Collections.emptyList())),
+        "{\"throttleTime\":0,\"errorCode\":0,\"errorMessage\":null,\"memberId\":\"share-member\",\"memberEpoch\":0,\"heartbeatIntervalMs\":0,\"assignment\":{\"topicPartitions\":[]}}"));
+    vectors.add(new Vector("shareGroupHeartbeat","ShareGroupHeartbeatResponse",(short) 1,"error",
+        new ShareGroupHeartbeatResponseData()
+        .setThrottleTimeMs(0)
+        .setErrorCode((short) 35)
+        .setErrorMessage("not enabled")
+        .setMemberId(null)
+        .setMemberEpoch(-1)
+        .setHeartbeatIntervalMs(0)
+        .setAssignment(null),
+        "{\"throttleTime\":0,\"errorCode\":35,\"errorMessage\":\"not enabled\",\"memberId\":null,\"memberEpoch\":-1,\"heartbeatIntervalMs\":0,\"assignment\":null}"));
+    vectors.add(new Vector("shareGroupDescribe","ShareGroupDescribeRequest",(short) 1,"basic",
+        new ShareGroupDescribeRequestData()
+        .setGroupIds(Arrays.asList("share-group","absent"))
+        .setIncludeAuthorizedOperations(false),
+        "{\"groupIds\":[\"share-group\",\"absent\"],\"includeAuthorizedOperations\":false}"));
+    vectors.add(new Vector("shareGroupDescribe","ShareGroupDescribeRequest",(short) 1,"authorized",
+        new ShareGroupDescribeRequestData()
+        .setGroupIds(Arrays.asList("share-group","absent"))
+        .setIncludeAuthorizedOperations(true),
+        "{\"groupIds\":[\"share-group\",\"absent\"],\"includeAuthorizedOperations\":true}"));
+    vectors.add(new Vector("shareGroupDescribe","ShareGroupDescribeResponse",(short) 1,"mixed",
+        new ShareGroupDescribeResponseData()
+        .setThrottleTimeMs(19)
+        .setGroups(Arrays.asList(new ShareGroupDescribeResponseData.DescribedGroup()
+        .setErrorCode((short) 0)
+        .setErrorMessage(null)
+        .setGroupId("share-group")
+        .setGroupState("Stable")
+        .setGroupEpoch(2147483647)
+        .setAssignmentEpoch(9)
+        .setAssignorName("simple")
+        .setMembers(Arrays.asList(new ShareGroupDescribeResponseData.Member()
+        .setMemberId("share-member")
+        .setRackId(null)
+        .setMemberEpoch(8)
+        .setClientId("client-a")
+        .setClientHost("/127.0.0.1")
+        .setSubscribedTopicNames(Arrays.asList("alpha","\u03b2eta"))
+        .setAssignment(new ShareGroupDescribeResponseData.Assignment()
+        .setTopicPartitions(Arrays.asList(new ShareGroupDescribeResponseData.TopicPartitions()
+        .setTopicId(shareUuid("01020304-0506-0708-090a-0b0c0d0e0f10"))
+        .setTopicName("alpha")
+        .setPartitions(Arrays.asList(0,2)))))))
+        .setAuthorizedOperations(-2147483647),new ShareGroupDescribeResponseData.DescribedGroup()
+        .setErrorCode((short) 69)
+        .setErrorMessage("missing")
+        .setGroupId("absent")
+        .setGroupState("")
+        .setGroupEpoch(0)
+        .setAssignmentEpoch(0)
+        .setAssignorName("")
+        .setMembers(Collections.emptyList())
+        .setAuthorizedOperations(-2147483648))),
+        "{\"throttleTime\":19,\"groups\":[{\"errorCode\":0,\"errorMessage\":null,\"groupId\":\"share-group\",\"groupState\":\"Stable\",\"groupEpoch\":2147483647,\"assignmentEpoch\":9,\"assignorName\":\"simple\",\"members\":[{\"memberId\":\"share-member\",\"rackId\":null,\"memberEpoch\":8,\"clientId\":\"client-a\",\"clientHost\":\"/127.0.0.1\",\"subscribedTopicNames\":[\"alpha\",\"\u03b2eta\"],\"assignment\":{\"topicPartitions\":[{\"topicId\":\"01020304-0506-0708-090a-0b0c0d0e0f10\",\"topicName\":\"alpha\",\"partitions\":[0,2]}]}}],\"authorizedOperations\":-2147483647},{\"errorCode\":69,\"errorMessage\":\"missing\",\"groupId\":\"absent\",\"groupState\":\"\",\"groupEpoch\":0,\"assignmentEpoch\":0,\"assignorName\":\"\",\"members\":[],\"authorizedOperations\":-2147483648}]}"));
+    vectors.add(new Vector("shareFetch","ShareFetchRequest",(short) 2,"open",
+        new ShareFetchRequestData()
+        .setGroupId("share-group")
+        .setMemberId("share-member")
+        .setShareSessionEpoch(0)
+        .setMaxWaitMs(500)
+        .setMinBytes(1)
+        .setMaxBytes(1048576)
+        .setMaxRecords(500)
+        .setBatchSize(500)
+        .setShareAcquireMode((byte) 1)
+        .setIsRenewAck(false)
+        .setTopics(new ShareFetchRequestData.FetchTopicCollection(Arrays.asList(new ShareFetchRequestData.FetchTopic()
+        .setTopicId(shareUuid("01020304-0506-0708-090a-0b0c0d0e0f10"))
+        .setPartitions(new ShareFetchRequestData.FetchPartitionCollection(Arrays.asList(new ShareFetchRequestData.FetchPartition()
+        .setPartitionIndex(0)
+        .setAcknowledgementBatches(Collections.emptyList()),new ShareFetchRequestData.FetchPartition()
+        .setPartitionIndex(1)
+        .setAcknowledgementBatches(Collections.emptyList()),new ShareFetchRequestData.FetchPartition()
+        .setPartitionIndex(2)
+        .setAcknowledgementBatches(Collections.emptyList())).iterator()))).iterator()))
+        .setForgottenTopicsData(Collections.emptyList()),
+        "{\"groupId\":\"share-group\",\"memberId\":\"share-member\",\"shareSessionEpoch\":0,\"maxWaitMs\":500,\"minBytes\":1,\"maxBytes\":1048576,\"maxRecords\":500,\"batchSize\":500,\"shareAcquireMode\":1,\"isRenewAck\":false,\"topics\":[{\"topicId\":\"01020304-0506-0708-090a-0b0c0d0e0f10\",\"partitions\":[{\"partitionIndex\":0,\"acknowledgementBatches\":[]},{\"partitionIndex\":1,\"acknowledgementBatches\":[]},{\"partitionIndex\":2,\"acknowledgementBatches\":[]}]}],\"forgottenTopicsData\":[]}"));
+    vectors.add(new Vector("shareFetch","ShareFetchRequest",(short) 2,"incremental",
+        new ShareFetchRequestData()
+        .setGroupId("share-group")
+        .setMemberId("share-member")
+        .setShareSessionEpoch(1)
+        .setMaxWaitMs(500)
+        .setMinBytes(0)
+        .setMaxBytes(2147483647)
+        .setMaxRecords(5)
+        .setBatchSize(5)
+        .setShareAcquireMode((byte) 1)
+        .setIsRenewAck(false)
+        .setTopics(new ShareFetchRequestData.FetchTopicCollection(Arrays.asList(new ShareFetchRequestData.FetchTopic()
+        .setTopicId(shareUuid("01020304-0506-0708-090a-0b0c0d0e0f10"))
+        .setPartitions(new ShareFetchRequestData.FetchPartitionCollection(Arrays.asList(new ShareFetchRequestData.FetchPartition()
+        .setPartitionIndex(0)
+        .setAcknowledgementBatches(Arrays.asList(new ShareFetchRequestData.AcknowledgementBatch()
+        .setFirstOffset(9007199254740993L)
+        .setLastOffset(9007199254740995L)
+        .setAcknowledgeTypes(Arrays.asList((byte) 1)),new ShareFetchRequestData.AcknowledgementBatch()
+        .setFirstOffset(9007199254740997L)
+        .setLastOffset(9007199254741000L)
+        .setAcknowledgeTypes(Arrays.asList((byte) 1,(byte) 0,(byte) 2,(byte) 3)),new ShareFetchRequestData.AcknowledgementBatch()
+        .setFirstOffset(9223372036854775807L)
+        .setLastOffset(9223372036854775807L)
+        .setAcknowledgeTypes(Arrays.asList((byte) 3))))).iterator()))).iterator()))
+        .setForgottenTopicsData(Collections.emptyList()),
+        "{\"groupId\":\"share-group\",\"memberId\":\"share-member\",\"shareSessionEpoch\":1,\"maxWaitMs\":500,\"minBytes\":0,\"maxBytes\":2147483647,\"maxRecords\":5,\"batchSize\":5,\"shareAcquireMode\":1,\"isRenewAck\":false,\"topics\":[{\"topicId\":\"01020304-0506-0708-090a-0b0c0d0e0f10\",\"partitions\":[{\"partitionIndex\":0,\"acknowledgementBatches\":[{\"firstOffset\":\"9007199254740993\",\"lastOffset\":\"9007199254740995\",\"acknowledgeTypes\":[1]},{\"firstOffset\":\"9007199254740997\",\"lastOffset\":\"9007199254741000\",\"acknowledgeTypes\":[1,0,2,3]},{\"firstOffset\":\"9223372036854775807\",\"lastOffset\":\"9223372036854775807\",\"acknowledgeTypes\":[3]}]}]}],\"forgottenTopicsData\":[]}"));
+    vectors.add(new Vector("shareFetch","ShareFetchRequest",(short) 2,"renew",
+        new ShareFetchRequestData()
+        .setGroupId("share-group")
+        .setMemberId("share-member")
+        .setShareSessionEpoch(1)
+        .setMaxWaitMs(0)
+        .setMinBytes(0)
+        .setMaxBytes(2147483647)
+        .setMaxRecords(0)
+        .setBatchSize(0)
+        .setShareAcquireMode((byte) 0)
+        .setIsRenewAck(true)
+        .setTopics(new ShareFetchRequestData.FetchTopicCollection(Arrays.asList(new ShareFetchRequestData.FetchTopic()
+        .setTopicId(shareUuid("01020304-0506-0708-090a-0b0c0d0e0f10"))
+        .setPartitions(new ShareFetchRequestData.FetchPartitionCollection(Arrays.asList(new ShareFetchRequestData.FetchPartition()
+        .setPartitionIndex(0)
+        .setAcknowledgementBatches(Arrays.asList(new ShareFetchRequestData.AcknowledgementBatch()
+        .setFirstOffset(9007199254740993L)
+        .setLastOffset(9007199254740993L)
+        .setAcknowledgeTypes(Arrays.asList((byte) 4))))).iterator()))).iterator()))
+        .setForgottenTopicsData(Collections.emptyList()),
+        "{\"groupId\":\"share-group\",\"memberId\":\"share-member\",\"shareSessionEpoch\":1,\"maxWaitMs\":0,\"minBytes\":0,\"maxBytes\":2147483647,\"maxRecords\":0,\"batchSize\":0,\"shareAcquireMode\":0,\"isRenewAck\":true,\"topics\":[{\"topicId\":\"01020304-0506-0708-090a-0b0c0d0e0f10\",\"partitions\":[{\"partitionIndex\":0,\"acknowledgementBatches\":[{\"firstOffset\":\"9007199254740993\",\"lastOffset\":\"9007199254740993\",\"acknowledgeTypes\":[4]}]}]}],\"forgottenTopicsData\":[]}"));
+    vectors.add(new Vector("shareFetch","ShareFetchRequest",(short) 2,"close",
+        new ShareFetchRequestData()
+        .setGroupId("share-group")
+        .setMemberId("share-member")
+        .setShareSessionEpoch(-1)
+        .setMaxWaitMs(0)
+        .setMinBytes(0)
+        .setMaxBytes(2147483647)
+        .setMaxRecords(0)
+        .setBatchSize(0)
+        .setShareAcquireMode((byte) 0)
+        .setIsRenewAck(false)
+        .setTopics(new ShareFetchRequestData.FetchTopicCollection())
+        .setForgottenTopicsData(Arrays.asList(new ShareFetchRequestData.ForgottenTopic()
+        .setTopicId(shareUuid("01020304-0506-0708-090a-0b0c0d0e0f10"))
+        .setPartitions(Arrays.asList(0,2)))),
+        "{\"groupId\":\"share-group\",\"memberId\":\"share-member\",\"shareSessionEpoch\":-1,\"maxWaitMs\":0,\"minBytes\":0,\"maxBytes\":2147483647,\"maxRecords\":0,\"batchSize\":0,\"shareAcquireMode\":0,\"isRenewAck\":false,\"topics\":[],\"forgottenTopicsData\":[{\"topicId\":\"01020304-0506-0708-090a-0b0c0d0e0f10\",\"partitions\":[0,2]}]}"));
+    vectors.add(new Vector("shareFetch","ShareFetchResponse",(short) 2,"recordsAndErrors",
+        new ShareFetchResponseData()
+        .setThrottleTimeMs(23)
+        .setErrorCode((short) 0)
+        .setErrorMessage(null)
+        .setAcquisitionLockTimeoutMs(15000)
+        .setResponses(new ShareFetchResponseData.ShareFetchableTopicResponseCollection(Arrays.asList(new ShareFetchResponseData.ShareFetchableTopicResponse()
+        .setTopicId(shareUuid("01020304-0506-0708-090a-0b0c0d0e0f10"))
+        .setPartitions(Arrays.asList(new ShareFetchResponseData.PartitionData()
+        .setPartitionIndex(0)
+        .setErrorCode((short) 0)
+        .setErrorMessage(null)
+        .setAcknowledgeErrorCode((short) 0)
+        .setAcknowledgeErrorMessage(null)
+        .setCurrentLeader(new ShareFetchResponseData.LeaderIdAndEpoch()
+        .setLeaderId(2)
+        .setLeaderEpoch(2147483647))
+        .setRecords(shareRecords())
+        .setAcquiredRecords(Arrays.asList(new ShareFetchResponseData.AcquiredRecords()
+        .setFirstOffset(9007199254740993L)
+        .setLastOffset(9007199254740995L)
+        .setDeliveryCount((short) 2),new ShareFetchResponseData.AcquiredRecords()
+        .setFirstOffset(9223372036854775807L)
+        .setLastOffset(9223372036854775807L)
+        .setDeliveryCount((short) 32767))),new ShareFetchResponseData.PartitionData()
+        .setPartitionIndex(1)
+        .setErrorCode((short) 6)
+        .setErrorMessage("moved")
+        .setAcknowledgeErrorCode((short) 121)
+        .setAcknowledgeErrorMessage("not held")
+        .setCurrentLeader(new ShareFetchResponseData.LeaderIdAndEpoch()
+        .setLeaderId(3)
+        .setLeaderEpoch(12))
+        .setRecords(org.apache.kafka.common.record.internal.MemoryRecords.EMPTY)
+        .setAcquiredRecords(Collections.emptyList())))).iterator()))
+        .setNodeEndpoints(new ShareFetchResponseData.NodeEndpointCollection(Arrays.asList(new ShareFetchResponseData.NodeEndpoint()
+        .setNodeId(2)
+        .setHost("localhost")
+        .setPort(9092)
+        .setRack(null),new ShareFetchResponseData.NodeEndpoint()
+        .setNodeId(3)
+        .setHost("node-3")
+        .setPort(9093)
+        .setRack("rack-b")).iterator())),
+        "{\"throttleTime\":23,\"errorCode\":0,\"errorMessage\":null,\"acquisitionLockTimeoutMs\":15000,\"responses\":[{\"topicId\":\"01020304-0506-0708-090a-0b0c0d0e0f10\",\"partitions\":[{\"partitionIndex\":0,\"errorCode\":0,\"errorMessage\":null,\"acknowledgeErrorCode\":0,\"acknowledgeErrorMessage\":null,\"currentLeader\":{\"leaderId\":2,\"leaderEpoch\":2147483647},\"acquiredRecords\":[{\"firstOffset\":\"9007199254740993\",\"lastOffset\":\"9007199254740995\",\"deliveryCount\":2},{\"firstOffset\":\"9223372036854775807\",\"lastOffset\":\"9223372036854775807\",\"deliveryCount\":32767}],\"messages\":[{\"offset\":\"9007199254740993\",\"timestamp\":\"1700000000000\",\"key\":\"6b\",\"value\":\"76\",\"headers\":{}}]},{\"partitionIndex\":1,\"errorCode\":6,\"errorMessage\":\"moved\",\"acknowledgeErrorCode\":121,\"acknowledgeErrorMessage\":\"not held\",\"currentLeader\":{\"leaderId\":3,\"leaderEpoch\":12},\"acquiredRecords\":[],\"messages\":[]}]}],\"nodeEndpoints\":[{\"nodeId\":2,\"host\":\"localhost\",\"port\":9092,\"rack\":null},{\"nodeId\":3,\"host\":\"node-3\",\"port\":9093,\"rack\":\"rack-b\"}]}"));
+    vectors.add(new Vector("shareFetch","ShareFetchResponse",(short) 2,"empty",
+        new ShareFetchResponseData()
+        .setThrottleTimeMs(0)
+        .setErrorCode((short) 0)
+        .setErrorMessage(null)
+        .setAcquisitionLockTimeoutMs(15000)
+        .setResponses(new ShareFetchResponseData.ShareFetchableTopicResponseCollection())
+        .setNodeEndpoints(new ShareFetchResponseData.NodeEndpointCollection()),
+        "{\"throttleTime\":0,\"errorCode\":0,\"errorMessage\":null,\"acquisitionLockTimeoutMs\":15000,\"responses\":[],\"nodeEndpoints\":[]}"));
+    vectors.add(new Vector("shareFetch","ShareFetchResponse",(short) 2,"error",
+        new ShareFetchResponseData()
+        .setThrottleTimeMs(0)
+        .setErrorCode((short) 35)
+        .setErrorMessage(null)
+        .setAcquisitionLockTimeoutMs(15000)
+        .setResponses(new ShareFetchResponseData.ShareFetchableTopicResponseCollection())
+        .setNodeEndpoints(new ShareFetchResponseData.NodeEndpointCollection()),
+        "{\"throttleTime\":0,\"errorCode\":35,\"errorMessage\":null,\"acquisitionLockTimeoutMs\":15000,\"responses\":[],\"nodeEndpoints\":[]}"));
+    vectors.add(new Vector("shareAcknowledge","ShareAcknowledgeRequest",(short) 2,"renew",
+        new ShareAcknowledgeRequestData()
+        .setGroupId("share-group")
+        .setMemberId("share-member")
+        .setShareSessionEpoch(1)
+        .setIsRenewAck(true)
+        .setTopics(new ShareAcknowledgeRequestData.AcknowledgeTopicCollection(Arrays.asList(new ShareAcknowledgeRequestData.AcknowledgeTopic()
+        .setTopicId(shareUuid("01020304-0506-0708-090a-0b0c0d0e0f10"))
+        .setPartitions(new ShareAcknowledgeRequestData.AcknowledgePartitionCollection(Arrays.asList(new ShareAcknowledgeRequestData.AcknowledgePartition()
+        .setPartitionIndex(0)
+        .setAcknowledgementBatches(Arrays.asList(new ShareAcknowledgeRequestData.AcknowledgementBatch()
+        .setFirstOffset(9007199254740993L)
+        .setLastOffset(9007199254740994L)
+        .setAcknowledgeTypes(Arrays.asList((byte) 4))))).iterator()))).iterator())),
+        "{\"groupId\":\"share-group\",\"memberId\":\"share-member\",\"shareSessionEpoch\":1,\"isRenewAck\":true,\"topics\":[{\"topicId\":\"01020304-0506-0708-090a-0b0c0d0e0f10\",\"partitions\":[{\"partitionIndex\":0,\"acknowledgementBatches\":[{\"firstOffset\":\"9007199254740993\",\"lastOffset\":\"9007199254740994\",\"acknowledgeTypes\":[4]}]}]}]}"));
+    vectors.add(new Vector("shareAcknowledge","ShareAcknowledgeRequest",(short) 2,"final",
+        new ShareAcknowledgeRequestData()
+        .setGroupId("share-group")
+        .setMemberId("share-member")
+        .setShareSessionEpoch(-1)
+        .setIsRenewAck(false)
+        .setTopics(new ShareAcknowledgeRequestData.AcknowledgeTopicCollection(Arrays.asList(new ShareAcknowledgeRequestData.AcknowledgeTopic()
+        .setTopicId(shareUuid("01020304-0506-0708-090a-0b0c0d0e0f10"))
+        .setPartitions(new ShareAcknowledgeRequestData.AcknowledgePartitionCollection(Arrays.asList(new ShareAcknowledgeRequestData.AcknowledgePartition()
+        .setPartitionIndex(2)
+        .setAcknowledgementBatches(Arrays.asList(new ShareAcknowledgeRequestData.AcknowledgementBatch()
+        .setFirstOffset(9223372036854775807L)
+        .setLastOffset(9223372036854775807L)
+        .setAcknowledgeTypes(Arrays.asList((byte) 2))))).iterator()))).iterator())),
+        "{\"groupId\":\"share-group\",\"memberId\":\"share-member\",\"shareSessionEpoch\":-1,\"isRenewAck\":false,\"topics\":[{\"topicId\":\"01020304-0506-0708-090a-0b0c0d0e0f10\",\"partitions\":[{\"partitionIndex\":2,\"acknowledgementBatches\":[{\"firstOffset\":\"9223372036854775807\",\"lastOffset\":\"9223372036854775807\",\"acknowledgeTypes\":[2]}]}]}]}"));
+    vectors.add(new Vector("shareAcknowledge","ShareAcknowledgeRequest",(short) 2,"mixed10",
+        new ShareAcknowledgeRequestData()
+        .setGroupId("share-group")
+        .setMemberId("share-member")
+        .setShareSessionEpoch(1)
+        .setIsRenewAck(false)
+        .setTopics(new ShareAcknowledgeRequestData.AcknowledgeTopicCollection(Arrays.asList(new ShareAcknowledgeRequestData.AcknowledgeTopic()
+        .setTopicId(shareUuid("01020304-0506-0708-090a-0b0c0d0e0f10"))
+        .setPartitions(new ShareAcknowledgeRequestData.AcknowledgePartitionCollection(Arrays.asList(new ShareAcknowledgeRequestData.AcknowledgePartition()
+        .setPartitionIndex(0)
+        .setAcknowledgementBatches(shareBatches(2,1,1,1,1,1,1,1,1,1,1,3))).iterator()))).iterator())),
+        "{\"groupId\":\"share-group\",\"memberId\":\"share-member\",\"shareSessionEpoch\":1,\"isRenewAck\":false,\"topics\":[{\"topicId\":\"01020304-0506-0708-090a-0b0c0d0e0f10\",\"partitions\":[{\"partitionIndex\":0,\"acknowledgementBatches\":[{\"firstOffset\":\"9007199254740993\",\"lastOffset\":\"9007199254741004\",\"acknowledgeTypes\":[2,1,1,1,1,1,1,1,1,1,1,3]}]}]}]}"));
+    vectors.add(new Vector("shareAcknowledge","ShareAcknowledgeRequest",(short) 2,"mixed11",
+        new ShareAcknowledgeRequestData()
+        .setGroupId("share-group")
+        .setMemberId("share-member")
+        .setShareSessionEpoch(1)
+        .setIsRenewAck(false)
+        .setTopics(new ShareAcknowledgeRequestData.AcknowledgeTopicCollection(Arrays.asList(new ShareAcknowledgeRequestData.AcknowledgeTopic()
+        .setTopicId(shareUuid("01020304-0506-0708-090a-0b0c0d0e0f10"))
+        .setPartitions(new ShareAcknowledgeRequestData.AcknowledgePartitionCollection(Arrays.asList(new ShareAcknowledgeRequestData.AcknowledgePartition()
+        .setPartitionIndex(0)
+        .setAcknowledgementBatches(shareBatches(2,1,1,1,1,1,1,1,1,1,1,1,3))).iterator()))).iterator())),
+        "{\"groupId\":\"share-group\",\"memberId\":\"share-member\",\"shareSessionEpoch\":1,\"isRenewAck\":false,\"topics\":[{\"topicId\":\"01020304-0506-0708-090a-0b0c0d0e0f10\",\"partitions\":[{\"partitionIndex\":0,\"acknowledgementBatches\":[{\"firstOffset\":\"9007199254740993\",\"lastOffset\":\"9007199254740993\",\"acknowledgeTypes\":[2]},{\"firstOffset\":\"9007199254740994\",\"lastOffset\":\"9007199254741004\",\"acknowledgeTypes\":[1]},{\"firstOffset\":\"9007199254741005\",\"lastOffset\":\"9007199254741005\",\"acknowledgeTypes\":[3]}]}]}]}"));
+    vectors.add(new Vector("shareAcknowledge","ShareAcknowledgeRequest",(short) 2,"uniform1",
+        new ShareAcknowledgeRequestData()
+        .setGroupId("share-group")
+        .setMemberId("share-member")
+        .setShareSessionEpoch(1)
+        .setIsRenewAck(false)
+        .setTopics(new ShareAcknowledgeRequestData.AcknowledgeTopicCollection(Arrays.asList(new ShareAcknowledgeRequestData.AcknowledgeTopic()
+        .setTopicId(shareUuid("01020304-0506-0708-090a-0b0c0d0e0f10"))
+        .setPartitions(new ShareAcknowledgeRequestData.AcknowledgePartitionCollection(Arrays.asList(new ShareAcknowledgeRequestData.AcknowledgePartition()
+        .setPartitionIndex(0)
+        .setAcknowledgementBatches(shareBatches(1))).iterator()))).iterator())),
+        "{\"groupId\":\"share-group\",\"memberId\":\"share-member\",\"shareSessionEpoch\":1,\"isRenewAck\":false,\"topics\":[{\"topicId\":\"01020304-0506-0708-090a-0b0c0d0e0f10\",\"partitions\":[{\"partitionIndex\":0,\"acknowledgementBatches\":[{\"firstOffset\":\"9007199254740993\",\"lastOffset\":\"9007199254740993\",\"acknowledgeTypes\":[1]}]}]}]}"));
+    vectors.add(new Vector("shareAcknowledge","ShareAcknowledgeRequest",(short) 2,"uniform2",
+        new ShareAcknowledgeRequestData()
+        .setGroupId("share-group")
+        .setMemberId("share-member")
+        .setShareSessionEpoch(1)
+        .setIsRenewAck(false)
+        .setTopics(new ShareAcknowledgeRequestData.AcknowledgeTopicCollection(Arrays.asList(new ShareAcknowledgeRequestData.AcknowledgeTopic()
+        .setTopicId(shareUuid("01020304-0506-0708-090a-0b0c0d0e0f10"))
+        .setPartitions(new ShareAcknowledgeRequestData.AcknowledgePartitionCollection(Arrays.asList(new ShareAcknowledgeRequestData.AcknowledgePartition()
+        .setPartitionIndex(0)
+        .setAcknowledgementBatches(shareBatches(1,1))).iterator()))).iterator())),
+        "{\"groupId\":\"share-group\",\"memberId\":\"share-member\",\"shareSessionEpoch\":1,\"isRenewAck\":false,\"topics\":[{\"topicId\":\"01020304-0506-0708-090a-0b0c0d0e0f10\",\"partitions\":[{\"partitionIndex\":0,\"acknowledgementBatches\":[{\"firstOffset\":\"9007199254740993\",\"lastOffset\":\"9007199254740994\",\"acknowledgeTypes\":[1]}]}]}]}"));
+    vectors.add(new Vector("shareAcknowledge","ShareAcknowledgeRequest",(short) 2,"uniform10",
+        new ShareAcknowledgeRequestData()
+        .setGroupId("share-group")
+        .setMemberId("share-member")
+        .setShareSessionEpoch(1)
+        .setIsRenewAck(false)
+        .setTopics(new ShareAcknowledgeRequestData.AcknowledgeTopicCollection(Arrays.asList(new ShareAcknowledgeRequestData.AcknowledgeTopic()
+        .setTopicId(shareUuid("01020304-0506-0708-090a-0b0c0d0e0f10"))
+        .setPartitions(new ShareAcknowledgeRequestData.AcknowledgePartitionCollection(Arrays.asList(new ShareAcknowledgeRequestData.AcknowledgePartition()
+        .setPartitionIndex(0)
+        .setAcknowledgementBatches(shareBatches(1,1,1,1,1,1,1,1,1,1))).iterator()))).iterator())),
+        "{\"groupId\":\"share-group\",\"memberId\":\"share-member\",\"shareSessionEpoch\":1,\"isRenewAck\":false,\"topics\":[{\"topicId\":\"01020304-0506-0708-090a-0b0c0d0e0f10\",\"partitions\":[{\"partitionIndex\":0,\"acknowledgementBatches\":[{\"firstOffset\":\"9007199254740993\",\"lastOffset\":\"9007199254741002\",\"acknowledgeTypes\":[1]}]}]}]}"));
+    vectors.add(new Vector("shareAcknowledge","ShareAcknowledgeRequest",(short) 2,"uniform11",
+        new ShareAcknowledgeRequestData()
+        .setGroupId("share-group")
+        .setMemberId("share-member")
+        .setShareSessionEpoch(1)
+        .setIsRenewAck(false)
+        .setTopics(new ShareAcknowledgeRequestData.AcknowledgeTopicCollection(Arrays.asList(new ShareAcknowledgeRequestData.AcknowledgeTopic()
+        .setTopicId(shareUuid("01020304-0506-0708-090a-0b0c0d0e0f10"))
+        .setPartitions(new ShareAcknowledgeRequestData.AcknowledgePartitionCollection(Arrays.asList(new ShareAcknowledgeRequestData.AcknowledgePartition()
+        .setPartitionIndex(0)
+        .setAcknowledgementBatches(shareBatches(1,1,1,1,1,1,1,1,1,1,1))).iterator()))).iterator())),
+        "{\"groupId\":\"share-group\",\"memberId\":\"share-member\",\"shareSessionEpoch\":1,\"isRenewAck\":false,\"topics\":[{\"topicId\":\"01020304-0506-0708-090a-0b0c0d0e0f10\",\"partitions\":[{\"partitionIndex\":0,\"acknowledgementBatches\":[{\"firstOffset\":\"9007199254740993\",\"lastOffset\":\"9007199254741003\",\"acknowledgeTypes\":[1]}]}]}]}"));
+    vectors.add(new Vector("shareAcknowledge","ShareAcknowledgeRequest",(short) 2,"uniform64",
+        new ShareAcknowledgeRequestData()
+        .setGroupId("share-group")
+        .setMemberId("share-member")
+        .setShareSessionEpoch(1)
+        .setIsRenewAck(false)
+        .setTopics(new ShareAcknowledgeRequestData.AcknowledgeTopicCollection(Arrays.asList(new ShareAcknowledgeRequestData.AcknowledgeTopic()
+        .setTopicId(shareUuid("01020304-0506-0708-090a-0b0c0d0e0f10"))
+        .setPartitions(new ShareAcknowledgeRequestData.AcknowledgePartitionCollection(Arrays.asList(new ShareAcknowledgeRequestData.AcknowledgePartition()
+        .setPartitionIndex(0)
+        .setAcknowledgementBatches(shareBatches(1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1))).iterator()))).iterator())),
+        "{\"groupId\":\"share-group\",\"memberId\":\"share-member\",\"shareSessionEpoch\":1,\"isRenewAck\":false,\"topics\":[{\"topicId\":\"01020304-0506-0708-090a-0b0c0d0e0f10\",\"partitions\":[{\"partitionIndex\":0,\"acknowledgementBatches\":[{\"firstOffset\":\"9007199254740993\",\"lastOffset\":\"9007199254741056\",\"acknowledgeTypes\":[1]}]}]}]}"));
+    vectors.add(new Vector("shareAcknowledge","ShareAcknowledgeResponse",(short) 2,"mixed",
+        new ShareAcknowledgeResponseData()
+        .setThrottleTimeMs(29)
+        .setErrorCode((short) 0)
+        .setErrorMessage(null)
+        .setAcquisitionLockTimeoutMs(15000)
+        .setResponses(new ShareAcknowledgeResponseData.ShareAcknowledgeTopicResponseCollection(Arrays.asList(new ShareAcknowledgeResponseData.ShareAcknowledgeTopicResponse()
+        .setTopicId(shareUuid("01020304-0506-0708-090a-0b0c0d0e0f10"))
+        .setPartitions(Arrays.asList(new ShareAcknowledgeResponseData.PartitionData()
+        .setPartitionIndex(0)
+        .setErrorCode((short) 0)
+        .setErrorMessage(null)
+        .setCurrentLeader(new ShareAcknowledgeResponseData.LeaderIdAndEpoch()
+        .setLeaderId(2)
+        .setLeaderEpoch(2147483647)),new ShareAcknowledgeResponseData.PartitionData()
+        .setPartitionIndex(1)
+        .setErrorCode((short) 121)
+        .setErrorMessage("not held")
+        .setCurrentLeader(new ShareAcknowledgeResponseData.LeaderIdAndEpoch()
+        .setLeaderId(3)
+        .setLeaderEpoch(8))))).iterator()))
+        .setNodeEndpoints(new ShareAcknowledgeResponseData.NodeEndpointCollection(Arrays.asList(new ShareAcknowledgeResponseData.NodeEndpoint()
+        .setNodeId(3)
+        .setHost("node-3")
+        .setPort(9093)
+        .setRack(null)).iterator())),
+        "{\"throttleTime\":29,\"errorCode\":0,\"errorMessage\":null,\"acquisitionLockTimeoutMs\":15000,\"responses\":[{\"topicId\":\"01020304-0506-0708-090a-0b0c0d0e0f10\",\"partitions\":[{\"partitionIndex\":0,\"errorCode\":0,\"errorMessage\":null,\"currentLeader\":{\"leaderId\":2,\"leaderEpoch\":2147483647}},{\"partitionIndex\":1,\"errorCode\":121,\"errorMessage\":\"not held\",\"currentLeader\":{\"leaderId\":3,\"leaderEpoch\":8}}]}],\"nodeEndpoints\":[{\"nodeId\":3,\"host\":\"node-3\",\"port\":9093,\"rack\":null}]}"));
+    vectors.add(new Vector("shareAcknowledge","ShareAcknowledgeResponse",(short) 2,"error",
+        new ShareAcknowledgeResponseData()
+        .setThrottleTimeMs(0)
+        .setErrorCode((short) 35)
+        .setErrorMessage(null)
+        .setAcquisitionLockTimeoutMs(15000)
+        .setResponses(new ShareAcknowledgeResponseData.ShareAcknowledgeTopicResponseCollection())
+        .setNodeEndpoints(new ShareAcknowledgeResponseData.NodeEndpointCollection()),
+        "{\"throttleTime\":0,\"errorCode\":35,\"errorMessage\":null,\"acquisitionLockTimeoutMs\":15000,\"responses\":[],\"nodeEndpoints\":[]}"));
+    vectors.add(new Vector("describeShareGroupOffsets","DescribeShareGroupOffsetsRequest",(short) 1,"nullTopics",
+        new DescribeShareGroupOffsetsRequestData()
+        .setGroups(Arrays.asList(new DescribeShareGroupOffsetsRequestData.DescribeShareGroupOffsetsRequestGroup()
+        .setGroupId("share-group")
+        .setTopics(null))),
+        "{\"groups\":[{\"groupId\":\"share-group\",\"topics\":null}]}"));
+    vectors.add(new Vector("describeShareGroupOffsets","DescribeShareGroupOffsetsRequest",(short) 1,"emptyTopics",
+        new DescribeShareGroupOffsetsRequestData()
+        .setGroups(Arrays.asList(new DescribeShareGroupOffsetsRequestData.DescribeShareGroupOffsetsRequestGroup()
+        .setGroupId("share-group")
+        .setTopics(Collections.emptyList()))),
+        "{\"groups\":[{\"groupId\":\"share-group\",\"topics\":[]}]}"));
+    vectors.add(new Vector("describeShareGroupOffsets","DescribeShareGroupOffsetsRequest",(short) 1,"namedTopics",
+        new DescribeShareGroupOffsetsRequestData()
+        .setGroups(Arrays.asList(new DescribeShareGroupOffsetsRequestData.DescribeShareGroupOffsetsRequestGroup()
+        .setGroupId("share-group")
+        .setTopics(Arrays.asList(new DescribeShareGroupOffsetsRequestData.DescribeShareGroupOffsetsRequestTopic()
+        .setTopicName("alpha")
+        .setPartitions(Arrays.asList(0,2)))))),
+        "{\"groups\":[{\"groupId\":\"share-group\",\"topics\":[{\"topicName\":\"alpha\",\"partitions\":[0,2]}]}]}"));
+    vectors.add(new Vector("describeShareGroupOffsets","DescribeShareGroupOffsetsResponse",(short) 1,"knownAndUnknownLag",
+        new DescribeShareGroupOffsetsResponseData()
+        .setThrottleTimeMs(31)
+        .setGroups(Arrays.asList(new DescribeShareGroupOffsetsResponseData.DescribeShareGroupOffsetsResponseGroup()
+        .setGroupId("share-group")
+        .setTopics(Arrays.asList(new DescribeShareGroupOffsetsResponseData.DescribeShareGroupOffsetsResponseTopic()
+        .setTopicName("alpha")
+        .setTopicId(shareUuid("01020304-0506-0708-090a-0b0c0d0e0f10"))
+        .setPartitions(Arrays.asList(new DescribeShareGroupOffsetsResponseData.DescribeShareGroupOffsetsResponsePartition()
+        .setPartitionIndex(0)
+        .setStartOffset(9007199254740993L)
+        .setLeaderEpoch(2147483647)
+        .setLag(9223372036854775807L)
+        .setErrorCode((short) 0)
+        .setErrorMessage(null),new DescribeShareGroupOffsetsResponseData.DescribeShareGroupOffsetsResponsePartition()
+        .setPartitionIndex(2)
+        .setStartOffset(9223372036854775807L)
+        .setLeaderEpoch(-1)
+        .setLag(-1L)
+        .setErrorCode((short) 29)
+        .setErrorMessage("denied")))))
+        .setErrorCode((short) 0)
+        .setErrorMessage(null),new DescribeShareGroupOffsetsResponseData.DescribeShareGroupOffsetsResponseGroup()
+        .setGroupId("absent")
+        .setTopics(Collections.emptyList())
+        .setErrorCode((short) 69)
+        .setErrorMessage("missing"))),
+        "{\"throttleTime\":31,\"groups\":[{\"groupId\":\"share-group\",\"topics\":[{\"topicName\":\"alpha\",\"topicId\":\"01020304-0506-0708-090a-0b0c0d0e0f10\",\"partitions\":[{\"partitionIndex\":0,\"startOffset\":\"9007199254740993\",\"leaderEpoch\":2147483647,\"lag\":\"9223372036854775807\",\"errorCode\":0,\"errorMessage\":null},{\"partitionIndex\":2,\"startOffset\":\"9223372036854775807\",\"leaderEpoch\":-1,\"lag\":\"-1\",\"errorCode\":29,\"errorMessage\":\"denied\"}]}],\"errorCode\":0,\"errorMessage\":null},{\"groupId\":\"absent\",\"topics\":[],\"errorCode\":69,\"errorMessage\":\"missing\"}]}"));
+    vectors.add(new Vector("alterShareGroupOffsets","AlterShareGroupOffsetsRequest",(short) 0,"offsets",
+        new AlterShareGroupOffsetsRequestData()
+        .setGroupId("share-group")
+        .setTopics(new AlterShareGroupOffsetsRequestData.AlterShareGroupOffsetsRequestTopicCollection(Arrays.asList(new AlterShareGroupOffsetsRequestData.AlterShareGroupOffsetsRequestTopic()
+        .setTopicName("alpha")
+        .setPartitions(Arrays.asList(new AlterShareGroupOffsetsRequestData.AlterShareGroupOffsetsRequestPartition()
+        .setPartitionIndex(0)
+        .setStartOffset(9007199254740993L),new AlterShareGroupOffsetsRequestData.AlterShareGroupOffsetsRequestPartition()
+        .setPartitionIndex(2)
+        .setStartOffset(9223372036854775807L)))).iterator())),
+        "{\"groupId\":\"share-group\",\"topics\":[{\"topicName\":\"alpha\",\"partitions\":[{\"partitionIndex\":0,\"startOffset\":\"9007199254740993\"},{\"partitionIndex\":2,\"startOffset\":\"9223372036854775807\"}]}]}"));
+    vectors.add(new Vector("alterShareGroupOffsets","AlterShareGroupOffsetsResponse",(short) 0,"mixed",
+        new AlterShareGroupOffsetsResponseData()
+        .setThrottleTimeMs(37)
+        .setErrorCode((short) 0)
+        .setErrorMessage(null)
+        .setResponses(new AlterShareGroupOffsetsResponseData.AlterShareGroupOffsetsResponseTopicCollection(Arrays.asList(new AlterShareGroupOffsetsResponseData.AlterShareGroupOffsetsResponseTopic()
+        .setTopicName("alpha")
+        .setTopicId(shareUuid("01020304-0506-0708-090a-0b0c0d0e0f10"))
+        .setPartitions(Arrays.asList(new AlterShareGroupOffsetsResponseData.AlterShareGroupOffsetsResponsePartition()
+        .setPartitionIndex(0)
+        .setErrorCode((short) 0)
+        .setErrorMessage(null),new AlterShareGroupOffsetsResponseData.AlterShareGroupOffsetsResponsePartition()
+        .setPartitionIndex(2)
+        .setErrorCode((short) 29)
+        .setErrorMessage("denied")))).iterator())),
+        "{\"throttleTime\":37,\"errorCode\":0,\"errorMessage\":null,\"responses\":[{\"topicName\":\"alpha\",\"topicId\":\"01020304-0506-0708-090a-0b0c0d0e0f10\",\"partitions\":[{\"partitionIndex\":0,\"errorCode\":0,\"errorMessage\":null},{\"partitionIndex\":2,\"errorCode\":29,\"errorMessage\":\"denied\"}]}]}"));
+    vectors.add(new Vector("alterShareGroupOffsets","AlterShareGroupOffsetsResponse",(short) 0,"error",
+        new AlterShareGroupOffsetsResponseData()
+        .setThrottleTimeMs(0)
+        .setErrorCode((short) 86)
+        .setErrorMessage("members remain")
+        .setResponses(new AlterShareGroupOffsetsResponseData.AlterShareGroupOffsetsResponseTopicCollection()),
+        "{\"throttleTime\":0,\"errorCode\":86,\"errorMessage\":\"members remain\",\"responses\":[]}"));
+    vectors.add(new Vector("deleteShareGroupOffsets","DeleteShareGroupOffsetsRequest",(short) 0,"topics",
+        new DeleteShareGroupOffsetsRequestData()
+        .setGroupId("share-group")
+        .setTopics(Arrays.asList(new DeleteShareGroupOffsetsRequestData.DeleteShareGroupOffsetsRequestTopic()
+        .setTopicName("alpha"),new DeleteShareGroupOffsetsRequestData.DeleteShareGroupOffsetsRequestTopic()
+        .setTopicName("\u03b2eta"))),
+        "{\"groupId\":\"share-group\",\"topics\":[{\"topicName\":\"alpha\"},{\"topicName\":\"\u03b2eta\"}]}"));
+    vectors.add(new Vector("deleteShareGroupOffsets","DeleteShareGroupOffsetsResponse",(short) 0,"mixed",
+        new DeleteShareGroupOffsetsResponseData()
+        .setThrottleTimeMs(41)
+        .setErrorCode((short) 0)
+        .setErrorMessage(null)
+        .setResponses(Arrays.asList(new DeleteShareGroupOffsetsResponseData.DeleteShareGroupOffsetsResponseTopic()
+        .setTopicName("alpha")
+        .setTopicId(shareUuid("01020304-0506-0708-090a-0b0c0d0e0f10"))
+        .setErrorCode((short) 0)
+        .setErrorMessage(null),new DeleteShareGroupOffsetsResponseData.DeleteShareGroupOffsetsResponseTopic()
+        .setTopicName("\u03b2eta")
+        .setTopicId(shareUuid("01020304-0506-0708-090a-0b0c0d0e0f10"))
+        .setErrorCode((short) 29)
+        .setErrorMessage("denied"))),
+        "{\"throttleTime\":41,\"errorCode\":0,\"errorMessage\":null,\"responses\":[{\"topicName\":\"alpha\",\"topicId\":\"01020304-0506-0708-090a-0b0c0d0e0f10\",\"errorCode\":0,\"errorMessage\":null},{\"topicName\":\"\u03b2eta\",\"topicId\":\"01020304-0506-0708-090a-0b0c0d0e0f10\",\"errorCode\":29,\"errorMessage\":\"denied\"}]}"));
+    vectors.add(new Vector("deleteShareGroupOffsets","DeleteShareGroupOffsetsResponse",(short) 0,"error",
+        new DeleteShareGroupOffsetsResponseData()
+        .setThrottleTimeMs(0)
+        .setErrorCode((short) 86)
+        .setErrorMessage(null)
+        .setResponses(Collections.emptyList()),
+        "{\"throttleTime\":0,\"errorCode\":86,\"errorMessage\":null,\"responses\":[]}"));
+    vectors.add(new Vector("shareGroupHeartbeat","ShareGroupHeartbeatResponse",(short) 1,"unknownTags",
+        shareTagged(new ShareGroupHeartbeatResponseData()
+        .setThrottleTimeMs(17)
+        .setErrorCode((short) 0)
+        .setErrorMessage(null)
+        .setMemberId("share-member")
+        .setMemberEpoch(2147483647)
+        .setHeartbeatIntervalMs(500)
+        .setAssignment(shareTagged(new ShareGroupHeartbeatResponseData.Assignment()
+        .setTopicPartitions(Arrays.asList(shareTagged(new ShareGroupHeartbeatResponseData.TopicPartitions()
+        .setTopicId(shareUuid("01020304-0506-0708-090a-0b0c0d0e0f10"))
+        .setPartitions(Arrays.asList(0,2)))))))),
+        "{\"throttleTime\":17,\"errorCode\":0,\"errorMessage\":null,\"memberId\":\"share-member\",\"memberEpoch\":2147483647,\"heartbeatIntervalMs\":500,\"assignment\":{\"topicPartitions\":[{\"topicId\":\"01020304-0506-0708-090a-0b0c0d0e0f10\",\"partitions\":[0,2]}]}}"));
+    vectors.add(new Vector("shareGroupDescribe","ShareGroupDescribeResponse",(short) 1,"unknownTags",
+        shareTagged(new ShareGroupDescribeResponseData()
+        .setThrottleTimeMs(19)
+        .setGroups(Arrays.asList(shareTagged(new ShareGroupDescribeResponseData.DescribedGroup()
+        .setErrorCode((short) 0)
+        .setErrorMessage(null)
+        .setGroupId("share-group")
+        .setGroupState("Stable")
+        .setGroupEpoch(2147483647)
+        .setAssignmentEpoch(9)
+        .setAssignorName("simple")
+        .setMembers(Arrays.asList(shareTagged(new ShareGroupDescribeResponseData.Member()
+        .setMemberId("share-member")
+        .setRackId(null)
+        .setMemberEpoch(8)
+        .setClientId("client-a")
+        .setClientHost("/127.0.0.1")
+        .setSubscribedTopicNames(Arrays.asList("alpha","\u03b2eta"))
+        .setAssignment(shareTagged(new ShareGroupDescribeResponseData.Assignment()
+        .setTopicPartitions(Arrays.asList(shareTagged(new ShareGroupDescribeResponseData.TopicPartitions()
+        .setTopicId(shareUuid("01020304-0506-0708-090a-0b0c0d0e0f10"))
+        .setTopicName("alpha")
+        .setPartitions(Arrays.asList(0,2))))))))))
+        .setAuthorizedOperations(-2147483647)),shareTagged(new ShareGroupDescribeResponseData.DescribedGroup()
+        .setErrorCode((short) 69)
+        .setErrorMessage("missing")
+        .setGroupId("absent")
+        .setGroupState("")
+        .setGroupEpoch(0)
+        .setAssignmentEpoch(0)
+        .setAssignorName("")
+        .setMembers(Collections.emptyList())
+        .setAuthorizedOperations(-2147483648))))),
+        "{\"throttleTime\":19,\"groups\":[{\"errorCode\":0,\"errorMessage\":null,\"groupId\":\"share-group\",\"groupState\":\"Stable\",\"groupEpoch\":2147483647,\"assignmentEpoch\":9,\"assignorName\":\"simple\",\"members\":[{\"memberId\":\"share-member\",\"rackId\":null,\"memberEpoch\":8,\"clientId\":\"client-a\",\"clientHost\":\"/127.0.0.1\",\"subscribedTopicNames\":[\"alpha\",\"\u03b2eta\"],\"assignment\":{\"topicPartitions\":[{\"topicId\":\"01020304-0506-0708-090a-0b0c0d0e0f10\",\"topicName\":\"alpha\",\"partitions\":[0,2]}]}}],\"authorizedOperations\":-2147483647},{\"errorCode\":69,\"errorMessage\":\"missing\",\"groupId\":\"absent\",\"groupState\":\"\",\"groupEpoch\":0,\"assignmentEpoch\":0,\"assignorName\":\"\",\"members\":[],\"authorizedOperations\":-2147483648}]}"));
+    vectors.add(new Vector("shareFetch","ShareFetchResponse",(short) 2,"unknownTags",
+        shareTagged(new ShareFetchResponseData()
+        .setThrottleTimeMs(23)
+        .setErrorCode((short) 0)
+        .setErrorMessage(null)
+        .setAcquisitionLockTimeoutMs(15000)
+        .setResponses(new ShareFetchResponseData.ShareFetchableTopicResponseCollection(Arrays.asList(shareTagged(new ShareFetchResponseData.ShareFetchableTopicResponse()
+        .setTopicId(shareUuid("01020304-0506-0708-090a-0b0c0d0e0f10"))
+        .setPartitions(Arrays.asList(shareTagged(new ShareFetchResponseData.PartitionData()
+        .setPartitionIndex(0)
+        .setErrorCode((short) 0)
+        .setErrorMessage(null)
+        .setAcknowledgeErrorCode((short) 0)
+        .setAcknowledgeErrorMessage(null)
+        .setCurrentLeader(shareTagged(new ShareFetchResponseData.LeaderIdAndEpoch()
+        .setLeaderId(2)
+        .setLeaderEpoch(2147483647)))
+        .setRecords(shareRecords())
+        .setAcquiredRecords(Arrays.asList(shareTagged(new ShareFetchResponseData.AcquiredRecords()
+        .setFirstOffset(9007199254740993L)
+        .setLastOffset(9007199254740995L)
+        .setDeliveryCount((short) 2)),shareTagged(new ShareFetchResponseData.AcquiredRecords()
+        .setFirstOffset(9223372036854775807L)
+        .setLastOffset(9223372036854775807L)
+        .setDeliveryCount((short) 32767))))),shareTagged(new ShareFetchResponseData.PartitionData()
+        .setPartitionIndex(1)
+        .setErrorCode((short) 6)
+        .setErrorMessage("moved")
+        .setAcknowledgeErrorCode((short) 121)
+        .setAcknowledgeErrorMessage("not held")
+        .setCurrentLeader(shareTagged(new ShareFetchResponseData.LeaderIdAndEpoch()
+        .setLeaderId(3)
+        .setLeaderEpoch(12)))
+        .setRecords(org.apache.kafka.common.record.internal.MemoryRecords.EMPTY)
+        .setAcquiredRecords(Collections.emptyList())))))).iterator()))
+        .setNodeEndpoints(new ShareFetchResponseData.NodeEndpointCollection(Arrays.asList(shareTagged(new ShareFetchResponseData.NodeEndpoint()
+        .setNodeId(2)
+        .setHost("localhost")
+        .setPort(9092)
+        .setRack(null)),shareTagged(new ShareFetchResponseData.NodeEndpoint()
+        .setNodeId(3)
+        .setHost("node-3")
+        .setPort(9093)
+        .setRack("rack-b"))).iterator()))),
+        "{\"throttleTime\":23,\"errorCode\":0,\"errorMessage\":null,\"acquisitionLockTimeoutMs\":15000,\"responses\":[{\"topicId\":\"01020304-0506-0708-090a-0b0c0d0e0f10\",\"partitions\":[{\"partitionIndex\":0,\"errorCode\":0,\"errorMessage\":null,\"acknowledgeErrorCode\":0,\"acknowledgeErrorMessage\":null,\"currentLeader\":{\"leaderId\":2,\"leaderEpoch\":2147483647},\"acquiredRecords\":[{\"firstOffset\":\"9007199254740993\",\"lastOffset\":\"9007199254740995\",\"deliveryCount\":2},{\"firstOffset\":\"9223372036854775807\",\"lastOffset\":\"9223372036854775807\",\"deliveryCount\":32767}],\"messages\":[{\"offset\":\"9007199254740993\",\"timestamp\":\"1700000000000\",\"key\":\"6b\",\"value\":\"76\",\"headers\":{}}]},{\"partitionIndex\":1,\"errorCode\":6,\"errorMessage\":\"moved\",\"acknowledgeErrorCode\":121,\"acknowledgeErrorMessage\":\"not held\",\"currentLeader\":{\"leaderId\":3,\"leaderEpoch\":12},\"acquiredRecords\":[],\"messages\":[]}]}],\"nodeEndpoints\":[{\"nodeId\":2,\"host\":\"localhost\",\"port\":9092,\"rack\":null},{\"nodeId\":3,\"host\":\"node-3\",\"port\":9093,\"rack\":\"rack-b\"}]}"));
+    vectors.add(new Vector("shareAcknowledge","ShareAcknowledgeResponse",(short) 2,"unknownTags",
+        shareTagged(new ShareAcknowledgeResponseData()
+        .setThrottleTimeMs(29)
+        .setErrorCode((short) 0)
+        .setErrorMessage(null)
+        .setAcquisitionLockTimeoutMs(15000)
+        .setResponses(new ShareAcknowledgeResponseData.ShareAcknowledgeTopicResponseCollection(Arrays.asList(shareTagged(new ShareAcknowledgeResponseData.ShareAcknowledgeTopicResponse()
+        .setTopicId(shareUuid("01020304-0506-0708-090a-0b0c0d0e0f10"))
+        .setPartitions(Arrays.asList(shareTagged(new ShareAcknowledgeResponseData.PartitionData()
+        .setPartitionIndex(0)
+        .setErrorCode((short) 0)
+        .setErrorMessage(null)
+        .setCurrentLeader(shareTagged(new ShareAcknowledgeResponseData.LeaderIdAndEpoch()
+        .setLeaderId(2)
+        .setLeaderEpoch(2147483647)))),shareTagged(new ShareAcknowledgeResponseData.PartitionData()
+        .setPartitionIndex(1)
+        .setErrorCode((short) 121)
+        .setErrorMessage("not held")
+        .setCurrentLeader(shareTagged(new ShareAcknowledgeResponseData.LeaderIdAndEpoch()
+        .setLeaderId(3)
+        .setLeaderEpoch(8)))))))).iterator()))
+        .setNodeEndpoints(new ShareAcknowledgeResponseData.NodeEndpointCollection(Arrays.asList(shareTagged(new ShareAcknowledgeResponseData.NodeEndpoint()
+        .setNodeId(3)
+        .setHost("node-3")
+        .setPort(9093)
+        .setRack(null))).iterator()))),
+        "{\"throttleTime\":29,\"errorCode\":0,\"errorMessage\":null,\"acquisitionLockTimeoutMs\":15000,\"responses\":[{\"topicId\":\"01020304-0506-0708-090a-0b0c0d0e0f10\",\"partitions\":[{\"partitionIndex\":0,\"errorCode\":0,\"errorMessage\":null,\"currentLeader\":{\"leaderId\":2,\"leaderEpoch\":2147483647}},{\"partitionIndex\":1,\"errorCode\":121,\"errorMessage\":\"not held\",\"currentLeader\":{\"leaderId\":3,\"leaderEpoch\":8}}]}],\"nodeEndpoints\":[{\"nodeId\":3,\"host\":\"node-3\",\"port\":9093,\"rack\":null}]}"));
+    vectors.add(new Vector("describeShareGroupOffsets","DescribeShareGroupOffsetsResponse",(short) 1,"unknownTags",
+        shareTagged(new DescribeShareGroupOffsetsResponseData()
+        .setThrottleTimeMs(31)
+        .setGroups(Arrays.asList(shareTagged(new DescribeShareGroupOffsetsResponseData.DescribeShareGroupOffsetsResponseGroup()
+        .setGroupId("share-group")
+        .setTopics(Arrays.asList(shareTagged(new DescribeShareGroupOffsetsResponseData.DescribeShareGroupOffsetsResponseTopic()
+        .setTopicName("alpha")
+        .setTopicId(shareUuid("01020304-0506-0708-090a-0b0c0d0e0f10"))
+        .setPartitions(Arrays.asList(shareTagged(new DescribeShareGroupOffsetsResponseData.DescribeShareGroupOffsetsResponsePartition()
+        .setPartitionIndex(0)
+        .setStartOffset(9007199254740993L)
+        .setLeaderEpoch(2147483647)
+        .setLag(9223372036854775807L)
+        .setErrorCode((short) 0)
+        .setErrorMessage(null)),shareTagged(new DescribeShareGroupOffsetsResponseData.DescribeShareGroupOffsetsResponsePartition()
+        .setPartitionIndex(2)
+        .setStartOffset(9223372036854775807L)
+        .setLeaderEpoch(-1)
+        .setLag(-1L)
+        .setErrorCode((short) 29)
+        .setErrorMessage("denied")))))))
+        .setErrorCode((short) 0)
+        .setErrorMessage(null)),shareTagged(new DescribeShareGroupOffsetsResponseData.DescribeShareGroupOffsetsResponseGroup()
+        .setGroupId("absent")
+        .setTopics(Collections.emptyList())
+        .setErrorCode((short) 69)
+        .setErrorMessage("missing"))))),
+        "{\"throttleTime\":31,\"groups\":[{\"groupId\":\"share-group\",\"topics\":[{\"topicName\":\"alpha\",\"topicId\":\"01020304-0506-0708-090a-0b0c0d0e0f10\",\"partitions\":[{\"partitionIndex\":0,\"startOffset\":\"9007199254740993\",\"leaderEpoch\":2147483647,\"lag\":\"9223372036854775807\",\"errorCode\":0,\"errorMessage\":null},{\"partitionIndex\":2,\"startOffset\":\"9223372036854775807\",\"leaderEpoch\":-1,\"lag\":\"-1\",\"errorCode\":29,\"errorMessage\":\"denied\"}]}],\"errorCode\":0,\"errorMessage\":null},{\"groupId\":\"absent\",\"topics\":[],\"errorCode\":69,\"errorMessage\":\"missing\"}]}"));
+    vectors.add(new Vector("alterShareGroupOffsets","AlterShareGroupOffsetsResponse",(short) 0,"unknownTags",
+        shareTagged(new AlterShareGroupOffsetsResponseData()
+        .setThrottleTimeMs(37)
+        .setErrorCode((short) 0)
+        .setErrorMessage(null)
+        .setResponses(new AlterShareGroupOffsetsResponseData.AlterShareGroupOffsetsResponseTopicCollection(Arrays.asList(shareTagged(new AlterShareGroupOffsetsResponseData.AlterShareGroupOffsetsResponseTopic()
+        .setTopicName("alpha")
+        .setTopicId(shareUuid("01020304-0506-0708-090a-0b0c0d0e0f10"))
+        .setPartitions(Arrays.asList(shareTagged(new AlterShareGroupOffsetsResponseData.AlterShareGroupOffsetsResponsePartition()
+        .setPartitionIndex(0)
+        .setErrorCode((short) 0)
+        .setErrorMessage(null)),shareTagged(new AlterShareGroupOffsetsResponseData.AlterShareGroupOffsetsResponsePartition()
+        .setPartitionIndex(2)
+        .setErrorCode((short) 29)
+        .setErrorMessage("denied")))))).iterator()))),
+        "{\"throttleTime\":37,\"errorCode\":0,\"errorMessage\":null,\"responses\":[{\"topicName\":\"alpha\",\"topicId\":\"01020304-0506-0708-090a-0b0c0d0e0f10\",\"partitions\":[{\"partitionIndex\":0,\"errorCode\":0,\"errorMessage\":null},{\"partitionIndex\":2,\"errorCode\":29,\"errorMessage\":\"denied\"}]}]}"));
+    vectors.add(new Vector("deleteShareGroupOffsets","DeleteShareGroupOffsetsResponse",(short) 0,"unknownTags",
+        shareTagged(new DeleteShareGroupOffsetsResponseData()
+        .setThrottleTimeMs(41)
+        .setErrorCode((short) 0)
+        .setErrorMessage(null)
+        .setResponses(Arrays.asList(shareTagged(new DeleteShareGroupOffsetsResponseData.DeleteShareGroupOffsetsResponseTopic()
+        .setTopicName("alpha")
+        .setTopicId(shareUuid("01020304-0506-0708-090a-0b0c0d0e0f10"))
+        .setErrorCode((short) 0)
+        .setErrorMessage(null)),shareTagged(new DeleteShareGroupOffsetsResponseData.DeleteShareGroupOffsetsResponseTopic()
+        .setTopicName("\u03b2eta")
+        .setTopicId(shareUuid("01020304-0506-0708-090a-0b0c0d0e0f10"))
+        .setErrorCode((short) 29)
+        .setErrorMessage("denied"))))),
+        "{\"throttleTime\":41,\"errorCode\":0,\"errorMessage\":null,\"responses\":[{\"topicName\":\"alpha\",\"topicId\":\"01020304-0506-0708-090a-0b0c0d0e0f10\",\"errorCode\":0,\"errorMessage\":null},{\"topicName\":\"\u03b2eta\",\"topicId\":\"01020304-0506-0708-090a-0b0c0d0e0f10\",\"errorCode\":29,\"errorMessage\":\"denied\"}]}"));
+    return vectors;
+  }
+  /** @param value canonical UUID @return Kafka UUID with the same raw bits */
+  private static Uuid shareUuid(String value) {
+    UUID uuid = UUID.fromString(value);
+    return new Uuid(uuid.getMostSignificantBits(), uuid.getLeastSignificantBits());
+  }
+  /** @param data message or nested structure @param <T> message type @return data with one unknown tag */
+  private static <T extends Message> T shareTagged(T data) {
+    data.unknownTaggedFields().add(new org.apache.kafka.common.protocol.types.RawTaggedField(10, new byte[] {97}));
+    return data;
+  }
+  /** @return a single uncompressed record at an offset beyond Number's safe integer range */
+  private static org.apache.kafka.common.record.internal.MemoryRecords shareRecords() {
+    return org.apache.kafka.common.record.internal.MemoryRecords.withRecords(
+        9007199254740993L, org.apache.kafka.common.compress.Compression.NONE,
+        new org.apache.kafka.common.record.internal.SimpleRecord(1700000000000L, new byte[] {107}, new byte[] {118}));
+  }
+  /** @param types per-offset acknowledgements @return the release client's compact batch representation */
+  private static List<ShareAcknowledgeRequestData.AcknowledgementBatch> shareBatches(int... types) {
+    org.apache.kafka.clients.consumer.internals.Acknowledgements acknowledgements =
+        org.apache.kafka.clients.consumer.internals.Acknowledgements.empty();
+    for (int index = 0; index < types.length; index++) {
+      acknowledgements.add(9007199254740993L + index,
+          org.apache.kafka.clients.consumer.AcknowledgeType.forId((byte) types[index]));
+    }
+    List<ShareAcknowledgeRequestData.AcknowledgementBatch> batches = new ArrayList<>();
+    for (org.apache.kafka.clients.consumer.internals.AcknowledgementBatch batch : acknowledgements.getAcknowledgementBatches()) {
+      batches.add(batch.toShareAcknowledgeRequest());
+    }
+    return batches;
+  }
 }

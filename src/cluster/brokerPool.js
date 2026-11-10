@@ -2,6 +2,7 @@ const {
   currentDeadline,
   checked,
   shareMetadata,
+  sharedSetup,
   retrierOf,
   withAdminGuard,
 } = require('../admin/deadline')
@@ -1175,13 +1176,16 @@ module.exports = class BrokerPool {
   }
 
   /**
+   * Tries brokers in shuffled order, skipping connection failures as well as callback failures.
+   * Other lookup failures propagate immediately. If no callback succeeds, the last connection
+   * failure is thrown if any broker failed to connect; otherwise returns null.
    * @public
    * @param {(params: { nodeId: string, broker: Broker }) => Promise<T>} callback
    * @param {object} [options]
    * @param {import('../producer/generation')} [options.fence] the producer lifecycle asking: once
    *   it closed, no further broker is tried
-   * @returns {Promise<T>}
-   * @throws {Error} the lifecycle's close error
+   * @returns {Promise<T|null>}
+   * @throws {Error} a lookup failure, the last connection failure or the lifecycle's close error
    * @template T
    */
   async withBroker(callback, { fence } = {}) {
@@ -1190,8 +1194,18 @@ module.exports = class BrokerPool {
       throw new KafkaJSBrokerNotFound('No brokers in the broker pool')
     }
 
+    let connectionError = null
     for (const nodeId of brokers) {
-      const broker = await this.findBroker({ nodeId, fence })
+      let broker
+      try {
+        broker = await this.findBroker({ nodeId, fence })
+      } catch (e) {
+        fence?.check()
+        checked(null)
+        if (!isConnectionFailure(e)) throw e
+        connectionError = e
+        continue
+      }
       try {
         return await callback({ nodeId, broker })
       } catch (e) {
@@ -1200,6 +1214,7 @@ module.exports = class BrokerPool {
       }
     }
 
+    if (connectionError) throw connectionError
     return null
   }
 
@@ -1377,7 +1392,8 @@ module.exports = class BrokerPool {
    * wrapper only guards a rejected promise, so an application listener that throws synchronously
    * would otherwise reject the shared `rebootstrap()` promise - and with it the metadata refresh
    * that triggered the rebootstrap, replacing the caller's original error with the listener's.
-   * A throw is logged and dropped instead.
+   * A throw is logged and dropped instead. Listener work does not belong to the publishing
+   * discovery's lifetime.
    *
    * @private
    * @param {string} eventName
@@ -1390,7 +1406,7 @@ module.exports = class BrokerPool {
     }
 
     try {
-      this.instrumentationEmitter.emit(eventName, payload)
+      sharedSetup(() => this.instrumentationEmitter.emit(eventName, payload))
     } catch (e) {
       this.logger.error('Instrumentation event listener threw, ignoring it', {
         eventName,

@@ -1,7 +1,8 @@
-const { Kafka, PartitionAssigners, logLevel } = require('../../../index')
+const { Kafka, PartitionAssigners } = require('../../../index')
 const { KafkaJSConnectionError } = require('../../errors')
 const createConsumer = require('../index')
 const Runner = require('../runner')
+const ClassicMembership = require('../groupProtocol/classic')
 const { createCluster, newLogger } = require('testHelpers')
 const {
   createScriptedCluster,
@@ -239,6 +240,62 @@ describe('Consumer > broker outages', () => {
     }
   )
 
+  it('recovers after a lost heartbeat when the skipped coordinator is refused and the surviving broker reports it unavailable', async () => {
+    jest.spyOn(Math, 'random').mockReturnValue(0)
+    const { cluster, breaker, events } = scenario()
+    await start(events)
+    await until(() => events.records.length === 1, 'the first record')
+
+    const heartbeat = cluster.schedule.hold({ api: 'Heartbeat', node: COORDINATOR })
+    await heartbeat.arrived()
+    let unavailable = true
+    cluster.answer('FindCoordinator', ({ coordinatorKeys }) => ({
+      coordinators: coordinatorKeys.map((key) => ({
+        key,
+        nodeId: COORDINATOR,
+        host: NODES[COORDINATOR].host,
+        port: NODES[COORDINATOR].port,
+        errorCode: unavailable ? 15 : 0,
+        errorMessage: null,
+      })),
+    }))
+    const outageAt = cluster.requests().length
+    breaker.take(COORDINATOR, 'refused')
+    heartbeat.release()
+    await until(
+      () =>
+        wire(cluster, 'FindCoordinator', outageAt).some(
+          ({ node, answeredOrder }) => node === LEADER && answeredOrder !== undefined
+        ),
+      'an unavailable coordinator answer from the surviving broker'
+    )
+    await sleep(OUTAGE_MS)
+    const unavailableLookups = wire(cluster, 'FindCoordinator', outageAt).filter(
+      ({ node, answeredOrder }) => node === LEADER && answeredOrder !== undefined
+    )
+    const restoredAt = cluster.requests().length
+    unavailable = false
+    breaker.restore(COORDINATOR)
+    await until(
+      () =>
+        events.crashes.length > 0 ||
+        wire(cluster, 'Heartbeat', restoredAt).some(
+          ({ node, answeredOrder }) => node === COORDINATOR && answeredOrder !== undefined
+        ),
+      'a heartbeat answered after coordinator restoration or a crash'
+    )
+
+    expect(events.crashes).toEqual([])
+    expect(unavailableLookups.length).toBeGreaterThan(0)
+    expect(
+      wire(cluster, 'Heartbeat', restoredAt).some(
+        ({ node, answeredOrder }) => node === COORDINATOR && answeredOrder !== undefined
+      )
+    ).toBe(true)
+    expect(wire(cluster, 'JoinGroup')).toHaveLength(1)
+    expect(events.rebalancing).toEqual([])
+  })
+
   it.each([['refused'], ['reset']])(
     'a coordinator %s at the first join costs no crash: the consumer joins once it is back',
     async (kind) => {
@@ -423,26 +480,26 @@ describe('Consumer > broker outages', () => {
         retry: { ...RETRY, restartOnFailure: async () => false },
       })
       endlessRecords(cluster)
-      // Only a heartbeat the handler awaits is answered, so the error always reaches the handler.
-      let handlerHeartbeating = false
-      let answered = 0
       let rethrown = 0
-      cluster.answer('Heartbeat', () => {
-        const moved = handlerHeartbeating && answered < 2
-        if (moved) answered++
-        return { errorCode: moved ? NOT_COORDINATOR : 0 }
-      })
       await start(events, {
         eachMessage: async ({ message, heartbeat }) => {
           events.records.push(message.offset)
-          handlerHeartbeating = true
           try {
-            await heartbeat()
+            if (rethrown < 2) {
+              const held = cluster.schedule.hold({ api: 'Heartbeat' })
+              await held.arrived()
+              // Share the pending wire request before releasing its answer: a fresh call can
+              // otherwise be throttled after an automatic heartbeat renews the interval.
+              const heartbeating = heartbeat()
+              held.release({ errorCode: NOT_COORDINATOR })
+              await heartbeating
+            } else {
+              await heartbeat()
+            }
           } catch (e) {
+            expect(e.code).toBe(NOT_COORDINATOR)
             rethrown++
             throw e
-          } finally {
-            handlerHeartbeating = false
           }
         },
       })
@@ -637,32 +694,216 @@ describe('Consumer > broker outages', () => {
     expect(restart).toBe(true)
   })
 
-  it('a disconnect after a heartbeat lost the coordinator sends no leave and looks for no coordinator', async () => {
-    const retry = { retries: 5, initialRetryTime: 300, maxRetryTime: 2000 }
-    const lines = []
-    const { cluster, breaker, events } = scenario(
-      { heartbeatInterval: 1000, sessionTimeout: 6000, retry },
-      { retry, logLevel: logLevel.DEBUG, logCreator: () => (entry) => lines.push(entry) },
-      { batches: 0 }
-    )
-    const held = cluster.schedule.hold({ api: 'Heartbeat' })
-    await start(events)
-    await held.arrived()
-    breaker.take(COORDINATOR, 'refused')
-    await until(
-      () => lines.some(({ log }) => /Background heartbeat failed/.test(log.message)),
-      'the heartbeat that lost the coordinator'
-    )
+  it.each([
+    ['coordinator first', 0],
+    ['leader first', 0.99],
+  ])(
+    'a disconnect after a heartbeat lost the coordinator sends no leave and looks for no coordinator (%s)',
+    async (_order, random) => {
+      jest.spyOn(Math, 'random').mockReturnValue(random)
+      const retry = { retries: 5, initialRetryTime: 300, maxRetryTime: 2000 }
+      let heartbeatFailure
+      const heartbeat = ClassicMembership.prototype.heartbeat
+      jest
+        .spyOn(ClassicMembership.prototype, 'heartbeat')
+        .mockImplementation(async function (options) {
+          try {
+            return await heartbeat.call(this, options)
+          } catch (error) {
+            heartbeatFailure ??= error
+            throw error
+          }
+        })
+      const { cluster, breaker, events } = scenario(
+        { heartbeatInterval: 1000, sessionTimeout: 6000, retry },
+        { retry },
+        { batches: 0 }
+      )
+      const held = cluster.schedule.hold({ api: 'Heartbeat' })
+      await start(events)
+      // Make a Fetch straddle the stop: its late empty result must not start a heartbeat
+      // (and a fresh coordinator lookup) after stop released the existing lookup waiters.
+      const fetch = cluster.schedule.hold({ api: 'Fetch', node: LEADER })
+      await fetch.arrived()
+      await held.arrived()
+      breaker.take(COORDINATOR, 'refused')
+      // Observe the real rejection before fetch-manager draining can delay its log behind a lookup.
+      await until(() => heartbeatFailure !== undefined, 'the heartbeat that lost the coordinator')
+      held.release()
 
-    const lostAt = cluster.requests().length
-    const disconnectedAt = performance.now()
-    await consumer.disconnect()
+      const lostAt = cluster.requests().length
+      const disconnectedAt = performance.now()
+      const disconnecting = consumer.disconnect()
+      fetch.release()
+      await disconnecting
 
-    expect(wire(cluster, 'FindCoordinator', lostAt)).toEqual([])
-    expect(wire(cluster, 'LeaveGroup', lostAt)).toEqual([])
-    expect(performance.now() - disconnectedAt).toBeLessThan(1000)
-    expect(events.crashes).toEqual([])
-  }, 20000)
+      expect(lostConnection(heartbeatFailure)).toBe(true)
+      expect(wire(cluster, 'FindCoordinator', lostAt)).toEqual([])
+      expect(wire(cluster, 'LeaveGroup', lostAt)).toEqual([])
+      expect(performance.now() - disconnectedAt).toBeLessThan(1000)
+      expect(events.crashes).toEqual([])
+    },
+    20000
+  )
+
+  it.each([
+    ['eachMessage', false],
+    ['eachBatch', false],
+    ['eachMessage', true],
+    ['eachBatch', true],
+  ])(
+    'a held %s returning after disconnect with autoCommit=%s sends no leave and looks for no coordinator',
+    async (mode, autoCommit) => {
+      jest.spyOn(Math, 'random').mockReturnValue(0.99)
+      const retry = { retries: 5, initialRetryTime: 300, maxRetryTime: 2000 }
+      let heartbeatFailure
+      const heartbeat = ClassicMembership.prototype.heartbeat
+      jest
+        .spyOn(ClassicMembership.prototype, 'heartbeat')
+        .mockImplementation(async function (options) {
+          try {
+            return await heartbeat.call(this, options)
+          } catch (error) {
+            heartbeatFailure ??= error
+            throw error
+          }
+        })
+      const { cluster, breaker, events } = scenario(
+        { heartbeatInterval: 1000, sessionTimeout: 6000, retry },
+        { retry }
+      )
+      let runner
+      const fetch = Runner.prototype.fetch
+      jest.spyOn(Runner.prototype, 'fetch').mockImplementation(function (nodeId) {
+        runner = this
+        return fetch.call(this, nodeId)
+      })
+      let releaseHandler
+      const heldHandler = new Promise((resolve) => (releaseHandler = resolve))
+      let handlerEntered = false
+      const handler = async () => {
+        // With auto-commit on, leave no eligible progress for a stop-time commit: those lookups
+        // are allowed. The regression isolates the heartbeat after this handler returns.
+        if (autoCommit) {
+          runner.consumerGroup.resolveOffset({ topic: TOPIC, partition: 0, offset: '0' })
+          await runner.autoCommitOffsets()
+        }
+        handlerEntered = true
+        await heldHandler
+      }
+      const heldHeartbeat = cluster.schedule.hold({ api: 'Heartbeat' })
+      await start(events, { autoCommit, eachMessage: undefined, [mode]: handler })
+      await until(() => handlerEntered, 'the held handler')
+      await heldHeartbeat.arrived()
+      breaker.take(COORDINATOR, 'refused')
+      await until(() => heartbeatFailure !== undefined, 'the heartbeat that lost the coordinator')
+      heldHeartbeat.release()
+
+      const lostAt = cluster.requests().length
+      const disconnectedAt = performance.now()
+      const disconnecting = consumer.disconnect()
+      releaseHandler()
+      await disconnecting
+
+      expect(lostConnection(heartbeatFailure)).toBe(true)
+      expect(wire(cluster, 'FindCoordinator', lostAt)).toEqual([])
+      expect(wire(cluster, 'LeaveGroup', lostAt)).toEqual([])
+      expect(wire(cluster, 'OffsetCommit')).toHaveLength(autoCommit ? 1 : 0)
+      expect(wire(cluster, 'OffsetCommit', lostAt)).toEqual([])
+      expect(performance.now() - disconnectedAt).toBeLessThan(1000)
+      expect(events.crashes).toEqual([])
+    },
+    20000
+  )
+
+  it.each(['classic', 'consumer'])(
+    'a %s stop-time final commit looks up a coordinator lost after stop, commits pending progress and then leaves',
+    async (groupProtocol) => {
+      const script = groupProtocol === 'classic' ? groupScript : consumerProtocolScript
+      const cluster = script(
+        createScriptedCluster({
+          nodes: NODES,
+          profile: groupProtocol === 'classic' ? 'default' : 'consumer',
+        }),
+        { coordinator: COORDINATOR, batches: 1 }
+      )
+      const breaker = outages(cluster)
+      consumer = new Kafka(cluster.kafkaOptions({ retry: RETRY })).consumer({
+        groupId: 'outage-group',
+        groupProtocol,
+        ...(groupProtocol === 'classic' && {
+          sessionTimeout: SESSION_TIMEOUT,
+          heartbeatInterval: 100,
+        }),
+        maxWaitTimeInMs: 20,
+        retry: RETRY,
+      })
+      const events = { crashes: [] }
+      consumer.on(consumer.events.CRASH, ({ payload }) => events.crashes.push(payload))
+      let runner
+      const fetch = Runner.prototype.fetch
+      jest.spyOn(Runner.prototype, 'fetch').mockImplementation(function (nodeId) {
+        runner = this
+        return fetch.call(this, nodeId)
+      })
+      let releaseHandler
+      const heldHandler = new Promise((resolve) => (releaseHandler = resolve))
+      let handlerEntered = false
+      await start(events, {
+        autoCommit: true,
+        eachBatchAutoResolve: false,
+        eachMessage: undefined,
+        eachBatch: async ({ batch, resolveOffset }) => {
+          resolveOffset(batch.lastOffset())
+          handlerEntered = true
+          await heldHandler
+        },
+      })
+      await until(() => handlerEntered, 'the handler with uncommitted progress')
+      expect(wire(cluster, 'OffsetCommit')).toEqual([])
+      expect(runner.consumerGroup.offsetManager.coordinator.isConnected()).toBe(true)
+
+      const disconnecting = consumer.disconnect()
+      let stoppedAt
+      try {
+        await until(() => runner.stopRequested, 'the latched stop')
+        stoppedAt = cluster.requests().length
+        // Only now lose the cached coordinator: ordinary heartbeats have stopped, but the
+        // eligible final commit must still discover a coordinator under the close's authority.
+        breaker.take(COORDINATOR, 'reset')
+        await until(
+          () => !runner.consumerGroup.offsetManager.coordinator.isConnected(),
+          'the disconnected coordinator after stop'
+        )
+        breaker.restore(COORDINATOR)
+      } finally {
+        releaseHandler()
+        await disconnecting
+      }
+
+      const leaveApi = groupProtocol === 'classic' ? 'LeaveGroup' : 'ConsumerGroupHeartbeat'
+      const closing = cluster
+        .requests()
+        .slice(stoppedAt)
+        .filter(({ api }) => ['FindCoordinator', 'OffsetCommit', leaveApi].includes(api))
+      expect(closing.map(({ api }) => api)).toEqual(['FindCoordinator', 'OffsetCommit', leaveApi])
+      const [lookup, commit, leave] = closing
+      expect(lookup.answeredOrder).toBeLessThan(commit.order)
+      expect(commit.answeredOrder).toBeLessThan(leave.order)
+      expect(commit.node).toBe(COORDINATOR)
+      expect(commit.fields).toMatchObject({
+        groupId: 'outage-group',
+        groupGenerationId: 1,
+        topics: [{ partitions: [{ partition: 0, offset: '1' }] }],
+      })
+      expect(leave.node).toBe(COORDINATOR)
+      if (groupProtocol === 'consumer') expect(leave.fields.memberEpoch).toBe(-1)
+      expect(leave.answeredOrder).toBeDefined()
+      expect(events.crashes).toEqual([])
+      consumer = undefined
+      cluster.assertClean()
+    }
+  )
 
   it('a stop while the first join rides out an outage ends the join without a crash', async () => {
     const { breaker, events } = scenario()

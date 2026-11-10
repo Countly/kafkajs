@@ -1,0 +1,146 @@
+{
+  "provenance": {
+    "source": "FG1 independent default-cluster broker captures",
+    "brokerVersion": "4.0.2",
+    "brokerCommitId": "5d0fe56677f97d95",
+    "imageDigest": "apache/kafka@sha256:836cafdad9f4825880d7cf1d5a21202915ae2527bd0ef1c3600c526ed7814d1f",
+    "captures": [
+      {
+        "file": "broker-api-versions.txt",
+        "sha256": "9f36ce07d2795c34b95c9a79f5910a30dd20a21c2def73e86a4afaacc0ebcc5a",
+        "capturedOn": "2026-10-18T11:38:24Z",
+        "howProduced": "kafka-broker-api-versions.sh --bootstrap-server kafka1:29092; project every supported numeric API key and both endpoints from the first broker; all three broker blocks agree; UNSUPPORTED entries are excluded."
+      },
+      {
+        "file": "wire-apiversions-v4.jsonl",
+        "sha256": "ed8bc6c59dc440ac868e20695ebd70f5a95812d37ac073b621cca16fbae3bdc6",
+        "capturedOn": "2026-10-18",
+        "howProduced": "First JSON line, preserved verbatim as an object, from standalone wire-features.js localhost 19092 (ApiVersions v4, built-in Node modules only, no client codec); run-wire-19092.log records the rerun on the capture date."
+      }
+    ]
+  },
+  "apiRanges": {
+    "0": [0, 12],
+    "1": [4, 17],
+    "2": [1, 10],
+    "3": [0, 13],
+    "8": [2, 9],
+    "9": [1, 9],
+    "10": [0, 6],
+    "11": [0, 9],
+    "12": [0, 4],
+    "13": [0, 5],
+    "14": [0, 5],
+    "15": [0, 6],
+    "16": [0, 5],
+    "17": [0, 1],
+    "18": [0, 4],
+    "19": [2, 7],
+    "20": [1, 6],
+    "21": [0, 2],
+    "22": [0, 5],
+    "23": [2, 4],
+    "24": [0, 5],
+    "25": [0, 4],
+    "26": [0, 5],
+    "27": [1, 1],
+    "28": [0, 5],
+    "29": [1, 3],
+    "30": [1, 3],
+    "31": [1, 3],
+    "32": [1, 4],
+    "33": [0, 2],
+    "34": [1, 2],
+    "35": [1, 4],
+    "36": [0, 2],
+    "37": [0, 3],
+    "38": [1, 3],
+    "39": [1, 2],
+    "40": [1, 2],
+    "41": [1, 3],
+    "42": [0, 2],
+    "43": [0, 2],
+    "44": [0, 1],
+    "45": [0, 0],
+    "46": [0, 0],
+    "47": [0, 0],
+    "48": [0, 1],
+    "49": [0, 1],
+    "50": [0, 0],
+    "51": [0, 0],
+    "55": [0, 2],
+    "57": [0, 2],
+    "60": [0, 2],
+    "61": [0, 0],
+    "64": [0, 0],
+    "65": [0, 0],
+    "66": [0, 1],
+    "68": [0, 1],
+    "69": [0, 1],
+    "74": [0, 0],
+    "75": [0, 0],
+    "80": [0, 0],
+    "81": [0, 0]
+  },
+  "features": {
+    "correlation": 1,
+    "errorCode": 0,
+    "apiKeyCount": 61,
+    "throttle": 0,
+    "shareApiRanges": {
+      "76": null,
+      "77": null,
+      "78": null,
+      "79": null,
+      "90": null,
+      "91": null,
+      "92": null
+    },
+    "supportedFeatures": [
+      {
+        "name": "group.version",
+        "min": 0,
+        "max": 1
+      },
+      {
+        "name": "kraft.version",
+        "min": 0,
+        "max": 1
+      },
+      {
+        "name": "metadata.version",
+        "min": 7,
+        "max": 25
+      },
+      {
+        "name": "transaction.version",
+        "min": 0,
+        "max": 2
+      },
+      {
+        "name": "eligible.leader.replicas.version",
+        "min": 0,
+        "max": 1
+      }
+    ],
+    "finalizedFeaturesEpoch": "25",
+    "finalizedFeatures": [
+      {
+        "name": "group.version",
+        "maxVersionLevel": 1,
+        "minVersionLevel": 1
+      },
+      {
+        "name": "transaction.version",
+        "maxVersionLevel": 2,
+        "minVersionLevel": 2
+      },
+      {
+        "name": "metadata.version",
+        "maxVersionLevel": 25,
+        "minVersionLevel": 25
+      }
+    ],
+    "tags": [0, 1, 2]
+  }
+}

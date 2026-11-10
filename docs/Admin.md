@@ -62,6 +62,10 @@ No file's presence proves a live run passed.
 | `deleteGroups` | apiTimeout | groups |
 | `removeMembersFromConsumerGroup` | apiTimeout, groupId, members, reason | groups |
 | `describeGroups` | apiTimeout, includeAuthorizedOperations | groups |
+| `describeShareGroups` | apiTimeout, includeAuthorizedOperations | groups |
+| `listShareGroupOffsets` | apiTimeout, groupId, topics | groups |
+| `alterShareGroupOffsets` | apiTimeout, groupId, topics | groups |
+| `deleteShareGroupOffsets` | apiTimeout, groupId, topics | groups |
 | `describeAcls` | apiTimeout, host, operation, permissionType, principal, resourceName, resourcePatternType, resourceType | ACLs |
 | `deleteAcls` | apiTimeout, filters | ACLs |
 | `createAcls` | acl, apiTimeout | ACLs |
@@ -92,7 +96,7 @@ live script below is a single owner even when it contains several cases or fixtu
 | metadata | src/protocol/requests/metadata/; src/protocol/requests/describeTopicPartitions/ | src/admin/__tests__/authorizedOperations.spec.js | src/admin/__tests__/describeTopicPartitionsAdmin.spec.js | test:e2e:admin-ledger |
 | ACLs | src/protocol/requests/describeAcls/; src/protocol/requests/createAcls/; src/protocol/requests/deleteAcls/ | src/admin/__tests__/aclResourceUser.spec.js | src/admin/__tests__/errorMessage.spec.js | test:e2e:admin-ledger |
 | configuration | src/protocol/requests/describeConfigs/; src/protocol/requests/alterConfigs/; src/protocol/requests/incrementalAlterConfigs/ | src/admin/__tests__/configRouting.spec.js | src/admin/__tests__/validateOnly.spec.js | test:e2e:admin-ledger |
-| groups | src/protocol/requests/describeGroups/; src/protocol/requests/listGroups/; src/protocol/requests/deleteGroups/; src/protocol/requests/leaveGroup/ | src/admin/__tests__/describeGroupsRouting.spec.js | src/admin/__tests__/adminGroupApis.spec.js | test:e2e:admin-ledger |
+| groups | src/protocol/requests/describeGroups/; src/protocol/requests/listGroups/; src/protocol/requests/deleteGroups/; src/protocol/requests/leaveGroup/; src/protocol/requests/shareGroupDescribe/; src/protocol/requests/describeShareGroupOffsets/; src/protocol/requests/alterShareGroupOffsets/; src/protocol/requests/deleteShareGroupOffsets/ | src/admin/__tests__/describeGroupsRouting.spec.js; src/admin/__tests__/shareGroups.spec.js | src/admin/__tests__/adminGroupApis.spec.js; src/admin/__tests__/shareGroups.spec.js | test:e2e:admin-ledger |
 | offsets | src/protocol/requests/offsetFetch/; src/protocol/requests/offsetCommit/; src/protocol/requests/offsetDelete/; src/protocol/requests/listOffsets/; src/protocol/requests/deleteRecords/ | src/admin/__tests__/fetchOffsetsIsolation.spec.js | src/admin/__tests__/fetchOffsetsForGroups.spec.js | test:e2e:admin-ledger |
 | offset specifications | src/protocol/requests/listOffsets/ | src/admin/__tests__/listOffsetsSpecs.spec.js | src/admin/__tests__/listOffsetsSpecs.spec.js | test:e2e:admin-tiered |
 | reassignment | src/protocol/requests/alterPartitionReassignments/; src/protocol/requests/listPartitionReassignments/ | src/admin/__tests__/alterPartitionReassignmentsV1.spec.js | src/admin/__tests__/alterPartitionReassignmentsV1.spec.js | test:e2e:admin-ledger |
@@ -109,7 +113,7 @@ live script below is a single owner even when it contains several cases or fixtu
 
 This inventory follows Apache Kafka 4.3.1 Admin, including deprecated aliases. Every method
 also has the inherited AbstractOptions timeout unless the row states an excluded or deferred
-surface. Share administration belongs to the consumer-group extension; Streams administration
+surface. Share administration is implemented; Streams administration
 and quorum/voter administration are excluded from this package. Client telemetry belongs to
 the telemetry extension; JVM metric registration has no JavaScript equivalent.
 
@@ -121,7 +125,7 @@ the telemetry extension; JVM metric registration has no JavaScript equivalent.
 | alterConsumerGroupOffsets | equivalent | setOffsets / resetOffsets | ordinary method fields and apiTimeout; no semantic option is silently dropped |
 | alterPartitionReassignments | implemented | alterPartitionReassignments | allowReplicationFactorChange; timeout |
 | alterReplicaLogDirs | implemented | alterReplicaLogDirs | replicas |
-| alterShareGroupOffsets | consumer groups | share-group administration belongs to its own extension | all options deferred with that surface |
+| alterShareGroupOffsets | implemented | alterShareGroupOffsets | group id; topic partitions with exact decimal offsets; apiTimeout; a partition error is data and a group error throws |
 | alterStreamsGroupOffsets | excluded | Streams-group administration excluded | not implemented |
 | alterUserScramCredentials | implemented | alterUserScramCredentials | upsertions; deletions; salt; iterations; mechanism |
 | clientInstanceId | telemetry | client telemetry or JVM-only metrics | not part of admin RPC parity |
@@ -134,8 +138,8 @@ the telemetry extension; JVM metric registration has no JavaScript equivalent.
 | deleteConsumerGroupOffsets | equivalent | deleteOffsets | ordinary method fields and apiTimeout; no semantic option is silently dropped |
 | deleteConsumerGroups | equivalent | deleteGroups | ordinary method fields and apiTimeout; no semantic option is silently dropped |
 | deleteRecords | equivalent | deleteTopicRecords | ordinary method fields and apiTimeout; no semantic option is silently dropped |
-| deleteShareGroupOffsets | consumer groups | share-group administration belongs to its own extension | all options deferred with that surface |
-| deleteShareGroups | consumer groups | share-group administration belongs to its own extension | all options deferred with that surface |
+| deleteShareGroupOffsets | implemented | deleteShareGroupOffsets | group id; topic names; apiTimeout; a topic error is data and a group error throws |
+| deleteShareGroups | equivalent | deleteGroups | no separate method; the existing call takes the group id and apiTimeout |
 | deleteStreamsGroupOffsets | excluded | Streams-group administration excluded | not implemented |
 | deleteStreamsGroups | excluded | Streams-group administration excluded | not implemented |
 | deleteTopics | implemented | deleteTopics | name or topic ID; retryOnQuotaViolation uses existing quota retry; timeoutMs maps to apiTimeout |
@@ -151,7 +155,7 @@ the telemetry extension; JVM metric registration has no JavaScript equivalent.
 | describeMetadataQuorum | excluded | quorum and voter administration excluded | not implemented |
 | describeProducers | implemented | describeProducers | brokerId; partitions |
 | describeReplicaLogDirs | implemented | describeReplicaLogDirs | replicas |
-| describeShareGroups | consumer groups | share-group administration belongs to its own extension | all options deferred with that surface |
+| describeShareGroups | implemented | describeShareGroups | group ids; includeAuthorizedOperations as a raw signed mask; apiTimeout; rows in caller order |
 | describeStreamsGroups | excluded | Streams-group administration excluded | not implemented |
 | describeTopics | equivalent | fetchTopicMetadata | includeAuthorizedOperations maps to includeTopicAuthorizedOperations; partitionSizeLimitPerResponse uses the internal responsePartitionLimit |
 | describeTransactions | implemented | describeTransactions | transactionalIds |
@@ -168,7 +172,7 @@ the telemetry extension; JVM metric registration has no JavaScript equivalent.
 | listGroups | implemented | listGroups | states; types |
 | listOffsets | equivalent | fetchTopicOffsets / fetchTopicOffsetsByTimestamp | earliest; latest; timestamp; maxTimestamp; earliestLocal; latestTiered; earliestPendingUpload; isolationLevel |
 | listPartitionReassignments | implemented | listPartitionReassignments | ordinary method fields and apiTimeout; no semantic option is silently dropped |
-| listShareGroupOffsets | consumer groups | share-group administration belongs to its own extension | all options deferred with that surface |
+| listShareGroupOffsets | implemented | listShareGroupOffsets | group id; optional topic partitions; apiTimeout; offsets and lag as decimal strings, unknown lag null |
 | listStreamsGroupOffsets | excluded | Streams-group administration excluded | not implemented |
 | listTopics | implemented | listTopics | listInternal: fetchTopicMetadata returns isInternal for caller filtering |
 | listTransactions | implemented | listTransactions | filterStates maps to states; filterProducerIds maps to producerIds; filterOnDuration maps to durationFilter; filterOnTransactionalIdPattern maps to transactionalIdPattern |
@@ -989,7 +993,7 @@ Errors are reported per group id, not per call:
 - A coordinator that is loading or has moved is retried on the configured retry budget; a transport or coordinator error that outlives the budget still fails the call.
 - **Rows are not returned in the order you passed the ids in.** Match them by `groupId`.
 
-These calls model classic groups and KIP-848 consumer groups. A group id neither of those paths recognises falls back to `DescribeGroups`, so whatever that API answers for it is what you get, on a row carrying `groupType: 'classic'` because that is the API the row came from — against a 4.x broker expect a `Dead` row with `errorCode: 69` rather than a description. Share groups and streams groups are not modelled here and are not covered by these calls.
+These calls model classic groups and KIP-848 consumer groups. A group id neither of those paths recognises falls back to `DescribeGroups`, so whatever that API answers for it is what you get, on a row carrying `groupType: 'classic'` because that is the API the row came from — against a 4.x broker expect a `Dead` row with `errorCode: 69` rather than a description. Streams groups are not modelled here. Share groups have their own call, [`describeShareGroups`](#describe-share-groups); `describeGroups` with a share group id is not modelled either and returns whatever the broker answers for that id.
 Helper function to decode `memeberMetadata` and `memberAssignment` is available in `AssignerProtocol`
 
 Example: 
@@ -1038,6 +1042,122 @@ try {
 ```
 
 On brokers supporting DeleteGroups v3, each result includes `errorMessage: string | null`. Failed results in `KafkaJSDeleteGroupsError` retain the broker's per-group message. Older versions omit this optional field. The existing rejection and retry contracts are unchanged, except that a retry sends only the groups no coordinator has answered yet, so a group that was deleted is never sent again.
+
+## <a name="describe-share-groups"></a> Describe share groups
+
+Kafka 4.2+ share administration adds four methods. Each accepts the admin client's end-to-end `apiTimeout` budget (default 60000 ms). An unsupported API or version, or a disabled share feature, rejects with `KafkaJSShareGroupsNotSupportedError`. A local timeout after transmission leaves a mutation's remote outcome unknown.
+
+```javascript
+const { groups } = await admin.describeShareGroups(['orders-workers'], {
+  includeAuthorizedOperations: true,
+  apiTimeout: 10000,
+})
+```
+
+Groups are batched by group coordinator. Each group result contains `groupId`, `state`, `groupEpoch`, `assignmentEpoch`, `assignorName`, `members`, `errorCode`, `errorMessage` and `authorizedOperations`. Members contain `memberId`, `rackId`, `memberEpoch`, `clientId`, `clientHost`, `subscribedTopics` and `assignment`; each assignment names `topic`, `topicId` and `partitions`. A failure of one group stays on its own result beside the successful groups.
+
+Repeated ids share their work and produce fresh result snapshots in caller order, including repeated rows. `authorizedOperations` is a raw signed INT32 number that keeps unknown bits, or `null` when it was not requested or the broker sent the absent value. It is never converted to an array of operation names.
+
+## <a name="list-share-group-offsets"></a> List share group offsets
+
+```javascript
+const all = await admin.listShareGroupOffsets({ groupId: 'orders-workers' })
+const selected = await admin.listShareGroupOffsets({
+  groupId: 'orders-workers',
+  topics: [{ topic: 'orders', partitions: [0, 1] }],
+  apiTimeout: 10000,
+})
+```
+
+Omitting `topics` requests every topic the group has offsets for. An explicit empty array requests an empty selection. Results are arrays of `{ topic, topicId, partitions }`; partitions contain `partition`, a decimal-string `startOffset`, a numeric `leaderEpoch`, `lag`, `errorCode` and an optional `KafkaJSProtocolError`. Lag is a decimal string, or `null` when the broker reports it as unknown. Partition errors are data; a group-level error throws.
+
+## <a name="alter-share-group-offsets"></a> Alter share group offsets
+
+```javascript
+const altered = await admin.alterShareGroupOffsets({
+  groupId: 'orders-workers',
+  topics: [{ topic: 'orders', partitions: [{ partition: 0, offset: '8' }] }],
+  apiTimeout: 10000,
+})
+```
+
+The group must have no members. Every offset must be an exact non-negative decimal string within signed int64; the whole selection is checked before any lookup or request. Results are arrays of `{ topic, topicId, partitions: [{ partition, errorCode, error? }] }`. Partition failures are data and group failures throw. An earliest, latest or by-timestamp reset composes `fetchTopicOffsets` or `fetchTopicOffsetsByTimestamp` with this call.
+
+## <a name="delete-share-group-offsets"></a> Delete share group offsets
+
+```javascript
+const deleted = await admin.deleteShareGroupOffsets({
+  groupId: 'orders-workers',
+  topics: ['orders'],
+  apiTimeout: 10000,
+})
+```
+
+The group must no longer subscribe to the named topics. Results are arrays of `{ topic, topicId, errorCode, error? }`; topic failures are data and group failures throw. No `deleteShareGroups` method exists: delete a share group with [`deleteGroups`](#delete-groups). On a broker that offers DeleteGroups v3, each result carries the broker's `errorMessage`.
+
+Use describeShareGroups for share-group membership. The existing describeGroups call retains its generic-group behavior. Captured public outcomes (group ids normalized) are: Kafka 4.3.1, empty: {"kind":"return","value":{"groups":[{"groupId":"share-group","protocolType":"","protocol":"","state":"Dead","errorCode":69,"errorMessage":"Group share-group is not a consumer group.","groupType":"classic","groupEpoch":null,"assignmentEpoch":null,"assignorName":null,"authorizedOperations":null,"members":[]}]}}; Kafka 4.3.1, member-present: {"kind":"return","value":{"groups":[{"groupId":"share-group","protocolType":"","protocol":"","state":"Dead","errorCode":69,"errorMessage":"Group share-group is not a consumer group.","groupType":"classic","groupEpoch":null,"assignmentEpoch":null,"assignorName":null,"authorizedOperations":null,"members":[]}]}}; Kafka 4.4.0, empty: {"kind":"return","value":{"groups":[{"groupId":"share-group","protocolType":"","protocol":"","state":"Dead","errorCode":69,"errorMessage":"Group share-group is not a consumer group.","groupType":"classic","groupEpoch":null,"assignmentEpoch":null,"assignorName":null,"authorizedOperations":null,"members":[]}]}}; Kafka 4.4.0, member-present: {"kind":"return","value":{"groups":[{"groupId":"share-group","protocolType":"","protocol":"","state":"Dead","errorCode":69,"errorMessage":"Group share-group is not a consumer group.","groupType":"classic","groupEpoch":null,"assignmentEpoch":null,"assignorName":null,"authorizedOperations":null,"members":[]}]}}. These are captured broker/client results; they do not describe share membership. The fixture src/admin/__tests__/fixtures/describeGroupsShareGroup.json and its replay pin this behavior.
+
+## <a name="reset-share-group-offsets"></a> Reset an empty share group's offsets
+
+Stop every group member before altering offsets. Compose `fetchTopicOffsets` with `alterShareGroupOffsets` for earliest/latest, or `fetchTopicOffsetsByTimestamp` with `alterShareGroupOffsets` for a timestamp. The existing timestamp lookup falls back to the partition's latest offset when the requested timestamp has no match. Offsets remain decimal strings, including values above Number.MAX_SAFE_INTEGER. This is an application recipe, not a new admin method, seek operation or atomic reset across calls. A member can rejoin between inspection and mutation; the broker's refusal remains authoritative. Group errors reject; inspect per-partition errors before treating a reset as successful. Do not automatically retry an unanswered mutation to infer its outcome.
+
+```javascript
+/**
+ * Resets one empty share group's selected topic using exact broker offsets.
+ * Stop all its members before calling; the broker enforces emptiness at mutation time.
+ * Each public call has its own admin deadline; this sequence is not atomic.
+ * @param {import('@countly/kafkajs').Admin} admin Connected admin client.
+ * @param {string} groupId Empty share group identifier.
+ * @param {string} topic Topic name.
+ * @param {'earliest'|'latest'|number} position Boundary or nonnegative epoch milliseconds.
+ * @returns {Promise<import('@countly/kafkajs').ShareGroupAlterOffsetsResult[]>} Per-partition results.
+ * @throws {Error} For invalid input, nonempty/missing group, invalid lookup or broker failure.
+ */
+async function resetShareOffsets(admin, groupId, topic, position) {
+  if (position !== 'earliest' && position !== 'latest' &&
+      (!Number.isSafeInteger(position) || position < 0)) {
+    throw new Error('Use earliest, latest or nonnegative epoch milliseconds')
+  }
+  const { groups } = await admin.describeShareGroups([groupId])
+  if (groups.length !== 1 || groups[0].groupId !== groupId ||
+      groups[0].errorCode !== 0 || groups[0].members.length !== 0) {
+    throw new Error('The share group must exist and have no members')
+  }
+  const rows = typeof position === 'number'
+    ? await admin.fetchTopicOffsetsByTimestamp(topic, position)
+    : await admin.fetchTopicOffsets(topic)
+  const partitions = rows.map((row) => {
+    const offset = position === 'earliest' ? row.low :
+      position === 'latest' ? row.high : row.offset
+    if (typeof offset !== 'string' || !/^(0|[1-9][0-9]*)$/.test(offset) ||
+        BigInt(offset) > 9223372036854775807n) {
+      throw new Error('The offset lookup must return a nonnegative signed int64 string')
+    }
+    return { partition: row.partition, offset }
+  })
+  if (partitions.length === 0) throw new Error('The lookup returned no partitions')
+  const results = await admin.alterShareGroupOffsets({
+    groupId,
+    topics: [{ topic, partitions }],
+  })
+  for (const result of results) {
+    for (const partition of result.partitions) {
+      if (partition.errorCode !== 0) {
+        throw partition.error || new Error('The broker refused a partition reset')
+      }
+    }
+  }
+  return results
+}
+
+await resetShareOffsets(admin, 'orders-workers', 'orders', 'earliest')
+await resetShareOffsets(admin, 'orders-workers', 'orders', 'latest')
+await resetShareOffsets(admin, 'orders-workers', 'orders', 1700000000000)
+```
+
+## <a name="delete-share-group"></a> Delete an empty share group
+
+Use `await admin.deleteGroups(['orders-workers'])`; no `deleteShareGroups` alias is added. Stop all members first and inspect the real result. The offset deletion method has a different precondition: the group must no longer subscribe to the named topics. Use `describeShareGroups` for membership and share assignment fields.
 
 ## <a name="remove-members"></a> Remove members from a consumer group
 

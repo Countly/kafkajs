@@ -1052,13 +1052,30 @@ class AdminLedgerScenario {
       return resources.resources.some(({ name: key, type }) => key === resourceName && type === 16)
     })
     const metricsResourcePresent = true
-    const described = await p.invoke(() =>
-      admin.describeConfigs({
-        resources: [
-          { type: 16, name: resourceName, configNames: entries.map(({ name: key }) => key) },
-        ],
+    // Listing and config description can reach different brokers; wait for the values too.
+    let described
+    try {
+      await p.poll(async () => {
+        described = await p.invoke(() =>
+          admin.describeConfigs({
+            resources: [
+              { type: 16, name: resourceName, configNames: entries.map(({ name: key }) => key) },
+            ],
+          })
+        )
+        p.items(described.resources)
+        return entries.every(({ name, value }) =>
+          described.resources[0].configEntries.some(
+            ({ configName, configValue }) => configName === name && configValue === value
+          )
+        )
       })
-    )
+    } catch (error) {
+      throw new Error(
+        `Client metrics config readback for ${resourceName}: ${error.message}; last observation: ${JSON.stringify(described)}`,
+        { cause: error }
+      )
+    }
     p.items(described.resources)
     for (const entry of entries)
       expect(described.resources[0].configEntries).toContainEqual(

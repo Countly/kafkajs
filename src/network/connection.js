@@ -2,6 +2,7 @@ const { currentDeadline, sharedSetup } = require('../admin/deadline')
 const { isNativeError } = require('util').types
 const describeThrown = require('./describeThrown')
 const createSocket = require('./socket')
+const { detachSocket } = createSocket
 const createRequest = require('../protocol/request')
 const Decoder = require('../protocol/decoder')
 const { NETWORK_AUTHENTICATION_FAILURE } = require('./instrumentationEvents')
@@ -423,10 +424,10 @@ module.exports = class Connection {
 
       const onError = (e) => {
         if (!isCurrentAttempt()) return
-        const error = new KafkaJSConnectionError(`Connection error: ${e.message}`, {
-          broker: this.broker,
-          code: e.code,
-        })
+        const error = new KafkaJSConnectionError(
+          `Connection error: ${describeThrown(e) || e.code || 'Socket error'}`,
+          { broker: this.broker, code: e.code }
+        )
         const beforeHandshake = this.ssl && !this.isConnected() && e.code === 'ECONNRESET'
         this.failGeneration(error)
         try {
@@ -632,11 +633,7 @@ module.exports = class Connection {
     // `error` stays attached, inert once the attempt is over: a post-close error on the old socket
     // (e.g. ECONNRESET) must not become an uncaught exception.
     if (socket && !socket.destroyed) {
-      if (typeof socket.removeAllListeners === 'function') {
-        socket.removeAllListeners('data')
-        socket.removeAllListeners('end')
-        socket.removeAllListeners('timeout')
-      }
+      detachSocket(socket)
       socket.destroy()
     }
 

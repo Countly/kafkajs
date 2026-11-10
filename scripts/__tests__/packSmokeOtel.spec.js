@@ -18,7 +18,8 @@ describe('scripts/assertCleanTarball.sh', () => {
   })
 
   /**
-   * Packs a tarball whose entries sit under `package/`, as `npm pack` lays them out.
+   * Packs only the requested entries under `package/`, without implicit parent directories,
+   * as `npm pack` lays out shipped files.
    * @param {string[]} files paths below `package/`; one ending in `/` is an empty directory
    * @returns {string} the tarball's path
    */
@@ -35,7 +36,10 @@ describe('scripts/assertCleanTarball.sh', () => {
     }
 
     const tarball = `${stage}.tgz`
-    expect(spawnSync('tar', ['-czf', tarball, '-C', stage, 'package']).status).toBe(0)
+    expect(
+      spawnSync('tar', ['-czf', tarball, '-C', stage, ...files.map((file) => `package/${file}`)])
+        .status
+    ).toBe(0)
     return tarball
   }
 
@@ -47,7 +51,15 @@ describe('scripts/assertCleanTarball.sh', () => {
   const run = (...args) => spawnSync('bash', [SCRIPT, ...args], { encoding: 'utf8' })
 
   it('passes a tarball that holds only shipped files', () => {
-    const result = run(pack(['index.js', 'package.json', 'src/index.js', 'types/index.d.ts']))
+    const result = run(
+      pack([
+        'index.js',
+        'package.json',
+        'src/index.js',
+        'types/index.d.ts',
+        'docs/ShareConsumer.md',
+      ])
+    )
 
     expect(result.status).toBe(0)
     expect(result.stderr).toBe('')
@@ -69,7 +81,9 @@ describe('scripts/assertCleanTarball.sh', () => {
   })
 
   it('does not take a path that merely ends in otel for the sub-package', () => {
-    const result = run(pack(['src/hotel/index.js', 'src/otel/index.js', 'otel.js']))
+    const result = run(
+      pack(['src/hotel/index.js', 'src/otel/index.js', 'otel.js', 'docs/ShareConsumer.md'])
+    )
 
     expect(result.status).toBe(0)
   })

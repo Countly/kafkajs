@@ -1,0 +1,7 @@
+{
+  "message": "DeleteShareGroupOffsetsResponse",
+  "version": 0,
+  "case": "unknownTags",
+  "hex": "000000290000000306616c7068610102030405060708090a0b0c0d0e0f10000000010a016106ceb26574610102030405060708090a0b0c0d0e0f10001d0764656e696564010a0161010a0161",
+  "fields": {"throttleTime":41,"errorCode":0,"errorMessage":null,"responses":[{"topicName":"alpha","topicId":"01020304-0506-0708-090a-0b0c0d0e0f10","errorCode":0,"errorMessage":null},{"topicName":"βeta","topicId":"01020304-0506-0708-090a-0b0c0d0e0f10","errorCode":29,"errorMessage":"denied"}]}
+}

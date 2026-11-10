@@ -67,12 +67,22 @@ Gap classes: `current` (fork max equals the Kafka max) · `behind:N` · `stub` (
 | PushTelemetry | 72 | 0 | v0+ | — | not-planned | Client telemetry (KIP-714); deferred. |
 | ListConfigResources | 74 | 0-1 | v0+ | 0-1 | current | v0 is the old ListClientMetricsResources and lists only client-metrics resources; v1 adds a ResourceTypes filter (KIP-1142). |
 | DescribeTopicPartitions | 75 | 0 | v0+ | 0 | current | Paginated describe of topics by name, with topic ids and eligible leader replicas; v0 is the only version and every 4.x broker offers it. The ELR arrays are null unless the cluster tracks them. |
+| ShareGroupHeartbeat | 76 | 1 | v0+ | 1 | current (on-floor) | KIP-932 share group membership: joins, keeps and leaves a share group, sends the subscribed topic names and receives the partitions assigned to the member. v1 is the only version. |
+| ShareGroupDescribe | 77 | 1 | v0+ | 1 | current (on-floor) | Admin-side describe of share groups: state, epochs, members with their subscriptions and assignments, and authorized operations. v1 is the only version. |
+| ShareFetch | 78 | 1-2 | v0+ | 2 | current | Fetches records for a share group member and carries its acknowledgements; the response names the acquired offset ranges with their delivery counts. v2 is the only implemented version; v1 is not implemented. |
+| ShareAcknowledge | 79 | 1-2 | v0+ | 2 | current | Acknowledges the records a share group member acquired: accept, release, reject or renew. v2 is the only implemented version; v1 is not implemented. |
+| DescribeShareGroupOffsets | 90 | 0-1 | v0+ | 1 | current | Admin-side read of a share group's start offsets and lag; a null topic list asks for every topic the group has offsets for. v1 is the only implemented version; v0 is not implemented. |
+| AlterShareGroupOffsets | 91 | 0 | v0+ | 0 | current | Admin-side change of a share group's start offsets for the named topics and partitions. v0 is the only version. |
+| DeleteShareGroupOffsets | 92 | 0 | v0+ | 0 | current | Admin-side deletion of a share group's offsets for the named topics. v0 is the only version. |
 
 ## Floor watch
 
 These APIs implement exactly the minimum version the pinned broker still accepts. The next KIP-896 floor raise breaks them with no warning.
 
-None.
+| API | Key | Fork max | Kafka 4.4.0 minimum |
+|---|--:|--:|--:|
+| ShareGroupHeartbeat | 76 | v1 | v1 |
+| ShareGroupDescribe | 77 | v1 | v1 |
 
 ## Below-floor waivers
 

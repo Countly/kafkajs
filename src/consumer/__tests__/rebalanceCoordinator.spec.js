@@ -151,10 +151,11 @@ const build = ({
 /**
  * Cases 5, 6, 7, 8, 12, 13 and 18 need a REAL `Runner` around the coordinator, so they assert
  * through `runner.rebalanceCoordinator` - a real `Runner` builds its own, and it is a different
- * object from `build()`'s.
+ * object from `build()`'s. Model an active run without starting its fetch loop; startup cases
+ * opt out so they can exercise start() itself.
  */
 const realRunners = []
-const createRealRunner = (options = {}) => {
+const createRealRunner = ({ started = true, ...options } = {}) => {
   const Runner = require('../runner')
   const built = build(options)
 
@@ -185,6 +186,8 @@ const createRealRunner = (options = {}) => {
     onCrash: jest.fn(),
     onJoinComplete: options.onJoinComplete,
   })
+  // start() sets running before its first round. Heartbeats require that active-run state.
+  runner.running = started
 
   // Replacing a collaborator field on an instance is stubbing, not a production accessor added
   // for a test. BOTH references matter: the Runner constructor passed its own collaborators into
@@ -835,7 +838,7 @@ describe('Consumer > RebalanceCoordinator', () => {
 
   describe('case 12: the first join of a run', () => {
     it('runs with running already true and emits GROUP_JOIN without REBALANCING', async () => {
-      const { runner, consumerGroup, emitted, calls } = createRealRunner()
+      const { runner, consumerGroup, emitted, calls } = createRealRunner({ started: false })
       let runningDuringJoin = null
       consumerGroup.joinAndSync.mockImplementation(async () => {
         calls.push('joinAndSync')
@@ -857,7 +860,7 @@ describe('Consumer > RebalanceCoordinator', () => {
     })
 
     it('reverts running to false and crashes when the initial round throws', async () => {
-      const { runner, consumerGroup } = createRealRunner()
+      const { runner, consumerGroup } = createRealRunner({ started: false })
       const boom = new Error('join failed')
       consumerGroup.joinAndSync.mockRejectedValue(boom)
       runner.scheduleFetchManager = jest.fn()
@@ -1349,7 +1352,7 @@ describe('Consumer > RebalanceCoordinator', () => {
 
     it('is handed to the coordinator a real Runner builds', async () => {
       const onJoinComplete = jest.fn()
-      const { runner, calls } = createRealRunner({ onJoinComplete })
+      const { runner, calls } = createRealRunner({ onJoinComplete, started: false })
       onJoinComplete.mockImplementation(() => calls.push('onJoinComplete'))
       runner.scheduleFetchManager = jest.fn()
 
@@ -1654,7 +1657,7 @@ describe('Consumer > RebalanceCoordinator', () => {
       jest.useFakeTimers()
 
       try {
-        const { runner, consumerGroup, realHeartbeatManager } = createRealRunner()
+        const { runner, consumerGroup, realHeartbeatManager } = createRealRunner({ started: false })
         // The manager the Runner built, so `start()`'s own re-arm is what is under test.
         runner.heartbeatManager = realHeartbeatManager
         runner.rebalanceCoordinator.heartbeatManager = realHeartbeatManager
@@ -1696,6 +1699,7 @@ describe('Consumer > RebalanceCoordinator', () => {
       try {
         const { runner, consumerGroup, realHeartbeatManager } = createRealRunner({
           mode: COOPERATIVE,
+          started: false,
         })
         // The manager the Runner built, so the crash path's own cleanup is what is under test.
         runner.heartbeatManager = realHeartbeatManager

@@ -19,6 +19,22 @@ const REQUEST_TIMED_OUT = 7
 const silentLogger = () => createLogger({ level: LEVELS.NOTHING, logCreator: () => () => {} })
 
 describe('Producer > deliveryTimeout', () => {
+  const producers = []
+
+  beforeEach(() => {
+    // Delivery deadlines read Date.now(); CPU load must not spend the test's retry budget.
+    jest.useFakeTimers({ now: 0, doNotFake: ['nextTick', 'setImmediate'] })
+  })
+
+  afterEach(async () => {
+    try {
+      await jest.runAllTimersAsync()
+      await Promise.all(producers.splice(0).map((producer) => producer.disconnect()))
+    } finally {
+      jest.useRealTimers()
+    }
+  })
+
   describe('validation at kafka.producer()', () => {
     beforeEach(() => {
       Cluster.mockImplementation((options) => createFakeCluster({ options }))
@@ -143,7 +159,8 @@ describe('Producer > deliveryTimeout', () => {
         retry,
         deliveryTimeout,
       })
-      return { producer, lastErrors }
+      producers.push(producer)
+      return { producer, cluster, lastErrors }
     }
 
     test('a send that keeps failing rejects with KafkaJSDeliveryTimeout once the deadline passes', async () => {
@@ -152,26 +169,58 @@ describe('Producer > deliveryTimeout', () => {
         retry: { retries: 1000, initialRetryTime: 10, maxRetryTime: 20 },
       })
       await producer.connect()
-      const started = Date.now()
+      const sent = producer.send({ topic: TOPIC, messages: MESSAGES }).catch((e) => e)
 
-      const error = await producer.send({ topic: TOPIC, messages: MESSAGES }).catch((e) => e)
+      await jest.advanceTimersByTimeAsync(50)
+      expect(lastErrors.length).toBeGreaterThan(1)
+      await jest.advanceTimersByTimeAsync(50)
+      const error = await sent
 
       expect(error).toBeInstanceOf(KafkaJSDeliveryTimeout)
       expect(error.category).toEqual('abortable')
       expect(error.cause).toBe(lastErrors[lastErrors.length - 1])
       expect(error.cause).toMatchObject({ code: REQUEST_TIMED_OUT })
-      expect(Date.now() - started).toBeLessThan(1000)
+    })
+
+    test('a deadline that passes before the first Produce rejects unsent without a cause', async () => {
+      const { producer, cluster, lastErrors } = failingProducer({
+        deliveryTimeout: 100,
+        retry: { retries: 1000, initialRetryTime: 10, maxRetryTime: 20 },
+      })
+      // Keep metadata pending beyond expiry, without creating a preceding failure as a cause.
+      cluster.addMultipleTargetTopics.mockImplementationOnce(
+        () => new Promise((resolve) => setTimeout(resolve, 200))
+      )
+      await producer.connect()
+      const sent = producer.send({ topic: TOPIC, messages: MESSAGES }).catch((e) => e)
+
+      await jest.advanceTimersByTimeAsync(100)
+      const error = await sent
+
+      expect(error).toBeInstanceOf(KafkaJSDeliveryTimeout)
+      expect(error).toMatchObject({ category: 'abortable', outcome: 'unsent' })
+      expect(error.cause).toBeUndefined()
+      expect(lastErrors).toEqual([])
+      expect(cluster.broker.produce).not.toHaveBeenCalled()
+
+      // A late metadata answer must not start a Produce after the send has expired.
+      await jest.advanceTimersByTimeAsync(100)
+      expect(cluster.broker.produce).not.toHaveBeenCalled()
     })
 
     test('without deliveryTimeout, a deadline set as retry.maxTotalTime still bounds the send', async () => {
-      const { producer } = failingProducer({
+      const { producer, lastErrors } = failingProducer({
         retry: { retries: 1000, initialRetryTime: 10, maxRetryTime: 20, maxTotalTime: 100 },
       })
       await producer.connect()
 
-      await expect(producer.send({ topic: TOPIC, messages: MESSAGES })).rejects.toThrow(
-        KafkaJSDeliveryTimeout
-      )
+      const sent = producer.send({ topic: TOPIC, messages: MESSAGES }).catch((e) => e)
+
+      await jest.advanceTimersByTimeAsync(50)
+      expect(lastErrors.length).toBeGreaterThan(1)
+      await jest.advanceTimersByTimeAsync(50)
+
+      expect(await sent).toBeInstanceOf(KafkaJSDeliveryTimeout)
     })
 
     test('retries exhausted before the deadline still reject with KafkaJSNumberOfRetriesExceeded', async () => {
@@ -181,9 +230,11 @@ describe('Producer > deliveryTimeout', () => {
       })
       await producer.connect()
 
-      await expect(producer.send({ topic: TOPIC, messages: MESSAGES })).rejects.toThrow(
-        KafkaJSNumberOfRetriesExceeded
-      )
+      const sent = producer.send({ topic: TOPIC, messages: MESSAGES }).catch((e) => e)
+
+      await jest.advanceTimersByTimeAsync(100)
+
+      expect(await sent).toBeInstanceOf(KafkaJSNumberOfRetriesExceeded)
     })
   })
 
@@ -202,12 +253,12 @@ describe('Producer > deliveryTimeout', () => {
       requestTimeout: 1,
       retry: { retries: 100, initialRetryTime: 10, maxRetryTime: 20, maxTotalTime: 60000 },
     }).producer({ deliveryTimeout: 100 })
+    producers.push(producer)
     await producer.connect()
-    const started = Date.now()
+    const sent = producer.send({ topic: TOPIC, messages: MESSAGES }).catch((e) => e)
 
-    const error = await producer.send({ topic: TOPIC, messages: MESSAGES }).catch((e) => e)
+    await jest.advanceTimersByTimeAsync(100)
 
-    expect(error).toBeInstanceOf(KafkaJSDeliveryTimeout)
-    expect(Date.now() - started).toBeLessThan(1000)
+    expect(await sent).toBeInstanceOf(KafkaJSDeliveryTimeout)
   })
 })

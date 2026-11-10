@@ -322,6 +322,14 @@ describe('the five category classes', () => {
 describe('every error class this package exports carries an own, enumerable category', () => {
   // Constructor arguments for the classes that need more than a message.
   const ARGUMENTS = {
+    KafkaJSShareAcknowledgementError: () => [
+      'not confirmed',
+      { reason: 'session-lost', topic: 'topic', partition: 0, ranges: [] },
+    ],
+    KafkaJSShareGroupsNotSupportedError: () => [
+      'unsupported',
+      { apiKey: 78, apiName: 'ShareFetch', reason: 'api-version-range' },
+    ],
     KafkaJSOffsetOutOfRange: () => [createErrorFromCode(1), { topic: 'topic', partition: 0 }],
     KafkaJSMemberIdRequired: () => [createErrorFromCode(79), { memberId: 'member' }],
     KafkaJSNumberOfRetriesExceeded: () => [
@@ -1000,4 +1008,95 @@ test('create-topic detail does not replace the protocol message', () => {
   expect(error.message).toBe(source.message)
   expect(error.errorMessage).toBe('broker detail')
   expect(new KafkaJSCreateTopicError(source, 't').errorMessage).toBeNull()
+})
+
+describe('share capability errors', () => {
+  test.each(['api-not-advertised', 'api-version-range', 'feature-disabled', 'refused-by-broker'])(
+    'preserves the unsupported API contract for %s',
+    (reason) => {
+      const error = new errors.KafkaJSShareGroupsNotSupportedError(
+        'ShareFetch client [2,2], broker [1,1]',
+        { apiKey: 78, apiName: 'ShareFetch', reason, shareVersion: 0 }
+      )
+
+      expect(error).toBeInstanceOf(errors.KafkaJSServerDoesNotSupportApiKey)
+      expect(error).toBeInstanceOf(errors.KafkaJSNonRetriableError)
+      expect(error).toMatchObject({
+        name: 'KafkaJSShareGroupsNotSupportedError',
+        reason,
+        apiKey: 78,
+        apiName: 'ShareFetch',
+        shareVersion: 0,
+        retriable: false,
+      })
+      expect(error.message).toContain('client [2,2], broker [1,1]')
+      expect(packageEntry.KafkaJSShareGroupsNotSupportedError).toBe(
+        errors.KafkaJSShareGroupsNotSupportedError
+      )
+    }
+  )
+
+  test('retains null when no feature level was reported', () => {
+    expect(
+      new errors.KafkaJSShareGroupsNotSupportedError('unsupported', {
+        apiKey: 76,
+        apiName: 'ShareGroupHeartbeat',
+        reason: 'api-not-advertised',
+      }).shareVersion
+    ).toBeNull()
+  })
+})
+
+describe('compact share acknowledgement errors', () => {
+  test.each([
+    'unacknowledged',
+    'session-lost',
+    'membership-lost',
+    'not-sent',
+    'rejected-by-broker',
+  ])('preserves exact compact failure metadata for %s', (reason) => {
+    const cause = createErrorFromCode(121)
+    const ranges = [{ firstOffset: '9007199254740993', lastOffset: '9223372036854775807' }]
+    const error = new errors.KafkaJSShareAcknowledgementError('not confirmed', {
+      reason,
+      topic: '__proto__',
+      partition: 1,
+      ranges,
+      cause,
+    })
+    expect(error).toBeInstanceOf(KafkaJSError)
+    expect(error).not.toBeInstanceOf(KafkaJSProtocolError)
+    expect(error).toMatchObject({
+      name: 'KafkaJSShareAcknowledgementError',
+      reason,
+      retriable: false,
+      topic: '__proto__',
+      partition: 1,
+      ranges,
+    })
+    expect(error.cause).toBe(cause)
+    expect(error.category).toBe(cause.category)
+    expect(Object.prototype.propertyIsEnumerable.call(error, 'category')).toBe(true)
+    expect(error.ranges).not.toBe(ranges)
+    expect(error.ranges[0]).not.toBe(ranges[0])
+    expect(packageEntry.KafkaJSShareAcknowledgementError).toBe(
+      errors.KafkaJSShareAcknowledgementError
+    )
+    expect(JSON.stringify(error).length).toBeLessThan(1000)
+  })
+  test('copies Error diagnostics and compact ranges without enumerating the interval', () => {
+    const source = new Error('lost response')
+    const ranges = [{ firstOffset: '0', lastOffset: '999999' }]
+    const error = new errors.KafkaJSShareAcknowledgementError(source, {
+      reason: 'session-lost',
+      topic: 'topic',
+      partition: 0,
+      ranges,
+    })
+    ranges[0].firstOffset = '1'
+    expect(error.message).toBe('lost response')
+    expect(error.ranges).toEqual([{ firstOffset: '0', lastOffset: '999999' }])
+    expect(error.retriable).toBe(false)
+    expect(error.category).toBe('applicationRecoverable')
+  })
 })

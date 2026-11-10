@@ -1,0 +1,7 @@
+{
+  "message": "ShareAcknowledgeResponse",
+  "version": 2,
+  "case": "error",
+  "hex": "0000000000230000003a98010100",
+  "fields": {"throttleTime":0,"errorCode":35,"errorMessage":null,"acquisitionLockTimeoutMs":15000,"responses":[],"nodeEndpoints":[]}
+}

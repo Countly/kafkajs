@@ -2,6 +2,8 @@ const MetadataCache = require('../metadataCache')
 const BrokerPool = require('../brokerPool')
 const Cluster = require('../index')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
+const RequestQueue = require('../../network/requestQueue')
+const { currentDeadline, shareMetadata } = require('../../admin/deadline')
 const { CLUSTER_TOPIC_RECREATED } = require('../instrumentationEvents')
 const { newLogger } = require('testHelpers')
 
@@ -626,6 +628,71 @@ describe('Cluster > MetadataCache > routing change notifications', () => {
     const unsubscribe = cache.onRoutingChange(listener)
     return { cache, listener, unsubscribe }
   }
+
+  it.each(['routing', 'topic recreation'])(
+    'keeps work started by a %s listener independent of the metadata discovery',
+    async (notification) => {
+      const emitter = new InstrumentationEventEmitter()
+      const cache = new MetadataCache({ logger: newLogger(), instrumentationEmitter: emitter })
+      cache.update(response())
+      const queue = new RequestQueue({
+        maxInFlightRequests: 1,
+        requestTimeout: 1000,
+        enforceRequestTimeout: false,
+        clientId: 'metadata-listener',
+        broker: 'localhost:9092',
+        logger: newLogger(),
+      })
+      const sendRequest = jest.fn()
+      let resume
+      const gate = new Promise((resolve) => {
+        resume = resolve
+      })
+      let request
+      let listenerScope
+      /** @returns {void} Starts an independent request, held until after discovery completes. */
+      const listener = () => {
+        listenerScope = currentDeadline()
+        request = gate.then(
+          () =>
+            new Promise((resolve, reject) => {
+              queue.push({
+                entry: { correlationId: 1, resolve, reject },
+                expectResponse: false,
+                sendRequest,
+              })
+            })
+        )
+      }
+      const unsubscribe =
+        notification === 'routing'
+          ? cache.onRoutingChange(listener)
+          : emitter.addListener(CLUSTER_TOPIC_RECREATED, listener)
+      let discovery
+      const shared = shareMetadata(async () => {
+        discovery = currentDeadline()
+        cache.update(response({ topicId: ID_B, leader: 2, leaderEpoch: 6 }))
+        expect(currentDeadline()).toBe(discovery)
+        discovery.check()
+      })
+
+      try {
+        await shared()
+        expect(discovery.guard()).toMatchObject({ message: 'Metadata discovery completed' })
+        expect(request).toBeDefined()
+        resume()
+        await expect(request).resolves.toMatchObject({ size: 0, payload: null })
+        expect(sendRequest).toHaveBeenCalledTimes(1)
+        expect(listenerScope).toBeUndefined()
+        expect(queue.isIdle()).toBe(true)
+      } finally {
+        resume()
+        await request?.catch(() => {})
+        unsubscribe()
+        queue.destroy()
+      }
+    }
+  )
 
   it('notifies once per accepted install, after the cache holds the new leader', () => {
     const { cache, listener } = build()

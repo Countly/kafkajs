@@ -10,7 +10,9 @@ const {
   respondWithFrame,
   readRequestHeader,
 } = require('testHelpers')
-const { CloseRig, TOPIC, gate, pause, until } = require('./fixtures/closeRig')
+const { CloseRig, TOPIC, gate, pause } = require('./fixtures/closeRig')
+const { pump } = require('./fixtures/lifecycleCase')
+const { useSharedFakeClock } = require('./fixtures/sharedFakeClock')
 const {
   TOPIC: HARNESS_TOPIC,
   NEW_ID,
@@ -23,38 +25,98 @@ const BOUND_MS = 500
 const CELL = { topic: TOPIC, partition: 0 }
 const bounded = { maxTotalTime: BOUND_MS }
 
+/**
+ * Proves the call stays pending until its original monotonic deadline, then expires exactly there.
+ * @param {Promise<unknown>} promise the bounded call, with any rejection already observed
+ * @param {number} startedAt performance.now() at entry
+ * @param {number} [boundMs] the original budget
+ * @returns {Promise<void>}
+ */
+const expectAtOriginalDeadline = async (promise, startedAt, boundMs = BOUND_MS) => {
+  let settled = false
+  const result = promise.then(
+    (value) => {
+      settled = true
+      return value
+    },
+    (error) => {
+      settled = true
+      return error
+    }
+  )
+  await jest.advanceTimersByTimeAsync(boundMs - 1 - (performance.now() - startedAt))
+  expect(settled).toBe(false)
+  await jest.advanceTimersByTimeAsync(1)
+  expect(settled).toBe(true)
+  expect(await result).toBeInstanceOf(KafkaJSDeliveryTimeout)
+  expect(performance.now() - startedAt).toBe(boundMs)
+}
+
+/**
+ * @template T
+ * @param {Promise<T>} promise work driven by fake timers and real socket turns
+ * @param {string} label the completion being awaited
+ * @returns {Promise<T>} the work's result
+ */
+const drive = async (promise, label) => {
+  let outcome
+  promise.then(
+    (value) => {
+      outcome = { value }
+    },
+    (error) => {
+      outcome = { error }
+    }
+  )
+  await pump(() => outcome !== undefined, label)
+  if ('error' in outcome) throw outcome.error
+  return outcome.value
+}
+
 describe.each([true, false])(
   'a public API call under request timeout enforcement %p',
   (enforce) => {
     /** @type {CloseRig} */
     let rig
+    beforeEach(() => {
+      // API budgets and the imported perf_hooks clock must advance only when the test asks.
+      useSharedFakeClock()
+    })
     /** @param {object} [options] rig options @returns {Promise<void>} a fresh rig, read as `rig` */
     const open = async (options) => {
       rig = await CloseRig.open({ enforce, retry: bounded, ...options })
     }
     afterEach(async () => {
-      await rig.dispose()
+      try {
+        if (rig) await drive(rig.dispose(), 'the rig to dispose')
+      } finally {
+        rig = null
+        jest.useRealTimers()
+        jest.restoreAllMocks()
+      }
     })
 
     describe('whose first coordinator lookup is held', () => {
       test('commitOffsets settles at its deadline and sends nothing once the lookup answers', async () => {
         await open()
         const lookup = rig.lookup()
-        const { consumer } = await rig.started({ run: { autoCommit: false } })
+        const { consumer } = await drive(
+          rig.started({ run: { autoCommit: false } }),
+          'the consumer to start'
+        )
         const committed = []
         consumer.on(consumer.events.COMMIT_OFFSETS, ({ payload }) => committed.push(payload))
         lookup.makeStale()
         const held = lookup.hold()
-        const startedAt = Date.now()
+        const startedAt = performance.now()
         const settled = consumer
           .commitOffsets([{ topic: TOPIC, partition: 0, offset: '2' }])
           .catch((error) => error)
-        await held.entered
-        expect(await settled).toBeInstanceOf(KafkaJSDeliveryTimeout)
-        expect(Date.now() - startedAt).toBeGreaterThanOrEqual(BOUND_MS - 50)
-        expect(Date.now() - startedAt).toBeLessThan(BOUND_MS + 1500)
+        await drive(held.entered, 'the held coordinator lookup')
+        await expectAtOriginalDeadline(settled, startedAt)
+        const answering = lookup.spy.mock.results.at(-1).value
         held.release()
-        await pause(150)
+        await drive(answering, 'the late coordinator lookup to answer')
         expect(rig.frames('OffsetCommit')).toHaveLength(0)
         expect(committed).toEqual([])
       })
@@ -62,84 +124,91 @@ describe.each([true, false])(
       test('position settles at its deadline and applies nothing once the lookup answers', async () => {
         await open()
         const lookup = rig.lookup()
-        const { consumer } = await rig.started()
-        const before = await consumer.position(CELL)
+        const { consumer } = await drive(rig.started(), 'the consumer to start')
+        const before = await drive(consumer.position(CELL), 'the initial position')
         const committed = []
         consumer.on(consumer.events.COMMIT_OFFSETS, ({ payload }) => committed.push(payload))
         const commitsBefore = rig.frames('OffsetCommit').length
         lookup.makeStale()
         const held = lookup.hold()
         consumer.seek({ ...CELL, offset: '1' })
+        const startedAt = performance.now()
         const settled = consumer.position(CELL).catch((error) => error)
-        await held.entered
-        expect(await settled).toBeInstanceOf(KafkaJSDeliveryTimeout)
+        await drive(held.entered, 'the held coordinator lookup')
+        await expectAtOriginalDeadline(settled, startedAt)
+        const answering = lookup.spy.mock.results.at(-1).value
         held.release()
-        await pause(150)
+        await drive(answering, 'the late coordinator lookup to answer')
         expect(rig.frames('OffsetCommit')).toHaveLength(commitsBefore)
         expect(committed).toEqual([])
-        expect(await consumer.position(CELL)).toBe(before)
+        expect(await drive(consumer.position(CELL), 'the unchanged position')).toBe(before)
       })
 
       test('committed settles at its deadline and reads nothing once the lookup answers', async () => {
         await open()
         const consumer = rig.consumer()
-        await consumer.connect()
-        const held = rig.lookup().hold()
+        await drive(consumer.connect(), 'the consumer to connect')
+        const lookup = rig.lookup()
+        const held = lookup.hold()
+        const startedAt = performance.now()
         const settled = consumer.committed([CELL]).catch((error) => error)
-        await held.entered
-        expect(await settled).toBeInstanceOf(KafkaJSDeliveryTimeout)
+        await drive(held.entered, 'the held coordinator lookup')
+        await expectAtOriginalDeadline(settled, startedAt)
+        const answering = lookup.spy.mock.results.at(-1).value
         held.release()
-        await pause(150)
+        await drive(answering, 'the late coordinator lookup to answer')
         expect(rig.frames('OffsetFetch')).toHaveLength(0)
       })
     })
 
     describe('whose one deadline spans the lookup, its retry and the response', () => {
-      /**
-       * @param {number} spent ms the early stages take in all
-       * @param {number} startedAt when the call began
-       * @returns {void}
-       */
-      const expectAtOriginalDeadline = (spent, startedAt) => {
-        const elapsed = Date.now() - startedAt
-        expect(elapsed).toBeGreaterThanOrEqual(BOUND_MS - 50)
-        expect(elapsed).toBeLessThan(BOUND_MS + spent * 0.75)
-      }
-
       test('committed expires at the entry deadline, not a new duration from the final stage', async () => {
         await open()
         const consumer = rig.consumer()
-        await consumer.connect()
+        await drive(consumer.connect(), 'the consumer to connect')
         const lookup = rig.lookup()
         lookup.failAfter(150)
         lookup.answerAfter(150)
         const response = rig.hold('OffsetFetch')
-        const startedAt = Date.now()
-        await expect(consumer.committed([CELL])).rejects.toBeInstanceOf(KafkaJSDeliveryTimeout)
-        expectAtOriginalDeadline(300, startedAt)
+        const startedAt = performance.now()
+        const reading = consumer.committed([CELL]).catch((error) => error)
+        await pump(() => response.hits === 1, 'the held OffsetFetch response')
+        expect(lookup.calls).toHaveLength(2)
+        expect(performance.now() - startedAt).toBeGreaterThanOrEqual(300)
+        expect(performance.now() - startedAt).toBeLessThan(BOUND_MS)
+        await expectAtOriginalDeadline(reading, startedAt)
         expect(response.hits).toBe(1)
       })
 
       test('commitOffsets expires at the entry deadline, not a new duration from the final stage', async () => {
         await open()
         const lookup = rig.lookup()
-        const { consumer } = await rig.started({ run: { autoCommit: false } })
+        const { consumer } = await drive(
+          rig.started({ run: { autoCommit: false } }),
+          'the consumer to start'
+        )
         lookup.makeStale()
+        const lookupsBefore = lookup.calls.length
         lookup.failAfter(150)
         lookup.answerAfter(150)
         const response = rig.hold('OffsetCommit')
-        const startedAt = Date.now()
-        await expect(
-          consumer.commitOffsets([{ topic: TOPIC, partition: 0, offset: '2' }])
-        ).rejects.toBeInstanceOf(KafkaJSDeliveryTimeout)
-        expectAtOriginalDeadline(300, startedAt)
+        const startedAt = performance.now()
+        const committing = consumer
+          .commitOffsets([{ topic: TOPIC, partition: 0, offset: '2' }])
+          .catch((error) => error)
+        await pump(() => response.hits === 1, 'the held OffsetCommit response')
+        expect(response.hits).toBe(1)
+        expect(lookup.calls).toHaveLength(lookupsBefore + 2)
+        expect(performance.now() - startedAt).toBeGreaterThanOrEqual(300)
+        expect(performance.now() - startedAt).toBeLessThan(BOUND_MS)
+        await expectAtOriginalDeadline(committing, startedAt)
         expect(response.hits).toBe(1)
       })
 
       test('an unbounded call keeps waiting for the same held response', async () => {
         await open({ retry: { maxTotalTime: undefined } })
         const consumer = rig.consumer()
-        await consumer.connect()
+        await drive(consumer.connect(), 'the consumer to connect')
         const lookup = rig.lookup()
         lookup.failAfter(150)
         lookup.answerAfter(150)
@@ -149,17 +218,29 @@ describe.each([true, false])(
           settled = true
           return rows
         })
-        await until(() => response.hits === 1, 'the held response')
-        await pause(BOUND_MS + 100)
+        await pump(() => response.hits === 1, 'the held response')
+        await jest.advanceTimersByTimeAsync(BOUND_MS + 100)
         expect(settled).toBe(false)
         response.release()
-        await expect(reading).resolves.toEqual([{ ...CELL, offset: null, metadata: null }])
+        expect(await drive(reading, 'the unbounded response')).toEqual([
+          { ...CELL, offset: null, metadata: null },
+        ])
       })
     })
   }
 )
 
 describe('describeGroup under one operation spanning its stages', () => {
+  const operations = []
+  beforeEach(() => {
+    useSharedFakeClock()
+  })
+  afterEach(() => {
+    operations.splice(0).forEach((operation) => operation.finish())
+    jest.useRealTimers()
+    jest.restoreAllMocks()
+  })
+
   const unknown = { groups: [{ groupId: 'g', errorCode: 69, errorMessage: 'unknown' }] }
   const classic = {
     groups: [
@@ -201,20 +282,37 @@ describe('describeGroup under one operation spanning its stages', () => {
   test('expires at the original deadline while the fallback response is held', async () => {
     const { cluster, coordinator, response } = stages(100)
     const operation = new ConsumerOperation({ deadlineAt: performance.now() + BOUND_MS })
-    const startedAt = Date.now()
+    operations.push(operation)
+    const startedAt = performance.now()
+    const described = describer(cluster)
+      .describe(['g'], { operation })
+      .catch((error) => error)
+    await jest.advanceTimersByTimeAsync(200)
+    expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(1)
+    expect(coordinator.consumerGroupDescribe).toHaveBeenCalledTimes(1)
+    expect(coordinator.describeGroups).toHaveBeenCalledTimes(1)
+    await expectAtOriginalDeadline(described, startedAt)
+    response.resolve(classic)
+    await jest.advanceTimersByTimeAsync(0)
+    expect(await described).toBeInstanceOf(KafkaJSDeliveryTimeout)
+  })
+
+  test('expiry before the first lookup starts sends no request', async () => {
+    const { cluster, coordinator } = stages(100)
+    const operation = new ConsumerOperation({ deadlineAt: performance.now() + BOUND_MS })
+    operations.push(operation)
+    await jest.advanceTimersByTimeAsync(BOUND_MS)
+
     await expect(describer(cluster).describe(['g'], { operation })).rejects.toBeInstanceOf(
       KafkaJSDeliveryTimeout
     )
-    const elapsed = Date.now() - startedAt
-    expect(elapsed).toBeGreaterThanOrEqual(BOUND_MS - 50)
-    expect(elapsed).toBeLessThan(BOUND_MS + 200)
-    expect(coordinator.describeGroups).toHaveBeenCalledTimes(1)
-    response.resolve(classic)
-    operation.finish()
+    expect(cluster.findGroupCoordinator).not.toHaveBeenCalled()
+    expect(coordinator.consumerGroupDescribe).not.toHaveBeenCalled()
+    expect(coordinator.describeGroups).not.toHaveBeenCalled()
   })
 
   test('an ordinary admin call waits for the same held response', async () => {
-    const { cluster, response } = stages(100)
+    const { cluster, coordinator, response } = stages(100)
     let settled = false
     const described = describer(cluster)
       .describe(['g'])
@@ -222,7 +320,9 @@ describe('describeGroup under one operation spanning its stages', () => {
         settled = true
         return result
       })
-    await pause(BOUND_MS + 100)
+    await jest.advanceTimersByTimeAsync(200)
+    expect(coordinator.describeGroups).toHaveBeenCalledTimes(1)
+    await jest.advanceTimersByTimeAsync(BOUND_MS + 100)
     expect(settled).toBe(false)
     response.resolve(classic)
     expect((await described).groups).toHaveLength(1)
@@ -232,6 +332,17 @@ describe('describeGroup under one operation spanning its stages', () => {
 describe('position over a real offset manager and ledger', () => {
   const KEY = `${HARNESS_TOPIC}|0`
   const POSITION_CELL = { topic: HARNESS_TOPIC, partition: 0 }
+  const POSITION_BOUND_MS = 150
+  const operations = []
+
+  beforeEach(() => {
+    useSharedFakeClock()
+  })
+  afterEach(() => {
+    operations.splice(0).forEach((operation) => operation.finish())
+    jest.useRealTimers()
+    jest.restoreAllMocks()
+  })
 
   /**
    * One partition with no committed offset, so its first position is a ListOffsets read, and a
@@ -249,13 +360,12 @@ describe('position over a real offset manager and ledger', () => {
       require('../instrumentationEvents').events.PARTITION_HALTED,
       (event) => halts.push(event.payload)
     )
-    const operations = []
-    const call = (deadlineMs = 150) => {
+    const call = (deadlineMs = POSITION_BOUND_MS) => {
       const operation = new ConsumerOperation({ deadlineAt: performance.now() + deadlineMs })
       operations.push(operation)
       return operation.wait(() => group.position(POSITION_CELL, { operation }))
     }
-    return { ...ctx, group, halts, call, finish: () => operations.forEach((op) => op.finish()) }
+    return { ...ctx, group, halts, call }
   }
 
   /** @param {object} h the fixture @returns {void} nothing of an expired call survived */
@@ -274,29 +384,29 @@ describe('position over a real offset manager and ledger', () => {
     const lookup = gate()
     h.coordinator.isConnected = () => false
     h.cluster.findGroupCoordinator = jest.fn(() => lookup.promise)
+    const startedAt = performance.now()
     const settled = h.call().catch((error) => error)
-    expect(await settled).toBeInstanceOf(KafkaJSDeliveryTimeout)
     expect(h.cluster.findGroupCoordinator).toHaveBeenCalledTimes(1)
+    await expectAtOriginalDeadline(settled, startedAt, POSITION_BOUND_MS)
     lookup.resolve({ ...h.coordinator, isConnected: () => true })
-    await pause(30)
+    await jest.advanceTimersByTimeAsync(0)
     expect(h.coordinator.offsetFetch).not.toHaveBeenCalled()
     expect(h.cluster.fetchTopicsOffset).not.toHaveBeenCalled()
     expectUntouched(h)
-    h.finish()
   })
 
   test('an expired reset answer fills no position, cache, debt or halt', async () => {
     const h = positionGroup()
     h.recreate(NEW_ID)
     const reset = h.schedule.hold({ api: 'ListOffsets' })
+    const startedAt = performance.now()
     const settled = h.call().catch((error) => error)
     await reset.arrived()
-    expect(await settled).toBeInstanceOf(KafkaJSDeliveryTimeout)
+    await expectAtOriginalDeadline(settled, startedAt, POSITION_BOUND_MS)
     reset.release(listOffsetsAnswer({ 0: '7' }))
-    await pause(30)
+    await jest.advanceTimersByTimeAsync(0)
     expectUntouched(h)
     expect(h.owed()).toBe(true)
-    h.finish()
   })
 
   test('a same-offset seek keeps the same acquisition and the call resolves', async () => {
@@ -308,7 +418,6 @@ describe('position over a real offset manager and ledger', () => {
     reset.release(listOffsetsAnswer({ 0: '7' }))
     await expect(pending).resolves.toBe('7')
     expect(h.group.acquired.get(KEY).acquiredAt).toBe(1)
-    h.finish()
   })
 
   test('an equal-valued reacquisition under a distinct identity refuses the old answer', async () => {
@@ -332,7 +441,6 @@ describe('position over a real offset manager and ledger', () => {
     expect(h.owed()).toBe(true)
 
     await expect(h.group.position(POSITION_CELL)).resolves.toBe('7')
-    h.finish()
   })
 })
 

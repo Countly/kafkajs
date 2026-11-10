@@ -11,6 +11,7 @@ const {
   createTopic,
   testIfKafkaAtLeast_0_11,
   retryProtocol,
+  waitFor,
 } = require('testHelpers')
 
 describe('Broker > Produce', () => {
@@ -272,25 +273,39 @@ describe('Broker > Produce', () => {
 
   describe('Record batch', () => {
     testIfKafkaAtLeast_0_11('request', async () => {
-      const metadata = await retryProtocol(
-        'LEADER_NOT_AVAILABLE',
-        async () => await broker.metadata([topicName])
-      )
+      const response1 = await waitFor(
+        async () => {
+          try {
+            const metadata = await broker.metadata([topicName])
+            const partitionBroker = metadata.topicMetadata[0].partitionMetadata[0].leader
+            const newBrokerData = metadata.brokers.find((b) => b.nodeId === partitionBroker)
+            if (!newBrokerData) return false
 
-      // Find leader of partition
-      const partitionBroker = metadata.topicMetadata[0].partitionMetadata[0].leader
-      const newBrokerData = metadata.brokers.find((b) => b.nodeId === partitionBroker)
-
-      // Connect to the correct broker to produce message
-      broker2 = new Broker({
-        connectionPool: createConnectionPool(newBrokerData),
-        logger: newLogger(),
-      })
-      await broker2.connect()
-
-      const response1 = await retryProtocol(
-        'LEADER_NOT_AVAILABLE',
-        async () => await broker2.produce({ topicData: createTopicData() })
+            if (broker2) await broker2.disconnect()
+            broker2 = new Broker({
+              connectionPool: createConnectionPool(newBrokerData),
+              logger: newLogger(),
+            })
+            await broker2.connect()
+            return await broker2.produce({ topicData: createTopicData() })
+          } catch (error) {
+            if (
+              ![
+                'UNKNOWN_TOPIC_OR_PARTITION',
+                'LEADER_NOT_AVAILABLE',
+                'NOT_LEADER_FOR_PARTITION',
+              ].includes(error.type)
+            ) {
+              throw error
+            }
+            return false
+          }
+        },
+        {
+          ignoreTimeout: false,
+          maxWait: 30000,
+          timeoutMessage: `Leader did not become ready for ${topicName}`,
+        }
       )
 
       expect(response1).toEqual({

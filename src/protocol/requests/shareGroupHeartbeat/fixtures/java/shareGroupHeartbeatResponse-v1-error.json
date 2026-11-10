@@ -1,0 +1,7 @@
+{
+  "message": "ShareGroupHeartbeatResponse",
+  "version": 1,
+  "case": "error",
+  "hex": "0000000000230c6e6f7420656e61626c656400ffffffff00000000ff00",
+  "fields": {"throttleTime":0,"errorCode":35,"errorMessage":"not enabled","memberId":null,"memberEpoch":-1,"heartbeatIntervalMs":0,"assignment":null}
+}

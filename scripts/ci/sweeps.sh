@@ -88,6 +88,8 @@ scripts/compat/config.json:    "json": "docs/\x6bafka-compatibility.json"
 scripts/compat/index.js: *   npm run compat:generate   write docs/KafkaCompatibility.md + docs/\x6bafka-compatibility.json
 src/oauth/__tests__/oauthDocs.spec.js:      /\\/Users\\/|\\/home\\/|\\/var\\/tmp|new_countly|~\\/|C:\\\\|\x73uperpowers|\x75pgrade-ref|CLAUDE\\.md|AGENT\\.md|EXECUTION\\.md|\\b(?:Phase|Task|Wave) \\d/
 scripts/compat/__tests__/build.spec.js:      expect(JSON.parse(read('docs', '\x6bafka-compatibility.json')).generatedFrom.kafkaTag).toBe(tag)
+scripts/assertCleanTarball.sh:if tar -xOf "$1" package/docs/ShareConsumer.md | grep -E '[/]var[/]tmp[/]|/home/[^ /]+/|\\.\x73uperpowers/'; then
+src/consumer/share/__tests__/shareIsolationDocs.spec.js:    expect(guide).not.toMatch(/\\/var\\/tmp\\/|\\/home\\/[^ /]+\\/|\\.\x73uperpowers\\//)
 LIST
 )")
 NEW_LABELS=$(printf '%b\n' "$(cat <<'LIST'
@@ -100,12 +102,21 @@ src/__tests__/equivalentApis.spec.js:it('R1\u00a7B2:max.poll.records', async () 
 src/__tests__/equivalentApis.spec.js:it('R2\u00a73:MaxConcurrentFetches', async () => {
 src/__tests__/equivalentApis.spec.js:it('R2\u00a73:OnOffsetsFetched', async () => {
 CHANGELOG.md:### \x50hase \x39D — Client, security and admin breadth
+CHANGELOG.md:### \x50hase \x39E — Share groups
 docs/OAuth.md:With `clientAssertion` in place of the secret, the client authenticates with a signed JWT (RFC 7523 \u00a72.2): the body carries `client_assertion_type`, `client_assertion` and `client_id`, and there is no Authorization header. The supplier is called once for each token request; it may return the assertion or a promise of it.
 docs/OAuth.md:`clientCredentials` sends the OAuth 2.0 client-credentials grant (RFC 6749 \u00a74.4). With `clientSecret`, the client id and secret are form-encoded and sent as HTTP Basic authentication; the body is `grant_type=client_credentials`, plus `scope` when given.
 docs/OAuth.md:`jwtBearer` sends the JWT-bearer grant (RFC 7523 \u00a72.1): the assertion is the grant, as `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=…`, plus `scope` when given.
 src/__tests__/equivalentApis.spec.js:  it('R1\u00a7C:listTopics', async () => {
 src/__tests__/equivalentApis.spec.js:  it('R2\u00a75:kadm.Lag', async () => {
 src/__tests__/equivalentApis.spec.js:it('R1\u00a7C:forceTerminateTransaction', async () => {
+src/__tests__/equivalentApis.spec.js:it('R1\u00a7C:deleteShareGroups', async () => {
+src/__tests__/equivalentApis.spec.js:it('R1\u00a7E:poll', async () => {
+src/__tests__/equivalentApis.spec.js:it('R1\u00a7E:commitAsync', async () => {
+src/__tests__/equivalentApis.spec.js:it('R1\u00a7E:ackCallback', async () => {
+src/__tests__/equivalentApis.spec.js:it('R1\u00a7E:reset-offsets', async () => {
+src/__tests__/equivalentApis.spec.js:it('R1\u00a7E:commitSync', async () => {
+src/__tests__/equivalentApis.spec.js:it('R1\u00a7E:unsubscribe', async () => {
+src/__tests__/equivalentApis.spec.js:it('R1\u00a7E:resubscribe', async () => {
 src/oauth/clientCredentials.js: * @returns {string} the value form-encoded, as RFC 6749 \u00a72.3.1 requires before HTTP Basic
 src/oauth/clientCredentials.js: * Basic authentication; with `clientAssertion` (RFC 7523 \u00a72.2, KIP-1258) it carries the supplied
 src/oauth/clientCredentials.js: * The OAuth `error` codes RFC 6749 defines (\u00a75.2; \u00a74.1.2.1 for the last two) that a helper error

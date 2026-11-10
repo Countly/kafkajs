@@ -128,6 +128,54 @@ describe('createResourceProbe', () => {
   })
 
   describe('heap', () => {
+    test('reads resources atomically before heap collection and its finalizer gap', async () => {
+      const socket = Object.assign(new EventEmitter(), { destroyed: false })
+      socket.on('error', () => {})
+      let depth = 1
+      const probe = createResourceProbe({
+        emitters: { socket },
+        sockets: () => ({ created: 1, destroyed: Number(socket.destroyed) }),
+        queueDepth: () => depth,
+        heap: true,
+        gc: () => {},
+        pause: async () => {
+          socket.destroyed = true
+          socket.removeAllListeners()
+          depth = 0
+        },
+      })
+
+      expect(await probe.snapshot()).toMatchObject({
+        listeners: { socket: 1 },
+        sockets: { created: 1, destroyed: 0, open: 1 },
+        queueDepth: 1,
+      })
+    })
+
+    test.each([false, true])(
+      'preserves the timer reading from before the collection gap, retained=%s',
+      async (retained) => {
+        const baseline = await createResourceProbe({ activeResources: true }).snapshot()
+        const timer = setTimeout(() => {}, 60000)
+        const probe = createResourceProbe({
+          activeResources: true,
+          heap: true,
+          gc: () => {},
+          pause: async () => {
+            if (!retained) clearTimeout(timer)
+          },
+        })
+        try {
+          const snapshot = await probe.snapshot()
+          expect(snapshot.activeResources.Timeout || 0).toBe(
+            (baseline.activeResources.Timeout || 0) + 1
+          )
+        } finally {
+          clearTimeout(timer)
+        }
+      }
+    )
+
     test('collects twice, 100 ms apart, before it reads', async () => {
       const events = []
       const probe = createResourceProbe({
@@ -165,6 +213,51 @@ describe('createResourceProbe', () => {
 
       expect(during - before).toBeGreaterThan(10 * 1024 * 1024)
       expect(during - after).toBeGreaterThan(10 * 1024 * 1024)
+    })
+  })
+})
+
+describe('share resource sources', () => {
+  test('reports actual sessions, records and compact ranges separately', async () => {
+    const probe = createResourceProbe({
+      shareState: () => ({ shareSessions: 2, shareRecords: 3, shareRanges: 1 }),
+    })
+    expect(await probe.snapshot()).toEqual({ shareSessions: 2, shareRecords: 3, shareRanges: 1 })
+  })
+
+  test('does not invent zero counts when the source is absent', async () => {
+    expect(await createResourceProbe().snapshot()).toEqual({})
+  })
+
+  test.each([undefined, null, -1, 0.5, NaN, '1'])(
+    'refuses a malformed share count %s',
+    async (value) => {
+      const probe = createResourceProbe({
+        shareState: () => ({ shareSessions: 0, shareRecords: 0, shareRanges: value }),
+      })
+      await expect(probe.snapshot()).rejects.toThrow(
+        'Missing share resource measurement: shareRanges'
+      )
+    }
+  )
+
+  test('refuses a source that returns no counts at all', async () => {
+    const probe = createResourceProbe({ shareState: () => undefined })
+    await expect(probe.snapshot()).rejects.toThrow(
+      'Missing share resource measurement: shareSessions'
+    )
+  })
+
+  test('keeps every other measurement beside the share counts', async () => {
+    const probe = createResourceProbe({
+      queueDepth: () => 4,
+      shareState: () => ({ shareSessions: 0, shareRecords: 0, shareRanges: 0 }),
+    })
+    expect(await probe.snapshot()).toEqual({
+      queueDepth: 4,
+      shareSessions: 0,
+      shareRecords: 0,
+      shareRanges: 0,
     })
   })
 })

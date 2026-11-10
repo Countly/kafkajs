@@ -3,7 +3,8 @@
 A single Apache Kafka Java consumer, run as a child process by the mixed Java/JavaScript
 interop scenario so a JS member and a Java member can be proved to share one group under the
 same assignor; and, with `--role`, a Java transactional producer or `read_committed` consumer,
-run the same way by the transactional interop scenarios.
+run the same way by the transactional interop scenarios. A separate `share-member` role runs a
+Java share consumer for mixed share-group scenarios.
 
 It is **not** part of `npm test`, `npm run test:unit` or any test group. The group member runs
 only from `npm run test:e2e:java-interop`, which sets `JAVA_INTEROP_E2E=1`; the transactional
@@ -29,7 +30,7 @@ alongside `group.protocol=consumer`. `--report-group-type` prints one extra line
 holds partitions; `--describe-group` prints that line for any group and exits without joining.
 
 `run.sh` downloads `kafka-clients` and `slf4j-api` from Maven Central into a temporary
-directory, compiles both members there and runs the one `--role` selects. **The jars and the
+directory, compiles all three members there and runs the one `--role` selects. **The jars and the
 compiled classes are never committed**; only the source files and this README are.
 
 `groupConversionProbe.js` (run by `npm run probe:group-conversion`) drives this member together
@@ -69,8 +70,8 @@ otherwise a cooperative round's delta could be mistaken for an assignment.
 
 ## Transactional member
 
-`JavaTransactionalMember.java` runs when `--role` is given; it is development-only like the group
-member and runs only from gated end-to-end scenarios.
+`JavaTransactionalMember.java` runs for every `--role` except `share-member`; it is
+development-only like the group member and runs only from gated end-to-end scenarios.
 
 - `--role transactional-producer` initializes a `KafkaProducer` with the given `transactional.id`
   and runs `<transactions>` transactions of `<recordsPerTransaction>` records each. Every record's
@@ -104,6 +105,49 @@ One JSON line per step on stdout:
 | 3 | fenced: a newer owner of the transactional id took over (`ProducerFencedException` or `InvalidProducerEpochException` anywhere in the cause chain) |
 | 4 | any other client error, from either role, printed as an `error` line |
 | 137 | the deliberate `--crash-after-produce` halt |
+
+## Share member
+
+`JavaShareMember.java` runs only with `--role share-member`. It is development-only and is
+invoked by gated share-group interoperability scenarios. The classpath probe downloads, compiles
+and eagerly loads `KafkaShareConsumer`, `AcknowledgeType` and `ByteArrayDeserializer` without
+constructing a consumer or contacting a broker:
+
+```bash
+timeout 600 scripts/e2e/javaConsumer/run.sh --role share-member --probe
+timeout 600 scripts/e2e/javaConsumer/run.sh --role share-member \
+  localhost:9092 my-share-group my-topic 30000
+timeout 600 scripts/e2e/javaConsumer/run.sh --role share-member --halt-after 1 \
+  localhost:9092 my-share-group my-topic 30000
+```
+
+The role sets `share.acknowledgement.mode=explicit` and `client.id=java-share-<groupId>`.
+Normal processing explicitly ACCEPTs each delivered record and checks the results of
+`commitSync(Duration)`. Its commit wait is at most 5000 ms, capped by the most recently known
+acquisition lock timeout when available; its explicit close wait is 5000 ms. These are helper
+budgets. The group owns its isolation, starting offset and lock settings; the role sets no
+ordinary-consumer protocol, auto-commit, reset, assignor or isolation option. The caller creates
+the topic and waits for the intended group configuration before starting the member.
+
+Stdout reports delivery observations, followed by `done` only after a successful close:
+
+```json
+{"event":"record","topic":"my-topic","partition":0,"offset":"9007199254740993","deliveryCount":2}
+{"event":"done"}
+```
+
+`offset` is a decimal string to preserve every int64 value in JavaScript. `deliveryCount` is a
+number when present and JSON null otherwise. A record line reports delivery rather than broker
+acceptance. Client failures print an `error` JSON line and exit 4 without `done`; bad arguments
+print usage on stderr and exit 2. The polling duration must be an integer from 1 through
+2147483647 ms.
+
+`--halt-after N` requires a positive int32 count. After printing and flushing the Nth record it
+calls `Runtime.halt(137)` before acknowledging that record or committing that poll. There is no
+close, shutdown hook or final `done` on this path. Records from that poll are therefore suitable
+for testing another member's recovery. The process exit code is 137. Normal completion exits 0;
+a missing probe class exits 1 and names the class on stderr. Existing roles retain their output
+and exit contracts.
 
 ## Requirements
 

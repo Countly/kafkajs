@@ -221,3 +221,60 @@ test('the packed client authenticates with PLAIN and reports the absent GSSAPI p
     await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
   }
 })
+
+test('share capability errors keep the unsupported API class across entry points', async () => {
+  const cjs = require(PKG)
+  const esm = await import(PKG)
+  assert.equal(esm.KafkaJSShareGroupsNotSupportedError, cjs.KafkaJSShareGroupsNotSupportedError)
+  const error = new cjs.KafkaJSShareGroupsNotSupportedError('unsupported', {
+    apiKey: 78, apiName: 'ShareFetch', reason: 'api-version-range', shareVersion: 0
+  })
+  assert.ok(error instanceof cjs.KafkaJSServerDoesNotSupportApiKey)
+  assert.equal(error.retriable, false)
+  assert.equal(error.apiName, 'ShareFetch')
+  assert.equal(error.reason, 'api-version-range')
+})
+
+test('the compact acknowledgement error has one constructor in both packed entry points', async () => {
+  const cjs = require(PKG)
+  const esm = await import(PKG)
+  assert.equal(typeof cjs.KafkaJSShareAcknowledgementError, 'function')
+  assert.equal(esm.KafkaJSShareAcknowledgementError, cjs.KafkaJSShareAcknowledgementError)
+  const cause = new Error('lost acknowledgement answer')
+  const error = new esm.KafkaJSShareAcknowledgementError('not confirmed', {
+    reason: 'session-lost',
+    topic: 'topic',
+    partition: 0,
+    ranges: [{ firstOffset: '9007199254740993', lastOffset: '9223372036854775807' }],
+    cause,
+  })
+  assert(error instanceof cjs.KafkaJSError)
+  assert.equal(error.retriable, false)
+  assert.equal(error.cause, cause)
+  assert.deepEqual(error.ranges, [
+    { firstOffset: '9007199254740993', lastOffset: '9223372036854775807' },
+  ])
+})
+
+test('the share consumer is additive in CommonJS and ESM', async () => {
+  const cjs = require(PKG)
+  const esm = await import(PKG)
+  const kafka = new cjs.Kafka({ brokers: [] })
+  const share = kafka.shareConsumer({ groupId: 'pack-share' })
+  assert.equal(typeof esm.Kafka.prototype.shareConsumer, 'function')
+  assert.equal(typeof share.connect, 'function')
+  assert.equal(typeof share.disconnect, 'function')
+  assert.equal(typeof share.run, 'function')
+  assert.equal(typeof share.on, 'function')
+  assert.deepEqual(share.subscription(), [])
+  assert.deepEqual(share.assignment(), [])
+  assert.equal(share.acquisitionLockTimeoutMs(), null)
+  assert.equal(Object.keys(share.events).length, 18)
+  assert.throws(
+    () => kafka.shareConsumer({ groupId: 'pack-share', readUncommitted: true }),
+    cjs.KafkaJSInvalidConfigurationError
+  )
+  assert.throws(() => require(`${PKG}/src/consumer/share`), {
+    code: 'ERR_PACKAGE_PATH_NOT_EXPORTED',
+  })
+})

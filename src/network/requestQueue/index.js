@@ -1,4 +1,4 @@
-const { currentDeadline } = require('../../admin/deadline')
+const { currentDeadline, sharedSetup } = require('../../admin/deadline')
 const { EventEmitter } = require('events')
 const SocketRequest = require('./socketRequest')
 const describeThrown = require('../describeThrown')
@@ -91,13 +91,20 @@ module.exports = class RequestQueue extends EventEmitter {
       }
     }
 
+    /** @returns {void} Notifies queue-size observers independently of the requesting scope. */
     this[PRIVATE.EMIT_QUEUE_SIZE_EVENT] = () => {
-      instrumentationEmitter &&
-        instrumentationEmitter.emit(events.NETWORK_REQUEST_QUEUE_SIZE, {
-          broker: this.broker,
-          clientId: this.clientId,
-          queueSize: this.pending.length,
-        })
+      if (
+        instrumentationEmitter &&
+        (instrumentationEmitter.hasListeners?.(events.NETWORK_REQUEST_QUEUE_SIZE) ?? true)
+      ) {
+        sharedSetup(() =>
+          instrumentationEmitter.emit(events.NETWORK_REQUEST_QUEUE_SIZE, {
+            broker: this.broker,
+            clientId: this.clientId,
+            queueSize: this.pending.length,
+          })
+        )
+      }
 
       this[PRIVATE.EMIT_REQUEST_QUEUE_EMPTY]()
     }
@@ -445,7 +452,8 @@ module.exports = class RequestQueue extends EventEmitter {
    *
    * Reconciles upstream PRs #1755, #1768, #1667 and #1572 with Countly's production patch:
    * an idle, unthrottled queue schedules nothing (#1704/#1556 busy loop) and the delay is
-   * always non-negative (#1751 TimeoutNegativeWarning on Node >= 24).
+   * always non-negative (#1751 TimeoutNegativeWarning on Node >= 24). The timer belongs to
+   * the queue and must not inherit the requesting invocation's lifetime.
    */
   scheduleCheckPendingRequests() {
     // If there is already something scheduled we assume that it will be fine, and potentially
@@ -468,9 +476,11 @@ module.exports = class RequestQueue extends EventEmitter {
       ? Math.max(timeUntilUnthrottled, CHECK_PENDING_REQUESTS_INTERVAL)
       : CHECK_PENDING_REQUESTS_INTERVAL
 
-    this.throttleCheckTimeoutId = setTimeout(() => {
-      this.throttleCheckTimeoutId = null
-      this.checkPendingRequests()
-    }, scheduleAt)
+    sharedSetup(() => {
+      this.throttleCheckTimeoutId = setTimeout(() => {
+        this.throttleCheckTimeoutId = null
+        this.checkPendingRequests()
+      }, scheduleAt)
+    })
   }
 }

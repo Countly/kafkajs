@@ -1,0 +1,561 @@
+{
+  "schema": 1,
+  "captures": [
+    {
+      "brokerVersion": "4.3.1",
+      "observedImageId": "sha256:ccd1314e47ec76909e01f86308b4dcf2064f19f7c89759234322314b0e319e26",
+      "tree": "unfrozen",
+      "node": "v24.22.2",
+      "stage": "empty",
+      "groupAlias": "share-group",
+      "wireVersions": {
+        "Metadata": 13,
+        "ApiVersions": 5,
+        "IncrementalAlterConfigs": 1,
+        "DescribeConfigs": 4,
+        "ListGroups": 5,
+        "GroupCoordinator": 6,
+        "OffsetFetch": 9,
+        "ConsumerGroupDescribe": 1,
+        "AlterShareGroupOffsets": 0,
+        "DescribeShareGroupOffsets": 1,
+        "ListOffsets": 9,
+        "ShareGroupDescribe": 1,
+        "DeleteShareGroupOffsets": 0,
+        "DeleteGroups": 2,
+        "DescribeGroups": 6
+      },
+      "trace": [
+        {
+          "method": "consumerGroupDescribe",
+          "apiKey": 69,
+          "apiVersion": 1,
+          "request": {
+            "groupIds": [
+              "share-group"
+            ],
+            "includeAuthorizedOperations": false
+          },
+          "outcome": {
+            "kind": "return",
+            "value": {
+              "throttleTime": 0,
+              "clientSideThrottleTime": 0,
+              "groups": [
+                {
+                  "errorCode": 69,
+                  "errorMessage": "Group share-group is not a consumer group.",
+                  "groupId": "share-group",
+                  "groupState": "",
+                  "groupEpoch": 0,
+                  "assignmentEpoch": 0,
+                  "assignorName": "",
+                  "members": [],
+                  "authorizedOperations": -2147483648
+                }
+              ]
+            }
+          }
+        },
+        {
+          "method": "describeGroups",
+          "apiKey": 15,
+          "apiVersion": 6,
+          "request": {
+            "groupIds": [
+              "share-group"
+            ],
+            "includeAuthorizedOperations": false
+          },
+          "outcome": {
+            "kind": "return",
+            "value": {
+              "throttleTime": 0,
+              "clientSideThrottleTime": 0,
+              "groups": [
+                {
+                  "errorCode": 69,
+                  "errorMessage": "Group share-group is not a classic group.",
+                  "groupId": "share-group",
+                  "state": "Dead",
+                  "protocolType": "",
+                  "protocol": "",
+                  "members": [],
+                  "authorizedOperations": -2147483648
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "rawDescribeGroups": {
+        "method": "describeGroups",
+        "apiKey": 15,
+        "apiVersion": 6,
+        "request": {
+          "groupIds": [
+            "share-group"
+          ],
+          "includeAuthorizedOperations": false
+        },
+        "outcome": {
+          "kind": "return",
+          "value": {
+            "throttleTime": 0,
+            "clientSideThrottleTime": 0,
+            "groups": [
+              {
+                "errorCode": 69,
+                "errorMessage": "Group share-group is not a classic group.",
+                "groupId": "share-group",
+                "state": "Dead",
+                "protocolType": "",
+                "protocol": "",
+                "members": [],
+                "authorizedOperations": -2147483648
+              }
+            ]
+          }
+        }
+      },
+      "publicOutcome": {
+        "kind": "return",
+        "value": {
+          "groups": [
+            {
+              "groupId": "share-group",
+              "protocolType": "",
+              "protocol": "",
+              "state": "Dead",
+              "errorCode": 69,
+              "errorMessage": "Group share-group is not a consumer group.",
+              "groupType": "classic",
+              "groupEpoch": null,
+              "assignmentEpoch": null,
+              "assignorName": null,
+              "authorizedOperations": null,
+              "members": []
+            }
+          ]
+        }
+      }
+    },
+    {
+      "brokerVersion": "4.3.1",
+      "observedImageId": "sha256:ccd1314e47ec76909e01f86308b4dcf2064f19f7c89759234322314b0e319e26",
+      "tree": "unfrozen",
+      "node": "v24.22.2",
+      "stage": "member-present",
+      "groupAlias": "share-group",
+      "wireVersions": {
+        "Metadata": 13,
+        "ApiVersions": 5,
+        "IncrementalAlterConfigs": 1,
+        "DescribeConfigs": 4,
+        "ListGroups": 5,
+        "GroupCoordinator": 6,
+        "OffsetFetch": 9,
+        "ConsumerGroupDescribe": 1,
+        "AlterShareGroupOffsets": 0,
+        "DescribeShareGroupOffsets": 1,
+        "ListOffsets": 9,
+        "ShareGroupDescribe": 1,
+        "DeleteShareGroupOffsets": 0,
+        "DeleteGroups": 2,
+        "DescribeGroups": 6
+      },
+      "trace": [
+        {
+          "method": "consumerGroupDescribe",
+          "apiKey": 69,
+          "apiVersion": 1,
+          "request": {
+            "groupIds": [
+              "share-group"
+            ],
+            "includeAuthorizedOperations": false
+          },
+          "outcome": {
+            "kind": "return",
+            "value": {
+              "throttleTime": 0,
+              "clientSideThrottleTime": 0,
+              "groups": [
+                {
+                  "errorCode": 69,
+                  "errorMessage": "Group share-group is not a consumer group.",
+                  "groupId": "share-group",
+                  "groupState": "",
+                  "groupEpoch": 0,
+                  "assignmentEpoch": 0,
+                  "assignorName": "",
+                  "members": [],
+                  "authorizedOperations": -2147483648
+                }
+              ]
+            }
+          }
+        },
+        {
+          "method": "describeGroups",
+          "apiKey": 15,
+          "apiVersion": 6,
+          "request": {
+            "groupIds": [
+              "share-group"
+            ],
+            "includeAuthorizedOperations": false
+          },
+          "outcome": {
+            "kind": "return",
+            "value": {
+              "throttleTime": 0,
+              "clientSideThrottleTime": 0,
+              "groups": [
+                {
+                  "errorCode": 69,
+                  "errorMessage": "Group share-group is not a classic group.",
+                  "groupId": "share-group",
+                  "state": "Dead",
+                  "protocolType": "",
+                  "protocol": "",
+                  "members": [],
+                  "authorizedOperations": -2147483648
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "rawDescribeGroups": {
+        "method": "describeGroups",
+        "apiKey": 15,
+        "apiVersion": 6,
+        "request": {
+          "groupIds": [
+            "share-group"
+          ],
+          "includeAuthorizedOperations": false
+        },
+        "outcome": {
+          "kind": "return",
+          "value": {
+            "throttleTime": 0,
+            "clientSideThrottleTime": 0,
+            "groups": [
+              {
+                "errorCode": 69,
+                "errorMessage": "Group share-group is not a classic group.",
+                "groupId": "share-group",
+                "state": "Dead",
+                "protocolType": "",
+                "protocol": "",
+                "members": [],
+                "authorizedOperations": -2147483648
+              }
+            ]
+          }
+        }
+      },
+      "publicOutcome": {
+        "kind": "return",
+        "value": {
+          "groups": [
+            {
+              "groupId": "share-group",
+              "protocolType": "",
+              "protocol": "",
+              "state": "Dead",
+              "errorCode": 69,
+              "errorMessage": "Group share-group is not a consumer group.",
+              "groupType": "classic",
+              "groupEpoch": null,
+              "assignmentEpoch": null,
+              "assignorName": null,
+              "authorizedOperations": null,
+              "members": []
+            }
+          ]
+        }
+      }
+    },
+    {
+      "brokerVersion": "4.4.0",
+      "observedImageId": "sha256:76af3d0116abbb33b4cd964af410d4921c33d1f663e7a95d5453a9c35a84869b",
+      "tree": "unfrozen",
+      "node": "v24.22.2",
+      "stage": "empty",
+      "groupAlias": "share-group",
+      "wireVersions": {
+        "Metadata": 13,
+        "IncrementalAlterConfigs": 1,
+        "ApiVersions": 5,
+        "DescribeConfigs": 4,
+        "ListGroups": 5,
+        "GroupCoordinator": 6,
+        "OffsetFetch": 9,
+        "ConsumerGroupDescribe": 1,
+        "AlterShareGroupOffsets": 0,
+        "DescribeShareGroupOffsets": 1,
+        "ListOffsets": 9,
+        "ShareGroupDescribe": 1,
+        "DeleteShareGroupOffsets": 0,
+        "DeleteGroups": 3,
+        "DescribeGroups": 6
+      },
+      "trace": [
+        {
+          "method": "consumerGroupDescribe",
+          "apiKey": 69,
+          "apiVersion": 1,
+          "request": {
+            "groupIds": [
+              "share-group"
+            ],
+            "includeAuthorizedOperations": false
+          },
+          "outcome": {
+            "kind": "return",
+            "value": {
+              "throttleTime": 0,
+              "clientSideThrottleTime": 0,
+              "groups": [
+                {
+                  "errorCode": 69,
+                  "errorMessage": "Group share-group is not a consumer group.",
+                  "groupId": "share-group",
+                  "groupState": "",
+                  "groupEpoch": 0,
+                  "assignmentEpoch": 0,
+                  "assignorName": "",
+                  "members": [],
+                  "authorizedOperations": -2147483648
+                }
+              ]
+            }
+          }
+        },
+        {
+          "method": "describeGroups",
+          "apiKey": 15,
+          "apiVersion": 6,
+          "request": {
+            "groupIds": [
+              "share-group"
+            ],
+            "includeAuthorizedOperations": false
+          },
+          "outcome": {
+            "kind": "return",
+            "value": {
+              "throttleTime": 0,
+              "clientSideThrottleTime": 0,
+              "groups": [
+                {
+                  "errorCode": 69,
+                  "errorMessage": "Group share-group is not a classic group.",
+                  "groupId": "share-group",
+                  "state": "Dead",
+                  "protocolType": "",
+                  "protocol": "",
+                  "members": [],
+                  "authorizedOperations": -2147483648
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "rawDescribeGroups": {
+        "method": "describeGroups",
+        "apiKey": 15,
+        "apiVersion": 6,
+        "request": {
+          "groupIds": [
+            "share-group"
+          ],
+          "includeAuthorizedOperations": false
+        },
+        "outcome": {
+          "kind": "return",
+          "value": {
+            "throttleTime": 0,
+            "clientSideThrottleTime": 0,
+            "groups": [
+              {
+                "errorCode": 69,
+                "errorMessage": "Group share-group is not a classic group.",
+                "groupId": "share-group",
+                "state": "Dead",
+                "protocolType": "",
+                "protocol": "",
+                "members": [],
+                "authorizedOperations": -2147483648
+              }
+            ]
+          }
+        }
+      },
+      "publicOutcome": {
+        "kind": "return",
+        "value": {
+          "groups": [
+            {
+              "groupId": "share-group",
+              "protocolType": "",
+              "protocol": "",
+              "state": "Dead",
+              "errorCode": 69,
+              "errorMessage": "Group share-group is not a consumer group.",
+              "groupType": "classic",
+              "groupEpoch": null,
+              "assignmentEpoch": null,
+              "assignorName": null,
+              "authorizedOperations": null,
+              "members": []
+            }
+          ]
+        }
+      }
+    },
+    {
+      "brokerVersion": "4.4.0",
+      "observedImageId": "sha256:76af3d0116abbb33b4cd964af410d4921c33d1f663e7a95d5453a9c35a84869b",
+      "tree": "unfrozen",
+      "node": "v24.22.2",
+      "stage": "member-present",
+      "groupAlias": "share-group",
+      "wireVersions": {
+        "Metadata": 13,
+        "IncrementalAlterConfigs": 1,
+        "ApiVersions": 5,
+        "DescribeConfigs": 4,
+        "ListGroups": 5,
+        "GroupCoordinator": 6,
+        "OffsetFetch": 9,
+        "ConsumerGroupDescribe": 1,
+        "AlterShareGroupOffsets": 0,
+        "DescribeShareGroupOffsets": 1,
+        "ListOffsets": 9,
+        "ShareGroupDescribe": 1,
+        "DeleteShareGroupOffsets": 0,
+        "DeleteGroups": 3,
+        "DescribeGroups": 6
+      },
+      "trace": [
+        {
+          "method": "consumerGroupDescribe",
+          "apiKey": 69,
+          "apiVersion": 1,
+          "request": {
+            "groupIds": [
+              "share-group"
+            ],
+            "includeAuthorizedOperations": false
+          },
+          "outcome": {
+            "kind": "return",
+            "value": {
+              "throttleTime": 0,
+              "clientSideThrottleTime": 0,
+              "groups": [
+                {
+                  "errorCode": 69,
+                  "errorMessage": "Group share-group is not a consumer group.",
+                  "groupId": "share-group",
+                  "groupState": "",
+                  "groupEpoch": 0,
+                  "assignmentEpoch": 0,
+                  "assignorName": "",
+                  "members": [],
+                  "authorizedOperations": -2147483648
+                }
+              ]
+            }
+          }
+        },
+        {
+          "method": "describeGroups",
+          "apiKey": 15,
+          "apiVersion": 6,
+          "request": {
+            "groupIds": [
+              "share-group"
+            ],
+            "includeAuthorizedOperations": false
+          },
+          "outcome": {
+            "kind": "return",
+            "value": {
+              "throttleTime": 0,
+              "clientSideThrottleTime": 0,
+              "groups": [
+                {
+                  "errorCode": 69,
+                  "errorMessage": "Group share-group is not a classic group.",
+                  "groupId": "share-group",
+                  "state": "Dead",
+                  "protocolType": "",
+                  "protocol": "",
+                  "members": [],
+                  "authorizedOperations": -2147483648
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "rawDescribeGroups": {
+        "method": "describeGroups",
+        "apiKey": 15,
+        "apiVersion": 6,
+        "request": {
+          "groupIds": [
+            "share-group"
+          ],
+          "includeAuthorizedOperations": false
+        },
+        "outcome": {
+          "kind": "return",
+          "value": {
+            "throttleTime": 0,
+            "clientSideThrottleTime": 0,
+            "groups": [
+              {
+                "errorCode": 69,
+                "errorMessage": "Group share-group is not a classic group.",
+                "groupId": "share-group",
+                "state": "Dead",
+                "protocolType": "",
+                "protocol": "",
+                "members": [],
+                "authorizedOperations": -2147483648
+              }
+            ]
+          }
+        }
+      },
+      "publicOutcome": {
+        "kind": "return",
+        "value": {
+          "groups": [
+            {
+              "groupId": "share-group",
+              "protocolType": "",
+              "protocol": "",
+              "state": "Dead",
+              "errorCode": 69,
+              "errorMessage": "Group share-group is not a consumer group.",
+              "groupType": "classic",
+              "groupEpoch": null,
+              "assignmentEpoch": null,
+              "assignorName": null,
+              "authorizedOperations": null,
+              "members": []
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

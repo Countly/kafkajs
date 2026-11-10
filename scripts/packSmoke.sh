@@ -9,6 +9,7 @@ echo "tarball: $PACK_DIR/$TARBALL"
 
 # The tarball must not contain tests, fixtures or the otel/ sub-package.
 "$ROOT/scripts/assertCleanTarball.sh" "$PACK_DIR/$TARBALL"
+# The guard also requires the public share guide and excludes other documentation.
 
 cd "$PACK_DIR"
 [ -f package.json ] || echo '{ "name": "pack-smoke", "private": true, "type": "commonjs" }' > package.json

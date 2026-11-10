@@ -55,10 +55,24 @@ const DEFAULT = [...CLASSIC, ...PRODUCER]
  * classic base beside their transaction pairs, and each advertises exactly the versions the
  * client's own caps allow under that transaction version: a transactional Produce, EndTxn and
  * TxnOffsetCommit at v11, v4 and v4 under transaction version 1, and at v12, v5 and v5 under 2,
- * which also sends no AddPartitionsToTxn and no AddOffsetsToTxn.
- * @type {Record<'default'|'sasl'|'consumer'|'tv1'|'tv2'|'offsets'|'transactions'|'storage'|'securityAdmin'|'clusterAdmin', Array<[string, number]>>}
+ * which also sends no AddPartitionsToTxn and no AddOffsetsToTxn. The `share` profile advertises the
+ * bootstrap pairs and the seven released share-group APIs at their one implemented version each;
+ * every one of them has a wire file.
+ * @type {Record<'default'|'sasl'|'consumer'|'tv1'|'tv2'|'offsets'|'transactions'|'storage'|'securityAdmin'|'clusterAdmin'|'share', Array<[string, number]>>}
  */
 const PROFILES = {
+  share: [
+    ['ApiVersions', 4],
+    ['Metadata', 13],
+    ['FindCoordinator', 6],
+    ['ShareGroupHeartbeat', 1],
+    ['ShareGroupDescribe', 1],
+    ['ShareFetch', 2],
+    ['ShareAcknowledge', 2],
+    ['DescribeShareGroupOffsets', 1],
+    ['AlterShareGroupOffsets', 0],
+    ['DeleteShareGroupOffsets', 0],
+  ],
   storage: [
     ...DEFAULT.filter(([api]) => api !== 'ListOffsets'),
     ['ListOffsets', 11],
@@ -272,7 +286,7 @@ class ScriptedCluster {
    * @param {Array<{ id: number, host: string, port: number }>} options.nodes the endpoints the
    *   client may dial; a dial to any other endpoint fails
    * @param {Schedule} [options.schedule] routes the calls; one is made when omitted
-   * @param {'default'|'sasl'|'consumer'|'tv1'|'tv2'|'offsets'|'transactions'|'storage'|'securityAdmin'|'clusterAdmin'} [options.profile='default'] what the cluster advertises
+   * @param {'default'|'sasl'|'consumer'|'tv1'|'tv2'|'offsets'|'transactions'|'storage'|'securityAdmin'|'clusterAdmin'|'share'} [options.profile='default'] what the cluster advertises
    * @param {Record<string, [number, number]>} [options.advertise] `[version, version]` per API
    *   name, over the profile's: how a test makes the client negotiate another single version, the
    *   only one the cluster then accepts; a non-singleton range is rejected
@@ -295,6 +309,10 @@ class ScriptedCluster {
     this.answerers = new Map()
     this.downNodes = new Set()
     this.blackholedNodes = new Set()
+    /** @type {Array<{node: object, socket: object, onConnect: () => void, generation: number}>} */
+    this.heldDials = []
+    /** @type {Map<string, object>} fields laid over every object answer of an API during its outage */
+    this.outages = new Map()
     this.advertised = new Map(PROFILES[profile].map(([api, version]) => [api, [version, version]]))
     for (const [api, range] of Object.entries(advertise)) {
       if (
@@ -338,11 +356,9 @@ class ScriptedCluster {
   }
 
   /**
-   * @param {number} id the id of a node taken down with `down`
-   * @returns {ScriptedCluster} this
-   */
-  /** Holds future dials without connecting; up restores them, existing sockets stay unchanged.
-   * @param {number} id node id
+   * Holds every later dial to a node: the socket exists but never connects, so a connect stays
+   * pending until `release`. Sockets the client already holds are unchanged.
+   * @param {number} id the node's id
    * @returns {ScriptedCluster} this
    */
   blackhole(id) {
@@ -351,10 +367,67 @@ class ScriptedCluster {
     return this
   }
 
-  /** Restores future dials; a held old dial remains held. @param {number} id node id @returns {ScriptedCluster} this */
+  /**
+   * Restores future dials of a node taken down or blackholed. A dial already held stays held until
+   * `release`.
+   * @param {number} id the node's id
+   * @returns {ScriptedCluster} this
+   */
   up(id) {
     this.downNodes.delete(id)
     this.blackholedNodes.delete(id)
+    return this
+  }
+
+  /**
+   * Connects every dial of a node that `blackhole` is holding, as if the network let it through
+   * now: each live held socket reports its connection on a later turn and answers requests from
+   * then on. A held socket the client already destroyed, for example on its connection timeout,
+   * stays dead. Callable whether or not the node is still blackholed.
+   * @param {number} id the node's id
+   * @returns {ScriptedCluster} this
+   */
+  release(id) {
+    const released = this.heldDials.filter(({ node }) => node.id === id)
+    this.heldDials = this.heldDials.filter(({ node }) => node.id !== id)
+    for (const { node, socket, onConnect, generation } of released) {
+      if (socket.destroyed) continue
+      this.answerOn(socket, node, generation)
+      setImmediate(onConnect)
+    }
+    return this
+  }
+
+  /**
+   * @param {number} id the node's id
+   * @returns {number} how many dials to the node are held and still alive, so a test can wait for
+   *   a dial to arrive before it releases it
+   */
+  heldDialsTo(id) {
+    return this.heldDials.filter(({ node, socket }) => node.id === id && !socket.destroyed).length
+  }
+
+  /**
+   * Starts an outage of one API: until `recover`, every later object answer of it carries `fields`
+   * over what it would have answered, so the broker stays reachable while the API fails. For
+   * Metadata, `{ errorCode: 129 }` is the top-level REBOOTSTRAP_REQUIRED answer. A Buffer answer
+   * released by a test is sent as it is.
+   * @param {string} api the API name, e.g. `Metadata`
+   * @param {object} fields the response fields that make it fail
+   * @returns {ScriptedCluster} this
+   */
+  outage(api, fields) {
+    this.outages.set(api, fields)
+    return this
+  }
+
+  /**
+   * Ends the outage of an API; its later answers are the ones nothing overrides.
+   * @param {string} api the API name
+   * @returns {ScriptedCluster} this
+   */
+  recover(api) {
+    this.outages.delete(api)
     return this
   }
 
@@ -372,11 +445,21 @@ class ScriptedCluster {
 
   /**
    * @returns {{ apiKeys: Array<{ apiKey: number, minVersion: number, maxVersion: number }>,
+   *   finalizedFeaturesEpoch?: number,
    *   finalizedFeatures?: Array<{ name: string, minVersionLevel: number, maxVersionLevel: number }> }}
-   *   the fields the ApiVersions answer is built from: the table, and under `tv2` the finalized
-   *   `transaction.version` at level 2, which is what makes a client choose transaction version 2
+   *   the fields the ApiVersions answer is built from: the table, under `tv2` the finalized
+   *   `transaction.version` at level 2, which is what makes a client choose transaction version 2,
+   *   and under `share` the finalized `share.version` at level 1 with feature epoch 7
    */
   apiVersionsAnswer() {
+    if (this.profile === 'share') {
+      return {
+        apiKeys: this.apiVersionsTable(),
+        finalizedFeaturesEpoch: 7,
+        finalizedFeatures: [{ name: 'share.version', minVersionLevel: 1, maxVersionLevel: 1 }],
+      }
+    }
+
     return this.profile === 'tv2'
       ? {
           apiKeys: this.apiVersionsTable(),
@@ -527,19 +610,33 @@ class ScriptedCluster {
       return refused
     }
 
-    if (this.blackholedNodes.has(node.id))
-      return this.fake.factory({ host, port, onConnect: () => {} })
+    if (this.blackholedNodes.has(node.id)) {
+      const held = this.fake.factory({ host, port, onConnect: () => {} })
+      this.heldDials.push({ node, socket: held, onConnect, generation: this.socketsOpenedTo(node) })
+      return held
+    }
 
     const socket = this.fake.factory({ host, port, onConnect })
-    const generation = this.socketsOpenedTo(node)
+    this.answerOn(socket, node, this.socketsOpenedTo(node))
+
+    return socket
+  }
+
+  /**
+   * Makes a socket answer every request written to it.
+   * @private
+   * @param {import('events').EventEmitter} socket the socket of a connected dial
+   * @param {{ id: number, host: string, port: number }} node the node it dialled
+   * @param {number} generation which connection of the node it is, counting from 1
+   * @returns {void}
+   */
+  answerOn(socket, node, generation) {
     const write = socket.write
     socket.write = (buffer, ...rest) => {
       const result = write(buffer, ...rest)
       this.handle(socket, node, generation, Buffer.from(buffer))
       return result
     }
-
-    return socket
   }
 
   /**
@@ -693,7 +790,9 @@ class ScriptedCluster {
 
   /**
    * Answers one request frame, or refuses it. The answer goes out on a later turn of the event
-   * loop, and not at all on a socket destroyed by then.
+   * loop, and not at all on a socket destroyed by then. The share profile defaults object answers
+   * to zero throttle instead of inheriting the wire vectors' quota examples; explicit throttles
+   * and raw response buffers are preserved, including answers released through a schedule gate.
    * @private
    * @param {import('events').EventEmitter} socket the socket the frame came in on
    * @param {{ id: number, host: string, port: number }} node the node it was written to
@@ -719,13 +818,19 @@ class ScriptedCluster {
     this.schedule
       .run({ ...record, ...targetOf(record.fields) }, () => this.defaultAnswer(pair, record))
       .then((answer) => (answer === undefined ? this.defaultAnswer(pair, record) : answer))
+      .then((answer) => this.underOutage(record.api, answer))
       .then(
         (answer) =>
           // A macrotask, as the bytes of a real answer arrive: a client that loops on empty
           // answers must not be able to starve the timers behind a chain of microtasks.
           setImmediate(() => {
             if (!socket.destroyed) {
-              const body = Buffer.isBuffer(answer) ? answer : pair.buildResponse(answer)
+              const body = Buffer.isBuffer(answer)
+                ? answer
+                : pair.buildResponse({
+                    ...(this.profile === 'share' && { throttleTime: 0 }),
+                    ...answer,
+                  })
               record.answeredOrder = this.clock++
               respondWithFrame(
                 { socket },
@@ -737,6 +842,18 @@ class ScriptedCluster {
           }),
         (error) => socket.destroy(error)
       )
+  }
+
+  /**
+   * @private
+   * @param {string} api the API name
+   * @param {object|Buffer} answer what the call would be answered with
+   * @returns {object|Buffer} the answer with the API's outage fields over it, or the answer itself
+   *   when there is no outage or the answer is a Buffer
+   */
+  underOutage(api, answer) {
+    const outage = this.outages.get(api)
+    return outage && !Buffer.isBuffer(answer) ? { ...answer, ...outage } : answer
   }
 
   /**
@@ -1077,6 +1194,23 @@ const producerScript = (cluster, { topic = TOPIC, partitions = 1 } = {}) =>
     }))
 
 /**
+ * Installs literal share-group answers without simulating membership, sessions, a log or
+ * ownership: each row's `response` is returned as it is and the wire pair supplies any field it
+ * omits. A repeated API replaces its earlier answer, and the schedule stays the only place that
+ * orders calls. Intended for the `share` profile.
+ * @param {ScriptedCluster} cluster
+ * @param {Array<{ api: string, response: object }>} rows literal answers, applied in order
+ * @returns {ScriptedCluster} the cluster; no group or acknowledgement state is kept
+ */
+const shareScript = (cluster, rows) => {
+  for (const { api, response } of rows) {
+    cluster.answer(api, () => response)
+  }
+
+  return cluster
+}
+
+/**
  * @param {ConstructorParameters<typeof ScriptedCluster>[0]} options
  * @returns {ScriptedCluster}
  */
@@ -1088,6 +1222,7 @@ module.exports = {
   groupScript,
   consumerProtocolScript,
   producerScript,
+  shareScript,
   PROFILES,
   NEGOTIATION_MS,
 }

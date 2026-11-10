@@ -1,0 +1,7 @@
+{
+  "message": "DeleteShareGroupOffsetsRequest",
+  "version": 0,
+  "case": "topics",
+  "hex": "0c73686172652d67726f75700306616c7068610006ceb26574610000",
+  "fields": {"groupId":"share-group","topics":[{"topicName":"alpha"},{"topicName":"βeta"}]}
+}

@@ -1,0 +1,7 @@
+{
+  "message": "ShareGroupHeartbeatResponse",
+  "version": 1,
+  "case": "unknownTags",
+  "hex": "000000110000000d73686172652d6d656d6265727fffffff000001f401020102030405060708090a0b0c0d0e0f10030000000000000002010a0161010a0161010a0161",
+  "fields": {"throttleTime":17,"errorCode":0,"errorMessage":null,"memberId":"share-member","memberEpoch":2147483647,"heartbeatIntervalMs":500,"assignment":{"topicPartitions":[{"topicId":"01020304-0506-0708-090a-0b0c0d0e0f10","partitions":[0,2]}]}}
+}

@@ -5,6 +5,70 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 ## Unreleased — 3.0.0
 
+### Phase 9E — Share groups
+
+#### Behavior changes
+
+- For all clients, a socket that closes without an error now fails pending requests immediately with the retriable connection-closed error, instead of waiting for the request timeout.
+
+- After `consumer.stop()` or `disconnect()` requests stop, the `heartbeat()` callback given to `eachMessage` and `eachBatch` handlers resolves without sending; in 2.2.4 it could still send. Finish handlers that need heartbeats before requesting stop.
+
+#### Additions
+
+- Implement the seven released share-group wire codecs: ShareGroupHeartbeat v1, ShareGroupDescribe v1, ShareFetch v2, ShareAcknowledge v2, DescribeShareGroupOffsets v1, AlterShareGroupOffsets v0 and DeleteShareGroupOffsets v0. Each is flexible with nested tag buffers, keeps int64 offsets and lag as exact decimal strings and passes broker error codes through as data. They are checked against independent Apache Kafka message vectors.
+
+- Route `ShareFetch` and `ShareAcknowledge` over a connection pool's data socket, each API counted by its own socket's generation, and add the seven share-group `Broker` methods. Add `KafkaJSShareGroupsNotSupportedError`, a `KafkaJSServerDoesNotSupportApiKey` subclass whose `reason` (`api-not-advertised`, `api-version-range`, `feature-disabled` or `refused-by-broker`) and `shareVersion` say why a cluster cannot run share groups. A capability check judges a broker by its advertised ranges and its finalized `share.version` (level 1 or above, including level 2 on Kafka 4.4).
+
+- Add `admin.describeShareGroups`, `listShareGroupOffsets`, `alterShareGroupOffsets` and `deleteShareGroupOffsets` for Kafka 4.2+ share groups, each taking the admin `apiTimeout`. Every call goes to the group coordinator. `describeShareGroups` sends one request per coordinator, relocates a moved group once and returns one row per requested id in caller order, with the raw signed `authorizedOperations` mask. The offset methods return exact decimal-string offsets and lag (unknown lag is `null`), check every offset to alter before any request, and keep a partition's or topic's error as data while a group-level error throws. A coordinator that cannot run the API rejects with `KafkaJSShareGroupsNotSupportedError`. Share-group deletion stays `admin.deleteGroups`; no `deleteShareGroups` is added, and against Kafka 4.4 `deleteGroups` negotiates DeleteGroups v3, so each result carries the broker's `errorMessage`.
+
+- Add the share-group membership: one generated member ID per run, heartbeats that send only changed fields, topic-ID assignments applied at once with unknown topic names resolved under a guarded retry, and the existing heartbeat manager reused for scheduling. Coordinator errors keep the membership, fenced members rejoin with the same ID, and `GROUP_ID_NOT_FOUND` (69) ends a membership as non-retriable unless it answers that member's own leave. The consumer-protocol heartbeat backoff moved to its own module without changing. The public share consumer uses this membership for joining, assignments and leaving.
+
+- Add exact record-range walking and compact acknowledgement outcomes with `KafkaJSShareAcknowledgementError`. Acquired records are classified through exact int64 offsets without expanding ranges; control and missing offsets become gaps, and the undecoded remainder after a decode failure is released rather than rejected. Per-partition acknowledgement ledgers keep automatic ranges compact, hold each decision until its handler completes, check a request against the broker's batch rules before a frame is built, and settle every outcome once. Lock deadlines count from the time the fetch was written; no timer is added. The public share consumer uses the internal walk and ledger for delivery and acknowledgement; the error class is exported. An internal-API benchmark compares the walk with a per-offset expansion control.
+
+- Add the share-group node loop: one serialized request queue and one non-prefetching fetch loop per leader node, so a node sends no second fetch until every handler of its previous answer has returned. Acknowledgements piggyback on the next fetch; ShareAcknowledge carries only flushes, renewals and the final close. A partition is forgotten in the same frame as its last acknowledgement, or in the first fetch after a flush or renewal, and a partition that still holds undelivered records is never forgotten. Session resets (122, 123, and 133 on fetch) never replay an old acknowledgement, a request written without an answer is never resent, and fetch and acknowledgement errors are classified separately, with leader hints, metadata refreshes and a fatal path for authorization and corrupt records. Empty rounds are paced at 50 ms and `record_limit` is bounded per node. The public share consumer uses this loop for fetching, acknowledgement and session recovery.
+
+- Add `Kafka.shareConsumer` with implicit or explicit acknowledgements, handler-driven renewal and bounded disconnect. Share isolation defaults to read_uncommitted and is configured per group; share groups require Kafka 4.2+.
+
+- Document share-consumer boundaries and offset-reset recipes, including compact acknowledgement events and the share-span boundary.
+
+- Add deterministic share membership, session and acknowledgement fault matrices, with captured shutdown authority, exact record outcomes and resource cleanup checks.
+- Verify share delivery, acknowledgement types, locks, isolation, membership, recovery, shutdown and administration against live brokers.
+- Verify share capability refusals, broker-bounce recovery, Java interoperability and diagnostics channels.
+- Verify that an idempotent batch whose answer is lost across a leader change is re-sent with the same producer ID, epoch, sequence and bytes, and that no later batch of the partition is written before it is acknowledged. A broker that lost the producer's state can still append that re-send a second time; the client cannot detect it, as with the Java producer.
+
+#### Fixes
+
+- Heartbeat retries after an empty Fetch or a handler returns during stop no longer delay disconnect after coordinator loss. Eligible stop-time commits retain their coordinator lookups.
+
+- All-topic metadata calls (`describeCluster`, `listTopics` and `fetchTopicMetadata`) now try the remaining brokers when a cached broker cannot reconnect after a socket close, preserving immediate close detection without exhausting retries on the stopped broker. If no broker's call succeeds, a skipped connection failure stays retriable, keeping consumer recovery through coordinator outages. Socket errors with an empty message report their error code, or a descriptive fallback.
+
+- A share consumer close no longer prints Node's `TimeoutNegativeWarning` when its handler deadline passes between checking the clock and arming the timer: a consumer-operation sleep with an already elapsed delay now schedules an immediate timer.
+- A connection closed without an error is now detected immediately instead of after the request timeout. In-flight requests fail with the same retriable connection-closed error as a socket end, and share sessions reopen on the next round.
+- A broker restart no longer crashes a share consumer with "Metadata discovery completed" when a metadata notification starts a new fetch loop. Rebootstrap and request-queue-size listeners, and the queue's pending-check timer, also run independently of the publishing discovery or admin invocation.
+- A share answer that arrives from a replaced connection pool is discarded and the session reopens on the next round, instead of ending the run and losing unrelated acquisitions.
+- A failed share heartbeat preserves the healthy data socket and its acquisitions while the coordinator reconnects.
+- A share consumer now leaves its group on disconnect even after its coordinator connection was re-established.
+
+- Prepared share renewals retain their own compact acknowledgement error when a routing change or shutdown retires their wait; callers retired before preparing a ticket receive a local refusal.
+
+- Share-consumer closes honor a disconnect deadline supplied during a stop and detach captured sockets when their shared close budget expires.
+
+- Unimplemented request slots throw `KafkaJSNotImplemented` with a diagnostic message instead of a `TypeError`.
+
+#### Tooling
+
+- Register the share broker-floor refusal checks in the exit gate (required on the 4.0.2 floor, tolerated skips elsewhere) and enumerate the new tarball and docs path guards in the exit sweeps.
+- Move share-soak memory acceptance to the separate `Memory gates` workflow on `p9m/` pull requests and manual dispatch, required before 3.0.0 rather than phase merges. CI jobs replace the local guard for these demonstrations. Only the short job currently ships; the full-profile job and complete independent acceptance validator remain owed to the memory-gates follow-up. Add a manual integration lane selector and run the soak unit spec in three case shards per supported Node version.
+
+- Add share-consumer soak and benchmark gates with separate batch and message identity controls. Before scored setup, both soak profiles execute one fixed same-process, same-realm 30-cycle priming pass with separate resources and joined cleanup, funded by a separate 1020000-ms allocation. The short/full scored profiles retain 32/64-second slots, 960/1920-second spans, thirty cycles, ten resets and separate 5000 ms per-cycle and final observations, with unchanged scored clocks and heap/resource screens. Inclusive child budgets and watchdogs are 2040/3000 seconds. These are declared bounds; live acceptance and measured performance remain unverified.
+
+- Track the seven released share-group APIs (keys 76–79 and 90–92) in the Kafka 4.4.0 and 4.3.1 message snapshots and regenerate their protocol compatibility inventory. Source inventory alone does not add share-group support.
+- Add a Java share-consumer interoperability member and classpath probe.
+- The Java message-vector generator writes 46 share-group vectors (24 requests, 22 responses), including Records bytes, unknown tagged fields at every nesting and Java's own acknowledgement batching; they need `KAFKA_CLIENTS_VERSION=4.4.0`.
+- Add share-group fixtures, finalized feature captures and configuration-readback checks.
+- Add independent wire pairs for ShareGroupHeartbeat v1, ShareFetch v2 and ShareAcknowledge v2, a `share` scripted-cluster profile and literal-row `shareScript`, checked against the Java message vectors.
+- Add independent wire pairs for ShareGroupDescribe v1, DescribeShareGroupOffsets v1, AlterShareGroupOffsets v0 and DeleteShareGroupOffsets v0, checked against the Java message vectors, so every pair the `share` scripted-cluster profile advertises has one. Share administration is covered over real Brokers on that profile, including the complete frame and connection slot of all seven share requests.
+
 ### Phase 9D — Client, security and admin breadth
 
 #### Behavior changes

@@ -60,4 +60,11 @@ module.exports = {
   ConsumerGroupDescribe: 69, // KIP-848 admin counterpart
   ListConfigResources: 74,
   DescribeTopicPartitions: 75, // KIP-966 admin describe, paginated
+  ShareGroupHeartbeat: 76, // KIP-932; keys 83-87 are the broker-internal share coordinator
+  ShareGroupDescribe: 77,
+  ShareFetch: 78,
+  ShareAcknowledge: 79,
+  DescribeShareGroupOffsets: 90,
+  AlterShareGroupOffsets: 91,
+  DeleteShareGroupOffsets: 92,
 }
