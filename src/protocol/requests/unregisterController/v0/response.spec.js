@@ -1,5 +1,6 @@
 const response = require('./response')
 const wire = require('../../../../../testHelpers/wire/unregisterControllerV0')
+const golden = require('../fixtures/v0_response.json')
 const { KafkaJSPartialMessageError, KafkaJSProtocolError } = require('../../../../errors')
 
 const decoded = (hex) => response.decode(Buffer.from(hex, 'hex'))
@@ -7,7 +8,7 @@ const tag = (n) => ({ tag: n, value: Buffer.from([0x78]) })
 
 describe('Protocol > Requests > UnregisterController > v0 response', () => {
   test('decodes success with null message byte for byte', async () => {
-    const hex = '0000001900000000'
+    const { hex } = golden
     expect(wire.buildResponse({ throttleTimeMs: 25 }).toString('hex')).toBe(hex)
     expect(await decoded(hex)).toEqual({
       throttleTimeMs: 25,
@@ -72,7 +73,7 @@ describe('Protocol > Requests > UnregisterController > v0 response', () => {
   })
 
   test('applies response throttle to the client', async () => {
-    const body = await decoded('0000001900000000')
+    const body = await decoded(golden.hex)
     expect(body.throttleTime).toBe(0)
     expect(body.clientSideThrottleTime).toBe(25)
     expect(await response.parse(body)).toBe(body)
