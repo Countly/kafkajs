@@ -122,7 +122,9 @@ public class CountingTelemetryReporter implements MetricsReporter, ClientTelemet
         return exporter;
     }
 
-    private void export(ClientTelemetryContext context, ClientTelemetryPayload payload) {
+    // Identity allocation and enqueue form one ordered operation. Concurrent callbacks must not
+    // publish a later sequence while an earlier callback is still decoding its payload.
+    private synchronized void export(ClientTelemetryContext context, ClientTelemetryPayload payload) {
         try {
             ByteBuffer buf = payload.data().asReadOnlyBuffer();
             byte[] data = new byte[buf.remaining()];

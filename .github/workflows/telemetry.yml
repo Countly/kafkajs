@@ -110,12 +110,14 @@ jobs:
         if: matrix.group == 'telemetry-java'
         timeout-minutes: 4
         run: timeout -k 5s 200s bash scripts/e2e/telemetry/fetch-interop.sh
-      - name: Run the observer checks with the independent Java decoder
+      - name: Run reporter ordering and observer checks with the independent Java decoder
         if: matrix.group == 'telemetry-reporter' && matrix.kafka == '4.3.1'
-        timeout-minutes: 3
+        timeout-minutes: 4
         env:
           TMPDIR: ${{ runner.temp }}
-        run: timeout -k 10s 150s npx jest --runInBand --ci --testPathPatterns 'testHelpers/__tests__/telemetryFixtures\.spec\.js$'
+        run: |
+          timeout -k 5s 60s bash scripts/e2e/telemetry/test-reporter-order.sh
+          timeout -k 10s 150s npx jest --runInBand --ci --testPathPatterns 'testHelpers/__tests__/telemetryFixtures\.spec\.js$'
       - name: Preflight isolated project ownership
         timeout-minutes: 2
         run: timeout -k 5s 90s node scripts/e2e/telemetry/ci.js preflight

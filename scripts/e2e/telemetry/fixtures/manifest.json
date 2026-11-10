@@ -319,7 +319,7 @@
       "imageOpenTelemetryProtoJarSha256 (the broker's own, 1.3.2-alpha, not used by the fixture)": "5e5d61a86cbdbc1db8c806894b6e4e253ea151671903ed51c021c705f7c37440",
       "reporterJar": {
         "path": "scripts/e2e/telemetry/fixtures/counting-telemetry-reporter-4.3.1.jar",
-        "sha256": "e04798357b0a22babcbb4b55890ebd6a3264c678830e4a06847d6854e4511aa7",
+        "sha256": "72935e20783a73d9d2a6c5026e073b6fd21464175a5d0593432bbed58b7e9bb9",
         "compiledAgainst": "kafka-clients-4.3.1.jar (Maven Central, sha256 52501b7b47510c66f898871adaf6d2968ab7246561d44ced43643a8a587f0b36)"
       },
       "javaClientJar": {
@@ -342,7 +342,7 @@
       "imageOpenTelemetryProtoJarSha256 (the broker's own, 1.3.2-alpha, not used by the fixture)": "5e5d61a86cbdbc1db8c806894b6e4e253ea151671903ed51c021c705f7c37440",
       "reporterJar": {
         "path": "scripts/e2e/telemetry/fixtures/counting-telemetry-reporter-4.2.2.jar",
-        "sha256": "e04798357b0a22babcbb4b55890ebd6a3264c678830e4a06847d6854e4511aa7",
+        "sha256": "72935e20783a73d9d2a6c5026e073b6fd21464175a5d0593432bbed58b7e9bb9",
         "compiledAgainst": "kafka-clients-4.2.2.jar (Maven Central, sha256 109b6c65c134fd65a424563c8377510f4d42e278e9fef0961d0450173e65496a)"
       },
       "javaClientJar": {
@@ -383,7 +383,7 @@
     }
   },
   "scripts": {
-    "CountingTelemetryReporter.java": "e9dc518682042474b0217883b24ebb0fb75bf2275901c5fa4df15e6487abb96a",
+    "CountingTelemetryReporter.java": "f624d0d3b774048ce50c21d418fe61429384a37e35fbc11d61170e2ea8e6cb9c",
     "JavaTelemetryClient.java": "27e3fb34c247f514a0e07a07e85448e7c1bd6bc27eaa3fe301af04721f01eab3",
     "OtlpGoldenVectors.java": "464246d43489c545218e3204aecd89ce193ba9c07def5eb58d346dac53edaa73",
     "base-ports.override.yml": "945b4b163977dbcdfc05301865fb2771aef8cb1ec40795aed1fff0a951276429",
