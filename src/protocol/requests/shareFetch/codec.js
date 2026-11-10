@@ -95,14 +95,15 @@ class ShareDecoder extends Decoder {
     return value
   }
 
-  /** @returns {number} @throws {KafkaJSPartialMessageError} on a null or truncated required array */
+  /** @returns {number} @throws {KafkaJSPartialMessageError} on a null, over-limit or truncated required array */
   arrayLength() {
     const length = this.readUVarInt()
     if (length === 0) {
       throw new KafkaJSPartialMessageError('Null required array')
     }
-    this.ensureReadable(length - 1, 'compact array')
-    return length - 1
+    const count = this.assertCount(length - 1, 'compact array')
+    this.ensureReadable(count, 'compact array')
+    return count
   }
 
   /** @param {function(ShareDecoder): *} reader @returns {Array} Required compact array. */
