@@ -8,16 +8,21 @@
  *   node scripts/benchmarks/compareDecoderBounds.js --input <file>
  *
  * `--run` extracts the baseline with `git archive` (a full-history checkout is required) into
- * `.tmp/decoder-comparison/baseline`, links this tree's `node_modules` into it, runs every arm's
- * benchmark from each tree in alternating old/new order, writes every raw invocation under
- * `--raw`, validates and compares the medians, writes the summary to `--out` and removes the
- * baseline tree again. `--input` validates and compares an existing summary.
+ * `.tmp/decoder-comparison/baseline`, links this tree's `node_modules` into it, copies the
+ * benchmark scripts the baseline predates over from this tree, runs every arm's benchmark from
+ * each tree in alternating old/new order, writes every raw invocation under `--raw`, validates and
+ * compares the medians, writes the summary to `--out` and removes the baseline tree again.
+ * `--input` validates and compares an existing summary.
  *
- * The input is `{ baselineSha, candidateSha, node, arms: [{ name, oldNsPerOp, newNsPerOp }] }`
- * with at least 5 positive finite samples per side. A slowdown above 5% passes only with an entry
- * `{ arm, maxSlowdownPercent, ruling }` in `decoderBoundsExceptions.json`, and only up to that
- * bound. Missing, incomplete or incomparable data never passes, with or without an exception.
- * Exit code 0 only when every required arm is complete and within its limit, otherwise 1.
+ * The input is
+ * `{ baselineSha, candidateSha, node, arms: [{ name, oldNsPerOp, newNsPerOp }], unavailable }`
+ * with at least 5 positive finite samples per side. Every known arm is either in `arms` or, when
+ * it is not required, named in `unavailable` (the arms no tree has a codec for); an arm in neither
+ * or in both, a required arm or an unknown name in `unavailable`, fails. A slowdown above 5%
+ * passes only with an entry `{ arm, maxSlowdownPercent, ruling }` in `decoderBoundsExceptions.json`,
+ * and only up to that bound. Missing, incomplete or incomparable data never passes, with or
+ * without an exception. Exit code 0 only when every required arm is complete and within its
+ * limit, otherwise 1.
  */
 const fs = require('fs')
 const path = require('path')
@@ -40,6 +45,14 @@ const USAGE =
 
 const FRAME_SHAPES = ['64b', '64k', '1m', 'coalesced', 'byte-chunks']
 const COMPRESSED_ARMS = ['gzip', 'zstd', 'lz4', 'snappy']
+const ARRAY_DECODE_SCRIPT = 'scripts/benchmarks/arrayDecode.js'
+const ARRAY_READERS = [
+  'readArray',
+  'readVarIntArray',
+  'readUVarIntArray',
+  'readArrayAsync',
+  'readUVarIntArrayAsync',
+]
 
 /**
  * @typedef {object} Arm
@@ -47,6 +60,8 @@ const COMPRESSED_ARMS = ['gzip', 'zstd', 'lz4', 'snappy']
  * @property {boolean} required a missing or unavailable required arm fails the gate
  * @property {string[]} argv command and arguments, run with the tree as working directory
  * @property {string} metric key of the benchmark's JSON line that holds nanoseconds per operation
+ * @property {string} [overlay] script of this tree that the baseline tree may predate: it is copied
+ *   into the baseline tree, so both trees run the same bytes
  */
 
 /** @type {Arm[]} */
@@ -70,9 +85,16 @@ const ARMS = [
     ],
     metric: 'nsPerOp',
   })),
+  ...ARRAY_READERS.map((reader) => ({
+    name: `array-decode:${reader}`,
+    required: true,
+    argv: ['node', ARRAY_DECODE_SCRIPT, '--arm', reader],
+    metric: 'nsPerOp',
+    overlay: ARRAY_DECODE_SCRIPT,
+  })),
 ]
 
-const REQUIRED_ARMS = ARMS.filter((arm) => arm.required).map((arm) => arm.name)
+const OVERLAY_FILES = [...new Set(ARMS.flatMap(({ overlay }) => overlay ?? []))]
 
 /**
  * @param {number[]} values at least one number
@@ -130,13 +152,53 @@ const validateInput = (input) => {
       }
     }
   }
-  for (const name of REQUIRED_ARMS) {
-    if (!seen.has(name)) {
-      problems.push(`required arm ${name} is missing`)
+
+  const declared = declaredUnavailable(input.unavailable, seen, problems)
+  for (const { name, required } of ARMS) {
+    if (seen.has(name) || (!required && declared.has(name))) {
+      continue
     }
+    problems.push(
+      required
+        ? `required arm ${name} is missing`
+        : `${name} has neither measurements nor an unavailable disposition`
+    )
   }
 
   return problems
+}
+
+/**
+ * Checks the arms an input declares unavailable: each must be a known, non-required arm that is
+ * not also measured and not declared twice.
+ * @param {*} unavailable the input's `unavailable`; absent means none
+ * @param {Set<string>} measured the names of the arms the input measures
+ * @param {string[]} problems receives one message per violation
+ * @returns {Set<string>} the declared names that are valid
+ */
+const declaredUnavailable = (unavailable = [], measured, problems) => {
+  if (!Array.isArray(unavailable)) {
+    problems.push('unavailable must be an array of arm names')
+    return new Set()
+  }
+
+  const declared = new Set()
+  for (const name of unavailable) {
+    const arm = ARMS.find((known) => known.name === name)
+    if (!arm) {
+      problems.push(`${String(name)} is not a known arm and cannot be unavailable`)
+    } else if (arm.required) {
+      problems.push(`required arm ${name} cannot be unavailable`)
+    } else if (measured.has(name)) {
+      problems.push(`${name} is both measured and unavailable`)
+    } else if (declared.has(name)) {
+      problems.push(`${name} is declared unavailable twice`)
+    } else {
+      declared.add(name)
+    }
+  }
+
+  return declared
 }
 
 /**
@@ -330,15 +392,34 @@ class MeasurementCollector {
 }
 
 /**
- * Extracts a commit into an empty directory and links this tree's dependencies into it.
+ * Copies files of the candidate tree over the same paths of another tree, so that a benchmark
+ * script the other tree predates runs there as the same bytes.
+ * @param {object} options
+ * @param {string} options.repoRoot the candidate tree
+ * @param {string} options.dir the tree to copy into
+ * @param {string[]} options.files paths relative to the tree roots
+ * @returns {void}
+ * @throws {Error} when a file is missing from the candidate tree
+ */
+const overlayFiles = ({ repoRoot, dir, files }) => {
+  for (const file of files) {
+    fs.mkdirSync(path.dirname(path.join(dir, file)), { recursive: true })
+    fs.copyFileSync(path.join(repoRoot, file), path.join(dir, file))
+  }
+}
+
+/**
+ * Extracts a commit into an empty directory, links this tree's dependencies into it and copies the
+ * overlay files of this tree over it.
  * @param {object} options
  * @param {string} options.repoRoot the candidate tree
  * @param {string} options.sha the 40-hex baseline commit
  * @param {string} options.dir the directory to fill; anything already there is removed
+ * @param {string[]} [options.overlay] files of the candidate tree to copy into the extracted tree
  * @returns {void}
  * @throws {Error} when the commit is not in this checkout, such as a shallow one
  */
-const prepareBaselineTree = ({ repoRoot, sha, dir }) => {
+const prepareBaselineTree = ({ repoRoot, sha, dir, overlay = [] }) => {
   try {
     execFileSync('git', ['cat-file', '-e', `${sha}^{commit}`], { cwd: repoRoot, stdio: 'pipe' })
   } catch {
@@ -352,6 +433,7 @@ const prepareBaselineTree = ({ repoRoot, sha, dir }) => {
   execFileSync('tar', ['-xf', tarball, '-C', dir])
   fs.rmSync(tarball)
   fs.symlinkSync(path.join(repoRoot, 'node_modules'), path.join(dir, 'node_modules'), 'dir')
+  overlayFiles({ repoRoot, dir, files: overlay })
 }
 
 /**
@@ -430,7 +512,12 @@ const main = (argv, log = console.log) => {
       input = JSON.parse(fs.readFileSync(options.input, 'utf8'))
     } else {
       extracted = true
-      prepareBaselineTree({ repoRoot: REPO_ROOT, sha: options.baseline, dir: baselineDir })
+      prepareBaselineTree({
+        repoRoot: REPO_ROOT,
+        sha: options.baseline,
+        dir: baselineDir,
+        overlay: OVERLAY_FILES,
+      })
       const collector = new MeasurementCollector({
         trees: { old: baselineDir, new: REPO_ROOT },
         rawDir: options.raw,
@@ -472,6 +559,7 @@ module.exports = {
   compare,
   formatReport,
   main,
+  overlayFiles,
   parseArgs,
   parseExceptions,
   prepareBaselineTree,

@@ -6,6 +6,7 @@ const {
   MeasurementCollector,
   compare,
   main,
+  overlayFiles,
   parseArgs,
   parseExceptions,
 } = require('../compareDecoderBounds')
@@ -13,21 +14,45 @@ const {
 const BASELINE = 'a'.repeat(40)
 const CANDIDATE = 'b'.repeat(40)
 const OPTIONAL = 'record-batch:zstd'
+const OPTIONAL_ARMS = ARMS.filter((arm) => !arm.required).map(({ name }) => name)
 
 const constant = (value) => Array.from({ length: 5 }, () => value)
 
-/** @returns {object} a complete, comparable input in which every arm is 100 ns in both trees */
+/** @returns {object} an arm that is 100 ns in both trees */
+const steadyArm = (name) => ({ name, oldNsPerOp: constant(100), newNsPerOp: constant(100) })
+
+/**
+ * @returns {object} a complete, comparable input: every required arm is 100 ns in both trees and
+ *   every optional arm is declared unavailable
+ */
 const completeInput = (overrides = {}) => ({
   baselineSha: BASELINE,
   candidateSha: CANDIDATE,
   node: 'v26.0.0',
-  arms: ARMS.filter((arm) => arm.required).map(({ name }) => ({
-    name,
-    oldNsPerOp: constant(100),
-    newNsPerOp: constant(100),
-  })),
+  arms: ARMS.filter((arm) => arm.required).map(({ name }) => steadyArm(name)),
+  unavailable: [...OPTIONAL_ARMS],
   ...overrides,
 })
+
+/** @returns {Function} runs `fn` with a temporary directory that is removed afterwards */
+const inTempDir = (fn) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'decoder-compare-'))
+  try {
+    return fn(dir)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+/** @returns {{ status: number, report: string }} what `--input` exits with and prints for the input */
+const runInput = (input) =>
+  inTempDir((dir) => {
+    const file = path.join(dir, 'in.json')
+    fs.writeFileSync(file, JSON.stringify(input))
+    const lines = []
+    const status = main(['--input', file], (line) => lines.push(line))
+    return { status, report: lines.join('\n') }
+  })
 
 /** @returns {object} the input with one arm's new-side samples replaced */
 const withNew = (name, value) => {
@@ -100,6 +125,127 @@ describe('Decoder performance comparison', () => {
 
     expect(main(['--input', '/nonexistent/decoder-comparison.json'], () => {})).toBe(1)
     expect(main(['--run'], () => {})).toBe(1)
+  })
+
+  const PERMISSIVE = parseExceptions(
+    ARMS.map(({ name }) => ({ arm: name, maxSlowdownPercent: 1000, ruling: 'test ruling' }))
+  )
+
+  test.each(OPTIONAL_ARMS)(
+    'refuses an input that leaves %s with neither measurements nor an unavailable disposition',
+    (name) => {
+      const input = completeInput({ unavailable: OPTIONAL_ARMS.filter((other) => other !== name) })
+
+      const result = compare(input, NO_EXCEPTIONS)
+
+      expect(result.pass).toBe(false)
+      expect(result.problems).toEqual([
+        `${name} has neither measurements nor an unavailable disposition`,
+      ])
+      expect(compare(input, PERMISSIVE).pass).toBe(false)
+      expect(runInput(input).status).toBe(1)
+    }
+  )
+
+  it('refuses an input that omits every optional arm and says so through --input', () => {
+    const everyOptionalOmitted = completeInput({ unavailable: [] })
+    const { unavailable, ...withoutTheField } = completeInput()
+
+    expect(compare(everyOptionalOmitted, NO_EXCEPTIONS).pass).toBe(false)
+    expect(compare(withoutTheField, NO_EXCEPTIONS).pass).toBe(false)
+
+    const exit = runInput(everyOptionalOmitted)
+    expect(exit.status).toBe(1)
+    for (const name of OPTIONAL_ARMS) {
+      expect(exit.report).toContain(`PROBLEM  ${name} has neither measurements nor`)
+    }
+    expect(exit.report).toContain('decoder performance: FAIL')
+    expect(runInput(completeInput())).toMatchObject({ status: 0 })
+    expect(unavailable).toEqual(OPTIONAL_ARMS)
+  })
+
+  const REQUIRED = ARMS.find((arm) => arm.required).name
+  const unpermitted = {
+    'an arm that is both measured and unavailable': [
+      () => completeInput({ arms: [...completeInput().arms, steadyArm(OPTIONAL)] }),
+      `${OPTIONAL} is both measured and unavailable`,
+    ],
+    'a required arm declared unavailable': [
+      () =>
+        completeInput({
+          arms: completeInput().arms.filter((arm) => arm.name !== REQUIRED),
+          unavailable: [...OPTIONAL_ARMS, REQUIRED],
+        }),
+      `required arm ${REQUIRED} cannot be unavailable`,
+    ],
+    'an unknown arm declared unavailable': [
+      () => completeInput({ unavailable: [...OPTIONAL_ARMS, 'record-batch:brotli'] }),
+      'record-batch:brotli is not a known arm',
+    ],
+    'an arm declared unavailable twice': [
+      () => completeInput({ unavailable: [...OPTIONAL_ARMS, OPTIONAL] }),
+      `${OPTIONAL} is declared unavailable twice`,
+    ],
+    'an unavailable list that is not an array': [
+      () => completeInput({ unavailable: OPTIONAL }),
+      'unavailable must be an array',
+    ],
+  }
+
+  test.each(Object.entries(unpermitted))('refuses %s', (label, [build, problem]) => {
+    const input = build()
+
+    const result = compare(input, NO_EXCEPTIONS)
+
+    expect(result.pass).toBe(false)
+    expect(result.problems.join('\n')).toContain(problem)
+    expect(compare(input, PERMISSIVE).pass).toBe(false)
+    expect(runInput(input).status).toBe(1)
+  })
+
+  it('measures a real response through each array reader the decoder bounds, in both trees', () => {
+    const arrayArms = ARMS.filter((arm) => arm.name.startsWith('array-decode:'))
+
+    expect(arrayArms.map((arm) => arm.name)).toEqual([
+      'array-decode:readArray',
+      'array-decode:readVarIntArray',
+      'array-decode:readUVarIntArray',
+      'array-decode:readArrayAsync',
+      'array-decode:readUVarIntArrayAsync',
+    ])
+    for (const arm of arrayArms) {
+      const reader = arm.name.split(':')[1]
+      expect(arm.required).toBe(true)
+      expect(arm.metric).toBe('nsPerOp')
+      expect(arm.argv.slice(0, 2)).toEqual(['node', 'scripts/benchmarks/arrayDecode.js'])
+      expect(arm.argv).toContain(reader)
+      expect(arm.overlay).toBe('scripts/benchmarks/arrayDecode.js')
+      expect(fs.existsSync(path.join(__dirname, '..', '..', '..', arm.overlay))).toBe(true)
+    }
+  })
+
+  it('overlays the candidate benchmark scripts into the baseline tree', () => {
+    inTempDir((dir) => {
+      const repoRoot = path.join(dir, 'candidate')
+      const tree = path.join(dir, 'baseline')
+      const write = (root, file, text) => {
+        fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true })
+        fs.writeFileSync(path.join(root, file), text)
+      }
+      const read = (root, file) => fs.readFileSync(path.join(root, file), 'utf8')
+      write(repoRoot, 'scripts/benchmarks/a.js', 'candidate a')
+      write(repoRoot, 'scripts/benchmarks/b.js', 'candidate b')
+      write(tree, 'scripts/benchmarks/a.js', 'baseline a')
+
+      const files = ['scripts/benchmarks/a.js', 'scripts/benchmarks/b.js']
+      overlayFiles({ repoRoot, dir: tree, files })
+
+      expect(read(tree, files[0])).toBe('candidate a')
+      expect(read(tree, files[1])).toBe('candidate b')
+      expect(() =>
+        overlayFiles({ repoRoot, dir: tree, files: ['scripts/benchmarks/missing.js'] })
+      ).toThrow(/missing\.js/)
+    })
   })
 
   it('accepts a slowdown covered by a recorded exception and rejects one beyond it', () => {
@@ -184,7 +330,7 @@ describe('Decoder performance comparison', () => {
       expect(arm.oldNsPerOp).toEqual(constant(100))
       expect(arm.newNsPerOp).toEqual(constant(101))
     }
-    expect(compare(completeInput({ arms }), NO_EXCEPTIONS).pass).toBe(true)
+    expect(compare(completeInput({ arms, unavailable: [] }), NO_EXCEPTIONS).pass).toBe(true)
 
     const first = ARMS[0].argv.join(' ')
     const forFirst = calls.filter((call) => call.endsWith(first))
