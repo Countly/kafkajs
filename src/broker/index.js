@@ -2160,6 +2160,24 @@ module.exports = class Broker {
     return { ...response, results: request.request.apiVersion === 2 ? null : response.results }
   }
 
+  /**
+   * Asks this broker to unregister one controller (KIP-1312).
+   * @param {{controllerId: number}} options the controller id, already validated by the caller
+   * @returns {Promise<object>} the decoded response
+   * @throws {KafkaJSServerDoesNotSupportApiKey} when this broker does not offer RPC 94
+   * @throws {KafkaJSProtocolError} for a broker error code, with `brokerErrorMessage` set
+   * @throws {Error} connection, protocol or deadline failure
+   */
+  async unregisterController({ controllerId }) {
+    const build = this.clusterRequest(
+      apiKeys.UnregisterController,
+      requests.UnregisterController,
+      0,
+      'unregisterController'
+    )
+    return this[PRIVATE.SEND_REQUEST](build({ controllerId }))
+  }
+
   /** Describes broker endpoints; fenced listing requires v2. @param {object} options flags @returns {Promise<object>} raw cluster body @throws {Error} capability, protocol or deadline failure */
   async describeCluster(options) {
     const build = this.clusterRequest(
