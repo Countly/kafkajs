@@ -391,13 +391,7 @@ const requiredLiveCatalogue = (record) => {
     if (!configured) {
       exact(results.inapplicable, ['drop', 'blackhole', 'late'], 'inapplicable fault')
       assert(Object.values(results.inapplicable).every((v) => v === 'absent telemetry transport'))
-      assert.deepEqual(results.share, {
-        status: 'rejected',
-        name: 'KafkaJSShareGroupsNotSupportedError',
-        reason: 'api-version-range',
-        apiKey: 78,
-        shareVersion: 0,
-      })
+      assertRefusal(results.share, { reason: 'api-version-range', apiKey: 78 })
     } else {
       assert.equal(results.share?.recovery?.owner, 'share', 'Missing configured share recovery')
       assert.equal(results.share.recovery.mode, 'drop')
@@ -821,17 +815,33 @@ const assertShareRefusal = (outcome, line) => {
     assert.deepEqual(outcome, { status: 'connected' })
     return
   }
+  const reason = line === '4.0.2' ? 'api-not-advertised' : 'api-version-range'
+  assertRefusal(outcome, { reason, apiKey: line === '4.0.2' ? 76 : 78 })
+}
+
+/**
+ * Compares a recorded share refusal exactly; a recorder that keeps the error message must hold
+ * the message the client builds from the reason.
+ * @param {object} outcome recorded connect outcome
+ * @param {{ reason: string, apiKey: number }} expected
+ * @throws {Error} when any field differs
+ */
+const assertRefusal = (outcome, { reason, apiKey }) => {
+  const { message, ...fields } = outcome
   assert.deepEqual(
-    outcome,
+    fields,
     {
       status: 'rejected',
       name: 'KafkaJSShareGroupsNotSupportedError',
-      reason: line === '4.0.2' ? 'api-not-advertised' : 'api-version-range',
-      apiKey: line === '4.0.2' ? 76 : 78,
+      reason,
+      apiKey,
       shareVersion: 0,
     },
     'Share capability refusal differs'
   )
+  if (message !== undefined) {
+    assert.equal(message, `Share groups refused: ${reason}`, 'Share capability refusal differs')
+  }
 }
 
 /**
