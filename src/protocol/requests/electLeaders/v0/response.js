@@ -1,11 +1,14 @@
 const { KafkaJSPartialMessageError } = require('../../../../errors')
 const Decoder = require('../../../decoder')
 const { createErrorFromCode } = require('../../../error')
-/** Reads a nonnullable classic array without accepting the null sentinel. @param {Decoder} d cursor @param {Function} read entry reader @returns {Array} entries @throws {Error} invalid length */
+/** Reads a nonnullable classic array without accepting the null sentinel, bounded by the decoder's count limit. @param {Decoder} d cursor @param {Function} read entry reader @returns {Array} entries @throws {Error} invalid, over-limit or truncated length */
 const readClassicArray = (d, read) => {
   const length = d.readInt32()
+  d.assertCount(length, 'array')
   d.ensureReadable(length, 'array')
-  return Array.from({ length }, () => read(d))
+  const values = []
+  for (let i = 0; i < length; i++) values.push(read(d))
+  return values
 }
 /** Reads one complete wire structure. @param {Decoder} d cursor @returns {object} fields @throws {Error} malformed bytes */
 const readResponseReplicaElectionResultsPartitionResult = (d) => {

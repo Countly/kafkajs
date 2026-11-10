@@ -16,6 +16,12 @@ const OTHER_BITS = 0x7f // 127
 
 const UUID_SIZE = 16
 
+/** Largest decoded array count accepted; matches the Apache Kafka 4.4 client's `MessageUtil`. */
+const MAX_ARRAY_COUNT = 1000000
+
+/** Largest tagged-field count accepted in one tag section. */
+const MAX_TAGGED_FIELDS = 10000
+
 /**
  * Shared result for the common empty tag section, so the per-partition tag buffers of a
  * flexible response cost no allocation. Its mutators throw so it can never be poisoned.
@@ -34,6 +40,15 @@ const EMPTY_TAGGED_FIELDS = Object.freeze(
     },
   })
 )
+
+/**
+ * @param {number} count the decoded count
+ * @param {number} limit the limit it exceeds
+ * @param {string} label what was being counted, for the message
+ * @returns {KafkaJSPartialMessageError} the non-retriable error for an over-limit count
+ */
+const countLimitError = (count, limit, label) =>
+  new KafkaJSPartialMessageError(`${label} count ${count} is above the limit of ${limit}`)
 
 module.exports = class Decoder {
   static int32Size() {
@@ -88,6 +103,24 @@ module.exports = class Decoder {
           `but only ${this.buffer.length - this.offset} byte(s) remain`
       )
     }
+  }
+
+  /**
+   * Refuses a decoded array count above 1,000,000 before anything is allocated or read for it.
+   * Complements `ensureReadable`, which only checks that the bytes exist: a large buffer could
+   * otherwise make a hostile count allocate and decode millions of elements. Call it after the
+   * reader's null and negative-length handling; compact readers pass the wire value minus one.
+   * @param {number} count the decoded entry count
+   * @param {string} label the reader or field, for the error
+   * @returns {number} `count`
+   * @throws {KafkaJSPartialMessageError} (non-retriable) when `count` is above the limit
+   */
+  assertCount(count, label) {
+    if (count > MAX_ARRAY_COUNT) {
+      throw countLimitError(count, MAX_ARRAY_COUNT, label)
+    }
+
+    return count
   }
 
   readInt8() {
@@ -287,6 +320,12 @@ module.exports = class Decoder {
     return result
   }
 
+  /**
+   * INT32-counted ARRAY; a count of -1 reads as an empty array.
+   * @param {(decoder: Decoder) => *} reader reads one element
+   * @returns {Array}
+   * @throws {KafkaJSPartialMessageError} when the count is above the limit or the bytes are short
+   */
   readArray(reader) {
     const length = this.readInt32()
 
@@ -294,15 +333,22 @@ module.exports = class Decoder {
       return []
     }
 
+    this.assertCount(length, 'readArray')
     this.ensureReadable(length, 'readArray')
-    const array = new Array(length)
+    const array = []
     for (let i = 0; i < length; i++) {
-      array[i] = reader(this)
+      array.push(reader(this))
     }
 
     return array
   }
 
+  /**
+   * Signed-varint-counted array; a count of -1 reads as an empty array.
+   * @param {(decoder: Decoder) => *} reader reads one element
+   * @returns {Array}
+   * @throws {KafkaJSPartialMessageError} when the count is above the limit or the bytes are short
+   */
   readVarIntArray(reader) {
     const length = this.readVarInt()
 
@@ -310,17 +356,24 @@ module.exports = class Decoder {
       return []
     }
 
+    this.assertCount(length, 'readVarIntArray')
     this.ensureReadable(length, 'readVarIntArray')
-    const array = new Array(length)
+    const array = []
     for (let i = 0; i < length; i++) {
-      array[i] = reader(this)
+      array.push(reader(this))
     }
 
     return array
   }
 
-  /* According to the protocol type documentation: https://kafka.apache.org/protocol#protocol_types,
-  a compact array with length zero is a null array. An array with length 1 is an empty array. */
+  /**
+   * COMPACT_ARRAY: an unsigned varint holding the count + 1. According to the protocol type
+   * documentation: https://kafka.apache.org/protocol#protocol_types, a compact array with length
+   * zero is a null array. An array with length 1 is an empty array.
+   * @param {(decoder: Decoder) => *} reader reads one element
+   * @returns {Array|null} null for the null array
+   * @throws {KafkaJSPartialMessageError} when the count is above the limit or the bytes are short
+   */
   readUVarIntArray(reader) {
     const length = this.readUVarInt()
 
@@ -328,15 +381,23 @@ module.exports = class Decoder {
       return null
     }
 
-    this.ensureReadable(length - 1, 'readUVarIntArray')
-    const array = new Array(length - 1)
-    for (let i = 0; i < length - 1; i++) {
-      array[i] = reader(this)
+    const count = length - 1
+    this.assertCount(count, 'readUVarIntArray')
+    this.ensureReadable(count, 'readUVarIntArray')
+    const array = []
+    for (let i = 0; i < count; i++) {
+      array.push(reader(this))
     }
 
     return array
   }
 
+  /**
+   * `readArray` with each element read through an async reader, awaited one after another.
+   * @param {(decoder: Decoder) => Promise<*>|*} reader reads one element
+   * @returns {Promise<Array>}
+   * @throws {KafkaJSPartialMessageError} when the count is above the limit or the bytes are short
+   */
   async readArrayAsync(reader) {
     const length = this.readInt32()
 
@@ -344,10 +405,11 @@ module.exports = class Decoder {
       return []
     }
 
+    this.assertCount(length, 'readArrayAsync')
     this.ensureReadable(length, 'readArrayAsync')
-    const array = new Array(length)
+    const array = []
     for (let i = 0; i < length; i++) {
-      array[i] = await reader(this)
+      array.push(await reader(this))
     }
 
     return array
@@ -359,6 +421,7 @@ module.exports = class Decoder {
    * Fetch v12+ partition's record batch.
    * @param {(decoder: Decoder) => Promise<*>} reader
    * @returns {Promise<Array|null>}
+   * @throws {KafkaJSPartialMessageError} when the count is above the limit or the bytes are short
    */
   async readUVarIntArrayAsync(reader) {
     const length = this.readUVarInt()
@@ -367,10 +430,12 @@ module.exports = class Decoder {
       return null
     }
 
-    this.ensureReadable(length - 1, 'readUVarIntArrayAsync')
-    const array = new Array(length - 1)
-    for (let i = 0; i < length - 1; i++) {
-      array[i] = await reader(this)
+    const count = length - 1
+    this.assertCount(count, 'readUVarIntArrayAsync')
+    this.ensureReadable(count, 'readUVarIntArrayAsync')
+    const array = []
+    for (let i = 0; i < count; i++) {
+      array.push(await reader(this))
     }
 
     return array
@@ -422,13 +487,18 @@ module.exports = class Decoder {
    * per refresh.
    *
    * @returns {Map<number, Buffer>} raw tagged values, in the order they appeared
-   * @throws {KafkaJSPartialMessageError} when the section is malformed or truncated
+   * @throws {KafkaJSPartialMessageError} when the section is malformed or truncated, or declares
+   *   more than 10,000 fields (checked before the Map is allocated)
    */
   readTaggedFields() {
     const numberOfTaggedFields = this.readUVarInt()
 
     if (numberOfTaggedFields === 0) {
       return EMPTY_TAGGED_FIELDS
+    }
+
+    if (numberOfTaggedFields > MAX_TAGGED_FIELDS) {
+      throw countLimitError(numberOfTaggedFields, MAX_TAGGED_FIELDS, 'Tagged fields')
     }
 
     const taggedFields = new Map()
