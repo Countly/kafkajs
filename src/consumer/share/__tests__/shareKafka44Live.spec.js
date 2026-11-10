@@ -416,17 +416,18 @@ enabled('Share Kafka 4.4 (live)', () => {
           () => assignedPartitions(heartbeatAnswers(f, 'A'), topicId).length > 1,
           { label: 'A losing a partition to B' }
         )
-        const [initial, reduced] = assignedPartitions(heartbeatAnswers(f, 'A'), topicId)
-        const lost = initial.filter((partition) => !reduced.includes(partition))
-        expect(lost.length).toBeGreaterThan(0)
-        expect(reduced.length).toBeGreaterThan(0)
+        const assignments = () => assignedPartitions(heartbeatAnswers(f, 'A'), topicId)
+        const lostBy = (history) =>
+          history[0].filter((partition) => !history[history.length - 1].includes(partition))
+        expect(lostBy(assignments()).length).toBeGreaterThan(0)
+        expect(assignments()[assignments().length - 1].length).toBeGreaterThan(0)
 
         release()
         await pollUntil(
           scope,
           POLL_MS,
           () =>
-            lost.every(
+            lostBy(assignments()).every(
               (partition) =>
                 partitionLifecycle(fetchRequests(f, 'A'), topicId, partition).firstAcknowledged >= 0
             ),
@@ -434,13 +435,15 @@ enabled('Share Kafka 4.4 (live)', () => {
         )
 
         const requests = fetchRequests(f, 'A')
+        const history = assignments()
+        const lost = lostBy(history)
         for (const partition of lost) {
           const lifecycle = partitionLifecycle(requests, topicId, partition)
           expect(lifecycle.forgotten).toEqual([lifecycle.firstAcknowledged])
           expect(lifecycle.lastListed).toBe(lifecycle.firstAcknowledged)
           expect(requests[lifecycle.firstAcknowledged].shareSessionEpoch).toBeGreaterThan(0)
         }
-        for (const partition of reduced) {
+        for (const partition of history[history.length - 1]) {
           expect(partitionLifecycle(requests, topicId, partition).forgotten).toEqual([])
         }
         expect(memberA.crashes).toEqual([])
