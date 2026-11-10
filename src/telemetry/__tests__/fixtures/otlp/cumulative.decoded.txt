@@ -1,0 +1,25 @@
+resource_metrics {
+  resource {
+  }
+  scope_metrics {
+    scope {
+      name: "countly-kafkajs"
+      version: "3.0.0"
+    }
+    metrics {
+      name: "com.example.count"
+      unit: "1"
+      sum {
+        data_points {
+          start_time_unix_nano: 9223372036854775808
+          time_unix_nano: 18446744073709551615
+          as_int: 9223372036854775807
+        }
+        aggregation_temporality: AGGREGATION_TEMPORALITY_CUMULATIVE
+        is_monotonic: true
+      }
+    }
+  }
+}
+resourceDropped=0
+com.example.count|AS_INT|9223372036854775808|18446744073709551615|9223372036854775807

@@ -2216,3 +2216,317 @@ describe('share profile', () => {
     cluster.assertClean()
   })
 })
+
+describe('telemetry strict frames', () => {
+  const get = require('../../src/protocol/requests/getTelemetrySubscriptions/fixtures/java/getTelemetrySubscriptionsRequest-v0-zero.json')
+  const push = require('../../src/protocol/requests/pushTelemetry/fixtures/java/pushTelemetryRequest-v0-empty.json')
+  test.each([
+    ['GetTelemetrySubscriptions', 71, get],
+    ['PushTelemetry', 72, push],
+  ])('%s reads literal fields through a flexible frame', async (api, key, vector) => {
+    const cluster = createScriptedCluster({ nodes: NODES, profile: 'telemetry' })
+    const body = Buffer.from(vector.hex, 'hex')
+    const { socket, frames } = await exchange(cluster, frameOf(key, 0, body))
+    try {
+      expect(cluster.requests()).toHaveLength(1)
+      expect(cluster.requests()[0]).toMatchObject({
+        api,
+        apiKey: key,
+        version: 0,
+        correlationId: 1,
+        generation: 1,
+        fields: vector.fields,
+      })
+      expect(frames).toHaveLength(1)
+      expect(frames[0].readInt32BE(4)).toBe(1)
+      expect(frames[0][8]).toBe(0)
+      cluster.assertClean()
+    } finally {
+      socket.destroy()
+    }
+  })
+  test.each([
+    ['getTelemetrySubscriptionsV0', get],
+    ['pushTelemetryV0', push],
+  ])('%s skips an unknown request tag and rejects truncated tag values', (module, vector) => {
+    const pair = require(`../wire/${module}`)
+    const body = Buffer.from(vector.hex, 'hex')
+    const tagged = Buffer.concat([body.subarray(0, -1), Buffer.from('010703aabbcc', 'hex')])
+    expect(pair.readRequest(tagged)).toEqual(vector.fields)
+    expect(() => pair.readRequest(tagged.subarray(0, -1))).toThrow()
+  })
+  test('telemetry profile adds exactly two pairs to the default profile', () => {
+    expect(PROFILES.telemetry).toEqual([
+      ...PROFILES.default,
+      ['GetTelemetrySubscriptions', 0],
+      ['PushTelemetry', 0],
+    ])
+  })
+  test('a missing telemetry pair refuses before a response can be built', () => {
+    const cluster = createScriptedCluster({
+      nodes: NODES,
+      profile: 'telemetry',
+      advertise: { PushTelemetry: [1, 1] },
+    })
+    expect(() => cluster.pairFor('PushTelemetry', 1)).toThrow('no response builder')
+    cluster.assertClean()
+  })
+  test('unadvertised v0 refuses before body parsing', () => {
+    const cluster = createScriptedCluster({ nodes: NODES })
+    expect(() => cluster.accept(NODES[0], 1, frameOf(71, 0, Buffer.from(get.hex, 'hex')))).toThrow(
+      'cluster advertises no version'
+    )
+    cluster.assertClean()
+  })
+  test.each([
+    ['GetTelemetrySubscriptions', 71, get],
+    ['PushTelemetry', 72, push],
+  ])('%s refuses trailing bytes and a missing header tag', (_api, key, vector) => {
+    const cluster = createScriptedCluster({ nodes: NODES, profile: 'telemetry' })
+    const body = Buffer.from(vector.hex, 'hex')
+    expect(() =>
+      cluster.accept(NODES[0], 1, frameOf(key, 0, Buffer.concat([body, Buffer.from([0])])))
+    ).toThrow('its tag buffer')
+    const frame = frameOf(key, 0, body)
+    const badHeader = Buffer.concat([frame.subarray(0, 17), frame.subarray(18)])
+    badHeader.writeInt32BE(badHeader.length - 4, 0)
+    expect(() => cluster.accept(NODES[0], 1, badHeader)).toThrow()
+    cluster.assertClean()
+  })
+  test('null Metrics and wrong frame length refuse loudly', () => {
+    const pair = require('../wire/pushTelemetryV0')
+    const body = Buffer.from(push.hex, 'hex')
+    body[22] = 0
+    expect(() => pair.readRequest(body)).toThrow('Metrics cannot be null')
+    const cluster = createScriptedCluster({ nodes: NODES, profile: 'telemetry' })
+    const frame = frameOf(72, 0, Buffer.from(push.hex, 'hex'))
+    frame.writeInt32BE(1, 0)
+    expect(() => cluster.accept(NODES[0], 1, frame)).toThrow('size prefix')
+    cluster.assertClean()
+  })
+})
+
+describe('bounded capture', () => {
+  const live = []
+  const metadata = () => frameOf(apiKeys.Metadata, 13, METADATA_REQUEST)
+  const v5 = new Encoder()
+    .writeUVarIntString('raw')
+    .writeUVarIntString('1')
+    .writeUVarIntString('c')
+    .writeInt32(2)
+    .writeTaggedFields().buffer
+  /** Dials, keeps the socket for cleanup and returns it with what it receives. */
+  const dialLive = (cluster) => {
+    const dialled = dial(cluster)
+    live.push(dialled.socket)
+    return dialled
+  }
+  /** Destroys a socket and lets its close callbacks and the cluster's cleanup run. */
+  const close = async (socket) => {
+    socket.destroy()
+    await settle()
+  }
+
+  afterEach(() => {
+    for (const socket of live.splice(0)) socket.destroy()
+  })
+
+  test('leaves a default cluster as it was and counts the same requests', async () => {
+    const cluster = createScriptedCluster({ nodes: NODES })
+    const { socket } = dialLive(cluster)
+    socket.write(metadata())
+    await settle()
+
+    expect(cluster.requests()).toHaveLength(1)
+    expect(['requested', 'answered', 'cancelled'].map((o) => cluster.tally('Metadata', o))).toEqual(
+      [1, 1, 0]
+    )
+    await close(socket)
+    expect(cluster.sockets()).toHaveLength(1)
+    expect(cluster.seenSockets.size).toBe(1)
+  })
+
+  test('refuses to bound a cluster that has already been used', async () => {
+    const cluster = createScriptedCluster({ nodes: NODES })
+    dialLive(cluster)
+
+    expect(() => cluster.bound()).toThrow(
+      'ScriptedCluster: bound() needs a cluster nothing has used'
+    )
+  })
+
+  test('drops an answered request from the log and keeps it in the tally and for listeners', async () => {
+    const cluster = createScriptedCluster({ nodes: NODES, bounded: true })
+    const events = []
+    cluster.watch((event, record) =>
+      events.push([event, record.api, typeof record.fields, record.answeredOrder !== undefined])
+    )
+    const { socket } = dialLive(cluster)
+    socket.write(metadata())
+    await settle()
+
+    expect(events).toEqual([
+      ['request', 'Metadata', 'object', false],
+      ['answered', 'Metadata', 'object', true],
+    ])
+    expect(cluster.requests()).toEqual([])
+    expect(['requested', 'answered', 'cancelled'].map((o) => cluster.tally('Metadata', o))).toEqual(
+      [1, 1, 0]
+    )
+    cluster.assertClean()
+  })
+
+  test('keeps a request live until it settles and counts a closed socket as cancelled', async () => {
+    const schedule = new Schedule()
+    const gate = schedule.hold({ api: 'Metadata' })
+    const cluster = createScriptedCluster({ nodes: NODES, schedule, bounded: true })
+    const { socket } = dialLive(cluster)
+    socket.write(metadata())
+    await settle()
+    expect(cluster.requests()).toHaveLength(1)
+
+    await close(socket)
+    expect(cluster.requests()).toHaveLength(1)
+    gate.release()
+    await settle()
+
+    expect(cluster.requests()).toEqual([])
+    expect(['requested', 'answered', 'cancelled'].map((o) => cluster.tally('Metadata', o))).toEqual(
+      [1, 0, 1]
+    )
+    cluster.assertClean()
+  })
+
+  test('keeps generations monotonic after the closed sockets were dropped', async () => {
+    const cluster = createScriptedCluster({ nodes: NODES, bounded: true })
+    const generations = []
+    cluster.watch((event, record) => event === 'request' && generations.push(record.generation))
+    for (let i = 0; i < 3; i++) {
+      const { socket } = dialLive(cluster)
+      socket.write(metadata())
+      await settle()
+      await close(socket)
+    }
+
+    expect(generations).toEqual([1, 2, 3])
+    expect(cluster.socketsOpenedTo(NODES[0])).toBe(3)
+    expect(cluster.sockets()).toEqual([])
+    cluster.assertClean()
+  })
+
+  test('forgets the negotiation of a closed socket and still treats each socket as new', async () => {
+    const cluster = createScriptedCluster({ nodes: NODES, bounded: true })
+    for (let i = 0; i < 3; i++) {
+      const { socket, frames } = dialLive(cluster)
+      socket.write(frameOf(apiKeys.ApiVersions, 5, v5))
+      await settle()
+      expect(frames).toHaveLength(1)
+      socket.write(frameOf(apiKeys.ApiVersions, 5, v5))
+      await settle()
+      expect(frames).toHaveLength(2)
+      await close(socket)
+    }
+
+    expect(['requested', 'answered'].map((o) => cluster.tally('ApiVersions', o))).toEqual([3, 3])
+    expect(cluster.negotiatedAt.size).toBe(0)
+    expect(cluster.seenSockets.size).toBe(0)
+    cluster.assertClean()
+  })
+
+  test('fails loudly past the live request bound', async () => {
+    const schedule = new Schedule()
+    const first = schedule.hold({ api: 'Metadata' })
+    const second = schedule.hold({ api: 'Metadata' })
+    const cluster = createScriptedCluster({
+      nodes: NODES,
+      schedule,
+      bounded: { maxLiveRequests: 2 },
+    })
+    const { socket } = dialLive(cluster)
+    socket.write(metadata())
+    socket.write(metadata())
+    await settle()
+    expect(cluster.requests()).toHaveLength(2)
+
+    socket.write(metadata())
+    await settle()
+
+    expect(cluster.failures().map((error) => error.message)).toEqual([
+      'ScriptedCluster: capture overflow, more than 2 live requests',
+    ])
+    expect(() => cluster.assertClean()).toThrow('more than 2 live requests')
+    expect(socket.destroyed).toBe(true)
+    first.release()
+    second.release()
+    await settle()
+  })
+
+  test('bounds held dials and drops one whose socket has closed', async () => {
+    const cluster = createScriptedCluster({ nodes: NODES, bounded: { maxHeldDials: 1 } })
+    cluster.blackhole(0)
+    const { socket } = dialLive(cluster)
+    expect(cluster.heldDialsTo(0)).toBe(1)
+
+    expect(() => dialLive(cluster)).toThrow('more than 1 held dials')
+    expect(cluster.failures().map((error) => error.message)).toEqual([
+      'ScriptedCluster: capture overflow, more than 1 held dials',
+    ])
+
+    await close(socket)
+    expect(cluster.heldDials).toEqual([])
+    expect(() => dialLive(cluster)).not.toThrow()
+  })
+
+  test('releases the schedule call history only in a bounded cluster', async () => {
+    const kept = new Schedule()
+    const released = new Schedule()
+    for (const [schedule, bounded] of [
+      [kept, false],
+      [released, true],
+    ]) {
+      const cluster = createScriptedCluster({ nodes: NODES, schedule, bounded })
+      const { socket } = dialLive(cluster)
+      socket.write(metadata())
+      await settle()
+    }
+
+    expect(kept.calls).toHaveLength(1)
+    expect(released.calls).toEqual([])
+  })
+
+  test.each(['timeline', 'apiVersionTrace'])('%s refuses in bounded mode', (name) => {
+    const cluster = createScriptedCluster({ nodes: NODES, bounded: true })
+
+    expect(() => cluster[name]()).toThrow(`ScriptedCluster: ${name}() needs the full history`)
+    expect(() => cluster.mark('x')).toThrow('ScriptedCluster: mark() needs the full history')
+  })
+
+  test('records a throwing listener as a cluster failure and keeps answering', async () => {
+    const cluster = createScriptedCluster({ nodes: NODES, bounded: true })
+    cluster.watch(() => {
+      throw new Error('listener failed')
+    })
+    const { socket, frames } = dialLive(cluster)
+    socket.write(metadata())
+    await settle()
+
+    expect(frames).toHaveLength(1)
+    expect(cluster.failures().map((error) => error.message)).toEqual([
+      'listener failed',
+      'listener failed',
+    ])
+  })
+
+  test('stops notifying a removed listener', async () => {
+    const cluster = createScriptedCluster({ nodes: NODES, bounded: true })
+    const seen = []
+    const remove = cluster.watch((event) => seen.push(event))
+    remove()
+    const { socket } = dialLive(cluster)
+    socket.write(metadata())
+    await settle()
+
+    expect(seen).toEqual([])
+    expect(cluster.tally('Metadata')).toBe(1)
+  })
+})

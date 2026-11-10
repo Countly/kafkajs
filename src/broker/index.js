@@ -211,6 +211,7 @@ module.exports = class Broker {
    * @param {number} [options.nodeId]
    * @param {import("../../types").ApiVersions} [options.versions=null] The object with all available versions and APIs
    *                                 supported by this cluster. The output of broker#apiVersions
+   * @param {Function|null} [options.onReady=null] private ready-advertisement notification, contained
    * @param {number} [options.authenticationTimeout=10000]
    * @param {boolean} [options.allowAutoTopicCreation=true] If this and the broker config 'auto.create.topics.enable'
    *                                                are true, topics that don't exist will be created when
@@ -230,6 +231,7 @@ module.exports = class Broker {
     logger,
     nodeId = null,
     versions = null,
+    onReady = null,
     authenticationTimeout = 10000,
     allowAutoTopicCreation = true,
     metadataIdentity = null,
@@ -237,6 +239,7 @@ module.exports = class Broker {
     onApiVersionsFailure = null,
   }) {
     this.connectionPool = connectionPool
+    this.onReady = onReady
 
     /**
      * Whether this broker was replaced (`retire()`). It never goes back: a pool offered later is
@@ -475,6 +478,9 @@ module.exports = class Broker {
         await connection.authenticate({ attempt })
         originalPool()
         connection.finishSetup(attempt)
+        try {
+          this.onReady?.()
+        } catch {}
       } catch (error) {
         if (this.connectionPool !== pool) {
           attempt.cancel(error)
@@ -2763,6 +2769,69 @@ module.exports = class Broker {
       requests.DescribeDelegationToken
     )
     return this[PRIVATE.SEND_REQUEST](build(fields))
+  }
+
+  /**
+   * Sends a subscription request on an already-ready dedicated socket. Never reconnects.
+   * @param {object} payload UUID request fields
+   * @param {{guard:Function,onWrite?:Function}} options captured private authority
+   * @returns {Promise<object>} complete response or original numeric protocol failure
+   * @throws {Error} obsolete authority, disconnected socket or unsupported version
+   */
+  getTelemetrySubscriptions(payload, options) {
+    return this.sendTelemetry(
+      apiKeys.GetTelemetrySubscriptions,
+      requests.GetTelemetrySubscriptions,
+      payload,
+      options
+    )
+  }
+
+  /**
+   * Sends one bounded telemetry payload on the already-ready dedicated socket.
+   * @param {object} payload validated subscription, terminating flag, codec and Metrics
+   * @param {{guard:Function,onWrite?:Function}} options captured private authority and commit
+   * @returns {Promise<object>} parsed response; no retry or foreground policy mutation
+   * @throws {Error} authority, transport or numeric protocol refusal
+   */
+  pushTelemetry(payload, options) {
+    return this.sendTelemetry(apiKeys.PushTelemetry, requests.PushTelemetry, payload, options)
+  }
+
+  /**
+   * Captures pool and physical attempt before any await and refuses rather than reconnecting.
+   * @param {number} apiKey telemetry key
+   * @param {object} definition versioned protocol definition
+   * @param {object} payload trusted request fields
+   * @param {{guard:Function,onWrite?:Function}} options private request authority
+   * @returns {Promise<object>} one physical request result
+   * @throws {Error} stale pool/attempt, disconnected socket, unsupported key or response error
+   */
+  async sendTelemetry(apiKey, definition, payload, { guard, onWrite = null }) {
+    const pool = this.connectionPool
+    const connection = pool.pool[0]
+    const attempt = connection.connectAttempt
+    const establishedOnly = apiKey === 72 && payload.terminating === true
+    const captured = () => {
+      if (this.connectionPool !== pool || pool.retired || connection.connectAttempt !== attempt)
+        return new KafkaJSConnectionClosedError('Telemetry connection was replaced', {
+          host: pool.host,
+          port: pool.port,
+        })
+      return guard()
+    }
+    this.throwIfRefused(captured)
+    connection.failIfNotConnected(attempt)
+    const build = this.lookupRequest(apiKey, definition)
+    const protocol = build(payload)
+    return connection.send({
+      ...protocol,
+      guard: captured,
+      responseGuard: captured,
+      onWrite,
+      establishedOnly,
+      logResponseError: false,
+    })
   }
 
   /**

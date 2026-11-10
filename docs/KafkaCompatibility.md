@@ -63,8 +63,8 @@ Gap classes: `current` (fork max equals the Kafka max) · `behind:N` · `stub` (
 | ListTransactions | 66 | 0-2 | v0+ | 0-2 | current |  |
 | ConsumerGroupHeartbeat | 68 | 0-1 | v0+ | 0-1 | current | Required for the KIP-848 consumer group protocol (groupProtocol: 'consumer'), GA since Kafka 4.0. |
 | ConsumerGroupDescribe | 69 | 0-1 | v0+ | 0-1 | current | Admin-side counterpart of KIP-848; needed so group descriptions stop reporting consumer-protocol groups as Dead. |
-| GetTelemetrySubscriptions | 71 | 0 | v0+ | — | not-planned | Client telemetry (KIP-714); deferred. |
-| PushTelemetry | 72 | 0 | v0+ | — | not-planned | Client telemetry (KIP-714); deferred. |
+| GetTelemetrySubscriptions | 71 | 0 | v0+ | 0 | current | Client telemetry v0 codec implemented. Runtime use requires both telemetry APIs and a working broker exporter; broker version alone is insufficient. |
+| PushTelemetry | 72 | 0 | v0+ | 0 | current | Client telemetry v0 codec implemented. Runtime use requires both telemetry APIs and a working broker exporter; broker version alone is insufficient. |
 | ListConfigResources | 74 | 0-1 | v0+ | 0-1 | current | v0 is the old ListClientMetricsResources and lists only client-metrics resources; v1 adds a ResourceTypes filter (KIP-1142). |
 | DescribeTopicPartitions | 75 | 0 | v0+ | 0 | current | Paginated describe of topics by name, with topic ids and eligible leader replicas; v0 is the only version and every 4.x broker offers it. The ELR arrays are null unless the cluster tracks them. |
 | ShareGroupHeartbeat | 76 | 1 | v0+ | 1 | current (on-floor) | KIP-932 share group membership: joins, keeps and leaves a share group, sends the subscribed topic names and receives the partitions assigned to the member. v1 is the only version. |

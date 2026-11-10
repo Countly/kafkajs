@@ -699,3 +699,20 @@ const socketFactory = ({ host, port, ssl, onConnect }) => {
   return socket
 }
 ```
+
+## Telemetry transport cost
+
+The internal telemetry transport can use one additional broker connection per
+client, including its TLS and SASL authentication. It sends interval-driven
+GetTelemetrySubscriptions and PushTelemetry traffic on a dedicated queue. Both
+negotiated APIs and a successful runtime handshake are required. Missing exporter
+and no matching CLIENT_METRICS resource are different outcomes: the former is
+dormant, while the latter polls without Push. Foreground operations retain their
+original results and errors. See [Client Telemetry options](#client-telemetry-options)
+and [Client Telemetry](ClientTelemetry.md).
+
+## Client telemetry options
+
+`enableMetricsPush` defaults to `false`; it is boolean only. `telemetryMaxBytes` defaults to `1048576` and accepts integers from 1 through 1048576. Both options apply to Kafka, producer, consumer, admin and shareConsumer. Each factory inherits an omitted/undefined root value; explicit true/false or an explicit byte limit overrides it. Null and other invalid values reject with `KafkaJSInvalidConfigurationError` before construction, even when disabled. Options are copied; later caller mutation cannot change them.
+
+Enabling telemetry can open one additional authenticated broker connection per returned client. Unsupported brokers leave foreground operations usable. There is no relationship to consumer maxBytes, maxResponseSize or decompression limits. See [Client Telemetry](ClientTelemetry.md) for the getter, registration, limits, disclosure and disable/timeout-zero escapes.

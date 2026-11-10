@@ -103,6 +103,7 @@ module.exports = class Connection {
    * @param {Object} [options.sasl=null] Attributes used for SASL authentication. Options based on the
    *                             key "mechanism". Connection is not actively using the SASL attributes
    *                             but acting as a data object for this information
+   * @param {object|null} [options.authenticationOwner=null] private persistent whole-mechanism shell
    * @param {number} [options.reauthenticationThreshold=10000]
    * @param {number} options.connectionTimeout Resolved base in milliseconds
    * @param {number} [options.connectionTimeoutMax] Resolved setup ceiling
@@ -123,6 +124,8 @@ module.exports = class Connection {
    *                                            max.in.flight.requests.per.connection default).
    *                                            Pass null for unbounded (the pre-3.0 behavior).
    * @param {import("../instrumentation/emitter")} [options.instrumentationEmitter=null]
+   * @param {object|null} [options.telemetrySink=null] private numeric collector; null on telemetry sockets
+   * @param {object|null} [options.telemetrySlot=null] pre-issued node slot, never an endpoint label
    * @param {(errorMessage: string) => void} [options.onAuthenticationFailure=null] Called with a
    *                                            sanitized description (mechanism, broker, stage)
    *                                            when the broker rejects SaslAuthenticate (code 58),
@@ -139,6 +142,7 @@ module.exports = class Connection {
     rack = null,
     ssl = null,
     sasl = null,
+    authenticationOwner = null,
     clientId = 'kafkajs',
     connectionTimeout,
     authenticationTimeout,
@@ -153,6 +157,8 @@ module.exports = class Connection {
     maxInFlightRequests = 5,
     instrumentationEmitter = null,
     onAuthenticationFailure = null,
+    telemetrySink = null,
+    telemetrySlot = null,
   }) {
     this.host = host
     this.port = port
@@ -164,6 +170,7 @@ module.exports = class Connection {
     this.socketFactory = socketFactory
     this.ssl = ssl
     this.sasl = sasl
+    this.authenticationOwner = authenticationOwner
 
     this.requestTimeout = requestTimeout
     this.connectionTimeout = connectionTimeout
@@ -192,6 +199,9 @@ module.exports = class Connection {
     this.reauthenticationThreshold = reauthenticationThreshold
     this.instrumentationEmitter = instrumentationEmitter
     this.onAuthenticationFailure = onAuthenticationFailure
+    this.telemetrySink = telemetrySink
+    this.telemetrySlot = telemetrySlot
+    this.telemetryPool = null
 
     /**
      * Splits what the socket delivers into response frames; reset on every connect and every close.
@@ -282,7 +292,7 @@ module.exports = class Connection {
      * @private
      * @returns {Promise}
      */
-    this[PRIVATE.AUTHENTICATE] = () => this.authenticate()
+    this[PRIVATE.AUTHENTICATE] = (options) => this.authenticate(options)
 
     this[PRIVATE.CONNECT] = sharedPromiseTo(async (supplied) => {
       if (!supplied && this.connectionStatus === CONNECTION_STATUS.CONNECTED) return true
@@ -306,6 +316,33 @@ module.exports = class Connection {
         throw error
       }
     })
+  }
+
+  /**
+   * Installs a trusted numeric observer and pre-issued slot outside request completion.
+   * The factory adapter never installs one on a dedicated telemetry transport.
+   * @param {object|null} sink owned collector, null when disabled
+   * @param {object|null} slot current metadata binding
+   * @param {object|null} [pool=null] private normal pool, used only to release inactivity on teardown
+   * @returns {void} requests already created retain their original observer and slot
+   */
+  setTelemetryObserver(sink, slot, pool = null) {
+    this.telemetrySink = sink
+    this.telemetrySlot = slot
+    this.telemetryPool = sink ? pool : null
+  }
+
+  /**
+   * Marks the node inactive once no socket of its normal pool is connected, so collector
+   * eviction prefers it. The collector is trusted library code; a failure never reaches teardown.
+   * @private
+   * @returns {void} a no-op without an installed observer
+   */
+  releaseTelemetryNode() {
+    if (!this.telemetrySink || !this.telemetryPool) return
+    try {
+      if (!this.telemetryPool.isConnected()) this.telemetrySink.releaseNode(this.telemetrySlot)
+    } catch {}
   }
 
   setVersions(versions) {
@@ -366,6 +403,8 @@ module.exports = class Connection {
       this.authenticatedAt = null
 
       const attempt = ++this.connectAttempt
+      const telemetrySink = this.telemetrySink
+      const telemetryAttempt = telemetrySink ? {} : null
       this[PRIVATE.QUEUED] = Promise.resolve()
       const isCurrentAttempt = () => this.connectAttempt === attempt
 
@@ -382,6 +421,11 @@ module.exports = class Connection {
         this.connectionStatus = CONNECTION_STATUS.CONNECTED
         this.requestQueue.scheduleRequestTimeoutCheck()
         this.generation += 1
+        if (telemetrySink) {
+          try {
+            telemetrySink.observeConnection(telemetryAttempt)
+          } catch {}
+        }
         resolve(true)
       }
 
@@ -609,7 +653,8 @@ module.exports = class Connection {
   }
 
   /**
-   * The teardown `failGeneration` and `disconnect()` share, with no observer run.
+   * The teardown `failGeneration` and `disconnect()` share, with no queue observer run; the private
+   * telemetry inactivity release is contained.
    * @private
    * @param {Error} error what the requests left on the connection are rejected with
    * @param {object} [socket=this.socket] the socket of the generation being ended
@@ -626,6 +671,7 @@ module.exports = class Connection {
     this.connectAttempt += 1
     this.authenticatedAt = null
     this.connectionStatus = CONNECTION_STATUS.DISCONNECTED
+    this.releaseTelemetryNode()
     if (abortConnect) {
       abortConnect(error)
     }
@@ -791,14 +837,25 @@ module.exports = class Connection {
    * Shares one bounded SASL episode on this socket; never adopts a replacement token.
    * Holds idle preparation once per episode, including token-provider work. An old
    * episode cannot decrement preparation on the replacement connection.
-   * @param {{ attempt?: SetupAttempt }} [options] Broker setup budget when applicable
+   * @param {{ attempt?: SetupAttempt, requestGuard?: Function|null }} [options] original setup;
+   * request authority applies only to the private telemetry authentication owner
    * @returns {Promise<void>}
    * @throws {KafkaJSConnectionError} when the whole SASL phase expires
    */
-  authenticate({ attempt = this.setupAttempt } = {}) {
+  authenticate({ attempt = this.setupAttempt, requestGuard = null } = {}) {
     const operation = currentDeadline()
-    if (operation) return operation.wait(() => sharedSetup(() => this.authenticate({ attempt })))
+    if (operation)
+      return operation.wait(() =>
+        sharedSetup(() =>
+          this.authenticationOwner
+            ? this.authenticate({ attempt, requestGuard })
+            : this.authenticate({ attempt })
+        )
+      )
     if (!this.sasl || this.isAuthenticated()) return Promise.resolve()
+    requestGuard = this.authenticationOwner ? requestGuard : null
+    const refusal = requestGuard && requestGuard()
+    if (refusal) return Promise.reject(refusal)
     if (this.authEpisode) return this.authEpisode.promise
     const epoch = this.connectAttempt
     const socket = this.socket
@@ -810,6 +867,7 @@ module.exports = class Connection {
         timeoutMs: this.authenticationTimeout,
       })
     const guard = () =>
+      (requestGuard && requestGuard()) ||
       budget.refusal() ||
       (this.connectAttempt !== epoch || this.socket !== socket
         ? new KafkaJSConnectionError('Authentication connection was replaced', {
@@ -826,10 +884,12 @@ module.exports = class Connection {
     episode.promise = (async () => {
       try {
         const authenticator = new SASLAuthenticator(this, this.logger, this.versions, guard)
-        await budget.guard(authenticator.authenticate(), {
-          phase: 'SASL',
-          cap: this.authenticationTimeout,
-        })
+        await budget.guard(
+          this.authenticationOwner
+            ? this.authenticationOwner.run(() => authenticator.authenticate(), guard)
+            : authenticator.authenticate(),
+          { phase: 'SASL', cap: this.authenticationTimeout }
+        )
         const refusal = guard()
         if (refusal) throw refusal
         this.authenticatedAt = process.hrtime()
@@ -916,6 +976,9 @@ module.exports = class Connection {
    *                         in-flight slot and leaves the connection open.
    * @param {(() => Error|null)|null} [protocol.responseGuard=null] original setup/authentication
    *                         guard, checked after decode and parse before publishing side effects
+   * @param {(() => void)|null} [protocol.onWrite=null] trusted private once-only commit immediately
+   *                         before socket.write; never called at encode, enqueue or response
+   * @param {boolean} [protocol.establishedOnly=false] refuse any authentication start or refresh
    * @returns {Promise<data>} where data is the return of "response#parse"
    */
   async send({
@@ -925,16 +988,39 @@ module.exports = class Connection {
     logResponseError = true,
     guard = null,
     responseGuard = null,
+    onWrite = null,
+    establishedOnly = false,
   }) {
+    if (establishedOnly) {
+      const authority = guard
+      guard = (frameLength) => {
+        const refusal = authority && authority(frameLength)
+        if (refusal) return refusal
+        return this.sasl && (!this.isAuthenticated() || this.authEpisode)
+          ? new KafkaJSConnectionError('Telemetry final requires established authentication')
+          : null
+      }
+    }
     const sensitiveResponse = SENSITIVE_API_KEYS.has(request.apiKey)
     const attempt = this.connectAttempt
+    const telemetrySink = this.telemetrySink
+    const telemetrySlot = telemetrySink ? this.telemetrySlot : null
     this.preparing += 1
     let answered
     let expectResponse
     try {
       expectResponse = !request.expectResponse || request.expectResponse()
-      const prepared = this[PRIVATE.PREPARE]({ request, expectResponse, guard })
-      const enqueue = (encoded) => this[PRIVATE.ENQUEUE](encoded, requestTimeout, attempt, guard)
+      const prepared = this[PRIVATE.PREPARE]({ request, expectResponse, guard, establishedOnly })
+      const enqueue = (encoded) =>
+        this[PRIVATE.ENQUEUE](
+          encoded,
+          requestTimeout,
+          attempt,
+          guard,
+          telemetrySink,
+          telemetrySlot,
+          onWrite
+        )
 
       let queued
       if (isAuthenticatedRequest(request)) {
@@ -985,7 +1071,11 @@ module.exports = class Connection {
       attachResponseSource(e, request.apiKey)
       if (logResponseError) {
         this.logError(`Response ${requestInfo(entry)}`, {
-          error: sensitiveResponse ? 'Sensitive response failed' : e.message,
+          error: sensitiveResponse
+            ? 'Sensitive response failed'
+            : this.authenticationOwner
+              ? 'Telemetry response failed'
+              : e.message,
           correlationId,
           size,
         })
@@ -993,7 +1083,11 @@ module.exports = class Connection {
 
       const isBuffer = Buffer.isBuffer(payload)
       this.logDebug(`Response ${requestInfo(entry)}`, {
-        error: sensitiveResponse ? 'Sensitive response failed' : e.message,
+        error: sensitiveResponse
+          ? 'Sensitive response failed'
+          : this.authenticationOwner
+            ? 'Telemetry response failed'
+            : e.message,
         correlationId,
         payload: sensitiveResponse
           ? '[filtered]'
@@ -1009,18 +1103,30 @@ module.exports = class Connection {
   /**
    * Authenticates when needed and encodes the request under the next correlation id.
    * @private
-   * @param {{ request: object, expectResponse: boolean, guard: ((frameLength?: number) => Error|null)|null }} options
+   * @param {{ request: object, expectResponse: boolean, guard: ((frameLength?: number) => Error|null)|null, establishedOnly: boolean }} options
    * @returns {Promise<{ request: object, expectResponse: boolean, correlationId: number,
    *   requestPayload: object }>}
-   * @throws {Error} the error the guard returns, once the request is authenticated and encoded
+   * @throws {Error} guard refusal after encoding; private requests also check before preparation
+   * and after authentication so obsolete private work cannot enter the encoder
    */
-  async [PRIVATE.PREPARE]({ request, expectResponse, guard }) {
+  async [PRIVATE.PREPARE]({ request, expectResponse, guard, establishedOnly }) {
     currentDeadline()?.check()
+    if (this.authenticationOwner && guard) {
+      const refusal = guard()
+      if (refusal) throw refusal
+    }
+    if (establishedOnly && this.sasl && (!this.isAuthenticated() || this.authEpisode))
+      throw new KafkaJSConnectionError('Telemetry final requires established authentication')
     if (!this.isAuthenticated() && isAuthenticatedRequest(request)) {
-      await this[PRIVATE.AUTHENTICATE]()
+      if (this.authenticationOwner) await this[PRIVATE.AUTHENTICATE]({ requestGuard: guard })
+      else await this[PRIVATE.AUTHENTICATE]()
     }
 
     currentDeadline()?.check()
+    if (this.authenticationOwner && guard) {
+      const refusal = guard()
+      if (refusal) throw refusal
+    }
     this.failIfNotConnected()
 
     const { clientId } = this
@@ -1053,6 +1159,9 @@ module.exports = class Connection {
    * @param {number} attempt the `connectAttempt` the request was sent under; a request of an older
    *   attempt is refused
    * @param {((frameLength?: number) => Error|null)|null} guard checked again by the queue at transmission
+   * @param {object|null} telemetrySink collector captured at send entry
+   * @param {object|null} telemetrySlot slot captured before authentication and encoding
+   * @param {(() => void)|null} onWrite private transmission commit, after the final guard
    * @returns {{ answered: Promise<{ correlationId: number, size: number, entry: object,
    *   payload: Buffer }> }} `answered` settles with the response frame; wrapped so that waiting
    *   for the push does not wait for the response
@@ -1061,7 +1170,10 @@ module.exports = class Connection {
     { request, expectResponse, correlationId, requestPayload },
     requestTimeout,
     attempt,
-    guard
+    guard,
+    telemetrySink,
+    telemetrySlot,
+    onWrite
   ) {
     const { apiKey, apiName, apiVersion } = request
     const answered = new Promise((resolve, reject) => {
@@ -1082,6 +1194,9 @@ module.exports = class Connection {
           requestTimeout,
           guard,
           frameLength: requestPayload.buffer.length,
+          telemetrySink,
+          telemetrySlot,
+          onWrite,
           sendRequest: () => {
             this.socket.write(requestPayload.buffer, 'binary')
           },

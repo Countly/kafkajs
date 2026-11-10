@@ -62,3 +62,204 @@ jobs:
           path: .tmp/e2e/
           if-no-files-found: ignore
           include-hidden-files: true
+  resources:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24, 26]
+    env:
+      TELEMETRY_RESOURCES_ARTIFACT_DIR: ${{ github.workspace }}/.tmp/telemetry-resources
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '${{ matrix.node }}', cache: npm }
+      - run: npm ci
+        timeout-minutes: 5
+      - name: Stamp the run and prepare the artifact directory
+        timeout-minutes: 1
+        run: |
+          echo "KAFKAJS_TREE=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          mkdir -p "$TELEMETRY_RESOURCES_ARTIFACT_DIR"
+      - name: Measure single-client memory alone on the idle runner
+        timeout-minutes: 10
+        env:
+          TMPDIR: ${{ runner.temp }}
+          TELEMETRY_RESOURCES_QUIET: '1'
+        run: timeout -k 10s 540s node --expose-gc node_modules/jest/bin/jest.js --runInBand --ci --detectOpenHandles --testPathPatterns 'src/telemetry/__tests__/resources\.spec\.js$' --testNamePattern 'resource memory for'
+      - name: Validate the recorded measurements for this tree and Node
+        if: always()
+        timeout-minutes: 2
+        run: node scripts/e2e/telemetry/resourceArtifact.js "$TELEMETRY_RESOURCES_ARTIFACT_DIR" --tree "$KAFKAJS_TREE" --node "$(node -p process.version)"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resources-node${{ matrix.node }}
+          path: .tmp/telemetry-resources/
+          if-no-files-found: error
+          include-hidden-files: true
+  retained-diagnostic:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      TELEMETRY_RESOURCES_QUIET: '1'
+      RETAINED_DIAGNOSTIC_DIR: ${{ github.workspace }}/.tmp/retained-diagnostic/run
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '24', cache: npm }
+      - name: Prepare diagnostic evidence and install dependencies
+        timeout-minutes: 5
+        run: |
+          mkdir -p .tmp/retained-diagnostic/controls
+          node -p 'JSON.stringify(process.versions)' > .tmp/retained-diagnostic/controls/runtime.json
+          npm ci
+      - name: Run six broker-free retained diagnostic control groups
+        timeout-minutes: 3
+        env:
+          TELEMETRY_RESOURCES_QUIET: '0'
+        shell: bash
+        run: |
+          mkdir -p .tmp/retained-diagnostic/controls
+          timeout -k 5s 110s npx jest --maxWorkers=2 --ci --testPathPatterns 'testHelpers/__tests__/(processMemory|resourceProbe)\.spec\.js$' 'scripts/e2e/telemetry/__tests__/retained.*\.spec\.js$' 2>&1 | tee .tmp/retained-diagnostic/controls/memory.log
+          timeout -k 5s 50s npx jest --maxWorkers=2 --ci --testPathPatterns 'src/telemetry/__tests__/resources\.spec\.js$' 'scripts/soak/__tests__/soak\.spec\.js$' --testNamePattern 'requires fresh authority|detects 131072|holds one native job across one hundred retirements' 2>&1 | tee .tmp/retained-diagnostic/controls/lifecycle.log
+      - name: Diagnose retained ownership on Node 24 alone (sixteen serial children)
+        timeout-minutes: 30
+        run: timeout -k 10s 1750s node scripts/e2e/telemetry/retainedDiagnostic.js --diagnostic-only "$RETAINED_DIAGNOSTIC_DIR"
+      - name: Analyse cold ownership and conditional ephemerons offline
+        if: always()
+        timeout-minutes: 5
+        run: timeout -k 5s 290s node --max-old-space-size=6144 scripts/e2e/telemetry/retained/analyse.js "$RETAINED_DIAGNOSTIC_DIR"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: retained-diagnostic-node24
+          path: .tmp/retained-diagnostic/
+          if-no-files-found: error
+          include-hidden-files: true
+  telemetry-soak:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24, 26]
+        kafka: ['4.3.1', '4.2.2']
+    env:
+      KAFKA_VERSION: ${{ matrix.kafka }}
+      COMPOSE_FILE: docker-compose.telemetry.yml
+      COMPOSE_PROJECT_NAME: telemetry-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
+      TF1_CACHE: ${{ github.workspace }}/.tmp/telemetry-cache
+      TELEMETRY_JAVA_CACHE: ${{ github.workspace }}/.tmp/telemetry-cache
+      TELEMETRY_DECODER_ARCHIVE: ${{ github.workspace }}/.tmp/telemetry-cache/decoder-${{ matrix.kafka }}.jsa
+      TELEMETRY_INTEROP_CACHE: ${{ github.workspace }}/.tmp/telemetry-interop
+      TELEMETRY_EVIDENCE_DIR: ${{ github.workspace }}/.tmp/telemetry-evidence
+      KAFKAJS_LANE: docker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '${{ matrix.node }}', cache: npm }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '21' }
+      - run: npm ci
+        timeout-minutes: 5
+      - name: Prepare telemetry evidence
+        timeout-minutes: 1
+        run: |
+          echo "KAFKAJS_TREE=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          mkdir -p .tmp/e2e "$TELEMETRY_EVIDENCE_DIR"
+          chmod 0777 "$TELEMETRY_EVIDENCE_DIR"
+      - name: Verify retained jars offline and prepare decoder inputs
+        timeout-minutes: 5
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          timeout -k 5s 30s env -u TELEMETRY_JAVA_CACHE bash scripts/e2e/telemetry/run.sh verify "$KAFKA_VERSION"
+          timeout -k 5s 180s bash scripts/e2e/telemetry/fetch.sh
+          timeout -k 5s 30s bash scripts/e2e/telemetry/run.sh verify "$KAFKA_VERSION"
+          timeout -k 5s 60s node scripts/e2e/telemetry/prepareDecoder.js
+      - name: Preflight isolated project ownership
+        timeout-minutes: 2
+        run: timeout -k 5s 90s node scripts/e2e/telemetry/ci.js preflight
+      - name: Prepare broker image
+        timeout-minutes: 4
+        run: timeout -k 5s 210s docker compose -f "$COMPOSE_FILE" pull
+      - name: Start and warm the owned telemetry cluster
+        timeout-minutes: 6
+        run: |
+          timeout -k 5s 90s docker compose -f "$COMPOSE_FILE" up -d --pull never
+          timeout -k 5s 240s node scripts/waitForKafka.js
+      - name: Verify mounted reporter and capture broker identities
+        timeout-minutes: 3
+        run: timeout -k 5s 150s node scripts/e2e/telemetry/ci.js capture
+      - name: Run telemetry churn soak lane
+        timeout-minutes: 12
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: timeout -k 10s 600s npm run test:group:telemetry-soak -- --ci
+      - name: Verify telemetry evidence before teardown
+        if: always()
+        timeout-minutes: 3
+        run: |
+          timeout -k 5s 150s node <<'NODE'
+          const fs = require('fs')
+          const { spawnSync } = require('child_process')
+          const { readBrokerVersion } = require('./testHelpers/brokerVersion')
+          const { verifyEvidence } = require('./scripts/e2e/telemetry/evidence')
+          const files = fs.readdirSync('.tmp/e2e').filter(name => name.endsWith('.jsonl'))
+            .map(name => `.tmp/e2e/${name}`)
+          const result = spawnSync(process.execPath, [
+            'scripts/evidence/verify.js', '--broker', readBrokerVersion(), ...files,
+          ], { stdio: 'inherit', timeout: 60000 })
+          if (result.error) throw result.error
+          if (result.status !== 0) throw new Error('Evidence stamp verification failed')
+          verifyEvidence('telemetry-soak', process.env.TELEMETRY_EVIDENCE_DIR, files)
+          NODE
+      - name: Stop owned project and prove container network volume removal
+        if: always()
+        timeout-minutes: 3
+        run: |
+          timeout -k 5s 150s node scripts/e2e/telemetry/ci.js stop
+          node -e "require('./scripts/e2e/telemetry/evidence').verifyCleanup(process.env.TELEMETRY_EVIDENCE_DIR, '.tmp/e2e', process.env.COMPOSE_PROJECT_NAME)"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-telemetry-soak-${{ matrix.kafka }}-node${{ matrix.node }}
+          path: |
+            .tmp/e2e/
+            .tmp/telemetry-evidence/
+            .tmp/telemetry-cache/decoder-*.jsa.json
+          if-no-files-found: error
+          include-hidden-files: true
+  telemetry-verdicts:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/')
+    uses: ./.github/workflows/telemetry.yml
+    with:
+      full: true
+      memory-verdicts: true
+  telemetry-verdict-controls:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 24, cache: npm }
+      - run: npm ci
+        timeout-minutes: 5
+      - name: Require broker-free ownership, resource, health and share-envelope controls
+        timeout-minutes: 3
+        run: |
+          mkdir -p .tmp/telemetry-verdict-controls
+          timeout -k 5s 150s node node_modules/jest/bin/jest.js --runInBand --ci --detectOpenHandles --runTestsByPath scripts/e2e/telemetry/__tests__/memoryVerdicts.spec.js testHelpers/__tests__/telemetryFixtures.spec.js --json --outputFile=.tmp/telemetry-verdict-controls/results.json
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: telemetry-verdict-controls-node24
+          path: .tmp/telemetry-verdict-controls/
+          if-no-files-found: error
+          include-hidden-files: true

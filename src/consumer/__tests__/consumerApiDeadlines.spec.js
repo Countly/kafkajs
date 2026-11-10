@@ -78,6 +78,13 @@ describe.each([true, false])(
   (enforce) => {
     /** @type {CloseRig} */
     let rig
+    const heldLookups = []
+    /** @returns {object} a lookup gate released even when an assertion fails */
+    const holdLookup = () => {
+      const held = rig.lookup().hold()
+      heldLookups.push(held)
+      return held
+    }
     beforeEach(() => {
       // API budgets and the imported perf_hooks clock must advance only when the test asks.
       useSharedFakeClock()
@@ -87,6 +94,7 @@ describe.each([true, false])(
       rig = await CloseRig.open({ enforce, retry: bounded, ...options })
     }
     afterEach(async () => {
+      for (const held of heldLookups.splice(0)) held.release()
       try {
         if (rig) await drive(rig.dispose(), 'the rig to dispose')
       } finally {
@@ -107,7 +115,7 @@ describe.each([true, false])(
         const committed = []
         consumer.on(consumer.events.COMMIT_OFFSETS, ({ payload }) => committed.push(payload))
         lookup.makeStale()
-        const held = lookup.hold()
+        const held = holdLookup()
         const startedAt = performance.now()
         const settled = consumer
           .commitOffsets([{ topic: TOPIC, partition: 0, offset: '2' }])
@@ -130,7 +138,7 @@ describe.each([true, false])(
         consumer.on(consumer.events.COMMIT_OFFSETS, ({ payload }) => committed.push(payload))
         const commitsBefore = rig.frames('OffsetCommit').length
         lookup.makeStale()
-        const held = lookup.hold()
+        const held = holdLookup()
         consumer.seek({ ...CELL, offset: '1' })
         const startedAt = performance.now()
         const settled = consumer.position(CELL).catch((error) => error)
@@ -149,7 +157,7 @@ describe.each([true, false])(
         const consumer = rig.consumer()
         await drive(consumer.connect(), 'the consumer to connect')
         const lookup = rig.lookup()
-        const held = lookup.hold()
+        const held = holdLookup()
         const startedAt = performance.now()
         const settled = consumer.committed([CELL]).catch((error) => error)
         await drive(held.entered, 'the held coordinator lookup')

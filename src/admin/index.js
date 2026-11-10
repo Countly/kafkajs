@@ -420,6 +420,9 @@ const toPublicGroupOverview = (row) => {
  * @param {InstrumentationEventEmitter} [params.instrumentationEmitter]
  * @param {import('../../types').RetryOptions} params.retry
  * @param {import("../../types").Cluster} params.cluster
+ * @param {import('../telemetry/factory').TelemetryFactory|null} [params.telemetry=null] private
+ *   telemetry binding: its three public methods are added to the admin, it resumes after a usable
+ *   connect and joins the one close
  * @param {number} [params.apiTimeout=60000] validated default end-to-end call budget
  *
  * @returns {import("../../types").Admin}
@@ -430,6 +433,7 @@ module.exports = ({
   retry,
   cluster,
   apiTimeout = 60000,
+  telemetry = null,
 }) => {
   apiTimeout = validateApiTimeout(apiTimeout)
   const logger = rootLogger.namespace('Admin')
@@ -440,6 +444,7 @@ module.exports = ({
     cluster,
     logger,
     onDisconnect: () => instrumentationEmitter.emit(DISCONNECT),
+    telemetry,
   })
 
   /**
@@ -452,6 +457,7 @@ module.exports = ({
       await generation.wait(sharedSetup(() => cluster.connect({ fence: generation })))
       const error = generation.guard()
       if (error) throw error
+      telemetry?.resume()
       instrumentationEmitter.emit(CONNECT)
     })
 
@@ -2773,6 +2779,7 @@ module.exports = ({
   return wrapAdmin(
     {
       ...createTransactions({ cluster, retry }),
+      ...telemetry?.methods(),
       connect,
       disconnect,
       listTopics,

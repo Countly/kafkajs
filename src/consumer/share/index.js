@@ -32,6 +32,7 @@ const DEFAULTS = Object.freeze({
   checkCrcs: true,
   maxInFlightRequests: 5,
 })
+const SHARE_CONSUMER_FIELDS = Object.freeze([...Object.keys(REJECTED), ...Object.keys(DEFAULTS)])
 const INTEGER_RANGES = [
   ['maxRecords', 1],
   ['minBytes', 0],
@@ -113,4 +114,4 @@ const validateShareConsumerOptions = (input, inheritedRetry = {}) => {
 const createShareConsumer = (options) =>
   new ShareRunner({ ...options, logger: options.logger.namespace('ShareConsumer') }).api()
 
-module.exports = { createShareConsumer, validateShareConsumerOptions }
+module.exports = { createShareConsumer, validateShareConsumerOptions, SHARE_CONSUMER_FIELDS }

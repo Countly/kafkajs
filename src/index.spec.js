@@ -8,6 +8,7 @@ const createProducer = require('./producer')
 const createConsumer = require('./consumer')
 const createAdmin = require('./admin')
 const Cluster = require('./cluster')
+const { TelemetryFactory } = require('./telemetry/factory')
 const ISOLATION_LEVEL = require('./protocol/isolationLevel')
 const { KafkaJSInvalidConfigurationError, KafkaJSNonRetriableError } = require('./errors')
 
@@ -219,6 +220,8 @@ describe('Client', () => {
 
     expect(createProducer).toHaveBeenCalledWith({
       ...options,
+      cluster: Cluster.mock.instances[0],
+      telemetry: expect.any(TelemetryFactory),
       linger: 5,
       batchSize: 16384,
       deliveryTimeout: 120000,

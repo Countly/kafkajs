@@ -58,7 +58,7 @@ const DEFAULT = [...CLASSIC, ...PRODUCER]
  * which also sends no AddPartitionsToTxn and no AddOffsetsToTxn. The `share` profile advertises the
  * bootstrap pairs and the seven released share-group APIs at their one implemented version each;
  * every one of them has a wire file.
- * @type {Record<'default'|'sasl'|'consumer'|'tv1'|'tv2'|'offsets'|'transactions'|'storage'|'securityAdmin'|'clusterAdmin'|'share', Array<[string, number]>>}
+ * @type {Record<'default'|'sasl'|'consumer'|'tv1'|'tv2'|'offsets'|'transactions'|'storage'|'securityAdmin'|'clusterAdmin'|'share'|'telemetry', Array<[string, number]>>}
  */
 const PROFILES = {
   share: [
@@ -90,6 +90,7 @@ const PROFILES = {
     ['WriteTxnMarkers', 2],
   ],
   default: DEFAULT,
+  telemetry: [...DEFAULT, ['GetTelemetrySubscriptions', 0], ['PushTelemetry', 0]],
   securityAdmin: [
     ...DEFAULT,
     ['DescribeClientQuotas', 1],
@@ -286,12 +287,20 @@ class ScriptedCluster {
    * @param {Array<{ id: number, host: string, port: number }>} options.nodes the endpoints the
    *   client may dial; a dial to any other endpoint fails
    * @param {Schedule} [options.schedule] routes the calls; one is made when omitted
-   * @param {'default'|'sasl'|'consumer'|'tv1'|'tv2'|'offsets'|'transactions'|'storage'|'securityAdmin'|'clusterAdmin'|'share'} [options.profile='default'] what the cluster advertises
+   * @param {'default'|'sasl'|'consumer'|'tv1'|'tv2'|'offsets'|'transactions'|'storage'|'securityAdmin'|'clusterAdmin'|'share'|'telemetry'} [options.profile='default'] what the cluster advertises
    * @param {Record<string, [number, number]>} [options.advertise] `[version, version]` per API
    *   name, over the profile's: how a test makes the client negotiate another single version, the
    *   only one the cluster then accepts; a non-singleton range is rejected
+   * @param {object|boolean} [options.bounded] opt-in bounded capture, see `bound`; `true` takes
+   *   the default limits
    */
-  constructor({ nodes, schedule = new Schedule(), profile = 'default', advertise = {} }) {
+  constructor({
+    nodes,
+    schedule = new Schedule(),
+    profile = 'default',
+    advertise = {},
+    bounded = null,
+  }) {
     if (!PROFILES[profile]) {
       throw new Error(`ScriptedCluster: no profile named ${profile}`)
     }
@@ -303,6 +312,14 @@ class ScriptedCluster {
     this.log = []
     /** @type {Map<string, number>} sockets opened to a node when the socket last negotiated, by socket */
     this.negotiatedAt = new Map()
+    /** @type {Set<string>} sockets that have sent a request, as `node/generation` */
+    this.seenSockets = new Set()
+    /** @type {WeakMap<object, string>} the `node/generation` of each answering socket */
+    this.socketKeys = new WeakMap()
+    /** @type {Map<string, number>} requests by `api:outcome`, kept in both modes */
+    this.tallies = new Map()
+    this.listeners = []
+    this.limits = null
     this.marks = []
     this.clock = 0
     this.errors = []
@@ -328,6 +345,144 @@ class ScriptedCluster {
     }
 
     this.socketFactory = ({ host, port, onConnect }) => this.connect(host, port, onConnect)
+    if (bounded) this.bound(bounded === true ? {} : bounded)
+  }
+
+  /**
+   * Switches an unused cluster to bounded capture, so a long schedule keeps no history of
+   * completed work. Live sockets are separate from the monotonic issued counters, a closed socket
+   * is dropped after its close callbacks ran, a request leaves `requests()` once it is answered or
+   * cancelled (its facts live on in `tally` and in `watch` listeners), and a dial held by
+   * `blackhole` leaves with its socket. A schedule's call history is released after each call is
+   * handed over. `timeline`, `apiVersionTrace` and `mark` need the whole history and refuse.
+   * Going past a live bound is a recorded failure, never silent growth.
+   * @param {object} [limits]
+   * @param {number} [limits.maxLiveSockets=16] sockets whose close has not been emitted
+   * @param {number} [limits.maxLiveRequests=64] requests not yet answered or cancelled
+   * @param {number} [limits.maxHeldDials=8] dials held by `blackhole`
+   * @returns {ScriptedCluster} this
+   * @throws {Error} when the cluster has already opened a socket or logged a request
+   */
+  bound({ maxLiveSockets = 16, maxLiveRequests = 64, maxHeldDials = 8 } = {}) {
+    if (this.fake.state.issued !== 0 || this.log.length !== 0 || this.marks.length !== 0) {
+      throw new Error('ScriptedCluster: bound() needs a cluster nothing has used')
+    }
+
+    this.limits = { maxLiveRequests, maxHeldDials }
+    this.fake = createFakeSocketFactory({
+      bounded: {
+        maxLiveSockets,
+        onClosed: (socket) => this.forget(socket),
+        onOverflow: (error) => this.errors.push(error),
+      },
+    })
+    return this
+  }
+
+  /**
+   * Observes every request without keeping it: `listener('request', record)` when one is read,
+   * then `listener('answered' | 'cancelled', record)` when it settles. The record, with its
+   * decoded fields, is only valid during the call in bounded mode.
+   * @param {(event: 'request'|'answered'|'cancelled', record: RequestRecord) => void} listener
+   * @returns {() => void} removes the listener
+   */
+  watch(listener) {
+    this.listeners.push(listener)
+    return () => {
+      const at = this.listeners.indexOf(listener)
+      if (at !== -1) this.listeners.splice(at, 1)
+    }
+  }
+
+  /**
+   * @returns {number} every request written so far that `requests()` lists in a cluster that keeps
+   *   its whole history, from the counters and so also in a bounded one
+   */
+  requestCount() {
+    let total = 0
+    for (const [key, count] of this.tallies) if (key.endsWith(':requested')) total += count
+    return total
+  }
+
+  /**
+   * @param {string} api the API name, e.g. `PushTelemetry`
+   * @param {'requested'|'answered'|'cancelled'} [outcome='requested']
+   * @returns {number} how many requests of that API reached that outcome since the cluster began;
+   *   discovery refusals are not counted, as `requests()` leaves them out
+   */
+  tally(api, outcome = 'requested') {
+    return this.tallies.get(`${api}:${outcome}`) ?? 0
+  }
+
+  /**
+   * Counts how a request ended and tells the listeners; a bounded cluster then drops the record.
+   * @private
+   * @param {RequestRecord} record the request
+   * @param {'answered'|'cancelled'} outcome what happened to it
+   * @returns {void}
+   */
+  settle(record, outcome) {
+    this.count(record, outcome)
+    this.notify(outcome, record)
+    if (this.limits) {
+      const at = this.log.indexOf(record)
+      if (at !== -1) this.log.splice(at, 1)
+    }
+  }
+
+  /**
+   * @private
+   * @param {RequestRecord} record the request
+   * @param {'requested'|'answered'|'cancelled'} outcome what to count; discovery refusals are not
+   * @returns {void}
+   */
+  count(record, outcome) {
+    if (record.discovery) return
+    const key = `${record.api}:${outcome}`
+    this.tallies.set(key, (this.tallies.get(key) ?? 0) + 1)
+  }
+
+  /**
+   * @private
+   * @param {'request'|'answered'|'cancelled'} event what happened
+   * @param {RequestRecord} record the request, still holding its decoded fields
+   * @returns {void}
+   */
+  notify(event, record) {
+    if (record.discovery) return
+    for (const listener of [...this.listeners]) {
+      try {
+        listener(event, record)
+      } catch (error) {
+        this.errors.push(error)
+      }
+    }
+  }
+
+  /**
+   * Drops what a closed socket left behind in a bounded cluster: its negotiation state and any
+   * dial still held for it.
+   * @private
+   * @param {import('events').EventEmitter} socket a socket whose close was emitted
+   * @returns {void}
+   */
+  forget(socket) {
+    const key = this.socketKeys.get(socket)
+    if (key !== undefined) {
+      this.negotiatedAt.delete(key)
+      this.seenSockets.delete(key)
+    }
+    this.heldDials = this.heldDials.filter((dial) => dial.socket !== socket)
+  }
+
+  /**
+   * @private
+   * @param {string} what the history-reading method
+   * @returns {void}
+   * @throws {Error} in bounded mode, which keeps no whole history
+   */
+  assertFullHistory(what) {
+    if (this.limits) throw new Error(`ScriptedCluster: ${what}() needs the full history`)
   }
 
   /**
@@ -468,14 +623,18 @@ class ScriptedCluster {
       : { apiKeys: this.apiVersionsTable() }
   }
 
-  /** @returns {import('events').EventEmitter[]} every socket the client opened, oldest first */
+  /**
+   * @returns {import('events').EventEmitter[]} every socket the client opened, oldest first; in
+   *   bounded mode only those whose close has not been emitted
+   */
   sockets() {
     return [...this.fake.state.sockets]
   }
 
   /**
    * @returns {RequestRecord[]} every request the client wrote, oldest first, without the one
-   *   ApiVersions discovery request each negotiation is kept apart from (see `apiVersionTrace`)
+   *   ApiVersions discovery request each negotiation is kept apart from (see `apiVersionTrace`);
+   *   in bounded mode only those not yet answered or cancelled, the rest being in `tally`
    */
   requests() {
     return this.log.filter(({ discovery }) => !discovery)
@@ -488,6 +647,7 @@ class ScriptedCluster {
    *   A refusal `requests()` does not list is marked `discovery: true`.
    */
   apiVersionTrace() {
+    this.assertFullHistory('apiVersionTrace')
     return this.log.filter(({ apiKey }) => apiKey === apiKeys.ApiVersions)
   }
 
@@ -498,6 +658,7 @@ class ScriptedCluster {
    * @returns {void}
    */
   mark(label) {
+    this.assertFullHistory('mark')
     this.marks.push({ order: this.clock++, label })
   }
 
@@ -507,6 +668,7 @@ class ScriptedCluster {
    *   number, node?: number, correlationId?: number, generation?: number, label?: string }>}
    */
   timeline() {
+    this.assertFullHistory('timeline')
     const events = this.marks.map(({ order, label }) => ({
       order,
       kind: 'mark',
@@ -611,6 +773,13 @@ class ScriptedCluster {
     }
 
     if (this.blackholedNodes.has(node.id)) {
+      if (this.limits && this.heldDials.length >= this.limits.maxHeldDials) {
+        const error = new Error(
+          `ScriptedCluster: capture overflow, more than ${this.limits.maxHeldDials} held dials`
+        )
+        this.errors.push(error)
+        throw error
+      }
       const held = this.fake.factory({ host, port, onConnect: () => {} })
       this.heldDials.push({ node, socket: held, onConnect, generation: this.socketsOpenedTo(node) })
       return held
@@ -631,6 +800,7 @@ class ScriptedCluster {
    * @returns {void}
    */
   answerOn(socket, node, generation) {
+    this.socketKeys.set(socket, `${node.id}/${generation}`)
     const write = socket.write
     socket.write = (buffer, ...rest) => {
       const result = write(buffer, ...rest)
@@ -642,13 +812,12 @@ class ScriptedCluster {
   /**
    * @private
    * @param {{ host: string, port: number }} node
-   * @returns {number} how many sockets the client has opened to the node, refused dials included;
-   *   the last one's number is its `generation`
+   * @returns {number} how many sockets the client has opened to the node, refused dials included,
+   *   from the issued counter, so a bounded cluster that dropped closed sockets never reuses a
+   *   number; the last one's number is its `generation`
    */
   socketsOpenedTo({ host, port }) {
-    return this.fake.state.sockets.filter(
-      (other) => other.endpoint.host === host && other.endpoint.port === port
-    ).length
+    return this.fake.state.issuedByEndpoint.get(`${host}:${port}`) ?? 0
   }
 
   /**
@@ -678,17 +847,30 @@ class ScriptedCluster {
       order: discovery ? this.clock : this.clock++,
       ...(discovery && { discovery: true }),
     }
-    this.log.push(record)
-
-    const pair = refused ? pairOf(api, header.apiVersion) : this.pairFor(api, header.apiVersion)
-    if (!pair) {
-      throw new Error(`ScriptedCluster: no response builder for ${api} v${header.apiVersion}`)
+    if (this.limits && this.log.length >= this.limits.maxLiveRequests) {
+      throw new Error(
+        `ScriptedCluster: capture overflow, more than ${this.limits.maxLiveRequests} live requests`
+      )
     }
+    this.seenSockets.add(`${node.id}/${generation}`)
+    this.log.push(record)
+    this.count(record, 'requested')
 
-    record.fields = reading(`the ${api} v${header.apiVersion} request`, () =>
-      pair.readRequest(frame.subarray(header.byteLength))
-    )
-    return { record, pair, refused }
+    try {
+      const pair = refused ? pairOf(api, header.apiVersion) : this.pairFor(api, header.apiVersion)
+      if (!pair) {
+        throw new Error(`ScriptedCluster: no response builder for ${api} v${header.apiVersion}`)
+      }
+
+      record.fields = reading(`the ${api} v${header.apiVersion} request`, () =>
+        pair.readRequest(frame.subarray(header.byteLength))
+      )
+      this.notify('request', record)
+      return { record, pair, refused }
+    } catch (error) {
+      this.settle(record, 'cancelled')
+      throw error
+    }
   }
 
   /**
@@ -721,10 +903,7 @@ class ScriptedCluster {
     const socket = `${node.id}/${generation}`
     const opened = this.socketsOpenedTo(node)
     const negotiatedAt = this.negotiatedAt.get(socket)
-    const opens =
-      negotiatedAt === undefined
-        ? !this.log.some((other) => other.node === node.id && other.generation === generation)
-        : negotiatedAt < opened
+    const opens = negotiatedAt === undefined ? !this.seenSockets.has(socket) : negotiatedAt < opened
     if (opens) this.negotiatedAt.set(socket, opened)
     return opens
   }
@@ -743,7 +922,10 @@ class ScriptedCluster {
    */
   refuseApiVersions(socket, record, pair) {
     setImmediate(() => {
-      if (socket.destroyed) return
+      if (socket.destroyed) {
+        this.settle(record, 'cancelled')
+        return
+      }
       if (!record.discovery) record.answeredOrder = this.clock++
       respondWithFrame(
         { socket },
@@ -759,6 +941,7 @@ class ScriptedCluster {
           ],
         })
       )
+      this.settle(record, 'answered')
     })
   }
 
@@ -815,8 +998,11 @@ class ScriptedCluster {
       return
     }
 
-    this.schedule
-      .run({ ...record, ...targetOf(record.fields) }, () => this.defaultAnswer(pair, record))
+    const scheduled = this.schedule.run({ ...record, ...targetOf(record.fields) }, () =>
+      this.defaultAnswer(pair, record)
+    )
+    if (this.limits && Array.isArray(this.schedule.calls)) this.schedule.calls.length = 0
+    scheduled
       .then((answer) => (answer === undefined ? this.defaultAnswer(pair, record) : answer))
       .then((answer) => this.underOutage(record.api, answer))
       .then(
@@ -838,9 +1024,15 @@ class ScriptedCluster {
                 responseHeaderVersion(record.apiKey, record.version),
                 body
               )
+              this.settle(record, 'answered')
+            } else {
+              this.settle(record, 'cancelled')
             }
           }),
-        (error) => socket.destroy(error)
+        (error) => {
+          socket.destroy(error)
+          this.settle(record, 'cancelled')
+        }
       )
   }
 

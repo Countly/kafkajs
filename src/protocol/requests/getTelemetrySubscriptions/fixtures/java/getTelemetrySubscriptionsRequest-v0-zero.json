@@ -1,0 +1,9 @@
+{
+  "message": "GetTelemetrySubscriptionsRequest",
+  "version": 0,
+  "case": "zero",
+  "hex": "0000000000000000000000000000000000",
+  "fields": {
+    "clientInstanceId": null
+  }
+}

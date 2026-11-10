@@ -41,15 +41,156 @@ Fit post-warm-up heap samples separately inside each scored phase. Independently
 
 Share-soak acceptance belongs to the `Memory gates` workflow (`.github/workflows/memory-gates.yml`), which runs on `p9m/` pull requests and manual dispatch. It is required before 3.0.0, not for phase merges. CI jobs replace the local guard for these demonstrations. The workflow currently contains only the short job: `node scripts/ci/naturalExit.js soak` on its own cold Kafka 4.3.1/Node 24 base cluster, with a 35-minute parent step and 55-minute job limit, evidence verification, teardown and artifact upload. The full-profile CI job and the complete independent acceptance validator, including archive-only revalidation and the combined verdict, are still owed to the memory-gates follow-up. The full job must observe the exposed-GC `share-consumer` CLI with a 3000-second child/watchdog, a 51-minute parent step and a 71-minute job limit. The present evidence verifier is not that complete validator. Fresh complete short/full receipts remain required; no passing live heap screen is claimed. See [share soak tooling](ShareSoakTooling.md) for the evidence and acceptance contract.
 
+The `Memory gates` workflow also runs the single-client public and collector memory arms (`resource memory for`) with stamped artifact validation on Node 22, 24 and 26; the Node 24 retained-ownership diagnostic with its broker-free controls, sixteen serial children and offline analysis; and the entire `telemetry-soak` churn lane on Kafka 4.3.1 and 4.2.2 for each Node 22, 24 and 26, using `docker-compose.telemetry.yml`. The churn lane includes its ordinary/share functional oracles, normal pushes, close-and-reopen proofs and per-worker memory verdicts. Each job retains its own checkout, setup, evidence and upload; the churn job preserves verified fixtures, decoder preparation, evidence verification and owned teardown. All jobs run manually or on pull requests from `p9m/` branches; the follow-up memory PR must pass it before the 3.0.0 release. The whole churn lane is required before 3.0.0 and does not run on phase PRs; the other functional telemetry lanes and non-memory resource schedules remain required there. CI's manual `lanes` input selects comma-separated integration groups (for example, `share-base,admin`), including every broker/Node variant of each group; empty input, pushes and pull requests retain the full matrix.
+
 The local `npm run test:e2e:share-soak` alias is historical and superseded for these demonstrations. Its 2460-second guard cap, the former full guard cap of 3420 seconds, the 2490/3450-second direct-execution contracts and their host accounting are retired for this CI acceptance path; they do not extend its budgets or authorize local acceptance runs.
 
 Benchmark controls count batch callbacks separately from messages and compare complete record identities. Measured share, record-walk and ordinary-regression benchmark sessions run on CI in a later performance phase, with their declared frame, latency, memory and A/A gates.
+
+### Telemetry wire evidence
+
+The telemetry v0 codecs have independent request and response vectors under each
+protocol directory's `fixtures/java/`. The development Java generator uses a pinned,
+verified Kafka 4.4.0 client jar. Codec tests compare encoded requests to those bytes
+and decoded responses to literal fields. Two strict wire pairs read the same request
+vectors and build the same response vectors; the telemetry profile adds only those
+two versions to the default scripted profile. Finite controls reject null Metrics,
+trailing bytes, truncated fields, missing pairs and unadvertised versions. These
+checks need no broker. Seeded response-corpus controls are separate from these
+deterministic tests and retain their independent source vectors.
+
+### Numeric telemetry evidence
+
+Broker-free collector tests cover metric names, selectors, resource whitelists,
+physical-attempt identity, node retirement, frozen gauge windows, exact BigInt sums,
+uint64 timestamps and bounded numeric registration on four collector kinds. A fake
+socket test follows real Connection preparation, queueing and response completion;
+its held encoder proves an old node slot cannot be relabeled. Public client methods,
+configured broker export and performance gates have separate integration owners.
+
+### Independent OTLP evidence
+
+The telemetry numeric-subset vectors pin OpenTelemetry proto v1.9.0, protoc 25.5,
+protobuf-java 3.25.5 and the independent generated-bindings digest. The separate
+GenerateTelemetryVectors.java uses constant inputs and generated Java builders;
+it never calls the JavaScript writer. Compare its exact bytes with the retained
+fixtures, then decode candidate bodies through the same independent bindings.
+See scripts/protocol/javaVectors/README.md for the offline classpath and commands.
+No tool or dependency is downloaded by these commands or by a client at runtime.
+Java regeneration is a required acceptance check; a hand-computed candidate vector
+or a JavaScript round trip does not replace it.
+
+Broker-free tests cover zero oneofs, non-ASCII nested lengths, signed integer and
+unsigned timestamp domains, whole-point fitting, paired node gauges, both byte caps,
+broker-ordered built-ins and retired native completions. Configured exporter and
+Java GZIP/ZSTD decode remain separate integration checks. A missing independent
+toolchain is an unrun check, never an equivalent pass.
+
+### Telemetry subscription transport checks
+
+Broker-free capability, subscription and error specs exercise atomic replacement,
+UUID retention, pacing, local caps, finite recovery and provisional reconnect. The
+broker request spec drives actual Connection queues with independent version-0
+wire pairs; the transport spec negotiates the actual private socket. Captured
+authority reaches setup, authentication, encoding, queue dispatch, socket write and
+response installation. Public lifecycle release schedules and configured receiver
+evidence are separate checks. Controller live runs use the existing guarded
+foreground runner with its shared reservation and the tv2 profile.
+
+Capability inspection runs at subscription scheduling boundaries. Extra nullable
+guard and transmission-callback checks on the ordinary request path must be
+measured with the actual Connection prepare/queue/fulfill driver, interleaved
+previous and candidate arms, recorded host load, and the fixed A/A controls.
+
+### Public telemetry factories and types
+
+The broker-free telemetry factory, instance-ID and options specs use the unit/coverage telemetry wildcard. They cover independent instances, root/client overrides, default-off traffic, registration storage, getter validation/deadlines/suspension and inherited close budgets. Run one exact physical pattern at a time with --maxWorkers=2 and a private cache. The TypeScript legacy, Node16 and package-export/alias checks preserve constructor and trailing disconnect tuples and signal callbacks. A valid TS2578 unused-expect-error control must fail compilation. All four returned kinds, including actual ShareConsumer declarations, are required before accepting this surface. Live exporter and natural-exit proofs have separate owners; a construction witness is not a live result.
+
+### Broker telemetry fixture and export checks
+
+The configured broker telemetry fixture is one self-contained `docker-compose.telemetry.yml`, selected for startup, readiness, inspection, verification and teardown. Local execution uses the reserved guard and project `kafkajs`; each ephemeral CI runner uses an explicit unique `COMPOSE_PROJECT_NAME`. The four retained reporter and Java client jars are committed as checksum-pinned test fixtures. `scripts/e2e/telemetry/run.sh verify` checks them offline against the manifest before startup. CI never rebuilds them; `build.sh` records historical provenance, and `fetch.sh` separately prepares checksum-pinned decoder dependencies. The npm tarball excludes the fixture and jars. Host endpoints are `localhost:19092`, `localhost:19095` and `localhost:19098`, with IPv4 loopback publication. Tests validate Metadata host and port before dialing and record the actual JS socket address. TLS/SASL host listeners are not published by this fixture.
+
+The reporter queue is bounded to 128 entries, each broker sink to 2 MiB and each JSON detail record to 4096 bytes. Overflow, parse failure, missing accepted exports, a stub or an observer limit breach fails the fixture. A cursor belongs to each broker independently. Full metric validation uses the pinned independent Java decoder on captured Push bytes and matches the decompressed hash, UUID and broker node to the sink and successful response; capped JSON detail alone is insufficient. Exporter push-interval context must equal the configured 1000 ms. Empty selection, a successful zero-byte Push and a broker without an exporter have separate controls.
+
+The reporter case connects actual producer, consumer, admin and ShareConsumer factories, subscribes to `org.apache.kafka.` through the public CLIENT_METRICS APIs and requires two independently decoded accepted normal pushes per instance in 15 seconds after full readiness. It checks distinct stable UUIDs, applicable resources and metric names, with normal connection and RTT identities recorded separately. Auxiliary admins disable telemetry. Records, commits and handlers are not used by this case.
+
+The `telemetry-reporter` CI lane runs two top-level tests, `reporter export` and `reporter no-resource control`, in one exact file with an anchored two-title selector. The `telemetry-base` lane runs the single `reporter no-plugin control` title. CI invokes these Jest group scripts directly after owned startup and full warm-up. The local nine `test:e2e:telemetry-*` scripts still invoke the sole reserved guard directly, profile `tv2`, with one literal file and exact title. The controller supplies `P9_CLUSTER_GUARD`, `KAFKA_VERSION` and one `COMPOSE_FILE`. No telemetry script uses a forced exit. Shutdown and soak select open-handle detection; soak requires its separately prepared, still-reserved fixture.
+
+CI ownership uses `scripts/e2e/telemetry/ci.js`: a unique project, empty container/network/volume preflight, bounded startup/test/verification/cleanup, then `down -v --remove-orphans` and proof that all three resource kinds are gone. Development CI has ten distinct Node 24 rows: the seven configured groups (`telemetry-reporter`, `telemetry-prefix`, `telemetry-custom`, `telemetry-payload`, `telemetry-java`, `telemetry-outcomes`, `telemetry-shutdown`) on Kafka 4.3.1; `telemetry-base` on 4.3.1 and 4.4.0; and `telemetry-unsupported` on 4.3.1. The base 4.4.0 smoke is additional coverage. Configured telemetry lanes check mounted reporter jars against the pinned manifest; base lanes verify broker identity without requiring a reporter jar. The required functional exit catalogue has 69 rows: for each Node 22/24/26, all seven configured groups on 4.3.1/4.2.2, both base groups on 4.3.1/4.2.2/4.1.2/4.0.2, and base 4.1.2 outcomes. Optional 4.4.0 rows are not an exit minimum. A separate `resources` job in the telemetry workflow runs the functional non-memory bounded-resource schedules once per Node line and is not one of these rows. The memory arms, retained-ownership diagnostic and six full-matrix churn rows run in `Memory gates`. The entire churn lane, including its ordinary/share functional oracles, normal pushes, close-and-reopen proofs and per-worker memory verdicts, is required before 3.0.0 and does not run on phase PRs. Ready pull requests also run the full exit workflow on updates; drafts receive development coverage. Capable ShareConsumers perform ordinary handler and broker-confirmed acknowledgement work under both options; older lines retain exact share capability refusals and N/A acknowledgement dimensions. All physical sockets require ordinary-work ownership, including setup-only connections.
+
+Each client has an ordinary REQUEST listener joined to its independent socket transcript. A bounded public `describeConfigs` call installs admin topology before the RTT control. Foreground bootstrap connections count in the Sum, but requests made without a known-node slot cannot invent gauges. Every applicable descriptor/node identity and metric window is audited. One successful decode consumes a sink row once and later assertions reuse it. Immutable per-case archives retain transmitted/decompressed bytes, full independent decoded JSON, load proofs, identities, request arithmetic and natural observer cleanup. The stamped JSONL references relative paths, sizes and SHA-256 digests; `evidence.js` verifies the manifest and exact scenario catalogue before teardown, and the final cleanup manifest links those stamps to the removal receipt.
+
+Delete the test's CLIENT_METRICS resource and verify absence, disconnect every created client, close observer children and sockets naturally, verify the stamped evidence while brokers remain up, then let the owner remove its project resources. Keep failures and cleanup diagnostics. See `scripts/e2e/telemetry/README.md` for the committed artifact identities, the offline verifier and decoder inputs and the bounded sink contract.
+
+#### Close and reopen (`telemetry-shutdown`)
+
+The case runs the producer, classic consumer, admin and share consumer concurrently, twenty rounds each on one returned object, inside one 118000 ms case: 98000 ms of work and 20000 ms of cleanup inside the 120000 ms test timeout. Each round selects the next observer segment before the public close, calls the same object's public connect in the close's own continuation with no checkpoint, read or await in between, and then requires a Get with the cached UUID and an accepted nonterminating, nonempty Push on the replacement socket, written strictly after that Get's response. The closing segment must hold exactly one accepted final inside its close window and no Get, connect or authentication after the close began. Four zero-timeout arms, one per kind, must write no final and no telemetry request after the close began, and one admin arm blackholes only its captured telemetry socket while foreground metadata work succeeds beside a close with a finite budget below 1000 ms.
+
+Broker logs are set to TRACE once and read once per round for all four kinds in contiguous windows; the old connection's registered-cache removal must appear exactly once and no not-found line may follow. The archive keeps at most two undischarged segments per kind, seals each closed segment after its sockets closed, joins every accepted Push to its successful Get, transmitted bytes, decompressed hash, full independent decode and a sink row that no other Push consumed, and requires the event-loop resource counts of the start after a one second quiet window. A run that cannot finish twenty rounds in the bound fails; no count or time is relaxed. Live execution happens only in CI. The cleanup manifest lists each segment index with its digest, format and segment count.
+
+### Telemetry lifecycle and outcome schedules
+
+The client telemetry checks use public producer, consumer, admin and share-consumer factories with deterministic gates on setup, authentication, encoding, queue dispatch, socket writes and results. They compare request bytes and captured identities together, including repeated subscription IDs and delayed timer delivery. Shutdown checks distinguish ordinary work from the captured final push and test the original close budget.
+
+Observer, serialization, compression and logging failures are checked against the original foreground result or rejection and invocation count. Awaited rebalance hooks keep their documented control-flow behavior. These broker-free schedules complement the configured telemetry, delivery and cleanup tests; they do not prove broker export or native resource bounds.
+
+The mandatory O17–O19 meter/span/context/getter/logger containment matrix runs in `otel/test/failureContainment.test.js` through `npm run test:otel` and the CI `otel` job. The runner installs the packed root candidate and optional dependencies before executing the matrix; a missing or nonidentical candidate fails the lane. The plain unit lane runs the remaining telemetry schedules without requiring an OTel installation.
+
+### Telemetry benchmark evidence
+
+This is a driver-only delivery. A20/A31 measured acceptance remains pending P10 CI measurements, F08 configured-outcome evidence, an accepted previous baseline, final public lifecycle delivery and the reviewed broker-guard adapter. No measured CI job or measured pass is delivered here.
+
+The telemetry benchmark driver checks observation, bounded serialization and public producer-to-consumer delivery. Its broker-free spec validates schedules, actual work, complete identities, legal metric descriptors, payload bytes and evidence schemas. These correctness tests contain no performance timing assertions.
+
+Planned P10 CI benchmark jobs compare the accepted previous snapshot and candidate with identical driver bytes. Sessions retain every declared observation, rotate arms through every position and add an independent A/A reference. One session warmup per arm is discarded separately from each workload's warmup. CPU or throughput noise above 3%, or p99 noise above 5%, makes the session void. Failed and void evidence remains available.
+
+Request denominators count completed correlated pairs. Payloads use one legal point or 128 validated custom series plus 129 built-ins and report actual raw and transmitted bytes. Delivery counts actual message entries or the sum of batch message lengths, separately from callbacks and observed gaps. Durable-log identities, handler identities and raw broker commits are independent checks. Same-path observer, serializer and handler controls must detect overhead. A unit-test pass does not establish a performance result or baseline.
+
+Run `npm run bench:telemetry --` with explicit request, payload or delivery arguments. Delivery jobs require the controller's reserved broker guard and configured fixture. The driver does not start brokers. A worker timeout, partial session, missing codec prerequisite or incorrect artifact cannot produce a passing benchmark result. Retain the manifest, source and driver hashes, all worker artifacts, noise verdict and cleanup evidence with each result.
+
+### Telemetry scenario evidence
+
+Each telemetry scenario runs in its own CI lane, `npm run test:group:telemetry-prefix`,
+`-custom`, `-payload`, `-unsupported`, `-java`, `-outcomes` or `-shutdown`, which
+selects one exact file and one top-level title. Every lane owns one selected
+Compose file and a unique project under the isolated ownership contract; no raw
+broker wrapper or second cleanup authority is used. Filtered sibling titles may
+be pending, but the selected title must pass exactly once. Java and shutdown
+children must exit naturally; watchdog termination is failure.
+
+Capture zero-byte Push on the wire, prefix replacement through its actual
+subscription error/Get cycle, later write-fenced snapshots after unregistration,
+and both raw and transmitted payload sizes. The 4096-byte fixture also uses an
+independent 4097-byte raw control with its own UUID to verify size refusal.
+Strict seam recovery receipts remain labelled separately from live responses.
+
+Java producer and consumer each require at least two complete accepted normal exports and exactly one complete UUID-specific terminating export within their close episode. Java admin requires at least two complete accepted normal exports, including a fresh normal export collected after a successful public admin operation at its explicit pre-close checkpoint. The parent must independently validate that export before allowing admin close. Admin then calls public `close(Duration.ofSeconds(3))`, returns, exits naturally within the existing 10000 ms close-to-exit bound with drained pipes, and passes the fixed all-node drain/quiescence observation. Report every observed admin final, permitting zero or one; validate its complete payload and lifecycle if present. The admin exception is qualified by the pinned Java client identity and shutdown sources. Every Java role still exports exactly its connection counter and the three unchanged custom controls in four ResourceMetrics. All KafkaJS final/timeout/reopen requirements remain unchanged.
+
+The pinned 4.3.1 admin reporter closes before network shutdown can guarantee a final. The completed listTopics/closeReady checkpoint must precede every proving point's collection time; exporter receive time is insufficient. One bounded acknowledgement binds checkpoint ID, UUID and the archived reporter row hash. Raw closeReleased/closing/closed markers, monotonic close-call duration, real child-close and drained pipes are replayed. The parent retains the subscription through 2000 ms drain and 2000 ms quiet, with timed reads and hashed prefixes from all three nodes; late collection, activity in quiet or incomplete capture fails. Optional admin finals retain full payload/lifecycle checks, while producer/consumer finals remain mandatory. Java evidence version 2 validates the actual pinned client/source identities before deriving the admin policy; old evidence and a bare optional-final flag fail. The corrected `org.apache.kafka.admin.client.connection.creation.total` plus three controls must still be observed live in exactly four ResourceMetrics. The configured interval, selected 150000 ms Jest budget, supervisors, output and archive caps remain unchanged. Offline client-check and broker-free sender/selection controls cannot replace live receipts. Keep the earlier failed archive intact and run both the selected assertion path and same-candidate archive verifier in the next CI attempt.
+
+Foreground evidence has three independent dimensions: durable record identities,
+raw broker commits or share acknowledgements, and actual handler entries. Stable
+telemetry-only faults permit no extra ordinary delivery. Socket faults select
+the captured telemetry transport, never every connection to a broker endpoint.
+Immediate public reconnect runs before any wait for broker cache retirement;
+new normal pushes and independent broker disconnect/cache evidence are required.
+
+Any expiry, abort or cleanup failure taints the spec run and prevents later
+cases from passing. The lane verifies the stamped evidence while the brokers are
+up, then removes only its recorded project resources and proves their absence.
+Keep the existing share shutdown case and its own fixture, lock and
+acknowledgement contract. The ordinary telemetry quiet-path floor case belongs
+in the existing broker floor file after the earlier cases.
+
+Other broker lines, the 4.0.2 floor, Node 22, 24 and 26 and measured benchmarks
+are judged by the CI lanes. Twenty-cycle resource, short-soak and the program's
+long-run evidence retain their separate owners.
 
 ## Integration tests
 
 Most of the test suite talks to a real Kafka cluster. `npm test` runs `npm run lint`, `npm run compat:check` and `npm run protocol:check`, boots the cluster, runs everything, and tears the cluster down again — it's a convenient local shortcut, but it is not what CI runs.
 
-CI (`.github/workflows/ci.yml`) plans its integration matrix and runs five kinds of test job. `lint` runs `npm run lint`, `npm run compat:check` and `npm run test:types`; `unit` runs `npm run test:unit` excluding `scripts/soak/__tests__/soak.spec.js` on Node 22, 24 and 26; `unit-soak` runs `npm run test:unit:soak` for that spec on the same Node versions in three independent case shards with a ten-minute job timeout; `pack` runs `npm run test:pack`; and `integration` starts a cluster per matrix row and calls `./scripts/testWithKafka.sh "npm run test:group:<name> -- --ci --maxWorkers=4"` directly, for the six groups (`broker`, `admin`, `producer`, `consumer`, `others`, `oauthbearer`) on Node 24 and for `broker` and `others` on Node 22 and 26, all against Kafka 4.3.1. Three share lanes run on Node 24 against Kafka 4.3.1 and 4.4.0: `share-base` on the base cluster (also the share capability, bounce and diagnostics-channel arms), `share` on `docker-compose.share.yml` (also the Java interop arms, which need a JDK; the 4.4.0 rows use the 4.4.0 Java client), and `share-limit` (4.3.1 only) on `docker-compose.share-limit.yml`; they run their specs serially (no `--maxWorkers`), and each uploads its `.tmp/e2e` evidence as a workflow artifact. CI stamps share evidence with the checked-out commit, verifies only this run's JSONL against the observed broker before teardown, and runs shutdown separately without `--forceExit`, enforcing its 120000 ms process and 10000 ms post-cleanup exit bounds. `.github/workflows/weekly.yml` runs the six groups on Node 22, 24 and 26 against Kafka 4.1.2, 4.2.2 and 4.3.1 every Monday and on demand; its matrix leaves out Node 22 with 4.2.2 and Node 26 with 4.1.2 and 4.2.2.
+CI (`.github/workflows/ci.yml`) plans its integration matrix and runs seven kinds of test job. `lint` runs `npm run lint`, `npm run compat:check` and `npm run test:types`; `unit` runs `npm run test:unit` excluding `scripts/soak/__tests__/soak.spec.js` on Node 22, 24 and 26; `unit-soak` runs `npm run test:unit:soak` for that spec on the same Node versions in three independent case shards with a fifteen-minute job timeout; `pack` runs `npm run test:pack`; `otel` runs `npm run test:otel` on Node 24; and `integration` starts a cluster per matrix row and calls `./scripts/testWithKafka.sh "npm run test:group:<name> -- --ci --maxWorkers=4"` directly, for the six groups (`broker`, `admin`, `producer`, `consumer`, `others`, `oauthbearer`) on Node 24 and for `broker` and `others` on Node 22 and 26, all against Kafka 4.3.1. Three share lanes run on Node 24 against Kafka 4.3.1 and 4.4.0: `share-base` on the base cluster (also the share capability, bounce and diagnostics-channel arms), `share` on `docker-compose.share.yml` (also the Java interop arms, which need a JDK; the 4.4.0 rows use the 4.4.0 Java client), and `share-limit` (4.3.1 only) on `docker-compose.share-limit.yml`; they run their specs serially (no `--maxWorkers`), and each uploads its `.tmp/e2e` evidence as a workflow artifact. CI stamps share evidence with the checked-out commit, verifies only this run's JSONL against the observed broker before teardown, and runs shutdown separately without `--forceExit`, enforcing its 120000 ms process and 10000 ms post-cleanup exit bounds. The seventh job, `telemetry`, verifies retained jars offline and calls the shared telemetry workflow with the ten functional development rows and the non-memory `resources` job listed above. The existing exit workflow supplies the 69 required functional rows under its non-draft, master and manual-dispatch condition. The entire `telemetry-soak` churn lane runs in `Memory gates`, including its ordinary/share functional oracles, normal pushes, close-and-reopen proofs and per-worker memory verdicts; it is required before 3.0.0 and does not run on phase PRs. Each selected scenario verifies its complete transcript, raw payloads, independent decoder receipts and oracle sidecars before teardown, then uploads its ownership/removal receipt. Every accepted nonempty Push is decoded; only exact request-level close or fault cancellations excuse unanswered exchanges. Required owners, Java roles, ordinary arms and fault modes are fixed independently of the archive. The close-and-reopen archive is versioned and segmented (`segmented-1`): each public-client lifecycle is one sealed observer segment, and the catalogue is fixed by the schedule before any result is read: 21 lifecycles for each of the four kinds, one segment for each of the four zero-timeout arms and one for the admin blackhole arm, 89 in all. Every segment is packed into exactly two files, its complete transcript and a payload/proof bundle, and the observer, sink and archive bounds (64 sockets, 4096 records and 2 MiB per observer, 2 MiB per sink, 512 files and 16 MiB per archive) are unchanged; overflow fails and never omits evidence. A final archive without this format cannot satisfy the lane. Every L7 JS export must retain its common counter, every custom lifecycle window has exact metric/resource/point counts, and share evidence joins created-topic metadata, raw acquisitions, handlers and settlements by topic and offset. Configured share recovery requires a successful API 71 Get followed strictly by a nonempty, nonterminating accepted API 72 Push with its complete decode/sink join. Share acquisition ranges and lock origins require fetch-partition success; broker settlements require acknowledgement success, including capable base-fixture share work. Archive negative controls retain positive baselines, refreshed hashes and specific intended diagnostics. A listed strict seam is inventory until the same-candidate unit job supplies its execution receipt. `.github/workflows/weekly.yml` runs the six groups on Node 22, 24 and 26 against Kafka 4.1.2, 4.2.2 and 4.3.1 every Monday and on demand; its matrix leaves out Node 22 with 4.2.2 and Node 26 with 4.1.2 and 4.2.2.
 
 Share functional scenarios run in the CI workflow's `share-base`, `share` and `share-limit` integration rows. A phase merge requires both the CI workflow and the Exit gate to be green for the same commit; a green Exit gate alone does not establish share functional coverage. CI's manual `lanes` input selects comma-separated integration groups (for example, `share-base,admin`), including every broker/Node variant of each group; empty input, pushes and pull requests retain the full matrix.
 
@@ -237,6 +378,189 @@ Consumer measurements count delivered records, batch callbacks and actual handle
 `scripts/benchmarks/connectSetup.js` measures 2000 actual setup episodes per arm against an in-process server. Each episode establishes a distinct socket and negotiates ApiVersions; timing ends at ready, and cleanup completes outside the measured interval before the next episode. Run the same bytes on the previous and new trees with an interleaved A/A control. `--control 1` adds one measured millisecond per setup; it must exceed the declared 3% limit. Resource checks require zero remaining timers and sockets. A noisy or void session is not a pass.
 
 `src/network/__tests__/idleReaping.spec.js` checks exact expiry, preparation and pending/in-flight exclusion, stale timer and encoder generations, authentication and socket cleanup on a deterministic seam. `scripts/benchmarks/requestQueueStamp.js` measures 2000000 completed pairs through Connection preparation, queue and fulfillment; the fixed interleaved previous/new/A-A session and ten-clock positive control are described in the benchmark plan. A unit smoke checks the driver, not its timing gate.
+
+### Telemetry resource and churn evidence
+
+Run `node --expose-gc scripts/soak/soak.js --profile telemetry` (`soak:telemetry`) against the configured telemetry fixture; the `Memory gates` workflow runs it as the `telemetry-soak` lane under the isolated ownership contract. The existing producer-churn and consumer profiles keep their own schedules and limits. Shortening telemetry with `--phase-seconds` is refused so a smoke run cannot be mistaken for resource acceptance.
+
+The shutdown file selects `close and reopen` separately from `telemetry churn`, both with open-handle detection and natural exit. Close/reopen checks one established final or no final at timeout zero, blackholes only the telemetry socket and caps telemetry cleanup at the smaller of 1000 ms and the inherited remaining deadline, plus 100 ms scheduling allowance. The next public action is reconnect on the same object; successful normal pushes and the independently asserted old-connection broker-cache event are both required.
+
+Under D142, phase-blocking telemetry lanes retain functional wire/decode health, exact cancellation accounting, all 21 shutdown lifecycles per kind, UUID/cache/final-Push semantics, corpus and raw-offset oracles, capability refusals, and explicit absence of API 71/72 requests in negative controls. The `telemetry-verdicts` job in `.github/workflows/memory-gates.yml` reruns outcomes, unsupported and shutdown with the full Node/broker matrix and requires resource acceptance from the same archived transcripts and lifecycle/resource ledgers. Its verdicts cover ordinary/refused-bootstrap socket ownership, enabled/disabled ownership equivalence, observer listeners/sockets/timers, decoder occupancy, undischarged identities and exact quiet-window equality. These verdicts block 3.0.0; they do not block a phase merge. Operational cleanup failures still fail functional lanes. The configured outcomes share oracle has 28000 ms of work and a 30000 ms full envelope, including its 2000 ms local cleanup reserve and full 3000 ms verifier observation; its enclosing case is 188000 ms (158000 ms work, 30000 ms cleanup), within the unchanged 270 s shell bound.
+
+Churn runs a 60-second warm-up and 300-second measurement with at least 10 settled samples, then cleanup within 120 seconds and total 540 seconds. It changes subscriptions every 10 seconds, reconnects telemetry every 30 seconds and closes/reopens publicly every 60 seconds. Four one-client workers prevent memory averaging. Measure heapUsed plus external after two collections; arrayBuffers is already included in external. Compare the same descriptor/UUID population, check exact timer/handle/listener/socket identities and record RSS/native peak separately. Independent durable-record, broker-commit or share-delivery, and handler-invocation identities remain separate oracles.
+
+The single-client memory and native arms of `src/telemetry/__tests__/resources.spec.js` need a quiet host: the `Memory gates` workflow selects those arms alone in its own `resources` job with `TELEMETRY_RESOURCES_QUIET=1`, and the shared unit lane skips those arms.
+
+Retain all memory inputs, stamped sidecar hashes, worker disconnect receipts, close events and stdout/stderr. Every child must close naturally with code zero and no signal, unexpected stderr or unhandled rejection, within 10 seconds of its explicit-disconnect receipt. A watchdog, missing resource source, missing client kind, changed baseline or failed restoration fails the run.
+
+Local resource gates use Kafka 4.3.1 and Node 26 on a quiet host. Other Kafka and Node lines and the separate performance measurements remain CI hand-offs. A short telemetry pass never closes the final 24-hour idle/churn gate.
+
+### Telemetry resource measurements
+
+The `resources` job in `.github/workflows/memory-gates.yml` selects the single-client memory arms
+of `src/telemetry/__tests__/resources.spec.js` with `--testNamePattern 'resource memory for'`
+alone on one idle runner per Node 22, 24 and 26 (`--runInBand --detectOpenHandles`, no forced exit,
+`TELEMETRY_RESOURCES_QUIET=1`). The separate `resources` job in `.github/workflows/telemetry.yml`
+keeps every functional bounded-resource schedule in the PR path with
+`--testNamePattern '^(?!.*resource memory for)'`. The variable only selects the quiet arms; it does not
+prove a quiet host, so every arm records its own host context at five points (before and after the child,
+and inside it before the control, at the control-to-enabled boundary and at the end) and a noisy host is
+inconclusive.
+
+Each memory arm runs in its own `node --expose-gc` child, one per kind, with no Jest, coverage or
+inspector inside it, and is recorded as `resources-<arm>-<kind>.json` under
+`TELEMETRY_RESOURCES_ARTIFACT_DIR`. The parent issues each child's identity, run and tree and records the
+process it spawned; the child declares them with its Node, V8, platform and architecture, and the verdict
+binds those declarations to the producing process and to the record's stamp (tree from `KAFKAJS_TREE`,
+Node, platform and run). The parent reads the child's output incrementally against a fixed catalogue: at
+most one explicit disconnect receipt, from the public arm only, then exactly one readings message. A
+malformed, foreign, duplicate, late or unterminated line, output past 64 KiB, or a receipt for another kind,
+child or client instance id is a recorded failure. The record carries the exit facts (code, signal, timeout,
+stdout and stderr bytes, the output verdict, the receipt and when the parent saw it, time to close after it,
+or after the readings where no receipt is owed) and every reading the verdict is computed from. The file is
+written before any assertion, and the job uploads the directory even when a step fails.
+
+| Arm | What it measures |
+|---|---|
+| `single client resource memory for <kind>` | An actual public producer, consumer, admin or share consumer. The child takes its startup memory before importing anything, loads every module either mode needs, then runs a **telemetry-disabled control** of the same kind in the same process (the same scripted wire and the same fixed foreground operations, three per public open), releases it, and only then builds the enabled client: 128 maximum-size custom descriptors registered through the public API, the assigned client instance id, a matched disconnected reading, real GZIP and, where supported, ZSTD pushes, one retired native completion per codec with a public close and an immediate same-object reopen, and a final public close. Each reopen's connect and the final close's disconnect receipt run in the public disconnect's own resolution continuation, and the observed order (the resolution, that call, then the continuation's first yield) is recorded for replay. The registered descriptors are journaled from the public calls that succeeded. At every retained checkpoint the client must still refuse a 129th descriptor, and every journaled descriptor is registered again: the fingerprint covers only those the client updated in place, so a descriptor swapped for another of the same size leaves it one short. The child must close by itself within 10 s of the receipt. |
+| `collector only resource memory for <kind>` | Supplementary only. The strict 64-node, 257-point collector and one persistent payload builder with a current and a retired native build for each codec, judged against its own same-kind disabled control in its own child. It reaches sizes a one-node public client cannot and never stands in for the public arm. |
+
+Telemetry memory is judged as an increment over the disabled control, never as an absolute number. The
+control is read twice (C0 after its first public open and C1 after its last, both connected and idle) after a
+real collection, a 100 ms pause, a second collection and the callbacks of both. Let B be the lower of the two
+RSS readings and Eref the lower of the two external readings. The absolute peak is the kernel's nonresetting
+high water of the child, `/proc/self/status` `VmHWM`, read before the first import and at every phase
+boundary through cleanup; the raw `maxRSS` is recorded beside it and never substituted for it or subtracted.
+P is the largest of those high-water readings, of every recorded current reading (each native submission
+and settlement included) and of the sampled peak; the external peak is taken the same way.
+
+| Gate | Limit |
+|---|---|
+| Control stability: C1 against C0 | RSS within 2 MiB, heap plus external within 256 KiB |
+| Setup and control absolute peak (through the control's release) | at most 96 MiB |
+| Telemetry RSS peak above the control, P minus B | at most 64 MiB |
+| Whole-arm absolute peak P | at most 160 MiB |
+| External memory peak above the control | at most 64 MiB (`arrayBuffers` is inside external and is never added again) |
+| Heap plus external above the matched disconnected baseline | at most 8 MiB while active, at most 256 KiB once closed |
+
+The matched baseline is a separate reading: the enabled client disconnected with its registered descriptors,
+its UUID and its counters retained. It is not the control, and it supplies only the last row. Native work is
+journaled from the production codec calls (weak-issued job, input and result identities, byte lengths,
+distinct backing stores counted once, a reading at each submission and settlement, readings every 20 ms
+while work is pending, and per pending window its first and last reading time, reading count and peaks) and
+at most one job may be occupied at a time. Each window must span its job from submission to settlement, the
+next phase mark must cover each native reading, and the sampled peak must cover each window. An unstable or inflated control, a
+setup above 96 MiB, a missing exposed collection function, a missing or incoherent peak source, collections
+that were not observed or a noisy host make the result inconclusive and are never rescued by subtraction. A
+broken fact (a control that performed telemetry, a wrong phase, a replaced collection function, a decreasing
+peak, a missing codec, a failed exit) or an observed violation fails, and a failure outranks an
+inconclusive measurement. After the public close no target handle may remain and no unknown handle may
+appear, by async resource role and trigger ancestry.
+
+`node scripts/e2e/telemetry/resourceArtifact.js <directory> --tree <hash> --node <version>` re-judges the
+directory by recomputing every difference and ceiling from the recorded readings: one stamped artifact per
+arm and kind, the current schema version only (an older or aggregate-only record is rejected), a child that
+ran on the stamped Node, a child identity on every artifact and none shared by two, the fixed phase and
+foreground catalogues, and the gates above. A missing, malformed, foreign or noisy artifact fails or is inconclusive and
+the job fails.
+
+The hundred-cycle schedules (`holds the native result through public cycles ...`, `holds the auth supplier
+through public cycles ...`) keep one returned client per kind through 100 public close and immediate
+connect attempts while one native job or one authentication supplier is held. They run on an opt-in bounded
+capture mode of the lifecycle and scripted-wire helpers: per-object patches live in a live-owner table and are
+restored when their owner completes, closed fake sockets are dropped with their callbacks while issued
+counters keep their numbers, completed requests are kept as counts, and a live bound that is exceeded is a
+recorded failure. After every reconnect one ordinary action of the kind completes through the real client (a
+producer send, a consumer message, an admin metadata request, a share record with its acknowledgement) with
+its original receiver, arguments and outcome; a share record counts only once the broker has answered its
+Accept and the client has confirmed it. Each cycle calls connect in the public disconnect's own resolution
+continuation and reaches its checkpoint through an observed settlement (the replacement's Get answered, or
+for the supplier its setup attempted and refused behind the held call). It journals a fixed-shape scalar row:
+the witnessed reconnect order, weak-issued owner identities by role, the dedicated socket's emitter and raw
+listener identities, the pending telemetry timers by owning role, and the populations of every capture root.
+The held shell must be the same objects in all 100 cycles, its native input being the payload's own buffer;
+owners that live across cycles (a sample, an operation, a queued request) must repeat the first cycle's,
+which has none, since every checkpoint is reached with no telemetry operation running; owners each lifecycle
+replaces must be as many and all issued after the previous cycle; the only pending timer is the scheduler's,
+issued in the cycle; and the second connection of every dedicated pool is counted and must never have been
+opened. `bounded capture controls` run both families for every kind and late outcome and require a specific
+diagnostic for a substituted owner of the same count, a stale or unowned timer, a reconnect deferred by one
+await, a share acknowledgement the broker rejects, a completed owner left in the restore table, a held late
+outcome released early, a write to a closed socket, a live bound that is exceeded and an issued number that
+falls. The native family, whose checkpoints hold one dedicated socket, also requires one for a retired
+socket, emitter or listener and for a duplicated listener; the supplier family's checkpoints hold no socket.
+Every kind, the admin client included, bounds its close with a public `disconnect({ timeout })`: for each, a
+held final that crosses its close deadline while the close timer is withheld writes no byte and records no
+final, and the reopened client still completes a Get and a Push. Disabled clients, from the root option and
+from a client override, do the same ordinary work and open nothing.
+
+### Telemetry churn (`telemetry churn`)
+
+The `telemetry-soak` lane runs the same `main('telemetry')` owner the CLI runs, in one prepared run:
+60 s of warm-up, 300 s of measurement, at most 48 s of setup and at most 120 s of cleanup counted from
+the common end-of-measurement boundary, 538 000 ms inclusive inside the 540 000 ms case. A verdict is
+stamped only after the last cleanup step.
+
+One parent supervises four one-client worker processes (producer, consumer, admin, share consumer). The
+parent owns the fixed tick catalogue: every 10 s a subscription transition, every 30 s a retirement of
+the telemetry socket, every 60 s a public close and immediate reopen of the same object. At every tick
+the stages are joined across all four workers in this order: close and immediate connect, telemetry
+retirement, then the broker set and readback followed by each worker's confirmation. A tick more than
+5 s late fails the run and is never caught up. Each confirmation is a successful Get that carries and
+returns the client's instance ID with exactly the requested prefix list and a 1000 ms interval; a
+lifecycle change also owes a nonempty, nonterminating, accepted Push on the very socket of its
+replacement Get, written strictly after that Get's response. An empty selection keeps the resource and
+polls; it is never deleted into the 300 000 ms fallback.
+
+Every public lifecycle of a worker is one sealed observer segment (seven per kind: setup, initial and
+five reopens), written as a transcript file and a payload/proof bundle. Every accepted Push keeps its
+bytes, response, node, subscription and sink join. The Pushes that are decoded in full are selected by
+a rule over the transcript alone: the first accepted Push of every telemetry socket, the first accepted
+Push governed by each custom-prefix Get, and the accepted final of every segment; the last segment's
+final is decoded by the parent after the worker has exited. A close owes exactly one final, written
+inside it and answered with error 0, when the selection in force as it begins is nonempty, and none
+when it is empty. The parent decodes the selected Pushes with the pinned Java reporter, keeps the real
+receipts and reduces them to the hash, broker line and identity a replay joins; the worker's memory
+never includes a decoder, and each decoder child's own peak memory is reported separately from its
+`/proc` status, or explicitly as unavailable.
+
+A telemetry retirement faults exactly the captured telemetry socket, right after the next telemetry
+request is written, so exactly one exchange is cut off and joined to its declaration, while ordinary
+work on core sockets still succeeds. Admission is paused, in-flight work finished and commits confirmed
+before every public close, and resumed after the reconnect.
+
+The ordinary corpora are three finite sets of 10 000 uniquely keyed 200 byte records, offered only in
+the measurement, one batch per fixed slot. The producer's offers and resolutions, the raw log, the
+handler entries, the processed ends and the raw broker committed offsets (`resolveOffsets: false`) are
+separate ledgers. The share consumer uses its own corpus and the accepted-prefix and rest-release
+behaviour: every offset is accepted exactly once at the broker and publicly, a release is the only
+reason for a second delivery, no accepted record is delivered again, and at each public close the
+handled prefix is accepted and the rest released.
+
+Memory is judged per worker against its own telemetry-disabled control of the same kind in the same
+process: the telemetry-attributable resident-size peak is at most 64 MiB above the control, the control
+and setup peak at most 96 MiB, the whole worker at most 160 MiB, and the external-memory peak at most
+64 MiB above the control. The peak source is the kernel's lifetime high-water mark of the executable
+image (`/proc/self/status`), read before any application module is loaded and at every phase boundary;
+the raw `maxRSS` is recorded beside it and never subtracted. A control that drifts by more than 2 MiB
+of resident size or 256 KiB of retained heap, a setup above its allowance, a missing collection or peak
+capability, or a noisy host (one-minute load per CPU above 0.75, free memory below 256 MiB, memory
+pressure above 5) makes the measurement inconclusive, with the facts retained; a broken or contradicted
+fact fails. The retained-heap gates are unchanged: at most 8 MiB active and 256 KiB closed above the
+matched disconnected baseline, a slope of at most 64 KiB per minute, last minus first at most 1 MiB,
+and at least ten post-collection readings spanning at least 270 s inside a measurement of at least
+300 s, each recorded with its real admission and completion time.
+
+The evidence verifier recomputes everything from the archive instead of trusting a boolean: the fixed
+segment catalogue, every proof, boundary, retirement and transition, the declared proof selection, the
+decoder receipts, the ordinary and share oracles from their archived identities, the four resource
+verdicts, the natural exits and the budgets from their raw stamps. Cancellation allowances come from
+the scheduled retirements, each worker's driver source must match the run's own
+`scripts/soak/telemetryChurn.js` and `scripts/soak/soak.js`, and each native journal must cover every
+compressed Push. It also requires the pinned image, reporter and compose identities of the configured
+fixture. Each child must close by itself within 10 s of its one explicit-disconnect receipt with
+drained pipes and no unexpected output; a child still running after that bound is killed and joined
+within a bound, and its row stays failed.
 
 ### Chaos, broker bounces and the 4.0 floor
 

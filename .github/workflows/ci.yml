@@ -35,8 +35,8 @@ jobs:
       - run: npm run test:unit -- --testPathIgnorePatterns 'scripts/soak/__tests__/soak\.spec\.js$'
   unit-soak:
     runs-on: ubuntu-latest
-    # 800–1300 seconds / 3 = 267–434 seconds; 10 minutes leaves at least 166 seconds for setup.
-    timeout-minutes: 10
+    # The slowest shard (Node 22) measured about 590 s of tests on 2026-11-10; 15 minutes leaves room for setup.
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix: { node: [22, 24, 26], shard: [1, 2, 3] }
@@ -54,6 +54,14 @@ jobs:
         with: { node-version: 24, cache: npm }
       - run: npm ci
       - run: npm run test:pack
+  otel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 24, cache: npm }
+      - run: npm ci
+      - run: npm run test:otel
   integration-plan:
     runs-on: ubuntu-latest
     outputs:
@@ -130,3 +138,8 @@ jobs:
           path: .tmp/e2e/
           if-no-files-found: ignore
           include-hidden-files: true
+  telemetry:
+    needs: [unit]
+    uses: ./.github/workflows/telemetry.yml
+    with:
+      full: false

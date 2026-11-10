@@ -1,0 +1,96 @@
+{
+  "message": "MetricsData",
+  "version": "1.9.0",
+  "case": "nested",
+  "hex": "0ae8010a2d0a130a0b636c69656e745f7261636b12040a0272310a140a0867726f75705f696412080a06e8aea2e58d95100112b6010a180a0f636f756e746c792d6b61666b616a731205332e302e3012390a11636f6d2e6578616d706c652e636f756e741a01313a210a1b1100002a36fe9c97171915cd853dfe9c971731010000000000200010011801125f0a11636f6d2e6578616d706c652e67617567651a01312a470a1f1915cd853dfe9c97172100000000000000003a0b0a047a6f6e6512030a01610a241915cd853dfe9c97172100000000000002c03a100a047a6f6e6512080a06e6b8a9e5baa6",
+  "fields": {
+    "revision": "1",
+    "subscriptionRevision": "1",
+    "points": [
+      {
+        "identity": {
+          "key": "[\"com.example.count\",[]]",
+          "revision": "1"
+        },
+        "name": "com.example.count",
+        "type": "sum",
+        "unit": "1",
+        "attributes": [],
+        "value": "9007199254740993",
+        "timeUnixNano": "1700000000123456789",
+        "startTimeUnixNano": "1700000000000000000",
+        "aggregationTemporality": 1,
+        "isMonotonic": true
+      },
+      {
+        "identity": {
+          "key": "[\"com.example.gauge\",[[\"zone\",\"温度\"]]]",
+          "revision": "1"
+        },
+        "name": "com.example.gauge",
+        "type": "gauge",
+        "unit": "1",
+        "attributes": [
+          {
+            "key": "zone",
+            "value": "温度"
+          }
+        ],
+        "value": -2.25,
+        "timeUnixNano": "1700000000123456789"
+      },
+      {
+        "identity": {
+          "key": "[\"com.example.gauge\",[[\"zone\",\"a\"]]]",
+          "revision": "1"
+        },
+        "name": "com.example.gauge",
+        "type": "gauge",
+        "unit": "1",
+        "attributes": [
+          {
+            "key": "zone",
+            "value": "a"
+          }
+        ],
+        "value": 0,
+        "timeUnixNano": "1700000000123456789"
+      }
+    ],
+    "resources": [
+      {
+        "key": "group_id",
+        "value": "订单"
+      },
+      {
+        "key": "client_rack",
+        "value": "r1"
+      }
+    ],
+    "droppedResourceAttributesCount": 1,
+    "scope": {
+      "name": "countly-kafkajs",
+      "version": "3.0.0"
+    }
+  },
+  "provenance": {
+    "protoTag": "v1.9.0",
+    "protoSha256": {
+      "common/v1/common.proto": "354d818af9cb0ed67f7447b9cf8408f1ac8911cedea0db73c5309484ec2bcc04",
+      "metrics/v1/metrics.proto": "d0a53dda45ad100edbf25675f5b339ce8bf689bdc51816f8cf19b0d51464e1a4",
+      "resource/v1/resource.proto": "e0a7cdc0ffcfeffaa2606e8611839735ebffaa2d6acdf33e9356f2c48ae692d3"
+    },
+    "generator": "scripts/protocol/javaVectors/GenerateTelemetryVectors.java",
+    "bindingsArtifact": "otlp-v1.9.0-bindings-unrelocated.jar",
+    "bindingsProvenance": "frozen SHA-256-pinned artifact",
+    "bindingsSha256": "99676bd7a6eff2b8e068a1ab10fe30cadf27958e82914adc6516699c88e266e7",
+    "protobufJavaCoordinates": "com.google.protobuf:protobuf-java:3.25.5",
+    "protobufJavaSha1": "5ae5c9ec39930ae9b5a61b32b93288818ec05ec1",
+    "protobufJavaSha1Url": "https://repo1.maven.org/maven2/com/google/protobuf/protobuf-java/3.25.5/protobuf-java-3.25.5.jar.sha1",
+    "protobufJavaSha256": "8540247fad9e06baefa8fb45eb313802d019f485f14300e0f9d6b556ed88e753",
+    "protocVersion": "25.5",
+    "protocSha256": "d69b0a9ac8264bb3d464ae22742430943aa0a6cdf3734180af5a607c0bf8adaa",
+    "status": "generated with pinned Java bindings",
+    "generatorSha256": "22ff891184b466e89132cc743d5b2619630bdc27dd9f71caf8f3c828b7acb8e1"
+  }
+}

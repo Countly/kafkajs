@@ -335,7 +335,7 @@ describe('Consumer > one coordinator lookup per membership, by protocol', () => 
 
       expect(wire.calls).toHaveLength(1)
       wire.calls[0].resolve(BROKER)
-      await expect(Promise.all(answers)).resolves.toEqual([undefined, BROKER, BROKER])
+      await expect(Promise.all(answers)).resolves.toEqual([BROKER, BROKER, BROKER])
       expect(protocol.coordinator).toBeNull()
     })
   })

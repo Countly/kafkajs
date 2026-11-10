@@ -114,7 +114,7 @@ describe('Share consumer option validation', () => {
     expect(Cluster).not.toHaveBeenCalled()
     expect(() => kafka.shareConsumer({ groupId: 'g', retry: { maxTotalTime: 1000 } })).not.toThrow()
   })
-  test('reads a known getter once and preserves a thrown getter identity', () => {
+  test('reads a known getter once and contains a thrown getter before constructing state', () => {
     const kafka = new Kafka({ brokers: [] })
     const cause = new Error('getter')
     const getter = jest.fn(() => {
@@ -127,7 +127,7 @@ describe('Share consumer option validation', () => {
           return getter()
         },
       })
-    ).toThrow(cause)
+    ).toThrow('Invalid client telemetry options')
     expect(getter).toHaveBeenCalledTimes(1)
     expect(Cluster).not.toHaveBeenCalled()
   })
@@ -163,15 +163,18 @@ describe('public share option contract', () => {
     expect(Object.keys(share).sort()).toEqual([
       'acquisitionLockTimeoutMs',
       'assignment',
+      'clientInstanceId',
       'connect',
       'disconnect',
       'events',
       'logger',
       'on',
+      'registerMetricForSubscription',
       'run',
       'stop',
       'subscribe',
       'subscription',
+      'unregisterMetricFromSubscription',
     ])
     expect(Object.isFrozen(share.events)).toBe(true)
     expect(Object.keys(share.events)).toHaveLength(18)

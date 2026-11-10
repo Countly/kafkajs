@@ -453,15 +453,26 @@ module.exports = class ConsumerGroupProtocol {
   /**
    * Resolves the group coordinator, through the membership's one pending lookup. A lookup that
    * finishes after its membership was replaced publishes nothing: the answer may be older than
-   * what the replacement already learned.
+   * what the replacement already learned. Offset-manager discovery uses the same path so a
+   * commit restores the coordinator known to membership, including for a later leave.
    * @param {number} [ownershipToken] the membership the lookup serves, captured before the first
    *   await; defaults to the current one
-   * @returns {Promise<void>}
-   * @throws {Error} the lookup's own failure; the caller stamps it with the membership
+   * @param {import('../../producer/generation')|import('./interface').ConsumerOperation} [fence]
+   *   the caller's fence; its refusal ends the wait and prevents publication
+   * @param {() => Error|null} [guard] the originating offset operation's immutable guard,
+   *   retained through recovery and checked immediately before publication
+   * @returns {Promise<import('../../../types').Broker>} the discovered coordinator, even if the
+   *   membership was replaced and the caller must refuse it under its own ownership guard
+   * @throws {Error} the lookup's failure or caller fence's or guard's refusal; the caller stamps
+   *   membership
    */
-  async connect(ownershipToken = this.ownership?.token()) {
-    const coordinator = await this.coordinatorLookup.find()
+  async connect(ownershipToken = this.ownership?.token(), fence, guard) {
+    const coordinator = await this.coordinatorLookup.find(fence)
+    fence?.check()
+    const refusal = guard?.()
+    if (refusal) throw refusal
     if (!this.ownershipReplaced(ownershipToken)) this.coordinator = coordinator
+    return coordinator
   }
 
   /**

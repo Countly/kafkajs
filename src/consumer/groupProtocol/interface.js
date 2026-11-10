@@ -39,7 +39,8 @@ const COOPERATIVE = 'cooperative'
  * @property {number} joinCount how many joins the coordinator has accepted, counted before the
  *   round's sync or apply; only ever goes up, so it tells a membership that replaced another even
  *   when the generation, the epoch and the member id came back the same
- * @property {() => Promise<void>} connect resolves the group coordinator
+ * @property {() => Promise<import('../../../types').Broker|void>} connect resolves and publishes
+ *   the group coordinator; manual membership only checks local readiness
  * @property {(context: { topics: string[], topicsSubscribed: string[],
  *   beforeSync: () => void, growSubscription?: (names: string[]) => Promise<void> }) => Promise<Object>} rebalance
  *   ONE exchange with the coordinator - a JoinGroup + SyncGroup for the classic protocol, one

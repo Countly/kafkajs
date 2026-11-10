@@ -1,5 +1,6 @@
 const { validateApiTimeout } = require('./admin/deadline')
 const { inspect } = require('util')
+const { TelemetryFactory, snapshotOptions } = require('./telemetry/factory')
 const {
   createLogger,
   LEVELS: { INFO },
@@ -16,7 +17,11 @@ const RackPreference = require('./producer/partitioners/rackPreference')
 const { minimumRequestSize } = require('./producer/state/recordSize')
 const { MAX_DELAY } = require('./producer/deadline')
 const createConsumer = require('./consumer')
-const { createShareConsumer, validateShareConsumerOptions } = require('./consumer/share')
+const {
+  createShareConsumer,
+  validateShareConsumerOptions,
+  SHARE_CONSUMER_FIELDS,
+} = require('./consumer/share')
 const createAdmin = require('./admin')
 const ISOLATION_LEVEL = require('./protocol/isolationLevel')
 const defaultSocketFactory = require('./network/socketFactory')
@@ -28,6 +33,7 @@ const {
 
 const PRIVATE = {
   CREATE_CLUSTER: Symbol('private:Kafka:createCluster'),
+  TELEMETRY: Symbol('private:Kafka:telemetry'),
   CLUSTER_RETRY: Symbol('private:Kafka:clusterRetry'),
   LOGGER: Symbol('private:Kafka:logger'),
   OFFSETS: Symbol('private:Kafka:offsets'),
@@ -49,6 +55,77 @@ const MIN_MAX_RESPONSE_SIZE = 4
 const DEFAULT_METADATA_RECOVERY_STRATEGY = 'rebootstrap'
 const DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER_MS = 300000
 const METADATA_RECOVERY_STRATEGIES = ['rebootstrap', 'none']
+
+/** Option fields each factory reads, snapshotted once with the two telemetry scalars. */
+const KAFKA_FIELDS = [
+  'brokers',
+  'ssl',
+  'sasl',
+  'clientId',
+  'connectionTimeout',
+  'connectionTimeoutMax',
+  'reconnectBackoff',
+  'reconnectBackoffMax',
+  'authenticationTimeout',
+  'connectionsMaxIdle',
+  'reauthenticationThreshold',
+  'requestTimeout',
+  'enforceRequestTimeout',
+  'maxResponseSize',
+  'retry',
+  'socketFactory',
+  'logLevel',
+  'logCreator',
+  'metadataRecoveryStrategy',
+  'metadataRecoveryRebootstrapTriggerMs',
+]
+const PRODUCER_FIELDS = [
+  'createPartitioner',
+  'retry',
+  'metadataMaxAge',
+  'metadataMaxIdle',
+  'allowAutoTopicCreation',
+  'idempotent',
+  'transactionalId',
+  'transactionTimeout',
+  'maxInFlightRequests',
+  'linger',
+  'batchSize',
+  'deliveryTimeout',
+  'compressionLevels',
+  'bufferMemory',
+  'maxBlockMs',
+  'maxRequestSize',
+  'rackId',
+  'rackAware',
+]
+const CONSUMER_FIELDS = [
+  'groupId',
+  'partitionAssigners',
+  'metadataMaxAge',
+  'sessionTimeout',
+  'rebalanceTimeout',
+  'maxPollInterval',
+  'heartbeatInterval',
+  'maxBytesPerPartition',
+  'minBytes',
+  'maxBytes',
+  'maxWaitTimeInMs',
+  'retry',
+  'allowAutoTopicCreation',
+  'maxInFlightRequests',
+  'readUncommitted',
+  'rackId',
+  'rackAwareAssignment',
+  'checkCrcs',
+  'maxDecompressedBatchBytes',
+  'groupInstanceId',
+  'groupProtocol',
+  'groupRemoteAssignor',
+  'maxPrefetchBatches',
+  'fetchSessions',
+]
+const ADMIN_FIELDS = ['retry', 'apiTimeout']
 
 /**
  * Accept the documented values for maxInFlightRequests: null (unbounded) or an integer >= 1.
@@ -348,30 +425,40 @@ module.exports = class Client {
    *   names no identity in ApiVersions and restores pre-3.0 behavior.
    * @param {number} [options.metadataRecoveryRebootstrapTriggerMs=300000] how long metadata must
    *   fail *continuously* before a rebootstrap is triggered. Must be an integer >= 1.
-   * @throws {KafkaJSInvalidConfigurationError} for an invalid `maxResponseSize`
+   * @param {boolean} [options.enableMetricsPush=false] default broker client telemetry opt-in of
+   *   every client; a factory option overrides it
+   * @param {number} [options.telemetryMaxBytes=1048576] default raw and transmitted metric-byte
+   *   ceiling, an integer from 1 to 1048576
+   * @throws {KafkaJSInvalidConfigurationError} for an invalid `maxResponseSize`, a throwing option
+   *   accessor, a non-boolean `enableMetricsPush` or an invalid `telemetryMaxBytes`
    */
-  constructor({
-    brokers,
-    ssl,
-    sasl,
-    clientId,
-    connectionTimeout,
-    connectionTimeoutMax,
-    reconnectBackoff,
-    reconnectBackoffMax,
-    authenticationTimeout,
-    connectionsMaxIdle,
-    reauthenticationThreshold,
-    requestTimeout,
-    enforceRequestTimeout = true,
-    maxResponseSize = DEFAULT_MAX_RESPONSE_SIZE,
-    retry,
-    socketFactory = defaultSocketFactory(),
-    logLevel = INFO,
-    logCreator = LoggerConsole,
-    metadataRecoveryStrategy = DEFAULT_METADATA_RECOVERY_STRATEGY,
-    metadataRecoveryRebootstrapTriggerMs = DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER_MS,
-  }) {
+  constructor(source) {
+    const { options, config: telemetryConfig } = snapshotOptions(source, KAFKA_FIELDS)
+    const {
+      brokers,
+      ssl,
+      sasl,
+      clientId,
+      connectionsMaxIdle,
+      reauthenticationThreshold,
+      requestTimeout,
+      enforceRequestTimeout = true,
+      maxResponseSize = DEFAULT_MAX_RESPONSE_SIZE,
+      retry,
+      socketFactory = defaultSocketFactory(),
+      logLevel = INFO,
+      logCreator = LoggerConsole,
+      metadataRecoveryStrategy = DEFAULT_METADATA_RECOVERY_STRATEGY,
+      metadataRecoveryRebootstrapTriggerMs = DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER_MS,
+    } = options
+    let {
+      connectionTimeout,
+      connectionTimeoutMax,
+      reconnectBackoff,
+      reconnectBackoffMax,
+      authenticationTimeout,
+    } = options
+    this[PRIVATE.TELEMETRY] = telemetryConfig
     this[PRIVATE.OFFSETS] = new Map()
     this[PRIVATE.OPERATIONS] = new Map()
     this[PRIVATE.LOGGER] = createLogger({ level: logLevel, logCreator })
@@ -409,6 +496,7 @@ module.exports = class Client {
       validateMetadataRecoveryRebootstrapTriggerMs(metadataRecoveryRebootstrapTriggerMs)
 
     this[PRIVATE.CREATE_CLUSTER] = ({
+      telemetryMetrics = null,
       metadataMaxAge,
       metadataMaxIdle,
       allowAutoTopicCreation = true,
@@ -419,6 +507,7 @@ module.exports = class Client {
       isolationLevel,
     }) =>
       new Cluster({
+        telemetryMetrics,
         maxInFlightRequests: validateMaxInFlightRequests(maxInFlightRequests),
         logger: this[PRIVATE.LOGGER],
         retry: this[PRIVATE.CLUSTER_RETRY],
@@ -475,32 +564,40 @@ module.exports = class Client {
    *   partitioners prefer the partitions whose leader is in that rack for records without a key,
    *   and use all partitions when none is; a record with a partition or a key and a custom
    *   partitioner are unaffected
+   * @param {boolean} [options.enableMetricsPush] broker client telemetry opt-in; overrides Kafka's
+   * @param {number} [options.telemetryMaxBytes] telemetry byte ceiling, an integer from 1 to 1048576
    * @returns {import("../types").Producer} the producer and its transaction factory
    * @throws {KafkaJSInvalidConfigurationError} for a setting idempotence asked for explicitly
    *   does not allow, for invalid delivery, buffer, request-size or compression-level options, for
-   *   a `rackId` that is not a string or a `rackAware` that is not a boolean, and for `rackAware`
-   *   with an empty `rackId`
+   *   a `rackId` that is not a string or a `rackAware` that is not a boolean, for `rackAware`
+   *   with an empty `rackId`, and for invalid telemetry options or a throwing option accessor
    */
-  producer({
-    createPartitioner,
-    retry,
-    metadataMaxAge = DEFAULT_METADATA_MAX_AGE,
-    metadataMaxIdle = 300000,
-    allowAutoTopicCreation,
-    idempotent,
-    transactionalId,
-    transactionTimeout,
-    maxInFlightRequests,
-    linger,
-    batchSize,
-    deliveryTimeout,
-    compressionLevels,
-    bufferMemory,
-    maxBlockMs,
-    maxRequestSize,
-    rackId = '',
-    rackAware = false,
-  } = {}) {
+  producer(source = {}) {
+    const { options, config: telemetryConfig } = snapshotOptions(
+      source,
+      PRODUCER_FIELDS,
+      this[PRIVATE.TELEMETRY]
+    )
+    const {
+      createPartitioner,
+      retry,
+      metadataMaxAge = DEFAULT_METADATA_MAX_AGE,
+      metadataMaxIdle = 300000,
+      allowAutoTopicCreation,
+      idempotent,
+      transactionalId,
+      transactionTimeout,
+      maxInFlightRequests,
+      linger,
+      batchSize,
+      deliveryTimeout,
+      compressionLevels,
+      bufferMemory,
+      maxBlockMs,
+      maxRequestSize,
+      rackId = '',
+      rackAware = false,
+    } = options
     if (!(
       Number.isInteger(metadataMaxIdle) &&
       metadataMaxIdle >= 5000 &&
@@ -531,8 +628,15 @@ module.exports = class Client {
       maxInFlightRequests: inFlight,
       logger: this[PRIVATE.LOGGER].namespace('Producer'),
     })
+    const telemetry = new TelemetryFactory({
+      kind: 'producer',
+      config: telemetryConfig,
+      logger: this[PRIVATE.LOGGER],
+    })
+    telemetry.updateResources({ client_rack: rackId, transactional_id: transactionalId })
     const instrumentationEmitter = new InstrumentationEventEmitter({ channels: channels.producer })
     const cluster = this[PRIVATE.CREATE_CLUSTER]({
+      telemetryMetrics: telemetry.metrics,
       metadataMaxAge,
       metadataMaxIdle,
       allowAutoTopicCreation,
@@ -551,7 +655,9 @@ module.exports = class Client {
         )
     }
 
+    telemetry.bind(cluster)
     return createProducer({
+      telemetry,
       retry: producerRetry,
       logger: this[PRIVATE.LOGGER],
       cluster,
@@ -594,36 +700,44 @@ module.exports = class Client {
    *
    * `fetchSessions` (default `false`) opts in to incremental Fetch sessions (KIP-227); `false`
    * keeps every Fetch a full request.
+   * `enableMetricsPush` and `telemetryMaxBytes` override Kafka's broker client telemetry options.
    * @throws {KafkaJSNonRetriableError} for a non-boolean `rackAwareAssignment` or `fetchSessions`
-   * @throws {KafkaJSInvalidConfigurationError} for an invalid `maxDecompressedBatchBytes`
+   * @throws {KafkaJSInvalidConfigurationError} for an invalid `maxDecompressedBatchBytes`, invalid
+   *   telemetry options or a throwing option accessor
    * @public
    */
-  consumer({
-    groupId,
-    partitionAssigners,
-    metadataMaxAge = DEFAULT_METADATA_MAX_AGE,
-    sessionTimeout,
-    rebalanceTimeout,
-    maxPollInterval,
-    heartbeatInterval,
-    maxBytesPerPartition,
-    minBytes,
-    maxBytes = 10485760,
-    maxWaitTimeInMs,
-    retry = { retries: 5 },
-    allowAutoTopicCreation,
-    maxInFlightRequests,
-    readUncommitted = false,
-    rackId = '',
-    rackAwareAssignment = false,
-    checkCrcs = true,
-    maxDecompressedBatchBytes = DEFAULT_MAX_DECOMPRESSED_BATCH_BYTES,
-    groupInstanceId = null,
-    groupProtocol,
-    groupRemoteAssignor,
-    maxPrefetchBatches,
-    fetchSessions = false,
-  } = {}) {
+  consumer(source = {}) {
+    const { options, config: telemetryConfig } = snapshotOptions(
+      source,
+      CONSUMER_FIELDS,
+      this[PRIVATE.TELEMETRY]
+    )
+    const {
+      groupId,
+      partitionAssigners,
+      metadataMaxAge = DEFAULT_METADATA_MAX_AGE,
+      sessionTimeout,
+      rebalanceTimeout,
+      maxPollInterval,
+      heartbeatInterval,
+      maxBytesPerPartition,
+      minBytes,
+      maxBytes = 10485760,
+      maxWaitTimeInMs,
+      retry = { retries: 5 },
+      allowAutoTopicCreation,
+      maxInFlightRequests,
+      readUncommitted = false,
+      rackId = '',
+      rackAwareAssignment = false,
+      checkCrcs = true,
+      maxDecompressedBatchBytes = DEFAULT_MAX_DECOMPRESSED_BATCH_BYTES,
+      groupInstanceId = null,
+      groupProtocol,
+      groupRemoteAssignor,
+      maxPrefetchBatches,
+      fetchSessions = false,
+    } = options
     if (typeof fetchSessions !== 'boolean') {
       throw new KafkaJSNonRetriableError('fetchSessions must be a boolean')
     }
@@ -645,10 +759,21 @@ module.exports = class Client {
         )
     }
 
+    const telemetry = new TelemetryFactory({
+      kind: 'consumer',
+      config: telemetryConfig,
+      logger: this[PRIVATE.LOGGER],
+    })
+    telemetry.updateResources({
+      client_rack: rackId,
+      group_id: groupId,
+      group_instance_id: groupInstanceId,
+    })
     const instrumentationEmitter = new InstrumentationEventEmitter({
       channels: channels.consumer,
     })
     const cluster = this[PRIVATE.CREATE_CLUSTER]({
+      telemetryMetrics: telemetry.metrics,
       metadataMaxAge,
       allowAutoTopicCreation,
       maxInFlightRequests,
@@ -656,7 +781,9 @@ module.exports = class Client {
       instrumentationEmitter,
     })
 
+    telemetry.bind(cluster)
     return createConsumer({
+      telemetry,
       retry: { ...this[PRIVATE.CLUSTER_RETRY], ...retry },
       logger: this[PRIVATE.LOGGER],
       cluster,
@@ -693,12 +820,18 @@ module.exports = class Client {
    * @public
    * @param {import('../types').ShareConsumerConfig} config Required group and share options.
    * @returns {import('../types').ShareConsumer} The additive run-based share client.
-   * @throws {KafkaJSInvalidConfigurationError} Before client state, for invalid share options or a
-   *   root `requestTimeout` that is not an integer from 1 to 2147483647.
+   * @throws {KafkaJSInvalidConfigurationError} Before client state, for invalid share options,
+   *   invalid telemetry options or a throwing known option accessor, or a root `requestTimeout` that
+   *   is not an integer from 1 to 2147483647.
    * @throws {KafkaJSNonRetriableError} For invalid `maxInFlightRequests`, as for `consumer()`.
    */
   shareConsumer(config) {
-    const options = validateShareConsumerOptions(config, this[PRIVATE.CLUSTER_RETRY])
+    const isOptions = config && typeof config === 'object' && !Array.isArray(config)
+    const snapshot = isOptions
+      ? snapshotOptions(config, SHARE_CONSUMER_FIELDS, this[PRIVATE.TELEMETRY])
+      : { options: config, config: this[PRIVATE.TELEMETRY] }
+    const telemetryConfig = snapshot.config
+    const options = validateShareConsumerOptions(snapshot.options, this[PRIVATE.CLUSTER_RETRY])
     const requestTimeout = this[PRIVATE.REQUEST_TIMEOUT]
     if (!(
       Number.isInteger(requestTimeout) &&
@@ -709,18 +842,27 @@ module.exports = class Client {
         'requestTimeout must be an integer from 1 to 2147483647 for shareConsumer'
       )
     }
+    const telemetry = new TelemetryFactory({
+      kind: 'shareConsumer',
+      config: telemetryConfig,
+      logger: this[PRIVATE.LOGGER],
+    })
+    telemetry.updateResources({ client_rack: options.rackId, group_id: options.groupId })
     const instrumentationEmitter = new InstrumentationEventEmitter({
       channels: channels.shareConsumer,
     })
     const cluster = this[PRIVATE.CREATE_CLUSTER]({
+      telemetryMetrics: telemetry.metrics,
       metadataMaxAge: options.metadataMaxAge,
       allowAutoTopicCreation: options.allowAutoTopicCreation,
       maxInFlightRequests: options.maxInFlightRequests,
       isolationLevel: ISOLATION_LEVEL.READ_UNCOMMITTED,
       instrumentationEmitter,
     })
+    telemetry.bind(cluster)
     return createShareConsumer({
       ...options,
+      telemetry,
       requestTimeout,
       cluster,
       instrumentationEmitter,
@@ -734,20 +876,37 @@ module.exports = class Client {
    * @param {object} [options] admin configuration
    * @param {object} [options.retry] retry limits and backoff, unchanged by the API cap
    * @param {number} [options.apiTimeout=60000] end-to-end call budget in milliseconds
+   * @param {boolean} [options.enableMetricsPush] broker client telemetry opt-in; overrides Kafka's
+   * @param {number} [options.telemetryMaxBytes] telemetry byte ceiling, an integer from 1 to 1048576
    * @returns {import('../types').Admin} admin client
-   * @throws {KafkaJSInvalidConfigurationError} for an invalid API budget before cluster creation
+   * @throws {KafkaJSInvalidConfigurationError} for an invalid API budget, invalid telemetry options
+   *   or a throwing option accessor, before cluster creation
    */
-  admin({ retry, apiTimeout } = {}) {
-    apiTimeout = validateApiTimeout(apiTimeout)
+  admin(source = {}) {
+    const { options, config: telemetryConfig } = snapshotOptions(
+      source,
+      ADMIN_FIELDS,
+      this[PRIVATE.TELEMETRY]
+    )
+    const { retry } = options
+    const apiTimeout = validateApiTimeout(options.apiTimeout)
+    const telemetry = new TelemetryFactory({
+      kind: 'admin',
+      config: telemetryConfig,
+      logger: this[PRIVATE.LOGGER],
+    })
     const instrumentationEmitter = new InstrumentationEventEmitter({
       channels: channels.admin,
     })
     const cluster = this[PRIVATE.CREATE_CLUSTER]({
+      telemetryMetrics: telemetry.metrics,
       allowAutoTopicCreation: false,
       instrumentationEmitter,
     })
 
+    telemetry.bind(cluster)
     return createAdmin({
+      telemetry,
       apiTimeout,
       retry: { ...this[PRIVATE.CLUSTER_RETRY], ...retry },
       logger: this[PRIVATE.LOGGER],

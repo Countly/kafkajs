@@ -8,6 +8,8 @@ jest.setTimeout(90000)
 const retries = process.env.TEST_RETRIES != null ? parseInt(process.env.TEST_RETRIES, 10) : 0
 jest.retryTimes(retries)
 
+require('./socketOwners').installSocketOwners(expect.getState)
+
 require('jest-extended/all')
 
 // Close the connections `createTopic` keeps open to watch topic propagation across all brokers.

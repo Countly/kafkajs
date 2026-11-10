@@ -1353,9 +1353,9 @@
     {
       "kafkaName": "GetTelemetrySubscriptions",
       "apiKey": 71,
-      "forkName": null,
-      "apiKeysName": null,
-      "planned": "no",
+      "forkName": "getTelemetrySubscriptions",
+      "apiKeysName": "GetTelemetrySubscriptions",
+      "planned": "done",
       "validVersions": [
         0,
         0
@@ -1363,18 +1363,20 @@
       "flexibleFrom": 0,
       "deprecatedVersions": null,
       "latestVersionUnstable": false,
-      "forkVersions": null,
-      "gap": "not-planned",
+      "forkVersions": [
+        0
+      ],
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
-      "notes": "Client telemetry (KIP-714); deferred."
+      "notes": "Client telemetry v0 codec implemented. Runtime use requires both telemetry APIs and a working broker exporter; broker version alone is insufficient."
     },
     {
       "kafkaName": "PushTelemetry",
       "apiKey": 72,
-      "forkName": null,
-      "apiKeysName": null,
-      "planned": "no",
+      "forkName": "pushTelemetry",
+      "apiKeysName": "PushTelemetry",
+      "planned": "done",
       "validVersions": [
         0,
         0
@@ -1382,11 +1384,13 @@
       "flexibleFrom": 0,
       "deprecatedVersions": null,
       "latestVersionUnstable": false,
-      "forkVersions": null,
-      "gap": "not-planned",
+      "forkVersions": [
+        0
+      ],
+      "gap": "current",
       "onFloor": false,
       "belowFloor": [],
-      "notes": "Client telemetry (KIP-714); deferred."
+      "notes": "Client telemetry v0 codec implemented. Runtime use requires both telemetry APIs and a working broker exporter; broker version alone is insufficient."
     },
     {
       "kafkaName": "ListConfigResources",

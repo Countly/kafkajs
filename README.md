@@ -19,6 +19,7 @@ A pure-JavaScript [Apache Kafka](https://kafka.apache.org/) client for Node.js, 
 - OAuth bearer token helpers and recipes ([OAuth.md](docs/OAuth.md))
 - Admin client, including describeShareGroups, listShareGroupOffsets, alterShareGroupOffsets and deleteShareGroupOffsets for Kafka 4.2+; share-group deletion uses deleteGroups
 - [Share groups (Kafka 4.2+)](docs/ShareConsumer.md) with compact acknowledgement outcomes, offset-reset recipes and explicit API boundaries.
+- Opt-in [broker client telemetry](docs/ClientTelemetry.md) with independent per-client IDs and bounded numeric snapshots.
 
 ## Getting started
 

@@ -553,6 +553,8 @@ describe('Broker > Fetch', () => {
         maxInFlightRequests: 1,
       })
 
+      // Replacing the outer hook's connected broker without closing it leaks its socket.
+      await broker.disconnect()
       broker = new Broker({
         connectionPool: createConnectionPool(newBrokerData),
         logger: newLogger(),

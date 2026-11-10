@@ -11,7 +11,7 @@ export default [
   // Reads .gitignore so lint covers the whole tree without shelling out to `git ls-files`.
   includeIgnoreFile(fileURLToPath(new URL('.gitignore', import.meta.url))),
   {
-    ignores: ['node_modules/**', 'coverage/**'],
+    ignores: ['node_modules/**', 'coverage/**', 'scripts/e2e/telemetry/telemetryWireProbe.js'],
   },
   js.configs.recommended,
   {

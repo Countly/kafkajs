@@ -5,6 +5,82 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 ## Unreleased — 3.0.0
 
+### Phase 9F — Client telemetry
+
+#### Additions
+
+- Implement the two flexible telemetry protocol codecs with capability-qualified compatibility output.
+- Add bounded numeric Gauge and monotonic BigInt Sum collection and snapshot registration internally.
+- Expose client telemetry options, stable instance IDs and numeric metric snapshots on all client kinds.
+
+#### Tooling
+
+- Move telemetry memory arms and their validated artifacts, the retained-ownership diagnostic and full Node/broker churn-soak coverage into the guarded Memory gates workflow; keep the other functional telemetry lanes and non-memory resource schedules on phase PRs with unchanged acceptance checks.
+- Prepare a verified runner-local AppCDS archive for the pinned telemetry decoder before timed observer work, retain preparation diagnostics, and require archive-backed decoding under unchanged time limits.
+- Flush terminal telemetry worker messages before IPC disconnect, retain failed-worker exit, output and phase diagnostics, and hold planned soak samples until their admission time.
+- Read hourly rolled telemetry request traces with bounded rotation retries, prove foreground fetch setup ownership, and exercise every discovered reporter broker without weakening socket or cleanup checks.
+- Verify pinned Java admin close with completed work, a fresh four-metric export and bounded acknowledged close/cessation evidence; retain mandatory producer/consumer finals and replay versioned raw receipts.
+- Compare the complete Java interoperability subscription without prefix-order assumptions in live checks and archive replay, retaining both admin counter names and rejecting missing, extra or duplicate prefixes.
+- Read a broker node that has not exported yet as an empty Java capture, while still rejecting a missing file whose capture recorded bytes.
+- Add an isolated Node-24 retained-ownership diagnostic with bounded captures, scalar counterparts, source archives and broker-free failure controls; diagnostic evidence cannot satisfy resource acceptance.
+- Reserve retained-diagnostic weak history before measurement, retire dead observation wrappers, and attribute observer storage separately from product state.
+- Qualify telemetry final subscription-deletion errors with archived admin evidence, and verify forced share shutdown using final acknowledgements and exact suffix redelivery.
+- Use the non-deprecated bounded Java consumer close API, select the Java admin counter by its source name, and read Kafka JSON connection traces from the request appender. Retain the primary shutdown failure with partial-segment diagnostics.
+- Settle resource measurements with recorded collection convergence, release native result references before closed readings, and preserve sampling through native settlement.
+- Add independent telemetry request/response vectors and strict wire fixtures.
+- Verify normal physical connections and completed-request observations independently.
+- Add independently generated and decoded OTLP metric vectors.
+- Exercise subscription updates and isolated bounded error recovery with fake transport handles. Verify Broker framing/quota propagation, transport negotiation and authentication, queue commit refusal, and omission-warning boundaries through the real network stack.
+- Add a pinned broker metrics reporter fixture with independent OTLP export and push-interval verification.
+- Retain checksum-pinned telemetry fixtures and verify complete export evidence and isolated CI ownership receipts.
+- Harden telemetry cleanup deadlines, complete Push and controlled RTT evidence verification, failed-capture archives, and development/exit-gate matrix scheduling.
+- Verify captured telemetry request identities and complete bodies, startup-failure cleanup, concurrent public commits and original rejection outcomes. Run optional OpenTelemetry containment against the byte-identical packed client in CI.
+- Add deterministic lifecycle, shutdown and observer-failure schedules for client telemetry.
+- Bound telemetry schedule cleanup and await operation settlement before lifecycle assertions.
+- Measure telemetry observation, bounded serialization and end-to-end overhead with independent work and identity controls.
+- Defer telemetry benchmark payload decoding and capture hashing until after delivery timing, and verify inherited consume bytes through frozen manifest inputs.
+- Verify client telemetry updates, custom metrics, payload limits, Java interoperability, unsupported brokers and unchanged foreground outcomes.
+- Verify every captured telemetry exchange, exact close cancellations, broker-qualified cache retirement, share acknowledgements and complete Java export semantics.
+- Require complete post-recovery telemetry exports, distinguish share fetch and acknowledgement statuses, and pin archive negative controls to their intended diagnostics.
+- Verify bounded telemetry resources, repeated reopen and natural shutdown under subscription and connection churn.
+- Prove twenty close-and-reopen rounds for each client kind through versioned, segmented observer evidence (89 fixed segments in two bounded files each, unchanged observer, sink and archive caps), shared broker log windows with the old connection's exact cache retirement, immediate public reconnect ordering, and quiet-resource baselines.
+- The resource job records stamped per-arm memory measurements, validates them with `scripts/e2e/telemetry/resourceArtifact.js` and uploads them even on failure. Telemetry memory is judged as an increment over a same-process telemetry-disabled control (RSS and external peaks at most 64 MiB above it, setup at most 96 MiB, the whole arm at most 160 MiB, from the kernel high water), and the hundred-cycle schedules complete real per-kind foreground work on an opt-in bounded capture mode of the lifecycle and scripted-wire helpers. The artifact replays each child's issued identity, its output catalogue, the disconnect receipt and reopen order witnessed in the public disconnect continuation, the registered descriptor population and every native reading and pending window; the hundred-cycle schedules judge owners, listeners and timers by identity and count a share record only once its acknowledgement is confirmed.
+- The churn lane is a parent-coordinated, segmented run: four one-client workers join each tick in stages, every lifecycle is a sealed observer segment, selected Pushes are decoded by the parent with the pinned Java reporter, the ordinary and share oracles use measurement-only corpora, resident size is judged against a same-process telemetry-disabled control, and the verifier recomputes the whole verdict from the archive.
+- The churn verifier now replays more of the run: the terminal lifecycle's final is decoded by the parent after the worker exits; share exchanges are archived as hashed protocol facts and re-derived per acquisition; custom identity changes are fenced by observer cursors with no time grace; every segment's request, error and cancellation stream is accounted; and the stage schedule is replayed from parent and worker receipts on one mapped clock. Resource evidence uses a versioned reading catalogue with arithmetic, collection and native-work facts. Failed or inconclusive attempts keep their partial worker evidence, also when the case's own bound expires first, and a cancelled worker is asked to stop and, if it is still running after its natural-exit bound, killed and joined within a bound, its row failed. The close-and-reopen lane compares exact resource, listener and pending-call identities after its quiet window.
+- Restore lifecycle helper capture compatibility and isolate deterministic clock cleanup and resource identity observations.
+- Match complete telemetry fixture client IDs, classify the Java source launcher's known deprecation notice with retained failure output, settle both shutdown resource readings, and stop failed churn workers without awaiting unproduced records.
+- Correct live telemetry close evidence, concurrent export ordering, unsupported socket-role comparisons and custom snapshot checks; qualify broker refresh throttling precisely and retain complete independently decoded strings.
+- Preload resource measurement fixtures, record frozen module populations, and restore maximum collector observations after disconnected baselines.
+- Every churn lifecycle whose selection is nonempty when its close begins must hold exactly one final, written inside the close, answered with error 0 and fully decoded; one under an empty selection must hold none. Cancellation allowances come from the scheduled retirements, not the transcript; each worker's driver source is joined to the run's tree; the share exchanges are archived once and joined by hash; each worker's native journal must cover every compressed Push; and each parent decoder child's memory is reported separately from `/proc`, or explicitly as unavailable. The close-and-reopen lane closes every kind, admin included, with the inherited 3000 ms budget, adds an admin zero-timeout arm (89 segments), bounds the admin blackhole cleanup by the smaller of 1000 ms and its finite remaining budget plus 100 ms, and links its fixed strict seams for private waiter, queue, snapshot and listener release.
+- The frozen coverage check can name the owner (test file, test, creation stack, endpoints) of every socket left open when a share cleanup baseline cannot settle; opt-in via `KAFKAJS_SOCKET_OWNERS=1`, enabled only in that check.
+- Client-metrics fixtures retry their creation readback for up to 3 s while broker metadata converges, keeping the exact configuration and listing checks and reporting the last observed mismatch on timeout.
+- The sharded soak CI job has 15 minutes instead of 10; its slowest shard already needed almost 10.
+
+#### Behavior changes
+
+- Observe successful foreground connections and completed request latency in the shared network runtime when telemetry is enabled; contain collector failures so the original request results are preserved.
+- Refuse obsolete telemetry connection opens before they can retire the current connection, preserving healthy telemetry after replacement or reconnect.
+- Log fixed diagnostics for private telemetry response failures without reading properties of arbitrary thrown values; ordinary request diagnostics retain their existing messages.
+- Contain private telemetry cleanup failures on repeated disconnects and complete the closed-state transition when metric cleanup fails.
+- Keep observational telemetry errors in the `applicationRecoverable` category regardless of a wrapped cause's transaction or configuration category; foreground clients remain usable.
+- Keep telemetry suspended after failed consumer startup, retain request latency observation across crash restarts, and wait for supported telemetry connection setup when requesting an instance ID. Contain all recognized share option accessors before construction; disabled disconnects retain their original scheduling.
+- Broker client metrics (KIP-714) are available with `enableMetricsPush: true`; the default remains false. Kafka-wide defaults can be overridden on producer, consumer, admin and share consumer.
+- Enabling broker telemetry can open one additional broker connection per client and send GetTelemetrySubscriptions/PushTelemetry traffic. Unsupported brokers quietly leave foreground operations usable.
+- Telemetry includes only applicable rack/group/static-member/current-member/transaction identity attributes, library scope/version and per-node metric labels.
+- Each client exposes an asynchronous stable `clientInstanceId({ timeout })`; disabled/unsupported/closed/unavailable calls reject with `KafkaJSTelemetryError`.
+- A `clientInstanceId()` caller whose own timeout has passed gives up its waiting slot when the next caller is admitted, without waiting for a timer; a new caller is refused with `limit` only while 64 unexpired callers wait.
+- A subscription response with more than 128 compression codecs, 256 requested-metric prefixes, 256 bytes in one prefix or 16384 prefix bytes is refused while it is decoded, before any array or string is built; telemetry stops for that client and foreground work continues.
+- Applications may register/unregister finite numeric Gauge and monotonic BigInt Sum snapshots for broker subscriptions.
+- Disconnect sends a best-effort terminating telemetry push on an active connected subscription, for at most 1000 ms within the existing close budget; timeout0 sends no final.
+- Preserve shared foreground SASL renewal when an individual caller expires; contain private telemetry commit and logging failures, retry transient socket failures, and retire expired telemetry work.
+- Positive telemetry push intervals below 100 ms are clamped to 100 ms locally; nonpositive intervals use 300000 ms.
+- Telemetry buffers, metric identities, labels and timers have fixed bounds; `telemetryMaxBytes` may lower the 1 MiB default. Small limits may omit metrics or send an empty blob. Only written included baselines advance; a rejected written sample can be lost from later deltas.
+- Telemetry payloads over1000 bytes use mutually supported built-in ZSTD/GZIP in broker order; NONE is always available. Producer codec registrations are unchanged.
+
+#### Fixes
+
+- A consumer that stops while an in-flight heartbeat loses the coordinator now still leaves its group (classic and consumer protocol): a coordinator rediscovered by the final offset commit is kept for the leave, without restarting heartbeats after stop. Previously the leave was skipped and the group waited a full session timeout (a regression from an earlier 3.0.0 pre-release). Coordinator recovery from a stale offset commit cannot overwrite the coordinator of a replacement membership.
+
 ### Phase 9E — Share groups
 
 #### Behavior changes

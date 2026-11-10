@@ -4,3 +4,4 @@
 *.md
 *.ts
 scripts/packageSmoke.test.mjs
+scripts/e2e/telemetry/telemetryWireProbe.js

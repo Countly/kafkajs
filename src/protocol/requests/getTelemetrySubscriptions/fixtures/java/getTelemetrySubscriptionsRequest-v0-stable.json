@@ -1,0 +1,9 @@
+{
+  "message": "GetTelemetrySubscriptionsRequest",
+  "version": 0,
+  "case": "stable",
+  "hex": "0102030405060708090a0b0c0d0e0f1000",
+  "fields": {
+    "clientInstanceId": "01020304-0506-0708-090a-0b0c0d0e0f10"
+  }
+}

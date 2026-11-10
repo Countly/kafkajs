@@ -388,16 +388,16 @@
     {
       "kafkaName": "GetTelemetrySubscriptions",
       "apiKey": 71,
-      "forkName": null,
-      "apiKeysName": null,
-      "planned": "no"
+      "forkName": "getTelemetrySubscriptions",
+      "apiKeysName": "GetTelemetrySubscriptions",
+      "planned": "done"
     },
     {
       "kafkaName": "PushTelemetry",
       "apiKey": 72,
-      "forkName": null,
-      "apiKeysName": null,
-      "planned": "no"
+      "forkName": "pushTelemetry",
+      "apiKeysName": "PushTelemetry",
+      "planned": "done"
     },
     {
       "kafkaName": "ListConfigResources",

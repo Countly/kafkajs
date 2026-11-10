@@ -57,6 +57,9 @@ const {
   withTimeout,
 } = require('../../consumer/__tests__/fixtures/liveScenario')
 const net = require('net')
+const fs = require('fs')
+const path = require('path')
+const { TelemetryWireObserver } = require('../../../testHelpers/telemetryFixtures')
 const { KafkaJSShareGroupsNotSupportedError } = require('../../../index')
 const { createResourceProbe } = require('../../../testHelpers/resourceProbe')
 const { FrameLog } = require('../../producer/__tests__/fixtures/liveWire')
@@ -1716,6 +1719,313 @@ class FloorShareCase {
   }
 }
 
+const { ordinaryOwnership } = require('../../../scripts/e2e/telemetry/semantics')
+const { persistEvidence, verifyScenario } = require('../../../scripts/e2e/telemetry/evidence')
+
+const digestFloor = (keys) =>
+  require('crypto')
+    .createHash('sha256')
+    .update([...keys].sort().join('\n'))
+    .digest('hex')
+
+const F24_TITLE = 'telemetry remains quiet on an unsupported broker'
+const F24_BUDGET_MS = 58000
+const F24_RECORDS = 1000
+const F24_PARTITIONS = 3
+
+/**
+ * F24: on the floor broker, which advertises neither telemetry API, telemetry-enabled producer,
+ * ordinary consumer and admin keep every supported operation and send no 71/72 frame or extra
+ * connection. A stable 1000-record workload has exact durable-log, raw-commit and handler sets,
+ * each read independently of the client.
+ */
+class FloorTelemetryCase {
+  /** Builds a case with fresh names; nothing is created until `run`. */
+  constructor() {
+    this.nonce = secureRandom(6)
+    this.arm = `floor-telemetry-${this.nonce}`
+    this.topic = `${this.arm}-topic`
+    this.group = `${this.arm}-group`
+    this.stack = new CleanupStack()
+    this.expected1000Ids = Array.from(
+      { length: F24_RECORDS },
+      (_, i) => `${this.arm}-${String(i).padStart(4, '0')}`
+    )
+    this.ends = Object.fromEntries(
+      Array.from({ length: F24_PARTITIONS }, (_, p) => [
+        p,
+        String(this.expected1000Ids.filter((_id, i) => i % F24_PARTITIONS === p).length),
+      ])
+    )
+    this.handled = []
+    this.processedNext = {}
+    this.committedNext = {}
+    this.observers = {}
+  }
+
+  /**
+   * @param {number} index record number
+   * @returns {Buffer} exactly 200 deterministic bytes that carry the identity
+   */
+  value(index) {
+    return Buffer.from(`${this.expected1000Ids[index]}|`.padEnd(200, 'x'))
+  }
+
+  /**
+   * @param {AbortSignal} scope the case scope
+   * @returns {Promise<void>}
+   * @throws {Error} the first assertion or fixture failure, with cleanup failures attached
+   */
+  async run(scope) {
+    try {
+      expect(process.env.KAFKA_VERSION).toBe('4.0.2')
+      const directory = path.resolve('.tmp/e2e', this.arm)
+      fs.mkdirSync(directory, { recursive: true })
+      let evidence
+      await this.stack.run(
+        async () => {
+          evidence = await this.work(scope, directory)
+        },
+        { budgetMs: 8000 }
+      )
+      const record = {
+        status: 'passed',
+        run: { stem: this.arm, line: process.env.KAFKA_VERSION },
+        corpus: evidence.corpus,
+        oracles: { corpus: evidence.corpus.inputs },
+        outcomes: Object.fromEntries(
+          ['producer', 'consumer', 'admin'].map((kind) => [kind, { status: 'connected' }])
+        ),
+      }
+      record.sidecars = persistEvidence({
+        name: 'telemetry-floor',
+        record,
+        directory,
+        observers: this.observers,
+      })
+      verifyScenario(record, directory)
+      writeEvidence(EVIDENCE, {
+        case: 'F24',
+        archiveDirectory: path.relative(path.resolve('.tmp/e2e'), directory),
+        archive: record,
+        ...evidence,
+        wireVersions: {},
+        config: { line: process.env.KAFKA_VERSION },
+      })
+    } catch (failure) {
+      writeEvidence(EVIDENCE, {
+        event: 'case-failed',
+        case: F24_TITLE,
+        scenario: this.nonce,
+        error: describeError(failure),
+      })
+      throw failure
+    }
+  }
+
+  /**
+   * Builds one telemetry-enabled client on an observed base-fixture socket factory; it is
+   * disconnected, its observer disposed and required clean when the case ends.
+   * @param {string} kind producer, consumer or admin
+   * @param {string} directory absolute observer directory
+   * @returns {object} the public client
+   */
+  client(kind, directory) {
+    const observer = new TelemetryWireObserver({
+      directory,
+      line: process.env.KAFKA_VERSION,
+      clock: { now: () => performance.now() },
+      mode: 'base',
+      owner: kind,
+    })
+    this.observers[kind] = observer
+    const kafka = new Kafka({
+      clientId: `${this.arm}-${kind}`,
+      brokers: plainTextBrokers(),
+      logLevel: logLevel.NOTHING,
+      socketFactory: (options) => observer.socketFactory(options),
+    })
+    const client =
+      kind === 'producer'
+        ? kafka.producer({ enableMetricsPush: true, idempotent: true })
+        : kind === 'admin'
+          ? kafka.admin({ enableMetricsPush: true })
+          : kafka.consumer({
+              enableMetricsPush: true,
+              groupId: this.group,
+              sessionTimeout: 30000,
+              heartbeatInterval: 3000,
+              maxWaitTimeInMs: 500,
+              readUncommitted: false,
+            })
+    this.stack.add(`require ${kind} observer clean`, () => observer.assertClean())
+    this.stack.add(`dispose ${kind} observer`, () => observer.dispose())
+    this.stack.add(`disconnect ${kind}`, () => observer.closeClient(client))
+    return client
+  }
+
+  /**
+   * @param {AbortSignal} scope the case scope
+   * @param {string} directory absolute observer directory
+   * @returns {Promise<object>} the evidence of the three independent oracles and the quiet path
+   */
+  async work(scope, directory) {
+    const brokers = plainTextBrokers()
+    await live.bounded(scope, 20000, () =>
+      createTopic({
+        topic: this.topic,
+        partitions: F24_PARTITIONS,
+        replicas: 3,
+        config: [{ name: 'min.insync.replicas', value: '2' }],
+      })
+    )
+    const producer = this.client('producer', directory)
+    const consumer = this.client('consumer', directory)
+    const admin = this.client('admin', directory)
+    const raw = new Kafka({
+      clientId: `${this.arm}-raw`,
+      brokers,
+      logLevel: logLevel.NOTHING,
+    }).admin({ enableMetricsPush: false })
+    this.stack.add('disconnect raw admin', () => raw.disconnect())
+    await live.bounded(scope, 10000, () =>
+      Promise.all([producer.connect(), consumer.connect(), admin.connect(), raw.connect()])
+    )
+    for (const observer of Object.values(this.observers)) observer.confirmForegroundBootstrap()
+    await live.bounded(scope, 15000, () =>
+      producer.send({
+        topic: this.topic,
+        acks: -1,
+        messages: this.expected1000Ids.map((key, i) => ({
+          key,
+          value: this.value(i),
+          partition: i % F24_PARTITIONS,
+        })),
+      })
+    )
+    await consumer.subscribe({ topic: this.topic, fromBeginning: true })
+    await consumer.run({
+      autoCommit: false,
+      eachMessage: async ({ partition, message }) => {
+        this.handled.push({
+          partition,
+          offset: message.offset,
+          key: message.key.toString(),
+          ordinal: this.handled.length + 1,
+        })
+        const next = String(BigInt(message.offset) + 1n)
+        this.processedNext[partition] = next
+        if (next === this.ends[partition] || this.handled.length % 100 === 0) {
+          await consumer.commitOffsets([{ topic: this.topic, partition, offset: next }])
+          this.committedNext[partition] = next
+        }
+      },
+    })
+    await live.pollUntil(
+      scope,
+      25000,
+      () => Object.entries(this.ends).every(([p, end]) => this.committedNext[p] === end),
+      { delayMs: 100, label: 'All floor records handled and committed' }
+    )
+    await consumer.stop()
+    await live.bounded(scope, 10000, () => admin.describeCluster())
+
+    const log = await live.bounded(scope, 20000, () =>
+      readLog({ brokers: [brokers[0]], topic: this.topic })
+    )
+    const durableIds = []
+    const rawEndByPartition = {}
+    for (const [partition, { endOffset, records }] of log) {
+      rawEndByPartition[partition] = endOffset
+      for (const record of records) {
+        const index = this.expected1000Ids.indexOf(record.key.toString())
+        expect(record.value.equals(this.value(index))).toBe(true)
+        durableIds.push(record.key.toString())
+      }
+    }
+    const fetched = await live.bounded(scope, 10000, () =>
+      raw.fetchOffsets({ groupId: this.group, topics: [this.topic], resolveOffsets: false })
+    )
+    const rows = fetched[0]?.partitions ?? fetched
+    const rawCommittedNextByPartition = Object.fromEntries(
+      rows.map((r) => [r.partition, String(r.offset)])
+    )
+    const processedNextByPartition = { ...this.processedNext }
+    const handlerIds = this.handled.map((h) => h.key)
+    const sortedDurableIds = [...durableIds].sort()
+    const sortedHandlerIds = [...handlerIds].sort()
+    const expected1000Ids = [...this.expected1000Ids].sort()
+
+    const adverts = Object.values(this.observers).flatMap((observer) => observer.advertisements())
+    const offered = adverts.flatMap((a) =>
+      [71, 72].filter((apiKey) => a.ranges[apiKey] !== null).map((apiKey) => ({ apiKey }))
+    )
+    const observedTelemetryRequests = Object.values(this.observers).flatMap((observer) =>
+      observer.readTranscript().filter((r) => r.apiKey === 71 || r.apiKey === 72)
+    )
+    const observedTelemetryConnections = Object.values(this.observers).flatMap((observer) =>
+      observer.telemetrySockets()
+    )
+    expect(adverts.length).toBeGreaterThan(0)
+    expect(offered.some(({ apiKey }) => apiKey === 71 || apiKey === 72)).toBe(false)
+    expect(observedTelemetryRequests).toEqual([])
+    expect(observedTelemetryConnections).toEqual([])
+    for (const observer of Object.values(this.observers))
+      ordinaryOwnership({ records: observer.readTranscript(), sockets: observer.socketOwnership() })
+    expect(sortedDurableIds).toEqual(expected1000Ids)
+    expect(sortedHandlerIds).toEqual(expected1000Ids)
+    expect(new Set(handlerIds).size).toBe(F24_RECORDS)
+    expect(rawCommittedNextByPartition).toEqual(processedNextByPartition)
+    expect(rawCommittedNextByPartition).toEqual(rawEndByPartition)
+    for (const kind of ['producer', 'consumer', 'admin']) {
+      const client = { producer, consumer, admin }[kind]
+      const error = await client.clientInstanceId({ timeout: 0 }).then(
+        () => null,
+        (e) => e
+      )
+      expect(error).toMatchObject({ name: 'KafkaJSTelemetryError', reason: 'unsupported' })
+      this.observers[kind].assertHealthy()
+    }
+    return {
+      corpus: {
+        count: F24_RECORDS,
+        expectedSha256: digestFloor(expected1000Ids),
+        logSha256: digestFloor(durableIds),
+        handlerSha256: digestFloor(handlerIds),
+        handlerEntries: this.handled.length,
+        rawCommitted: rawCommittedNextByPartition,
+        processedNext: processedNextByPartition,
+        rawEnd: rawEndByPartition,
+        inputs: {
+          expected: this.expected1000Ids.map((key, i) => ({
+            key,
+            partition: i % F24_PARTITIONS,
+            valueHex: this.value(i).toString('hex'),
+          })),
+          log: [...log].flatMap(([partition, { records }]) =>
+            records.map((r) => ({
+              partition,
+              offset: r.offset,
+              key: r.key.toString(),
+              valueHex: r.value.toString('hex'),
+            }))
+          ),
+          handled: this.handled,
+          commits: fetched,
+          ends: rawEndByPartition,
+        },
+      },
+      records: F24_RECORDS,
+      handlerEntries: this.handled.length,
+      rawCommittedNextByPartition,
+      rawEndByPartition,
+      offered: offered.length,
+      telemetryRequests: observedTelemetryRequests.length,
+      telemetryConnections: observedTelemetryConnections.length,
+    }
+  }
+}
+
 describeFakeLane('Floor share resource comparison', () => {
   /** @returns {object} the five measured resource counts, plus raw process/socket history */
   const measurement = () => ({
@@ -1797,6 +2107,12 @@ describeFloor('Share groups on the broker floor', () => {
     caseTimeout(SHARE_FLOOR_BUDGET_MS)
   )
 
+  test(
+    F24_TITLE,
+    live.liveCase(F24_BUDGET_MS, (scope) => new FloorTelemetryCase().run(scope)),
+    caseTimeout(F24_BUDGET_MS)
+  )
+
   afterEach(() => {
     if (!live.liveRun.takeAdmission()) return
     live.liveRun.assertClean()
@@ -1805,14 +2121,16 @@ describeFloor('Share groups on the broker floor', () => {
   test('the share refusal evidence of this run carries the stamps a verifier checks', () => {
     const lines = evidenceLines(EVIDENCE)
       .slice(linesBefore)
-      .filter(({ case: name }) => name === 'F23' || name === SHARE_FLOOR_TITLE)
+      .filter(({ case: name }) => name === 'F23' || name === SHARE_FLOOR_TITLE || name === 'F24')
     const verified = {
       tree: process.env.KAFKAJS_TREE || 'unfrozen',
       node: process.version,
       brokerVersion: process.env.KAFKA_VERSION,
     }
 
-    expect(lines.map(({ case: name }) => name).sort()).toEqual(['F23', SHARE_FLOOR_TITLE].sort())
+    expect(lines.map(({ case: name }) => name).sort()).toEqual(
+      ['F23', SHARE_FLOOR_TITLE, 'F24'].sort()
+    )
     for (const line of lines) expect(problemsOf(line, verified)).toEqual([])
   })
 })

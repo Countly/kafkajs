@@ -816,6 +816,21 @@ const data = await consumer.describeGroup()
 
 Under `groupProtocol: 'consumer'` the same call is answered by `ConsumerGroupDescribe`, so `groupType` is `'consumer'`, `groupEpoch`/`assignmentEpoch`/`assignorName` carry the coordinator's values, `protocol` is the server-side assignor's name, and each member carries its `memberEpoch`, `assignment`, `targetAssignment`, `subscribedTopics` and `subscribedTopicRegex`. `authorizedOperations` is `null` unless authorized operations were requested. See [Admin: describe groups](Admin.md#describe-groups) for the full field list.
 
+## Broker client telemetry
+
+Consumer config inherits Kafka's `enableMetricsPush: false` and `telemetryMaxBytes: 1048576`; explicit client values override them. The returned consumer exposes `clientInstanceId({ timeout: 60000 })`, `registerMetricForSubscription(metric)` and `unregisterMetricFromSubscription(identity)`. Connect before an uncached ID call; timeout0 is cached-only.
+
+```js
+const consumer = kafka.consumer({ groupId: 'orders', enableMetricsPush: true })
+await consumer.connect()
+const id = await consumer.clientInstanceId({ timeout: 60000 })
+consumer.registerMetricForSubscription({ name: 'com.example.processed.total', type: 'sum', value: 1n })
+consumer.unregisterMetricFromSubscription({ name: 'com.example.processed.total' })
+await consumer.disconnect({ leaveGroup: false, timeout: 0 })
+```
+
+Current rack/group/static-member/member attributes may be disclosed to the configured receiver; no-group mode omits group fields. Stop retains connected telemetry. Crash recovery suspends it, without a final, settling expired ID waits timeout and other pending waits not-connected. Seek, rejoin, topic recreation and reassignment retain UUID. Public disconnect keeps the first deadline, hook/final-commit/leave order and signal callback; telemetry joins concurrently within that budget and never reserves core time. Explicit false disables it. See [Client Telemetry](ClientTelemetry.md) for errors, bounds/losses, disclosure and corrective-reopen conditions.
+
 ## <a name="compression"></a> Compression
 
 KafkaJS only support GZIP natively, but [other codecs can be supported](Producing.md#compression-other).

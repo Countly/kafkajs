@@ -430,3 +430,62 @@ namespace ShareConsumerSurface {
   const stringDuration: string = share.acquisitionLockTimeoutMs()
   void [terminalType, stringDuration]
 }
+
+import * as kafkajs from '@countly/kafkajs'
+
+// Telemetry is additive to the existing root configuration and returned client types.
+const telemetryKafka = new kafkajs.Kafka({ brokers: ['localhost:9092'], enableMetricsPush: true, telemetryMaxBytes: 1048576 })
+const telemetryProducer = telemetryKafka.producer({ enableMetricsPush: false, telemetryMaxBytes: 1 })
+const telemetryConsumer = telemetryKafka.consumer({ groupId: 'telemetry-types', enableMetricsPush: true })
+const telemetryAdmin = telemetryKafka.admin({ enableMetricsPush: true })
+declare const telemetrySum: bigint
+for (const client of [telemetryProducer, telemetryConsumer, telemetryAdmin]) {
+  const id: Promise<string> = client.clientInstanceId({ timeout: 0 })
+  const registered: void = client.registerMetricForSubscription({ name: 'com.example.depth', type: 'gauge', value: -0.5 })
+  client.registerMetricForSubscription({ name: 'com.example.total', type: 'sum', value: telemetrySum })
+  const removed: void = client.unregisterMetricFromSubscription({ name: 'com.example.depth' })
+  void [id, registered, removed]
+  // @ts-expect-error callbacks are not numeric snapshots
+  client.registerMetricForSubscription({ name: 'com.example.depth', type: 'gauge', value: () => 1 })
+  // @ts-expect-error sums require bigint
+  client.registerMetricForSubscription({ name: 'com.example.total', type: 'sum', value: 1 })
+  // @ts-expect-error timeout is numeric
+  client.clientInstanceId({ timeout: '1' })
+}
+const telemetryError = new kafkajs.KafkaJSTelemetryError('Client telemetry disabled', { reason: 'disabled', apiKey: 71, cause: new Error('safe') })
+const telemetryReason: kafkajs.KafkaJSTelemetryErrorReason = telemetryError.reason
+// @ts-expect-error reason is readonly
+telemetryError.reason = 'timeout'
+// @ts-expect-error the reason union is closed
+new kafkajs.KafkaJSTelemetryError('x', { reason: 'fatal' })
+// @ts-expect-error the Kafka factory has no instance ID
+telemetryKafka.clientInstanceId()
+// @ts-expect-error boolean configuration only
+new kafkajs.Kafka({ brokers: [], enableMetricsPush: 1 })
+// @ts-expect-error the transaction handle has no telemetry surface
+telemetryProducer.transaction().then(transaction => transaction.clientInstanceId())
+type TelemetryEqual<A, B> = (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B ? 1 : 2) ? true : false
+const telemetryConstructor: TelemetryEqual<ConstructorParameters<typeof kafkajs.Kafka>, [config: kafkajs.KafkaConfig]> = true
+const telemetryProducerDisconnect: TelemetryEqual<Parameters<kafkajs.Producer['disconnect']>, []> = true
+const telemetryConsumerDisconnect: TelemetryEqual<Parameters<kafkajs.Consumer['disconnect']>, []> = true
+const telemetryAdminDisconnect: TelemetryEqual<Parameters<kafkajs.Admin['disconnect']>, []> = true
+process.on('SIGTERM', telemetryProducer.disconnect)
+process.on('SIGTERM', telemetryConsumer.disconnect)
+process.on('SIGTERM', telemetryAdmin.disconnect)
+telemetryProducer.disconnect({ timeout: 0 })
+telemetryConsumer.disconnect({ timeout: 0, leaveGroup: false })
+void [telemetryReason, telemetryConstructor, telemetryProducerDisconnect, telemetryConsumerDisconnect, telemetryAdminDisconnect]
+
+const telemetryShare = telemetryKafka.shareConsumer({ groupId: 'telemetry-types', enableMetricsPush: true, telemetryMaxBytes: 1 })
+const telemetryShareSurface: kafkajs.ClientTelemetry = telemetryShare
+const telemetryShareId: Promise<string> = telemetryShare.clientInstanceId({ timeout: 0 })
+telemetryShare.registerMetricForSubscription({ name: 'com.example.share', type: 'sum', value: telemetrySum })
+telemetryShare.unregisterMetricFromSubscription({ name: 'com.example.share' })
+const telemetryShareDisconnect: TelemetryEqual<Parameters<kafkajs.ShareConsumer['disconnect']>, []> = true
+process.on('SIGTERM', telemetryShare.disconnect)
+telemetryShare.disconnect({ timeout: 0 })
+// @ts-expect-error callbacks are not share metric snapshots
+telemetryShare.registerMetricForSubscription({ name: 'com.example.share', type: 'gauge', value: () => 1 })
+// @ts-expect-error the ID getter does not accept signal strings
+telemetryShare.clientInstanceId('SIGTERM')
+void [telemetryShareSurface, telemetryShareId, telemetryShareDisconnect]

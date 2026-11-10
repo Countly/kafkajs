@@ -1,0 +1,13 @@
+{
+  "message": "PushTelemetryRequest",
+  "version": 0,
+  "case": "zero",
+  "hex": "00000000000000000000000000000000000000000000030a0000",
+  "fields": {
+    "clientInstanceId": null,
+    "subscriptionId": 0,
+    "terminating": false,
+    "compressionType": 0,
+    "metrics": "0a00"
+  }
+}

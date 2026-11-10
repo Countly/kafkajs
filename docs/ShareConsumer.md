@@ -81,6 +81,21 @@ After the handler boundary, all finals and leave together have a finite local `r
 
 A crash fences old work immediately, also when it interrupts a stop that is waiting for handlers, and finishes bounded cleanup before restart supervision. A stop or disconnect that arrives while a fence or poll-expiry recovery is closing ends the run once that cleanup is done. The heartbeat chain is suspended for the length of a recovery close, so no join overlaps its final traffic. The exact original terminal error is passed to `retry.restartOnFailure`. A callback rejection is logged and defaults to restart as for the ordinary consumer. Configuration, authorization, broker refusal and explicit omission force `restart: false`. Stop or disconnect while supervision is pending prevents resurrection. Poll expiry tracks every active node handler's own start; progress on a fast node cannot conceal a slow one. Idle members do not expire for lack of records. Rejoin waits for captured expired calls to finish or be abandoned and for their close episode to end.
 
+## Broker client telemetry
+
+ShareConsumer config inherits Kafka's `enableMetricsPush: false` and `telemetryMaxBytes: 1048576`; explicit client values override them. Each returned share consumer owns independent telemetry, using the consumer metric names and its current group/member resources. It emits no ordinary static-member ID. Methods are `clientInstanceId({ timeout: 60000 })`, `registerMetricForSubscription(metric)` and `unregisterMetricFromSubscription(identity)`.
+
+```js
+const share = kafka.shareConsumer({ groupId: 'workers', enableMetricsPush: true })
+await share.connect()
+const id = await share.clientInstanceId({ timeout: 60000 })
+share.registerMetricForSubscription({ name: 'com.example.share.total', type: 'sum', value: 1n })
+share.unregisterMetricFromSubscription({ name: 'com.example.share.total' })
+await share.disconnect({ timeout: 0 })
+```
+
+Stop retains connected telemetry; crash cleanup suspends it without a final. The UUID and registrations survive reconnect. Existing first-close deadlines, lock renewal/acknowledgement/release order, OptionA prefix/rest oracle and signal callbacks remain unchanged; telemetry joins core draining concurrently inside that original budget. Timeout0 sends no final. Explicit false disables it. See [Client Telemetry](ClientTelemetry.md) for errors, disclosure, bounds/loss and the one provisional corrective-reopen cycle.
+
 ## Isolation
 
 Share isolation defaults to read_uncommitted, unlike consumer's read_committed; set share.isolation.level=read_committed on the GROUP resource and wait for describeConfigs readback before joining.
@@ -113,7 +128,9 @@ Use `run({ eachMessage })` or `run({ eachBatch })` for Java's polling role. The 
 | `acquisitionLockTimeoutMs()` | `acquisitionLockTimeoutMs()`, `null` until a broker answer carries it |
 | `close()`, `close(Duration)` | `disconnect()`, `disconnect({ timeout })` |
 | `wakeup()` | none; use `stop()` |
-| `metrics()`, `clientInstanceId(Duration)`, metric registration | none on this surface |
+| `clientInstanceId(Duration)` | `clientInstanceId({ timeout })` |
+| `registerMetricForSubscription(...)`, `unregisterMetricFromSubscription(...)` | `registerMetricForSubscription(metric)`, `unregisterMetricFromSubscription(identity)` |
+| `metrics()` | none on this surface |
 
 There is no callable synchronous flush-and-wait, no clear-subscription method and no subscription replacement while running. stop retains the subscribed names; use stop → subscribe → run to replace them. Automatic acknowledgement sending reports each homogeneous terminal range once; renew results are nonterminal. This sequence does not preserve running-replacement semantics.
 
@@ -140,7 +157,7 @@ The payload has exactly `topic`, `partition`, `firstOffset`, `lastOffset`, `type
 
 There are 43 ordinary channels and 18 share channels. ShareConsumer emits instrumentation events and diagnostics channels; this package does not create share-consumer spans.
 
-There is no built-in metrics registry or `metrics()` method on this surface. Use the instrumentation events and their diagnostics channels for counters and timing; the event contract supplies observations without creating an OpenTelemetry span. Client instance identity and metric subscription APIs are separate telemetry work; no ShareConsumer telemetry method is added here.
+There is no built-in metrics registry or `metrics()` method on this surface. Use the instrumentation events and their diagnostics channels for counters and timing; the event contract supplies observations without creating an OpenTelemetry span. Client instance identity and metric subscription APIs are available through `clientInstanceId({ timeout })`, `registerMetricForSubscription(metric)` and `unregisterMetricFromSubscription(identity)`. See [Broker client telemetry](#broker-client-telemetry) for their configuration and lifecycle.
 
 ## Administration and resetting offsets
 
@@ -206,4 +223,4 @@ Use `deleteGroups(['orders-workers'])` for an empty share group; no `deleteShare
 
 ## Public surface and test doubles
 
-`ShareConsumer` has `connect`, `disconnect`, `subscribe`, `subscription`, `assignment`, `run`, `stop`, `acquisitionLockTimeoutMs`, `on`, `logger`, and the `events` property. `ShareConsumer` is a TypeScript type and a factory-created client, not a named runtime constructor export. The root CommonJS and ESM packages export `KafkaJSShareGroupsNotSupportedError` and `KafkaJSShareAcknowledgementError`. Hand-written Kafka/Admin test doubles need the added members. Existing ordinary consumer methods, options and event contracts continue to apply to `consumer()`.
+`ShareConsumer` has `connect`, `disconnect`, `subscribe`, `subscription`, `assignment`, `run`, `stop`, `acquisitionLockTimeoutMs`, `on`, `logger`, the `events` property and the three broker telemetry methods `clientInstanceId`, `registerMetricForSubscription` and `unregisterMetricFromSubscription`. `ShareConsumer` is a TypeScript type and a factory-created client, not a named runtime constructor export. The root CommonJS and ESM packages export `KafkaJSShareGroupsNotSupportedError` and `KafkaJSShareAcknowledgementError`. Hand-written Kafka/Admin test doubles need the added members. Existing ordinary consumer methods, options and event contracts continue to apply to `consumer()`.

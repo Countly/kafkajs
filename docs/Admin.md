@@ -35,6 +35,7 @@ No file's presence proves a live run passed.
 | `fenceProducers` | apiTimeout, transactionTimeout, transactionalIds | transactions |
 | `connect` | none | lifecycle |
 | `disconnect` | timeout | lifecycle |
+| `clientInstanceId` | timeout | lifecycle |
 | `listTopics` | apiTimeout | metadata |
 | `createTopics` | apiTimeout, timeout, topics, validateOnly, waitForLeaders | topics |
 | `deleteTopics` | apiTimeout, timeout, topicIds, topics | topics |
@@ -82,6 +83,8 @@ No file's presence proves a live run passed.
 | `describeDelegationToken` | apiTimeout, owners | delegation tokens |
 | `logger` | none | instrumentation |
 | `on` | none | instrumentation |
+| `registerMetricForSubscription` | attributes, name, type, unit, value | instrumentation |
+| `unregisterMetricFromSubscription` | attributes, name | instrumentation |
 
 ## Admin evidence by family
 
@@ -206,6 +209,21 @@ A request already transmitted is not recalled. A mutation may have been applied;
 Retry counts and backoff remain unchanged. The call ends at the earlier of retry exhaustion and its API deadline. This differs from Java's effectively unbounded default retry count within the API deadline.
 
 For example, `createTopics({ topics, timeout: 30000, apiTimeout: 5000 })` can time out locally while the broker continues creating the topics. The error names the method and the API budget.
+
+## Broker client telemetry
+
+Admin config inherits Kafka's `enableMetricsPush: false` and `telemetryMaxBytes: 1048576`; explicit client values override them. The returned admin exposes `clientInstanceId({ timeout: 60000 })`, `registerMetricForSubscription(metric)` and `unregisterMetricFromSubscription(identity)`.
+
+```js
+const admin = kafka.admin({ enableMetricsPush: true, telemetryMaxBytes: 4096 })
+await admin.connect()
+const id = await admin.clientInstanceId({ timeout: 60000 })
+admin.registerMetricForSubscription({ name: 'com.example.admin.depth', type: 'gauge', value: 1 })
+admin.unregisterMetricFromSubscription({ name: 'com.example.admin.depth' })
+await admin.disconnect()
+```
+
+No group or transaction identity is emitted for admin. The three admin connection/RTT metrics are documented extensions. Existing apiTimeout and broker-side timeout meanings stay unchanged, and telemetry adds no disconnect option. Telemetry cleanup runs concurrently with the first valid close, for at most min(1000 ms, its remaining budget); `disconnect({ timeout: 0 })` sends no final. It cannot replace the close result or error. Disable it with explicit false. See [Client Telemetry](ClientTelemetry.md) for limits, loss, errors and corrective-reopen behavior.
 
 ## Authorized operations
 

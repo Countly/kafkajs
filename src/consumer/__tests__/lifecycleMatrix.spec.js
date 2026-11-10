@@ -1,15 +1,30 @@
 const { useSharedFakeClock } = require('./fixtures/sharedFakeClock')
-const { lifecycleCells } = require('../../../testHelpers/lifecycle')
+const {
+  lifecycleCells,
+  coreLifecycleCells,
+  runTelemetryLifecycleCell,
+} = require('../../../testHelpers/lifecycle')
 const committed = require('../../../testHelpers/lifecycleCells.json')
 const { runLifecycleCell } = require('./fixtures/lifecycleCase')
 const { runManualLifecycleCell } = require('./fixtures/manualLifecycleCase')
 
 describe('Consumer lifecycle matrix', () => {
   test('cell catalogue is exactly the committed reviewed list', () => {
+    const prior = coreLifecycleCells()
+    const added = committed.slice(prior.length)
     expect(lifecycleCells()).toEqual(committed)
-    expect(committed).toHaveLength(690)
-    expect(new Set(committed.map((cell) => JSON.stringify(cell))).size).toBe(690)
-    expect(committed.filter((cell) => cell.protocol === 'manual')).toHaveLength(126)
+    expect(prior).toHaveLength(690)
+    expect(committed.slice(0, prior.length)).toEqual(prior)
+    expect(prior.some((cell) => cell.telemetry)).toBe(false)
+    expect(committed).toHaveLength(prior.length + (6 * 8 + 2 * 7) * 2)
+    expect(new Set(committed.map((cell) => JSON.stringify(cell))).size).toBe(committed.length)
+    expect(added.every((cell) => cell.telemetry === true)).toBe(true)
+    expect(added.filter((cell) => cell.event === 'rejoin' && cell.protocol === 'manual')).toEqual(
+      []
+    )
+    expect(committed.filter((cell) => cell.protocol === 'manual' && !cell.telemetry)).toHaveLength(
+      126
+    )
   })
   test('every mandatory manual, hook, force and session cell is in the committed list', () => {
     const has = (event, boundary, protocol, membership) =>
@@ -49,14 +64,25 @@ describe('Consumer lifecycle matrix', () => {
       committed.filter((cell) => cell.protocol === 'manual' && cell.boundary.startsWith('hook:'))
     ).toEqual([])
   })
-  describe.each(committed)('$event at $boundary on $protocol/$membership', (cell) => {
-    beforeEach(useSharedFakeClock)
-    afterEach(() => {
-      jest.useRealTimers()
-      jest.restoreAllMocks()
-    })
-    test('no commit after loss, owed rejoin and settled teardown baseline', async () => {
-      await (cell.protocol === 'manual' ? runManualLifecycleCell(cell) : runLifecycleCell(cell))
-    })
-  })
+  describe.each(committed.filter((cell) => cell.telemetry))(
+    '$event at $boundary on $protocol/$membership enforce=$enforceRequestTimeout',
+    (cell) => {
+      test('telemetry authority is fenced and the original close is preserved', async () => {
+        await runTelemetryLifecycleCell(cell)
+      }, 60000)
+    }
+  )
+  describe.each(committed.filter((cell) => !cell.telemetry))(
+    '$event at $boundary on $protocol/$membership',
+    (cell) => {
+      beforeEach(useSharedFakeClock)
+      afterEach(() => {
+        jest.useRealTimers()
+        jest.restoreAllMocks()
+      })
+      test('no commit after loss, owed rejoin and settled teardown baseline', async () => {
+        await (cell.protocol === 'manual' ? runManualLifecycleCell(cell) : runLifecycleCell(cell))
+      })
+    }
+  )
 })

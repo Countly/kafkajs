@@ -48,7 +48,7 @@ export type Mechanism = {
   authenticationProvider: (args: AuthenticationProviderArgs) => Authenticator
 }
 
-export interface KafkaConfig {
+export interface KafkaConfig extends ClientTelemetryConfig {
   brokers: string[] | BrokersFunction
   ssl?: tls.ConnectionOptions | boolean
   sasl?: SASLOptions | Mechanism
@@ -212,7 +212,7 @@ type SASLMechanismOptions<T> = T extends SASLMechanism
   : never
 export type SASLOptions = SASLMechanismOptions<SASLMechanism>
 
-export interface ProducerConfig {
+export interface ProducerConfig extends ClientTelemetryConfig {
   /** Per-codec levels. Gzip: -1 or 1..9; zstd: -131072..22. Omission keeps codec defaults.
    * LZ4 levels are unavailable in lz4-napi and are rejected, as are Snappy levels.
    */
@@ -391,7 +391,7 @@ export interface ConsumerCommittedOffset {
   metadata: string | null
 }
 
-export interface ConsumerConfig {
+export interface ConsumerConfig extends ClientTelemetryConfig {
   groupId: string
   partitionAssigners?: PartitionAssigner[]
   metadataMaxAge?: number
@@ -594,7 +594,7 @@ export interface RetryOptions {
   restartOnFailure?: (e: Error) => Promise<boolean>
 }
 
-export interface AdminConfig {
+export interface AdminConfig extends ClientTelemetryConfig {
   retry?: RetryOptions
   /** Default end-to-end call budget, integer 1..2147483647 ms; default 60000. */
   apiTimeout?: number
@@ -996,7 +996,7 @@ export interface TransactionDescription extends AdminItemResult {
   topics: TopicPartitionList
 }
 
-export type Admin = {
+export type Admin = ClientTelemetry & {
   /** Describes partition leaders or one named replica; errors are partition data.
    * @param options unique topicPartitions and optional brokerId
    * @returns topic results with lossless int64 producer state
@@ -1760,7 +1760,7 @@ export type ProducerEvents = {
   REBOOTSTRAP: 'producer.cluster.rebootstrap'
 }
 
-export type Producer = Sender & {
+export type Producer = Sender & ClientTelemetry & {
   connect(): Promise<void>
   /**
    * Flushes the call-time snapshot of both accumulators. Send failures remain on their own promises.
@@ -2317,7 +2317,7 @@ export type ConsumerSubscribeRegex = {
   offsetReset?: ConsumerOffsetReset
 }
 
-export type Consumer = {
+export type Consumer = ClientTelemetry & {
   connect(): Promise<void>
   /**
    * `leaveGroup: true` makes the member leave the group, so its partitions are handed over at
@@ -2508,7 +2508,7 @@ export type ShareAcquireMode = 'batch_optimized' | 'record_limit'
 /** `accept`: done. `release`: deliver again, to anyone. `reject`: never deliver again. */
 export type ShareAcknowledgeType = 'accept' | 'release' | 'reject'
 
-export interface ShareConsumerConfig {
+export interface ShareConsumerConfig extends ClientTelemetryConfig {
   groupId: string
   /** Default `'implicit'`. */
   acknowledgementMode?: ShareAcknowledgementMode
@@ -2683,7 +2683,7 @@ export type ShareConsumerCrashEvent = InstrumentationEvent<{
   restart: boolean
 }>
 
-export type ShareConsumer = {
+export type ShareConsumer = ClientTelemetry & {
   /** Rejects with `KafkaJSShareGroupsNotSupportedError` when the cluster cannot run share groups. */
   connect(): Promise<void>
   /**
@@ -3332,6 +3332,58 @@ export interface KafkaJSStaleTopicMetadataAssignmentMetadata {
 export interface KafkaJSServerDoesNotSupportApiKeyMetadata {
   apiKey: number
   apiName: string
+}
+
+export interface ClientTelemetryConfig {
+  /** Broker telemetry opt-in; default false. A client factory overrides the Kafka default. */
+  enableMetricsPush?: boolean
+  /** Raw and transmitted metric-byte ceiling, default 1048576; integer 1..1048576. */
+  telemetryMaxBytes?: number
+}
+
+export interface ClientInstanceIdOptions {
+  /** Milliseconds to wait for an ID, default 60000; integer 0..2147483647. */
+  timeout?: number
+}
+
+export interface ClientTelemetryMetricIdentity {
+  name: string
+  attributes?: Readonly<Record<string, string>>
+}
+
+export type ClientTelemetryMetric = ClientTelemetryMetricIdentity & {
+  /** OTLP unit; default "1". */
+  unit?: string
+} & (
+    | { type: 'gauge'; value: number }
+    | { type: 'sum'; value: bigint }
+  )
+
+export interface ClientTelemetry {
+  /** Stable canonical UUID; does not implicitly connect the client or enable telemetry. */
+  clientInstanceId(options?: ClientInstanceIdOptions): Promise<string>
+  /** Registers or updates a numeric snapshot; invalid input throws before mutation. */
+  registerMetricForSubscription(metric: ClientTelemetryMetric): void
+  /** Removes this identity; an absent valid identity is a no-op. */
+  unregisterMetricFromSubscription(metric: ClientTelemetryMetricIdentity): void
+}
+
+export type KafkaJSTelemetryErrorReason =
+  | 'disabled'
+  | 'not-connected'
+  | 'closed'
+  | 'unsupported'
+  | 'timeout'
+  | 'stopped'
+  | 'limit'
+
+export class KafkaJSTelemetryError extends KafkaJSNonRetriableError {
+  readonly reason: KafkaJSTelemetryErrorReason
+  readonly apiKey?: number
+  constructor(
+    e: Error | string,
+    options: { reason: KafkaJSTelemetryErrorReason; apiKey?: number; cause?: Error }
+  )
 }
 
 /** One quota mutation; removal and assignment are exclusive. */
