@@ -75,6 +75,10 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Telemetry buffers, metric identities, labels and timers have fixed bounds; `telemetryMaxBytes` may lower the 1 MiB default. Small limits may omit metrics or send an empty blob. Only written included baselines advance; a rejected written sample can be lost from later deltas.
 - Telemetry payloads over1000 bytes use mutually supported built-in ZSTD/GZIP in broker order; NONE is always available. Producer codec registrations are unchanged.
 
+#### Fixes
+
+- A consumer that stops while an in-flight heartbeat loses the coordinator now still leaves its group (classic and consumer protocol): a coordinator rediscovered by the final offset commit is kept for the leave, without restarting heartbeats after stop. Previously the leave was skipped and the group waited a full session timeout (a regression of the 9E stopped-heartbeat guard).
+
 ### Phase 9E — Share groups
 
 #### Behavior changes
