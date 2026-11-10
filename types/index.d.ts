@@ -83,6 +83,11 @@ export interface KafkaConfig extends ClientTelemetryConfig {
   logLevel?: logLevel
   logCreator?: logCreator
   metadataRecoveryStrategy?: 'rebootstrap' | 'none'
+  /**
+   * Names the intended cluster and node in ApiVersions v5 (default `true`); `false` names none.
+   * Rebootstrap on `REBOOTSTRAP_REQUIRED` is unchanged. Only `true` with `rebootstrap` names them.
+   */
+  metadataClusterCheck?: boolean
   metadataRecoveryRebootstrapTriggerMs?: number
 }
 
@@ -1126,6 +1131,12 @@ fetchTopicOffsetsByTimestamp(topic: string, timestamp?: number): Promise<Array<S
   listConfigResources(
     options?: { resourceTypes?: ConfigResourceTypes[] } & ApiTimeoutOption,
   ): Promise<{ resources: Array<{ type: ConfigResourceTypes; name: string }> }>
+  /**
+   * Unregisters a controller (KIP-1312). Evolving; requires Kafka 4.4 or newer. Rejects with
+   * `KafkaJSServerDoesNotSupportApiKey` when no known broker offers the request and with a typed
+   * protocol error such as `CONTROLLER_ID_NOT_REGISTERED` when the broker refuses it.
+   */
+  unregisterController(options: { controllerId: number } & ApiTimeoutOption): Promise<void>
   /** Flags opt into DescribeCluster; no flag keeps the legacy Metadata request. */
   describeCluster(
     options?: {

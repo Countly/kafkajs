@@ -467,16 +467,17 @@ A consumer's `maxBytes` is a response target and does not cap process memory. Se
 
 ## Metadata recovery
 
-`metadataRecoveryStrategy` and `metadataRecoveryRebootstrapTriggerMs`, available on the `Kafka`
-constructor, control what the client does when it loses its view of the cluster (KIP-899/KIP-1102,
-matching the Java client's `metadata.recovery.strategy` and
-`metadata.recovery.rebootstrap.trigger.ms`).
+`metadataRecoveryStrategy`, `metadataClusterCheck` and `metadataRecoveryRebootstrapTriggerMs`,
+available on the `Kafka` constructor, control what the client does when it loses its view of the
+cluster (KIP-899/KIP-1102, matching the Java client's `metadata.recovery.strategy` and
+`metadata.recovery.rebootstrap.trigger.ms`) and whether it names the cluster it expects (KIP-1242).
 
 ```javascript
 new Kafka({
   clientId: 'my-app',
   brokers: ['kafka1:9092', 'kafka2:9092'],
   metadataRecoveryStrategy: 'rebootstrap',
+  metadataClusterCheck: true,
   metadataRecoveryRebootstrapTriggerMs: 300000,
 })
 ```
@@ -496,6 +497,20 @@ new Kafka({
   Bootstrap requests use no identity. `'none'` sends neither id and disables rebootstrap on
   `REBOOTSTRAP_REQUIRED`; a returned protocol error still fails the request. Older brokers answer
   the first request with `UNSUPPORTED_VERSION` and complete ApiVersions v4 negotiation.
+- `metadataClusterCheck`: `true` (the default) or `false`. It decides whether ApiVersions v5 names
+  the intended cluster id and node id once the client knows them. `false` names neither, so a
+  Kafka 4.4 broker no longer answers `REBOOTSTRAP_REQUIRED` because the cluster or node differs.
+  The other rebootstrap triggers stay on, and a `REBOOTSTRAP_REQUIRED` answer to any other request
+  still triggers rebootstrap. Bootstrap requests and older brokers never carry an identity. The
+  value must be a boolean; anything else throws `KafkaJSInvalidConfigurationError` from the
+  constructor.
+
+  | `metadataRecoveryStrategy` | `metadataClusterCheck` | Identity named in ApiVersions v5 |
+  |---|---|---|
+  | `'rebootstrap'` | `true` (default) | the intended cluster id and node id, once known |
+  | `'rebootstrap'` | `false` | none |
+  | `'none'` | `true` or `false` | none |
+
 - `metadataRecoveryRebootstrapTriggerMs`: how long metadata must fail continuously before trigger
   1 above fires. Defaults to `300000` (5 minutes, matching the Java client). Must be an integer
   **≥ 1** — `0` is rejected rather than meaning "rebootstrap immediately": at `0` the trigger would

@@ -20,6 +20,7 @@ const {
   KafkaJSMetadataNotLoaded,
   KafkaJSTopicMetadataNotLoaded,
   KafkaJSGroupCoordinatorNotFound,
+  KafkaJSServerDoesNotSupportApiKey,
 } = require('../errors')
 const COORDINATOR_TYPES = require('../protocol/coordinatorTypes')
 const apiKeys = require('../protocol/requests/apiKeys')
@@ -120,6 +121,7 @@ module.exports = class Cluster {
    *   pool unchanged.
    * @param {'rebootstrap'|'none'} [options.metadataRecoveryStrategy] forwarded to `BrokerPool`
    *   unchanged; `Cluster` stores neither this nor the trigger window.
+   * @param {boolean} [options.metadataClusterCheck] forwarded to `BrokerPool` unchanged.
    * @param {number} [options.metadataRecoveryRebootstrapTriggerMs] forwarded to `BrokerPool`
    *   unchanged.
    * @param {import("../instrumentation/emitter")} [options.instrumentationEmitter=null] stored on
@@ -156,6 +158,7 @@ module.exports = class Cluster {
     operations = new Map(),
     maxResponseSize,
     metadataRecoveryStrategy,
+    metadataClusterCheck,
     metadataRecoveryRebootstrapTriggerMs,
   }) {
     this.rootLogger = rootLogger
@@ -217,6 +220,7 @@ module.exports = class Cluster {
       authenticationTimeout,
       metadataMaxAge,
       metadataRecoveryStrategy,
+      metadataClusterCheck,
       metadataRecoveryRebootstrapTriggerMs,
       drainTimeout: requestTimeout,
     })
@@ -1111,6 +1115,34 @@ module.exports = class Cluster {
    */
   async findConnectedBroker({ fence } = {}) {
     return await this.brokerPool.findConnectedBroker(...fenceArgs(fence))
+  }
+
+  /**
+   * The first known broker, in ascending node id order, that negotiated a version of an API this
+   * client implements. For requests that are not routed to the controller or a coordinator.
+   * @public
+   * @param {number} apiKey the protocol key
+   * @param {import('../protocol/requests').RequestDefinitions} definitions the implemented versions
+   * @returns {Promise<import("../../types").Broker>} a connected broker offering the API
+   * @throws {KafkaJSBrokerNotFound} when the cluster lists no broker
+   * @throws {KafkaJSServerDoesNotSupportApiKey} once every known broker lacks an overlapping version
+   * @throws {Error} a connection or authentication failure of the broker being tried, unchanged
+   */
+  async findBrokerSupporting(apiKey, definitions) {
+    await this.refreshMetadataIfNecessary()
+    const nodeIds = this.getNodeIds().sort((a, b) => Number(a) - Number(b))
+    if (nodeIds.length === 0) throw new KafkaJSBrokerNotFound('No brokers in the broker pool')
+
+    for (const nodeId of nodeIds) {
+      const broker = await this.findBroker({ nodeId })
+      if (broker.negotiatedVersion(apiKey, definitions) !== null) return broker
+    }
+
+    const apiName = Object.keys(apiKeys).find((name) => apiKeys[name] === apiKey)
+    throw new KafkaJSServerDoesNotSupportApiKey(
+      `No known broker supports ${apiName}; client implements v${definitions.versions.join(', v')}`,
+      { apiKey, apiName }
+    )
   }
 
   /**
