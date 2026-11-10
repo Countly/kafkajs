@@ -82,6 +82,9 @@ const createRunner = (consumerGroupOverrides) => {
     maxPollInterval: 300000,
     onCrash: jest.fn(),
   })
+  // These cases drive an active member without starting the fetch loop. start() sets this
+  // before its first round; leaving the constructor's false value makes heartbeat() a no-op.
+  runner.running = true
 
   runners.push(runner)
   return { runner, consumerGroup, instrumentationEmitter }
