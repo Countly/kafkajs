@@ -105,7 +105,6 @@
         "scripts/ci/__tests__/resourceReporter.spec.js \u203a resource measurement reporter uses only the timer-free reporter in every in-band telemetry workflow command",
         "scripts/ci/__tests__/resourceReporter.spec.js \u203a resource measurement reporter uses only the timer-free reporter in the fixed share children and keeps their JSON report",
         "scripts/ci/__tests__/resourceReporter.spec.js \u203a resource measurement reporter prints completed tests and failures without creating Timeout or Immediate resources",
-        "scripts/soak/__tests__/telemetryJournals.spec.js \u203a telemetry journal ownership diagnostic compares ownership at every checkpoint and checks real retained sensitivity in both journal modes",
         "scripts/soak/__tests__/telemetryJournals.spec.js \u203a telemetry journal calibration matches the unchanged slope and endpoint evaluator on flat and seeded virtual vectors",
         "scripts/soak/__tests__/telemetryJournals.spec.js \u203a telemetry journal calibration records actual admission and completion times and inventories every settled boundary",
         "scripts/soak/__tests__/telemetryJournals.spec.js \u203a telemetry journal calibration rejects incomplete or virtualized real-time calibration evidence",
@@ -22281,7 +22280,6 @@
       "needs": {},
       "evidence": [],
       "titles": [
-        "scripts/soak/__tests__/telemetryJournals.spec.js \u203a telemetry journal ownership diagnostic compares ownership at every checkpoint and checks real retained sensitivity in both journal modes",
         "scripts/soak/__tests__/telemetryJournals.spec.js \u203a telemetry journal calibration matches the unchanged slope and endpoint evaluator on flat and seeded virtual vectors",
         "scripts/soak/__tests__/telemetryJournals.spec.js \u203a telemetry journal calibration records actual admission and completion times and inventories every settled boundary",
         "scripts/soak/__tests__/telemetryJournals.spec.js \u203a telemetry journal calibration rejects incomplete or virtualized real-time calibration evidence",

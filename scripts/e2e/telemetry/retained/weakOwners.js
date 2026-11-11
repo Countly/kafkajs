@@ -74,6 +74,22 @@ class WeakOwners {
     return observations
   }
 
+  /** @returns {object} diagnostic inventory; WeakMap entries are not enumerable, so issuance is an upper bound */
+  inventory() {
+    return {
+      capacity: this.capacity,
+      issued: this.count,
+      weakRefs: this.rows.reduce((count, row) => count + (row.weak === null ? 0 : 1), 0),
+      weakMaps: 1,
+      weakMapEntriesUpperBound: this.count,
+      maps: 0,
+      rowSlots: this.rows.length,
+      restorationSlots: this.restores.length,
+      buffers: 0,
+      byteLength: 0,
+    }
+  }
+
   /** @param {string[]} required issued categories @returns {object} missing issuance or live targets never certify release */
   retirement(required) {
     const observations = this.read()

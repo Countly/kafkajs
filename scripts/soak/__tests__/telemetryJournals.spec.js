@@ -254,88 +254,6 @@ describe('telemetry fixed journals', () => {
   })
 })
 
-describe('telemetry journal ownership diagnostic', () => {
-  test('compares ownership at every checkpoint and checks real retained sensitivity in both journal modes', () => {
-    const fs = require('node:fs')
-    const path = require('node:path')
-    const childProcess = require('node:child_process')
-    const root = process.env.CI
-      ? path.resolve('.tmp/e2e/journal-ownership')
-      : require('node:os').tmpdir()
-    fs.mkdirSync(root, { recursive: true })
-    const directory = fs.mkdtempSync(path.join(root, 'journal-ownership-'))
-    try {
-      const run = (mode, kind, seeded = false) =>
-        JSON.parse(
-          childProcess.execFileSync(
-            process.execPath,
-            [
-              '--expose-gc',
-              path.join(__dirname, 'fixtures/journalOwnershipChild.js'),
-              mode,
-              kind,
-              String(seeded),
-            ],
-            { timeout: 45000, maxBuffer: 16 * 1024 * 1024, encoding: 'utf8' }
-          )
-        )
-      for (const kind of ['producer', 'consumer', 'shareConsumer']) {
-        const old = run('legacy', kind)
-        const fixed = run('fixed', kind)
-        fs.writeFileSync(path.join(directory, `${kind}.json`), JSON.stringify({ old, fixed }))
-        expect(fixed).toMatchObject({
-          diagnostic: true,
-          acceptanceEligible: false,
-          attributionComplete: false,
-        })
-        expect(fixed.corpusSha256).toBe(old.corpusSha256)
-        expect(fixed.scheduleSha256).toBe(old.scheduleSha256)
-        expect(fixed.idsSha256).toBe(old.idsSha256)
-        expect(fixed.factsSha256).toBe(old.factsSha256)
-        expect(fixed.storage.mode).toBe('fixed')
-        expect(old.storage.mode).toBe('legacy')
-        expect(fixed.storage.before.byteLength).toBeGreaterThan(0)
-        expect(fixed.storage.closed.byteLength).toBe(fixed.storage.before.byteLength)
-        expect(fixed.storage.before.columns[0].columns[0].format).toBe('scalar-utf8-1')
-        if (kind === 'shareConsumer')
-          expect(fixed.storage.before.columns[1].columns[0].format).toBe('share-columns-utf8-1')
-        expect(old.storage.before).toBeNull()
-        expect(old.storage.closed).toBeNull()
-        for (const [index, checkpoint] of fixed.ownership.entries()) {
-          const { journals, ...ownership } = checkpoint
-          const { journals: legacyJournals, ...legacyOwnership } = old.ownership[index]
-          expect(ownership).toEqual(legacyOwnership)
-          expect(legacyJournals).toBeNull()
-          expect(journals.byteLength).toBe(fixed.storage.before.byteLength)
-        }
-        expect(fixed.violations).not.toContain('retained slope')
-        expect(fixed.violations).not.toContain('retained endpoint')
-        for (const result of [old, fixed]) {
-          expect(result.ownership.map((row) => row.checkpoint)).toEqual([
-            'M',
-            'first',
-            'last',
-            'closed',
-          ])
-          expect(result.ownership.every((row) => row.positiveAlive)).toBe(true)
-          expect(result.ownership.at(-1).recordTargetsAlive).toBeLessThan(10)
-        }
-      }
-      for (const mode of ['legacy', 'fixed']) {
-        const seeded = run(mode, 'consumer', true)
-        fs.writeFileSync(path.join(directory, `seeded-${mode}.json`), JSON.stringify(seeded))
-        expect(seeded.violations).toEqual(
-          expect.arrayContaining(['retained slope', 'retained endpoint'])
-        )
-        expect(seeded.ownership.at(-1).recordTargetsAlive).toBe(10000)
-        expect(seeded.ownership.at(-1).positiveAlive).toBe(true)
-      }
-    } finally {
-      if (!process.env.CI) fs.rmSync(directory, { recursive: true, force: true })
-    }
-  }, 240000)
-})
-
 describe('telemetry journal calibration', () => {
   test('matches the unchanged slope and endpoint evaluator on flat and seeded virtual vectors', () => {
     const { RetainedCalibration } = require('./fixtures/journalOwnershipChild')
@@ -406,5 +324,22 @@ describe('telemetry journal calibration', () => {
     expect(() => RetainedCalibration.evaluate({ samples: [], measurementMs: 1 })).toThrow(
       'calibration duration or samples'
     )
+    const { TELEMETRY } = require('../soak')
+    for (const corrupt of [
+      (row) => (row.completedAtMs = row.admittedAtMs - 1),
+      (row) => (row.admittedAtMs = 1),
+      (row) => (row.completedAtMs = 360001),
+      (row) => (row.snapshot.memory.retainedBytes = NaN),
+    ]) {
+      const samples = TELEMETRY.sampleAt.map((at) => ({
+        admittedAtMs: at,
+        completedAtMs: at + 300,
+        snapshot: { memory: { retainedBytes: 10000000 } },
+      }))
+      corrupt(samples[5])
+      expect(() => RetainedCalibration.evaluate({ samples, measurementMs: 300000 })).toThrow(
+        'invalid calibration sample'
+      )
+    }
   })
 })

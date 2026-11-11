@@ -102,9 +102,38 @@ atomic overflow and duplicate/invalid bitmap IDs. `telemetryChurn.spec.js` injec
 duplicate, reordered and wrong-timestamp decoded journal facts into the archive read by the
 production evidence verifier, keeping an unmodified journal archive positive case.
 
-The CI-only ownership child uses actual settled process readings and real product snapshots.
-Fixed-mode unseeded controls must stay below the slope and endpoint limits. Seeded legacy and
-fixed arms retain 4,096 bytes plus a product snapshot per record and must exceed both limits.
-Legacy/fixed ownership rows must agree at M, first, last and closed, including the positive root.
-Fixed storage format and byte length are checked at every checkpoint; legacy arrays report no
-fixed-storage metadata. This diagnostic is not live-worker attribution or acceptance evidence.
+The controls have two layers. Fast unit discovery uses deterministic virtual-time journal replay
+for exact IDs, facts, exchange hashes, overflow and malformed archive cases, and seeded evaluator
+vectors. Virtual timestamps never accompany an absolute real-memory slope assertion.
+
+The existing `resources` job in `memory-gates.yml` runs the second layer serially on Node 22, 24
+and 26. `scripts/soak/journalControls.js` runs paired virtual-time ownership children for each
+workload, then real-time seeded/unseeded children in both legacy and fixed modes. Its 105-minute
+job budget includes the original resource measurements and twelve six-minute calibration arms.
+The calibration uses the resource workers' executable, `MEMORY_FLAGS` and unchanged
+`ProcessMemory.settled()` protocol (two collections 100 ms apart, two event-loop turns, up to six
+pairs). It waits for the original eleven sample admissions over the real 60-second warm-up and
+300-second measurement window. Actual admission, completion, clock origin and elapsed times are
+archived; no virtual duration is supplied to a memory verdict.
+
+Each real-time child allocates one positive-root WeakRef and a non-zero-prefilled scalar reading
+archive before M, with no per-record weak observation or observer maps. Their counts and byte
+lengths must remain constant at M, every sample and closed; overflow fails. Workload journal
+storage and cursors are recorded separately. The intentionally growing per-record WeakRefs and
+WeakMap in the separate ownership replay are inventoried, together with its fixed archive buffers,
+and never supply calibration readings. Seeded arms retain a real product snapshot and 4,096
+bytes per record; unseeded arms release them. Every unseeded real-time arm must remain under
+both limits, and every seeded arm must trip both. No limits, bytes or samples are adjusted to
+make a control pass; legacy journal growth and runtime effects remain visible and can fail it.
+
+The real-time verdict is explicitly limited to slope and endpoint components with the unchanged
+limits and least-squares calculation. It does not invoke the full resource verdict, so it claims
+no identity, RSS or closed-transient acceptance. JSON preserves every heap, external,
+arrayBuffers and engine code/bytecode reading and the complete component verdict. Each result is
+written before assertions; remaining arms still run after a failure, and all failures are saved
+in `journal-controls/summary.json` beneath the resource artifact directory.
+
+Legacy/fixed ownership rows must agree at M, first, last and closed, including exact hashes,
+released target IDs and the deliberately retained positive product root. Fixed storage format and
+byte length are checked at every checkpoint; legacy arrays report no fixed-storage metadata.
+These diagnostics are not live-worker attribution or acceptance evidence.

@@ -7,7 +7,8 @@ const { journalState } = require('../../../../testHelpers/fixedJournal')
 const { ProcessMemory } = require('../../../../testHelpers/processMemory')
 const { WeakOwners } = require('../../../e2e/telemetry/retained/weakOwners')
 const TelemetryMetrics = require('../../../../src/telemetry/metrics')
-const { TELEMETRY, TelemetryResourceVerdict } = require('../../soak')
+const { TELEMETRY } = require('../../soak')
+const { RetainedCalibration } = require('./journalCalibration')
 
 /** @param {*} value scalar archive @returns {string} order-sensitive comparison hash */
 const sha = (value) => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex')
@@ -15,6 +16,7 @@ const sha = (value) => crypto.createHash('sha256').update(JSON.stringify(value))
 /**
  * CI-only paired ownership arm. The public ordinary workload uses the real corpus/slot catalogue,
  * with virtual time and broker stand-ins; actual product MetricSnapshots are weakly observed.
+ * Its growing weak inventory is disclosed, and none of its readings calibrate retained memory.
  * No live-worker attribution or acceptance is claimed. This process is never an acceptance worker.
  * @param {string} mode legacy or fixed @param {string} kind public workload kind
  * @param {boolean} seeded retain one actual product snapshot plus 4096 bytes per record when true
@@ -68,25 +70,34 @@ const run = async (mode, kind, seeded) => {
     if (seeded) retained.push({ snapshot, bytes: Buffer.alloc(4096, 0x6d) })
   }
 
+  /** @returns {object} weak tables and both reserved scalar archives, without target references */
+  const observerState = () => ({
+    ...owners.inventory(),
+    buffers: 2,
+    byteLength: readings.byteLength + ownership.byteLength,
+    archives: journalState([readings, ownership]),
+  })
+
   /** Captures only at an original reading, with no extra collections for the ownership observer. */
   const capture = (checkpoint) => {
     const rows = owners.read()
     ownership.push({
       checkpoint,
       journals: storageState(),
+      observer: observerState(),
       rows,
       positiveAlive: rows.find((row) => row.id === positiveId)?.alive === true,
       recordTargetsAlive: rows.filter((row) => row.kind === 'record' && row.alive).length,
     })
   }
 
-  /** Takes one real settled reading on the unchanged virtual admission grid. */
+  /** Collects liveness on a virtual replay grid; these readings never enter a memory verdict. */
   const sample = async (index) => {
     now = TELEMETRY.sampleAt[index]
     const reading = await memory.settled()
     readings.push({
-      admittedAtMs: now,
-      completedAtMs: now + 1,
+      replayAtMs: now,
+      observer: observerState(),
       snapshot: {
         memory: { ...reading, retainedBytes: reading.retained },
         registryDigest: 'diagnostic',
@@ -175,18 +186,6 @@ const run = async (mode, kind, seeded) => {
     const closed = await memory.settled()
     capture('closed')
     const samples = readings.values()
-    const snapshot = (reading) => ({
-      memory: { ...reading, retainedBytes: reading.retained },
-      registryDigest: 'diagnostic',
-    })
-    const verdict = TelemetryResourceVerdict.evaluate({
-      clientCount: 1,
-      baseline: snapshot(baseline),
-      samples,
-      teardown: snapshot(closed),
-      cleanupMs: 1,
-      measurementMs: TELEMETRY.measureMs,
-    })
     // Keep the positive root and seeded subtree through the closed reading and final weak census.
     if (positive.points.length !== 1 || (seeded && retained.length !== churn.CORPUS.records))
       throw new Error('Diagnostic positive root was lost')
@@ -207,7 +206,8 @@ const run = async (mode, kind, seeded) => {
       closed,
       ownership: ownership.values(),
       storage: { mode, before: beforeStorage, closed: storageState() },
-      violations: verdict.violations,
+      calibration: null,
+      timing: 'virtual-replay-ownership-only',
     }
   } finally {
     memory.stop()
@@ -221,3 +221,5 @@ if (require.main === module)
       process.stderr.write(error.stack)
       process.exitCode = 1
     })
+
+module.exports = { run, RetainedCalibration }

@@ -192,7 +192,7 @@ jobs:
   resources:
     if: github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/')
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 105
     strategy:
       fail-fast: false
       matrix:
@@ -220,6 +220,10 @@ jobs:
         if: always()
         timeout-minutes: 2
         run: node scripts/e2e/telemetry/resourceArtifact.js "$TELEMETRY_RESOURCES_ARTIFACT_DIR" --tree "$KAFKAJS_TREE" --node "$(node -p process.version)"
+      - name: Compare journal ownership and real-time retained sensitivity serially
+        if: always()
+        timeout-minutes: 85
+        run: timeout -k 10s 5000s node scripts/soak/journalControls.js "$TELEMETRY_RESOURCES_ARTIFACT_DIR/journal-controls" || exit 1
       - if: always()
         uses: actions/upload-artifact@v4
         with:
