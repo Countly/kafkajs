@@ -394,7 +394,7 @@ jobs:
     env:
       KAFKA_VERSION: ${{ matrix.kafka }}
       COMPOSE_FILE: docker-compose.telemetry.yml
-      COMPOSE_PROJECT_NAME: census-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
+      COMPOSE_PROJECT_NAME: telemetry-census-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
       TF1_CACHE: ${{ github.workspace }}/.tmp/telemetry-cache
       TELEMETRY_JAVA_CACHE: ${{ github.workspace }}/.tmp/telemetry-cache
       TELEMETRY_DECODER_ARCHIVE: ${{ github.workspace }}/.tmp/telemetry-cache/decoder-${{ matrix.kafka }}.jsa
