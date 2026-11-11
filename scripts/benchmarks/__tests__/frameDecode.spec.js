@@ -86,10 +86,14 @@ describe('Benchmarks > frameDecode', () => {
 
     test('discards three warmups and collects before each of seven measured intervals', async () => {
       const events = []
-      globalThis.gc = jest.fn(() => events.push('gc'))
+      let intervalCalls = 2
+      globalThis.gc = jest.fn(() => {
+        events.push('gc')
+        intervalCalls = 0
+      })
       const clock = process.hrtime.bigint
       jest.spyOn(process.hrtime, 'bigint').mockImplementation(() => {
-        events.push('time')
+        if (intervalCalls++ < 2) events.push('time')
         return clock()
       })
       const result = await timed('64b', 2)

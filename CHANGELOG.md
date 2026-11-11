@@ -23,7 +23,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Tooling
 
-- A CI check compares decode speed of the bounded array readers and record headers against the base revision on real Produce and Fetch responses; a slowdown above 5 % fails unless a recorded exception covers it.
+- Judge decoder benchmark rows with paired confidence bounds and a calibrated baseline control.
+- A CI check compares decode speed of the bounded array readers and record headers against the base revision on real Produce and Fetch responses.
 
 ### Phase 9F — Client telemetry
 

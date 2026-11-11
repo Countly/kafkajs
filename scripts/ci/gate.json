@@ -93,7 +93,7 @@
       "jest": null,
       "jestScript": null,
       "nodeTest": null,
-      "command": "node scripts/benchmarks/compareDecoderBounds.js --run --baseline fecc6d97bb7ed29f6db0bc3697772c1805cc594e",
+      "command": "node scripts/benchmarks/compareDecoderBounds.js --run --baseline fecc6d97bb7ed29f6db0bc3697772c1805cc594e || exit 1",
       "needs": {},
       "evidence": [],
       "titles": [],

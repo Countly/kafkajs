@@ -243,6 +243,7 @@ describe('Decoder performance comparison', () => {
       expect(result.slowdownPercent).toBeCloseTo(expectedDelta, 2)
       expect(result.verdict).toBe(verdict)
       expect(source.oldNsPerOp).toHaveLength(7)
+      expect(resultOf(source).verdict).toBe('invalid')
     }
     const source = replay.sources[3].arm
     const repeat = (samples) => Array.from({ length: 30 }, (_, n) => samples[n % samples.length])
@@ -301,6 +302,11 @@ describe('Decoder performance comparison', () => {
       expect(collected.unavailable).toEqual(missing.length === 2 ? [OPTIONAL[1]] : [])
       expect(compare(completeInput(collected)).pass).toBe(missing.length === 2)
       expect(setup.saved.size).toBeGreaterThan(1)
+      if (missing.length === 2) {
+        collected.unavailableInvocations[0].invocations.find(({ side }) => side === 'C').error =
+          'control failed'
+        expect(compare(completeInput(collected)).pass).toBe(false)
+      }
     }
   })
 

@@ -5,15 +5,14 @@
  * the requests carry only measures the body.
  * Usage: node --expose-gc scripts/benchmarks/frameDecode.js [--shape 64b|64k|1m|coalesced|byte-chunks]
  *          [--control 0|1]
- * Prints one JSON line: { frames, nsPerFrame, roundNsPerOp, heapRetainedBytes } (the heap only under
+ * Prints one JSON line: { frames, nsPerFrame, warmupRoundNsPerOp, roundNsPerOp, heapRetainedBytes } (the heap only under
  * `--expose-gc`).
  *
- * Declared before any run (session.js, medians of seven, the first run of each arm discarded, an
- * A/A arm, a quiet host): per shape the median ns per frame of this tree is within +3 % of the
- * previous tree's on every shape but `byte-chunks`, which is reported; the retained heap after
- * `gc()` is within +1 MiB of it. The positive control is `--control 1`, untimed: it counts the
- * calls of `RequestQueue#fulfillRequest`, which exists in both trees, and passes when they equal
- * the frames fed. A timed run carries no counter, and the script is the same bytes on both trees.
+ * Timed mode requires `--expose-gc`: three discarded warm-up rounds, then seven measured
+ * rounds, collecting after setup and before every interval. Only measured rounds set the median.
+ * The positive control is `--control 1`, untimed: it counts `RequestQueue#fulfillRequest` calls
+ * and passes when they equal the frames fed. It does not require GC. The comparison overlays this
+ * script unchanged into both trees and judges paired bounds with a calibrated baseline control.
  *
  * Shapes: `64b` 64-byte bodies, a frame to a `data` event; `64k` and `1m` bodies of 64 KiB and
  * 1 MiB in 16 KiB chunks; `coalesced` 64 frames of 64 bytes in one chunk; `byte-chunks` one 64 KiB
@@ -26,6 +25,7 @@ const Encoder = require('../../src/protocol/encoder')
 const { createLogger, LEVELS } = require('../../src/loggers')
 const LoggerConsole = require('../../src/loggers/console')
 
+const WARMUP_ROUNDS = 3
 const ROUNDS = 7
 const SIZE_PREFIX = 4
 const CORRELATION_ID_AT = 8
@@ -131,9 +131,10 @@ const chunksOf = ({ body, chunk, perChunk = 1 }, correlationIds) => {
  * request.
  * @param {Shape} shape
  * @param {number} frames
+ * @param {boolean} [collect] collect after setup, before the timed interval
  * @returns {Promise<number>} nanoseconds per frame
  */
-const round = async (shape, frames) => {
+const round = async (shape, frames, collect = false) => {
   const { factory, writes, socket } = createFakeSocket()
   const connection = new Connection({
     host: '127.0.0.1',
@@ -155,6 +156,7 @@ const round = async (shape, frames) => {
   const correlationIds = writes.map((write) => write.readInt32BE(CORRELATION_ID_AT))
   const chunks = chunksOf(shape, correlationIds)
 
+  if (collect) globalThis.gc()
   const startedAt = process.hrtime.bigint()
   for (const chunk of chunks) {
     socket().emit('data', chunk)
@@ -181,16 +183,22 @@ const retainedHeap = async () => {
 }
 
 /**
- * The timed run: an untimed round, then `ROUNDS` timed ones.
+ * Requires exposed GC. Three discarded warmups, then seven measured rounds; GC after setup
+ * precedes each interval. Warmup timings remain evidence but never enter the median.
  * @param {string} name a key of `SHAPES`
  * @param {number} [frames] frames per round, the shape's by default
- * @returns {Promise<{ frames: number, nsPerFrame: number, roundNsPerOp: number[], heapRetainedBytes?: number }>}
+ * @throws {Error} when globalThis.gc is unavailable
+ * @returns {Promise<{ frames: number, nsPerFrame: number, roundNsPerOp: number[], warmupRoundNsPerOp: number[], heapRetainedBytes?: number }>}
  */
 const timed = async (name, frames = SHAPES[name].frames) => {
-  await round(SHAPES[name], frames)
+  if (typeof globalThis.gc !== 'function') throw new Error('timed mode requires --expose-gc')
+  const warmupRoundNsPerOp = []
+  for (let i = 0; i < WARMUP_ROUNDS; i++) {
+    warmupRoundNsPerOp.push(await round(SHAPES[name], frames, true))
+  }
   const rounds = []
   for (let i = 0; i < ROUNDS; i++) {
-    rounds.push(await round(SHAPES[name], frames))
+    rounds.push(await round(SHAPES[name], frames, true))
   }
 
   const heapRetainedBytes = await retainedHeap()
@@ -198,6 +206,7 @@ const timed = async (name, frames = SHAPES[name].frames) => {
     frames,
     nsPerFrame: median(rounds),
     roundNsPerOp: rounds,
+    warmupRoundNsPerOp,
     ...(heapRetainedBytes && { heapRetainedBytes }),
   }
 }
