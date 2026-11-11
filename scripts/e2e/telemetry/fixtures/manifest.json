@@ -393,7 +393,7 @@
     "JavaTelemetryClient.java": "27e3fb34c247f514a0e07a07e85448e7c1bd6bc27eaa3fe301af04721f01eab3",
     "OtlpGoldenVectors.java": "464246d43489c545218e3204aecd89ce193ba9c07def5eb58d346dac53edaa73",
     "base-ports.override.yml": "945b4b163977dbcdfc05301865fb2771aef8cb1ec40795aed1fff0a951276429",
-    "build.sh": "aaeca680bcbbf59bb020cb9e5d83b60ee27ebcaa011ed65be3f06234c03af367",
+    "build.sh": "d3cedd6e4ae96948831c881bc8c7ab74c4f91ae8ef79a54111d1327b89c938c1",
     "check-exports.py": "3b607b9c28b5e855a9f65d9ff82952fe399ca5fac0c1b644a6604faa9c98df67",
     "check-golden-protoc.py": "047fdb999918513e22cba75164197e5a92d29b40324dd3d2daf5c537fbf4540c",
     "check-golden.py": "e7734ff4569b0317505238e380f638095b2e6a0edf8ceec2a8d3910116514b83",
@@ -411,7 +411,8 @@
     "check-metadata-follow.py": "2ef3039b1c7214372fe7f26e818328a7f8bbc9f638f1413ed3c6a899c406c013",
     "run-h6a-arm.sh": "edc7de09967a45fb3f149ed27f95bbd360a023c222395c5006f78e99470e9fa2",
     "prepare-reporter-source.sh": "3748442ebfa83bed146058594ef3942acd8dd7808431f1f285e5e46278d73797",
-    "legacy/JavaTelemetryClient.java": "27e3fb34c247f514a0e07a07e85448e7c1bd6bc27eaa3fe301af04721f01eab3"
+    "legacy/JavaTelemetryClient.java": "27e3fb34c247f514a0e07a07e85448e7c1bd6bc27eaa3fe301af04721f01eab3",
+    "prepare-client-source.sh": "640576304be9ede6093c089c659955cbd67fe12083e6e01d19a8d9b7ce95c5de"
   },
   "composeSha256": {
     "docker-compose.telemetry.yml": "cd6640b6553198f0a3b57479f74faffe4df44dbe52e2c990ce9f7136b8974075"
@@ -474,6 +475,20 @@
         }
       },
       "legacyJavaClientSourceCommit": "b4ffa018a857f3104d7474856927e969c2a7a90e"
+    },
+    {
+      "id": "independent-client-otlp-4.4.0",
+      "date": "2026-11-11",
+      "change": "Prepare the 4.4.0 client in scratch space with independent OTLP v1.9.0 bindings: parse push.metricsData(4096), which decompresses compressed payloads, instead of the removed ClientTelemetryUtils.deserializeMetricsData. Compile against the unrelocated bindings jar and protobuf-java 3.25.5, include the bindings in the 4.4.0 client jar, and run the unchanged offline count and close controls in CI. Only ByteBuffer crosses the Kafka API boundary. Both retained client sources, reporter source, historical provenance and older jar digests stay unchanged. No new 4.4.0 jar digest is claimed before the CI build.",
+      "buildSha256Before": "aaeca680bcbbf59bb020cb9e5d83b60ee27ebcaa011ed65be3f06234c03af367",
+      "buildSha256After": "d3cedd6e4ae96948831c881bc8c7ab74c4f91ae8ef79a54111d1327b89c938c1",
+      "preparedClientSha256": {
+        "4.4.0": "4837c77e71fd3e98a9e69b1bd11642dad1b367540caecc5ebf5613ce80c88888",
+        "4.3.1": "27e3fb34c247f514a0e07a07e85448e7c1bd6bc27eaa3fe301af04721f01eab3",
+        "4.2.2": "27e3fb34c247f514a0e07a07e85448e7c1bd6bc27eaa3fe301af04721f01eab3"
+      },
+      "clientBindings": "otlp-v1.9.0-bindings-unrelocated.jar",
+      "clientProtobufInput": "protobuf-java"
     }
   ]
 }

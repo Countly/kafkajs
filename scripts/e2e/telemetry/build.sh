@@ -41,15 +41,22 @@ JAR=$OUT/counting-telemetry-reporter-$V.jar
 jar --create --date=$DATE --file "$JAR" -C "$WORK/jar" .
 
 # 3b. deterministic Java telemetry client (KIP-1076 registration), compiled against the same pinned clients jar
-CLIENT_SOURCE=$HERE/legacy/JavaTelemetryClient.java
+CLIENT_SOURCE=$(bash "$HERE/prepare-client-source.sh" "$V" "$WORK/source")
 CLIENT_RELEASE=17
+CLIENT_CP=$KC:$SLF
 if [ "$V" = 4.4.0 ]; then
-  CLIENT_SOURCE=$HERE/JavaTelemetryClient.java
   CLIENT_RELEASE=21
+  CLIENT_CP=$CLIENT_CP:$PB:$OUT/otlp-v1.9.0-bindings-unrelocated.jar
 fi
 mkdir -p "$WORK/classes-client"
-javac --release "$CLIENT_RELEASE" -Xlint:all -cp "$KC:$SLF" -d "$WORK/classes-client" "$CLIENT_SOURCE"
+javac --release "$CLIENT_RELEASE" -Xlint:all -cp "$CLIENT_CP" -d "$WORK/classes-client" "$CLIENT_SOURCE"
+if [ "$V" = 4.4.0 ]; then
+  cp -r "$WORK/classes-orig/." "$WORK/classes-client/"
+fi
 jar --create --date=$DATE --file "$OUT/java-telemetry-client-$V.jar" -C "$WORK/classes-client" .
+if [ "$V" = 4.4.0 ]; then
+  java -cp "$OUT/java-telemetry-client-$V.jar:$KC:$PB:$SLF" org.countly.kafkajs.telemetry.JavaTelemetryClient --controls
+fi
 
 # 4. load proof: the plugin interfaces, the bindings and an empty-payload decode, from the jar alone
 java -cp "$JAR:$KC:$PB:$SLF" org.countly.kafkajs.telemetry.CountingTelemetryReporter check
