@@ -1,4 +1,5 @@
 const Long = require('../../../../utils/long')
+const HeaderDecoder = require('../../header/v0/decoder')
 const TimestampTypes = require('../../../timestampTypes')
 
 /**
@@ -14,9 +15,6 @@ const TimestampTypes = require('../../../timestampTypes')
  *     HeaderKey => VarInt|String
  *     HeaderValue => VarInt|Bytes
  */
-
-/** A header count of -1 reads as an empty header set; every other negative count is rejected. */
-const NULL_HEADER_COUNT = -1
 
 /**
  * Stores one header value as an own property of the header object.
@@ -58,7 +56,8 @@ const setHeader = (headers, key, value) => {
  * @throws {KafkaJSPartialMessageError} when the header count is negative (other than -1, an empty
  *   set) or above the bytes left in the record, before any header is read, or when a header runs
  *   past the record. The count is bounded by those bytes only, not by the 1,000,000 limit of the
- *   protocol array readers, and headers go straight into the result with no intermediate array.
+ *   protocol array readers. The header array grows as headers decode, without preallocation
+ *   from the untrusted count.
  */
 module.exports = (decoder, batchContext = {}, firstOffsetNumber) => {
   const {
@@ -95,14 +94,9 @@ module.exports = (decoder, batchContext = {}, firstOffsetNumber) => {
   // semantics are unchanged: the first occurrence stores the value, the second turns it into a
   // two-element array, later ones push onto it.
   const headers = {}
-  const headerCount = decoder.readVarInt()
-  if (headerCount !== NULL_HEADER_COUNT) {
-    decoder.ensureReadable(headerCount, 'readHeaders')
-  }
-
-  for (let i = 0; i < headerCount; i++) {
-    const headerKey = decoder.readVarIntString()
-    const headerValue = decoder.readVarIntBytes()
+  for (const { key: headerKey, value: headerValue } of decoder.readVarIntArrayBytesBounded(
+    HeaderDecoder
+  )) {
     const existing = Object.hasOwn(headers, headerKey) ? headers[headerKey] : undefined
 
     if (existing === undefined) {
