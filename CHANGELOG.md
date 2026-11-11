@@ -21,6 +21,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Fixes
 
+- Preallocate protocol-array results after validating both the count limit and remaining bytes, avoiding repeated storage growth during async decoding while keeping hostile counts rejected before allocation.
 - Skip redundant count and byte checks for empty compact arrays, including each Fetch partition's empty aborted-transaction list, while preserving bounds on nonempty arrays.
 - Apply `bootstrapResolveTimeout` to initial metadata discovery and subscription, and cancel pending admin DNS readiness before draining admitted calls.
 - Client-throttle Produce v8 to v13, AlterPartitionReassignments and ListPartitionReassignments responses as the Java client does (KAFKA-20828), and stop client-throttling DeleteTopics v1, whose throttle the broker already serves.
