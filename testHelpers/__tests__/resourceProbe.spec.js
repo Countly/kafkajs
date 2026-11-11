@@ -2459,7 +2459,32 @@ describe('telemetry timeout owner diagnostics', () => {
     }
   })
 
-  test('reports trigger creation facts after trigger destruction and clears every map on stop', async () => {
+  test('non-Timeout resources do not capture stacks', () => {
+    const { AsyncResource } = require('async_hooks')
+    const { TimeoutDiagnostics } = require('../timeoutDiagnostics')
+    const diagnostics = new TimeoutDiagnostics({ capacity: 2 }).start()
+    const resources = []
+    try {
+      resources.push(new AsyncResource('TimerOwner', { requireManualDestroy: true }))
+      resources.push(new AsyncResource('OtherOwner', { requireManualDestroy: true }))
+      expect([...diagnostics.resources.values()]).toEqual([
+        { type: 'TimerOwner' },
+        { type: 'OtherOwner' },
+      ])
+      resources.push(new AsyncResource('OverflowOwner', { requireManualDestroy: true }))
+      expect(diagnostics.resources.size).toBe(2)
+      expect(diagnostics.read()).toMatchObject({
+        created: 0,
+        resourceDropped: 1,
+        live: [],
+      })
+    } finally {
+      for (const resource of resources) resource.emitDestroy()
+      diagnostics.stop()
+    }
+  })
+
+  test('reports trigger type after trigger destruction and clears every map on stop', async () => {
     const { AsyncResource } = require('async_hooks')
     const { TimeoutDiagnostics } = require('../timeoutDiagnostics')
     const diagnostics = new TimeoutDiagnostics({ capacity: 8 }).start()
@@ -2477,11 +2502,10 @@ describe('telemetry timeout owner diagnostics', () => {
       expect(live[0]).toMatchObject({
         triggerAsyncId: owner.asyncId(),
         triggerType: 'TimerOwner',
-        triggerSource: 'repo',
-        triggerStack: expect.stringContaining('testHelpers/__tests__/resourceProbe.spec.js:'),
+        triggerSource: null,
+        triggerStack: '',
       })
-      expect(live[0].triggerStack).toContain('createTimerOwner')
-      expect(live[0].triggerStack).not.toContain(path.resolve(__dirname, '../..'))
+      expect(diagnostics.resources.has(owner.asyncId())).toBe(false)
       for (const map of Object.values(diagnostics).filter((value) => value instanceof Map)) {
         expect(map.size).toBeLessThanOrEqual(8)
         for (const fact of map.values()) {
