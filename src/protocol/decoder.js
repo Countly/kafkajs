@@ -16,7 +16,7 @@ const OTHER_BITS = 0x7f // 127
 
 const UUID_SIZE = 16
 
-/** Largest decoded array count accepted by any array reader. */
+/** Largest decoded protocol array count; record headers are bounded by bytes instead. */
 const MAX_ARRAY_COUNT = 1000000
 
 /** Largest tagged-field count accepted in one tag section. */
@@ -335,6 +335,31 @@ module.exports = class Decoder {
 
     this.assertCount(length, 'readArray')
     this.ensureReadable(length, 'readArray')
+    const array = []
+    for (let i = 0; i < length; i++) {
+      array.push(reader(this))
+    }
+
+    return array
+  }
+
+  /**
+   * Signed-varint-counted record headers, bounded only by the bytes left in this decoder.
+   * A count of -1 reads as an empty array. Unlike protocol arrays, headers have no count cap;
+   * the result grows as entries decode, without preallocating from the untrusted count.
+   * @param {(decoder: Decoder) => *} reader reads one header
+   * @returns {Array} headers in wire order
+   * @throws {KafkaJSPartialMessageError} when the count is negative other than -1, exceeds the
+   *   remaining bytes, or a header is truncated
+   */
+  readVarIntArrayBytesBounded(reader) {
+    const length = this.readVarInt()
+
+    if (length === -1) {
+      return []
+    }
+
+    this.ensureReadable(length, 'readVarIntArrayBytesBounded')
     const array = []
     for (let i = 0; i < length; i++) {
       array.push(reader(this))
