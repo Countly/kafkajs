@@ -7,6 +7,10 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 ### Phase 10 — Release, CI and benchmarks
 
+#### Behavior changes
+
+- Default test broker is Kafka 4.4.0 (compose files, `scripts/dockerComposeUp.sh`, jest setup, probe fallback); CI integration rows run on 4.4.0 (13 rows).
+
 #### Tooling
 
 - Weekly CI matrix now covers Kafka 4.0.2 (the claimed floor), 4.2.2, 4.3.2 and 4.4.0 on Node 22, 24 and 26; the `kafka_version` dispatch input is removed so every successful run is a full run.
@@ -16,9 +20,11 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Add `release.yml`: a `v*` tag publishes from CI only after the exact tagged commit has green `ci.yml`, `gate.yml` and `weekly.yml` runs on master and a reviewer approves the `npm-release` environment; the job publishes the tested tarball once, with npm provenance and no token. Retires the "never from CI" rule.
 - Declare `js-yaml` as a development dependency (it was used by workflow tests through another package).
 - Give every CI job an explicit timeout and fail the unit lane when a workflow job has none.
+- GitHub expressions are passed to workflow scripts through `env` and never interpolated inside `run:` (gate and memory-gates workflows follow when their open changes merge).
 
 #### Docs
 
+- Testing guide: broker versions and the one fixture that stays on 4.3.1, the 4.0.2 skip rule, the flake rule (with a pointer from `QUARANTINE.md`) and the benchmark report; the telemetry row counts, Kafka lines and jar count now match the lane plan.
 - Rewrite `RELEASING.md` for the CI release process; state the Kafka 4.0–4.4 claim.
 
 ### Phase 9G — Kafka 4.4 support
