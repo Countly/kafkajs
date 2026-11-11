@@ -1497,7 +1497,7 @@ describe('broker telemetry fixture', () => {
     expect(diagnose.run).toContain('--diagnostic-only "$RETAINED_DIAGNOSTIC_DIR"')
     const analyse = diagnostic.steps.find((step) => step.name?.startsWith('Analyse'))
     expect(analyse.if).toBe('always()')
-    expect(analyse.run).toContain('timeout -k 5s 290s node --max-old-space-size=6144')
+    expect(analyse.run).toContain('timeout -k 5s 590s node --max-old-space-size=6144')
     expect(diagnostic.steps.at(-1).with).toMatchObject({
       name: 'retained-diagnostic-node24',
       path: '.tmp/retained-diagnostic/',
