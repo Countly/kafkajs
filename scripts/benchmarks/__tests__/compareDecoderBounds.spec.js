@@ -17,7 +17,7 @@ const {
 } = require('../compareDecoderBounds')
 const replay = require('./fixtures/decoderReplay.json')
 
-const FIRST = ARMS[0].name
+const FIRST = 'frame-decode:64k'
 const BASELINE = 'a'.repeat(40)
 const CANDIDATE = 'b'.repeat(40)
 const OPTIONAL = ARMS.filter(({ required }) => !required).map(({ name }) => name)
@@ -104,7 +104,7 @@ describe('Decoder performance comparison', () => {
     for (const value of [105.001, 112, 1800]) {
       const input = withRow(row(FIRST, constant(100), constant(value)))
       expect(compare(input).pass).toBe(false)
-      expect(resultOf(input.arms[0]).verdict).toBe('regression')
+      expect(resultOf(input.arms.find(({ name }) => name === FIRST)).verdict).toBe('regression')
       expect((await runInput(input)).status).toBe(1)
     }
   })
@@ -372,8 +372,9 @@ describe('Decoder performance comparison', () => {
         ? Promise.reject(new Error('control failed'))
         : measure(arm, side, block, timeout)
     const collected = await setup.collector.collect()
-    expect(collected.arms[0].invocations).toHaveLength(90)
-    expect(resultOf(collected.arms[0]).verdict).toBe('invalid')
+    const failed = collected.arms.find(({ name }) => name === FIRST)
+    expect(failed.invocations).toHaveLength(90)
+    expect(resultOf(failed).verdict).toBe('invalid')
     expect(setup.calls).toHaveLength(15 * 30 * 3 - 1)
   })
 

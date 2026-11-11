@@ -3,15 +3,19 @@ const os = require('os')
 const path = require('path')
 const {
   ARMS,
+  INFORMATION_ONLY_ROWS,
   PARTITIONS,
   WORK_MULTIPLIERS,
   MeasurementCollector,
   combine,
   compare,
   createSchedule,
+  formatReport,
   main,
   parseArgs,
 } = require('../compareDecoderBounds')
+
+const D167_ROWS = ['frame-decode:1m', 'frame-decode:64b', 'frame-decode:coalesced']
 
 const EXPECTED = {
   'frame-1m': ['frame-decode:1m'],
@@ -66,6 +70,17 @@ const evidence = () =>
     }
   })
 
+/** @param {object} row paired row @param {string} side A/C/B @param {number[]} samples @returns {void} */
+const setSamples = (row, side, samples) => {
+  const fields = { A: 'oldNsPerOp', C: 'baselineControlNsPerOp', B: 'newNsPerOp' }
+  const { metric } = ARMS.find(({ name }) => name === row.name)
+  row[fields[side]] = samples
+  for (const invocation of row.invocations.filter((invocation) => invocation.side === side)) {
+    invocation[metric] = samples[invocation.block]
+    invocation.roundNsPerOp.fill(samples[invocation.block])
+  }
+}
+
 /** @param {string} partition @param {Function} now @param {Function} advance @returns {object} fake collector */
 const collectorFor = (partition, now = () => 0, advance = () => {}) => {
   const calls = []
@@ -95,6 +110,149 @@ const collectorFor = (partition, now = () => 0, advance = () => {}) => {
 }
 
 describe('Decoder measurement partitions', () => {
+  it('freezes exactly the three D167 information-only rows with hosted-runner noise reasons', () => {
+    expect(Object.keys(INFORMATION_ONLY_ROWS)).toEqual(D167_ROWS)
+    expect(Object.isFrozen(INFORMATION_ONLY_ROWS)).toBe(true)
+    for (const reason of Object.values(INFORMATION_ONLY_ROWS)) {
+      expect(reason).toMatch(/D167/)
+      expect(reason).toMatch(/GitHub-hosted/)
+      expect(reason).toMatch(/A\/A unstable/)
+      expect(reason).toMatch(/C as noisy as B/)
+    }
+  })
+
+  it('reports INVALID D167 rows as information only while ordinary INVALID rows fail', () => {
+    for (const { name } of ARMS) {
+      const input = evidence().find((input) => input.arms.some((row) => row.name === name))
+      setSamples(
+        input.arms.find((row) => row.name === name),
+        'C',
+        Array(30).fill(106)
+      )
+      const result = compare(input)
+      expect(result.problems).toEqual([])
+      expect(result.arms.find((row) => row.name === name)).toMatchObject({ verdict: 'invalid' })
+      expect(result.pass).toBe(D167_ROWS.includes(name))
+      const line = formatReport(result)
+        .split('\n')
+        .find((line) => line.includes(name))
+      expect(line).toContain('INVALID')
+      if (D167_ROWS.includes(name)) expect(line).toContain('information only (D167)')
+      else expect(line).not.toContain('information only (D167)')
+    }
+  })
+
+  it('fails a valid REGRESSION on each D167 information-only row', () => {
+    for (const name of D167_ROWS) {
+      const input = evidence().find((input) => input.arms.some((row) => row.name === name))
+      const row = input.arms.find((row) => row.name === name)
+      setSamples(row, 'C', Array(30).fill(106))
+      expect(compare(input).pass).toBe(true)
+      setSamples(row, 'C', Array(30).fill(100))
+      setSamples(row, 'B', Array(30).fill(106))
+      const result = compare(input)
+      expect(result.problems).toEqual([])
+      expect(result.pass).toBe(false)
+      expect(result.arms.find((row) => row.name === name)).toMatchObject({
+        verdict: 'regression',
+        problems: [],
+        ratioInterval: { lower: 1.06, upper: 1.06, k: 7, alpha: 0.05 / 30 },
+      })
+      const line = formatReport(result)
+        .split('\n')
+        .find((line) => line.includes(name))
+      expect(line).toContain('REGRESSION')
+      expect(line).toContain('information only (D167)')
+    }
+  })
+
+  it('preserves PASS FAIL and INCONCLUSIVE verdicts on D167 information-only rows', () => {
+    for (const name of D167_ROWS) {
+      const input = evidence().find((input) => input.arms.some((row) => row.name === name))
+      const row = input.arms.find((row) => row.name === name)
+      for (const [verdict, A, B] of [
+        ['pass', Array(30).fill(100), Array(30).fill(100)],
+        ['inconclusive', Array(30).fill(100), [...Array(23).fill(100), ...Array(7).fill(106)]],
+        [
+          'fail',
+          [...Array(15).fill(100), ...Array(15).fill(114)],
+          [114, ...Array(14).fill(105), ...Array(15).fill(119.7)],
+        ],
+      ]) {
+        setSamples(row, 'A', A)
+        setSamples(row, 'C', A)
+        setSamples(row, 'B', B)
+        const result = compare(input)
+        expect(result.pass).toBe(true)
+        expect(result.arms.find((row) => row.name === name)).toMatchObject({
+          verdict,
+          problems: [],
+        })
+        const line = formatReport(result)
+          .split('\n')
+          .find((line) => line.includes(name))
+        expect(line).toContain(verdict.toUpperCase())
+        expect(line).toContain('information only (D167)')
+      }
+    }
+  })
+
+  it('combines D167 noise without waiving ordinary INVALID rows or any valid REGRESSION', () => {
+    for (const { name } of ARMS) {
+      const inputs = evidence()
+      const rows = inputs.flatMap(({ arms }) => arms)
+      for (const row of rows.filter(({ name }) => D167_ROWS.includes(name)))
+        setSamples(row, 'C', Array(30).fill(106))
+      expect(combine(inputs).pass).toBe(true)
+      expect(combine(inputs).arms).toHaveLength(15)
+      const row = rows.find((row) => row.name === name)
+      setSamples(row, 'C', Array(30).fill(106))
+      expect(combine(inputs).pass).toBe(D167_ROWS.includes(name))
+      setSamples(row, 'C', Array(30).fill(100))
+      setSamples(row, 'B', Array(30).fill(106))
+      const result = combine(inputs)
+      expect(result.pass).toBe(false)
+      expect(result.arms.find((row) => row.name === name)).toMatchObject({
+        verdict: 'regression',
+        problems: [],
+      })
+    }
+  })
+
+  it('records the D167 information-only list and reasons in the summary with all fifteen rows', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'decoder-d167-'))
+    try {
+      const inputs = evidence()
+      for (const input of inputs) {
+        for (const row of input.arms.filter(({ name }) => D167_ROWS.includes(name)))
+          setSamples(row, 'C', Array(30).fill(106))
+        expect(Object.keys(compare(input).informationOnlyRows)).toEqual(D167_ROWS)
+      }
+      const files = inputs.map((input) => {
+        const file = path.join(dir, `${input.partition}.json`)
+        fs.writeFileSync(file, JSON.stringify(input))
+        return file
+      })
+      const out = path.join(dir, 'summary.json')
+      const lines = []
+      expect(
+        await main(
+          ['--combine', ...files.flatMap((file) => ['--input', file]), '--out', out],
+          (line) => lines.push(line)
+        )
+      ).toBe(0)
+      const summary = JSON.parse(fs.readFileSync(out, 'utf8'))
+      expect(summary.result.informationOnlyRows).toEqual(INFORMATION_ONLY_ROWS)
+      expect(Object.keys(summary.result.informationOnlyRows)).toEqual(D167_ROWS)
+      expect(summary.result.arms).toHaveLength(15)
+      expect(summary.partitions).toEqual(inputs)
+      for (const input of summary.partitions) expect(input.registeredRows).toHaveLength(15)
+      expect(lines.join('\n')).toContain('decoder performance: PASS')
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   it('fixes all fifteen work multipliers and passes and records them without changing units', async () => {
     expect(WORK_MULTIPLIERS).toEqual(
       Object.fromEntries(
@@ -148,7 +306,7 @@ describe('Decoder measurement partitions', () => {
     }
   })
 
-  it('combines only complete disjoint partitions from the same trees and requires fifteen passes', () => {
+  it('combines only complete disjoint partitions from the same trees and keeps all fifteen rows', () => {
     const valid = combine(evidence())
     expect(valid.pass).toBe(true)
     expect(valid.arms).toHaveLength(15)
