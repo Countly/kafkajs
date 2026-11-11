@@ -147,6 +147,8 @@ describe.each([false, true])('captured close with enforcement %s', (enforceReque
         expect(round.finalFrames()).toEqual([])
         expect(round.newSetupCallsSince(before)).toEqual([])
         expect(round.machine.uuid).toBe(TELEMETRY_UUID)
+        expect(round.machine.closing.handle).toBeNull()
+        expect(round.machine.closing.subscription).toBeNull()
       } finally {
         await round.dispose()
       }
@@ -240,6 +242,38 @@ describe.each([false, true])('captured close with enforcement %s', (enforceReque
       }
     }, 60000)
 
+    test('a closed client retains its close result but releases the retired transport and can reopen', async () => {
+      const { round, gate } = await closing(cell, { boundary: 'S13' })
+      try {
+        const episode = round.machine.closing
+        const retired = episode.handle
+        expect(retired).not.toBeNull()
+        expect(round.machine.close()).toBe(episode.promise)
+        await round.drainReleased(gate)
+        await round.settleClose()
+        expect(round.machine.state).toBe('CLOSED')
+        expect(round.machine.handle).toBeNull()
+        expect(episode.handle).toBeNull()
+        expect(episode.subscription).toBeNull()
+        expect(round.machine.close({ zero: true })).toBe(episode.promise)
+        await expect(episode.promise).resolves.toBeUndefined()
+        await round.wait(() => round.client.disconnect(round.closeOptions(1000)))
+        expect(round.finalFrames()).toHaveLength(1)
+        await round.wait(() => round.client.connect())
+        await round.establish()
+        expect(round.machine.closing).toBeNull()
+        expect(round.machine.handle).not.toBeNull()
+        expect(round.machine.handle).not.toBe(retired)
+        expect(round.machine.uuid).toBe(TELEMETRY_UUID)
+        await round.wait(() => round.beginClose(round.closeOptions(1000)))
+        expect(round.machine.closing).not.toBe(episode)
+        expect(round.machine.closing.handle).toBeNull()
+        expect(round.finalFrames()).toHaveLength(2)
+      } finally {
+        await round.dispose()
+      }
+    }, 60000)
+
     test('C04 a repeated close after settlement sends no second final and reopen sends one more', async () => {
       const round = new PublicTelemetryRound(cell)
       try {
@@ -291,6 +325,8 @@ describe.each([false, true])('captured close with enforcement %s', (enforceReque
           expect(round.newSetupCallsSince(before)).toEqual([])
           expect(round.pushes()).toHaveLength(1)
           expect(round.machine.state).toBe('CLOSED')
+          expect(round.machine.closing.handle).toBeNull()
+          expect(round.machine.closing.subscription).toBeNull()
         } finally {
           await round.dispose()
         }
@@ -355,6 +391,8 @@ describe.each([false, true])('captured close with enforcement %s', (enforceReque
           expect(round.written.length - before.written).toBe(fault === 'transport-refused' ? 0 : 1)
           expect(round.newSetupCallsSince(before)).toEqual([])
           expect(round.machine.state).toBe('CLOSED')
+          expect(round.machine.closing.handle).toBeNull()
+          expect(round.machine.closing.subscription).toBeNull()
           expect(round.unhandled).toEqual([])
         } finally {
           await round.dispose()
@@ -375,6 +413,8 @@ describe.each([false, true])('captured close with enforcement %s', (enforceReque
           await round.settleClose()
           expect(round.finalFrames()).toHaveLength(['S17', 'S18'].includes(boundary) ? 1 : 0)
           expect(round.forcedRetirements().length).toBeGreaterThan(0)
+          expect(round.machine.closing.handle).toBeNull()
+          expect(round.machine.closing.subscription).toBeNull()
         } finally {
           await round.dispose()
         }
@@ -389,6 +429,8 @@ describe.each([false, true])('captured close with enforcement %s', (enforceReque
         round.clock.jump(episode.closeDeadline + 1)
         await round.deliverCloseWatchdog()
         await round.settleClose()
+        expect(round.machine.closing.handle).toBeNull()
+        expect(round.savedClosingGuard()).not.toBeNull()
         await round.wait(() => round.client.connect())
         await round.establish()
         const replacement = round.capture()

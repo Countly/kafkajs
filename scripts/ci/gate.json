@@ -19068,7 +19068,16 @@
         "scripts/soak/__tests__/originalSharePriming.spec.js \u203a two-scope original share driver archives decodable negotiation replies from the scripted public boundary",
         "scripts/soak/__tests__/originalSharePriming.spec.js \u203a two-scope original share driver derives both complete workloads, cleanup and sealed archive verdicts from original operations, short=true",
         "scripts/soak/__tests__/originalSharePriming.spec.js \u203a two-scope original share driver derives both complete workloads, cleanup and sealed archive verdicts from original operations, short=false",
-        "scripts/soak/__tests__/originalSharePriming.spec.js \u203a two-scope original share driver detects retained orchestration roots for the prime driver and its corpus"
+        "scripts/soak/__tests__/originalSharePriming.spec.js \u203a two-scope original share driver detects retained orchestration roots for the prime driver and its corpus",
+        "src/telemetry/__tests__/close.spec.js \u203a captured close with enforcement false producer a closed client retains its close result but releases the retired transport and can reopen",
+        "src/telemetry/__tests__/close.spec.js \u203a captured close with enforcement false consumer a closed client retains its close result but releases the retired transport and can reopen",
+        "src/telemetry/__tests__/close.spec.js \u203a captured close with enforcement false admin a closed client retains its close result but releases the retired transport and can reopen",
+        "src/telemetry/__tests__/close.spec.js \u203a captured close with enforcement false shareConsumer a closed client retains its close result but releases the retired transport and can reopen",
+        "src/telemetry/__tests__/close.spec.js \u203a captured close with enforcement true producer a closed client retains its close result but releases the retired transport and can reopen",
+        "src/telemetry/__tests__/close.spec.js \u203a captured close with enforcement true consumer a closed client retains its close result but releases the retired transport and can reopen",
+        "src/telemetry/__tests__/close.spec.js \u203a captured close with enforcement true admin a closed client retains its close result but releases the retired transport and can reopen",
+        "src/telemetry/__tests__/close.spec.js \u203a captured close with enforcement true shareConsumer a closed client retains its close result but releases the retired transport and can reopen",
+        "src/network/__tests__/frameValidation.spec.js \u203a FrameBuffer > retained memory and copying reuses a dedicated four-byte prefix without retaining a pooled backing store"
       ],
       "capMinutes": 85,
       "allowedSkips": [
@@ -20032,7 +20041,17 @@
       "evidence": [
         "max-in-flight"
       ],
-      "titles": [],
+      "titles": [
+        "src/telemetry/__tests__/close.spec.js \u203a captured close with enforcement false producer a closed client retains its close result but releases the retired transport and can reopen",
+        "src/telemetry/__tests__/close.spec.js \u203a captured close with enforcement false consumer a closed client retains its close result but releases the retired transport and can reopen",
+        "src/telemetry/__tests__/close.spec.js \u203a captured close with enforcement false admin a closed client retains its close result but releases the retired transport and can reopen",
+        "src/telemetry/__tests__/close.spec.js \u203a captured close with enforcement false shareConsumer a closed client retains its close result but releases the retired transport and can reopen",
+        "src/telemetry/__tests__/close.spec.js \u203a captured close with enforcement true producer a closed client retains its close result but releases the retired transport and can reopen",
+        "src/telemetry/__tests__/close.spec.js \u203a captured close with enforcement true consumer a closed client retains its close result but releases the retired transport and can reopen",
+        "src/telemetry/__tests__/close.spec.js \u203a captured close with enforcement true admin a closed client retains its close result but releases the retired transport and can reopen",
+        "src/telemetry/__tests__/close.spec.js \u203a captured close with enforcement true shareConsumer a closed client retains its close result but releases the retired transport and can reopen",
+        "src/network/__tests__/frameValidation.spec.js \u203a FrameBuffer > retained memory and copying reuses a dedicated four-byte prefix without retaining a pooled backing store"
+      ],
       "capMinutes": 48,
       "allowedSkips": [
         "src/telemetry/__tests__/javaInteropLive.spec.js \u203a java telemetry interoperability",
@@ -22248,7 +22267,16 @@
         "src/consumer/share/__tests__/shareFetchLoop.spec.js \u203a share node socket integration omitted hooks support idle polling and invalidate acquisitions on a session reset",
         "src/telemetry/__tests__/subscription.spec.js \u203a telemetry default dependencies close without an outer budget bounds a held final to one second",
         "src/telemetry/__tests__/subscription.spec.js \u203a telemetry default dependencies the default monotonic clock includes options access in the getter timeout",
-        "src/telemetry/__tests__/subscription.spec.js \u203a telemetry default dependencies unregistering through the client removes only the selected metric identity"
+        "src/telemetry/__tests__/subscription.spec.js \u203a telemetry default dependencies unregistering through the client removes only the selected metric identity",
+        "src/telemetry/__tests__/close.spec.js \u203a captured close with enforcement false producer a closed client retains its close result but releases the retired transport and can reopen",
+        "src/telemetry/__tests__/close.spec.js \u203a captured close with enforcement false consumer a closed client retains its close result but releases the retired transport and can reopen",
+        "src/telemetry/__tests__/close.spec.js \u203a captured close with enforcement false admin a closed client retains its close result but releases the retired transport and can reopen",
+        "src/telemetry/__tests__/close.spec.js \u203a captured close with enforcement false shareConsumer a closed client retains its close result but releases the retired transport and can reopen",
+        "src/telemetry/__tests__/close.spec.js \u203a captured close with enforcement true producer a closed client retains its close result but releases the retired transport and can reopen",
+        "src/telemetry/__tests__/close.spec.js \u203a captured close with enforcement true consumer a closed client retains its close result but releases the retired transport and can reopen",
+        "src/telemetry/__tests__/close.spec.js \u203a captured close with enforcement true admin a closed client retains its close result but releases the retired transport and can reopen",
+        "src/telemetry/__tests__/close.spec.js \u203a captured close with enforcement true shareConsumer a closed client retains its close result but releases the retired transport and can reopen",
+        "src/network/__tests__/frameValidation.spec.js \u203a FrameBuffer > retained memory and copying reuses a dedicated four-byte prefix without retaining a pooled backing store"
       ],
       "capMinutes": 93,
       "allowedSkips": [
