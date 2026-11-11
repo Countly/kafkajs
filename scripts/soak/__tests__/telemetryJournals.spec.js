@@ -210,3 +210,61 @@ describe('telemetry fixed journals', () => {
     expect(retained[10000].payload[0]).toBe(0x6d)
   })
 })
+
+describe('telemetry journal ownership diagnostic', () => {
+  test('pairs old and fixed journals on one schedule and keeps seeded product retention visible', () => {
+    const fs = require('node:fs')
+    const path = require('node:path')
+    const childProcess = require('node:child_process')
+    const directory = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'journal-ownership-'))
+    try {
+      const run = (mode, kind, seeded = false) =>
+        JSON.parse(
+          childProcess.execFileSync(
+            process.execPath,
+            [
+              '--expose-gc',
+              path.join(__dirname, 'fixtures/journalOwnershipChild.js'),
+              mode,
+              kind,
+              String(seeded),
+            ],
+            { timeout: 45000, maxBuffer: 16 * 1024 * 1024, encoding: 'utf8' }
+          )
+        )
+      for (const kind of ['producer', 'consumer', 'shareConsumer']) {
+        const old = run('legacy', kind)
+        const fixed = run('fixed', kind)
+        fs.writeFileSync(path.join(directory, `${kind}.json`), JSON.stringify({ old, fixed }))
+        expect(fixed).toMatchObject({
+          diagnostic: true,
+          acceptanceEligible: false,
+          attributionComplete: false,
+        })
+        expect(fixed.corpusSha256).toBe(old.corpusSha256)
+        expect(fixed.scheduleSha256).toBe(old.scheduleSha256)
+        expect(fixed.idsSha256).toBe(old.idsSha256)
+        expect(fixed.factsSha256).toBe(old.factsSha256)
+        for (const result of [old, fixed]) {
+          expect(result.ownership.map((row) => row.checkpoint)).toEqual([
+            'M',
+            'first',
+            'last',
+            'closed',
+          ])
+          expect(result.ownership.every((row) => row.positiveAlive)).toBe(true)
+          expect(result.ownership.at(-1).recordTargetsAlive).toBeLessThan(10)
+        }
+      }
+      const seeded = run('fixed', 'consumer', true)
+      fs.writeFileSync(path.join(directory, 'seeded.json'), JSON.stringify(seeded))
+      expect(seeded.violations).toEqual(
+        expect.arrayContaining(['retained slope', 'retained endpoint'])
+      )
+      expect(seeded.ownership.at(-1).recordTargetsAlive).toBe(10000)
+      expect(seeded.ownership.at(-1).positiveAlive).toBe(true)
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  }, 240000)
+})
