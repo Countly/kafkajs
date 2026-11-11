@@ -1,497 +1,411 @@
 const fs = require('fs')
 const os = require('os')
 const path = require('path')
+const { EventEmitter } = require('events')
 const {
   ARMS,
   MeasurementCollector,
   compare,
   main,
+  medianInterval,
+  createSchedule,
   overlayFiles,
   parseArgs,
   parseExceptions,
+  runCommand,
 } = require('../compareDecoderBounds')
+const replay = require('./fixtures/decoderReplay.json')
 
+const FIRST = ARMS[0].name
 const BASELINE = 'a'.repeat(40)
 const CANDIDATE = 'b'.repeat(40)
-const OPTIONAL = 'record-batch:zstd'
-const OPTIONAL_ARMS = ARMS.filter((arm) => !arm.required).map(({ name }) => name)
+const OPTIONAL = ARMS.filter(({ required }) => !required).map(({ name }) => name)
+const constant = (value) => Array(30).fill(value)
+const sortedMedian = (values) => [...values].sort((a, b) => a - b)[Math.floor(values.length / 2)]
 
-const constant = (value) => Array.from({ length: 5 }, () => value)
-
-/** @returns {object} an arm that is 100 ns in both trees */
-const steadyArm = (name) => ({ name, oldNsPerOp: constant(100), newNsPerOp: constant(100) })
-
-/**
- * @returns {object} a complete, comparable input: every required arm is 100 ns in both trees and
- *   every optional arm is declared unavailable
- */
+/** @returns {object} complete paired observations with explicit invocation identity */
+const row = (name, A = constant(100), B = A, C = A) => {
+  const arm = ARMS.find((arm) => arm.name === name)
+  const schedule = createSchedule(42)
+  return {
+    name,
+    oldNsPerOp: A,
+    newNsPerOp: B,
+    baselineControlNsPerOp: C,
+    invocations: schedule.flatMap((order, block) =>
+      order.map((side) => ({
+        block,
+        side,
+        [arm.metric]: { A, B, C }[side][block],
+        roundNsPerOp: Array(arm.name.startsWith('frame-') ? 7 : 5).fill({ A, B, C }[side][block]),
+      }))
+    ),
+  }
+}
 const completeInput = (overrides = {}) => ({
   baselineSha: BASELINE,
   candidateSha: CANDIDATE,
   node: 'v26.0.0',
-  arms: ARMS.filter((arm) => arm.required).map(({ name }) => steadyArm(name)),
-  unavailable: [...OPTIONAL_ARMS],
+  registeredRows: ARMS.map(({ name }) => name),
+  seed: 42,
+  schedule: createSchedule(42),
+  arms: ARMS.filter(({ required }) => required).map(({ name }) => row(name)),
+  unavailable: [...OPTIONAL],
   ...overrides,
 })
-
-/** @returns {Function} runs `fn` with a temporary directory that is removed afterwards */
-const inTempDir = (fn) => {
+const withRow = (arm) =>
+  completeInput({ arms: completeInput().arms.map((a) => (a.name === arm.name ? arm : a)) })
+const resultOf = (arm) => compare(withRow(arm)).arms.find(({ name }) => name === arm.name)
+const runInput = async (input) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'decoder-compare-'))
   try {
-    return fn(dir)
+    const file = path.join(dir, 'input.json')
+    fs.writeFileSync(file, JSON.stringify(input))
+    const lines = []
+    return {
+      status: await main(['--input', file], (line) => lines.push(line)),
+      report: lines.join('\n'),
+    }
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
 }
 
-/** @returns {{ status: number, report: string }} what `--input` exits with and prints for the input */
-const runInput = (input) =>
-  inTempDir((dir) => {
-    const file = path.join(dir, 'in.json')
-    fs.writeFileSync(file, JSON.stringify(input))
-    const lines = []
-    const status = main(['--input', file], (line) => lines.push(line))
-    return { status, report: lines.join('\n') }
-  })
-
-/** @returns {object} the input with one arm's new-side samples replaced */
-const withNew = (name, value) => {
-  const input = completeInput()
-  input.arms.find((arm) => arm.name === name).newNsPerOp = constant(value)
-  return input
-}
-
-const verdictOf = (result, name) => result.arms.find((arm) => arm.name === name).verdict
-const NO_EXCEPTIONS = new Map()
-const FIRST = 'frame-decode:64b'
-
 describe('Decoder performance comparison', () => {
-  it('rejects a slowdown above five percent', () => {
-    const slower = compare(withNew(FIRST, 106), NO_EXCEPTIONS)
-    expect(slower.pass).toBe(false)
-    expect(verdictOf(slower, FIRST)).toBe('fail')
-    expect(slower.arms.find((arm) => arm.name === FIRST).slowdownPercent).toBeCloseTo(6, 6)
+  it('uses exact Bonferroni order statistics including optional registered rows and ties', () => {
+    const samples = Array.from({ length: 30 }, (_, i) => i + 1)
+    expect(ARMS).toHaveLength(15)
+    expect(medianInterval(samples, 15)).toEqual({ alpha: 0.05 / 30, k: 7, lower: 7, upper: 24 })
+    expect(medianInterval(samples, 1)).toEqual({ alpha: 0.025, k: 9, lower: 9, upper: 22 })
+    expect(medianInterval(constant(1), 15)).toMatchObject({ lower: 1, upper: 1 })
+    expect(resultOf(row(FIRST)).ratioInterval.k).toBe(7)
+  })
 
-    const boundary = compare(withNew(FIRST, 105), NO_EXCEPTIONS)
-    expect(boundary.pass).toBe(true)
-    expect(verdictOf(boundary, FIRST)).toBe('pass')
-
-    expect(compare(withNew(FIRST, 60), NO_EXCEPTIONS).pass).toBe(true)
-
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'decoder-compare-'))
-    try {
-      const file = path.join(dir, 'in.json')
-      fs.writeFileSync(file, JSON.stringify(withNew(FIRST, 106)))
-      const lines = []
-      expect(main(['--input', file], (line) => lines.push(line))).toBe(1)
-      expect(lines.join('\n')).toMatch(/FAIL\s+frame-decode:64b\s.*\+6\.00%/)
-      expect(lines.join('\n')).toContain('decoder performance: FAIL')
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true })
+  it('passes equal speed and inclusive five percent bounds but rejects stable regressions', async () => {
+    for (const value of [60, 100, 105]) {
+      const input = withRow(row(FIRST, constant(100), constant(value)))
+      expect(compare(input).pass).toBe(true)
+      expect((await runInput(input)).status).toBe(0)
+    }
+    for (const value of [105.001, 112, 1800]) {
+      const input = withRow(row(FIRST, constant(100), constant(value)))
+      expect(compare(input).pass).toBe(false)
+      expect(resultOf(input.arms[0]).verdict).toBe('regression')
+      expect((await runInput(input)).status).toBe(1)
     }
   })
 
-  it('reports baseline A/A medians beside each row and warns on drift above five percent', () => {
-    const input = completeInput()
-    input.arms[0].baselineControlNsPerOp = [900, 108, 107, 109, 1]
-
-    const result = compare(input, NO_EXCEPTIONS)
-    const { status, report } = runInput(input)
-
-    expect(result.arms[0].baselineControl).toEqual({
-      oldMedian: 100,
-      controlMedian: 108,
-      driftPercent: expect.closeTo(8, 6),
-      unstable: true,
-    })
-    expect(status).toBe(0)
-    expect(report).toMatch(/PASS\s+frame-decode:64b\s.*\+0\.00% {2}A\/A baseline \+8\.00%/)
-    expect(report).toContain(`WARNING  ${FIRST}: baseline A/A drift exceeds 5% (+8.00%)`)
-    expect(report).toContain('A/A baseline unavailable')
-
-    input.arms[0].baselineControlNsPerOp = constant(94)
-    expect(runInput(input).report).toContain(
-      `WARNING  ${FIRST}: baseline A/A drift exceeds 5% (-6.00%)`
-    )
-    input.arms[0].baselineControlNsPerOp = constant(105)
-    expect(runInput(input).report).not.toContain('WARNING')
+  it('a paired ratio pass cannot override a failed unpaired median check', () => {
+    const A = [...Array(15).fill(100), ...Array(15).fill(114)]
+    const B = [...Array(15).fill(105), ...Array(15).fill(119.7)]
+    B[0] = 114
+    const result = resultOf(row(FIRST, A, B, A))
+    expect(result.ratioInterval.upper).toBeLessThanOrEqual(1.05)
+    expect(result.newMedian / result.oldMedian).toBeGreaterThan(1.05)
+    expect(result.verdict).toBe('fail')
   })
 
-  it('A/A diagnostics never change acceptance medians, problems, exceptions or verdicts', () => {
-    for (const candidate of [100, 105, 106, 108]) {
-      for (const exceptions of [
-        NO_EXCEPTIONS,
-        parseExceptions([{ arm: FIRST, maxSlowdownPercent: 7, ruling: 'test ruling' }]),
-      ]) {
-        const input = withNew(FIRST, candidate)
-        const before = compare(input, exceptions)
-        for (const control of [constant(10000), constant(1), [NaN], null, []]) {
-          input.arms[0].baselineControlNsPerOp = control
-          const after = compare(input, exceptions)
-          expect(after.pass).toBe(before.pass)
-          expect(after.problems).toEqual(before.problems)
-          expect(after.arms[0]).toMatchObject({
-            oldMedian: before.arms[0].oldMedian,
-            newMedian: before.arms[0].newMedian,
-            slowdownPercent: before.arms[0].slowdownPercent,
-            verdict: before.arms[0].verdict,
-          })
-        }
-      }
-    }
-  })
-
-  it('refuses missing or incomparable measurements', () => {
-    const exceptions = parseExceptions(
-      ARMS.map(({ name }) => ({ arm: name, maxSlowdownPercent: 1000, ruling: 'test ruling' }))
-    )
-    const broken = (mutate) => {
-      const input = completeInput()
-      mutate(input)
-      return input
-    }
-    const cases = {
-      'required arm is missing': broken((input) => input.arms.pop()),
-      'fewer than five samples': broken((input) => (input.arms[0].newNsPerOp = [100, 100, 100])),
-      'a zero sample': broken((input) => (input.arms[0].oldNsPerOp = [0, 100, 100, 100, 100])),
-      'a NaN sample': broken((input) => (input.arms[0].newNsPerOp = [NaN, 1, 1, 1, 1])),
-      'a string sample': broken((input) => (input.arms[0].newNsPerOp = ['9', 9, 9, 9, 9])),
-      'samples that are not an array': broken((input) => (input.arms[0].oldNsPerOp = 100)),
-      'a short baseline sha': broken((input) => (input.baselineSha = 'abc123')),
-      'identical shas': broken((input) => (input.candidateSha = BASELINE)),
-      'no node version': broken((input) => delete input.node),
-      'a duplicated arm': broken((input) => input.arms.push({ ...input.arms[0] })),
-      'arms that are not an array': broken((input) => (input.arms = {})),
-    }
-
-    for (const [label, input] of Object.entries(cases)) {
-      const result = compare(input, NO_EXCEPTIONS)
-      expect({ label, pass: result.pass }).toEqual({ label, pass: false })
-      expect({ label, problems: result.problems.length > 0 }).toEqual({ label, problems: true })
-      expect({ label, pass: compare(input, exceptions).pass }).toEqual({ label, pass: false })
-    }
-    expect(compare(null, NO_EXCEPTIONS).pass).toBe(false)
-    expect(compare(completeInput(), NO_EXCEPTIONS).pass).toBe(true)
-
-    expect(main(['--input', '/nonexistent/decoder-comparison.json'], () => {})).toBe(1)
-    expect(main(['--run'], () => {})).toBe(1)
-  })
-
-  const PERMISSIVE = parseExceptions(
-    ARMS.map(({ name }) => ({ arm: name, maxSlowdownPercent: 1000, ruling: 'test ruling' }))
-  )
-
-  test.each(OPTIONAL_ARMS)(
-    'refuses an input that leaves %s with neither measurements nor an unavailable disposition',
-    (name) => {
-      const input = completeInput({ unavailable: OPTIONAL_ARMS.filter((other) => other !== name) })
-
-      const result = compare(input, NO_EXCEPTIONS)
-
-      expect(result.pass).toBe(false)
-      expect(result.problems).toEqual([
-        `${name} has neither measurements nor an unavailable disposition`,
-      ])
-      expect(compare(input, PERMISSIVE).pass).toBe(false)
-      expect(runInput(input).status).toBe(1)
-    }
-  )
-
-  it('refuses an input that omits every optional arm and says so through --input', () => {
-    const everyOptionalOmitted = completeInput({ unavailable: [] })
-    const { unavailable, ...withoutTheField } = completeInput()
-
-    expect(compare(everyOptionalOmitted, NO_EXCEPTIONS).pass).toBe(false)
-    expect(compare(withoutTheField, NO_EXCEPTIONS).pass).toBe(false)
-
-    const exit = runInput(everyOptionalOmitted)
-    expect(exit.status).toBe(1)
-    for (const name of OPTIONAL_ARMS) {
-      expect(exit.report).toContain(`PROBLEM  ${name} has neither measurements nor`)
-    }
-    expect(exit.report).toContain('decoder performance: FAIL')
-    expect(runInput(completeInput())).toMatchObject({ status: 0 })
-    expect(unavailable).toEqual(OPTIONAL_ARMS)
-  })
-
-  const REQUIRED = ARMS.find((arm) => arm.required).name
-  const unpermitted = {
-    'an arm that is both measured and unavailable': [
-      () => completeInput({ arms: [...completeInput().arms, steadyArm(OPTIONAL)] }),
-      `${OPTIONAL} is both measured and unavailable`,
-    ],
-    'a required arm declared unavailable': [
-      () =>
-        completeInput({
-          arms: completeInput().arms.filter((arm) => arm.name !== REQUIRED),
-          unavailable: [...OPTIONAL_ARMS, REQUIRED],
-        }),
-      `required arm ${REQUIRED} cannot be unavailable`,
-    ],
-    'an unknown arm declared unavailable': [
-      () => completeInput({ unavailable: [...OPTIONAL_ARMS, 'record-batch:brotli'] }),
-      'record-batch:brotli is not a known arm',
-    ],
-    'an arm declared unavailable twice': [
-      () => completeInput({ unavailable: [...OPTIONAL_ARMS, OPTIONAL] }),
-      `${OPTIONAL} is declared unavailable twice`,
-    ],
-    'an unavailable list that is not an array': [
-      () => completeInput({ unavailable: OPTIONAL }),
-      'unavailable must be an array',
-    ],
-  }
-
-  test.each(Object.entries(unpermitted))('refuses %s', (label, [build, problem]) => {
-    const input = build()
-
-    const result = compare(input, NO_EXCEPTIONS)
-
-    expect(result.pass).toBe(false)
-    expect(result.problems.join('\n')).toContain(problem)
-    expect(compare(input, PERMISSIVE).pass).toBe(false)
-    expect(runInput(input).status).toBe(1)
-  })
-
-  it('measures a real response through each array reader the decoder bounds and through record headers, in both trees', () => {
-    const arrayArms = ARMS.filter((arm) => arm.name.startsWith('array-decode:'))
-
-    expect(arrayArms.map((arm) => arm.name)).toEqual([
-      'array-decode:readArray',
-      'array-decode:record-headers',
-      'array-decode:readUVarIntArray',
-      'array-decode:readArrayAsync',
-      'array-decode:readUVarIntArrayAsync',
-    ])
-    for (const arm of arrayArms) {
-      const armName = arm.name.split(':')[1]
-      expect(arm.required).toBe(true)
-      expect(arm.metric).toBe('nsPerOp')
-      expect(arm.argv.slice(0, 2)).toEqual(['node', 'scripts/benchmarks/arrayDecode.js'])
-      expect(arm.argv).toContain(armName)
-      expect(arm.overlay).toBe('scripts/benchmarks/arrayDecode.js')
-      expect(fs.existsSync(path.join(__dirname, '..', '..', '..', arm.overlay))).toBe(true)
-    }
-  })
-
-  it('overlays the candidate benchmark scripts into the baseline tree', () => {
-    inTempDir((dir) => {
-      const repoRoot = path.join(dir, 'candidate')
-      const tree = path.join(dir, 'baseline')
-      const write = (root, file, text) => {
-        fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true })
-        fs.writeFileSync(path.join(root, file), text)
-      }
-      const read = (root, file) => fs.readFileSync(path.join(root, file), 'utf8')
-      write(repoRoot, 'scripts/benchmarks/a.js', 'candidate a')
-      write(repoRoot, 'scripts/benchmarks/b.js', 'candidate b')
-      write(tree, 'scripts/benchmarks/a.js', 'baseline a')
-
-      const files = ['scripts/benchmarks/a.js', 'scripts/benchmarks/b.js']
-      overlayFiles({ repoRoot, dir: tree, files })
-
-      expect(read(tree, files[0])).toBe('candidate a')
-      expect(read(tree, files[1])).toBe('candidate b')
-      expect(() =>
-        overlayFiles({ repoRoot, dir: tree, files: ['scripts/benchmarks/missing.js'] })
-      ).toThrow(/missing\.js/)
-    })
-  })
-
-  it('accepts a slowdown covered by a recorded exception and rejects one beyond it', () => {
-    const entry = (arm, maxSlowdownPercent) => ({ arm, maxSlowdownPercent, ruling: 'panel ruling' })
-
-    const covered = compare(withNew(FIRST, 108), parseExceptions([entry(FIRST, 10)]))
-    expect(covered.pass).toBe(true)
-    expect(verdictOf(covered, FIRST)).toBe('exception')
-
-    const beyond = compare(withNew(FIRST, 108), parseExceptions([entry(FIRST, 7)]))
-    expect(beyond.pass).toBe(false)
-    expect(verdictOf(beyond, FIRST)).toBe('fail')
-
-    const otherArm = compare(withNew(FIRST, 108), parseExceptions([entry('record-batch:gzip', 50)]))
-    expect(otherArm.pass).toBe(false)
-
-    expect(() => parseExceptions([{ arm: FIRST, maxSlowdownPercent: 10 }])).toThrow(/invalid/)
-    expect(() => parseExceptions([entry(FIRST, 3)])).toThrow(/invalid/)
-    expect(() => parseExceptions([entry(FIRST, 10), entry(FIRST, 20)])).toThrow(/duplicate/)
-    expect(() => parseExceptions({})).toThrow(/array/)
+  it('an interval straddling five percent is inconclusive and no exception rescues it', async () => {
+    const arm = row(FIRST, constant(100), [...Array(23).fill(100), ...Array(7).fill(106)])
+    expect(resultOf(arm).verdict).toBe('inconclusive')
+    expect(compare(withRow(arm), new Map([[FIRST, { maxSlowdownPercent: 1000 }]])).pass).toBe(false)
+    expect((await runInput(withRow(arm))).status).toBe(1)
+    expect(() =>
+      parseExceptions([{ arm: FIRST, maxSlowdownPercent: 1000, ruling: 'test' }])
+    ).toThrow(/empty/)
+    expect(parseExceptions([]).size).toBe(0)
     expect(JSON.parse(fs.readFileSync(require.resolve('../decoderBoundsExceptions.json')))).toEqual(
       []
     )
   })
 
-  it('parses run and input arguments strictly', () => {
-    expect(parseArgs(['--run', '--baseline', BASELINE])).toEqual({
-      mode: 'run',
-      baseline: BASELINE,
-      out: path.join('.tmp', 'decoder-comparison.json'),
-      raw: path.join('.tmp', 'decoder-comparison', 'raw'),
-    })
-    expect(
-      parseArgs(['--run', '--baseline', BASELINE, '--out', 'o.json', '--raw', 'raw-dir'])
-    ).toMatchObject({ out: 'o.json', raw: 'raw-dir' })
-    expect(parseArgs(['--input', 'in.json'])).toEqual({ mode: 'input', input: 'in.json' })
+  it('calibrates both the paired A/A interval and the unpaired control median inclusively', () => {
+    for (const C of [95, 100, 105])
+      expect(resultOf(row(FIRST, constant(100), constant(100), constant(C))).verdict).toBe('pass')
+    for (const C of [94.999, 105.001])
+      expect(resultOf(row(FIRST, constant(100), constant(100), constant(C))).verdict).toBe(
+        'invalid'
+      )
+    const A = [...Array(15).fill(100), ...Array(15).fill(114)]
+    const C = [...Array(15).fill(105), ...Array(15).fill(119.7)]
+    C[0] = 114
+    const result = resultOf(row(FIRST, A, A, C))
+    expect(result.controlInterval.upper).toBeLessThanOrEqual(1.05)
+    expect(result.verdict).toBe('invalid')
+    const intervalDrift = [...Array(23).fill(100), ...Array(7).fill(106)]
+    expect(resultOf(row(FIRST, constant(100), constant(100), intervalDrift)).verdict).toBe(
+      'invalid'
+    )
+  })
 
+  it('enforces the inclusive fifteen percent spread on every side and rejects bimodal samples', () => {
+    for (const side of ['A', 'B', 'C']) {
+      const make = (high) => {
+        const samples = constant(100)
+        samples[28] = samples[29] = high
+        return row(
+          FIRST,
+          side === 'A' ? samples : constant(100),
+          side === 'B' ? samples : constant(100),
+          side === 'C' ? samples : constant(100)
+        )
+      }
+      expect(resultOf(make(115)).verdict).toBe('pass')
+      expect(resultOf(make(115.001)).verdict).toBe('invalid')
+    }
+    const bimodal = [...Array(15).fill(100), ...Array(15).fill(200)]
+    expect(resultOf(row(FIRST, bimodal, bimodal, bimodal)).verdict).toBe('invalid')
+  })
+
+  it('rejects missing or duplicate blocks, malformed data, errors and changed registrations', async () => {
+    const mutations = [
+      (i) => i.arms[0].invocations.pop(),
+      (i) => i.arms[0].invocations.push(i.arms[0].invocations[0]),
+      (i) => (i.arms[0].invocations[0].block = 1),
+      (i) => (i.arms[0].invocations[0].side = 'wrong'),
+      (i) => (i.arms[0].invocations[0].error = 'control failed'),
+      (i) => (i.arms[0].invocations[0].roundNsPerOp = [NaN]),
+      (i) => (i.arms[0].oldNsPerOp[0] = 0),
+      (i) => (i.arms[0].newNsPerOp[0] = Infinity),
+      (i) => (i.arms[0].baselineControlNsPerOp = []),
+      (i) => (i.arms[0].newNsPerOp = '100'),
+      (i) => i.arms[0].newNsPerOp.pop(),
+      (i) => i.registeredRows.pop(),
+      (i) => i.schedule[0].reverse(),
+      (i) => (i.seed = '42'),
+      (i) => (i.baselineSha = 'abc'),
+      (i) => (i.candidateSha = BASELINE),
+      (i) => delete i.node,
+      (i) => i.arms.push(i.arms[0]),
+      (i) => (i.arms[0].name = 'unknown'),
+      (i) => (i.timedOut = true),
+      (i) => (i.arms = {}),
+    ]
+    for (const mutate of mutations) {
+      const input = completeInput()
+      mutate(input)
+      expect(compare(input).pass).toBe(false)
+      expect((await runInput(input)).status).toBe(1)
+    }
+    expect(compare(null).pass).toBe(false)
+  })
+
+  test.each(OPTIONAL)('requires a measured or unavailable disposition for %s', async (name) => {
+    const input = completeInput({ unavailable: OPTIONAL.filter((other) => other !== name) })
+    expect(compare(input).problems).toContain(
+      `${name} has neither measurements nor an unavailable disposition`
+    )
+    expect((await runInput(input)).status).toBe(1)
+    input.arms.push(row(name))
+    expect(compare(input).pass).toBe(true)
+  })
+
+  it('rejects unavailable required, unknown, duplicated or simultaneously measured codecs', () => {
+    for (const unavailable of [
+      [FIRST, ...OPTIONAL],
+      [...OPTIONAL, 'unknown'],
+      [...OPTIONAL, OPTIONAL[0]],
+      'wrong',
+    ]) {
+      expect(compare(completeInput({ unavailable })).pass).toBe(false)
+    }
+    expect(compare(completeInput({ arms: [...completeInput().arms, row(OPTIONAL[0])] })).pass).toBe(
+      false
+    )
+    const input = completeInput()
+    input.arms.pop()
+    expect(compare(input).pass).toBe(false)
+  })
+
+  it('reports the old unpaired median delta as information alongside paired bounds', async () => {
+    const output = await runInput(withRow(row(FIRST, constant(100), constant(112))))
+    expect(output.report).toContain('REGRESSION')
+    expect(output.report).toContain('unpaired +12.00% (information only)')
+    expect(output.report).toContain('R [1.1200, 1.1200]')
+    expect(output.report).toContain('Q [1.0000, 1.0000]')
+  })
+
+  it('replays honestly derived median projections and keeps noisy Exit frames non-regressions', () => {
+    expect(replay.derivation).toContain('synthetic')
+    for (const [index, expectedDelta, verdict] of [
+      [0, -4.07, 'pass'],
+      [1, 6.59, 'regression'],
+      [2, 19.71, 'regression'],
+    ]) {
+      const source = replay.sources[index].arm
+      const derived = row(
+        source.name,
+        constant(sortedMedian(source.oldNsPerOp)),
+        constant(sortedMedian(source.newNsPerOp)),
+        constant(sortedMedian(source.baselineControlNsPerOp))
+      )
+      const result = resultOf(derived)
+      expect(result.slowdownPercent).toBeCloseTo(expectedDelta, 2)
+      expect(result.verdict).toBe(verdict)
+      expect(source.oldNsPerOp).toHaveLength(7)
+    }
+    const source = replay.sources[3].arm
+    const repeat = (samples) => Array.from({ length: 30 }, (_, n) => samples[n % samples.length])
+    const derived = row(source.name, repeat(source.oldNsPerOp), repeat(source.newNsPerOp))
+    derived.baselineControlNsPerOp = []
+    derived.invocations = derived.invocations.filter(({ side }) => side !== 'C')
+    const result = resultOf(derived)
+    expect(
+      (sortedMedian(source.newNsPerOp) / sortedMedian(source.oldNsPerOp) - 1) * 100
+    ).toBeCloseTo(109.66, 2)
+    expect(result.verdict).toBe('invalid')
+    expect(compare(withRow(derived)).pass).toBe(false)
+  })
+
+  it('records a seeded balanced schedule before measurement and keeps every round without extension', async () => {
+    const schedule = createSchedule(42)
+    expect(createSchedule(42)).toEqual(schedule)
+    expect(createSchedule(43)).not.toEqual(schedule)
+    const counts = {}
+    for (const order of schedule) counts[order.join('')] = (counts[order.join('')] || 0) + 1
+    expect(counts).toEqual({ ACB: 5, ABC: 5, CAB: 5, CBA: 5, BAC: 5, BCA: 5 })
+    const { collector, calls, saved } = collectorFor()
+    const collected = await collector.collect()
+    expect(calls).toHaveLength(15 * 30 * 3)
+    expect(JSON.parse(saved.get(path.join('raw', 'schedule.json')))).toEqual({
+      seed: 42,
+      registeredRows: ARMS.map(({ name }) => name),
+      schedule,
+    })
+    for (const arm of collected.arms) {
+      expect(arm.invocations).toHaveLength(90)
+      expect(arm.invocations.map(({ side }) => side)).toEqual(schedule.flat())
+      expect(arm.invocations.every(({ roundNsPerOp }) => roundNsPerOp.length >= 5)).toBe(true)
+    }
+    expect(compare(completeInput(collected)).pass).toBe(true)
+    expect(saved.size).toBe(1 + calls.length)
+  })
+
+  it('a control error invalidates its row without retry or extension', async () => {
+    const setup = collectorFor()
+    const measure = setup.collector.measure.bind(setup.collector)
+    setup.collector.measure = (arm, side, block, timeout) =>
+      side === 'C' && arm.name === FIRST && block === 0
+        ? Promise.reject(new Error('control failed'))
+        : measure(arm, side, block, timeout)
+    const collected = await setup.collector.collect()
+    expect(collected.arms[0].invocations).toHaveLength(90)
+    expect(resultOf(collected.arms[0]).verdict).toBe('invalid')
+    expect(setup.calls).toHaveLength(15 * 30 * 3 - 1)
+  })
+
+  it('allows only codecs absent in both trees and preserves their availability evidence', async () => {
+    for (const missing of [['OLD', 'NEW'], ['OLD']]) {
+      const setup = collectorFor({ missing })
+      const collected = await setup.collector.collect()
+      expect(collected.unavailable).toEqual(missing.length === 2 ? [OPTIONAL[1]] : [])
+      expect(compare(completeInput(collected)).pass).toBe(missing.length === 2)
+      expect(setup.saved.size).toBeGreaterThan(1)
+    }
+  })
+
+  it('the fixed deadline stops collection with partial evidence and a non-green offline verdict', async () => {
+    let clock = 0
+    const setup = collectorFor({ now: () => clock, advance: () => (clock += 1) })
+    setup.collector.deadlineMs = 4
+    const collected = await setup.collector.collect()
+    expect(collected.timedOut).toBe(true)
+    expect(setup.calls).toHaveLength(4)
+    expect(setup.calls.map(({ timeoutMs }) => timeoutMs)).toEqual([4, 3, 2, 1])
+    expect(compare(completeInput(collected)).pass).toBe(false)
+    expect((await runInput(completeInput(collected))).status).toBe(1)
+  })
+
+  it('kills the subprocess group at the deadline under a fake clock', async () => {
+    jest.useFakeTimers()
+    try {
+      const child = new EventEmitter()
+      child.stdout = new EventEmitter()
+      child.stderr = new EventEmitter()
+      child.pid = 1234
+      const kill = jest.fn(() => child.emit('close', null, 'SIGKILL'))
+      const pending = runCommand('tree', ['node', 'bench.js'], {
+        timeoutMs: 50,
+        spawn: () => child,
+        kill,
+      })
+      jest.advanceTimersByTime(49)
+      expect(kill).not.toHaveBeenCalled()
+      jest.advanceTimersByTime(1)
+      expect(await pending).toMatchObject({ status: 1, timedOut: true })
+      expect(kill).toHaveBeenCalledWith(-1234, 'SIGKILL')
+      expect(jest.getTimerCount()).toBe(0)
+    } finally {
+      jest.useRealTimers()
+    }
+  })
+
+  it('overlays identical scripts for all frame, array and record-batch rows', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'decoder-overlay-'))
+    try {
+      const files = [...new Set(ARMS.map(({ overlay }) => overlay))]
+      overlayFiles({ repoRoot: path.resolve(__dirname, '../../..'), dir, files })
+      for (const file of files)
+        expect(fs.readFileSync(path.join(dir, file))).toEqual(
+          fs.readFileSync(path.resolve(__dirname, '../../..', file))
+        )
+      expect(ARMS.filter(({ name }) => name.startsWith('array-decode:'))).toHaveLength(5)
+      expect(
+        ARMS.slice(0, 5).every(({ argv }) => argv[0] === 'node' && argv[1] === '--expose-gc')
+      ).toBe(true)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('parses run and offline modes strictly including reproducible seeds', async () => {
+    expect(parseArgs(['--run', '--baseline', BASELINE, '--seed', '42'])).toMatchObject({
+      mode: 'run',
+      seed: 42,
+    })
+    expect(parseArgs(['--input', 'in.json'])).toEqual({ mode: 'input', input: 'in.json' })
     for (const argv of [
       [],
       ['--run'],
       ['--run', '--baseline', 'abc'],
-      ['--run', '--baseline', BASELINE, '--input', 'in.json'],
-      ['--input', 'in.json', '--baseline', BASELINE],
-      ['--input'],
-      ['--unknown'],
-    ]) {
+      ['--input', 'i', '--seed', '42'],
+      ['--run', '--baseline', BASELINE, '--seed', '-1'],
+    ])
       expect(() => parseArgs(argv)).toThrow(/usage/)
-    }
-  })
-
-  /** @returns {{ collector: MeasurementCollector, calls: string[], saved: Map<string, string> }} */
-  const collect = ({ reply, pairs = 5 }) => {
-    const calls = []
-    const saved = new Map()
-    const collector = new MeasurementCollector({
-      trees: { old: 'OLD', new: 'NEW' },
-      rawDir: 'raw',
-      pairs,
-      run: (cwd, argv) => {
-        calls.push(`${cwd} ${argv.join(' ')}`)
-        return reply(cwd, argv)
-      },
-      save: (file, text) => saved.set(file, text),
-    })
-    return { collector, calls, saved }
-  }
-
-  const ok = (value) => ({ status: 0, stdout: `banner\n${JSON.stringify(value)}\n`, stderr: '' })
-  const valueFor = (cwd, argv) => {
-    const arm = ARMS.find((candidate) => candidate.argv.join(' ') === argv.join(' '))
-    return ok({
-      available: 1,
-      [arm.metric]: cwd === 'OLD' ? 100 : 101,
-      roundNsPerOp: [98, 99, 100, 101, 102],
-    })
-  }
-  test('acceptance keeps seven alternating pairs per side by default; the A/A control adds samples without changing them', () => {
-    const collector = new MeasurementCollector({
-      trees: { old: 'OLD', new: 'NEW' },
-      rawDir: 'raw',
-      run: valueFor,
-      save: () => {},
-    })
-    const { arms } = collector.collect()
-    for (const arm of arms) {
-      expect(arm.oldNsPerOp).toHaveLength(7)
-      expect(arm.newNsPerOp).toHaveLength(7)
-      expect(arm.baselineControlNsPerOp).toHaveLength(7)
-    }
-  })
-
-  it('collector runs each arm in both trees, alternates their order and keeps every raw invocation', () => {
-    const { collector, calls, saved } = collect({ reply: valueFor })
-
-    const { arms, unavailable } = collector.collect()
-
-    expect(unavailable).toEqual([])
-    expect(arms.map((arm) => arm.name)).toEqual(ARMS.map((arm) => arm.name))
-    for (const arm of arms) {
-      expect(arm.oldNsPerOp).toEqual(constant(100))
-      expect(arm.newNsPerOp).toEqual(constant(101))
-      expect(arm.baselineControlNsPerOp).toEqual(constant(100))
-      expect(arm.invocations).toHaveLength(15)
-      expect(arm.invocations.every(({ roundNsPerOp }) => roundNsPerOp.length === 5)).toBe(true)
-    }
-    expect(compare(completeInput({ arms, unavailable: [] }), NO_EXCEPTIONS).pass).toBe(true)
-
-    const first = ARMS[0].argv.join(' ')
-    const forFirst = calls.filter((call) => call.endsWith(first))
-    expect(forFirst.map((call) => call.split(' ')[0])).toEqual([
-      'OLD',
-      'OLD',
-      'NEW',
-      'NEW',
-      'OLD',
-      'OLD',
-      'OLD',
-      'OLD',
-      'NEW',
-      'NEW',
-      'OLD',
-      'OLD',
-      'OLD',
-      'OLD',
-      'NEW',
-    ])
-    expect(saved.size).toBe(ARMS.length * 5 * 3)
-    expect(arms[0].invocations.slice(0, 6).map(({ pair, side }) => [pair, side])).toEqual([
-      [0, 'old'],
-      [0, 'baselineControl'],
-      [0, 'new'],
-      [1, 'new'],
-      [1, 'baselineControl'],
-      [1, 'old'],
-    ])
-    expect(saved.get(path.join('raw', 'frame-decode-64b', '1-new.txt'))).toContain(
-      `$ ${first}\nexit 0\n--- stdout\nbanner\n{"available":1,"nsPerFrame":101,`
-    )
-  })
-
-  it('collector reports a failed A/A invocation without changing the acceptance verdict', () => {
-    let oldCalls = 0
-    const { collector } = collect({
-      reply: (cwd, argv) => {
-        if (cwd === 'OLD' && ++oldCalls === 2) {
-          return { status: 1, stdout: '', stderr: 'diagnostic failed' }
-        }
-        return valueFor(cwd, argv)
-      },
-    })
-
-    const collected = collector.collect()
-
-    expect(collected.arms[0].baselineControlNsPerOp).toHaveLength(4)
-    expect(collected.arms[0].invocations[1]).toMatchObject({
-      pair: 0,
-      side: 'baselineControl',
-      error: expect.stringContaining('exit 1'),
-    })
-    expect(compare(completeInput(collected), NO_EXCEPTIONS).pass).toBe(true)
-    expect(runInput(completeInput(collected)).report).toContain('A/A baseline unavailable')
-  })
-
-  it('collector names an arm that neither tree has and leaves an arm one tree lacks incomplete', () => {
-    const lacking = (name, trees) => (cwd, argv) =>
-      argv.includes(name) && trees.includes(cwd) ? ok({ available: 0 }) : valueFor(cwd, argv)
-
-    const both = collect({ reply: lacking('zstd', ['OLD', 'NEW']) })
-    const bothResult = both.collector.collect()
-    expect(bothResult.unavailable).toEqual([OPTIONAL])
-    expect(bothResult.arms.map((arm) => arm.name)).not.toContain(OPTIONAL)
-    expect(both.calls.filter((call) => call.includes('zstd'))).toHaveLength(2)
-    expect(compare(completeInput(bothResult), NO_EXCEPTIONS).pass).toBe(true)
-
-    const one = collect({ reply: lacking('zstd', ['OLD']) })
-    const oneResult = one.collector.collect()
-    expect(oneResult.unavailable).toEqual([])
-    const zstd = oneResult.arms.find((arm) => arm.name === OPTIONAL)
-    expect(zstd.oldNsPerOp).toEqual([])
-    const result = compare(completeInput(oneResult), NO_EXCEPTIONS)
-    expect(result.pass).toBe(false)
-    expect(result.problems.join('\n')).toContain(`${OPTIONAL}: oldNsPerOp needs at least 5`)
-  })
-
-  it('collector fails on a benchmark that exits non-zero or prints no usable number', () => {
-    const failing = (reply) => collect({ reply: () => reply })
-
-    expect(() => failing({ status: 1, stdout: '', stderr: 'boom' }).collector.collect()).toThrow(
-      /frame-decode:64b failed in the old tree \(exit 1\)/
-    )
-    expect(() => failing({ status: 0, stdout: 'no json', stderr: '' }).collector.collect()).toThrow(
-      /printed no JSON line/
-    )
-    expect(() => failing(ok({ available: 1, nsPerFrame: 0 })).collector.collect()).toThrow(
-      /no usable nsPerFrame/
-    )
-    expect(() => failing(ok({ available: 1 })).collector.collect()).toThrow(/no usable/)
+    expect(await main(['--run'], () => {})).toBe(1)
+    expect(await main(['--input', '/nonexistent/input.json'], () => {})).toBe(1)
   })
 })
+
+/** @returns {object} collector driven by deterministic fake subprocess responses */
+const collectorFor = ({ missing = [], now = () => 0, advance = () => {} } = {}) => {
+  const calls = []
+  const saved = new Map()
+  const collector = new MeasurementCollector({
+    trees: { old: 'OLD', new: 'NEW' },
+    rawDir: 'raw',
+    seed: 42,
+    now,
+    save: (file, text) => {
+      if (file.endsWith('schedule.json')) expect(calls).toHaveLength(0)
+      saved.set(file, text)
+    },
+    run: async (cwd, argv, { timeoutMs }) => {
+      calls.push({ cwd, argv, timeoutMs })
+      advance()
+      const arm = ARMS.find((arm) => arm.argv.join(' ') === argv.join(' '))
+      const measurement =
+        argv.includes('zstd') && missing.includes(cwd)
+          ? { available: 0 }
+          : {
+              available: 1,
+              [arm.metric]: cwd === 'OLD' ? 100 : 101,
+              roundNsPerOp: Array(arm.name.startsWith('frame-') ? 7 : 5).fill(
+                cwd === 'OLD' ? 100 : 101
+              ),
+            }
+      return { status: 0, stdout: `${JSON.stringify(measurement)}\n`, stderr: '' }
+    },
+  })
+  return { collector, calls, saved }
+}

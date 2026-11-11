@@ -69,6 +69,39 @@ describe('Benchmarks > frameDecode', () => {
   })
 
   describe('a run', () => {
+    const originalGc = globalThis.gc
+    beforeEach(() => {
+      globalThis.gc = jest.fn()
+    })
+    afterEach(() => {
+      globalThis.gc = originalGc
+      jest.restoreAllMocks()
+    })
+
+    test('timed mode requires gc while the functional control does not', async () => {
+      delete globalThis.gc
+      await expect(timed('64b', 2)).rejects.toThrow(/gc/)
+      await expect(control('64b', 2)).resolves.toMatchObject({ pass: true })
+    })
+
+    test('discards three warmups and collects before each of seven measured intervals', async () => {
+      const events = []
+      globalThis.gc = jest.fn(() => events.push('gc'))
+      const clock = process.hrtime.bigint
+      jest.spyOn(process.hrtime, 'bigint').mockImplementation(() => {
+        events.push('time')
+        return clock()
+      })
+      const result = await timed('64b', 2)
+      expect(result.warmupRoundNsPerOp).toHaveLength(3)
+      expect(result.roundNsPerOp).toHaveLength(7)
+      expect(events).toEqual([
+        ...Array.from({ length: 10 }, () => ['gc', 'time', 'time']).flat(),
+        'gc',
+        'gc',
+      ])
+      expect(result.nsPerFrame).toBe([...result.roundNsPerOp].sort((a, b) => a - b)[3])
+    })
     test.each(Object.keys(SHAPES))(
       'times %s, and the control counts as many calls as frames fed',
       async (shape) => {
