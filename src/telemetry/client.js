@@ -665,6 +665,7 @@ module.exports = class ClientTelemetry {
 
   /**
    * Captures a distinct closing authority synchronously; no retry, setup or reconnect is allowed.
+   * The settled episode keeps its result but releases its retired handle and subscription.
    * @param {{deadline?:number,remaining?:Function,zero?:boolean}} budget original core remaining predicate
    * @returns {Promise<void>} one captured final within min1000ms/original remaining budget
    */
@@ -764,6 +765,8 @@ module.exports = class ClientTelemetry {
         this.clock.clearTimeout(timer)
         if (snapshot && !written) this.metrics.abandon(snapshot)
         if (old) await old.retire({ drainTimeout: 0 }).catch(() => {})
+        episode.handle = null
+        episode.subscription = null
         if (this.closing === episode) {
           this.payload.retire()
           try {
