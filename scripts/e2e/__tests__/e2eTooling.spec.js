@@ -1602,6 +1602,27 @@ describe('broker telemetry fixture', () => {
     expect(JSON.stringify(soak)).not.toContain('forceExit')
   })
 
+  test('covers all six live census lanes with capture and scalar companions', () => {
+    // eslint-disable-next-line n/no-extraneous-require -- YAML parser is pinned by the ESLint/Jest toolchain
+    const yaml = require('js-yaml')
+    const workflow = yaml.load(read('.github/workflows/memory-gates.yml').toString())
+    const census = workflow.jobs['live-owner-census']
+    expect(census.strategy).toEqual({
+      'fail-fast': false,
+      matrix: {
+        node: [22, 24, 26],
+        kafka: ['4.3.1', '4.2.2'],
+        variant: ['capture', 'scalar'],
+      },
+    })
+    expect(census.steps.at(-1).with.name).toBe(
+      'live-owner-census-$' +
+        '{{ matrix.kafka }}-node$' +
+        '{{ matrix.node }}-$' +
+        '{{ matrix.variant }}'
+    )
+  })
+
   test('wires the seeded live control as its own job whose records stay out of acceptance evidence', () => {
     // eslint-disable-next-line n/no-extraneous-require -- YAML parser is pinned by the ESLint/Jest toolchain
     const yaml = require('js-yaml')
