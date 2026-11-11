@@ -1247,6 +1247,132 @@ describe('telemetry profile oracles', () => {
   })
 })
 
+describe('telemetry rotation readback', () => {
+  const entries = { 'interval.ms': '1000', match: 'client_id=^s-.*$' }
+  const answer = (values) => ({
+    resources: [
+      {
+        resourceType: 16,
+        resourceName: 's',
+        errorCode: 0,
+        configEntries: Object.entries(values).map(([configName, configValue]) => ({
+          configName,
+          configValue,
+        })),
+      },
+    ],
+  })
+  const make = () => {
+    const admin = {
+      incrementalAlterConfigs: jest.fn(async () => answer({})),
+      describeConfigs: jest.fn(async () => answer({ metrics: 'com.example.', ...entries })),
+    }
+    const fixture = new ParentFixture({
+      stem: 's',
+      kafka: { admin: () => admin, producer: () => ({}) },
+      clock: { now: () => Date.now() },
+    })
+    return { fixture, admin }
+  }
+  beforeEach(() => jest.useFakeTimers({ now: 1000 }))
+  afterEach(() => jest.useRealTimers())
+
+  test('converges after a stale successful read and records attempts', async () => {
+    const { fixture, admin } = make()
+    admin.describeConfigs.mockResolvedValueOnce(
+      answer({ metrics: 'org.apache.kafka.', ...entries })
+    )
+    const result = fixture.rotate(1, 'com.example.', 300)
+    result.catch(() => {})
+    await jest.advanceTimersByTimeAsync(50)
+    await expect(result).resolves.toEqual({
+      index: 1,
+      selection: 'com.example.',
+      setAt: 1000,
+      readbackAt: 1050,
+      readback: 'com.example.',
+      readbackAttempts: 2,
+    })
+    expect(admin.describeConfigs).toHaveBeenCalledTimes(2)
+    expect(admin.describeConfigs).toHaveBeenLastCalledWith({
+      timeout: 250,
+      resources: [{ type: 16, name: 's', configNames: ['metrics', 'interval.ms', 'match'] }],
+    })
+    expect(jest.getTimerCount()).toBe(0)
+  })
+
+  test('fails API errors immediately without another read', async () => {
+    const transport = new Error('describe failed')
+    const failed = answer({ metrics: 'com.example.', ...entries })
+    failed.resources[0].errorCode = 42
+    for (const response of [transport, failed]) {
+      const { fixture, admin } = make()
+      if (response === transport) admin.describeConfigs.mockRejectedValueOnce(transport)
+      else admin.describeConfigs.mockResolvedValueOnce(response)
+      const result = fixture.rotate(1, 'com.example.', 300)
+      if (response === transport) await expect(result).rejects.toBe(transport)
+      else await expect(result).rejects.toThrow('Client metrics resource operation failed')
+      expect(Date.now()).toBe(1000)
+      expect(admin.describeConfigs).toHaveBeenCalledTimes(1)
+      expect(jest.getTimerCount()).toBe(0)
+    }
+  })
+
+  test('fails persistent mismatch at the original deadline with expected and observed values', async () => {
+    const { fixture, admin } = make()
+    admin.incrementalAlterConfigs.mockImplementationOnce(
+      () => new Promise((resolve) => setTimeout(() => resolve(answer({})), 75))
+    )
+    admin.describeConfigs.mockResolvedValueOnce(
+      answer({ metrics: 'org.apache.kafka.', ...entries })
+    )
+    let failure
+    const result = fixture.rotate(14, '', 300).catch((error) => {
+      failure = error
+    })
+    await jest.advanceTimersByTimeAsync(299)
+    expect(failure).toBeUndefined()
+    await jest.advanceTimersByTimeAsync(1)
+    await result
+    expect(failure).toBeInstanceOf(Error)
+    expect(failure.message).toBe(
+      'The subscription readback differs: ' +
+        JSON.stringify({
+          index: 14,
+          expected: { metrics: '', ...entries },
+          observed: { metrics: 'com.example.', ...entries },
+        })
+    )
+    expect(Date.now()).toBe(1300)
+    expect(admin.describeConfigs).toHaveBeenCalledTimes(5)
+    const attempts = admin.describeConfigs.mock.calls.length
+    await jest.advanceTimersByTimeAsync(500)
+    expect(admin.describeConfigs).toHaveBeenCalledTimes(attempts)
+    expect(jest.getTimerCount()).toBe(0)
+  })
+
+  test('compares empty metrics exactly without accepting missing or null values', async () => {
+    const { fixture, admin } = make()
+    admin.describeConfigs
+      .mockResolvedValueOnce(answer(entries))
+      .mockResolvedValueOnce(answer({ metrics: null, ...entries }))
+      .mockResolvedValueOnce(answer({ metrics: '', 'interval.ms': '999', match: entries.match }))
+      .mockResolvedValueOnce(answer({ metrics: '', 'interval.ms': '1000', match: 'foreign' }))
+      .mockResolvedValueOnce(answer({ metrics: '', ...entries }))
+    const result = fixture.rotate(2, '', 300)
+    result.catch(() => {})
+    await jest.advanceTimersByTimeAsync(200)
+    await expect(result).resolves.toMatchObject({
+      selection: '',
+      readback: '',
+      readbackAt: 1200,
+      readbackAttempts: 5,
+    })
+    expect(admin.describeConfigs).toHaveBeenCalledTimes(5)
+    expect(jest.getTimerCount()).toBe(0)
+  })
+})
+
 describe('telemetry profile ordinary work', () => {
   test('subscribes every owned worker suffix and excludes another run', async () => {
     let config
@@ -2438,8 +2564,8 @@ describe('telemetry profile parent', () => {
       ['lifecycle', 'retire', 'confirm'].flatMap((stage) => KINDS.map((kind) => `${kind}:${stage}`))
     )
     expect(fixture.rotate).toHaveBeenCalledTimes(35)
-    expect(fixture.rotate.mock.calls[0]).toEqual([1, 'com.example.'])
-    expect(fixture.rotate.mock.calls[1]).toEqual([2, ''])
+    expect(fixture.rotate.mock.calls[0]).toEqual([1, 'com.example.', 9000])
+    expect(fixture.rotate.mock.calls[1]).toEqual([2, '', 9000])
     const produce = calls.filter((c) => Array.isArray(c))
     expect(produce).toHaveLength(2 * 100)
     expect(produce[0][3] - timeline.epochAt).toBeGreaterThanOrEqual(60000)
@@ -2452,7 +2578,7 @@ describe('telemetry profile parent', () => {
   })
 
   test('joins all confirmation fences before rotating the subscription', async () => {
-    const { churn, fixture, processes, clock } = make()
+    const { churn, fixture, processes, clock, advance } = make()
     let releaseFence
     let fenceRequested
     const held = new Promise((resolve) => (releaseFence = resolve))
@@ -2483,8 +2609,10 @@ describe('telemetry profile parent', () => {
     )
     await Promise.race([requested, ticking])
     expect(fixture.rotate).not.toHaveBeenCalled()
+    advance(8500)
     releaseFence()
     await ticking
+    expect(fixture.rotate.mock.calls[0]).toEqual([1, 'com.example.', 1500])
     expect(processes.sent.filter((m) => m.type === 'confirm-fence')).toHaveLength(35 * KINDS.length)
   })
 
@@ -3480,6 +3608,26 @@ describe('telemetry churn coordinated stage replay', () => {
     expect(Object.keys(counts)).toEqual([...KINDS])
     for (const kind of KINDS)
       expect(counts[kind]).toEqual({ subscription: 30, retire: 10, reopen: 5 })
+  })
+
+  test('accepts a polled readback only before every worker release', () => {
+    const input = archive()
+    const rotation = input.archive.rotations[0]
+    rotation.readbackAt += 250
+    rotation.readbackAttempts = 6
+    for (const kind of KINDS) {
+      const row = input.archive.stages.find((r) => r.tick === rotation.tick && r.kind === kind)
+      row.releasedAt += 250
+      row.parentAt += 250
+      row.workerDoneAt += 250
+      input.archive.workers[kind].stages[0].doneAt += 250
+      input.archive.workers[kind].claims.transitions[0].releasedAt += 250
+    }
+    expect(verifyChurnStages(input).producer.subscription).toBe(30)
+    rotation.readbackAt += 2
+    expect(() => verifyChurnStages(input)).toThrow(
+      'The set and readback are outside their stage barrier'
+    )
   })
 
   test.each([
