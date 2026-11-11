@@ -17,14 +17,17 @@
  * Bonferroni median intervals use all 15 registered rows, including unavailable optional codecs.
  * A/A interval and median calibration and all three spreads determine validity. PASS requires
  * both the paired upper candidate bound and the unpaired median ratio at most 1.05. A valid lower
- * bound above 1.05 is REGRESSION; a failed median check is FAIL; otherwise INCONCLUSIVE. Invalid,
- * inconclusive, fail, regression and timeout all exit 1 for ordinary rows. D167 information-only
- * rows retain their verdicts but only a valid REGRESSION fails the gate; structural errors and
+ * bound above 1.05 is REGRESSION; a failed median check is FAIL; otherwise INCONCLUSIVE. D171
+ * accepts ordinary INVALID rows only for the named interval/spread noise problems when the
+ * unpaired median ratio is at most 1.05. Control-median calibration remains blocking. All other
+ * invalid, inconclusive, fail, regression and timeout results exit 1 for ordinary rows. D167/D168
+ * information-only rows retain their verdicts; valid FAIL or REGRESSION, structural errors and
  * timeouts still fail. Exceptions must remain empty.
  *
  * The summary holds { baselineSha, candidateSha, node, registeredRows, seed, schedule, arms,
  * unavailable, unavailableInvocations, timedOut, result }. The result records informationOnlyRows
- * with their reasons. Arms retain oldNsPerOp, newNsPerOp,
+ * with their reasons and noiseAcceptedRows naming strict rows accepted under D171.
+ * Arms retain oldNsPerOp, newNsPerOp,
  * baselineControlNsPerOp and invocations with explicit block and A/C/B side. The old unpaired
  * delta is printed as information only. Each partition has its own 25-minute deadline; no retries or
  * adaptive extension. A timeout kills the running subprocess group and preserves partial data.
@@ -46,6 +49,11 @@ const COLLECTION_DEADLINE_MS = 25 * 60 * 1000
 const MAX_RATIO = 1.05
 const MIN_CONTROL_RATIO = 0.95
 const MAX_SPREAD = 0.15
+/** Exact problem identities waived by D171; the separate unpaired C/A calibration is retained. */
+const NOISE_PROBLEMS = Object.freeze({
+  CONTROL_INTERVAL: 'A/A interval outside [0.95, 1.05]',
+  SPREAD: 'spread exceeds fifteen percent',
+})
 /** D167/D168 frame rows remain measured and reported; only noise is waived, a valid FAIL or regression still fails. */
 const INFORMATION_ONLY_ROWS = Object.freeze({
   'frame-decode:1m': 'D167: GitHub-hosted runner noise; A/A unstable and C as noisy as B.',
@@ -389,11 +397,11 @@ const judgeRow = (row) => {
   const spreads = { A: spread(A), C: spread(C), B: spread(B) }
   const problems = []
   if (controlInterval.lower < MIN_CONTROL_RATIO || controlInterval.upper > MAX_RATIO)
-    problems.push('A/A interval outside [0.95, 1.05]')
+    problems.push(NOISE_PROBLEMS.CONTROL_INTERVAL)
   if (!medianWithin(oldMedian, controlMedian) || controlMedian / oldMedian < MIN_CONTROL_RATIO)
     problems.push('A/A median outside five percent')
   if (Object.values(spreads).some((value) => value > MAX_SPREAD))
-    problems.push('spread exceeds fifteen percent')
+    problems.push(NOISE_PROBLEMS.SPREAD)
   let verdict = 'invalid'
   if (!problems.length) {
     if (ratioInterval.upper <= MAX_RATIO && medianWithin(oldMedian, newMedian)) verdict = 'pass'
@@ -419,16 +427,31 @@ const judgeRow = (row) => {
 const WAIVED_NOISE = Object.freeze(['invalid', 'inconclusive'])
 
 /**
- * @param {object} row computed row verdict; structural problems remain separate gate failures
- * @returns {boolean} PASS, or INVALID/INCONCLUSIVE on a D167 information-only row
+ * @param {object} row computed row verdict, problems and unpaired medians
+ * @returns {boolean} strict INVALID accepted only for D171 noise within the D164 median bound
  */
-const rowPassesGate = ({ name, verdict }) =>
-  verdict === 'pass' ||
-  (Object.hasOwn(INFORMATION_ONLY_ROWS, name) && WAIVED_NOISE.includes(verdict))
+const passesNoiseGate = ({ name, verdict, problems, oldMedian, newMedian }) =>
+  !Object.hasOwn(INFORMATION_ONLY_ROWS, name) &&
+  verdict === 'invalid' &&
+  Array.isArray(problems) &&
+  problems.length > 0 &&
+  problems.every((problem) => Object.values(NOISE_PROBLEMS).includes(problem)) &&
+  validSample(oldMedian) &&
+  validSample(newMedian) &&
+  medianWithin(oldMedian, newMedian)
+
+/**
+ * @param {object} row computed row verdict; structural problems remain separate gate failures
+ * @returns {boolean} PASS, D167/D168 information-only waiver, or D171 noise-only median acceptance
+ */
+const rowPassesGate = (row) =>
+  row.verdict === 'pass' ||
+  (Object.hasOwn(INFORMATION_ONLY_ROWS, row.name) && WAIVED_NOISE.includes(row.verdict)) ||
+  passesNoiseGate(row)
 
 /**
  * @param {*} input summary; live and offline use this same decision path
- * @returns {{ pass: boolean, problems: string[], unavailable: string[], arms: object[], informationOnlyRows: object }} gate verdict and D167 reasons
+ * @returns {{ pass: boolean, problems: string[], unavailable: string[], arms: object[], informationOnlyRows: object, noiseAcceptedRows: string[] }} gate verdict, D167/D168 reasons and D171 row acceptances
  */
 const compare = (input) => {
   const problems = validateInput(input)
@@ -443,6 +466,7 @@ const compare = (input) => {
     unavailable,
     arms,
     informationOnlyRows: INFORMATION_ONLY_ROWS,
+    noiseAcceptedRows: arms.filter(passesNoiseGate).map(({ name }) => name),
   }
 }
 
@@ -450,7 +474,7 @@ const compare = (input) => {
  * Combines exactly the three complete, disjoint partitions. Seeds and clocks are independent;
  * tree identities, Node version, registration and work must agree. No unavailable row is a PASS.
  * @param {object[]} inputs partition evidence files, in any order
- * @returns {ReturnType<typeof compare>} all fifteen verdicts, with D167 information-only treatment
+ * @returns {ReturnType<typeof compare>} all fifteen verdicts with D167/D168 and D171 treatment
  */
 const combine = (inputs) => {
   if (!Array.isArray(inputs))
@@ -460,6 +484,7 @@ const combine = (inputs) => {
       unavailable: [],
       arms: [],
       informationOnlyRows: INFORMATION_ONLY_ROWS,
+      noiseAcceptedRows: [],
     }
   const problems = []
   const seen = new Set()
@@ -492,6 +517,7 @@ const combine = (inputs) => {
     unavailable: results.flatMap((result) => result.unavailable),
     arms,
     informationOnlyRows: INFORMATION_ONLY_ROWS,
+    noiseAcceptedRows: arms.filter(passesNoiseGate).map(({ name }) => name),
   }
 }
 
@@ -500,7 +526,10 @@ const formatReport = ({ pass, problems, unavailable, arms }) =>
   [
     ...arms.map(
       (arm) =>
-        `${arm.verdict.toUpperCase().padEnd(13)}${String(arm.name).padEnd(29)}` +
+        (passesNoiseGate(arm)
+          ? 'INVALID (noise; median within 5%, D171) '
+          : arm.verdict.toUpperCase().padEnd(13)) +
+        `${String(arm.name).padEnd(29)}` +
         (Object.hasOwn(INFORMATION_ONLY_ROWS, arm.name) ? 'information only (D167)  ' : '') +
         (arm.ratioInterval
           ? `R [${arm.ratioInterval.lower.toFixed(4)}, ${arm.ratioInterval.upper.toFixed(4)}]  ` +
