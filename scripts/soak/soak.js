@@ -459,6 +459,19 @@ class TelemetryResourceVerdict {
   }
 
   /**
+   * The setup-peak allowance of one client kind: `TELEMETRY.setupPeakBytes`, plus for the share
+   * consumer the exact bytes of its declared, prefilled journals. The telemetry increase and
+   * absolute peak limits are the same for every kind and are never raised.
+   * @param {string} [kind] the client kind of the control reference
+   * @returns {number} allowed setup peak in bytes
+   */
+  static setupAllowance(kind) {
+    const { declaredJournalBytes } = require('./telemetryChurn')
+    const declared = kind === 'shareConsumer' ? declaredJournalBytes(kind, TELEMETRY) : 0
+    return TELEMETRY.setupPeakBytes + declared
+  }
+
+  /**
    * Validates one memory reading of the versioned catalogue: its phase, monotonic time, every
    * counter as a nonnegative safe integer, `retained = heapUsed + external` with `arrayBuffers`
    * inside `external` (never added again), and for a settled reading real collections admitted
@@ -601,7 +614,15 @@ class TelemetryResourceVerdict {
       inconclusive.push('unstable control')
     const peakOf = (list) => Math.max(...list.flatMap((r) => [r.hwm ?? 0, r.rss]))
     const setupPeak = peakOf(readings.slice(0, 5))
-    if (setupPeak > TELEMETRY.setupPeakBytes) inconclusive.push('setup peak above its allowance')
+    const share = control.kind === 'shareConsumer'
+    const allowance = TelemetryResourceVerdict.setupAllowance(control.kind)
+    const recorded = reference.journals?.setupAllowanceBytes
+    fail(recorded === allowance || (recorded === undefined && !share), 'recorded setup allowance')
+    fail(
+      !share || reference.journals?.allocation?.byteLength === allowance - TELEMETRY.setupPeakBytes,
+      'declared journal bytes'
+    )
+    if (setupPeak > allowance) inconclusive.push('setup peak above its allowance')
     const base = Math.min(control.c0.rss, control.c1.rss)
     const externalReference = Math.min(control.c0.external, control.c1.external)
     const sampled = native?.sampler?.peak ?? { rss: 0, external: 0 }
@@ -619,6 +640,7 @@ class TelemetryResourceVerdict {
       controlBaseRss: base,
       controlExternal: externalReference,
       setupPeak,
+      setupAllowanceBytes: allowance,
       peak,
       rssDelta: peak - base,
       externalPeak,

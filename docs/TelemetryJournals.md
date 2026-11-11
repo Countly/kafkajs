@@ -14,6 +14,16 @@ The fixed workload needs fewer than 64 labels (lifecycle names, group, topic ide
 decision types and error names/reasons). Row, byte or label exhaustion fails the run, including
 when an outer workload catches the exception. Storage never grows, wraps or overwrites.
 
+The share journals use the packed layout (`share-packed-1`). A lower-case 64-character SHA-256
+string in `requestSha256` or `responseSha256` is stored as 32 raw bytes, and a canonical decimal
+int64 string in `firstOffset` or `lastOffset` (an optional leading `-`, no leading zeros, no `-0`,
+inside the int64 range) as 8 raw bytes. Every other value keeps its ordinary lossless encoding:
+upper-case or wrong-length hex, an out-of-range or non-canonical offset text, a number, `null`, a
+missing field or a lone surrogate. Each fact therefore decodes to exactly what was pushed, and an
+archive cannot differ from the one the legacy columns layout (`share-columns-utf8-1`, kept as the
+exactness oracle) decodes. Text that cannot be packed costs more than its reserve and overflows
+fatally; it is never truncated.
+
 ## Capacity derivation
 
 These are bounds on the fixed workload, not averages measured from an archive:
@@ -30,23 +40,28 @@ These are bounds on the fixed workload, not averages measured from an archive:
   no renewals. With a reopen every 60,000 ms, reserve 3 × (ceil(540,000 / 60,000) + 2) = 33
   session episodes, including setup/close margin, and four opening/final/reset exchanges per
   episode (132). The exchange row bound is therefore 32,400 + 22,000 + 132 = **54,532**.
-- Headers reserve 256 bytes each: ordinal/socket/API/version/correlation scalars, exact request
-  and response clocks, two 64-character SHA-256 strings, schema/array prefixes and label-slot
-  indices. The full maximum header occupies at most 242 bytes with int32 identifiers; the
-  remainder is explicit shape margin. SHA strings stay UTF-8, not truncated fingerprints.
+- Every reserve below is the proved worst-case encoded size of its row in the packed layout,
+  rounded up to a multiple of 16.
+- Headers reserve 176 bytes each: ordinal/socket/API/version/correlation scalars, exact request
+  and response clocks, two raw 32-byte SHA-256 digests, schema/array prefixes and label-slot
+  indices. The full maximum header occupies at most 167 bytes with int32 identifiers; the
+  remainder is explicit shape margin. Digests are whole 32-byte values, never truncated
+  fingerprints.
 - The maximum topic shape is one topic and three partitions. At a paced empty-round boundary,
   the node assignments together contain at most three partitions, already counted by the three
   node rounds above. Every other exchange may name all three. Reserve 80 bytes per request/response
   partition pair: 32,400 + 3 × (22,000 + 132) = **98,796 pairs**. Field codes, topic label indices,
-  partition/status scalars and empty batch/range array prefixes fit within that bound.
+  partition/status scalars and empty batch/range array prefixes fit within that bound (72 bytes at
+  most, with each pair's own topic wrappers).
 - Acquired and acknowledgement ranges may each split down to one range per record, with a
-  separate acknowledgement type per record. Reserve **128 bytes per record operation** for both
-  sides together, including signed int64 offset strings (up to 20 characters), delivery count,
-  type elements and range prefixes. A node response can contain up to 500 acquired records; the
-  global record budget covers those ranges regardless of their batching or partition distribution.
-- Public acknowledgement rows reserve 192 bytes each for topic/type/error label indices,
-  partition, two signed int64 offsets, clock and schema prefixes. Even the error-bearing shape
-  fits with margin.
+  separate acknowledgement type per record. Reserve **64 bytes per record operation** for both
+  sides together: an acquired range with two 8-byte int64 offsets and a delivery count (29 bytes)
+  and an acknowledgement batch with two offsets and one type element (34 bytes), 63 in all. A node
+  response can contain up to 500 acquired records; the global record budget covers those ranges
+  regardless of their batching or partition distribution.
+- Public acknowledgement rows reserve 80 bytes each for topic/type/error label indices,
+  partition, two 8-byte int64 offsets, clock and schema prefixes. The error-bearing shape, the
+  largest, takes 67.
 - Ordinary commit/pause receipts reserve 2 × (ceil(540,000 / 60,000) + 3) = 24 rows per journal;
   the extra episodes cover initial/final receipts. The existing 256-byte receipt row, 65,536-byte
   sample reserve and 1,024 native/pending-window rows remain conservative fixed envelopes.
@@ -60,27 +75,44 @@ These are bounds on the fixed workload, not averages measured from an archive:
 | Native compression journal | 1,024 × 2,048 | 2,097,152 |
 | Pending native windows | 1,024 × 256 | 262,144 |
 | Memory samples | (11 + 4) × 65,536 | 983,040 |
-| Share exchanges | 54,532 × 256 + 98,796 × 80 + 11,000 × 128 + 16,384 label bytes | 23,288,256 |
-| Share public acknowledgements | 11,000 × 192 + 16,384 label bytes | 2,128,384 |
+| Share exchanges | 54,532 × 176 + 98,796 × 80 + 11,000 × 64 + 16,384 label bytes | 18,221,696 |
+| Share public acknowledgements | 11,000 × 80 + 16,384 label bytes | 896,384 |
 | **Producer / consumer / admin total before c0** | Ordinary + native + windows + samples | **4,070,384** |
-| **ShareConsumer total before c0** | All owners | **29,487,024** |
+| **ShareConsumer total before c0** | All owners | **23,188,464** |
 
-Previously the ordinary reserve was 1,405,840 bytes and the share reserve 29,573,120 bytes,
-allocated after the disabled control. The new ordinary reserve is 728,048 bytes and the new share
-reserve 25,416,640 bytes. The exchange arena grows to cover the corrected count bound; the much
-smaller acknowledgement and ordinary reserves reduce total share-worker storage by **4,834,272
-bytes (4.61 MiB)**. All 29,487,024 bytes now count toward the 96 MiB setup and 160 MiB absolute
-allowances. Moving the allocation changes the disabled RSS baseline; it is explicitly disclosed,
-not a subtraction from the 64 MiB delta verdict.
+Before packing the share reserve was 25,416,640 bytes (23,288,256 exchanges, 2,128,384
+acknowledgements) and the share worker declared 29,487,024 bytes; the ordinary reserve is 728,048
+bytes. The packed layout lowers the share reserve to 19,118,080 bytes and the share worker to
+**23,188,464 bytes**, **6,298,560 bytes (6.01 MiB, 21.4%)** less, without shrinking any row bound
+from observed traffic: each reserve is derived from the worst case of the new encoding. The
+producer, consumer and admin workers are unchanged at 4,070,384 bytes. All declared bytes are
+allocated and touched before `c0`; moving the allocation changes the disabled RSS baseline, which
+is disclosed, not a subtraction from the 64 MiB delta verdict.
+
+## Setup allowance of the share consumer
+
+All declared journal bytes count toward the baseline, the setup peak and the 160 MiB absolute
+peak. The share consumer's setup allowance is **96 MiB plus its declared journal bytes**,
+100,663,296 + 23,188,464 = 123,851,760 bytes (118.11 MiB); every other kind keeps 96 MiB. The
+64 MiB increase over the control and the 160 MiB absolute peak are unchanged for every kind.
+The broker-free resource lane keeps its own unchanged 96 MiB allowance.
+
+The extra allowance is an exact constant, never a measurement: `declaredJournalBytes(kind)` sums
+the allocations that the journal limits imply. The worker records it as
+`journals.setupAllowanceBytes` beside the allocation it made, and the verdict stores it as
+`measured.setupAllowanceBytes`. The verdict and the artifact validator, which re-evaluates every
+recorded input, recompute the allowance from the kind and fail the run when the recorded
+allowance, or the recorded share allocation, differs from the recomputed bytes.
 
 ## Predictions, not acceptance results
 
 The following arithmetic uses the Node 22 / Kafka 4.2.2 H2 archive from CI run 42988230730,
-head `7fca0ccf`. Assume fully resident buffers and identical non-journal memory: add the new
-ordinary/share reserve to the control and setup peak; change the absolute peak by new minus old
-ordinary/share storage. Native/windows/sample storage was already present before the control.
-The resulting delta is the old delta minus the old after-control reserve. This model does not
-predict allocator, GC or compilation effects and does not establish a passing run.
+head `7fca0ccf`, for the reserves before packing. Assume fully resident buffers and identical
+non-journal memory: add the new ordinary/share reserve to the control and setup peak; change the
+absolute peak by new minus old ordinary/share storage. Native/windows/sample storage was already
+present before the control. The resulting delta is the old delta minus the old after-control
+reserve. This model does not predict allocator, GC or compilation effects and does not establish
+a passing run.
 
 | Worker | Headroom against 64 MiB delta | Headroom against 96 MiB setup | Headroom against 160 MiB absolute |
 | --- | ---: | ---: | ---: |
@@ -90,17 +122,29 @@ predict allocator, GC or compilation effects and does not establish a passing ru
 | ShareConsumer | −6.29 MiB | −10.62 MiB | −15.59 MiB |
 
 Negative headroom predicts an overage. Consumer RSS remains a separate pre-existing concern.
-The share journal change alone is not predicted to clear its RSS gates; preallocation also raises
-its setup peak. The closed-transient verdict is outside this storage fix. Fresh CI evidence must
-judge all unchanged limits.
+Under the same model the packed share layout lowers the share worker's setup and absolute peaks by
+its 6,298,560 bytes (6.01 MiB) and leaves its delta unchanged, because the reserve precedes
+`c0`. Against the 160 MiB absolute peak the share headroom becomes −9.58 MiB, so packing alone is
+not predicted to clear that gate. Against its own setup allowance (96 MiB plus the declared bytes)
+the headroom is 17.50 MiB, whatever the declared size, since the allowance moves with the
+reserve. The closed-transient verdict is outside this storage fix. Fresh CI evidence must judge
+all unchanged limits.
 
 ## Regression controls
 
 `telemetryJournals.spec.js` replays full identities and share facts against the independent array
 reference, preserves UTF-8/lone-surrogate strings, checks exact numeric boundaries, fixed capacity,
-atomic overflow and duplicate/invalid bitmap IDs. `telemetryChurn.spec.js` injects missing,
-duplicate, reordered and wrong-timestamp decoded journal facts into the archive read by the
-production evidence verifier, keeping an unmodified journal archive positive case.
+atomic overflow and duplicate/invalid bitmap IDs. It also decodes the legacy columns layout and
+the packed layout of the same edge-case facts (digest and offset fallbacks, UTF-16, fractional
+times, missing fields, errors, duplicates) to identical archives, proves the worst-case size of
+every share row against its reserve, drives every dimension (rows, bytes, label slots, text that
+cannot be packed) to an overflow that stays recorded when the caller catches it, and checks that
+`declaredJournalBytes` equals the bytes each worker allocates and fills. `soak.spec.js` checks
+the share setup allowance, that other kinds and the 64 MiB and 160 MiB limits are unchanged, and
+that a recorded allowance or allocation that differs from the recomputed value fails the verdict.
+`telemetryChurn.spec.js` injects missing, duplicate, reordered and wrong-timestamp decoded
+journal facts into the archive read by the production evidence verifier, keeping an unmodified
+journal archive positive case.
 
 The controls have two layers. Fast unit discovery uses deterministic virtual-time journal replay
 for exact IDs, facts, exchange hashes, overflow and malformed archive cases, and seeded evaluator
