@@ -1347,6 +1347,10 @@ describe('broker telemetry fixture', () => {
     // eslint-disable-next-line n/no-extraneous-require -- YAML parser is pinned by the ESLint/Jest toolchain
     const yaml = require('js-yaml')
     const workflow = yaml.load(read('.github/workflows/memory-gates.yml').toString())
+    for (const job of Object.values(workflow.jobs)) {
+      if (!job.uses) expect(job['timeout-minutes']).toBeDefined()
+      for (const step of job.steps ?? []) expect(step.run ?? '').not.toContain('$' + '{{')
+    }
     expect(workflow.on).toHaveProperty('workflow_dispatch')
     expect(workflow.on.pull_request.types).toEqual([
       'opened',
@@ -1473,7 +1477,7 @@ describe('broker telemetry fixture', () => {
       'Measure single-client memory alone on the idle runner',
       'Validate the recorded measurements for this tree and Node',
       'Compare journal ownership and real-time retained sensitivity serially',
-      'actions/upload-artifact@v4',
+      'Upload resource and calibration evidence',
     ])
     const memory = resources.steps.find((step) => step.name?.startsWith('Measure'))
     expect(memory.env.TELEMETRY_RESOURCES_QUIET).toBe('1')

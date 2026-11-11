@@ -425,9 +425,11 @@ describe('required memory gate composition', () => {
     expect(jobs.verdict).toContain("job.result !== 'success'")
     expect(jobs['share-soak']).toContain('profile: short, jobMinutes: 55, parentMinutes: 35')
     expect(jobs['share-soak']).toContain('profile: full, jobMinutes: 71, parentMinutes: 51')
+    expect(jobs['share-soak']).toContain('node scripts/ci/shareSoakJob.js freeze "$SOAK_PROFILE"')
     expect(jobs['share-soak-verify']).toContain('profile: [short, full]')
     expect(jobs['share-soak-verdict']).toContain('needs: [share-soak, share-soak-verify]')
     expect(jobs.resources).toContain('node: [22, 24, 26]')
+    expect(jobs.resources).toContain('    timeout-minutes: 105')
     expect(jobs.resources).toContain(
       '- name: Upload resource and calibration evidence\n' +
         '        if: always()\n' +

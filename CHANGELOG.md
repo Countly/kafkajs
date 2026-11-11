@@ -80,6 +80,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 #### Fixes
 
 - Release completed request scopes from connection ordering tails on settlement and generation close, and drop cleared request-timeout interval handles. Preserve request order and reconnect fencing.
+- Release disposed telemetry wire observer callbacks and frame parsers while retaining complete wire and cleanup evidence; flush serial calibration child artifacts and always upload resource diagnostics.
 - Release a closed client telemetry connection and its frame buffer once the final telemetry push has settled.
 - A consumer that stops while an in-flight heartbeat loses the coordinator now still leaves its group (classic and consumer protocol): a coordinator rediscovered by the final offset commit is kept for the leave, without restarting heartbeats after stop. Previously the leave was skipped and the group waited a full session timeout (a regression from an earlier 3.0.0 pre-release). Coordinator recovery from a stale offset commit cannot overwrite the coordinator of a replacement membership.
 

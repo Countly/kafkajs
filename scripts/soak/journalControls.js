@@ -47,8 +47,8 @@ const run = (directory) => {
         maxBuffer: 16 * 1024 * 1024,
       }
     )
-    fs.writeFileSync(path.join(directory, `${name}.json`), result.stdout || '{}')
-    fs.writeFileSync(path.join(directory, `${name}.stderr`), result.stderr || '')
+    fs.writeFileSync(path.join(directory, `${name}.json`), result.stdout || '{}', { flush: true })
+    fs.writeFileSync(path.join(directory, `${name}.stderr`), result.stderr || '', { flush: true })
     if (result.error) throw result.error
     assert.equal(result.status, 0, `${name}: unsuccessful child exit (${result.signal})`)
     return JSON.parse(result.stdout)

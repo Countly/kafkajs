@@ -1253,6 +1253,11 @@ describe('telemetry wire observer', () => {
     await observer.dispose()
     expect(() => observer.assertFunctional()).not.toThrow()
     expect(() => observer.assertClean()).toThrow('Observed client socket 1 is still open')
+    expect(observer.openSockets()).toBe(1)
+    let closed = false
+    observer.socketsClosed().then(() => (closed = true))
+    await Promise.resolve()
+    expect(closed).toBe(false)
   })
 
   test('functional cleanup still fails a latched sink sequence error', async () => {

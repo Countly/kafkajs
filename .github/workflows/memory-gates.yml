@@ -64,9 +64,11 @@ jobs:
         timeout-minutes: 4
       - name: Freeze contract and start owned cold base cluster
         timeout-minutes: 4
+        env:
+          SOAK_PROFILE: ${{ matrix.profile }}
         run: |
           mkdir -p .tmp/e2e
-          node scripts/ci/shareSoakJob.js freeze ${{ matrix.profile }}
+          node scripts/ci/shareSoakJob.js freeze "$SOAK_PROFILE"
           node scripts/ci/shareSoakJob.js startup
       - name: Run share soak (natural exit)
         if: matrix.profile == 'short'
@@ -224,7 +226,9 @@ jobs:
         if: always()
         timeout-minutes: 85
         run: timeout -k 10s 5000s node scripts/soak/journalControls.js "$TELEMETRY_RESOURCES_ARTIFACT_DIR/journal-controls" || exit 1
-      - if: always()
+      - name: Upload resource and calibration evidence
+        if: always()
+        timeout-minutes: 2
         uses: actions/upload-artifact@v4
         with:
           name: resources-node${{ matrix.node }}

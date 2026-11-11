@@ -896,9 +896,16 @@ class TelemetryWireObserver {
     return [...this.#sockets.values()].filter((state) => !state.closed).length
   }
 
-  /** @returns {Promise<void>} once every socket issued so far has closed */
+  /**
+   * After disposal, an unclosed socket remains an unresolved cleanup failure.
+   * @returns {Promise<void>} once every socket issued so far has closed
+   */
   async socketsClosed() {
-    await Promise.all([...this.#sockets.values()].map((state) => state.closedPromise))
+    await Promise.all(
+      [...this.#sockets.values()].map(
+        (state) => state.closedPromise ?? (state.closed ? undefined : new Promise(() => {}))
+      )
+    )
   }
 
   /**
@@ -1239,7 +1246,8 @@ class TelemetryWireObserver {
 
   /**
    * Detaches every listener and write wrapper, joins decoder children and cancels retry timers.
-   * It never destroys a client socket: surviving sockets are retained in the resource ledger.
+   * It never destroys a client socket: surviving socket identities stay in the resource ledger.
+   * Retains scalar evidence only, releasing socket callbacks and frame parsers after detachment.
    * Idempotent; later calls return the first disposal.
    * @returns {Promise<void>} when no owned child, timer or listener remains
    */
@@ -1698,11 +1706,22 @@ class TelemetryWireObserver {
     this.#timers.clear()
     for (const child of this.#children) this.#signalGroup(child.pid, 'SIGTERM')
     await Promise.allSettled([...this.#children].map((child) => child.done))
-    for (const state of this.#sockets.values()) {
+    for (const [id, state] of this.#sockets) {
       if (!state.closed) {
         this.#stillOpen.push(state.id)
       }
       state.detach()
+      this.#sockets.set(id, {
+        id,
+        port: state.port,
+        node: state.node,
+        kind: state.kind,
+        closed: state.closed,
+        closedAt: state.closedAt,
+        attached: false,
+        foregroundBootstrap: state.foregroundBootstrap,
+        ranges: state.ranges,
+      })
     }
     try {
       fs.writeFileSync(

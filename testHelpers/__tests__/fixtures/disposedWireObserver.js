@@ -68,11 +68,14 @@ const facts = (observer) => ({
  */
 const prepare = async (directory) => {
   const stimulus = JSON.parse(fs.readFileSync(path.join(directory, 'stimulus.json')))
+  const timing = clock()
+  const closedAt = new Map()
+  const faults = []
   const observer = new TelemetryWireObserver({
     directory,
     line: '4.3.1',
     owner: 'retired-client',
-    clock: clock(),
+    clock: timing,
     dial,
     completeStream: true,
     decoder: decode,
@@ -97,6 +100,8 @@ const prepare = async (directory) => {
     })
     await connection.connect()
     const socket = connection.socket
+    const id = connections.length + 1
+    socket.inner.once('close', () => closedAt.set(id, timing.tick))
     refs.push(...[socket.inner, socket, connection].map((value) => new WeakRef(value)))
     // Responses bypass the product parser because these are observer-only wire vectors.
     socket.removeAllListeners('data')
@@ -105,7 +110,8 @@ const prepare = async (directory) => {
       if (response) socket.inner.emit('data', Buffer.from(response, 'hex'))
     }
     if (arm.fault) {
-      observer.declareFault(connections.length + 1)
+      faults.push({ socketId: id, at: timing.tick + 1 })
+      observer.declareFault(id)
       socket.write(Buffer.from(arm.fault, 'hex'))
       await connection.disconnect()
     }
@@ -119,11 +125,13 @@ const prepare = async (directory) => {
   const generation = new Generation()
   const terminal = Object.assign(new Error('client closed'), { observer })
   generation.close(terminal)
+  const at = timing.tick + 1
   await observer.closeClient({
     disconnect: async () => {
       for (const connection of connections) await connection.disconnect()
     },
   })
+  const end = timing.tick
   await observer.socketsClosed()
   await observer.dispose()
   const after = JSON.stringify(facts(observer))
@@ -136,6 +144,58 @@ const prepare = async (directory) => {
     decoded
   )
   const archive = fs.readFileSync(path.join(observer.directory, 'transcript.json'), 'utf8')
+  const pending = observer.subscriptions().find((row) => row.socketId === 3)
+  const faulted = observer
+    .readTranscript()
+    .find((row) => row.socketId === 2 && !row.response && row.type === 'request')
+  assert.equal(
+    archive,
+    JSON.stringify({
+      owner: 'retired-client',
+      closures: [{ at, pending: [pending.requestKey], end }],
+      faults,
+      cancellations: [
+        {
+          requestKey: faulted.requestKey,
+          apiKey: 72,
+          socketId: 2,
+          writeAt: faulted.writeAt,
+          at: faults[0].at,
+          end: closedAt.get(2),
+          disposition: 'faulted-transport',
+        },
+        {
+          requestKey: pending.requestKey,
+          apiKey: 71,
+          socketId: 3,
+          writeAt: pending.writeAt,
+          at,
+          end: closedAt.get(3),
+          disposition: 'close-in-flight',
+        },
+      ],
+      records: JSON.parse(before).transcript,
+      sockets: [
+        { id: 1, kind: 'normal', node: '1', foregroundBootstrap: true, closedAt: closedAt.get(1) },
+        {
+          id: 2,
+          kind: 'telemetry',
+          node: '2',
+          foregroundBootstrap: false,
+          closedAt: closedAt.get(2),
+        },
+        {
+          id: 3,
+          kind: 'telemetry',
+          node: '3',
+          foregroundBootstrap: false,
+          closedAt: closedAt.get(3),
+        },
+      ],
+      cleanup: { children: 0, timers: 0, stillOpen: [], attached: 0 },
+      failures: [],
+    })
+  )
   for (const ref of refs.filter((_, index) => index % 3 === 0)) {
     const socket = ref.deref()
     assert.equal(socket.listenerCount('data'), 1)
@@ -182,6 +242,7 @@ const run = async (directory) => {
     fs.readFileSync(path.join(retained.observer.directory, 'transcript.json'), 'utf8'),
     retained.archive
   )
+  retained.observer.assertHealthy()
   retained.observer.assertClean({ allowUnanswered: retained.observer.cancellationKeys() })
   await retained.observer.socketsClosed()
   process.stdout.write(
