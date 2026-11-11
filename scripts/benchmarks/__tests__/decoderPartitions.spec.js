@@ -119,11 +119,13 @@ describe('Decoder measurement partitions', () => {
   it('freezes exactly the five D167 and D168 frame rows as information only with hosted-runner noise reasons', () => {
     expect(Object.keys(INFORMATION_ONLY_ROWS)).toEqual(D167_ROWS)
     expect(Object.isFrozen(INFORMATION_ONLY_ROWS)).toBe(true)
-    for (const reason of Object.values(INFORMATION_ONLY_ROWS)) {
+    for (const [name, reason] of Object.entries(INFORMATION_ONLY_ROWS)) {
       expect(reason).toMatch(/D167/)
       expect(reason).toMatch(/GitHub-hosted/)
       expect(reason).toMatch(/A\/A unstable/)
-      expect(reason).toMatch(/C as noisy as B/)
+      if (['frame-decode:64k', 'frame-decode:byte-chunks'].includes(name))
+        expect(reason).toMatch(/^D168 \(extends D167\)/)
+      else expect(reason).toMatch(/C as noisy as B/)
     }
   })
 

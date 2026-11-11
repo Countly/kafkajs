@@ -120,12 +120,15 @@ describe('Decoder performance comparison', () => {
   })
 
   it('an interval straddling five percent is inconclusive and no exception rescues it', async () => {
-    const arm = row(FIRST, constant(100), [...Array(23).fill(100), ...Array(7).fill(106)])
+    const ordinary = 'record-batch:uncompressed'
+    const arm = row(ordinary, constant(100), [...Array(23).fill(100), ...Array(7).fill(106)])
     expect(resultOf(arm).verdict).toBe('inconclusive')
-    expect(compare(withRow(arm), new Map([[FIRST, { maxSlowdownPercent: 1000 }]])).pass).toBe(false)
+    expect(compare(withRow(arm), new Map([[ordinary, { maxSlowdownPercent: 1000 }]])).pass).toBe(
+      false
+    )
     expect((await runInput(withRow(arm))).status).toBe(1)
     expect(() =>
-      parseExceptions([{ arm: FIRST, maxSlowdownPercent: 1000, ruling: 'test' }])
+      parseExceptions([{ arm: ordinary, maxSlowdownPercent: 1000, ruling: 'test' }])
     ).toThrow(/empty/)
     expect(parseExceptions([]).size).toBe(0)
     expect(JSON.parse(fs.readFileSync(require.resolve('../decoderBoundsExceptions.json')))).toEqual(
