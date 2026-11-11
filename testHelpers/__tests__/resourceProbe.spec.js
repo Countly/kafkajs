@@ -1736,6 +1736,41 @@ describe('resource artifact validation', () => {
       expect(judged('collector', (r) => (r.manifest.seed = null))).toEqual(PASS)
     })
 
+    test.each(ARMS)(
+      'reports the closed ceiling and seed rejection for a valid seeded %s record',
+      (arm) => {
+        expect(
+          judged(arm, (r) => {
+            r.manifest.seed = { mode: 'close', closeBytes: 131072, warmupBytes: 1048577 }
+            grow(r.closed, r.matched, LIMITS.closedTransient + 1)
+          })
+        ).toEqual({
+          verdict: 'fail',
+          problems: [CLOSED, 'seeded control is not acceptance evidence'],
+        })
+      }
+    )
+
+    test('reports structural failures as well as the seeded-control rejection', () => {
+      const result = judged('public', (r) => {
+        r.manifest.seed = { mode: 'close' }
+        delete r.warmup
+      })
+      expect(result.verdict).toBe('fail')
+      expect(result.problems).toContain('warm-up readings are missing')
+      expect(result.problems).toContain('seeded control is not acceptance evidence')
+    })
+
+    test('rejects a seeded control even when GC is unavailable', () => {
+      const result = judged('public', (r) => {
+        r.manifest.seed = { mode: 'close' }
+        r.manifest.gc.available = false
+      })
+      expect(result.verdict).toBe('fail')
+      expect(result.problems).toContain('real exposed GC is unavailable')
+      expect(result.problems).toContain('seeded control is not acceptance evidence')
+    })
+
     test('keeps the active retained gate on raw bytes: code growth is not subtracted from it', () => {
       const result = judged('public', (r) => {
         grow(r.actives[0], r.matched, LIMITS.retained - 1, MIB)
@@ -2505,6 +2540,33 @@ describe('resource artifact validation', () => {
       const checked = validateResourceArtifacts(directory, { tree: TREE, node: NODE })
       expect(checked.results).toHaveLength(8)
       expect(checked.ok).toBe(true)
+    })
+
+    test('rejects seeded artifacts for every arm and kind, with or without exposed GC', () => {
+      for (const available of [true, false]) {
+        for (const arm of ARMS)
+          for (const kind of KINDS) {
+            writeAll()
+            const seeded = record(arm, kind)
+            seeded.readings.manifest.seed = { mode: 'close' }
+            seeded.readings.manifest.gc.available = available
+            write(arm, kind, seeded)
+
+            const checked = validateResourceArtifacts(directory, { tree: TREE, node: NODE })
+            expect(checked.ok).toBe(false)
+            expect(checked.results.filter((result) => result.verdict !== 'pass')).toEqual([
+              {
+                arm,
+                kind,
+                verdict: 'fail',
+                problems: [
+                  'seeded control is not acceptance evidence',
+                  ...(!available ? ['real exposed GC is unavailable'] : []),
+                ],
+              },
+            ])
+          }
+      }
     })
 
     test('fails a missing kind even when the rest pass', () => {
