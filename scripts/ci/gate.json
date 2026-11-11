@@ -99,6 +99,11 @@
       "needs": {},
       "evidence": [],
       "titles": [
+        "scripts/e2e/telemetry/__tests__/retainedCensus.spec.js \u203a owner census counts shared stores and retained product self bytes once",
+        "scripts/e2e/telemetry/__tests__/retainedCensus.spec.js \u203a owner census reports released allocations and absolute unresolved additions and removals",
+        "scripts/e2e/telemetry/__tests__/retainedCensus.spec.js \u203a live owner census keeps diagnostic flags and captures original M first last and closed only",
+        "scripts/e2e/telemetry/__tests__/retainedCensus.spec.js \u203a prepared ephemeron removals preserve AND dependencies without rebuilding indexes",
+        "scripts/e2e/telemetry/__tests__/retainedCensus.spec.js \u203a shared cyclic audits preserve every root target and trace without repeated graph traversal",
         "scripts/ci/__tests__/resourceReporter.spec.js \u203a resource measurement reporter uses only the timer-free reporter in measured package commands",
         "scripts/ci/__tests__/resourceReporter.spec.js \u203a resource measurement reporter propagates the timer-free reporter through guarded telemetry and share commands",
         "scripts/ci/__tests__/resourceReporter.spec.js \u203a resource measurement reporter selects only the timer-free reporter when the guard environment requests it",
