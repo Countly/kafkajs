@@ -82,6 +82,7 @@ const prepare = async (directory) => {
   })
   const connections = []
   const refs = []
+  const listeners = []
   for (const arm of stimulus) {
     const connection = new Connection({
       host: 'localhost',
@@ -89,7 +90,17 @@ const prepare = async (directory) => {
       logger: logger(),
       socketFactory: ({ onConnect, ...endpoint }) => {
         const inner = observer.socketFactory(endpoint)
+        const observed = Object.fromEntries(
+          ['data', 'connect', 'close'].map((event) => [event, inner.listeners(event)])
+        )
         const chaos = new ChaosSocket(inner, endpoint, () => 0.5)
+        const forwarding = Object.fromEntries(
+          ['data', 'connect', 'close', 'error'].map((event) => [
+            event,
+            inner.listeners(event).at(-1),
+          ])
+        )
+        listeners.push({ socket: inner, observed, forwarding })
         inner.once('connect', onConnect)
         setImmediate(() => inner.emit('connect'))
         return chaos
@@ -196,11 +207,19 @@ const prepare = async (directory) => {
       failures: [],
     })
   )
-  for (const ref of refs.filter((_, index) => index % 3 === 0)) {
-    const socket = ref.deref()
-    assert.equal(socket.listenerCount('data'), 1)
-    assert.equal(socket.listenerCount('connect'), 1)
-    assert.equal(socket.listenerCount('close'), 1)
+  for (const { socket, observed, forwarding } of listeners) {
+    for (const [event, handlers] of Object.entries(observed)) {
+      for (const handler of handlers) assert(!socket.listeners(event).includes(handler))
+    }
+    for (const event of ['data', 'close', 'error']) {
+      assert.deepEqual(socket.listeners(event), [forwarding[event]])
+    }
+    // With no native handle, net.Socket._read re-arms itself during the synthetic connect.
+    const readOnConnect = socket
+      .listeners('connect')
+      .find((handler) => handler !== forwarding.connect)
+    assert.equal(readOnConnect?.toString(), '() => this._read(n)')
+    assert.deepEqual(socket.listeners('connect'), [forwarding.connect, readOnConnect])
     assert.doesNotThrow(() => socket.emit('error', new Error('late reset')))
   }
   return { observer, generation, terminal, refs, after, archive, decoded }
