@@ -53,6 +53,23 @@ const readBody = (decoder) => {
   return value
 }
 
+/** @param {Decoder} decoder Response reader. @returns {object} Literal response fields. @throws {Error} Truncated fields or tags. */
+const readTopicPartitions = (decoder) => {
+  const value = {
+    topicId: decoder.readUuid(),
+    partitions: decoder.readUVarIntArray((entry) => entry.readInt32()),
+  }
+  decoder.readTaggedFields()
+  return value
+}
+
+/** @param {Decoder} decoder Response reader. @returns {object} Literal response fields. @throws {Error} Truncated fields or tags. */
+const readAssignment = (decoder) => {
+  const value = { topicPartitions: decoder.readUVarIntArray(readTopicPartitions) }
+  decoder.readTaggedFields()
+  return value
+}
+
 /**
  * Independent ShareGroupHeartbeat v1 wire pair; uses protocol primitives and literal released-source fields.
  * It models no broker state and imports no request encoder, response decoder or share codec helper.
@@ -72,6 +89,27 @@ module.exports = {
   buildResponse(fields = {}, { tagged = false } = {}) {
     const tags = tagged ? [{ tag: 10, value: Buffer.from([0x61]) }] : []
     return encodeResponse({ ...literal.response, ...fields }, tags).buffer
+  },
+  /**
+   * @param {Buffer} body Response body without its header.
+   * @returns {object} All response fields; a null assignment stays null.
+   * @throws {Error} Truncated body or trailing bytes after the tag buffer.
+   */
+  readResponse(body) {
+    const decoder = new Decoder(body)
+    const value = {
+      throttleTime: decoder.readInt32(),
+      errorCode: decoder.readInt16(),
+      errorMessage: decoder.readUVarIntString(),
+      memberId: decoder.readUVarIntString(),
+      memberEpoch: decoder.readInt32(),
+      heartbeatIntervalMs: decoder.readInt32(),
+      assignment: decoder.readInt8() === -1 ? null : readAssignment(decoder),
+    }
+    decoder.readTaggedFields()
+    if (decoder.canReadBytes(1))
+      throw new Error('ShareGroupHeartbeat v1 response has a byte after its tag buffer')
+    return value
   },
   /**
    * @param {Buffer} body Request body without its header.

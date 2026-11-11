@@ -118,6 +118,50 @@ module.exports = {
     return encodeResponse({ ...literal.response, ...fields }, tags).buffer
   },
   /**
+   * @param {Buffer} body Response body without its header.
+   * @returns {object} Independently decoded response fields, including acknowledgement errors.
+   * @throws {Error} Truncated fields or trailing bytes.
+   */
+  readResponse(body) {
+    const decoder = new Decoder(body)
+    const value = {
+      throttleTime: decoder.readInt32(),
+      errorCode: decoder.readInt16(),
+      errorMessage: decoder.readUVarIntString(),
+      acquisitionLockTimeoutMs: decoder.readInt32(),
+      responses: decoder.readUVarIntArray((d) => {
+        const topicId = d.readUuid()
+        const partitions = d.readUVarIntArray((d) => {
+          const row = {
+            partitionIndex: d.readInt32(),
+            errorCode: d.readInt16(),
+            errorMessage: d.readUVarIntString(),
+            currentLeader: { leaderId: d.readInt32(), leaderEpoch: d.readInt32() },
+          }
+          d.readTaggedFields()
+          d.readTaggedFields()
+          return row
+        })
+        d.readTaggedFields()
+        return { topicId, partitions }
+      }),
+      nodeEndpoints: decoder.readUVarIntArray((d) => {
+        const node = {
+          nodeId: d.readInt32(),
+          host: d.readUVarIntString(),
+          port: d.readInt32(),
+          rack: d.readUVarIntString(),
+        }
+        d.readTaggedFields()
+        return node
+      }),
+    }
+    decoder.readTaggedFields()
+    if (decoder.canReadBytes(1))
+      throw new Error('ShareAcknowledge v2 response has a byte after its tag buffer')
+    return value
+  },
+  /**
    * @param {Buffer} body Request body without its header.
    * @returns {object} All request fields; int64 offsets remain exact decimal strings.
    * @throws {Error} Truncated body or trailing bytes after the tag buffer.

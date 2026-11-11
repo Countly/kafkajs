@@ -174,6 +174,7 @@ describe('admin API ledger', () => {
       'removeRaftVoter',
       'renewDelegationToken',
       'unregisterBroker',
+      'unregisterController',
       'unregisterMetricFromSubscription',
       'updateFeatures',
       'alterConfigs',

@@ -9,8 +9,9 @@
  * with the decompression bound set; a tree without the bound ignores it, and a tree without the
  * codec reports `{ "available": 0 }`.
  *
- * Usage: node scripts/benchmarks/recordBatchDecode.js [--iterations 20000] [--arm <name>]
- * Prints one JSON line: { available, iterations, nsPerOp, opsPerSecond, records, decompressCalls }.
+ * Usage: node scripts/benchmarks/recordBatchDecode.js [--iterations 20000] [--arm <name>] [--work-multiplier <k>]
+ * Prints one JSON line: { available, iterations, nsPerOp, roundNsPerOp, opsPerSecond, records,
+ * decompressCalls }.
  * `decompressCalls` is how many times the codec's `decompress` ran in 10 untimed decodes, counted by
  * wrapping it: 10 for a compressed arm, 0 for the uncompressed one.
  */
@@ -23,6 +24,7 @@ const arg = (name, fallback) => {
 }
 
 const ITERATIONS = Number(arg('iterations', 20000))
+const WORK_MULTIPLIER = Number(arg('work-multiplier', 1))
 const ARM = arg('arm', 'uncompressed')
 const WARMUP = 2000
 const ROUNDS = 5
@@ -110,18 +112,23 @@ const countRecords = (data) =>
 
 /**
  * Decodes the fixture `iterations` times (after an untimed warmup), split into equal rounds, and
- * reports the median round so a single scheduling hiccup does not set the result.
+ * reports the median round so a single scheduling hiccup does not set the result. Repetitions
+ * increase operation count within each round while preserving nanoseconds per decode.
  * @param {Buffer} fixture
  * @param {object} options the decode options
  * @param {number} iterations timed iterations to run
- * @returns {Promise<{ nsPerOp: number, opsPerSecond: number }>} per-op cost and throughput
+ * @param {number} [workMultiplier] repetitions per operation, including warmup
+ * @throws {Error} when the multiplier is not a positive integer
+ * @returns {Promise<{ nsPerOp: number, roundNsPerOp: number[], opsPerSecond: number }>} per-op cost and throughput
  */
-const run = async (fixture, options, iterations) => {
-  for (let i = 0; i < WARMUP; i++) {
+const run = async (fixture, options, iterations, workMultiplier = 1) => {
+  if (!Number.isSafeInteger(workMultiplier) || workMultiplier < 1)
+    throw new Error('invalid work multiplier')
+  for (let i = 0; i < WARMUP * workMultiplier; i++) {
     await decode(fixture, options)
   }
 
-  const perRound = Math.max(1, Math.floor(iterations / ROUNDS))
+  const perRound = Math.max(1, Math.floor(iterations / ROUNDS)) * workMultiplier
   const roundNsPerOp = []
 
   for (let round = 0; round < ROUNDS; round++) {
@@ -133,7 +140,7 @@ const run = async (fixture, options, iterations) => {
   }
 
   const nsPerOp = median(roundNsPerOp)
-  return { nsPerOp, opsPerSecond: 1e9 / nsPerOp }
+  return { nsPerOp, roundNsPerOp, opsPerSecond: 1e9 / nsPerOp }
 }
 
 /**
@@ -166,31 +173,42 @@ const countDecompressCalls = async (fixture, options, codec) => {
   return calls
 }
 
-;(async () => {
-  const prepared = await prepare(ARM)
+if (require.main === module) {
+  ;(async () => {
+    const prepared = await prepare(ARM)
 
-  if (prepared === null) {
-    console.log(JSON.stringify({ available: 0 }))
-    return
-  }
+    if (prepared === null) {
+      console.log(JSON.stringify({ available: 0 }))
+      return
+    }
 
-  const { fixture, codec } = prepared
-  const options = { checkCrcs: false, maxDecompressedBatchBytes: BOUND }
-  const records = countRecords(await decode(fixture, options))
-  const decompressCalls = await countDecompressCalls(fixture, options, codec)
-  const { nsPerOp, opsPerSecond } = await run(fixture, options, ITERATIONS)
+    const { fixture, codec } = prepared
+    const options = { checkCrcs: false, maxDecompressedBatchBytes: BOUND }
+    const records = countRecords(await decode(fixture, options))
+    const decompressCalls = await countDecompressCalls(fixture, options, codec)
+    const { nsPerOp, roundNsPerOp, opsPerSecond } = await run(
+      fixture,
+      options,
+      ITERATIONS,
+      WORK_MULTIPLIER
+    )
 
-  console.log(
-    JSON.stringify({
-      available: 1,
-      iterations: ITERATIONS,
-      nsPerOp,
-      opsPerSecond,
-      records,
-      decompressCalls,
-    })
-  )
-})().catch((e) => {
-  console.error(e)
-  process.exit(1)
-})
+    console.log(
+      JSON.stringify({
+        available: 1,
+        iterations: ITERATIONS,
+        workMultiplier: WORK_MULTIPLIER,
+        nsPerOp,
+        roundNsPerOp,
+        opsPerSecond,
+        records,
+        decompressCalls,
+      })
+    )
+  })().catch((e) => {
+    console.error(e)
+    process.exit(1)
+  })
+}
+
+module.exports = { run }

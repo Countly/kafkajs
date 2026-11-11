@@ -61,6 +61,7 @@ describe('Broker > alterPartitionReassignments', () => {
 
     expect(response).toEqual({
       throttleTime: 0,
+      clientSideThrottleTime: 0,
       allowReplicationFactorChange: true,
       errorCode: 0,
       responses: [

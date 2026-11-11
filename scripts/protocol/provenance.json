@@ -4315,6 +4315,15 @@
       }
     ]
   },
+  "UnregisterController": {
+    "kafkaTag": "4.4.0",
+    "messageSha256": {
+      "Request": "3d836051e8c6473b19e5fbf1e6241ea1c453a9e39f16a595e1137c2dcd9e51d1",
+      "Response": "4d3ad9def175c37f481ec184645db6c1fcd5be582f5af4f6a7f1dd8e2dd59a87"
+    },
+    "javaClientsJar": null,
+    "javaVectors": []
+  },
   "UpdateFeatures": {
     "kafkaTag": "4.4.0",
     "messageSha256": {

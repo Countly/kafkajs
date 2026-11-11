@@ -2,20 +2,21 @@ const Decoder = require('../../../decoder')
 const { createErrorFromCode } = require('../../../error')
 const { KafkaJSPartialMessageError } = require('../../../../errors')
 
-/** Reads a classic array with the message's exact nullability.
- * @param {object} decoder positioned decoder
+/** Reads a classic array with the message's exact nullability, bounded by the decoder's count limit.
+ * @param {Decoder} decoder positioned decoder
  * @param {Function} read nested struct reader
  * @param {boolean} nullable schema permits null
  * @returns {object[]|null} decoded values
- * @throws {Error} negative, null-forbidden or truncated framing
+ * @throws {Error} negative, null-forbidden, over-limit or truncated framing
  */
 const readArray = (decoder, read, nullable) => {
   const length = decoder.readInt32()
   if (length === -1 && nullable) return null
   if (length < 0) throw new KafkaJSPartialMessageError('Invalid array length')
+  decoder.assertCount(length, 'array')
   decoder.ensureReadable(length, 'array')
-  const values = new Array(length)
-  for (let i = 0; i < length; i++) values[i] = read(decoder)
+  const values = []
+  for (let i = 0; i < length; i++) values.push(read(decoder))
   return values
 }
 

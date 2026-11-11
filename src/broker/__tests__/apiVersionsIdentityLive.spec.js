@@ -129,8 +129,9 @@ describeApiIdentity('Broker > ApiVersions identity (live)', () => {
    * @param {object} options
    * @param {Function} options.socketFactory
    * @param {'rebootstrap'|'none'} [options.strategy]
+   * @param {boolean} [options.clusterCheck] the `metadataClusterCheck` option, left to its default
    */
-  const open = ({ socketFactory, strategy }) => {
+  const open = ({ socketFactory, strategy, clusterCheck }) => {
     const emitter = new InstrumentationEventEmitter()
     const events = []
     emitter.addListener(CLUSTER_REBOOTSTRAP, ({ payload }) => events.push(payload))
@@ -141,6 +142,7 @@ describeApiIdentity('Broker > ApiVersions identity (live)', () => {
       socketFactory,
       instrumentationEmitter: emitter,
       metadataRecoveryStrategy: strategy,
+      ...(clusterCheck !== undefined && { metadataClusterCheck: clusterCheck }),
       retry: { retries: 3, initialRetryTime: 100, maxRetryTime: 500 },
       enforceRequestTimeout: false,
     })
@@ -330,6 +332,46 @@ describeApiIdentity('Broker > ApiVersions identity (live)', () => {
       expect(route.sent.some(({ routedTo }) => routedTo === endpointOf(actual))).toBe(true)
       writeEvidence(EVIDENCE, {
         step: 'none-strategy',
+        wireVersions: wireVersionsOf(
+          route.sent.map(({ version }) => ({ apiName: 'ApiVersions', apiVersion: version }))
+        ),
+        expectedVersion: offered,
+        events,
+        requests: route.sent.length,
+      })
+    },
+    CASE_BUDGET_MS
+  )
+
+  test(
+    'metadataClusterCheck false suppresses known identity on rebootstrap',
+    async () => {
+      const offered = offeredVersion()
+      const route = routing()
+      const { cluster, events } = open({ socketFactory: route.socketFactory, clusterCheck: false })
+      await cluster.connect()
+      await cluster.refreshMetadata()
+      const { intended, actual } = nodesOutside(route.sent)
+      route.routes.set(endpointOf(intended), { host: actual.host, port: actual.port })
+
+      const broker = await cluster.findBroker({ nodeId: intended.nodeId })
+
+      // The strategy is still rebootstrap, yet no request names an identity, so the broker that
+      // was reached has nothing to refuse and nothing is recovered from.
+      expect(cluster.brokerPool.metadataRecoveryStrategy).toBe('rebootstrap')
+      expect(broker.versions[18].maxVersion).toBe(offered)
+      expect(events).toEqual([])
+      expect(sentTo(route.sent, endpointOf(intended)).map(({ version }) => version)).toEqual(
+        versionsAskedOf(offered)
+      )
+      expect(
+        route.sent.every(
+          ({ fields }) => (fields.clusterId ?? null) === null && (fields.nodeId ?? -1) === -1
+        )
+      ).toBe(true)
+      expect(route.sent.some(({ routedTo }) => routedTo === endpointOf(actual))).toBe(true)
+      writeEvidence(EVIDENCE, {
+        step: 'cluster-check-off',
         wireVersions: wireVersionsOf(
           route.sent.map(({ version }) => ({ apiName: 'ApiVersions', apiVersion: version }))
         ),

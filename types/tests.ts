@@ -803,6 +803,9 @@ void (nodeIds[0] === 1)
 
 // The client option for the response-size limit.
 new Kafka({ brokers: ['localhost:9092'], maxResponseSize: 1048576 })
+new Kafka({ brokers: ['localhost:9092'], metadataClusterCheck: false })
+// @ts-expect-error the cluster check is a boolean
+new Kafka({ brokers: ['localhost:9092'], metadataClusterCheck: 'false' })
 
 // KafkaJSLockTimeout stays exported.
 new KafkaJSLockTimeout()
@@ -1779,6 +1782,7 @@ admin.electLeaders({topicPartitions:null,apiTimeout:10,electionType:'unclean'}).
 admin.describeFeatures({brokerId:0}).then(r=>{const epoch:string|null=r.finalizedFeaturesEpoch;void epoch})
 admin.updateFeatures({features:[{name:'metadata.version',maxVersionLevel:0,upgradeType:'safe-downgrade'}],validateOnly:true}).then(rows=>{const f:string=rows[0].feature;void f})
 admin.listConfigResources({resourceTypes:[ConfigResourceTypes.CLIENT_METRICS]}).then(r=>{const t:ConfigResourceTypes=r.resources[0].type;void t})
+admin.unregisterController({controllerId:7,apiTimeout:10}).then(done=>{const none:void=done;void none})
 admin.describeCluster({includeAuthorizedOperations:true,includeFencedBrokers:true}).then(r=>{const f:boolean|undefined=r.brokers[0].fenced;const m:number|null|undefined=r.authorizedOperations;void f;void m})
 // @ts-expect-error election type is a declared enum
 admin.electLeaders({electionType:'random'})
@@ -1788,6 +1792,10 @@ admin.updateFeatures({features:[{name:'a',maxVersionLevel:1,upgradeType:'random'
 admin.describeCluster({includeFencedBrokers:'true'})
 // @ts-expect-error resource types are numeric enum members
 admin.listConfigResources({resourceTypes:['CLIENT_METRICS']})
+// @ts-expect-error the controller id is a number
+admin.unregisterController({controllerId:'7'})
+// @ts-expect-error the controller id is required
+admin.unregisterController({})
 
 // GSSAPI
 const gssapiOptions: import('./index').GssapiSaslOptions = { mechanism: 'gssapi' }

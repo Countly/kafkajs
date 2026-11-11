@@ -106,6 +106,23 @@ class KafkaJSRebalanceListenerError extends KafkaJSNonRetriableError {
 }
 
 /**
+ * The bootstrap DNS readiness gate expired: none of the bootstrap hostnames resolved within
+ * `bootstrapResolveTimeout`. The client that raised it keeps raising it; create a new client to
+ * check again.
+ * @class
+ */
+class KafkaJSBootstrapResolutionError extends KafkaJSNonRetriableError {
+  /**
+   * @param {Error|string} e
+   * @param {{ cause?: Error }} [options] `cause` is the last lookup failure
+   */
+  constructor(e, { cause } = {}) {
+    super(e, { cause })
+    this.name = 'KafkaJSBootstrapResolutionError'
+  }
+}
+
+/**
  * A partition cannot obtain a starting position under the none reset policy.
  * Recovery is an explicit seek or an ordinary halt-lifecycle transition.
  * @class
@@ -901,6 +918,7 @@ class KafkaJSProducerClosedError extends KafkaJSNonRetriableError {
 }
 
 module.exports = {
+  KafkaJSBootstrapResolutionError,
   KafkaJSNoOffsetError,
   KafkaJSRebalanceListenerError,
   KafkaJSProducerClosedError,

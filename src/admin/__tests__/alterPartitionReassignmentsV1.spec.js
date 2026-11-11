@@ -123,6 +123,7 @@ describe('reassignment response boolean', () => {
       const decoded = await response.decode(Buffer.from(hex, 'hex')).catch((error) => error)
       expect(decoded).toEqual({
         throttleTime: 0,
+        clientSideThrottleTime: 0,
         allowReplicationFactorChange,
         errorCode,
         responses: [],

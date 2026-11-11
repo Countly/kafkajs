@@ -1,4 +1,5 @@
 const { inspect } = require('node:util')
+const path = require('node:path')
 const { randomBytes } = require('node:crypto')
 // eslint-disable-next-line n/no-unsupported-features/node-builtins -- test-only timer ownership
 const { createHook } = require('node:async_hooks')
@@ -169,26 +170,116 @@ const markersOf = (secret) => {
   ]
 }
 
+/** The creation diagnostic is bounded independently of the complete timer ownership ledger. */
+const TIMER_STACK_CAPACITY = 128
+const TIMER_STACK_FRAMES = 8
+const TIMER_FRAME_CHARS = 512
+const REPO_ROOT = path.resolve(__dirname, '../../../..') + path.sep
+
 /**
- * Follows the timers created from `start` on, by identity, so a case can be held to the timers it
- * made itself rather than to the process-wide count, which other work moves too.
+ * Captures scalar creation frames beyond async-hooks internals, preferring repository callers.
+ * The temporary stack limit is restored even if a custom stack formatter fails.
+ * @returns {{ source: string, stack: string }} at most eight frames of 512 characters each
+ */
+const timerCreationStack = () => {
+  const previousLimit = Error.stackTraceLimit
+  try {
+    Error.stackTraceLimit = 64
+    const frames = String(new Error().stack).split('\n').slice(1)
+    const repo = frames.filter(
+      (frame) =>
+        frame.includes(REPO_ROOT) && !frame.includes(__filename) && !frame.includes('node_modules')
+    )
+    const selected = repo.length
+      ? repo
+      : frames.filter(
+          (frame) =>
+            !frame.includes(__filename) &&
+            !frame.includes('node:internal') &&
+            !frame.includes('async_hooks')
+        )
+    return {
+      source: repo.length ? 'repo' : 'raw',
+      stack: selected
+        .slice(0, TIMER_STACK_FRAMES)
+        .map((frame) => frame.trim().split(REPO_ROOT).join('').slice(0, TIMER_FRAME_CHARS))
+        .join('\n'),
+    }
+  } catch {
+    return { source: 'unavailable', stack: 'Timer creation stack could not be formatted' }
+  } finally {
+    Error.stackTraceLimit = previousLimit
+  }
+}
+
+/**
+ * Follows every timer created from `start` on, by identity. Bounded creation diagnostics never
+ * exclude a timer from the ownership verdict, including unref'd or not-yet-destroyed timers.
  */
 class TimerLedger {
-  /** Builds the hook; it does nothing until `start`. */
-  constructor() {
-    /** @type {Map<number, object>} the pending timers by async id */
+  /**
+   * Builds the hook; it does nothing until `start`.
+   * @param {object} [options] diagnostic limits only; ownership is never capped
+   * @param {number} [options.capacity=128] maximum pending stacks and reported timer details
+   * @throws {RangeError} when capacity is not an integer from 1 through 128
+   */
+  constructor({ capacity = TIMER_STACK_CAPACITY } = {}) {
+    if (!Number.isInteger(capacity) || capacity < 1 || capacity > TIMER_STACK_CAPACITY)
+      throw new RangeError('Timer diagnostic capacity must be an integer from 1 through 128')
+    this.capacity = capacity
+    /** @type {Map<number, object>} every pending timer by async id */
     this.pending = new Map()
+    /** @type {Map<number, { source: string, stack: string }>} bounded scalar creation facts */
+    this.stacks = new Map()
     this.hook = createHook({
       init: (id, type, _trigger, resource) => {
-        if (type === 'Timeout') this.pending.set(id, resource)
+        if (type !== 'Timeout') return
+        this.pending.set(id, resource)
+        if (this.stacks.size < this.capacity) this.stacks.set(id, timerCreationStack())
       },
-      destroy: (id) => this.pending.delete(id),
+      destroy: (id) => {
+        this.pending.delete(id)
+        this.stacks.delete(id)
+      },
     })
   }
 
   /** @returns {void} */
   start() {
     this.hook.enable()
+  }
+
+  /**
+   * Copies bounded scalar diagnostics without changing ownership or inspecting callbacks.
+   * Node timer fields explain delayed destruction; they never determine the leak verdict.
+   * @returns {{ retained: number, omitted: number, missingStacks: number, timers: object[] }}
+   *   all retained timers counted, with explicit counts for any diagnostic truncation
+   */
+  read() {
+    const timers = []
+    let missingStacks = 0
+    for (const [id, timer] of this.pending) {
+      const creation = this.stacks.get(id)
+      if (!creation) missingStacks++
+      if (timers.length >= this.capacity) continue
+      timers.push({
+        id,
+        delayMs: timer._idleTimeout,
+        repeatMs: timer._repeat,
+        referenced: timer.hasRef(),
+        destroyed: timer._destroyed,
+        ...(creation ?? {
+          source: 'omitted',
+          stack: 'Timer creation diagnostic capacity exceeded',
+        }),
+      })
+    }
+    return {
+      retained: this.pending.size,
+      omitted: this.pending.size - timers.length,
+      missingStacks,
+      timers,
+    }
   }
 
   /**
@@ -200,6 +291,7 @@ class TimerLedger {
     this.hook.disable()
     const retained = [...this.pending.values()]
     this.pending.clear()
+    this.stacks.clear()
     return retained
   }
 }
@@ -587,11 +679,12 @@ class FloorProbe {
       liveRun.taint(error)
       errors.push(error)
     }
+    const timerDiagnostics = this.timers?.read()
     const owned = this.timers?.stop() ?? []
     if (owned.length) {
       const count = (snapshot = {}) => snapshot.activeResources?.Timeout ?? 0
       const error = new Error(
-        `The case retained ${owned.length} of its own timers (process-wide Timeout count ${count(this.baseline)} before, ${count(after)} after)`
+        `The case retained ${owned.length} of its own timers (process-wide Timeout count ${count(this.baseline)} before, ${count(after)} after)\nTimer creation diagnostics: ${JSON.stringify(timerDiagnostics, null, 2)}`
       )
       liveRun.taint(error)
       errors.push(error)

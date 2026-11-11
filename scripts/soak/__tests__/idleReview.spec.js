@@ -76,7 +76,11 @@ const healthyIdle = async ({ metadataMaxAge, duration = 0 } = {}) => {
     probe,
     topic: 'idle-topic',
     record: () => {},
-    nap: async (ms) => jest.advanceTimersByTimeAsync(ms),
+    nap: async (ms) => {
+      // Quiet intervals have no outstanding sends or intermediate observations.
+      jest.advanceTimersByTime(ms)
+      await jest.advanceTimersByTimeAsync(0)
+    },
   })
   try {
     await pump(producer.connect())
@@ -154,7 +158,6 @@ test('a healthy idle cycle completes when GC enables delayed heap sampling', asy
   }
 })
 
-// Replaying the full 420 s profile on fake timers takes about 95 s of CPU on a 2-core runner.
 test('healthy default metadata expiry does not fail a full duration idle profile', async () => {
   expect(PROFILES.idle).toEqual([{ name: 'idle', workload: 'idle', ms: 420000 }])
   await healthyIdle({ duration: PROFILES.idle[0].ms })

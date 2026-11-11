@@ -74,6 +74,7 @@ Gap classes: `current` (fork max equals the Kafka max) · `behind:N` · `stub` (
 | DescribeShareGroupOffsets | 90 | 0-1 | v0+ | 1 | current | Admin-side read of a share group's start offsets and lag; a null topic list asks for every topic the group has offsets for. v1 is the only implemented version; v0 is not implemented. |
 | AlterShareGroupOffsets | 91 | 0 | v0+ | 0 | current | Admin-side change of a share group's start offsets for the named topics and partitions. v0 is the only version. |
 | DeleteShareGroupOffsets | 92 | 0 | v0+ | 0 | current | Admin-side deletion of a share group's offsets for the named topics. v0 is the only version. |
+| UnregisterController | 94 | 0 | v0+ | 0 | current |  |
 
 ## Floor watch
 

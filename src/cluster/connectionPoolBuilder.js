@@ -79,6 +79,9 @@ module.exports = ({
 }) => {
   let index = 0
   let bootstrapEndpoints = new Set()
+  /** The list `bootstrapHosts()` read, held for the first bootstrap `build()`; cleared when used. */
+  let gatedList = null
+  let gatedReads = 0
 
   const isValidBroker = (broker) => {
     return broker && typeof broker === 'string' && broker.length > 0
@@ -194,9 +197,23 @@ module.exports = ({
     get bootstrapEndpoints() {
       return new Set(bootstrapEndpoints)
     },
+    /**
+     * Reads and validates the bootstrap list once for the DNS readiness gate, and keeps it for the
+     * first bootstrap `build()`, so a dynamic `brokers` function is not called twice for one dial.
+     * Never called when the gate is disabled.
+     * @returns {Promise<string[]>} the distinct original hostnames, brackets removed from IPv6 literals
+     * @throws {KafkaJSNonRetriableError|KafkaJSConnectionError} as `brokers` validation or the function does
+     */
+    bootstrapHosts: async () => {
+      const read = ++gatedReads
+      const list = await getBrokers()
+      if (read === gatedReads) gatedList = list
+      return [...new Set(list.map((text) => parseBroker(text).host))]
+    },
     build: async ({ host, port, rack } = {}) => {
       if (!host) {
-        const list = await getBrokers()
+        const list = gatedList ?? (await getBrokers())
+        gatedList = null
 
         const seed = parseBroker(list[index++ % list.length])
         host = seed.host

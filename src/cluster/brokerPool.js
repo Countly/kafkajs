@@ -93,6 +93,8 @@ module.exports = class BrokerPool {
    * @param {object|null} [options.telemetryMetrics=null] private numeric observer of this client,
    *   never shared with the dedicated telemetry transport
    * @param {import("./connectionPoolBuilder").ConnectionPoolBuilder} options.connectionPoolBuilder
+   * @param {import("./bootstrapResolution")|null} [options.bootstrapResolution] Cluster-owned
+   *   readiness gate; omitted when disabled to preserve the synchronous connection path
    * @param {import("../../types").Logger} options.logger
    * @param {import("./metadataCache")} [options.metadataCache] optional: a `BrokerPool` owns its
    *   metadata and is usable standalone, so it defaults to a private cache rather than requiring
@@ -110,12 +112,15 @@ module.exports = class BrokerPool {
    *   the same recovery on a `REBOOTSTRAP_REQUIRED` answer to ApiVersions (KIP-1242);
    *   `'none'` disables them, sends no cluster or node id in ApiVersions and leaves
    *   `REBOOTSTRAP_REQUIRED` (129) as a plain protocol error.
+   * @param {boolean} [options.metadataClusterCheck=true] `false` makes every broker of this pool
+   *   send no cluster or node id in ApiVersions v5; recovery on `REBOOTSTRAP_REQUIRED` is unchanged.
    * @param {number} [options.metadataRecoveryRebootstrapTriggerMs=300000] how long metadata must
    *   fail *continuously* (trigger (a)) before a rebootstrap fires.
    */
   constructor({
     telemetryMetrics = null,
     connectionPoolBuilder,
+    bootstrapResolution = null,
     logger,
     metadataCache,
     captureTopics,
@@ -125,6 +130,7 @@ module.exports = class BrokerPool {
     authenticationTimeout,
     metadataMaxAge,
     metadataRecoveryStrategy,
+    metadataClusterCheck,
     metadataRecoveryRebootstrapTriggerMs,
     drainTimeout,
   }) {
@@ -135,6 +141,7 @@ module.exports = class BrokerPool {
     this.retiredBrokers = new WeakSet()
     this.rootLogger = logger
     this.connectionPoolBuilder = connectionPoolBuilder
+    this.bootstrapResolution = bootstrapResolution
     this.metadataMaxAge = metadataMaxAge || 0
     this.logger = logger.namespace('BrokerPool')
     this.retryOptions = assign({}, retry)
@@ -167,6 +174,7 @@ module.exports = class BrokerPool {
         allowAutoTopicCreation,
         authenticationTimeout,
         metadataRecoveryStrategy: this.metadataRecoveryStrategy,
+        metadataClusterCheck: this.metadataClusterCheck,
         metadataIdentity: () => ({
           clusterId: this.metadata?.clusterId ?? null,
           nodeId: broker.nodeId ?? -1,
@@ -195,6 +203,7 @@ module.exports = class BrokerPool {
     this.versions = null
 
     this.metadataRecoveryStrategy = metadataRecoveryStrategy ?? 'rebootstrap'
+    this.metadataClusterCheck = metadataClusterCheck ?? true
     this.metadataRecoveryRebootstrapTriggerMs = metadataRecoveryRebootstrapTriggerMs ?? 300000
 
     /** Failures `onApiVersionsFailure` already recovered from, so a surrounding catch skips them. */
@@ -714,6 +723,19 @@ module.exports = class BrokerPool {
    * @throws {Error} the lifecycle's close error
    */
   async connect({ fence } = {}) {
+    fence?.check()
+    checked(null)
+    if (this.bootstrapResolution) {
+      try {
+        await this.bootstrapResolution.wait()
+      } catch (error) {
+        fence?.check()
+        checked(null)
+        throw error
+      }
+      fence?.check()
+      checked(null)
+    }
     if (this.hasConnectedBrokers()) {
       return
     }

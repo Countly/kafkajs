@@ -322,6 +322,8 @@ module.exports = async (
  * The count is checked before anything is allocated for it, twice: against the record ceiling the
  * byte bound implies, before the body is decompressed, and against the bytes the records have,
  * `MIN_RECORD_BYTES` each, once they are known. The body is decompressed within the byte bound.
+ * The result array is preallocated from the checked count, so its 8-byte slots take at most 8/7 of
+ * the record bytes held and at most `maxDecompressedBatchBytes / 64` bytes.
  * @param {object} batch
  * @param {object|null} batch.codec the compression codec for this batch, or null when uncompressed
  * @param {number} batch.attributes the batch attributes

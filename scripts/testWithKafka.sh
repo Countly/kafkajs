@@ -35,6 +35,9 @@ if [ -z "$(find_container_id)" ]; then
 fi
 
 $PWD/scripts/waitForKafka.js
+if [ "${SHARE_KAFKA44_SETUP:-0}" = "1" ]; then
+  "$PWD/scripts/e2e/shareKafka44Setup.sh"
+fi
 echo
 if [ "${SKIP_SCRAM:-0}" != "1" ]; then
   echo -e "Create SCRAM credentials"

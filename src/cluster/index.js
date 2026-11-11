@@ -10,6 +10,7 @@ const Lock = require('../utils/lock')
 const { isConnectionFailure } = require('../network/connectionFailure')
 const createRetry = require('../retry')
 const connectionPoolBuilder = require('./connectionPoolBuilder')
+const BootstrapResolution = require('./bootstrapResolution')
 const GroupRegistry = require('./groupRegistry')
 const { EARLIEST_OFFSET, LATEST_OFFSET } = require('../constants')
 const {
@@ -20,6 +21,7 @@ const {
   KafkaJSMetadataNotLoaded,
   KafkaJSTopicMetadataNotLoaded,
   KafkaJSGroupCoordinatorNotFound,
+  KafkaJSServerDoesNotSupportApiKey,
 } = require('../errors')
 const COORDINATOR_TYPES = require('../protocol/coordinatorTypes')
 const apiKeys = require('../protocol/requests/apiKeys')
@@ -120,8 +122,12 @@ module.exports = class Cluster {
    *   pool unchanged.
    * @param {'rebootstrap'|'none'} [options.metadataRecoveryStrategy] forwarded to `BrokerPool`
    *   unchanged; `Cluster` stores neither this nor the trigger window.
+   * @param {boolean} [options.metadataClusterCheck] forwarded to `BrokerPool` unchanged.
    * @param {number} [options.metadataRecoveryRebootstrapTriggerMs] forwarded to `BrokerPool`
    *   unchanged.
+   * @param {number} [options.bootstrapResolveTimeout=0] milliseconds `connect()` waits for a
+   *   bootstrap hostname to resolve in DNS before dialing; 0 skips the check. The gate belongs to
+   *   this cluster, so each client has its own; `disconnect()` cancels a pending wait.
    * @param {import("../instrumentation/emitter")} [options.instrumentationEmitter=null] stored on
    *   the instance (`this.instrumentationEmitter`) and shared with the `MetadataCache` and the
    *   `BrokerPool`, so a topic recreation seen by either surfaces on the same emitter the client
@@ -156,7 +162,9 @@ module.exports = class Cluster {
     operations = new Map(),
     maxResponseSize,
     metadataRecoveryStrategy,
+    metadataClusterCheck,
     metadataRecoveryRebootstrapTriggerMs,
+    bootstrapResolveTimeout = 0,
   }) {
     this.rootLogger = rootLogger
     this.logger = rootLogger.namespace('Cluster')
@@ -186,6 +194,12 @@ module.exports = class Cluster {
       reauthenticationThreshold,
     })
 
+    this.bootstrapResolution = new BootstrapResolution({
+      timeout: bootstrapResolveTimeout,
+      resolveHosts: () => this.connectionPoolBuilder.bootstrapHosts(),
+      retry,
+    })
+
     this.targetTopics = new Set()
     this.metadataMaxIdle = metadataMaxIdle
     this.targetTopicState = metadataMaxIdle === undefined ? null : new Map()
@@ -207,6 +221,7 @@ module.exports = class Cluster {
     this.brokerPool = new BrokerPool({
       telemetryMetrics,
       connectionPoolBuilder: this.connectionPoolBuilder,
+      bootstrapResolution: bootstrapResolveTimeout > 0 ? this.bootstrapResolution : null,
       logger: this.rootLogger,
       metadataCache: this.metadataCache,
       captureTopics:
@@ -217,6 +232,7 @@ module.exports = class Cluster {
       authenticationTimeout,
       metadataMaxAge,
       metadataRecoveryStrategy,
+      metadataClusterCheck,
       metadataRecoveryRebootstrapTriggerMs,
       drainTimeout: requestTimeout,
     })
@@ -439,12 +455,25 @@ module.exports = class Cluster {
    * @returns {Promise<void>}
    */
   async disconnect(options) {
+    this.cancelPendingBootstrapResolution()
     try {
       await this.brokerPool.disconnect(...(options ? [options] : []))
     } finally {
       for (const groupId of this.groupEntries.keys()) this.groupRegistry.release(groupId, this)
       this.groupEntries.clear()
     }
+  }
+
+  /**
+   * Cancels bootstrap readiness before a client drains calls waiting for it. Transport draining
+   * remains the disconnect caller's responsibility; an open or terminal gate is unchanged.
+   * @returns {void}
+   * @throws Never.
+   */
+  cancelPendingBootstrapResolution() {
+    this.bootstrapResolution.cancel(
+      new KafkaJSConnectionError('Disconnected while waiting for bootstrap DNS resolution')
+    )
   }
 
   /**
@@ -1111,6 +1140,34 @@ module.exports = class Cluster {
    */
   async findConnectedBroker({ fence } = {}) {
     return await this.brokerPool.findConnectedBroker(...fenceArgs(fence))
+  }
+
+  /**
+   * The first known broker, in ascending node id order, that negotiated a version of an API this
+   * client implements. For requests that are not routed to the controller or a coordinator.
+   * @public
+   * @param {number} apiKey the protocol key
+   * @param {import('../protocol/requests').RequestDefinitions} definitions the implemented versions
+   * @returns {Promise<import("../../types").Broker>} a connected broker offering the API
+   * @throws {KafkaJSBrokerNotFound} when the cluster lists no broker
+   * @throws {KafkaJSServerDoesNotSupportApiKey} once every known broker lacks an overlapping version
+   * @throws {Error} a connection or authentication failure of the broker being tried, unchanged
+   */
+  async findBrokerSupporting(apiKey, definitions) {
+    await this.refreshMetadataIfNecessary()
+    const nodeIds = this.getNodeIds().sort((a, b) => Number(a) - Number(b))
+    if (nodeIds.length === 0) throw new KafkaJSBrokerNotFound('No brokers in the broker pool')
+
+    for (const nodeId of nodeIds) {
+      const broker = await this.findBroker({ nodeId })
+      if (broker.negotiatedVersion(apiKey, definitions) !== null) return broker
+    }
+
+    const apiName = Object.keys(apiKeys).find((name) => apiKeys[name] === apiKey)
+    throw new KafkaJSServerDoesNotSupportApiKey(
+      `No known broker supports ${apiName}; client implements v${definitions.versions.join(', v')}`,
+      { apiKey, apiName }
+    )
   }
 
   /**

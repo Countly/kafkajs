@@ -136,4 +136,44 @@ describe('Broker > admin request capabilities', () => {
     expect(result).toBe(answer)
     expect(sent.map(({ version }) => version)).toEqual([9])
   })
+
+  test('unregisterController sends RPC 94 version 0 with the controller id', async () => {
+    const { broker, sent } = brokerOver(
+      { [apiKeys.UnregisterController]: { minVersion: 0, maxVersion: 0 } },
+      { errorCode: 0, errorMessage: null }
+    )
+
+    await broker.unregisterController({ controllerId: 7 })
+
+    // controller id 7, tag buffer
+    expect(sent).toEqual([{ version: 0, body: '0000000700' }])
+  })
+
+  test('unregisterController refuses a broker without RPC 94 before sending', async () => {
+    const { broker, sent } = brokerOver({})
+
+    const error = await broker.unregisterController({ controllerId: 7 }).catch((reason) => reason)
+
+    expect(error).toBeInstanceOf(KafkaJSServerDoesNotSupportApiKey)
+    expect(error.message).toMatch(
+      /^unregisterController requires UnregisterController v0\+; client implements v0-v0, broker supports no range$/
+    )
+    expect(sent).toEqual([])
+  })
+
+  test('unregisterController rethrows a broker error code as its typed protocol error', async () => {
+    const { broker } = brokerOver(
+      { [apiKeys.UnregisterController]: { minVersion: 0, maxVersion: 0 } },
+      { errorCode: 136, errorMessage: 'not registered' }
+    )
+
+    const error = await broker.unregisterController({ controllerId: 7 }).catch((reason) => reason)
+
+    expect(error).toMatchObject({
+      type: 'CONTROLLER_ID_NOT_REGISTERED',
+      code: 136,
+      retriable: false,
+      brokerErrorMessage: 'not registered',
+    })
+  })
 })

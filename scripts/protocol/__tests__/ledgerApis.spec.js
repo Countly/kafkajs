@@ -14,6 +14,8 @@ const SNAPSHOT = path.join(__dirname, '..', '..', 'compat', 'messages', '4.3.1')
 const PROVENANCE = path.join(__dirname, '..', 'provenance.json')
 const BROKER_RANGES = path.join(__dirname, '..', 'brokerRanges.json')
 const LINES = ['4.0.2', '4.1.2', '4.2.2', '4.3.1']
+/** Tracked APIs whose message definitions first ship after the 4.3.1 snapshot. */
+const ADDED_AFTER_4_3_1 = ['UnregisterController']
 
 /**
  * The Apache Kafka 4.3.1 definitions of the admin APIs the client adds, read from the SHA-512
@@ -355,10 +357,9 @@ describe('scripts/protocol > admin ledger APIs', () => {
       const expected = [
         'RequestHeader.json',
         'ResponseHeader.json',
-        ...trackedApis.tracked.flatMap(({ kafkaName }) => [
-          `${kafkaName}Request.json`,
-          `${kafkaName}Response.json`,
-        ]),
+        ...trackedApis.tracked
+          .filter(({ kafkaName }) => !ADDED_AFTER_4_3_1.includes(kafkaName))
+          .flatMap(({ kafkaName }) => [`${kafkaName}Request.json`, `${kafkaName}Response.json`]),
       ].sort()
 
       expect(fs.readdirSync(SNAPSHOT).sort()).toEqual(expected)
@@ -463,8 +464,8 @@ describe('scripts/protocol > admin ledger APIs', () => {
   describe('the broker ranges', () => {
     const table = () => readJson(BROKER_RANGES)
 
-    test('records the floor line and the three lines the suite runs on', () => {
-      expect(Object.keys(table())).toEqual(LINES)
+    test('records the floor line, the three lines the suite runs on and the 4.3.2 and 4.4.0 captures', () => {
+      expect(Object.keys(table())).toEqual([...LINES, '4.3.2', '4.4.0'])
     })
 
     test.each(LEDGER)('%s: every line records its range under the API name', (name) => {

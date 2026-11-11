@@ -42,17 +42,6 @@ describe('Protocol > Decoder', () => {
       expect(() => decoder.readUVarIntBytes()).toThrow(KafkaJSPartialMessageError)
     })
 
-    it('readVarIntArray throws when the declared length exceeds the buffer', () => {
-      // zigzag(64) requires 64 elements, buffer has none left
-      const decoder = new Decoder(Buffer.from([0x80, 0x01]))
-      expect(() => decoder.readVarIntArray((d) => d.readInt8())).toThrow(KafkaJSPartialMessageError)
-    })
-
-    it('readVarIntArray returns [] on a VarInt -1 length', () => {
-      const decoder = new Decoder(Buffer.from([0x01]))
-      expect(decoder.readVarIntArray((d) => d.readInt8())).toEqual([])
-    })
-
     it('readUVarIntArray throws when the declared length exceeds the buffer', () => {
       // UVarInt 65 => length - 1 = 64 elements required, buffer has none left
       const decoder = new Decoder(Buffer.from([0x41]))

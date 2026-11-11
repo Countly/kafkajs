@@ -53,6 +53,11 @@ const setHeader = (headers, key, value) => {
  *   from `Long`, never from `Number#toString`.
  * @returns {object} the decoded record: `{ magicByte, attributes, timestamp, offset, key, value,
  *   headers, isControlRecord, batchContext }`, with `timestamp` and `offset` as decimal strings
+ * @throws {KafkaJSPartialMessageError} when the header count is negative (other than -1, an empty
+ *   set) or above the bytes left in the record, before any header is read, or when a header runs
+ *   past the record. The count is bounded by those bytes only, not by the 1,000,000 limit of the
+ *   protocol array readers. The header array grows as headers decode, without preallocation
+ *   from the untrusted count.
  */
 module.exports = (decoder, batchContext = {}, firstOffsetNumber) => {
   const {
@@ -89,7 +94,9 @@ module.exports = (decoder, batchContext = {}, firstOffsetNumber) => {
   // semantics are unchanged: the first occurrence stores the value, the second turns it into a
   // two-element array, later ones push onto it.
   const headers = {}
-  for (const { key: headerKey, value: headerValue } of decoder.readVarIntArray(HeaderDecoder)) {
+  for (const { key: headerKey, value: headerValue } of decoder.readVarIntArrayBytesBounded(
+    HeaderDecoder
+  )) {
     const existing = Object.hasOwn(headers, headerKey) ? headers[headerKey] : undefined
 
     if (existing === undefined) {

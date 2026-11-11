@@ -2,6 +2,8 @@ const assert = require('assert')
 const fs = require('fs')
 const path = require('path')
 
+const CAPTURES_DIR = path.join(__dirname, '../scripts/protocol/captures')
+
 /**
  * Whether a JSON value is an object rather than an array or null.
  * @param {unknown} value
@@ -22,14 +24,15 @@ const isRange = (min, max) =>
  * Reads independent broker evidence by version. Numeric API keys and raw feature fields stay in
  * their capture representation; no production name or feature conversion supplies expectations.
  * @param {string} version the recorded broker's major.minor.patch version
+ * @param {string} [capturesDir] directory containing versioned recordings
  * @returns {{ provenance: object, apiRanges: Record<string, number[]>, features: object }}
  * @throws {Error} when required capture data or provenance is missing or malformed, identifying
  *   the broker recording as incomplete
  */
-const readBrokerCapture = (version) => {
+const readBrokerCapture = (version, capturesDir = CAPTURES_DIR) => {
   try {
     assert(/^\d+\.\d+\.\d+$/.test(version), 'invalid broker version')
-    const file = path.join(__dirname, '../scripts/protocol/captures', version, 'apiVersions.json')
+    const file = path.join(capturesDir, version, 'apiVersions.json')
     const capture = JSON.parse(fs.readFileSync(file, 'utf8'))
     const { provenance, apiRanges, features } = capture
     assert(isObject(provenance), 'missing provenance')

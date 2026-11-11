@@ -54,7 +54,8 @@ describe('validation-only admin requests', () => {
 const fs = require('node:fs')
 const path = require('node:path')
 const { readSpec } = require('../../../scripts/compat/parse')
-const messageDirectory = path.join(__dirname, '../../../scripts/compat/messages/4.3.1')
+const { kafkaTag } = require('../../../scripts/compat/config.json')
+const messageDirectory = path.join(__dirname, '../../../scripts/compat/messages', kafkaTag)
 const withValidation = {
   createTopics: ['CreateTopicsRequest', '1+'],
   createPartitions: ['CreatePartitionsRequest', '0+'],
@@ -82,6 +83,7 @@ const withoutValidation = {
   removeMembersFromConsumerGroup: [['LeaveGroup'], 'no wire validation form'],
   alterPartitionReassignments: [['AlterPartitionReassignments'], 'no wire validation form'],
   electLeaders: [['ElectLeaders'], 'no wire validation form'],
+  unregisterController: [['UnregisterController'], 'no wire validation form'],
   abortTransaction: [['WriteTxnMarkers'], 'no wire validation form'],
   fenceProducers: [['InitProducerId', 'FindCoordinator'], 'no wire validation form'],
   alterReplicaLogDirs: [['AlterReplicaLogDirs'], 'no wire validation form'],

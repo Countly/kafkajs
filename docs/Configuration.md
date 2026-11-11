@@ -98,6 +98,14 @@ const kafka = new Kafka({
 
 An address without a reverse name stays an address, as in Java.
 
+### `bootstrapResolveTimeout`
+
+`bootstrapResolveTimeout` is an integer timeout in milliseconds, from 0 to 2147483647, with a default of `0` (disabled). A positive value makes the first connection wait until at least one bootstrap hostname resolves. The connection then dials the original hostname, preserving the TLS server name and the hostname passed to a custom `socketFactory`.
+
+Each client owns its readiness check, and concurrent connection attempts share that check. It applies both to an explicit `connect()` and to initial metadata discovery, including `subscribe()` before `connect()`. If `brokers` is a dynamic function, its first returned, validated list is used for both the readiness check and the initial connection.
+
+If the deadline expires, the check fails with a terminal `KafkaJSBootstrapResolutionError`. Later attempts on that client reject with the same error; create a new client to try again. Disconnect cancels a pending check, and the next connection attempt checks again. After the first readiness success, the check is never repeated, including on reconnect.
+
 ## SSL
 
 The `ssl` option can be used to configure the TLS sockets. The options are passed directly to [`tls.connect`](https://nodejs.org/api/tls.html#tls_tls_connect_options_callback) and used to create the TLS Secure Context, all options are accepted.
@@ -467,16 +475,17 @@ A consumer's `maxBytes` is a response target and does not cap process memory. Se
 
 ## Metadata recovery
 
-`metadataRecoveryStrategy` and `metadataRecoveryRebootstrapTriggerMs`, available on the `Kafka`
-constructor, control what the client does when it loses its view of the cluster (KIP-899/KIP-1102,
-matching the Java client's `metadata.recovery.strategy` and
-`metadata.recovery.rebootstrap.trigger.ms`).
+`metadataRecoveryStrategy`, `metadataClusterCheck` and `metadataRecoveryRebootstrapTriggerMs`,
+available on the `Kafka` constructor, control what the client does when it loses its view of the
+cluster (KIP-899/KIP-1102, matching the Java client's `metadata.recovery.strategy` and
+`metadata.recovery.rebootstrap.trigger.ms`) and whether it names the cluster it expects (KIP-1242).
 
 ```javascript
 new Kafka({
   clientId: 'my-app',
   brokers: ['kafka1:9092', 'kafka2:9092'],
   metadataRecoveryStrategy: 'rebootstrap',
+  metadataClusterCheck: true,
   metadataRecoveryRebootstrapTriggerMs: 300000,
 })
 ```
@@ -496,6 +505,20 @@ new Kafka({
   Bootstrap requests use no identity. `'none'` sends neither id and disables rebootstrap on
   `REBOOTSTRAP_REQUIRED`; a returned protocol error still fails the request. Older brokers answer
   the first request with `UNSUPPORTED_VERSION` and complete ApiVersions v4 negotiation.
+- `metadataClusterCheck`: `true` (the default) or `false`. It decides whether ApiVersions v5 names
+  the intended cluster id and node id once the client knows them. `false` names neither, so a
+  Kafka 4.4 broker no longer answers `REBOOTSTRAP_REQUIRED` because the cluster or node differs.
+  The other rebootstrap triggers stay on, and a `REBOOTSTRAP_REQUIRED` answer to any other request
+  still triggers rebootstrap. Bootstrap requests and older brokers never carry an identity. The
+  value must be a boolean; anything else throws `KafkaJSInvalidConfigurationError` from the
+  constructor.
+
+  | `metadataRecoveryStrategy` | `metadataClusterCheck` | Identity named in ApiVersions v5 |
+  |---|---|---|
+  | `'rebootstrap'` | `true` (default) | the intended cluster id and node id, once known |
+  | `'rebootstrap'` | `false` | none |
+  | `'none'` | `true` or `false` | none |
+
 - `metadataRecoveryRebootstrapTriggerMs`: how long metadata must fail continuously before trigger
   1 above fires. Defaults to `300000` (5 minutes, matching the Java client). Must be an integer
   **≥ 1** — `0` is rejected rather than meaning "rebootstrap immediately": at `0` the trigger would

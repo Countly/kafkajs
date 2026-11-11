@@ -1581,6 +1581,27 @@
       "onFloor": false,
       "belowFloor": [],
       "notes": "Admin-side deletion of a share group's offsets for the named topics. v0 is the only version."
+    },
+    {
+      "kafkaName": "UnregisterController",
+      "apiKey": 94,
+      "forkName": "unregisterController",
+      "apiKeysName": "UnregisterController",
+      "planned": "done",
+      "validVersions": [
+        0,
+        0
+      ],
+      "flexibleFrom": 0,
+      "deprecatedVersions": null,
+      "latestVersionUnstable": false,
+      "forkVersions": [
+        0
+      ],
+      "gap": "current",
+      "onFloor": false,
+      "belowFloor": [],
+      "notes": ""
     }
   ],
   "waivers": [],

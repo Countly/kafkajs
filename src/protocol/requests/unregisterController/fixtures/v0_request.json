@@ -1,0 +1,7 @@
+{
+  "construction": "Hand-assembled from the UnregisterController request definition (flexible version): an int32 controller id, then an empty tag buffer, with struct packing and no codec of this repository.",
+  "hex": "0000000700",
+  "fields": {
+    "controllerId": 7
+  }
+}

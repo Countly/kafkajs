@@ -22,6 +22,7 @@ describe('Protocol > Requests > Produce > v8', () => {
         },
       ],
       throttleTime: 0,
+      clientSideThrottleTime: 0,
     })
 
     await expect(parse(data)).resolves.toBeTruthy()
@@ -77,6 +78,7 @@ describe('Protocol > Requests > Produce > v8', () => {
         },
       ],
       throttleTime: 0,
+      clientSideThrottleTime: 0,
     })
 
     await expect(parse(data)).resolves.toBeTruthy()

@@ -55,7 +55,8 @@ const decode = async (rawData) => {
 
   return {
     topics,
-    throttleTime,
+    throttleTime: 0,
+    clientSideThrottleTime: throttleTime,
   }
 }
 
