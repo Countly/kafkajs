@@ -19016,7 +19016,12 @@
         "scripts/ci/__tests__/benchWorkflow.spec.js › bench.yml runs report.js for 3 runs against the two prefixes and writes into one directory",
         "scripts/ci/__tests__/benchWorkflow.spec.js › bench.yml shows the Markdown report in the job summary",
         "scripts/ci/__tests__/benchWorkflow.spec.js › bench.yml starts the cluster with NO_LOGS so the startup script returns",
-        "scripts/ci/__tests__/benchWorkflow.spec.js › bench.yml uploads the report and tears the cluster down even when the run fails"
+        "scripts/ci/__tests__/benchWorkflow.spec.js › bench.yml uploads the report and tears the cluster down even when the run fails",
+        "scripts/ci/__tests__/workflowTimeouts.spec.js › workflow job timeouts every runner-executed job sets timeout-minutes",
+        "scripts/ci/__tests__/workflowTimeouts.spec.js › workflow job timeouts a reusable-workflow caller job is exempt and its callee is checked",
+        "scripts/ci/__tests__/workflowTimeouts.spec.js › workflow job timeouts fails on a reusable-workflow call whose callee cannot be resolved",
+        "scripts/ci/__tests__/workflowTimeouts.spec.js › workflow job timeouts rejects a job with no timeout (negative control)",
+        "scripts/ci/__tests__/workflowTimeouts.spec.js › workflow job timeouts rejects a timeout of 0 or above 360"
       ],
       "capMinutes": 85,
       "allowedSkips": [
@@ -22238,7 +22243,12 @@
         "scripts/ci/__tests__/benchWorkflow.spec.js › bench.yml runs report.js for 3 runs against the two prefixes and writes into one directory",
         "scripts/ci/__tests__/benchWorkflow.spec.js › bench.yml shows the Markdown report in the job summary",
         "scripts/ci/__tests__/benchWorkflow.spec.js › bench.yml starts the cluster with NO_LOGS so the startup script returns",
-        "scripts/ci/__tests__/benchWorkflow.spec.js › bench.yml uploads the report and tears the cluster down even when the run fails"
+        "scripts/ci/__tests__/benchWorkflow.spec.js › bench.yml uploads the report and tears the cluster down even when the run fails",
+        "scripts/ci/__tests__/workflowTimeouts.spec.js › workflow job timeouts every runner-executed job sets timeout-minutes",
+        "scripts/ci/__tests__/workflowTimeouts.spec.js › workflow job timeouts a reusable-workflow caller job is exempt and its callee is checked",
+        "scripts/ci/__tests__/workflowTimeouts.spec.js › workflow job timeouts fails on a reusable-workflow call whose callee cannot be resolved",
+        "scripts/ci/__tests__/workflowTimeouts.spec.js › workflow job timeouts rejects a job with no timeout (negative control)",
+        "scripts/ci/__tests__/workflowTimeouts.spec.js › workflow job timeouts rejects a timeout of 0 or above 360"
       ],
       "capMinutes": 93,
       "allowedSkips": [
