@@ -35,7 +35,7 @@ const scoped = async (kind, work) => {
   const weak = new WeakRef(marker)
   if (kind === 'consumer') {
     await withConsumerOperation(
-      { marker, check() {}, guard: () => null, register: () => () => {} },
+      { marker, check() {}, guard: () => null, register: () => () => {}, wait: (fn) => fn() },
       work
     )
   } else {
