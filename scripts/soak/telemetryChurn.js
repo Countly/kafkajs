@@ -395,7 +395,10 @@ class EngineCodeJournal {
    */
   static shadow(points) {
     const report = { scope: 'shadow', acceptance: false, readings: points.length }
-    if (points.length < 2 || points.some((p) => !Number.isFinite(p.raw + p.code)))
+    if (
+      points.length < 2 ||
+      points.some((p) => ![p.minutes, p.raw, p.code, p.raw - p.code].every(Number.isFinite))
+    )
       return { ...report, complete: false }
     const series = (pick) => {
       const values = points.map((p) => [p.minutes, pick(p)])
@@ -418,27 +421,102 @@ class EngineCodeJournal {
   }
 
   /**
-   * Joins the journal to the judged samples by each reading's own time.
-   * @param {object[]} samples the verdict input samples, each `{completedAtMs, snapshot.memory}`
-   * @returns {object} the shadow report, or `complete: false` naming how many samples had no row
+   * Validates an archived journal against the original raw samples without sorting or dropping rows.
+   * Reading indices name the full journal; sample indices name the original verdict input array.
+   * Both clocks must match exactly: absolute memory `at` and phase-relative `completedAtMs`.
+   * @param {object[]} samples original `{completedAtMs, snapshot.memory}` samples in order
+   * @param {object} engine version 1 archive with `readingCount`, `readings` and `samples` references
+   * @returns {object[]} joined sample identity, both clocks, raw retained bytes, code and bytecode
+   * @throws {Error} for missing, duplicate, reordered, mismatched or non-finite facts
+   */
+  static join(samples, engine) {
+    if (
+      engine?.version !== 1 ||
+      !Array.isArray(samples) ||
+      !Array.isArray(engine.readings) ||
+      !Array.isArray(engine.samples) ||
+      engine.readings.length !== engine.readingCount ||
+      engine.samples.length !== samples.length
+    )
+      throw new Error('Engine journal join needs complete version 1 arrays')
+    let previousAt = -Infinity
+    for (const [index, row] of engine.readings.entries()) {
+      if (
+        row?.readingIndex !== index ||
+        typeof row.phase !== 'string' ||
+        row.phase.length === 0 ||
+        ![row.at, row.code, row.bytecode].every(Number.isFinite) ||
+        row.at <= previousAt
+      )
+        throw new Error(`Engine journal has an invalid or reordered reading ${index}`)
+      previousAt = row.at
+    }
+    let previousReading = -1
+    let previousCompletion = -Infinity
+    return samples.map((sample, sampleIndex) => {
+      const reference = engine.samples[sampleIndex]
+      const reading = engine.readings[reference?.readingIndex]
+      const memory = sample?.snapshot?.memory
+      if (
+        reference?.sampleIndex !== sampleIndex ||
+        !Number.isSafeInteger(reference.readingIndex) ||
+        reference.readingIndex <= previousReading ||
+        !reading ||
+        !memory ||
+        ![memory.at, memory.retainedBytes, sample.completedAtMs].every(Number.isFinite) ||
+        reading.at !== memory.at ||
+        reading.phase !== memory.phase ||
+        reference.completedAtMs !== sample.completedAtMs ||
+        sample.completedAtMs <= previousCompletion
+      )
+        throw new Error(`Engine journal join mismatch at sample ${sampleIndex}`)
+      previousReading = reference.readingIndex
+      previousCompletion = sample.completedAtMs
+      return {
+        sampleIndex,
+        readingIndex: reference.readingIndex,
+        phase: reading.phase,
+        at: reading.at,
+        completedAtMs: sample.completedAtMs,
+        raw: memory.retainedBytes,
+        code: reading.code,
+        bytecode: reading.bytecode,
+      }
+    })
+  }
+
+  /**
+   * Materialises the full engine journal and exact sample references only after the closed reading.
+   * Extra control, baseline and cleanup readings stay in the archive, outside the sample fit.
+   * The summary uses the original OLS arithmetic and phase-relative sample completion times.
+   * @param {object[]} samples original verdict input samples, each `{completedAtMs, snapshot.memory}`
+   * @returns {object} diagnostic-only summary and versioned `engine` archive; an invalid join or
+   *   overflow is `complete: false`, retains the evidence and publishes no partial series
    */
   report(samples) {
-    const rows = new Map(this.values().map((row) => [row.at, row]))
-    const points = []
-    let missing = 0
-    for (const { completedAtMs, snapshot } of samples) {
-      const row = rows.get(snapshot?.memory?.at)
-      if (row === undefined) missing++
-      else
-        points.push({
-          minutes: completedAtMs / 60000,
-          raw: snapshot.memory.retainedBytes,
-          code: row.code + row.bytecode,
-        })
+    const readings = this.values().map((row, readingIndex) => ({ readingIndex, ...row }))
+    const byTime = new Map(readings.map((row) => [row.at, row.readingIndex]))
+    const engine = {
+      version: 1,
+      readingCount: this.journalState().length,
+      readings,
+      samples: samples.map((sample, sampleIndex) => ({
+        sampleIndex,
+        readingIndex: byTime.get(sample?.snapshot?.memory?.at) ?? null,
+        completedAtMs: sample?.completedAtMs,
+      })),
     }
-    return missing
-      ? { scope: 'shadow', acceptance: false, complete: false, missing }
-      : EngineCodeJournal.shadow(points)
+    try {
+      if (this.journalState().overflow) throw new Error('Engine journal overflow')
+      const points = EngineCodeJournal.join(samples, engine).map((row) => ({
+        minutes: row.completedAtMs / 60000,
+        raw: row.raw,
+        code: row.code + row.bytecode,
+      }))
+      return { ...EngineCodeJournal.shadow(points), engine }
+    } catch (error) {
+      return { scope: 'shadow', acceptance: false, complete: false, error: error.message, engine }
+    }
   }
 }
 

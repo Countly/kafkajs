@@ -237,3 +237,38 @@ it reports the least-squares slope per minute and the first-to-last change of th
 (`heapUsed + external`), of the code series (code plus bytecode) and of the data series (raw minus
 code). The verdict, its recomputation from `input` and every limit are unchanged, and nothing in
 acceptance reads the shadow. The live-flags calibration arms report the same shadow for their samples.
+
+## Per-reading engine archive
+
+After the closed reading, each worker's `shadow` report includes `engine`, separate from the
+judged `result`. It is diagnostic only (`scope: 'shadow'`, `acceptance: false`); the resource verdict,
+limits, sampling grid and settlement protocol are unchanged.
+
+The `engine` schema is version 1:
+
+- `readingCount`: the full row count from the fixed journal, checked against the exported array.
+- `readings`: the full journal in recording order. Each row has `readingIndex` (zero-based),
+  `phase` (the reading's catalogue label), `at` (absolute monotonic milliseconds), `code`
+  (`code_and_metadata_size` bytes), and `bytecode` (`bytecode_and_metadata_size` bytes).
+  Control, baseline and cleanup readings are retained, including readings outside the sample fit.
+- `samples`: one reference per original `input.samples` entry, in the same order. Each has
+  `sampleIndex` (that input array's zero-based index), `readingIndex` (the corresponding engine
+  row), and `completedAtMs` (the original phase-relative completion time in milliseconds).
+
+An offline reader calls `EngineCodeJournal.join(input.samples, shadow.engine)` from
+`scripts/soak/telemetryChurn.js` to validate and obtain rows containing those identities, `phase`,
+`at`, `completedAtMs`, `raw` (the original memory `retainedBytes`), `code`, and `bytecode`.
+The join rejects missing, duplicate or reordered rows, mismatched identities or clocks, and
+non-finite scalars, including JSON nulls. It does not sort or discard evidence. A worker report
+with an invalid join or journal overflow is `complete: false`, retains the engine archive, and
+publishes no partial OLS series.
+
+Replay each OLS series in sample order with `completedAtMs / 60000` as x. The y values are `raw`,
+`code + bytecode`, and `raw - (code + bytecode)` respectively; each endpoint is the last y minus
+the first. Use the existing `slope` function from `scripts/soak/bounds.js` for identical floating
+point arithmetic. Absolute `at` identifies the reading; it is not the fit's x coordinate.
+
+Export allocates only after closed. Recording still uses the original fixed, non-zero-prefilled
+64-row, 4,096-byte engine arena, allocated before the disabled control and held through closed.
+The export does not resize or release it. Overflow remains fatal through journal constancy even
+if a caller catches the append error.
