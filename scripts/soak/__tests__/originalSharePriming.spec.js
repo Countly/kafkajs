@@ -60,6 +60,34 @@ describe('two-scope original share driver', () => {
     }
   })
 
+  test('keeps scripted reply mutations separate from original metadata and assignment results', () => {
+    const { SoakTransport } = require('./fixtures/soakTransport')
+    const cases = [
+      [
+        'fetchTopicMetadata',
+        { topics: [{ name: 't', partitions: [{ partitionId: 0, replicas: [0, 1, 2] }] }] },
+        (fields) => fields.Topics[0].Partitions[0].ReplicaNodes.pop(),
+      ],
+      [
+        'describeShareGroups',
+        {
+          groups: [
+            { groupId: 'g', members: [{ assignment: [{ topic: 't', partitions: [0, 1, 2] }] }] },
+          ],
+        },
+        (fields) => fields.Groups[0].Members[0].Assignment.TopicPartitions[0].Partitions.pop(),
+      ],
+    ]
+    for (const [name, result, mutate] of cases) {
+      const original = JSON.parse(JSON.stringify(result))
+      const fields = SoakTransport.prototype.resultFields(name, [], result)
+      mutate(fields)
+      expect(result).toEqual(original)
+      const pristine = SoakTransport.prototype.resultFields(name, [], result)
+      expect(fields).not.toEqual(pristine)
+    }
+  })
+
   test.each([true, false])(
     'derives both complete workloads, cleanup and sealed archive verdicts from original operations, short=%s',
     async (short) => {

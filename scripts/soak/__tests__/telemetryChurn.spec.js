@@ -1390,6 +1390,113 @@ describe('telemetry rotation readback', () => {
   })
 })
 
+describe('telemetry share corpus configuration', () => {
+  const make = () => {
+    let source = 5
+    let value = 'latest'
+    const resource = { resourceType: 32, resourceName: 's-share-group', errorCode: 0 }
+    const admin = {
+      connect: jest.fn(async () => {}),
+      createTopics: jest.fn(async () => {}),
+      incrementalAlterConfigs: jest.fn(async () => ({ resources: [resource] })),
+      describeConfigs: jest.fn(async () => ({
+        resources: [
+          {
+            ...resource,
+            configEntries: [
+              { configName: 'share.auto.offset.reset', configValue: value, configSource: source },
+            ],
+          },
+        ],
+      })),
+      disconnect: jest.fn(async () => {}),
+    }
+    const producer = { connect: jest.fn(async () => {}), disconnect: jest.fn(async () => {}) }
+    const fixture = new ParentFixture({
+      stem: 's',
+      kafka: { admin: () => admin, producer: () => producer },
+    })
+    return {
+      fixture,
+      admin,
+      producer,
+      apply: (nextSource, nextValue) => {
+        source = nextSource
+        value = nextValue
+      },
+    }
+  }
+  beforeEach(() => jest.useFakeTimers({ now: 1000 }))
+  afterEach(() => jest.useRealTimers())
+
+  test('reads back earliest share offsets before setup completes and restores the override before disconnect', async () => {
+    const { fixture, admin, apply } = make()
+    let ready = false
+    const opening = fixture.open().then(() => {
+      ready = true
+    })
+    opening.catch(() => {})
+    await jest.advanceTimersByTimeAsync(0)
+    expect(ready).toBe(false)
+    expect(admin.incrementalAlterConfigs).toHaveBeenCalledWith({
+      resources: [
+        {
+          type: 32,
+          name: 's-share-group',
+          configEntries: [{ name: 'share.auto.offset.reset', operation: 0, value: 'earliest' }],
+        },
+      ],
+    })
+    apply(5, 'earliest')
+    await jest.advanceTimersByTimeAsync(250)
+    expect(ready).toBe(false)
+    apply(8, 'earliest')
+    await jest.advanceTimersByTimeAsync(250)
+    await opening
+    expect(ready).toBe(true)
+    const closing = fixture.close()
+    closing.catch(() => {})
+    await jest.advanceTimersByTimeAsync(0)
+    expect(admin.disconnect).not.toHaveBeenCalled()
+    expect(admin.incrementalAlterConfigs).toHaveBeenLastCalledWith({
+      resources: [
+        {
+          type: 32,
+          name: 's-share-group',
+          configEntries: [{ name: 'share.auto.offset.reset', operation: 1 }],
+        },
+      ],
+    })
+    apply(5, 'latest')
+    await jest.advanceTimersByTimeAsync(100)
+    await closing
+    expect(admin.disconnect).toHaveBeenCalledTimes(1)
+    expect(jest.getTimerCount()).toBe(0)
+  })
+
+  test('restores a refused share setup and disconnects both clients even when restoration fails', async () => {
+    const { fixture, admin, producer } = make()
+    const refused = new Error('config set failed')
+    const restoration = new Error('config reset failed')
+    admin.incrementalAlterConfigs.mockRejectedValueOnce(refused).mockRejectedValueOnce(restoration)
+    await expect(fixture.open()).rejects.toBe(refused)
+    const closing = fixture.close()
+    await expect(closing).rejects.toMatchObject({ errors: [restoration] })
+    expect(admin.incrementalAlterConfigs).toHaveBeenLastCalledWith({
+      resources: [
+        {
+          type: 32,
+          name: 's-share-group',
+          configEntries: [{ name: 'share.auto.offset.reset', operation: 1 }],
+        },
+      ],
+    })
+    expect(admin.disconnect).toHaveBeenCalledTimes(1)
+    expect(producer.disconnect).toHaveBeenCalledTimes(1)
+    expect(jest.getTimerCount()).toBe(0)
+  })
+})
+
 describe('telemetry profile ordinary work', () => {
   test('subscribes every owned worker suffix and excludes another run', async () => {
     let config
