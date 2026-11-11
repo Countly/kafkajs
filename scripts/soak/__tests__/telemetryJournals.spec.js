@@ -335,3 +335,76 @@ describe('telemetry journal ownership diagnostic', () => {
     }
   }, 240000)
 })
+
+describe('telemetry journal calibration', () => {
+  test('matches the unchanged slope and endpoint evaluator on flat and seeded virtual vectors', () => {
+    const { RetainedCalibration } = require('./fixtures/journalOwnershipChild')
+    const { TELEMETRY, TelemetryResourceVerdict } = require('../soak')
+    for (const rate of [0, 131072, 524288]) {
+      const samples = TELEMETRY.sampleAt.map((at, index) => ({
+        admittedAtMs: at,
+        completedAtMs: at + 300 + (index % 2 ? 37 : 0),
+        snapshot: {
+          registryDigest: 'diagnostic',
+          memory: {
+            retainedBytes: 10000000 + Math.round((rate * (at - 60000)) / 60000),
+          },
+        },
+      }))
+      const input = { samples, measurementMs: TELEMETRY.measureMs }
+      const actual = RetainedCalibration.evaluate(input)
+      const full = TelemetryResourceVerdict.evaluate({
+        ...input,
+        clientCount: 1,
+        baseline: samples[0].snapshot,
+        teardown: samples.at(-1).snapshot,
+        cleanupMs: 1,
+      })
+      expect(actual.scope).toBe('slope-and-endpoint-only')
+      expect(actual.measured.slopeBytesPerMinute).toBe(full.measured.slopeBytesPerMinute)
+      expect(actual.measured.endpointBytes).toBe(full.measured.endpointBytes)
+      expect(actual.violations).toEqual(
+        full.violations.filter((label) => ['retained slope', 'retained endpoint'].includes(label))
+      )
+      expect(actual.ok).toBe(rate === 0)
+      if (rate === 524288)
+        expect(actual.violations).toEqual(['retained slope', 'retained endpoint'])
+    }
+  })
+
+  test('records actual admission and completion times and inventories every settled boundary', async () => {
+    const { RetainedCalibration } = require('./fixtures/journalOwnershipChild')
+    let now = 1060019
+    const inventory = { weakRefs: 1, weakMaps: 0, maps: 0, buffers: 2, byteLength: 4096 }
+    const memory = {
+      settled: async () => {
+        now += 237
+        return { at: now, heapUsed: 100, external: 20, arrayBuffers: 10, retained: 120 }
+      },
+    }
+    const calibration = new RetainedCalibration({
+      memory,
+      now: () => now,
+      origin: 1000000,
+      inventory: () => inventory,
+    })
+    const row = await calibration.take('first', 60000)
+    expect(row).toMatchObject({
+      checkpoint: 'first',
+      scheduledAtMs: 60000,
+      admittedAtMs: 60019,
+      completedAtMs: 60256,
+      observer: inventory,
+      snapshot: { memory: { retainedBytes: 120, heapUsed: 100, external: 20, arrayBuffers: 10 } },
+    })
+    inventory.weakRefs++
+    await expect(calibration.take('last', 359000)).rejects.toThrow('observer storage changed')
+  })
+
+  test('rejects incomplete or virtualized real-time calibration evidence', () => {
+    const { RetainedCalibration } = require('./fixtures/journalOwnershipChild')
+    expect(() => RetainedCalibration.evaluate({ samples: [], measurementMs: 1 })).toThrow(
+      'calibration duration or samples'
+    )
+  })
+})
