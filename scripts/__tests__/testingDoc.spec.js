@@ -1,5 +1,7 @@
 const fs = require('fs')
 const path = require('path')
+const vm = require('vm')
+const yaml = require('js-yaml')
 const { scripts } = require('../../package.json')
 const { integrationPlan } = require('../ci/integrationPlan')
 
@@ -13,6 +15,39 @@ const ci = page.slice(
   page.indexOf('CI (`.github/workflows/ci.yml`)'),
   page.indexOf('For development')
 )
+
+const WORDS = 'zero one two three four five six seven eight nine ten eleven twelve'.split(' ')
+
+/**
+ * Runs the telemetry workflow's `plan` script as the workflow does, without the memory verdicts.
+ * @param {boolean} full true for the exit catalogue, false for the development rows
+ * @returns {{node: number, kafka: string, group: string, compose: string}[]} the matrix rows
+ */
+const telemetryRows = (full) => {
+  const plan = yaml
+    .load(read('.github', 'workflows', 'telemetry.yml'))
+    .jobs.plan.steps.find(({ id }) => id === 'plan')
+  const script = /node <<'NODE'\n([\s\S]*?)\nNODE/.exec(plan.run)[1]
+  let output
+  vm.runInNewContext(script, {
+    process: { env: { FULL: String(full), MEMORY_VERDICTS: 'false', GITHUB_OUTPUT: 'output' } },
+    require: () => ({
+      appendFileSync: (file, value) => {
+        output = value
+      },
+    }),
+  })
+  return JSON.parse(output.trim().slice('matrix='.length)).include
+}
+
+/**
+ * @param {{kafka: string}[]} rows matrix rows
+ * @returns {string} their distinct Kafka lines, newest first, joined by `/`
+ */
+const kafkaLines = (rows) =>
+  [...new Set(rows.map(({ kafka }) => kafka))]
+    .sort((a, b) => b.localeCompare(a, 'en', { numeric: true }))
+    .join('/')
 
 /**
  * @param {string} text
@@ -194,6 +229,38 @@ describe('docs/Testing.md', () => {
       'no threshold',
     ])
       expect(block).toContain(text)
+  })
+
+  it('states the telemetry row counts, Kafka lines and jars the tree has', () => {
+    const configured = 'docker-compose.telemetry.yml'
+    const development = telemetryRows(false)
+    const exit = telemetryRows(true)
+    const exitConfigured = exit.filter(({ compose }) => compose === configured)
+    const exitBase = exit.filter(({ compose }) => compose !== configured)
+    const jars = read('.gitignore').match(
+      /^!scripts\/e2e\/telemetry\/fixtures\/(?:counting-telemetry-reporter|java-telemetry-client)-[\d.]+\.jar$/gm
+    )
+
+    expect(new Set(development.map(({ node }) => node))).toEqual(new Set([24]))
+    expect(new Set(exitConfigured.map(({ group }) => group)).size).toBe(7)
+    expect(page).toContain(
+      `Development CI has ${WORDS[development.length]} distinct Node 24 rows, all on Kafka ${kafkaLines(development)}:`
+    )
+    expect(ci).toContain(`the ${WORDS[development.length]} functional development rows`)
+    expect(page).toContain(`required functional exit catalogue has ${exit.length} rows`)
+    expect(ci).toContain(`supplies the ${exit.length} required functional rows`)
+    expect(page).toContain(`all seven configured groups on ${kafkaLines(exitConfigured)},`)
+    expect(page).toContain(
+      `(\`telemetry-base\` and \`telemetry-unsupported\`) on ${kafkaLines(
+        exitBase.filter(({ group }) => group !== 'telemetry-outcomes')
+      )},`
+    )
+    expect(page).toContain(
+      `the base \`telemetry-outcomes\` group on ${kafkaLines(
+        exitBase.filter(({ group }) => group === 'telemetry-outcomes')
+      )}.`
+    )
+    expect(page).toContain(`The ${WORDS[jars.length]} retained reporter and Java client jars`)
   })
 
   it('does not claim the cold-cluster createTopics race is gone from every run', () => {
