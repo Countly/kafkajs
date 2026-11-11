@@ -164,6 +164,66 @@ describe('Independent broker tool captures', () => {
     }
   })
 
+  test('accepts an advancing finalized-features epoch and projects the wire epoch', () => {
+    for (const [toolEpoch, wireEpoch] of [
+      ['183', '184'],
+      ['9', '10'],
+      ['9007199254740992', '9007199254740993'],
+    ]) {
+      const { features } = projectBrokerTools(
+        projectorInput({
+          features: featuresText(toolEpoch),
+          wire: { ...wireObject(), finalizedFeaturesEpoch: wireEpoch },
+        })
+      )
+
+      expect(features.finalizedFeaturesEpoch).toBe(wireEpoch)
+    }
+  })
+
+  test('rejects a finalized-features epoch that moves backwards from tool to wire', () => {
+    for (const [toolEpoch, wireEpoch] of [
+      ['185', '184'],
+      ['9007199254740993', '9007199254740992'],
+    ]) {
+      expect(() =>
+        projectBrokerTools(
+          projectorInput({
+            features: featuresText(toolEpoch),
+            wire: { ...wireObject(), finalizedFeaturesEpoch: wireEpoch },
+          })
+        )
+      ).toThrow(
+        new RegExp(`finalized-features epoch disagree: tool ${toolEpoch}, wire ${wireEpoch}`)
+      )
+    }
+  })
+
+  test('accepts equal finalized-features epochs', () => {
+    const { features } = projectBrokerTools(
+      projectorInput({
+        features: featuresText('184'),
+        wire: { ...wireObject(), finalizedFeaturesEpoch: '184' },
+      })
+    )
+
+    expect(features.finalizedFeaturesEpoch).toBe('184')
+  })
+
+  test('rejects epoch comparisons without timestamps proving the tool was captured first', () => {
+    for (const toolEpoch of ['183', '184']) {
+      for (const capturedOn of ['2026-11-12T10:00:04Z', '2026-11-12T10:00:05Z']) {
+        const input = projectorInput({
+          features: featuresText(toolEpoch),
+          wire: { ...wireObject(), finalizedFeaturesEpoch: '184' },
+        })
+        input.provenance.captures.find(({ file }) => file === RAW.features).capturedOn = capturedOn
+
+        expect(() => projectBrokerTools(input)).toThrow(/capture order.*tool.*before.*wire/)
+      }
+    }
+  })
+
   test('rejects missing provenance and a raw digest mismatch', () => {
     const input = projectorInput()
     expect(() => projectBrokerTools({ ...input, provenance: undefined })).toThrow(/provenance/)

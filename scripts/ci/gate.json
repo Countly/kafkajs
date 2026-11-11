@@ -113,6 +113,10 @@
       "needs": {},
       "evidence": [],
       "titles": [
+        "scripts/protocol/__tests__/captureBrokerTools.spec.js \u203a Independent broker tool captures accepts an advancing finalized-features epoch and projects the wire epoch",
+        "scripts/protocol/__tests__/captureBrokerTools.spec.js \u203a Independent broker tool captures accepts equal finalized-features epochs",
+        "scripts/protocol/__tests__/captureBrokerTools.spec.js \u203a Independent broker tool captures rejects a finalized-features epoch that moves backwards from tool to wire",
+        "scripts/protocol/__tests__/captureBrokerTools.spec.js \u203a Independent broker tool captures rejects epoch comparisons without timestamps proving the tool was captured first",
         "scripts/protocol/__tests__/captureBrokerTools.spec.js \u203a Independent broker tool captures both capture tools load only literal Node built-in dependencies",
         "scripts/protocol/__tests__/captureBrokerTools.spec.js \u203a Independent broker tool captures dependency scan rejects client code and non-literal specifiers",
         "scripts/protocol/__tests__/captureBrokerTools.spec.js \u203a Independent broker tool captures projects finalized feature levels without inventing absent fields",
@@ -22890,6 +22894,10 @@
       "needs": {},
       "evidence": [],
       "titles": [
+        "scripts/protocol/__tests__/captureBrokerTools.spec.js \u203a Independent broker tool captures accepts an advancing finalized-features epoch and projects the wire epoch",
+        "scripts/protocol/__tests__/captureBrokerTools.spec.js \u203a Independent broker tool captures accepts equal finalized-features epochs",
+        "scripts/protocol/__tests__/captureBrokerTools.spec.js \u203a Independent broker tool captures rejects a finalized-features epoch that moves backwards from tool to wire",
+        "scripts/protocol/__tests__/captureBrokerTools.spec.js \u203a Independent broker tool captures rejects epoch comparisons without timestamps proving the tool was captured first",
         "scripts/protocol/__tests__/captureBrokerTools.spec.js \u203a Independent broker tool captures both capture tools load only literal Node built-in dependencies",
         "scripts/protocol/__tests__/captureBrokerTools.spec.js \u203a Independent broker tool captures dependency scan rejects client code and non-literal specifiers",
         "scripts/protocol/__tests__/captureBrokerTools.spec.js \u203a Independent broker tool captures projects finalized feature levels without inventing absent fields",
