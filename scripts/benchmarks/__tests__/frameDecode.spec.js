@@ -1,4 +1,5 @@
 const { SHAPES, parseArgs, chunksOf, timed, control } = require('../frameDecode')
+const { EventEmitter } = require('events')
 const RequestQueue = require('../../../src/network/requestQueue')
 
 const FRAME_HEADER = 8
@@ -69,6 +70,43 @@ describe('Benchmarks > frameDecode', () => {
   })
 
   describe('a run', () => {
+    const originalGc = globalThis.gc
+    beforeEach(() => {
+      globalThis.gc = jest.fn()
+    })
+    afterEach(() => {
+      globalThis.gc = originalGc
+      jest.restoreAllMocks()
+    })
+
+    test('timed mode requires gc while the functional control does not', async () => {
+      delete globalThis.gc
+      await expect(timed('64b', 2)).rejects.toThrow(/gc/)
+      await expect(control('64b', 2)).resolves.toMatchObject({ pass: true })
+    })
+
+    test('discards three warmups and collects before each of seven measured intervals', async () => {
+      const events = []
+      let intervalCalls = 2
+      globalThis.gc = jest.fn(() => {
+        events.push('gc')
+        intervalCalls = 0
+      })
+      const clock = process.hrtime.bigint
+      jest.spyOn(process.hrtime, 'bigint').mockImplementation(() => {
+        if (intervalCalls++ < 2) events.push('time')
+        return clock()
+      })
+      const result = await timed('64b', 2)
+      expect(result.warmupRoundNsPerOp).toHaveLength(3)
+      expect(result.roundNsPerOp).toHaveLength(7)
+      expect(events).toEqual([
+        ...Array.from({ length: 10 }, () => ['gc', 'time', 'time']).flat(),
+        'gc',
+        'gc',
+      ])
+      expect(result.nsPerFrame).toBe([...result.roundNsPerOp].sort((a, b) => a - b)[3])
+    })
     test.each(Object.keys(SHAPES))(
       'times %s, and the control counts as many calls as frames fed',
       async (shape) => {
@@ -84,6 +122,28 @@ describe('Benchmarks > frameDecode', () => {
       },
       60000
     )
+
+    test('repeats unchanged fixtures in every warmup and measured round and keeps nanoseconds per frame', async () => {
+      let nanos = 0n
+      const emit = EventEmitter.prototype.emit
+      jest.spyOn(EventEmitter.prototype, 'emit').mockImplementation(function (event, ...args) {
+        if (event === 'data' && Buffer.isBuffer(args[0])) nanos += 1600n
+        return emit.call(this, event, ...args)
+      })
+      jest.spyOn(process.hrtime, 'bigint').mockImplementation(() => nanos)
+      const fulfill = jest.spyOn(RequestQueue.prototype, 'fulfillRequest')
+      const result = await timed('64b', 2, 3)
+      expect(result.nsPerFrame).toBe(1600)
+      expect(result.roundNsPerOp).toEqual(Array(7).fill(1600))
+      expect(result.warmupRoundNsPerOp).toEqual(Array(3).fill(1600))
+      expect(fulfill).toHaveBeenCalledTimes(2 * 3 * 10)
+      expect(result.workMultiplier).toBe(3)
+      expect(result.frames).toBe(2)
+      expect(result.warmupRoundNsPerOp).toHaveLength(3)
+      expect(result.roundNsPerOp).toHaveLength(7)
+      expect(globalThis.gc).toHaveBeenCalledTimes(12)
+      expect(result.nsPerFrame).toBe([...result.roundNsPerOp].sort((a, b) => a - b)[3])
+    })
 
     test('the control leaves the request queue as it found it', async () => {
       const original = RequestQueue.prototype.fulfillRequest

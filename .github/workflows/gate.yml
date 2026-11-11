@@ -31,10 +31,12 @@ env:
   TIERED_JAR_SHA256: f3236936854c13815ffaa7f35a3f2d6861c125616cba5395b538b8680dded886
 jobs:
   plan:
+    timeout-minutes: 5
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ${{ vars.GATE_RUNNER || 'ubuntu-latest' }}
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
+      decoder: ${{ steps.plan.outputs.decoder }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -55,11 +57,18 @@ jobs:
             if (!ids.includes(id)) throw new Error(`Unknown check: ${id}`)
           }
           const include = gate.checks.filter(check => !only.length || only.includes(check.id))
-            .map(({ id, capMinutes }) => {
+            .flatMap(({ id, capMinutes, partitions }) => {
               if (!/^[a-z0-9][a-z0-9-]*$/.test(id) || !Number.isInteger(capMinutes) || capMinutes < 1) {
                 throw new Error(`Invalid matrix entry: ${id}`)
               }
-              return { id, capMinutes }
+              if (partitions !== undefined) {
+                const expected = ['frame-1m', 'frame-other', 'batch-array']
+                if (id !== 'decoder-count-performance' || JSON.stringify(partitions) !== JSON.stringify(expected)) {
+                  throw new Error(`Invalid partitions: ${id}`)
+                }
+                return partitions.map(partition => ({ id: `${id}-${partition}`, checkId: id, partition, capMinutes }))
+              }
+              return [{ id, capMinutes }]
             })
           for (const check of gate.checks) {
             if (check.kafkaVersion !== undefined && !/^\d+\.\d+\.\d+$/.test(check.kafkaVersion)) {
@@ -67,6 +76,7 @@ jobs:
             }
           }
           if (!include.length) throw new Error('No checks selected')
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `decoder=${include.some(row => row.checkId === 'decoder-count-performance')}\n`)
           fs.appendFileSync(process.env.GITHUB_OUTPUT, `matrix=${JSON.stringify({ include })}\n`)
           NODE
 
@@ -79,7 +89,9 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     env:
-      CHECK_ID: ${{ matrix.id }}
+      CHECK_ID: ${{ matrix.checkId || matrix.id }}
+      MATRIX_ID: ${{ matrix.id }}
+      PARTITION: ${{ matrix.partition }}
       DO_NOT_STOP: '1'
     steps:
       - uses: actions/checkout@v4
@@ -301,12 +313,19 @@ jobs:
             coverage/coverage-summary.json
             coverage/lcov.info
             ${{ runner.temp }}/compose.log
+      - uses: actions/upload-artifact@v4
+        if: always() && matrix.partition != null
+        with:
+          name: decoder-partition-${{ matrix.partition }}
+          retention-days: 14
+          include-hidden-files: true
+          path: .tmp/decoder-comparison.json
       - name: Record result
         if: always()
         env:
           RESULT: ${{ job.status }}
         run: |
-          node -e 'require("fs").writeFileSync(`${process.env.RUNNER_TEMP}/${process.env.CHECK_ID}.json`, JSON.stringify({id: process.env.CHECK_ID, result: process.env.RESULT}))'
+          node -e 'require("fs").writeFileSync(`${process.env.RUNNER_TEMP}/${process.env.MATRIX_ID}.json`, JSON.stringify({id: process.env.MATRIX_ID, result: process.env.RESULT}))'
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -314,8 +333,51 @@ jobs:
           retention-days: 14
           path: ${{ runner.temp }}/${{ matrix.id }}.json
 
+  decoder-combine:
+    needs: [plan, check]
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.decoder == 'true'
+    name: decoder-count-performance
+    runs-on: ${{ vars.GATE_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: decoder-partition-*
+          path: .tmp/decoder-partitions
+      - name: Combine decoder partitions
+        run: |
+          node scripts/benchmarks/compareDecoderBounds.js --combine \
+            --input .tmp/decoder-partitions/decoder-partition-frame-1m/decoder-comparison.json \
+            --input .tmp/decoder-partitions/decoder-partition-frame-other/decoder-comparison.json \
+            --input .tmp/decoder-partitions/decoder-partition-batch-array/decoder-comparison.json \
+            --out .tmp/decoder-combined.json || exit 1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: decoder-combined
+          retention-days: 14
+          include-hidden-files: true
+          path: .tmp/decoder-combined.json
+      - name: Record combined decoder result
+        if: always()
+        env:
+          RESULT: ${{ job.status }}
+        run: |
+          node -e 'require("fs").writeFileSync(`${process.env.RUNNER_TEMP}/decoder-count-performance.json`, JSON.stringify({id: "decoder-count-performance", result: process.env.RESULT}))' || exit 1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gate-result-decoder-count-performance
+          retention-days: 14
+          path: ${{ runner.temp }}/decoder-count-performance.json
+
   verdict:
-    needs: [plan, check, telemetry]
+    timeout-minutes: 5
+    needs: [plan, check, telemetry, decoder-combine]
     if: always() && needs.plan.result != 'skipped'
     runs-on: ${{ vars.GATE_RUNNER || 'ubuntu-latest' }}
     steps:
@@ -331,6 +393,7 @@ jobs:
         if: always()
         env:
           MATRIX: ${{ needs.plan.outputs.matrix }}
+          DECODER: ${{ needs.plan.outputs.decoder }}
           PLAN_RESULT: ${{ needs.plan.result }}
           CHECK_RESULT: ${{ needs.check.result }}
           TELEMETRY_RESULT: ${{ needs.telemetry.result }}
@@ -342,6 +405,10 @@ jobs:
             const file = `results/${id}.json`
             return { id, result: fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')).result : 'missing' }
           })
+          if (process.env.DECODER === 'true') {
+            const file = 'results/decoder-count-performance.json'
+            rows.push({ id: 'decoder-count-performance', result: fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')).result : 'missing' })
+          }
           rows.push({ id: 'telemetry-full', result: process.env.TELEMETRY_RESULT })
           const summary = ['| Check id | Result |', '| --- | --- |', ...rows.map(({ id, result }) => `| ${id} | ${result} |`)]
           fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, summary.join('\n') + '\n')

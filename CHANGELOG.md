@@ -7,6 +7,10 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 ### Phase 9G — Kafka 4.4 support
 
+#### Behavior changes
+
+- Reject decoded arrays above 1,000,000 entries and tagged sections above 10,000 fields in protocol responses before allocation, including in the DescribeDelegationToken, DescribeClientQuotas, AlterClientQuotas, ElectLeaders and ShareFetch readers; bound initial array allocation. Record batches are not affected: record counts and record headers stay bounded by the bytes received and by `maxDecompressedBatchBytes`, as before; otherwise-valid records with more than 1,000,000 headers remain supported.
+
 #### Additions
 
 - Record independent Kafka 4.4.0 and 4.3.2 broker capability captures.
@@ -19,11 +23,11 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - Apply `bootstrapResolveTimeout` to initial metadata discovery and subscription, and cancel pending admin DNS readiness before draining admitted calls.
 - Client-throttle Produce v8 to v13, AlterPartitionReassignments and ListPartitionReassignments responses as the Java client does (KAFKA-20828), and stop client-throttling DeleteTopics v1, whose throttle the broker already serves.
-- Reject decoded arrays above 1,000,000 entries and tagged sections above 10,000 fields in protocol responses before allocation, including in the DescribeDelegationToken, DescribeClientQuotas, AlterClientQuotas, ElectLeaders and ShareFetch readers; bound initial array allocation. Record batches are not affected: record counts and record headers stay bounded by the bytes received and by `maxDecompressedBatchBytes`, as before; otherwise-valid records with more than 1,000,000 headers remain supported.
 
 #### Tooling
 
-- A CI check compares decode speed of the bounded array readers and record headers against the base revision on real Produce and Fetch responses; a slowdown above 5 % fails unless a recorded exception covers it.
+- Judge decoder benchmark rows with paired confidence bounds and a calibrated baseline control, using longer rounds and three parallel collection partitions.
+- A CI check compares decode speed of the bounded array readers and record headers against the base revision on real Produce and Fetch responses.
 
 ### Phase 9F — Client telemetry
 
