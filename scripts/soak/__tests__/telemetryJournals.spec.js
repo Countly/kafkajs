@@ -141,6 +141,20 @@ describe('telemetry fixed journals', () => {
         teardown: { journals: journal.journalState() },
       })
     ).toContain('journal overflow')
+    const columns = new churn.FixedJournal({
+      name: 'labels',
+      capacity: 70,
+      bytes: 8192,
+      columns: true,
+    })
+    columns.push({ groupId: 'λ\ud800', unknown: 'λ' })
+    expect(columns.values()).toEqual([{ groupId: 'λ\ud800', unknown: 'λ' }])
+    for (let n = 0; n < 63; n++) columns.push({ groupId: String(n) })
+    const state = columns.journalState()
+    const contents = Buffer.from(columns.storage)
+    expect(() => columns.push({ groupId: 'overflow' })).toThrow(/symbol overflow/)
+    expect(columns.journalState()).toEqual({ ...state, overflow: true })
+    expect(columns.storage.equals(contents)).toBe(true)
     const bytes = new churn.FixedJournal({ name: 'bytes', capacity: 2, bytes: 32 })
     expect(() => bytes.push('x'.repeat(100))).toThrow(/bytes.*overflow/)
     expect(bytes.length).toBe(0)
@@ -200,6 +214,23 @@ describe('telemetry fixed journals', () => {
     journal.push(...strings)
     expect(journal.values()).toEqual(strings)
     expect(journal.cursor).toBe(84)
+    const scalars = new churn.FixedJournal({ name: 'numbers', capacity: 12, bytes: 128 })
+    const values = [
+      -0,
+      NaN,
+      Infinity,
+      -Infinity,
+      -32769,
+      -32768,
+      32767,
+      32768,
+      -2147483648,
+      2147483647,
+      2147483648,
+      0.125,
+    ]
+    scalars.push(...values)
+    expect(scalars.values()).toEqual(values)
   })
 
   test('counts only valid distinct corpus ids toward handler completeness', () => {
@@ -265,12 +296,21 @@ describe('telemetry journal ownership diagnostic', () => {
         expect(old.storage.mode).toBe('legacy')
         expect(fixed.storage.before.byteLength).toBeGreaterThan(0)
         expect(fixed.storage.closed.byteLength).toBe(fixed.storage.before.byteLength)
+        expect(fixed.storage.before.columns[0].columns[0].format).toBe('scalar-utf8-1')
+        if (kind === 'shareConsumer')
+          expect(fixed.storage.before.columns[1].columns[0].format).toBe('share-columns-utf8-1')
         expect(old.storage.before).toBeNull()
         expect(old.storage.closed).toBeNull()
-        expect(fixed.ownership).toEqual(old.ownership)
+        for (const [index, checkpoint] of fixed.ownership.entries()) {
+          const { journals, ...ownership } = checkpoint
+          const { journals: legacyJournals, ...legacyOwnership } = old.ownership[index]
+          expect(ownership).toEqual(legacyOwnership)
+          expect(legacyJournals).toBeNull()
+          expect(journals.byteLength).toBe(fixed.storage.before.byteLength)
+        }
+        expect(fixed.violations).not.toContain('retained slope')
+        expect(fixed.violations).not.toContain('retained endpoint')
         for (const result of [old, fixed]) {
-          expect(result.violations).not.toContain('retained slope')
-          expect(result.violations).not.toContain('retained endpoint')
           expect(result.ownership.map((row) => row.checkpoint)).toEqual([
             'M',
             'first',

@@ -3,6 +3,7 @@
 const crypto = require('node:crypto')
 const churn = require('../../telemetryChurn')
 const { ReferenceWork, ReferenceShareLedger } = require('./journalReference')
+const { journalState } = require('../../../../testHelpers/fixedJournal')
 const { ProcessMemory } = require('../../../../testHelpers/processMemory')
 const { WeakOwners } = require('../../../e2e/telemetry/retained/weakOwners')
 const TelemetryMetrics = require('../../../../src/telemetry/metrics')
@@ -72,6 +73,7 @@ const run = async (mode, kind, seeded) => {
     const rows = owners.read()
     ownership.push({
       checkpoint,
+      journals: storageState(),
       rows,
       positiveAlive: rows.find((row) => row.id === positiveId)?.alive === true,
       recordTargetsAlive: rows.filter((row) => row.kind === 'record' && row.alive).length,
@@ -143,6 +145,9 @@ const run = async (mode, kind, seeded) => {
       now += ms
     },
   })
+  const storageState = () =>
+    mode === 'fixed' ? journalState([work, ...(ledger ? [ledger] : [])]) : null
+  const beforeStorage = storageState()
   try {
     await work.start()
     const baseline = await memory.settled()
@@ -201,6 +206,7 @@ const run = async (mode, kind, seeded) => {
       samples,
       closed,
       ownership: ownership.values(),
+      storage: { mode, before: beforeStorage, closed: storageState() },
       violations: verdict.violations,
     }
   } finally {

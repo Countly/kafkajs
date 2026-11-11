@@ -97,23 +97,32 @@ const ROOT = path.resolve(__dirname, '../..')
 const NATIVE_ROWS = 1024
 
 /**
- * Sizes finite journals from the case envelope, workload cadence and lifecycle catalogue.
- * Four times the paced exchange estimate also admits acknowledgements, renewals and reconnects.
+ * Bounds the unchanged corpus, three-partition topology and session catalogue, not average traffic.
+ * Empty/error rounds owe 50 ms per node (shareFetchLoop); 500 ms is only a maximum broker wait.
+ * A productive fetch or a separate flush may carry just one record, not a full 100-record batch.
+ * The 10% corpus margin covers extra deliveries; further traffic or shapes overflow fatally.
+ * Headers reserve 256 bytes, request/response partition pairs 80, acquisition+ack+types per record
+ * 128, and public ack rows 192. Field columns and byte-only label slots bound repeated names.
  * @param {object} [limits] the unchanged telemetry schedule constants @returns {object} capacities
  */
 const journalLimits = (
   limits = { caseMs: 540000, sampleAt: Array(11), warmupMs: 60000, measureMs: 300000 }
 ) => {
   const batches = Math.ceil(CORPUS.records / CORPUS.batch)
-  const exchanges = 4 * (Math.ceil(limits.caseMs / 500) + batches)
-  const receipts = 4 * (Math.ceil(limits.caseMs / STEPS.subscriptionMs) + 1)
+  const records = Math.ceil((CORPUS.records * 11) / 10)
+  const sessions = 3 * (Math.ceil(limits.caseMs / STEPS.reopenMs) + 2)
+  const emptyRounds = 3 * Math.ceil(limits.caseMs / 50)
+  const lifecycleExchanges = sessions * 4
+  const exchanges = emptyRounds + records * 2 + lifecycleExchanges
+  const partitionPairs = emptyRounds + 3 * (records * 2 + lifecycleExchanges)
+  const receipts = 2 * (Math.ceil(limits.caseMs / STEPS.reopenMs) + 3)
   return {
-    records: CORPUS.records * 2,
-    batches: batches * 2,
+    records,
+    batches: Math.ceil((batches * 11) / 10),
     exchanges,
-    exchangeBytes: exchanges * 4096,
-    acknowledgements: CORPUS.records * 2,
-    acknowledgementBytes: CORPUS.records * 2 * 512,
+    exchangeBytes: exchanges * 256 + partitionPairs * 80 + records * 128,
+    acknowledgements: records,
+    acknowledgementBytes: records * 192,
     receipts,
     samples: limits.sampleAt.length + 4,
     sampleBytes: (limits.sampleAt.length + 4) * 65536,
@@ -1330,11 +1339,13 @@ class ShareLedger {
     this.traces = []
     this.exchanges = new FixedJournal({
       name: 'share exchanges',
+      columns: true,
       capacity: storage.exchanges,
       bytes: storage.exchangeBytes,
     })
     this.settled = new FixedJournal({
       name: 'share acknowledgements',
+      columns: true,
       capacity: storage.acknowledgements,
       bytes: storage.acknowledgementBytes,
     })
@@ -4185,7 +4196,7 @@ class TelemetryWorkerProcess {
    *   control with its frozen catalogue, the enabled replay of that catalogue, the native work
    *   journal and its sampler, and the host before the control, at the boundary and after the run
    */
-  reference({ loaded, control, host, memory, journal, sampler, foreground }) {
+  reference({ loaded, control, host, memory, journal, sampler, foreground, allocation }) {
     return {
       version: 'rss-reference-2',
       source: memory.source ? 'proc-status-vmhwm' : null,
@@ -4196,11 +4207,19 @@ class TelemetryWorkerProcess {
       control,
       foreground,
       journals: {
-        version: 1,
-        allocationBeforeControl: ['native', 'pending-windows', 'memory-samples'],
-        allocationAfterControlBeforeM: ['ordinary', 'share'],
+        version: 2,
+        allocationBeforeControl: [
+          'native',
+          'pending-windows',
+          'memory-samples',
+          'ordinary',
+          ...(this.kind === 'shareConsumer' ? ['share'] : []),
+        ],
+        allocationAfterControlBeforeM: [],
+        allocation,
+        capacities: journalLimits(this.soak.TELEMETRY),
         rssEffect:
-          'The control includes preallocated native, pending-window and sample storage; ordinary and share storage are charged to the enabled RSS delta.',
+          'All journal backing storage is touched before c0 and held through closed. It is included in the disabled RSS baseline, the 96 MiB setup allowance and the 160 MiB absolute peak; no bytes are subtracted from any reading.',
       },
       native: { journal: journal.summary(), sampler: sampler.summary() },
       final: readMemory('final', () => this.clock.now()),
@@ -4267,6 +4286,30 @@ class TelemetryWorkerProcess {
     let worker = null
     try {
       const config = await this.inbox.take((m) => m.type === 'config')
+      const schedule = new TelemetrySchedule(soak.TELEMETRY)
+      const ledger =
+        kind === 'shareConsumer'
+          ? new ShareLedger({ group: config.group, clock: this.clock, storage })
+          : null
+      const ordinary = new OrdinaryWork({
+        kind,
+        client: null,
+        stem: config.stem,
+        topic: config.topic,
+        ctl: config.ctl,
+        clock: this.clock,
+        sleep: this.sleep,
+        ledger,
+        slots: schedule.corpusSlots(),
+        storage,
+      })
+      const allocation = journalState([
+        ordinary,
+        ...(ledger ? [ledger] : []),
+        journal,
+        sampler,
+        sampleJournal,
+      ])
       resources.start()
       const loaded = readMemory('loaded', () => this.clock.now())
       const host = { before: hostContext(() => this.clock.now()) }
@@ -4284,10 +4327,6 @@ class TelemetryWorkerProcess {
       host.boundary = hostContext(() => this.clock.now())
       journal.observe('gzip', gzipCodec)
       journal.observe('zstd', zstdCodec)
-      const ledger =
-        kind === 'shareConsumer'
-          ? new ShareLedger({ group: config.group, clock: this.clock, storage })
-          : null
       segments = TelemetrySegments.ordinary(SCENARIO, kind, {
         directory: config.directory,
         clock: this.clock,
@@ -4310,7 +4349,7 @@ class TelemetryWorkerProcess {
         { publicOnly: true, memory: true, identities: () => resources.identities() }
       )
       const client = this.create(kafka, config)
-      const schedule = new TelemetrySchedule(soak.TELEMETRY)
+      ordinary.client = client
       const owned = segments
       worker = new TelemetryWorker({
         kind,
@@ -4327,18 +4366,7 @@ class TelemetryWorkerProcess {
         target,
         ledger,
         foreground: { manifest: control.manifest, prefix: `${config.stem}:ctl-on` },
-        ordinary: new OrdinaryWork({
-          kind,
-          client,
-          stem: config.stem,
-          topic: config.topic,
-          ctl: config.ctl,
-          clock: this.clock,
-          sleep: this.sleep,
-          ledger,
-          slots: schedule.corpusSlots(),
-          storage,
-        }),
+        ordinary,
       })
       const uuid = await worker.prepare()
       const measured = {
@@ -4402,6 +4430,7 @@ class TelemetryWorkerProcess {
             journal,
             sampler,
             foreground: worker.claims.foreground,
+            allocation,
           }),
           sampler: { skipped: run.skipped, readFailures: run.readFailures },
         }
