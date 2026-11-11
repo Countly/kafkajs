@@ -443,7 +443,8 @@ jobs:
         timeout-minutes: 12
         env:
           TMPDIR: ${{ runner.temp }}
-        run: timeout -k 10s 700s node --expose-gc scripts/e2e/telemetry/retained/liveDiagnostic.js --diagnostic-only "$LIVE_CENSUS_ROOT" ${{ matrix.variant }}
+          CENSUS_VARIANT: ${{ matrix.variant }}
+        run: timeout -k 10s 700s node --expose-gc scripts/e2e/telemetry/retained/liveDiagnostic.js --diagnostic-only "$LIVE_CENSUS_ROOT" "$CENSUS_VARIANT"
       - name: Analyse additive live ownership offline
         if: always()
         timeout-minutes: 10
