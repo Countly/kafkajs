@@ -99,6 +99,8 @@
       "needs": {},
       "evidence": [],
       "titles": [
+        "testHelpers/__tests__/chaosSocket.spec.js \u203a ChaosSocket the live-only factory releases closed sockets and preserves fault arming across reconnects",
+        "scripts/soak/__tests__/telemetryChurn.spec.js \u203a telemetry profile transport tap releases closed factory sockets while the tap stays alive and preserves scalar fault facts",
         "scripts/soak/__tests__/telemetryChurn.spec.js \u203a telemetry profile worker accepts a matching Get written between readback and confirmation delivery",
         "scripts/soak/__tests__/telemetryChurn.spec.js \u203a telemetry profile worker rejects stale Gets on either side of the confirmation cursor and timestamp fence",
         "scripts/soak/__tests__/telemetryChurn.spec.js \u203a telemetry profile parent joins all confirmation fences before rotating the subscription",
@@ -22229,6 +22231,8 @@
       "needs": {},
       "evidence": [],
       "titles": [
+        "testHelpers/__tests__/chaosSocket.spec.js \u203a ChaosSocket the live-only factory releases closed sockets and preserves fault arming across reconnects",
+        "scripts/soak/__tests__/telemetryChurn.spec.js \u203a telemetry profile transport tap releases closed factory sockets while the tap stays alive and preserves scalar fault facts",
         "scripts/soak/__tests__/telemetryChurn.spec.js \u203a telemetry profile worker accepts a matching Get written between readback and confirmation delivery",
         "scripts/soak/__tests__/telemetryChurn.spec.js \u203a telemetry profile worker rejects stale Gets on either side of the confirmation cursor and timestamp fence",
         "scripts/soak/__tests__/telemetryChurn.spec.js \u203a telemetry profile parent joins all confirmation fences before rotating the subscription",

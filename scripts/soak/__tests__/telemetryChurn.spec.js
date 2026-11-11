@@ -530,6 +530,74 @@ describe('telemetry profile', () => {
       expect(() => tap.retire()).toThrow('exactly one open telemetry socket')
     })
 
+    test('releases closed factory sockets while the tap stays alive and preserves scalar fault facts', async () => {
+      const owners = []
+      const faults = []
+      let now = 0
+      const segment = {
+        id: 'producer-lc-1',
+        observer: {
+          socketOwnership: () => owners,
+          declareFault: (ordinal) => faults.push({ ordinal, at: now }),
+        },
+      }
+      const tap = new TelemetryTap(
+        {
+          current: () => segment,
+          socketFactory: () => {
+            owners.push({})
+            const inner = new EventEmitter()
+            inner.destroyed = false
+            inner.write = () => true
+            inner.destroy = (error) => {
+              inner.destroyed = true
+              if (error) inner.emit('error', error)
+              inner.emit('close')
+            }
+            return inner
+          },
+        },
+        { clock: { now: () => ++now } }
+      )
+      const core = tap.factory({ host: 'a', port: 1 })
+      let telemetry = tap.factory({ host: 'a', port: 1 })
+      telemetry.on('error', () => {})
+      telemetry.write(frame(71))
+      const fault = tap.retire()
+      expect(fault).toMatchObject({ segment: 'producer-lc-1', ordinal: 2, declaredAt: 1 })
+      const released = new WeakRef(telemetry)
+      telemetry.write(frame(72))
+      await expect(fault.hit).resolves.toBe(2)
+      expect(faults).toEqual([{ ordinal: 2, at: 1 }])
+      expect(tap.open()).toBe(1)
+      expect(tap.telemetry()).toEqual([])
+      expect(tap.chaos.sockets).toEqual([core])
+      expect(tap.records[1]).toMatchObject({
+        segment: 'producer-lc-1',
+        ordinal: 2,
+        telemetry: true,
+        closed: true,
+        closedAt: 3,
+        socket: null,
+        restore: null,
+        faulted: null,
+      })
+      telemetry = null
+
+      if (typeof global.gc === 'function') {
+        for (let i = 0; i < 10; i++) {
+          await turn()
+          global.gc()
+        }
+        expect(released.deref()).toBeUndefined()
+        expect(tap.open()).toBe(1)
+        expect(faults).toEqual([{ ordinal: 2, at: 1 }])
+      }
+      core.destroy()
+      expect(tap.chaos.sockets).toEqual([])
+      expect(tap.records.map(({ socket }) => socket)).toEqual([null, null])
+    })
+
     test('refuses to fault when more than one telemetry socket is open', () => {
       const { tap, add } = make()
       add().write(frame(71))

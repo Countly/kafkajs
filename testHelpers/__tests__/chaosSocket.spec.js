@@ -474,7 +474,46 @@ describe('ChaosSocket', () => {
     const first = factory({ host: 'a', port: 1 })
     const second = factory({ host: 'b', port: 2 })
 
+    first.destroy()
     expect(factory.sockets).toEqual([first, second])
+  })
+
+  test('the live-only factory releases closed sockets and preserves fault arming across reconnects', async () => {
+    const factory = createChaosSocketFactory(fakeInner, { retainClosed: false })
+    let first = factory({ host: 'a', port: 1 })
+    const other = factory({ host: 'b', port: 2 })
+    const disarm = factory.arm({ host: 'a' }, (socket) => socket.dropRequests({ apiKey: 26 }))
+    first.write(requestFrame(26, 1))
+    first.write(requestFrame(3, 2))
+    expect(first.inner.written).toEqual([requestFrame(3, 2)])
+    const released = new WeakRef(first)
+    first.destroy()
+    expect(factory.sockets).toEqual([other])
+    first = null
+
+    const replacement = factory({ host: 'a', port: 1 })
+    replacement.write(requestFrame(26, 3))
+    replacement.write(requestFrame(3, 4))
+    expect(replacement.inner.written).toEqual([requestFrame(3, 4)])
+    expect(factory.sockets).toEqual([other, replacement])
+    other.inner.destroy()
+    expect(factory.sockets).toEqual([replacement])
+    disarm()
+    const unarmed = factory({ host: 'a', port: 1 })
+    unarmed.write(requestFrame(26, 5))
+    expect(unarmed.inner.written).toEqual([requestFrame(26, 5)])
+    replacement.destroy()
+    unarmed.destroy()
+    expect(factory.sockets).toEqual([])
+
+    if (typeof global.gc === 'function') {
+      for (let i = 0; i < 10; i++) {
+        await new Promise((resolve) => setImmediate(resolve))
+        global.gc()
+      }
+      expect(released.deref()).toBeUndefined()
+      expect(factory.sockets).toEqual([])
+    }
   })
 
   test('a response it drops leaves a real Connection to its request timeout, which closes it', async () => {
