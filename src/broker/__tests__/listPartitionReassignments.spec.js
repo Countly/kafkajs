@@ -79,7 +79,7 @@ describe('Broker > alterPartitionReassignments', () => {
     )
 
     expect(observed.at(-1)).toEqual({
-      listed: { throttleTime: 0, errorCode: 0, topics: [] },
+      listed: { throttleTime: 0, clientSideThrottleTime: 0, errorCode: 0, topics: [] },
       replicas: [2, 3],
     })
 
@@ -131,6 +131,7 @@ describe('Broker > listPartitionReassignments > on the scripted cluster', () => 
 
       expect(response).toEqual({
         throttleTime: 0,
+        clientSideThrottleTime: 0,
         errorCode: 0,
         topics: [
           {
