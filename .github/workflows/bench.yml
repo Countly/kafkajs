@@ -1,0 +1,54 @@
+# Manual benchmark report (no thresholds, nothing here gates a release). It runs scripts/benchmarks/manifest.json
+# against one Compose cluster on Kafka 4.4.0 for the packed fork and, through the public API only, for kafkajs 2.2.4.
+# A benchmark that fails is an error row in the report; the report is uploaded either way.
+name: Benchmarks
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    # Starting value; tightened to the first run's wall-clock time plus headroom.
+    timeout-minutes: 120
+    env:
+      KAFKA_VERSION: '4.4.0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - run: npm ci
+      - name: Install the packed fork and kafkajs 2.2.4 into separate prefixes
+        run: |
+          set -euo pipefail
+          tarball=$(npm pack --pack-destination "$RUNNER_TEMP" --json | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8'))[0].filename")
+          npm install --prefix "$RUNNER_TEMP/fork" "$RUNNER_TEMP/$tarball"
+          npm install --prefix "$RUNNER_TEMP/base" kafkajs@2.2.4
+      # Without a non-empty NO_LOGS the script ends in `docker compose logs -f` and never returns.
+      - name: Start the cluster
+        env:
+          NO_LOGS: '1'
+        run: ./scripts/dockerComposeUp.sh
+      - run: node scripts/waitForKafka.js
+      - name: Run the benchmarks
+        run: node scripts/benchmarks/report.js --runs 3 --fork-dir "$RUNNER_TEMP/fork" --baseline-dir "$RUNNER_TEMP/base" --out "$RUNNER_TEMP/bench"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: bench-report
+          path: |
+            ${{ runner.temp }}/bench/bench-report.md
+            ${{ runner.temp }}/bench/bench-report.json
+          if-no-files-found: warn
+      - name: Show the report in the job summary
+        if: always()
+        run: |
+          report="$RUNNER_TEMP/bench/bench-report.md"
+          if [ -f "$report" ]; then cat "$report" >> "$GITHUB_STEP_SUMMARY"; fi
+      - name: Stop the cluster
+        if: always()
+        run: docker compose down --volumes --remove-orphans
