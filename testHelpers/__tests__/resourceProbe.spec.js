@@ -2394,6 +2394,113 @@ describe('resource artifact validation', () => {
 })
 
 describe('telemetry timeout owner diagnostics', () => {
+  test('reports a repo owner beyond twenty nested timer creation calls', () => {
+    const { TimeoutDiagnostics } = require('../timeoutDiagnostics')
+    const nested = vm.runInNewContext(
+      `(function nested(depth) {
+        return depth ? nested(depth - 1) : setTimeout(() => {}, 60000)
+      })`,
+      { setTimeout },
+      { filename: 'node_modules/timer-fixture/deep.js' }
+    )
+    const diagnostics = new TimeoutDiagnostics().start()
+    const previousLimit = Error.stackTraceLimit
+    let timer
+    try {
+      Error.stackTraceLimit = 10
+      function createDeepTimer() {
+        return nested(20)
+      }
+      timer = createDeepTimer()
+      const { live } = diagnostics.read()
+      expect(live).toHaveLength(1)
+      expect(live[0]).toMatchObject({
+        source: 'repo',
+        stack: expect.stringContaining('createDeepTimer'),
+      })
+      expect(live[0].stack).toContain('testHelpers/__tests__/resourceProbe.spec.js:')
+      expect(live[0].stack).not.toContain('node_modules')
+      expect(live[0].stack.split('\n').length).toBeLessThanOrEqual(8)
+      expect(Error.stackTraceLimit).toBe(10)
+    } finally {
+      Error.stackTraceLimit = previousLimit
+      clearTimeout(timer)
+      diagnostics.stop()
+    }
+  })
+
+  test('reports raw creation frames when no repo frame is available', () => {
+    const { TimeoutDiagnostics } = require('../timeoutDiagnostics')
+    const foreign = vm.runInNewContext(
+      `(function foreign(depth) {
+        return depth ? foreign(depth - 1) : setTimeout(() => {}, 60000)
+      })`,
+      { setTimeout },
+      { filename: 'node_modules/timer-fixture/raw.js' }
+    )
+    const diagnostics = new TimeoutDiagnostics().start()
+    let timer
+    try {
+      timer = foreign(80)
+      const { live } = diagnostics.read()
+      expect(live).toHaveLength(1)
+      expect(live[0]).toMatchObject({
+        source: 'raw',
+        stack: expect.stringContaining('node_modules/timer-fixture/raw.js:'),
+      })
+      expect(live[0].stack).not.toContain('node:internal')
+      expect(live[0].stack).not.toContain('async_hooks')
+      expect(live[0].stack).not.toContain('timeoutDiagnostics.js')
+      expect(live[0].stack.split('\n').length).toBeLessThanOrEqual(8)
+      for (const frame of live[0].stack.split('\n')) expect(frame.length).toBeLessThanOrEqual(512)
+    } finally {
+      clearTimeout(timer)
+      diagnostics.stop()
+    }
+  })
+
+  test('reports trigger creation facts after trigger destruction and clears every map on stop', async () => {
+    const { AsyncResource } = require('async_hooks')
+    const { TimeoutDiagnostics } = require('../timeoutDiagnostics')
+    const diagnostics = new TimeoutDiagnostics({ capacity: 8 }).start()
+    function createTimerOwner() {
+      return new AsyncResource('TimerOwner', { requireManualDestroy: true })
+    }
+    const owner = createTimerOwner()
+    const timer = owner.runInAsyncScope(() => setTimeout(() => {}, 60000))
+    try {
+      owner.emitDestroy()
+      await new Promise((resolve) => setImmediate(resolve))
+      await new Promise((resolve) => setImmediate(resolve))
+      const { live } = diagnostics.read()
+      expect(live).toHaveLength(1)
+      expect(live[0]).toMatchObject({
+        triggerAsyncId: owner.asyncId(),
+        triggerType: 'TimerOwner',
+        triggerSource: 'repo',
+        triggerStack: expect.stringContaining('testHelpers/__tests__/resourceProbe.spec.js:'),
+      })
+      expect(live[0].triggerStack).toContain('createTimerOwner')
+      expect(live[0].triggerStack).not.toContain(path.resolve(__dirname, '../..'))
+      for (const map of Object.values(diagnostics).filter((value) => value instanceof Map)) {
+        expect(map.size).toBeLessThanOrEqual(8)
+        for (const fact of map.values()) {
+          for (const value of Object.values(fact)) {
+            expect(value === null || ['string', 'number'].includes(typeof value)).toBe(true)
+          }
+        }
+      }
+      diagnostics.stop()
+      expect(diagnostics.read().live).toEqual([])
+      for (const map of Object.values(diagnostics).filter((value) => value instanceof Map)) {
+        expect(map.size).toBe(0)
+      }
+    } finally {
+      clearTimeout(timer)
+      diagnostics.stop()
+    }
+  })
+
   test('reports a leaked timer creation stack and releases every diagnostic resource', async () => {
     // eslint-disable-next-line n/no-unsupported-features/node-builtins -- development-only async resource identity
     const { executionAsyncId } = require('async_hooks')
