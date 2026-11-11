@@ -19,6 +19,7 @@ const zlib = require('node:zlib')
 // eslint-disable-next-line n/no-unsupported-features/node-builtins -- development driver; only the resource lifetime hooks are used
 const { AsyncLocalStorage, createHook } = require('node:async_hooks')
 const { fork } = require('node:child_process')
+const v8 = require('node:v8')
 const { createChaosSocketFactory, FrameFilter } = require('../../testHelpers/chaosSocket')
 const {
   DecoderGate,
@@ -50,6 +51,7 @@ const {
 } = require('../../testHelpers/fixedJournal')
 const gzipCodec = require('../../src/protocol/message/compression/gzip')
 const zstdCodec = require('../../src/protocol/message/compression/zstd')
+const { slope } = require('./bounds')
 const {
   ShareTrace,
   acknowledgementResponse,
@@ -95,6 +97,10 @@ const MIB = 1048576
 const ROOT = path.resolve(__dirname, '../..')
 /** Native compression rows one worker journals: one per Push of a 360 s run at 1 s, with room. */
 const NATIVE_ROWS = 1024
+/** Engine code readings one worker journals: every settled reading of a run, with room. */
+const ENGINE_ROWS = 64
+/** The node flags every telemetry worker is forked with; broker-free controls reuse this list. */
+const WORKER_FLAGS = Object.freeze(['--expose-gc'])
 
 /**
  * Bounds the unchanged corpus, three-partition topology and session catalogue, not average traffic.
@@ -281,11 +287,12 @@ const readMemory = (phase, now = () => performance.now()) => {
 /**
  * Two collections 100 ms apart with the collection callbacks left to settle, then a reading.
  * @param {string} phase the reading's place in the fixed catalogue
- * @param {object} io `{gc, pause, now, collections}`; the pause must let timers and immediates run,
- *   `collections` counts the collections the engine reported so far
+ * @param {object} io `{gc, pause, now, collections, engine}`; the pause must let timers and immediates
+ *   run, `collections` counts the collections the engine reported so far, and an `engine` journal
+ *   (shadow only) takes the engine's code sizes beside the reading
  * @returns {Promise<object>} the settled reading with `gc: {admittedAt, completedAt, observed}`
  */
-const settledReading = async (phase, { gc, pause, now, collections = () => 0 }) => {
+const settledReading = async (phase, { gc, pause, now, collections = () => 0, engine = null }) => {
   const admittedAt = now()
   const before = collections()
   gc()
@@ -294,9 +301,99 @@ const settledReading = async (phase, { gc, pause, now, collections = () => 0 }) 
   await new Promise((resolve) => setImmediate(resolve))
   await new Promise((resolve) => setImmediate(resolve))
   const reading = readMemory(phase, now)
+  engine?.record(reading)
   return {
     ...reading,
     gc: { admittedAt, completedAt: reading.at, observed: collections() - before },
+  }
+}
+
+/**
+ * The V8 code and bytecode bytes beside every reading of one worker, kept as fixed scalar rows. It
+ * is shadow evidence of the code-accounting question and never enters a verdict. Its storage is
+ * reserved before the first control reading and held to the end; an overflow throws and nothing is
+ * truncated or overwritten.
+ */
+class EngineCodeJournal {
+  /** @param {{capacity?:number}} [options] the most readings one worker takes */
+  constructor({ capacity = ENGINE_ROWS } = {}) {
+    this.rows = new FixedJournal({ name: 'engine code', capacity, bytes: capacity * 64 })
+  }
+
+  /**
+   * Appends the engine's code sizes for a reading just taken; nothing about the reading changes.
+   * @param {{phase:string, at:number}} reading the reading's catalogue name and monotonic time
+   * @returns {void}
+   * @throws {Error} when the journal is full
+   */
+  record({ phase, at }) {
+    const code = v8.getHeapCodeStatistics()
+    this.rows.push([phase, at, code.code_and_metadata_size, code.bytecode_and_metadata_size])
+  }
+
+  /** @returns {object} fixed storage and append cursor, never the rows */
+  journalState() {
+    return this.rows.journalState()
+  }
+
+  /** @returns {Array<{phase:string, at:number, code:number, bytecode:number}>} rows, after the run */
+  values() {
+    return this.rows.values().map(([phase, at, code, bytecode]) => ({ phase, at, code, bytecode }))
+  }
+
+  /**
+   * Reports the raw, code and data series of a run beside its acceptance verdict, never into it.
+   * Code is `code_and_metadata_size + bytecode_and_metadata_size`; data is raw minus code, in bytes.
+   * @param {Array<{minutes:number, raw:number, code:number}>} points the settled readings in order
+   * @returns {object} per series the least-squares slope per minute and the first-to-last change,
+   *   or `complete: false` when fewer than two readings or two distinct times exist; it never throws
+   */
+  static shadow(points) {
+    const report = { scope: 'shadow', acceptance: false, readings: points.length }
+    if (points.length < 2 || points.some((p) => !Number.isFinite(p.raw + p.code)))
+      return { ...report, complete: false }
+    const series = (pick) => {
+      const values = points.map((p) => [p.minutes, pick(p)])
+      return {
+        slopeBytesPerMinute: slope(values),
+        endpointBytes: values.at(-1)[1] - values[0][1],
+      }
+    }
+    try {
+      return {
+        ...report,
+        complete: true,
+        raw: series((p) => p.raw),
+        code: series((p) => p.code),
+        data: series((p) => p.raw - p.code),
+      }
+    } catch (error) {
+      return { ...report, complete: false, error: error.message }
+    }
+  }
+
+  /**
+   * Joins the journal to the judged samples by each reading's own time.
+   * @param {object[]} samples the verdict input samples, each `{completedAtMs, snapshot.memory}`
+   * @returns {object} the shadow report, or `complete: false` naming how many samples had no row
+   */
+  report(samples) {
+    const rows = new Map(this.values().map((row) => [row.at, row]))
+    const points = []
+    let missing = 0
+    for (const { completedAtMs, snapshot } of samples) {
+      const row = rows.get(snapshot?.memory?.at)
+      if (row === undefined) missing++
+      else
+        points.push({
+          minutes: completedAtMs / 60000,
+          raw: snapshot.memory.retainedBytes,
+          code: row.code + row.bytecode,
+        })
+    }
+    return missing
+      ? { scope: 'shadow', acceptance: false, complete: false, missing }
+      : EngineCodeJournal.shadow(points)
   }
 }
 
@@ -2227,7 +2324,7 @@ class TelemetryProcesses {
     const token = crypto.randomBytes(8).toString('hex')
     const child = this.spawn(this.script, [...this.args, '--profile', 'telemetry'], {
       execPath: process.execPath,
-      execArgv: ['--expose-gc'],
+      execArgv: [...WORKER_FLAGS],
       env: { ...process.env, [WORKER_ENV]: kind, [WORKER_TOKEN]: token },
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     })
@@ -3208,6 +3305,7 @@ class ReferenceControl {
    * @param {(ms:number)=>Promise<void>} [options.sleep] real delay
    * @param {function():void} [options.gc] a full collection, `global.gc` by default
    * @param {function():number} [options.collections] collections the engine reported so far
+   * @param {EngineCodeJournal|null} [options.engine] takes the code sizes of each settled reading
    */
   constructor({
     kind,
@@ -3220,6 +3318,7 @@ class ReferenceControl {
     sleep = wait,
     gc = globalThis.gc,
     collections = () => 0,
+    engine = null,
   }) {
     Object.assign(this, {
       kind,
@@ -3232,6 +3331,7 @@ class ReferenceControl {
       sleep,
       gc,
       collections,
+      engine,
     })
     this.manifest = controlManifest(kind, config)
   }
@@ -3249,6 +3349,7 @@ class ReferenceControl {
       pause: (ms) => this.sleep(ms),
       now: () => clock.now(),
       collections: this.collections,
+      engine: this.engine,
     }
     const counter = new FrameCounter(this.socketFactory)
     return this.resources.as('fixture:control', async () => {
@@ -3907,6 +4008,7 @@ class TelemetryChurn {
       const input = { ...result.input, clientCount: 1 }
       const resourceVerdict = this.verdict(input)
       const evaluated = JournalConstancy.apply(resourceVerdict, input)
+      const shadow = result.shadow ? { shadow: result.shadow } : {}
       workers.push({
         kind: result.kind,
         input,
@@ -3914,6 +4016,7 @@ class TelemetryChurn {
         exit,
         uuid: result.uuid,
         facts: result.facts,
+        ...shadow,
       })
       this.record({
         kind: 'resource-verdict',
@@ -3922,6 +4025,7 @@ class TelemetryChurn {
         uuid: result.uuid,
         input,
         result: evaluated,
+        ...shadow,
       })
       this.record({ ...exit, kind: 'natural-exit', clientKind: result.kind })
       if (!evaluated.ok)
@@ -4192,12 +4296,13 @@ class TelemetryWorkerProcess {
 
   /**
    * @param {object} parts what the reference holds when the run is judged
+   * @param {EngineCodeJournal} [parts.engine] takes the code sizes of the final reading
    * @returns {object} the replayable reference facts: source and capability, every reading, the
    *   control with its frozen catalogue, the enabled replay of that catalogue, the native work
    *   journal and its sampler, and the host before the control, at the boundary and after the run
    */
-  reference({ loaded, control, host, memory, journal, sampler, foreground, allocation }) {
-    return {
+  reference({ loaded, control, host, memory, journal, sampler, foreground, allocation, engine }) {
+    const reference = {
       version: 'rss-reference-2',
       source: memory.source ? 'proc-status-vmhwm' : null,
       units: 'bytes',
@@ -4212,6 +4317,7 @@ class TelemetryWorkerProcess {
           'native',
           'pending-windows',
           'memory-samples',
+          'engine-code',
           'ordinary',
           ...(this.kind === 'shareConsumer' ? ['share'] : []),
         ],
@@ -4225,6 +4331,8 @@ class TelemetryWorkerProcess {
       final: readMemory('final', () => this.clock.now()),
       host: { ...host, after: hostContext(() => this.clock.now()) },
     }
+    engine?.record(reference.final)
+    return reference
   }
 
   /**
@@ -4267,6 +4375,7 @@ class TelemetryWorkerProcess {
       capacity: storage.samples,
       bytes: storage.sampleBytes,
     })
+    const engine = new EngineCodeJournal()
     const sampler = new PendingSampler(memory, {
       capacity: NATIVE_ROWS,
       set: (fn, ms) => resources.as('fixture:native-sampler', () => setInterval(fn, ms)),
@@ -4309,9 +4418,11 @@ class TelemetryWorkerProcess {
         journal,
         sampler,
         sampleJournal,
+        engine,
       ])
       resources.start()
       const loaded = readMemory('loaded', () => this.clock.now())
+      engine.record(loaded)
       const host = { before: hostContext(() => this.clock.now()) }
       const control = await new ReferenceControl({
         kind,
@@ -4323,6 +4434,7 @@ class TelemetryWorkerProcess {
         clock: this.clock,
         sleep: this.sleep,
         collections: () => memory.collections,
+        engine,
       }).run()
       host.boundary = hostContext(() => this.clock.now())
       journal.observe('gzip', gzipCodec)
@@ -4378,6 +4490,7 @@ class TelemetryWorkerProcess {
           await new Promise((resolve) => setImmediate(resolve))
           await new Promise((resolve) => setImmediate(resolve))
           const reading = readMemory('settled', () => this.clock.now())
+          engine.record(reading)
           return {
             ...snapshot,
             memory: snapshot.memory && {
@@ -4394,6 +4507,7 @@ class TelemetryWorkerProcess {
                 journal,
                 sampler,
                 sampleJournal,
+                engine,
               ]),
               owners: {
                 ordinary: worker.ordinary.journalState(),
@@ -4401,12 +4515,14 @@ class TelemetryWorkerProcess {
                 native: journal.journalState(),
                 pendingWindows: sampler.journalState(),
                 samples: sampleJournal.journalState(),
+                engine: engine.journalState(),
               },
             },
           }
         },
       }
       let input
+      let shadow = null
       const judge = (run) => {
         sampler.stop()
         journal.restoreAll()
@@ -4431,10 +4547,13 @@ class TelemetryWorkerProcess {
             sampler,
             foreground: worker.claims.foreground,
             allocation,
+            engine,
           }),
           sampler: { skipped: run.skipped, readFailures: run.readFailures },
         }
-        return JournalConstancy.apply(soak.TelemetryResourceVerdict.evaluate(input), input)
+        const judged = JournalConstancy.apply(soak.TelemetryResourceVerdict.evaluate(input), input)
+        shadow = engine.report(input.samples)
+        return judged
       }
       const soakRun = new soak.Soak({
         kafka,
@@ -4463,6 +4582,7 @@ class TelemetryWorkerProcess {
           verdict,
           input,
           facts: worker.facts(),
+          shadow,
         },
         { flush: true }
       )
@@ -4526,6 +4646,7 @@ module.exports = {
   WORKER_TOKEN,
   SUBSCRIPTIONS,
   DecoderCoordinator,
+  EngineCodeJournal,
   FrameCounter,
   Inbox,
   OrdinaryOracle,
@@ -4544,6 +4665,7 @@ module.exports = {
   TelemetryTap,
   TelemetryWorker,
   TelemetryWorkerProcess,
+  WORKER_FLAGS,
   checkLog,
   compactRuns,
   controlManifest,
