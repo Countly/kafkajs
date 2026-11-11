@@ -417,6 +417,7 @@ describe('required memory gate composition', () => {
       'journal-controls',
       'retained-diagnostic',
       'telemetry-soak',
+      'telemetry-seeded-control',
       'live-owner-census',
       'telemetry-verdicts',
       'telemetry-verdict-controls',
@@ -439,6 +440,8 @@ describe('required memory gate composition', () => {
     )
     expect(jobs['telemetry-soak']).toContain('node: [22, 24, 26]')
     expect(jobs['telemetry-soak']).toContain("kafka: ['4.3.1', '4.2.2']")
+    expect(jobs['telemetry-seeded-control']).toContain('node: [22, 24, 26]')
+    expect(jobs['telemetry-seeded-control']).toContain("KAFKA_VERSION: '4.3.1'")
     expect(jobs['telemetry-verdicts']).toContain('full: true')
     expect(jobs['telemetry-verdicts']).toContain('memory-verdicts: true')
     expect(workflow).not.toContain('continue-on-error:')
