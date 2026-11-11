@@ -37,6 +37,20 @@ const collectionsSettled = (before, after) =>
     (field) => Math.abs(after[field] - before[field]) <= SETTLE.bytes
   )
 
+/**
+ * The quantity the closed-ceiling, first-use and control-stability gates judge: the bytes the
+ * heap and external memory hold, without what V8 spends on bytecode and compiled code. It is read
+ * from the final checkpoint of a settled reading, so it is the same moment as `retained`. It never
+ * feeds the RSS, external or peak gates.
+ * @param {{heapUsed: number, external: number, gc: {checkpoints: Array<{engine: {bytecode: number,
+ *   code: number}}>}}} reading a settled reading with its collection checkpoints
+ * @returns {number} `heapUsed + external - (bytecode + code)` at the final checkpoint
+ */
+const dataBytes = (reading) => {
+  const { bytecode, code } = reading.gc.checkpoints.at(-1).engine
+  return reading.heapUsed + reading.external - (bytecode + code)
+}
+
 /** What the selected absolute peak source is called and measures. */
 const PEAK_SOURCE = Object.freeze({ name: 'proc-self-status-vmhwm', units: 'bytes' })
 
@@ -219,7 +233,8 @@ class ProcessMemory {
    * Repeats the two-collection/100 ms protocol until two successive readings converge, with at
    * most six pairs. Every reading remains in the evidence and contributes to peak coverage. The
    * last reading is returned even when convergence fails; no minimum or favourable endpoint is
-   * selected. Engine code sizes diagnose first-use compilation separately, without subtracting it.
+   * selected. Every checkpoint records the engine's bytecode and compiled-code sizes; only
+   * `dataBytes` subtracts them, and only for the gates that name it.
    * @param {Function|null} [observe] diagnostic-only synchronous (round, stage) scalar observer;
    *   omitted in acceptance, with no additional reads, collections or turns
    * @param {Function|null} [completed] diagnostic-only synchronous observer of the final reading
@@ -613,6 +628,7 @@ module.exports = {
   MEMORY_FLAGS,
   SETTLE,
   collectionsSettled,
+  dataBytes,
   PEAK_SOURCE,
   SAMPLE_MS,
   GC_PAUSE_MS,

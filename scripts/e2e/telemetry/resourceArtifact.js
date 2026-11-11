@@ -16,9 +16,16 @@
  * P       = max over marks of max(high water, current RSS covered by the mark), every recorded
  *           current reading (native submission and settlement included) and the sampled peak
  * Epeak   = the same maximum over the external bytes
+ * data(x) = heapUsed + external - (V8 bytecode + compiled code), at the final settle checkpoint
  * RSS     delta P - B <= 64 MiB,  P <= 160 MiB,  external delta Epeak - Eref <= 64 MiB
- * control C1 and C0 settled readings within 2 MiB RSS and 256 KiB retained; setup peak <= 96 MiB
+ * control C1 and C0 settled readings within 2 MiB RSS and 256 KiB data; setup peak <= 96 MiB
+ * closed  data(closed) - data(M) <= 256 KiB; below -256 KiB is inconclusive
+ * warm-up one full throwaway pass of the same kind and arm runs before M; M0 is its reading at the
+ *         M position, and data(M) - data(M0) <= 1 MiB
  * ```
+ *
+ * Only the control, closed and first-use gates use `data`; the RSS, external, peak and active
+ * retained gates read the raw bytes. A record that declares a seed is a control, never acceptance.
  *
  * Usage: node scripts/e2e/telemetry/resourceArtifact.js <directory> --tree <hash> --node <version>
  */
@@ -27,10 +34,15 @@ const path = require('node:path')
 const crypto = require('node:crypto')
 const { StringDecoder } = require('node:string_decoder')
 const { compareSnapshots } = require('../../../testHelpers/resourceProbe')
-const { MEMORY_FLAGS, SETTLE, collectionsSettled } = require('../../../testHelpers/processMemory')
+const {
+  MEMORY_FLAGS,
+  SETTLE,
+  collectionsSettled,
+  dataBytes,
+} = require('../../../testHelpers/processMemory')
 
 /** The version of the recorded shape; an older artifact is not evidence for the current gate. */
-const SCHEMA = 5
+const SCHEMA = 6
 
 const KINDS = Object.freeze(['producer', 'consumer', 'admin', 'shareConsumer'])
 const ARMS = Object.freeze(['public', 'collector'])
@@ -45,6 +57,7 @@ const LIMITS = Object.freeze({
   controlRetained: 262144,
   retained: 8388608,
   closedTransient: 262144,
+  firstUse: 1048576,
   closeAfterMarkMs: 10000,
   outputBytes: 65536,
   descriptors: 128,
@@ -310,6 +323,8 @@ const phaseCatalogue = (arm, zstdSupported) => {
     'control:c0',
     'control:c1',
     'control:released',
+    'warmup:matched',
+    'warmup:closed',
     `${prefix}:start`,
     ...(arm === 'public' ? ['enabled:registered'] : []),
     `${prefix}:matched`,
@@ -541,8 +556,10 @@ class MemoryArmJudge {
     if (!manifest || typeof manifest !== 'object') this.fail('manifest is missing')
     if (!Array.isArray(marks))
       this.fail('peak marks are missing: aggregate evidence is not accepted')
+    if (!r.warmup || typeof r.warmup !== 'object') this.fail('warm-up readings are missing')
     if (this.failures.length > before) return false
 
+    if (manifest.seed != null) this.fail('seeded control is not acceptance evidence')
     this.childContext(manifest)
     if (manifest.kind !== this.record.kind || manifest.arm !== this.record.arm)
       this.fail('manifest is for another kind or arm')
@@ -578,6 +595,8 @@ class MemoryArmJudge {
       ['c0', r.c0],
       ['c1', r.c1],
       ['released', r.released],
+      ['warm-up matched', r.warmup.m0],
+      ['warm-up closed', r.warmup.end],
       ['matched', r.matched],
       ...(Array.isArray(r.actives) ? r.actives.map((a, i) => [`active ${i + 1}`, a]) : []),
       ['closed', r.closed],
@@ -654,7 +673,16 @@ class MemoryArmJudge {
     const edges = Array.isArray(r.native?.rows)
       ? r.native.rows.flatMap((row) => [row?.submitted, row?.settled])
       : []
-    const checkpoints = [r.c0, r.c1, r.released, r.matched, ...r.actives, r.closed]
+    const checkpoints = [
+      r.c0,
+      r.c1,
+      r.released,
+      r.warmup.m0,
+      r.warmup.end,
+      r.matched,
+      ...r.actives,
+      r.closed,
+    ]
     return [
       ...checkpoints.flatMap((reading) => reading.gc?.checkpoints ?? []),
       r.startup,
@@ -662,6 +690,8 @@ class MemoryArmJudge {
       r.c0,
       r.c1,
       r.released,
+      r.warmup.m0,
+      r.warmup.end,
       r.matched,
       ...r.actives,
       r.closed,
@@ -756,6 +786,8 @@ class MemoryArmJudge {
       ['control:c0', r.c0],
       ['control:c1', r.c1],
       ['control:released', r.released],
+      ['warmup:matched', r.warmup.m0],
+      ['warmup:closed', r.warmup.end],
       [`${prefix}:matched`, r.matched],
       ...r.actives.map((reading) => [`${prefix}:${reading.phase}`, reading]),
       [`${prefix}:closed`, r.closed],
@@ -784,8 +816,8 @@ class MemoryArmJudge {
       this.wait('control RSS is unstable')
       admitted = false
     }
-    if (Math.abs(r.c1.retained - r.c0.retained) > LIMITS.controlRetained) {
-      this.wait('control retained bytes are unstable')
+    if (Math.abs(dataBytes(r.c1) - dataBytes(r.c0)) > LIMITS.controlRetained) {
+      this.wait('control data bytes are unstable')
       admitted = false
     }
     if (peaks.setupPeak > LIMITS.setupPeak) {
@@ -797,7 +829,9 @@ class MemoryArmJudge {
 
   /**
    * Judges the incremental RSS and external gates against the admitted control, the absolute
-   * backstop, and the retained and transient gates against the matched baseline.
+   * backstop, the active retained gate on raw bytes, and the first-use and closed transient gates
+   * on data bytes (heap plus external without V8 code) against the matched baseline. Data below
+   * the matched baseline by more than the transient ceiling cannot be read as a pass.
    * @param {object|null} peaks what `peaks` returned @param {boolean} admitted the control verdict
    * @returns {void}
    */
@@ -815,8 +849,12 @@ class MemoryArmJudge {
     for (const active of r.actives.flatMap((reading) => [reading, ...reading.gc.checkpoints]))
       if (active.retained - r.matched.retained > LIMITS.retained)
         this.fail('active retained bytes exceed the matched baseline by more than 8 MiB')
-    if (r.closed.retained - r.matched.retained > LIMITS.closedTransient)
-      this.fail('closed transient bytes exceed 256 KiB')
+    if (dataBytes(r.matched) - dataBytes(r.warmup.m0) > LIMITS.firstUse)
+      this.fail('warm-up first-use data bytes exceed 1 MiB')
+    const closed = dataBytes(r.closed) - dataBytes(r.matched)
+    if (closed > LIMITS.closedTransient) this.fail('closed transient data bytes exceed 256 KiB')
+    else if (closed < -LIMITS.closedTransient)
+      this.wait('closed data bytes are more than 256 KiB below the matched baseline')
   }
 
   /**

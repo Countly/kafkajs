@@ -123,6 +123,83 @@ const within = (promise, what) => {
 const descriptor = (index) => ({ ...maximumDescriptor(index), value: 9007199254740993n })
 
 /**
+ * The seeded controls: a deliberate leak through a product-reachable root, to prove the memory
+ * gates see it. The bytes hang from the product's own exported `Kafka` class, so they outlive any
+ * client and its release, exactly as a leak in a product singleton would.
+ */
+const SEED = Object.freeze({
+  root: Symbol.for('resource.seed.root'),
+  modes: Object.freeze(['close', 'close-warmup', 'warmup-only']),
+  closeBytes: 131072,
+  warmupBytes: 1048577,
+  warmupAtClose: 2,
+})
+
+/**
+ * Leaks on the public closes of one pass. `close` leaks `SEED.closeBytes` on every close in the
+ * measured pass (and in the warm-up too for `close-warmup`); `warmup-only` leaks
+ * `SEED.warmupBytes` once, at the first close after the matched position of the warm-up, and
+ * nothing in the measured pass.
+ */
+class ProductSeed {
+  /**
+   * @param {'close'|'close-warmup'|'warmup-only'} mode which passes leak
+   * @param {boolean} warm whether this is the warm-up pass
+   * @returns {ProductSeed|null} the seed of this pass, or null when this pass does not leak
+   * @throws {Error} for an unknown mode
+   */
+  static of(mode, warm) {
+    if (!mode) return null
+    if (!SEED.modes.includes(mode)) throw new Error(`Unknown seed mode ${mode}`)
+    const leaks =
+      mode === 'close-warmup' || (mode === 'close' && !warm) || (mode === 'warmup-only' && warm)
+    return leaks ? new ProductSeed(mode) : null
+  }
+
+  /** @param {string} mode the seed mode @returns {ProductSeed} a seed that has leaked nothing */
+  constructor(mode) {
+    this.mode = mode
+    this.closes = 0
+    this.bytes = 0
+    this.matchedBytes = null
+  }
+
+  /** @returns {void} leaks what this mode leaks at one public close */
+  close() {
+    this.closes += 1
+    const bytes =
+      this.mode === 'warmup-only'
+        ? this.closes === SEED.warmupAtClose
+          ? SEED.warmupBytes
+          : 0
+        : SEED.closeBytes
+    if (bytes === 0) return
+    Kafka[SEED.root] ??= []
+    Kafka[SEED.root].push(Buffer.alloc(bytes, 0x5a))
+    this.bytes += bytes
+  }
+
+  /** @returns {void} records how much leaked up to the matched position */
+  matched() {
+    this.matchedBytes = this.bytes
+  }
+
+  /**
+   * @returns {{mode: string, closes: number, bytes: number, afterMatched: number}} what this pass
+   *   leaked in all and after the matched position
+   */
+  summary() {
+    const { mode, closes, bytes } = this
+    return { mode, closes, bytes, afterMatched: bytes - (this.matchedBytes ?? 0) }
+  }
+
+  /** @returns {void} drops every leaked buffer from the product root */
+  static release() {
+    delete Kafka[SEED.root]
+  }
+}
+
+/**
  * One public client of a kind over a bounded scripted wire that answers the core protocol and the
  * telemetry APIs. Telemetry is enabled or disabled by the constructor; the wire and the
  * operations are the same either way. It owns the client, its wire and the fixture timers, and
@@ -131,12 +208,14 @@ const descriptor = (index) => ({ ...maximumDescriptor(index), value: 90071992547
 class MemoryForeground {
   /**
    * @param {string} kind producer, consumer, admin or shareConsumer
-   * @param {{enabled: boolean}} options whether `enableMetricsPush` is set
+   * @param {{enabled: boolean, seed?: ProductSeed|null}} options whether `enableMetricsPush` is
+   *   set, and the seeded control's leak on every public close of this client, normally none
    * @returns {MemoryForeground} an object with no client yet
    */
-  constructor(kind, { enabled }) {
+  constructor(kind, { enabled, seed = null }) {
     this.kind = kind
     this.enabled = enabled
+    this.seed = seed
     this.codecs = [0]
     this.timers = new Set()
     this.ops = []
@@ -349,6 +428,7 @@ class MemoryForeground {
    * @returns {Promise<void>} the original public disconnect promise
    */
   close(timeout) {
+    this.seed?.close()
     return this.client.disconnect({ timeout })
   }
 
@@ -483,6 +563,8 @@ module.exports = {
   DESCRIPTOR_BYTES,
   MEMORY_UUID,
   MemoryForeground,
+  ProductSeed,
+  SEED,
   WAIT_MS,
   descriptor,
   foregroundCatalogue,
