@@ -147,7 +147,7 @@ class SoakTransport {
           Partitions: t.partitions.map((p) => ({
             PartitionIndex: p.partitionId,
             LeaderId: p.leader,
-            ReplicaNodes: p.replicas,
+            ReplicaNodes: [...p.replicas],
           })),
         })),
       }
@@ -239,7 +239,7 @@ class SoakTransport {
             Assignment: {
               TopicPartitions: m.assignment.map((t) => ({
                 TopicName: t.topic,
-                Partitions: t.partitions,
+                Partitions: [...t.partitions],
               })),
             },
           })),

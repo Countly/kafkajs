@@ -268,7 +268,7 @@ jobs:
           timeout -k 5s 590s node --max-old-space-size=6144 scripts/e2e/telemetry/retained/analyse.js "$RETAINED_DIAGNOSTIC_DIR"
       - name: Start retained diagnostic upload timing
         if: always()
-        run: echo "RETAINED_UPLOAD_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+        run: echo "retained diagnostic upload started at $(date -u +%FT%TZ); duration is recorded in the upload step log"
       - name: Upload retained diagnostic evidence
         if: always()
         timeout-minutes: 5
@@ -278,10 +278,6 @@ jobs:
           path: .tmp/retained-diagnostic/
           if-no-files-found: error
           include-hidden-files: true
-      - name: Report retained diagnostic upload timing
-        if: always()
-        run: |
-          echo "retained diagnostic upload elapsed: $(( $(date +%s) - RETAINED_UPLOAD_STARTED_AT )) s"
   telemetry-soak:
     if: github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/')
     runs-on: ubuntu-latest

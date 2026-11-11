@@ -29,6 +29,7 @@ const {
   readExports,
 } = require('../../testHelpers/telemetryFixtures')
 const { pollUntil } = require('../../src/producer/__tests__/fixtures/bounded')
+const { setShareGroupConfigs, resetShareGroupConfigs } = require('../../testHelpers/shareFixtures')
 const {
   TelemetrySegments,
   checkSegmentFiles,
@@ -1766,6 +1767,7 @@ class ParentFixture {
     this.admin = kafka.admin({ enableMetricsPush: false })
     this.producer = kafka.producer({ enableMetricsPush: false, idempotent: true })
     this.rotationEntries = { 'interval.ms': '1000', match: `client_id=^${stem}-.*$` }
+    this.shareConfigOwned = false
   }
 
   /** @param {string} kind the client kind @returns {string} its corpus topic */
@@ -1783,7 +1785,11 @@ class ParentFixture {
     return `${this.stem}-ctl`
   }
 
-  /** @returns {Promise<void>} connects and creates the corpus and control topics, 3 partitions RF3 */
+  /**
+   * Creates the corpus topics and reads back earliest share offsets before any worker joins.
+   * @returns {Promise<void>} Connected clients, 3 partitions RF3, and an applied group override.
+   * @throws {Error} On topic creation or group configuration failure.
+   */
   async open() {
     await this.admin.connect()
     await this.producer.connect()
@@ -1800,6 +1806,10 @@ class ParentFixture {
         replicationFactor: 3,
         configEntries: [{ name: 'min.insync.replicas', value: '2' }],
       })),
+    })
+    this.shareConfigOwned = true
+    await setShareGroupConfigs(this.admin, this.group('shareConsumer'), {
+      'share.auto.offset.reset': 'earliest',
     })
   }
 
@@ -1947,10 +1957,25 @@ class ParentFixture {
     return topic.topicId
   }
 
-  /** @returns {Promise<void>} disconnects every client the fixture opened */
+  /**
+   * Restores the owned group override before disconnecting both clients, even after failed setup.
+   * @returns {Promise<void>} Every cleanup attempted.
+   * @throws {AggregateError} All restoration and disconnect failures.
+   */
   async close() {
+    const errors = []
+    if (this.shareConfigOwned) {
+      try {
+        await resetShareGroupConfigs(this.admin, this.group('shareConsumer'), [
+          'share.auto.offset.reset',
+        ])
+        this.shareConfigOwned = false
+      } catch (error) {
+        errors.push(error)
+      }
+    }
     const outcomes = await Promise.allSettled([this.producer.disconnect(), this.admin.disconnect()])
-    const errors = outcomes.filter((o) => o.status === 'rejected').map((o) => o.reason)
+    errors.push(...outcomes.filter((o) => o.status === 'rejected').map((o) => o.reason))
     if (errors.length) throw new AggregateError(errors, 'Fixture cleanup failed')
   }
 }
