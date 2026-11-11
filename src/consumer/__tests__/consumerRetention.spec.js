@@ -134,6 +134,7 @@ jest.mock('../disposal', () => ({ disposeConsumer: jest.fn(async () => {}) }))
 const createConsumer = require('../index')
 const createAdmin = require('../../admin')
 const Cluster = require('../../cluster')
+const BootstrapResolution = require('../../cluster/bootstrapResolution')
 const GroupRegistry = require('../../cluster/groupRegistry')
 const { EventEmitter } = require('events')
 
@@ -143,6 +144,7 @@ const adminRegistry = (
   { offsets, operations } = { offsets: new Map(), operations: new Map() }
 ) => {
   const cluster = Object.create(Cluster.prototype)
+  cluster.bootstrapResolution = new BootstrapResolution({ resolveHosts: async () => [] })
   cluster.groupRegistry = GroupRegistry.forStores(offsets, operations)
   cluster.groupEntries = new Map()
   cluster.groupScopes = new Map()
