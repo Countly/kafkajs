@@ -473,7 +473,11 @@ class ShareKafka44Fixture {
         topics: this.topics,
       })
     } catch (error) {
-      this.row('case-failed', { error: { message: error.message }, cleanup: this.cleanup })
+      this.row('case-failed', {
+        error: { message: error.message },
+        cleanup: this.cleanup,
+        wire: this.wireSnapshot(),
+      })
       throw error
     }
   }
@@ -493,13 +497,18 @@ class ShareKafka44Fixture {
     })
   }
 
-  /** @param {object} proof Scenario-specific observations. @returns {void} Archives raw frames before validating the scenario. @throws {Error} A missing or violated oracle. */
-  observe(proof) {
-    const wire = this.tap.exchanges.map(({ request, response, ...entry }) => ({
+  /** @returns {object[]} Raw request/response bodies and exchange timestamps, including unanswered requests. */
+  wireSnapshot() {
+    return this.tap.exchanges.map(({ request, response, ...entry }) => ({
       ...entry,
       requestHex: request.toString('hex'),
       responseHex: response?.toString('hex') ?? null,
     }))
+  }
+
+  /** @param {object} proof Scenario-specific observations. @returns {void} Archives raw frames before validating the scenario. @throws {Error} A missing or violated oracle. */
+  observe(proof) {
+    const wire = this.wireSnapshot()
     this.row('observations', { proof, wire, features: this.features })
     assertScenario(this.scenario, proof, wire)
   }

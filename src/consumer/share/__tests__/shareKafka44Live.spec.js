@@ -405,6 +405,7 @@ enabled('Share Kafka 4.4 (live)', () => {
           release = resolve
         })
         const held = []
+        let heldFetch
         const memberA = await f.member(
           scope,
           'A',
@@ -412,6 +413,29 @@ enabled('Share Kafka 4.4 (live)', () => {
           [topic],
           {
             eachMessage: async ({ partition, message, acknowledge }) => {
+              if (!heldFetch) {
+                const exchange = f.tap.of(78, 'A').at(-1)
+                const answer = shareFetch.readResponse(exchange.response)
+                const acquired = answer.responses
+                  .filter((entry) => entry.topicId === topicId)
+                  .flatMap((entry) => entry.partitions)
+                const complete =
+                  answer.errorCode === 0 &&
+                  partitions.every((partition) =>
+                    acquired.some(
+                      (entry) =>
+                        entry.partitionIndex === partition &&
+                        entry.errorCode === 0 &&
+                        entry.acquiredRecords.length > 0
+                    )
+                  )
+                // Initial broker replies can acquire only part of the assignment.
+                if (!complete) {
+                  acknowledge('release')
+                  return
+                }
+                heldFetch = exchange
+              }
               held.push({ partition, offset: message.offset })
               await released
               acknowledge('accept')
@@ -419,7 +443,14 @@ enabled('Share Kafka 4.4 (live)', () => {
           }
         )
         f.stack.add('release the held handler', () => release())
-        await pollUntil(scope, POLL_MS, () => held.length > 0, { label: 'A holding a record' })
+        await pollUntil(scope, POLL_MS, () => held.length > 0, {
+          label: 'A holding acquisitions for every partition in one response',
+        })
+        const heldAt = heldFetch.answeredAt
+        const heldThrough = f.tap.of(78, 'A').indexOf(heldFetch) + 1
+        const acknowledgedThrough = memberA.acknowledgements.length
+        const pendingRequests = () => fetchRequests(f, 'A').slice(heldThrough)
+        const acknowledgements = () => memberA.acknowledgements.slice(acknowledgedThrough)
         /** @returns {number[][]} assignment changes starting with the first non-empty answer */
         const assignments = () => {
           const history = assignedPartitions(heartbeatAnswers(f, 'A'), topicId)
@@ -439,17 +470,20 @@ enabled('Share Kafka 4.4 (live)', () => {
         })
         const lostBy = (history) =>
           history[0].filter((partition) => !history[history.length - 1].includes(partition))
-        expect(lostBy(assignments()).length).toBeGreaterThan(0)
-        expect(assignments()[assignments().length - 1].length).toBeGreaterThan(0)
+        const history = assignments()
+        const lost = lostBy(history)
+        const kept = history[history.length - 1]
+        expect(lost.length).toBeGreaterThan(0)
+        expect(kept.length).toBeGreaterThan(0)
 
         release()
         await pollUntil(
           scope,
           POLL_MS,
           () =>
-            lostBy(assignments()).every(
+            lost.every(
               (partition) =>
-                partitionLifecycle(fetchRequests(f, 'A'), topicId, partition).firstAcknowledged >= 0
+                partitionLifecycle(pendingRequests(), topicId, partition).firstAcknowledged >= 0
             ),
           { label: 'A acknowledging every lost partition' }
         )
@@ -458,8 +492,8 @@ enabled('Share Kafka 4.4 (live)', () => {
           scope,
           POLL_MS,
           () =>
-            lostBy(assignments()).every((partition) =>
-              memberA.acknowledgements.some(
+            lost.every((partition) =>
+              acknowledgements().some(
                 (entry) =>
                   entry.topic === topic &&
                   entry.partition === partition &&
@@ -485,16 +519,15 @@ enabled('Share Kafka 4.4 (live)', () => {
             label: 'A later completed fetch after acknowledgement settlement',
           }
         )
-        const requests = fetchRequests(f, 'A')
-        const history = assignments()
-        const lost = lostBy(history)
+        const requests = pendingRequests()
+        expect(assignments()).toEqual(history)
         for (const partition of lost) {
           const lifecycle = partitionLifecycle(requests, topicId, partition)
           expect(lifecycle.forgotten).toEqual([lifecycle.firstAcknowledged])
           expect(lifecycle.lastListed).toBe(lifecycle.firstAcknowledged)
           expect(requests[lifecycle.firstAcknowledged].shareSessionEpoch).toBeGreaterThan(0)
         }
-        for (const partition of history[history.length - 1]) {
+        for (const partition of kept) {
           expect(partitionLifecycle(requests, topicId, partition).forgotten).toEqual([])
         }
         expect(memberA.crashes).toEqual([])
@@ -502,9 +535,10 @@ enabled('Share Kafka 4.4 (live)', () => {
         f.observe({
           topicId,
           lost,
-          kept: history[history.length - 1],
+          kept,
+          heldAt,
           settledAt,
-          acknowledgements: memberA.acknowledgements,
+          acknowledgements: acknowledgements(),
           crashes: [...memberA.crashes, ...memberB.crashes],
         })
       })
