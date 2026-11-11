@@ -11,6 +11,7 @@ const Connection = require('../../../src/network/connection')
 const Generation = require('../../../src/producer/generation')
 const { KafkaJSProducerClosedError } = require('../../../src/errors')
 const { TelemetryWireObserver } = require('../../telemetryFixtures')
+const { packSegment, checkSegmentFiles } = require('../../telemetrySegments')
 
 /** @param {Buffer} bytes payload @returns {string} SHA-256 */
 const sha = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex')
@@ -242,18 +243,31 @@ const releaseObserver = async (directory) => {
   assert.equal(JSON.stringify(facts(retained.observer)), before)
   const archive = fs.readFileSync(path.join(retained.observer.directory, 'transcript.json'), 'utf8')
   assert.deepEqual(JSON.parse(archive).records, facts(retained.observer).transcript)
-  const files = fs
-    .readdirSync(retained.observer.directory)
-    .filter((name) => name.endsWith('.bin') || name.endsWith('.json'))
-    .map((name) => ({
-      file: path.join(retained.observer.directory, name),
-      sha256: sha(fs.readFileSync(path.join(retained.observer.directory, name))),
-    }))
   await retained.observer.dispose()
   assert.equal(
     fs.readFileSync(path.join(retained.observer.directory, 'transcript.json'), 'utf8'),
     archive
   )
+  const target = path.join(directory, 'segments')
+  const sealed = packSegment({
+    id: 'retention-client',
+    source: retained.observer.directory,
+    target,
+  })
+  const transcript = fs.readFileSync(path.join(target, sealed.transcript.name), 'utf8')
+  const bundle = fs.readFileSync(path.join(target, sealed.bundle.name), 'utf8')
+  assert.equal(transcript, archive)
+  const checked = checkSegmentFiles({ id: sealed.id, transcript, bundle })
+  assert.deepEqual(
+    [...checked.proofs.values()].map((line) => line.decoded),
+    proofs
+  )
+  assert(!fs.existsSync(retained.observer.directory), 'Sealing must remove the redundant source')
+  const files = [sealed.transcript, sealed.bundle].map(({ name, sha256 }) => ({
+    file: path.join(target, name),
+    sha256,
+  }))
+
   return {
     client,
     fence,
