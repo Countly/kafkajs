@@ -7,6 +7,7 @@ const root = path.join(__dirname, '..', '..')
 const read = (...parts) => fs.readFileSync(path.join(root, ...parts), 'utf8')
 
 const page = read('docs', 'Testing.md')
+const gate = JSON.parse(read('scripts', 'ci', 'gate.json'))
 const workflows = ['ci.yml', 'weekly.yml'].map((name) => read('.github', 'workflows', name))
 const ci = page.slice(
   page.indexOf('CI (`.github/workflows/ci.yml`)'),
@@ -78,7 +79,7 @@ describe('docs/Testing.md', () => {
     expect(workflows[0]).toContain('matrix: { node: [22, 24, 26] }')
     expect(integrationPlan('pull_request').include).toContainEqual({
       node: 26,
-      kafka: '4.3.1',
+      kafka: '4.4.0',
       group: 'others',
     })
     expect(workflows[1]).toContain("kafka: ['4.0.2', '4.2.2', '4.3.2', '4.4.0']")
@@ -89,8 +90,10 @@ describe('docs/Testing.md', () => {
     expect(ci).toContain('on Node 22, 24 and 26;')
     expect(ci).toContain('every Monday and on demand')
     expect(ci).toContain(
-      'on Node 24 and for `broker` and `others` on Node 22 and 26, all against Kafka 4.3.1'
+      'on Node 24 and for `broker` and `others` on Node 22 and 26, all against Kafka 4.4.0'
     )
+    expect(ci).toContain('Three share lanes run on Node 24 against Kafka 4.4.0:')
+    expect(ci).not.toContain('4.3.1')
     expect(ci).toContain('Kafka 4.0.2, 4.2.2, 4.3.2 and 4.4.0')
     expect(ci).toContain('leaves out Node 26 with 4.0.2, Node 22 with 4.2.2 and Node 24 with 4.3.2')
     expect(ci).toContain('has no Kafka version input')
@@ -104,6 +107,93 @@ describe('docs/Testing.md', () => {
     expect(node).toEqual(['22', '24', '26'])
     expect(kafka.filter((version) => !ci.includes(version))).toEqual([])
     expect(node.filter((version) => !ci.includes(version))).toEqual([])
+  })
+
+  it('names Kafka 4.4.0 as the default test broker', () => {
+    expect(page).toContain('`KAFKA_VERSION` (default `4.4.0`)')
+    expect(page).toContain('By default the suite targets `KAFKA_VERSION=4.4.0`')
+    expect(page).toContain('Kafka 4.4.0 is the default test broker')
+    expect(page).toContain('the Kafka 4.4.0 storage test jar from Maven Central')
+    expect(page).not.toMatch(/default `4\.3\.1`|KAFKA_VERSION=4\.3\.1|Kafka 4\.3\.1 storage/)
+  })
+
+  it.each([
+    'test:e2e:delete-groups-v3',
+    'test:e2e:txn-offset-commit-v6',
+    'test:e2e:api-identity',
+    'test:e2e:rack-aware-producer',
+  ])('documents %s on the default broker with its Kafka 4.3.2 control', (script) => {
+    const control = `e2e-${script.slice('test:e2e:'.length)}-kafka-4-3`
+    const block = page
+      .split('\n\n')
+      .find((paragraph) => paragraph.includes(`KAFKA_VERSION=4.3.2 npm run ${script}`))
+
+    expect(gate.checks.find(({ id }) => id === control).kafkaVersion).toBe('4.3.2')
+    expect(block).toBeDefined()
+    expect(block).toContain(`\`${control}\``)
+    expect(block).not.toContain('KAFKA_VERSION=4.4.0')
+  })
+
+  it('names the one fixture that stays on Kafka 4.3.1 and the checks that use it', () => {
+    const pinned = gate.checks
+      .filter(({ javaClientsVersion }) => javaClientsVersion !== undefined)
+      .map(({ id }) => id)
+    const block = page.split('\n\n').find((paragraph) => paragraph.includes('`javaClientsVersion`'))
+
+    expect(pinned).toHaveLength(4)
+    expect(block).toBeDefined()
+    for (const id of pinned) expect(block).toContain(`\`${id}\``)
+    for (const text of ['One fixture stays on Kafka 4.3.1', '`kafka-clients`', 'a 4.4.0 broker'])
+      expect(block).toContain(text)
+  })
+
+  it('states the rule for skipping a test on Kafka 4.0.2', () => {
+    const block = page
+      .split('\n\n')
+      .find((paragraph) => paragraph.includes('individually identified'))
+
+    expect(block).toBeDefined()
+    for (const text of [
+      'Kafka 4.0.2',
+      'missing broker feature',
+      'capture',
+      'fixed and never skipped',
+    ])
+      expect(block).toContain(text)
+  })
+
+  it('states the flake rule and has QUARANTINE.md point at it', () => {
+    const block = page.split('\n\n').find((paragraph) => paragraph.includes('passes on a rerun'))
+
+    expect(block).toBeDefined()
+    for (const text of [
+      'fails and then passes on a rerun of the same commit',
+      '`QUARANTINE.md`',
+      'before the next merge to `master`',
+      'no quarantined test',
+    ])
+      expect(block).toContain(text)
+    expect(read('QUARANTINE.md')).toContain('[docs/Testing.md](docs/Testing.md#skipped-tests)')
+  })
+
+  it('describes the manual benchmark report and that it gates nothing', () => {
+    const block = page
+      .split('\n\n')
+      .find((paragraph) => paragraph.startsWith('`.github/workflows/bench.yml`'))
+
+    expect(block).toBeDefined()
+    for (const text of [
+      '`scripts/benchmarks/manifest.json`',
+      '`scripts/benchmarks/report.js`',
+      'Kafka 4.4.0',
+      '`kafkajs` 2.2.4',
+      'three times',
+      'median',
+      '`error` row',
+      '`bench-report`',
+      'no threshold',
+    ])
+      expect(block).toContain(text)
   })
 
   it('does not claim the cold-cluster createTopics race is gone from every run', () => {
@@ -534,7 +624,7 @@ describe('documented live scenario scripts', () => {
     expect(scripts['test:e2e:rack-aware-producer']).toBe(
       [
         `timeout -k 20s 600s node "\${P9_CLUSTER_GUARD:?set P9_CLUSTER_GUARD to the reviewed guard}"`,
-        `\${KAFKA_VERSION:-4.3.1} racks RACK_AWARE_PRODUCER_E2E`,
+        `\${KAFKA_VERSION:-4.4.0} racks RACK_AWARE_PRODUCER_E2E`,
         spec,
       ].join(' ')
     )
