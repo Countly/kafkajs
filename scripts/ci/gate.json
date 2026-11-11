@@ -3474,6 +3474,8 @@
         "src/admin/__tests__/liveAdminProbe.spec.js \u203a standalone cluster without a guard control stops a broker through Compose and restores it with start",
         "src/admin/__tests__/liveAdminProbe.spec.js \u203a standalone cluster without a guard exec runs the selected Compose service with literal operands and no guard files",
         "src/admin/__tests__/liveAdminProbe.spec.js \u203a tainted run refuses lazy work and final success",
+        "src/admin/__tests__/liveAdminProbe.spec.js \u203a deadlines under a fake clock a new topic waits for metadata propagation without repeating creation",
+        "src/admin/__tests__/liveAdminProbe.spec.js \u203a deadlines under a fake clock a new topic metadata authorization failure ends the read immediately",
         "src/admin/__tests__/liveAdminProbe.spec.js \u203a topic helper creates a default topic when called without arguments and deletes it on a connected owner",
         "src/admin/__tests__/liveAdminProbe.spec.js \u203a topic helper removes its topic through the owner a scenario closed for good, before closing it again",
         "src/admin/__tests__/liveAdminRegressions.spec.js \u203a delete-records partial broker retries keeps successful brokers out of retries and reports only the refused partition",

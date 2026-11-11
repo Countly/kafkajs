@@ -420,24 +420,23 @@ enabled('Share Kafka 4.4 (live)', () => {
         )
         f.stack.add('release the held handler', () => release())
         await pollUntil(scope, POLL_MS, () => held.length > 0, { label: 'A holding a record' })
-        await pollUntil(
-          scope,
-          POLL_MS,
-          () => assignedPartitions(heartbeatAnswers(f, 'A'), topicId).length > 0,
-          { label: 'The first assignment of A' }
-        )
-        expect(assignedPartitions(heartbeatAnswers(f, 'A'), topicId)[0]).toEqual(partitions)
+        /** @returns {number[][]} assignment changes starting with the first non-empty answer */
+        const assignments = () => {
+          const history = assignedPartitions(heartbeatAnswers(f, 'A'), topicId)
+          const first = history.findIndex((assignment) => assignment.length > 0)
+          return first < 0 ? [] : history.slice(first)
+        }
+        await pollUntil(scope, POLL_MS, () => assignments().length > 0, {
+          label: 'The first non-empty assignment of A',
+        })
+        expect(assignments()[0]).toEqual(partitions)
 
         const memberB = await f.member(scope, 'B', { groupId: group }, [topic], {
           eachMessage: async () => {},
         })
-        await pollUntil(
-          scope,
-          POLL_MS,
-          () => assignedPartitions(heartbeatAnswers(f, 'A'), topicId).length > 1,
-          { label: 'A losing a partition to B' }
-        )
-        const assignments = () => assignedPartitions(heartbeatAnswers(f, 'A'), topicId)
+        await pollUntil(scope, POLL_MS, () => assignments().length > 1, {
+          label: 'A losing a partition to B',
+        })
         const lostBy = (history) =>
           history[0].filter((partition) => !history[history.length - 1].includes(partition))
         expect(lostBy(assignments()).length).toBeGreaterThan(0)
