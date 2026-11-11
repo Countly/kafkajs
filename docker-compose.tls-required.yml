@@ -5,7 +5,7 @@
 # test CA, which the base truststore holds) into an ignored directory. Select the file with
 # COMPOSE_FILE=docker-compose.tls-required.yml, through the shared cluster guard only.
 x-kafka-common: &kafka-common
-  image: apache/kafka:${KAFKA_VERSION:-4.3.1}
+  image: apache/kafka:${KAFKA_VERSION:-4.4.0}
   environment: &kafka-env
     KAFKA_PROCESS_ROLES: 'broker,controller'
     KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka1:19093,2@kafka2:19093,3@kafka3:19093'

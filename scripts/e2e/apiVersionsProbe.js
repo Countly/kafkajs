@@ -265,7 +265,7 @@ const DEFAULT_SOURCES = Object.freeze({ readApiVersions, readBrokerVersion, writ
  * and, with `--record=<file>`, merges it into that table; with `--record-features=<file>` it does
  * the same with the finalized features of that answer. `--all` and both record flags list every
  * API under the version the running broker reports; plain mode lists the probed APIs under
- * `KAFKA_VERSION` (default 4.3.1) and never asks the broker for its version.
+ * `KAFKA_VERSION` (default 4.4.0) and never asks the broker for its version.
  * @param {string[]} argv the arguments after the script name
  * @param {object} [sources] what the probe reads and writes; each defaults to the live one
  * @param {() => Promise<object>} [sources.readApiVersions] the broker's decoded answer
@@ -286,7 +286,7 @@ const main = async (argv, sources = {}) => {
 
   const all = argv.includes('--all') || record !== undefined || recordFeatures !== undefined
   const answer = await io.readApiVersions()
-  const kafkaVersion = all ? io.readBrokerVersion() : process.env.KAFKA_VERSION || '4.3.1'
+  const kafkaVersion = all ? io.readBrokerVersion() : process.env.KAFKA_VERSION || '4.4.0'
 
   if (all) {
     assertSameVersion(kafkaVersion, process.env.KAFKA_VERSION)

@@ -466,7 +466,7 @@ describe('E2E tooling', () => {
 
       test.each([
         ['4.1.2', '4.1.2'],
-        [undefined, '4.3.1'],
+        [undefined, '4.4.0'],
       ])(
         'lists the probed APIs under KAFKA_VERSION=%p, as %p, without asking the broker',
         async (requested, kafkaVersion) => {
