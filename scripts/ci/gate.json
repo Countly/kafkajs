@@ -99,6 +99,12 @@
       "needs": {},
       "evidence": [],
       "titles": [
+        "scripts/ci/__tests__/resourceReporter.spec.js \u203a resource measurement reporter uses only the timer-free reporter in measured package commands",
+        "scripts/ci/__tests__/resourceReporter.spec.js \u203a resource measurement reporter propagates the timer-free reporter through guarded telemetry and share commands",
+        "scripts/ci/__tests__/resourceReporter.spec.js \u203a resource measurement reporter selects only the timer-free reporter when the guard environment requests it",
+        "scripts/ci/__tests__/resourceReporter.spec.js \u203a resource measurement reporter uses only the timer-free reporter in every in-band telemetry workflow command",
+        "scripts/ci/__tests__/resourceReporter.spec.js \u203a resource measurement reporter uses only the timer-free reporter in the fixed share children and keeps their JSON report",
+        "scripts/ci/__tests__/resourceReporter.spec.js \u203a resource measurement reporter prints completed tests and failures without creating Timeout or Immediate resources",
         "testHelpers/__tests__/chaosSocket.spec.js \u203a ChaosSocket the live-only factory releases closed sockets and preserves fault arming across reconnects",
         "scripts/soak/__tests__/telemetryChurn.spec.js \u203a telemetry profile transport tap releases closed factory sockets while the tap stays alive and preserves scalar fault facts",
         "scripts/soak/__tests__/telemetryChurn.spec.js \u203a telemetry profile worker accepts a matching Get written between readback and confirmation delivery",
