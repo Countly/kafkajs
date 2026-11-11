@@ -2,6 +2,8 @@
 
 Generated from the committed Apache Kafka **4.4.0** message definitions in `scripts/compat/messages/4.4.0/`. **Do not edit by hand** — run `npm run compat:generate`; `npm run compat:check` fails when this file and the generator disagree.
 
+Supported brokers: Apache Kafka 4.0–4.4. The tables below compare against the 4.4.0 definitions.
+
 Gap classes: `current` (fork max equals the Kafka max) · `behind:N` · `stub` (the key is known but unimplemented) · `missing` (planned, no codec) · `not-planned`. `on-floor` and `below-floor` are reported alongside the class, not instead of it.
 
 ## Summary

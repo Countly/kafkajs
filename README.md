@@ -3,7 +3,7 @@
 A pure-JavaScript [Apache Kafka](https://kafka.apache.org/) client for Node.js, maintained by [Countly](https://github.com/Countly) as a standalone continuation of [KafkaJS](https://github.com/tulios/kafkajs) 2.2.4.
 
 - **Drop-in for KafkaJS users**: preserved API plus documented semantic differences. `eachMessage`/`eachBatch`, pause/resume, instrumentation events and error classes remain available; see the [migration guide](./docs/MigrationGuide-3-0-0.md).
-- **Targets current infrastructure**: Apache Kafka **4.0+** (KRaft) and Node.js **22+**. Older brokers and runtimes are not supported.
+- **Targets current infrastructure**: Apache Kafka **4.0–4.4** (KRaft) and Node.js **22+**. Older brokers and runtimes are not supported.
 - **Zero required runtime dependencies** (one optional native dependency, `lz4-napi`, enables LZ4 compression), CommonJS entry point plus an ES module entry.
 
 > **Status**: under active development, **not yet released**. The first public version will be `3.0.0`. Until then the package is not published to npm and internal pre-release tags (`3.0.0-alpha.N`) are used.
@@ -26,6 +26,8 @@ A pure-JavaScript [Apache Kafka](https://kafka.apache.org/) client for Node.js, 
 ```sh
 npm install @countly/kafkajs
 ```
+
+Release candidates are published on the `next` dist-tag. Until 3.0.0, `latest` also points at a release candidate. Install release candidates by exact version.
 
 ```javascript
 const { Kafka } = require('@countly/kafkajs')
