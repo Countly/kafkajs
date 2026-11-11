@@ -363,7 +363,7 @@ describe('configured telemetry evidence documentation', () => {
     const document = squeeze('docs/ClientTelemetry.md')
     expect(document).toContain('## Configured checks and Java interoperability')
     expect(document).toContain('disabled unless enableMetricsPush is true')
-    expect(document).toContain('4.3.1, 4.2.2, 4.1.2 and 4.0.2 without exporter')
+    expect(document).toContain('4.4.0, 4.2.2, 4.1.2 and 4.0.2 without exporter')
     expect(document).toContain('raw committed next offsets')
     expect(document).toContain('successful subscription Get alone is insufficient')
   })
