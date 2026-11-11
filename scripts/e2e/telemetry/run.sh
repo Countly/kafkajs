@@ -91,6 +91,6 @@ elif [ -n "${TELEMETRY_DECODER_ARCHIVE:-}" ]; then
   case "$TELEMETRY_DECODER_ARCHIVE" in /*) ;; *) exit 2 ;; esac
   [ -f "$TELEMETRY_DECODER_ARCHIVE" ] && [ ! -L "$TELEMETRY_DECODER_ARCHIVE" ] || exit 2
   # Sharing is mandatory when prepared: stale/incompatible archives fail instead of falling back.
-  JVM+=(-Xshare:on "-XX:SharedArchiveFile=$TELEMETRY_DECODER_ARCHIVE")
+  JVM+=(-Xshare:on "-XX:SharedArchiveFile=$TELEMETRY_DECODER_ARCHIVE" -Xlog:disable -Xlog:all=warning:stderr)
 fi
 exec timeout --foreground -k 5s 20s java "${JVM[@]}" -Djava.io.tmpdir="$TMPDIR" -cp "$CP" org.countly.kafkajs.telemetry.FullTelemetryDecoder "$RAW"
