@@ -270,6 +270,10 @@ const verifyProvenance = (provenance, raws) => {
 
 /**
  * Projects the three raw outputs of one cluster state into a capture.
+ * KRaft's finalized-features epoch is the metadata image offset: periodic no-op records can advance
+ * it without changing feature levels. When both sources carry epochs, provenance timestamps must
+ * place the tool capture strictly before the wire capture, and the tool epoch must be no greater
+ * than the wire epoch. API ranges, numeric feature ranges and finalized levels still match exactly.
  * @param {object} input
  * @param {string} input.apiVersionsText raw `kafka-broker-api-versions.sh` output
  * @param {string} input.wireFeaturesLine raw one-line output of `wireFeatures.js`
@@ -280,8 +284,9 @@ const verifyProvenance = (provenance, raws) => {
  *   capture `readBrokerCapture` reads: numeric API ranges from the tool and the feature envelope
  *   from the wire line; the finalized-features epoch falls back to the tool's when the wire line
  *   lacks it
- * @throws {Error} when provenance or a digest is wrong, the sources disagree where they overlap, a
- *   required envelope field is missing from every source, or `apiKeyCount` differs from the ranges
+ * @throws {Error} when provenance or a digest is wrong, epoch capture order is unproven, the epoch
+ *   decreases, the sources disagree elsewhere, a required envelope field is missing from every
+ *   source, or `apiKeyCount` differs from the ranges
  */
 const projectBrokerTools = ({ apiVersionsText, wireFeaturesLine, featuresText, provenance }) => {
   const checked = verifyProvenance(provenance, {
@@ -296,8 +301,15 @@ const projectBrokerTools = ({ apiVersionsText, wireFeaturesLine, featuresText, p
   const numeric = (value) => (typeof value === 'string' && /^\d+$/.test(value) ? value : undefined)
   const toolEpoch = numeric(rows[0].epoch)
   const wireEpoch = numeric(wire.finalizedFeaturesEpoch)
-  if (toolEpoch && wireEpoch && toolEpoch !== wireEpoch) {
-    throw new Error(`finalized-features epoch disagree: tool ${toolEpoch}, wire ${wireEpoch}`)
+  if (toolEpoch && wireEpoch) {
+    const toolCapture = checked.captures.find(({ file }) => file === RAW_FILES.features)
+    const wireCapture = checked.captures.find(({ file }) => file === RAW_FILES.wire)
+    if (toolCapture.capturedOn >= wireCapture.capturedOn) {
+      throw new Error('capture order must show the tool was captured before the wire probe')
+    }
+    if (BigInt(toolEpoch) > BigInt(wireEpoch)) {
+      throw new Error(`finalized-features epoch disagree: tool ${toolEpoch}, wire ${wireEpoch}`)
+    }
   }
 
   const envelope = { ...wire, finalizedFeaturesEpoch: wireEpoch ?? toolEpoch }
