@@ -698,6 +698,8 @@ describe('resource artifact validation', () => {
     'control:c0': [80, 74, 3e6],
     'control:c1': [80, 74, 3e6],
     'control:released': [80, 72, 3e6],
+    'warmup:matched': [80, 80, 4e6],
+    'warmup:closed': [80, 72, 3e6],
     start: [80, 72, 3e6],
     registered: [110, 100, 12e6],
     matched: [110, 80, 4e6],
@@ -834,6 +836,10 @@ describe('resource artifact validation', () => {
         c0: settled(1000, 73 * MIB, 3e6, 6e6),
         c1: settled(2000, 74 * MIB, 3e6, 6.1e6),
         released: settled(3000, 72 * MIB, 3e6, 5.9e6),
+        warmup: {
+          m0: settled(3300, 80 * MIB, 4e6, 29.9e6),
+          end: settled(3600, 72 * MIB, 3e6, 6e6),
+        },
         control: {
           enabled: false,
           api71: 0,
@@ -916,10 +922,12 @@ describe('resource artifact validation', () => {
       broken.readings.c0,
       broken.readings.c1,
       broken.readings.released,
+      broken.readings.warmup?.m0,
+      broken.readings.warmup?.end,
       broken.readings.matched,
       ...broken.readings.actives,
       broken.readings.closed,
-    ]
+    ].filter(Boolean)
     const previous = checkpoints.map((reading) => ({ ...reading }))
     change(broken.readings, broken)
     // A scalar gate control changes the same final value in its otherwise unchanged GC history.
@@ -945,7 +953,7 @@ describe('resource artifact validation', () => {
 
   describe('diagnostic acceptance isolation and recorded boundary replay', () => {
     test.each([{ diagnostic: true }, { acceptanceEligible: false }])(
-      'rejects diagnostic marker %p even in a schema-5 envelope',
+      'rejects diagnostic marker %p even in a schema-6 envelope',
       (marker) => {
         expect(judgeMemoryArm({ ...record('public'), ...marker })).toEqual({
           verdict: 'fail',
@@ -1002,7 +1010,7 @@ describe('resource artifact validation', () => {
   })
 
   describe('the schema and the shape of the evidence', () => {
-    test.each([1, 2, 3, 4])('rejects schema %s without frozen module evidence', (schema) => {
+    test.each([1, 2, 3, 4, 5])('rejects schema %s without frozen module evidence', (schema) => {
       const old = record('public')
       old.schema = schema
       expect(judgeMemoryArm(old)).toEqual({ verdict: 'fail', problems: ['unknown schema'] })
@@ -1557,8 +1565,8 @@ describe('resource artifact validation', () => {
           kind
         )
         expect(result.verdict).toBe('fail')
-        expect(result.problems).toContain('closed transient bytes exceed 256 KiB')
-        expect(result.problems).toContain('control retained bytes are unstable')
+        expect(result.problems).toContain('closed transient data bytes exceed 256 KiB')
+        expect(result.problems).toContain('control data bytes are unstable')
       }
     )
 
@@ -1586,10 +1594,206 @@ describe('resource artifact validation', () => {
           kind
         )
         expect(result.verdict).toBe('fail')
-        expect(result.problems).toContain('closed transient bytes exceed 256 KiB')
-        expect(result.problems).toContain('control retained bytes are unstable')
+        expect(result.problems).toContain('closed transient data bytes exceed 256 KiB')
+        expect(result.problems).toContain('control data bytes are unstable')
       }
     )
+  })
+
+  describe('data bytes, the warm-up and the seeded controls', () => {
+    /** Moves a reading's data bytes by `data` from a reference reading, and its code bytes by `code`. */
+    const grow = (reading, from, data, code = 0) => {
+      const base = from.gc.checkpoints.at(-1).engine
+      reading.retained = from.retained + data + code
+      reading.heapUsed = reading.retained - reading.external
+      reading.gc.checkpoints.at(-1).engine = { bytecode: base.bytecode, code: base.code + code }
+    }
+    /** Moves M and keeps the closed reading the same distance above it. */
+    const moveMatched = (r, data, code = 0) => {
+      grow(r.matched, r.warmup.m0, data, code)
+      grow(r.closed, r.matched, 100000)
+    }
+    const PASS = { verdict: 'pass', problems: [] }
+    const CLOSED = 'closed transient data bytes exceed 256 KiB'
+    const BELOW = 'closed data bytes are more than 256 KiB below the matched baseline'
+    const UNSTABLE = 'control data bytes are unstable'
+    const FIRST_USE = 'warm-up first-use data bytes exceed 1 MiB'
+
+    test('judges the closed ceiling on heap plus external without V8 code, to the byte', () => {
+      expect(
+        judged('public', (r) => grow(r.closed, r.matched, LIMITS.closedTransient, 150000))
+      ).toEqual(PASS)
+      expect(
+        judged('public', (r) => grow(r.closed, r.matched, LIMITS.closedTransient + 1, 150000))
+      ).toEqual({ verdict: 'fail', problems: [CLOSED] })
+    })
+
+    test('is inconclusive, never a pass, once data falls more than 256 KiB below the matched baseline', () => {
+      expect(judged('public', (r) => grow(r.closed, r.matched, -LIMITS.closedTransient))).toEqual(
+        PASS
+      )
+      expect(
+        judged('public', (r) => grow(r.closed, r.matched, -LIMITS.closedTransient - 1))
+      ).toEqual({ verdict: 'inconclusive', problems: [BELOW] })
+    })
+
+    test('recomputes data from the raw engine sizes: code that outgrows the heap is not a pass', () => {
+      const result = judged('public', (r) => {
+        r.closed.gc.checkpoints.at(-1).engine = { bytecode: 100, code: 100 + MIB }
+      })
+      expect(result).toEqual({ verdict: 'inconclusive', problems: [BELOW] })
+    })
+
+    test('moves compiled code only through the code bytes and a 1 MiB array through the data bytes', () => {
+      expect(judged('public', (r) => grow(r.closed, r.matched, 0, MIB))).toEqual(PASS)
+      expect(judged('public', (r) => grow(r.closed, r.matched, MIB, 0))).toEqual({
+        verdict: 'fail',
+        problems: [CLOSED],
+      })
+    })
+
+    test('judges control stability on data bytes, so control compilation is not instability', () => {
+      expect(judged('public', (r) => grow(r.c1, r.c0, LIMITS.controlRetained, 200000))).toEqual(
+        PASS
+      )
+      expect(judged('public', (r) => grow(r.c1, r.c0, LIMITS.controlRetained + 1, 200000))).toEqual(
+        { verdict: 'inconclusive', problems: [UNSTABLE] }
+      )
+    })
+
+    test('bounds the first-use step from M0 to M at 1 MiB of data bytes, to the byte', () => {
+      expect(LIMITS.firstUse).toBe(MIB)
+      expect(judged('public', (r) => moveMatched(r, MIB, 80000))).toEqual(PASS)
+      expect(judged('public', (r) => moveMatched(r, MIB + 1, 80000))).toEqual({
+        verdict: 'fail',
+        problems: [FIRST_USE],
+      })
+    })
+
+    test('keeps the first-use failure when the closed ceiling also fails', () => {
+      const result = judged('public', (r) => {
+        moveMatched(r, MIB + 1)
+        grow(r.closed, r.matched, LIMITS.closedTransient + 1)
+      })
+      expect(result).toEqual({ verdict: 'fail', problems: [FIRST_USE, CLOSED] })
+    })
+
+    test.each([
+      ['no warm-up readings', (r) => delete r.warmup, 'warm-up readings are missing'],
+      ['no M0 reading', (r) => (r.warmup.m0 = null), 'warm-up matched reading is incomplete'],
+      [
+        'no collection facts at M0',
+        (r) => delete r.warmup.m0.gc,
+        'warm-up matched collection facts are incomplete',
+      ],
+      [
+        'no collection facts after the release',
+        (r) => delete r.warmup.end.gc,
+        'warm-up closed collection facts are incomplete',
+      ],
+      [
+        'an M0 taken after M',
+        (r) => (r.warmup.m0.at = r.matched.at + 1),
+        'readings are out of order',
+      ],
+      [
+        'a warm-up mark that is missing',
+        (r) => (r.marks = r.marks.filter((mark) => mark.phase !== 'warmup:matched')),
+        'peak marks are not the fixed phase catalogue',
+      ],
+      [
+        'a warm-up mark that understates its reading',
+        (r) => (markOf(r, 'warmup:matched').covered = 1),
+        'a peak mark understates a reading',
+      ],
+    ])('fails %s', (_name, change, problem) => {
+      const result = judged('public', change)
+      expect(result.verdict).toBe('fail')
+      expect(result.problems).toContain(problem)
+    })
+
+    test('counts the warm-up readings in the external peak above the control', () => {
+      const result = judged('public', (r) => {
+        const end = r.warmup.end
+        end.external = r.c0.external + LIMITS.externalDelta + 1
+        end.heapUsed = 1e6
+        end.retained = end.heapUsed + end.external
+        markOf(r, 'warmup:closed').coveredExternal = end.external
+      })
+      expect(result.verdict).toBe('fail')
+      expect(result.problems).toContain(
+        'external memory peak exceeds 64 MiB above the disabled control'
+      )
+    })
+
+    test('refuses a record that declares a seed as acceptance evidence', () => {
+      const result = judged('public', (r) => {
+        r.manifest.seed = { mode: 'close', closeBytes: 131072, warmupBytes: 1048577 }
+      })
+      expect(result.verdict).toBe('fail')
+      expect(result.problems).toContain('seeded control is not acceptance evidence')
+      expect(judged('public', (r) => (r.manifest.seed = null))).toEqual(PASS)
+      expect(judged('collector', (r) => (r.manifest.seed = null))).toEqual(PASS)
+    })
+
+    test('keeps the active retained gate on raw bytes: code growth is not subtracted from it', () => {
+      const result = judged('public', (r) => {
+        grow(r.actives[0], r.matched, LIMITS.retained - 1, MIB)
+      })
+      expect(result).toEqual({
+        verdict: 'fail',
+        problems: ['active retained bytes exceed the matched baseline by more than 8 MiB'],
+      })
+    })
+  })
+
+  describe('no dynamic code compilation in product source', () => {
+    const DYNAMIC_CODE = [
+      /\bnew\s+Function\b/,
+      /(^|[^\w.$])Function\s*\(/,
+      /(^|[^\w.$])eval\s*\(/,
+      /require\(\s*['"](?:node:)?vm['"]\s*\)/,
+      /from\s+['"](?:node:)?vm['"]/,
+    ]
+
+    /** @param {string} dir a directory @returns {string[]} its product JavaScript files, recursively */
+    const productFiles = (dir) =>
+      fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+        const file = path.join(dir, entry.name)
+        if (entry.isDirectory()) return entry.name === '__tests__' ? [] : productFiles(file)
+        return entry.name.endsWith('.js') && !entry.name.endsWith('.spec.js') ? [file] : []
+      })
+
+    const forbidden = (source) => DYNAMIC_CODE.filter((pattern) => pattern.test(source))
+
+    test('finds no new Function, eval or vm in the product tree', () => {
+      const root = path.join(__dirname, '..', '..', 'src')
+      const files = productFiles(root)
+      expect(files.length).toBeGreaterThan(500)
+      const offenders = files
+        .filter((file) => forbidden(fs.readFileSync(file, 'utf8')).length > 0)
+        .map((file) => path.relative(root, file))
+      expect(offenders).toEqual([])
+    })
+
+    test('recognises every form it forbids and leaves ordinary code alone', () => {
+      for (const source of [
+        'const f = new Function("a", "return a")',
+        'const f = Function("return this")()',
+        'eval(code)',
+        "const vm = require('vm')",
+        'const vm = require("node:vm")',
+        "import vm from 'node:vm'",
+      ])
+        expect({ source, found: forbidden(source).length > 0 }).toEqual({ source, found: true })
+      for (const source of [
+        'const fn = function () {}',
+        'x.Function(1)',
+        'const evaluate = (a) => a',
+        'const medieval = 1',
+      ])
+        expect({ source, found: forbidden(source).length > 0 }).toEqual({ source, found: false })
+    })
   })
 
   describe('the disabled control', () => {
@@ -1686,7 +1890,7 @@ describe('resource artifact validation', () => {
       })
       expect(result.verdict).toBe('fail')
       expect(result.problems).toEqual([
-        'closed transient bytes exceed 256 KiB',
+        'closed transient data bytes exceed 256 KiB',
         'modules loaded after the disabled reference',
       ])
     })
@@ -1712,7 +1916,7 @@ describe('resource artifact validation', () => {
           r.c1.retained = r.c0.retained - extra
           r.c1.heapUsed = r.c1.retained - r.c1.external
         },
-        'control retained bytes are unstable',
+        'control data bytes are unstable',
       ],
     ])(
       'admits a control whose %s differ by the bound in either direction and not by one more',
@@ -1730,7 +1934,7 @@ describe('resource artifact validation', () => {
     test('admits a setup peak of 96 MiB and not a byte more, whatever follows', () => {
       const setup = (bytes) => (r) => {
         markOf(r, 'control:released').vmhwm = bytes
-        raiseFrom(r, 'enabled:start', Math.max(bytes, 120 * MIB))
+        raiseFrom(r, 'warmup:matched', Math.max(bytes, 120 * MIB))
       }
 
       expect(LIMITS.setupPeak).toBe(100663296)
@@ -1805,7 +2009,7 @@ describe('resource artifact validation', () => {
     test('judges the absolute backstop even when the control is inadmissible, and never passes it', () => {
       const inadmissible = (peak) => (r) => {
         markOf(r, 'control:released').vmhwm = LIMITS.setupPeak + 1
-        raiseFrom(r, 'enabled:start', peak)
+        raiseFrom(r, 'warmup:matched', peak)
       }
 
       expect(judged('public', inadmissible(LIMITS.absolutePeak))).toEqual({
@@ -1866,7 +2070,7 @@ describe('resource artifact validation', () => {
           r.closed.retained = r.matched.retained + extra
           r.closed.heapUsed = r.closed.retained - r.closed.external
         },
-        'closed transient bytes exceed 256 KiB',
+        'closed transient data bytes exceed 256 KiB',
       ],
     ])('allows %s exactly at the bound and fails one more', (_name, bound, set, problem) => {
       expect(judged('public', (r) => set(r, bound))).toEqual({ verdict: 'pass', problems: [] })
@@ -1887,7 +2091,7 @@ describe('resource artifact validation', () => {
       expect(result).toEqual({
         verdict: 'fail',
         problems: [
-          'closed transient bytes exceed 256 KiB',
+          'closed transient data bytes exceed 256 KiB',
           'host load was high',
           'control RSS is unstable',
         ],
