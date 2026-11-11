@@ -1337,6 +1337,241 @@ describe('telemetry wire observer', () => {
     }
   })
 
+  test('preserves every Push byte and decode identity across interleaved partial frames', async () => {
+    const payloads = [Buffer.alloc(0), ...[1, 7, 31, 127, 4096].map((n) => Buffer.alloc(n, n))]
+    const { observer } = observe()
+    const sockets = [open(observer), open(observer, 19095)]
+    const inputs = sockets.map((socket, lane) =>
+      payloads.map((blob, index) => ({
+        blob,
+        request: push72(index + 1, blob, { terminating: index === payloads.length - 1 }),
+        response: push72Response(index + 1),
+        node: String(lane + 1),
+      }))
+    )
+    for (const [lane, rows] of inputs.entries()) {
+      writeSink(
+        String(lane + 1),
+        rows
+          .slice(1)
+          .map(({ blob }, i) =>
+            sinkRow(String(lane + 1), i + 1, blob, { terminating: i === rows.length - 2 })
+          )
+      )
+    }
+    for (let index = 0; index < payloads.length; index++) {
+      for (const [lane, socket] of sockets.entries())
+        socket.write(inputs[lane][index].request.subarray(0, 3))
+      for (const [lane, socket] of sockets.entries())
+        socket.write(inputs[lane][index].request.subarray(3, 17))
+      for (const [lane, socket] of sockets.entries())
+        socket.write(inputs[lane][index].request.subarray(17))
+      for (const [lane, socket] of sockets.entries())
+        socket.emit('data', inputs[lane][index].response.subarray(0, 5))
+      for (const [lane, socket] of sockets.entries())
+        socket.emit('data', inputs[lane][index].response.subarray(5))
+    }
+    const records = requests(observer)
+    expect(records).toHaveLength(payloads.length * 2)
+    for (const record of records) {
+      const input = inputs[Number(record.node) - 1][record.correlation - 1]
+      expect(
+        fs.readFileSync(path.join(observer.directory, `push-${record.requestKey}.bin`))
+      ).toEqual(input.blob)
+      expect(record.metricsSha256).toBe(sha(input.blob))
+      expect(record.sha256).toBe(sha(input.request.subarray(4)))
+      expect(record.response.sha256).toBe(sha(input.response.subarray(4)))
+      if (!input.blob.length) continue
+      const proof = await observer.decodeAccepted(record, { sinkWaitMs: 0 })
+      expect(proof).toMatchObject({
+        requestKey: record.requestKey,
+        uuid: ID,
+        node: input.node,
+        rawBytes: input.blob.length,
+        transmittedBytes: input.blob.length,
+        rawSha256: sha(input.blob),
+        transmittedSha256: sha(input.blob),
+        decoded: { parse: 'ok', dataBytes: input.blob.length, dataSha256: sha(input.blob) },
+        exportIdentity: { node: input.node, seq: record.correlation - 1 },
+      })
+      expect(
+        JSON.parse(
+          fs.readFileSync(path.join(observer.directory, `decoded-${record.requestKey}.json`))
+        )
+      ).toEqual(proof)
+    }
+    for (const socket of sockets) socket.emit('close')
+    const disposal = observer.dispose()
+    expect(observer.dispose()).toBe(disposal)
+    await disposal
+    const archive = fs.readFileSync(path.join(observer.directory, 'transcript.json'))
+    expect(JSON.parse(archive).records).toEqual(observer.readTranscript())
+    await observer.dispose()
+    expect(fs.readFileSync(path.join(observer.directory, 'transcript.json'))).toEqual(archive)
+    observer.assertClean()
+  })
+
+  test('keeps empty oversized and malformed Push evidence fatal without truncation', async () => {
+    for (const [blob, diagnostic] of [
+      [Buffer.alloc(0), 'zero-byte'],
+      [Buffer.alloc(4097, 3), 'exceeds 4096'],
+    ]) {
+      const { observer } = observe()
+      const socket = open(observer)
+      send(socket, push72(1, blob))
+      receive(socket, push72Response(1))
+      const [record] = observer.accepted()
+      expect(record.metricsBytes).toBe(blob.length)
+      expect(
+        fs.readFileSync(path.join(observer.directory, `push-${record.requestKey}.bin`))
+      ).toEqual(blob)
+      await expect(observer.decodeAccepted(record, { sinkWaitMs: 0 })).rejects.toThrow(diagnostic)
+      expect(() => observer.assertHealthy()).toThrow(diagnostic)
+    }
+    for (const kind of ['null', 'truncated', 'trailing']) {
+      const { observer } = observe()
+      const socket = open(observer)
+      const valid = push72(1, Buffer.from('x'))
+      const malformed =
+        kind === 'null'
+          ? frame(header2(72, 0, 1), uuidBytes(ID), i32(7), i8(0), i8(0), uvar(0), TAGS)
+          : kind === 'truncated'
+            ? frame(valid.subarray(4, -2))
+            : frame(valid.subarray(4), i8(1))
+      expect(() => send(socket, malformed)).not.toThrow()
+      expect(socket.written[0]).toEqual(malformed)
+      expect(() => observer.assertHealthy()).toThrow()
+      expect(requests(observer)).toEqual([])
+      expect(fs.readdirSync(observer.directory).filter((name) => name.startsWith('push-'))).toEqual(
+        []
+      )
+    }
+  })
+
+  test.each(['resolved', 'rejected', 'throwing'])(
+    'keeps the synchronous close boundary and exact receipt for a %s disconnect',
+    async (mode) => {
+      let tick = 10
+      const { observer } = observe({ clock: { now: () => tick } })
+      const socket = open(observer)
+      send(socket, get71(1))
+      const pending = requests(observer)[0].requestKey
+      let finish
+      const held = new Promise((resolve) => {
+        finish = resolve
+      })
+      const failure = new Error('close failure')
+      const stack = jest.fn(() => {
+        throw new Error('stack must remain lazy')
+      })
+      Object.defineProperty(failure, 'stack', { get: stack })
+      const options = { timeout: 40 }
+      const order = []
+      const client = {
+        disconnect: jest.fn((received) => {
+          expect(received).toBe(options)
+          expect(tick).toBe(10)
+          order.push('disconnect')
+          tick = 11
+          send(socket, push72(2, Buffer.alloc(0), { terminating: true }))
+          if (mode === 'throwing') {
+            socket.emit('close')
+            throw failure
+          }
+          return held.then(() => {
+            tick = 20
+            socket.emit('close')
+            if (mode === 'rejected') throw failure
+          })
+        }),
+        connect: jest.fn(() => order.push('connect')),
+      }
+      const closed = observer.closeClient(client, options)
+      expect(order).toEqual(['disconnect'])
+      const result = closed.then(
+        () => {
+          client.connect()
+          return null
+        },
+        (error) => error
+      )
+      if (mode !== 'throwing') {
+        await Promise.resolve()
+        expect(order).toEqual(['disconnect'])
+        finish()
+      }
+      expect(await result).toBe(mode === 'resolved' ? null : failure)
+      expect(order).toEqual(mode === 'resolved' ? ['disconnect', 'connect'] : ['disconnect'])
+      const disposal = observer.dispose()
+      expect(observer.dispose()).toBe(disposal)
+      await disposal
+      const archive = JSON.parse(fs.readFileSync(path.join(observer.directory, 'transcript.json')))
+      expect(archive.closures).toEqual([
+        { at: 10, pending: [pending], end: mode === 'throwing' ? 11 : 20 },
+      ])
+      expect(archive.cancellations.map((r) => r.disposition)).toEqual([
+        'close-in-flight',
+        'close-final',
+      ])
+      expect(observer.cancellationKeys()).toEqual(requests(observer).map((r) => r.requestKey))
+      observer.assertClean({ allowUnanswered: observer.cancellationKeys() })
+      expect(stack).not.toHaveBeenCalled()
+    }
+  )
+
+  const retentionChild = (mode) => {
+    const blob = Buffer.from('retention-evidence')
+    const payloads =
+      mode === 'backing' ? [1, 7, 31, 127, 4096].map((n) => Buffer.alloc(n, n)) : [blob]
+    writeSink(
+      '1',
+      payloads.map((bytes, i) => sinkRow('1', i + 1, bytes))
+    )
+    fs.writeFileSync(
+      path.join(directory, 'stimulus.json'),
+      JSON.stringify(
+        payloads.map((bytes, i) => ({
+          request: push72(i + 1, bytes).toString('hex'),
+          response: push72Response(i + 1).toString('hex'),
+        }))
+      )
+    )
+    const result = require('child_process').spawnSync(
+      process.execPath,
+      ['--expose-gc', path.join(__dirname, 'fixtures/observerRetention.js'), directory, mode],
+      { encoding: 'utf8', timeout: 15000 }
+    )
+    expect(result.error).toBeUndefined()
+    expect(result.stderr).toBe('')
+    expect(result.status).toBe(0)
+    return JSON.parse(result.stdout)
+  }
+
+  test('gives retained Push blobs exact backing stores beside a pooled scalar control', () => {
+    const proof = retentionChild('backing')
+    expect(proof.lengths).toEqual([1, 7, 31, 127, 4096])
+    expect(proof.backings).toEqual(proof.lengths)
+    expect(proof.pooledBytes).toBeGreaterThan(proof.exactBytes)
+    expect(proof.poolUnchanged).toBe(true)
+    expect(proof.released).toBe(true)
+    expect(proof.positiveAlive).toBe(true)
+  })
+
+  test.each(['default', 'custom', 'throwing'])(
+    'collects sealed observer and evidence behind a public close error with %s stack hooks',
+    (mode) => {
+      expect(retentionChild(mode)).toEqual({
+        observerCollected: true,
+        transcriptCollected: true,
+        decodedCollected: true,
+        positiveAlive: true,
+        fenceAlive: true,
+        hookPreserved: true,
+        evidenceUnchanged: true,
+      })
+    }
+  )
+
   test('closes listeners and reports a still-open client socket on disposal', async () => {
     const { observer } = observe()
     const open1 = open(observer)
