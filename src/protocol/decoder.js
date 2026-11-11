@@ -386,7 +386,7 @@ module.exports = class Decoder {
     this.ensureReadable(length, 'readArrayAsync')
     const array = []
     for (let i = 0; i < length; i++) {
-      array.push(await reader(this))
+      array[i] = await reader(this)
     }
 
     return array
@@ -412,7 +412,7 @@ module.exports = class Decoder {
     this.ensureReadable(count, 'readUVarIntArrayAsync')
     const array = []
     for (let i = 0; i < count; i++) {
-      array.push(await reader(this))
+      array[i] = await reader(this)
     }
 
     return array
