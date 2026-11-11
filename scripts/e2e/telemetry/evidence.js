@@ -3716,7 +3716,7 @@ const verifyDecoderMemory = (memory) => {
  * @param {string} directory absolute run directory @param {object} manifest sidecar manifest
  * @param {function(string):object} read verified JSON sidecar reader
  * @returns {void}
- * @throws {Error} for a missing, duplicate, substituted, failed or aggregate-only fact
+ * @throws {Error} for a missing, duplicate, substituted, failed, seeded or aggregate-only fact
  */
 const verifyChurn = (record, directory, manifest, read) => {
   const { TelemetryResourceVerdict } = require('../../soak/soak')
@@ -3724,6 +3724,10 @@ const verifyChurn = (record, directory, manifest, read) => {
   const schedule = SCHEDULES[CHURN]
   const rows = record.results?.rows
   assert(Array.isArray(rows), 'Missing churn rows')
+  assert(
+    rows.every((row) => row.seed === undefined),
+    'A seeded run is never acceptance evidence'
+  )
   const of = (kind) => rows.filter((row) => row.kind === kind)
   const oracles = read(`${manifest.root}/oracles.json`)
   assert.deepEqual(Object.keys(oracles), ['churn'], 'Required oracle catalogue differs')

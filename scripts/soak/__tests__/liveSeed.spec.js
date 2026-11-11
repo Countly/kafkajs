@@ -2,7 +2,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const { Kafka } = require('../../../index')
-const { TELEMETRY, TelemetryResourceVerdict } = require('../soak')
+const { PROFILES, TELEMETRY, TelemetryResourceVerdict, buildTelemetryChurn } = require('../soak')
 const churn = require('../telemetryChurn')
 const { verifyChurn } = require('../../e2e/telemetry/evidence')
 const {
@@ -246,6 +246,30 @@ describe('live seeded control records', () => {
       'the archive was read'
     )
   })
+
+  test('refuses a seeded parent that would write the default scenario evidence', () => {
+    const saved = { seed: process.env[LIVE_SEED.env], line: process.env.KAFKA_VERSION }
+    const exposed = globalThis.gc
+    process.env[LIVE_SEED.env] = LIVE_SEED.mode
+    delete process.env.KAFKA_VERSION
+    globalThis.gc = () => {}
+    const build = (options = {}) =>
+      buildTelemetryChurn({ brokers: [], phases: PROFILES.telemetry, ...options })
+    try {
+      expect(() => build()).toThrow('A seeded telemetry run records only to a control sink')
+      expect(() => build({ record: () => {} })).toThrow('needs the configured broker line')
+      delete process.env[LIVE_SEED.env]
+      expect(() => build()).toThrow('needs the configured broker line')
+    } finally {
+      globalThis.gc = exposed
+      for (const [name, value] of [
+        [LIVE_SEED.env, saved.seed],
+        ['KAFKA_VERSION', saved.line],
+      ])
+        if (value === undefined) delete process.env[name]
+        else process.env[name] = value
+    }
+  })
 })
 
 describe('live seeded control judge', () => {
@@ -373,6 +397,7 @@ describe('live seeded control judge', () => {
       { signal: 'SIGKILL' },
       { event: 'timeout' },
       { afterDisconnectMs: TELEMETRY.exitMs + 1 },
+      { afterDisconnectMs: null },
     ])
       expect(() => judge(changed({ exit: exit(over) }))).toThrow('natural exit')
   })
