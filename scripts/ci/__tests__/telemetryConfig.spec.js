@@ -174,6 +174,10 @@ describe('telemetry lane configuration', () => {
         expect(result.stdout).toBe(file + '\n')
         const prepared = fs.readFileSync(file)
         expect(crypto.createHash('sha256').update(prepared).digest('hex')).toBe(expected)
+        const amendment = JSON.parse(read(FIXTURES + 'manifest.json')).amendments.find(
+          (entry) => entry.id === 'app-info-parser-4.4.0'
+        )
+        expect(amendment.preparedReporterSha256[line]).toBe(expected)
         expect(sha256(source)).toBe(
           'f624d0d3b774048ce50c21d418fe61429384a37e35fbc11d61170e2ea8e6cb9c'
         )
@@ -212,6 +216,39 @@ describe('telemetry lane configuration', () => {
     } finally {
       fs.rmSync(directory, { recursive: true, force: true })
     }
+  })
+
+  test('preserves the original Java 17 client for older jars and builds the current client for Java 21', () => {
+    const source = 'scripts/e2e/telemetry/legacy/JavaTelemetryClient.java'
+    expect(sha256(source)).toBe('27e3fb34c247f514a0e07a07e85448e7c1bd6bc27eaa3fe301af04721f01eab3')
+    const manifest = JSON.parse(read(FIXTURES + 'manifest.json'))
+    expect(sha256(source)).toBe(manifest.scripts['JavaTelemetryClient.java'])
+    const amendment = manifest.amendments.find((entry) => entry.id === 'app-info-parser-4.4.0')
+    expect(amendment.javaClientBuilds).toEqual({
+      '4.4.0': {
+        source: 'JavaTelemetryClient.java',
+        sha256: '1145746dfeadc7d315e42b1c9d3b3468d819929324cc7701cbddbb423f66b580',
+        release: 21,
+      },
+      '4.3.1': {
+        source: 'legacy/JavaTelemetryClient.java',
+        sha256: '27e3fb34c247f514a0e07a07e85448e7c1bd6bc27eaa3fe301af04721f01eab3',
+        release: 17,
+      },
+      '4.2.2': {
+        source: 'legacy/JavaTelemetryClient.java',
+        sha256: '27e3fb34c247f514a0e07a07e85448e7c1bd6bc27eaa3fe301af04721f01eab3',
+        release: 17,
+      },
+    })
+    const build = read('scripts/e2e/telemetry/build.sh')
+    expect(build).toContain(`CLIENT_SOURCE=$HERE/legacy/JavaTelemetryClient.java
+CLIENT_RELEASE=17
+if [ "$V" = 4.4.0 ]; then
+  CLIENT_SOURCE=$HERE/JavaTelemetryClient.java
+  CLIENT_RELEASE=21
+fi`)
+    expect(build).toMatch(/javac --release "\$CLIENT_RELEASE" [^\n]+ "\$CLIENT_SOURCE"/)
   })
 
   test('the temporary telemetry fixtures build workflow sets its cache on the runner and supports manual dispatch', () => {
