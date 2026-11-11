@@ -18,10 +18,13 @@
  * A/A interval and median calibration and all three spreads determine validity. PASS requires
  * both the paired upper candidate bound and the unpaired median ratio at most 1.05. A valid lower
  * bound above 1.05 is REGRESSION; a failed median check is FAIL; otherwise INCONCLUSIVE. Invalid,
- * inconclusive, fail, regression and timeout all exit 1. Exceptions must remain empty.
+ * inconclusive, fail, regression and timeout all exit 1 for ordinary rows. D167 information-only
+ * rows retain their verdicts but only a valid REGRESSION fails the gate; structural errors and
+ * timeouts still fail. Exceptions must remain empty.
  *
  * The summary holds { baselineSha, candidateSha, node, registeredRows, seed, schedule, arms,
- * unavailable, unavailableInvocations, timedOut }. Arms retain oldNsPerOp, newNsPerOp,
+ * unavailable, unavailableInvocations, timedOut, result }. The result records informationOnlyRows
+ * with their reasons. Arms retain oldNsPerOp, newNsPerOp,
  * baselineControlNsPerOp and invocations with explicit block and A/C/B side. The old unpaired
  * delta is printed as information only. Each partition has its own 25-minute deadline; no retries or
  * adaptive extension. A timeout kills the running subprocess group and preserves partial data.
@@ -43,6 +46,12 @@ const COLLECTION_DEADLINE_MS = 25 * 60 * 1000
 const MAX_RATIO = 1.05
 const MIN_CONTROL_RATIO = 0.95
 const MAX_SPREAD = 0.15
+/** D167 rows remain measured and reported; a valid regression still fails the gate. */
+const INFORMATION_ONLY_ROWS = Object.freeze({
+  'frame-decode:1m': 'D167: GitHub-hosted runner noise; A/A unstable and C as noisy as B.',
+  'frame-decode:64b': 'D167: GitHub-hosted runner noise; A/A unstable and C as noisy as B.',
+  'frame-decode:coalesced': 'D167: GitHub-hosted runner noise; A/A unstable and C as noisy as B.',
+})
 const SIDES = { A: 'oldNsPerOp', C: 'baselineControlNsPerOp', B: 'newNsPerOp' }
 const ORDERS = ['ACB', 'ABC', 'CAB', 'CBA', 'BAC', 'BCA']
 const USAGE =
@@ -403,8 +412,15 @@ const judgeRow = (row) => {
 }
 
 /**
+ * @param {object} row computed row verdict; structural problems remain separate gate failures
+ * @returns {boolean} ordinary PASS or D167 information-only row without a valid regression
+ */
+const rowPassesGate = ({ name, verdict }) =>
+  verdict === 'pass' || (Object.hasOwn(INFORMATION_ONLY_ROWS, name) && verdict !== 'regression')
+
+/**
  * @param {*} input summary; live and offline use this same decision path
- * @returns {{ pass: boolean, problems: string[], unavailable: string[], arms: object[] }} strict verdicts
+ * @returns {{ pass: boolean, problems: string[], unavailable: string[], arms: object[], informationOnlyRows: object }} gate verdict and D167 reasons
  */
 const compare = (input) => {
   const problems = validateInput(input)
@@ -414,10 +430,11 @@ const compare = (input) => {
   })
   const unavailable = Array.isArray(input?.unavailable) ? input.unavailable : []
   return {
-    pass: !problems.length && arms.every(({ verdict }) => verdict === 'pass'),
+    pass: !problems.length && arms.every(rowPassesGate),
     problems,
     unavailable,
     arms,
+    informationOnlyRows: INFORMATION_ONLY_ROWS,
   }
 }
 
@@ -425,11 +442,17 @@ const compare = (input) => {
  * Combines exactly the three complete, disjoint partitions. Seeds and clocks are independent;
  * tree identities, Node version, registration and work must agree. No unavailable row is a PASS.
  * @param {object[]} inputs partition evidence files, in any order
- * @returns {ReturnType<typeof compare>} green only when all fifteen registered rows PASS
+ * @returns {ReturnType<typeof compare>} all fifteen verdicts, with D167 information-only treatment
  */
 const combine = (inputs) => {
   if (!Array.isArray(inputs))
-    return { pass: false, problems: ['partitions must be an array'], unavailable: [], arms: [] }
+    return {
+      pass: false,
+      problems: ['partitions must be an array'],
+      unavailable: [],
+      arms: [],
+      informationOnlyRows: INFORMATION_ONLY_ROWS,
+    }
   const problems = []
   const seen = new Set()
   const results = inputs.map((input) => {
@@ -456,13 +479,11 @@ const combine = (inputs) => {
     problems.push('every registered row must occur exactly once')
   problems.push(...results.flatMap((result) => result.problems))
   return {
-    pass:
-      !problems.length &&
-      results.every((result) => result.pass) &&
-      arms.every(({ verdict }) => verdict === 'pass'),
+    pass: !problems.length && results.every((result) => result.pass) && arms.every(rowPassesGate),
     problems,
     unavailable: results.flatMap((result) => result.unavailable),
     arms,
+    informationOnlyRows: INFORMATION_ONLY_ROWS,
   }
 }
 
@@ -472,6 +493,7 @@ const formatReport = ({ pass, problems, unavailable, arms }) =>
     ...arms.map(
       (arm) =>
         `${arm.verdict.toUpperCase().padEnd(13)}${String(arm.name).padEnd(29)}` +
+        (Object.hasOwn(INFORMATION_ONLY_ROWS, arm.name) ? 'information only (D167)  ' : '') +
         (arm.ratioInterval
           ? `R [${arm.ratioInterval.lower.toFixed(4)}, ${arm.ratioInterval.upper.toFixed(4)}]  ` +
             `Q [${arm.controlInterval.lower.toFixed(4)}, ${arm.controlInterval.upper.toFixed(4)}]  ` +
@@ -776,7 +798,7 @@ const saveFile = (file, text) => {
 /**
  * @param {string[]} argv arguments after the script name
  * @param {Function} [log] report sink
- * @returns {Promise<number>} zero only for a complete calibrated PASS on every measured row
+ * @returns {Promise<number>} zero for complete accepted evidence with no proven regression
  */
 const main = async (argv, log = console.log) => {
   const baselineDir = path.join(REPO_ROOT, WORK_DIR, 'baseline')
@@ -836,6 +858,7 @@ if (require.main === module)
 
 module.exports = {
   ARMS,
+  INFORMATION_ONLY_ROWS,
   PARTITIONS,
   WORK_MULTIPLIERS,
   MeasurementCollector,
