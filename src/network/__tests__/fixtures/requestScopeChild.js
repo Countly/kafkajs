@@ -62,6 +62,7 @@ const collect = async () => {
 
 /**
  * Keeps the real connection or queue alive across collection, plus an independent positive root.
+ * Retired requests keep their scope active until disconnect ends the connection generation.
  * @param {string} mode settled, closed, retired or timer
  * @param {string} kind request scope kind
  * @returns {Promise<object>} scalar collection and lifecycle observations
@@ -100,7 +101,7 @@ const run = async (mode, kind) => {
   })
   try {
     await connection.connect()
-    const marker = await scoped(kind, () => {
+    const marker = await scoped(kind, async () => {
       if (mode !== 'retired') return connection.send(protocol)
       connection
         .send({
@@ -108,12 +109,13 @@ const run = async (mode, kind) => {
           request: { ...protocol.request, encode: () => new Promise(() => {}) },
         })
         .catch(() => {})
-    })
-    if (mode === 'retired') {
       await turn()
       assert.equal(connection.preparing, 1, 'the encoder must still be blocked')
-    }
-    if (mode !== 'settled') await connection.disconnect({ drainTimeout: 0 })
+      const attempt = connection.connectAttempt
+      await connection.disconnect({ drainTimeout: 0 })
+      assert.equal(connection.connectAttempt, attempt + 1, 'disconnect must retire the generation')
+    })
+    if (mode === 'closed') await connection.disconnect({ drainTimeout: 0 })
     await collect()
     return {
       markerCollected: marker.deref() === undefined,
