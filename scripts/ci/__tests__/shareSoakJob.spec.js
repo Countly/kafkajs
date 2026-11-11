@@ -378,6 +378,7 @@ describe('required memory gate composition', () => {
       'resources',
       'retained-diagnostic',
       'telemetry-soak',
+      'live-owner-census',
       'telemetry-verdicts',
       'telemetry-verdict-controls',
     ]

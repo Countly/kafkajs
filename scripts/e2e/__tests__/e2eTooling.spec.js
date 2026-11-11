@@ -1362,6 +1362,7 @@ describe('broker telemetry fixture', () => {
       'resources',
       'retained-diagnostic',
       'telemetry-soak',
+      'live-owner-census',
       'telemetry-verdicts',
       'telemetry-verdict-controls',
       'verdict',
@@ -1380,6 +1381,7 @@ describe('broker telemetry fixture', () => {
       'resources',
       'retained-diagnostic',
       'telemetry-soak',
+      'live-owner-census',
       'telemetry-verdicts',
       'telemetry-verdict-controls',
     ])
