@@ -9,6 +9,9 @@ const { MEMORY_FLAGS, SETTLE, ProcessMemory } = require('../../../../testHelpers
 const TelemetryMetrics = require('../../../../src/telemetry/metrics')
 const { TELEMETRY } = require('../../soak')
 
+/** The live worker's settled reading: collection count, their spacing and the event-loop turns. */
+const LIVE_SETTLEMENT = Object.freeze({ collections: 2, pauseMs: 100, turns: 2 })
+
 /** @param {number} at monotonic deadline @returns {Promise<void>} no earlier than the deadline */
 const until = async (at) => {
   while (performance.now() < at)
@@ -18,20 +21,28 @@ const until = async (at) => {
 /**
  * Scalar companion to the ownership replay. Only one positive-root WeakRef is allocated, before M;
  * per-record weak observation belongs in the separate ownership child, never in measured memory.
+ * The `resource` protocol is the resource workers' (`MEMORY_FLAGS`, `ProcessMemory.settled()`); the
+ * `live` protocol is the telemetry worker's: its exact `WORKER_FLAGS` and its settled reading of two
+ * collections 100 ms apart and two event-loop turns, with the same warm-up, window, grid and evaluator.
  * @param {string} mode legacy or fixed journal implementation
- * @param {string} kind producer, consumer or shareConsumer
+ * @param {string} kind producer, consumer, admin or shareConsumer; the admin offers the same
+ *   product allocation per corpus record while its paced describes do nothing else
  * @param {boolean} seeded retains an actual product snapshot and 4096 bytes for every record
- * @returns {Promise<object>} all readings, real elapsed times, engine facts and component verdict
+ * @param {'resource'|'live'} [protocol] executable flags and settled reading of the arm
+ * @returns {Promise<object>} all readings, real elapsed times, engine facts and component verdict;
+ *   a live arm adds the shadow raw, code and data series of its samples
  * @throws {Error} on invalid flags, overflow, timing failure or lost positive root
  */
-const run = async (mode, kind, seeded) => {
+const run = async (mode, kind, seeded, protocol = 'resource') => {
   if (
     !['legacy', 'fixed'].includes(mode) ||
-    !['producer', 'consumer', 'shareConsumer'].includes(kind)
+    !['producer', 'consumer', 'admin', 'shareConsumer'].includes(kind) ||
+    !['resource', 'live'].includes(protocol)
   )
     throw new Error('Unknown sensitivity arm')
-  if (JSON.stringify(process.execArgv) !== JSON.stringify(MEMORY_FLAGS))
-    throw new Error('Sensitivity arm requires the resource workers executable flags')
+  const flags = protocol === 'live' ? churn.WORKER_FLAGS : MEMORY_FLAGS
+  if (JSON.stringify(process.execArgv) !== JSON.stringify(flags))
+    throw new Error(`Sensitivity arm requires the ${protocol} workers executable flags`)
   const Work = mode === 'fixed' ? churn.OrdinaryWork : ReferenceWork
   const Ledger = mode === 'fixed' ? churn.ShareLedger : ReferenceShareLedger
   const clock = { now: () => performance.now() }
@@ -93,6 +104,7 @@ const run = async (mode, kind, seeded) => {
       for (let n = 0; n < messages.length; n++) product()
       batchDone()
     },
+    describeCluster: async () => {},
   }
   const work = new Work({
     kind,
@@ -106,10 +118,24 @@ const run = async (mode, kind, seeded) => {
     sleep: (ms) => until(clock.now() + ms),
   })
   const memory = new ProcessMemory()
+  const engine = protocol === 'live' ? new churn.EngineCodeJournal() : null
+  const reader =
+    protocol === 'live'
+      ? {
+          settled: () =>
+            churn.settledReading('settled', {
+              gc: globalThis.gc,
+              pause: churn.wait,
+              now: clock.now,
+              collections: () => memory.collections,
+              engine,
+            }),
+        }
+      : memory
   const storage = () =>
     mode === 'fixed' ? journalState([work, ...(ledger ? [ledger] : [])]) : null
   const calibration = new RetainedCalibration({
-    memory,
+    memory: reader,
     now: clock.now,
     origin: 0,
     inventory: () => ({
@@ -159,10 +185,11 @@ const run = async (mode, kind, seeded) => {
         for (let record = 0; record < churn.CORPUS.batch; record++) {
           const index = batch * churn.CORPUS.batch + record
           product()
-          await handler({
-            partition: index % 3,
-            message: { offset: String(index), key: churn.recordId('journal', kind, index) },
-          })
+          if (kind !== 'admin')
+            await handler({
+              partition: index % 3,
+              message: { offset: String(index), key: churn.recordId('journal', kind, index) },
+            })
         }
         batchDone()
       }
@@ -208,7 +235,8 @@ const run = async (mode, kind, seeded) => {
         v8: process.versions.v8,
       },
       protocol: {
-        settlement: SETTLE,
+        name: protocol,
+        settlement: protocol === 'live' ? LIVE_SETTLEMENT : SETTLE,
         sampleAt: TELEMETRY.sampleAt,
         perRecordWeakObservation: false,
       },
@@ -223,6 +251,7 @@ const run = async (mode, kind, seeded) => {
       verdict,
       storage: { before: baseline.snapshot.journals.workload, closed: storage() },
       seededRoots: seeded ? retained.length : 0,
+      ...(engine ? { shadow: engine.report(samples) } : {}),
     }
   } finally {
     memory.stop()
@@ -230,7 +259,7 @@ const run = async (mode, kind, seeded) => {
 }
 
 if (require.main === module)
-  run(process.argv[2], process.argv[3], process.argv[4] === 'true')
+  run(process.argv[2], process.argv[3], process.argv[4] === 'true', process.argv[5])
     .then((result) => process.stdout.write(JSON.stringify(result)))
     .catch((error) => {
       process.stderr.write(error.stack)

@@ -1364,6 +1364,7 @@ describe('broker telemetry fixture', () => {
       'share-soak-verify',
       'share-soak-verdict',
       'resources',
+      'journal-controls',
       'retained-diagnostic',
       'telemetry-soak',
       'live-owner-census',
@@ -1383,6 +1384,7 @@ describe('broker telemetry fixture', () => {
       'unit',
       'share-soak-verdict',
       'resources',
+      'journal-controls',
       'retained-diagnostic',
       'telemetry-soak',
       'live-owner-census',
@@ -1487,11 +1489,49 @@ describe('broker telemetry fixture', () => {
     const validate = resources.steps.find((step) => step.run?.includes('resourceArtifact.js'))
     expect(validate.if).toBe('always()')
     expect(validate.run).toContain('--tree "$KAFKAJS_TREE" --node "$(node -p process.version)"')
+    const calibration = resources.steps.find((step) => step.name?.startsWith('Compare journal'))
+    expect(calibration.run).toContain(
+      '--kinds=producer,consumer,shareConsumer --protocols=resource || exit 1'
+    )
+    expect(calibration['timeout-minutes']).toBe(85)
     expect(resources.steps.at(-1)).toMatchObject({
       name: 'Upload resource and calibration evidence',
       if: 'always()',
       'timeout-minutes': 2,
       uses: 'actions/upload-artifact@v4',
+    })
+    const journals = workflow.jobs['journal-controls']
+    expect(journals['timeout-minutes']).toBe(60)
+    expect(journals.strategy).toEqual({
+      'fail-fast': false,
+      matrix: {
+        node: [22, 24, 26],
+        group: [
+          { name: 'admin', kinds: 'admin', protocols: 'resource,live' },
+          { name: 'live-flags', kinds: 'producer,consumer,shareConsumer', protocols: 'live' },
+        ],
+      },
+    })
+    const parity = journals.steps.find((step) => step.run?.includes('journalControls.js'))
+    expect(parity.env).toEqual({
+      JOURNAL_KINDS: '$' + '{{ matrix.group.kinds }}',
+      JOURNAL_PROTOCOLS: '$' + '{{ matrix.group.protocols }}',
+    })
+    expect(parity.run).toBe(
+      'timeout -k 10s 2900s node scripts/soak/journalControls.js "$JOURNAL_CONTROLS_DIR" --kinds="$JOURNAL_KINDS" --protocols="$JOURNAL_PROTOCOLS" || exit 1'
+    )
+    expect(parity['timeout-minutes'] * 60).toBeGreaterThan(2900)
+    expect(journals['timeout-minutes']).toBeGreaterThan(parity['timeout-minutes'] + 5 + 2)
+    for (const step of journals.steps.filter((row) => row.run))
+      expect(step['timeout-minutes']).toBeGreaterThan(0)
+    expect(journals.steps.at(-1)).toMatchObject({
+      if: 'always()',
+      uses: 'actions/upload-artifact@v4',
+      with: {
+        name: 'journal-controls-$' + '{{ matrix.group.name }}-node$' + '{{ matrix.node }}',
+        path: '.tmp/journal-controls/',
+        'if-no-files-found': 'error',
+      },
     })
     expect(resources.steps.at(-1).with).toMatchObject({
       name: 'resources-node$' + '{{ matrix.node }}',

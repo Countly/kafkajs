@@ -60,16 +60,17 @@ These are bounds on the fixed workload, not averages measured from an archive:
 | Native compression journal | 1,024 × 2,048 | 2,097,152 |
 | Pending native windows | 1,024 × 256 | 262,144 |
 | Memory samples | (11 + 4) × 65,536 | 983,040 |
+| Engine code readings (shadow) | 64 × 64 | 4,096 |
 | Share exchanges | 54,532 × 256 + 98,796 × 80 + 11,000 × 128 + 16,384 label bytes | 23,288,256 |
 | Share public acknowledgements | 11,000 × 192 + 16,384 label bytes | 2,128,384 |
-| **Producer / consumer / admin total before c0** | Ordinary + native + windows + samples | **4,070,384** |
-| **ShareConsumer total before c0** | All owners | **29,487,024** |
+| **Producer / consumer / admin total before c0** | Ordinary + native + windows + samples + engine code | **4,074,480** |
+| **ShareConsumer total before c0** | All owners | **29,491,120** |
 
 Previously the ordinary reserve was 1,405,840 bytes and the share reserve 29,573,120 bytes,
 allocated after the disabled control. The new ordinary reserve is 728,048 bytes and the new share
 reserve 25,416,640 bytes. The exchange arena grows to cover the corrected count bound; the much
 smaller acknowledgement and ordinary reserves reduce total share-worker storage by **4,834,272
-bytes (4.61 MiB)**. All 29,487,024 bytes now count toward the 96 MiB setup and 160 MiB absolute
+bytes (4.61 MiB)** before the 4,096-byte engine code journal. All 29,491,120 bytes now count toward the 96 MiB setup and 160 MiB absolute
 allowances. Moving the allocation changes the disabled RSS baseline; it is explicitly disclosed,
 not a subtraction from the 64 MiB delta verdict.
 
@@ -108,11 +109,17 @@ vectors. Virtual timestamps never accompany an absolute real-memory slope assert
 
 The existing `resources` job in `memory-gates.yml` runs the second layer serially on Node 22, 24
 and 26. `scripts/soak/journalControls.js` runs paired virtual-time ownership children for each
-workload, then real-time seeded/unseeded children in both legacy and fixed modes. Its 105-minute
-job budget includes the original resource measurements and twelve six-minute calibration arms.
-The calibration uses the resource workers' executable, `MEMORY_FLAGS` and unchanged
-`ProcessMemory.settled()` protocol (two collections 100 ms apart, two event-loop turns, up to six
-pairs). It waits for the original eleven sample admissions over the real 60-second warm-up and
+workload, then real-time seeded/unseeded children in both legacy and fixed modes. The job runs the
+producer, consumer and share workloads (`--kinds=producer,consumer,shareConsumer
+--protocols=resource`); its 105-minute budget includes the original resource measurements and
+twelve six-minute calibration arms. The separate `journal-controls` job runs, per Node line, the
+admin workload under both protocols and the live-flags arms of the other three, six six-minute arms
+each, so neither job's timeout grows. The `resource` protocol uses the resource workers'
+executable, `MEMORY_FLAGS` and unchanged `ProcessMemory.settled()` protocol (two collections 100
+ms apart, two event-loop turns, up to six pairs). The `live` protocol runs the fixed journal under
+the telemetry worker's exact flags (`WORKER_FLAGS`, `--expose-gc` alone) and its settled reading
+(two collections 100 ms apart, two event-loop turns, one pass), with the same warm-up, window, grid
+and evaluator; its results also carry the shadow raw, code and data series of its samples. It waits for the original eleven sample admissions over the real 60-second warm-up and
 300-second measurement window. Actual admission, completion, clock origin and elapsed times are
 archived; no virtual duration is supplied to a memory verdict.
 
@@ -122,9 +129,23 @@ lengths must remain constant at M, every sample and closed; overflow fails. Work
 storage and cursors are recorded separately. The intentionally growing per-record WeakRefs and
 WeakMap in the separate ownership replay are inventoried, together with its fixed archive buffers,
 and never supply calibration readings. Seeded arms retain a real product snapshot and 4,096
-bytes per record; unseeded arms release them. Every unseeded real-time arm must remain under
-both limits, and every seeded arm must trip both. No limits, bytes or samples are adjusted to
-make a control pass; legacy journal growth and runtime effects remain visible and can fail it.
+bytes per record; unseeded arms release them. Each arm has a role, written into its summary row:
+
+| Arm | Role | Judged by |
+|---|---|---|
+| fixed, unseeded | `null` | no violation |
+| fixed or legacy, seeded | `seeded-positive` | both violations |
+| legacy, unseeded, consumer and share | `contamination-positive` | the retained-slope violation; the endpoint violation is also asserted whenever its measured value exceeds the limit |
+| legacy, unseeded, producer | `contamination-positive` | paired ordering only: legacy slope and endpoint above the fixed null's, on the same Node |
+| legacy, unseeded, admin | `no-contamination-recorded` | recorded only: the admin writes no legacy journal |
+| fixed, unseeded, live flags | `live-configuration-null` | recorded only |
+| fixed, seeded, live flags | `seeded-positive` | both violations |
+
+The legacy unseeded arm is a contamination-positive control, not a null: the old array journals
+really grew, so detecting them shows the method sees harness contamination. A crashed, timed-out
+or malformed child, or a verdict without measured values, is a failure and never a detection or a
+null. No limits, bytes or samples are adjusted to make a control pass; legacy journal growth and
+runtime effects remain visible.
 
 The real-time verdict is explicitly limited to slope and endpoint components with the unchanged
 limits and least-squares calculation. It does not invoke the full resource verdict, so it claims
@@ -137,3 +158,17 @@ Legacy/fixed ownership rows must agree at M, first, last and closed, including e
 released target IDs and the deliberately retained positive product root. Fixed storage format and
 byte length are checked at every checkpoint; legacy arrays report no fixed-storage metadata.
 These diagnostics are not live-worker attribution or acceptance evidence.
+
+## Engine code shadow
+
+Every worker also records the engine's code sizes beside each reading it takes: loaded, c0, c1,
+control-released, M, each sample, closed and final. An `EngineCodeJournal` keeps `v8.getHeapCodeStatistics()`
+`code_and_metadata_size` and `bytecode_and_metadata_size` as scalars in 64 fixed rows, touched before
+c0 and counted in the allocation. It has its own owner entry in each snapshot's journal state, so the
+constancy check covers it, and an overflow throws.
+
+The parent's `resource-verdict` row carries a `shadow` object next to `result`: for the settled samples
+it reports the least-squares slope per minute and the first-to-last change of the raw series
+(`heapUsed + external`), of the code series (code plus bytecode) and of the data series (raw minus
+code). The verdict, its recomputation from `input` and every limit are unchanged, and nothing in
+acceptance reads the shadow. The live-flags calibration arms report the same shadow for their samples.
