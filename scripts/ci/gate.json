@@ -19594,7 +19594,8 @@
         "scripts/ci/__tests__/workflowTimeouts.spec.js › workflow job timeouts a reusable-workflow caller job is exempt and its callee is checked",
         "scripts/ci/__tests__/workflowTimeouts.spec.js › workflow job timeouts fails on a reusable-workflow call whose callee cannot be resolved",
         "scripts/ci/__tests__/workflowTimeouts.spec.js › workflow job timeouts rejects a job with no timeout (negative control)",
-        "scripts/ci/__tests__/workflowTimeouts.spec.js › workflow job timeouts rejects a timeout of 0 or above 360"
+        "scripts/ci/__tests__/workflowTimeouts.spec.js › workflow job timeouts rejects a timeout of 0 or above 360",
+        "scripts/ci/__tests__/workflowExpressions.spec.js › workflow run expressions no run script interpolates a workflow expression outside pending PR merges"
       ],
       "capMinutes": 85,
       "allowedSkips": [
@@ -23655,7 +23656,8 @@
         "scripts/ci/__tests__/workflowTimeouts.spec.js › workflow job timeouts a reusable-workflow caller job is exempt and its callee is checked",
         "scripts/ci/__tests__/workflowTimeouts.spec.js › workflow job timeouts fails on a reusable-workflow call whose callee cannot be resolved",
         "scripts/ci/__tests__/workflowTimeouts.spec.js › workflow job timeouts rejects a job with no timeout (negative control)",
-        "scripts/ci/__tests__/workflowTimeouts.spec.js › workflow job timeouts rejects a timeout of 0 or above 360"
+        "scripts/ci/__tests__/workflowTimeouts.spec.js › workflow job timeouts rejects a timeout of 0 or above 360",
+        "scripts/ci/__tests__/workflowExpressions.spec.js › workflow run expressions no run script interpolates a workflow expression outside pending PR merges"
       ],
       "capMinutes": 93,
       "allowedSkips": [
