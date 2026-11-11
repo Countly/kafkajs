@@ -22574,7 +22574,9 @@
         "testHelpers/__tests__/resourceProbe.spec.js \u203a resource artifact validation data bytes, the warm-up and the seeded controls keeps the active retained gate on raw bytes: code growth is not subtracted from it",
         "testHelpers/__tests__/resourceProbe.spec.js \u203a resource artifact validation no dynamic code compilation in product source finds no new Function, eval or vm in the product tree",
         "testHelpers/__tests__/resourceProbe.spec.js \u203a resource artifact validation no dynamic code compilation in product source recognises every form it forbids and leaves ordinary code alone",
-        "testHelpers/__tests__/resourceProbe.spec.js \u203a resource artifact validation a directory of artifacts rejects seeded artifacts for every arm and kind, with or without exposed GC"
+        "testHelpers/__tests__/resourceProbe.spec.js \u203a resource artifact validation a directory of artifacts rejects seeded artifacts for every arm and kind, with or without exposed GC",
+        "scripts/soak/__tests__/originalSharePriming.spec.js \u203a two-scope original share driver matches scripted cluster discovery to the public admin option semantics",
+        "scripts/soak/__tests__/originalSharePriming.spec.js \u203a two-scope original share driver selects API 60 through the real public admin during share setup"
       ],
       "capMinutes": 93,
       "allowedSkips": [

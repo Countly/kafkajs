@@ -853,10 +853,6 @@ const main = async (argv) => {
     return 1
   }
 }
-if (require.main === module)
-  main(process.argv.slice(2)).then((status) => {
-    process.exitCode = status
-  })
 module.exports = {
   validateArchive,
   validateRows,
@@ -864,3 +860,8 @@ module.exports = {
   configurationProblems,
   cleanupPopulation,
 }
+
+if (require.main === module)
+  main(process.argv.slice(2)).then((status) => {
+    process.exitCode = status
+  })
