@@ -442,6 +442,13 @@ describe('required memory gate composition', () => {
     expect(jobs['telemetry-soak']).toContain("kafka: ['4.3.1', '4.2.2']")
     expect(jobs['telemetry-seeded-control']).toContain('node: [22, 24, 26]')
     expect(jobs['telemetry-seeded-control']).toContain("KAFKA_VERSION: '4.3.1'")
+    expect(jobs['live-owner-census']).toContain('node: [22, 24, 26]')
+    expect(jobs['live-owner-census']).toContain("kafka: ['4.3.1', '4.2.2']")
+    expect(jobs['live-owner-census']).toContain('variant: [capture, scalar]')
+    expect(jobs['live-owner-census']).toContain(
+      'liveDiagnostic.js --diagnostic-only "$LIVE_CENSUS_ROOT" "$CENSUS_VARIANT"'
+    )
+    expect(jobs['live-owner-census']).not.toMatch(/verifyEvidence|resourceArtifact\.js/)
     expect(jobs['telemetry-verdicts']).toContain('full: true')
     expect(jobs['telemetry-verdicts']).toContain('memory-verdicts: true')
     expect(workflow).not.toContain('continue-on-error:')

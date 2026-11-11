@@ -504,13 +504,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { node: 22, kafka: '4.3.1', variant: capture }
-          - { node: 22, kafka: '4.3.1', variant: scalar }
-          - { node: 26, kafka: '4.3.1', variant: capture }
-          - { node: 26, kafka: '4.3.1', variant: scalar }
-          - { node: 26, kafka: '4.2.2', variant: capture }
-          - { node: 26, kafka: '4.2.2', variant: scalar }
+        node: [22, 24, 26]
+        kafka: ['4.3.1', '4.2.2']
+        variant: [capture, scalar]
     env:
       KAFKA_VERSION: ${{ matrix.kafka }}
       COMPOSE_FILE: docker-compose.telemetry.yml

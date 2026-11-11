@@ -1602,6 +1602,56 @@ describe('broker telemetry fixture', () => {
     expect(JSON.stringify(soak)).not.toContain('forceExit')
   })
 
+  test('covers all six live census lanes with capture and scalar companions', () => {
+    // eslint-disable-next-line n/no-extraneous-require -- YAML parser is pinned by the ESLint/Jest toolchain
+    const yaml = require('js-yaml')
+    const workflow = yaml.load(read('.github/workflows/memory-gates.yml').toString())
+    const census = workflow.jobs['live-owner-census']
+    expect(census.strategy).toEqual({
+      'fail-fast': false,
+      matrix: {
+        node: [22, 24, 26],
+        kafka: ['4.3.1', '4.2.2'],
+        variant: ['capture', 'scalar'],
+      },
+    })
+    expect(census.env.KAFKA_VERSION).toBe('$' + '{{ matrix.kafka }}')
+    expect(census.steps[1].with['node-version']).toBe('$' + '{{ matrix.node }}')
+    for (const identity of ['github.run_id', 'github.run_attempt', 'strategy.job-index'])
+      expect(census.env.COMPOSE_PROJECT_NAME).toContain(identity)
+    expect(census.env.TELEMETRY_RESOURCES_ARTIFACT_DIR).toBeUndefined()
+    const steps = census.steps.filter((step) => step.run)
+    for (const step of steps) expect(step['timeout-minutes']).toBeGreaterThan(0)
+    const capture = steps.find((step) => step.run.includes('liveDiagnostic.js'))
+    expect(capture.env.CENSUS_VARIANT).toBe('$' + '{{ matrix.variant }}')
+    expect(capture.run).toBe(
+      'timeout -k 10s 700s node --expose-gc scripts/e2e/telemetry/retained/liveDiagnostic.js --diagnostic-only "$LIVE_CENSUS_ROOT" "$CENSUS_VARIANT"'
+    )
+    expect(capture['timeout-minutes'] * 60).toBeGreaterThan(710)
+    const analyse = steps.find((step) => step.run.includes('analyseLive.js'))
+    expect(analyse.if).toBe('always()')
+    expect(analyse.run).toContain('analyseLive.js "$LIVE_CENSUS_ROOT"')
+    const stop = steps.find((step) => step.run.includes('ci.js stop'))
+    expect(stop.if).toBe('always()')
+    expect(stop.run).toContain('verifyCleanup(')
+    expect(census['timeout-minutes']).toBeGreaterThan(
+      census.steps.reduce((sum, step) => sum + (step['timeout-minutes'] ?? 0), 0)
+    )
+    expect(JSON.stringify(census)).not.toMatch(/verifyEvidence|resourceArtifact\.js|forceExit/)
+    expect(census.steps.at(-1)).toMatchObject({
+      if: 'always()',
+      uses: 'actions/upload-artifact@v4',
+      with: { 'if-no-files-found': 'error', 'include-hidden-files': true },
+    })
+    expect(census.steps.at(-1).with.name).toBe(
+      'live-owner-census-$' +
+        '{{ matrix.kafka }}-node$' +
+        '{{ matrix.node }}-$' +
+        '{{ matrix.variant }}'
+    )
+    expect(census.steps.at(-1).with.path).toContain('.tmp/live-census/')
+  })
+
   test('wires the seeded live control as its own job whose records stay out of acceptance evidence', () => {
     // eslint-disable-next-line n/no-extraneous-require -- YAML parser is pinned by the ESLint/Jest toolchain
     const yaml = require('js-yaml')
