@@ -9,6 +9,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Additions
 
+- Document share dead-letter queue configuration and verify reject/max-delivery routing on Kafka 4.4.
 - Add evolving `admin.unregisterController({ controllerId })` for Kafka 4.4+ (KIP-1312).
 - Add `metadataClusterCheck` (default `true`) to opt out of intended cluster/node identity in ApiVersions v5.
 - Add opt-in `bootstrapResolveTimeout` (default 0); a positive timeout gates initial connection on DNS readiness and fails terminally when its deadline expires.
