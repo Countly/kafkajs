@@ -79,6 +79,10 @@ describe('weekly matrix', () => {
   test('keeps the Monday 03:00 cron and the six groups', () => {
     expect(workflow.on.schedule).toEqual([{ cron: '0 3 * * 1' }])
     expect(job.strategy.matrix.group).toEqual(GROUPS)
+    expect(job.env.MATRIX_GROUP).toBe(expr('matrix.group'))
+    expect(job.steps.at(-1).run).toBe(
+      './scripts/testWithKafka.sh "npm run test:group:$MATRIX_GROUP -- --ci --maxWorkers=4"'
+    )
     expect(job.env.COMPOSE_FILE).toBe(
       expr(
         "matrix.group == 'oauthbearer' && 'docker-compose.oauthbearer.yml' || 'docker-compose.yml'"

@@ -80,6 +80,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     env:
+      MATRIX_GROUP: ${{ matrix.group }}
       KAFKA_VERSION: ${{ matrix.kafka }}
       COMPOSE_FILE: ${{ matrix.compose }}
       COMPOSE_PROJECT_NAME: telemetry-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
@@ -144,7 +145,7 @@ jobs:
         timeout-minutes: 5
         env:
           TMPDIR: ${{ runner.temp }}
-        run: timeout -k 10s 270s npm run test:group:${{ matrix.group }} -- --ci
+        run: timeout -k 10s 270s npm run "test:group:$MATRIX_GROUP" -- --ci
       - name: Verify telemetry evidence before teardown
         if: always()
         timeout-minutes: 3
@@ -161,7 +162,7 @@ jobs:
           ], { stdio: 'inherit', timeout: 60000 })
           if (result.error) throw result.error
           if (result.status !== 0) throw new Error('Evidence stamp verification failed')
-          verifyEvidence('${{ matrix.group }}', process.env.TELEMETRY_EVIDENCE_DIR, files)
+          verifyEvidence(process.env.MATRIX_GROUP, process.env.TELEMETRY_EVIDENCE_DIR, files)
           NODE
       - name: Require archived socket ownership and shutdown resource acceptance
         if: ${{ always() && inputs.memory-verdicts }}
@@ -172,7 +173,7 @@ jobs:
           const { verifyMemoryEvidence } = require('./scripts/e2e/telemetry/memoryVerdicts')
           const files = fs.readdirSync('.tmp/e2e').filter(name => name.endsWith('.jsonl'))
             .map(name => `.tmp/e2e/${name}`)
-          verifyMemoryEvidence('${{ matrix.group }}', process.env.TELEMETRY_EVIDENCE_DIR, files)
+          verifyMemoryEvidence(process.env.MATRIX_GROUP, process.env.TELEMETRY_EVIDENCE_DIR, files)
           NODE
       - name: Stop owned project and prove container network volume removal
         if: always()

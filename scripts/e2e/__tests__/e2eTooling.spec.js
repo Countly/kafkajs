@@ -1317,6 +1317,15 @@ describe('broker telemetry fixture', () => {
       workflow.jobs.telemetry.steps.find((step) => step.name === 'Run telemetry lane').if
     ).toBeUndefined()
     const job = workflow.jobs.telemetry
+    expect(job.env.MATRIX_GROUP).toBe('$' + '{{ matrix.group }}')
+    expect(job.steps.find((step) => step.name === 'Run telemetry lane').run).toBe(
+      'timeout -k 10s 270s npm run "test:group:$MATRIX_GROUP" -- --ci'
+    )
+    expect(
+      job.steps.find((step) => step.name === 'Verify telemetry evidence before teardown').run
+    ).toContain(
+      'verifyEvidence(process.env.MATRIX_GROUP, process.env.TELEMETRY_EVIDENCE_DIR, files)'
+    )
     for (const identity of ['github.run_id', 'github.run_attempt', 'strategy.job-index'])
       expect(job.env.COMPOSE_PROJECT_NAME).toContain(identity)
     const steps = job.steps.filter((step) => step.run)
@@ -1427,6 +1436,10 @@ describe('broker telemetry fixture', () => {
       step.run?.includes('verifyMemoryEvidence')
     )
     expect(verdict.if).toBe('$' + '{{ always() && inputs.memory-verdicts }}')
+    expect(shared.jobs.telemetry.env.MATRIX_GROUP).toBe('$' + '{{ matrix.group }}')
+    expect(verdict.run).toContain(
+      'verifyMemoryEvidence(process.env.MATRIX_GROUP, process.env.TELEMETRY_EVIDENCE_DIR, files)'
+    )
     expect(verdict['continue-on-error']).toBeUndefined()
     expect(shared.on.workflow_call.inputs['memory-verdicts'].default).toBe(false)
     const mutationControls = workflow.jobs['telemetry-verdict-controls']

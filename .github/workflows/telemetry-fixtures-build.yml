@@ -1,6 +1,7 @@
 name: Telemetry fixtures build (temporary)
 # Builds the Kafka 4.4.0 telemetry fixture jars with provenance. Delete this file after the artifacts are committed.
 on:
+  workflow_dispatch:
   pull_request:
     paths:
       - scripts/e2e/telemetry/fixtures/**
@@ -16,12 +17,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
-      TF1_CACHE: ${{ runner.temp }}/tf1-cache
       KAFKA_IMAGE: apache/kafka:4.4.0
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: '21' }
+      - name: Set telemetry fixture cache path
+        timeout-minutes: 1
+        run: echo "TF1_CACHE=$RUNNER_TEMP/tf1-cache" >> "$GITHUB_ENV"
       - name: Fetch and verify the pinned build inputs
         timeout-minutes: 5
         run: bash scripts/e2e/telemetry/fetch.sh

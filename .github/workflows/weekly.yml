@@ -18,6 +18,7 @@ jobs:
           - { node: 22, kafka: '4.2.2' }
           - { node: 24, kafka: '4.3.2' }
     env:
+      MATRIX_GROUP: ${{ matrix.group }}
       KAFKA_VERSION: ${{ matrix.kafka }}
       COMPOSE_FILE: ${{ matrix.group == 'oauthbearer' && 'docker-compose.oauthbearer.yml' || 'docker-compose.yml' }}
     steps:
@@ -25,4 +26,4 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: '${{ matrix.node }}', cache: npm }
       - run: npm ci
-      - run: ./scripts/testWithKafka.sh "npm run test:group:${{ matrix.group }} -- --ci --maxWorkers=4"
+      - run: ./scripts/testWithKafka.sh "npm run test:group:$MATRIX_GROUP -- --ci --maxWorkers=4"
