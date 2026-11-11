@@ -25,8 +25,10 @@ const {
   DecoderMemory,
   TelemetryWireObserver,
   OBSERVER_LIMITS,
+  checkedResource,
   readExports,
 } = require('../../testHelpers/telemetryFixtures')
+const { pollUntil } = require('../../src/producer/__tests__/fixtures/bounded')
 const {
   TelemetrySegments,
   checkSegmentFiles,
@@ -1735,50 +1737,89 @@ class ParentFixture {
   }
 
   /**
-   * Sets the next subscription value, checks the set succeeded and reads the resource back.
+   * Sets the next subscription and polls successful stale readbacks until every value is exact.
+   * The set, all reads and pauses share the parent's remaining rotation budget; API errors fail
+   * immediately, and expiry stops polling with the last expected/observed mismatch.
    * @param {number} index the 10 s transition number, from 1 @param {string} metrics the new value
+   * @param {number} [budgetMs] remaining time within the existing confirmation stage, at most 9 s
    * @returns {Promise<{index:number, selection:string, setAt:number, readbackAt:number,
-   *   readback:string}>} the transition row, times on this process's monotonic clock
-   * @throws {Error} when the set or the readback is not exactly what was asked
+   *   readback:string, readbackAttempts:number}>} the transition row, times on this process's clock
+   * @throws {Error} on an API failure or when the budget expires without an exact readback
    */
-  async rotate(index, metrics) {
+  async rotate(index, metrics, budgetMs = STAGE_MS.confirm - 1000) {
     const resource = { type: 16, name: this.stem }
-    const set = await this.admin.incrementalAlterConfigs({
-      timeout: 3000,
-      resources: [
-        { ...resource, configEntries: [{ name: 'metrics', operation: 0, value: metrics }] },
-      ],
-    })
-    const setAt = this.clock.now()
-    const rows = set?.resources
-    if (!Array.isArray(rows) || rows.length !== 1 || rows[0].errorCode !== 0)
-      throw new Error('The subscription set was not accepted')
-    const read = await this.admin.describeConfigs({
-      timeout: 3000,
-      resources: [{ ...resource, configNames: ['metrics', 'interval.ms', 'match'] }],
-    })
-    const entries = Object.fromEntries(
-      read.resources[0].configEntries.map((e) => [e.configName, e.configValue])
-    )
-    const readbackAt = this.clock.now()
-    if (
-      (entries.metrics ?? '') !== metrics ||
-      entries['interval.ms'] !== this.rotationEntries['interval.ms'] ||
-      entries.match !== this.rotationEntries.match
-    )
+    const expected = { metrics, ...this.rotationEntries }
+    const names = Object.keys(expected)
+    const deadline = this.clock.now() + budgetMs
+    const timeout = () => Math.max(1, Math.min(3000, Math.ceil(deadline - this.clock.now())))
+    const label = 'The subscription set and readback'
+    const owner = new AbortController()
+    let entries
+    let readbackAttempts = 0
+    try {
+      return await within(
+        async () => {
+          const set = await this.admin.incrementalAlterConfigs({
+            timeout: timeout(),
+            resources: [
+              { ...resource, configEntries: [{ name: 'metrics', operation: 0, value: metrics }] },
+            ],
+          })
+          owner.signal.throwIfAborted()
+          const setAt = this.clock.now()
+          const rows = set?.resources
+          if (!Array.isArray(rows) || rows.length !== 1 || rows[0].errorCode !== 0)
+            throw new Error('The subscription set was not accepted')
+          let readbackAt
+          await pollUntil(
+            owner.signal,
+            Infinity,
+            async (scope) => {
+              readbackAttempts += 1
+              const answer = await this.admin.describeConfigs({
+                timeout: timeout(),
+                resources: [{ ...resource, configNames: names }],
+              })
+              scope.throwIfAborted()
+              const read = checkedResource(answer, resource.name)
+              entries = Object.fromEntries(
+                read.configEntries.map((e) => [e.configName, e.configValue])
+              )
+              readbackAt = this.clock.now()
+              return names.every((name) => entries[name] === expected[name])
+            },
+            { delayMs: 50 }
+          )
+          return {
+            index,
+            selection: metrics,
+            setAt,
+            readbackAt,
+            readback: entries.metrics,
+            readbackAttempts,
+          }
+        },
+        budgetMs,
+        label
+      )
+    } catch (error) {
+      if (!entries || error?.message !== `${label} did not finish within ${budgetMs} ms`)
+        throw error
       throw new Error(
         `The subscription readback differs: ${JSON.stringify({
           index,
-          expected: { metrics, ...this.rotationEntries },
+          expected,
           observed: Object.fromEntries(
-            ['metrics', 'interval.ms', 'match'].map((name) => [
+            names.map((name) => [
               name,
               entries[name] === undefined ? null : String(entries[name]).slice(0, 256),
             ])
           ),
         })}`
       )
-    return { index, selection: metrics, setAt, readbackAt, readback: entries.metrics ?? '' }
+    } finally {
+      owner.abort()
+    }
   }
 
   /**
@@ -3525,10 +3566,12 @@ class TelemetryChurn {
             this.abort,
           ])
           const requestedAt = this.clock.now()
-          const rotation = await within(
-            this.own(this.fixture.rotate(tick.index, schedule.selection(tick.index))),
-            Math.min(STAGE_MS.confirm - 1000, remaining()),
-            'The subscription set and readback'
+          const rotation = await this.own(
+            this.fixture.rotate(
+              tick.index,
+              schedule.selection(tick.index),
+              Math.min(STAGE_MS.confirm - 1000, remaining())
+            )
           )
           this.rotations.push({ tick: tick.number, requestedAt, ...rotation })
         }

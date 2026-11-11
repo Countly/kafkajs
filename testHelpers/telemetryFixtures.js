@@ -2035,6 +2035,7 @@ const verifyMetricWindows = ({ kind, samples, requests, connects, delta }) => {
 module.exports = {
   readCreatedTopicConfig,
   canonicalUuid,
+  checkedResource,
   DecoderGate,
   DecoderMemory,
   OBSERVER_LIMITS: DEFAULT_LIMITS,
