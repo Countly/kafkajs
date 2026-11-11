@@ -23,12 +23,13 @@ concurrency:
   cancel-in-progress: true
 env:
   # The broker release of every check that sets no kafkaVersion; the Read check step exports it as KAFKA_VERSION.
-  DEFAULT_KAFKA_VERSION: 4.3.1
+  DEFAULT_KAFKA_VERSION: 4.4.0
   # Ubuntu 24.04 (docker.io/library/ubuntu index digest, read from the registry 2026-11-05). The KDC
   # Dockerfile installs the MIT Kerberos packages onto it when the base lacks them.
   KDC_BASE_IMAGE: ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852
-  # Maven Central's kafka-storage-4.3.1-test.jar.sha256, read 2026-11-05 and matched to the jar's own digest.
-  TIERED_JAR_SHA256: f3236936854c13815ffaa7f35a3f2d6861c125616cba5395b538b8680dded886
+  # Maven Central's kafka-storage-4.4.0-test-fixtures.jar.sha256, read 2026-11-11 (LocalTieredStorage moved
+  # from the -test jar to the test fixtures in 4.4.0).
+  TIERED_JAR_SHA256: ab62d0acf3ca64ba5cce7941c21c338d0399954b2c66c25efbf24a57241ff991
 jobs:
   plan:
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
@@ -220,7 +221,7 @@ jobs:
         uses: actions/cache@v4
         if: fromJSON(steps.entry.outputs.check).needs.tiered
         with:
-          path: testHelpers/kafka/plugins/kafka-storage-4.3.1-test.jar
+          path: testHelpers/kafka/plugins/kafka-storage-4.4.0-test-fixtures.jar
           key: tiered-jar-${{ env.TIERED_JAR_SHA256 }}
       - name: Prepare tiered storage
         if: fromJSON(steps.entry.outputs.check).needs.tiered
@@ -228,9 +229,9 @@ jobs:
           [[ "$TIERED_JAR_SHA256" =~ ^[a-f0-9]{64}$ ]] || { echo 'Set TIERED_JAR_SHA256 to the audited Maven artifact digest'; exit 1; }
           mkdir -p testHelpers/kafka/plugins "$RUNNER_TEMP/tiered-remote"
           chmod 777 "$RUNNER_TEMP/tiered-remote"
-          jar=testHelpers/kafka/plugins/kafka-storage-4.3.1-test.jar
+          jar=testHelpers/kafka/plugins/kafka-storage-4.4.0-test-fixtures.jar
           # Maven Central answers runners with a transient 403 at times, which plain --retry skips.
-          [ -s "$jar" ] || curl --fail --location --retry 5 --retry-all-errors --retry-delay 10 --max-time 120 https://repo.maven.apache.org/maven2/org/apache/kafka/kafka-storage/4.3.1/kafka-storage-4.3.1-test.jar -o "$jar"
+          [ -s "$jar" ] || curl --fail --location --retry 5 --retry-all-errors --retry-delay 10 --max-time 120 https://repo.maven.apache.org/maven2/org/apache/kafka/kafka-storage/4.4.0/kafka-storage-4.4.0-test-fixtures.jar -o "$jar"
           printf '%s  %s\n' "$TIERED_JAR_SHA256" "$jar" | sha256sum --check -
           echo "TIERED_REMOTE_DIR=$RUNNER_TEMP/tiered-remote" >> "$GITHUB_ENV"
       - name: Run check
