@@ -159,10 +159,16 @@ const IDENTITY_LOG =
  * @param {string} dir an existing directory
  * @param {object} [options]
  * @param {string} [options.identity] the broker identity log
+ * @param {object} [options.wire] the wire feature response
  * @returns {void}
  */
-const writeArtifact = (dir, { identity = IDENTITY_LOG } = {}) => {
-  const { apiVersionsText, featuresText: features, wireFeaturesLine, provenance } = projectorInput()
+const writeArtifact = (dir, { identity = IDENTITY_LOG, wire } = {}) => {
+  const {
+    apiVersionsText,
+    featuresText: features,
+    wireFeaturesLine,
+    provenance,
+  } = projectorInput({ wire })
   const files = {
     [RAW.apiVersions]: apiVersionsText,
     [RAW.features]: features,

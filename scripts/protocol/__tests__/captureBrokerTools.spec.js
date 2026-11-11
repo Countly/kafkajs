@@ -18,6 +18,28 @@ const {
 const WIRE_SCRIPT = path.join(__dirname, '..', 'wireFeatures.js')
 
 /**
+ * Rejects dependency specifiers outside Node's built-ins without executing the source.
+ * @param {string} source JavaScript to scan
+ * @returns {void}
+ * @throws {Error} for a client dependency or a non-literal specifier
+ */
+const assertBuiltinDependencies = (source) => {
+  const specifiers = [
+    ...source.matchAll(/\brequire\(\s*['"]([^'"]+)['"]\s*\)/g),
+    ...source.matchAll(/\bfrom\s+['"]([^'"]+)['"]/g),
+    ...source.matchAll(/\bimport\(\s*['"]([^'"]+)['"]\s*\)/g),
+  ].map((match) => match[1])
+  if (
+    specifiers.some((specifier) => !isBuiltin(specifier)) ||
+    (source.match(/\brequire\(/g) || []).length !==
+      (source.match(/\brequire\(\s*['"][^'"]+['"]\s*\)/g) || []).length ||
+    /\bimport\s*\(\s*[^'"\s)]/.test(source)
+  ) {
+    throw new Error('Expected only literal Node built-in dependencies')
+  }
+}
+
+/**
  * @param {object} wire a wire object
  * @param {string} field the field to take out
  * @returns {object} a copy of `wire` without `field`
@@ -141,20 +163,33 @@ describe('Independent broker tool captures', () => {
     }
   })
 
-  test('wire features script loads no client code', () => {
-    const source = fs.readFileSync(WIRE_SCRIPT, 'utf8')
-    const specifiers = [
-      ...source.matchAll(/\brequire\(\s*['"]([^'"]+)['"]\s*\)/g),
-      ...source.matchAll(/\bfrom\s+['"]([^'"]+)['"]/g),
-      ...source.matchAll(/\bimport\(\s*['"]([^'"]+)['"]\s*\)/g),
-    ].map((match) => match[1])
+  test('both capture tools load only literal Node built-in dependencies', () => {
+    for (const file of [WIRE_SCRIPT, path.join(__dirname, '..', 'captureBrokerTools.js')]) {
+      expect(() => assertBuiltinDependencies(fs.readFileSync(file, 'utf8'))).not.toThrow()
+    }
+    expect(() =>
+      assertBuiltinDependencies(`
+        const fs = require ('fs')
+        import path from 'node:path'
+        import 'node:crypto'
+        import('node:net')
+      `)
+    ).not.toThrow()
+  })
 
-    expect(specifiers.length).toBeGreaterThan(0)
-    expect(specifiers.filter((specifier) => !isBuiltin(specifier))).toEqual([])
-    expect(source.match(/\brequire\(/g)).toHaveLength(
-      source.match(/\brequire\(\s*['"][^'"]+['"]\s*\)/g).length
-    )
-    expect(source).not.toMatch(/\bimport\s*\(\s*[^'"\s)]/)
+  test('dependency scan rejects client code and non-literal specifiers', () => {
+    for (const source of [
+      "require('../../src/protocol/decoder')",
+      "import '../../src/protocol/decoder.js'",
+      "require ('../../src/protocol/decoder')",
+      'require (specifier)',
+      'import(specifier)',
+      "import Decoder from '../../src/protocol/decoder.js'",
+      "import('../../src/protocol/decoder.js')",
+      "require('node:' + specifier)",
+    ]) {
+      expect(() => assertBuiltinDependencies(source)).toThrow(/Node built-in dependencies/)
+    }
   })
 
   test('rejects a wire feature level that disagrees with the feature tool', () => {

@@ -3,7 +3,7 @@ const os = require('os')
 const path = require('path')
 const { importCapture, mergeClientTables, main } = require('../importCaptureArtifacts')
 const { projectBrokerTools } = require('../captureBrokerTools')
-const { RAW, projectorInput, writeArtifact } = require('./fixtures/brokerToolFixtures')
+const { RAW, projectorInput, writeArtifact, wireObject } = require('./fixtures/brokerToolFixtures')
 
 describe('Independent broker tool capture import', () => {
   /** @type {string[]} */
@@ -130,6 +130,23 @@ describe('Independent broker tool capture import', () => {
         ).toThrow(reason)
         expect(fs.readFileSync(refused.rangesFile, 'utf8')).toBe(before)
       }
+    })
+
+    test('a dry run rejects an unsuccessful capture before merging client tables', () => {
+      const protocol = path.join(__dirname, '..')
+      const snapshot = () => [
+        fs.readFileSync(path.join(protocol, 'brokerRanges.json'), 'utf8'),
+        fs.readFileSync(path.join(protocol, 'brokerFeatures.json'), 'utf8'),
+        fs.readdirSync(path.join(protocol, 'captures')).sort(),
+      ]
+      const before = snapshot()
+      const { tablesDir } = files(probed(), { 'share.version': 2 })
+      const artifactDir = artifact({ wire: { ...wireObject(), errorCode: 35 } })
+
+      expect(() =>
+        main(['--artifact', artifactDir, '--version', '4.4.0', '--tables', tablesDir, '--dry-run'])
+      ).toThrow(/Incomplete broker recording for 4\.4\.0: unsuccessful feature response/)
+      expect(snapshot()).toEqual(before)
     })
 
     test('a dry run checks the artifact and the client tables and writes nothing to the repository', () => {
