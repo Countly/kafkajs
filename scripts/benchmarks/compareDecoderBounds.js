@@ -38,7 +38,7 @@ const DEFAULT_RAW = path.join(WORK_DIR, 'raw')
 
 const SHA = /^[0-9a-f]{40}$/
 const MIN_SAMPLES = 5
-const PAIRS = 8
+const PAIRS = 7
 const MAX_SLOWDOWN_PERCENT = 5
 const INVOCATION_TIMEOUT_MS = 10 * 60 * 1000
 const USAGE =
