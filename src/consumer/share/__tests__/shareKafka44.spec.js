@@ -14,6 +14,7 @@ const {
   partitionLifecycle,
   prepareShareKafka44,
   ShareWireTap,
+  ShareKafka44Fixture,
 } = require('../../../../testHelpers/shareKafka44')
 
 /** @param {Record<string, number>} levels finalized levels by feature name. @returns {object} An admin whose `describeFeatures` reports them. */
@@ -318,6 +319,45 @@ describe('Share Kafka 4.4 wire observation', () => {
 })
 
 describe('Share Kafka 4.4 archived evidence', () => {
+  test('preserves raw requests and responses when a scenario fails before observation', async () => {
+    const fixture = new ShareKafka44Fixture('forget')
+    const rows = []
+    fixture.row = (event, fields) => rows.push({ event, ...fields })
+    fixture.tap.exchanges.push({
+      apiKey: 78,
+      apiVersion: 2,
+      label: 'A',
+      requestedAt: 10,
+      answeredAt: 11,
+      request: Buffer.from('0102', 'hex'),
+      response: Buffer.from('0304', 'hex'),
+    })
+    const failure = new Error('acknowledgement deadline')
+    await expect(
+      fixture.run(async () => {
+        throw failure
+      })
+    ).rejects.toBe(failure)
+    expect(rows).toEqual([
+      {
+        event: 'case-failed',
+        error: { message: failure.message },
+        cleanup: { groupsAbsent: false, topicsAbsent: false, adminDisconnected: false },
+        wire: [
+          {
+            apiKey: 78,
+            apiVersion: 2,
+            label: 'A',
+            requestedAt: 10,
+            answeredAt: 11,
+            requestHex: '0102',
+            responseHex: '0304',
+          },
+        ],
+      },
+    ])
+  })
+
   test('requires all scenarios and cleanup instead of accepting a stamped success line', () => {
     const { verifyFiles } = require('../../../../scripts/evidence/verify')
     const verified = { tree: 'a'.repeat(40), node: process.version, brokerVersion: '4.4.0' }
@@ -509,7 +549,7 @@ describe('Share Kafka 4.4 forget evidence', () => {
   test('requires settled acknowledgements and a later successful fetch without reintroducing lost partitions', async () => {
     const { assertScenario } = require('../../../../scripts/evidence/shareKafka44')
     const request = require('../../../protocol/requests/shareFetch/v2/request')
-    const frame = async (partitions, forgotten, time) => ({
+    const frame = async (partitions, forgotten, time, response = shareFetch.buildResponse()) => ({
       apiKey: 78,
       label: 'A',
       requestedAt: time,
@@ -518,24 +558,35 @@ describe('Share Kafka 4.4 forget evidence', () => {
         await request({
           groupId: 'group',
           memberId: A,
+          shareSessionEpoch: 1,
           topics: [{ topicId: A, partitions }],
           forgottenTopicsData: forgotten,
         }).encode()
       ).buffer.toString('hex'),
-      responseHex: shareFetch.buildResponse().toString('hex'),
+      responseHex: response.toString('hex'),
     })
     const keep = { partitionIndex: 1, acknowledgementBatches: [] }
+    const response = (partitions) => shareFetch.buildResponse(fetchAnswer(partitions))
+    const lost = {
+      partitionIndex: 0,
+      acknowledgementBatches: [{ firstOffset: '0', lastOffset: '1', acknowledgeTypes: [2] }],
+    }
     const wire = [
+      await frame([lost, keep], [], 1, response([part({ partition: 0 })])),
       await frame(
-        [
-          {
-            partitionIndex: 0,
-            acknowledgementBatches: [{ firstOffset: '0', lastOffset: '0', acknowledgeTypes: [2] }],
-          },
-          keep,
-        ],
+        [keep],
+        [],
+        3,
+        response([
+          part({ partition: 0, acquire: [acquired(0, 1)] }),
+          part({ partition: 1, acquire: [acquired(0, 1)] }),
+        ])
+      ),
+      await frame(
+        [lost, keep],
         [{ topicId: A, partitions: [0] }],
-        10
+        10,
+        response([part({ partition: 0 })])
       ),
       await frame([keep], [], 30),
     ]
@@ -543,19 +594,20 @@ describe('Share Kafka 4.4 forget evidence', () => {
       topicId: A,
       lost: [0],
       kept: [1],
+      heldAt: 4,
       settledAt: 20,
       crashes: [],
       acknowledgements: [{ partition: 0, type: 'release', error: null }],
     }
     expect(() => assertScenario('forget', proof, wire)).not.toThrow()
-    expect(() => assertScenario('forget', proof, wire.slice(0, 1))).toThrow(
+    expect(() => assertScenario('forget', proof, wire.slice(0, -1))).toThrow(
       'no later successful fetch'
     )
     expect(() => assertScenario('forget', { ...proof, acknowledgements: [] }, wire)).toThrow()
     expect(() => assertScenario('forget', { ...proof, settledAt: 40 }, wire)).toThrow(
       'no later successful fetch'
     )
-    expect(() => assertScenario('forget', proof, [...wire, wire[0]])).toThrow()
+    expect(() => assertScenario('forget', proof, [...wire, wire[2]])).toThrow()
     const reintroduced = await frame(
       [{ partitionIndex: 0, acknowledgementBatches: [] }, keep],
       [],
@@ -566,9 +618,34 @@ describe('Share Kafka 4.4 forget evidence', () => {
     )
     expect(() =>
       assertScenario('forget', proof, [
-        wire[0],
-        { ...wire[1], responseHex: shareFetch.buildResponse({ errorCode: 30 }).toString('hex') },
+        ...wire.slice(0, -1),
+        {
+          ...wire.at(-1),
+          responseHex: shareFetch.buildResponse({ errorCode: 30 }).toString('hex'),
+        },
       ])
     ).toThrow('no later successful fetch')
+    const damaged = (index, responseHex) =>
+      wire.map((entry, i) => (i === index ? { ...entry, responseHex } : entry))
+    expect(() =>
+      assertScenario(
+        'forget',
+        proof,
+        damaged(1, response([part({ partition: 1, acquire: [acquired(0, 1)] })]).toString('hex'))
+      )
+    ).toThrow('held fetch did not acquire partition 0')
+    for (const fields of [
+      { errorCode: 122 },
+      { errorCode: 123 },
+      fetchAnswer([part({ partition: 0, ack: 6 })]),
+    ]) {
+      expect(() =>
+        assertScenario(
+          'forget',
+          proof,
+          damaged(2, shareFetch.buildResponse(fields).toString('hex'))
+        )
+      ).toThrow()
+    }
   })
 })
