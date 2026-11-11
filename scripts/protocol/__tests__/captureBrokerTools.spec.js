@@ -210,18 +210,28 @@ describe('Independent broker tool captures', () => {
     expect(features.finalizedFeaturesEpoch).toBe('184')
   })
 
-  test('rejects epoch comparisons without timestamps proving the tool was captured first', () => {
+  test('rejects epoch comparisons whose timestamps put the tool after the wire probe', () => {
     for (const toolEpoch of ['183', '184']) {
-      for (const capturedOn of ['2026-11-12T10:00:04Z', '2026-11-12T10:00:05Z']) {
-        const input = projectorInput({
-          features: featuresText(toolEpoch),
-          wire: { ...wireObject(), finalizedFeaturesEpoch: '184' },
-        })
-        input.provenance.captures.find(({ file }) => file === RAW.features).capturedOn = capturedOn
+      const input = projectorInput({
+        features: featuresText(toolEpoch),
+        wire: { ...wireObject(), finalizedFeaturesEpoch: '184' },
+      })
+      input.provenance.captures.find(({ file }) => file === RAW.features).capturedOn =
+        '2026-11-12T10:00:05Z'
 
-        expect(() => projectBrokerTools(input)).toThrow(/capture order.*tool.*before.*wire/)
-      }
+      expect(() => projectBrokerTools(input)).toThrow(/capture order.*tool.*wire/)
     }
+  })
+
+  test('accepts tool and wire captures stamped in the same second', () => {
+    const input = projectorInput({
+      features: featuresText('183'),
+      wire: { ...wireObject(), finalizedFeaturesEpoch: '184' },
+    })
+    input.provenance.captures.find(({ file }) => file === RAW.features).capturedOn =
+      '2026-11-12T10:00:04Z'
+
+    expect(projectBrokerTools(input).features.finalizedFeaturesEpoch).toBe('184')
   })
 
   test('rejects missing provenance and a raw digest mismatch', () => {
