@@ -21,7 +21,7 @@
  * bytes.
  *
  * Usage: node scripts/benchmarks/arrayDecode.js --arm <name> [--iterations 300]
- * Prints one JSON line: { available, arm, iterations, nsPerOp, opsPerSecond, elements }, where
+ * Prints one JSON line: { available, arm, iterations, nsPerOp, roundNsPerOp, opsPerSecond, elements }, where
  * `elements` is how many elements of the widest array one decode returns.
  */
 const Encoder = require('../../src/protocol/encoder')
@@ -264,7 +264,7 @@ const prepare = async (name) => {
  * @param {Buffer} raw
  * @param {ArrayArm} arm
  * @param {number} iterations timed iterations to run
- * @returns {Promise<{ nsPerOp: number, opsPerSecond: number }>}
+ * @returns {Promise<{ nsPerOp: number, roundNsPerOp: number[], opsPerSecond: number }>}
  */
 const run = async (raw, { decode }, iterations) => {
   for (let i = 0; i < WARMUP; i++) {
@@ -282,20 +282,21 @@ const run = async (raw, { decode }, iterations) => {
   }
 
   const nsPerOp = median(roundNsPerOp)
-  return { nsPerOp, opsPerSecond: 1e9 / nsPerOp }
+  return { nsPerOp, roundNsPerOp, opsPerSecond: 1e9 / nsPerOp }
 }
 
 if (require.main === module) {
   ;(async () => {
     const { arm: name, iterations } = parseArgs(process.argv.slice(2))
     const { raw, arm } = await prepare(name)
-    const { nsPerOp, opsPerSecond } = await run(raw, arm, iterations)
+    const { nsPerOp, roundNsPerOp, opsPerSecond } = await run(raw, arm, iterations)
     console.log(
       JSON.stringify({
         available: 1,
         arm: name,
         iterations,
         nsPerOp,
+        roundNsPerOp,
         opsPerSecond,
         elements: arm.elements,
       })

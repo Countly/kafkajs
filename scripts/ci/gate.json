@@ -23311,7 +23311,17 @@
         "src/consumer/share/__tests__/shareDlqConfig.spec.js \u203a Share DLQ configuration sets group destination and copy flag through existing config APIs",
         "src/consumer/share/__tests__/shareDlqConfig.spec.js \u203a Share DLQ configuration enables a manually created DLQ topic",
         "src/consumer/share/__tests__/shareDlqConfig.spec.js \u203a Share DLQ configuration refuses a destination equal to the source and surfaces a broker refusal",
-        "src/consumer/share/__tests__/shareDlqConfig.spec.js \u203a Share DLQ configuration does not add a client DLQ option"
+        "src/consumer/share/__tests__/shareDlqConfig.spec.js \u203a Share DLQ configuration does not add a client DLQ option",
+        "src/protocol/recordBatch/v0/recordBounds.spec.js \u203a Protocol > RecordBatch > v0 > bounds inside a record batch record headers preserves duplicate order, null and empty values, and special own header keys",
+        "src/protocol/recordBatch/v0/recordBounds.spec.js \u203a Protocol > RecordBatch > v0 > bounds inside a record batch record headers a header whose value overruns the record is corrupt even when its count fits",
+        "src/protocol/decoderCountBounds.spec.js \u203a Decoder count bounds readArrayAsync awaits each element in wire order across suspension",
+        "src/protocol/decoderCountBounds.spec.js \u203a Decoder count bounds readArrayAsync propagates an element failure without reading later elements",
+        "src/protocol/decoderCountBounds.spec.js \u203a Decoder count bounds readUVarIntArrayAsync awaits each element in wire order across suspension",
+        "src/protocol/decoderCountBounds.spec.js \u203a Decoder count bounds readUVarIntArrayAsync propagates an element failure without reading later elements",
+        "src/protocol/decoderCountBounds.spec.js \u203a Decoder count bounds readArrayAsync rejects negative counts other than -1 before reading an element",
+        "scripts/benchmarks/__tests__/compareDecoderBounds.spec.js \u203a Decoder performance comparison reports baseline A/A medians beside each row and warns on drift above five percent",
+        "scripts/benchmarks/__tests__/compareDecoderBounds.spec.js \u203a Decoder performance comparison A/A diagnostics never change acceptance medians, problems, exceptions or verdicts",
+        "scripts/benchmarks/__tests__/compareDecoderBounds.spec.js \u203a Decoder performance comparison collector reports a failed A/A invocation without changing the acceptance verdict"
       ],
       "capMinutes": 93,
       "allowedSkips": [

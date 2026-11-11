@@ -10,7 +10,8 @@
  * codec reports `{ "available": 0 }`.
  *
  * Usage: node scripts/benchmarks/recordBatchDecode.js [--iterations 20000] [--arm <name>]
- * Prints one JSON line: { available, iterations, nsPerOp, opsPerSecond, records, decompressCalls }.
+ * Prints one JSON line: { available, iterations, nsPerOp, roundNsPerOp, opsPerSecond, records,
+ * decompressCalls }.
  * `decompressCalls` is how many times the codec's `decompress` ran in 10 untimed decodes, counted by
  * wrapping it: 10 for a compressed arm, 0 for the uncompressed one.
  */
@@ -114,7 +115,7 @@ const countRecords = (data) =>
  * @param {Buffer} fixture
  * @param {object} options the decode options
  * @param {number} iterations timed iterations to run
- * @returns {Promise<{ nsPerOp: number, opsPerSecond: number }>} per-op cost and throughput
+ * @returns {Promise<{ nsPerOp: number, roundNsPerOp: number[], opsPerSecond: number }>} per-op cost and throughput
  */
 const run = async (fixture, options, iterations) => {
   for (let i = 0; i < WARMUP; i++) {
@@ -133,7 +134,7 @@ const run = async (fixture, options, iterations) => {
   }
 
   const nsPerOp = median(roundNsPerOp)
-  return { nsPerOp, opsPerSecond: 1e9 / nsPerOp }
+  return { nsPerOp, roundNsPerOp, opsPerSecond: 1e9 / nsPerOp }
 }
 
 /**
@@ -178,13 +179,14 @@ const countDecompressCalls = async (fixture, options, codec) => {
   const options = { checkCrcs: false, maxDecompressedBatchBytes: BOUND }
   const records = countRecords(await decode(fixture, options))
   const decompressCalls = await countDecompressCalls(fixture, options, codec)
-  const { nsPerOp, opsPerSecond } = await run(fixture, options, ITERATIONS)
+  const { nsPerOp, roundNsPerOp, opsPerSecond } = await run(fixture, options, ITERATIONS)
 
   console.log(
     JSON.stringify({
       available: 1,
       iterations: ITERATIONS,
       nsPerOp,
+      roundNsPerOp,
       opsPerSecond,
       records,
       decompressCalls,
