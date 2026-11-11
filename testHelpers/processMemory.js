@@ -556,7 +556,8 @@ class NativeJournal {
 
   /** @returns {object} reserved native-row capacity and cursor, with no product references */
   journalState() {
-    return this.rows.journalState()
+    const state = this.rows.journalState()
+    return { ...state, overflow: state.overflow || this.overflow }
   }
 
   /**

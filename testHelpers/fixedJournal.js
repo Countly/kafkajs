@@ -55,6 +55,7 @@ class FixedJournal {
     this.storage = Buffer.alloc(bytes, 0xa5)
     this.cursor = 0
     this.length = 0
+    this.overflow = false
   }
 
   /** @returns {number} the physical byte capacity, never the used prefix */
@@ -69,10 +70,12 @@ class FixedJournal {
    */
   push(...entries) {
     const bytes = entries.reduce((sum, entry) => sum + 4 + encodedSize(entry), 0)
-    if (this.length + entries.length > this.capacity || this.cursor + bytes > this.byteLength)
+    if (this.length + entries.length > this.capacity || this.cursor + bytes > this.byteLength) {
+      this.overflow = true
       throw new Error(
         `${this.name} journal overflow (rows ${this.length}/${this.capacity}, bytes ${this.cursor}+${bytes}/${this.byteLength})`
       )
+    }
     for (const entry of entries) {
       const size = encodedSize(entry)
       this.storage.writeUInt32LE(size, this.cursor)
@@ -163,13 +166,14 @@ class FixedJournal {
     })
   }
 
-  /** @returns {{byteLength:number,cursor:number,length:number,capacity:number}} scalar evidence */
+  /** @returns {{byteLength:number,cursor:number,length:number,capacity:number,overflow:boolean}} scalar evidence */
   journalState() {
     return {
       byteLength: this.byteLength,
       cursor: this.cursor,
       length: this.length,
       capacity: this.capacity,
+      overflow: this.overflow,
     }
   }
 }
@@ -183,6 +187,7 @@ class HandlerJournal {
     this.seen = Buffer.alloc(records, 0xa5)
     this.length = 0
     this.unique = 0
+    this.overflow = false
   }
 
   /**
@@ -191,7 +196,10 @@ class HandlerJournal {
    * @returns {number} the row to finish @throws {Error} on overflow or an invalid int64 offset
    */
   enter(partition, offset, index, at) {
-    if (this.length === this.capacity) throw new Error('handler journal overflow')
+    if (this.length === this.capacity) {
+      this.overflow = true
+      throw new Error('handler journal overflow')
+    }
     const exact = BigInt(offset)
     if (exact < -(1n << 63n) || exact >= 1n << 63n)
       throw new Error('handler offset is outside int64')
@@ -236,6 +244,7 @@ class HandlerJournal {
       cursor: this.length * 32 + this.seen.byteLength,
       length: this.length,
       capacity: this.capacity,
+      overflow: this.overflow,
     }
   }
 }
@@ -283,6 +292,7 @@ class JournalConstancy {
       if (JSON.stringify(Object.keys(rows)) !== JSON.stringify(Object.keys(original)))
         violations.add('journal storage constancy')
       for (const [name, state] of Object.entries(rows)) {
+        if (state?.overflow) violations.add('journal overflow')
         const bytes = original[name]?.byteLength
         if (!Number.isSafeInteger(bytes) || bytes < 1 || state?.byteLength !== bytes)
           violations.add('journal storage constancy')
