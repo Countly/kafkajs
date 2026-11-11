@@ -216,7 +216,11 @@ describe('telemetry journal ownership diagnostic', () => {
     const fs = require('node:fs')
     const path = require('node:path')
     const childProcess = require('node:child_process')
-    const directory = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'journal-ownership-'))
+    const root = process.env.CI
+      ? path.resolve('.tmp/e2e/journal-ownership')
+      : require('node:os').tmpdir()
+    fs.mkdirSync(root, { recursive: true })
+    const directory = fs.mkdtempSync(path.join(root, 'journal-ownership-'))
     try {
       const run = (mode, kind, seeded = false) =>
         JSON.parse(
@@ -264,7 +268,7 @@ describe('telemetry journal ownership diagnostic', () => {
       expect(seeded.ownership.at(-1).recordTargetsAlive).toBe(10000)
       expect(seeded.ownership.at(-1).positiveAlive).toBe(true)
     } finally {
-      fs.rmSync(directory, { recursive: true, force: true })
+      if (!process.env.CI) fs.rmSync(directory, { recursive: true, force: true })
     }
   }, 240000)
 })
