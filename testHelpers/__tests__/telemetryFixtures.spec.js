@@ -4323,6 +4323,8 @@ describe('offline decoder preparation', () => {
         '-Xshare:on',
         '-XX:TieredStopAtLevel=1',
         '-XX:SharedArchiveFile=' + archive,
+        '-Xlog:disable',
+        '-Xlog:all=warning:stderr',
       ])
     )
     expect(args.slice(-2)).toEqual(['org.countly.kafkajs.telemetry.FullTelemetryDecoder', raw])
