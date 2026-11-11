@@ -130,6 +130,7 @@ types/index.d.ts:  /** SASL extensions sent with the token (RFC 7628 \u00a73.1).
 CHANGELOG.md:### \x50hase \x39E — Share groups
 CHANGELOG.md:### \x50hase \x39F — Client telemetry
 CHANGELOG.md:### \x50hase \x39G — Kafka 4.4 support
+CHANGELOG.md:### \x50hase 10 — Release, CI and benchmarks
 scripts/benchmarks/__tests__/telemetry.spec.js:      milestone: '\x39E',
 scripts/benchmarks/telemetry.js:    assert.equal(accepted.milestone, '\x39E')
 scripts/benchmarks/telemetry.js: * Candidate arms share one snapshot. Previous requires a separately hashed accepted-\x39E receipt with

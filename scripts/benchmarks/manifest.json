@@ -1,0 +1,323 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "name": "compare-produce-latency",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "produce-latency"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "p50", "unit": "ms" },
+        { "key": "p90", "unit": "ms" },
+        { "key": "p99", "unit": "ms" },
+        { "key": "messagesPerSecond", "unit": "msg/s" }
+      ],
+      "arms": ["fork", "kafkajs@2.2.4"]
+    },
+    {
+      "name": "compare-produce-throughput",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "produce-throughput"
+      ],
+      "broker": true,
+      "metrics": [{ "key": "messagesPerSecond", "unit": "msg/s" }],
+      "arms": ["fork", "kafkajs@2.2.4"]
+    },
+    {
+      "name": "compare-consume-throughput",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "consume-throughput"
+      ],
+      "broker": true,
+      "metrics": [{ "key": "messagesPerSecond", "unit": "msg/s" }],
+      "arms": ["fork", "kafkajs@2.2.4"]
+    },
+    {
+      "name": "murmur2",
+      "command": ["scripts/benchmarks/murmur2.js", "--baseline-tree", "{baselinePackageDir}"],
+      "broker": false,
+      "metrics": [
+        { "key": "sizes.16.nsPerOp", "unit": "ns" },
+        { "key": "sizes.16.baselineNsPerOp", "unit": "ns" },
+        { "key": "sizes.16.ratio", "unit": "fork / 2.2.4" },
+        { "key": "sizes.256.nsPerOp", "unit": "ns" },
+        { "key": "sizes.256.baselineNsPerOp", "unit": "ns" },
+        { "key": "sizes.256.ratio", "unit": "fork / 2.2.4" }
+      ],
+      "arms": ["fork"]
+    },
+    {
+      "name": "frameDecode-64b",
+      "command": ["--expose-gc", "scripts/benchmarks/frameDecode.js", "--shape", "64b"],
+      "broker": false,
+      "metrics": [
+        { "key": "nsPerFrame", "unit": "ns" },
+        { "key": "heapRetainedBytes", "unit": "bytes" }
+      ],
+      "arms": ["fork"]
+    },
+    {
+      "name": "frameDecode-64k",
+      "command": ["--expose-gc", "scripts/benchmarks/frameDecode.js", "--shape", "64k"],
+      "broker": false,
+      "metrics": [
+        { "key": "nsPerFrame", "unit": "ns" },
+        { "key": "heapRetainedBytes", "unit": "bytes" }
+      ],
+      "arms": ["fork"]
+    },
+    {
+      "name": "frameDecode-1m",
+      "command": ["--expose-gc", "scripts/benchmarks/frameDecode.js", "--shape", "1m"],
+      "broker": false,
+      "metrics": [
+        { "key": "nsPerFrame", "unit": "ns" },
+        { "key": "heapRetainedBytes", "unit": "bytes" }
+      ],
+      "arms": ["fork"]
+    },
+    {
+      "name": "frameDecode-coalesced",
+      "command": ["--expose-gc", "scripts/benchmarks/frameDecode.js", "--shape", "coalesced"],
+      "broker": false,
+      "metrics": [
+        { "key": "nsPerFrame", "unit": "ns" },
+        { "key": "heapRetainedBytes", "unit": "bytes" }
+      ],
+      "arms": ["fork"]
+    },
+    {
+      "name": "frameDecode-byte-chunks",
+      "command": ["--expose-gc", "scripts/benchmarks/frameDecode.js", "--shape", "byte-chunks"],
+      "broker": false,
+      "metrics": [
+        { "key": "nsPerFrame", "unit": "ns" },
+        { "key": "heapRetainedBytes", "unit": "bytes" }
+      ],
+      "arms": ["fork"]
+    },
+    {
+      "name": "produceResponseDecode",
+      "command": ["scripts/benchmarks/produceResponseDecode.js"],
+      "broker": false,
+      "metrics": [
+        { "key": "v7.nsPerOp", "unit": "ns" },
+        { "key": "v11.nsPerOp", "unit": "ns" },
+        { "key": "ratio", "unit": "v11 / v7" }
+      ],
+      "arms": ["fork"]
+    },
+    {
+      "name": "recordBatchDecode-uncompressed",
+      "command": ["scripts/benchmarks/recordBatchDecode.js", "--arm", "uncompressed"],
+      "broker": false,
+      "metrics": [
+        { "key": "nsPerOp", "unit": "ns" },
+        { "key": "opsPerSecond", "unit": "ops/s" }
+      ],
+      "arms": ["fork"]
+    },
+    {
+      "name": "recordBatchDecode-gzip",
+      "command": ["scripts/benchmarks/recordBatchDecode.js", "--arm", "gzip"],
+      "broker": false,
+      "metrics": [
+        { "key": "nsPerOp", "unit": "ns" },
+        { "key": "opsPerSecond", "unit": "ops/s" }
+      ],
+      "arms": ["fork"]
+    },
+    {
+      "name": "recordBatchDecode-snappy",
+      "command": ["scripts/benchmarks/recordBatchDecode.js", "--arm", "snappy"],
+      "broker": false,
+      "metrics": [
+        { "key": "nsPerOp", "unit": "ns" },
+        { "key": "opsPerSecond", "unit": "ops/s" }
+      ],
+      "arms": ["fork"]
+    },
+    {
+      "name": "requestQueueStamp",
+      "command": ["--expose-gc", "scripts/benchmarks/requestQueueStamp.js"],
+      "broker": false,
+      "metrics": [
+        { "key": "nsPerPair", "unit": "ns" },
+        { "key": "heapGrowth", "unit": "bytes" }
+      ],
+      "arms": ["fork"]
+    },
+    {
+      "name": "connectSetup",
+      "command": ["scripts/benchmarks/connectSetup.js"],
+      "broker": false,
+      "metrics": [{ "key": "usPerSetup", "unit": "us" }],
+      "arms": ["fork"]
+    },
+    {
+      "name": "accumulatorScan",
+      "command": ["scripts/benchmarks/accumulatorScan.js"],
+      "broker": false,
+      "metrics": [
+        { "key": "wallMs", "unit": "ms" },
+        { "key": "cpuMs", "unit": "ms" }
+      ],
+      "arms": ["fork"]
+    },
+    {
+      "name": "fetchRound-1000",
+      "command": ["--expose-gc", "scripts/benchmarks/fetchRound.js", "--partitions", "1000"],
+      "broker": false,
+      "metrics": [
+        { "key": "nsPerNodeRound", "unit": "ns" },
+        { "key": "allocatedBytesPerRound", "unit": "bytes" },
+        { "key": "retainedHeapDelta", "unit": "bytes" }
+      ],
+      "arms": ["fork"]
+    },
+    {
+      "name": "subscriptionResolve",
+      "command": ["scripts/benchmarks/subscriptionResolve.js"],
+      "broker": false,
+      "metrics": [{ "key": "evaluationMs", "unit": "ms" }],
+      "arms": ["fork"]
+    },
+    {
+      "name": "produceLatency",
+      "command": ["scripts/benchmarks/produceLatency.js"],
+      "broker": true,
+      "metrics": [
+        { "key": "p50", "unit": "ms" },
+        { "key": "p90", "unit": "ms" },
+        { "key": "p99", "unit": "ms" },
+        { "key": "messagesPerSecond", "unit": "msg/s" }
+      ],
+      "arms": ["fork"]
+    },
+    {
+      "name": "stickyBalance",
+      "command": ["--expose-gc", "scripts/benchmarks/stickyBalance.js"],
+      "broker": true,
+      "metrics": [
+        { "key": "recordsPerRequest", "unit": "records" },
+        { "key": "balance", "unit": "ratio" },
+        { "key": "p99Ms", "unit": "ms" },
+        { "key": "heapRetainedBytes", "unit": "bytes" }
+      ],
+      "arms": ["fork"]
+    },
+    {
+      "name": "produceIdempotent",
+      "command": ["scripts/benchmarks/produceIdempotent.js", "--idempotent", "1"],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "recordsPerRequest", "unit": "records" }
+      ],
+      "arms": ["fork"]
+    },
+    {
+      "name": "consumeThroughput-eachBatch",
+      "command": ["scripts/benchmarks/consumeThroughput.js", "--handler", "eachBatch"],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "p99", "unit": "ms" }
+      ],
+      "arms": ["fork"]
+    },
+    {
+      "name": "consumeThroughput-eachMessage",
+      "command": ["scripts/benchmarks/consumeThroughput.js", "--handler", "eachMessage"],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "p99", "unit": "ms" }
+      ],
+      "arms": ["fork"]
+    },
+    {
+      "name": "rebalanceLatency-eager",
+      "command": [
+        "scripts/benchmarks/rebalanceLatency.js",
+        "--protocol",
+        "eager",
+        "--group-protocol",
+        "classic"
+      ],
+      "broker": true,
+      "metrics": [{ "key": "medianMs", "unit": "ms" }],
+      "arms": ["fork"]
+    },
+    {
+      "name": "rebalanceLatency-cooperative",
+      "command": [
+        "scripts/benchmarks/rebalanceLatency.js",
+        "--protocol",
+        "cooperative",
+        "--group-protocol",
+        "classic"
+      ],
+      "broker": true,
+      "metrics": [{ "key": "medianMs", "unit": "ms" }],
+      "arms": ["fork"]
+    }
+  ],
+  "excluded": [
+    {
+      "file": "admissionAccounting.js",
+      "reason": "A calibration gate, not a measurement: it prints a line per record shape and a verdict, and exits 1 outside its accounting window."
+    },
+    {
+      "file": "fetchSessions.js",
+      "reason": "Needs a controller-owned node inventory (BENCH_NODES), an evidence directory and, for one arm, controller IPC; it also uses the racks cluster."
+    },
+    {
+      "file": "produceFrameSize.js",
+      "reason": "A frame-size check against maxRequestSize that reports exact counts, not timings, and re-spawns itself with NODE_PATH set."
+    },
+    {
+      "file": "rebalanceStorm.js",
+      "reason": "A retained-heap leak gate of 200 live cooperative rounds that exits 1 on its slope limit; the memory gates own it and three runs would take too long."
+    },
+    {
+      "file": "shareRecordWalk.js",
+      "reason": "Ends in an A/A void rule that throws when two sessions differ by more than 3 %, which a shared runner cannot promise."
+    },
+    {
+      "file": "shareThroughput.js",
+      "reason": "Needs KAFKAJS_CLUSTER_MANIFEST, P9_SHARE_CORPUS and P9_SHARE_TRACE and a live guard that CI does not provide."
+    },
+    {
+      "file": "snappyCodec.js",
+      "reason": "Refuses to run without the seven Java read-back artifacts and exits 1 on its event-loop and memory limits."
+    },
+    {
+      "file": "stickyAssign.js",
+      "reason": "A differential check against a baseline source tree: it prints a line per shape, lets a shape run to a 10-minute limit and has no single metric."
+    },
+    {
+      "file": "telemetry.js",
+      "reason": "A session controller driven by a manifest of its own, with correctness gates and its own exit codes."
+    }
+  ]
+}

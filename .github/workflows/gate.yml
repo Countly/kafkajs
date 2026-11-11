@@ -33,6 +33,7 @@ jobs:
   plan:
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ${{ vars.GATE_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 10
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
     steps:
@@ -318,6 +319,7 @@ jobs:
     needs: [plan, check, telemetry]
     if: always() && needs.plan.result != 'skipped'
     runs-on: ${{ vars.GATE_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 10
     steps:
       - uses: actions/setup-node@v4
         with:
