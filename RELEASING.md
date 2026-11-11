@@ -58,10 +58,11 @@ Create it in GitHub (Settings → Environments → New environment) **before any
 | Deployment branches and tags | Selected, tag pattern `v*` |
 | Allow administrators to bypass configured protection rules | **Off** |
 
-Read the settings back and check them before the first tag, before the trusted-publisher step, and before every release tag. Read the response for the reviewer, the administrator-bypass flag and the deployment policy:
+Read the settings back and check them before the first tag, before the trusted-publisher step, and before every release tag. The first command shows the reviewer, the administrator-bypass flag and that custom branch and tag policies are on; the second lists those policies, which must be exactly one tag policy, `v*`:
 
 ```sh
 gh api repos/Countly/kafkajs/environments/npm-release
+gh api --paginate repos/Countly/kafkajs/environments/npm-release/deployment-branch-policies
 ```
 
 A mismatch stops the step.
@@ -94,7 +95,9 @@ Tag names:
 - CI tags start at `v3.0.0-rc.1`.
 - Until 3.0.0, `latest` also points at a release candidate. Install release candidates by exact version.
 
-## After every publish
+## After every CI publish (rc.1 onwards)
+
+These checks apply to versions published by `release.yml`. The hand-published rc.0 has no workflow run, job summary or provenance; for it, only the dist-tag read-back in the first-publish sequence applies.
 
 Take the `sha512-…` value from the `publish` job summary (the "Release tarball" section). Set `VERSION` and `EXPECTED` and run both checks.
 
@@ -125,11 +128,11 @@ Optional after U5: in npm, turn on "require two-factor authentication and disall
 
 ## Release gate
 
-Do these in order. Each box has its own evidence.
+Do these in order, except that boxes 2 and 3 are independent of each other: both must hold before a release candidate, but the memory gates never block merging the release and CI changes. Each box has its own evidence.
 
-- [ ] **1. 9E, 9F and 9G are merged and tagged** (`3.0.0-alpha.9e`, `9f`, `9g` exist on `origin`).
+- [ ] **1. The alpha work is merged and tagged** (tags `3.0.0-alpha.9e`, `3.0.0-alpha.9f` and `3.0.0-alpha.9g` exist on `origin`).
 - [ ] **2. `memory-gates.yml` is green** after the `p9m/memory-gates` PR is merged. Keep the run URL.
-- [ ] **3. The Phase 10 PR is merged** (every functional lane green). Straight after the merge, dispatch the benchmark workflow on `master`: `gh workflow run bench.yml --ref master`.
+- [ ] **3. The release and CI changes PR is merged** (every functional lane green). Straight after the merge, dispatch the benchmark workflow on `master`: `gh workflow run bench.yml --ref master`.
 - [ ] **4. `QUARANTINE.md` lists no quarantined test**, or the release owner has accepted each listed test in writing.
 - [ ] **5. Release candidate commit.** Version `3.0.0-rc.N` in `package.json` and the lockfile, a `## 3.0.0-rc.N` CHANGELOG heading, and the README status text updated. On that exact SHA, the `ci.yml` and `gate.yml` push runs are green on Kafka 4.4.0, and `weekly.yml` dispatched on `master` is green. Publish the candidate (rc.0 by hand, later ones by CI).
 - [ ] **6. Read the benchmark report** (`bench-report.md` from a `bench.yml` run on the rc commit). No threshold gates the release: the owner reads it and decides.
