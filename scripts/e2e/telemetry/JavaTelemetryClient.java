@@ -21,6 +21,7 @@ import org.apache.kafka.common.message.GetTelemetrySubscriptionsResponseData;
 import org.apache.kafka.common.requests.GetTelemetrySubscriptionsResponse;
 import org.apache.kafka.common.requests.PushTelemetryRequest;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.Future;
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.consumer.CloseOptions;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
@@ -28,6 +29,7 @@ import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.clients.producer.RecordMetadata;
 import org.apache.kafka.common.MetricName;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.errors.TimeoutException;
@@ -126,10 +128,12 @@ public final class JavaTelemetryClient {
         public abstract void close() throws Exception;
     }
 
-    /** Producer with the prepared send-immediately-before-close control. */
+    /** Producer whose final record remains queued until public close drains it. */
     private static final class ProducerRole extends Role {
+        private static final int CLOSE_LINGER_MS = 60000;
         private final KafkaProducer<String, String> client;
         private final String topic;
+        private Future<RecordMetadata> closeWork;
         /**
          * Opens the producer and registers the known metric controls.
          * @param options validated CLI values
@@ -142,10 +146,14 @@ public final class JavaTelemetryClient {
             props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
             props.put(ProducerConfig.ACKS_CONFIG, "all");
             props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true");
+            // Longer than the 45 s supervisor: only flush or close can release these tiny batches.
+            props.put(ProducerConfig.LINGER_MS_CONFIG, CLOSE_LINGER_MS);
             client = new KafkaProducer<>(props);
             try {
                 for (KafkaMetric metric : controls()) client.registerMetricForSubscription(metric);
-                client.send(new ProducerRecord<>(topic, "k", "v")).get(3, TimeUnit.SECONDS);
+                var seed = client.send(new ProducerRecord<>(topic, "k", "v"));
+                client.flush();
+                seed.get(3, TimeUnit.SECONDS);
             } catch (Exception failure) {
                 try { close(); } catch (Exception cleanup) { failure.addSuppressed(cleanup); }
                 throw failure;
@@ -155,10 +163,18 @@ public final class JavaTelemetryClient {
         @Override void work() throws InterruptedException { Thread.sleep(50); }
         /** @return assigned UUID @throws TimeoutException if not assigned */
         @Override Uuid id() { return client.clientInstanceId(Duration.ZERO); }
-        /** @return nothing @throws RuntimeException on send refusal */
-        @Override void armClose() { client.send(new ProducerRecord<>(topic, "k", "last")); }
-        /** @return nothing @throws RuntimeException on close failure */
-        @Override public void close() { client.close(Duration.ofSeconds(3)); }
+        /** @return nothing @throws RuntimeException on refusal or prematurely completed work */
+        @Override void armClose() {
+            closeWork = client.send(new ProducerRecord<>(topic, "k", "last"));
+            if (closeWork.isDone()) throw new IllegalStateException("Producer close work already completed");
+            System.out.println("{\"producerCloseWork\":true,\"pending\":true,\"lingerMs\":" + CLOSE_LINGER_MS + "}");
+            System.out.flush();
+        }
+        /** @return nothing @throws Exception on close failure or undelivered final work */
+        @Override public void close() throws Exception {
+            client.close(Duration.ofSeconds(3));
+            if (closeWork != null) closeWork.get(0, TimeUnit.MILLISECONDS);
+        }
     }
 
     /** Classic consumer with an established fetch session and an asynchronous commit at close. */
