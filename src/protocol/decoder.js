@@ -371,7 +371,7 @@ module.exports = class Decoder {
   /**
    * COMPACT_ARRAY: an unsigned varint holding the count + 1. According to the protocol type
    * documentation: https://kafka.apache.org/protocol#protocol_types, a compact array with length
-   * zero is a null array. An array with length 1 is an empty array.
+   * zero is a null array. An array with length 1 is an empty array and needs no count or byte check.
    * @param {(decoder: Decoder) => *} reader reads one element
    * @returns {Array|null} null for the null array
    * @throws {KafkaJSPartialMessageError} when the count is above the limit or the bytes are short
@@ -381,6 +381,10 @@ module.exports = class Decoder {
 
     if (length === 0) {
       return null
+    }
+
+    if (length === 1) {
+      return []
     }
 
     const count = length - 1
