@@ -509,6 +509,7 @@ module.exports = {
   TelemetrySegments,
   checkSegmentFiles,
   packSegment,
+  scheduleOf,
   segmentCatalogue,
   segmentIdentities,
 }

@@ -599,6 +599,23 @@ describe('telemetry profile', () => {
       tap.records.length = 1024
       expect(() => tap.factory({ host: 'a', port: 1 })).toThrow('socket history bound exceeded')
       expect(owners).toHaveLength(2)
+      jest.isolateModules(() => {
+        const segments = jest.requireActual('../../../testHelpers/telemetrySegments')
+        const schedule = jest.spyOn(segments, 'scheduleOf')
+        try {
+          const { TelemetryTap } = require('../telemetryChurn')
+          const capped = new TelemetryTap({ socketFactory: jest.fn() })
+          capped.records.length = 1024
+          expect(() => capped.factory({ host: 'a', port: 1 })).toThrow(
+            'socket history bound exceeded'
+          )
+          expect(schedule).toHaveBeenCalledWith('telemetry-churn')
+          expect(schedule.mock.results[0].value.cap).toBe(16)
+          expect(capped.segments.socketFactory).not.toHaveBeenCalled()
+        } finally {
+          schedule.mockRestore()
+        }
+      })
     })
 
     test('refuses to fault when more than one telemetry socket is open', () => {
