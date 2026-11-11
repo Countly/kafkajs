@@ -131,6 +131,7 @@ const answerRows = (request, decoded) => {
           }
     )
   }
+  if (request.apiKey === 3 && name === 'describeCluster') return resultRows(name, decoded)
   if (request.apiKey === 60 && name === 'describeCluster')
     return resultRows(name, { brokers: decoded.brokers.map((b) => ({ ...b, nodeId: b.brokerId })) })
   if (request.apiKey === 16 && name === 'listGroups') return resultRows(name, decoded)
