@@ -560,6 +560,44 @@ describe('deadlines under a fake clock', () => {
     return outcome
   }
 
+  test('a new topic waits for metadata propagation without repeating creation', async () => {
+    const { probe } = scenario()
+    stubResources(probe)
+    const outcome = await settle(
+      probe.finish(async () => {
+        const admin = await probe.start()
+        admin.fetchTopicMetadata.mockRejectedValueOnce(
+          require('../../protocol/error').createErrorFromCode(3)
+        )
+        const topic = await probe.topic({ name: 'barrier' })
+        expect(probe.topics).toEqual([{ name: topic, topicId: `id-${topic}` }])
+        expect(admin.createTopics).toHaveBeenCalledTimes(1)
+        expect(admin.fetchTopicMetadata).toHaveBeenCalledTimes(2)
+        expect(admin.fetchTopicMetadata).toHaveBeenNthCalledWith(1, { topics: [topic] })
+        expect(admin.fetchTopicMetadata).toHaveBeenNthCalledWith(2, { topics: [topic] })
+      })
+    )
+    expect(outcome.error).toBeUndefined()
+    expect(liveRun.tainted).toBe(false)
+  })
+
+  test('a new topic metadata authorization failure ends the read immediately', async () => {
+    const { probe } = scenario()
+    stubResources(probe)
+    const failure = require('../../protocol/error').createErrorFromCode(29)
+    const outcome = await settle(
+      probe.finish(async () => {
+        const admin = await probe.start()
+        admin.fetchTopicMetadata.mockRejectedValueOnce(failure)
+        await expect(probe.topic()).rejects.toBe(failure)
+        expect(admin.createTopics).toHaveBeenCalledTimes(1)
+        expect(admin.fetchTopicMetadata).toHaveBeenCalledTimes(1)
+        expect(probe.topics).toEqual([])
+      })
+    )
+    expect(outcome.error).toBeUndefined()
+  })
+
   test('a guarded command that outlives its allowance is cancelled, taints the run and blocks the next command', async () => {
     const { probe } = scenario()
     probe.due = performance.now() + probe.reserve + 30
