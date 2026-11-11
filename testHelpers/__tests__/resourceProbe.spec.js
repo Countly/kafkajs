@@ -1762,9 +1762,10 @@ describe('resource artifact validation', () => {
     })
 
     test('rejects a seeded control even when GC is unavailable', () => {
-      const result = judged('public', (r) => {
+      const result = judged('public', (r, whole) => {
         r.manifest.seed = { mode: 'close' }
         r.manifest.gc.available = false
+        whole.exit.receipts = 0
       })
       expect(result.verdict).toBe('fail')
       expect(result.problems).toContain('real exposed GC is unavailable')
@@ -2550,6 +2551,7 @@ describe('resource artifact validation', () => {
             const seeded = record(arm, kind)
             seeded.readings.manifest.seed = { mode: 'close' }
             seeded.readings.manifest.gc.available = available
+            if (arm === 'public' && !available) seeded.exit.receipts = 0
             write(arm, kind, seeded)
 
             const checked = validateResourceArtifacts(directory, { tree: TREE, node: NODE })

@@ -13,7 +13,6 @@ permissions:
 jobs:
   plan:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
     steps:

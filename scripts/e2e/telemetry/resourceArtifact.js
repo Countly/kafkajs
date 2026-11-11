@@ -409,12 +409,15 @@ class MemoryArmJudge {
   /**
    * @returns {{ verdict: 'pass'|'fail'|'inconclusive', problems: string[] }} `fail` for any broken
    *   fact or observed gate violation, `inconclusive` when only a missing capability, an
-   *   inadmissible control or the host stops the numbers deciding
+   *   inadmissible control or the host stops the numbers deciding. Seeded controls always fail
+   *   eligibility after any structurally valid measurements have been judged.
    */
   evaluate() {
     this.envelope()
     if (this.record.schema === SCHEMA && this.readings) this.measurements()
     else if (this.record.schema === SCHEMA) this.fail('readings are missing')
+    if (this.readings?.manifest?.seed != null)
+      this.fail('seeded control is not acceptance evidence')
     const verdict = this.failures.length
       ? 'fail'
       : this.inconclusive.length
@@ -559,7 +562,6 @@ class MemoryArmJudge {
     if (!r.warmup || typeof r.warmup !== 'object') this.fail('warm-up readings are missing')
     if (this.failures.length > before) return false
 
-    if (manifest.seed != null) this.fail('seeded control is not acceptance evidence')
     this.childContext(manifest)
     if (manifest.kind !== this.record.kind || manifest.arm !== this.record.arm)
       this.fail('manifest is for another kind or arm')

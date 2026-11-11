@@ -15,7 +15,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Tooling
 
-- Resource gate: closed ceiling, control stability and a new first-use bound judge heap plus external without V8 bytecode and compiled code (limits unchanged, schema 6); a measured warm-up pass runs before M; seeded controls prove per-close, warm-up and warm-up-only leaks fail on Node 22/24/26.
+- Resource gate: closed ceiling, control stability and a new first-use bound judge heap plus external without V8 bytecode and compiled code (limits unchanged, schema 6); a measured warm-up pass runs before M; seeded per-close, warm-up and warm-up-only controls must fail on Node 22/24/26. Seeded records are never acceptance evidence, while structurally valid controls still report numerical limit failures.
 - Memory-gate controls: the legacy journal arm is a contamination-positive control; admin and live-flags parity arms; the live worker records V8 code bytes in shadow.
 - Declare explicit 360-minute timeouts for the nine remaining runner jobs without a job limit; retain every existing explicit timeout.
 - Move telemetry memory arms and their validated artifacts, the retained-ownership diagnostic and full Node/broker churn-soak coverage into the guarded Memory gates workflow; keep the other functional telemetry lanes and non-memory resource schedules on phase PRs with unchanged acceptance checks.
