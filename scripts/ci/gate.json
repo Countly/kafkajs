@@ -19546,6 +19546,50 @@
         "scripts/ci/__tests__/benchWorkflow.spec.js › bench.yml shows the Markdown report in the job summary",
         "scripts/ci/__tests__/benchWorkflow.spec.js › bench.yml starts the cluster with NO_LOGS so the startup script returns",
         "scripts/ci/__tests__/benchWorkflow.spec.js › bench.yml uploads the report and tears the cluster down even when the run fails",
+        "scripts/ci/__tests__/weeklyMatrix.spec.js › weekly matrix covers Kafka 4.0.2, 4.2.2, 4.3.2 and 4.4.0 exactly",
+        "scripts/ci/__tests__/weeklyMatrix.spec.js › weekly matrix runs every Kafka line on at least two Node versions and 4.4.0 on all three",
+        "scripts/ci/__tests__/weeklyMatrix.spec.js › weekly matrix expands to nine Kafka-by-Node cells and 54 jobs",
+        "scripts/ci/__tests__/weeklyMatrix.spec.js › weekly matrix has no dispatch input and KAFKA_VERSION comes only from matrix.kafka",
+        "scripts/ci/__tests__/weeklyMatrix.spec.js › weekly matrix keeps the Monday 03:00 cron and the six groups",
+        "scripts/ci/__tests__/weeklyMatrix.spec.js › weekly matrix runs all six groups on Kafka 4.0.2",
+        "scripts/ci/__tests__/weeklyMatrix.spec.js › weekly matrix keeps max-parallel at 6",
+        "scripts/ci/__tests__/weeklyMatrix.spec.js › weekly matrix sets timeout-minutes",
+        "scripts/ci/__tests__/weeklyMatrix.spec.js › weekly matrix drops a combination only when every key of an exclude entry matches",
+        "scripts/ci/__tests__/telemetryConfig.spec.js › telemetry lane configuration the full telemetry matrix lists the exact Kafka lines per group",
+        "scripts/ci/__tests__/telemetryConfig.spec.js › telemetry lane configuration the development telemetry matrix runs Kafka 4.4.0 only",
+        "scripts/ci/__tests__/telemetryConfig.spec.js › telemetry lane configuration no telemetry lane runs Kafka 4.3.1",
+        "scripts/ci/__tests__/telemetryConfig.spec.js › telemetry lane configuration docker-compose.telemetry.yml defaults to Kafka 4.4.0 and its reporter jar name follows KAFKA_VERSION",
+        "scripts/ci/__tests__/telemetryConfig.spec.js › telemetry lane configuration the telemetry manifest has a 4.4.0 line whose jars exist and match their SHA-256",
+        "scripts/ci/__tests__/telemetryConfig.spec.js › telemetry lane configuration the fixture runners accept Kafka 4.4.0",
+        "scripts/ci/__tests__/telemetryConfig.spec.js › telemetry lane configuration the reporter ordering step runs on a Kafka 4.4.0 row and covers every retained reporter jar",
+        "scripts/ci/__tests__/telemetryConfig.spec.js › telemetry lane configuration the temporary telemetry fixtures build workflow is not on the merged tree",
+        "testHelpers/__tests__/telemetryFixtures.spec.js › telemetry wire observer accepts a configured observer on every line with a reporter jar and refuses the rest",
+        "testHelpers/__tests__/telemetryFixtures.spec.js › required live archive dimensions and semantics telemetry-outcomes evidence for base-mode Kafka 4.4.0 is accepted",
+        "testHelpers/__tests__/telemetryFixtures.spec.js › required live archive dimensions and semantics telemetry-outcomes evidence for configured-mode Kafka 4.4.0 is accepted",
+        "testHelpers/__tests__/telemetryFixtures.spec.js › required live archive dimensions and semantics telemetry-outcomes evidence for configured-mode Kafka 4.2.2 is accepted",
+        "testHelpers/__tests__/telemetryFixtures.spec.js › required live archive dimensions and semantics telemetry-outcomes base-mode 4.1.2 evidence still requires the api-version-range refusal",
+        "testHelpers/__tests__/telemetryFixtures.spec.js › required live archive dimensions and semantics telemetry-outcomes base-mode 4.0.2 evidence still requires the api-not-advertised refusal",
+        "testHelpers/__tests__/telemetryFixtures.spec.js › required live archive dimensions and semantics telemetry-outcomes rejects a base-mode 4.4.0 record that carries a share refusal",
+        "testHelpers/__tests__/telemetryFixtures.spec.js › required live archive dimensions and semantics telemetry-outcomes rejects a base-mode 4.4.0 record that has a rejected share result without the refusal fields",
+        "testHelpers/__tests__/telemetryFixtures.spec.js › required live archive dimensions and semantics telemetry-outcomes rejects a base-mode 4.4.0 record that has no share result",
+        "testHelpers/__tests__/telemetryFixtures.spec.js › required live archive dimensions and semantics telemetry-outcomes rejects a configured-mode record that claims mode base",
+        "testHelpers/__tests__/telemetryFixtures.spec.js › required live archive dimensions and semantics telemetry-outcomes rejects a base-lane record that carries the configured fixture digest",
+        "testHelpers/__tests__/telemetryFixtures.spec.js › required live archive dimensions and semantics telemetry-outcomes rejects configured mode on a line without a reporter jar",
+        "scripts/ci/__tests__/gateBroker.spec.js › exit gate broker the Exit gate default broker is Kafka 4.4.0",
+        "scripts/ci/__tests__/gateBroker.spec.js › exit gate broker the focused checks run on the default broker and no -kafka-4-4 id remains",
+        "scripts/ci/__tests__/gateBroker.spec.js › exit gate broker the four old-broker controls run on Kafka 4.3.2",
+        "scripts/ci/__tests__/gateBroker.spec.js › exit gate broker the floor checks run on Kafka 4.0.2",
+        "scripts/ci/__tests__/gateBroker.spec.js › exit gate broker only the floor checks and the old-broker controls pin a broker version",
+        "scripts/ci/__tests__/gateBroker.spec.js › exit gate broker the tiered storage test-fixtures jar is the 4.4.0 jar in gate.yml and docker-compose.tiered.yml",
+        "scripts/ci/__tests__/gateBroker.spec.js › exit gate broker the admin tiered spec checks the jar and digest the gate pins",
+        "scripts/ci/__tests__/gateBroker.spec.js › exit gate broker the consumer-group-state build knows Kafka 4.4.0",
+        "scripts/ci/__tests__/gateBroker.spec.js › exit gate broker the consumer-group-state image and its state fixture default to Kafka 4.4.0",
+        "scripts/ci/__tests__/gateJavaOracle.spec.js › exit gate Java oracle the four interop checks pin Kafka clients 4.3.1",
+        "scripts/ci/__tests__/gateJavaOracle.spec.js › exit gate Java oracle the share check does not pin Java clients and gets Kafka clients 4.4.0",
+        "scripts/ci/__tests__/gateJavaOracle.spec.js › exit gate Java oracle gate.yml selects javaClientsVersion before the broker version for jars and their cache",
+        "scripts/ci/__tests__/gateJavaOracle.spec.js › exit gate Java oracle every pinned Java client version has a checksum case entry",
+        "scripts/ci/__tests__/gateJavaOracle.spec.js › exit gate Java oracle both manifest readers reject an unknown Java client version",
+        "scripts/__tests__/testingDoc.spec.js › docs/Testing.md names every Kafka line and Node version the weekly matrix runs",
         "scripts/ci/__tests__/workflowTimeouts.spec.js › workflow job timeouts every runner-executed job sets timeout-minutes",
         "scripts/ci/__tests__/workflowTimeouts.spec.js › workflow job timeouts a reusable-workflow caller job is exempt and its callee is checked",
         "scripts/ci/__tests__/workflowTimeouts.spec.js › workflow job timeouts fails on a reusable-workflow call whose callee cannot be resolved",
@@ -21315,6 +21359,7 @@
     },
     {
       "id": "e2e-compression",
+      "javaClientsVersion": "4.3.1",
       "kind": "cluster",
       "compose": "docker-compose.yml",
       "env": {
@@ -21599,6 +21644,7 @@
     },
     {
       "id": "e2e-java-interop",
+      "javaClientsVersion": "4.3.1",
       "kind": "cluster",
       "compose": "docker-compose.yml",
       "env": {
@@ -21831,6 +21877,7 @@
     },
     {
       "id": "e2e-java-transaction-interop",
+      "javaClientsVersion": "4.3.1",
       "kind": "cluster",
       "compose": "docker-compose.yml",
       "env": {
@@ -22230,6 +22277,7 @@
     },
     {
       "id": "e2e-leader-union",
+      "javaClientsVersion": "4.3.1",
       "kind": "cluster",
       "compose": "docker-compose.yml",
       "env": {
@@ -23560,6 +23608,49 @@
         "scripts/ci/__tests__/benchWorkflow.spec.js › bench.yml shows the Markdown report in the job summary",
         "scripts/ci/__tests__/benchWorkflow.spec.js › bench.yml starts the cluster with NO_LOGS so the startup script returns",
         "scripts/ci/__tests__/benchWorkflow.spec.js › bench.yml uploads the report and tears the cluster down even when the run fails",
+        "scripts/ci/__tests__/weeklyMatrix.spec.js › weekly matrix covers Kafka 4.0.2, 4.2.2, 4.3.2 and 4.4.0 exactly",
+        "scripts/ci/__tests__/weeklyMatrix.spec.js › weekly matrix runs every Kafka line on at least two Node versions and 4.4.0 on all three",
+        "scripts/ci/__tests__/weeklyMatrix.spec.js › weekly matrix expands to nine Kafka-by-Node cells and 54 jobs",
+        "scripts/ci/__tests__/weeklyMatrix.spec.js › weekly matrix has no dispatch input and KAFKA_VERSION comes only from matrix.kafka",
+        "scripts/ci/__tests__/weeklyMatrix.spec.js › weekly matrix keeps the Monday 03:00 cron and the six groups",
+        "scripts/ci/__tests__/weeklyMatrix.spec.js › weekly matrix runs all six groups on Kafka 4.0.2",
+        "scripts/ci/__tests__/weeklyMatrix.spec.js › weekly matrix keeps max-parallel at 6",
+        "scripts/ci/__tests__/weeklyMatrix.spec.js › weekly matrix sets timeout-minutes",
+        "scripts/ci/__tests__/weeklyMatrix.spec.js › weekly matrix drops a combination only when every key of an exclude entry matches",
+        "scripts/ci/__tests__/telemetryConfig.spec.js › telemetry lane configuration the full telemetry matrix lists the exact Kafka lines per group",
+        "scripts/ci/__tests__/telemetryConfig.spec.js › telemetry lane configuration the development telemetry matrix runs Kafka 4.4.0 only",
+        "scripts/ci/__tests__/telemetryConfig.spec.js › telemetry lane configuration no telemetry lane runs Kafka 4.3.1",
+        "scripts/ci/__tests__/telemetryConfig.spec.js › telemetry lane configuration docker-compose.telemetry.yml defaults to Kafka 4.4.0 and its reporter jar name follows KAFKA_VERSION",
+        "scripts/ci/__tests__/telemetryConfig.spec.js › telemetry lane configuration the telemetry manifest has a 4.4.0 line whose jars exist and match their SHA-256",
+        "scripts/ci/__tests__/telemetryConfig.spec.js › telemetry lane configuration the fixture runners accept Kafka 4.4.0",
+        "scripts/ci/__tests__/telemetryConfig.spec.js › telemetry lane configuration the reporter ordering step runs on a Kafka 4.4.0 row and covers every retained reporter jar",
+        "scripts/ci/__tests__/telemetryConfig.spec.js › telemetry lane configuration the temporary telemetry fixtures build workflow is not on the merged tree",
+        "testHelpers/__tests__/telemetryFixtures.spec.js › telemetry wire observer accepts a configured observer on every line with a reporter jar and refuses the rest",
+        "testHelpers/__tests__/telemetryFixtures.spec.js › required live archive dimensions and semantics telemetry-outcomes evidence for base-mode Kafka 4.4.0 is accepted",
+        "testHelpers/__tests__/telemetryFixtures.spec.js › required live archive dimensions and semantics telemetry-outcomes evidence for configured-mode Kafka 4.4.0 is accepted",
+        "testHelpers/__tests__/telemetryFixtures.spec.js › required live archive dimensions and semantics telemetry-outcomes evidence for configured-mode Kafka 4.2.2 is accepted",
+        "testHelpers/__tests__/telemetryFixtures.spec.js › required live archive dimensions and semantics telemetry-outcomes base-mode 4.1.2 evidence still requires the api-version-range refusal",
+        "testHelpers/__tests__/telemetryFixtures.spec.js › required live archive dimensions and semantics telemetry-outcomes base-mode 4.0.2 evidence still requires the api-not-advertised refusal",
+        "testHelpers/__tests__/telemetryFixtures.spec.js › required live archive dimensions and semantics telemetry-outcomes rejects a base-mode 4.4.0 record that carries a share refusal",
+        "testHelpers/__tests__/telemetryFixtures.spec.js › required live archive dimensions and semantics telemetry-outcomes rejects a base-mode 4.4.0 record that has a rejected share result without the refusal fields",
+        "testHelpers/__tests__/telemetryFixtures.spec.js › required live archive dimensions and semantics telemetry-outcomes rejects a base-mode 4.4.0 record that has no share result",
+        "testHelpers/__tests__/telemetryFixtures.spec.js › required live archive dimensions and semantics telemetry-outcomes rejects a configured-mode record that claims mode base",
+        "testHelpers/__tests__/telemetryFixtures.spec.js › required live archive dimensions and semantics telemetry-outcomes rejects a base-lane record that carries the configured fixture digest",
+        "testHelpers/__tests__/telemetryFixtures.spec.js › required live archive dimensions and semantics telemetry-outcomes rejects configured mode on a line without a reporter jar",
+        "scripts/ci/__tests__/gateBroker.spec.js › exit gate broker the Exit gate default broker is Kafka 4.4.0",
+        "scripts/ci/__tests__/gateBroker.spec.js › exit gate broker the focused checks run on the default broker and no -kafka-4-4 id remains",
+        "scripts/ci/__tests__/gateBroker.spec.js › exit gate broker the four old-broker controls run on Kafka 4.3.2",
+        "scripts/ci/__tests__/gateBroker.spec.js › exit gate broker the floor checks run on Kafka 4.0.2",
+        "scripts/ci/__tests__/gateBroker.spec.js › exit gate broker only the floor checks and the old-broker controls pin a broker version",
+        "scripts/ci/__tests__/gateBroker.spec.js › exit gate broker the tiered storage test-fixtures jar is the 4.4.0 jar in gate.yml and docker-compose.tiered.yml",
+        "scripts/ci/__tests__/gateBroker.spec.js › exit gate broker the admin tiered spec checks the jar and digest the gate pins",
+        "scripts/ci/__tests__/gateBroker.spec.js › exit gate broker the consumer-group-state build knows Kafka 4.4.0",
+        "scripts/ci/__tests__/gateBroker.spec.js › exit gate broker the consumer-group-state image and its state fixture default to Kafka 4.4.0",
+        "scripts/ci/__tests__/gateJavaOracle.spec.js › exit gate Java oracle the four interop checks pin Kafka clients 4.3.1",
+        "scripts/ci/__tests__/gateJavaOracle.spec.js › exit gate Java oracle the share check does not pin Java clients and gets Kafka clients 4.4.0",
+        "scripts/ci/__tests__/gateJavaOracle.spec.js › exit gate Java oracle gate.yml selects javaClientsVersion before the broker version for jars and their cache",
+        "scripts/ci/__tests__/gateJavaOracle.spec.js › exit gate Java oracle every pinned Java client version has a checksum case entry",
+        "scripts/ci/__tests__/gateJavaOracle.spec.js › exit gate Java oracle both manifest readers reject an unknown Java client version",
         "scripts/ci/__tests__/workflowTimeouts.spec.js › workflow job timeouts every runner-executed job sets timeout-minutes",
         "scripts/ci/__tests__/workflowTimeouts.spec.js › workflow job timeouts a reusable-workflow caller job is exempt and its callee is checked",
         "scripts/ci/__tests__/workflowTimeouts.spec.js › workflow job timeouts fails on a reusable-workflow call whose callee cannot be resolved",
@@ -24023,10 +24114,9 @@
       ]
     },
     {
-      "id": "e2e-share-kafka-4-4",
+      "id": "e2e-share",
       "kind": "cluster",
       "compose": "docker-compose.share.yml",
-      "kafkaVersion": "4.4.0",
       "env": {
         "SHARE_KAFKA44_SETUP": "1",
         "SHARE_KAFKA44_E2E": "1",
@@ -24387,10 +24477,9 @@
       "capMinutes": 45
     },
     {
-      "id": "e2e-delete-groups-v3-kafka-4-4",
+      "id": "e2e-delete-groups-v3",
       "kind": "cluster",
       "compose": "docker-compose.yml",
-      "kafkaVersion": "4.4.0",
       "env": {
         "DELETE_GROUPS_V3_E2E": "1"
       },
@@ -24416,7 +24505,7 @@
       "id": "e2e-delete-groups-v3-kafka-4-3",
       "kind": "cluster",
       "compose": "docker-compose.yml",
-      "kafkaVersion": "4.3.1",
+      "kafkaVersion": "4.3.2",
       "env": {
         "DELETE_GROUPS_V3_E2E": "1"
       },
@@ -24613,10 +24702,9 @@
       "capMinutes": 25
     },
     {
-      "id": "e2e-rack-aware-producer-kafka-4-4",
+      "id": "e2e-rack-aware-producer",
       "kind": "cluster",
       "compose": "docker-compose.racks.yml",
-      "kafkaVersion": "4.4.0",
       "env": {
         "RACK_AWARE_PRODUCER_E2E": "1"
       },
@@ -24647,7 +24735,7 @@
       "id": "e2e-rack-aware-producer-kafka-4-3",
       "kind": "cluster",
       "compose": "docker-compose.racks.yml",
-      "kafkaVersion": "4.3.1",
+      "kafkaVersion": "4.3.2",
       "env": {
         "RACK_AWARE_PRODUCER_E2E": "1"
       },
@@ -24675,10 +24763,9 @@
       "capMinutes": 30
     },
     {
-      "id": "e2e-api-identity-kafka-4-4",
+      "id": "e2e-api-identity",
       "kind": "cluster",
       "compose": "docker-compose.yml",
-      "kafkaVersion": "4.4.0",
       "env": {
         "API_IDENTITY_E2E": "1"
       },
@@ -24706,7 +24793,7 @@
       "id": "e2e-api-identity-kafka-4-3",
       "kind": "cluster",
       "compose": "docker-compose.yml",
-      "kafkaVersion": "4.3.1",
+      "kafkaVersion": "4.3.2",
       "env": {
         "API_IDENTITY_E2E": "1"
       },
@@ -24731,10 +24818,9 @@
       "capMinutes": 30
     },
     {
-      "id": "e2e-txn-offset-commit-v6-kafka-4-4",
+      "id": "e2e-txn-offset-commit-v6",
       "kind": "cluster",
       "compose": "docker-compose.yml",
-      "kafkaVersion": "4.4.0",
       "env": {
         "TXN_OFFSET_COMMIT_V6_E2E": "1"
       },
@@ -24760,7 +24846,7 @@
       "id": "e2e-txn-offset-commit-v6-kafka-4-3",
       "kind": "cluster",
       "compose": "docker-compose.yml",
-      "kafkaVersion": "4.3.1",
+      "kafkaVersion": "4.3.2",
       "env": {
         "TXN_OFFSET_COMMIT_V6_E2E": "1"
       },

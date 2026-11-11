@@ -9,6 +9,9 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Tooling
 
+- Weekly CI matrix now covers Kafka 4.0.2 (the claimed floor), 4.2.2, 4.3.2 and 4.4.0 on Node 22, 24 and 26; the `kafka_version` dispatch input is removed so every successful run is a full run.
+- Telemetry lanes and their Java fixtures (reporter and client jars, built in CI) run on Kafka 4.4.0; the no-plugin lanes also cover 4.0.2, 4.1.2 and 4.2.2.
+- The Exit gate and its fixtures run on Kafka 4.4.0 (tiered storage test-fixtures jar, coordinator patch, state fixtures); the focused 4.4.0 checks and the share check are default checks, the 4.3 checks stay as old-broker controls on 4.3.2, and the Java interop checks keep the Kafka 4.3.1 client as their oracle.
 - Add a manual benchmark workflow that reports medians for the fork and, through the public API, for kafkajs 2.2.4 (no thresholds).
 - Add `release.yml`: a `v*` tag publishes from CI only after the exact tagged commit has green `ci.yml`, `gate.yml` and `weekly.yml` runs on master and a reviewer approves the `npm-release` environment; the job publishes the tested tarball once, with npm provenance and no token. Retires the "never from CI" rule.
 - Declare `js-yaml` as a development dependency (it was used by workflow tests through another package).
