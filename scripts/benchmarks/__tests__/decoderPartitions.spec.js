@@ -116,6 +116,207 @@ const collectorFor = (partition, now = () => 0, advance = () => {}) => {
 }
 
 describe('Decoder measurement partitions', () => {
+  it('passes strict A/A interval-only INVALID rows at equal medians under D171 in compare and combine', () => {
+    const inputs = evidence()
+    const input = inputs.find(({ partition }) => partition === 'batch-array')
+    const row = input.arms.find(({ name }) => name === 'record-batch:uncompressed')
+    setSamples(row, 'C', [...Array(23).fill(100), ...Array(7).fill(106)])
+    for (const result of [compare(input), combine(inputs)]) {
+      expect(result.problems).toEqual([])
+      expect(result.arms.find(({ name }) => name === row.name)).toMatchObject({
+        verdict: 'invalid',
+        problems: ['A/A interval outside [0.95, 1.05]'],
+        oldMedian: 100,
+        newMedian: 100,
+      })
+      expect(result.pass).toBe(true)
+      expect(result.noiseAcceptedRows).toEqual([row.name])
+      expect(formatReport(result)).toContain(`INVALID (noise; median within 5%, D171) ${row.name}`)
+    }
+  })
+
+  it('accepts strict spread-only INVALID rows through median 1.05 but rejects 1.051 under D171', () => {
+    for (const side of ['A', 'C', 'B']) {
+      for (const [newMedian, pass] of [
+        [104.9, true],
+        [105, true],
+        [105.1, false],
+      ]) {
+        const inputs = evidence()
+        const input = inputs.find(({ partition }) => partition === 'batch-array')
+        const row = input.arms.find(({ name }) => name === 'record-batch:uncompressed')
+        setSamples(row, 'B', Array(30).fill(newMedian))
+        const samples = Array(30).fill(side === 'B' ? newMedian : 100)
+        samples[28] = samples[29] = 130
+        setSamples(row, side, samples)
+        for (const result of [compare(input), combine(inputs)]) {
+          expect(result.problems).toEqual([])
+          expect(result.arms.find(({ name }) => name === row.name)).toMatchObject({
+            verdict: 'invalid',
+            problems: ['spread exceeds fifteen percent'],
+            oldMedian: 100,
+            newMedian,
+          })
+          expect(result.pass).toBe(pass)
+          expect(result.noiseAcceptedRows).toEqual(pass ? [row.name] : [])
+          expect(formatReport(result).includes('noise; median within 5%, D171')).toBe(pass)
+        }
+      }
+    }
+  })
+
+  it('accepts both named noise problems together but keeps unpaired control-median calibration blocking', () => {
+    const inputs = evidence()
+    const input = inputs.find(({ partition }) => partition === 'batch-array')
+    const row = input.arms.find(({ name }) => name === 'record-batch:uncompressed')
+    setSamples(row, 'C', [...Array(23).fill(100), ...Array(7).fill(120)])
+    for (const result of [compare(input), combine(inputs)]) {
+      expect(result.arms.find(({ name }) => name === row.name).problems).toEqual([
+        'A/A interval outside [0.95, 1.05]',
+        'spread exceeds fifteen percent',
+      ])
+      expect(result.pass).toBe(true)
+      expect(result.noiseAcceptedRows).toEqual([row.name])
+    }
+    setSamples(row, 'C', Array(30).fill(106))
+    for (const result of [compare(input), combine(inputs)]) {
+      expect(result.arms.find(({ name }) => name === row.name).problems).toEqual([
+        'A/A interval outside [0.95, 1.05]',
+        'A/A median outside five percent',
+      ])
+      expect(result.pass).toBe(false)
+      expect(result.noiseAcceptedRows).toEqual([])
+    }
+  })
+
+  it('keeps structural row and schedule errors missing evidence timeouts and partition errors blocking with D171 noise', () => {
+    const mutations = [
+      (inputs, input, row) => row.invocations.pop(),
+      (inputs, input, row) => (row.invocations[0].error = 'control failed'),
+      (inputs, input) => input.schedule[0].reverse(),
+      (inputs, input) => input.arms.pop(),
+      (inputs, input) => (input.timedOut = true),
+      (inputs, input) => (input.partition = 'unknown'),
+      (inputs, input) => delete input.workMultipliers,
+    ]
+    for (const mutate of mutations) {
+      const inputs = evidence()
+      const input = inputs.find(({ partition }) => partition === 'batch-array')
+      const row = input.arms.find(({ name }) => name === 'record-batch:uncompressed')
+      setSamples(row, 'C', [...Array(23).fill(100), ...Array(7).fill(106)])
+      expect(compare(input).pass).toBe(true)
+      expect(combine(inputs).pass).toBe(true)
+      mutate(inputs, input, row)
+      for (const result of [compare(input), combine(inputs)]) {
+        expect(result.problems.length).toBeGreaterThan(0)
+        expect(result.pass).toBe(false)
+      }
+    }
+    const inputs = evidence()
+    const input = inputs.find(({ partition }) => partition === 'batch-array')
+    setSamples(input.arms[0], 'C', [...Array(23).fill(100), ...Array(7).fill(106)])
+    for (const invalid of [inputs.slice(1), [...inputs, inputs[0]]]) {
+      expect(combine(invalid).pass).toBe(false)
+      expect(combine(invalid).problems).toContain('all three partitions are required')
+    }
+  })
+
+  it('keeps non-finite paired ratios INVALID and blocking under D171', () => {
+    const inputs = evidence()
+    const input = inputs.find(({ partition }) => partition === 'batch-array')
+    const row = input.arms.find(({ name }) => name === 'record-batch:uncompressed')
+    setSamples(row, 'A', Array(30).fill(Number.MIN_VALUE))
+    setSamples(row, 'C', Array(30).fill(Number.MIN_VALUE))
+    setSamples(row, 'B', [...Array(23).fill(Number.MIN_VALUE), ...Array(7).fill(100)])
+    for (const result of [compare(input), combine(inputs)]) {
+      expect(result.problems).toEqual([])
+      expect(result.arms.find(({ name }) => name === row.name)).toMatchObject({
+        verdict: 'invalid',
+        problems: ['non-finite paired ratio'],
+      })
+      expect(result.pass).toBe(false)
+      expect(result.noiseAcceptedRows).toEqual([])
+    }
+  })
+
+  it('keeps valid strict FAIL REGRESSION and INCONCLUSIVE verdicts blocking under D171', () => {
+    for (const [verdict, A, B] of [
+      [
+        'fail',
+        [...Array(15).fill(100), ...Array(15).fill(114)],
+        [114, ...Array(14).fill(105), ...Array(15).fill(119.7)],
+      ],
+      ['regression', Array(30).fill(100), Array(30).fill(106)],
+      ['inconclusive', Array(30).fill(100), [...Array(23).fill(100), ...Array(7).fill(106)]],
+    ]) {
+      const inputs = evidence()
+      const input = inputs.find(({ partition }) => partition === 'batch-array')
+      const row = input.arms.find(({ name }) => name === 'record-batch:uncompressed')
+      setSamples(row, 'A', A)
+      setSamples(row, 'C', A)
+      setSamples(row, 'B', B)
+      for (const result of [compare(input), combine(inputs)]) {
+        expect(result.problems).toEqual([])
+        expect(result.arms.find(({ name }) => name === row.name)).toMatchObject({
+          verdict,
+          problems: [],
+        })
+        expect(result.pass).toBe(false)
+        expect(result.noiseAcceptedRows).toEqual([])
+        expect(formatReport(result)).not.toContain('noise; median within 5%, D171')
+      }
+    }
+  })
+
+  it('preserves information-only INVALID acceptance above five percent without claiming D171 acceptance', () => {
+    const inputs = evidence()
+    for (const input of inputs.filter(({ partition }) => partition !== 'batch-array')) {
+      for (const row of input.arms) {
+        setSamples(row, 'C', Array(30).fill(106))
+        setSamples(row, 'B', Array(30).fill(120))
+      }
+      const result = compare(input)
+      expect(result.pass).toBe(true)
+      expect(result.arms.every(({ verdict }) => verdict === 'invalid')).toBe(true)
+      expect(result.noiseAcceptedRows).toEqual([])
+      expect(formatReport(result)).toContain('information only (D167)')
+      expect(formatReport(result)).not.toContain('noise; median within 5%, D171')
+    }
+    expect(combine(inputs).pass).toBe(true)
+    expect(combine(inputs).noiseAcceptedRows).toEqual([])
+  })
+
+  it('records D171 accepted strict rows in the combined summary while preserving INVALID verdicts', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'decoder-d171-'))
+    try {
+      const inputs = evidence()
+      const input = inputs.find(({ partition }) => partition === 'batch-array')
+      const row = input.arms.find(({ name }) => name === 'record-batch:uncompressed')
+      setSamples(row, 'C', [...Array(23).fill(100), ...Array(7).fill(106)])
+      const files = inputs.map((input) => {
+        const file = path.join(dir, `${input.partition}.json`)
+        fs.writeFileSync(file, JSON.stringify(input))
+        return file
+      })
+      const out = path.join(dir, 'summary.json')
+      const lines = []
+      expect(
+        await main(
+          ['--combine', ...files.flatMap((file) => ['--input', file]), '--out', out],
+          (line) => lines.push(line)
+        )
+      ).toBe(0)
+      const summary = JSON.parse(fs.readFileSync(out, 'utf8'))
+      expect(summary.result.noiseAcceptedRows).toEqual([row.name])
+      expect(summary.result.arms.find(({ name }) => name === row.name).verdict).toBe('invalid')
+      expect(summary.partitions).toEqual(inputs)
+      expect(lines.join('\n')).toContain(`INVALID (noise; median within 5%, D171) ${row.name}`)
+      expect(lines.join('\n')).toContain('decoder performance: PASS')
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   it('freezes exactly the five D167 and D168 frame rows as information only with hosted-runner noise reasons', () => {
     expect(Object.keys(INFORMATION_ONLY_ROWS)).toEqual(D167_ROWS)
     expect(Object.isFrozen(INFORMATION_ONLY_ROWS)).toBe(true)
