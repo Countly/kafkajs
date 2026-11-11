@@ -1,5 +1,4 @@
 const Long = require('../../../../utils/long')
-const HeaderDecoder = require('../../header/v0/decoder')
 const TimestampTypes = require('../../../timestampTypes')
 
 /**
@@ -102,7 +101,8 @@ module.exports = (decoder, batchContext = {}, firstOffsetNumber) => {
   }
 
   for (let i = 0; i < headerCount; i++) {
-    const { key: headerKey, value: headerValue } = HeaderDecoder(decoder)
+    const headerKey = decoder.readVarIntString()
+    const headerValue = decoder.readVarIntBytes()
     const existing = Object.hasOwn(headers, headerKey) ? headers[headerKey] : undefined
 
     if (existing === undefined) {

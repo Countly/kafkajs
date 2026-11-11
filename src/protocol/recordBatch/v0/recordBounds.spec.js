@@ -94,6 +94,48 @@ describe('Protocol > RecordBatch > v0 > bounds inside a record batch', () => {
 
     afterEach(() => jest.restoreAllMocks())
 
+    test('preserves duplicate order, null and empty values, and special own header keys', async () => {
+      const entries = [
+        ['repeat', null],
+        ['__proto__', 'first'],
+        ['constructor', 'constructor-value'],
+        ['repeat', ''],
+        ['toString', 'toString-value'],
+        ['__proto__', null],
+        ['repeat', 'last'],
+        ['__proto__', 'last-proto'],
+        ['', 'empty-name'],
+      ]
+
+      const { messages, corruption } = await decodeRecords([record({ headers: entries })])
+
+      expect(corruption).toBeUndefined()
+      expect(messages).toHaveLength(1)
+      const { headers } = messages[0]
+      expect(Object.getPrototypeOf(headers)).toBe(Object.prototype)
+      expect(Object.keys(headers)).toEqual(['repeat', '__proto__', 'constructor', 'toString', ''])
+      expect(headers.repeat).toEqual([null, Buffer.alloc(0), Buffer.from('last')])
+      expect(Object.getOwnPropertyDescriptor(headers, '__proto__')).toEqual({
+        value: [Buffer.from('first'), null, Buffer.from('last-proto')],
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      })
+      expect(headers.constructor).toEqual(Buffer.from('constructor-value'))
+      expect(headers.toString).toEqual(Buffer.from('toString-value'))
+      expect(headers['']).toEqual(Buffer.from('empty-name'))
+    })
+
+    test('a header whose value overruns the record is corrupt even when its count fits', async () => {
+      const truncated = Buffer.concat([varint(1), Buffer.from('k'), varint(2), Buffer.from('v')])
+
+      const { messages, corruption } = await decodeRecords([recordDeclaring(1, truncated)])
+
+      expect(messages).toEqual([])
+      expect(corruption).toMatchObject({ reason: 'length', offset: '0' })
+      expect(corruption.error.cause).toBeInstanceOf(KafkaJSPartialMessageError)
+    })
+
     test(
       `a record with ${HEADER_COUNT} headers decodes`,
       async () => {

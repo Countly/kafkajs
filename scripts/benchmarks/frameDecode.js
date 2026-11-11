@@ -5,7 +5,7 @@
  * the requests carry only measures the body.
  * Usage: node --expose-gc scripts/benchmarks/frameDecode.js [--shape 64b|64k|1m|coalesced|byte-chunks]
  *          [--control 0|1]
- * Prints one JSON line of numbers: { frames, nsPerFrame, heapRetainedBytes } (the heap only under
+ * Prints one JSON line: { frames, nsPerFrame, roundNsPerOp, heapRetainedBytes } (the heap only under
  * `--expose-gc`).
  *
  * Declared before any run (session.js, medians of seven, the first run of each arm discarded, an
@@ -184,7 +184,7 @@ const retainedHeap = async () => {
  * The timed run: an untimed round, then `ROUNDS` timed ones.
  * @param {string} name a key of `SHAPES`
  * @param {number} [frames] frames per round, the shape's by default
- * @returns {Promise<{ frames: number, nsPerFrame: number, heapRetainedBytes?: number }>}
+ * @returns {Promise<{ frames: number, nsPerFrame: number, roundNsPerOp: number[], heapRetainedBytes?: number }>}
  */
 const timed = async (name, frames = SHAPES[name].frames) => {
   await round(SHAPES[name], frames)
@@ -194,7 +194,12 @@ const timed = async (name, frames = SHAPES[name].frames) => {
   }
 
   const heapRetainedBytes = await retainedHeap()
-  return { frames, nsPerFrame: median(rounds), ...(heapRetainedBytes && { heapRetainedBytes }) }
+  return {
+    frames,
+    nsPerFrame: median(rounds),
+    roundNsPerOp: rounds,
+    ...(heapRetainedBytes && { heapRetainedBytes }),
+  }
 }
 
 /**

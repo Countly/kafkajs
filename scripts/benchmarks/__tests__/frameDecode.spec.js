@@ -77,6 +77,9 @@ describe('Benchmarks > frameDecode', () => {
 
         expect(timedRun).toMatchObject({ frames: 2, nsPerFrame: expect.any(Number) })
         expect(timedRun.nsPerFrame).toBeGreaterThan(0)
+        expect(timedRun.roundNsPerOp).toHaveLength(7)
+        expect(timedRun.roundNsPerOp.every((value) => value > 0)).toBe(true)
+        expect(timedRun.nsPerFrame).toBe([...timedRun.roundNsPerOp].sort((a, b) => a - b)[3])
         expect(controlRun).toEqual({ control: true, shape, framesFed: 2, fulfilled: 2, pass: true })
       },
       60000

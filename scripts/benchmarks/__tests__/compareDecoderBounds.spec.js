@@ -91,6 +91,56 @@ describe('Decoder performance comparison', () => {
     }
   })
 
+  it('reports baseline A/A medians beside each row and warns on drift above five percent', () => {
+    const input = completeInput()
+    input.arms[0].baselineControlNsPerOp = [900, 108, 107, 109, 1]
+
+    const result = compare(input, NO_EXCEPTIONS)
+    const { status, report } = runInput(input)
+
+    expect(result.arms[0].baselineControl).toEqual({
+      oldMedian: 100,
+      controlMedian: 108,
+      driftPercent: expect.closeTo(8, 6),
+      unstable: true,
+    })
+    expect(status).toBe(0)
+    expect(report).toMatch(/PASS\s+frame-decode:64b\s.*\+0\.00% {2}A\/A baseline \+8\.00%/)
+    expect(report).toContain(`WARNING  ${FIRST}: baseline A/A drift exceeds 5% (+8.00%)`)
+    expect(report).toContain('A/A baseline unavailable')
+
+    input.arms[0].baselineControlNsPerOp = constant(94)
+    expect(runInput(input).report).toContain(
+      `WARNING  ${FIRST}: baseline A/A drift exceeds 5% (-6.00%)`
+    )
+    input.arms[0].baselineControlNsPerOp = constant(105)
+    expect(runInput(input).report).not.toContain('WARNING')
+  })
+
+  it('A/A diagnostics never change acceptance medians, problems, exceptions or verdicts', () => {
+    for (const candidate of [100, 105, 106, 108]) {
+      for (const exceptions of [
+        NO_EXCEPTIONS,
+        parseExceptions([{ arm: FIRST, maxSlowdownPercent: 7, ruling: 'test ruling' }]),
+      ]) {
+        const input = withNew(FIRST, candidate)
+        const before = compare(input, exceptions)
+        for (const control of [constant(10000), constant(1), [NaN], null, []]) {
+          input.arms[0].baselineControlNsPerOp = control
+          const after = compare(input, exceptions)
+          expect(after.pass).toBe(before.pass)
+          expect(after.problems).toEqual(before.problems)
+          expect(after.arms[0]).toMatchObject({
+            oldMedian: before.arms[0].oldMedian,
+            newMedian: before.arms[0].newMedian,
+            slowdownPercent: before.arms[0].slowdownPercent,
+            verdict: before.arms[0].verdict,
+          })
+        }
+      }
+    }
+  })
+
   it('refuses missing or incomparable measurements', () => {
     const exceptions = parseExceptions(
       ARMS.map(({ name }) => ({ arm: name, maxSlowdownPercent: 1000, ruling: 'test ruling' }))
@@ -316,7 +366,11 @@ describe('Decoder performance comparison', () => {
   const ok = (value) => ({ status: 0, stdout: `banner\n${JSON.stringify(value)}\n`, stderr: '' })
   const valueFor = (cwd, argv) => {
     const arm = ARMS.find((candidate) => candidate.argv.join(' ') === argv.join(' '))
-    return ok({ available: 1, [arm.metric]: cwd === 'OLD' ? 100 : 101 })
+    return ok({
+      available: 1,
+      [arm.metric]: cwd === 'OLD' ? 100 : 101,
+      roundNsPerOp: [98, 99, 100, 101, 102],
+    })
   }
 
   it('collector runs each arm in both trees, alternates their order and keeps every raw invocation', () => {
@@ -329,6 +383,9 @@ describe('Decoder performance comparison', () => {
     for (const arm of arms) {
       expect(arm.oldNsPerOp).toEqual(constant(100))
       expect(arm.newNsPerOp).toEqual(constant(101))
+      expect(arm.baselineControlNsPerOp).toEqual(constant(100))
+      expect(arm.invocations).toHaveLength(15)
+      expect(arm.invocations.every(({ roundNsPerOp }) => roundNsPerOp.length === 5)).toBe(true)
     }
     expect(compare(completeInput({ arms, unavailable: [] }), NO_EXCEPTIONS).pass).toBe(true)
 
@@ -336,20 +393,56 @@ describe('Decoder performance comparison', () => {
     const forFirst = calls.filter((call) => call.endsWith(first))
     expect(forFirst.map((call) => call.split(' ')[0])).toEqual([
       'OLD',
+      'OLD',
       'NEW',
       'NEW',
       'OLD',
       'OLD',
+      'OLD',
+      'OLD',
       'NEW',
       'NEW',
+      'OLD',
+      'OLD',
       'OLD',
       'OLD',
       'NEW',
     ])
-    expect(saved.size).toBe(ARMS.length * 5 * 2)
+    expect(saved.size).toBe(ARMS.length * 5 * 3)
+    expect(arms[0].invocations.slice(0, 6).map(({ pair, side }) => [pair, side])).toEqual([
+      [0, 'old'],
+      [0, 'baselineControl'],
+      [0, 'new'],
+      [1, 'new'],
+      [1, 'baselineControl'],
+      [1, 'old'],
+    ])
     expect(saved.get(path.join('raw', 'frame-decode-64b', '1-new.txt'))).toContain(
-      `$ ${first}\nexit 0\n--- stdout\nbanner\n{"available":1,"nsPerFrame":101}`
+      `$ ${first}\nexit 0\n--- stdout\nbanner\n{"available":1,"nsPerFrame":101,`
     )
+  })
+
+  it('collector reports a failed A/A invocation without changing the acceptance verdict', () => {
+    let oldCalls = 0
+    const { collector } = collect({
+      reply: (cwd, argv) => {
+        if (cwd === 'OLD' && ++oldCalls === 2) {
+          return { status: 1, stdout: '', stderr: 'diagnostic failed' }
+        }
+        return valueFor(cwd, argv)
+      },
+    })
+
+    const collected = collector.collect()
+
+    expect(collected.arms[0].baselineControlNsPerOp).toHaveLength(4)
+    expect(collected.arms[0].invocations[1]).toMatchObject({
+      pair: 0,
+      side: 'baselineControl',
+      error: expect.stringContaining('exit 1'),
+    })
+    expect(compare(completeInput(collected), NO_EXCEPTIONS).pass).toBe(true)
+    expect(runInput(completeInput(collected)).report).toContain('A/A baseline unavailable')
   })
 
   it('collector names an arm that neither tree has and leaves an arm one tree lacks incomplete', () => {

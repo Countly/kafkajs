@@ -10,12 +10,14 @@
  * `--run` extracts the baseline with `git archive` (a full-history checkout is required) into
  * `.tmp/decoder-comparison/baseline`, links this tree's `node_modules` into it, copies the
  * benchmark scripts the baseline predates over from this tree, runs every arm's benchmark from
- * each tree in alternating old/new order, writes every raw invocation under `--raw`, validates and
- * compares the medians, writes the summary to `--out` and removes the baseline tree again.
+ * each tree in alternating old/new order, interleaves a baseline A/A diagnostic, writes every raw
+ * invocation under `--raw`, validates and compares the medians, writes the summary to `--out` and
+ * removes the baseline tree again. A/A drift only warns; it never changes the acceptance verdict.
  * `--input` validates and compares an existing summary.
  *
  * The input is
- * `{ baselineSha, candidateSha, node, arms: [{ name, oldNsPerOp, newNsPerOp }], unavailable }`
+ * `{ baselineSha, candidateSha, node, arms: [{ name, oldNsPerOp, newNsPerOp,
+ * baselineControlNsPerOp?, invocations? }], unavailable }`
  * with at least 5 positive finite samples per side. Every known arm is either in `arms` or, when
  * it is not required, named in `unavailable` (the arms no tree has a codec for); an arm in neither
  * or in both, a required arm or an unknown name in `unavailable`, fails. A slowdown above 5%
@@ -36,7 +38,7 @@ const DEFAULT_RAW = path.join(WORK_DIR, 'raw')
 
 const SHA = /^[0-9a-f]{40}$/
 const MIN_SAMPLES = 5
-const PAIRS = 7
+const PAIRS = 8
 const MAX_SLOWDOWN_PERCENT = 5
 const INVOCATION_TIMEOUT_MS = 10 * 60 * 1000
 const USAGE =
@@ -71,6 +73,7 @@ const ARMS = [
     required: true,
     argv: ['npm', 'run', '--silent', 'bench:frame-decode', '--', '--shape', shape],
     metric: 'nsPerFrame',
+    overlay: 'scripts/benchmarks/frameDecode.js',
   })),
   ...['uncompressed', ...COMPRESSED_ARMS].map((arm) => ({
     name: `record-batch:${arm}`,
@@ -84,6 +87,7 @@ const ARMS = [
       arm,
     ],
     metric: 'nsPerOp',
+    overlay: 'scripts/benchmarks/recordBatchDecode.js',
   })),
   ...ARRAY_DECODE_ARMS.map((arm) => ({
     name: `array-decode:${arm}`,
@@ -235,6 +239,7 @@ const parseExceptions = (entries) => {
  * @property {number} newMedian nanoseconds per operation in the candidate
  * @property {number} slowdownPercent `(new / old - 1) * 100`; negative when faster
  * @property {'pass'|'exception'|'fail'} verdict
+ * @property {object|null} baselineControl A/A diagnostic, null when unavailable or incomplete
  */
 
 /**
@@ -245,6 +250,27 @@ const parseExceptions = (entries) => {
  *   cross-multiplication so that 105 against 100 is exactly 5%
  */
 const within = (oldMedian, newMedian, percent) => newMedian * 100 <= oldMedian * (100 + percent)
+
+/**
+ * Compares the acceptance baseline samples with extra invocations of that same tree. This is
+ * diagnostic only: absent or invalid control data must not affect acceptance validation.
+ * @param {object} arm the input row
+ * @param {number} oldMedian the acceptance baseline median
+ * @returns {{ oldMedian: number, controlMedian: number, driftPercent: number, unstable: boolean }|null}
+ */
+const baselineDiagnostic = (arm, oldMedian) => {
+  if (!validSamples(arm.baselineControlNsPerOp)) return null
+
+  const controlMedian = median(arm.baselineControlNsPerOp)
+  return {
+    oldMedian,
+    controlMedian,
+    driftPercent: (controlMedian / oldMedian - 1) * 100,
+    unstable:
+      !within(oldMedian, controlMedian, MAX_SLOWDOWN_PERCENT) ||
+      controlMedian * 100 < oldMedian * (100 - MAX_SLOWDOWN_PERCENT),
+  }
+}
 
 /**
  * Compares the medians of every arm and applies the 5% limit and any recorded exception.
@@ -276,6 +302,7 @@ const compare = (input, exceptions) => {
       newMedian,
       slowdownPercent: (newMedian / oldMedian - 1) * 100,
       verdict,
+      baselineControl: baselineDiagnostic(arm, oldMedian),
     })
   }
 
@@ -290,12 +317,21 @@ const compare = (input, exceptions) => {
  */
 const formatReport = ({ pass, problems, unavailable, arms }) =>
   [
-    ...arms.map(
-      (arm) =>
+    ...arms.flatMap((arm) => {
+      const diagnostic = arm.baselineControl
+      const drift = diagnostic
+        ? `${diagnostic.driftPercent >= 0 ? '+' : ''}${diagnostic.driftPercent.toFixed(2)}%`
+        : 'unavailable'
+      return [
         `${arm.verdict.toUpperCase().padEnd(9)}${arm.name.padEnd(28)}` +
-        `old ${arm.oldMedian.toFixed(1)} ns  new ${arm.newMedian.toFixed(1)} ns  ` +
-        `${arm.slowdownPercent >= 0 ? '+' : ''}${arm.slowdownPercent.toFixed(2)}%`
-    ),
+          `old ${arm.oldMedian.toFixed(1)} ns  new ${arm.newMedian.toFixed(1)} ns  ` +
+          `${arm.slowdownPercent >= 0 ? '+' : ''}${arm.slowdownPercent.toFixed(2)}%  ` +
+          `A/A baseline ${drift}`,
+        ...(diagnostic?.unstable
+          ? [`WARNING  ${arm.name}: baseline A/A drift exceeds 5% (${drift})`]
+          : []),
+      ]
+    }),
     ...unavailable.map((name) => `UNAVAILABLE ${name} (no such codec in either tree)`),
     ...problems.map((problem) => `PROBLEM  ${problem}`),
     pass ? 'decoder performance: PASS' : 'decoder performance: FAIL',
@@ -303,7 +339,9 @@ const formatReport = ({ pass, problems, unavailable, arms }) =>
 
 /**
  * Runs every arm in the baseline and candidate trees, alternating which goes first each round so
- * that machine drift lands on both sides, and keeps every raw invocation.
+ * that machine drift lands on both sides, and keeps every raw invocation. Each pair also runs
+ * one extra baseline invocation between the acceptance sides: old/control/new, then new/control/old.
+ * The A/A sides thus alternate too, reusing the acceptance baseline without doubling the workload.
  */
 class MeasurementCollector {
   /**
@@ -323,23 +361,41 @@ class MeasurementCollector {
   }
 
   /**
-   * @returns {{ arms: Array<{ name: string, oldNsPerOp: number[], newNsPerOp: number[] }>, unavailable: string[] }}
+   * @returns {{ arms: object[], unavailable: string[] }}
    *   the samples per arm; an arm whose codec is missing in both trees is named in `unavailable`
-   *   instead, and one missing in a single tree keeps fewer than the required samples there
-   * @throws {Error} when an invocation fails or prints no usable number
+   *   instead, and one missing in a single tree keeps fewer than the required samples there.
+   *   Each arm also holds baselineControlNsPerOp and every invocation's parsed JSON, including
+   *   internal roundNsPerOp timings. A failed diagnostic is recorded, never an acceptance failure.
+   * @throws {Error} when an acceptance invocation fails or prints no usable number
    */
   collect() {
-    const samples = new Map(ARMS.map((arm) => [arm.name, { old: [], new: [] }]))
+    const samples = new Map(
+      ARMS.map((arm) => [arm.name, { old: [], new: [], baselineControl: [], invocations: [] }])
+    )
     const missing = { old: new Set(), new: new Set() }
 
     for (let pair = 0; pair < this.pairs; pair++) {
-      const sides = pair % 2 === 0 ? ['old', 'new'] : ['new', 'old']
+      const sides =
+        pair % 2 === 0 ? ['old', 'baselineControl', 'new'] : ['new', 'baselineControl', 'old']
       for (const arm of ARMS) {
+        const sample = samples.get(arm.name)
         for (const side of sides) {
-          if (missing[side].has(arm.name)) continue
-          const value = this.measure(arm, side, pair)
-          if (value === null) missing[side].add(arm.name)
-          else samples.get(arm.name)[side].push(value)
+          const treeSide = side === 'baselineControl' ? 'old' : side
+          if (missing[treeSide].has(arm.name)) continue
+          let measurement
+          try {
+            measurement = this.measure(arm, side, pair)
+          } catch (error) {
+            if (side !== 'baselineControl') throw error
+            sample.invocations.push({ pair, side, error: error.message })
+            continue
+          }
+          sample.invocations.push({ ...measurement, pair, side })
+          if (measurement.available === 0) {
+            if (side !== 'baselineControl') missing[side].add(arm.name)
+          } else {
+            sample[side].push(measurement[arm.metric])
+          }
         }
       }
     }
@@ -351,19 +407,23 @@ class MeasurementCollector {
       name,
       oldNsPerOp: samples.get(name).old,
       newNsPerOp: samples.get(name).new,
+      baselineControlNsPerOp: samples.get(name).baselineControl,
+      invocations: samples.get(name).invocations,
     }))
     return { arms, unavailable }
   }
 
   /**
    * @param {Arm} arm
-   * @param {'old'|'new'} side
+   * @param {'old'|'new'|'baselineControl'} side the invocation label; baselineControl uses the old tree
    * @param {number} pair
-   * @returns {number|null} nanoseconds per operation, or null when the tree has no such codec
+   * @returns {object} the benchmark's parsed JSON, with its metric and internal round timings;
+   *   available is 0 when the tree has no such codec
    * @throws {Error} when the process fails or its last line is not JSON with a positive number
    */
   measure(arm, side, pair) {
-    const { status, stdout, stderr } = this.run(this.trees[side], arm.argv)
+    const treeSide = side === 'baselineControl' ? 'old' : side
+    const { status, stdout, stderr } = this.run(this.trees[treeSide], arm.argv)
     const file = path.join(this.rawDir, arm.name.replace(':', '-'), `${pair}-${side}.txt`)
     this.save(
       file,
@@ -381,13 +441,13 @@ class MeasurementCollector {
       throw new Error(`${arm.name} printed no JSON line in the ${side} tree; see ${file}`)
     }
     if (parsed.available === 0) {
-      return null
+      return parsed
     }
     if (!validSample(parsed[arm.metric])) {
       throw new Error(`${arm.name} reported no usable ${arm.metric} in the ${side} tree`)
     }
 
-    return parsed[arm.metric]
+    return parsed
   }
 }
 

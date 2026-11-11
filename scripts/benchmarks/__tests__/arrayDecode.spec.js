@@ -130,5 +130,9 @@ describe('Benchmarks > arrayDecode', () => {
       elements: 2000,
     })
     expect(JSON.parse(run.stdout).nsPerOp).toBeGreaterThan(0)
+    const { roundNsPerOp, nsPerOp } = JSON.parse(run.stdout)
+    expect(roundNsPerOp).toHaveLength(5)
+    expect(roundNsPerOp.every((value) => value > 0)).toBe(true)
+    expect(nsPerOp).toBe([...roundNsPerOp].sort((a, b) => a - b)[2])
   })
 })
