@@ -142,9 +142,18 @@ describe('telemetry fixed journals', () => {
     journal.push({ at: 1.125, text: 'λ' })
     const before = journal.values()
     const cursor = journal.cursor
+    const baseline = { journals: journal.journalState() }
     expect(() => journal.push({ at: 2 })).toThrow(/control.*overflow/)
     expect(journal.values()).toEqual(before)
     expect(journal.cursor).toBe(cursor)
+    expect(journal.journalState().overflow).toBe(true)
+    expect(
+      churn.JournalConstancy.violations({
+        baseline,
+        samples: [],
+        teardown: { journals: journal.journalState() },
+      })
+    ).toContain('journal overflow')
     const bytes = new churn.FixedJournal({ name: 'bytes', capacity: 2, bytes: 32 })
     expect(() => bytes.push('x'.repeat(100))).toThrow(/bytes.*overflow/)
     expect(bytes.length).toBe(0)
