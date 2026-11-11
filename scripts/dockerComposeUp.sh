@@ -1,6 +1,6 @@
 #!/bin/bash -e
 COMPOSE_FILE=${COMPOSE_FILE:="docker-compose.yml"}
-echo "Running compose file: ${COMPOSE_FILE} (KAFKA_VERSION=${KAFKA_VERSION:-4.3.1})"
+echo "Running compose file: ${COMPOSE_FILE} (KAFKA_VERSION=${KAFKA_VERSION:-4.4.0})"
 for attempt in 1 2 3; do
   if docker compose -f "${COMPOSE_FILE}" up --force-recreate -d; then
     break
