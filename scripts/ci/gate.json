@@ -99,6 +99,9 @@
       "needs": {},
       "evidence": [],
       "titles": [
+        "scripts/e2e/telemetry/__tests__/retainedOwnership.spec.js \u203a readSnapshot matches JSON parsing when analysing a real V8 heap snapshot",
+        "scripts/e2e/telemetry/__tests__/retainedOwnership.spec.js \u203a readSnapshot preserves escaped and non-ASCII strings while skipping other sections",
+        "scripts/e2e/telemetry/__tests__/retainedOwnership.spec.js \u203a readSnapshot rejects truncated or malformed snapshots with a clear error",
         "scripts/e2e/telemetry/__tests__/retainedCensus.spec.js \u203a owner census counts shared stores and retained product self bytes once",
         "scripts/e2e/telemetry/__tests__/retainedCensus.spec.js \u203a owner census reports released allocations and absolute unresolved additions and removals",
         "scripts/e2e/telemetry/__tests__/retainedCensus.spec.js \u203a live owner census keeps diagnostic flags and captures original M first last and closed only",
@@ -22285,6 +22288,9 @@
       "needs": {},
       "evidence": [],
       "titles": [
+        "scripts/e2e/telemetry/__tests__/retainedOwnership.spec.js \u203a readSnapshot matches JSON parsing when analysing a real V8 heap snapshot",
+        "scripts/e2e/telemetry/__tests__/retainedOwnership.spec.js \u203a readSnapshot preserves escaped and non-ASCII strings while skipping other sections",
+        "scripts/e2e/telemetry/__tests__/retainedOwnership.spec.js \u203a readSnapshot rejects truncated or malformed snapshots with a clear error",
         "scripts/soak/__tests__/telemetryJournals.spec.js \u203a telemetry journal calibration matches the unchanged slope and endpoint evaluator on flat and seeded virtual vectors",
         "scripts/soak/__tests__/telemetryJournals.spec.js \u203a telemetry journal calibration records actual admission and completion times and inventories every settled boundary",
         "scripts/soak/__tests__/telemetryJournals.spec.js \u203a telemetry journal calibration rejects incomplete or virtualized real-time calibration evidence",
