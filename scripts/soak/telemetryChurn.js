@@ -107,6 +107,7 @@ const MESSAGE_TYPES = Object.freeze({
     'ready',
     'phase',
     'stage-done',
+    'confirm-fenced',
     'decode',
     'result',
     'failure',
@@ -1753,7 +1754,18 @@ class ParentFixture {
       entries['interval.ms'] !== this.rotationEntries['interval.ms'] ||
       entries.match !== this.rotationEntries.match
     )
-      throw new Error('The subscription readback differs')
+      throw new Error(
+        `The subscription readback differs: ${JSON.stringify({
+          index,
+          expected: { metrics, ...this.rotationEntries },
+          observed: Object.fromEntries(
+            ['metrics', 'interval.ms', 'match'].map((name) => [
+              name,
+              entries[name] === undefined ? null : String(entries[name]).slice(0, 256),
+            ])
+          ),
+        })}`
+      )
     return { index, selection: metrics, setAt, readbackAt, readback: entries.metrics ?? '' }
   }
 
@@ -2409,6 +2421,7 @@ class TelemetryWorker {
     this.owed = new Set()
     this.coreN = 0
     this.sealing = null
+    this.confirmation = null
     this.timing = {
       phaseAt: null,
       goAt: null,
@@ -2657,17 +2670,47 @@ class TelemetryWorker {
   }
 
   /**
-   * After the parent confirmed its set and readback: swaps one custom identity, waits for the
-   * successful Get that proves the selection (written after this message was taken), and discharges
-   * the current normal Push proof this tick owes on its current subscribed socket.
-   * @param {{tick:number, index:number, selection:string}} command the stage command
+   * Captures and acknowledges the write fence before the parent may rotate the subscription.
+   * @param {{tick:number, index:number, selection:string}} command the pending transition
+   * @returns {void} the receipt contains only scalar observer and clock facts
+   * @throws {Error} for overlapping fences
+   */
+  fenceConfirmation(command) {
+    if (this.confirmation) throw new Error('A confirmation fence is already pending')
+    const segment = this.segments.current()
+    this.confirmation = {
+      tick: command.tick,
+      index: command.index,
+      selection: command.selection,
+      segment: segment.id,
+      receivedAt: this.clock.now(),
+      after: segment.observer.checkpoint(),
+    }
+    this.send({ type: 'confirm-fenced', ...this.confirmation })
+  }
+
+  /**
+   * After the parent's successful readback, swaps one custom identity and proves the selection
+   * with a Get written after the acknowledged fence, including one already received before this
+   * release command. Discharges every owed current normal Push under the unchanged bounds.
+   * @param {{tick:number, index:number, selection:string}} command the stage release
    * @returns {Promise<object>} the facts of the stage
-   * @throws {Error} when no Get proves the selection or the owed Push never arrives
+   * @throws {Error} for a missing or mismatched fence, no matching Get or no owed Push
    */
   async confirm(command) {
-    const receivedAt = this.clock.now()
+    const fence = this.confirmation
     const segment = this.segments.current()
-    const after = segment.observer.checkpoint()
+    if (
+      !fence ||
+      fence.tick !== command.tick ||
+      fence.index !== command.index ||
+      fence.selection !== command.selection ||
+      fence.segment !== segment.id
+    )
+      throw new Error('The confirmation has no matching pre-rotation fence')
+    this.confirmation = null
+    const { receivedAt, after } = fence
+    const releasedAt = this.clock.now()
     const replacement = this.registry.replace(command.tick)
     const list = command.selection === '' ? [] : [command.selection]
     const get = await this.find('selection Get', STAGE_MS.confirm - 2000, () =>
@@ -2682,6 +2725,8 @@ class TelemetryWorker {
       selection: command.selection,
       segment: segment.id,
       receivedAt,
+      releasedAt,
+      after,
       get: get.requestKey,
       subscriptionId: get.response.subscriptionId,
       replacement,
@@ -2734,7 +2779,12 @@ class TelemetryWorker {
     const tick = this.schedule.ticks[command.tick]
     if (!tick || !tick.actions.map((a) => STAGE_OF[a]).includes(command.stage))
       throw new Error(`A stage the fixed table does not hold: ${command.tick}/${command.stage}`)
-    const startedAt = this.clock.now()
+    if (command.type === 'confirm-fence') {
+      if (command.stage !== 'confirm') throw new Error('Only confirmation stages have a fence')
+      this.fenceConfirmation(command)
+      return
+    }
+    const startedAt = command.stage === 'confirm' ? this.confirmation?.receivedAt : this.clock.now()
     if (command.stage === 'lifecycle') await this.reopen(command)
     else if (command.stage === 'retire') await this.retire(command)
     else await this.confirm(command)
@@ -2765,7 +2815,9 @@ class TelemetryWorker {
       this.timing.goAt = this.clock.now()
       await this.begin()
       for (;;) {
-        const command = await this.inbox.take((m) => ['stage', 'corpus', 'finish'].includes(m.type))
+        const command = await this.inbox.take((m) =>
+          ['confirm-fence', 'stage', 'corpus', 'finish'].includes(m.type)
+        )
         if (command.type === 'finish') break
         await this.handle(command)
       }
@@ -3410,8 +3462,8 @@ class TelemetryChurn {
   /**
    * The fixed tick catalogue. At every tick the stages run in order and are joined across all four
    * workers: close and immediate connect, then telemetry retirement, then the parent's set and
-   * readback followed by every worker's selection confirmation. A tick that is more than the late
-   * bound behind is a missed tick and is never caught up.
+   * readback between the joined worker fences and their released selection confirmations. A tick
+   * more than the late bound behind is a missed tick and is never caught up.
    * @param {number} epoch the monotonic reading at which the schedule began
    * @param {TelemetrySchedule} schedule the fixed catalogue @returns {Promise<void>} after the last tick
    * @throws {Error} a missed measured tick, a stage over its bound or a failed set
@@ -3436,31 +3488,47 @@ class TelemetryChurn {
       this.tickStarts.push({ tick: tick.number, at: tick.at, beganAt })
       for (const stage of schedule.stages(tick)) {
         this.guard()
+        const sentAt = this.clock.now()
+        const remaining = () => Math.max(0, STAGE_MS[stage] - (this.clock.now() - sentAt))
+        const command = {
+          tick: tick.number,
+          stage,
+          index: tick.index,
+          selection: schedule.selection(tick.index),
+        }
+        let fences = null
         if (stage === 'confirm') {
+          for (const kind of KINDS) this.processes.send(kind, { type: 'confirm-fence', ...command })
+          fences = await Promise.race([
+            Promise.all(
+              KINDS.map((kind) =>
+                this.processes.until(
+                  kind,
+                  (m) => m.type === 'confirm-fenced' && m.tick === tick.number,
+                  remaining(),
+                  `confirmation fence of tick ${tick.number}`
+                )
+              )
+            ),
+            this.abort,
+          ])
           const requestedAt = this.clock.now()
           const rotation = await within(
             this.own(this.fixture.rotate(tick.index, schedule.selection(tick.index))),
-            STAGE_MS.confirm - 1000,
+            Math.min(STAGE_MS.confirm - 1000, remaining()),
             'The subscription set and readback'
           )
           this.rotations.push({ tick: tick.number, requestedAt, ...rotation })
         }
-        const sentAt = this.clock.now()
-        for (const kind of KINDS)
-          this.processes.send(kind, {
-            type: 'stage',
-            tick: tick.number,
-            stage,
-            index: tick.index,
-            selection: schedule.selection(tick.index),
-          })
+        const releasedAt = this.clock.now()
+        for (const kind of KINDS) this.processes.send(kind, { type: 'stage', ...command })
         const done = await Promise.race([
           Promise.all(
             KINDS.map((kind) =>
               this.processes.until(
                 kind,
                 (m) => m.type === 'stage-done' && m.tick === tick.number && m.stage === stage,
-                STAGE_MS[stage],
+                remaining(),
                 `${stage} of tick ${tick.number}`
               )
             )
@@ -3473,6 +3541,15 @@ class TelemetryChurn {
             stage,
             kind: KINDS[position],
             sentAt,
+            ...(fences && {
+              releasedAt,
+              fence: {
+                parentAt: fences[position].parentAt,
+                receivedAt: fences[position].receivedAt,
+                after: fences[position].after,
+                segment: fences[position].segment,
+              },
+            }),
             parentAt: message.parentAt,
             workerStartedAt: message.startedAt,
             workerDoneAt: message.doneAt,

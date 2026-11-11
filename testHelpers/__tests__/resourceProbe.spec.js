@@ -2420,7 +2420,13 @@ describe('telemetry timeout owner diagnostics', () => {
       clearTimeout(timer)
       await new Promise((resolve) => setImmediate(resolve))
       await new Promise((resolve) => setImmediate(resolve))
-      expect(diagnostics.read()).toMatchObject({ live: [], created: 1, destroyed: 1, dropped: 0 })
+      expect(diagnostics.read()).toMatchObject({
+        live: [],
+        created: 1,
+        destroyed: 1,
+        lastDestroyedAt: expect.any(Number),
+        dropped: 0,
+      })
       diagnostics.stop()
       expect(roles.read()).toEqual(before)
       const later = setTimeout(() => {}, 60000)

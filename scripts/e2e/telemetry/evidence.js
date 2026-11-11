@@ -3159,7 +3159,7 @@ const verifyChurnRetirement = ({ claim, transcript, uuid }) => {
 
 /**
  * Re-derives one subscription transition: the parent's set and readback, the successful Get that
- * proves exactly that selection (written after the worker took the confirmation), a subscription
+ * proves exactly that selection (written after the acknowledged pre-rotation fence), a subscription
  * that differs from the last one, and the current Push proof every lifecycle change at the tick owes.
  * @param {object} input `claim`, `tick`, the parent's `rotation`, the segment `transcript`, the
  *   worker `uuid`, the `selection` the table requires and the `previous` subscription ID
@@ -3185,6 +3185,9 @@ const verifyChurnTransition = ({
   assert(
     TelemetryProofs.gets(transcript.records, uuid).some((g) => g.requestKey === get.requestKey) &&
       get.writeAt >= claim.receivedAt &&
+      Number.isSafeInteger(claim.after) &&
+      claim.after >= 0 &&
+      get.index > claim.after &&
       get.response.pushIntervalMs === 1000 &&
       JSON.stringify(get.response.requestedMetrics) === JSON.stringify(list),
     'No successful Get proves the selection'
@@ -3261,8 +3264,8 @@ const verifyChurnLifecycles = ({ names, transcripts, uuid }) => {
  * Re-derives the coordinated schedule from the parent's raw stage receipts and every worker's own
  * stage journal, never from counts: the exact `(tick, stage, kind)` catalogue once and in order,
  * each tick begun at or after its due time and within the late bound, every stage sent after the
- * previous stage's receipts from all four workers, the set and readback inside the barrier before
- * the confirmation, every receipt within its deadline, one constant offset mapping each worker's
+ * previous stage's receipts from all four workers, the set and readback after every worker's fence
+ * acknowledgement and before its release, every receipt within its deadline, one offset mapping each worker's
  * monotonic clock onto the parent's, each worker's measurement interval on that mapping, and every
  * claim time inside its own stage. The measured action counts are derived from these joined rows.
  * @param {object} input `archive` (stages, rotations, tickStarts, missed and worker facts) and the
@@ -3313,11 +3316,16 @@ const verifyChurnStages = ({ archive, timeline }) => {
       if (stage === 'confirm') {
         const rotation = archive.rotations.find((r) => r.tick === tick.number)
         assert.equal(rotation.index, tick.index, 'A set names another transition')
+        for (const row of rows)
+          assert(
+            row.fence && row.fence.parentAt >= sentAt && row.fence.parentAt <= rotation.requestedAt,
+            'The rotation preceded a worker confirmation fence'
+          )
         assert(
           rotation.requestedAt >= barrier &&
             rotation.setAt >= rotation.requestedAt &&
             rotation.readbackAt >= rotation.setAt &&
-            sentAt >= rotation.readbackAt,
+            rows.every((r) => r.releasedAt >= rotation.readbackAt && r.releasedAt <= r.parentAt),
           'The set and readback are outside their stage barrier'
         )
       }
@@ -3346,6 +3354,12 @@ const verifyChurnStages = ({ archive, timeline }) => {
       assert(row.workerStartedAt <= row.workerDoneAt, 'A worker stage ends before it starts')
       lo = Math.max(lo, row.sentAt - row.workerStartedAt)
       hi = Math.min(hi, row.parentAt - row.workerDoneAt)
+      if (row.stage === 'confirm') {
+        const claim = facts.claims.transitions.find((c) => c.tick === row.tick)
+        assert(claim, 'A confirmation receipt has no transition claim')
+        lo = Math.max(lo, row.releasedAt - claim.releasedAt)
+        hi = Math.min(hi, row.fence.parentAt - claim.receivedAt)
+      }
     }
     const { timing } = facts
     lo = Math.max(lo, timeline.epochAt - timing.goAt, timeline.boundaryAt - timing.boundaryAt)
@@ -3367,7 +3381,28 @@ const verifyChurnStages = ({ archive, timeline }) => {
     }
     for (const c of facts.claims.reopens) within(c.tick, 'lifecycle', c.observedAt, c.closedAt)
     for (const c of facts.claims.retirements) within(c.tick, 'retire', c.declaredAt, c.faultedAt)
-    for (const c of facts.claims.transitions) within(c.tick, 'confirm', c.receivedAt)
+    for (const c of facts.claims.transitions) {
+      within(c.tick, 'confirm', c.receivedAt, c.releasedAt)
+      const row = rows.find((r) => r.tick === c.tick && r.stage === 'confirm')
+      assert.deepEqual(
+        { receivedAt: c.receivedAt, after: c.after, segment: c.segment },
+        {
+          receivedAt: row.fence.receivedAt,
+          after: row.fence.after,
+          segment: row.fence.segment,
+        },
+        'The transition differs from its acknowledged fence'
+      )
+      assert.equal(
+        c.receivedAt,
+        row.workerStartedAt,
+        'The confirmation stage did not start at its fence'
+      )
+      assert(
+        c.receivedAt + lo <= row.fence.parentAt && c.releasedAt + hi >= row.releasedAt,
+        'The worker confirmation fence or release cannot map onto the parent epoch'
+      )
+    }
     const counts = { subscription: 0, retire: 0, reopen: 0 }
     for (const row of rows)
       if (table.measured(table.ticks[row.tick])) counts[CHURN_NAMES[row.stage]] += 1

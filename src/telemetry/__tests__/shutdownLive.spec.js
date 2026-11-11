@@ -21,6 +21,7 @@ const { cacheRetirement, connectionIdentity } = require('../../../scripts/e2e/te
 const { DecoderGate, withTelemetryResource } = require('../../../testHelpers/telemetryFixtures')
 const { SCHEDULES, TelemetrySegments } = require('../../../testHelpers/telemetrySegments')
 const { createResourceProbe, ResourceRoles } = require('../../../testHelpers/resourceProbe')
+const { TimeoutDiagnostics } = require('../../../testHelpers/timeoutDiagnostics')
 const { createChaosSocketFactory, FrameFilter } = require('../../../testHelpers/chaosSocket')
 const { assertRequestLogConfig, requestTraceArgs } = require('./fixtures/requestTrace')
 const {
@@ -455,6 +456,7 @@ class ReopenCase {
     // The process's own stdio handles exist before the case, never as a case-time survivor.
     if (!process.stdout || !process.stderr) throw new Error('The case needs process stdio')
     this.roles = new ResourceRoles({ roles: ['case', 'quiet'] }).start()
+    this.timeouts = new TimeoutDiagnostics().start()
     this.probe = createResourceProbe({
       activeResources: true,
       resources: this.roles,
@@ -884,7 +886,7 @@ class ReopenCase {
    */
   async quiet(baseline) {
     const final = await this.settledResources()
-    this.results.resources = { baseline, final }
+    this.results.resources = { baseline, final, timeoutDiagnostics: this.timeouts.read() }
     this.results.decoderOccupancy = this.gate.occupancy()
   }
 
@@ -1078,7 +1080,10 @@ live(
         stem: attempt.record.run.stem,
         attempt,
       })
-      cleanup.defer(() => scenario.roles.stop())
+      cleanup.defer(() => {
+        scenario.timeouts.stop()
+        scenario.roles.stop()
+      })
       const baseline = await scenario.settledResources()
       cleanup.defer(() => scenario.quiet(baseline))
       cleanup.defer(() => scenario.roles.run('case', () => scenario.close()))

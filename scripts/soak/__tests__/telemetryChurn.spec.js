@@ -2020,6 +2020,7 @@ describe('telemetry profile worker', () => {
       },
     })
     worker.owed.add('reopen')
+    worker.fenceConfirmation({ tick: 1, index: 6, selection: 'com.example.' })
     const claim = await worker.confirm({ tick: 1, index: 6, selection: 'com.example.' })
     expect(claim).toMatchObject({
       tick: 1,
@@ -2090,6 +2091,7 @@ describe('telemetry profile worker', () => {
           )
       },
     })
+    worker.fenceConfirmation({ tick: 1, index: 2, selection: '' })
     const claim = await worker.confirm({ tick: 1, index: 2, selection: '' })
     expect(claim).toMatchObject({ selection: '', get: 'r2', proof: null })
     worker.owed.add('retire')
@@ -2099,6 +2101,7 @@ describe('telemetry profile worker', () => {
       sleep: async () => {},
     })
     none.worker.owed.add('retire')
+    none.worker.fenceConfirmation({ tick: 1, index: 2, selection: '' })
     await expect(none.worker.confirm({ tick: 1, index: 2, selection: '' })).rejects.toThrow(
       'no selection Get'
     )
@@ -2261,7 +2264,19 @@ describe('telemetry profile parent', () => {
       send: jest.fn((kind, message) => sent.push({ kind, ...message, at: clock.now() })),
       message: jest.fn(async (kind, type) => ({ type, kind, parentAt: clock.now() })),
       until: jest.fn(async (kind, match) => {
-        const last = sent.filter((m) => m.kind === kind && m.type === 'stage').at(-1)
+        const last = sent
+          .filter((m) => m.kind === kind && ['stage', 'confirm-fence'].includes(m.type))
+          .at(-1)
+        if (last.type === 'confirm-fence')
+          return {
+            type: 'confirm-fenced',
+            tick: last.tick,
+            kind,
+            receivedAt: 1,
+            after: 0,
+            segment: `${kind}-lc-1`,
+            parentAt: clock.now(),
+          }
         return {
           type: 'stage-done',
           kind,
@@ -2367,6 +2382,22 @@ describe('telemetry profile parent', () => {
 
   test('joins all confirmation fences before rotating the subscription', async () => {
     const { churn, fixture, processes, clock } = make()
+    let releaseFence
+    let fenceRequested
+    const held = new Promise((resolve) => (releaseFence = resolve))
+    const requested = new Promise((resolve) => (fenceRequested = resolve))
+    const original = processes.until
+    let heldOnce = false
+    processes.until = jest.fn(async (...args) => {
+      const [kind] = args
+      const last = processes.sent.filter((m) => m.kind === kind).at(-1)
+      if (!heldOnce && kind === 'admin' && last.type === 'confirm-fence') {
+        heldOnce = true
+        fenceRequested()
+        await held
+      }
+      return original(...args)
+    })
     fixture.rotate.mockImplementation(async (index, selection) => {
       const fences = processes.sent.filter((m) => m.type === 'confirm-fence')
       expect(fences.slice(-KINDS.length).map((m) => m.kind)).toEqual([...KINDS])
@@ -2375,7 +2406,14 @@ describe('telemetry profile parent', () => {
       ])
       return { index, selection, setAt: clock.now(), readbackAt: clock.now(), readback: selection }
     })
-    await churn.ticks(clock.now(), new TelemetrySchedule({ warmupMs: 60000, measureMs: 300000 }))
+    const ticking = churn.ticks(
+      clock.now(),
+      new TelemetrySchedule({ warmupMs: 60000, measureMs: 300000 })
+    )
+    await Promise.race([requested, ticking])
+    expect(fixture.rotate).not.toHaveBeenCalled()
+    releaseFence()
+    await ticking
     expect(processes.sent.filter((m) => m.type === 'confirm-fence')).toHaveLength(35 * KINDS.length)
   })
 
@@ -2762,6 +2800,8 @@ describe('telemetry churn verification of one worker', () => {
         selection: 'com.example.',
         segment: 's',
         receivedAt: 50,
+        releasedAt: 65,
+        after: 1,
         get: 'r2',
         subscriptionId: 8,
         proof: { socketId: 3, get: 'r1', push: 'r3', owedBy: ['reopen'] },
@@ -3279,26 +3319,36 @@ describe('telemetry churn coordinated stage replay', () => {
       t = Math.max(t, EPOCH + tick.at)
       tickStarts.push({ tick: tick.number, at: tick.at, beganAt: t })
       for (const stage of table.stages(tick)) {
+        const sentAt = t
+        let releasedAt
         if (stage === 'confirm') {
           rotations.push({
             tick: tick.number,
             index: tick.index,
-            requestedAt: t,
-            setAt: t + 1,
-            readbackAt: t + 2,
+            requestedAt: t + 3,
+            setAt: t + 4,
+            readbackAt: t + 5,
           })
-          t += 3
+          releasedAt = t + 6
         }
-        const sentAt = t
         for (const kind of KINDS) {
           const startedAt = sentAt + 1 - OFFSET[kind]
-          const doneAt = sentAt + 5 - OFFSET[kind]
+          const doneAt = sentAt + 8 - OFFSET[kind]
           stages.push({
             tick: tick.number,
             stage,
             kind,
             sentAt,
-            parentAt: sentAt + 6,
+            ...(stage === 'confirm' && {
+              releasedAt,
+              fence: {
+                parentAt: sentAt + 2,
+                receivedAt: startedAt,
+                after: 1,
+                segment: `${kind}-lc-1`,
+              },
+            }),
+            parentAt: sentAt + 9,
             workerStartedAt: startedAt,
             workerDoneAt: doneAt,
           })
@@ -3309,9 +3359,15 @@ describe('telemetry churn coordinated stage replay', () => {
           if (stage === 'retire')
             claims.retirements.push({ tick: tick.number, declaredAt: startedAt, faultedAt: doneAt })
           if (stage === 'confirm')
-            claims.transitions.push({ tick: tick.number, receivedAt: startedAt })
+            claims.transitions.push({
+              tick: tick.number,
+              receivedAt: startedAt,
+              releasedAt: releasedAt + 1 - OFFSET[kind],
+              after: 1,
+              segment: `${kind}-lc-1`,
+            })
         }
-        t = sentAt + 6
+        t = sentAt + 9
       }
     }
     const boundaryAt = EPOCH + 360000
@@ -3402,7 +3458,7 @@ describe('telemetry churn coordinated stage replay', () => {
     ],
     [
       'a set outside its barrier',
-      (a) => (a.rotations[2].requestedAt -= 10),
+      (a) => (a.rotations[2].setAt = a.rotations[2].requestedAt - 1),
       'The set and readback are outside their stage barrier',
     ],
     [
