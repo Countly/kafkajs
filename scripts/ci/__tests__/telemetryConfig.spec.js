@@ -182,7 +182,7 @@ describe('telemetry lane configuration', () => {
           'f624d0d3b774048ce50c21d418fe61429384a37e35fbc11d61170e2ea8e6cb9c'
         )
         expect(sha256(client)).toBe(
-          '1145746dfeadc7d315e42b1c9d3b3468d819929324cc7701cbddbb423f66b580'
+          '8c9254fd4e929ce95dd6b8d8cfbca8513f8ce8fe37d19d596421e4fa3e7736c3'
         )
         for (const script of ['build.sh', 'test-reporter-order.sh']) {
           const text = read('scripts/e2e/telemetry/' + script)
@@ -222,12 +222,15 @@ describe('telemetry lane configuration', () => {
     const source = 'scripts/e2e/telemetry/legacy/JavaTelemetryClient.java'
     expect(sha256(source)).toBe('27e3fb34c247f514a0e07a07e85448e7c1bd6bc27eaa3fe301af04721f01eab3')
     const manifest = JSON.parse(read(FIXTURES + 'manifest.json'))
-    expect(sha256(source)).toBe(manifest.scripts['JavaTelemetryClient.java'])
+    expect(sha256(source)).toBe(manifest.scripts['legacy/JavaTelemetryClient.java'])
+    expect(sha256('scripts/e2e/telemetry/JavaTelemetryClient.java')).toBe(
+      manifest.scripts['JavaTelemetryClient.java']
+    )
     const amendment = manifest.amendments.find((entry) => entry.id === 'app-info-parser-4.4.0')
     expect(amendment.javaClientBuilds).toEqual({
       '4.4.0': {
         source: 'JavaTelemetryClient.java',
-        sha256: '1145746dfeadc7d315e42b1c9d3b3468d819929324cc7701cbddbb423f66b580',
+        sha256: '8c9254fd4e929ce95dd6b8d8cfbca8513f8ce8fe37d19d596421e4fa3e7736c3',
         release: 21,
       },
       '4.3.1': {
@@ -257,7 +260,7 @@ fi`)
   })
 
   test.each([
-    ['4.4.0', '4837c77e71fd3e98a9e69b1bd11642dad1b367540caecc5ebf5613ce80c88888'],
+    ['4.4.0', 'f84cbb66d46b3f20257daaa23f14783b636931fb5e228abcc1735241463cf6b4'],
     ['4.3.1', '27e3fb34c247f514a0e07a07e85448e7c1bd6bc27eaa3fe301af04721f01eab3'],
     ['4.2.2', '27e3fb34c247f514a0e07a07e85448e7c1bd6bc27eaa3fe301af04721f01eab3'],
   ])(
@@ -295,7 +298,7 @@ fi`)
             )
           )
         expect(sha256('scripts/e2e/telemetry/JavaTelemetryClient.java')).toBe(
-          '1145746dfeadc7d315e42b1c9d3b3468d819929324cc7701cbddbb423f66b580'
+          '8c9254fd4e929ce95dd6b8d8cfbca8513f8ce8fe37d19d596421e4fa3e7736c3'
         )
         expect(sha256('scripts/e2e/telemetry/CountingTelemetryReporter.java')).toBe(
           'f624d0d3b774048ce50c21d418fe61429384a37e35fbc11d61170e2ea8e6cb9c'

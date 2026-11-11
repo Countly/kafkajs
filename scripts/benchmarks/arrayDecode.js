@@ -41,7 +41,8 @@ const DEFAULT_ITERATIONS = 300
 const WARMUP = 50
 const ROUNDS = 5
 
-const USAGE = 'usage: node scripts/benchmarks/arrayDecode.js --arm <name> [--iterations <n>]'
+const USAGE =
+  'usage: node scripts/benchmarks/arrayDecode.js --arm <name> [--iterations <n>] [--work-multiplier <k>]'
 
 /** @param {number} length @returns {number[]} 0 to length - 1 */
 const range = (length) => Array.from({ length }, (_, n) => n)
@@ -211,7 +212,7 @@ const ARMS = {
 
 /**
  * @param {string[]} argv
- * @returns {{ arm: string, iterations: number }}
+ * @returns {{ arm: string, iterations: number, workMultiplier?: number }}
  * @throws {Error} the usage line for any argument it does not accept
  */
 const parseArgs = (argv) => {
@@ -226,6 +227,12 @@ const parseArgs = (argv) => {
       Number(value) >= ROUNDS
     ) {
       options.iterations = Number(value)
+    } else if (
+      flag === '--work-multiplier' &&
+      Number.isSafeInteger(Number(value)) &&
+      Number(value) > 0
+    ) {
+      options.workMultiplier = Number(value)
     } else {
       throw new Error(USAGE)
     }
@@ -260,18 +267,22 @@ const prepare = async (name) => {
 
 /**
  * Decodes the response `iterations` times (after an untimed warmup), split into equal rounds, and
- * reports the median round so a single scheduling hiccup does not set the result.
+ * reports the median round so a single scheduling hiccup does not set the result. Repetitions
+ * increase operation count within each round while preserving nanoseconds per decode.
  * @param {Buffer} raw
  * @param {ArrayArm} arm
  * @param {number} iterations timed iterations to run
+ * @param {number} [workMultiplier] repetitions per operation, including warmup
+ * @throws {Error} when the multiplier is not a positive integer
  * @returns {Promise<{ nsPerOp: number, roundNsPerOp: number[], opsPerSecond: number }>}
  */
-const run = async (raw, { decode }, iterations) => {
-  for (let i = 0; i < WARMUP; i++) {
+const run = async (raw, { decode }, iterations, workMultiplier = 1) => {
+  if (!Number.isSafeInteger(workMultiplier) || workMultiplier < 1) throw new Error(USAGE)
+  for (let i = 0; i < WARMUP * workMultiplier; i++) {
     await decode(raw, OPTIONS)
   }
 
-  const perRound = Math.floor(iterations / ROUNDS)
+  const perRound = Math.floor(iterations / ROUNDS) * workMultiplier
   const roundNsPerOp = []
   for (let round = 0; round < ROUNDS; round++) {
     const started = process.hrtime.bigint()
@@ -287,14 +298,15 @@ const run = async (raw, { decode }, iterations) => {
 
 if (require.main === module) {
   ;(async () => {
-    const { arm: name, iterations } = parseArgs(process.argv.slice(2))
+    const { arm: name, iterations, workMultiplier = 1 } = parseArgs(process.argv.slice(2))
     const { raw, arm } = await prepare(name)
-    const { nsPerOp, roundNsPerOp, opsPerSecond } = await run(raw, arm, iterations)
+    const { nsPerOp, roundNsPerOp, opsPerSecond } = await run(raw, arm, iterations, workMultiplier)
     console.log(
       JSON.stringify({
         available: 1,
         arm: name,
         iterations,
+        workMultiplier,
         nsPerOp,
         roundNsPerOp,
         opsPerSecond,
@@ -307,4 +319,4 @@ if (require.main === module) {
   })
 }
 
-module.exports = { ARMS, OPTIONS, parseArgs, prepare }
+module.exports = { ARMS, OPTIONS, parseArgs, prepare, run }

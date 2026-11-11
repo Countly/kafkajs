@@ -322,6 +322,8 @@ module.exports = class Decoder {
 
   /**
    * INT32-counted ARRAY; a count of -1 reads as an empty array.
+   * Reserves storage only after count and byte validation, at most one slot per remaining
+   * byte. An element error throws without returning a partial array.
    * @param {(decoder: Decoder) => *} reader reads one element
    * @returns {Array}
    * @throws {KafkaJSPartialMessageError} when the count is above the limit or the bytes are short
@@ -335,9 +337,9 @@ module.exports = class Decoder {
 
     this.assertCount(length, 'readArray')
     this.ensureReadable(length, 'readArray')
-    const array = []
+    const array = new Array(length)
     for (let i = 0; i < length; i++) {
-      array.push(reader(this))
+      array[i] = reader(this)
     }
 
     return array
@@ -371,7 +373,8 @@ module.exports = class Decoder {
   /**
    * COMPACT_ARRAY: an unsigned varint holding the count + 1. According to the protocol type
    * documentation: https://kafka.apache.org/protocol#protocol_types, a compact array with length
-   * zero is a null array. An array with length 1 is an empty array.
+   * zero is a null array. An array with length 1 is an empty array and needs no count or byte check.
+   * Reserves storage only after count and byte validation; an element error returns no partial array.
    * @param {(decoder: Decoder) => *} reader reads one element
    * @returns {Array|null} null for the null array
    * @throws {KafkaJSPartialMessageError} when the count is above the limit or the bytes are short
@@ -383,12 +386,16 @@ module.exports = class Decoder {
       return null
     }
 
+    if (length === 1) {
+      return []
+    }
+
     const count = length - 1
     this.assertCount(count, 'readUVarIntArray')
     this.ensureReadable(count, 'readUVarIntArray')
-    const array = []
+    const array = new Array(count)
     for (let i = 0; i < count; i++) {
-      array.push(reader(this))
+      array[i] = reader(this)
     }
 
     return array
@@ -396,6 +403,7 @@ module.exports = class Decoder {
 
   /**
    * `readArray` with each element read through an async reader, awaited one after another.
+   * Reserves storage only after count and byte validation; rejects without publishing a partial array.
    * @param {(decoder: Decoder) => Promise<*>|*} reader reads one element
    * @returns {Promise<Array>}
    * @throws {KafkaJSPartialMessageError} when the count is above the limit or the bytes are short
@@ -409,7 +417,7 @@ module.exports = class Decoder {
 
     this.assertCount(length, 'readArrayAsync')
     this.ensureReadable(length, 'readArrayAsync')
-    const array = []
+    const array = new Array(length)
     for (let i = 0; i < length; i++) {
       array[i] = await reader(this)
     }
@@ -421,6 +429,7 @@ module.exports = class Decoder {
    * `readUVarIntArray`'s compact-array framing (a UVarInt length, 0 meaning null), with each
    * element read through an async reader. Used where an element decode itself awaits, such as a
    * Fetch v12+ partition's record batch.
+   * Reserves storage only after count and byte validation; rejects without publishing a partial array.
    * @param {(decoder: Decoder) => Promise<*>} reader
    * @returns {Promise<Array|null>}
    * @throws {KafkaJSPartialMessageError} when the count is above the limit or the bytes are short
@@ -435,7 +444,7 @@ module.exports = class Decoder {
     const count = length - 1
     this.assertCount(count, 'readUVarIntArrayAsync')
     this.ensureReadable(count, 'readUVarIntArrayAsync')
-    const array = []
+    const array = new Array(count)
     for (let i = 0; i < count; i++) {
       array[i] = await reader(this)
     }

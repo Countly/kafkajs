@@ -1313,6 +1313,14 @@ now logged.
 
 Wire and connection behavior: negotiated versions, version floors, authentication and rebootstrap.
 
+- **Oversized arrays and tagged sections in responses are rejected.** A protocol response that
+  declares more than 1,000,000 array entries or more than 10,000 tagged fields now fails with a
+  non-retriable `KafkaJSPartialMessageError` before anything is allocated, matching the limits of the
+  Kafka 4.4 Java client. Record batches are not affected: record counts and record headers stay
+  bounded by the bytes received and by `maxDecompressedBatchBytes`, so a valid record with more
+  than 1,000,000 headers still decodes. *What to do:* nothing against a correct broker; such a
+  response only comes from a faulty or hostile peer.
+
 - **Request versions below the Kafka 4.0 floors are gone.** The client no longer implements Produce
   v0–2, Fetch v0–3, ListOffsets v0, OffsetCommit v0–1, CreateTopics v0–1, DeleteTopics v0,
   DescribeAcls/CreateAcls/DeleteAcls v0 and DescribeConfigs v0 (KIP-896, KIP-724). A Kafka 4.x

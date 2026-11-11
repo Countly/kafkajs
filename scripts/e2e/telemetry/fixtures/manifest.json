@@ -390,7 +390,7 @@
   },
   "scripts": {
     "CountingTelemetryReporter.java": "f624d0d3b774048ce50c21d418fe61429384a37e35fbc11d61170e2ea8e6cb9c",
-    "JavaTelemetryClient.java": "27e3fb34c247f514a0e07a07e85448e7c1bd6bc27eaa3fe301af04721f01eab3",
+    "JavaTelemetryClient.java": "8c9254fd4e929ce95dd6b8d8cfbca8513f8ce8fe37d19d596421e4fa3e7736c3",
     "OtlpGoldenVectors.java": "464246d43489c545218e3204aecd89ce193ba9c07def5eb58d346dac53edaa73",
     "base-ports.override.yml": "945b4b163977dbcdfc05301865fb2771aef8cb1ec40795aed1fff0a951276429",
     "build.sh": "d3cedd6e4ae96948831c881bc8c7ab74c4f91ae8ef79a54111d1327b89c938c1",
@@ -460,7 +460,7 @@
       "javaClientBuilds": {
         "4.4.0": {
           "source": "JavaTelemetryClient.java",
-          "sha256": "1145746dfeadc7d315e42b1c9d3b3468d819929324cc7701cbddbb423f66b580",
+          "sha256": "8c9254fd4e929ce95dd6b8d8cfbca8513f8ce8fe37d19d596421e4fa3e7736c3",
           "release": 21
         },
         "4.3.1": {
@@ -483,7 +483,7 @@
       "buildSha256Before": "aaeca680bcbbf59bb020cb9e5d83b60ee27ebcaa011ed65be3f06234c03af367",
       "buildSha256After": "d3cedd6e4ae96948831c881bc8c7ab74c4f91ae8ef79a54111d1327b89c938c1",
       "preparedClientSha256": {
-        "4.4.0": "4837c77e71fd3e98a9e69b1bd11642dad1b367540caecc5ebf5613ce80c88888",
+        "4.4.0": "f84cbb66d46b3f20257daaa23f14783b636931fb5e228abcc1735241463cf6b4",
         "4.3.1": "27e3fb34c247f514a0e07a07e85448e7c1bd6bc27eaa3fe301af04721f01eab3",
         "4.2.2": "27e3fb34c247f514a0e07a07e85448e7c1bd6bc27eaa3fe301af04721f01eab3"
       },

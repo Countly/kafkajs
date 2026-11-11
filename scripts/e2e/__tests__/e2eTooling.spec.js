@@ -1101,7 +1101,7 @@ describe('broker telemetry fixture', () => {
 
   test('retains the reviewed reporter and corrected host fixture identities', () => {
     const file = fixture + 'fixtures/manifest.json'
-    expect(digest(file)).toBe('b46f5783aa6efc223921a64f6fff2296f0701cc62f1cc0a050b3b204367e3d1c')
+    expect(digest(file)).toBe('dc06427f80f72aa946cf2905a4216d15d6c44adc73495181e8fadb9fdc1694d6')
     const manifest = JSON.parse(read(file))
     expect(digest('docker-compose.telemetry.yml')).toBe(
       manifest.composeSha256['docker-compose.telemetry.yml']
@@ -1200,7 +1200,6 @@ describe('broker telemetry fixture', () => {
       expect(script).toContain(`--testPathPatterns 'src/telemetry/__tests__/${file}\\.spec\\.js'`)
       expect(script).toContain(`--testNamePattern '^${title}$'`)
     }
-    // eslint-disable-next-line n/no-extraneous-require -- YAML parser is pinned by the ESLint/Jest toolchain
     const yaml = require('js-yaml')
     const parse = (file) => yaml.load(read(file).toString())
     const ci = parse('.github/workflows/ci.yml')
@@ -1367,7 +1366,6 @@ describe('broker telemetry fixture', () => {
   })
 
   test('keeps memory acceptance in guarded jobs with the full Node and broker coverage', () => {
-    // eslint-disable-next-line n/no-extraneous-require -- YAML parser is pinned by the ESLint/Jest toolchain
     const yaml = require('js-yaml')
     const workflow = yaml.load(read('.github/workflows/memory-gates.yml').toString())
     expect(workflow.on).toHaveProperty('workflow_dispatch')
@@ -1650,7 +1648,7 @@ describe('Java telemetry role runner', () => {
     const fixture = path.join(root, 'scripts/e2e/telemetry')
     const digest = (file) => createHash('sha256').update(fs.readFileSync(file)).digest('hex')
     expect(digest(path.join(fixture, 'JavaTelemetryClient.java'))).toBe(
-      '1145746dfeadc7d315e42b1c9d3b3468d819929324cc7701cbddbb423f66b580'
+      '8c9254fd4e929ce95dd6b8d8cfbca8513f8ce8fe37d19d596421e4fa3e7736c3'
     )
     expect(digest(path.join(fixture, 'telemetryWireProbe.js'))).toBe(
       '139afdbec5034f7c1498b90306889fd918ae13097efee1ea9f435b03dcf9b1b1'

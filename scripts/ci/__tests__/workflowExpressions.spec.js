@@ -3,7 +3,7 @@ const path = require('node:path')
 const yaml = require('js-yaml')
 
 const WORKFLOWS_DIR = path.join(__dirname, '..', '..', '..', '.github', 'workflows')
-const PENDING_UNTIL_PRS_15_AND_16_MERGE = ['gate.yml', 'memory-gates.yml']
+const PENDING_UNTIL_PR_15_MERGES = ['memory-gates.yml']
 
 describe('workflow run expressions', () => {
   test('no run script interpolates a workflow expression outside pending PR merges', () => {
@@ -12,7 +12,7 @@ describe('workflow run expressions', () => {
 
     for (const file of files) {
       const workflow = yaml.load(fs.readFileSync(path.join(WORKFLOWS_DIR, file), 'utf8'))
-      if (PENDING_UNTIL_PRS_15_AND_16_MERGE.includes(file)) continue
+      if (PENDING_UNTIL_PR_15_MERGES.includes(file)) continue
       for (const [job, config] of Object.entries(workflow.jobs ?? {})) {
         for (const [index, step] of (config.steps ?? []).entries()) {
           if (typeof step.run === 'string' && step.run.includes('${{'))

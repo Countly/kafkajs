@@ -1,81 +1,113 @@
 /**
- * Decoder performance gate: compares the decode benchmarks of this tree (the candidate) with a
- * frozen baseline tree, on one machine and one Node version, and fails on a slowdown above 5%.
+ * Decoder performance gate: one fixed collection of 30 paired A/C/B blocks per registered row.
+ * A is baseline, C is another baseline invocation and B is candidate. All six orders occur five
+ * times in a seeded schedule saved before measurement. Identical benchmark scripts overlay both
+ * trees; every invocation and its internal rounds remain in the output and raw files.
  *
- * Usage:
- *   node scripts/benchmarks/compareDecoderBounds.js --run --baseline <40-hex sha>
- *        [--out .tmp/decoder-comparison.json] [--raw .tmp/decoder-comparison/raw]
- *   node scripts/benchmarks/compareDecoderBounds.js --input <file>
+ * Usage: node scripts/benchmarks/compareDecoderBounds.js --run --baseline <40-hex sha>
+ *          --partition frame-1m|frame-other|batch-array [--seed <uint32>] [--out <file>] [--raw <dir>]
+ *        node scripts/benchmarks/compareDecoderBounds.js --combine --input <file> --input <file> --input <file>
+ *          [--out <file>]
+ *        node scripts/benchmarks/compareDecoderBounds.js --input <file>
  *
- * `--run` extracts the baseline with `git archive` (a full-history checkout is required) into
- * `.tmp/decoder-comparison/baseline`, links this tree's `node_modules` into it, copies the
- * benchmark scripts the baseline predates over from this tree, runs every arm's benchmark from
- * each tree in alternating old/new order, interleaves a baseline A/A diagnostic, writes every raw
- * invocation under `--raw`, validates and compares the medians, writes the summary to `--out` and
- * removes the baseline tree again. A/A drift only warns; it never changes the acceptance verdict.
- * `--input` validates and compares an existing summary.
+ * Live and offline modes use the same validation and verdict. Each row needs 30 positive finite
+ * observations on A, C and B, paired by its invocation block/side and the recorded schedule.
+ * Frame invocations also need three positive finite warm-up rounds. Unavailable codecs need all
+ * 90 invocations to report absence in both trees, without errors.
+ * Bonferroni median intervals use all 15 registered rows, including unavailable optional codecs.
+ * A/A interval and median calibration and all three spreads determine validity. PASS requires
+ * both the paired upper candidate bound and the unpaired median ratio at most 1.05. A valid lower
+ * bound above 1.05 is REGRESSION; a failed median check is FAIL; otherwise INCONCLUSIVE. D171
+ * accepts ordinary INVALID rows only for the named interval/spread noise problems when the
+ * unpaired median ratio is at most 1.05. Control-median calibration remains blocking. All other
+ * invalid, inconclusive, fail, regression and timeout results exit 1 for ordinary rows. D167/D168
+ * information-only rows retain their verdicts; valid FAIL or REGRESSION, structural errors and
+ * timeouts still fail. Exceptions must remain empty.
  *
- * The input is
- * `{ baselineSha, candidateSha, node, arms: [{ name, oldNsPerOp, newNsPerOp,
- * baselineControlNsPerOp?, invocations? }], unavailable }`
- * with at least 5 positive finite samples per side. Every known arm is either in `arms` or, when
- * it is not required, named in `unavailable` (the arms no tree has a codec for); an arm in neither
- * or in both, a required arm or an unknown name in `unavailable`, fails. A slowdown above 5%
- * passes only with an entry `{ arm, maxSlowdownPercent, ruling }` in `decoderBoundsExceptions.json`,
- * and only up to that bound. Missing, incomplete or incomparable data never passes, with or
- * without an exception. Exit code 0 only when every required arm is complete and within its
- * limit, otherwise 1.
+ * The summary holds { baselineSha, candidateSha, node, registeredRows, seed, schedule, arms,
+ * unavailable, unavailableInvocations, timedOut, result }. The result records informationOnlyRows
+ * with their reasons and noiseAcceptedRows naming strict rows accepted under D171.
+ * Arms retain oldNsPerOp, newNsPerOp,
+ * baselineControlNsPerOp and invocations with explicit block and A/C/B side. The old unpaired
+ * delta is printed as information only. Each partition has its own 25-minute deadline; no retries or
+ * adaptive extension. A timeout kills the running subprocess group and preserves partial data.
  */
 const fs = require('fs')
 const path = require('path')
-const { execFileSync, spawnSync } = require('child_process')
+const { randomBytes } = require('crypto')
+const { performance } = require('perf_hooks')
+const { execFileSync, spawn } = require('child_process')
 
 const REPO_ROOT = path.resolve(__dirname, '..', '..')
 const EXCEPTIONS_FILE = path.join(__dirname, 'decoderBoundsExceptions.json')
 const WORK_DIR = path.join('.tmp', 'decoder-comparison')
 const DEFAULT_OUT = path.join('.tmp', 'decoder-comparison.json')
 const DEFAULT_RAW = path.join(WORK_DIR, 'raw')
-
 const SHA = /^[0-9a-f]{40}$/
-const MIN_SAMPLES = 5
-const PAIRS = 7
-const MAX_SLOWDOWN_PERCENT = 5
-const INVOCATION_TIMEOUT_MS = 10 * 60 * 1000
+const BLOCKS = 30
+const COLLECTION_DEADLINE_MS = 25 * 60 * 1000
+const MAX_RATIO = 1.05
+const MIN_CONTROL_RATIO = 0.95
+const MAX_SPREAD = 0.15
+/** Exact problem identities waived by D171; the separate unpaired C/A calibration is retained. */
+const NOISE_PROBLEMS = Object.freeze({
+  CONTROL_INTERVAL: 'A/A interval outside [0.95, 1.05]',
+  SPREAD: 'spread exceeds fifteen percent',
+})
+/** D167/D168 frame rows remain measured and reported; only noise is waived, a valid FAIL or regression still fails. */
+const INFORMATION_ONLY_ROWS = Object.freeze({
+  'frame-decode:1m': 'D167: GitHub-hosted runner noise; A/A unstable and C as noisy as B.',
+  'frame-decode:64b': 'D167: GitHub-hosted runner noise; A/A unstable and C as noisy as B.',
+  'frame-decode:coalesced': 'D167: GitHub-hosted runner noise; A/A unstable and C as noisy as B.',
+  'frame-decode:64k':
+    'D168 (extends D167): GitHub-hosted runner noise; A/A unstable on re-measure.',
+  'frame-decode:byte-chunks':
+    'D168 (extends D167): GitHub-hosted runner noise; A/A unstable on re-measure.',
+})
+const SIDES = { A: 'oldNsPerOp', C: 'baselineControlNsPerOp', B: 'newNsPerOp' }
+const ORDERS = ['ACB', 'ABC', 'CAB', 'CBA', 'BAC', 'BCA']
 const USAGE =
   'usage: node scripts/benchmarks/compareDecoderBounds.js ' +
-  '(--run --baseline <40-hex sha> [--out <file>] [--raw <dir>] | --input <file>)'
+  '(--run --baseline <40-hex sha> --partition frame-1m|frame-other|batch-array ' +
+  '[--seed <uint32>] [--out <file>] [--raw <dir>] | [--combine] --input <file> [--input <file>] [--out <file>])'
 
-const FRAME_SHAPES = ['64b', '64k', '1m', 'coalesced', 'byte-chunks']
-const COMPRESSED_ARMS = ['gzip', 'zstd', 'lz4', 'snappy']
-const ARRAY_DECODE_SCRIPT = 'scripts/benchmarks/arrayDecode.js'
-const ARRAY_DECODE_ARMS = [
-  'readArray',
-  'record-headers',
-  'readUVarIntArray',
-  'readArrayAsync',
-  'readUVarIntArrayAsync',
-]
+/** Fixed work per operation; the overlay and command use the same value on A, C and B. */
+const WORK_MULTIPLIERS = {
+  'frame-decode:64b': 16,
+  'frame-decode:64k': 16,
+  'frame-decode:1m': 64,
+  'frame-decode:coalesced': 16,
+  'frame-decode:byte-chunks': 16,
+  'record-batch:uncompressed': 16,
+  'record-batch:gzip': 2,
+  'record-batch:zstd': 2,
+  'record-batch:lz4': 1,
+  'record-batch:snappy': 1,
+  'array-decode:readArray': 1,
+  'array-decode:record-headers': 1,
+  'array-decode:readUVarIntArray': 1,
+  'array-decode:readArrayAsync': 1,
+  'array-decode:readUVarIntArrayAsync': 1,
+}
 
 /**
  * @typedef {object} Arm
- * @property {string} name unique arm name
- * @property {boolean} required a missing or unavailable required arm fails the gate
+ * @property {string} name unique registered row
+ * @property {boolean} required unavailable required rows fail
  * @property {string[]} argv command and arguments, run with the tree as working directory
- * @property {string} metric key of the benchmark's JSON line that holds nanoseconds per operation
- * @property {string} [overlay] script of this tree that the baseline tree may predate: it is copied
- *   into the baseline tree, so both trees run the same bytes
+ * @property {string} metric nanoseconds per operation in the benchmark JSON
+ * @property {string} overlay copied unchanged into the baseline tree
  */
-
 /** @type {Arm[]} */
 const ARMS = [
-  ...FRAME_SHAPES.map((shape) => ({
+  ...['64b', '64k', '1m', 'coalesced', 'byte-chunks'].map((shape) => ({
     name: `frame-decode:${shape}`,
     required: true,
-    argv: ['npm', 'run', '--silent', 'bench:frame-decode', '--', '--shape', shape],
+    argv: ['node', '--expose-gc', 'scripts/benchmarks/frameDecode.js', '--shape', shape],
     metric: 'nsPerFrame',
     overlay: 'scripts/benchmarks/frameDecode.js',
   })),
-  ...['uncompressed', ...COMPRESSED_ARMS].map((arm) => ({
+  ...['uncompressed', 'gzip', 'zstd', 'lz4', 'snappy'].map((arm) => ({
     name: `record-batch:${arm}`,
     required: arm === 'uncompressed',
     argv: [
@@ -89,368 +121,556 @@ const ARMS = [
     metric: 'nsPerOp',
     overlay: 'scripts/benchmarks/recordBatchDecode.js',
   })),
-  ...ARRAY_DECODE_ARMS.map((arm) => ({
+  ...[
+    'readArray',
+    'record-headers',
+    'readUVarIntArray',
+    'readArrayAsync',
+    'readUVarIntArrayAsync',
+  ].map((arm) => ({
     name: `array-decode:${arm}`,
     required: true,
-    argv: ['node', ARRAY_DECODE_SCRIPT, '--arm', arm],
+    argv: ['node', 'scripts/benchmarks/arrayDecode.js', '--arm', arm],
     metric: 'nsPerOp',
-    overlay: ARRAY_DECODE_SCRIPT,
+    overlay: 'scripts/benchmarks/arrayDecode.js',
   })),
-]
+].map((arm) => ({
+  ...arm,
+  argv: [...arm.argv, '--work-multiplier', String(WORK_MULTIPLIERS[arm.name])],
+}))
+const REGISTERED_ROWS = ARMS.map(({ name }) => name)
+const PARTITIONS = {
+  'frame-1m': ['frame-decode:1m'],
+  'frame-other': REGISTERED_ROWS.filter(
+    (name) => name.startsWith('frame-decode:') && name !== 'frame-decode:1m'
+  ),
+  'batch-array': REGISTERED_ROWS.filter((name) => !name.startsWith('frame-decode:')),
+}
+const OVERLAY_FILES = [...new Set(ARMS.map(({ overlay }) => overlay))]
 
-const OVERLAY_FILES = [...new Set(ARMS.flatMap(({ overlay }) => overlay ?? []))]
-
-/**
- * @param {number[]} values at least one number
- * @returns {number} the median; the mean of the two middle values for an even count
- */
+/** @param {number[]} values @returns {number} median, averaging the middle two for even counts */
 const median = (values) => {
   const sorted = [...values].sort((a, b) => a - b)
   const middle = Math.floor(sorted.length / 2)
-  return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2
+  return sorted.length % 2
+    ? sorted[middle]
+    : sorted[middle - 1] + (sorted[middle] - sorted[middle - 1]) / 2
 }
-
-/** @param {*} sample @returns {boolean} a positive finite number */
-const validSample = (sample) => typeof sample === 'number' && Number.isFinite(sample) && sample > 0
-
-/** @param {*} samples @returns {boolean} an array of at least 5 positive finite numbers */
-const validSamples = (samples) =>
-  Array.isArray(samples) && samples.length >= MIN_SAMPLES && samples.every(validSample)
+/** @param {*} value @returns {boolean} positive finite number */
+const validSample = (value) => typeof value === 'number' && Number.isFinite(value) && value > 0
+/** @param {*} values @param {number} count @returns {boolean} complete positive finite samples */
+const validSamples = (values, count = BLOCKS) =>
+  Array.isArray(values) && values.length === count && Array.from(values).every(validSample)
+/** @param {*} seed @returns {boolean} a reproducible unsigned 32-bit seed */
+const validSeed = (seed) => Number.isInteger(seed) && seed >= 0 && seed <= 0xffffffff
 
 /**
- * Checks that an input can be compared at all.
- * @param {*} input the parsed input
- * @returns {string[]} one message per problem; empty when the input is complete and comparable
+ * Fisher-Yates shuffle of five copies of each order, using a uint32 seeded generator.
+ * @param {number} seed unsigned 32-bit seed
+ * @returns {string[][]} all 30 orders, in collection order
+ * @throws {Error} when the seed is not a uint32
  */
-const validateInput = (input) => {
-  if (input === null || typeof input !== 'object') {
-    return ['the input is not an object']
+const createSchedule = (seed) => {
+  if (!validSeed(seed)) throw new Error('seed must be a uint32')
+  let state = seed
+  const schedule = ORDERS.flatMap((order) => Array.from({ length: 5 }, () => order.split('')))
+  for (let i = schedule.length - 1; i > 0; i--) {
+    state = (state + 0x6d2b79f5) >>> 0
+    let value = Math.imul(state ^ (state >>> 15), state | 1)
+    value ^= value + Math.imul(value ^ (value >>> 7), value | 61)
+    const j = Math.floor((((value ^ (value >>> 14)) >>> 0) / 4294967296) * (i + 1))
+    ;[schedule[i], schedule[j]] = [schedule[j], schedule[i]]
   }
+  return schedule
+}
 
+/**
+ * Exact two-sided binomial order-statistic median interval, Bonferroni corrected for R and Q.
+ * k = max{j: P[Binomial(30, .5) <= j-1] <= alpha/2}; endpoints are X(k), X(31-k).
+ * @param {number[]} samples exactly 30 positive finite ratios
+ * @param {number} m registered rows fixed before collection, including optional rows
+ * @returns {{ alpha: number, k: number, lower: number, upper: number }} one-based index and bounds
+ * @throws {Error} when samples or registration count are invalid
+ */
+const medianInterval = (samples, m) => {
+  if (!validSamples(samples) || !Number.isInteger(m) || m < 1)
+    throw new Error('invalid interval input')
+  const alpha = 0.05 / (2 * m)
+  let probability = 2 ** -BLOCKS
+  let cumulative = 0
+  let k = 0
+  for (let j = 1; j <= BLOCKS / 2; j++) {
+    cumulative += probability
+    if (cumulative <= alpha / 2) k = j
+    probability *= (BLOCKS - j + 1) / j
+  }
+  const sorted = [...samples].sort((a, b) => a - b)
+  return { alpha, k, lower: sorted[k - 1] ?? 0, upper: sorted[BLOCKS - k] ?? Infinity }
+}
+
+/**
+ * @param {object} row measured row
+ * @param {string[][]} schedule pre-recorded order of each block
+ * @param {boolean} [requireWork] require revised work accounting in each invocation
+ * @returns {string[]} errors in identity, samples, pairing or internal rounds
+ */
+const rowProblems = (row, schedule, requireWork = false) => {
   const problems = []
-  for (const key of ['baselineSha', 'candidateSha']) {
-    if (typeof input[key] !== 'string' || !SHA.test(input[key])) {
-      problems.push(`${key} must be a full 40-hex commit SHA`)
-    }
+  const arm = ARMS.find(({ name }) => name === row?.name)
+  if (!arm) return [`unknown arm ${String(row?.name)}`]
+  for (const field of Object.values(SIDES)) {
+    if (!validSamples(row[field]))
+      problems.push(`${row.name}: ${field} needs 30 positive finite samples`)
   }
-  if (input.baselineSha === input.candidateSha && SHA.test(input.baselineSha ?? '')) {
-    problems.push('baselineSha and candidateSha are the same commit; nothing is being compared')
+  if (!Array.isArray(row.invocations) || row.invocations.length !== BLOCKS * 3) {
+    return [...problems, `${row.name}: needs 90 paired invocations`]
   }
-  if (typeof input.node !== 'string' || input.node === '') {
-    problems.push('node must name the Node version both sides ran on')
-  }
-  if (!Array.isArray(input.arms)) {
-    return [...problems, 'arms must be an array']
-  }
-
-  const seen = new Set()
-  for (const arm of input.arms) {
-    if (typeof arm?.name !== 'string' || arm.name === '' || seen.has(arm.name)) {
-      problems.push(`arm name ${JSON.stringify(arm?.name)} is missing or duplicated`)
-      continue
-    }
-    seen.add(arm.name)
-    for (const side of ['oldNsPerOp', 'newNsPerOp']) {
-      if (!validSamples(arm[side])) {
-        problems.push(`${arm.name}: ${side} needs at least ${MIN_SAMPLES} positive finite samples`)
-      }
-    }
-  }
-
-  const declared = declaredUnavailable(input.unavailable, seen, problems)
-  for (const { name, required } of ARMS) {
-    if (seen.has(name) || (!required && declared.has(name))) {
-      continue
-    }
-    problems.push(
-      required
-        ? `required arm ${name} is missing`
-        : `${name} has neither measurements nor an unavailable disposition`
+  Array.from(row.invocations).forEach((invocation, index) => {
+    const block = Math.floor(index / 3)
+    const side = schedule?.[block]?.[index % 3]
+    const rounds = arm.metric === 'nsPerFrame' ? 7 : 5
+    if (
+      !invocation ||
+      invocation.block !== block ||
+      !Object.hasOwn(SIDES, side ?? '') ||
+      invocation.side !== side ||
+      invocation.error ||
+      (requireWork && invocation.workMultiplier !== WORK_MULTIPLIERS[row.name]) ||
+      invocation.available === 0 ||
+      !validSample(invocation[arm.metric]) ||
+      invocation[arm.metric] !== row[SIDES[side]]?.[block] ||
+      !validSamples(invocation.roundNsPerOp, rounds) ||
+      (arm.metric === 'nsPerFrame' && !validSamples(invocation.warmupRoundNsPerOp, 3)) ||
+      median(invocation.roundNsPerOp) !== invocation[arm.metric]
     )
-  }
-
+      problems.push(`${row.name}: invalid invocation ${index} in block ${block}`)
+  })
   return problems
 }
 
 /**
- * Checks the arms an input declares unavailable: each must be a known, non-required arm that is
- * not also measured and not declared twice.
- * @param {*} unavailable the input's `unavailable`; absent means none
- * @param {Set<string>} measured the names of the arms the input measures
- * @param {string[]} problems receives one message per violation
- * @returns {Set<string>} the declared names that are valid
+ * @param {*} input parsed summary
+ * @returns {string[]} structural problems; no malformed or partial evidence is acceptance eligible
+ */
+const validateInput = (input) => {
+  if (input === null || typeof input !== 'object') return ['the input is not an object']
+  const problems = []
+  for (const key of ['baselineSha', 'candidateSha']) {
+    if (!SHA.test(input[key] ?? '')) problems.push(`${key} must be a full 40-hex commit SHA`)
+  }
+  if (input.baselineSha === input.candidateSha)
+    problems.push('baselineSha and candidateSha are the same commit')
+  if (typeof input.node !== 'string' || !input.node)
+    problems.push('node must name the shared Node version')
+  if (JSON.stringify(input.registeredRows) !== JSON.stringify(REGISTERED_ROWS))
+    problems.push('registeredRows must include every registered row in order')
+  if (
+    !validSeed(input.seed) ||
+    JSON.stringify(input.schedule) !== JSON.stringify(createSchedule(input.seed))
+  )
+    problems.push('schedule must match its seed and contain six orders five times each')
+  if (input.timedOut) problems.push('collection timed out')
+  if (!Array.isArray(input.arms)) return [...problems, 'arms must be an array']
+  const partitioned = input.partition !== undefined
+  const names =
+    partitioned && Object.hasOwn(PARTITIONS, input.partition)
+      ? PARTITIONS[input.partition]
+      : REGISTERED_ROWS
+  if (partitioned) {
+    if (!Object.hasOwn(PARTITIONS, input.partition)) problems.push('unknown partition')
+    if (JSON.stringify(input.workMultipliers) !== JSON.stringify(WORK_MULTIPLIERS))
+      problems.push('workMultipliers must match the registered work table')
+  }
+  const seen = new Set()
+  for (const row of input.arms) {
+    if (!row || seen.has(row.name)) problems.push('arm name is missing or duplicated')
+    seen.add(row?.name)
+    if (partitioned && !names.includes(row?.name)) problems.push('row is outside its partition')
+    problems.push(...rowProblems(row, input.schedule, partitioned))
+  }
+  const declared = declaredUnavailable(input.unavailable, seen, problems)
+  if (partitioned && declared.size)
+    problems.push('every partition row must PASS; unavailable rows are non-green')
+  if (declared.size > 0 || input.unavailableInvocations !== undefined) {
+    const evidence = input.unavailableInvocations
+    if (
+      !Array.isArray(evidence) ||
+      evidence.length !== declared.size ||
+      new Set(evidence.map((row) => row?.name)).size !== declared.size
+    ) {
+      problems.push('unavailable codec evidence is incomplete or duplicated')
+    } else {
+      for (const row of evidence) {
+        if (
+          !declared.has(row?.name) ||
+          !Array.isArray(row.invocations) ||
+          row.invocations.length !== BLOCKS * 3 ||
+          Array.from(row.invocations).some(
+            (invocation, index) =>
+              !invocation ||
+              invocation.block !== Math.floor(index / 3) ||
+              invocation.side !== input.schedule?.[Math.floor(index / 3)]?.[index % 3] ||
+              invocation.available !== 0 ||
+              invocation.error
+          )
+        ) {
+          problems.push('unavailable codec evidence contains a measurement or control error')
+        }
+      }
+    }
+  }
+  for (const { name, required } of ARMS.filter(({ name }) => names.includes(name))) {
+    if (!seen.has(name) && (required || !declared.has(name))) {
+      problems.push(
+        required
+          ? `required arm ${name} is missing`
+          : `${name} has neither measurements nor an unavailable disposition`
+      )
+    }
+  }
+  return problems
+}
+
+/**
+ * @param {*} unavailable optional codec names, absent means none
+ * @param {Set<string>} measured measured names
+ * @param {string[]} problems receives disposition violations
+ * @returns {Set<string>} permitted unavailable names
  */
 const declaredUnavailable = (unavailable = [], measured, problems) => {
   if (!Array.isArray(unavailable)) {
     problems.push('unavailable must be an array of arm names')
     return new Set()
   }
-
   const declared = new Set()
   for (const name of unavailable) {
     const arm = ARMS.find((known) => known.name === name)
-    if (!arm) {
-      problems.push(`${String(name)} is not a known arm and cannot be unavailable`)
-    } else if (arm.required) {
-      problems.push(`required arm ${name} cannot be unavailable`)
-    } else if (measured.has(name)) {
-      problems.push(`${name} is both measured and unavailable`)
-    } else if (declared.has(name)) {
-      problems.push(`${name} is declared unavailable twice`)
-    } else {
-      declared.add(name)
-    }
+    if (!arm) problems.push(`${String(name)} is not a known arm and cannot be unavailable`)
+    else if (arm.required) problems.push(`required arm ${name} cannot be unavailable`)
+    else if (measured.has(name)) problems.push(`${name} is both measured and unavailable`)
+    else if (declared.has(name)) problems.push(`${name} is declared unavailable twice`)
+    else declared.add(name)
   }
-
   return declared
 }
 
 /**
- * @param {*} entries the parsed exceptions file
- * @returns {Map<string, { maxSlowdownPercent: number, ruling: string }>} the entries by arm
- * @throws {Error} when the file is not an array of `{ arm, maxSlowdownPercent, ruling }`
+ * @param {*} entries parsed exceptions file
+ * @returns {Map} empty exception set; exceptions never alter confidence or validity
+ * @throws {Error} when exceptions are nonempty or malformed
  */
 const parseExceptions = (entries) => {
-  if (!Array.isArray(entries)) {
-    throw new Error('the exceptions file must hold an array')
-  }
+  if (!Array.isArray(entries) || entries.length)
+    throw new Error('decoder performance exceptions must remain empty')
+  return new Map()
+}
 
-  const byArm = new Map()
-  for (const entry of entries) {
-    const valid =
-      typeof entry?.arm === 'string' &&
-      Number.isFinite(entry.maxSlowdownPercent) &&
-      entry.maxSlowdownPercent > MAX_SLOWDOWN_PERCENT &&
-      typeof entry.ruling === 'string' &&
-      entry.ruling !== ''
-    if (!valid || byArm.has(entry.arm)) {
-      throw new Error(`invalid or duplicate exception ${JSON.stringify(entry)}`)
-    }
-    byArm.set(entry.arm, entry)
-  }
-
-  return byArm
+/** @param {number[]} samples @returns {number} second-highest minus second-lowest over median */
+const spread = (samples) => {
+  const sorted = [...samples].sort((a, b) => a - b)
+  return (sorted[28] - sorted[1]) / median(sorted)
+}
+/** @param {number} a @param {number} b @returns {boolean} inclusive unpaired 5% upper check */
+const medianWithin = (a, b) => {
+  const scaled = b * 100
+  const bound = a * 105
+  return Number.isFinite(scaled) && Number.isFinite(bound) ? scaled <= bound : b / a <= MAX_RATIO
 }
 
 /**
- * @typedef {object} ArmResult
- * @property {string} name
- * @property {number} oldMedian nanoseconds per operation in the baseline
- * @property {number} newMedian nanoseconds per operation in the candidate
- * @property {number} slowdownPercent `(new / old - 1) * 100`; negative when faster
- * @property {'pass'|'exception'|'fail'} verdict
- * @property {object|null} baselineControl A/A diagnostic, null when unavailable or incomplete
+ * @param {object} row structurally paired observations
+ * @returns {object} validity calibration, paired intervals and the strict verdict
  */
-
-/**
- * @param {number} oldMedian
- * @param {number} newMedian
- * @param {number} percent allowed slowdown
- * @returns {boolean} whether `newMedian` is at most `percent` above `oldMedian`; compared by
- *   cross-multiplication so that 105 against 100 is exactly 5%
- */
-const within = (oldMedian, newMedian, percent) => newMedian * 100 <= oldMedian * (100 + percent)
-
-/**
- * Compares the acceptance baseline samples with extra invocations of that same tree. This is
- * diagnostic only: absent or invalid control data must not affect acceptance validation.
- * @param {object} arm the input row
- * @param {number} oldMedian the acceptance baseline median
- * @returns {{ oldMedian: number, controlMedian: number, driftPercent: number, unstable: boolean }|null}
- */
-const baselineDiagnostic = (arm, oldMedian) => {
-  if (!validSamples(arm.baselineControlNsPerOp)) return null
-
-  const controlMedian = median(arm.baselineControlNsPerOp)
+const judgeRow = (row) => {
+  const A = row.oldNsPerOp
+  const B = row.newNsPerOp
+  const C = row.baselineControlNsPerOp
+  const oldMedian = median(A)
+  const newMedian = median(B)
+  const controlMedian = median(C)
+  const R = B.map((b, i) => b / A[i])
+  const Q = C.map((c, i) => c / A[i])
+  if (!validSamples(R) || !validSamples(Q))
+    return { name: row.name, verdict: 'invalid', problems: ['non-finite paired ratio'] }
+  const ratioInterval = medianInterval(R, ARMS.length)
+  const controlInterval = medianInterval(Q, ARMS.length)
+  const spreads = { A: spread(A), C: spread(C), B: spread(B) }
+  const problems = []
+  if (controlInterval.lower < MIN_CONTROL_RATIO || controlInterval.upper > MAX_RATIO)
+    problems.push(NOISE_PROBLEMS.CONTROL_INTERVAL)
+  if (!medianWithin(oldMedian, controlMedian) || controlMedian / oldMedian < MIN_CONTROL_RATIO)
+    problems.push('A/A median outside five percent')
+  if (Object.values(spreads).some((value) => value > MAX_SPREAD))
+    problems.push(NOISE_PROBLEMS.SPREAD)
+  let verdict = 'invalid'
+  if (!problems.length) {
+    if (ratioInterval.upper <= MAX_RATIO && medianWithin(oldMedian, newMedian)) verdict = 'pass'
+    else if (ratioInterval.lower > MAX_RATIO) verdict = 'regression'
+    else if (!medianWithin(oldMedian, newMedian)) verdict = 'fail'
+    else verdict = 'inconclusive'
+  }
   return {
+    name: row.name,
     oldMedian,
+    newMedian,
     controlMedian,
-    driftPercent: (controlMedian / oldMedian - 1) * 100,
-    unstable:
-      !within(oldMedian, controlMedian, MAX_SLOWDOWN_PERCENT) ||
-      controlMedian * 100 < oldMedian * (100 - MAX_SLOWDOWN_PERCENT),
+    slowdownPercent: (newMedian / oldMedian - 1) * 100,
+    ratioInterval,
+    controlInterval,
+    spreads,
+    verdict,
+    problems,
   }
 }
 
+/** Verdicts D167 waives on its information-only rows: noise, never valid slowdown evidence. */
+const WAIVED_NOISE = Object.freeze(['invalid', 'inconclusive'])
+
 /**
- * Compares the medians of every arm and applies the 5% limit and any recorded exception.
- * @param {object} input see the file comment
- * @param {Map<string, { maxSlowdownPercent: number }>} exceptions from {@link parseExceptions}
- * @returns {{ pass: boolean, problems: string[], unavailable: string[], arms: ArmResult[] }}
- *   `pass` is false whenever `problems` is not empty, whatever the exceptions say
+ * @param {object} row computed row verdict, problems and unpaired medians
+ * @returns {boolean} strict INVALID accepted only for D171 noise within the D164 median bound
  */
-const compare = (input, exceptions) => {
+const passesNoiseGate = ({ name, verdict, problems, oldMedian, newMedian }) =>
+  !Object.hasOwn(INFORMATION_ONLY_ROWS, name) &&
+  verdict === 'invalid' &&
+  Array.isArray(problems) &&
+  problems.length > 0 &&
+  problems.every((problem) => Object.values(NOISE_PROBLEMS).includes(problem)) &&
+  validSample(oldMedian) &&
+  validSample(newMedian) &&
+  medianWithin(oldMedian, newMedian)
+
+/**
+ * @param {object} row computed row verdict; structural problems remain separate gate failures
+ * @returns {boolean} PASS, D167/D168 information-only waiver, or D171 noise-only median acceptance
+ */
+const rowPassesGate = (row) =>
+  row.verdict === 'pass' ||
+  (Object.hasOwn(INFORMATION_ONLY_ROWS, row.name) && WAIVED_NOISE.includes(row.verdict)) ||
+  passesNoiseGate(row)
+
+/**
+ * @param {*} input summary; live and offline use this same decision path
+ * @returns {{ pass: boolean, problems: string[], unavailable: string[], arms: object[], informationOnlyRows: object, noiseAcceptedRows: string[] }} gate verdict, D167/D168 reasons and D171 row acceptances
+ */
+const compare = (input) => {
   const problems = validateInput(input)
-  const arms = []
-  for (const arm of Array.isArray(input?.arms) ? input.arms : []) {
-    if (!validSamples(arm?.oldNsPerOp) || !validSamples(arm?.newNsPerOp)) {
-      continue
-    }
-
-    const oldMedian = median(arm.oldNsPerOp)
-    const newMedian = median(arm.newNsPerOp)
-    const exception = exceptions.get(arm.name)
-    let verdict = 'fail'
-    if (within(oldMedian, newMedian, MAX_SLOWDOWN_PERCENT)) {
-      verdict = 'pass'
-    } else if (exception && within(oldMedian, newMedian, exception.maxSlowdownPercent)) {
-      verdict = 'exception'
-    }
-    arms.push({
-      name: arm.name,
-      oldMedian,
-      newMedian,
-      slowdownPercent: (newMedian / oldMedian - 1) * 100,
-      verdict,
-      baselineControl: baselineDiagnostic(arm, oldMedian),
-    })
-  }
-
+  const arms = (Array.isArray(input?.arms) ? input.arms : []).map((row) => {
+    const issues = rowProblems(row, input.schedule, input.partition !== undefined)
+    return issues.length ? { name: row?.name, verdict: 'invalid', problems: issues } : judgeRow(row)
+  })
   const unavailable = Array.isArray(input?.unavailable) ? input.unavailable : []
-  const pass = problems.length === 0 && arms.every((arm) => arm.verdict !== 'fail')
-  return { pass, problems, unavailable, arms }
+  return {
+    pass: !problems.length && arms.every(rowPassesGate),
+    problems,
+    unavailable,
+    arms,
+    informationOnlyRows: INFORMATION_ONLY_ROWS,
+    noiseAcceptedRows: arms.filter(passesNoiseGate).map(({ name }) => name),
+  }
 }
 
 /**
- * @param {ReturnType<typeof compare>} result
- * @returns {string} the per-arm report, problems and unavailable arms included
+ * Combines exactly the three complete, disjoint partitions. Seeds and clocks are independent;
+ * tree identities, Node version, registration and work must agree. No unavailable row is a PASS.
+ * @param {object[]} inputs partition evidence files, in any order
+ * @returns {ReturnType<typeof compare>} all fifteen verdicts with D167/D168 and D171 treatment
  */
+const combine = (inputs) => {
+  if (!Array.isArray(inputs))
+    return {
+      pass: false,
+      problems: ['partitions must be an array'],
+      unavailable: [],
+      arms: [],
+      informationOnlyRows: INFORMATION_ONLY_ROWS,
+      noiseAcceptedRows: [],
+    }
+  const problems = []
+  const seen = new Set()
+  const results = inputs.map((input) => {
+    if (!Object.hasOwn(PARTITIONS, input?.partition ?? '') || seen.has(input.partition))
+      problems.push('missing, unknown or duplicate partition')
+    seen.add(input?.partition)
+    for (const key of ['baselineSha', 'candidateSha', 'node']) {
+      if (input?.[key] !== inputs[0]?.[key]) problems.push(`${key} differs across partitions`)
+    }
+    return compare(input)
+  })
+  if (
+    inputs.length !== Object.keys(PARTITIONS).length ||
+    Object.keys(PARTITIONS).some((id) => !seen.has(id))
+  )
+    problems.push('all three partitions are required')
+  const arms = results.flatMap((result) => result.arms)
+  const names = arms.map(({ name }) => name)
+  if (
+    names.length !== REGISTERED_ROWS.length ||
+    new Set(names).size !== REGISTERED_ROWS.length ||
+    REGISTERED_ROWS.some((name) => !names.includes(name))
+  )
+    problems.push('every registered row must occur exactly once')
+  problems.push(...results.flatMap((result) => result.problems))
+  return {
+    pass: !problems.length && results.every((result) => result.pass) && arms.every(rowPassesGate),
+    problems,
+    unavailable: results.flatMap((result) => result.unavailable),
+    arms,
+    informationOnlyRows: INFORMATION_ONLY_ROWS,
+    noiseAcceptedRows: arms.filter(passesNoiseGate).map(({ name }) => name),
+  }
+}
+
+/** @param {ReturnType<typeof compare>} result @returns {string} per-row bounds and diagnostic delta */
 const formatReport = ({ pass, problems, unavailable, arms }) =>
   [
-    ...arms.flatMap((arm) => {
-      const diagnostic = arm.baselineControl
-      const drift = diagnostic
-        ? `${diagnostic.driftPercent >= 0 ? '+' : ''}${diagnostic.driftPercent.toFixed(2)}%`
-        : 'unavailable'
-      return [
-        `${arm.verdict.toUpperCase().padEnd(9)}${arm.name.padEnd(28)}` +
-          `old ${arm.oldMedian.toFixed(1)} ns  new ${arm.newMedian.toFixed(1)} ns  ` +
-          `${arm.slowdownPercent >= 0 ? '+' : ''}${arm.slowdownPercent.toFixed(2)}%  ` +
-          `A/A baseline ${drift}`,
-        ...(diagnostic?.unstable
-          ? [`WARNING  ${arm.name}: baseline A/A drift exceeds 5% (${drift})`]
-          : []),
-      ]
-    }),
+    ...arms.map(
+      (arm) =>
+        (passesNoiseGate(arm)
+          ? 'INVALID (noise; median within 5%, D171) '
+          : arm.verdict.toUpperCase().padEnd(13)) +
+        `${String(arm.name).padEnd(29)}` +
+        (Object.hasOwn(INFORMATION_ONLY_ROWS, arm.name) ? 'information only (D167)  ' : '') +
+        (arm.ratioInterval
+          ? `R [${arm.ratioInterval.lower.toFixed(4)}, ${arm.ratioInterval.upper.toFixed(4)}]  ` +
+            `Q [${arm.controlInterval.lower.toFixed(4)}, ${arm.controlInterval.upper.toFixed(4)}]  ` +
+            `unpaired ${arm.slowdownPercent >= 0 ? '+' : ''}${arm.slowdownPercent.toFixed(2)}% (information only)`
+          : '') +
+        (arm.problems.length ? `  ${arm.problems.join('; ')}` : '')
+    ),
     ...unavailable.map((name) => `UNAVAILABLE ${name} (no such codec in either tree)`),
     ...problems.map((problem) => `PROBLEM  ${problem}`),
     pass ? 'decoder performance: PASS' : 'decoder performance: FAIL',
   ].join('\n')
 
-/**
- * Runs every arm in the baseline and candidate trees, alternating which goes first each round so
- * that machine drift lands on both sides, and keeps every raw invocation. Each pair also runs
- * one extra baseline invocation between the acceptance sides: old/control/new, then new/control/old.
- * The A/A sides thus alternate too, reusing the acceptance baseline without doubling the workload.
- */
+/** One fixed seeded collection. Errors remain evidence; no measurement is retried or extended. */
 class MeasurementCollector {
   /**
-   * @param {object} options
-   * @param {{ old: string, new: string }} options.trees the working directory of each side
-   * @param {string} options.rawDir directory that receives one file per invocation
-   * @param {(cwd: string, argv: string[]) => { status: number, stdout: string, stderr: string }} options.run
-   * @param {(file: string, text: string) => void} options.save writes a raw file, creating its directory
-   * @param {number} [options.pairs] paired invocations per arm
+   * @param {object} options dependencies
+   * @param {{ old: string, new: string }} options.trees tree directories
+   * @param {string} options.rawDir invocation evidence directory
+   * @param {Function} options.run asynchronous subprocess runner with a remaining timeout
+   * @param {Function} options.save synchronous evidence writer
+   * @param {string} [options.partition] one fixed subset; omitted only for legacy offline fixtures
+   * @param {number} [options.seed] unsigned seed, random by default
+   * @param {Function} [options.now] monotonic milliseconds
    */
-  constructor({ trees, rawDir, run, save, pairs = PAIRS }) {
-    this.trees = trees
-    this.rawDir = rawDir
-    this.run = run
-    this.save = save
-    this.pairs = pairs
+  constructor({
+    trees,
+    rawDir,
+    run,
+    save,
+    partition,
+    seed = randomBytes(4).readUInt32LE(0),
+    now = () => performance.now(),
+  }) {
+    if (partition !== undefined && !Object.hasOwn(PARTITIONS, partition))
+      throw new Error('unknown partition')
+    Object.assign(this, { trees, rawDir, run, save, seed, now, partition })
+    this.arms =
+      partition === undefined
+        ? ARMS
+        : ARMS.filter(({ name }) => PARTITIONS[partition].includes(name))
+    this.schedule = createSchedule(seed)
+    this.deadlineMs = COLLECTION_DEADLINE_MS
   }
 
   /**
-   * @returns {{ arms: object[], unavailable: string[] }}
-   *   the samples per arm; an arm whose codec is missing in both trees is named in `unavailable`
-   *   instead, and one missing in a single tree keeps fewer than the required samples there.
-   *   Each arm also holds baselineControlNsPerOp and every invocation's parsed JSON, including
-   *   internal roundNsPerOp timings. A failed diagnostic is recorded, never an acceptance failure.
-   * @throws {Error} when an acceptance invocation fails or prints no usable number
+   * Records the schedule before the first invocation, then collects each block once.
+   * @returns {Promise<object>} complete or partial observations, including timeout and error evidence
    */
-  collect() {
-    const samples = new Map(
-      ARMS.map((arm) => [arm.name, { old: [], new: [], baselineControl: [], invocations: [] }])
-    )
-    const missing = { old: new Set(), new: new Set() }
-
-    for (let pair = 0; pair < this.pairs; pair++) {
-      const sides =
-        pair % 2 === 0 ? ['old', 'baselineControl', 'new'] : ['new', 'baselineControl', 'old']
-      for (const arm of ARMS) {
-        const sample = samples.get(arm.name)
-        for (const side of sides) {
-          const treeSide = side === 'baselineControl' ? 'old' : side
-          if (missing[treeSide].has(arm.name)) continue
-          let measurement
-          try {
-            measurement = this.measure(arm, side, pair)
-          } catch (error) {
-            if (side !== 'baselineControl') throw error
-            sample.invocations.push({ pair, side, error: error.message })
-            continue
+  async collect() {
+    const started = this.now()
+    const registration = {
+      ...(this.partition !== undefined && { partition: this.partition }),
+      workMultipliers: { ...WORK_MULTIPLIERS },
+      seed: this.seed,
+      registeredRows: [...REGISTERED_ROWS],
+      schedule: this.schedule,
+    }
+    this.save(path.join(this.rawDir, 'schedule.json'), `${JSON.stringify(registration, null, 2)}\n`)
+    const rows = this.arms.map(({ name }) => ({
+      name,
+      oldNsPerOp: [],
+      newNsPerOp: [],
+      baselineControlNsPerOp: [],
+      invocations: [],
+    }))
+    let timedOut = false
+    for (let block = 0; block < BLOCKS && !timedOut; block++) {
+      for (const [index, arm] of this.arms.entries()) {
+        if (timedOut) break
+        const row = rows[index]
+        for (const side of this.schedule[block]) {
+          const remaining = this.deadlineMs - (this.now() - started)
+          if (remaining <= 0) {
+            timedOut = true
+            break
           }
-          sample.invocations.push({ ...measurement, pair, side })
-          if (measurement.available === 0) {
-            if (side !== 'baselineControl') missing[side].add(arm.name)
-          } else {
-            sample[side].push(measurement[arm.metric])
+          try {
+            const measurement = await this.measure(arm, side, block, remaining)
+            row.invocations.push({ ...measurement, block, side })
+            if (measurement.available !== 0) row[SIDES[side]].push(measurement[arm.metric])
+          } catch (error) {
+            row.invocations.push({ block, side, error: error.message })
+            if (error.timedOut) {
+              timedOut = true
+              break
+            }
           }
         }
       }
     }
-
-    const unavailable = ARMS.map((arm) => arm.name).filter(
-      (name) => missing.old.has(name) && missing.new.has(name)
+    if (this.now() - started >= this.deadlineMs) timedOut = true
+    const unavailableRows = rows.filter(
+      (row) =>
+        !ARMS.find(({ name }) => name === row.name).required &&
+        row.invocations.length === BLOCKS * 3 &&
+        row.invocations.every((invocation) => invocation.available === 0 && !invocation.error)
     )
-    const arms = ARMS.filter((arm) => !unavailable.includes(arm.name)).map(({ name }) => ({
-      name,
-      oldNsPerOp: samples.get(name).old,
-      newNsPerOp: samples.get(name).new,
-      baselineControlNsPerOp: samples.get(name).baselineControl,
-      invocations: samples.get(name).invocations,
-    }))
-    return { arms, unavailable }
+    const unavailable = unavailableRows.map(({ name }) => name)
+    return {
+      ...registration,
+      timedOut,
+      arms: rows.filter(({ name }) => !unavailable.includes(name)),
+      unavailable,
+      unavailableInvocations: unavailableRows,
+    }
   }
 
   /**
-   * @param {Arm} arm
-   * @param {'old'|'new'|'baselineControl'} side the invocation label; baselineControl uses the old tree
-   * @param {number} pair
-   * @returns {object} the benchmark's parsed JSON, with its metric and internal round timings;
-   *   available is 0 when the tree has no such codec
-   * @throws {Error} when the process fails or its last line is not JSON with a positive number
+   * @param {Arm} arm registered row
+   * @param {'A'|'C'|'B'} side C and A run in the baseline tree
+   * @param {number} block zero-based block identity
+   * @param {number} timeoutMs remaining collection time
+   * @returns {Promise<object>} unmodified parsed benchmark JSON, including every internal round
+   * @throws {Error} failed process, invalid metric or timeout, always after preserving raw evidence
    */
-  measure(arm, side, pair) {
-    const treeSide = side === 'baselineControl' ? 'old' : side
-    const { status, stdout, stderr } = this.run(this.trees[treeSide], arm.argv)
-    const file = path.join(this.rawDir, arm.name.replace(':', '-'), `${pair}-${side}.txt`)
+  async measure(arm, side, block, timeoutMs) {
+    const result = await this.run(this.trees[side === 'B' ? 'new' : 'old'], arm.argv, { timeoutMs })
+    const { status, stdout, stderr } = result
+    const file = path.join(this.rawDir, arm.name.replace(':', '-'), `${block}-${side}.txt`)
     this.save(
       file,
-      `$ ${arm.argv.join(' ')}\nexit ${status}\n--- stdout\n${stdout}\n--- stderr\n${stderr}\n`
+      `$ ${arm.argv.join(' ')}\nexit ${status}\ntimeout ${Boolean(result.timedOut)}\n--- stdout\n${stdout}\n--- stderr\n${stderr}\n`
     )
-    if (status !== 0) {
-      throw new Error(`${arm.name} failed in the ${side} tree (exit ${status}); see ${file}`)
+    if (result.timedOut || status !== 0) {
+      const error = new Error(`${arm.name} failed in ${side} (exit ${status}); see ${file}`)
+      error.timedOut = Boolean(result.timedOut)
+      throw error
     }
-
-    const line = stdout.trim().split('\n').pop()
     let parsed
     try {
-      parsed = JSON.parse(line)
+      parsed = JSON.parse(stdout.trim().split('\n').pop())
     } catch {
-      throw new Error(`${arm.name} printed no JSON line in the ${side} tree; see ${file}`)
+      throw new Error(`${arm.name} printed no JSON line in ${side}; see ${file}`)
     }
-    if (parsed.available === 0) {
-      return parsed
-    }
-    if (!validSample(parsed[arm.metric])) {
-      throw new Error(`${arm.name} reported no usable ${arm.metric} in the ${side} tree`)
-    }
-
+    if (parsed?.available === 0) return parsed
+    if (!validSample(parsed?.[arm.metric]))
+      throw new Error(`${arm.name} reported no usable ${arm.metric} in ${side}`)
     return parsed
   }
 }
-
 /**
  * Copies files of the candidate tree over the same paths of another tree, so that a benchmark
  * script the other tree predates runs there as the same bytes.
@@ -497,80 +717,137 @@ const prepareBaselineTree = ({ repoRoot, sha, dir, overlay = [] }) => {
 }
 
 /**
- * @param {string} cwd
+ * Runs a direct command in its own process group. The deadline kills the group, including any
+ * descendants, with SIGKILL; it is not a graceful wait that could overrun the collection budget.
+ * @param {string} cwd working directory
  * @param {string[]} argv command and arguments
- * @returns {{ status: number, stdout: string, stderr: string }} a timeout or spawn failure has a
- *   non-zero status
+ * @param {object} [options] subprocess dependencies and budget
+ * @param {number} [options.timeoutMs] remaining collection milliseconds
+ * @param {Function} [options.spawn] process factory
+ * @param {Function} [options.kill] process-group signal sender
+ * @returns {Promise<{ status: number, stdout: string, stderr: string, timedOut: boolean }>} evidence
  */
-const runCommand = (cwd, argv) => {
-  const [command, ...args] = argv
-  const result = spawnSync(command, args, {
-    cwd,
-    encoding: 'utf8',
-    maxBuffer: 64 * 1024 * 1024,
-    timeout: INVOCATION_TIMEOUT_MS,
+const runCommand = (
+  cwd,
+  argv,
+  {
+    timeoutMs = COLLECTION_DEADLINE_MS,
+    spawn: start = spawn,
+    kill = process.kill.bind(process),
+  } = {}
+) =>
+  new Promise((resolve) => {
+    const child = start(argv[0], argv.slice(1), {
+      cwd,
+      detached: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let stdout = ''
+    let stderr = ''
+    let timedOut = false
+    const timer = setTimeout(
+      () => {
+        timedOut = true
+        try {
+          kill(-child.pid, 'SIGKILL')
+        } catch (error) {
+          if (error.code !== 'ESRCH') stderr += error.message
+        }
+      },
+      Math.max(1, Math.ceil(timeoutMs))
+    )
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk
+    })
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk
+    })
+    child.on('error', (error) => {
+      stderr += error.message
+    })
+    child.on('close', (status) => {
+      clearTimeout(timer)
+      resolve({ status: timedOut ? 1 : (status ?? 1), stdout, stderr, timedOut })
+    })
   })
-  return { status: result.status ?? 1, stdout: result.stdout ?? '', stderr: result.stderr ?? '' }
-}
 
 /**
- * @param {string[]} argv the arguments after the script name
- * @returns {{ mode: 'run', baseline: string, out: string, raw: string } | { mode: 'input', input: string }}
- * @throws {Error} the usage line for anything it does not accept
+ * @param {string[]} argv arguments after the script name
+ * @returns {object} strict run or offline options
+ * @throws {Error} usage for invalid options
  */
 const parseArgs = (argv) => {
-  const options = {}
+  const options = { inputs: [] }
   for (let i = 0; i < argv.length; i++) {
     const flag = argv[i]
-    if (flag === '--run') {
-      options.run = true
-    } else if (['--baseline', '--out', '--raw', '--input'].includes(flag) && argv[i + 1]) {
+    if (flag === '--run' || flag === '--combine') options[flag.slice(2)] = true
+    else if (flag === '--input' && argv[i + 1]) options.inputs.push(argv[++i])
+    else if (
+      ['--baseline', '--out', '--raw', '--seed', '--partition'].includes(flag) &&
+      argv[i + 1] &&
+      options[flag.slice(2)] === undefined
+    )
       options[flag.slice(2)] = argv[++i]
-    } else {
-      throw new Error(USAGE)
-    }
+    else throw new Error(USAGE)
   }
-
-  if (options.run && !options.input && SHA.test(options.baseline ?? '')) {
+  if (
+    options.seed !== undefined &&
+    (!/^\d+$/.test(options.seed) || !validSeed(Number(options.seed)))
+  )
+    throw new Error(USAGE)
+  if (
+    options.run &&
+    !options.combine &&
+    !options.inputs.length &&
+    SHA.test(options.baseline ?? '') &&
+    Object.hasOwn(PARTITIONS, options.partition ?? '')
+  ) {
     return {
       mode: 'run',
+      partition: options.partition,
       baseline: options.baseline,
       out: options.out ?? DEFAULT_OUT,
       raw: options.raw ?? DEFAULT_RAW,
+      seed: options.seed === undefined ? randomBytes(4).readUInt32LE(0) : Number(options.seed),
     }
   }
-  if (!options.run && options.input && !options.baseline && !options.out && !options.raw) {
-    return { mode: 'input', input: options.input }
+  if (
+    !options.run &&
+    options.inputs.length &&
+    !options.baseline &&
+    !options.raw &&
+    options.seed === undefined &&
+    options.partition === undefined
+  ) {
+    if (options.combine || options.inputs.length > 1)
+      return { mode: 'combine', inputs: options.inputs, out: options.out }
+    if (!options.out) return { mode: 'input', input: options.inputs[0] }
   }
-
   throw new Error(USAGE)
 }
 
-/**
- * @param {string} file
- * @param {string} text
- * @returns {void}
- */
+/** @param {string} file @param {string} text @returns {void} writes evidence with parent directories */
 const saveFile = (file, text) => {
   fs.mkdirSync(path.dirname(file), { recursive: true })
   fs.writeFileSync(file, text)
 }
 
 /**
- * @param {string[]} argv the arguments after the script name
- * @param {(line: string) => void} [log]
- * @returns {number} the exit code
+ * @param {string[]} argv arguments after the script name
+ * @param {Function} [log] report sink
+ * @returns {Promise<number>} zero for complete accepted evidence with no proven regression
  */
-const main = (argv, log = console.log) => {
+const main = async (argv, log = console.log) => {
   const baselineDir = path.join(REPO_ROOT, WORK_DIR, 'baseline')
   let extracted = false
   try {
     const options = parseArgs(argv)
-    const exceptions = parseExceptions(JSON.parse(fs.readFileSync(EXCEPTIONS_FILE, 'utf8')))
+    parseExceptions(JSON.parse(fs.readFileSync(EXCEPTIONS_FILE, 'utf8')))
     let input
-    if (options.mode === 'input') {
-      input = JSON.parse(fs.readFileSync(options.input, 'utf8'))
-    } else {
+    if (options.mode === 'combine')
+      input = options.inputs.map((file) => JSON.parse(fs.readFileSync(file, 'utf8')))
+    else if (options.mode === 'input') input = JSON.parse(fs.readFileSync(options.input, 'utf8'))
+    else {
       extracted = true
       prepareBaselineTree({
         repoRoot: REPO_ROOT,
@@ -581,6 +858,8 @@ const main = (argv, log = console.log) => {
       const collector = new MeasurementCollector({
         trees: { old: baselineDir, new: REPO_ROOT },
         rawDir: options.raw,
+        partition: options.partition,
+        seed: options.seed,
         run: runCommand,
         save: saveFile,
       })
@@ -589,16 +868,16 @@ const main = (argv, log = console.log) => {
         candidateSha: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: REPO_ROOT })
           .toString()
           .trim(),
-        node: runCommand(REPO_ROOT, ['node', '--version']).stdout.trim(),
+        node: process.version,
         commands: Object.fromEntries(ARMS.map((arm) => [arm.name, arm.argv.join(' ')])),
-        ...collector.collect(),
+        ...(await collector.collect()),
       }
     }
-
-    const result = compare(input, exceptions)
-    if (options.mode === 'run') {
+    const result = options.mode === 'combine' ? combine(input) : compare(input)
+    if (options.mode === 'combine' && options.out)
+      saveFile(options.out, `${JSON.stringify({ partitions: input, result }, null, 2)}\n`)
+    if (options.mode === 'run')
       saveFile(options.out, `${JSON.stringify({ ...input, result }, null, 2)}\n`)
-    }
     log(formatReport(result))
     return result.pass ? 0 : 1
   } catch (error) {
@@ -609,19 +888,27 @@ const main = (argv, log = console.log) => {
   }
 }
 
-if (require.main === module) {
-  process.exitCode = main(process.argv.slice(2))
-}
+if (require.main === module)
+  main(process.argv.slice(2)).then((code) => {
+    process.exitCode = code
+  })
 
 module.exports = {
   ARMS,
+  INFORMATION_ONLY_ROWS,
+  PARTITIONS,
+  WORK_MULTIPLIERS,
   MeasurementCollector,
+  combine,
   compare,
   formatReport,
   main,
+  medianInterval,
+  createSchedule,
   overlayFiles,
   parseArgs,
   parseExceptions,
   prepareBaselineTree,
+  runCommand,
   validateInput,
 }
