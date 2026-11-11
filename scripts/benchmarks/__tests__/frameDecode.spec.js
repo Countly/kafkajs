@@ -80,7 +80,7 @@ describe('Benchmarks > frameDecode', () => {
     })
 
     test('timed mode requires gc while the functional control does not', async () => {
-      delete globalThis.gc
+      globalThis.gc = undefined
       await expect(timed('64b', 2)).rejects.toThrow(/gc/)
       await expect(control('64b', 2)).resolves.toMatchObject({ pass: true })
     })
