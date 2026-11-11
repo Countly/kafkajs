@@ -47,7 +47,9 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: '${{ matrix.node }}', cache: npm }
       - run: npm ci
-      - run: npm run test:unit:soak -- --ci --shard=${{ matrix.shard }}/3
+      - env:
+          MATRIX_SHARD: ${{ matrix.shard }}
+        run: npm run test:unit:soak -- --ci --shard="$MATRIX_SHARD/3"
   pack:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -89,6 +91,7 @@ jobs:
       max-parallel: 6
       matrix: ${{ fromJSON(needs.integration-plan.outputs.matrix) }}
     env:
+      MATRIX_GROUP: ${{ matrix.group }}
       KAFKA_VERSION: ${{ matrix.kafka }}
       COMPOSE_FILE: ${{ matrix.compose || 'docker-compose.yml' }}
       KAFKA_CLIENTS_VERSION: ${{ matrix.clients || '' }}
@@ -99,7 +102,7 @@ jobs:
       - run: npm ci
       - run: docker compose version
       - if: ${{ !startsWith(matrix.group, 'share') }}
-        run: ./scripts/testWithKafka.sh "npm run test:group:${{ matrix.group }} -- --ci --maxWorkers=4"
+        run: ./scripts/testWithKafka.sh "npm run test:group:$MATRIX_GROUP -- --ci --maxWorkers=4"
       - name: Prepare share evidence
         if: startsWith(matrix.group, 'share')
         run: |
@@ -110,7 +113,7 @@ jobs:
         if: startsWith(matrix.group, 'share')
         env:
           DO_NOT_STOP: '1'
-        run: ./scripts/testWithKafka.sh "npm run test:group:${{ matrix.group }} -- --ci"
+        run: ./scripts/testWithKafka.sh "npm run test:group:$MATRIX_GROUP -- --ci"
       - name: Prove shutdown exits naturally
         if: matrix.group == 'share'
         env:

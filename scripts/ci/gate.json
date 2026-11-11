@@ -19393,8 +19393,7 @@
         "scripts/release/__tests__/verify.spec.js \u203a verifyRelease rule 3: the CHANGELOG heading only a level-two heading counts: \"# 3.0.0\"",
         "scripts/release/__tests__/verify.spec.js \u203a verifyRelease rule 3: the CHANGELOG heading accepts the heading \"## 3.0.0\", with or without a date suffix",
         "scripts/release/__tests__/verify.spec.js \u203a verifyRelease rule 3: the CHANGELOG heading accepts the heading \"## 3.0.0 \u2014 2026-12-01\", with or without a date suffix",
-        "scripts/release/__tests__/verify.spec.js \u203a verifyRelease rule 3: the CHANGELOG heading accepts the heading \"## 3.0.0",
-        "\", with or without a date suffix",
+        "scripts/release/__tests__/verify.spec.js \u203a verifyRelease rule 3: the CHANGELOG heading accepts the heading \"## 3.0.0\r\", with or without a date suffix",
         "scripts/release/__tests__/verify.spec.js \u203a verifyRelease rule 4: ci.yml and gate.yml push runs rejects a missing ci.yml run",
         "scripts/release/__tests__/verify.spec.js \u203a verifyRelease rule 4: ci.yml and gate.yml push runs rejects a missing gate.yml run",
         "scripts/release/__tests__/verify.spec.js \u203a verifyRelease rule 4: ci.yml and gate.yml push runs rejects a dispatch-only success",
@@ -19562,7 +19561,7 @@
         "scripts/ci/__tests__/telemetryConfig.spec.js › telemetry lane configuration the telemetry manifest has a 4.4.0 line whose jars exist and match their SHA-256",
         "scripts/ci/__tests__/telemetryConfig.spec.js › telemetry lane configuration the fixture runners accept Kafka 4.4.0",
         "scripts/ci/__tests__/telemetryConfig.spec.js › telemetry lane configuration the reporter ordering step runs on a Kafka 4.4.0 row and covers every retained reporter jar",
-        "scripts/ci/__tests__/telemetryConfig.spec.js › telemetry lane configuration the temporary telemetry fixtures build workflow is not on the merged tree",
+        "scripts/ci/__tests__/telemetryConfig.spec.js › telemetry lane configuration the temporary telemetry fixtures build workflow sets its cache on the runner and supports manual dispatch",
         "testHelpers/__tests__/telemetryFixtures.spec.js › telemetry wire observer accepts a configured observer on every line with a reporter jar and refuses the rest",
         "testHelpers/__tests__/telemetryFixtures.spec.js › required live archive dimensions and semantics telemetry-outcomes evidence for base-mode Kafka 4.4.0 is accepted",
         "testHelpers/__tests__/telemetryFixtures.spec.js › required live archive dimensions and semantics telemetry-outcomes evidence for configured-mode Kafka 4.4.0 is accepted",
@@ -19594,7 +19593,8 @@
         "scripts/ci/__tests__/workflowTimeouts.spec.js › workflow job timeouts a reusable-workflow caller job is exempt and its callee is checked",
         "scripts/ci/__tests__/workflowTimeouts.spec.js › workflow job timeouts fails on a reusable-workflow call whose callee cannot be resolved",
         "scripts/ci/__tests__/workflowTimeouts.spec.js › workflow job timeouts rejects a job with no timeout (negative control)",
-        "scripts/ci/__tests__/workflowTimeouts.spec.js › workflow job timeouts rejects a timeout of 0 or above 360"
+        "scripts/ci/__tests__/workflowTimeouts.spec.js › workflow job timeouts rejects a timeout of 0 or above 360",
+        "scripts/ci/__tests__/workflowExpressions.spec.js › workflow run expressions no run script interpolates a workflow expression outside pending PR merges"
       ],
       "capMinutes": 85,
       "allowedSkips": [
@@ -23624,7 +23624,7 @@
         "scripts/ci/__tests__/telemetryConfig.spec.js › telemetry lane configuration the telemetry manifest has a 4.4.0 line whose jars exist and match their SHA-256",
         "scripts/ci/__tests__/telemetryConfig.spec.js › telemetry lane configuration the fixture runners accept Kafka 4.4.0",
         "scripts/ci/__tests__/telemetryConfig.spec.js › telemetry lane configuration the reporter ordering step runs on a Kafka 4.4.0 row and covers every retained reporter jar",
-        "scripts/ci/__tests__/telemetryConfig.spec.js › telemetry lane configuration the temporary telemetry fixtures build workflow is not on the merged tree",
+        "scripts/ci/__tests__/telemetryConfig.spec.js › telemetry lane configuration the temporary telemetry fixtures build workflow sets its cache on the runner and supports manual dispatch",
         "testHelpers/__tests__/telemetryFixtures.spec.js › telemetry wire observer accepts a configured observer on every line with a reporter jar and refuses the rest",
         "testHelpers/__tests__/telemetryFixtures.spec.js › required live archive dimensions and semantics telemetry-outcomes evidence for base-mode Kafka 4.4.0 is accepted",
         "testHelpers/__tests__/telemetryFixtures.spec.js › required live archive dimensions and semantics telemetry-outcomes evidence for configured-mode Kafka 4.4.0 is accepted",
@@ -23655,7 +23655,8 @@
         "scripts/ci/__tests__/workflowTimeouts.spec.js › workflow job timeouts a reusable-workflow caller job is exempt and its callee is checked",
         "scripts/ci/__tests__/workflowTimeouts.spec.js › workflow job timeouts fails on a reusable-workflow call whose callee cannot be resolved",
         "scripts/ci/__tests__/workflowTimeouts.spec.js › workflow job timeouts rejects a job with no timeout (negative control)",
-        "scripts/ci/__tests__/workflowTimeouts.spec.js › workflow job timeouts rejects a timeout of 0 or above 360"
+        "scripts/ci/__tests__/workflowTimeouts.spec.js › workflow job timeouts rejects a timeout of 0 or above 360",
+        "scripts/ci/__tests__/workflowExpressions.spec.js › workflow run expressions no run script interpolates a workflow expression outside pending PR merges"
       ],
       "capMinutes": 93,
       "allowedSkips": [

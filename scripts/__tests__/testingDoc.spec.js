@@ -1,5 +1,6 @@
 const fs = require('fs')
 const path = require('path')
+const yaml = require('js-yaml')
 const { scripts } = require('../../package.json')
 const { integrationPlan } = require('../ci/integrationPlan')
 
@@ -129,7 +130,17 @@ describe('docs/Testing.md', () => {
   })
 
   it('says the workflows call the cluster script directly', () => {
-    expect(workflows[0]).toContain('./scripts/testWithKafka.sh "npm run test:group:')
+    const jobs = yaml.load(workflows[0]).jobs
+    expect(jobs.integration.env.MATRIX_GROUP).toBe('$' + '{{ matrix.group }}')
+    expect(jobs.integration.steps.find((step) => step.run?.includes('--maxWorkers=4')).run).toBe(
+      './scripts/testWithKafka.sh "npm run test:group:$MATRIX_GROUP -- --ci --maxWorkers=4"'
+    )
+    expect(jobs.integration.steps.find((step) => step.name === 'Run share lane').run).toBe(
+      './scripts/testWithKafka.sh "npm run test:group:$MATRIX_GROUP -- --ci"'
+    )
+    const shard = jobs['unit-soak'].steps.find((step) => step.run?.includes('--shard='))
+    expect(shard.env.MATRIX_SHARD).toBe('$' + '{{ matrix.shard }}')
+    expect(shard.run).toBe('npm run test:unit:soak -- --ci --shard="$MATRIX_SHARD/3"')
     expect(page).toContain('calls `./scripts/testWithKafka.sh "npm run test:group:<name>')
   })
 
