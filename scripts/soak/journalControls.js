@@ -191,7 +191,7 @@ const run = (directory, { kinds = KINDS, protocols = PROTOCOLS } = {}) => {
     assert.equal(fixed.storage.closed.byteLength, fixed.storage.before.byteLength)
     assert.equal(fixed.storage.before.columns[0].columns[0].format, 'scalar-utf8-1')
     if (kind === 'shareConsumer')
-      assert.equal(fixed.storage.before.columns[1].columns[0].format, 'share-columns-utf8-1')
+      assert.equal(fixed.storage.before.columns[1].columns[0].format, 'share-packed-1')
     for (const result of [old, fixed]) {
       assert.equal(result.diagnostic, true)
       assert.equal(result.acceptanceEligible, false)

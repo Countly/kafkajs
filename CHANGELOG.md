@@ -15,6 +15,9 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Tooling
 
+- Resource gate: closed ceiling, control stability and a new first-use bound judge heap plus external without V8 bytecode and compiled code (limits unchanged, schema 6); a measured warm-up pass runs before M; seeded controls prove per-close, warm-up and warm-up-only leaks fail on Node 22/24/26.
+- Memory-gate controls: the legacy journal arm is a contamination-positive control; admin and live-flags parity arms; the live worker records V8 code bytes in shadow.
+- Declare explicit 360-minute timeouts for the nine remaining runner jobs without a job limit; retain every existing explicit timeout.
 - Move telemetry memory arms and their validated artifacts, the retained-ownership diagnostic and full Node/broker churn-soak coverage into the guarded Memory gates workflow; keep the other functional telemetry lanes and non-memory resource schedules on phase PRs with unchanged acceptance checks.
 - Prepare a verified runner-local AppCDS archive for the pinned telemetry decoder before timed observer work, retain preparation diagnostics, and require archive-backed decoding under unchanged time limits.
 - Flush terminal telemetry worker messages before IPC disconnect, retain failed-worker exit, output and phase diagnostics, and hold planned soak samples until their admission time.
@@ -58,6 +61,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Behavior changes
 
+- Telemetry churn share journals are packed losslessly with raw digests and int64 offsets; the share worker's declared journal bytes fall from 29,487,024 to 23,192,560; its live setup allowance is 96 MiB plus those declared bytes, recorded and recomputed; the 64 MiB increase and 160 MiB peak limits are unchanged.
 - Observe successful foreground connections and completed request latency in the shared network runtime when telemetry is enabled; contain collector failures so the original request results are preserved.
 - Refuse obsolete telemetry connection opens before they can retire the current connection, preserving healthy telemetry after replacement or reconnect.
 - Log fixed diagnostics for private telemetry response failures without reading properties of arbitrary thrown values; ordinary request diagnostics retain their existing messages.

@@ -436,16 +436,32 @@ and settlement included) and of the sampled peak; the external peak is taken the
 
 | Gate | Limit |
 |---|---|
-| Control stability: C1 against C0 | RSS within 2 MiB, heap plus external within 256 KiB |
+| Control stability: C1 against C0 | RSS within 2 MiB, data within 256 KiB |
 | Setup and control absolute peak (through the control's release) | at most 96 MiB |
 | Telemetry RSS peak above the control, P minus B | at most 64 MiB |
 | Whole-arm absolute peak P | at most 160 MiB |
 | External memory peak above the control | at most 64 MiB (`arrayBuffers` is inside external and is never added again) |
-| Heap plus external above the matched disconnected baseline | at most 8 MiB while active, at most 256 KiB once closed |
+| Heap plus external above the matched disconnected baseline | at most 8 MiB while active |
+| Data above the matched disconnected baseline once closed | at most 256 KiB |
+| First use | first use M − M0 ≤ 1 MiB in data |
+| Unseeded closed data | unseeded data below −256 KiB is inconclusive |
 
 The matched baseline is a separate reading: the enabled client disconnected with its registered descriptors,
-its UUID and its counters retained. It is not the control, and it supplies only the last row. Native work is
-journaled from the production codec calls (weak-issued job, input and result identities, byte lengths,
+its UUID and its counters retained. It is not the control. In schema 6, control stability and the closed
+ceiling judge Δdata = Δ(heapUsed + external) − Δ(V8 code_and_metadata_size + bytecode_and_metadata_size)
+at the same final settle checkpoint. Raw retained bytes and the engine readings remain recorded, and
+the validator recomputes data from them. Only V8 code and bytecode are excluded; RSS, external, peak
+and active-retention gates keep their original quantities, limits and settle protocol.
+
+Before the matched baseline M, one measured warm-up lifecycle runs the same kind, arm and catalogue,
+then closes and releases it. M0 records the old matched position before that lifecycle; the first-use
+bound measures M minus M0. CI on Node 22/24/26 runs product-root seeds of 131,072 bytes per close
+(at least 512 KiB total), both after warm-up and also during warm-up, and a warm-up-only seed of
+1 MiB + 1. Each must fail its closed or first-use bound. Code-accounting controls distinguish
+compilation from retained arrays, and all 24 unseeded arms across those Node lines must stay within
+±256 KiB of closed data. A static sweep checks production source for dynamic code generation.
+
+Native work is journaled from the production codec calls (weak-issued job, input and result identities, byte lengths,
 distinct backing stores counted once, a reading at each submission and settlement, readings every 20 ms
 while work is pending, and per pending window its first and last reading time, reading count and peaks) and
 at most one job may be occupied at a time. Each window must span its job from submission to settlement, the
@@ -539,7 +555,12 @@ handled prefix is accepted and the rest released.
 
 Memory is judged per worker against its own telemetry-disabled control of the same kind in the same
 process: the telemetry-attributable resident-size peak is at most 64 MiB above the control, the control
-and setup peak at most 96 MiB, the whole worker at most 160 MiB, and the external-memory peak at most
+and setup peak at most 96 MiB for producer, consumer and admin. The share consumer's live setup
+allowance is 96 MiB plus its declared journal bytes: 100,663,296 + 23,192,560 = 123,855,856 bytes.
+Its packed journals preserve raw digests and exact int64 offsets losslessly. All journal storage,
+including the 4,096-byte engine code journal, is allocated and touched before the disabled control.
+The allocation and setup allowance are recorded and recomputed by the validator. The whole worker
+stays at most 160 MiB, and the external-memory peak at most
 64 MiB above the control. The peak source is the kernel's lifetime high-water mark of the executable
 image (`/proc/self/status`), read before any application module is loaded and at every phase boundary;
 the raw `maxRSS` is recorded beside it and never subtracted. A control that drifts by more than 2 MiB
@@ -549,7 +570,19 @@ pressure above 5) makes the measurement inconclusive, with the facts retained; a
 fact fails. The retained-heap gates are unchanged: at most 8 MiB active and 256 KiB closed above the
 matched disconnected baseline, a slope of at most 64 KiB per minute, last minus first at most 1 MiB,
 and at least ten post-collection readings spanning at least 270 s inside a measurement of at least
-300 s, each recorded with its real admission and completion time.
+300 s, each recorded with its real admission and completion time. These live retained gates still
+judge heap plus external; the schema 6 data gates and measured warm-up above apply to the broker-free
+resource arms. Every live reading records V8 code bytes in shadow only, with raw, code and data slopes;
+the live acceptance quantities remain unchanged pending the controls and an explicit decision.
+
+The legacy unseeded arm is a contamination-positive control: fixed unseeded must pass, fixed and
+legacy seeded must show both slope and endpoint violations, and legacy consumer/share unseeded must
+show the slope violation (also the endpoint violation whenever its measured value exceeds the limit).
+Producer legacy unseeded is judged by paired slope and endpoint ordering above fixed on the same Node;
+admin legacy is recorded only. The separate live-flags control uses the live worker's exact flags and
+two-collection probe, fixed seeded/unseeded for all four kinds on Node 22/24/26. Its unseeded result
+is recorded only and its seed must show both violations. Legacy evidence is retained. See
+[Telemetry churn journal storage](TelemetryJournals.md) for capacities, roles and the CI job split.
 
 The evidence verifier recomputes everything from the archive instead of trusting a boolean: the fixed
 segment catalogue, every proof, boundary, retirement and transition, the declared proof selection, the

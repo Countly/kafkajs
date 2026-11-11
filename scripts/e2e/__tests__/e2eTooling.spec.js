@@ -1348,7 +1348,9 @@ describe('broker telemetry fixture', () => {
     // eslint-disable-next-line n/no-extraneous-require -- YAML parser is pinned by the ESLint/Jest toolchain
     const yaml = require('js-yaml')
     const workflow = yaml.load(read('.github/workflows/memory-gates.yml').toString())
-    for (const file of fs.readdirSync('.github/workflows').filter((file) => /\.ya?ml$/.test(file))) {
+    for (const file of fs
+      .readdirSync('.github/workflows')
+      .filter((file) => /\.ya?ml$/.test(file))) {
       const document = yaml.load(read('.github/workflows/' + file).toString())
       for (const job of Object.values(document.jobs))
         if (job['runs-on']) expect(job['timeout-minutes']).toBeDefined()

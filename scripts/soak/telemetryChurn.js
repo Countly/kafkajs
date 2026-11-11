@@ -157,9 +157,9 @@ const journalLimits = (
  * The exact bytes a worker of `kind` allocates and fills before its disabled control, derived only
  * from the journal limits: ordinary work (two 16-byte id ledgers, 32-byte handler rows with their
  * completeness bitmap, 256-byte receipts, 16-byte producer slots), the native journal (2,048-byte
- * rows) with its pending windows (256 bytes), the memory samples and, for the share consumer, both
- * share archives with their label slots. The sizes mirror the owners that allocate them; a spec
- * compares the sum with the storage the real owners hold.
+ * rows) with its pending windows (256 bytes), the memory samples, the engine code journal (64-byte
+ * rows) and, for the share consumer, both share archives with their label slots. The sizes mirror
+ * the owners that allocate them; a spec compares the sum with the storage the real owners hold.
  * @param {string} kind a client kind
  * @param {object} [limits] the telemetry schedule constants, as for `journalLimits`
  * @returns {number} declared journal bytes
@@ -176,7 +176,7 @@ const declaredJournalBytes = (kind, limits) => {
     kind === 'shareConsumer'
       ? storage.exchangeBytes + storage.acknowledgementBytes + 2 * SYMBOL_BYTES
       : 0
-  return ordinary + native + storage.sampleBytes + share
+  return ordinary + native + storage.sampleBytes + ENGINE_ROWS * 64 + share
 }
 
 const CONTROL = Object.freeze({

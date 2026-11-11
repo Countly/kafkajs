@@ -2,8 +2,10 @@
 
 The telemetry workers reserve and touch all journal backing buffers before the telemetry-disabled
 `c0` reading. The same buffers remain owned through the closed reading. Archives materialize
-later. The reference evidence declares the allocation sizes and schedule capacities. No reading,
-limit, measurement boundary, GC protocol or workload is adjusted or subtracted.
+later. The reference evidence declares the allocation sizes and schedule capacities. Packing changes
+only storage; the live share setup allowance includes its exact declared bytes as described below.
+The 64 MiB increase and 160 MiB absolute limits, measurement boundaries, GC protocol and workload
+are unchanged. Live V8 code accounting remains shadow only.
 
 The share fact archive uses one-byte field codes and exact small integers; fractional values,
 large numbers and negative zero retain Float64 representation. Well-formed strings use UTF-8;
@@ -84,9 +86,10 @@ These are bounds on the fixed workload, not averages measured from an archive:
 Before packing the share reserve was 25,416,640 bytes (23,288,256 exchanges, 2,128,384
 acknowledgements) and the share worker declared 29,487,024 bytes; the ordinary reserve is 728,048
 bytes. The packed layout lowers the share reserve to 19,118,080 bytes and the share worker to
-**23,188,464 bytes**, **6,294,464 bytes (6.00 MiB, 21.3%)** less including the new 4,096-byte engine code journal, without shrinking any row bound
-from observed traffic: each reserve is derived from the worst case of the new encoding. The
-producer, consumer and admin workers each declare 4,074,480 bytes, including that engine code journal. All declared bytes are
+**23,192,560 bytes**, **6,294,464 bytes (6.00 MiB, 21.3%)** less including the new 4,096-byte
+engine code journal, without shrinking any row bound from observed traffic: each reserve is derived
+from the worst case of the new encoding. The producer, consumer and admin workers each declare
+4,074,480 bytes, including that engine code journal. All declared bytes are
 allocated and touched before `c0`; moving the allocation changes the disabled RSS baseline, which
 is disclosed, not a subtraction from the 64 MiB delta verdict.
 
@@ -124,8 +127,9 @@ a passing run.
 
 Negative headroom predicts an overage. Consumer RSS remains a separate pre-existing concern.
 Under the same model the packed share layout lowers the share worker's setup and absolute peaks by
-6,294,464 bytes (6.00 MiB), including the engine code journal, and leaves its delta unchanged, because the reserve precedes
-`c0`. Against the 160 MiB absolute peak the share headroom becomes −9.58 MiB, so packing alone is
+6,294,464 bytes (6.00 MiB), including the engine code journal, and leaves its delta unchanged,
+because the reserve precedes `c0`. Against the 160 MiB absolute peak the share headroom is about
+−9.59 MiB, so packing alone is
 not predicted to clear that gate. Against its own setup allowance (96 MiB plus the declared bytes)
 the headroom is 17.50 MiB, whatever the declared size, since the allowance moves with the
 reserve. The closed-transient verdict is outside this storage fix. Fresh CI evidence must judge
@@ -202,6 +206,23 @@ Legacy/fixed ownership rows must agree at M, first, last and closed, including e
 released target IDs and the deliberately retained positive product root. Fixed storage format and
 byte length are checked at every checkpoint; legacy arrays report no fixed-storage metadata.
 These diagnostics are not live-worker attribution or acceptance evidence.
+
+## Broker-free data gates
+
+The separate broker-free resource artifacts use schema 6. Their control stability and 256 KiB
+closed ceiling judge Δdata = Δ(heapUsed + external) − Δ(V8 code_and_metadata_size + bytecode_and_metadata_size)
+at the final checkpoint of the unchanged settle protocol. Raw retained bytes and both V8 code
+readings remain recorded, and the validator recomputes the data quantity. No other bytes are
+subtracted, and RSS, external, peak and active-retention gates keep their original quantities.
+An unseeded closed data delta below −256 KiB is inconclusive.
+
+One measured warm-up lifecycle of the same kind and arm completes the same catalogue, closes and
+releases before M; M0 records the old matched position. The first-use data step M − M0 must be at
+most 1 MiB. CI on Node 22/24/26 checks product-root seeds of 131,072 bytes per close (at least
+512 KiB total), with and without seeding during warm-up, and a warm-up-only seed of 1 MiB + 1.
+The controls must fail the closed or first-use bound, while all 24 unseeded arms remain within
+±256 KiB closed data. Compiled-code and retained-array controls check code accounting. These data
+gates do not change live slope or endpoint acceptance; the live code series below remains shadow.
 
 ## Engine code shadow
 
