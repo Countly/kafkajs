@@ -197,7 +197,7 @@ jobs:
         if: fromJSON(steps.entry.outputs.check).needs.kerberos
         run: |
           [[ "$KDC_BASE_IMAGE" =~ @sha256:[a-f0-9]{64}$ ]] || { echo 'Set KDC_BASE_IMAGE to a pinned image containing MIT Kerberos tools'; exit 1; }
-          docker build --build-arg KDC_BASE_IMAGE="$KDC_BASE_IMAGE" -t gate-kdc:local testHelpers/kerberos
+          docker build --network=host --build-arg KDC_BASE_IMAGE="$KDC_BASE_IMAGE" -t gate-kdc:local testHelpers/kerberos
           docker pull "apache/kafka:$KAFKA_VERSION"
           mkdir -p "$RUNNER_TEMP/kerberos"
           chmod 777 "$RUNNER_TEMP/kerberos"
