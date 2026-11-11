@@ -5241,6 +5241,7 @@ describe('Share soak cycle finalization and isolation adapter', () => {
     const original = { sequence: 1, epoch: 4, socket: 1, endpoint: 'node:1' }
     let broken = false
     let redeliver
+    const resetWrites = []
     const tap = new ShareFetchTap(64, { now: () => 0 })
     const Broker = require('../../../src/broker')
     const { respondWithFrame } = require('../../../testHelpers/fakeSocket')
@@ -5358,6 +5359,8 @@ describe('Share soak cycle finalization and isolation adapter', () => {
               const recover = redeliver
               redeliver = null
               await recover()
+            } else if (resetWrites.length) {
+              tap.notify('api78-write', resetWrites.shift())
             }
             await Promise.resolve()
           }
@@ -5378,7 +5381,8 @@ describe('Share soak cycle finalization and isolation adapter', () => {
       topicId: SOAK_UUID,
       group: 'soak-group',
       admin: {},
-      leaders: new Map([[0, 'node:1']]),
+      leaders: new Map([0, 1, 2].map((nodeId) => [nodeId, `node:${nodeId + 1}`])),
+      nodes: new Map([0, 1, 2].map((nodeId) => [`node:${nodeId + 1}`, nodeId])),
     })
     driver.awaitMembers = async () => {}
     driver.produce = async () => {
@@ -5412,6 +5416,13 @@ describe('Share soak cycle finalization and isolation adapter', () => {
               messages: a.batch.batch.messages.map((message) => ({ ...message, deliveryCount: 2 })),
             },
           })
+          resetWrites.push(
+            ...[0, 1, 2].map((nodeId) => ({
+              endpoint: `node:${nodeId + 1}`,
+              groupId: 'soak-group',
+              memberId: a.memberId,
+            }))
+          )
         }
       return facts.produced
     }
@@ -5659,6 +5670,12 @@ describe('Share soak cycle finalization and isolation adapter', () => {
   test('waits for held identities to be redelivered before closing the workload member', async () => {
     const { work } = await cycle({ reset: true })
     const observed = await work
+    const writes = observed.steps.filter((row) => row.step === 'post-reset-api78')
+    expect(writes.map((row) => row.nodeId)).toEqual([0, 1, 2])
+    const disconnect = observed.steps.findIndex(
+      (row) => row.step === 'disconnect-start' && row.member === 'A'
+    )
+    expect(observed.steps.indexOf(writes[2])).toBeLessThan(disconnect)
     expect(observed.held).toHaveLength(20)
     expect(observed.handler).toHaveLength(80)
     for (const identity of observed.held)
