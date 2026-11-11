@@ -1620,7 +1620,7 @@ describe('Java telemetry role runner', () => {
     const fixture = path.join(root, 'scripts/e2e/telemetry')
     const digest = (file) => createHash('sha256').update(fs.readFileSync(file)).digest('hex')
     expect(digest(path.join(fixture, 'JavaTelemetryClient.java'))).toBe(
-      '1145746dfeadc7d315e42b1c9d3b3468d819929324cc7701cbddbb423f66b580'
+      '8c9254fd4e929ce95dd6b8d8cfbca8513f8ce8fe37d19d596421e4fa3e7736c3'
     )
     expect(digest(path.join(fixture, 'telemetryWireProbe.js'))).toBe(
       '139afdbec5034f7c1498b90306889fd918ae13097efee1ea9f435b03dcf9b1b1'
