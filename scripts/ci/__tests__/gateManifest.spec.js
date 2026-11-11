@@ -129,6 +129,11 @@ describe('exit gate manifest', () => {
     expect(missing).toEqual([])
   })
 
+  test('the KDC image builds on the host network so its package fetch uses the runner DNS', () => {
+    const build = workflow.split('\n').find((line) => /docker build .*gate-kdc:local/.test(line))
+    expect(build).toMatch(/docker build --network=host /)
+  })
+
   test('every expected title names an existing spec that its check selects', () => {
     for (const check of gate.checks) {
       if (!check.jest || !check.titles) continue
