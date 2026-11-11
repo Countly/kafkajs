@@ -116,6 +116,7 @@ describe('telemetry fixed journals', () => {
     expect(actual.before).toBeDefined()
     expect(actual.ledger.journalState().byteLength).toBe(actual.before.byteLength)
     exact(expected.ledger.facts(), actual.ledger.facts())
+    expect(actual.ledger.facts()).toEqual(expected.ledger.facts())
     expect(actual.ledger.facts().exchangesSha256).toBe(expected.ledger.facts().exchangesSha256)
     const fact = exchange(101)
     actual.ledger.exchanges.push(fact)
@@ -160,6 +161,10 @@ describe('telemetry fixed journals', () => {
     expect(churn.JournalConstancy.violations(input)).toEqual([])
     input.samples[1].snapshot.journals.byteLength++
     expect(churn.JournalConstancy.violations(input)).toContain('journal storage constancy')
+    expect(churn.JournalConstancy.apply({ ok: true, violations: [] }, input)).toMatchObject({
+      ok: false,
+      outcome: 'failed',
+    })
     input.samples[1].snapshot.journals.byteLength--
     input.teardown.journals.cursor = 4097
     expect(churn.JournalConstancy.violations(input)).toContain('journal cursor bounds')
@@ -172,9 +177,19 @@ describe('telemetry fixed journals', () => {
     const sampler = new PendingSampler(memory, { set: () => 1, clear: () => {}, capacity: 40 })
     const journal = new NativeJournal({ memory, sampler, capacity: 40, fixed: true })
     const before = journal.journalState()
+    const referenceSampler = new PendingSampler(memory, { set: () => 1, clear: () => {} })
+    const reference = new NativeJournal({ memory, sampler: referenceSampler, capacity: 40 })
     for (let i = 0; i < 40; i++) {
       const row = journal.begin('gzip', { buffer: Buffer.alloc(1) })
       journal.end(row, Buffer.alloc(2))
+      if (i < 32) {
+        const old = reference.begin('gzip', { buffer: Buffer.alloc(1) })
+        reference.end(old, Buffer.alloc(2))
+      }
+      if (i === 31) {
+        expect(journal.summary()).toEqual(reference.summary())
+        expect(sampler.summary()).toEqual(referenceSampler.summary())
+      }
     }
     expect(journal.journalState().byteLength).toBe(before.byteLength)
     expect(journal.summary().rows).toHaveLength(40)
