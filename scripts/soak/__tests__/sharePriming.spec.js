@@ -331,6 +331,16 @@ describe('fixed same-realm share priming', () => {
       const { owner, rows, result, error, problems, shares } = await recording({ short })
       expect(error).toBeUndefined()
       expect(result).toMatchObject({ ok: true, counts: { cycles: 30, resets: 10 } })
+      for (const scope of ['priming', 'scored']) {
+        const original = rows.filter((r) => r.scope === scope)
+        expect(verifyShareProtocol(original).problems).toEqual([])
+        const manifest = original.find((r) => r.event === 'soak-protocol-manifest')
+        const completion = original.find((r) =>
+          ['priming-complete', 'case-complete'].includes(r.event)
+        )
+        expect(manifest).toBeDefined()
+        expect(completion.protocolSha256).toBe(manifest.sha256)
+      }
       expect(problems).toEqual([])
       expect(verifySharePriming(rows)).toEqual([])
       expect(rows.filter((r) => r.event === 'soak-cycle')).toHaveLength(60)

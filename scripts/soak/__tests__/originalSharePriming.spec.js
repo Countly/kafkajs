@@ -110,6 +110,18 @@ describe('two-scope original share driver', () => {
           }
         workloadSockets.push(sockets)
         for (const cycle of cycles.filter((r) => r.reset)) {
+          const writes = cycle.steps.filter((r) => r.step === 'post-reset-api78')
+          expect([...new Set(writes.map((r) => r.nodeId))].sort()).toEqual([0, 1, 2])
+          const disconnect = cycle.steps.find(
+            (r) => r.member === 'A' && r.step === 'disconnect-start'
+          )
+          for (const write of writes) {
+            expect(write.at).toBeLessThanOrEqual(disconnect.at)
+            const exchange = cycle.provenance.exchanges.find((r) => r.id === write.exchange)
+            const frame = exchange.frames.find((r) => r.id === write.frame)
+            expect(frame.socket).toBe(write.socket)
+            expect(frame.at).toBe(write.at)
+          }
           expect(cycle.reset.oldSocket).not.toBe(cycle.reset.nextSocket)
           expect(sockets.has(cycle.reset.oldSocket)).toBe(true)
           expect(sockets.has(cycle.reset.nextSocket)).toBe(true)
