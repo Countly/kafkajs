@@ -416,6 +416,87 @@ jobs:
             .tmp/telemetry-cache/decoder-*.jsa.json
           if-no-files-found: error
           include-hidden-files: true
+  telemetry-seeded-control:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24, 26]
+    env:
+      KAFKA_VERSION: '4.3.1'
+      COMPOSE_FILE: docker-compose.telemetry.yml
+      COMPOSE_PROJECT_NAME: telemetry-seeded-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
+      TF1_CACHE: ${{ github.workspace }}/.tmp/telemetry-cache
+      TELEMETRY_JAVA_CACHE: ${{ github.workspace }}/.tmp/telemetry-cache
+      TELEMETRY_DECODER_ARCHIVE: ${{ github.workspace }}/.tmp/telemetry-cache/decoder-4.3.1.jsa
+      TELEMETRY_INTEROP_CACHE: ${{ github.workspace }}/.tmp/telemetry-interop
+      TELEMETRY_EVIDENCE_DIR: ${{ github.workspace }}/.tmp/telemetry-seeded
+      KAFKAJS_LANE: docker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '${{ matrix.node }}', cache: npm }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '21' }
+      - run: npm ci
+        timeout-minutes: 5
+      - name: Prepare telemetry control evidence
+        timeout-minutes: 1
+        run: |
+          echo "KAFKAJS_TREE=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          mkdir -p .tmp/e2e "$TELEMETRY_EVIDENCE_DIR"
+          chmod 0777 "$TELEMETRY_EVIDENCE_DIR"
+      - name: Verify retained jars offline and prepare decoder inputs
+        timeout-minutes: 5
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          timeout -k 5s 30s env -u TELEMETRY_JAVA_CACHE bash scripts/e2e/telemetry/run.sh verify "$KAFKA_VERSION"
+          timeout -k 5s 180s bash scripts/e2e/telemetry/fetch.sh
+          timeout -k 5s 30s bash scripts/e2e/telemetry/run.sh verify "$KAFKA_VERSION"
+          timeout -k 5s 60s node scripts/e2e/telemetry/prepareDecoder.js
+      - name: Preflight isolated project ownership
+        timeout-minutes: 2
+        run: timeout -k 5s 90s node scripts/e2e/telemetry/ci.js preflight
+      - name: Prepare broker image
+        timeout-minutes: 4
+        run: timeout -k 5s 210s docker compose -f "$COMPOSE_FILE" pull
+      - name: Start and warm the owned telemetry cluster
+        timeout-minutes: 6
+        run: |
+          timeout -k 5s 90s docker compose -f "$COMPOSE_FILE" up -d --pull never
+          timeout -k 5s 240s node scripts/waitForKafka.js
+      - name: Verify mounted reporter and capture broker identities
+        timeout-minutes: 3
+        run: timeout -k 5s 150s node scripts/e2e/telemetry/ci.js capture
+      - name: Run the seeded telemetry churn control at twice the slope limit
+        timeout-minutes: 12
+        env:
+          TMPDIR: ${{ runner.temp }}
+          TELEMETRY_SEED: slope2x
+        run: timeout -k 10s 600s npm run test:group:telemetry-seeded-control -- --ci
+      - name: Require the seeded control to have detected its retained slope
+        timeout-minutes: 1
+        run: node -e "require('./scripts/soak/liveSeed').requireControl(process.env.TELEMETRY_EVIDENCE_DIR)"
+      - name: Stop owned project and prove container network volume removal
+        if: always()
+        timeout-minutes: 3
+        run: |
+          timeout -k 5s 150s node scripts/e2e/telemetry/ci.js stop
+          node -e "require('./scripts/e2e/telemetry/evidence').verifyCleanup(process.env.TELEMETRY_EVIDENCE_DIR, '.tmp/e2e', process.env.COMPOSE_PROJECT_NAME)"
+      - if: always()
+        timeout-minutes: 2
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-telemetry-seeded-node${{ matrix.node }}
+          path: |
+            .tmp/e2e/
+            .tmp/telemetry-seeded/
+            .tmp/telemetry-cache/decoder-*.jsa.json
+          if-no-files-found: error
+          include-hidden-files: true
   live-owner-census:
     if: github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/')
     runs-on: ubuntu-latest
@@ -538,7 +619,7 @@ jobs:
     name: memory-gates-verdict
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [unit, share-soak-verdict, resources, journal-controls, retained-diagnostic, telemetry-soak, live-owner-census, telemetry-verdicts, telemetry-verdict-controls]
+    needs: [unit, share-soak-verdict, resources, journal-controls, retained-diagnostic, telemetry-soak, telemetry-seeded-control, live-owner-census, telemetry-verdicts, telemetry-verdict-controls]
     if: always() && (github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/'))
     steps:
       - name: Require every relocated memory gate

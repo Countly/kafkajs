@@ -1240,3 +1240,67 @@ live(
   ),
   caseTimeout(CHURN_BUDGET)
 )
+
+/**
+ * The seeded control of the churn case: the same `main('telemetry')` owner with every worker
+ * retaining twice the slope limit through the product's `Kafka` class, selected by the environment.
+ * Its records go only under `controls/` of the run directory, never to scenario evidence. It passes
+ * only when every worker's own live verdict reports the retained slope and its shadow data slope
+ * matches the seed; the run's overall verdict, which the seed fails by design, is not consulted.
+ */
+live(
+  'telemetry seeded control',
+  liveCase(CHURN_BUDGET, async (scope) => {
+    const { main, buildTelemetryChurn, TELEMETRY } = require('../../../scripts/soak/soak')
+    const {
+      LIVE_SEED,
+      ControlRecords,
+      factsOf,
+      judgeSeededRun,
+    } = require('../../../scripts/soak/liveSeed')
+    const directory = process.env.TELEMETRY_EVIDENCE_DIR
+    if (process.env[LIVE_SEED.env] !== LIVE_SEED.mode)
+      throw new Error(`${LIVE_SEED.env} must select the seeded control`)
+    if (!directory || !path.isAbsolute(directory))
+      throw new Error('TELEMETRY_EVIDENCE_DIR must name the absolute run directory')
+    const reason = (error) => String(error?.message ?? error).slice(0, 2048)
+    const records = new ControlRecords(directory)
+    const restore = exposeCollection()
+    try {
+      let parent
+      let result
+      try {
+        result = await bounded(
+          scope,
+          CHURN_BUDGET,
+          () =>
+            main('telemetry', {
+              brokers: PORTS.map((port) => `localhost:${port}`),
+              telemetry: (options) =>
+                (parent = buildTelemetryChurn({
+                  ...options,
+                  record: (row) => records.record(row),
+                })),
+            }),
+          { label: 'The seeded telemetry churn' }
+        )
+      } catch (error) {
+        parent?.fail(error)
+        records.finish({ ok: false, failure: reason(error), workers: [] })
+        throw error
+      }
+      const workers = result.workers.map(factsOf)
+      let failure = null
+      try {
+        judgeSeededRun(workers, TELEMETRY)
+      } catch (error) {
+        failure = error
+      }
+      records.finish({ ok: failure === null, failure: failure && reason(failure), workers })
+      if (failure) throw failure
+    } finally {
+      restore()
+    }
+  }),
+  caseTimeout(CHURN_BUDGET)
+)

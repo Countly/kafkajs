@@ -53,6 +53,7 @@ const {
 const gzipCodec = require('../../src/protocol/message/compression/gzip')
 const zstdCodec = require('../../src/protocol/message/compression/zstd')
 const { slope } = require('./bounds')
+const { LIVE_SEED, LiveSeed } = require('./liveSeed')
 const {
   ShareTrace,
   acknowledgementResponse,
@@ -4052,7 +4053,10 @@ class TelemetryChurn {
       const input = { ...result.input, clientCount: 1 }
       const resourceVerdict = this.verdict(input)
       const evaluated = JournalConstancy.apply(resourceVerdict, input)
-      const shadow = result.shadow ? { shadow: result.shadow } : {}
+      const beside = {
+        ...(result.shadow && { shadow: result.shadow }),
+        ...(result.seed && { seed: result.seed }),
+      }
       workers.push({
         kind: result.kind,
         input,
@@ -4060,7 +4064,7 @@ class TelemetryChurn {
         exit,
         uuid: result.uuid,
         facts: result.facts,
-        ...shadow,
+        ...beside,
       })
       this.record({
         kind: 'resource-verdict',
@@ -4069,7 +4073,7 @@ class TelemetryChurn {
         uuid: result.uuid,
         input,
         result: evaluated,
-        ...shadow,
+        ...beside,
       })
       this.record({ ...exit, kind: 'natural-exit', clientKind: result.kind })
       if (!evaluated.ok)
@@ -4318,6 +4322,29 @@ class TelemetryWorkerProcess {
   }
 
   /**
+   * The seeded control of this worker, selected by the environment.
+   * @returns {LiveSeed|null} the seed that retains through the product `Kafka` class, or null
+   * @throws {Error} for an unknown seed mode
+   */
+  seeded() {
+    return LiveSeed.of(this.env[LIVE_SEED.env], {
+      root: this.soak.Kafka,
+      limits: this.soak.TELEMETRY,
+    })
+  }
+
+  /**
+   * Forwards one soak row to the parent. The row of a scheduled sample also retains the seeded
+   * control's buffer for the interval that follows it, so the next reading carries it.
+   * @param {object} row a soak row @param {LiveSeed|null} seed the seeded control, if any
+   * @returns {void}
+   */
+  progress(row, seed) {
+    this.send({ type: 'progress', row })
+    if (row.kind === 'sample') seed?.retain()
+  }
+
+  /**
    * Builds the one public client of this kind with telemetry on.
    * @param {object} kafka the instrumented `Kafka` @param {object} config the parent's configuration
    * @returns {object} the public client
@@ -4438,8 +4465,10 @@ class TelemetryWorkerProcess {
     let failure
     let failed = false
     let worker = null
+    let seed = null
     try {
       const config = await this.inbox.take((m) => m.type === 'config')
+      seed = this.seeded()
       const schedule = new TelemetrySchedule(soak.TELEMETRY)
       const ledger =
         kind === 'shareConsumer'
@@ -4611,7 +4640,7 @@ class TelemetryWorkerProcess {
         warmupMs: soak.TELEMETRY.warmupMs,
         judge: (run) =>
           judge({ ...run, skipped: soakRun.skipped, readFailures: soakRun.readFailures }),
-        record: (row) => this.send({ type: 'progress', row }),
+        record: (row) => this.progress(row, seed),
         workloads: soak.WORKLOADS,
         clock: this.clock,
       })
@@ -4628,6 +4657,7 @@ class TelemetryWorkerProcess {
           input,
           facts: worker.facts(),
           shadow,
+          seed: seed?.summary() ?? null,
         },
         { flush: true }
       )

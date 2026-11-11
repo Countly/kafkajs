@@ -20,6 +20,7 @@ describe('resource measurement reporter', () => {
       'test:group:share-soak',
       'test:group:telemetry-shutdown',
       'test:group:telemetry-soak',
+      'test:group:telemetry-seeded-control',
     ]) {
       expect({ name, reporters: scripts[name].match(/--reporters[= ][^ ]+/g) }).toEqual({
         name,

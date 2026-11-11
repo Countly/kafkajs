@@ -7550,13 +7550,10 @@ const buildShareSoak = ({ brokers, short = false, record, run }) => {
  *   by default, a live spec supplies its own sink
  * @returns {{ run: () => Promise<{ ok: boolean }>, close: () => Promise<void> }}
  * @throws {Error} without `--expose-gc`, for another phase list, an unconfigured broker line or
- *   evidence directory, and for a worker without its kind or IPC channel
+ *   evidence directory, for a worker without its kind or IPC channel, and for a seeded run (the
+ *   `TELEMETRY_SEED` control) given no sink of its own, so it never writes scenario evidence
  */
-const buildTelemetryChurn = ({
-  brokers: requested,
-  phases,
-  record = (row) => writeEvidence('telemetry-churn', row),
-}) => {
+const buildTelemetryChurn = ({ brokers: requested, phases, record }) => {
   if (typeof globalThis.gc !== 'function')
     throw new Error(
       'The telemetry profile reads memory after a collection: run node with --expose-gc'
@@ -7564,6 +7561,7 @@ const buildTelemetryChurn = ({
   if (JSON.stringify(phases) !== JSON.stringify(PROFILES.telemetry))
     throw new Error('The telemetry profile runs its one fixed phase')
   const churn = require('./telemetryChurn')
+  const { LIVE_SEED } = require('./liveSeed')
   const kind = process.env[churn.WORKER_ENV]
   if (kind !== undefined) {
     if (!churn.KINDS.includes(kind) || typeof process.send !== 'function')
@@ -7585,6 +7583,8 @@ const buildTelemetryChurn = ({
     })
     return { run: () => worker.run(), close: async () => {} }
   }
+  if (process.env[LIVE_SEED.env] && !record)
+    throw new Error('A seeded telemetry run records only to a control sink')
   const line = process.env.KAFKA_VERSION
   const directory = process.env.TELEMETRY_EVIDENCE_DIR ?? ''
   if (
@@ -7614,7 +7614,7 @@ const buildTelemetryChurn = ({
     }),
     processes: new churn.TelemetryProcesses({ script: __filename }),
     decoder: new churn.DecoderCoordinator({ directory, line, clock }),
-    record,
+    record: record ?? ((row) => writeEvidence('telemetry-churn', row)),
     clock,
     limits: TELEMETRY,
     verdict: (input) => TelemetryResourceVerdict.evaluate(input),

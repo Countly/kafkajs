@@ -1367,6 +1367,7 @@ describe('broker telemetry fixture', () => {
       'journal-controls',
       'retained-diagnostic',
       'telemetry-soak',
+      'telemetry-seeded-control',
       'live-owner-census',
       'telemetry-verdicts',
       'telemetry-verdict-controls',
@@ -1387,6 +1388,7 @@ describe('broker telemetry fixture', () => {
       'journal-controls',
       'retained-diagnostic',
       'telemetry-soak',
+      'telemetry-seeded-control',
       'live-owner-census',
       'telemetry-verdicts',
       'telemetry-verdict-controls',
@@ -1598,6 +1600,76 @@ describe('broker telemetry fixture', () => {
       'if-no-files-found': 'error',
     })
     expect(JSON.stringify(soak)).not.toContain('forceExit')
+  })
+
+  test('wires the seeded live control as its own job whose records stay out of acceptance evidence', () => {
+    // eslint-disable-next-line n/no-extraneous-require -- YAML parser is pinned by the ESLint/Jest toolchain
+    const yaml = require('js-yaml')
+    const { LIVE_SEED } = require('../../soak/liveSeed')
+    const { TELEMETRY } = require('../../soak/soak')
+    const workflow = yaml.load(read('.github/workflows/memory-gates.yml').toString())
+    const control = workflow.jobs['telemetry-seeded-control']
+    const soak = workflow.jobs['telemetry-soak']
+    expect(control.strategy).toEqual({ 'fail-fast': false, matrix: { node: [22, 24, 26] } })
+    expect(control.env.KAFKA_VERSION).toBe('4.3.1')
+    expect(control.env.COMPOSE_FILE).toBe('docker-compose.telemetry.yml')
+    for (const identity of ['github.run_id', 'github.run_attempt', 'strategy.job-index'])
+      expect(control.env.COMPOSE_PROJECT_NAME).toContain(identity)
+    expect(control.env.COMPOSE_PROJECT_NAME).not.toBe(soak.env.COMPOSE_PROJECT_NAME)
+    expect(control.env.TELEMETRY_EVIDENCE_DIR).not.toBe(soak.env.TELEMETRY_EVIDENCE_DIR)
+    for (const [name, job] of Object.entries(workflow.jobs)) {
+      const sets = [job.env, ...(job.steps ?? []).map((step) => step.env)].filter(
+        (env) => env && LIVE_SEED.env in env
+      )
+      expect({ name, sets: sets.length }).toEqual({
+        name,
+        sets: name === 'telemetry-seeded-control' ? 1 : 0,
+      })
+    }
+    const steps = control.steps.filter((step) => step.run)
+    for (const step of steps) expect(step['timeout-minutes']).toBeGreaterThan(0)
+    const ordered = [
+      'run.sh verify',
+      'fetch.sh',
+      'prepareDecoder.js',
+      'ci.js preflight',
+      'docker compose -f "$COMPOSE_FILE" pull',
+      'docker compose -f "$COMPOSE_FILE" up',
+      'ci.js capture',
+      'test:group:telemetry-seeded-control',
+      'requireControl(',
+      'ci.js stop',
+    ]
+    const positions = ordered.map((text) => steps.findIndex((step) => step.run.includes(text)))
+    expect(positions.every((index) => index >= 0)).toBe(true)
+    expect([...positions].sort((a, b) => a - b)).toEqual(positions)
+    const run = steps[positions[7]]
+    expect(run.env[LIVE_SEED.env]).toBe(LIVE_SEED.mode)
+    expect(run.run).toBe('timeout -k 10s 600s npm run test:group:telemetry-seeded-control -- --ci')
+    const soakRun = soak.steps.find((step) => step.run?.includes('test:group:telemetry-soak'))
+    expect(run['timeout-minutes']).toBe(soakRun['timeout-minutes'])
+    expect(TELEMETRY.caseMs / 1000 + 10).toBeLessThanOrEqual(600)
+    expect(run['timeout-minutes'] * 60).toBeGreaterThan(600)
+    expect(control['timeout-minutes']).toBe(soak['timeout-minutes'])
+    const total = steps.reduce((sum, step) => sum + step['timeout-minutes'], 0)
+    expect(control['timeout-minutes']).toBeGreaterThan(total)
+    expect(steps[positions[8]].run).toContain(
+      "require('./scripts/soak/liveSeed').requireControl(process.env.TELEMETRY_EVIDENCE_DIR)"
+    )
+    expect(steps[positions[9]].if).toBe('always()')
+    expect(steps[positions[9]].run).toContain('verifyCleanup(')
+    expect(control.steps.at(-1)).toMatchObject({
+      if: 'always()',
+      uses: 'actions/upload-artifact@v4',
+      with: {
+        name: 'e2e-telemetry-seeded-node$' + '{{ matrix.node }}',
+        'if-no-files-found': 'error',
+        'include-hidden-files': true,
+      },
+    })
+    const serialized = JSON.stringify(control)
+    expect(serialized).not.toMatch(/verifyEvidence|scripts\/evidence\/verify\.js|forceExit/)
+    expect(workflow.jobs.verdict.needs).toContain('telemetry-seeded-control')
   })
 })
 
