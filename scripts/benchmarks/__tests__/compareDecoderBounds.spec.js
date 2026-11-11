@@ -38,21 +38,34 @@ const row = (name, A = constant(100), B = A, C = A) => {
         side,
         [arm.metric]: { A, B, C }[side][block],
         roundNsPerOp: Array(arm.name.startsWith('frame-') ? 7 : 5).fill({ A, B, C }[side][block]),
+        ...(arm.metric === 'nsPerFrame' && { warmupRoundNsPerOp: [120, 110, 100] }),
       }))
     ),
   }
 }
-const completeInput = (overrides = {}) => ({
-  baselineSha: BASELINE,
-  candidateSha: CANDIDATE,
-  node: 'v26.0.0',
-  registeredRows: ARMS.map(({ name }) => name),
-  seed: 42,
-  schedule: createSchedule(42),
-  arms: ARMS.filter(({ required }) => required).map(({ name }) => row(name)),
-  unavailable: [...OPTIONAL],
-  ...overrides,
-})
+const completeInput = (overrides = {}) => {
+  const schedule = createSchedule(42)
+  const unavailable = overrides.unavailable ?? [...OPTIONAL]
+  return {
+    baselineSha: BASELINE,
+    candidateSha: CANDIDATE,
+    node: 'v26.0.0',
+    registeredRows: ARMS.map(({ name }) => name),
+    seed: 42,
+    schedule,
+    arms: ARMS.filter(({ required }) => required).map(({ name }) => row(name)),
+    unavailable,
+    unavailableInvocations: Array.isArray(unavailable)
+      ? unavailable.map((name) => ({
+          name,
+          invocations: schedule.flatMap((order, block) =>
+            order.map((side) => ({ block, side, available: 0 }))
+          ),
+        }))
+      : [],
+    ...overrides,
+  }
+}
 const withRow = (arm) =>
   completeInput({ arms: completeInput().arms.map((a) => (a.name === arm.name ? arm : a)) })
 const resultOf = (arm) => compare(withRow(arm)).arms.find(({ name }) => name === arm.name)
@@ -188,6 +201,73 @@ describe('Decoder performance comparison', () => {
       expect((await runInput(input)).status).toBe(1)
     }
     expect(compare(null).pass).toBe(false)
+  })
+
+  test.each([
+    ['missing', undefined],
+    ['truncated', [120, 110]],
+    ['NaN', [120, NaN, 100]],
+    ['zero', [120, 0, 100]],
+  ])('rejects %s frame warmup evidence', async (_label, warmup) => {
+    expect(compare(completeInput()).pass).toBe(true)
+    for (const { name } of ARMS.filter(({ metric }) => metric === 'nsPerFrame')) {
+      for (const side of ['A', 'B', 'C']) {
+        const input = completeInput()
+        const frame = input.arms.find((arm) => arm.name === name)
+        const invocation = frame.invocations.find((invocation) => invocation.side === side)
+        if (warmup === undefined) delete invocation.warmupRoundNsPerOp
+        else invocation.warmupRoundNsPerOp = warmup
+        const result = compare(input)
+        expect(result.pass).toBe(false)
+        expect(result.arms.find((arm) => arm.name === name).verdict).toBe('invalid')
+        expect((await runInput(input)).status).toBe(1)
+      }
+    }
+  })
+
+  it('rejects unavailable codecs without complete absence evidence for all paired invocations', async () => {
+    expect(compare(completeInput()).pass).toBe(true)
+    const measured = completeInput({ arms: ARMS.map(({ name }) => row(name)), unavailable: [] })
+    delete measured.unavailableInvocations
+    expect(compare(measured).pass).toBe(true)
+    expect((await runInput(measured)).status).toBe(0)
+    const mutations = [
+      (i) => delete i.unavailableInvocations,
+      (i) => (i.unavailableInvocations = []),
+      (i) => i.unavailableInvocations.pop(),
+      (i) => (i.unavailableInvocations[0] = i.unavailableInvocations[1]),
+      (i) => i.unavailableInvocations[0].invocations.pop(),
+      (i) => (i.unavailableInvocations[0].invocations[89].block = 0),
+      (i) => (i.unavailableInvocations[0].invocations[89].side = 'wrong'),
+      (i) => (i.unavailableInvocations[0].invocations[89].error = 'control failed'),
+      ...['A', 'B', 'C'].map(
+        (side) => (i) =>
+          (i.unavailableInvocations[0].invocations.find(
+            (invocation) => invocation.side === side
+          ).available = 1)
+      ),
+    ]
+    for (const mutate of mutations) {
+      const input = completeInput()
+      mutate(input)
+      expect(compare(input).pass).toBe(false)
+      expect((await runInput(input)).status).toBe(1)
+    }
+  })
+
+  it('rejects a regressing optional codec reclassified as unavailable without evidence', async () => {
+    const name = OPTIONAL[0]
+    const input = completeInput({ unavailable: OPTIONAL.filter((other) => other !== name) })
+    input.arms.push(row(name, constant(100), constant(112)))
+    const result = compare(input)
+    expect(result.pass).toBe(false)
+    expect(result.arms.find((arm) => arm.name === name).verdict).toBe('regression')
+    expect((await runInput(input)).status).toBe(1)
+    input.arms.pop()
+    input.unavailable.push(name)
+    delete input.unavailableInvocations
+    expect(compare(input).pass).toBe(false)
+    expect((await runInput(input)).status).toBe(1)
   })
 
   test.each(OPTIONAL)('requires a measured or unavailable disposition for %s', async (name) => {
@@ -409,6 +489,7 @@ const collectorFor = ({ missing = [], now = () => 0, advance = () => {} } = {}) 
               roundNsPerOp: Array(arm.name.startsWith('frame-') ? 7 : 5).fill(
                 cwd === 'OLD' ? 100 : 101
               ),
+              ...(arm.metric === 'nsPerFrame' && { warmupRoundNsPerOp: [120, 110, 100] }),
             }
       return { status: 0, stdout: `${JSON.stringify(measurement)}\n`, stderr: '' }
     },
