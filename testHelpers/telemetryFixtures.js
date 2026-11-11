@@ -647,7 +647,9 @@ const parseRequest = (prefix, length) => {
     head.compressionType = cursor.int8()
     const size = cursor.varuint() - 1
     if (size < 0) throw new Error('Null PushTelemetry metrics')
-    head.blob = Buffer.from(cursor.take(size))
+    const bytes = cursor.take(size)
+    head.blob = Buffer.alloc(size)
+    bytes.copy(head.blob)
   }
   cursor.tags()
   cursor.done()
@@ -732,6 +734,24 @@ const decompress = (type, blob) => {
  * @returns {string} lower-case SHA-256 hex
  */
 const sha256 = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex')
+
+/**
+ * Joins public disconnect without an observer receiver in its awaited stack frame. Only the
+ * client, original options, borrowed clock and scalar close receipt enter this boundary.
+ * @param {object} client public client
+ * @param {object|undefined} options original disconnect arguments
+ * @param {{now:function():number}} clock borrowed monotonic clock
+ * @param {{at:number,pending:string[],end?:number}} close scalar close receipt
+ * @returns {Promise<void>} after disconnect and receipt completion
+ * @throws {*} the original disconnect failure, without reading its stack
+ */
+const closeObservedClient = async (client, options, clock, close) => {
+  try {
+    await client.disconnect(options)
+  } finally {
+    close.end = clock.now()
+  }
+}
 
 /**
  * Observes the real client sockets of one public client, independently of the library. It wraps
@@ -853,24 +873,24 @@ class TelemetryWireObserver {
    * @returns {Promise<void>} after the original disconnect settles
    * @throws {*} the original disconnect failure
    */
-  async closeClient(client, options) {
-    const close = {
-      at: this.#clock.now(),
-      pending: this.#records
-        .filter(
-          (r) =>
-            r.type === 'request' &&
-            TELEMETRY_APIS.has(r.apiKey) &&
-            !r.response &&
-            !this.#sockets.get(r.socketId).closed
-        )
-        .map((r) => r.requestKey),
-    }
-    this.#closures.push(close)
+  closeClient(client, options) {
     try {
-      await client.disconnect(options)
-    } finally {
-      close.end = this.#clock.now()
+      const close = {
+        at: this.#clock.now(),
+        pending: this.#records
+          .filter(
+            (r) =>
+              r.type === 'request' &&
+              TELEMETRY_APIS.has(r.apiKey) &&
+              !r.response &&
+              !this.#sockets.get(r.socketId).closed
+          )
+          .map((r) => r.requestKey),
+      }
+      this.#closures.push(close)
+      return closeObservedClient(client, options, this.#clock, close)
+    } catch (error) {
+      return Promise.reject(error)
     }
   }
 
