@@ -504,6 +504,8 @@ describe('share node socket integration', () => {
     })
     const arrived = deferred()
     const held = deferred()
+    const response = h.hold({ api: 'ShareFetch', node: 0 })
+    const walk = jest.spyOn(ShareRecordWalk, 'walk')
     n0.dispatch = async (rows) => {
       await Promise.all(
         rows.map(async (row) => {
@@ -525,11 +527,21 @@ describe('share node socket integration', () => {
     const first0 = n0.loop.poll()
     const first1 = n1.loop.poll()
     const first2 = n2.loop.poll()
-    await arrived.promise
+    await response.arrived()
     await Promise.all([first1, first2])
-    await Promise.all([n1.loop.poll(), n2.loop.poll()])
-    expect(n0.loop.poll()).toBe(first0)
+    const otherWalks = walk.mock.calls.length
+    for (let i = 0; i < 5; i++) expect(n0.loop.poll()).toBe(first0)
     await flush()
+    expect(fetchFrames(h, 0)).toHaveLength(1)
+    expect(n0.handled).toEqual([])
+    expect(walk).toHaveBeenCalledTimes(otherWalks)
+    response.release()
+    await arrived.promise
+    expect(walk).toHaveBeenCalledTimes(otherWalks + 2)
+    await Promise.all([n1.loop.poll(), n2.loop.poll()])
+    for (let i = 0; i < 5; i++) expect(n0.loop.poll()).toBe(first0)
+    await flush()
+    expect(walk).toHaveBeenCalledTimes(otherWalks + 2)
     expect(fetchFrames(h, 0)).toHaveLength(1)
     expect(frames(h.cluster, 79)).toHaveLength(0)
     const acks = (frame) =>
@@ -547,6 +559,7 @@ describe('share node socket integration', () => {
       [1, [batchOf(200, 201, 1)]],
     ])
     expect(frames(h.cluster, 79)).toHaveLength(0)
+    expect(walk).toHaveBeenCalledTimes(otherWalks + 2)
     const handled = [...n0.handled, ...n1.handled, ...n2.handled].map(({ value }) => value)
     expect(handled.sort()).toEqual(['p0-0', 'p0-1', 'p1-0', 'p1-1', 'p2-0', 'p2-1', 'p3-0', 'p3-1'])
   })

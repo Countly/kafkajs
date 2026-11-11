@@ -106,6 +106,45 @@ An open transaction blocks a read_committed group's delivery.
 
 The broker applies isolation for the whole group. ShareFetch sends no client isolation setting and returns no aborted-transaction list or last stable offset. The client applies no transactional filtering. Acquired control records and completed-walk missing offsets are Gap acknowledgements, never handler messages. Set the desired GROUP configuration with `admin.incrementalAlterConfigs` and poll `admin.describeConfigs` until it reads back before joining; joining first can initialize share-partition state with `latest`.
 
+## Dead-letter queues
+
+A Kafka 4.4 broker can write the records that a share group rejects, or releases past its delivery count limit, to a dead-letter queue (DLQ) topic (KIP-1191). The broker does the routing and the existing admin calls configure it. This client has no DLQ option and no DLQ method, and `acknowledge('reject')` and `acknowledge('release')` behave as before. The feature needs `share.version` finalized at 2, which in turn needs `metadata.version` 4.4-IV0 or later; `admin.describeFeatures()` shows the finalized levels.
+
+| Scope | Config | Default | Meaning |
+|---|---|---|---|
+| Group | `errors.deadletterqueue.topic.name` | empty: no DLQ for the group | The destination topic. It must not start with `__`. |
+| Group | `errors.deadletterqueue.copy.record.enable` | `false` | `true` copies the original key and value into the DLQ record; `false` writes the headers only. |
+| Group | `share.delivery.count.limit` | the broker's `group.share.delivery.count.limit`, 5 | Deliveries before a released record is archived. A group value must lie within the broker's minimum (default 2) and maximum (default 10). |
+| Topic | `errors.deadletterqueue.group.enable` | `false` | Must be `true` on the destination topic. |
+| Cluster | `errors.deadletterqueue.topic.name.prefix` | `dlq.` | The destination topic name must start with it; an empty value lifts the restriction. |
+| Cluster | `errors.deadletterqueue.auto.create.topics.enable` | `false` | When `true` the broker creates a missing destination topic with the topic setting enabled. |
+
+An operator sets the cluster prefix and auto-create policy in the broker configuration. Dynamic reconfiguration of these two settings through a `BROKER` resource has not been verified. With those operator settings in place, create the destination topic first, then configure the group before any member joins:
+
+```js
+const { ConfigResourceTypes, AlterConfigOpTypes } = require('@countly/kafkajs')
+
+const set = (name, value) => ({ name, operation: AlterConfigOpTypes.SET, value })
+const alter = async (type, name, configEntries) => {
+  const { resources } = await admin.incrementalAlterConfigs({
+    resources: [{ type, name, configEntries }],
+  })
+  if (resources[0].errorCode !== 0) throw new Error(resources[0].errorMessage)
+}
+
+await admin.createTopics({ topics: [{ topic: 'dlq.orders', numPartitions: 1 }] })
+await alter(ConfigResourceTypes.TOPIC, 'dlq.orders', [set('errors.deadletterqueue.group.enable', 'true')])
+await alter(ConfigResourceTypes.GROUP, 'orders', [
+  set('errors.deadletterqueue.topic.name', 'dlq.orders'),
+  set('errors.deadletterqueue.copy.record.enable', 'true'),
+  set('share.delivery.count.limit', '3'),
+])
+```
+
+Poll `admin.describeConfigs` until the values read back before a member joins, as for the other group settings. A reject sends the record to the DLQ at once. A release sends it back to the group until the record has been delivered `share.delivery.count.limit` times; the release at that limit archives it and the broker writes it to the DLQ. Release therefore does not guarantee another delivery. Whether a lock timeout at the limit also writes a DLQ record is not established here.
+
+Each DLQ record is one record of the destination topic, in partition `source partition % destination partitions`, with six headers whose values are UTF-8 text: `__dlq.errors.topic`, `__dlq.errors.partition` and `__dlq.errors.offset` (decimal) name the source record, `__dlq.errors.group` the group, `__dlq.errors.delivery.count` the count at that point, and `__dlq.errors.message` the cause (`Offset rejected by client.` or `Offset delivery count exceeded the threshold.`). Its key and value are null unless the group copies the record. Read the destination with an ordinary consumer. The broker can rarely write more than one DLQ record for one source offset, so make that consumer idempotent on source topic, partition and offset.
+
 ## Events and diagnostics
 
 `share.events` has eighteen public names: `heartbeat`, `group_join`, `assignment_changed`, `fetch`, `acknowledge`, `session_reset`, `lock_expired`, `handler_error`, `connect`, `disconnect`, `stop`, `crash`, `network.request`, `network.request_timeout`, `network.request_queue_size`, `network.authentication_failure`, `cluster.topic_recreated`, `cluster.rebootstrap`, each prefixed with `share_consumer.`. `session_reset` reports a data-session reset or, with reason `membership`, a session the run discarded when its membership closed; `recordsDropped` counts the delivered records that reset discarded, not automatic gap spans or records already settled. Subscribe with `share.on(share.events.ACKNOWLEDGE, listener)`; it returns a remover. Unknown names throw synchronously. Sync listener throws and rejected returns are logged and contained.

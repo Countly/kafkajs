@@ -149,6 +149,59 @@ const readBody = (decoder) => {
   return value
 }
 
+/** @param {Decoder} decoder Response reader. @returns {object} Literal response fields. @throws {Error} Truncated fields or tags. */
+const readAcquiredRecords = (decoder) => {
+  const value = {
+    firstOffset: decoder.readInt64().toString(),
+    lastOffset: decoder.readInt64().toString(),
+    deliveryCount: decoder.readInt16(),
+  }
+  decoder.readTaggedFields()
+  return value
+}
+
+/** @param {Decoder} decoder Response reader. @returns {object} Literal response fields. @throws {Error} Truncated fields or tags. */
+const readResponsePartition = (decoder) => {
+  const value = {
+    partitionIndex: decoder.readInt32(),
+    errorCode: decoder.readInt16(),
+    errorMessage: decoder.readUVarIntString(),
+    acknowledgeErrorCode: decoder.readInt16(),
+    acknowledgeErrorMessage: decoder.readUVarIntString(),
+    currentLeader: {
+      leaderId: decoder.readInt32(),
+      leaderEpoch: decoder.readInt32(),
+    },
+  }
+  decoder.readTaggedFields()
+  value.records = decoder.readUVarIntBytes()
+  value.acquiredRecords = decoder.readUVarIntArray(readAcquiredRecords)
+  decoder.readTaggedFields()
+  return value
+}
+
+/** @param {Decoder} decoder Response reader. @returns {object} Literal response fields. @throws {Error} Truncated fields or tags. */
+const readResponseTopic = (decoder) => {
+  const value = {
+    topicId: decoder.readUuid(),
+    partitions: decoder.readUVarIntArray(readResponsePartition),
+  }
+  decoder.readTaggedFields()
+  return value
+}
+
+/** @param {Decoder} decoder Response reader. @returns {object} Literal response fields. @throws {Error} Truncated fields or tags. */
+const readNodeEndpoint = (decoder) => {
+  const value = {
+    nodeId: decoder.readInt32(),
+    host: decoder.readUVarIntString(),
+    port: decoder.readInt32(),
+    rack: decoder.readUVarIntString(),
+  }
+  decoder.readTaggedFields()
+  return value
+}
+
 /**
  * Independent ShareFetch v2 wire pair; uses protocol primitives and literal released-source fields.
  * It models no broker state and imports no request encoder, response decoder or share codec helper.
@@ -168,6 +221,27 @@ module.exports = {
   buildResponse(fields = {}, { tagged = false } = {}) {
     const tags = tagged ? [{ tag: 10, value: Buffer.from([0x61]) }] : []
     return encodeResponse({ ...literal.response, ...fields }, tags).buffer
+  },
+  /**
+   * @param {Buffer} body Response body without its header.
+   * @returns {object} All response fields; int64 offsets remain exact decimal strings and a
+   *   partition's `records` is the raw record bytes.
+   * @throws {Error} Truncated body or trailing bytes after the tag buffer.
+   */
+  readResponse(body) {
+    const decoder = new Decoder(body)
+    const value = {
+      throttleTime: decoder.readInt32(),
+      errorCode: decoder.readInt16(),
+      errorMessage: decoder.readUVarIntString(),
+      acquisitionLockTimeoutMs: decoder.readInt32(),
+      responses: decoder.readUVarIntArray(readResponseTopic),
+      nodeEndpoints: decoder.readUVarIntArray(readNodeEndpoint),
+    }
+    decoder.readTaggedFields()
+    if (decoder.canReadBytes(1))
+      throw new Error('ShareFetch v2 response has a byte after its tag buffer')
+    return value
   },
   /**
    * @param {Buffer} body Request body without its header.

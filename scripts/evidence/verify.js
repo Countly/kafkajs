@@ -10,6 +10,8 @@
  * the verified tree, this Node and the given broker version, on the docker lane.
  */
 const fs = require('fs')
+const path = require('path')
+const { verifyShareKafka44 } = require('./shareKafka44')
 const { execFileSync } = require('child_process')
 const { STAMP_FIELDS } = require('../../testHelpers/e2eEvidence')
 const { verifyShareQuietHeap } = require('./shareQuietHeap')
@@ -111,6 +113,7 @@ const verifyFiles = (files, verified, readFile = (file) => fs.readFileSync(file,
 
     const shareScenarios = new Map()
     const acceptanceRows = []
+    const scenarioRows = []
     const rows = text.split('\n')
     if (rows.every((row) => !row.trim())) {
       problems.push(`${file}: holds no evidence lines`)
@@ -130,6 +133,7 @@ const verifyFiles = (files, verified, readFile = (file) => fs.readFileSync(file,
         return
       }
 
+      scenarioRows.push(line)
       if (
         isPlainObject(line) &&
         (['SHARE_SOAK_E2E', 'SHARE_SOAK_FULL'].includes(line.selector) ||
@@ -150,6 +154,8 @@ const verifyFiles = (files, verified, readFile = (file) => fs.readFileSync(file,
         problems.push(`${file}:${index + 1}: ${problem}`)
       }
     })
+    for (const problem of verifyShareKafka44(path.basename(file, '.jsonl'), scenarioRows))
+      problems.push(`${file}: ${problem}`)
     for (const [scenario, original] of shareScenarios) {
       const quiet = original.filter(
         (r) =>
