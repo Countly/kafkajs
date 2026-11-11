@@ -1,7 +1,7 @@
 /**
  * The same workload through the public API of any KafkaJS-compatible client, so the fork and
  * kafkajs@2.2.4 are measured by identical code. It loads the client only from `--client` with
- * `require.resolve` with a real-path prefix check and uses `Kafka`, `producer().send` and
+ * `createRequire` rooted there with a real-path prefix check and uses `Kafka`, `producer().send` and
  * `consumer().run` only: no fork module, no helper and no instrumentation is loaded.
  *
  * Usage: node scripts/benchmarks/clientCompare.js --client <dir> --package <@countly/kafkajs|kafkajs>
@@ -18,6 +18,7 @@
  * reports elapsedMs. Exit codes: 0 done, 1 the client or the workload failed, 2 a bad argument.
  */
 const fs = require('node:fs')
+const { createRequire } = require('node:module')
 const path = require('node:path')
 
 const WORKLOADS = ['produce-latency', 'produce-throughput', 'consume-throughput']
@@ -82,8 +83,9 @@ const parseArgs = (argv) => {
  */
 const loadClient = (dir, pkg) => {
   const prefix = fs.realpathSync(dir)
+  const clientRequire = createRequire(path.join(prefix, 'package.json'))
   const resolve = (id) => {
-    const resolved = fs.realpathSync(require.resolve(id, { paths: [prefix] }))
+    const resolved = fs.realpathSync(clientRequire.resolve(id))
     const relative = path.relative(prefix, resolved)
     if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
       throw new Error(`${id} resolved outside client prefix: ${dir}`)

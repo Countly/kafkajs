@@ -162,6 +162,8 @@ describe('Benchmarks > clientCompare', () => {
       const fork = load(path.join(prefix, 'fork'), '@countly/kafkajs')
       const base = load(path.join(prefix, 'base'), 'kafkajs')
 
+      expect({ status: fork.status, stderr: fork.stderr }).toEqual({ status: 0, stderr: '' })
+      expect({ status: base.status, stderr: base.stderr }).toEqual({ status: 0, stderr: '' })
       expect(JSON.parse(fork.stdout)).toEqual({
         name: '@countly/kafkajs',
         version: '3.0.0-test',
@@ -189,14 +191,21 @@ describe('Benchmarks > clientCompare', () => {
 
       const result = load(empty, 'kafkajs')
 
-      expect(result.status).toBe(1)
+      expect({ status: result.status, stderr: result.stderr }).toEqual({
+        status: 1,
+        stderr: expect.stringMatching(/outside.*prefix/i),
+      })
       expect(result.stdout).toBe('')
-      expect(result.stderr).toMatch(/outside.*prefix/i)
     })
 
     test('an arm cannot load the other arm package from its directory', () => {
-      expect(load(path.join(prefix, 'fork'), 'kafkajs').status).not.toBe(0)
-      expect(load(path.join(prefix, 'base'), '@countly/kafkajs').status).not.toBe(0)
+      for (const [dir, pkg] of [
+        ['fork', 'kafkajs'],
+        ['base', '@countly/kafkajs'],
+      ]) {
+        const { status, stderr } = load(path.join(prefix, dir), pkg)
+        expect({ status, stderr }).toEqual({ status: 1, stderr: expect.stringContaining(pkg) })
+      }
     })
   })
 
@@ -213,9 +222,11 @@ describe('Benchmarks > clientCompare', () => {
         'produce-latency'
       )
 
-      expect(result.status).toBe(1)
+      expect({ status: result.status, stderr: result.stderr }).toEqual({
+        status: 1,
+        stderr: expect.stringMatching(/kafkajs/),
+      })
       expect(result.stdout).toBe('')
-      expect(result.stderr).toMatch(/kafkajs/)
     })
 
     test('a missing or unknown flag or workload exits 2 and names the problem', () => {
@@ -239,8 +250,10 @@ describe('Benchmarks > clientCompare', () => {
 
       for (const args of bad) {
         const result = run(...args)
-        expect(result.status).toBe(2)
-        expect(result.stderr).toMatch(/usage|--/i)
+        expect({ status: result.status, stderr: result.stderr }).toEqual({
+          status: 2,
+          stderr: expect.stringMatching(/usage|--/i),
+        })
       }
     })
 
