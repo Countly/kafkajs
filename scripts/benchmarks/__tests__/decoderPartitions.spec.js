@@ -81,9 +81,13 @@ const collectorFor = (partition, now = () => 0, advance = () => {}) => {
       calls.push({ argv, timeoutMs })
       advance()
       const arm = ARMS.find((arm) => arm.argv.join(' ') === argv.join(' '))
-      const sample = evidence()
-        .flatMap((p) => p.arms)
-        .find((row) => row.name === arm.name).invocations[0]
+      const sample = {
+        available: 1,
+        workMultiplier: WORK_MULTIPLIERS[arm.name],
+        [arm.metric]: 100,
+        roundNsPerOp: Array(arm.metric === 'nsPerFrame' ? 7 : 5).fill(100),
+        ...(arm.metric === 'nsPerFrame' && { warmupRoundNsPerOp: [100, 100, 100] }),
+      }
       return { status: 0, stdout: JSON.stringify(sample), stderr: '' }
     },
   })

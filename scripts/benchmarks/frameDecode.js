@@ -4,12 +4,13 @@
  * frame loop (framing, matching a frame to its request, settling it) and nothing else: the codec
  * the requests carry only measures the body.
  * Usage: node --expose-gc scripts/benchmarks/frameDecode.js [--shape 64b|64k|1m|coalesced|byte-chunks]
- *          [--control 0|1]
- * Prints one JSON line: { frames, nsPerFrame, warmupRoundNsPerOp, roundNsPerOp, heapRetainedBytes } (the heap only under
+ *          [--control 0|1] [--work-multiplier <k>]
+ * Prints one JSON line: { frames, workMultiplier, nsPerFrame, warmupRoundNsPerOp, roundNsPerOp, heapRetainedBytes } (the heap only under
  * `--expose-gc`).
  *
  * Timed mode requires `--expose-gc`: three discarded warm-up rounds, then seven measured
- * rounds, collecting after setup and before every interval. Only measured rounds set the median.
+ * rounds, collecting after setup before each round's first interval. Sequential repetitions
+ * exclude setup and disconnect from elapsed time. Only measured rounds set the median.
  * The positive control is `--control 1`, untimed: it counts `RequestQueue#fulfillRequest` calls
  * and passes when they equal the frames fed. It does not require GC. The comparison overlays this
  * script unchanged into both trees and judges paired bounds with a calibrated baseline control.
@@ -47,11 +48,11 @@ const SHAPES = {
   'byte-chunks': { body: 65536, frames: 2, chunk: 1 },
 }
 
-const USAGE = `usage: node scripts/benchmarks/frameDecode.js [--shape ${Object.keys(SHAPES).join('|')}] [--control 0|1]`
+const USAGE = `usage: node scripts/benchmarks/frameDecode.js [--shape ${Object.keys(SHAPES).join('|')}] [--control 0|1] [--work-multiplier <k>]`
 
 /**
  * @param {string[]} argv
- * @returns {{ shape: string, control: boolean }}
+ * @returns {{ shape: string, control: boolean, workMultiplier?: number }}
  * @throws {Error} the usage line for any argument it does not know
  */
 const parseArgs = (argv) => {
@@ -62,6 +63,12 @@ const parseArgs = (argv) => {
       options.shape = value
     } else if (flag === '--control' && (value === '0' || value === '1')) {
       options.control = value === '1'
+    } else if (
+      flag === '--work-multiplier' &&
+      Number.isSafeInteger(Number(value)) &&
+      Number(value) > 0
+    ) {
+      options.workMultiplier = Number(value)
     } else {
       throw new Error(USAGE)
     }
@@ -127,8 +134,8 @@ const chunksOf = ({ body, chunk, perChunk = 1 }, correlationIds) => {
 }
 
 /**
- * One round: sends the requests, then times the delivery of every frame and the settling of every
- * request.
+ * One fixture: sends requests, then times frame delivery and request settlement. Repetitions
+ * keep setup and disconnect outside timing and never increase concurrent requests.
  * @param {Shape} shape
  * @param {number} frames
  * @param {boolean} [collect] collect after setup, before the timed interval
@@ -184,26 +191,37 @@ const retainedHeap = async () => {
 
 /**
  * Requires exposed GC. Three discarded warmups, then seven measured rounds; GC after setup
- * precedes each interval. Warmup timings remain evidence but never enter the median.
+ * precedes each round's first interval. Each round averages repeated fixture timings; warmup
+ * timings remain evidence but never enter the median.
  * @param {string} name a key of `SHAPES`
- * @param {number} [frames] frames per round, the shape's by default
- * @throws {Error} when globalThis.gc is unavailable
- * @returns {Promise<{ frames: number, nsPerFrame: number, roundNsPerOp: number[], warmupRoundNsPerOp: number[], heapRetainedBytes?: number }>}
+ * @param {number} [frames] frames per fixture, the shape's by default
+ * @param {number} [workMultiplier] sequential fixtures per round; GC precedes the first interval
+ * @throws {Error} when globalThis.gc is unavailable or the multiplier is not a positive integer
+ * @returns {Promise<{ frames: number, workMultiplier: number, nsPerFrame: number, roundNsPerOp: number[], warmupRoundNsPerOp: number[], heapRetainedBytes?: number }>}
  */
-const timed = async (name, frames = SHAPES[name].frames) => {
+const timed = async (name, frames = SHAPES[name].frames, workMultiplier = 1) => {
   if (typeof globalThis.gc !== 'function') throw new Error('timed mode requires --expose-gc')
+  if (!Number.isSafeInteger(workMultiplier) || workMultiplier < 1) throw new Error(USAGE)
+  const repeatedRound = async () => {
+    let nsPerFrame = 0
+    for (let repetition = 0; repetition < workMultiplier; repetition++) {
+      nsPerFrame += await round(SHAPES[name], frames, repetition === 0)
+    }
+    return nsPerFrame / workMultiplier
+  }
   const warmupRoundNsPerOp = []
   for (let i = 0; i < WARMUP_ROUNDS; i++) {
-    warmupRoundNsPerOp.push(await round(SHAPES[name], frames, true))
+    warmupRoundNsPerOp.push(await repeatedRound())
   }
   const rounds = []
   for (let i = 0; i < ROUNDS; i++) {
-    rounds.push(await round(SHAPES[name], frames, true))
+    rounds.push(await repeatedRound())
   }
 
   const heapRetainedBytes = await retainedHeap()
   return {
     frames,
+    workMultiplier,
     nsPerFrame: median(rounds),
     roundNsPerOp: rounds,
     warmupRoundNsPerOp,
@@ -237,8 +255,8 @@ const control = async (name, frames = SHAPES[name].frames) => {
 
 if (require.main === module) {
   ;(async () => {
-    const { shape, control: controlRun } = parseArgs(process.argv.slice(2))
-    const result = controlRun ? await control(shape) : await timed(shape)
+    const { shape, control: controlRun, workMultiplier } = parseArgs(process.argv.slice(2))
+    const result = controlRun ? await control(shape) : await timed(shape, undefined, workMultiplier)
     console.log(JSON.stringify(result))
     process.exitCode = result.pass === false ? 1 : 0
   })().catch((e) => {

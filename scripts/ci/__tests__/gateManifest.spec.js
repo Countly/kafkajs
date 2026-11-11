@@ -58,7 +58,12 @@ describe('exit gate manifest', () => {
         },
       }),
     })
-    const matrix = JSON.parse(output.trim().slice('matrix='.length)).include
+    const matrix = JSON.parse(
+      output
+        .split('\n')
+        .find((line) => line.startsWith('matrix='))
+        .slice('matrix='.length)
+    ).include
     expect(matrix.map(({ partition }) => partition)).toEqual(check.partitions)
     expect(new Set(matrix.map(({ id }) => id)).size).toBe(3)
     expect(matrix.every(({ capMinutes }) => capMinutes === 30)).toBe(true)

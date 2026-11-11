@@ -1,4 +1,5 @@
 const { SHAPES, parseArgs, chunksOf, timed, control } = require('../frameDecode')
+const { EventEmitter } = require('events')
 const RequestQueue = require('../../../src/network/requestQueue')
 
 const FRAME_HEADER = 8
@@ -123,8 +124,18 @@ describe('Benchmarks > frameDecode', () => {
     )
 
     test('repeats unchanged fixtures in every warmup and measured round and keeps nanoseconds per frame', async () => {
+      let nanos = 0n
+      const emit = EventEmitter.prototype.emit
+      jest.spyOn(EventEmitter.prototype, 'emit').mockImplementation(function (event, ...args) {
+        if (event === 'data' && Buffer.isBuffer(args[0])) nanos += 1600n
+        return emit.call(this, event, ...args)
+      })
+      jest.spyOn(process.hrtime, 'bigint').mockImplementation(() => nanos)
       const fulfill = jest.spyOn(RequestQueue.prototype, 'fulfillRequest')
       const result = await timed('64b', 2, 3)
+      expect(result.nsPerFrame).toBe(1600)
+      expect(result.roundNsPerOp).toEqual(Array(7).fill(1600))
+      expect(result.warmupRoundNsPerOp).toEqual(Array(3).fill(1600))
       expect(fulfill).toHaveBeenCalledTimes(2 * 3 * 10)
       expect(result.workMultiplier).toBe(3)
       expect(result.frames).toBe(2)

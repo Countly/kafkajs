@@ -6,6 +6,7 @@ on:
       kafka_version: { description: 'Extra Kafka version to add (e.g. 4.4.0)', required: false }
 jobs:
   integration:
+    timeout-minutes: 360
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false

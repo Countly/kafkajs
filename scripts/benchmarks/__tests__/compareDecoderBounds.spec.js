@@ -4,6 +4,7 @@ const path = require('path')
 const { EventEmitter } = require('events')
 const {
   ARMS,
+  WORK_MULTIPLIERS,
   MeasurementCollector,
   compare,
   main,
@@ -350,6 +351,7 @@ describe('Decoder performance comparison', () => {
     expect(calls).toHaveLength(15 * 30 * 3)
     expect(JSON.parse(saved.get(path.join('raw', 'schedule.json')))).toEqual({
       seed: 42,
+      workMultipliers: WORK_MULTIPLIERS,
       registeredRows: ARMS.map(({ name }) => name),
       schedule,
     })
@@ -445,7 +447,9 @@ describe('Decoder performance comparison', () => {
   })
 
   it('parses run and offline modes strictly including reproducible seeds', async () => {
-    expect(parseArgs(['--run', '--baseline', BASELINE, '--seed', '42'])).toMatchObject({
+    expect(
+      parseArgs(['--run', '--baseline', BASELINE, '--partition', 'frame-1m', '--seed', '42'])
+    ).toMatchObject({
       mode: 'run',
       seed: 42,
     })

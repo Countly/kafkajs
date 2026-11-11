@@ -5,7 +5,9 @@
  * trees; every invocation and its internal rounds remain in the output and raw files.
  *
  * Usage: node scripts/benchmarks/compareDecoderBounds.js --run --baseline <40-hex sha>
- *          [--seed <uint32>] [--out <file>] [--raw <dir>]
+ *          --partition frame-1m|frame-other|batch-array [--seed <uint32>] [--out <file>] [--raw <dir>]
+ *        node scripts/benchmarks/compareDecoderBounds.js --combine --input <file> --input <file> --input <file>
+ *          [--out <file>]
  *        node scripts/benchmarks/compareDecoderBounds.js --input <file>
  *
  * Live and offline modes use the same validation and verdict. Each row needs 30 positive finite
@@ -21,7 +23,7 @@
  * The summary holds { baselineSha, candidateSha, node, registeredRows, seed, schedule, arms,
  * unavailable, unavailableInvocations, timedOut }. Arms retain oldNsPerOp, newNsPerOp,
  * baselineControlNsPerOp and invocations with explicit block and A/C/B side. The old unpaired
- * delta is printed as information only. Collection has one 25-minute deadline; no retries or
+ * delta is printed as information only. Each partition has its own 25-minute deadline; no retries or
  * adaptive extension. A timeout kills the running subprocess group and preserves partial data.
  */
 const fs = require('fs')
@@ -45,7 +47,27 @@ const SIDES = { A: 'oldNsPerOp', C: 'baselineControlNsPerOp', B: 'newNsPerOp' }
 const ORDERS = ['ACB', 'ABC', 'CAB', 'CBA', 'BAC', 'BCA']
 const USAGE =
   'usage: node scripts/benchmarks/compareDecoderBounds.js ' +
-  '(--run --baseline <40-hex sha> [--seed <uint32>] [--out <file>] [--raw <dir>] | --input <file>)'
+  '(--run --baseline <40-hex sha> --partition frame-1m|frame-other|batch-array ' +
+  '[--seed <uint32>] [--out <file>] [--raw <dir>] | [--combine] --input <file> [--input <file>] [--out <file>])'
+
+/** Fixed work per operation; the overlay and command use the same value on A, C and B. */
+const WORK_MULTIPLIERS = {
+  'frame-decode:64b': 16,
+  'frame-decode:64k': 16,
+  'frame-decode:1m': 64,
+  'frame-decode:coalesced': 16,
+  'frame-decode:byte-chunks': 16,
+  'record-batch:uncompressed': 16,
+  'record-batch:gzip': 2,
+  'record-batch:zstd': 2,
+  'record-batch:lz4': 1,
+  'record-batch:snappy': 1,
+  'array-decode:readArray': 1,
+  'array-decode:record-headers': 1,
+  'array-decode:readUVarIntArray': 1,
+  'array-decode:readArrayAsync': 1,
+  'array-decode:readUVarIntArrayAsync': 1,
+}
 
 /**
  * @typedef {object} Arm
@@ -91,8 +113,18 @@ const ARMS = [
     metric: 'nsPerOp',
     overlay: 'scripts/benchmarks/arrayDecode.js',
   })),
-]
+].map((arm) => ({
+  ...arm,
+  argv: [...arm.argv, '--work-multiplier', String(WORK_MULTIPLIERS[arm.name])],
+}))
 const REGISTERED_ROWS = ARMS.map(({ name }) => name)
+const PARTITIONS = {
+  'frame-1m': ['frame-decode:1m'],
+  'frame-other': REGISTERED_ROWS.filter(
+    (name) => name.startsWith('frame-decode:') && name !== 'frame-decode:1m'
+  ),
+  'batch-array': REGISTERED_ROWS.filter((name) => !name.startsWith('frame-decode:')),
+}
 const OVERLAY_FILES = [...new Set(ARMS.map(({ overlay }) => overlay))]
 
 /** @param {number[]} values @returns {number} median, averaging the middle two for even counts */
@@ -158,9 +190,10 @@ const medianInterval = (samples, m) => {
 /**
  * @param {object} row measured row
  * @param {string[][]} schedule pre-recorded order of each block
+ * @param {boolean} [requireWork] require revised work accounting in each invocation
  * @returns {string[]} errors in identity, samples, pairing or internal rounds
  */
-const rowProblems = (row, schedule) => {
+const rowProblems = (row, schedule, requireWork = false) => {
   const problems = []
   const arm = ARMS.find(({ name }) => name === row?.name)
   if (!arm) return [`unknown arm ${String(row?.name)}`]
@@ -181,6 +214,7 @@ const rowProblems = (row, schedule) => {
       !Object.hasOwn(SIDES, side ?? '') ||
       invocation.side !== side ||
       invocation.error ||
+      (requireWork && invocation.workMultiplier !== WORK_MULTIPLIERS[row.name]) ||
       invocation.available === 0 ||
       !validSample(invocation[arm.metric]) ||
       invocation[arm.metric] !== row[SIDES[side]]?.[block] ||
@@ -216,13 +250,26 @@ const validateInput = (input) => {
     problems.push('schedule must match its seed and contain six orders five times each')
   if (input.timedOut) problems.push('collection timed out')
   if (!Array.isArray(input.arms)) return [...problems, 'arms must be an array']
+  const partitioned = input.partition !== undefined
+  const names =
+    partitioned && Object.hasOwn(PARTITIONS, input.partition)
+      ? PARTITIONS[input.partition]
+      : REGISTERED_ROWS
+  if (partitioned) {
+    if (!Object.hasOwn(PARTITIONS, input.partition)) problems.push('unknown partition')
+    if (JSON.stringify(input.workMultipliers) !== JSON.stringify(WORK_MULTIPLIERS))
+      problems.push('workMultipliers must match the registered work table')
+  }
   const seen = new Set()
   for (const row of input.arms) {
     if (!row || seen.has(row.name)) problems.push('arm name is missing or duplicated')
     seen.add(row?.name)
-    problems.push(...rowProblems(row, input.schedule))
+    if (partitioned && !names.includes(row?.name)) problems.push('row is outside its partition')
+    problems.push(...rowProblems(row, input.schedule, partitioned))
   }
   const declared = declaredUnavailable(input.unavailable, seen, problems)
+  if (partitioned && declared.size)
+    problems.push('every partition row must PASS; unavailable rows are non-green')
   if (declared.size > 0 || input.unavailableInvocations !== undefined) {
     const evidence = input.unavailableInvocations
     if (
@@ -251,7 +298,7 @@ const validateInput = (input) => {
       }
     }
   }
-  for (const { name, required } of ARMS) {
+  for (const { name, required } of ARMS.filter(({ name }) => names.includes(name))) {
     if (!seen.has(name) && (required || !declared.has(name))) {
       problems.push(
         required
@@ -362,7 +409,7 @@ const judgeRow = (row) => {
 const compare = (input) => {
   const problems = validateInput(input)
   const arms = (Array.isArray(input?.arms) ? input.arms : []).map((row) => {
-    const issues = rowProblems(row, input.schedule)
+    const issues = rowProblems(row, input.schedule, input.partition !== undefined)
     return issues.length ? { name: row?.name, verdict: 'invalid', problems: issues } : judgeRow(row)
   })
   const unavailable = Array.isArray(input?.unavailable) ? input.unavailable : []
@@ -370,6 +417,51 @@ const compare = (input) => {
     pass: !problems.length && arms.every(({ verdict }) => verdict === 'pass'),
     problems,
     unavailable,
+    arms,
+  }
+}
+
+/**
+ * Combines exactly the three complete, disjoint partitions. Seeds and clocks are independent;
+ * tree identities, Node version, registration and work must agree. No unavailable row is a PASS.
+ * @param {object[]} inputs partition evidence files, in any order
+ * @returns {ReturnType<typeof compare>} green only when all fifteen registered rows PASS
+ */
+const combine = (inputs) => {
+  if (!Array.isArray(inputs))
+    return { pass: false, problems: ['partitions must be an array'], unavailable: [], arms: [] }
+  const problems = []
+  const seen = new Set()
+  const results = inputs.map((input) => {
+    if (!Object.hasOwn(PARTITIONS, input?.partition ?? '') || seen.has(input.partition))
+      problems.push('missing, unknown or duplicate partition')
+    seen.add(input?.partition)
+    for (const key of ['baselineSha', 'candidateSha', 'node']) {
+      if (input?.[key] !== inputs[0]?.[key]) problems.push(`${key} differs across partitions`)
+    }
+    return compare(input)
+  })
+  if (
+    inputs.length !== Object.keys(PARTITIONS).length ||
+    Object.keys(PARTITIONS).some((id) => !seen.has(id))
+  )
+    problems.push('all three partitions are required')
+  const arms = results.flatMap((result) => result.arms)
+  const names = arms.map(({ name }) => name)
+  if (
+    names.length !== REGISTERED_ROWS.length ||
+    new Set(names).size !== REGISTERED_ROWS.length ||
+    REGISTERED_ROWS.some((name) => !names.includes(name))
+  )
+    problems.push('every registered row must occur exactly once')
+  problems.push(...results.flatMap((result) => result.problems))
+  return {
+    pass:
+      !problems.length &&
+      results.every((result) => result.pass) &&
+      arms.every(({ verdict }) => verdict === 'pass'),
+    problems,
+    unavailable: results.flatMap((result) => result.unavailable),
     arms,
   }
 }
@@ -400,6 +492,7 @@ class MeasurementCollector {
    * @param {string} options.rawDir invocation evidence directory
    * @param {Function} options.run asynchronous subprocess runner with a remaining timeout
    * @param {Function} options.save synchronous evidence writer
+   * @param {string} [options.partition] one fixed subset; omitted only for legacy offline fixtures
    * @param {number} [options.seed] unsigned seed, random by default
    * @param {Function} [options.now] monotonic milliseconds
    */
@@ -408,10 +501,17 @@ class MeasurementCollector {
     rawDir,
     run,
     save,
+    partition,
     seed = randomBytes(4).readUInt32LE(0),
     now = () => performance.now(),
   }) {
-    Object.assign(this, { trees, rawDir, run, save, seed, now })
+    if (partition !== undefined && !Object.hasOwn(PARTITIONS, partition))
+      throw new Error('unknown partition')
+    Object.assign(this, { trees, rawDir, run, save, seed, now, partition })
+    this.arms =
+      partition === undefined
+        ? ARMS
+        : ARMS.filter(({ name }) => PARTITIONS[partition].includes(name))
     this.schedule = createSchedule(seed)
     this.deadlineMs = COLLECTION_DEADLINE_MS
   }
@@ -423,12 +523,14 @@ class MeasurementCollector {
   async collect() {
     const started = this.now()
     const registration = {
+      ...(this.partition !== undefined && { partition: this.partition }),
+      workMultipliers: { ...WORK_MULTIPLIERS },
       seed: this.seed,
       registeredRows: [...REGISTERED_ROWS],
       schedule: this.schedule,
     }
     this.save(path.join(this.rawDir, 'schedule.json'), `${JSON.stringify(registration, null, 2)}\n`)
-    const rows = ARMS.map(({ name }) => ({
+    const rows = this.arms.map(({ name }) => ({
       name,
       oldNsPerOp: [],
       newNsPerOp: [],
@@ -437,7 +539,7 @@ class MeasurementCollector {
     }))
     let timedOut = false
     for (let block = 0; block < BLOCKS && !timedOut; block++) {
-      for (const [index, arm] of ARMS.entries()) {
+      for (const [index, arm] of this.arms.entries()) {
         if (timedOut) break
         const row = rows[index]
         for (const side of this.schedule[block]) {
@@ -616,11 +718,16 @@ const runCommand = (
  * @throws {Error} usage for invalid options
  */
 const parseArgs = (argv) => {
-  const options = {}
+  const options = { inputs: [] }
   for (let i = 0; i < argv.length; i++) {
     const flag = argv[i]
-    if (flag === '--run') options.run = true
-    else if (['--baseline', '--out', '--raw', '--input', '--seed'].includes(flag) && argv[i + 1])
+    if (flag === '--run' || flag === '--combine') options[flag.slice(2)] = true
+    else if (flag === '--input' && argv[i + 1]) options.inputs.push(argv[++i])
+    else if (
+      ['--baseline', '--out', '--raw', '--seed', '--partition'].includes(flag) &&
+      argv[i + 1] &&
+      options[flag.slice(2)] === undefined
+    )
       options[flag.slice(2)] = argv[++i]
     else throw new Error(USAGE)
   }
@@ -629,9 +736,16 @@ const parseArgs = (argv) => {
     (!/^\d+$/.test(options.seed) || !validSeed(Number(options.seed)))
   )
     throw new Error(USAGE)
-  if (options.run && !options.input && SHA.test(options.baseline ?? '')) {
+  if (
+    options.run &&
+    !options.combine &&
+    !options.inputs.length &&
+    SHA.test(options.baseline ?? '') &&
+    Object.hasOwn(PARTITIONS, options.partition ?? '')
+  ) {
     return {
       mode: 'run',
+      partition: options.partition,
       baseline: options.baseline,
       out: options.out ?? DEFAULT_OUT,
       raw: options.raw ?? DEFAULT_RAW,
@@ -640,13 +754,16 @@ const parseArgs = (argv) => {
   }
   if (
     !options.run &&
-    options.input &&
+    options.inputs.length &&
     !options.baseline &&
-    !options.out &&
     !options.raw &&
-    options.seed === undefined
-  )
-    return { mode: 'input', input: options.input }
+    options.seed === undefined &&
+    options.partition === undefined
+  ) {
+    if (options.combine || options.inputs.length > 1)
+      return { mode: 'combine', inputs: options.inputs, out: options.out }
+    if (!options.out) return { mode: 'input', input: options.inputs[0] }
+  }
   throw new Error(USAGE)
 }
 
@@ -668,7 +785,9 @@ const main = async (argv, log = console.log) => {
     const options = parseArgs(argv)
     parseExceptions(JSON.parse(fs.readFileSync(EXCEPTIONS_FILE, 'utf8')))
     let input
-    if (options.mode === 'input') input = JSON.parse(fs.readFileSync(options.input, 'utf8'))
+    if (options.mode === 'combine')
+      input = options.inputs.map((file) => JSON.parse(fs.readFileSync(file, 'utf8')))
+    else if (options.mode === 'input') input = JSON.parse(fs.readFileSync(options.input, 'utf8'))
     else {
       extracted = true
       prepareBaselineTree({
@@ -680,6 +799,7 @@ const main = async (argv, log = console.log) => {
       const collector = new MeasurementCollector({
         trees: { old: baselineDir, new: REPO_ROOT },
         rawDir: options.raw,
+        partition: options.partition,
         seed: options.seed,
         run: runCommand,
         save: saveFile,
@@ -694,7 +814,9 @@ const main = async (argv, log = console.log) => {
         ...(await collector.collect()),
       }
     }
-    const result = compare(input)
+    const result = options.mode === 'combine' ? combine(input) : compare(input)
+    if (options.mode === 'combine' && options.out)
+      saveFile(options.out, `${JSON.stringify({ partitions: input, result }, null, 2)}\n`)
     if (options.mode === 'run')
       saveFile(options.out, `${JSON.stringify({ ...input, result }, null, 2)}\n`)
     log(formatReport(result))
@@ -714,7 +836,10 @@ if (require.main === module)
 
 module.exports = {
   ARMS,
+  PARTITIONS,
+  WORK_MULTIPLIERS,
   MeasurementCollector,
+  combine,
   compare,
   formatReport,
   main,
