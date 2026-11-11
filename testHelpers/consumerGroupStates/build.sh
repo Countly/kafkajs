@@ -2,7 +2,7 @@
 set -euo pipefail
 version="${1:?supply a pinned Kafka version}"
 work_dir="${2:?supply a disposable build directory}"
-case "$version" in 4.3.1|4.2.2|4.1.2) ;; *) echo 'unsupported fixture version' >&2; exit 2 ;; esac
+case "$version" in 4.4.0|4.3.1|4.2.2|4.1.2) ;; *) echo 'unsupported fixture version' >&2; exit 2 ;; esac
 source_dir="$(cd "$(dirname "$0")" && pwd)"
 mkdir -p "$work_dir"
 work_dir="$(cd "$work_dir" && pwd)"
