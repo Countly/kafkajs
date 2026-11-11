@@ -81,16 +81,29 @@ describe('docs/Testing.md', () => {
       kafka: '4.3.1',
       group: 'others',
     })
-    expect(workflows[1]).toContain("kafka: ['4.1.2', '4.2.2', '4.3.1']")
-    expect(workflows[1]).toContain("- { node: 26, kafka: '4.2.2' }")
+    expect(workflows[1]).toContain("kafka: ['4.0.2', '4.2.2', '4.3.2', '4.4.0']")
+    expect(workflows[1]).toContain("- { node: 26, kafka: '4.0.2' }")
+    expect(workflows[1]).toContain("- { node: 22, kafka: '4.2.2' }")
+    expect(workflows[1]).toContain("- { node: 24, kafka: '4.3.2' }")
     expect(workflows[1]).toContain("cron: '0 3 * * 1'")
     expect(ci).toContain('on Node 22, 24 and 26;')
     expect(ci).toContain('every Monday and on demand')
     expect(ci).toContain(
       'on Node 24 and for `broker` and `others` on Node 22 and 26, all against Kafka 4.3.1'
     )
-    expect(ci).toContain('Kafka 4.1.2, 4.2.2 and 4.3.1')
-    expect(ci).toContain('leaves out Node 22 with 4.2.2 and Node 26 with 4.1.2 and 4.2.2')
+    expect(ci).toContain('Kafka 4.0.2, 4.2.2, 4.3.2 and 4.4.0')
+    expect(ci).toContain('leaves out Node 26 with 4.0.2, Node 22 with 4.2.2 and Node 24 with 4.3.2')
+    expect(ci).toContain('has no Kafka version input')
+  })
+
+  it('names every Kafka line and Node version the weekly matrix runs', () => {
+    const kafka = captures(workflows[1], /'(\d+\.\d+\.\d+)'/g)
+    const node = captures(workflows[1], /node: \[([\d, ]+)\]/g).flatMap((list) => list.split(/, */))
+
+    expect(kafka).toEqual(['4.0.2', '4.2.2', '4.3.2', '4.4.0'])
+    expect(node).toEqual(['22', '24', '26'])
+    expect(kafka.filter((version) => !ci.includes(version))).toEqual([])
+    expect(node.filter((version) => !ci.includes(version))).toEqual([])
   })
 
   it('does not claim the cold-cluster createTopics race is gone from every run', () => {
