@@ -2,7 +2,7 @@ const crypto = require('node:crypto')
 const churn = require('../telemetryChurn')
 const { ReferenceWork, ReferenceShareLedger } = require('./fixtures/journalReference')
 const { NativeJournal, PendingSampler } = require('../../../testHelpers/processMemory')
-const { TelemetryResourceVerdict } = require('../soak')
+const { HandlerJournal } = require('../../../testHelpers/fixedJournal')
 
 const sha = (value) => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex')
 
@@ -124,19 +124,6 @@ describe('telemetry fixed journals', () => {
     expect(actual.ledger.facts().exchanges[100].request.groupId).toBe('group')
   })
 
-  test.each(['missing', 'duplicate', 'reordered', 'wrong-timestamp'])(
-    'rejects %s replay input',
-    (fault) => {
-      const expected = shareReplay(ReferenceShareLedger).ledger.facts()
-      const actual = shareReplay(churn.ShareLedger).ledger.facts()
-      if (fault === 'missing') actual.exchanges.pop()
-      if (fault === 'duplicate') actual.exchanges.push(actual.exchanges[0])
-      if (fault === 'reordered') actual.exchanges.reverse()
-      if (fault === 'wrong-timestamp') actual.exchanges[0].at += 0.125
-      expect(() => exact(expected, actual)).toThrow('journal replay differs')
-    }
-  )
-
   test('fails row and byte overflow before truncating or overwriting any archived fact', () => {
     const journal = new churn.FixedJournal({ name: 'control', capacity: 1, bytes: 128 })
     journal.push({ at: 1.125, text: 'λ' })
@@ -207,36 +194,37 @@ describe('telemetry fixed journals', () => {
     expect(() => journal.begin('gzip', {})).toThrow(/overflow/)
   })
 
-  test('retained per-record product objects still trip slope and endpoint in a measured stand-in', () => {
-    const retained = []
-    const snapshot = (bytes) => ({ memory: { retainedBytes: bytes }, registryDigest: 'same' })
-    const input = {
-      clientCount: 1,
-      baseline: snapshot(0),
-      samples: [],
-      teardown: snapshot(0),
-      cleanupMs: 1,
-      measurementMs: 300000,
-    }
-    for (let sample = 0; sample < 11; sample++) {
-      for (let record = 0; record < 1000; record++)
-        retained.push({ payload: Buffer.alloc(256, 0x6d) })
-      input.samples.push({
-        admittedAtMs: 60000 + sample * 29900,
-        completedAtMs: 60001 + sample * 29900,
-        snapshot: snapshot(retained.reduce((sum, object) => sum + object.payload.length, 0)),
-      })
-    }
-    const result = TelemetryResourceVerdict.evaluate(input)
-    expect(result.violations).toEqual(
-      expect.arrayContaining(['retained slope', 'retained endpoint'])
-    )
-    expect(retained[10000].payload[0]).toBe(0x6d)
+  test('stores UTF-8 strings compactly and preserves lone surrogates losslessly', () => {
+    const journal = new churn.FixedJournal({ name: 'strings', capacity: 4, bytes: 96 })
+    const strings = ['x'.repeat(20), 'λ'.repeat(10), '\ud800x', 'x\udc00']
+    journal.push(...strings)
+    expect(journal.values()).toEqual(strings)
+    expect(journal.cursor).toBe(84)
+  })
+
+  test('counts only valid distinct corpus ids toward handler completeness', () => {
+    const journal = new HandlerJournal(10000, 10004)
+    for (let id = 0; id < 9999; id++) journal.enter(0, String(id), id, 0.125)
+    for (const id of [0, -1, 10000]) journal.enter(0, '0', id, 0.125)
+    expect(journal.unique).toBe(9999)
+    journal.enter(0, '9999', 9999, 0.125)
+    expect(journal.unique).toBe(10000)
+  })
+
+  test('reserves share shapes from the empty-round floor and finite corpus within a bounded arena', () => {
+    const storage = churn.journalLimits()
+    expect(storage.exchanges).toBeGreaterThanOrEqual(32400 + 20000)
+    expect(storage.exchangeBytes + storage.acknowledgementBytes).toBeLessThan(29000000)
+    const ledger = new churn.ShareLedger({ group: 'group', clock: { now: () => 0 } })
+    const before = ledger.journalState()
+    for (let n = 1; n <= storage.exchanges; n++) ledger.exchanges.push(exchange(n))
+    expect(ledger.journalState().byteLength).toBe(before.byteLength)
+    expect(ledger.facts().exchanges).toHaveLength(storage.exchanges)
   })
 })
 
 describe('telemetry journal ownership diagnostic', () => {
-  test('pairs old and fixed journals on one schedule and keeps seeded product retention visible', () => {
+  test('compares ownership at every checkpoint and checks real retained sensitivity in both journal modes', () => {
     const fs = require('node:fs')
     const path = require('node:path')
     const childProcess = require('node:child_process')
@@ -273,7 +261,16 @@ describe('telemetry journal ownership diagnostic', () => {
         expect(fixed.scheduleSha256).toBe(old.scheduleSha256)
         expect(fixed.idsSha256).toBe(old.idsSha256)
         expect(fixed.factsSha256).toBe(old.factsSha256)
+        expect(fixed.storage.mode).toBe('fixed')
+        expect(old.storage.mode).toBe('legacy')
+        expect(fixed.storage.before.byteLength).toBeGreaterThan(0)
+        expect(fixed.storage.closed.byteLength).toBe(fixed.storage.before.byteLength)
+        expect(old.storage.before).toBeNull()
+        expect(old.storage.closed).toBeNull()
+        expect(fixed.ownership).toEqual(old.ownership)
         for (const result of [old, fixed]) {
+          expect(result.violations).not.toContain('retained slope')
+          expect(result.violations).not.toContain('retained endpoint')
           expect(result.ownership.map((row) => row.checkpoint)).toEqual([
             'M',
             'first',
@@ -284,13 +281,15 @@ describe('telemetry journal ownership diagnostic', () => {
           expect(result.ownership.at(-1).recordTargetsAlive).toBeLessThan(10)
         }
       }
-      const seeded = run('fixed', 'consumer', true)
-      fs.writeFileSync(path.join(directory, 'seeded.json'), JSON.stringify(seeded))
-      expect(seeded.violations).toEqual(
-        expect.arrayContaining(['retained slope', 'retained endpoint'])
-      )
-      expect(seeded.ownership.at(-1).recordTargetsAlive).toBe(10000)
-      expect(seeded.ownership.at(-1).positiveAlive).toBe(true)
+      for (const mode of ['legacy', 'fixed']) {
+        const seeded = run(mode, 'consumer', true)
+        fs.writeFileSync(path.join(directory, `seeded-${mode}.json`), JSON.stringify(seeded))
+        expect(seeded.violations).toEqual(
+          expect.arrayContaining(['retained slope', 'retained endpoint'])
+        )
+        expect(seeded.ownership.at(-1).recordTargetsAlive).toBe(10000)
+        expect(seeded.ownership.at(-1).positiveAlive).toBe(true)
+      }
     } finally {
       if (!process.env.CI) fs.rmSync(directory, { recursive: true, force: true })
     }

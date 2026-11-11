@@ -4570,6 +4570,31 @@ describe('telemetry churn archive replay', () => {
     )
   })
 
+  test.each(['missing', 'duplicate', 'reordered', 'wrong-timestamp'])(
+    'rejects %s share journal facts through the production archive verifier',
+    (fault) => {
+      expect(verify()).not.toThrow()
+      expect(
+        verify((made) => {
+          const captured = made.archive.workers.shareConsumer.share
+          const ledger = new churnModule.ShareLedger({
+            group: captured.group,
+            clock: { now: () => 0 },
+          })
+          for (const row of captured.exchanges) ledger.exchanges.push({ ...row, at: row.n + 0.125 })
+          const original = ledger.facts()
+          captured.exchanges = original.exchanges
+          captured.exchangesSha256 = original.exchangesSha256
+          made.archive.inputs.shareConsumer.exchangesSha256 = original.exchangesSha256
+          if (fault === 'missing') captured.exchanges.pop()
+          if (fault === 'duplicate') captured.exchanges.push(captured.exchanges[0])
+          if (fault === 'reordered') captured.exchanges.reverse()
+          if (fault === 'wrong-timestamp') captured.exchanges[0].at += 0.125
+        })
+      ).toThrow('Share exchange facts differ from their capture hash')
+    }
+  )
+
   test.each([
     [
       'a second copy of the exchanges in the oracle inputs',
