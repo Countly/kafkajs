@@ -2393,7 +2393,6 @@ describe('resource artifact validation', () => {
   })
 })
 
-
 describe('telemetry timeout owner diagnostics', () => {
   test('reports a leaked timer creation stack and releases every diagnostic resource', async () => {
     // eslint-disable-next-line n/no-unsupported-features/node-builtins -- development-only async resource identity
@@ -2439,7 +2438,11 @@ describe('telemetry timeout owner diagnostics', () => {
     const diagnostics = new TimeoutDiagnostics({ capacity: 1 }).start()
     const timers = [setTimeout(() => {}, 60000), setTimeout(() => {}, 60000)]
     try {
-      expect(diagnostics.read()).toMatchObject({ created: 2, dropped: 1, live: [expect.any(Object)] })
+      expect(diagnostics.read()).toMatchObject({
+        created: 2,
+        dropped: 1,
+        live: [expect.any(Object)],
+      })
       for (const timer of timers) clearTimeout(timer)
       await new Promise((resolve) => setImmediate(resolve))
       await new Promise((resolve) => setImmediate(resolve))

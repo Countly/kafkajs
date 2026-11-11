@@ -2370,7 +2370,9 @@ describe('telemetry profile parent', () => {
     fixture.rotate.mockImplementation(async (index, selection) => {
       const fences = processes.sent.filter((m) => m.type === 'confirm-fence')
       expect(fences.slice(-KINDS.length).map((m) => m.kind)).toEqual([...KINDS])
-      expect(processes.until.mock.calls.slice(-KINDS.length).map(([kind]) => kind)).toEqual([...KINDS])
+      expect(processes.until.mock.calls.slice(-KINDS.length).map(([kind]) => kind)).toEqual([
+        ...KINDS,
+      ])
       return { index, selection, setAt: clock.now(), readbackAt: clock.now(), readback: selection }
     })
     await churn.ticks(clock.now(), new TelemetrySchedule({ warmupMs: 60000, measureMs: 300000 }))
