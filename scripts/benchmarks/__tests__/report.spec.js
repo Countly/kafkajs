@@ -165,8 +165,8 @@ describe('Benchmarks > report', () => {
             { key: 'b', unit: 'ms' },
           ],
         }),
-        options((args) =>
-          args.includes('@countly/kafkajs')
+        options((_command, args) =>
+          valueAfter(args, '--package') === '@countly/kafkajs'
             ? { status: 2, stdout: '', stderr: 'down' }
             : json({ ...BASE, a: 4, b: 6 })
         )
@@ -188,6 +188,8 @@ describe('Benchmarks > report', () => {
         ['kafkajs@2.2.4', 'a', true],
         ['kafkajs@2.2.4', 'b', true],
       ])
+      expect(partial[0].error).toBe('run 1 of 3: exit 2: down')
+      expect(partial[1].error).toBe('run 1 of 3: exit 2: down')
       expect(partial[2]).toMatchObject({ median: 4, runs: 3 })
     })
 
@@ -249,8 +251,13 @@ describe('Benchmarks > report', () => {
         runEntry(
           compared(),
           options(
-            (args) =>
-              json({ ...(args.includes('@countly/kafkajs') ? forkIdentity : baseIdentity), a: 1 }),
+            (_command, args) =>
+              json({
+                ...(valueAfter(args, '--package') === '@countly/kafkajs'
+                  ? forkIdentity
+                  : baseIdentity),
+                a: 1,
+              }),
             1
           )
         )
@@ -262,7 +269,7 @@ describe('Benchmarks > report', () => {
       const baselineWrongVersion = run(FORK, { package: 'kafkajs', version: '2.3.0' })
       const noIdentity = run({}, BASE)
 
-      expect(ok.every((row) => row.error === undefined)).toBe(true)
+      expect(ok.map((row) => row.error)).toEqual([undefined, undefined])
       expect(errorOf(forkLoadedBaseline, 'fork')).toMatch(/@countly\/kafkajs/)
       expect(errorOf(forkLoadedBaseline, 'kafkajs@2.2.4')).toBeUndefined()
       expect(errorOf(baselineLoadedFork, 'kafkajs@2.2.4')).toMatch(/kafkajs/)
