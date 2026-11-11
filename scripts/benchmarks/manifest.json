@@ -214,6 +214,18 @@
       "arms": ["fork"]
     },
     {
+      "name": "stickyBalance",
+      "command": ["--expose-gc", "scripts/benchmarks/stickyBalance.js"],
+      "broker": true,
+      "metrics": [
+        { "key": "recordsPerRequest", "unit": "records" },
+        { "key": "balance", "unit": "ratio" },
+        { "key": "p99Ms", "unit": "ms" },
+        { "key": "heapRetainedBytes", "unit": "bytes" }
+      ],
+      "arms": ["fork"]
+    },
+    {
       "name": "produceIdempotent",
       "command": ["scripts/benchmarks/produceIdempotent.js", "--idempotent", "1"],
       "broker": true,
@@ -302,10 +314,6 @@
     {
       "file": "stickyAssign.js",
       "reason": "A differential check against a baseline source tree: it prints a line per shape, lets a shape run to a 10-minute limit and has no single metric."
-    },
-    {
-      "file": "stickyBalance.js",
-      "reason": "A gate of the sticky partitioner against round robin that needs the tree's chaos socket helper and judges a session of three arms."
     },
     {
       "file": "telemetry.js",

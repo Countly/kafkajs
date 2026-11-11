@@ -1,7 +1,7 @@
 /**
  * The same workload through the public API of any KafkaJS-compatible client, so the fork and
  * kafkajs@2.2.4 are measured by identical code. It loads the client only from `--client` with
- * `require.resolve(<package>, { paths: [<dir>] })` and uses `Kafka`, `producer().send` and
+ * `require.resolve` with a real-path prefix check and uses `Kafka`, `producer().send` and
  * `consumer().run` only: no fork module, no helper and no instrumentation is loaded.
  *
  * Usage: node scripts/benchmarks/clientCompare.js --client <dir> --package <@countly/kafkajs|kafkajs>
@@ -17,6 +17,7 @@
  * `consume-throughput` messagesPerSecond between the first and the last `eachMessage`. Each also
  * reports elapsedMs. Exit codes: 0 done, 1 the client or the workload failed, 2 a bad argument.
  */
+const fs = require('node:fs')
 const path = require('node:path')
 
 const WORKLOADS = ['produce-latency', 'produce-throughput', 'consume-throughput']
@@ -77,12 +78,22 @@ const parseArgs = (argv) => {
  * @param {string} pkg the package name to load
  * @returns {{ Kafka: Function, logLevel: object, name: string, version: string }} the client and the
  *   name and version its own package.json states
- * @throws {Error} when `pkg` cannot be resolved from `dir`
+ * @throws {Error} when either the entry point or package metadata resolves outside `dir` or is absent
  */
 const loadClient = (dir, pkg) => {
-  const resolve = (id) => require.resolve(id, { paths: [dir] })
-  const { Kafka, logLevel } = require(resolve(pkg))
-  const { name, version } = require(resolve(`${pkg}/package.json`))
+  const prefix = fs.realpathSync(dir)
+  const resolve = (id) => {
+    const resolved = fs.realpathSync(require.resolve(id, { paths: [prefix] }))
+    const relative = path.relative(prefix, resolved)
+    if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      throw new Error(`${id} resolved outside client prefix: ${dir}`)
+    }
+    return resolved
+  }
+  const entry = resolve(pkg)
+  const metadata = resolve(`${pkg}/package.json`)
+  const { Kafka, logLevel } = require(entry)
+  const { name, version } = require(metadata)
   return { Kafka, logLevel, name, version }
 }
 
@@ -95,6 +106,9 @@ const percentile = (sorted, p) => sorted[Math.min(sorted.length - 1, Math.floor(
 
 /** @returns {bigint} a monotonic clock reading in nanoseconds */
 const now = () => process.hrtime.bigint()
+
+/** @typedef {{ now: () => bigint, setTimeout: Function, clearTimeout: Function }} Timing */
+const DEFAULT_TIMING = { now, setTimeout, clearTimeout }
 
 /**
  * Sends `messages` messages in sends of at most `BATCH`, one after another.
@@ -119,8 +133,8 @@ const sendAll = async (producer, topic, messages, value) => {
  */
 const withProducer = async (kafka, work) => {
   const producer = kafka.producer()
-  await producer.connect()
   try {
+    await producer.connect()
     return await work(producer)
   } finally {
     await producer.disconnect()
@@ -132,9 +146,10 @@ const withProducer = async (kafka, work) => {
  * @param {object} kafka
  * @param {string} topic
  * @param {{ messages: number, size: number }} options
+ * @param {Timing} timing monotonic clock and timeout scheduling
  * @returns {Promise<object>} p50, p90, p99, messagesPerSecond and elapsedMs
  */
-const produceLatency = (kafka, topic, { messages, size }) =>
+const produceLatency = (kafka, topic, { messages, size }, { now }) =>
   withProducer(kafka, async (producer) => {
     const value = Buffer.alloc(size, 'x')
     await producer.send({ topic, messages: [{ value }] })
@@ -161,9 +176,10 @@ const produceLatency = (kafka, topic, { messages, size }) =>
  * @param {object} kafka
  * @param {string} topic
  * @param {{ messages: number, size: number }} options
+ * @param {Timing} timing monotonic clock and timeout scheduling
  * @returns {Promise<object>} messagesPerSecond and elapsedMs
  */
-const produceThroughput = (kafka, topic, { messages, size }) =>
+const produceThroughput = (kafka, topic, { messages, size }, { now }) =>
   withProducer(kafka, async (producer) => {
     const value = Buffer.alloc(size, 'x')
     await producer.send({ topic, messages: [{ value }] })
@@ -179,17 +195,23 @@ const produceThroughput = (kafka, topic, { messages, size }) =>
  * @param {object} kafka
  * @param {string} topic
  * @param {{ messages: number, size: number }} options
+ * @param {Timing} timing monotonic clock and timeout scheduling
  * @returns {Promise<object>} messagesPerSecond and elapsedMs
  * @throws {Error} when the corpus is not delivered in time
  */
-const consumeThroughput = async (kafka, topic, { messages, size }) => {
+const consumeThroughput = async (
+  kafka,
+  topic,
+  { messages, size },
+  { now, setTimeout, clearTimeout }
+) => {
   await withProducer(kafka, (producer) =>
     sendAll(producer, topic, messages, Buffer.alloc(size, 'x'))
   )
   const consumer = kafka.consumer({ groupId: `${topic}-group` })
-  await consumer.connect()
   let timer
   try {
+    await consumer.connect()
     await consumer.subscribe({ topic, fromBeginning: true })
     let received = 0
     let first
@@ -227,14 +249,15 @@ const RUNNERS = {
 }
 
 /**
- * Runs one workload on a fresh topic, which it deletes afterwards.
+ * Runs one workload on a fresh topic, then deletes its group (if any) and topic.
  * @param {{ Kafka: Function, logLevel: object }} client
  * @param {string} workload one of `WORKLOADS`
  * @param {{ messages: number, size: number, brokers: string[] }} options
+ * @param {Timing} [timing] monotonic clock and timeout scheduling
  * @returns {Promise<object>} the workload's metrics
  * @throws {Error} for an unknown workload, or whatever the client throws
  */
-const runWorkload = async ({ Kafka, logLevel }, workload, options) => {
+const runWorkload = async ({ Kafka, logLevel }, workload, options, timing = DEFAULT_TIMING) => {
   if (!RUNNERS[workload]) throw new Error(`unknown workload ${workload}`)
   const kafka = new Kafka({
     clientId: `bench-compare-${workload}`,
@@ -243,17 +266,27 @@ const runWorkload = async ({ Kafka, logLevel }, workload, options) => {
   })
   const topic = `bench-compare-${workload}-${process.pid}-${Date.now()}`
   const admin = kafka.admin()
-  await admin.connect()
   try {
-    await admin.createTopics({
-      topics: [{ topic, numPartitions: PARTITIONS }],
-      waitForLeaders: true,
-    })
-    return await RUNNERS[workload](kafka, topic, options)
+    await admin.connect()
+    try {
+      await admin.createTopics({
+        topics: [{ topic, numPartitions: PARTITIONS }],
+        waitForLeaders: true,
+      })
+      return await RUNNERS[workload](kafka, topic, options, timing)
+    } finally {
+      if (workload === 'consume-throughput') {
+        await admin
+          .deleteGroups([`${topic}-group`])
+          .catch((error) =>
+            process.stderr.write(`could not delete ${topic}-group: ${error.message}\n`)
+          )
+      }
+      await admin
+        .deleteTopics({ topics: [topic] })
+        .catch((error) => process.stderr.write(`could not delete ${topic}: ${error.message}\n`))
+    }
   } finally {
-    await admin
-      .deleteTopics({ topics: [topic] })
-      .catch((error) => process.stderr.write(`could not delete ${topic}: ${error.message}\n`))
     await admin.disconnect()
   }
 }
