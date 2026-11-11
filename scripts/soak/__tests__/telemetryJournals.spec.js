@@ -2,7 +2,7 @@ const crypto = require('node:crypto')
 const churn = require('../telemetryChurn')
 const { ReferenceWork, ReferenceShareLedger } = require('./fixtures/journalReference')
 const { NativeJournal, PendingSampler } = require('../../../testHelpers/processMemory')
-const { HandlerJournal } = require('../../../testHelpers/fixedJournal')
+const { HandlerJournal, journalState } = require('../../../testHelpers/fixedJournal')
 
 const sha = (value) => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex')
 
@@ -251,6 +251,371 @@ describe('telemetry fixed journals', () => {
     for (let n = 1; n <= storage.exchanges; n++) ledger.exchanges.push(exchange(n))
     expect(ledger.journalState().byteLength).toBe(before.byteLength)
     expect(ledger.facts().exchanges).toHaveLength(storage.exchanges)
+  })
+})
+
+describe('share journal packing', () => {
+  const HEX = '0123456789abcdef'.repeat(4)
+  const MIN = '-9223372036854775808'
+  const MAX = '9223372036854775807'
+  const open = (options, capacity = 128, bytes = 1 << 20) =>
+    new churn.FixedJournal({ name: 'packing', capacity, bytes, ...options })
+  /** The bytes of one fact in a layout, with its 4-byte length prefix. */
+  const rowBytes = (fact, options = { packed: true }) => {
+    const journal = open(options, 1, 8192)
+    journal.push(fact)
+    return journal.cursor
+  }
+
+  /** The largest exchange header: int32 identifiers, Float64 clocks, full labels and two digests. */
+  const worstExchange = (request, response, over = {}) => ({
+    n: 2147483647,
+    segment: 'x'.repeat(249),
+    socket: -2147483648,
+    apiKey: 79,
+    apiVersion: 32767,
+    correlationId: -2147483648,
+    at: 0.1 + 0.2,
+    responseAt: 1 / 3,
+    requestSha256: HEX,
+    responseSha256: HEX,
+    request: {
+      groupId: 'g'.repeat(249),
+      isRenewAck: true,
+      topics: request ? [{ topicId: 'T'.repeat(36), partitions: [request] }] : [],
+    },
+    response: {
+      errorCode: -32768,
+      lockMs: -2147483648,
+      topics: response ? [{ topicId: 'T'.repeat(36), partitions: [response] }] : [],
+    },
+    ...over,
+  })
+  const worstRequest = (batches = []) => ({ partition: 2147483647, batches })
+  const worstResponse = (acquired = []) => ({
+    partition: -2147483648,
+    fetchErrorCode: -32768,
+    acknowledgeErrorCode: -32768,
+    acquired,
+  })
+  const worstAcknowledgement = () => ({
+    topic: 'x'.repeat(249),
+    partition: 2147483647,
+    firstOffset: MIN,
+    lastOffset: MIN,
+    type: 'release',
+    error: { name: 'N'.repeat(249), reason: 'R'.repeat(249) },
+    at: 0.1 + 0.2,
+  })
+
+  /** Facts at every encoding edge: exact ints, fractional times, missing fields, UTF-16, duplicates. */
+  const edgeFacts = () => {
+    const exchange = (over) => ({
+      n: 1,
+      segment: 'segment',
+      socket: 1,
+      apiKey: 78,
+      apiVersion: 2,
+      correlationId: 7,
+      at: 0.1 + 0.2,
+      responseAt: 1 / 3,
+      requestSha256: HEX,
+      responseSha256: null,
+      request: { groupId: 'g', isRenewAck: false, topics: [] },
+      response: null,
+      ...over,
+    })
+    const range = (firstOffset, lastOffset) => ({ firstOffset, lastOffset, deliveryCount: 1 })
+    const partition = (acquired) => ({
+      partition: -1,
+      fetchErrorCode: null,
+      acknowledgeErrorCode: 0,
+      acquired,
+    })
+    const facts = [
+      exchange(),
+      exchange({
+        n: 2147483647,
+        socket: -2147483648,
+        correlationId: -1,
+        requestSha256: HEX.toUpperCase(),
+        responseSha256: HEX,
+      }),
+      exchange({ requestSha256: undefined, responseSha256: undefined, response: undefined }),
+      exchange({ requestSha256: 5, responseSha256: HEX.slice(1) }),
+      exchange({ requestSha256: `\ud800${'a'.repeat(63)}`, responseSha256: 'λ'.repeat(64) }),
+      exchange({ segment: '\ud800', at: -0, responseAt: 5e-324 }),
+      exchange({ segment: 'λ😀', at: 2 ** 53 + 2, responseAt: Number.MAX_VALUE }),
+      exchange({ segment: 'x'.repeat(250), at: NaN, responseAt: Infinity }),
+      exchange({
+        response: {
+          errorCode: 0,
+          lockMs: 2147483647,
+          topics: [
+            {
+              topicId: 'T',
+              partitions: [
+                partition([
+                  range(MIN, MAX),
+                  range('0', '0'),
+                  range('-1', '9223372036854775808'),
+                  range('007', 12),
+                  range(null, undefined),
+                ]),
+              ],
+            },
+          ],
+        },
+      }),
+      exchange({
+        request: {
+          groupId: 'g',
+          topics: [
+            {
+              topicId: 'T',
+              partitions: [
+                {
+                  partition: 0,
+                  batches: [
+                    { firstOffset: MIN, lastOffset: MAX, types: [1, 2, 3, 4] },
+                    { firstOffset: '5', lastOffset: '٣', types: [] },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      }),
+      { 'k\udc00': 1, topic: 'T', offset: '12', firstOffset: HEX },
+      {},
+      {
+        topic: 'T',
+        partition: 1,
+        firstOffset: '5',
+        lastOffset: '6',
+        type: 'reject',
+        error: { name: 'E\ud800', reason: 'λ' },
+        at: 0.5,
+      },
+      { topic: 'T', partition: 1, firstOffset: '5', lastOffset: '6', type: 'reject', error: null },
+    ]
+    return [...facts, facts[0], facts[8]]
+  }
+
+  test('stores digests and int64 offsets as raw bytes only where the text is exactly reconstructible', () => {
+    expect(rowBytes({ requestSha256: HEX })).toBe(43)
+    expect(rowBytes({ requestSha256: HEX }, { columns: true })).toBe(79)
+    expect(rowBytes({ firstOffset: MIN })).toBe(19)
+    expect(rowBytes({ firstOffset: MIN }, { columns: true })).toBe(35)
+    for (const [field, value] of [
+      ['requestSha256', HEX.toUpperCase()],
+      ['responseSha256', HEX.slice(1)],
+      ['requestSha256', `${HEX}0`],
+      ['firstOffset', '9223372036854775808'],
+      ['lastOffset', '-9223372036854775809'],
+      ['firstOffset', '007'],
+      ['lastOffset', '-0'],
+      ['firstOffset', '+1'],
+      ['lastOffset', ' 1'],
+      ['firstOffset', '1e3'],
+      ['firstOffset', ''],
+      ['lastOffset', '٣'],
+      ['topic', HEX],
+      ['offset', '12'],
+    ])
+      expect(rowBytes({ [field]: value })).toBe(rowBytes({ [field]: value }, { columns: true }))
+  })
+
+  test('decodes the legacy columns and the packed encoding of the same facts to identical archives', () => {
+    const facts = edgeFacts()
+    const legacy = open({ columns: true })
+    const packed = open({ packed: true })
+    legacy.push(...facts)
+    packed.push(...facts)
+    expect(packed.length).toBe(facts.length)
+    expect(packed.values()).toStrictEqual(legacy.values())
+    expect(packed.values()).toStrictEqual(facts)
+    expect(sha(packed.values())).toBe(sha(legacy.values()))
+    expect(packed.cursor).toBeLessThan(legacy.cursor)
+    expect(packed.journalState().format).toBe('share-packed-1')
+    expect(legacy.journalState().format).toBe('share-columns-utf8-1')
+    const fact = { requestSha256: HEX, firstOffset: MAX }
+    packed.push(fact)
+    fact.requestSha256 = 'mutated'
+    fact.firstOffset = '0'
+    expect(packed.values().at(-1)).toStrictEqual({ requestSha256: HEX, firstOffset: MAX })
+  })
+
+  test('reserves each share row at its proved worst-case size in the packed layout', () => {
+    const header = rowBytes(worstExchange())
+    const pair = rowBytes(worstExchange(worstRequest(), worstResponse())) - header
+    const record =
+      rowBytes(
+        worstExchange(
+          worstRequest([{ firstOffset: MIN, lastOffset: MIN, types: [4] }]),
+          worstResponse([{ firstOffset: MIN, lastOffset: MIN, deliveryCount: 32767 }])
+        )
+      ) -
+      header -
+      pair
+    const acknowledgement = rowBytes(worstAcknowledgement())
+    expect({ header, pair, record, acknowledgement }).toEqual({
+      header: 167,
+      pair: 72,
+      record: 63,
+      acknowledgement: 67,
+    })
+    const reserve = churn.SHARE_ROW_BYTES
+    expect(reserve).toEqual({ header: 176, partitionPair: 80, record: 64, acknowledgement: 80 })
+    for (const [proved, reserved] of [
+      [header, reserve.header],
+      [pair, reserve.partitionPair],
+      [record, reserve.record],
+      [acknowledgement, reserve.acknowledgement],
+    ]) {
+      expect(reserved).toBeGreaterThanOrEqual(proved)
+      expect(reserved - proved).toBeLessThan(16)
+    }
+    const unpacked = worstExchange(undefined, undefined, {
+      requestSha256: HEX.toUpperCase(),
+      responseSha256: HEX.toUpperCase(),
+    })
+    expect(rowBytes(unpacked)).toBeGreaterThan(reserve.header)
+    const storage = churn.journalLimits()
+    expect(storage.exchangeBytes).toBe(54532 * 176 + 98796 * 80 + 11000 * 64)
+    expect(storage.acknowledgementBytes).toBe(11000 * 80)
+  })
+
+  test('fails every share journal dimension fatally, even when the caller catches it', () => {
+    const header = rowBytes(worstExchange())
+    const event = { payload: { topic: 'T', partition: 0, firstOffset: MIN, lastOffset: MIN } }
+    const acknowledged = { ...event, payload: { ...event.payload, type: 'release', error: null } }
+    const acknowledgement = rowBytes({ ...acknowledged.payload, at: 0.5 })
+    const storage = (over) => ({
+      exchanges: 100,
+      exchangeBytes: 1 << 20,
+      acknowledgements: 100,
+      acknowledgementBytes: 1 << 20,
+      ...over,
+    })
+    const exchange = (i) => worstExchange(undefined, undefined, { segment: `segment-${i}` })
+    const cases = [
+      [
+        'exchange rows',
+        storage({ exchanges: 2 }),
+        (ledger) => ledger.exchanges.push(exchange(0), exchange(0)),
+        (ledger) => ledger.exchanges.push(exchange(0)),
+        /share exchanges journal overflow \(rows 2\/2/,
+      ],
+      [
+        'exchange bytes',
+        storage({ exchangeBytes: 2 * header + 1 }),
+        (ledger) => ledger.exchanges.push(exchange(0), exchange(0)),
+        (ledger) => ledger.exchanges.push(exchange(0)),
+        /share exchanges journal overflow \(rows 2\/100/,
+      ],
+      [
+        'exchange labels',
+        storage({}),
+        (ledger) => {
+          for (let i = 0; i < 64; i++) ledger.exchanges.push({ segment: `label-${i}` })
+        },
+        (ledger) => ledger.exchanges.push({ segment: 'label-64' }),
+        /share exchanges journal symbol overflow/,
+      ],
+      [
+        'acknowledgement rows',
+        storage({ acknowledgements: 1 }),
+        (ledger) => ledger.record(acknowledged),
+        (ledger) => ledger.record(acknowledged),
+        /share acknowledgements journal overflow \(rows 1\/1/,
+      ],
+      [
+        'acknowledgement bytes',
+        storage({ acknowledgementBytes: acknowledgement + 1 }),
+        (ledger) => ledger.record(acknowledged),
+        (ledger) => ledger.record(acknowledged),
+        /share acknowledgements journal overflow \(rows 1\/100/,
+      ],
+    ]
+    for (const [, limits, fill, overflow, message] of cases) {
+      const ledger = new churn.ShareLedger({
+        group: 'group',
+        clock: { now: () => 0.5 },
+        storage: limits,
+      })
+      fill(ledger)
+      const before = ledger.journalState()
+      const archive = ledger.facts()
+      const bytes = Buffer.concat([ledger.exchanges.storage, ledger.settled.storage])
+      expect(() => overflow(ledger)).toThrow(message)
+      expect(ledger.facts()).toStrictEqual(archive)
+      expect(Buffer.concat([ledger.exchanges.storage, ledger.settled.storage]).equals(bytes)).toBe(
+        true
+      )
+      const after = ledger.journalState()
+      expect(after.byteLength).toBe(before.byteLength)
+      expect(after.columns.filter((state) => state.overflow)).toHaveLength(1)
+      expect(
+        churn.JournalConstancy.violations({
+          baseline: { journals: before },
+          samples: [],
+          teardown: { journals: after },
+        })
+      ).toContain('journal overflow')
+    }
+    expect(rowBytes({ segment: 'x'.repeat(250) })).toBe(265)
+  })
+
+  test('declares exactly the bytes each worker allocates and fills before the disabled control', () => {
+    const { TELEMETRY } = require('../soak')
+    const storage = churn.journalLimits(TELEMETRY)
+    const clock = { now: () => 0 }
+    const memory = { current: () => ({ at: 1.125, rss: 2, external: 3 }) }
+    const declared = {}
+    for (const kind of churn.KINDS) {
+      const ledger =
+        kind === 'shareConsumer' ? new churn.ShareLedger({ group: 'group', clock, storage }) : null
+      const ordinary = new churn.OrdinaryWork({
+        kind,
+        client: null,
+        stem: 'stem',
+        topic: 'topic',
+        ctl: 'ctl',
+        clock,
+        ledger,
+        slots: [],
+        storage,
+      })
+      const sampler = new PendingSampler(memory, {
+        set: () => 1,
+        clear: () => {},
+        capacity: churn.NATIVE_ROWS,
+      })
+      const journal = new NativeJournal({
+        memory,
+        sampler,
+        capacity: churn.NATIVE_ROWS,
+        fixed: true,
+      })
+      const samples = new churn.FixedJournal({
+        name: 'memory samples',
+        capacity: storage.samples,
+        bytes: storage.sampleBytes,
+      })
+      declared[kind] = churn.declaredJournalBytes(kind, TELEMETRY)
+      expect(
+        journalState([ordinary, ...(ledger ? [ledger] : []), journal, sampler, samples]).byteLength
+      ).toBe(declared[kind])
+      for (const archive of ledger ? [ledger.exchanges, ledger.settled] : [])
+        expect(archive.storage.equals(Buffer.alloc(archive.byteLength, 0xa5))).toBe(true)
+    }
+    expect(declared).toEqual({
+      producer: 4070384,
+      consumer: 4070384,
+      admin: 4070384,
+      shareConsumer: 23188464,
+    })
   })
 })
 
