@@ -5560,8 +5560,8 @@ class ShareSoakDriver {
 
   /**
    * Runs one cycle: A joins, a transient B joins and leaves, the corpus is produced and delivered
-   * (with held identities redelivered after a reset before A closes), and every independent oracle
-   * is read.
+   * (with held identities redelivered and all three leaders fetched after a reset before A closes),
+   * and every independent oracle is read.
    * @param {ReturnType<typeof ShareCycleOracle.plan>} plan the cycle
    * @param {AbortSignal} scope the cycle's slot; every await below ends with it
    * @param {{due?: number, clock?: {now: Function}}} [timing] Original absolute slot cutoff and clock.
@@ -5782,10 +5782,11 @@ class ShareSoakDriver {
               counts.set(identity, (counts.get(identity) ?? 0) + 1)
             return (
               counts.size >= plan.records.length &&
-              observation.held.every((identity) => counts.get(identity) >= 2)
+              observation.held.every((identity) => counts.get(identity) >= 2) &&
+              (!plan.reset || postResetNodes.size === 3)
             )
           },
-          { delayMs: 25, label: 'Every identity delivered' }
+          { delayMs: 25, label: 'Every identity delivered and all reset nodes progressed' }
         )
         note('all-delivered')
         const reads = await Promise.allSettled([

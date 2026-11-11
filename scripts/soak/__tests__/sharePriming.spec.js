@@ -146,6 +146,12 @@ const recording = async ({
   separateCoordinators = false,
   scoredMetadataVersion = 13,
 } = {}) => {
+  const environment = { ...process.env }
+  Object.assign(process.env, {
+    KAFKAJS_LANE: 'docker',
+    KAFKAJS_SOAK_PROFILE: short ? 'short' : 'full',
+    [short ? 'SHARE_SOAK_E2E' : 'SHARE_SOAK_FULL']: '1',
+  })
   jest.useFakeTimers({ now: 1700000000000, doNotFake: ['setImmediate'] })
   const rows = []
   const gate = new LiveRun()
@@ -303,6 +309,7 @@ const recording = async ({
   } finally {
     jest.useRealTimers()
     liveRun.reset()
+    process.env = environment
   }
 }
 
