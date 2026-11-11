@@ -34,14 +34,21 @@ jar --create --date=$DATE --file "$OUT/otlp-v1.9.0-bindings-unrelocated.jar" -C 
 
 # 3. compile the reporter against the pinned Kafka clients jar and the relocated bindings
 mkdir -p "$WORK/classes-reporter"
-javac --release 17 -Xlint:all -cp "$KC:$PB:$WORK/classes-reloc" -d "$WORK/classes-reporter" "$HERE/CountingTelemetryReporter.java"
+REPORTER_SOURCE=$(bash "$HERE/prepare-reporter-source.sh" "$V" "$WORK/source")
+javac --release 17 -Xlint:all -cp "$KC:$PB:$WORK/classes-reloc" -d "$WORK/classes-reporter" "$REPORTER_SOURCE"
 mkdir -p "$WORK/jar" && cp -r "$WORK/classes-reloc/." "$WORK/jar/" && cp -r "$WORK/classes-reporter/." "$WORK/jar/"
 JAR=$OUT/counting-telemetry-reporter-$V.jar
 jar --create --date=$DATE --file "$JAR" -C "$WORK/jar" .
 
 # 3b. deterministic Java telemetry client (KIP-1076 registration), compiled against the same pinned clients jar
+CLIENT_SOURCE=$HERE/legacy/JavaTelemetryClient.java
+CLIENT_RELEASE=17
+if [ "$V" = 4.4.0 ]; then
+  CLIENT_SOURCE=$HERE/JavaTelemetryClient.java
+  CLIENT_RELEASE=21
+fi
 mkdir -p "$WORK/classes-client"
-javac --release 17 -Xlint:all -cp "$KC:$SLF" -d "$WORK/classes-client" "$HERE/JavaTelemetryClient.java"
+javac --release "$CLIENT_RELEASE" -Xlint:all -cp "$KC:$SLF" -d "$WORK/classes-client" "$CLIENT_SOURCE"
 jar --create --date=$DATE --file "$OUT/java-telemetry-client-$V.jar" -C "$WORK/classes-client" .
 
 # 4. load proof: the plugin interfaces, the bindings and an empty-payload decode, from the jar alone

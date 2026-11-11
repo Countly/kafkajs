@@ -21,10 +21,10 @@ const check = (file, expected) => {
   if (sha(file) !== expected) throw new Error('Fixture identity mismatch: ' + file)
 }
 const file = path.join(here, 'fixtures/manifest.json')
-check(file, '7ca0a20e383b745bc427b80211ee0a8e8ae8af0b1fd9a36e73ece96df77b38f4')
+check(file, '35ed05b76cb359c912165d3e54d8d7c3049c04a65249ccb3b253db2e300d35f3')
 const manifest = JSON.parse(fs.readFileSync(file, 'utf8'))
 check(path.join(root, 'docker-compose.telemetry.yml'), manifest.composeSha256['docker-compose.telemetry.yml'])
-for (const name of ['CountingTelemetryReporter.java', 'build.sh'])
+for (const name of ['CountingTelemetryReporter.java', 'build.sh', 'prepare-reporter-source.sh', 'legacy/JavaTelemetryClient.java'])
   check(path.join(here, name), manifest.scripts[name])
 for (const item of Object.values(manifest.lines)) {
   for (const kind of ['reporterJar', 'javaClientJar'])

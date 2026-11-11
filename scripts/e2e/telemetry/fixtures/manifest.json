@@ -393,7 +393,7 @@
     "JavaTelemetryClient.java": "27e3fb34c247f514a0e07a07e85448e7c1bd6bc27eaa3fe301af04721f01eab3",
     "OtlpGoldenVectors.java": "464246d43489c545218e3204aecd89ce193ba9c07def5eb58d346dac53edaa73",
     "base-ports.override.yml": "945b4b163977dbcdfc05301865fb2771aef8cb1ec40795aed1fff0a951276429",
-    "build.sh": "dc36611f5b088ca07bcf80bcb93cd42e2f05807f92b00cc657148588030060ce",
+    "build.sh": "aaeca680bcbbf59bb020cb9e5d83b60ee27ebcaa011ed65be3f06234c03af367",
     "check-exports.py": "3b607b9c28b5e855a9f65d9ff82952fe399ca5fac0c1b644a6604faa9c98df67",
     "check-golden-protoc.py": "047fdb999918513e22cba75164197e5a92d29b40324dd3d2daf5c537fbf4540c",
     "check-golden.py": "e7734ff4569b0317505238e380f638095b2e6a0edf8ceec2a8d3910116514b83",
@@ -409,7 +409,9 @@
     "write-manifest.py": "eec2d6191d622a9bc60470c860192aec9a4db8107ec8ac45de468af1bb7be0a4",
     "telemetryMetadataFollow.js": "a2b48f78e0721700d2fd8312cf32617ba457da35c3ce995ab84974bdac693cab",
     "check-metadata-follow.py": "2ef3039b1c7214372fe7f26e818328a7f8bbc9f638f1413ed3c6a899c406c013",
-    "run-h6a-arm.sh": "edc7de09967a45fb3f149ed27f95bbd360a023c222395c5006f78e99470e9fa2"
+    "run-h6a-arm.sh": "edc7de09967a45fb3f149ed27f95bbd360a023c222395c5006f78e99470e9fa2",
+    "prepare-reporter-source.sh": "3748442ebfa83bed146058594ef3942acd8dd7808431f1f285e5e46278d73797",
+    "legacy/JavaTelemetryClient.java": "27e3fb34c247f514a0e07a07e85448e7c1bd6bc27eaa3fe301af04721f01eab3"
   },
   "composeSha256": {
     "docker-compose.telemetry.yml": "cd6640b6553198f0a3b57479f74faffe4df44dbe52e2c990ce9f7136b8974075"
@@ -442,6 +444,36 @@
       "addedInputs": [
         "kafka-clients-4.4.0"
       ]
+    },
+    {
+      "id": "app-info-parser-4.4.0",
+      "date": "2026-11-11",
+      "change": "Build and reporter ordering control prepare scratch sources with prepare-reporter-source.sh. Only 4.4.0 replaces the AppInfoParser import with org.apache.kafka.common.utils.internals; 4.3.1 and 4.2.2 retain the original reporter source bytes. The historical Java client source is restored under legacy/ for older jars with release 17; the unchanged current source builds for 4.4.0 with release 21 for Thread.ofPlatform(). Existing Java sources, historical provenance and older jar digests are unchanged. No 4.4.0 jar digest is claimed before the CI build.",
+      "buildSha256Before": "dc36611f5b088ca07bcf80bcb93cd42e2f05807f92b00cc657148588030060ce",
+      "buildSha256After": "aaeca680bcbbf59bb020cb9e5d83b60ee27ebcaa011ed65be3f06234c03af367",
+      "preparedReporterSha256": {
+        "4.4.0": "8ae1b15a3f459992abc6f07e3f1ae4ed05b6c2371f4cb9fcaa451cac550959b8",
+        "4.3.1": "f624d0d3b774048ce50c21d418fe61429384a37e35fbc11d61170e2ea8e6cb9c",
+        "4.2.2": "f624d0d3b774048ce50c21d418fe61429384a37e35fbc11d61170e2ea8e6cb9c"
+      },
+      "javaClientBuilds": {
+        "4.4.0": {
+          "source": "JavaTelemetryClient.java",
+          "sha256": "1145746dfeadc7d315e42b1c9d3b3468d819929324cc7701cbddbb423f66b580",
+          "release": 21
+        },
+        "4.3.1": {
+          "source": "legacy/JavaTelemetryClient.java",
+          "sha256": "27e3fb34c247f514a0e07a07e85448e7c1bd6bc27eaa3fe301af04721f01eab3",
+          "release": 17
+        },
+        "4.2.2": {
+          "source": "legacy/JavaTelemetryClient.java",
+          "sha256": "27e3fb34c247f514a0e07a07e85448e7c1bd6bc27eaa3fe301af04721f01eab3",
+          "release": 17
+        }
+      },
+      "legacyJavaClientSourceCommit": "b4ffa018a857f3104d7474856927e969c2a7a90e"
     }
   ]
 }
