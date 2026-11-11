@@ -15,14 +15,14 @@ const { verifySharePriming } = require('../../evidence/sharePriming')
 const { originalShareSchedule } = require('./fixtures/originalShareSchedule')
 
 /**
- * Checks weak original roots after a new job and a full collection, retaining no returned graph.
- * A full collection avoids the heap enumeration performed by count-only object queries.
+ * Checks weak original roots after a new job and an asynchronous major collection.
+ * Async GC avoids conservative stack roots; only names escape, without heap enumeration.
  * @param {object} roots Weak references created by the first-use factory.
  * @returns {Promise<string[]>} Retained original roots by name.
  */
 const retainedRoots = async (roots) => {
   await new Promise(setImmediate)
-  collect()
+  await collect({ type: 'major', execution: 'async' })
   return Object.entries(roots)
     .filter(([, ref]) => ref.deref() !== undefined)
     .map(([name]) => name)
