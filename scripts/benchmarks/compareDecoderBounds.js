@@ -10,6 +10,8 @@
  *
  * Live and offline modes use the same validation and verdict. Each row needs 30 positive finite
  * observations on A, C and B, paired by its invocation block/side and the recorded schedule.
+ * Frame invocations also need three positive finite warm-up rounds. Unavailable codecs need all
+ * 90 invocations to report absence in both trees, without errors.
  * Bonferroni median intervals use all 15 registered rows, including unavailable optional codecs.
  * A/A interval and median calibration and all three spreads determine validity. PASS requires
  * both the paired upper candidate bound and the unpaired median ratio at most 1.05. A valid lower
@@ -183,6 +185,7 @@ const rowProblems = (row, schedule) => {
       !validSample(invocation[arm.metric]) ||
       invocation[arm.metric] !== row[SIDES[side]]?.[block] ||
       !validSamples(invocation.roundNsPerOp, rounds) ||
+      (arm.metric === 'nsPerFrame' && !validSamples(invocation.warmupRoundNsPerOp, 3)) ||
       median(invocation.roundNsPerOp) !== invocation[arm.metric]
     )
       problems.push(`${row.name}: invalid invocation ${index} in block ${block}`)
@@ -220,7 +223,7 @@ const validateInput = (input) => {
     problems.push(...rowProblems(row, input.schedule))
   }
   const declared = declaredUnavailable(input.unavailable, seen, problems)
-  if (input.unavailableInvocations !== undefined) {
+  if (declared.size > 0 || input.unavailableInvocations !== undefined) {
     const evidence = input.unavailableInvocations
     if (
       !Array.isArray(evidence) ||
