@@ -15,7 +15,13 @@ const {
   parseArgs,
 } = require('../compareDecoderBounds')
 
-const D167_ROWS = ['frame-decode:1m', 'frame-decode:64b', 'frame-decode:coalesced']
+const D167_ROWS = [
+  'frame-decode:1m',
+  'frame-decode:64b',
+  'frame-decode:coalesced',
+  'frame-decode:64k',
+  'frame-decode:byte-chunks',
+]
 
 const EXPECTED = {
   'frame-1m': ['frame-decode:1m'],
@@ -110,7 +116,7 @@ const collectorFor = (partition, now = () => 0, advance = () => {}) => {
 }
 
 describe('Decoder measurement partitions', () => {
-  it('freezes exactly the three D167 information-only rows with hosted-runner noise reasons', () => {
+  it('freezes exactly the five D167 and D168 frame rows as information only with hosted-runner noise reasons', () => {
     expect(Object.keys(INFORMATION_ONLY_ROWS)).toEqual(D167_ROWS)
     expect(Object.isFrozen(INFORMATION_ONLY_ROWS)).toBe(true)
     for (const reason of Object.values(INFORMATION_ONLY_ROWS)) {
