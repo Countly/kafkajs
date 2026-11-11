@@ -1101,7 +1101,7 @@ describe('broker telemetry fixture', () => {
 
   test('retains the reviewed reporter and corrected host fixture identities', () => {
     const file = fixture + 'fixtures/manifest.json'
-    expect(digest(file)).toBe('5e1bca462c8ff3a4cd651be82eb0f56ed2f132815b0569a8ac469806c949577d')
+    expect(digest(file)).toBe('7ca0a20e383b745bc427b80211ee0a8e8ae8af0b1fd9a36e73ece96df77b38f4')
     const manifest = JSON.parse(read(file))
     expect(digest('docker-compose.telemetry.yml')).toBe(
       manifest.composeSha256['docker-compose.telemetry.yml']
@@ -1110,9 +1110,9 @@ describe('broker telemetry fixture', () => {
       expect(digest(fixture + name)).toBe(manifest.scripts[name])
     expect(digest(fixture + 'fetch.sh')).toBe(manifest.scripts['fetch.sh'])
     expect(digest(fixture + 'fixtures/inputs.sha256')).toBe(
-      '79293d88513002896afad9a9ad48ec0fc75b57be2db78fb46ba4bef0e590cefc'
+      '221be9594f870c453fc4a56126fcadaadcb4d3741750a0d727e6a08e332553b3'
     )
-    for (const line of ['4.3.1', '4.2.2']) {
+    for (const line of ['4.4.0', '4.3.1', '4.2.2']) {
       for (const kind of ['reporterJar', 'javaClientJar']) {
         const jar = manifest.lines[line][kind]
         expect(fs.statSync(path.join(root, jar.path)).isFile()).toBe(true)
@@ -1124,9 +1124,13 @@ describe('broker telemetry fixture', () => {
       maxFileBytesPerNode: 2097152,
       maxRecordBytes: 4096,
     })
-    expect(read('.gitignore').toString()).toContain(
-      '!scripts/e2e/telemetry/fixtures/counting-telemetry-reporter-4.3.1.jar'
-    )
+    for (const jar of [
+      'counting-telemetry-reporter-4.4.0.jar',
+      'counting-telemetry-reporter-4.3.1.jar',
+      'java-telemetry-client-4.4.0.jar',
+      'java-telemetry-client-4.3.1.jar',
+    ])
+      expect(read('.gitignore').toString()).toContain(`!scripts/e2e/telemetry/fixtures/${jar}`)
     expect(read('scripts/assertCleanTarball.sh').toString()).toContain('scripts/e2e/telemetry/')
     expect(read('scripts/assertCleanTarball.sh').toString()).toContain('.*\\.jar$')
   })
@@ -1265,26 +1269,26 @@ describe('broker telemetry fixture', () => {
       )
     const base = (node, group, kafkas) =>
       kafkas.map((kafka) => ({ node, kafka, group, compose: 'docker-compose.yml' }))
-    const noPlugin = ['4.3.1', '4.2.2', '4.1.2', '4.0.2']
+    const noPlugin = ['4.4.0', '4.2.2', '4.1.2', '4.0.2']
     const rowsOf = (node, full) => {
       const rows = []
       for (const group of configuredGroups)
         rows.push(
-          ...configured(node, full ? ['4.3.1', '4.2.2'] : ['4.3.1']).filter(
+          ...configured(node, full ? ['4.4.0', '4.2.2'] : ['4.4.0']).filter(
             (r) => r.group === group
           )
         )
-      rows.push(...base(node, 'telemetry-base', full ? noPlugin : ['4.3.1', '4.4.0']))
-      rows.push(...base(node, 'telemetry-unsupported', full ? noPlugin : ['4.3.1']))
-      if (full) rows.push(...base(node, 'telemetry-outcomes', ['4.1.2']))
+      rows.push(...base(node, 'telemetry-base', full ? noPlugin : ['4.4.0']))
+      rows.push(...base(node, 'telemetry-unsupported', full ? noPlugin : ['4.4.0']))
+      if (full) rows.push(...base(node, 'telemetry-outcomes', ['4.4.0', '4.1.2']))
       return rows
     }
     expect(catalogue(false)).toEqual(rowsOf(24, false))
-    expect(catalogue(false)).toHaveLength(10)
+    expect(catalogue(false)).toHaveLength(9)
     const required = [22, 24, 26].flatMap((node) => rowsOf(node, true))
     expect(catalogue(true)).toEqual(required)
-    expect(new Set(catalogue(true).map(JSON.stringify)).size).toBe(69)
-    expect(new Set(catalogue(true).map((r) => `${r.group}-${r.kafka}-${r.node}`)).size).toBe(69)
+    expect(new Set(catalogue(true).map(JSON.stringify)).size).toBe(72)
+    expect(new Set(catalogue(true).map((r) => `${r.group}-${r.kafka}-${r.node}`)).size).toBe(72)
     const resources = workflow.jobs.resources
     expect(resources.needs).toBeUndefined()
     const alone = resources.steps.find((step) => step.run?.includes('resources\\.spec'))
@@ -1398,20 +1402,25 @@ describe('broker telemetry fixture', () => {
     const rows = JSON.parse(output.trim().slice('matrix='.length)).include
     const expected = [22, 24, 26].flatMap((node) => [
       ...['telemetry-outcomes', 'telemetry-shutdown'].flatMap((group) =>
-        ['4.3.1', '4.2.2'].map((kafka) => ({
+        ['4.4.0', '4.2.2'].map((kafka) => ({
           node,
           kafka,
           group,
           compose: 'docker-compose.telemetry.yml',
         }))
       ),
-      ...['4.3.1', '4.2.2', '4.1.2', '4.0.2'].map((kafka) => ({
+      ...['4.4.0', '4.2.2', '4.1.2', '4.0.2'].map((kafka) => ({
         node,
         kafka,
         group: 'telemetry-unsupported',
         compose: 'docker-compose.yml',
       })),
-      { node, kafka: '4.1.2', group: 'telemetry-outcomes', compose: 'docker-compose.yml' },
+      ...['4.4.0', '4.1.2'].map((kafka) => ({
+        node,
+        kafka,
+        group: 'telemetry-outcomes',
+        compose: 'docker-compose.yml',
+      })),
     ])
     expect(rows).toEqual(expected)
     const verdict = shared.jobs.telemetry.steps.find((step) =>

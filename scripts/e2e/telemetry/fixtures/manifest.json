@@ -52,7 +52,7 @@
     "jarFlags": "--date=2026-01-01T00:00:00Z (reproducible)",
     "javacFlags": "--release 17 -Xlint:all"
   },
-  "buildCommand": "TF1_CACHE=<cache> TF1_WORK=<work> TF1_OUT=scripts/e2e/telemetry/fixtures scripts/e2e/telemetry/fetch.sh && scripts/e2e/telemetry/build.sh <4.3.1|4.2.2> && scripts/e2e/telemetry/make-golden.sh",
+  "buildCommand": "TF1_CACHE=<cache> TF1_WORK=<work> TF1_OUT=scripts/e2e/telemetry/fixtures scripts/e2e/telemetry/fetch.sh && scripts/e2e/telemetry/build.sh <4.4.0|4.3.1|4.2.2> && scripts/e2e/telemetry/make-golden.sh",
   "reproducibility": "two builds of the same inputs gave the same reporter jar SHA-256 (see evidence/build.txt)",
   "inputs": {
     "protoc": {
@@ -72,6 +72,12 @@
       "cachePath": "jars/slf4j-api-1.7.36.jar",
       "sha256": "d3ef575e3e4979678dc01bf1dcce51021493b4d11fb7f1be8ad982877c16a1c0",
       "verification": "Maven Central .sha1 6c62681a2f655b49963a5983b8b0950a6120ae14 matched; byte-identical to the jar inside both images"
+    },
+    "kafka-clients-4.4.0": {
+      "url": "https://repo1.maven.org/maven2/org/apache/kafka/kafka-clients/4.4.0/kafka-clients-4.4.0.jar",
+      "cachePath": "jars/kafka-clients-4.4.0.jar",
+      "sha256": "1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9",
+      "verification": "Maven Central .sha256 1ab07317... read 2026-11-11; the same digest the Exit gate pins for its Java client jar"
     },
     "kafka-clients-4.3.1": {
       "url": "https://repo1.maven.org/maven2/org/apache/kafka/kafka-clients/4.3.1/kafka-clients-4.3.1.jar",
@@ -387,11 +393,11 @@
     "JavaTelemetryClient.java": "27e3fb34c247f514a0e07a07e85448e7c1bd6bc27eaa3fe301af04721f01eab3",
     "OtlpGoldenVectors.java": "464246d43489c545218e3204aecd89ce193ba9c07def5eb58d346dac53edaa73",
     "base-ports.override.yml": "945b4b163977dbcdfc05301865fb2771aef8cb1ec40795aed1fff0a951276429",
-    "build.sh": "a9f64eb1e4f4466e009df59dd3d5f4b10425eed7ef37c646bd61d2bea90f2bb0",
+    "build.sh": "dc36611f5b088ca07bcf80bcb93cd42e2f05807f92b00cc657148588030060ce",
     "check-exports.py": "3b607b9c28b5e855a9f65d9ff82952fe399ca5fac0c1b644a6604faa9c98df67",
     "check-golden-protoc.py": "047fdb999918513e22cba75164197e5a92d29b40324dd3d2daf5c537fbf4540c",
     "check-golden.py": "e7734ff4569b0317505238e380f638095b2e6a0edf8ceec2a8d3910116514b83",
-    "fetch.sh": "3d878bb99cdf6cb12173c2c9ed10e902b1ca8c2b0f44d01ac7b000bf010e5b26",
+    "fetch.sh": "4bd8e416d1911026569527a75aa5d487d2ab494353a108ea3672d95a66a5b1b0",
     "lib.sh": "e439e1d349bb8e2e9f8c7e97d1175a5671c89ca2596f4a3b0e523c756f6d5cdc",
     "make-golden.sh": "fe81af51242bff3d7c98de7be40911ab1a9a581caaba1fffaba98a6616db12ca",
     "protoc-text-to-semantic.py": "996dbb4b65a6f128a61d22d614c4f61fc1d467d97b5ca0c3cae4b063be12870f",
@@ -406,7 +412,7 @@
     "run-h6a-arm.sh": "edc7de09967a45fb3f149ed27f95bbd360a023c222395c5006f78e99470e9fa2"
   },
   "composeSha256": {
-    "docker-compose.telemetry.yml": "106c4ff1ad900a6d2351fa5702b23dfcc257023444f0d8bdd6341e6daceb454c"
+    "docker-compose.telemetry.yml": "cd6640b6553198f0a3b57479f74faffe4df44dbe52e2c990ce9f7136b8974075"
   },
   "amendments": [
     {
@@ -425,6 +431,16 @@
         "telemetryMetadataFollow.js",
         "check-metadata-follow.py",
         "run-h6a-arm.sh"
+      ]
+    },
+    {
+      "id": "kafka-4.4.0",
+      "date": "2026-11-11",
+      "change": "docker-compose.telemetry.yml defaults to apache/kafka:4.4.0 and its reporter jar name; fetch.sh and inputs.sha256 gain kafka-clients-4.4.0; build.sh usage names 4.4.0; nothing else in the compose file changed",
+      "composeSha256Before": "106c4ff1ad900a6d2351fa5702b23dfcc257023444f0d8bdd6341e6daceb454c",
+      "composeSha256After": "cd6640b6553198f0a3b57479f74faffe4df44dbe52e2c990ce9f7136b8974075",
+      "addedInputs": [
+        "kafka-clients-4.4.0"
       ]
     }
   ]

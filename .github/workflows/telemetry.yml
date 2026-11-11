@@ -25,8 +25,8 @@ jobs:
           node <<'NODE'
           const configured = 'docker-compose.telemetry.yml'
           const base = 'docker-compose.yml'
-          const both = ['4.3.1', '4.2.2']
-          const noPlugin = ['4.3.1', '4.2.2', '4.1.2', '4.0.2']
+          const both = ['4.4.0', '4.2.2']
+          const noPlugin = ['4.4.0', '4.2.2', '4.1.2', '4.0.2']
           const lanes = [
             ...[
               'telemetry-reporter',
@@ -36,10 +36,10 @@ jobs:
               'telemetry-java',
               'telemetry-outcomes',
               'telemetry-shutdown',
-            ].map((group) => ({ group, compose: configured, full: both, dev: ['4.3.1'] })),
-            { group: 'telemetry-base', compose: base, full: noPlugin, dev: ['4.3.1', '4.4.0'] },
-            { group: 'telemetry-unsupported', compose: base, full: noPlugin, dev: ['4.3.1'] },
-            { group: 'telemetry-outcomes', compose: base, full: ['4.1.2'], dev: [] },
+            ].map((group) => ({ group, compose: configured, full: both, dev: ['4.4.0'] })),
+            { group: 'telemetry-base', compose: base, full: noPlugin, dev: ['4.4.0'] },
+            { group: 'telemetry-unsupported', compose: base, full: noPlugin, dev: ['4.4.0'] },
+            { group: 'telemetry-outcomes', compose: base, full: ['4.4.0', '4.1.2'], dev: [] },
           ]
           const memory = process.env.MEMORY_VERDICTS === 'true'
           const selected = memory ? lanes.filter((lane) =>
@@ -50,7 +50,6 @@ jobs:
             for (const lane of selected)
               for (const kafka of full ? lane.full : lane.dev)
                 include.push({ node, kafka, group: lane.group, compose: lane.compose })
-          // The base 4.4.0 development smoke is additional coverage, not an exit obligation.
           require('fs').appendFileSync(process.env.GITHUB_OUTPUT, `matrix=${JSON.stringify({ include })}\n`)
           NODE
   resources:
@@ -120,7 +119,7 @@ jobs:
         timeout-minutes: 4
         run: timeout -k 5s 200s bash scripts/e2e/telemetry/fetch-interop.sh
       - name: Run reporter ordering and observer checks with the independent Java decoder
-        if: matrix.group == 'telemetry-reporter' && matrix.kafka == '4.3.1'
+        if: matrix.group == 'telemetry-reporter' && matrix.kafka == '4.4.0'
         timeout-minutes: 4
         env:
           TMPDIR: ${{ runner.temp }}
