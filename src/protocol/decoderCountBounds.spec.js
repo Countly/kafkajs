@@ -1,4 +1,6 @@
 const Decoder = require('./decoder')
+const Encoder = require('./encoder')
+const { decode: decodeFetchV12 } = require('./requests/fetch/v12/response')
 const { KafkaJSPartialMessageError } = require('../errors')
 
 const MAX_COUNT = 1000000
@@ -119,6 +121,54 @@ const tagSection = (count, { spacing = 1, first = 0, valueFor = (i) => [i & 0xff
   ])
 
 describe('Decoder count bounds', () => {
+  it('Fetch v12 validates only nonempty arrays when partitions have empty aborted transactions', async () => {
+    const partitions = [0, 1, 2].map((partition) =>
+      new Encoder()
+        .writeInt32(partition)
+        .writeInt16(0)
+        .writeInt64(100)
+        .writeInt64(100)
+        .writeInt64(0)
+        .writeUVarIntArray([], 'object')
+        .writeInt32(-1)
+        .writeUVarInt(1)
+        .writeTaggedFields()
+    )
+    const body = new Encoder()
+      .writeInt32(0)
+      .writeInt16(0)
+      .writeInt32(0)
+      .writeUVarIntArray(
+        [
+          new Encoder()
+            .writeUVarIntString('topic')
+            .writeUVarIntArray(partitions, 'object')
+            .writeTaggedFields(),
+        ],
+        'object'
+      )
+      .writeTaggedFields().buffer
+    const validation = jest.spyOn(Decoder.prototype, 'assertCount')
+
+    try {
+      const decoded = await decodeFetchV12(body)
+
+      expect(decoded.responses).toHaveLength(1)
+      expect(decoded.responses[0].topicName).toBe('topic')
+      expect(decoded.responses[0].partitions.map(({ partition }) => partition)).toEqual([0, 1, 2])
+      for (const partition of decoded.responses[0].partitions) {
+        expect(partition.abortedTransactions).toEqual([])
+        expect(partition.messages).toEqual([])
+      }
+      expect(validation.mock.calls).toEqual([
+        [1, 'readUVarIntArrayAsync'],
+        [3, 'readUVarIntArrayAsync'],
+      ])
+    } finally {
+      validation.mockRestore()
+    }
+  })
+
   for (const reader of READERS.filter(({ name }) => name.endsWith('Async'))) {
     it(`${reader.name} awaits each element in wire order across suspension`, async () => {
       const decoder = new Decoder(Buffer.concat([reader.prefix(3), Buffer.from([11, 22, 33])]))
