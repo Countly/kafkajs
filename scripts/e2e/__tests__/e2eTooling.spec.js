@@ -1284,6 +1284,7 @@ describe('broker telemetry fixture', () => {
     expect(new Set(catalogue(true).map(JSON.stringify)).size).toBe(69)
     expect(new Set(catalogue(true).map((r) => `${r.group}-${r.kafka}-${r.node}`)).size).toBe(69)
     const resources = workflow.jobs.resources
+    expect(resources['timeout-minutes']).toBe(105)
     expect(resources.needs).toBeUndefined()
     const alone = resources.steps.find((step) => step.run?.includes('resources\\.spec'))
     expect(alone.run).toContain('--runInBand')
@@ -1502,6 +1503,13 @@ describe('broker telemetry fixture', () => {
     })
     const journals = workflow.jobs['journal-controls']
     expect(journals['timeout-minutes']).toBe(60)
+    expect(journals.steps.map((step) => step.name ?? step.uses)).toEqual([
+      'actions/checkout@v4',
+      'actions/setup-node@v4',
+      undefined,
+      'Run the admin and live-flags journal controls serially on the idle runner',
+      'Upload journal control evidence',
+    ])
     expect(journals.strategy).toEqual({
       'fail-fast': false,
       matrix: {

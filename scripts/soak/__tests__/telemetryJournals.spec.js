@@ -608,18 +608,22 @@ describe('share journal packing', () => {
         capacity: storage.samples,
         bytes: storage.sampleBytes,
       })
+      const engine = new churn.EngineCodeJournal()
       declared[kind] = churn.declaredJournalBytes(kind, TELEMETRY)
       expect(
-        journalState([ordinary, ...(ledger ? [ledger] : []), journal, sampler, samples]).byteLength
+        journalState([ordinary, ...(ledger ? [ledger] : []), journal, sampler, samples, engine])
+          .byteLength
       ).toBe(declared[kind])
+      expect(engine.journalState().byteLength).toBe(4096)
+      expect(engine.rows.storage.equals(Buffer.alloc(4096, 0xa5))).toBe(true)
       for (const archive of ledger ? [ledger.exchanges, ledger.settled] : [])
         expect(archive.storage.equals(Buffer.alloc(archive.byteLength, 0xa5))).toBe(true)
     }
     expect(declared).toEqual({
-      producer: 4070384,
-      consumer: 4070384,
-      admin: 4070384,
-      shareConsumer: 23188464,
+      producer: 4074480,
+      consumer: 4074480,
+      admin: 4074480,
+      shareConsumer: 23192560,
     })
   })
 })

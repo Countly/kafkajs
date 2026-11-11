@@ -7088,7 +7088,7 @@ describe('telemetry resident-size reference', () => {
 
   test('allows the share consumer a setup peak of 96 MiB plus its exact declared journal bytes and no more', () => {
     const { input, declared } = shareInput()
-    expect(declared).toBe(23188464)
+    expect(declared).toBe(23192560)
     setPeak(input, 96 * MIB + declared)
     expect(evaluate(input)).toMatchObject({
       ok: true,

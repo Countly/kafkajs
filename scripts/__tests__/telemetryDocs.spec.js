@@ -444,6 +444,19 @@ describe('telemetry resource documentation', () => {
     expect(testing).not.toMatch(/absolute lifetime peak RSS at most 64 MiB/)
     expect(telemetry).toContain('refused before either selection array is built')
     expect(telemetry).toContain('64 MiB above')
+    for (const document of [testing, telemetry]) {
+      expect(document).toContain('Δdata = Δ(heapUsed + external) − Δ(V8 code_and_metadata_size + bytecode_and_metadata_size)')
+      expect(document).toContain('first use M − M0 ≤ 1 MiB')
+      expect(document).toContain('unseeded data below −256 KiB is inconclusive')
+      expect(document).toContain('measured warm-up lifecycle')
+      expect(document).toContain('schema 6')
+      expect(document).toContain('96 MiB plus its declared journal bytes')
+      expect(document).toContain('shadow only')
+    }
+    expect(testing).toContain('legacy unseeded arm is a contamination-positive control')
+    expect(testing).toContain('live-flags control')
+    expect(testing).toContain('23,192,560')
+    expect(testing).toContain('123,855,856')
   })
 
   test('documents the churn method and the CI rows', () => {
