@@ -159,7 +159,23 @@ const assertScenario = (scenario, proof, raw) => {
     assert.deepEqual(proof.crashes, [])
   } else if (scenario === 'forget') {
     assert(proof.lost.length > 0 && proof.kept.length > 0)
-    const requests = wire.filter(({ apiKey, label }) => apiKey === 78 && label === 'A')
+    const fetches = wire.filter(({ apiKey, label }) => apiKey === 78 && label === 'A')
+    const held = fetches.find(({ answeredAt }) => answeredAt === proof.heldAt)
+    assert(held?.answer?.errorCode === 0, 'no successful held fetch')
+    const acquired = held.answer.responses
+      .filter(({ topicId }) => topicId === proof.topicId)
+      .flatMap(({ partitions }) => partitions)
+    for (const partition of [...proof.lost, ...proof.kept])
+      assert(
+        acquired.some(
+          (entry) =>
+            entry.partitionIndex === partition &&
+            entry.errorCode === 0 &&
+            entry.acquiredRecords.length > 0
+        ),
+        `held fetch did not acquire partition ${partition}`
+      )
+    const requests = fetches.filter(({ requestedAt }) => requestedAt >= proof.heldAt)
     for (const partition of proof.lost) {
       const ack = requests.findIndex(({ request }) =>
         request.topics.some(
@@ -172,6 +188,21 @@ const assertScenario = (scenario, proof, raw) => {
         )
       )
       assert(ack >= 0)
+      assert(requests[ack].request.shareSessionEpoch > 0)
+      const settled = decisions([requests[ack]], proof.topicId, partition)
+      const expectedOffsets = acquired
+        .find(({ partitionIndex }) => partitionIndex === partition)
+        .acquiredRecords.flatMap(({ firstOffset, lastOffset }) => {
+          const offsets = []
+          for (let offset = BigInt(firstOffset); offset <= BigInt(lastOffset); offset++)
+            offsets.push(String(offset))
+          return offsets
+        })
+      assert.deepEqual(
+        settled.map(({ offset }) => offset),
+        expectedOffsets
+      )
+      assert(settled.every(({ type }) => [1, 2].includes(type)))
       const listed = (request) =>
         request.topics.some(
           ({ topicId, partitions }) =>
