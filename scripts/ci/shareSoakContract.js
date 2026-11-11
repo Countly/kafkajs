@@ -45,6 +45,7 @@ const childArgs = (profile) => {
         '--ci',
         '--detectOpenHandles',
         '--runInBand',
+        '--reporters=./testHelpers/quietReporter.js',
         '--runTestsByPath',
         'src/consumer/share/__tests__/shareSoakLive.spec.js',
         '--json',

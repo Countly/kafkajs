@@ -1,5 +1,8 @@
 module.exports = {
   verbose: !!process.env.VERBOSE,
+  ...(process.env.KAFKAJS_RESOURCE_REPORTER === '1' && {
+    reporters: ['<rootDir>/testHelpers/quietReporter.js'],
+  }),
   moduleNameMapper: {
     // Anchored: an unanchored key matches any require path that merely contains the name, so a
     // module under testHelpers/ would resolve to the index instead of itself.

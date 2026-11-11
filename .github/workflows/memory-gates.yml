@@ -215,7 +215,7 @@ jobs:
         env:
           TMPDIR: ${{ runner.temp }}
           TELEMETRY_RESOURCES_QUIET: '1'
-        run: timeout -k 10s 540s node --expose-gc node_modules/jest/bin/jest.js --runInBand --ci --detectOpenHandles --testPathPatterns 'src/telemetry/__tests__/resources\.spec\.js$' --testNamePattern 'resource memory for'
+        run: timeout -k 10s 540s node --expose-gc node_modules/jest/bin/jest.js --runInBand --ci --detectOpenHandles --reporters=./testHelpers/quietReporter.js --testPathPatterns 'src/telemetry/__tests__/resources\.spec\.js$' --testNamePattern 'resource memory for'
       - name: Validate the recorded measurements for this tree and Node
         if: always()
         timeout-minutes: 2
@@ -397,7 +397,7 @@ jobs:
         timeout-minutes: 3
         run: |
           mkdir -p .tmp/telemetry-verdict-controls
-          timeout -k 5s 150s node node_modules/jest/bin/jest.js --runInBand --ci --detectOpenHandles --runTestsByPath scripts/e2e/telemetry/__tests__/memoryVerdicts.spec.js testHelpers/__tests__/telemetryFixtures.spec.js --json --outputFile=.tmp/telemetry-verdict-controls/results.json
+          timeout -k 5s 150s node node_modules/jest/bin/jest.js --runInBand --ci --detectOpenHandles --reporters=./testHelpers/quietReporter.js --runTestsByPath scripts/e2e/telemetry/__tests__/memoryVerdicts.spec.js testHelpers/__tests__/telemetryFixtures.spec.js --json --outputFile=.tmp/telemetry-verdict-controls/results.json
       - if: always()
         uses: actions/upload-artifact@v4
         with:

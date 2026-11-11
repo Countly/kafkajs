@@ -153,6 +153,7 @@ const runNaturalExit = (
           '--ci',
           '--detectOpenHandles',
           '--runInBand',
+          '--reporters=./testHelpers/quietReporter.js',
           '--runTestsByPath',
           `src/consumer/share/__tests__/${spec}`,
         ]

@@ -195,6 +195,7 @@ describe.each(['soak', 'soak-full', 'shutdown'])('CI natural exit > %s', (lane) 
             '--ci',
             '--detectOpenHandles',
             '--runInBand',
+            '--reporters=./testHelpers/quietReporter.js',
             '--runTestsByPath',
             `src/consumer/share/__tests__/share${lane === 'soak' ? 'Soak' : 'Shutdown'}Live.spec.js`,
           ],
