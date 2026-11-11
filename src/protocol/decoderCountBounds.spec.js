@@ -119,6 +119,68 @@ const tagSection = (count, { spacing = 1, first = 0, valueFor = (i) => [i & 0xff
   ])
 
 describe('Decoder count bounds', () => {
+  for (const reader of READERS.filter(({ name }) => name.endsWith('Async'))) {
+    it(`${reader.name} awaits each element in wire order across suspension`, async () => {
+      const decoder = new Decoder(Buffer.concat([reader.prefix(3), Buffer.from([11, 22, 33])]))
+      const events = []
+      const element = async (input) => {
+        events.push(`start:${input.offset}`)
+        await Promise.resolve()
+        const value = input.readInt8()
+        events.push(`end:${value}`)
+        return value * 2
+      }
+      const start = reader.prefix(3).length
+
+      const result = await decoder[reader.name](element)
+
+      expect(result).toEqual([22, 44, 66])
+      expect(events).toEqual([
+        `start:${start}`,
+        'end:11',
+        `start:${start + 1}`,
+        'end:22',
+        `start:${start + 2}`,
+        'end:33',
+      ])
+      expect(decoder.offset).toBe(decoder.buffer.length)
+    })
+
+    it(`${reader.name} propagates an element failure without reading later elements`, async () => {
+      for (const asynchronous of [false, true]) {
+        const decoder = new Decoder(Buffer.concat([reader.prefix(3), Buffer.from([11, 22, 33])]))
+        const sentinel = new Error('second element failed')
+        const values = []
+        const element = (input) => {
+          const value = input.readInt8()
+          values.push(value)
+          if (value === 22) {
+            if (asynchronous) return Promise.reject(sentinel)
+            throw sentinel
+          }
+          return Promise.resolve(value)
+        }
+
+        await expect(decoder[reader.name](element)).rejects.toBe(sentinel)
+
+        expect(values).toEqual([11, 22])
+        expect(decoder.offset).toBe(reader.prefix(3).length + 2)
+      }
+    })
+  }
+
+  it('readArrayAsync rejects negative counts other than -1 before reading an element', async () => {
+    const element = jest.fn()
+
+    for (const count of [-2, -2147483648]) {
+      await expect(new Decoder(int32(count)).readArrayAsync(element)).rejects.toBeInstanceOf(
+        KafkaJSPartialMessageError
+      )
+    }
+
+    expect(element).not.toHaveBeenCalled()
+  })
+
   for (const reader of READERS) {
     it(
       `${reader.name} rejects ${MAX_COUNT + 1} entries before reading an element`,
