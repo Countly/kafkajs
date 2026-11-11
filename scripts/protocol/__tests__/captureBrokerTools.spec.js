@@ -2,6 +2,7 @@ const fs = require('fs')
 const net = require('net')
 const path = require('path')
 const { isBuiltin } = require('module')
+const { Linter } = require('eslint')
 const { projectBrokerTools } = require('../captureBrokerTools')
 const { capture } = require('../wireFeatures')
 const {
@@ -24,19 +25,44 @@ const WIRE_SCRIPT = path.join(__dirname, '..', 'wireFeatures.js')
  * @throws {Error} for a client dependency or a non-literal specifier
  */
 const assertBuiltinDependencies = (source) => {
-  const specifiers = [
-    ...source.matchAll(/\brequire\(\s*['"]([^'"]+)['"]\s*\)/g),
-    ...source.matchAll(/\bfrom\s+['"]([^'"]+)['"]/g),
-    ...source.matchAll(/\bimport\(\s*['"]([^'"]+)['"]\s*\)/g),
-  ].map((match) => match[1])
-  if (
-    specifiers.some((specifier) => !isBuiltin(specifier)) ||
-    (source.match(/\brequire\(/g) || []).length !==
-      (source.match(/\brequire\(\s*['"][^'"]+['"]\s*\)/g) || []).length ||
-    /\bimport\s*\(\s*[^'"\s)]/.test(source)
-  ) {
-    throw new Error('Expected only literal Node built-in dependencies')
-  }
+  const messages = new Linter().verify(source, {
+    languageOptions: { ecmaVersion: 2023, sourceType: 'module' },
+    plugins: {
+      capture: {
+        rules: {
+          builtins: {
+            create(context) {
+              const check = (node, specifier) => {
+                if (
+                  specifier?.type !== 'Literal' ||
+                  typeof specifier.value !== 'string' ||
+                  !isBuiltin(specifier.value)
+                ) {
+                  context.report({
+                    node,
+                    message: 'Expected only literal Node built-in dependencies',
+                  })
+                }
+              }
+              return {
+                CallExpression(node) {
+                  if (node.callee.type === 'Identifier' && node.callee.name === 'require') {
+                    check(node, node.arguments.length === 1 ? node.arguments[0] : undefined)
+                  }
+                },
+                ImportDeclaration: (node) => check(node, node.source),
+                ImportExpression: (node) => check(node, node.source),
+                ExportNamedDeclaration: (node) => node.source && check(node, node.source),
+                ExportAllDeclaration: (node) => check(node, node.source),
+              }
+            },
+          },
+        },
+      },
+    },
+    rules: { 'capture/builtins': 'error' },
+  })
+  if (messages.length) throw new Error(messages.map(({ message }) => message).join('\n'))
 }
 
 /**

@@ -22,6 +22,7 @@ const fs = require('fs')
 const os = require('os')
 const path = require('path')
 const { RAW_FILES, projectBrokerTools, sha256 } = require('./captureBrokerTools')
+const { readBrokerCapture } = require('../../testHelpers/brokerCapture')
 
 const CAPTURES_DIR = path.join(__dirname, 'captures')
 const RANGES_FILE = path.join(__dirname, 'brokerRanges.json')
@@ -225,6 +226,7 @@ const main = (argv) => {
     const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'capture-dry-run-'))
     try {
       const { capture } = importCapture({ artifactDir, version, outDir: scratch })
+      readBrokerCapture(version, scratch)
       if (tablesDir) {
         const [rangesFile, featuresFile] = [RANGES_FILE, FEATURES_FILE].map((file) => {
           const copy = path.join(scratch, path.basename(file))
@@ -242,7 +244,7 @@ const main = (argv) => {
 
   const { capture, target } = importCapture({ artifactDir, version })
   try {
-    require('../../testHelpers/brokerCapture').readBrokerCapture(version)
+    readBrokerCapture(version)
     if (tablesDir) mergeClientTables({ tablesDir, version, capture })
   } catch (error) {
     fs.rmSync(target, { recursive: true, force: true })
