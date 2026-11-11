@@ -1355,26 +1355,62 @@ describe('broker telemetry fixture', () => {
       'ready_for_review',
     ])
     expect(Object.keys(workflow.jobs)).toEqual([
-      'share-soak-short',
+      'unit',
+      'share-soak',
+      'share-soak-verify',
+      'share-soak-verdict',
+      'resources',
+      'retained-diagnostic',
+      'telemetry-soak',
+      'telemetry-verdicts',
+      'telemetry-verdict-controls',
+      'verdict',
+    ])
+    expect(workflow.jobs['share-soak'].needs).toEqual(['unit'])
+    expect(workflow.jobs['share-soak'].strategy.matrix.include.map((row) => row.profile)).toEqual([
+      'short',
+      'full',
+    ])
+    expect(workflow.jobs['share-soak-verify'].needs).toEqual(['share-soak'])
+    expect(workflow.jobs['share-soak-verify'].strategy.matrix.profile).toEqual(['short', 'full'])
+    expect(workflow.jobs['share-soak-verdict'].needs).toEqual(['share-soak', 'share-soak-verify'])
+    expect(workflow.jobs.verdict.needs).toEqual([
+      'unit',
+      'share-soak-verdict',
       'resources',
       'retained-diagnostic',
       'telemetry-soak',
       'telemetry-verdicts',
       'telemetry-verdict-controls',
     ])
-    for (const job of Object.values(workflow.jobs)) {
+    for (const job of [workflow.jobs['share-soak-verdict'], workflow.jobs.verdict]) {
       expect(job.if).toBe(
-        "github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/')"
+        "always() && (github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/'))"
       )
-      expect(job.needs).toBeUndefined()
+    }
+    expect(workflow.jobs['share-soak-verdict'].steps[0].run).toBe(
+      'test "$PRODUCED" = success && test "$RECHECKED" = success'
+    )
+    expect(JSON.stringify(workflow.jobs.verdict)).toContain("job.result !== 'success'")
+    for (const [name, job] of Object.entries(workflow.jobs)) {
+      if (['share-soak-verdict', 'verdict'].includes(name)) continue
+      expect(job.if).toBe(
+        name === 'share-soak-verify'
+          ? "always() && (github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/'))"
+          : "github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/')"
+      )
+      if (!['share-soak', 'share-soak-verify'].includes(name)) expect(job.needs).toBeUndefined()
       if (job.uses) {
         expect(job.uses).toBe('./.github/workflows/telemetry.yml')
         expect(job.with).toEqual({ full: true, 'memory-verdicts': true })
         expect(job['continue-on-error']).toBeUndefined()
         continue
       }
-      expect(job.steps[0].uses).toBe('actions/checkout@v4')
-      expect(job.steps[1].uses).toBe('actions/setup-node@v4')
+      const checkout = job.steps.findIndex((step) => step.uses === 'actions/checkout@v4')
+      expect(checkout).toBeGreaterThanOrEqual(0)
+      if (name === 'share-soak') expect(job.steps[checkout].with['fetch-depth']).toBe(2)
+      expect(job.steps[checkout + 1].uses).toBe('actions/setup-node@v4')
+      if (name === 'unit') continue
       expect(job.steps.at(-1)).toMatchObject({
         if: 'always()',
         uses: 'actions/upload-artifact@v4',

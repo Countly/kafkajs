@@ -1,3 +1,4 @@
+const { resultProblems } = require('./shareSoakResults')
 const Decoder = require('../../src/protocol/decoder')
 const { responseHeaderVersion } = require('../../src/protocol/headers')
 const { readRequestHeader } = require('../../testHelpers/fakeSocket')
@@ -45,6 +46,12 @@ const errors = (value) => {
 const verifyProtocolAnswers = async (rows) => {
   const problems = []
   const successes = []
+  const answers = []
+  const operationResults = new Map(
+    rows
+      .filter((r) => r.event === 'soak-wire' && r.kind === 'operation' && r.status === 'passed')
+      .map((r) => [r.id, r.result])
+  )
   const groupListings = []
   const requests = rows.filter((r) => r.event === 'soak-wire' && r.kind === 'request')
   const replies = new Map(
@@ -70,7 +77,12 @@ const verifyProtocolAnswers = async (rows) => {
       const decoded = await codec.decode(body)
       const codes = errors(decoded)
       if (codes.some((code) => !Number.isInteger(code))) throw new Error('Invalid wire error code')
-      if (codes.some((code) => code !== 0)) continue
+      if (codes.some((code) => code !== 0)) {
+        if (errors(operationResults.get(request.operationId)).some((code) => code !== 0))
+          answers.push({ request, decoded })
+        continue
+      }
+      answers.push({ request, decoded })
       if (header.apiKey === 16)
         groupListings.push({
           operationId: request.operationId,
@@ -114,6 +126,7 @@ const verifyProtocolAnswers = async (rows) => {
   ])
     if (!successes.some((r) => r.operation === operation))
       problems.push(`No decoded successful operation ${operation}`)
+  problems.push(...resultProblems(rows, answers))
   return { problems, successes, groupListings }
 }
 module.exports = { verifyProtocolAnswers }

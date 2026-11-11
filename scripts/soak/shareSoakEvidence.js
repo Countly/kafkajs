@@ -202,4 +202,13 @@ class ShareSoakEvidence {
  * @throws {Error} On repeated installation.
  */
 const observeShareSoakDriver = (driver, record) => new ShareSoakEvidence(driver, record).install()
-module.exports = { ShareSoakEvidence, observeShareSoakDriver }
+/**
+ * Enables extra evidence work only for the fixed CI profile and matching workload selector.
+ * @param {object} [env=process.env] Original process environment.
+ * @returns {boolean} Whether the explicit CI evidence contract is active.
+ */
+const ciEvidenceEnabled = (env = process.env) => {
+  const profile = require('../ci/shareSoakContract').PROFILES[env.KAFKAJS_SOAK_PROFILE]
+  return env.KAFKAJS_LANE === 'docker' && Boolean(profile && env[profile.selector] === '1')
+}
+module.exports = { ShareSoakEvidence, observeShareSoakDriver, ciEvidenceEnabled }

@@ -8,22 +8,21 @@ const path = require('node:path')
 const { sourceIdentity } = require('../../ci/shareSoakJob')
 const { validateArchive } = require('../../evidence/shareSoakAcceptance')
 const { shareArchive } = require('./fixtures/shareArchive')
-// eslint-disable-next-line n/no-unsupported-features/node-builtins -- count-only collection checks original weak roots on the supported Node 22+ test lane
-const { queryObjects } = require('node:v8')
-const { ShareSoakDriver } = require('../soak')
+require('node:v8').setFlagsFromString('--expose-gc')
+const collect = require('node:vm').runInNewContext('gc')
 const { liveRun } = require('../../../src/producer/__tests__/fixtures/bounded')
 const { verifySharePriming } = require('../../evidence/sharePriming')
 const { originalShareSchedule } = require('./fixtures/originalShareSchedule')
 
 /**
  * Checks weak original roots after a new job and a full collection, retaining no returned graph.
- * The count-only query performs collection; it never returns instances to this control.
+ * A full collection avoids the heap enumeration performed by count-only object queries.
  * @param {object} roots Weak references created by the first-use factory.
  * @returns {Promise<string[]>} Retained original roots by name.
  */
 const retainedRoots = async (roots) => {
   await new Promise(setImmediate)
-  queryObjects(ShareSoakDriver, { format: 'count' })
+  collect()
   return Object.entries(roots)
     .filter(([, ref]) => ref.deref() !== undefined)
     .map(([name]) => name)

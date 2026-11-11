@@ -4671,7 +4671,10 @@ class ShareFetchTap {
     }
     const operation = this.operations.getStore()
     written ??= { id: ++this.frameSequence, socket, endpoint, ...header, at: this.clock.now() }
-    const codecs = header.apiKey === 0 ? require('./shareProtocol').produceCodecs(frame) : undefined
+    const codecs =
+      this.archive && header.apiKey === 0
+        ? require('./shareProtocol').produceCodecs(frame)
+        : undefined
     this.archive?.({
       kind: 'request',
       frame: written.id,
@@ -4753,14 +4756,34 @@ class ShareFetchTap {
    * @param {string} role Client role.
    * @param {string} name Public operation and concrete option shape.
    * @param {Function} work Original invocation.
+   * @param {object} [target] Original public topic/group selection for response correlation.
    * @returns {T} Original return value.
    * @throws {Error} Original synchronous error.
    */
-  operation(role, name, work) {
-    const context = { role, name, id: ++this.operationSequence }
+  operation(role, name, work, target) {
+    if (!this.archive) return work()
+    const context = { role, name, id: ++this.operationSequence, ...(target && { target }) }
     return this.operations.run(context, () => {
-      const record = (status) =>
-        this.archive?.({ kind: 'operation', ...context, at: this.clock.now(), status })
+      const record = (status, result) =>
+        this.archive?.({
+          kind: 'operation',
+          ...context,
+          at: this.clock.now(),
+          status,
+          ...([
+            'send',
+            'describeConfigs',
+            'fetchTopicMetadata',
+            'listTopics',
+            'describeCluster',
+            'describeShareGroups',
+            'listShareGroupOffsets:named',
+            'listShareGroupOffsets:all',
+            'fetchTopicOffsets',
+            'listGroups',
+          ].includes(name) &&
+            status === 'passed' && { result }),
+        })
       record('started')
       let result
       try {
@@ -4772,13 +4795,13 @@ class ShareFetchTap {
       if (result?.then)
         result
           .then(
-            () => record('passed'),
+            (value) => record('passed', value),
             () => record('failed')
           )
           .catch(() => {
             this.faults++
           })
-      else record('passed')
+      else record('passed', result)
       return result
     })
   }
@@ -4804,7 +4827,10 @@ class ShareFetchTap {
                 )
                 operation += `:${[...new Set(operations)].sort().join(',')}`
               }
-              return this.operation(role, operation, () => value.apply(client, args))
+              return this.operation(role, operation, () => value.apply(client, args), {
+                topic: args[0]?.topic,
+                groupId: args[0]?.groupId,
+              })
             },
       ])
     )
@@ -6602,12 +6628,14 @@ class ShareSoak {
    * @throws {Error} the setup failure; its cleanups are registered already and run on `close`
    */
   async prepare() {
-    if (this.driver instanceof ShareSoakDriver)
+    const evidence = require('./shareSoakEvidence').ciEvidenceEnabled()
+    if (evidence && this.driver instanceof ShareSoakDriver)
       require('./shareSoakEvidence').observeShareSoakDriver(this.driver, (event, fields) =>
         this.row(event, fields)
       )
     await this.stage('setup', async (scope) => {
-      if (this.driver.tap) this.driver.tap.archive = (fact) => this.row('soak-wire', fact)
+      if (evidence && this.driver.tap)
+        this.driver.tap.archive = (fact) => this.row('soak-wire', fact)
       const digest = (file) =>
         require('node:crypto').createHash('sha256').update(fs.readFileSync(file)).digest('hex')
       this.row('soak-schedule', {
@@ -7424,11 +7452,14 @@ const buildShareSoak = ({ brokers, short = false, record, run }) => {
     logLevel: logLevel.NOTHING,
     socketFactory: tap.factory(forgettingDestroyed(chaos, { releaseOnClose: true })),
   })
-  const observedKafka = (client) => ({
-    admin: (...args) => tap.client('admin', client.admin(...args)),
-    producer: (...args) => tap.client('producer', client.producer(...args)),
-    shareConsumer: (...args) => tap.client('share', client.shareConsumer(...args)),
-  })
+  const observedKafka = (client) =>
+    require('./shareSoakEvidence').ciEvidenceEnabled()
+      ? {
+          admin: (...args) => tap.client('admin', client.admin(...args)),
+          producer: (...args) => tap.client('producer', client.producer(...args)),
+          shareConsumer: (...args) => tap.client('share', client.shareConsumer(...args)),
+        }
+      : client
   const scoredKafka = observedKafka(kafka)
   return new ShareSoak({
     driver: new ShareSoakDriver({

@@ -56,6 +56,7 @@ jobs:
           NODE
       - uses: actions/checkout@v4
         timeout-minutes: 1
+        with: { fetch-depth: 2 }
       - uses: actions/setup-node@v4
         timeout-minutes: 1
         with: { node-version: 24, cache: npm }

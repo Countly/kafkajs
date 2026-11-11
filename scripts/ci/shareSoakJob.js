@@ -36,7 +36,11 @@ const git = (args) => execFileSync('git', args, { encoding: 'utf8' }).trim()
  * @throws {Error} On a non-merge or mismatched parent pair.
  */
 const verifyMergeParents = (pr, run = git) => {
-  const parents = run(['show', '-s', '--format=%P', 'HEAD']).split(' ')
+  const parents = run(['cat-file', '-p', 'HEAD'])
+    .split('\n\n', 1)[0]
+    .split('\n')
+    .filter((line) => line.startsWith('parent '))
+    .map((line) => line.slice(7))
   if (parents.length !== 2 || !parents.includes(pr.head.sha) || !parents.includes(pr.base.sha))
     throw new Error('Unexpected tested merge relationship')
 }

@@ -379,7 +379,8 @@ const scopeProblems = (rows, completion, contract) => {
           reset.oldSocket !== target.socket ||
           !reopen ||
           !ArchivedCycle.response(reopen) ||
-          reopen.generation === source.generation ||
+          reopen.open === source.open ||
+          (reopen.pool === source.pool && reopen.generation === source.generation) ||
           new Set(writes.map((s) => s.nodeId)).size !== 3 ||
           !steps.some((s) => s.step === 'socket-close' && s.socket === target.socket)
         )

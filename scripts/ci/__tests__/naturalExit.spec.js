@@ -460,6 +460,12 @@ describe('CI natural exit > actual fixed CLI subprocess observation', () => {
         const fs = require('node:fs')
         const rows = JSON.parse(fs.readFileSync('rows.json'))
         const at = Number(process.hrtime.bigint() / 1000000n)
+        const prime = rows.find(r => r.event === 'priming-complete')
+        prime.cleanup.completedAt = at
+        prime.cleanup.clock.completedAt = at
+        const hash = require(${JSON.stringify(require.resolve('../../evidence/sharePrimingLink'))}).primingReceiptHash(prime)
+        rows.find(r => r.event === 'priming-boundary').priming.receiptSha256 = hash
+        rows.at(-1).priming.receiptSha256 = hash
         rows.at(-1).cleanup.completedAt = at
         rows.at(-1).cleanup.clock.completedAt = at
         fs.writeFileSync('.tmp/e2e/share-soak-full.jsonl', rows.map(JSON.stringify).join('\\n') + '\\n')
