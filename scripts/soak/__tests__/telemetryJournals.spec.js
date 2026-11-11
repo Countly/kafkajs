@@ -3,7 +3,7 @@ const fs = require('node:fs')
 const v8 = require('node:v8')
 const churn = require('../telemetryChurn')
 const controls = require('../journalControls')
-const { TELEMETRY } = require('../soak')
+const { TELEMETRY, TelemetryResourceVerdict } = require('../soak')
 const { MEMORY_FLAGS } = require('../../../testHelpers/processMemory')
 const { ReferenceWork, ReferenceShareLedger } = require('./fixtures/journalReference')
 const { NativeJournal, PendingSampler } = require('../../../testHelpers/processMemory')
@@ -1078,7 +1078,7 @@ describe('telemetry engine code shadow', () => {
   test('takes the final reading engine sizes while building the reference and lists the journal as allocated before the control', () => {
     const worker = new churn.TelemetryWorkerProcess({
       kind: 'admin',
-      soak: { TELEMETRY },
+      soak: { TELEMETRY, TelemetryResourceVerdict },
       proc: {},
       env: {},
     })
@@ -1090,7 +1090,7 @@ describe('telemetry engine code shadow', () => {
       journal: { summary: () => ({}) },
       sampler: { summary: () => ({}) },
       foreground: [],
-      allocation: {},
+      allocation: { byteLength: churn.declaredJournalBytes('admin', TELEMETRY) },
     }
     const engine = new churn.EngineCodeJournal({ capacity: 2 })
     const reference = worker.reference({ ...parts, engine })
@@ -1103,6 +1103,7 @@ describe('telemetry engine code shadow', () => {
       },
     ])
     expect(reference.journals.allocationBeforeControl).toContain('engine-code')
+    expect(reference.journals.setupAllowanceBytes).toBe(TELEMETRY.setupPeakBytes)
     expect(worker.reference(parts).final.phase).toBe('final')
   })
 
