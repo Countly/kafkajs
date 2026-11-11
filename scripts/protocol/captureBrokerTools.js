@@ -271,9 +271,9 @@ const verifyProvenance = (provenance, raws) => {
 /**
  * Projects the three raw outputs of one cluster state into a capture.
  * KRaft's finalized-features epoch is the metadata image offset: periodic no-op records can advance
- * it without changing feature levels. When both sources carry epochs, provenance timestamps must
- * place the tool capture strictly before the wire capture, and the tool epoch must be no greater
- * than the wire epoch. API ranges, numeric feature ranges and finalized levels still match exactly.
+ * it without changing feature levels. When both sources carry epochs, the whole-second provenance
+ * timestamps must not place the tool capture after the wire capture, and the tool epoch must be no
+ * greater than the wire epoch. API ranges, numeric feature ranges and finalized levels still match exactly.
  * @param {object} input
  * @param {string} input.apiVersionsText raw `kafka-broker-api-versions.sh` output
  * @param {string} input.wireFeaturesLine raw one-line output of `wireFeatures.js`
@@ -304,8 +304,8 @@ const projectBrokerTools = ({ apiVersionsText, wireFeaturesLine, featuresText, p
   if (toolEpoch && wireEpoch) {
     const toolCapture = checked.captures.find(({ file }) => file === RAW_FILES.features)
     const wireCapture = checked.captures.find(({ file }) => file === RAW_FILES.wire)
-    if (toolCapture.capturedOn >= wireCapture.capturedOn) {
-      throw new Error('capture order must show the tool was captured before the wire probe')
+    if (toolCapture.capturedOn > wireCapture.capturedOn) {
+      throw new Error('capture order puts the tool after the wire probe')
     }
     if (BigInt(toolEpoch) > BigInt(wireEpoch)) {
       throw new Error(`finalized-features epoch disagree: tool ${toolEpoch}, wire ${wireEpoch}`)
