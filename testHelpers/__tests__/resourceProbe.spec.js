@@ -2392,3 +2392,61 @@ describe('resource artifact validation', () => {
     })
   })
 })
+
+
+describe('telemetry timeout owner diagnostics', () => {
+  test('reports a leaked timer creation stack and releases every diagnostic resource', async () => {
+    // eslint-disable-next-line n/no-unsupported-features/node-builtins -- development-only async resource identity
+    const { executionAsyncId } = require('async_hooks')
+    const { TimeoutDiagnostics } = require('../timeoutDiagnostics')
+    const roles = new ResourceRoles().start()
+    const diagnostics = new TimeoutDiagnostics().start()
+    const before = roles.read()
+    const triggerAsyncId = executionAsyncId()
+    const timer = setTimeout(() => {}, 60000)
+    try {
+      const report = diagnostics.read()
+      const ids = roles.read().unknown.Timeout
+      expect(report.live).toHaveLength(1)
+      expect(report.live[0]).toMatchObject({
+        id: ids[0],
+        triggerAsyncId,
+        createdAt: expect.any(Number),
+        destroyedAt: null,
+        stack: expect.stringContaining('testHelpers/__tests__/resourceProbe.spec.js:'),
+      })
+      expect(report.live[0].stack).not.toContain(path.resolve(__dirname, '../..'))
+      expect(report.live[0].stack).not.toContain('node_modules')
+      expect(report.created).toBe(1)
+      clearTimeout(timer)
+      await new Promise((resolve) => setImmediate(resolve))
+      await new Promise((resolve) => setImmediate(resolve))
+      expect(diagnostics.read()).toMatchObject({ live: [], created: 1, destroyed: 1, dropped: 0 })
+      diagnostics.stop()
+      expect(roles.read()).toEqual(before)
+      const later = setTimeout(() => {}, 60000)
+      clearTimeout(later)
+      expect(diagnostics.read()).toMatchObject({ live: [], created: 1 })
+    } finally {
+      clearTimeout(timer)
+      diagnostics.stop()
+      roles.stop()
+    }
+  })
+
+  test('bounds live timer facts and reports dropped diagnostics', async () => {
+    const { TimeoutDiagnostics } = require('../timeoutDiagnostics')
+    const diagnostics = new TimeoutDiagnostics({ capacity: 1 }).start()
+    const timers = [setTimeout(() => {}, 60000), setTimeout(() => {}, 60000)]
+    try {
+      expect(diagnostics.read()).toMatchObject({ created: 2, dropped: 1, live: [expect.any(Object)] })
+      for (const timer of timers) clearTimeout(timer)
+      await new Promise((resolve) => setImmediate(resolve))
+      await new Promise((resolve) => setImmediate(resolve))
+      expect(diagnostics.read()).toMatchObject({ live: [], destroyed: 1 })
+    } finally {
+      for (const timer of timers) clearTimeout(timer)
+      diagnostics.stop()
+    }
+  })
+})

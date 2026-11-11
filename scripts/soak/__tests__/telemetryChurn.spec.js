@@ -2034,6 +2034,44 @@ describe('telemetry profile worker', () => {
     ])
   })
 
+  test('accepts a matching Get written between readback and confirmation delivery', async () => {
+    const records = [getRecord(1, 3)]
+    const current = { id: 'producer-lc-2', observer: observerOf(records) }
+    const { worker } = make({ current })
+    const command = { tick: 1, index: 2, stage: 'confirm', selection: '' }
+    await worker.handle({ ...command, type: 'confirm-fence' })
+    const fence = worker.send.mock.calls.at(-1)[0]
+    expect(fence).toMatchObject({ type: 'confirm-fenced', tick: 1, after: 1, segment: current.id })
+    records.push(
+      getRecord(2, 3, {
+        writeAt: fence.receivedAt + 1,
+        response: { ...getRecord(2, 3).response, requestedMetrics: [], subscriptionId: 9 },
+      })
+    )
+    await worker.handle({ ...command, type: 'stage' })
+    expect(worker.claims.transitions[0]).toMatchObject({
+      receivedAt: fence.receivedAt,
+      after: 1,
+      get: 'r2',
+      subscriptionId: 9,
+    })
+    expect(worker.claims.transitions[0].releasedAt).toBeGreaterThan(records[1].writeAt)
+  })
+
+  test('rejects stale Gets on either side of the confirmation cursor and timestamp fence', async () => {
+    for (const stale of ['cursor', 'timestamp']) {
+      const response = { ...getRecord(1, 3).response, requestedMetrics: [] }
+      const records = [getRecord(1, 3, { writeAt: 1e9, response })]
+      const current = { id: 'producer-lc-2', observer: observerOf(records) }
+      const { worker } = make({ current })
+      const command = { tick: 1, index: 2, stage: 'confirm', selection: '' }
+      await worker.handle({ ...command, type: 'confirm-fence' })
+      if (stale === 'timestamp') records.push(getRecord(2, 3, { writeAt: 0, response }))
+      await expect(worker.confirm(command)).rejects.toThrow('no selection Get within 8000 ms')
+      expect(worker.claims.transitions).toEqual([])
+    }
+  })
+
   test('proves an empty selection by its Get alone and never owes a Push under it', async () => {
     const records = [getRecord(1, 3)]
     const current = { id: 'producer-lc-2', observer: observerOf(records) }
@@ -2325,6 +2363,18 @@ describe('telemetry profile parent', () => {
     expect(processes.sent.filter((m) => m.type === 'corpus')).toHaveLength(KINDS.length)
     expect(processes.sent.filter((m) => m.type === 'finish')).toHaveLength(KINDS.length)
     expect(timeline.boundaryAt - timeline.epochAt).toBeGreaterThanOrEqual(360000)
+  })
+
+  test('joins all confirmation fences before rotating the subscription', async () => {
+    const { churn, fixture, processes, clock } = make()
+    fixture.rotate.mockImplementation(async (index, selection) => {
+      const fences = processes.sent.filter((m) => m.type === 'confirm-fence')
+      expect(fences.slice(-KINDS.length).map((m) => m.kind)).toEqual([...KINDS])
+      expect(processes.until.mock.calls.slice(-KINDS.length).map(([kind]) => kind)).toEqual([...KINDS])
+      return { index, selection, setAt: clock.now(), readbackAt: clock.now(), readback: selection }
+    })
+    await churn.ticks(clock.now(), new TelemetrySchedule({ warmupMs: 60000, measureMs: 300000 }))
+    expect(processes.sent.filter((m) => m.type === 'confirm-fence')).toHaveLength(35 * KINDS.length)
   })
 
   test('fails a measured tick that is more than its late bound behind and never catches it up', async () => {
@@ -3282,6 +3332,18 @@ describe('telemetry churn coordinated stage replay', () => {
     return () => verifyChurnStages({ archive: input.archive, timeline: input.timeline })
   }
   const tickWith = (table, action) => table.ticks.find((t) => t.actions.includes(action)).number
+
+  test('rejects a rotation before every worker fence acknowledgement', () => {
+    expect(
+      replay((a) => {
+        const rotation = a.rotations[0]
+        const rows = a.stages.filter((r) => r.tick === rotation.tick && r.stage === 'confirm')
+        for (const row of rows) {
+          row.fence = { parentAt: rotation.requestedAt + 1 }
+        }
+      })
+    ).toThrow('The rotation preceded a worker confirmation fence')
+  })
 
   test('derives the measured counts per kind from the joined receipts', () => {
     const input = archive()

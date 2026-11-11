@@ -17990,6 +17990,8 @@
         "testHelpers/__tests__/rawLog.spec.js \u203a rawLog reads two partitions of one leader over one connection, and takes no aborted list as none",
         "testHelpers/__tests__/rawLog.spec.js \u203a rawLog still disconnects the brokers it opened when opening another fails",
         "testHelpers/__tests__/resourceProbe.spec.js \u203a createResourceProbe active resources counts a real timer again once legacy fake timers are removed",
+        "testHelpers/__tests__/resourceProbe.spec.js \u203a telemetry timeout owner diagnostics reports a leaked timer creation stack and releases every diagnostic resource",
+        "testHelpers/__tests__/resourceProbe.spec.js \u203a telemetry timeout owner diagnostics bounds live timer facts and reports dropped diagnostics",
         "testHelpers/__tests__/resourceProbe.spec.js \u203a createResourceProbe active resources counts a real timer by its type, and not once it is cleared",
         "testHelpers/__tests__/resourceProbe.spec.js \u203a createResourceProbe active resources refuses to count under legacy fake timers, which it cannot see",
         "testHelpers/__tests__/resourceProbe.spec.js \u203a createResourceProbe active resources refuses to count under modern fake timers, which it cannot see",
