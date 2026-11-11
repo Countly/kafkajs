@@ -445,7 +445,9 @@ describe('telemetry resource documentation', () => {
     expect(telemetry).toContain('refused before either selection array is built')
     expect(telemetry).toContain('64 MiB above')
     for (const document of [testing, telemetry]) {
-      expect(document).toContain('Δdata = Δ(heapUsed + external) − Δ(V8 code_and_metadata_size + bytecode_and_metadata_size)')
+      expect(document).toContain(
+        'Δdata = Δ(heapUsed + external) − Δ(V8 code_and_metadata_size + bytecode_and_metadata_size)'
+      )
       expect(document).toContain('first use M − M0 ≤ 1 MiB')
       expect(document).toContain('unseeded data below −256 KiB is inconclusive')
       expect(document).toContain('measured warm-up lifecycle')

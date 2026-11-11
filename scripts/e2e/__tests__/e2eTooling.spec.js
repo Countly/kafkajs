@@ -1284,7 +1284,7 @@ describe('broker telemetry fixture', () => {
     expect(new Set(catalogue(true).map(JSON.stringify)).size).toBe(69)
     expect(new Set(catalogue(true).map((r) => `${r.group}-${r.kafka}-${r.node}`)).size).toBe(69)
     const resources = workflow.jobs.resources
-    expect(resources['timeout-minutes']).toBe(105)
+    expect(resources['timeout-minutes']).toBe(45)
     expect(resources.needs).toBeUndefined()
     const alone = resources.steps.find((step) => step.run?.includes('resources\\.spec'))
     expect(alone.run).toContain('--runInBand')
@@ -1348,6 +1348,11 @@ describe('broker telemetry fixture', () => {
     // eslint-disable-next-line n/no-extraneous-require -- YAML parser is pinned by the ESLint/Jest toolchain
     const yaml = require('js-yaml')
     const workflow = yaml.load(read('.github/workflows/memory-gates.yml').toString())
+    for (const file of fs.readdirSync('.github/workflows').filter((file) => /\.ya?ml$/.test(file))) {
+      const document = yaml.load(read('.github/workflows/' + file).toString())
+      for (const job of Object.values(document.jobs))
+        if (job['runs-on']) expect(job['timeout-minutes']).toBeDefined()
+    }
     for (const job of Object.values(workflow.jobs)) {
       if (!job.uses) expect(job['timeout-minutes']).toBeDefined()
       for (const step of job.steps ?? []) expect(step.run ?? '').not.toContain('$' + '{{')
@@ -1470,6 +1475,7 @@ describe('broker telemetry fixture', () => {
     expect(controlsRun.run).toContain('testHelpers/__tests__/telemetryFixtures.spec.js')
     expect(controlsRun['continue-on-error']).toBeUndefined()
     const resources = workflow.jobs.resources
+    expect(resources['timeout-minutes']).toBe(105)
     expect(resources.strategy).toEqual({ 'fail-fast': false, matrix: { node: [22, 24, 26] } })
     expect(resources.env.TELEMETRY_RESOURCES_ARTIFACT_DIR).toContain('telemetry-resources')
     expect(resources.steps.map((step) => step.name ?? step.uses)).toEqual([
