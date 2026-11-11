@@ -32,6 +32,75 @@ const retainedRoots = async (roots) => {
 describe('two-scope original share driver', () => {
   afterEach(() => liveRun.reset())
 
+  test('selects API 60 through the real public admin during share setup', async () => {
+    const createAdmin = require('../../../src/admin')
+    const { createLogger, LEVELS } = require('../../../src/loggers')
+    const { ShareSoakDriver } = require('../soak')
+    const brokers = [{ nodeId: 0, host: 'node0', port: 9092 }]
+    const broker = {
+      negotiatedVersion: () => 2,
+      describeCluster: jest.fn(async () => ({
+        brokers: [{ brokerId: 0, host: 'node0', port: 9092 }],
+        controllerId: 0,
+      })),
+    }
+    const cluster = {
+      metadata: jest.fn(async () => ({ brokers, controllerId: 0 })),
+      findConnectedBroker: async () => broker,
+    }
+    const publicAdmin = createAdmin({
+      cluster,
+      logger: createLogger({ level: LEVELS.NOTHING, logCreator: () => () => {} }),
+      retry: { retries: 0 },
+    })
+    const admin = {
+      connect: async () => {},
+      disconnect: async () => {},
+      createTopics: async () => {},
+      fetchTopicMetadata: async ({ topics: [name] }) => ({
+        topics: [{ name, topicId: 'topic-id', partitions: [{ partitionId: 0, leader: 0 }] }],
+      }),
+      describeCluster: publicAdmin.describeCluster,
+      listGroups: async () => ({ groups: [] }),
+    }
+    const driver = new ShareSoakDriver({
+      kafka: { admin: () => admin },
+      shares: {},
+      ports: {
+        bounded: { bounded: async (scope, ms, work) => work() },
+        fixtures: {
+          setShareGroupConfigs: async () => {},
+          captureShareCleanupBaseline: async () => ({}),
+        },
+      },
+    })
+    const configuration = jest.spyOn(driver, 'readConfiguration').mockResolvedValue({})
+    try {
+      await driver.prepare({ add: () => {} }, new AbortController().signal)
+      expect(broker.describeCluster).toHaveBeenCalledTimes(1)
+      expect(broker.describeCluster).toHaveBeenCalledWith({
+        includeClusterAuthorizedOperations: true,
+        includeFencedBrokers: false,
+      })
+      expect(cluster.metadata).not.toHaveBeenCalled()
+      expect(driver.nodes).toEqual(new Map([['node0:9092', 0]]))
+    } finally {
+      configuration.mockRestore()
+    }
+  })
+
+  test('matches scripted cluster discovery to the public admin option semantics', async () => {
+    const { SoakTransport } = require('./fixtures/soakTransport')
+    const transport = new SoakTransport()
+    const legacy = transport.adminRequest('describeCluster', [])
+    expect(legacy.apiKey).toBe(3)
+    const explicit = transport.adminRequest('describeCluster', [
+      { includeAuthorizedOperations: true },
+    ])
+    expect(explicit.apiKey).toBe(60)
+    expect((await explicit.encode()).buffer[0]).toBe(1)
+  })
+
   test('archives decodable negotiation replies from the scripted public boundary', async () => {
     const { SoakTransport } = require('./fixtures/soakTransport')
     const { ShareFetchTap } = require('../soak')

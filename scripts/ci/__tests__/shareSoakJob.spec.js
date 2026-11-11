@@ -176,6 +176,100 @@ describe('share soak CI lifecycle controls', () => {
     expect(run).toHaveBeenCalledTimes(1)
   })
 
+  test.each([
+    [
+      'lifecycle',
+      'scripts/ci/shareSoakJob.js',
+      '../evidence/shareSoakAcceptance',
+      ['verify'],
+      ['sourceIdentity', 'admit', 'inventory'],
+    ],
+    [
+      'soak',
+      'scripts/soak/soak.js',
+      './telemetryChurn',
+      ['--profile', 'telemetry'],
+      ['main', 'buildTelemetryChurn', 'TelemetryResourceVerdict'],
+    ],
+  ])(
+    'publishes %s exports before main enters a circular dependency',
+    (label, file, dependency, args, names) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'share-main-'))
+      const script = path.resolve(file)
+      try {
+        fs.mkdirSync(path.join(root, '.tmp/e2e'), { recursive: true })
+        fs.writeFileSync(
+          path.join(root, '.tmp/e2e/lifecycle.json'),
+          JSON.stringify(lifecycle('short'))
+        )
+        const child = spawnSync(
+          process.execPath,
+          [
+            '--expose-gc',
+            '-e',
+            `
+        const Module = require('node:module')
+        const load = Module._load
+        Module._load = function(request, parent, isMain) {
+          const loaded = load.call(this, request, parent, isMain)
+          if (parent?.filename === ${JSON.stringify(script)} && request === ${JSON.stringify(dependency)}) {
+            const exports = require.cache[parent.filename].exports
+            console.log(JSON.stringify(${JSON.stringify(names)}.map((name) => typeof exports[name])))
+            throw new Error('Broker-free main boundary reached')
+          }
+          return loaded
+        }
+        process.argv = [process.execPath, ${JSON.stringify(script)}, ...${JSON.stringify(args)}]
+        Module.runMain()
+      `,
+          ],
+          { cwd: root, encoding: 'utf8', timeout: 10000 }
+        )
+        expect(child.error).toBeUndefined()
+        expect(child.signal).toBeNull()
+        expect(child.status).toBe(1)
+        expect(child.stderr).toContain('Broker-free main boundary reached')
+        expect(child.stderr).not.toContain('circular dependency')
+        expect(JSON.parse(child.stdout)).toEqual(names.map(() => 'function'))
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true })
+      }
+    }
+  )
+
+  test('captures Compose logs above the default buffer without changing their content', () => {
+    const logs = 'original broker log\n'.repeat(120000).trim()
+    const run = jest.fn((command, args, options) => {
+      expect(command).toBe('docker')
+      expect(args).toEqual([
+        'compose',
+        '-f',
+        'docker-compose.yml',
+        '-p',
+        'owned',
+        'logs',
+        '--no-color',
+      ])
+      expect(options.maxBuffer).toBeGreaterThanOrEqual(Buffer.byteLength(logs))
+      expect(options.maxBuffer).toBeLessThanOrEqual(64 * 1024 * 1024)
+      return execFileSync(
+        process.execPath,
+        ['-e', "process.stdout.write('original broker log\\n'.repeat(120000))"],
+        options
+      )
+    })
+    const write = jest.spyOn(fs, 'writeFileSync').mockImplementation(() => {})
+    try {
+      const job = new ShareSoakJob({ run })
+      job.state = lifecycle('short')
+      job.logs()
+      expect(run).toHaveBeenCalledTimes(1)
+      expect(write).toHaveBeenCalledWith('.tmp/e2e/compose.log', logs)
+    } finally {
+      write.mockRestore()
+    }
+  })
+
   test('observes real clean subprocess exit and kills a bounded event-loop holder', () => {
     const clean = spawnSync(process.execPath, ['-e', 'setImmediate(() => {})'], { timeout: 3000 })
     expect(clean.status).toBe(0)
