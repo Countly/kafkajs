@@ -151,6 +151,69 @@ describe('telemetry lane configuration', () => {
     )
   })
 
+  test.each([
+    ['4.4.0', '8ae1b15a3f459992abc6f07e3f1ae4ed05b6c2371f4cb9fcaa451cac550959b8'],
+    ['4.3.1', 'f624d0d3b774048ce50c21d418fe61429384a37e35fbc11d61170e2ea8e6cb9c'],
+    ['4.2.2', 'f624d0d3b774048ce50c21d418fe61429384a37e35fbc11d61170e2ea8e6cb9c'],
+  ])(
+    'prepares the compatible reporter source for Kafka %s without changing retained bytes',
+    (line, expected) => {
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'telemetry-reporter-source-'))
+      const source = 'scripts/e2e/telemetry/CountingTelemetryReporter.java'
+      const client = 'scripts/e2e/telemetry/JavaTelemetryClient.java'
+      const prepare = 'scripts/e2e/telemetry/prepare-reporter-source.sh'
+      try {
+        const output = path.join(directory, 'source with spaces')
+        const result = spawnSync('bash', [path.join(ROOT, prepare), line, output], {
+          encoding: 'utf8',
+        })
+
+        expect(result.status).toBe(0)
+        expect(result.stderr).toBe('')
+        const file = path.join(output, 'CountingTelemetryReporter.java')
+        expect(result.stdout).toBe(file + '\n')
+        const prepared = fs.readFileSync(file)
+        expect(crypto.createHash('sha256').update(prepared).digest('hex')).toBe(expected)
+        expect(sha256(source)).toBe(
+          'f624d0d3b774048ce50c21d418fe61429384a37e35fbc11d61170e2ea8e6cb9c'
+        )
+        expect(sha256(client)).toBe(
+          '1145746dfeadc7d315e42b1c9d3b3468d819929324cc7701cbddbb423f66b580'
+        )
+        for (const script of ['build.sh', 'test-reporter-order.sh']) {
+          const text = read('scripts/e2e/telemetry/' + script)
+          expect(text).toContain(
+            'REPORTER_SOURCE=$(bash "$HERE/prepare-reporter-source.sh" "$V" "$WORK/source")'
+          )
+          expect(text).toMatch(/javac [^\n]+ "\$REPORTER_SOURCE"/)
+          expect(text).not.toMatch(/javac [^\n]+ "\$HERE\/CountingTelemetryReporter\.java"/)
+        }
+      } finally {
+        fs.rmSync(directory, { recursive: true, force: true })
+      }
+    }
+  )
+
+  test('rejects unsupported reporter source versions before writing output', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'telemetry-reporter-version-'))
+    try {
+      const output = path.join(directory, 'source')
+      const result = spawnSync(
+        'bash',
+        [path.join(ROOT, 'scripts/e2e/telemetry/prepare-reporter-source.sh'), '4.1.2', output],
+        {
+          encoding: 'utf8',
+        }
+      )
+
+      expect(result.status).toBe(2)
+      expect(result.stdout).toBe('')
+      expect(fs.existsSync(output)).toBe(false)
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
   test('the temporary telemetry fixtures build workflow sets its cache on the runner and supports manual dispatch', () => {
     const workflow = yaml.load(read('.github/workflows/telemetry-fixtures-build.yml'))
     const job = workflow.jobs.build
