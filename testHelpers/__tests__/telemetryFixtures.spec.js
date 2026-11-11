@@ -2300,10 +2300,10 @@ describe('required live archive dimensions and semantics', () => {
           put(`${owner}/decoder-${index}.json`, {
             code: 0,
             signal: null,
-            line: '4.3.1',
+            line: this.record.run.line,
             rawSha256: digest,
             stdout:
-              JSON.stringify({ verified: true, line: '4.3.1' }) +
+              JSON.stringify({ verified: true, line: this.record.run.line }) +
               '\n' +
               JSON.stringify(body) +
               '\n',

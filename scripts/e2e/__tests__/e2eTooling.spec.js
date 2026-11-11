@@ -1288,7 +1288,9 @@ describe('broker telemetry fixture', () => {
     const required = [22, 24, 26].flatMap((node) => rowsOf(node, true))
     expect(catalogue(true)).toEqual(required)
     expect(new Set(catalogue(true).map(JSON.stringify)).size).toBe(72)
-    expect(new Set(catalogue(true).map((r) => `${r.group}-${r.kafka}-${r.node}`)).size).toBe(72)
+    expect(
+      new Set(catalogue(true).map((r) => `${r.group}-${r.kafka}-${r.node}-${r.compose}`)).size
+    ).toBe(72)
     const resources = workflow.jobs.resources
     expect(resources.needs).toBeUndefined()
     const alone = resources.steps.find((step) => step.run?.includes('resources\\.spec'))
