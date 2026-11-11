@@ -47,8 +47,8 @@ function creationStack() {
  * Bounded, case-local Timeout ownership diagnostics for telemetry evidence. Holds scalar facts
  * only: neither Timeout objects, callbacks nor Error objects escape an init hook. Destroyed timer entries
  * are removed immediately; only live entries can appear in the final quiet-check archive.
- * Resource creation facts must be captured before a resource becomes a timer trigger. Both that
- * bounded history and the facts pinned by live timers contain only scalar fields.
+ * Only Timeouts capture creation stacks. Other resources retain their type in a bounded history
+ * until destruction; live timers pin trigger types so they survive trigger destruction.
  */
 class TimeoutDiagnostics {
   /**
@@ -72,10 +72,8 @@ class TimeoutDiagnostics {
     this.hook = createHook({
       init: (id, type, triggerAsyncId) => {
         const createdAt = type === 'Timeout' ? performance.now() : null
-        let creation
         if (this.resources.size < this.capacity) {
-          creation = creationStack()
-          this.resources.set(id, { type, ...creation })
+          this.resources.set(id, { type })
         } else {
           this.resourceDropped++
         }
@@ -92,8 +90,8 @@ class TimeoutDiagnostics {
           const parent = this.resources.get(triggerAsyncId)
           this.triggers.set(triggerAsyncId, {
             type: parent?.type ?? null,
-            stack: parent?.stack ?? '',
-            source: parent?.source ?? null,
+            stack: '',
+            source: null,
             timers: 1,
           })
         }
@@ -102,7 +100,7 @@ class TimeoutDiagnostics {
           triggerAsyncId,
           createdAt,
           destroyedAt: null,
-          ...(creation ?? creationStack()),
+          ...creationStack(),
         })
       },
       destroy: (id) => {
@@ -134,10 +132,10 @@ class TimeoutDiagnostics {
 
   /**
    * @returns {{created:number, destroyed:number, lastDestroyedAt:number|null, dropped:number, resourceDropped:number, live:object[]}}
-   *   copied scalar facts for live timers: stack/source describe timer creation; triggerType,
-   *   triggerStack and triggerSource describe the trigger's creation, even after its destruction.
-   *   Null trigger type/source means its creation was outside the bounded observation history.
-   *   Timer and resource-history drops are counted separately and never alter the resource verdict.
+   *   copied scalar facts for live timers: stack/source describe timer creation; triggerType
+   *   remains available after trigger destruction, or null if outside the bounded type history.
+   *   Trigger stacks are not captured: triggerStack is empty and triggerSource is null.
+   *   Timer and resource-type history drops are counted separately and never alter the resource verdict.
    */
   read() {
     return {
