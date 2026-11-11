@@ -13,6 +13,7 @@ const collect = require('node:vm').runInNewContext('gc')
 const { liveRun } = require('../../../src/producer/__tests__/fixtures/bounded')
 const { verifySharePriming } = require('../../evidence/sharePriming')
 const { originalShareSchedule } = require('./fixtures/originalShareSchedule')
+const { diagnosePrimeRoots } = require('./fixtures/primeRetainers')
 
 /**
  * Checks weak original roots after a new job and an asynchronous major collection.
@@ -98,6 +99,7 @@ describe('two-scope original share driver', () => {
         twoScopes: true,
         checkBoundaryRoots: async (roots) => {
           boundaryRoots = await retainedRoots(roots)
+          if (boundaryRoots.length) await diagnosePrimeRoots(`boundary, short=${short}`)
         },
       })
       expect(error).toBeUndefined()
@@ -431,6 +433,7 @@ describe('two-scope original share driver', () => {
     owner.retainedPrime = owner.retainedPrime.acknowledged
     const corpusOnly = await retainedRoots(primeRoots)
     expect(corpusOnly).toContain('corpus')
+    if (corpusOnly.includes('driver')) await diagnosePrimeRoots('corpus-only')
     expect(corpusOnly).not.toContain('driver')
     delete owner.retainedPrime
     expect(await retainedRoots(primeRoots)).toEqual([])
