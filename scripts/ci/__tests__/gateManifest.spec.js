@@ -37,6 +37,44 @@ const patternsOf = (check) => {
 }
 
 describe('exit gate manifest', () => {
+  test('decoder performance uses three parallel capped partitions and a combined check with the original id', () => {
+    // eslint-disable-next-line n/no-extraneous-require -- provided by the toolchain
+    const yaml = require('js-yaml')
+    const jobs = yaml.load(workflow).jobs
+    const check = gate.checks.find(({ id }) => id === 'decoder-count-performance')
+    expect(check.partitions).toEqual(['frame-1m', 'frame-other', 'batch-array'])
+    expect(check.capMinutes).toBe(30)
+    expect(check.command).toContain('--partition "$PARTITION"')
+    expect(check.command).toMatch(/\|\| exit 1$/)
+    const plan = jobs.plan.steps.find(({ id }) => id === 'plan').run
+    const vm = require('vm')
+    let output = ''
+    vm.runInNewContext(plan.match(/node <<'NODE'\n([\s\S]*?)\nNODE/)[1], {
+      process: { env: { ONLY: check.id, GITHUB_OUTPUT: 'output' } },
+      require: () => ({
+        readFileSync: () => JSON.stringify(gate),
+        appendFileSync: (_file, text) => {
+          output += text
+        },
+      }),
+    })
+    const matrix = JSON.parse(output.trim().slice('matrix='.length)).include
+    expect(matrix.map(({ partition }) => partition)).toEqual(check.partitions)
+    expect(new Set(matrix.map(({ id }) => id)).size).toBe(3)
+    expect(matrix.every(({ capMinutes }) => capMinutes === 30)).toBe(true)
+    expect(jobs.check.strategy['fail-fast']).toBe(false)
+    expect(jobs['decoder-combine'].needs).toContain('check')
+    expect(jobs['decoder-combine']['timeout-minutes']).toBeGreaterThan(0)
+    expect(jobs.verdict.needs).toContain('decoder-combine')
+    expect(JSON.stringify(jobs['decoder-combine'])).toContain(
+      'gate-result-decoder-count-performance'
+    )
+    for (const job of Object.values(jobs)) {
+      if (!job.uses) expect(job['timeout-minutes']).toBeDefined()
+      for (const step of job.steps || []) if (step.run) expect(step.run).not.toContain('$' + '{{')
+    }
+  })
+
   test('every check has a unique kebab-case id and a whole number of minutes', () => {
     const ids = gate.checks.map(({ id }) => id)
     expect(new Set(ids).size).toBe(ids.length)

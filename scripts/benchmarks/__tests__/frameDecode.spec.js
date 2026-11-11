@@ -122,6 +122,18 @@ describe('Benchmarks > frameDecode', () => {
       60000
     )
 
+    test('repeats unchanged fixtures in every warmup and measured round and keeps nanoseconds per frame', async () => {
+      const fulfill = jest.spyOn(RequestQueue.prototype, 'fulfillRequest')
+      const result = await timed('64b', 2, 3)
+      expect(fulfill).toHaveBeenCalledTimes(2 * 3 * 10)
+      expect(result.workMultiplier).toBe(3)
+      expect(result.frames).toBe(2)
+      expect(result.warmupRoundNsPerOp).toHaveLength(3)
+      expect(result.roundNsPerOp).toHaveLength(7)
+      expect(globalThis.gc).toHaveBeenCalledTimes(12)
+      expect(result.nsPerFrame).toBe([...result.roundNsPerOp].sort((a, b) => a - b)[3])
+    })
+
     test('the control leaves the request queue as it found it', async () => {
       const original = RequestQueue.prototype.fulfillRequest
 
