@@ -1,7 +1,7 @@
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const v8 = require('node:v8')
+const { spawnSync } = require('node:child_process')
 const { analyseSnapshot, auditReferences, readSnapshot } = require('../retained/heapDiff')
 const { ephemeronLiveness, refineOwnership, selfLedger } = require('../retained/ownership')
 
@@ -348,9 +348,19 @@ describe('readSnapshot', () => {
   })
 
   test('matches JSON parsing when analysing a real V8 heap snapshot', () => {
-    class SnapshotReaderSentinel {}
-    const sentinel = new SnapshotReaderSentinel()
-    v8.writeHeapSnapshot(filename)
+    const child = spawnSync(
+      process.execPath,
+      [
+        '-e',
+        `class SnapshotReaderSentinel {}
+         globalThis.sentinel = new SnapshotReaderSentinel()
+         require('node:v8').writeHeapSnapshot(process.argv[1])`,
+        filename,
+      ],
+      { encoding: 'utf8', timeout: 30000 }
+    )
+    expect(child.error).toBeUndefined()
+    expect(child.status).toBe(0)
     const raw = JSON.parse(fs.readFileSync(filename, 'utf8'))
     const parsed = readSnapshot(filename)
     expect(parsed.snapshot).toEqual(raw.snapshot)
@@ -367,11 +377,11 @@ describe('readSnapshot', () => {
       graph.groups.find(({ type, name }) => type === 'object' && name === 'SnapshotReaderSentinel')
     expect(known(expected)).toMatchObject({ count: 1 })
     expect(known(actual)).toEqual(known(expected))
-    expect(sentinel).toBeInstanceOf(SnapshotReaderSentinel)
   })
 
   test('preserves escaped and non-ASCII strings while skipping other sections', () => {
     const raw = smallSnapshot()
+    raw.nodes[2] = Number.MAX_SAFE_INTEGER
     raw.strings.push(
       'quote " comma , braces } ]',
       'backslash \\',
@@ -392,7 +402,7 @@ describe('readSnapshot', () => {
     expect(parsed.strings).toEqual(raw.strings)
     expect(Array.from(parsed.nodes)).toEqual(raw.nodes)
     expect(Object.keys(parsed).sort()).toEqual(['edges', 'nodes', 'snapshot', 'strings'])
-    expect(analyseSnapshot(parsed).describe(0).id).toBe(4294967297)
+    expect(analyseSnapshot(parsed).describe(0).id).toBe(Number.MAX_SAFE_INTEGER)
   })
 
   test('rejects truncated or malformed snapshots with a clear error', () => {

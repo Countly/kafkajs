@@ -1,6 +1,210 @@
 #!/usr/bin/env node
 'use strict'
 
+const fs = require('node:fs')
+
+/**
+ * Reads V8 graph sections from bytes without creating a string for the complete snapshot.
+ * Numeric fields retain safe-integer precision; unrelated sections are skipped.
+ * @param {string} filename V8 .heapsnapshot path.
+ * @returns {object} Snapshot metadata, typed node/edge arrays and decoded strings.
+ * @throws {Error} On unreadable files, malformed JSON or inconsistent graph dimensions.
+ */
+const readSnapshot = (filename) => {
+  const bytes = fs.readFileSync(filename)
+  let offset = 0
+  const fail = (detail) => {
+    throw new Error(`Malformed heap snapshot: ${detail} at byte ${offset}`)
+  }
+  const whitespace = () => {
+    while (
+      bytes[offset] === 32 ||
+      bytes[offset] === 9 ||
+      bytes[offset] === 10 ||
+      bytes[offset] === 13
+    )
+      offset++
+  }
+  const take = (byte) => {
+    whitespace()
+    if (bytes[offset++] !== byte) fail(`expected '${String.fromCharCode(byte)}'`)
+  }
+  const stringEnd = () => {
+    take(34)
+    while (offset < bytes.length) {
+      const byte = bytes[offset++]
+      if (byte === 34) return
+      if (byte < 32) fail('unescaped control character')
+      if (byte === 92) {
+        const escape = bytes[offset++]
+        if (escape === 117)
+          for (let i = 0; i < 4; i++) {
+            const hex = bytes[offset++]
+            if (!(
+              (hex >= 48 && hex <= 57) ||
+              (hex >= 65 && hex <= 70) ||
+              (hex >= 97 && hex <= 102)
+            ))
+              fail('invalid Unicode escape')
+          }
+        else if (![34, 92, 47, 98, 102, 110, 114, 116].includes(escape))
+          fail('invalid string escape')
+      }
+    }
+    fail('unterminated string')
+  }
+  const decode = (start, end) => {
+    try {
+      return JSON.parse(bytes.toString('utf8', start, end))
+    } catch (error) {
+      fail(`invalid JSON: ${error.message}`)
+    }
+  }
+  const delimiter = (byte) => byte === undefined || [32, 9, 10, 13, 44, 93, 125].includes(byte)
+  const valueEnd = () => {
+    const stack = []
+    while (true) {
+      whitespace()
+      const byte = bytes[offset]
+      if (byte === undefined) fail('truncated value')
+      if (byte === 91 || byte === 123) {
+        const close = byte === 91 ? 93 : 125
+        stack.push(close)
+        offset++
+        whitespace()
+        if (bytes[offset] === close) {
+          offset++
+          stack.pop()
+        } else {
+          if (close === 125) {
+            stringEnd()
+            take(58)
+          }
+          continue
+        }
+      } else if (byte === 34) stringEnd()
+      else {
+        const start = offset
+        while (bytes[offset] >= 48 && bytes[offset] <= 57) offset++
+        if (offset === start || !delimiter(bytes[offset])) {
+          while (!delimiter(bytes[offset])) offset++
+          if (offset === start) fail('missing value')
+          decode(start, offset)
+        } else if (byte === 48 && offset - start > 1) fail('invalid number')
+      }
+      while (stack.length) {
+        whitespace()
+        const close = stack[stack.length - 1]
+        if (bytes[offset] === close) {
+          offset++
+          stack.pop()
+          continue
+        }
+        take(44)
+        if (close === 125) {
+          stringEnd()
+          take(58)
+        }
+        break
+      }
+      if (!stack.length) return
+    }
+  }
+  const sections = new Map()
+  take(123)
+  whitespace()
+  if (bytes[offset] !== 125)
+    while (true) {
+      const start = offset
+      stringEnd()
+      const key = decode(start, offset)
+      take(58)
+      whitespace()
+      const valueStart = offset
+      valueEnd()
+      if (['snapshot', 'nodes', 'edges', 'strings'].includes(key)) {
+        if (sections.has(key)) fail(`duplicate ${key} section`)
+        sections.set(key, [valueStart, offset])
+      }
+      whitespace()
+      if (bytes[offset] !== 44) break
+      offset++
+      whitespace()
+    }
+  take(125)
+  whitespace()
+  if (offset !== bytes.length) fail('trailing data')
+  for (const key of ['snapshot', 'nodes', 'edges', 'strings'])
+    if (!sections.has(key)) fail(`missing ${key} section`)
+  const snapshot = decode(...sections.get('snapshot'))
+  if (
+    !snapshot ||
+    !Array.isArray(snapshot.meta?.node_fields) ||
+    !snapshot.meta.node_fields.length ||
+    !Array.isArray(snapshot.meta.edge_fields) ||
+    !snapshot.meta.edge_fields.length
+  )
+    fail('missing snapshot field metadata')
+  const numbers = (key, count, fields) => {
+    const length = count * fields
+    if (
+      !Number.isSafeInteger(count) ||
+      count < 0 ||
+      !Number.isSafeInteger(length) ||
+      length > bytes.length
+    )
+      fail(`invalid ${key} dimensions`)
+    const [start, end] = sections.get(key)
+    offset = start
+    take(91)
+    const values = new Float64Array(length)
+    let size = 0
+    whitespace()
+    if (bytes[offset] !== 93)
+      while (true) {
+        whitespace()
+        const first = offset
+        let value = 0
+        while (bytes[offset] >= 48 && bytes[offset] <= 57)
+          value = value * 10 + (bytes[offset++] - 48)
+        if (
+          offset === first ||
+          (bytes[first] === 48 && offset - first > 1) ||
+          !Number.isSafeInteger(value)
+        )
+          fail(`invalid ${key} integer`)
+        if (size >= length) fail(`wrong ${key} length`)
+        values[size++] = value
+        whitespace()
+        if (bytes[offset] !== 44) break
+        offset++
+      }
+    take(93)
+    if (size !== length || offset !== end) fail(`wrong ${key} length`)
+    return values
+  }
+  const nodes = numbers('nodes', snapshot.node_count, snapshot.meta.node_fields.length)
+  const edges = numbers('edges', snapshot.edge_count, snapshot.meta.edge_fields.length)
+  const [start, end] = sections.get('strings')
+  offset = start
+  take(91)
+  const strings = []
+  whitespace()
+  if (bytes[offset] !== 93)
+    while (true) {
+      whitespace()
+      const first = offset
+      stringEnd()
+      strings.push(decode(first, offset))
+      whitespace()
+      if (bytes[offset] !== 44) break
+      offset++
+    }
+  take(93)
+  if (offset !== end) fail('invalid strings section')
+  return { snapshot, nodes, edges, strings }
+}
+
 /**
  * Parses V8's flat graph, computes strong reachability and immediate dominators using
  * Lengauer-Tarjan, and totals each constructor's union of dominated subtrees.
@@ -600,4 +804,10 @@ const prepareReferenceAudits = (graph) => {
   }
 }
 
-module.exports = { analyseSnapshot, ownershipIndex, auditReferences, prepareReferenceAudits }
+module.exports = {
+  readSnapshot,
+  analyseSnapshot,
+  ownershipIndex,
+  auditReferences,
+  prepareReferenceAudits,
+}

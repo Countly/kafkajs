@@ -28,8 +28,8 @@ const labels = (value) => ({
  * @throws {Error} Snapshot parsing or graph analysis failure.
  */
 const summarize = (filename) => {
-  const { analyseSnapshot } = require('../../../e2e/telemetry/retained/heapDiff')
-  const graph = analyseSnapshot(JSON.parse(fs.readFileSync(filename, 'utf8')))
+  const { analyseSnapshot, readSnapshot } = require('../../../e2e/telemetry/retained/heapDiff')
+  const graph = analyseSnapshot(readSnapshot(filename))
   let matches = 0
   const drivers = []
   for (let v = 0; v < graph.n; v++) {
@@ -99,9 +99,9 @@ const diagnosePrimeRoots = async (stage) => {
     const filename = require('node:v8').writeHeapSnapshot(
       path.join(directory, 'prime.heapsnapshot')
     )
-    const child = spawnSync(process.execPath, [__filename, filename], {
+    const child = spawnSync(process.execPath, ['--max-old-space-size=6144', __filename, filename], {
       encoding: 'utf8',
-      timeout: 120000,
+      timeout: 300000,
       maxBuffer: 65536,
     })
     if (child.error || child.status !== 0)
