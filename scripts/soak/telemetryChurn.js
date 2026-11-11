@@ -41,6 +41,12 @@ const {
   ProcessMemory,
   readProcStatus,
 } = require('../../testHelpers/processMemory')
+const {
+  FixedJournal,
+  HandlerJournal,
+  JournalConstancy,
+  journalState,
+} = require('../../testHelpers/fixedJournal')
 const gzipCodec = require('../../src/protocol/message/compression/gzip')
 const zstdCodec = require('../../src/protocol/message/compression/zstd')
 const {
@@ -88,6 +94,31 @@ const MIB = 1048576
 const ROOT = path.resolve(__dirname, '../..')
 /** Native compression rows one worker journals: one per Push of a 360 s run at 1 s, with room. */
 const NATIVE_ROWS = 1024
+
+/**
+ * Sizes finite journals from the case envelope, workload cadence and lifecycle catalogue.
+ * Four times the paced exchange estimate also admits acknowledgements, renewals and reconnects.
+ * @param {object} [limits] the unchanged telemetry schedule constants @returns {object} capacities
+ */
+const journalLimits = (
+  limits = { caseMs: 540000, sampleAt: Array(11), warmupMs: 60000, measureMs: 300000 }
+) => {
+  const batches = Math.ceil(CORPUS.records / CORPUS.batch)
+  const exchanges = 4 * (Math.ceil(limits.caseMs / 500) + batches)
+  const receipts = 4 * (Math.ceil(limits.caseMs / STEPS.subscriptionMs) + 1)
+  return {
+    records: CORPUS.records * 2,
+    batches: batches * 2,
+    exchanges,
+    exchangeBytes: exchanges * 4096,
+    acknowledgements: CORPUS.records * 2,
+    acknowledgementBytes: CORPUS.records * 2 * 512,
+    receipts,
+    samples: limits.sampleAt.length + 4,
+    sampleBytes: (limits.sampleAt.length + 4) * 65536,
+  }
+}
+
 const CONTROL = Object.freeze({
   rssDriftBytes: 2 * MIB,
   retainedDriftBytes: 262144,
@@ -1289,14 +1320,23 @@ class TelemetryTap {
 class ShareLedger {
   /**
    * @param {object} options
+   * @param {object} [options.storage] schedule-derived journal capacities
    * @param {string} options.group the share group @param {{now:function():number}} options.clock
    */
-  constructor({ group, clock }) {
+  constructor({ group, clock, storage = journalLimits() }) {
     this.group = group
     this.clock = clock
     this.traces = []
-    this.exchanges = []
-    this.settled = []
+    this.exchanges = new FixedJournal({
+      name: 'share exchanges',
+      capacity: storage.exchanges,
+      bytes: storage.exchangeBytes,
+    })
+    this.settled = new FixedJournal({
+      name: 'share acknowledgements',
+      capacity: storage.acknowledgements,
+      bytes: storage.acknowledgementBytes,
+    })
   }
 
   /**
@@ -1389,14 +1429,20 @@ class ShareLedger {
     })
   }
 
+  /** @returns {object} fixed storage and append cursors; never materialises the facts */
+  journalState() {
+    return journalState([this.exchanges, this.settled])
+  }
+
   /** @returns {object} the archived facts, after a final drain, with the hash of the exchanges */
   facts() {
     this.drain()
+    const exchanges = this.exchanges.values()
     return {
       group: this.group,
-      exchanges: this.exchanges,
-      exchangesSha256: sha(JSON.stringify(this.exchanges)),
-      settled: this.settled,
+      exchanges,
+      exchangesSha256: sha(JSON.stringify(exchanges)),
+      settled: this.settled.values(),
     }
   }
 }
@@ -1418,8 +1464,20 @@ class OrdinaryWork {
    * @param {(ms:number)=>Promise<void>} [options.sleep] real delay
    * @param {ShareLedger} [options.ledger] the share ledger of a share consumer
    * @param {number[]} [options.slots] producer batch slots, in ms after the corpus start
+   * @param {object} [options.storage] schedule-derived journal capacities
    */
-  constructor({ kind, client, stem, topic, ctl, clock, sleep = wait, ledger = null, slots = [] }) {
+  constructor({
+    kind,
+    client,
+    stem,
+    topic,
+    ctl,
+    clock,
+    sleep = wait,
+    ledger = null,
+    slots = [],
+    storage = journalLimits(),
+  }) {
     Object.assign(this, { kind, client, stem, topic, ctl, clock, sleep, ledger, slots })
     this.running = false
     this.paused = false
@@ -1427,14 +1485,28 @@ class OrdinaryWork {
     this.inflight = null
     this.active = 0
     this.lastExit = -Infinity
-    this.offered = []
-    this.resolved = []
-    this.handled = []
+    const ids = (name) =>
+      new FixedJournal({ name, capacity: storage.records, bytes: storage.records * 16 })
+    this.offered = ids('offered')
+    this.resolved = ids('resolved')
+    this.handled = new HandlerJournal(CORPUS.records, storage.records)
     this.processed = new Map()
     this.committed = new Map()
-    this.commits = []
-    this.pauses = []
-    this.late = []
+    this.commits = new FixedJournal({
+      name: 'commits',
+      capacity: storage.receipts,
+      bytes: storage.receipts * 256,
+    })
+    this.pauses = new FixedJournal({
+      name: 'pauses',
+      capacity: storage.receipts,
+      bytes: storage.receipts * 256,
+    })
+    this.late = new FixedJournal({
+      name: 'producer slots',
+      capacity: storage.batches,
+      bytes: storage.batches * 16,
+    })
     this.failures = []
     this.listening = false
   }
@@ -1446,18 +1518,16 @@ class OrdinaryWork {
   async attach() {
     const handle = async ({ partition, message }) => {
       this.active += 1
-      const entry = [
+      const row = this.handled.enter(
         partition,
-        Number(message.offset),
+        message.offset,
         indexOf(String(message.key)),
-        this.clock.now(),
-        null,
-      ]
-      this.handled.push(entry)
+        this.clock.now()
+      )
       if (this.kind === 'consumer')
         this.processed.set(String(partition), String(BigInt(message.offset) + 1n))
-      entry[4] = this.clock.now()
-      this.lastExit = entry[4]
+      this.lastExit = this.clock.now()
+      this.handled.exit(row, this.lastExit)
       this.active -= 1
     }
     if (this.kind === 'shareConsumer') {
@@ -1632,15 +1702,24 @@ class OrdinaryWork {
     if (this.failures.length) throw this.failures[0]
     if (this.kind === 'consumer' || this.kind === 'shareConsumer') {
       const deadline = this.clock.now() + ms
-      while (
-        new Set(this.handled.map((e) => e[2])).size < CORPUS.records &&
-        this.clock.now() < deadline
-      )
+      while (this.handled.unique < CORPUS.records && this.clock.now() < deadline)
         await this.sleep(200)
-      if (new Set(this.handled.map((e) => e[2])).size < CORPUS.records)
+      if (this.handled.unique < CORPUS.records)
         throw new Error('The corpus was not fully handled before the close')
       if (this.kind === 'consumer') await this.commit()
     }
+  }
+
+  /** @returns {object} allocated bytes and cursors without rebuilding the oracle */
+  journalState() {
+    return journalState([
+      this.offered,
+      this.resolved,
+      this.handled,
+      this.commits,
+      this.pauses,
+      this.late,
+    ])
   }
 
   /**
@@ -1650,14 +1729,14 @@ class OrdinaryWork {
   ids() {
     return {
       kind: this.kind,
-      offered: this.offered,
-      resolved: this.resolved,
-      handled: this.handled,
+      offered: this.offered.values(),
+      resolved: this.resolved.values(),
+      handled: this.handled.values(),
       processed: Object.fromEntries(this.processed),
       committed: Object.fromEntries(this.committed),
-      commits: this.commits,
-      pauses: this.pauses,
-      late: this.late,
+      commits: this.commits.values(),
+      pauses: this.pauses.values(),
+      late: this.late.values(),
     }
   }
 }
@@ -3790,7 +3869,8 @@ class TelemetryChurn {
       }
       const exit = shutdown.exits[result.kind] ?? {}
       const input = { ...result.input, clientCount: 1 }
-      const evaluated = this.verdict(input)
+      const resourceVerdict = this.verdict(input)
+      const evaluated = JournalConstancy.apply(resourceVerdict, input)
       workers.push({
         kind: result.kind,
         input,
@@ -4090,6 +4170,13 @@ class TelemetryWorkerProcess {
       loaded,
       control,
       foreground,
+      journals: {
+        version: 1,
+        allocationBeforeControl: ['native', 'pending-windows', 'memory-samples'],
+        allocationAfterControlBeforeM: ['ordinary', 'share'],
+        rssEffect:
+          'The control includes preallocated native, pending-window and sample storage; ordinary and share storage are charged to the enabled RSS delta.',
+      },
       native: { journal: journal.summary(), sampler: sampler.summary() },
       final: readMemory('final', () => this.clock.now()),
       host: { ...host, after: hostContext(() => this.clock.now()) },
@@ -4130,7 +4217,14 @@ class TelemetryWorkerProcess {
     this.send({ type: 'hello', ...this.stamps() })
     const resources = new ProcessResources()
     const memory = new ProcessMemory({ now: () => this.clock.now() })
+    const storage = journalLimits(soak.TELEMETRY)
+    const sampleJournal = new FixedJournal({
+      name: 'memory samples',
+      capacity: storage.samples,
+      bytes: storage.sampleBytes,
+    })
     const sampler = new PendingSampler(memory, {
+      capacity: NATIVE_ROWS,
       set: (fn, ms) => resources.as('fixture:native-sampler', () => setInterval(fn, ms)),
     })
     let segments = null
@@ -4138,6 +4232,7 @@ class TelemetryWorkerProcess {
       memory,
       sampler,
       capacity: NATIVE_ROWS,
+      fixed: true,
       epoch: () => segments?.current().index ?? 0,
     })
     const target = (work) => resources.as('target', work)
@@ -4166,7 +4261,7 @@ class TelemetryWorkerProcess {
       journal.observe('zstd', zstdCodec)
       const ledger =
         kind === 'shareConsumer'
-          ? new ShareLedger({ group: config.group, clock: this.clock })
+          ? new ShareLedger({ group: config.group, clock: this.clock, storage })
           : null
       segments = TelemetrySegments.ordinary(SCENARIO, kind, {
         directory: config.directory,
@@ -4217,6 +4312,7 @@ class TelemetryWorkerProcess {
           sleep: this.sleep,
           ledger,
           slots: schedule.corpusSlots(),
+          storage,
         }),
       })
       const uuid = await worker.prepare()
@@ -4238,6 +4334,22 @@ class TelemetryWorkerProcess {
               gc: { admittedAt, completedAt: reading.at, observed: memory.collections - before },
             },
             registryDigest: worker.registry.digest(uuid),
+            journals: {
+              ...journalState([
+                worker.ordinary,
+                ...(ledger ? [ledger] : []),
+                journal,
+                sampler,
+                sampleJournal,
+              ]),
+              owners: {
+                ordinary: worker.ordinary.journalState(),
+                ...(ledger ? { share: ledger.journalState() } : {}),
+                native: journal.journalState(),
+                pendingWindows: sampler.journalState(),
+                samples: sampleJournal.journalState(),
+              },
+            },
           }
         },
       }
@@ -4268,7 +4380,7 @@ class TelemetryWorkerProcess {
           }),
           sampler: { skipped: run.skipped, readFailures: run.readFailures },
         }
-        return soak.TelemetryResourceVerdict.evaluate(input)
+        return JournalConstancy.apply(soak.TelemetryResourceVerdict.evaluate(input), input)
       }
       const soakRun = new soak.Soak({
         kafka,
@@ -4277,6 +4389,7 @@ class TelemetryWorkerProcess {
         context: { telemetryChurn: worker },
         sampleMs: soak.TELEMETRY.sampleMs,
         sampleAt: soak.TELEMETRY.sampleAt,
+        sampleJournal,
         warmupMs: soak.TELEMETRY.warmupMs,
         judge: (run) =>
           judge({ ...run, skipped: soakRun.skipped, readFailures: soakRun.readFailures }),
@@ -4343,6 +4456,9 @@ class TelemetryWorkerProcess {
 }
 
 module.exports = {
+  FixedJournal,
+  JournalConstancy,
+  journalLimits,
   KINDS,
   SCENARIO,
   SCHEDULE_STEPS: STEPS,

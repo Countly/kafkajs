@@ -1,7 +1,7 @@
 'use strict'
 
 /**
- * Process memory measurement for the single-client resource arms. It loads only Node builtins, so
+ * Process memory measurement for the single-client resource arms. Its dependencies load no product, so
  * an arm can take its startup reading before any application module is imported.
  *
  * Absolute current-image high water comes from `/proc/self/status` `VmHWM` (kibibytes, scaled to
@@ -10,6 +10,7 @@
  * never substituted for it. Nothing here writes `/proc/self/clear_refs` or resets a high water.
  */
 const fs = require('node:fs')
+const { FixedJournal } = require('./fixedJournal')
 const os = require('node:os')
 const v8 = require('node:v8')
 const { performance, PerformanceObserver } = require('node:perf_hooks')
@@ -287,16 +288,20 @@ class PendingSampler {
    * @param {object} [timers] replaceable timers for tests
    * @param {(fn: () => void, ms: number) => *} [timers.set] `setInterval`
    * @param {(handle: *) => void} [timers.clear] `clearInterval`
+   * @param {number|null} [timers.capacity] fixed scalar window archive; null preserves the default
    * @returns {PendingSampler} a sampler with nothing pending
    */
-  constructor(memory, { set = setInterval, clear = clearInterval } = {}) {
+  constructor(memory, { set = setInterval, clear = clearInterval, capacity = null } = {}) {
     Object.assign(this, { memory, set, clear })
     this.pending = 0
     this.handle = null
     this.windowLast = null
     this.count = 0
     this.windows = 0
-    this.windowRows = []
+    this.windowRows =
+      capacity === null
+        ? []
+        : new FixedJournal({ name: 'pending windows', capacity, bytes: capacity * 256 })
     this.window = null
     this.overflow = false
     this.maxGapMs = 0
@@ -333,8 +338,10 @@ class PendingSampler {
     if (this.pending === 0) {
       this.windows += 1
       this.window = { begin: null, end: null, count: 0, rss: 0, external: 0 }
-      if (this.windowRows.length < WINDOW_CAPACITY) this.windowRows.push(this.window)
-      else this.overflow = true
+      if (!(this.windowRows instanceof FixedJournal)) {
+        if (this.windowRows.length < WINDOW_CAPACITY) this.windowRows.push(this.window)
+        else this.overflow = true
+      }
       this.windowLast = null
       this.handle = this.set(() => this.take(), SAMPLE_MS)
     }
@@ -354,6 +361,7 @@ class PendingSampler {
     if (this.pending === 0) {
       this.clear(this.handle)
       this.handle = null
+      if (this.windowRows instanceof FixedJournal) this.windowRows.push(this.window)
       this.window = null
     }
     return reading
@@ -372,6 +380,11 @@ class PendingSampler {
     this.pending = 0
   }
 
+  /** @returns {object} fixed window capacity and append cursor, without materialising rows */
+  journalState() {
+    return this.windowRows.journalState()
+  }
+
   /**
    * @returns {{count:number, windows:number, pendingWindows:Array<{begin:number, end:number,
    *   count:number, rss:number, external:number}>, overflow:boolean, maxGapMs:number,
@@ -382,7 +395,10 @@ class PendingSampler {
     return {
       count: this.count,
       windows: this.windows,
-      pendingWindows: this.windowRows.map((window) => ({ ...window })),
+      pendingWindows:
+        this.windowRows instanceof FixedJournal
+          ? [...this.windowRows.values(), ...(this.window ? [{ ...this.window }] : [])]
+          : this.windowRows.map((window) => ({ ...window })),
       overflow: this.overflow,
       maxGapMs: this.maxGapMs,
       intervalMs: SAMPLE_MS,
@@ -406,11 +422,22 @@ class NativeJournal {
    * @param {() => number} [options.epoch] the arm's lifecycle counter; a job that settles in a
    *   later epoch than it was submitted in is a retired completion
    * @param {(row: object) => void} [options.onSubmit] called synchronously after a submission
+   * @param {boolean} [options.fixed] reserve and touch scalar byte storage before M; overflow throws
    * @returns {NativeJournal} a journal observing nothing yet
    */
-  constructor({ memory, sampler, capacity = 32, epoch = () => 0, onSubmit = () => {} }) {
+  constructor({
+    memory,
+    sampler,
+    capacity = 32,
+    epoch = () => 0,
+    onSubmit = () => {},
+    fixed = false,
+  }) {
     Object.assign(this, { memory, sampler, capacity, epoch, onSubmit })
-    this.rows = []
+    this.rows = fixed
+      ? new FixedJournal({ name: 'native work', capacity, bytes: capacity * 2048 })
+      : []
+    this.submitted = 0
     this.live = new Set()
     this.maxLive = 0
     this.overflow = false
@@ -466,13 +493,14 @@ class NativeJournal {
    * @returns {object|null} the row, or null once the capacity is exceeded
    */
   begin(codec, job) {
-    if (this.rows.length >= this.capacity) {
+    if (this.submitted >= this.capacity) {
       this.overflow = true
+      if (this.rows instanceof FixedJournal) throw new Error('native work journal overflow')
       return null
     }
     const input = job?.buffer
     const row = {
-      id: this.rows.length + 1,
+      id: ++this.submitted,
       codec,
       jobId: this.idOf(job),
       inputId: this.idOf(input),
@@ -490,7 +518,7 @@ class NativeJournal {
       distinctBackingBytes: 0,
       retired: false,
     }
-    this.rows.push(row)
+    if (!(this.rows instanceof FixedJournal)) this.rows.push(row)
     this.live.add(row)
     row.submitted = this.sampler.begin()
     this.maxLive = Math.max(this.maxLive, this.live.size)
@@ -518,6 +546,7 @@ class NativeJournal {
     if (row.resultBackingId !== null) distinct.set(row.resultBackingId, row.resultBackingBytes)
     row.distinctBackingBytes = [...distinct.values()].reduce((sum, bytes) => sum + bytes, 0)
     row.retired = this.epoch() !== row.epoch
+    if (this.rows instanceof FixedJournal) this.rows.push(row)
   }
 
   /** @returns {void} restores every wrapped module */
@@ -525,12 +554,20 @@ class NativeJournal {
     while (this.restores.length) this.restores.pop()()
   }
 
+  /** @returns {object} reserved native-row capacity and cursor, with no product references */
+  journalState() {
+    return this.rows.journalState()
+  }
+
   /**
    * @returns {{rows: object[], maxLive: number, live: number, overflow: boolean}} bounded facts
    */
   summary() {
     return {
-      rows: this.rows.map((row) => ({ ...row })),
+      rows:
+        this.rows instanceof FixedJournal
+          ? [...this.rows.values(), ...this.live].sort((a, b) => a.id - b.id)
+          : this.rows.map((row) => ({ ...row })),
       maxLive: this.maxLive,
       live: this.live.size,
       overflow: this.overflow,

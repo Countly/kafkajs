@@ -11,6 +11,8 @@ const replay = async (Work, kind) => {
   let now = 0.125
   let handler
   const client = {
+    events: { ACKNOWLEDGE: 'ack', FETCH: 'fetch' },
+    on: () => {},
     subscribe: async () => {},
     run: async ({ eachMessage }) => (handler = eachMessage),
     send: async () => {},
@@ -98,7 +100,7 @@ const exact = (expected, actual) => {
 
 describe('telemetry fixed journals', () => {
   test('replays the full 10000-record producer and consumer ids without growing storage', async () => {
-    for (const kind of ['producer', 'consumer']) {
+    for (const kind of ['producer', 'consumer', 'shareConsumer']) {
       const expected = await replay(ReferenceWork, kind)
       const actual = await replay(churn.OrdinaryWork, kind)
       expect(actual.before).toBeDefined()

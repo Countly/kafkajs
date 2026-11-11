@@ -2622,6 +2622,8 @@ class Soak {
    *   `warmupMs`, and each sample names its phase and how long into it it was taken
    * @param {number} [options.settleMs=SETTLE_MS] how long a quiet point waits for closed sockets to go
    * @param {(record: object) => void} [options.record=writeEvidence('soak', ...)] where every line goes
+   * @param {object|null} [options.sampleJournal] preallocated scalar storage with `push`/`values`;
+   *   materialised only after the teardown reading, used by telemetry workers
    * @param {(snapshot: object) => object} [options.sampleSnapshot] Selects the snapshot fields kept
    *   for the judge. Evidence always receives the complete original snapshot.
    * @param {Record<string, Function>} [options.workloads=WORKLOADS]
@@ -2639,6 +2641,7 @@ class Soak {
     context,
     sampleMs = SAMPLE_MS,
     sampleAt = null,
+    sampleJournal = null,
     warmupMs = WARMUP_MS,
     judge = evaluate,
     settleMs = SETTLE_MS,
@@ -2656,6 +2659,7 @@ class Soak {
       context,
       sampleMs,
       sampleAt,
+      sampleJournal,
       warmupMs,
       judge,
       settleMs,
@@ -2666,7 +2670,7 @@ class Soak {
       beforeTeardown,
       transition,
     })
-    this.samples = []
+    this.samples = sampleJournal ?? []
     this.phaseEnds = []
     this.sampling = false
     this.sampler = Promise.resolve()
@@ -2710,7 +2714,7 @@ class Soak {
       const verdict = this.judge({
         baseline,
         phaseEnds: this.phaseEnds,
-        samples: this.samples,
+        samples: this.sampleJournal ? this.sampleJournal.values() : this.samples,
         teardown,
         warmupMs: this.warmupMs,
       })

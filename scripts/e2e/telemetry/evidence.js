@@ -3617,6 +3617,11 @@ const verifyChurnFence = (kind, facts, bundles, transcripts, names) => {
  */
 const verifyChurnReference = ({ kind, uuid, stem, input }) => {
   const churn = require('../../soak/telemetryChurn')
+  assert.deepEqual(
+    churn.JournalConstancy.violations(input),
+    [],
+    'Journal storage changed during the measurement'
+  )
   const registry = new churn.Registry(
     { registerMetricForSubscription() {}, unregisterMetricFromSubscription() {} },
     kind

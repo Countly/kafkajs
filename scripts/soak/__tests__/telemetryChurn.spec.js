@@ -3829,8 +3829,8 @@ describe('telemetry churn worker identity', () => {
         uuid: U,
         stem: STEM,
         input: {
-          baseline: { registryDigest: digest },
-          teardown: { registryDigest: digest },
+          baseline: { registryDigest: digest, journals: { byteLength: 4096, cursor: 0 } },
+          teardown: { registryDigest: digest, journals: { byteLength: 4096, cursor: 0 } },
           reference: {
             control: { kind: 'producer', manifest },
             foreground: manifest.operations.map((o) => ({ n: o.n, status: 'fulfilled' })),
@@ -4285,8 +4285,8 @@ describe('telemetry churn archive replay', () => {
         result: VERDICT,
         input: {
           clientCount: 1,
-          baseline: { registryDigest: digest },
-          teardown: { registryDigest: digest },
+          baseline: { registryDigest: digest, journals: { byteLength: 4096, cursor: 0 } },
+          teardown: { registryDigest: digest, journals: { byteLength: 4096, cursor: 0 } },
           reference: {
             control: { kind, manifest },
             foreground: manifest.operations.map((o) => ({ n: o.n, status: 'fulfilled' })),
