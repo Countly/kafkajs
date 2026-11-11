@@ -5,7 +5,6 @@ const { KafkaJSPartialMessageError } = require('../errors')
 
 const MAX_COUNT = 1000000
 const MAX_TAGS = 10000
-const MAX_PREALLOCATION = 1000
 const BIG_TIMEOUT = 60000
 
 /** @param {number} value @returns {Buffer} the value as a big-endian int32 */
@@ -77,13 +76,6 @@ const observeConstruction = (name, run) => {
     global[name] = original
   }
 }
-
-/** @param {number[][]} constructions @returns {number} the largest numeric capacity a construct call advertised */
-const largestCapacity = (constructions) =>
-  constructions.reduce(
-    (largest, args) => (typeof args[0] === 'number' ? Math.max(largest, args[0]) : largest),
-    0
-  )
 
 /** @param {() => *} call @returns {Promise<*>} what `call` returned or threw, as a promise */
 const settle = (call) => {
@@ -198,28 +190,6 @@ describe('Decoder count bounds', () => {
       ])
       expect(decoder.offset).toBe(decoder.buffer.length)
     })
-
-    it(`${reader.name} propagates an element failure without reading later elements`, async () => {
-      for (const asynchronous of [false, true]) {
-        const decoder = new Decoder(Buffer.concat([reader.prefix(3), Buffer.from([11, 22, 33])]))
-        const sentinel = new Error('second element failed')
-        const values = []
-        const element = (input) => {
-          const value = input.readInt8()
-          values.push(value)
-          if (value === 22) {
-            if (asynchronous) return Promise.reject(sentinel)
-            throw sentinel
-          }
-          return Promise.resolve(value)
-        }
-
-        await expect(decoder[reader.name](element)).rejects.toBe(sentinel)
-
-        expect(values).toEqual([11, 22])
-        expect(decoder.offset).toBe(reader.prefix(3).length + 2)
-      }
-    })
   }
 
   it('readArrayAsync rejects negative counts other than -1 before reading an element', async () => {
@@ -241,10 +211,14 @@ describe('Decoder count bounds', () => {
         const element = countingReader()
         const decoder = new Decoder(bodyOf(reader, MAX_COUNT + 1))
 
-        const error = await failureOf(() => decoder[reader.name](element.read))
+        const { outcome, constructions } = observeConstruction('Array', () =>
+          failureOf(() => decoder[reader.name](element.read))
+        )
+        const error = await outcome
 
         expectNonRetriableLimit(error, MAX_COUNT + 1)
         expect(element.calls()).toBe(0)
+        expect(constructions).toEqual([])
       },
       BIG_TIMEOUT
     )
@@ -264,9 +238,30 @@ describe('Decoder count bounds', () => {
       BIG_TIMEOUT
     )
 
-    it(`${reader.name} allocates at most ${MAX_PREALLOCATION} slots before the first element fails`, async () => {
+    it(`${reader.name} rejects byte-short and hostile counts before allocating or reading an element`, async () => {
+      const counts = reader.name.includes('UVarInt')
+        ? [2000, 4294967294]
+        : [2000, 2147483647, -2, -2147483648]
+      for (const count of counts) {
+        const body = Buffer.concat([reader.prefix(count), Buffer.alloc(count === 2000 ? 1999 : 0)])
+        const decoder = new Decoder(body)
+        const element = countingReader()
+
+        const { outcome, constructions } = observeConstruction('Array', () =>
+          failureOf(() => decoder[reader.name](element.read))
+        )
+        const error = await outcome
+
+        expect(error).toBeInstanceOf(KafkaJSPartialMessageError)
+        expect(error.retriable).toBe(false)
+        expect(element.calls()).toBe(0)
+        expect(constructions).toEqual([])
+      }
+    })
+
+    it(`${reader.name} reserves validated capacity before the first element`, async () => {
       const sentinel = new Error('first element failed')
-      const decoder = new Decoder(bodyOf(reader, 900000))
+      const decoder = new Decoder(bodyOf(reader, 2000))
       const failing = () => {
         throw sentinel
       }
@@ -276,8 +271,58 @@ describe('Decoder count bounds', () => {
       )
 
       await expect(Promise.resolve(outcome)).rejects.toBe(sentinel)
-      expect(largestCapacity(constructions)).toBeLessThanOrEqual(MAX_PREALLOCATION)
-    }, 20000)
+      expect(constructions).toEqual([[2000]])
+    })
+
+    it(`${reader.name} returns a plain dense array of exactly the validated count`, async () => {
+      for (const count of [0, 3, 2000]) {
+        const body = Buffer.concat([reader.prefix(count), Buffer.alloc(count, 42)])
+        const decoder = new Decoder(body)
+        let index = 0
+        const element = (input) => {
+          const value = input.readInt8()
+          return index++ === 1 ? undefined : value
+        }
+
+        const result = await decoder[reader.name](element)
+
+        expect(Object.getPrototypeOf(result)).toBe(Array.prototype)
+        expect(result).toStrictEqual(
+          Array.from({ length: count }, (_, i) => (i === 1 ? undefined : 42))
+        )
+        expect(Object.keys(result)).toHaveLength(count)
+        expect(decoder.offset).toBe(body.length)
+      }
+    })
+
+    it(`${reader.name} propagates an element failure without reading later elements`, async () => {
+      for (const asynchronous of reader.name.endsWith('Async') ? [false, true] : [false]) {
+        const decoder = new Decoder(Buffer.concat([reader.prefix(3), Buffer.from([11, 22, 33])]))
+        const sentinel = new Error('second element failed')
+        const values = []
+        const read = (input) => {
+          const value = input.readInt8()
+          values.push(value)
+          if (value === 22) throw sentinel
+          return value
+        }
+        const element = asynchronous
+          ? async (input) => {
+              await Promise.resolve()
+              return read(input)
+            }
+          : read
+        const publish = jest.fn()
+        const outcome = settle(() => decoder[reader.name](element)).then(publish)
+
+        await expect(outcome).rejects.toBe(sentinel)
+
+        expect(publish).not.toHaveBeenCalled()
+        expect(values).toEqual([11, 22])
+        expect(decoder.offset).toBe(reader.prefix(3).length + 2)
+        expect(decoder.readInt8()).toBe(33)
+      }
+    })
   }
 
   it('accepts 10000 ordered tags', () => {
