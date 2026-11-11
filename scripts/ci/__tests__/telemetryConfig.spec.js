@@ -242,13 +242,102 @@ describe('telemetry lane configuration', () => {
       },
     })
     const build = read('scripts/e2e/telemetry/build.sh')
-    expect(build).toContain(`CLIENT_SOURCE=$HERE/legacy/JavaTelemetryClient.java
-CLIENT_RELEASE=17
+    expect(build).toContain(
+      'CLIENT_SOURCE=$(bash "$HERE/prepare-client-source.sh" "$V" "$WORK/source")'
+    )
+    expect(build).toContain(`CLIENT_RELEASE=17
+CLIENT_CP=$KC:$SLF
 if [ "$V" = 4.4.0 ]; then
-  CLIENT_SOURCE=$HERE/JavaTelemetryClient.java
   CLIENT_RELEASE=21
+  CLIENT_CP=$CLIENT_CP:$PB:$OUT/otlp-v1.9.0-bindings-unrelocated.jar
 fi`)
-    expect(build).toMatch(/javac --release "\$CLIENT_RELEASE" [^\n]+ "\$CLIENT_SOURCE"/)
+    expect(build).toMatch(
+      /javac --release "\$CLIENT_RELEASE" [^\n]+ -cp "\$CLIENT_CP" [^\n]+ "\$CLIENT_SOURCE"/
+    )
+  })
+
+  test.each([
+    ['4.4.0', '4837c77e71fd3e98a9e69b1bd11642dad1b367540caecc5ebf5613ce80c88888'],
+    ['4.3.1', '27e3fb34c247f514a0e07a07e85448e7c1bd6bc27eaa3fe301af04721f01eab3'],
+    ['4.2.2', '27e3fb34c247f514a0e07a07e85448e7c1bd6bc27eaa3fe301af04721f01eab3'],
+  ])(
+    'prepares an independent OTLP client for Kafka %s while preserving historical sources',
+    (line, expected) => {
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'telemetry-client-source-'))
+      const prepare = 'scripts/e2e/telemetry/prepare-client-source.sh'
+      try {
+        const output = path.join(directory, 'source with spaces')
+        const result = spawnSync('bash', [path.join(ROOT, prepare), line, output], {
+          encoding: 'utf8',
+        })
+        expect(result.status).toBe(0)
+        expect(result.stderr).toBe('')
+        const file = path.join(output, 'JavaTelemetryClient.java')
+        expect(result.stdout).toBe(file + '\n')
+        const prepared = fs.readFileSync(file)
+        expect(crypto.createHash('sha256').update(prepared).digest('hex')).toBe(expected)
+        const manifest = JSON.parse(read(FIXTURES + 'manifest.json'))
+        const amendment = manifest.amendments.find(
+          (entry) => entry.id === 'independent-client-otlp-4.4.0'
+        )
+        expect(amendment.preparedClientSha256[line]).toBe(expected)
+        expect(manifest.scripts['prepare-client-source.sh']).toBe(sha256(prepare))
+        if (line === '4.4.0') {
+          const source = prepared.toString()
+          expect(source).toContain('import io.opentelemetry.proto.metrics.v1.MetricsData;')
+          expect(source).toContain('MetricsData.parseFrom(push.metricsData(4096))')
+          expect(source).not.toMatch(/ClientTelemetryUtils|org\.apache\.kafka\.shaded/)
+          expect(source).toContain('if (count != (corrected ? 4 : 3))')
+        } else
+          expect(prepared).toEqual(
+            fs.readFileSync(
+              path.join(ROOT, 'scripts/e2e/telemetry/legacy/JavaTelemetryClient.java')
+            )
+          )
+        expect(sha256('scripts/e2e/telemetry/JavaTelemetryClient.java')).toBe(
+          '1145746dfeadc7d315e42b1c9d3b3468d819929324cc7701cbddbb423f66b580'
+        )
+        expect(sha256('scripts/e2e/telemetry/CountingTelemetryReporter.java')).toBe(
+          'f624d0d3b774048ce50c21d418fe61429384a37e35fbc11d61170e2ea8e6cb9c'
+        )
+      } finally {
+        fs.rmSync(directory, { recursive: true, force: true })
+      }
+    }
+  )
+
+  test('rejects unsupported client source versions before writing output', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'telemetry-client-version-'))
+    try {
+      const output = path.join(directory, 'source')
+      const result = spawnSync(
+        'bash',
+        [path.join(ROOT, 'scripts/e2e/telemetry/prepare-client-source.sh'), '4.1.2', output],
+        {
+          encoding: 'utf8',
+        }
+      )
+      expect(result.status).toBe(2)
+      expect(result.stdout).toBe('')
+      expect(fs.existsSync(output)).toBe(false)
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('packages independent client bindings and runs the real Kafka 4.4.0 controls in the provenance build', () => {
+    const build = read('scripts/e2e/telemetry/build.sh')
+    expect(build).toContain(
+      'if [ "$V" = 4.4.0 ]; then\n  cp -r "$WORK/classes-orig/." "$WORK/classes-client/"\nfi'
+    )
+    expect(build).toContain(
+      'java -cp "$OUT/java-telemetry-client-$V.jar:$KC:$PB:$SLF" org.countly.kafkajs.telemetry.JavaTelemetryClient --controls'
+    )
+    expect(build.indexOf('cp -r "$WORK/classes-orig/."')).toBeLessThan(
+      build.indexOf('jar --create --date=$DATE --file "$OUT/java-telemetry-client-$V.jar"')
+    )
+    const runner = read('scripts/e2e/telemetry/run.sh')
+    expect(runner).toContain("'prepare-client-source.sh'")
   })
 
   test('the temporary telemetry fixtures build workflow sets its cache on the runner and supports manual dispatch', () => {
