@@ -372,6 +372,20 @@ describe('Decoder performance comparison', () => {
       roundNsPerOp: [98, 99, 100, 101, 102],
     })
   }
+  test('acceptance keeps seven alternating pairs per side by default; the A/A control adds samples without changing them', () => {
+    const collector = new MeasurementCollector({
+      trees: { old: 'OLD', new: 'NEW' },
+      rawDir: 'raw',
+      run: valueFor,
+      save: () => {},
+    })
+    const { arms } = collector.collect()
+    for (const arm of arms) {
+      expect(arm.oldNsPerOp).toHaveLength(7)
+      expect(arm.newNsPerOp).toHaveLength(7)
+      expect(arm.baselineControlNsPerOp).toHaveLength(7)
+    }
+  })
 
   it('collector runs each arm in both trees, alternates their order and keeps every raw invocation', () => {
     const { collector, calls, saved } = collect({ reply: valueFor })
