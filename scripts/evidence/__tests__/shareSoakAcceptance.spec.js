@@ -191,6 +191,9 @@ describe('share soak independent acceptance controls', () => {
     const transport = new SoakTransport(tap)
     try {
       const admin = transport.admin({
+        describeCluster: async () => ({
+          brokers: [{ nodeId: 7, host: 'node7', port: 9092 }],
+        }),
         listGroups: async () => ({ groups: [{ groupId: 'unrelated' }] }),
         describeConfigs: async () => ({
           resources: [
@@ -209,6 +212,8 @@ describe('share soak independent acceptance controls', () => {
           ],
         }),
       })
+      await admin.describeCluster()
+      await admin.describeCluster({ includeAuthorizedOperations: true })
       await admin.listGroups()
       await admin.describeConfigs({ resources: [{ type: 32, name: 'owned' }] })
       const producer = transport.producer({
@@ -227,13 +232,46 @@ describe('share soak independent acceptance controls', () => {
         ],
       })
       const result = await verifyProtocolAnswers(rows)
-      expect(result.problems.filter((p) => p.startsWith('Original protocol answer'))).toEqual([])
+      expect(
+        result.problems.filter((p) => /^Original (protocol answer|operation)/.test(p))
+      ).toEqual([])
       expect(result.groupListings).toEqual([
         expect.objectContaining({ groups: [expect.objectContaining({ groupId: 'unrelated' })] }),
       ])
       expect(result.successes).toEqual(
-        expect.arrayContaining([0, 16, 18, 32].map((apiKey) => expect.objectContaining({ apiKey })))
+        expect.arrayContaining(
+          [0, 3, 16, 18, 32, 60].map((apiKey) => expect.objectContaining({ apiKey }))
+        )
       )
+      const discovery = rows.filter(
+        (r) => r.kind === 'request' && r.operation === 'describeCluster' && r.apiKey !== 18
+      )
+      expect(discovery.map(({ apiKey, apiVersion }) => [apiKey, apiVersion])).toEqual([
+        [3, 13],
+        [60, 2],
+      ])
+      const { reply } = require('../../soak/__tests__/fixtures/soakReplies')
+      for (const request of discovery) {
+        const response = rows.find(
+          (r) => r.kind === 'response' && r.socket === request.socket && r.frame === request.frame
+        )
+        const before = response.bytes
+        const bytes = Buffer.concat([
+          Buffer.from(before, 'base64').subarray(0, 9),
+          reply(request.apiKey === 60 ? 'DescribeCluster' : 'Metadata', request.apiVersion, {
+            Brokers: [
+              { [request.apiKey === 60 ? 'BrokerId' : 'NodeId']: 7, Host: 'changed', Port: 9092 },
+            ],
+          }),
+        ])
+        bytes.writeInt32BE(bytes.length - 4, 0)
+        response.bytes = bytes.toString('base64')
+        const changed = await verifyProtocolAnswers(rows)
+        expect(changed.problems).toContain(
+          `Original operation ${request.operationId}/describeCluster: decoded values differ`
+        )
+        response.bytes = before
+      }
     } finally {
       transport.close()
     }
