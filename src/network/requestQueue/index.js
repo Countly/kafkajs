@@ -425,10 +425,13 @@ module.exports = class RequestQueue extends EventEmitter {
   }
 
   /**
+   * Clears scheduling handles while keeping the queue reusable.
    * @public
+   * @returns {void}
    */
   destroy() {
     clearInterval(this.requestTimeoutIntervalId)
+    this.requestTimeoutIntervalId = null
     clearTimeout(this.throttleCheckTimeoutId)
     this.throttleCheckTimeoutId = null
   }
