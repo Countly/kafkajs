@@ -223,7 +223,8 @@ const run = async (directory) => {
   const positiveRef = new WeakRef(positive)
   for (let round = 0; round < 30; round++) {
     await turn()
-    global.gc()
+    // Async major GC skips conservative stack roots that could keep the retired cohort visible.
+    await global.gc({ type: 'major', execution: 'async' })
   }
   assert(
     retained.refs.every((ref) => ref.deref() === undefined),
