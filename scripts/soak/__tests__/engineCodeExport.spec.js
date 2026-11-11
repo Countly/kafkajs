@@ -13,6 +13,7 @@ const canned = () =>
     ],
     "engine": {
       "version":1,
+      "readingCount":6,
       "readings":[
         {"readingIndex":0,"phase":"c0","at":100.125,"code":1000000,"bytecode":500000},
         {"readingIndex":1,"phase":"settled","at":70000.25,"code":1500000,"bytecode":500000},
@@ -73,6 +74,8 @@ describe('telemetry engine scalar export', () => {
       (raw, code) => raw.splice(1, 1),
       (raw, code) => code.samples.splice(1, 1),
       (raw, code) => code.readings.splice(2, 1),
+      (raw, code) => code.readings.pop(),
+      (raw, code) => code.readings.push({ ...code.readings[5], readingIndex: 6, at: 400000 }),
       (raw, code) => raw.splice(1, 0, raw[0]),
       (raw, code) => code.samples.splice(1, 0, code.samples[0]),
       (raw, code) => code.readings.splice(1, 0, code.readings[0]),
