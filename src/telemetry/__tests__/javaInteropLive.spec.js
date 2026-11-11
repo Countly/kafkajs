@@ -699,6 +699,15 @@ class JavaInteropCase {
       expect(exits[role].signal).toBeNull()
       expect(closing).toBeDefined()
       expect(closed).toBeDefined()
+      if (role === 'producer') {
+        const armed = child.marker('producerCloseWork')
+        expect(armed?.fields).toEqual({
+          producerCloseWork: true,
+          pending: true,
+          lingerMs: 60000,
+        })
+        expect(armed.at).toBeLessThanOrEqual(closing.at)
+      }
       const closeToExitMs = exits[role].exitAt - closing.at
       expect(closeToExitMs).toBeGreaterThanOrEqual(0)
       expect(closeToExitMs).toBeLessThanOrEqual(CLOSE_TO_EXIT_MS)
