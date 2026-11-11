@@ -26,7 +26,12 @@ const installStub = (prefix, name, version, origin) => {
 }
 
 /** An in-memory Kafka that keeps what it was asked to do in `state`. */
-const fakeKafka = ({ failSend = false } = {}) => {
+const fakeKafka = ({
+  failSend = false,
+  failConnect,
+  failRun = false,
+  manualDelivery = false,
+} = {}) => {
   const state = {
     topics: new Map(),
     sends: [],
@@ -34,6 +39,31 @@ const fakeKafka = ({ failSend = false } = {}) => {
     deleted: [],
     configs: [],
     consumerGroups: [],
+    deletedGroups: [],
+    events: [],
+    callbacks: 0,
+    timers: new Map(),
+  }
+  let elapsedNs = 0n
+  let ready
+  state.ready = new Promise((resolve) => {
+    ready = resolve
+  })
+  const timing = {
+    now: () => elapsedNs,
+    setTimeout: (callback, delay) => {
+      const timer = Symbol('timeout')
+      state.timers.set(timer, { callback, delay })
+      return timer
+    },
+    clearTimeout: (timer) => state.timers.delete(timer),
+  }
+  const connect = async (kind) => {
+    if (failConnect === kind) throw new Error(`${kind} connect failed`)
+  }
+  const disconnect = async (kind) => {
+    state.closed.push(kind)
+    state.events.push(`disconnect ${kind}`)
   }
   class Kafka {
     constructor(config) {
@@ -42,27 +72,34 @@ const fakeKafka = ({ failSend = false } = {}) => {
 
     admin() {
       return {
-        connect: async () => {},
+        connect: () => connect('admin'),
         createTopics: async ({ topics }) => {
           for (const { topic } of topics) state.topics.set(topic, [])
           return true
         },
         deleteTopics: async ({ topics }) => {
           for (const topic of topics) state.deleted.push(topic)
+          state.events.push('delete topics')
         },
-        disconnect: async () => state.closed.push('admin'),
+        deleteGroups: async (groups) => {
+          state.deletedGroups.push(...groups)
+          state.events.push('delete groups')
+        },
+        disconnect: () => disconnect('admin'),
       }
     }
 
     producer() {
       return {
-        connect: async () => {},
+        connect: () => connect('producer'),
         send: async ({ topic, messages }) => {
           if (failSend) throw new Error('send failed')
+          const durationMs = state.sends.length === 0 ? 1000 : state.sends.length
+          elapsedNs += BigInt(durationMs) * 1000000n
           state.sends.push(messages.length)
           state.topics.get(topic).push(...messages)
         },
-        disconnect: async () => state.closed.push('producer'),
+        disconnect: () => disconnect('producer'),
       }
     }
 
@@ -70,24 +107,31 @@ const fakeKafka = ({ failSend = false } = {}) => {
       state.consumerGroups.push(groupId)
       let topic
       return {
-        connect: async () => {},
+        connect: () => connect('consumer'),
         subscribe: async (subscription) => {
           topic = subscription.topic
           state.subscription = subscription
         },
         run: async ({ eachMessage }) => {
           state.deliverable = state.topics.get(topic).length
-          setImmediate(async () => {
-            for (const message of state.topics.get(topic)) {
+          let index = 0
+          state.deliver = async (count) => {
+            for (let i = 0; i < count; i++) {
+              const message = state.topics.get(topic)[index++]
+              elapsedNs += 10000000n
+              state.callbacks += 1
               await eachMessage({ topic, partition: 0, message })
             }
-          })
+          }
+          ready()
+          if (failRun) throw new Error('run failed')
+          if (!manualDelivery) await state.deliver(state.deliverable)
         },
-        disconnect: async () => state.closed.push('consumer'),
+        disconnect: () => disconnect('consumer'),
       }
     }
   }
-  return { client: { Kafka, logLevel: { NOTHING: 0 } }, state }
+  return { client: { Kafka, logLevel: { NOTHING: 0 } }, state, timing }
 }
 
 describe('Benchmarks > clientCompare', () => {
@@ -130,6 +174,24 @@ describe('Benchmarks > clientCompare', () => {
         origin: 'baseline',
         level: { NOTHING: 0 },
       })
+    })
+
+    test('rejects an ancestor package before evaluating it when the requested prefix is empty', () => {
+      const ancestor = path.join(prefix, 'ancestor')
+      const empty = path.join(ancestor, 'empty')
+      fs.mkdirSync(empty, { recursive: true })
+      installStub(ancestor, 'kafkajs', '2.2.4', 'ancestor')
+      fs.writeFileSync(
+        path.join(ancestor, 'node_modules', 'kafkajs', 'index.js'),
+        "process.stdout.write('ancestor evaluated')\n" +
+          'exports.Kafka = class Kafka {}\nexports.logLevel = { NOTHING: 0 }\n'
+      )
+
+      const result = load(empty, 'kafkajs')
+
+      expect(result.status).toBe(1)
+      expect(result.stdout).toBe('')
+      expect(result.stderr).toMatch(/outside.*prefix/i)
     })
 
     test('an arm cannot load the other arm package from its directory', () => {
@@ -221,44 +283,130 @@ describe('Benchmarks > clientCompare', () => {
 
   describe('runWorkload', () => {
     const run = (workload, messages, kafka = fakeKafka()) =>
-      runWorkload(kafka.client, workload, { messages, size: 8, brokers: BROKERS }).then(
-        (metrics) => ({ metrics, ...kafka })
-      )
+      runWorkload(
+        kafka.client,
+        workload,
+        { messages, size: 8, brokers: BROKERS },
+        kafka.timing
+      ).then((metrics) => ({ metrics, ...kafka }))
 
     test('produce-latency sends one single-message batch per record after one untimed warm-up', async () => {
       const { metrics, state } = await run('produce-latency', 40)
 
       expect(state.sends).toEqual(Array(41).fill(1))
-      expect(Object.keys(metrics).sort()).toEqual([
-        'elapsedMs',
-        'messagesPerSecond',
-        'p50',
-        'p90',
-        'p99',
-      ])
-      expect(metrics.p50).toBeLessThanOrEqual(metrics.p90)
-      expect(metrics.p90).toBeLessThanOrEqual(metrics.p99)
-      expect(Number.isFinite(metrics.messagesPerSecond)).toBe(true)
-      expect(metrics.messagesPerSecond).toBeGreaterThan(0)
+      expect(metrics).toEqual({
+        p50: 21,
+        p90: 37,
+        p99: 40,
+        elapsedMs: 820,
+        messagesPerSecond: (40 / 820) * 1000,
+      })
     })
 
     test('produce-throughput sends batches of 500 and the last batch carries the remainder', async () => {
       const { metrics, state } = await run('produce-throughput', 1200)
 
       expect(state.sends).toEqual([1, 500, 500, 200])
-      expect(Object.keys(metrics).sort()).toEqual(['elapsedMs', 'messagesPerSecond'])
-      expect(metrics.messagesPerSecond).toBeGreaterThan(0)
+      expect(metrics).toEqual({ elapsedMs: 6, messagesPerSecond: 200000 })
     })
 
-    test('consume-throughput produces the whole corpus first and counts delivery of every message', async () => {
-      const { metrics, state } = await run('consume-throughput', 50)
+    test('consume-throughput waits for the final callback and measures only the delivery interval', async () => {
+      const kafka = fakeKafka({ manualDelivery: true })
+      const { state } = kafka
+      let completed = false
+      const pending = run('consume-throughput', 50, kafka).then((result) => {
+        completed = true
+        return result
+      })
+      await state.ready
 
-      expect(state.sends.reduce((a, b) => a + b, 0)).toBe(50)
-      expect(state.deliverable).toBe(50)
+      expect(state.sends).toEqual([50])
       expect(state.subscription).toMatchObject({ fromBeginning: true })
-      expect(Object.keys(metrics).sort()).toEqual(['elapsedMs', 'messagesPerSecond'])
-      expect(metrics.messagesPerSecond).toBeGreaterThan(0)
-      expect(state.closed).toContain('consumer')
+      expect([...state.timers.values()].map(({ delay }) => delay)).toEqual([300000])
+      await state.deliver(49)
+      expect(state.callbacks).toBe(49)
+      expect(completed).toBe(false)
+      expect(state.closed).toEqual(['producer'])
+      expect(state.deletedGroups).toEqual([])
+      expect(state.deleted).toEqual([])
+
+      await state.deliver(1)
+      const { metrics } = await pending
+
+      expect(state.callbacks).toBe(50)
+      expect(metrics).toEqual({ elapsedMs: 490, messagesPerSecond: 100 })
+      expect(state.events).toEqual([
+        'disconnect producer',
+        'disconnect consumer',
+        'delete groups',
+        'delete topics',
+        'disconnect admin',
+      ])
+      expect(state.deletedGroups).toEqual(state.consumerGroups)
+      expect(state.deleted).toEqual([...state.topics.keys()])
+      expect(state.timers.size).toBe(0)
+    })
+
+    test('deletes its group and topic after shutting down a failed consumer', async () => {
+      const kafka = fakeKafka({ failRun: true })
+
+      await expect(run('consume-throughput', 5, kafka)).rejects.toThrow('run failed')
+
+      expect(kafka.state.deletedGroups).toEqual(kafka.state.consumerGroups)
+      expect(kafka.state.deletedGroups).toHaveLength(1)
+      expect(kafka.state.deleted).toEqual([...kafka.state.topics.keys()])
+      expect(kafka.state.events).toEqual([
+        'disconnect producer',
+        'disconnect consumer',
+        'delete groups',
+        'delete topics',
+        'disconnect admin',
+      ])
+      expect(kafka.state.timers.size).toBe(0)
+    })
+
+    test('a consume timeout rejects with the delivery count and releases its timer and clients', async () => {
+      const kafka = fakeKafka({ manualDelivery: true })
+      const pending = run('consume-throughput', 5, kafka).catch((error) => error)
+      await kafka.state.ready
+      await kafka.state.deliver(2)
+
+      expect(kafka.state.timers.size).toBe(1)
+      const [{ callback }] = kafka.state.timers.values()
+      callback()
+      expect(await pending).toEqual(new Error('received 2 of 5 messages in time'))
+
+      expect(kafka.state.timers.size).toBe(0)
+      expect(kafka.state.closed).toEqual(['producer', 'consumer', 'admin'])
+      expect(kafka.state.deletedGroups).toEqual(kafka.state.consumerGroups)
+      expect(kafka.state.deleted).toEqual([...kafka.state.topics.keys()])
+    })
+
+    test('disconnects the producer and admin when producer connect rejects', async () => {
+      const kafka = fakeKafka({ failConnect: 'producer' })
+
+      await expect(run('produce-latency', 5, kafka)).rejects.toThrow('producer connect failed')
+
+      expect(kafka.state.closed).toEqual(['producer', 'admin'])
+      expect(kafka.state.deleted).toEqual([...kafka.state.topics.keys()])
+    })
+
+    test('disconnects the consumer and admin when consumer connect rejects', async () => {
+      const kafka = fakeKafka({ failConnect: 'consumer' })
+
+      await expect(run('consume-throughput', 5, kafka)).rejects.toThrow('consumer connect failed')
+
+      expect(kafka.state.closed).toEqual(['producer', 'consumer', 'admin'])
+      expect(kafka.state.deleted).toEqual([...kafka.state.topics.keys()])
+    })
+
+    test('disconnects the admin when admin connect rejects', async () => {
+      const kafka = fakeKafka({ failConnect: 'admin' })
+
+      await expect(run('produce-latency', 5, kafka)).rejects.toThrow('admin connect failed')
+
+      expect(kafka.state.closed).toEqual(['admin'])
+      expect(kafka.state.sends).toEqual([])
     })
 
     test('names the topic and the consumer group with the pid and the time', async () => {

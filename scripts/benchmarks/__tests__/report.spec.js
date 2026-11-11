@@ -284,6 +284,29 @@ describe('Benchmarks > report', () => {
       expect(rows.every((row) => row.error === undefined)).toBe(true)
     })
 
+    test('runs stickyBalance as a fork-only single arm with garbage collection enabled', () => {
+      const entry = manifest.entries.find((candidate) => candidate.name === 'stickyBalance')
+      expect(entry).toBeDefined()
+      const { spawn, calls } = stub(() =>
+        json({ recordsPerRequest: 32, balance: 0.9, p99Ms: 12, heapRetainedBytes: 256 })
+      )
+
+      const rows = runEntry(entry, options(spawn, 1))
+
+      expect(entry.arms).toEqual(['fork'])
+      expect(entry.broker).toBe(true)
+      expect(calls).toHaveLength(1)
+      expect(calls[0].args).toEqual(['--expose-gc', 'scripts/benchmarks/stickyBalance.js'])
+      expect(rows.map(({ metric, median, unit }) => ({ metric, median, unit }))).toEqual([
+        { metric: 'recordsPerRequest', median: 32, unit: 'records' },
+        { metric: 'balance', median: 0.9, unit: 'ratio' },
+        { metric: 'p99Ms', median: 12, unit: 'ms' },
+        { metric: 'heapRetainedBytes', median: 256, unit: 'bytes' },
+      ])
+      expect(rows.every((row) => row.error === undefined)).toBe(true)
+      expect(manifest.excluded.map(({ file }) => file)).not.toContain('stickyBalance.js')
+    })
+
     test('reads dotted metric paths', () => {
       const entry = single({ metrics: [{ key: 'sizes.16.nsPerOp', unit: 'ns' }] })
       const { spawn } = stub(() => json({ sizes: { 16: { nsPerOp: 21 } } }))
