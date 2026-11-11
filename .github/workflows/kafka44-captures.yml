@@ -1,0 +1,123 @@
+# Independent broker captures for Kafka 4.4.0 and 4.3.2: one dedicated job and one fresh Compose
+# cluster per version. Dispatch it with the full SHA of the commit whose capture tooling should run.
+# Each job uploads `broker-capture-<version>`; import it with
+#   node scripts/protocol/importCaptureArtifacts.js --artifact <downloaded dir> --version <version> --tables <downloaded dir>/client-tables
+# and keep the logs artifact `broker-capture-logs-<version>` with the run record.
+name: Kafka broker captures
+on:
+  push:
+    branches: ['p9g/**']
+    paths:
+      - '.github/workflows/kafka44-captures.yml'
+      - 'scripts/protocol/**'
+      - 'scripts/e2e/apiVersionsProbe.js'
+      - 'scripts/dockerComposeUp.sh'
+      - 'scripts/waitForKafka.js'
+      - 'docker-compose.yml'
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Full 40-character commit SHA to capture with
+        required: true
+permissions:
+  contents: read
+concurrency:
+  group: kafka-broker-captures-${{ inputs.sha || github.sha }}
+  cancel-in-progress: false
+jobs:
+  capture:
+    name: capture-${{ matrix.kafka }}
+    runs-on: ${{ vars.GATE_RUNNER || 'ubuntu-latest' }}
+    # Provisional cap, to be set from the first run's timings.
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kafka: 4.4.0
+            upgrade: 'true'
+            state: share.version upgraded to 2 with kafka-features.sh before every capture
+          - kafka: 4.3.2
+            upgrade: 'false'
+            state: default cluster, no feature change
+    env:
+      KAFKA_VERSION: ${{ matrix.kafka }}
+      FEATURE_STATE: ${{ matrix.state }}
+      CANDIDATE_SHA: ${{ inputs.sha || github.sha }}
+      NO_LOGS: '1'
+      OUT: capture-out/${{ matrix.kafka }}
+    steps:
+      - name: Check the commit argument
+        run: '[[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+      - name: Confirm the checked-out tree
+        run: test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 26
+          cache: npm
+      - run: npm ci
+      - name: Start the cluster
+        run: ./scripts/dockerComposeUp.sh
+      - name: Wait for the cluster
+        run: ./scripts/waitForKafka.js
+      - name: Finalize share.version 2
+        if: matrix.upgrade == 'true'
+        run: |
+          set -euo pipefail
+          tool() { docker compose exec -T kafka1 "/opt/kafka/bin/$1" --bootstrap-server kafka1:29092 "${@:2}"; }
+          tool kafka-features.sh upgrade --feature share.version=2
+          tool kafka-features.sh describe | grep -E '^Feature: share\.version +SupportedMinVersion: [0-9]+ +SupportedMaxVersion: [0-9]+ +FinalizedVersionLevel: 2 '
+      - name: Capture the three raw outputs
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUT/client-tables"
+          tool() { docker compose exec -T kafka1 "/opt/kafka/bin/$1" --bootstrap-server kafka1:29092 "${@:2}"; }
+          now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+          tool kafka-broker-api-versions.sh > "$OUT/broker-api-versions.txt"; t1="$(now)"
+          tool kafka-features.sh describe > "$OUT/kafka-features-describe.txt"; t2="$(now)"
+          node scripts/protocol/wireFeatures.js localhost 9092 > "$OUT/wire-apiversions-v4.jsonl"; t3="$(now)"
+          docker compose logs --no-color kafka1 | grep -E 'Kafka (version|commitId): ' > "$OUT/broker-identity.txt"
+          docker image inspect --format '{{index .RepoDigests 0}}' "apache/kafka:$KAFKA_VERSION" > "$OUT/image-digest.txt"
+          jq -n --arg source "Independent broker tool captures (Kafka $KAFKA_VERSION default cluster)" \
+            --arg sha "$CANDIDATE_SHA" --arg state "$FEATURE_STATE" \
+            --arg t1 "$t1" --arg t2 "$t2" --arg t3 "$t3" '{
+              source: $source, candidateSha: $sha, featureState: $state,
+              captures: [
+                { file: "broker-api-versions.txt", capturedOn: $t1,
+                  howProduced: "kafka-broker-api-versions.sh --bootstrap-server kafka1:29092, run in the kafka1 container; every supported numeric API key with both endpoints, all broker blocks agree, UNSUPPORTED entries excluded." },
+                { file: "kafka-features-describe.txt", capturedOn: $t2,
+                  howProduced: "kafka-features.sh --bootstrap-server kafka1:29092 describe, run in the kafka1 container." },
+                { file: "wire-apiversions-v4.jsonl", capturedOn: $t3,
+                  howProduced: "The one JSON line printed by node scripts/protocol/wireFeatures.js localhost 9092 (ApiVersions v4, Node built-in modules only, no client codec)." }
+              ] }' > "$OUT/capture-meta.json"
+          (cd "$OUT" && sha256sum broker-api-versions.txt kafka-features-describe.txt wire-apiversions-v4.jsonl broker-identity.txt image-digest.txt capture-meta.json > SHA256SUMS)
+      - name: Record the client tables
+        run: |
+          set -euo pipefail
+          cp scripts/protocol/brokerRanges.json scripts/protocol/brokerFeatures.json "$OUT/client-tables/"
+          node scripts/e2e/apiVersionsProbe.js --all --record="$OUT/client-tables/brokerRanges.json" --record-features="$OUT/client-tables/brokerFeatures.json"
+      - name: Dry-run the import
+        run: node scripts/protocol/importCaptureArtifacts.js --artifact "$OUT" --version "$KAFKA_VERSION" --tables "$OUT/client-tables" --dry-run
+      - name: Collect cluster logs
+        if: always()
+        run: |
+          mkdir -p capture-logs
+          docker compose logs --no-color > capture-logs/compose.log 2>&1 || true
+      - name: Stop the cluster
+        if: always()
+        run: docker compose down --volumes --remove-orphans
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: broker-capture-${{ matrix.kafka }}
+          retention-days: 30
+          path: capture-out/${{ matrix.kafka }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: broker-capture-logs-${{ matrix.kafka }}
+          retention-days: 30
+          path: capture-logs

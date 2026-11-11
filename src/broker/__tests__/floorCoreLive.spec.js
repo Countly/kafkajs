@@ -1353,6 +1353,79 @@ describe('Floor administration helpers', () => {
     for (const gone of [earlier, cleared, fired]) expect(pending).not.toContain(gone)
   })
 
+  test('a timer ledger records deep creation stacks for unref timers and restores the stack limit', () => {
+    const ledger = new TimerLedger()
+    const previousLimit = Error.stackTraceLimit
+    const createOwnedTimer = () => setTimeout(() => {}, 60000).unref()
+    const descend = (depth) => (depth ? descend(depth - 1) : createOwnedTimer())
+    let retained
+    let pending
+    let diagnostics
+    let restoredLimit
+    try {
+      Error.stackTraceLimit = 2
+      ledger.start()
+      retained = descend(20)
+      restoredLimit = Error.stackTraceLimit
+      diagnostics = ledger.read()
+    } finally {
+      pending = ledger.stop()
+      clearTimeout(retained)
+      Error.stackTraceLimit = previousLimit
+    }
+
+    expect(restoredLimit).toBe(2)
+    expect(pending).toEqual([retained])
+    expect(diagnostics).toMatchObject({ retained: 1, omitted: 0, missingStacks: 0 })
+    expect(diagnostics.timers).toHaveLength(1)
+    expect(diagnostics.timers[0]).toMatchObject({
+      delayMs: 60000,
+      referenced: false,
+      destroyed: false,
+      source: 'repo',
+    })
+    const { stack } = diagnostics.timers[0]
+    expect(stack).toMatch(/createOwnedTimer.*src\/broker\/__tests__\/floorCoreLive\.spec\.js:\d+/)
+    expect(stack).not.toContain('node:internal')
+    expect(stack).not.toContain('node_modules')
+    expect(stack.split('\n').length).toBeLessThanOrEqual(8)
+    expect(stack.split('\n').every((frame) => frame.length <= 512)).toBe(true)
+    expect(ledger.read()).toEqual({ retained: 0, omitted: 0, missingStacks: 0, timers: [] })
+  })
+
+  test('a timer ledger bounds diagnostics without dropping owned timers and releases destroyed stacks', async () => {
+    const ledger = new TimerLedger({ capacity: 1 })
+    const timers = []
+    let overflow
+    let reused
+    let pending
+    try {
+      ledger.start()
+      timers.push(
+        setTimeout(() => {}, 60000),
+        setTimeout(() => {}, 60000)
+      )
+      overflow = ledger.read()
+      for (const timer of timers) clearTimeout(timer)
+      expect(ledger.read()).toMatchObject({ retained: 2, omitted: 1, missingStacks: 1 })
+      expect(ledger.read().timers[0].destroyed).toBe(true)
+      await new Promise((resolve) => setImmediate(resolve))
+      expect(ledger.read()).toEqual({ retained: 0, omitted: 0, missingStacks: 0, timers: [] })
+      timers.push(setTimeout(() => {}, 60000))
+      reused = ledger.read()
+    } finally {
+      pending = ledger.stop()
+      for (const timer of timers) clearTimeout(timer)
+    }
+
+    expect(overflow).toMatchObject({ retained: 2, omitted: 1, missingStacks: 1 })
+    expect(overflow.timers).toHaveLength(1)
+    expect(overflow.timers[0].source).toBe('repo')
+    expect(reused).toMatchObject({ retained: 1, omitted: 0, missingStacks: 0 })
+    expect(reused.timers[0].source).toBe('repo')
+    expect(pending).toEqual([timers[2]])
+  })
+
   test('credential markers cover the encodings a log or a buffer dump can show', () => {
     expect(markersOf('ab')).toEqual(['ab', '6162', 'YWI=', '61 62', '97,98'])
     expect(markersOf(Buffer.from([0xff]))).toContain('ff')

@@ -53,6 +53,7 @@ No file's presence proves a live run passed.
 | `describeFeatures` | apiTimeout, brokerId | cluster and features |
 | `updateFeatures` | apiTimeout, features, validateOnly | cluster and features |
 | `listConfigResources` | apiTimeout, resourceTypes | cluster and features |
+| `unregisterController` | apiTimeout, controllerId | cluster and features |
 | `describeCluster` | apiTimeout, includeAuthorizedOperations, includeFencedBrokers | cluster and features |
 | `setOffsets` | apiTimeout, groupId, partitions, topic | offsets |
 | `resetOffsets` | apiTimeout, earliest, groupId, topic | offsets |
@@ -104,7 +105,7 @@ live script below is a single owner even when it contains several cases or fixtu
 | offset specifications | src/protocol/requests/listOffsets/ | src/admin/__tests__/listOffsetsSpecs.spec.js | src/admin/__tests__/listOffsetsSpecs.spec.js | test:e2e:admin-tiered |
 | reassignment | src/protocol/requests/alterPartitionReassignments/; src/protocol/requests/listPartitionReassignments/ | src/admin/__tests__/alterPartitionReassignmentsV1.spec.js | src/admin/__tests__/alterPartitionReassignmentsV1.spec.js | test:e2e:admin-ledger |
 | transactions | src/protocol/requests/describeProducers/; src/protocol/requests/describeTransactions/; src/protocol/requests/listTransactions/; src/protocol/requests/writeTxnMarkers/; src/protocol/requests/initProducerId/ | src/admin/__tests__/transactionDiagnostics.spec.js | src/admin/__tests__/abortFence.spec.js | test:e2e:admin-ledger |
-| cluster and features | src/protocol/requests/describeCluster/; src/protocol/requests/electLeaders/; src/protocol/requests/apiVersions/; src/protocol/requests/updateFeatures/; src/protocol/requests/listConfigResources/ | src/admin/__tests__/features.spec.js | src/admin/__tests__/configResources.spec.js | test:e2e:admin-ledger |
+| cluster and features | src/protocol/requests/describeCluster/; src/protocol/requests/electLeaders/; src/protocol/requests/apiVersions/; src/protocol/requests/updateFeatures/; src/protocol/requests/listConfigResources/; src/protocol/requests/unregisterController/ | src/admin/__tests__/features.spec.js | src/admin/__tests__/configResources.spec.js | test:e2e:admin-ledger |
 | log directories | src/protocol/requests/describeLogDirs/; src/protocol/requests/alterReplicaLogDirs/ | src/admin/__tests__/logDirs.spec.js | src/admin/__tests__/logDirs.spec.js | test:e2e:admin-logdirs |
 | client quotas | src/protocol/requests/describeClientQuotas/; src/protocol/requests/alterClientQuotas/ | src/admin/__tests__/clientQuotas.spec.js | src/admin/__tests__/securityAdminFailures.spec.js | test:e2e:admin-quota |
 | SCRAM credentials | src/protocol/requests/describeUserScramCredentials/; src/protocol/requests/alterUserScramCredentials/ | src/admin/__tests__/scramCredentials.spec.js | src/admin/__tests__/securityAdminFailures.spec.js | test:e2e:admin-ledger |
@@ -114,7 +115,7 @@ live script below is a single owner even when it contains several cases or fixtu
 
 ## Java administration dispositions
 
-This inventory follows Apache Kafka 4.3.1 Admin, including deprecated aliases. Every method
+This inventory follows Apache Kafka 4.3.1 Admin, including deprecated aliases, plus the 4.4 unregisterController method. Every method
 also has the inherited AbstractOptions timeout unless the row states an excluded or deferred
 surface. Share administration is implemented; Streams administration
 and quorum/voter administration are excluded from this package. Client telemetry belongs to
@@ -185,6 +186,7 @@ the telemetry extension; JVM metric registration has no JavaScript equivalent.
 | removeRaftVoter | excluded | quorum and voter administration excluded | not implemented |
 | renewDelegationToken | implemented | renewDelegationToken | hmac; renewPeriodMs |
 | unregisterBroker | excluded | quorum and voter administration excluded | not implemented |
+| unregisterController | implemented | unregisterController | controllerId; apiTimeout; an evolving method that needs Kafka 4.4 |
 | unregisterMetricFromSubscription | telemetry | client telemetry or JVM-only metrics | not part of admin RPC parity |
 | updateFeatures | implemented | updateFeatures | validateOnly; upgradeType; features |
 | alterConfigs | retained compatibility | legacy alterConfigs | retained although removed from Java Admin; validateOnly and separate errorMessage |
@@ -192,9 +194,9 @@ the telemetry extension; JVM metric registration has no JavaScript equivalent.
 | default.api.timeout.ms | implemented | AdminConfig.apiTimeout | 60000 ms; integer 1 through 2147483647 |
 | retries | retained compatibility | retry | counted retry limits differ from Java INT_MAX; the API deadline still bounds the call |
 
-UnregisterController is a protocol inventory exclusion, not a member of the Java 4.3.1 Admin
-interface. No Java method is invented for it. Deprecated listConsumerGroups/listClientMetricsResources
-and describeClassicGroups/listGroups keep explicit equivalent rows above.
+UnregisterController (RPC 94) is a member of the Java 4.4 Admin interface and is implemented as
+`unregisterController`. Deprecated listConsumerGroups/listClientMetricsResources and
+describeClassicGroups/listGroups keep explicit equivalent rows above.
 
 The admin client hosts all the cluster operations, such as: `createTopics`, `createPartitions`, etc.
 
@@ -655,6 +657,14 @@ The result is an array of `{ feature, errorCode, error, errorMessage }`. Older p
 `admin.listConfigResources({ resourceTypes: [ConfigResourceTypes.CLIENT_METRICS] })` returns `{ resources: [{ type, name }] }`. `resourceTypes` is an optional array of unique known `ConfigResourceTypes`; omitted or empty selects the version's default supported resources. A nonempty filter requires v1 except exactly `[CLIENT_METRICS]`, which is the explicit v0 equivalent. A v0 broker lists client-metrics resources only. Other filters are refused rather than silently dropped. `apiTimeout` is supported.
 
 The existing `describeConfigs`, `alterConfigs` and `incrementalAlterConfigs` resource shapes and routing stay unchanged, including `CLIENT_METRICS` and `GROUP`. The equivalent of Java's deprecated `listClientMetricsResources` is `listConfigResources({ resourceTypes: [CLIENT_METRICS] })`. No separate deprecated method is added. Telemetry subscription/push operations are a different feature.
+
+## Unregister a controller
+
+`admin.unregisterController({ controllerId })` removes one controller registration from a Kafka cluster (KIP-1312) and resolves `undefined` on success. The method is evolving: Kafka marks the Java method unstable, so its shape can change. It requires Kafka 4.4 or newer.
+
+`controllerId` must be an integer from 0 through 2147483647. Any other value rejects with `KafkaJSInvalidConfigurationError` before the client looks up a broker or sends a request. The call goes to the first known broker, lowest node id first, that offers API key 94. A broker without it is skipped, and `KafkaJSServerDoesNotSupportApiKey` is thrown only after every known broker lacks it. A connection or authentication failure is thrown as it is and is never reported as unsupported.
+
+A broker refusal is thrown as the standard protocol error with its `code`, `type` and `retriable` flag. `brokerErrorMessage` is `null` when the broker sent no message and `''` when it sent an empty one; non-empty text is also appended to `message`. `CONTROLLER_ID_NOT_REGISTERED` (136) and `CLUSTER_AUTHORIZATION_FAILED` (31) do not retry; retriable codes retry under the client retry options. `apiTimeout` covers discovery, retries and the response, and a request that was sent may have been applied when it expires.
 
 ## <a name="describe-configs"></a> Describe configs
 

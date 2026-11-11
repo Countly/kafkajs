@@ -158,6 +158,7 @@ describe('recorded broker version regressions', () => {
     const decoded = await response.parse(await response.decode(raw))
     expect(decoded).toEqual({
       throttleTime: 0,
+      clientSideThrottleTime: 0,
       allowReplicationFactorChange: true,
       errorCode: 0,
       responses: [{ topic: 't', partitions: [{ partition: 0, errorCode: 0 }] }],

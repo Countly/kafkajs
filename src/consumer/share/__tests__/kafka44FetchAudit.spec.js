@@ -1,0 +1,494 @@
+const { ShareRun } = require('../shareRun')
+const { newLogger } = require('../../../../testHelpers')
+const {
+  A,
+  acquire,
+  acquired,
+  fetchAnswer,
+  flush,
+  frames,
+  harness,
+  part,
+  recordsHex,
+} = require('../../../../testHelpers/shareHarness')
+
+const SHARE_FETCH = 78
+/** @param {object} h The harness. @param {number} [node] Restricts the frames to one node. @returns {object[]} The ShareFetch frames written, oldest first. */
+const fetchFrames = (h, node) =>
+  frames(h.cluster, SHARE_FETCH).filter(({ node: id }) => node === undefined || id === node)
+
+/** @param {number|string} first First offset. @param {number|string} last Last offset. @param {number} type Wire acknowledge type. @returns {object} One acknowledgement batch. */
+const batchOf = (first, last, type) => ({
+  firstOffset: String(first),
+  lastOffset: String(last),
+  acknowledgeTypes: [type],
+})
+
+/** @param {object} frame One ShareFetch frame. @returns {object[]} Its acknowledgement batches, flattened over partitions. */
+const acknowledgementsOf = (frame) =>
+  frame.fields.topics.flatMap(({ partitions }) =>
+    partitions.flatMap(({ acknowledgementBatches }) => acknowledgementBatches)
+  )
+
+/**
+ * @param {Array<{row: object, results: object[]}>} outcomes What `onResults` saw.
+ * @returns {Map<string, Array<{row: object, type: string, error: unknown}>>} Every offset's
+ *   outcomes, with the acquisition each belongs to.
+ */
+const byOffset = (outcomes) => {
+  const seen = new Map()
+  for (const { row, results } of outcomes) {
+    for (const { firstOffset, lastOffset, type, error } of results) {
+      for (let offset = BigInt(firstOffset); offset <= BigInt(lastOffset); offset++) {
+        const key = String(offset)
+        seen.set(key, [...(seen.get(key) ?? []), { row, type, error }])
+      }
+    }
+  }
+  return seen
+}
+
+/**
+ * @param {object[]} results A node's compact outcomes.
+ * @returns {Map<string, Array<{type: string, reason: string|undefined}>>} Every offset's outcomes
+ *   with the failure reason, if any.
+ */
+const tally = (results) => {
+  const seen = new Map()
+  for (const { firstOffset, lastOffset, type, error } of results) {
+    for (let offset = BigInt(firstOffset); offset <= BigInt(lastOffset); offset++) {
+      const key = String(offset)
+      seen.set(key, [...(seen.get(key) ?? []), { type, reason: error?.reason }])
+    }
+  }
+  return seen
+}
+
+/**
+ * Builds a one-node harness whose loop reports every compact outcome with its acquisition and
+ * whose handler is the test's own `dispatch`, so an offset stays undecided until the test decides.
+ * @param {object} [options] Harness options.
+ * @returns {Promise<{h: object, m: object, outcomes: object[], rows: object[]}>} The harness, its
+ *   node, the outcomes seen and the acquisitions delivered, in order.
+ */
+const oneNode = async (options = {}) => {
+  const outcomes = []
+  const rows = []
+  const h = await harness({
+    ...options,
+    loop: { onResults: (results, row) => outcomes.push({ row, results }) },
+  })
+  return { h, m: h.members[0], outcomes, rows }
+}
+
+describe('Kafka 4.4 client fix audit', () => {
+  let h
+
+  afterEach(async () => {
+    if (h) await h.close()
+    h = null
+    jest.restoreAllMocks()
+  })
+
+  test('KAFKA-20780 share fetch remains outstanding while another node progresses', async () => {
+    h = await harness({ nodes: 2 })
+    const [n0, n1] = h.members
+    n0.want = [{ topicId: A, partition: 0 }]
+    n1.want = [{ topicId: A, partition: 1 }]
+    h.scriptNodes('ShareFetch', {
+      1: [
+        fetchAnswer([acquire(1, 300, ['b0', 'b1'])]),
+        fetchAnswer([part({ partition: 1 })]),
+        fetchAnswer([part({ partition: 1 })]),
+      ],
+    })
+    const held = h.hold({ api: 'ShareFetch', node: 0 })
+
+    const first0 = n0.loop.poll()
+    await held.arrived()
+    for (let round = 1; round <= 3; round++) {
+      await n1.loop.poll()
+      await flush()
+      expect(fetchFrames(h, 1)).toHaveLength(round)
+      expect(fetchFrames(h, 0)).toHaveLength(1)
+      expect(n0.loop.poll()).toBe(first0)
+    }
+
+    expect(n1.handled.map(({ value }) => value)).toEqual(['b0', 'b1'])
+    expect(n0.handled).toEqual([])
+
+    held.release(fetchAnswer([part({ partition: 0 })]))
+    await first0
+    await n0.loop.poll()
+    await flush()
+
+    expect(fetchFrames(h, 0)).toHaveLength(2)
+    expect(fetchFrames(h, 1)).toHaveLength(3)
+  })
+
+  test('KAFKA-21106 two acquisitions of one partition settle separately and leave nothing retained', async () => {
+    const node = await oneNode()
+    h = node.h
+    const { m, outcomes, rows } = node
+    const delivered = []
+    m.want = [{ topicId: A, partition: 0 }]
+    m.dispatch = async (cohorts) => {
+      for (const row of cohorts) {
+        rows.push(row)
+        for (const message of row.walk.deliver.records) delivered.push({ row, message })
+        if (rows.length === 1) row.ledger.complete(['10'], 'accept')
+      }
+    }
+    h.script('ShareFetch', [
+      fetchAnswer([acquire(0, 10, ['a', 'b'])]),
+      fetchAnswer([acquire(0, 20, ['c', 'd'])]),
+    ])
+
+    await m.loop.poll()
+    await m.loop.poll()
+    const [first, second] = rows
+    expect(rows).toHaveLength(2)
+    expect(first).not.toBe(second)
+    expect(first.token).not.toBe(second.token)
+    expect(first.ledger).not.toBe(second.ledger)
+    expect(acknowledgementsOf(fetchFrames(h)[1])).toEqual([batchOf(10, 10, 1)])
+    expect(delivered.map(({ message }) => message.offset)).toEqual(['10', '11', '20', '21'])
+    delivered.forEach(({ row, message }) => {
+      const own = row.walk.deliver.records.find(({ offset }) => offset === message.offset)
+      expect(message).toBe(own)
+    })
+
+    first.ledger.complete(['11'], 'accept')
+    second.ledger.complete(['20', '21'], 'accept')
+    await m.loop.poll()
+    expect(acknowledgementsOf(fetchFrames(h)[2])).toEqual([batchOf(11, 11, 1)])
+    await m.loop.poll()
+    expect(acknowledgementsOf(fetchFrames(h)[3])).toEqual([batchOf(20, 21, 1)])
+
+    const seen = byOffset(outcomes)
+    expect([...seen.keys()].sort()).toEqual(['10', '11', '20', '21'])
+    for (const [offset, row] of [
+      ['10', first],
+      ['11', first],
+      ['20', second],
+      ['21', second],
+    ]) {
+      expect(seen.get(offset)).toEqual([{ row, type: 'accept', error: null }])
+    }
+    expect(m.loop.cohorts.size).toBe(0)
+    expect(m.loop.exchanges.size).toBe(0)
+
+    m.want = []
+    await m.loop.poll()
+    const last = fetchFrames(h)[4].fields
+    expect(last.forgottenTopicsData).toEqual([{ topicId: A, partitions: [0] }])
+    expect(last.topics).toEqual([])
+    expect(m.loop.cohorts.size).toBe(0)
+    expect(m.loop.exchanges.size).toBe(0)
+  })
+
+  test('KAFKA-21106 two acquisition ranges of one partition in one answer are acknowledged per range and released', async () => {
+    const node = await oneNode()
+    h = node.h
+    const { m, outcomes, rows } = node
+    const values = Array.from({ length: 16 }, (_, offset) => `v${offset}`)
+    m.want = [{ topicId: A, partition: 0 }]
+    m.dispatch = async (cohorts) => {
+      for (const row of cohorts) {
+        rows.push(row)
+        row.ledger.complete(['0', '1', '2'], 'accept')
+        row.ledger.complete(['13', '14', '15'], 'release')
+      }
+    }
+    h.script('ShareFetch', [
+      fetchAnswer([
+        part({
+          partition: 0,
+          acquire: [acquired(0, 2, 1), acquired(13, 15, 2)],
+          records: recordsHex(0, values),
+        }),
+      ]),
+    ])
+
+    await m.loop.poll()
+    expect(rows).toHaveLength(1)
+    const [row] = rows
+    expect(row.walk.deliver.records.map(({ offset }) => offset)).toEqual([
+      '0',
+      '1',
+      '2',
+      '13',
+      '14',
+      '15',
+    ])
+    expect(Array.from(row.walk.deliver.deliveryCounts)).toEqual([1, 1, 1, 2, 2, 2])
+    expect(row.walk.gaps).toEqual([])
+
+    await m.loop.poll()
+    expect(acknowledgementsOf(fetchFrames(h)[1])).toEqual([batchOf(0, 2, 1), batchOf(13, 15, 2)])
+    const seen = byOffset(outcomes)
+    expect([...seen.keys()]).toEqual(['0', '1', '2', '13', '14', '15'])
+    for (const [offset, entries] of seen) {
+      expect(entries).toEqual([
+        { row, type: Number(offset) < 3 ? 'accept' : 'release', error: null },
+      ])
+    }
+    expect(m.loop.cohorts.size).toBe(0)
+    expect(m.loop.exchanges.size).toBe(0)
+  })
+
+  test('gap-only acquisitions send acknowledgements without delivering records', async () => {
+    const node = await oneNode()
+    h = node.h
+    const { m, outcomes, rows } = node
+    const delivered = []
+    m.want = [{ topicId: A, partition: 0 }]
+    m.dispatch = async (cohorts) => {
+      for (const row of cohorts) {
+        rows.push(row)
+        delivered.push(...row.walk.deliver.records)
+      }
+    }
+    h.script('ShareFetch', [
+      fetchAnswer([part({ partition: 0, acquire: [acquired(5, 7)], records: '' })]),
+    ])
+
+    await m.loop.poll()
+    expect(rows).toHaveLength(1)
+    expect(rows[0].walk.deliver.records).toEqual([])
+    expect(delivered).toEqual([])
+    expect(m.loop.cohorts.size).toBe(1)
+
+    await m.loop.poll()
+    expect(acknowledgementsOf(fetchFrames(h)[1])).toEqual([batchOf(5, 7, 0)])
+    const seen = byOffset(outcomes)
+    expect([...seen.keys()]).toEqual(['5', '6', '7'])
+    for (const entries of seen.values())
+      expect(entries).toEqual([{ row: rows[0], type: 'gap', error: null }])
+    expect(delivered).toEqual([])
+    expect(m.loop.cohorts.size).toBe(0)
+    expect(m.loop.exchanges.size).toBe(0)
+  })
+
+  test('KAFKA-21106 a late old-leader acquisition of a moved partition is released without a handler call while the node keeps another partition', async () => {
+    for (const batch of [false, true]) {
+      h = await harness({ nodes: 3 })
+      const outcomes = []
+      const delivered = []
+      let moved = false
+      const runner = {
+        subscription: ['topic-a'],
+        options: {
+          groupId: 'group',
+          acknowledgementMode: 'implicit',
+          maxPollInterval: 30000,
+          minBytes: 1,
+          maxBytes: 1048576,
+          maxRecords: 100,
+          acquireMode: 'record_limit',
+          logger: newLogger(),
+          cluster: {
+            ...h.metadata,
+            onRoutingChange: () => () => {},
+            cachedLeader: (_, partition) => (moved && partition === 0 ? 2 : 0),
+          },
+        },
+        emit: jest.fn(),
+        publishResults: (row, results) => outcomes.push({ row, results }),
+      }
+      const run = new ShareRun({
+        runner,
+        batch,
+        handler: async (payload) => {
+          const partition = batch ? payload.batch.partition : payload.partition
+          const messages = batch ? payload.batch.messages : [payload.message]
+          delivered.push(
+            ...messages.map(({ offset, value }) => ({ partition, offset, value: value.toString() }))
+          )
+        },
+      })
+      runner.current = run
+      // The test drives rounds explicitly; routing, sessions, transport and dispatch stay real.
+      jest.spyOn(run, 'driveNode').mockImplementation(async (node) => {
+        node.session = h.members[node.id].session
+        node.loop = run.createLoop(node, h.members[node.id].broker)
+      })
+      const adopted = []
+      const loopClass = require('../shareFetchLoop').ShareFetchLoop
+      const adoptOriginal = loopClass.prototype.adopt
+      const capture = jest.spyOn(loopClass.prototype, 'adopt').mockImplementation(function (
+        ...args
+      ) {
+        const row = adoptOriginal.apply(this, args)
+        if (row) adopted.push(row)
+        return row
+      })
+      let late
+      let gate
+      try {
+        run.assignment.set(A, { topic: 'topic-a', partitions: [0, 1] })
+        run.syncNodes()
+        const old = run.nodes.get(0)
+        h.scriptNodes('ShareFetch', {
+          0: [fetchAnswer([acquire(0, 10, ['retired', 'retired-next'])])],
+          2: [fetchAnswer([acquire(0, 10, ['replacement', 'replacement-next'])])],
+        })
+        await run.pollNode(old)
+        const retired = adopted[0]
+        gate = h.hold({ api: 'ShareFetch', node: 0 })
+        late = run.pollNode(old)
+        await gate.arrived()
+        moved = true
+        run.syncNodes()
+        expect(run.nodes.get(0)).toBe(old)
+        expect(old.keys).toEqual(new Set([`${A}:1`]))
+        const replacement = run.nodes.get(2)
+        await run.pollNode(replacement)
+        await run.pollNode(replacement)
+        expect(delivered.slice(-2)).toEqual([
+          { partition: 0, offset: '10', value: 'replacement' },
+          { partition: 0, offset: '11', value: 'replacement-next' },
+        ])
+        const afterRetirement = outcomes.filter(({ row }) => row === retired)
+        expect(afterRetirement).toHaveLength(1)
+        expect(
+          afterRetirement[0].results.every(({ error }) => error?.reason === 'session-lost')
+        ).toBe(true)
+
+        delivered.length = 0
+        gate.release(fetchAnswer([acquire(0, 10, ['late', 'late-next']), acquire(1, 30, ['kept'])]))
+        await late
+        expect(delivered).toEqual([{ partition: 1, offset: '30', value: 'kept' }])
+        await run.pollNode(old)
+        const release = fetchFrames(h, 0)[2].fields
+        expect(release.forgottenTopicsData).toEqual([{ topicId: A, partitions: [0] }])
+        expect(release.topics).toEqual([
+          {
+            topicId: A,
+            partitions: [
+              { partitionIndex: 0, acknowledgementBatches: [batchOf(10, 11, 2)] },
+              { partitionIndex: 1, acknowledgementBatches: [batchOf(30, 30, 1)] },
+            ],
+          },
+        ])
+        await run.pollNode(old)
+        await run.pollNode(replacement)
+        const lateRow = adopted.find(
+          (row) => row.walk.deliver.records[0]?.value.toString() === 'late'
+        )
+        const replacementRow = adopted.find(
+          (row) => row.walk.deliver.records[0]?.value.toString() === 'replacement'
+        )
+        const keptRow = adopted.find((row) => row.partition === 1)
+        expect(byOffset(outcomes.filter(({ row }) => row === keptRow))).toEqual(
+          new Map([['30', [{ row: keptRow, type: 'accept', error: null }]]])
+        )
+        expect(outcomes).toHaveLength(4)
+        expect(lateRow.token).not.toBe(replacementRow.token)
+        expect(lateRow.ledger).not.toBe(replacementRow.ledger)
+        for (const [row, type] of [
+          [lateRow, 'release'],
+          [replacementRow, 'accept'],
+        ]) {
+          expect(byOffset(outcomes.filter((entry) => entry.row === row))).toEqual(
+            new Map([
+              ['10', [{ row, type, error: null }]],
+              ['11', [{ row, type, error: null }]],
+            ])
+          )
+        }
+        expect(outcomes.filter(({ row }) => row === retired)).toEqual(afterRetirement)
+        expect(fetchFrames(h, 0).slice(3).flatMap(acknowledgementsOf)).toEqual([])
+        for (const node of run.nodes.values()) {
+          expect(node.loop.cohorts.size).toBe(0)
+          expect(node.loop.exchanges.size).toBe(0)
+          expect(node.session.busy).toBe(false)
+          expect(node.queue).toBe(null)
+          expect(node.active).toBe(null)
+        }
+        for (const row of adopted) expect(row.ledger.size).toBe(0)
+        expect(run.poll.calls.size).toBe(0)
+      } finally {
+        if (gate?.settle) gate.release()
+        if (late) await late
+        capture.mockRestore()
+        for (const node of run.nodes.values()) node.loop.dispose()
+        run.manager.shutdown()
+        run.poll.stop()
+        run.unrouted()
+        await h.close()
+        h = null
+      }
+    }
+  })
+
+  test('KAFKA-21106 a late old-leader response cannot restore retired ownership', async () => {
+    h = await harness({ nodes: 3 })
+    const [old, , replacement] = h.members
+    const key = `${A}:0`
+    const delivered = { old: [], replacement: [] }
+    old.want = [{ topicId: A, partition: 0 }]
+    old.dispatch = async (cohorts) => {
+      for (const row of cohorts) {
+        delivered.old.push(...row.walk.deliver.records.map(({ offset }) => offset))
+        if (delivered.old.length === 2) row.ledger.complete(['10'], 'accept')
+      }
+    }
+    replacement.dispatch = async (cohorts) => {
+      for (const row of cohorts) {
+        delivered.replacement.push(...row.walk.deliver.records.map(({ offset }) => offset))
+        row.ledger.complete(
+          row.walk.deliver.records.map(({ offset }) => offset),
+          'accept'
+        )
+      }
+    }
+    h.scriptNodes('ShareFetch', {
+      0: [fetchAnswer([acquire(0, 10, ['a', 'b'])])],
+      2: [fetchAnswer([acquire(0, 30, ['new', 'newer'])])],
+    })
+    await old.loop.poll()
+    expect(delivered.old).toEqual(['10', '11'])
+
+    const gate = h.hold({ api: 'ShareFetch', node: 0 })
+    const late = old.loop.poll()
+    await gate.arrived()
+    // What the run does when routing moves the partition: stop wanting it, retire it, end the node.
+    old.want = []
+    old.loop.retireKey(key, 'session-lost')
+    const finishing = old.loop.finishNode()
+    replacement.want = [{ topicId: A, partition: 0 }]
+    await replacement.loop.poll()
+    await replacement.loop.poll()
+    expect(delivered.replacement).toEqual(['30', '31'])
+
+    gate.release(fetchAnswer([acquire(0, 12, ['late'])]))
+    await late.catch(() => {})
+    await finishing
+    await flush()
+
+    expect(delivered).toEqual({ old: ['10', '11'], replacement: ['30', '31'] })
+    expect(tally(old.results)).toEqual(
+      new Map([
+        ['10', [{ type: 'accept', reason: 'session-lost' }]],
+        ['11', [{ type: 'release', reason: 'session-lost' }]],
+        ['12', [{ type: 'release', reason: undefined }]],
+      ])
+    )
+    expect(tally(replacement.results)).toEqual(
+      new Map([
+        ['30', [{ type: 'accept', reason: undefined }]],
+        ['31', [{ type: 'accept', reason: undefined }]],
+      ])
+    )
+    expect(fetchFrames(h, 2).map(acknowledgementsOf)).toEqual([[], [batchOf(30, 31, 1)]])
+    const releases = frames(h.cluster, 79)
+    expect(releases).toHaveLength(1)
+    expect(releases[0]).toMatchObject({ node: 0, fields: { shareSessionEpoch: -1 } })
+    expect(acknowledgementsOf(releases[0])).toEqual([batchOf(12, 12, 2)])
+    for (const loop of [old.loop, replacement.loop]) {
+      expect(loop.cohorts.size).toBe(0)
+      expect(loop.exchanges.size).toBe(0)
+    }
+  })
+})

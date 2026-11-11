@@ -130,6 +130,7 @@ class AdminLifecycle {
     }
     if (this.closing) return this.closing
     if (this.closed) return Promise.resolve()
+    this.cluster.cancelPendingBootstrapResolution?.()
     const generation = this.generation
     const due = timeout === undefined ? Infinity : startedAt + timeout
     // Runs concurrently with the core close and never shortens or extends its budget.

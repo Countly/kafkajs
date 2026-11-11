@@ -620,11 +620,13 @@ describe('E2E tooling', () => {
         }
       )
 
-      test('holds the floor image and the three lines the suite runs on', () => {
+      test('holds the floor image, the three lines the suite runs on and the 4.3.2 and 4.4.0 captures', () => {
         const versions = Object.keys(table())
 
-        expect(versions).toHaveLength(4)
-        expect(versions).toEqual(expect.arrayContaining(['4.1.2', '4.2.2', '4.3.1']))
+        expect(versions).toHaveLength(6)
+        expect(versions).toEqual(
+          expect.arrayContaining(['4.1.2', '4.2.2', '4.3.1', '4.3.2', '4.4.0'])
+        )
         expect(versions.filter((version) => /^4\.0\.\d+$/.test(version))).toHaveLength(1)
       })
     })
@@ -1618,7 +1620,7 @@ describe('Java telemetry role runner', () => {
     const fixture = path.join(root, 'scripts/e2e/telemetry')
     const digest = (file) => createHash('sha256').update(fs.readFileSync(file)).digest('hex')
     expect(digest(path.join(fixture, 'JavaTelemetryClient.java'))).toBe(
-      '1145746dfeadc7d315e42b1c9d3b3468d819929324cc7701cbddbb423f66b580'
+      '8c9254fd4e929ce95dd6b8d8cfbca8513f8ce8fe37d19d596421e4fa3e7736c3'
     )
     expect(digest(path.join(fixture, 'telemetryWireProbe.js'))).toBe(
       '139afdbec5034f7c1498b90306889fd918ae13097efee1ea9f435b03dcf9b1b1'

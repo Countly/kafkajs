@@ -102,6 +102,7 @@ const COUNTS = {
   shareGroupHeartbeat: 5,
   syncGroup: 8,
   txnOffsetCommit: 16,
+  unregisterController: 1,
   writeTxnMarkers: 5,
   updateFeatures: 3,
 }

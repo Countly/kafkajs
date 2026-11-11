@@ -215,10 +215,10 @@ class AdminLiveProbe {
   /**
    * Creates a uniquely named topic, registering removal before the mutation. Removal reconnects the
    * creating admin first, because a scenario may have closed it, and runs before that admin's own
-   * disconnect.
+   * disconnect. Waits for the created topic to reach the answering broker within the work deadline.
    * @param {object} [options] name suffix and public createTopics settings
    * @returns {Promise<string>} actual topic name
-   * @throws {Error} broker failure or incomplete metadata identity
+   * @throws {Error} broker failure other than pending creation, or incomplete metadata identity
    */
   async topic({
     name = 'data',
@@ -248,7 +248,16 @@ class AdminLiveProbe {
         ],
       })
     )
-    const metadata = await this.invoke(() => admin.fetchTopicMetadata({ topics: [topic] }))
+    let metadata
+    await this.poll(async () => {
+      try {
+        metadata = await this.invoke(() => admin.fetchTopicMetadata({ topics: [topic] }))
+        return true
+      } catch (error) {
+        if (error.type === 'UNKNOWN_TOPIC_OR_PARTITION') return false
+        throw error
+      }
+    })
     const row = metadata.topics.find((entry) => entry.name === topic)
     if (!row?.topicId) throw new Error('Created topic has no canonical identity')
     this.topics.push(row)

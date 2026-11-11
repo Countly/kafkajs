@@ -416,3 +416,17 @@ describe('released share source domains', () => {
     }
   )
 })
+
+describe('Recorded broker captures', () => {
+  test('Recorded broker capture coverage includes Kafka 4.4.0 and 4.3.2', () => {
+    const ranges = require('../../../scripts/protocol/brokerRanges.json')
+    const features = require('../../../scripts/protocol/brokerFeatures.json')
+    const { readBrokerCapture } = require('../../../testHelpers/brokerCapture')
+
+    for (const line of ['4.4.0', '4.3.2']) {
+      expect(Object.keys(ranges)).toContain(line)
+      expect(Object.keys(features)).toContain(line)
+      expect(readBrokerCapture(line).provenance.brokerVersion).toBe(line)
+    }
+  })
+})

@@ -13,6 +13,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   lint:
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -23,6 +24,7 @@ jobs:
       - run: npm run compat:check
       - run: npm run test:types
   unit:
+    timeout-minutes: 60
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -47,6 +49,7 @@ jobs:
       - run: npm ci
       - run: npm run test:unit:soak -- --ci --shard=${{ matrix.shard }}/3
   pack:
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -55,6 +58,7 @@ jobs:
       - run: npm ci
       - run: npm run test:pack
   otel:
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -63,6 +67,7 @@ jobs:
       - run: npm ci
       - run: npm run test:otel
   integration-plan:
+    timeout-minutes: 5
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}

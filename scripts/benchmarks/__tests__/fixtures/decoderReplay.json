@@ -1,0 +1,1217 @@
+{
+  "derivation": "Sources contain seven observations, not thirty independent blocks. Specs explicitly use constant median projections for threshold examples; these are synthetic fixtures, never acceptance evidence. The Exit frame example repeats the observed samples without inventing absent controls.",
+  "sources": [
+    {
+      "run": "42993101409",
+      "source": "https://github.com/Countly/kafkajs/actions/runs/42993101409",
+      "baselineSha": "fecc6d97bb7ed29f6db0bc3697772c1805cc594e",
+      "candidateSha": "596c961d8801e227020a01f9000fdaa6373394f8",
+      "arm": {
+        "name": "array-decode:record-headers",
+        "oldNsPerOp": [
+          1991855.55,
+          1941683.3166666667,
+          1935712.9666666666,
+          2009558.8666666667,
+          2268890.25,
+          2041417.25,
+          1929951.8833333333
+        ],
+        "newNsPerOp": [
+          1915696.0333333334,
+          1907835.7333333334,
+          1867971.85,
+          1921452.3833333333,
+          1929663.9166666667,
+          1910848.4166666667,
+          1891438.35
+        ],
+        "baselineControlNsPerOp": [
+          2021852.0166666666,
+          1909471.6833333333,
+          1994387.9833333334,
+          1924828.15,
+          1949717.95,
+          1888749.3166666667,
+          2001577.4166666667
+        ],
+        "invocations": [
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1991855.55,
+            "roundNsPerOp": [
+              2254646.2,
+              2023135.4333333333,
+              1991855.55,
+              1974393.8833333333,
+              1939409.4333333333
+            ],
+            "opsPerSecond": 502.0444379111728,
+            "elements": 4000,
+            "pair": 0,
+            "side": "old"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 2021852.0166666666,
+            "roundNsPerOp": [
+              2288070.8,
+              2021852.0166666666,
+              1968147.3333333333,
+              2037344.5833333333,
+              2020186.35
+            ],
+            "opsPerSecond": 494.59603955024045,
+            "elements": 4000,
+            "pair": 0,
+            "side": "baselineControl"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1915696.0333333334,
+            "roundNsPerOp": [
+              2100801.716666667,
+              1925021.5333333334,
+              1915696.0333333334,
+              1849390.9666666666,
+              1884521.4666666666
+            ],
+            "opsPerSecond": 522.0034820764275,
+            "elements": 4000,
+            "pair": 0,
+            "side": "new"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1907835.7333333334,
+            "roundNsPerOp": [
+              2129340.683333333,
+              1908348,
+              1887898.6833333333,
+              1907835.7333333334,
+              1885411.95
+            ],
+            "opsPerSecond": 524.1541410133982,
+            "elements": 4000,
+            "pair": 1,
+            "side": "new"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1909471.6833333333,
+            "roundNsPerOp": [
+              2224886.1,
+              1873669.85,
+              1909471.6833333333,
+              1964413.7333333334,
+              1906705.2
+            ],
+            "opsPerSecond": 523.7050691709219,
+            "elements": 4000,
+            "pair": 1,
+            "side": "baselineControl"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1941683.3166666667,
+            "roundNsPerOp": [
+              2151337.6666666665,
+              1979226.7833333334,
+              1935399.05,
+              1941683.3166666667,
+              1919455.8333333333
+            ],
+            "opsPerSecond": 515.0170429010656,
+            "elements": 4000,
+            "pair": 1,
+            "side": "old"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1935712.9666666666,
+            "roundNsPerOp": [
+              2193263.05,
+              1935712.9666666666,
+              1935978.8666666667,
+              1913448.1666666667,
+              1920659.85
+            ],
+            "opsPerSecond": 516.605518080513,
+            "elements": 4000,
+            "pair": 2,
+            "side": "old"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1994387.9833333334,
+            "roundNsPerOp": [
+              2245398.75,
+              1966607.0833333333,
+              2013776.3833333333,
+              1991236.2833333334,
+              1994387.9833333334
+            ],
+            "opsPerSecond": 501.4069520859444,
+            "elements": 4000,
+            "pair": 2,
+            "side": "baselineControl"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1867971.85,
+            "roundNsPerOp": [
+              2216872.433333333,
+              1951231.7,
+              1831624.45,
+              1867971.85,
+              1845882.0666666667
+            ],
+            "opsPerSecond": 535.3399731371754,
+            "elements": 4000,
+            "pair": 2,
+            "side": "new"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1921452.3833333333,
+            "roundNsPerOp": [
+              2207687.816666667,
+              1908291.3833333333,
+              1872740.6333333333,
+              1951687.6333333333,
+              1921452.3833333333
+            ],
+            "opsPerSecond": 520.4396469431115,
+            "elements": 4000,
+            "pair": 3,
+            "side": "new"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1924828.15,
+            "roundNsPerOp": [
+              2180324.4,
+              1924828.15,
+              1887403.5666666667,
+              1934110.3166666667,
+              1917212
+            ],
+            "opsPerSecond": 519.5268990636905,
+            "elements": 4000,
+            "pair": 3,
+            "side": "baselineControl"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 2009558.8666666667,
+            "roundNsPerOp": [
+              2309827.1,
+              2009558.8666666667,
+              1991818.6333333333,
+              2031230.0166666666,
+              1995326.4
+            ],
+            "opsPerSecond": 497.62165049622996,
+            "elements": 4000,
+            "pair": 3,
+            "side": "old"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 2268890.25,
+            "roundNsPerOp": [
+              2301107.8333333335,
+              2065703.1166666667,
+              2374288.15,
+              2268890.25,
+              1983035.5333333334
+            ],
+            "opsPerSecond": 440.74410386311104,
+            "elements": 4000,
+            "pair": 4,
+            "side": "old"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1949717.95,
+            "roundNsPerOp": [
+              2195303.683333333,
+              1949717.95,
+              1883740.45,
+              1961746.4333333333,
+              1921894.7333333334
+            ],
+            "opsPerSecond": 512.8946984357405,
+            "elements": 4000,
+            "pair": 4,
+            "side": "baselineControl"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1929663.9166666667,
+            "roundNsPerOp": [
+              2201418.85,
+              1929663.9166666667,
+              1927608.65,
+              1963597.0666666667,
+              1927922.4833333334
+            ],
+            "opsPerSecond": 518.2249568761262,
+            "elements": 4000,
+            "pair": 4,
+            "side": "new"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1910848.4166666667,
+            "roundNsPerOp": [
+              2173698.3,
+              1909326.0833333333,
+              1905110.5,
+              1911699.3666666667,
+              1910848.4166666667
+            ],
+            "opsPerSecond": 523.3277486994106,
+            "elements": 4000,
+            "pair": 5,
+            "side": "new"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1888749.3166666667,
+            "roundNsPerOp": [
+              2130450.0833333335,
+              1904744.9833333334,
+              1888749.3166666667,
+              1836986.4666666666,
+              1867623.6833333333
+            ],
+            "opsPerSecond": 529.4508864547659,
+            "elements": 4000,
+            "pair": 5,
+            "side": "baselineControl"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 2041417.25,
+            "roundNsPerOp": [
+              2242535.8,
+              2041417.25,
+              2020748.1333333333,
+              2036660.2166666666,
+              2051231.95
+            ],
+            "opsPerSecond": 489.8557607466088,
+            "elements": 4000,
+            "pair": 5,
+            "side": "old"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1929951.8833333333,
+            "roundNsPerOp": [
+              2278898.35,
+              1971528.9166666667,
+              1889864.7666666666,
+              1929951.8833333333,
+              1880970.45
+            ],
+            "opsPerSecond": 518.1476329206929,
+            "elements": 4000,
+            "pair": 6,
+            "side": "old"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 2001577.4166666667,
+            "roundNsPerOp": [
+              2234129.6333333333,
+              1982766.7166666666,
+              1985371.3333333333,
+              2007362.1833333333,
+              2001577.4166666667
+            ],
+            "opsPerSecond": 499.6059566186319,
+            "elements": 4000,
+            "pair": 6,
+            "side": "baselineControl"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1891438.35,
+            "roundNsPerOp": [
+              2131698.8,
+              1874061.1666666667,
+              1891438.35,
+              1907420.9333333333,
+              1865749.3833333333
+            ],
+            "opsPerSecond": 528.6981730068019,
+            "elements": 4000,
+            "pair": 6,
+            "side": "new"
+          }
+        ]
+      }
+    },
+    {
+      "run": "42990129857",
+      "source": "https://github.com/Countly/kafkajs/actions/runs/42990129857",
+      "baselineSha": "fecc6d97bb7ed29f6db0bc3697772c1805cc594e",
+      "candidateSha": "eef60577c01264482e4befd564b5a12c22f6f9f6",
+      "arm": {
+        "name": "array-decode:record-headers",
+        "oldNsPerOp": [
+          1990485.4,
+          1906852.8666666667,
+          2018194.4833333334,
+          1973889.2,
+          1926298.1666666667,
+          1878007.3666666667,
+          2040664.9333333333
+        ],
+        "newNsPerOp": [
+          2103975.2333333334,
+          2116227.716666667,
+          2072374.8166666667,
+          2060203.0333333334,
+          2076714.25,
+          2151299.466666667,
+          2171704
+        ],
+        "baselineControlNsPerOp": [
+          2062950.2,
+          1954142.3666666667,
+          1915361.4166666667,
+          1969021.3166666667,
+          2005523.0333333334,
+          1963563.9166666667,
+          1958583.1833333333
+        ],
+        "invocations": [
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1990485.4,
+            "roundNsPerOp": [
+              2243064.75,
+              1981619.9333333333,
+              1990485.4,
+              2002794.7833333334,
+              1957397.5833333333
+            ],
+            "opsPerSecond": 502.3900200423475,
+            "elements": 4000,
+            "pair": 0,
+            "side": "old"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 2062950.2,
+            "roundNsPerOp": [
+              2214990.716666667,
+              2062950.2,
+              2485679.8833333333,
+              1961586.3833333333,
+              1958539.1333333333
+            ],
+            "opsPerSecond": 484.7426758047771,
+            "elements": 4000,
+            "pair": 0,
+            "side": "baselineControl"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 2103975.2333333334,
+            "roundNsPerOp": [
+              2304646.55,
+              2107992.85,
+              2101126.2,
+              2091533.0833333333,
+              2103975.2333333334
+            ],
+            "opsPerSecond": 475.2907658593003,
+            "elements": 4000,
+            "pair": 0,
+            "side": "new"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 2116227.716666667,
+            "roundNsPerOp": [
+              2353587.9,
+              2116227.716666667,
+              2110792.15,
+              2108201.2333333334,
+              2120137.183333333
+            ],
+            "opsPerSecond": 472.53893903966525,
+            "elements": 4000,
+            "pair": 1,
+            "side": "new"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1954142.3666666667,
+            "roundNsPerOp": [
+              2293501.8666666667,
+              1954142.3666666667,
+              1951949.5666666667,
+              1946536.7166666666,
+              1981519.2166666666
+            ],
+            "opsPerSecond": 511.733442280246,
+            "elements": 4000,
+            "pair": 1,
+            "side": "baselineControl"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1906852.8666666667,
+            "roundNsPerOp": [
+              2174216.7,
+              1906852.8666666667,
+              1902393.3333333333,
+              1912083.4666666666,
+              1864499.6166666667
+            ],
+            "opsPerSecond": 524.4243105909272,
+            "elements": 4000,
+            "pair": 1,
+            "side": "old"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 2018194.4833333334,
+            "roundNsPerOp": [
+              2227516.7666666666,
+              2017645.3166666667,
+              2001950.1833333333,
+              2029325.1166666667,
+              2018194.4833333334
+            ],
+            "opsPerSecond": 495.4923860203793,
+            "elements": 4000,
+            "pair": 2,
+            "side": "old"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1915361.4166666667,
+            "roundNsPerOp": [
+              2146769.7,
+              1905570.8833333333,
+              1920680.25,
+              1915361.4166666667,
+              1835799.6333333333
+            ],
+            "opsPerSecond": 522.0946769097582,
+            "elements": 4000,
+            "pair": 2,
+            "side": "baselineControl"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 2072374.8166666667,
+            "roundNsPerOp": [
+              2300602.3666666667,
+              2038116.6333333333,
+              2072374.8166666667,
+              2087031.2333333334,
+              2057974.1833333333
+            ],
+            "opsPerSecond": 482.53819336043694,
+            "elements": 4000,
+            "pair": 2,
+            "side": "new"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 2060203.0333333334,
+            "roundNsPerOp": [
+              2306347.183333333,
+              2069336.1,
+              2027551.0166666666,
+              2060203.0333333334,
+              2044841.9
+            ],
+            "opsPerSecond": 485.38905332162165,
+            "elements": 4000,
+            "pair": 3,
+            "side": "new"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1969021.3166666667,
+            "roundNsPerOp": [
+              2210919.9833333334,
+              1969021.3166666667,
+              1968935.4333333333,
+              1962840.2166666666,
+              1977786.9833333334
+            ],
+            "opsPerSecond": 507.8665180186512,
+            "elements": 4000,
+            "pair": 3,
+            "side": "baselineControl"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1973889.2,
+            "roundNsPerOp": [
+              2251927.566666667,
+              1976837.9,
+              1973889.2,
+              1944857.4666666666,
+              1922387.15
+            ],
+            "opsPerSecond": 506.6140490560463,
+            "elements": 4000,
+            "pair": 3,
+            "side": "old"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1926298.1666666667,
+            "roundNsPerOp": [
+              2188747.966666667,
+              1946586.8833333333,
+              1883021.6166666667,
+              1926298.1666666667,
+              1855828.8
+            ],
+            "opsPerSecond": 519.130432299811,
+            "elements": 4000,
+            "pair": 4,
+            "side": "old"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 2005523.0333333334,
+            "roundNsPerOp": [
+              2224779.8,
+              2005523.0333333334,
+              2015231.5333333334,
+              1985582.1,
+              1989239.6
+            ],
+            "opsPerSecond": 498.62304415318687,
+            "elements": 4000,
+            "pair": 4,
+            "side": "baselineControl"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 2076714.25,
+            "roundNsPerOp": [
+              2323018.6333333333,
+              2057620.75,
+              2076714.25,
+              2089215.6,
+              2053203.4666666666
+            ],
+            "opsPerSecond": 481.529897529234,
+            "elements": 4000,
+            "pair": 4,
+            "side": "new"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 2151299.466666667,
+            "roundNsPerOp": [
+              2513577.533333333,
+              2151299.466666667,
+              2109892.3833333333,
+              2101837.6,
+              2158099.2666666666
+            ],
+            "opsPerSecond": 464.8353311542679,
+            "elements": 4000,
+            "pair": 5,
+            "side": "new"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1963563.9166666667,
+            "roundNsPerOp": [
+              2249735.1166666667,
+              1930339.2833333334,
+              1962591.0333333334,
+              1963563.9166666667,
+              1967507.5833333333
+            ],
+            "opsPerSecond": 509.2780487113419,
+            "elements": 4000,
+            "pair": 5,
+            "side": "baselineControl"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1878007.3666666667,
+            "roundNsPerOp": [
+              2172571.4166666665,
+              1910142.4333333333,
+              1869753.05,
+              1878007.3666666667,
+              1866222.8333333333
+            ],
+            "opsPerSecond": 532.4792744423207,
+            "elements": 4000,
+            "pair": 5,
+            "side": "old"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 2040664.9333333333,
+            "roundNsPerOp": [
+              2265135.1166666667,
+              2086923.8833333333,
+              2016405.25,
+              1998889.45,
+              2040664.9333333333
+            ],
+            "opsPerSecond": 490.03635220337003,
+            "elements": 4000,
+            "pair": 6,
+            "side": "old"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1958583.1833333333,
+            "roundNsPerOp": [
+              2214935.0833333335,
+              1948326.95,
+              1924988.6,
+              1958583.1833333333,
+              1974143.9666666666
+            ],
+            "opsPerSecond": 510.5731574280595,
+            "elements": 4000,
+            "pair": 6,
+            "side": "baselineControl"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 2171704,
+            "roundNsPerOp": [
+              2429608.1166666667,
+              2115697.5833333335,
+              2171704,
+              2173466.65,
+              2055652.7666666666
+            ],
+            "opsPerSecond": 460.4679090704811,
+            "elements": 4000,
+            "pair": 6,
+            "side": "new"
+          }
+        ]
+      }
+    },
+    {
+      "run": "42991335664",
+      "source": "https://github.com/Countly/kafkajs/actions/runs/42991335664",
+      "baselineSha": "fecc6d97bb7ed29f6db0bc3697772c1805cc594e",
+      "candidateSha": "e2bb2e655894fbf5c8baf1419f5d67d2c557b97b",
+      "arm": {
+        "name": "array-decode:record-headers",
+        "oldNsPerOp": [
+          1386063.5166666666,
+          1325404.9333333333,
+          1355010.5333333334,
+          1322134.35,
+          1255550.9333333333,
+          1281827.5333333334,
+          1308468.8333333333
+        ],
+        "newNsPerOp": [
+          1527716.95,
+          1610523.3166666667,
+          1582709.4166666667,
+          1729703.35,
+          1434121.7333333334,
+          1664415.4666666666,
+          1527771.9166666667
+        ],
+        "baselineControlNsPerOp": [
+          1325451.2333333334,
+          1324570.3333333333,
+          1286503.8666666667,
+          1356544.5166666666,
+          1281811.1333333333,
+          1271970.2166666666,
+          1264160.4333333333
+        ],
+        "invocations": [
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1386063.5166666666,
+            "roundNsPerOp": [
+              1529239.8833333333,
+              1346996.9333333333,
+              1386063.5166666666,
+              1397744.8833333333,
+              1348187.3666666667
+            ],
+            "opsPerSecond": 721.4676585708656,
+            "elements": 4000,
+            "pair": 0,
+            "side": "old"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1325451.2333333334,
+            "roundNsPerOp": [
+              1515093.8666666667,
+              1325451.2333333334,
+              1324966.1666666667,
+              1301089.1666666667,
+              1340597.9333333333
+            ],
+            "opsPerSecond": 754.4600471532499,
+            "elements": 4000,
+            "pair": 0,
+            "side": "baselineControl"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1527716.95,
+            "roundNsPerOp": [
+              1746397.65,
+              1527716.95,
+              1493698.8,
+              1527269.8333333333,
+              1575536.9333333333
+            ],
+            "opsPerSecond": 654.5715160128321,
+            "elements": 4000,
+            "pair": 0,
+            "side": "new"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1610523.3166666667,
+            "roundNsPerOp": [
+              1686909.2333333334,
+              1610523.3166666667,
+              1550228.85,
+              1703982.45,
+              1605032.8333333333
+            ],
+            "opsPerSecond": 620.9161889501362,
+            "elements": 4000,
+            "pair": 1,
+            "side": "new"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1324570.3333333333,
+            "roundNsPerOp": [
+              1518524.8833333333,
+              1324570.3333333333,
+              1310399.9666666666,
+              1328427.75,
+              1318820.9833333334
+            ],
+            "opsPerSecond": 754.961797674768,
+            "elements": 4000,
+            "pair": 1,
+            "side": "baselineControl"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1325404.9333333333,
+            "roundNsPerOp": [
+              1505374.8333333333,
+              1337271.55,
+              1322921.5666666667,
+              1324622.9166666667,
+              1325404.9333333333
+            ],
+            "opsPerSecond": 754.486402495157,
+            "elements": 4000,
+            "pair": 1,
+            "side": "old"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1355010.5333333334,
+            "roundNsPerOp": [
+              1545005.2166666666,
+              1375020.2666666666,
+              1346483.5166666666,
+              1355010.5333333334,
+              1350148.15
+            ],
+            "opsPerSecond": 738.001643086858,
+            "elements": 4000,
+            "pair": 2,
+            "side": "old"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1286503.8666666667,
+            "roundNsPerOp": [
+              1512864.1166666667,
+              1358812.6666666667,
+              1275618.0333333334,
+              1286503.8666666667,
+              1238051.8666666667
+            ],
+            "opsPerSecond": 777.3004231934424,
+            "elements": 4000,
+            "pair": 2,
+            "side": "baselineControl"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1582709.4166666667,
+            "roundNsPerOp": [
+              1754840.7666666666,
+              1534273.1333333333,
+              1587570.5,
+              1582709.4166666667,
+              1544544.2333333334
+            ],
+            "opsPerSecond": 631.8279208233265,
+            "elements": 4000,
+            "pair": 2,
+            "side": "new"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1729703.35,
+            "roundNsPerOp": [
+              1849262.1166666667,
+              2421037.2666666666,
+              1662212.6833333333,
+              1675312.1333333333,
+              1729703.35
+            ],
+            "opsPerSecond": 578.1338169923762,
+            "elements": 4000,
+            "pair": 3,
+            "side": "new"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1356544.5166666666,
+            "roundNsPerOp": [
+              1545043.8,
+              1368360.5666666667,
+              1342351.75,
+              1332572.55,
+              1356544.5166666666
+            ],
+            "opsPerSecond": 737.1671093088959,
+            "elements": 4000,
+            "pair": 3,
+            "side": "baselineControl"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1322134.35,
+            "roundNsPerOp": [
+              1489501.0333333334,
+              1301757.7333333334,
+              1308043.0666666667,
+              1331701.0833333333,
+              1322134.35
+            ],
+            "opsPerSecond": 756.3527866891893,
+            "elements": 4000,
+            "pair": 3,
+            "side": "old"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1255550.9333333333,
+            "roundNsPerOp": [
+              1408571.5833333333,
+              1235392.6333333333,
+              1222616.6333333333,
+              1255550.9333333333,
+              1266027.6666666667
+            ],
+            "opsPerSecond": 796.4631091031273,
+            "elements": 4000,
+            "pair": 4,
+            "side": "old"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1281811.1333333333,
+            "roundNsPerOp": [
+              1463600.2,
+              1253449.6333333333,
+              1278911.6666666667,
+              1281811.1333333333,
+              1289517.2666666666
+            ],
+            "opsPerSecond": 780.1461338532089,
+            "elements": 4000,
+            "pair": 4,
+            "side": "baselineControl"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1434121.7333333334,
+            "roundNsPerOp": [
+              1617698.6166666667,
+              1470938.6,
+              1434121.7333333334,
+              1423781.6833333333,
+              1417875.25
+            ],
+            "opsPerSecond": 697.2908761906125,
+            "elements": 4000,
+            "pair": 4,
+            "side": "new"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1664415.4666666666,
+            "roundNsPerOp": [
+              1828524.6666666667,
+              1673779.8833333333,
+              1664415.4666666666,
+              1657818,
+              1636918.1333333333
+            ],
+            "opsPerSecond": 600.8115281472992,
+            "elements": 4000,
+            "pair": 5,
+            "side": "new"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1271970.2166666666,
+            "roundNsPerOp": [
+              1456641.4333333333,
+              1271970.2166666666,
+              1250780.7333333334,
+              1264943.1166666667,
+              1279340.3333333333
+            ],
+            "opsPerSecond": 786.1819301245956,
+            "elements": 4000,
+            "pair": 5,
+            "side": "baselineControl"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1281827.5333333334,
+            "roundNsPerOp": [
+              1475239.5833333333,
+              1281248.15,
+              1300798.05,
+              1281827.5333333334,
+              1268010.8333333333
+            ],
+            "opsPerSecond": 780.1361524818757,
+            "elements": 4000,
+            "pair": 5,
+            "side": "old"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1308468.8333333333,
+            "roundNsPerOp": [
+              1442953.2833333334,
+              1324116.0833333333,
+              1273222.25,
+              1254298.6,
+              1308468.8333333333
+            ],
+            "opsPerSecond": 764.2520589905785,
+            "elements": 4000,
+            "pair": 6,
+            "side": "old"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1264160.4333333333,
+            "roundNsPerOp": [
+              1412392.85,
+              1250559.3833333333,
+              1284532.2,
+              1264160.4333333333,
+              1204181.2333333334
+            ],
+            "opsPerSecond": 791.0388378183961,
+            "elements": 4000,
+            "pair": 6,
+            "side": "baselineControl"
+          },
+          {
+            "available": 1,
+            "arm": "record-headers",
+            "iterations": 300,
+            "nsPerOp": 1527771.9166666667,
+            "roundNsPerOp": [
+              1542119.0833333333,
+              1527771.9166666667,
+              1587580.85,
+              1512786.4666666666,
+              1522392.25
+            ],
+            "opsPerSecond": 654.5479656294681,
+            "elements": 4000,
+            "pair": 6,
+            "side": "new"
+          }
+        ]
+      }
+    },
+    {
+      "run": "42986546845",
+      "source": "https://github.com/Countly/kafkajs/actions/runs/42986546845",
+      "baselineSha": "fecc6d97bb7ed29f6db0bc3697772c1805cc594e",
+      "candidateSha": "daae3d5933a007584238da40df3d52e8667556be",
+      "arm": {
+        "name": "frame-decode:1m",
+        "oldNsPerOp": [
+          401011.8,
+          402575.55,
+          904784.15,
+          934691.65,
+          976841.05,
+          448842.15,
+          431121
+        ],
+        "newNsPerOp": [
+          979105.55,
+          388563.35,
+          941038.5,
+          948990.45,
+          971257.5,
+          438485.3,
+          425561.65
+        ]
+      }
+    }
+  ]
+}

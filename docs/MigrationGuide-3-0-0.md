@@ -67,7 +67,7 @@ To use GSSAPI, install `kerberos@7.0.0` yourself. The client loads this optional
 
 - **SCRAM server checks.** SCRAM authentication now refuses, before deriving any key, a server-first message whose nonce does not extend the client's (an equal nonce included), whose iteration count is not an integer or is above 1 048 576, or that has a mandatory-extension, unknown or repeated attribute; it compares the server signature in constant time, and a server error attribute fails the exchange without its text. *What to do:* nothing for a Kafka broker, whose credentials allow at most 16 384 iterations. A server that asks for more needs the credential's iteration count lowered; there is no option to relax the checks.
 
-- **ApiVersions v5 checks the cluster and node ids (KIP-1242).** Against Kafka 4.4 brokers, ApiVersions v5 sends the intended cluster and node ids once both are known. A broker reporting `REBOOTSTRAP_REQUIRED` invokes the existing rebootstrap recovery. `metadataRecoveryStrategy: 'none'` disables identity checking and this recovery trigger. Older brokers retain the v4 path: on Kafka 4.0 to 4.3 they refuse the v5 request and the client completes ApiVersions v4, so each new connection, an idle reconnect included, costs one extra round trip. *What to do:* nothing for a cluster whose advertised addresses reach the brokers they name. A deployment that routes a node's advertised address to a different broker now sees `REBOOTSTRAP_REQUIRED` on Kafka 4.4: the client rebootstraps and the operation that opened the connection fails, and a routing that stays wrong rebootstraps again on each later attempt. Fix the routing, or set `metadataRecoveryStrategy: 'none'`.
+- **ApiVersions v5 checks the cluster and node ids (KIP-1242).** Against Kafka 4.4 brokers, ApiVersions v5 sends the intended cluster and node ids once both are known. A broker reporting `REBOOTSTRAP_REQUIRED` invokes the existing rebootstrap recovery. `metadataRecoveryStrategy: 'none'` disables identity checking and this recovery trigger. Older brokers retain the v4 path: on Kafka 4.0 to 4.3 they refuse the v5 request and the client completes ApiVersions v4, so each new connection, an idle reconnect included, costs one extra round trip. *What to do:* nothing for a cluster whose advertised addresses reach the brokers they name. A deployment that routes a node's advertised address to a different broker now sees `REBOOTSTRAP_REQUIRED` on Kafka 4.4: the client rebootstraps and the operation that opened the connection fails, and a routing that stays wrong rebootstraps again on each later attempt. Fix the routing, set `metadataClusterCheck: false` to stop naming the identity while keeping the other rebootstrap triggers, or set `metadataRecoveryStrategy: 'none'`.
 
 ### Producer
 
@@ -1312,6 +1312,14 @@ now logged.
 ### Protocol
 
 Wire and connection behavior: negotiated versions, version floors, authentication and rebootstrap.
+
+- **Oversized arrays and tagged sections in responses are rejected.** A protocol response that
+  declares more than 1,000,000 array entries or more than 10,000 tagged fields now fails with a
+  non-retriable `KafkaJSPartialMessageError` before anything is allocated, matching the limits of the
+  Kafka 4.4 Java client. Record batches are not affected: record counts and record headers stay
+  bounded by the bytes received and by `maxDecompressedBatchBytes`, so a valid record with more
+  than 1,000,000 headers still decodes. *What to do:* nothing against a correct broker; such a
+  response only comes from a faulty or hostile peer.
 
 - **Request versions below the Kafka 4.0 floors are gone.** The client no longer implements Produce
   v0–2, Fetch v0–3, ListOffsets v0, OffsetCommit v0–1, CreateTopics v0–1, DeleteTopics v0,

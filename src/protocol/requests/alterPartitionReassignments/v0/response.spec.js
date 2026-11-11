@@ -6,6 +6,7 @@ describe('Protocol > Requests > AlterPartitionReassignments > v0', () => {
     const data = await decode(Buffer.from(require('../fixtures/v0_response.json')))
     expect(data).toEqual({
       throttleTime: 0,
+      clientSideThrottleTime: 0,
       errorCode: 0,
       responses: [
         {
@@ -37,6 +38,7 @@ describe('Protocol > Requests > AlterPartitionReassignments > v0', () => {
         },
       ],
       throttleTime: 0,
+      clientSideThrottleTime: 0,
     })
 
     const promise = parse(data)

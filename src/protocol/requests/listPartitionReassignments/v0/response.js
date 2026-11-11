@@ -50,7 +50,8 @@ const decode = async (rawData) => {
   // Read error message
   decoder.readUVarIntString()
   return {
-    throttleTime,
+    throttleTime: 0,
+    clientSideThrottleTime: throttleTime,
     errorCode,
     topics: decoder.readUVarIntArray(decodeTopics),
   }

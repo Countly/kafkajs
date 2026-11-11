@@ -10,7 +10,13 @@ const measure = (arm) => {
   })
 
   expect(run.status).toBe(0)
-  return JSON.parse(run.stdout)
+  const result = JSON.parse(run.stdout)
+  if (result.available) {
+    expect(result.roundNsPerOp).toHaveLength(5)
+    expect(result.roundNsPerOp.every((value) => value > 0)).toBe(true)
+    expect(result.nsPerOp).toBe([...result.roundNsPerOp].sort((a, b) => a - b)[2])
+  }
+  return result
 }
 
 describe('Benchmarks > recordBatchDecode', () => {

@@ -52,7 +52,13 @@ const decode = async (rawData) => {
   decoder.readTaggedFields()
   if (decoder.canReadBytes(1))
     throw new KafkaJSInvariantViolation('AlterPartitionReassignments response has trailing bytes')
-  return { throttleTime, allowReplicationFactorChange, errorCode, responses }
+  return {
+    throttleTime: 0,
+    clientSideThrottleTime: throttleTime,
+    allowReplicationFactorChange,
+    errorCode,
+    responses,
+  }
 }
 
 module.exports = { decode, parse }

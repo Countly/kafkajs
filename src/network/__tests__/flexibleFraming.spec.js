@@ -196,6 +196,11 @@ describe('Network > Connection > flexible framing', () => {
       .writeTaggedFields().buffer
 
     respond(fake.state, correlationId, 1, body)
-    await expect(promise).resolves.toEqual({ throttleTime: 0, errorCode: 0, topics: [] })
+    await expect(promise).resolves.toEqual({
+      throttleTime: 0,
+      clientSideThrottleTime: 0,
+      errorCode: 0,
+      topics: [],
+    })
   })
 })
