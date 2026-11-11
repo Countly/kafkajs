@@ -230,7 +230,7 @@ jobs:
   retained-diagnostic:
     if: github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/')
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 55
     env:
       TELEMETRY_RESOURCES_QUIET: '1'
       RETAINED_DIAGNOSTIC_DIR: ${{ github.workspace }}/.tmp/retained-diagnostic/run
@@ -255,18 +255,33 @@ jobs:
           timeout -k 5s 50s npx jest --maxWorkers=2 --ci --testPathPatterns 'src/telemetry/__tests__/resources\.spec\.js$' 'scripts/soak/__tests__/soak\.spec\.js$' --testNamePattern 'requires fresh authority|detects 131072|holds one native job across one hundred retirements' 2>&1 | tee .tmp/retained-diagnostic/controls/lifecycle.log
       - name: Diagnose retained ownership on Node 24 alone (sixteen serial children)
         timeout-minutes: 30
-        run: timeout -k 10s 1750s node scripts/e2e/telemetry/retainedDiagnostic.js --diagnostic-only "$RETAINED_DIAGNOSTIC_DIR"
+        run: |
+          phase_started_at=$(date +%s)
+          trap 'echo "retained diagnostic capture elapsed: $(( $(date +%s) - phase_started_at )) s"' EXIT
+          timeout -k 10s 1750s node scripts/e2e/telemetry/retainedDiagnostic.js --diagnostic-only "$RETAINED_DIAGNOSTIC_DIR"
       - name: Analyse cold ownership and conditional ephemerons offline
         if: always()
+        timeout-minutes: 10
+        run: |
+          phase_started_at=$(date +%s)
+          trap 'echo "retained diagnostic analysis elapsed: $(( $(date +%s) - phase_started_at )) s"' EXIT
+          timeout -k 5s 590s node --max-old-space-size=6144 scripts/e2e/telemetry/retained/analyse.js "$RETAINED_DIAGNOSTIC_DIR"
+      - name: Start retained diagnostic upload timing
+        if: always()
+        run: echo "RETAINED_UPLOAD_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+      - name: Upload retained diagnostic evidence
+        if: always()
         timeout-minutes: 5
-        run: timeout -k 5s 290s node --max-old-space-size=6144 scripts/e2e/telemetry/retained/analyse.js "$RETAINED_DIAGNOSTIC_DIR"
-      - if: always()
         uses: actions/upload-artifact@v4
         with:
           name: retained-diagnostic-node24
           path: .tmp/retained-diagnostic/
           if-no-files-found: error
           include-hidden-files: true
+      - name: Report retained diagnostic upload timing
+        if: always()
+        run: |
+          echo "retained diagnostic upload elapsed: $(( $(date +%s) - RETAINED_UPLOAD_STARTED_AT )) s"
   telemetry-soak:
     if: github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/')
     runs-on: ubuntu-latest
