@@ -380,7 +380,7 @@ describe('required memory gate composition', () => {
         expect(() => run('calibration-artifacts')).toThrow('Journal controls failed')
       })
       const children = events.filter((event) => event.type === 'spawn')
-      expect(children).toHaveLength(23)
+      expect(children).toHaveLength(35)
       for (const [index, event] of events.entries()) {
         if (event.type !== 'spawn') continue
         const json = events[index + 1]
@@ -414,6 +414,7 @@ describe('required memory gate composition', () => {
       'unit',
       'share-soak-verdict',
       'resources',
+      'journal-controls',
       'retained-diagnostic',
       'telemetry-soak',
       'live-owner-census',

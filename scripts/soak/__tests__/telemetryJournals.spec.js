@@ -1,5 +1,10 @@
 const crypto = require('node:crypto')
+const fs = require('node:fs')
+const v8 = require('node:v8')
 const churn = require('../telemetryChurn')
+const controls = require('../journalControls')
+const { TELEMETRY } = require('../soak')
+const { MEMORY_FLAGS } = require('../../../testHelpers/processMemory')
 const { ReferenceWork, ReferenceShareLedger } = require('./fixtures/journalReference')
 const { NativeJournal, PendingSampler } = require('../../../testHelpers/processMemory')
 const { HandlerJournal } = require('../../../testHelpers/fixedJournal')
@@ -341,5 +346,445 @@ describe('telemetry journal calibration', () => {
         'invalid calibration sample'
       )
     }
+  })
+})
+
+/** A component verdict as the child's evaluator forms it from a measured slope and endpoint. */
+const verdictOf = (slopeBytesPerMinute, endpointBytes) => {
+  const violations = [
+    ...(slopeBytesPerMinute > TELEMETRY.slopeBytesPerMinute ? ['retained slope'] : []),
+    ...(endpointBytes > TELEMETRY.endpointBytes ? ['retained endpoint'] : []),
+  ]
+  return {
+    scope: 'slope-and-endpoint-only',
+    ok: violations.length === 0,
+    violations,
+    measured: { samples: 11, slopeBytesPerMinute, endpointBytes },
+  }
+}
+const arm = (kind, mode, seeded, protocol = 'resource') => ({ kind, mode, seeded, protocol })
+const LIMITS = { slope: TELEMETRY.slopeBytesPerMinute, endpoint: TELEMETRY.endpointBytes }
+const CLEAN = verdictOf(LIMITS.slope / 2, LIMITS.endpoint / 4)
+const BOTH = verdictOf(LIMITS.slope * 4, LIMITS.endpoint * 1.3)
+const FALLBACK = {
+  scope: 'slope-and-endpoint-only',
+  ok: false,
+  violations: ['calibration evidence'],
+  error: 'invalid calibration sample',
+}
+
+describe('telemetry journal calibration roles', () => {
+  test('assigns each arm its role: null, seeded, contamination-positive, or record only', () => {
+    for (const kind of ['consumer', 'shareConsumer'])
+      expect(controls.armOf(arm(kind, 'legacy', false))).toEqual({
+        role: 'contamination-positive',
+        judgedBy: 'slope violation',
+      })
+    expect(controls.armOf(arm('producer', 'legacy', false))).toEqual({
+      role: 'contamination-positive',
+      judgedBy: 'paired ordering',
+    })
+    expect(controls.armOf(arm('admin', 'legacy', false)).judgedBy).toBe('record only')
+    for (const kind of controls.KINDS) {
+      expect(controls.armOf(arm(kind, 'fixed', false))).toEqual({
+        role: 'null',
+        judgedBy: 'no violation',
+      })
+      for (const mode of ['legacy', 'fixed'])
+        expect(controls.armOf(arm(kind, mode, true)).role).toBe('seeded-positive')
+      expect(controls.armOf(arm(kind, 'fixed', false, 'live')).judgedBy).toBe('record only')
+      expect(controls.armOf(arm(kind, 'fixed', true, 'live')).judgedBy).toBe('both violations')
+    }
+  })
+
+  test('accepts the consumer and share legacy contamination only when the retained slope is detected', () => {
+    for (const kind of ['consumer', 'shareConsumer']) {
+      const legacy = arm(kind, 'legacy', false)
+      expect(() => controls.judgeArm(legacy, BOTH)).not.toThrow()
+      expect(() =>
+        controls.judgeArm(legacy, verdictOf(LIMITS.slope * 2, LIMITS.endpoint / 2))
+      ).not.toThrow()
+      expect(() => controls.judgeArm(legacy, verdictOf(100, LIMITS.endpoint * 2))).toThrow(
+        'legacy contamination was not detected'
+      )
+      expect(() => controls.judgeArm(legacy, CLEAN)).toThrow(
+        'legacy contamination was not detected'
+      )
+      const dropped = { ...BOTH, violations: ['retained slope'] }
+      expect(() => controls.judgeArm(legacy, dropped)).toThrow('endpoint violation agrees')
+    }
+  })
+
+  test('requires the fixed unseeded null to pass and every seeded arm to show both violations', () => {
+    for (const kind of controls.KINDS) {
+      const fixed = arm(kind, 'fixed', false)
+      expect(() => controls.judgeArm(fixed, CLEAN)).not.toThrow()
+      expect(() => controls.judgeArm(fixed, verdictOf(LIMITS.slope * 2, 1))).toThrow('null failed')
+      expect(() => controls.judgeArm(fixed, verdictOf(1, LIMITS.endpoint * 2))).toThrow(
+        'null failed'
+      )
+      for (const mode of ['legacy', 'fixed']) {
+        const seeded = arm(kind, mode, true)
+        expect(() => controls.judgeArm(seeded, BOTH)).not.toThrow()
+        expect(() => controls.judgeArm(seeded, CLEAN)).toThrow()
+        expect(() => controls.judgeArm(seeded, verdictOf(LIMITS.slope * 2, 1))).toThrow()
+      }
+    }
+  })
+
+  test('judges the producer legacy arm by paired ordering against its fixed null only', () => {
+    const legacy = arm('producer', 'legacy', false)
+    expect(() => controls.judgeArm(legacy, CLEAN)).not.toThrow()
+    const old = verdictOf(85 * 1024, 540 * 1024)
+    const fixed = verdictOf(41 * 1024, 322 * 1024)
+    expect(() => controls.judgeOrdering(old, fixed)).not.toThrow()
+    expect(() => controls.judgeOrdering(fixed, old)).toThrow('legacy slope')
+    expect(() => controls.judgeOrdering(old, verdictOf(41 * 1024, 540 * 1024))).toThrow(
+      'legacy endpoint'
+    )
+    expect(() => controls.judgeOrdering(verdictOf(70 * 1024, 900 * 1024), fixed)).not.toThrow()
+    expect(() => controls.judgeOrdering(verdictOf(41 * 1024, 900 * 1024), fixed)).toThrow(
+      'legacy slope'
+    )
+  })
+
+  test('never accepts a missing, partial or contradictory verdict as a detection or a null', () => {
+    const arms = [
+      arm('consumer', 'legacy', false),
+      arm('consumer', 'fixed', false),
+      arm('consumer', 'fixed', true),
+      arm('admin', 'legacy', false),
+      arm('admin', 'fixed', false, 'live'),
+    ]
+    const contradictory = { ...BOTH, ok: true }
+    const unlabelled = { ...BOTH, violations: [...BOTH.violations, 'identity roles'] }
+    const nonFinite = verdictOf(NaN, 0)
+    for (const target of arms)
+      for (const bad of [undefined, {}, FALLBACK, contradictory, unlabelled, nonFinite])
+        expect(() => controls.judgeArm(target, bad)).toThrow()
+    expect(() => controls.judgeOrdering(undefined, CLEAN)).toThrow()
+    expect(() => controls.judgeOrdering(BOTH, FALLBACK)).toThrow('measured slope and endpoint')
+  })
+
+  test('records the admin legacy arm and the live-flags unseeded null without judging them', () => {
+    expect(() => controls.judgeArm(arm('admin', 'legacy', false), BOTH)).not.toThrow()
+    expect(() => controls.judgeArm(arm('admin', 'legacy', false), CLEAN)).not.toThrow()
+    for (const kind of controls.KINDS) {
+      const live = arm(kind, 'fixed', false, 'live')
+      expect(() => controls.judgeArm(live, BOTH)).not.toThrow()
+      expect(() => controls.judgeArm(live, CLEAN)).not.toThrow()
+      expect(() => controls.judgeArm(arm(kind, 'fixed', true, 'live'), CLEAN)).toThrow()
+    }
+  })
+
+  test('parses the workload and protocol selection and rejects any other option', () => {
+    expect(controls.parseArguments(['out'])).toEqual({ directory: 'out', options: {} })
+    expect(controls.parseArguments(['out', '--kinds=admin,producer', '--protocols=live'])).toEqual({
+      directory: 'out',
+      options: { kinds: ['admin', 'producer'], protocols: ['live'] },
+    })
+    expect(() => controls.parseArguments(['out', '--kind=admin'])).toThrow('Unknown option')
+    expect(() => controls.run('out', { kinds: ['broker'] })).toThrow('unknown workload kind')
+    expect(() => controls.run('out', { protocols: ['fast'] })).toThrow('unknown protocol')
+  })
+})
+
+describe('telemetry journal calibration children', () => {
+  /** Runs the controls with every child scripted, returning the argument vectors and the summary. */
+  const scripted = (options, respond) => {
+    const calls = []
+    const files = new Map()
+    const spawn = jest
+      .spyOn(require('node:child_process'), 'spawnSync')
+      .mockImplementation((...call) => {
+        calls.push(call)
+        return respond(call[1]) ?? { status: 0, stdout: '{}', stderr: '' }
+      })
+    const mkdir = jest.spyOn(fs, 'mkdirSync').mockImplementation(() => {})
+    const write = jest.spyOn(fs, 'writeFileSync').mockImplementation((file, data) => {
+      files.set(file.split('/').pop(), data)
+    })
+    let error
+    try {
+      jest.isolateModules(() => {
+        try {
+          require('../journalControls').run('controls', options)
+        } catch (thrown) {
+          error = thrown
+        }
+      })
+    } finally {
+      spawn.mockRestore()
+      mkdir.mockRestore()
+      write.mockRestore()
+    }
+    return { calls, error, summary: JSON.parse(files.get('summary.json')) }
+  }
+  const argsOf = ([, args]) => {
+    const script = args.findIndex((arg) => arg.endsWith('.js'))
+    return {
+      flags: args.slice(0, script),
+      script: args[script].split('/').pop(),
+      rest: args.slice(script + 1),
+    }
+  }
+
+  test('runs the live-flags arms with the exact worker flags, fixed mode only, for every workload', () => {
+    const { calls, error, summary } = scripted({ protocols: ['live'] }, () => null)
+    expect(error).toBeInstanceOf(AggregateError)
+    expect(calls).toHaveLength(8)
+    const arms = calls.map(argsOf)
+    for (const { flags, script } of arms) {
+      expect(flags).toEqual(['--expose-gc'])
+      expect(script).toBe('journalSensitivityChild.js')
+    }
+    expect(arms.map((row) => row.rest)).toEqual(
+      ['producer', 'consumer', 'admin', 'shareConsumer'].flatMap((kind) => [
+        ['fixed', kind, 'false', 'live'],
+        ['fixed', kind, 'true', 'live'],
+      ])
+    )
+    expect(summary.protocols).toEqual(['live'])
+    expect(summary.failures.map((row) => row.name)).toContain('sensitivity-admin-fixed-true-live')
+  })
+
+  test('runs the admin kind through all four resource arms with the resource flags and no ownership child', () => {
+    const { calls } = scripted({ kinds: ['admin'], protocols: ['resource'] }, () => null)
+    const arms = calls.map(argsOf)
+    expect(arms.map((row) => row.script)).toEqual(Array(4).fill('journalSensitivityChild.js'))
+    for (const { flags } of arms) expect(flags).toEqual(MEMORY_FLAGS)
+    expect(arms.map((row) => row.rest)).toEqual([
+      ['legacy', 'admin', 'false', 'resource'],
+      ['legacy', 'admin', 'true', 'resource'],
+      ['fixed', 'admin', 'false', 'resource'],
+      ['fixed', 'admin', 'true', 'resource'],
+    ])
+  })
+
+  test('never accepts a timed-out, crashed or malformed legacy unseeded child as a detection', () => {
+    const timeout = Object.assign(new Error('spawnSync node ETIMEDOUT'), { code: 'ETIMEDOUT' })
+    const answers = [
+      { error: timeout, status: null, signal: 'SIGTERM', stdout: '', stderr: '' },
+      { status: 1, signal: null, stdout: '{}', stderr: 'crash' },
+      { status: 0, signal: null, stdout: 'not json', stderr: '' },
+      { status: 0, signal: null, stdout: JSON.stringify({ verdict: FALLBACK }), stderr: '' },
+    ]
+    for (const [index, answer] of answers.entries()) {
+      const { error, summary } = scripted(
+        { kinds: ['consumer'], protocols: ['resource'] },
+        (args) =>
+          args.includes('legacy') &&
+          args.includes('false') &&
+          args.some((a) => a.endsWith('journalSensitivityChild.js'))
+            ? answer
+            : null
+      )
+      expect(error).toBeInstanceOf(AggregateError)
+      expect(summary.failures.map((row) => row.name)).toContain('sensitivity-consumer-legacy-false')
+      const rows = summary.summary.filter((row) => row.mode === 'legacy' && row.seeded === false)
+      expect(rows).toHaveLength(index === 3 ? 1 : 0)
+      for (const row of rows) expect(row).toMatchObject({ role: 'contamination-positive' })
+    }
+  })
+})
+
+describe('telemetry engine code shadow', () => {
+  /** Makes each engine code reading deterministic, in call order. */
+  const sizes = (...readings) => {
+    const spy = jest.spyOn(v8, 'getHeapCodeStatistics')
+    for (const [code, bytecode] of readings)
+      spy.mockReturnValueOnce({
+        code_and_metadata_size: code,
+        bytecode_and_metadata_size: bytecode,
+      })
+    return spy
+  }
+
+  test('journals code and bytecode sizes of every reading in fixed storage and fails an overflow', () => {
+    const spy = sizes([1000, 500], [1100, 500])
+    try {
+      const engine = new churn.EngineCodeJournal({ capacity: 2 })
+      const before = engine.journalState()
+      engine.record({ phase: 'c0', at: 1.5 })
+      engine.record({ phase: 'settled', at: 2.5 })
+      expect(engine.journalState().byteLength).toBe(before.byteLength)
+      expect(engine.values()).toEqual([
+        { phase: 'c0', at: 1.5, code: 1000, bytecode: 500 },
+        { phase: 'settled', at: 2.5, code: 1100, bytecode: 500 },
+      ])
+      const full = engine.journalState()
+      expect(() => engine.record({ phase: 'final', at: 3.5 })).toThrow(/engine code.*overflow/)
+      expect(engine.journalState()).toEqual({ ...full, overflow: true })
+      expect(engine.values()).toHaveLength(2)
+      expect(
+        churn.JournalConstancy.violations({
+          baseline: { journals: before },
+          samples: [],
+          teardown: { journals: engine.journalState() },
+        })
+      ).toContain('journal overflow')
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  test('takes the engine sizes beside a settled reading without changing the reading', async () => {
+    const spy = sizes([2048, 1024])
+    try {
+      const engine = new churn.EngineCodeJournal({ capacity: 4 })
+      let now = 10
+      const reading = await churn.settledReading('c0', {
+        gc: jest.fn(),
+        pause: async () => {},
+        now: () => (now += 1),
+        engine,
+      })
+      expect(reading).toMatchObject({ phase: 'c0', retained: reading.heapUsed + reading.external })
+      expect(Object.keys(reading)).not.toContain('engine')
+      expect(engine.values()).toEqual([{ phase: 'c0', at: reading.at, code: 2048, bytecode: 1024 }])
+      const plain = await churn.settledReading('c1', {
+        gc: jest.fn(),
+        pause: async () => {},
+        now: () => (now += 1),
+      })
+      expect(plain.phase).toBe('c1')
+      expect(engine.values()).toHaveLength(1)
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  test('reports raw, code and data slope for a code-driven series and marks an unjoined one incomplete', () => {
+    const points = Array.from({ length: 6 }, (_, i) => ({
+      minutes: i + 1,
+      raw: 10000000 + 100000 * (i + 1),
+      code: 2000000 + 40000 * (i + 1),
+    }))
+    const report = churn.EngineCodeJournal.shadow(points)
+    expect(report).toMatchObject({
+      scope: 'shadow',
+      acceptance: false,
+      complete: true,
+      readings: 6,
+    })
+    expect(report.raw.slopeBytesPerMinute).toBeCloseTo(100000, 3)
+    expect(report.code.slopeBytesPerMinute).toBeCloseTo(40000, 3)
+    expect(report.data.slopeBytesPerMinute).toBeCloseTo(60000, 3)
+    expect([
+      report.raw.endpointBytes,
+      report.code.endpointBytes,
+      report.data.endpointBytes,
+    ]).toEqual([500000, 200000, 300000])
+    expect(churn.EngineCodeJournal.shadow(points.slice(0, 1))).toMatchObject({ complete: false })
+    expect(churn.EngineCodeJournal.shadow([points[0], { ...points[0], raw: 1 }])).toMatchObject({
+      complete: false,
+      error: expect.stringContaining('different x'),
+    })
+    const rows = points.map((p, i) => [2000000 + 40000 * (i + 1) - 500, 500])
+    const spy = sizes(...rows)
+    try {
+      const engine = new churn.EngineCodeJournal()
+      const samples = points.map((p, i) => {
+        engine.record({ phase: 'settled', at: 100 + i })
+        return {
+          completedAtMs: p.minutes * 60000,
+          snapshot: { memory: { at: 100 + i, retainedBytes: p.raw } },
+        }
+      })
+      const joined = engine.report(samples)
+      expect(joined.data.slopeBytesPerMinute).toBeCloseTo(60000, 3)
+      expect(joined.code.endpointBytes).toBe(200000)
+      samples[2].snapshot.memory.at = 999
+      expect(engine.report(samples)).toEqual({
+        scope: 'shadow',
+        acceptance: false,
+        complete: false,
+        missing: 1,
+      })
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  test('takes the final reading engine sizes while building the reference and lists the journal as allocated before the control', () => {
+    const worker = new churn.TelemetryWorkerProcess({
+      kind: 'admin',
+      soak: { TELEMETRY },
+      proc: {},
+      env: {},
+    })
+    const parts = {
+      loaded: {},
+      control: {},
+      host: { before: {} },
+      memory: { source: null, gcCapability: () => ({ native: true }) },
+      journal: { summary: () => ({}) },
+      sampler: { summary: () => ({}) },
+      foreground: [],
+      allocation: {},
+    }
+    const engine = new churn.EngineCodeJournal({ capacity: 2 })
+    const reference = worker.reference({ ...parts, engine })
+    expect(engine.values()).toEqual([
+      {
+        phase: 'final',
+        at: reference.final.at,
+        code: expect.any(Number),
+        bytecode: expect.any(Number),
+      },
+    ])
+    expect(reference.journals.allocationBeforeControl).toContain('engine-code')
+    expect(worker.reference(parts).final.phase).toBe('final')
+  })
+
+  test('forwards a worker shadow report beside, never into, its judged resource verdict', () => {
+    const record = jest.fn()
+    const verdict = jest.fn(() => ({
+      ok: true,
+      outcome: 'passed',
+      violations: [],
+      inconclusive: [],
+      measured: {},
+    }))
+    const churnRun = new churn.TelemetryChurn({
+      fixture: {},
+      processes: { workers: new Map() },
+      decoder: {},
+      record,
+      clock: { now: () => 0 },
+      limits: {},
+      verdict,
+      brokers: [],
+      stem: 'stem',
+      line: '4.3.1',
+      directory: '/evidence',
+    })
+    const shadow = { scope: 'shadow', acceptance: false, complete: true, readings: 11 }
+    const results = churn.KINDS.map((kind) => ({
+      kind,
+      clientId: `stem-${kind}`,
+      uuid: `uuid-${kind}`,
+      input: {},
+      facts: { requirements: { ok: true, violations: [] } },
+      ...(kind === 'producer' ? { shadow } : {}),
+    }))
+    const exits = Object.fromEntries(churn.KINDS.map((kind) => [kind, { kind }]))
+    churnRun.judge(
+      results,
+      { errors: [], exits, oracle: null },
+      { t0: 0, epochAt: 1, boundaryAt: 2, cleanupEndAt: 3 },
+      new churn.TelemetrySchedule({ warmupMs: 60000, measureMs: 300000 })
+    )
+    const rows = record.mock.calls
+      .map(([row]) => row)
+      .filter((row) => row.kind === 'resource-verdict')
+    expect(rows.map((row) => row.clientKind)).toEqual(churn.KINDS)
+    expect(rows.find((row) => row.clientKind === 'producer').shadow).toEqual(shadow)
+    for (const row of rows) {
+      expect(row.result).not.toHaveProperty('shadow')
+      if (row.clientKind !== 'producer') expect(row).not.toHaveProperty('shadow')
+    }
+    expect(verdict).toHaveBeenCalledTimes(4)
+    for (const [input] of verdict.mock.calls) expect(input).not.toHaveProperty('shadow')
   })
 })
