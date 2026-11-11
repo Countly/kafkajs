@@ -1472,6 +1472,7 @@ describe('broker telemetry fixture', () => {
       'Stamp the run and prepare the artifact directory',
       'Measure single-client memory alone on the idle runner',
       'Validate the recorded measurements for this tree and Node',
+      'Compare journal ownership and real-time retained sensitivity serially',
       'actions/upload-artifact@v4',
     ])
     const memory = resources.steps.find((step) => step.name?.startsWith('Measure'))
