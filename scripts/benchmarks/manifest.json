@@ -288,6 +288,14 @@
       "reason": "A calibration gate, not a measurement: it prints a line per record shape and a verdict, and exits 1 outside its accounting window."
     },
     {
+      "file": "arrayDecode.js",
+      "reason": "An internal decoder benchmark copied into a frozen baseline tree by the exit-gate decoder performance comparison, not a report entry."
+    },
+    {
+      "file": "compareDecoderBounds.js",
+      "reason": "An exit-gate decoder performance tool that compares frozen trees and exits 1 on missing evidence or an excessive slowdown, not a report entry."
+    },
+    {
       "file": "fetchSessions.js",
       "reason": "Needs a controller-owned node inventory (BENCH_NODES), an evidence directory and, for one arm, controller IPC; it also uses the racks cluster."
     },
