@@ -166,7 +166,7 @@ describe('Decoder measurement partitions', () => {
     }
   })
 
-  it('preserves PASS FAIL and INCONCLUSIVE verdicts on D167 information-only rows', () => {
+  it('waives PASS and INCONCLUSIVE but fails a valid FAIL on D167 information-only rows', () => {
     for (const name of D167_ROWS) {
       const input = evidence().find((input) => input.arms.some((row) => row.name === name))
       const row = input.arms.find((row) => row.name === name)
@@ -183,11 +183,17 @@ describe('Decoder measurement partitions', () => {
         setSamples(row, 'C', A)
         setSamples(row, 'B', B)
         const result = compare(input)
-        expect(result.pass).toBe(true)
+        expect(result.pass).toBe(verdict !== 'fail')
         expect(result.arms.find((row) => row.name === name)).toMatchObject({
           verdict,
           problems: [],
         })
+        const combined = evidence()
+        const combinedRow = combined.flatMap(({ arms }) => arms).find((row) => row.name === name)
+        setSamples(combinedRow, 'A', A)
+        setSamples(combinedRow, 'C', A)
+        setSamples(combinedRow, 'B', B)
+        expect(combine(combined).pass).toBe(verdict !== 'fail')
         const line = formatReport(result)
           .split('\n')
           .find((line) => line.includes(name))

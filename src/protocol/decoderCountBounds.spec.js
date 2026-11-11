@@ -149,6 +149,7 @@ describe('Decoder count bounds', () => {
       )
       .writeTaggedFields().buffer
     const validation = jest.spyOn(Decoder.prototype, 'assertCount')
+    const byteChecks = jest.spyOn(Decoder.prototype, 'ensureReadable')
 
     try {
       const decoded = await decodeFetchV12(body)
@@ -164,8 +165,10 @@ describe('Decoder count bounds', () => {
         [1, 'readUVarIntArrayAsync'],
         [3, 'readUVarIntArrayAsync'],
       ])
+      expect(byteChecks.mock.calls.filter(([, label]) => label === 'readUVarIntArray')).toEqual([])
     } finally {
       validation.mockRestore()
+      byteChecks.mockRestore()
     }
   })
 
