@@ -24,12 +24,14 @@ const {
   DecoderGate,
   DecoderMemory,
   TelemetryWireObserver,
+  OBSERVER_LIMITS,
   readExports,
 } = require('../../testHelpers/telemetryFixtures')
 const {
   TelemetrySegments,
   checkSegmentFiles,
   FILE_BOUND,
+  scheduleOf,
 } = require('../../testHelpers/telemetrySegments')
 const {
   NativeJournal,
@@ -1153,7 +1155,8 @@ class ShareOracle {
  * The classifying socket factory of one worker. Every socket is a chaos socket over the socket of
  * the observer segment the owner has selected. The first request frame of API 71 or 72 marks that
  * very socket as the telemetry transport; one such open socket can be retired, leaving core sockets
- * untouched. A closed socket is released at once, so only scalar facts outlive it.
+ * untouched. A closed socket is released at once, so only scalar facts outlive it. Socket history
+ * is bounded by the churn segment cap times the observer socket cap; overflow fails before dialing.
  */
 class TelemetryTap {
   /**
@@ -1162,12 +1165,18 @@ class TelemetryTap {
    *   wraps every socket of a share consumer
    */
   constructor(segments, { share = null, clock = { now: () => performance.now() } } = {}) {
-    const chaos = createChaosSocketFactory((options) => segments.socketFactory(options))
+    this.chaos = createChaosSocketFactory((options) => segments.socketFactory(options), {
+      retainClosed: false,
+    })
     this.segments = segments
     this.share = share
     this.clock = clock
     this.records = []
-    this.factory = (options) => this.track(chaos(options), segments.current())
+    this.factory = (options) => {
+      if (this.records.length >= scheduleOf(SCENARIO).cap * OBSERVER_LIMITS.sockets)
+        throw new Error('Telemetry tap socket history bound exceeded')
+      return this.track(this.chaos(options), segments.current())
+    }
   }
 
   /**
@@ -1202,8 +1211,10 @@ class TelemetryTap {
         record.armed = false
         record.hit = false
         const at = tap.clock.now()
+        const faulted = record.faulted
+        record.faulted = null
         this.destroy(new Error('telemetry transport retired'))
-        record.faulted(at)
+        faulted(at)
       }
       return result
     }
@@ -1217,6 +1228,7 @@ class TelemetryTap {
       record.restore?.()
       record.restore = null
       record.socket = null
+      record.faulted = null
     })
     this.records.push(record)
     return socket
@@ -2945,7 +2957,7 @@ class TelemetryWorker {
 class FrameCounter {
   /** @param {Function} inner the underlying socket factory */
   constructor(inner) {
-    const chaos = createChaosSocketFactory(inner)
+    const chaos = createChaosSocketFactory(inner, { retainClosed: false })
     this.frames = 0
     this.open = 0
     this.factory = (options) => this.track(chaos(options))

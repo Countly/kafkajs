@@ -505,6 +505,9 @@ describe('ChaosSocket', () => {
     replacement.destroy()
     unarmed.destroy()
     expect(factory.sockets).toEqual([])
+    factory.arm({ host: 'instant' }, (socket) => socket.destroy())
+    expect(factory({ host: 'instant', port: 1 }).destroyed).toBe(true)
+    expect(factory.sockets).toEqual([])
 
     if (typeof global.gc === 'function') {
       for (let i = 0; i < 10; i++) {

@@ -596,6 +596,9 @@ describe('telemetry profile', () => {
       core.destroy()
       expect(tap.chaos.sockets).toEqual([])
       expect(tap.records.map(({ socket }) => socket)).toEqual([null, null])
+      tap.records.length = 1024
+      expect(() => tap.factory({ host: 'a', port: 1 })).toThrow('socket history bound exceeded')
+      expect(owners).toHaveLength(2)
     })
 
     test('refuses to fault when more than one telemetry socket is open', () => {

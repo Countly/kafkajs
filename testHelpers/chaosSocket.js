@@ -398,19 +398,30 @@ class ChaosSocket extends EventEmitter {
  * @param {object} [options] applied to every socket the factory creates
  * @param {number|[number, number]} [options.killAfter] each socket's lifetime, see `killAfter`
  * @param {number} [options.seed=1] the seed of the lifetime draws, so a run can be repeated
+ * @param {boolean} [options.retainClosed=true] keep closed sockets in the historical list; false
+ *   releases them and their pending deliveries on close, without changing endpoint armings
  * @returns {Function & { sockets: ChaosSocket[], arm: Function }} the factory; `sockets` lists
- *   every socket it created, oldest first, and `arm` arms an endpoint's sockets
+ *   every socket it created, oldest first (only live sockets when `retainClosed` is false),
+ *   and `arm` arms an endpoint's sockets
  */
-const createChaosSocketFactory = (inner, { killAfter, seed = 1 } = {}) => {
+const createChaosSocketFactory = (inner, { killAfter, seed = 1, retainClosed = true } = {}) => {
   const random = mulberry32(seed)
   const armings = new Set()
   const matches = ({ endpoint }, { host, port }) =>
     (host === undefined || endpoint.host === host) && (port === undefined || endpoint.port === port)
   const factory = (options) => {
     const socket = new ChaosSocket(inner(options), options, random)
+    if (!retainClosed) {
+      factory.sockets.push(socket)
+      socket.once('close', () => {
+        socket.stop()
+        const index = factory.sockets.indexOf(socket)
+        if (index !== -1) factory.sockets.splice(index, 1)
+      })
+    }
     if (killAfter !== undefined) socket.killAfter(killAfter)
     for (const { select, apply } of armings) if (matches(socket, select)) apply(socket)
-    factory.sockets.push(socket)
+    if (retainClosed) factory.sockets.push(socket)
     return socket
   }
   factory.sockets = []
