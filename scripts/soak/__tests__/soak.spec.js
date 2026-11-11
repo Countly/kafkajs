@@ -7061,6 +7061,109 @@ describe('telemetry resident-size reference', () => {
     expect(evaluate(capability)).toMatchObject({ ok: false, outcome: 'inconclusive' })
   })
 
+  /** Every reading that reaches the setup peak or the overall peak, as one high water would. */
+  const readingsOf = (input) => [
+    input.reference.loaded,
+    input.reference.control.c0,
+    input.reference.control.c1,
+    input.reference.control.released,
+    input.baseline.memory,
+    ...input.samples.map((s) => s.snapshot.memory),
+    input.teardown.memory,
+    input.reference.final,
+  ]
+  const setPeak = (input, hwm) => readingsOf(input).forEach((memory) => (memory.hwm = hwm))
+  /** A share-consumer reference that records the allocation and setup allowance it was run under. */
+  const shareInput = () => {
+    const { declaredJournalBytes } = require('../telemetryChurn')
+    const declared = declaredJournalBytes('shareConsumer', TELEMETRY)
+    const input = make()
+    input.reference.control.kind = 'shareConsumer'
+    input.reference.journals = {
+      allocation: { byteLength: declared },
+      setupAllowanceBytes: 96 * MIB + declared,
+    }
+    return { input, declared }
+  }
+
+  test('allows the share consumer a setup peak of 96 MiB plus its exact declared journal bytes and no more', () => {
+    const { input, declared } = shareInput()
+    expect(declared).toBe(23188464)
+    setPeak(input, 96 * MIB + declared)
+    expect(evaluate(input)).toMatchObject({
+      ok: true,
+      outcome: 'passed',
+      violations: [],
+      inconclusive: [],
+      measured: { setupPeak: 96 * MIB + declared, setupAllowanceBytes: 96 * MIB + declared },
+    })
+    setPeak(input, 96 * MIB + declared + 1)
+    expect(evaluate(input)).toMatchObject({
+      ok: false,
+      outcome: 'inconclusive',
+      violations: [],
+      inconclusive: ['setup peak above its allowance'],
+    })
+  })
+
+  test('keeps the 96 MiB setup allowance for every other client kind', () => {
+    for (const kind of ['producer', 'consumer', 'admin']) {
+      const input = make()
+      input.reference.control.kind = kind
+      setPeak(input, 96 * MIB)
+      expect(evaluate(input)).toMatchObject({
+        ok: true,
+        measured: { setupPeak: 96 * MIB, setupAllowanceBytes: 96 * MIB },
+      })
+      setPeak(input, 96 * MIB + 1)
+      expect(evaluate(input).inconclusive).toEqual(['setup peak above its allowance'])
+    }
+  })
+
+  test('never raises the 64 MiB increase or the 160 MiB peak for the share consumer', () => {
+    const { input } = shareInput()
+    raise(input, 70 * MIB + 64 * MIB)
+    expect(evaluate(input)).toMatchObject({ ok: true, violations: [], inconclusive: [] })
+    raise(input, 70 * MIB + 64 * MIB + 1)
+    expect(evaluate(input).violations).toEqual(['telemetry resident-size increase'])
+    raise(input, 160 * MIB + 1)
+    expect(evaluate(input).violations).toEqual([
+      'telemetry resident-size increase',
+      'absolute resident-size peak',
+    ])
+  })
+
+  test('rejects a recorded setup allowance or declared allocation that differs from the recomputed value', () => {
+    expect(evaluate(shareInput().input).violations).toEqual([])
+    for (const [change, violations] of [
+      [(journals) => journals.setupAllowanceBytes++, ['recorded setup allowance']],
+      [(journals) => journals.setupAllowanceBytes--, ['recorded setup allowance']],
+      [(journals) => (journals.setupAllowanceBytes = 96 * MIB), ['recorded setup allowance']],
+      [(journals) => delete journals.setupAllowanceBytes, ['recorded setup allowance']],
+      [(journals) => journals.allocation.byteLength++, ['declared journal bytes']],
+      [(journals) => journals.allocation.byteLength--, ['declared journal bytes']],
+      [(journals) => delete journals.allocation, ['declared journal bytes']],
+    ]) {
+      const { input } = shareInput()
+      change(input.reference.journals)
+      expect(evaluate(input)).toMatchObject({ ok: false, outcome: 'failed', violations })
+    }
+    const missing = shareInput().input
+    delete missing.reference.journals
+    expect(evaluate(missing).violations).toEqual([
+      'recorded setup allowance',
+      'declared journal bytes',
+    ])
+    const relabelled = shareInput().input
+    relabelled.reference.control.kind = 'producer'
+    expect(evaluate(relabelled).violations).toEqual(['recorded setup allowance'])
+    const plain = make()
+    plain.reference.journals = { setupAllowanceBytes: 96 * MIB + 1 }
+    expect(evaluate(plain).violations).toEqual(['recorded setup allowance'])
+    plain.reference.journals.setupAllowanceBytes = 96 * MIB
+    expect(evaluate(plain)).toMatchObject({ ok: true, violations: [] })
+  })
+
   test('lets a failure take precedence over an inconclusive measurement', () => {
     const input = make()
     input.reference.capability.peak = false

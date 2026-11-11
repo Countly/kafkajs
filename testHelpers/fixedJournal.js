@@ -15,6 +15,8 @@ const TAG = Object.freeze({
   int32: 10,
   int16: 11,
   symbol: 12,
+  digest: 13,
+  int64: 14,
 })
 
 /** Fixed field names and bounded byte-only symbols for the share fact schema. */
@@ -56,9 +58,46 @@ const COLUMNS = Object.freeze([
 const SYMBOL_FIELDS = new Set(['segment', 'groupId', 'topicId', 'topic', 'type', 'name', 'reason'])
 const SYMBOL_SLOTS = 64
 const SYMBOL_BYTES = SYMBOL_SLOTS * 256
+/** Share fields that the packed layout stores as raw bytes when the text is exactly reconstructible. */
+const DIGEST_FIELDS = new Set(['requestSha256', 'responseSha256'])
+const OFFSET_FIELDS = new Set(['firstOffset', 'lastOffset'])
+const DIGEST = /^[0-9a-f]{64}$/
+const INT64 = /^(?:0|-?[1-9][0-9]{0,18})$/
+const INT64_LIMIT = 2n ** 63n
+/** Share layouts: field codes with label slots, and the same with raw digests and int64 offsets. */
+const COLUMNS_LAYOUT = 'columns'
+const PACKED_LAYOUT = 'packed'
+
+/** Format names by layout, as reported in the storage evidence. */
+const FORMATS = Object.freeze({
+  [COLUMNS_LAYOUT]: 'share-columns-utf8-1',
+  [PACKED_LAYOUT]: 'share-packed-1',
+  plain: 'scalar-utf8-1',
+})
 
 /** @param {string} value arbitrary JS string @returns {string} its lossless byte encoding */
 const stringEncoding = (value) => (value.isWellFormed() ? 'utf8' : 'utf16le')
+
+/**
+ * @param {string} value text @returns {bigint|null} its value when the text is the canonical decimal
+ *   of an int64, so that `String(result) === value`; otherwise null
+ */
+const int64Of = (value) => {
+  if (!INT64.test(value)) return null
+  const exact = BigInt(value)
+  return exact >= -INT64_LIMIT && exact < INT64_LIMIT ? exact : null
+}
+
+/**
+ * @param {string} value a well-formed string fact @param {string|null} key its containing field
+ * @returns {number|null} `TAG.digest` for lower-case SHA-256 hex or `TAG.int64` for a canonical
+ *   int64 offset under their share fields, otherwise null: the ordinary string encoding is exact
+ */
+const packedTag = (value, key) => {
+  if (DIGEST_FIELDS.has(key)) return DIGEST.test(value) ? TAG.digest : null
+  if (OFFSET_FIELDS.has(key)) return int64Of(value) === null ? null : TAG.int64
+  return null
+}
 
 /** @param {number} value scalar @returns {number} smallest exact numeric tag, preserving -0 */
 const numberTag = (value) => {
@@ -71,18 +110,21 @@ const numberTag = (value) => {
 /**
  * Counts the bytes before any write, rejecting product instances and cyclic or excessive nesting.
  * @param {*} value scalar, array or plain fact object @param {number} [depth] nesting level
- * @param {boolean} [columns] use share field codes @param {string|null} [key] containing field
+ * @param {string|null} [layout] share layout, or null for plain scalars
+ * @param {string|null} [key] containing field
  * @param {Set<string>|null} [symbols] temporary preflight labels, never retained
  * @returns {number} exact encoded length @throws {Error} for a non-fact value
  */
-const encodedSize = (value, depth = 0, columns = false, key = null, symbols = null) => {
+const encodedSize = (value, depth = 0, layout = null, key = null, symbols = null) => {
   if (depth > 64) throw new Error('Journal facts are cyclic or too deeply nested')
   if (value == null || typeof value === 'boolean') return 1
   if (typeof value === 'number')
     return numberTag(value) === TAG.int16 ? 3 : numberTag(value) === TAG.int32 ? 5 : 9
   if (typeof value === 'string') {
+    const tag = layout === PACKED_LAYOUT ? packedTag(value, key) : null
+    if (tag) return tag === TAG.digest ? 33 : 9
     const bytes = Buffer.byteLength(value, stringEncoding(value))
-    if (columns && SYMBOL_FIELDS.has(key) && bytes <= 249) {
+    if (layout && SYMBOL_FIELDS.has(key) && bytes <= 249) {
       symbols?.add(value)
       return 3
     }
@@ -91,7 +133,7 @@ const encodedSize = (value, depth = 0, columns = false, key = null, symbols = nu
   if (typeof value !== 'object') throw new Error('Journal accepts scalars and plain facts only')
   if (Array.isArray(value))
     return (
-      5 + value.reduce((sum, item) => sum + encodedSize(item, depth + 1, columns, null, symbols), 0)
+      5 + value.reduce((sum, item) => sum + encodedSize(item, depth + 1, layout, null, symbols), 0)
     )
   if (![Object.prototype, null].includes(Object.getPrototypeOf(value)))
     throw new Error('Journal cannot retain a product instance')
@@ -100,10 +142,10 @@ const encodedSize = (value, depth = 0, columns = false, key = null, symbols = nu
     Object.keys(value).reduce(
       (sum, key) =>
         sum +
-        (columns
+        (layout
           ? 1 + (COLUMNS.includes(key) ? 0 : encodedSize(key, depth + 1))
           : encodedSize(key, depth + 1)) +
-        encodedSize(value[key], depth + 1, columns, key, symbols),
+        encodedSize(value[key], depth + 1, layout, key, symbols),
       0
     )
   )
@@ -115,9 +157,12 @@ class FixedJournal {
    * @param {object} options @param {string} options.name overflow label
    * @param {number} options.capacity maximum entries @param {number} options.bytes arena capacity
    * @param {boolean} [options.columns] encode field names and repeated share labels in fixed columns
+   * @param {boolean} [options.packed] also store lower-case SHA-256 hex and canonical int64 offset
+   *   strings of the share fields as raw 32 and 8 bytes; implies `columns`, and any other string
+   *   keeps its ordinary lossless encoding
    * @returns {FixedJournal} fully touched storage, to allocate before the measurement baseline
    */
-  constructor({ name, capacity, bytes, columns = false }) {
+  constructor({ name, capacity, bytes, columns = false, packed = false }) {
     if (
       !Number.isSafeInteger(capacity) ||
       capacity < 1 ||
@@ -125,8 +170,9 @@ class FixedJournal {
       bytes < 1
     )
       throw new Error('Journal needs positive fixed capacities')
-    Object.assign(this, { name, capacity, columns, arenaBytes: bytes })
-    this.storage = Buffer.alloc(bytes + (columns ? SYMBOL_BYTES : 0), 0xa5)
+    const layout = packed ? PACKED_LAYOUT : columns ? COLUMNS_LAYOUT : null
+    Object.assign(this, { name, capacity, layout, arenaBytes: bytes })
+    this.storage = Buffer.alloc(bytes + (layout ? SYMBOL_BYTES : 0), 0xa5)
     this.symbols = 0
     this.cursor = 0
     this.length = 0
@@ -144,9 +190,9 @@ class FixedJournal {
    * @throws {Error} on capacity exhaustion or a non-fact value, before writing anything
    */
   push(...entries) {
-    const symbols = this.columns ? new Set() : null
+    const symbols = this.layout ? new Set() : null
     const bytes = entries.reduce(
-      (sum, entry) => sum + 4 + encodedSize(entry, 0, this.columns, null, symbols),
+      (sum, entry) => sum + 4 + encodedSize(entry, 0, this.layout, null, symbols),
       0
     )
     const newSymbols = symbols
@@ -163,7 +209,7 @@ class FixedJournal {
       )
     }
     for (const entry of entries) {
-      const size = encodedSize(entry, 0, this.columns)
+      const size = encodedSize(entry, 0, this.layout)
       this.storage.writeUInt32LE(size, this.cursor)
       this.cursor += 4
       this.write(entry)
@@ -186,11 +232,23 @@ class FixedJournal {
             ? TAG[String(value)]
             : TAG[typeof value]
     if (tag === TAG.number) tag = numberTag(value)
-    if (tag === TAG.object && this.columns) tag = TAG.columns
+    if (tag === TAG.object && this.layout) tag = TAG.columns
     if (tag === TAG.string && stringEncoding(value) === 'utf16le') tag = TAG.utf16
+    const packed =
+      this.layout === PACKED_LAYOUT && tag === TAG.string ? packedTag(value, key) : null
+    if (packed === TAG.digest) {
+      this.storage[this.cursor++] = TAG.digest
+      this.cursor += this.storage.write(value, this.cursor, 32, 'hex')
+      return
+    }
+    if (packed === TAG.int64) {
+      this.storage[this.cursor++] = TAG.int64
+      this.cursor = this.storage.writeBigInt64LE(int64Of(value), this.cursor)
+      return
+    }
     if (
       (tag === TAG.string || tag === TAG.utf16) &&
-      this.columns &&
+      this.layout &&
       SYMBOL_FIELDS.has(key) &&
       Buffer.byteLength(value, stringEncoding(value)) <= 249
     ) {
@@ -301,6 +359,14 @@ class FixedJournal {
         cursor += 8
         return value
       }
+      if (tag === TAG.digest) {
+        cursor += 32
+        return this.storage.toString('hex', cursor - 32, cursor)
+      }
+      if (tag === TAG.int64) {
+        cursor += 8
+        return String(this.storage.readBigInt64LE(cursor - 8))
+      }
       const length = this.storage.readUInt32LE(cursor)
       cursor += 4
       if (tag === TAG.string || tag === TAG.utf16) {
@@ -339,7 +405,7 @@ class FixedJournal {
     return {
       byteLength: this.byteLength,
       cursor: this.cursor + this.symbols * 256,
-      format: this.columns ? 'share-columns-utf8-1' : 'scalar-utf8-1',
+      format: FORMATS[this.layout ?? 'plain'],
       symbolCount: this.symbols,
       length: this.length,
       capacity: this.capacity,
@@ -489,4 +555,4 @@ class JournalConstancy {
   }
 }
 
-module.exports = { FixedJournal, HandlerJournal, JournalConstancy, journalState }
+module.exports = { FixedJournal, HandlerJournal, JournalConstancy, SYMBOL_BYTES, journalState }

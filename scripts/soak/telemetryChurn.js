@@ -47,6 +47,7 @@ const {
   FixedJournal,
   HandlerJournal,
   JournalConstancy,
+  SYMBOL_BYTES,
   journalState,
 } = require('../../testHelpers/fixedJournal')
 const gzipCodec = require('../../src/protocol/message/compression/gzip')
@@ -103,12 +104,26 @@ const ENGINE_ROWS = 64
 const WORKER_FLAGS = Object.freeze(['--expose-gc'])
 
 /**
+ * The proved worst-case encoded bytes of each share row in the `share-packed-1` layout, rounded up
+ * to a multiple of 16: an exchange header (167, with int32 identifiers, Float64 clocks, two raw
+ * 32-byte digests and every label in a slot), a request/response partition pair with its own
+ * topic wrappers (72), the acquired range plus acknowledgement batch of one record with int64
+ * offsets of 8 bytes each (63) and a public acknowledgement row with its error labels (67).
+ * Digests, offsets and labels that cannot be packed exactly cost more and overflow fatally.
+ */
+const SHARE_ROW_BYTES = Object.freeze({
+  header: 176,
+  partitionPair: 80,
+  record: 64,
+  acknowledgement: 80,
+})
+
+/**
  * Bounds the unchanged corpus, three-partition topology and session catalogue, not average traffic.
  * Empty/error rounds owe 50 ms per node (shareFetchLoop); 500 ms is only a maximum broker wait.
  * A productive fetch or a separate flush may carry just one record, not a full 100-record batch.
  * The 10% corpus margin covers extra deliveries; further traffic or shapes overflow fatally.
- * Headers reserve 256 bytes, request/response partition pairs 80, acquisition+ack+types per record
- * 128, and public ack rows 192. Field columns and byte-only label slots bound repeated names.
+ * Rows reserve their `SHARE_ROW_BYTES`; field columns and byte-only label slots bound repeated names.
  * @param {object} [limits] the unchanged telemetry schedule constants @returns {object} capacities
  */
 const journalLimits = (
@@ -126,13 +141,42 @@ const journalLimits = (
     records,
     batches: Math.ceil((batches * 11) / 10),
     exchanges,
-    exchangeBytes: exchanges * 256 + partitionPairs * 80 + records * 128,
+    exchangeBytes:
+      exchanges * SHARE_ROW_BYTES.header +
+      partitionPairs * SHARE_ROW_BYTES.partitionPair +
+      records * SHARE_ROW_BYTES.record,
     acknowledgements: records,
-    acknowledgementBytes: records * 192,
+    acknowledgementBytes: records * SHARE_ROW_BYTES.acknowledgement,
     receipts,
     samples: limits.sampleAt.length + 4,
     sampleBytes: (limits.sampleAt.length + 4) * 65536,
   }
+}
+
+/**
+ * The exact bytes a worker of `kind` allocates and fills before its disabled control, derived only
+ * from the journal limits: ordinary work (two 16-byte id ledgers, 32-byte handler rows with their
+ * completeness bitmap, 256-byte receipts, 16-byte producer slots), the native journal (2,048-byte
+ * rows) with its pending windows (256 bytes), the memory samples and, for the share consumer, both
+ * share archives with their label slots. The sizes mirror the owners that allocate them; a spec
+ * compares the sum with the storage the real owners hold.
+ * @param {string} kind a client kind
+ * @param {object} [limits] the telemetry schedule constants, as for `journalLimits`
+ * @returns {number} declared journal bytes
+ */
+const declaredJournalBytes = (kind, limits) => {
+  const storage = journalLimits(limits)
+  const ordinary =
+    2 * storage.records * 16 +
+    (storage.records * 32 + CORPUS.records) +
+    2 * storage.receipts * 256 +
+    storage.batches * 16
+  const native = NATIVE_ROWS * (2048 + 256)
+  const share =
+    kind === 'shareConsumer'
+      ? storage.exchangeBytes + storage.acknowledgementBytes + 2 * SYMBOL_BYTES
+      : 0
+  return ordinary + native + storage.sampleBytes + share
 }
 
 const CONTROL = Object.freeze({
@@ -1436,13 +1480,13 @@ class ShareLedger {
     this.traces = []
     this.exchanges = new FixedJournal({
       name: 'share exchanges',
-      columns: true,
+      packed: true,
       capacity: storage.exchanges,
       bytes: storage.exchangeBytes,
     })
     this.settled = new FixedJournal({
       name: 'share acknowledgements',
-      columns: true,
+      packed: true,
       capacity: storage.acknowledgements,
       bytes: storage.acknowledgementBytes,
     })
@@ -4324,8 +4368,9 @@ class TelemetryWorkerProcess {
         allocationAfterControlBeforeM: [],
         allocation,
         capacities: journalLimits(this.soak.TELEMETRY),
+        setupAllowanceBytes: this.soak.TelemetryResourceVerdict.setupAllowance(this.kind),
         rssEffect:
-          'All journal backing storage is touched before c0 and held through closed. It is included in the disabled RSS baseline, the 96 MiB setup allowance and the 160 MiB absolute peak; no bytes are subtracted from any reading.',
+          'All journal backing storage is touched before c0 and held through closed. It is included in the disabled RSS baseline, the setup allowance and the 160 MiB absolute peak. The setup allowance is 96 MiB, plus for the share consumer its exact declared journal bytes; no bytes are subtracted from any reading.',
       },
       native: { journal: journal.summary(), sampler: sampler.summary() },
       final: readMemory('final', () => this.clock.now()),
@@ -4632,8 +4677,11 @@ class TelemetryWorkerProcess {
 module.exports = {
   FixedJournal,
   JournalConstancy,
+  declaredJournalBytes,
   journalLimits,
   KINDS,
+  NATIVE_ROWS,
+  SHARE_ROW_BYTES,
   SCENARIO,
   SCHEDULE_STEPS: STEPS,
   MINIMUMS,
