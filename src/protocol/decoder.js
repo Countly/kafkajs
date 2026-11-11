@@ -197,6 +197,11 @@ module.exports = class Decoder {
     return value
   }
 
+  /**
+   * Reads a VarInt-prefixed UTF-8 string directly from the checked byte range, without a Buffer view.
+   * @returns {string|null} the string, or null for a length of -1
+   * @throws {KafkaJSPartialMessageError} when the length is below -1 or the bytes are truncated
+   */
   readVarIntString() {
     const byteLength = this.readVarInt()
 
@@ -205,8 +210,7 @@ module.exports = class Decoder {
     }
 
     this.ensureReadable(byteLength, 'readVarIntString')
-    const stringBuffer = this.buffer.slice(this.offset, this.offset + byteLength)
-    const value = stringBuffer.toString('utf8')
+    const value = this.buffer.toString('utf8', this.offset, this.offset + byteLength)
     this.offset += byteLength
     return value
   }
