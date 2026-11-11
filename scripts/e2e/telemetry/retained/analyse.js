@@ -3,11 +3,12 @@
 
 const fs = require('node:fs')
 const path = require('node:path')
-const { analyseSnapshot, ownershipIndex, auditReferences } = require('./heapDiff')
-const { ephemeronLiveness, refineOwnership, selfLedger } = require('./ownership')
+const { analyseSnapshot, ownershipIndex, prepareReferenceAudits } = require('./heapDiff')
+const { prepareEphemerons, refineOwnership, selfLedger } = require('./ownership')
 const { replay, verifySources } = require('../retainedDiagnostic')
 const { CAPTURES, CATALOGUE, validateCatalogue, digest } = require('./contract')
 const { backingInventory, backingComparison } = require('./coldOwnership')
+const { censusSnapshot, censusComparison } = require('./census')
 
 /**
  * Reads one authenticated graph and records semantic liveness independently of ordinary dominators.
@@ -17,7 +18,8 @@ const read = (file) => {
   const bytes = fs.readFileSync(file)
   const raw = JSON.parse(bytes)
   const graph = analyseSnapshot(raw)
-  const semantic = ephemeronLiveness(raw)
+  const ephemerons = prepareEphemerons(raw)
+  const semantic = ephemerons.liveness()
   const labels = refineOwnership(graph).labels
   const conservativeOnly = []
   for (let v = 0; v < graph.n; v++)
@@ -32,6 +34,7 @@ const read = (file) => {
     graph,
     labels,
     semantic,
+    ephemerons,
     conservativeOnly,
   }
 }
@@ -84,6 +87,7 @@ const details = (before, after) => {
   const material = []
   const backingStores = []
   const audits = []
+  const preparedAudits = prepareReferenceAudits(graph)
   const index = ownershipIndex(graph)
   for (let v = 0; v < graph.n; v++) {
     if (graph.groupIndex[v] < 0) continue
@@ -105,7 +109,6 @@ const details = (before, after) => {
         properties: graph
           .outgoing(v, true)
           .map(({ target, edge }) => ({ edge, target: graph.describe(target) })),
-        sourceExpectations: LIFETIMES,
       }
       material.push(trace)
       if (store) backingStores.push(trace)
@@ -116,20 +119,16 @@ const details = (before, after) => {
       (/FeedbackVector|FeedbackCell/.test(node.name) ||
         (node.type === 'closure' && /Telemetry|Connection|Share|MemoryForeground/.test(node.name)))
     )
-      audits.push(
-        auditReferences(graph, v, {
-          maxNodes: Infinity,
-          maxDepth: Infinity,
-          maxReferences: Infinity,
-          includePaths: false,
-        })
-      )
+      audits.push(preparedAudits.audit(v))
   }
   return {
     material,
+    sourceExpectations: LIFETIMES,
     backingStores,
     anchors: index.anchors.map(({ index: ignored, ...anchor }) => anchor),
     audits,
+    auditFormat: 'audits[].table indexes auditTables; root traces remain per root',
+    auditTables: preparedAudits.tables,
   }
 }
 
@@ -152,11 +151,16 @@ const main = async (directory) => {
   const summary = JSON.parse(fs.readFileSync(path.join(directory, 'diagnostic-summary.json')))
   const runProblems = validateCatalogue(summary.results)
   const replays = []
+  const verifiedSources = new Set()
   for (const tuple of CATALOGUE) {
     const child = path.join(directory, `${tuple.arm}-${tuple.kind}-${tuple.variant}`)
     try {
       const record = JSON.parse(fs.readFileSync(path.join(child, 'record.json')))
-      verifySources(directory, record.identity.sources)
+      const sourceKey = digest(Buffer.from(JSON.stringify(record.identity.sources)))
+      if (!verifiedSources.has(sourceKey)) {
+        verifySources(directory, record.identity.sources)
+        verifiedSources.add(sourceKey)
+      }
       const reviewed = await replay(child, record.identity, record.exit)
       replays.push({
         ...tuple,
@@ -188,6 +192,9 @@ const main = async (directory) => {
     const snapshots = []
     const cold = []
     const coldOwners = []
+    let matchedCensus
+    let previousCensus
+    const ownerCensus = []
     for (const name of CAPTURES) {
       const capture = captures.find((row) => row.name === name)
       if (!capture) continue
@@ -195,6 +202,48 @@ const main = async (directory) => {
       if (current.bytes !== capture.bytes || current.sha256 !== capture.sha256)
         throw new Error('offline capture authentication failed')
       const report = details(previous, current)
+      if (['M', 'closed-0', 'closed-5', 'all-released'].includes(name)) {
+        const census = censusSnapshot(current)
+        if (name === 'M') matchedCensus = census
+        const file = `census-${name}.json`
+        fs.writeFileSync(
+          path.join(child, file),
+          JSON.stringify({
+            ...census,
+            name,
+            identityFile: 'record.json',
+            checkpoint: capture,
+            journals: {
+              logBackingBytes: events.find((event) => event.type === 'manifest')?.manifest.capacity
+                .eventBytes,
+              logCursorBeforeCheckpoint: capture.sequence,
+              logBytesBeforeCheckpoint: events
+                .slice(0, capture.sequence)
+                .reduce((sum, event) => sum + Buffer.byteLength(JSON.stringify(event) + '\n'), 0),
+              recordedAfterCapture: events
+                .filter((event) => event.sequence > capture.sequence && event.type === 'block')
+                .slice(0, 1)
+                .map((block) => ({
+                  sequence: block.sequence,
+                  index: block.index,
+                  nativeRows: block.native.rows.length,
+                  pendingWindows: block.samples.windows,
+                  nativeCapacity: events[0].manifest.capacity.native,
+                  windowCapacity: events[0].manifest.capacity.windows,
+                })),
+            },
+            sha256: current.sha256,
+            reading: capture.pre,
+            processRetainedBytes: capture.pre.heapUsed + capture.pre.external,
+            graphMinusProcessBytes:
+              census.totalSelfBytes - capture.pre.heapUsed - capture.pre.external,
+            originalM: matchedCensus ? censusComparison(matchedCensus, census) : null,
+            consecutive: previousCensus ? censusComparison(previousCensus, census) : null,
+          })
+        )
+        ownerCensus.push({ name, file, unresolvedBytes: census.totals.unresolved })
+        previousCensus = census
+      }
       if (['M', 'closed-0', 'closed-5', 'all-released'].includes(name)) {
         cold.push({ name, sha256: current.sha256, backingStores: backingInventory(current) })
         if (name === 'closed-0')
@@ -223,11 +272,8 @@ const main = async (directory) => {
         (pair) => pair.active && !pair.independentlyReachableValue
       )
       const dependencies = new Set(conditional.flatMap((pair) => [pair.tableId, pair.keyId]))
-      const raw = dependencies.size
-        ? JSON.parse(fs.readFileSync(path.join(child, capture.file)))
-        : null
       const dependencyRemoval = [...dependencies].map((id) => {
-        const removed = ephemeronLiveness(raw, [id])
+        const removed = current.ephemerons.liveness([id])
         return {
           id,
           lostConditionalValues: conditional
@@ -327,6 +373,7 @@ const main = async (directory) => {
         snapshots,
         comparisons,
         coldReport: 'cold-ownership.json',
+        ownerCensus,
         lifetimeExpectations: LIFETIMES,
         limitations:
           'Self bytes are additive; retained subtrees overlap and are never summed. Ordinary dominators conservatively include labelled pair edges; semantic AND(table,key) liveness and dependency-removal facts are separate. No subtraction from pre-capture heapUsed. Every residual/unclassified bucket and material named path requires owner review; flat later bytes do not establish cold ownership.',

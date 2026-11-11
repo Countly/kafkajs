@@ -8,8 +8,10 @@ const { ownershipIndex } = require('./heapDiff')
  * reachability excludes both copies of the labelled pair edge and all weak edges.
  * Removing a dependency and recomputing the least fixed point tests conditional
  * retention; an activated edge alone is NOT an ordinary dominator relation.
+ * @param {object} raw V8 snapshot @returns {object} reusable liveness evaluator
+ * @throws {Error} on malformed labelled dependencies
  */
-const ephemeronLiveness = (raw, excludedIds = []) => {
+const prepareEphemerons = (raw) => {
   const { nodes, edges, strings, snapshot } = raw
   const meta = snapshot.meta
   const nf = meta.node_fields.length
@@ -54,42 +56,53 @@ const ephemeronLiveness = (raw, excludedIds = []) => {
       } else if (type !== 'weak') ordinary[v].push(target)
     }
   }
-  const excluded = new Set(excludedIds.map((id) => byId.get(id)))
-  const reached = new Set()
-  const queue = []
-  const add = (v) => {
-    if (!reached.has(v) && !excluded.has(v)) {
-      reached.add(v)
-      queue.push(v)
+  const liveness = (excludedIds = []) => {
+    const excluded = new Set(excludedIds.map((id) => byId.get(id)))
+    const reached = new Set()
+    const queue = []
+    const add = (v) => {
+      if (!reached.has(v) && !excluded.has(v)) {
+        reached.add(v)
+        queue.push(v)
+      }
+    }
+    const drain = () => {
+      for (let cursor = 0; cursor < queue.length; cursor++)
+        for (const target of ordinary[queue[cursor]]) add(target)
+      queue.length = 0
+    }
+    add((snapshot.root_index ?? 0) / nf)
+    drain()
+    const ordinaryIds = new Set([...reached].map((v) => nodes[v * nf + idAt]))
+    let changed
+    do {
+      const oldSize = reached.size
+      for (const { tableId, keyId, valueId } of pairs.values())
+        if (reached.has(byId.get(tableId)) && reached.has(byId.get(keyId))) add(byId.get(valueId))
+      drain()
+      changed = reached.size !== oldSize
+    } while (changed)
+    const reachableIds = new Set([...reached].map((v) => nodes[v * nf + idAt]))
+    return {
+      ordinaryIds,
+      reachableIds,
+      pairs: [...pairs.values()].map((pair) => ({
+        ...pair,
+        active: reachableIds.has(pair.tableId) && reachableIds.has(pair.keyId),
+        independentlyReachableValue: ordinaryIds.has(pair.valueId),
+      })),
     }
   }
-  const drain = () => {
-    for (let cursor = 0; cursor < queue.length; cursor++)
-      for (const target of ordinary[queue[cursor]]) add(target)
-    queue.length = 0
-  }
-  add((snapshot.root_index ?? 0) / nf)
-  drain()
-  const ordinaryIds = new Set([...reached].map((v) => nodes[v * nf + idAt]))
-  let changed
-  do {
-    const oldSize = reached.size
-    for (const { tableId, keyId, valueId } of pairs.values())
-      if (reached.has(byId.get(tableId)) && reached.has(byId.get(keyId))) add(byId.get(valueId))
-    drain()
-    changed = reached.size !== oldSize
-  } while (changed)
-  const reachableIds = new Set([...reached].map((v) => nodes[v * nf + idAt]))
-  return {
-    ordinaryIds,
-    reachableIds,
-    pairs: [...pairs.values()].map((pair) => ({
-      ...pair,
-      active: reachableIds.has(pair.tableId) && reachableIds.has(pair.keyId),
-      independentlyReachableValue: ordinaryIds.has(pair.valueId),
-    })),
-  }
+  return { liveness }
 }
+
+/**
+ * Evaluates semantic liveness; repeated exclusions should use one prepared index.
+ * @param {object} raw V8 snapshot @param {number[]} [excludedIds] removed dependencies
+ * @returns {object} ordinary and conditional live IDs and pair facts
+ * @throws {Error} on malformed ephemeron labels
+ */
+const ephemeronLiveness = (raw, excludedIds = []) => prepareEphemerons(raw).liveness(excludedIds)
 
 /**
  * Identifies only the observer's row array, element storage, rows, kind strings and WeakRefs.
@@ -274,4 +287,4 @@ const selfLedger = (before, after, beforeLabels, afterLabels) => {
   return rows
 }
 
-module.exports = { ephemeronLiveness, refineOwnership, selfLedger }
+module.exports = { prepareEphemerons, ephemeronLiveness, refineOwnership, selfLedger }

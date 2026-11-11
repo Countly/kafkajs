@@ -37,7 +37,15 @@ const archiveSources = (directory) => {
       for (const name of fs.readdirSync(absolute).sort()) visit(path.join(relative, name))
     } else if (/\.(js|json)$/.test(relative)) files.push(relative)
   }
-  for (const source of ['src', 'testHelpers', 'scripts/e2e/telemetry', 'index.js', 'package.json'])
+  for (const source of [
+    'src',
+    'testHelpers',
+    'scripts/soak',
+    'scripts/e2e/telemetry',
+    'index.js',
+    'package.json',
+    'package-lock.json',
+  ])
     visit(source)
   return files.sort().map((file) => {
     const bytes = fs.readFileSync(path.join(ROOT, file))

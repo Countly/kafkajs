@@ -12,7 +12,6 @@ const backingInventory = ({ graph, labels, semantic }) => {
   for (let v = 0; v < graph.n; v++) {
     const node = graph.describe(v)
     byId.set(node.id, v)
-    if (graph.groupIndex[v] < 0) continue
     if (/JSArrayBufferData/.test(node.name)) stores.add(v)
     for (const { target, edge } of graph.outgoing(v))
       if (edge.name === 'backing_store') stores.add(target)
@@ -23,7 +22,7 @@ const backingInventory = ({ graph, labels, semantic }) => {
     const aliases = new Map()
     for (const wrapper of wrappers)
       for (const entry of graph.incoming(byId.get(wrapper.owner.id)))
-        if (/^(Buffer|Uint8Array|DataView)$/.test(entry.owner.name))
+        if (/^(Buffer|\w+Array|DataView)$/.test(entry.owner.name))
           aliases.set(entry.owner.id, {
             ...entry.owner,
             edge: entry.edge,

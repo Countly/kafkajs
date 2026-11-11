@@ -207,6 +207,7 @@ const analyseSnapshot = ({ snapshot, nodes, edges, strings }) => {
     }
   }
   const rootPath = (v) => {
+    if (rootParent[v] === -1) return []
     const result = []
     while (true) {
       const e = rootEdge[v]
@@ -268,6 +269,19 @@ const analyseSnapshot = ({ snapshot, nodes, edges, strings }) => {
     idom,
     describe,
     rootPath,
+    rootLink: (v) => {
+      const parent = rootParent[v]
+      if (parent === -1 || v === root) return { parentId: null, edge: null }
+      const e = rootEdge[v]
+      const type = edgeTypes[edges[e + et]]
+      return {
+        parentId: describe(parent).id,
+        edge: {
+          type,
+          name: ['element', 'hidden'].includes(type) ? edges[e + en] : strings[edges[e + en]],
+        },
+      }
+    },
     groupIndex,
     outgoing,
     incoming,
@@ -515,4 +529,75 @@ const auditReferences = (graph, start, options = {}) => {
   }
 }
 
-module.exports = { analyseSnapshot, ownershipIndex, auditReferences }
+/**
+ * Shares uncapped path-free audit tables between roots in the same strong component.
+ * Root traces stay distinct. Components use exactly the audit's traversal boundaries.
+ * @param {object} graph analysed snapshot @returns {object} lazy audit lookup and shared tables
+ */
+const prepareReferenceAudits = (graph) => {
+  const forward = Array.from({ length: graph.n }, () => [])
+  const reverse = Array.from({ length: graph.n }, () => [])
+  for (let v = 0; v < graph.n; v++)
+    for (const { target, edge } of graph.outgoing(v)) {
+      const node = graph.describe(target)
+      if (/string/.test(node.type) || node.type === 'synthetic' || edge.name === '__proto__')
+        continue
+      forward[v].push(target)
+      reverse[target].push(v)
+    }
+  const seen = new Uint8Array(graph.n)
+  const order = []
+  for (let v = 0; v < graph.n; v++) {
+    if (seen[v]) continue
+    const stack = [[v, 0]]
+    seen[v] = 1
+    while (stack.length) {
+      const top = stack[stack.length - 1]
+      if (top[1] === forward[top[0]].length) {
+        order.push(top[0])
+        stack.pop()
+      } else {
+        const target = forward[top[0]][top[1]++]
+        if (!seen[target]) {
+          seen[target] = 1
+          stack.push([target, 0])
+        }
+      }
+    }
+  }
+  const components = new Int32Array(graph.n).fill(-1)
+  for (let i = order.length - 1; i >= 0; i--) {
+    const v = order[i]
+    if (components[v] !== -1) continue
+    const stack = [v]
+    components[v] = v
+    while (stack.length)
+      for (const target of reverse[stack.pop()])
+        if (components[target] === -1) {
+          components[target] = v
+          stack.push(target)
+        }
+  }
+  const cache = new Map()
+  const tables = []
+  return {
+    tables,
+    audit: (start) => {
+      const component = components[start]
+      if (!cache.has(component)) {
+        const { node, ownerTrace, ...facts } = auditReferences(graph, start, {
+          includePaths: false,
+        })
+        cache.set(component, tables.length)
+        tables.push(facts)
+      }
+      return {
+        node: graph.describe(start),
+        ownerTrace: traceOwner(graph, start),
+        table: cache.get(component),
+      }
+    },
+  }
+}
+
+module.exports = { analyseSnapshot, ownershipIndex, auditReferences, prepareReferenceAudits }
