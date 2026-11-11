@@ -57,6 +57,13 @@ const originalShareSchedule = async ({
   observeRow = () => {},
   processResources,
 } = {}) => {
+  const environment = { ...process.env }
+  if (twoScopes)
+    Object.assign(process.env, {
+      KAFKAJS_LANE: 'docker',
+      KAFKAJS_SOAK_PROFILE: short ? 'short' : 'full',
+      [short ? 'SHARE_SOAK_E2E' : 'SHARE_SOAK_FULL']: '1',
+    })
   const clock = new ShareClock().install()
   const osOrigin = process.hrtime.bigint()
   const cleanupClock = correlateCleanup
@@ -637,6 +644,7 @@ const originalShareSchedule = async ({
       globalThis.gc = exposed
       cleanupClock?.mockRestore()
       clock.restore()
+      process.env = environment
     }
   }
   if (cleanupErrors.length) {

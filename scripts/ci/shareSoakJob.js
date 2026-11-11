@@ -29,6 +29,19 @@ const write = (file, value) => fs.writeFileSync(file, JSON.stringify(value, null
 const git = (args) => execFileSync('git', args, { encoding: 'utf8' }).trim()
 
 /**
+ * Verifies the exact tested PR merge parents, including shallow runner checkouts.
+ * @param {object} pr Original GitHub PR head/base identities.
+ * @param {Function} [run=git] Git command reader in the tested checkout.
+ * @returns {void}
+ * @throws {Error} On a non-merge or mismatched parent pair.
+ */
+const verifyMergeParents = (pr, run = git) => {
+  const parents = run(['show', '-s', '--format=%P', 'HEAD']).split(' ')
+  if (parents.length !== 2 || !parents.includes(pr.head.sha) || !parents.includes(pr.base.sha))
+    throw new Error('Unexpected tested merge relationship')
+}
+
+/**
  * Freezes every tracked byte, including the full source dependency closure.
  * Dependency installs and the single output root are the only untracked exceptions.
  * @returns {object} Commit, Git tree object and sorted path/length/hash inventory.
@@ -180,9 +193,7 @@ class ShareSoakJob {
     this.env.KAFKAJS_TREE = source.commit
     if (this.env.GITHUB_EVENT_NAME === 'pull_request') {
       const pr = read(this.env.GITHUB_EVENT_PATH).pull_request
-      const parents = git(['show', '-s', '--format=%P', 'HEAD']).split(' ')
-      if (!parents.includes(pr.head.sha) || !parents.includes(pr.base.sha))
-        throw new Error('Unexpected tested merge relationship')
+      verifyMergeParents(pr)
     }
     const environment = environmentIdentity(childEnvironment(profile, this.env))
     const event = read(this.env.GITHUB_EVENT_PATH)
@@ -610,4 +621,12 @@ if (require.main === module) {
     process.exitCode = 1
   })
 }
-module.exports = { ShareSoakJob, sourceIdentity, admit, inventory, seal, STAGES }
+module.exports = {
+  ShareSoakJob,
+  sourceIdentity,
+  verifyMergeParents,
+  admit,
+  inventory,
+  seal,
+  STAGES,
+}

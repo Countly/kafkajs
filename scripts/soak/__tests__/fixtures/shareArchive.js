@@ -178,14 +178,17 @@ const shareArchive = (root, recording, short) => {
     GITHUB_WORKFLOW_REF: contract.workflowRef,
     GITHUB_WORKFLOW_SHA: contract.workflowSha,
   }
-  const seal = () =>
-    write('seal.json', {
+  const seal = (validation) => {
+    if (validation)
+      write('validation.json', { ...validation, semanticSha256: digest(JSON.stringify(rows)) })
+    return write('seal.json', {
       complete: true,
       files: inventory(root),
       contractSha256: digest(fs.readFileSync(path.join(root, 'contract.json'))),
       excluded: ['seal.json'],
       root: '.',
     })
+  }
   const finish = (validation) => {
     write('validation.json', validation)
     for (const name of ['verify', 'logs', 'teardown', 'seal'])

@@ -175,6 +175,27 @@ describe('two-scope original share driver', () => {
             /replication\/retention/,
           ],
           [
+            'soak-original-cycle',
+            (r) => {
+              const observation = r.observation
+              const source = observation.provenance.exchanges.find(
+                (e) =>
+                  e.id ===
+                  observation.provenance.acquisitions.find(
+                    (a) => a.id === observation.resetTarget.acquisition
+                  ).exchange
+              )
+              const reopen = observation.provenance.exchanges.find(
+                (e) =>
+                  e.frames[0]?.socket === observation.reset.nextSocket &&
+                  e.frames[0].request.shareSessionEpoch === 0
+              )
+              reopen.pool = source.pool
+              reopen.generation = source.generation
+            },
+            /reset transport\/generation/,
+          ],
+          [
             'soak-cleanup',
             (r) => {
               r.after.queueDepth++
@@ -187,6 +208,7 @@ describe('two-scope original share driver', () => {
             (r) =>
               r.scope === 'scored' &&
               r.event === event &&
+              (event !== 'soak-original-cycle' || r.cycle === 10) &&
               (event !== 'soak-cleanup' || r.step === 'cleanup-resources')
           )
           expect(index).toBeGreaterThanOrEqual(0)
@@ -202,8 +224,139 @@ describe('two-scope original share driver', () => {
           expect(rejected.problems).not.toContain('Changed/incomplete artifact seal')
           archive.rows[index] = before
         }
+        const { SoakTransport } = require('./fixtures/soakTransport')
+        const { reply } = require('./fixtures/soakReplies')
+        const topic = archive.rows.find(
+          (r) => r.event === 'soak-configuration' && r.scope === 'scored'
+        ).config.topic
+        const mutations = [
+          [
+            'send',
+            0,
+            'Produce',
+            () => true,
+            (f) => {
+              f.Responses[0].PartitionResponses[0].BaseOffset = '1'
+            },
+          ],
+          [
+            'describeConfigs',
+            32,
+            'DescribeConfigs',
+            (r) => r.resources[0].resourceType === 32,
+            (f) => {
+              f.Results[0].Configs.find((e) => e.Name === 'share.record.lock.duration.ms').Value =
+                '30001'
+            },
+          ],
+          [
+            'describeConfigs',
+            32,
+            'DescribeConfigs',
+            (r) => r.resources[0].resourceType === 2,
+            (f) => {
+              f.Results[0].Configs.find((e) => e.Name === 'min.insync.replicas').Value = '1'
+            },
+          ],
+          [
+            'fetchTopicMetadata',
+            3,
+            'Metadata',
+            () => true,
+            (f) => {
+              f.Topics[0].Partitions[0].ReplicaNodes.pop()
+            },
+          ],
+          [
+            'listShareGroupOffsets:named',
+            90,
+            'DescribeShareGroupOffsets',
+            () => true,
+            (f) => {
+              f.Groups[0].Topics[0].Partitions[0].StartOffset = '1'
+            },
+          ],
+          [
+            'listShareGroupOffsets:all',
+            90,
+            'DescribeShareGroupOffsets',
+            () => true,
+            (f) => {
+              f.Groups[0].Topics[0].Partitions[0].Lag = '1'
+            },
+          ],
+          [
+            'fetchTopicOffsets',
+            2,
+            'ListOffsets',
+            () => true,
+            (f) => {
+              f.Topics[0].Partitions[0].Offset = '1'
+            },
+          ],
+          [
+            'describeShareGroups',
+            77,
+            'ShareGroupDescribe',
+            (r) => r.groups[0].members.length > 0,
+            (f) => {
+              f.Groups[0].Members[0].Assignment.TopicPartitions[0].Partitions.pop()
+            },
+          ],
+        ]
+        for (const [name, apiKey, api, select, mutate] of mutations) {
+          const operation = archive.rows.find(
+            (r) =>
+              r.scope === 'scored' &&
+              r.event === 'soak-wire' &&
+              r.kind === 'operation' &&
+              r.status === 'passed' &&
+              r.name === name &&
+              select(r.result)
+          )
+          expect(operation).toBeDefined()
+          const request = archive.rows.find(
+            (r) =>
+              r.scope === 'scored' &&
+              r.kind === 'request' &&
+              r.operationId === operation.id &&
+              r.apiKey === apiKey
+          )
+          expect(request).toBeDefined()
+          const response = archive.rows.find(
+            (r) =>
+              r.scope === 'scored' &&
+              r.kind === 'response' &&
+              r.socket === request.socket &&
+              r.frame === request.frame
+          )
+          const before = response.bytes
+          const options = name === 'fetchTopicOffsets' ? topic : operation.target
+          const fields = SoakTransport.prototype.resultFields(
+            name.split(':')[0],
+            [options],
+            operation.result
+          )
+          mutate(fields)
+          const bytes = Buffer.concat([
+            Buffer.from(before, 'base64').subarray(0, 9),
+            reply(api, request.apiVersion, fields),
+          ])
+          bytes.writeInt32BE(bytes.length - 4, 0)
+          response.bytes = bytes.toString('base64')
+          archive.writeRows()
+          archive.seal(first)
+          const rejected = await validateArchive(archive.contract, root, {
+            provenance: archive.provenance,
+          })
+          expect(rejected.problems).not.toContain('Changed/incomplete artifact seal')
+          expect(rejected.problems.join('; ')).toMatch(
+            new RegExp(`Original operation ${operation.id}/${name}: decoded values differ`)
+          )
+          response.bytes = before
+        }
         archive.writeRows()
-        archive.seal()
+        archive.seal(first)
         const foreign = await validateArchive(archive.contract, root, {
           provenance: { ...archive.provenance, attempt: '2' },
         })

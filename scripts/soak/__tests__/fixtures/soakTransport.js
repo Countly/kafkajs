@@ -132,6 +132,25 @@ class SoakTransport {
    * @returns {object} Literal upstream fields; failed operations never reach this method.
    */
   resultFields(name, [options], result) {
+    if (name === 'describeCluster')
+      return {
+        Brokers: result.brokers.map((b) => ({ BrokerId: b.nodeId, Host: b.host, Port: b.port })),
+      }
+    if (name === 'fetchTopicMetadata' || name === 'listTopics')
+      return {
+        Topics: (name === 'listTopics'
+          ? result.map((name) => ({ name, partitions: [] }))
+          : result.topics
+        ).map((t) => ({
+          Name: t.name,
+          TopicId: t.topicId,
+          Partitions: t.partitions.map((p) => ({
+            PartitionIndex: p.partitionId,
+            LeaderId: p.leader,
+            ReplicaNodes: p.replicas,
+          })),
+        })),
+      }
     if (name === 'listGroups') return { Groups: result.groups.map((g) => ({ GroupId: g.groupId })) }
     if (name === 'describeConfigs')
       return {

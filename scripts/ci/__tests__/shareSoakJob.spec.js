@@ -1,8 +1,8 @@
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { spawnSync } = require('node:child_process')
-const { admit, inventory, ShareSoakJob } = require('../shareSoakJob')
+const { execFileSync, spawnSync } = require('node:child_process')
+const { admit, inventory, ShareSoakJob, verifyMergeParents } = require('../shareSoakJob')
 const {
   PROFILES,
   childArgs,
@@ -41,6 +41,37 @@ describe('share soak CI lifecycle controls', () => {
       expect(() => childEnvironment('short', { [key]: 'override' })).toThrow()
     }
   )
+
+  test('verifies real merge parents in a depth-one checkout without accepting a foreign head', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'share-shallow-'))
+    const source = path.join(root, 'source')
+    const clone = path.join(root, 'clone')
+    const git = (cwd, args) => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim()
+    try {
+      fs.mkdirSync(source)
+      git(source, ['init', '-b', 'base'])
+      git(source, ['config', 'user.name', 'Fixture'])
+      git(source, ['config', 'user.email', 'fixture@example.com'])
+      git(source, ['-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-m', 'base'])
+      const base = git(source, ['rev-parse', 'HEAD'])
+      git(source, ['checkout', '-b', 'head'])
+      git(source, ['-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-m', 'head'])
+      const head = git(source, ['rev-parse', 'HEAD'])
+      git(source, ['checkout', 'base'])
+      git(source, ['-c', 'commit.gpgsign=false', 'merge', '--no-ff', 'head', '-m', 'merge'])
+      git(root, ['clone', '--depth=1', `file://${source}`, clone])
+      const run = (args) => git(clone, args)
+      expect(run(['show', '-s', '--format=%P', 'HEAD'])).toBe('')
+      expect(() =>
+        verifyMergeParents({ head: { sha: head }, base: { sha: base } }, run)
+      ).not.toThrow()
+      expect(() =>
+        verifyMergeParents({ head: { sha: base }, base: { sha: 'f'.repeat(40) } }, run)
+      ).toThrow(/merge relationship/)
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
 
   test('binds the fixed full CLI and exposed-GC short Jest report', () => {
     expect(childArgs('full')).toEqual([

@@ -239,6 +239,148 @@ describe('share soak independent acceptance controls', () => {
     }
   })
 
+  test.each([
+    [
+      'Produce base offset',
+      'send',
+      'Produce',
+      { Responses: [{ Name: 'topic', PartitionResponses: [{ Index: 0, BaseOffset: '1' }] }] },
+    ],
+    [
+      'group configuration',
+      'describeConfigs',
+      'DescribeConfigs',
+      {
+        Results: [
+          {
+            ResourceType: 32,
+            ResourceName: 'owned',
+            Configs: [{ Name: 'share.auto.offset.reset', Value: 'latest', ConfigSource: 8 }],
+          },
+        ],
+      },
+    ],
+    [
+      'terminal lag',
+      'listShareGroupOffsets',
+      'DescribeShareGroupOffsets',
+      {
+        Groups: [
+          {
+            GroupId: 'owned',
+            Topics: [
+              {
+                TopicName: 'topic',
+                TopicId: '00000000-0000-4000-8000-000000000001',
+                Partitions: [{ PartitionIndex: 0, StartOffset: '0', Lag: '1', LeaderEpoch: 1 }],
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  ])(
+    'rejects changed decoded %s with the original operation result unchanged',
+    async (_label, method, api, fields) => {
+      const { ShareFetchTap } = require('../../soak/soak')
+      const { SoakTransport } = require('../../soak/__tests__/fixtures/soakTransport')
+      const { reply } = require('../../soak/__tests__/fixtures/soakReplies')
+      const tap = new ShareFetchTap()
+      const rows = []
+      tap.archive = (row) => rows.push(original({ event: 'soak-wire', ...row }))
+      const transport = new SoakTransport(tap)
+      try {
+        const client =
+          method === 'send'
+            ? transport.producer({
+                send: async () => [{ partition: 0, baseOffset: '0', errorCode: 0 }],
+              })
+            : transport.admin({
+                describeConfigs: async () => ({
+                  resources: [
+                    {
+                      resourceType: 32,
+                      resourceName: 'owned',
+                      errorCode: 0,
+                      configEntries: [
+                        {
+                          configName: 'share.auto.offset.reset',
+                          configValue: 'earliest',
+                          configSource: 8,
+                        },
+                      ],
+                    },
+                  ],
+                }),
+                listShareGroupOffsets: async () => [
+                  {
+                    topic: 'topic',
+                    topicId: '00000000-0000-4000-8000-000000000001',
+                    partitions: [
+                      { partition: 0, startOffset: '0', lag: '0', leaderEpoch: 1, errorCode: 0 },
+                    ],
+                  },
+                ],
+              })
+        await client[method]({
+          topic: 'topic',
+          acks: -1,
+          groupId: 'owned',
+          resources: [{ type: 32, name: 'owned' }],
+          messages: [
+            {
+              partition: 0,
+              key: Buffer.from('k'),
+              value: Buffer.from('v'),
+              timestamp: '1700000000000',
+            },
+          ],
+        })
+        const before = await verifyProtocolAnswers(rows)
+        expect(before.problems.filter((p) => p.startsWith('Original operation'))).toEqual([])
+        const request = rows.find((r) => r.kind === 'request' && r.apiKey !== 18)
+        const response = rows.find(
+          (r) => r.kind === 'response' && r.socket === request.socket && r.frame === request.frame
+        )
+        const bytes = Buffer.concat([
+          Buffer.from(response.bytes, 'base64').subarray(0, 9),
+          reply(api, request.apiVersion, fields),
+        ])
+        bytes.writeInt32BE(bytes.length - 4, 0)
+        response.bytes = bytes.toString('base64')
+        const result = await verifyProtocolAnswers(rows)
+        expect(result.problems).toContain(
+          `Original operation ${request.operationId}/${request.operation}: decoded values differ`
+        )
+      } finally {
+        transport.close()
+      }
+    }
+  )
+
+  test('reconciles absent-group replies without counting them as successful coverage', async () => {
+    const { ShareFetchTap } = require('../../soak/soak')
+    const { SoakTransport } = require('../../soak/__tests__/fixtures/soakTransport')
+    const tap = new ShareFetchTap()
+    const rows = []
+    tap.archive = (row) => rows.push(original({ event: 'soak-wire', ...row }))
+    const transport = new SoakTransport(tap)
+    try {
+      const admin = transport.admin({
+        describeShareGroups: async () => ({
+          groups: [{ groupId: 'owned', errorCode: 69, state: 'Empty', members: [] }],
+        }),
+      })
+      await admin.describeShareGroups(['owned'])
+      const result = await verifyProtocolAnswers(rows)
+      expect(result.problems.filter((p) => p.startsWith('Original operation'))).toEqual([])
+      expect(result.successes.some((r) => r.apiKey === 77)).toBe(false)
+      expect(result.problems).toContain('No decoded successful API 77')
+    } finally {
+      transport.close()
+    }
+  })
+
   test('observes the real producer adapter and decoded raw-log adapter through serialization', async () => {
     const rows = []
     const sent = [{ partition: 0, errorCode: 0, baseOffset: '0' }]
