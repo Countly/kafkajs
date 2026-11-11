@@ -46,7 +46,7 @@ const COLLECTION_DEADLINE_MS = 25 * 60 * 1000
 const MAX_RATIO = 1.05
 const MIN_CONTROL_RATIO = 0.95
 const MAX_SPREAD = 0.15
-/** D167 rows remain measured and reported; a valid regression still fails the gate. */
+/** D167 rows remain measured and reported; only noise is waived, a valid FAIL or regression still fails. */
 const INFORMATION_ONLY_ROWS = Object.freeze({
   'frame-decode:1m': 'D167: GitHub-hosted runner noise; A/A unstable and C as noisy as B.',
   'frame-decode:64b': 'D167: GitHub-hosted runner noise; A/A unstable and C as noisy as B.',
@@ -411,12 +411,16 @@ const judgeRow = (row) => {
   }
 }
 
+/** Verdicts D167 waives on its information-only rows: noise, never valid slowdown evidence. */
+const WAIVED_NOISE = Object.freeze(['invalid', 'inconclusive'])
+
 /**
  * @param {object} row computed row verdict; structural problems remain separate gate failures
- * @returns {boolean} ordinary PASS or D167 information-only row without a valid regression
+ * @returns {boolean} PASS, or INVALID/INCONCLUSIVE on a D167 information-only row
  */
 const rowPassesGate = ({ name, verdict }) =>
-  verdict === 'pass' || (Object.hasOwn(INFORMATION_ONLY_ROWS, name) && verdict !== 'regression')
+  verdict === 'pass' ||
+  (Object.hasOwn(INFORMATION_ONLY_ROWS, name) && WAIVED_NOISE.includes(verdict))
 
 /**
  * @param {*} input summary; live and offline use this same decision path

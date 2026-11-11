@@ -27,7 +27,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Tooling
 
-- The Exit gate's decoder benchmark reports frame-decode 1m, 64b and coalesced as information only: on GitHub-hosted runners their A/A control is too noisy to judge; a proven regression on them still fails.
+- The Exit gate's decoder benchmark reports frame-decode 1m, 64b and coalesced as information only: on GitHub-hosted runners their A/A control is too noisy to judge; a valid FAIL or proven regression on them still fails.
 - Judge decoder benchmark rows with paired confidence bounds and a calibrated baseline control, using longer rounds and three parallel collection partitions.
 - A CI check compares decode speed of the bounded array readers and record headers against the base revision on real Produce and Fetch responses.
 
