@@ -139,21 +139,23 @@ class ShareSoakJob {
     Object.assign(this, { now, run, env, source })
   }
 
-  /** @param {string} command Executable. @param {string[]} args Fixed operation arguments. @returns {string} Stdout. @throws {Error} On command failure/timeout. */
-  command(command, args) {
-    return this.run(command, args, { encoding: 'utf8', timeout: 30000, env: this.env }).trim()
+  /** @param {string} command Executable. @param {string[]} args Fixed operation arguments. @param {number} [maxBuffer] Bounded output bytes; omitted uses the process default. @returns {string} Stdout. @throws {Error} On command failure/timeout. */
+  command(command, args, maxBuffer) {
+    return this.run(command, args, {
+      encoding: 'utf8',
+      timeout: 30000,
+      env: this.env,
+      maxBuffer,
+    }).trim()
   }
 
-  /** @param {string[]} args Fixed Compose operation. @returns {string} Stdout. @throws {Error} On Compose failure. */
-  compose(args) {
-    return this.command('docker', [
-      'compose',
-      '-f',
-      'docker-compose.yml',
-      '-p',
-      this.state.project,
-      ...args,
-    ])
+  /** @param {string[]} args Fixed Compose operation. @param {number} [maxBuffer] Bounded output bytes. @returns {string} Stdout. @throws {Error} On Compose failure. */
+  compose(args, maxBuffer) {
+    return this.command(
+      'docker',
+      ['compose', '-f', 'docker-compose.yml', '-p', this.state.project, ...args],
+      maxBuffer
+    )
   }
 
   /**
@@ -498,9 +500,12 @@ class ShareSoakJob {
     return result
   }
 
-  /** @returns {void} Logs captured while the owned cluster exists. @throws {Error} On logging failure. */
+  /** @returns {void} Complete logs captured with a bounded 64 MiB buffer while the owned cluster exists. @throws {Error} On logging failure. */
   logs() {
-    fs.writeFileSync(`${OUTPUT}/compose.log`, this.compose(['logs', '--no-color']))
+    fs.writeFileSync(
+      `${OUTPUT}/compose.log`,
+      this.compose(['logs', '--no-color'], 64 * 1024 * 1024)
+    )
   }
 
   /**
@@ -619,12 +624,6 @@ const main = async (argv) => {
         : STAGES[action]
   )
 }
-if (require.main === module) {
-  main(process.argv.slice(2)).catch((error) => {
-    console.error(error)
-    process.exitCode = 1
-  })
-}
 module.exports = {
   ShareSoakJob,
   sourceIdentity,
@@ -633,4 +632,11 @@ module.exports = {
   inventory,
   seal,
   STAGES,
+}
+
+if (require.main === module) {
+  main(process.argv.slice(2)).catch((error) => {
+    console.error(error)
+    process.exitCode = 1
+  })
 }

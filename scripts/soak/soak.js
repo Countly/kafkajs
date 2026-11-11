@@ -5386,6 +5386,7 @@ class ShareSoakDriver {
   /**
    * Creates the topic and group, reads the group configuration back, captures routing and the
    * unrelated groups, closes the setup clients and takes the client-free baseline.
+   * Requests the API-60 form of cluster discovery for the mandatory protocol inventory.
    * @param {{ add: Function }} stack cleanup stack; every cleanup is registered before its effect
    * @param {AbortSignal} scope the scenario scope
    * @returns {Promise<{ topic: string, group: string }>}
@@ -5440,7 +5441,9 @@ class ShareSoakDriver {
       admin.fetchTopicMetadata({ topics: [this.topic] })
     )
     const [topic] = metadata.topics.filter(({ name }) => name === this.topic)
-    const { brokers } = await bounded(scope, Infinity, () => admin.describeCluster())
+    const { brokers } = await bounded(scope, Infinity, () =>
+      admin.describeCluster({ includeAuthorizedOperations: true })
+    )
     this.nodes = new Map(brokers.map(({ host, port, nodeId }) => [`${host}:${port}`, nodeId]))
     for (const { partitionId, leader } of topic.partitions) {
       const node = brokers.find(({ nodeId }) => nodeId === leader)
@@ -7774,20 +7777,6 @@ const main = async (
   return verdict
 }
 
-if (require.main === module) {
-  const { profile, phaseSeconds } = parseArgs(process.argv.slice(2))
-  main(profile, { phaseSeconds }).then(
-    (verdict) => {
-      console.log(JSON.stringify(verdict))
-      process.exitCode = verdict.ok ? 0 : 1
-    },
-    (error) => {
-      console.error(error)
-      process.exitCode = 1
-    }
-  )
-}
-
 module.exports = {
   CHURN,
   TELEMETRY,
@@ -7824,4 +7813,18 @@ module.exports = {
   instrument,
   instrumentShare,
   main,
+}
+
+if (require.main === module) {
+  const { profile, phaseSeconds } = parseArgs(process.argv.slice(2))
+  main(profile, { phaseSeconds }).then(
+    (verdict) => {
+      console.log(JSON.stringify(verdict))
+      process.exitCode = verdict.ok ? 0 : 1
+    },
+    (error) => {
+      console.error(error)
+      process.exitCode = 1
+    }
+  )
 }

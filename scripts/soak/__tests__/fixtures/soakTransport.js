@@ -134,7 +134,13 @@ class SoakTransport {
   resultFields(name, [options], result) {
     if (name === 'describeCluster')
       return {
-        Brokers: result.brokers.map((b) => ({ BrokerId: b.nodeId, Host: b.host, Port: b.port })),
+        Brokers: result.brokers.map((b) => ({
+          [options?.includeAuthorizedOperations || options?.includeFencedBrokers
+            ? 'BrokerId'
+            : 'NodeId']: b.nodeId,
+          Host: b.host,
+          Port: b.port,
+        })),
       }
     if (name === 'fetchTopicMetadata' || name === 'listTopics')
       return {
@@ -260,7 +266,16 @@ class SoakTransport {
       deleteTopics: ['deleteTopics/v6', options],
       listTopics: ['metadata/v13', { topics: [] }],
       fetchTopicMetadata: ['metadata/v13', { topics: [], ...options }],
-      describeCluster: ['describeCluster/v2', options],
+      describeCluster:
+        options?.includeAuthorizedOperations || options?.includeFencedBrokers
+          ? [
+              'describeCluster/v2',
+              {
+                includeClusterAuthorizedOperations: options.includeAuthorizedOperations,
+                includeFencedBrokers: options.includeFencedBrokers,
+              },
+            ]
+          : ['metadata/v13', { topics: [] }],
       listGroups: ['listGroups/v5', options],
       deleteGroups: ['deleteGroups/v2', options],
       describeShareGroups: ['shareGroupDescribe/v1', { groupIds: options }],
