@@ -1483,6 +1483,12 @@ describe('broker telemetry fixture', () => {
     const validate = resources.steps.find((step) => step.run?.includes('resourceArtifact.js'))
     expect(validate.if).toBe('always()')
     expect(validate.run).toContain('--tree "$KAFKAJS_TREE" --node "$(node -p process.version)"')
+    expect(resources.steps.at(-1)).toMatchObject({
+      name: 'Upload resource and calibration evidence',
+      if: 'always()',
+      'timeout-minutes': 2,
+      uses: 'actions/upload-artifact@v4',
+    })
     expect(resources.steps.at(-1).with).toMatchObject({
       name: 'resources-node$' + '{{ matrix.node }}',
       path: '.tmp/telemetry-resources/',

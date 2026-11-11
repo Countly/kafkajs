@@ -1264,6 +1264,74 @@ describe('telemetry wire observer', () => {
     expect(() => observer.assertFunctional()).toThrow('sequence')
   })
 
+  test('collects retired socket cohorts behind a retained terminal error without changing evidence', () => {
+    const blob = Buffer.from('retained-evidence')
+    const exchanges = (pairs) => pairs.map((pair) => pair.map((bytes) => bytes?.toString('hex')))
+    writeSink('2', [sinkRow('2', 1, blob), sinkRow('2', 2, blob, { terminating: true })])
+    fs.writeFileSync(
+      path.join(directory, 'stimulus.json'),
+      JSON.stringify([
+        {
+          port: 19092,
+          exchanges: exchanges([
+            [apiVersions(1), apiVersionsResponse(1, [[3, 0, 6]])],
+            [metadata(2), metadataResponse(2)],
+          ]),
+        },
+        {
+          port: 19095,
+          exchanges: exchanges([
+            [
+              apiVersions(1),
+              apiVersionsResponse(1, [
+                [71, 0, 0],
+                [72, 0, 0],
+              ]),
+            ],
+            [get71(2), get71Response(2)],
+            [push72(3, blob), push72Response(3)],
+            [push72(4, blob, { terminating: true }), push72Response(4)],
+          ]),
+          fault: push72(5, Buffer.alloc(0)).toString('hex'),
+        },
+        {
+          port: 19098,
+          exchanges: exchanges([[get71(1), null]]),
+        },
+      ])
+    )
+    const result = require('child_process').spawnSync(
+      process.execPath,
+      ['--expose-gc', path.join(__dirname, 'fixtures/disposedWireObserver.js'), directory],
+      { encoding: 'utf8', timeout: 15000 }
+    )
+    expect(result.error).toBeUndefined()
+    expect(result.stderr).toBe('')
+    expect(result.status).toBe(0)
+    const { archive, decoded } = JSON.parse(result.stdout)
+    expect(archive.owner).toBe('retired-client')
+    expect(archive.failures).toEqual([])
+    expect(archive.cleanup).toEqual({ children: 0, timers: 0, stillOpen: [], attached: 0 })
+    expect(archive.sockets).toHaveLength(3)
+    expect(archive.closures).toHaveLength(1)
+    expect(archive.faults).toHaveLength(1)
+    expect(archive.cancellations.map((row) => row.disposition)).toEqual([
+      'faulted-transport',
+      'close-in-flight',
+    ])
+    expect(archive.cancellations.map((row) => row.socketId)).toEqual([2, 3])
+    expect(decoded.map((row) => row.exportIdentity)).toEqual([
+      { node: '2', seq: 1 },
+      { node: '2', seq: 2 },
+    ])
+    for (const row of decoded) {
+      expect(row.rawSha256).toBe(sha(blob))
+      expect(row.transmittedSha256).toBe(sha(blob))
+      expect(row.rawBytes).toBe(blob.length)
+      expect(row.transmittedBytes).toBe(blob.length)
+    }
+  })
+
   test('closes listeners and reports a still-open client socket on disposal', async () => {
     const { observer } = observe()
     const open1 = open(observer)

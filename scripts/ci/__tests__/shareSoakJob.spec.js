@@ -363,6 +363,44 @@ describe('share soak CI owned lifecycle serialization', () => {
 })
 
 describe('required memory gate composition', () => {
+  test('flushes each calibration child before starting the next even after failure', () => {
+    const events = []
+    const spawn = jest.spyOn(require('node:child_process'), 'spawnSync').mockImplementation(() => {
+      const index = events.filter((event) => event.type === 'spawn').length
+      events.push({ type: 'spawn', index })
+      return { status: index === 0 ? 1 : 0, stdout: JSON.stringify({ index }), stderr: '' }
+    })
+    const mkdir = jest.spyOn(fs, 'mkdirSync').mockImplementation(() => {})
+    const write = jest.spyOn(fs, 'writeFileSync').mockImplementation((file, data, options) => {
+      events.push({ type: 'write', file, data, options })
+    })
+    try {
+      jest.isolateModules(() => {
+        const { run } = require('../../soak/journalControls')
+        expect(() => run('calibration-artifacts')).toThrow('Journal controls failed')
+      })
+      const children = events.filter((event) => event.type === 'spawn')
+      expect(children).toHaveLength(23)
+      for (const [index, event] of events.entries()) {
+        if (event.type !== 'spawn') continue
+        const json = events[index + 1]
+        expect(json).toMatchObject({ type: 'write', options: { flush: true } })
+        expect(json.file).toMatch(/\.json$/)
+        expect(JSON.parse(json.data)).toEqual({ index: event.index })
+        expect(events[index + 2]).toMatchObject({ type: 'write', options: { flush: true } })
+        expect(events[index + 2].file).toMatch(/\.stderr$/)
+      }
+      expect(events.at(-1).file).toMatch(/summary\.json$/)
+      expect(JSON.parse(events.at(-1).data).failures[0].message).toContain(
+        'unsuccessful child exit'
+      )
+    } finally {
+      spawn.mockRestore()
+      mkdir.mockRestore()
+      write.mockRestore()
+    }
+  })
+
   test('requires both share profiles and every relocated telemetry verdict without optional jobs', () => {
     const workflow = fs.readFileSync('.github/workflows/memory-gates.yml', 'utf8')
     const jobs = {}
@@ -390,6 +428,12 @@ describe('required memory gate composition', () => {
     expect(jobs['share-soak-verify']).toContain('profile: [short, full]')
     expect(jobs['share-soak-verdict']).toContain('needs: [share-soak, share-soak-verify]')
     expect(jobs.resources).toContain('node: [22, 24, 26]')
+    expect(jobs.resources).toContain(
+      '- name: Upload resource and calibration evidence\n' +
+        '        if: always()\n' +
+        '        timeout-minutes: 2\n' +
+        '        uses: actions/upload-artifact@v4'
+    )
     expect(jobs['telemetry-soak']).toContain('node: [22, 24, 26]')
     expect(jobs['telemetry-soak']).toContain("kafka: ['4.3.1', '4.2.2']")
     expect(jobs['telemetry-verdicts']).toContain('full: true')
