@@ -464,8 +464,8 @@ describe('scripts/protocol > admin ledger APIs', () => {
   describe('the broker ranges', () => {
     const table = () => readJson(BROKER_RANGES)
 
-    test('records the floor line and the three lines the suite runs on', () => {
-      expect(Object.keys(table())).toEqual(LINES)
+    test('records the floor line, the three lines the suite runs on and the 4.3.2 and 4.4.0 captures', () => {
+      expect(Object.keys(table())).toEqual([...LINES, '4.3.2', '4.4.0'])
     })
 
     test.each(LEDGER)('%s: every line records its range under the API name', (name) => {

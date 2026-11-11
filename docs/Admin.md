@@ -660,7 +660,7 @@ The existing `describeConfigs`, `alterConfigs` and `incrementalAlterConfigs` res
 
 ## Unregister a controller
 
-`admin.unregisterController({ controllerId })` removes one controller registration from a Kafka cluster (KIP-1312) and resolves `undefined` on success. The method is evolving: Kafka marks the Java method unstable, so its shape can change. It requires Kafka 4.4 or newer. <!-- placeholder: capability sentence to be finalised from the committed Kafka 4.4.0 capture -->
+`admin.unregisterController({ controllerId })` removes one controller registration from a Kafka cluster (KIP-1312) and resolves `undefined` on success. The method is evolving: Kafka marks the Java method unstable, so its shape can change. It requires Kafka 4.4 or newer.
 
 `controllerId` must be an integer from 0 through 2147483647. Any other value rejects with `KafkaJSInvalidConfigurationError` before the client looks up a broker or sends a request. The call goes to the first known broker, lowest node id first, that offers API key 94. A broker without it is skipped, and `KafkaJSServerDoesNotSupportApiKey` is thrown only after every known broker lacks it. A connection or authentication failure is thrown as it is and is never reported as unsupported.
 

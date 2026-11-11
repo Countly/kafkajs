@@ -620,11 +620,13 @@ describe('E2E tooling', () => {
         }
       )
 
-      test('holds the floor image and the three lines the suite runs on', () => {
+      test('holds the floor image, the three lines the suite runs on and the 4.3.2 and 4.4.0 captures', () => {
         const versions = Object.keys(table())
 
-        expect(versions).toHaveLength(4)
-        expect(versions).toEqual(expect.arrayContaining(['4.1.2', '4.2.2', '4.3.1']))
+        expect(versions).toHaveLength(6)
+        expect(versions).toEqual(
+          expect.arrayContaining(['4.1.2', '4.2.2', '4.3.1', '4.3.2', '4.4.0'])
+        )
         expect(versions.filter((version) => /^4\.0\.\d+$/.test(version))).toHaveLength(1)
       })
     })

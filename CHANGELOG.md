@@ -9,6 +9,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Additions
 
+- Record independent Kafka 4.4.0 and 4.3.2 broker capability captures.
 - Document share dead-letter queue configuration and verify reject/max-delivery routing on Kafka 4.4.
 - Add evolving `admin.unregisterController({ controllerId })` for Kafka 4.4+ (KIP-1312).
 - Add `metadataClusterCheck` (default `true`) to opt out of intended cluster/node identity in ApiVersions v5.
