@@ -46,11 +46,15 @@ const COLLECTION_DEADLINE_MS = 25 * 60 * 1000
 const MAX_RATIO = 1.05
 const MIN_CONTROL_RATIO = 0.95
 const MAX_SPREAD = 0.15
-/** D167 rows remain measured and reported; only noise is waived, a valid FAIL or regression still fails. */
+/** D167/D168 frame rows remain measured and reported; only noise is waived, a valid FAIL or regression still fails. */
 const INFORMATION_ONLY_ROWS = Object.freeze({
   'frame-decode:1m': 'D167: GitHub-hosted runner noise; A/A unstable and C as noisy as B.',
   'frame-decode:64b': 'D167: GitHub-hosted runner noise; A/A unstable and C as noisy as B.',
   'frame-decode:coalesced': 'D167: GitHub-hosted runner noise; A/A unstable and C as noisy as B.',
+  'frame-decode:64k':
+    'D168 (extends D167): GitHub-hosted runner noise; A/A unstable on re-measure.',
+  'frame-decode:byte-chunks':
+    'D168 (extends D167): GitHub-hosted runner noise; A/A unstable on re-measure.',
 })
 const SIDES = { A: 'oldNsPerOp', C: 'baselineControlNsPerOp', B: 'newNsPerOp' }
 const ORDERS = ['ACB', 'ABC', 'CAB', 'CBA', 'BAC', 'BCA']
