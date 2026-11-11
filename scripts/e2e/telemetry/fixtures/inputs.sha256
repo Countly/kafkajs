@@ -1,5 +1,6 @@
 d69b0a9ac8264bb3d464ae22742430943aa0a6cdf3734180af5a607c0bf8adaa  tools/protoc-3.25.5-linux-x86_64.exe
 8540247fad9e06baefa8fb45eb313802d019f485f14300e0f9d6b556ed88e753  jars/protobuf-java-3.25.5.jar
+1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9  jars/kafka-clients-4.4.0.jar
 52501b7b47510c66f898871adaf6d2968ab7246561d44ced43643a8a587f0b36  jars/kafka-clients-4.3.1.jar
 109b6c65c134fd65a424563c8377510f4d42e278e9fef0961d0450173e65496a  jars/kafka-clients-4.2.2.jar
 354d818af9cb0ed67f7447b9cf8408f1ac8911cedea0db73c5309484ec2bcc04  proto/opentelemetry/proto/common/v1/common.proto

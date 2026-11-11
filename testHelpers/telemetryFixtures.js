@@ -772,7 +772,7 @@ class TelemetryWireObserver {
   /**
    * @param {object} options observer configuration
    * @param {string} options.directory absolute run evidence directory shared with the broker sinks
-   * @param {string} options.line broker line: 4.3.1 or 4.2.2 (any x.y.z in `base` mode)
+   * @param {string} options.line broker line: 4.4.0, 4.3.1 or 4.2.2 (any x.y.z in `base` mode)
    * @param {{now:function():number}} options.clock monotonic milliseconds, such as performance.now
    * @param {'configured'|'base'} [options.mode] selects the exact fixture endpoint allowlist
    * @param {string} [options.owner] label of the observed client, kept in the evidence
@@ -806,7 +806,9 @@ class TelemetryWireObserver {
       throw new Error('Expected an absolute observer directory')
     if (!Object.hasOwn(ENDPOINTS, mode)) throw new Error('Unknown observer mode')
     const allowed =
-      mode === 'configured' ? ['4.3.1', '4.2.2'].includes(line) : /^\d+\.\d+\.\d+$/.test(line)
+      mode === 'configured'
+        ? ['4.4.0', '4.3.1', '4.2.2'].includes(line)
+        : /^\d+\.\d+\.\d+$/.test(line)
     if (!allowed) throw new Error('Unsupported broker line for the observer')
     if (typeof clock?.now !== 'function') throw new Error('Expected a monotonic clock')
     this.#completeStream = completeStream

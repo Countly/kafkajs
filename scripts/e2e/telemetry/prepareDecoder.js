@@ -24,7 +24,7 @@ function prepareDecoder({
   env = process.env,
   script = path.join(__dirname, 'run.sh'),
 }) {
-  assert(['4.3.1', '4.2.2'].includes(line), 'Unsupported decoder line')
+  assert(['4.4.0', '4.3.1', '4.2.2'].includes(line), 'Unsupported decoder line')
   assert(path.isAbsolute(archive), 'Expected an absolute decoder archive path')
   assert(!fs.existsSync(archive), 'Decoder archive already exists')
   const directory = fs.mkdtempSync(path.join(path.dirname(archive), 'decoder-prepare-'))

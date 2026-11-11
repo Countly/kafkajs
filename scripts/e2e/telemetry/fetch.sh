@@ -12,6 +12,7 @@ while read -r rel url; do
 done <<LIST
 tools/protoc-3.25.5-linux-x86_64.exe $M/com/google/protobuf/protoc/3.25.5/protoc-3.25.5-linux-x86_64.exe
 jars/protobuf-java-3.25.5.jar $M/com/google/protobuf/protobuf-java/3.25.5/protobuf-java-3.25.5.jar
+jars/kafka-clients-4.4.0.jar $M/org/apache/kafka/kafka-clients/4.4.0/kafka-clients-4.4.0.jar
 jars/kafka-clients-4.3.1.jar $M/org/apache/kafka/kafka-clients/4.3.1/kafka-clients-4.3.1.jar
 jars/kafka-clients-4.2.2.jar $M/org/apache/kafka/kafka-clients/4.2.2/kafka-clients-4.2.2.jar
 jars/slf4j-api-1.7.36.jar $M/org/slf4j/slf4j-api/1.7.36/slf4j-api-1.7.36.jar

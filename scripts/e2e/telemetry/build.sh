@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Builds fixtures/counting-telemetry-reporter-<kafka-version>.jar (reporter + relocated OTLP v1.9.0 bindings) and the
-# unrelocated bindings jar used by the offline vector generator. Usage: build.sh <4.3.1|4.2.2>
+# unrelocated bindings jar used by the offline vector generator. Usage: build.sh <4.4.0|4.3.1|4.2.2>
 # Env: TF1_CACHE (downloaded inputs, see fetch.sh), TF1_WORK (scratch build dir), TF1_OUT (default ./fixtures).
 # Deterministic: fixed jar timestamps, so two builds of the same inputs give the same SHA-256.
 set -euo pipefail
-V=${1:?kafka version, 4.3.1 or 4.2.2}
+V=${1:?kafka version, 4.4.0, 4.3.1 or 4.2.2}
 HERE=$(cd "$(dirname "$0")" && pwd)
 CACHE=${TF1_CACHE:?set TF1_CACHE}
 WORK=${TF1_WORK:?set TF1_WORK}/$V

@@ -3,9 +3,9 @@
 # Usage: run.sh verify <line> | decode <line> <raw> | prepare <line> <raw> | client[-check] <line> <role arguments>
 set -euo pipefail
 MODE=${1:?verify, decode, prepare, client or client-check}
-LINE=${2:?4.3.1 or 4.2.2}
+LINE=${2:?4.4.0, 4.3.1 or 4.2.2}
 case "$MODE:$LINE" in
-  verify:4.3.1|verify:4.2.2|decode:4.3.1|decode:4.2.2|prepare:4.3.1|prepare:4.2.2|client:4.3.1|client:4.2.2|client-check:4.3.1|client-check:4.2.2) ;;
+  verify:4.4.0|verify:4.3.1|verify:4.2.2|decode:4.4.0|decode:4.3.1|decode:4.2.2|prepare:4.4.0|prepare:4.3.1|prepare:4.2.2|client:4.4.0|client:4.3.1|client:4.2.2|client-check:4.4.0|client-check:4.3.1|client-check:4.2.2) ;;
   *) exit 2 ;;
 esac
 : "${TMPDIR:?set a private temporary directory}"
@@ -21,7 +21,7 @@ const check = (file, expected) => {
   if (sha(file) !== expected) throw new Error('Fixture identity mismatch: ' + file)
 }
 const file = path.join(here, 'fixtures/manifest.json')
-check(file, '5e1bca462c8ff3a4cd651be82eb0f56ed2f132815b0569a8ac469806c949577d')
+check(file, '7ca0a20e383b745bc427b80211ee0a8e8ae8af0b1fd9a36e73ece96df77b38f4')
 const manifest = JSON.parse(fs.readFileSync(file, 'utf8'))
 check(path.join(root, 'docker-compose.telemetry.yml'), manifest.composeSha256['docker-compose.telemetry.yml'])
 for (const name of ['CountingTelemetryReporter.java', 'build.sh'])
