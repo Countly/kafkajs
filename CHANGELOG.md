@@ -13,6 +13,10 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - Add `release.yml`: a `v*` tag publishes from CI only after the exact tagged commit has green `ci.yml`, `gate.yml` and `weekly.yml` runs on master and a reviewer approves the `npm-release` environment; the job publishes the tested tarball once, with npm provenance and no token. Retires the "never from CI" rule.
 - Declare `js-yaml` as a development dependency (it was used by workflow tests through another package).
 
+#### Docs
+
+- Rewrite `RELEASING.md` for the CI release process; state the Kafka 4.0–4.4 claim.
+
 ### Phase 9F — Client telemetry
 
 #### Additions
