@@ -621,6 +621,12 @@ describe('required memory gate composition', () => {
     expect(jobs['share-soak']).toContain('profile: full, jobMinutes: 71, parentMinutes: 51')
     expect(jobs['share-soak']).toContain('node scripts/ci/shareSoakJob.js freeze "$SOAK_PROFILE"')
     expect(jobs['share-soak-verify']).toContain('profile: [short, full]')
+    // A fresh verify checkout has no .tmp; unzip -d creates only the last directory level.
+    const verify = jobs['share-soak-verify']
+    expect(verify).toContain("fs.mkdirSync('.tmp/download', { recursive: true })")
+    expect(verify.indexOf("fs.mkdirSync('.tmp/download'")).toBeLessThan(
+      verify.indexOf("execFileSync('unzip', ['-q', zip, '-d', '.tmp/download'])")
+    )
     expect(jobs['share-soak-verdict']).toContain('needs: [select, share-soak, share-soak-verify]')
     expect(jobs.resources).toContain('node: [22, 24, 26]')
     expect(jobs.resources).toContain('    timeout-minutes: 105')
