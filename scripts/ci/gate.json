@@ -20241,7 +20241,9 @@
         "src/admin/__tests__/adminVersionsLive.spec.js \u203a Admin > captured newest versions 4.3.2 capture limits DeleteGroups to v2",
         "src/admin/__tests__/adminVersionsLive.spec.js \u203a Admin > captured newest versions 4.4.0 capture permits DeleteGroups v3",
         "src/admin/__tests__/adminVersionsLive.spec.js \u203a Admin > captured newest versions a capture cannot supply a broker-only API",
-        "src/admin/__tests__/adminVersionsLive.spec.js \u203a Admin > captured newest versions an uncaptured broker version cannot fall back to another recording"
+        "src/admin/__tests__/adminVersionsLive.spec.js \u203a Admin > captured newest versions an uncaptured broker version cannot fall back to another recording",
+        "scripts/soak/__tests__/soak.spec.js \u203a Share soak cycle finalization and isolation adapter reserves the reset node diagnostic for its replacement socket after a retiring write=false",
+        "scripts/soak/__tests__/soak.spec.js \u203a Share soak cycle finalization and isolation adapter reserves the reset node diagnostic for its replacement socket after a retiring write=true"
       ],
       "capMinutes": 85,
       "allowedSkips": [

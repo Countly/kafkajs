@@ -5234,6 +5234,7 @@ describe('Share soak cycle finalization and isolation adapter', () => {
     failRaw = false,
     leaveMode = 'answered',
     retained = false,
+    retiringWrite = false,
   } = {}) => {
     const plan = ShareCycleOracle.plan(reset ? 10 : 0)
     const clients = []
@@ -5279,6 +5280,14 @@ describe('Share soak cycle finalization and isolation adapter', () => {
       mark === 0 ? [original] : broken ? [{ sequence: 2, epoch: 0, socket: 2 }] : []
     tap.destroy = () => {
       broken = true
+      if (retiringWrite)
+        tap.notify('api78-write', {
+          ...original,
+          epoch: 5,
+          groupId: 'soak-group',
+          memberId: clients[0].memberId,
+          attempted: true,
+        })
       clients[0].emit('SESSION_RESET', { nodeId: 1, reason: 'connection' })
     }
     const kafka = {
@@ -5419,8 +5428,11 @@ describe('Share soak cycle finalization and isolation adapter', () => {
           resetWrites.push(
             ...[0, 1, 2].map((nodeId) => ({
               endpoint: `node:${nodeId + 1}`,
+              socket: nodeId === 0 ? 2 : nodeId + 3,
+              epoch: nodeId === 0 ? 0 : 4,
               groupId: 'soak-group',
               memberId: a.memberId,
+              attempted: true,
             }))
           )
         }
@@ -5664,6 +5676,26 @@ describe('Share soak cycle finalization and isolation adapter', () => {
           message.includes(reset ? 'delivery count' : 'duplicate delivery')
         )
       ).toBe(true)
+    }
+  )
+
+  test.each([false, true])(
+    'reserves the reset node diagnostic for its replacement socket after a retiring write=%s',
+    async (retiringWrite) => {
+      const { work } = await cycle({ reset: true, retiringWrite })
+      const observed = await work
+      const writes = observed.steps.filter(({ step }) => step === 'post-reset-api78')
+      expect(writes).toHaveLength(3)
+      expect(writes.map(({ nodeId }) => nodeId)).toEqual([0, 1, 2])
+      expect(writes.find(({ nodeId }) => nodeId === observed.resetTarget.nodeId)).toMatchObject({
+        socket: observed.reset.nextSocket,
+        epoch: 0,
+        attempted: true,
+      })
+      expect(writes.filter(({ nodeId }) => nodeId !== observed.resetTarget.nodeId)).toEqual([
+        expect.objectContaining({ socket: 4, epoch: 4 }),
+        expect.objectContaining({ socket: 5, epoch: 4 }),
+      ])
     }
   )
 
