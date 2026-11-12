@@ -5,10 +5,13 @@ const {
   installSharePeak,
 } = require('../sharePeak')
 const {
+  ReferenceControl,
   TelemetryWorker,
   TelemetryWorkerProcess,
   declaredJournalBytes,
 } = require('../telemetryChurn')
+const { PROFILES, TELEMETRY } = require('../soak')
+const { TelemetrySegments } = require('../../../testHelpers/telemetrySegments')
 
 /** @returns {object} deterministic kernel, engine and clock facts */
 const fixture = () => {
@@ -148,6 +151,91 @@ describe('share peak attribution', () => {
     expect(worker.registry.fill).toHaveBeenCalledTimes(1)
     expect(worker.registry.replace).toHaveBeenCalledWith(6)
     expect(worker.segments.cycle).toHaveBeenCalledWith(client, { timeout: 3000 })
+  })
+
+  test('marks exported verdict inputs only while a share peak recorder is active', async () => {
+    const snapshot = { journals: { byteLength: 4096, cursor: 0 } }
+    const run = {
+      baseline: snapshot,
+      samples: [{ admittedPhaseMs: 60000, phaseMs: 60300, snapshot }],
+      teardown: snapshot,
+    }
+    const ordinary = {
+      clientCount: 1,
+      baseline: snapshot,
+      samples: [{ admittedAtMs: 60000, completedAtMs: 60300, atMs: 60300, snapshot }],
+      teardown: snapshot,
+      measurementMs: 300000,
+      cleanupMs: 1000,
+      reference: {},
+      sampler: { skipped: [], readFailures: [] },
+    }
+    jest.spyOn(ReferenceControl.prototype, 'run').mockResolvedValue({ manifest: {} })
+    jest.spyOn(TelemetrySegments, 'ordinary').mockReturnValue({})
+    try {
+      for (const active of [false, true]) {
+        const messages = []
+        const verdict = { ok: true, outcome: 'passed', violations: [] }
+        const owner = new TelemetryWorkerProcess({
+          kind: 'shareConsumer',
+          soak: {
+            TELEMETRY,
+            PROFILES,
+            logLevel: { NOTHING: 0 },
+            instrument: () => ({ kafka: { shareConsumer: () => ({}) } }),
+            sharePeak: () => (active ? fixture().peak : null),
+            SharePeakWorker: class {
+              constructor() {
+                this.timing = { measurementMs: 300000, cleanupMs: 1000 }
+                this.claims = { foreground: [] }
+              }
+
+              async prepare() {
+                return 'uuid'
+              }
+
+              facts() {
+                return {}
+              }
+            },
+            TelemetryResourceVerdict: { evaluate: () => verdict },
+            Soak: class {
+              constructor({ judge }) {
+                this.judge = judge
+                this.skipped = []
+                this.readFailures = []
+              }
+
+              async run() {
+                return this.judge(run)
+              }
+            },
+          },
+          proc: {
+            on() {},
+            send(message, callback) {
+              messages.push(JSON.parse(JSON.stringify(message)))
+              callback?.()
+            },
+          },
+          env: {},
+        })
+        owner.stamps = () => ({})
+        owner.reference = () => ({})
+        owner.inbox.push({ type: 'config', stem: 'peak', topic: 'topic', group: 'group' })
+        owner.inbox.push({ type: 'start' })
+        await expect(owner.run()).resolves.toEqual(verdict)
+        const result = messages.find((message) => message.type === 'result')
+        expect(JSON.stringify(result.input)).toBe(
+          JSON.stringify({
+            ...ordinary,
+            ...(active && { diagnostic: true, acceptanceEligible: false }),
+          })
+        )
+      }
+    } finally {
+      jest.restoreAllMocks()
+    }
   })
 
   test('installs only in diagnostic share children and leaves the judged input contract unchanged', () => {
