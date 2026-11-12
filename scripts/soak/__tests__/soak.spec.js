@@ -5235,6 +5235,7 @@ describe('Share soak cycle finalization and isolation adapter', () => {
     leaveMode = 'answered',
     retained = false,
     retiringWrite = false,
+    afterCloseWrite = false,
   } = {}) => {
     const plan = ShareCycleOracle.plan(reset ? 10 : 0)
     const clients = []
@@ -5246,7 +5247,7 @@ describe('Share soak cycle finalization and isolation adapter', () => {
     const tap = new ShareFetchTap(64, { now: () => 0 })
     const Broker = require('../../../src/broker')
     const { respondWithFrame } = require('../../../testHelpers/fakeSocket')
-    const socket = tap.wrap(Object.assign(new EventEmitter(), { write: () => true }), 'node:1')
+    const socket = tap.wrap(Object.assign(new EventEmitter(), { write: () => true }), 'node:1', 10)
     let correlationId = 0
     const broker = Object.assign(Object.create(Broker.prototype), { brokerAddress: 'node:1' })
     const heartbeat = jest
@@ -5278,16 +5279,20 @@ describe('Share soak cycle finalization and isolation adapter', () => {
     tap.mark = () => 0
     tap.since = (mark) =>
       mark === 0 ? [original] : broken ? [{ sequence: 2, epoch: 0, socket: 2 }] : []
+    const retiredWrite = () =>
+      tap.notify('api78-write', {
+        ...original,
+        epoch: 5,
+        groupId: afterCloseWrite === 'different-context' ? 'foreign-group' : 'soak-group',
+        memberId: clients[0].memberId,
+        attempted: true,
+      })
     tap.destroy = () => {
       broken = true
-      if (retiringWrite)
-        tap.notify('api78-write', {
-          ...original,
-          epoch: 5,
-          groupId: 'soak-group',
-          memberId: clients[0].memberId,
-          attempted: true,
-        })
+      if (retiringWrite) retiredWrite()
+      tap.notify('socket-close', { socket: original.socket, endpoint: original.endpoint })
+      if (afterCloseWrite === 'before-reopen' || afterCloseWrite === 'different-context')
+        retiredWrite()
       clients[0].emit('SESSION_RESET', { nodeId: 1, reason: 'connection' })
     }
     const kafka = {
@@ -5318,6 +5323,7 @@ describe('Share soak cycle finalization and isolation adapter', () => {
           },
           disconnect: async () => {
             await client.pending
+            if (client === clients[0] && afterCloseWrite === 'during-disconnect') retiredWrite()
             if (lateDuringClose && client === clients[0])
               await client.handlers.eachBatch(client.batch)
             if (client === clients[0])
@@ -5370,6 +5376,7 @@ describe('Share soak cycle finalization and isolation adapter', () => {
               await recover()
             } else if (resetWrites.length) {
               tap.notify('api78-write', resetWrites.shift())
+              if (!resetWrites.length && afterCloseWrite === 'after-reopen') retiredWrite()
             }
             await Promise.resolve()
           }
@@ -5696,6 +5703,23 @@ describe('Share soak cycle finalization and isolation adapter', () => {
         expect.objectContaining({ socket: 4, epoch: 4 }),
         expect.objectContaining({ socket: 5, epoch: 4 }),
       ])
+    }
+  )
+
+  test.each(['before-reopen', 'after-reopen', 'during-disconnect', 'different-context'])(
+    'rejects a retired socket write after confirmed close, timing=%s',
+    async (afterCloseWrite) => {
+      const control = await cycle({ reset: true, retiringWrite: true })
+      await expect(control.work).resolves.toMatchObject({ reset: { nextSocket: 2, nextEpoch: 0 } })
+      const { work, driver } = await cycle({ reset: true, retiringWrite: true, afterCloseWrite })
+      await expect(work).rejects.toThrow('Retired reset socket 1 was written after close')
+      expect(driver.lastCycle.steps).toContainEqual(
+        expect.objectContaining({ step: 'retired-socket-write', socket: 1 })
+      )
+      expect(driver.lastCycle.steps.filter(({ step }) => step === 'post-reset-api78')).toHaveLength(
+        3
+      )
+      expect(driver.lastCycle.snapshot.workloadJoined).toBe(true)
     }
   )
 

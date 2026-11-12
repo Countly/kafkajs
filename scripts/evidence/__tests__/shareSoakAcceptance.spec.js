@@ -6,7 +6,7 @@ const { validateRows, cleanupPopulation, validateArchive } = require('../shareSo
 const { verifyProtocolAnswers } = require('../shareSoakProtocol')
 const { receiptProblems } = require('../shareSoakReceipts')
 const { createCycleFacts } = require('../../soak/__tests__/fixtures/shareCycleFacts')
-const { ShareSoakDriver } = require('../../soak/soak')
+const { ShareSoakDriver, ShareCycleOracle } = require('../../soak/soak')
 const { observeShareSoakDriver } = require('../../soak/shareSoakEvidence')
 
 /** @param {*} value Original recording. @returns {*} JSON-round-tripped original bytes. */
@@ -114,6 +114,69 @@ describe('share soak independent acceptance controls', () => {
     mutate(facts)
     expect(ArchivedCycle.verify(ArchivedCycle.plan(10), facts).length).toBeGreaterThan(0)
   })
+
+  describe.each([
+    ['runner', ShareCycleOracle],
+    ['archive', ArchivedCycle],
+  ])('%s reset retirement evidence', (_name, judge) => {
+    /** @returns {object} A pre-close attempt followed by a new epoch-zero socket. */
+    const recording = () => {
+      const facts = original(createCycleFacts().cycleFacts(10))
+      facts.steps = [{ step: 'socket-close', socket: 3, at: 10, lastFrame: 1000 }]
+      facts.provenance.exchanges.push(
+        { frames: [{ id: 999, socket: 3, at: 9, apiKey: 78 }] },
+        { frames: [{ id: 1002, socket: 7, at: 11, apiKey: 78 }] }
+      )
+      return facts
+    }
+    /** @param {object} facts Original cycle frames. @returns {string[]} Membership failures. */
+    const problems = (facts) => {
+      const failures = []
+      judge.membership(judge.plan(10), facts, (message) => failures.push(message))
+      return failures
+    }
+
+    test('accepts the pre-close race and replacement writes', () => {
+      expect(problems(recording())).toEqual([])
+    })
+
+    test.each([
+      ['later timestamp', { id: 1001, at: 11, apiKey: 78 }, false],
+      ['same-millisecond sequence', { id: 1001, at: 10, apiKey: 78 }, false],
+      ['acknowledgement frame', { id: 1001, at: 11, apiKey: 79 }, false],
+      ['legacy close timestamp', { id: 1001, at: 11, apiKey: 78 }, true],
+    ])('rejects raw post-close %s without a diagnostic marker', (_label, fields, legacy) => {
+      const facts = recording()
+      if (legacy) delete facts.steps[0].lastFrame
+      expect(problems(facts)).toEqual([])
+      facts.provenance.exchanges.push({ frames: [{ socket: 3, ...fields }] })
+      expect(problems(facts)).toEqual(['Retired reset socket 3 was written after close'])
+    })
+  })
+
+  test.each([0, 1])(
+    'rejects an unanswered wire write %s ms after reset socket close',
+    async (delay) => {
+      const rows = original(require('./fixtures/shareProduceV13.json').rows)
+      const request = rows.find((r) => r.kind === 'request' && r.apiKey === 0)
+      const at = Math.max(...rows.filter((r) => r.kind === 'request').map((r) => r.at)) + 1
+      const frame = Math.max(...rows.filter((r) => r.kind === 'request').map((r) => r.frame)) + 1
+      rows.push({
+        event: 'soak-cycle-step',
+        step: 'socket-close',
+        socket: request.socket,
+        monotonicAt: at,
+        lastFrame: frame - 1,
+      })
+      const pristine = await verifyProtocolAnswers(rows)
+      expect(pristine.problems.filter((p) => p.startsWith('Original'))).toEqual([])
+      rows.push({ ...request, frame, at: at + delay })
+      const changed = await verifyProtocolAnswers(rows)
+      expect(changed.problems.filter((p) => p.startsWith('Original'))).toEqual([
+        `Original request after reset socket close: socket ${request.socket}, frame ${frame}`,
+      ])
+    }
+  )
 
   test.each(['short', 'full'])('refuses empty or removed %s share-identifying rows', (profile) => {
     const contract = { profile, node: 'v24.0.0', source: { commit: 'a'.repeat(40) } }

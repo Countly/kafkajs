@@ -4437,12 +4437,42 @@ class ShareCycleOracle {
   }
 
   /**
+   * Rejects writes after the reset socket's observed close, including attempts without answers.
+   * The close's last frame orders same-millisecond events; older archives retain clock evidence.
+   * @param {object} observation Original reset, close steps and request frames.
+   * @param {(message: string) => void} fail Receives a retirement violation.
+   * @returns {void}
+   */
+  static retirement(observation, fail) {
+    const socket = observation.resetTarget?.socket ?? observation.reset?.oldSocket
+    if (socket === undefined) return
+    const steps = observation.steps ?? []
+    const closed = steps.find((s) => s.step === 'socket-close' && s.socket === socket)
+    const provenance = observation.provenance ?? {}
+    const requests = [...(provenance.exchanges ?? []), ...(provenance.heartbeats ?? [])]
+    if (
+      steps.some((s) => s.step === 'retired-socket-write' && s.socket === socket) ||
+      (closed &&
+        requests.some((request) =>
+          request.frames?.some(
+            (frame) =>
+              frame.socket === socket &&
+              (frame.at > closed.at ||
+                (Number.isSafeInteger(closed.lastFrame) && frame.id > closed.lastFrame))
+          )
+        ))
+    )
+      fail(`Retired reset socket ${socket} was written after close`)
+  }
+
+  /**
    * @param {ReturnType<typeof ShareCycleOracle.plan>} plan the cycle
    * @param {object} observation the cycle's observations
    * @param {(message: string) => void} fail
    * @returns {void}
    */
   static membership(plan, observation, fail) {
+    ShareCycleOracle.retirement(observation, fail)
     const { members = {}, reset = null, verifier = {}, provenance = {} } = observation
     for (const label of ['A', 'B']) {
       const member = observation.memberObservations?.find((member) => member.member === label)
@@ -5683,6 +5713,8 @@ class ShareSoakDriver {
     const active = { capture, observation, failureArchived: false }
     this.activeCycle = active
     const postResetNodes = new Set()
+    let resetSocketClosed = false
+    let retiredWrite = false
     const unlisten = this.tap.listen((step, fields, at) => {
       if (step.startsWith('leave-') && fields.groupId === this.group) {
         const member = members.find((member) => member.memberId === fields.memberId)
@@ -5693,6 +5725,11 @@ class ShareSoakDriver {
       if (!target) return
       const nodeId = this.nodes.get(fields.endpoint)
       if (step === 'api78-write') {
+        if (resetSocketClosed && fields.socket === target.socket) {
+          if (!retiredWrite) note('retired-socket-write', { ...fields, nodeId }, at)
+          retiredWrite = true
+          return
+        }
         // An attempted write can reach the destroyed stream before its close callback runs.
         if (
           fields.memberId !== target.memberId ||
@@ -5704,7 +5741,10 @@ class ShareSoakDriver {
         postResetNodes.add(fields.endpoint)
         note('post-reset-api78', { ...fields, nodeId }, at)
       } else if (fields.socket === target.socket) {
-        note(step, { ...fields, nodeId }, at)
+        if (step === 'socket-close') {
+          resetSocketClosed = true
+          note(step, { ...fields, nodeId, lastFrame: this.tap.frameSequence }, at)
+        } else note(step, { ...fields, nodeId }, at)
       } else if (fields.endpoint === target.endpoint && step.startsWith('socket-connect-')) {
         note(step.replace('socket-connect-', 'reconnect-'), { ...fields, nodeId }, at)
       }
@@ -5763,7 +5803,7 @@ class ShareSoakDriver {
     }
 
     this.lastCycle = observation
-    return stack.run(
+    const result = await stack.run(
       async () => {
         note('cycle-start')
         const a = track(
@@ -5917,6 +5957,10 @@ class ShareSoakDriver {
       },
       { budgetMs: 2000 }
     )
+    const violations = []
+    ShareCycleOracle.retirement(result, (message) => violations.push(message))
+    if (violations.length) throw new Error(violations[0])
+    return result
   }
 
   /**
