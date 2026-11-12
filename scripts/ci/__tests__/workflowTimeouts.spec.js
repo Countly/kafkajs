@@ -165,6 +165,15 @@ describe('Workflow timeouts', () => {
     }
   })
 
+  test('gives the memory-gate unit run at least the CI unit budget for the whole suite', () => {
+    const memory = yaml.load(fs.readFileSync(path.join(workflows, 'memory-gates.yml'), 'utf8'))
+    const ci = yaml.load(fs.readFileSync(path.join(workflows, 'ci.yml'), 'utf8'))
+    const job = memory.jobs.unit
+    const run = job.steps.find((step) => step.run?.startsWith('npm run test:unit'))
+    expect(run['timeout-minutes']).toBeGreaterThanOrEqual(ci.jobs.unit['timeout-minutes'])
+    expect(job['timeout-minutes']).toBeGreaterThan(run['timeout-minutes'])
+  })
+
   test('bounds the isolated share peak arms and keeps expressions outside shell commands', () => {
     const workflow = yaml.load(fs.readFileSync(path.join(workflows, 'memory-gates.yml'), 'utf8'))
     const job = workflow.jobs['share-peak']

@@ -71,7 +71,7 @@ jobs:
     name: share-soak-controls
     if: contains(fromJSON(needs.select.outputs.jobs), 'unit')
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions: { contents: read }
     steps:
       - uses: actions/checkout@v4
@@ -82,7 +82,7 @@ jobs:
       - run: npm ci
         timeout-minutes: 5
       - name: Run broker-free acceptance and retained sensitivity controls
-        timeout-minutes: 30
+        timeout-minutes: 40
         run: npm run test:unit -- --ci --maxWorkers=2
   share-soak:
     name: share-soak-${{ matrix.profile }}
