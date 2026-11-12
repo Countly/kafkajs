@@ -19791,7 +19791,16 @@
         "scripts/benchmarks/__tests__/compareDecoderBounds.spec.js \u203a Decoder performance comparison requires a measured or unavailable disposition for record-batch:lz4",
         "scripts/benchmarks/__tests__/compareDecoderBounds.spec.js \u203a Decoder performance comparison requires a measured or unavailable disposition for record-batch:snappy",
         "scripts/benchmarks/__tests__/frameDecode.spec.js \u203a Benchmarks > frameDecode a run timed mode requires gc while the functional control does not",
-        "scripts/benchmarks/__tests__/frameDecode.spec.js \u203a Benchmarks > frameDecode a run discards three warmups and collects before each of seven measured intervals"
+        "scripts/benchmarks/__tests__/frameDecode.spec.js \u203a Benchmarks > frameDecode a run discards three warmups and collects before each of seven measured intervals",
+        "scripts/e2e/telemetry/__tests__/warmupWitness.spec.js \u203a warm-up lifecycle witnesses enumerates own catalogue foreground map set and backing objects without invoking getters",
+        "scripts/e2e/telemetry/__tests__/warmupWitness.spec.js \u203a warm-up lifecycle witnesses preserves pre-M deaths late catalogue births and post-M death intervals",
+        "scripts/e2e/telemetry/__tests__/warmupWitness.spec.js \u203a warm-up lifecycle witnesses fails on overflow duplicate phases skipped phases and late registration",
+        "scripts/e2e/telemetry/__tests__/warmupWitness.spec.js \u203a warm-up lifecycle witnesses joins exact code and data scalars with post-M deaths without claiming causation",
+        "scripts/e2e/telemetry/__tests__/warmupWitness.spec.js \u203a warm-up lifecycle witnesses distinguishes a negative delta without late witness deaths and a surviving witness",
+        "scripts/e2e/telemetry/__tests__/warmupWitness.spec.js \u203a warm-up lifecycle witnesses rejects missing duplicate reordered nonfinite mismatched and resurrected evidence",
+        "scripts/e2e/telemetry/__tests__/warmupWitness.spec.js \u203a warm-up lifecycle witnesses launches original children with exact flags and keeps collector contrasts unseeded",
+        "scripts/e2e/telemetry/__tests__/warmupWitness.spec.js \u203a warm-up lifecycle witnesses hooks the five original settled boundaries and never adds a collection or settle",
+        "scripts/ci/__tests__/workflowTimeouts.spec.js \u203a Workflow timeouts warm-up witness jobs bound serial original-child pairs on Node 24 and 26"
       ],
       "capMinutes": 85,
       "allowedSkips": [
@@ -24010,7 +24019,16 @@
         "scripts/benchmarks/__tests__/compareDecoderBounds.spec.js \u203a Decoder performance comparison requires a measured or unavailable disposition for record-batch:lz4",
         "scripts/benchmarks/__tests__/compareDecoderBounds.spec.js \u203a Decoder performance comparison requires a measured or unavailable disposition for record-batch:snappy",
         "scripts/benchmarks/__tests__/frameDecode.spec.js \u203a Benchmarks > frameDecode a run timed mode requires gc while the functional control does not",
-        "scripts/benchmarks/__tests__/frameDecode.spec.js \u203a Benchmarks > frameDecode a run discards three warmups and collects before each of seven measured intervals"
+        "scripts/benchmarks/__tests__/frameDecode.spec.js \u203a Benchmarks > frameDecode a run discards three warmups and collects before each of seven measured intervals",
+        "scripts/e2e/telemetry/__tests__/warmupWitness.spec.js \u203a warm-up lifecycle witnesses enumerates own catalogue foreground map set and backing objects without invoking getters",
+        "scripts/e2e/telemetry/__tests__/warmupWitness.spec.js \u203a warm-up lifecycle witnesses preserves pre-M deaths late catalogue births and post-M death intervals",
+        "scripts/e2e/telemetry/__tests__/warmupWitness.spec.js \u203a warm-up lifecycle witnesses fails on overflow duplicate phases skipped phases and late registration",
+        "scripts/e2e/telemetry/__tests__/warmupWitness.spec.js \u203a warm-up lifecycle witnesses joins exact code and data scalars with post-M deaths without claiming causation",
+        "scripts/e2e/telemetry/__tests__/warmupWitness.spec.js \u203a warm-up lifecycle witnesses distinguishes a negative delta without late witness deaths and a surviving witness",
+        "scripts/e2e/telemetry/__tests__/warmupWitness.spec.js \u203a warm-up lifecycle witnesses rejects missing duplicate reordered nonfinite mismatched and resurrected evidence",
+        "scripts/e2e/telemetry/__tests__/warmupWitness.spec.js \u203a warm-up lifecycle witnesses launches original children with exact flags and keeps collector contrasts unseeded",
+        "scripts/e2e/telemetry/__tests__/warmupWitness.spec.js \u203a warm-up lifecycle witnesses hooks the five original settled boundaries and never adds a collection or settle",
+        "scripts/ci/__tests__/workflowTimeouts.spec.js \u203a Workflow timeouts warm-up witness jobs bound serial original-child pairs on Node 24 and 26"
       ],
       "capMinutes": 93,
       "allowedSkips": [
