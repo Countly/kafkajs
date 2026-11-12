@@ -1,6 +1,12 @@
 name: Memory gates
 on:
   workflow_dispatch:
+    inputs:
+      replicates:
+        description: Replicates of every telemetry-long-window tuple; pull requests run one
+        type: choice
+        default: '1'
+        options: ['1', '2', '3']
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
 concurrency:
@@ -737,6 +743,97 @@ jobs:
           name: share-peak-${{ matrix.kafka }}-node${{ matrix.node }}-${{ matrix.arm }}
           path: |
             .tmp/share-peak/
+            .tmp/e2e/
+            .tmp/telemetry-evidence/
+            .tmp/telemetry-cache/decoder-*.jsa.json
+          if-no-files-found: error
+          include-hidden-files: true
+  telemetry-long-window:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24, 26]
+        kafka: ['4.2.2', '4.3.1']
+        arm: [unseeded, seeded]
+        replicate: ${{ fromJSON(github.event.inputs.replicates == '3' && '[1,2,3]' || github.event.inputs.replicates == '2' && '[1,2]' || '[1]') }}
+        include:
+          - { node: 22, kafka: '4.3.1', arm: warmup-seed, replicate: 1 }
+          - { node: 24, kafka: '4.3.1', arm: warmup-seed, replicate: 1 }
+          - { node: 26, kafka: '4.3.1', arm: warmup-seed, replicate: 1 }
+    env:
+      KAFKA_VERSION: ${{ matrix.kafka }}
+      COMPOSE_FILE: docker-compose.telemetry.yml
+      COMPOSE_PROJECT_NAME: telemetry-long-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
+      TF1_CACHE: ${{ github.workspace }}/.tmp/telemetry-cache
+      TELEMETRY_JAVA_CACHE: ${{ github.workspace }}/.tmp/telemetry-cache
+      TELEMETRY_DECODER_ARCHIVE: ${{ github.workspace }}/.tmp/telemetry-cache/decoder-${{ matrix.kafka }}.jsa
+      TELEMETRY_INTEROP_CACHE: ${{ github.workspace }}/.tmp/telemetry-interop
+      TELEMETRY_EVIDENCE_DIR: ${{ github.workspace }}/.tmp/telemetry-evidence
+      KAFKAJS_LANE: docker
+      LONG_WINDOW_ROOT: ${{ github.workspace }}/.tmp/long-window
+      LONG_WINDOW_ARM: ${{ matrix.arm }}
+      LONG_WINDOW_REPLICATE: ${{ matrix.replicate }}
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 1
+      - uses: actions/setup-node@v4
+        timeout-minutes: 1
+        with: { node-version: '${{ matrix.node }}', cache: npm }
+      - uses: actions/setup-java@v4
+        timeout-minutes: 2
+        with: { distribution: temurin, java-version: '21' }
+      - run: npm ci
+        timeout-minutes: 5
+      - name: Prepare telemetry evidence
+        timeout-minutes: 1
+        run: |
+          echo "KAFKAJS_TREE=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          mkdir -p .tmp/e2e "$TELEMETRY_EVIDENCE_DIR"
+          chmod 0777 "$TELEMETRY_EVIDENCE_DIR"
+      - name: Verify retained jars offline and prepare decoder inputs
+        timeout-minutes: 5
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          timeout -k 5s 30s env -u TELEMETRY_JAVA_CACHE bash scripts/e2e/telemetry/run.sh verify "$KAFKA_VERSION"
+          timeout -k 5s 180s bash scripts/e2e/telemetry/fetch.sh
+          timeout -k 5s 30s bash scripts/e2e/telemetry/run.sh verify "$KAFKA_VERSION"
+          timeout -k 5s 60s node scripts/e2e/telemetry/prepareDecoder.js
+      - name: Preflight isolated project ownership
+        timeout-minutes: 2
+        run: timeout -k 5s 90s node scripts/e2e/telemetry/ci.js preflight
+      - name: Prepare broker image
+        timeout-minutes: 4
+        run: timeout -k 5s 210s docker compose -f "$COMPOSE_FILE" pull
+      - name: Start and warm the owned telemetry cluster
+        timeout-minutes: 6
+        run: |
+          timeout -k 5s 90s docker compose -f "$COMPOSE_FILE" up -d --pull never
+          timeout -k 5s 240s node scripts/waitForKafka.js
+      - name: Verify mounted reporter and capture broker identities
+        timeout-minutes: 3
+        run: timeout -k 5s 150s node scripts/e2e/telemetry/ci.js capture
+      - name: Run the long-window shadow candidate for one arm and replicate
+        timeout-minutes: 36
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: timeout -k 10s 1980s node --expose-gc scripts/soak/longWindowDiagnostic.js --diagnostic-only "$LONG_WINDOW_ROOT"
+      - name: Stop owned project and prove container network volume removal
+        if: always()
+        timeout-minutes: 3
+        run: |
+          timeout -k 5s 150s node scripts/e2e/telemetry/ci.js stop
+          node -e "require('./scripts/e2e/telemetry/evidence').verifyCleanup(process.env.TELEMETRY_EVIDENCE_DIR, '.tmp/e2e', process.env.COMPOSE_PROJECT_NAME)"
+      - if: always()
+        timeout-minutes: 2
+        uses: actions/upload-artifact@v4
+        with:
+          name: telemetry-long-window-node${{ matrix.node }}-${{ matrix.kafka }}-${{ matrix.arm }}-r${{ matrix.replicate }}
+          path: |
+            .tmp/long-window/
             .tmp/e2e/
             .tmp/telemetry-evidence/
             .tmp/telemetry-cache/decoder-*.jsa.json
