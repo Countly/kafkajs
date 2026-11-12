@@ -3953,6 +3953,7 @@
         "src/broker/__tests__/floorCoreLive.spec.js \u203a Floor administration helpers a held dial withholds readiness, counts one attempt per destroyed socket and lets a free dial through",
         "src/broker/__tests__/floorCoreLive.spec.js \u203a Floor administration helpers a rejection becomes the failure itself and a resolution becomes null",
         "src/broker/__tests__/floorCoreLive.spec.js \u203a Floor administration helpers a shared budget starts once, only shrinks and refuses a start with no cleanup reserve left",
+        "src/broker/__tests__/floorCoreLive.spec.js \u203a Floor administration helpers a timer ledger does not own a timer Jest itself creates, but still owns one the test creates",
         "src/broker/__tests__/floorCoreLive.spec.js \u203a Floor administration helpers a timer ledger reports the timers started since it began that are still pending, by identity",
         "src/broker/__tests__/floorCoreLive.spec.js \u203a Floor administration helpers a typed refusal is found through its cause chain, and a cycle or a non-error ends the walk",
         "src/broker/__tests__/floorCoreLive.spec.js \u203a Floor administration helpers credential markers cover the encodings a log or a buffer dump can show",
