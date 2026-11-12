@@ -235,6 +235,39 @@ jobs:
           path: .tmp/telemetry-resources/
           if-no-files-found: error
           include-hidden-files: true
+  warmup-witnesses:
+    name: warmup-witnesses-node${{ matrix.node }}
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    permissions: { contents: read }
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [24, 26]
+    env:
+      WARMUP_WITNESS_DIR: ${{ github.workspace }}/.tmp/warmup-witnesses/run
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '${{ matrix.node }}', cache: npm }
+      - run: npm ci
+        timeout-minutes: 5
+      - name: Prepare warm-up witness evidence
+        timeout-minutes: 1
+        run: mkdir -p "$(dirname "$WARMUP_WITNESS_DIR")"
+      - name: Record paired warm-up witnesses
+        timeout-minutes: 100
+        run: timeout -k 10s 5900s node scripts/e2e/telemetry/warmupWitness.js --diagnostic-only "$WARMUP_WITNESS_DIR" || exit 1
+      - name: Upload warm-up witness evidence
+        if: always()
+        timeout-minutes: 3
+        uses: actions/upload-artifact@v4
+        with:
+          name: warmup-witnesses-node${{ matrix.node }}
+          path: .tmp/warmup-witnesses/
+          if-no-files-found: error
+          include-hidden-files: true
   journal-controls:
     name: journal-controls-${{ matrix.group.name }}-node${{ matrix.node }}
     if: github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/')
@@ -615,7 +648,7 @@ jobs:
     name: memory-gates-verdict
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [unit, share-soak-verdict, resources, journal-controls, retained-diagnostic, telemetry-soak, telemetry-seeded-control, live-owner-census, telemetry-verdicts, telemetry-verdict-controls]
+    needs: [unit, share-soak-verdict, resources, journal-controls, warmup-witnesses, retained-diagnostic, telemetry-soak, telemetry-seeded-control, live-owner-census, telemetry-verdicts, telemetry-verdict-controls]
     if: always() && (github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/'))
     steps:
       - name: Require every relocated memory gate

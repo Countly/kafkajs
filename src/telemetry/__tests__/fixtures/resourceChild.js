@@ -44,6 +44,11 @@ const gzipModule = require('../../../protocol/message/compression/gzip')
 const zstd = require('../../../protocol/message/compression/zstd')
 const { maximum, bindNodes } = require('./maximum')
 
+const witnesses =
+  process.env.RESOURCE_WITNESSES === '1'
+    ? new (require(path.join(ROOT, 'scripts/e2e/telemetry/warmupWitness')).WarmupWitnesses)()
+    : null
+
 const loaded = { ...memory.current(), modules: process.moduleLoadList.length }
 memory.mark('loaded')
 
@@ -145,20 +150,39 @@ const measure = async (kind) => {
     try {
       if (!warm) memory.mark('collector:start')
       const { metrics, subscription, slots } = maximum(kind)
+      if (warm) {
+        witnesses?.track('catalogue:metrics', metrics)
+        witnesses?.track('catalogue:subscription', subscription)
+        witnesses?.track('catalogue:slots', slots)
+      }
       slots.forEach((slot) => metrics.retireNode(slot))
       slots.length = 0
       metrics.resetTransient()
       const builder = new TelemetryPayload(1n)
+      if (warm) {
+        witnesses?.track('catalogue:builder', builder)
+        witnesses?.track('observation', watch)
+      }
       const matched = await settled()
+      if (warm) witnesses?.check('m0', matched)
+      else witnesses?.check('matched', matched)
       memory.mark(warm ? 'warmup:matched' : 'collector:matched')
       const active = bindNodes(metrics, subscription)
       let snapshot = metrics.snapshot(active)
+      if (warm) {
+        witnesses?.track('catalogue:active', active)
+        witnesses?.track('catalogue:snapshot', snapshot)
+      }
       const builds = []
       const actives = []
       for (const codec of codecs) {
-        builds.push(await nativePair(builder, snapshot, codec, () => hooks.epoch++))
+        builds.push(
+          await nativePair(builder, snapshot, codec, () => hooks.epoch++, warm ? witnesses : null)
+        )
         if (!warm) {
-          actives.push({ phase: codec.name, ...(await settled()) })
+          const reading = await settled()
+          if (actives.length === 0) witnesses?.check('firstActive', reading)
+          actives.push({ phase: codec.name, ...reading })
           memory.mark(`collector:${codec.name}`)
         }
       }
@@ -173,8 +197,14 @@ const measure = async (kind) => {
       slots.length = 0
       metrics.resetTransient()
       sampler.stop()
-      if (warm) return { m0: matched }
+      if (warm) {
+        witnesses?.track('observation:closed', watch)
+        witnesses?.track('catalogue:builds', builds)
+        witnesses?.track('catalogue:actives', actives)
+        return { m0: matched }
+      }
       const closed = await settled()
+      witnesses?.check('closed', closed)
       memory.mark('collector:closed')
       return {
         matched,
@@ -193,13 +223,37 @@ const measure = async (kind) => {
     const control = await runControlObserved()
     contexts.boundary = hostContext()
 
-    const warmed = await pass(true)
+    if (witnesses)
+      witnesses.exclude(
+        memory,
+        roles,
+        ...Object.values(require.cache).map((entry) => entry.exports)
+      )
+    if (witnesses) {
+      witnesses.observe(require('../../metrics').prototype, [
+        'register',
+        'bindNode',
+        'select',
+        'snapshot',
+      ])
+      witnesses.observe(require('../../payload').prototype, ['buildPayload'])
+    }
+    let warmed
+    try {
+      warmed = await pass(true)
+    } finally {
+      witnesses?.restore()
+    }
     const end = await settled()
+    witnesses?.check('warmupEnd', end)
     memory.mark('warmup:closed')
     const arm = await pass(false)
     contexts.final = hostContext()
     const readings = {
       manifest,
+      ...(witnesses
+        ? { diagnostic: true, acceptanceEligible: false, warmupWitnesses: witnesses.summary() }
+        : {}),
       startup,
       loaded,
       c0: control.c0,

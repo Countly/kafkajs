@@ -5,6 +5,7 @@ const fs = require('node:fs')
 const { EventEmitter } = require('node:events')
 const { PassThrough } = require('node:stream')
 const { MEMORY_FLAGS } = require('../../../../testHelpers/processMemory')
+const { phaseCatalogue, foregroundCatalogue } = require('../resourceArtifact')
 
 const load = () => require(path.join(__dirname, '../warmupWitness'))
 const points = ['m0', 'warmupEnd', 'matched', 'firstActive', 'closed']
@@ -71,6 +72,7 @@ const pair = () => {
     },
     code: 0,
     signal: null,
+    pid: 123,
     timedOut: false,
     failure: null,
     stderrBytes: 0,
@@ -88,6 +90,10 @@ const pair = () => {
         pid: 123,
         execArgv: MEMORY_FLAGS,
         seed: null,
+        codecs: { gzip: true, zstd: false },
+        foreground: foregroundCatalogue('producer', 3),
+        phases: phaseCatalogue('public', false),
+        fixture: { descriptors: 128, descriptorBytes: 128 * 2768 },
         gc: { available: true, native: true },
         instrumented: { inspector: false, coverage: false, jest: false },
       },
@@ -142,6 +148,7 @@ describe('warm-up lifecycle witnesses', () => {
       [true, false, false, false, false],
       [null, true, true, true, false],
     ])
+    expect(meter.rows.every((row) => row === null || row.weak !== null)).toBe(true)
   })
 
   test('fails on overflow duplicate phases skipped phases and late registration', () => {
@@ -153,6 +160,32 @@ describe('warm-up lifecycle witnesses', () => {
     expect(() => meter.check('matched', reading(3000))).toThrow(/phase/)
     meter.check('warmupEnd', reading(2000))
     expect(() => meter.track('late', {})).toThrow(/registration/)
+  })
+
+  test('observes factory receivers inputs and results weakly and restores exact methods', () => {
+    const { meter } = census()
+    const input = {}
+    const result = {}
+    const prototype = {
+      make(value) {
+        expect(value).toBe(input)
+        return result
+      },
+    }
+    const original = prototype.make
+    const receiver = Object.create(prototype)
+    meter.exclude(prototype)
+    meter.observe(prototype, ['make'])
+    expect(receiver.make(input)).toBe(result)
+    meter.restore()
+    expect(prototype.make).toBe(original)
+    points.forEach((point, i) => meter.check(point, reading(1000 + i * 1000)))
+    expect(meter.summary().objects.map((row) => row.label)).toEqual([
+      'factory:make:receiver',
+      'factory:make:input',
+      'factory:make:result',
+    ])
+    expect(meter.summary().factories).toEqual({ make: 1 })
   })
 
   test('joins exact code and data scalars with post-M deaths without claiming causation', () => {
@@ -218,6 +251,12 @@ describe('warm-up lifecycle witnesses', () => {
         p.witness.readings.warmupWitnesses.points[4].at++
       },
       (p) => {
+        p.scalar.pid++
+      },
+      (p) => {
+        p.witness.readings.manifest.fixture.descriptors--
+      },
+      (p) => {
         p.scalar.timedOut = true
       },
       (p) => {
@@ -273,6 +312,21 @@ describe('warm-up lifecycle witnesses', () => {
       expect(source).toContain("process.env.RESOURCE_WITNESSES === '1'")
       expect(source).toContain('warmupWitnesses: witnesses.summary()')
       expect(source).not.toMatch(/globalThis\.gc\(|witnesses\?\.settled\(/)
+      expect(source.match(/await settled\(\)/g)).toHaveLength(5)
+      expect(source).toContain('witnesses?.restore()')
     }
+  })
+
+  test('refuses witness child readings as acceptance even without the diagnostic envelope', () => {
+    const { judgeMemoryArm, SCHEMA } = require('../resourceArtifact')
+    const input = pair().witness
+    const judged = judgeMemoryArm({
+      schema: SCHEMA,
+      arm: 'public',
+      kind: 'producer',
+      readings: { ...input.readings, acceptanceEligible: false },
+    })
+    expect(judged.verdict).toBe('fail')
+    expect(judged.problems).toContain('diagnostic records are ineligible for acceptance')
   })
 })
