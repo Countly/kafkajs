@@ -118,6 +118,10 @@
       "needs": {},
       "evidence": [],
       "titles": [
+        "src/telemetry/__tests__/controlDiagnostics.spec.js \u203a resource control attribution diagnostics switch-off control for producer preserves base JSON without loading or allocating diagnostic state",
+        "src/telemetry/__tests__/controlDiagnostics.spec.js \u203a resource control attribution diagnostics switch-off control for consumer preserves base JSON without loading or allocating diagnostic state",
+        "src/telemetry/__tests__/controlDiagnostics.spec.js \u203a resource control attribution diagnostics switch-off control for admin preserves base JSON without loading or allocating diagnostic state",
+        "src/telemetry/__tests__/controlDiagnostics.spec.js \u203a resource control attribution diagnostics switch-off control for shareConsumer preserves base JSON without loading or allocating diagnostic state",
         "src/telemetry/__tests__/controlDiagnostics.spec.js \u203a resource control attribution diagnostics records heap spaces, heap capacity, code, memory and raw maxRSS without collecting",
         "src/telemetry/__tests__/controlDiagnostics.spec.js \u203a resource control attribution diagnostics records C0 and C1 after the original readings without changing control order for producer",
         "src/telemetry/__tests__/controlDiagnostics.spec.js \u203a resource control attribution diagnostics records C0 and C1 after the original readings without changing control order for consumer",
@@ -23911,6 +23915,10 @@
       "needs": {},
       "evidence": [],
       "titles": [
+        "src/telemetry/__tests__/controlDiagnostics.spec.js \u203a resource control attribution diagnostics switch-off control for producer preserves base JSON without loading or allocating diagnostic state",
+        "src/telemetry/__tests__/controlDiagnostics.spec.js \u203a resource control attribution diagnostics switch-off control for consumer preserves base JSON without loading or allocating diagnostic state",
+        "src/telemetry/__tests__/controlDiagnostics.spec.js \u203a resource control attribution diagnostics switch-off control for admin preserves base JSON without loading or allocating diagnostic state",
+        "src/telemetry/__tests__/controlDiagnostics.spec.js \u203a resource control attribution diagnostics switch-off control for shareConsumer preserves base JSON without loading or allocating diagnostic state",
         "src/telemetry/__tests__/controlDiagnostics.spec.js \u203a resource control attribution diagnostics records heap spaces, heap capacity, code, memory and raw maxRSS without collecting",
         "src/telemetry/__tests__/controlDiagnostics.spec.js \u203a resource control attribution diagnostics records C0 and C1 after the original readings without changing control order for producer",
         "src/telemetry/__tests__/controlDiagnostics.spec.js \u203a resource control attribution diagnostics records C0 and C1 after the original readings without changing control order for consumer",
