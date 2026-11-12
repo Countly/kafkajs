@@ -1353,6 +1353,32 @@ describe('Floor administration helpers', () => {
     for (const gone of [earlier, cleared, fired]) expect(pending).not.toContain(gone)
   })
 
+  test('a timer ledger does not own a timer Jest itself creates, but still owns one the test creates', () => {
+    // Run in band, Jest's reporter shares the test process and debounces status output with a timer.
+    const root = fs.mkdtempSync(path.join(require('os').tmpdir(), 'jest-owned-'))
+    const reporter = path.join(root, 'node_modules', '@jest', 'reporters', 'index.js')
+    fs.mkdirSync(path.dirname(reporter), { recursive: true })
+    fs.writeFileSync(reporter, 'module.exports = () => setTimeout(() => {}, 60000)\n')
+    const debounce = require(reporter)
+    const ledger = new TimerLedger()
+    let jestTimer
+    let ownTimer
+    let pending
+    try {
+      ledger.start()
+      jestTimer = debounce()
+      ownTimer = setTimeout(() => {}, 60000)
+      pending = ledger.stop()
+    } finally {
+      clearTimeout(jestTimer)
+      clearTimeout(ownTimer)
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+
+    expect(pending).toContain(ownTimer)
+    expect(pending).not.toContain(jestTimer)
+  })
+
   test('a timer ledger records deep creation stacks for unref timers and restores the stack limit', () => {
     const ledger = new TimerLedger()
     const previousLimit = Error.stackTraceLimit

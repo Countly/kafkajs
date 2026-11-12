@@ -212,6 +212,28 @@ const timerCreationStack = () => {
   }
 }
 
+/** A frame inside Jest's own packages. */
+const JEST_OWN = /[\\/]node_modules[\\/](@jest[\\/]|jest-)/
+
+/**
+ * Whether Jest itself asked for the timer being created. Run in band, Jest's reporter shares the
+ * test process and debounces its status output with a 100 ms timer; that timer is not the case's.
+ * @returns {boolean} true when the first frame outside this file and Node's internals is Jest's
+ */
+const createdByJest = () => {
+  const previousLimit = Error.stackTraceLimit
+  try {
+    Error.stackTraceLimit = 16
+    const caller = String(new Error().stack)
+      .split('\n')
+      .slice(1)
+      .find((frame) => !frame.includes(__filename) && !/\(node:|async_hooks/.test(frame))
+    return JEST_OWN.test(caller ?? '')
+  } finally {
+    Error.stackTraceLimit = previousLimit
+  }
+}
+
 /**
  * Follows every timer created from `start` on, by identity. Bounded creation diagnostics never
  * exclude a timer from the ownership verdict, including unref'd or not-yet-destroyed timers.
@@ -233,7 +255,7 @@ class TimerLedger {
     this.stacks = new Map()
     this.hook = createHook({
       init: (id, type, _trigger, resource) => {
-        if (type !== 'Timeout') return
+        if (type !== 'Timeout' || createdByJest()) return
         this.pending.set(id, resource)
         if (this.stacks.size < this.capacity) this.stacks.set(id, timerCreationStack())
       },
