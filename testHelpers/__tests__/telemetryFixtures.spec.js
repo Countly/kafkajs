@@ -4317,6 +4317,10 @@ describe('offline decoder preparation', () => {
         '-Xshare:on',
         '-XX:TieredStopAtLevel=1',
         '-XX:SharedArchiveFile=' + archive,
+        // JVM warnings (e.g. an hsperfdata PID collision) must never reach the decoder's stdout.
+        '-XX:-UsePerfData',
+        '-Xlog:disable',
+        '-Xlog:all=warning:stderr',
       ])
     )
     expect(args.slice(-2)).toEqual(['org.countly.kafkajs.telemetry.FullTelemetryDecoder', raw])
