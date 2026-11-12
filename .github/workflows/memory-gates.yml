@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: Comma-separated job ids; empty runs all and enables the full verdict
+        description: Comma-separated job ids; empty runs all; partial selections fail verdicts
         type: string
         required: false
         default: ''
@@ -253,14 +253,21 @@ jobs:
     timeout-minutes: 5
     permissions: { contents: read }
     needs: [select, share-soak, share-soak-verify]
-    if: always() && needs.select.result == 'success' && contains(fromJSON(needs.select.outputs.jobs), 'share-soak-verdict')
+    if: always() && needs.select.result == 'success'
     steps:
       - name: Require both producing and archived reconstruction matrices
         timeout-minutes: 1
         env:
+          FULL: ${{ needs.select.outputs.full }}
+          ONLY: ${{ inputs.only }}
           PRODUCED: ${{ needs.share-soak.result }}
           RECHECKED: ${{ needs.share-soak-verify.result }}
-        run: test "$PRODUCED" = success && test "$RECHECKED" = success
+        run: |
+          if [ "$FULL" != true ]; then
+            echo "::error::partial selection (only=$ONLY) is not a share-soak pass"
+            exit 1
+          fi
+          test "$PRODUCED" = success && test "$RECHECKED" = success
   resources:
     needs: [select]
     if: contains(fromJSON(needs.select.outputs.jobs), 'resources')
@@ -980,14 +987,18 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     needs: [select, unit, share-soak-verdict, resources, journal-controls, retained-diagnostic, telemetry-soak, telemetry-seeded-control, live-owner-census, telemetry-verdicts, telemetry-verdict-controls]
-    if: always() && needs.select.result == 'success' && needs.select.outputs.full == 'true'
+    if: always() && needs.select.result == 'success'
     steps:
       - name: Require every relocated memory gate
         timeout-minutes: 1
         env:
+          FULL: ${{ needs.select.outputs.full }}
+          ONLY: ${{ inputs.only }}
           RESULTS: ${{ toJSON(needs) }}
         run: |
           node <<'NODE'
+          if (process.env.FULL !== 'true')
+            throw new Error(`partial selection (only=${process.env.ONLY || ''}) is not a memory-gates pass`)
           const results = JSON.parse(process.env.RESULTS)
           for (const [name, job] of Object.entries(results))
             if (job.result !== 'success') throw new Error(`${name}: ${job.result}`)
