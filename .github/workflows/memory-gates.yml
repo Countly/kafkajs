@@ -342,7 +342,7 @@ jobs:
         run: |
           echo "KAFKAJS_TREE=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
           mkdir -p .tmp
-      - name: Compare default and disabled bytecode flushing on original share controls
+      - name: Compare default and pinned young-generation sizes on original share controls
         timeout-minutes: 8
         run: timeout -k 10s 420s node scripts/e2e/telemetry/controlDiagnostic.js --diagnostic-only .tmp/resource-control-diagnostic
       - if: always()

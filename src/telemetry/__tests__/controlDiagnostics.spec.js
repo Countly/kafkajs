@@ -259,7 +259,7 @@ describe('resource control attribution diagnostics', () => {
     }
   )
 
-  test('launches the no-flush comparison on the original share children with bounded supervision', async () => {
+  test('launches every diagnostic variant on the original share children with its V8 flags', async () => {
     const calls = []
     const launch = (file, args, options) => {
       calls.push({ file, args, options })
@@ -282,7 +282,12 @@ describe('resource control attribution diagnostics', () => {
     process.env.RESOURCE_CONTROL_DIAGNOSTICS = '1'
     try {
       for (const arm of ['public', 'collector']) {
-        for (const variant of ['scalar', 'no-flush-bytecode']) {
+        for (const [variant, extra] of [
+          ['scalar', []],
+          ['no-flush-bytecode', ['--no-flush-bytecode']],
+          ['semi-space-1', ['--min-semi-space-size=1', '--max-semi-space-size=1']],
+          ['semi-space-16', ['--min-semi-space-size=16', '--max-semi-space-size=16']],
+        ]) {
           const run = await supervise(
             {
               arm,
@@ -294,9 +299,7 @@ describe('resource control attribution diagnostics', () => {
             launch
           )
           expect(run).toMatchObject({ diagnostic: true, acceptanceEligible: false, failure: null })
-          expect(run.readings.manifest.execArgv).toEqual(
-            variant === 'scalar' ? MEMORY_FLAGS : [...MEMORY_FLAGS, '--no-flush-bytecode']
-          )
+          expect(run.readings.manifest.execArgv).toEqual([...MEMORY_FLAGS, ...extra])
         }
       }
     } finally {
@@ -304,16 +307,14 @@ describe('resource control attribution diagnostics', () => {
       else process.env.RESOURCE_CONTROL_DIAGNOSTICS = previous
     }
     expect(calls.map((call) => path.basename(call.args.at(-2)))).toEqual([
-      'publicMemoryChild.js',
-      'publicMemoryChild.js',
-      'resourceChild.js',
-      'resourceChild.js',
+      ...Array(4).fill('publicMemoryChild.js'),
+      ...Array(4).fill('resourceChild.js'),
     ])
     expect(calls.every((call) => call.args.at(-1) === 'shareConsumer')).toBe(true)
     expect(calls.every((call) => call.options.env.RESOURCE_CONTROL_DIAGNOSTICS === '1')).toBe(true)
   })
 
-  test('archives four serial original controls and their exact C1 minus C0 RSS comparison', async () => {
+  test('archives serial original controls per variant and their exact C1 minus C0 RSS', async () => {
     const parent = path.join(process.cwd(), '.tmp')
     fs.mkdirSync(parent, { recursive: true })
     const directory = fs.mkdtempSync(path.join(parent, 'control-diagnostic-'))
@@ -332,7 +333,7 @@ describe('resource control attribution diagnostics', () => {
         stderrBytes: 0,
         readings: {
           c0: { rss: 100 },
-          c1: { rss: identity.variant === 'scalar' ? 130 : 110 },
+          c1: { rss: { scalar: 130, 'semi-space-1': 110, 'semi-space-16': 120 }[identity.variant] },
           controlDiagnostics: { c0: { maxRSS: 1 }, c1: { maxRSS: 2 } },
         },
       }
@@ -342,11 +343,13 @@ describe('resource control attribution diagnostics', () => {
       await collect(directory, { tree: 'tree', runId: 'run' }, run)
       expect(calls.map(({ arm, variant }) => [arm, variant])).toEqual([
         ['public', 'scalar'],
-        ['public', 'no-flush-bytecode'],
+        ['public', 'semi-space-1'],
+        ['public', 'semi-space-16'],
         ['collector', 'scalar'],
-        ['collector', 'no-flush-bytecode'],
+        ['collector', 'semi-space-1'],
+        ['collector', 'semi-space-16'],
       ])
-      expect(new Set(calls.map((row) => row.childId)).size).toBe(4)
+      expect(new Set(calls.map((row) => row.childId)).size).toBe(6)
       expect(calls.every((row) => row.kind === 'shareConsumer' && row.mode === 'unseeded')).toBe(
         true
       )
@@ -354,11 +357,11 @@ describe('resource control attribution diagnostics', () => {
       expect(summary).toMatchObject({ diagnostic: true, acceptanceEligible: false })
       for (const arm of ['public', 'collector']) {
         expect(summary.comparisons[arm]).toEqual({
-          scalarRssDelta: 30,
-          noFlushRssDelta: 10,
-          difference: -20,
+          scalar: 30,
+          'semi-space-1': 10,
+          'semi-space-16': 20,
         })
-        for (const variant of ['scalar', 'no-flush-bytecode']) {
+        for (const variant of ['scalar', 'semi-space-1', 'semi-space-16']) {
           const record = JSON.parse(fs.readFileSync(path.join(directory, `${arm}-${variant}.json`)))
           expect(record.acceptanceEligible).toBe(false)
           expect(record.readings.controlDiagnostics.c1.maxRSS).toBe(2)

@@ -406,9 +406,16 @@ const analysePair = ({ scalar, witness }) => {
   }
 }
 
+/** Extra V8 flags of the diagnostic-only control variants. */
+const VARIANT_FLAGS = {
+  'no-flush-bytecode': ['--no-flush-bytecode'],
+  'semi-space-1': ['--min-semi-space-size=1', '--max-semi-space-size=1'],
+  'semi-space-16': ['--min-semi-space-size=16', '--max-semi-space-size=16'],
+}
+
 /**
  * Runs one original child with an inclusive watchdog and bounded output; close joins both pipes.
- * Only the no-flush-bytecode diagnostic variant adds a V8 flag; scalar/witness flags are unchanged.
+ * Only diagnostic variants named in VARIANT_FLAGS add V8 flags; scalar/witness flags are unchanged.
  * @param {object} identity parent-issued tuple @param {Function} [launch] replaceable spawn
  * @returns {Promise<object>} diagnostic record, including failures for archival before analysis
  */
@@ -426,10 +433,7 @@ const supervise = (identity, launch = spawn) =>
       RESOURCE_RUN_ID: identity.runId,
     })
     const script = identity.arm === 'public' ? 'publicMemoryChild.js' : 'resourceChild.js'
-    const flags =
-      identity.variant === 'no-flush-bytecode'
-        ? [...MEMORY_FLAGS, '--no-flush-bytecode']
-        : MEMORY_FLAGS
+    const flags = [...MEMORY_FLAGS, ...(VARIANT_FLAGS[identity.variant] ?? [])]
     const child = launch(
       process.execPath,
       [...flags, path.join(ROOT, 'src/telemetry/__tests__/fixtures', script), identity.kind],

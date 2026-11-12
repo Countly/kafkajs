@@ -8,15 +8,18 @@ const { execFileSync } = require('node:child_process')
 const { supervise } = require('./warmupWitness')
 
 /**
- * Archives four serial original shareConsumer children, pairing default and disabled bytecode
- * flushing for each arm. No acceptance verdict or corrected RSS is computed. Every record is
- * ineligible, including the default-flag companion; original readings remain verbatim.
+ * Archives serial original shareConsumer children, one per arm and VARIANTS entry (default flags
+ * and pinned young-generation sizes). No acceptance verdict or corrected RSS is computed. Every
+ * record is ineligible, including the default-flag companion; original readings remain verbatim.
  * @param {string} directory fresh output directory; pre-existing output is refused
  * @param {{tree:string, runId:string}} stamp parent-issued run identity
  * @param {Function} [run] bounded original-child supervisor, replaceable for broker-free tests
- * @returns {Promise<void>} writes all child records and exact RSS endpoint contrasts
+ * @returns {Promise<void>} writes all child records and each variant's exact C1 minus C0 RSS
  * @throws {Error} after archiving all children when any run or endpoint is incomplete
  */
+/** Diagnostic variants; supervise maps each non-scalar one to its V8 flags. */
+const VARIANTS = ['scalar', 'semi-space-1', 'semi-space-16']
+
 const collect = async (directory, stamp, run = supervise) => {
   fs.mkdirSync(directory)
   const write = (file, value) =>
@@ -30,7 +33,7 @@ const collect = async (directory, stamp, run = supervise) => {
   }
   for (const arm of ['public', 'collector']) {
     const deltas = {}
-    for (const variant of ['scalar', 'no-flush-bytecode']) {
+    for (const variant of VARIANTS) {
       const identity = {
         ...stamp,
         arm,
@@ -54,19 +57,14 @@ const collect = async (directory, stamp, run = supervise) => {
       if (!complete) summary.failures.push(`${arm}-${variant}: incomplete child evidence`)
       else deltas[variant] = readings.c1.rss - readings.c0.rss
     }
-    if (Object.keys(deltas).length === 2)
-      summary.comparisons[arm] = {
-        scalarRssDelta: deltas.scalar,
-        noFlushRssDelta: deltas['no-flush-bytecode'],
-        difference: deltas['no-flush-bytecode'] - deltas.scalar,
-      }
+    summary.comparisons[arm] = deltas
     write('summary.json', summary)
   }
   if (summary.failures.length) throw new Error(summary.failures.join('; '))
 }
 
 /**
- * Requires explicit diagnostic intent and runs a bounded four-child comparison, without brokers.
+ * Requires explicit diagnostic intent and runs a bounded serial comparison, without brokers.
  * @param {string[]} args diagnostic-only switch and fresh output directory
  * @returns {Promise<void>} archives evidence; never dispatches acceptance verification
  * @throws {Error} on invalid arguments, incomplete child evidence or existing output
@@ -92,4 +90,4 @@ if (require.main === module)
     process.exitCode = 1
   })
 
-module.exports = { collect, main }
+module.exports = { VARIANTS, collect, main }
