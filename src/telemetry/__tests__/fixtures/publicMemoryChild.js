@@ -299,15 +299,20 @@ const measure = async (kind) => {
           )
           if (warm) witnesses?.track(`foreground:${codec.name}`, enabled)
           if (!warm) {
-            if (activeCensus) {
-              activeCensus.phase = codec.name
-              activeJournal = journal
+            if (witnesses || activeCensus) {
+              if (activeCensus) {
+                activeCensus.phase = codec.name
+                activeJournal = journal
+              }
+              const active = await settled()
+              if (activeCensus) activeCensus.phase = null
+              activeJournal = null
+              if (actives.length === 0) witnesses?.check('firstActive', active)
+              actives.push({ phase: codec.name, ...active, registry: enabled.fingerprint(uuid) })
+            } else {
+              const active = await settled()
+              actives.push({ phase: codec.name, ...active, registry: enabled.fingerprint(uuid) })
             }
-            const active = await settled()
-            if (activeCensus) activeCensus.phase = null
-            activeJournal = null
-            if (actives.length === 0) witnesses?.check('firstActive', active)
-            actives.push({ phase: codec.name, ...active, registry: enabled.fingerprint(uuid) })
             memory.mark(`enabled:${codec.name}`)
           }
           if (codec !== codecs.at(-1)) {
@@ -422,17 +427,17 @@ const measure = async (kind) => {
         witnesses,
         ...Object.values(require.cache).map((entry) => entry.exports)
       )
-    if (witnesses) {
-      witnesses.observe(require('../../metrics').prototype, [
-        'register',
-        'bindNode',
-        'select',
-        'snapshot',
-      ])
-      witnesses.observe(require('../../payload').prototype, ['buildPayload'])
-    }
     let warmed
     try {
+      if (witnesses) {
+        witnesses.observe(require('../../metrics').prototype, [
+          'register',
+          'bindNode',
+          'select',
+          'snapshot',
+        ])
+        witnesses.observe(require('../../payload').prototype, ['buildPayload'])
+      }
       warmed = await pass(true)
     } finally {
       witnesses?.restore()
@@ -446,9 +451,8 @@ const measure = async (kind) => {
     const { facts, samples, native, seed, ...arm } = enabledRun
     const readings = {
       manifest,
-      ...(witnesses
-        ? { diagnostic: true, acceptanceEligible: false, warmupWitnesses: witnesses.summary() }
-        : {}),
+      ...(witnesses || activeCensus ? { diagnostic: true, acceptanceEligible: false } : {}),
+      ...(witnesses ? { warmupWitnesses: witnesses.summary() } : {}),
       startup,
       loaded,
       c0: control.c0,

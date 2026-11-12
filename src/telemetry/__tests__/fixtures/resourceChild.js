@@ -180,9 +180,13 @@ const measure = async (kind) => {
           await nativePair(builder, snapshot, codec, () => hooks.epoch++, warm ? witnesses : null)
         )
         if (!warm) {
-          const reading = await settled()
-          if (actives.length === 0) witnesses?.check('firstActive', reading)
-          actives.push({ phase: codec.name, ...reading })
+          if (witnesses) {
+            const reading = await settled()
+            if (actives.length === 0) witnesses?.check('firstActive', reading)
+            actives.push({ phase: codec.name, ...reading })
+          } else {
+            actives.push({ phase: codec.name, ...(await settled()) })
+          }
           memory.mark(`collector:${codec.name}`)
         }
       }
@@ -229,17 +233,17 @@ const measure = async (kind) => {
         roles,
         ...Object.values(require.cache).map((entry) => entry.exports)
       )
-    if (witnesses) {
-      witnesses.observe(require('../../metrics').prototype, [
-        'register',
-        'bindNode',
-        'select',
-        'snapshot',
-      ])
-      witnesses.observe(require('../../payload').prototype, ['buildPayload'])
-    }
     let warmed
     try {
+      if (witnesses) {
+        witnesses.observe(require('../../metrics').prototype, [
+          'register',
+          'bindNode',
+          'select',
+          'snapshot',
+        ])
+        witnesses.observe(require('../../payload').prototype, ['buildPayload'])
+      }
       warmed = await pass(true)
     } finally {
       witnesses?.restore()

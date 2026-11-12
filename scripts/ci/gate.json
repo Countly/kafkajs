@@ -19816,7 +19816,10 @@
         "scripts/e2e/telemetry/__tests__/warmupWitness.spec.js \u203a warm-up lifecycle witnesses hooks the five original settled boundaries and never adds a collection or settle",
         "scripts/ci/__tests__/workflowTimeouts.spec.js \u203a Workflow timeouts warm-up witness jobs bound serial original-child pairs on Node 24 and 26",
         "scripts/e2e/telemetry/__tests__/warmupWitness.spec.js \u203a warm-up lifecycle witnesses observes factory receivers inputs and results weakly and restores exact methods",
-        "scripts/e2e/telemetry/__tests__/warmupWitness.spec.js \u203a warm-up lifecycle witnesses refuses witness child readings as acceptance even without the diagnostic envelope"
+        "scripts/e2e/telemetry/__tests__/warmupWitness.spec.js \u203a warm-up lifecycle witnesses refuses witness child readings as acceptance even without the diagnostic envelope",
+        "scripts/e2e/telemetry/__tests__/warmupWitness.spec.js \u203a warm-up lifecycle witnesses restores every prototype when the second child witness installation throws",
+        "scripts/e2e/telemetry/__tests__/warmupWitness.spec.js \u203a warm-up lifecycle witnesses preserves the original active row allocation order without diagnostic hooks",
+        "scripts/e2e/telemetry/__tests__/warmupWitness.spec.js \u203a warm-up lifecycle witnesses marks census-only public readings ineligible for the acceptance judge"
       ],
       "capMinutes": 85,
       "allowedSkips": [
@@ -24060,7 +24063,10 @@
         "scripts/e2e/telemetry/__tests__/warmupWitness.spec.js \u203a warm-up lifecycle witnesses hooks the five original settled boundaries and never adds a collection or settle",
         "scripts/ci/__tests__/workflowTimeouts.spec.js \u203a Workflow timeouts warm-up witness jobs bound serial original-child pairs on Node 24 and 26",
         "scripts/e2e/telemetry/__tests__/warmupWitness.spec.js \u203a warm-up lifecycle witnesses observes factory receivers inputs and results weakly and restores exact methods",
-        "scripts/e2e/telemetry/__tests__/warmupWitness.spec.js \u203a warm-up lifecycle witnesses refuses witness child readings as acceptance even without the diagnostic envelope"
+        "scripts/e2e/telemetry/__tests__/warmupWitness.spec.js \u203a warm-up lifecycle witnesses refuses witness child readings as acceptance even without the diagnostic envelope",
+        "scripts/e2e/telemetry/__tests__/warmupWitness.spec.js \u203a warm-up lifecycle witnesses restores every prototype when the second child witness installation throws",
+        "scripts/e2e/telemetry/__tests__/warmupWitness.spec.js \u203a warm-up lifecycle witnesses preserves the original active row allocation order without diagnostic hooks",
+        "scripts/e2e/telemetry/__tests__/warmupWitness.spec.js \u203a warm-up lifecycle witnesses marks census-only public readings ineligible for the acceptance judge"
       ],
       "capMinutes": 93,
       "allowedSkips": [
