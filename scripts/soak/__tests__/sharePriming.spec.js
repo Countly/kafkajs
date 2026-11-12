@@ -80,7 +80,12 @@ const request = async (apiKey, apiVersion, correlationId, compression = 0) => {
  * @param {ShareFetchTap} tap Original call-through transport observer.
  * @returns {Promise<void>} Complete fixed header/codec coverage.
  */
-const coverage = async (tap, endpoint = 'node:1', metadataVersion = 13) => {
+const coverage = async (
+  tap,
+  endpoint = 'node:1',
+  metadataVersion = 13,
+  negotiationOperation = 'connect'
+) => {
   const calls = [
     ['send', 0, 9, 'producer'],
     ['send', 22, 4, 'producer'],
@@ -110,7 +115,7 @@ const coverage = async (tap, endpoint = 'node:1', metadataVersion = 13) => {
   tap.wrap(socket, endpoint)
   for (const [index, [operation, apiKey, version, role = 'admin']] of calls.entries()) {
     const bytes = await request(apiKey, version, index)
-    tap.operation(role, operation, () => {
+    tap.operation(role, apiKey === 18 ? negotiationOperation : operation, () => {
       expect(socket.write(bytes.subarray(0, 7))).toBe(false)
       expect(socket.write(bytes.subarray(7))).toBe(false)
       const body = new Encoder()
@@ -146,6 +151,7 @@ const recording = async ({
   damagePrime,
   separateCoordinators = false,
   scoredMetadataVersion = 13,
+  scoredNegotiationOperation = 'connect',
 } = {}) => {
   const environment = { ...process.env }
   Object.assign(process.env, {
@@ -204,7 +210,8 @@ const recording = async ({
         await coverage(
           tap,
           separateCoordinators ? (priming ? 'node-a:9092' : 'node-b:9092') : 'node:1',
-          priming ? 13 : scoredMetadataVersion
+          priming ? 13 : scoredMetadataVersion,
+          priming ? 'connect' : scoredNegotiationOperation
         )
       }),
       openPhase: async () => {
@@ -324,6 +331,24 @@ describe('fixed same-realm share priming', () => {
     const inventories = rows.filter((r) => r.event === 'soak-protocol-manifest')
     expect(inventories[0].inventory.every((r) => r.endpoint === 'node-a:9092')).toBe(true)
     expect(inventories[1].inventory.every((r) => r.endpoint === 'node-b:9092')).toBe(true)
+  }, 120000)
+
+  test('accepts identical ApiVersions attempts made during different public operations', async () => {
+    const { rows, result, error, problems } = await recording({
+      scoredNegotiationOperation: 'deleteTopics',
+    })
+    expect(error).toBeUndefined()
+    expect(result.ok).toBe(true)
+    expect(problems).toEqual([])
+    const manifests = rows.filter((r) => r.event === 'soak-protocol-manifest')
+    expect(manifests[0].inventory.filter((r) => r.apiKey === 18).map((r) => r.operation)).toEqual([
+      'connect',
+      'connect',
+    ])
+    expect(manifests[1].inventory.filter((r) => r.apiKey === 18).map((r) => r.operation)).toEqual([
+      'deleteTopics',
+      'deleteTopics',
+    ])
   }, 120000)
 
   test('rejects a corresponding negotiated version mismatch across separate coordinators', async () => {

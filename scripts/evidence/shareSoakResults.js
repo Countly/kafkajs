@@ -117,7 +117,7 @@ const answerRows = (request, decoded) => {
     )
   if (request.apiKey === 32 && name === 'describeConfigs') return resultRows(name, decoded)
   if (request.apiKey === 3 && ['fetchTopicMetadata', 'listTopics'].includes(name)) {
-    const topics = decoded.topicMetadata.filter((t) => name !== 'listTopics' || !t.isInternal)
+    const topics = decoded.topicMetadata
     return resultRows(
       name,
       name === 'listTopics'
@@ -176,7 +176,8 @@ const answerRows = (request, decoded) => {
 
 /**
  * Reconciles operation results with their original decoded replies and derived observations.
- * Broker fan-out is joined by operation id; another call's equal-looking reply cannot replace it.
+ * Produce partitions arrive already joined to their original invocation and record corpus.
+ * Other broker fan-out is joined by operation id; another call's reply cannot replace it.
  * @param {object[]} rows One scope's original observations.
  * @param {object[]} answers Decoded successful replies associated with original requests.
  * @returns {string[]} Missing or divergent wire/result/observation links.

@@ -493,7 +493,11 @@ describe('two-scope original share driver', () => {
           })
           expect(rejected.problems).not.toContain('Changed/incomplete artifact seal')
           expect(rejected.problems.join('; ')).toMatch(
-            new RegExp(`Original operation ${operation.id}/${name}: decoded values differ`)
+            new RegExp(
+              name === 'send'
+                ? `Original Produce ${request.socket}:${request.frame}: Produce partition lacks one original invocation and corpus`
+                : `Original operation ${operation.id}/${name}: decoded values differ`
+            )
           )
           response.bytes = before
         }
