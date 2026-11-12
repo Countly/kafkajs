@@ -1,4 +1,5 @@
 const { resultProblems } = require('./shareSoakResults')
+const { ShareProduceEvidence } = require('./shareSoakProduce')
 const Decoder = require('../../src/protocol/decoder')
 const { responseHeaderVersion } = require('../../src/protocol/headers')
 const { readRequestHeader } = require('../../testHelpers/fakeSocket')
@@ -40,6 +41,8 @@ const errors = (value) => {
 /**
  * Decodes original answered frames with low-level versioned codecs. An answered error is archived
  * but cannot establish successful operation coverage. ApiVersions rejection uses its v0 body.
+ * Produce topic IDs resolve only through wire Metadata replies received before that request;
+ * workload partitions also require original invocation, payload and acknowledgement coverage.
  * @param {object[]} rows One scope's original wire observations.
  * @returns {Promise<object>} Successful operation/version inventory and decode failures.
  */
@@ -47,6 +50,7 @@ const verifyProtocolAnswers = async (rows) => {
   const problems = []
   const successes = []
   const answers = []
+  const metadataTopics = new Map()
   const operationResults = new Map(
     rows
       .filter((r) => r.event === 'soak-wire' && r.kind === 'operation' && r.status === 'passed')
@@ -74,15 +78,37 @@ const verifyProtocolAnswers = async (rows) => {
       const codec = require(
         `../../src/protocol/requests/${APIS[header.apiKey]}/v${version}/response`
       )
-      const decoded = await codec.decode(body)
+      const options =
+        header.apiKey === 0
+          ? {
+              topicNames: new Map(
+                [...metadataTopics]
+                  .filter(([, topic]) => topic.at <= request.at)
+                  .map(([id, topic]) => [id, topic.name])
+              ),
+            }
+          : {}
+      const decoded = await codec.decode(body, options)
       const codes = errors(decoded)
       if (codes.some((code) => !Number.isInteger(code))) throw new Error('Invalid wire error code')
       if (codes.some((code) => code !== 0)) {
         if (errors(operationResults.get(request.operationId)).some((code) => code !== 0))
-          answers.push({ request, decoded })
+          answers.push({ request, decoded, answeredAt: reply.at })
         continue
       }
-      answers.push({ request, decoded })
+      if (header.apiKey === 3) {
+        for (const topic of decoded.topicMetadata) {
+          if (!topic.topicId || topic.topicId === '00000000-0000-0000-0000-000000000000') continue
+          const previous = metadataTopics.get(topic.topicId)
+          if (previous && previous.name !== topic.topic)
+            throw new Error('Ambiguous metadata topic ID')
+          metadataTopics.set(topic.topicId, {
+            name: topic.topic,
+            at: Math.min(previous?.at ?? Infinity, reply.at),
+          })
+        }
+      }
+      answers.push({ request, decoded, answeredAt: reply.at })
       if (header.apiKey === 16)
         groupListings.push({
           operationId: request.operationId,
@@ -126,7 +152,8 @@ const verifyProtocolAnswers = async (rows) => {
   ])
     if (!successes.some((r) => r.operation === operation))
       problems.push(`No decoded successful operation ${operation}`)
-  problems.push(...resultProblems(rows, answers))
+  const produced = await new ShareProduceEvidence(rows).reconcile(answers)
+  problems.push(...produced.problems, ...resultProblems(rows, produced.answers))
   return { problems, successes, groupListings }
 }
 module.exports = { verifyProtocolAnswers }

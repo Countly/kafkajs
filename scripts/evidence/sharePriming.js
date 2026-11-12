@@ -168,12 +168,22 @@ const verifyShareProtocol = (rows) => {
 /**
  * Projects authenticated operation/client roles and negotiated implementations across placements.
  * Literal endpoints remain in each manifest; independent groups may select different brokers.
+ * ApiVersions has its own client-role/version inventory: reconnect timing can put the same
+ * negotiation under a different public call without selecting a different implementation.
  * @param {object[]} inventory Validated original manifest entries.
  * @returns {string[]} Distinct corresponding implementations in a stable order.
  */
 const correspondingImplementations = (inventory) =>
   [
-    ...new Set(inventory.map(({ endpoint, ...implementation }) => JSON.stringify(implementation))),
+    ...new Set(
+      inventory.map(({ endpoint, ...implementation }) =>
+        JSON.stringify(
+          implementation.apiKey === 18
+            ? { ...implementation, operation: 'ApiVersions' }
+            : implementation
+        )
+      )
+    ),
   ].sort()
 
 /**
