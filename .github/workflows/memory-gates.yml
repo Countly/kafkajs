@@ -40,6 +40,7 @@ jobs:
             'share-soak-verify',
             'share-soak-verdict',
             'resources',
+            'resource-control-diagnostic',
             'active-owner-census',
             'warmup-witnesses',
             'journal-controls',
@@ -314,6 +315,40 @@ jobs:
         with:
           name: resources-node${{ matrix.node }}
           path: .tmp/telemetry-resources/
+          if-no-files-found: error
+          include-hidden-files: true
+  resource-control-diagnostic:
+    needs: [select]
+    if: github.event_name == 'workflow_dispatch' && contains(fromJSON(needs.select.outputs.jobs), 'resource-control-diagnostic')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions: { contents: read }
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24, 26]
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 1
+      - uses: actions/setup-node@v4
+        timeout-minutes: 1
+        with: { node-version: '${{ matrix.node }}', cache: npm }
+      - run: npm ci
+        timeout-minutes: 5
+      - name: Stamp the tree and prepare the diagnostic parent directory
+        timeout-minutes: 1
+        run: |
+          echo "KAFKAJS_TREE=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          mkdir -p .tmp
+      - name: Compare default and disabled bytecode flushing on original share controls
+        timeout-minutes: 8
+        run: timeout -k 10s 420s node scripts/e2e/telemetry/controlDiagnostic.js --diagnostic-only .tmp/resource-control-diagnostic
+      - if: always()
+        timeout-minutes: 2
+        uses: actions/upload-artifact@v4
+        with:
+          name: resource-control-diagnostic-node${{ matrix.node }}
+          path: .tmp/resource-control-diagnostic/
           if-no-files-found: error
           include-hidden-files: true
   active-owner-census:

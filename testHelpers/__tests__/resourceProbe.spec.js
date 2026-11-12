@@ -953,16 +953,21 @@ describe('resource artifact validation', () => {
 
   describe('diagnostic acceptance isolation and recorded boundary replay', () => {
     test.each(ARMS)('ignores control diagnostic counters in the %s verdict', (arm) => {
-      const whole = record(arm, 'shareConsumer')
-      const before = JSON.stringify(whole)
-      const original = judgeMemoryArm(whole)
-      whole.readings.controlDiagnostics = {
-        c0: { memory: { rss: 1e12 } },
-        c1: { heap: { total_heap_size: 1e12 }, maxRSS: 1e12 },
+      for (const delta of [MIB, 2 * MIB, 2 * MIB + 1]) {
+        const whole = record(arm, 'shareConsumer')
+        whole.readings.c1.rss = whole.readings.c0.rss + delta
+        for (const point of whole.readings.c1.gc.checkpoints) point.rss = whole.readings.c1.rss
+        const before = JSON.stringify(whole)
+        const original = judgeMemoryArm(whole)
+        expect(original.problems.includes('control RSS is unstable')).toBe(delta > 2 * MIB)
+        whole.readings.controlDiagnostics = {
+          c0: { memory: { rss: 1e12 }, code: { code_and_metadata_size: 1e12 } },
+          c1: { heapSpaces: [{ space_size: 1e12 }], heap: { total_heap_size: 1e12 }, maxRSS: 1e12 },
+        }
+        expect(judgeMemoryArm(whole)).toEqual(original)
+        delete whole.readings.controlDiagnostics
+        expect(JSON.stringify(whole)).toBe(before)
       }
-      expect(judgeMemoryArm(whole)).toEqual(original)
-      delete whole.readings.controlDiagnostics
-      expect(JSON.stringify(whole)).toBe(before)
     })
 
     test.each(ARMS)('rejects no-flush-bytecode diagnostic evidence for the %s arm', (arm) => {

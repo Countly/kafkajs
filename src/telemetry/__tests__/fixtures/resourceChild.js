@@ -255,13 +255,15 @@ const measure = async (kind) => {
     contexts.final = hostContext()
     const readings = {
       manifest,
-      ...(witnesses
-        ? { diagnostic: true, acceptanceEligible: false, warmupWitnesses: witnesses.summary() }
+      ...(witnesses || process.execArgv.includes('--no-flush-bytecode')
+        ? { diagnostic: true, acceptanceEligible: false }
         : {}),
+      ...(witnesses ? { warmupWitnesses: witnesses.summary() } : {}),
       startup,
       loaded,
       c0: control.c0,
       c1: control.c1,
+      controlDiagnostics: control.diagnostics,
       released: control.released,
       control: control.facts,
       warmup: { m0: warmed.m0, end },

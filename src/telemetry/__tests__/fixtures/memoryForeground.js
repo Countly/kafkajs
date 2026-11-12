@@ -11,6 +11,7 @@
  * share-only helpers, so an arm can finish all loading before its control.
  */
 const path = require('node:path')
+const controlDiagnostics = require('./controlDiagnostics')
 
 const ROOT = path.join(__dirname, '..', '..', '..', '..')
 const { Kafka } = require(path.join(ROOT, 'index.js'))
@@ -494,9 +495,9 @@ class MemoryForeground {
  * @param {import('../../../../testHelpers/processMemory').NativeJournal} arm.journal observing
  *   the native codecs, which must see no call
  * @param {MemoryForeground[]} arm.live the clients a failed run still has to close
- * @returns {Promise<{c0:object, c1:object, released:object, facts:object,
+ * @returns {Promise<{c0:object, c1:object, diagnostics:object, released:object, facts:object,
  *   releasedResources:object}>} the three settled readings, the control's facts and the roles
- *   still live after its release
+ *   still live after its release; diagnostics are separate post-reading counters, never verdict inputs
  */
 const runControl = async ({ kind, lifecycles, memory, roles, journal, live }) => {
   const settled = () => roles.run('fixture', () => memory.settled())
@@ -507,6 +508,7 @@ const runControl = async ({ kind, lifecycles, memory, roles, journal, live }) =>
     live.push(client)
     await client.open()
     const c0 = await settled()
+    const diagnostics = { c0: controlDiagnostics() }
     memory.mark('control:c0')
     for (let index = 1; index < lifecycles; index++) {
       await client.close(0)
@@ -514,6 +516,7 @@ const runControl = async ({ kind, lifecycles, memory, roles, journal, live }) =>
       await client.open()
     }
     const c1 = await settled()
+    diagnostics.c1 = controlDiagnostics()
     memory.mark('control:c1')
     const probe = await client.client.clientInstanceId({ timeout: 0 }).then(
       () => 'resolved',
@@ -528,7 +531,7 @@ const runControl = async ({ kind, lifecycles, memory, roles, journal, live }) =>
     live.splice(live.indexOf(client), 1)
     const released = await settled()
     memory.mark('control:released')
-    return { c0, c1, released, facts, releasedResources: roles.read() }
+    return { c0, c1, diagnostics, released, facts, releasedResources: roles.read() }
   })
 }
 

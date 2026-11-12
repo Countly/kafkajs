@@ -451,12 +451,15 @@ const measure = async (kind) => {
     const { facts, samples, native, seed, ...arm } = enabledRun
     const readings = {
       manifest,
-      ...(witnesses || activeCensus ? { diagnostic: true, acceptanceEligible: false } : {}),
+      ...(witnesses || activeCensus || process.execArgv.includes('--no-flush-bytecode')
+        ? { diagnostic: true, acceptanceEligible: false }
+        : {}),
       ...(witnesses ? { warmupWitnesses: witnesses.summary() } : {}),
       startup,
       loaded,
       c0: control.c0,
       c1: control.c1,
+      controlDiagnostics: control.diagnostics,
       released: control.released,
       control: control.facts,
       warmup: { m0: warmed.m0, end },
