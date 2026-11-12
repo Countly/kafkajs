@@ -39,6 +39,7 @@ const {
   SETTLE,
   collectionsSettled,
   dataBytes,
+  peakReadingDecreases,
 } = require('../../../testHelpers/processMemory')
 
 /** The version of the recorded shape; an older artifact is not evidence for the current gate. */
@@ -407,10 +408,11 @@ class MemoryArmJudge {
   }
 
   /**
-   * @returns {{ verdict: 'pass'|'fail'|'inconclusive', problems: string[] }} `fail` for any broken
+   * @returns {{ verdict: 'pass'|'fail'|'inconclusive', problems: string[], facts?: object }} `fail` for any broken
    *   fact or observed gate violation, `inconclusive` when only a missing capability, an
    *   inadmissible control or the host stops the numbers deciding. Seeded controls always fail
-   *   eligibility after any structurally valid measurements have been judged.
+   *   eligibility after any structurally valid measurements have been judged. Optional `facts`
+   *   records peak decreases and the unchanged all-read maxima when any decrease was observed.
    */
   evaluate() {
     this.envelope()
@@ -423,7 +425,11 @@ class MemoryArmJudge {
       : this.inconclusive.length
         ? 'inconclusive'
         : 'pass'
-    return { verdict, problems: [...this.failures, ...this.inconclusive] }
+    return {
+      verdict,
+      problems: [...this.failures, ...this.inconclusive],
+      ...(this.peakFacts && { facts: this.peakFacts }),
+    }
   }
 
   /** @returns {void} judges the schema, the child's exit and the host contexts */
@@ -706,7 +712,8 @@ class MemoryArmJudge {
   }
 
   /**
-   * Validates the marks and recomputes the peaks and baselines from them.
+   * Validates the marks and recomputes the peaks and baselines from all reads. Approximate
+   * peak-counter decreases are recorded as facts and never lower any judged maximum.
    * @returns {{B:number, Eref:number, P:number, Epeak:number, setupPeak:number,
    *   usable:boolean}|null} the quantities every gate uses, or null when the marks are unusable
    */
@@ -725,11 +732,7 @@ class MemoryArmJudge {
         this.fail('peak source is claimed but a mark has no reading')
         return null
       }
-      if (previous) {
-        if (mark.at < previous.at) this.fail('marks are out of order')
-        if (mark.maxRss < previous.maxRss) this.fail('raw maximum decreased')
-        if (claimed && mark.vmhwm < previous.vmhwm) this.fail('authoritative peak decreased')
-      }
+      if (previous && mark.at < previous.at) this.fail('marks are out of order')
       if (claimed && mark.vmhwm < mark.covered) {
         this.wait('peak source does not cover a current reading')
         usable = false
@@ -744,7 +747,7 @@ class MemoryArmJudge {
     const sampled = this.readings.samples?.peak
     const largest = (field) =>
       Math.max(0, sampled?.[field] ?? 0, ...readings.map((r) => r?.[field] ?? 0))
-    return {
+    const peaks = {
       B: Math.min(c0.rss, c1.rss),
       Eref: Math.min(c0.external, c1.external),
       P: Math.max(...marks.map(peakOf), largest('rss')),
@@ -752,6 +755,10 @@ class MemoryArmJudge {
       setupPeak: Math.max(...upToSetup.map(peakOf)),
       usable,
     }
+    const peakDecreases = peakReadingDecreases(marks, claimed ? ['maxRss', 'vmhwm'] : ['maxRss'])
+    if (peakDecreases.length)
+      this.peakFacts = { peak: peaks.P, setupPeak: peaks.setupPeak, peakDecreases }
+    return peaks
   }
 
   /**
@@ -1067,7 +1074,7 @@ class MemoryArmJudge {
  * Judges one recorded memory arm.
  * @param {object} record `{ schema, arm, kind, stamp, exit, context, readings }` as the resource
  *   spec writes it
- * @returns {{ verdict: 'pass'|'fail'|'inconclusive', problems: string[] }} `fail` for any broken
+ * @returns {{ verdict: 'pass'|'fail'|'inconclusive', problems: string[], facts?: object }} `fail` for any broken
  *   fact or observed gate violation, `inconclusive` when only a missing capability, an
  *   inadmissible control or the host stops the numbers deciding
  */

@@ -7110,6 +7110,85 @@ describe('telemetry resident-size reference', () => {
     expect(evaluate(make()).measured.peak).toBe(80 * MIB)
   })
 
+  test('records every peak decrease and retains the running maximum', () => {
+    const input = make()
+    raise(input, 89 * MIB)
+    input.samples[4].snapshot.memory.hwm = 90 * MIB
+    input.samples[6].snapshot.memory.hwm = 88 * MIB
+    for (const row of [
+      ...input.samples.slice(5).map((s) => s.snapshot.memory),
+      input.teardown.memory,
+      input.reference.final,
+    ])
+      row.rawMaxRss = 299 * MIB
+    input.samples[6].snapshot.memory.rawMaxRss = 298 * MIB
+    const original = JSON.stringify(input)
+    const replay = JSON.parse(original)
+    const verdict = evaluate(replay)
+    expect(verdict).toMatchObject({ ok: true, outcome: 'passed', violations: [], inconclusive: [] })
+    expect(verdict.measured).toMatchObject({
+      peak: 90 * MIB,
+      rssDelta: 20 * MIB,
+      setupPeak: 80 * MIB,
+    })
+    expect(verdict.measured.peakDecreases).toEqual([
+      {
+        index: 11,
+        phase: 'settled',
+        field: 'rawMaxRss',
+        before: 300 * MIB,
+        after: 299 * MIB,
+        delta: -MIB,
+      },
+      { index: 11, phase: 'settled', field: 'hwm', before: 90 * MIB, after: 89 * MIB, delta: -MIB },
+      {
+        index: 12,
+        phase: 'settled',
+        field: 'rawMaxRss',
+        before: 299 * MIB,
+        after: 298 * MIB,
+        delta: -MIB,
+      },
+      { index: 12, phase: 'settled', field: 'hwm', before: 89 * MIB, after: 88 * MIB, delta: -MIB },
+    ])
+    expect(JSON.stringify(replay)).toBe(original)
+  })
+
+  test('preserves setup, delta and absolute limits after a peak decrease', () => {
+    const input = make()
+    input.reference.control.c0.hwm = 96 * MIB + 1
+    input.samples[4].snapshot.memory.hwm = 160 * MIB + 1
+    const verdict = evaluate(input)
+    expect(verdict.measured).toMatchObject({
+      peak: 160 * MIB + 1,
+      setupPeak: 96 * MIB + 1,
+      rssDelta: 90 * MIB + 1,
+    })
+    expect(verdict.violations).toEqual([
+      'telemetry resident-size increase',
+      'absolute resident-size peak',
+    ])
+    expect(verdict.inconclusive).toEqual(['setup peak above its allowance'])
+    expect(verdict.measured.peakDecreases).toEqual([
+      {
+        index: 3,
+        phase: 'c1',
+        field: 'hwm',
+        before: 96 * MIB + 1,
+        after: 80 * MIB,
+        delta: -16 * MIB - 1,
+      },
+      {
+        index: 11,
+        phase: 'settled',
+        field: 'hwm',
+        before: 160 * MIB + 1,
+        after: 80 * MIB,
+        delta: -80 * MIB - 1,
+      },
+    ])
+  })
+
   test('holds the absolute backstop and the increase together at equality, one byte over fails both', () => {
     const equal = make()
     const readings = [
@@ -7303,13 +7382,6 @@ describe('telemetry resident-size reference', () => {
     ],
     ['an absent reference', (r) => delete r.reference, 'resident-size reference facts'],
     ['a wrong peak source', (r) => (r.reference.source = 'maxrss'), 'resident-size peak source'],
-    [
-      'a decreasing peak',
-      (r) => {
-        r.samples[6].snapshot.memory.hwm = 75 * MIB
-      },
-      'resident-size peak series',
-    ],
     [
       'a peak below its own reading',
       (r) => {

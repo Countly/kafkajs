@@ -5,9 +5,10 @@
  * an arm can take its startup reading before any application module is imported.
  *
  * Absolute current-image high water comes from `/proc/self/status` `VmHWM` (kibibytes, scaled to
- * bytes). It is the nonresetting kernel maximum of this executable and covers spikes between
- * sampler callbacks. The raw `process.resourceUsage().maxRSS * 1024` is recorded beside it and is
- * never substituted for it. Nothing here writes `/proc/self/clear_refs` or resets a high water.
+ * bytes). Its approximate readings can decrease, so judges retain the maximum across all reads
+ * and separately check current-reading coverage. The raw `process.resourceUsage().maxRSS * 1024` is
+ * recorded beside it, can also decrease, and is never substituted for it. Nothing here writes
+ * `/proc/self/clear_refs` or resets a high water.
  */
 const fs = require('node:fs')
 const { FixedJournal } = require('./fixedJournal')
@@ -49,6 +50,41 @@ const collectionsSettled = (before, after) =>
 const dataBytes = (reading) => {
   const { bytecode, code } = reading.gc.checkpoints.at(-1).engine
   return reading.heapUsed + reading.external - (bytecode + code)
+}
+
+/**
+ * Records adjacent decreases of valid peak counters without changing the readings. A rebound
+ * below an earlier maximum is not another decrease; missing or invalid counters are left to the
+ * caller's validation. The signed delta is `after - before`.
+ * @param {object[]} readings raw readings in catalogue order
+ * @param {string[]} fields peak counters to inspect
+ * @returns {Array<{index:number, phase:string, field:string, before:number, after:number,
+ *   delta:number}>} every observed decrease, in reading and field order
+ */
+const peakReadingDecreases = (readings, fields) => {
+  const decreases = []
+  for (let index = 1; index < readings.length; index++) {
+    for (const field of fields) {
+      const before = readings[index - 1]?.[field]
+      const after = readings[index]?.[field]
+      if (
+        Number.isSafeInteger(before) &&
+        before >= 0 &&
+        Number.isSafeInteger(after) &&
+        after >= 0 &&
+        after < before
+      )
+        decreases.push({
+          index,
+          phase: readings[index].phase,
+          field,
+          before,
+          after,
+          delta: after - before,
+        })
+    }
+  }
+  return decreases
 }
 
 /** What the selected absolute peak source is called and measures. */
@@ -198,7 +234,7 @@ class ProcessMemory {
 
   /**
    * Records the absolute high water at a phase boundary and starts a new covered interval. The
-   * current reading is taken before the kernel's, so the high water can never read below it.
+   * current reading is taken before the kernel's; the judge checks whether the peak covers it.
    * @param {string} phase the fixed catalogue name of the boundary
    * @returns {{phase:string, at:number, rss:number, vmhwm:number|null, maxRss:number,
    *   covered:number, coveredExternal:number, imports:{count:number,late:string[]}|null}} the mark, also kept in `marks`; `vmhwm` is null
@@ -629,6 +665,7 @@ module.exports = {
   SETTLE,
   collectionsSettled,
   dataBytes,
+  peakReadingDecreases,
   PEAK_SOURCE,
   SAMPLE_MS,
   GC_PAUSE_MS,

@@ -20272,7 +20272,17 @@
         "scripts/evidence/__tests__/shareSoakAcceptance.spec.js \u203a share soak independent acceptance controls archive reset retirement evidence rejects raw post-close acknowledgement frame without a diagnostic marker",
         "scripts/evidence/__tests__/shareSoakAcceptance.spec.js \u203a share soak independent acceptance controls archive reset retirement evidence rejects raw post-close legacy close timestamp without a diagnostic marker",
         "scripts/evidence/__tests__/shareSoakAcceptance.spec.js \u203a share soak independent acceptance controls rejects an unanswered wire write 0 ms after reset socket close",
-        "scripts/evidence/__tests__/shareSoakAcceptance.spec.js \u203a share soak independent acceptance controls rejects an unanswered wire write 1 ms after reset socket close"
+        "scripts/evidence/__tests__/shareSoakAcceptance.spec.js \u203a share soak independent acceptance controls rejects an unanswered wire write 1 ms after reset socket close",
+        "testHelpers/__tests__/resourceProbe.spec.js \u203a resource artifact validation peak reading decreases records every decrease and retains the maximum for the public arm",
+        "testHelpers/__tests__/resourceProbe.spec.js \u203a resource artifact validation peak reading decreases records every decrease and retains the maximum for the collector arm",
+        "testHelpers/__tests__/resourceProbe.spec.js \u203a resource artifact validation peak reading decreases preserves the setup limit after a decrease",
+        "testHelpers/__tests__/resourceProbe.spec.js \u203a resource artifact validation peak reading decreases preserves the delta limit after a decrease",
+        "testHelpers/__tests__/resourceProbe.spec.js \u203a resource artifact validation peak reading decreases preserves the absolute limit after a decrease",
+        "testHelpers/__tests__/resourceProbe.spec.js \u203a resource artifact validation peak reading decreases keeps invalid marks and uncovered readings rejected after a decrease",
+        "scripts/soak/__tests__/soak.spec.js \u203a telemetry resident-size reference records every peak decrease and retains the running maximum",
+        "scripts/soak/__tests__/soak.spec.js \u203a telemetry resident-size reference preserves setup, delta and absolute limits after a peak decrease",
+        "scripts/e2e/telemetry/__tests__/retainedDiagnostic.spec.js \u203a records decreasing sources while preserving missing-coverage diagnostics and the peak",
+        "scripts/e2e/telemetry/__tests__/retainedDiagnostic.spec.js \u203a keeps the diagnostic peak above 160 MiB despite a later decrease"
       ],
       "capMinutes": 85,
       "allowedSkips": [
@@ -24692,7 +24702,17 @@
         "src/admin/__tests__/adminVersionsLive.spec.js \u203a Admin > captured newest versions 4.3.2 capture limits DeleteGroups to v2",
         "src/admin/__tests__/adminVersionsLive.spec.js \u203a Admin > captured newest versions 4.4.0 capture permits DeleteGroups v3",
         "src/admin/__tests__/adminVersionsLive.spec.js \u203a Admin > captured newest versions a capture cannot supply a broker-only API",
-        "src/admin/__tests__/adminVersionsLive.spec.js \u203a Admin > captured newest versions an uncaptured broker version cannot fall back to another recording"
+        "src/admin/__tests__/adminVersionsLive.spec.js \u203a Admin > captured newest versions an uncaptured broker version cannot fall back to another recording",
+        "testHelpers/__tests__/resourceProbe.spec.js \u203a resource artifact validation peak reading decreases records every decrease and retains the maximum for the public arm",
+        "testHelpers/__tests__/resourceProbe.spec.js \u203a resource artifact validation peak reading decreases records every decrease and retains the maximum for the collector arm",
+        "testHelpers/__tests__/resourceProbe.spec.js \u203a resource artifact validation peak reading decreases preserves the setup limit after a decrease",
+        "testHelpers/__tests__/resourceProbe.spec.js \u203a resource artifact validation peak reading decreases preserves the delta limit after a decrease",
+        "testHelpers/__tests__/resourceProbe.spec.js \u203a resource artifact validation peak reading decreases preserves the absolute limit after a decrease",
+        "testHelpers/__tests__/resourceProbe.spec.js \u203a resource artifact validation peak reading decreases keeps invalid marks and uncovered readings rejected after a decrease",
+        "scripts/soak/__tests__/soak.spec.js \u203a telemetry resident-size reference records every peak decrease and retains the running maximum",
+        "scripts/soak/__tests__/soak.spec.js \u203a telemetry resident-size reference preserves setup, delta and absolute limits after a peak decrease",
+        "scripts/e2e/telemetry/__tests__/retainedDiagnostic.spec.js \u203a records decreasing sources while preserving missing-coverage diagnostics and the peak",
+        "scripts/e2e/telemetry/__tests__/retainedDiagnostic.spec.js \u203a keeps the diagnostic peak above 160 MiB despite a later decrease"
       ],
       "capMinutes": 93,
       "allowedSkips": [
