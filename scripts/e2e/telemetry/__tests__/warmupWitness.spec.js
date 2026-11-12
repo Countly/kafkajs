@@ -2,6 +2,7 @@
 
 const path = require('node:path')
 const fs = require('node:fs')
+const vm = require('node:vm')
 const { EventEmitter } = require('node:events')
 const { PassThrough } = require('node:stream')
 const { MEMORY_FLAGS } = require('../../../../testHelpers/processMemory')
@@ -32,6 +33,13 @@ const reading = (at, data = 1000000) => {
     },
   }
 }
+
+/** @param {string} file child fixture name @returns {string} original child source */
+const childSource = (file) =>
+  fs.readFileSync(
+    path.join(__dirname, '../../../../src/telemetry/__tests__/fixtures', file),
+    'utf8'
+  )
 
 /** @returns {object} deterministic weak references without invoking collection */
 const census = (capacity = 100) => {
@@ -188,6 +196,56 @@ describe('warm-up lifecycle witnesses', () => {
     expect(meter.summary().factories).toEqual({ make: 1 })
   })
 
+  test('restores every prototype when the second child witness installation throws', async () => {
+    for (const file of ['publicMemoryChild.js', 'resourceChild.js']) {
+      const source = childSource(file)
+      const start = source.indexOf('    if (witnesses)\n      witnesses.exclude(')
+      const end = source.indexOf('    const end = await settled()', start)
+      expect(start).toBeGreaterThan(-1)
+      expect(end).toBeGreaterThan(start)
+      const metrics = {
+        prototype: { register() {}, bindNode() {}, select() {}, snapshot() {} },
+      }
+      const payload = { prototype: { buildPayload: null } }
+      const originals = [metrics, payload].map(({ prototype }) =>
+        Object.getOwnPropertyDescriptors(prototype)
+      )
+      const requireFixture = (name) => (name === '../../metrics' ? metrics : payload)
+      requireFixture.cache = {}
+      const { meter } = census()
+      const pass = jest.fn()
+      try {
+        await expect(
+          vm.runInNewContext(`(async () => {${source.slice(start, end)}})()`, {
+            witnesses: meter,
+            require: requireFixture,
+            memory: {},
+            roles: {},
+            pass,
+          })
+        ).rejects.toThrow('missing witness factory buildPayload')
+        expect(pass).not.toHaveBeenCalled()
+        expect(
+          [metrics, payload].map(({ prototype }) => Object.getOwnPropertyDescriptors(prototype))
+        ).toEqual(originals)
+        expect(meter.restores).toHaveLength(0)
+      } finally {
+        meter.restore()
+      }
+    }
+  })
+
+  test('preserves the original active row allocation order without diagnostic hooks', () => {
+    const collector = childSource('resourceChild.js')
+    expect(collector).toMatch(
+      /if \(witnesses\) \{[^]*?\} else \{\s*actives\.push\(\{ phase: codec\.name, \.\.\.\(await settled\(\)\) \}\)/
+    )
+    const publicChild = childSource('publicMemoryChild.js')
+    expect(publicChild).toMatch(
+      /if \(witnesses \|\| activeCensus\) \{[^]*?\} else \{\s*const active = await settled\(\)\s*actives\.push\(\{ phase: codec\.name, \.\.\.active, registry: enabled\.fingerprint\(uuid\) \}\)/
+    )
+  })
+
   test('joins exact code and data scalars with post-M deaths without claiming causation', () => {
     const result = load().analysePair(pair())
     expect(result.acceptanceEligible).toBe(false)
@@ -315,6 +373,35 @@ describe('warm-up lifecycle witnesses', () => {
       expect(source.match(/await settled\(\)/g)).toHaveLength(5)
       expect(source).toContain('witnesses?.restore()')
     }
+  })
+
+  test('marks census-only public readings ineligible for the acceptance judge', () => {
+    const source = childSource('publicMemoryChild.js')
+    const start = source.indexOf('    const readings = {')
+    const metadata = source.slice(
+      source.indexOf('      manifest,', start),
+      source.indexOf('      startup,', start)
+    )
+    const { judgeMemoryArm, SCHEMA } = require('../resourceArtifact')
+    const input = pair().scalar.readings
+    const readings = {
+      ...input,
+      ...vm.runInNewContext(`({${metadata}})`, {
+        manifest: input.manifest,
+        witnesses: null,
+        activeCensus: {},
+      }),
+    }
+    expect(readings.warmupWitnesses).toBeUndefined()
+    const judged = judgeMemoryArm({
+      schema: SCHEMA,
+      arm: 'public',
+      kind: 'producer',
+      readings,
+    })
+    expect(judged.verdict).toBe('fail')
+    expect(judged.problems).toContain('diagnostic records are ineligible for acceptance')
+    expect(readings).toMatchObject({ diagnostic: true, acceptanceEligible: false })
   })
 
   test('refuses witness child readings as acceptance even without the diagnostic envelope', () => {
