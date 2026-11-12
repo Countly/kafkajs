@@ -92,7 +92,10 @@ describe('testHelpers > waiting for a created topic to reach every broker', () =
     await jest.advanceTimersByTimeAsync(100)
     await pending
     expect(settled).toBe(true)
-    expect(brokers[2].metadata).toHaveBeenLastCalledWith(['topic-a'])
+    expect(brokers[2].metadata).toHaveBeenLastCalledWith(
+      ['topic-a'],
+      expect.objectContaining({ guard: expect.any(Function) })
+    )
   })
 
   it('owner cancellation stops the propagation wait and later metadata reads', async () => {
@@ -113,6 +116,7 @@ describe('testHelpers > waiting for a created topic to reach every broker', () =
     owner.abort(failure)
     await jest.advanceTimersByTimeAsync(1000)
     expect(await outcome).toBe(failure)
+    expect(broker.metadata.mock.calls[0][1].guard()).toBe(failure)
     const reads = broker.metadata.mock.calls.length
     await jest.advanceTimersByTimeAsync(1000)
     expect(broker.metadata).toHaveBeenCalledTimes(reads)
