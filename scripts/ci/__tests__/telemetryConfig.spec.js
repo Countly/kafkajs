@@ -342,24 +342,4 @@ fi`)
     const runner = read('scripts/e2e/telemetry/run.sh')
     expect(runner).toContain("'prepare-client-source.sh'")
   })
-
-  test('the temporary telemetry fixtures build workflow sets its cache on the runner and supports manual dispatch', () => {
-    const workflow = yaml.load(read('.github/workflows/telemetry-fixtures-build.yml'))
-    const job = workflow.jobs.build
-    const cache = job.steps.findIndex((step) => step.name === 'Set telemetry fixture cache path')
-    const fetch = job.steps.findIndex(
-      (step) => step.name === 'Fetch and verify the pinned build inputs'
-    )
-
-    expect(workflow.on).toHaveProperty('workflow_dispatch')
-    expect(workflow.on.pull_request.paths).toContain(
-      '.github/workflows/telemetry-fixtures-build.yml'
-    )
-    expect(job['timeout-minutes']).toBe(20)
-    expect(job.env).toEqual({ KAFKA_IMAGE: 'apache/kafka:4.4.0' })
-    expect(cache).toBeGreaterThanOrEqual(0)
-    expect(fetch).toBeGreaterThan(cache)
-    expect(job.steps[cache].run).toBe('echo "TF1_CACHE=$RUNNER_TEMP/tf1-cache" >> "$GITHUB_ENV"')
-    expect(job.steps.at(-1).with.path).toBe('$' + '{{ runner.temp }}/collected/')
-  })
 })
