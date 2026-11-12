@@ -952,6 +952,30 @@ describe('resource artifact validation', () => {
   const B = 73 * MIB
 
   describe('diagnostic acceptance isolation and recorded boundary replay', () => {
+    test.each(ARMS)('ignores control diagnostic counters in the %s verdict', (arm) => {
+      const whole = record(arm, 'shareConsumer')
+      const before = JSON.stringify(whole)
+      const original = judgeMemoryArm(whole)
+      whole.readings.controlDiagnostics = {
+        c0: { memory: { rss: 1e12 } },
+        c1: { heap: { total_heap_size: 1e12 }, maxRSS: 1e12 },
+      }
+      expect(judgeMemoryArm(whole)).toEqual(original)
+      delete whole.readings.controlDiagnostics
+      expect(JSON.stringify(whole)).toBe(before)
+    })
+
+    test.each(ARMS)('rejects no-flush-bytecode diagnostic evidence for the %s arm', (arm) => {
+      const whole = record(arm, 'shareConsumer')
+      whole.readings.manifest.execArgv.push('--no-flush-bytecode')
+      whole.readings.diagnostic = true
+      whole.readings.acceptanceEligible = false
+      expect(judgeMemoryArm(whole)).toEqual({
+        verdict: 'fail',
+        problems: ['diagnostic records are ineligible for acceptance'],
+      })
+    })
+
     test.each([{ diagnostic: true }, { acceptanceEligible: false }])(
       'rejects diagnostic marker %p even in a schema-6 envelope',
       (marker) => {
