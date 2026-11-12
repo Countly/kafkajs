@@ -9,7 +9,12 @@ const { Admission } = require('../../state/admission')
 const Generation = require('../../generation')
 const { Kafka, CompressionTypes, ConfigResourceTypes, logLevel } = require('../../../../index')
 const { readLog, committedRecords } = require('../../../../testHelpers/rawLog')
-const { createConnectionPool, createTopic, newLogger, plainTextBrokers } = require('testHelpers')
+const {
+  createConnectionPool,
+  createTopic,
+  newLogger,
+  plainTextBrokers,
+} = require('../../../../testHelpers')
 const { NEVER, STOP_GRACE_MS, bounded, delay, liveRun } = require('./bounded')
 
 /** The most one probe record carries, an independent conservative bound. */
