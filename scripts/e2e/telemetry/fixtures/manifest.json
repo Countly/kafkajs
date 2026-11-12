@@ -318,8 +318,8 @@
         "apache/kafka@sha256:833b867a9585a141da455dc2b57431c65cbccb27f11c91f694444cca9f777e0f"
       ],
       "imageJava": "OpenJDK Runtime Environment Temurin-25.0.4.1+1 (build 25.0.4.1+1-LTS)",
-      "observedBrokerVersion": "Kafka version: 4.4.0 (kafka-topics.sh --version in the image; captures/4.4.0 brokerVersion)",
-      "observedCommit": "Kafka commitId: 1156b2752aaa28ea (scripts/protocol/captures/4.4.0/apiVersions.json brokerCommitId)",
+      "observedBrokerVersion": "Kafka version: 4.4.0 (org.apache.kafka.common.utils.internals.AppInfoParser)",
+      "observedCommit": "Kafka commitId: 1156b2752aaa28ea (org.apache.kafka.common.utils.internals.AppInfoParser)",
       "imageKafkaClientsJarSha256": "9e4514622675f9b24c83373d0d5b35dd7a4dba34bad69762fe90a9e54cfb71de",
       "imageProtobufJavaSha256": "8540247fad9e06baefa8fb45eb313802d019f485f14300e0f9d6b556ed88e753",
       "imageOpenTelemetryProtoJarSha256 (the broker's own, 1.3.2-alpha, not used by the fixture)": "5e5d61a86cbdbc1db8c806894b6e4e253ea151671903ed51c021c705f7c37440",
