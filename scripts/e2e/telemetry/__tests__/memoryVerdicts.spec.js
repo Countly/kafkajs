@@ -1,5 +1,6 @@
 const fs = require('fs')
 const { ordinaryOwnership } = require('../semantics')
+const { readBrokerCapture } = require('../../../../testHelpers/brokerCapture')
 const { verifyScenario } = require('../evidence')
 const {
   buildShutdownModel,
@@ -55,6 +56,16 @@ describe('memory-gates refused bootstrap ownership', () => {
     t.records[2].response.ranges[76] = [0, 0]
     expect(() => ordinaryOwnership(t, { refusal: outcome })).toThrow()
   })
+  test.each(['4.0.2', '4.1.2'])(
+    'preserves the captured %s capability refusal after fallback',
+    (line) => {
+      const outcome =
+        line === '4.0.2' ? { ...refusal(), reason: 'api-not-advertised', apiKey: 76 } : refusal()
+      expect(ordinaryOwnership(connectedWire(line), { refusal: outcome })).toEqual([
+        '1:refused-bootstrap',
+      ])
+    }
+  )
   test.each([
     ['an extra setup socket', (t) => t.sockets.push({ id: 2, node: '1', kind: 'normal' })],
     [
@@ -97,6 +108,164 @@ describe('memory-gates refused bootstrap ownership', () => {
     const wire = refusedWire()
     change(wire)
     expect(() => ordinaryOwnership(wire, { refusal: refusal() })).toThrow()
+  })
+})
+
+/**
+ * Replays a connect-only share bootstrap using the committed broker ranges. Older brokers reject
+ * ApiVersions v5 before accepting v4; 4.4.0 answers the first request successfully.
+ * @param {string} line captured broker version
+ * @returns {object} closed physical socket and its negotiation records
+ */
+const connectedWire = (line = '4.4.0') => {
+  const wire = refusedWire()
+  wire.owner = 'share'
+  const ranges = readBrokerCapture(line).apiRanges
+  wire.records[2].response.ranges = ranges
+  if (ranges[18][1] >= 5) {
+    wire.records.splice(1, 1)
+    wire.records[1].apiVersion = 5
+  }
+  return wire
+}
+
+describe('memory-gates connected share bootstrap ownership', () => {
+  const outcome = { status: 'connected' }
+  test.each(['4.2.2', '4.3.1', '4.3.2', '4.4.0'])(
+    'owns only the closed connect-only bootstrap with captured %s negotiation',
+    (line) => {
+      const wire = connectedWire(line)
+      expect(ordinaryOwnership(wire, { refusal: outcome })).toEqual(['1:bootstrap'])
+      expect(wire.sockets[0].kind).toBe('undecided')
+      expect(wire.sockets[0].foregroundBootstrap).not.toBe(true)
+    }
+  )
+  test.each([
+    [22, 14100.435606, 14100.955878, 14101.786546, 14105.161956],
+    [26, 14957.455607, 14958.025168, 14959.099669, 14962.658055],
+  ])(
+    'replays the recorded Node %s quiet socket without relabelling it',
+    (_node, at, write, response, close) => {
+      const wire = connectedWire()
+      wire.records[0].at = at
+      wire.records[1].writeAt = write
+      wire.records[1].response.responseAt = response
+      wire.sockets[0].closedAt = close
+      expect(wire.records.map((r) => [r.type, r.apiKey, r.apiVersion])).toEqual([
+        ['connect', undefined, undefined],
+        ['request', 18, 5],
+      ])
+      expect(ordinaryOwnership(wire, { refusal: outcome })).toEqual(['1:bootstrap'])
+      expect(wire.sockets[0].kind).toBe('undecided')
+    }
+  )
+  test.each([
+    ['extra socket', (t) => t.sockets.push({ id: 2, node: '1', kind: 'undecided' })],
+    [
+      'telemetry socket',
+      (t) => {
+        t.sockets[0].kind = 'telemetry'
+      },
+    ],
+    [
+      'unclosed socket',
+      (t) => {
+        delete t.sockets[0].closedAt
+      },
+    ],
+    [
+      'failed negotiation',
+      (t) => {
+        t.records[1].response.errorCode = 35
+      },
+    ],
+    [
+      'unanswered negotiation',
+      (t) => {
+        delete t.records[1].response
+      },
+    ],
+    [
+      'different connect',
+      (t) => {
+        t.records[0].socketId = 2
+      },
+    ],
+    [
+      'different request node',
+      (t) => {
+        t.records[1].node = '2'
+      },
+    ],
+    [
+      'request before connect',
+      (t) => {
+        t.records[1].writeAt = 0
+      },
+    ],
+    [
+      'response before write',
+      (t) => {
+        t.records[1].response.responseAt = 0
+      },
+    ],
+    [
+      'close before response',
+      (t) => {
+        t.sockets[0].closedAt = 0
+      },
+    ],
+    [
+      'unadvertised negotiation version',
+      (t) => {
+        t.records[1].response.ranges[18] = [0, 4]
+      },
+    ],
+    [
+      'missing share API',
+      (t) => {
+        delete t.records[1].response.ranges[78]
+      },
+    ],
+    [
+      'advertised GetTelemetrySubscriptions',
+      (t) => {
+        t.records[1].response.ranges[71] = [0, 0]
+      },
+    ],
+    [
+      'advertised PushTelemetry',
+      (t) => {
+        t.records[1].response.ranges[72] = [0, 0]
+      },
+    ],
+    [
+      'extra GetTelemetrySubscriptions',
+      (t) => {
+        t.records.push({ ...t.records[1], apiKey: 71 })
+      },
+    ],
+    [
+      'extra successful negotiation',
+      (t) => {
+        t.records.push({ ...t.records[1] })
+      },
+    ],
+  ])('rejects %s as connected bootstrap proof', (_name, mutate) => {
+    const wire = connectedWire()
+    mutate(wire)
+    expect(() => ordinaryOwnership(wire, { refusal: outcome })).toThrow()
+  })
+  test('requires the public connected outcome for a quiet bootstrap', () => {
+    expect(() => ordinaryOwnership(connectedWire())).toThrow('Unowned or additional quiet socket')
+  })
+  test('requires one client and ordered fallback after a version refusal', () => {
+    const wire = connectedWire('4.3.1')
+    wire.records[1].clientId = 'other'
+    expect(() => ordinaryOwnership(wire, { refusal: outcome })).toThrow()
+    wire.records[1].clientId = 'share'
+    wire.records[1].response.responseAt = 4
+    expect(() => ordinaryOwnership(wire, { refusal: outcome })).toThrow()
   })
 })
 
