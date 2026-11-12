@@ -25,7 +25,11 @@ class ShareProduceEvidence {
     this.observed = new Set()
   }
 
-  /** @param {object} value Public or decoded partition result. @returns {object} Exact acknowledgement fields. */
+  /**
+   * Locates candidates by partition acknowledgement; `claim` checks their names against Metadata.
+   * @param {object} value Public or decoded partition result.
+   * @returns {object} Partition identity, offset and error fields.
+   */
   result({ partition, baseOffset, errorCode }) {
     return { partition, baseOffset, errorCode }
   }
@@ -55,6 +59,7 @@ class ShareProduceEvidence {
     if (decoder.readInt16() !== -1) throw new Error('Produce acknowledgement mode differs')
     decoder.readInt32()
     const seen = new Set()
+    const matchedTopics = new Set()
     const topics = await array(async () => {
       const key = header.apiVersion >= 13 ? decoder.readUuid() : string()
       const found = decoded.topics.filter(
@@ -62,6 +67,8 @@ class ShareProduceEvidence {
       )
       if (found.length !== 1 || typeof found[0].topicName !== 'string')
         throw new Error('Produce topic lacks matching request, response and metadata')
+      if (matchedTopics.has(found[0])) throw new Error('Duplicate requested Produce topic')
+      matchedTopics.add(found[0])
       const topic = found[0].topicName
       const partitions = await array(async () => {
         const partition = decoder.readInt32()
@@ -95,6 +102,8 @@ class ShareProduceEvidence {
     })
     tags()
     const partitions = topics.flat()
+    if (matchedTopics.size !== decoded.topics.length)
+      throw new Error('Produce response topic inventory differs from request and metadata')
     if (
       decoder.offset !== decoder.buffer.length ||
       partitions.length !== decoded.topics.reduce((n, t) => n + t.partitions.length, 0)
@@ -136,6 +145,10 @@ class ShareProduceEvidence {
       throw new Error('Produce partition lacks one original invocation and corpus')
     const [operation] = calls
     const [observation] = observations
+    if (operation.result[0].topicName !== topic)
+      throw new Error('Public Produce acknowledgement topic differs from metadata')
+    if (observation.sent[0].topicName !== topic)
+      throw new Error('Observed Produce acknowledgement topic differs from metadata')
     if (this.claimed.has(operation.id) || this.observed.has(observation))
       throw new Error('Produce partition reused original send evidence')
     const expected = observation.messages.map(({ partition, key, value, timestamp }) => ({

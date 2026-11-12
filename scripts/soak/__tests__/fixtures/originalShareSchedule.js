@@ -508,7 +508,7 @@ const originalShareSchedule = async ({
                 owner: null,
                 count: 0,
               })
-            return [{ partition, baseOffset, errorCode: 0 }]
+            return [{ topicName: topic, partition, baseOffset, errorCode: 0 }]
           },
         }),
     }
