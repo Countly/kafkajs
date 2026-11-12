@@ -11,8 +11,13 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 - Default test broker is Kafka 4.4.0 (compose files, `scripts/dockerComposeUp.sh`, jest setup, probe fallback); CI integration rows run on 4.4.0 (13 rows).
 
+#### Fixes
+
+- Return `allowReplicationFactorChange: true` for AlterPartitionReassignments v0 responses, matching the schema default on Kafka 4.0.
+
 #### Tooling
 
+- Weekly integration jobs use CI's 20-minute default and per-row timeout overrides.
 - Weekly CI matrix now covers Kafka 4.0.2 (the claimed floor), 4.2.2, 4.3.2 and 4.4.0 on Node 22, 24 and 26; the `kafka_version` dispatch input is removed so every successful run is a full run.
 - Telemetry lanes and their Java fixtures (reporter and client jars, built in CI) run on Kafka 4.4.0; the no-plugin lanes also cover 4.0.2, 4.1.2 and 4.2.2.
 - The Exit gate and its fixtures run on Kafka 4.4.0 (tiered storage test-fixtures jar, coordinator patch, state fixtures); the focused 4.4.0 checks and the share check are default checks, the 4.3 checks stay as old-broker controls on 4.3.2, and the Java interop checks keep the Kafka 4.3.1 client as their oracle.
