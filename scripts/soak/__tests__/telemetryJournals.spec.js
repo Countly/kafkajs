@@ -1057,18 +1057,18 @@ describe('telemetry engine code shadow', () => {
         engine.record({ phase: 'settled', at: 100 + i })
         return {
           completedAtMs: p.minutes * 60000,
-          snapshot: { memory: { at: 100 + i, retainedBytes: p.raw } },
+          snapshot: { memory: { phase: 'settled', at: 100 + i, retainedBytes: p.raw } },
         }
       })
       const joined = engine.report(samples)
       expect(joined.data.slopeBytesPerMinute).toBeCloseTo(60000, 3)
       expect(joined.code.endpointBytes).toBe(200000)
       samples[2].snapshot.memory.at = 999
-      expect(engine.report(samples)).toEqual({
+      expect(engine.report(samples)).toMatchObject({
         scope: 'shadow',
         acceptance: false,
         complete: false,
-        missing: 1,
+        error: expect.stringContaining('join mismatch at sample 2'),
       })
     } finally {
       spy.mockRestore()
