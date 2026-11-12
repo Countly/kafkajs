@@ -2,32 +2,28 @@ name: Weekly full matrix
 on:
   schedule: [{ cron: '0 3 * * 1' }]
   workflow_dispatch:
-    inputs:
-      kafka_version: { description: 'Extra Kafka version to add (e.g. 4.4.0)', required: false }
 jobs:
   integration:
-    timeout-minutes: 360
     runs-on: ubuntu-latest
+    timeout-minutes: ${{ matrix.timeout || 20 }}
     strategy:
       fail-fast: false
       max-parallel: 6
       matrix:
         node: [22, 24, 26]
-        kafka: ['4.1.2', '4.2.2', '4.3.1']
+        kafka: ['4.0.2', '4.2.2', '4.3.2', '4.4.0']
         group: [broker, admin, producer, consumer, others, oauthbearer]
         exclude:
+          - { node: 26, kafka: '4.0.2' }
           - { node: 22, kafka: '4.2.2' }
-          - { node: 26, kafka: '4.1.2' }
-          - { node: 26, kafka: '4.2.2' }
-    # When kafka_version is provided via workflow_dispatch, it overrides KAFKA_VERSION for every
-    # matrix job (not just one), replacing matrix.kafka for the whole run — acceptable for an
-    # ad-hoc check.
+          - { node: 24, kafka: '4.3.2' }
     env:
-      KAFKA_VERSION: ${{ github.event.inputs.kafka_version || matrix.kafka }}
+      MATRIX_GROUP: ${{ matrix.group }}
+      KAFKA_VERSION: ${{ matrix.kafka }}
       COMPOSE_FILE: ${{ matrix.group == 'oauthbearer' && 'docker-compose.oauthbearer.yml' || 'docker-compose.yml' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: '${{ matrix.node }}', cache: npm }
       - run: npm ci
-      - run: ./scripts/testWithKafka.sh "npm run test:group:${{ matrix.group }} -- --ci --maxWorkers=4"
+      - run: ./scripts/testWithKafka.sh "npm run test:group:$MATRIX_GROUP -- --ci --maxWorkers=4"

@@ -5,7 +5,7 @@ const { liveCase, caseTimeout } = require('../../producer/__tests__/fixtures/bou
 
 const suite = process.env.ADMIN_TIERED_E2E ? describe : describe.skip
 const budget = 540000
-const jarHash = 'f3236936854c13815ffaa7f35a3f2d6861c125616cba5395b538b8680dded886'
+const jarHash = 'ab62d0acf3ca64ba5cce7941c21c338d0399954b2c66c25efbf24a57241ff991'
 
 suite('admin configured remote storage', () => {
   test(
@@ -16,7 +16,7 @@ suite('admin configured remote storage', () => {
         for (const service of ['kafka1', 'kafka2', 'kafka3']) {
           const hash = await probe.host(service, [
             'sha256sum',
-            '/opt/kafka/plugins/kafka-storage-4.3.1-test.jar',
+            '/opt/kafka/plugins/kafka-storage-4.4.0-test-fixtures.jar',
           ])
           expect(hash.split(/\s+/)[0]).toBe(jarHash)
         }

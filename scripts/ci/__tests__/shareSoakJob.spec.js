@@ -555,3 +555,43 @@ describe('required memory gate composition', () => {
     expect(telemetry).not.toContain('continue-on-error:')
   })
 })
+
+describe('share soak child module graph', () => {
+  /**
+   * Collects every relative require reachable from `entry` and the bare Jest aliases it uses.
+   * @param {string} entry absolute file path
+   * @returns {string[]} `file -> specifier` for each require that only Jest's moduleNameMapper resolves
+   */
+  const jestOnlyRequires = (entry) => {
+    const seen = new Set()
+    const aliases = []
+    const visit = (file) => {
+      if (seen.has(file)) return
+      seen.add(file)
+      const source = fs.readFileSync(file, 'utf8')
+      for (const [, specifier] of source.matchAll(/require\(\s*['"]([^'"]+)['"]\s*\)/g)) {
+        if (specifier === 'testHelpers' || specifier.startsWith('testHelpers/')) {
+          aliases.push(`${path.relative(root, file)} -> ${specifier}`)
+        } else if (specifier.startsWith('.')) {
+          const base = path.resolve(path.dirname(file), specifier)
+          const target = [base, `${base}.js`, path.join(base, 'index.js')].find(
+            (candidate) => fs.existsSync(candidate) && fs.statSync(candidate).isFile()
+          )
+          if (target) visit(target)
+        }
+      }
+    }
+    visit(entry)
+    return aliases
+  }
+  const root = path.resolve(__dirname, '../../..')
+
+  test('runs under plain node: no module reachable from the soak entry points uses a Jest-only alias', () => {
+    for (const entry of [
+      'scripts/soak/soak.js',
+      'scripts/ci/naturalExit.js',
+      'scripts/ci/shareSoakJob.js',
+    ])
+      expect(jestOnlyRequires(path.join(root, entry))).toEqual([])
+  })
+})

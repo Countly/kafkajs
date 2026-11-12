@@ -138,6 +138,7 @@ const recording = async ({
   failPrime = false,
   failCleanup = false,
   damageBoundary,
+  damageReference,
   primeRate = 0,
   idleWakeMs = 0,
   heapOffset = 0,
@@ -171,6 +172,8 @@ const recording = async ({
       )
       if (armedAt === null) point.heapUsed += Math.round((primeRate * now) / 60000)
       if (damagePrime && !rows.some((r) => r.event === 'priming-complete')) damagePrime(point)
+      if (damageReference && !rows.some((r) => r.event === 'priming-boundary-reference'))
+        damageReference(point)
       return point
     },
     restore: jest.fn(),
@@ -331,6 +334,57 @@ describe('fixed same-realm share priming', () => {
     expect(result.ok).toBe(true)
     expect(problems).toContain('share.jsonl: priming/scored negotiated implementations differ')
   }, 120000)
+
+  test('uses the settled timer census when a pre-priming Immediate completes during collection', async () => {
+    const { rows, result, error, problems } = await recording({
+      damageReference: (point) => {
+        point.activeResourcesBeforeCollection.Immediate = 1
+        point.timerOwners.beforeCollection.unattributed.Immediate = 1
+      },
+    })
+    expect(error).toBeUndefined()
+    expect(result.ok).toBe(true)
+    expect(problems).toEqual([])
+    const reference = rows.find((r) => r.event === 'priming-boundary-reference').snapshot
+    const boundary = rows.find((r) => r.event === 'priming-boundary').snapshot
+    expect(reference.timerOwners.beforeCollection.unattributed.Immediate).toBe(1)
+    expect(reference.timerOwners.afterCollection.unattributed.Immediate ?? 0).toBe(0)
+    for (const owners of Object.values(boundary.timerOwners))
+      expect(owners.unattributed.Immediate ?? 0).toBe(0)
+    expect(verifySharePriming(rows)).toEqual([])
+  }, 120000)
+
+  test('rejects a boundary Immediate that disappears during collection', async () => {
+    const { rows, error, scoredDriver } = await recording({
+      damageReference: (point) => {
+        point.activeResourcesBeforeCollection.Immediate = 1
+        point.timerOwners.beforeCollection.unattributed.Immediate = 1
+      },
+      damageBoundary: (point) => {
+        point.activeResourcesBeforeCollection.Immediate = 1
+        point.timerOwners.beforeCollection.unattributed.Immediate = 1
+      },
+    })
+    expect(error.message).toMatch(/priming boundary/)
+    expect(scoredDriver.prepare).not.toHaveBeenCalled()
+    expect(rows.some((r) => r.event === 'priming-boundary')).toBe(false)
+    expect(rows.some((r) => r.event === 'case-complete')).toBe(false)
+  }, 120000)
+
+  test.each(['beforeCollection', 'afterCollection'])(
+    'requires the original %s reference attribution source',
+    async (when) => {
+      const { error, scoredDriver, rows } = await recording({
+        damageReference: (point) => {
+          delete point.timerOwners[when].unattributed
+        },
+      })
+      expect(error.message).toMatch(/priming boundary/)
+      expect(scoredDriver.prepare).not.toHaveBeenCalled()
+      expect(rows.some((r) => r.event === 'priming-boundary')).toBe(false)
+    },
+    120000
+  )
 
   test.each([true, false])(
     'executes one complete disjoint pass before scoring, short=%s',
@@ -735,6 +789,29 @@ describe('recorded priming integrity', () => {
   }, 120000)
 
   test.each([
+    ...[
+      [
+        'missing reference before-collection attribution',
+        (point) => {
+          delete point.timerOwners.beforeCollection.unattributed
+        },
+      ],
+      [
+        'invalid reference before-collection attribution',
+        (point) => {
+          point.timerOwners.beforeCollection.unattributed.Immediate = -1
+        },
+      ],
+      [
+        'reference observer overflow',
+        (point) => {
+          point.timerOwners.beforeCollection.dropped = 1
+        },
+      ],
+    ].map(([name, damage]) => [
+      name,
+      (rows) => damage(rows.find((r) => r.event === 'priming-boundary-reference').snapshot),
+    ]),
     [
       'forged boundary resource',
       (rows) => {

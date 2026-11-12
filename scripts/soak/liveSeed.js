@@ -27,6 +27,13 @@ const LIVE_SEED = Object.freeze({
   allowed: Object.freeze(['retained slope', 'retained endpoint', 'closed transient ceiling']),
 })
 
+/**
+ * The warm-up-only seed of the long-window lane: 128 KiB retained after each of the first twelve
+ * samples (the 60 s to 390 s readings), 1.5 MiB in all, and nothing once the window opens. It is the
+ * positive control of the first-use bound and, like every seed, never acceptance evidence.
+ */
+const WARMUP_SEED = Object.freeze({ mode: 'warmup1p5mib', intervals: 12, bytesPerInterval: 131072 })
+
 const MINUTE_MS = 60000
 const RECORDS = 'telemetry-seeded-rows.jsonl'
 const VERDICT = 'telemetry-seeded-verdict.json'
@@ -38,10 +45,11 @@ class LiveSeed {
    * @param {{root: object, limits: {slopeBytesPerMinute: number, sampleMs: number}}} options the
    *   product object that holds the buffers, and the `TELEMETRY` limits the rate derives from
    * @returns {LiveSeed|null} the seed, or null when none is requested
-   * @throws {Error} for a mode other than `slope2x`
+   * @throws {Error} for a mode other than `slope2x` or the long-window `warmup1p5mib`
    */
   static of(mode, { root, limits } = {}) {
     if (!mode) return null
+    if (mode === WARMUP_SEED.mode) return new WarmupLiveSeed(root)
     if (mode !== LIVE_SEED.mode) throw new Error(`Unknown telemetry seed mode ${mode}`)
     return new LiveSeed(root, limits)
   }
@@ -83,6 +91,26 @@ class LiveSeed {
   /** @returns {void} drops every retained buffer from the root */
   release() {
     delete this.root[LIVE_SEED.root]
+  }
+}
+
+/** The warm-up-only seed: it retains for the first `WARMUP_SEED.intervals` samples and then counts on. */
+class WarmupLiveSeed extends LiveSeed {
+  /** @param {object} root the product object that holds the buffers */
+  constructor(root) {
+    super(root, { slopeBytesPerMinute: 0, sampleMs: 0 })
+    this.bytesPerInterval = WARMUP_SEED.bytesPerInterval
+  }
+
+  /** @returns {void} retains one buffer while the warm-up lasts; later samples only advance the count */
+  retain() {
+    if (this.intervals < WARMUP_SEED.intervals) super.retain()
+    else this.intervals += 1
+  }
+
+  /** @returns {object} the base summary under the warm-up mode */
+  summary() {
+    return { ...super.summary(), mode: WARMUP_SEED.mode }
   }
 }
 
@@ -224,4 +252,12 @@ const requireControl = (directory, limits = require('./soak').TELEMETRY) => {
   judgeSeededRun(record.workers, limits)
 }
 
-module.exports = { LIVE_SEED, LiveSeed, ControlRecords, factsOf, judgeSeededRun, requireControl }
+module.exports = {
+  LIVE_SEED,
+  WARMUP_SEED,
+  LiveSeed,
+  ControlRecords,
+  factsOf,
+  judgeSeededRun,
+  requireControl,
+}

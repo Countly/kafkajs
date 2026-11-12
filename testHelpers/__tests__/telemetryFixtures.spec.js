@@ -122,6 +122,64 @@ describe('independent telemetry evidence', () => {
     expect(reader.readExports()).toEqual([])
     expect(() => reader.readExports({ after: 3 })).toThrow('cursor')
   })
+
+  test('reads a full sink in bounded chunks without changing bytes or selected evidence', () => {
+    const otherId = '00000000-0000-0000-0000-000000000000'
+    const expected = Array.from({ length: 512 }, (_, i) =>
+      row('1', i + 1, {
+        clientInstanceId: i % 2 ? otherId : ID,
+        detail: '雪'.repeat(1000),
+      })
+    )
+    const partial = JSON.stringify(row('1', 513)).slice(0, 25)
+    write('1', [...expected].reverse(), partial)
+    const file = path.join(directory, 'exports-1.jsonl')
+    const original = fs.readFileSync(file)
+    const digest = crypto.createHash('sha256').update(original).digest('hex')
+    expect(original.length).toBeGreaterThan(1024 * 1024)
+    const { persistEvidence } = require('../../scripts/e2e/telemetry/evidence')
+    const archive = (exports) =>
+      persistEvidence({
+        name: 'telemetry-churn',
+        directory,
+        observers: {},
+        record: { status: 'passed', run: { stem: 'bounded-reader' }, oracles: { exports } },
+      })
+    const before = archive(expected)
+    const archivedBytes = before.files.map((file) =>
+      fs.readFileSync(path.join(directory, file.path))
+    )
+    fs.rmSync(path.join(directory, before.root), { recursive: true })
+    const readSync = fs.readSync
+    const lengths = []
+    let actual
+    const reading = jest
+      .spyOn(fs, 'readSync')
+      .mockImplementation((fd, bytes, offset, length, at) => {
+        lengths.push(length)
+        return readSync(fd, bytes, offset, length, at)
+      })
+    try {
+      actual = reader.readExports()
+      expect(actual).toEqual(expected)
+      expect(reader.readExports({ uuid: ID, after: { 1: 200 } })).toEqual(
+        expected.filter((item) => item.clientInstanceId === ID && item.seq > 200)
+      )
+    } finally {
+      reading.mockRestore()
+    }
+    expect(lengths.length).toBeGreaterThan(2)
+    expect(Math.max(...lengths)).toBeLessThanOrEqual(4096)
+    const after = archive(actual)
+    expect(after).toEqual(before)
+    expect(after.files.map((file) => fs.readFileSync(path.join(directory, file.path)))).toEqual(
+      archivedBytes
+    )
+    expect(fs.readFileSync(file)).toEqual(original)
+    expect(crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')).toBe(digest)
+    fs.appendFileSync(file, JSON.stringify(row('1', 513)).slice(partial.length) + '\n')
+    expect(reader.readExports({ after: { 1: 512 } })).toEqual([row('1', 513)])
+  })
 })
 
 describe('new topic config propagation', () => {
@@ -629,6 +687,12 @@ describe('telemetry wire observer', () => {
     expect(base.dial).toHaveBeenCalledTimes(1)
   })
 
+  test('accepts a configured observer on every line with a reporter jar and refuses the rest', () => {
+    for (const line of ['4.4.0', '4.3.1', '4.2.2']) expect(() => observe({ line })).not.toThrow()
+    expect(() => observe({ line: '4.1.2' })).toThrow('Unsupported broker line for the observer')
+    expect(() => observe({ mode: 'base', line: '4.4.0' })).not.toThrow()
+  })
+
   test('records actual socket address and host metadata identity', () => {
     const { observer } = observe()
     for (const port of [19092, 19095, 19098]) {
@@ -767,7 +831,11 @@ describe('telemetry wire observer', () => {
       const raw = Buffer.from(vectors[name].hex, 'hex')
       const capped = { truncated: true, resources: [], metrics: [] }
       writeSink('1', [sinkRow('1', 1, raw, capped)])
-      const { observer } = observe({ decoder: undefined })
+      // The lane's prepared decoder archive is mandatory and only matches its own line's classpath.
+      const { observer } = observe({
+        decoder: undefined,
+        line: process.env.KAFKA_VERSION ?? '4.3.1',
+      })
       const socket = open(observer)
       send(socket, push72(1, raw))
       receive(socket, push72Response(1, 0))
@@ -2602,10 +2670,10 @@ describe('required live archive dimensions and semantics', () => {
           put(`${owner}/decoder-${index}.json`, {
             code: 0,
             signal: null,
-            line: '4.3.1',
+            line: this.record.run.line,
             rawSha256: digest,
             stdout:
-              JSON.stringify({ verified: true, line: '4.3.1' }) +
+              JSON.stringify({ verified: true, line: this.record.run.line }) +
               '\n' +
               JSON.stringify(body) +
               '\n',
@@ -3402,10 +3470,18 @@ describe('required live archive dimensions and semantics', () => {
     })
     expect(() => a.verify()).toThrow(diagnostic)
   })
-  test('verifies the base outcomes catalogue and rejects a missing ordinary arm', () => {
+  const refusal = (reason, apiKey) => ({
+    status: 'rejected',
+    name: 'KafkaJSShareGroupsNotSupportedError',
+    reason,
+    apiKey,
+    shareVersion: 0,
+  })
+  /** @param {string} line broker line @param {object} share recorded share connect outcome @returns {Archive} base-lane outcomes archive */
+  const baseOutcomesArchive = (line, share) => {
     const a = outcomesArchive()
     a.record.mode = 'base'
-    a.record.run.line = '4.1.2'
+    a.record.run.line = line
     a.record.results.arms = {
       control: a.record.results.arms.control,
       optin: a.record.results.arms.optin,
@@ -3417,13 +3493,7 @@ describe('required live archive dimensions and semantics', () => {
       blackhole: 'absent telemetry transport',
       late: 'absent telemetry transport',
     }
-    a.record.results.share = {
-      status: 'rejected',
-      name: 'KafkaJSShareGroupsNotSupportedError',
-      reason: 'api-version-range',
-      apiKey: 78,
-      shareVersion: 0,
-    }
+    a.record.results.share = share
     a.streams = {}
     a.record.pushes = []
     a.record.sidecars.owners = {}
@@ -3435,9 +3505,64 @@ describe('required live archive dimensions and semantics', () => {
       'share',
     ])
       a.owner(owner, owner.split('-').at(-1))
+    return a
+  }
+  test('verifies the base outcomes catalogue and rejects a missing ordinary arm', () => {
+    const a = baseOutcomesArchive('4.1.2', refusal('api-version-range', 78))
     a.verify()
     delete a.record.results.arms.optin
     expect(() => a.verify()).toThrow(/Required ordinary arm catalogue/)
+  })
+  test('telemetry-outcomes evidence for base-mode Kafka 4.4.0 is accepted', () => {
+    baseOutcomesArchive('4.4.0', { status: 'connected' }).verify()
+  })
+  test.each(['4.4.0', '4.2.2'])(
+    'telemetry-outcomes evidence for configured-mode Kafka %s is accepted',
+    (line) => {
+      const a = outcomesArchive()
+      a.record.run.line = line
+      a.verify()
+    }
+  )
+  test.each([
+    ['4.1.2', 'api-version-range', 78, 'api-not-advertised', 76],
+    ['4.0.2', 'api-not-advertised', 76, 'api-version-range', 78],
+  ])(
+    'telemetry-outcomes base-mode %s evidence still requires the %s refusal',
+    (line, reason, apiKey, otherReason, otherApiKey) => {
+      baseOutcomesArchive(line, refusal(reason, apiKey)).verify()
+      expect(() => baseOutcomesArchive(line, refusal(otherReason, otherApiKey)).verify()).toThrow(
+        'Share capability refusal differs'
+      )
+      expect(() => baseOutcomesArchive(line, { status: 'connected' }).verify()).toThrow(
+        'Share capability refusal differs'
+      )
+    }
+  )
+  test.each([
+    ['carries a share refusal', refusal('api-version-range', 78)],
+    ['has a rejected share result without the refusal fields', { status: 'rejected' }],
+    ['has no share result', undefined],
+  ])('telemetry-outcomes rejects a base-mode 4.4.0 record that %s', (_, share) => {
+    expect(() => baseOutcomesArchive('4.4.0', share).verify()).toThrow(
+      'Share capability outcome differs'
+    )
+  })
+  test('telemetry-outcomes rejects a configured-mode record that claims mode base', () => {
+    const a = outcomesArchive()
+    a.record.run.line = '4.4.0'
+    a.record.mode = 'base'
+    expect(() => a.verify()).toThrow('Required ordinary arm catalogue differs')
+  })
+  test('telemetry-outcomes rejects a base-lane record that carries the configured fixture digest', () => {
+    const a = baseOutcomesArchive('4.4.0', { status: 'connected' })
+    a.record.run.composeSha256 = 'a'.repeat(64)
+    expect(() => a.verify()).toThrow('Base lane claims the configured fixture')
+  })
+  test('telemetry-outcomes rejects configured mode on a line without a reporter jar', () => {
+    const a = outcomesArchive()
+    a.record.run.line = '4.1.2'
+    expect(() => a.verify()).toThrow('Configured lane has no reporter jar for this line')
   })
 })
 
@@ -4558,6 +4683,8 @@ describe('offline decoder preparation', () => {
         '-Xshare:on',
         '-XX:TieredStopAtLevel=1',
         '-XX:SharedArchiveFile=' + archive,
+        // JVM warnings (e.g. an hsperfdata PID collision) must never reach the decoder's stdout.
+        '-XX:-UsePerfData',
         '-Xlog:disable',
         '-Xlog:all=warning:stderr',
       ])

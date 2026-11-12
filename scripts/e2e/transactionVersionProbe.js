@@ -248,7 +248,7 @@ const main = async () => {
 
     const line = {
       event: 'transaction-version',
-      kafkaVersion: process.env.KAFKA_VERSION || '4.3.1',
+      kafkaVersion: process.env.KAFKA_VERSION || '4.4.0',
       mechanism: 'downgrade',
       formatFlag,
       finalizedFeaturesEpoch: arm.finalizedFeaturesEpoch,

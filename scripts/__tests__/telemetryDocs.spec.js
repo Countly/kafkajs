@@ -235,7 +235,7 @@ describe('broker telemetry fixture documentation', () => {
     expect(testing).toContain('CI never rebuilds')
     expect(testing).toContain('two top-level tests')
     expect(testing).toContain('down -v --remove-orphans')
-    expect(testing).toContain('4.3.1/4.2.2/4.1.2/4.0.2')
+    expect(testing).toContain('4.4.0/4.2.2/4.1.2/4.0.2')
     expect(testing).toContain('Configured telemetry lanes check mounted reporter jars')
     expect(testing).toContain('base lanes verify broker identity without requiring a reporter jar')
     expect(testing).not.toContain('built deterministically')
@@ -363,7 +363,7 @@ describe('configured telemetry evidence documentation', () => {
     const document = squeeze('docs/ClientTelemetry.md')
     expect(document).toContain('## Configured checks and Java interoperability')
     expect(document).toContain('disabled unless enableMetricsPush is true')
-    expect(document).toContain('4.3.1, 4.2.2, 4.1.2 and 4.0.2 without exporter')
+    expect(document).toContain('4.4.0, 4.2.2, 4.1.2 and 4.0.2 without exporter')
     expect(document).toContain('raw committed next offsets')
     expect(document).toContain('successful subscription Get alone is insufficient')
   })
@@ -464,8 +464,8 @@ describe('telemetry resource documentation', () => {
   test('documents the churn method and the CI rows', () => {
     expect(testing).toContain('### Telemetry churn (`telemetry churn`)')
     expect(testing).toContain('selected by a rule over the transcript alone')
-    expect(testing).toContain('ten distinct Node 24 rows')
-    expect(testing).toContain('required functional exit catalogue has 69 rows')
+    expect(testing).toContain('nine distinct Node 24 rows, all on Kafka 4.4.0')
+    expect(testing).toContain('required functional exit catalogue has 72 rows')
     expect(telemetry).toContain('35 subscription transitions')
   })
 

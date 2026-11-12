@@ -411,6 +411,7 @@ describe('the run of a live scenario', () => {
   test('has the tree "unfrozen" when nobody froze one, and the fake lane outside test:kafka', () => {
     delete process.env.KAFKAJS_TREE
     delete process.env.KAFKAJS_LANE
+    delete process.env.KAFKA_VERSION
     const evidence = load(() => '4.3.1')
 
     evidence.writeEvidence(name, {})

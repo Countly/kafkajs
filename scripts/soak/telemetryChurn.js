@@ -54,6 +54,7 @@ const gzipCodec = require('../../src/protocol/message/compression/gzip')
 const zstdCodec = require('../../src/protocol/message/compression/zstd')
 const { slope } = require('./bounds')
 const { LIVE_SEED, LiveSeed } = require('./liveSeed')
+const { LONG_WINDOW, HeapSpaceJournal, selected: longWindowSelected } = require('./longWindow')
 const {
   ShareTrace,
   acknowledgementResponse,
@@ -64,7 +65,7 @@ const { readRequestHeader } = require('../../testHelpers/fakeSocket')
 const shareFetchWire = require('../../testHelpers/wire/shareFetchV2')
 const shareAckWire = require('../../testHelpers/wire/shareAcknowledgeV2')
 
-const SCENARIO = 'telemetry-churn'
+const SCENARIO = longWindowSelected() ? LONG_WINDOW.scenario : 'telemetry-churn'
 const KINDS = Object.freeze(['producer', 'consumer', 'admin', 'shareConsumer'])
 const STEPS = Object.freeze({ subscriptionMs: 10000, retireMs: 30000, reopenMs: 60000 })
 const ORDER = Object.freeze(['reopen', 'retire', 'subscription'])
@@ -72,7 +73,12 @@ const STAGE_OF = Object.freeze({ reopen: 'lifecycle', retire: 'retire', subscrip
 const MINIMUMS = Object.freeze({ subscription: 30, retire: 10, reopen: 5 })
 const LATE_MS = 5000
 const DESCRIPTORS = 128
-const CORPUS = Object.freeze({ records: 10000, batch: 100, batchMs: 3000, bytes: 200 })
+const CORPUS = Object.freeze({
+  records: longWindowSelected() ? LONG_WINDOW.corpusRecords : 10000,
+  batch: 100,
+  batchMs: 3000,
+  bytes: 200,
+})
 const SETUP_MS = 48000
 const NATURAL_EXIT_MS = 10000
 /** How long a killed worker's close and drained pipes are awaited before its row is final. */
@@ -159,7 +165,9 @@ const journalLimits = (
  * from the journal limits: ordinary work (two 16-byte id ledgers, 32-byte handler rows with their
  * completeness bitmap, 256-byte receipts, 16-byte producer slots), the native journal (2,048-byte
  * rows) with its pending windows (256 bytes), the memory samples, the engine code journal (64-byte
- * rows) and, for the share consumer, both share archives with their label slots. The sizes mirror
+ * rows), the long-window heap space journal when the limits name one and, for the share consumer,
+ * both share archives with their label slots. `nativeRows`, `engineRows` and `heapSpaceRows` of the
+ * limits replace the defaults of the existing lane. The sizes mirror
  * the owners that allocate them; a spec compares the sum with the storage the real owners hold.
  * @param {string} kind a client kind
  * @param {object} [limits] the telemetry schedule constants, as for `journalLimits`
@@ -172,12 +180,14 @@ const declaredJournalBytes = (kind, limits) => {
     (storage.records * 32 + CORPUS.records) +
     2 * storage.receipts * 256 +
     storage.batches * 16
-  const native = NATIVE_ROWS * (2048 + 256)
+  const native = (limits?.nativeRows ?? NATIVE_ROWS) * (2048 + 256)
+  const engine = (limits?.engineRows ?? ENGINE_ROWS) * 64
+  const heapSpaces = (limits?.heapSpaceRows ?? 0) * LONG_WINDOW.heapSpaceRowBytes
   const share =
     kind === 'shareConsumer'
       ? storage.exchangeBytes + storage.acknowledgementBytes + 2 * SYMBOL_BYTES
       : 0
-  return ordinary + native + storage.sampleBytes + ENGINE_ROWS * 64 + share
+  return ordinary + native + storage.sampleBytes + engine + heapSpaces + share
 }
 
 const CONTROL = Object.freeze({
@@ -591,10 +601,13 @@ const writeFence = (segments) => ({
  */
 class TelemetrySchedule {
   /**
-   * @param {{warmupMs:number, measureMs:number}} window warm-up and measurement lengths
+   * @param {{warmupMs:number, measureMs:number, corpusStartMs?:number}} window warm-up and
+   *   measurement lengths, and when the corpus starts: with the measurement unless the long-window
+   *   candidate starts traffic with the warm-up
    */
-  constructor({ warmupMs, measureMs }) {
+  constructor({ warmupMs, measureMs, corpusStartMs = warmupMs }) {
     this.warmupMs = warmupMs
+    this.corpusStartMs = corpusStartMs
     this.endMs = warmupMs + measureMs
     const at = new Map()
     for (const [action, step] of [
@@ -647,13 +660,13 @@ class TelemetrySchedule {
   }
 
   /**
-   * @returns {number[]} the fixed slots, in ms after the epoch, at which the measured corpus batches
-   *   are offered; none falls in the warm-up
+   * @returns {number[]} the fixed slots, in ms after the epoch, at which the corpus batches are
+   *   offered; none falls in the warm-up unless the corpus starts with it
    */
   corpusSlots() {
     return Array.from(
       { length: CORPUS.records / CORPUS.batch },
-      (_, batch) => this.warmupMs + batch * CORPUS.batchMs
+      (_, batch) => this.corpusStartMs + batch * CORPUS.batchMs
     )
   }
 }
@@ -2422,6 +2435,8 @@ class TelemetryProcesses {
    * @param {string[]} [options.args] the driver arguments
    * @param {(kind:string, error:Error)=>void} [options.onFailure] told once per failed worker
    * @param {(kind:string, message:object)=>void} [options.onDecode] serves a worker's decode request
+   * @param {number} [options.messageBytes] the largest IPC message a worker may send
+   * @param {number} [options.totalBytes] the most IPC bytes a worker may send in all
    */
   constructor({
     script,
@@ -2430,8 +2445,10 @@ class TelemetryProcesses {
     args = [],
     onFailure = () => {},
     onDecode = () => {},
+    messageBytes = MESSAGE_BYTES,
+    totalBytes = TOTAL_BYTES,
   }) {
-    Object.assign(this, { script, spawn, now, args, onFailure, onDecode })
+    Object.assign(this, { script, spawn, now, args, onFailure, onDecode, messageBytes, totalBytes })
     this.workers = new Map()
   }
 
@@ -2537,7 +2554,7 @@ class TelemetryProcesses {
       return bad('a substituted handshake or message')
     const size = Buffer.byteLength(JSON.stringify(message))
     worker.bytes += size
-    if (size > MESSAGE_BYTES || worker.bytes > TOTAL_BYTES) return bad('IPC overflow')
+    if (size > this.messageBytes || worker.bytes > this.totalBytes) return bad('IPC overflow')
     const seen = (worker.counts.get(message.type) ?? 0) + 1
     worker.counts.set(message.type, seen)
     if (MESSAGE_TYPES.once.includes(message.type) && seen > 1)
@@ -4483,6 +4500,7 @@ class TelemetryWorkerProcess {
           'pending-windows',
           'memory-samples',
           'engine-code',
+          ...(this.soak.TELEMETRY?.heapSpaceRows ? ['heap-spaces'] : []),
           'ordinary',
           ...(this.kind === 'shareConsumer' ? ['share'] : []),
         ],
@@ -4541,9 +4559,13 @@ class TelemetryWorkerProcess {
       capacity: storage.samples,
       bytes: storage.sampleBytes,
     })
-    const engine = new EngineCodeJournal()
+    const engine = new EngineCodeJournal({ capacity: soak.TELEMETRY?.engineRows })
+    const heapSpaces = soak.TELEMETRY?.heapSpaceRows
+      ? new HeapSpaceJournal({ capacity: soak.TELEMETRY.heapSpaceRows })
+      : null
+    const nativeRows = soak.TELEMETRY?.nativeRows ?? NATIVE_ROWS
     const sampler = new PendingSampler(memory, {
-      capacity: NATIVE_ROWS,
+      capacity: nativeRows,
       set: (fn, ms) => resources.as('fixture:native-sampler', () => setInterval(fn, ms)),
     })
     const peak = soak.sharePeak?.({ sampler, limits: soak.TELEMETRY }) ?? null
@@ -4552,7 +4574,7 @@ class TelemetryWorkerProcess {
     const journal = new NativeJournal({
       memory,
       sampler,
-      capacity: NATIVE_ROWS,
+      capacity: nativeRows,
       fixed: true,
       epoch: () => segments?.current().index ?? 0,
     })
@@ -4589,6 +4611,7 @@ class TelemetryWorkerProcess {
         sampler,
         sampleJournal,
         engine,
+        ...(heapSpaces ? [heapSpaces] : []),
       ])
       resources.start()
       if (peak) resources.as('fixture:share-peak', () => peak.start())
@@ -4670,6 +4693,7 @@ class TelemetryWorkerProcess {
           await new Promise((resolve) => setImmediate(resolve))
           const reading = readMemory('settled', () => this.clock.now())
           engine.record(reading)
+          heapSpaces?.record(reading, memory.collections)
           return {
             ...snapshot,
             memory: snapshot.memory && {
@@ -4687,6 +4711,7 @@ class TelemetryWorkerProcess {
                 sampler,
                 sampleJournal,
                 engine,
+                ...(heapSpaces ? [heapSpaces] : []),
               ]),
               owners: {
                 ordinary: worker.ordinary.journalState(),
@@ -4695,6 +4720,7 @@ class TelemetryWorkerProcess {
                 pendingWindows: sampler.journalState(),
                 samples: sampleJournal.journalState(),
                 engine: engine.journalState(),
+                ...(heapSpaces ? { heapSpaces: heapSpaces.journalState() } : {}),
               },
             },
           }
@@ -4729,14 +4755,21 @@ class TelemetryWorkerProcess {
             engine,
           }),
           sampler: { skipped: run.skipped, readFailures: run.readFailures },
-          ...(peak && { diagnostic: true, acceptanceEligible: false }),
+          ...((peak || soak.TELEMETRY?.diagnostic) && {
+            diagnostic: true,
+            acceptanceEligible: false,
+          }),
         }
         const judged = JournalConstancy.apply(soak.TelemetryResourceVerdict.evaluate(input), input)
         if (peak) {
           peak.phase('final')
           peak.stop()
         }
-        shadow = { ...engine.report(input.samples), ...(peak && { sharePeak: peak.report() }) }
+        shadow = {
+          ...engine.report(input.samples),
+          ...(peak && { sharePeak: peak.report() }),
+          ...(heapSpaces && { heapSpaces: heapSpaces.values() }),
+        }
         return judged
       }
       const soakRun = new soak.Soak({

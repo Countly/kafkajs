@@ -38,7 +38,6 @@ const patternsOf = (check) => {
 
 describe('exit gate manifest', () => {
   test('decoder performance uses three parallel capped partitions and a combined check with the original id', () => {
-    // eslint-disable-next-line n/no-extraneous-require -- provided by the toolchain
     const yaml = require('js-yaml')
     const jobs = yaml.load(workflow).jobs
     const check = gate.checks.find(({ id }) => id === 'decoder-count-performance')
@@ -46,7 +45,27 @@ describe('exit gate manifest', () => {
     expect(check.capMinutes).toBe(30)
     expect(check.command).toContain('--partition "$PARTITION"')
     expect(check.command).toMatch(/\|\| exit 1$/)
-    const plan = jobs.plan.steps.find(({ id }) => id === 'plan').run
+    const planStep = jobs.plan.steps.find(({ id }) => id === 'plan')
+    expect(planStep.env.ONLY).toBe('$' + '{{ inputs.only }}')
+    const plan = planStep.run
+    expect(plan).toContain('process.env.ONLY')
+    expect(jobs.check.env).toMatchObject({
+      CHECK_ID: '$' + '{{ matrix.checkId || matrix.id }}',
+      MATRIX_ID: '$' + '{{ matrix.id }}',
+      PARTITION: '$' + '{{ matrix.partition }}',
+    })
+    const record = jobs.check.steps.find(({ name }) => name === 'Record result')
+    expect(record.env.RESULT).toBe('$' + '{{ job.status }}')
+    expect(record.run).toContain('process.env.MATRIX_ID')
+    expect(record.run).toContain('process.env.RESULT')
+    const summary = jobs.verdict.steps.find(({ name }) => name === 'Summarize results')
+    expect(summary.env).toEqual({
+      MATRIX: '$' + '{{ needs.plan.outputs.matrix }}',
+      DECODER: '$' + '{{ needs.plan.outputs.decoder }}',
+      PLAN_RESULT: '$' + '{{ needs.plan.result }}',
+      CHECK_RESULT: '$' + '{{ needs.check.result }}',
+      TELEMETRY_RESULT: '$' + '{{ needs.telemetry.result }}',
+    })
     const vm = require('vm')
     let output = ''
     vm.runInNewContext(plan.match(/node <<'NODE'\n([\s\S]*?)\nNODE/)[1], {

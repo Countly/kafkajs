@@ -1,6 +1,8 @@
 const assert = require('assert')
 const fs = require('fs')
 const path = require('path')
+const apiKeys = require('../src/protocol/requests/apiKeys')
+const { requests } = require('../src/protocol/requests')
 
 const CAPTURES_DIR = path.join(__dirname, '../scripts/protocol/captures')
 
@@ -98,4 +100,25 @@ const readBrokerCapture = (version, capturesDir = CAPTURES_DIR) => {
   }
 }
 
-module.exports = { readBrokerCapture }
+/**
+ * Derives newest mutual versions from independent broker evidence and implemented client codecs.
+ * @param {string} version broker-reported major.minor.patch version
+ * @param {string[]} apiNames APIs whose default negotiation is being checked
+ * @returns {Record<string, number>} highest implemented version within each captured range
+ * @throws {Error} when the capture is incomplete or an API has no common implemented version
+ */
+const newestVersionsFromCapture = (version, apiNames) => {
+  const { apiRanges } = readBrokerCapture(version)
+  return Object.fromEntries(
+    apiNames.map((name) => {
+      const range = apiRanges[apiKeys[name]]
+      const common = (requests[name]?.versions || [])
+        .map(Number)
+        .filter((implemented) => range && implemented >= range[0] && implemented <= range[1])
+      assert(common.length > 0, `No common captured version for ${name} on ${version}`)
+      return [name, Math.max(...common)]
+    })
+  )
+}
+
+module.exports = { readBrokerCapture, newestVersionsFromCapture }

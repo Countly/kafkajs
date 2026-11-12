@@ -1,0 +1,121 @@
+# Publishes a pushed v* tag to npm. verify checks the tag and the CI evidence for its exact commit, pack
+# builds the tarball, publish waits for approval of the npm-release environment and publishes that tarball.
+# npm registers this file name as the trusted publisher: do not rename it.
+name: Release
+on:
+  push:
+    tags: ['v*']
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      version: ${{ steps.verify.outputs.version }}
+      dist-tag: ${{ steps.verify.outputs.dist-tag }}
+      sha: ${{ steps.verify.outputs.sha }}
+    steps:
+      # Full history: the verifier needs origin/master to see whether the tagged commit is on it.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - id: verify
+        run: node scripts/release/verify.js
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  pack:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Check the checkout is the verified commit
+        run: test "$(git rev-parse HEAD)" = "$VERIFIED_SHA"
+        env:
+          VERIFIED_SHA: ${{ needs.verify.outputs.sha }}
+      - run: npm ci --ignore-scripts
+      - name: Pack and check the tarball
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/pack"
+          npm pack --pack-destination "$RUNNER_TEMP/pack"
+          ./scripts/assertCleanTarball.sh "$RUNNER_TEMP"/pack/*.tgz
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-tarball
+          path: ${{ runner.temp }}/pack/*.tgz
+          if-no-files-found: error
+  publish:
+    needs: [verify, pack]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: npm-release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-tarball
+          path: release
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      # The digest goes to the summary before the publish, so a refused publish still leaves it for the
+      # investigation; after a publish, dist.integrity on the registry must equal it.
+      - name: Check tarball and npm
+        id: tarball
+        working-directory: release
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(*.tgz)
+          if [ "${#files[@]}" -ne 1 ]; then
+            echo "expected exactly one tarball in the artifact, found ${#files[@]}" >&2
+            exit 1
+          fi
+          file=${files[0]}
+          name=$(tar -xOf "$file" package/package.json | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).name")
+          version=$(tar -xOf "$file" package/package.json | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).version")
+          if [ "$name" != "@countly/kafkajs" ] || [ "$version" != "$VERSION" ]; then
+            echo "tarball holds $name@$version, expected @countly/kafkajs@$VERSION" >&2
+            exit 1
+          fi
+          npm_version=$(npm --version)
+          IFS=. read -r major minor patch <<< "${npm_version%%-*}"
+          if (( major < 11 || (major == 11 && (minor < 5 || (minor == 5 && patch < 1))) )); then
+            echo "npm $npm_version is older than 11.5.1, which trusted publishing needs" >&2
+            exit 1
+          fi
+          digest="sha512-$(openssl dgst -sha512 -binary "$file" | base64 | tr -d '\n')"
+          {
+            echo "### Release tarball"
+            echo
+            echo "- file: $file"
+            echo "- integrity: $digest"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "file=$file" >> "$GITHUB_OUTPUT"
+      - name: Publish
+        working-directory: release
+        env:
+          FILE: ${{ steps.tarball.outputs.file }}
+          DIST_TAG: ${{ needs.verify.outputs.dist-tag }}
+        run: npm publish "./$FILE" --access public --tag "$DIST_TAG" --provenance --ignore-scripts --registry https://registry.npmjs.org

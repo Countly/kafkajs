@@ -20,7 +20,7 @@ NO_LOGS=1 ./scripts/dockerComposeUp.sh
 ./scripts/createScramCredentials.sh
 ```
 
-This boots the cluster described by `docker-compose.yml` (see [scripts/dockerComposeUp.sh](../scripts/dockerComposeUp.sh)). Without `NO_LOGS=1`, the script blocks on `docker compose logs -f`, so set it when you want the shell back. By default it runs `apache/kafka:4.3.1`; pin a different broker version with `KAFKA_VERSION`:
+This boots the cluster described by `docker-compose.yml` (see [scripts/dockerComposeUp.sh](../scripts/dockerComposeUp.sh)). Without `NO_LOGS=1`, the script blocks on `docker compose logs -f`, so set it when you want the shell back. By default it runs `apache/kafka:4.4.0`; pin a different broker version with `KAFKA_VERSION`:
 
 ```sh
 KAFKA_VERSION=4.1.2 NO_LOGS=1 ./scripts/dockerComposeUp.sh
@@ -62,7 +62,7 @@ const kafka = new Kafka({
 ## Running the tests
 
 - `npm run test:unit` runs the broker-free unit tests (no cluster required).
-- `npx jest` runs the full test suite against a cluster you've already started, defaulting to `KAFKA_VERSION=4.3.1`.
+- `npx jest` runs the full test suite against a cluster you've already started, defaulting to `KAFKA_VERSION=4.4.0`.
 - `npm run test:kafka -- "npx jest"` starts the cluster (if it isn't already running), waits for it, creates SCRAM credentials, runs the given command, and tears the cluster down afterwards. Pin a broker version the same way:
 
   ```sh

@@ -21,7 +21,7 @@
 # Verified by npm run probe:transaction-version on 2026-10-08: apache/kafka:4.3.1, mechanism downgrade, FinalizedFeaturesEpoch 192, transaction.version level 1; the storage-format flag: pinned.
 # Also verified on apache/kafka:4.1.2 (FinalizedFeaturesEpoch 210).
 x-kafka-common: &kafka-common
-  image: apache/kafka:${KAFKA_VERSION:-4.3.1}
+  image: apache/kafka:${KAFKA_VERSION:-4.4.0}
   environment: &kafka-env
     KAFKA_PROCESS_ROLES: 'broker,controller'
     KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka1:19093,2@kafka2:19093,3@kafka3:19093'
@@ -102,7 +102,7 @@ services:
   # orders the start and the retry loop, each attempt capped by timeout, is the wait; it has no
   # custom.project label, so waitForKafka.js and createScramCredentials.sh ignore it.
   transactionVersionDowngrade:
-    image: apache/kafka:${KAFKA_VERSION:-4.3.1}
+    image: apache/kafka:${KAFKA_VERSION:-4.4.0}
     container_name: transactionVersionDowngrade
     depends_on: [kafka1, kafka2, kafka3]
     command:

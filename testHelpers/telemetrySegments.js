@@ -31,6 +31,13 @@ const SCHEDULES = Object.freeze({
     extras: Object.freeze([]),
     name: (kind, index) => `${kind}-lc-${index}`,
   }),
+  'telemetry-long-window': Object.freeze({
+    kinds: Object.freeze(['producer', 'consumer', 'admin', 'shareConsumer']),
+    perKind: 23,
+    cap: 32,
+    extras: Object.freeze([]),
+    name: (kind, index) => `${kind}-lw-${index}`,
+  }),
 })
 
 /**

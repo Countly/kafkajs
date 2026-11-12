@@ -118,6 +118,7 @@ const {
 } = require('./churnLedger')
 const { ClosingProbe } = require('./closingProbe')
 const { ConsumerChurnOracle } = require('./consumerChurn')
+const LongWindow = require('./longWindow')
 
 const PARTITIONS = 6
 /** The seed brokers of the CLI, and of the configured telemetry fixture, which publishes others. */
@@ -312,6 +313,20 @@ const TELEMETRY = Object.freeze({
   noisePressure: 5,
 })
 
+/** The long-window shadow candidate's limits, derived from `TELEMETRY` without changing it. */
+const TELEMETRY_LONG = LongWindow.limitsOf(TELEMETRY)
+
+/** The limits and profiles this process runs the telemetry churn with: the candidate's only when selected. */
+const ACTIVE_TELEMETRY = LongWindow.selected() ? TELEMETRY_LONG : TELEMETRY
+const ACTIVE_PROFILES = LongWindow.selected()
+  ? {
+      ...PROFILES,
+      telemetry: [
+        { ...PROFILES.telemetry[0], ms: TELEMETRY_LONG.warmupMs + TELEMETRY_LONG.measureMs },
+      ],
+    }
+  : PROFILES
+
 /** The quiet-identity roles every telemetry reading must carry, whatever they hold. */
 const TELEMETRY_ROLES = Object.freeze([
   'resources:fixture',
@@ -469,14 +484,15 @@ class TelemetryResourceVerdict {
 
   /**
    * The setup-peak allowance of one client kind: `TELEMETRY.setupPeakBytes`, plus for the share
-   * consumer the exact bytes of its declared, prefilled journals. The telemetry increase and
+   * consumer the exact bytes of its declared, prefilled journals under the limits this process runs
+   * with. The telemetry increase and
    * absolute peak limits are the same for every kind and are never raised.
    * @param {string} [kind] the client kind of the control reference
    * @returns {number} allowed setup peak in bytes
    */
   static setupAllowance(kind) {
     const { declaredJournalBytes } = require('./telemetryChurn')
-    const declared = kind === 'shareConsumer' ? declaredJournalBytes(kind, TELEMETRY) : 0
+    const declared = kind === 'shareConsumer' ? declaredJournalBytes(kind, ACTIVE_TELEMETRY) : 0
     return TELEMETRY.setupPeakBytes + declared
   }
 
@@ -6587,7 +6603,9 @@ class ShareSoak {
 
   /**
    * Executes one fixed first-use scope in this realm and releases its strong roots before the
-   * boundary observation. Global observation history remains installed until scored cleanup.
+   * boundary observation. Both boundary censuses must match the settled reference population;
+   * its pre-collection transients remain archived and validated. Global observation history
+   * remains installed until scored cleanup.
    * @param {AbortSignal} scope Original nested priming bound.
    * @returns {Promise<void>} Only a scalar completion link survives in this owner.
    * @throws {Error} Any priming or boundary failure; scored setup has not started.
@@ -6626,11 +6644,22 @@ class ShareSoak {
         )
           violations.push('priming boundary: invalid heap source or elapsed timestamp')
         ShareSoakScreen.quiet(snapshot, original, 'priming boundary', violations)
-        for (const when of ['beforeCollection', 'afterCollection']) {
+        for (const [when, resource] of [
+          ['beforeCollection', 'activeResourcesBeforeCollection'],
+          ['afterCollection', 'activeResources'],
+        ]) {
+          const source = original.timerOwners?.[when]
+          const counts = original[resource]
           if (
+            !Array.isArray(source?.rows) ||
+            source.dropped !== 0 ||
+            !counts ||
+            !Object.values(counts).every(ShareSoakScreen.count) ||
+            !source.unattributed ||
+            !Object.values(source.unattributed).every(ShareSoakScreen.count) ||
             !ShareSoakScreen.same(
               snapshot.timerOwners?.[when]?.unattributed,
-              original.timerOwners?.[when]?.unattributed
+              original.timerOwners?.afterCollection?.unattributed
             )
           )
             violations.push('priming boundary: timer attribution differs')
@@ -7563,8 +7592,9 @@ const buildShareSoak = ({ brokers, short = false, record, run }) => {
  *   by default, a live spec supplies its own sink
  * @returns {{ run: () => Promise<{ ok: boolean }>, close: () => Promise<void> }}
  * @throws {Error} without `--expose-gc`, for another phase list, an unconfigured broker line or
- *   evidence directory, for a worker without its kind or IPC channel, and for a seeded run (the
- *   `TELEMETRY_SEED` control) given no sink of its own, so it never writes scenario evidence
+ *   evidence directory, for a worker without its kind or IPC channel, and for a seeded or long-window
+ *   run (the `TELEMETRY_SEED` control or the `TELEMETRY_LONG_WINDOW` candidate) given no sink of its
+ *   own, so it never writes scenario evidence
  */
 const buildTelemetryChurn = ({ brokers: requested, phases, record }) => {
   if (typeof globalThis.gc !== 'function')
@@ -7584,9 +7614,9 @@ const buildTelemetryChurn = ({ brokers: requested, phases, record }) => {
       soak: {
         Soak,
         WORKLOADS,
-        PROFILES,
+        PROFILES: ACTIVE_PROFILES,
         instrument,
-        TELEMETRY,
+        TELEMETRY: ACTIVE_TELEMETRY,
         TelemetryResourceVerdict,
         logLevel,
         Kafka,
@@ -7598,6 +7628,8 @@ const buildTelemetryChurn = ({ brokers: requested, phases, record }) => {
   }
   if (process.env[LIVE_SEED.env] && !record)
     throw new Error('A seeded telemetry run records only to a control sink')
+  if (LongWindow.selected() && !record)
+    throw new Error('A long-window telemetry run records only to a diagnostic sink')
   const line = process.env.KAFKA_VERSION
   const directory = process.env.TELEMETRY_EVIDENCE_DIR ?? ''
   if (
@@ -7625,11 +7657,15 @@ const buildTelemetryChurn = ({ brokers: requested, phases, record }) => {
       withResource: withTelemetryResource,
       clock,
     }),
-    processes: new churn.TelemetryProcesses({ script: __filename }),
+    processes: new churn.TelemetryProcesses({
+      script: __filename,
+      messageBytes: ACTIVE_TELEMETRY.messageBytes,
+      totalBytes: ACTIVE_TELEMETRY.totalBytes,
+    }),
     decoder: new churn.DecoderCoordinator({ directory, line, clock }),
     record: record ?? ((row) => writeEvidence('telemetry-churn', row)),
     clock,
-    limits: TELEMETRY,
+    limits: ACTIVE_TELEMETRY,
     verdict: (input) => TelemetryResourceVerdict.evaluate(input),
     brokers,
     stem,
@@ -7790,6 +7826,7 @@ const main = async (
 module.exports = {
   CHURN,
   TELEMETRY,
+  TELEMETRY_LONG,
   TelemetryResourceVerdict,
   ConsumerChurnOracle,
   buildConsumerChurn,

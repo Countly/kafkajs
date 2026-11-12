@@ -11,7 +11,7 @@ The test cluster is a 3-broker Kafka cluster running in [KRaft mode](https://kaf
 ./scripts/dockerComposeUp.sh
 ```
 
-This runs `docker compose -f docker-compose.yml up`, using the compose file's default broker image `apache/kafka:4.3.1`. Override the version with the `KAFKA_VERSION` environment variable:
+This runs `docker compose -f docker-compose.yml up`, using the compose file's default broker image `apache/kafka:4.4.0`. Override the version with the `KAFKA_VERSION` environment variable:
 
 ```sh
 KAFKA_VERSION=4.1.2 ./scripts/dockerComposeUp.sh

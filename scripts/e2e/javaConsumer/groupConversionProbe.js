@@ -196,7 +196,7 @@ const requireGroupType = (label, groupType) => {
 
     console.log(
       JSON.stringify({
-        kafkaVersion: process.env.KAFKA_VERSION || '4.3.1',
+        kafkaVersion: process.env.KAFKA_VERSION || '4.4.0',
         typeBefore,
         typeWithConsumerMember,
         typeAfterConsumerMemberLeft,

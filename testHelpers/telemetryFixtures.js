@@ -96,23 +96,14 @@ class TelemetryExportReader {
         if (error.code === 'ENOENT' && !(after[node] > 0)) continue
         throw error
       }
-      let bytes
+      let rows
       try {
         const stat = fs.fstatSync(fd)
         if (!stat.isFile() || stat.size > FILE_CAP) throw new Error('Telemetry sink file cap')
-        bytes = Buffer.alloc(stat.size)
-        if (fs.readSync(fd, bytes, 0, bytes.length, 0) !== bytes.length)
-          throw new Error('Telemetry sink changed during read')
+        rows = this.#readRows(fd, stat.size)
       } finally {
         fs.closeSync(fd)
       }
-      const end = bytes.lastIndexOf(10)
-      if (bytes.length - end - 1 > RECORD_CAP) throw new Error('Telemetry sink record cap')
-      const lines = end < 0 ? [] : bytes.subarray(0, end).toString('utf8').split('\n')
-      const rows = lines.map((line) => {
-        if (Buffer.byteLength(line) > RECORD_CAP) throw new Error('Telemetry sink record cap')
-        return JSON.parse(line)
-      })
       // Reporter callbacks assign identities before concurrently enqueueing their rows.
       rows.sort((a, b) => a.seq - b.seq)
       let previous = 0
@@ -144,6 +135,44 @@ class TelemetryExportReader {
     }
     checkOverflow()
     return result
+  }
+
+  /**
+   * Parses complete JSONL records from the original stat-sized snapshot with an 8 KiB scratch
+   * buffer. UTF-8 is decoded only after a full line is present; a bounded unfinished tail is
+   * retried on the next read. Every complete row is retained for the unchanged ordering and
+   * validation pass. No sink bytes, cursors or evidence are rewritten, cached or dropped.
+   * @param {number} fd original no-follow file descriptor
+   * @param {number} size bounded size captured before reading
+   * @returns {object[]} complete source rows in their original file order
+   * @throws {Error|SyntaxError} for a short read, overlong record or malformed complete JSON
+   */
+  #readRows(fd, size) {
+    if (size === 0) return []
+    const buffer = Buffer.alloc(2 * RECORD_CAP)
+    const rows = []
+    let kept = 0
+    for (let position = 0; position < size;) {
+      const length = Math.min(RECORD_CAP, size - position)
+      if (fs.readSync(fd, buffer, kept, length, position) !== length)
+        throw new Error('Telemetry sink changed during read')
+      position += length
+      const end = kept + length
+      const bytes = buffer.subarray(0, end)
+      let start = 0
+      let newline
+      while ((newline = bytes.indexOf(10, start)) !== -1) {
+        if (newline - start > RECORD_CAP) throw new Error('Telemetry sink record cap')
+        const line = bytes.toString('utf8', start, newline)
+        if (Buffer.byteLength(line) > RECORD_CAP) throw new Error('Telemetry sink record cap')
+        rows.push(JSON.parse(line))
+        start = newline + 1
+      }
+      kept = end - start
+      if (kept > RECORD_CAP) throw new Error('Telemetry sink record cap')
+      buffer.copy(buffer, 0, start, end)
+    }
+    return rows
   }
 }
 
@@ -792,7 +821,7 @@ class TelemetryWireObserver {
   /**
    * @param {object} options observer configuration
    * @param {string} options.directory absolute run evidence directory shared with the broker sinks
-   * @param {string} options.line broker line: 4.3.1 or 4.2.2 (any x.y.z in `base` mode)
+   * @param {string} options.line broker line: 4.4.0, 4.3.1 or 4.2.2 (any x.y.z in `base` mode)
    * @param {{now:function():number}} options.clock monotonic milliseconds, such as performance.now
    * @param {'configured'|'base'} [options.mode] selects the exact fixture endpoint allowlist
    * @param {string} [options.owner] label of the observed client, kept in the evidence
@@ -826,7 +855,9 @@ class TelemetryWireObserver {
       throw new Error('Expected an absolute observer directory')
     if (!Object.hasOwn(ENDPOINTS, mode)) throw new Error('Unknown observer mode')
     const allowed =
-      mode === 'configured' ? ['4.3.1', '4.2.2'].includes(line) : /^\d+\.\d+\.\d+$/.test(line)
+      mode === 'configured'
+        ? ['4.4.0', '4.3.1', '4.2.2'].includes(line)
+        : /^\d+\.\d+\.\d+$/.test(line)
     if (!allowed) throw new Error('Unsupported broker line for the observer')
     if (typeof clock?.now !== 'function') throw new Error('Expected a monotonic clock')
     this.#completeStream = completeStream

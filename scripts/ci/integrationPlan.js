@@ -1,18 +1,16 @@
 const ROWS = [
-  { node: 24, kafka: '4.3.1', group: 'broker' },
-  { node: 24, kafka: '4.3.1', group: 'admin' },
-  { node: 24, kafka: '4.3.1', group: 'producer' },
-  { node: 24, kafka: '4.3.1', group: 'consumer' },
-  { node: 24, kafka: '4.3.1', group: 'others' },
-  { node: 24, kafka: '4.3.1', group: 'oauthbearer', compose: 'docker-compose.oauthbearer.yml' },
-  { node: 22, kafka: '4.3.1', group: 'broker' },
-  { node: 22, kafka: '4.3.1', group: 'others' },
-  { node: 26, kafka: '4.3.1', group: 'broker' },
-  { node: 26, kafka: '4.3.1', group: 'others' },
+  { node: 24, kafka: '4.4.0', group: 'broker' },
+  { node: 24, kafka: '4.4.0', group: 'admin' },
+  { node: 24, kafka: '4.4.0', group: 'producer' },
+  { node: 24, kafka: '4.4.0', group: 'consumer' },
+  { node: 24, kafka: '4.4.0', group: 'others' },
+  { node: 24, kafka: '4.4.0', group: 'oauthbearer', compose: 'docker-compose.oauthbearer.yml' },
+  { node: 22, kafka: '4.4.0', group: 'broker' },
+  { node: 22, kafka: '4.4.0', group: 'others' },
+  { node: 26, kafka: '4.4.0', group: 'broker' },
+  { node: 26, kafka: '4.4.0', group: 'others' },
   // 55 minutes minus the relocated 35-minute soak step leaves the functional lane 20 minutes.
-  { node: 24, kafka: '4.3.1', group: 'share-base', timeout: 20 },
-  { node: 24, kafka: '4.4.0', group: 'share-base', clients: '4.4.0' },
-  { node: 24, kafka: '4.3.1', group: 'share', compose: 'docker-compose.share.yml' },
+  { node: 24, kafka: '4.4.0', group: 'share-base', clients: '4.4.0', timeout: 20 },
   {
     node: 24,
     kafka: '4.4.0',
@@ -20,7 +18,7 @@ const ROWS = [
     compose: 'docker-compose.share.yml',
     clients: '4.4.0',
   },
-  { node: 24, kafka: '4.3.1', group: 'share-limit', compose: 'docker-compose.share-limit.yml' },
+  { node: 24, kafka: '4.4.0', group: 'share-limit', compose: 'docker-compose.share-limit.yml' },
 ]
 
 /**
