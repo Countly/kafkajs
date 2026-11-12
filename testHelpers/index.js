@@ -9,6 +9,7 @@ const crypto = require('crypto')
 const Cluster = require('../src/cluster')
 const Broker = require('../src/broker')
 const waitFor = require('../src/utils/waitFor')
+const { pollUntil } = require('../src/producer/__tests__/fixtures/bounded')
 const connectionBuilder = require('../src/cluster/connectionPoolBuilder')
 const ConnectionPool = require('../src/network/connectionPool')
 const defaultSocketFactory = require('../src/network/socketFactory')
@@ -340,15 +341,24 @@ const disconnectPropagationBrokers = async () => {
  *
  * @param {string} topic
  * @param {number} partitions
+ * @param {object} [options]
+ * @param {AbortSignal} [options.signal] cancels reads and polling under the same 30-second bound
+ * @param {object[]} [options.brokers] caller-owned brokers; otherwise uses the file's shared brokers
  * @returns {Promise<void>}
+ * @throws {Error} permanent metadata error, cancellation or propagation timeout
  */
-const waitForTopicPropagation = async (topic, partitions) => {
-  const servesTopic = async (broker) => {
+const waitForTopicPropagation = async (topic, partitions, { signal, brokers } = {}) => {
+  signal?.throwIfAborted()
+  const servesTopic = async (broker, scope) => {
+    scope?.throwIfAborted()
+    const options = scope ? { guard: () => (scope.aborted ? scope.reason : null) } : undefined
     let response
     try {
-      await broker.connect() // no-op while connected; reconnects a socket the broker closed
-      response = await broker.metadata([topic])
+      await broker.connect(options)
+      scope?.throwIfAborted()
+      response = await broker.metadata([topic], options)
     } catch (e) {
+      scope?.throwIfAborted()
       if (TOPIC_NOT_READY_ERRORS.includes(e.type)) {
         return false
       }
@@ -363,12 +373,22 @@ const waitForTopicPropagation = async (topic, partitions) => {
     )
   }
 
-  const brokers = getPropagationBrokers()
-  await waitFor(async () => (await Promise.all(brokers.map(servesTopic))).every(Boolean), {
-    delay: TOPIC_PROPAGATION_DELAY_MS,
-    maxWait: TOPIC_PROPAGATION_MAX_WAIT_MS,
-    timeoutMessage: `Timed out waiting for all brokers to serve metadata for topic "${topic}"`,
-  })
+  const targets = brokers || getPropagationBrokers()
+  const check = async (scope) =>
+    (await Promise.all(targets.map((broker) => servesTopic(broker, scope)))).every(Boolean)
+  const label = `Timed out waiting for all brokers to serve metadata for topic "${topic}"`
+  if (signal) {
+    await pollUntil(signal, TOPIC_PROPAGATION_MAX_WAIT_MS, check, {
+      delayMs: TOPIC_PROPAGATION_DELAY_MS,
+      label,
+    })
+  } else {
+    await waitFor(() => check(), {
+      delay: TOPIC_PROPAGATION_DELAY_MS,
+      maxWait: TOPIC_PROPAGATION_MAX_WAIT_MS,
+      timeoutMessage: label,
+    })
+  }
 }
 
 const createTopic = async ({ topic, partitions = 1, replicas = 1, config = [] }) => {

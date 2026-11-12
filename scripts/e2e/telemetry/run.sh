@@ -3,9 +3,9 @@
 # Usage: run.sh verify <line> | decode <line> <raw> | prepare <line> <raw> | client[-check] <line> <role arguments>
 set -euo pipefail
 MODE=${1:?verify, decode, prepare, client or client-check}
-LINE=${2:?4.3.1 or 4.2.2}
+LINE=${2:?4.4.0, 4.3.1 or 4.2.2}
 case "$MODE:$LINE" in
-  verify:4.3.1|verify:4.2.2|decode:4.3.1|decode:4.2.2|prepare:4.3.1|prepare:4.2.2|client:4.3.1|client:4.2.2|client-check:4.3.1|client-check:4.2.2) ;;
+  verify:4.4.0|verify:4.3.1|verify:4.2.2|decode:4.4.0|decode:4.3.1|decode:4.2.2|prepare:4.4.0|prepare:4.3.1|prepare:4.2.2|client:4.4.0|client:4.3.1|client:4.2.2|client-check:4.4.0|client-check:4.3.1|client-check:4.2.2) ;;
   *) exit 2 ;;
 esac
 : "${TMPDIR:?set a private temporary directory}"
@@ -21,10 +21,10 @@ const check = (file, expected) => {
   if (sha(file) !== expected) throw new Error('Fixture identity mismatch: ' + file)
 }
 const file = path.join(here, 'fixtures/manifest.json')
-check(file, '5e1bca462c8ff3a4cd651be82eb0f56ed2f132815b0569a8ac469806c949577d')
+check(file, 'b75a444cd969d490ac896539430a0585ea9155a5a8250592ae837a71b0ecacc5')
 const manifest = JSON.parse(fs.readFileSync(file, 'utf8'))
 check(path.join(root, 'docker-compose.telemetry.yml'), manifest.composeSha256['docker-compose.telemetry.yml'])
-for (const name of ['CountingTelemetryReporter.java', 'build.sh'])
+for (const name of ['CountingTelemetryReporter.java', 'build.sh', 'prepare-reporter-source.sh', 'prepare-client-source.sh', 'legacy/JavaTelemetryClient.java'])
   check(path.join(here, name), manifest.scripts[name])
 for (const item of Object.values(manifest.lines)) {
   for (const kind of ['reporterJar', 'javaClientJar'])
@@ -81,12 +81,13 @@ case "$RAW" in /*) ;; *) exit 2 ;; esac
 [ "$(wc -c < "$RAW")" -le 4096 ]
 CP="$HERE/fixtures/full-telemetry-decoder.jar:$HERE/fixtures/counting-telemetry-reporter-$LINE.jar:$TELEMETRY_JAVA_CACHE/jars/kafka-clients-$LINE.jar:$TELEMETRY_JAVA_CACHE/jars/protobuf-java-3.25.5.jar:$TELEMETRY_JAVA_CACHE/jars/slf4j-api-1.7.36.jar"
 # A one-shot decoder has no long-running workload to amortize profiling/C2 compilation.
-JVM=(-XX:TieredStopAtLevel=1)
+# Warnings go to stderr and no hsperfdata file is used: the decoder's stdout carries exactly two JSON lines.
+JVM=(-XX:TieredStopAtLevel=1 -XX:-UsePerfData -Xlog:disable -Xlog:all=warning:stderr)
 if [ "$MODE" = prepare ]; then
   : "${TELEMETRY_DECODER_ARCHIVE:?set a new absolute AppCDS archive path}"
   case "$TELEMETRY_DECODER_ARCHIVE" in /*) ;; *) exit 2 ;; esac
   [ ! -e "$TELEMETRY_DECODER_ARCHIVE" ] && [ ! -L "$TELEMETRY_DECODER_ARCHIVE" ] || exit 2
-  JVM+=(-Xshare:on "-XX:ArchiveClassesAtExit=$TELEMETRY_DECODER_ARCHIVE" -Xlog:disable -Xlog:all=warning:stderr)
+  JVM+=(-Xshare:on "-XX:ArchiveClassesAtExit=$TELEMETRY_DECODER_ARCHIVE")
 elif [ -n "${TELEMETRY_DECODER_ARCHIVE:-}" ]; then
   case "$TELEMETRY_DECODER_ARCHIVE" in /*) ;; *) exit 2 ;; esac
   [ -f "$TELEMETRY_DECODER_ARCHIVE" ] && [ ! -L "$TELEMETRY_DECODER_ARCHIVE" ] || exit 2

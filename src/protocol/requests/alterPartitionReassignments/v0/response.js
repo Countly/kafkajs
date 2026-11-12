@@ -41,6 +41,11 @@ const decodePartitions = (decoder) => {
   return partition
 }
 
+/**
+ * Decodes v0 with the schema default for the absent replication policy.
+ * @param {Buffer} rawData response body
+ * @returns {Promise<object>} decoded response with allowReplicationFactorChange=true
+ */
 const decode = async (rawData) => {
   const decoder = new Decoder(rawData)
   const throttleTime = decoder.readInt32()
@@ -49,6 +54,7 @@ const decode = async (rawData) => {
   return {
     throttleTime: 0,
     clientSideThrottleTime: throttleTime,
+    allowReplicationFactorChange: true,
     errorCode,
     responses: Decoder.requireArray(
       decoder.readUVarIntArray(decodeResponses),

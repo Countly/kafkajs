@@ -13,8 +13,8 @@ concurrency:
   cancel-in-progress: true
 jobs:
   lint:
-    timeout-minutes: 15
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -24,8 +24,8 @@ jobs:
       - run: npm run compat:check
       - run: npm run test:types
   unit:
-    timeout-minutes: 60
     runs-on: ubuntu-latest
+    timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix: { node: [22, 24, 26] }
@@ -47,10 +47,12 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: '${{ matrix.node }}', cache: npm }
       - run: npm ci
-      - run: npm run test:unit:soak -- --ci --shard=${{ matrix.shard }}/3
+      - env:
+          MATRIX_SHARD: ${{ matrix.shard }}
+        run: npm run test:unit:soak -- --ci --shard="$MATRIX_SHARD/3"
   pack:
-    timeout-minutes: 15
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -58,8 +60,8 @@ jobs:
       - run: npm ci
       - run: npm run test:pack
   otel:
-    timeout-minutes: 15
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -67,8 +69,8 @@ jobs:
       - run: npm ci
       - run: npm run test:otel
   integration-plan:
-    timeout-minutes: 5
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
     steps:
@@ -82,13 +84,14 @@ jobs:
         run: node scripts/ci/integrationPlan.js >> "$GITHUB_OUTPUT"
   integration:
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ matrix.timeout || 360 }}
+    timeout-minutes: ${{ matrix.timeout || 20 }}
     needs: [unit, integration-plan]
     strategy:
       fail-fast: false
       max-parallel: 6
       matrix: ${{ fromJSON(needs.integration-plan.outputs.matrix) }}
     env:
+      MATRIX_GROUP: ${{ matrix.group }}
       KAFKA_VERSION: ${{ matrix.kafka }}
       COMPOSE_FILE: ${{ matrix.compose || 'docker-compose.yml' }}
       KAFKA_CLIENTS_VERSION: ${{ matrix.clients || '' }}
@@ -99,7 +102,7 @@ jobs:
       - run: npm ci
       - run: docker compose version
       - if: ${{ !startsWith(matrix.group, 'share') }}
-        run: ./scripts/testWithKafka.sh "npm run test:group:${{ matrix.group }} -- --ci --maxWorkers=4"
+        run: ./scripts/testWithKafka.sh "npm run test:group:$MATRIX_GROUP -- --ci --maxWorkers=4"
       - name: Prepare share evidence
         if: startsWith(matrix.group, 'share')
         run: |
@@ -110,7 +113,7 @@ jobs:
         if: startsWith(matrix.group, 'share')
         env:
           DO_NOT_STOP: '1'
-        run: ./scripts/testWithKafka.sh "npm run test:group:${{ matrix.group }} -- --ci"
+        run: ./scripts/testWithKafka.sh "npm run test:group:$MATRIX_GROUP -- --ci"
       - name: Prove shutdown exits naturally
         if: matrix.group == 'share'
         env:

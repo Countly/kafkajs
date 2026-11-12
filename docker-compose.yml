@@ -1,7 +1,7 @@
 # 3-node KRaft cluster (combined broker+controller) on the official apache/kafka image.
 # Host ports keep the layout testHelpers/index.js expects. Controller quorum is static (see spec C1).
 x-kafka-common: &kafka-common
-  image: apache/kafka:${KAFKA_VERSION:-4.3.1}
+  image: apache/kafka:${KAFKA_VERSION:-4.4.0}
   environment: &kafka-env
     # JMX is enabled for the broker process only, through KAFKA_JMX_PORT.
     KAFKA_JMX_PORT: '9999'

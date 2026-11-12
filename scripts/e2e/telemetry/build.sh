@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Builds fixtures/counting-telemetry-reporter-<kafka-version>.jar (reporter + relocated OTLP v1.9.0 bindings) and the
-# unrelocated bindings jar used by the offline vector generator. Usage: build.sh <4.3.1|4.2.2>
+# unrelocated bindings jar used by the offline vector generator. Usage: build.sh <4.4.0|4.3.1|4.2.2>
 # Env: TF1_CACHE (downloaded inputs, see fetch.sh), TF1_WORK (scratch build dir), TF1_OUT (default ./fixtures).
 # Deterministic: fixed jar timestamps, so two builds of the same inputs give the same SHA-256.
 set -euo pipefail
-V=${1:?kafka version, 4.3.1 or 4.2.2}
+V=${1:?kafka version, 4.4.0, 4.3.1 or 4.2.2}
 HERE=$(cd "$(dirname "$0")" && pwd)
 CACHE=${TF1_CACHE:?set TF1_CACHE}
 WORK=${TF1_WORK:?set TF1_WORK}/$V
@@ -34,15 +34,29 @@ jar --create --date=$DATE --file "$OUT/otlp-v1.9.0-bindings-unrelocated.jar" -C 
 
 # 3. compile the reporter against the pinned Kafka clients jar and the relocated bindings
 mkdir -p "$WORK/classes-reporter"
-javac --release 17 -Xlint:all -cp "$KC:$PB:$WORK/classes-reloc" -d "$WORK/classes-reporter" "$HERE/CountingTelemetryReporter.java"
+REPORTER_SOURCE=$(bash "$HERE/prepare-reporter-source.sh" "$V" "$WORK/source")
+javac --release 17 -Xlint:all -cp "$KC:$PB:$WORK/classes-reloc" -d "$WORK/classes-reporter" "$REPORTER_SOURCE"
 mkdir -p "$WORK/jar" && cp -r "$WORK/classes-reloc/." "$WORK/jar/" && cp -r "$WORK/classes-reporter/." "$WORK/jar/"
 JAR=$OUT/counting-telemetry-reporter-$V.jar
 jar --create --date=$DATE --file "$JAR" -C "$WORK/jar" .
 
 # 3b. deterministic Java telemetry client (KIP-1076 registration), compiled against the same pinned clients jar
+CLIENT_SOURCE=$(bash "$HERE/prepare-client-source.sh" "$V" "$WORK/source")
+CLIENT_RELEASE=17
+CLIENT_CP=$KC:$SLF
+if [ "$V" = 4.4.0 ]; then
+  CLIENT_RELEASE=21
+  CLIENT_CP=$CLIENT_CP:$PB:$OUT/otlp-v1.9.0-bindings-unrelocated.jar
+fi
 mkdir -p "$WORK/classes-client"
-javac --release 17 -Xlint:all -cp "$KC:$SLF" -d "$WORK/classes-client" "$HERE/JavaTelemetryClient.java"
+javac --release "$CLIENT_RELEASE" -Xlint:all -cp "$CLIENT_CP" -d "$WORK/classes-client" "$CLIENT_SOURCE"
+if [ "$V" = 4.4.0 ]; then
+  cp -r "$WORK/classes-orig/." "$WORK/classes-client/"
+fi
 jar --create --date=$DATE --file "$OUT/java-telemetry-client-$V.jar" -C "$WORK/classes-client" .
+if [ "$V" = 4.4.0 ]; then
+  java -cp "$OUT/java-telemetry-client-$V.jar:$KC:$PB:$SLF" org.countly.kafkajs.telemetry.JavaTelemetryClient --controls
+fi
 
 # 4. load proof: the plugin interfaces, the bindings and an empty-payload decode, from the jar alone
 java -cp "$JAR:$KC:$PB:$SLF" org.countly.kafkajs.telemetry.CountingTelemetryReporter check

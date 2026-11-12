@@ -1,4 +1,7 @@
-const { KafkaJSAggregateError } = require('../../../../errors')
+const {
+  KafkaJSAggregateError,
+  KafkaJSAlterPartitionReassignmentsError,
+} = require('../../../../errors')
 const { decode, parse } = require('./response')
 
 describe('Protocol > Requests > AlterPartitionReassignments > v0', () => {
@@ -7,6 +10,7 @@ describe('Protocol > Requests > AlterPartitionReassignments > v0', () => {
     expect(data).toEqual({
       throttleTime: 0,
       clientSideThrottleTime: 0,
+      allowReplicationFactorChange: true,
       errorCode: 0,
       responses: [
         {
@@ -39,6 +43,7 @@ describe('Protocol > Requests > AlterPartitionReassignments > v0', () => {
       ],
       throttleTime: 0,
       clientSideThrottleTime: 0,
+      allowReplicationFactorChange: true,
     })
 
     const promise = parse(data)
@@ -63,4 +68,29 @@ describe('Protocol > Requests > AlterPartitionReassignments > v0', () => {
     expect(data.errorCode).toEqual(0)
     expect(Array.isArray(data.responses)).toBe(true)
   })
+
+  test.each([
+    [0, '000000110000000100'],
+    [41, '000000110029000100'],
+  ])(
+    'defaults allowReplicationFactorChange to true for a v0 golden with error code %i',
+    async (errorCode, hex) => {
+      const data = await decode(Buffer.from(hex, 'hex'))
+
+      expect(data).toEqual({
+        throttleTime: 0,
+        clientSideThrottleTime: 17,
+        allowReplicationFactorChange: true,
+        errorCode,
+        responses: [],
+      })
+      if (errorCode) {
+        const promise = parse(data)
+        await expect(promise).rejects.toBeInstanceOf(KafkaJSAlterPartitionReassignmentsError)
+        await expect(promise).rejects.toMatchObject({ code: errorCode })
+      } else {
+        await expect(parse(data)).resolves.toBe(data)
+      }
+    }
+  )
 })

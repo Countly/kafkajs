@@ -1,4 +1,12 @@
 {
+  "4.4.0": {
+    "url": "https://raw.githubusercontent.com/apache/kafka/4.4.0/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java",
+    "sha256": "869dd1964d2bd6c1029476ef13edef8996d86e059d020bb0fda46d45767c96fc",
+    "transition": "maybeUpdateTargetAssignment",
+    "gatePatchSha256": "f6c9999fd41ccf6a9a593350686ab6f4e86372f7f3b608736be91d3faa691156",
+    "apiVisibleCapture": "unverified as of 2026-11-11",
+    "finalCaptureOwner": "consumer state live tests"
+  },
   "4.3.1": {
     "url": "https://raw.githubusercontent.com/apache/kafka/4.3.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java",
     "sha256": "51e62c24aca4b39c6f0ce41e41792a92fccb1b5f511457f89403466292eafb93",

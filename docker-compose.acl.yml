@@ -9,7 +9,7 @@
 # @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-679%3A+Producer+will+enable+the+strongest+delivery+guarantee+by+default
 # Measured by npm run probe:idempotent-authz on 2026-10-08 (apache/kafka:4.3.1): InitProducerId for User:bob 31, a non-idempotent connect 0, a non-idempotent send 29, InitProducerId after WRITE on one topic 0 (0 = allowed).
 x-kafka-common: &kafka-common
-  image: apache/kafka:${KAFKA_VERSION:-4.3.1}
+  image: apache/kafka:${KAFKA_VERSION:-4.4.0}
   environment: &kafka-env
     KAFKA_PROCESS_ROLES: 'broker,controller'
     KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka1:19093,2@kafka2:19093,3@kafka3:19093'

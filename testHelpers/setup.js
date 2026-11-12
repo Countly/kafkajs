@@ -1,6 +1,6 @@
 // Defaults for a bare `npx jest ...` run (previously set by the package.json script wrappers).
 process.env.NODE_ENV ||= 'test'
-process.env.KAFKA_VERSION ||= '4.3.1'
+process.env.KAFKA_VERSION ||= '4.4.0'
 process.env.KAFKAJS_DEBUG_PROTOCOL_BUFFERS ||= '1'
 
 jest.setTimeout(90000)
