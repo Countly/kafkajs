@@ -1012,10 +1012,14 @@ describe('telemetry wire observer', () => {
     observer.confirmForegroundFetchSetup()
     expect(observer.undecided()).toEqual([])
     expect(
-      ordinaryOwnership({
-        records: observer.readTranscript(),
-        sockets: observer.socketOwnership(),
-      })
+      ordinaryOwnership(
+        {
+          owner: 'client',
+          records: observer.readTranscript(),
+          sockets: observer.socketOwnership(),
+        },
+        { owner: 'client', clientId: 'client' }
+      )
     ).toEqual(['2:bootstrap', '2:ordinary'])
     setup.emit('close')
     fetch.emit('close')
@@ -2512,6 +2516,7 @@ describe('required live archive dimensions and semantics', () => {
       const clientId = `required-${owner}`
       const get = {
         type: 'request',
+        owner,
         apiKey: 71,
         apiVersion: 0,
         requestKey: 'r1',
@@ -2533,14 +2538,18 @@ describe('required live archive dimensions and semantics', () => {
         },
       }
       const transcript = {
+        owner,
         records: [
           {
             type: 'request',
+            owner,
             apiKey: kind === 'producer' ? 0 : kind === 'consumer' ? 1 : 3,
             clientId,
             socketId: 3,
           },
-          ...(kind === 'consumer' ? [{ type: 'request', apiKey: 8, clientId, socketId: 3 }] : []),
+          ...(kind === 'consumer'
+            ? [{ type: 'request', owner, apiKey: 8, clientId, socketId: 3 }]
+            : []),
           ...(snapshots.length ? [get] : []),
         ],
         sockets: [
@@ -2562,6 +2571,7 @@ describe('required live archive dimensions and semantics', () => {
         if (fault !== 'blackhole') {
           transcript.records.push({
             type: 'request',
+            owner,
             requestKey: 'r2',
             apiKey: 72,
             apiVersion: 0,
@@ -2613,6 +2623,7 @@ describe('required live archive dimensions and semantics', () => {
         const requestKey = `r${(index + 1) * 10}`
         transcript.records.push({
           type: 'request',
+          owner,
           requestKey,
           index: (index + 1) * 10,
           apiKey: 72,
@@ -3420,6 +3431,46 @@ describe('required live archive dimensions and semantics', () => {
       expect(() => verifyMemoryScenario(a.record, a.directory)).toThrow(
         'Unowned or additional quiet socket'
       )
+    }
+  )
+
+  test.each([
+    ['share', 'every request client id'],
+    ['share', 'entire identity'],
+    ['share-off', 'every request client id'],
+    ['share-off', 'entire identity'],
+  ])(
+    'rejects unsupported %s bootstrap with a replaced %s in memory-gates',
+    (owner, replacement) => {
+      const { verifyMemoryScenario } = require('../../scripts/e2e/telemetry/memoryVerdicts')
+      const { readBrokerCapture } = require('../brokerCapture')
+      const a = unsupportedArchive()
+      a.record.run.line = '4.4.0'
+      const transcript = a.streams[owner].transcript
+      transcript.records = [
+        { type: 'connect', socketId: 1, node: '1', at: 1 },
+        {
+          type: 'request',
+          owner,
+          socketId: 1,
+          node: '1',
+          clientId: `required-${owner}`,
+          apiKey: 18,
+          apiVersion: 5,
+          writeAt: 2,
+          response: { errorCode: 0, responseAt: 3, ranges: readBrokerCapture('4.4.0').apiRanges },
+        },
+      ]
+      transcript.sockets = [{ id: 1, node: '1', kind: 'undecided', closedAt: 4 }]
+      a.verify()
+      expect(() => verifyMemoryScenario(a.record, a.directory)).not.toThrow()
+      if (replacement === 'entire identity') transcript.owner = 'producer'
+      for (const request of transcript.records.filter((r) => r.type === 'request')) {
+        request.clientId = 'foreign'
+        if (replacement === 'entire identity') request.owner = 'producer'
+      }
+      a.verify()
+      expect(() => verifyMemoryScenario(a.record, a.directory)).toThrow()
     }
   )
 
