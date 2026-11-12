@@ -459,7 +459,7 @@ const measure = async (kind) => {
       loaded,
       c0: control.c0,
       c1: control.c1,
-      controlDiagnostics: control.diagnostics,
+      ...(control.diagnostics && { controlDiagnostics: control.diagnostics }),
       released: control.released,
       control: control.facts,
       warmup: { m0: warmed.m0, end },
@@ -502,6 +502,10 @@ const measure = async (kind) => {
 const [kind] = process.argv.slice(2)
 measure(kind).then(
   (readings) => {
+    if (process.env.RESOURCE_CONTROL_DIAGNOSTICS === '1') {
+      readings.diagnostic = true
+      readings.acceptanceEligible = false
+    }
     process.stdout.write(`${JSON.stringify({ readings })}\n`)
   },
   async (error) => {
