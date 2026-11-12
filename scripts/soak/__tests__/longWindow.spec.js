@@ -568,6 +568,40 @@ describe('shadow report', () => {
     expect(empty).toMatchObject({ complete: false, kind: 'admin', arm: 'unseeded' })
   })
 
+  test('rejects a missing or duplicate reading anywhere on the frozen grid', () => {
+    for (const missing of [60000, 420000, 450000, 480000, 1290000, 1319000]) {
+      const report = reportOf({ dataAt: line(0), grid: GRID.filter((at) => at !== missing) })
+      expect(report).toMatchObject({ complete: false })
+      expect(report.error).toMatch(/grid|checkpoint/)
+      expect(report).not.toHaveProperty('wouldBe')
+    }
+    const duplicate = reportOf({ dataAt: line(0), grid: [GRID[0], ...GRID] })
+    expect(duplicate.complete).toBe(false)
+    expect(duplicate.error).toMatch(/grid/)
+    expect(duplicate).not.toHaveProperty('wouldBe')
+  })
+
+  test('rejects the full grid when one prescribed mid-cycle reading overlaps a lifecycle', () => {
+    const stages = stagesOf().map((stage) =>
+      stage.stage === 'lifecycle' && stage.tick === 10
+        ? { ...stage, doneAt: PHASE_AT + 695000 }
+        : stage
+    )
+    for (const arm of ['unseeded', 'seeded']) {
+      const report = reportOf({ arm, dataAt: line(128 * KIB), stages })
+      expect(report.complete).toBe(false)
+      expect(report.error).toMatch(/mid-cycle.*690000/)
+      expect(report).not.toHaveProperty('wouldBe')
+    }
+  })
+
+  test('accepts admission jitter within each frozen grid slot', () => {
+    const report = reportOf({ dataAt: line(0), grid: GRID.map((at) => at + 5) })
+    expect(report.complete).toBe(true)
+    expect(report.counts.mid).toBe(15)
+    expect(report.firstUse).toMatchObject({ fromAtMs: 60005, toAtMs: 420005 })
+  })
+
   test('passes the worker seed summary through beside the series', () => {
     const seed = { mode: 'slope2x', intervals: 43, buffers: 43, bytes: 43 * 65536 }
     const samples = GRID.map((at) => sampleOf(at, line(0)(at), 4 * MIB))
