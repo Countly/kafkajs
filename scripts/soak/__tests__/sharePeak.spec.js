@@ -12,6 +12,12 @@ const {
 } = require('../telemetryChurn')
 const { PROFILES, TELEMETRY } = require('../soak')
 const { TelemetrySegments } = require('../../../testHelpers/telemetrySegments')
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
+const crypto = require('node:crypto')
+// eslint-disable-next-line n/no-missing-require -- implemented by the following fix commit
+const { ShareAllocationProfile, topStacks, PROFILE_LIMITS } = require('../shareAllocationProfile')
 
 /** @returns {object} deterministic kernel, engine and clock facts */
 const fixture = () => {
@@ -322,5 +328,194 @@ describe('share peak attribution', () => {
     expect(peak.report().readings[0].phase).toBe('M')
     expect(TelemetryWorkerProcess.prototype).not.toHaveProperty('sharePeak')
     expect(() => installSharePeak(processOwner, 'unknown')).toThrow('share peak arm')
+  })
+})
+
+describe('share allocation sampling', () => {
+  let directory
+  beforeEach(() => {
+    directory = fs.mkdtempSync(path.join(os.tmpdir(), 'share-allocation-'))
+  })
+  afterEach(() => fs.rmSync(directory, { recursive: true, force: true }))
+
+  /** @returns {object} deterministic V8-shaped self-byte tree, including a collected allocation */
+  const profile = () => ({
+    head: {
+      id: 1,
+      callFrame: { functionName: '(root)', url: '', lineNumber: -1, columnNumber: -1 },
+      selfSize: 0,
+      children: [
+        {
+          id: 2,
+          callFrame: {
+            functionName: 'seal',
+            url: 'file:///repo/scripts/soak/telemetryChurn.js',
+            lineNumber: 2887,
+            columnNumber: 2,
+          },
+          selfSize: 64,
+          children: [
+            {
+              id: 3,
+              callFrame: {
+                functionName: 'readExports',
+                url: 'file:///repo/testHelpers/telemetryFixtures.js',
+                lineNumber: 74,
+                columnNumber: 2,
+              },
+              selfSize: 8192,
+              children: [],
+            },
+          ],
+        },
+      ],
+    },
+    samples: [{ size: 8192, nodeId: 3, ordinal: 1 }],
+  })
+
+  /**
+   * @param {object} [options] a protocol failure or oversized profile
+   * @returns {object} protocol seam and call log; work and artifact writing use real code
+   */
+  const recorder = ({ failStart = false, value = profile() } = {}) => {
+    const calls = []
+    const session = {
+      connect: () => calls.push('connect'),
+      disconnect: () => calls.push('disconnect'),
+      post(method, params, callback) {
+        calls.push([method, params])
+        if (failStart && method === 'HeapProfiler.startSampling')
+          callback(new Error('sampling unavailable'))
+        else callback(null, method === 'HeapProfiler.stopSampling' ? { profile: value } : {})
+      },
+    }
+    const allocation = new ShareAllocationProfile({ directory, session: () => session })
+    return { allocation, calls }
+  }
+
+  test('ranks stacks by self bytes without counting parent allocations twice', () => {
+    expect(topStacks(profile(), 1)).toEqual({
+      totalSelfBytes: 8256,
+      allocationNodes: 2,
+      omittedNodes: 1,
+      top: [
+        {
+          nodeId: 3,
+          selfBytes: 8192,
+          stack: [
+            { functionName: '(root)', url: '', line: 0, column: 0 },
+            {
+              functionName: 'seal',
+              url: 'file:///repo/scripts/soak/telemetryChurn.js',
+              line: 2888,
+              column: 3,
+            },
+            {
+              functionName: 'readExports',
+              url: 'file:///repo/testHelpers/telemetryFixtures.js',
+              line: 75,
+              column: 3,
+            },
+          ],
+        },
+      ],
+    })
+  })
+
+  test('brackets work with collected-object sampling and preserves the complete bounded profile', async () => {
+    const { allocation, calls } = recorder()
+    const result = await allocation.capture('reopen', 6, async () => {
+      calls.push('work')
+      return 'original result'
+    })
+    expect(result).toBe('original result')
+    expect(calls).toEqual([
+      'connect',
+      [
+        'HeapProfiler.startSampling',
+        {
+          samplingInterval: PROFILE_LIMITS.samplingInterval,
+          includeObjectsCollectedByMajorGC: true,
+          includeObjectsCollectedByMinorGC: true,
+        },
+      ],
+      'work',
+      ['HeapProfiler.stopSampling', {}],
+      'disconnect',
+    ])
+    const raw = fs.readFileSync(path.join(directory, '0-reopen-6.heapprofile'))
+    expect(JSON.parse(raw)).toEqual(profile())
+    const summary = JSON.parse(fs.readFileSync(path.join(directory, '0-reopen-6.json')))
+    expect(summary).toMatchObject({
+      diagnostic: true,
+      acceptanceEligible: false,
+      stage: 'reopen',
+      tick: 6,
+      workCompleted: true,
+      totalSelfBytes: 8256,
+      profile: {
+        name: '0-reopen-6.heapprofile',
+        bytes: raw.length,
+        sha256: crypto.createHash('sha256').update(raw).digest('hex'),
+      },
+    })
+    await allocation.capture('cleanup', null, async () => {})
+    expect(allocation.report()).toMatchObject({
+      complete: true,
+      stages: [
+        { stage: 'reopen', tick: 6 },
+        { stage: 'cleanup', tick: null },
+      ],
+    })
+  })
+
+  test('stops and disconnects on workload failure while retaining its allocation evidence', async () => {
+    const { allocation, calls } = recorder()
+    const error = new Error('original close failed')
+    await expect(
+      allocation.capture('cleanup', null, async () => {
+        throw error
+      })
+    ).rejects.toBe(error)
+    expect(calls.at(-1)).toBe('disconnect')
+    const summary = JSON.parse(fs.readFileSync(path.join(directory, '0-cleanup-none.json')))
+    expect(summary).toMatchObject({ workCompleted: false, errors: ['original close failed'] })
+    expect(summary.profile.bytes).toBeGreaterThan(0)
+    expect(allocation.report().complete).toBe(false)
+  })
+
+  test('fails unavailable sampling and artifact bounds without truncating a profile or running unprofiled work', async () => {
+    const unavailable = recorder({ failStart: true })
+    let ran = false
+    await expect(
+      unavailable.allocation.capture('reopen', 6, async () => {
+        ran = true
+      })
+    ).rejects.toThrow('sampling unavailable')
+    expect(ran).toBe(false)
+    expect(unavailable.calls.at(-1)).toBe('disconnect')
+    const oversized = recorder({
+      value: { ...profile(), padding: 'x'.repeat(PROFILE_LIMITS.profileBytes) },
+    })
+    await expect(oversized.allocation.capture('cleanup', null, async () => {})).rejects.toThrow(
+      'profile byte bound'
+    )
+    expect(fs.readdirSync(directory).filter((name) => name.endsWith('.heapprofile'))).toEqual([])
+    expect(oversized.allocation.report().complete).toBe(false)
+  })
+
+  test('installs allocation sampling only in the enabled diagnostic CI share worker', () => {
+    for (const [kind, arm, env, enabled] of [
+      ['shareConsumer', 'enabled', { CI: 'true', SHARE_PEAK_DIAGNOSTIC: '1' }, true],
+      ['shareConsumer', 'disabled', { CI: 'true', SHARE_PEAK_DIAGNOSTIC: '1' }, false],
+      ['shareConsumer', 'enabled', {}, false],
+      ['producer', 'enabled', { CI: 'true', SHARE_PEAK_DIAGNOSTIC: '1' }, false],
+    ]) {
+      const owner = { kind, soak: {} }
+      installSharePeak(owner, arm, { ...env, TELEMETRY_EVIDENCE_DIR: directory })
+      const Worker = owner.soak.SharePeakWorker
+      expect(!!Worker && Worker !== DisabledShareWorker).toBe(enabled)
+      if (enabled) expect(Worker.prototype).toBeInstanceOf(TelemetryWorker)
+    }
   })
 })
