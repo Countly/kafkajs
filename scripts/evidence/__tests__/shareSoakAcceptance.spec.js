@@ -154,6 +154,30 @@ describe('share soak independent acceptance controls', () => {
     })
   })
 
+  test.each([0, 1])(
+    'rejects an unanswered wire write %s ms after reset socket close',
+    async (delay) => {
+      const rows = original(require('./fixtures/shareProduceV13.json').rows)
+      const request = rows.find((r) => r.kind === 'request' && r.apiKey === 0)
+      const at = Math.max(...rows.filter((r) => r.kind === 'request').map((r) => r.at)) + 1
+      const frame = Math.max(...rows.filter((r) => r.kind === 'request').map((r) => r.frame)) + 1
+      rows.push({
+        event: 'soak-cycle-step',
+        step: 'socket-close',
+        socket: request.socket,
+        monotonicAt: at,
+        lastFrame: frame - 1,
+      })
+      const pristine = await verifyProtocolAnswers(rows)
+      expect(pristine.problems.filter((p) => p.startsWith('Original'))).toEqual([])
+      rows.push({ ...request, frame, at: at + delay })
+      const changed = await verifyProtocolAnswers(rows)
+      expect(changed.problems.filter((p) => p.startsWith('Original'))).toEqual([
+        `Original request after reset socket close: socket ${request.socket}, frame ${frame}`,
+      ])
+    }
+  )
+
   test.each(['short', 'full'])('refuses empty or removed %s share-identifying rows', (profile) => {
     const contract = { profile, node: 'v24.0.0', source: { commit: 'a'.repeat(40) } }
     expect(validateRows([], contract).length).toBeGreaterThan(0)

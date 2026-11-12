@@ -5247,7 +5247,7 @@ describe('Share soak cycle finalization and isolation adapter', () => {
     const tap = new ShareFetchTap(64, { now: () => 0 })
     const Broker = require('../../../src/broker')
     const { respondWithFrame } = require('../../../testHelpers/fakeSocket')
-    const socket = tap.wrap(Object.assign(new EventEmitter(), { write: () => true }), 'node:1')
+    const socket = tap.wrap(Object.assign(new EventEmitter(), { write: () => true }), 'node:1', 10)
     let correlationId = 0
     const broker = Object.assign(Object.create(Broker.prototype), { brokerAddress: 'node:1' })
     const heartbeat = jest

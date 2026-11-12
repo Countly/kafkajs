@@ -20267,7 +20267,9 @@
         "scripts/evidence/__tests__/shareSoakAcceptance.spec.js \u203a share soak independent acceptance controls archive reset retirement evidence rejects raw post-close later timestamp without a diagnostic marker",
         "scripts/evidence/__tests__/shareSoakAcceptance.spec.js \u203a share soak independent acceptance controls archive reset retirement evidence rejects raw post-close same-millisecond sequence without a diagnostic marker",
         "scripts/evidence/__tests__/shareSoakAcceptance.spec.js \u203a share soak independent acceptance controls archive reset retirement evidence rejects raw post-close acknowledgement frame without a diagnostic marker",
-        "scripts/evidence/__tests__/shareSoakAcceptance.spec.js \u203a share soak independent acceptance controls archive reset retirement evidence rejects raw post-close legacy close timestamp without a diagnostic marker"
+        "scripts/evidence/__tests__/shareSoakAcceptance.spec.js \u203a share soak independent acceptance controls archive reset retirement evidence rejects raw post-close legacy close timestamp without a diagnostic marker",
+        "scripts/evidence/__tests__/shareSoakAcceptance.spec.js \u203a share soak independent acceptance controls rejects an unanswered wire write 0 ms after reset socket close",
+        "scripts/evidence/__tests__/shareSoakAcceptance.spec.js \u203a share soak independent acceptance controls rejects an unanswered wire write 1 ms after reset socket close"
       ],
       "capMinutes": 85,
       "allowedSkips": [
