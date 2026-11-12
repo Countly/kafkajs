@@ -1013,7 +1013,6 @@ describe('resource artifact validation', () => {
     test.each(ARMS)('records every decrease and retains the maximum for the %s arm', (arm) => {
       const whole = record(arm)
       const prefix = arm === 'public' ? 'enabled' : 'collector'
-      const marks = whole.readings.marks
       Object.assign(markOf(whole.readings, `${prefix}:held`), {
         vmhwm: 119 * MIB,
         maxRss: 357482496,
@@ -1027,7 +1026,8 @@ describe('resource artifact validation', () => {
         maxRss: 357613568,
       })
       const original = JSON.stringify(whole)
-      const result = judgeMemoryArm(JSON.parse(original))
+      const replay = JSON.parse(original)
+      const result = judgeMemoryArm(replay)
       expect(result).toMatchObject({ verdict: 'pass', problems: [] })
       expect(result.facts).toEqual({
         peak: 120 * MIB,
@@ -1067,8 +1067,7 @@ describe('resource artifact validation', () => {
           },
         ],
       })
-      expect(JSON.stringify(whole)).toBe(original)
-      expect(marks.at(-1).vmhwm).toBe(119 * MIB)
+      expect(JSON.stringify(replay)).toBe(original)
     })
 
     test.each([

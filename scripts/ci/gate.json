@@ -19823,7 +19823,17 @@
         "scripts/e2e/telemetry/__tests__/warmupWitness.spec.js \u203a warm-up lifecycle witnesses refuses witness child readings as acceptance even without the diagnostic envelope",
         "scripts/e2e/telemetry/__tests__/warmupWitness.spec.js \u203a warm-up lifecycle witnesses restores every prototype when the second child witness installation throws",
         "scripts/e2e/telemetry/__tests__/warmupWitness.spec.js \u203a warm-up lifecycle witnesses preserves the original active row allocation order without diagnostic hooks",
-        "scripts/e2e/telemetry/__tests__/warmupWitness.spec.js \u203a warm-up lifecycle witnesses marks census-only public readings ineligible for the acceptance judge"
+        "scripts/e2e/telemetry/__tests__/warmupWitness.spec.js \u203a warm-up lifecycle witnesses marks census-only public readings ineligible for the acceptance judge",
+        "testHelpers/__tests__/resourceProbe.spec.js \u203a resource artifact validation peak reading decreases records every decrease and retains the maximum for the public arm",
+        "testHelpers/__tests__/resourceProbe.spec.js \u203a resource artifact validation peak reading decreases records every decrease and retains the maximum for the collector arm",
+        "testHelpers/__tests__/resourceProbe.spec.js \u203a resource artifact validation peak reading decreases preserves the setup limit after a decrease",
+        "testHelpers/__tests__/resourceProbe.spec.js \u203a resource artifact validation peak reading decreases preserves the delta limit after a decrease",
+        "testHelpers/__tests__/resourceProbe.spec.js \u203a resource artifact validation peak reading decreases preserves the absolute limit after a decrease",
+        "testHelpers/__tests__/resourceProbe.spec.js \u203a resource artifact validation peak reading decreases keeps invalid marks and uncovered readings rejected after a decrease",
+        "scripts/soak/__tests__/soak.spec.js \u203a telemetry resident-size reference records every peak decrease and retains the running maximum",
+        "scripts/soak/__tests__/soak.spec.js \u203a telemetry resident-size reference preserves setup, delta and absolute limits after a peak decrease",
+        "scripts/e2e/telemetry/__tests__/retainedDiagnostic.spec.js \u203a records decreasing sources while preserving missing-coverage diagnostics and the peak",
+        "scripts/e2e/telemetry/__tests__/retainedDiagnostic.spec.js \u203a keeps the diagnostic peak above 160 MiB despite a later decrease"
       ],
       "capMinutes": 85,
       "allowedSkips": [
@@ -24074,7 +24084,17 @@
         "scripts/e2e/telemetry/__tests__/warmupWitness.spec.js \u203a warm-up lifecycle witnesses refuses witness child readings as acceptance even without the diagnostic envelope",
         "scripts/e2e/telemetry/__tests__/warmupWitness.spec.js \u203a warm-up lifecycle witnesses restores every prototype when the second child witness installation throws",
         "scripts/e2e/telemetry/__tests__/warmupWitness.spec.js \u203a warm-up lifecycle witnesses preserves the original active row allocation order without diagnostic hooks",
-        "scripts/e2e/telemetry/__tests__/warmupWitness.spec.js \u203a warm-up lifecycle witnesses marks census-only public readings ineligible for the acceptance judge"
+        "scripts/e2e/telemetry/__tests__/warmupWitness.spec.js \u203a warm-up lifecycle witnesses marks census-only public readings ineligible for the acceptance judge",
+        "testHelpers/__tests__/resourceProbe.spec.js \u203a resource artifact validation peak reading decreases records every decrease and retains the maximum for the public arm",
+        "testHelpers/__tests__/resourceProbe.spec.js \u203a resource artifact validation peak reading decreases records every decrease and retains the maximum for the collector arm",
+        "testHelpers/__tests__/resourceProbe.spec.js \u203a resource artifact validation peak reading decreases preserves the setup limit after a decrease",
+        "testHelpers/__tests__/resourceProbe.spec.js \u203a resource artifact validation peak reading decreases preserves the delta limit after a decrease",
+        "testHelpers/__tests__/resourceProbe.spec.js \u203a resource artifact validation peak reading decreases preserves the absolute limit after a decrease",
+        "testHelpers/__tests__/resourceProbe.spec.js \u203a resource artifact validation peak reading decreases keeps invalid marks and uncovered readings rejected after a decrease",
+        "scripts/soak/__tests__/soak.spec.js \u203a telemetry resident-size reference records every peak decrease and retains the running maximum",
+        "scripts/soak/__tests__/soak.spec.js \u203a telemetry resident-size reference preserves setup, delta and absolute limits after a peak decrease",
+        "scripts/e2e/telemetry/__tests__/retainedDiagnostic.spec.js \u203a records decreasing sources while preserving missing-coverage diagnostics and the peak",
+        "scripts/e2e/telemetry/__tests__/retainedDiagnostic.spec.js \u203a keeps the diagnostic peak above 160 MiB despite a later decrease"
       ],
       "capMinutes": 93,
       "allowedSkips": [

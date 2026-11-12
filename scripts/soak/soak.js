@@ -74,6 +74,7 @@ const STARTUP = (() => {
   }
 })()
 const { subscribeNamedTopic } = require('./subscribeNamedTopic')
+const { peakReadingDecreases } = require('../../testHelpers/processMemory')
 const fs = require('node:fs')
 const { AsyncLocalStorage } = require('node:async_hooks')
 const path = require('node:path')
@@ -522,7 +523,8 @@ class TelemetryResourceVerdict {
    * Judges the resident-size gates against the worker's own disabled control, over every reading
    * of the versioned catalogue and the native work journal, which must hold at least one resolved
    * production compression. Failures are pushed into `violations`; what only makes the measurement
-   * uninformative is returned.
+   * uninformative is returned. Approximate peak-counter decreases are recorded in `measured`
+   * without invalidating the series or lowering its all-read maxima.
    * @param {object} reference the replayable reference facts
    * @param {object} run `baseline`, `samples`, `teardown`, `violations` to append to and `measured`
    * @returns {string[]} the reasons the measurement is inconclusive
@@ -589,12 +591,10 @@ class TelemetryResourceVerdict {
     if (readings.some((r) => r.hwm === null)) {
       inconclusive.push('resident-size peak capability')
     } else {
-      let high = -Infinity
       let covered = -Infinity
       for (const reading of readings) {
         covered = Math.max(covered, reading.rss)
-        fail(reading.hwm >= high && reading.hwm >= covered, 'resident-size peak series')
-        high = Math.max(high, reading.hwm)
+        fail(reading.hwm >= covered, 'resident-size peak series')
       }
     }
     fail(
@@ -644,6 +644,7 @@ class TelemetryResourceVerdict {
       ...nativeReadings.map((r) => r?.external ?? 0),
       sampled.external ?? 0
     )
+    const peakDecreases = peakReadingDecreases(readings, ['rawMaxRss', 'hwm'])
     Object.assign(measured, {
       controlBaseRss: base,
       controlExternal: externalReference,
@@ -654,6 +655,7 @@ class TelemetryResourceVerdict {
       externalPeak,
       externalDelta: externalPeak - externalReference,
       nativeJobs: Array.isArray(rows) ? rows.length : null,
+      ...(peakDecreases.length && { peakDecreases }),
     })
     fail(peak - base <= TELEMETRY.rssDeltaBytes, 'telemetry resident-size increase')
     fail(peak <= TELEMETRY.peakBytes, 'absolute resident-size peak')

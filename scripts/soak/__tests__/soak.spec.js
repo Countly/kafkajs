@@ -7067,7 +7067,8 @@ describe('telemetry resident-size reference', () => {
       row.rawMaxRss = 299 * MIB
     input.samples[6].snapshot.memory.rawMaxRss = 298 * MIB
     const original = JSON.stringify(input)
-    const verdict = evaluate(JSON.parse(original))
+    const replay = JSON.parse(original)
+    const verdict = evaluate(replay)
     expect(verdict).toMatchObject({ ok: true, outcome: 'passed', violations: [], inconclusive: [] })
     expect(verdict.measured).toMatchObject({
       peak: 90 * MIB,
@@ -7094,7 +7095,7 @@ describe('telemetry resident-size reference', () => {
       },
       { index: 12, phase: 'settled', field: 'hwm', before: 89 * MIB, after: 88 * MIB, delta: -MIB },
     ])
-    expect(JSON.stringify(input)).toBe(original)
+    expect(JSON.stringify(replay)).toBe(original)
   })
 
   test('preserves setup, delta and absolute limits after a peak decrease', () => {

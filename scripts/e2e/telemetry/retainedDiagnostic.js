@@ -10,6 +10,7 @@ const {
   MEMORY_FLAGS,
   hostContext,
   collectionsSettled,
+  peakReadingDecreases,
 } = require('../../../testHelpers/processMemory')
 const {
   CAPACITY,
@@ -256,14 +257,12 @@ const screen = (events) => {
     if (Math.abs(control.c1.rss - control.c0.rss) > LIMITS.controlRss)
       inconclusive.push('control RSS is unstable')
   }
-  let previous = 0
+  const peakDecreases = peakReadingDecreases(marks, ['maxRss', 'vmhwm'])
   for (const mark of marks) {
     if (mark.vmhwm === null) inconclusive.push('peak capability missing')
     else {
-      if (mark.vmhwm < previous) problems.push('authoritative peak decreased')
       if (mark.vmhwm < mark.covered)
         inconclusive.push('peak source does not cover a current reading')
-      previous = mark.vmhwm
     }
   }
   const readings = events
@@ -326,6 +325,7 @@ const screen = (events) => {
     controlRetainedDelta: control ? control.c1.retained - control.c0.retained : null,
     controlRssDelta: control ? control.c1.rss - control.c0.rss : null,
     closedDeltas,
+    peakDecreases,
     problems: [...new Set(problems)],
     inconclusive: [...new Set(inconclusive)],
   }
