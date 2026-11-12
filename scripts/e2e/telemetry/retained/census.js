@@ -31,7 +31,7 @@ const category = (node, label = '') => {
     return 'runtime'
   if (
     node.type === 'object' &&
-    /^(FixedJournal|WeakOwners|WeakRef|NativeJournal|PendingSampler|ProcessMemory|DiagnosticMemory|DiagnosticLog|LiveCensus|TelemetryTap|TelemetrySegments|TelemetryWireObserver|TelemetryExportReader|TelemetrySchedule|TelemetryProcesses|TelemetryWorker|TelemetryWorkerProcess|TelemetryChurn|TelemetryProofs|ProcessResources|Registry|OrdinaryOracle|ShareExchanges|ShareOracle|ParentFixture|DecoderCoordinator|DecoderMemory|DecoderGate|WireCursor|FrameStream|FrameCounter|ReferenceControl|Inbox|OrdinaryWork|ShareLedger|SocketTape)$/.test(
+    /^(FixedJournal|WeakOwners|WeakRef|NativeJournal|PendingSampler|ProcessMemory|DiagnosticMemory|DiagnosticLog|ActiveCensus|LiveCensus|TelemetryTap|TelemetrySegments|TelemetryWireObserver|TelemetryExportReader|TelemetrySchedule|TelemetryProcesses|TelemetryWorker|TelemetryWorkerProcess|TelemetryChurn|TelemetryProofs|ProcessResources|Registry|OrdinaryOracle|ShareExchanges|ShareOracle|ParentFixture|DecoderCoordinator|DecoderMemory|DecoderGate|WireCursor|FrameStream|FrameCounter|ReferenceControl|Inbox|OrdinaryWork|ShareLedger|SocketTape)$/.test(
       node.name
     )
   )

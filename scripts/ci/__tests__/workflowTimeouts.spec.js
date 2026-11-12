@@ -27,6 +27,21 @@ describe('Workflow timeouts', () => {
     expect(job.steps.some((step) => step.run?.includes('sharePeakDiagnostic.js'))).toBe(true)
   })
 
+  test('active owner census is broker-free diagnostic only with bounded capture and scalar jobs', () => {
+    const { jobs } = yaml.load(fs.readFileSync(path.join(workflows, 'memory-gates.yml'), 'utf8'))
+    const job = jobs['active-owner-census']
+    expect(job['timeout-minutes']).toBe(25)
+    expect(job.strategy.matrix).toEqual({ node: [22, 24, 26], variant: ['scalar', 'capture'] })
+    const commands = job.steps
+      .filter((step) => step.run)
+      .map((step) => step.run)
+      .join('\n')
+    expect(commands).toContain('activeDiagnostic.js --diagnostic-only')
+    expect(commands).not.toMatch(/docker|jest|\$\{\{/)
+    expect(job.steps.find((step) => step.uses === 'actions/upload-artifact@v4').if).toBe('always()')
+    expect(jobs.verdict.needs).not.toContain('active-owner-census')
+  })
+
   test('every runner job has a timeout and reusable jobs call bounded local workflows', () => {
     for (const file of fs.readdirSync(workflows).filter((file) => /\.ya?ml$/.test(file))) {
       const { jobs } = yaml.load(fs.readFileSync(path.join(workflows, file), 'utf8'))
