@@ -6677,6 +6677,61 @@ describe('telemetry resource evidence', () => {
   })
   const evaluate = (input) => TelemetryResourceVerdict.evaluate(input)
 
+  test('rejects diagnostic or acceptance-ineligible inputs after JSON replay', () => {
+    for (const markers of [
+      { diagnostic: true },
+      { acceptanceEligible: false },
+      { diagnostic: true, acceptanceEligible: false },
+    ]) {
+      const input = JSON.parse(JSON.stringify({ ...run(), ...markers }))
+      const verdict = evaluate(input)
+      expect(verdict.ok).toBe(false)
+      expect(verdict.outcome).toBe('failed')
+      expect(verdict.violations).toEqual(['diagnostic inputs are not acceptance-eligible'])
+      expect(verdict.inconclusive).toEqual([])
+    }
+  })
+
+  test('preserves byte-identical unmarked verdicts and inputs for every outcome', () => {
+    const expected = {
+      ok: true,
+      outcome: 'passed',
+      violations: [],
+      inconclusive: [],
+      measured: {
+        samples: 11,
+        skippedSamples: 0,
+        slopeBytesPerMinute: 0,
+        endpointBytes: 0,
+        controlBaseRss: 73400320,
+        controlExternal: 4194304,
+        setupPeak: 83886080,
+        setupAllowanceBytes: 100663296,
+        peak: 83886080,
+        rssDelta: 10485760,
+        externalPeak: 4194304,
+        externalDelta: 0,
+        nativeJobs: 1,
+      },
+    }
+    for (const outcome of ['passed', 'failed', 'inconclusive']) {
+      const input = run()
+      if (outcome === 'failed') input.cleanupMs = 120001
+      if (outcome === 'inconclusive') input.reference.control.c1.rss += 2097153
+      const original = JSON.stringify(input)
+      expect(JSON.stringify(evaluate(input))).toBe(
+        JSON.stringify({
+          ...expected,
+          ok: outcome === 'passed',
+          outcome,
+          violations: outcome === 'failed' ? ['cleanup budget'] : [],
+          inconclusive: outcome === 'inconclusive' ? ['unstable control'] : [],
+        })
+      )
+      expect(JSON.stringify(input)).toBe(original)
+    }
+  })
+
   test('detects 131072 B/min at actual irregular observation times while a pre-M0 constant escapes slope', () => {
     const input = run()
     input.samples.forEach((sample, index) => {

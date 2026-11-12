@@ -121,7 +121,6 @@ class SharePeak {
     const kernel = this.proc()
     const hwm = kernel?.vmhwm ?? NaN
     if (!kernel) this.errors.add('proc status unavailable')
-    if (hwm < this.lastHwm) this.errors.add('VmHWM decreased')
     const step = Number.isFinite(this.lastHwm) && hwm > this.lastHwm
     const changed = !Number.isFinite(hwm) || hwm !== this.lastHwm
     const gridAt = at >= this.nextGrid ? this.nextGrid - this.origin : NaN
@@ -183,7 +182,8 @@ class SharePeak {
   }
 
   /**
-   * @returns {object} raw replayable facts; RSS categories overlap and are never subtracted
+   * @returns {object} raw replayable facts, including VmHWM decreases and the first maximum.
+   *   Decreases do not invalidate the diagnostic; RSS categories overlap and are never subtracted.
    */
   report() {
     const readings = Array.from({ length: this.length }, (_, index) => {
@@ -227,6 +227,13 @@ class SharePeak {
         })),
       }
     })
+    const hwmDecreases = []
+    for (let i = 1; i < readings.length; i++) {
+      const before = readings[i - 1].VmHWM
+      const { index, phase, VmHWM: after, VmRSS } = readings[i]
+      if (before !== null && after !== null && after < before)
+        hwmDecreases.push({ index, phase, before, after, VmRSS })
+    }
     const peak = readings.reduce(
       (best, row) => (row.VmHWM !== null && (!best || row.VmHWM > best.VmHWM) ? row : best),
       null
@@ -247,6 +254,7 @@ class SharePeak {
       expectedPeakPhase:
         'Hypothesis: measured reopen, where the previous segment seal overlaps the next public lifecycle. Setup, native work, active subscription/retirement and terminal cleanup remain alternative phases; peak.phase tests this without excusing any bytes.',
       errors: [...this.errors],
+      hwmDecreases,
       peak,
       readings,
       interpretation:

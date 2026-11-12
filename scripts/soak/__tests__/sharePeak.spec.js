@@ -5,10 +5,13 @@ const {
   installSharePeak,
 } = require('../sharePeak')
 const {
+  ReferenceControl,
   TelemetryWorker,
   TelemetryWorkerProcess,
   declaredJournalBytes,
 } = require('../telemetryChurn')
+const { PROFILES, TELEMETRY } = require('../soak')
+const { TelemetrySegments } = require('../../../testHelpers/telemetrySegments')
 
 /** @returns {object} deterministic kernel, engine and clock facts */
 const fixture = () => {
@@ -67,20 +70,57 @@ describe('share peak attribution', () => {
     expect(report.peak).toEqual(step)
   })
 
-  test('preserves counter regressions and missing sources as incomplete diagnostic evidence', () => {
+  test('records every VmHWM decrease as complete diagnostic evidence and retains the maximum peak', () => {
+    const { peak, state } = fixture()
+    peak.phase('setup')
+    state.at = 20
+    peak.poll()
+    state.at = 40
+    state.vmhwm = 1600
+    peak.phase('reopen', 6)
+    state.at = 60
+    state.vmhwm = 1450
+    state.vmrss = 1005
+    peak.phase('retire', 7)
+    state.at = 80
+    state.vmhwm = 1400
+    state.vmrss = 1004
+    peak.poll()
+    state.at = 100
+    state.vmhwm = 1500
+    peak.poll()
+    state.at = 120
+    state.vmhwm = 1300
+    state.vmrss = 990
+    peak.phase('cleanup')
+    const report = JSON.parse(JSON.stringify(peak.report()))
+    expect(report.complete).toBe(true)
+    expect(report.errors).toEqual([])
+    expect(report.hwmDecreases).toEqual([
+      { index: 2, phase: 'retire', before: 1600, after: 1450, VmRSS: 1005 },
+      { index: 3, phase: 'retire', before: 1450, after: 1400, VmRSS: 1004 },
+      { index: 5, phase: 'cleanup', before: 1500, after: 1300, VmRSS: 990 },
+    ])
+    expect(report.readings.map((row) => row.VmHWM)).toEqual([1200, 1600, 1450, 1400, 1500, 1300])
+    expect(report.peak).toMatchObject({ index: 1, phase: 'reopen', VmHWM: 1600 })
+    expect(report.peak).toEqual(report.readings[1])
+  })
+
+  test('keeps missing sources incomplete without inventing a VmHWM decrease', () => {
     const { peak, state } = fixture()
     peak.poll()
-    state.at = 20
-    state.vmhwm = 1100
-    peak.poll()
-    expect(peak.report()).toMatchObject({ complete: false })
-    expect(peak.report().readings.at(-1).VmHWM).toBe(1100)
     peak.proc = () => null
-    state.at = 40
+    state.at = 20
     peak.poll()
-    expect(peak.report().errors).toEqual(
-      expect.arrayContaining(['VmHWM decreased', 'proc status unavailable'])
-    )
+    state.at = 40
+    peak.proc = () => ({ vmrss: 1000, vmhwm: 1100 })
+    peak.poll()
+    const report = peak.report()
+    expect(report.complete).toBe(false)
+    expect(report.readings[1].VmHWM).toBe(null)
+    expect(report.errors).toEqual(['proc status unavailable'])
+    expect(report.hwmDecreases).toEqual([])
+    expect(report.peak.VmHWM).toBe(1200)
   })
 
   test('prefills bounded diagnostic storage without changing the original reserve and fails overflow', () => {
@@ -148,6 +188,91 @@ describe('share peak attribution', () => {
     expect(worker.registry.fill).toHaveBeenCalledTimes(1)
     expect(worker.registry.replace).toHaveBeenCalledWith(6)
     expect(worker.segments.cycle).toHaveBeenCalledWith(client, { timeout: 3000 })
+  })
+
+  test('marks exported verdict inputs only while a share peak recorder is active', async () => {
+    const snapshot = { journals: { byteLength: 4096, cursor: 0 } }
+    const run = {
+      baseline: snapshot,
+      samples: [{ admittedPhaseMs: 60000, phaseMs: 60300, snapshot }],
+      teardown: snapshot,
+    }
+    const ordinary = {
+      clientCount: 1,
+      baseline: snapshot,
+      samples: [{ admittedAtMs: 60000, completedAtMs: 60300, atMs: 60300, snapshot }],
+      teardown: snapshot,
+      measurementMs: 300000,
+      cleanupMs: 1000,
+      reference: {},
+      sampler: { skipped: [], readFailures: [] },
+    }
+    jest.spyOn(ReferenceControl.prototype, 'run').mockResolvedValue({ manifest: {} })
+    jest.spyOn(TelemetrySegments, 'ordinary').mockReturnValue({})
+    try {
+      for (const active of [false, true]) {
+        const messages = []
+        const verdict = { ok: true, outcome: 'passed', violations: [] }
+        const owner = new TelemetryWorkerProcess({
+          kind: 'shareConsumer',
+          soak: {
+            TELEMETRY,
+            PROFILES,
+            logLevel: { NOTHING: 0 },
+            instrument: () => ({ kafka: { shareConsumer: () => ({}) } }),
+            sharePeak: () => (active ? fixture().peak : null),
+            SharePeakWorker: class {
+              constructor() {
+                this.timing = { measurementMs: 300000, cleanupMs: 1000 }
+                this.claims = { foreground: [] }
+              }
+
+              async prepare() {
+                return 'uuid'
+              }
+
+              facts() {
+                return {}
+              }
+            },
+            TelemetryResourceVerdict: { evaluate: () => verdict },
+            Soak: class {
+              constructor({ judge }) {
+                this.judge = judge
+                this.skipped = []
+                this.readFailures = []
+              }
+
+              async run() {
+                return this.judge(run)
+              }
+            },
+          },
+          proc: {
+            on() {},
+            send(message, callback) {
+              messages.push(JSON.parse(JSON.stringify(message)))
+              callback?.()
+            },
+          },
+          env: {},
+        })
+        owner.stamps = () => ({})
+        owner.reference = () => ({})
+        owner.inbox.push({ type: 'config', stem: 'peak', topic: 'topic', group: 'group' })
+        owner.inbox.push({ type: 'start' })
+        await expect(owner.run()).resolves.toEqual(verdict)
+        const result = messages.find((message) => message.type === 'result')
+        expect(JSON.stringify(result.input)).toBe(
+          JSON.stringify({
+            ...ordinary,
+            ...(active && { diagnostic: true, acceptanceEligible: false }),
+          })
+        )
+      }
+    } finally {
+      jest.restoreAllMocks()
+    }
   })
 
   test('installs only in diagnostic share children and leaves the judged input contract unchanged', () => {

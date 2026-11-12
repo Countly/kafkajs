@@ -328,6 +328,8 @@ const TELEMETRY_ROLES = Object.freeze([
 class TelemetryResourceVerdict {
   /**
    * @param {object} run observed, serializable evidence, never expected input counts
+   * @param {boolean} [run.diagnostic] true excludes the input from acceptance
+   * @param {boolean} [run.acceptanceEligible] false excludes the input from acceptance
    * @param {number} run.clientCount clients measured in this process, 1 on the live profile
    * @param {object} run.baseline disconnected descriptor/UUID baseline after warm-up
    * @param {Array<{admittedAtMs:number, completedAtMs:number, snapshot:object}>} run.samples
@@ -345,6 +347,8 @@ class TelemetryResourceVerdict {
    * @throws {TypeError} for a missing evidence container; callers fail the run
    */
   static evaluate({
+    diagnostic,
+    acceptanceEligible,
     clientCount,
     baseline,
     samples,
@@ -368,6 +372,10 @@ class TelemetryResourceVerdict {
     const finiteBytes = (value) => Number.isSafeInteger(value) && value >= 0
     const baselineBytes = bytes(baseline)
     const closedBytes = bytes(teardown)
+    fail(
+      diagnostic !== true && acceptanceEligible !== false,
+      'diagnostic inputs are not acceptance-eligible'
+    )
     fail(Number.isInteger(clientCount) && clientCount >= 1 && clientCount <= 4, 'client count')
     fail(finiteBytes(baselineBytes) && finiteBytes(closedBytes), 'settled baseline and teardown')
     fail(
