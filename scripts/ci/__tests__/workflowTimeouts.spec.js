@@ -19,9 +19,9 @@ describe('Workflow timeouts', () => {
     // eslint-disable-next-line no-template-curly-in-string -- GitHub expression is literal YAML data
     expect(job.env.SHARE_PEAK_ARM).toBe('${{ matrix.arm }}')
     for (const step of job.steps) {
+      expect(step['timeout-minutes']).toBeGreaterThan(0)
       if (step.run) {
         expect(step.run).not.toContain('${{')
-        expect(step['timeout-minutes']).toBeGreaterThan(0)
       }
     }
     expect(job.steps.some((step) => step.run?.includes('sharePeakDiagnostic.js'))).toBe(true)
@@ -38,6 +38,7 @@ describe('Workflow timeouts', () => {
       .join('\n')
     expect(commands).toContain('activeDiagnostic.js --diagnostic-only')
     expect(commands).not.toMatch(/docker|jest|\$\{\{/)
+    for (const step of job.steps) expect(step['timeout-minutes']).toBeGreaterThan(0)
     expect(job.steps.find((step) => step.uses === 'actions/upload-artifact@v4').if).toBe('always()')
     expect(jobs.verdict.needs).not.toContain('active-owner-census')
   })
@@ -52,7 +53,10 @@ describe('Workflow timeouts', () => {
     expect(run['timeout-minutes']).toBe(100)
     expect(run.run).toContain('timeout -k 10s 5900s node scripts/e2e/telemetry/warmupWitness.js')
     expect(job.steps.some((step) => /docker|compose|java|jest/.test(step.run || ''))).toBe(false)
-    for (const step of job.steps) if (step.run) expect(step.run).not.toContain('$' + '{{')
+    for (const step of job.steps) {
+      expect(step['timeout-minutes']).toBeGreaterThan(0)
+      if (step.run) expect(step.run).not.toContain('$' + '{{')
+    }
     expect(job.steps.find((step) => step.uses === 'actions/upload-artifact@v4').if).toBe('always()')
     expect(jobs.verdict.needs).toContain('warmup-witnesses')
   })
