@@ -25,7 +25,12 @@ const verifyMemoryScenario = (record, directory) => {
   const transcripts = Object.fromEntries(
     Object.entries(manifest.owners).map(([owner, file]) => [owner, read(file)])
   )
-  const ownership = (owner, refusal) => ordinaryOwnership(transcripts[owner], { refusal })
+  const ownership = (owner, refusal) =>
+    ordinaryOwnership(transcripts[owner], {
+      owner,
+      clientId: `${record.run.stem}-${owner}`,
+      refusal,
+    })
   if (manifest.scenario === 'telemetry-shutdown') {
     for (const segment of manifest.segments) {
       const transcript = read(segment.transcript)

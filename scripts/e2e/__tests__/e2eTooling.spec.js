@@ -3072,17 +3072,24 @@ describe('complete telemetry evidence controls', () => {
 describe('physical telemetry absence controls', () => {
   const { ordinaryOwnership } = require('../telemetry/semantics')
   test('rejects an additional socket that sent only setup frames', () => {
+    const identity = { owner: 'producer', clientId: 'foreground' }
     const baseline = {
-      records: [{ type: 'request', apiKey: 18, socketId: 1 }],
+      owner: 'producer',
+      records: [
+        { type: 'request', owner: 'producer', clientId: 'foreground', apiKey: 18, socketId: 1 },
+      ],
       sockets: [{ id: 1, node: '1', kind: 'normal', foregroundBootstrap: true }],
     }
-    expect(ordinaryOwnership(baseline)).toEqual(['1:bootstrap'])
+    expect(ordinaryOwnership(baseline, identity)).toEqual(['1:bootstrap'])
     for (const kind of ['undecided', 'normal', 'telemetry'])
       expect(() =>
-        ordinaryOwnership({
-          ...baseline,
-          sockets: [...baseline.sockets, { id: 2, node: '1', kind }],
-        })
+        ordinaryOwnership(
+          {
+            ...baseline,
+            sockets: [...baseline.sockets, { id: 2, node: '1', kind }],
+          },
+          identity
+        )
       ).toThrow()
   })
 })
