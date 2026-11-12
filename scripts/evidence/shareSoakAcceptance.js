@@ -187,12 +187,24 @@ const scheduleProblems = (done, prime) => {
 }
 
 /**
+ * Compares the public topic/partition set with admin rows that also carry a topic UUID.
+ * Keeps duplicate entries visible; only topic and partition order are immaterial.
+ * @param {object[]} assignment Original public or admin assignment.
+ * @returns {object[]} Comparable topic names and sorted partition lists.
+ */
+const normalizeAssignment = (assignment) =>
+  assignment
+    .map(({ topic, partitions }) => ({ topic, partitions: [...partitions].sort((a, b) => a - b) }))
+    .sort((a, b) => a.topic.localeCompare(b.topic))
+
+/**
  * Requires primitive producer acknowledgements and decoded raw records before reading summaries.
  * @param {object[]} rows One scope's ordered original observations.
  * @param {object} completion Scope completion row.
  * @returns {string[]} Independent cycle, final, schedule and cleanup failures.
  */
 const scopeProblems = (rows, completion, contract) => {
+  const configuration = rows.find((r) => r.event === 'soak-configuration')?.config
   const problems = []
   const fail = (message) => problems.push(message)
   const original = rows.filter((r) => r.event === 'soak-original-cycle')
@@ -340,11 +352,16 @@ const scopeProblems = (rows, completion, contract) => {
         const actual = barrier.described.map((m) => m.memberId).sort()
         if (
           !same(ids, actual) ||
+          barrier.described.some((member) =>
+            member.assignment.some(({ topicId }) => !topicId || topicId !== configuration?.topicId)
+          ) ||
           barrier.members.some(
             (m) =>
               !same(
-                m.assignment,
-                barrier.described.find((b) => b.memberId === m.memberId)?.assignment
+                normalizeAssignment(m.assignment),
+                normalizeAssignment(
+                  barrier.described.find((b) => b.memberId === m.memberId)?.assignment ?? []
+                )
               )
           )
         )
