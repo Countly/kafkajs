@@ -1,5 +1,9 @@
-// eslint-disable-next-line n/no-missing-require -- implementation follows in the green commit
-const { SharePeak, DisabledShareWorker, installSharePeak } = require('../sharePeak')
+const {
+  SharePeak,
+  DisabledShareWorker,
+  DisabledShareRegistry,
+  installSharePeak,
+} = require('../sharePeak')
 const {
   TelemetryWorker,
   TelemetryWorkerProcess,
@@ -150,10 +154,47 @@ describe('share peak attribution', () => {
     const processOwner = { kind: 'shareConsumer', soak: {} }
     installSharePeak(processOwner, 'disabled')
     expect(processOwner.soak.SharePeakWorker).toBe(DisabledShareWorker)
+    const kafka = { shareConsumer: jest.fn() }
+    processOwner.create(kafka, { group: 'same-group' })
+    expect(kafka.shareConsumer).toHaveBeenCalledWith({
+      enableMetricsPush: false,
+      groupId: 'same-group',
+    })
+    const registry = new DisabledShareRegistry(
+      {
+        registerMetricForSubscription: () => {
+          throw new Error('disabled')
+        },
+      },
+      'shareConsumer'
+    )
+    registry.fill()
+    const before = registry.digest(null)
+    registry.replace(6)
+    registry.restore()
+    expect(registry.registered).toHaveLength(128)
+    expect(registry.digest(null)).toBe(before)
     expect(typeof processOwner.soak.sharePeak).toBe('function')
     const other = { kind: 'producer', soak: {} }
     installSharePeak(other, 'enabled')
     expect(other.soak).toEqual({})
+    const send = jest.fn()
+    const owner = new TelemetryWorkerProcess({
+      kind: 'shareConsumer',
+      soak: {},
+      proc: { send },
+      env: {},
+    })
+    const { peak } = fixture()
+    owner.peak = peak
+    const snapshot = Object.freeze({ memory: Object.freeze({ hwm: 1200 }) })
+    const row = Object.freeze({ kind: 'baseline', snapshot })
+    owner.progress(row)
+    expect(send.mock.calls[0][0].row).toBe(row)
+    expect(row.snapshot).toBe(snapshot)
+    expect(row).not.toHaveProperty('shadow')
+    expect(snapshot).not.toHaveProperty('sharePeak')
+    expect(peak.report().readings[0].phase).toBe('M')
     expect(TelemetryWorkerProcess.prototype).not.toHaveProperty('sharePeak')
     expect(() => installSharePeak(processOwner, 'unknown')).toThrow('share peak arm')
   })

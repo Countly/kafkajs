@@ -2753,6 +2753,7 @@ class TelemetryWorker {
    *   delivers a message to the parent
    * @param {function(Function):*} [options.target] runs a public client call under the target role
    * @param {ShareLedger} [options.ledger] the share ledger of a share consumer
+   * @param {object} [options.peak] diagnostic-only share phase recorder
    * @param {object} [options.schedule] a `TelemetrySchedule`
    * @param {{manifest:object, prefix:string}} [options.foreground] the control's frozen catalogue,
    *   replayed once by the enabled client during setup
@@ -2773,6 +2774,7 @@ class TelemetryWorker {
     ledger = null,
     schedule,
     foreground = null,
+    peak = null,
   }) {
     Object.assign(this, {
       kind,
@@ -2789,6 +2791,7 @@ class TelemetryWorker {
       target,
       ledger,
       foreground,
+      peak,
     })
     this.schedule = schedule ?? new TelemetrySchedule(limits)
     this.uuid = null
@@ -3172,6 +3175,10 @@ class TelemetryWorker {
       this.fenceConfirmation(command)
       return
     }
+    this.peak?.phase(
+      { lifecycle: 'reopen', retire: 'retire', confirm: 'subscription' }[command.stage],
+      command.tick
+    )
     const startedAt = command.stage === 'confirm' ? this.confirmation?.receivedAt : this.clock.now()
     if (command.stage === 'lifecycle') await this.reopen(command)
     else if (command.stage === 'retire') await this.retire(command)
@@ -3182,6 +3189,7 @@ class TelemetryWorker {
     const doneAt = this.clock.now()
     this.stages.push({ tick: command.tick, stage: command.stage, startedAt, doneAt })
     this.send({ type: 'stage-done', tick: command.tick, stage: command.stage, startedAt, doneAt })
+    this.peak?.phase('active')
   }
 
   /**
@@ -3197,11 +3205,15 @@ class TelemetryWorker {
     if (ms !== warmupMs + measureMs) throw new Error('Telemetry churn runs its fixed 360000 ms')
     const errors = []
     this.timing.phaseAt = this.sampler.phaseStartedAt
+    this.peak?.window(this.timing.phaseAt, this.limits.warmupMs)
+    this.peak?.phase('await-go')
     this.send({ type: 'phase', at: this.timing.phaseAt, uuid: this.uuid })
     try {
       await this.inbox.take((m) => m.type === 'go')
       this.timing.goAt = this.clock.now()
+      this.peak?.phase('begin')
       await this.begin()
+      this.peak?.phase('active')
       for (;;) {
         const command = await this.inbox.take((m) =>
           ['confirm-fence', 'stage', 'corpus', 'finish'].includes(m.type)
@@ -3233,6 +3245,7 @@ class TelemetryWorker {
         errors.push(error)
       }
     }
+    this.peak?.phase('cleanup')
     this.timing.boundaryAt = this.clock.now()
     this.timing.measurementMs = this.timing.boundaryAt - this.timing.phaseAt - this.limits.warmupMs
     await attempt(() => this.sampler.endSampling())
@@ -4254,6 +4267,7 @@ class TelemetryChurn {
       sealed: failure?.facts?.sealed ?? progress.filter((m) => m.sealed).map((m) => m.sealed),
       rows: progress.filter((m) => m.row).map((m) => m.row),
       failures: failure?.failures ?? [],
+      ...(failure?.shadow && { shadow: failure.shadow }),
       exit,
     }
   }
@@ -4418,6 +4432,8 @@ class TelemetryWorkerProcess {
    * @returns {void}
    */
   progress(row, seed) {
+    if (row.kind === 'baseline') this.peak?.phase('M')
+    if (row.kind === 'teardown') this.peak?.phase('closed')
     this.send({ type: 'progress', row })
     if (row.kind === 'sample') seed?.retain()
   }
@@ -4530,6 +4546,8 @@ class TelemetryWorkerProcess {
       capacity: NATIVE_ROWS,
       set: (fn, ms) => resources.as('fixture:native-sampler', () => setInterval(fn, ms)),
     })
+    const peak = soak.sharePeak?.({ sampler, limits: soak.TELEMETRY }) ?? null
+    this.peak = peak
     let segments = null
     const journal = new NativeJournal({
       memory,
@@ -4573,9 +4591,12 @@ class TelemetryWorkerProcess {
         engine,
       ])
       resources.start()
+      if (peak) resources.as('fixture:share-peak', () => peak.start())
+      peak?.phase('loaded')
       const loaded = readMemory('loaded', () => this.clock.now())
       engine.record(loaded)
       const host = { before: hostContext(() => this.clock.now()) }
+      peak?.phase('control')
       const control = await new ReferenceControl({
         kind,
         config,
@@ -4588,6 +4609,7 @@ class TelemetryWorkerProcess {
         collections: () => memory.collections,
         engine,
       }).run()
+      peak?.phase('setup')
       host.boundary = hostContext(() => this.clock.now())
       journal.observe('gzip', gzipCodec)
       journal.observe('zstd', zstdCodec)
@@ -4615,12 +4637,16 @@ class TelemetryWorkerProcess {
       const client = this.create(kafka, config)
       ordinary.client = client
       const owned = segments
-      worker = new TelemetryWorker({
+      const WorkerRegistry = soak.SharePeakRegistry ?? Registry
+      const Worker = soak.SharePeakWorker ?? TelemetryWorker
+      worker = new Worker({
         kind,
         client,
         tap,
         segments,
-        registry: new Registry(client, kind, DESCRIPTORS, this.clock, () => writeFence(owned)),
+        registry: new WorkerRegistry(client, kind, DESCRIPTORS, this.clock, () =>
+          writeFence(owned)
+        ),
         clock: this.clock,
         sleep: this.sleep,
         limits: soak.TELEMETRY,
@@ -4631,6 +4657,7 @@ class TelemetryWorkerProcess {
         ledger,
         foreground: { manifest: control.manifest, prefix: `${config.stem}:ctl-on` },
         ordinary,
+        peak,
       })
       const uuid = await worker.prepare()
       const measured = {
@@ -4704,7 +4731,11 @@ class TelemetryWorkerProcess {
           sampler: { skipped: run.skipped, readFailures: run.readFailures },
         }
         const judged = JournalConstancy.apply(soak.TelemetryResourceVerdict.evaluate(input), input)
-        shadow = engine.report(input.samples)
+        if (peak) {
+          peak.phase('final')
+          peak.stop()
+        }
+        shadow = { ...engine.report(input.samples), ...(peak && { sharePeak: peak.report() }) }
         return judged
       }
       const soakRun = new soak.Soak({
@@ -4754,10 +4785,12 @@ class TelemetryWorkerProcess {
       } catch (factError) {
         causes.push(factError)
       }
+      peak?.stop()
       await this.send(
         {
           type: 'failure',
           facts,
+          ...(peak && { shadow: { sharePeak: peak.report() } }),
           native: { journal: journal.summary(), sampler: sampler.summary() },
           failures: causes.map((cause) => ({
             name: cause?.name ?? typeof cause,
@@ -4771,6 +4804,7 @@ class TelemetryWorkerProcess {
         { flush: true }
       )
     } finally {
+      peak?.stop()
       sampler.stop()
       journal.restoreAll()
       memory.stop()
