@@ -125,9 +125,13 @@ class LongWindowDiagnostic {
     } finally {
       await owner.close()
     }
-    const reports = result.workers.map((worker) => this.reportOf(worker, result.oracle))
+    const workers = result.workers.map((worker) => ({
+      ...worker,
+      execArgv: result.archive.handshakes.find((row) => row.kind === worker.kind)?.execArgv ?? null,
+    }))
+    const reports = workers.map((worker) => this.reportOf(worker, result.oracle))
     this.write('long-window.json', { workers: reports })
-    this.write('workers.json', { workers: result.workers.map((worker) => this.archiveOf(worker)) })
+    this.write('workers.json', { workers: workers.map((worker) => this.archiveOf(worker)) })
     this.write('result.json', {
       ok: result.ok,
       violations: result.violations,
@@ -144,34 +148,38 @@ class LongWindowDiagnostic {
   }
 
   /**
-   * @param {object} worker a worker entry of the churn result
+   * @param {object} worker a churn worker with `execArgv` from its own handshake
    * @param {object} oracle the independent durability oracle of the run
    * @returns {object} its shadow report; missing or invalid functional evidence is incomplete
    */
   reportOf(worker, oracle) {
     const { ShadowReport, LONG_WINDOW } = this.modules
-    const { input, facts, shadow, seed } = worker
+    const { input, facts, shadow, seed, execArgv = null } = worker
     const head = {
       scope: 'shadow',
       acceptance: false,
       diagnostic: true,
       kind: worker.kind,
       arm: this.arm,
+      execArgv,
     }
     if (!input || !facts?.timing) return { ...head, complete: false, error: 'no worker result' }
     try {
       const violations = this.functionalViolations(worker, oracle)
       if (violations.length) throw new Error(`functional failure: ${violations.join('; ')}`)
-      return ShadowReport.of({
-        kind: worker.kind,
-        arm: this.arm,
-        samples: input.samples,
-        engine: shadow?.engine,
-        heapSpaces: shadow?.heapSpaces,
-        stages: facts.stages,
-        endAt: facts.timing.phaseAt + LONG_WINDOW.warmupMs + LONG_WINDOW.measureMs,
-        seed: seed ?? null,
-      })
+      return {
+        ...ShadowReport.of({
+          kind: worker.kind,
+          arm: this.arm,
+          samples: input.samples,
+          engine: shadow?.engine,
+          heapSpaces: shadow?.heapSpaces,
+          stages: facts.stages,
+          endAt: facts.timing.phaseAt + LONG_WINDOW.warmupMs + LONG_WINDOW.measureMs,
+          seed: seed ?? null,
+        }),
+        execArgv,
+      }
     } catch (error) {
       return { ...head, complete: false, error: error.message }
     }
@@ -181,10 +189,15 @@ class LongWindowDiagnostic {
    * Checks run correctness without consulting the intentionally ineligible resource verdict.
    * @param {object} worker a worker entry of the churn result
    * @param {object} oracle the independent durability oracle of the run
-   * @returns {string[]} functional, oracle and journal failures
+   * @returns {string[]} worker flag, functional, oracle and journal failures
    */
-  functionalViolations({ input, facts, shadow, exit }, oracle) {
+  functionalViolations({ input, facts, shadow, exit, execArgv }, oracle) {
     const violations = JournalConstancy.violations(input)
+    if (
+      !Array.isArray(execArgv) ||
+      !this.modules.LONG_WINDOW.v8Flags.every((flag) => execArgv.includes(flag))
+    )
+      violations.push('missing long-window worker flag --no-flush-bytecode')
     if (oracle?.ok !== true || oracle.violations?.length !== 0)
       violations.push(`durability oracle: ${oracle?.violations?.join(', ') || 'missing or failed'}`)
     if (facts.requirements?.ok !== true || facts.requirements.violations?.length !== 0)
@@ -221,9 +234,10 @@ class LongWindowDiagnostic {
    *   verdict, its exit, its engine and heap-space rows and its stage times, without the id ledgers
    */
   archiveOf(worker) {
-    const { kind, uuid, exit, result, input, shadow, seed, facts } = worker
+    const { kind, uuid, exit, result, input, shadow, seed, facts, execArgv } = worker
     return {
       kind,
+      execArgv,
       uuid,
       exit,
       result,

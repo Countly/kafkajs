@@ -23,18 +23,22 @@ const REPLICATES = [1, 2, 3]
 const keyOf = (parts) => JSON.stringify(parts)
 
 /**
- * Indexes one frozen collection without combining commits, runtimes or duplicate downloads.
+ * Indexes one frozen candidate without combining versions, commits, runtimes or duplicate downloads.
+ * Unversioned records belong to candidate v1.
  * @param {object[]} records the diagnostic job records
  * @returns {Map<string, object>} workers by Node major, Kafka, arm, replicate and kind
- * @throws {Error} for duplicate identities, mixed commits/runtimes or an unexpected matrix tuple
+ * @throws {Error} for duplicate identities, mixed candidates, commits or runtimes, or an unexpected tuple
  */
 const observationsOf = (records) => {
   const observations = new Map()
   const identities = new Set()
   const runtimes = new Map()
+  const versions = new Set()
   let commit = null
   for (const record of records) {
     const { node, kafka, arm, replicate, workers } = record
+    versions.add(record.candidate?.version ?? 1)
+    if (versions.size > 1) throw new Error('mixed candidate versions in long-window collection')
     const sha = record.sha ?? record.tree
     const major = /^v(\d+)\./.exec(node)?.[1]
     if (typeof sha !== 'string' || !sha.length) throw new Error('missing collection commit')

@@ -25,6 +25,8 @@ const MINUTE_MS = 60000
  * are what the longer run needs to keep the existing journals, segments and IPC bounds from overflowing.
  */
 const LONG_WINDOW = Object.freeze({
+  version: 2,
+  v8Flags: Object.freeze(['--no-flush-bytecode']),
   env: 'TELEMETRY_LONG_WINDOW',
   arms: Object.freeze(['unseeded', 'seeded', 'warmup-seed']),
   warmupMs: 420000,
@@ -150,7 +152,8 @@ const identityOf = ({ arm, replicate, tree, env = process.env }) => {
     throw new Error(`Invalid long-window replicate ${replicate}`)
   if (typeof tree !== 'string' || tree.length === 0)
     throw new Error('A long-window record needs its commit')
-  const { warmupMs, measureMs, sampleMs, reopenMs, corpusRecords, thresholds } = LONG_WINDOW
+  const { version, v8Flags, warmupMs, measureMs, sampleMs, reopenMs, corpusRecords, thresholds } =
+    LONG_WINDOW
   return {
     diagnostic: true,
     scope: 'shadow',
@@ -164,8 +167,10 @@ const identityOf = ({ arm, replicate, tree, env = process.env }) => {
     node: process.version,
     v8: process.versions.v8,
     kafka: env.KAFKA_VERSION,
-    flags: ['--expose-gc'],
+    flags: ['--expose-gc', ...v8Flags],
     candidate: {
+      version,
+      v8Flags,
       warmupMs,
       measureMs,
       sampleMs,
