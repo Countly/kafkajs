@@ -1,6 +1,7 @@
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
+const vm = require('node:vm')
 const { LongWindowDiagnostic } = require('../longWindowDiagnostic')
 const { LONG_WINDOW, ShadowReport, identityOf } = require('../longWindow')
 
@@ -140,6 +141,18 @@ describe('long-window driver', () => {
       (worker) => {
         worker.exit.killed = true
       },
+      ...[
+        { event: 'timeout' },
+        { signal: 'SIGKILL' },
+        { stderrBytes: 1 },
+        { unhandled: 1 },
+        { receipts: 0 },
+        { receipts: 2 },
+        { aborted: true },
+        { watchdogExpired: true },
+        { afterDisconnectMs: null },
+        { afterDisconnectMs: -1 },
+      ].map((exit) => (worker) => Object.assign(worker.exit, exit)),
       (worker) => {
         worker.shadow.complete = false
       },
@@ -246,5 +259,116 @@ describe('long-window driver', () => {
     expect(() => driver('warmup-seed').verify(reports({ tripped: false }))).toThrow(
       'did not trip the first-use bound for producer, consumer, admin, shareConsumer'
     )
+  })
+})
+
+/**
+ * Executes the real CLI completion handlers with a broker-free fulfilled or rejected driver.
+ * @param {object} options worker environment, resource verdict and optional execution failure
+ * @returns {Promise<object>} process exit status and unchanged output of the CLI
+ */
+const cliOf = async ({ env = {}, verdict = { ok: false }, error, profile = 'telemetry' } = {}) => {
+  const source = fs.readFileSync(path.join(__dirname, '../soak.js'), 'utf8')
+  const mainModule = {}
+  const load = Object.assign(
+    (name) => {
+      if (name === './telemetryChurn') return { KINDS }
+      throw new Error(`Unexpected CLI dependency ${name}`)
+    },
+    { main: mainModule }
+  )
+  const proc = { env, argv: ['node', 'soak.js'], send: () => {}, exitCode: undefined }
+  const output = { log: jest.fn(), error: jest.fn() }
+  await vm.runInNewContext(source.slice(source.lastIndexOf('if (require.main === module)')), {
+    require: load,
+    module: mainModule,
+    process: proc,
+    console: output,
+    LongWindow: require('../longWindow'),
+    parseArgs: () => ({ profile, phaseSeconds: null }),
+    main: async () => {
+      if (error) throw error
+      return verdict
+    },
+  })
+  return { proc, output }
+}
+
+describe('long-window worker CLI', () => {
+  test('exits zero after successful diagnostic execution for every kind while preserving the failed resource verdict', async () => {
+    const verdict = {
+      ok: false,
+      outcome: 'failed',
+      violations: [
+        'diagnostic inputs are not acceptance-eligible',
+        'post-GC sample shape or retained state',
+      ],
+    }
+    for (const kind of KINDS) {
+      const { proc, output } = await cliOf({
+        env: { TELEMETRY_LONG_WINDOW: '1', TELEMETRY_WORKER_KIND: kind },
+        verdict,
+      })
+      expect(proc.exitCode).toBe(0)
+      expect(output.log).toHaveBeenCalledWith(JSON.stringify(verdict))
+      expect(output.error).not.toHaveBeenCalled()
+      expect(verdict.ok).toBe(false)
+    }
+  })
+
+  test('keeps failed verdicts fatal outside the long worker and keeps execution failures fatal inside it', async () => {
+    for (const env of [
+      {},
+      { TELEMETRY_WORKER_KIND: 'producer' },
+      { TELEMETRY_LONG_WINDOW: '0', TELEMETRY_WORKER_KIND: 'producer' },
+      { TELEMETRY_LONG_WINDOW: '1' },
+      { TELEMETRY_LONG_WINDOW: '1', TELEMETRY_WORKER_KIND: 'foreign' },
+    ]) {
+      expect((await cliOf({ env })).proc.exitCode).toBe(1)
+      expect((await cliOf({ env, verdict: { ok: true } })).proc.exitCode).toBe(0)
+    }
+    const env = { TELEMETRY_LONG_WINDOW: '1', TELEMETRY_WORKER_KIND: 'producer' }
+    expect((await cliOf({ env, profile: 'idle' })).proc.exitCode).toBe(1)
+    const failure = new Error('functional workload failed')
+    const { proc, output } = await cliOf({ env, error: failure })
+    expect(proc.exitCode).toBe(1)
+    expect(output.error).toHaveBeenCalledWith(failure)
+    expect(output.log).not.toHaveBeenCalled()
+  })
+})
+
+describe('long-window sample timing', () => {
+  test('never arms a negative sample delay when the clock crosses the grid deadline after an early wake', async () => {
+    const { Soak } = require('../soak')
+    const times = [0, 0, 59999.99, 60000.002508]
+    const clock = { now: () => times.shift() ?? 60000.01 }
+    let finish
+    const workload = new Promise((resolve) => {
+      finish = resolve
+    })
+    const run = new Soak({
+      kafka: {},
+      context: {},
+      phases: [],
+      sampleAt: [60000],
+      settleMs: 0,
+      clock,
+      probe: { snapshot: async () => ({}) },
+      workloads: { idle: () => workload },
+      record: (row) => {
+        if (row.kind === 'sample') {
+          run.sampling = false
+          finish()
+        }
+      },
+    })
+    run.nap = jest.fn(async () => {})
+    await run.runPhase({ name: 'telemetry', workload: 'idle', ms: 1320000 }, 0)
+    expect(run.nap.mock.calls.length).toBeGreaterThanOrEqual(1)
+    for (const [delay] of run.nap.mock.calls) expect(delay).toBeGreaterThanOrEqual(0)
+    expect(run.samples).toHaveLength(1)
+    expect(run.samples[0].admittedPhaseMs).toBeGreaterThanOrEqual(60000)
+    expect(run.skipped).toEqual([])
+    expect(run.readFailures).toEqual([])
   })
 })
