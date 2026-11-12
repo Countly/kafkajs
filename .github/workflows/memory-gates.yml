@@ -222,6 +222,7 @@ jobs:
             fs.writeFileSync(zip, bytes)
             const entries = execFileSync('unzip', ['-Z1', zip], { encoding: 'utf8' }).trim().split('\n')
             if (entries.some(name => name.startsWith('/') || name.split('/').includes('..'))) throw new Error('Unsafe archive path')
+            fs.mkdirSync('.tmp/download', { recursive: true })
             execFileSync('unzip', ['-q', zip, '-d', '.tmp/download'])
             fs.writeFileSync(`${process.env.RUNNER_TEMP}/share-soak-provenance.json`, JSON.stringify({
               repository: `${context.repo.owner}/${context.repo.repo}`, runId: context.runId, attempt,
