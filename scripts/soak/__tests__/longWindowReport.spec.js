@@ -28,6 +28,7 @@ const recordOf = ({ node, kafka = '4.3.1', arm, replicate = 1, workers }) => ({
   node: `v${node}.1.0`,
   kafka,
   tree: 'a'.repeat(40),
+  sha: 'a'.repeat(40),
   workers,
 })
 
@@ -96,7 +97,7 @@ describe('long-window report', () => {
 
   test('fails S3 and counts the S2 misses of a Node whose unseeded replicates scatter', () => {
     const { nodes } = summarise(matrix(24, (k, i, r) => 10 + (r - 1) * 30, 120))
-    expect(nodes['24'].s2).toEqual({ pass: 16, total: 24 })
+    expect(nodes['24'].s2).toMatchObject({ status: 'fail', pass: 16, total: 24 })
     expect(nodes['24'].s3).toMatchObject({
       status: 'fail',
       sd: 30,
@@ -109,7 +110,7 @@ describe('long-window report', () => {
   test('reports S3 as undecidable with one replicate per tuple', () => {
     const { nodes } = summarise(matrix(26, () => 10, 120, 1))
     expect(nodes['26'].s3).toMatchObject({ status: 'insufficient', sd: null })
-    expect(nodes['26'].s1).toEqual({ pass: 8, total: 8 })
+    expect(nodes['26'].s1).toMatchObject({ status: 'insufficient', pass: 8, total: 24 })
   })
 
   test('pools the within-tuple deviation over the degrees of freedom of every tuple', () => {
@@ -129,8 +130,68 @@ describe('long-window report', () => {
     const { nodes } = summarise(records)
     expect(nodes['22'].incomplete).toBe(1)
     expect(nodes['22'].masked).toBe(3)
-    expect(nodes['22'].s2.total).toBe(23)
+    expect(nodes['22'].s2).toMatchObject({ status: 'insufficient', pass: 23, total: 24 })
+    expect(nodes['22'].s3.status).toBe('insufficient')
     expect(nodes['22'].s3.unseededMean).toBeLessThan(50)
+  })
+
+  test('rejects duplicate downloads and duplicate worker identities instead of pooling them', () => {
+    const records = matrix(22, () => 10, 120)
+    expect(() => summarise([...records, JSON.parse(JSON.stringify(records[0]))])).toThrow(
+      /duplicate.*identity/i
+    )
+    records[0].workers.push({ ...records[0].workers[0] })
+    expect(() => summarise(records)).toThrow(/duplicate.*identity/i)
+  })
+
+  test('requires every Kafka, arm, kind and replicate observation before S1, S2 or S3 can pass', () => {
+    const missingJob = matrix(22, () => 10, 120).filter(
+      (record) => !(record.kafka === '4.3.1' && record.arm === 'seeded' && record.replicate === 3)
+    )
+    const job = summarise(missingJob).nodes['22']
+    expect(job.s1).toMatchObject({ status: 'insufficient', pass: 20, total: 24 })
+    expect(job.s3.status).toBe('insufficient')
+    const missingWorker = matrix(22, () => 10, 120)
+    missingWorker[0].workers.pop()
+    const worker = summarise(missingWorker).nodes['22']
+    expect(worker.s2).toMatchObject({ status: 'insufficient', pass: 23, total: 24 })
+    expect(worker.missing).toBe(1)
+    expect(worker.s3.status).toBe('insufficient')
+    const twoReplicates = summarise(matrix(22, () => 10, 120, 2)).nodes['22']
+    expect(twoReplicates.s3.status).toBe('insufficient')
+    expect(twoReplicates.s2).toMatchObject({ status: 'insufficient', pass: 16, total: 24 })
+    const oneTuple = summarise(matrix(22, () => 10, 120).slice(0, 6)).nodes['22']
+    expect(oneTuple.s3.status).toBe('insufficient')
+  })
+
+  test('keeps incomplete seeded workers in the expected denominator and makes S3 insufficient', () => {
+    const records = matrix(22, () => 10, 120)
+    records[1].workers[0] = { kind: 'producer', arm: 'seeded', complete: false }
+    const node = summarise(records).nodes['22']
+    expect(node.s1).toMatchObject({ status: 'insufficient', pass: 23, total: 24 })
+    expect(node.incomplete).toBe(1)
+    expect(node.s3.status).toBe('insufficient')
+    expect(render({ nodes: { 22: node } })).toMatch(/23\/24 insufficient/)
+  })
+
+  test('reports entirely missing Nodes and warm-up controls as insufficient', () => {
+    const records = matrix(22, () => 10, 120).filter((record) => record.arm !== 'warmup-seed')
+    const { nodes } = summarise(records)
+    expect(nodes['22'].firstUse).toMatchObject({ status: 'insufficient', tripped: 0, total: 4 })
+    for (const major of ['24', '26']) {
+      expect(nodes[major].s1).toMatchObject({ status: 'insufficient', pass: 0, total: 24 })
+      expect(nodes[major].s2).toMatchObject({ status: 'insufficient', pass: 0, total: 24 })
+      expect(nodes[major].s3.status).toBe('insufficient')
+    }
+  })
+
+  test('refuses to pool different commits or Node runtimes in one collection', () => {
+    const commits = matrix(22, () => 10, 120)
+    commits[0].sha = 'b'.repeat(40)
+    expect(() => summarise(commits)).toThrow(/commit/)
+    const runtimes = matrix(22, () => 10, 120)
+    runtimes[0].node = 'v22.2.0'
+    expect(() => summarise(runtimes)).toThrow(/runtime/)
   })
 
   test('prints one line per Node with S1, S2, masking, first-use trips and S3', () => {
@@ -142,9 +203,9 @@ describe('long-window report', () => {
       ])
     )
     expect(text).toMatch(/diagnostic/)
-    expect(text).toMatch(/^22 +24\/24 +24\/24 +0 +4\/4 +pass/m)
-    expect(text).toMatch(/^24 +24\/24 +16\/24 +0 +4\/4 +fail/m)
-    expect(text).toMatch(/^26 +8\/8 +8\/8 +0 +4\/4 +n\/a/m)
+    expect(text).toMatch(/^22 +24\/24 pass +24\/24 pass +0 +4\/4 pass +pass/m)
+    expect(text).toMatch(/^24 +24\/24 pass +16\/24 fail +0 +4\/4 pass +fail/m)
+    expect(text).toMatch(/^26 +8\/24 insufficient +8\/24 insufficient +0 +4\/4 pass +insufficient/m)
   })
 
   describe('over downloaded artifacts', () => {
