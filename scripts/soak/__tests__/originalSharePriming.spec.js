@@ -159,7 +159,7 @@ describe('two-scope original share driver', () => {
   })
 
   test.each([true, false])(
-    'derives both complete workloads, cleanup and sealed archive verdicts from original operations, short=%s',
+    'derives both complete workloads, UUID-bearing assignments, cleanup and sealed archive verdicts from original operations, short=%s',
     async (short) => {
       let boundaryRoots
       const { owner, rows, result, error, primeRoots } = await originalShareSchedule({
@@ -182,6 +182,18 @@ describe('two-scope original share driver', () => {
         const cycles = original.filter((r) => r.event === 'soak-cycle')
         const done = original.find((r) => ['priming-complete', 'case-complete'].includes(r.event))
         const requests = original.filter((r) => r.event === 'soak-wire' && r.kind === 'request')
+        const barriers = original.filter((r) => r.event === 'soak-membership')
+        const config = original.find((r) => r.event === 'soak-configuration').config
+        expect(barriers).toHaveLength(90)
+        for (const barrier of barriers) {
+          for (const member of barrier.members) {
+            const described = barrier.described.find((m) => m.memberId === member.memberId)
+            expect(member.assignment).toEqual(
+              described.assignment.map(({ topic, partitions }) => ({ topic, partitions }))
+            )
+            expect(described.assignment.every((row) => row.topicId === config.topicId)).toBe(true)
+          }
+        }
         expect(cycles).toHaveLength(30)
         expect(cycles.filter((r) => r.reset)).toHaveLength(10)
         expect(done.cleanup).toMatchObject({ groupsAbsent: true, topicsAbsent: true })
@@ -270,6 +282,26 @@ describe('two-scope original share driver', () => {
             },
             /assignment barriers|ownership differs/,
           ],
+          ...[
+            (r) => {
+              r.described[0].assignment[0].partitions.pop()
+            },
+            (r) => {
+              r.described[0].assignment[0].topic = 'another-topic'
+            },
+            (r) => {
+              r.described[0].memberId = 'another-member'
+            },
+            (r) => {
+              r.described.push(JSON.parse(JSON.stringify(r.described[0])))
+            },
+            (r) => {
+              r.described[0].assignment[0].topicId = '00000000-0000-4000-8000-000000000099'
+            },
+            (r) => {
+              delete r.described[0].assignment[0].topicId
+            },
+          ].map((mutate) => ['soak-membership', mutate, /assignment mismatch/]),
           [
             'soak-reset',
             (r) => {

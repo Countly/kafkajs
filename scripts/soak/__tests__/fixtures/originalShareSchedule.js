@@ -348,7 +348,7 @@ const originalShareSchedule = async ({
               state: members.size ? 'Stable' : 'Empty',
               members: [...members.keys()].map((memberId) => ({
                 memberId,
-                assignment: assignment(memberId),
+                assignment: assignment(memberId).map((row) => ({ ...row, topicId: SOAK_UUID })),
               })),
             },
           ],

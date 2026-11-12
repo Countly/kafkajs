@@ -244,6 +244,7 @@ class SoakTransport {
             MemberId: m.memberId,
             Assignment: {
               TopicPartitions: m.assignment.map((t) => ({
+                TopicId: t.topicId,
                 TopicName: t.topic,
                 Partitions: [...t.partitions],
               })),
