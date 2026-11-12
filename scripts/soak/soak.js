@@ -5696,9 +5696,11 @@ class ShareSoakDriver {
       if (!target) return
       const nodeId = this.nodes.get(fields.endpoint)
       if (step === 'api78-write') {
+        // An attempted write can reach the destroyed stream before its close callback runs.
         if (
           fields.memberId !== target.memberId ||
           fields.groupId !== this.group ||
+          fields.socket === target.socket ||
           postResetNodes.has(fields.endpoint)
         )
           return
