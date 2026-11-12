@@ -295,6 +295,9 @@ describe('long-window acceptance', () => {
         attempt: '1',
         workers: record.workers.map((worker) => ({
           ...worker,
+          diagnostic: false,
+          acceptance: true,
+          scope: 'acceptance',
           execArgv: ['--expose-gc', '--no-flush-bytecode'],
         })),
       }))
@@ -362,6 +365,22 @@ describe('long-window acceptance', () => {
         records[0].diagnostic = true
       },
     ],
+    [
+      'diagnostic worker report in an eligible record',
+      (records) => {
+        Object.assign(records[0].workers[0], {
+          diagnostic: true,
+          acceptance: false,
+          scope: 'shadow',
+        })
+      },
+    ],
+    ...[null, false, ''].map((endpointBytes) => [
+      `non-numeric endpoint ${JSON.stringify(endpointBytes)} despite a stale pass flag`,
+      (records) => {
+        records[0].workers[0].mid.data.endpointBytes = endpointBytes
+      },
+    ]),
     [
       'missing worker flag',
       (records) => {
