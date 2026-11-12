@@ -5,7 +5,7 @@ const path = require('node:path')
 const v8 = require('node:v8')
 
 const FLAGS = Object.freeze({ diagnostic: true, acceptanceEligible: false })
-/** Engine code journal rows: the warm capture's extra settles overflow the 64-row default. */
+/** Engine code journal rows: headroom for the warm capture's extra reading. */
 const ENGINE_ROWS = 128
 
 /** Three endpoint captures, written synchronously only AFTER the original settled heap reading. */
@@ -108,7 +108,6 @@ const installClosedDiagnostic = (worker, env = process.env, ports = {}) => {
             if (this.clock.now() - this.phaseStartedAt > this.warmupMs + 5000)
               throw new Error('closed diagnostic missed the warm baseline')
             this.warmCaptured = true
-            await this.settle()
             capture.record('warm', await snapshot())
           }
           return value
