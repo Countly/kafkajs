@@ -19348,6 +19348,7 @@
         "scripts/ci/__tests__/shareSoakJob.spec.js \u203a share soak CI owned lifecycle serialization retains logs failure and attempts bounded owned cleanup and partial records",
         "scripts/ci/__tests__/shareSoakJob.spec.js \u203a share soak CI owned lifecycle serialization retains teardown failure and attempts bounded owned cleanup and partial records",
         "scripts/ci/__tests__/shareSoakJob.spec.js \u203a share soak CI owned lifecycle serialization retains seal failure and attempts bounded owned cleanup and partial records",
+        "scripts/ci/__tests__/shareSoakJob.spec.js \u203a required memory gate composition isolates dispatch concurrency by selection and replicates while superseding older PR runs",
         "scripts/ci/__tests__/shareSoakJob.spec.js \u203a required memory gate composition fails both named verdicts on partial dispatches and checks every dependency on full runs",
         "scripts/ci/__tests__/shareSoakJob.spec.js \u203a required memory gate composition requires both share profiles and every relocated telemetry verdict with explicit partial failures",
         "scripts/evidence/__tests__/shareSoakAcceptance.spec.js \u203a share soak independent acceptance controls reconstructs original framed acquisitions, accepts, departures and terminal reads for cycle 0",

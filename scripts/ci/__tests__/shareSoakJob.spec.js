@@ -457,6 +457,43 @@ describe('share soak CI owned lifecycle serialization', () => {
 })
 
 describe('required memory gate composition', () => {
+  test('isolates dispatch concurrency by selection and replicates while superseding older PR runs', () => {
+    const { concurrency } = require('js-yaml').load(
+      fs.readFileSync('.github/workflows/memory-gates.yml', 'utf8')
+    )
+    const vm = require('node:vm')
+    /**
+     * Evaluates the pinned workflow key with the GitHub contexts used by each trigger.
+     * @param {string} ref Branch or pull-request ref.
+     * @param {object} [inputs] Optional workflow_dispatch inputs; absent for pull requests.
+     * @param {string} [sha] Commit identity, which must not split superseding PR runs.
+     * @returns {string} The concurrency group selected by the workflow expression.
+     */
+    const key = (ref, inputs = {}, sha = 'old') =>
+      concurrency.group.replace(/\$\{\{\s*(.*?)\s*\}\}/g, (_match, expression) =>
+        String(vm.runInNewContext(expression, { github: { ref, sha }, inputs }))
+      )
+    const branch = 'refs/heads/p9m/memory-gates'
+    const selections = [
+      {},
+      { only: 'share-soak', replicates: '1' },
+      { only: 'telemetry-long-window', replicates: '3' },
+      { only: '', replicates: '3' },
+    ]
+    expect(new Set(selections.map((inputs) => key(branch, inputs))).size).toBe(4)
+    expect(key(branch, { only: '', replicates: '1' })).toBe(key(branch))
+    const pull = 'refs/pull/15/merge'
+    expect(key(pull, {}, 'old')).toBe(key(pull, {}, 'new'))
+    expect(key(pull)).not.toBe(key('refs/pull/16/merge'))
+    expect(concurrency['cancel-in-progress']).toBe(true)
+    expect(concurrency.group).toBe(
+      'memory-gates-$' +
+        '{{ github.ref }}-$' +
+        "{{ inputs.only || 'all' }}-$" +
+        "{{ inputs.replicates || '1' }}"
+    )
+  })
+
   test('flushes each calibration child before starting the next even after failure', () => {
     const events = []
     const spawn = jest.spyOn(require('node:child_process'), 'spawnSync').mockImplementation(() => {
