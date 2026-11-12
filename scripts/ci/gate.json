@@ -19791,7 +19791,12 @@
         "scripts/benchmarks/__tests__/compareDecoderBounds.spec.js \u203a Decoder performance comparison requires a measured or unavailable disposition for record-batch:lz4",
         "scripts/benchmarks/__tests__/compareDecoderBounds.spec.js \u203a Decoder performance comparison requires a measured or unavailable disposition for record-batch:snappy",
         "scripts/benchmarks/__tests__/frameDecode.spec.js \u203a Benchmarks > frameDecode a run timed mode requires gc while the functional control does not",
-        "scripts/benchmarks/__tests__/frameDecode.spec.js \u203a Benchmarks > frameDecode a run discards three warmups and collects before each of seven measured intervals"
+        "scripts/benchmarks/__tests__/frameDecode.spec.js \u203a Benchmarks > frameDecode a run discards three warmups and collects before each of seven measured intervals",
+        "scripts/e2e/telemetry/__tests__/activeCensus.spec.js \u203a active census pairs raw and explicit major GC with one pending job without retaining its input",
+        "scripts/e2e/telemetry/__tests__/activeCensus.spec.js \u203a active census scalar companion observes the same seam without GC or captures outside active settlement",
+        "scripts/e2e/telemetry/__tests__/activeCensus.spec.js \u203a active census fails incomplete codec coverage and preserves capture failures",
+        "scripts/e2e/telemetry/__tests__/activeCensus.spec.js \u203a active census top owners carry additive self bytes and named retaining paths including unresolved owners",
+        "scripts/ci/__tests__/workflowTimeouts.spec.js \u203a Workflow timeouts active owner census is broker-free diagnostic only with bounded capture and scalar jobs"
       ],
       "capMinutes": 85,
       "allowedSkips": [
@@ -24010,7 +24015,12 @@
         "scripts/benchmarks/__tests__/compareDecoderBounds.spec.js \u203a Decoder performance comparison requires a measured or unavailable disposition for record-batch:lz4",
         "scripts/benchmarks/__tests__/compareDecoderBounds.spec.js \u203a Decoder performance comparison requires a measured or unavailable disposition for record-batch:snappy",
         "scripts/benchmarks/__tests__/frameDecode.spec.js \u203a Benchmarks > frameDecode a run timed mode requires gc while the functional control does not",
-        "scripts/benchmarks/__tests__/frameDecode.spec.js \u203a Benchmarks > frameDecode a run discards three warmups and collects before each of seven measured intervals"
+        "scripts/benchmarks/__tests__/frameDecode.spec.js \u203a Benchmarks > frameDecode a run discards three warmups and collects before each of seven measured intervals",
+        "scripts/e2e/telemetry/__tests__/activeCensus.spec.js \u203a active census pairs raw and explicit major GC with one pending job without retaining its input",
+        "scripts/e2e/telemetry/__tests__/activeCensus.spec.js \u203a active census scalar companion observes the same seam without GC or captures outside active settlement",
+        "scripts/e2e/telemetry/__tests__/activeCensus.spec.js \u203a active census fails incomplete codec coverage and preserves capture failures",
+        "scripts/e2e/telemetry/__tests__/activeCensus.spec.js \u203a active census top owners carry additive self bytes and named retaining paths including unresolved owners",
+        "scripts/ci/__tests__/workflowTimeouts.spec.js \u203a Workflow timeouts active owner census is broker-free diagnostic only with bounded capture and scalar jobs"
       ],
       "capMinutes": 93,
       "allowedSkips": [
