@@ -6107,7 +6107,7 @@ describe('Share soak complete original-owner schedules', () => {
         )
         expect(new Set(joined.map(({ memberId }) => memberId)).size).toBe(3)
         for (const beat of beats.filter(({ response }) => response?.errorCode === 0)) {
-          expect(beat.response.heartbeatIntervalMs).toBe(5000)
+          expect(beat.response.heartbeatIntervalMs).toBe(beat.request.memberEpoch === -1 ? 0 : 5000)
           expect(beat.answeredAt).toBeGreaterThanOrEqual(beat.at)
           expect(beat.frames).toEqual(
             expect.arrayContaining([
