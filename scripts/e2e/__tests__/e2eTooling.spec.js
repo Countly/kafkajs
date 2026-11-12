@@ -1374,6 +1374,7 @@ describe('broker telemetry fixture', () => {
       'telemetry-seeded-control',
       'live-owner-census',
       'share-peak',
+      'telemetry-long-window',
       'telemetry-verdicts',
       'telemetry-verdict-controls',
       'verdict',
@@ -1605,6 +1606,75 @@ describe('broker telemetry fixture', () => {
       'if-no-files-found': 'error',
     })
     expect(JSON.stringify(soak)).not.toContain('forceExit')
+  })
+
+  test('keeps the long-window shadow lane diagnostic, bounded and out of the memory verdict', () => {
+    // eslint-disable-next-line n/no-extraneous-require -- YAML parser is pinned by the ESLint/Jest toolchain
+    const yaml = require('js-yaml')
+    const workflow = yaml.load(read('.github/workflows/memory-gates.yml').toString())
+    const expr = (text) => '$' + `{{ ${text} }}`
+    const job = workflow.jobs['telemetry-long-window']
+    expect(workflow.jobs.verdict.needs).not.toContain('telemetry-long-window')
+    expect(JSON.stringify(workflow.jobs.verdict)).not.toContain('long-window')
+    expect(workflow.on.workflow_dispatch.inputs.replicates).toMatchObject({
+      type: 'choice',
+      default: '1',
+      options: ['1', '2', '3'],
+    })
+    expect(job.if).toBe(
+      "github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/')"
+    )
+    expect(job.needs).toBeUndefined()
+    expect(job['timeout-minutes']).toBeLessThanOrEqual(75)
+    const { matrix } = job.strategy
+    expect(job.strategy['fail-fast']).toBe(false)
+    expect(matrix.node).toEqual([22, 24, 26])
+    expect(matrix.kafka).toEqual(['4.2.2', '4.3.1'])
+    expect(matrix.arm).toEqual(['unseeded', 'seeded'])
+    expect(matrix.replicate).toBe(
+      expr(
+        "fromJSON(github.event.inputs.replicates == '3' && '[1,2,3]' || github.event.inputs.replicates == '2' && '[1,2]' || '[1]')"
+      )
+    )
+    expect(matrix.include).toEqual(
+      [22, 24, 26].map((node) => ({ node, kafka: '4.3.1', arm: 'warmup-seed', replicate: 1 }))
+    )
+    expect(
+      matrix.node.length * matrix.kafka.length * matrix.arm.length * 3 + matrix.include.length
+    ).toBe(39)
+    expect(job.env.COMPOSE_FILE).toBe('docker-compose.telemetry.yml')
+    for (const identity of ['github.run_id', 'github.run_attempt', 'strategy.job-index'])
+      expect(job.env.COMPOSE_PROJECT_NAME).toContain(identity)
+    expect(job.env.LONG_WINDOW_ARM).toBe(expr('matrix.arm'))
+    expect(job.env.LONG_WINDOW_REPLICATE).toBe(expr('matrix.replicate'))
+    for (const step of job.steps) expect(step['timeout-minutes']).toBeGreaterThan(0)
+    const run = job.steps.find((step) => step.run?.includes('longWindowDiagnostic.js'))
+    expect(run.run).toBe(
+      'timeout -k 10s 1980s node --expose-gc scripts/soak/longWindowDiagnostic.js --diagnostic-only "$LONG_WINDOW_ROOT"'
+    )
+    expect(run['timeout-minutes'] * 60).toBeGreaterThan(1990)
+    expect(run.if).toBeUndefined()
+    const stop = job.steps.find((step) => step.run?.includes('ci.js stop'))
+    expect(stop.if).toBe('always()')
+    expect(stop.run).toContain('verifyCleanup(')
+    expect(job.steps.at(-1)).toMatchObject({
+      if: 'always()',
+      'timeout-minutes': 2,
+      uses: 'actions/upload-artifact@v4',
+      with: { 'if-no-files-found': 'error', 'include-hidden-files': true },
+    })
+    expect(job.steps.at(-1).with.name).toBe(
+      'telemetry-long-window-node' +
+        expr('matrix.node') +
+        '-' +
+        expr('matrix.kafka') +
+        '-' +
+        expr('matrix.arm') +
+        '-r' +
+        expr('matrix.replicate')
+    )
+    expect(job.steps.at(-1).with.path).toContain('.tmp/long-window/')
+    expect(JSON.stringify(job)).not.toContain('forceExit')
   })
 
   test('covers all six live census lanes with capture and scalar companions', () => {
