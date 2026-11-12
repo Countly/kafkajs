@@ -752,11 +752,13 @@ const verifyScenario = (record, directory) => {
       ].includes(manifest.scenario)
     )
     for (const [kind, relative] of Object.entries(manifest.owners)) {
-      const { records, sockets } = read(relative)
+      const transcript = read(relative)
+      const { records, sockets } = transcript
       assert(!records.some((r) => r.apiKey === 72), 'Unexpected Push in negative control')
       if (noPlugin) {
         assert(!records.some((r) => r.apiKey === 71))
-        if (manifest.scenario === 'telemetry-floor') ordinaryOwnership({ records, sockets })
+        if (manifest.scenario === 'telemetry-floor')
+          ordinaryOwnership(transcript, { owner: kind, clientId: `${record.run.stem}-${kind}` })
         else if (manifest.scenario !== UNSUPPORTED)
           assert(!sockets.some((s) => s.kind === 'telemetry'))
         assert(

@@ -802,14 +802,27 @@ const assertJavaCaptures = (receipts, directory) => {
 /**
  * Proves ownership of every physical connection, including setup-only sockets. The initial
  * foreground bootstrap is explicit or proven by a successful connect-only share negotiation;
- * every other socket must carry actual ordinary work.
- * @param {object} transcript records and physical sockets
- * @param {object} [options] independent public lifecycle evidence
+ * every other socket must carry actual ordinary work. All requests must match the identity
+ * configured by the caller, independently of the recorded stream.
+ * @param {object} transcript recorded owner, records and physical sockets
+ * @param {object} options independent public lifecycle evidence
+ * @param {string} options.owner expected observer owner
+ * @param {string} options.clientId expected configured client ID
  * @param {object} [options.refusal] recorded share connect outcome (connected or refused)
  * @returns {object[]} node/role ownership baseline (counts deliberately excluded)
- * @throws {Error} for telemetry, an undecided extra connection or an unowned setup-only socket
+ * @throws {Error} for foreign identity, telemetry, an extra connection or an unowned setup-only socket
  */
-const ordinaryOwnership = ({ records, sockets }, { refusal } = {}) => {
+const ordinaryOwnership = (
+  { owner: recordedOwner, records, sockets },
+  { refusal, owner, clientId } = {}
+) => {
+  assert(typeof owner === 'string' && owner.length > 0, 'Missing expected socket owner')
+  assert(typeof clientId === 'string' && clientId.length > 0, 'Missing expected client identity')
+  assert.equal(recordedOwner, owner, 'Socket owner differs')
+  for (const request of records.filter((r) => r.type === 'request')) {
+    assert.equal(request.owner, owner, 'Request owner differs')
+    assert.equal(request.clientId, clientId, 'Request client identity differs')
+  }
   if (refusal?.status === 'connected' && sockets.length === 1 && sockets[0].kind === 'undecided') {
     const [socket] = sockets
     const [connect, ...requests] = records
@@ -824,8 +837,6 @@ const ordinaryOwnership = ({ records, sockets }, { refusal } = {}) => {
       assert.equal(request.apiKey, 18)
       assert.equal(request.socketId, socket.id)
       assert.equal(request.node, socket.node)
-      assert.equal(request.clientId, negotiated.clientId)
-      assert(typeof request.clientId === 'string' && request.clientId.length > 0)
       assert(connect.at < request.writeAt && request.writeAt <= request.response?.responseAt)
     }
     assert.equal(requests[0].apiVersion, 5)

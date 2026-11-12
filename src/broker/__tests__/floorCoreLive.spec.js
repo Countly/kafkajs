@@ -2043,8 +2043,11 @@ class FloorTelemetryCase {
     expect(offered.some(({ apiKey }) => apiKey === 71 || apiKey === 72)).toBe(false)
     expect(observedTelemetryRequests).toEqual([])
     expect(observedTelemetryConnections).toEqual([])
-    for (const observer of Object.values(this.observers))
-      ordinaryOwnership({ records: observer.readTranscript(), sockets: observer.socketOwnership() })
+    for (const [owner, observer] of Object.entries(this.observers))
+      ordinaryOwnership(
+        { owner, records: observer.readTranscript(), sockets: observer.socketOwnership() },
+        { owner, clientId: `${this.arm}-${owner}` }
+      )
     expect(sortedDurableIds).toEqual(expected1000Ids)
     expect(sortedHandlerIds).toEqual(expected1000Ids)
     expect(new Set(handlerIds).size).toBe(F24_RECORDS)
