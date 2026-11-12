@@ -118,6 +118,10 @@
       "needs": {},
       "evidence": [],
       "titles": [
+        "src/admin/__tests__/adminVersionsLive.spec.js \u203a Admin > captured newest versions 4.3.2 capture limits DeleteGroups to v2",
+        "src/admin/__tests__/adminVersionsLive.spec.js \u203a Admin > captured newest versions 4.4.0 capture permits DeleteGroups v3",
+        "src/admin/__tests__/adminVersionsLive.spec.js \u203a Admin > captured newest versions a capture cannot supply a broker-only API",
+        "src/admin/__tests__/adminVersionsLive.spec.js \u203a Admin > captured newest versions an uncaptured broker version cannot fall back to another recording",
         "src/protocol/requests/index.spec.js \u203a Recorded broker captures Recorded broker capture coverage includes Kafka 4.4.0 and 4.3.2",
         "src/protocol/requests/index.spec.js \u203a released share source domains 4.4.0 records the share ranges by name and the internal ones by key",
         "src/protocol/requests/index.spec.js \u203a released share source domains 4.3.2 records the share ranges by name and the internal ones by key",
@@ -20247,6 +20251,10 @@
       "needs": {},
       "evidence": [],
       "titles": [
+        "src/admin/__tests__/adminVersionsLive.spec.js \u203a Admin > captured newest versions 4.3.2 capture limits DeleteGroups to v2",
+        "src/admin/__tests__/adminVersionsLive.spec.js \u203a Admin > captured newest versions 4.4.0 capture permits DeleteGroups v3",
+        "src/admin/__tests__/adminVersionsLive.spec.js \u203a Admin > captured newest versions a capture cannot supply a broker-only API",
+        "src/admin/__tests__/adminVersionsLive.spec.js \u203a Admin > captured newest versions an uncaptured broker version cannot fall back to another recording",
         "src/admin/__tests__/floorConditionalLive.spec.js \u203a Floor conditional expectations reads what each ApiVersions request names and the error code of its own answer",
         "src/admin/__tests__/floorConditionalLive.spec.js \u203a Floor conditional expectations runs cleanup newest first, continues past a failure and reports only what it could not undo",
         "src/admin/__tests__/kafka44LeaderAudit.spec.js \u203a Kafka 4.4 client fix audit KAFKA-20673 removed cached leader cannot strand an admin call"
@@ -22125,6 +22133,10 @@
       "needs": {},
       "evidence": [],
       "titles": [
+        "src/admin/__tests__/adminVersionsLive.spec.js \u203a Admin > captured newest versions 4.3.2 capture limits DeleteGroups to v2",
+        "src/admin/__tests__/adminVersionsLive.spec.js \u203a Admin > captured newest versions 4.4.0 capture permits DeleteGroups v3",
+        "src/admin/__tests__/adminVersionsLive.spec.js \u203a Admin > captured newest versions a capture cannot supply a broker-only API",
+        "src/admin/__tests__/adminVersionsLive.spec.js \u203a Admin > captured newest versions an uncaptured broker version cannot fall back to another recording",
         "src/admin/__tests__/adminVersionsLive.spec.js \u203a Admin > topic, record, group and ACL APIs at their newest versions (live) createTopics answers the topic id that Metadata reports for the topic",
         "src/admin/__tests__/adminVersionsLive.spec.js \u203a Admin > topic, record, group and ACL APIs at their newest versions (live) createPartitions grows the topic from 3 to 5 partitions",
         "src/admin/__tests__/adminVersionsLive.spec.js \u203a Admin > topic, record, group and ACL APIs at their newest versions (live) deleteTopicRecords moves the low watermark of the partition",
@@ -23243,6 +23255,10 @@
       "needs": {},
       "evidence": [],
       "titles": [
+        "src/admin/__tests__/adminVersionsLive.spec.js \u203a Admin > captured newest versions 4.3.2 capture limits DeleteGroups to v2",
+        "src/admin/__tests__/adminVersionsLive.spec.js \u203a Admin > captured newest versions 4.4.0 capture permits DeleteGroups v3",
+        "src/admin/__tests__/adminVersionsLive.spec.js \u203a Admin > captured newest versions a capture cannot supply a broker-only API",
+        "src/admin/__tests__/adminVersionsLive.spec.js \u203a Admin > captured newest versions an uncaptured broker version cannot fall back to another recording",
         "src/protocol/requests/index.spec.js \u203a Recorded broker captures Recorded broker capture coverage includes Kafka 4.4.0 and 4.3.2",
         "src/protocol/requests/index.spec.js \u203a released share source domains 4.4.0 records the share ranges by name and the internal ones by key",
         "src/protocol/requests/index.spec.js \u203a released share source domains 4.3.2 records the share ranges by name and the internal ones by key",
