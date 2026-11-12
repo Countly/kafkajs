@@ -141,9 +141,9 @@ describe('share soak independent acceptance controls', () => {
     })
 
     test.each([
-      ['later timestamp', { id: 1001, at: 11, apiKey: 78 }],
-      ['same-millisecond sequence', { id: 1001, at: 10, apiKey: 78 }],
-      ['acknowledgement frame', { id: 1001, at: 11, apiKey: 79 }],
+      ['later timestamp', { id: 1001, at: 11, apiKey: 78 }, false],
+      ['same-millisecond sequence', { id: 1001, at: 10, apiKey: 78 }, false],
+      ['acknowledgement frame', { id: 1001, at: 11, apiKey: 79 }, false],
       ['legacy close timestamp', { id: 1001, at: 11, apiKey: 78 }, true],
     ])('rejects raw post-close %s without a diagnostic marker', (_label, fields, legacy) => {
       const facts = recording()

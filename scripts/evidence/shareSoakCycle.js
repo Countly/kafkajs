@@ -778,12 +778,42 @@ class ArchivedCycle {
   }
 
   /**
+   * Rejects writes after the reset socket's observed close, including attempts without answers.
+   * The close's last frame orders same-millisecond events; older archives retain clock evidence.
+   * @param {object} observation Original reset, close steps and request frames.
+   * @param {(message: string) => void} fail Receives a retirement violation.
+   * @returns {void}
+   */
+  static retirement(observation, fail) {
+    const socket = observation.resetTarget?.socket ?? observation.reset?.oldSocket
+    if (socket === undefined) return
+    const steps = observation.steps ?? []
+    const closed = steps.find((s) => s.step === 'socket-close' && s.socket === socket)
+    const provenance = observation.provenance ?? {}
+    const requests = [...(provenance.exchanges ?? []), ...(provenance.heartbeats ?? [])]
+    if (
+      steps.some((s) => s.step === 'retired-socket-write' && s.socket === socket) ||
+      (closed &&
+        requests.some((request) =>
+          request.frames?.some(
+            (frame) =>
+              frame.socket === socket &&
+              (frame.at > closed.at ||
+                (Number.isSafeInteger(closed.lastFrame) && frame.id > closed.lastFrame))
+          )
+        ))
+    )
+      fail(`Retired reset socket ${socket} was written after close`)
+  }
+
+  /**
    * @param {ReturnType<typeof ArchivedCycle.plan>} plan the cycle
    * @param {object} observation the cycle's observations
    * @param {(message: string) => void} fail
    * @returns {void}
    */
   static membership(plan, observation, fail) {
+    ArchivedCycle.retirement(observation, fail)
     const { members = {}, reset = null, verifier = {}, provenance = {} } = observation
     for (const label of ['A', 'B']) {
       const member = observation.memberObservations?.find((member) => member.member === label)

@@ -58,6 +58,21 @@ const verifyProtocolAnswers = async (rows) => {
   )
   const groupListings = []
   const requests = rows.filter((r) => r.event === 'soak-wire' && r.kind === 'request')
+  const closed = new Map()
+  for (const row of rows)
+    if (row.event === 'soak-cycle-step' && row.step === 'socket-close' && !closed.has(row.socket))
+      closed.set(row.socket, row)
+  for (const request of requests) {
+    const close = closed.get(request.socket)
+    if (
+      close &&
+      (request.at > close.monotonicAt ||
+        (Number.isSafeInteger(close.lastFrame) && request.frame > close.lastFrame))
+    )
+      problems.push(
+        `Original request after reset socket close: socket ${request.socket}, frame ${request.frame}`
+      )
+  }
   const replies = new Map(
     rows
       .filter((r) => r.event === 'soak-wire' && r.kind === 'response')
