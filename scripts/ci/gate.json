@@ -20253,7 +20253,21 @@
         "scripts/soak/__tests__/shareSoakLiveAssertions.spec.js \u203a share soak live verifier assertions rejects rejected leave after accepting the pristine recording",
         "scripts/soak/__tests__/shareSoakLiveAssertions.spec.js \u203a share soak live verifier assertions rejects non-leave response epoch after accepting the pristine recording",
         "scripts/soak/__tests__/shareSoakLiveAssertions.spec.js \u203a share soak live verifier assertions rejects unordered heartbeat answer after accepting the pristine recording",
-        "scripts/soak/__tests__/shareSoakLiveAssertions.spec.js \u203a share soak live verifier assertions rejects missing active response bytes after accepting the pristine recording"
+        "scripts/soak/__tests__/shareSoakLiveAssertions.spec.js \u203a share soak live verifier assertions rejects missing active response bytes after accepting the pristine recording",
+        "scripts/soak/__tests__/soak.spec.js \u203a Share soak cycle finalization and isolation adapter rejects a retired socket write after confirmed close, timing=before-reopen",
+        "scripts/soak/__tests__/soak.spec.js \u203a Share soak cycle finalization and isolation adapter rejects a retired socket write after confirmed close, timing=after-reopen",
+        "scripts/soak/__tests__/soak.spec.js \u203a Share soak cycle finalization and isolation adapter rejects a retired socket write after confirmed close, timing=during-disconnect",
+        "scripts/soak/__tests__/soak.spec.js \u203a Share soak cycle finalization and isolation adapter rejects a retired socket write after confirmed close, timing=different-context",
+        "scripts/evidence/__tests__/shareSoakAcceptance.spec.js \u203a share soak independent acceptance controls runner reset retirement evidence accepts the pre-close race and replacement writes",
+        "scripts/evidence/__tests__/shareSoakAcceptance.spec.js \u203a share soak independent acceptance controls runner reset retirement evidence rejects raw post-close later timestamp without a diagnostic marker",
+        "scripts/evidence/__tests__/shareSoakAcceptance.spec.js \u203a share soak independent acceptance controls runner reset retirement evidence rejects raw post-close same-millisecond sequence without a diagnostic marker",
+        "scripts/evidence/__tests__/shareSoakAcceptance.spec.js \u203a share soak independent acceptance controls runner reset retirement evidence rejects raw post-close acknowledgement frame without a diagnostic marker",
+        "scripts/evidence/__tests__/shareSoakAcceptance.spec.js \u203a share soak independent acceptance controls runner reset retirement evidence rejects raw post-close legacy close timestamp without a diagnostic marker",
+        "scripts/evidence/__tests__/shareSoakAcceptance.spec.js \u203a share soak independent acceptance controls archive reset retirement evidence accepts the pre-close race and replacement writes",
+        "scripts/evidence/__tests__/shareSoakAcceptance.spec.js \u203a share soak independent acceptance controls archive reset retirement evidence rejects raw post-close later timestamp without a diagnostic marker",
+        "scripts/evidence/__tests__/shareSoakAcceptance.spec.js \u203a share soak independent acceptance controls archive reset retirement evidence rejects raw post-close same-millisecond sequence without a diagnostic marker",
+        "scripts/evidence/__tests__/shareSoakAcceptance.spec.js \u203a share soak independent acceptance controls archive reset retirement evidence rejects raw post-close acknowledgement frame without a diagnostic marker",
+        "scripts/evidence/__tests__/shareSoakAcceptance.spec.js \u203a share soak independent acceptance controls archive reset retirement evidence rejects raw post-close legacy close timestamp without a diagnostic marker"
       ],
       "capMinutes": 85,
       "allowedSkips": [
