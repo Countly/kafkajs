@@ -274,10 +274,12 @@ class ProcessMemory {
    * @param {Function|null} [observe] diagnostic-only synchronous (round, stage) scalar observer;
    *   omitted in acceptance, with no additional reads, collections or turns
    * @param {Function|null} [completed] diagnostic-only synchronous observer of the final reading
+   * @param {Function|null} [recorded] diagnostic-only (checkpoint, round, checkpoints) observer,
+   *   called only after the original checkpoint is stored; never changes its scalar facts
    * @returns {Promise<object>} the final reading and all GC admission/completion/engine facts
    * @throws {Error} when no collection function exists
    */
-  async settled(observe = null, completed = null) {
+  async settled(observe = null, completed = null, recorded = null) {
     if (typeof this.gc !== 'function') throw new Error('A settled reading needs node --expose-gc')
     const admittedAt = this.now()
     const before = this.collections
@@ -305,6 +307,7 @@ class ProcessMemory {
       }
       const previous = checkpoints.at(-1)
       checkpoints.push(checkpoint)
+      if (recorded) recorded(checkpoint, round, checkpoints)
       if (collectionsSettled(previous, checkpoint)) break
     }
     const last = checkpoints.at(-1)

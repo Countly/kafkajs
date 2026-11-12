@@ -20287,7 +20287,9 @@
         "scripts/e2e/telemetry/__tests__/activeCensus.spec.js \u203a active snapshot records M then triggers once strictly after an original checkpoint without GC",
         "scripts/e2e/telemetry/__tests__/activeCensus.spec.js \u203a active snapshot uses a strict four MiB threshold and never retries failed captures",
         "scripts/e2e/telemetry/__tests__/activeCensus.spec.js \u203a active snapshot pair analysis reports additive growth owners paths and unresolved GC-sensitive bytes",
-        "scripts/e2e/telemetry/__tests__/activeCensus.spec.js \u203a active snapshot diagnostic is dispatch only bounded and excluded from every verdict"
+        "scripts/e2e/telemetry/__tests__/activeCensus.spec.js \u203a active snapshot diagnostic is dispatch only bounded and excluded from every verdict",
+        "scripts/e2e/telemetry/__tests__/activeCensus.spec.js \u203a active snapshot replay rejects changed identities scalars digests and a skipped first overage",
+        "scripts/e2e/telemetry/__tests__/activeCensus.spec.js \u203a active snapshot offline analysis preserves no-trigger children and partial failures"
       ],
       "capMinutes": 85,
       "allowedSkips": [
@@ -24601,7 +24603,9 @@
         "scripts/e2e/telemetry/__tests__/activeCensus.spec.js \u203a active snapshot records M then triggers once strictly after an original checkpoint without GC",
         "scripts/e2e/telemetry/__tests__/activeCensus.spec.js \u203a active snapshot uses a strict four MiB threshold and never retries failed captures",
         "scripts/e2e/telemetry/__tests__/activeCensus.spec.js \u203a active snapshot pair analysis reports additive growth owners paths and unresolved GC-sensitive bytes",
-        "scripts/e2e/telemetry/__tests__/activeCensus.spec.js \u203a active snapshot diagnostic is dispatch only bounded and excluded from every verdict"
+        "scripts/e2e/telemetry/__tests__/activeCensus.spec.js \u203a active snapshot diagnostic is dispatch only bounded and excluded from every verdict",
+        "scripts/e2e/telemetry/__tests__/activeCensus.spec.js \u203a active snapshot replay rejects changed identities scalars digests and a skipped first overage",
+        "scripts/e2e/telemetry/__tests__/activeCensus.spec.js \u203a active snapshot offline analysis preserves no-trigger children and partial failures"
       ],
       "capMinutes": 93,
       "allowedSkips": [

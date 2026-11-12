@@ -31,10 +31,14 @@ const supervise = (directory, identity) =>
       RESOURCE_CHILD_ID: identity.childId,
       RESOURCE_TREE: identity.tree,
       RESOURCE_RUN_ID: identity.runId,
-      ACTIVE_CENSUS_DIRECTORY: directory,
-      ACTIVE_CENSUS_VARIANT: identity.variant,
+      ...(identity.variant === 'snapshot'
+        ? { RESOURCE_ACTIVE_SNAPSHOT_DIRECTORY: directory }
+        : { ACTIVE_CENSUS_DIRECTORY: directory, ACTIVE_CENSUS_VARIANT: identity.variant }),
     }
     for (const key of ['NODE_OPTIONS', 'NODE_V8_COVERAGE', 'RESOURCE_SEED']) delete env[key]
+    if (identity.variant === 'snapshot')
+      for (const key of ['ACTIVE_CENSUS_DIRECTORY', 'ACTIVE_CENSUS_VARIANT', 'RESOURCE_WITNESSES'])
+        delete env[key]
     const child = spawn(
       process.execPath,
       [

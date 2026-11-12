@@ -252,7 +252,23 @@ test('active snapshot switch off preserves scalar bytes and performs no capture'
       memory.stop()
     }
   }
-  expect(await run(null)).toEqual(await run(snapshotModule().createActiveSnapshot({ env: {} })))
+  const scalar = { rss: 100, heapUsed: 20, external: 10, arrayBuffers: 2, retained: 30 }
+  const expected = {
+    at: 5,
+    ...scalar,
+    gc: {
+      admittedAt: 1,
+      completedAt: 5,
+      observed: 0,
+      checkpoints: [
+        { at: 3, ...scalar, admittedAt: 2, observed: 0 },
+        { at: 5, ...scalar, admittedAt: 4, observed: 0 },
+      ],
+    },
+  }
+  const originalBytes = { bytes: JSON.stringify(expected), collections: 4 }
+  expect(await run(null)).toEqual(originalBytes)
+  expect(await run(snapshotModule().createActiveSnapshot({ env: {} }))).toEqual(originalBytes)
   expect(capture).not.toHaveBeenCalled()
 })
 
@@ -283,6 +299,9 @@ test('active snapshot records M then triggers once strictly after an original ch
     expect(order.slice(0, 4)).toEqual(['matched-recorded', 'M', 'checkpoint-recorded', 'trigger'])
     expect(order.filter((name) => name === 'trigger')).toHaveLength(1)
     expect(memory.gc).toHaveBeenCalledTimes(4)
+    expect(require('../resourceArtifact').judgeMemoryArm(observer.summary()).problems).toContain(
+      'diagnostic records are ineligible for acceptance'
+    )
     expect(observer.summary()).toMatchObject({
       diagnostic: true,
       acceptanceEligible: false,
@@ -410,4 +429,259 @@ test('active snapshot diagnostic is dispatch only bounded and excluded from ever
     process: { env: { ONLY: 'resource-active-snapshot', GITHUB_OUTPUT: 'output' } },
   })
   expect(outputs.join('')).toContain('jobs=["resource-active-snapshot"]')
+})
+
+test('active snapshot replay rejects changed identities scalars digests and a skipped first overage', () => {
+  const crypto = require('node:crypto')
+  const { validateChild } = require(path.join(__dirname, '../retained/analyseActiveSnapshot'))
+  const directory = fs.mkdtempSync(path.join(__dirname, '.active-snapshot-'))
+  const identity = {
+    diagnostic: true,
+    acceptanceEligible: false,
+    attributionComplete: false,
+    childId: 'child',
+    tree: 'tree',
+    runId: 'run',
+    kind: 'producer',
+    node: 'node',
+    v8: 'v8',
+    variant: 'capture',
+    pid: 123,
+    flags: ['--expose-gc'],
+  }
+  const matched = reading(1, MiB)
+  const checkpoint = reading(10, 9 * MiB)
+  const active = {
+    phase: 'gzip',
+    ...reading(20, MiB),
+    gc: { checkpoints: [reading(8, MiB), checkpoint] },
+  }
+  const records = [
+    {
+      diagnostic: true,
+      acceptanceEligible: false,
+      attributionComplete: false,
+      name: 'M',
+      phase: 'matched',
+      round: null,
+      delta: 0,
+      reading: matched,
+      processRetainedBytes: matched.retained,
+      afterSnapshot: reading(4, MiB),
+    },
+    {
+      diagnostic: true,
+      acceptanceEligible: false,
+      attributionComplete: false,
+      name: 'trigger',
+      phase: 'gzip',
+      round: 1,
+      delta: 8 * MiB,
+      reading: checkpoint,
+      processRetainedBytes: checkpoint.retained,
+      afterSnapshot: reading(13, MiB),
+    },
+  ]
+  const events = records.map(({ afterSnapshot, ...record }, index) => {
+    const bytes = Buffer.from(`synthetic-${record.name}`)
+    fs.writeFileSync(path.join(directory, `${record.name}.heapsnapshot`), bytes)
+    return {
+      ...record,
+      file: `${record.name}.heapsnapshot`,
+      bytes: bytes.length,
+      sha256: crypto.createHash('sha256').update(bytes).digest('hex'),
+      startedAt: index ? 11 : 2,
+      endedAt: index ? 12 : 3,
+    }
+  })
+  const result = {
+    complete: true,
+    identity,
+    pid: 123,
+    readings: {
+      manifest: { execArgv: identity.flags },
+      matched,
+      actives: [active],
+      activeSnapshot: {
+        diagnostic: true,
+        acceptanceEligible: false,
+        attributionComplete: false,
+        complete: true,
+        triggered: true,
+        threshold: 4 * MiB,
+        records,
+      },
+    },
+  }
+  const save = (rows) =>
+    fs.writeFileSync(
+      path.join(directory, 'census-events.jsonl'),
+      rows.map((row) => JSON.stringify(row)).join('\n') + '\n'
+    )
+  try {
+    fs.writeFileSync(path.join(directory, 'census-identity.json'), JSON.stringify(identity))
+    save(events)
+    expect(validateChild(directory, result)).toHaveLength(2)
+    for (const mutate of [
+      (copy) => {
+        copy.readings.activeSnapshot.acceptanceEligible = true
+      },
+      (copy) => {
+        copy.identity.childId = 'foreign'
+      },
+      (copy) => {
+        copy.readings.actives[0].gc.checkpoints[1].heapUsed++
+      },
+      (copy) => {
+        copy.readings.activeSnapshot.records[1].afterSnapshot.at = 9
+      },
+      (copy) => {
+        copy.readings.actives[0].gc.checkpoints[0] = reading(8, 8 * MiB)
+      },
+    ]) {
+      const copy = JSON.parse(JSON.stringify(result))
+      mutate(copy)
+      expect(() => validateChild(directory, copy)).toThrow()
+    }
+    for (const mutate of [
+      (copy) => {
+        copy[1].sha256 = 'changed'
+      },
+      (copy) => {
+        copy[1].file = '../trigger.heapsnapshot'
+      },
+      (copy) => {
+        copy[1].startedAt = 0
+      },
+      (copy) => {
+        copy[1].delta++
+      },
+    ]) {
+      const copy = JSON.parse(JSON.stringify(events))
+      mutate(copy)
+      save(copy)
+      expect(() => validateChild(directory, result)).toThrow()
+    }
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test('active snapshot offline analysis preserves no-trigger children and partial failures', () => {
+  const crypto = require('node:crypto')
+  const { main } = require(path.join(__dirname, '../retained/analyseActiveSnapshot'))
+  const { KINDS } = require('../resourceArtifact')
+  const { REPETITIONS } = require('../activeSnapshotDiagnostic')
+  const directory = fs.mkdtempSync(path.join(__dirname, '.active-analysis-'))
+  const bytes = Buffer.from('synthetic-reference')
+  const sha256 = crypto.createHash('sha256').update(bytes).digest('hex')
+  const identity = {
+    diagnostic: true,
+    acceptanceEligible: false,
+    attributionComplete: false,
+    tree: 'tree',
+    runId: 'run',
+    node: 'node',
+    v8: 'v8',
+    variant: 'snapshot',
+  }
+  const run = {
+    ...identity,
+    complete: true,
+    repetitions: REPETITIONS,
+    sources: [{ file: 'source.js', bytes: bytes.length, sha256 }],
+    results: [],
+  }
+  const log = jest.spyOn(console, 'table').mockImplementation(() => {})
+  try {
+    fs.mkdirSync(path.join(directory, 'sources'))
+    fs.writeFileSync(path.join(directory, 'sources/source.js'), bytes)
+    for (const kind of KINDS)
+      for (let repetition = 1; repetition <= REPETITIONS; repetition++) {
+        const name = `${kind}-${repetition}`
+        const child = path.join(directory, name)
+        fs.mkdirSync(child)
+        const childId = name
+        const matched = reading(1, MiB)
+        const result = {
+          complete: true,
+          pid: 123,
+          identity: { ...identity, kind, repetition, childId },
+          readings: {
+            manifest: { execArgv: ['--expose-gc'] },
+            matched,
+            actives: [
+              { phase: 'held', ...reading(20, MiB), gc: { checkpoints: [reading(10, MiB)] } },
+            ],
+            activeSnapshot: {
+              ...identity,
+              complete: true,
+              threshold: 4 * MiB,
+              triggered: false,
+              records: [
+                {
+                  name: 'M',
+                  reading: matched,
+                  phase: 'matched',
+                  round: null,
+                  delta: 0,
+                  afterSnapshot: reading(4, MiB),
+                },
+              ],
+            },
+          },
+        }
+        const event = {
+          ...identity,
+          name: 'M',
+          reading: matched,
+          phase: 'matched',
+          round: null,
+          delta: 0,
+          processRetainedBytes: matched.retained,
+          file: 'M.heapsnapshot',
+          bytes: bytes.length,
+          sha256,
+          startedAt: 2,
+          endedAt: 3,
+        }
+        fs.writeFileSync(path.join(child, 'result.json'), JSON.stringify(result))
+        fs.writeFileSync(path.join(child, 'M.heapsnapshot'), bytes)
+        fs.writeFileSync(path.join(child, 'census-events.jsonl'), JSON.stringify(event) + '\n')
+        fs.writeFileSync(
+          path.join(child, 'census-identity.json'),
+          JSON.stringify({
+            ...result.identity,
+            variant: 'capture',
+            pid: 123,
+            flags: ['--expose-gc'],
+          })
+        )
+        run.results.push({ child: name, kind, repetition, childId, complete: true })
+      }
+    fs.writeFileSync(path.join(directory, 'snapshot-summary.json'), JSON.stringify(run))
+    main(directory)
+    const summary = JSON.parse(fs.readFileSync(path.join(directory, 'snapshot-analysis.json')))
+    expect(summary).toMatchObject({
+      diagnostic: true,
+      acceptanceEligible: false,
+      analysisComplete: true,
+    })
+    expect(summary.children).toHaveLength(12)
+    expect(
+      summary.children.every(
+        (row) => row.triggered === false && row.outcome.includes('No original active reading')
+      )
+    ).toBe(true)
+    fs.unlinkSync(path.join(directory, 'producer-1/census-events.jsonl'))
+    expect(() => main(directory)).toThrow('incomplete active snapshot analysis')
+    const partial = JSON.parse(fs.readFileSync(path.join(directory, 'snapshot-analysis.json')))
+    expect(partial.analysisComplete).toBe(false)
+    expect(partial.children.filter((row) => row.analysisComplete)).toHaveLength(11)
+    expect(partial.children[0].failure).toContain('census-events.jsonl')
+    expect(fs.existsSync(path.join(directory, 'producer-1/snapshot-analysis.json'))).toBe(true)
+  } finally {
+    log.mockRestore()
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
 })

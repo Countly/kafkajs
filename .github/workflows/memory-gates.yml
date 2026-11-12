@@ -41,6 +41,7 @@ jobs:
             'share-soak-verdict',
             'resources',
             'active-owner-census',
+            'resource-active-snapshot',
             'warmup-witnesses',
             'journal-controls',
             'retained-diagnostic',
@@ -353,6 +354,43 @@ jobs:
         with:
           name: active-owner-census-node${{ matrix.node }}-${{ matrix.variant }}
           path: .tmp/active-census/
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
+  resource-active-snapshot:
+    needs: [select]
+    if: github.event_name == 'workflow_dispatch' && contains(fromJSON(needs.select.outputs.jobs), 'resource-active-snapshot')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions: { contents: read }
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24, 26]
+    env:
+      RESOURCE_ACTIVE_SNAPSHOT_ROOT: ${{ github.workspace }}/.tmp/resource-active-snapshot
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 1
+      - uses: actions/setup-node@v4
+        timeout-minutes: 1
+        with: { node-version: '${{ matrix.node }}', cache: npm }
+      - run: npm ci
+        timeout-minutes: 5
+      - name: Capture first overage after original scalar readings in twelve public children
+        timeout-minutes: 20
+        run: timeout -k 10s 1140s node scripts/e2e/telemetry/activeSnapshotDiagnostic.js --diagnostic-only "$RESOURCE_ACTIVE_SNAPSHOT_ROOT"
+      - name: Analyse additive active growth and retaining paths offline
+        if: always()
+        timeout-minutes: 15
+        run: timeout -k 10s 840s node --max-old-space-size=6144 scripts/e2e/telemetry/retained/analyseActiveSnapshot.js "$RESOURCE_ACTIVE_SNAPSHOT_ROOT"
+      - name: Archive complete or partial diagnostic snapshots and scalars
+        if: always()
+        timeout-minutes: 2
+        uses: actions/upload-artifact@v4
+        with:
+          name: resource-active-snapshot-node${{ matrix.node }}
+          path: .tmp/resource-active-snapshot/
           if-no-files-found: error
           include-hidden-files: true
           retention-days: 14

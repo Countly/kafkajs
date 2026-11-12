@@ -95,6 +95,12 @@ const activeCensus = process.env.ACTIVE_CENSUS_DIRECTORY
     })
   : null
 
+const activeSnapshot = process.env.RESOURCE_ACTIVE_SNAPSHOT_DIRECTORY
+  ? require(path.join(ROOT, 'scripts/e2e/telemetry/retained/activeSnapshot')).createActiveSnapshot({
+      memory,
+    })
+  : null
+
 const PHASE_PUSHES = 2
 const GZIP_MAGIC = [0x1f, 0x8b]
 const ZSTD_MAGIC = 0xfd2fb528
@@ -172,12 +178,17 @@ const measure = async (kind) => {
   }
 
   const roles = new ResourceRoles({ roles: ['control', 'target', 'fixture'] }).start()
+  let snapshotPhase = null
   let activeJournal = null
   const settled = () =>
     roles.run('fixture', () =>
       memory.settled(
         activeCensus && activeJournal
           ? (round, stage) => activeCensus.observe(round, stage, activeJournal)
+          : null,
+        null,
+        activeSnapshot && snapshotPhase
+          ? (point, round) => activeSnapshot.active(point, { phase: snapshotPhase, round })
           : null
       )
     )
@@ -279,6 +290,7 @@ const measure = async (kind) => {
         seed?.matched()
         const matchedResources = roles.read()
         if (!warm) activeCensus?.baseline(matched)
+        if (!warm) activeSnapshot?.baseline(matched)
 
         const actives = []
         for (const codec of codecs) {
@@ -299,6 +311,7 @@ const measure = async (kind) => {
           )
           if (warm) witnesses?.track(`foreground:${codec.name}`, enabled)
           if (!warm) {
+            if (activeSnapshot) snapshotPhase = codec.name
             if (witnesses || activeCensus) {
               if (activeCensus) {
                 activeCensus.phase = codec.name
@@ -313,6 +326,10 @@ const measure = async (kind) => {
               const active = await settled()
               actives.push({ phase: codec.name, ...active, registry: enabled.fingerprint(uuid) })
             }
+            if (activeSnapshot) {
+              snapshotPhase = null
+              activeSnapshot.active(actives.at(-1), { phase: codec.name, round: null })
+            }
             memory.mark(`enabled:${codec.name}`)
           }
           if (codec !== codecs.at(-1)) {
@@ -322,10 +339,15 @@ const measure = async (kind) => {
           }
         }
         if (!warm) {
+          if (activeSnapshot) snapshotPhase = 'held'
           const settledHeld = await settled()
           const held = { phase: 'held', ...settledHeld, registry: enabled.fingerprint(uuid) }
           memory.mark('enabled:held')
           actives.push(held)
+          if (activeSnapshot) {
+            snapshotPhase = null
+            activeSnapshot.active(held, { phase: 'held', round: null })
+          }
         }
         const censusCoverage = !warm
           ? activeCensus?.complete(codecs.map((codec) => codec.name))
@@ -451,7 +473,10 @@ const measure = async (kind) => {
     const { facts, samples, native, seed, ...arm } = enabledRun
     const readings = {
       manifest,
-      ...(witnesses || activeCensus ? { diagnostic: true, acceptanceEligible: false } : {}),
+      ...(witnesses || activeCensus || activeSnapshot
+        ? { diagnostic: true, acceptanceEligible: false }
+        : {}),
+      ...(activeSnapshot ? { activeSnapshot: activeSnapshot.summary() } : {}),
       ...(witnesses ? { warmupWitnesses: witnesses.summary() } : {}),
       startup,
       loaded,
