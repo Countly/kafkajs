@@ -336,3 +336,39 @@ describe('long-window worker CLI', () => {
     expect(output.log).not.toHaveBeenCalled()
   })
 })
+
+describe('long-window sample timing', () => {
+  test('never arms a negative sample delay when the clock crosses the grid deadline after an early wake', async () => {
+    const { Soak } = require('../soak')
+    const times = [0, 0, 59999.99, 60000.002508]
+    const clock = { now: () => times.shift() ?? 60000.01 }
+    let finish
+    const workload = new Promise((resolve) => {
+      finish = resolve
+    })
+    const run = new Soak({
+      kafka: {},
+      context: {},
+      phases: [],
+      sampleAt: [60000],
+      settleMs: 0,
+      clock,
+      probe: { snapshot: async () => ({}) },
+      workloads: { idle: () => workload },
+      record: (row) => {
+        if (row.kind === 'sample') {
+          run.sampling = false
+          finish()
+        }
+      },
+    })
+    run.nap = jest.fn(async () => {})
+    await run.runPhase({ name: 'telemetry', workload: 'idle', ms: 1320000 }, 0)
+    expect(run.nap.mock.calls.length).toBeGreaterThanOrEqual(1)
+    for (const [delay] of run.nap.mock.calls) expect(delay).toBeGreaterThanOrEqual(0)
+    expect(run.samples).toHaveLength(1)
+    expect(run.samples[0].admittedPhaseMs).toBeGreaterThanOrEqual(60000)
+    expect(run.skipped).toEqual([])
+    expect(run.readFailures).toEqual([])
+  })
+})
