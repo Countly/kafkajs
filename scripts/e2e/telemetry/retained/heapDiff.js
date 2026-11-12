@@ -808,6 +808,7 @@ module.exports = {
   readSnapshot,
   analyseSnapshot,
   ownershipIndex,
+  traceOwner,
   auditReferences,
   prepareReferenceAudits,
 }

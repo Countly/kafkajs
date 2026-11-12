@@ -20291,7 +20291,11 @@
         "scripts/soak/__tests__/closedDiagnostic.spec.js \u203a closed transient diagnostic \u203a captures original endpoints after settled readings and adds one warm reading with the same protocol",
         "scripts/soak/__tests__/closedDiagnostic.spec.js \u203a closed transient diagnostic \u203a requires explicit diagnostic CI and refuses duplicate capture checkpoints",
         "scripts/soak/__tests__/closedDiagnostic.spec.js \u203a closed transient diagnostic \u203a reconciles additive constructor and owner growth without hiding feedback-held application data",
+        "scripts/soak/__tests__/closedDiagnostic.spec.js \u203a closed transient diagnostic \u203a keeps product Map container bytes out of engine feedback storage",
+        "scripts/soak/__tests__/closedDiagnostic.spec.js \u203a closed transient diagnostic \u203a follows real V8 closure contexts only through matching product and harness source trees",
         "scripts/soak/__tests__/closedDiagnostic.spec.js \u203a closed transient diagnostic \u203a emits both endpoint comparisons from the existing snapshot reader and bounds compressed evidence",
+        "scripts/soak/__tests__/closedDiagnostic.spec.js \u203a closed transient diagnostic \u203a archives incomplete captures and enforces the streaming compressed byte cap",
+        "scripts/soak/__tests__/closedDiagnostic.spec.js \u203a closed transient diagnostic \u203a refuses the job outside explicit CI or with mixed experiments before loading the live driver",
         "scripts/soak/__tests__/closedDiagnostic.spec.js \u203a closed transient diagnostic \u203a runs only on explicit dispatch within 45 minutes and outside every verdict dependency"
       ],
       "capMinutes": 85,
@@ -24727,7 +24731,11 @@
         "scripts/soak/__tests__/closedDiagnostic.spec.js \u203a closed transient diagnostic \u203a captures original endpoints after settled readings and adds one warm reading with the same protocol",
         "scripts/soak/__tests__/closedDiagnostic.spec.js \u203a closed transient diagnostic \u203a requires explicit diagnostic CI and refuses duplicate capture checkpoints",
         "scripts/soak/__tests__/closedDiagnostic.spec.js \u203a closed transient diagnostic \u203a reconciles additive constructor and owner growth without hiding feedback-held application data",
+        "scripts/soak/__tests__/closedDiagnostic.spec.js \u203a closed transient diagnostic \u203a keeps product Map container bytes out of engine feedback storage",
+        "scripts/soak/__tests__/closedDiagnostic.spec.js \u203a closed transient diagnostic \u203a follows real V8 closure contexts only through matching product and harness source trees",
         "scripts/soak/__tests__/closedDiagnostic.spec.js \u203a closed transient diagnostic \u203a emits both endpoint comparisons from the existing snapshot reader and bounds compressed evidence",
+        "scripts/soak/__tests__/closedDiagnostic.spec.js \u203a closed transient diagnostic \u203a archives incomplete captures and enforces the streaming compressed byte cap",
+        "scripts/soak/__tests__/closedDiagnostic.spec.js \u203a closed transient diagnostic \u203a refuses the job outside explicit CI or with mixed experiments before loading the live driver",
         "scripts/soak/__tests__/closedDiagnostic.spec.js \u203a closed transient diagnostic \u203a runs only on explicit dispatch within 45 minutes and outside every verdict dependency"
       ],
       "capMinutes": 93,
