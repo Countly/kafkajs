@@ -373,7 +373,7 @@ class ShadowReport {
         throw new Error(`prescribed mid-cycle reading at ${at} ms is not quiet`)
     if (mid.length !== prescribed.length)
       throw new Error('unexpected mid-cycle readings on the frozen grid')
-    const fit = (rows) => ({
+    const fitSeries = (rows) => ({
       raw: seriesOf(rows.map((r) => [r.minutes, r.rawBytes])),
       data: seriesOf(rows.map((r) => [r.minutes, r.dataBytes])),
     })
@@ -384,7 +384,7 @@ class ShadowReport {
       dataBytes: entry.dataBytes - first.dataBytes,
     }
     const { thresholds } = params
-    const series = fit(mid)
+    const series = fitSeries(mid)
     const slopeBytes = series.data.slopeBytesPerMinute
     const masked = slopeBytes < thresholds.maskingSlopeBytesPerMinute
     const unseeded = {
@@ -407,7 +407,7 @@ class ShadowReport {
       mid: { readings: mid.length, ...series },
       boundary: {
         readings: boundary.length,
-        ...(boundary.length >= 2 ? fit(boundary) : { raw: null, data: null }),
+        ...(boundary.length >= 2 ? fitSeries(boundary) : { raw: null, data: null }),
       },
       firstUse: {
         fromAtMs: first.admittedAtMs,

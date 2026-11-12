@@ -14,6 +14,55 @@ const { LONG_WINDOW } = require('./longWindow')
 
 const KIB = 1024
 const FILE = 'long-window.json'
+const NODES = ['22', '24', '26']
+const KAFKAS = ['4.2.2', '4.3.1']
+const KINDS = ['producer', 'consumer', 'admin', 'shareConsumer']
+const REPLICATES = [1, 2, 3]
+
+/** @param {Array<string|number>} parts identity fields @returns {string} an unambiguous map key */
+const keyOf = (parts) => JSON.stringify(parts)
+
+/**
+ * Indexes one frozen collection without combining commits, runtimes or duplicate downloads.
+ * @param {object[]} records the diagnostic job records
+ * @returns {Map<string, object>} workers by Node major, Kafka, arm, replicate and kind
+ * @throws {Error} for duplicate identities, mixed commits/runtimes or an unexpected matrix tuple
+ */
+const observationsOf = (records) => {
+  const observations = new Map()
+  const identities = new Set()
+  const runtimes = new Map()
+  let commit = null
+  for (const record of records) {
+    const { node, kafka, arm, replicate, workers } = record
+    const sha = record.sha ?? record.tree
+    const major = /^v(\d+)\./.exec(node)?.[1]
+    if (typeof sha !== 'string' || !sha.length) throw new Error('missing collection commit')
+    commit ??= sha
+    if (sha !== commit) throw new Error('mixed commits in long-window collection')
+    if (runtimes.has(major) && runtimes.get(major) !== node)
+      throw new Error('mixed Node runtimes for Node ' + major)
+    runtimes.set(major, node)
+    if (
+      !NODES.includes(major) ||
+      !KAFKAS.includes(kafka) ||
+      !LONG_WINDOW.arms.includes(arm) ||
+      !REPLICATES.includes(replicate) ||
+      (arm === 'warmup-seed' && (kafka !== '4.3.1' || replicate !== 1)) ||
+      !Array.isArray(workers)
+    )
+      throw new Error('unexpected long-window matrix tuple')
+    for (const worker of workers) {
+      if (!KINDS.includes(worker.kind) || worker.arm !== arm)
+        throw new Error('unexpected long-window worker tuple')
+      const identity = keyOf([sha, node, kafka, arm, replicate, worker.kind])
+      if (identities.has(identity)) throw new Error('duplicate long-window identity ' + identity)
+      identities.add(identity)
+      observations.set(keyOf([major, kafka, arm, replicate, worker.kind]), worker)
+    }
+  }
+  return observations
+}
 
 /**
  * @param {string} directory the downloaded artifacts root
@@ -58,15 +107,16 @@ const mean = (values) => values.reduce((sum, value) => sum + value, 0) / values.
  * S3 of one Node from its seeded slopes and its unseeded slopes grouped by tuple (Kafka and kind).
  * @param {number[]} seeded the seeded data slopes, KiB/min
  * @param {number[][]} tuples the unseeded data slopes of each tuple, KiB/min
+ * @param {boolean} complete whether every expected observation is complete
  * @returns {object} `status` `pass`, `fail` or `insufficient`, the two means, the pooled SD and the
  *   two bounds the thresholds are compared with
  */
-const s3Of = (seeded, tuples) => {
+const s3Of = (seeded, tuples, complete) => {
   const unseeded = tuples.flat()
   const sd = pooledSd(tuples)
   const seededMean = seeded.length ? mean(seeded) : null
   const unseededMean = unseeded.length ? mean(unseeded) : null
-  if (sd === null || seededMean === null)
+  if (!complete || sd === null || seededMean === null)
     return {
       status: 'insufficient',
       seededMean,
@@ -93,50 +143,80 @@ const s3Of = (seeded, tuples) => {
 
 /**
  * @param {object[]} records the long-window records of every job
- * @returns {{nodes: Object<string, object>}} per Node major version: `s1` and `s2` as `{pass, total}`,
- *   the masked unseeded workers, the first-use trips of the warm-up seed, the incomplete workers and
- *   `s3`; incomplete workers are counted and never enter a table
+ * @returns {{nodes: Object<string, object>}} the frozen three-replicate table for Node 22/24/26.
+ *   Missing and incomplete observations stay in the denominators and make their lane insufficient;
+ *   S3 requires the complete collection and uses only valid slopes for its descriptive statistics.
+ * @throws {Error} for duplicate identities or records outside one frozen collection
  */
 const summarise = (records) => {
+  const observations = observationsOf(records)
   const nodes = {}
-  const seeded = {}
-  const tuples = {}
-  for (const record of records) {
-    const major = /^v(\d+)\./.exec(record.node)?.[1] ?? String(record.node)
-    nodes[major] ??= {
-      s1: { pass: 0, total: 0 },
-      s2: { pass: 0, total: 0 },
+  for (const major of NODES) {
+    const lane = () => ({ pass: 0, total: 0, missing: 0, incomplete: 0 })
+    const node = {
+      s1: lane(),
+      s2: lane(),
       masked: 0,
-      firstUse: { tripped: 0, total: 0 },
+      firstUse: { tripped: 0, total: 0, missing: 0, incomplete: 0 },
+      missing: 0,
       incomplete: 0,
     }
-    seeded[major] ??= []
-    tuples[major] ??= new Map()
-    const node = nodes[major]
-    for (const worker of record.workers) {
-      if (!worker.complete) {
+    const seeded = []
+    const tuples = []
+    const observe = (kafka, arm, replicate, kind, target) => {
+      target.total += 1
+      const worker = observations.get(keyOf([major, kafka, arm, replicate, kind]))
+      if (!worker) {
+        node.missing += 1
+        target.missing += 1
+        return null
+      }
+      const verdict = arm === 'seeded' ? worker.wouldBe?.s1 : worker.wouldBe?.s2
+      const valid =
+        worker.complete === true &&
+        Number.isFinite(worker.mid?.data?.slopeBytesPerMinute) &&
+        (arm === 'warmup-seed'
+          ? typeof worker.firstUse?.tripped === 'boolean'
+          : typeof verdict?.pass === 'boolean')
+      if (!valid) {
         node.incomplete += 1
-        continue
+        target.incomplete += 1
+        return null
       }
-      const slope = worker.mid.data.slopeBytesPerMinute / KIB
-      if (record.arm === 'seeded') {
-        node.s1.total += 1
-        if (worker.wouldBe?.s1?.pass) node.s1.pass += 1
-        seeded[major].push(slope)
-      } else if (record.arm === 'unseeded') {
-        node.s2.total += 1
-        if (worker.wouldBe?.s2?.pass) node.s2.pass += 1
-        if (worker.masked) node.masked += 1
-        const key = `${record.kafka}|${worker.kind}`
-        tuples[major].set(key, [...(tuples[major].get(key) ?? []), slope])
-      } else if (record.arm === 'warmup-seed') {
-        node.firstUse.total += 1
-        if (worker.firstUse?.tripped) node.firstUse.tripped += 1
-      }
+      return worker
     }
+    for (const kafka of KAFKAS)
+      for (const kind of KINDS) {
+        const unseeded = []
+        for (const replicate of REPLICATES) {
+          const positive = observe(kafka, 'seeded', replicate, kind, node.s1)
+          if (positive) {
+            if (positive.wouldBe.s1.pass) node.s1.pass += 1
+            seeded.push(positive.mid.data.slopeBytesPerMinute / KIB)
+          }
+          const negative = observe(kafka, 'unseeded', replicate, kind, node.s2)
+          if (negative) {
+            if (negative.wouldBe.s2.pass) node.s2.pass += 1
+            if (negative.masked) node.masked += 1
+            unseeded.push(negative.mid.data.slopeBytesPerMinute / KIB)
+          }
+        }
+        tuples.push(unseeded)
+      }
+    for (const kind of KINDS) {
+      const worker = observe('4.3.1', 'warmup-seed', 1, kind, node.firstUse)
+      if (worker?.firstUse.tripped) node.firstUse.tripped += 1
+    }
+    for (const target of [node.s1, node.s2, node.firstUse])
+      target.status =
+        target.missing || target.incomplete
+          ? 'insufficient'
+          : (target.pass ?? target.tripped) === target.total
+            ? 'pass'
+            : 'fail'
+    node.s3 = s3Of(seeded, tuples, node.missing === 0 && node.incomplete === 0)
+    nodes[major] = node
   }
-  for (const major of Object.keys(nodes))
-    nodes[major].s3 = s3Of(seeded[major], [...tuples[major].values()])
   return { nodes }
 }
 
@@ -145,7 +225,7 @@ const summarise = (records) => {
  */
 const s3Text = (s3) => {
   if (s3.status === 'insufficient')
-    return 'n/a (needs seeded and unseeded workers and two replicates per tuple)'
+    return 'insufficient (needs the complete collection with three replicates per tuple)'
   const sigmas = LONG_WINDOW.thresholds.sigmas
   const sd = s3.sd.toFixed(1)
   return (
@@ -164,10 +244,10 @@ const render = ({ nodes }) => {
     'long-window shadow table (diagnostic, never acceptance); mid-cycle data slopes, KiB/min',
     [
       cell('node', 6),
-      cell('S1 seeded>=96', 15),
-      cell('S2 unseeded<=64,<=1MiB,unmasked', 33),
+      cell('S1 seeded>=96', 23),
+      cell('S2 unseeded<=64,<=1MiB,unmasked', 40),
       cell('masked', 8),
-      cell('first-use', 11),
+      cell('first-use', 21),
       'S3',
     ].join(''),
   ]
@@ -176,11 +256,13 @@ const render = ({ nodes }) => {
     lines.push(
       [
         cell(major, 6),
-        cell(`${node.s1.pass}/${node.s1.total}`, 15),
-        cell(`${node.s2.pass}/${node.s2.total}`, 33),
+        cell(`${node.s1.pass}/${node.s1.total} ${node.s1.status}`, 23),
+        cell(`${node.s2.pass}/${node.s2.total} ${node.s2.status}`, 40),
         cell(node.masked, 8),
-        cell(`${node.firstUse.tripped}/${node.firstUse.total}`, 11),
-        s3Text(node.s3) + (node.incomplete ? ` [${node.incomplete} incomplete workers]` : ''),
+        cell(`${node.firstUse.tripped}/${node.firstUse.total} ${node.firstUse.status}`, 21),
+        s3Text(node.s3) +
+          (node.missing ? ` [${node.missing} missing workers]` : '') +
+          (node.incomplete ? ` [${node.incomplete} incomplete workers]` : ''),
       ].join('')
     )
   }
