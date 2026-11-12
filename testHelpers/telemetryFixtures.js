@@ -42,12 +42,17 @@ const canonicalUuid = (value) => {
 class TelemetryExportReader {
   /**
    * @param {string} directory fresh absolute run sink directory
+   * @param {object} [options] sink limits; the existing lane keeps its 2 MiB file cap
+   * @param {number} [options.fileBytes] maximum bytes of each complete node sink
    * @returns {TelemetryExportReader} bounded reader
    * @throws {Error} for a relative directory
    */
-  constructor(directory) {
+  constructor(directory, { fileBytes = FILE_CAP } = {}) {
     if (!path.isAbsolute(directory)) throw new Error('Expected an absolute export directory')
+    if (!Number.isSafeInteger(fileBytes) || fileBytes < 1)
+      throw new Error('Expected a positive sink file cap')
     this.directory = directory
+    this.fileBytes = fileBytes
   }
 
   /**
@@ -99,7 +104,7 @@ class TelemetryExportReader {
       let rows
       try {
         const stat = fs.fstatSync(fd)
-        if (!stat.isFile() || stat.size > FILE_CAP) throw new Error('Telemetry sink file cap')
+        if (!stat.isFile() || stat.size > this.fileBytes) throw new Error('Telemetry sink file cap')
         rows = this.#readRows(fd, stat.size)
       } finally {
         fs.closeSync(fd)
@@ -375,8 +380,10 @@ const withTelemetryResource = async (
  * @returns {object[]} bounded independent exporter records
  * @throws {Error} for absent configuration or corrupt evidence
  */
-const readExports = (options) =>
-  new TelemetryExportReader(process.env.TELEMETRY_EVIDENCE_DIR || '').readExports(options)
+const readExports = ({ fileBytes, ...options } = {}) =>
+  new TelemetryExportReader(process.env.TELEMETRY_EVIDENCE_DIR || '', { fileBytes }).readExports(
+    options
+  )
 
 const ENDPOINTS = Object.freeze({
   configured: Object.freeze({ 19092: '1', 19095: '2', 19098: '3' }),
@@ -828,6 +835,7 @@ class TelemetryWireObserver {
    * @param {function(object, function):object} [options.dial] socket dialer, `net.connect` by default
    * @param {boolean} [options.completeStream=false] decode every accepted nonempty Push before disposal
    * @param {Partial<typeof DEFAULT_LIMITS>} [options.limits] lower bounds for controls
+   * @param {number} [options.sinkBytes] sink file cap; omitted for the existing lane
    * @param {function(Buffer, number):Promise<object>} [options.decoder] decoder seam for controls
    * @param {string} [options.decoderScript] runner script, `scripts/e2e/telemetry/run.sh` by default
    * @param {object} [options.env] environment of the decoder child
@@ -844,6 +852,7 @@ class TelemetryWireObserver {
     owner = 'client',
     dial = net.connect,
     limits = {},
+    sinkBytes,
     decoder,
     completeStream = false,
     decoderScript = DECODER_SCRIPT,
@@ -872,7 +881,7 @@ class TelemetryWireObserver {
     this.#line = line
     this.#decoder = decoder
     this.#owner = owner
-    this.#reader = new TelemetryExportReader(directory)
+    this.#reader = new TelemetryExportReader(directory, { fileBytes: sinkBytes })
     this.directory = fs.mkdtempSync(path.join(directory, 'observer-'))
     this.tmp = path.join(this.directory, 'tmp')
     fs.mkdirSync(this.tmp)

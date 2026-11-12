@@ -802,7 +802,14 @@ jobs:
           timeout -k 5s 180s bash scripts/e2e/telemetry/fetch.sh
           timeout -k 5s 30s bash scripts/e2e/telemetry/run.sh verify "$KAFKA_VERSION"
           timeout -k 5s 60s node scripts/e2e/telemetry/prepareDecoder.js
+      - name: Prepare the bounded long-window reporter
+        timeout-minutes: 4
+        env:
+          TELEMETRY_LONG_WINDOW: '1'
+        run: timeout -k 5s 210s node scripts/soak/longWindowReporter.js
       - name: Preflight isolated project ownership
+        env:
+          TELEMETRY_LONG_WINDOW: '1'
         timeout-minutes: 2
         run: timeout -k 5s 90s node scripts/e2e/telemetry/ci.js preflight
       - name: Prepare broker image
@@ -811,9 +818,11 @@ jobs:
       - name: Start and warm the owned telemetry cluster
         timeout-minutes: 6
         run: |
-          timeout -k 5s 90s docker compose -f "$COMPOSE_FILE" up -d --pull never
+          timeout -k 5s 90s docker compose -f "$COMPOSE_FILE" -f .tmp/telemetry-long-reporter/compose.json up -d --pull never
           timeout -k 5s 240s node scripts/waitForKafka.js
       - name: Verify mounted reporter and capture broker identities
+        env:
+          TELEMETRY_LONG_WINDOW: '1'
         timeout-minutes: 3
         run: timeout -k 5s 150s node scripts/e2e/telemetry/ci.js capture
       - name: Run the long-window shadow candidate for one arm and replicate
@@ -822,6 +831,8 @@ jobs:
           TMPDIR: ${{ runner.temp }}
         run: timeout -k 10s 1980s node --expose-gc scripts/soak/longWindowDiagnostic.js --diagnostic-only "$LONG_WINDOW_ROOT"
       - name: Stop owned project and prove container network volume removal
+        env:
+          TELEMETRY_LONG_WINDOW: '1'
         if: always()
         timeout-minutes: 3
         run: |
@@ -834,6 +845,7 @@ jobs:
           name: telemetry-long-window-node${{ matrix.node }}-${{ matrix.kafka }}-${{ matrix.arm }}-r${{ matrix.replicate }}
           path: |
             .tmp/long-window/
+            .tmp/telemetry-long-reporter/
             .tmp/e2e/
             .tmp/telemetry-evidence/
             .tmp/telemetry-cache/decoder-*.jsa.json

@@ -52,6 +52,32 @@ const LONG_WINDOW = Object.freeze({
 })
 
 /**
+ * A sink can receive all four clients: 1,320 periodic Pushes per client, plus the unchanged
+ * 180 s setup/cleanup reserve, two edge Pushes for each of 23 lifecycles, and an extra Push for
+ * each retirement (43) and subscription transition (131). These deliberately overcount overlapping
+ * events. Each JSON record is at most 4,096 bytes plus its newline; reserve another 25%, then
+ * round up to MiB. The queue, record size, per-lifecycle observer and packed-file caps stay fixed.
+ * The long diagnostic writes worker archives directly, without the 512-file/16 MiB scenario packer.
+ */
+const phaseMs = LONG_WINDOW.warmupMs + LONG_WINDOW.measureMs
+const sinkLifecycles = Math.ceil(phaseMs / LONG_WINDOW.reopenMs) + 1
+const sinkRows =
+  4 *
+  (Math.ceil((phaseMs + 180000) / 1000) +
+    2 * sinkLifecycles +
+    Math.ceil(phaseMs / 30000) -
+    1 +
+    Math.ceil(phaseMs / 10000) -
+    1)
+const SINK_BUDGET = Object.freeze({
+  lifecycles: sinkLifecycles,
+  rows: sinkRows,
+  requiredBytes: sinkRows * 4097,
+  margin: 1.25,
+})
+const SINK_BYTES = Math.ceil((SINK_BUDGET.requiredBytes * SINK_BUDGET.margin) / MIB) * MIB
+
+/**
  * @returns {ReadonlyArray<number>} the phase-anchored reading times of the candidate: every 30 s from
  *   60 s up to one interval before the end, then one 1 s before the end, as the existing lane does
  */
@@ -96,6 +122,8 @@ const limitsOf = (base) =>
     messageBytes: LONG_WINDOW.messageBytes,
     totalBytes: LONG_WINDOW.totalBytes,
     scenario: LONG_WINDOW.scenario,
+    sinkBytes: SINK_BYTES,
+    sinkBudget: SINK_BUDGET,
   })
 
 /**
@@ -453,6 +481,8 @@ class ShadowReport {
 }
 
 module.exports = {
+  SINK_BUDGET,
+  SINK_BYTES,
   LONG_WINDOW,
   HeapSpaceJournal,
   MidCycle,

@@ -7660,7 +7660,12 @@ const buildTelemetryChurn = ({ brokers: requested, phases, record }) => {
       messageBytes: ACTIVE_TELEMETRY.messageBytes,
       totalBytes: ACTIVE_TELEMETRY.totalBytes,
     }),
-    decoder: new churn.DecoderCoordinator({ directory, line, clock }),
+    decoder: new churn.DecoderCoordinator({
+      directory,
+      line,
+      clock,
+      sinkBytes: ACTIVE_TELEMETRY.sinkBytes,
+    }),
     record: record ?? ((row) => writeEvidence('telemetry-churn', row)),
     clock,
     limits: ACTIVE_TELEMETRY,

@@ -2238,6 +2238,7 @@ class DecoderCoordinator {
    * @param {DecoderGate} [options.gate] the concurrency limiter, four by default
    * @param {Function} [options.make] builds the observer; a spec supplies a fake
    * @param {function():object[]} [options.exports] reads the broker sink rows
+   * @param {number} [options.sinkBytes] long-window sink cap; omitted for the existing lane
    */
   constructor({
     directory,
@@ -2246,15 +2247,17 @@ class DecoderCoordinator {
     env = process.env,
     gate = new DecoderGate(DECODER_SLOTS),
     make = (options) => new TelemetryWireObserver(options),
-    exports = readExports,
+    exports,
+    sinkBytes,
   }) {
-    this.exports = exports
+    this.exports = exports ?? (() => readExports({ fileBytes: sinkBytes }))
     this.observer = make({
       directory,
       line,
       clock,
       mode: 'configured',
       owner: 'parent-decoder',
+      sinkBytes,
       gate,
       env,
     })
@@ -4644,6 +4647,7 @@ class TelemetryWorkerProcess {
           mode: 'configured',
           decoder: (raw) => this.askDecode(raw),
           completeStream: false,
+          sinkBytes: soak.TELEMETRY.sinkBytes,
           consumed: new Set(),
         },
       })

@@ -398,6 +398,32 @@ describe('long-window fixture capacity', () => {
     expect(prepared).not.toBe(source)
     expect(prepared).toContain('overflow("file-cap")')
     expect(prepared).toContain('overflow("queue-full")')
+    const env = { CI: 'true', TELEMETRY_LONG_WINDOW: '1', KAFKA_VERSION: '4.3.1' }
+    const output = path.join(directory, 'prepared')
+    const run = jest.fn((command, args) => {
+      if (command === 'jar' && args.includes('--create'))
+        fs.writeFileSync(path.join(output, 'reporter.jar'), 'compiled reporter')
+    })
+    const reporter = new LongWindowReporter({ env, run, directory: output })
+    jest.spyOn(reporter, 'inputs').mockReturnValue({
+      original: source,
+      retainedJar: 'retained.jar',
+      dependencies: [],
+      sourceSha256: require('crypto').createHash('sha256').update(source).digest('hex'),
+      retainedSha256: 'b'.repeat(64),
+    })
+    const receipt = reporter.prepare()
+    expect(run.mock.calls.map(([command]) => command)).toEqual(['jar', 'javac', 'jar'])
+    expect(fs.readFileSync(path.join(output, 'CountingTelemetryReporter.java'), 'utf8')).toBe(
+      prepared
+    )
+    expect(reporter.read()).toMatchObject({ sha256: receipt.sha256, sinkBytes: LONG.sinkBytes })
+    fs.writeFileSync(path.join(output, 'reporter.jar'), 'foreign jar')
+    expect(() => reporter.read()).toThrow()
+    expect(
+      () => new LongWindowReporter({ env: { ...env, TELEMETRY_LONG_WINDOW: undefined } })
+    ).toThrow('diagnostic CI-only')
+
     expect(() =>
       LongWindowReporter.source(source.replace('MAX_FILE_BYTES = 2L', 'MAX_FILE_BYTES = 3L'))
     ).toThrow('reporter file cap')
@@ -435,8 +461,73 @@ describe('long-window fixture capacity', () => {
     })
     owner.run(['compose', '-f', owner.file, 'config'])
     expect(docker.mock.calls[0][0]).toEqual(['compose', '-f', owner.file, 'config'])
-    const ci = fs.readFileSync(path.join(__dirname, '../../e2e/telemetry/ci.js'), 'utf8')
-    expect(ci).toMatch(/reporterSha256, this\.longReporter\?\.sha256 \?\? manifest/)
+    const { LongWindowReporter } = jest.requireActual('../longWindowReporter')
+    const expected = {
+      sha256: 'd'.repeat(64),
+      sinkBytes: LONG.sinkBytes,
+      compose: '/long/compose.json',
+    }
+    const read = jest.spyOn(LongWindowReporter.prototype, 'read').mockReturnValue(expected)
+    try {
+      const longOwner = new CiOwnership({
+        env: {
+          CI: 'true',
+          TELEMETRY_LONG_WINDOW: '1',
+          KAFKA_VERSION: '4.3.1',
+          COMPOSE_PROJECT_NAME: 'telemetry-long',
+          COMPOSE_FILE: owner.file,
+        },
+        docker,
+      })
+      longOwner.run(['compose', '-f', owner.file, 'config'])
+      expect(docker.mock.calls.at(-1)[0]).toEqual([
+        'compose',
+        '-f',
+        owner.file,
+        '-f',
+        expected.compose,
+        'config',
+      ])
+      longOwner.directory = directory
+      longOwner.read = () => ({ line: '4.3.1' })
+      longOwner.save = jest.fn()
+      const manifest = require('../../e2e/telemetry/fixtures/manifest.json')
+      longOwner.journal = () =>
+        [1, 2, 3].map((id) => ({
+          Id: String(id),
+          Image: 'image',
+          State: { Running: true },
+          Config: {
+            Labels: {
+              'com.docker.compose.project': 'telemetry-long',
+              'com.docker.compose.service': `kafka${id}`,
+            },
+          },
+        }))
+      for (const id of [1, 2, 3])
+        fs.writeFileSync(
+          path.join(directory, `reporter-${id}.json`),
+          JSON.stringify({ maxFileBytes: LONG.sinkBytes })
+        )
+      let mounted = expected.sha256
+      docker.mockImplementation((args) => {
+        if (args[0] === 'image')
+          return JSON.stringify([{ Id: 'image', RepoDigests: manifest.lines['4.3.1'].repoDigests }])
+        if (args.includes('--version')) return '4.3.1'
+        return args.at(-1).endsWith('reporter.jar') ? mounted : 'a'.repeat(64)
+      })
+      longOwner.capture()
+      expect(longOwner.save).toHaveBeenCalledWith(
+        expect.objectContaining({ longReporter: expected })
+      )
+      mounted = 'f'.repeat(64)
+      expect(() => longOwner.capture()).toThrow()
+      mounted = expected.sha256
+      fs.writeFileSync(path.join(directory, 'reporter-1.json'), '{"maxFileBytes":2097152}')
+      expect(() => longOwner.capture()).toThrow('Long reporter sink cap mismatch')
+    } finally {
+      read.mockRestore()
+    }
   })
 
   test('offers all 440 batches before the long boundary without changing the corpus rate', () => {
