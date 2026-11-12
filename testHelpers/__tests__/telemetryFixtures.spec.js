@@ -122,6 +122,64 @@ describe('independent telemetry evidence', () => {
     expect(reader.readExports()).toEqual([])
     expect(() => reader.readExports({ after: 3 })).toThrow('cursor')
   })
+
+  test('reads a full sink in bounded chunks without changing bytes or selected evidence', () => {
+    const otherId = '00000000-0000-0000-0000-000000000000'
+    const expected = Array.from({ length: 512 }, (_, i) =>
+      row('1', i + 1, {
+        clientInstanceId: i % 2 ? otherId : ID,
+        detail: '雪'.repeat(1000),
+      })
+    )
+    const partial = JSON.stringify(row('1', 513)).slice(0, 25)
+    write('1', [...expected].reverse(), partial)
+    const file = path.join(directory, 'exports-1.jsonl')
+    const original = fs.readFileSync(file)
+    const digest = crypto.createHash('sha256').update(original).digest('hex')
+    expect(original.length).toBeGreaterThan(1024 * 1024)
+    const { persistEvidence } = require('../../scripts/e2e/telemetry/evidence')
+    const archive = (exports) =>
+      persistEvidence({
+        name: 'telemetry-churn',
+        directory,
+        observers: {},
+        record: { status: 'passed', run: { stem: 'bounded-reader' }, oracles: { exports } },
+      })
+    const before = archive(expected)
+    const archivedBytes = before.files.map((file) =>
+      fs.readFileSync(path.join(directory, file.path))
+    )
+    fs.rmSync(path.join(directory, before.root), { recursive: true })
+    const readSync = fs.readSync
+    const lengths = []
+    let actual
+    const reading = jest
+      .spyOn(fs, 'readSync')
+      .mockImplementation((fd, bytes, offset, length, at) => {
+        lengths.push(length)
+        return readSync(fd, bytes, offset, length, at)
+      })
+    try {
+      actual = reader.readExports()
+      expect(actual).toEqual(expected)
+      expect(reader.readExports({ uuid: ID, after: { 1: 200 } })).toEqual(
+        expected.filter((item) => item.clientInstanceId === ID && item.seq > 200)
+      )
+    } finally {
+      reading.mockRestore()
+    }
+    expect(lengths.length).toBeGreaterThan(2)
+    expect(Math.max(...lengths)).toBeLessThanOrEqual(4096)
+    const after = archive(actual)
+    expect(after).toEqual(before)
+    expect(after.files.map((file) => fs.readFileSync(path.join(directory, file.path)))).toEqual(
+      archivedBytes
+    )
+    expect(fs.readFileSync(file)).toEqual(original)
+    expect(crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')).toBe(digest)
+    fs.appendFileSync(file, JSON.stringify(row('1', 513)).slice(partial.length) + '\n')
+    expect(reader.readExports({ after: { 1: 512 } })).toEqual([row('1', 513)])
+  })
 })
 
 describe('new topic config propagation', () => {
