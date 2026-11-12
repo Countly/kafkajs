@@ -15,7 +15,7 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
 concurrency:
-  group: memory-gates-${{ github.ref }}
+  group: memory-gates-${{ github.ref }}-${{ inputs.only || 'all' }}-${{ inputs.replicates || '1' }}
   cancel-in-progress: true
 jobs:
   select:
