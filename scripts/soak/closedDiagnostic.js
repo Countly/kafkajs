@@ -5,6 +5,8 @@ const path = require('node:path')
 const v8 = require('node:v8')
 
 const FLAGS = Object.freeze({ diagnostic: true, acceptanceEligible: false })
+/** Engine code journal rows: the warm capture's extra settles overflow the 64-row default. */
+const ENGINE_ROWS = 128
 
 /** Three endpoint captures, written synchronously only AFTER the original settled heap reading. */
 class ClosedCapture {
@@ -117,7 +119,7 @@ const installClosedDiagnostic = (worker, env = process.env, ports = {}) => {
   worker.soak = {
     ...worker.soak,
     Soak: ClosedSoak,
-    TELEMETRY: { ...worker.soak.TELEMETRY, ...FLAGS },
+    TELEMETRY: { ...worker.soak.TELEMETRY, ...FLAGS, engineRows: ENGINE_ROWS },
   }
 }
 
