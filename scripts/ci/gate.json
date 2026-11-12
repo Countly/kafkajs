@@ -20243,7 +20243,17 @@
         "src/admin/__tests__/adminVersionsLive.spec.js \u203a Admin > captured newest versions a capture cannot supply a broker-only API",
         "src/admin/__tests__/adminVersionsLive.spec.js \u203a Admin > captured newest versions an uncaptured broker version cannot fall back to another recording",
         "scripts/soak/__tests__/soak.spec.js \u203a Share soak cycle finalization and isolation adapter reserves the reset node diagnostic for its replacement socket after a retiring write=false",
-        "scripts/soak/__tests__/soak.spec.js \u203a Share soak cycle finalization and isolation adapter reserves the reset node diagnostic for its replacement socket after a retiring write=true"
+        "scripts/soak/__tests__/soak.spec.js \u203a Share soak cycle finalization and isolation adapter reserves the reset node diagnostic for its replacement socket after a retiring write=true",
+        "scripts/soak/__tests__/shareSoakLiveAssertions.spec.js \u203a share soak live verifier assertions proves active heartbeats and every original zero-interval leave separately",
+        "scripts/soak/__tests__/shareSoakLiveAssertions.spec.js \u203a share soak live verifier assertions rejects zero active interval after accepting the pristine recording",
+        "scripts/soak/__tests__/shareSoakLiveAssertions.spec.js \u203a share soak live verifier assertions rejects only leave heartbeats after accepting the pristine recording",
+        "scripts/soak/__tests__/shareSoakLiveAssertions.spec.js \u203a share soak live verifier assertions rejects missing departure after accepting the pristine recording",
+        "scripts/soak/__tests__/shareSoakLiveAssertions.spec.js \u203a share soak live verifier assertions rejects missing leave frame after accepting the pristine recording",
+        "scripts/soak/__tests__/shareSoakLiveAssertions.spec.js \u203a share soak live verifier assertions rejects mismatched leave correlation after accepting the pristine recording",
+        "scripts/soak/__tests__/shareSoakLiveAssertions.spec.js \u203a share soak live verifier assertions rejects rejected leave after accepting the pristine recording",
+        "scripts/soak/__tests__/shareSoakLiveAssertions.spec.js \u203a share soak live verifier assertions rejects non-leave response epoch after accepting the pristine recording",
+        "scripts/soak/__tests__/shareSoakLiveAssertions.spec.js \u203a share soak live verifier assertions rejects unordered heartbeat answer after accepting the pristine recording",
+        "scripts/soak/__tests__/shareSoakLiveAssertions.spec.js \u203a share soak live verifier assertions rejects missing active response bytes after accepting the pristine recording"
       ],
       "capMinutes": 85,
       "allowedSkips": [

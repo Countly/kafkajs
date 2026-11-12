@@ -201,7 +201,7 @@ const originalShareSchedule = async ({
           errorCode: 0,
           memberId: fields.memberId,
           memberEpoch: -1,
-          heartbeatIntervalMs: 5000,
+          heartbeatIntervalMs: 0,
           assignment: null,
         }
       }
