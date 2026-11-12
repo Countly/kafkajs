@@ -1009,6 +1009,138 @@ describe('resource artifact validation', () => {
     })
   })
 
+  describe('peak reading decreases', () => {
+    test.each(ARMS)('records every decrease and retains the maximum for the %s arm', (arm) => {
+      const whole = record(arm)
+      const prefix = arm === 'public' ? 'enabled' : 'collector'
+      const marks = whole.readings.marks
+      Object.assign(markOf(whole.readings, `${prefix}:held`), {
+        vmhwm: 119 * MIB,
+        maxRss: 357482496,
+      })
+      Object.assign(markOf(whole.readings, `${prefix}:closed`), {
+        vmhwm: 118 * MIB,
+        maxRss: 357351424,
+      })
+      Object.assign(markOf(whole.readings, 'final'), {
+        vmhwm: 119 * MIB,
+        maxRss: 357613568,
+      })
+      const original = JSON.stringify(whole)
+      const result = judgeMemoryArm(JSON.parse(original))
+      expect(result).toMatchObject({ verdict: 'pass', problems: [] })
+      expect(result.facts).toEqual({
+        peak: 120 * MIB,
+        setupPeak: 80 * MIB,
+        peakDecreases: [
+          {
+            index: arm === 'public' ? 12 : 11,
+            phase: `${prefix}:held`,
+            field: 'maxRss',
+            before: 357744640,
+            after: 357482496,
+            delta: -262144,
+          },
+          {
+            index: arm === 'public' ? 12 : 11,
+            phase: `${prefix}:held`,
+            field: 'vmhwm',
+            before: 120 * MIB,
+            after: 119 * MIB,
+            delta: -MIB,
+          },
+          {
+            index: arm === 'public' ? 13 : 12,
+            phase: `${prefix}:closed`,
+            field: 'maxRss',
+            before: 357482496,
+            after: 357351424,
+            delta: -131072,
+          },
+          {
+            index: arm === 'public' ? 13 : 12,
+            phase: `${prefix}:closed`,
+            field: 'vmhwm',
+            before: 119 * MIB,
+            after: 118 * MIB,
+            delta: -MIB,
+          },
+        ],
+      })
+      expect(JSON.stringify(whole)).toBe(original)
+      expect(marks.at(-1).vmhwm).toBe(119 * MIB)
+    })
+
+    test.each([
+      [
+        'setup',
+        'control:c0',
+        96 * MIB + 1,
+        'inconclusive',
+        'setup exceeds the 96 MiB admission allowance',
+      ],
+      [
+        'delta',
+        'enabled:gzip',
+        137 * MIB + 1,
+        'fail',
+        'telemetry RSS peak exceeds 64 MiB above the disabled control',
+      ],
+      [
+        'absolute',
+        'enabled:gzip',
+        160 * MIB + 1,
+        'fail',
+        'absolute current-image peak exceeds 160 MiB',
+      ],
+    ])('preserves the %s limit after a decrease', (_name, phase, peak, verdict, problem) => {
+      const result = judged('public', (r) => (markOf(r, phase).vmhwm = peak))
+      expect(result.verdict).toBe(verdict)
+      expect(result.problems).toContain(problem)
+      expect(result.facts.peak).toBe(Math.max(120 * MIB, peak))
+      expect(result.facts.setupPeak).toBe(phase === 'control:c0' ? peak : 80 * MIB)
+      expect(result.facts.peakDecreases).toHaveLength(1)
+    })
+
+    test('keeps invalid marks and uncovered readings rejected after a decrease', () => {
+      for (const [change, verdict, problem] of [
+        [
+          (r) => delete markOf(r, 'enabled:closed').covered,
+          'fail',
+          'enabled:closed mark is incomplete',
+        ],
+        [
+          (r) => (markOf(r, 'enabled:closed').maxRss = Infinity),
+          'fail',
+          'enabled:closed mark is incomplete',
+        ],
+        [
+          (r) => (markOf(r, 'enabled:closed').vmhwm = NaN),
+          'fail',
+          'peak source is claimed but a mark has no reading',
+        ],
+        [
+          (r) => (markOf(r, 'enabled:closed').vmhwm = null),
+          'fail',
+          'peak source is claimed but a mark has no reading',
+        ],
+        [(r) => (markOf(r, 'enabled:closed').at = 1), 'fail', 'marks are out of order'],
+        [
+          (r) => (markOf(r, 'enabled:held').covered = 120 * MIB),
+          'inconclusive',
+          'peak source does not cover a current reading',
+        ],
+      ]) {
+        const result = judged('public', (r) => {
+          markOf(r, 'enabled:held').vmhwm = 119 * MIB
+          change(r)
+        })
+        expect(result.verdict).toBe(verdict)
+        expect(result.problems).toContain(problem)
+      }
+    })
+  })
+
   describe('the schema and the shape of the evidence', () => {
     test.each([1, 2, 3, 4, 5])('rejects schema %s without frozen module evidence', (schema) => {
       const old = record('public')
@@ -1096,16 +1228,6 @@ describe('resource artifact validation', () => {
         'a peak source claimed without a reading',
         (r) => (markOf(r, 'enabled:held').vmhwm = null),
         'peak source is claimed but a mark has no reading',
-      ],
-      [
-        'a decreasing authoritative peak',
-        (r) => (markOf(r, 'enabled:held').vmhwm = 100 * MIB),
-        'authoritative peak decreased',
-      ],
-      [
-        'a decreasing raw maximum',
-        (r) => (markOf(r, 'enabled:held').maxRss = 1),
-        'raw maximum decreased',
       ],
       [
         'marks out of time order',

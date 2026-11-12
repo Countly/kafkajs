@@ -405,15 +405,41 @@ test('rejects circular serialization while leaving primary scalar evidence avail
   expect(fs.readFileSync(log.file, 'utf8').match(/"type":"error"/g)).toHaveLength(2)
 })
 
-test('does not let decreasing sources or missing coverage become passes after clamping', () => {
-  const rows = evidence(temp())
-  rows.push(
-    { type: 'mark', mark: { vmhwm: 1000, covered: 900 } },
-    { type: 'mark', mark: { vmhwm: 999, covered: 1100 } }
-  )
+test('records decreasing sources while preserving missing-coverage diagnostics and the peak', () => {
+  const rows = [
+    { type: 'mark', mark: { phase: 'M', vmhwm: 1000, maxRss: 2000, covered: 900 } },
+    { type: 'mark', mark: { phase: 'closed', vmhwm: 999, maxRss: 1900, covered: 1100 } },
+  ]
   expect(screen(rows)).toMatchObject({
-    problems: ['authoritative peak decreased'],
+    peak: 1100,
+    problems: [],
     inconclusive: ['peak source does not cover a current reading'],
+    peakDecreases: [
+      { index: 1, phase: 'closed', field: 'maxRss', before: 2000, after: 1900, delta: -100 },
+      { index: 1, phase: 'closed', field: 'vmhwm', before: 1000, after: 999, delta: -1 },
+    ],
+  })
+})
+
+test('keeps the diagnostic peak above 160 MiB despite a later decrease', () => {
+  expect(
+    screen([
+      { type: 'mark', mark: { phase: 'M', vmhwm: 167772161, covered: 1 } },
+      { type: 'mark', mark: { phase: 'closed', vmhwm: 1000, covered: 1 } },
+    ])
+  ).toMatchObject({
+    peak: 167772161,
+    problems: ['absolute current-image peak exceeds 160 MiB'],
+    peakDecreases: [
+      {
+        index: 1,
+        phase: 'closed',
+        field: 'vmhwm',
+        before: 167772161,
+        after: 1000,
+        delta: -167771161,
+      },
+    ],
   })
 })
 
