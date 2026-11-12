@@ -20286,7 +20286,13 @@
         "scripts/soak/__tests__/soak.spec.js \u203a telemetry resident-size reference records every peak decrease and retains the running maximum",
         "scripts/soak/__tests__/soak.spec.js \u203a telemetry resident-size reference preserves setup, delta and absolute limits after a peak decrease",
         "scripts/e2e/telemetry/__tests__/retainedDiagnostic.spec.js \u203a records decreasing sources while preserving missing-coverage diagnostics and the peak",
-        "scripts/e2e/telemetry/__tests__/retainedDiagnostic.spec.js \u203a keeps the diagnostic peak above 160 MiB despite a later decrease"
+        "scripts/e2e/telemetry/__tests__/retainedDiagnostic.spec.js \u203a keeps the diagnostic peak above 160 MiB despite a later decrease",
+        "scripts/soak/__tests__/closedDiagnostic.spec.js \u203a closed transient diagnostic \u203a leaves the switch-off path byte-identical without snapshots, readings or fields",
+        "scripts/soak/__tests__/closedDiagnostic.spec.js \u203a closed transient diagnostic \u203a captures original endpoints after settled readings and adds one warm reading with the same protocol",
+        "scripts/soak/__tests__/closedDiagnostic.spec.js \u203a closed transient diagnostic \u203a requires explicit diagnostic CI and refuses duplicate capture checkpoints",
+        "scripts/soak/__tests__/closedDiagnostic.spec.js \u203a closed transient diagnostic \u203a reconciles additive constructor and owner growth without hiding feedback-held application data",
+        "scripts/soak/__tests__/closedDiagnostic.spec.js \u203a closed transient diagnostic \u203a emits both endpoint comparisons from the existing snapshot reader and bounds compressed evidence",
+        "scripts/soak/__tests__/closedDiagnostic.spec.js \u203a closed transient diagnostic \u203a runs only on explicit dispatch within 45 minutes and outside every verdict dependency"
       ],
       "capMinutes": 85,
       "allowedSkips": [
@@ -24716,7 +24722,13 @@
         "scripts/soak/__tests__/soak.spec.js \u203a telemetry resident-size reference records every peak decrease and retains the running maximum",
         "scripts/soak/__tests__/soak.spec.js \u203a telemetry resident-size reference preserves setup, delta and absolute limits after a peak decrease",
         "scripts/e2e/telemetry/__tests__/retainedDiagnostic.spec.js \u203a records decreasing sources while preserving missing-coverage diagnostics and the peak",
-        "scripts/e2e/telemetry/__tests__/retainedDiagnostic.spec.js \u203a keeps the diagnostic peak above 160 MiB despite a later decrease"
+        "scripts/e2e/telemetry/__tests__/retainedDiagnostic.spec.js \u203a keeps the diagnostic peak above 160 MiB despite a later decrease",
+        "scripts/soak/__tests__/closedDiagnostic.spec.js \u203a closed transient diagnostic \u203a leaves the switch-off path byte-identical without snapshots, readings or fields",
+        "scripts/soak/__tests__/closedDiagnostic.spec.js \u203a closed transient diagnostic \u203a captures original endpoints after settled readings and adds one warm reading with the same protocol",
+        "scripts/soak/__tests__/closedDiagnostic.spec.js \u203a closed transient diagnostic \u203a requires explicit diagnostic CI and refuses duplicate capture checkpoints",
+        "scripts/soak/__tests__/closedDiagnostic.spec.js \u203a closed transient diagnostic \u203a reconciles additive constructor and owner growth without hiding feedback-held application data",
+        "scripts/soak/__tests__/closedDiagnostic.spec.js \u203a closed transient diagnostic \u203a emits both endpoint comparisons from the existing snapshot reader and bounds compressed evidence",
+        "scripts/soak/__tests__/closedDiagnostic.spec.js \u203a closed transient diagnostic \u203a runs only on explicit dispatch within 45 minutes and outside every verdict dependency"
       ],
       "capMinutes": 93,
       "allowedSkips": [
