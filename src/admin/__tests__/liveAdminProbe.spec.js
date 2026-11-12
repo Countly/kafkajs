@@ -6,6 +6,7 @@ const mockProducerOptions = []
 const mockActions = []
 let mockConnectFailure
 const mockWrite = jest.fn()
+const mockPropagation = jest.fn()
 const mockExec = jest.fn()
 const mockAccess = jest.fn()
 
@@ -64,7 +65,8 @@ jest.mock('../../../index', () => ({
   })),
 }))
 jest.mock('testHelpers', () => ({
-  plainTextBrokers: () => ['fake:1'],
+  plainTextBrokers: () => ['fake:1', 'fake:2', 'fake:3'],
+  waitForTopicPropagation: (...args) => mockPropagation(...args),
   writeEvidence: (...args) => mockWrite(...args),
   wireVersionsOf: () => ({}),
   disconnectPropagationBrokers: async () => {},
@@ -93,6 +95,7 @@ beforeEach(() => {
   mockProducerOptions.length = 0
   mockActions.length = 0
   mockConnectFailure = undefined
+  mockPropagation.mockReset().mockResolvedValue(undefined)
   process.env.P9_CLUSTER_GUARD = 'fake-guard'
   process.env.P9_CLUSTER_MANIFEST = 'fake-manifest'
   mockAccess.mockImplementation(() => {})
@@ -579,6 +582,37 @@ describe('deadlines under a fake clock', () => {
     )
     expect(outcome.error).toBeUndefined()
     expect(liveRun.tainted).toBe(false)
+  })
+
+  test('a created topic is not published before every broker observes it', async () => {
+    const { probe } = scenario()
+    stubResources(probe)
+    let release
+    mockPropagation.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          release = resolve
+        })
+    )
+    let published = false
+    const pending = probe.finish(async () => {
+      await probe.start()
+      const topic = await probe.topic({ replicaAssignment: [{ partition: 0, replicas: [1, 2] }] })
+      published = true
+      expect(probe.topics).toEqual([{ name: topic, topicId: `id-${topic}` }])
+    })
+    await jest.advanceTimersByTimeAsync(0)
+    expect(published).toBe(false)
+    expect(probe.topics).toEqual([])
+    expect(release).toBeDefined()
+    release()
+    const outcome = await settle(pending)
+    expect(outcome.error).toBeUndefined()
+    expect(published).toBe(true)
+    const [, partitions, { brokers, signal }] = mockPropagation.mock.calls[0]
+    expect(partitions).toBe(1)
+    expect(brokers).toHaveLength(3)
+    expect(signal).toBeInstanceOf(AbortSignal)
   })
 
   test('a new topic metadata authorization failure ends the read immediately', async () => {

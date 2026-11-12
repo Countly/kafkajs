@@ -118,6 +118,10 @@
       "needs": {},
       "evidence": [],
       "titles": [
+        "src/utils/topicPropagationWait.spec.js \u203a testHelpers > waiting for a created topic to reach every broker waits for every supplied broker rather than one visible topic",
+        "src/utils/topicPropagationWait.spec.js \u203a testHelpers > waiting for a created topic to reach every broker owner cancellation stops the propagation wait and later metadata reads",
+        "src/utils/topicPropagationWait.spec.js \u203a testHelpers > waiting for a created topic to reach every broker a permanent metadata error ends the all-broker wait immediately",
+        "src/admin/__tests__/liveAdminProbe.spec.js \u203a deadlines under a fake clock a created topic is not published before every broker observes it",
         "src/admin/__tests__/adminVersionsLive.spec.js \u203a Admin > captured newest versions 4.3.2 capture limits DeleteGroups to v2",
         "src/admin/__tests__/adminVersionsLive.spec.js \u203a Admin > captured newest versions 4.4.0 capture permits DeleteGroups v3",
         "src/admin/__tests__/adminVersionsLive.spec.js \u203a Admin > captured newest versions a capture cannot supply a broker-only API",

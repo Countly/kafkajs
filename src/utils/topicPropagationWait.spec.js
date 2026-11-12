@@ -65,4 +65,75 @@ describe('testHelpers > waiting for a created topic to reach every broker', () =
     expect(createTopics).toHaveBeenCalledTimes(1)
     expect(createTopics.mock.calls[0][0].timeout).toBeGreaterThanOrEqual(30000)
   })
+
+  it('waits for every supplied broker rather than one visible topic', async () => {
+    jest.useFakeTimers()
+    const owner = new AbortController()
+    let ready = false
+    const visible = { topicMetadata: [{ topic: 'topic-a', partitionMetadata: [{ leader: 1 }] }] }
+    const brokers = [0, 1, 2].map((index) => ({
+      connect: jest.fn(async () => {}),
+      metadata: jest.fn(async () => {
+        if (index === 2 && !ready) throw NOT_PROPAGATED
+        return visible
+      }),
+    }))
+    let settled = false
+    const pending = waitForTopicPropagation('topic-a', 1, {
+      brokers,
+      signal: owner.signal,
+    }).then(() => {
+      settled = true
+    })
+    await jest.advanceTimersByTimeAsync(200)
+    expect(settled).toBe(false)
+    expect(brokers.every((broker) => broker.metadata.mock.calls.length > 0)).toBe(true)
+    ready = true
+    await jest.advanceTimersByTimeAsync(100)
+    await pending
+    expect(settled).toBe(true)
+    expect(brokers[2].metadata).toHaveBeenLastCalledWith(['topic-a'])
+  })
+
+  it('owner cancellation stops the propagation wait and later metadata reads', async () => {
+    jest.useFakeTimers()
+    const owner = new AbortController()
+    const broker = {
+      connect: jest.fn(async () => {}),
+      metadata: jest.fn(async () => {
+        throw NOT_PROPAGATED
+      }),
+    }
+    const failure = new Error('cancel topic setup')
+    const outcome = waitForTopicPropagation('topic-a', 1, {
+      brokers: [broker],
+      signal: owner.signal,
+    }).catch((error) => error)
+    await jest.advanceTimersByTimeAsync(100)
+    owner.abort(failure)
+    await jest.advanceTimersByTimeAsync(1000)
+    expect(await outcome).toBe(failure)
+    const reads = broker.metadata.mock.calls.length
+    await jest.advanceTimersByTimeAsync(1000)
+    expect(broker.metadata).toHaveBeenCalledTimes(reads)
+  })
+
+  it('a permanent metadata error ends the all-broker wait immediately', async () => {
+    const failure = Object.assign(new Error('not authorized'), {
+      type: 'TOPIC_AUTHORIZATION_FAILED',
+    })
+    const broker = {
+      connect: jest.fn(async () => {}),
+      metadata: jest.fn(async () => {
+        throw failure
+      }),
+    }
+    await expect(
+      waitForTopicPropagation('topic-a', 1, {
+        brokers: [broker],
+        signal: new AbortController().signal,
+      })
+    ).rejects.toBe(failure)
+    expect(broker.metadata).toHaveBeenCalledTimes(1)
+  })
 })
