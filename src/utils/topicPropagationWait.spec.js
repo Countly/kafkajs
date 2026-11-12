@@ -113,11 +113,15 @@ describe('testHelpers > waiting for a created topic to reach every broker', () =
       signal: owner.signal,
     }).catch((error) => error)
     await jest.advanceTimersByTimeAsync(100)
+    const guard = broker.metadata.mock.calls[0][1].guard
+    const completedCheckReason = guard()
+    expect(completedCheckReason).toMatchObject({ name: 'AbortError' })
+    const reads = broker.metadata.mock.calls.length
     owner.abort(failure)
     await jest.advanceTimersByTimeAsync(1000)
     expect(await outcome).toBe(failure)
-    expect(broker.metadata.mock.calls[0][1].guard()).toBe(failure)
-    const reads = broker.metadata.mock.calls.length
+    expect(guard()).toBe(completedCheckReason)
+    expect(broker.metadata).toHaveBeenCalledTimes(reads)
     await jest.advanceTimersByTimeAsync(1000)
     expect(broker.metadata).toHaveBeenCalledTimes(reads)
   })
