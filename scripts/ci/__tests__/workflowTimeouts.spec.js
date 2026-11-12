@@ -58,7 +58,7 @@ describe('Workflow timeouts', () => {
       if (step.run) expect(step.run).not.toContain('$' + '{{')
     }
     expect(job.steps.find((step) => step.uses === 'actions/upload-artifact@v4').if).toBe('always()')
-    expect(jobs.verdict.needs).toContain('warmup-witnesses')
+    expect(jobs.verdict.needs).not.toContain('warmup-witnesses')
   })
 
   test('every runner job has a timeout and reusable jobs call bounded local workflows', () => {

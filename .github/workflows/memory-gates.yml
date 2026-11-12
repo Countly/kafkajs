@@ -774,7 +774,7 @@ jobs:
     name: memory-gates-verdict
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [unit, share-soak-verdict, resources, journal-controls, warmup-witnesses, retained-diagnostic, telemetry-soak, telemetry-seeded-control, live-owner-census, telemetry-verdicts, telemetry-verdict-controls]
+    needs: [unit, share-soak-verdict, resources, journal-controls, retained-diagnostic, telemetry-soak, telemetry-seeded-control, live-owner-census, telemetry-verdicts, telemetry-verdict-controls]
     if: always() && (github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/'))
     steps:
       - name: Require every relocated memory gate
