@@ -19,8 +19,6 @@ const { LIVE_SEED, WARMUP_SEED } = require('./liveSeed')
 const KIB = 1024
 const MIB = 1024 * KIB
 const MINUTE_MS = 60000
-/** The fewest mid-cycle readings a fit needs before the report calls itself complete. */
-const MIN_MID_READINGS = 3
 
 /**
  * The frozen candidate. `thresholds` are the would-be S1/S2 limits and the S3 sigma count; the sizes
@@ -307,8 +305,8 @@ class ShadowReport {
    * @param {object[]} samples @param {object} engine @param {object[]} heapSpaces
    * @param {object[]} stages @param {number} endAt @param {string} arm @param {object} params
    * @returns {object} the measured part of the report
-   * @throws {Error} for a reading without its engine row or collection interval, or too few
-   *   mid-cycle readings
+   * @throws {Error} for an incomplete frozen grid, a reading without its engine row or collection
+   *   interval, or a prescribed mid-cycle reading outside the quiet interval
    */
   static measure(samples, engine, heapSpaces, stages, endAt, arm, params) {
     if (!samples?.length) throw new Error('no readings')
@@ -338,6 +336,18 @@ class ShadowReport {
         heap: row ? ShadowReport.heapOf(row) : null,
       }
     })
+    for (const [index, at] of SAMPLE_AT.entries()) {
+      const reading = readings[index]
+      const next = SAMPLE_AT[index + 1] ?? params.warmupMs + params.measureMs
+      if (
+        !reading ||
+        !(reading.admittedAtMs >= at && reading.admittedAtMs < next) ||
+        reading.completedAtMs < reading.admittedAtMs ||
+        reading.completedAtMs > next
+      )
+        throw new Error(`missing or invalid frozen grid reading at ${at} ms`)
+    }
+    if (readings.length !== SAMPLE_AT.length) throw new Error('extra readings on the frozen grid')
     const middle = new Set(
       MidCycle.indexes(
         readings.map((r) => r.gc),
@@ -355,14 +365,20 @@ class ShadowReport {
             : 'boundary'
     const mid = readings.filter((r) => r.class === 'mid')
     const boundary = readings.filter((r) => r.class === 'boundary')
-    if (mid.length < MIN_MID_READINGS)
-      throw new Error(`fewer than ${MIN_MID_READINGS} mid-cycle readings in the window`)
+    const prescribed = SAMPLE_AT.filter(
+      (at) => at > params.warmupMs && at % params.reopenMs === params.sampleMs
+    )
+    for (const at of prescribed)
+      if (!middle.has(SAMPLE_AT.indexOf(at)))
+        throw new Error(`prescribed mid-cycle reading at ${at} ms is not quiet`)
+    if (mid.length !== prescribed.length)
+      throw new Error('unexpected mid-cycle readings on the frozen grid')
     const fit = (rows) => ({
       raw: seriesOf(rows.map((r) => [r.minutes, r.rawBytes])),
       data: seriesOf(rows.map((r) => [r.minutes, r.dataBytes])),
     })
-    const first = readings[0]
-    const entry = readings.find((r) => r.class !== 'warmup')
+    const first = readings[SAMPLE_AT.indexOf(params.firstSampleMs)]
+    const entry = readings[SAMPLE_AT.indexOf(params.warmupMs)]
     const growth = {
       rawBytes: entry.rawBytes - first.rawBytes,
       dataBytes: entry.dataBytes - first.dataBytes,
