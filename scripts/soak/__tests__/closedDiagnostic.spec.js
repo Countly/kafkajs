@@ -199,7 +199,6 @@ describe('closed transient diagnostic', () => {
       'snapshot:0',
       'gc-settled:59999',
       'gc-settled:60000',
-      'settle',
       'gc-settled:60000',
       'snapshot:60000',
       'gc-settled:90000',
