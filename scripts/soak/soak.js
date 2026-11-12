@@ -2795,13 +2795,10 @@ class Soak {
           delayMs = planned < this.sampleAt.length ? this.sampleAt[planned] - elapsed : 2 ** 31 - 1
         }
         await this.nap(delayMs)
-        while (
-          this.sampling &&
-          this.sampleAt &&
-          planned < this.sampleAt.length &&
-          this.clock.now() - phaseStartedAt < this.sampleAt[planned]
-        ) {
-          await this.nap(this.sampleAt[planned] - (this.clock.now() - phaseStartedAt))
+        while (this.sampling && this.sampleAt && planned < this.sampleAt.length) {
+          const remaining = this.sampleAt[planned] - (this.clock.now() - phaseStartedAt)
+          if (remaining <= 0) break
+          await this.nap(remaining)
         }
         if (this.sampling) {
           const admitted = this.clock.now()
@@ -7867,10 +7864,15 @@ module.exports = {
 
 if (require.main === module) {
   const { profile, phaseSeconds } = parseArgs(process.argv.slice(2))
+  // The parent validates diagnostic workers; their resource verdicts are intentionally ineligible.
+  const diagnosticWorker =
+    profile === 'telemetry' &&
+    LongWindow.selected(process.env) &&
+    require('./telemetryChurn').KINDS.includes(process.env.TELEMETRY_WORKER_KIND)
   main(profile, { phaseSeconds }).then(
     (verdict) => {
       console.log(JSON.stringify(verdict))
-      process.exitCode = verdict.ok ? 0 : 1
+      process.exitCode = diagnosticWorker || verdict.ok ? 0 : 1
     },
     (error) => {
       console.error(error)
