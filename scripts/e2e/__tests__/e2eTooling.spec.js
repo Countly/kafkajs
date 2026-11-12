@@ -1366,7 +1366,7 @@ describe('broker telemetry fixture', () => {
     expect(serialized).not.toMatch(/forceExit|docker (pull|system prune)/)
   })
 
-  test('keeps memory acceptance in guarded jobs with the full Node and broker coverage', () => {
+  test('keeps memory acceptance behind the exact PR head and base with full Node and broker coverage', () => {
     const yaml = require('js-yaml')
     const workflow = yaml.load(read('.github/workflows/memory-gates.yml').toString())
     for (const job of Object.values(workflow.jobs)) {
@@ -1380,6 +1380,7 @@ describe('broker telemetry fixture', () => {
       'ready_for_review',
     ])
     expect(Object.keys(workflow.jobs)).toEqual([
+      'select',
       'unit',
       'share-soak',
       'share-soak-verify',
@@ -1398,15 +1399,20 @@ describe('broker telemetry fixture', () => {
       'telemetry-verdict-controls',
       'verdict',
     ])
-    expect(workflow.jobs['share-soak'].needs).toEqual(['unit'])
+    expect(workflow.jobs['share-soak'].needs).toEqual(['select', 'unit'])
     expect(workflow.jobs['share-soak'].strategy.matrix.include.map((row) => row.profile)).toEqual([
       'short',
       'full',
     ])
-    expect(workflow.jobs['share-soak-verify'].needs).toEqual(['share-soak'])
+    expect(workflow.jobs['share-soak-verify'].needs).toEqual(['select', 'share-soak'])
     expect(workflow.jobs['share-soak-verify'].strategy.matrix.profile).toEqual(['short', 'full'])
-    expect(workflow.jobs['share-soak-verdict'].needs).toEqual(['share-soak', 'share-soak-verify'])
+    expect(workflow.jobs['share-soak-verdict'].needs).toEqual([
+      'select',
+      'share-soak',
+      'share-soak-verify',
+    ])
     expect(workflow.jobs.verdict.needs).toEqual([
+      'select',
       'unit',
       'share-soak-verdict',
       'resources',
@@ -1418,24 +1424,45 @@ describe('broker telemetry fixture', () => {
       'telemetry-verdicts',
       'telemetry-verdict-controls',
     ])
-    for (const job of [workflow.jobs['share-soak-verdict'], workflow.jobs.verdict]) {
-      expect(job.if).toBe(
-        "always() && (github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/'))"
-      )
+    const gate = workflow.jobs.select
+    expect(gate.if).toBe(
+      "github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.head_ref == 'p9m/memory-gates' && github.base_ref == 'master')"
+    )
+    for (const [event, head, base, expected] of [
+      ['pull_request', 'p9m/memory-gates', 'master', true],
+      ['pull_request', 'p9m/q9', 'p9m/memory-gates', false],
+      ['pull_request', 'p9m/q9', 'master', false],
+      ['pull_request', 'p9m/memory-gates', 'p9m/other', false],
+      ['pull_request', 'feature', 'master', false],
+      ['workflow_dispatch', 'feature', 'other', true],
+      ['push', 'p9m/memory-gates', 'master', false],
+    ]) {
+      expect(
+        require('vm').runInNewContext(gate.if, {
+          github: { event_name: event, head_ref: head, base_ref: base },
+        })
+      ).toBe(expected)
     }
+    expect(workflow.jobs['share-soak-verdict'].if).toBe(
+      "always() && needs.select.result == 'success' && contains(fromJSON(needs.select.outputs.jobs), 'share-soak-verdict')"
+    )
+    expect(workflow.jobs.verdict.if).toBe(
+      "always() && needs.select.result == 'success' && needs.select.outputs.full == 'true'"
+    )
     expect(workflow.jobs['share-soak-verdict'].steps[0].run).toBe(
       'test "$PRODUCED" = success && test "$RECHECKED" = success'
     )
     expect(JSON.stringify(workflow.jobs.verdict)).toContain("job.result !== 'success'")
     for (const [name, job] of Object.entries(workflow.jobs)) {
-      // The long-window shadow lane is dispatch-only; its own test pins that guard.
-      if (['share-soak-verdict', 'verdict', 'telemetry-long-window'].includes(name)) continue
+      if (['select', 'share-soak-verdict', 'verdict', 'telemetry-long-window'].includes(name))
+        continue
+      const selected = `contains(fromJSON(needs.select.outputs.jobs), '${name}')`
       expect(job.if).toBe(
         name === 'share-soak-verify'
-          ? "always() && (github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/'))"
-          : "github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/')"
+          ? `always() && needs.select.result == 'success' && ${selected}`
+          : selected
       )
-      if (!['share-soak', 'share-soak-verify'].includes(name)) expect(job.needs).toBeUndefined()
+      if (!['share-soak', 'share-soak-verify'].includes(name)) expect(job.needs).toEqual(['select'])
       if (job.uses) {
         expect(job.uses).toBe('./.github/workflows/telemetry.yml')
         expect(job.with).toEqual({ full: true, 'memory-verdicts': true })
@@ -1637,6 +1664,96 @@ describe('broker telemetry fixture', () => {
     expect(JSON.stringify(soak)).not.toContain('forceExit')
   })
 
+  test('selects exact memory job ids and share dependencies without a full verdict on partial dispatches', () => {
+    const workflow = require('js-yaml').load(read('.github/workflows/memory-gates.yml').toString())
+    expect(workflow.on.workflow_dispatch.inputs.only).toEqual(
+      expect.objectContaining({ type: 'string', required: false, default: '' })
+    )
+    expect(workflow.jobs.select).toBeDefined()
+    const step = workflow.jobs.select.steps.find((step) => step.id === 'select')
+    expect(step.env.ONLY).toBe('$' + '{{ inputs.only }}')
+    expect(workflow.jobs.select.outputs).toEqual({
+      jobs: '$' + '{{ steps.select.outputs.jobs }}',
+      full: '$' + '{{ steps.select.outputs.full }}',
+    })
+    const source = step.run.match(/node <<'NODE'\n([\s\S]*?)\nNODE/)[1]
+    const vm = require('vm')
+    /** @param {string} only Dispatch input. @returns {object} Real selector outputs. */
+    const select = (only) => {
+      let output = ''
+      vm.runInNewContext(source, {
+        process: { env: { ONLY: only, GITHUB_OUTPUT: 'output' } },
+        require: (id) => {
+          expect(id).toBe('node:fs')
+          return {
+            appendFileSync: (file, value) => {
+              expect(file).toBe('output')
+              output += value
+            },
+          }
+        },
+      })
+      return Object.fromEntries(
+        output
+          .trim()
+          .split('\n')
+          .map((line) => {
+            const index = line.indexOf('=')
+            return [line.slice(0, index), line.slice(index + 1)]
+          })
+      )
+    }
+    /** @param {object} outputs Selector outputs. @param {string} event Trigger. @returns {string[]} Runnable jobs. */
+    const runnable = (outputs, event = 'workflow_dispatch') =>
+      Object.entries(workflow.jobs)
+        .filter(([id]) => id !== 'select')
+        .filter(([, job]) =>
+          vm.runInNewContext(job.if, {
+            github: { event_name: event },
+            needs: { select: { result: 'success', outputs } },
+            always: () => true,
+            fromJSON: JSON.parse,
+            contains: (array, item) => array.includes(item),
+          })
+        )
+        .map(([id]) => id)
+    const all = Object.keys(workflow.jobs).filter((id) => id !== 'select')
+    const full = select('')
+    expect(full.full).toBe('true')
+    expect(JSON.parse(full.jobs).sort()).toEqual([...all].sort())
+    expect(runnable(full)).toEqual(all)
+    expect(runnable(full, 'pull_request')).toEqual(
+      all.filter((id) => id !== 'telemetry-long-window')
+    )
+    const share = ['unit', 'share-soak', 'share-soak-verify', 'share-soak-verdict']
+    for (const id of all.filter((id) => id !== 'verdict')) {
+      const outputs = select(id)
+      expect(outputs.full).toBe('false')
+      expect(runnable(outputs)).toEqual(id.startsWith('share-soak') ? share : [id])
+    }
+    expect(runnable(select(' resources, telemetry-verdicts,resources '))).toEqual([
+      'resources',
+      'telemetry-verdicts',
+    ])
+    expect(runnable(select('share-soak,telemetry-long-window'))).toEqual([
+      ...share,
+      'telemetry-long-window',
+    ])
+    expect(runnable(select('telemetry-long-window'), 'pull_request')).toEqual([])
+    expect(runnable(select('verdict'))).toEqual([])
+    for (const input of [' ', ',']) expect(runnable(select(input))).not.toContain('verdict')
+    for (const input of ['soak', 'share-soak-extra', 'resources,unknown', 'select'])
+      expect(() => select(input)).toThrow(/Unknown job/)
+    for (const id of ['share-soak-verify', 'share-soak-verdict', 'verdict']) {
+      expect(
+        vm.runInNewContext(workflow.jobs[id].if, {
+          needs: { select: { result: 'skipped', outputs: {} } },
+          always: () => true,
+        })
+      ).toBe(false)
+    }
+  })
+
   test('keeps the long-window shadow lane diagnostic, bounded and out of the memory verdict', () => {
     // eslint-disable-next-line n/no-extraneous-require -- YAML parser is pinned by the ESLint/Jest toolchain
     const yaml = require('js-yaml')
@@ -1651,8 +1768,10 @@ describe('broker telemetry fixture', () => {
       options: ['1', '2', '3'],
     })
     // About 40 runner-minutes per job: manual collections only, never every PR push.
-    expect(job.if).toBe("github.event_name == 'workflow_dispatch'")
-    expect(job.needs).toBeUndefined()
+    expect(job.if).toBe(
+      "github.event_name == 'workflow_dispatch' && contains(fromJSON(needs.select.outputs.jobs), 'telemetry-long-window')"
+    )
+    expect(job.needs).toEqual(['select'])
     expect(job['timeout-minutes']).toBeLessThanOrEqual(75)
     const { matrix } = job.strategy
     expect(job.strategy['fail-fast']).toBe(false)

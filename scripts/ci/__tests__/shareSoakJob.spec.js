@@ -495,7 +495,7 @@ describe('required memory gate composition', () => {
     }
   })
 
-  test('requires both share profiles and every relocated telemetry verdict without optional jobs', () => {
+  test('requires both share profiles and every relocated telemetry verdict only for full selections', () => {
     const workflow = fs.readFileSync('.github/workflows/memory-gates.yml', 'utf8')
     const jobs = {}
     let current
@@ -505,6 +505,7 @@ describe('required memory gate composition', () => {
       if (current) jobs[current] = (jobs[current] ?? '') + line + '\n'
     }
     const required = [
+      'select',
       'unit',
       'share-soak-verdict',
       'resources',
@@ -517,13 +518,15 @@ describe('required memory gate composition', () => {
       'telemetry-verdict-controls',
     ]
     expect(jobs.verdict).toContain('needs: [' + required.join(', ') + ']')
-    expect(jobs.verdict).toContain('if: always()')
+    expect(jobs.verdict).toContain(
+      "if: always() && needs.select.result == 'success' && needs.select.outputs.full == 'true'"
+    )
     expect(jobs.verdict).toContain("job.result !== 'success'")
     expect(jobs['share-soak']).toContain('profile: short, jobMinutes: 55, parentMinutes: 35')
     expect(jobs['share-soak']).toContain('profile: full, jobMinutes: 71, parentMinutes: 51')
     expect(jobs['share-soak']).toContain('node scripts/ci/shareSoakJob.js freeze "$SOAK_PROFILE"')
     expect(jobs['share-soak-verify']).toContain('profile: [short, full]')
-    expect(jobs['share-soak-verdict']).toContain('needs: [share-soak, share-soak-verify]')
+    expect(jobs['share-soak-verdict']).toContain('needs: [select, share-soak, share-soak-verify]')
     expect(jobs.resources).toContain('node: [22, 24, 26]')
     expect(jobs.resources).toContain('    timeout-minutes: 105')
     expect(jobs.resources).toContain(

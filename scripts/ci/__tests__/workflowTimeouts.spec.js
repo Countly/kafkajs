@@ -154,6 +154,17 @@ const root = path.resolve(__dirname, '../../..')
 const workflows = path.join(root, '.github/workflows')
 
 describe('Workflow timeouts', () => {
+  test('bounds every memory gate step and keeps dispatch inputs outside shell commands', () => {
+    const { jobs } = yaml.load(fs.readFileSync(path.join(workflows, 'memory-gates.yml'), 'utf8'))
+    expect(jobs.select).toEqual(expect.objectContaining({ 'timeout-minutes': 5 }))
+    for (const job of Object.values(jobs)) {
+      for (const step of job.steps ?? []) {
+        expect(isValidTimeout(step['timeout-minutes'])).toBe(true)
+        expect(step.run ?? '').not.toContain('$' + '{{')
+      }
+    }
+  })
+
   test('bounds the isolated share peak arms and keeps expressions outside shell commands', () => {
     const workflow = yaml.load(fs.readFileSync(path.join(workflows, 'memory-gates.yml'), 'utf8'))
     const job = workflow.jobs['share-peak']
