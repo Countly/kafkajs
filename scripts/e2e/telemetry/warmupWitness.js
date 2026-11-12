@@ -4,6 +4,7 @@
 const fs = require('node:fs')
 const path = require('node:path')
 const crypto = require('node:crypto')
+const { types } = require('node:util')
 const { spawn, execFileSync } = require('node:child_process')
 const { MEMORY_FLAGS, SETTLE } = require('../../../testHelpers/processMemory')
 const { phaseCatalogue, foregroundCatalogue } = require('./resourceArtifact')
@@ -23,14 +24,15 @@ const object = (value) => value !== null && ['object', 'function'].includes(type
 const edges = (value) => {
   const children = []
   if (ArrayBuffer.isView(value)) return [['buffer', value.buffer]]
-  if (value instanceof Map) {
+  // Brand checks: a Map/Set subclass prototype passes instanceof but is not a collection.
+  if (types.isMap(value)) {
     let index = 0
-    for (const [key, item] of value) {
+    for (const [key, item] of Map.prototype.entries.call(value)) {
       children.push([`key${index}`, key], [`value${index++}`, item])
     }
-  } else if (value instanceof Set) {
+  } else if (types.isSet(value)) {
     let index = 0
-    for (const item of value) children.push([`item${index++}`, item])
+    for (const item of Set.prototype.values.call(value)) children.push([`item${index++}`, item])
   }
   for (const key of Reflect.ownKeys(value)) {
     const descriptor = Object.getOwnPropertyDescriptor(value, key)
