@@ -773,7 +773,11 @@ describe('telemetry wire observer', () => {
       const raw = Buffer.from(vectors[name].hex, 'hex')
       const capped = { truncated: true, resources: [], metrics: [] }
       writeSink('1', [sinkRow('1', 1, raw, capped)])
-      const { observer } = observe({ decoder: undefined })
+      // The lane's prepared decoder archive is mandatory and only matches its own line's classpath.
+      const { observer } = observe({
+        decoder: undefined,
+        line: process.env.KAFKA_VERSION ?? '4.3.1',
+      })
       const socket = open(observer)
       send(socket, push72(1, raw))
       receive(socket, push72Response(1, 0))
