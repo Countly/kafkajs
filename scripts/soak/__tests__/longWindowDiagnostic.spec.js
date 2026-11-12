@@ -11,6 +11,64 @@ const reportOf = (kind, { tripped = false, complete = true } = {}) =>
     ? { kind, complete: true, firstUse: { tripped }, mid: { data: { slopeBytesPerMinute: 0 } } }
     : { kind, complete: false, error: 'no worker result' }
 
+/** @returns {object} a complete worker with independent functional and journal evidence */
+const workerOf = (kind) => {
+  const samples = [...Array.from({ length: 42 }, (_, i) => 60000 + i * 30000), 1319000].map(
+    (at) => ({
+      admittedAtMs: at,
+      completedAtMs: at + 100,
+      snapshot: {
+        memory: {
+          at: at + 100,
+          retainedBytes: 100000,
+          gc: { admittedAt: at, completedAt: at + 100, observed: 2 },
+        },
+        journals: { byteLength: 4096, cursor: at / 1000, overflow: false },
+      },
+    })
+  )
+  return {
+    kind,
+    input: {
+      diagnostic: true,
+      acceptanceEligible: false,
+      baseline: { journals: { byteLength: 4096, cursor: 0, overflow: false } },
+      samples,
+      teardown: { journals: { byteLength: 4096, cursor: 1400, overflow: false } },
+      sampler: { skipped: [], readFailures: [] },
+    },
+    result: { ok: false, violations: ['diagnostic inputs are not acceptance-eligible'] },
+    exit: {
+      event: 'close',
+      code: 0,
+      signal: null,
+      stderrBytes: 0,
+      unhandled: 0,
+      receipts: 1,
+      afterDisconnectMs: 10,
+    },
+    facts: {
+      timing: { phaseAt: 0 },
+      stages: Array.from({ length: 21 }, (_, i) => ({
+        stage: 'lifecycle',
+        startedAt: (i + 1) * 60000,
+        doneAt: (i + 1) * 60000 + 4000,
+      })),
+      requirements: { ok: true, violations: [] },
+    },
+    shadow: {
+      complete: true,
+      engine: {
+        readings: samples.map(({ snapshot }) => ({
+          at: snapshot.memory.at,
+          code: 1000,
+          bytecode: 1000,
+        })),
+      },
+    },
+  }
+}
+
 describe('long-window driver', () => {
   let directory
   beforeEach(() => {
@@ -66,6 +124,88 @@ describe('long-window driver', () => {
       complete: false,
       error: 'no worker result',
     })
+  })
+
+  test('rejects functional failures independently of the ineligible resource verdict', () => {
+    const run = driver('unseeded')
+    const oracle = { ok: true, violations: [] }
+    expect(run.reportOf(workerOf('producer'), oracle).complete).toBe(true)
+    for (const change of [
+      (worker) => {
+        worker.facts.requirements = { ok: false, violations: ['missing reopen'] }
+      },
+      (worker) => {
+        worker.exit.code = 1
+      },
+      (worker) => {
+        worker.exit.killed = true
+      },
+      (worker) => {
+        worker.shadow.complete = false
+      },
+      (worker) => {
+        worker.input.sampler.readFailures.push({ message: 'failed reading' })
+      },
+    ]) {
+      const worker = workerOf('producer')
+      change(worker)
+      const report = run.reportOf(worker, oracle)
+      expect(report.complete).toBe(false)
+      expect(report.error).toMatch(/functional/)
+      expect(report).not.toHaveProperty('wouldBe')
+    }
+    for (const invalid of [undefined, { ok: false, violations: ['durability mismatch'] }]) {
+      const report = run.reportOf(workerOf('producer'), invalid)
+      expect(report.complete).toBe(false)
+      expect(report.error).toMatch(/oracle/)
+      expect(report).not.toHaveProperty('wouldBe')
+    }
+  })
+
+  test('rejects journal overflow, storage changes and cursor regression before reporting slopes', () => {
+    for (const change of [
+      (worker) => {
+        worker.input.samples[3].snapshot.journals.overflow = true
+      },
+      (worker) => {
+        worker.input.teardown.journals.byteLength += 1
+      },
+      (worker) => {
+        worker.input.teardown.journals.cursor = 0
+      },
+    ]) {
+      const worker = workerOf('producer')
+      change(worker)
+      const report = driver('unseeded').reportOf(worker, { ok: true, violations: [] })
+      expect(report.complete).toBe(false)
+      expect(report.error).toMatch(/journal/)
+      expect(report).not.toHaveProperty('wouldBe')
+    }
+  })
+
+  test('archives incomplete reports and fails the job on an oracle mismatch', async () => {
+    const run = driver('unseeded')
+    const result = {
+      ok: false,
+      violations: ['diagnostic inputs are not acceptance-eligible'],
+      workers: KINDS.map(workerOf),
+      oracle: { ok: false, violations: ['durability mismatch'] },
+      archive: { processes: {}, handshakes: [] },
+    }
+    run.modules.PROFILES = { telemetry: [] }
+    run.modules.buildTelemetryChurn = () => ({
+      run: async () => result,
+      close: async () => {},
+    })
+    await expect(run.execute()).rejects.toThrow(/oracle/)
+    const archived = JSON.parse(fs.readFileSync(path.join(directory, 'long-window.json'), 'utf8'))
+    expect(archived.workers).toHaveLength(4)
+    for (const report of archived.workers) {
+      expect(report.complete).toBe(false)
+      expect(report).not.toHaveProperty('wouldBe')
+    }
+    result.oracle = { ok: true, violations: [] }
+    await expect(run.execute()).resolves.toBeUndefined()
   })
 
   test('archives a worker beside its report without the id ledgers', () => {
