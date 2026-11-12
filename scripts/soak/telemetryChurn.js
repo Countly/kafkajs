@@ -4729,6 +4729,7 @@ class TelemetryWorkerProcess {
             engine,
           }),
           sampler: { skipped: run.skipped, readFailures: run.readFailures },
+          ...(peak && { diagnostic: true, acceptanceEligible: false }),
         }
         const judged = JournalConstancy.apply(soak.TelemetryResourceVerdict.evaluate(input), input)
         if (peak) {
