@@ -6788,7 +6788,7 @@ describe('telemetry resource evidence', () => {
     }
   })
 
-  test('detects 131072 B/min at actual irregular observation times while a pre-M0 constant escapes slope', () => {
+  test('reports irregular slopes without judging five-minute slope or endpoint', () => {
     const input = run()
     input.samples.forEach((sample, index) => {
       const jitter = index === 0 ? 0 : index % 2 ? 37 : -19
@@ -6800,7 +6800,7 @@ describe('telemetry resource evidence', () => {
       )
     })
     const result = evaluate(input)
-    expect(result.violations).toContain('retained slope')
+    expect(result.violations).not.toContain('retained slope')
     expect(result.measured.slopeBytesPerMinute).toBeCloseTo(131072, 0)
     expect(result.violations).not.toContain('retained endpoint')
     const plateau = run()
@@ -7002,28 +7002,23 @@ describe('telemetry resource evidence', () => {
       },
       'active retained ceiling',
     ],
-    [
-      'steep slope',
-      (r) => {
-        r.samples.forEach((s, i) => {
-          grow(s.snapshot.memory, i * 32769)
-        })
-      },
-      'retained slope',
-    ],
-    [
-      'last endpoint',
-      (r) => {
-        grow(r.samples.at(-1).snapshot.memory, 1048576 + 1)
-      },
-      'retained endpoint',
-    ],
   ])('rejects %s', (_name, change, label) => {
     const input = run()
     change(input)
     expect(evaluate(input).violations).toContain(label)
     expect(evaluate(input).ok).toBe(false)
   })
+
+  test.each(['steep slope', 'last endpoint'])(
+    'accepts %s within the remaining ceilings',
+    (shape) => {
+      const input = run()
+      if (shape === 'steep slope')
+        input.samples.forEach((sample, i) => grow(sample.snapshot.memory, i * 32769))
+      else grow(input.samples.at(-1).snapshot.memory, 1048576 + 1)
+      expect(evaluate(input)).toMatchObject({ ok: true, violations: [] })
+    }
+  )
 
   test('accepts the closed transient and active ceilings at equality', () => {
     const input = run()

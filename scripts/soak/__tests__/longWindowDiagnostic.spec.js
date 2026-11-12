@@ -116,6 +116,23 @@ describe('long-window driver', () => {
     expect(written.candidate.warmupMs).toBe(420000)
   })
 
+  test('stamps adopted reports eligible while keeping worker resource inputs diagnostic', () => {
+    const run = driver('unseeded')
+    Object.assign(run.identity, {
+      diagnostic: false,
+      scope: 'acceptance',
+      acceptanceEligible: true,
+    })
+    const worker = workerOf('producer')
+    expect(run.reportOf(worker, { ok: true, violations: [] })).toMatchObject({
+      complete: true,
+      diagnostic: false,
+      scope: 'acceptance',
+      acceptance: true,
+    })
+    expect(worker.input).toMatchObject({ diagnostic: true, acceptanceEligible: false })
+  })
+
   test('reports a worker without a result as an incomplete shadow report', () => {
     expect(driver('unseeded').reportOf({ kind: 'admin' })).toEqual({
       scope: 'shadow',

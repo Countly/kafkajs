@@ -1,7 +1,14 @@
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { summarise, render, readRecords, pooledSd, main } = require('../longWindowReport')
+const {
+  summarise,
+  render,
+  readRecords,
+  pooledSd,
+  main,
+  verifyAcceptance,
+} = require('../longWindowReport')
 
 const KIB = 1024
 const KINDS = ['producer', 'consumer', 'admin', 'shareConsumer']
@@ -131,7 +138,7 @@ describe('long-window report', () => {
     const { nodes } = summarise(records)
     expect(nodes['22'].incomplete).toBe(1)
     expect(nodes['22'].masked).toBe(3)
-    expect(nodes['22'].s2).toMatchObject({ status: 'insufficient', pass: 23, total: 24 })
+    expect(nodes['22'].s2).toMatchObject({ status: 'insufficient', pass: 20, total: 24 })
     expect(nodes['22'].s3.status).toBe('insufficient')
     expect(nodes['22'].s3.unseededMean).toBeLessThan(50)
   })
@@ -242,9 +249,15 @@ describe('long-window report', () => {
       expect(() => readRecords(path.join(directory, 'missing'))).toThrow()
     })
 
-    test('refuses a record that is not diagnostic or that claims acceptance', () => {
-      place('a', { ...recordOf({ node: 22, arm: 'seeded', workers: [] }), diagnostic: false })
-      expect(() => readRecords(directory)).toThrow('not a diagnostic long-window record')
+    test('reads eligible records for the separate acceptance verifier', () => {
+      place('a', {
+        ...recordOf({ node: 22, arm: 'seeded', workers: [] }),
+        diagnostic: false,
+        acceptanceEligible: true,
+      })
+      expect(readRecords(directory)).toMatchObject([
+        { diagnostic: false, acceptanceEligible: true },
+      ])
     })
 
     test('prints the table of a directory through main', () => {
@@ -254,5 +267,156 @@ describe('long-window report', () => {
       expect(lines.join('\n')).toMatch(/^22 +24\/24/m)
       expect(() => main([], () => {})).toThrow('usage')
     })
+  })
+})
+
+describe('long-window acceptance', () => {
+  const expected = { tree: 'a'.repeat(40), runId: '7', attempt: '1' }
+  const collection = () =>
+    [22, 24, 26].flatMap((node) =>
+      matrix(node, (k, i, r) => 10 + r - 2, 120).map((record) => ({
+        ...record,
+        diagnostic: false,
+        acceptanceEligible: true,
+        scope: 'acceptance',
+        runId: '7',
+        attempt: '1',
+        workers: record.workers.map((worker) => ({
+          ...worker,
+          execArgv: ['--expose-gc', '--no-flush-bytecode'],
+        })),
+      }))
+    )
+
+  test('passes exactly 39 eligible v2 artifacts from the expected run and tree', () => {
+    const records = collection()
+    expect(records).toHaveLength(39)
+    expect(verifyAcceptance(records, expected).nodes['26'].s3.status).toBe('pass')
+  })
+
+  test.each([
+    ['missing artifact', (records) => records.pop()],
+    [
+      'duplicate artifact',
+      (records) => {
+        records[0] = records[1]
+      },
+    ],
+    [
+      'mixed version',
+      (records) => {
+        records[0].candidate.version = 1
+      },
+    ],
+    [
+      'foreign tree',
+      (records) => {
+        records[0].tree = 'b'.repeat(40)
+      },
+    ],
+    [
+      'foreign run',
+      (records) => {
+        records[0].runId = '8'
+      },
+    ],
+    [
+      'foreign attempt',
+      (records) => {
+        records[0].attempt = '2'
+      },
+    ],
+    [
+      'ineligible record',
+      (records) => {
+        records[0].acceptanceEligible = false
+      },
+    ],
+    [
+      'diagnostic record',
+      (records) => {
+        records[0].diagnostic = true
+      },
+    ],
+    [
+      'missing worker flag',
+      (records) => {
+        records[0].workers[0].execArgv = []
+      },
+    ],
+    [
+      'masked slope despite a stale pass flag',
+      (records) => {
+        records[0].workers[0].mid.data.slopeBytesPerMinute = -33 * KIB
+        records[0].workers[0].masked = true
+      },
+    ],
+    [
+      'endpoint failure despite a stale pass flag',
+      (records) => {
+        records[0].workers[0].mid.data.endpointBytes = 1048577
+      },
+    ],
+    [
+      'S1 failure',
+      (records) => {
+        records[1].workers[0].wouldBe.s1.pass = false
+        records[1].workers[0].mid.data.slopeBytesPerMinute = 95 * KIB
+      },
+    ],
+    [
+      'S3 failure with passing individual workers',
+      (records) => {
+        for (const record of records.filter((record) => record.arm === 'unseeded'))
+          for (const worker of record.workers)
+            worker.mid.data.slopeBytesPerMinute = (record.replicate - 1) * 30 * KIB
+      },
+    ],
+    [
+      'first-use failure',
+      (records) => {
+        records.find((record) => record.arm === 'warmup-seed').workers[0].firstUse.tripped = false
+      },
+    ],
+  ])('fails %s', (_name, change) => {
+    const records = collection()
+    change(records)
+    expect(() => verifyAcceptance(records, expected)).toThrow()
+  })
+
+  test('requires explicit replay to judge historical diagnostic records without promoting them', () => {
+    const records = collection().map((record) => ({
+      ...record,
+      diagnostic: true,
+      acceptanceEligible: false,
+    }))
+    expect(() => verifyAcceptance(records, expected)).toThrow()
+    expect(
+      verifyAcceptance(records, { ...expected, replayDiagnostic: true }).nodes['22'].s3.status
+    ).toBe('pass')
+    expect(records.every((record) => record.acceptanceEligible === false)).toBe(true)
+    expect(() =>
+      verifyAcceptance(records, { ...expected, tree: 'b'.repeat(40), replayDiagnostic: true })
+    ).toThrow()
+  })
+
+  test('returns a failing CLI verdict for an incomplete collection and requires explicit provenance', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'long-window-verdict-'))
+    try {
+      const lines = []
+      const args = [directory, '--verdict', '--tree', expected.tree, '--run', '7', '--attempt', '1']
+      expect(main(args, (line) => lines.push(line))).toBe(1)
+      expect(lines.join('\n')).toMatch(/FAIL/)
+      expect(() => main([directory, '--verdict'], () => {})).toThrow(/tree|usage/)
+      for (const [i, record] of collection().entries()) {
+        const folder = path.join(directory, `artifact-${i}`)
+        fs.mkdirSync(folder)
+        fs.writeFileSync(path.join(folder, 'long-window.json'), JSON.stringify(record))
+      }
+      expect(main(args, (line) => lines.push(line))).toBe(0)
+      expect(lines.join('\n')).toMatch(/PASS/)
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
   })
 })

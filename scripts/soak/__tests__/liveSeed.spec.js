@@ -105,7 +105,7 @@ describe('live seeded control', () => {
     })
   })
 
-  test('turns the retained buffers into a retained slope on the real verdict and a matching shadow data slope', () => {
+  test('reports seeded growth without a five-minute slope failure and keeps the diagnostic data slope', () => {
     const seed = LiveSeed.of(LIVE_SEED.mode, { root: {}, limits: TELEMETRY })
     const base = 10000000
     const samples = TELEMETRY.sampleAt.map((at) => {
@@ -125,7 +125,7 @@ describe('live seeded control', () => {
       teardown: samples.at(-1).snapshot,
       cleanupMs: 1,
     })
-    expect(verdict.violations).toContain('retained slope')
+    expect(verdict.violations).not.toContain('retained slope')
     expect(verdict.violations).not.toContain('retained endpoint')
     const shadow = churn.EngineCodeJournal.shadow(
       samples.map((sample) => ({
@@ -288,7 +288,7 @@ describe('live seeded control judge', () => {
   })
   const facts = (kind, over = {}) => ({
     kind,
-    violations: ['retained slope', 'closed transient ceiling'],
+    violations: ['closed transient ceiling'],
     measured: { samples: 11, slopeBytesPerMinute: 131270, endpointBytes: 655360 },
     samples: 11,
     shadow: {
@@ -314,43 +314,26 @@ describe('live seeded control judge', () => {
   const changed = (over) => [facts('producer', over), ...workers().slice(1)]
   const judge = (run) => judgeSeededRun(run, TELEMETRY)
 
-  test('passes only when every worker reports the retained slope and its data slope matches the seed', () => {
+  test('keeps the five-minute seed diagnostic and permits verdicts without slope or endpoint failures', () => {
     expect(() => judge(workers())).not.toThrow()
-    const both = { violations: ['retained slope', 'retained endpoint', 'closed transient ceiling'] }
-    expect(() => judge(workers(both))).not.toThrow()
-    expect(() => judge(workers({ violations: ['retained slope'] }))).not.toThrow()
-    const mapped = {
-      kind: 'producer',
-      result: { violations: facts('producer').violations, measured: facts('producer').measured },
-      input: { samples: Array(11).fill({}) },
-      shadow: facts('producer').shadow,
-      seed: facts('producer').seed,
-      exit: exit(),
-    }
-    expect(factsOf(mapped)).toEqual(facts('producer'))
+    expect(() => judge(workers({ violations: [], exit: exit({ code: 0 }) }))).not.toThrow()
+    expect(() => judge(changed({ violations: ['retained slope'] }))).toThrow(
+      'violations the seed does not explain'
+    )
+    expect(() => judge(changed({ violations: ['retained endpoint'] }))).toThrow(
+      'violations the seed does not explain'
+    )
+    expect(() => judge([factsOf({ kind: 'producer' }), ...workers().slice(1)])).toThrow(
+      'violations list'
+    )
     expect(() => judge(churn.KINDS.slice(1).map((kind) => facts(kind)))).toThrow(
       'one worker of every kind'
     )
   })
 
-  test('fails a worker whose verdict misses the retained slope, whatever else it reports', () => {
-    const quiet = { slopeBytesPerMinute: 1000, endpointBytes: 100 }
-    for (const over of [
-      { violations: [], measured: { samples: 11, ...quiet } },
-      { violations: ['closed transient ceiling'], measured: { samples: 11, ...quiet } },
-    ])
-      expect(() => judge(changed(over))).toThrow('the seeded retained slope was not detected')
-    expect(() =>
-      judge(changed({ violations: ['retained slope'], measured: { samples: 11, ...quiet } }))
-    ).toThrow('slope label agrees with its measured value')
-    expect(() => judge([factsOf({ kind: 'producer' }), ...workers().slice(1)])).toThrow(
-      'violations list'
-    )
-  })
-
   test('fails a violation the seed does not explain', () => {
     for (const label of ['identity roles', 'sampler read failure', 'active retained ceiling'])
-      expect(() => judge(changed({ violations: ['retained slope', label] }))).toThrow(
+      expect(() => judge(changed({ violations: [label] }))).toThrow(
         'violations the seed does not explain'
       )
   })
@@ -417,8 +400,10 @@ describe('live seeded control judge', () => {
       expect(() => requireControl(directory, TELEMETRY)).toThrow('node')
       rewrite({ acceptance: true })
       expect(() => requireControl(directory, TELEMETRY)).toThrow('acceptance')
-      rewrite({ workers: changed({ violations: [], measured: record.workers[0].measured }) })
-      expect(() => requireControl(directory, TELEMETRY)).toThrow('retained slope')
+      rewrite({ workers: changed({ violations: ['sampler read failure'] }) })
+      expect(() => requireControl(directory, TELEMETRY)).toThrow(
+        'violations the seed does not explain'
+      )
     } finally {
       fs.rmSync(directory, { recursive: true, force: true })
     }
