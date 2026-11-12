@@ -108,6 +108,21 @@ const pair = () => {
 }
 
 describe('warm-up lifecycle witnesses', () => {
+  test('excludes module exports whose prototypes inherit from Map or Set without iterating them', () => {
+    const { meter } = census()
+    class Offsets extends Map {
+      [Symbol.iterator]() {
+        throw new Error('subclass iterator invoked')
+      }
+    }
+    class Members extends Set {}
+    const live = new Offsets([['k', {}]])
+    expect(() => meter.exclude({ Offsets, Members, live })).not.toThrow()
+    expect(meter.excluded.has(Offsets.prototype)).toBe(true)
+    expect(meter.excluded.has(Members.prototype)).toBe(true)
+    expect(meter.excluded.has(live.get('k'))).toBe(true)
+  })
+
   test('enumerates own catalogue foreground map set and backing objects without invoking getters', () => {
     const { meter } = census()
     const shared = {}
