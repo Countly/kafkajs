@@ -30,6 +30,7 @@ const workerOf = (kind) => {
   )
   return {
     kind,
+    execArgv: ['--expose-gc', '--no-flush-bytecode'],
     input: {
       diagnostic: true,
       acceptanceEligible: false,
@@ -122,6 +123,7 @@ describe('long-window driver', () => {
       diagnostic: true,
       kind: 'admin',
       arm: 'unseeded',
+      execArgv: null,
       complete: false,
       error: 'no worker result',
     })
@@ -203,7 +205,13 @@ describe('long-window driver', () => {
       violations: ['diagnostic inputs are not acceptance-eligible'],
       workers: KINDS.map(workerOf),
       oracle: { ok: false, violations: ['durability mismatch'] },
-      archive: { processes: {}, handshakes: [] },
+      archive: {
+        processes: {},
+        handshakes: KINDS.map((kind) => ({
+          kind,
+          execArgv: ['--expose-gc', '--no-flush-bytecode'],
+        })),
+      },
     }
     run.modules.PROFILES = { telemetry: [] }
     run.modules.buildTelemetryChurn = () => ({
@@ -219,6 +227,47 @@ describe('long-window driver', () => {
     }
     result.oracle = { ok: true, violations: [] }
     await expect(run.execute()).resolves.toBeUndefined()
+  })
+
+  test('records each worker runtime flag and fails the job when a required flag or handshake is missing', async () => {
+    const run = driver('unseeded')
+    const result = {
+      workers: KINDS.map(workerOf),
+      oracle: { ok: true, violations: [] },
+      archive: {
+        processes: {},
+        handshakes: KINDS.map((kind) => ({
+          kind,
+          execArgv: ['--expose-gc', '--no-flush-bytecode'],
+        })),
+      },
+    }
+    run.modules.PROFILES = { telemetry: [] }
+    run.modules.buildTelemetryChurn = () => ({
+      run: async () => result,
+      close: async () => {},
+    })
+    await expect(run.execute()).resolves.toBeUndefined()
+    const read = (name) => JSON.parse(fs.readFileSync(path.join(directory, name), 'utf8'))
+    for (const name of ['long-window.json', 'workers.json']) {
+      const archived = read(name)
+      expect(archived.candidate).toMatchObject({ version: 2, v8Flags: ['--no-flush-bytecode'] })
+      for (const worker of archived.workers)
+        expect(worker.execArgv).toEqual(['--expose-gc', '--no-flush-bytecode'])
+    }
+    for (const kind of KINDS) {
+      const handshake = result.archive.handshakes.find((row) => row.kind === kind)
+      for (const execArgv of [undefined, [], ['--expose-gc']]) {
+        handshake.execArgv = execArgv
+        await expect(run.execute()).rejects.toThrow(/no-flush-bytecode/)
+        const worker = read('long-window.json').workers.find((row) => row.kind === kind)
+        expect(worker.complete).toBe(false)
+        expect(worker).not.toHaveProperty('wouldBe')
+      }
+      handshake.execArgv = ['--expose-gc', '--no-flush-bytecode']
+    }
+    result.archive.handshakes.pop()
+    await expect(run.execute()).rejects.toThrow(/no-flush-bytecode/)
   })
 
   test('archives a worker beside its report without the id ledgers', () => {

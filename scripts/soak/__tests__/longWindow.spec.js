@@ -1,6 +1,7 @@
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
+const { EventEmitter } = require('node:events')
 const { Kafka } = require('../../../index')
 const { TELEMETRY, TelemetryResourceVerdict, PROFILES } = require('../soak')
 const churn = require('../telemetryChurn')
@@ -875,7 +876,7 @@ describe('long-window records', () => {
       },
     })
 
-  test('marks every record diagnostic and acceptance-ineligible and carries the frozen candidate with the commit', () => {
+  test('marks every record diagnostic and acceptance-ineligible and carries candidate v2 with its V8 flags and commit', () => {
     expect(identity()).toMatchObject({
       diagnostic: true,
       scope: 'shadow',
@@ -888,9 +889,11 @@ describe('long-window records', () => {
       attempt: '1',
       kafka: '4.3.1',
       node: process.version,
-      flags: ['--expose-gc'],
+      flags: ['--expose-gc', '--no-flush-bytecode'],
     })
     expect(identity().candidate).toEqual({
+      version: 2,
+      v8Flags: ['--no-flush-bytecode'],
       warmupMs: 420000,
       measureMs: 900000,
       sampleMs: 30000,
@@ -966,6 +969,68 @@ describe('warm-up-only seed', () => {
     expect(() => LiveSeed.of('slope3x', { root: {}, limits: TELEMETRY })).toThrow(
       'Unknown telemetry seed mode slope3x'
     )
+  })
+})
+
+describe('long-window worker flags', () => {
+  const child = () =>
+    Object.assign(new EventEmitter(), {
+      stdout: new EventEmitter(),
+      stderr: new EventEmitter(),
+    })
+
+  test('adds no-flush-bytecode only to long-window workers and leaves the default worker flags unchanged', () => {
+    const parentFlags = [...process.execArgv]
+    for (const on of [true, false]) {
+      const flags = withModules(on, ({ churn: c }) => {
+        const spawned = []
+        const processes = new c.TelemetryProcesses({
+          script: 'driver.js',
+          spawn: (script, args, options) => {
+            spawned.push({ kind: options.env[c.WORKER_ENV], execArgv: options.execArgv })
+            return child()
+          },
+        })
+        for (const kind of c.KINDS) processes.start(kind)
+        expect(c.WORKER_FLAGS).toEqual(['--expose-gc'])
+        return spawned
+      })
+      expect(flags).toEqual(
+        churn.KINDS.map((kind) => ({
+          kind,
+          execArgv: on ? ['--expose-gc', '--no-flush-bytecode'] : ['--expose-gc'],
+        }))
+      )
+    }
+    expect(process.execArgv).toEqual(parentFlags)
+  })
+
+  test('rejects each long-window worker handshake without no-flush-bytecode and accepts its actual flags', async () => {
+    await withModules(true, ({ churn: c }) => {
+      const checks = []
+      for (const execArgv of [
+        undefined,
+        [],
+        ['--expose-gc'],
+        '--no-flush-bytecode',
+        ['--expose-gc', '--no-flush-bytecode'],
+      ]) {
+        const processes = new c.TelemetryProcesses({ script: 'driver.js', spawn: child })
+        for (const kind of c.KINDS) {
+          const worker = processes.start(kind)
+          processes.receive(kind, { type: 'hello', kind, token: worker.token, execArgv })
+          const hello = processes.message(kind, 'hello', 500)
+          checks.push({ hello, kind, execArgv })
+        }
+      }
+      return Promise.all(
+        checks.map(async ({ hello, kind, execArgv }) => {
+          if (Array.isArray(execArgv) && execArgv.includes('--no-flush-bytecode'))
+            await expect(hello).resolves.toMatchObject({ kind, execArgv })
+          else await expect(hello).rejects.toThrow('--no-flush-bytecode')
+        })
+      )
+    })
   })
 })
 

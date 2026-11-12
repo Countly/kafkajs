@@ -21,6 +21,7 @@ const workerOf = (kind, arm, slopeKiB, { tripped = false, complete = true } = {}
 })
 
 const recordOf = ({ node, kafka = '4.3.1', arm, replicate = 1, workers }) => ({
+  candidate: { version: 2, v8Flags: ['--no-flush-bytecode'] },
   diagnostic: true,
   acceptanceEligible: false,
   arm,
@@ -192,6 +193,16 @@ describe('long-window report', () => {
     const runtimes = matrix(22, () => 10, 120)
     runtimes[0].node = 'v22.2.0'
     expect(() => summarise(runtimes)).toThrow(/runtime/)
+  })
+
+  test('refuses to pool different candidate versions including unversioned v1 records', () => {
+    for (const candidate of [{ version: 1 }, undefined]) {
+      const records = matrix(22, () => 10, 120)
+      records[0].candidate = candidate
+      expect(() => summarise(records)).toThrow(/mixed candidate versions/)
+    }
+    const legacy = matrix(22, () => 10, 120).map(({ candidate, ...record }) => record)
+    expect(summarise(legacy).nodes['22'].s3.status).toBe('pass')
   })
 
   test('prints one line per Node with S1, S2, masking, first-use trips and S3', () => {
