@@ -207,6 +207,7 @@ const summarise = (records) => {
               !masked &&
               negative.mid.data.slopeBytesPerMinute <=
                 LONG_WINDOW.thresholds.unseededSlopeBytesPerMinute &&
+              Number.isFinite(negative.mid.data.endpointBytes) &&
               negative.mid.data.endpointBytes <= LONG_WINDOW.thresholds.endpointBytes
             )
               node.s2.pass += 1
@@ -324,6 +325,10 @@ const verifyAcceptance = (records, { tree, runId, attempt, replayDiagnostic = fa
     if (record.workers?.length !== KINDS.length)
       throw new Error('Expected four long-window workers')
     for (const worker of record.workers) {
+      const workerEligible = replayDiagnostic
+        ? worker.diagnostic === true && worker.acceptance === false
+        : worker.diagnostic === false && worker.acceptance === true && worker.scope === 'acceptance'
+      if (!workerEligible) throw new Error('Ineligible long-window worker report')
       if (
         !Number.isFinite(worker.firstUse?.dataBytes) ||
         worker.firstUse.tripped !== worker.firstUse.dataBytes > LONG_WINDOW.thresholds.firstUseBytes

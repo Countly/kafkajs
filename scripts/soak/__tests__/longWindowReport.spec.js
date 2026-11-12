@@ -445,6 +445,12 @@ describe('long-window acceptance', () => {
       ...record,
       diagnostic: true,
       acceptanceEligible: false,
+      workers: record.workers.map((worker) => ({
+        ...worker,
+        diagnostic: true,
+        acceptance: false,
+        scope: 'shadow',
+      })),
     }))
     expect(() => verifyAcceptance(records, expected)).toThrow()
     expect(
