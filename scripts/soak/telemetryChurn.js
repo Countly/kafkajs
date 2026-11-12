@@ -107,7 +107,7 @@ const ROOT = path.resolve(__dirname, '../..')
 const NATIVE_ROWS = 1024
 /** Engine code readings one worker journals: every settled reading of a run, with room. */
 const ENGINE_ROWS = 64
-/** The node flags every telemetry worker is forked with; broker-free controls reuse this list. */
+/** Default telemetry worker flags, also reused by broker-free controls. */
 const WORKER_FLAGS = Object.freeze(['--expose-gc'])
 
 /**
@@ -2467,7 +2467,7 @@ class TelemetryProcesses {
     const token = crypto.randomBytes(8).toString('hex')
     const child = this.spawn(this.script, [...this.args, '--profile', 'telemetry'], {
       execPath: process.execPath,
-      execArgv: [...WORKER_FLAGS],
+      execArgv: [...WORKER_FLAGS, ...(longWindowSelected() ? LONG_WINDOW.v8Flags : [])],
       env: { ...process.env, [WORKER_ENV]: kind, [WORKER_TOKEN]: token },
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     })
@@ -2573,6 +2573,13 @@ class TelemetryProcesses {
       ...(message.row && { rowKind: message.row.kind }),
       ...(message.message && { message: String(message.message).slice(0, 2048) }),
     }
+    if (
+      message.type === 'hello' &&
+      longWindowSelected() &&
+      (!Array.isArray(message.execArgv) ||
+        !LONG_WINDOW.v8Flags.every((flag) => message.execArgv.includes(flag)))
+    )
+      return bad('missing long-window worker flag --no-flush-bytecode')
     if (message.type === 'receipt') worker.receiptAt = this.now()
     if (message.type === 'decode') {
       if (!worker.error) this.onDecode(kind, message)
