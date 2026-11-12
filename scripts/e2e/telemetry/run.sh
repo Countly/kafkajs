@@ -81,12 +81,13 @@ case "$RAW" in /*) ;; *) exit 2 ;; esac
 [ "$(wc -c < "$RAW")" -le 4096 ]
 CP="$HERE/fixtures/full-telemetry-decoder.jar:$HERE/fixtures/counting-telemetry-reporter-$LINE.jar:$TELEMETRY_JAVA_CACHE/jars/kafka-clients-$LINE.jar:$TELEMETRY_JAVA_CACHE/jars/protobuf-java-3.25.5.jar:$TELEMETRY_JAVA_CACHE/jars/slf4j-api-1.7.36.jar"
 # A one-shot decoder has no long-running workload to amortize profiling/C2 compilation.
-JVM=(-XX:TieredStopAtLevel=1)
+# Warnings go to stderr and no hsperfdata file is used: the decoder's stdout carries exactly two JSON lines.
+JVM=(-XX:TieredStopAtLevel=1 -XX:-UsePerfData -Xlog:disable -Xlog:all=warning:stderr)
 if [ "$MODE" = prepare ]; then
   : "${TELEMETRY_DECODER_ARCHIVE:?set a new absolute AppCDS archive path}"
   case "$TELEMETRY_DECODER_ARCHIVE" in /*) ;; *) exit 2 ;; esac
   [ ! -e "$TELEMETRY_DECODER_ARCHIVE" ] && [ ! -L "$TELEMETRY_DECODER_ARCHIVE" ] || exit 2
-  JVM+=(-Xshare:on "-XX:ArchiveClassesAtExit=$TELEMETRY_DECODER_ARCHIVE" -Xlog:disable -Xlog:all=warning:stderr)
+  JVM+=(-Xshare:on "-XX:ArchiveClassesAtExit=$TELEMETRY_DECODER_ARCHIVE")
 elif [ -n "${TELEMETRY_DECODER_ARCHIVE:-}" ]; then
   case "$TELEMETRY_DECODER_ARCHIVE" in /*) ;; *) exit 2 ;; esac
   [ -f "$TELEMETRY_DECODER_ARCHIVE" ] && [ ! -L "$TELEMETRY_DECODER_ARCHIVE" ] || exit 2
