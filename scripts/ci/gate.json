@@ -19796,7 +19796,9 @@
         "scripts/e2e/telemetry/__tests__/activeCensus.spec.js \u203a active census scalar companion observes the same seam without GC or captures outside active settlement",
         "scripts/e2e/telemetry/__tests__/activeCensus.spec.js \u203a active census fails incomplete codec coverage and preserves capture failures",
         "scripts/e2e/telemetry/__tests__/activeCensus.spec.js \u203a active census top owners carry additive self bytes and named retaining paths including unresolved owners",
-        "scripts/ci/__tests__/workflowTimeouts.spec.js \u203a Workflow timeouts active owner census is broker-free diagnostic only with bounded capture and scalar jobs"
+        "scripts/ci/__tests__/workflowTimeouts.spec.js \u203a Workflow timeouts active owner census is broker-free diagnostic only with bounded capture and scalar jobs",
+        "scripts/e2e/telemetry/__tests__/activeCensus.spec.js \u203a active census replay rejects unpaired changed and nonfinite evidence without hiding raw overages",
+        "scripts/e2e/telemetry/__tests__/activeCensus.spec.js \u203a active census captures the original pending post-turn checkpoint and reports absent overlaps"
       ],
       "capMinutes": 85,
       "allowedSkips": [
@@ -24020,7 +24022,9 @@
         "scripts/e2e/telemetry/__tests__/activeCensus.spec.js \u203a active census scalar companion observes the same seam without GC or captures outside active settlement",
         "scripts/e2e/telemetry/__tests__/activeCensus.spec.js \u203a active census fails incomplete codec coverage and preserves capture failures",
         "scripts/e2e/telemetry/__tests__/activeCensus.spec.js \u203a active census top owners carry additive self bytes and named retaining paths including unresolved owners",
-        "scripts/ci/__tests__/workflowTimeouts.spec.js \u203a Workflow timeouts active owner census is broker-free diagnostic only with bounded capture and scalar jobs"
+        "scripts/ci/__tests__/workflowTimeouts.spec.js \u203a Workflow timeouts active owner census is broker-free diagnostic only with bounded capture and scalar jobs",
+        "scripts/e2e/telemetry/__tests__/activeCensus.spec.js \u203a active census replay rejects unpaired changed and nonfinite evidence without hiding raw overages",
+        "scripts/e2e/telemetry/__tests__/activeCensus.spec.js \u203a active census captures the original pending post-turn checkpoint and reports absent overlaps"
       ],
       "capMinutes": 93,
       "allowedSkips": [

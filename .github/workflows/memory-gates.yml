@@ -235,6 +235,45 @@ jobs:
           path: .tmp/telemetry-resources/
           if-no-files-found: error
           include-hidden-files: true
+  active-owner-census:
+    name: active-owner-census-node${{ matrix.node }}-${{ matrix.variant }}
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions: { contents: read }
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24, 26]
+        variant: [scalar, capture]
+    env:
+      ACTIVE_CENSUS_ROOT: ${{ github.workspace }}/.tmp/active-census
+      ACTIVE_CENSUS_VARIANT: ${{ matrix.variant }}
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 1
+      - uses: actions/setup-node@v4
+        timeout-minutes: 1
+        with: { node-version: '${{ matrix.node }}', cache: npm }
+      - run: npm ci
+        timeout-minutes: 5
+      - name: Observe pending compression in four serial public resource children
+        timeout-minutes: 8
+        run: timeout -k 10s 450s node scripts/e2e/telemetry/activeDiagnostic.js --diagnostic-only "$ACTIVE_CENSUS_ROOT" "$ACTIVE_CENSUS_VARIANT"
+      - name: Attribute active heap owners offline with the retained census
+        if: always()
+        timeout-minutes: 8
+        run: timeout -k 10s 450s node scripts/e2e/telemetry/retained/analyseActive.js "$ACTIVE_CENSUS_ROOT"
+      - name: Archive complete or partial diagnostic evidence
+        if: always()
+        timeout-minutes: 2
+        uses: actions/upload-artifact@v4
+        with:
+          name: active-owner-census-node${{ matrix.node }}-${{ matrix.variant }}
+          path: .tmp/active-census/
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
   journal-controls:
     name: journal-controls-${{ matrix.group.name }}-node${{ matrix.node }}
     if: github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/')

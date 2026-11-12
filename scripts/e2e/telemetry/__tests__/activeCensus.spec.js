@@ -103,6 +103,8 @@ test('active census fails incomplete codec coverage and preserves capture failur
   })
   expect(() => census.submit(row, journal)).toThrow('snapshot overflow')
   expect(() => census.complete(['gzip'])).toThrow('missing active census')
+  census.submit(row, journal)
+  expect(capture).toHaveBeenCalledTimes(2)
 })
 
 test('active census top owners carry additive self bytes and named retaining paths including unresolved owners', () => {
@@ -122,4 +124,99 @@ test('active census top owners carry additive self bytes and named retaining pat
   expect(summary[1]).toMatchObject({ name: 'TelemetryPayload', selfBytes: 100, count: 2 })
   expect(summary[1].examples).toHaveLength(2)
   expect(summary[1].examples[0].rootPath[1].edge.name).toBe('currentJob')
+  const cohort = load().topOwners({ nodes }, graph, new Set([2]))
+  expect(cohort).toHaveLength(1)
+  expect(cohort[0]).toMatchObject({ selfBytes: 60, count: 1 })
+  expect(cohort[0].examples[0].rootPath[1].node.id).toBe(2)
+})
+
+test('active census replay rejects unpaired changed and nonfinite evidence without hiding raw overages', () => {
+  const { census, capture, row, journal } = setup()
+  census.phase = 'gzip'
+  census.submit(row, journal)
+  const event = { ...capture.mock.calls[1][1], name: 'gzip', startedAt: 22, endedAt: 23 }
+  const options = {
+    variant: 'capture',
+    matched: reading(10, 50),
+    native: { ...row, settled: { at: 24 } },
+  }
+  expect(() => load().validatePoint(event, options)).not.toThrow()
+  const checkpoint = { ...event, name: 'gzip-checkpoint', stage: 'after-turn-2', round: 0 }
+  expect(() => load().validatePoint(checkpoint, options)).not.toThrow()
+  expect(() => load().validatePoint({ ...checkpoint, round: 6 }, options)).toThrow()
+  for (const mutate of [
+    (copy) => {
+      copy.acceptanceEligible = true
+    },
+    (copy) => {
+      copy.raw.at = NaN
+    },
+    (copy) => {
+      copy.raw.retained++
+    },
+    (copy) => {
+      copy.afterMajorGc.retained++
+    },
+    (copy) => {
+      copy.rawMinusM++
+    },
+    (copy) => {
+      copy.pending[0].jobId++
+    },
+    (copy) => {
+      copy.pending.push(copy.pending[0])
+    },
+    (copy) => {
+      copy.endedAt = 25
+    },
+    (copy) => {
+      copy.startedAt = 19
+    },
+    (copy) => {
+      copy.afterMajorGc = null
+    },
+  ]) {
+    const changed = JSON.parse(JSON.stringify(event))
+    mutate(changed)
+    expect(() => load().validatePoint(changed, options)).toThrow()
+  }
+  const large = reading(20, 12 * 1024 * 1024)
+  const overage = { ...event, raw: large, rawMinusM: large.retained - options.matched.retained }
+  expect(() => load().validatePoint(overage, options)).not.toThrow()
+  expect(() =>
+    load().validatePoint(
+      { ...event, name: 'M', reading: reading(9, 50), processRetainedBytes: 60 },
+      options
+    )
+  ).toThrow('baseline changed')
+})
+
+test('active census captures the original pending post-turn checkpoint and reports absent overlaps', () => {
+  const { census, memory, capture, row, journal } = setup()
+  census.phase = 'gzip'
+  census.submit(row, journal)
+  memory.current.mockReturnValueOnce(reading(30, 300)).mockReturnValueOnce(reading(31, 90))
+  for (const stage of ['after-second-gc', 'before-turn-1', 'after-turn-1', 'before-turn-2'])
+    census.observe(0, stage, journal)
+  expect(capture).toHaveBeenCalledTimes(2)
+  census.observe(0, 'after-turn-2', journal)
+  census.observe(1, 'after-turn-2', journal)
+  expect(capture.mock.calls.map(([name]) => name)).toEqual(['M', 'gzip', 'gzip-checkpoint'])
+  expect(capture.mock.calls[2][1]).toMatchObject({
+    stage: 'after-turn-2',
+    round: 0,
+    raw: reading(30, 300),
+    afterMajorGc: reading(31, 90),
+  })
+  expect(census.complete(['gzip']).checkpointCoverage).toEqual([
+    { codec: 'gzip', pendingCheckpointCaptured: true },
+  ])
+  const absent = setup('scalar')
+  absent.census.phase = 'gzip'
+  absent.census.submit(absent.row, absent.journal)
+  absent.journal.live.clear()
+  absent.census.observe(0, 'after-turn-2', absent.journal)
+  expect(absent.census.complete(['gzip']).checkpointCoverage).toEqual([
+    { codec: 'gzip', pendingCheckpointCaptured: false },
+  ])
 })

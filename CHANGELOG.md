@@ -28,6 +28,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Tooling
 
+- Add isolated broker-free active compression diagnostics on Node 22/24/26, with unchanged public resource children, scalar companions, explicit major-GC pairs and bounded retained-root censuses; records cannot satisfy memory acceptance.
 - Exit gate decoder benchmark: a row that is INVALID only because of runner noise passes when its median new/old is within 5%; a valid FAIL or regression, a structural problem or a larger median still fails.
 - The Exit gate's decoder benchmark reports all five frame-decode rows (1m, 64b, 64k, coalesced, byte-chunks) as information only: on GitHub-hosted runners their A/A control is too noisy to judge; a valid FAIL or proven regression on them still fails.
 - Judge decoder benchmark rows with paired confidence bounds and a calibrated baseline control, using longer rounds and three parallel collection partitions.

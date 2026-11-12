@@ -70,6 +70,26 @@ const zstd = require('../../../protocol/message/compression/zstd')
 const loaded = { ...memory.current(), modules: process.moduleLoadList.length }
 memory.mark('loaded')
 
+const activeCensus = process.env.ACTIVE_CENSUS_DIRECTORY
+  ? new (require(path.join(ROOT, 'scripts/e2e/telemetry/retained/activeCensus')).ActiveCensus)({
+      memory,
+      variant: process.env.ACTIVE_CENSUS_VARIANT,
+      capture: require(path.join(ROOT, 'scripts/e2e/telemetry/retained/liveCensus')).captureSink(
+        process.env.ACTIVE_CENSUS_DIRECTORY,
+        {
+          diagnostic: true,
+          acceptanceEligible: false,
+          attributionComplete: false,
+          childId: process.env.RESOURCE_CHILD_ID,
+          tree: process.env.RESOURCE_TREE,
+          runId: process.env.RESOURCE_RUN_ID,
+          kind: process.argv[2],
+          variant: process.env.ACTIVE_CENSUS_VARIANT,
+        }
+      ),
+    })
+  : null
+
 const PHASE_PUSHES = 2
 const GZIP_MAGIC = [0x1f, 0x8b]
 const ZSTD_MAGIC = 0xfd2fb528
@@ -147,7 +167,15 @@ const measure = async (kind) => {
   }
 
   const roles = new ResourceRoles({ roles: ['control', 'target', 'fixture'] }).start()
-  const settled = () => roles.run('fixture', () => memory.settled())
+  let activeJournal = null
+  const settled = () =>
+    roles.run('fixture', () =>
+      memory.settled(
+        activeCensus && activeJournal
+          ? (round, stage) => activeCensus.observe(round, stage, activeJournal)
+          : null
+      )
+    )
   const turn = () => new Promise((resolve) => setImmediate(resolve))
   const contexts = { control: hostContext() }
 
@@ -203,6 +231,7 @@ const measure = async (kind) => {
         let armed = null
         let reopen = null
         hooks.onSubmit = (row) => {
+          activeCensus?.submit(row, journal)
           if (armed !== row.codec) return
           armed = null
           hooks.epoch += 1
@@ -231,6 +260,7 @@ const measure = async (kind) => {
         memory.mark(warm ? 'warmup:matched' : 'enabled:matched')
         seed?.matched()
         const matchedResources = roles.read()
+        if (!warm) activeCensus?.baseline(matched)
 
         const actives = []
         for (const codec of codecs) {
@@ -250,7 +280,13 @@ const measure = async (kind) => {
             `${codec.name} push after reopen`
           )
           if (!warm) {
+            if (activeCensus) {
+              activeCensus.phase = codec.name
+              activeJournal = journal
+            }
             const active = await settled()
+            if (activeCensus) activeCensus.phase = null
+            activeJournal = null
             actives.push({ phase: codec.name, ...active, registry: enabled.fingerprint(uuid) })
             memory.mark(`enabled:${codec.name}`)
           }
@@ -266,6 +302,9 @@ const measure = async (kind) => {
           memory.mark('enabled:held')
           actives.push(held)
         }
+        const censusCoverage = !warm
+          ? activeCensus?.complete(codecs.map((codec) => codec.name))
+          : null
         const uuidHeld = await enabled.client.clientInstanceId({ timeout: 0 })
         hooks.epoch += 1
         const disconnect = new BoundaryWitness(() => memory.now())
@@ -311,6 +350,7 @@ const measure = async (kind) => {
         return {
           uuid,
           uuidHeld,
+          censusCoverage,
           matched,
           matchedResources,
           actives,
@@ -373,6 +413,7 @@ const measure = async (kind) => {
       registry: arm.registry,
       uuid: arm.uuid,
       uuidHeld: arm.uuidHeld,
+      ...(activeCensus ? { activeCensus: arm.censusCoverage } : {}),
       descriptors: DESCRIPTORS,
       resources: {
         released: control.releasedResources,
