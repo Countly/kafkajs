@@ -208,14 +208,16 @@ class ProductSeed {
 class MemoryForeground {
   /**
    * @param {string} kind producer, consumer, admin or shareConsumer
-   * @param {{enabled: boolean, seed?: ProductSeed|null}} options whether `enableMetricsPush` is
+   * @param {{enabled: boolean, seed?: ProductSeed|null, witnesses?: object|null}} options whether `enableMetricsPush` is
    *   set, and the seeded control's leak on every public close of this client, normally none
+   * @param {object|null} [options.witnesses] diagnostic-only weak inventory of build inputs
    * @returns {MemoryForeground} an object with no client yet
    */
-  constructor(kind, { enabled, seed = null }) {
+  constructor(kind, { enabled, seed = null, witnesses = null }) {
     this.kind = kind
     this.enabled = enabled
     this.seed = seed
+    if (witnesses) this.witnesses = witnesses
     this.codecs = [0]
     this.timers = new Set()
     this.ops = []
@@ -237,6 +239,8 @@ class MemoryForeground {
   build() {
     const advertise = { GetTelemetrySubscriptions: [0, 0], PushTelemetry: [0, 0] }
     const options = { enableMetricsPush: this.enabled }
+    this.witnesses?.track('foreground:advertise', advertise)
+    this.witnesses?.track('foreground:options', options)
     if (this.kind === 'shareConsumer') {
       this.harness = share.shareClient({
         advertise,
@@ -254,6 +258,7 @@ class MemoryForeground {
         bounded: WIRE_BOUNDS,
       })
       const kafka = new Kafka(this.wire.kafkaOptions(options))
+      this.witnesses?.track('foreground:kafka', kafka)
       if (this.kind === 'producer') this.client = kafka.producer({ idempotent: false })
       else if (this.kind === 'admin') this.client = kafka.admin()
       else
@@ -291,6 +296,7 @@ class MemoryForeground {
     )
     if (this.kind === 'consumer')
       this.removers.push(this.client.on(this.client.events.GROUP_JOIN, () => (this.joins += 1)))
+    this.witnesses?.track('foreground:built', this)
     return this
   }
 
@@ -534,18 +540,22 @@ const runControl = async ({ kind, lifecycles, memory, roles, journal, live }) =>
  * @param {object} snapshot the strict maximum collector sample
  * @param {{name:string,type:number}} codec the real codec to select
  * @param {() => void} retire advances the journal's lifecycle while the second job is pending
+ * @param {object|null} [witnesses] diagnostic-only weak inventory of payload temporaries
  * @returns {Promise<object>} the byte/point/retirement facts, with no payload references
  * @throws {Error} preserves a failed native build
  */
-const nativePair = async (builder, snapshot, codec, retire) => {
+const nativePair = async (builder, snapshot, codec, retire, witnesses = null) => {
   const options = {
     telemetryMaxBytes: 1048576,
     acceptedCompressionTypes: [codec.type, 0],
     isCurrent: () => true,
   }
+  witnesses?.track('catalogue:native-options', options)
   const current = await builder.buildPayload(snapshot, options)
+  witnesses?.track('catalogue:native-current', current)
   let valid = true
   const retiring = builder.buildPayload(snapshot, { ...options, isCurrent: () => valid })
+  witnesses?.track('catalogue:native-retiring', retiring)
   retire()
   valid = false
   return {

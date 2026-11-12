@@ -67,6 +67,11 @@ const { phaseCatalogue } = require(
 const gzipModule = require('../../../protocol/message/compression/gzip')
 const zstd = require('../../../protocol/message/compression/zstd')
 
+const witnesses =
+  process.env.RESOURCE_WITNESSES === '1'
+    ? new (require(path.join(ROOT, 'scripts/e2e/telemetry/warmupWitness')).WarmupWitnesses)()
+    : null
+
 const loaded = { ...memory.current(), modules: process.moduleLoadList.length }
 memory.mark('loaded')
 
@@ -225,7 +230,11 @@ const measure = async (kind) => {
       const seed = ProductSeed.of(process.env.RESOURCE_SEED, warm)
       try {
         if (!warm) memory.mark('enabled:start')
-        const enabled = new MemoryForeground(kind, { enabled: true, seed }).build()
+        const enabled = new MemoryForeground(kind, {
+          enabled: true,
+          seed,
+          witnesses: warm ? witnesses : null,
+        }).build()
         live.push(enabled)
         const reopens = []
         let armed = null
@@ -238,6 +247,7 @@ const measure = async (kind) => {
           // Called from inside the submission: the close starts while the native job is in flight
           // and the same object's next call is the connect in the close's own continuation.
           const witness = new BoundaryWitness(() => memory.now())
+          if (warm) witnesses?.track('catalogue:reopen', witness)
           reopens.push({ codec: row.codec, events: witness.events })
           reopen = enabled
             .close(0)
@@ -255,7 +265,15 @@ const measure = async (kind) => {
         hooks.epoch += 1
         await enabled.close(0)
         await enabled.drain()
+        if (warm && witnesses) {
+          witnesses.track('foreground', enabled)
+          witnesses.track('observation', watch)
+          witnesses.track('reopens', reopens)
+          witnesses.track('seed:root', require(path.join(ROOT, 'index.js')).Kafka[SEED.root])
+        }
         const settledMatched = await settled()
+        if (warm) witnesses?.check('m0', settledMatched)
+        else witnesses?.check('matched', settledMatched)
         const matched = { ...settledMatched, registry: enabled.fingerprint(uuid) }
         memory.mark(warm ? 'warmup:matched' : 'enabled:matched')
         seed?.matched()
@@ -279,6 +297,7 @@ const measure = async (kind) => {
             () => enabled.accepted(codec.type) > before,
             `${codec.name} push after reopen`
           )
+          if (warm) witnesses?.track(`foreground:${codec.name}`, enabled)
           if (!warm) {
             if (activeCensus) {
               activeCensus.phase = codec.name
@@ -287,6 +306,7 @@ const measure = async (kind) => {
             const active = await settled()
             if (activeCensus) activeCensus.phase = null
             activeJournal = null
+            if (actives.length === 0) witnesses?.check('firstActive', active)
             actives.push({ phase: codec.name, ...active, registry: enabled.fingerprint(uuid) })
             memory.mark(`enabled:${codec.name}`)
           }
@@ -335,12 +355,22 @@ const measure = async (kind) => {
         await turn()
         await turn()
         if (warm) {
+          if (witnesses) {
+            witnesses.track('foreground:closed', enabled)
+            witnesses.track('observation:closed', watch)
+            witnesses.track('catalogue:pushes', pushes)
+            witnesses.track('catalogue:decoded', decoded)
+            witnesses.track('catalogue:disconnect', disconnect)
+            witnesses.track('catalogue:closing', closing)
+            witnesses.track('seed:root', require(path.join(ROOT, 'index.js')).Kafka[SEED.root])
+          }
           enabled.release()
           live.splice(live.indexOf(enabled), 1)
           return { m0: settledMatched, seed: seed?.summary() ?? null }
         }
         const facts = enabled.facts()
         const settledClosed = await settled()
+        witnesses?.check('closed', settledClosed)
         const closed = { ...settledClosed, registry: enabled.fingerprint(uuid) }
         memory.mark('enabled:closed')
         const closedResources = roles.read()
@@ -385,8 +415,30 @@ const measure = async (kind) => {
     const control = await runControlObserved()
     contexts.boundary = hostContext()
 
-    const warmed = await pass(true)
+    if (witnesses)
+      witnesses.exclude(
+        memory,
+        roles,
+        witnesses,
+        ...Object.values(require.cache).map((entry) => entry.exports)
+      )
+    if (witnesses) {
+      witnesses.observe(require('../../metrics').prototype, [
+        'register',
+        'bindNode',
+        'select',
+        'snapshot',
+      ])
+      witnesses.observe(require('../../payload').prototype, ['buildPayload'])
+    }
+    let warmed
+    try {
+      warmed = await pass(true)
+    } finally {
+      witnesses?.restore()
+    }
     const end = await settled()
+    witnesses?.check('warmupEnd', end)
     memory.mark('warmup:closed')
     const enabledRun = await pass(false)
 
@@ -394,6 +446,9 @@ const measure = async (kind) => {
     const { facts, samples, native, seed, ...arm } = enabledRun
     const readings = {
       manifest,
+      ...(witnesses
+        ? { diagnostic: true, acceptanceEligible: false, warmupWitnesses: witnesses.summary() }
+        : {}),
       startup,
       loaded,
       c0: control.c0,
