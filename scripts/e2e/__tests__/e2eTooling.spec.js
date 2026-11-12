@@ -1621,9 +1621,8 @@ describe('broker telemetry fixture', () => {
       default: '1',
       options: ['1', '2', '3'],
     })
-    expect(job.if).toBe(
-      "github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/')"
-    )
+    // About 40 runner-minutes per job: manual collections only, never every PR push.
+    expect(job.if).toBe("github.event_name == 'workflow_dispatch'")
     expect(job.needs).toBeUndefined()
     expect(job['timeout-minutes']).toBeLessThanOrEqual(75)
     const { matrix } = job.strategy
