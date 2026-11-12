@@ -1,10 +1,14 @@
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
 const { Kafka } = require('../../../index')
 const { TELEMETRY, TelemetryResourceVerdict, PROFILES } = require('../soak')
 const churn = require('../telemetryChurn')
 const { LIVE_SEED, LiveSeed } = require('../liveSeed')
 const { judgeMemoryArm, SCHEMA } = require('../../e2e/telemetry/resourceArtifact')
 const { ReferenceControl, TelemetryWorkerProcess, declaredJournalBytes } = churn
-const { TelemetrySegments } = require('../../../testHelpers/telemetrySegments')
+const { TelemetrySegments, FILE_BOUND } = require('../../../testHelpers/telemetrySegments')
+const { TelemetryExportReader, OBSERVER_LIMITS } = require('../../../testHelpers/telemetryFixtures')
 const {
   LONG_WINDOW,
   HeapSpaceJournal,
@@ -298,6 +302,148 @@ describe('long-window sizing', () => {
     expect(declaredJournalBytes('producer', { ...TELEMETRY, heapSpaceRows: 2 }) - base).toBe(
       2 * LONG_WINDOW.heapSpaceRowBytes
     )
+  })
+})
+
+describe('long-window fixture capacity', () => {
+  let directory
+  beforeEach(() => {
+    directory = fs.mkdtempSync(path.join(os.tmpdir(), 'long-sink-'))
+  })
+  afterEach(() => fs.rmSync(directory, { recursive: true, force: true }))
+
+  test('budgets all four clients on one sink for the frozen schedule with 25 percent margin', () => {
+    const schedule = new churn.TelemetrySchedule(LONG)
+    const count = (action) => schedule.ticks.filter((tick) => tick.actions.includes(action)).length
+    const lifecycles = count('reopen') + 2
+    const rows =
+      4 * (Math.ceil(LONG.caseMs / 1000) + 2 * lifecycles + count('retire') + count('subscription'))
+    const requiredBytes = rows * (4096 + 1)
+    const bytesWithMargin = Math.ceil(requiredBytes * 1.25)
+    expect(lifecycles).toBe(23)
+    expect(rows).toBe(6880)
+    expect(LONG.sinkBytes).toBe(Math.ceil(bytesWithMargin / MIB) * MIB)
+    expect(LONG.sinkBytes).toBeGreaterThanOrEqual(bytesWithMargin)
+    expect(LONG.sinkBudget).toEqual({ lifecycles, rows, requiredBytes, margin: 1.25 })
+    expect(TELEMETRY).not.toHaveProperty('sinkBytes')
+    expect(TELEMETRY).not.toHaveProperty('sinkBudget')
+    expect(OBSERVER_LIMITS).toEqual({
+      sockets: 64,
+      pending: 128,
+      records: 4096,
+      retained: 2 * MIB,
+      frame: MIB,
+      prefix: 8192,
+    })
+    expect(FILE_BOUND).toBe(2 * MIB)
+  })
+
+  test('retains every row beyond the default sink cap and keeps overflow fatal on the long cap', () => {
+    const rows = Array.from({ length: 8000 }, (_, i) => ({
+      v: 1,
+      node: '1',
+      seq: i + 1,
+      clientInstanceId: '00112233-4455-6677-8899-aabbccddeeff',
+      parse: 'ok',
+      dataBytes: 22,
+      dataSha256: 'a'.repeat(64),
+      terminating: false,
+      pushIntervalMs: 1000,
+      detail: 'x'.repeat(100),
+    }))
+    const bytes = rows.map((row) => JSON.stringify(row) + '\n').join('')
+    expect(Buffer.byteLength(bytes)).toBeGreaterThan(2 * MIB)
+    const file = path.join(directory, 'exports-1.jsonl')
+    fs.writeFileSync(file, bytes)
+    expect(() => new TelemetryExportReader(directory).readExports()).toThrow('file cap')
+    const reader = new TelemetryExportReader(directory, { fileBytes: LONG.sinkBytes })
+    expect(reader.readExports()).toEqual(rows)
+    expect(reader.checkpoint()).toEqual({ 1: rows.length, 2: 0, 3: 0 })
+    fs.writeFileSync(path.join(directory, 'OVERFLOW-3.json'), '{"reason":"file-cap"}')
+    expect(() => reader.readExports({ after: { 1: rows.length } })).toThrow(
+      'Telemetry fixture overflow'
+    )
+    fs.unlinkSync(path.join(directory, 'OVERFLOW-3.json'))
+    fs.truncateSync(file, LONG.sinkBytes + 1)
+    expect(() => reader.readExports()).toThrow('file cap')
+  })
+
+  test('passes the long sink cap to both worker observers and the parent decoder', () => {
+    const make = jest.fn(() => ({}))
+    const decoder = new churn.DecoderCoordinator({
+      directory,
+      line: '4.3.1',
+      clock: { now: () => 0 },
+      make,
+      sinkBytes: LONG.sinkBytes,
+    })
+    expect(decoder.observer).toEqual({})
+    expect(make).toHaveBeenCalledWith(expect.objectContaining({ sinkBytes: LONG.sinkBytes }))
+    const source = fs.readFileSync(path.join(__dirname, '../telemetryChurn.js'), 'utf8')
+    expect(source).toMatch(/sinkBytes: soak\.TELEMETRY\.sinkBytes/)
+    const soak = fs.readFileSync(path.join(__dirname, '../soak.js'), 'utf8')
+    expect(soak).toMatch(/sinkBytes: ACTIVE_TELEMETRY\.sinkBytes/)
+  })
+
+  test('changes only the reporter file cap and preserves its fatal overflow paths', () => {
+    const { LongWindowReporter } = jest.requireActual('../longWindowReporter')
+    const source = fs.readFileSync(
+      path.join(__dirname, '../../e2e/telemetry/CountingTelemetryReporter.java'),
+      'utf8'
+    )
+    const prepared = LongWindowReporter.source(source)
+    expect(prepared).toBe(
+      source.replace('MAX_FILE_BYTES = 2L * 1024 * 1024;', `MAX_FILE_BYTES = ${LONG.sinkBytes}L;`)
+    )
+    expect(prepared).not.toBe(source)
+    expect(prepared).toContain('overflow("file-cap")')
+    expect(prepared).toContain('overflow("queue-full")')
+    expect(() =>
+      LongWindowReporter.source(source.replace('MAX_FILE_BYTES = 2L', 'MAX_FILE_BYTES = 3L'))
+    ).toThrow('reporter file cap')
+  })
+
+  test('uses the derived reporter only in the long job and verifies the mounted jar identity', () => {
+    const yaml = require('js-yaml')
+    const jobs = yaml.load(
+      fs.readFileSync(path.join(__dirname, '../../../.github/workflows/memory-gates.yml'), 'utf8')
+    ).jobs
+    const long = jobs['telemetry-long-window']
+    expect(long.steps.filter((step) => step.run?.includes('longWindowReporter.js'))).toHaveLength(1)
+    expect(
+      long.steps.findIndex((step) => step.run?.includes('longWindowReporter.js'))
+    ).toBeLessThan(long.steps.findIndex((step) => step.run?.includes('ci.js preflight')))
+    const start = long.steps.find((step) => step.run?.includes('up -d --pull never'))
+    expect(start.run).toContain('-f .tmp/telemetry-long-reporter/compose.json')
+    for (const action of ['preflight', 'capture', 'stop']) {
+      const step = long.steps.find((entry) => entry.run?.includes(`ci.js ${action}`))
+      expect(step.env.TELEMETRY_LONG_WINDOW).toBe('1')
+    }
+    for (const [name, job] of Object.entries(jobs)) {
+      if (name !== 'telemetry-long-window')
+        expect(JSON.stringify(job)).not.toContain('longWindowReporter')
+    }
+    const { CiOwnership } = require('../../e2e/telemetry/ci')
+    const docker = jest.fn(() => '')
+    const owner = new CiOwnership({
+      env: {
+        CI: 'true',
+        COMPOSE_PROJECT_NAME: 'telemetry-default',
+        COMPOSE_FILE: 'docker-compose.telemetry.yml',
+      },
+      docker,
+    })
+    owner.run(['compose', '-f', owner.file, 'config'])
+    expect(docker.mock.calls[0][0]).toEqual(['compose', '-f', owner.file, 'config'])
+    const ci = fs.readFileSync(path.join(__dirname, '../../e2e/telemetry/ci.js'), 'utf8')
+    expect(ci).toMatch(/reporterSha256, this\.longReporter\?\.sha256 \?\? manifest/)
+  })
+
+  test('offers all 440 batches before the long boundary without changing the corpus rate', () => {
+    const sizes = sizesWith(true)
+    expect(sizes.long.slots).toEqual(Array.from({ length: 440 }, (_, i) => i * 3000))
+    expect(sizes.long.slots.at(-1) + churn.CORPUS.batchMs).toBe(LONG.warmupMs + LONG.measureMs)
+    expect(sizes.records).toBe(440 * churn.CORPUS.batch)
   })
 })
 
