@@ -16,7 +16,6 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const crypto = require('node:crypto')
-// eslint-disable-next-line n/no-missing-require -- implemented by the following fix commit
 const { ShareAllocationProfile, topStacks, PROFILE_LIMITS } = require('../shareAllocationProfile')
 
 /** @returns {object} deterministic kernel, engine and clock facts */
@@ -502,9 +501,19 @@ describe('share allocation sampling', () => {
     )
     expect(fs.readdirSync(directory).filter((name) => name.endsWith('.heapprofile'))).toEqual([])
     expect(oversized.allocation.report().complete).toBe(false)
+    const largeStack = profile()
+    largeStack.head.callFrame.url = 'x'.repeat(PROFILE_LIMITS.summaryBytes)
+    const summaryOverflow = recorder({ value: largeStack })
+    await expect(
+      summaryOverflow.allocation.capture('cleanup', null, async () => {})
+    ).rejects.toThrow('summary byte bound')
+    expect(fs.readdirSync(directory).filter((name) => name.endsWith('.heapprofile'))).toEqual([])
+    const capped = recorder().allocation
+    capped.stages.length = PROFILE_LIMITS.stages
+    await expect(capped.capture('cleanup', null, async () => {})).rejects.toThrow('stage bound')
   })
 
-  test('installs allocation sampling only in the enabled diagnostic CI share worker', () => {
+  test('installs allocation sampling only in the enabled diagnostic CI share worker', async () => {
     for (const [kind, arm, env, enabled] of [
       ['shareConsumer', 'enabled', { CI: 'true', SHARE_PEAK_DIAGNOSTIC: '1' }, true],
       ['shareConsumer', 'disabled', { CI: 'true', SHARE_PEAK_DIAGNOSTIC: '1' }, false],
@@ -512,10 +521,48 @@ describe('share allocation sampling', () => {
       ['producer', 'enabled', { CI: 'true', SHARE_PEAK_DIAGNOSTIC: '1' }, false],
     ]) {
       const owner = { kind, soak: {} }
-      installSharePeak(owner, arm, { ...env, TELEMETRY_EVIDENCE_DIR: directory })
+      installSharePeak(owner, arm, { ...env, SHARE_PEAK_ROOT: directory })
       const Worker = owner.soak.SharePeakWorker
       expect(!!Worker && Worker !== DisabledShareWorker).toBe(enabled)
-      if (enabled) expect(Worker.prototype).toBeInstanceOf(TelemetryWorker)
+      if (!enabled) continue
+      expect(Worker.prototype).toBeInstanceOf(TelemetryWorker)
+      const { allocation, calls } = recorder()
+      const worker = Object.create(Worker.prototype)
+      worker.peak = { allocations: allocation }
+      let finishSeal
+      const sealing = new Promise((resolve) => {
+        finishSeal = resolve
+      })
+      const claim = { tick: 6, from: 's0', to: 's1' }
+      const errors = []
+      const failure = new Error('cleanup failure')
+      jest.spyOn(TelemetryWorker.prototype, 'reopen').mockImplementation(function () {
+        this.sealing = { promise: sealing }
+        return Promise.resolve(claim)
+      })
+      jest.spyOn(TelemetryWorker.prototype, 'cleanup').mockImplementation(async (ledger) => {
+        expect(ledger).toBe(errors)
+        ledger.push(failure)
+      })
+      try {
+        const opening = worker.reopen({ tick: 6 })
+        await new Promise((resolve) => setImmediate(resolve))
+        expect(calls.some((call) => call[0] === 'HeapProfiler.stopSampling')).toBe(false)
+        finishSeal()
+        await expect(opening).resolves.toBe(claim)
+        await worker.cleanup(errors)
+        expect(errors).toEqual([failure])
+        expect(allocation.report()).toMatchObject({
+          complete: true,
+          stages: [
+            { stage: 'reopen', tick: 6 },
+            { stage: 'cleanup', tick: null },
+          ],
+        })
+      } finally {
+        finishSeal()
+        jest.restoreAllMocks()
+      }
     }
   })
 })

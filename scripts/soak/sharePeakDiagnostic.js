@@ -8,8 +8,10 @@ const { execFileSync } = require('node:child_process')
 const root = path.resolve(__dirname, '../..')
 
 /**
- * Runs the original scalar cohort on an isolated CI runner. Only the share client's telemetry
- * switch differs between arms; the parent corpus, pacing, public reopens, reserve and GC stay fixed.
+ * Runs the diagnostic cohort on an isolated CI runner. The enabled share worker also samples
+ * allocations around reopens and cleanup; those profiled peaks include extra observer overhead.
+ * The parent corpus, public reopens, reserve and GC stay fixed. Reopen completion joins the seal
+ * before stopping the profile, so this diagnostic can delay stage acknowledgements.
  * Telemetry proof failures in the disabled arm remain archived, never promoted to a passing gate.
  * @param {string[]} argv explicit selector and fresh output directory
  * @returns {Promise<void>} diagnostic-only parent records, original verdict and share shadow facts
@@ -51,9 +53,11 @@ const main = async ([selector, directory]) => {
     v8: process.versions.v8,
     kafka: process.env.KAFKA_VERSION,
     flags: ['--expose-gc'],
+    allocationSampling: arm === 'enabled',
   }
   fs.writeFileSync(path.join(directory, 'identity.json'), JSON.stringify(identity))
   process.env.SHARE_PEAK_DIAGNOSTIC = '1'
+  process.env.SHARE_PEAK_ROOT = path.resolve(directory)
   const owner = buildTelemetryChurn({
     brokers: ['localhost:19092', 'localhost:19095', 'localhost:19098'],
     phases: PROFILES.telemetry,
@@ -127,6 +131,15 @@ const main = async ([selector, directory]) => {
   )
   if ((arm === 'disabled' && telemetryFrames !== 0) || (arm === 'enabled' && telemetryFrames === 0))
     throw new Error('share peak telemetry switch does not match the archived wire requests')
+  if (arm === 'enabled') {
+    const allocations = peak.allocationProfiles
+    const reopens = share.facts.actions.warm.reopen + share.facts.actions.measured.reopen
+    if (
+      !allocations?.complete ||
+      allocations.stages.filter((entry) => entry.stage === 'reopen').length !== reopens
+    )
+      throw new Error('incomplete share allocation profiles; inspect original result and artifacts')
+  }
   if (
     !peak.complete ||
     !share.facts.requirements.ok ||

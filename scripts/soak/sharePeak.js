@@ -1,6 +1,8 @@
 'use strict'
 
 const v8 = require('node:v8')
+const path = require('node:path')
+const { ShareAllocationProfile } = require('./shareAllocationProfile')
 const { readProcStatus } = require('../../testHelpers/processMemory')
 const {
   TelemetryWorker,
@@ -257,9 +259,48 @@ class SharePeak {
       hwmDecreases,
       peak,
       readings,
+      ...(this.allocations && { allocationProfiles: this.allocations.report() }),
       interpretation:
         'peak is the first observation of the largest VmHWM. Inspect phase, tick, phaseMs and previousPollAt. Reopen/retire/subscription delimit churn; cleanup includes terminal decode and disconnect. Committed V8 spaces, heap, external and arrayBuffers overlap and do not partition RSS. Allocator/native/code residency remains unattributed. Diagnostic storage is additional observer overhead, identical in both arms; nothing is subtracted.',
     }
+  }
+}
+
+/** Brackets enabled diagnostic operations, joining each reopen's asynchronous seal before stop. */
+class ProfiledShareWorker extends TelemetryWorker {
+  /**
+   * @param {object} command original parent lifecycle command
+   * @returns {Promise<object>} original reopen claim, after the previous segment finishes sealing
+   * @throws {Error} original reopen, seal or diagnostic profiler failure
+   */
+  reopen(command) {
+    return this.peak.allocations.capture('reopen', command.tick, async () => {
+      let claim
+      const errors = []
+      try {
+        claim = await super.reopen(command)
+      } catch (error) {
+        errors.push(error)
+      }
+      try {
+        await this.sealing?.promise
+        if (this.sealing?.error) throw this.sealing.error
+      } catch (error) {
+        if (!errors.includes(error)) errors.push(error)
+      }
+      if (errors.length === 1) throw errors[0]
+      if (errors.length) throw new AggregateError(errors, 'Share diagnostic reopen failed')
+      return claim
+    })
+  }
+
+  /**
+   * @param {Error[]} errors original cleanup error ledger, unchanged
+   * @returns {Promise<void>} original cleanup with terminal decode and sealing profiled
+   * @throws {Error} diagnostic profiler failure; workload errors stay in the original ledger
+   */
+  cleanup(errors) {
+    return this.peak.allocations.capture('cleanup', null, () => super.cleanup(errors))
   }
 }
 
@@ -344,18 +385,28 @@ class DisabledShareWorker extends TelemetryWorker {
 /**
  * Installs explicit diagnostic seams in a child owner; normal and non-share owners stay untouched.
  * @param {object} owner original TelemetryWorkerProcess @param {string} arm enabled or disabled
+ * @param {object} [env] explicit diagnostic CI environment
  * @returns {void} @throws {Error} for an unknown arm
  */
-const installSharePeak = (owner, arm) => {
+const installSharePeak = (owner, arm, env = process.env) => {
   if (!['enabled', 'disabled'].includes(arm)) throw new Error('unknown share peak arm')
   if (owner.kind !== 'shareConsumer') return
-  owner.soak.sharePeak = ({ sampler, limits }) =>
-    new SharePeak({
+  const profile = arm === 'enabled' && env.CI === 'true' && env.SHARE_PEAK_DIAGNOSTIC === '1'
+  owner.soak.sharePeak = ({ sampler, limits }) => {
+    const peak = new SharePeak({
       reserveBytes: declaredJournalBytes('shareConsumer', limits),
       durationMs: limits.caseMs,
       pending: () => sampler.pending,
       now: () => owner.clock.now(),
     })
+    if (profile)
+      peak.allocations = new ShareAllocationProfile({
+        directory: path.join(env.SHARE_PEAK_ROOT, 'allocations'),
+        now: () => owner.clock.now(),
+      })
+    return peak
+  }
+  if (profile) owner.soak.SharePeakWorker = ProfiledShareWorker
   if (arm === 'disabled') {
     owner.soak.SharePeakWorker = DisabledShareWorker
     owner.soak.SharePeakRegistry = DisabledShareRegistry
