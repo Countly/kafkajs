@@ -5,6 +5,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 const Module = require('node:module')
 const { execFileSync } = require('node:child_process')
+const { JournalConstancy } = require('../../testHelpers/fixedJournal')
 const root = path.resolve(__dirname, '../..')
 
 /**
@@ -12,7 +13,7 @@ const root = path.resolve(__dirname, '../..')
  * candidate (420 s warm-up, 900 s window, traffic at the existing rate from the start) on an isolated
  * CI runner and archives what the candidate asks for. Every file carries `diagnostic: true` and
  * `acceptanceEligible: false`, the frozen parameters and the commit; the embedded verdicts of the run
- * are by construction not acceptance and are never consulted.
+ * are by construction not acceptance. Functional, oracle and journal checks remain mandatory.
  */
 class LongWindowDiagnostic {
   /**
@@ -124,7 +125,7 @@ class LongWindowDiagnostic {
     } finally {
       await owner.close()
     }
-    const reports = result.workers.map((worker) => this.reportOf(worker))
+    const reports = result.workers.map((worker) => this.reportOf(worker, result.oracle))
     this.write('long-window.json', { workers: reports })
     this.write('workers.json', { workers: result.workers.map((worker) => this.archiveOf(worker)) })
     this.write('result.json', {
@@ -144,31 +145,74 @@ class LongWindowDiagnostic {
 
   /**
    * @param {object} worker a worker entry of the churn result
-   * @returns {object} its shadow report; a worker without a result is an incomplete report
+   * @param {object} oracle the independent durability oracle of the run
+   * @returns {object} its shadow report; missing or invalid functional evidence is incomplete
    */
-  reportOf(worker) {
+  reportOf(worker, oracle) {
     const { ShadowReport, LONG_WINDOW } = this.modules
     const { input, facts, shadow, seed } = worker
-    if (!input || !facts?.timing)
-      return {
-        scope: 'shadow',
-        acceptance: false,
-        diagnostic: true,
-        kind: worker.kind,
-        arm: this.arm,
-        complete: false,
-        error: 'no worker result',
-      }
-    return ShadowReport.of({
+    const head = {
+      scope: 'shadow',
+      acceptance: false,
+      diagnostic: true,
       kind: worker.kind,
       arm: this.arm,
-      samples: input.samples,
-      engine: shadow?.engine,
-      heapSpaces: shadow?.heapSpaces,
-      stages: facts.stages,
-      endAt: facts.timing.phaseAt + LONG_WINDOW.warmupMs + LONG_WINDOW.measureMs,
-      seed: seed ?? null,
-    })
+    }
+    if (!input || !facts?.timing) return { ...head, complete: false, error: 'no worker result' }
+    try {
+      const violations = this.functionalViolations(worker, oracle)
+      if (violations.length) throw new Error(`functional failure: ${violations.join('; ')}`)
+      return ShadowReport.of({
+        kind: worker.kind,
+        arm: this.arm,
+        samples: input.samples,
+        engine: shadow?.engine,
+        heapSpaces: shadow?.heapSpaces,
+        stages: facts.stages,
+        endAt: facts.timing.phaseAt + LONG_WINDOW.warmupMs + LONG_WINDOW.measureMs,
+        seed: seed ?? null,
+      })
+    } catch (error) {
+      return { ...head, complete: false, error: error.message }
+    }
+  }
+
+  /**
+   * Checks run correctness without consulting the intentionally ineligible resource verdict.
+   * @param {object} worker a worker entry of the churn result
+   * @param {object} oracle the independent durability oracle of the run
+   * @returns {string[]} functional, oracle and journal failures
+   */
+  functionalViolations({ input, facts, shadow, exit }, oracle) {
+    const violations = JournalConstancy.violations(input)
+    if (oracle?.ok !== true || oracle.violations?.length !== 0)
+      violations.push(`durability oracle: ${oracle?.violations?.join(', ') || 'missing or failed'}`)
+    if (facts.requirements?.ok !== true || facts.requirements.violations?.length !== 0)
+      violations.push(
+        `worker requirements: ${facts.requirements?.violations?.join(', ') || 'missing or failed'}`
+      )
+    if (shadow?.complete !== true)
+      violations.push(`engine journal: ${shadow?.error || 'missing or incomplete'}`)
+    if (
+      !input.sampler ||
+      input.sampler.skipped?.length !== 0 ||
+      input.sampler.readFailures?.length !== 0
+    )
+      violations.push('sampler skipped or failed readings')
+    if (
+      exit?.event !== 'close' ||
+      exit.code !== 0 ||
+      exit.signal !== null ||
+      exit.stderrBytes !== 0 ||
+      exit.unhandled !== 0 ||
+      exit.receipts !== 1 ||
+      exit.killed ||
+      exit.aborted ||
+      exit.watchdogExpired ||
+      !(Number.isFinite(exit.afterDisconnectMs) && exit.afterDisconnectMs >= 0)
+    )
+      violations.push('the child did not exit naturally')
+    return violations
   }
 
   /**
