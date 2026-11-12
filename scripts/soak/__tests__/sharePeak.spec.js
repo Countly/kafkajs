@@ -70,20 +70,57 @@ describe('share peak attribution', () => {
     expect(report.peak).toEqual(step)
   })
 
-  test('preserves counter regressions and missing sources as incomplete diagnostic evidence', () => {
+  test('records every VmHWM decrease as complete diagnostic evidence and retains the maximum peak', () => {
+    const { peak, state } = fixture()
+    peak.phase('setup')
+    state.at = 20
+    peak.poll()
+    state.at = 40
+    state.vmhwm = 1600
+    peak.phase('reopen', 6)
+    state.at = 60
+    state.vmhwm = 1450
+    state.vmrss = 1005
+    peak.phase('retire', 7)
+    state.at = 80
+    state.vmhwm = 1400
+    state.vmrss = 1004
+    peak.poll()
+    state.at = 100
+    state.vmhwm = 1500
+    peak.poll()
+    state.at = 120
+    state.vmhwm = 1300
+    state.vmrss = 990
+    peak.phase('cleanup')
+    const report = JSON.parse(JSON.stringify(peak.report()))
+    expect(report.complete).toBe(true)
+    expect(report.errors).toEqual([])
+    expect(report.hwmDecreases).toEqual([
+      { index: 2, phase: 'retire', before: 1600, after: 1450, VmRSS: 1005 },
+      { index: 3, phase: 'retire', before: 1450, after: 1400, VmRSS: 1004 },
+      { index: 5, phase: 'cleanup', before: 1500, after: 1300, VmRSS: 990 },
+    ])
+    expect(report.readings.map((row) => row.VmHWM)).toEqual([1200, 1600, 1450, 1400, 1500, 1300])
+    expect(report.peak).toMatchObject({ index: 1, phase: 'reopen', VmHWM: 1600 })
+    expect(report.peak).toEqual(report.readings[1])
+  })
+
+  test('keeps missing sources incomplete without inventing a VmHWM decrease', () => {
     const { peak, state } = fixture()
     peak.poll()
-    state.at = 20
-    state.vmhwm = 1100
-    peak.poll()
-    expect(peak.report()).toMatchObject({ complete: false })
-    expect(peak.report().readings.at(-1).VmHWM).toBe(1100)
     peak.proc = () => null
-    state.at = 40
+    state.at = 20
     peak.poll()
-    expect(peak.report().errors).toEqual(
-      expect.arrayContaining(['VmHWM decreased', 'proc status unavailable'])
-    )
+    state.at = 40
+    peak.proc = () => ({ vmrss: 1000, vmhwm: 1100 })
+    peak.poll()
+    const report = peak.report()
+    expect(report.complete).toBe(false)
+    expect(report.readings[1].VmHWM).toBe(null)
+    expect(report.errors).toEqual(['proc status unavailable'])
+    expect(report.hwmDecreases).toEqual([])
+    expect(report.peak.VmHWM).toBe(1200)
   })
 
   test('prefills bounded diagnostic storage without changing the original reserve and fails overflow', () => {
