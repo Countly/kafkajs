@@ -466,7 +466,7 @@ describe('E2E tooling', () => {
 
       test.each([
         ['4.1.2', '4.1.2'],
-        [undefined, '4.3.1'],
+        [undefined, '4.4.0'],
       ])(
         'lists the probed APIs under KAFKA_VERSION=%p, as %p, without asking the broker',
         async (requested, kafkaVersion) => {
@@ -1101,18 +1101,24 @@ describe('broker telemetry fixture', () => {
 
   test('retains the reviewed reporter and corrected host fixture identities', () => {
     const file = fixture + 'fixtures/manifest.json'
-    expect(digest(file)).toBe('5e1bca462c8ff3a4cd651be82eb0f56ed2f132815b0569a8ac469806c949577d')
+    expect(digest(file)).toBe('b75a444cd969d490ac896539430a0585ea9155a5a8250592ae837a71b0ecacc5')
     const manifest = JSON.parse(read(file))
     expect(digest('docker-compose.telemetry.yml')).toBe(
       manifest.composeSha256['docker-compose.telemetry.yml']
     )
-    for (const name of ['CountingTelemetryReporter.java', 'build.sh'])
+    for (const name of [
+      'CountingTelemetryReporter.java',
+      'build.sh',
+      'prepare-reporter-source.sh',
+      'prepare-client-source.sh',
+      'legacy/JavaTelemetryClient.java',
+    ])
       expect(digest(fixture + name)).toBe(manifest.scripts[name])
     expect(digest(fixture + 'fetch.sh')).toBe(manifest.scripts['fetch.sh'])
     expect(digest(fixture + 'fixtures/inputs.sha256')).toBe(
-      '79293d88513002896afad9a9ad48ec0fc75b57be2db78fb46ba4bef0e590cefc'
+      '221be9594f870c453fc4a56126fcadaadcb4d3741750a0d727e6a08e332553b3'
     )
-    for (const line of ['4.3.1', '4.2.2']) {
+    for (const line of ['4.4.0', '4.3.1', '4.2.2']) {
       for (const kind of ['reporterJar', 'javaClientJar']) {
         const jar = manifest.lines[line][kind]
         expect(fs.statSync(path.join(root, jar.path)).isFile()).toBe(true)
@@ -1124,9 +1130,13 @@ describe('broker telemetry fixture', () => {
       maxFileBytesPerNode: 2097152,
       maxRecordBytes: 4096,
     })
-    expect(read('.gitignore').toString()).toContain(
-      '!scripts/e2e/telemetry/fixtures/counting-telemetry-reporter-4.3.1.jar'
-    )
+    for (const jar of [
+      'counting-telemetry-reporter-4.4.0.jar',
+      'counting-telemetry-reporter-4.3.1.jar',
+      'java-telemetry-client-4.4.0.jar',
+      'java-telemetry-client-4.3.1.jar',
+    ])
+      expect(read('.gitignore').toString()).toContain(`!scripts/e2e/telemetry/fixtures/${jar}`)
     expect(read('scripts/assertCleanTarball.sh').toString()).toContain('scripts/e2e/telemetry/')
     expect(read('scripts/assertCleanTarball.sh').toString()).toContain('.*\\.jar$')
   })
@@ -1190,7 +1200,6 @@ describe('broker telemetry fixture', () => {
       expect(script).toContain(`--testPathPatterns 'src/telemetry/__tests__/${file}\\.spec\\.js'`)
       expect(script).toContain(`--testNamePattern '^${title}$'`)
     }
-    // eslint-disable-next-line n/no-extraneous-require -- YAML parser is pinned by the ESLint/Jest toolchain
     const yaml = require('js-yaml')
     const parse = (file) => yaml.load(read(file).toString())
     const ci = parse('.github/workflows/ci.yml')
@@ -1265,26 +1274,28 @@ describe('broker telemetry fixture', () => {
       )
     const base = (node, group, kafkas) =>
       kafkas.map((kafka) => ({ node, kafka, group, compose: 'docker-compose.yml' }))
-    const noPlugin = ['4.3.1', '4.2.2', '4.1.2', '4.0.2']
+    const noPlugin = ['4.4.0', '4.2.2', '4.1.2', '4.0.2']
     const rowsOf = (node, full) => {
       const rows = []
       for (const group of configuredGroups)
         rows.push(
-          ...configured(node, full ? ['4.3.1', '4.2.2'] : ['4.3.1']).filter(
+          ...configured(node, full ? ['4.4.0', '4.2.2'] : ['4.4.0']).filter(
             (r) => r.group === group
           )
         )
-      rows.push(...base(node, 'telemetry-base', full ? noPlugin : ['4.3.1', '4.4.0']))
-      rows.push(...base(node, 'telemetry-unsupported', full ? noPlugin : ['4.3.1']))
-      if (full) rows.push(...base(node, 'telemetry-outcomes', ['4.1.2']))
+      rows.push(...base(node, 'telemetry-base', full ? noPlugin : ['4.4.0']))
+      rows.push(...base(node, 'telemetry-unsupported', full ? noPlugin : ['4.4.0']))
+      if (full) rows.push(...base(node, 'telemetry-outcomes', ['4.4.0', '4.1.2']))
       return rows
     }
     expect(catalogue(false)).toEqual(rowsOf(24, false))
-    expect(catalogue(false)).toHaveLength(10)
+    expect(catalogue(false)).toHaveLength(9)
     const required = [22, 24, 26].flatMap((node) => rowsOf(node, true))
     expect(catalogue(true)).toEqual(required)
-    expect(new Set(catalogue(true).map(JSON.stringify)).size).toBe(69)
-    expect(new Set(catalogue(true).map((r) => `${r.group}-${r.kafka}-${r.node}`)).size).toBe(69)
+    expect(new Set(catalogue(true).map(JSON.stringify)).size).toBe(72)
+    expect(
+      new Set(catalogue(true).map((r) => `${r.group}-${r.kafka}-${r.node}-${r.compose}`)).size
+    ).toBe(72)
     const resources = workflow.jobs.resources
     expect(resources['timeout-minutes']).toBe(45)
     expect(resources.needs).toBeUndefined()
@@ -1314,6 +1325,15 @@ describe('broker telemetry fixture', () => {
       workflow.jobs.telemetry.steps.find((step) => step.name === 'Run telemetry lane').if
     ).toBeUndefined()
     const job = workflow.jobs.telemetry
+    expect(job.env.MATRIX_GROUP).toBe('$' + '{{ matrix.group }}')
+    expect(job.steps.find((step) => step.name === 'Run telemetry lane').run).toBe(
+      'timeout -k 10s 270s npm run "test:group:$MATRIX_GROUP" -- --ci'
+    )
+    expect(
+      job.steps.find((step) => step.name === 'Verify telemetry evidence before teardown').run
+    ).toContain(
+      'verifyEvidence(process.env.MATRIX_GROUP, process.env.TELEMETRY_EVIDENCE_DIR, files)'
+    )
     for (const identity of ['github.run_id', 'github.run_attempt', 'strategy.job-index'])
       expect(job.env.COMPOSE_PROJECT_NAME).toContain(identity)
     const steps = job.steps.filter((step) => step.run)
@@ -1347,7 +1367,6 @@ describe('broker telemetry fixture', () => {
   })
 
   test('keeps memory acceptance in guarded jobs with the full Node and broker coverage', () => {
-    // eslint-disable-next-line n/no-extraneous-require -- YAML parser is pinned by the ESLint/Jest toolchain
     const yaml = require('js-yaml')
     const workflow = yaml.load(read('.github/workflows/memory-gates.yml').toString())
     for (const job of Object.values(workflow.jobs)) {
@@ -1448,26 +1467,35 @@ describe('broker telemetry fixture', () => {
     const rows = JSON.parse(output.trim().slice('matrix='.length)).include
     const expected = [22, 24, 26].flatMap((node) => [
       ...['telemetry-outcomes', 'telemetry-shutdown'].flatMap((group) =>
-        ['4.3.1', '4.2.2'].map((kafka) => ({
+        ['4.4.0', '4.2.2'].map((kafka) => ({
           node,
           kafka,
           group,
           compose: 'docker-compose.telemetry.yml',
         }))
       ),
-      ...['4.3.1', '4.2.2', '4.1.2', '4.0.2'].map((kafka) => ({
+      ...['4.4.0', '4.2.2', '4.1.2', '4.0.2'].map((kafka) => ({
         node,
         kafka,
         group: 'telemetry-unsupported',
         compose: 'docker-compose.yml',
       })),
-      { node, kafka: '4.1.2', group: 'telemetry-outcomes', compose: 'docker-compose.yml' },
+      ...['4.4.0', '4.1.2'].map((kafka) => ({
+        node,
+        kafka,
+        group: 'telemetry-outcomes',
+        compose: 'docker-compose.yml',
+      })),
     ])
     expect(rows).toEqual(expected)
     const verdict = shared.jobs.telemetry.steps.find((step) =>
       step.run?.includes('verifyMemoryEvidence')
     )
     expect(verdict.if).toBe('$' + '{{ always() && inputs.memory-verdicts }}')
+    expect(shared.jobs.telemetry.env.MATRIX_GROUP).toBe('$' + '{{ matrix.group }}')
+    expect(verdict.run).toContain(
+      'verifyMemoryEvidence(process.env.MATRIX_GROUP, process.env.TELEMETRY_EVIDENCE_DIR, files)'
+    )
     expect(verdict['continue-on-error']).toBeUndefined()
     expect(shared.on.workflow_call.inputs['memory-verdicts'].default).toBe(false)
     const mutationControls = workflow.jobs['telemetry-verdict-controls']

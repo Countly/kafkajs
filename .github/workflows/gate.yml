@@ -3,7 +3,8 @@
 # tls-required (tracked TLS fixtures), tokens (per-run delegation-token key), logdirs (compose-only),
 # tiered (test jar/remote dir).
 # A check may set kafkaVersion (major.minor.patch) to run on another broker release; absent means
-# DEFAULT_KAFKA_VERSION below. The live specs run against the job's own Compose cluster, without a guard.
+# DEFAULT_KAFKA_VERSION below. javaClientsVersion optionally selects a verified Java client release;
+# absent means the check's broker release. The live specs run against the job's own Compose cluster, without a guard.
 name: Exit gate
 on:
   workflow_dispatch:
@@ -23,17 +24,18 @@ concurrency:
   cancel-in-progress: true
 env:
   # The broker release of every check that sets no kafkaVersion; the Read check step exports it as KAFKA_VERSION.
-  DEFAULT_KAFKA_VERSION: 4.3.1
+  DEFAULT_KAFKA_VERSION: 4.4.0
   # Ubuntu 24.04 (docker.io/library/ubuntu index digest, read from the registry 2026-11-05). The KDC
   # Dockerfile installs the MIT Kerberos packages onto it when the base lacks them.
   KDC_BASE_IMAGE: ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852
-  # Maven Central's kafka-storage-4.3.1-test.jar.sha256, read 2026-11-05 and matched to the jar's own digest.
-  TIERED_JAR_SHA256: f3236936854c13815ffaa7f35a3f2d6861c125616cba5395b538b8680dded886
+  # Maven Central's kafka-storage-4.4.0-test-fixtures.jar.sha256, read 2026-11-11 (LocalTieredStorage moved
+  # from the -test jar to the test fixtures in 4.4.0).
+  TIERED_JAR_SHA256: ab62d0acf3ca64ba5cce7941c21c338d0399954b2c66c25efbf24a57241ff991
 jobs:
   plan:
-    timeout-minutes: 5
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ${{ vars.GATE_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 10
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
       decoder: ${{ steps.plan.outputs.decoder }}
@@ -73,6 +75,9 @@ jobs:
           for (const check of gate.checks) {
             if (check.kafkaVersion !== undefined && !/^\d+\.\d+\.\d+$/.test(check.kafkaVersion)) {
               throw new Error(`Invalid kafkaVersion: ${check.id}`)
+            }
+            if (check.javaClientsVersion !== undefined && !['4.3.1', '4.4.0'].includes(check.javaClientsVersion)) {
+              throw new Error(`Invalid javaClientsVersion: ${check.id}`)
             }
           }
           if (!include.length) throw new Error('No checks selected')
@@ -118,6 +123,9 @@ jobs:
           if (check.kafkaVersion !== undefined && !/^\d+\.\d+\.\d+$/.test(check.kafkaVersion)) {
             throw new Error(`Invalid kafkaVersion: ${check.kafkaVersion}`)
           }
+          if (check.javaClientsVersion !== undefined && !['4.3.1', '4.4.0'].includes(check.javaClientsVersion)) {
+            throw new Error(`Invalid javaClientsVersion: ${check.javaClientsVersion}`)
+          }
           fs.writeFileSync(`${process.env.RUNNER_TEMP}/check.json`, JSON.stringify(check))
           fs.appendFileSync(process.env.GITHUB_OUTPUT, `check=${JSON.stringify(check)}\n`)
           fs.appendFileSync(process.env.GITHUB_ENV, `COMPOSE_FILE=${check.compose || 'docker-compose.yml'}\n`)
@@ -132,16 +140,19 @@ jobs:
         if: fromJSON(steps.entry.outputs.check).needs.java
         with:
           path: ${{ runner.temp }}/gate-java
-          key: gate-java-v1-kafka-${{ env.KAFKA_VERSION }}-slf4j-1.7.36-snappy-1.1.10.7-lz4-1.8.0-zstd-1.5.6-10
+          key: gate-java-v1-kafka-${{ fromJSON(steps.entry.outputs.check).javaClientsVersion || env.KAFKA_VERSION }}-slf4j-1.7.36-snappy-1.1.10.7-lz4-1.8.0-zstd-1.5.6-10
       - name: Prepare verified Java jars
         if: fromJSON(steps.entry.outputs.check).needs.java
+        env:
+          JAVA_CLIENTS_VERSION: ${{ fromJSON(steps.entry.outputs.check).javaClientsVersion }}
         run: |
-          case "$KAFKA_VERSION" in
+          KAFKA_CLIENTS_VERSION="${JAVA_CLIENTS_VERSION:-$KAFKA_VERSION}"
+          case "$KAFKA_CLIENTS_VERSION" in
             4.3.1) clients_sha256=52501b7b47510c66f898871adaf6d2968ab7246561d44ced43643a8a587f0b36 ;;
             # repo1.maven.org/maven2/org/apache/kafka/kafka-clients/4.4.0/kafka-clients-4.4.0.jar.sha256 (2026-11-11).
             # Release: https://github.com/apache/kafka/releases/tag/4.4.0. Other fixture jars retain their pins.
             4.4.0) clients_sha256=1ab07317eb6633241392449d329dbdc5d9251e6ffc4926860f42dd966e88bdf9 ;;
-            *) echo "No verified Java client pins for Kafka $KAFKA_VERSION" >&2; exit 1 ;;
+            *) echo "No verified Java client pins for Kafka $KAFKA_CLIENTS_VERSION" >&2; exit 1 ;;
           esac
           mkdir -p "$RUNNER_TEMP/gate-java" || exit 1
           while read -r coordinate digest; do
@@ -153,13 +164,13 @@ jobs:
             [[ "$digest" =~ ^[[:xdigit:]]{64}$ ]] || exit 1
             printf '%s  %s\n' "$digest" "$jar" | sha256sum --check - || exit 1
           done <<JARS
-          org/apache/kafka/kafka-clients/$KAFKA_VERSION/kafka-clients-$KAFKA_VERSION.jar $clients_sha256
+          org/apache/kafka/kafka-clients/$KAFKA_CLIENTS_VERSION/kafka-clients-$KAFKA_CLIENTS_VERSION.jar $clients_sha256
           org/slf4j/slf4j-api/1.7.36/slf4j-api-1.7.36.jar d3ef575e3e4979678dc01bf1dcce51021493b4d11fb7f1be8ad982877c16a1c0
           org/xerial/snappy/snappy-java/1.1.10.7/snappy-java-1.1.10.7.jar 4c766cb3f855415ee734b2392949a0b6f12a60879334a74518deaf6270d32e36
           org/lz4/lz4-java/1.8.0/lz4-java-1.8.0.jar d74a3334fb35195009b338a951f918203d6bbca3d1d359033dc33edd1cadc9ef
           com/github/luben/zstd-jni/1.5.6-10/zstd-jni-1.5.6-10.jar b6c3237e24b8252a5a9c3a0e1ae30ef8f323412e74bd358548b7a9e527d676df
           JARS
-          echo "KAFKA_CLIENTS_VERSION=$KAFKA_VERSION" >> "$GITHUB_ENV" || exit 1
+          echo "KAFKA_CLIENTS_VERSION=$KAFKA_CLIENTS_VERSION" >> "$GITHUB_ENV" || exit 1
           echo "JAVA_E2E_WORK_DIR=$RUNNER_TEMP/gate-java" >> "$GITHUB_ENV" || exit 1
           echo "JAVA_VECTORS_WORK_DIR=$RUNNER_TEMP/gate-java" >> "$GITHUB_ENV" || exit 1
           echo 'JAVA_E2E_OFFLINE=1' >> "$GITHUB_ENV" || exit 1
@@ -231,7 +242,7 @@ jobs:
         uses: actions/cache@v4
         if: fromJSON(steps.entry.outputs.check).needs.tiered
         with:
-          path: testHelpers/kafka/plugins/kafka-storage-4.3.1-test.jar
+          path: testHelpers/kafka/plugins/kafka-storage-4.4.0-test-fixtures.jar
           key: tiered-jar-${{ env.TIERED_JAR_SHA256 }}
       - name: Prepare tiered storage
         if: fromJSON(steps.entry.outputs.check).needs.tiered
@@ -239,9 +250,9 @@ jobs:
           [[ "$TIERED_JAR_SHA256" =~ ^[a-f0-9]{64}$ ]] || { echo 'Set TIERED_JAR_SHA256 to the audited Maven artifact digest'; exit 1; }
           mkdir -p testHelpers/kafka/plugins "$RUNNER_TEMP/tiered-remote"
           chmod 777 "$RUNNER_TEMP/tiered-remote"
-          jar=testHelpers/kafka/plugins/kafka-storage-4.3.1-test.jar
+          jar=testHelpers/kafka/plugins/kafka-storage-4.4.0-test-fixtures.jar
           # Maven Central answers runners with a transient 403 at times, which plain --retry skips.
-          [ -s "$jar" ] || curl --fail --location --retry 5 --retry-all-errors --retry-delay 10 --max-time 120 https://repo.maven.apache.org/maven2/org/apache/kafka/kafka-storage/4.3.1/kafka-storage-4.3.1-test.jar -o "$jar"
+          [ -s "$jar" ] || curl --fail --location --retry 5 --retry-all-errors --retry-delay 10 --max-time 120 https://repo.maven.apache.org/maven2/org/apache/kafka/kafka-storage/4.4.0/kafka-storage-4.4.0-test-fixtures.jar -o "$jar"
           printf '%s  %s\n' "$TIERED_JAR_SHA256" "$jar" | sha256sum --check -
           echo "TIERED_REMOTE_DIR=$RUNNER_TEMP/tiered-remote" >> "$GITHUB_ENV"
       - name: Run check
@@ -376,10 +387,10 @@ jobs:
           path: ${{ runner.temp }}/decoder-count-performance.json
 
   verdict:
-    timeout-minutes: 5
     needs: [plan, check, telemetry, decoder-combine]
     if: always() && needs.plan.result != 'skipped'
     runs-on: ${{ vars.GATE_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 10
     steps:
       - uses: actions/setup-node@v4
         with:

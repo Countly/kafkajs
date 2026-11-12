@@ -20,7 +20,7 @@ services:
       timeout: 1s
       retries: 60
   kafka1:
-    image: apache/kafka:${KAFKA_VERSION:-4.3.1}
+    image: apache/kafka:${KAFKA_VERSION:-4.4.0}
     pull_policy: never
     container_name: kafka1
     hostname: kafka1

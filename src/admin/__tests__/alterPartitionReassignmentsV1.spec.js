@@ -3,6 +3,7 @@ const {
   KafkaJSAggregateError,
   KafkaJSAlterPartitionReassignmentsError,
   KafkaJSInvalidConfigurationError,
+  KafkaJSServerDoesNotSupportApiKey,
 } = require('../../errors')
 const { createErrorFromCode } = require('../../protocol/error')
 const logger = { namespace: () => logger, debug() {}, info() {}, warn() {}, error() {} }
@@ -74,12 +75,19 @@ describe('reassignment version capability', () => {
     const broker = Object.create(Broker.prototype)
     broker.versions = { 45: { minVersion: 0, maxVersion: 0 } }
     broker.lookupRequest = jest.fn()
-    await expect(
-      broker.alterPartitionReassignments({ topics, allowReplicationFactorChange: false })
-    ).rejects.toMatchObject({
+    const promise = broker.alterPartitionReassignments({
+      topics,
+      allowReplicationFactorChange: false,
+    })
+    await expect(promise).rejects.toBeInstanceOf(KafkaJSServerDoesNotSupportApiKey)
+    await expect(promise).rejects.toMatchObject({
       name: 'KafkaJSServerDoesNotSupportApiKey',
+      retriable: false,
+      apiKey: 45,
       apiName: 'AlterPartitionReassignments',
-      message: expect.stringMatching(/client implements v0-v1, broker supports v0-v0/),
+      message: expect.stringMatching(
+        /allowReplicationFactorChange=false requires v1; client implements v0-v1, broker supports v0-v0/
+      ),
     })
     expect(broker.lookupRequest).not.toHaveBeenCalled()
   })

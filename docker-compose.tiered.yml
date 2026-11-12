@@ -1,11 +1,11 @@
 # Tiered-storage arm: the three-node cluster of docker-compose.yml with KIP-405 remote storage on. The
-# RemoteStorageManager is upstream LocalTieredStorage from the pinned cached Kafka 4.3.1 test jar.
+# RemoteStorageManager is upstream LocalTieredStorage from the pinned cached Kafka 4.4.0 test-fixtures jar.
 # A directory shared by the three brokers stands in for the remote tier, and the
 # remote log metadata is the default topic-based manager over the INTERNAL listener. Retention checks and
 # the remote copy task run every 5 s so a test sees an upload and a local eviction within a minute.
 # Select it with COMPOSE_FILE=docker-compose.tiered.yml.
 x-kafka-common: &kafka-common
-  image: apache/kafka:${KAFKA_VERSION:-4.3.1}
+  image: apache/kafka:${KAFKA_VERSION:-4.4.0}
   environment: &kafka-env
     KAFKA_PROCESS_ROLES: 'broker,controller'
     KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka1:19093,2@kafka2:19093,3@kafka3:19093'
@@ -41,7 +41,7 @@ x-kafka-common: &kafka-common
     KAFKA_OPTS: '-Djava.security.auth.login.config=/etc/kafka/secrets/server-jaas.conf -Djava.security.properties=/etc/kafka/dns.security'
     KAFKA_REMOTE_LOG_STORAGE_SYSTEM_ENABLE: 'true'
     KAFKA_REMOTE_LOG_STORAGE_MANAGER_CLASS_NAME: 'org.apache.kafka.server.log.remote.storage.LocalTieredStorage'
-    KAFKA_REMOTE_LOG_STORAGE_MANAGER_CLASS_PATH: '/opt/kafka/plugins/kafka-storage-4.3.1-test.jar'
+    KAFKA_REMOTE_LOG_STORAGE_MANAGER_CLASS_PATH: '/opt/kafka/plugins/kafka-storage-4.4.0-test-fixtures.jar'
     KAFKA_REMOTE_LOG_STORAGE_MANAGER_IMPL_PREFIX: 'rsm.config.'
     KAFKA_RSM_CONFIG_DIR: '/var/lib/kafka/data/remote'
     KAFKA_REMOTE_LOG_METADATA_MANAGER_LISTENER_NAME: 'INTERNAL'
@@ -58,7 +58,7 @@ x-kafka-common: &kafka-common
     - ./testHelpers/certs/kafka.server.truststore.jks:/etc/kafka/secrets/kafka.server.truststore.jks:ro,z
     - ./testHelpers/kafka/dns.security:/etc/kafka/dns.security:ro,z
     - ./testHelpers/kafka/server-jaas.conf:/etc/kafka/secrets/server-jaas.conf:ro,z
-    - ./testHelpers/kafka/plugins/kafka-storage-4.3.1-test.jar:/opt/kafka/plugins/kafka-storage-4.3.1-test.jar:ro,z
+    - ./testHelpers/kafka/plugins/kafka-storage-4.4.0-test-fixtures.jar:/opt/kafka/plugins/kafka-storage-4.4.0-test-fixtures.jar:ro,z
     - ${TIERED_REMOTE_DIR:?set the directory the brokers share as the remote tier}:/var/lib/kafka/data
 
 services:

@@ -3,14 +3,14 @@
 # KIP-714 (ApiVersions keys 71 and 72) and writes each decoded client push to a bounded JSONL sink.
 #
 # Select it with COMPOSE_FILE=docker-compose.telemetry.yml (one file path, project kafkajs). KAFKA_VERSION picks the
-# image and the matching jar: scripts/e2e/telemetry/fixtures/counting-telemetry-reporter-${KAFKA_VERSION}.jar (4.3.1 or 4.2.2).
+# image and the matching jar: scripts/e2e/telemetry/fixtures/counting-telemetry-reporter-${KAFKA_VERSION}.jar (4.4.0, 4.3.1 or 4.2.2).
 # TELEMETRY_EVIDENCE_DIR (host) is mounted at /var/telemetry-evidence on every broker; clear it before each arm.
 # Quorum, listeners, auth and volumes are those of docker-compose.yml. Differences: no container_name, only the
 # PLAINTEXT_HOST listener of each broker is published, and on host ports 19092/19095/19098 (the base ports 9092/9095/9098
 # are not published). The PLAINTEXT_HOST listener of each broker also advertises that published port
 # (localhost:19092/19095/19098), so a host client that follows Metadata reaches the right broker; in-cluster clients use INTERNAL.
 x-kafka-common: &kafka-common
-  image: apache/kafka:${KAFKA_VERSION:-4.3.1}
+  image: apache/kafka:${KAFKA_VERSION:-4.4.0}
   environment: &kafka-env
     KAFKA_PROCESS_ROLES: 'broker,controller'
     KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka1:19093,2@kafka2:19093,3@kafka3:19093'
@@ -57,7 +57,7 @@ x-kafka-common: &kafka-common
     - ./testHelpers/certs/kafka.server.keystore.jks:/etc/kafka/secrets/kafka.server.keystore.jks:ro,z
     - ./testHelpers/certs/kafka.server.truststore.jks:/etc/kafka/secrets/kafka.server.truststore.jks:ro,z
     - ./testHelpers/kafka/server-jaas.conf:/etc/kafka/secrets/server-jaas.conf:ro,z
-    - ./scripts/e2e/telemetry/fixtures/counting-telemetry-reporter-${KAFKA_VERSION:-4.3.1}.jar:/opt/kafka/libs/counting-telemetry-reporter.jar:ro,z
+    - ./scripts/e2e/telemetry/fixtures/counting-telemetry-reporter-${KAFKA_VERSION:-4.4.0}.jar:/opt/kafka/libs/counting-telemetry-reporter.jar:ro,z
     - ${TELEMETRY_EVIDENCE_DIR:-./.tmp/telemetry-evidence}:/var/telemetry-evidence:rw,z
 
 services:

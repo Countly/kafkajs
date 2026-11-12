@@ -11,6 +11,10 @@ run again: the request timeout event and the request queue size events
 the partition reassignment listing (`src/broker/__tests__/listPartitionReassignments.spec.js`)
 as its completed shape on the live cluster and its in-flight shape on the scripted cluster.
 
+A test that fails and then passes on a rerun of the same commit follows the flake rule in
+[docs/Testing.md](docs/Testing.md#skipped-tests): it is fixed or listed here before the next merge
+to `master`.
+
 ## Root causes
 
 - **R1 — auto topic creation / metadata propagation (retired).** In KRaft the

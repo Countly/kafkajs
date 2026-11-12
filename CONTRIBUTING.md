@@ -13,5 +13,8 @@ Contributions are made through Issues and Pull Requests on https://github.com/Co
 - Behavior changes to the public API need an issue first; the API is a compatibility contract with existing KafkaJS users.
 - Upstream KafkaJS fixes adopted here are credited by PR number in `CHANGELOG.md`; keep that convention.
 
+## Releases
+A release is a `v*` tag on a `master` commit; the `Release` workflow checks the tag and the CI runs for that commit, then publishes to npm after a maintainer approves it. Maintainers follow [RELEASING.md](./RELEASING.md); contributors do not publish.
+
 ## Development
 See `docs/DevelopmentEnvironment.md` (Node 22+, Docker, `docker compose` for the KRaft test cluster) and `docs/Testing.md`.

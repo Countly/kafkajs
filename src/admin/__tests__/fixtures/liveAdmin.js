@@ -9,7 +9,12 @@ const socketFactory = require('../../../network/socketFactory')
 const { createLogger, LEVELS } = require('../../../loggers')
 const { createResourceProbe } = require('../../../../testHelpers/resourceProbe')
 const path = require('path')
-const { plainTextBrokers, writeEvidence, wireVersionsOf } = require('testHelpers')
+const {
+  plainTextBrokers,
+  writeEvidence,
+  wireVersionsOf,
+  waitForTopicPropagation,
+} = require('testHelpers')
 const { composeArgs } = require('../../../../testHelpers/leaderElection')
 const { CleanupStack } = require('../../../producer/__tests__/fixtures/liveProbe')
 const {
@@ -144,7 +149,7 @@ class AdminLiveProbe {
   /**
    * Executes one lazy operation without retries or outcome translation.
    * @template T
-   * @param {() => Promise<T>} work signal-checked operation
+   * @param {(signal: AbortSignal) => Promise<T>} work receives the bounded operation's signal
    * @returns {Promise<T>} original result
    * @throws {Error} original failure, abort, taint or insufficient mutation budget
    */
@@ -215,7 +220,7 @@ class AdminLiveProbe {
   /**
    * Creates a uniquely named topic, registering removal before the mutation. Removal reconnects the
    * creating admin first, because a scenario may have closed it, and runs before that admin's own
-   * disconnect. Waits for the created topic to reach the answering broker within the work deadline.
+   * disconnect. Waits for every broker to report the topic with leaders within the work deadline.
    * @param {object} [options] name suffix and public createTopics settings
    * @returns {Promise<string>} actual topic name
    * @throws {Error} broker failure other than pending creation, or incomplete metadata identity
@@ -260,6 +265,39 @@ class AdminLiveProbe {
     })
     const row = metadata.topics.find((entry) => entry.name === topic)
     if (!row?.topicId) throw new Error('Created topic has no canonical identity')
+    const readers = new CleanupStack()
+    await readers.run(
+      async () => {
+        this.signal.throwIfAborted()
+        const brokers = this.baseOptions.brokers.map((address) => {
+          const [host, port] = address.split(':')
+          const broker = new Broker({
+            logger: this.logger,
+            allowAutoTopicCreation: false,
+            connectionPool: new Pool({
+              host,
+              port: Number(port),
+              logger: this.logger,
+              socketFactory: (args) => this.socket(args),
+              connectionsMaxIdle: 0,
+              connectionTimeout: 3000,
+              requestTimeout: Math.max(1, this.wholeMs(30000, this.reserve)),
+            }),
+          })
+          readers.add('topic visibility reader', () =>
+            broker.disconnect({ drainTimeout: this.wholeMs(5000) })
+          )
+          return broker
+        })
+        await this.invoke((signal) =>
+          waitForTopicPropagation(topic, replicaAssignment?.length ?? partitions, {
+            signal,
+            brokers,
+          })
+        )
+      },
+      { budgetMs: this.wholeMs(5000) }
+    )
     this.topics.push(row)
     return topic
   }

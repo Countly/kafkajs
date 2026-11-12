@@ -287,7 +287,7 @@ Internal consumer/share crash cleanup suspends telemetry without a final. Expire
 
 ## Broker reporter fixture
 
-The test reporter implements Kafka's MetricsReporter and ClientTelemetryExporterProvider and independently decodes OTLP v1.9.0. Its pinned source, build provenance, jar and toolchain identities are recorded in `scripts/e2e/telemetry/fixtures/manifest.json`; the four retained reporter and Java client jars are committed as checksum-pinned test fixtures and verified offline before startup. CI never rebuilds these jars; source building remains historical provenance. The fixture and jars stay out of the npm tarball. The single configured compose file installs the matching jar on every broker with a 4096-byte telemetry cap. Host clients follow Metadata to the published plaintext endpoints on ports 19092, 19095 and 19098; the test socket selects IPv4 for those loopback listeners. This is fixture setup, with no change to the library socket defaults.
+The test reporter implements Kafka's MetricsReporter and ClientTelemetryExporterProvider and independently decodes OTLP v1.9.0. Its pinned source, build provenance, jar and toolchain identities are recorded in `scripts/e2e/telemetry/fixtures/manifest.json`; the six retained reporter and Java client jars are committed as checksum-pinned test fixtures and verified offline before startup. CI never rebuilds these jars; source building remains historical provenance. The fixture and jars stay out of the npm tarball. The single configured compose file installs the matching jar on every broker with a 4096-byte telemetry cap. Host clients follow Metadata to the published plaintext endpoints on ports 19092, 19095 and 19098; the test socket selects IPv4 for those loopback listeners. This is fixture setup, with no change to the library socket defaults.
 
 Create the test subscription through the public CLIENT_METRICS configuration-resource APIs with `metrics=org.apache.kafka.`, `interval.ms=1000` and an anchored match for the test client IDs. The four public client kinds must produce distinct stable instance IDs and independently decoded accepted pushes. The exporter must report push-interval context 1000. A successful handshake with no matching resource is different from a broker without the exporter; a zero-byte payload is proved on the wire because it need not reach the exporter.
 
@@ -320,8 +320,8 @@ an empty requested list polls without Push. Wire evidence distinguishes them.
 
 | Designated fixture | Evidence required |
 |---|---|
-| Configured Kafka 4.3.1 and 4.2.2 | Accepted JS wire requests, complete independent decoding and matching reporter exports |
-| Base Kafka 4.3.1, 4.2.2, 4.1.2 and 4.0.2 without exporter (4.4.0 as additional coverage) | Actual missing telemetry advertisements and no extra telemetry traffic or connection; supported foreground operations remain usable |
+| Configured Kafka 4.4.0 and 4.2.2 | Accepted JS wire requests, complete independent decoding and matching reporter exports |
+| Base Kafka 4.4.0, 4.2.2, 4.1.2 and 4.0.2 without exporter | Actual missing telemetry advertisements and no extra telemetry traffic or connection; supported foreground operations remain usable |
 | Java client 4.3.1 producer, consumer and admin | Distinct stable instance IDs, four-metric exports, producer/consumer finals and the pinned admin checkpoint/close/cessation proof |
 
 These are fixture-specific checks, not a claim that an older broker version can

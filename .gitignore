@@ -27,9 +27,11 @@ upgrade-ref-index.md
 CODEX_brainstorm.md
 skills-lock.json
 
-# Keep binary build outputs ignored, except the four checksum-pinned test fixtures.
+# Keep binary build outputs ignored, except the six checksum-pinned test fixtures.
 *.jar
 !scripts/e2e/telemetry/fixtures/counting-telemetry-reporter-4.2.2.jar
 !scripts/e2e/telemetry/fixtures/counting-telemetry-reporter-4.3.1.jar
+!scripts/e2e/telemetry/fixtures/counting-telemetry-reporter-4.4.0.jar
 !scripts/e2e/telemetry/fixtures/java-telemetry-client-4.2.2.jar
 !scripts/e2e/telemetry/fixtures/java-telemetry-client-4.3.1.jar
+!scripts/e2e/telemetry/fixtures/java-telemetry-client-4.4.0.jar

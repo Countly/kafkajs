@@ -114,7 +114,7 @@ describe('a producer to consumer round trip on a live cluster', { skip: !live },
       const sendSpanId = send?.spanContext().spanId
       const processParentSpanId = processed?.parentSpanContext?.spanId
       writeEvidence(EVIDENCE, {
-        kafkaVersion: process.env.KAFKA_VERSION || '4.3.1',
+        kafkaVersion: process.env.KAFKA_VERSION || '4.4.0',
         topic,
         sendSpan: Boolean(send),
         processSpan: Boolean(processed),

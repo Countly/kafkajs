@@ -40,6 +40,10 @@ const sha = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex')
 const KINDS = ['producer', 'consumer', 'admin', 'share']
 const CAP = 16 * 1024 * 1024
 const CONFIGURED_COMPOSE = 'docker-compose.telemetry.yml'
+/** Broker lines with a committed reporter jar, the only lines the configured compose can run. */
+const REPORTER_LINES = Object.freeze(['4.4.0', '4.3.1', '4.2.2'])
+/** Broker lines the outcomes scenario accepts; lines without a reporter jar run in base mode only. */
+const OUTCOMES_LINES = Object.freeze([...REPORTER_LINES, '4.1.2', '4.0.2'])
 const LIVE = Object.freeze([
   'telemetry-prefix',
   'telemetry-custom',
@@ -371,9 +375,16 @@ const requiredLiveCatalogue = (record) => {
     return KINDS.map((kind) => `js-${kind}`)
   }
   if (scenario === 'telemetry-outcomes') {
-    assert(['4.3.1', '4.2.2', '4.1.2'].includes(record.run.line))
-    const configured = record.run.line !== '4.1.2'
-    assert.equal(record.mode, configured ? 'configured' : 'base')
+    assert(OUTCOMES_LINES.includes(record.run.line), 'Unsupported outcomes broker line')
+    assert(['configured', 'base'].includes(record.mode), 'Unknown outcomes lane mode')
+    const configured = record.mode === 'configured'
+    if (configured)
+      assert(
+        REPORTER_LINES.includes(record.run.line),
+        'Configured lane has no reporter jar for this line'
+      )
+    else
+      assert.equal(record.run.composeSha256, undefined, 'Base lane claims the configured fixture')
     const modes = configured ? FAULT_MODES : []
     const arms = ['control', 'optin', ...modes]
     exact(results.arms, arms, 'ordinary arm')
@@ -391,7 +402,7 @@ const requiredLiveCatalogue = (record) => {
     if (!configured) {
       exact(results.inapplicable, ['drop', 'blackhole', 'late'], 'inapplicable fault')
       assert(Object.values(results.inapplicable).every((v) => v === 'absent telemetry transport'))
-      assertRefusal(results.share, { reason: 'api-version-range', apiKey: 78 })
+      assertShareRefusal(results.share, record.run.line)
     } else {
       assert.equal(results.share?.recovery?.owner, 'share', 'Missing configured share recovery')
       assert.equal(results.share.recovery.mode, 'drop')
@@ -812,7 +823,7 @@ const assertNoTelemetryRequests = ({ records }) => {
 /** @param {object} outcome public connect result @param {string} line broker line */
 const assertShareRefusal = (outcome, line) => {
   if (!['4.0.2', '4.1.2'].includes(line)) {
-    assert.deepEqual(outcome, { status: 'connected' })
+    assert.deepEqual(outcome, { status: 'connected' }, 'Share capability outcome differs')
     return
   }
   const reason = line === '4.0.2' ? 'api-not-advertised' : 'api-version-range'

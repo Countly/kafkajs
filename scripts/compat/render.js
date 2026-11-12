@@ -174,6 +174,10 @@ const render = (model) => {
   )
   lines.push('')
   lines.push(
+    'Supported brokers: Apache Kafka 4.0–4.4. The tables below compare against the 4.4.0 definitions.'
+  )
+  lines.push('')
+  lines.push(
     'Gap classes: `current` (fork max equals the Kafka max) · `behind:N` · `stub` (the key is known but unimplemented) · `missing` (planned, no codec) · `not-planned`. `on-floor` and `below-floor` are reported alongside the class, not instead of it.'
   )
   renderSummary(lines, model)
