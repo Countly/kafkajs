@@ -370,7 +370,7 @@ describe('warm-up lifecycle witnesses', () => {
       expect(source).toContain("process.env.RESOURCE_WITNESSES === '1'")
       expect(source).toContain('warmupWitnesses: witnesses.summary()')
       expect(source).not.toMatch(/globalThis\.gc\(|witnesses\?\.settled\(/)
-      expect(source.match(/await settled\(\)/g)).toHaveLength(5)
+      expect(source.match(/await settled\(\)/g)).toHaveLength(6)
       expect(source).toContain('witnesses?.restore()')
     }
   })
