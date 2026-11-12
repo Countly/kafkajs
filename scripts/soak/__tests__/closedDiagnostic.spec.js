@@ -222,6 +222,7 @@ describe('closed transient diagnostic', () => {
     }
     expect(rows.map((row) => row.kind)).toEqual(['baseline', 'teardown'])
     expect(worker.soak.TELEMETRY).toMatchObject(flags)
+    expect(worker.soak.TELEMETRY.engineRows).toBe(128)
     const verdict = TelemetryResourceVerdict.evaluate({ clientCount: 1, samples: [], ...flags })
     expect(verdict.ok).toBe(false)
     expect(verdict.violations).toContain('diagnostic inputs are not acceptance-eligible')
