@@ -137,8 +137,22 @@ describe('independent telemetry evidence', () => {
     const original = fs.readFileSync(file)
     const digest = crypto.createHash('sha256').update(original).digest('hex')
     expect(original.length).toBeGreaterThan(1024 * 1024)
+    const { persistEvidence } = require('../../scripts/e2e/telemetry/evidence')
+    const archive = (exports) =>
+      persistEvidence({
+        name: 'telemetry-churn',
+        directory,
+        observers: {},
+        record: { status: 'passed', run: { stem: 'bounded-reader' }, oracles: { exports } },
+      })
+    const before = archive(expected)
+    const archivedBytes = before.files.map((file) =>
+      fs.readFileSync(path.join(directory, file.path))
+    )
+    fs.rmSync(path.join(directory, before.root), { recursive: true })
     const readSync = fs.readSync
     const lengths = []
+    let actual
     const reading = jest
       .spyOn(fs, 'readSync')
       .mockImplementation((fd, bytes, offset, length, at) => {
@@ -146,7 +160,8 @@ describe('independent telemetry evidence', () => {
         return readSync(fd, bytes, offset, length, at)
       })
     try {
-      expect(reader.readExports()).toEqual(expected)
+      actual = reader.readExports()
+      expect(actual).toEqual(expected)
       expect(reader.readExports({ uuid: ID, after: { 1: 200 } })).toEqual(
         expected.filter((item) => item.clientInstanceId === ID && item.seq > 200)
       )
@@ -155,6 +170,11 @@ describe('independent telemetry evidence', () => {
     }
     expect(lengths.length).toBeGreaterThan(2)
     expect(Math.max(...lengths)).toBeLessThanOrEqual(4096)
+    const after = archive(actual)
+    expect(after).toEqual(before)
+    expect(after.files.map((file) => fs.readFileSync(path.join(directory, file.path)))).toEqual(
+      archivedBytes
+    )
     expect(fs.readFileSync(file)).toEqual(original)
     expect(crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')).toBe(digest)
     fs.appendFileSync(file, JSON.stringify(row('1', 513)).slice(partial.length) + '\n')
