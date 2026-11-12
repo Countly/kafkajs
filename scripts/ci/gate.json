@@ -141,6 +141,7 @@
         "testHelpers/__tests__/telemetryFixtures.spec.js \u203a telemetry wire observer collects sealed observer and evidence behind a public close error with custom stack hooks",
         "testHelpers/__tests__/telemetryFixtures.spec.js \u203a telemetry wire observer collects sealed observer and evidence behind a public close error with throwing stack hooks",
         "scripts/ci/__tests__/shareSoakJob.spec.js \u203a share soak CI lifecycle controls publishes lifecycle exports before main enters a circular dependency",
+        "scripts/ci/__tests__/shareSoakJob.spec.js › share soak child module graph runs under plain node: no module reachable from the soak entry points uses a Jest-only alias",
         "scripts/ci/__tests__/shareSoakJob.spec.js \u203a share soak CI lifecycle controls publishes soak exports before main enters a circular dependency",
         "scripts/ci/__tests__/shareSoakJob.spec.js \u203a share soak CI lifecycle controls captures Compose logs above the default buffer without changing their content",
         "scripts/ci/__tests__/shareSoakJob.spec.js \u203a required memory gate composition flushes each calibration child before starting the next even after failure",
