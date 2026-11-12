@@ -1395,6 +1395,7 @@ describe('broker telemetry fixture', () => {
       'live-owner-census',
       'share-peak',
       'telemetry-long-window',
+      'telemetry-long-window-verdict',
       'telemetry-verdicts',
       'telemetry-verdict-controls',
       'verdict',
@@ -1419,7 +1420,7 @@ describe('broker telemetry fixture', () => {
       'journal-controls',
       'retained-diagnostic',
       'telemetry-soak',
-      'telemetry-seeded-control',
+      'telemetry-long-window-verdict',
       'live-owner-census',
       'telemetry-verdicts',
       'telemetry-verdict-controls',
@@ -1452,7 +1453,15 @@ describe('broker telemetry fixture', () => {
     )
     expect(JSON.stringify(workflow.jobs.verdict)).toContain("job.result !== 'success'")
     for (const [name, job] of Object.entries(workflow.jobs)) {
-      if (['select', 'share-soak-verdict', 'verdict', 'telemetry-long-window'].includes(name))
+      if (
+        [
+          'select',
+          'share-soak-verdict',
+          'verdict',
+          'telemetry-long-window',
+          'telemetry-long-window-verdict',
+        ].includes(name)
+      )
         continue
       const selected = `contains(fromJSON(needs.select.outputs.jobs), '${name}')`
       expect(job.if).toBe(
@@ -1718,30 +1727,32 @@ describe('broker telemetry fixture', () => {
     const all = Object.keys(workflow.jobs).filter((id) => id !== 'select')
     const full = select('')
     expect(full.full).toBe('true')
-    expect(JSON.parse(full.jobs).sort()).toEqual([...all].sort())
-    expect(runnable(full)).toEqual(all)
-    expect(runnable(full, 'pull_request')).toEqual(
-      all.filter((id) => id !== 'telemetry-long-window')
-    )
+    const defaults = all.filter((id) => id !== 'telemetry-seeded-control')
+    expect(JSON.parse(full.jobs).sort()).toEqual([...defaults].sort())
+    expect(runnable(full)).toEqual(defaults)
+    expect(runnable(full, 'pull_request')).toEqual(defaults)
     const share = ['unit', 'share-soak', 'share-soak-verify', 'share-soak-verdict']
     const verdicts = ['share-soak-verdict', 'verdict']
+    const long = ['telemetry-long-window', 'telemetry-long-window-verdict']
     const withVerdicts = (ids) => all.filter((id) => ids.includes(id) || verdicts.includes(id))
     for (const id of all.filter((id) => id !== 'verdict')) {
       const outputs = select(id)
       expect(outputs.full).toBe('false')
-      expect(runnable(outputs)).toEqual(withVerdicts(id.startsWith('share-soak') ? share : [id]))
+      expect(runnable(outputs)).toEqual(
+        withVerdicts(id.startsWith('share-soak') ? share : long.includes(id) ? long : [id])
+      )
     }
     expect(runnable(select(' resources, telemetry-verdicts,resources '))).toEqual(
       withVerdicts(['resources', 'telemetry-verdicts'])
     )
     expect(runnable(select('share-soak,telemetry-long-window'))).toEqual(
-      withVerdicts([...share, 'telemetry-long-window'])
+      withVerdicts([...share, ...long])
     )
-    expect(runnable(select('telemetry-long-window'), 'pull_request')).toEqual(verdicts)
+    expect(runnable(select('telemetry-long-window'), 'pull_request')).toEqual(withVerdicts(long))
     expect(runnable(select('verdict'))).toEqual(verdicts)
     for (const input of [' ', ',']) {
       expect(select(input).full).toBe('false')
-      expect(runnable(select(input))).toEqual(all)
+      expect(runnable(select(input))).toEqual(defaults)
     }
     for (const input of ['soak', 'share-soak-extra', 'resources,unknown', 'select'])
       expect(() => select(input)).toThrow(/Unknown job/)
@@ -1755,23 +1766,20 @@ describe('broker telemetry fixture', () => {
     }
   })
 
-  test('keeps the long-window shadow lane diagnostic, bounded and out of the memory verdict', () => {
+  test('requires the adopted long-window lane on pull requests with three replicates and bounded jobs', () => {
     // eslint-disable-next-line n/no-extraneous-require -- YAML parser is pinned by the ESLint/Jest toolchain
     const yaml = require('js-yaml')
     const workflow = yaml.load(read('.github/workflows/memory-gates.yml').toString())
     const expr = (text) => '$' + `{{ ${text} }}`
     const job = workflow.jobs['telemetry-long-window']
     expect(workflow.jobs.verdict.needs).not.toContain('telemetry-long-window')
-    expect(JSON.stringify(workflow.jobs.verdict)).not.toContain('long-window')
+    expect(workflow.jobs.verdict.needs).toContain('telemetry-long-window-verdict')
     expect(workflow.on.workflow_dispatch.inputs.replicates).toMatchObject({
       type: 'choice',
-      default: '1',
+      default: '3',
       options: ['1', '2', '3'],
     })
-    // About 40 runner-minutes per job: manual collections only, never every PR push.
-    expect(job.if).toBe(
-      "github.event_name == 'workflow_dispatch' && contains(fromJSON(needs.select.outputs.jobs), 'telemetry-long-window')"
-    )
+    expect(job.if).toBe("contains(fromJSON(needs.select.outputs.jobs), 'telemetry-long-window')")
     expect(job.needs).toEqual(['select'])
     expect(job['timeout-minutes']).toBeLessThanOrEqual(75)
     const { matrix } = job.strategy
@@ -1781,7 +1789,7 @@ describe('broker telemetry fixture', () => {
     expect(matrix.arm).toEqual(['unseeded', 'seeded'])
     expect(matrix.replicate).toBe(
       expr(
-        "fromJSON(github.event.inputs.replicates == '3' && '[1,2,3]' || github.event.inputs.replicates == '2' && '[1,2]' || '[1]')"
+        "fromJSON(github.event.inputs.replicates == '1' && '[1]' || github.event.inputs.replicates == '2' && '[1,2]' || '[1,2,3]')"
       )
     )
     expect(matrix.include).toEqual(
@@ -1797,8 +1805,10 @@ describe('broker telemetry fixture', () => {
     expect(job.env.LONG_WINDOW_REPLICATE).toBe(expr('matrix.replicate'))
     for (const step of job.steps) expect(step['timeout-minutes']).toBeGreaterThan(0)
     const run = job.steps.find((step) => step.run?.includes('longWindowDiagnostic.js'))
-    expect(run.run).toBe(
-      'timeout -k 10s 1980s node --expose-gc scripts/soak/longWindowDiagnostic.js --diagnostic-only "$LONG_WINDOW_ROOT"'
+    expect(run.run).toContain('mode=--acceptance')
+    expect(run.run).toContain('if [ "$REPLICATES" != \'3\' ]; then mode=--diagnostic-only; fi')
+    expect(run.run).toContain(
+      'timeout -k 10s 1980s node --expose-gc scripts/soak/longWindowDiagnostic.js "$mode" "$LONG_WINDOW_ROOT"'
     )
     expect(run['timeout-minutes'] * 60).toBeGreaterThan(1990)
     expect(run.if).toBeUndefined()
@@ -1942,7 +1952,7 @@ describe('broker telemetry fixture', () => {
     })
     const serialized = JSON.stringify(control)
     expect(serialized).not.toMatch(/verifyEvidence|scripts\/evidence\/verify\.js|forceExit/)
-    expect(workflow.jobs.verdict.needs).toContain('telemetry-seeded-control')
+    expect(workflow.jobs.verdict.needs).not.toContain('telemetry-seeded-control')
   })
 })
 

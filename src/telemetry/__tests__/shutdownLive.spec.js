@@ -1245,8 +1245,8 @@ live(
  * The seeded control of the churn case: the same `main('telemetry')` owner with every worker
  * retaining twice the slope limit through the product's `Kafka` class, selected by the environment.
  * Its records go only under `controls/` of the run directory, never to scenario evidence. It passes
- * only when every worker's own live verdict reports the retained slope and its shadow data slope
- * matches the seed; the run's overall verdict, which the seed fails by design, is not consulted.
+ * only when its diagnostic data slope matches the seed, seed storage is exact and the remaining
+ * resource and exit checks hold. Slope and endpoint acceptance belong to the long-window lane.
  */
 live(
   'telemetry seeded control',

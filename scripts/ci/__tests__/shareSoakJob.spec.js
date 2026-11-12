@@ -478,10 +478,10 @@ describe('required memory gate composition', () => {
       {},
       { only: 'share-soak', replicates: '1' },
       { only: 'telemetry-long-window', replicates: '3' },
-      { only: '', replicates: '3' },
+      { only: '', replicates: '1' },
     ]
     expect(new Set(selections.map((inputs) => key(branch, inputs))).size).toBe(4)
-    expect(key(branch, { only: '', replicates: '1' })).toBe(key(branch))
+    expect(key(branch, { only: '', replicates: '3' })).toBe(key(branch))
     const pull = 'refs/pull/15/merge'
     expect(key(pull, {}, 'old')).toBe(key(pull, {}, 'new'))
     expect(key(pull)).not.toBe(key('refs/pull/16/merge'))
@@ -490,7 +490,7 @@ describe('required memory gate composition', () => {
       'memory-gates-$' +
         '{{ github.ref }}-$' +
         "{{ inputs.only || 'all' }}-$" +
-        "{{ inputs.replicates || '1' }}"
+        "{{ inputs.replicates || '3' }}"
     )
   })
 
@@ -609,7 +609,7 @@ describe('required memory gate composition', () => {
       'journal-controls',
       'retained-diagnostic',
       'telemetry-soak',
-      'telemetry-seeded-control',
+      'telemetry-long-window-verdict',
       'live-owner-census',
       'telemetry-verdicts',
       'telemetry-verdict-controls',

@@ -461,11 +461,6 @@ class TelemetryResourceVerdict {
       )
       measured.slopeBytesPerMinute = slope(points)
       measured.endpointBytes = points.at(-1)[1] - points[0][1]
-      fail(
-        measured.slopeBytesPerMinute <= TELEMETRY.slopeBytesPerMinute * clientCount,
-        'retained slope'
-      )
-      fail(measured.endpointBytes <= TELEMETRY.endpointBytes * clientCount, 'retained endpoint')
     }
     fail(
       closedBytes - baselineBytes <= TELEMETRY.closedBytes * clientCount,

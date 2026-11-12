@@ -629,7 +629,7 @@ describe('share journal packing', () => {
 })
 
 describe('telemetry journal calibration', () => {
-  test('matches the unchanged slope and endpoint evaluator on flat and seeded virtual vectors', () => {
+  test('preserves diagnostic slope calibration while the five-minute verdict only reports slope and endpoint', () => {
     const { RetainedCalibration } = require('./fixtures/journalOwnershipChild')
     const { TELEMETRY, TelemetryResourceVerdict } = require('../soak')
     for (const rate of [0, 131072, 524288]) {
@@ -655,9 +655,9 @@ describe('telemetry journal calibration', () => {
       expect(actual.scope).toBe('slope-and-endpoint-only')
       expect(actual.measured.slopeBytesPerMinute).toBe(full.measured.slopeBytesPerMinute)
       expect(actual.measured.endpointBytes).toBe(full.measured.endpointBytes)
-      expect(actual.violations).toEqual(
+      expect(
         full.violations.filter((label) => ['retained slope', 'retained endpoint'].includes(label))
-      )
+      ).toEqual([])
       expect(actual.ok).toBe(rate === 0)
       if (rate === 524288)
         expect(actual.violations).toEqual(['retained slope', 'retained endpoint'])

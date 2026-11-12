@@ -116,7 +116,7 @@ describe('long-window driver', () => {
     expect(written.candidate.warmupMs).toBe(420000)
   })
 
-  test('stamps adopted reports eligible while keeping worker resource inputs diagnostic', () => {
+  test('stamps adopted reports eligible while keeping worker resource inputs diagnostic', async () => {
     const run = driver('unseeded')
     Object.assign(run.identity, {
       diagnostic: false,
@@ -131,6 +131,35 @@ describe('long-window driver', () => {
       acceptance: true,
     })
     expect(worker.input).toMatchObject({ diagnostic: true, acceptanceEligible: false })
+    const execute = jest
+      .spyOn(LongWindowDiagnostic.prototype, 'execute')
+      .mockImplementation(async function () {
+        this.write('identity.json', {})
+      })
+    const alias = jest.spyOn(LongWindowDiagnostic, 'aliasTestHelpers').mockImplementation(() => {})
+    try {
+      await LongWindowDiagnostic.main(['--acceptance', directory], {
+        CI: 'true',
+        LONG_WINDOW_ARM: 'unseeded',
+        LONG_WINDOW_REPLICATE: '3',
+        GITHUB_RUN_ID: '7',
+        GITHUB_RUN_ATTEMPT: '1',
+        GITHUB_SHA: 'a'.repeat(40),
+      })
+      expect(
+        JSON.parse(fs.readFileSync(path.join(directory, 'identity.json'), 'utf8'))
+      ).toMatchObject({
+        diagnostic: false,
+        scope: 'acceptance',
+        acceptanceEligible: true,
+        runId: '7',
+        attempt: '1',
+        tree: expect.stringMatching(/^[a-f0-9]{40}$/),
+      })
+    } finally {
+      execute.mockRestore()
+      alias.mockRestore()
+    }
   })
 
   test('reports a worker without a result as an incomplete shadow report', () => {

@@ -8,13 +8,7 @@ const { execFileSync } = require('node:child_process')
 const { JournalConstancy } = require('../../testHelpers/fixedJournal')
 const root = path.resolve(__dirname, '../..')
 
-/**
- * One job of the long-window shadow lane: it runs the existing telemetry churn once with the frozen
- * candidate (420 s warm-up, 900 s window, traffic at the existing rate from the start) on an isolated
- * CI runner and archives what the candidate asks for. Every file carries `diagnostic: true` and
- * `acceptanceEligible: false`, the frozen parameters and the commit; the embedded verdicts of the run
- * are by construction not acceptance. Functional, oracle and journal checks remain mandatory.
- */
+/** Runs one adopted long-window job and archives its measurements and functional evidence. */
 class LongWindowDiagnostic {
   /**
    * @param {object} options
@@ -30,27 +24,29 @@ class LongWindowDiagnostic {
   /**
    * Validates the invocation, selects the candidate and its seed for this process and the workers it
    * forks, runs the job and writes its files.
-   * @param {string[]} argv `['--diagnostic-only', <fresh-directory>]`
+   * @param {string[]} argv `['--acceptance'|'--diagnostic-only', <fresh-directory>]`
    * @param {object} [env] the environment, `process.env` by default
    * @returns {Promise<void>}
-   * @throws {Error} outside diagnostic CI, for a stale directory or switch, an incomplete run, or a
+   * @throws {Error} outside CI, for a stale directory or switch, an incomplete run, or a
    *   warm-up seed that did not trip the first-use bound; the files are written first
    */
   static async main([selector, directory], env = process.env) {
     const { LONG_WINDOW, identityOf, seedModeOf } = require('./longWindow')
     const arm = env.LONG_WINDOW_ARM
     if (
-      selector !== '--diagnostic-only' ||
+      !['--acceptance', '--diagnostic-only'].includes(selector) ||
       !directory ||
       env.CI !== 'true' ||
       !LONG_WINDOW.arms.includes(arm) ||
       env.LIVE_CENSUS_IDENTITY ||
       env.SHARE_PEAK_DIAGNOSTIC ||
       env.TELEMETRY_SEED ||
-      env[LONG_WINDOW.env]
+      env[LONG_WINDOW.env] ||
+      (selector === '--acceptance' &&
+        ![env.GITHUB_RUN_ID, env.GITHUB_RUN_ATTEMPT, env.GITHUB_SHA].every(Boolean))
     )
       throw new Error(
-        'Use --diagnostic-only <fresh-directory> with an explicit long-window arm in CI'
+        'Use --diagnostic-only or --acceptance <fresh-directory> with an explicit long-window arm in CI'
       )
     fs.mkdirSync(directory, { recursive: true })
     if (fs.readdirSync(directory).length) throw new Error('long-window directory must be fresh')
@@ -60,6 +56,8 @@ class LongWindowDiagnostic {
       tree: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim(),
       env,
     })
+    if (selector === '--acceptance')
+      Object.assign(identity, { diagnostic: false, scope: 'acceptance', acceptanceEligible: true })
     env[LONG_WINDOW.env] = '1'
     const seed = seedModeOf(arm)
     if (seed) env.TELEMETRY_SEED = seed
@@ -102,7 +100,7 @@ class LongWindowDiagnostic {
   /**
    * Runs the churn, archives its failure or its result, and always closes it.
    * @returns {Promise<void>}
-   * @throws {Error} the failure of the run, or an incomplete or unexpected shadow outcome
+   * @throws {Error} the failure of the run, or an incomplete or unexpected long-window outcome
    */
   async execute() {
     const { buildTelemetryChurn, PROFILES } = this.modules
@@ -150,15 +148,15 @@ class LongWindowDiagnostic {
   /**
    * @param {object} worker a churn worker with `execArgv` from its own handshake
    * @param {object} oracle the independent durability oracle of the run
-   * @returns {object} its shadow report; missing or invalid functional evidence is incomplete
+   * @returns {object} its long-window report; missing or invalid functional evidence is incomplete
    */
   reportOf(worker, oracle) {
     const { ShadowReport, LONG_WINDOW } = this.modules
     const { input, facts, shadow, seed, execArgv = null } = worker
     const head = {
-      scope: 'shadow',
-      acceptance: false,
-      diagnostic: true,
+      scope: this.identity.scope,
+      acceptance: this.identity.acceptanceEligible,
+      diagnostic: this.identity.diagnostic,
       kind: worker.kind,
       arm: this.arm,
       execArgv,
@@ -178,7 +176,7 @@ class LongWindowDiagnostic {
           endAt: facts.timing.phaseAt + LONG_WINDOW.warmupMs + LONG_WINDOW.measureMs,
           seed: seed ?? null,
         }),
-        execArgv,
+        ...head,
       }
     } catch (error) {
       return { ...head, complete: false, error: error.message }

@@ -73,6 +73,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Tooling
 
+- Adopt long-window v2 as telemetry slope/endpoint acceptance: 39 jobs (three seeded and three unseeded replicates per Node/Kafka tuple plus warm-up seeds), with S1/S2/S3, masking and first-use checks; the five-minute lane retains all other checks and its seeded slope control becomes optional diagnostic evidence.
 - Resource gate: closed ceiling, control stability and a new first-use bound judge heap plus external without V8 bytecode and compiled code (limits unchanged, schema 6); a measured warm-up pass runs before M; seeded per-close, warm-up and warm-up-only controls must fail on Node 22/24/26. Seeded records are never acceptance evidence, while structurally valid controls still report numerical limit failures.
 - Memory-gate controls: the legacy journal arm is a contamination-positive control; admin and live-flags parity arms; the live worker records V8 code bytes in shadow.
 - Live soak: a seeded control per Node must show the retained-slope violation at twice the slope limit.

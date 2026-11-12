@@ -10,6 +10,8 @@ const {
   verifyAcceptance,
 } = require('../longWindowReport')
 
+const { identityOf } = require('../longWindow')
+
 const KIB = 1024
 const KINDS = ['producer', 'consumer', 'admin', 'shareConsumer']
 
@@ -20,7 +22,7 @@ const workerOf = (kind, arm, slopeKiB, { tripped = false, complete = true } = {}
   complete,
   mid: { data: { slopeBytesPerMinute: slopeKiB * KIB, endpointBytes: 0 } },
   masked: slopeKiB < -32,
-  firstUse: { tripped },
+  firstUse: { tripped, dataBytes: tripped ? 1572864 : 0 },
   wouldBe: {
     s1: arm === 'seeded' ? { pass: slopeKiB >= 96 } : null,
     s2: arm === 'unseeded' ? { pass: slopeKiB <= 64 } : null,
@@ -276,6 +278,16 @@ describe('long-window acceptance', () => {
     [22, 24, 26].flatMap((node) =>
       matrix(node, (k, i, r) => 10 + r - 2, 120).map((record) => ({
         ...record,
+        candidate: JSON.parse(
+          JSON.stringify(
+            identityOf({
+              arm: record.arm,
+              replicate: record.replicate,
+              tree: record.tree,
+              env: {},
+            }).candidate
+          )
+        ),
         diagnostic: false,
         acceptanceEligible: true,
         scope: 'acceptance',
@@ -306,6 +318,18 @@ describe('long-window acceptance', () => {
       'mixed version',
       (records) => {
         records[0].candidate.version = 1
+      },
+    ],
+    [
+      'changed method',
+      (records) => {
+        records[0].candidate.measureMs = 300000
+      },
+    ],
+    [
+      'changed limit',
+      (records) => {
+        records[0].candidate.thresholds.endpointBytes += 1
       },
     ],
     [
@@ -348,7 +372,10 @@ describe('long-window acceptance', () => {
       'masked slope despite a stale pass flag',
       (records) => {
         records[0].workers[0].mid.data.slopeBytesPerMinute = -33 * KIB
-        records[0].workers[0].masked = true
+        expect(summarise(records).nodes['22']).toMatchObject({
+          masked: 1,
+          s2: { status: 'inconclusive' },
+        })
       },
     ],
     [
@@ -373,14 +400,24 @@ describe('long-window acceptance', () => {
       },
     ],
     [
+      'unseeded first-use overflow',
+      (records) => {
+        Object.assign(records[0].workers[0].firstUse, { tripped: true, dataBytes: 1048577 })
+      },
+    ],
+    [
       'first-use failure',
       (records) => {
-        records.find((record) => record.arm === 'warmup-seed').workers[0].firstUse.tripped = false
+        Object.assign(records.find((record) => record.arm === 'warmup-seed').workers[0].firstUse, {
+          tripped: false,
+          dataBytes: 1048576,
+        })
       },
     ],
   ])('fails %s', (_name, change) => {
     const records = collection()
     change(records)
+    expect(typeof verifyAcceptance).toBe('function')
     expect(() => verifyAcceptance(records, expected)).toThrow()
   })
 
@@ -408,13 +445,20 @@ describe('long-window acceptance', () => {
       expect(main(args, (line) => lines.push(line))).toBe(1)
       expect(lines.join('\n')).toMatch(/FAIL/)
       expect(() => main([directory, '--verdict'], () => {})).toThrow(/tree|usage/)
-      for (const [i, record] of collection().entries()) {
-        const folder = path.join(directory, `artifact-${i}`)
+      for (const record of collection()) {
+        const folder = path.join(
+          directory,
+          `telemetry-long-window-node${/^v(\d+)/.exec(record.node)[1]}-${record.kafka}-${record.arm}-r${record.replicate}`
+        )
         fs.mkdirSync(folder)
         fs.writeFileSync(path.join(folder, 'long-window.json'), JSON.stringify(record))
       }
       expect(main(args, (line) => lines.push(line))).toBe(0)
       expect(lines.join('\n')).toMatch(/PASS/)
+      expect(main([directory], (line) => lines.push(line))).toBe(0)
+      expect(lines.at(-1)).toMatch(/^long-window acceptance table/)
+      fs.mkdirSync(path.join(directory, 'telemetry-long-window-node22-unexpected'))
+      expect(main(args, () => {})).toBe(1)
     } finally {
       fs.rmSync(directory, { recursive: true, force: true })
     }

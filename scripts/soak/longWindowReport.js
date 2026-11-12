@@ -1,16 +1,11 @@
 #!/usr/bin/env node
 'use strict'
 
-/**
- * Offline analysis of the long-window shadow lane. It reads the downloaded artifacts of the lane's
- * jobs and prints, per Node, the would-be S1 (seeded workers reach 96 KiB/min), S2 (unseeded workers
- * stay within 64 KiB/min and a 1 MiB endpoint, unmasked) and S3 (the seeded mean less three pooled
- * SDs reaches 96 and the unseeded mean plus three stays within 64) tables, the masked workers and the
- * warm-up seed's first-use trips. It judges nothing: every record it reads is diagnostic.
- */
+/** Offline S1/S2/S3 report and acceptance verdict for the frozen long-window method. */
 const fs = require('node:fs')
 const path = require('node:path')
-const { LONG_WINDOW } = require('./longWindow')
+const { isDeepStrictEqual } = require('node:util')
+const { LONG_WINDOW, identityOf } = require('./longWindow')
 
 const KIB = 1024
 const FILE = 'long-window.json'
@@ -25,7 +20,7 @@ const keyOf = (parts) => JSON.stringify(parts)
 /**
  * Indexes one frozen candidate without combining versions, commits, runtimes or duplicate downloads.
  * Unversioned records belong to candidate v1.
- * @param {object[]} records the diagnostic job records
+ * @param {object[]} records the long-window job records
  * @returns {Map<string, object>} workers by Node major, Kafka, arm, replicate and kind
  * @throws {Error} for duplicate identities, mixed candidates, commits or runtimes, or an unexpected tuple
  */
@@ -71,7 +66,7 @@ const observationsOf = (records) => {
 /**
  * @param {string} directory the downloaded artifacts root
  * @returns {object[]} every `long-window.json` beneath it, parsed
- * @throws {Error} for an unreadable directory or a record that is not diagnostic and ineligible
+ * @throws {Error} for an unreadable directory or invalid JSON
  */
 const readRecords = (directory) => {
   const records = []
@@ -80,8 +75,6 @@ const readRecords = (directory) => {
     if (entry.isDirectory()) records.push(...readRecords(file))
     else if (entry.name === FILE) {
       const record = JSON.parse(fs.readFileSync(file, 'utf8'))
-      if (record.diagnostic !== true || record.acceptanceEligible !== false)
-        throw new Error(`${file} is not a diagnostic long-window record`)
       records.push(record)
     }
   }
@@ -195,13 +188,29 @@ const summarise = (records) => {
         for (const replicate of REPLICATES) {
           const positive = observe(kafka, 'seeded', replicate, kind, node.s1)
           if (positive) {
-            if (positive.wouldBe.s1.pass) node.s1.pass += 1
+            if (
+              positive.wouldBe.s1.pass &&
+              positive.mid.data.slopeBytesPerMinute >=
+                LONG_WINDOW.thresholds.seededSlopeBytesPerMinute
+            )
+              node.s1.pass += 1
             seeded.push(positive.mid.data.slopeBytesPerMinute / KIB)
           }
           const negative = observe(kafka, 'unseeded', replicate, kind, node.s2)
           if (negative) {
-            if (negative.wouldBe.s2.pass) node.s2.pass += 1
-            if (negative.masked) node.masked += 1
+            const masked =
+              negative.masked ||
+              negative.mid.data.slopeBytesPerMinute <
+                LONG_WINDOW.thresholds.maskingSlopeBytesPerMinute
+            if (
+              negative.wouldBe.s2.pass &&
+              !masked &&
+              negative.mid.data.slopeBytesPerMinute <=
+                LONG_WINDOW.thresholds.unseededSlopeBytesPerMinute &&
+              negative.mid.data.endpointBytes <= LONG_WINDOW.thresholds.endpointBytes
+            )
+              node.s2.pass += 1
+            if (masked) node.masked += 1
             unseeded.push(negative.mid.data.slopeBytesPerMinute / KIB)
           }
         }
@@ -218,6 +227,7 @@ const summarise = (records) => {
           : (target.pass ?? target.tripped) === target.total
             ? 'pass'
             : 'fail'
+    if (node.masked && node.s2.status !== 'insufficient') node.s2.status = 'inconclusive'
     node.s3 = s3Of(seeded, tuples, node.missing === 0 && node.incomplete === 0)
     nodes[major] = node
   }
@@ -240,12 +250,13 @@ const s3Text = (s3) => {
 
 /**
  * @param {{nodes: Object<string, object>}} summary from `summarise`
+ * @param {boolean} [acceptance] whether to label an eligible acceptance collection
  * @returns {string} the printed table, one line per Node in numeric order
  */
-const render = ({ nodes }) => {
+const render = ({ nodes }, acceptance = false) => {
   const cell = (text, width) => String(text).padEnd(width)
   const lines = [
-    'long-window shadow table (diagnostic, never acceptance); mid-cycle data slopes, KiB/min',
+    `long-window ${acceptance ? 'acceptance' : 'diagnostic (never acceptance)'} table; mid-cycle data slopes, KiB/min`,
     [
       cell('node', 6),
       cell('S1 seeded>=96', 23),
@@ -274,19 +285,145 @@ const render = ({ nodes }) => {
 }
 
 /**
- * @param {string[]} argv `[<artifact-directory>]`
- * @param {function(string):void} [write] where the table goes, `console.log` by default
- * @returns {number} the exit code, 0: the report is a table, never a verdict
- * @throws {Error} the usage line for another argument list
+ * Requires the complete adopted collection and reuses the report's S1/S2/S3 and first-use judgement.
+ * Historical diagnostic replay is explicit and does not make its records acceptance-eligible.
+ * @param {object[]} records the 39 job records
+ * @param {{tree:string, runId:string, attempt:string, replayDiagnostic?:boolean}} expected provenance
+ * @returns {object} the passing summary
+ * @throws {Error} for wrong provenance, ineligible or incomplete evidence, or any failing check
  */
-const main = (argv, write = console.log) => {
-  if (argv.length !== 1)
-    throw new Error('usage: node scripts/soak/longWindowReport.js <artifact-directory>')
-  write(render(summarise(readRecords(argv[0]))))
-  return 0
+const verifyAcceptance = (records, { tree, runId, attempt, replayDiagnostic = false }) => {
+  if (![tree, runId, attempt].every((value) => typeof value === 'string' && value.length))
+    throw new Error('Expected tree, run and attempt are required')
+  if (records.length !== 39)
+    throw new Error(`Expected 39 long-window artifacts, found ${records.length}`)
+  for (const record of records) {
+    if (
+      record.tree !== tree ||
+      record.sha !== tree ||
+      record.runId !== runId ||
+      record.attempt !== attempt
+    )
+      throw new Error('Foreign tree, run or attempt in long-window collection')
+    if (
+      !isDeepStrictEqual(
+        record.candidate,
+        identityOf({
+          arm: record.arm,
+          replicate: record.replicate,
+          tree,
+          env: {},
+        }).candidate
+      )
+    )
+      throw new Error('Expected adopted long-window v2 identity')
+    const eligible = replayDiagnostic
+      ? record.diagnostic === true && record.acceptanceEligible === false
+      : record.diagnostic === false && record.acceptanceEligible === true
+    if (!eligible) throw new Error('Ineligible long-window record')
+    if (record.workers?.length !== KINDS.length)
+      throw new Error('Expected four long-window workers')
+    for (const worker of record.workers) {
+      if (
+        !Number.isFinite(worker.firstUse?.dataBytes) ||
+        worker.firstUse.tripped !== worker.firstUse.dataBytes > LONG_WINDOW.thresholds.firstUseBytes
+      )
+        throw new Error('Invalid long-window first-use measurement')
+      if (record.arm === 'unseeded' && worker.firstUse.tripped)
+        throw new Error('Unseeded long-window first-use exceeds 1 MiB')
+      if (!LONG_WINDOW.v8Flags.every((flag) => worker.execArgv?.includes(flag)))
+        throw new Error('Missing long-window worker flag --no-flush-bytecode')
+    }
+  }
+  const summary = summarise(records)
+  for (const [major, node] of Object.entries(summary.nodes))
+    if (
+      node.masked ||
+      [node.s1, node.s2, node.s3, node.firstUse].some((check) => check.status !== 'pass')
+    )
+      throw new Error(`Node ${major}: S1, S2, S3 or first-use failed, inconclusive or incomplete`)
+  return summary
 }
 
-module.exports = { main, pooledSd, readRecords, render, summarise }
+/**
+ * @param {string} directory the separate artifact directories downloaded from one run
+ * @returns {object[]} one record per correctly named artifact
+ * @throws {Error} for an extra, empty, duplicate or incorrectly named artifact
+ */
+const readArtifacts = (directory) => {
+  const records = []
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    if (!entry.isDirectory()) throw new Error('Unexpected long-window artifact entry')
+    const found = readRecords(path.join(directory, entry.name))
+    if (found.length !== 1) throw new Error('Expected one record per long-window artifact')
+    const record = found[0]
+    const major = /^v(\d+)\./.exec(record.node)?.[1]
+    const name = `telemetry-long-window-node${major}-${record.kafka}-${record.arm}-r${record.replicate}`
+    if (entry.name !== name) throw new Error('Unexpected long-window artifact name')
+    records.push(record)
+  }
+  return records
+}
+
+/**
+ * @param {string[]} argv directory, optionally `--verdict --tree SHA --run ID --attempt N` and
+ *   `--replay-diagnostic` for historical diagnostics only
+ * @param {function(string):void} [write] output sink
+ * @returns {number} 0 for a report or passing verdict; 1 for a failed verdict
+ * @throws {Error} for invalid arguments or unreadable evidence
+ */
+const main = (argv, write = console.log) => {
+  const [directory, ...args] = argv
+  const options = {}
+  for (let i = 0; i < args.length; i++) {
+    const flag = args[i]
+    if (['--verdict', '--replay-diagnostic'].includes(flag)) options[flag] = true
+    else if (['--tree', '--run', '--attempt'].includes(flag) && args[i + 1])
+      options[flag] = args[++i]
+    else
+      throw new Error(
+        'usage: longWindowReport.js <artifact-directory> [--verdict --tree SHA --run ID --attempt N [--replay-diagnostic]]'
+      )
+  }
+  const verdict = options['--verdict'] === true
+  if (
+    !directory ||
+    (args.length && !verdict) ||
+    (verdict && !['--tree', '--run', '--attempt'].every((flag) => options[flag]))
+  )
+    throw new Error(
+      'usage: longWindowReport.js <artifact-directory> [--verdict --tree SHA --run ID --attempt N [--replay-diagnostic]]'
+    )
+  if (!verdict) {
+    const records = readRecords(directory)
+    const eligible =
+      records.length > 0 &&
+      records.every((record) => record.diagnostic === false && record.acceptanceEligible === true)
+    write(render(summarise(records), eligible))
+    return 0
+  }
+  try {
+    const records = readArtifacts(directory)
+    write(render(summarise(records), !options['--replay-diagnostic']))
+    verifyAcceptance(records, {
+      tree: options['--tree'],
+      runId: options['--run'],
+      attempt: options['--attempt'],
+      replayDiagnostic: options['--replay-diagnostic'] === true,
+    })
+    write(
+      options['--replay-diagnostic']
+        ? 'PASS: historical diagnostic replay only; records remain ineligible'
+        : 'PASS: long-window acceptance'
+    )
+    return 0
+  } catch (error) {
+    write(`FAIL: ${error.message}`)
+    return 1
+  }
+}
+
+module.exports = { main, pooledSd, readRecords, render, summarise, verifyAcceptance }
 if (require.main === module) {
   try {
     process.exitCode = main(process.argv.slice(2))

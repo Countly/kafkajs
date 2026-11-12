@@ -3,7 +3,7 @@
 /**
  * The seeded control of the live telemetry churn. Each worker retains one fresh, touched buffer for
  * every scheduled sample, through the product's own `Kafka` class, at twice the slope limit. The
- * control proves the live retained-slope verdict and the shadow data slope both see real growth.
+ * diagnostic control reports real growth through its shadow data slope.
  * A seeded run is never acceptance evidence: its records live only under `controls/` and the churn
  * archive verifier refuses any row that carries a seed.
  */
@@ -15,7 +15,7 @@ const path = require('node:path')
  * The control's switch, mode and rate, and how far the shadow data slope may fall short of it.
  * `toleranceFraction` is of the seeded rate: a quarter, so the data slope must reach 96 KiB/min of
  * the 128 KiB/min seeded, beside natural drift. `allowed` is every violation a seeded run may
- * report: the slope, and the endpoint and closed ceilings that retained bytes can also cross.
+ * report: the closed ceiling that retained bytes can cross.
  */
 const LIVE_SEED = Object.freeze({
   env: 'TELEMETRY_SEED',
@@ -24,7 +24,7 @@ const LIVE_SEED = Object.freeze({
   root: Symbol.for('telemetry.seed.root'),
   fill: 0x5a,
   toleranceFraction: 0.25,
-  allowed: Object.freeze(['retained slope', 'retained endpoint', 'closed transient ceiling']),
+  allowed: Object.freeze(['closed transient ceiling']),
 })
 
 /**
@@ -131,10 +131,8 @@ const factsOf = (worker) => ({
 })
 
 /**
- * Holds a seeded live run to its role: every worker's own verdict reports the retained slope and no
- * violation the seed cannot explain, its shadow data slope is at least the seeded rate minus the
- * tolerance, the seed retained exactly one configured buffer for every judged sample, and the
- * worker exited naturally with its own verdict failed. The run's overall verdict is not consulted.
+ * Checks the optional five-minute seed diagnostic: data slope, exact seed storage, unexplained
+ * resource failures and natural exit. Slope and endpoint acceptance belong to the long lane.
  * @param {object[]} workers the facts of every worker, from `factsOf`, in kind order
  * @param {{slopeBytesPerMinute: number, sampleMs: number, exitMs: number}} limits the `TELEMETRY` limits
  * @returns {void}
@@ -149,17 +147,8 @@ const judgeSeededRun = (workers, limits) => {
   )
   const rate = limits.slopeBytesPerMinute * LIVE_SEED.factor
   const bytesPerInterval = Math.round((rate * limits.sampleMs) / MINUTE_MS)
-  for (const { kind, violations, measured, samples, shadow, seed, exit } of workers) {
+  for (const { kind, violations, samples, shadow, seed, exit } of workers) {
     assert(Array.isArray(violations), `${kind}: violations list`)
-    assert(
-      violations.includes('retained slope'),
-      `${kind}: the seeded retained slope was not detected`
-    )
-    assert(
-      Number.isFinite(measured?.slopeBytesPerMinute) &&
-        measured.slopeBytesPerMinute > limits.slopeBytesPerMinute,
-      `${kind}: the slope label agrees with its measured value`
-    )
     const stray = violations.filter((label) => !LIVE_SEED.allowed.includes(label))
     assert.equal(stray.length, 0, `${kind}: violations the seed does not explain: ${stray}`)
     assert.equal(seed?.mode, LIVE_SEED.mode, `${kind}: seed mode`)
@@ -179,7 +168,7 @@ const judgeSeededRun = (workers, limits) => {
     )
     assert(
       exit?.event === 'close' &&
-        exit.code === 1 &&
+        exit.code === (violations.length ? 1 : 0) &&
         exit.signal === null &&
         !exit.killed &&
         !exit.aborted &&
@@ -190,7 +179,7 @@ const judgeSeededRun = (workers, limits) => {
         Number.isFinite(exit.afterDisconnectMs) &&
         exit.afterDisconnectMs >= 0 &&
         exit.afterDisconnectMs <= limits.exitMs,
-      `${kind}: natural exit on its own failed verdict (code ${exit?.code}, signal ${exit?.signal}, stderr ${exit?.stderrBytes} bytes)`
+      `${kind}: natural exit on its own verdict (code ${exit?.code}, signal ${exit?.signal}, stderr ${exit?.stderrBytes} bytes)`
     )
   }
 }

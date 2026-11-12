@@ -1,15 +1,9 @@
 'use strict'
 
 /**
- * The frozen long-window candidate of the telemetry churn, run as a shadow diagnostic lane. Warm-up is
- * 420 s (seven reopen cycles) and the window 900 s (fifteen), the readings stay every 30 s, and the
- * slope and endpoint use only the fifteen mid-cycle readings at 450 s to 1,290 s. Traffic keeps the
- * per-minute rate of the existing lane through warm-up and window. Nothing here is a verdict: the
- * candidate is frozen, every record it produces is diagnostic and acceptance-ineligible, and no limit,
- * window, estimator or settle protocol of the existing lane reads it.
- *
- * The module is pure beside `HeapSpaceJournal`, which only reads the engine, so the driver, the worker
- * and the offline report can all load it.
+ * Frozen telemetry slope/endpoint method: 420 s warm-up, 900 s window and OLS over fifteen quiet
+ * mid-cycle readings. The driver stamps adopted CI reports eligible; raw measurements stay diagnostic
+ * so the five-minute resource verdict cannot accept this separate protocol.
  */
 const v8 = require('node:v8')
 const { FixedJournal } = require('../../testHelpers/fixedJournal')
@@ -21,7 +15,7 @@ const MIB = 1024 * KIB
 const MINUTE_MS = 60000
 
 /**
- * The frozen candidate. `thresholds` are the would-be S1/S2 limits and the S3 sigma count; the sizes
+ * The frozen method. `thresholds` are the S1/S2 limits and the S3 sigma count; the sizes
  * are what the longer run needs to keep the existing journals, segments and IPC bounds from overflowing.
  */
 const LONG_WINDOW = Object.freeze({

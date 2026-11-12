@@ -8,14 +8,14 @@ on:
         required: false
         default: ''
       replicates:
-        description: Replicates of every telemetry-long-window tuple; pull requests run one
+        description: Long-window replicates; three required for acceptance, fewer are diagnostic
         type: choice
-        default: '1'
+        default: '3'
         options: ['1', '2', '3']
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
 concurrency:
-  group: memory-gates-${{ github.ref }}-${{ inputs.only || 'all' }}-${{ inputs.replicates || '1' }}
+  group: memory-gates-${{ github.ref }}-${{ inputs.only || 'all' }}-${{ inputs.replicates || '3' }}
   cancel-in-progress: true
 jobs:
   select:
@@ -49,6 +49,7 @@ jobs:
             'live-owner-census',
             'share-peak',
             'telemetry-long-window',
+            'telemetry-long-window-verdict',
             'telemetry-verdicts',
             'telemetry-verdict-controls',
             'verdict',
@@ -58,10 +59,14 @@ jobs:
           for (const id of requested) {
             if (!ids.includes(id)) throw new Error(`Unknown job: ${id}`)
           }
-          const selected = new Set(requested.length ? requested : ids)
+          const selected = new Set(requested.length ? requested : ids.filter(id => id !== 'telemetry-seeded-control'))
           const share = ['share-soak', 'share-soak-verify', 'share-soak-verdict']
           if (share.some(id => selected.has(id))) {
             for (const id of ['unit', ...share]) selected.add(id)
+          }
+          const long = ['telemetry-long-window', 'telemetry-long-window-verdict']
+          if (long.some(id => selected.has(id))) {
+            for (const id of long) selected.add(id)
           }
           const jobs = ids.filter(id => selected.has(id))
           fs.appendFileSync(process.env.GITHUB_OUTPUT, `jobs=${JSON.stringify(jobs)}\nfull=${only === ''}\n`)
@@ -644,13 +649,13 @@ jobs:
       - name: Verify mounted reporter and capture broker identities
         timeout-minutes: 3
         run: timeout -k 5s 150s node scripts/e2e/telemetry/ci.js capture
-      - name: Run the seeded telemetry churn control at twice the slope limit
+      - name: Run the optional five-minute seeded slope diagnostic
         timeout-minutes: 12
         env:
           TMPDIR: ${{ runner.temp }}
           TELEMETRY_SEED: slope2x
         run: timeout -k 10s 600s npm run test:group:telemetry-seeded-control -- --ci
-      - name: Require the seeded control to have detected its retained slope
+      - name: Require diagnostic seed storage, data slope and remaining checks
         timeout-minutes: 1
         run: node -e "require('./scripts/soak/liveSeed').requireControl(process.env.TELEMETRY_EVIDENCE_DIR)"
       - name: Stop owned project and prove container network volume removal
@@ -848,7 +853,7 @@ jobs:
           include-hidden-files: true
   telemetry-long-window:
     needs: [select]
-    if: github.event_name == 'workflow_dispatch' && contains(fromJSON(needs.select.outputs.jobs), 'telemetry-long-window')
+    if: contains(fromJSON(needs.select.outputs.jobs), 'telemetry-long-window')
     runs-on: ubuntu-latest
     timeout-minutes: 75
     strategy:
@@ -857,7 +862,7 @@ jobs:
         node: [22, 24, 26]
         kafka: ['4.2.2', '4.3.1']
         arm: [unseeded, seeded]
-        replicate: ${{ fromJSON(github.event.inputs.replicates == '3' && '[1,2,3]' || github.event.inputs.replicates == '2' && '[1,2]' || '[1]') }}
+        replicate: ${{ fromJSON(github.event.inputs.replicates == '1' && '[1]' || github.event.inputs.replicates == '2' && '[1,2]' || '[1,2,3]') }}
         include:
           - { node: 22, kafka: '4.3.1', arm: warmup-seed, replicate: 1 }
           - { node: 24, kafka: '4.3.1', arm: warmup-seed, replicate: 1 }
@@ -924,11 +929,15 @@ jobs:
           TELEMETRY_LONG_WINDOW: '1'
         timeout-minutes: 3
         run: timeout -k 5s 150s node scripts/e2e/telemetry/ci.js capture
-      - name: Run the long-window shadow candidate for one arm and replicate
+      - name: Run the adopted long-window method for one arm and replicate
         timeout-minutes: 36
         env:
           TMPDIR: ${{ runner.temp }}
-        run: timeout -k 10s 1980s node --expose-gc scripts/soak/longWindowDiagnostic.js --diagnostic-only "$LONG_WINDOW_ROOT"
+          REPLICATES: ${{ inputs.replicates || '3' }}
+        run: |
+          mode=--acceptance
+          if [ "$REPLICATES" != '3' ]; then mode=--diagnostic-only; fi
+          timeout -k 10s 1980s node --expose-gc scripts/soak/longWindowDiagnostic.js "$mode" "$LONG_WINDOW_ROOT"
       - name: Stop owned project and prove container network volume removal
         env:
           TELEMETRY_LONG_WINDOW: '1'
@@ -950,6 +959,33 @@ jobs:
             .tmp/telemetry-cache/decoder-*.jsa.json
           if-no-files-found: error
           include-hidden-files: true
+  telemetry-long-window-verdict:
+    needs: [select, telemetry-long-window]
+    if: always() && needs.select.result == 'success' && contains(fromJSON(needs.select.outputs.jobs), 'telemetry-long-window-verdict')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions: { contents: read, actions: read }
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 1
+      - uses: actions/setup-node@v4
+        timeout-minutes: 1
+        with: { node-version: 24, cache: npm }
+      - run: npm ci
+        timeout-minutes: 5
+      - name: Download every long-window artifact of this run separately
+        timeout-minutes: 2
+        uses: actions/download-artifact@v4
+        with:
+          pattern: telemetry-long-window-node*
+          path: .tmp/long-window-verdict/
+      - name: Require all 39 adopted records and every long-window check
+        timeout-minutes: 1
+        env:
+          LONG_WINDOW_RESULT: ${{ needs.telemetry-long-window.result }}
+        run: |
+          test "$LONG_WINDOW_RESULT" = success || exit 1
+          node scripts/soak/longWindowReport.js .tmp/long-window-verdict --verdict --tree "$(git rev-parse HEAD)" --run "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
   telemetry-verdicts:
     needs: [select]
     if: contains(fromJSON(needs.select.outputs.jobs), 'telemetry-verdicts')
@@ -987,7 +1023,7 @@ jobs:
     name: memory-gates-verdict
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [select, unit, share-soak-verdict, resources, journal-controls, retained-diagnostic, telemetry-soak, telemetry-seeded-control, live-owner-census, telemetry-verdicts, telemetry-verdict-controls]
+    needs: [select, unit, share-soak-verdict, resources, journal-controls, retained-diagnostic, telemetry-soak, telemetry-long-window-verdict, live-owner-census, telemetry-verdicts, telemetry-verdict-controls]
     if: always() && needs.select.result == 'success'
     steps:
       - name: Require every relocated memory gate
