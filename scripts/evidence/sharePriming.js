@@ -431,15 +431,23 @@ const verifySharePriming = (rows) => {
     ['afterCollection', 'activeResources'],
   ]) {
     const owners = observed?.timerOwners?.[when]
-    const before = reference?.timerOwners?.[when]
+    const source = reference?.timerOwners?.[when]
+    const before = reference?.timerOwners?.afterCollection
+    const counts = reference?.[resource]
     if (
       !owners ||
       !before ||
+      !Array.isArray(source?.rows) ||
+      source.dropped !== 0 ||
+      !counts ||
+      !Object.values(counts).every((n) => Number.isSafeInteger(n) && n >= 0) ||
+      !source.unattributed ||
+      !Object.values(source.unattributed).every((n) => Number.isSafeInteger(n) && n >= 0) ||
       owners.dropped !== 0 ||
       !equalCounts(owners.unattributed, before.unattributed) ||
       !equalCounts(
         ShareTimerObserver.comparableResources(observed?.[resource], owners),
-        ShareTimerObserver.comparableResources(reference?.[resource], before)
+        ShareTimerObserver.comparableResources(reference?.activeResources, before)
       )
     )
       problems.push('priming boundary inventory, attribution or observer overflow failure')

@@ -6601,7 +6601,9 @@ class ShareSoak {
 
   /**
    * Executes one fixed first-use scope in this realm and releases its strong roots before the
-   * boundary observation. Global observation history remains installed until scored cleanup.
+   * boundary observation. Both boundary censuses must match the settled reference population;
+   * its pre-collection transients remain archived and validated. Global observation history
+   * remains installed until scored cleanup.
    * @param {AbortSignal} scope Original nested priming bound.
    * @returns {Promise<void>} Only a scalar completion link survives in this owner.
    * @throws {Error} Any priming or boundary failure; scored setup has not started.
@@ -6640,11 +6642,22 @@ class ShareSoak {
         )
           violations.push('priming boundary: invalid heap source or elapsed timestamp')
         ShareSoakScreen.quiet(snapshot, original, 'priming boundary', violations)
-        for (const when of ['beforeCollection', 'afterCollection']) {
+        for (const [when, resource] of [
+          ['beforeCollection', 'activeResourcesBeforeCollection'],
+          ['afterCollection', 'activeResources'],
+        ]) {
+          const source = original.timerOwners?.[when]
+          const counts = original[resource]
           if (
+            !Array.isArray(source?.rows) ||
+            source.dropped !== 0 ||
+            !counts ||
+            !Object.values(counts).every(ShareSoakScreen.count) ||
+            !source.unattributed ||
+            !Object.values(source.unattributed).every(ShareSoakScreen.count) ||
             !ShareSoakScreen.same(
               snapshot.timerOwners?.[when]?.unattributed,
-              original.timerOwners?.[when]?.unattributed
+              original.timerOwners?.afterCollection?.unattributed
             )
           )
             violations.push('priming boundary: timer attribution differs')
