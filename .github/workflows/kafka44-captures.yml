@@ -3,6 +3,7 @@
 # Each job uploads `broker-capture-<version>`; import it with
 #   node scripts/protocol/importCaptureArtifacts.js --artifact <downloaded dir> --version <version> --tables <downloaded dir>/client-tables
 # and keep the logs artifact `broker-capture-logs-<version>` with the run record.
+# The 4.4.0 job also uploads an unreviewed `completing-rebalance-capture-4.4.0` candidate.
 name: Kafka broker captures
 on:
   push:
@@ -101,6 +102,30 @@ jobs:
           node scripts/e2e/apiVersionsProbe.js --all --record="$OUT/client-tables/brokerRanges.json" --record-features="$OUT/client-tables/brokerFeatures.json"
       - name: Dry-run the import
         run: node scripts/protocol/importCaptureArtifacts.js --artifact "$OUT" --version "$KAFKA_VERSION" --tables "$OUT/client-tables" --dry-run
+      - name: Capture completing-rebalance candidate
+        if: matrix.kafka == '4.4.0'
+        env:
+          COMPLETING_REBALANCE_E2E: '1'
+          COMPLETING_REBALANCE_CAPTURE: '1'
+          KAFKAJS_LANE: docker
+          KAFKAJS_TREE: ${{ env.CANDIDATE_SHA }}
+        run: |
+          set -euo pipefail
+          node node_modules/jest/bin/jest.js --runInBand --testPathPatterns 'src/consumer/__tests__/completingRebalanceLive\.spec\.js' --detectOpenHandles
+          test -s ".tmp/e2e/completing-rebalance-candidate-$KAFKA_VERSION.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always() && matrix.kafka == '4.4.0'
+        with:
+          name: completing-rebalance-capture-${{ matrix.kafka }}
+          retention-days: 30
+          if-no-files-found: error
+          include-hidden-files: true
+          path: |
+            .tmp/e2e/completing-rebalance-candidate-${{ matrix.kafka }}.json
+            .tmp/e2e/completing-rebalance.jsonl
+            capture-out/${{ matrix.kafka }}/capture-meta.json
+            capture-out/${{ matrix.kafka }}/broker-identity.txt
+            capture-out/${{ matrix.kafka }}/image-digest.txt
       - name: Collect cluster logs
         if: always()
         run: |

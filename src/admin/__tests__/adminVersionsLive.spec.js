@@ -1,5 +1,6 @@
 const Broker = require('../../broker')
 const { newestVersionsFromCapture } = require('../../../testHelpers/brokerCapture')
+const { readBrokerVersion } = require('../../../testHelpers/brokerVersion')
 const {
   Kafka,
   logLevel,
@@ -100,6 +101,7 @@ describeAdminVersions(
     let producer
     let spies
     let startedAt
+    let expectedVersions
 
     /**
      * Calls `read` until `holds(result)` is true, within the propagation budget.
@@ -127,6 +129,16 @@ describeAdminVersions(
     }
 
     beforeAll(async () => {
+      expectedVersions = newestVersionsFromCapture(readBrokerVersion(), [
+        'CreateTopics',
+        'DeleteTopics',
+        'CreatePartitions',
+        'DeleteRecords',
+        'DeleteGroups',
+        'DescribeAcls',
+        'CreateAcls',
+        'DeleteAcls',
+      ])
       spies = [
         recording('createTopics', (answer) => createdTopics.push(answer)),
         recording('deleteGroups', (answer) => deletedGroups.push(answer)),
@@ -319,16 +331,11 @@ describeAdminVersions(
           negotiated,
           wireVersions: wireVersionsOf(requests),
         })
-        expect(negotiated).toEqual({
-          CreateTopics: [7],
-          DeleteTopics: [6],
-          CreatePartitions: [3],
-          DeleteRecords: [2],
-          DeleteGroups: [2],
-          DescribeAcls: [3],
-          CreateAcls: [3],
-          DeleteAcls: [3],
-        })
+        expect(negotiated).toEqual(
+          Object.fromEntries(
+            Object.entries(expectedVersions).map(([name, version]) => [name, [version]])
+          )
+        )
       },
       CASE_BUDGET_MS
     )
@@ -347,16 +354,9 @@ describeAdminVersions(
         for (const line of lines) {
           expect(problemsOf(line, verified)).toEqual([])
         }
-        expect(lines.find(({ step }) => step === 'versions').wireVersions).toMatchObject({
-          CreateTopics: 7,
-          DeleteTopics: 6,
-          CreatePartitions: 3,
-          DeleteRecords: 2,
-          DeleteGroups: 2,
-          DescribeAcls: 3,
-          CreateAcls: 3,
-          DeleteAcls: 3,
-        })
+        expect(lines.find(({ step }) => step === 'versions').wireVersions).toMatchObject(
+          expectedVersions
+        )
       },
       CASE_BUDGET_MS
     )
