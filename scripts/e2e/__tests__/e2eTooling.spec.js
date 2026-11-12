@@ -1428,7 +1428,8 @@ describe('broker telemetry fixture', () => {
     )
     expect(JSON.stringify(workflow.jobs.verdict)).toContain("job.result !== 'success'")
     for (const [name, job] of Object.entries(workflow.jobs)) {
-      if (['share-soak-verdict', 'verdict'].includes(name)) continue
+      // The long-window shadow lane is dispatch-only; its own test pins that guard.
+      if (['share-soak-verdict', 'verdict', 'telemetry-long-window'].includes(name)) continue
       expect(job.if).toBe(
         name === 'share-soak-verify'
           ? "always() && (github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/'))"
