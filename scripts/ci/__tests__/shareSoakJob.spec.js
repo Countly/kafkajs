@@ -495,7 +495,67 @@ describe('required memory gate composition', () => {
     }
   })
 
-  test('requires both share profiles and every relocated telemetry verdict only for full selections', () => {
+  test('fails both named verdicts on partial dispatches and checks every dependency on full runs', () => {
+    const { jobs } = require('js-yaml').load(
+      fs.readFileSync('.github/workflows/memory-gates.yml', 'utf8')
+    )
+    for (const id of ['verdict', 'share-soak-verdict']) {
+      const job = jobs[id]
+      const step = job.steps[0]
+      const label = id === 'verdict' ? 'memory-gates' : 'share-soak'
+      const successful = Object.fromEntries(job.needs.map((name) => [name, { result: 'success' }]))
+      /** @param {object} overrides Environment values. @returns {object} Actual verdict shell result. */
+      const run = (overrides = {}) =>
+        spawnSync('bash', ['-c', step.run], {
+          encoding: 'utf8',
+          timeout: 5000,
+          env: {
+            ...process.env,
+            FULL: 'true',
+            ONLY: '',
+            RESULTS: JSON.stringify(successful),
+            PRODUCED: 'success',
+            RECHECKED: 'success',
+            ...overrides,
+          },
+        })
+      for (const only of [
+        'share-soak',
+        'telemetry-verdicts',
+        'telemetry-long-window',
+        'verdict',
+        ' ',
+        ',',
+      ]) {
+        for (const full of ['false', '', undefined]) {
+          const result = run({ FULL: full, ONLY: only })
+          expect(result.error).toBeUndefined()
+          expect(result.status).toBe(1)
+          expect(result.stdout + result.stderr).toContain(
+            `partial selection (only=${only}) is not a ${label} pass`
+          )
+        }
+      }
+      expect(step.env.FULL).toBe('$' + '{{ needs.select.outputs.full }}')
+      expect(step.env.ONLY).toBe('$' + '{{ inputs.only }}')
+      expect(run().status).toBe(0)
+      for (const status of ['failure', 'cancelled', 'skipped']) {
+        if (id === 'verdict') {
+          for (const name of job.needs) {
+            const results = { ...successful, [name]: { result: status } }
+            const result = run({ RESULTS: JSON.stringify(results) })
+            expect(result.status).toBe(1)
+            expect(result.stderr).toContain(`${name}: ${status}`)
+          }
+        } else {
+          expect(run({ PRODUCED: status }).status).toBe(1)
+          expect(run({ RECHECKED: status }).status).toBe(1)
+        }
+      }
+    }
+  })
+
+  test('requires both share profiles and every relocated telemetry verdict with explicit partial failures', () => {
     const workflow = fs.readFileSync('.github/workflows/memory-gates.yml', 'utf8')
     const jobs = {}
     let current
@@ -518,9 +578,7 @@ describe('required memory gate composition', () => {
       'telemetry-verdict-controls',
     ]
     expect(jobs.verdict).toContain('needs: [' + required.join(', ') + ']')
-    expect(jobs.verdict).toContain(
-      "if: always() && needs.select.result == 'success' && needs.select.outputs.full == 'true'"
-    )
+    expect(jobs.verdict).toContain("    if: always() && needs.select.result == 'success'\n")
     expect(jobs.verdict).toContain("job.result !== 'success'")
     expect(jobs['share-soak']).toContain('profile: short, jobMinutes: 55, parentMinutes: 35')
     expect(jobs['share-soak']).toContain('profile: full, jobMinutes: 71, parentMinutes: 51')

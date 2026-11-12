@@ -1444,12 +1444,10 @@ describe('broker telemetry fixture', () => {
       ).toBe(expected)
     }
     expect(workflow.jobs['share-soak-verdict'].if).toBe(
-      "always() && needs.select.result == 'success' && contains(fromJSON(needs.select.outputs.jobs), 'share-soak-verdict')"
+      "always() && needs.select.result == 'success'"
     )
-    expect(workflow.jobs.verdict.if).toBe(
-      "always() && needs.select.result == 'success' && needs.select.outputs.full == 'true'"
-    )
-    expect(workflow.jobs['share-soak-verdict'].steps[0].run).toBe(
+    expect(workflow.jobs.verdict.if).toBe("always() && needs.select.result == 'success'")
+    expect(workflow.jobs['share-soak-verdict'].steps[0].run).toContain(
       'test "$PRODUCED" = success && test "$RECHECKED" = success'
     )
     expect(JSON.stringify(workflow.jobs.verdict)).toContain("job.result !== 'success'")
@@ -1664,7 +1662,7 @@ describe('broker telemetry fixture', () => {
     expect(JSON.stringify(soak)).not.toContain('forceExit')
   })
 
-  test('selects exact memory job ids and share dependencies without a full verdict on partial dispatches', () => {
+  test('selects exact memory job ids and share dependencies while running both verdicts on partial dispatches', () => {
     const workflow = require('js-yaml').load(read('.github/workflows/memory-gates.yml').toString())
     expect(workflow.on.workflow_dispatch.inputs.only).toEqual(
       expect.objectContaining({ type: 'string', required: false, default: '' })
@@ -1726,22 +1724,25 @@ describe('broker telemetry fixture', () => {
       all.filter((id) => id !== 'telemetry-long-window')
     )
     const share = ['unit', 'share-soak', 'share-soak-verify', 'share-soak-verdict']
+    const verdicts = ['share-soak-verdict', 'verdict']
+    const withVerdicts = (ids) => all.filter((id) => ids.includes(id) || verdicts.includes(id))
     for (const id of all.filter((id) => id !== 'verdict')) {
       const outputs = select(id)
       expect(outputs.full).toBe('false')
-      expect(runnable(outputs)).toEqual(id.startsWith('share-soak') ? share : [id])
+      expect(runnable(outputs)).toEqual(withVerdicts(id.startsWith('share-soak') ? share : [id]))
     }
-    expect(runnable(select(' resources, telemetry-verdicts,resources '))).toEqual([
-      'resources',
-      'telemetry-verdicts',
-    ])
-    expect(runnable(select('share-soak,telemetry-long-window'))).toEqual([
-      ...share,
-      'telemetry-long-window',
-    ])
-    expect(runnable(select('telemetry-long-window'), 'pull_request')).toEqual([])
-    expect(runnable(select('verdict'))).toEqual([])
-    for (const input of [' ', ',']) expect(runnable(select(input))).not.toContain('verdict')
+    expect(runnable(select(' resources, telemetry-verdicts,resources '))).toEqual(
+      withVerdicts(['resources', 'telemetry-verdicts'])
+    )
+    expect(runnable(select('share-soak,telemetry-long-window'))).toEqual(
+      withVerdicts([...share, 'telemetry-long-window'])
+    )
+    expect(runnable(select('telemetry-long-window'), 'pull_request')).toEqual(verdicts)
+    expect(runnable(select('verdict'))).toEqual(verdicts)
+    for (const input of [' ', ',']) {
+      expect(select(input).full).toBe('false')
+      expect(runnable(select(input))).toEqual(all)
+    }
     for (const input of ['soak', 'share-soak-extra', 'resources,unknown', 'select'])
       expect(() => select(input)).toThrow(/Unknown job/)
     for (const id of ['share-soak-verify', 'share-soak-verdict', 'verdict']) {
