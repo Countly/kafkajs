@@ -104,9 +104,7 @@ describe('weekly matrix', () => {
   })
 
   test('sets timeout-minutes', () => {
-    expect(Number.isInteger(job['timeout-minutes'])).toBe(true)
-    expect(job['timeout-minutes']).toBeGreaterThanOrEqual(1)
-    expect(job['timeout-minutes']).toBeLessThanOrEqual(360)
+    expect(job['timeout-minutes']).toBe(expr('matrix.timeout || 20'))
   })
 
   test('drops a combination only when every key of an exclude entry matches', () => {

@@ -1,6 +1,7 @@
 const fs = require('node:fs')
 const path = require('node:path')
 const yaml = require('js-yaml')
+const { integrationPlan } = require('../integrationPlan')
 
 const WORKFLOWS_DIR = path.join(__dirname, '..', '..', '..', '.github', 'workflows')
 const LOCAL_PREFIX = './.github/workflows/'
@@ -61,6 +62,19 @@ describe('workflow job timeouts', () => {
 
     expect(files.length).toBeGreaterThan(0)
     expect(missing).toEqual([])
+  })
+
+  test('weekly integration uses the CI timeout expression and shared-group overrides', () => {
+    const ci = workflows['ci.yml'].jobs.integration
+    const weekly = workflows['weekly.yml'].jobs.integration
+    const matrix = weekly.strategy.matrix
+    const overrides = integrationPlan('push').include.filter(
+      (row) => matrix.group.includes(row.group) && row.timeout !== undefined
+    )
+
+    expect(ci['timeout-minutes']).toBe(`\${{ matrix.timeout || 20 }}`)
+    expect(weekly['timeout-minutes']).toBe(ci['timeout-minutes'])
+    expect(matrix.include ?? []).toEqual(overrides)
   })
 
   test('a reusable-workflow caller job is exempt and its callee is checked', () => {
