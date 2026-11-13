@@ -598,8 +598,8 @@ describe('share allocation sampling', () => {
       finishSeal()
       await expect(opening).resolves.toBe(claim)
       expect(allocation.report()).toMatchObject({
-        complete: true,
-        stages: [{ stage: 'reopen', tick: 6 }],
+        errors: [],
+        stages: [{ stage: 'reopen', tick: 6, workCompleted: true }],
       })
     } finally {
       finishSeal()

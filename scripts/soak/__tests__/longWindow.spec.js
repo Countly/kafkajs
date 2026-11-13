@@ -1144,7 +1144,14 @@ describe('five-minute reporter capacity', () => {
     })
     const receipt = reporter.prepare()
     expect(receipt.sinkBytes).toBe(5242880)
-    expect(receipt.sinkBytes).toBeGreaterThanOrEqual(3649091 * 1.25)
+    expect(receipt.sinkBudget).toEqual({
+      observedBytes: 2096328,
+      droppedRows: 379,
+      tailRows: 48,
+      requiredBytes: 3845747,
+      margin: 1.25,
+    })
+    expect(receipt.sinkBytes).toBeGreaterThanOrEqual(3845747 * 1.25)
     const prepared = source.replace(
       'MAX_FILE_BYTES = 2L * 1024 * 1024;',
       'MAX_FILE_BYTES = 5242880L;'

@@ -6,6 +6,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 const { execFileSync } = require('node:child_process')
 const { selected, SINK_BYTES, SINK_BUDGET } = require('./longWindow')
+const Churn = require('./churnReporter')
 
 const ROOT = path.resolve(__dirname, '../..')
 const DIRECTORY = '.tmp/telemetry-long-reporter'
@@ -13,28 +14,33 @@ const DEFAULT_CAP = 'MAX_FILE_BYTES = 2L * 1024 * 1024;'
 const sha = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex')
 
 /**
- * Prepares the long diagnostic's reporter outside the timed run. Retained source, jars, decoder
+ * Prepares a bounded long-window or five-minute reporter outside the timed run. Retained source, jars, decoder
  * inputs and Compose bytes stay immutable. Only the reporter's file cap changes; queue overflow,
  * file overflow and every evidence check remain fatal. The derived jar and its source/input hashes
  * are archived, and CI ownership verifies the actual mounted jar against that receipt.
  */
-class LongWindowReporter {
+class BoundedReporter {
   /**
    * @param {object} [options] CI environment and bounded compiler seam
    * @param {string} [options.directory] fresh absolute output directory
-   * @param {object} [options.env] environment selecting the long diagnostic and pinned Java cache
+   * @param {object} [options.env] environment selecting one bounded reporter profile and pinned Java cache
    * @param {function(string,string[],object):*} [options.run] synchronous child runner
    */
-  constructor({
-    env = process.env,
-    run = execFileSync,
-    directory = path.join(ROOT, DIRECTORY),
-  } = {}) {
-    assert(env.CI === 'true' && selected(env), 'Long reporter preparation is diagnostic CI-only')
-    assert(['4.2.2', '4.3.1'].includes(env.KAFKA_VERSION), 'Unsupported long reporter line')
+  constructor({ env = process.env, run = execFileSync, directory } = {}) {
+    const long = selected(env)
+    const churn = env.TELEMETRY_CHURN_REPORTER === '1'
+    assert(
+      env.CI === 'true' && long !== churn,
+      'Bounded reporter preparation is diagnostic CI-only with exactly one profile'
+    )
+    this.diagnostic = long
+    this.sinkBytes = long ? SINK_BYTES : Churn.SINK_BYTES
+    this.sinkBudget = long ? SINK_BUDGET : Churn.SINK_BUDGET
+    directory ??= path.join(ROOT, long ? DIRECTORY : Churn.DIRECTORY)
+    assert(['4.2.2', '4.3.1'].includes(env.KAFKA_VERSION), 'Unsupported bounded reporter line')
     this.env = env
     this.run = run
-    assert(path.isAbsolute(directory), 'Long reporter directory must be absolute')
+    assert(path.isAbsolute(directory), 'Bounded reporter directory must be absolute')
     this.directory = directory
     this.jar = path.join(this.directory, 'reporter.jar')
     this.compose = path.join(this.directory, 'compose.json')
@@ -42,12 +48,13 @@ class LongWindowReporter {
 
   /**
    * @param {string} original retained reporter source
-   * @returns {string} the same source with exactly its file cap replaced by the derived long cap
+   * @param {number} [sinkBytes] derived file cap; the frozen long-window cap by default
+   * @returns {string} the same source with exactly its file cap replaced
    * @throws {Error} if the retained cap is missing or appears more than once
    */
-  static source(original) {
+  static source(original, sinkBytes = SINK_BYTES) {
     assert.equal(original.split(DEFAULT_CAP).length, 2, 'Unexpected reporter file cap')
-    return original.replace(DEFAULT_CAP, `MAX_FILE_BYTES = ${SINK_BYTES}L;`)
+    return original.replace(DEFAULT_CAP, `MAX_FILE_BYTES = ${sinkBytes}L;`)
   }
 
   /**
@@ -61,7 +68,7 @@ class LongWindowReporter {
       const stat = fs.lstatSync(file)
       assert(stat.isFile() && !stat.isSymbolicLink(), 'Reporter input must be a regular file')
       const bytes = fs.readFileSync(file)
-      assert.equal(sha(bytes), digest, 'Long reporter input identity mismatch')
+      assert.equal(sha(bytes), digest, 'Bounded reporter input identity mismatch')
       return bytes
     }
     const original = read(
@@ -96,7 +103,7 @@ class LongWindowReporter {
     const classes = path.join(this.directory, 'classes')
     fs.mkdirSync(classes)
     const source = path.join(this.directory, 'CountingTelemetryReporter.java')
-    const prepared = LongWindowReporter.source(inputs.original)
+    const prepared = BoundedReporter.source(inputs.original, this.sinkBytes)
     fs.writeFileSync(source, prepared, { flag: 'wx' })
     const run = (command, args) =>
       this.run(command, args, {
@@ -119,11 +126,11 @@ class LongWindowReporter {
     ])
     run('jar', ['--create', '--date=2026-01-01T00:00:00Z', '--file', this.jar, '-C', classes, '.'])
     const receipt = {
-      diagnostic: true,
-      acceptanceEligible: false,
+      diagnostic: this.diagnostic,
+      acceptanceEligible: !this.diagnostic,
       line: this.env.KAFKA_VERSION,
-      sinkBytes: SINK_BYTES,
-      sinkBudget: SINK_BUDGET,
+      sinkBytes: this.sinkBytes,
+      sinkBudget: this.sinkBudget,
       sourceSha256: inputs.sourceSha256,
       preparedSourceSha256: sha(prepared),
       retainedSha256: inputs.retainedSha256,
@@ -159,11 +166,11 @@ class LongWindowReporter {
   read() {
     const inputs = this.inputs()
     const receipt = JSON.parse(fs.readFileSync(path.join(this.directory, 'receipt.json')))
-    assert.equal(receipt.diagnostic, true)
-    assert.equal(receipt.acceptanceEligible, false)
+    assert.equal(receipt.diagnostic, this.diagnostic)
+    assert.equal(receipt.acceptanceEligible, !this.diagnostic)
     assert.equal(receipt.line, this.env.KAFKA_VERSION)
-    assert.equal(receipt.sinkBytes, SINK_BYTES)
-    assert.deepEqual(receipt.sinkBudget, SINK_BUDGET)
+    assert.equal(receipt.sinkBytes, this.sinkBytes)
+    assert.deepEqual(receipt.sinkBudget, this.sinkBudget)
     assert.equal(receipt.sourceSha256, inputs.sourceSha256)
     assert.equal(receipt.retainedSha256, inputs.retainedSha256)
     assert.deepEqual(receipt.dependencies, inputs.dependencies)
@@ -171,7 +178,7 @@ class LongWindowReporter {
       path.join(this.directory, 'CountingTelemetryReporter.java'),
       'utf8'
     )
-    assert.equal(source, LongWindowReporter.source(inputs.original))
+    assert.equal(source, BoundedReporter.source(inputs.original, this.sinkBytes))
     assert.equal(sha(source), receipt.preparedSourceSha256)
     assert.equal(sha(fs.readFileSync(this.jar)), receipt.sha256)
     const { services } = JSON.parse(fs.readFileSync(this.compose))
@@ -191,6 +198,6 @@ class LongWindowReporter {
   }
 }
 
-if (require.main === module) new LongWindowReporter().prepare()
+if (require.main === module) new BoundedReporter().prepare()
 
-module.exports = { LongWindowReporter, DIRECTORY }
+module.exports = { BoundedReporter, LongWindowReporter: BoundedReporter, DIRECTORY }

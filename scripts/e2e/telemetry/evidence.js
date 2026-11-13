@@ -2865,7 +2865,9 @@ const verifyChurnSegments = (record, directory, manifest, archive) => {
       `Segment count of ${kind} differs`
     )
   const sink = new Map(
-    new TelemetryExportReader(path.join(directory, manifest.root))
+    new TelemetryExportReader(path.join(directory, manifest.root), {
+      fileBytes: require('../../soak/churnReporter').SINK_BYTES,
+    })
       .readExports()
       .map((row) => [`${row.node}:${row.seq}`, row])
   )

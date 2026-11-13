@@ -11,6 +11,7 @@
  * Development-only and public-API-only: nothing here reads a private member of the client.
  * `soak.js` injects its `Soak`, `instrument` and verdict so this module never requires it back.
  */
+const { SINK_BYTES: CHURN_SINK_BYTES } = require('./churnReporter')
 const crypto = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
@@ -2267,7 +2268,7 @@ class DecoderCoordinator {
    * @param {DecoderGate} [options.gate] the concurrency limiter, four by default
    * @param {Function} [options.make] builds the observer; a spec supplies a fake
    * @param {function():object[]} [options.exports] reads the broker sink rows
-   * @param {number} [options.sinkBytes] long-window sink cap; omitted for the existing lane
+   * @param {number} [options.sinkBytes] reporter sink cap; the five-minute cap by default
    */
   constructor({
     directory,
@@ -2277,7 +2278,7 @@ class DecoderCoordinator {
     gate = new DecoderGate(DECODER_SLOTS),
     make = (options) => new TelemetryWireObserver(options),
     exports,
-    sinkBytes,
+    sinkBytes = CHURN_SINK_BYTES,
   }) {
     this.exports = exports ?? (() => readExports({ fileBytes: sinkBytes }))
     this.observer = make({
@@ -4777,7 +4778,7 @@ class TelemetryWorkerProcess {
           mode: 'configured',
           decoder: (raw) => this.askDecode(raw),
           completeStream: false,
-          sinkBytes: soak.TELEMETRY.sinkBytes,
+          sinkBytes: soak.TELEMETRY.sinkBytes ?? CHURN_SINK_BYTES,
           consumed: new Set(),
         },
       })

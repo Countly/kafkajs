@@ -74,6 +74,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Tooling
 
+- Give every five-minute churn job a verified 5 MiB derived reporter sink, retaining fatal overflow checks and the unchanged long-window reporter; release the disabled share diagnostic's disconnected confirmation fences so its original corpus resumes, and profile enabled confirmation reconnects.
 - Apply all 35 five-minute telemetry subscription transitions in disconnected batches before the next handshake, retain the error-42-only contract and socket retirement slots, and use eight public reopen cycles within the unchanged segment cap; the long-window method is unchanged.
 - Idle the share consumer's five-minute telemetry-disabled control for 10 seconds before C0, retaining 2 seconds for other kinds, the 2-second validator minimum and both drift limits.
 - Warm the five-minute telemetry-disabled control catalogue and idle window before C0, validate its separate outcomes and timing, and retain both drift limits and the frozen long-window method.

@@ -266,7 +266,7 @@ class SharePeak {
   }
 }
 
-/** Brackets enabled diagnostic operations, joining each reopen's asynchronous seal before stop. */
+/** Profiles explicit reopens or confirmation reconnects, joining any pending seal before stop. */
 class ProfiledShareWorker extends TelemetryWorker {
   /**
    * @param {object} command original parent lifecycle command
@@ -274,11 +274,32 @@ class ProfiledShareWorker extends TelemetryWorker {
    * @throws {Error} original reopen, seal or diagnostic profiler failure
    */
   reopen(command) {
-    return this.peak.allocations.capture('reopen', command.tick, async () => {
+    return this.profileReopen(command.tick, () => super.reopen(command))
+  }
+
+  /**
+   * Profiles the reconnect now performed by a disconnected confirmation batch.
+   * @param {object} command original parent confirmation command
+   * @returns {Promise<object>} original confirmation claim
+   * @throws {Error} original confirmation, seal or diagnostic profiler failure
+   */
+  confirm(command) {
+    return command.transitions
+      ? this.profileReopen(command.tick, () => super.confirm(command))
+      : super.confirm(command)
+  }
+
+  /**
+   * @param {number} tick parent lifecycle tick @param {Function} work public reopen or confirmation
+   * @returns {Promise<object>} original claim after the background seal joins the profile
+   * @throws {Error|AggregateError} original operation, seal or diagnostic profiler failures
+   */
+  profileReopen(tick, work) {
+    return this.peak.allocations.capture('reopen', tick, async () => {
       let claim
       const errors = []
       try {
-        claim = await super.reopen(command)
+        claim = await work()
       } catch (error) {
         errors.push(error)
       }
@@ -372,11 +393,29 @@ class DisabledShareWorker extends TelemetryWorker {
     this.claims.retirements.push({ tick: command.tick, telemetry: false })
   }
 
-  /** @param {object} command original tick @returns {Promise<void>} keeps descriptor replacement */
+  /**
+   * Releases the parent's disconnected fence, then resumes ordinary work and replaces descriptors.
+   * @param {object} command original tick @returns {Promise<void>} after reconnect and replacement
+   * @throws {Error} for a missing fence or a failed reconnect/resume
+   */
   async confirm(command) {
     if (this.confirmation?.tick !== command.tick)
       throw new Error('missing disabled confirmation fence')
+    const fence = this.confirmation
     this.confirmation = null
+    if (fence.cycle) {
+      fence.resume()
+      await within(fence.cycle.reopened, 10000, 'The shareConsumer reconnect')
+      await this.target(() => this.ordinary.resume())
+      this.claims.reopens.push({
+        tick: command.tick,
+        from: fence.cycle.from.id,
+        to: fence.cycle.to.id,
+        observedAt: fence.observedAt,
+        closedAt: fence.closedAt,
+        pause: fence.pause,
+      })
+    }
     const replacement = this.registry.replace(command.tick)
     this.claims.transitions.push({ tick: command.tick, replacement, telemetry: false })
   }

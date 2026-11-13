@@ -7736,7 +7736,7 @@ const buildTelemetryChurn = ({ brokers: requested, phases, record }) => {
       directory,
       line,
       clock,
-      sinkBytes: ACTIVE_TELEMETRY.sinkBytes,
+      sinkBytes: ACTIVE_TELEMETRY.sinkBytes ?? require('./churnReporter').SINK_BYTES,
     }),
     record: record ?? ((row) => writeEvidence('telemetry-churn', row)),
     clock,

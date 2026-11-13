@@ -494,7 +494,7 @@ jobs:
     needs: [select]
     if: contains(fromJSON(needs.select.outputs.jobs), 'telemetry-soak')
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
@@ -510,6 +510,7 @@ jobs:
       TELEMETRY_INTEROP_CACHE: ${{ github.workspace }}/.tmp/telemetry-interop
       TELEMETRY_EVIDENCE_DIR: ${{ github.workspace }}/.tmp/telemetry-evidence
       KAFKAJS_LANE: docker
+      TELEMETRY_CHURN_REPORTER: '1'
     steps:
       - uses: actions/checkout@v4
         timeout-minutes: 1
@@ -536,6 +537,9 @@ jobs:
           timeout -k 5s 180s bash scripts/e2e/telemetry/fetch.sh
           timeout -k 5s 30s bash scripts/e2e/telemetry/run.sh verify "$KAFKA_VERSION"
           timeout -k 5s 60s node scripts/e2e/telemetry/prepareDecoder.js
+      - name: Prepare the bounded five-minute reporter
+        timeout-minutes: 4
+        run: timeout -k 5s 210s node scripts/soak/churnReporter.js
       - name: Preflight isolated project ownership
         timeout-minutes: 2
         run: timeout -k 5s 90s node scripts/e2e/telemetry/ci.js preflight
@@ -545,7 +549,7 @@ jobs:
       - name: Start and warm the owned telemetry cluster
         timeout-minutes: 6
         run: |
-          timeout -k 5s 90s docker compose -f "$COMPOSE_FILE" up -d --pull never
+          timeout -k 5s 90s docker compose -f "$COMPOSE_FILE" -f .tmp/telemetry-churn-reporter/compose.json up -d --pull never
           timeout -k 5s 240s node scripts/waitForKafka.js
       - name: Verify mounted reporter and capture broker identities
         timeout-minutes: 3
@@ -587,6 +591,7 @@ jobs:
           path: |
             .tmp/e2e/
             .tmp/telemetry-evidence/
+            .tmp/telemetry-churn-reporter/
             .tmp/telemetry-cache/decoder-*.jsa.json
           if-no-files-found: error
           include-hidden-files: true
@@ -594,7 +599,7 @@ jobs:
     needs: [select]
     if: contains(fromJSON(needs.select.outputs.jobs), 'telemetry-seeded-control')
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
@@ -609,6 +614,7 @@ jobs:
       TELEMETRY_INTEROP_CACHE: ${{ github.workspace }}/.tmp/telemetry-interop
       TELEMETRY_EVIDENCE_DIR: ${{ github.workspace }}/.tmp/telemetry-seeded
       KAFKAJS_LANE: docker
+      TELEMETRY_CHURN_REPORTER: '1'
     steps:
       - uses: actions/checkout@v4
         timeout-minutes: 1
@@ -635,6 +641,9 @@ jobs:
           timeout -k 5s 180s bash scripts/e2e/telemetry/fetch.sh
           timeout -k 5s 30s bash scripts/e2e/telemetry/run.sh verify "$KAFKA_VERSION"
           timeout -k 5s 60s node scripts/e2e/telemetry/prepareDecoder.js
+      - name: Prepare the bounded five-minute reporter
+        timeout-minutes: 4
+        run: timeout -k 5s 210s node scripts/soak/churnReporter.js
       - name: Preflight isolated project ownership
         timeout-minutes: 2
         run: timeout -k 5s 90s node scripts/e2e/telemetry/ci.js preflight
@@ -644,7 +653,7 @@ jobs:
       - name: Start and warm the owned telemetry cluster
         timeout-minutes: 6
         run: |
-          timeout -k 5s 90s docker compose -f "$COMPOSE_FILE" up -d --pull never
+          timeout -k 5s 90s docker compose -f "$COMPOSE_FILE" -f .tmp/telemetry-churn-reporter/compose.json up -d --pull never
           timeout -k 5s 240s node scripts/waitForKafka.js
       - name: Verify mounted reporter and capture broker identities
         timeout-minutes: 3
@@ -672,6 +681,7 @@ jobs:
           path: |
             .tmp/e2e/
             .tmp/telemetry-seeded/
+            .tmp/telemetry-churn-reporter/
             .tmp/telemetry-cache/decoder-*.jsa.json
           if-no-files-found: error
           include-hidden-files: true
@@ -679,7 +689,7 @@ jobs:
     needs: [select]
     if: contains(fromJSON(needs.select.outputs.jobs), 'live-owner-census')
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 65
     strategy:
       fail-fast: false
       matrix:
@@ -696,6 +706,7 @@ jobs:
       TELEMETRY_INTEROP_CACHE: ${{ github.workspace }}/.tmp/telemetry-interop
       TELEMETRY_EVIDENCE_DIR: ${{ github.workspace }}/.tmp/telemetry-evidence
       KAFKAJS_LANE: docker
+      TELEMETRY_CHURN_REPORTER: '1'
       LIVE_CENSUS_ROOT: ${{ github.workspace }}/.tmp/live-census
     steps:
       - uses: actions/checkout@v4
@@ -723,6 +734,9 @@ jobs:
           timeout -k 5s 180s bash scripts/e2e/telemetry/fetch.sh
           timeout -k 5s 30s bash scripts/e2e/telemetry/run.sh verify "$KAFKA_VERSION"
           timeout -k 5s 60s node scripts/e2e/telemetry/prepareDecoder.js
+      - name: Prepare the bounded five-minute reporter
+        timeout-minutes: 4
+        run: timeout -k 5s 210s node scripts/soak/churnReporter.js
       - name: Preflight isolated project ownership
         timeout-minutes: 2
         run: timeout -k 5s 90s node scripts/e2e/telemetry/ci.js preflight
@@ -732,7 +746,7 @@ jobs:
       - name: Start and warm the owned telemetry cluster
         timeout-minutes: 6
         run: |
-          timeout -k 5s 90s docker compose -f "$COMPOSE_FILE" up -d --pull never
+          timeout -k 5s 90s docker compose -f "$COMPOSE_FILE" -f .tmp/telemetry-churn-reporter/compose.json up -d --pull never
           timeout -k 5s 240s node scripts/waitForKafka.js
       - name: Verify mounted reporter and capture broker identities
         timeout-minutes: 3
@@ -762,6 +776,7 @@ jobs:
             .tmp/live-census/
             .tmp/e2e/
             .tmp/telemetry-evidence/
+            .tmp/telemetry-churn-reporter/
             .tmp/telemetry-cache/decoder-*.jsa.json
           if-no-files-found: error
           include-hidden-files: true
@@ -786,6 +801,7 @@ jobs:
       TELEMETRY_INTEROP_CACHE: ${{ github.workspace }}/.tmp/telemetry-interop
       TELEMETRY_EVIDENCE_DIR: ${{ github.workspace }}/.tmp/telemetry-evidence
       KAFKAJS_LANE: docker
+      TELEMETRY_CHURN_REPORTER: '1'
       SHARE_PEAK_ROOT: ${{ github.workspace }}/.tmp/share-peak
       SHARE_PEAK_ARM: ${{ matrix.arm }}
     steps:
@@ -814,6 +830,9 @@ jobs:
           timeout -k 5s 180s bash scripts/e2e/telemetry/fetch.sh
           timeout -k 5s 30s bash scripts/e2e/telemetry/run.sh verify "$KAFKA_VERSION"
           timeout -k 5s 60s node scripts/e2e/telemetry/prepareDecoder.js
+      - name: Prepare the bounded five-minute reporter
+        timeout-minutes: 4
+        run: timeout -k 5s 210s node scripts/soak/churnReporter.js
       - name: Preflight isolated project ownership
         timeout-minutes: 2
         run: timeout -k 5s 90s node scripts/e2e/telemetry/ci.js preflight
@@ -823,7 +842,7 @@ jobs:
       - name: Start and warm the owned telemetry cluster
         timeout-minutes: 6
         run: |
-          timeout -k 5s 90s docker compose -f "$COMPOSE_FILE" up -d --pull never
+          timeout -k 5s 90s docker compose -f "$COMPOSE_FILE" -f .tmp/telemetry-churn-reporter/compose.json up -d --pull never
           timeout -k 5s 240s node scripts/waitForKafka.js
       - name: Verify mounted reporter and capture broker identities
         timeout-minutes: 3
@@ -848,6 +867,7 @@ jobs:
             .tmp/share-peak/
             .tmp/e2e/
             .tmp/telemetry-evidence/
+            .tmp/telemetry-churn-reporter/
             .tmp/telemetry-cache/decoder-*.jsa.json
           if-no-files-found: error
           include-hidden-files: true
