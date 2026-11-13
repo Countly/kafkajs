@@ -7197,16 +7197,50 @@ describe('telemetry resident-size reference', () => {
     expect(JSON.stringify(replay)).toBe(original)
   })
 
-  test('records a peak counter below an earlier resident size and judges the larger reading', () => {
+  test('records a peak counter read just below its own resident size and judges the larger reading', () => {
     const input = make()
-    const { hwm } = input.baseline.memory
-    input.baseline.memory.rss = hwm + 52 * 1024
+    const { hwm } = input.teardown.memory
+    input.teardown.memory.rss = hwm + 52 * 1024
+    input.reference.final.hwm = hwm + 52 * 1024
     const verdict = evaluate(input)
     expect(verdict).toMatchObject({ ok: true, outcome: 'passed', violations: [], inconclusive: [] })
     expect(verdict.measured.peakCoverage).toEqual([
-      { index: 5, phase: 'settled', hwm, covered: hwm + 52 * 1024, shortfall: 52 * 1024 },
+      expect.objectContaining({
+        phase: 'settled',
+        hwm,
+        covered: hwm + 52 * 1024,
+        shortfall: 52 * 1024,
+      }),
     ])
     expect(verdict.measured.peak).toBeGreaterThanOrEqual(hwm + 52 * 1024)
+  })
+
+  test.each([
+    [
+      'a peak counter below an earlier resident size',
+      (input) => {
+        input.baseline.memory.rss = 85 * MIB
+      },
+    ],
+    [
+      'a zero peak counter',
+      (input) => {
+        for (const reading of [
+          ...Object.values(input.reference).filter((r) => r && typeof r === 'object' && 'hwm' in r),
+          input.reference.control.c0,
+          input.reference.control.c1,
+          input.reference.control.released,
+          input.baseline.memory,
+          ...input.samples.map((sample) => sample.snapshot.memory),
+          input.teardown.memory,
+        ])
+          reading.hwm = 0
+      },
+    ],
+  ])('fails the peak series for %s', (_name, change) => {
+    const input = make()
+    change(input)
+    expect(evaluate(input).violations).toContain('resident-size peak series')
   })
 
   test('preserves setup, delta and absolute limits after a peak decrease', () => {

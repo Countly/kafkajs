@@ -530,9 +530,9 @@ class TelemetryResourceVerdict {
    * of the versioned catalogue, a completed control warm-up before c0, and the native work journal,
    * which must hold at least one resolved production compression. Failures are pushed into
    * `violations`; what only makes the measurement
-   * uninformative is returned. Approximate peak-counter decreases, and a peak counter read below an
-   * earlier resident size, are recorded in `measured` without invalidating the series or lowering
-   * its all-read maxima.
+   * uninformative is returned. Approximate peak-counter decreases, and a peak counter read just below
+   * its own reading's resident size, are recorded in `measured` without invalidating the series or
+   * lowering its all-read maxima; a peak counter below any earlier reading's resident size fails.
    * @param {object} reference the replayable reference facts
    * @param {object} run `baseline`, `samples`, `teardown`, `violations` to append to and `measured`
    * @returns {string[]} the reasons the measurement is inconclusive
@@ -600,18 +600,22 @@ class TelemetryResourceVerdict {
       inconclusive.push('resident-size peak capability')
     } else {
       const peakCoverage = []
-      let covered = -Infinity
+      const seen = new Set()
+      let earlier = -Infinity
       readings.forEach((reading, index) => {
-        covered = Math.max(covered, reading.rss)
-        const last = peakCoverage.at(-1)
-        if (reading.hwm < covered && !(last?.hwm === reading.hwm && last.covered === covered))
+        fail(reading.hwm >= earlier, 'resident-size peak series')
+        const key = `${reading.hwm}:${reading.rss}`
+        if (reading.hwm < reading.rss && !seen.has(key)) {
+          seen.add(key)
           peakCoverage.push({
             index,
             phase: reading.phase,
             hwm: reading.hwm,
-            covered,
-            shortfall: covered - reading.hwm,
+            covered: reading.rss,
+            shortfall: reading.rss - reading.hwm,
           })
+        }
+        earlier = Math.max(earlier, reading.rss)
       })
       if (peakCoverage.length) measured.peakCoverage = peakCoverage
     }

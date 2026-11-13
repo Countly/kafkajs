@@ -447,7 +447,9 @@ written before any assertion, and the job uploads the directory even when a step
 
 Telemetry memory is judged as an increment over the disabled control, never as an absolute number. The
 control is read twice (C0 after its first public open and C1 after its last, both connected and idle) after a
-real collection, a 100 ms pause, a second collection and the callbacks of both. Let B be the lower of the two
+real collection, a 100 ms pause, a second collection and the callbacks of both. C0 and C1 may take up to
+twelve collection rounds to settle within 16 KiB; every other reading keeps six, and an unsettled control
+reading stays inconclusive. Let B be the lower of the two
 RSS readings and Eref the lower of the two external readings. The absolute peak is the kernel's nonresetting
 high water of the child, `/proc/self/status` `VmHWM`, read before the first import and at every phase
 boundary through cleanup; the raw `maxRSS` is recorded beside it and never substituted for it or subtracted.
@@ -574,7 +576,10 @@ reason for a second delivery, no accepted record is delivered again, and at each
 handled prefix is accepted and the rest released.
 
 Memory is judged per worker against its own telemetry-disabled control of the same kind in the same
-process: the telemetry-attributable resident-size peak is at most 64 MiB above the control, the control
+process. In this five-minute lane the control first runs its catalogue and idle window once before C0,
+so first-use compilation precedes both control readings; the validator requires that warm-up to be
+complete, fulfilled and earlier than C0. The long-window lane keeps its frozen control without it.
+The telemetry-attributable resident-size peak is at most 64 MiB above the control, the control
 and setup peak at most 96 MiB for producer, consumer and admin. The share consumer's live setup
 allowance is 96 MiB plus its declared journal bytes: 100,663,296 + 23,192,560 = 123,855,856 bytes.
 Its packed journals preserve raw digests and exact int64 offsets losslessly. All journal storage,

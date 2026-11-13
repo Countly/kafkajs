@@ -462,6 +462,8 @@ describe('telemetry resource documentation', () => {
     expect(testing).toContain('closed data below −256 KiB is recorded as facts')
     expect(testing).toContain('the five-minute lane no longer judges a closed ceiling')
     expect(testing).not.toContain('below −256 KiB is inconclusive')
+    expect(testing).toContain('may take up to twelve collection rounds')
+    expect(testing).toContain('first runs its catalogue and idle window once before C0')
     expect(testing).toContain('legacy unseeded arm is a contamination-positive control')
     expect(testing).toContain('live-flags control')
     expect(testing).toContain('23,192,560')
