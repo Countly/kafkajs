@@ -108,7 +108,13 @@ const NATIVE_ROWS = 1024
 /** Engine code readings one worker journals: every settled reading of a run, with room. */
 const ENGINE_ROWS = 64
 /** Default telemetry worker flags, also reused by broker-free controls. */
-const WORKER_FLAGS = Object.freeze(['--expose-gc'])
+const WORKER_FLAGS = Object.freeze([
+  '--expose-gc',
+  '--no-lazy',
+  '--no-lazy-feedback-allocation',
+  '--min-semi-space-size=1',
+  '--max-semi-space-size=1',
+])
 
 /**
  * The proved worst-case encoded bytes of each share row in the `share-packed-1` layout, rounded up
