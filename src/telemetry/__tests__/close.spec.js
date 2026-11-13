@@ -183,6 +183,43 @@ describe.each([false, true])('captured close with enforcement %s', (enforceReque
       60000
     )
 
+    test.each([20, 1000])(
+      'a close waiting for the periodic codec keeps its %s ms deadline',
+      async (timeout) => {
+        const round = new PublicTelemetryRound(cell)
+        const gate = round.hold('S12', { mode: 'normal' })
+        try {
+          await round.start({
+            points: 'large',
+            subscription: { acceptedCompressionTypes: [1, 0] },
+          })
+          await round.ready()
+          const before = round.capture()
+          round.arm()
+          round.tick()
+          await round.wait(() => gate.arrived())
+          round.beginClose(round.closeOptions(timeout))
+          expect(round.machine.closing.deadline).toBe(round.closeEntry + timeout)
+          round.clock.jump(round.closeEntry + timeout)
+          await round.deliverCloseWatchdog()
+          await round.settleClose()
+          expect(round.codecJobs[0].settled).toBe(false)
+          expect(round.finalFrames()).toEqual([])
+          expect(round.machine.closing.handle).toBeNull()
+          expect(round.openDedicated()).toEqual([])
+          await round.drainReleased(gate)
+          expect(round.codecJobs[0].settled).toBe(true)
+          expect(round.finalFrames()).toEqual([])
+          expect(round.pushes()).toHaveLength(1)
+          expect(round.newSetupCallsSince(before)).toEqual([])
+          expect(round.unhandled).toEqual([])
+        } finally {
+          await round.dispose()
+        }
+      },
+      60000
+    )
+
     test('C03 zero budget never starts a final', async () => {
       const round = new PublicTelemetryRound(cell)
       try {

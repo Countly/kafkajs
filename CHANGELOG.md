@@ -157,6 +157,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Fixes
 
+- Preserve the final terminating telemetry push when disconnect races a periodic compression job, while retaining the original close deadline and single-job bound.
 - Custom telemetry metrics serialize each registered identity once and reuse it as the series key, so a client no longer retains a second copy of every custom metric identity string (about 370 KiB for 128 maximum-size descriptors).
 - Initialize the request queue's timeout handle in its constructor, so clearing it later no longer changes the queue's object layout and slows coalesced frame decoding (about 7% against master in the frame benchmark).
 - Release completed request scopes from connection ordering tails on settlement and generation close, and drop cleared request-timeout interval handles. Preserve request order and reconnect fencing.

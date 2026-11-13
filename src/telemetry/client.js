@@ -723,6 +723,8 @@ module.exports = class ClientTelemetry {
         if (!snapshot) return
         this.payload.resetTransport(this.transportRevision)
         const work = async () => {
+          await this.payload.waitForIdle()
+          if (!current()) return
           const payload = await this.payload.buildPayload(snapshot, {
             telemetryMaxBytes: this.maxBytes,
             brokerMaxBytes: subscription.telemetryMaxBytes,

@@ -464,7 +464,6 @@ const manifestOf =
       action === RELEASE_ACTIONS[2] &&
       mode === 'normal' &&
       (boundary !== 'S18' || options.position === 'result') &&
-      boundary !== 'S12' &&
       !RENEWAL_BOUNDARIES.includes(boundary)
     )
       expected.push(frame('F', 1n))

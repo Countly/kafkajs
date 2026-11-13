@@ -59,6 +59,15 @@ class TelemetryPayload {
     this.#suppressed.clear()
   }
 
+  /** Waits for the occupied codec slot; retirement keeps it until native work settles.
+   * @returns {Promise<void>} no retry or new job; a prior job failure does not fail the caller
+   */
+  async waitForIdle() {
+    try {
+      await this.#job?.completion
+    } catch {}
+  }
+
   /** Invalidates current authority without releasing an outstanding native-job slot early.
    * @returns {void} stale completion cannot suppress a replacement transport's codec
    */
@@ -197,7 +206,8 @@ class TelemetryPayload {
     this.#job = job
     try {
       if (!this.#current(job)) return null
-      await this.#compress(job)
+      job.completion = this.#compress(job)
+      await job.completion
       if (!this.#current(job)) return null
       return {
         metrics: job.metrics,
