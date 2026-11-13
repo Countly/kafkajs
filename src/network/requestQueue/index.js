@@ -69,6 +69,9 @@ module.exports = class RequestQueue extends EventEmitter {
      */
     this.throttledUntil = -1
 
+    /** @type {null|NodeJS.Timeout} Request-timeout handle, present even when checks are disabled. */
+    this.requestTimeoutIntervalId = null
+
     /**
      * Timeout id if we have scheduled a check for pending requests due to client-side throttling
      *
