@@ -195,6 +195,62 @@ describe('share peak attribution', () => {
     expect(worker.segments.cycle).toHaveBeenCalledWith(client, { timeout: 3000 })
   })
 
+  test('releases all eight disabled share confirmation fences and resumes corpus handling', async () => {
+    let connected = true
+    let paused = false
+    let handled = 0
+    let current = { id: 's1', observer: { checkpoint: () => 0 } }
+    const client = {}
+    const worker = new DisabledShareWorker({
+      kind: 'shareConsumer',
+      client,
+      clock: { now: () => 10 },
+      limits: TELEMETRY,
+      segments: {
+        current: () => current,
+        cycle: (client, options, between) => {
+          const from = current
+          current = { id: `s${Number(from.id.slice(1)) + 1}`, observer: { checkpoint: () => 0 } }
+          const closed = Promise.resolve().then(() => {
+            connected = false
+          })
+          const reopened = closed.then(between).then(() => {
+            connected = true
+          })
+          return { from, to: current, closed, reopened }
+        },
+      },
+      ordinary: {
+        pause: async () => {
+          paused = true
+          return { pausedAt: 10 }
+        },
+        resume: async () => {
+          expect(connected).toBe(true)
+          paused = false
+          handled += 100
+        },
+      },
+      registry: { replace: (tick) => ({ tick }) },
+      send: () => {},
+    })
+    worker.drain = () => {}
+    for (let tick = 0; tick < 8; tick++) {
+      const command = { tick, index: tick + 1, selection: '*', transitions: [tick + 1] }
+      await worker.fenceConfirmation(command)
+      expect(connected).toBe(false)
+      expect(paused).toBe(true)
+      expect(handled).toBe(tick * 100)
+      await worker.confirm(command)
+      expect(connected).toBe(true)
+      expect(paused).toBe(false)
+      expect(handled).toBe((tick + 1) * 100)
+    }
+    expect(worker.claims.reopens).toHaveLength(8)
+    expect(worker.claims.transitions).toHaveLength(8)
+    expect(worker.claims.reopens.at(-1)).toMatchObject({ tick: 7, from: 's8', to: 's9' })
+  })
+
   test('marks exported verdict inputs only while a share peak recorder is active', async () => {
     const snapshot = { journals: { byteLength: 4096, cursor: 0 } }
     const run = {

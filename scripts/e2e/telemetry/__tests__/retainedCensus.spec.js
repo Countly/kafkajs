@@ -220,3 +220,25 @@ test('shared cyclic audits preserve every root target and trace without repeated
   expect(rows[2].table).not.toBe(rows[0].table)
   expect(prepared.tables).toHaveLength(2)
 })
+
+test('live census checkpoints follow the sample grid through eight public churn reopens', () => {
+  const { TELEMETRY } = require('../../../soak/soak')
+  const { TelemetrySchedule } = require('../../../soak/telemetryChurn')
+  const schedule = new TelemetrySchedule(TELEMETRY)
+  const captures = []
+  const census = new LiveCensus({
+    sampleAt: TELEMETRY.sampleAt,
+    capture: (name) => captures.push(name),
+  })
+  const snapshot = { memory: { heapUsed: 8, external: 4 }, journals: {} }
+  census.observe({ kind: 'baseline', snapshot })
+  const reopens = schedule.ticks.filter((tick) => tick.actions.includes('reopen'))
+  expect(reopens).toHaveLength(8)
+  for (const tick of reopens) census.observe({ kind: 'reopen', at: tick.at, snapshot })
+  for (const admittedPhaseMs of TELEMETRY.sampleAt)
+    census.observe({ kind: 'sample', admittedPhaseMs, snapshot })
+  expect(census.complete()).toBe(false)
+  census.observe({ kind: 'teardown', snapshot })
+  expect(captures).toEqual(['M', 'first', 'last', 'closed'])
+  expect(census.complete()).toBe(true)
+})

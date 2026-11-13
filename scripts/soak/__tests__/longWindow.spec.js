@@ -1111,3 +1111,213 @@ describe('long-window worker', () => {
     expect(base.shadow).not.toHaveProperty('heapSpaces')
   })
 })
+
+describe('five-minute reporter capacity', () => {
+  let directory
+  beforeEach(() => {
+    directory = fs.mkdtempSync(path.join(os.tmpdir(), 'churn-sink-'))
+  })
+  afterEach(() => fs.rmSync(directory, { recursive: true, force: true }))
+
+  test('prepares a five MiB sink with authenticated source jar and compose receipts', () => {
+    const { LongWindowReporter } = jest.requireActual('../longWindowReporter')
+    const source = fs.readFileSync(
+      path.join(__dirname, '../../e2e/telemetry/CountingTelemetryReporter.java'),
+      'utf8'
+    )
+    const env = { CI: 'true', TELEMETRY_CHURN_REPORTER: '1', KAFKA_VERSION: '4.3.1' }
+    const output = path.join(directory, 'prepared')
+    const reporter = new LongWindowReporter({
+      env,
+      directory: output,
+      run: (command, args) => {
+        if (command === 'jar' && args.includes('--create'))
+          fs.writeFileSync(path.join(output, 'reporter.jar'), 'compiled')
+      },
+    })
+    jest.spyOn(reporter, 'inputs').mockReturnValue({
+      original: source,
+      retainedJar: 'retained.jar',
+      dependencies: [],
+      sourceSha256: require('crypto').createHash('sha256').update(source).digest('hex'),
+      retainedSha256: 'b'.repeat(64),
+    })
+    const receipt = reporter.prepare()
+    expect(receipt.sinkBytes).toBe(5242880)
+    expect(receipt.sinkBytes).toBeGreaterThanOrEqual(3649091 * 1.25)
+    const prepared = source.replace(
+      'MAX_FILE_BYTES = 2L * 1024 * 1024;',
+      'MAX_FILE_BYTES = 5242880L;'
+    )
+    expect(fs.readFileSync(path.join(output, 'CountingTelemetryReporter.java'), 'utf8')).toBe(
+      prepared
+    )
+    expect(reporter.read()).toMatchObject({ sha256: receipt.sha256, sinkBytes: 5242880 })
+    for (const [file, bytes] of [
+      ['reporter.jar', 'foreign jar'],
+      ['CountingTelemetryReporter.java', source],
+      ['compose.json', '{}'],
+      ['receipt.json', JSON.stringify({ ...receipt, sinkBytes: 2097152 })],
+    ]) {
+      const target = path.join(output, file)
+      const original = fs.readFileSync(target)
+      fs.writeFileSync(target, bytes)
+      expect(() => reporter.read()).toThrow()
+      fs.writeFileSync(target, original)
+    }
+    expect(() => new LongWindowReporter({ env: { ...env, TELEMETRY_LONG_WINDOW: '1' } })).toThrow()
+  })
+
+  test.each(['telemetry-soak', 'telemetry-seeded-control', 'share-peak', 'live-owner-census'])(
+    'mounts and archives the bounded reporter before %s starts its churn',
+    (name) => {
+      const jobs = require('js-yaml').load(
+        fs.readFileSync(path.join(__dirname, '../../../.github/workflows/memory-gates.yml'), 'utf8')
+      ).jobs
+      const job = jobs[name]
+      expect(job.env.TELEMETRY_CHURN_REPORTER).toBe('1')
+      const prepare = job.steps.findIndex((step) =>
+        step.run?.includes('node scripts/soak/churnReporter.js')
+      )
+      expect(prepare).toBeGreaterThan(-1)
+      expect(job.steps[prepare].if).toBeUndefined()
+      expect(prepare).toBeLessThan(
+        job.steps.findIndex((step) => step.run?.includes('ci.js preflight'))
+      )
+      expect(job.steps.find((step) => step.run?.includes('up -d --pull never')).run).toContain(
+        '-f .tmp/telemetry-churn-reporter/compose.json'
+      )
+      expect(
+        job.steps.find((step) => step.uses === 'actions/upload-artifact@v4').with.path
+      ).toContain('.tmp/telemetry-churn-reporter/')
+      expect(jobs['telemetry-long-window'].env.TELEMETRY_CHURN_REPORTER).toBeUndefined()
+      expect(
+        jobs['telemetry-long-window'].steps.find((step) => step.run?.includes('up -d --pull never'))
+          .run
+      ).toContain('-f .tmp/telemetry-long-reporter/compose.json')
+    }
+  )
+
+  test('checks the churn mounted jar and loaded cap before recording broker provenance', () => {
+    const { LongWindowReporter } = jest.requireActual('../longWindowReporter')
+    const { CiOwnership } = require('../../e2e/telemetry/ci')
+    const expected = { sha256: 'd'.repeat(64), sinkBytes: 5242880, compose: '/churn/compose.json' }
+    const read = jest.spyOn(LongWindowReporter.prototype, 'read').mockReturnValue(expected)
+    let mounted = expected.sha256
+    const manifest = require('../../e2e/telemetry/fixtures/manifest.json')
+    const docker = (args) => {
+      if (args[0] === 'image')
+        return JSON.stringify([{ Id: 'image', RepoDigests: manifest.lines['4.3.1'].repoDigests }])
+      if (args.includes('--version')) return '4.3.1'
+      return args.at(-1).endsWith('reporter.jar') ? mounted : 'a'.repeat(64)
+    }
+    try {
+      const owner = new CiOwnership({
+        env: {
+          CI: 'true',
+          TELEMETRY_CHURN_REPORTER: '1',
+          KAFKA_VERSION: '4.3.1',
+          COMPOSE_PROJECT_NAME: 'telemetry-churn',
+          COMPOSE_FILE: 'docker-compose.telemetry.yml',
+        },
+        docker,
+      })
+      owner.directory = directory
+      owner.read = () => ({ line: '4.3.1' })
+      owner.save = () => {}
+      owner.journal = () =>
+        [1, 2, 3].map((id) => ({
+          Id: String(id),
+          Image: 'image',
+          State: { Running: true },
+          Config: {
+            Labels: {
+              'com.docker.compose.project': 'telemetry-churn',
+              'com.docker.compose.service': `kafka${id}`,
+            },
+          },
+        }))
+      for (const id of [1, 2, 3])
+        fs.writeFileSync(
+          path.join(directory, `reporter-${id}.json`),
+          JSON.stringify({ maxFileBytes: 5242880 })
+        )
+      owner.capture()
+      const receipt = JSON.parse(fs.readFileSync(path.join(directory, 'identity.json')))
+      expect(receipt.churnReporter).toEqual(expected)
+      expect(receipt.brokers.map((broker) => broker.reporterSha256)).toEqual(
+        Array(3).fill(expected.sha256)
+      )
+      mounted = 'f'.repeat(64)
+      expect(() => owner.capture()).toThrow()
+      mounted = expected.sha256
+      fs.writeFileSync(path.join(directory, 'reporter-1.json'), '{"maxFileBytes":2097152}')
+      expect(() => owner.capture()).toThrow('reporter sink cap mismatch')
+    } finally {
+      read.mockRestore()
+    }
+  })
+
+  test('rejects an overflow marker during independent churn evidence verification', () => {
+    const { verifyChurn } = require('../../e2e/telemetry/evidence')
+    const { SEGMENT_FORMAT, segmentIdentities } = require('../../../testHelpers/telemetrySegments')
+    const segments = [...segmentIdentities('telemetry-churn')].map(([id, identity]) => ({
+      id,
+      ...identity,
+    }))
+    const manifest = { root: '.', segments, files: [{ path: './index.json' }] }
+    fs.writeFileSync(
+      path.join(directory, 'index.json'),
+      JSON.stringify({ format: SEGMENT_FORMAT, scenario: 'telemetry-churn', segments })
+    )
+    fs.writeFileSync(path.join(directory, 'OVERFLOW-1.json'), '{"reason":"file-cap"}')
+    const rows = churn.KINDS.flatMap((clientKind) => [
+      { kind: 'resource-verdict', clientKind },
+      { kind: 'natural-exit', clientKind },
+    ])
+    const archive = {
+      stem: 'fixture',
+      workers: Object.fromEntries(churn.KINDS.map((kind) => [kind, {}])),
+    }
+    expect(() =>
+      verifyChurn({ results: { rows } }, directory, manifest, () => ({ churn: archive }))
+    ).toThrow('Telemetry fixture overflow')
+  })
+
+  test('reads the larger churn sink in the parent decoder and still refuses overflow evidence', () => {
+    const saved = process.env.TELEMETRY_EVIDENCE_DIR
+    process.env.TELEMETRY_EVIDENCE_DIR = directory
+    try {
+      const rows = Array.from({ length: 1200 }, (_, i) => ({
+        v: 1,
+        node: '1',
+        seq: i + 1,
+        clientInstanceId: '00112233-4455-6677-8899-aabbccddeeff',
+        parse: 'ok',
+        dataBytes: 22,
+        dataSha256: 'a'.repeat(64),
+        terminating: false,
+        pushIntervalMs: 1000,
+        detail: 'x'.repeat(2400),
+      }))
+      fs.writeFileSync(
+        path.join(directory, 'exports-1.jsonl'),
+        rows.map((row) => JSON.stringify(row) + '\n').join('')
+      )
+      expect(fs.statSync(path.join(directory, 'exports-1.jsonl')).size).toBeGreaterThan(2 * MIB)
+      const decoder = new churn.DecoderCoordinator({
+        directory,
+        line: '4.3.1',
+        clock: { now: () => 0 },
+        make: (options) => options,
+      })
+      expect(decoder.exports()).toEqual(rows)
+      expect(decoder.observer.sinkBytes).toBe(5242880)
+      fs.writeFileSync(path.join(directory, 'OVERFLOW-1.json'), '{"reason":"file-cap"}')
+      expect(() => decoder.exports()).toThrow('Telemetry fixture overflow')
+    } finally {
+      if (saved === undefined) delete process.env.TELEMETRY_EVIDENCE_DIR
+      else process.env.TELEMETRY_EVIDENCE_DIR = saved
+    }
+  })
+})
