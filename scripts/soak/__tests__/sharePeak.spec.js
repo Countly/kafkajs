@@ -569,6 +569,44 @@ describe('share allocation sampling', () => {
     await expect(capped.capture('cleanup', null, async () => {})).rejects.toThrow('stage bound')
   })
 
+  test('profiles the confirmation reconnects used by disconnected churn and joins their seals', async () => {
+    const owner = { kind: 'shareConsumer', soak: {} }
+    installSharePeak(owner, 'enabled', {
+      CI: 'true',
+      SHARE_PEAK_DIAGNOSTIC: '1',
+      SHARE_PEAK_ROOT: directory,
+    })
+    const worker = Object.create(owner.soak.SharePeakWorker.prototype)
+    const { allocation, calls } = recorder()
+    worker.peak = { allocations: allocation }
+    let finishSeal
+    const sealing = new Promise((resolve) => {
+      finishSeal = resolve
+    })
+    const claim = { tick: 6, from: 's0', to: 's1' }
+    const confirm = jest
+      .spyOn(TelemetryWorker.prototype, 'confirm')
+      .mockImplementation(function () {
+        this.sealing = { promise: sealing }
+        return Promise.resolve(claim)
+      })
+    try {
+      const opening = worker.confirm({ tick: 6, transitions: [1, 2] })
+      await new Promise((resolve) => setImmediate(resolve))
+      expect(calls[0]).toBe('connect')
+      expect(calls.some((call) => call[0] === 'HeapProfiler.stopSampling')).toBe(false)
+      finishSeal()
+      await expect(opening).resolves.toBe(claim)
+      expect(allocation.report()).toMatchObject({
+        complete: true,
+        stages: [{ stage: 'reopen', tick: 6 }],
+      })
+    } finally {
+      finishSeal()
+      confirm.mockRestore()
+    }
+  })
+
   test('installs allocation sampling only in the enabled diagnostic CI share worker', async () => {
     for (const [kind, arm, env, enabled] of [
       ['shareConsumer', 'enabled', { CI: 'true', SHARE_PEAK_DIAGNOSTIC: '1' }, true],

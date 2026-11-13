@@ -20394,7 +20394,8 @@
         "scripts/soak/__tests__/longWindow.spec.js \u203a five-minute reporter capacity mounts and archives the bounded reporter before live-owner-census starts its churn",
         "scripts/soak/__tests__/longWindow.spec.js \u203a five-minute reporter capacity checks the churn mounted jar and loaded cap before recording broker provenance",
         "scripts/soak/__tests__/longWindow.spec.js \u203a five-minute reporter capacity rejects an overflow marker during independent churn evidence verification",
-        "scripts/soak/__tests__/longWindow.spec.js \u203a five-minute reporter capacity reads the larger churn sink in the parent decoder and still refuses overflow evidence"
+        "scripts/soak/__tests__/longWindow.spec.js \u203a five-minute reporter capacity reads the larger churn sink in the parent decoder and still refuses overflow evidence",
+        "scripts/soak/__tests__/sharePeak.spec.js \u203a share allocation sampling profiles the confirmation reconnects used by disconnected churn and joins their seals"
       ],
       "capMinutes": 85,
       "allowedSkips": [
