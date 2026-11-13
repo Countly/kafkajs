@@ -436,6 +436,48 @@ const assertOwnerUuid = (transcript, uuid) => {
 }
 
 /**
+ * Authenticates the five-minute reporter's archived build receipt using the same cap-only source
+ * derivation as the long-window builder. Compiler paths belong to the CI runner; their pinned
+ * content hashes, rather than host paths, identify the ordered inputs during offline replay.
+ * @param {object} receipt derived reporter receipt captured by CI ownership
+ * @param {string} line scenario broker line
+ * @param {object} pinned retained fixture manifest
+ * @returns {string} authenticated built-jar digest to compare with every broker-mounted jar
+ * @throws {Error} if the profile, source derivation, pinned inputs or built digest differ
+ */
+const churnReporterHash = (receipt, line, pinned) => {
+  const { BoundedReporter } = require('../../soak/longWindowReporter')
+  const { SINK_BYTES, SINK_BUDGET } = require('../../soak/churnReporter')
+  assert(['4.2.2', '4.3.1'].includes(line), 'Unsupported churn reporter broker line')
+  assert.equal(receipt.diagnostic, false, 'Churn reporter diagnostic profile differs')
+  assert.equal(receipt.acceptanceEligible, true, 'Churn reporter acceptance eligibility differs')
+  assert.equal(receipt.line, line, 'Churn reporter broker line differs')
+  assert.equal(receipt.sinkBytes, SINK_BYTES, 'Churn reporter sink cap differs')
+  assert.deepEqual(receipt.sinkBudget, SINK_BUDGET, 'Churn reporter sink budget differs')
+  const source = fs.readFileSync(path.join(__dirname, 'CountingTelemetryReporter.java'), 'utf8')
+  const sourceHash = pinned.scripts['CountingTelemetryReporter.java']
+  assert.equal(sha(source), sourceHash, 'Churn reporter source identity differs')
+  assert.equal(receipt.sourceSha256, sourceHash, 'Churn reporter source identity differs')
+  assert.equal(
+    receipt.preparedSourceSha256,
+    sha(BoundedReporter.source(source, SINK_BYTES)),
+    'Churn reporter prepared source differs'
+  )
+  assert.equal(
+    receipt.retainedSha256,
+    pinned.lines[line].reporterJar.sha256,
+    'Churn reporter retained jar differs'
+  )
+  assert.deepEqual(
+    receipt.dependencies?.map((input) => input.sha256),
+    [`kafka-clients-${line}`, 'protobuf-java'].map((key) => pinned.inputs[key].sha256),
+    'Churn reporter dependencies differ'
+  )
+  assert(/^[0-9a-f]{64}$/.test(receipt.sha256), 'Churn reporter built jar hash is invalid')
+  return receipt.sha256
+}
+
+/**
  * Verifies a single stamped scenario's entire sidecar catalogue, decode/sink/request joins,
  * independently observed arithmetic and natural cleanup. All referenced paths stay under the run.
  * @param {object} record stamped evidence with a sidecar manifest
@@ -499,8 +541,12 @@ const verifyScenario = (record, directory) => {
           ),
           'Image digest mismatch'
         )
+      const reporterHash =
+        manifest.scenario === CHURN && identity.churnReporter
+          ? churnReporterHash(identity.churnReporter, record.run.line, pinned)
+          : pinned.lines[record.run.line].reporterJar.sha256
       for (const broker of identity.brokers) {
-        assert.equal(broker.reporterSha256, pinned.lines[record.run.line].reporterJar.sha256)
+        assert.equal(broker.reporterSha256, reporterHash, 'Reporter jar identity mismatch')
         assert(broker.configSha256)
       }
       assert.equal(

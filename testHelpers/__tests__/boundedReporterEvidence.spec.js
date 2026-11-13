@@ -90,6 +90,7 @@ describe('bounded reporter evidence identity', () => {
   let directory
   let project
   beforeEach(() => {
+    fs.mkdirSync(path.resolve('.tmp'), { recursive: true })
     directory = fs.mkdtempSync(path.resolve('.tmp/evidjar-test-'))
     project = process.env.COMPOSE_PROJECT_NAME
   })
