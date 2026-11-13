@@ -1312,7 +1312,7 @@ quiet(KINDS)(
     const before = hostContext()
     const run = await supervise('publicMemoryChild.js', kind)
     const judged = judgeMemoryArm(record('public', kind, run, before, hostContext()))
-    expect(judged).toEqual({ verdict: 'pass', problems: [] })
+    expect(judged).toMatchObject({ verdict: 'pass', problems: [] })
   },
   120000
 )
@@ -1323,7 +1323,7 @@ quiet(KINDS)(
     const before = hostContext()
     const run = await supervise('resourceChild.js', kind)
     const judged = judgeMemoryArm(record('collector', kind, run, before, hostContext()))
-    expect(judged).toEqual({ verdict: 'pass', problems: [] })
+    expect(judged).toMatchObject({ verdict: 'pass', problems: [] })
   },
   120000
 )

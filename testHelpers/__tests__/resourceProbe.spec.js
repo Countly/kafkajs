@@ -1708,6 +1708,23 @@ describe('resource artifact validation', () => {
         })
       }
     )
+
+    test.each([
+      [
+        'conflicting extra semi-space flags',
+        (argv) => [...argv, '--min-semi-space-size=16', '--max-semi-space-size=16'],
+      ],
+      ['reordered flags', (argv) => [...argv].reverse()],
+      ['a flag string instead of an array', (argv) => argv.join(' ')],
+    ])('rejects %s', (_name, change) => {
+      const result = judged('public', (r) => {
+        r.manifest.execArgv = change(r.manifest.execArgv)
+      })
+      expect(result).toEqual({
+        verdict: 'fail',
+        problems: ['child did not declare the required memory flags'],
+      })
+    })
   })
 
   describe('recorded retained growth', () => {

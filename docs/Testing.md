@@ -464,7 +464,7 @@ and settlement included) and of the sampled peak; the external peak is taken the
 | Heap plus external above the matched disconnected baseline | at most 8 MiB while active |
 | Data above the matched disconnected baseline once closed | at most 256 KiB |
 | First use | first use M − M0 ≤ 1 MiB in data |
-| Unseeded closed data | unseeded data below −256 KiB is inconclusive |
+| Unseeded closed data | closed data below −256 KiB is recorded as facts, not inconclusive (a decrease is not a leak) |
 
 The matched baseline is a separate reading: the enabled client disconnected with its registered descriptors,
 its UUID and its counters retained. It is not the control. In schema 6, control stability and the closed
@@ -478,8 +478,8 @@ then closes and releases it. M0 records the old matched position before that lif
 bound measures M minus M0. CI on Node 22/24/26 runs product-root seeds of 131,072 bytes per close
 (at least 512 KiB total), both after warm-up and also during warm-up, and a warm-up-only seed of
 1 MiB + 1. Each must fail its closed or first-use bound. Code-accounting controls distinguish
-compilation from retained arrays, and all 24 unseeded arms across those Node lines must stay within
-±256 KiB of closed data. A static sweep checks production source for dynamic code generation.
+compilation from retained arrays, and none of the 24 unseeded arms across those Node lines may exceed
++256 KiB of closed data (a larger decrease is recorded as facts). A static sweep checks production source for dynamic code generation.
 
 Native work is journaled from the production codec calls (weak-issued job, input and result identities, byte lengths,
 distinct backing stores counted once, a reading at each submission and settlement, readings every 20 ms
@@ -587,10 +587,11 @@ the raw `maxRSS` is recorded beside it and never subtracted. A control that drif
 of resident size or 256 KiB of retained heap, a setup above its allowance, a missing collection or peak
 capability, or a noisy host (one-minute load per CPU above 0.75, free memory below 256 MiB, memory
 pressure above 5) makes the measurement inconclusive, with the facts retained; a broken or contradicted
-fact fails. The retained-heap gates are unchanged: at most 8 MiB active and 256 KiB closed above the
-matched disconnected baseline, a slope of at most 64 KiB per minute, last minus first at most 1 MiB,
-and at least ten post-collection readings spanning at least 270 s inside a measurement of at least
-300 s, each recorded with its real admission and completion time. These live retained gates still
+fact fails. This five-minute lane judges at most 8 MiB active above the matched disconnected
+baseline and at least ten post-collection readings spanning at least 270 s inside a measurement of at
+least 300 s, each recorded with its real admission and completion time. The slope (at most 64 KiB per
+minute) and last minus first (at most 1 MiB) are judged by the long-window lane, and memory after close
+by the broker-free resource arms; the five-minute lane no longer judges a closed ceiling. These live retained gates still
 judge heap plus external; the schema 6 data gates and measured warm-up above apply to the broker-free
 resource arms. Every live reading records V8 code bytes in shadow only, with raw, code and data slopes;
 the live acceptance quantities remain unchanged pending the controls and an explicit decision.

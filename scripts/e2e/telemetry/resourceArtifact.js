@@ -19,7 +19,7 @@
  * data(x) = heapUsed + external - (V8 bytecode + compiled code), at the final settle checkpoint
  * RSS     delta P - B <= 64 MiB,  P <= 160 MiB,  external delta Epeak - Eref <= 64 MiB
  * control C1 and C0 settled readings within 2 MiB RSS and 256 KiB data; setup peak <= 96 MiB
- * closed  data(closed) - data(M) <= 256 KiB; below -256 KiB is inconclusive
+ * closed  data(closed) - data(M) <= 256 KiB; below -256 KiB is recorded as a fact
  * warm-up one full throwaway pass of the same kind and arm runs before M; M0 is its reading at the
  *         M position, and data(M) - data(M0) <= 1 MiB
  * ```
@@ -586,7 +586,7 @@ class MemoryArmJudge {
     if (Object.values(manifest.instrumented ?? { missing: true }).some(Boolean))
       this.fail('child ran under an inspector, coverage or Jest')
     if (!manifest.execArgv?.includes('--expose-gc')) this.fail('child did not expose GC')
-    if (!MEMORY_FLAGS.slice(1).every((flag) => manifest.execArgv?.includes(flag)))
+    if (!Array.isArray(manifest.execArgv) || !same(manifest.execArgv, MEMORY_FLAGS))
       this.fail('child did not declare the required memory flags')
     if (manifest.gc?.native !== true) this.fail('GC function is not the engine collection')
     const codecCount = manifest.codecs?.zstd === true ? 2 : 1
