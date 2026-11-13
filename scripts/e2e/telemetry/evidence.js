@@ -3082,10 +3082,11 @@ const churnProof = (transcript, get, pushKey) => {
  * selected before the close resolved, connect was the next public action, there was no Get, connect
  * or authentication during the final, the cached UUID and a successful replacement Get that carried
  * it, and admission paused, drained and confirmed before the close.
- * @param {object} input `claim`, `from` and `to` transcripts, the worker `journal` and its `uuid`
+ * @param {object} input `claim`, `from` and `to` transcripts, the worker `journal`, its `uuid`
+ *   and optional `releasedAt` of the disconnected subscription batch
  * @returns {void} @throws {Error} naming the first contradicted proof
  */
-const verifyChurnReopen = ({ claim, from, to, journal, uuid }) => {
+const verifyChurnReopen = ({ claim, from, to, journal, uuid, releasedAt }) => {
   const { TelemetryProofs } = require('../../soak/telemetryChurn')
   const note = (type) => {
     const found = journal.filter(
@@ -3115,6 +3116,11 @@ const verifyChurnReopen = ({ claim, from, to, journal, uuid }) => {
     [],
     'Get, connect or authentication during the final'
   )
+  if (releasedAt !== undefined)
+    assert(
+      closure.end <= claim.closedAt && claim.closedAt <= releasedAt && releasedAt <= called.at,
+      'The subscription release is outside the disconnected lifecycle gap'
+    )
   assert.equal(claim.cachedUuid, uuid, 'The cached timeout-zero UUID differs')
   const get = churnRecord(to, claim.get)
   assert(
@@ -3172,8 +3178,9 @@ const verifyChurnRetirement = ({ claim, transcript, uuid }) => {
 
 /**
  * Re-derives one subscription transition: the parent's set and readback, the successful Get that
- * proves exactly that selection (written after the acknowledged pre-rotation fence), a subscription
- * that differs from the last one, and the current Push proof every lifecycle change at the tick owes.
+ * proves the final selection of the disconnected batch after the acknowledged fence, and the
+ * current Push proof a nonempty reopened lifecycle owes. Intermediate selections are proved by
+ * ordered set/readbacks; a batch may return to the previous selection and subscription ID.
  * @param {object} input `claim`, `tick`, the parent's `rotation`, the segment `transcript`, the
  *   worker `uuid`, the `selection` the table requires and the `previous` subscription ID
  * @returns {void} @throws {Error} naming the first contradicted proof
@@ -3206,8 +3213,13 @@ const verifyChurnTransition = ({
     'No successful Get proves the selection'
   )
   assert.equal(get.response.subscriptionId, claim.subscriptionId)
-  assert.notEqual(claim.subscriptionId, previous, 'The subscription did not change')
-  const owed = tick.actions.filter((a) => a !== 'subscription').sort()
+  if (!tick.transitions)
+    assert.notEqual(claim.subscriptionId, previous, 'The subscription did not change')
+  const owed = tick.transitions
+    ? selection === ''
+      ? []
+      : ['reopen']
+    : tick.actions.filter((a) => a !== 'subscription').sort()
   if (!owed.length) return assert.equal(claim.proof, null, 'Unexpected current Push proof')
   assert(claim.proof, 'A lifecycle change without its current Push proof')
   assert.deepEqual([...claim.proof.owedBy].sort(), owed)
@@ -3310,10 +3322,10 @@ const verifyChurnStages = ({ archive, timeline }) => {
     'Tick starts differ from the fixed table'
   )
   assert.deepEqual(
-    archive.rotations.map((r) => r.tick),
+    archive.rotations.map((r) => [r.tick, r.index]),
     table.ticks
       .filter((t) => !missed.has(t.number) && t.actions.includes('subscription'))
-      .map((t) => t.number),
+      .flatMap((t) => (t.transitions ?? [t.index]).map((index) => [t.number, index])),
     'Transition set and readback differ from the table'
   )
   let barrier = timeline.epochAt
@@ -3327,20 +3339,31 @@ const verifyChurnStages = ({ archive, timeline }) => {
       const rows = archive.stages.filter((r) => r.tick === tick.number && r.stage === stage)
       const [{ sentAt }] = rows
       if (stage === 'confirm') {
-        const rotation = archive.rotations.find((r) => r.tick === tick.number)
-        assert.equal(rotation.index, tick.index, 'A set names another transition')
-        for (const row of rows)
-          assert(
-            row.fence && row.fence.parentAt >= sentAt && row.fence.parentAt <= rotation.requestedAt,
-            'The rotation preceded a worker confirmation fence'
+        const rotations = archive.rotations.filter((r) => r.tick === tick.number)
+        let after = barrier
+        for (const rotation of rotations) {
+          assert.equal(
+            rotation.selection,
+            table.selection(rotation.index),
+            'A set names another selection'
           )
-        assert(
-          rotation.requestedAt >= barrier &&
-            rotation.setAt >= rotation.requestedAt &&
-            rotation.readbackAt >= rotation.setAt &&
-            rows.every((r) => r.releasedAt >= rotation.readbackAt && r.releasedAt <= r.parentAt),
-          'The set and readback are outside their stage barrier'
-        )
+          assert.equal(rotation.readback, rotation.selection, 'The readback differs from the set')
+          for (const row of rows)
+            assert(
+              row.fence &&
+                row.fence.parentAt >= sentAt &&
+                row.fence.parentAt <= rotation.requestedAt,
+              'The rotation preceded a worker confirmation fence'
+            )
+          assert(
+            rotation.requestedAt >= after &&
+              rotation.setAt >= rotation.requestedAt &&
+              rotation.readbackAt >= rotation.setAt &&
+              rows.every((r) => r.releasedAt >= rotation.readbackAt && r.releasedAt <= r.parentAt),
+            'The set and readback are outside their stage barrier'
+          )
+          after = rotation.readbackAt
+        }
       }
       for (const row of rows) {
         assert.equal(row.sentAt, sentAt, 'One stage was sent at different times')
@@ -3392,7 +3415,7 @@ const verifyChurnStages = ({ archive, timeline }) => {
         `${kind} claim at tick ${tick} lies outside its ${stage} stage`
       )
     }
-    for (const c of facts.claims.reopens) within(c.tick, 'lifecycle', c.observedAt, c.closedAt)
+    for (const c of facts.claims.reopens) within(c.tick, 'confirm', c.observedAt, c.closedAt)
     for (const c of facts.claims.retirements) within(c.tick, 'retire', c.declaredAt, c.faultedAt)
     for (const c of facts.claims.transitions) {
       within(c.tick, 'confirm', c.receivedAt, c.releasedAt)
@@ -3411,6 +3434,12 @@ const verifyChurnStages = ({ archive, timeline }) => {
         row.workerStartedAt,
         'The confirmation stage did not start at its fence'
       )
+      const reopen = facts.claims.reopens.find((r) => r.tick === c.tick)
+      assert(reopen, 'The subscription transition has no disconnected lifecycle boundary')
+      assert(
+        reopen.closedAt + lo <= row.fence.parentAt && reopen.closedAt <= c.releasedAt,
+        'A subscription transition was released inside an active lifecycle'
+      )
       assert(
         c.receivedAt + lo <= row.fence.parentAt && c.releasedAt + hi >= row.releasedAt,
         'The worker confirmation fence or release cannot map onto the parent epoch'
@@ -3418,7 +3447,12 @@ const verifyChurnStages = ({ archive, timeline }) => {
     }
     const counts = { subscription: 0, retire: 0, reopen: 0 }
     for (const row of rows)
-      if (table.measured(table.ticks[row.tick])) counts[CHURN_NAMES[row.stage]] += 1
+      if (table.measured(table.ticks[row.tick])) {
+        if (row.stage === 'confirm') {
+          counts.subscription += table.ticks[row.tick].transitions.length
+          counts.reopen += 1
+        } else counts[CHURN_NAMES[row.stage]] += 1
+      }
     assert.deepEqual(
       counts,
       table.required(),
@@ -3480,7 +3514,16 @@ const verifyChurnWorker = ({ kind, uuid, facts, transcripts, schedule, archive }
       [names[position + 1], names[position + 2]],
       'Reopen segments differ from the schedule'
     )
-    verifyChurnReopen({ claim, from: segment(claim.from), to: segment(claim.to), journal, uuid })
+    const transition = claims.transitions.find((c) => c.tick === claim.tick)
+    assert(transition, 'A reopen lacks its subscription release')
+    verifyChurnReopen({
+      claim,
+      from: segment(claim.from),
+      to: segment(claim.to),
+      journal,
+      uuid,
+      releasedAt: transition.releasedAt,
+    })
   })
   const retireTicks = table.ticks.filter((t) => t.actions.includes('retire'))
   assert.equal(claims.retirements.length, retireTicks.length, `Missing ${kind} retirements`)
@@ -3488,22 +3531,31 @@ const verifyChurnWorker = ({ kind, uuid, facts, transcripts, schedule, archive }
     assert.equal(claim.tick, retireTicks[position].number)
     verifyChurnRetirement({ claim, transcript: segment(claim.segment), uuid })
   })
-  assert.equal(claims.transitions.length, table.ticks.length, `Missing ${kind} transitions`)
+  const transitionTicks = table.ticks.filter((t) => t.actions.includes('subscription'))
+  assert.equal(claims.transitions.length, transitionTicks.length, `Missing ${kind} transitions`)
   let previous = null
   claims.transitions.forEach((claim, position) => {
-    const tick = table.ticks[position]
+    const tick = transitionTicks[position]
     assert.equal(claim.tick, tick.number)
     verifyChurnTransition({
       claim,
       tick,
-      rotation: archive.rotations.find((r) => r.tick === tick.number),
+      rotation: archive.rotations.find((r) => r.tick === tick.number && r.index === tick.index),
       transcript: segment(claim.segment),
       uuid,
       selection: table.selection(tick.index),
       previous,
     })
+    const get = churnRecord(segment(claim.segment), claim.get)
+    assert(get.writeAt >= claim.releasedAt, 'The next handshake preceded the subscription release')
     previous = claim.subscriptionId
   })
+  for (const claim of claims.retirements) {
+    const proof = claims.proofs.find((p) => p.tick === claim.tick && p.owedBy.includes('retire'))
+    assert(proof, 'A retirement lacks its current Push proof')
+    const transcript = segment(claim.segment)
+    churnProof(transcript, churnRecord(transcript, claim.get), proof.push)
+  }
   const unique = new Set(claims.proofs.map((p) => `${p.segment}/${p.push}`))
   assert.equal(unique.size, claims.proofs.length, 'A proving Push was claimed twice')
 }

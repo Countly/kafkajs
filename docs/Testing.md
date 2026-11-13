@@ -407,7 +407,7 @@ The shutdown file selects `close and reopen` separately from `telemetry churn`, 
 
 Under D142, phase-blocking telemetry lanes retain functional wire/decode health, exact cancellation accounting, all 21 shutdown lifecycles per kind, UUID/cache/final-Push semantics, corpus and raw-offset oracles, capability refusals, and explicit absence of API 71/72 requests in negative controls. The `telemetry-verdicts` job in `.github/workflows/memory-gates.yml` reruns outcomes, unsupported and shutdown with the full Node/broker matrix and requires resource acceptance from the same archived transcripts and lifecycle/resource ledgers. Its verdicts cover ordinary/refused-bootstrap socket ownership, enabled/disabled ownership equivalence, observer listeners/sockets/timers, decoder occupancy, undischarged identities and exact quiet-window equality. These verdicts block 3.0.0; they do not block a phase merge. Operational cleanup failures still fail functional lanes. The configured outcomes share oracle has 28000 ms of work and a 30000 ms full envelope, including its 2000 ms local cleanup reserve and full 3000 ms verifier observation; its enclosing case is 188000 ms (158000 ms work, 30000 ms cleanup), within the unchanged 270 s shell bound.
 
-Churn runs a 60-second warm-up and 300-second measurement with at least 10 settled samples, then cleanup within 120 seconds and total 540 seconds. It changes subscriptions every 10 seconds, reconnects telemetry every 30 seconds and closes/reopens publicly every 60 seconds. Four one-client workers prevent memory averaging. Measure heapUsed plus external after two collections; arrayBuffers is already included in external. Compare the same descriptor/UUID population, check exact timer/handle/listener/socket identities and record RSS/native peak separately. Independent durable-record, broker-commit or share-delivery, and handler-invocation identities remain separate oracles.
+Churn runs a 60-second warm-up and 300-second measurement with at least 10 settled samples, then cleanup within 120 seconds and total 540 seconds. It preserves 35 ordered subscription set/readbacks, batched only between public lifecycles, and retires telemetry every 30 seconds. Public close/reopen boundaries include the original 60-second cadence and three additional gaps; no scheduled subscription update runs while any worker is active. Four one-client workers prevent memory averaging. Measure heapUsed plus external after two collections; arrayBuffers is already included in external. Compare the same descriptor/UUID population, check exact timer/handle/listener/socket identities and record RSS/native peak separately. Independent durable-record, broker-commit or share-delivery, and handler-invocation identities remain separate oracles.
 
 The single-client memory and native arms of `src/telemetry/__tests__/resources.spec.js` need a quiet host: the `Memory gates` workflow selects those arms alone in its own `resources` job with `TELEMETRY_RESOURCES_QUIET=1`, and the shared unit lane skips those arms.
 
@@ -540,18 +540,30 @@ the common end-of-measurement boundary, 538 000 ms inclusive inside the 540 000 
 stamped only after the last cleanup step.
 
 One parent supervises four one-client worker processes (producer, consumer, admin, share consumer). The
-parent owns the fixed tick catalogue: every 10 s a subscription transition, every 30 s a retirement of
-the telemetry socket, every 60 s a public close and immediate reopen of the same object. At every tick
-the stages are joined across all four workers in this order: close and immediate connect, telemetry
-retirement, then the broker set and readback followed by each worker's confirmation. A tick more than
-5 s late fails the run and is never caught up. Each confirmation is a successful Get that carries and
-returns the client's instance ID with exactly the requested prefix list and a 1000 ms interval; a
-lifecycle change also owes a nonempty, nonterminating, accepted Push on the very socket of its
-replacement Get, written strictly after that Get's response. An empty selection keeps the resource and
-polls; it is never deleted into the 300 000 ms fallback.
+parent owns the fixed tick catalogue. The original 35 selections still alternate `com.example.`, empty,
+and `org.apache.kafka.` in order, but run as disconnected batches: transition 1 at 10 s, 2–5 at 50 s,
+6 at 60 s, 7–12 at 120 s, 13–18 at 180 s, 19–24 at 240 s, 25–30 at 300 s and 31–35 at 350 s.
+These are release slots after the epoch, subject to the existing stage deadlines. A batch first pauses
+and drains admission and closes all four public clients. Only after every disconnected fence arrives
+does the parent apply every set and successful readback in order. It then releases all reconnects;
+connect remains the next public client action. No next lifecycle or handshake can precede those
+readbacks. A tick more than 5 s late fails and is never caught up. The 11 telemetry retirements retain
+their 30 s slots and, when coincident, follow confirmation; each proves its own recovery Push.
 
-Every public lifecycle of a worker is one sealed observer segment (seven per kind: setup, initial and
-five reopens), written as a transcript file and a payload/proof bundle. Every accepted Push keeps its
+There are eight public close/reopen cycles, including the original five 60 s boundaries. Giving each
+of the 35 transitions its own lifecycle would exceed the unchanged 16-segment cap. Batching preserves
+the transition count and values, but intermediate selections have set/readback proof rather than an
+active Get/Push stream. Each batch's final Get carries and returns the same instance ID, the exact
+requested prefix list and a 1000 ms interval. A nonempty reopened lifecycle owes an accepted normal
+Push after its replacement Get on that socket. An empty selection keeps the resource and polls
+without a Push; it is never deleted into the 300 000 ms fallback. Error 42 remains the only permitted
+churn stream error; an undeclared 117 still fails verification. The in-lifecycle
+117 → Get → filtered Push path remains covered by `src/telemetry/__tests__/subscriptionLive.spec.js`.
+The frozen long-window method keeps its original subscription schedule, identity and readings; only
+the five-minute lane uses these disconnected batches.
+
+Every public lifecycle of a worker is one sealed observer segment (ten per kind: setup, initial and
+eight reopens), written as a transcript file and a payload/proof bundle. Every accepted Push keeps its
 bytes, response, node, subscription and sink join. The Pushes that are decoded in full are selected by
 a rule over the transcript alone: the first accepted Push of every telemetry socket, the first accepted
 Push governed by each custom-prefix Get, and the accepted final of every segment; the last segment's
@@ -576,9 +588,11 @@ reason for a second delivery, no accepted record is delivered again, and at each
 handled prefix is accepted and the rest released.
 
 Memory is judged per worker against its own telemetry-disabled control of the same kind in the same
-process. In this five-minute lane the control first runs its catalogue and idle window once before C0,
-so first-use compilation precedes both control readings; the validator requires that warm-up to be
-complete, fulfilled and earlier than C0. The long-window lane keeps its frozen control without it.
+process. In this five-minute lane the control first runs its catalogue and idle window once before C0:
+10 s (5 × the 2 s control idle) for the share consumer, 2 s for the other kinds, with early timers
+topped up against the monotonic clock. This precedes both control readings; the validator still
+requires at least 2 s, complete fulfilled outcomes and completion before C0. The RSS and retained
+drift limits stay 2 MiB and 256 KiB. The long-window lane keeps its frozen control without this warm-up.
 The telemetry-attributable resident-size peak is at most 64 MiB above the control, the control
 and setup peak at most 96 MiB for producer, consumer and admin. The share consumer's live setup
 allowance is 96 MiB plus its declared journal bytes: 100,663,296 + 23,192,560 = 123,855,856 bytes.

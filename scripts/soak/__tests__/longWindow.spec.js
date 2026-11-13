@@ -240,18 +240,18 @@ describe('long-window shadow candidate', () => {
 })
 
 describe('long-window sizing', () => {
-  test('keeps the default corpus, segment and journal sizes byte-identical when the switch is unset', () => {
+  test('keeps the default corpus and journals unchanged with ten disconnected churn segments', () => {
     const sizes = sizesWith(false)
     expect(sizes.records).toBe(10000)
     expect(sizes.scenario).toBe('telemetry-churn')
-    expect(sizes.plan).toMatchObject({ perKind: 7, cap: 16 })
+    expect(sizes.plan).toMatchObject({ perKind: 10, cap: 16 })
     expect(sizes.declared.share).toBe(23192560)
     expect(sizes.declared.shareImplicit).toBe(23192560)
     expect(sizes.allowance.share).toBe(sizes.allowance.setupPeak + 23192560)
     expect(sizes.allowance.producer).toBe(sizes.allowance.setupPeak)
     expect(sizes.plain.slots).toHaveLength(100)
     expect(sizes.plain.slots[0]).toBe(60000)
-    expect(sizes.plain.required).toEqual({ subscription: 30, retire: 10, reopen: 5 })
+    expect(sizes.plain.required).toEqual({ subscription: 30, retire: 10, reopen: 6 })
   })
 
   test('sizes the long run at 44,000 records and one segment per reopen plus two', () => {

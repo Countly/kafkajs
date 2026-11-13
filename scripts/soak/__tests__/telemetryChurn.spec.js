@@ -301,34 +301,36 @@ describe('telemetry profile', () => {
     )
   })
 
-  test.each(KINDS)('releases every %s subscription batch between lifecycle windows', (kind) => {
+  test('releases every subscription batch between lifecycle windows', () => {
     for (let measureMs = 60000; measureMs <= 300000; measureMs += 10000) {
       const schedule = new TelemetrySchedule({ warmupMs: 60000, measureMs })
       const transitions = schedule.ticks.flatMap((tick) => tick.transitions)
       expect(transitions).toEqual(
         Array.from({ length: (60000 + measureMs) / 10000 - 1 }, (_, n) => n + 1)
       )
-      expect(schedule.ticks.length + 2).toBeLessThanOrEqual(16)
-      for (const tick of schedule.ticks) {
+      expect(
+        schedule.ticks.filter((t) => t.actions.includes('reopen')).length + 2
+      ).toBeLessThanOrEqual(16)
+      for (const tick of schedule.ticks.filter((t) => t.transitions.length)) {
         expect(tick.actions).toContain('reopen')
         expect(schedule.stages(tick)[0]).toBe('confirm')
         expect(tick.transitions.every((index) => index * 10000 <= tick.at)).toBe(true)
-        expect(kind).toBeDefined()
       }
     }
   })
 
   test('holds the fixed measured action counts, the serialization order and the corpus slots', () => {
     const schedule = new TelemetrySchedule({ warmupMs: 60000, measureMs: 300000 })
-    expect(schedule.required()).toEqual({ subscription: 30, retire: 10, reopen: 5 })
-    expect(schedule.ticks).toHaveLength(35)
+    expect(schedule.required()).toEqual({ subscription: 30, retire: 10, reopen: 6 })
+    expect(schedule.ticks).toHaveLength(14)
+    expect(schedule.ticks.filter((t) => t.transitions.length)).toHaveLength(8)
     schedule.ticks.forEach((tick, number) => {
       expect(tick.number).toBe(number)
       expect(tick.index).toBe(tick.at / 10000)
     })
     const sixty = schedule.ticks.find((tick) => tick.at === 60000)
     expect(sixty.actions).toEqual(['reopen', 'retire', 'subscription'])
-    expect(schedule.stages(sixty)).toEqual(['lifecycle', 'retire', 'confirm'])
+    expect(schedule.stages(sixty)).toEqual(['confirm', 'retire'])
     expect(schedule.stages(schedule.ticks[0])).toEqual(['confirm'])
     expect(schedule.ticks.at(-1).at).toBe(350000)
     expect(
@@ -342,7 +344,9 @@ describe('telemetry profile', () => {
       '',
       'org.apache.kafka.',
     ])
-    for (const tick of schedule.ticks.filter((t) => t.actions.length > 1))
+    for (const tick of schedule.ticks.filter(
+      (t) => t.actions.includes('retire') && t.transitions.length
+    ))
       expect(schedule.selection(tick.index)).not.toBe('')
     const slots = schedule.corpusSlots()
     expect(slots).toHaveLength(CORPUS.records / CORPUS.batch)
@@ -2222,6 +2226,107 @@ describe('telemetry profile worker', () => {
     return { worker, log, from, to, segments, ordinary }
   }
 
+  test.each(KINDS)(
+    'keeps %s transition releases outside every active lifecycle window',
+    async (kind) => {
+      const { TelemetrySegments } = require('../../../testHelpers/telemetrySegments')
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'subscription-windows-'))
+      let at = 0
+      let active = true
+      let selection = 'org.apache.kafka.'
+      const windows = [{ start: at, end: null }]
+      const releases = []
+      const clock = { now: () => ++at }
+      const segments = TelemetrySegments.ordinary('telemetry-churn', kind, {
+        directory,
+        clock,
+        observer: { line: '4.3.1' },
+      })
+      const { worker } = make({ kind })
+      worker.segments = segments
+      worker.clock = clock
+      worker.client = {
+        disconnect: async () => {
+          expect(active).toBe(true)
+          active = false
+          windows.at(-1).end = ++at
+        },
+        connect: async () => {
+          expect(active).toBe(false)
+          active = true
+          windows.push({ start: ++at, end: null })
+          const get = getRecord(1, 1, {
+            writeAt: ++at,
+            response: {
+              ...getRecord(1, 1).response,
+              requestedMetrics: selection ? [selection] : [],
+              responseAt: ++at,
+            },
+          })
+          const records = [get]
+          if (selection)
+            records.push({
+              type: 'request',
+              apiKey: 72,
+              index: 2,
+              requestKey: 'r2',
+              socketId: 1,
+              uuid: U,
+              subscriptionId: 7,
+              terminating: false,
+              metricsBytes: 10,
+              writeAt: ++at,
+              response: { errorCode: 0, responseAt: ++at },
+            })
+          jest
+            .spyOn(segments.current().observer, 'readTranscript')
+            .mockImplementation(() => records)
+        },
+        clientInstanceId: async () => U,
+      }
+      worker.tap = { telemetry: () => [{ segment: segments.current().id, ordinal: 1 }] }
+      worker.seal = async (segment) => {
+        await segment.observer.dispose()
+        segment.observer = null
+        segment.state = 'sealed'
+        return {}
+      }
+      try {
+        const schedule = new TelemetrySchedule({ warmupMs: 60000, measureMs: 300000 })
+        for (const tick of schedule.ticks.filter((t) => t.transitions.length)) {
+          const command = {
+            tick: tick.number,
+            index: tick.index,
+            transitions: tick.transitions,
+            selection: schedule.selection(tick.index),
+            stage: 'confirm',
+          }
+          await worker.handle({ type: 'confirm-fence', ...command })
+          expect(active).toBe(false)
+          expect(worker.send.mock.calls.at(-1)[0]).toMatchObject({ type: 'confirm-fenced' })
+          for (const index of tick.transitions) {
+            expect(active).toBe(false)
+            selection = schedule.selection(index)
+            releases.push(++at)
+          }
+          await worker.handle({ type: 'stage', ...command })
+          expect(active).toBe(true)
+          await worker.sealing.promise
+        }
+        expect(releases).toHaveLength(35)
+        expect(windows).toHaveLength(9)
+        for (const releasedAt of releases)
+          expect(
+            windows.some((w) => w.start <= releasedAt && (w.end === null || releasedAt <= w.end))
+          ).toBe(false)
+        expect(worker.actions.measured).toEqual({ subscription: 30, reopen: 6, retire: 0 })
+      } finally {
+        for (const segment of segments.undischarged()) await segment.observer?.dispose()
+        fs.rmSync(directory, { recursive: true, force: true })
+      }
+    }
+  )
+
   test('retains immediate reopen ordering and normal pushes', async () => {
     const { worker, log, from, segments } = make()
     const claim = await worker.reopen({ tick: 5 })
@@ -2377,10 +2482,10 @@ describe('telemetry profile worker', () => {
     const records = [getRecord(1, 3)]
     const current = { id: 'producer-lc-2', observer: observerOf(records) }
     const { worker } = make({ current })
-    const command = { tick: 1, index: 2, stage: 'confirm', selection: '' }
+    const command = { tick: 0, index: 2, stage: 'confirm', selection: '' }
     await worker.handle({ ...command, type: 'confirm-fence' })
     const fence = worker.send.mock.calls.at(-1)[0]
-    expect(fence).toMatchObject({ type: 'confirm-fenced', tick: 1, after: 1, segment: current.id })
+    expect(fence).toMatchObject({ type: 'confirm-fenced', tick: 0, after: 1, segment: current.id })
     records.push(
       getRecord(2, 3, {
         writeAt: fence.receivedAt + 1,
@@ -2403,7 +2508,7 @@ describe('telemetry profile worker', () => {
       const records = [getRecord(1, 3, { writeAt: 1e9, response })]
       const current = { id: 'producer-lc-2', observer: observerOf(records) }
       const { worker } = make({ current })
-      const command = { tick: 1, index: 2, stage: 'confirm', selection: '' }
+      const command = { tick: 0, index: 2, stage: 'confirm', selection: '' }
       await worker.handle({ ...command, type: 'confirm-fence' })
       if (stale === 'timestamp') records.push(getRecord(2, 3, { writeAt: 0, response }))
       await expect(worker.confirm(command)).rejects.toThrow('no selection Get within 8000 ms')
@@ -2702,7 +2807,7 @@ describe('telemetry profile parent', () => {
     const stages = processes.sent.filter((m) => m.type === 'stage')
     const sixty = schedule.ticks.find((t) => t.at === 60000).number
     expect(stages.filter((m) => m.tick === sixty).map((m) => `${m.kind}:${m.stage}`)).toEqual(
-      ['lifecycle', 'retire', 'confirm'].flatMap((stage) => KINDS.map((kind) => `${kind}:${stage}`))
+      ['confirm', 'retire'].flatMap((stage) => KINDS.map((kind) => `${kind}:${stage}`))
     )
     expect(fixture.rotate).toHaveBeenCalledTimes(35)
     expect(fixture.rotate.mock.calls[0]).toEqual([1, 'com.example.', 9000])
@@ -2711,11 +2816,15 @@ describe('telemetry profile parent', () => {
     expect(produce).toHaveLength(2 * 100)
     expect(produce[0][3] - timeline.epochAt).toBeGreaterThanOrEqual(60000)
     expect(churn.rotations).toHaveLength(35)
-    expect(churn.stages).toHaveLength(KINDS.length * (35 + 11 + 5))
+    expect(churn.stages).toHaveLength(KINDS.length * (8 + 11))
     expect(timeline.setupMs).toBe(0)
     expect(processes.sent.filter((m) => m.type === 'corpus')).toHaveLength(KINDS.length)
     expect(processes.sent.filter((m) => m.type === 'finish')).toHaveLength(KINDS.length)
     expect(timeline.boundaryAt - timeline.epochAt).toBeGreaterThanOrEqual(360000)
+    churn.judge([], { errors: [], exits: {}, oracle: { ok: true } }, timeline, schedule)
+    const verdict = churn.record.mock.calls.map(([row]) => row).find((r) => r.kind === 'verdict')
+    expect(verdict.measured).toEqual({ subscription: 30, retire: 10, reopen: 6 })
+    expect(verdict.violations.filter((v) => v.startsWith('measured '))).toEqual([])
   })
 
   test('joins all confirmation fences before rotating the subscription', async () => {
@@ -2754,7 +2863,7 @@ describe('telemetry profile parent', () => {
     releaseFence()
     await ticking
     expect(fixture.rotate.mock.calls[0]).toEqual([1, 'com.example.', 1500])
-    expect(processes.sent.filter((m) => m.type === 'confirm-fence')).toHaveLength(35 * KINDS.length)
+    expect(processes.sent.filter((m) => m.type === 'confirm-fence')).toHaveLength(8 * KINDS.length)
   })
 
   test('fails a measured tick that is more than its late bound behind and never catches it up', async () => {
@@ -2992,6 +3101,17 @@ describe('telemetry churn verification of one worker', () => {
 
     test('accepts the immediate same-object reopen with its replacement Get', () => {
       expect(() => verifyChurnReopen(base())).not.toThrow()
+    })
+
+    test('checks subscription release against raw close and reconnect times', () => {
+      const input = base()
+      input.claim.closedAt = 121
+      input.releasedAt = 123
+      expect(() => verifyChurnReopen(input)).not.toThrow()
+      for (const releasedAt of [110, 126])
+        expect(() => verifyChurnReopen({ ...input, releasedAt })).toThrow(
+          'The subscription release is outside the disconnected lifecycle gap'
+        )
     })
 
     test.each([
@@ -3408,10 +3528,12 @@ describe('telemetry churn complete-stream accounting', () => {
   }
 
   test('rejects an undeclared 117 after a subscription transition', () => {
-    expect(verify((t) => {
-      const push = t.records.find((r) => r.apiKey === 72 && !r.terminating && r.response)
-      push.response.errorCode = 117
-    })).toThrow('Undeclared error 117')
+    expect(
+      verify((t) => {
+        const push = t.records.find((r) => r.apiKey === 72 && !r.terminating && r.response)
+        push.response.errorCode = 117
+      })
+    ).toThrow('Undeclared error 117')
   })
 
   test('accounts for every request, the faulted exchange and the one final', () => {
@@ -3669,13 +3791,16 @@ describe('telemetry churn coordinated stage replay', () => {
         const sentAt = t
         let releasedAt
         if (stage === 'confirm') {
-          rotations.push({
-            tick: tick.number,
-            index: tick.index,
-            requestedAt: t + 3,
-            setAt: t + 4,
-            readbackAt: t + 5,
-          })
+          for (const index of tick.transitions)
+            rotations.push({
+              tick: tick.number,
+              index,
+              selection: table.selection(index),
+              readback: table.selection(index),
+              requestedAt: t + 3,
+              setAt: t + 3,
+              readbackAt: t + 3,
+            })
           releasedAt = t + 6
         }
         for (const kind of KINDS) {
@@ -3701,8 +3826,8 @@ describe('telemetry churn coordinated stage replay', () => {
           })
           const { claims } = workers[kind]
           workers[kind].stages.push({ tick: tick.number, stage, startedAt, doneAt })
-          if (stage === 'lifecycle')
-            claims.reopens.push({ tick: tick.number, observedAt: startedAt, closedAt: doneAt })
+          if (stage === 'confirm')
+            claims.reopens.push({ tick: tick.number, observedAt: startedAt, closedAt: startedAt })
           if (stage === 'retire')
             claims.retirements.push({ tick: tick.number, declaredAt: startedAt, faultedAt: doneAt })
           if (stage === 'confirm')
@@ -3755,7 +3880,7 @@ describe('telemetry churn coordinated stage replay', () => {
     const counts = verifyChurnStages({ archive: input.archive, timeline: input.timeline })
     expect(Object.keys(counts)).toEqual([...KINDS])
     for (const kind of KINDS)
-      expect(counts[kind]).toEqual({ subscription: 30, retire: 10, reopen: 5 })
+      expect(counts[kind]).toEqual({ subscription: 30, retire: 10, reopen: 6 })
   })
 
   test('accepts a polled readback only before every worker release', () => {
@@ -3772,7 +3897,7 @@ describe('telemetry churn coordinated stage replay', () => {
       input.archive.workers[kind].claims.transitions[0].releasedAt += 250
     }
     expect(verifyChurnStages(input).producer.subscription).toBe(30)
-    rotation.readbackAt += 2
+    rotation.readbackAt += 4
     expect(() => verifyChurnStages(input)).toThrow(
       'The set and readback are outside their stage barrier'
     )
@@ -3847,8 +3972,21 @@ describe('telemetry churn coordinated stage replay', () => {
     ],
     [
       'a claim outside its own stage',
-      (a) => (a.workers.producer.claims.reopens[0].closedAt += 1),
-      'lies outside its lifecycle stage',
+      (a) => (a.workers.producer.claims.reopens[0].closedAt += 10),
+      'lies outside its confirm stage',
+    ],
+    [
+      'a transition while a lifecycle is still active',
+      (a) => {
+        const facts = a.workers.producer
+        facts.claims.reopens[0].closedAt = facts.stages[0].startedAt + 5
+      },
+      'A subscription transition was released inside an active lifecycle',
+    ],
+    [
+      'a transition without a disconnected lifecycle boundary',
+      (a) => a.workers.producer.claims.reopens.shift(),
+      'The subscription transition has no disconnected lifecycle boundary',
     ],
     [
       'an advertised measurement interval',
@@ -4214,7 +4352,7 @@ describe('telemetry churn archive replay', () => {
 
   /**
    * A complete churn archive with an empty tick table, so no stage, reopen, retirement or
-   * transition is claimed and the resource, oracle and stage arithmetic is stubbed: per kind, seven
+   * transition is claimed and the resource, oracle and stage arithmetic is stubbed: per kind, ten
    * lifecycles (a setup Get; the initial custom Get, its proving Push and an empty readback; plain
    * Gets after), with the sink rows, decoder receipts, worker facts, handshakes and parent rows that
    * join them. The producer's initial lifecycle also writes two gzip and one zstd Push, each resolved
@@ -4256,7 +4394,7 @@ describe('telemetry churn archive replay', () => {
           responseAt: at + 5,
         },
       })
-      for (let n = 0; n < 7; n++) {
+      for (let n = 0; n < 10; n++) {
         const id = name(n)
         const records = [get(1, n === 1 ? ['com.example.'] : [], 10)]
         const lines = []
@@ -4385,7 +4523,7 @@ describe('telemetry churn archive replay', () => {
           transitions: [],
           proofs: [],
         },
-        journal: Array.from({ length: 6 }, (_, n) => ({
+        journal: Array.from({ length: 9 }, (_, n) => ({
           seq: n + 1,
           type: 'select',
           from: name(n),
@@ -4463,7 +4601,7 @@ describe('telemetry churn archive replay', () => {
         consumer: { handled: workers.consumer.ordinary.handled },
         shareConsumer: {
           group: share.group,
-          closures: Array.from({ length: 7 }, () => ({ at: 90, end: 95 })),
+          closures: Array.from({ length: 10 }, () => ({ at: 90, end: 95 })),
           handled: workers.shareConsumer.ordinary.handled,
           exchangesSha256: share.exchangesSha256,
           settled: share.settled,
@@ -4672,7 +4810,7 @@ describe('telemetry control warm-up', () => {
         clock: { now: () => ++at },
         sleep: async (ms) => {
           at += ms
-          if (ms === 2000) events.push('idle')
+          if (ms === 2000 || ms === 10000) events.push('idle')
         },
         gc: () => {},
         engine: { record: (reading) => events.push(reading.phase) },
@@ -4701,6 +4839,9 @@ describe('telemetry control warm-up', () => {
       expect(result.warmup.completedAt - result.warmup.idleStartedAt).toBeGreaterThanOrEqual(
         kind === 'shareConsumer' ? 10000 : 2000
       )
+      expect(result.warmup.completedAt - result.warmup.idleStartedAt).toBeLessThan(
+        (kind === 'shareConsumer' ? 10000 : 2000) + 10
+      )
       expect(result.warmup.completedAt).toBeLessThanOrEqual(result.c0.gc.admittedAt)
       expect(result.outcomes).toHaveLength(result.manifest.operations.length)
       expect(result.outcomes.every((o) => o.at > result.c0.at && o.at < result.c1.at)).toBe(true)
@@ -4709,35 +4850,37 @@ describe('telemetry control warm-up', () => {
   )
 
   test('tops up an idle timer that fires early so the warm-up idle lasts the full window', async () => {
-    let at = 0
-    const client = {
-      connect: async () => {},
-      subscribe: async () => {},
-      run: async () => {},
-      disconnect: async () => {},
-      describeCluster: async () => {},
+    for (const kind of ['consumer', 'shareConsumer']) {
+      let at = 0
+      const client = {
+        connect: async () => {},
+        subscribe: async () => {},
+        run: async () => {},
+        disconnect: async () => {},
+        describeCluster: async () => {},
+      }
+      const { ReferenceControl, CONTROL } = require('../telemetryChurn')
+      const result = await new ReferenceControl({
+        kind,
+        config: { stem: 's', topic: 's-topic', ctl: 's-ctl', group: 's-group' },
+        Kafka: function Kafka() {
+          return { [kind]: () => client }
+        },
+        socketFactory: () => {},
+        logLevel: { NOTHING: 0 },
+        resources: { as: (_role, work) => work(), live: new Map() },
+        clock: { now: () => at },
+        sleep: async (ms) => {
+          at += ms >= CONTROL.idleMs ? ms - 0.35 : ms
+        },
+        gc: () => {},
+        engine: { record: () => {} },
+      }).run()
+      expect(result.warmup.completedAt - result.warmup.idleStartedAt).toBeGreaterThanOrEqual(
+        CONTROL.idleMs * (kind === 'shareConsumer' ? 5 : 1)
+      )
+      expect(result.warmup.completedAt).toBeLessThanOrEqual(result.c0.gc.admittedAt)
     }
-    const { ReferenceControl, CONTROL } = require('../telemetryChurn')
-    const result = await new ReferenceControl({
-      kind: 'consumer',
-      config: { stem: 's', topic: 's-topic', ctl: 's-ctl', group: 's-group' },
-      Kafka: function Kafka() {
-        return { consumer: () => client }
-      },
-      socketFactory: () => {},
-      logLevel: { NOTHING: 0 },
-      resources: { as: (_role, work) => work(), live: new Map() },
-      clock: { now: () => at },
-      sleep: async (ms) => {
-        at += ms === CONTROL.idleMs ? ms - 0.35 : ms
-      },
-      gc: () => {},
-      engine: { record: () => {} },
-    }).run()
-    expect(result.warmup.completedAt - result.warmup.idleStartedAt).toBeGreaterThanOrEqual(
-      CONTROL.idleMs
-    )
-    expect(result.warmup.completedAt).toBeLessThanOrEqual(result.c0.gc.admittedAt)
   })
 
   test('preserves the frozen long-window control catalogue and three readings', async () => {
@@ -4752,43 +4895,47 @@ describe('telemetry control warm-up', () => {
       if (previous === undefined) delete process.env.TELEMETRY_LONG_WINDOW
       else process.env.TELEMETRY_LONG_WINDOW = previous
     }
-    const events = []
-    let at = 0
-    const result = await new Control({
-      kind: 'admin',
-      config: { stem: 's', topic: 't', ctl: 'ctl', group: 'g' },
-      Kafka: function Kafka() {
-        return {
-          admin: () => ({
-            connect: async () => {},
-            disconnect: async () => {},
-            describeCluster: async () => events.push('operation'),
-          }),
-        }
-      },
-      socketFactory: () => {},
-      logLevel: { NOTHING: 0 },
-      resources: { as: (_role, work) => work(), live: new Map() },
-      clock: { now: () => ++at },
-      sleep: async (ms) => {
-        at += ms
-        events.push(ms)
-      },
-      gc: () => {},
-      engine: { record: (reading) => events.push(reading.phase) },
-    }).run()
-    expect(events).toEqual([
-      2000,
-      100,
-      'c0',
-      ...Array(10).fill('operation'),
-      2000,
-      100,
-      'c1',
-      100,
-      'control-released',
-    ])
-    expect(result).not.toHaveProperty('warmup')
-    expect(result.outcomes).toHaveLength(10)
+    for (const kind of ['admin', 'shareConsumer']) {
+      const events = []
+      let at = 0
+      const result = await new Control({
+        kind,
+        config: { stem: 's', topic: 't', ctl: 'ctl', group: 'g' },
+        Kafka: function Kafka() {
+          return {
+            [kind]: () => ({
+              subscribe: async () => {},
+              run: async () => {},
+              connect: async () => {},
+              disconnect: async () => {},
+              describeCluster: async () => events.push('operation'),
+            }),
+          }
+        },
+        socketFactory: () => {},
+        logLevel: { NOTHING: 0 },
+        resources: { as: (_role, work) => work(), live: new Map() },
+        clock: { now: () => ++at },
+        sleep: async (ms) => {
+          at += ms
+          events.push(ms)
+        },
+        gc: () => {},
+        engine: { record: (reading) => events.push(reading.phase) },
+      }).run()
+      expect(events).toEqual([
+        2000,
+        100,
+        'c0',
+        ...Array(kind === 'admin' ? 10 : 0).fill('operation'),
+        2000,
+        100,
+        'c1',
+        100,
+        'control-released',
+      ])
+      expect(result).not.toHaveProperty('warmup')
+      expect(result.outcomes).toHaveLength(kind === 'admin' ? 10 : 0)
+    }
   })
 })

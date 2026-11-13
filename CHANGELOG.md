@@ -74,6 +74,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Tooling
 
+- Apply all 35 five-minute telemetry subscription transitions in disconnected batches before the next handshake, retain the error-42-only contract and socket retirement slots, and use eight public reopen cycles within the unchanged segment cap; the long-window method is unchanged.
+- Idle the share consumer's five-minute telemetry-disabled control for 10 seconds before C0, retaining 2 seconds for other kinds, the 2-second validator minimum and both drift limits.
 - Warm the five-minute telemetry-disabled control catalogue and idle window before C0, validate its separate outcomes and timing, and retain both drift limits and the frozen long-window method.
 - Allow resource-control C0/C1 up to twelve GC rounds with the same 16 KiB settle rule; other readings keep six, and an unsettled control remains inconclusive.
 - Run every memory child with eager compilation and both semi-space sizes pinned to 1 MiB; telemetry churn and long-window worker flags stay unchanged.

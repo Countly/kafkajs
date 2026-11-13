@@ -597,7 +597,8 @@ const writeFence = (segments) => ({
 
 /**
  * The deterministic action table of one run, derived from the fixed schedule alone: what happens at
- * which millisecond after the epoch, split into the three coordinated stages of every tick.
+ * which millisecond after the epoch. The five-minute lane batches the original ordered selections
+ * into disconnected public boundaries; the long-window lane retains its original three stages.
  */
 class TelemetrySchedule {
   /**
@@ -609,6 +610,7 @@ class TelemetrySchedule {
     this.warmupMs = warmupMs
     this.corpusStartMs = corpusStartMs
     this.endMs = warmupMs + measureMs
+    this.betweenLifecycles = SCENARIO === 'telemetry-churn' && measureMs <= 300000
     const at = new Map()
     for (const [action, step] of [
       ['reopen', STEPS.reopenMs],
@@ -624,6 +626,26 @@ class TelemetrySchedule {
         index: ms / STEPS.subscriptionMs,
         actions: ORDER.filter((a) => actions.includes(a)),
       }))
+    if (this.betweenLifecycles) {
+      const pending = []
+      this.ticks = this.ticks
+        .flatMap((tick) => {
+          pending.push(tick.index)
+          const flush =
+            tick.index === 1 ||
+            tick.at + STEPS.subscriptionMs === warmupMs ||
+            tick.actions.includes('reopen') ||
+            tick.at + STEPS.subscriptionMs === this.endMs
+          const transitions = flush ? pending.splice(0) : []
+          const actions = [
+            ...(transitions.length ? ['reopen'] : []),
+            ...(tick.actions.includes('retire') ? ['retire'] : []),
+            ...(transitions.length ? ['subscription'] : []),
+          ]
+          return actions.length ? [{ ...tick, actions, transitions }] : []
+        })
+        .map((tick, number) => ({ ...tick, number }))
+    }
   }
 
   /**
@@ -637,6 +659,11 @@ class TelemetrySchedule {
    * @param {{actions:string[]}} tick one table row @returns {string[]} its stages, in order
    */
   stages(tick) {
+    if (this.betweenLifecycles)
+      return [
+        ...(tick.transitions.length ? ['confirm'] : []),
+        ...(tick.actions.includes('retire') ? ['retire'] : []),
+      ]
     return tick.actions.map((action) => STAGE_OF[action])
   }
 
@@ -655,7 +682,9 @@ class TelemetrySchedule {
   required() {
     const counts = { subscription: 0, retire: 0, reopen: 0 }
     for (const tick of this.ticks)
-      if (this.measured(tick)) for (const action of tick.actions) counts[action] += 1
+      if (this.measured(tick))
+        for (const action of tick.actions)
+          counts[action] += action === 'subscription' ? (tick.transitions?.length ?? 1) : 1
     return counts
   }
 
@@ -3088,13 +3117,49 @@ class TelemetryWorker {
   }
 
   /**
-   * Captures and acknowledges the write fence before the parent may rotate the subscription.
-   * @param {{tick:number, index:number, selection:string}} command the pending transition
-   * @returns {void} the receipt contains only scalar observer and clock facts
-   * @throws {Error} for overlapping fences
+   * In the five-minute lane, pauses admission and closes the public lifecycle before acknowledging
+   * the fence; reconnect waits for the parent's batch readbacks. The frozen long-window fence
+   * only captures its original write cursor.
+   * @param {{tick:number, index:number, selection:string, transitions?:number[]}} command pending batch
+   * @returns {Promise<void>} the receipt contains only scalar observer and clock facts
+   * @throws {Error} for overlapping fences, a failed close or an undrained previous segment
    */
-  fenceConfirmation(command) {
+  async fenceConfirmation(command) {
     if (this.confirmation) throw new Error('A confirmation fence is already pending')
+    if (command.transitions) {
+      await this.drained()
+      const pause = await this.target(() => this.ordinary.pause())
+      const observedAt = this.clock.now()
+      const cycle = this.target(() =>
+        this.segments.cycle(this.client, this.closeOptions(), () => {
+          this.confirmation.closedAt = this.clock.now()
+          this.confirmation.after = cycle.to.observer.checkpoint()
+          this.send({
+            type: 'confirm-fenced',
+            ...this.confirmation,
+            cycle: undefined,
+            resume: undefined,
+          })
+          return new Promise((resolve) => {
+            this.confirmation.resume = resolve
+          })
+        })
+      )
+      this.confirmation = {
+        tick: command.tick,
+        index: command.index,
+        selection: command.selection,
+        segment: cycle.to.id,
+        receivedAt: observedAt,
+        after: 0,
+        pause,
+        observedAt,
+        cycle,
+      }
+      await within(cycle.closed, 8000, `The ${this.kind} close`)
+      this.drain(cycle.from)
+      return
+    }
     const segment = this.segments.current()
     this.confirmation = {
       tick: command.tick,
@@ -3109,8 +3174,9 @@ class TelemetryWorker {
 
   /**
    * After the parent's successful readback, swaps one custom identity and proves the selection
-   * with a Get written after the acknowledged fence, including one already received before this
-   * release command. Discharges every owed current normal Push under the unchanged bounds.
+   * with a Get written after the acknowledged fence. The five-minute lane first releases the held
+   * reconnect, so its handshake follows all readbacks; the long-window lane can use a Get already
+   * received before this command. Discharges every owed current normal Push under unchanged bounds.
    * @param {{tick:number, index:number, selection:string}} command the stage release
    * @returns {Promise<object>} the facts of the stage
    * @throws {Error} for a missing or mismatched fence, no matching Get or no owed Push
@@ -3129,6 +3195,23 @@ class TelemetryWorker {
     this.confirmation = null
     const { receivedAt, after } = fence
     const releasedAt = this.clock.now()
+    if (fence.cycle) {
+      fence.resume()
+      await within(fence.cycle.reopened, 10000, `The ${this.kind} reconnect`)
+      const cached = await this.target(() => this.client.clientInstanceId({ timeout: 0 }))
+      if (cached !== this.uuid) throw new Error('The instance ID changed across a public reopen')
+      await this.target(() => this.ordinary.resume())
+      this.claims.reopens.push({
+        tick: command.tick,
+        from: fence.cycle.from.id,
+        to: segment.id,
+        observedAt: fence.observedAt,
+        closedAt: fence.closedAt,
+        cachedUuid: cached,
+        pause: fence.pause,
+      })
+      if (command.selection !== '') this.owed.add('reopen')
+    }
     const replacement = this.registry.replace(command.tick)
     const list = command.selection === '' ? [] : [command.selection]
     const get = await this.find('selection Get', STAGE_MS.confirm - 2000, () =>
@@ -3137,6 +3220,7 @@ class TelemetryWorker {
         selection: list,
       })
     )
+    if (fence.cycle) this.claims.reopens.at(-1).get = get.requestKey
     const claim = {
       tick: command.tick,
       index: command.index,
@@ -3150,37 +3234,47 @@ class TelemetryWorker {
       replacement,
       proof: null,
     }
-    if (this.owed.size) {
-      const open = this.tap.telemetry()
-      if (open.length !== 1 || open[0].segment !== segment.id)
-        throw new Error(`${this.kind}: expected one open telemetry socket for the owed proof`)
-      const records = () => segment.observer.readTranscript({ after: 0 })
-      const current = TelemetryProofs.gets(records(), this.uuid)
-        .filter((g) => g.socketId === open[0].ordinal)
-        .at(0)
-      if (!current) throw new Error(`${this.kind}: the current socket has no replacement Get`)
-      const push = await this.find('owed current Push', TICK_PROOF_MS, () =>
-        TelemetryProofs.provingPush(
-          segment.observer.readTranscript({ after: current.index - 1 }),
-          current
-        )
-      )
-      claim.proof = {
-        socketId: open[0].ordinal,
-        get: current.requestKey,
-        push: push.requestKey,
-        owedBy: [...this.owed],
-      }
-      this.claims.proofs.push({
-        tick: command.tick,
-        segment: segment.id,
-        push: push.requestKey,
-        owedBy: [...this.owed],
-      })
-      this.owed.clear()
-    }
+    claim.proof = await this.proveOwed(command.tick)
     this.claims.transitions.push(claim)
     return claim
+  }
+
+  /**
+   * Proves every pending lifecycle or retirement obligation on the current socket.
+   * @param {number} tick schedule row @returns {Promise<object|null>} current Push proof, if owed
+   * @throws {Error} when the current socket has no successful Get or normal Push
+   */
+  async proveOwed(tick) {
+    const segment = this.segments.current()
+    if (!this.owed.size) return null
+    const open = this.tap.telemetry()
+    if (open.length !== 1 || open[0].segment !== segment.id)
+      throw new Error(`${this.kind}: expected one open telemetry socket for the owed proof`)
+    const records = () => segment.observer.readTranscript({ after: 0 })
+    const current = TelemetryProofs.gets(records(), this.uuid)
+      .filter((g) => g.socketId === open[0].ordinal)
+      .at(0)
+    if (!current) throw new Error(`${this.kind}: the current socket has no replacement Get`)
+    const push = await this.find('owed current Push', TICK_PROOF_MS, () =>
+      TelemetryProofs.provingPush(
+        segment.observer.readTranscript({ after: current.index - 1 }),
+        current
+      )
+    )
+    const proof = {
+      socketId: open[0].ordinal,
+      get: current.requestKey,
+      push: push.requestKey,
+      owedBy: [...this.owed],
+    }
+    this.claims.proofs.push({
+      tick,
+      segment: segment.id,
+      push: push.requestKey,
+      owedBy: [...this.owed],
+    })
+    this.owed.clear()
+    return proof
   }
 
   /**
@@ -3195,11 +3289,11 @@ class TelemetryWorker {
       return
     }
     const tick = this.schedule.ticks[command.tick]
-    if (!tick || !tick.actions.map((a) => STAGE_OF[a]).includes(command.stage))
+    if (!tick || !this.schedule.stages(tick).includes(command.stage))
       throw new Error(`A stage the fixed table does not hold: ${command.tick}/${command.stage}`)
     if (command.type === 'confirm-fence') {
       if (command.stage !== 'confirm') throw new Error('Only confirmation stages have a fence')
-      this.fenceConfirmation(command)
+      await this.fenceConfirmation(command)
       return
     }
     this.peak?.phase(
@@ -3208,11 +3302,14 @@ class TelemetryWorker {
     )
     const startedAt = command.stage === 'confirm' ? this.confirmation?.receivedAt : this.clock.now()
     if (command.stage === 'lifecycle') await this.reopen(command)
-    else if (command.stage === 'retire') await this.retire(command)
-    else await this.confirm(command)
+    else if (command.stage === 'retire') {
+      await this.retire(command)
+      if (this.schedule.betweenLifecycles) await this.proveOwed(command.tick)
+    } else await this.confirm(command)
     const bucket = this.schedule.measured(tick) ? this.actions.measured : this.actions.warm
     const action = { lifecycle: 'reopen', retire: 'retire', confirm: 'subscription' }[command.stage]
-    bucket[action] += 1
+    bucket[action] += command.stage === 'confirm' ? (command.transitions?.length ?? 1) : 1
+    if (command.stage === 'confirm' && command.transitions) bucket.reopen += 1
     const doneAt = this.clock.now()
     this.stages.push({ tick: command.tick, stage: command.stage, startedAt, doneAt })
     this.send({ type: 'stage-done', tick: command.tick, stage: command.stage, startedAt, doneAt })
@@ -3565,10 +3662,11 @@ class ReferenceControl {
           )
           warmup.idleStartedAt = clock.now()
         }
-        await this.sleep(CONTROL.idleMs)
+        const warmupIdleMs = CONTROL.idleMs * (warmup && kind === 'shareConsumer' ? 5 : 1)
+        await this.sleep(warmupIdleMs)
         if (warmup) {
           // A timer may fire a fraction of a millisecond early against this clock.
-          while (clock.now() - warmup.idleStartedAt < CONTROL.idleMs) await this.sleep(1)
+          while (clock.now() - warmup.idleStartedAt < warmupIdleMs) await this.sleep(1)
           warmup.completedAt = clock.now()
         }
         c0 = await settledReading('c0', io)
@@ -3912,8 +4010,9 @@ class TelemetryChurn {
 
   /**
    * The fixed tick catalogue. At every tick the stages run in order and are joined across all four
-   * workers: close and immediate connect, then telemetry retirement, then the parent's set and
-   * readback between the joined worker fences and their released selection confirmations. A tick
+   * workers. In the five-minute lane, each confirmation fence closes its public lifecycle; every
+   * original set/readback in the batch then precedes the reconnect and confirmation, followed by
+   * any scheduled telemetry retirement. The long-window lane retains its original stage order. A tick
    * more than the late bound behind is a missed tick and is never caught up.
    * @param {number} epoch the monotonic reading at which the schedule began
    * @param {TelemetrySchedule} schedule the fixed catalogue @returns {Promise<void>} after the last tick
@@ -3946,6 +4045,7 @@ class TelemetryChurn {
           stage,
           index: tick.index,
           selection: schedule.selection(tick.index),
+          ...(tick.transitions && { transitions: tick.transitions }),
         }
         let fences = null
         if (stage === 'confirm') {
@@ -3963,15 +4063,17 @@ class TelemetryChurn {
             ),
             this.abort,
           ])
-          const requestedAt = this.clock.now()
-          const rotation = await this.own(
-            this.fixture.rotate(
-              tick.index,
-              schedule.selection(tick.index),
-              Math.min(STAGE_MS.confirm - 1000, remaining())
+          for (const index of tick.transitions ?? [tick.index]) {
+            const requestedAt = this.clock.now()
+            const rotation = await this.own(
+              this.fixture.rotate(
+                index,
+                schedule.selection(index),
+                Math.min(STAGE_MS.confirm - 1000, remaining())
+              )
             )
-          )
-          this.rotations.push({ tick: tick.number, requestedAt, ...rotation })
+            this.rotations.push({ tick: tick.number, requestedAt, ...rotation })
+          }
         }
         const releasedAt = this.clock.now()
         for (const kind of KINDS) this.processes.send(kind, { type: 'stage', ...command })
@@ -4246,8 +4348,10 @@ class TelemetryChurn {
                 (s) => s.tick === tick.number && s.stage === stage && s.kind === kind
               )
             )
-          )
-            measured[unit[stage]] += 1
+          ) {
+            measured[unit[stage]] += stage === 'confirm' ? (tick.transitions?.length ?? 1) : 1
+            if (stage === 'confirm' && tick.transitions) measured.reopen += 1
+          }
     for (const action of Object.keys(need))
       if (measured[action] < need[action] || measured[action] < MINIMUMS[action])
         violations.push(`measured ${action} stages ${measured[action]} of ${need[action]}`)

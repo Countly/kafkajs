@@ -231,7 +231,7 @@
         "scripts/soak/__tests__/longWindow.spec.js \u203a long-window shadow candidate leaves the limits of the existing lane untouched",
         "scripts/soak/__tests__/longWindow.spec.js \u203a long-window shadow candidate keeps the traffic rate of the existing lane through warm-up and window",
         "scripts/soak/__tests__/longWindow.spec.js \u203a long-window shadow candidate selects the candidate only by its switch",
-        "scripts/soak/__tests__/longWindow.spec.js \u203a long-window sizing keeps the default corpus, segment and journal sizes byte-identical when the switch is unset",
+        "scripts/soak/__tests__/longWindow.spec.js \u203a long-window sizing keeps the default corpus and journals unchanged with ten disconnected churn segments",
         "scripts/soak/__tests__/longWindow.spec.js \u203a long-window sizing sizes the long run at 44,000 records and one segment per reopen plus two",
         "scripts/soak/__tests__/longWindow.spec.js \u203a long-window sizing reserves the longer share journal inside the setup allowance and the job",
         "scripts/soak/__tests__/longWindow.spec.js \u203a long-window sizing journals every native job and reading of the longer run with room",
@@ -20373,7 +20373,16 @@
         "scripts/soak/__tests__/soak.spec.js \u203a telemetry resident-size reference rejects unordered operations telemetry control warm-up evidence",
         "scripts/soak/__tests__/soak.spec.js \u203a telemetry resident-size reference rejects missing time telemetry control warm-up evidence",
         "scripts/soak/__tests__/soak.spec.js \u203a telemetry resident-size reference rejects before loading telemetry control warm-up evidence",
-        "scripts/soak/__tests__/soak.spec.js \u203a telemetry resident-size reference keeps both telemetry control drift boundaries after warm-up"
+        "scripts/soak/__tests__/soak.spec.js \u203a telemetry resident-size reference keeps both telemetry control drift boundaries after warm-up",
+        "scripts/soak/__tests__/telemetryChurn.spec.js \u203a telemetry profile releases every subscription batch between lifecycle windows",
+        "scripts/soak/__tests__/telemetryChurn.spec.js \u203a telemetry profile worker keeps producer transition releases outside every active lifecycle window",
+        "scripts/soak/__tests__/telemetryChurn.spec.js \u203a telemetry profile worker keeps consumer transition releases outside every active lifecycle window",
+        "scripts/soak/__tests__/telemetryChurn.spec.js \u203a telemetry profile worker keeps admin transition releases outside every active lifecycle window",
+        "scripts/soak/__tests__/telemetryChurn.spec.js \u203a telemetry profile worker keeps shareConsumer transition releases outside every active lifecycle window",
+        "scripts/soak/__tests__/telemetryChurn.spec.js \u203a telemetry churn verification of one worker reopen checks subscription release against raw close and reconnect times",
+        "scripts/soak/__tests__/telemetryChurn.spec.js \u203a telemetry churn complete-stream accounting rejects an undeclared 117 after a subscription transition",
+        "scripts/soak/__tests__/telemetryChurn.spec.js \u203a telemetry churn coordinated stage replay refuses a transition while a lifecycle is still active",
+        "scripts/soak/__tests__/telemetryChurn.spec.js \u203a telemetry churn coordinated stage replay refuses a transition without a disconnected lifecycle boundary"
       ],
       "capMinutes": 85,
       "allowedSkips": [
@@ -24865,7 +24874,16 @@
         "scripts/soak/__tests__/soak.spec.js \u203a telemetry resident-size reference rejects unordered operations telemetry control warm-up evidence",
         "scripts/soak/__tests__/soak.spec.js \u203a telemetry resident-size reference rejects missing time telemetry control warm-up evidence",
         "scripts/soak/__tests__/soak.spec.js \u203a telemetry resident-size reference rejects before loading telemetry control warm-up evidence",
-        "scripts/soak/__tests__/soak.spec.js \u203a telemetry resident-size reference keeps both telemetry control drift boundaries after warm-up"
+        "scripts/soak/__tests__/soak.spec.js \u203a telemetry resident-size reference keeps both telemetry control drift boundaries after warm-up",
+        "scripts/soak/__tests__/telemetryChurn.spec.js \u203a telemetry profile releases every subscription batch between lifecycle windows",
+        "scripts/soak/__tests__/telemetryChurn.spec.js \u203a telemetry profile worker keeps producer transition releases outside every active lifecycle window",
+        "scripts/soak/__tests__/telemetryChurn.spec.js \u203a telemetry profile worker keeps consumer transition releases outside every active lifecycle window",
+        "scripts/soak/__tests__/telemetryChurn.spec.js \u203a telemetry profile worker keeps admin transition releases outside every active lifecycle window",
+        "scripts/soak/__tests__/telemetryChurn.spec.js \u203a telemetry profile worker keeps shareConsumer transition releases outside every active lifecycle window",
+        "scripts/soak/__tests__/telemetryChurn.spec.js \u203a telemetry churn verification of one worker reopen checks subscription release against raw close and reconnect times",
+        "scripts/soak/__tests__/telemetryChurn.spec.js \u203a telemetry churn complete-stream accounting rejects an undeclared 117 after a subscription transition",
+        "scripts/soak/__tests__/telemetryChurn.spec.js \u203a telemetry churn coordinated stage replay refuses a transition while a lifecycle is still active",
+        "scripts/soak/__tests__/telemetryChurn.spec.js \u203a telemetry churn coordinated stage replay refuses a transition without a disconnected lifecycle boundary"
       ],
       "capMinutes": 93,
       "allowedSkips": [

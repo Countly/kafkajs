@@ -3743,7 +3743,7 @@ describe('telemetry observation segments', () => {
 
   test('holds each kind to its fixed schedule and cap', async () => {
     expect(segmentCatalogue('telemetry-shutdown')).toHaveLength(89)
-    expect(segmentCatalogue('telemetry-churn')).toHaveLength(28)
+    expect(segmentCatalogue('telemetry-churn')).toHaveLength(40)
     const l5 = ordinary()
     const client = fakeClient(l5)
     for (let round = 1; round < SCHEDULES['telemetry-shutdown'].perKind; round++)
@@ -3757,7 +3757,7 @@ describe('telemetry observation segments', () => {
     const churn = fakeClient(l9)
     for (let round = 1; round < 16; round++) await l9.discharge((await rotate(l9, churn)).from)
     expect(() => l9.cycle(churn)).toThrow('Segment cap of 16')
-    await expect(l9.finish(churn)).rejects.toThrow('Expected 7 segments, found 16')
+    await expect(l9.finish(churn)).rejects.toThrow('Expected 10 segments, found 16')
   })
 
   test('seals exactly two files holding every payload and proof', async () => {
@@ -4034,8 +4034,8 @@ describe('telemetry profile', () => {
     await l9.discharge(cycle.from)
     for (let round = 2; round < 16; round++) await l9.discharge((await rotate(l9, fake)).from)
     expect(() => l9.cycle(fake)).toThrow('Segment cap of 16')
-    expect(SCHEDULES['telemetry-churn'].perKind).toBe(7)
-    await expect(l9.finish(fake)).rejects.toThrow('Expected 7 segments, found 16')
+    expect(SCHEDULES['telemetry-churn'].perKind).toBe(10)
+    await expect(l9.finish(fake)).rejects.toThrow('Expected 10 segments, found 16')
 
     // The fixed catalogues, then a complete archive that proves them.
     const catalogue = segmentCatalogue('telemetry-shutdown')
