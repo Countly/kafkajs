@@ -37,6 +37,7 @@ const { compareSnapshots } = require('../../../testHelpers/resourceProbe')
 const {
   MEMORY_FLAGS,
   SETTLE,
+  CONTROL_SETTLE_ROUNDS,
   collectionsSettled,
   dataBytes,
   peakReadingDecreases,
@@ -526,12 +527,14 @@ class MemoryArmJudge {
    * Replays every collection pair and convergence, without trusting a declared settled flag.
    * @param {string} name checkpoint name @param {object} reading the final reading and GC journal
    * @returns {void} records incomplete facts or unconverged collections; only active readings may
-   *   remain unconverged without making the measurement inconclusive
+   *   remain unconverged without making the measurement inconclusive. Only c0/c1 may use twelve
+   *   pairs; all other readings retain the six-pair budget and the same 16 KiB convergence rule.
    */
   collectionHistory(name, reading) {
     const gc = reading.gc
     const points = gc?.checkpoints
-    if (!Array.isArray(points) || points.length < 2 || points.length > SETTLE.rounds) {
+    const rounds = ['c0', 'c1'].includes(name) ? CONTROL_SETTLE_ROUNDS : SETTLE.rounds
+    if (!Array.isArray(points) || points.length < 2 || points.length > rounds) {
       this.fail(`${name} collection checkpoints are incomplete`)
       return
     }

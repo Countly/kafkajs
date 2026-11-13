@@ -3456,7 +3456,8 @@ const runCatalogue = async (client, manifest, prefix, now) => {
  * The telemetry-disabled reference of one worker: the same kind, process, loaded modules, topic
  * and resident subscription as the enabled client, running the frozen foreground catalogue between
  * two settled readings that bracket it at the same idle resident state, then a complete release
- * before the enabled client exists. It performs no telemetry work and proves that.
+ * before the enabled client exists. The five-minute lane warms the catalogue and its idle window
+ * before c0, recording those outcomes separately. It performs no telemetry work and proves that.
  */
 class ReferenceControl {
   /**
@@ -3501,7 +3502,8 @@ class ReferenceControl {
 
   /**
    * @returns {Promise<object>} the control facts: the frozen manifest and every outcome, both
-   *   settled readings bracketing the catalogue, the release reading, the telemetry frames it sent
+   *   settled readings bracketing the catalogue, the five-minute warm-up outcomes and idle times,
+   *   the release reading, the telemetry frames it sent
    *   (none), the sockets and handles it left (none)
    * @throws {Error} a failed foreground operation or a control that is still holding something
    */
@@ -3541,6 +3543,7 @@ class ReferenceControl {
                 })
       let c0
       let c1
+      let warmup
       let outcomes = []
       try {
         await client.connect()
@@ -3552,7 +3555,18 @@ class ReferenceControl {
           await client.subscribe({ topics: [manifest.topic] })
           await client.run({ eachMessage: async () => {} })
         }
+        if (SCENARIO === 'telemetry-churn') {
+          warmup = { startedAt: clock.now() }
+          warmup.outcomes = await runCatalogue(
+            client,
+            manifest,
+            `${config.stem}:ctl-warmup`,
+            io.now
+          )
+          warmup.idleStartedAt = clock.now()
+        }
         await this.sleep(CONTROL.idleMs)
+        if (warmup) warmup.completedAt = clock.now()
         c0 = await settledReading('c0', io)
         outcomes = await runCatalogue(client, manifest, `${config.stem}:ctl-off`, io.now)
         await this.sleep(CONTROL.idleMs)
@@ -3572,6 +3586,7 @@ class ReferenceControl {
         kind,
         manifest,
         outcomes,
+        ...(warmup && { warmup }),
         catalogue: manifest.operations.length,
         telemetryFrames: counter.frames,
         openSockets: counter.open,

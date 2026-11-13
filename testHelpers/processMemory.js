@@ -32,6 +32,8 @@ const MEMORY_FLAGS = Object.freeze([
 
 /** Collection convergence is stricter than any retained gate; it never changes an acceptance value. */
 const SETTLE = Object.freeze({ rounds: 6, bytes: 16384 })
+/** Only the resource control c0/c1 may spend this many collection pairs reaching convergence. */
+const CONTROL_SETTLE_ROUNDS = 12
 
 /**
  * @param {object|undefined} before preceding post-GC reading
@@ -273,22 +275,25 @@ class ProcessMemory {
 
   /**
    * Repeats the two-collection/100 ms protocol until two successive readings converge, with at
-   * most six pairs. Every reading remains in the evidence and contributes to peak coverage. The
-   * last reading is returned even when convergence fails; no minimum or favourable endpoint is
+   * most six pairs by default, or twelve for resource control c0/c1. Every reading remains in the
+   * evidence and contributes to peak coverage. The last reading is returned even when convergence
+   * fails; no minimum or favourable endpoint is
    * selected. Every checkpoint records the engine's bytecode and compiled-code sizes; only
    * `dataBytes` subtracts them, and only for the gates that name it.
    * @param {Function|null} [observe] diagnostic-only synchronous (round, stage) scalar observer;
    *   omitted in acceptance, with no additional reads, collections or turns
    * @param {Function|null} [completed] diagnostic-only synchronous observer of the final reading
+   * @param {number} [rounds=SETTLE.rounds] collection-pair budget; only resource control c0/c1 use
+   *   `CONTROL_SETTLE_ROUNDS`, with the same convergence rule
    * @returns {Promise<object>} the final reading and all GC admission/completion/engine facts
    * @throws {Error} when no collection function exists
    */
-  async settled(observe = null, completed = null) {
+  async settled(observe = null, completed = null, rounds = SETTLE.rounds) {
     if (typeof this.gc !== 'function') throw new Error('A settled reading needs node --expose-gc')
     const admittedAt = this.now()
     const before = this.collections
     const checkpoints = []
-    for (let round = 0; round < SETTLE.rounds; round++) {
+    for (let round = 0; round < rounds; round++) {
       const started = this.now()
       const observed = this.collections
       this.gc()
@@ -669,6 +674,7 @@ class BoundaryWitness {
 module.exports = {
   MEMORY_FLAGS,
   SETTLE,
+  CONTROL_SETTLE_ROUNDS,
   collectionsSettled,
   dataBytes,
   peakReadingDecreases,

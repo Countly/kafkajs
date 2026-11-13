@@ -527,8 +527,9 @@ class TelemetryResourceVerdict {
 
   /**
    * Judges the resident-size gates against the worker's own disabled control, over every reading
-   * of the versioned catalogue and the native work journal, which must hold at least one resolved
-   * production compression. Failures are pushed into `violations`; what only makes the measurement
+   * of the versioned catalogue, a completed control warm-up before c0, and the native work journal,
+   * which must hold at least one resolved production compression. Failures are pushed into
+   * `violations`; what only makes the measurement
    * uninformative is returned. Approximate peak-counter decreases, and a peak counter read below an
    * earlier resident size, are recorded in `measured` without invalidating the series or lowering
    * its all-read maxima.
@@ -623,6 +624,27 @@ class TelemetryResourceVerdict {
         control.outcomes.length === control.manifest.operations.length &&
         control.outcomes.every((o, n) => o.n === n && o.status === 'fulfilled'),
       'telemetry-disabled control'
+    )
+    const { CONTROL } = require('./telemetryChurn')
+    const warmup = control.warmup
+    fail(
+      [warmup?.startedAt, warmup?.idleStartedAt, warmup?.completedAt].every(Number.isFinite) &&
+        warmup.startedAt >= reference.loaded.at &&
+        warmup.idleStartedAt >= warmup.startedAt &&
+        warmup.completedAt - warmup.idleStartedAt >= CONTROL.idleMs &&
+        warmup.completedAt <= control.c0.gc?.admittedAt &&
+        warmup.completedAt < control.c0.at &&
+        Array.isArray(warmup.outcomes) &&
+        warmup.outcomes.length === control.manifest?.operations?.length &&
+        warmup.outcomes.every(
+          (o, n) =>
+            o?.n === n &&
+            o.status === 'fulfilled' &&
+            Number.isFinite(o.at) &&
+            o.at >= (n === 0 ? warmup.startedAt : warmup.outcomes[n - 1].at) &&
+            o.at <= warmup.idleStartedAt
+        ),
+      'telemetry-disabled control warm-up'
     )
     fail(
       Array.isArray(reference.foreground) &&

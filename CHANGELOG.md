@@ -74,6 +74,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Tooling
 
+- Warm the five-minute telemetry-disabled control catalogue and idle window before C0, validate its separate outcomes and timing, and retain both drift limits and the frozen long-window method.
+- Allow resource-control C0/C1 up to twelve GC rounds with the same 16 KiB settle rule; other readings keep six, and an unsettled control remains inconclusive.
 - Run every memory child with eager compilation and both semi-space sizes pinned to 1 MiB; telemetry churn and long-window worker flags stay unchanged.
 - Remove the five-minute telemetry closed transient ceiling; resources still judge closed growth above 256 KiB and the long-window lane still judges its endpoint.
 - Record unsettled active resource readings as facts while judging the 8 MiB ceiling over every active checkpoint; control, matched, warm-up and closed readings still require settlement.

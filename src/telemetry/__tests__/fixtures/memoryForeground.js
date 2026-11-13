@@ -11,6 +11,7 @@
  * share-only helpers, so an arm can finish all loading before its control.
  */
 const path = require('node:path')
+const { CONTROL_SETTLE_ROUNDS } = require('../../../../testHelpers/processMemory')
 
 const ROOT = path.join(__dirname, '..', '..', '..', '..')
 const { Kafka } = require(path.join(ROOT, 'index.js'))
@@ -485,7 +486,8 @@ class MemoryForeground {
  * client, over `lifecycles` public opens, with settled readings C0 after the first and C1 after
  * the last (both with the client connected and idle), then a public close, release of the client
  * and of everything it owned, and a settled reading once nothing of it remains. The control makes
- * no telemetry call; its facts say so.
+ * no telemetry call; its facts say so. Only C0 and C1 may take twelve collection pairs; the
+ * released reading retains the six-pair budget.
  * @param {object} arm
  * @param {string} arm.kind public client kind
  * @param {number} arm.lifecycles how many times the client is opened and works
@@ -499,21 +501,21 @@ class MemoryForeground {
  *   still live after its release
  */
 const runControl = async ({ kind, lifecycles, memory, roles, journal, live }) => {
-  const settled = () => roles.run('fixture', () => memory.settled())
+  const settled = (rounds) => roles.run('fixture', () => memory.settled(null, null, rounds))
   const turn = () => new Promise((resolve) => setImmediate(resolve))
   return roles.run('control', async () => {
     memory.mark('control:start')
     const client = new MemoryForeground(kind, { enabled: false }).build()
     live.push(client)
     await client.open()
-    const c0 = await settled()
+    const c0 = await settled(CONTROL_SETTLE_ROUNDS)
     memory.mark('control:c0')
     for (let index = 1; index < lifecycles; index++) {
       await client.close(0)
       await client.drain()
       await client.open()
     }
-    const c1 = await settled()
+    const c1 = await settled(CONTROL_SETTLE_ROUNDS)
     memory.mark('control:c1')
     const probe = await client.client.clientInstanceId({ timeout: 0 }).then(
       () => 'resolved',
