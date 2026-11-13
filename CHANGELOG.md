@@ -154,7 +154,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Fixes
 
-- Custom telemetry metrics serialize each registered identity once and reuse it as the series key, so a client with 128 custom descriptors no longer retains a second ~370 KiB copy of their identity strings.
+- Custom telemetry metrics serialize each registered identity once and reuse it as the series key, so a client no longer retains a second copy of every custom metric identity string (about 370 KiB for 128 maximum-size descriptors).
 - Release completed request scopes from connection ordering tails on settlement and generation close, and drop cleared request-timeout interval handles. Preserve request order and reconnect fencing.
 - Release disposed telemetry wire observer callbacks and frame parsers while retaining complete wire and cleanup evidence; flush serial calibration child artifacts and always upload resource diagnostics.
 - Release a closed client telemetry connection and its frame buffer once the final telemetry push has settled.
