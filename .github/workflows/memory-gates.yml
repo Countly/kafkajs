@@ -40,6 +40,7 @@ jobs:
             'share-soak-verify',
             'share-soak-verdict',
             'resources',
+            'closed-snapshot',
             'active-owner-census',
             'warmup-witnesses',
             'journal-controls',
@@ -55,11 +56,12 @@ jobs:
             'verdict',
           ]
           const only = process.env.ONLY || ''
+          const diagnostics = ['closed-snapshot']
           const requested = only.split(',').map(id => id.trim()).filter(Boolean)
           for (const id of requested) {
             if (!ids.includes(id)) throw new Error(`Unknown job: ${id}`)
           }
-          const selected = new Set(requested.length ? requested : ids.filter(id => id !== 'telemetry-seeded-control'))
+          const selected = new Set(requested.length ? requested : ids.filter(id => id !== 'telemetry-seeded-control' && !diagnostics.includes(id)))
           const share = ['share-soak', 'share-soak-verify', 'share-soak-verdict']
           if (share.some(id => selected.has(id))) {
             for (const id of ['unit', ...share]) selected.add(id)
@@ -321,6 +323,45 @@ jobs:
           path: .tmp/telemetry-resources/
           if-no-files-found: error
           include-hidden-files: true
+  closed-snapshot:
+    needs: [select]
+    name: closed-snapshot-node${{ matrix.node }}-${{ matrix.variant }}
+    if: github.event_name == 'workflow_dispatch' && contains(fromJSON(needs.select.outputs.jobs), 'closed-snapshot')
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions: { contents: read }
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [24, 26]
+        variant: [scalar, capture]
+    env:
+      CLOSE_SNAPSHOT_ROOT: ${{ github.workspace }}/.tmp/closed-snapshot
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 1
+      - uses: actions/setup-node@v4
+        timeout-minutes: 1
+        with: { node-version: '${{ matrix.node }}', cache: npm }
+      - run: npm ci
+        timeout-minutes: 5
+      - name: Capture original public M and closed readings serially
+        timeout-minutes: 9
+        run: timeout -k 10s 500s node scripts/e2e/telemetry/closeSnapshotDiagnostic.js --diagnostic-only "$CLOSE_SNAPSHOT_ROOT" "${{ matrix.variant }}"
+      - name: Attribute disappearing self bytes offline
+        if: always()
+        timeout-minutes: 10
+        run: timeout -k 10s 570s node --max-old-space-size=6144 scripts/e2e/telemetry/retained/analyseCloseSnapshot.js "$CLOSE_SNAPSHOT_ROOT"
+      - name: Archive diagnostic evidence
+        if: always()
+        timeout-minutes: 2
+        uses: actions/upload-artifact@v4
+        with:
+          name: closed-snapshot-node${{ matrix.node }}-${{ matrix.variant }}
+          path: .tmp/closed-snapshot/
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
   active-owner-census:
     needs: [select]
     name: active-owner-census-node${{ matrix.node }}-${{ matrix.variant }}

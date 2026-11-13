@@ -1,5 +1,10 @@
 'use strict'
 
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
+const { digest } = require('../retained/contract')
+const { main } = require('../closeSnapshotDiagnostic')
 const { CloseSnapshot, createCloseSnapshot } = require('../retained/closeSnapshot')
 const { analysePair, validateChild } = require('../retained/analyseCloseSnapshot')
 
@@ -14,6 +19,11 @@ const node = (id, selfBytes, category, name = 'Object') => ({
 })
 const census = (nodes) => ({
   nodes,
+  totals: {
+    unresolved: nodes
+      .filter((node) => node.category === 'unresolved')
+      .reduce((sum, node) => sum + node.selfBytes, 0),
+  },
   totalSelfBytes: nodes.reduce((sum, entry) => sum + entry.selfBytes, 0),
 })
 const graph = { rootPath: (index) => [{ node: { id: index + 100 }, edge: null }] }
@@ -103,5 +113,116 @@ describe('closed snapshot diagnostic', () => {
     expect(() =>
       validateChild('unused', { complete: true, readings: { acceptanceEligible: true } })
     ).toThrow(/incomplete/)
+  })
+})
+
+describe('closed snapshot evidence authentication', () => {
+  let directory
+  let result
+  let events
+  const writeEvents = () =>
+    fs.writeFileSync(
+      path.join(directory, 'census-events.jsonl'),
+      events.map(JSON.stringify).join('\n')
+    )
+
+  beforeEach(() => {
+    directory = fs.mkdtempSync(path.join(os.tmpdir(), 'closed-snapshot-test-'))
+    const identity = {
+      childId: 'child',
+      tree: 'tree',
+      runId: 'run',
+      kind: 'producer',
+      node: 'node',
+      v8: 'v8',
+      variant: 'capture',
+      seed: null,
+      diagnostic: true,
+      acceptanceEligible: false,
+      attributionComplete: false,
+      pid: 123,
+      flags: ['--expose-gc'],
+    }
+    fs.writeFileSync(path.join(directory, 'census-identity.json'), JSON.stringify(identity))
+    events = ['M', 'closed'].map((name, index) => {
+      const bytes = Buffer.from(`snapshot-${name}`)
+      fs.writeFileSync(path.join(directory, `${name}.heapsnapshot`), bytes)
+      return {
+        diagnostic: true,
+        acceptanceEligible: false,
+        attributionComplete: false,
+        name,
+        reading: reading(index * 10),
+        processRetainedBytes: 1200,
+        countersBefore: { spaces: [] },
+        startedAt: index * 10 + 1,
+        endedAt: index * 10 + 2,
+        file: `${name}.heapsnapshot`,
+        bytes: bytes.length,
+        sha256: digest(bytes),
+      }
+    })
+    writeEvents()
+    result = {
+      complete: true,
+      identity: { ...identity, seed: 'unseeded' },
+      pid: 123,
+      readings: {
+        diagnostic: true,
+        acceptanceEligible: false,
+        manifest: { execArgv: identity.flags },
+        matched: { ...events[0].reading, registry: {} },
+        closed: { ...events[1].reading, registry: {} },
+        closeSnapshot: {
+          diagnostic: true,
+          acceptanceEligible: false,
+          attributionComplete: false,
+          complete: true,
+          records: events.map((event) => ({
+            ...event,
+            afterSnapshot: reading(event.endedAt + 1),
+            countersAfter: { heap: {} },
+          })),
+        },
+      },
+    }
+  })
+  afterEach(() => fs.rmSync(directory, { recursive: true, force: true }))
+
+  test('accepts only joined same-child M and closed captures with original scalar seams', () => {
+    expect(validateChild(directory, result).map((event) => event.name)).toEqual(['M', 'closed'])
+    result.readings.matched.heapUsed++
+    expect(() => validateChild(directory, result)).toThrow(/original reading/)
+  })
+
+  test('rejects changed snapshot bytes and foreign child identities', () => {
+    fs.appendFileSync(path.join(directory, 'M.heapsnapshot'), 'changed')
+    expect(() => validateChild(directory, result)).toThrow(/digest/)
+    result.identity.childId = 'foreign'
+    expect(() => validateChild(directory, result)).toThrow(/foreign/)
+  })
+
+  test('rejects reordered captures and a snapshot preceding its original reading', () => {
+    events.reverse()
+    writeEvents()
+    expect(() => validateChild(directory, result)).toThrow(/original reading/)
+    events.reverse()
+    events[0].startedAt = -1
+    writeEvents()
+    expect(() => validateChild(directory, result)).toThrow(/original reading/)
+  })
+
+  test('refuses to launch outside a manual isolated CI dispatch', async () => {
+    const old = { CI: process.env.CI, GITHUB_EVENT_NAME: process.env.GITHUB_EVENT_NAME }
+    try {
+      process.env.CI = 'true'
+      process.env.GITHUB_EVENT_NAME = 'pull_request'
+      await expect(main(['--diagnostic-only', directory, 'capture'])).rejects.toThrow(/isolated CI/)
+    } finally {
+      for (const [key, value] of Object.entries(old)) {
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+    }
   })
 })

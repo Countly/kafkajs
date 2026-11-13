@@ -72,6 +72,12 @@ const witnesses =
     ? new (require(path.join(ROOT, 'scripts/e2e/telemetry/warmupWitness')).WarmupWitnesses)()
     : null
 
+const closeSnapshot = process.env.RESOURCE_CLOSE_SNAPSHOT_DIRECTORY
+  ? require(path.join(ROOT, 'scripts/e2e/telemetry/retained/closeSnapshot')).createCloseSnapshot({
+      memory,
+    })
+  : null
+
 const loaded = { ...memory.current(), modules: process.moduleLoadList.length }
 memory.mark('loaded')
 
@@ -272,6 +278,7 @@ const measure = async (kind) => {
           witnesses.track('seed:root', require(path.join(ROOT, 'index.js')).Kafka[SEED.root])
         }
         const settledMatched = await settled()
+        if (!warm) closeSnapshot?.record('M', settledMatched)
         if (warm) witnesses?.check('m0', settledMatched)
         else witnesses?.check('matched', settledMatched)
         const matched = { ...settledMatched, registry: enabled.fingerprint(uuid) }
@@ -375,6 +382,7 @@ const measure = async (kind) => {
         }
         const facts = enabled.facts()
         const settledClosed = await settled()
+        closeSnapshot?.record('closed', settledClosed)
         witnesses?.check('closed', settledClosed)
         const closed = { ...settledClosed, registry: enabled.fingerprint(uuid) }
         memory.mark('enabled:closed')
@@ -451,7 +459,10 @@ const measure = async (kind) => {
     const { facts, samples, native, seed, ...arm } = enabledRun
     const readings = {
       manifest,
-      ...(witnesses || activeCensus ? { diagnostic: true, acceptanceEligible: false } : {}),
+      ...(witnesses || activeCensus || closeSnapshot
+        ? { diagnostic: true, acceptanceEligible: false }
+        : {}),
+      ...(closeSnapshot ? { closeSnapshot: closeSnapshot.summary() } : {}),
       ...(witnesses ? { warmupWitnesses: witnesses.summary() } : {}),
       startup,
       loaded,
