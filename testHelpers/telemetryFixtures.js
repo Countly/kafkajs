@@ -1791,7 +1791,7 @@ class TelemetryWireObserver {
           closures: this.#closures,
           faults: this.#faults,
           cancellations: this.#cancellations,
-          records: this.#records.map(copy),
+          records: this.#records,
           sockets: [...this.#sockets.values()].map(
             ({ id, kind, node, foregroundBootstrap, closedAt }) => ({
               id,

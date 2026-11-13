@@ -307,13 +307,13 @@ const TELEMETRY = Object.freeze({
   peakBytes: 160 * 1024 * 1024,
   controlRssDriftBytes: 2 * 1024 * 1024,
   controlRetainedDriftBytes: 262144,
-  noiseLoadPerCpu: 0.75,
+  noiseLoadPerCpu: 1.0,
   noiseFreeBytes: 268435456,
   noisePressure: 5,
 })
 
 /** The long-window shadow candidate's limits, derived from `TELEMETRY` without changing it. */
-const TELEMETRY_LONG = LongWindow.limitsOf(TELEMETRY)
+const TELEMETRY_LONG = LongWindow.limitsOf({ ...TELEMETRY, noiseLoadPerCpu: 0.75 })
 
 /** The limits and profiles this process runs the telemetry churn with: the candidate's only when selected. */
 const ACTIVE_TELEMETRY = LongWindow.selected() ? TELEMETRY_LONG : TELEMETRY

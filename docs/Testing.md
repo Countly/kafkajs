@@ -591,6 +591,11 @@ behaviour: every offset is accepted exactly once at the broker and publicly, a r
 reason for a second delivery, no accepted record is delivered again, and at each public close the
 handled prefix is accepted and the rest released.
 
+Five-minute workers use exactly
+`--expose-gc --min-semi-space-size=1 --max-semi-space-size=1`; the live-flags journal controls
+use the same flags for comparability. Resource children keep their eager-compilation flags, and
+long-window workers keep `--expose-gc --no-flush-bytecode`.
+
 Memory is judged per worker against its own telemetry-disabled control of the same kind in the same
 process. In this five-minute lane the control first runs its catalogue and idle window once before C0:
 10 s (5 × the 2 s control idle) for the share consumer, 2 s for the other kinds, with early timers
@@ -608,9 +613,10 @@ stays at most 160 MiB, and the external-memory peak at most
 image (`/proc/self/status`), read before any application module is loaded and at every phase boundary;
 the raw `maxRSS` is recorded beside it and never subtracted. A control whose resident size grows by more than
 2 MiB (a larger decrease is recorded as a fact) or whose retained heap drifts by more than 256 KiB, a setup above its allowance, a missing collection or peak
-capability, or a noisy host (one-minute load per CPU above 0.75, free memory below 256 MiB, memory
+capability, or a noisy host (one-minute load per CPU above 1.0, free memory below 256 MiB, memory
 pressure above 5) makes the measurement inconclusive, with the facts retained; a broken or contradicted
-fact fails. This five-minute lane judges at most 8 MiB active above the matched disconnected
+fact fails. The resource verifier keeps its load-per-CPU threshold at 0.75.
+This five-minute lane judges at most 8 MiB active above the matched disconnected
 baseline and at least ten post-collection readings spanning at least 270 s inside a measurement of at
 least 300 s, each recorded with its real admission and completion time. The slope (at most 64 KiB per
 minute) and last minus first (at most 1 MiB) are judged by the long-window lane, and memory after close

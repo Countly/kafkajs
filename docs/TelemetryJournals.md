@@ -165,7 +165,7 @@ admin workload under both protocols and the live-flags arms of the other three, 
 each, so neither job's timeout grows. The `resource` protocol uses the resource workers'
 executable, `MEMORY_FLAGS` and unchanged `ProcessMemory.settled()` protocol (two collections 100
 ms apart, two event-loop turns, up to six pairs). The `live` protocol runs the fixed journal under
-the telemetry worker's exact flags (`WORKER_FLAGS`, `--expose-gc` alone) and its settled reading
+the telemetry worker's exact flags (`WORKER_FLAGS`, `--expose-gc --min-semi-space-size=1 --max-semi-space-size=1`) and its settled reading
 (two collections 100 ms apart, two event-loop turns, one pass), with the same warm-up, window, grid
 and evaluator; its results also carry the shadow raw, code and data series of its samples. It waits for the original eleven sample admissions over the real 60-second warm-up and
 300-second measurement window. Actual admission, completion, clock origin and elapsed times are
@@ -217,8 +217,9 @@ subtracted, and RSS, external, peak and active-retention gates keep their origin
 Unseeded closed data below −256 KiB is recorded as facts without blocking acceptance. Every active
 reading and collection checkpoint still faces the 8 MiB ceiling; unsettled active readings are recorded
 as facts. Control, matched, warm-up and closed readings still require settlement. Memory children use
-`--min-semi-space-size=1 --max-semi-space-size=1` with the eager-compilation flags; live and long-window
-worker flags are unchanged.
+`--min-semi-space-size=1 --max-semi-space-size=1` with the eager-compilation flags. Five-minute live workers and live-flags controls
+use the same young-space pin without eager compilation; long-window workers keep
+`--expose-gc --no-flush-bytecode`.
 
 One measured warm-up lifecycle of the same kind and arm completes the same catalogue, closes and
 releases before M; M0 records the old matched position. The first-use data step M − M0 must be at

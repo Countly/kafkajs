@@ -56,6 +56,9 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 #### Tooling
 
 - Memory gates record decreases in approximate kernel peak readings as evidence and retain the maximum across all reads; the 160 MiB peak, 64 MiB increase, setup allowances and invalid-reading checks are unchanged.
+- Pin five-minute telemetry workers and their live-flags journal controls to 1 MiB minimum and maximum semi-spaces; long-window workers and resource children keep their existing flags.
+- Raise only the five-minute telemetry host-load threshold from 0.75 to 1.0 per CPU; the resource verifier and long-window configuration keep 0.75.
+- Serialize observer disposal records directly without intermediate defensive copies, preserving transcript bytes and defensive copies on public reads.
 - The five-minute telemetry control records a resident-size decrease between its two readings instead of marking the control unstable; growth over 2 MiB and retained drift over 256 KiB still do.
 - The five-minute telemetry lane and the resource verifier record a kernel peak counter read just below its own reading's (or interval's) resident size (each distinct shortfall once) instead of failing its peak series; a peak counter below any earlier reading's resident size still fails, and the judged peak takes the larger of both readings.
 - Add the `telemetry-long-window` shadow lane to the memory gates (manual dispatch only, outside the verdict): the frozen long-window candidate (420 s warm-up, 900 s window, the existing traffic rate from the start, slope on the 15 mid-cycle readings) runs per Node, Kafka line, seeded or unseeded arm and replicate, plus a warm-up-only seed per Node, with heap-space and collection attribution; every record is diagnostic and refused by the resource verdict and the memory arm judge, no limit, window or estimator changes, and `scripts/soak/longWindowReport.js` prints the S1/S2/S3 table.

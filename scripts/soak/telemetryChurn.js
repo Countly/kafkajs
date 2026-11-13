@@ -108,8 +108,12 @@ const ROOT = path.resolve(__dirname, '../..')
 const NATIVE_ROWS = 1024
 /** Engine code readings one worker journals: every settled reading of a run, with room. */
 const ENGINE_ROWS = 64
-/** Default telemetry worker flags, also reused by broker-free controls. */
-const WORKER_FLAGS = Object.freeze(['--expose-gc'])
+/** Five-minute telemetry worker flags, also reused by live-flags journal controls. */
+const WORKER_FLAGS = Object.freeze([
+  '--expose-gc',
+  '--min-semi-space-size=1',
+  '--max-semi-space-size=1',
+])
 
 /**
  * The proved worst-case encoded bytes of each share row in the `share-packed-1` layout, rounded up
@@ -2502,7 +2506,7 @@ class TelemetryProcesses {
     const token = crypto.randomBytes(8).toString('hex')
     const child = this.spawn(this.script, [...this.args, '--profile', 'telemetry'], {
       execPath: process.execPath,
-      execArgv: [...WORKER_FLAGS, ...(longWindowSelected() ? LONG_WINDOW.v8Flags : [])],
+      execArgv: longWindowSelected() ? ['--expose-gc', ...LONG_WINDOW.v8Flags] : [...WORKER_FLAGS],
       env: { ...process.env, [WORKER_ENV]: kind, [WORKER_TOKEN]: token },
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     })

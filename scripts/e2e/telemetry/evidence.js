@@ -3765,16 +3765,16 @@ const verifyChurnReference = ({ kind, uuid, stem, input }) => {
 }
 
 /**
- * Requires one hello per kind from four distinct processes of one Node build, flags, platform and
- * codec capability, each carrying the driver source the parent recorded, and that recorded source
- * to be this module tree's own `scripts/soak/telemetryChurn.js` and `scripts/soak/soak.js`, by path
- * and digest. Workers that agree only with each other cannot stand in for the run's driver.
+ * Requires one hello per kind from four distinct processes with the exact five-minute worker flags
+ * and matching Node build, platform and codec capability. Each carries the driver source recorded
+ * by the parent, which must be this module tree's `scripts/soak/telemetryChurn.js` and
+ * `scripts/soak/soak.js`, by path and digest. Workers that agree only with each other cannot stand in for the run's driver.
  * @param {object[]} handshakes the parent's archived hello facts
  * @param {object} source the parent's archived `sourceStamp` of the driver
  * @returns {void} @throws {Error} for a missing, duplicate or foreign handshake or source
  */
 const verifyChurnHandshakes = (handshakes, source) => {
-  const { KINDS, sourceStamp } = require('../../soak/telemetryChurn')
+  const { KINDS, WORKER_FLAGS, sourceStamp } = require('../../soak/telemetryChurn')
   assert.deepEqual(
     source,
     sourceStamp(path.resolve(__dirname, '../../soak/soak.js')),
@@ -3793,7 +3793,8 @@ const verifyChurnHandshakes = (handshakes, source) => {
       assert.deepEqual(hello[key], first[key], `Worker ${hello.kind} ${key} differs`)
     assert.deepEqual(hello.source, source, `Worker ${hello.kind} source differs from the driver`)
   }
-  assert(first.execArgv.includes('--expose-gc'), 'Workers ran without real collection')
+  assert(first.execArgv?.includes('--expose-gc'), 'Workers ran without real collection')
+  assert.deepEqual(first.execArgv, WORKER_FLAGS, 'Workers ran with unexpected five-minute flags')
 }
 
 /**
