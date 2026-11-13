@@ -7,6 +7,7 @@ const { readSnapshot } = require('../../e2e/telemetry/retained/heapDiff')
 const { installClosedDiagnostic, ClosedCapture } = require('../closedDiagnostic')
 const { compareSnapshots, analyseWorker } = require('../closedAnalysis')
 const { Soak, TelemetryResourceVerdict } = require('../soak')
+const { ReferenceControl, EngineCodeJournal } = require('../telemetryChurn')
 
 const flags = { diagnostic: true, acceptanceEligible: false }
 const reading = (at) => ({
@@ -131,6 +132,97 @@ describe('closed transient diagnostic', () => {
     }
     expect(await execute(true)).toBe(await execute(false))
     expect(fs.readdirSync(directory)).toEqual([])
+  })
+
+  test('captures control C0 and C1 once after the original readings without adding collections or engine rows', async () => {
+    let at = 0
+    let collections = 0
+    const events = []
+    const client = {
+      connect: async () => {},
+      disconnect: async () => events.push('disconnect'),
+      describeCluster: async () => events.push('catalogue'),
+    }
+    const journal = new EngineCodeJournal({ capacity: 128 })
+    const originalRoots = { client: {} }
+    globalThis.__telemetryClosedRoots = originalRoots
+    const engine = {
+      getHeapSpaceStatistics: () => [],
+      getHeapCodeStatistics: () => ({}),
+      writeHeapSnapshot: (file) => {
+        const checkpoint = path.basename(file, '.heapsnapshot')
+        const row = JSON.parse(fs.readFileSync(path.join(path.dirname(file), `${checkpoint}.json`)))
+        expect(row).toMatchObject({ ...flags, checkpoint, memory: { gc: { observed: 2 } } })
+        expect(row.memory.retainedBytes).toBe(row.memory.retained)
+        expect(row.memory.at).toBe(at)
+        expect(journal.values().map((entry) => entry.phase)).toEqual(
+          checkpoint === 'c0' ? ['c0'] : ['c0', 'c1']
+        )
+        expect(collections).toBe(checkpoint === 'c0' ? 2 : 4)
+        expect(globalThis.__telemetryClosedRoots.client).toBe(client)
+        events.push(`snapshot:${checkpoint}`)
+        fs.writeFileSync(file, '{}')
+      },
+    }
+    const worker = { kind: 'admin', soak: { Soak } }
+    installClosedDiagnostic(
+      worker,
+      {
+        CI: 'true',
+        TELEMETRY_CLOSED_DIAGNOSTIC: '1',
+        TELEMETRY_CLOSED_ROOT: directory,
+      },
+      { engine }
+    )
+    const control = new ReferenceControl({
+      kind: 'admin',
+      config: { stem: 'closed', group: 'closed', topic: 'closed' },
+      Kafka: class {
+        admin() {
+          return client
+        }
+      },
+      logLevel: { NOTHING: 0 },
+      resources: { as: (role, work) => work(), live: new Map() },
+      clock: { now: () => at },
+      sleep: async (ms) => {
+        at += ms
+      },
+      gc: () => {
+        collections++
+        events.push('gc')
+      },
+      collections: () => collections,
+      engine: journal,
+      capture: worker.soak.closedControlCapture,
+    })
+    const result = await control.run()
+    expect(events).toEqual([
+      'gc',
+      'gc',
+      'snapshot:c0',
+      ...Array(10).fill('catalogue'),
+      'gc',
+      'gc',
+      'snapshot:c1',
+      'disconnect',
+      'gc',
+      'gc',
+    ])
+    expect(collections).toBe(6)
+    expect(journal.values().map((row) => row.phase)).toEqual(['c0', 'c1', 'control-released'])
+    expect(globalThis.__telemetryClosedRoots).toBe(originalRoots)
+    expect(fs.readdirSync(path.join(directory, 'admin')).sort()).toEqual([
+      'c0.heapsnapshot',
+      'c0.json',
+      'c1.heapsnapshot',
+      'c1.json',
+    ])
+    expect(result.c0.gc.observed).toBe(2)
+    expect(result.c1.gc.observed).toBe(2)
+    expect(worker.soak.TELEMETRY.engineRows).toBe(128)
+    const verdict = TelemetryResourceVerdict.evaluate({ clientCount: 1, samples: [], ...flags })
+    expect(verdict.violations).toContain('diagnostic inputs are not acceptance-eligible')
   })
 
   test('captures original endpoints after settled readings and adds one warm reading with the same protocol', async () => {
@@ -318,8 +410,8 @@ describe('closed transient diagnostic', () => {
     expect(child.error).toBeUndefined()
     expect(child.status).toBe(0)
     const result = compareSnapshots(
-      readSnapshot(path.join(directory, 'before.heapsnapshot')),
-      readSnapshot(path.join(directory, 'after.heapsnapshot'))
+      readSnapshot(path.join(directory, 'before.heapsnapshot'), { locations: true }),
+      readSnapshot(path.join(directory, 'after.heapsnapshot'), { locations: true })
     )
     expect(result.groups.find((row) => row.constructor === 'ClosedProductState')).toMatchObject({
       scope: 'product',
@@ -329,6 +421,15 @@ describe('closed transient diagnostic', () => {
       scope: 'harness',
       owner: 'harness.read',
     })
+    const owner = result.groups.find((row) => row.constructor === 'ClosedProductState').paths[0]
+      .owner
+    expect(owner).toMatchObject({
+      reachable: true,
+      root: 'client',
+      source: { file: 'src/owner.js', line: 5 },
+    })
+    expect(owner.field).toContain('client.read')
+    expect(owner.field).toContain('state')
   })
 
   test('emits both endpoint comparisons from the existing snapshot reader and bounds compressed evidence', async () => {
@@ -336,6 +437,8 @@ describe('closed transient diagnostic', () => {
       ['baseline', 0],
       ['warm', 5],
       ['teardown', 10],
+      ['c0', 2],
+      ['c1', 8],
     ]) {
       fs.writeFileSync(
         path.join(directory, `${name}.heapsnapshot`),
@@ -362,8 +465,97 @@ describe('closed transient diagnostic', () => {
     expect(fs.readdirSync(directory).filter((file) => file.endsWith('.heapsnapshot'))).toEqual([])
     expect(
       fs.readdirSync(directory).filter((file) => file.endsWith('.heapsnapshot.gz'))
-    ).toHaveLength(3)
+    ).toHaveLength(5)
     expect(JSON.parse(fs.readFileSync(path.join(directory, 'summary.json')))).toEqual(summary)
+  })
+
+  test('emits the control pair with the existing scope split and growth paths', async () => {
+    for (const [name, growth] of [
+      ['baseline', 0],
+      ['warm', 5],
+      ['teardown', 10],
+      ['c0', 2],
+      ['c1', 8],
+    ]) {
+      fs.writeFileSync(
+        path.join(directory, `${name}.heapsnapshot`),
+        JSON.stringify(fixture(growth))
+      )
+      fs.writeFileSync(
+        path.join(directory, `${name}.json`),
+        JSON.stringify({
+          ...flags,
+          kind: 'admin',
+          checkpoint: name,
+          memory: reading(growth).memory,
+          heapSpaces: [{ space_name: 'old_space', space_used_size: growth * 3 }],
+          code: { code_and_metadata_size: growth * 2 },
+        })
+      )
+    }
+    const summary = await analyseWorker(directory, { kind: 'admin' })
+    expect(summary.control).toMatchObject({
+      selfDelta: 42,
+      retainedDelta: 6,
+      byScope: {
+        product: { delta: 6 },
+        harness: { delta: 12 },
+        engine: { delta: 18 },
+        unresolved: { delta: 6 },
+      },
+      codeDelta: { code_and_metadata_size: 12 },
+      heapSpaces: [{ name: 'old_space', usedDelta: 18 }],
+    })
+    expect(
+      summary.control.groups.find((row) => row.constructor === 'TelemetryMetrics')
+    ).toMatchObject({
+      scope: 'product',
+      owner: 'client.metrics',
+      delta: 6,
+      paths: [
+        expect.objectContaining({
+          owner: expect.objectContaining({
+            reachable: true,
+            root: 'client',
+            field: 'client.metrics',
+            source: null,
+          }),
+          trace: expect.objectContaining({ rootPath: expect.any(Array) }),
+        }),
+      ],
+    })
+    expect(summary.original.selfDelta).toBe(70)
+    expect(summary.warm.selfDelta).toBe(35)
+    expect(JSON.parse(fs.readFileSync(path.join(directory, 'summary.json')))).toEqual(summary)
+    expect(
+      fs.readdirSync(directory).filter((file) => file.endsWith('.heapsnapshot.gz'))
+    ).toHaveLength(5)
+  })
+
+  test('rejects acceptance-eligible control captures and archives their snapshots', async () => {
+    for (const name of ['baseline', 'warm', 'teardown', 'c0', 'c1']) {
+      fs.writeFileSync(path.join(directory, `${name}.heapsnapshot`), JSON.stringify(fixture()))
+      fs.writeFileSync(
+        path.join(directory, `${name}.json`),
+        JSON.stringify({
+          ...flags,
+          acceptanceEligible: name === 'c1',
+          kind: 'admin',
+          checkpoint: name,
+          memory: reading(0).memory,
+          heapSpaces: [],
+          code: {},
+        })
+      )
+    }
+    await expect(analyseWorker(directory, { kind: 'admin' })).rejects.toThrow(/ineligible.*c1/)
+    expect(JSON.parse(fs.readFileSync(path.join(directory, 'summary.json')))).toMatchObject({
+      ...flags,
+      complete: false,
+    })
+    expect(
+      fs.readdirSync(directory).filter((file) => file.endsWith('.heapsnapshot.gz'))
+    ).toHaveLength(5)
   })
 
   test('archives incomplete captures and enforces the streaming compressed byte cap', async () => {
@@ -375,7 +567,7 @@ describe('closed transient diagnostic', () => {
     })
     expect(fs.existsSync(path.join(directory, 'baseline.heapsnapshot.gz'))).toBe(true)
     fs.unlinkSync(path.join(directory, 'baseline.heapsnapshot.gz'))
-    for (const name of ['baseline', 'warm', 'teardown']) {
+    for (const name of ['baseline', 'warm', 'teardown', 'c0', 'c1']) {
       fs.writeFileSync(path.join(directory, `${name}.heapsnapshot`), JSON.stringify(fixture()))
       fs.writeFileSync(
         path.join(directory, `${name}.json`),
