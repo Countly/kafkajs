@@ -54,7 +54,7 @@ class FrameBuffer {
     this.onFrame = onFrame
     this.minBodyOf = minBodyOf
     this.broker = broker
-    this.prefix = Buffer.alloc(LENGTH_PREFIX_SIZE)
+    this.prefix = Buffer.allocUnsafe(LENGTH_PREFIX_SIZE)
     this.copied = 0
     this.reset()
   }
