@@ -56,6 +56,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 #### Tooling
 
 - Memory gates record decreases in approximate kernel peak readings as evidence and retain the maximum across all reads; the 160 MiB peak, 64 MiB increase, setup allowances and invalid-reading checks are unchanged.
+- The five-minute telemetry lane records a kernel peak counter read below an earlier resident size (each distinct shortfall once) instead of failing its peak series; the judged peak still takes the larger of both readings.
 - Add the `telemetry-long-window` shadow lane to the memory gates (manual dispatch only, outside the verdict): the frozen long-window candidate (420 s warm-up, 900 s window, the existing traffic rate from the start, slope on the 15 mid-cycle readings) runs per Node, Kafka line, seeded or unseeded arm and replicate, plus a warm-up-only seed per Node, with heap-space and collection attribution; every record is diagnostic and refused by the resource verdict and the memory arm judge, no limit, window or estimator changes, and `scripts/soak/longWindowReport.js` prints the S1/S2/S3 table.
 - Add isolated broker-free active compression diagnostics on Node 22/24/26, with unchanged public resource children, scalar companions, explicit major-GC pairs and bounded retained-root censuses; records cannot satisfy memory acceptance.
 - Exit gate decoder benchmark: a row that is INVALID only because of runner noise passes when its median new/old is within 5%; a valid FAIL or regression, a structural problem or a larger median still fails.

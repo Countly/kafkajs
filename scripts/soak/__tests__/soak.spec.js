@@ -7141,6 +7141,18 @@ describe('telemetry resident-size reference', () => {
     expect(JSON.stringify(replay)).toBe(original)
   })
 
+  test('records a peak counter below an earlier resident size and judges the larger reading', () => {
+    const input = make()
+    const { hwm } = input.baseline.memory
+    input.baseline.memory.rss = hwm + 52 * 1024
+    const verdict = evaluate(input)
+    expect(verdict).toMatchObject({ ok: true, outcome: 'passed', violations: [], inconclusive: [] })
+    expect(verdict.measured.peakCoverage).toEqual([
+      { index: 5, phase: 'settled', hwm, covered: hwm + 52 * 1024, shortfall: 52 * 1024 },
+    ])
+    expect(verdict.measured.peak).toBeGreaterThanOrEqual(hwm + 52 * 1024)
+  })
+
   test('preserves setup, delta and absolute limits after a peak decrease', () => {
     const input = make()
     input.reference.control.c0.hwm = 96 * MIB + 1
@@ -7369,13 +7381,6 @@ describe('telemetry resident-size reference', () => {
     ],
     ['an absent reference', (r) => delete r.reference, 'resident-size reference facts'],
     ['a wrong peak source', (r) => (r.reference.source = 'maxrss'), 'resident-size peak source'],
-    [
-      'a peak below its own reading',
-      (r) => {
-        r.baseline.memory.rss = 85 * MIB
-      },
-      'resident-size peak series',
-    ],
     [
       'a missing reading field',
       (r) => {
