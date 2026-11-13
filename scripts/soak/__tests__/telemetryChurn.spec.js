@@ -39,6 +39,7 @@ const { SEGMENT_FORMAT, checkSegmentFiles } = require('../../../testHelpers/tele
 const {
   PROFILES,
   TelemetryResourceVerdict,
+  TELEMETRY,
   buildTelemetryChurn,
   instrument,
   main,
@@ -326,14 +327,14 @@ describe('telemetry profile', () => {
   test('holds the fixed measured action counts, the serialization order and the corpus slots', () => {
     const schedule = new TelemetrySchedule({ warmupMs: 60000, measureMs: 300000 })
     expect(schedule.required()).toEqual({ subscription: 35, retire: 10, reopen: 5 })
-    expect(schedule.ticks).toHaveLength(13)
+    expect(schedule.ticks).toHaveLength(16)
     expect(
       schedule.ticks.filter((t) => t.transitions.length).map((t) => [t.at, t.transitions])
     ).toEqual([
       [70000, [1, 2, 3, 4, 5, 6, 7]],
-      [120000, [8, 9, 10, 11, 12]],
-      [180000, [13, 14, 15, 16, 17, 18]],
-      [240000, [19, 20, 21, 22, 23, 24]],
+      [135000, [8, 9, 10, 11, 12]],
+      [195000, [13, 14, 15, 16, 17, 18]],
+      [255000, [19, 20, 21, 22, 23, 24]],
       [350000, [25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35]],
     ])
     expect(schedule.ticks.filter((t) => t.actions.includes('retire')).map((t) => t.at)).toEqual(
@@ -341,7 +342,7 @@ describe('telemetry profile', () => {
     )
     schedule.ticks.forEach((tick, number) => {
       expect(tick.number).toBe(number)
-      expect(tick.index).toBe(tick.at / 10000)
+      expect(tick.index).toBe(tick.transitions.at(-1) ?? tick.at / 10000)
     })
     const sixty = schedule.ticks.find((tick) => tick.at === 60000)
     expect(sixty.actions).toEqual(['retire'])
@@ -361,15 +362,36 @@ describe('telemetry profile', () => {
       '',
       'org.apache.kafka.',
     ])
-    for (const tick of schedule.ticks.filter(
-      (t) => t.actions.includes('retire') && t.transitions.length
-    ))
-      expect(schedule.selection(tick.index)).not.toBe('')
+    let selection = 'org.apache.kafka.'
+    for (const tick of schedule.ticks) {
+      if (tick.transitions.length) selection = schedule.selection(tick.index)
+      if (tick.actions.includes('retire')) expect(selection).not.toBe('')
+    }
     const slots = schedule.corpusSlots()
     expect(slots).toHaveLength(CORPUS.records / CORPUS.batch)
     expect(slots[0]).toBe(60000)
     expect(slots.at(-1)).toBe(357000)
     expect(slots.every((slot) => slot >= 60000 && slot < 360000)).toBe(true)
+  })
+
+  test('places middle reconnect and subscription boundaries halfway between settled samples', () => {
+    const schedule = new TelemetrySchedule(TELEMETRY)
+    const boundaries = schedule.ticks.filter((tick) => tick.actions.includes('subscription'))
+    expect(boundaries.map((tick) => tick.at)).toEqual([70000, 135000, 195000, 255000, 350000])
+    for (const tick of boundaries) {
+      expect(tick.actions).toEqual(['reopen', 'subscription'])
+      expect(schedule.stages(tick)).toEqual(['confirm'])
+    }
+    for (const tick of boundaries.slice(1, -1)) {
+      const distance = Math.min(...TELEMETRY.sampleAt.map((at) => Math.abs(tick.at - at)))
+      expect(distance).toBe(TELEMETRY.sampleMs / 2)
+      expect(distance).toBeGreaterThan(10000)
+      const next = schedule.ticks[tick.number + 1]
+      expect(next.at - tick.at).toBe(15000)
+      expect(next.actions).toEqual(['retire'])
+    }
+    expect(boundaries[0].at).toBe(70000)
+    expect(boundaries.at(-1).at).toBe(350000)
   })
 
   test('tracks resources by creating role and trigger, and a same-count swap by token', async () => {
@@ -2908,6 +2930,36 @@ describe('telemetry profile parent', () => {
     expect(processes.sent.filter((m) => m.type === 'confirm-fence')).toHaveLength(5 * KINDS.length)
   })
 
+  test('finishes batch readbacks and joined confirmations before the next action and measurement end', async () => {
+    const { churn, fixture, processes, clock, advance } = make()
+    const schedule = new TelemetrySchedule(TELEMETRY)
+    const epoch = clock.now()
+    const until = processes.until
+    processes.until = jest.fn(async (...args) => {
+      advance(500)
+      return until(...args)
+    })
+    const rotate = fixture.rotate
+    fixture.rotate = jest.fn(async (...args) => {
+      advance(100)
+      return rotate(...args)
+    })
+    await churn.ticks(epoch, schedule)
+    for (const tick of schedule.ticks.filter((t) => t.transitions.length)) {
+      const rows = churn.stages.filter((row) => row.tick === tick.number)
+      const readbacks = churn.rotations.filter((row) => row.tick === tick.number)
+      const next = epoch + (schedule.ticks[tick.number + 1]?.at ?? schedule.endMs)
+      expect(rows).toHaveLength(KINDS.length)
+      expect(readbacks.map((row) => row.index)).toEqual(tick.transitions)
+      for (const row of rows) {
+        expect(row.sentAt).toBe(epoch + tick.at)
+        expect(row.releasedAt).toBeGreaterThanOrEqual(readbacks.at(-1).readbackAt)
+        expect(row.parentAt).toBeLessThan(next)
+        expect(row.parentAt).toBeLessThan(epoch + schedule.endMs)
+      }
+    }
+  })
+
   test('fails a measured tick that is more than its late bound behind and never catches it up', async () => {
     const { churn, processes, advance, fixture } = make()
     const original = processes.until
@@ -3923,6 +3975,22 @@ describe('telemetry churn coordinated stage replay', () => {
     expect(Object.keys(counts)).toEqual([...KINDS])
     for (const kind of KINDS)
       expect(counts[kind]).toEqual({ subscription: 35, retire: 10, reopen: 5 })
+  })
+
+  test('replays shifted gaps with all retirements separate and confirmations inside the window', () => {
+    const input = archive()
+    const { table, timeline } = input
+    const gaps = table.ticks.filter((tick) => tick.transitions.length)
+    expect(gaps.map((tick) => tick.at)).toEqual([70000, 135000, 195000, 255000, 350000])
+    for (const gap of gaps) {
+      const rows = input.archive.stages.filter((row) => row.tick === gap.number)
+      expect(rows.every((row) => row.stage === 'confirm')).toBe(true)
+      const next = EPOCH + (table.ticks[gap.number + 1]?.at ?? table.endMs)
+      expect(rows.every((row) => row.parentAt < next && row.parentAt < timeline.boundaryAt)).toBe(
+        true
+      )
+    }
+    expect(() => verifyChurnStages(input)).not.toThrow()
   })
 
   test('accepts a polled readback only before every worker release', () => {

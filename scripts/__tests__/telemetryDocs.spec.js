@@ -486,8 +486,10 @@ describe('telemetry resource documentation', () => {
       'Five public close/reopen cycles (seven segments including setup and initial)'
     )
     expect(testing).toContain(
-      'transition 1–7 at 70 s, 8–12 at 120 s, 13–18 at 180 s, 19–24 at 240 s and 25–35 at 350 s'
+      'transition 1–7 at 70 s, 8–12 at 135 s, 13–18 at 195 s, 19–24 at 255 s and 25–35 at 350 s'
     )
+    expect(telemetry).toContain('middle gaps at 135, 195 and 255 s')
+    expect(testing).toContain('All settled samples remain judged')
     expect(testing).toContain(
       '35 measured subscription transitions, 10 measured retirements and five measured reopens'
     )

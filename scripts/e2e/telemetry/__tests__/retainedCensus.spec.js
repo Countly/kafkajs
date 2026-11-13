@@ -234,6 +234,7 @@ test('live census checkpoints follow the sample grid through five public churn r
   census.observe({ kind: 'baseline', snapshot })
   const reopens = schedule.ticks.filter((tick) => tick.actions.includes('reopen'))
   expect(reopens).toHaveLength(5)
+  expect(reopens.map((tick) => tick.at)).toEqual([70000, 135000, 195000, 255000, 350000])
   for (const tick of reopens) census.observe({ kind: 'reopen', at: tick.at, snapshot })
   for (const admittedPhaseMs of TELEMETRY.sampleAt)
     census.observe({ kind: 'sample', admittedPhaseMs, snapshot })

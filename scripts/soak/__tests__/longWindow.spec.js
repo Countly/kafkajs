@@ -1,6 +1,7 @@
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
+const crypto = require('node:crypto')
 const { EventEmitter } = require('node:events')
 const { Kafka } = require('../../../index')
 const { TELEMETRY, TelemetryResourceVerdict, PROFILES } = require('../soak')
@@ -172,6 +173,15 @@ const reportOf = ({
 const line = (perMinute) => (at) => 20 * MIB + perMinute * minutesOf(at)
 
 describe('long-window shadow candidate', () => {
+  test('preserves the serialized long-window schedule while five-minute gaps move', () => {
+    withModules(true, ({ churn: c, soak }) => {
+      const schedule = new c.TelemetrySchedule(soak.TELEMETRY_LONG)
+      expect(crypto.createHash('sha256').update(JSON.stringify(schedule)).digest('hex')).toBe(
+        '1f6435bcfebe71c203261671dadea9b6da42b250d504a13bfce178292a7998d7'
+      )
+    })
+  })
+
   test('freezes the candidate at a 420 s warm-up, a 900 s window and the existing 30 s readings', () => {
     expect(Object.isFrozen(LONG_WINDOW)).toBe(true)
     expect(LONG_WINDOW).toMatchObject({
