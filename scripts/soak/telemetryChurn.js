@@ -3568,7 +3568,8 @@ class ReferenceControl {
         await this.sleep(CONTROL.idleMs)
         if (warmup) {
           // A timer may fire a fraction of a millisecond early against this clock.
-          while (clock.now() - warmup.idleStartedAt < CONTROL.idleMs) await this.sleep(1)
+          const warmIdleMs = CONTROL.idleMs * (kind === 'shareConsumer' ? 5 : 1)
+          while (clock.now() - warmup.idleStartedAt < warmIdleMs) await this.sleep(1)
           warmup.completedAt = clock.now()
         }
         c0 = await settledReading('c0', io)
