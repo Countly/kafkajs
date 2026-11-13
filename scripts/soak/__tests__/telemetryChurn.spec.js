@@ -4682,6 +4682,38 @@ describe('telemetry control warm-up', () => {
     }
   )
 
+  test('tops up an idle timer that fires early so the warm-up idle lasts the full window', async () => {
+    let at = 0
+    const client = {
+      connect: async () => {},
+      subscribe: async () => {},
+      run: async () => {},
+      disconnect: async () => {},
+      describeCluster: async () => {},
+    }
+    const { ReferenceControl, CONTROL } = require('../telemetryChurn')
+    const result = await new ReferenceControl({
+      kind: 'consumer',
+      config: { stem: 's', topic: 's-topic', ctl: 's-ctl', group: 's-group' },
+      Kafka: function Kafka() {
+        return { consumer: () => client }
+      },
+      socketFactory: () => {},
+      logLevel: { NOTHING: 0 },
+      resources: { as: (_role, work) => work(), live: new Map() },
+      clock: { now: () => at },
+      sleep: async (ms) => {
+        at += ms === CONTROL.idleMs ? ms - 0.35 : ms
+      },
+      gc: () => {},
+      engine: { record: () => {} },
+    }).run()
+    expect(result.warmup.completedAt - result.warmup.idleStartedAt).toBeGreaterThanOrEqual(
+      CONTROL.idleMs
+    )
+    expect(result.warmup.completedAt).toBeLessThanOrEqual(result.c0.gc.admittedAt)
+  })
+
   test('preserves the frozen long-window control catalogue and three readings', async () => {
     const previous = process.env.TELEMETRY_LONG_WINDOW
     let Control

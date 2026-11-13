@@ -3566,7 +3566,11 @@ class ReferenceControl {
           warmup.idleStartedAt = clock.now()
         }
         await this.sleep(CONTROL.idleMs)
-        if (warmup) warmup.completedAt = clock.now()
+        if (warmup) {
+          // A timer may fire a fraction of a millisecond early against this clock.
+          while (clock.now() - warmup.idleStartedAt < CONTROL.idleMs) await this.sleep(1)
+          warmup.completedAt = clock.now()
+        }
         c0 = await settledReading('c0', io)
         outcomes = await runCatalogue(client, manifest, `${config.stem}:ctl-off`, io.now)
         await this.sleep(CONTROL.idleMs)
