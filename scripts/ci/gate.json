@@ -20327,7 +20327,9 @@
         "testHelpers/__tests__/resourceProbe.spec.js \u203a resource artifact validation collection convergence keeps unsettled closed collections inconclusive",
         "testHelpers/__tests__/resourceProbe.spec.js \u203a resource artifact validation memory child flags rejects a child missing --min-semi-space-size=1",
         "testHelpers/__tests__/resourceProbe.spec.js \u203a resource artifact validation memory child flags rejects a child missing --max-semi-space-size=1",
-        "scripts/soak/__tests__/soak.spec.js \u203a telemetry resource evidence accepts closed growth above 256 KiB while keeping the active ceiling at equality"
+        "scripts/soak/__tests__/soak.spec.js \u203a telemetry resource evidence accepts closed growth above 256 KiB while keeping the active ceiling at equality",
+        "testHelpers/__tests__/processMemory.spec.js \u203a ProcessMemory declares eager compilation without invoking telemetry or warming native work",
+        "testHelpers/__tests__/resourceProbe.spec.js \u203a resource artifact validation collection convergence does not discard an active retained violation found before convergence"
       ],
       "capMinutes": 85,
       "allowedSkips": [
@@ -24773,7 +24775,9 @@
         "testHelpers/__tests__/resourceProbe.spec.js \u203a resource artifact validation collection convergence keeps unsettled closed collections inconclusive",
         "testHelpers/__tests__/resourceProbe.spec.js \u203a resource artifact validation memory child flags rejects a child missing --min-semi-space-size=1",
         "testHelpers/__tests__/resourceProbe.spec.js \u203a resource artifact validation memory child flags rejects a child missing --max-semi-space-size=1",
-        "scripts/soak/__tests__/soak.spec.js \u203a telemetry resource evidence accepts closed growth above 256 KiB while keeping the active ceiling at equality"
+        "scripts/soak/__tests__/soak.spec.js \u203a telemetry resource evidence accepts closed growth above 256 KiB while keeping the active ceiling at equality",
+        "testHelpers/__tests__/processMemory.spec.js \u203a ProcessMemory declares eager compilation without invoking telemetry or warming native work",
+        "testHelpers/__tests__/resourceProbe.spec.js \u203a resource artifact validation collection convergence does not discard an active retained violation found before convergence"
       ],
       "capMinutes": 93,
       "allowedSkips": [

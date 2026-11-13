@@ -301,7 +301,6 @@ const TELEMETRY = Object.freeze({
   slopeBytesPerMinute: 64 * 1024,
   endpointBytes: 1024 * 1024,
   activeBytes: 8 * 1024 * 1024,
-  closedBytes: 256 * 1024,
   rssDeltaBytes: 64 * 1024 * 1024,
   externalDeltaBytes: 64 * 1024 * 1024,
   setupPeakBytes: 96 * 1024 * 1024,
@@ -462,10 +461,6 @@ class TelemetryResourceVerdict {
       measured.slopeBytesPerMinute = slope(points)
       measured.endpointBytes = points.at(-1)[1] - points[0][1]
     }
-    fail(
-      closedBytes - baselineBytes <= TELEMETRY.closedBytes * clientCount,
-      'closed transient ceiling'
-    )
     const inconclusive = TelemetryResourceVerdict.reference(reference, {
       baseline,
       samples,

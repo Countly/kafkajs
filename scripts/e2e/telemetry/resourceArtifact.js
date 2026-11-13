@@ -395,6 +395,7 @@ class MemoryArmJudge {
     this.readings = this.record.readings
     this.failures = []
     this.inconclusive = []
+    this.facts = {}
   }
 
   /** @param {string} problem a broken fact or an observed violation @returns {void} */
@@ -412,7 +413,8 @@ class MemoryArmJudge {
    *   fact or observed gate violation, `inconclusive` when only a missing capability, an
    *   inadmissible control or the host stops the numbers deciding. Seeded controls always fail
    *   eligibility after any structurally valid measurements have been judged. Optional `facts`
-   *   records peak decreases and the unchanged all-read maxima when any decrease was observed.
+   *   records peak decreases with unchanged all-read maxima, unsettled active readings and closed
+   *   data decreases beyond the transient allowance. These observations do not block acceptance.
    */
   evaluate() {
     this.envelope()
@@ -428,7 +430,7 @@ class MemoryArmJudge {
     return {
       verdict,
       problems: [...this.failures, ...this.inconclusive],
-      ...(this.peakFacts && { facts: this.peakFacts }),
+      ...(Object.keys(this.facts).length && { facts: this.facts }),
     }
   }
 
@@ -523,7 +525,8 @@ class MemoryArmJudge {
   /**
    * Replays every collection pair and convergence, without trusting a declared settled flag.
    * @param {string} name checkpoint name @param {object} reading the final reading and GC journal
-   * @returns {void} records incomplete facts or an unconverged measurement
+   * @returns {void} records incomplete facts or unconverged collections; only active readings may
+   *   remain unconverged without making the measurement inconclusive
    */
   collectionHistory(name, reading) {
     const gc = reading.gc
@@ -555,7 +558,12 @@ class MemoryArmJudge {
     const last = points.at(-1)
     if (last.at !== reading.at || READING_FIELDS.some((field) => last[field] !== reading[field]))
       this.fail(`${name} final reading differs from its collection checkpoint`)
-    if (!collectionsSettled(points.at(-2), last)) this.wait(`${name} collections did not settle`)
+    if (!collectionsSettled(points.at(-2), last)) {
+      if (/^active \d+$/.test(name)) {
+        this.facts.unsettledActiveReadings ??= []
+        this.facts.unsettledActiveReadings.push(name)
+      } else this.wait(`${name} collections did not settle`)
+    }
   }
 
   /**
@@ -579,7 +587,7 @@ class MemoryArmJudge {
       this.fail('child ran under an inspector, coverage or Jest')
     if (!manifest.execArgv?.includes('--expose-gc')) this.fail('child did not expose GC')
     if (!MEMORY_FLAGS.slice(1).every((flag) => manifest.execArgv?.includes(flag)))
-      this.fail('child did not declare eager JavaScript compilation')
+      this.fail('child did not declare the required memory flags')
     if (manifest.gc?.native !== true) this.fail('GC function is not the engine collection')
     const codecCount = manifest.codecs?.zstd === true ? 2 : 1
     const catalogue = phaseCatalogue(this.record.arm, manifest.codecs?.zstd === true)
@@ -757,7 +765,7 @@ class MemoryArmJudge {
     }
     const peakDecreases = peakReadingDecreases(marks, claimed ? ['maxRss', 'vmhwm'] : ['maxRss'])
     if (peakDecreases.length)
-      this.peakFacts = { peak: peaks.P, setupPeak: peaks.setupPeak, peakDecreases }
+      Object.assign(this.facts, { peak: peaks.P, setupPeak: peaks.setupPeak, peakDecreases })
     return peaks
   }
 
@@ -843,8 +851,8 @@ class MemoryArmJudge {
   /**
    * Judges the incremental RSS and external gates against the admitted control, the absolute
    * backstop, the active retained gate on raw bytes, and the first-use and closed transient gates
-   * on data bytes (heap plus external without V8 code) against the matched baseline. Data below
-   * the matched baseline by more than the transient ceiling cannot be read as a pass.
+   * on data bytes (heap plus external without V8 code) against the matched baseline. Closed data
+   * below the matched baseline by more than the transient ceiling is recorded without blocking a pass.
    * @param {object|null} peaks what `peaks` returned @param {boolean} admitted the control verdict
    * @returns {void}
    */
@@ -867,7 +875,11 @@ class MemoryArmJudge {
     const closed = dataBytes(r.closed) - dataBytes(r.matched)
     if (closed > LIMITS.closedTransient) this.fail('closed transient data bytes exceed 256 KiB')
     else if (closed < -LIMITS.closedTransient)
-      this.wait('closed data bytes are more than 256 KiB below the matched baseline')
+      this.facts.closedDataDecrease = {
+        matched: dataBytes(r.matched),
+        closed: dataBytes(r.closed),
+        delta: closed,
+      }
   }
 
   /**

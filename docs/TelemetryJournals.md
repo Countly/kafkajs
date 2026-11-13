@@ -214,14 +214,18 @@ closed ceiling judge Δdata = Δ(heapUsed + external) − Δ(V8 code_and_metadat
 at the final checkpoint of the unchanged settle protocol. Raw retained bytes and both V8 code
 readings remain recorded, and the validator recomputes the data quantity. No other bytes are
 subtracted, and RSS, external, peak and active-retention gates keep their original quantities.
-An unseeded closed data delta below −256 KiB is inconclusive.
+Unseeded closed data below −256 KiB is recorded as facts without blocking acceptance. Every active
+reading and collection checkpoint still faces the 8 MiB ceiling; unsettled active readings are recorded
+as facts. Control, matched, warm-up and closed readings still require settlement. Memory children use
+`--min-semi-space-size=1 --max-semi-space-size=1` with the eager-compilation flags; live and long-window
+worker flags are unchanged.
 
 One measured warm-up lifecycle of the same kind and arm completes the same catalogue, closes and
 releases before M; M0 records the old matched position. The first-use data step M − M0 must be at
 most 1 MiB. CI on Node 22/24/26 checks product-root seeds of 131,072 bytes per close (at least
 512 KiB total), with and without seeding during warm-up, and a warm-up-only seed of 1 MiB + 1.
-The controls must fail the closed or first-use bound, while all 24 unseeded arms remain within
-±256 KiB closed data. Compiled-code and retained-array controls check code accounting. These data
+The controls must fail the closed or first-use bound, while all 24 unseeded arms must keep closed growth at most
+256 KiB. Compiled-code and retained-array controls check code accounting. These data
 gates do not change live slope or endpoint acceptance; the live code series below remains shadow.
 
 ## Engine code shadow

@@ -19,10 +19,16 @@ const { performance, PerformanceObserver } = require('node:perf_hooks')
 const KIB = 1024
 
 /**
- * Request eager JavaScript bytecode and feedback allocation for this measurement tuple.
+ * Pin both semi-space sizes to 1 MiB and request eager bytecode and feedback allocation.
  * Execution can still grow compiled code and metadata; these flags do not establish retained stability.
  */
-const MEMORY_FLAGS = Object.freeze(['--expose-gc', '--no-lazy', '--no-lazy-feedback-allocation'])
+const MEMORY_FLAGS = Object.freeze([
+  '--expose-gc',
+  '--no-lazy',
+  '--no-lazy-feedback-allocation',
+  '--min-semi-space-size=1',
+  '--max-semi-space-size=1',
+])
 
 /** Collection convergence is stricter than any retained gate; it never changes an acceptance value. */
 const SETTLE = Object.freeze({ rounds: 6, bytes: 16384 })

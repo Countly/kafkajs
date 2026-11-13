@@ -15,7 +15,7 @@ const path = require('node:path')
  * The control's switch, mode and rate, and how far the shadow data slope may fall short of it.
  * `toleranceFraction` is of the seeded rate: a quarter, so the data slope must reach 96 KiB/min of
  * the 128 KiB/min seeded, beside natural drift. `allowed` is every violation a seeded run may
- * report: the closed ceiling that retained bytes can cross.
+ * report; the five-minute verdict has no growth check that the seed may violate.
  */
 const LIVE_SEED = Object.freeze({
   env: 'TELEMETRY_SEED',
@@ -24,7 +24,7 @@ const LIVE_SEED = Object.freeze({
   root: Symbol.for('telemetry.seed.root'),
   fill: 0x5a,
   toleranceFraction: 0.25,
-  allowed: Object.freeze(['closed transient ceiling']),
+  allowed: Object.freeze([]),
 })
 
 /**
