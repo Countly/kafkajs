@@ -28,6 +28,7 @@ const MEMORY_FLAGS = Object.freeze([
   '--no-lazy-feedback-allocation',
   '--min-semi-space-size=1',
   '--max-semi-space-size=1',
+  '--no-flush-bytecode',
 ])
 
 /** Collection convergence is stricter than any retained gate; it never changes an acceptance value. */
