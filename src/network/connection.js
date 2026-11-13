@@ -25,9 +25,6 @@ const { attachResponseSource } = require('../broker/failureSource')
 const apiKeys = require('../protocol/requests/apiKeys')
 const { responseHeaderVersion, RESPONSE_HEADER_V1 } = require('../protocol/headers')
 
-/** Fulfilled ordering seed shared outside request ownership. */
-const EMPTY_QUEUE = sharedSetup(() => Promise.resolve())
-
 const requestInfo = ({ apiName, apiKey, apiVersion }) =>
   `${apiName}(key: ${apiKey}, version: ${apiVersion})`
 
@@ -286,10 +283,10 @@ module.exports = class Connection {
 
     /**
      * Settles once the latest request of the current attempt has reached the request queue,
-     * whatever its outcome. Settlement and generation close release the tail's request scope.
-     * Each `connect()` attempt starts a fresh order, so an ended attempt never holds up the next.
+     * whatever its outcome. Each `connect()` attempt starts a fresh one, so a request of an
+     * ended attempt never holds up the next.
      */
-    this[PRIVATE.QUEUED] = EMPTY_QUEUE
+    this[PRIVATE.QUEUED] = Promise.resolve()
 
     /**
      * @private
@@ -408,7 +405,7 @@ module.exports = class Connection {
       const attempt = ++this.connectAttempt
       const telemetrySink = this.telemetrySink
       const telemetryAttempt = telemetrySink ? {} : null
-      this[PRIVATE.QUEUED] = EMPTY_QUEUE
+      this[PRIVATE.QUEUED] = Promise.resolve()
       const isCurrentAttempt = () => this.connectAttempt === attempt
 
       const abort = (error) => {
@@ -672,7 +669,6 @@ module.exports = class Connection {
     const abortConnect = this[PRIVATE.ABORT_CONNECT]
     this[PRIVATE.ABORT_CONNECT] = null
     this.connectAttempt += 1
-    this[PRIVATE.QUEUED] = EMPTY_QUEUE
     this.authenticatedAt = null
     this.connectionStatus = CONNECTION_STATUS.DISCONNECTED
     this.releaseTelemetryNode()
@@ -1012,7 +1008,6 @@ module.exports = class Connection {
     this.preparing += 1
     let answered
     let expectResponse
-    let tail
     try {
       expectResponse = !request.expectResponse || request.expectResponse()
       const prepared = this[PRIVATE.PREPARE]({ request, expectResponse, guard, establishedOnly })
@@ -1032,18 +1027,16 @@ module.exports = class Connection {
         // It may reject before the chain reaches it; marked handled so Node does not report it.
         prepared.catch(() => {})
         queued = this[PRIVATE.QUEUED].then(() => prepared).then(enqueue)
-        tail = queued.then(
+        this[PRIVATE.QUEUED] = queued.then(
           () => {},
           () => {}
         )
-        this[PRIVATE.QUEUED] = tail
       } else {
         queued = prepared.then(enqueue)
       }
 
       ;({ answered } = await queued)
     } finally {
-      if (this[PRIVATE.QUEUED] === tail) this[PRIVATE.QUEUED] = EMPTY_QUEUE
       if (attempt === this.connectAttempt) this.preparing -= 1
     }
     const { correlationId, size, entry, payload } = await answered
