@@ -605,6 +605,8 @@ const writeFence = (segments) => ({
  * which millisecond after the epoch. The five-minute lane batches the original ordered selections
  * into five disconnected public boundaries: the first follows the 60 s slot so its final selection
  * is custom, and the last follows all retirements so an empty selection owes no recovery Push.
+ * Middle boundaries move 15 s past their batch cutoff, between settled samples; their index still
+ * names the final transition, and retirements keep their original slots.
  * The long-window lane retains its original three stages.
  */
 class TelemetrySchedule {
@@ -654,6 +656,19 @@ class TelemetrySchedule {
           ]
           return actions.length ? [{ ...tick, actions, transitions }] : []
         })
+        .flatMap((tick) => {
+          if (
+            !tick.transitions.length ||
+            !tick.actions.includes('retire') ||
+            tick.at === this.endMs - STEPS.subscriptionMs
+          )
+            return [tick]
+          return [
+            { ...tick, actions: ['retire'], transitions: [] },
+            { ...tick, at: tick.at + STEPS.retireMs / 2, actions: ['reopen', 'subscription'] },
+          ]
+        })
+        .sort((a, b) => a.at - b.at)
         .map((tick, number) => ({ ...tick, number }))
     }
   }

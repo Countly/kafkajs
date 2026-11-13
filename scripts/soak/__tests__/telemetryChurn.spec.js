@@ -2936,7 +2936,9 @@ describe('telemetry profile parent', () => {
     const epoch = clock.now()
     const until = processes.until
     processes.until = jest.fn(async (...args) => {
-      advance(500)
+      const [kind, , remaining] = args
+      if (processes.sent.at(-1).type === 'confirm-fence') advance(500)
+      else if (kind === KINDS.at(-1)) advance(remaining - 1)
       return until(...args)
     })
     const rotate = fixture.rotate
@@ -2950,6 +2952,7 @@ describe('telemetry profile parent', () => {
       const readbacks = churn.rotations.filter((row) => row.tick === tick.number)
       const next = epoch + (schedule.ticks[tick.number + 1]?.at ?? schedule.endMs)
       expect(rows).toHaveLength(KINDS.length)
+      expect(Math.max(...rows.map((row) => row.parentAt - row.sentAt))).toBe(9999)
       expect(readbacks.map((row) => row.index)).toEqual(tick.transitions)
       for (const row of rows) {
         expect(row.sentAt).toBe(epoch + tick.at)
@@ -4034,11 +4037,12 @@ describe('telemetry churn coordinated stage replay', () => {
       'Stage catalogue differs from the fixed table',
     ],
     [
-      'stages reordered within a tick',
+      'a shifted confirmation reordered before its preceding retirement',
       (a, table) => {
-        const tick = table.ticks.find((t) => t.actions.length === 3).number
-        const rows = a.stages.filter((r) => r.tick === tick)
+        const tick = table.ticks.find((t) => t.at === 135000).number
+        const rows = a.stages.filter((r) => r.tick === tick - 1 || r.tick === tick)
         const first = a.stages.indexOf(rows[0])
+        expect(rows).toHaveLength(8)
         a.stages.splice(first, 8, ...rows.slice(4, 8), ...rows.slice(0, 4))
       },
       'Stage catalogue differs from the fixed table',

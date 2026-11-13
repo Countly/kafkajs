@@ -542,13 +542,28 @@ stamped only after the last cleanup step.
 One parent supervises four one-client worker processes (producer, consumer, admin, share consumer). The
 parent owns the fixed tick catalogue. The original 35 selections still alternate `com.example.`, empty,
 and `org.apache.kafka.` in order, but run as disconnected batches: transition 1–7 at 70 s, 8–12 at
-120 s, 13–18 at 180 s, 19–24 at 240 s and 25–35 at 350 s.
+135 s, 13–18 at 195 s, 19–24 at 255 s and 25–35 at 350 s.
+The three middle gaps sit halfway between the unchanged 30 s settled-sample slots. All settled samples
+remain judged, including the 60 s and 359 s samples near the unchanged first and last gaps.
+
+| Gap after epoch | Ordered transitions | Retirement before / after |
+| --- | --- | --- |
+| 70 s | 1–7 | 60 / 90 s |
+| 135 s | 8–12 | 120 / 150 s |
+| 195 s | 13–18 | 180 / 210 s |
+| 255 s | 19–24 | 240 / 270 s |
+| 350 s | 25–35 | 330 s / none before measurement ends at 360 s |
+
 These are release slots after the epoch, subject to the existing stage deadlines. A batch first pauses
 and drains admission and closes all four public clients. Only after every disconnected fence arrives
 does the parent apply every set and successful readback in order. It then releases all reconnects;
 connect remains the next public client action. No next lifecycle or handshake can precede those
 readbacks. A tick more than 5 s late fails and is never caught up. The 11 telemetry retirements retain
-their 30 s slots and, when coincident, follow confirmation; each proves its own recovery Push.
+their 30 s slots, now separate from every batch; each proves its own recovery Push. Each confirmation
+still joins all set/readbacks, reconnects and owed Push proofs under the unchanged 10 s stage bound.
+The middle gaps have 15 s until the next retirement; the last retains 10 s until measurement ends.
+Confirmations remain serialized with subsequent actions; stage deadlines and the measurement-boundary
+evidence check are unchanged.
 
 There are five public close/reopen cycles, restoring the original cycle count. The first gap at 70 s
 ends on a custom selection for decoded wire proof; the last at 350 s applies the empty selection after
