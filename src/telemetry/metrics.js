@@ -199,9 +199,10 @@ module.exports = class TelemetryMetrics {
   /**
    * @param {string} name fixed name @param {string} type sum or gauge @param {string} unit OTLP unit
    * @param {Array} attributes frozen canonical attributes @param {number|bigint} value observed value
+   * @param {string} [key] the identity already serialized from the same name and attributes
    * @returns {object} issued metric state; selected origin is independent of numeric subscription IDs
    */
-  #series(name, type, unit, attributes, value) {
+  #series(name, type, unit, attributes, value, key = JSON.stringify([name, attributes])) {
     const time = this.#now()
     const state = {
       name,
@@ -217,7 +218,7 @@ module.exports = class TelemetryMetrics {
       everSelected: false,
       live: window(),
     }
-    state.key = JSON.stringify([name, attributes])
+    state.key = key
     return state
   }
 
@@ -436,7 +437,14 @@ module.exports = class TelemetryMetrics {
       previous.value = data.value
       return
     }
-    const state = this.#series(data.name, data.type, data.unit, data.attributes, data.value)
+    const state = this.#series(
+      data.name,
+      data.type,
+      data.unit,
+      data.attributes,
+      data.value,
+      data.key
+    )
     state.bytes = data.bytes
     this.#custom.set(data.key, state)
     this.#metadataBytes += data.bytes

@@ -262,3 +262,36 @@ describe('metric names selectors and resources', () => {
     )
   })
 })
+
+describe('custom metric identity storage', () => {
+  test('serializes each registered identity once and reuses it as the series key', () => {
+    const { metrics, select } = fixture()
+    const s = select()
+    const descriptor = {
+      name: 'com.test.identity',
+      type: 'gauge',
+      value: 1,
+      attributes: { region: 'eu', zone: 'a' },
+    }
+    const stringify = jest.spyOn(JSON, 'stringify')
+    try {
+      metrics.register(descriptor)
+      const identities = stringify.mock.calls.filter(
+        ([value]) => Array.isArray(value) && value[0] === descriptor.name
+      )
+      expect(identities).toHaveLength(1)
+    } finally {
+      stringify.mockRestore()
+    }
+    const point = metrics.snapshot(s).points.find((p) => p.name === descriptor.name)
+    expect(point.identity.key).toBe(
+      JSON.stringify([
+        descriptor.name,
+        [
+          { key: 'region', value: 'eu' },
+          { key: 'zone', value: 'a' },
+        ],
+      ])
+    )
+  })
+})
