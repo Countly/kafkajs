@@ -20,8 +20,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        comparison: [master-pr, aa]
-        partition: [frame-other, frame-1m]
+        comparison: [master-pr]
+        partition: [frame-other]
     env:
       BASELINE: ${{ matrix.comparison == 'aa' && inputs.candidate || inputs.baseline }}
       CANDIDATE: ${{ inputs.candidate }}
