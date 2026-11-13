@@ -407,7 +407,7 @@ The shutdown file selects `close and reopen` separately from `telemetry churn`, 
 
 Under D142, phase-blocking telemetry lanes retain functional wire/decode health, exact cancellation accounting, all 21 shutdown lifecycles per kind, UUID/cache/final-Push semantics, corpus and raw-offset oracles, capability refusals, and explicit absence of API 71/72 requests in negative controls. The `telemetry-verdicts` job in `.github/workflows/memory-gates.yml` reruns outcomes, unsupported and shutdown with the full Node/broker matrix and requires resource acceptance from the same archived transcripts and lifecycle/resource ledgers. Its verdicts cover ordinary/refused-bootstrap socket ownership, enabled/disabled ownership equivalence, observer listeners/sockets/timers, decoder occupancy, undischarged identities and exact quiet-window equality. These verdicts block 3.0.0; they do not block a phase merge. Operational cleanup failures still fail functional lanes. The configured outcomes share oracle has 28000 ms of work and a 30000 ms full envelope, including its 2000 ms local cleanup reserve and full 3000 ms verifier observation; its enclosing case is 188000 ms (158000 ms work, 30000 ms cleanup), within the unchanged 270 s shell bound.
 
-Churn runs a 60-second warm-up and 300-second measurement with at least 10 settled samples, then cleanup within 120 seconds and total 540 seconds. It preserves 35 ordered subscription set/readbacks, batched only between public lifecycles, and retires telemetry every 30 seconds. Public close/reopen boundaries include the original 60-second cadence and three additional gaps; no scheduled subscription update runs while any worker is active. Four one-client workers prevent memory averaging. Measure heapUsed plus external after two collections; arrayBuffers is already included in external. Compare the same descriptor/UUID population, check exact timer/handle/listener/socket identities and record RSS/native peak separately. Independent durable-record, broker-commit or share-delivery, and handler-invocation identities remain separate oracles.
+Churn runs a 60-second warm-up and 300-second measurement with at least 10 settled samples, then cleanup within 120 seconds and total 540 seconds. It preserves 35 ordered subscription set/readbacks, batched only between public lifecycles, and retires telemetry every 30 seconds. Five public close/reopen boundaries batch all 35 transitions; no scheduled subscription update runs while any worker is active. Four one-client workers prevent memory averaging. Measure heapUsed plus external after two collections; arrayBuffers is already included in external. Compare the same descriptor/UUID population, check exact timer/handle/listener/socket identities and record RSS/native peak separately. Independent durable-record, broker-commit or share-delivery, and handler-invocation identities remain separate oracles.
 
 The single-client memory and native arms of `src/telemetry/__tests__/resources.spec.js` need a quiet host: the `Memory gates` workflow selects those arms alone in its own `resources` job with `TELEMETRY_RESOURCES_QUIET=1`, and the shared unit lane skips those arms.
 
@@ -541,8 +541,8 @@ stamped only after the last cleanup step.
 
 One parent supervises four one-client worker processes (producer, consumer, admin, share consumer). The
 parent owns the fixed tick catalogue. The original 35 selections still alternate `com.example.`, empty,
-and `org.apache.kafka.` in order, but run as disconnected batches: transition 1 at 10 s, 2–5 at 50 s,
-6 at 60 s, 7–12 at 120 s, 13–18 at 180 s, 19–24 at 240 s, 25–30 at 300 s and 31–35 at 350 s.
+and `org.apache.kafka.` in order, but run as disconnected batches: transition 1–7 at 70 s, 8–12 at
+120 s, 13–18 at 180 s, 19–24 at 240 s and 25–35 at 350 s.
 These are release slots after the epoch, subject to the existing stage deadlines. A batch first pauses
 and drains admission and closes all four public clients. Only after every disconnected fence arrives
 does the parent apply every set and successful readback in order. It then releases all reconnects;
@@ -550,9 +550,13 @@ connect remains the next public client action. No next lifecycle or handshake ca
 readbacks. A tick more than 5 s late fails and is never caught up. The 11 telemetry retirements retain
 their 30 s slots and, when coincident, follow confirmation; each proves its own recovery Push.
 
-There are eight public close/reopen cycles, including the original five 60 s boundaries. Giving each
-of the 35 transitions its own lifecycle would exceed the unchanged 16-segment cap. Batching preserves
-the transition count and values, but intermediate selections have set/readback proof rather than an
+There are five public close/reopen cycles, restoring the original cycle count. The first gap at 70 s
+ends on a custom selection for decoded wire proof; the last at 350 s applies the empty selection after
+the final retirement at 330 s, so every retirement still owes a recovery Push. The table now contains
+35 measured subscription transitions, 10 measured retirements and five measured reopens; the first
+retirement remains in warm-up. Giving each transition its own lifecycle would exceed the unchanged
+16-segment cap. Batching preserves the transition count and values, but intermediate selections have
+set/readback proof rather than an
 active Get/Push stream. Each batch's final Get carries and returns the same instance ID, the exact
 requested prefix list and a 1000 ms interval. A nonempty reopened lifecycle owes an accepted normal
 Push after its replacement Get on that socket. An empty selection keeps the resource and polls
@@ -562,8 +566,8 @@ churn stream error; an undeclared 117 still fails verification. The in-lifecycle
 The frozen long-window method keeps its original subscription schedule, identity and readings; only
 the five-minute lane uses these disconnected batches.
 
-Every public lifecycle of a worker is one sealed observer segment (ten per kind: setup, initial and
-eight reopens), written as a transcript file and a payload/proof bundle. Every accepted Push keeps its
+Every public lifecycle of a worker is one sealed observer segment (seven per kind: setup, initial and
+five reopens), written as a transcript file and a payload/proof bundle. Every accepted Push keeps its
 bytes, response, node, subscription and sink join. The Pushes that are decoded in full are selected by
 a rule over the transcript alone: the first accepted Push of every telemetry socket, the first accepted
 Push governed by each custom-prefix Get, and the accepted final of every segment; the last segment's

@@ -2503,10 +2503,11 @@ describe('telemetry profile worker', () => {
     const records = [getRecord(1, 3)]
     const current = { id: 'producer-lc-2', observer: observerOf(records) }
     const { worker } = make({ current })
-    const command = { tick: 0, index: 2, stage: 'confirm', selection: '' }
+    const tick = worker.schedule.ticks.find((t) => t.actions.includes('subscription')).number
+    const command = { tick, index: 2, stage: 'confirm', selection: '' }
     await worker.handle({ ...command, type: 'confirm-fence' })
     const fence = worker.send.mock.calls.at(-1)[0]
-    expect(fence).toMatchObject({ type: 'confirm-fenced', tick: 0, after: 1, segment: current.id })
+    expect(fence).toMatchObject({ type: 'confirm-fenced', tick, after: 1, segment: current.id })
     records.push(
       getRecord(2, 3, {
         writeAt: fence.receivedAt + 1,
@@ -2529,7 +2530,8 @@ describe('telemetry profile worker', () => {
       const records = [getRecord(1, 3, { writeAt: 1e9, response })]
       const current = { id: 'producer-lc-2', observer: observerOf(records) }
       const { worker } = make({ current })
-      const command = { tick: 0, index: 2, stage: 'confirm', selection: '' }
+      const tick = worker.schedule.ticks.find((t) => t.actions.includes('subscription')).number
+      const command = { tick, index: 2, stage: 'confirm', selection: '' }
       await worker.handle({ ...command, type: 'confirm-fence' })
       if (stale === 'timestamp') records.push(getRecord(2, 3, { writeAt: 0, response }))
       await expect(worker.confirm(command)).rejects.toThrow('no selection Get within 8000 ms')
@@ -2899,7 +2901,7 @@ describe('telemetry profile parent', () => {
     releaseFence()
     await ticking
     expect(fixture.rotate.mock.calls[0]).toEqual([1, 'com.example.', 1500])
-    expect(processes.sent.filter((m) => m.type === 'confirm-fence')).toHaveLength(8 * KINDS.length)
+    expect(processes.sent.filter((m) => m.type === 'confirm-fence')).toHaveLength(5 * KINDS.length)
   })
 
   test('fails a measured tick that is more than its late bound behind and never catches it up', async () => {
@@ -3924,12 +3926,21 @@ describe('telemetry churn coordinated stage replay', () => {
     const rotation = input.archive.rotations[0]
     rotation.readbackAt += 250
     rotation.readbackAttempts = 6
+    for (const next of input.archive.rotations.filter(
+      (r) => r.tick === rotation.tick && r.index > rotation.index
+    )) {
+      next.requestedAt += 250
+      next.setAt += 250
+      next.readbackAt += 250
+    }
     for (const kind of KINDS) {
       const row = input.archive.stages.find((r) => r.tick === rotation.tick && r.kind === kind)
       row.releasedAt += 250
       row.parentAt += 250
       row.workerDoneAt += 250
-      input.archive.workers[kind].stages[0].doneAt += 250
+      input.archive.workers[kind].stages.find(
+        (r) => r.tick === rotation.tick && r.stage === 'confirm'
+      ).doneAt += 250
       input.archive.workers[kind].claims.transitions[0].releasedAt += 250
     }
     expect(verifyChurnStages(input).producer.subscription).toBe(35)
@@ -4015,7 +4026,9 @@ describe('telemetry churn coordinated stage replay', () => {
       'a transition while a lifecycle is still active',
       (a) => {
         const facts = a.workers.producer
-        facts.claims.reopens[0].closedAt = facts.stages[0].startedAt + 5
+        const reopen = facts.claims.reopens[0]
+        const stage = facts.stages.find((s) => s.tick === reopen.tick && s.stage === 'confirm')
+        reopen.closedAt = stage.startedAt + 5
       },
       'A subscription transition was released inside an active lifecycle',
     ],

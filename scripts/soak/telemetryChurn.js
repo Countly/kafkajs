@@ -599,7 +599,9 @@ const writeFence = (segments) => ({
 /**
  * The deterministic action table of one run, derived from the fixed schedule alone: what happens at
  * which millisecond after the epoch. The five-minute lane batches the original ordered selections
- * into disconnected public boundaries; the long-window lane retains its original three stages.
+ * into five disconnected public boundaries: the first follows the 60 s slot so its final selection
+ * is custom, and the last follows all retirements so an empty selection owes no recovery Push.
+ * The long-window lane retains its original three stages.
  */
 class TelemetrySchedule {
   /**
@@ -628,16 +630,19 @@ class TelemetrySchedule {
         actions: ORDER.filter((a) => actions.includes(a)),
       }))
     if (this.betweenLifecycles) {
+      const cycles = this.ticks.filter((tick) => tick.actions.includes('reopen'))
+      const gaps = new Set(
+        cycles.map((tick, index) =>
+          index === cycles.length - 1
+            ? this.endMs - STEPS.subscriptionMs
+            : tick.at + (index === 0 ? STEPS.subscriptionMs : 0)
+        )
+      )
       const pending = []
       this.ticks = this.ticks
         .flatMap((tick) => {
           pending.push(tick.index)
-          const flush =
-            tick.index === 1 ||
-            tick.at + STEPS.subscriptionMs === warmupMs ||
-            tick.actions.includes('reopen') ||
-            tick.at + STEPS.subscriptionMs === this.endMs
-          const transitions = flush ? pending.splice(0) : []
+          const transitions = gaps.has(tick.at) ? pending.splice(0) : []
           const actions = [
             ...(transitions.length ? ['reopen'] : []),
             ...(tick.actions.includes('retire') ? ['retire'] : []),

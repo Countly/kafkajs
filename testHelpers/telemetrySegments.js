@@ -26,7 +26,7 @@ const SCHEDULES = Object.freeze({
   }),
   'telemetry-churn': Object.freeze({
     kinds: Object.freeze(['producer', 'consumer', 'admin', 'shareConsumer']),
-    perKind: 10,
+    perKind: 7,
     cap: 16,
     extras: Object.freeze([]),
     name: (kind, index) => `${kind}-lc-${index}`,
