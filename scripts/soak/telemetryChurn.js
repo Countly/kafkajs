@@ -3469,6 +3469,7 @@ class ReferenceControl {
    * @param {function():void} [options.gc] a full collection, `global.gc` by default
    * @param {function():number} [options.collections] collections the engine reported so far
    * @param {EngineCodeJournal|null} [options.engine] takes the code sizes of each settled reading
+   * @param {Function} [options.capture] diagnostic-only callback after each original C0/C1 reading
    */
   constructor({
     kind,
@@ -3482,6 +3483,7 @@ class ReferenceControl {
     gc = globalThis.gc,
     collections = () => 0,
     engine = null,
+    capture,
   }) {
     Object.assign(this, {
       kind,
@@ -3496,6 +3498,7 @@ class ReferenceControl {
       collections,
       engine,
     })
+    if (capture) this.capture = capture
     this.manifest = controlManifest(kind, config)
   }
 
@@ -3554,9 +3557,11 @@ class ReferenceControl {
         }
         await this.sleep(CONTROL.idleMs)
         c0 = await settledReading('c0', io)
+        this.capture?.('c0', c0, client, this)
         outcomes = await runCatalogue(client, manifest, `${config.stem}:ctl-off`, io.now)
         await this.sleep(CONTROL.idleMs)
         c1 = await settledReading('c1', io)
+        this.capture?.('c1', c1, client, this)
       } catch (error) {
         await client.disconnect().catch(() => {})
         throw error
@@ -4641,6 +4646,7 @@ class TelemetryWorkerProcess {
         sleep: this.sleep,
         collections: () => memory.collections,
         engine,
+        capture: soak.closedControlCapture,
       }).run()
       peak?.phase('setup')
       host.boundary = hostContext(() => this.clock.now())

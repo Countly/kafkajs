@@ -5,10 +5,10 @@ const path = require('node:path')
 const v8 = require('node:v8')
 
 const FLAGS = Object.freeze({ diagnostic: true, acceptanceEligible: false })
-/** Engine code journal rows: headroom for the warm capture's extra reading. */
+/** Engine journal headroom includes the warm reading; C0/C1 captures add no readings. */
 const ENGINE_ROWS = 128
 
-/** Three endpoint captures, written synchronously only AFTER the original settled heap reading. */
+/** Endpoint and control captures, written synchronously AFTER the original settled heap reading. */
 class ClosedCapture {
   /**
    * @param {object} options
@@ -25,7 +25,7 @@ class ClosedCapture {
   /**
    * Does not collect or settle before recording statistics. Snapshot creation itself perturbs V8;
    * these observations can never substitute for acceptance readings.
-   * @param {'baseline'|'warm'|'teardown'} checkpoint original endpoint or experimental baseline
+   * @param {'baseline'|'warm'|'teardown'|'c0'|'c1'} checkpoint original endpoint or experimental baseline
    * @param {object} snapshot already collected and settled probe reading
    * @returns {void} writes statistics before taking the corresponding snapshot
    * @throws {Error} on duplicate checkpoints, missing GC evidence or file/capture failure
@@ -76,6 +76,23 @@ const installClosedDiagnostic = (worker, env = process.env, ports = {}) => {
     kind: worker.kind,
     ...ports,
   })
+  /**
+   * Temporarily names the disabled client and control owner without retaining them after capture.
+   * @param {'c0'|'c1'} checkpoint original control endpoint @param {object} reading settled memory
+   * @param {object} client disabled public client @param {object} control reference harness owner
+   * @returns {void} writes diagnostic evidence with no extra reading or explicit collection
+   * @throws {Error} on invalid readings or capture failure
+   */
+  const closedControlCapture = (checkpoint, reading, client, control) => {
+    const previous = globalThis.__telemetryClosedRoots
+    try {
+      globalThis.__telemetryClosedRoots = { client, harness: control }
+      capture.record(checkpoint, { memory: { ...reading, retainedBytes: reading.retained } })
+    } finally {
+      if (previous === undefined) delete globalThis.__telemetryClosedRoots
+      else globalThis.__telemetryClosedRoots = previous
+    }
+  }
   const Original = worker.soak.Soak
   /** Opt-in capture seam; ordinary workers never load or instantiate it. */
   class ClosedSoak extends Original {
@@ -118,6 +135,7 @@ const installClosedDiagnostic = (worker, env = process.env, ports = {}) => {
   worker.soak = {
     ...worker.soak,
     Soak: ClosedSoak,
+    closedControlCapture,
     TELEMETRY: { ...worker.soak.TELEMETRY, ...FLAGS, engineRows: ENGINE_ROWS },
   }
 }

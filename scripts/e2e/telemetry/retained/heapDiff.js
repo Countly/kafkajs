@@ -7,10 +7,12 @@ const fs = require('node:fs')
  * Reads V8 graph sections from bytes without creating a string for the complete snapshot.
  * Numeric fields retain safe-integer precision; unrelated sections are skipped.
  * @param {string} filename V8 .heapsnapshot path.
+ * @param {object} [options] optional graph evidence
+ * @param {boolean} [options.locations=false] retain V8 source positions for diagnostic owner paths
  * @returns {object} Snapshot metadata, typed node/edge arrays and decoded strings.
  * @throws {Error} On unreadable files, malformed JSON or inconsistent graph dimensions.
  */
-const readSnapshot = (filename) => {
+const readSnapshot = (filename, { locations = false } = {}) => {
   const bytes = fs.readFileSync(filename)
   let offset = 0
   const fail = (detail) => {
@@ -122,7 +124,10 @@ const readSnapshot = (filename) => {
       whitespace()
       const valueStart = offset
       valueEnd()
-      if (['snapshot', 'nodes', 'edges', 'strings'].includes(key)) {
+      if (
+        ['snapshot', 'nodes', 'edges', 'strings'].includes(key) ||
+        (locations && key === 'locations')
+      ) {
         if (sections.has(key)) fail(`duplicate ${key} section`)
         sections.set(key, [valueStart, offset])
       }
@@ -202,7 +207,15 @@ const readSnapshot = (filename) => {
     }
   take(93)
   if (offset !== end) fail('invalid strings section')
-  return { snapshot, nodes, edges, strings }
+  return {
+    snapshot,
+    nodes,
+    edges,
+    strings,
+    ...(locations && sections.has('locations')
+      ? { locations: decode(...sections.get('locations')) }
+      : {}),
+  }
 }
 
 /**

@@ -16,7 +16,7 @@ const { selfLedger } = require('../e2e/telemetry/retained/ownership')
 const { FLAGS } = require('./closedDiagnostic')
 
 const SCOPES = ['product', 'harness', 'engine', 'unresolved']
-const CHECKPOINTS = ['baseline', 'warm', 'teardown']
+const CHECKPOINTS = ['baseline', 'warm', 'teardown', 'c0', 'c1']
 const MAX_COMPRESSED_BYTES = 256 * 1024 * 1024
 
 /**
@@ -46,19 +46,20 @@ const sourceOf = (graph, start) => {
  * registry/worker. Only state edges are walked; prototypes, compiler metadata, weak links, module
  * caches and global/native contexts are boundaries. Closure contexts are followed only when their
  * script is in the matching source tree. Unproven and multiply owned nodes remain unresolved.
- * @param {object} graph analysed strong graph
- * @returns {string[]} disjoint scope/owner/constructor labels for the existing self-byte ledger
+ * @param {object} graph analysed strong graph @param {object} raw snapshot with optional V8 locations
+ * @returns {object} disjoint ledger labels and a state-path lookup for sampled growth
  */
-const labelsOf = (graph) => {
+const labelsOf = (graph, raw) => {
   const ownership = ownershipIndex(graph)
   const owners = new Array(graph.n)
+  const parents = new Int32Array(graph.n).fill(-1)
   const sources = new Map()
   const source = (v) => {
     if (!sources.has(v)) sources.set(v, sourceOf(graph, v))
     return sources.get(v)
   }
   const walk = (start, scope, owner) => {
-    const queue = [{ v: start, owner }]
+    const queue = [{ v: start, owner, parent: -1 }]
     const seen = new Set([start])
     for (let i = 0; i < queue.length; i++) {
       const entry = queue[i]
@@ -78,7 +79,10 @@ const labelsOf = (graph) => {
       const label = `${scope}\0${entry.owner}`
       const previous = owners[v]
       if (previous && previous.split('\0')[0] !== scope) owners[v] = 'unresolved\0shared-state'
-      else if (!previous) owners[v] = label
+      else if (!previous) {
+        owners[v] = label
+        parents[v] = entry.parent
+      }
       for (const { target, edge } of graph.outgoing(v)) {
         if (
           seen.has(target) ||
@@ -103,7 +107,11 @@ const labelsOf = (graph) => {
         )
           continue
         seen.add(target)
-        queue.push({ v: target, owner: v === start ? `${owner}.${edge.name}` : entry.owner })
+        queue.push({
+          v: target,
+          owner: v === start ? `${owner}.${edge.name}` : entry.owner,
+          parent: v,
+        })
       }
     }
   }
@@ -116,7 +124,7 @@ const labelsOf = (graph) => {
         if (edge.name === 'harness') walk(target, 'harness', 'harness')
       }
     }
-  return Array.from({ length: graph.n }, (_, v) => {
+  const labels = Array.from({ length: graph.n }, (_, v) => {
     const node = graph.describe(v)
     const category = ownership.categories[v]
     let owner = owners[v] || 'unresolved\0unproven'
@@ -138,6 +146,50 @@ const labelsOf = (graph) => {
       owner = `engine\0${node.name}`
     return `${owner}\0${node.type}\0${/string/.test(node.type) ? '(string)' : node.name.slice(0, 160)}`
   })
+  const positions = new Map()
+  const fields = raw.snapshot.meta.location_fields || []
+  if (fields.length)
+    for (let i = 0; i < (raw.locations?.length || 0); i += fields.length) {
+      const index =
+        raw.locations[i + fields.indexOf('object_index')] / raw.snapshot.meta.node_fields.length
+      const line = raw.locations[i + fields.indexOf('line')]
+      if (
+        Number.isInteger(index) &&
+        index >= 0 &&
+        index < graph.n &&
+        Number.isInteger(line) &&
+        line >= 0
+      )
+        positions.set(index, line + 1)
+    }
+  /**
+   * Gives a concrete state-field chain from a named client or registry, when the walk proved one.
+   * Source positions name the nearest owning closure, not an inferred allocation site.
+   * @param {number} v growth node @returns {object} reachability, owner field and optional file:line
+   */
+  const ownerOf = (v) => {
+    const unproven = { reachable: null, root: null, field: null, source: null }
+    if (!owners[v] || owners[v].startsWith('unresolved')) return unproven
+    const chain = []
+    let location = null
+    let current = v
+    for (let depth = 0; depth < graph.n; depth++) {
+      if (!location && graph.describe(current).type === 'closure') {
+        const file = source(current)
+        const line = positions.get(current)
+        if (file && line) location = { file, line }
+      }
+      const parent = parents[current]
+      if (parent === -1) break
+      const link = graph.outgoing(parent).find(({ target }) => target === current)
+      chain.push(String(link.edge.name))
+      current = parent
+    }
+    const root = owners[current]?.split('\0')[1]
+    if (!['client', 'registry'].includes(root)) return unproven
+    return { reachable: true, root, field: [root, ...chain.reverse()].join('.'), source: location }
+  }
+  return { labels, ownerOf }
 }
 
 /**
@@ -159,8 +211,8 @@ const compact = (value) =>
 const compareSnapshots = (beforeRaw, afterRaw) => {
   const before = analyseSnapshot(beforeRaw)
   const after = analyseSnapshot(afterRaw)
-  const beforeLabels = labelsOf(before)
-  const afterLabels = labelsOf(after)
+  const { labels: beforeLabels } = labelsOf(before, beforeRaw)
+  const { labels: afterLabels, ownerOf } = labelsOf(after, afterRaw)
   const ledger = selfLedger(before, after, beforeLabels, afterLabels)
   const byScope = Object.fromEntries(
     SCOPES.map((scope) => [scope, { before: 0, after: 0, delta: 0 }])
@@ -200,6 +252,7 @@ const compareSnapshots = (beforeRaw, afterRaw) => {
       return {
         ...row,
         node: compact(row.node),
+        owner: compact(ownerOf(index)),
         trace: {
           rootPath: trace.rootPath.slice(-24),
           incoming: trace.incoming.slice(0, 8),
@@ -221,7 +274,7 @@ const compareSnapshots = (beforeRaw, afterRaw) => {
       .map(({ key, ...row }) => row),
     groupsTotal: groups.length,
     limitations:
-      'Self bytes only; strong graph excludes weak edges, not an ephemeron proof. State/source boundaries and shared owners remain unresolved. Snapshot GC and capture overhead perturb the run; engine statistics and snapshot self bytes are distinct measurements.',
+      'Self bytes only; strong graph excludes weak edges, not an ephemeron proof. State/source boundaries and shared owners remain unresolved. Owner reachability is proven only for walked state edges; null means unproven. Source positions identify owning closures, not allocation sites. Snapshot GC and capture overhead perturb the run; engine statistics and snapshot self bytes are distinct measurements.',
   }
 }
 
@@ -229,7 +282,7 @@ const compareSnapshots = (beforeRaw, afterRaw) => {
  * Compresses available snapshots with a streaming byte bound; a failed or oversized output is
  * removed before upload. Originals are removed only after successful compression.
  * @param {string} directory worker directory @param {number} maxBytes total compressed limit
- * @returns {Promise<number>} compressed bytes across the three unique snapshots
+ * @returns {Promise<number>} compressed bytes across the five unique snapshots
  * @throws {Error} on compression failure or size overflow
  */
 const compressSnapshots = async (directory, maxBytes) => {
@@ -264,7 +317,7 @@ const compressSnapshots = async (directory, maxBytes) => {
 }
 
 /**
- * Analyses both pairs serially and always archives a summary, including incomplete evidence.
+ * Analyses endpoint and control pairs serially and always archives a summary, including incomplete evidence.
  * The per-worker compressed cap bounds the four-worker snapshot artifact to 1 GiB.
  * @param {string} directory one worker directory @param {object} identity shared CI identity
  * @param {object} [options] bounded compression options, smaller limits for broker-free controls
@@ -291,19 +344,19 @@ const analyseWorker = async (directory, identity, { maxBytes = MAX_COMPRESSED_BY
       })
     )
     summary.readings = rows
-    const pair = (name) => ({
+    const pair = (name, end = 'teardown') => ({
       ...compareSnapshots(
-        readSnapshot(path.join(directory, `${name}.heapsnapshot`)),
-        readSnapshot(path.join(directory, 'teardown.heapsnapshot'))
+        readSnapshot(path.join(directory, `${name}.heapsnapshot`), { locations: true }),
+        readSnapshot(path.join(directory, `${end}.heapsnapshot`), { locations: true })
       ),
-      retainedDelta: rows.teardown.memory.retainedBytes - rows[name].memory.retainedBytes,
+      retainedDelta: rows[end].memory.retainedBytes - rows[name].memory.retainedBytes,
       codeDelta: Object.fromEntries(
-        Object.keys(rows.teardown.code).map((field) => [
+        Object.keys(rows[end].code).map((field) => [
           field,
-          rows.teardown.code[field] - rows[name].code[field],
+          rows[end].code[field] - rows[name].code[field],
         ])
       ),
-      heapSpaces: rows.teardown.heapSpaces.map((space) => ({
+      heapSpaces: rows[end].heapSpaces.map((space) => ({
         name: space.space_name,
         usedDelta:
           space.space_used_size -
@@ -313,6 +366,7 @@ const analyseWorker = async (directory, identity, { maxBytes = MAX_COMPRESSED_BY
     })
     summary.original = pair('baseline')
     summary.warm = pair('warm')
+    summary.control = pair('c0', 'c1')
     summary.complete = true
   } catch (error) {
     failure = error
@@ -349,7 +403,7 @@ const main = async (directory) => {
       failures.push(`${kind}: ${error.message}`)
       continue
     }
-    for (const pair of ['original', 'warm']) {
+    for (const pair of ['original', 'warm', 'control']) {
       const row = summary[pair]
       console.log(
         `${kind.padEnd(14)} ${pair.padEnd(9)} ${[row.retainedDelta, ...SCOPES.map((scope) => row.byScope[scope].delta)].map((bytes) => (bytes / 1024).toFixed(1).padStart(10)).join(' ')}`

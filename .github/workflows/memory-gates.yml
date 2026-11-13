@@ -648,12 +648,12 @@ jobs:
       - name: Verify mounted reporter and capture broker identities
         timeout-minutes: 2
         run: timeout -k 5s 90s node scripts/e2e/telemetry/ci.js capture
-      - name: Capture original and experimental warm endpoints for all four workers
+      - name: Capture control, original and experimental warm endpoints for all four workers
         timeout-minutes: 10
         env:
           TMPDIR: ${{ runner.temp }}
         run: timeout -k 10s 570s node --expose-gc scripts/soak/closedDiagnosticJob.js --diagnostic-only "$TELEMETRY_CLOSED_ROOT"
-      - name: Attribute both snapshot pairs serially and compress snapshots once
+      - name: Attribute endpoint and control snapshot pairs serially and compress snapshots once
         if: always()
         timeout-minutes: 8
         run: timeout -k 10s 450s node --max-old-space-size=4096 scripts/soak/closedAnalysis.js "$TELEMETRY_CLOSED_ROOT"
