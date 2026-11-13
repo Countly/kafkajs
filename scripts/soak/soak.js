@@ -656,13 +656,14 @@ class TelemetryResourceVerdict {
         reference.foreground.every((o, n) => o.n === n && o.status === 'fulfilled'),
       'enabled replay of the control catalogue'
     )
-    const rssDrift = Math.abs(control.c1.rss - control.c0.rss)
+    const rssGrowth = control.c1.rss - control.c0.rss
     const retainedDrift = Math.abs(control.c1.retained - control.c0.retained)
     if (
-      rssDrift > TELEMETRY.controlRssDriftBytes ||
+      rssGrowth > TELEMETRY.controlRssDriftBytes ||
       retainedDrift > TELEMETRY.controlRetainedDriftBytes
     )
       inconclusive.push('unstable control')
+    if (rssGrowth < -TELEMETRY.controlRssDriftBytes) measured.controlRssDecrease = -rssGrowth
     const peakOf = (list) => Math.max(...list.flatMap((r) => [r.hwm ?? 0, r.rss]))
     const setupPeak = peakOf(readings.slice(0, 5))
     const share = control.kind === 'shareConsumer'

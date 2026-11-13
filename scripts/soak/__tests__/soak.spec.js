@@ -7313,6 +7313,18 @@ describe('telemetry resident-size reference', () => {
     expect(evaluate(input).violations).toContain('external-memory increase')
   })
 
+  test('records a control resident-size decrease without marking the control unstable', () => {
+    const input = make()
+    input.reference.control.c1.rss -= 6 * MIB + 448 * 1024
+    const verdict = evaluate(input)
+    expect(verdict.inconclusive).not.toContain('unstable control')
+    expect(verdict.measured.controlRssDecrease).toBe(6 * MIB + 448 * 1024)
+    const grown = make()
+    grown.reference.control.c1.rss += 2 * MIB + 1
+    expect(evaluate(grown).inconclusive).toContain('unstable control')
+    expect(evaluate(grown).measured).not.toHaveProperty('controlRssDecrease')
+  })
+
   test('is inconclusive for an unstable control, an inflated setup or a missing capability', () => {
     const drift = make()
     drift.reference.control.c1.rss += 2 * MIB + 1

@@ -606,8 +606,8 @@ The allocation and setup allowance are recorded and recomputed by the validator.
 stays at most 160 MiB, and the external-memory peak at most
 64 MiB above the control. The peak source is the kernel's lifetime high-water mark of the executable
 image (`/proc/self/status`), read before any application module is loaded and at every phase boundary;
-the raw `maxRSS` is recorded beside it and never subtracted. A control that drifts by more than 2 MiB
-of resident size or 256 KiB of retained heap, a setup above its allowance, a missing collection or peak
+the raw `maxRSS` is recorded beside it and never subtracted. A control whose resident size grows by more than
+2 MiB (a larger decrease is recorded as a fact) or whose retained heap drifts by more than 256 KiB, a setup above its allowance, a missing collection or peak
 capability, or a noisy host (one-minute load per CPU above 0.75, free memory below 256 MiB, memory
 pressure above 5) makes the measurement inconclusive, with the facts retained; a broken or contradicted
 fact fails. This five-minute lane judges at most 8 MiB active above the matched disconnected
