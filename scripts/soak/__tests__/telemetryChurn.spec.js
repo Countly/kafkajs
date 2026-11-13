@@ -301,6 +301,23 @@ describe('telemetry profile', () => {
     )
   })
 
+  test.each(KINDS)('releases every %s subscription batch between lifecycle windows', (kind) => {
+    for (let measureMs = 60000; measureMs <= 300000; measureMs += 10000) {
+      const schedule = new TelemetrySchedule({ warmupMs: 60000, measureMs })
+      const transitions = schedule.ticks.flatMap((tick) => tick.transitions)
+      expect(transitions).toEqual(
+        Array.from({ length: (60000 + measureMs) / 10000 - 1 }, (_, n) => n + 1)
+      )
+      expect(schedule.ticks.length + 2).toBeLessThanOrEqual(16)
+      for (const tick of schedule.ticks) {
+        expect(tick.actions).toContain('reopen')
+        expect(schedule.stages(tick)[0]).toBe('confirm')
+        expect(tick.transitions.every((index) => index * 10000 <= tick.at)).toBe(true)
+        expect(kind).toBeDefined()
+      }
+    }
+  })
+
   test('holds the fixed measured action counts, the serialization order and the corpus slots', () => {
     const schedule = new TelemetrySchedule({ warmupMs: 60000, measureMs: 300000 })
     expect(schedule.required()).toEqual({ subscription: 30, retire: 10, reopen: 5 })
@@ -3390,6 +3407,13 @@ describe('telemetry churn complete-stream accounting', () => {
     return () => verifyChurnStream({ [ID]: transcript }, faulted)
   }
 
+  test('rejects an undeclared 117 after a subscription transition', () => {
+    expect(verify((t) => {
+      const push = t.records.find((r) => r.apiKey === 72 && !r.terminating && r.response)
+      push.response.errorCode = 117
+    })).toThrow('Undeclared error 117')
+  })
+
   test('accounts for every request, the faulted exchange and the one final', () => {
     expect(verify()).not.toThrow()
   })
@@ -4674,7 +4698,9 @@ describe('telemetry control warm-up', () => {
       expect(result.warmup.outcomes.every((o, n) => o.n === n && o.status === 'fulfilled')).toBe(
         true
       )
-      expect(result.warmup.completedAt - result.warmup.idleStartedAt).toBeGreaterThanOrEqual(2000)
+      expect(result.warmup.completedAt - result.warmup.idleStartedAt).toBeGreaterThanOrEqual(
+        kind === 'shareConsumer' ? 10000 : 2000
+      )
       expect(result.warmup.completedAt).toBeLessThanOrEqual(result.c0.gc.admittedAt)
       expect(result.outcomes).toHaveLength(result.manifest.operations.length)
       expect(result.outcomes.every((o) => o.at > result.c0.at && o.at < result.c1.at)).toBe(true)
