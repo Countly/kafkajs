@@ -4,6 +4,22 @@ const RequestQueue = require('./index')
 const { newLogger } = require('testHelpers')
 
 describe('Network > RequestQueue > timer release', () => {
+  it('keeps its field layout when timeout enforcement is disabled', () => {
+    const queue = new RequestQueue({
+      logger: newLogger(),
+      enforceRequestTimeout: false,
+      requestTimeout: 100,
+    })
+    const fields = Reflect.ownKeys(queue)
+
+    queue.scheduleRequestTimeoutCheck()
+    queue.destroy()
+    queue.destroy()
+
+    expect(Reflect.ownKeys(queue)).toEqual(fields)
+    expect(queue.requestTimeoutIntervalId).toBeNull()
+  })
+
   it('releases the cleared interval and its scope while the queue stays alive', () => {
     const child = spawnSync(
       process.execPath,
