@@ -269,7 +269,13 @@ describe('ProcessMemory', () => {
   )
 
   test('declares eager compilation without invoking telemetry or warming native work', () => {
-    expect(MEMORY_FLAGS).toEqual(['--expose-gc', '--no-lazy', '--no-lazy-feedback-allocation'])
+    expect(MEMORY_FLAGS).toEqual([
+      '--expose-gc',
+      '--no-lazy',
+      '--no-lazy-feedback-allocation',
+      '--min-semi-space-size=1',
+      '--max-semi-space-size=1',
+    ])
   })
 
   test('refuses a settled reading without a collection function', async () => {

@@ -275,7 +275,7 @@ describe('live seeded control records', () => {
 describe('live seeded control judge', () => {
   const exit = (over = {}) => ({
     event: 'close',
-    code: 1,
+    code: 0,
     signal: null,
     killed: false,
     aborted: false,
@@ -288,7 +288,7 @@ describe('live seeded control judge', () => {
   })
   const facts = (kind, over = {}) => ({
     kind,
-    violations: ['closed transient ceiling'],
+    violations: [],
     measured: { samples: 11, slopeBytesPerMinute: 131270, endpointBytes: 655360 },
     samples: 11,
     shadow: {
@@ -316,7 +316,10 @@ describe('live seeded control judge', () => {
 
   test('keeps the five-minute seed diagnostic and permits verdicts without slope or endpoint failures', () => {
     expect(() => judge(workers())).not.toThrow()
-    expect(() => judge(workers({ violations: [], exit: exit({ code: 0 }) }))).not.toThrow()
+    expect(LIVE_SEED.allowed).toEqual([])
+    expect(() => judge(changed({ violations: ['closed transient ceiling'] }))).toThrow(
+      'violations the seed does not explain'
+    )
     expect(() => judge(changed({ violations: ['retained slope'] }))).toThrow(
       'violations the seed does not explain'
     )
@@ -368,7 +371,7 @@ describe('live seeded control judge', () => {
     expect(() => judge(changed({ seed: null }))).toThrow('seed mode')
   })
 
-  test('fails a worker that did not exit naturally on its own failed verdict', () => {
+  test('fails a worker that did not exit naturally on its own verdict', () => {
     for (const over of [
       { killed: true },
       { aborted: true },
@@ -376,7 +379,7 @@ describe('live seeded control judge', () => {
       { stderrBytes: 5 },
       { unhandled: 1 },
       { receipts: 0 },
-      { code: 0 },
+      { code: 1 },
       { signal: 'SIGKILL' },
       { event: 'timeout' },
       { afterDisconnectMs: TELEMETRY.exitMs + 1 },

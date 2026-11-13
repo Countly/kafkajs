@@ -6836,7 +6836,6 @@ describe('telemetry resource evidence', () => {
       slopeBytesPerMinute: 65536,
       endpointBytes: 1048576,
       activeBytes: 8388608,
-      closedBytes: 262144,
       rssDeltaBytes: 67108864,
       externalDeltaBytes: 67108864,
       setupPeakBytes: 100663296,
@@ -6989,13 +6988,6 @@ describe('telemetry resource evidence', () => {
       'sampler read failure',
     ],
     [
-      'closed transient overflow',
-      (r) => {
-        grow(r.teardown.memory, 262144 + 1)
-      },
-      'closed transient ceiling',
-    ],
-    [
       'active overflow',
       (r) => {
         grow(r.samples[5].snapshot.memory, 8388608 + 1)
@@ -7020,9 +7012,9 @@ describe('telemetry resource evidence', () => {
     }
   )
 
-  test('accepts the closed transient and active ceilings at equality', () => {
+  test('accepts closed growth above 256 KiB while keeping the active ceiling at equality', () => {
     const input = run()
-    grow(input.teardown.memory, 262144)
+    grow(input.teardown.memory, 262145)
     input.samples.forEach((s) => grow(s.snapshot.memory, 8388608))
     expect(evaluate(input).ok).toBe(true)
   })

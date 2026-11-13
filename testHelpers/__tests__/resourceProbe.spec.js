@@ -818,7 +818,13 @@ describe('resource artifact validation', () => {
           arm,
           kind,
           ...child,
-          execArgv: ['--expose-gc', '--no-lazy', '--no-lazy-feedback-allocation'],
+          execArgv: [
+            '--expose-gc',
+            '--no-lazy',
+            '--no-lazy-feedback-allocation',
+            '--min-semi-space-size=1',
+            '--max-semi-space-size=1',
+          ],
           instrumented: { inspector: false, coverage: false, jest: false },
           peakSource: { name: 'proc-self-status-vmhwm', units: 'bytes' },
           gc: { available: true, native: true },
@@ -1608,13 +1614,38 @@ describe('resource artifact validation', () => {
       expect(result.problems).toContain('closed collection reading is incomplete')
     })
 
-    test('does not let an unsettled control become an admitted reference', () => {
-      const result = judged('public', (r) => {
-        r.c0.gc.checkpoints[0].heapUsed -= 300000
-        r.c0.gc.checkpoints[0].retained -= 300000
+    test.each(ARMS)('records unsettled active collections as facts for the %s arm', (arm) => {
+      const result = judged(arm, (r) => {
+        for (const active of r.actives) {
+          active.gc.checkpoints[0].heapUsed -= 300000
+          active.gc.checkpoints[0].retained -= 300000
+        }
       })
-      expect(result.verdict).toBe('inconclusive')
-      expect(result.problems).toContain('c0 collections did not settle')
+      expect(result).toEqual({
+        verdict: 'pass',
+        problems: [],
+        facts: { unsettledActiveReadings: ['active 1', 'active 2'] },
+      })
+    })
+
+    test.each([
+      ['c0', (r) => r.c0],
+      ['c1', (r) => r.c1],
+      ['released', (r) => r.released],
+      ['warm-up matched', (r) => r.warmup.m0],
+      ['warm-up closed', (r) => r.warmup.end],
+      ['matched', (r) => r.matched],
+      ['closed', (r) => r.closed],
+    ])('keeps unsettled %s collections inconclusive', (name, select) => {
+      const result = judged('public', (r) => {
+        const reading = select(r)
+        reading.gc.checkpoints[0].heapUsed -= 300000
+        reading.gc.checkpoints[0].retained -= 300000
+      })
+      expect(result).toEqual({
+        verdict: 'inconclusive',
+        problems: [`${name} collections did not settle`],
+      })
     })
 
     test('keeps earlier collection peaks even when the last reading is smaller', () => {
@@ -1634,9 +1665,10 @@ describe('resource artifact validation', () => {
         r.actives[0].gc.checkpoints[0].retained += 9 * MIB
       })
       expect(result.verdict).toBe('fail')
-      expect(result.problems).toContain(
-        'active retained bytes exceed the matched baseline by more than 8 MiB'
-      )
+      expect(result.problems).toEqual([
+        'active retained bytes exceed the matched baseline by more than 8 MiB',
+      ])
+      expect(result.facts).toEqual({ unsettledActiveReadings: ['active 1'] })
     })
 
     test('rejects continued collection after an already converged pair', () => {
@@ -1659,8 +1691,23 @@ describe('resource artifact validation', () => {
         r.manifest.execArgv = ['--expose-gc']
       })
       expect(result.verdict).toBe('fail')
-      expect(result.problems).toContain('child did not declare eager JavaScript compilation')
+      expect(result.problems).toContain('child did not declare the required memory flags')
     })
+  })
+
+  describe('memory child flags', () => {
+    test.each(['--min-semi-space-size=1', '--max-semi-space-size=1'])(
+      'rejects a child missing %s',
+      (flag) => {
+        const result = judged('public', (r) => {
+          r.manifest.execArgv = r.manifest.execArgv.filter((value) => value !== flag)
+        })
+        expect(result).toEqual({
+          verdict: 'fail',
+          problems: ['child did not declare the required memory flags'],
+        })
+      }
+    )
   })
 
   describe('recorded retained growth', () => {
@@ -1736,7 +1783,6 @@ describe('resource artifact validation', () => {
     }
     const PASS = { verdict: 'pass', problems: [] }
     const CLOSED = 'closed transient data bytes exceed 256 KiB'
-    const BELOW = 'closed data bytes are more than 256 KiB below the matched baseline'
     const UNSTABLE = 'control data bytes are unstable'
     const FIRST_USE = 'warm-up first-use data bytes exceed 1 MiB'
 
@@ -1749,20 +1795,26 @@ describe('resource artifact validation', () => {
       ).toEqual({ verdict: 'fail', problems: [CLOSED] })
     })
 
-    test('is inconclusive, never a pass, once data falls more than 256 KiB below the matched baseline', () => {
+    test('records closed data more than 256 KiB below the matched baseline without blocking a pass', () => {
       expect(judged('public', (r) => grow(r.closed, r.matched, -LIMITS.closedTransient))).toEqual(
         PASS
       )
       expect(
         judged('public', (r) => grow(r.closed, r.matched, -LIMITS.closedTransient - 1))
-      ).toEqual({ verdict: 'inconclusive', problems: [BELOW] })
+      ).toEqual({
+        ...PASS,
+        facts: { closedDataDecrease: { matched: 29999800, closed: 29737655, delta: -262145 } },
+      })
     })
 
-    test('recomputes data from the raw engine sizes: code that outgrows the heap is not a pass', () => {
+    test('records closed data decreases recomputed from the raw engine sizes', () => {
       const result = judged('public', (r) => {
         r.closed.gc.checkpoints.at(-1).engine = { bytecode: 100, code: 100 + MIB }
       })
-      expect(result).toEqual({ verdict: 'inconclusive', problems: [BELOW] })
+      expect(result).toEqual({
+        ...PASS,
+        facts: { closedDataDecrease: { matched: 29999800, closed: 29051224, delta: -948576 } },
+      })
     })
 
     test('moves compiled code only through the code bytes and a 1 MiB array through the data bytes', () => {

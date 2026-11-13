@@ -921,6 +921,13 @@ describe('telemetry journal calibration children', () => {
     const { calls } = scripted({ kinds: ['admin'], protocols: ['resource'] }, () => null)
     const arms = calls.map(argsOf)
     expect(arms.map((row) => row.script)).toEqual(Array(4).fill('journalSensitivityChild.js'))
+    expect(MEMORY_FLAGS).toEqual([
+      '--expose-gc',
+      '--no-lazy',
+      '--no-lazy-feedback-allocation',
+      '--min-semi-space-size=1',
+      '--max-semi-space-size=1',
+    ])
     for (const { flags } of arms) expect(flags).toEqual(MEMORY_FLAGS)
     expect(arms.map((row) => row.rest)).toEqual([
       ['legacy', 'admin', 'false', 'resource'],
