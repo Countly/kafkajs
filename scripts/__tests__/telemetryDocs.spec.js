@@ -430,6 +430,7 @@ describe('telemetry resource documentation', () => {
       expect(telemetry).toContain(value)
     expect(telemetry).toContain('not measured results from a unit test')
     expect(telemetry).toContain('one occupied shell')
+    expect(telemetry).toContain('five-minute verdict does not judge closed growth')
     expect(testing).toContain('arrayBuffers is already included in external')
     expect(testing).toContain('Four one-client workers prevent memory averaging')
   })
@@ -449,11 +450,14 @@ describe('telemetry resource documentation', () => {
         'Δdata = Δ(heapUsed + external) − Δ(V8 code_and_metadata_size + bytecode_and_metadata_size)'
       )
       expect(document).toContain('first use M − M0 ≤ 1 MiB')
-      expect(document).toContain('unseeded data below −256 KiB is inconclusive')
       expect(document).toContain('measured warm-up lifecycle')
       expect(document).toContain('schema 6')
       expect(document).toContain('96 MiB plus its declared journal bytes')
       expect(document).toContain('shadow only')
+    }
+    for (const document of [telemetry, squeeze('docs/TelemetryJournals.md')]) {
+      expect(document).toContain('closed data below −256 KiB is recorded as facts')
+      expect(document).toContain('unsettled active readings are recorded as facts')
     }
     expect(testing).toContain('legacy unseeded arm is a contamination-positive control')
     expect(testing).toContain('live-flags control')
