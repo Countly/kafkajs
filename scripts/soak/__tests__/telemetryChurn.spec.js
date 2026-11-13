@@ -3011,7 +3011,7 @@ describe('telemetry profile parent', () => {
     await expect(churn.ticks(epoch, schedule)).rejects.toThrow('exhausted its budget')
     expect(clock.now()).toBe(epoch + 360000)
     expect(churn.stages.some((row) => row.tick === lastTick.number)).toBe(false)
-    expect(fixture.rotate.mock.calls.at(-1)[0]).toBe(25)
+    expect(fixture.rotate.mock.calls.at(-1)[0]).toBe(24)
     expect(processes.sent.some((m) => m.tick === lastTick.number && m.type === 'stage')).toBe(false)
   })
 
@@ -4587,6 +4587,7 @@ describe('telemetry churn archive replay', () => {
     jest.spyOn(churnModule, 'TelemetrySchedule').mockImplementation(() => ({
       ticks: [],
       warmupMs: 60000,
+      endMs: 360000,
       required: () => ({ ...NONE }),
     }))
     jest.replaceProperty(churnModule, 'MINIMUMS', NONE)

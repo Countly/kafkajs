@@ -4037,7 +4037,8 @@ class TelemetryChurn {
    * The fixed tick catalogue. At every tick the stages run in order and are joined across all four
    * workers. In the five-minute lane, each confirmation fence closes its public lifecycle; every
    * original set/readback in the batch then precedes the reconnect and confirmation, followed by
-   * any scheduled telemetry retirement. The long-window lane retains its original stage order. A tick
+   * any scheduled telemetry retirement. The final confirmation's budget is capped at the absolute
+   * measurement end. The long-window lane retains its original stage order and budgets. A tick
    * more than the late bound behind is a missed tick and is never caught up.
    * @param {number} epoch the monotonic reading at which the schedule began
    * @param {TelemetrySchedule} schedule the fixed catalogue @returns {Promise<void>} after the last tick
@@ -4064,7 +4065,18 @@ class TelemetryChurn {
       for (const stage of schedule.stages(tick)) {
         this.guard()
         const sentAt = this.clock.now()
-        const remaining = () => Math.max(0, STAGE_MS[stage] - (this.clock.now() - sentAt))
+        const capped =
+          schedule.betweenLifecycles && tick === schedule.ticks.at(-1) && stage === 'confirm'
+        const deadline = Math.min(
+          sentAt + STAGE_MS[stage],
+          capped ? epoch + schedule.endMs : Infinity
+        )
+        const remaining = () => {
+          const left = deadline - this.clock.now()
+          if (capped && left <= 0)
+            throw new Error(`The ${stage} stage of tick ${tick.number} exhausted its budget`)
+          return Math.max(0, left)
+        }
         const command = {
           tick: tick.number,
           stage,
@@ -4074,6 +4086,7 @@ class TelemetryChurn {
         }
         let fences = null
         if (stage === 'confirm') {
+          if (capped) remaining()
           for (const kind of KINDS) this.processes.send(kind, { type: 'confirm-fence', ...command })
           fences = await Promise.race([
             Promise.all(
@@ -4100,6 +4113,7 @@ class TelemetryChurn {
             this.rotations.push({ tick: tick.number, requestedAt, ...rotation })
           }
         }
+        if (capped) remaining()
         const releasedAt = this.clock.now()
         for (const kind of KINDS) this.processes.send(kind, { type: 'stage', ...command })
         const done = await Promise.race([
@@ -4115,6 +4129,11 @@ class TelemetryChurn {
           ),
           this.abort,
         ])
+        if (
+          capped &&
+          (this.clock.now() > deadline || done.some((message) => message.parentAt > deadline))
+        )
+          throw new Error(`The ${stage} stage of tick ${tick.number} exhausted its budget`)
         done.forEach((message, position) =>
           this.stages.push({
             tick: tick.number,

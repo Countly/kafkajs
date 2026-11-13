@@ -3338,9 +3338,10 @@ const verifyChurnLifecycles = ({ names, transcripts, uuid }) => {
  * stage journal, never from counts: the exact `(tick, stage, kind)` catalogue once and in order,
  * each tick begun at or after its due time and within the late bound, every stage sent after the
  * previous stage's receipts from all four workers, the set and readback after every worker's fence
- * acknowledgement and before its release, every receipt within its deadline, one offset mapping each worker's
- * monotonic clock onto the parent's, each worker's measurement interval on that mapping, and every
- * claim time inside its own stage. The measured action counts are derived from these joined rows.
+ * acknowledgement and before its release, every receipt within its deadline and the fixed
+ * measurement end, one offset mapping each worker's monotonic clock onto the parent's, each
+ * worker's measurement interval on that mapping, and every claim time inside its own stage.
+ * The measured action counts are derived from these joined rows.
  * @param {object} input `archive` (stages, rotations, tickStarts, missed and worker facts) and the
  *   verdict's `timeline`
  * @returns {Object<string,{subscription:number, retire:number, reopen:number}>} measured counts by kind
@@ -3422,7 +3423,10 @@ const verifyChurnStages = ({ archive, timeline }) => {
       barrier = Math.max(...rows.map((r) => r.parentAt))
     }
   }
-  assert(timeline.boundaryAt >= barrier, 'Stage work continued past the measurement boundary')
+  assert(
+    barrier <= Math.min(timeline.boundaryAt, timeline.epochAt + table.endMs),
+    'Stage work continued past the measurement boundary'
+  )
   const measured = {}
   for (const kind of churn.KINDS) {
     const facts = archive.workers[kind]
