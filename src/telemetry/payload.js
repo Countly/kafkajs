@@ -39,6 +39,7 @@ class TelemetryPayload {
   #transportRevision
   #suppressed = new Set()
   #job = null
+  idleWaiters = null
 
   /** @param {object|bigint} transportRevision non-reused transport token
    * @returns {TelemetryPayload} encoder with no active job or timer
@@ -59,13 +60,25 @@ class TelemetryPayload {
     this.#suppressed.clear()
   }
 
-  /** Waits for the occupied codec slot; retirement keeps it until native work settles.
-   * @returns {Promise<void>} no retry or new job; a prior job failure does not fail the caller
+  /** Registers a removable wait only when the codec slot is occupied.
+   * @returns {{promise:Promise<void>,cancel:Function}|null} idle notification or null when idle;
+   * cancellation resolves the wait and detaches it without releasing the native-job slot
    */
-  async waitForIdle() {
-    try {
-      await this.#job?.completion
-    } catch {}
+  waitForIdle() {
+    if (!this.#job) return null
+    const waiters = this.idleWaiters ?? (this.idleWaiters = new Set())
+    let resolve
+    const promise = new Promise((done) => {
+      resolve = done
+    })
+    waiters.add(resolve)
+    return {
+      promise,
+      cancel: () => {
+        waiters.delete(resolve)
+        resolve()
+      },
+    }
   }
 
   /** Invalidates current authority without releasing an outstanding native-job slot early.
@@ -206,8 +219,7 @@ class TelemetryPayload {
     this.#job = job
     try {
       if (!this.#current(job)) return null
-      job.completion = this.#compress(job)
-      await job.completion
+      await this.#compress(job)
       if (!this.#current(job)) return null
       return {
         metrics: job.metrics,
@@ -223,6 +235,12 @@ class TelemetryPayload {
     } finally {
       this.#clearJob()
       this.#job = null
+      const waiters = this.idleWaiters
+      this.idleWaiters = null
+      if (waiters) {
+        for (const resolve of waiters) resolve()
+        waiters.clear()
+      }
     }
   }
 }

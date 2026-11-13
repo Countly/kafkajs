@@ -665,7 +665,7 @@ module.exports = class ClientTelemetry {
 
   /**
    * Captures a distinct closing authority synchronously; no retry, setup or reconnect is allowed.
-   * The settled episode keeps its result but releases its retired handle and subscription.
+   * The settled episode keeps its result but releases its codec wait and captured data.
    * @param {{deadline?:number,remaining?:Function,zero?:boolean}} budget original core remaining predicate
    * @returns {Promise<void>} one captured final within min1000ms/original remaining budget
    */
@@ -688,6 +688,8 @@ module.exports = class ClientTelemetry {
       uuid: this.uuid,
       deadline,
       attempted: false,
+      snapshot: null,
+      resources: null,
     }
     this.invalidate('closed', eligible)
     this.connected = false
@@ -695,11 +697,12 @@ module.exports = class ClientTelemetry {
     this.closing = episode
     const current = () =>
       this.closing === episode &&
+      episode.handle !== null &&
       this.state === 'CLOSING' &&
       this.clock.now() < deadline &&
       remaining() > 0
     episode.promise = (async () => {
-      let snapshot = null
+      let cancelIdle = null
       let written = false
       let timer
       const expired = new Promise((resolve) => {
@@ -707,7 +710,7 @@ module.exports = class ClientTelemetry {
           () => {
             if (this.closing === episode) {
               this.payload.retire()
-              if (old) this.observeRetire(old)
+              if (episode.handle) this.observeRetire(episode.handle)
             }
             resolve()
           },
@@ -716,33 +719,43 @@ module.exports = class ClientTelemetry {
       })
       try {
         if (!eligible || !current()) return
-        const resources = this.config.resources
+        episode.resources = this.config.resources
           ? this.config.resources()
           : { values: [], isCurrent: () => true }
-        snapshot = this.metrics.snapshot(subscription, resources.values)
-        if (!snapshot) return
+        episode.snapshot = this.metrics.snapshot(episode.subscription, episode.resources.values)
+        if (!episode.snapshot) return
         this.payload.resetTransport(this.transportRevision)
         const work = async () => {
-          await this.payload.waitForIdle()
+          const idle = this.payload.waitForIdle()
+          if (idle) {
+            cancelIdle = idle.cancel
+            await idle.promise
+            cancelIdle = null
+          }
           if (!current()) return
-          const payload = await this.payload.buildPayload(snapshot, {
+          const payload = await this.payload.buildPayload(episode.snapshot, {
             telemetryMaxBytes: this.maxBytes,
-            brokerMaxBytes: subscription.telemetryMaxBytes,
+            brokerMaxBytes: episode.subscription.telemetryMaxBytes,
             penaltyMaxBytes: this.penalty ?? undefined,
-            acceptedCompressionTypes: subscription.acceptedCompressionTypes.filter(
+            acceptedCompressionTypes: episode.subscription.acceptedCompressionTypes.filter(
               (c) => !this.rejectedCodecs.has(c)
             ),
-            isCurrent: () => current() && resources.isCurrent() && this.metrics.isCurrent(snapshot),
+            isCurrent: () =>
+              current() &&
+              episode.resources.isCurrent() &&
+              this.metrics.isCurrent(episode.snapshot),
           })
           if (!payload || !current()) return
           const guard = () =>
-            current() && resources.isCurrent() && (written || this.metrics.isCurrent(snapshot))
+            current() &&
+            episode.resources.isCurrent() &&
+            (written || this.metrics.isCurrent(episode.snapshot))
               ? null
               : this.error('closed')
-          await old.push(
+          await episode.handle.push(
             {
               clientInstanceId: episode.uuid,
-              subscriptionId: subscription.subscriptionId,
+              subscriptionId: episode.subscription.subscriptionId,
               terminating: true,
               compressionType: payload.compressionType,
               metrics: payload.metrics,
@@ -756,7 +769,7 @@ module.exports = class ClientTelemetry {
                 episode.attempted = true
                 this.hadFinal = true
                 written = true
-                this.metrics.written(snapshot, payload.includedIdentities)
+                this.metrics.written(episode.snapshot, payload.includedIdentities)
               },
             }
           )
@@ -765,10 +778,15 @@ module.exports = class ClientTelemetry {
       } catch {
       } finally {
         this.clock.clearTimeout(timer)
-        if (snapshot && !written) this.metrics.abandon(snapshot)
-        if (old) await old.retire({ drainTimeout: 0 }).catch(() => {})
+        cancelIdle?.()
+        cancelIdle = null
+        if (episode.snapshot && !written) this.metrics.abandon(episode.snapshot)
+        episode.snapshot = null
+        episode.resources = null
+        const handle = episode.handle
         episode.handle = null
         episode.subscription = null
+        if (handle) await handle.retire({ drainTimeout: 0 }).catch(() => {})
         if (this.closing === episode) {
           this.payload.retire()
           try {

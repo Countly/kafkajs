@@ -20466,6 +20466,7 @@
         "testHelpers/__tests__/boundedReporterEvidence.spec.js \u203a bounded reporter evidence identity keeps the retained jar pin for telemetry-outcomes even with a valid churn receipt",
         "testHelpers/__tests__/boundedReporterEvidence.spec.js \u203a bounded reporter evidence identity keeps the retained jar pin for telemetry-shutdown even with a valid churn receipt",
         "testHelpers/__tests__/boundedReporterEvidence.spec.js \u203a bounded reporter evidence identity preserves retained jar evidence for telemetry-reporter",
+        "src/telemetry/__tests__/close.spec.js \u203a close codec waiter retention expired close cycles release codec waiters and captured close data before codec settlement",
         "testHelpers/__tests__/boundedReporterEvidence.spec.js \u203a bounded reporter evidence identity preserves retained jar evidence for telemetry-shutdown"
       ],
       "capMinutes": 85,
@@ -21899,6 +21900,7 @@
         "src/cluster/__tests__/bootstrapResolutionWiring.spec.js \u203a Bootstrap DNS resolution each share consumer owns an independent gate through the public client",
         "src/cluster/__tests__/bootstrapResolutionWiring.spec.js \u203a Bootstrap DNS resolution zero performs no lookup and preserves the existing connect path through the public client",
         "src/network/__tests__/kafka44ThrottleAudit.spec.js \u203a Kafka 4.4 client fix audit KAFKA-20828 per API throttling matches the verified response version boundaries",
+        "src/telemetry/__tests__/close.spec.js \u203a close codec waiter retention expired close cycles release codec waiters and captured close data before codec settlement",
         "src/telemetry/__tests__/kafka44EndpointAudit.spec.js \u203a Kafka 4.4 client fix audit KAFKA-20393 endpoint changes retire stale telemetry sends"
       ],
       "capMinutes": 48,
@@ -25084,6 +25086,7 @@
         "testHelpers/__tests__/boundedReporterEvidence.spec.js \u203a bounded reporter evidence identity keeps the retained jar pin for telemetry-outcomes even with a valid churn receipt",
         "testHelpers/__tests__/boundedReporterEvidence.spec.js \u203a bounded reporter evidence identity keeps the retained jar pin for telemetry-shutdown even with a valid churn receipt",
         "testHelpers/__tests__/boundedReporterEvidence.spec.js \u203a bounded reporter evidence identity preserves retained jar evidence for telemetry-reporter",
+        "src/telemetry/__tests__/close.spec.js \u203a close codec waiter retention expired close cycles release codec waiters and captured close data before codec settlement",
         "testHelpers/__tests__/boundedReporterEvidence.spec.js \u203a bounded reporter evidence identity preserves retained jar evidence for telemetry-shutdown"
       ],
       "capMinutes": 93,
