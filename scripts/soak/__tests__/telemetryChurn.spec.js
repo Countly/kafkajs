@@ -321,21 +321,34 @@ describe('telemetry profile', () => {
 
   test('holds the fixed measured action counts, the serialization order and the corpus slots', () => {
     const schedule = new TelemetrySchedule({ warmupMs: 60000, measureMs: 300000 })
-    expect(schedule.required()).toEqual({ subscription: 30, retire: 10, reopen: 6 })
-    expect(schedule.ticks).toHaveLength(14)
-    expect(schedule.ticks.filter((t) => t.transitions.length)).toHaveLength(8)
+    expect(schedule.required()).toEqual({ subscription: 35, retire: 10, reopen: 5 })
+    expect(schedule.ticks).toHaveLength(13)
+    expect(
+      schedule.ticks.filter((t) => t.transitions.length).map((t) => [t.at, t.transitions])
+    ).toEqual([
+      [70000, [1, 2, 3, 4, 5, 6, 7]],
+      [120000, [8, 9, 10, 11, 12]],
+      [180000, [13, 14, 15, 16, 17, 18]],
+      [240000, [19, 20, 21, 22, 23, 24]],
+      [350000, [25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35]],
+    ])
+    expect(schedule.ticks.filter((t) => t.actions.includes('retire')).map((t) => t.at)).toEqual(
+      Array.from({ length: 11 }, (_, n) => (n + 1) * 30000)
+    )
     schedule.ticks.forEach((tick, number) => {
       expect(tick.number).toBe(number)
       expect(tick.index).toBe(tick.at / 10000)
     })
     const sixty = schedule.ticks.find((tick) => tick.at === 60000)
-    expect(sixty.actions).toEqual(['reopen', 'retire', 'subscription'])
-    expect(schedule.stages(sixty)).toEqual(['confirm', 'retire'])
-    expect(schedule.stages(schedule.ticks[0])).toEqual(['confirm'])
+    expect(sixty.actions).toEqual(['retire'])
+    expect(schedule.stages(sixty)).toEqual(['retire'])
+    const firstBatch = schedule.ticks.find((tick) => tick.transitions.length)
+    expect(schedule.selection(firstBatch.index)).toBe('com.example.')
+    expect(schedule.stages(firstBatch)).toEqual(['confirm'])
     expect(schedule.ticks.at(-1).at).toBe(350000)
     expect(
       schedule.ticks.filter((tick) => !schedule.measured(tick)).flatMap((t) => t.actions)
-    ).toEqual(expect.arrayContaining(['retire', 'subscription']))
+    ).toEqual(['retire'])
     expect([1, 2, 3, 4, 5, 6].map((i) => schedule.selection(i))).toEqual([
       'com.example.',
       '',
@@ -2236,6 +2249,7 @@ describe('telemetry profile worker', () => {
       let selection = 'org.apache.kafka.'
       const windows = [{ start: at, end: null }]
       const releases = []
+      const readbacks = []
       const clock = { now: () => ++at }
       const segments = TelemetrySegments.ordinary('telemetry-churn', kind, {
         directory,
@@ -2253,6 +2267,8 @@ describe('telemetry profile worker', () => {
         },
         connect: async () => {
           expect(active).toBe(false)
+          expect(readbacks.at(-1).at).toBeLessThan(at + 1)
+          expect(readbacks.at(-1).selection).toBe(selection)
           active = true
           windows.push({ start: ++at, end: null })
           const get = getRecord(1, 1, {
@@ -2307,19 +2323,24 @@ describe('telemetry profile worker', () => {
           for (const index of tick.transitions) {
             expect(active).toBe(false)
             selection = schedule.selection(index)
-            releases.push(++at)
+            releases.push({ index, selection, at: ++at })
+            readbacks.push({ index, selection, at: ++at })
           }
           await worker.handle({ type: 'stage', ...command })
           expect(active).toBe(true)
           await worker.sealing.promise
         }
         expect(releases).toHaveLength(35)
-        expect(windows).toHaveLength(9)
-        for (const releasedAt of releases)
+        expect(windows).toHaveLength(6)
+        expect(releases.map((r) => r.index)).toEqual(Array.from({ length: 35 }, (_, n) => n + 1))
+        expect(readbacks.map((r) => [r.index, r.selection])).toEqual(
+          releases.map((r) => [r.index, r.selection])
+        )
+        for (const { at: releasedAt } of [...releases, ...readbacks])
           expect(
             windows.some((w) => w.start <= releasedAt && (w.end === null || releasedAt <= w.end))
           ).toBe(false)
-        expect(worker.actions.measured).toEqual({ subscription: 30, reopen: 6, retire: 0 })
+        expect(worker.actions.measured).toEqual({ subscription: 35, reopen: 5, retire: 0 })
       } finally {
         for (const segment of segments.undischarged()) await segment.observer?.dispose()
         fs.rmSync(directory, { recursive: true, force: true })
@@ -2807,7 +2828,7 @@ describe('telemetry profile parent', () => {
     const stages = processes.sent.filter((m) => m.type === 'stage')
     const sixty = schedule.ticks.find((t) => t.at === 60000).number
     expect(stages.filter((m) => m.tick === sixty).map((m) => `${m.kind}:${m.stage}`)).toEqual(
-      ['confirm', 'retire'].flatMap((stage) => KINDS.map((kind) => `${kind}:${stage}`))
+      KINDS.map((kind) => `${kind}:retire`)
     )
     expect(fixture.rotate).toHaveBeenCalledTimes(35)
     expect(fixture.rotate.mock.calls[0]).toEqual([1, 'com.example.', 9000])
@@ -2815,15 +2836,30 @@ describe('telemetry profile parent', () => {
     const produce = calls.filter((c) => Array.isArray(c))
     expect(produce).toHaveLength(2 * 100)
     expect(produce[0][3] - timeline.epochAt).toBeGreaterThanOrEqual(60000)
-    expect(churn.rotations).toHaveLength(35)
-    expect(churn.stages).toHaveLength(KINDS.length * (8 + 11))
+    expect(churn.rotations.map((r) => [r.index, r.selection, r.readback])).toEqual(
+      Array.from({ length: 35 }, (_, n) => [
+        n + 1,
+        schedule.selection(n + 1),
+        schedule.selection(n + 1),
+      ])
+    )
+    for (const tick of schedule.ticks.filter((t) => t.transitions.length)) {
+      const batch = churn.rotations.filter((r) => r.tick === tick.number)
+      const releases = stages.filter((m) => m.tick === tick.number && m.stage === 'confirm')
+      expect(releases).toHaveLength(KINDS.length)
+      for (const release of releases) {
+        expect(release.selection).toBe(batch.at(-1).readback)
+        expect(batch.every((r) => r.readbackAt <= release.at)).toBe(true)
+      }
+    }
+    expect(churn.stages).toHaveLength(KINDS.length * (5 + 11))
     expect(timeline.setupMs).toBe(0)
     expect(processes.sent.filter((m) => m.type === 'corpus')).toHaveLength(KINDS.length)
     expect(processes.sent.filter((m) => m.type === 'finish')).toHaveLength(KINDS.length)
     expect(timeline.boundaryAt - timeline.epochAt).toBeGreaterThanOrEqual(360000)
     churn.judge([], { errors: [], exits: {}, oracle: { ok: true } }, timeline, schedule)
     const verdict = churn.record.mock.calls.map(([row]) => row).find((r) => r.kind === 'verdict')
-    expect(verdict.measured).toEqual({ subscription: 30, retire: 10, reopen: 6 })
+    expect(verdict.measured).toEqual({ subscription: 35, retire: 10, reopen: 5 })
     expect(verdict.violations.filter((v) => v.startsWith('measured '))).toEqual([])
   })
 
@@ -3880,7 +3916,7 @@ describe('telemetry churn coordinated stage replay', () => {
     const counts = verifyChurnStages({ archive: input.archive, timeline: input.timeline })
     expect(Object.keys(counts)).toEqual([...KINDS])
     for (const kind of KINDS)
-      expect(counts[kind]).toEqual({ subscription: 30, retire: 10, reopen: 6 })
+      expect(counts[kind]).toEqual({ subscription: 35, retire: 10, reopen: 5 })
   })
 
   test('accepts a polled readback only before every worker release', () => {
@@ -3896,7 +3932,7 @@ describe('telemetry churn coordinated stage replay', () => {
       input.archive.workers[kind].stages[0].doneAt += 250
       input.archive.workers[kind].claims.transitions[0].releasedAt += 250
     }
-    expect(verifyChurnStages(input).producer.subscription).toBe(30)
+    expect(verifyChurnStages(input).producer.subscription).toBe(35)
     rotation.readbackAt += 4
     expect(() => verifyChurnStages(input)).toThrow(
       'The set and readback are outside their stage barrier'
@@ -4352,7 +4388,7 @@ describe('telemetry churn archive replay', () => {
 
   /**
    * A complete churn archive with an empty tick table, so no stage, reopen, retirement or
-   * transition is claimed and the resource, oracle and stage arithmetic is stubbed: per kind, ten
+   * transition is claimed and the resource, oracle and stage arithmetic is stubbed: per kind, seven
    * lifecycles (a setup Get; the initial custom Get, its proving Push and an empty readback; plain
    * Gets after), with the sink rows, decoder receipts, worker facts, handshakes and parent rows that
    * join them. The producer's initial lifecycle also writes two gzip and one zstd Push, each resolved
@@ -4394,7 +4430,7 @@ describe('telemetry churn archive replay', () => {
           responseAt: at + 5,
         },
       })
-      for (let n = 0; n < 10; n++) {
+      for (let n = 0; n < 7; n++) {
         const id = name(n)
         const records = [get(1, n === 1 ? ['com.example.'] : [], 10)]
         const lines = []
@@ -4523,7 +4559,7 @@ describe('telemetry churn archive replay', () => {
           transitions: [],
           proofs: [],
         },
-        journal: Array.from({ length: 9 }, (_, n) => ({
+        journal: Array.from({ length: 6 }, (_, n) => ({
           seq: n + 1,
           type: 'select',
           from: name(n),
@@ -4601,7 +4637,7 @@ describe('telemetry churn archive replay', () => {
         consumer: { handled: workers.consumer.ordinary.handled },
         shareConsumer: {
           group: share.group,
-          closures: Array.from({ length: 10 }, () => ({ at: 90, end: 95 })),
+          closures: Array.from({ length: 7 }, () => ({ at: 90, end: 95 })),
           handled: workers.shareConsumer.ordinary.handled,
           exchangesSha256: share.exchangesSha256,
           settled: share.settled,

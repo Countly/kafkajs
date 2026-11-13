@@ -476,6 +476,17 @@ describe('telemetry resource documentation', () => {
     expect(testing).toContain('nine distinct Node 24 rows, all on Kafka 4.4.0')
     expect(testing).toContain('required functional exit catalogue has 72 rows')
     expect(telemetry).toContain('35 ordered subscription transitions')
+    expect(telemetry).toContain(
+      'Five public close/reopen cycles (seven segments including setup and initial)'
+    )
+    expect(testing).toContain(
+      'transition 1–7 at 70 s, 8–12 at 120 s, 13–18 at 180 s, 19–24 at 240 s and 25–35 at 350 s'
+    )
+    expect(testing).toContain(
+      '35 measured subscription transitions, 10 measured retirements and five measured reopens'
+    )
+    expect(testing).toContain('seven per kind: setup, initial and five reopens')
+    expect(testing).not.toContain('eight public close/reopen cycles')
   })
 
   test('retains the long-run obligation and the changelog lines', () => {

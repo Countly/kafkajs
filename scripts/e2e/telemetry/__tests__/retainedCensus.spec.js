@@ -221,7 +221,7 @@ test('shared cyclic audits preserve every root target and trace without repeated
   expect(prepared.tables).toHaveLength(2)
 })
 
-test('live census checkpoints follow the sample grid through eight public churn reopens', () => {
+test('live census checkpoints follow the sample grid through five public churn reopens', () => {
   const { TELEMETRY } = require('../../../soak/soak')
   const { TelemetrySchedule } = require('../../../soak/telemetryChurn')
   const schedule = new TelemetrySchedule(TELEMETRY)
@@ -233,7 +233,7 @@ test('live census checkpoints follow the sample grid through eight public churn 
   const snapshot = { memory: { heapUsed: 8, external: 4 }, journals: {} }
   census.observe({ kind: 'baseline', snapshot })
   const reopens = schedule.ticks.filter((tick) => tick.actions.includes('reopen'))
-  expect(reopens).toHaveLength(8)
+  expect(reopens).toHaveLength(5)
   for (const tick of reopens) census.observe({ kind: 'reopen', at: tick.at, snapshot })
   for (const admittedPhaseMs of TELEMETRY.sampleAt)
     census.observe({ kind: 'sample', admittedPhaseMs, snapshot })

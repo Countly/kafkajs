@@ -6,6 +6,7 @@ const {
 } = require('../sharePeak')
 const {
   ReferenceControl,
+  TelemetrySchedule,
   TelemetryWorker,
   TelemetryWorkerProcess,
   declaredJournalBytes,
@@ -195,7 +196,7 @@ describe('share peak attribution', () => {
     expect(worker.segments.cycle).toHaveBeenCalledWith(client, { timeout: 3000 })
   })
 
-  test('releases all eight disabled share confirmation fences and resumes corpus handling', async () => {
+  test('releases all five disabled share confirmation fences and resumes corpus handling', async () => {
     let connected = true
     let paused = false
     let handled = 0
@@ -235,20 +236,32 @@ describe('share peak attribution', () => {
       send: () => {},
     })
     worker.drain = () => {}
-    for (let tick = 0; tick < 8; tick++) {
-      const command = { tick, index: tick + 1, selection: '*', transitions: [tick + 1] }
+    const schedule = new TelemetrySchedule(TELEMETRY)
+    const batches = schedule.ticks.filter((tick) => tick.transitions.length)
+    expect(batches).toHaveLength(5)
+    for (const [cycle, tick] of batches.entries()) {
+      const command = {
+        tick: tick.number,
+        index: tick.index,
+        selection: schedule.selection(tick.index),
+        transitions: tick.transitions,
+      }
       await worker.fenceConfirmation(command)
       expect(connected).toBe(false)
       expect(paused).toBe(true)
-      expect(handled).toBe(tick * 100)
+      expect(handled).toBe(cycle * 100)
       await worker.confirm(command)
       expect(connected).toBe(true)
       expect(paused).toBe(false)
-      expect(handled).toBe((tick + 1) * 100)
+      expect(handled).toBe((cycle + 1) * 100)
     }
-    expect(worker.claims.reopens).toHaveLength(8)
-    expect(worker.claims.transitions).toHaveLength(8)
-    expect(worker.claims.reopens.at(-1)).toMatchObject({ tick: 7, from: 's8', to: 's9' })
+    expect(worker.claims.reopens).toHaveLength(5)
+    expect(worker.claims.transitions).toHaveLength(5)
+    expect(worker.claims.reopens.at(-1)).toMatchObject({
+      tick: batches.at(-1).number,
+      from: 's5',
+      to: 's6',
+    })
   })
 
   test('marks exported verdict inputs only while a share peak recorder is active', async () => {
