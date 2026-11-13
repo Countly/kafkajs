@@ -90,6 +90,73 @@ const closing = async (cell, { boundary, mode = 'final', timeout = 1000, start }
   }
 }
 
+describe('close codec waiter retention', () => {
+  test('expired close cycles release codec waiters and captured close data before codec settlement', async () => {
+    const round = new PublicTelemetryRound({ kind: 'producer' })
+    const gate = round.hold('S12', { mode: 'normal' })
+    const pending = new Set()
+    try {
+      await round.start({
+        points: 'large',
+        subscription: { acceptedCompressionTypes: [1, 0] },
+      })
+      await round.ready()
+      round.patch(
+        round.machine.payload,
+        'waitForIdle',
+        (original) =>
+          function (...args) {
+            const wait = original.apply(this, args)
+            if (wait) {
+              pending.add(wait)
+              Promise.resolve(wait.promise ?? wait).then(() => pending.delete(wait))
+            }
+            return wait
+          }
+      )
+      round.arm()
+      round.tick()
+      await round.wait(() => gate.arrived())
+      for (let cycle = 0; cycle < 4; cycle++) {
+        const before = round.capture()
+        round.beginClose(round.closeOptions(20))
+        await round.until(() => pending.size === 1)
+        const episode = round.machine.closing
+        expect(episode.handle).not.toBeNull()
+        expect(episode.subscription).not.toBeNull()
+        round.clock.jump(round.closeEntry + 20)
+        await round.deliverCloseWatchdog()
+        await round.settleClose()
+        expect(pending.size).toBe(0)
+        expect(round.machine.payload.idleWaiters?.size ?? 0).toBe(0)
+        expect(episode).toMatchObject({
+          handle: null,
+          subscription: null,
+          snapshot: null,
+          resources: null,
+        })
+        expect(round.codecJobs).toHaveLength(1)
+        expect(round.codecJobs[0].settled).toBe(false)
+        expect(round.finalFrames()).toEqual([])
+        expect(round.openDedicated()).toEqual([])
+        expect(round.newSetupCallsSince(before)).toEqual([])
+        if (cycle < 3) {
+          await round.client.connect()
+          round.tick()
+          await round.until(() => round.machine.subscription && !round.machine.running)
+        }
+      }
+      await round.drainReleased(gate)
+      expect(round.codecJobs[0].settled).toBe(true)
+      expect(round.machine.payload.idleWaiters).toBeNull()
+      expect(round.finalFrames()).toEqual([])
+      expect(round.unhandled).toEqual([])
+    } finally {
+      await round.dispose()
+    }
+  }, 60000)
+})
+
 describe.each([false, true])('captured close with enforcement %s', (enforceRequestTimeout) => {
   describe.each(TELEMETRY_KINDS)('%s', (kind) => {
     const cell = { kind, enforceRequestTimeout }
