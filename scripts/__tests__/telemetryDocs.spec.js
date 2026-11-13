@@ -475,7 +475,7 @@ describe('telemetry resource documentation', () => {
     expect(testing).toContain('selected by a rule over the transcript alone')
     expect(testing).toContain('nine distinct Node 24 rows, all on Kafka 4.4.0')
     expect(testing).toContain('required functional exit catalogue has 72 rows')
-    expect(telemetry).toContain('35 subscription transitions')
+    expect(telemetry).toContain('35 ordered subscription transitions')
   })
 
   test('retains the long-run obligation and the changelog lines', () => {
