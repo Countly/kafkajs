@@ -1855,6 +1855,13 @@ describe('broker telemetry fixture', () => {
     expect(census.env.TELEMETRY_RESOURCES_ARTIFACT_DIR).toBeUndefined()
     const steps = census.steps.filter((step) => step.run)
     for (const step of steps) expect(step['timeout-minutes']).toBeGreaterThan(0)
+    const { censusFlags } = require('../telemetry/retained/liveDiagnostic')
+    expect(censusFlags()).toEqual(require('../../soak/telemetryChurn').WORKER_FLAGS)
+    expect(censusFlags()).toEqual([
+      '--expose-gc',
+      '--min-semi-space-size=1',
+      '--max-semi-space-size=1',
+    ])
     const capture = steps.find((step) => step.run.includes('liveDiagnostic.js'))
     expect(capture.env.CENSUS_VARIANT).toBe('$' + '{{ matrix.variant }}')
     expect(capture.run).toBe(

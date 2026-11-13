@@ -54,7 +54,7 @@ const main = async ([selector, directory, variant]) => {
     attempt: process.env.GITHUB_RUN_ATTEMPT,
     node: process.version,
     v8: process.versions.v8,
-    flags: ['--expose-gc'],
+    flags: censusFlags(),
     kafka: process.env.KAFKA_VERSION,
     variant,
     sources,
@@ -99,7 +99,13 @@ const main = async ([selector, directory, variant]) => {
   if (results.some((row) => !row.completed)) process.exitCode = 1
 }
 
-module.exports = { main }
+/**
+ * The V8 flags the census workers are spawned with: the five-minute telemetry worker flags.
+ * @returns {string[]} a copy of `WORKER_FLAGS`
+ */
+const censusFlags = () => [...require('../../../soak/telemetryChurn').WORKER_FLAGS]
+
+module.exports = { main, censusFlags }
 if (require.main === module)
   main(process.argv.slice(2)).catch((error) => {
     process.stderr.write(`${error.stack}\n`)
