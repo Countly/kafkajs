@@ -137,6 +137,52 @@ describe.each([false, true])('captured close with enforcement %s', (enforceReque
       }
     }, 60000)
 
+    test.each([-1, 0, 1])(
+      'a close at periodic push due time %s ms writes exactly one final',
+      async (offset) => {
+        const round = new PublicTelemetryRound(cell)
+        const gate = round.hold('S12', { mode: 'normal' })
+        try {
+          await round.start({
+            points: 'large',
+            subscription: { acceptedCompressionTypes: [1, 0] },
+          })
+          await round.ready()
+          const before = round.capture()
+          const timer = round.machine.timer
+          const staleTick = round.clock.callback(timer)
+          const due = round.clock.pending.get(timer).due
+          round.arm()
+          round.clock.jump(due + offset)
+          if (offset >= 0) {
+            round.clock.deliver(timer)
+            await round.wait(() => gate.arrived())
+            expect(round.codecJobs).toHaveLength(1)
+            expect(round.codecJobs[0].settled).toBe(false)
+          }
+          round.beginClose(round.closeOptions(1000))
+          if (offset >= 0) await round.drainReleased(gate)
+          await round.settleClose()
+          round.clock.jump(due + 1001)
+          staleTick()
+          await round.settleWork()
+          expect(round.finalFrames()).toHaveLength(1)
+          expect(round.finalFrames()[0].fields).toMatchObject({
+            terminating: true,
+            clientInstanceId: TELEMETRY_UUID,
+            subscriptionId: DEFAULT_SUBSCRIPTION.subscriptionId,
+          })
+          expect(round.pushes()).toHaveLength(1)
+          expect(round.newSetupCallsSince(before)).toEqual([])
+          expect(round.machine.closing.handle).toBeNull()
+          expect(round.unhandled).toEqual([])
+        } finally {
+          await round.dispose()
+        }
+      },
+      60000
+    )
+
     test('C03 zero budget never starts a final', async () => {
       const round = new PublicTelemetryRound(cell)
       try {
