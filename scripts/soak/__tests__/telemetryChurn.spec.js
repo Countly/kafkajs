@@ -2963,6 +2963,81 @@ describe('telemetry profile parent', () => {
     }
   })
 
+  test('caps a maximally late final confirmation at the absolute measurement end', async () => {
+    const { churn, processes, clock, advance } = make()
+    const schedule = new TelemetrySchedule(TELEMETRY)
+    const epoch = clock.now()
+    const lastTick = schedule.ticks.at(-1)
+    const untilTick = churn.until.bind(churn)
+    churn.until = async (target) => {
+      await untilTick(target)
+      if (target === epoch + 350000) advance(5000)
+    }
+    const until = processes.until
+    processes.until = jest.fn(async (...args) => {
+      const [kind, , remaining] = args
+      const last = processes.sent.at(-1)
+      if (last.tick === lastTick.number && last.type === 'stage' && kind === KINDS.at(-1))
+        advance(remaining - 1)
+      return until(...args)
+    })
+    await churn.ticks(epoch, schedule)
+    const rows = churn.stages.filter((row) => row.tick === lastTick.number)
+    expect(rows).toHaveLength(KINDS.length)
+    expect(rows.every((row) => row.sentAt === epoch + 355000)).toBe(true)
+    expect(Math.max(...rows.map((row) => row.parentAt))).toBe(epoch + 359999)
+    expect(clock.now()).toBe(epoch + 359999)
+    expect(churn.missed).toEqual([])
+  })
+
+  test('fails explicitly when the late final confirmation fence exhausts its remaining budget', async () => {
+    const { churn, fixture, processes, clock, advance } = make()
+    const schedule = new TelemetrySchedule(TELEMETRY)
+    const epoch = clock.now()
+    const lastTick = schedule.ticks.at(-1)
+    const untilTick = churn.until.bind(churn)
+    churn.until = async (target) => {
+      await untilTick(target)
+      if (target === epoch + 350000) advance(5000)
+    }
+    const until = processes.until
+    processes.until = jest.fn(async (...args) => {
+      const [kind] = args
+      const last = processes.sent.at(-1)
+      if (last.tick === lastTick.number && last.type === 'confirm-fence' && kind === KINDS.at(-1))
+        advance(5000)
+      return until(...args)
+    })
+    await expect(churn.ticks(epoch, schedule)).rejects.toThrow('exhausted its budget')
+    expect(clock.now()).toBe(epoch + 360000)
+    expect(churn.stages.some((row) => row.tick === lastTick.number)).toBe(false)
+    expect(fixture.rotate.mock.calls.at(-1)[0]).toBe(25)
+    expect(processes.sent.some((m) => m.tick === lastTick.number && m.type === 'stage')).toBe(false)
+  })
+
+  test('fails explicitly when a final confirmation receipt arrives past the absolute measurement end', async () => {
+    const { churn, processes, clock, advance } = make()
+    const schedule = new TelemetrySchedule(TELEMETRY)
+    const epoch = clock.now()
+    const lastTick = schedule.ticks.at(-1)
+    const untilTick = churn.until.bind(churn)
+    churn.until = async (target) => {
+      await untilTick(target)
+      if (target === epoch + 350000) advance(5000)
+    }
+    const until = processes.until
+    processes.until = jest.fn(async (...args) => {
+      const [kind] = args
+      const last = processes.sent.at(-1)
+      if (last.tick === lastTick.number && last.type === 'stage' && kind === KINDS.at(-1))
+        advance(5001)
+      return until(...args)
+    })
+    await expect(churn.ticks(epoch, schedule)).rejects.toThrow('exhausted its budget')
+    expect(clock.now()).toBe(epoch + 360001)
+    expect(churn.stages.some((row) => row.tick === lastTick.number)).toBe(false)
+  })
+
   test('fails a measured tick that is more than its late bound behind and never catches it up', async () => {
     const { churn, processes, advance, fixture } = make()
     const original = processes.until
@@ -3994,6 +4069,46 @@ describe('telemetry churn coordinated stage replay', () => {
       )
     }
     expect(() => verifyChurnStages(input)).not.toThrow()
+  })
+
+  test('rejects a final receipt at 360001 ms even when the recorded boundary is later', () => {
+    const input = archive()
+    const { archive: facts, table, timeline } = input
+    const tick = table.ticks.at(-1).number
+    facts.tickStarts.at(-1).beganAt += 5000
+    timeline.boundaryAt += 5000
+    for (const rotation of facts.rotations.filter((r) => r.tick === tick)) {
+      rotation.requestedAt += 5000
+      rotation.setAt += 5000
+      rotation.readbackAt += 5000
+    }
+    for (const kind of KINDS) {
+      const row = facts.stages.find((r) => r.tick === tick && r.kind === kind)
+      row.sentAt += 5000
+      row.releasedAt += 5000
+      row.fence.parentAt += 5000
+      row.fence.receivedAt += 5000
+      row.workerStartedAt += 5000
+      row.workerDoneAt = EPOCH + 359999 - OFFSET[kind]
+      row.parentAt = EPOCH + 360000
+      const worker = facts.workers[kind]
+      const own = worker.stages.find((s) => s.tick === tick)
+      own.startedAt = row.workerStartedAt
+      own.doneAt = row.workerDoneAt
+      const claim = worker.claims.transitions.find((c) => c.tick === tick)
+      claim.receivedAt += 5000
+      claim.releasedAt += 5000
+      const reopen = worker.claims.reopens.find((c) => c.tick === tick)
+      reopen.observedAt += 5000
+      reopen.closedAt += 5000
+      worker.timing.boundaryAt += 5000
+      worker.timing.measurementMs += 5000
+    }
+    expect(() => verifyChurnStages(input)).not.toThrow()
+    facts.stages.at(-1).parentAt += 1
+    expect(() => verifyChurnStages(input)).toThrow(
+      'Stage work continued past the measurement boundary'
+    )
   })
 
   test('accepts a polled readback only before every worker release', () => {
