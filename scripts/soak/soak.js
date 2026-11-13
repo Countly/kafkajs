@@ -713,7 +713,7 @@ class TelemetryResourceVerdict {
       fail(known, `host context ${name}`)
       if (
         known &&
-        (host.load1 / host.cpus > TELEMETRY.noiseLoadPerCpu ||
+        (host.load1 / host.cpus > ACTIVE_TELEMETRY.noiseLoadPerCpu ||
           host.freeBytes < TELEMETRY.noiseFreeBytes ||
           (host.pressure?.available && host.pressure.someAvg10 > TELEMETRY.noisePressure))
       )

@@ -7639,6 +7639,26 @@ describe('telemetry resident-size reference', () => {
     }
   })
 
+  test('keeps the long-window noise ceiling at 0.75 load per CPU when that lane is selected', () => {
+    const previous = process.env.TELEMETRY_LONG_WINDOW
+    let LongVerdict
+    try {
+      process.env.TELEMETRY_LONG_WINDOW = '1'
+      jest.isolateModules(() => {
+        LongVerdict = require('../soak').TelemetryResourceVerdict
+      })
+    } finally {
+      if (previous === undefined) delete process.env.TELEMETRY_LONG_WINDOW
+      else process.env.TELEMETRY_LONG_WINDOW = previous
+    }
+    const input = make()
+    const context = input.reference.host.before
+    context.loadPerCpu = 0.9
+    context.load1 = context.cpus * 0.9
+    expect(LongVerdict.evaluate(input).inconclusive).toContain('host noise before')
+    expect(evaluate(input).inconclusive).not.toContain('host noise before')
+  })
+
   test('is inconclusive on a noisy host and keeps the unavailable pressure capability visible', () => {
     const loaded = make()
     loaded.reference.host.before.load1 = 4.04
