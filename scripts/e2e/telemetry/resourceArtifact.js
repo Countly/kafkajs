@@ -724,7 +724,9 @@ class MemoryArmJudge {
 
   /**
    * Validates the marks and recomputes the peaks and baselines from all reads. Approximate
-   * peak-counter decreases are recorded as facts and never lower any judged maximum.
+   * peak-counter decreases, and a high water read just below its own interval's resident size, are
+   * recorded as facts and never lower any judged maximum; a high water below an earlier interval's
+   * resident size leaves the peaks unusable.
    * @returns {{B:number, Eref:number, P:number, Epeak:number, setupPeak:number,
    *   usable:boolean}|null} the quantities every gate uses, or null when the marks are unusable
    */
@@ -734,6 +736,8 @@ class MemoryArmJudge {
     const claimed = manifest.peakSource !== null
     let usable = claimed
     let previous = null
+    let earlier = -Infinity
+    const peakCoverage = []
     for (const mark of marks) {
       if (!MARK_FIELDS.every((field) => count(mark?.[field])) || !time(mark?.at)) {
         this.fail(`${mark?.phase} mark is incomplete`)
@@ -744,12 +748,20 @@ class MemoryArmJudge {
         return null
       }
       if (previous && mark.at < previous.at) this.fail('marks are out of order')
-      if (claimed && mark.vmhwm < mark.covered) {
+      if (claimed && mark.vmhwm < earlier) {
         this.wait('peak source does not cover a current reading')
         usable = false
-      }
+      } else if (claimed && mark.vmhwm < mark.covered)
+        peakCoverage.push({
+          phase: mark.phase,
+          vmhwm: mark.vmhwm,
+          covered: mark.covered,
+          shortfall: mark.covered - mark.vmhwm,
+        })
+      earlier = Math.max(earlier, mark.covered)
       previous = mark
     }
+    if (peakCoverage.length) this.facts.peakCoverage = peakCoverage
     const peakOf = (mark) => Math.max(claimed ? mark.vmhwm : 0, mark.covered)
     const upToSetup = marks.slice(
       0,

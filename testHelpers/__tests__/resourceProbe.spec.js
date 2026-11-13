@@ -1131,7 +1131,10 @@ describe('resource artifact validation', () => {
         ],
         [(r) => (markOf(r, 'enabled:closed').at = 1), 'fail', 'marks are out of order'],
         [
-          (r) => (markOf(r, 'enabled:held').covered = 120 * MIB),
+          (r) => {
+            markOf(r, 'enabled:held').covered = 120 * MIB
+            for (const phase of ['enabled:closed', 'final']) markOf(r, phase).vmhwm = 119 * MIB
+          },
           'inconclusive',
           'peak source does not cover a current reading',
         ],
@@ -1572,6 +1575,17 @@ describe('resource artifact validation', () => {
       })
     })
 
+    test('records a high water read just below its own interval and judges the larger reading', () => {
+      const result = judged('public', (r) => {
+        const mark = markOf(r, 'enabled:gzip')
+        mark.vmhwm = mark.covered - 8192
+      })
+      expect(result).toMatchObject({ verdict: 'pass', problems: [] })
+      expect(result.facts.peakCoverage).toEqual([
+        expect.objectContaining({ phase: 'enabled:gzip', shortfall: 8192 }),
+      ])
+    })
+
     test('is inconclusive when the high water does not cover a current reading', () => {
       const result = judged('public', (r) => {
         markOf(r, 'enabled:gzip').vmhwm = markOf(r, 'enabled:gzip').covered - 1
@@ -1579,7 +1593,7 @@ describe('resource artifact validation', () => {
           markOf(r, phase).vmhwm = markOf(r, 'enabled:gzip').vmhwm
       })
 
-      expect(result).toEqual({
+      expect(result).toMatchObject({
         verdict: 'inconclusive',
         problems: ['peak source does not cover a current reading'],
       })
