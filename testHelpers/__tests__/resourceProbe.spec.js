@@ -839,7 +839,7 @@ describe('resource artifact validation', () => {
         },
         startup: settled(10, 41 * MIB, 1e6, 2e6),
         loaded: settled(50, 70 * MIB, 3e6, 5e6),
-        c0: settled(1000, 73 * MIB, 3e6, 6e6),
+        c0: settled(1500, 73 * MIB, 3e6, 6e6),
         c1: settled(2000, 74 * MIB, 3e6, 6.1e6),
         released: settled(3000, 72 * MIB, 3e6, 5.9e6),
         warmup: {
@@ -1600,6 +1600,63 @@ describe('resource artifact validation', () => {
   })
 
   describe('collection convergence', () => {
+    /** Replaces the pair with a monotone series, optionally converging only at its last point. */
+    const extend = (reading, rounds, converges = true) => {
+      const final = reading.gc.checkpoints.at(-1)
+      reading.gc.checkpoints = Array.from({ length: rounds }, (_, i) => {
+        const distance = converges ? Math.max(0, rounds - i - 2) : rounds - i - 1
+        const at = reading.at - (rounds - i - 1) * 100
+        return {
+          ...final,
+          at,
+          admittedAt: at - 100,
+          heapUsed: reading.heapUsed - distance * 32768,
+          retained: reading.retained - distance * 32768,
+        }
+      })
+      reading.gc.admittedAt = reading.gc.checkpoints[0].admittedAt
+      reading.gc.observed = rounds * 2
+    }
+
+    test.each(['c0', 'c1'])(
+      'accepts %s convergence on each round from seven through twelve',
+      (name) => {
+        for (const rounds of [7, 8, 9, 10, 11, 12])
+          for (const arm of ARMS)
+            expect(judged(arm, (r) => extend(r[name], rounds))).toEqual({
+              verdict: 'pass',
+              problems: [],
+            })
+      }
+    )
+
+    test.each(['c0', 'c1'])('keeps %s inconclusive after twelve unconverged rounds', (name) => {
+      expect(judged('public', (r) => extend(r[name], 12, false))).toEqual({
+        verdict: 'inconclusive',
+        problems: [`${name} collections did not settle`],
+      })
+    })
+
+    test.each(['c0', 'c1'])('rejects a thirteenth %s collection round', (name) => {
+      const result = judged('public', (r) => extend(r[name], 13))
+      expect(result.verdict).toBe('fail')
+      expect(result.problems).toContain(`${name} collection checkpoints are incomplete`)
+    })
+
+    test.each([
+      ['released', (r) => r.released],
+      ['warm-up matched', (r) => r.warmup.m0],
+      ['warm-up closed', (r) => r.warmup.end],
+      ['matched', (r) => r.matched],
+      ['active 1', (r) => r.actives[0]],
+      ['active 2', (r) => r.actives[1]],
+      ['closed', (r) => r.closed],
+    ])('rejects a seventh %s collection round', (name, select) => {
+      const result = judged('public', (r) => extend(select(r), 7))
+      expect(result.verdict).toBe('fail')
+      expect(result.problems).toContain(`${name} collection checkpoints are incomplete`)
+    })
+
     test('rejects a checkpoint without its successive post-GC readings', () => {
       const result = judged('public', (r) => delete r.closed.gc.checkpoints)
       expect(result.verdict).toBe('fail')

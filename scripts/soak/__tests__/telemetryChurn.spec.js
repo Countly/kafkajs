@@ -4619,3 +4619,118 @@ describe('telemetry churn archive replay', () => {
     expect(verify((made) => change(made.archive))).toThrow(message)
   })
 })
+
+describe('telemetry control warm-up', () => {
+  test.each(['producer', 'admin', 'consumer', 'shareConsumer'])(
+    'warms the %s catalogue and idle window before c0 without changing the measured replay',
+    async (kind) => {
+      const events = []
+      let at = 0
+      const client = {
+        connect: async () => events.push('connect'),
+        subscribe: async () => {},
+        run: async () => {},
+        disconnect: async () => events.push('disconnect'),
+        send: async (request) => events.push(request.messages[0].key),
+        describeCluster: async () => events.push('describeCluster'),
+      }
+      const config = { stem: 's', topic: 's-topic', ctl: 's-ctl', group: 's-group' }
+      const { ReferenceControl } = require('../telemetryChurn')
+      const result = await new ReferenceControl({
+        kind,
+        config,
+        Kafka: function Kafka() {
+          return { [kind]: () => client }
+        },
+        socketFactory: () => {},
+        logLevel: { NOTHING: 0 },
+        resources: { as: (_role, work) => work(), live: new Map() },
+        clock: { now: () => ++at },
+        sleep: async (ms) => {
+          at += ms
+          if (ms === 2000) events.push('idle')
+        },
+        gc: () => {},
+        engine: { record: (reading) => events.push(reading.phase) },
+      }).run()
+      const count = { producer: 20, admin: 10, consumer: 0, shareConsumer: 0 }[kind]
+      const catalogue = (prefix) =>
+        Array.from({ length: count }, (_, n) =>
+          kind === 'producer' ? `s:${prefix}:${n}` : 'describeCluster'
+        )
+      expect(events).toEqual([
+        'connect',
+        ...catalogue('ctl-warmup'),
+        'idle',
+        'c0',
+        ...catalogue('ctl-off'),
+        'idle',
+        'c1',
+        'disconnect',
+        'control-released',
+      ])
+      expect(result.warmup).toBeDefined()
+      expect(result.warmup.outcomes).toHaveLength(count)
+      expect(result.warmup.outcomes.every((o, n) => o.n === n && o.status === 'fulfilled')).toBe(
+        true
+      )
+      expect(result.warmup.completedAt - result.warmup.idleStartedAt).toBeGreaterThanOrEqual(2000)
+      expect(result.warmup.completedAt).toBeLessThanOrEqual(result.c0.gc.admittedAt)
+      expect(result.outcomes).toHaveLength(result.manifest.operations.length)
+      expect(result.outcomes.every((o) => o.at > result.c0.at && o.at < result.c1.at)).toBe(true)
+      expect(Object.keys(result.c0).sort()).toEqual(Object.keys(result.c1).sort())
+    }
+  )
+
+  test('preserves the frozen long-window control catalogue and three readings', async () => {
+    const previous = process.env.TELEMETRY_LONG_WINDOW
+    let Control
+    try {
+      process.env.TELEMETRY_LONG_WINDOW = '1'
+      jest.isolateModules(() => {
+        Control = require('../telemetryChurn').ReferenceControl
+      })
+    } finally {
+      if (previous === undefined) delete process.env.TELEMETRY_LONG_WINDOW
+      else process.env.TELEMETRY_LONG_WINDOW = previous
+    }
+    const events = []
+    let at = 0
+    const result = await new Control({
+      kind: 'admin',
+      config: { stem: 's', topic: 't', ctl: 'ctl', group: 'g' },
+      Kafka: function Kafka() {
+        return {
+          admin: () => ({
+            connect: async () => {},
+            disconnect: async () => {},
+            describeCluster: async () => events.push('operation'),
+          }),
+        }
+      },
+      socketFactory: () => {},
+      logLevel: { NOTHING: 0 },
+      resources: { as: (_role, work) => work(), live: new Map() },
+      clock: { now: () => ++at },
+      sleep: async (ms) => {
+        at += ms
+        events.push(ms)
+      },
+      gc: () => {},
+      engine: { record: (reading) => events.push(reading.phase) },
+    }).run()
+    expect(events).toEqual([
+      2000,
+      100,
+      'c0',
+      ...Array(10).fill('operation'),
+      2000,
+      100,
+      'c1',
+      100,
+      'control-released',
+    ])
+    expect(result).not.toHaveProperty('warmup')
+    expect(result.outcomes).toHaveLength(10)
+  })
+})

@@ -6616,7 +6616,15 @@ describe('Share soak complete original-owner schedules', () => {
  * collection facts, the control agrees with itself and replays its frozen catalogue, every peak
  * covers its own and every earlier current reading, so only a deliberate change fails.
  */
-const AT = { startup: 0, loaded: 1, c0: 2, c1: 3, 'control-released': 4, settled: 10, final: 20 }
+const AT = {
+  startup: 0,
+  loaded: 1,
+  c0: 2004,
+  c1: 2005,
+  'control-released': 2006,
+  settled: 2010,
+  final: 2020,
+}
 const SETTLED = new Set(['c0', 'c1', 'control-released', 'settled'])
 const reading = (phase, over = {}) => {
   const r = {
@@ -6670,6 +6678,12 @@ const reference = () => ({
   control: {
     manifest: { kind: 'producer', topic: 't', joins: false, operations, lifecycles: 1 },
     outcomes: outcomes(),
+    warmup: {
+      startedAt: 1,
+      outcomes: [0, 1].map((n) => ({ n, status: 'fulfilled', at: 1.1 + n / 10 })),
+      idleStartedAt: 2,
+      completedAt: 2002,
+    },
     telemetryFrames: 0,
     openSockets: 0,
     leftoverHandles: 0,
@@ -7083,6 +7097,48 @@ describe('telemetry resident-size reference', () => {
       if (external !== undefined) setExternal(memory, external)
     }
   }
+
+  test.each([
+    ['missing', (c) => delete c.warmup],
+    ['incomplete', (c) => c.warmup.outcomes.pop()],
+    ['rejected', (c) => (c.warmup.outcomes[0].status = 'rejected')],
+    ['misnumbered', (c) => (c.warmup.outcomes[0].n = 1)],
+    ['late', (c) => (c.warmup.completedAt = c.c0.at + 1)],
+    ['short idle', (c) => (c.warmup.completedAt = c.warmup.idleStartedAt + 1999)],
+    ['late operation', (c) => (c.warmup.outcomes[0].at = c.warmup.completedAt)],
+    ['unordered operations', (c) => (c.warmup.outcomes[1].at = 1.05)],
+    ['missing time', (c) => delete c.warmup.startedAt],
+    ['before loading', (c) => (c.warmup.startedAt = 0)],
+  ])('rejects %s telemetry control warm-up evidence', (_name, change) => {
+    const input = make()
+    expect(evaluate(input)).toMatchObject({ ok: true, violations: [] })
+    change(input.reference.control)
+    expect(evaluate(input)).toMatchObject({
+      ok: false,
+      outcome: 'failed',
+      violations: ['telemetry-disabled control warm-up'],
+    })
+  })
+
+  test('keeps both telemetry control drift boundaries after warm-up', () => {
+    for (const [field, limit] of [
+      ['rss', 2097152],
+      ['heapUsed', 262144],
+    ]) {
+      const input = make()
+      const control = input.reference.control
+      control.c1[field] += limit
+      if (field === 'heapUsed') control.c1.retained += limit
+      expect(evaluate(input)).toMatchObject({ ok: true, inconclusive: [] })
+      control.c1[field]++
+      if (field === 'heapUsed') control.c1.retained++
+      expect(evaluate(input)).toMatchObject({
+        ok: false,
+        outcome: 'inconclusive',
+        inconclusive: ['unstable control'],
+      })
+    }
+  })
 
   test('measures against the disabled control and no longer against an absolute 64 MiB', () => {
     const input = make()
