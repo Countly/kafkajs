@@ -6856,7 +6856,7 @@ describe('telemetry resource evidence', () => {
       peakBytes: 167772160,
       controlRssDriftBytes: 2097152,
       controlRetainedDriftBytes: 262144,
-      noiseLoadPerCpu: 0.75,
+      noiseLoadPerCpu: 1.0,
       noiseFreeBytes: 268435456,
       noisePressure: 5,
     })
@@ -7622,9 +7622,26 @@ describe('telemetry resident-size reference', () => {
     expect(verdict.inconclusive).toContain('resident-size peak capability')
   })
 
+  test('uses a load-per-CPU ceiling of one only for the telemetry verdict', () => {
+    for (const name of ['before', 'boundary', 'after']) {
+      for (const loadPerCpu of [0.99, 1.0, 1.01]) {
+        const input = make()
+        const context = input.reference.host[name]
+        context.loadPerCpu = loadPerCpu
+        context.load1 = context.cpus * loadPerCpu
+        expect(evaluate(input)).toMatchObject({
+          ok: loadPerCpu <= 1,
+          outcome: loadPerCpu <= 1 ? 'passed' : 'inconclusive',
+          violations: [],
+          inconclusive: loadPerCpu <= 1 ? [] : [`host noise ${name}`],
+        })
+      }
+    }
+  })
+
   test('is inconclusive on a noisy host and keeps the unavailable pressure capability visible', () => {
     const loaded = make()
-    loaded.reference.host.before.load1 = 3.1
+    loaded.reference.host.before.load1 = 4.04
     expect(evaluate(loaded).inconclusive).toContain('host noise before')
     const memory = make()
     memory.reference.host.after.freeBytes = 268435455

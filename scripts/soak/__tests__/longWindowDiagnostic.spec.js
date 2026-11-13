@@ -303,7 +303,12 @@ describe('long-window driver', () => {
     }
     for (const kind of KINDS) {
       const handshake = result.archive.handshakes.find((row) => row.kind === kind)
-      for (const execArgv of [undefined, [], ['--expose-gc']]) {
+      for (const execArgv of [
+        undefined,
+        [],
+        ['--expose-gc'],
+        ['--expose-gc', '--min-semi-space-size=1', '--max-semi-space-size=1'],
+      ]) {
         handshake.execArgv = execArgv
         await expect(run.execute()).rejects.toThrow(/no-flush-bytecode/)
         const worker = read('long-window.json').workers.find((row) => row.kind === kind)

@@ -1483,6 +1483,32 @@ describe('telemetry wire observer', () => {
     observer.assertClean()
   })
 
+  test('serializes disposal records without per-record copies and preserves the legacy bytes and public isolation', async () => {
+    const { observer } = observe()
+    const socket = open(observer)
+    send(socket, metadata(1), get71(2), push72(3, Buffer.from('plain-records')))
+    receive(socket, metadataResponse(1), get71Response(2), push72Response(3))
+    socket.emit('close')
+    const records = observer.readTranscript()
+    const legacyRecords = records.map((record) => JSON.parse(JSON.stringify(record)))
+    expect(legacyRecords.filter((record) => record.type === 'request')).toHaveLength(3)
+    records[0].type = 'mutated'
+    records.find((record) => record.apiKey === 72).response.errorCode = 999
+    expect(observer.readTranscript()).toEqual(legacyRecords)
+    const stringify = jest.spyOn(JSON, 'stringify')
+    try {
+      await observer.dispose()
+      expect(stringify.mock.calls.filter(([value]) => Number.isInteger(value?.index))).toEqual([])
+    } finally {
+      stringify.mockRestore()
+    }
+    const archive = fs.readFileSync(path.join(observer.directory, 'transcript.json'), 'utf8')
+    const legacy = { ...JSON.parse(archive), records: legacyRecords }
+    expect(archive).toBe(JSON.stringify(legacy))
+    expect(observer.readTranscript()).toEqual(legacyRecords)
+    observer.assertClean()
+  })
+
   test('keeps empty oversized and malformed Push evidence fatal without truncation', async () => {
     for (const [blob, diagnostic] of [
       [Buffer.alloc(0), 'zero-byte'],

@@ -979,7 +979,7 @@ describe('long-window worker flags', () => {
       stderr: new EventEmitter(),
     })
 
-  test('adds no-flush-bytecode only to long-window workers and leaves the default worker flags unchanged', () => {
+  test('pins young space only for five-minute workers and preserves long-window flags', () => {
     const parentFlags = [...process.execArgv]
     for (const on of [true, false]) {
       const flags = withModules(on, ({ churn: c }) => {
@@ -992,13 +992,20 @@ describe('long-window worker flags', () => {
           },
         })
         for (const kind of c.KINDS) processes.start(kind)
-        expect(c.WORKER_FLAGS).toEqual(['--expose-gc'])
+        expect(c.WORKER_FLAGS).toEqual([
+          '--expose-gc',
+          '--min-semi-space-size=1',
+          '--max-semi-space-size=1',
+        ])
+        expect(require('../soak').TELEMETRY_LONG.noiseLoadPerCpu).toBe(0.75)
         return spawned
       })
       expect(flags).toEqual(
         churn.KINDS.map((kind) => ({
           kind,
-          execArgv: on ? ['--expose-gc', '--no-flush-bytecode'] : ['--expose-gc'],
+          execArgv: on
+            ? ['--expose-gc', '--no-flush-bytecode']
+            : ['--expose-gc', '--min-semi-space-size=1', '--max-semi-space-size=1'],
         }))
       )
     }
@@ -1012,6 +1019,7 @@ describe('long-window worker flags', () => {
         undefined,
         [],
         ['--expose-gc'],
+        ['--expose-gc', '--min-semi-space-size=1', '--max-semi-space-size=1'],
         '--no-flush-bytecode',
         ['--expose-gc', '--no-flush-bytecode'],
       ]) {

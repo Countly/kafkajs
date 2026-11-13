@@ -227,7 +227,11 @@ describe('telemetry profile', () => {
     expect(new Set(spawned.map(({ options }) => options.env[WORKER_TOKEN])).size).toBe(4)
     for (const { args, options } of spawned) {
       expect(args).toEqual(['--profile', 'telemetry'])
-      expect(options.execArgv).toEqual(['--expose-gc'])
+      expect(options.execArgv).toEqual([
+        '--expose-gc',
+        '--min-semi-space-size=1',
+        '--max-semi-space-size=1',
+      ])
       expect(options.stdio).toEqual(['ignore', 'pipe', 'pipe', 'ipc'])
     }
     expect(() => processes.start('producer')).toThrow('already started')
@@ -4237,7 +4241,7 @@ describe('telemetry churn worker identity', () => {
           v8: '13.0',
           platform: 'linux',
           arch: 'x64',
-          execArgv: ['--expose-gc'],
+          execArgv: ['--expose-gc', '--min-semi-space-size=1', '--max-semi-space-size=1'],
           modules: 300,
           codecs: { gzip: true, zstd: true },
           source,
@@ -4259,6 +4263,20 @@ describe('telemetry churn worker identity', () => {
       expect(run().source.driver.file).toBe('scripts/soak/soak.js')
       expect(run().source.churn.file).toBe('scripts/soak/telemetryChurn.js')
       expect(verify()).not.toThrow()
+    })
+
+    test('requires the exact five-minute flags even when all workers agree', () => {
+      for (const flags of [
+        ['--expose-gc'],
+        ['--expose-gc', '--no-flush-bytecode'],
+        ['--expose-gc', '--min-semi-space-size=1'],
+        ['--expose-gc', '--max-semi-space-size=1'],
+        ['--expose-gc', '--min-semi-space-size=1', '--max-semi-space-size=2'],
+        ['--expose-gc', '--min-semi-space-size=1', '--max-semi-space-size=1', '--inspect'],
+      ])
+        expect(verify((r) => r.handshakes.forEach((hello) => (hello.execArgv = flags)))).toThrow(
+          'Workers ran with unexpected five-minute flags'
+        )
     })
 
     test.each([
@@ -4639,7 +4657,7 @@ describe('telemetry churn archive replay', () => {
         v8: '13.0',
         platform: 'linux',
         arch: 'x64',
-        execArgv: ['--expose-gc'],
+        execArgv: ['--expose-gc', '--min-semi-space-size=1', '--max-semi-space-size=1'],
         codecs: { gzip: true, zstd: true },
         source,
         parentAt: 5 + i,

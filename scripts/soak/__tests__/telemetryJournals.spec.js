@@ -904,7 +904,7 @@ describe('telemetry journal calibration children', () => {
     expect(calls).toHaveLength(8)
     const arms = calls.map(argsOf)
     for (const { flags, script } of arms) {
-      expect(flags).toEqual(['--expose-gc'])
+      expect(flags).toEqual(['--expose-gc', '--min-semi-space-size=1', '--max-semi-space-size=1'])
       expect(script).toBe('journalSensitivityChild.js')
     }
     expect(arms.map((row) => row.rest)).toEqual(

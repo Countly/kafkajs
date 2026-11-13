@@ -468,6 +468,12 @@ describe('telemetry resource documentation', () => {
     expect(testing).toContain('live-flags control')
     expect(testing).toContain('23,192,560')
     expect(testing).toContain('123,855,856')
+    expect(testing).toContain('one-minute load per CPU above 1.0')
+    expect(testing).toContain('resource verifier keeps its load-per-CPU threshold at 0.75')
+    expect(testing).toContain('`--expose-gc --min-semi-space-size=1 --max-semi-space-size=1`')
+    expect(squeeze('docs/TelemetryJournals.md')).toContain(
+      '`WORKER_FLAGS`, `--expose-gc --min-semi-space-size=1 --max-semi-space-size=1`'
+    )
   })
 
   test('documents the churn method and the CI rows', () => {

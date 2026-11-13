@@ -1511,6 +1511,18 @@ describe('resource artifact validation', () => {
       expect(result.problems).toContain(problem)
     })
 
+    test('keeps the resource host-load ceiling at 0.75 per CPU', () => {
+      for (const loadPerCpu of [0.75, 0.76, 0.99]) {
+        const result = judged('public', (_r, whole) => {
+          whole.context.before.load[0] = whole.context.before.cpus * loadPerCpu
+        })
+        expect(result).toEqual({
+          verdict: loadPerCpu <= 0.75 ? 'pass' : 'inconclusive',
+          problems: loadPerCpu <= 0.75 ? [] : ['host load was high'],
+        })
+      }
+    })
+
     test('accepts an explicitly unavailable pressure source', () => {
       const result = judged('public', (r, whole) => {
         whole.context.before.psi = null
