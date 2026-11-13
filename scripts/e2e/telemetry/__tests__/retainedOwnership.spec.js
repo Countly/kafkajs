@@ -1,4 +1,8 @@
-const { analyseSnapshot, auditReferences } = require('../retained/heapDiff')
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
+const { spawnSync } = require('node:child_process')
+const { analyseSnapshot, auditReferences, readSnapshot } = require('../retained/heapDiff')
 const { ephemeronLiveness, refineOwnership, selfLedger } = require('../retained/ownership')
 
 const fixture = (definitions) => {
@@ -279,4 +283,160 @@ test('attributes weak observation history without exempting strongly retained pr
   expect(labels[5]).not.toBe('harness:weak-observation-history')
   expect(labels[6]).not.toBe('harness:weak-observation-history')
   expect(labels[7]).toBe('harness:weak-observation-history')
+})
+
+test('cold backing ledger preserves store identities, aliases, replacements and release paths', () => {
+  const { backingInventory, backingComparison } = require('../retained/coldOwnership')
+  const snapshot = (id, size, alias = true) => {
+    const graph = analyseSnapshot(
+      fixture([
+        ['synthetic', 'root', 1, 0, [['property', 'client', 1]]],
+        [
+          'object',
+          'TelemetryPayload',
+          3,
+          40,
+          [['property', 'retainedOnce', 2], ...(alias ? [['property', 'alias', 3]] : [])],
+        ],
+        ['object', 'Buffer', 5, 32, [['internal', 'buffer', 4]]],
+        ['object', 'Buffer', 7, 32, alias ? [['internal', 'buffer', 4]] : []],
+        ['object', 'ArrayBuffer', 9, 32, [['internal', 'backing_store', 5]]],
+        ['object', 'system / JSArrayBufferData', id, size, []],
+      ])
+    )
+    return { graph, labels: refineOwnership(graph).labels }
+  }
+  const old = backingInventory(snapshot(11, 1048576))
+  expect(old).toHaveLength(1)
+  expect(old[0]).toMatchObject({ id: 11, selfBytes: 1048576 })
+  expect(old[0].aliases.map((entry) => entry.id)).toEqual([5, 7])
+  expect(old[0].rootPath.map((entry) => entry.edge?.name)).toContain('retainedOnce')
+  const next = backingInventory(snapshot(13, 65536, false))
+  const replaced = backingComparison(old, next)
+  expect(replaced.removed.map((row) => row.id)).toEqual([11])
+  expect(replaced.added.map((row) => row.id)).toEqual([13])
+  expect(replaced.delta).toBe(65536 - 1048576)
+  expect(backingComparison(next, []).removed.map((row) => row.id)).toEqual([13])
+  expect(backingComparison(old, old).surviving[0].id).toBe(11)
+})
+
+describe('readSnapshot', () => {
+  let directory
+  let filename
+
+  beforeEach(() => {
+    directory = fs.mkdtempSync(path.join(os.tmpdir(), 'read-snapshot-'))
+    filename = path.join(directory, 'small.heapsnapshot')
+  })
+
+  afterEach(() => fs.rmSync(directory, { recursive: true, force: true }))
+
+  const smallSnapshot = () => ({
+    snapshot: {
+      node_count: 1,
+      edge_count: 0,
+      meta: {
+        node_fields: ['type', 'name', 'id', 'self_size', 'edge_count'],
+        node_types: [['synthetic']],
+        edge_fields: ['type', 'name_or_index', 'to_node'],
+        edge_types: [['property']],
+      },
+    },
+    nodes: [0, 0, 4294967297, 0, 0],
+    edges: [],
+    strings: ['root'],
+  })
+
+  test('matches JSON parsing when analysing a real V8 heap snapshot', () => {
+    const child = spawnSync(
+      process.execPath,
+      [
+        '-e',
+        `class SnapshotReaderSentinel {}
+         globalThis.sentinel = new SnapshotReaderSentinel()
+         require('node:v8').writeHeapSnapshot(process.argv[1])`,
+        filename,
+      ],
+      { encoding: 'utf8', timeout: 30000 }
+    )
+    expect(child.error).toBeUndefined()
+    expect(child.status).toBe(0)
+    const raw = JSON.parse(fs.readFileSync(filename, 'utf8'))
+    const parsed = readSnapshot(filename)
+    expect(parsed.snapshot).toEqual(raw.snapshot)
+    expect(ArrayBuffer.isView(parsed.nodes)).toBe(true)
+    expect(ArrayBuffer.isView(parsed.edges)).toBe(true)
+    expect(Array.from(parsed.nodes)).toEqual(raw.nodes)
+    expect(Array.from(parsed.edges)).toEqual(raw.edges)
+    expect(parsed.strings).toEqual(raw.strings)
+    const expected = analyseSnapshot(raw)
+    const actual = analyseSnapshot(parsed)
+    expect(actual.n).toBe(expected.n)
+    expect(actual.describe(actual.root)).toEqual(expected.describe(expected.root))
+    const known = (graph) =>
+      graph.groups.find(({ type, name }) => type === 'object' && name === 'SnapshotReaderSentinel')
+    expect(known(expected)).toMatchObject({ count: 1 })
+    expect(known(actual)).toEqual(known(expected))
+  })
+
+  test('preserves escaped and non-ASCII strings while skipping other sections', () => {
+    const raw = smallSnapshot()
+    raw.nodes[2] = Number.MAX_SAFE_INTEGER
+    raw.strings.push(
+      'quote " comma , braces } ]',
+      'backslash \\',
+      '\n\r\t\b\f\u0000',
+      'café 雪 😀',
+      '\ud800'
+    )
+    const json = JSON.stringify({
+      before: { nested: [1, { label: 'escaped " } ] \\' }] },
+      strings: raw.strings,
+      edges: raw.edges,
+      snapshot: raw.snapshot,
+      nodes: raw.nodes,
+      after: [[], {}, true, null, -1.5e2],
+    })
+    fs.writeFileSync(filename, json.replace('café', 'caf\\u00e9'))
+    const parsed = readSnapshot(filename)
+    expect(parsed.strings).toEqual(raw.strings)
+    expect(Array.from(parsed.nodes)).toEqual(raw.nodes)
+    expect(Object.keys(parsed).sort()).toEqual(['edges', 'nodes', 'snapshot', 'strings'])
+    expect(analyseSnapshot(parsed).describe(0).id).toBe(Number.MAX_SAFE_INTEGER)
+  })
+
+  test('rejects truncated or malformed snapshots with a clear error', () => {
+    const json = JSON.stringify(smallSnapshot())
+    const malformed = [
+      '',
+      json.slice(0, -1),
+      json.slice(0, json.indexOf('"strings"') + 14),
+      json.replace('"strings":["root"]', '"strings":["unterminated]'),
+      json.replace('"strings":["root"]', '"strings":["bad\\q"]'),
+      json.replace('"strings":["root"]', '"strings":[123]'),
+      json.replace('"strings":["root"]', '"strings":["root",]'),
+      json.replace(',"edges":[]', ''),
+      json.replace(',"strings":["root"]', ''),
+      json.replace('"nodes":', '"missing_nodes":'),
+      json.replace('"snapshot":', '"missing":'),
+      json.replace('"node_count":1', '"node_count":2'),
+      json.replace('"edge_count":0', '"edge_count":1'),
+      json.replace('"nodes":[0,0,4294967297,0,0]', '"nodes":[0,0,1,0]'),
+      json.replace('"edges":[]', '"edges":[0]'),
+      json.replace('4294967297', '9007199254740992'),
+      json.replace('4294967297', '1.5'),
+      json.replace('4294967297', '01'),
+      json.replace('4294967297', '-1'),
+      json.replace('4294967297', 'null'),
+      json.replace('4294967297,0,0', '4294967297,0,0,'),
+      json.replace('"edge_count":0,', '"edge_count":-1,'),
+      json.replace('"node_fields":[', '"missing_fields":['),
+      `${json} trailing`,
+      json.replace('"nodes":', '"nodes":[],"nodes":'),
+    ]
+    for (const input of malformed) {
+      fs.writeFileSync(filename, input)
+      expect(() => readSnapshot(filename)).toThrow(/Malformed heap snapshot:/)
+    }
+  })
 })

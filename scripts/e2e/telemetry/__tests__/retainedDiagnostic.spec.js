@@ -21,6 +21,7 @@ const { DiagnosticMemory, DiagnosticSampler } = require('../retained/observer')
 const TelemetryPayload = require('../../../../src/telemetry/payload')
 const { MEMORY_FLAGS } = require('../../../../testHelpers/processMemory')
 const { foregroundCatalogue } = require('../resourceArtifact')
+const { STAGES } = require('../retained/settlement')
 const {
   MemoryForeground,
   descriptor,
@@ -130,27 +131,53 @@ const evidence = (dir, id = identity()) => {
       },
     })
   let tick = 1000
-  const checkpoint = (name) => {
+  let measurementId = 0
+  const measured = () => {
     tick += 1000
+    const result = reading(tick)
+    result.gc.diagnosticId = ++measurementId
+    log.write('settlement', {
+      id: measurementId,
+      phase: 'fixture',
+      readingAt: tick,
+      checkpoints: result.gc.checkpoints,
+      observations: result.gc.checkpoints.flatMap((point, round) =>
+        STAGES.map((stage, index) => ({
+          ...point,
+          round,
+          stage,
+          at: point.at - 90 + index * 10,
+          submittedId: 0,
+          submittedJobId: 0,
+          submittedCodec: 0,
+          settledId: 0,
+          settledJobId: 0,
+          settledCodec: 0,
+          pending: 0,
+        }))
+      ),
+    })
+    return result
+  }
+  const checkpoint = (name, pre = measured()) => {
     log.write('checkpoint', {
       name,
-      observedAt: tick,
-      startedAt: tick + 1,
-      endedAt: tick + 2,
-      pre: reading(tick),
-      post: { at: tick + 3 },
+      observedAt: pre.at,
+      startedAt: pre.at + 1,
+      endedAt: pre.at + 2,
+      pre,
+      post: { at: pre.at + 3 },
       file: null,
       bytes: 0,
       sha256: null,
     })
+    return pre
   }
-  for (const name of CAPTURES.slice(0, 3)) checkpoint(name)
-  const c0 = reading(2000)
-  const c1 = reading(3000)
+  const [c0, c1, released] = CAPTURES.slice(0, 3).map((name) => checkpoint(name))
   log.write('control', {
     c0,
     c1,
-    released: reading(4000),
+    released,
     facts: {
       enabled: false,
       api71: 0,
@@ -164,7 +191,9 @@ const evidence = (dir, id = identity()) => {
   })
   checkpoint('M')
   for (let index = 0; index < 6; index++) {
-    if (index === 0 || index === 5) checkpoint(`closed-${index}`)
+    const actives = [measured(), measured()]
+    const closed = measured()
+    if (index === 0 || index === 5) checkpoint(`closed-${index}`, closed)
     const rows = ['gzip', 'zstd'].flatMap((codec, c) =>
       [false, true].map((retired, r) => ({
         id: c * 2 + r + 1,
@@ -184,8 +213,8 @@ const evidence = (dir, id = identity()) => {
     )
     log.write('block', {
       index,
-      closed: reading(tick),
-      actives: [reading(tick - 500), reading(tick - 250)],
+      closed,
+      actives,
       delta: 0,
       matchedRetained: 1000000,
       ops: foregroundCatalogue(id.kind, 5).ops,
@@ -376,15 +405,41 @@ test('rejects circular serialization while leaving primary scalar evidence avail
   expect(fs.readFileSync(log.file, 'utf8').match(/"type":"error"/g)).toHaveLength(2)
 })
 
-test('does not let decreasing sources or missing coverage become passes after clamping', () => {
-  const rows = evidence(temp())
-  rows.push(
-    { type: 'mark', mark: { vmhwm: 1000, covered: 900 } },
-    { type: 'mark', mark: { vmhwm: 999, covered: 1100 } }
-  )
+test('records decreasing sources while preserving missing-coverage diagnostics and the peak', () => {
+  const rows = [
+    { type: 'mark', mark: { phase: 'M', vmhwm: 1000, maxRss: 2000, covered: 900 } },
+    { type: 'mark', mark: { phase: 'closed', vmhwm: 999, maxRss: 1900, covered: 1100 } },
+  ]
   expect(screen(rows)).toMatchObject({
-    problems: ['authoritative peak decreased'],
+    peak: 1100,
+    problems: [],
     inconclusive: ['peak source does not cover a current reading'],
+    peakDecreases: [
+      { index: 1, phase: 'closed', field: 'maxRss', before: 2000, after: 1900, delta: -100 },
+      { index: 1, phase: 'closed', field: 'vmhwm', before: 1000, after: 999, delta: -1 },
+    ],
+  })
+})
+
+test('keeps the diagnostic peak above 160 MiB despite a later decrease', () => {
+  expect(
+    screen([
+      { type: 'mark', mark: { phase: 'M', vmhwm: 167772161, covered: 1 } },
+      { type: 'mark', mark: { phase: 'closed', vmhwm: 1000, covered: 1 } },
+    ])
+  ).toMatchObject({
+    peak: 167772161,
+    problems: ['absolute current-image peak exceeds 160 MiB'],
+    peakDecreases: [
+      {
+        index: 1,
+        phase: 'closed',
+        field: 'vmhwm',
+        before: 167772161,
+        after: 1000,
+        delta: -167771161,
+      },
+    ],
   })
 })
 

@@ -1729,7 +1729,6 @@ const {
   liveRun,
   NEVER,
   bounded,
-  delay,
 } = require('../../../src/producer/__tests__/fixtures/bounded')
 const {
   SHARE_SOAK,
@@ -5235,6 +5234,8 @@ describe('Share soak cycle finalization and isolation adapter', () => {
     failRaw = false,
     leaveMode = 'answered',
     retained = false,
+    retiringWrite = false,
+    afterCloseWrite = false,
   } = {}) => {
     const plan = ShareCycleOracle.plan(reset ? 10 : 0)
     const clients = []
@@ -5242,10 +5243,11 @@ describe('Share soak cycle finalization and isolation adapter', () => {
     const original = { sequence: 1, epoch: 4, socket: 1, endpoint: 'node:1' }
     let broken = false
     let redeliver
+    const resetWrites = []
     const tap = new ShareFetchTap(64, { now: () => 0 })
     const Broker = require('../../../src/broker')
     const { respondWithFrame } = require('../../../testHelpers/fakeSocket')
-    const socket = tap.wrap(Object.assign(new EventEmitter(), { write: () => true }), 'node:1')
+    const socket = tap.wrap(Object.assign(new EventEmitter(), { write: () => true }), 'node:1', 10)
     let correlationId = 0
     const broker = Object.assign(Object.create(Broker.prototype), { brokerAddress: 'node:1' })
     const heartbeat = jest
@@ -5277,8 +5279,20 @@ describe('Share soak cycle finalization and isolation adapter', () => {
     tap.mark = () => 0
     tap.since = (mark) =>
       mark === 0 ? [original] : broken ? [{ sequence: 2, epoch: 0, socket: 2 }] : []
+    const retiredWrite = () =>
+      tap.notify('api78-write', {
+        ...original,
+        epoch: 5,
+        groupId: afterCloseWrite === 'different-context' ? 'foreign-group' : 'soak-group',
+        memberId: clients[0].memberId,
+        attempted: true,
+      })
     tap.destroy = () => {
       broken = true
+      if (retiringWrite) retiredWrite()
+      tap.notify('socket-close', { socket: original.socket, endpoint: original.endpoint })
+      if (afterCloseWrite === 'before-reopen' || afterCloseWrite === 'different-context')
+        retiredWrite()
       clients[0].emit('SESSION_RESET', { nodeId: 1, reason: 'connection' })
     }
     const kafka = {
@@ -5309,6 +5323,7 @@ describe('Share soak cycle finalization and isolation adapter', () => {
           },
           disconnect: async () => {
             await client.pending
+            if (client === clients[0] && afterCloseWrite === 'during-disconnect') retiredWrite()
             if (lateDuringClose && client === clients[0])
               await client.handlers.eachBatch(client.batch)
             if (client === clients[0])
@@ -5359,6 +5374,9 @@ describe('Share soak cycle finalization and isolation adapter', () => {
               const recover = redeliver
               redeliver = null
               await recover()
+            } else if (resetWrites.length) {
+              tap.notify('api78-write', resetWrites.shift())
+              if (!resetWrites.length && afterCloseWrite === 'after-reopen') retiredWrite()
             }
             await Promise.resolve()
           }
@@ -5379,7 +5397,8 @@ describe('Share soak cycle finalization and isolation adapter', () => {
       topicId: SOAK_UUID,
       group: 'soak-group',
       admin: {},
-      leaders: new Map([[0, 'node:1']]),
+      leaders: new Map([0, 1, 2].map((nodeId) => [nodeId, `node:${nodeId + 1}`])),
+      nodes: new Map([0, 1, 2].map((nodeId) => [`node:${nodeId + 1}`, nodeId])),
     })
     driver.awaitMembers = async () => {}
     driver.produce = async () => {
@@ -5413,6 +5432,16 @@ describe('Share soak cycle finalization and isolation adapter', () => {
               messages: a.batch.batch.messages.map((message) => ({ ...message, deliveryCount: 2 })),
             },
           })
+          resetWrites.push(
+            ...[0, 1, 2].map((nodeId) => ({
+              endpoint: `node:${nodeId + 1}`,
+              socket: nodeId === 0 ? 2 : nodeId + 3,
+              epoch: nodeId === 0 ? 0 : 4,
+              groupId: 'soak-group',
+              memberId: a.memberId,
+              attempted: true,
+            }))
+          )
         }
       return facts.produced
     }
@@ -5657,9 +5686,52 @@ describe('Share soak cycle finalization and isolation adapter', () => {
     }
   )
 
+  test.each([false, true])(
+    'reserves the reset node diagnostic for its replacement socket after a retiring write=%s',
+    async (retiringWrite) => {
+      const { work } = await cycle({ reset: true, retiringWrite })
+      const observed = await work
+      const writes = observed.steps.filter(({ step }) => step === 'post-reset-api78')
+      expect(writes).toHaveLength(3)
+      expect(writes.map(({ nodeId }) => nodeId)).toEqual([0, 1, 2])
+      expect(writes.find(({ nodeId }) => nodeId === observed.resetTarget.nodeId)).toMatchObject({
+        socket: observed.reset.nextSocket,
+        epoch: 0,
+        attempted: true,
+      })
+      expect(writes.filter(({ nodeId }) => nodeId !== observed.resetTarget.nodeId)).toEqual([
+        expect.objectContaining({ socket: 4, epoch: 4 }),
+        expect.objectContaining({ socket: 5, epoch: 4 }),
+      ])
+    }
+  )
+
+  test.each(['before-reopen', 'after-reopen', 'during-disconnect', 'different-context'])(
+    'rejects a retired socket write after confirmed close, timing=%s',
+    async (afterCloseWrite) => {
+      const control = await cycle({ reset: true, retiringWrite: true })
+      await expect(control.work).resolves.toMatchObject({ reset: { nextSocket: 2, nextEpoch: 0 } })
+      const { work, driver } = await cycle({ reset: true, retiringWrite: true, afterCloseWrite })
+      await expect(work).rejects.toThrow('Retired reset socket 1 was written after close')
+      expect(driver.lastCycle.steps).toContainEqual(
+        expect.objectContaining({ step: 'retired-socket-write', socket: 1 })
+      )
+      expect(driver.lastCycle.steps.filter(({ step }) => step === 'post-reset-api78')).toHaveLength(
+        3
+      )
+      expect(driver.lastCycle.snapshot.workloadJoined).toBe(true)
+    }
+  )
+
   test('waits for held identities to be redelivered before closing the workload member', async () => {
     const { work } = await cycle({ reset: true })
     const observed = await work
+    const writes = observed.steps.filter((row) => row.step === 'post-reset-api78')
+    expect(writes.map((row) => row.nodeId)).toEqual([0, 1, 2])
+    const disconnect = observed.steps.findIndex(
+      (row) => row.step === 'disconnect-start' && row.member === 'A'
+    )
+    expect(observed.steps.indexOf(writes[2])).toBeLessThan(disconnect)
     expect(observed.held).toHaveLength(20)
     expect(observed.handler).toHaveLength(80)
     for (const identity of observed.held)
@@ -5759,556 +5831,9 @@ describe('Share soak owned raw reader', () => {
 
 describe('Share soak complete original-owner schedules', () => {
   afterEach(() => liveRun.reset())
-  const {
-    ShareClock,
-    shareClient,
-    fetchAnswer,
-    ackAnswer,
-    part,
-    acquired,
-    flush,
-  } = require('../../../testHelpers/shareHarness')
-  const {
-    batch,
-    record,
-  } = require('../../../src/protocol/requests/fetch/__tests__/fixtures/recordBatchBytes')
-  const fixtures = require('../../../testHelpers/shareFixtures')
-  const diagnostics = require('../../../testHelpers/shareLiveDiagnostics')
+  const { originalShareSchedule: schedule } = require('./fixtures/originalShareSchedule')
   const { ShareTimerObserver } = require('../shareTimerObserver')
   const { setTimeout: realSetTimeout, clearTimeout: realClearTimeout } = require('node:timers')
-
-  /**
-   * Script only external I/O. Membership, session loss/reopen, acquisition, dispatch, ledger
-   * decisions, acknowledgements, window observation, resource judging and reconstruction call
-   * through their original implementations. The raw corpus is independent of handler evidence.
-   * @param {object} [options] Scripted I/O and observation controls.
-   * @param {Function} [options.processResources] Supplies coherent process counts and timer owners
-   *   for both sides of the collection boundary; receives the original measured snapshot.
-   * @returns {Promise<object>} Original owner, evidence, corpus and verdict or failure.
-   * @throws {Error} The schedule exceeds its frozen envelope or cleanup fails after success.
-   */
-  const schedule = async ({
-    short = true,
-    damage = () => {},
-    wire = () => {},
-    finalDamage = () => {},
-    io = async () => {},
-    assignmentDelay = 0,
-    idleWakeMs = 0,
-    replayAt,
-    drainReplay = false,
-    socketClosed = () => {},
-    closeOnly = false,
-    observeRow = () => {},
-    processResources = () => ({ counts: {}, owners: { rows: [], dropped: 0 } }),
-  } = {}) => {
-    const clock = new ShareClock().install()
-    const exposed = globalThis.gc
-    globalThis.gc = undefined
-    const transport = shareClient({ nodes: 3, topics: {} })
-    const { cluster, table } = transport
-    const tap = new ShareFetchTap(64, { now: () => performance.now() })
-    const { SoakTransport } = require('./fixtures/soakTransport')
-    const external = new SoakTransport(tap)
-    /**
-     * Models transport reset and close even though the wire archive retains destroyed sockets.
-     * Rejects destroyed-stream writes before they can apply acknowledgements at the broker.
-     * Connection removes its end listener before deliberate shutdown; destroying a live stream
-     * instead reports the injected reset, settling original requests before close releases listeners.
-     * The close-only variant preserves the fake socket's original destroy and write semantics.
-     * @param {object} options Socket endpoint and connection callback.
-     * @returns {object} The scripted socket with asynchronous stream-write failures.
-     */
-    const socketFactory = (options) => {
-      const socket = cluster.socketFactory(options)
-      if (!closeOnly) {
-        const destroy = socket.destroy.bind(socket)
-        socket.destroy = (error) =>
-          destroy(
-            error ??
-              (socket.listenerCount('end') > 0
-                ? Object.assign(new Error('Connection reset'), { code: 'ECONNRESET' })
-                : undefined)
-          )
-      }
-      socket.once('close', () => {
-        socket.removeAllListeners()
-        socketClosed(socket)
-      })
-      if (!closeOnly) {
-        const write = socket.write.bind(socket)
-        socket.write = (...args) => {
-          if (!socket.destroyed) return write(...args)
-          const error = Object.assign(new Error('Cannot call write after a stream was destroyed'), {
-            code: 'ERR_STREAM_DESTROYED',
-          })
-          queueMicrotask(() => {
-            if (socket.listenerCount('error')) socket.emit('error', error)
-          })
-          return false
-        }
-      }
-      return socket
-    }
-    const instrumented = instrumentShare(
-      cluster.kafkaOptions({
-        socketFactory: tap.factory(socketFactory),
-        retry: { initialRetryTime: 50, maxRetryTime: 100, factor: 0, retries: 3 },
-      }),
-      { activeResources: false }
-    )
-    const resources = instrumented.shareResources
-    const originalSnapshot = resources.snapshot
-    // Process counts and timer attribution share one script; original client state is measured.
-    resources.snapshot = async () => {
-      const original = await originalSnapshot()
-      const { counts, owners } = processResources(original)
-      return {
-        ...original,
-        heapUsed: 1024,
-        activeResources: { ...counts },
-        activeResourcesBeforeCollection: { ...counts },
-        timerOwners: {
-          beforeCollection: ShareTimerObserver.evidence(owners, counts),
-          afterCollection: ShareTimerObserver.evidence(owners, counts),
-        },
-      }
-    }
-    const records = [[], [], []]
-    const members = new Map()
-    const configs = new Map()
-    const sessions = new Map()
-    const rows = []
-    let groupId
-    let topic
-    let groupPresent = false
-    let listingNode = 0
-    let firstWindow
-    let replayDue
-    const verifierStarts = []
-    const seenMembers = new Map()
-    const assignedMembers = new Set()
-    const assignment = (id) => {
-      const ids = [...members.keys()]
-      return [{ topic, partitions: ids.length < 2 ? [0, 1, 2] : id === ids[0] ? [0, 1] : [2] }]
-    }
-    const wireAssignment = (id) => ({
-      topicPartitions: assignment(id).map(({ partitions }) => ({ topicId: SOAK_UUID, partitions })),
-    })
-    cluster.answer('ShareGroupHeartbeat', async (fields) => {
-      if (fields.memberEpoch === -1) {
-        members.delete(fields.memberId)
-        return {
-          errorCode: 0,
-          memberId: fields.memberId,
-          memberEpoch: -1,
-          heartbeatIntervalMs: 5000,
-          assignment: null,
-        }
-      }
-      members.set(fields.memberId, true)
-      if (!seenMembers.has(fields.memberId)) seenMembers.set(fields.memberId, performance.now())
-      const waiting = performance.now() - seenMembers.get(fields.memberId) < 5000
-      if (!waiting && !assignedMembers.has(fields.memberId)) {
-        assignedMembers.add(fields.memberId)
-        // Delay the first assignment reply without requiring a heartbeat beyond the join bound.
-        if (
-          assignmentDelay &&
-          (driver.lastCycle?.members.aLeft || owner.counts.cycles === SHARE_SOAK.cycles)
-        )
-          await new Promise((resolve) => setTimeout(resolve, assignmentDelay))
-      }
-      return {
-        errorCode: 0,
-        memberId: fields.memberId,
-        memberEpoch: 1,
-        heartbeatIntervalMs: 5000,
-        assignment: waiting ? null : wireAssignment(fields.memberId),
-      }
-    })
-    const answer = (fields, call) => {
-      const key = `${fields.memberId}:${call.node}:${call.generation}`
-      if (fields.shareSessionEpoch === 0) sessions.set(key, new Set())
-      const wanted = sessions.get(key) ?? new Set()
-      for (const { partitions } of fields.topics)
-        for (const { partitionIndex, acknowledgementBatches } of partitions) {
-          wanted.add(partitionIndex)
-          for (const ack of acknowledgementBatches)
-            for (const row of records[partitionIndex])
-              if (
-                BigInt(row.offset) >= BigInt(ack.firstOffset) &&
-                BigInt(row.offset) <= BigInt(ack.lastOffset) &&
-                row.owner === key &&
-                ack.acknowledgeTypes.every((type) => type === 1)
-              )
-                row.settled = true
-        }
-      sessions.set(key, wanted)
-      for (const { partitions } of fields.forgottenTopicsData ?? [])
-        for (const partition of partitions) wanted.delete(partition)
-      if (call.apiKey === 79)
-        return ackAnswer([...wanted].map((partition) => ({ topicId: SOAK_UUID, partition })))
-      const parts = [...wanted].map((partition) => {
-        const available = records[partition].filter((row) => !row.settled && row.owner !== key)
-        const acquire = []
-        let bytes = ''
-        if (available.length) {
-          for (const row of available) {
-            row.owner = key
-            row.count++
-          }
-          acquire.push(acquired(available[0].offset, available.at(-1).offset, available[0].count))
-          bytes = batch({
-            baseOffset: BigInt(available[0].offset),
-            records: available.map((row, index) =>
-              record({ offsetDelta: index, key: row.key, value: row.value })
-            ),
-          }).toString('hex')
-        }
-        return part({ topicId: SOAK_UUID, partition, acquire, records: bytes })
-      })
-      const result = fetchAnswer(parts, { acquisitionLockTimeoutMs: 30000 })
-      if (
-        fields.shareSessionEpoch > 0 &&
-        (driver.lastCycle?.members.aLeft || owner.counts.cycles === SHARE_SOAK.cycles)
-      )
-        result.responses = result.responses.flatMap((topic) => {
-          const partitions = topic.partitions.filter(
-            (partition) => partition.errorCode !== 0 || partition.acquiredRecords.length > 0
-          )
-          return partitions.length ? [{ ...topic, partitions }] : []
-        })
-      wire({ fields, call, result, owner, records, members })
-      return result
-    }
-    cluster.answer('ShareFetch', answer)
-    cluster.answer('ShareAcknowledge', answer)
-    const admin = () => {
-      const events = new EventEmitter()
-      return {
-        events: { REQUEST: 'request' },
-        on: (event, listener) => {
-          events.on(event, listener)
-          return () => events.off(event, listener)
-        },
-        connect: async () => {},
-        disconnect: async () => io('admin-disconnect', { owner, driver, clock }),
-        createTopics: async ({ topics: [created] }) => {
-          topic = created.topic
-          table.set(topic, {
-            topicId: SOAK_UUID,
-            partitions: [0, 1, 2].map((leader) => ({ leader, epoch: 1 })),
-          })
-        },
-        deleteTopics: async () => {
-          await io('delete-topic', { owner, driver, clock })
-          return table.clear()
-        },
-        listTopics: async () => {
-          events.emit('request', {
-            payload: { apiName: 'Metadata', broker: `node${listingNode++ % 3}:9092` },
-          })
-          return [...table.keys()]
-        },
-        fetchTopicMetadata: async () => ({
-          topics: [
-            {
-              name: topic,
-              topicId: SOAK_UUID,
-              partitions: [0, 1, 2].map((partitionId) => ({ partitionId, leader: partitionId })),
-            },
-          ],
-        }),
-        describeCluster: async () => ({
-          brokers: [0, 1, 2].map((nodeId) => ({ nodeId, host: `node${nodeId}`, port: 9092 })),
-        }),
-        listGroups: async () => ({ groups: groupPresent ? [{ groupId }] : [] }),
-        deleteGroups: async () => {
-          groupPresent = false
-        },
-        describeShareGroups: async ([id]) => ({
-          groups: [
-            {
-              groupId: id,
-              errorCode: groupPresent ? 0 : 69,
-              state: members.size ? 'Stable' : 'Empty',
-              members: [...members.keys()].map((memberId) => ({
-                memberId,
-                assignment: assignment(memberId),
-              })),
-            },
-          ],
-        }),
-        listShareGroupOffsets: async () => [
-          {
-            topic,
-            topicId: SOAK_UUID,
-            partitions: records.map((rows, partition) => ({
-              partition,
-              startOffset: '0',
-              lag: String(rows.filter(({ settled }) => !settled).length),
-              errorCode: 0,
-              leaderEpoch: 1,
-            })),
-          },
-        ],
-        fetchTopicOffsets: async () => {
-          await io('terminal-ends', { owner, driver, clock })
-          return records.map((rows, partition) => ({ partition, high: String(rows.length) }))
-        },
-        incrementalAlterConfigs: async ({ resources: [resource] }) => {
-          groupId = resource.name
-          groupPresent = true
-          for (const { name, value, operation } of resource.configEntries)
-            if (operation === 1) configs.delete(name)
-            else configs.set(name, value)
-          return { resources: [{ errorCode: 0 }] }
-        },
-        describeConfigs: async ({ resources: [resource] }) => {
-          const values =
-            resource.type === 32
-              ? new Map([
-                  ['share.heartbeat.interval.ms', '5000'],
-                  ['share.session.timeout.ms', '45000'],
-                  ...configs,
-                ])
-              : new Map([
-                  ['group.share.heartbeat.interval.ms', '5000'],
-                  ['group.share.min.heartbeat.interval.ms', '5000'],
-                  ['group.share.max.heartbeat.interval.ms', '15000'],
-                  ['group.share.session.timeout.ms', '45000'],
-                  ['group.share.min.session.timeout.ms', '45000'],
-                  ['group.share.max.session.timeout.ms', '60000'],
-                  ['group.share.assignment.interval.ms', '1000'],
-                  ['group.share.min.assignment.interval.ms', '0'],
-                  ['group.share.max.assignment.interval.ms', '15000'],
-                  ['group.share.assignors', 'simple'],
-                ])
-          return {
-            resources: [
-              {
-                resourceName: resource.name,
-                resourceType: resource.type,
-                errorCode: 0,
-                configEntries: [...values]
-                  .filter(([name]) => !resource.configNames || resource.configNames.includes(name))
-                  .map(([configName, configValue]) => ({
-                    configName,
-                    configValue,
-                    configSource: configs.has(configName) ? 8 : resource.type === 32 ? 5 : 4,
-                    configSynonyms: [],
-                  })),
-              },
-            ],
-          }
-        },
-      }
-    }
-    const kafka = {
-      shareConsumer: (options) => {
-        const client = instrumented.kafka.shareConsumer(options)
-        if (!driver.lastCycle?.members.aLeft && owner.counts.cycles !== 30)
-          return {
-            ...client,
-            disconnect: async (options) => {
-              await io('workload-disconnect', { owner, driver, clock })
-              return client.disconnect(options)
-            },
-          }
-        const assignment = client.assignment
-        const disconnect = client.disconnect
-        // The public consumer is frozen: wrap a copy instead of mutating it.
-        const observed = { ...client }
-        let fetching = false
-        let started = false
-        let gate
-        const remove = client.on(client.events.REQUEST, ({ payload }) => {
-          if (payload.apiName === 'ShareFetch') fetching = true
-        })
-        const replay = () =>
-          fetchAnswer(
-            [
-              part({
-                topicId: SOAK_UUID,
-                partition: 0,
-                acquire: [acquired(0, 0, 2)],
-                records: batch({
-                  baseOffset: 0n,
-                  records: [record({ key: records[0][0].key, value: records[0][0].value })],
-                }).toString('hex'),
-              }),
-            ],
-            { acquisitionLockTimeoutMs: 30000 }
-          )
-        observed.assignment = () => {
-          const current = assignment()
-          if (!started && fetching && current[0]?.partitions.length === 3) {
-            started = true
-            verifierStarts.push(performance.now())
-            if (replayAt !== undefined || drainReplay) {
-              gate = transport.hold({ api: 'ShareFetch', node: 0 })
-              if (!drainReplay) {
-                replayDue = performance.now() + replayAt
-                setTimeout(() => gate.release(replay()), replayAt)
-              }
-            }
-          }
-          return current
-        }
-        observed.disconnect = async (options) => {
-          await io('verifier-disconnect', { owner, driver, clock })
-          if (drainReplay && gate?.settle) {
-            gate.release(replay())
-            await flush()
-          }
-          try {
-            return await disconnect(options)
-          } finally {
-            remove()
-          }
-        }
-        return observed
-      },
-      admin: () => external.admin(admin()),
-      producer: () =>
-        external.producer({
-          connect: async () => io('phase-open', { owner, driver, clock }),
-          disconnect: async () => {},
-          send: async ({ messages }) => {
-            const partition = messages[0].partition
-            const baseOffset = String(records[partition].length)
-            for (const message of messages)
-              records[partition].push({
-                ...message,
-                offset: String(records[partition].length),
-                settled: false,
-                owner: null,
-                count: 0,
-              })
-            return [{ partition, baseOffset, errorCode: 0 }]
-          },
-        }),
-    }
-    const driver = new ShareSoakDriver({
-      kafka,
-      shares: resources,
-      tap,
-      brokers: ['node0:9092'],
-      socketFactory: instrumented.socketFactory,
-      ports: {
-        fixtures,
-        diagnostics,
-        bounded: require('../../../src/producer/__tests__/fixtures/bounded'),
-        probe: require('../../../src/producer/__tests__/fixtures/liveProbe'),
-        readLog: external.reader(
-          async () =>
-            new Map(
-              records.map((rows, partition) => [
-                partition,
-                {
-                  endOffset: String(rows.length),
-                  records: rows.map(({ offset, key, value }) => ({ offset, key, value })),
-                },
-              ])
-            )
-        ),
-      },
-    })
-    const owner = new ShareSoak({
-      driver,
-      kafka,
-      shares: resources,
-      short,
-      stack: new CleanupStack(),
-      clock: { now: () => performance.now() },
-      pause: async (scope, ms) => {
-        await delay(scope, ms)
-        clock.skew(idleWakeMs)
-      },
-      gate: new LiveRun(),
-      evidence: {
-        read: () => rows,
-        write: (row) => {
-          if (row.event === 'soak-cycle') {
-            if (row.verifier) firstWindow ??= JSON.parse(JSON.stringify(row.verifier))
-            if (row.status === 'passed') damage(row, { owner, firstWindow, rows, clock })
-          }
-          if (row.event === 'soak-resources' && row.kind === 'teardown')
-            finalDamage(owner.final, { owner, rows, clock })
-          rows.push(row)
-          observeRow(row, { owner, driver, clock })
-        },
-      },
-    })
-    owner.prime = async () => {
-      owner.priming = { status: 'passed', topic: 'primed', groupId: 'primed', topicId: 'primed' }
-    }
-    let result
-    let error
-    let done = false
-    const work = owner
-      .run()
-      .then(
-        (value) => {
-          result = value
-        },
-        (failure) => {
-          error = failure
-        }
-      )
-      .finally(() => {
-        done = true
-      })
-    const cleanupErrors = []
-    try {
-      for (let tick = 0; tick <= owner.budget.totalMs / 250; tick++) {
-        if (done) break
-        // Drain response macrotasks at the replay boundary before advancing past the window.
-        const step = replayDue === undefined ? 250 : Math.max(0, replayDue - performance.now())
-        await clock.advance(Math.min(250, step))
-        if (performance.now() >= replayDue) replayDue = undefined
-      }
-      if (!done) throw new Error('The scripted schedule did not finish within its frozen envelope')
-      await work
-      cluster.assertClean()
-    } finally {
-      let closed = false
-      const closing = owner
-        .close()
-        .catch((failure) => cleanupErrors.push(failure))
-        .finally(() => {
-          closed = true
-        })
-      for (let tick = 0; tick < 100; tick++) {
-        if (closed) break
-        await clock.advance(250)
-      }
-      try {
-        await closing
-        await transport.close().catch((failure) => cleanupErrors.push(failure))
-        await flush()
-      } finally {
-        external.close()
-        resources.restore()
-        globalThis.gc = exposed
-        clock.restore()
-      }
-    }
-    if (cleanupErrors.length) {
-      if (error) error.cleanupErrors = cleanupErrors
-      else if (result?.ok === false) result.cleanupErrors = cleanupErrors
-      else throw cleanupErrors[0]
-    }
-    return {
-      owner,
-      rows,
-      result,
-      error,
-      records,
-      verifierStarts,
-      reason: error?.message ?? result?.violations.join('; '),
-    }
-  }
 
   /**
    * Checks original reset observations against primitive frames and immediate evidence rows.
@@ -6606,7 +6131,7 @@ describe('Share soak complete original-owner schedules', () => {
         )
         expect(new Set(joined.map(({ memberId }) => memberId)).size).toBe(3)
         for (const beat of beats.filter(({ response }) => response?.errorCode === 0)) {
-          expect(beat.response.heartbeatIntervalMs).toBe(5000)
+          expect(beat.response.heartbeatIntervalMs).toBe(beat.request.memberEpoch === -1 ? 0 : 5000)
           expect(beat.answeredAt).toBeGreaterThanOrEqual(beat.at)
           expect(beat.frames).toEqual(
             expect.arrayContaining([
@@ -7091,7 +6616,15 @@ describe('Share soak complete original-owner schedules', () => {
  * collection facts, the control agrees with itself and replays its frozen catalogue, every peak
  * covers its own and every earlier current reading, so only a deliberate change fails.
  */
-const AT = { startup: 0, loaded: 1, c0: 2, c1: 3, 'control-released': 4, settled: 10, final: 20 }
+const AT = {
+  startup: 0,
+  loaded: 1,
+  c0: 2004,
+  c1: 2005,
+  'control-released': 2006,
+  settled: 2010,
+  final: 2020,
+}
 const SETTLED = new Set(['c0', 'c1', 'control-released', 'settled'])
 const reading = (phase, over = {}) => {
   const r = {
@@ -7145,6 +6678,12 @@ const reference = () => ({
   control: {
     manifest: { kind: 'producer', topic: 't', joins: false, operations, lifecycles: 1 },
     outcomes: outcomes(),
+    warmup: {
+      startedAt: 1,
+      outcomes: [0, 1].map((n) => ({ n, status: 'fulfilled', at: 1.1 + n / 10 })),
+      idleStartedAt: 2,
+      completedAt: 2002,
+    },
     telemetryFrames: 0,
     openSockets: 0,
     leftoverHandles: 0,
@@ -7208,7 +6747,62 @@ describe('telemetry resource evidence', () => {
   })
   const evaluate = (input) => TelemetryResourceVerdict.evaluate(input)
 
-  test('detects 131072 B/min at actual irregular observation times while a pre-M0 constant escapes slope', () => {
+  test('rejects diagnostic or acceptance-ineligible inputs after JSON replay', () => {
+    for (const markers of [
+      { diagnostic: true },
+      { acceptanceEligible: false },
+      { diagnostic: true, acceptanceEligible: false },
+    ]) {
+      const input = JSON.parse(JSON.stringify({ ...run(), ...markers }))
+      const verdict = evaluate(input)
+      expect(verdict.ok).toBe(false)
+      expect(verdict.outcome).toBe('failed')
+      expect(verdict.violations).toEqual(['diagnostic inputs are not acceptance-eligible'])
+      expect(verdict.inconclusive).toEqual([])
+    }
+  })
+
+  test('preserves byte-identical unmarked verdicts and inputs for every outcome', () => {
+    const expected = {
+      ok: true,
+      outcome: 'passed',
+      violations: [],
+      inconclusive: [],
+      measured: {
+        samples: 11,
+        skippedSamples: 0,
+        slopeBytesPerMinute: 0,
+        endpointBytes: 0,
+        controlBaseRss: 73400320,
+        controlExternal: 4194304,
+        setupPeak: 83886080,
+        setupAllowanceBytes: 100663296,
+        peak: 83886080,
+        rssDelta: 10485760,
+        externalPeak: 4194304,
+        externalDelta: 0,
+        nativeJobs: 1,
+      },
+    }
+    for (const outcome of ['passed', 'failed', 'inconclusive']) {
+      const input = run()
+      if (outcome === 'failed') input.cleanupMs = 120001
+      if (outcome === 'inconclusive') input.reference.control.c1.rss += 2097153
+      const original = JSON.stringify(input)
+      expect(JSON.stringify(evaluate(input))).toBe(
+        JSON.stringify({
+          ...expected,
+          ok: outcome === 'passed',
+          outcome,
+          violations: outcome === 'failed' ? ['cleanup budget'] : [],
+          inconclusive: outcome === 'inconclusive' ? ['unstable control'] : [],
+        })
+      )
+      expect(JSON.stringify(input)).toBe(original)
+    }
+  })
+
+  test('reports irregular slopes without judging five-minute slope or endpoint', () => {
     const input = run()
     input.samples.forEach((sample, index) => {
       const jitter = index === 0 ? 0 : index % 2 ? 37 : -19
@@ -7220,7 +6814,7 @@ describe('telemetry resource evidence', () => {
       )
     })
     const result = evaluate(input)
-    expect(result.violations).toContain('retained slope')
+    expect(result.violations).not.toContain('retained slope')
     expect(result.measured.slopeBytesPerMinute).toBeCloseTo(131072, 0)
     expect(result.violations).not.toContain('retained endpoint')
     const plateau = run()
@@ -7256,14 +6850,13 @@ describe('telemetry resource evidence', () => {
       slopeBytesPerMinute: 65536,
       endpointBytes: 1048576,
       activeBytes: 8388608,
-      closedBytes: 262144,
       rssDeltaBytes: 67108864,
       externalDeltaBytes: 67108864,
       setupPeakBytes: 100663296,
       peakBytes: 167772160,
       controlRssDriftBytes: 2097152,
       controlRetainedDriftBytes: 262144,
-      noiseLoadPerCpu: 0.75,
+      noiseLoadPerCpu: 1.0,
       noiseFreeBytes: 268435456,
       noisePressure: 5,
     })
@@ -7409,34 +7002,11 @@ describe('telemetry resource evidence', () => {
       'sampler read failure',
     ],
     [
-      'closed transient overflow',
-      (r) => {
-        grow(r.teardown.memory, 262144 + 1)
-      },
-      'closed transient ceiling',
-    ],
-    [
       'active overflow',
       (r) => {
         grow(r.samples[5].snapshot.memory, 8388608 + 1)
       },
       'active retained ceiling',
-    ],
-    [
-      'steep slope',
-      (r) => {
-        r.samples.forEach((s, i) => {
-          grow(s.snapshot.memory, i * 32769)
-        })
-      },
-      'retained slope',
-    ],
-    [
-      'last endpoint',
-      (r) => {
-        grow(r.samples.at(-1).snapshot.memory, 1048576 + 1)
-      },
-      'retained endpoint',
     ],
   ])('rejects %s', (_name, change, label) => {
     const input = run()
@@ -7445,9 +7015,20 @@ describe('telemetry resource evidence', () => {
     expect(evaluate(input).ok).toBe(false)
   })
 
-  test('accepts the closed transient and active ceilings at equality', () => {
+  test.each(['steep slope', 'last endpoint'])(
+    'accepts %s within the remaining ceilings',
+    (shape) => {
+      const input = run()
+      if (shape === 'steep slope')
+        input.samples.forEach((sample, i) => grow(sample.snapshot.memory, i * 32769))
+      else grow(input.samples.at(-1).snapshot.memory, 1048576 + 1)
+      expect(evaluate(input)).toMatchObject({ ok: true, violations: [] })
+    }
+  )
+
+  test('accepts closed growth above 256 KiB while keeping the active ceiling at equality', () => {
     const input = run()
-    grow(input.teardown.memory, 262144)
+    grow(input.teardown.memory, 262145)
     input.samples.forEach((s) => grow(s.snapshot.memory, 8388608))
     expect(evaluate(input).ok).toBe(true)
   })
@@ -7517,6 +7098,48 @@ describe('telemetry resident-size reference', () => {
     }
   }
 
+  test.each([
+    ['missing', (c) => delete c.warmup],
+    ['incomplete', (c) => c.warmup.outcomes.pop()],
+    ['rejected', (c) => (c.warmup.outcomes[0].status = 'rejected')],
+    ['misnumbered', (c) => (c.warmup.outcomes[0].n = 1)],
+    ['late', (c) => (c.warmup.completedAt = c.c0.at + 1)],
+    ['short idle', (c) => (c.warmup.completedAt = c.warmup.idleStartedAt + 1999)],
+    ['late operation', (c) => (c.warmup.outcomes[0].at = c.warmup.completedAt)],
+    ['unordered operations', (c) => (c.warmup.outcomes[1].at = 1.05)],
+    ['missing time', (c) => delete c.warmup.startedAt],
+    ['before loading', (c) => (c.warmup.startedAt = 0)],
+  ])('rejects %s telemetry control warm-up evidence', (_name, change) => {
+    const input = make()
+    expect(evaluate(input)).toMatchObject({ ok: true, violations: [] })
+    change(input.reference.control)
+    expect(evaluate(input)).toMatchObject({
+      ok: false,
+      outcome: 'failed',
+      violations: ['telemetry-disabled control warm-up'],
+    })
+  })
+
+  test('keeps both telemetry control drift boundaries after warm-up', () => {
+    for (const [field, limit] of [
+      ['rss', 2097152],
+      ['heapUsed', 262144],
+    ]) {
+      const input = make()
+      const control = input.reference.control
+      control.c1[field] += limit
+      if (field === 'heapUsed') control.c1.retained += limit
+      expect(evaluate(input)).toMatchObject({ ok: true, inconclusive: [] })
+      control.c1[field]++
+      if (field === 'heapUsed') control.c1.retained++
+      expect(evaluate(input)).toMatchObject({
+        ok: false,
+        outcome: 'inconclusive',
+        inconclusive: ['unstable control'],
+      })
+    }
+  })
+
   test('measures against the disabled control and no longer against an absolute 64 MiB', () => {
     const input = make()
     raise(input, 80 * MIB + 64 * MIB)
@@ -7528,6 +7151,131 @@ describe('telemetry resident-size reference', () => {
     expect(evaluate(inside).measured.rssDelta).toBe(64 * MIB)
     expect(evaluate(inside)).toMatchObject({ ok: true, outcome: 'passed' })
     expect(evaluate(make()).measured.peak).toBe(80 * MIB)
+  })
+
+  test('records every peak decrease and retains the running maximum', () => {
+    const input = make()
+    raise(input, 89 * MIB)
+    input.samples[4].snapshot.memory.hwm = 90 * MIB
+    input.samples[6].snapshot.memory.hwm = 88 * MIB
+    for (const row of [
+      ...input.samples.slice(5).map((s) => s.snapshot.memory),
+      input.teardown.memory,
+      input.reference.final,
+    ])
+      row.rawMaxRss = 299 * MIB
+    input.samples[6].snapshot.memory.rawMaxRss = 298 * MIB
+    const original = JSON.stringify(input)
+    const replay = JSON.parse(original)
+    const verdict = evaluate(replay)
+    expect(verdict).toMatchObject({ ok: true, outcome: 'passed', violations: [], inconclusive: [] })
+    expect(verdict.measured).toMatchObject({
+      peak: 90 * MIB,
+      rssDelta: 20 * MIB,
+      setupPeak: 80 * MIB,
+    })
+    expect(verdict.measured.peakDecreases).toEqual([
+      {
+        index: 11,
+        phase: 'settled',
+        field: 'rawMaxRss',
+        before: 300 * MIB,
+        after: 299 * MIB,
+        delta: -MIB,
+      },
+      { index: 11, phase: 'settled', field: 'hwm', before: 90 * MIB, after: 89 * MIB, delta: -MIB },
+      {
+        index: 12,
+        phase: 'settled',
+        field: 'rawMaxRss',
+        before: 299 * MIB,
+        after: 298 * MIB,
+        delta: -MIB,
+      },
+      { index: 12, phase: 'settled', field: 'hwm', before: 89 * MIB, after: 88 * MIB, delta: -MIB },
+    ])
+    expect(JSON.stringify(replay)).toBe(original)
+  })
+
+  test('records a peak counter read just below its own resident size and judges the larger reading', () => {
+    const input = make()
+    const { hwm } = input.teardown.memory
+    input.teardown.memory.rss = hwm + 52 * 1024
+    input.reference.final.hwm = hwm + 52 * 1024
+    const verdict = evaluate(input)
+    expect(verdict).toMatchObject({ ok: true, outcome: 'passed', violations: [], inconclusive: [] })
+    expect(verdict.measured.peakCoverage).toEqual([
+      expect.objectContaining({
+        phase: 'settled',
+        hwm,
+        covered: hwm + 52 * 1024,
+        shortfall: 52 * 1024,
+      }),
+    ])
+    expect(verdict.measured.peak).toBeGreaterThanOrEqual(hwm + 52 * 1024)
+  })
+
+  test.each([
+    [
+      'a peak counter below an earlier resident size',
+      (input) => {
+        input.baseline.memory.rss = 85 * MIB
+      },
+    ],
+    [
+      'a zero peak counter',
+      (input) => {
+        for (const reading of [
+          ...Object.values(input.reference).filter((r) => r && typeof r === 'object' && 'hwm' in r),
+          input.reference.control.c0,
+          input.reference.control.c1,
+          input.reference.control.released,
+          input.baseline.memory,
+          ...input.samples.map((sample) => sample.snapshot.memory),
+          input.teardown.memory,
+        ])
+          reading.hwm = 0
+      },
+    ],
+  ])('fails the peak series for %s', (_name, change) => {
+    const input = make()
+    change(input)
+    expect(evaluate(input).violations).toContain('resident-size peak series')
+  })
+
+  test('preserves setup, delta and absolute limits after a peak decrease', () => {
+    const input = make()
+    input.reference.control.c0.hwm = 96 * MIB + 1
+    input.samples[4].snapshot.memory.hwm = 160 * MIB + 1
+    const verdict = evaluate(input)
+    expect(verdict.measured).toMatchObject({
+      peak: 160 * MIB + 1,
+      setupPeak: 96 * MIB + 1,
+      rssDelta: 90 * MIB + 1,
+    })
+    expect(verdict.violations).toEqual([
+      'telemetry resident-size increase',
+      'absolute resident-size peak',
+    ])
+    expect(verdict.inconclusive).toEqual(['setup peak above its allowance'])
+    expect(verdict.measured.peakDecreases).toEqual([
+      {
+        index: 3,
+        phase: 'c1',
+        field: 'hwm',
+        before: 96 * MIB + 1,
+        after: 80 * MIB,
+        delta: -16 * MIB - 1,
+      },
+      {
+        index: 11,
+        phase: 'settled',
+        field: 'hwm',
+        before: 160 * MIB + 1,
+        after: 80 * MIB,
+        delta: -80 * MIB - 1,
+      },
+    ])
   })
 
   test('holds the absolute backstop and the increase together at equality, one byte over fails both', () => {
@@ -7565,6 +7313,18 @@ describe('telemetry resident-size reference', () => {
     expect(evaluate(input).violations).toContain('external-memory increase')
   })
 
+  test('records a control resident-size decrease without marking the control unstable', () => {
+    const input = make()
+    input.reference.control.c1.rss -= 6 * MIB + 448 * 1024
+    const verdict = evaluate(input)
+    expect(verdict.inconclusive).not.toContain('unstable control')
+    expect(verdict.measured.controlRssDecrease).toBe(6 * MIB + 448 * 1024)
+    const grown = make()
+    grown.reference.control.c1.rss += 2 * MIB + 1
+    expect(evaluate(grown).inconclusive).toContain('unstable control')
+    expect(evaluate(grown).measured).not.toHaveProperty('controlRssDecrease')
+  })
+
   test('is inconclusive for an unstable control, an inflated setup or a missing capability', () => {
     const drift = make()
     drift.reference.control.c1.rss += 2 * MIB + 1
@@ -7590,6 +7350,109 @@ describe('telemetry resident-size reference', () => {
     const capability = make()
     capability.reference.capability.gc = false
     expect(evaluate(capability)).toMatchObject({ ok: false, outcome: 'inconclusive' })
+  })
+
+  /** Every reading that reaches the setup peak or the overall peak, as one high water would. */
+  const readingsOf = (input) => [
+    input.reference.loaded,
+    input.reference.control.c0,
+    input.reference.control.c1,
+    input.reference.control.released,
+    input.baseline.memory,
+    ...input.samples.map((s) => s.snapshot.memory),
+    input.teardown.memory,
+    input.reference.final,
+  ]
+  const setPeak = (input, hwm) => readingsOf(input).forEach((memory) => (memory.hwm = hwm))
+  /** A share-consumer reference that records the allocation and setup allowance it was run under. */
+  const shareInput = () => {
+    const { declaredJournalBytes } = require('../telemetryChurn')
+    const declared = declaredJournalBytes('shareConsumer', TELEMETRY)
+    const input = make()
+    input.reference.control.kind = 'shareConsumer'
+    input.reference.journals = {
+      allocation: { byteLength: declared },
+      setupAllowanceBytes: 96 * MIB + declared,
+    }
+    return { input, declared }
+  }
+
+  test('allows the share consumer a setup peak of 96 MiB plus its exact declared journal bytes and no more', () => {
+    const { input, declared } = shareInput()
+    expect(declared).toBe(23192560)
+    setPeak(input, 96 * MIB + declared)
+    expect(evaluate(input)).toMatchObject({
+      ok: true,
+      outcome: 'passed',
+      violations: [],
+      inconclusive: [],
+      measured: { setupPeak: 96 * MIB + declared, setupAllowanceBytes: 96 * MIB + declared },
+    })
+    setPeak(input, 96 * MIB + declared + 1)
+    expect(evaluate(input)).toMatchObject({
+      ok: false,
+      outcome: 'inconclusive',
+      violations: [],
+      inconclusive: ['setup peak above its allowance'],
+    })
+  })
+
+  test('keeps the 96 MiB setup allowance for every other client kind', () => {
+    for (const kind of ['producer', 'consumer', 'admin']) {
+      const input = make()
+      input.reference.control.kind = kind
+      setPeak(input, 96 * MIB)
+      expect(evaluate(input)).toMatchObject({
+        ok: true,
+        measured: { setupPeak: 96 * MIB, setupAllowanceBytes: 96 * MIB },
+      })
+      setPeak(input, 96 * MIB + 1)
+      expect(evaluate(input).inconclusive).toEqual(['setup peak above its allowance'])
+    }
+  })
+
+  test('never raises the 64 MiB increase or the 160 MiB peak for the share consumer', () => {
+    const { input } = shareInput()
+    raise(input, 70 * MIB + 64 * MIB)
+    expect(evaluate(input)).toMatchObject({ ok: true, violations: [], inconclusive: [] })
+    raise(input, 70 * MIB + 64 * MIB + 1)
+    expect(evaluate(input).violations).toEqual(['telemetry resident-size increase'])
+    raise(input, 160 * MIB + 1)
+    expect(evaluate(input).violations).toEqual([
+      'telemetry resident-size increase',
+      'absolute resident-size peak',
+    ])
+  })
+
+  test('rejects a recorded setup allowance or declared allocation that differs from the recomputed value', () => {
+    expect(evaluate(shareInput().input).violations).toEqual([])
+    for (const [change, violations] of [
+      [(journals) => journals.setupAllowanceBytes++, ['recorded setup allowance']],
+      [(journals) => journals.setupAllowanceBytes--, ['recorded setup allowance']],
+      [(journals) => (journals.setupAllowanceBytes = 96 * MIB), ['recorded setup allowance']],
+      [(journals) => delete journals.setupAllowanceBytes, ['recorded setup allowance']],
+      [(journals) => journals.allocation.byteLength++, ['declared journal bytes']],
+      [(journals) => journals.allocation.byteLength--, ['declared journal bytes']],
+      [(journals) => delete journals.allocation, ['declared journal bytes']],
+    ]) {
+      const { input } = shareInput()
+      change(input.reference.journals)
+      expect(evaluate(input)).toMatchObject({ ok: false, outcome: 'failed', violations })
+    }
+    const missing = shareInput().input
+    delete missing.reference.journals
+    expect(evaluate(missing).violations).toEqual([
+      'recorded setup allowance',
+      'declared journal bytes',
+    ])
+    const relabelled = shareInput().input
+    relabelled.reference.control.kind = 'producer'
+    expect(evaluate(relabelled).violations).toEqual(['recorded setup allowance'])
+    const plain = make()
+    plain.reference.journals = { setupAllowanceBytes: 96 * MIB + 1 }
+    expect(evaluate(plain).violations).toEqual(['recorded setup allowance'])
+    plain.reference.journals.setupAllowanceBytes = 96 * MIB
+    expect(evaluate(plain)).toMatchObject({ ok: true, violations: [] })
   })
 
   test('lets a failure take precedence over an inconclusive measurement', () => {
@@ -7620,20 +7483,6 @@ describe('telemetry resident-size reference', () => {
     ],
     ['an absent reference', (r) => delete r.reference, 'resident-size reference facts'],
     ['a wrong peak source', (r) => (r.reference.source = 'maxrss'), 'resident-size peak source'],
-    [
-      'a decreasing peak',
-      (r) => {
-        r.samples[6].snapshot.memory.hwm = 75 * MIB
-      },
-      'resident-size peak series',
-    ],
-    [
-      'a peak below its own reading',
-      (r) => {
-        r.baseline.memory.rss = 85 * MIB
-      },
-      'resident-size peak series',
-    ],
     [
       'a missing reading field',
       (r) => {
@@ -7773,9 +7622,46 @@ describe('telemetry resident-size reference', () => {
     expect(verdict.inconclusive).toContain('resident-size peak capability')
   })
 
+  test('uses a load-per-CPU ceiling of one only for the telemetry verdict', () => {
+    for (const name of ['before', 'boundary', 'after']) {
+      for (const loadPerCpu of [0.99, 1.0, 1.01]) {
+        const input = make()
+        const context = input.reference.host[name]
+        context.loadPerCpu = loadPerCpu
+        context.load1 = context.cpus * loadPerCpu
+        expect(evaluate(input)).toMatchObject({
+          ok: loadPerCpu <= 1,
+          outcome: loadPerCpu <= 1 ? 'passed' : 'inconclusive',
+          violations: [],
+          inconclusive: loadPerCpu <= 1 ? [] : [`host noise ${name}`],
+        })
+      }
+    }
+  })
+
+  test('keeps the long-window noise ceiling at 0.75 load per CPU when that lane is selected', () => {
+    const previous = process.env.TELEMETRY_LONG_WINDOW
+    let LongVerdict
+    try {
+      process.env.TELEMETRY_LONG_WINDOW = '1'
+      jest.isolateModules(() => {
+        LongVerdict = require('../soak').TelemetryResourceVerdict
+      })
+    } finally {
+      if (previous === undefined) delete process.env.TELEMETRY_LONG_WINDOW
+      else process.env.TELEMETRY_LONG_WINDOW = previous
+    }
+    const input = make()
+    const context = input.reference.host.before
+    context.loadPerCpu = 0.9
+    context.load1 = context.cpus * 0.9
+    expect(LongVerdict.evaluate(input).inconclusive).toContain('host noise before')
+    expect(evaluate(input).inconclusive).not.toContain('host noise before')
+  })
+
   test('is inconclusive on a noisy host and keeps the unavailable pressure capability visible', () => {
     const loaded = make()
-    loaded.reference.host.before.load1 = 3.1
+    loaded.reference.host.before.load1 = 4.04
     expect(evaluate(loaded).inconclusive).toContain('host noise before')
     const memory = make()
     memory.reference.host.after.freeBytes = 268435455

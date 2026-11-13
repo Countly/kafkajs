@@ -430,6 +430,7 @@ describe('telemetry resource documentation', () => {
       expect(telemetry).toContain(value)
     expect(telemetry).toContain('not measured results from a unit test')
     expect(telemetry).toContain('one occupied shell')
+    expect(telemetry).toContain('five-minute verdict does not judge closed growth')
     expect(testing).toContain('arrayBuffers is already included in external')
     expect(testing).toContain('Four one-client workers prevent memory averaging')
   })
@@ -444,6 +445,35 @@ describe('telemetry resource documentation', () => {
     expect(testing).not.toMatch(/absolute lifetime peak RSS at most 64 MiB/)
     expect(telemetry).toContain('refused before either selection array is built')
     expect(telemetry).toContain('64 MiB above')
+    for (const document of [testing, telemetry]) {
+      expect(document).toContain(
+        'Δdata = Δ(heapUsed + external) − Δ(V8 code_and_metadata_size + bytecode_and_metadata_size)'
+      )
+      expect(document).toContain('first use M − M0 ≤ 1 MiB')
+      expect(document).toContain('measured warm-up lifecycle')
+      expect(document).toContain('schema 6')
+      expect(document).toContain('96 MiB plus its declared journal bytes')
+      expect(document).toContain('shadow only')
+    }
+    for (const document of [telemetry, squeeze('docs/TelemetryJournals.md')]) {
+      expect(document).toContain('closed data below −256 KiB is recorded as facts')
+      expect(document).toContain('unsettled active readings are recorded as facts')
+    }
+    expect(testing).toContain('closed data below −256 KiB is recorded as facts')
+    expect(testing).toContain('the five-minute lane no longer judges a closed ceiling')
+    expect(testing).not.toContain('below −256 KiB is inconclusive')
+    expect(testing).toContain('may take up to twelve collection rounds')
+    expect(testing).toContain('first runs its catalogue and idle window once before C0')
+    expect(testing).toContain('legacy unseeded arm is a contamination-positive control')
+    expect(testing).toContain('live-flags control')
+    expect(testing).toContain('23,192,560')
+    expect(testing).toContain('123,855,856')
+    expect(testing).toContain('one-minute load per CPU above 1.0')
+    expect(testing).toContain('resource verifier keeps its load-per-CPU threshold at 0.75')
+    expect(testing).toContain('`--expose-gc --min-semi-space-size=1 --max-semi-space-size=1`')
+    expect(squeeze('docs/TelemetryJournals.md')).toContain(
+      '`WORKER_FLAGS`, `--expose-gc --min-semi-space-size=1 --max-semi-space-size=1`'
+    )
   })
 
   test('documents the churn method and the CI rows', () => {
@@ -451,7 +481,20 @@ describe('telemetry resource documentation', () => {
     expect(testing).toContain('selected by a rule over the transcript alone')
     expect(testing).toContain('nine distinct Node 24 rows, all on Kafka 4.4.0')
     expect(testing).toContain('required functional exit catalogue has 72 rows')
-    expect(telemetry).toContain('35 subscription transitions')
+    expect(telemetry).toContain('35 ordered subscription transitions')
+    expect(telemetry).toContain(
+      'Five public close/reopen cycles (seven segments including setup and initial)'
+    )
+    expect(testing).toContain(
+      'transition 1–7 at 70 s, 8–12 at 135 s, 13–18 at 195 s, 19–24 at 255 s and 25–35 at 350 s'
+    )
+    expect(telemetry).toContain('middle gaps at 135, 195 and 255 s')
+    expect(testing).toContain('All settled samples remain judged')
+    expect(testing).toContain(
+      '35 measured subscription transitions, 10 measured retirements and five measured reopens'
+    )
+    expect(testing).toContain('seven per kind: setup, initial and five reopens')
+    expect(testing).not.toContain('eight public close/reopen cycles')
   })
 
   test('retains the long-run obligation and the changelog lines', () => {

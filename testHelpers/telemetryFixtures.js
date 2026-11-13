@@ -42,12 +42,17 @@ const canonicalUuid = (value) => {
 class TelemetryExportReader {
   /**
    * @param {string} directory fresh absolute run sink directory
+   * @param {object} [options] sink limits; the existing lane keeps its 2 MiB file cap
+   * @param {number} [options.fileBytes] maximum bytes of each complete node sink
    * @returns {TelemetryExportReader} bounded reader
    * @throws {Error} for a relative directory
    */
-  constructor(directory) {
+  constructor(directory, { fileBytes = FILE_CAP } = {}) {
     if (!path.isAbsolute(directory)) throw new Error('Expected an absolute export directory')
+    if (!Number.isSafeInteger(fileBytes) || fileBytes < 1)
+      throw new Error('Expected a positive sink file cap')
     this.directory = directory
+    this.fileBytes = fileBytes
   }
 
   /**
@@ -96,23 +101,14 @@ class TelemetryExportReader {
         if (error.code === 'ENOENT' && !(after[node] > 0)) continue
         throw error
       }
-      let bytes
+      let rows
       try {
         const stat = fs.fstatSync(fd)
-        if (!stat.isFile() || stat.size > FILE_CAP) throw new Error('Telemetry sink file cap')
-        bytes = Buffer.alloc(stat.size)
-        if (fs.readSync(fd, bytes, 0, bytes.length, 0) !== bytes.length)
-          throw new Error('Telemetry sink changed during read')
+        if (!stat.isFile() || stat.size > this.fileBytes) throw new Error('Telemetry sink file cap')
+        rows = this.#readRows(fd, stat.size)
       } finally {
         fs.closeSync(fd)
       }
-      const end = bytes.lastIndexOf(10)
-      if (bytes.length - end - 1 > RECORD_CAP) throw new Error('Telemetry sink record cap')
-      const lines = end < 0 ? [] : bytes.subarray(0, end).toString('utf8').split('\n')
-      const rows = lines.map((line) => {
-        if (Buffer.byteLength(line) > RECORD_CAP) throw new Error('Telemetry sink record cap')
-        return JSON.parse(line)
-      })
       // Reporter callbacks assign identities before concurrently enqueueing their rows.
       rows.sort((a, b) => a.seq - b.seq)
       let previous = 0
@@ -144,6 +140,44 @@ class TelemetryExportReader {
     }
     checkOverflow()
     return result
+  }
+
+  /**
+   * Parses complete JSONL records from the original stat-sized snapshot with an 8 KiB scratch
+   * buffer. UTF-8 is decoded only after a full line is present; a bounded unfinished tail is
+   * retried on the next read. Every complete row is retained for the unchanged ordering and
+   * validation pass. No sink bytes, cursors or evidence are rewritten, cached or dropped.
+   * @param {number} fd original no-follow file descriptor
+   * @param {number} size bounded size captured before reading
+   * @returns {object[]} complete source rows in their original file order
+   * @throws {Error|SyntaxError} for a short read, overlong record or malformed complete JSON
+   */
+  #readRows(fd, size) {
+    if (size === 0) return []
+    const buffer = Buffer.alloc(2 * RECORD_CAP)
+    const rows = []
+    let kept = 0
+    for (let position = 0; position < size;) {
+      const length = Math.min(RECORD_CAP, size - position)
+      if (fs.readSync(fd, buffer, kept, length, position) !== length)
+        throw new Error('Telemetry sink changed during read')
+      position += length
+      const end = kept + length
+      const bytes = buffer.subarray(0, end)
+      let start = 0
+      let newline
+      while ((newline = bytes.indexOf(10, start)) !== -1) {
+        if (newline - start > RECORD_CAP) throw new Error('Telemetry sink record cap')
+        const line = bytes.toString('utf8', start, newline)
+        if (Buffer.byteLength(line) > RECORD_CAP) throw new Error('Telemetry sink record cap')
+        rows.push(JSON.parse(line))
+        start = newline + 1
+      }
+      kept = end - start
+      if (kept > RECORD_CAP) throw new Error('Telemetry sink record cap')
+      buffer.copy(buffer, 0, start, end)
+    }
+    return rows
   }
 }
 
@@ -346,8 +380,10 @@ const withTelemetryResource = async (
  * @returns {object[]} bounded independent exporter records
  * @throws {Error} for absent configuration or corrupt evidence
  */
-const readExports = (options) =>
-  new TelemetryExportReader(process.env.TELEMETRY_EVIDENCE_DIR || '').readExports(options)
+const readExports = ({ fileBytes, ...options } = {}) =>
+  new TelemetryExportReader(process.env.TELEMETRY_EVIDENCE_DIR || '', { fileBytes }).readExports(
+    options
+  )
 
 const ENDPOINTS = Object.freeze({
   configured: Object.freeze({ 19092: '1', 19095: '2', 19098: '3' }),
@@ -647,7 +683,9 @@ const parseRequest = (prefix, length) => {
     head.compressionType = cursor.int8()
     const size = cursor.varuint() - 1
     if (size < 0) throw new Error('Null PushTelemetry metrics')
-    head.blob = Buffer.from(cursor.take(size))
+    const bytes = cursor.take(size)
+    head.blob = Buffer.alloc(size)
+    bytes.copy(head.blob)
   }
   cursor.tags()
   cursor.done()
@@ -734,6 +772,24 @@ const decompress = (type, blob) => {
 const sha256 = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex')
 
 /**
+ * Joins public disconnect without an observer receiver in its awaited stack frame. Only the
+ * client, original options, borrowed clock and scalar close receipt enter this boundary.
+ * @param {object} client public client
+ * @param {object|undefined} options original disconnect arguments
+ * @param {{now:function():number}} clock borrowed monotonic clock
+ * @param {{at:number,pending:string[],end?:number}} close scalar close receipt
+ * @returns {Promise<void>} after disconnect and receipt completion
+ * @throws {*} the original disconnect failure, without reading its stack
+ */
+const closeObservedClient = async (client, options, clock, close) => {
+  try {
+    await client.disconnect(options)
+  } finally {
+    close.end = clock.now()
+  }
+}
+
+/**
  * Observes the real client sockets of one public client, independently of the library. It wraps
  * `write`, listens to `data`, and records normal and telemetry traffic, so tests can join actual
  * accepted Push requests to the broker sinks and to an independent Java decode. It never changes
@@ -779,6 +835,7 @@ class TelemetryWireObserver {
    * @param {function(object, function):object} [options.dial] socket dialer, `net.connect` by default
    * @param {boolean} [options.completeStream=false] decode every accepted nonempty Push before disposal
    * @param {Partial<typeof DEFAULT_LIMITS>} [options.limits] lower bounds for controls
+   * @param {number} [options.sinkBytes] sink file cap; omitted for the existing lane
    * @param {function(Buffer, number):Promise<object>} [options.decoder] decoder seam for controls
    * @param {string} [options.decoderScript] runner script, `scripts/e2e/telemetry/run.sh` by default
    * @param {object} [options.env] environment of the decoder child
@@ -795,6 +852,7 @@ class TelemetryWireObserver {
     owner = 'client',
     dial = net.connect,
     limits = {},
+    sinkBytes,
     decoder,
     completeStream = false,
     decoderScript = DECODER_SCRIPT,
@@ -823,7 +881,7 @@ class TelemetryWireObserver {
     this.#line = line
     this.#decoder = decoder
     this.#owner = owner
-    this.#reader = new TelemetryExportReader(directory)
+    this.#reader = new TelemetryExportReader(directory, { fileBytes: sinkBytes })
     this.directory = fs.mkdtempSync(path.join(directory, 'observer-'))
     this.tmp = path.join(this.directory, 'tmp')
     fs.mkdirSync(this.tmp)
@@ -855,24 +913,24 @@ class TelemetryWireObserver {
    * @returns {Promise<void>} after the original disconnect settles
    * @throws {*} the original disconnect failure
    */
-  async closeClient(client, options) {
-    const close = {
-      at: this.#clock.now(),
-      pending: this.#records
-        .filter(
-          (r) =>
-            r.type === 'request' &&
-            TELEMETRY_APIS.has(r.apiKey) &&
-            !r.response &&
-            !this.#sockets.get(r.socketId).closed
-        )
-        .map((r) => r.requestKey),
-    }
-    this.#closures.push(close)
+  closeClient(client, options) {
     try {
-      await client.disconnect(options)
-    } finally {
-      close.end = this.#clock.now()
+      const close = {
+        at: this.#clock.now(),
+        pending: this.#records
+          .filter(
+            (r) =>
+              r.type === 'request' &&
+              TELEMETRY_APIS.has(r.apiKey) &&
+              !r.response &&
+              !this.#sockets.get(r.socketId).closed
+          )
+          .map((r) => r.requestKey),
+      }
+      this.#closures.push(close)
+      return closeObservedClient(client, options, this.#clock, close)
+    } catch (error) {
+      return Promise.reject(error)
     }
   }
 
@@ -898,9 +956,16 @@ class TelemetryWireObserver {
     return [...this.#sockets.values()].filter((state) => !state.closed).length
   }
 
-  /** @returns {Promise<void>} once every socket issued so far has closed */
+  /**
+   * After disposal, an unclosed socket remains an unresolved cleanup failure.
+   * @returns {Promise<void>} once every socket issued so far has closed
+   */
   async socketsClosed() {
-    await Promise.all([...this.#sockets.values()].map((state) => state.closedPromise))
+    await Promise.all(
+      [...this.#sockets.values()].map(
+        (state) => state.closedPromise ?? (state.closed ? undefined : new Promise(() => {}))
+      )
+    )
   }
 
   /**
@@ -1241,7 +1306,8 @@ class TelemetryWireObserver {
 
   /**
    * Detaches every listener and write wrapper, joins decoder children and cancels retry timers.
-   * It never destroys a client socket: surviving sockets are retained in the resource ledger.
+   * It never destroys a client socket: surviving socket identities stay in the resource ledger.
+   * Retains scalar evidence only, releasing socket callbacks and frame parsers after detachment.
    * Idempotent; later calls return the first disposal.
    * @returns {Promise<void>} when no owned child, timer or listener remains
    */
@@ -1700,11 +1766,22 @@ class TelemetryWireObserver {
     this.#timers.clear()
     for (const child of this.#children) this.#signalGroup(child.pid, 'SIGTERM')
     await Promise.allSettled([...this.#children].map((child) => child.done))
-    for (const state of this.#sockets.values()) {
+    for (const [id, state] of this.#sockets) {
       if (!state.closed) {
         this.#stillOpen.push(state.id)
       }
       state.detach()
+      this.#sockets.set(id, {
+        id,
+        port: state.port,
+        node: state.node,
+        kind: state.kind,
+        closed: state.closed,
+        closedAt: state.closedAt,
+        attached: false,
+        foregroundBootstrap: state.foregroundBootstrap,
+        ranges: state.ranges,
+      })
     }
     try {
       fs.writeFileSync(
@@ -1714,7 +1791,7 @@ class TelemetryWireObserver {
           closures: this.#closures,
           faults: this.#faults,
           cancellations: this.#cancellations,
-          records: this.#records.map(copy),
+          records: this.#records,
           sockets: [...this.#sockets.values()].map(
             ({ id, kind, node, foregroundBootstrap, closedAt }) => ({
               id,
@@ -2037,6 +2114,7 @@ const verifyMetricWindows = ({ kind, samples, requests, connects, delta }) => {
 module.exports = {
   readCreatedTopicConfig,
   canonicalUuid,
+  checkedResource,
   DecoderGate,
   DecoderMemory,
   OBSERVER_LIMITS: DEFAULT_LIMITS,

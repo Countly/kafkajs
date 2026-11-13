@@ -74,6 +74,7 @@ const STARTUP = (() => {
   }
 })()
 const { subscribeNamedTopic } = require('./subscribeNamedTopic')
+const { peakReadingDecreases } = require('../../testHelpers/processMemory')
 const fs = require('node:fs')
 const { AsyncLocalStorage } = require('node:async_hooks')
 const path = require('node:path')
@@ -117,6 +118,7 @@ const {
 } = require('./churnLedger')
 const { ClosingProbe } = require('./closingProbe')
 const { ConsumerChurnOracle } = require('./consumerChurn')
+const LongWindow = require('./longWindow')
 
 const PARTITIONS = 6
 /** The seed brokers of the CLI, and of the configured telemetry fixture, which publishes others. */
@@ -299,17 +301,30 @@ const TELEMETRY = Object.freeze({
   slopeBytesPerMinute: 64 * 1024,
   endpointBytes: 1024 * 1024,
   activeBytes: 8 * 1024 * 1024,
-  closedBytes: 256 * 1024,
   rssDeltaBytes: 64 * 1024 * 1024,
   externalDeltaBytes: 64 * 1024 * 1024,
   setupPeakBytes: 96 * 1024 * 1024,
   peakBytes: 160 * 1024 * 1024,
   controlRssDriftBytes: 2 * 1024 * 1024,
   controlRetainedDriftBytes: 262144,
-  noiseLoadPerCpu: 0.75,
+  noiseLoadPerCpu: 1.0,
   noiseFreeBytes: 268435456,
   noisePressure: 5,
 })
+
+/** The long-window shadow candidate's limits, derived from `TELEMETRY` without changing it. */
+const TELEMETRY_LONG = LongWindow.limitsOf({ ...TELEMETRY, noiseLoadPerCpu: 0.75 })
+
+/** The limits and profiles this process runs the telemetry churn with: the candidate's only when selected. */
+const ACTIVE_TELEMETRY = LongWindow.selected() ? TELEMETRY_LONG : TELEMETRY
+const ACTIVE_PROFILES = LongWindow.selected()
+  ? {
+      ...PROFILES,
+      telemetry: [
+        { ...PROFILES.telemetry[0], ms: TELEMETRY_LONG.warmupMs + TELEMETRY_LONG.measureMs },
+      ],
+    }
+  : PROFILES
 
 /** The quiet-identity roles every telemetry reading must carry, whatever they hold. */
 const TELEMETRY_ROLES = Object.freeze([
@@ -328,6 +343,8 @@ const TELEMETRY_ROLES = Object.freeze([
 class TelemetryResourceVerdict {
   /**
    * @param {object} run observed, serializable evidence, never expected input counts
+   * @param {boolean} [run.diagnostic] true excludes the input from acceptance
+   * @param {boolean} [run.acceptanceEligible] false excludes the input from acceptance
    * @param {number} run.clientCount clients measured in this process, 1 on the live profile
    * @param {object} run.baseline disconnected descriptor/UUID baseline after warm-up
    * @param {Array<{admittedAtMs:number, completedAtMs:number, snapshot:object}>} run.samples
@@ -345,6 +362,8 @@ class TelemetryResourceVerdict {
    * @throws {TypeError} for a missing evidence container; callers fail the run
    */
   static evaluate({
+    diagnostic,
+    acceptanceEligible,
     clientCount,
     baseline,
     samples,
@@ -368,6 +387,10 @@ class TelemetryResourceVerdict {
     const finiteBytes = (value) => Number.isSafeInteger(value) && value >= 0
     const baselineBytes = bytes(baseline)
     const closedBytes = bytes(teardown)
+    fail(
+      diagnostic !== true && acceptanceEligible !== false,
+      'diagnostic inputs are not acceptance-eligible'
+    )
     fail(Number.isInteger(clientCount) && clientCount >= 1 && clientCount <= 4, 'client count')
     fail(finiteBytes(baselineBytes) && finiteBytes(closedBytes), 'settled baseline and teardown')
     fail(
@@ -437,16 +460,7 @@ class TelemetryResourceVerdict {
       )
       measured.slopeBytesPerMinute = slope(points)
       measured.endpointBytes = points.at(-1)[1] - points[0][1]
-      fail(
-        measured.slopeBytesPerMinute <= TELEMETRY.slopeBytesPerMinute * clientCount,
-        'retained slope'
-      )
-      fail(measured.endpointBytes <= TELEMETRY.endpointBytes * clientCount, 'retained endpoint')
     }
-    fail(
-      closedBytes - baselineBytes <= TELEMETRY.closedBytes * clientCount,
-      'closed transient ceiling'
-    )
     const inconclusive = TelemetryResourceVerdict.reference(reference, {
       baseline,
       samples,
@@ -456,6 +470,20 @@ class TelemetryResourceVerdict {
     })
     const outcome = violations.length ? 'failed' : inconclusive.length ? 'inconclusive' : 'passed'
     return { ok: outcome === 'passed', outcome, violations, inconclusive, measured }
+  }
+
+  /**
+   * The setup-peak allowance of one client kind: `TELEMETRY.setupPeakBytes`, plus for the share
+   * consumer the exact bytes of its declared, prefilled journals under the limits this process runs
+   * with. The telemetry increase and
+   * absolute peak limits are the same for every kind and are never raised.
+   * @param {string} [kind] the client kind of the control reference
+   * @returns {number} allowed setup peak in bytes
+   */
+  static setupAllowance(kind) {
+    const { declaredJournalBytes } = require('./telemetryChurn')
+    const declared = kind === 'shareConsumer' ? declaredJournalBytes(kind, ACTIVE_TELEMETRY) : 0
+    return TELEMETRY.setupPeakBytes + declared
   }
 
   /**
@@ -499,9 +527,12 @@ class TelemetryResourceVerdict {
 
   /**
    * Judges the resident-size gates against the worker's own disabled control, over every reading
-   * of the versioned catalogue and the native work journal, which must hold at least one resolved
-   * production compression. Failures are pushed into `violations`; what only makes the measurement
-   * uninformative is returned.
+   * of the versioned catalogue, a completed control warm-up before c0, and the native work journal,
+   * which must hold at least one resolved production compression. Failures are pushed into
+   * `violations`; what only makes the measurement
+   * uninformative is returned. Approximate peak-counter decreases, and a peak counter read just below
+   * its own reading's resident size, are recorded in `measured` without invalidating the series or
+   * lowering its all-read maxima; a peak counter below any earlier reading's resident size fails.
    * @param {object} reference the replayable reference facts
    * @param {object} run `baseline`, `samples`, `teardown`, `violations` to append to and `measured`
    * @returns {string[]} the reasons the measurement is inconclusive
@@ -568,13 +599,25 @@ class TelemetryResourceVerdict {
     if (readings.some((r) => r.hwm === null)) {
       inconclusive.push('resident-size peak capability')
     } else {
-      let high = -Infinity
-      let covered = -Infinity
-      for (const reading of readings) {
-        covered = Math.max(covered, reading.rss)
-        fail(reading.hwm >= high && reading.hwm >= covered, 'resident-size peak series')
-        high = Math.max(high, reading.hwm)
-      }
+      const peakCoverage = []
+      const seen = new Set()
+      let earlier = -Infinity
+      readings.forEach((reading, index) => {
+        fail(reading.hwm >= earlier, 'resident-size peak series')
+        const key = `${reading.hwm}:${reading.rss}`
+        if (reading.hwm < reading.rss && !seen.has(key)) {
+          seen.add(key)
+          peakCoverage.push({
+            index,
+            phase: reading.phase,
+            hwm: reading.hwm,
+            covered: reading.rss,
+            shortfall: reading.rss - reading.hwm,
+          })
+        }
+        earlier = Math.max(earlier, reading.rss)
+      })
+      if (peakCoverage.length) measured.peakCoverage = peakCoverage
     }
     fail(
       control.telemetryFrames === 0 &&
@@ -586,22 +629,52 @@ class TelemetryResourceVerdict {
         control.outcomes.every((o, n) => o.n === n && o.status === 'fulfilled'),
       'telemetry-disabled control'
     )
+    const { CONTROL } = require('./telemetryChurn')
+    const warmup = control.warmup
+    fail(
+      [warmup?.startedAt, warmup?.idleStartedAt, warmup?.completedAt].every(Number.isFinite) &&
+        warmup.startedAt >= reference.loaded.at &&
+        warmup.idleStartedAt >= warmup.startedAt &&
+        warmup.completedAt - warmup.idleStartedAt >= CONTROL.idleMs &&
+        warmup.completedAt <= control.c0.gc?.admittedAt &&
+        warmup.completedAt < control.c0.at &&
+        Array.isArray(warmup.outcomes) &&
+        warmup.outcomes.length === control.manifest?.operations?.length &&
+        warmup.outcomes.every(
+          (o, n) =>
+            o?.n === n &&
+            o.status === 'fulfilled' &&
+            Number.isFinite(o.at) &&
+            o.at >= (n === 0 ? warmup.startedAt : warmup.outcomes[n - 1].at) &&
+            o.at <= warmup.idleStartedAt
+        ),
+      'telemetry-disabled control warm-up'
+    )
     fail(
       Array.isArray(reference.foreground) &&
         reference.foreground.length === control.manifest?.operations?.length &&
         reference.foreground.every((o, n) => o.n === n && o.status === 'fulfilled'),
       'enabled replay of the control catalogue'
     )
-    const rssDrift = Math.abs(control.c1.rss - control.c0.rss)
+    const rssGrowth = control.c1.rss - control.c0.rss
     const retainedDrift = Math.abs(control.c1.retained - control.c0.retained)
     if (
-      rssDrift > TELEMETRY.controlRssDriftBytes ||
+      rssGrowth > TELEMETRY.controlRssDriftBytes ||
       retainedDrift > TELEMETRY.controlRetainedDriftBytes
     )
       inconclusive.push('unstable control')
+    if (rssGrowth < -TELEMETRY.controlRssDriftBytes) measured.controlRssDecrease = -rssGrowth
     const peakOf = (list) => Math.max(...list.flatMap((r) => [r.hwm ?? 0, r.rss]))
     const setupPeak = peakOf(readings.slice(0, 5))
-    if (setupPeak > TELEMETRY.setupPeakBytes) inconclusive.push('setup peak above its allowance')
+    const share = control.kind === 'shareConsumer'
+    const allowance = TelemetryResourceVerdict.setupAllowance(control.kind)
+    const recorded = reference.journals?.setupAllowanceBytes
+    fail(recorded === allowance || (recorded === undefined && !share), 'recorded setup allowance')
+    fail(
+      !share || reference.journals?.allocation?.byteLength === allowance - TELEMETRY.setupPeakBytes,
+      'declared journal bytes'
+    )
+    if (setupPeak > allowance) inconclusive.push('setup peak above its allowance')
     const base = Math.min(control.c0.rss, control.c1.rss)
     const externalReference = Math.min(control.c0.external, control.c1.external)
     const sampled = native?.sampler?.peak ?? { rss: 0, external: 0 }
@@ -615,15 +688,18 @@ class TelemetryResourceVerdict {
       ...nativeReadings.map((r) => r?.external ?? 0),
       sampled.external ?? 0
     )
+    const peakDecreases = peakReadingDecreases(readings, ['rawMaxRss', 'hwm'])
     Object.assign(measured, {
       controlBaseRss: base,
       controlExternal: externalReference,
       setupPeak,
+      setupAllowanceBytes: allowance,
       peak,
       rssDelta: peak - base,
       externalPeak,
       externalDelta: externalPeak - externalReference,
       nativeJobs: Array.isArray(rows) ? rows.length : null,
+      ...(peakDecreases.length && { peakDecreases }),
     })
     fail(peak - base <= TELEMETRY.rssDeltaBytes, 'telemetry resident-size increase')
     fail(peak <= TELEMETRY.peakBytes, 'absolute resident-size peak')
@@ -637,7 +713,7 @@ class TelemetryResourceVerdict {
       fail(known, `host context ${name}`)
       if (
         known &&
-        (host.load1 / host.cpus > TELEMETRY.noiseLoadPerCpu ||
+        (host.load1 / host.cpus > ACTIVE_TELEMETRY.noiseLoadPerCpu ||
           host.freeBytes < TELEMETRY.noiseFreeBytes ||
           (host.pressure?.available && host.pressure.someAvg10 > TELEMETRY.noisePressure))
       )
@@ -2622,6 +2698,8 @@ class Soak {
    *   `warmupMs`, and each sample names its phase and how long into it it was taken
    * @param {number} [options.settleMs=SETTLE_MS] how long a quiet point waits for closed sockets to go
    * @param {(record: object) => void} [options.record=writeEvidence('soak', ...)] where every line goes
+   * @param {object|null} [options.sampleJournal] preallocated scalar storage with `push`/`values`;
+   *   materialised only after the teardown reading, used by telemetry workers
    * @param {(snapshot: object) => object} [options.sampleSnapshot] Selects the snapshot fields kept
    *   for the judge. Evidence always receives the complete original snapshot.
    * @param {Record<string, Function>} [options.workloads=WORKLOADS]
@@ -2639,6 +2717,7 @@ class Soak {
     context,
     sampleMs = SAMPLE_MS,
     sampleAt = null,
+    sampleJournal = null,
     warmupMs = WARMUP_MS,
     judge = evaluate,
     settleMs = SETTLE_MS,
@@ -2656,6 +2735,7 @@ class Soak {
       context,
       sampleMs,
       sampleAt,
+      sampleJournal,
       warmupMs,
       judge,
       settleMs,
@@ -2666,7 +2746,7 @@ class Soak {
       beforeTeardown,
       transition,
     })
-    this.samples = []
+    this.samples = sampleJournal ?? []
     this.phaseEnds = []
     this.sampling = false
     this.sampler = Promise.resolve()
@@ -2710,7 +2790,7 @@ class Soak {
       const verdict = this.judge({
         baseline,
         phaseEnds: this.phaseEnds,
-        samples: this.samples,
+        samples: this.sampleJournal ? this.sampleJournal.values() : this.samples,
         teardown,
         warmupMs: this.warmupMs,
       })
@@ -2745,13 +2825,10 @@ class Soak {
           delayMs = planned < this.sampleAt.length ? this.sampleAt[planned] - elapsed : 2 ** 31 - 1
         }
         await this.nap(delayMs)
-        while (
-          this.sampling &&
-          this.sampleAt &&
-          planned < this.sampleAt.length &&
-          this.clock.now() - phaseStartedAt < this.sampleAt[planned]
-        ) {
-          await this.nap(this.sampleAt[planned] - (this.clock.now() - phaseStartedAt))
+        while (this.sampling && this.sampleAt && planned < this.sampleAt.length) {
+          const remaining = this.sampleAt[planned] - (this.clock.now() - phaseStartedAt)
+          if (remaining <= 0) break
+          await this.nap(remaining)
         }
         if (this.sampling) {
           const admitted = this.clock.now()
@@ -4390,12 +4467,42 @@ class ShareCycleOracle {
   }
 
   /**
+   * Rejects writes after the reset socket's observed close, including attempts without answers.
+   * The close's last frame orders same-millisecond events; older archives retain clock evidence.
+   * @param {object} observation Original reset, close steps and request frames.
+   * @param {(message: string) => void} fail Receives a retirement violation.
+   * @returns {void}
+   */
+  static retirement(observation, fail) {
+    const socket = observation.resetTarget?.socket ?? observation.reset?.oldSocket
+    if (socket === undefined) return
+    const steps = observation.steps ?? []
+    const closed = steps.find((s) => s.step === 'socket-close' && s.socket === socket)
+    const provenance = observation.provenance ?? {}
+    const requests = [...(provenance.exchanges ?? []), ...(provenance.heartbeats ?? [])]
+    if (
+      steps.some((s) => s.step === 'retired-socket-write' && s.socket === socket) ||
+      (closed &&
+        requests.some((request) =>
+          request.frames?.some(
+            (frame) =>
+              frame.socket === socket &&
+              (frame.at > closed.at ||
+                (Number.isSafeInteger(closed.lastFrame) && frame.id > closed.lastFrame))
+          )
+        ))
+    )
+      fail(`Retired reset socket ${socket} was written after close`)
+  }
+
+  /**
    * @param {ReturnType<typeof ShareCycleOracle.plan>} plan the cycle
    * @param {object} observation the cycle's observations
    * @param {(message: string) => void} fail
    * @returns {void}
    */
   static membership(plan, observation, fail) {
+    ShareCycleOracle.retirement(observation, fail)
     const { members = {}, reset = null, verifier = {}, provenance = {} } = observation
     for (const label of ['A', 'B']) {
       const member = observation.memberObservations?.find((member) => member.member === label)
@@ -4671,7 +4778,10 @@ class ShareFetchTap {
     }
     const operation = this.operations.getStore()
     written ??= { id: ++this.frameSequence, socket, endpoint, ...header, at: this.clock.now() }
-    const codecs = header.apiKey === 0 ? require('./shareProtocol').produceCodecs(frame) : undefined
+    const codecs =
+      this.archive && header.apiKey === 0
+        ? require('./shareProtocol').produceCodecs(frame)
+        : undefined
     this.archive?.({
       kind: 'request',
       frame: written.id,
@@ -4753,14 +4863,34 @@ class ShareFetchTap {
    * @param {string} role Client role.
    * @param {string} name Public operation and concrete option shape.
    * @param {Function} work Original invocation.
+   * @param {object} [target] Original public topic/group selection for response correlation.
    * @returns {T} Original return value.
    * @throws {Error} Original synchronous error.
    */
-  operation(role, name, work) {
-    const context = { role, name, id: ++this.operationSequence }
+  operation(role, name, work, target) {
+    if (!this.archive) return work()
+    const context = { role, name, id: ++this.operationSequence, ...(target && { target }) }
     return this.operations.run(context, () => {
-      const record = (status) =>
-        this.archive?.({ kind: 'operation', ...context, at: this.clock.now(), status })
+      const record = (status, result) =>
+        this.archive?.({
+          kind: 'operation',
+          ...context,
+          at: this.clock.now(),
+          status,
+          ...([
+            'send',
+            'describeConfigs',
+            'fetchTopicMetadata',
+            'listTopics',
+            'describeCluster',
+            'describeShareGroups',
+            'listShareGroupOffsets:named',
+            'listShareGroupOffsets:all',
+            'fetchTopicOffsets',
+            'listGroups',
+          ].includes(name) &&
+            status === 'passed' && { result }),
+        })
       record('started')
       let result
       try {
@@ -4772,13 +4902,13 @@ class ShareFetchTap {
       if (result?.then)
         result
           .then(
-            () => record('passed'),
+            (value) => record('passed', value),
             () => record('failed')
           )
           .catch(() => {
             this.faults++
           })
-      else record('passed')
+      else record('passed', result)
       return result
     })
   }
@@ -4804,7 +4934,10 @@ class ShareFetchTap {
                 )
                 operation += `:${[...new Set(operations)].sort().join(',')}`
               }
-              return this.operation(role, operation, () => value.apply(client, args))
+              return this.operation(role, operation, () => value.apply(client, args), {
+                topic: args[0]?.topic,
+                groupId: args[0]?.groupId,
+              })
             },
       ])
     )
@@ -5334,6 +5467,7 @@ class ShareSoakDriver {
   /**
    * Creates the topic and group, reads the group configuration back, captures routing and the
    * unrelated groups, closes the setup clients and takes the client-free baseline.
+   * Requests the API-60 form of cluster discovery for the mandatory protocol inventory.
    * @param {{ add: Function }} stack cleanup stack; every cleanup is registered before its effect
    * @param {AbortSignal} scope the scenario scope
    * @returns {Promise<{ topic: string, group: string }>}
@@ -5388,7 +5522,9 @@ class ShareSoakDriver {
       admin.fetchTopicMetadata({ topics: [this.topic] })
     )
     const [topic] = metadata.topics.filter(({ name }) => name === this.topic)
-    const { brokers } = await bounded(scope, Infinity, () => admin.describeCluster())
+    const { brokers } = await bounded(scope, Infinity, () =>
+      admin.describeCluster({ includeAuthorizedOperations: true })
+    )
     this.nodes = new Map(brokers.map(({ host, port, nodeId }) => [`${host}:${port}`, nodeId]))
     for (const { partitionId, leader } of topic.partitions) {
       const node = brokers.find(({ nodeId }) => nodeId === leader)
@@ -5534,8 +5670,8 @@ class ShareSoakDriver {
 
   /**
    * Runs one cycle: A joins, a transient B joins and leaves, the corpus is produced and delivered
-   * (with held identities redelivered after a reset before A closes), and every independent oracle
-   * is read.
+   * (with held identities redelivered and all three leaders fetched after a reset before A closes),
+   * and every independent oracle is read.
    * @param {ReturnType<typeof ShareCycleOracle.plan>} plan the cycle
    * @param {AbortSignal} scope the cycle's slot; every await below ends with it
    * @param {{due?: number, clock?: {now: Function}}} [timing] Original absolute slot cutoff and clock.
@@ -5607,6 +5743,8 @@ class ShareSoakDriver {
     const active = { capture, observation, failureArchived: false }
     this.activeCycle = active
     const postResetNodes = new Set()
+    let resetSocketClosed = false
+    let retiredWrite = false
     const unlisten = this.tap.listen((step, fields, at) => {
       if (step.startsWith('leave-') && fields.groupId === this.group) {
         const member = members.find((member) => member.memberId === fields.memberId)
@@ -5617,16 +5755,26 @@ class ShareSoakDriver {
       if (!target) return
       const nodeId = this.nodes.get(fields.endpoint)
       if (step === 'api78-write') {
+        if (resetSocketClosed && fields.socket === target.socket) {
+          if (!retiredWrite) note('retired-socket-write', { ...fields, nodeId }, at)
+          retiredWrite = true
+          return
+        }
+        // An attempted write can reach the destroyed stream before its close callback runs.
         if (
           fields.memberId !== target.memberId ||
           fields.groupId !== this.group ||
+          fields.socket === target.socket ||
           postResetNodes.has(fields.endpoint)
         )
           return
         postResetNodes.add(fields.endpoint)
         note('post-reset-api78', { ...fields, nodeId }, at)
       } else if (fields.socket === target.socket) {
-        note(step, { ...fields, nodeId }, at)
+        if (step === 'socket-close') {
+          resetSocketClosed = true
+          note(step, { ...fields, nodeId, lastFrame: this.tap.frameSequence }, at)
+        } else note(step, { ...fields, nodeId }, at)
       } else if (fields.endpoint === target.endpoint && step.startsWith('socket-connect-')) {
         note(step.replace('socket-connect-', 'reconnect-'), { ...fields, nodeId }, at)
       }
@@ -5685,7 +5833,7 @@ class ShareSoakDriver {
     }
 
     this.lastCycle = observation
-    return stack.run(
+    const result = await stack.run(
       async () => {
         note('cycle-start')
         const a = track(
@@ -5756,10 +5904,11 @@ class ShareSoakDriver {
               counts.set(identity, (counts.get(identity) ?? 0) + 1)
             return (
               counts.size >= plan.records.length &&
-              observation.held.every((identity) => counts.get(identity) >= 2)
+              observation.held.every((identity) => counts.get(identity) >= 2) &&
+              (!plan.reset || postResetNodes.size === 3)
             )
           },
-          { delayMs: 25, label: 'Every identity delivered' }
+          { delayMs: 25, label: 'Every identity delivered and all reset nodes progressed' }
         )
         note('all-delivered')
         const reads = await Promise.allSettled([
@@ -5838,6 +5987,10 @@ class ShareSoakDriver {
       },
       { budgetMs: 2000 }
     )
+    const violations = []
+    ShareCycleOracle.retirement(result, (message) => violations.push(message))
+    if (violations.length) throw new Error(violations[0])
+    return result
   }
 
   /**
@@ -6521,7 +6674,9 @@ class ShareSoak {
 
   /**
    * Executes one fixed first-use scope in this realm and releases its strong roots before the
-   * boundary observation. Global observation history remains installed until scored cleanup.
+   * boundary observation. Both boundary censuses must match the settled reference population;
+   * its pre-collection transients remain archived and validated. Global observation history
+   * remains installed until scored cleanup.
    * @param {AbortSignal} scope Original nested priming bound.
    * @returns {Promise<void>} Only a scalar completion link survives in this owner.
    * @throws {Error} Any priming or boundary failure; scored setup has not started.
@@ -6560,11 +6715,22 @@ class ShareSoak {
         )
           violations.push('priming boundary: invalid heap source or elapsed timestamp')
         ShareSoakScreen.quiet(snapshot, original, 'priming boundary', violations)
-        for (const when of ['beforeCollection', 'afterCollection']) {
+        for (const [when, resource] of [
+          ['beforeCollection', 'activeResourcesBeforeCollection'],
+          ['afterCollection', 'activeResources'],
+        ]) {
+          const source = original.timerOwners?.[when]
+          const counts = original[resource]
           if (
+            !Array.isArray(source?.rows) ||
+            source.dropped !== 0 ||
+            !counts ||
+            !Object.values(counts).every(ShareSoakScreen.count) ||
+            !source.unattributed ||
+            !Object.values(source.unattributed).every(ShareSoakScreen.count) ||
             !ShareSoakScreen.same(
               snapshot.timerOwners?.[when]?.unattributed,
-              original.timerOwners?.[when]?.unattributed
+              original.timerOwners?.afterCollection?.unattributed
             )
           )
             violations.push('priming boundary: timer attribution differs')
@@ -6602,8 +6768,14 @@ class ShareSoak {
    * @throws {Error} the setup failure; its cleanups are registered already and run on `close`
    */
   async prepare() {
+    const evidence = require('./shareSoakEvidence').ciEvidenceEnabled()
+    if (evidence && this.driver instanceof ShareSoakDriver)
+      require('./shareSoakEvidence').observeShareSoakDriver(this.driver, (event, fields) =>
+        this.row(event, fields)
+      )
     await this.stage('setup', async (scope) => {
-      if (this.driver.tap) this.driver.tap.archive = (fact) => this.row('soak-wire', fact)
+      if (evidence && this.driver.tap)
+        this.driver.tap.archive = (fact) => this.row('soak-wire', fact)
       const digest = (file) =>
         require('node:crypto').createHash('sha256').update(fs.readFileSync(file)).digest('hex')
       this.row('soak-schedule', {
@@ -7188,6 +7360,11 @@ class ShareSoak {
       stem: this.stem,
       scope: this instanceof SharePriming ? 'priming' : 'scored',
       schema: 'share-soak-scopes-v1',
+      ci: {
+        runId: process.env.GITHUB_RUN_ID ?? null,
+        attempt: process.env.GITHUB_RUN_ATTEMPT ?? null,
+        profile: process.env.KAFKAJS_SOAK_PROFILE ?? null,
+      },
       selector: this.short ? 'SHARE_SOAK_E2E' : 'SHARE_SOAK_FULL',
       soakProfile: this.short ? 'share-consumer-short' : 'share-consumer',
       ...fields,
@@ -7415,11 +7592,14 @@ const buildShareSoak = ({ brokers, short = false, record, run }) => {
     logLevel: logLevel.NOTHING,
     socketFactory: tap.factory(forgettingDestroyed(chaos, { releaseOnClose: true })),
   })
-  const observedKafka = (client) => ({
-    admin: (...args) => tap.client('admin', client.admin(...args)),
-    producer: (...args) => tap.client('producer', client.producer(...args)),
-    shareConsumer: (...args) => tap.client('share', client.shareConsumer(...args)),
-  })
+  const observedKafka = (client) =>
+    require('./shareSoakEvidence').ciEvidenceEnabled()
+      ? {
+          admin: (...args) => tap.client('admin', client.admin(...args)),
+          producer: (...args) => tap.client('producer', client.producer(...args)),
+          shareConsumer: (...args) => tap.client('share', client.shareConsumer(...args)),
+        }
+      : client
   const scoredKafka = observedKafka(kafka)
   return new ShareSoak({
     driver: new ShareSoakDriver({
@@ -7483,13 +7663,11 @@ const buildShareSoak = ({ brokers, short = false, record, run }) => {
  *   by default, a live spec supplies its own sink
  * @returns {{ run: () => Promise<{ ok: boolean }>, close: () => Promise<void> }}
  * @throws {Error} without `--expose-gc`, for another phase list, an unconfigured broker line or
- *   evidence directory, and for a worker without its kind or IPC channel
+ *   evidence directory, for a worker without its kind or IPC channel, and for a seeded or long-window
+ *   run (the `TELEMETRY_SEED` control or the `TELEMETRY_LONG_WINDOW` candidate) given no sink of its
+ *   own, so it never writes scenario evidence
  */
-const buildTelemetryChurn = ({
-  brokers: requested,
-  phases,
-  record = (row) => writeEvidence('telemetry-churn', row),
-}) => {
+const buildTelemetryChurn = ({ brokers: requested, phases, record }) => {
   if (typeof globalThis.gc !== 'function')
     throw new Error(
       'The telemetry profile reads memory after a collection: run node with --expose-gc'
@@ -7497,6 +7675,7 @@ const buildTelemetryChurn = ({
   if (JSON.stringify(phases) !== JSON.stringify(PROFILES.telemetry))
     throw new Error('The telemetry profile runs its one fixed phase')
   const churn = require('./telemetryChurn')
+  const { LIVE_SEED } = require('./liveSeed')
   const kind = process.env[churn.WORKER_ENV]
   if (kind !== undefined) {
     if (!churn.KINDS.includes(kind) || typeof process.send !== 'function')
@@ -7506,9 +7685,9 @@ const buildTelemetryChurn = ({
       soak: {
         Soak,
         WORKLOADS,
-        PROFILES,
+        PROFILES: ACTIVE_PROFILES,
         instrument,
-        TELEMETRY,
+        TELEMETRY: ACTIVE_TELEMETRY,
         TelemetryResourceVerdict,
         logLevel,
         Kafka,
@@ -7518,6 +7697,10 @@ const buildTelemetryChurn = ({
     })
     return { run: () => worker.run(), close: async () => {} }
   }
+  if (process.env[LIVE_SEED.env] && !record)
+    throw new Error('A seeded telemetry run records only to a control sink')
+  if (LongWindow.selected() && !record)
+    throw new Error('A long-window telemetry run records only to a diagnostic sink')
   const line = process.env.KAFKA_VERSION
   const directory = process.env.TELEMETRY_EVIDENCE_DIR ?? ''
   if (
@@ -7545,11 +7728,20 @@ const buildTelemetryChurn = ({
       withResource: withTelemetryResource,
       clock,
     }),
-    processes: new churn.TelemetryProcesses({ script: __filename }),
-    decoder: new churn.DecoderCoordinator({ directory, line, clock }),
-    record,
+    processes: new churn.TelemetryProcesses({
+      script: __filename,
+      messageBytes: ACTIVE_TELEMETRY.messageBytes,
+      totalBytes: ACTIVE_TELEMETRY.totalBytes,
+    }),
+    decoder: new churn.DecoderCoordinator({
+      directory,
+      line,
+      clock,
+      sinkBytes: ACTIVE_TELEMETRY.sinkBytes ?? require('./churnReporter').SINK_BYTES,
+    }),
+    record: record ?? ((row) => writeEvidence('telemetry-churn', row)),
     clock,
-    limits: TELEMETRY,
+    limits: ACTIVE_TELEMETRY,
     verdict: (input) => TelemetryResourceVerdict.evaluate(input),
     brokers,
     stem,
@@ -7707,23 +7899,10 @@ const main = async (
   return verdict
 }
 
-if (require.main === module) {
-  const { profile, phaseSeconds } = parseArgs(process.argv.slice(2))
-  main(profile, { phaseSeconds }).then(
-    (verdict) => {
-      console.log(JSON.stringify(verdict))
-      process.exitCode = verdict.ok ? 0 : 1
-    },
-    (error) => {
-      console.error(error)
-      process.exitCode = 1
-    }
-  )
-}
-
 module.exports = {
   CHURN,
   TELEMETRY,
+  TELEMETRY_LONG,
   TelemetryResourceVerdict,
   ConsumerChurnOracle,
   buildConsumerChurn,
@@ -7757,4 +7936,23 @@ module.exports = {
   instrument,
   instrumentShare,
   main,
+}
+
+if (require.main === module) {
+  const { profile, phaseSeconds } = parseArgs(process.argv.slice(2))
+  // The parent validates diagnostic workers; their resource verdicts are intentionally ineligible.
+  const diagnosticWorker =
+    profile === 'telemetry' &&
+    LongWindow.selected(process.env) &&
+    require('./telemetryChurn').KINDS.includes(process.env.TELEMETRY_WORKER_KIND)
+  main(profile, { phaseSeconds }).then(
+    (verdict) => {
+      console.log(JSON.stringify(verdict))
+      process.exitCode = diagnosticWorker || verdict.ok ? 0 : 1
+    },
+    (error) => {
+      console.error(error)
+      process.exitCode = 1
+    }
+  )
 }

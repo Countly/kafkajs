@@ -11,6 +11,7 @@
  * share-only helpers, so an arm can finish all loading before its control.
  */
 const path = require('node:path')
+const { CONTROL_SETTLE_ROUNDS } = require('../../../../testHelpers/processMemory')
 
 const ROOT = path.join(__dirname, '..', '..', '..', '..')
 const { Kafka } = require(path.join(ROOT, 'index.js'))
@@ -123,6 +124,83 @@ const within = (promise, what) => {
 const descriptor = (index) => ({ ...maximumDescriptor(index), value: 9007199254740993n })
 
 /**
+ * The seeded controls: a deliberate leak through a product-reachable root, to prove the memory
+ * gates see it. The bytes hang from the product's own exported `Kafka` class, so they outlive any
+ * client and its release, exactly as a leak in a product singleton would.
+ */
+const SEED = Object.freeze({
+  root: Symbol.for('resource.seed.root'),
+  modes: Object.freeze(['close', 'close-warmup', 'warmup-only']),
+  closeBytes: 131072,
+  warmupBytes: 1048577,
+  warmupAtClose: 2,
+})
+
+/**
+ * Leaks on the public closes of one pass. `close` leaks `SEED.closeBytes` on every close in the
+ * measured pass (and in the warm-up too for `close-warmup`); `warmup-only` leaks
+ * `SEED.warmupBytes` once, at the first close after the matched position of the warm-up, and
+ * nothing in the measured pass.
+ */
+class ProductSeed {
+  /**
+   * @param {'close'|'close-warmup'|'warmup-only'} mode which passes leak
+   * @param {boolean} warm whether this is the warm-up pass
+   * @returns {ProductSeed|null} the seed of this pass, or null when this pass does not leak
+   * @throws {Error} for an unknown mode
+   */
+  static of(mode, warm) {
+    if (!mode) return null
+    if (!SEED.modes.includes(mode)) throw new Error(`Unknown seed mode ${mode}`)
+    const leaks =
+      mode === 'close-warmup' || (mode === 'close' && !warm) || (mode === 'warmup-only' && warm)
+    return leaks ? new ProductSeed(mode) : null
+  }
+
+  /** @param {string} mode the seed mode @returns {ProductSeed} a seed that has leaked nothing */
+  constructor(mode) {
+    this.mode = mode
+    this.closes = 0
+    this.bytes = 0
+    this.matchedBytes = null
+  }
+
+  /** @returns {void} leaks what this mode leaks at one public close */
+  close() {
+    this.closes += 1
+    const bytes =
+      this.mode === 'warmup-only'
+        ? this.closes === SEED.warmupAtClose
+          ? SEED.warmupBytes
+          : 0
+        : SEED.closeBytes
+    if (bytes === 0) return
+    Kafka[SEED.root] ??= []
+    Kafka[SEED.root].push(Buffer.alloc(bytes, 0x5a))
+    this.bytes += bytes
+  }
+
+  /** @returns {void} records how much leaked up to the matched position */
+  matched() {
+    this.matchedBytes = this.bytes
+  }
+
+  /**
+   * @returns {{mode: string, closes: number, bytes: number, afterMatched: number}} what this pass
+   *   leaked in all and after the matched position
+   */
+  summary() {
+    const { mode, closes, bytes } = this
+    return { mode, closes, bytes, afterMatched: bytes - (this.matchedBytes ?? 0) }
+  }
+
+  /** @returns {void} drops every leaked buffer from the product root */
+  static release() {
+    delete Kafka[SEED.root]
+  }
+}
+
+/**
  * One public client of a kind over a bounded scripted wire that answers the core protocol and the
  * telemetry APIs. Telemetry is enabled or disabled by the constructor; the wire and the
  * operations are the same either way. It owns the client, its wire and the fixture timers, and
@@ -131,12 +209,16 @@ const descriptor = (index) => ({ ...maximumDescriptor(index), value: 90071992547
 class MemoryForeground {
   /**
    * @param {string} kind producer, consumer, admin or shareConsumer
-   * @param {{enabled: boolean}} options whether `enableMetricsPush` is set
+   * @param {{enabled: boolean, seed?: ProductSeed|null, witnesses?: object|null}} options whether `enableMetricsPush` is
+   *   set, and the seeded control's leak on every public close of this client, normally none
+   * @param {object|null} [options.witnesses] diagnostic-only weak inventory of build inputs
    * @returns {MemoryForeground} an object with no client yet
    */
-  constructor(kind, { enabled }) {
+  constructor(kind, { enabled, seed = null, witnesses = null }) {
     this.kind = kind
     this.enabled = enabled
+    this.seed = seed
+    if (witnesses) this.witnesses = witnesses
     this.codecs = [0]
     this.timers = new Set()
     this.ops = []
@@ -158,6 +240,8 @@ class MemoryForeground {
   build() {
     const advertise = { GetTelemetrySubscriptions: [0, 0], PushTelemetry: [0, 0] }
     const options = { enableMetricsPush: this.enabled }
+    this.witnesses?.track('foreground:advertise', advertise)
+    this.witnesses?.track('foreground:options', options)
     if (this.kind === 'shareConsumer') {
       this.harness = share.shareClient({
         advertise,
@@ -175,6 +259,7 @@ class MemoryForeground {
         bounded: WIRE_BOUNDS,
       })
       const kafka = new Kafka(this.wire.kafkaOptions(options))
+      this.witnesses?.track('foreground:kafka', kafka)
       if (this.kind === 'producer') this.client = kafka.producer({ idempotent: false })
       else if (this.kind === 'admin') this.client = kafka.admin()
       else
@@ -212,6 +297,7 @@ class MemoryForeground {
     )
     if (this.kind === 'consumer')
       this.removers.push(this.client.on(this.client.events.GROUP_JOIN, () => (this.joins += 1)))
+    this.witnesses?.track('foreground:built', this)
     return this
   }
 
@@ -349,6 +435,7 @@ class MemoryForeground {
    * @returns {Promise<void>} the original public disconnect promise
    */
   close(timeout) {
+    this.seed?.close()
     return this.client.disconnect({ timeout })
   }
 
@@ -399,7 +486,8 @@ class MemoryForeground {
  * client, over `lifecycles` public opens, with settled readings C0 after the first and C1 after
  * the last (both with the client connected and idle), then a public close, release of the client
  * and of everything it owned, and a settled reading once nothing of it remains. The control makes
- * no telemetry call; its facts say so.
+ * no telemetry call; its facts say so. Only C0 and C1 may take twelve collection pairs; the
+ * released reading retains the six-pair budget.
  * @param {object} arm
  * @param {string} arm.kind public client kind
  * @param {number} arm.lifecycles how many times the client is opened and works
@@ -413,21 +501,21 @@ class MemoryForeground {
  *   still live after its release
  */
 const runControl = async ({ kind, lifecycles, memory, roles, journal, live }) => {
-  const settled = () => roles.run('fixture', () => memory.settled())
+  const settled = (rounds) => roles.run('fixture', () => memory.settled(null, null, rounds))
   const turn = () => new Promise((resolve) => setImmediate(resolve))
   return roles.run('control', async () => {
     memory.mark('control:start')
     const client = new MemoryForeground(kind, { enabled: false }).build()
     live.push(client)
     await client.open()
-    const c0 = await settled()
+    const c0 = await settled(CONTROL_SETTLE_ROUNDS)
     memory.mark('control:c0')
     for (let index = 1; index < lifecycles; index++) {
       await client.close(0)
       await client.drain()
       await client.open()
     }
-    const c1 = await settled()
+    const c1 = await settled(CONTROL_SETTLE_ROUNDS)
     memory.mark('control:c1')
     const probe = await client.client.clientInstanceId({ timeout: 0 }).then(
       () => 'resolved',
@@ -454,18 +542,22 @@ const runControl = async ({ kind, lifecycles, memory, roles, journal, live }) =>
  * @param {object} snapshot the strict maximum collector sample
  * @param {{name:string,type:number}} codec the real codec to select
  * @param {() => void} retire advances the journal's lifecycle while the second job is pending
+ * @param {object|null} [witnesses] diagnostic-only weak inventory of payload temporaries
  * @returns {Promise<object>} the byte/point/retirement facts, with no payload references
  * @throws {Error} preserves a failed native build
  */
-const nativePair = async (builder, snapshot, codec, retire) => {
+const nativePair = async (builder, snapshot, codec, retire, witnesses = null) => {
   const options = {
     telemetryMaxBytes: 1048576,
     acceptedCompressionTypes: [codec.type, 0],
     isCurrent: () => true,
   }
+  witnesses?.track('catalogue:native-options', options)
   const current = await builder.buildPayload(snapshot, options)
+  witnesses?.track('catalogue:native-current', current)
   let valid = true
   const retiring = builder.buildPayload(snapshot, { ...options, isCurrent: () => valid })
+  witnesses?.track('catalogue:native-retiring', retiring)
   retire()
   valid = false
   return {
@@ -483,6 +575,8 @@ module.exports = {
   DESCRIPTOR_BYTES,
   MEMORY_UUID,
   MemoryForeground,
+  ProductSeed,
+  SEED,
   WAIT_MS,
   descriptor,
   foregroundCatalogue,

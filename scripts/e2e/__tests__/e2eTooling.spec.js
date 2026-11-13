@@ -1297,6 +1297,7 @@ describe('broker telemetry fixture', () => {
       new Set(catalogue(true).map((r) => `${r.group}-${r.kafka}-${r.node}-${r.compose}`)).size
     ).toBe(72)
     const resources = workflow.jobs.resources
+    expect(resources['timeout-minutes']).toBe(45)
     expect(resources.needs).toBeUndefined()
     const alone = resources.steps.find((step) => step.run?.includes('resources\\.spec'))
     expect(alone.run).toContain('--runInBand')
@@ -1365,9 +1366,12 @@ describe('broker telemetry fixture', () => {
     expect(serialized).not.toMatch(/forceExit|docker (pull|system prune)/)
   })
 
-  test('keeps memory acceptance in guarded jobs with the full Node and broker coverage', () => {
+  test('keeps memory acceptance behind the exact PR head and base with full Node and broker coverage', () => {
     const yaml = require('js-yaml')
     const workflow = yaml.load(read('.github/workflows/memory-gates.yml').toString())
+    for (const job of Object.values(workflow.jobs)) {
+      for (const step of job.steps ?? []) expect(step.run ?? '').not.toContain('$' + '{{')
+    }
     expect(workflow.on).toHaveProperty('workflow_dispatch')
     expect(workflow.on.pull_request.types).toEqual([
       'opened',
@@ -1376,26 +1380,107 @@ describe('broker telemetry fixture', () => {
       'ready_for_review',
     ])
     expect(Object.keys(workflow.jobs)).toEqual([
-      'share-soak-short',
+      'select',
+      'unit',
+      'share-soak',
+      'share-soak-verify',
+      'share-soak-verdict',
       'resources',
+      'active-owner-census',
+      'warmup-witnesses',
+      'journal-controls',
       'retained-diagnostic',
       'telemetry-soak',
+      'telemetry-seeded-control',
+      'live-owner-census',
+      'share-peak',
+      'telemetry-long-window',
+      'telemetry-long-window-verdict',
+      'telemetry-verdicts',
+      'telemetry-verdict-controls',
+      'verdict',
+    ])
+    expect(workflow.jobs['share-soak'].needs).toEqual(['select', 'unit'])
+    expect(workflow.jobs['share-soak'].strategy.matrix.include.map((row) => row.profile)).toEqual([
+      'short',
+      'full',
+    ])
+    expect(workflow.jobs['share-soak-verify'].needs).toEqual(['select', 'share-soak'])
+    expect(workflow.jobs['share-soak-verify'].strategy.matrix.profile).toEqual(['short', 'full'])
+    expect(workflow.jobs['share-soak-verdict'].needs).toEqual([
+      'select',
+      'share-soak',
+      'share-soak-verify',
+    ])
+    expect(workflow.jobs.verdict.needs).toEqual([
+      'select',
+      'unit',
+      'share-soak-verdict',
+      'resources',
+      'journal-controls',
+      'retained-diagnostic',
+      'telemetry-soak',
+      'telemetry-long-window-verdict',
+      'live-owner-census',
       'telemetry-verdicts',
       'telemetry-verdict-controls',
     ])
-    for (const job of Object.values(workflow.jobs)) {
-      expect(job.if).toBe(
-        "github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/')"
+    const gate = workflow.jobs.select
+    expect(gate.if).toBe(
+      "github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.head_ref == 'p9m/memory-gates' && github.base_ref == 'master')"
+    )
+    for (const [event, head, base, expected] of [
+      ['pull_request', 'p9m/memory-gates', 'master', true],
+      ['pull_request', 'p9m/q9', 'p9m/memory-gates', false],
+      ['pull_request', 'p9m/q9', 'master', false],
+      ['pull_request', 'p9m/memory-gates', 'p9m/other', false],
+      ['pull_request', 'feature', 'master', false],
+      ['workflow_dispatch', 'feature', 'other', true],
+      ['push', 'p9m/memory-gates', 'master', false],
+    ]) {
+      expect(
+        require('vm').runInNewContext(gate.if, {
+          github: { event_name: event, head_ref: head, base_ref: base },
+        })
+      ).toBe(expected)
+    }
+    expect(workflow.jobs['share-soak-verdict'].if).toBe(
+      "always() && needs.select.result == 'success'"
+    )
+    expect(workflow.jobs.verdict.if).toBe("always() && needs.select.result == 'success'")
+    expect(workflow.jobs['share-soak-verdict'].steps[0].run).toContain(
+      'test "$PRODUCED" = success && test "$RECHECKED" = success'
+    )
+    expect(JSON.stringify(workflow.jobs.verdict)).toContain("job.result !== 'success'")
+    for (const [name, job] of Object.entries(workflow.jobs)) {
+      if (
+        [
+          'select',
+          'share-soak-verdict',
+          'verdict',
+          'telemetry-long-window',
+          'telemetry-long-window-verdict',
+        ].includes(name)
       )
-      expect(job.needs).toBeUndefined()
+        continue
+      const selected = `contains(fromJSON(needs.select.outputs.jobs), '${name}')`
+      expect(job.if).toBe(
+        name === 'share-soak-verify'
+          ? `always() && needs.select.result == 'success' && ${selected}`
+          : selected
+      )
+      if (!['share-soak', 'share-soak-verify'].includes(name)) expect(job.needs).toEqual(['select'])
       if (job.uses) {
         expect(job.uses).toBe('./.github/workflows/telemetry.yml')
         expect(job.with).toEqual({ full: true, 'memory-verdicts': true })
         expect(job['continue-on-error']).toBeUndefined()
         continue
       }
-      expect(job.steps[0].uses).toBe('actions/checkout@v4')
-      expect(job.steps[1].uses).toBe('actions/setup-node@v4')
+      const checkout = job.steps.findIndex((step) => step.uses === 'actions/checkout@v4')
+      expect(checkout).toBeGreaterThanOrEqual(0)
+      if (name === 'share-soak') expect(job.steps[checkout].with['fetch-depth']).toBe(2)
+      expect(job.steps[checkout + 1].uses).toBe('actions/setup-node@v4')
+      if (name === 'unit') continue
       expect(job.steps.at(-1)).toMatchObject({
         if: 'always()',
         uses: 'actions/upload-artifact@v4',
@@ -1455,6 +1540,7 @@ describe('broker telemetry fixture', () => {
     expect(controlsRun.run).toContain('testHelpers/__tests__/telemetryFixtures.spec.js')
     expect(controlsRun['continue-on-error']).toBeUndefined()
     const resources = workflow.jobs.resources
+    expect(resources['timeout-minutes']).toBe(105)
     expect(resources.strategy).toEqual({ 'fail-fast': false, matrix: { node: [22, 24, 26] } })
     expect(resources.env.TELEMETRY_RESOURCES_ARTIFACT_DIR).toContain('telemetry-resources')
     expect(resources.steps.map((step) => step.name ?? step.uses)).toEqual([
@@ -1464,7 +1550,8 @@ describe('broker telemetry fixture', () => {
       'Stamp the run and prepare the artifact directory',
       'Measure single-client memory alone on the idle runner',
       'Validate the recorded measurements for this tree and Node',
-      'actions/upload-artifact@v4',
+      'Compare journal ownership and real-time retained sensitivity serially',
+      'Upload resource and calibration evidence',
     ])
     const memory = resources.steps.find((step) => step.name?.startsWith('Measure'))
     expect(memory.env.TELEMETRY_RESOURCES_QUIET).toBe('1')
@@ -1474,6 +1561,57 @@ describe('broker telemetry fixture', () => {
     const validate = resources.steps.find((step) => step.run?.includes('resourceArtifact.js'))
     expect(validate.if).toBe('always()')
     expect(validate.run).toContain('--tree "$KAFKAJS_TREE" --node "$(node -p process.version)"')
+    const calibration = resources.steps.find((step) => step.name?.startsWith('Compare journal'))
+    expect(calibration.run).toContain(
+      '--kinds=producer,consumer,shareConsumer --protocols=resource || exit 1'
+    )
+    expect(calibration['timeout-minutes']).toBe(85)
+    expect(resources.steps.at(-1)).toMatchObject({
+      name: 'Upload resource and calibration evidence',
+      if: 'always()',
+      'timeout-minutes': 2,
+      uses: 'actions/upload-artifact@v4',
+    })
+    const journals = workflow.jobs['journal-controls']
+    expect(journals['timeout-minutes']).toBe(60)
+    expect(journals.steps.map((step) => step.name ?? step.uses)).toEqual([
+      'actions/checkout@v4',
+      'actions/setup-node@v4',
+      undefined,
+      'Run the admin and live-flags journal controls serially on the idle runner',
+      'Upload journal control evidence',
+    ])
+    expect(journals.strategy).toEqual({
+      'fail-fast': false,
+      matrix: {
+        node: [22, 24, 26],
+        group: [
+          { name: 'admin', kinds: 'admin', protocols: 'resource,live' },
+          { name: 'live-flags', kinds: 'producer,consumer,shareConsumer', protocols: 'live' },
+        ],
+      },
+    })
+    const parity = journals.steps.find((step) => step.run?.includes('journalControls.js'))
+    expect(parity.env).toEqual({
+      JOURNAL_KINDS: '$' + '{{ matrix.group.kinds }}',
+      JOURNAL_PROTOCOLS: '$' + '{{ matrix.group.protocols }}',
+    })
+    expect(parity.run).toBe(
+      'timeout -k 10s 2900s node scripts/soak/journalControls.js "$JOURNAL_CONTROLS_DIR" --kinds="$JOURNAL_KINDS" --protocols="$JOURNAL_PROTOCOLS" || exit 1'
+    )
+    expect(parity['timeout-minutes'] * 60).toBeGreaterThan(2900)
+    expect(journals['timeout-minutes']).toBeGreaterThan(parity['timeout-minutes'] + 5 + 2)
+    for (const step of journals.steps.filter((row) => row.run))
+      expect(step['timeout-minutes']).toBeGreaterThan(0)
+    expect(journals.steps.at(-1)).toMatchObject({
+      if: 'always()',
+      uses: 'actions/upload-artifact@v4',
+      with: {
+        name: 'journal-controls-$' + '{{ matrix.group.name }}-node$' + '{{ matrix.node }}',
+        path: '.tmp/journal-controls/',
+        'if-no-files-found': 'error',
+      },
+    })
     expect(resources.steps.at(-1).with).toMatchObject({
       name: 'resources-node$' + '{{ matrix.node }}',
       path: '.tmp/telemetry-resources/',
@@ -1491,7 +1629,7 @@ describe('broker telemetry fixture', () => {
     expect(diagnose.run).toContain('--diagnostic-only "$RETAINED_DIAGNOSTIC_DIR"')
     const analyse = diagnostic.steps.find((step) => step.name?.startsWith('Analyse'))
     expect(analyse.if).toBe('always()')
-    expect(analyse.run).toContain('timeout -k 5s 290s node --max-old-space-size=6144')
+    expect(analyse.run).toContain('timeout -k 5s 590s node --max-old-space-size=6144')
     expect(diagnostic.steps.at(-1).with).toMatchObject({
       name: 'retained-diagnostic-node24',
       path: '.tmp/retained-diagnostic/',
@@ -1513,7 +1651,7 @@ describe('broker telemetry fixture', () => {
       'prepareDecoder.js',
       'ci.js preflight',
       'docker compose -f "$COMPOSE_FILE" pull',
-      'docker compose -f "$COMPOSE_FILE" up',
+      'docker compose -f "$COMPOSE_FILE" -f .tmp/telemetry-churn-reporter/compose.json up',
       'ci.js capture',
       'timeout -k 10s 600s npm run test:group:telemetry-soak -- --ci',
       "verifyEvidence('telemetry-soak'",
@@ -1531,6 +1669,297 @@ describe('broker telemetry fixture', () => {
       'if-no-files-found': 'error',
     })
     expect(JSON.stringify(soak)).not.toContain('forceExit')
+  })
+
+  test('selects exact memory job ids and share dependencies while running both verdicts on partial dispatches', () => {
+    const workflow = require('js-yaml').load(read('.github/workflows/memory-gates.yml').toString())
+    expect(workflow.on.workflow_dispatch.inputs.only).toEqual(
+      expect.objectContaining({ type: 'string', required: false, default: '' })
+    )
+    expect(workflow.jobs.select).toBeDefined()
+    const step = workflow.jobs.select.steps.find((step) => step.id === 'select')
+    expect(step.env.ONLY).toBe('$' + '{{ inputs.only }}')
+    expect(workflow.jobs.select.outputs).toEqual({
+      jobs: '$' + '{{ steps.select.outputs.jobs }}',
+      full: '$' + '{{ steps.select.outputs.full }}',
+    })
+    const source = step.run.match(/node <<'NODE'\n([\s\S]*?)\nNODE/)[1]
+    const vm = require('vm')
+    /** @param {string} only Dispatch input. @returns {object} Real selector outputs. */
+    const select = (only) => {
+      let output = ''
+      vm.runInNewContext(source, {
+        process: { env: { ONLY: only, GITHUB_OUTPUT: 'output' } },
+        require: (id) => {
+          expect(id).toBe('node:fs')
+          return {
+            appendFileSync: (file, value) => {
+              expect(file).toBe('output')
+              output += value
+            },
+          }
+        },
+      })
+      return Object.fromEntries(
+        output
+          .trim()
+          .split('\n')
+          .map((line) => {
+            const index = line.indexOf('=')
+            return [line.slice(0, index), line.slice(index + 1)]
+          })
+      )
+    }
+    /** @param {object} outputs Selector outputs. @param {string} event Trigger. @returns {string[]} Runnable jobs. */
+    const runnable = (outputs, event = 'workflow_dispatch') =>
+      Object.entries(workflow.jobs)
+        .filter(([id]) => id !== 'select')
+        .filter(([, job]) =>
+          vm.runInNewContext(job.if, {
+            github: { event_name: event },
+            needs: { select: { result: 'success', outputs } },
+            always: () => true,
+            fromJSON: JSON.parse,
+            contains: (array, item) => array.includes(item),
+          })
+        )
+        .map(([id]) => id)
+    const all = Object.keys(workflow.jobs).filter((id) => id !== 'select')
+    const full = select('')
+    expect(full.full).toBe('true')
+    const defaults = all.filter((id) => id !== 'telemetry-seeded-control')
+    expect(JSON.parse(full.jobs).sort()).toEqual([...defaults].sort())
+    expect(runnable(full)).toEqual(defaults)
+    expect(runnable(full, 'pull_request')).toEqual(defaults)
+    const share = ['unit', 'share-soak', 'share-soak-verify', 'share-soak-verdict']
+    const verdicts = ['share-soak-verdict', 'verdict']
+    const long = ['telemetry-long-window', 'telemetry-long-window-verdict']
+    const withVerdicts = (ids) => all.filter((id) => ids.includes(id) || verdicts.includes(id))
+    for (const id of all.filter((id) => id !== 'verdict')) {
+      const outputs = select(id)
+      expect(outputs.full).toBe('false')
+      expect(runnable(outputs)).toEqual(
+        withVerdicts(id.startsWith('share-soak') ? share : long.includes(id) ? long : [id])
+      )
+    }
+    expect(runnable(select(' resources, telemetry-verdicts,resources '))).toEqual(
+      withVerdicts(['resources', 'telemetry-verdicts'])
+    )
+    expect(runnable(select('share-soak,telemetry-long-window'))).toEqual(
+      withVerdicts([...share, ...long])
+    )
+    expect(runnable(select('telemetry-long-window'), 'pull_request')).toEqual(withVerdicts(long))
+    expect(runnable(select('verdict'))).toEqual(verdicts)
+    for (const input of [' ', ',']) {
+      expect(select(input).full).toBe('false')
+      expect(runnable(select(input))).toEqual(defaults)
+    }
+    for (const input of ['soak', 'share-soak-extra', 'resources,unknown', 'select'])
+      expect(() => select(input)).toThrow(/Unknown job/)
+    for (const id of ['share-soak-verify', 'share-soak-verdict', 'verdict']) {
+      expect(
+        vm.runInNewContext(workflow.jobs[id].if, {
+          needs: { select: { result: 'skipped', outputs: {} } },
+          always: () => true,
+        })
+      ).toBe(false)
+    }
+  })
+
+  test('requires the adopted long-window lane on pull requests with three replicates and bounded jobs', () => {
+    // eslint-disable-next-line n/no-extraneous-require -- YAML parser is pinned by the ESLint/Jest toolchain
+    const yaml = require('js-yaml')
+    const workflow = yaml.load(read('.github/workflows/memory-gates.yml').toString())
+    const expr = (text) => '$' + `{{ ${text} }}`
+    const job = workflow.jobs['telemetry-long-window']
+    expect(workflow.jobs.verdict.needs).not.toContain('telemetry-long-window')
+    expect(workflow.jobs.verdict.needs).toContain('telemetry-long-window-verdict')
+    expect(workflow.on.workflow_dispatch.inputs.replicates).toMatchObject({
+      type: 'choice',
+      default: '3',
+      options: ['1', '2', '3'],
+    })
+    expect(job.if).toBe("contains(fromJSON(needs.select.outputs.jobs), 'telemetry-long-window')")
+    expect(job.needs).toEqual(['select'])
+    expect(job['timeout-minutes']).toBeLessThanOrEqual(75)
+    const { matrix } = job.strategy
+    expect(job.strategy['fail-fast']).toBe(false)
+    expect(matrix.node).toEqual([22, 24, 26])
+    expect(matrix.kafka).toEqual(['4.2.2', '4.3.1'])
+    expect(matrix.arm).toEqual(['unseeded', 'seeded'])
+    expect(matrix.replicate).toBe(
+      expr(
+        "fromJSON(github.event.inputs.replicates == '1' && '[1]' || github.event.inputs.replicates == '2' && '[1,2]' || '[1,2,3]')"
+      )
+    )
+    expect(matrix.include).toEqual(
+      [22, 24, 26].map((node) => ({ node, kafka: '4.3.1', arm: 'warmup-seed', replicate: 1 }))
+    )
+    expect(
+      matrix.node.length * matrix.kafka.length * matrix.arm.length * 3 + matrix.include.length
+    ).toBe(39)
+    expect(job.env.COMPOSE_FILE).toBe('docker-compose.telemetry.yml')
+    for (const identity of ['github.run_id', 'github.run_attempt', 'strategy.job-index'])
+      expect(job.env.COMPOSE_PROJECT_NAME).toContain(identity)
+    expect(job.env.LONG_WINDOW_ARM).toBe(expr('matrix.arm'))
+    expect(job.env.LONG_WINDOW_REPLICATE).toBe(expr('matrix.replicate'))
+    for (const step of job.steps) expect(step['timeout-minutes']).toBeGreaterThan(0)
+    const run = job.steps.find((step) => step.run?.includes('longWindowDiagnostic.js'))
+    expect(run.run).toContain('mode=--acceptance')
+    expect(run.run).toContain('if [ "$REPLICATES" != \'3\' ]; then mode=--diagnostic-only; fi')
+    expect(run.run).toContain(
+      'timeout -k 10s 1980s node --expose-gc scripts/soak/longWindowDiagnostic.js "$mode" "$LONG_WINDOW_ROOT"'
+    )
+    expect(run['timeout-minutes'] * 60).toBeGreaterThan(1990)
+    expect(run.if).toBeUndefined()
+    const stop = job.steps.find((step) => step.run?.includes('ci.js stop'))
+    expect(stop.if).toBe('always()')
+    expect(stop.run).toContain('verifyCleanup(')
+    expect(job.steps.at(-1)).toMatchObject({
+      if: 'always()',
+      'timeout-minutes': 2,
+      uses: 'actions/upload-artifact@v4',
+      with: { 'if-no-files-found': 'error', 'include-hidden-files': true },
+    })
+    expect(job.steps.at(-1).with.name).toBe(
+      'telemetry-long-window-node' +
+        expr('matrix.node') +
+        '-' +
+        expr('matrix.kafka') +
+        '-' +
+        expr('matrix.arm') +
+        '-r' +
+        expr('matrix.replicate')
+    )
+    expect(job.steps.at(-1).with.path).toContain('.tmp/long-window/')
+    expect(JSON.stringify(job)).not.toContain('forceExit')
+  })
+
+  test('covers all six live census lanes with capture and scalar companions', () => {
+    // eslint-disable-next-line n/no-extraneous-require -- YAML parser is pinned by the ESLint/Jest toolchain
+    const yaml = require('js-yaml')
+    const workflow = yaml.load(read('.github/workflows/memory-gates.yml').toString())
+    const census = workflow.jobs['live-owner-census']
+    expect(census.strategy).toEqual({
+      'fail-fast': false,
+      matrix: {
+        node: [22, 24, 26],
+        kafka: ['4.3.1', '4.2.2'],
+        variant: ['capture', 'scalar'],
+      },
+    })
+    expect(census.env.KAFKA_VERSION).toBe('$' + '{{ matrix.kafka }}')
+    expect(census.steps[1].with['node-version']).toBe('$' + '{{ matrix.node }}')
+    for (const identity of ['github.run_id', 'github.run_attempt', 'strategy.job-index'])
+      expect(census.env.COMPOSE_PROJECT_NAME).toContain(identity)
+    expect(census.env.TELEMETRY_RESOURCES_ARTIFACT_DIR).toBeUndefined()
+    const steps = census.steps.filter((step) => step.run)
+    for (const step of steps) expect(step['timeout-minutes']).toBeGreaterThan(0)
+    const { censusFlags } = require('../telemetry/retained/liveDiagnostic')
+    expect(censusFlags()).toEqual(require('../../soak/telemetryChurn').WORKER_FLAGS)
+    expect(censusFlags()).toEqual([
+      '--expose-gc',
+      '--min-semi-space-size=1',
+      '--max-semi-space-size=1',
+    ])
+    const capture = steps.find((step) => step.run.includes('liveDiagnostic.js'))
+    expect(capture.env.CENSUS_VARIANT).toBe('$' + '{{ matrix.variant }}')
+    expect(capture.run).toBe(
+      'timeout -k 10s 700s node --expose-gc scripts/e2e/telemetry/retained/liveDiagnostic.js --diagnostic-only "$LIVE_CENSUS_ROOT" "$CENSUS_VARIANT"'
+    )
+    expect(capture['timeout-minutes'] * 60).toBeGreaterThan(710)
+    const analyse = steps.find((step) => step.run.includes('analyseLive.js'))
+    expect(analyse.if).toBe('always()')
+    expect(analyse.run).toContain('analyseLive.js "$LIVE_CENSUS_ROOT"')
+    const stop = steps.find((step) => step.run.includes('ci.js stop'))
+    expect(stop.if).toBe('always()')
+    expect(stop.run).toContain('verifyCleanup(')
+    expect(census['timeout-minutes']).toBeGreaterThan(
+      census.steps.reduce((sum, step) => sum + (step['timeout-minutes'] ?? 0), 0)
+    )
+    expect(JSON.stringify(census)).not.toMatch(/verifyEvidence|resourceArtifact\.js|forceExit/)
+    expect(census.steps.at(-1)).toMatchObject({
+      if: 'always()',
+      uses: 'actions/upload-artifact@v4',
+      with: { 'if-no-files-found': 'error', 'include-hidden-files': true },
+    })
+    expect(census.steps.at(-1).with.name).toBe(
+      'live-owner-census-$' +
+        '{{ matrix.kafka }}-node$' +
+        '{{ matrix.node }}-$' +
+        '{{ matrix.variant }}'
+    )
+    expect(census.steps.at(-1).with.path).toContain('.tmp/live-census/')
+  })
+
+  test('wires the seeded live control as its own job whose records stay out of acceptance evidence', () => {
+    // eslint-disable-next-line n/no-extraneous-require -- YAML parser is pinned by the ESLint/Jest toolchain
+    const yaml = require('js-yaml')
+    const { LIVE_SEED } = require('../../soak/liveSeed')
+    const { TELEMETRY } = require('../../soak/soak')
+    const workflow = yaml.load(read('.github/workflows/memory-gates.yml').toString())
+    const control = workflow.jobs['telemetry-seeded-control']
+    const soak = workflow.jobs['telemetry-soak']
+    expect(control.strategy).toEqual({ 'fail-fast': false, matrix: { node: [22, 24, 26] } })
+    expect(control.env.KAFKA_VERSION).toBe('4.3.1')
+    expect(control.env.COMPOSE_FILE).toBe('docker-compose.telemetry.yml')
+    for (const identity of ['github.run_id', 'github.run_attempt', 'strategy.job-index'])
+      expect(control.env.COMPOSE_PROJECT_NAME).toContain(identity)
+    expect(control.env.COMPOSE_PROJECT_NAME).not.toBe(soak.env.COMPOSE_PROJECT_NAME)
+    expect(control.env.TELEMETRY_EVIDENCE_DIR).not.toBe(soak.env.TELEMETRY_EVIDENCE_DIR)
+    for (const [name, job] of Object.entries(workflow.jobs)) {
+      const sets = [job.env, ...(job.steps ?? []).map((step) => step.env)].filter(
+        (env) => env && LIVE_SEED.env in env
+      )
+      expect({ name, sets: sets.length }).toEqual({
+        name,
+        sets: name === 'telemetry-seeded-control' ? 1 : 0,
+      })
+    }
+    const steps = control.steps.filter((step) => step.run)
+    for (const step of steps) expect(step['timeout-minutes']).toBeGreaterThan(0)
+    const ordered = [
+      'run.sh verify',
+      'fetch.sh',
+      'prepareDecoder.js',
+      'ci.js preflight',
+      'docker compose -f "$COMPOSE_FILE" pull',
+      'docker compose -f "$COMPOSE_FILE" -f .tmp/telemetry-churn-reporter/compose.json up',
+      'ci.js capture',
+      'test:group:telemetry-seeded-control',
+      'requireControl(',
+      'ci.js stop',
+    ]
+    const positions = ordered.map((text) => steps.findIndex((step) => step.run.includes(text)))
+    expect(positions.every((index) => index >= 0)).toBe(true)
+    expect([...positions].sort((a, b) => a - b)).toEqual(positions)
+    const run = steps[positions[7]]
+    expect(run.env[LIVE_SEED.env]).toBe(LIVE_SEED.mode)
+    expect(run.run).toBe('timeout -k 10s 600s npm run test:group:telemetry-seeded-control -- --ci')
+    const soakRun = soak.steps.find((step) => step.run?.includes('test:group:telemetry-soak'))
+    expect(run['timeout-minutes']).toBe(soakRun['timeout-minutes'])
+    expect(TELEMETRY.caseMs / 1000 + 10).toBeLessThanOrEqual(600)
+    expect(run['timeout-minutes'] * 60).toBeGreaterThan(600)
+    expect(control['timeout-minutes']).toBe(soak['timeout-minutes'])
+    const total = steps.reduce((sum, step) => sum + step['timeout-minutes'], 0)
+    expect(control['timeout-minutes']).toBeGreaterThan(total)
+    expect(steps[positions[8]].run).toContain(
+      "require('./scripts/soak/liveSeed').requireControl(process.env.TELEMETRY_EVIDENCE_DIR)"
+    )
+    expect(steps[positions[9]].if).toBe('always()')
+    expect(steps[positions[9]].run).toContain('verifyCleanup(')
+    expect(control.steps.at(-1)).toMatchObject({
+      if: 'always()',
+      uses: 'actions/upload-artifact@v4',
+      with: {
+        name: 'e2e-telemetry-seeded-node$' + '{{ matrix.node }}',
+        'if-no-files-found': 'error',
+        'include-hidden-files': true,
+      },
+    })
+    const serialized = JSON.stringify(control)
+    expect(serialized).not.toMatch(/verifyEvidence|scripts\/evidence\/verify\.js|forceExit/)
+    expect(workflow.jobs.verdict.needs).not.toContain('telemetry-seeded-control')
   })
 })
 
@@ -2780,17 +3209,24 @@ describe('complete telemetry evidence controls', () => {
 describe('physical telemetry absence controls', () => {
   const { ordinaryOwnership } = require('../telemetry/semantics')
   test('rejects an additional socket that sent only setup frames', () => {
+    const identity = { owner: 'producer', clientId: 'foreground' }
     const baseline = {
-      records: [{ type: 'request', apiKey: 18, socketId: 1 }],
+      owner: 'producer',
+      records: [
+        { type: 'request', owner: 'producer', clientId: 'foreground', apiKey: 18, socketId: 1 },
+      ],
       sockets: [{ id: 1, node: '1', kind: 'normal', foregroundBootstrap: true }],
     }
-    expect(ordinaryOwnership(baseline)).toEqual(['1:bootstrap'])
+    expect(ordinaryOwnership(baseline, identity)).toEqual(['1:bootstrap'])
     for (const kind of ['undecided', 'normal', 'telemetry'])
       expect(() =>
-        ordinaryOwnership({
-          ...baseline,
-          sockets: [...baseline.sockets, { id: 2, node: '1', kind }],
-        })
+        ordinaryOwnership(
+          {
+            ...baseline,
+            sockets: [...baseline.sockets, { id: 2, node: '1', kind }],
+          },
+          identity
+        )
       ).toThrow()
   })
 })

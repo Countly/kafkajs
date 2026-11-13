@@ -5,6 +5,7 @@ const os = require('os')
 const path = require('path')
 const zlib = require('zlib')
 const { performance } = require('perf_hooks')
+const { isDeepStrictEqual } = require('util')
 const { spawn } = require('child_process')
 const { Kafka, logLevel } = require('../../../index')
 const { assertCadence, assertCustomShape } = require('../../../scripts/e2e/telemetry/semantics')
@@ -286,20 +287,31 @@ class SubscriptionCases {
     expect(answer.resources).toEqual([
       expect.objectContaining({ resourceType: 16, resourceName: this.stem, errorCode: 0 }),
     ])
-    const read = await this.within(8000, 'The resource readback', () =>
-      this.aux.describeConfigs({
+    const valuesOf = (answer) =>
+      Object.fromEntries(
+        (answer.resources[0]?.configEntries ?? []).map((e) => [e.configName, e.configValue ?? ''])
+      )
+    // A describe may reach a broker that has not applied the controller's new record yet.
+    const read = await this.find('The resource readback of the altered values', 8000, async () => {
+      const answer = await this.aux.describeConfigs({
         timeout: 3000,
         resources: [{ ...resource, configNames: Object.keys(entries) }],
       })
-    )
+      return isDeepStrictEqual(valuesOf(answer), entries) && answer
+    })
     expect(read.resources).toHaveLength(1)
     expect(read.resources[0]).toMatchObject({ resourceName: this.stem, errorCode: 0 })
     const actual = Object.fromEntries(
       read.resources[0].configEntries.map((e) => [e.configName, e.configValue ?? ''])
     )
     expect(actual).toEqual(entries)
-    const listed = await this.within(8000, 'The resource listing', () =>
-      this.aux.listConfigResources({ resourceTypes: [16], timeout: 3000 })
+    const listed = await this.find(
+      'The resource listing of the altered resource',
+      8000,
+      async () => {
+        const answer = await this.aux.listConfigResources({ resourceTypes: [16], timeout: 3000 })
+        return answer.resources.some((r) => r.name === this.stem) && answer
+      }
     )
     expect(listed.resources.filter((r) => r.name === this.stem)).toEqual([
       { type: 16, name: this.stem },

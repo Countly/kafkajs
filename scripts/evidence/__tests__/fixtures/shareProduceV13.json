@@ -1,0 +1,706 @@
+{
+  "source": {
+    "runId": "43206890892",
+    "artifact": "share-soak-short-43206890892-1",
+    "cycle": 0
+  },
+  "rows": [
+    {
+      "at": 32284,
+      "event": "soak-wire",
+      "kind": "operation",
+      "role": "producer",
+      "name": "send",
+      "id": 196,
+      "target": {
+        "topic": "soak-share-prime-f388dcf8-16b3-47c8-a37f-d83f98b49404"
+      },
+      "status": "started"
+    },
+    {
+      "at": 32287,
+      "event": "soak-wire",
+      "kind": "operation",
+      "role": "producer",
+      "name": "send",
+      "id": 197,
+      "target": {
+        "topic": "soak-share-prime-f388dcf8-16b3-47c8-a37f-d83f98b49404"
+      },
+      "status": "started"
+    },
+    {
+      "at": 32287,
+      "event": "soak-wire",
+      "kind": "operation",
+      "role": "producer",
+      "name": "send",
+      "id": 198,
+      "target": {
+        "topic": "soak-share-prime-f388dcf8-16b3-47c8-a37f-d83f98b49404"
+      },
+      "status": "started"
+    },
+    {
+      "at": 32289,
+      "event": "soak-wire",
+      "kind": "request",
+      "frame": 491,
+      "socket": 5,
+      "generation": 5,
+      "endpoint": "localhost:9092",
+      "apiKey": 3,
+      "apiVersion": 13,
+      "correlationId": 4,
+      "clientId": "soak-share-prime",
+      "byteLength": 31,
+      "operation": "send",
+      "operationId": 196,
+      "role": "producer",
+      "bytes": "AAAAZgADAA0AAAAEABBzb2FrLXNoYXJlLXByaW1lAAIAAAAAAAAAAAAAAAAAAAAANnNvYWstc2hhcmUtcHJpbWUtZjM4OGRjZjgtMTZiMy00N2M4LWEzN2YtZDgzZjk4YjQ5NDA0AAEAAA=="
+    },
+    {
+      "at": 32289,
+      "event": "soak-wire",
+      "kind": "response",
+      "frame": 491,
+      "socket": 5,
+      "generation": 5,
+      "endpoint": "localhost:9092",
+      "correlationId": 4,
+      "bytes": "AAABMgAAAAQAAAAAAAQAAAABCmxvY2FsaG9zdAAAI4QAAAAAAAIKbG9jYWxob3N0AAAjhwAAAAAAAwpsb2NhbGhvc3QAACOKAAAXOUpyQVhXcWFUay1tZVRaVzJwNDZvQQAAAAMCAAA2c29hay1zaGFyZS1wcmltZS1mMzg4ZGNmOC0xNmIzLTQ3YzgtYTM3Zi1kODNmOThiNDk0MDR8l7ja/IhG2JpqIyqNZExhAAQAAAAAAAAAAAABAAAAAAQAAAABAAAAAgAAAAMEAAAAAQAAAAIAAAADAQAAAAAAAAEAAAACAAAAAAQAAAACAAAAAwAAAAEEAAAAAgAAAAMAAAABAQAAAAAAAAIAAAADAAAAAAQAAAADAAAAAQAAAAIEAAAAAwAAAAEAAAACAQCAAAAAAAAAAA=="
+    },
+    {
+      "at": 32304,
+      "event": "soak-wire",
+      "kind": "request",
+      "frame": 492,
+      "socket": 5,
+      "generation": 5,
+      "endpoint": "localhost:9092",
+      "apiKey": 0,
+      "apiVersion": 13,
+      "correlationId": 5,
+      "clientId": "soak-share-prime",
+      "byteLength": 31,
+      "operation": "send",
+      "operationId": 196,
+      "role": "producer",
+      "bytes": "AAAC3gAAAA0AAAAFABBzb2FrLXNoYXJlLXByaW1lAAD//wAAdTACfJe42vyIRtiaaiMqjWRMYQIAAAAAogUAAAAAAAAAAAAAApUAAAAAApC09K8AAAAAABMAAAGLz+VoAAAAAYvP5WgAAAAAAAAAAAAAAAAAAAAAAAAUOAAAABRzb2FrLWtleS0wGHNvYWstdmFsdWUtMAA4AAACFHNvYWsta2V5LTMYc29hay12YWx1ZS0zADgAAAQUc29hay1rZXktNhhzb2FrLXZhbHVlLTYAOAAABhRzb2FrLWtleS05GHNvYWstdmFsdWUtOQA8AAAIFnNvYWsta2V5LTEyGnNvYWstdmFsdWUtMTIAPAAAChZzb2FrLWtleS0xNRpzb2FrLXZhbHVlLTE1ADwAAAwWc29hay1rZXktMTgac29hay12YWx1ZS0xOAA8AAAOFnNvYWsta2V5LTIxGnNvYWstdmFsdWUtMjEAPAAAEBZzb2FrLWtleS0yNBpzb2FrLXZhbHVlLTI0ADwAABIWc29hay1rZXktMjcac29hay12YWx1ZS0yNwA8AAAUFnNvYWsta2V5LTMwGnNvYWstdmFsdWUtMzAAPAAAFhZzb2FrLWtleS0zMxpzb2FrLXZhbHVlLTMzADwAABgWc29hay1rZXktMzYac29hay12YWx1ZS0zNgA8AAAaFnNvYWsta2V5LTM5GnNvYWstdmFsdWUtMzkAPAAAHBZzb2FrLWtleS00Mhpzb2FrLXZhbHVlLTQyADwAAB4Wc29hay1rZXktNDUac29hay12YWx1ZS00NQA8AAAgFnNvYWsta2V5LTQ4GnNvYWstdmFsdWUtNDgAPAAAIhZzb2FrLWtleS01MRpzb2FrLXZhbHVlLTUxADwAACQWc29hay1rZXktNTQac29hay12YWx1ZS01NAA8AAAmFnNvYWsta2V5LTU3GnNvYWstdmFsdWUtNTcAAAAA",
+      "codecs": [
+        0
+      ]
+    },
+    {
+      "at": 32310,
+      "event": "soak-wire",
+      "kind": "request",
+      "frame": 497,
+      "socket": 15,
+      "generation": 15,
+      "endpoint": "localhost:9095",
+      "apiKey": 0,
+      "apiVersion": 13,
+      "correlationId": 2,
+      "clientId": "soak-share-prime",
+      "byteLength": 31,
+      "operation": "send",
+      "operationId": 196,
+      "role": "producer",
+      "bytes": "AAAC4AAAAA0AAAACABBzb2FrLXNoYXJlLXByaW1lAAD//wAAdTACfJe42vyIRtiaaiMqjWRMYQIAAAABpAUAAAAAAAAAAAAAApcAAAAAAsQQ8qEAAAAAABMAAAGLz+VoAAAAAYvP5WgAAAAAAAAAAAAAAAAAAAAAAAAUOAAAABRzb2FrLWtleS0xGHNvYWstdmFsdWUtMQA4AAACFHNvYWsta2V5LTQYc29hay12YWx1ZS00ADgAAAQUc29hay1rZXktNxhzb2FrLXZhbHVlLTcAPAAABhZzb2FrLWtleS0xMBpzb2FrLXZhbHVlLTEwADwAAAgWc29hay1rZXktMTMac29hay12YWx1ZS0xMwA8AAAKFnNvYWsta2V5LTE2GnNvYWstdmFsdWUtMTYAPAAADBZzb2FrLWtleS0xORpzb2FrLXZhbHVlLTE5ADwAAA4Wc29hay1rZXktMjIac29hay12YWx1ZS0yMgA8AAAQFnNvYWsta2V5LTI1GnNvYWstdmFsdWUtMjUAPAAAEhZzb2FrLWtleS0yOBpzb2FrLXZhbHVlLTI4ADwAABQWc29hay1rZXktMzEac29hay12YWx1ZS0zMQA8AAAWFnNvYWsta2V5LTM0GnNvYWstdmFsdWUtMzQAPAAAGBZzb2FrLWtleS0zNxpzb2FrLXZhbHVlLTM3ADwAABoWc29hay1rZXktNDAac29hay12YWx1ZS00MAA8AAAcFnNvYWsta2V5LTQzGnNvYWstdmFsdWUtNDMAPAAAHhZzb2FrLWtleS00Nhpzb2FrLXZhbHVlLTQ2ADwAACAWc29hay1rZXktNDkac29hay12YWx1ZS00OQA8AAAiFnNvYWsta2V5LTUyGnNvYWstdmFsdWUtNTIAPAAAJBZzb2FrLWtleS01NRpzb2FrLXZhbHVlLTU1ADwAACYWc29hay1rZXktNTgac29hay12YWx1ZS01OAAAAAA=",
+      "codecs": [
+        0
+      ]
+    },
+    {
+      "at": 32312,
+      "event": "soak-wire",
+      "kind": "request",
+      "frame": 498,
+      "socket": 16,
+      "generation": 16,
+      "endpoint": "localhost:9098",
+      "apiKey": 0,
+      "apiVersion": 13,
+      "correlationId": 2,
+      "clientId": "soak-share-prime",
+      "byteLength": 31,
+      "operation": "send",
+      "operationId": 196,
+      "role": "producer",
+      "bytes": "AAAC4AAAAA0AAAACABBzb2FrLXNoYXJlLXByaW1lAAD//wAAdTACfJe42vyIRtiaaiMqjWRMYQIAAAACpAUAAAAAAAAAAAAAApcAAAAAAuHPqVkAAAAAABMAAAGLz+VoAAAAAYvP5WgAAAAAAAAAAAAAAAAAAAAAAAAUOAAAABRzb2FrLWtleS0yGHNvYWstdmFsdWUtMgA4AAACFHNvYWsta2V5LTUYc29hay12YWx1ZS01ADgAAAQUc29hay1rZXktOBhzb2FrLXZhbHVlLTgAPAAABhZzb2FrLWtleS0xMRpzb2FrLXZhbHVlLTExADwAAAgWc29hay1rZXktMTQac29hay12YWx1ZS0xNAA8AAAKFnNvYWsta2V5LTE3GnNvYWstdmFsdWUtMTcAPAAADBZzb2FrLWtleS0yMBpzb2FrLXZhbHVlLTIwADwAAA4Wc29hay1rZXktMjMac29hay12YWx1ZS0yMwA8AAAQFnNvYWsta2V5LTI2GnNvYWstdmFsdWUtMjYAPAAAEhZzb2FrLWtleS0yORpzb2FrLXZhbHVlLTI5ADwAABQWc29hay1rZXktMzIac29hay12YWx1ZS0zMgA8AAAWFnNvYWsta2V5LTM1GnNvYWstdmFsdWUtMzUAPAAAGBZzb2FrLWtleS0zOBpzb2FrLXZhbHVlLTM4ADwAABoWc29hay1rZXktNDEac29hay12YWx1ZS00MQA8AAAcFnNvYWsta2V5LTQ0GnNvYWstdmFsdWUtNDQAPAAAHhZzb2FrLWtleS00Nxpzb2FrLXZhbHVlLTQ3ADwAACAWc29hay1rZXktNTAac29hay12YWx1ZS01MAA8AAAiFnNvYWsta2V5LTUzGnNvYWstdmFsdWUtNTMAPAAAJBZzb2FrLWtleS01Nhpzb2FrLXZhbHVlLTU2ADwAACYWc29hay1rZXktNTkac29hay12YWx1ZS01OQAAAAA=",
+      "codecs": [
+        0
+      ]
+    },
+    {
+      "at": 32333,
+      "event": "soak-wire",
+      "kind": "response",
+      "frame": 497,
+      "socket": 15,
+      "generation": 15,
+      "endpoint": "localhost:9095",
+      "correlationId": 2,
+      "bytes": "AAAAPgAAAAIAAnyXuNr8iEbYmmojKo1kTGECAAAAAQAAAAAAAAAAAAD//////////wAAAAAAAAAAAQAAAAAAAAAA"
+    },
+    {
+      "at": 32337,
+      "event": "soak-wire",
+      "kind": "operation",
+      "role": "producer",
+      "name": "send",
+      "id": 197,
+      "target": {
+        "topic": "soak-share-prime-f388dcf8-16b3-47c8-a37f-d83f98b49404"
+      },
+      "status": "passed",
+      "result": [
+        {
+          "topicName": "soak-share-prime-f388dcf8-16b3-47c8-a37f-d83f98b49404",
+          "partition": 1,
+          "errorCode": 0,
+          "baseOffset": "0",
+          "logAppendTime": "-1",
+          "logStartOffset": "0"
+        }
+      ]
+    },
+    {
+      "at": "2026-11-12T11:37:47.258Z",
+      "event": "soak-producer",
+      "cycle": 0,
+      "topic": "soak-share-prime-f388dcf8-16b3-47c8-a37f-d83f98b49404",
+      "partition": 1,
+      "messages": [
+        {
+          "partition": 1,
+          "key": "736f616b2d6b65792d31",
+          "value": "736f616b2d76616c75652d31",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 1,
+          "key": "736f616b2d6b65792d34",
+          "value": "736f616b2d76616c75652d34",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 1,
+          "key": "736f616b2d6b65792d37",
+          "value": "736f616b2d76616c75652d37",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 1,
+          "key": "736f616b2d6b65792d3130",
+          "value": "736f616b2d76616c75652d3130",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 1,
+          "key": "736f616b2d6b65792d3133",
+          "value": "736f616b2d76616c75652d3133",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 1,
+          "key": "736f616b2d6b65792d3136",
+          "value": "736f616b2d76616c75652d3136",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 1,
+          "key": "736f616b2d6b65792d3139",
+          "value": "736f616b2d76616c75652d3139",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 1,
+          "key": "736f616b2d6b65792d3232",
+          "value": "736f616b2d76616c75652d3232",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 1,
+          "key": "736f616b2d6b65792d3235",
+          "value": "736f616b2d76616c75652d3235",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 1,
+          "key": "736f616b2d6b65792d3238",
+          "value": "736f616b2d76616c75652d3238",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 1,
+          "key": "736f616b2d6b65792d3331",
+          "value": "736f616b2d76616c75652d3331",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 1,
+          "key": "736f616b2d6b65792d3334",
+          "value": "736f616b2d76616c75652d3334",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 1,
+          "key": "736f616b2d6b65792d3337",
+          "value": "736f616b2d76616c75652d3337",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 1,
+          "key": "736f616b2d6b65792d3430",
+          "value": "736f616b2d76616c75652d3430",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 1,
+          "key": "736f616b2d6b65792d3433",
+          "value": "736f616b2d76616c75652d3433",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 1,
+          "key": "736f616b2d6b65792d3436",
+          "value": "736f616b2d76616c75652d3436",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 1,
+          "key": "736f616b2d6b65792d3439",
+          "value": "736f616b2d76616c75652d3439",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 1,
+          "key": "736f616b2d6b65792d3532",
+          "value": "736f616b2d76616c75652d3532",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 1,
+          "key": "736f616b2d6b65792d3535",
+          "value": "736f616b2d76616c75652d3535",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 1,
+          "key": "736f616b2d6b65792d3538",
+          "value": "736f616b2d76616c75652d3538",
+          "timestamp": "1700000000000"
+        }
+      ],
+      "sent": [
+        {
+          "topicName": "soak-share-prime-f388dcf8-16b3-47c8-a37f-d83f98b49404",
+          "partition": 1,
+          "errorCode": 0,
+          "baseOffset": "0",
+          "logAppendTime": "-1",
+          "logStartOffset": "0"
+        }
+      ]
+    },
+    {
+      "at": 32338,
+      "event": "soak-wire",
+      "kind": "response",
+      "frame": 492,
+      "socket": 5,
+      "generation": 5,
+      "endpoint": "localhost:9092",
+      "correlationId": 5,
+      "bytes": "AAAAPgAAAAUAAnyXuNr8iEbYmmojKo1kTGECAAAAAAAAAAAAAAAAAAD//////////wAAAAAAAAAAAQAAAAAAAAAA"
+    },
+    {
+      "at": 32341,
+      "event": "soak-wire",
+      "kind": "operation",
+      "role": "producer",
+      "name": "send",
+      "id": 196,
+      "target": {
+        "topic": "soak-share-prime-f388dcf8-16b3-47c8-a37f-d83f98b49404"
+      },
+      "status": "passed",
+      "result": [
+        {
+          "topicName": "soak-share-prime-f388dcf8-16b3-47c8-a37f-d83f98b49404",
+          "partition": 0,
+          "errorCode": 0,
+          "baseOffset": "0",
+          "logAppendTime": "-1",
+          "logStartOffset": "0"
+        }
+      ]
+    },
+    {
+      "at": "2026-11-12T11:37:47.261Z",
+      "event": "soak-producer",
+      "cycle": 0,
+      "topic": "soak-share-prime-f388dcf8-16b3-47c8-a37f-d83f98b49404",
+      "partition": 0,
+      "messages": [
+        {
+          "partition": 0,
+          "key": "736f616b2d6b65792d30",
+          "value": "736f616b2d76616c75652d30",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 0,
+          "key": "736f616b2d6b65792d33",
+          "value": "736f616b2d76616c75652d33",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 0,
+          "key": "736f616b2d6b65792d36",
+          "value": "736f616b2d76616c75652d36",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 0,
+          "key": "736f616b2d6b65792d39",
+          "value": "736f616b2d76616c75652d39",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 0,
+          "key": "736f616b2d6b65792d3132",
+          "value": "736f616b2d76616c75652d3132",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 0,
+          "key": "736f616b2d6b65792d3135",
+          "value": "736f616b2d76616c75652d3135",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 0,
+          "key": "736f616b2d6b65792d3138",
+          "value": "736f616b2d76616c75652d3138",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 0,
+          "key": "736f616b2d6b65792d3231",
+          "value": "736f616b2d76616c75652d3231",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 0,
+          "key": "736f616b2d6b65792d3234",
+          "value": "736f616b2d76616c75652d3234",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 0,
+          "key": "736f616b2d6b65792d3237",
+          "value": "736f616b2d76616c75652d3237",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 0,
+          "key": "736f616b2d6b65792d3330",
+          "value": "736f616b2d76616c75652d3330",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 0,
+          "key": "736f616b2d6b65792d3333",
+          "value": "736f616b2d76616c75652d3333",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 0,
+          "key": "736f616b2d6b65792d3336",
+          "value": "736f616b2d76616c75652d3336",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 0,
+          "key": "736f616b2d6b65792d3339",
+          "value": "736f616b2d76616c75652d3339",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 0,
+          "key": "736f616b2d6b65792d3432",
+          "value": "736f616b2d76616c75652d3432",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 0,
+          "key": "736f616b2d6b65792d3435",
+          "value": "736f616b2d76616c75652d3435",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 0,
+          "key": "736f616b2d6b65792d3438",
+          "value": "736f616b2d76616c75652d3438",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 0,
+          "key": "736f616b2d6b65792d3531",
+          "value": "736f616b2d76616c75652d3531",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 0,
+          "key": "736f616b2d6b65792d3534",
+          "value": "736f616b2d76616c75652d3534",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 0,
+          "key": "736f616b2d6b65792d3537",
+          "value": "736f616b2d76616c75652d3537",
+          "timestamp": "1700000000000"
+        }
+      ],
+      "sent": [
+        {
+          "topicName": "soak-share-prime-f388dcf8-16b3-47c8-a37f-d83f98b49404",
+          "partition": 0,
+          "errorCode": 0,
+          "baseOffset": "0",
+          "logAppendTime": "-1",
+          "logStartOffset": "0"
+        }
+      ]
+    },
+    {
+      "at": 32350,
+      "event": "soak-wire",
+      "kind": "response",
+      "frame": 498,
+      "socket": 16,
+      "generation": 16,
+      "endpoint": "localhost:9098",
+      "correlationId": 2,
+      "bytes": "AAAAPgAAAAIAAnyXuNr8iEbYmmojKo1kTGECAAAAAgAAAAAAAAAAAAD//////////wAAAAAAAAAAAQAAAAAAAAAA"
+    },
+    {
+      "at": 32351,
+      "event": "soak-wire",
+      "kind": "operation",
+      "role": "producer",
+      "name": "send",
+      "id": 198,
+      "target": {
+        "topic": "soak-share-prime-f388dcf8-16b3-47c8-a37f-d83f98b49404"
+      },
+      "status": "passed",
+      "result": [
+        {
+          "topicName": "soak-share-prime-f388dcf8-16b3-47c8-a37f-d83f98b49404",
+          "partition": 2,
+          "errorCode": 0,
+          "baseOffset": "0",
+          "logAppendTime": "-1",
+          "logStartOffset": "0"
+        }
+      ]
+    },
+    {
+      "at": "2026-11-12T11:37:47.271Z",
+      "event": "soak-producer",
+      "cycle": 0,
+      "topic": "soak-share-prime-f388dcf8-16b3-47c8-a37f-d83f98b49404",
+      "partition": 2,
+      "messages": [
+        {
+          "partition": 2,
+          "key": "736f616b2d6b65792d32",
+          "value": "736f616b2d76616c75652d32",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 2,
+          "key": "736f616b2d6b65792d35",
+          "value": "736f616b2d76616c75652d35",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 2,
+          "key": "736f616b2d6b65792d38",
+          "value": "736f616b2d76616c75652d38",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 2,
+          "key": "736f616b2d6b65792d3131",
+          "value": "736f616b2d76616c75652d3131",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 2,
+          "key": "736f616b2d6b65792d3134",
+          "value": "736f616b2d76616c75652d3134",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 2,
+          "key": "736f616b2d6b65792d3137",
+          "value": "736f616b2d76616c75652d3137",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 2,
+          "key": "736f616b2d6b65792d3230",
+          "value": "736f616b2d76616c75652d3230",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 2,
+          "key": "736f616b2d6b65792d3233",
+          "value": "736f616b2d76616c75652d3233",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 2,
+          "key": "736f616b2d6b65792d3236",
+          "value": "736f616b2d76616c75652d3236",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 2,
+          "key": "736f616b2d6b65792d3239",
+          "value": "736f616b2d76616c75652d3239",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 2,
+          "key": "736f616b2d6b65792d3332",
+          "value": "736f616b2d76616c75652d3332",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 2,
+          "key": "736f616b2d6b65792d3335",
+          "value": "736f616b2d76616c75652d3335",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 2,
+          "key": "736f616b2d6b65792d3338",
+          "value": "736f616b2d76616c75652d3338",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 2,
+          "key": "736f616b2d6b65792d3431",
+          "value": "736f616b2d76616c75652d3431",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 2,
+          "key": "736f616b2d6b65792d3434",
+          "value": "736f616b2d76616c75652d3434",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 2,
+          "key": "736f616b2d6b65792d3437",
+          "value": "736f616b2d76616c75652d3437",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 2,
+          "key": "736f616b2d6b65792d3530",
+          "value": "736f616b2d76616c75652d3530",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 2,
+          "key": "736f616b2d6b65792d3533",
+          "value": "736f616b2d76616c75652d3533",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 2,
+          "key": "736f616b2d6b65792d3536",
+          "value": "736f616b2d76616c75652d3536",
+          "timestamp": "1700000000000"
+        },
+        {
+          "partition": 2,
+          "key": "736f616b2d6b65792d3539",
+          "value": "736f616b2d76616c75652d3539",
+          "timestamp": "1700000000000"
+        }
+      ],
+      "sent": [
+        {
+          "topicName": "soak-share-prime-f388dcf8-16b3-47c8-a37f-d83f98b49404",
+          "partition": 2,
+          "errorCode": 0,
+          "baseOffset": "0",
+          "logAppendTime": "-1",
+          "logStartOffset": "0"
+        }
+      ]
+    }
+  ],
+  "listings": [
+    {
+      "at": 1954417,
+      "event": "soak-wire",
+      "kind": "operation",
+      "role": "admin",
+      "name": "listTopics",
+      "id": 14502,
+      "target": {},
+      "status": "started"
+    },
+    {
+      "at": 1954418,
+      "event": "soak-wire",
+      "kind": "request",
+      "frame": 36611,
+      "socket": 1470,
+      "generation": 1470,
+      "endpoint": "localhost:9092",
+      "apiKey": 3,
+      "apiVersion": 13,
+      "correlationId": 10,
+      "operation": "listTopics",
+      "operationId": 14502,
+      "role": "admin",
+      "bytes": "AAAAGQADAA0AAAAKAApzb2FrLXNoYXJlAAAAAAA="
+    },
+    {
+      "at": 1954418,
+      "event": "soak-wire",
+      "kind": "response",
+      "frame": 36611,
+      "socket": 1470,
+      "generation": 1470,
+      "endpoint": "localhost:9092",
+      "correlationId": 10,
+      "bytes": "AAAOBgAAAAoAAAAAAAQAAAABCmxvY2FsaG9zdAAAI4QAAAAAAAIKbG9jYWxob3N0AAAjhwAAAAAAAwpsb2NhbGhvc3QAACOKAAAXOUpyQVhXcWFUay1tZVRaVzJwNDZvQQAAAAEDAAAUX19zaGFyZV9ncm91cF9zdGF0ZcvS2AXVkkj+oRkfoJJuXT4BMwAAAAAAAAAAAAIAAAAAAwAAAAIAAAADAwAAAAIAAAADAQAAAAAAAAEAAAADAAAAAAMAAAADAAAAAQMAAAADAAAAAQEAAAAAAAACAAAAAQAAAAADAAAAAQAAAAIDAAAAAQAAAAIBAAAAAAAAAwAAAAMAAAAAAwAAAAMAAAABAwAAAAMAAAABAQAAAAAAAAQAAAABAAAAAAMAAAABAAAAAgMAAAABAAAAAgEAAAAAAAAFAAAAAgAAAAADAAAAAgAAAAMDAAAAAgAAAAMBAAAAAAAABgAAAAIAAAAAAwAAAAIAAAABAwAAAAIAAAABAQAAAAAAAAcAAAABAAAAAAMAAAABAAAAAwMAAAABAAAAAwEAAAAAAAAIAAAAAwAAAAADAAAAAwAAAAIDAAAAAwAAAAIBAAAAAAAACQAAAAIAAAAAAwAAAAIAAAABAwAAAAIAAAABAQAAAAAAAAoAAAABAAAAAAMAAAABAAAAAwMAAAABAAAAAwEAAAAAAAALAAAAAwAAAAADAAAAAwAAAAIDAAAAAwAAAAIBAAAAAAAADAAAAAMAAAAAAwAAAAMAAAACAwAAAAMAAAACAQAAAAAAAA0AAAACAAAAAAMAAAACAAAAAQMAAAACAAAAAQEAAAAAAAAOAAAAAQAAAAADAAAAAQAAAAMDAAAAAQAAAAMBAAAAAAAADwAAAAMAAAAAAwAAAAMAAAACAwAAAAMAAAACAQAAAAAAABAAAAACAAAAAAMAAAACAAAAAQMAAAACAAAAAQEAAAAAAAARAAAAAQAAAAADAAAAAQAAAAMDAAAAAQAAAAMBAAAAAAAAEgAAAAEAAAAAAwAAAAEAAAACAwAAAAEAAAACAQAAAAAAABMAAAACAAAAAAMAAAACAAAAAwMAAAACAAAAAwEAAAAAAAAUAAAAAwAAAAADAAAAAwAAAAEDAAAAAwAAAAEBAAAAAAAAFQAAAAEAAAAAAwAAAAEAAAACAwAAAAEAAAACAQAAAAAAABYAAAACAAAAAAMAAAACAAAAAwMAAAACAAAAAwEAAAAAAAAXAAAAAwAAAAADAAAAAwAAAAEDAAAAAwAAAAEBAAAAAAAAGAAAAAMAAAAAAwAAAAMAAAABAwAAAAMAAAABAQAAAAAAABkAAAABAAAAAAMAAAABAAAAAgMAAAABAAAAAgEAAAAAAAAaAAAAAgAAAAADAAAAAgAAAAMDAAAAAgAAAAMBAAAAAAAAGwAAAAEAAAAAAwAAAAEAAAADAwAAAAEAAAADAQAAAAAAABwAAAADAAAAAAMAAAADAAAAAgMAAAADAAAAAgEAAAAAAAAdAAAAAgAAAAADAAAAAgAAAAEDAAAAAgAAAAEBAAAAAAAAHgAAAAEAAAAAAwAAAAEAAAADAwAAAAEAAAADAQAAAAAAAB8AAAADAAAAAAMAAAADAAAAAgMAAAADAAAAAgEAAAAAAAAgAAAAAgAAAAADAAAAAgAAAAEDAAAAAgAAAAEBAAAAAAAAIQAAAAEAAAAAAwAAAAEAAAADAwAAAAEAAAADAQAAAAAAACIAAAADAAAAAAMAAAADAAAAAgMAAAADAAAAAgEAAAAAAAAjAAAAAgAAAAADAAAAAgAAAAEDAAAAAgAAAAEBAAAAAAAAJAAAAAMAAAAAAwAAAAMAAAACAwAAAAMAAAACAQAAAAAAACUAAAACAAAAAAMAAAACAAAAAQMAAAACAAAAAQEAAAAAAAAmAAAAAQAAAAADAAAAAQAAAAMDAAAAAQAAAAMBAAAAAAAAJwAAAAIAAAAAAwAAAAIAAAABAwAAAAIAAAABAQAAAAAAACgAAAABAAAAAAMAAAABAAAAAwMAAAABAAAAAwEAAAAAAAApAAAAAwAAAAADAAAAAwAAAAIDAAAAAwAAAAIBAAAAAAAAKgAAAAMAAAAAAwAAAAMAAAACAwAAAAMAAAACAQAAAAAAACsAAAACAAAAAAMAAAACAAAAAQMAAAACAAAAAQEAAAAAAAAsAAAAAQAAAAADAAAAAQAAAAMDAAAAAQAAAAMBAAAAAAAALQAAAAMAAAAAAwAAAAMAAAABAwAAAAMAAAABAQAAAAAAAC4AAAABAAAAAAMAAAABAAAAAgMAAAABAAAAAgEAAAAAAAAvAAAAAgAAAAADAAAAAgAAAAMDAAAAAgAAAAMBAAAAAAAAMAAAAAEAAAAAAwAAAAEAAAADAwAAAAEAAAADAQAAAAAAADEAAAADAAAAAAMAAAADAAAAAgMAAAADAAAAAgEAgAAAAAAAABNfX2NvbnN1bWVyX29mZnNldHODuem01D5P3KtHttqAl6QGATMAAAAAAAAAAAADAAAAAAMAAAADAAAAAQMAAAADAAAAAQEAAAAAAAABAAAAAQAAAAADAAAAAQAAAAIDAAAAAQAAAAIBAAAAAAAAAgAAAAIAAAAAAwAAAAIAAAADAwAAAAIAAAADAQAAAAAAAAMAAAACAAAAAAMAAAACAAAAAQMAAAACAAAAAQEAAAAAAAAEAAAAAQAAAAADAAAAAQAAAAMDAAAAAQAAAAMBAAAAAAAABQAAAAMAAAAAAwAAAAMAAAACAwAAAAMAAAACAQAAAAAAAAYAAAABAAAAAAMAAAABAAAAAgMAAAABAAAAAgEAAAAAAAAHAAAAAgAAAAADAAAAAgAAAAMDAAAAAgAAAAMBAAAAAAAACAAAAAMAAAAAAwAAAAMAAAABAwAAAAMAAAABAQAAAAAAAAkAAAABAAAAAAMAAAABAAAAAgMAAAABAAAAAgEAAAAAAAAKAAAAAgAAAAADAAAAAgAAAAMDAAAAAgAAAAMBAAAAAAAACwAAAAMAAAAAAwAAAAMAAAABAwAAAAMAAAABAQAAAAAAAAwAAAABAAAAAAMAAAABAAAAAgMAAAABAAAAAgEAAAAAAAANAAAAAgAAAAADAAAAAgAAAAMDAAAAAgAAAAMBAAAAAAAADgAAAAMAAAAAAwAAAAMAAAABAwAAAAMAAAABAQAAAAAAAA8AAAACAAAAAAMAAAACAAAAAwMAAAACAAAAAwEAAAAAAAAQAAAAAwAAAAADAAAAAwAAAAEDAAAAAwAAAAEBAAAAAAAAEQAAAAEAAAAAAwAAAAEAAAACAwAAAAEAAAACAQAAAAAAABIAAAACAAAAAAMAAAACAAAAAwMAAAACAAAAAwEAAAAAAAATAAAAAwAAAAADAAAAAwAAAAEDAAAAAwAAAAEBAAAAAAAAFAAAAAEAAAAAAwAAAAEAAAACAwAAAAEAAAACAQAAAAAAABUAAAACAAAAAAMAAAACAAAAAwMAAAACAAAAAwEAAAAAAAAWAAAAAwAAAAADAAAAAwAAAAEDAAAAAwAAAAEBAAAAAAAAFwAAAAEAAAAAAwAAAAEAAAACAwAAAAEAAAACAQAAAAAAABgAAAACAAAAAAMAAAACAAAAAQMAAAACAAAAAQEAAAAAAAAZAAAAAQAAAAADAAAAAQAAAAMDAAAAAQAAAAMBAAAAAAAAGgAAAAMAAAAAAwAAAAMAAAACAwAAAAMAAAACAQAAAAAAABsAAAACAAAAAAMAAAACAAAAAQMAAAACAAAAAQEAAAAAAAAcAAAAAQAAAAADAAAAAQAAAAMDAAAAAQAAAAMBAAAAAAAAHQAAAAMAAAAAAwAAAAMAAAACAwAAAAMAAAACAQAAAAAAAB4AAAABAAAAAAMAAAABAAAAAwMAAAABAAAAAwEAAAAAAAAfAAAAAwAAAAADAAAAAwAAAAIDAAAAAwAAAAIBAAAAAAAAIAAAAAIAAAAAAwAAAAIAAAABAwAAAAIAAAABAQAAAAAAACEAAAACAAAAAAMAAAACAAAAAwMAAAACAAAAAwEAAAAAAAAiAAAAAwAAAAADAAAAAwAAAAEDAAAAAwAAAAEBAAAAAAAAIwAAAAEAAAAAAwAAAAEAAAACAwAAAAEAAAACAQAAAAAAACQAAAACAAAAAAMAAAACAAAAAwMAAAACAAAAAwEAAAAAAAAlAAAAAwAAAAADAAAAAwAAAAEDAAAAAwAAAAEBAAAAAAAAJgAAAAEAAAAAAwAAAAEAAAACAwAAAAEAAAACAQAAAAAAACcAAAACAAAAAAMAAAACAAAAAQMAAAACAAAAAQEAAAAAAAAoAAAAAQAAAAADAAAAAQAAAAMDAAAAAQAAAAMBAAAAAAAAKQAAAAMAAAAAAwAAAAMAAAACAwAAAAMAAAACAQAAAAAAACoAAAABAAAAAAMAAAABAAAAAwMAAAABAAAAAwEAAAAAAAArAAAAAwAAAAADAAAAAwAAAAIDAAAAAwAAAAIBAAAAAAAALAAAAAIAAAAAAwAAAAIAAAABAwAAAAIAAAABAQAAAAAAAC0AAAABAAAAAAMAAAABAAAAAgMAAAABAAAAAgEAAAAAAAAuAAAAAgAAAAADAAAAAgAAAAMDAAAAAgAAAAMBAAAAAAAALwAAAAMAAAAAAwAAAAMAAAABAwAAAAMAAAABAQAAAAAAADAAAAABAAAAAAMAAAABAAAAAgMAAAABAAAAAgEAAAAAAAAxAAAAAgAAAAADAAAAAgAAAAMDAAAAAgAAAAMBAIAAAAAAAAAA"
+    },
+    {
+      "at": 1954419,
+      "event": "soak-wire",
+      "kind": "operation",
+      "role": "admin",
+      "name": "listTopics",
+      "id": 14502,
+      "target": {},
+      "status": "passed",
+      "result": [
+        "__share_group_state",
+        "__consumer_offsets"
+      ]
+    }
+  ]
+}

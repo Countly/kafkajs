@@ -1,15 +1,17 @@
 'use strict'
 
 /**
- * Process memory measurement for the single-client resource arms. It loads only Node builtins, so
+ * Process memory measurement for the single-client resource arms. Its dependencies load no product, so
  * an arm can take its startup reading before any application module is imported.
  *
  * Absolute current-image high water comes from `/proc/self/status` `VmHWM` (kibibytes, scaled to
- * bytes). It is the nonresetting kernel maximum of this executable and covers spikes between
- * sampler callbacks. The raw `process.resourceUsage().maxRSS * 1024` is recorded beside it and is
- * never substituted for it. Nothing here writes `/proc/self/clear_refs` or resets a high water.
+ * bytes). Its approximate readings can decrease, so judges retain the maximum across all reads
+ * and separately check current-reading coverage. The raw `process.resourceUsage().maxRSS * 1024` is
+ * recorded beside it, can also decrease, and is never substituted for it. Nothing here writes
+ * `/proc/self/clear_refs` or resets a high water.
  */
 const fs = require('node:fs')
+const { FixedJournal } = require('./fixedJournal')
 const os = require('node:os')
 const v8 = require('node:v8')
 const { performance, PerformanceObserver } = require('node:perf_hooks')
@@ -17,13 +19,21 @@ const { performance, PerformanceObserver } = require('node:perf_hooks')
 const KIB = 1024
 
 /**
- * Request eager JavaScript bytecode and feedback allocation for this measurement tuple.
+ * Pin both semi-space sizes to 1 MiB and request eager bytecode and feedback allocation.
  * Execution can still grow compiled code and metadata; these flags do not establish retained stability.
  */
-const MEMORY_FLAGS = Object.freeze(['--expose-gc', '--no-lazy', '--no-lazy-feedback-allocation'])
+const MEMORY_FLAGS = Object.freeze([
+  '--expose-gc',
+  '--no-lazy',
+  '--no-lazy-feedback-allocation',
+  '--min-semi-space-size=1',
+  '--max-semi-space-size=1',
+])
 
 /** Collection convergence is stricter than any retained gate; it never changes an acceptance value. */
 const SETTLE = Object.freeze({ rounds: 6, bytes: 16384 })
+/** Only the resource control c0/c1 may spend this many collection pairs reaching convergence. */
+const CONTROL_SETTLE_ROUNDS = 12
 
 /**
  * @param {object|undefined} before preceding post-GC reading
@@ -35,6 +45,55 @@ const collectionsSettled = (before, after) =>
   ['heapUsed', 'external', 'arrayBuffers'].every(
     (field) => Math.abs(after[field] - before[field]) <= SETTLE.bytes
   )
+
+/**
+ * The quantity the closed-ceiling, first-use and control-stability gates judge: the bytes the
+ * heap and external memory hold, without what V8 spends on bytecode and compiled code. It is read
+ * from the final checkpoint of a settled reading, so it is the same moment as `retained`. It never
+ * feeds the RSS, external or peak gates.
+ * @param {{heapUsed: number, external: number, gc: {checkpoints: Array<{engine: {bytecode: number,
+ *   code: number}}>}}} reading a settled reading with its collection checkpoints
+ * @returns {number} `heapUsed + external - (bytecode + code)` at the final checkpoint
+ */
+const dataBytes = (reading) => {
+  const { bytecode, code } = reading.gc.checkpoints.at(-1).engine
+  return reading.heapUsed + reading.external - (bytecode + code)
+}
+
+/**
+ * Records adjacent decreases of valid peak counters without changing the readings. A rebound
+ * below an earlier maximum is not another decrease; missing or invalid counters are left to the
+ * caller's validation. The signed delta is `after - before`.
+ * @param {object[]} readings raw readings in catalogue order
+ * @param {string[]} fields peak counters to inspect
+ * @returns {Array<{index:number, phase:string, field:string, before:number, after:number,
+ *   delta:number}>} every observed decrease, in reading and field order
+ */
+const peakReadingDecreases = (readings, fields) => {
+  const decreases = []
+  for (let index = 1; index < readings.length; index++) {
+    for (const field of fields) {
+      const before = readings[index - 1]?.[field]
+      const after = readings[index]?.[field]
+      if (
+        Number.isSafeInteger(before) &&
+        before >= 0 &&
+        Number.isSafeInteger(after) &&
+        after >= 0 &&
+        after < before
+      )
+        decreases.push({
+          index,
+          phase: readings[index].phase,
+          field,
+          before,
+          after,
+          delta: after - before,
+        })
+    }
+  }
+  return decreases
+}
 
 /** What the selected absolute peak source is called and measures. */
 const PEAK_SOURCE = Object.freeze({ name: 'proc-self-status-vmhwm', units: 'bytes' })
@@ -183,7 +242,7 @@ class ProcessMemory {
 
   /**
    * Records the absolute high water at a phase boundary and starts a new covered interval. The
-   * current reading is taken before the kernel's, so the high water can never read below it.
+   * current reading is taken before the kernel's; the judge checks whether the peak covers it.
    * @param {string} phase the fixed catalogue name of the boundary
    * @returns {{phase:string, at:number, rss:number, vmhwm:number|null, maxRss:number,
    *   covered:number, coveredExternal:number, imports:{count:number,late:string[]}|null}} the mark, also kept in `marks`; `vmhwm` is null
@@ -216,25 +275,37 @@ class ProcessMemory {
 
   /**
    * Repeats the two-collection/100 ms protocol until two successive readings converge, with at
-   * most six pairs. Every reading remains in the evidence and contributes to peak coverage. The
-   * last reading is returned even when convergence fails; no minimum or favourable endpoint is
-   * selected. Engine code sizes diagnose first-use compilation separately, without subtracting it.
+   * most six pairs by default, or twelve for resource control c0/c1. Every reading remains in the
+   * evidence and contributes to peak coverage. The last reading is returned even when convergence
+   * fails; no minimum or favourable endpoint is
+   * selected. Every checkpoint records the engine's bytecode and compiled-code sizes; only
+   * `dataBytes` subtracts them, and only for the gates that name it.
+   * @param {Function|null} [observe] diagnostic-only synchronous (round, stage) scalar observer;
+   *   omitted in acceptance, with no additional reads, collections or turns
+   * @param {Function|null} [completed] diagnostic-only synchronous observer of the final reading
+   * @param {number} [rounds=SETTLE.rounds] collection-pair budget; only resource control c0/c1 use
+   *   `CONTROL_SETTLE_ROUNDS`, with the same convergence rule
    * @returns {Promise<object>} the final reading and all GC admission/completion/engine facts
    * @throws {Error} when no collection function exists
    */
-  async settled() {
+  async settled(observe = null, completed = null, rounds = SETTLE.rounds) {
     if (typeof this.gc !== 'function') throw new Error('A settled reading needs node --expose-gc')
     const admittedAt = this.now()
     const before = this.collections
     const checkpoints = []
-    for (let round = 0; round < SETTLE.rounds; round++) {
+    for (let round = 0; round < rounds; round++) {
       const started = this.now()
       const observed = this.collections
       this.gc()
       await this.sleep(GC_PAUSE_MS)
       this.gc()
+      if (observe) observe(round, 'after-second-gc')
+      if (observe) observe(round, 'before-turn-1')
       await this.settleTurn()
+      if (observe) observe(round, 'after-turn-1')
+      if (observe) observe(round, 'before-turn-2')
       await this.settleTurn()
+      if (observe) observe(round, 'after-turn-2')
       const code = v8.getHeapCodeStatistics()
       const reading = this.current()
       const checkpoint = {
@@ -254,10 +325,12 @@ class ProcessMemory {
         last[key],
       ])
     )
-    return {
+    const result = {
       ...reading,
       gc: { admittedAt, completedAt: reading.at, observed: this.collections - before, checkpoints },
     }
+    if (completed) completed(result)
+    return result
   }
 
   /** @returns {void} stops watching collections */
@@ -277,16 +350,20 @@ class PendingSampler {
    * @param {object} [timers] replaceable timers for tests
    * @param {(fn: () => void, ms: number) => *} [timers.set] `setInterval`
    * @param {(handle: *) => void} [timers.clear] `clearInterval`
+   * @param {number|null} [timers.capacity] fixed scalar window archive; null preserves the default
    * @returns {PendingSampler} a sampler with nothing pending
    */
-  constructor(memory, { set = setInterval, clear = clearInterval } = {}) {
+  constructor(memory, { set = setInterval, clear = clearInterval, capacity = null } = {}) {
     Object.assign(this, { memory, set, clear })
     this.pending = 0
     this.handle = null
     this.windowLast = null
     this.count = 0
     this.windows = 0
-    this.windowRows = []
+    this.windowRows =
+      capacity === null
+        ? []
+        : new FixedJournal({ name: 'pending windows', capacity, bytes: capacity * 256 })
     this.window = null
     this.overflow = false
     this.maxGapMs = 0
@@ -323,8 +400,10 @@ class PendingSampler {
     if (this.pending === 0) {
       this.windows += 1
       this.window = { begin: null, end: null, count: 0, rss: 0, external: 0 }
-      if (this.windowRows.length < WINDOW_CAPACITY) this.windowRows.push(this.window)
-      else this.overflow = true
+      if (!(this.windowRows instanceof FixedJournal)) {
+        if (this.windowRows.length < WINDOW_CAPACITY) this.windowRows.push(this.window)
+        else this.overflow = true
+      }
       this.windowLast = null
       this.handle = this.set(() => this.take(), SAMPLE_MS)
     }
@@ -344,6 +423,7 @@ class PendingSampler {
     if (this.pending === 0) {
       this.clear(this.handle)
       this.handle = null
+      if (this.windowRows instanceof FixedJournal) this.windowRows.push(this.window)
       this.window = null
     }
     return reading
@@ -362,6 +442,11 @@ class PendingSampler {
     this.pending = 0
   }
 
+  /** @returns {object} fixed window capacity and append cursor, without materialising rows */
+  journalState() {
+    return this.windowRows.journalState()
+  }
+
   /**
    * @returns {{count:number, windows:number, pendingWindows:Array<{begin:number, end:number,
    *   count:number, rss:number, external:number}>, overflow:boolean, maxGapMs:number,
@@ -372,7 +457,10 @@ class PendingSampler {
     return {
       count: this.count,
       windows: this.windows,
-      pendingWindows: this.windowRows.map((window) => ({ ...window })),
+      pendingWindows:
+        this.windowRows instanceof FixedJournal
+          ? [...this.windowRows.values(), ...(this.window ? [{ ...this.window }] : [])]
+          : this.windowRows.map((window) => ({ ...window })),
       overflow: this.overflow,
       maxGapMs: this.maxGapMs,
       intervalMs: SAMPLE_MS,
@@ -396,11 +484,22 @@ class NativeJournal {
    * @param {() => number} [options.epoch] the arm's lifecycle counter; a job that settles in a
    *   later epoch than it was submitted in is a retired completion
    * @param {(row: object) => void} [options.onSubmit] called synchronously after a submission
+   * @param {boolean} [options.fixed] reserve and touch scalar byte storage before M; overflow throws
    * @returns {NativeJournal} a journal observing nothing yet
    */
-  constructor({ memory, sampler, capacity = 32, epoch = () => 0, onSubmit = () => {} }) {
+  constructor({
+    memory,
+    sampler,
+    capacity = 32,
+    epoch = () => 0,
+    onSubmit = () => {},
+    fixed = false,
+  }) {
     Object.assign(this, { memory, sampler, capacity, epoch, onSubmit })
-    this.rows = []
+    this.rows = fixed
+      ? new FixedJournal({ name: 'native work', capacity, bytes: capacity * 2048 })
+      : []
+    this.submitted = 0
     this.live = new Set()
     this.maxLive = 0
     this.overflow = false
@@ -456,13 +555,14 @@ class NativeJournal {
    * @returns {object|null} the row, or null once the capacity is exceeded
    */
   begin(codec, job) {
-    if (this.rows.length >= this.capacity) {
+    if (this.submitted >= this.capacity) {
       this.overflow = true
+      if (this.rows instanceof FixedJournal) throw new Error('native work journal overflow')
       return null
     }
     const input = job?.buffer
     const row = {
-      id: this.rows.length + 1,
+      id: ++this.submitted,
       codec,
       jobId: this.idOf(job),
       inputId: this.idOf(input),
@@ -480,7 +580,7 @@ class NativeJournal {
       distinctBackingBytes: 0,
       retired: false,
     }
-    this.rows.push(row)
+    if (!(this.rows instanceof FixedJournal)) this.rows.push(row)
     this.live.add(row)
     row.submitted = this.sampler.begin()
     this.maxLive = Math.max(this.maxLive, this.live.size)
@@ -508,6 +608,7 @@ class NativeJournal {
     if (row.resultBackingId !== null) distinct.set(row.resultBackingId, row.resultBackingBytes)
     row.distinctBackingBytes = [...distinct.values()].reduce((sum, bytes) => sum + bytes, 0)
     row.retired = this.epoch() !== row.epoch
+    if (this.rows instanceof FixedJournal) this.rows.push(row)
   }
 
   /** @returns {void} restores every wrapped module */
@@ -515,12 +616,21 @@ class NativeJournal {
     while (this.restores.length) this.restores.pop()()
   }
 
+  /** @returns {object} reserved native-row capacity and cursor, with no product references */
+  journalState() {
+    const state = this.rows.journalState()
+    return { ...state, overflow: state.overflow || this.overflow }
+  }
+
   /**
    * @returns {{rows: object[], maxLive: number, live: number, overflow: boolean}} bounded facts
    */
   summary() {
     return {
-      rows: this.rows.map((row) => ({ ...row })),
+      rows:
+        this.rows instanceof FixedJournal
+          ? [...this.rows.values(), ...this.live].sort((a, b) => a.id - b.id)
+          : this.rows.map((row) => ({ ...row })),
       maxLive: this.maxLive,
       live: this.live.size,
       overflow: this.overflow,
@@ -564,7 +674,10 @@ class BoundaryWitness {
 module.exports = {
   MEMORY_FLAGS,
   SETTLE,
+  CONTROL_SETTLE_ROUNDS,
   collectionsSettled,
+  dataBytes,
+  peakReadingDecreases,
   PEAK_SOURCE,
   SAMPLE_MS,
   GC_PAUSE_MS,

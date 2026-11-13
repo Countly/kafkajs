@@ -146,6 +146,30 @@ describe('share owner cleanup populations', () => {
     bounded.liveRun.reset()
   })
 
+  test('preserves non-CI driver methods, RPC calls and results from the original soak', async () => {
+    const environment = { ...process.env }
+    delete process.env.KAFKAJS_SOAK_PROFILE
+    const { owner, driver, admin, shares, rows } = cleanupOwner()
+    const methods = ['readConfiguration', 'cycle', 'final', 'produce', 'readLogs', 'awaitMembers']
+    const originals = methods.map((name) => driver[name])
+    try {
+      expect(await owner.run()).toEqual({ ok: true, violations: [], measured: {} })
+      expect(methods.map((name) => driver[name])).toEqual(originals)
+      expect(driver.primitiveEvidence).toBeUndefined()
+      expect(driver.tap.archive).toBeUndefined()
+      expect(admin.fetchTopicMetadata).toHaveBeenCalledTimes(1)
+      expect(admin.describeConfigs).toBeUndefined()
+      expect(admin.createTopics).toHaveBeenCalledTimes(1)
+      expect(admin.deleteTopics).toHaveBeenCalledTimes(1)
+      expect(admin.deleteGroups).toHaveBeenCalledTimes(1)
+      expect(rows.some((row) => row.event === 'soak-original-final')).toBe(false)
+    } finally {
+      await owner.close()
+      shares.restore()
+      process.env = environment
+    }
+  })
+
   test.each([false, true])(
     'matches original nested priming populations inside real Jest liveCase and outer cleanup, exceptional=%s',
     bounded.liveCase(30000, async (_scope, exceptional) => {

@@ -10,6 +10,7 @@ const {
   MEMORY_FLAGS,
   hostContext,
   collectionsSettled,
+  peakReadingDecreases,
 } = require('../../../testHelpers/processMemory')
 const {
   CAPACITY,
@@ -20,6 +21,8 @@ const {
   validateEvents,
   validateCatalogue,
 } = require('./retained/contract')
+
+const { settlementReport } = require('./retained/settlement')
 
 const ROOT = path.resolve(__dirname, '../../..')
 
@@ -35,7 +38,15 @@ const archiveSources = (directory) => {
       for (const name of fs.readdirSync(absolute).sort()) visit(path.join(relative, name))
     } else if (/\.(js|json)$/.test(relative)) files.push(relative)
   }
-  for (const source of ['src', 'testHelpers', 'scripts/e2e/telemetry', 'index.js', 'package.json'])
+  for (const source of [
+    'src',
+    'testHelpers',
+    'scripts/soak',
+    'scripts/e2e/telemetry',
+    'index.js',
+    'package.json',
+    'package-lock.json',
+  ])
     visit(source)
   return files.sort().map((file) => {
     const bytes = fs.readFileSync(path.join(ROOT, file))
@@ -229,6 +240,7 @@ const replay = async (directory, identity, exit) => {
     exit,
     problems,
     screens: screen(events),
+    settlement: problems.length === 0 ? settlementReport(events) : null,
   }
 }
 
@@ -245,14 +257,12 @@ const screen = (events) => {
     if (Math.abs(control.c1.rss - control.c0.rss) > LIMITS.controlRss)
       inconclusive.push('control RSS is unstable')
   }
-  let previous = 0
+  const peakDecreases = peakReadingDecreases(marks, ['maxRss', 'vmhwm'])
   for (const mark of marks) {
     if (mark.vmhwm === null) inconclusive.push('peak capability missing')
     else {
-      if (mark.vmhwm < previous) problems.push('authoritative peak decreased')
       if (mark.vmhwm < mark.covered)
         inconclusive.push('peak source does not cover a current reading')
-      previous = mark.vmhwm
     }
   }
   const readings = events
@@ -315,6 +325,7 @@ const screen = (events) => {
     controlRetainedDelta: control ? control.c1.retained - control.c0.retained : null,
     controlRssDelta: control ? control.c1.rss - control.c0.rss : null,
     closedDeltas,
+    peakDecreases,
     problems: [...new Set(problems)],
     inconclusive: [...new Set(inconclusive)],
   }

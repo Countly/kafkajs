@@ -279,6 +279,24 @@ describe('FrameBuffer > splitting and delivery', () => {
 describe('FrameBuffer > retained memory and copying', () => {
   const INITIAL = 64 * KIB
 
+  it('reuses a dedicated four-byte prefix without retaining a pooled backing store', () => {
+    const { buffer, frames } = recording()
+    const prefix = buffer.prefix
+    expect(prefix.buffer.byteLength).toBe(4)
+
+    const first = frameOf(1, Buffer.from('first'))
+    buffer.push(first.subarray(0, 2))
+    buffer.push(first.subarray(2))
+    buffer.reset()
+    const second = frameOf(2, Buffer.from('second'))
+    buffer.push(second)
+
+    expect(frames).toEqual([first.subarray(4), second.subarray(4)])
+    expect(buffer.prefix).toBe(prefix)
+    expect(buffer.prefix.buffer.byteLength).toBe(4)
+    expect(recording().buffer.prefix.buffer).not.toBe(prefix.buffer)
+  })
+
   /** Feeds `frame` in chunks of `chunkSize`, checking the bounds after every chunk. */
   const feed = (buffer, frame, chunkSize) => {
     const size = frame.length - 4

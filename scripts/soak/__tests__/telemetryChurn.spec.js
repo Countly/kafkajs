@@ -39,6 +39,7 @@ const { SEGMENT_FORMAT, checkSegmentFiles } = require('../../../testHelpers/tele
 const {
   PROFILES,
   TelemetryResourceVerdict,
+  TELEMETRY,
   buildTelemetryChurn,
   instrument,
   main,
@@ -227,7 +228,11 @@ describe('telemetry profile', () => {
     expect(new Set(spawned.map(({ options }) => options.env[WORKER_TOKEN])).size).toBe(4)
     for (const { args, options } of spawned) {
       expect(args).toEqual(['--profile', 'telemetry'])
-      expect(options.execArgv).toEqual(['--expose-gc'])
+      expect(options.execArgv).toEqual([
+        '--expose-gc',
+        '--min-semi-space-size=1',
+        '--max-semi-space-size=1',
+      ])
       expect(options.stdio).toEqual(['ignore', 'pipe', 'pipe', 'ipc'])
     }
     expect(() => processes.start('producer')).toThrow('already started')
@@ -301,22 +306,54 @@ describe('telemetry profile', () => {
     )
   })
 
+  test('releases every subscription batch between lifecycle windows', () => {
+    for (let measureMs = 60000; measureMs <= 300000; measureMs += 10000) {
+      const schedule = new TelemetrySchedule({ warmupMs: 60000, measureMs })
+      const transitions = schedule.ticks.flatMap((tick) => tick.transitions)
+      expect(transitions).toEqual(
+        Array.from({ length: (60000 + measureMs) / 10000 - 1 }, (_, n) => n + 1)
+      )
+      expect(
+        schedule.ticks.filter((t) => t.actions.includes('reopen')).length + 2
+      ).toBeLessThanOrEqual(16)
+      for (const tick of schedule.ticks.filter((t) => t.transitions.length)) {
+        expect(tick.actions).toContain('reopen')
+        expect(schedule.stages(tick)[0]).toBe('confirm')
+        expect(tick.transitions.every((index) => index * 10000 <= tick.at)).toBe(true)
+      }
+    }
+  })
+
   test('holds the fixed measured action counts, the serialization order and the corpus slots', () => {
     const schedule = new TelemetrySchedule({ warmupMs: 60000, measureMs: 300000 })
-    expect(schedule.required()).toEqual({ subscription: 30, retire: 10, reopen: 5 })
-    expect(schedule.ticks).toHaveLength(35)
+    expect(schedule.required()).toEqual({ subscription: 35, retire: 10, reopen: 5 })
+    expect(schedule.ticks).toHaveLength(16)
+    expect(
+      schedule.ticks.filter((t) => t.transitions.length).map((t) => [t.at, t.transitions])
+    ).toEqual([
+      [70000, [1, 2, 3, 4, 5, 6, 7]],
+      [135000, [8, 9, 10, 11, 12]],
+      [195000, [13, 14, 15, 16, 17, 18]],
+      [255000, [19, 20, 21, 22, 23, 24]],
+      [350000, [25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35]],
+    ])
+    expect(schedule.ticks.filter((t) => t.actions.includes('retire')).map((t) => t.at)).toEqual(
+      Array.from({ length: 11 }, (_, n) => (n + 1) * 30000)
+    )
     schedule.ticks.forEach((tick, number) => {
       expect(tick.number).toBe(number)
-      expect(tick.index).toBe(tick.at / 10000)
+      expect(tick.index).toBe(tick.transitions.at(-1) ?? tick.at / 10000)
     })
     const sixty = schedule.ticks.find((tick) => tick.at === 60000)
-    expect(sixty.actions).toEqual(['reopen', 'retire', 'subscription'])
-    expect(schedule.stages(sixty)).toEqual(['lifecycle', 'retire', 'confirm'])
-    expect(schedule.stages(schedule.ticks[0])).toEqual(['confirm'])
+    expect(sixty.actions).toEqual(['retire'])
+    expect(schedule.stages(sixty)).toEqual(['retire'])
+    const firstBatch = schedule.ticks.find((tick) => tick.transitions.length)
+    expect(schedule.selection(firstBatch.index)).toBe('com.example.')
+    expect(schedule.stages(firstBatch)).toEqual(['confirm'])
     expect(schedule.ticks.at(-1).at).toBe(350000)
     expect(
       schedule.ticks.filter((tick) => !schedule.measured(tick)).flatMap((t) => t.actions)
-    ).toEqual(expect.arrayContaining(['retire', 'subscription']))
+    ).toEqual(['retire'])
     expect([1, 2, 3, 4, 5, 6].map((i) => schedule.selection(i))).toEqual([
       'com.example.',
       '',
@@ -325,13 +362,36 @@ describe('telemetry profile', () => {
       '',
       'org.apache.kafka.',
     ])
-    for (const tick of schedule.ticks.filter((t) => t.actions.length > 1))
-      expect(schedule.selection(tick.index)).not.toBe('')
+    let selection = 'org.apache.kafka.'
+    for (const tick of schedule.ticks) {
+      if (tick.transitions.length) selection = schedule.selection(tick.index)
+      if (tick.actions.includes('retire')) expect(selection).not.toBe('')
+    }
     const slots = schedule.corpusSlots()
     expect(slots).toHaveLength(CORPUS.records / CORPUS.batch)
     expect(slots[0]).toBe(60000)
     expect(slots.at(-1)).toBe(357000)
     expect(slots.every((slot) => slot >= 60000 && slot < 360000)).toBe(true)
+  })
+
+  test('places middle reconnect and subscription boundaries halfway between settled samples', () => {
+    const schedule = new TelemetrySchedule(TELEMETRY)
+    const boundaries = schedule.ticks.filter((tick) => tick.actions.includes('subscription'))
+    expect(boundaries.map((tick) => tick.at)).toEqual([70000, 135000, 195000, 255000, 350000])
+    for (const tick of boundaries) {
+      expect(tick.actions).toEqual(['reopen', 'subscription'])
+      expect(schedule.stages(tick)).toEqual(['confirm'])
+    }
+    for (const tick of boundaries.slice(1, -1)) {
+      const distance = Math.min(...TELEMETRY.sampleAt.map((at) => Math.abs(tick.at - at)))
+      expect(distance).toBe(TELEMETRY.sampleMs / 2)
+      expect(distance).toBeGreaterThan(10000)
+      const next = schedule.ticks[tick.number + 1]
+      expect(next.at - tick.at).toBe(15000)
+      expect(next.actions).toEqual(['retire'])
+    }
+    expect(boundaries[0].at).toBe(70000)
+    expect(boundaries.at(-1).at).toBe(350000)
   })
 
   test('tracks resources by creating role and trigger, and a same-count swap by token', async () => {
@@ -528,6 +588,94 @@ describe('telemetry profile', () => {
       expect(tap.telemetry()).toHaveLength(0)
       expect(tap.records[1].socket).toBeNull()
       expect(() => tap.retire()).toThrow('exactly one open telemetry socket')
+    })
+
+    test('releases closed factory sockets while the tap stays alive and preserves scalar fault facts', async () => {
+      const owners = []
+      const faults = []
+      let now = 0
+      const segment = {
+        id: 'producer-lc-1',
+        observer: {
+          socketOwnership: () => owners,
+          declareFault: (ordinal) => faults.push({ ordinal, at: now }),
+        },
+      }
+      const tap = new TelemetryTap(
+        {
+          current: () => segment,
+          socketFactory: () => {
+            owners.push({})
+            const inner = new EventEmitter()
+            inner.destroyed = false
+            inner.write = () => true
+            inner.destroy = (error) => {
+              inner.destroyed = true
+              if (error) inner.emit('error', error)
+              inner.emit('close')
+            }
+            return inner
+          },
+        },
+        { clock: { now: () => ++now } }
+      )
+      const core = tap.factory({ host: 'a', port: 1 })
+      let telemetry = tap.factory({ host: 'a', port: 1 })
+      telemetry.on('error', () => {})
+      telemetry.write(frame(71))
+      const fault = tap.retire()
+      expect(fault).toMatchObject({ segment: 'producer-lc-1', ordinal: 2, declaredAt: 1 })
+      const released = new WeakRef(telemetry)
+      telemetry.write(frame(72))
+      await expect(fault.hit).resolves.toBe(2)
+      expect(faults).toEqual([{ ordinal: 2, at: 1 }])
+      expect(tap.open()).toBe(1)
+      expect(tap.telemetry()).toEqual([])
+      expect(tap.chaos.sockets).toEqual([core])
+      expect(tap.records[1]).toMatchObject({
+        segment: 'producer-lc-1',
+        ordinal: 2,
+        telemetry: true,
+        closed: true,
+        closedAt: 3,
+        socket: null,
+        restore: null,
+        faulted: null,
+      })
+      telemetry = null
+
+      if (typeof global.gc === 'function') {
+        for (let i = 0; i < 10; i++) {
+          await turn()
+          global.gc()
+        }
+        expect(released.deref()).toBeUndefined()
+        expect(tap.open()).toBe(1)
+        expect(faults).toEqual([{ ordinal: 2, at: 1 }])
+      }
+      core.destroy()
+      expect(tap.chaos.sockets).toEqual([])
+      expect(tap.records.map(({ socket }) => socket)).toEqual([null, null])
+      tap.records.length = 1024
+      expect(() => tap.factory({ host: 'a', port: 1 })).toThrow('socket history bound exceeded')
+      expect(owners).toHaveLength(2)
+      jest.isolateModules(() => {
+        const segments = jest.requireActual('../../../testHelpers/telemetrySegments')
+        const schedule = jest.spyOn(segments, 'scheduleOf')
+        try {
+          const { TelemetryTap } = require('../telemetryChurn')
+          const capped = new TelemetryTap({ socketFactory: jest.fn() })
+          capped.records.length = 1024
+          expect(() => capped.factory({ host: 'a', port: 1 })).toThrow(
+            'socket history bound exceeded'
+          )
+          expect(schedule).toHaveBeenCalledWith('telemetry-churn')
+          expect(schedule.mock.results[0].value.cap).toBe(16)
+          expect(capped.segments.socketFactory).not.toHaveBeenCalled()
+        } finally {
+          schedule.mockRestore()
+        }
+      })
     })
 
     test('refuses to fault when more than one telemetry socket is open', () => {
@@ -1173,6 +1321,239 @@ describe('telemetry profile oracles', () => {
         'an offset was unsettled when its close ended'
       )
     })
+  })
+})
+
+describe('telemetry rotation readback', () => {
+  const entries = { 'interval.ms': '1000', match: 'client_id=^s-.*$' }
+  const answer = (values) => ({
+    resources: [
+      {
+        resourceType: 16,
+        resourceName: 's',
+        errorCode: 0,
+        configEntries: Object.entries(values).map(([configName, configValue]) => ({
+          configName,
+          configValue,
+        })),
+      },
+    ],
+  })
+  const make = () => {
+    const admin = {
+      incrementalAlterConfigs: jest.fn(async () => answer({})),
+      describeConfigs: jest.fn(async () => answer({ metrics: 'com.example.', ...entries })),
+    }
+    const fixture = new ParentFixture({
+      stem: 's',
+      kafka: { admin: () => admin, producer: () => ({}) },
+      clock: { now: () => Date.now() },
+    })
+    return { fixture, admin }
+  }
+  beforeEach(() => jest.useFakeTimers({ now: 1000 }))
+  afterEach(() => jest.useRealTimers())
+
+  test('converges after a stale successful read and records attempts', async () => {
+    const { fixture, admin } = make()
+    admin.describeConfigs.mockResolvedValueOnce(
+      answer({ metrics: 'org.apache.kafka.', ...entries })
+    )
+    const result = fixture.rotate(1, 'com.example.', 300)
+    result.catch(() => {})
+    await jest.advanceTimersByTimeAsync(50)
+    await expect(result).resolves.toEqual({
+      index: 1,
+      selection: 'com.example.',
+      setAt: 1000,
+      readbackAt: 1050,
+      readback: 'com.example.',
+      readbackAttempts: 2,
+    })
+    expect(admin.describeConfigs).toHaveBeenCalledTimes(2)
+    expect(admin.describeConfigs).toHaveBeenLastCalledWith({
+      timeout: 250,
+      resources: [{ type: 16, name: 's', configNames: ['metrics', 'interval.ms', 'match'] }],
+    })
+    expect(jest.getTimerCount()).toBe(0)
+  })
+
+  test('fails API errors immediately without another read', async () => {
+    const transport = new Error('describe failed')
+    const failed = answer({ metrics: 'com.example.', ...entries })
+    failed.resources[0].errorCode = 42
+    for (const response of [transport, failed]) {
+      const { fixture, admin } = make()
+      if (response === transport) admin.describeConfigs.mockRejectedValueOnce(transport)
+      else admin.describeConfigs.mockResolvedValueOnce(response)
+      const result = fixture.rotate(1, 'com.example.', 300)
+      if (response === transport) await expect(result).rejects.toBe(transport)
+      else await expect(result).rejects.toThrow('Client metrics resource operation failed')
+      expect(Date.now()).toBe(1000)
+      expect(admin.describeConfigs).toHaveBeenCalledTimes(1)
+      expect(jest.getTimerCount()).toBe(0)
+    }
+  })
+
+  test('fails persistent mismatch at the original deadline with expected and observed values', async () => {
+    const { fixture, admin } = make()
+    admin.incrementalAlterConfigs.mockImplementationOnce(
+      () => new Promise((resolve) => setTimeout(() => resolve(answer({})), 75))
+    )
+    admin.describeConfigs.mockResolvedValueOnce(
+      answer({ metrics: 'org.apache.kafka.', ...entries })
+    )
+    let failure
+    const result = fixture.rotate(14, '', 300).catch((error) => {
+      failure = error
+    })
+    await jest.advanceTimersByTimeAsync(299)
+    expect(failure).toBeUndefined()
+    await jest.advanceTimersByTimeAsync(1)
+    await result
+    expect(failure).toBeInstanceOf(Error)
+    expect(failure.message).toBe(
+      'The subscription readback differs: ' +
+        JSON.stringify({
+          index: 14,
+          expected: { metrics: '', ...entries },
+          observed: { metrics: 'com.example.', ...entries },
+        })
+    )
+    expect(Date.now()).toBe(1300)
+    expect(admin.describeConfigs).toHaveBeenCalledTimes(5)
+    const attempts = admin.describeConfigs.mock.calls.length
+    await jest.advanceTimersByTimeAsync(500)
+    expect(admin.describeConfigs).toHaveBeenCalledTimes(attempts)
+    expect(jest.getTimerCount()).toBe(0)
+  })
+
+  test('compares empty metrics exactly without accepting missing or null values', async () => {
+    const { fixture, admin } = make()
+    admin.describeConfigs
+      .mockResolvedValueOnce(answer(entries))
+      .mockResolvedValueOnce(answer({ metrics: null, ...entries }))
+      .mockResolvedValueOnce(answer({ metrics: '', 'interval.ms': '999', match: entries.match }))
+      .mockResolvedValueOnce(answer({ metrics: '', 'interval.ms': '1000', match: 'foreign' }))
+      .mockResolvedValueOnce(answer({ metrics: '', ...entries }))
+    const result = fixture.rotate(2, '', 300)
+    result.catch(() => {})
+    await jest.advanceTimersByTimeAsync(200)
+    await expect(result).resolves.toMatchObject({
+      selection: '',
+      readback: '',
+      readbackAt: 1200,
+      readbackAttempts: 5,
+    })
+    expect(admin.describeConfigs).toHaveBeenCalledTimes(5)
+    expect(jest.getTimerCount()).toBe(0)
+  })
+})
+
+describe('telemetry share corpus configuration', () => {
+  const make = () => {
+    let source = 5
+    let value = 'latest'
+    const resource = { resourceType: 32, resourceName: 's-share-group', errorCode: 0 }
+    const admin = {
+      connect: jest.fn(async () => {}),
+      createTopics: jest.fn(async () => {}),
+      incrementalAlterConfigs: jest.fn(async () => ({ resources: [resource] })),
+      describeConfigs: jest.fn(async () => ({
+        resources: [
+          {
+            ...resource,
+            configEntries: [
+              { configName: 'share.auto.offset.reset', configValue: value, configSource: source },
+            ],
+          },
+        ],
+      })),
+      disconnect: jest.fn(async () => {}),
+    }
+    const producer = { connect: jest.fn(async () => {}), disconnect: jest.fn(async () => {}) }
+    const fixture = new ParentFixture({
+      stem: 's',
+      kafka: { admin: () => admin, producer: () => producer },
+    })
+    return {
+      fixture,
+      admin,
+      producer,
+      apply: (nextSource, nextValue) => {
+        source = nextSource
+        value = nextValue
+      },
+    }
+  }
+  beforeEach(() => jest.useFakeTimers({ now: 1000 }))
+  afterEach(() => jest.useRealTimers())
+
+  test('reads back earliest share offsets before setup completes and restores the override before disconnect', async () => {
+    const { fixture, admin, apply } = make()
+    let ready = false
+    const opening = fixture.open().then(() => {
+      ready = true
+    })
+    opening.catch(() => {})
+    await jest.advanceTimersByTimeAsync(0)
+    expect(ready).toBe(false)
+    expect(admin.incrementalAlterConfigs).toHaveBeenCalledWith({
+      resources: [
+        {
+          type: 32,
+          name: 's-share-group',
+          configEntries: [{ name: 'share.auto.offset.reset', operation: 0, value: 'earliest' }],
+        },
+      ],
+    })
+    apply(5, 'earliest')
+    await jest.advanceTimersByTimeAsync(250)
+    expect(ready).toBe(false)
+    apply(8, 'earliest')
+    await jest.advanceTimersByTimeAsync(250)
+    await opening
+    expect(ready).toBe(true)
+    const closing = fixture.close()
+    closing.catch(() => {})
+    await jest.advanceTimersByTimeAsync(0)
+    expect(admin.disconnect).not.toHaveBeenCalled()
+    expect(admin.incrementalAlterConfigs).toHaveBeenLastCalledWith({
+      resources: [
+        {
+          type: 32,
+          name: 's-share-group',
+          configEntries: [{ name: 'share.auto.offset.reset', operation: 1 }],
+        },
+      ],
+    })
+    apply(5, 'latest')
+    await jest.advanceTimersByTimeAsync(100)
+    await closing
+    expect(admin.disconnect).toHaveBeenCalledTimes(1)
+    expect(jest.getTimerCount()).toBe(0)
+  })
+
+  test('restores a refused share setup and disconnects both clients even when restoration fails', async () => {
+    const { fixture, admin, producer } = make()
+    const refused = new Error('config set failed')
+    const restoration = new Error('config reset failed')
+    admin.incrementalAlterConfigs.mockRejectedValueOnce(refused).mockRejectedValueOnce(restoration)
+    await expect(fixture.open()).rejects.toBe(refused)
+    const closing = fixture.close()
+    await expect(closing).rejects.toMatchObject({ errors: [restoration] })
+    expect(admin.incrementalAlterConfigs).toHaveBeenLastCalledWith({
+      resources: [
+        {
+          type: 32,
+          name: 's-share-group',
+          configEntries: [{ name: 'share.auto.offset.reset', operation: 1 }],
+        },
+      ],
+    })
+    expect(admin.disconnect).toHaveBeenCalledTimes(1)
+    expect(producer.disconnect).toHaveBeenCalledTimes(1)
+    expect(jest.getTimerCount()).toBe(0)
   })
 })
 
@@ -1884,6 +2265,115 @@ describe('telemetry profile worker', () => {
     return { worker, log, from, to, segments, ordinary }
   }
 
+  test.each(KINDS)(
+    'keeps %s transition releases outside every active lifecycle window',
+    async (kind) => {
+      const { TelemetrySegments } = require('../../../testHelpers/telemetrySegments')
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'subscription-windows-'))
+      let at = 0
+      let active = true
+      let selection = 'org.apache.kafka.'
+      const windows = [{ start: at, end: null }]
+      const releases = []
+      const readbacks = []
+      const clock = { now: () => ++at }
+      const segments = TelemetrySegments.ordinary('telemetry-churn', kind, {
+        directory,
+        clock,
+        observer: { line: '4.3.1' },
+      })
+      const { worker } = make({ kind })
+      worker.segments = segments
+      worker.clock = clock
+      worker.client = {
+        disconnect: async () => {
+          expect(active).toBe(true)
+          active = false
+          windows.at(-1).end = ++at
+        },
+        connect: async () => {
+          expect(active).toBe(false)
+          expect(readbacks.at(-1).at).toBeLessThan(at + 1)
+          expect(readbacks.at(-1).selection).toBe(selection)
+          active = true
+          windows.push({ start: ++at, end: null })
+          const get = getRecord(1, 1, {
+            writeAt: ++at,
+            response: {
+              ...getRecord(1, 1).response,
+              requestedMetrics: selection ? [selection] : [],
+              responseAt: ++at,
+            },
+          })
+          const records = [get]
+          if (selection)
+            records.push({
+              type: 'request',
+              apiKey: 72,
+              index: 2,
+              requestKey: 'r2',
+              socketId: 1,
+              uuid: U,
+              subscriptionId: 7,
+              terminating: false,
+              metricsBytes: 10,
+              writeAt: ++at,
+              response: { errorCode: 0, responseAt: ++at },
+            })
+          jest
+            .spyOn(segments.current().observer, 'readTranscript')
+            .mockImplementation(() => records)
+        },
+        clientInstanceId: async () => U,
+      }
+      worker.tap = { telemetry: () => [{ segment: segments.current().id, ordinal: 1 }] }
+      worker.seal = async (segment) => {
+        await segment.observer.dispose()
+        segment.observer = null
+        segment.state = 'sealed'
+        return {}
+      }
+      try {
+        const schedule = new TelemetrySchedule({ warmupMs: 60000, measureMs: 300000 })
+        for (const tick of schedule.ticks.filter((t) => t.transitions.length)) {
+          const command = {
+            tick: tick.number,
+            index: tick.index,
+            transitions: tick.transitions,
+            selection: schedule.selection(tick.index),
+            stage: 'confirm',
+          }
+          await worker.handle({ type: 'confirm-fence', ...command })
+          expect(active).toBe(false)
+          expect(worker.send.mock.calls.at(-1)[0]).toMatchObject({ type: 'confirm-fenced' })
+          for (const index of tick.transitions) {
+            expect(active).toBe(false)
+            selection = schedule.selection(index)
+            releases.push({ index, selection, at: ++at })
+            readbacks.push({ index, selection, at: ++at })
+          }
+          await worker.handle({ type: 'stage', ...command })
+          expect(active).toBe(true)
+          await worker.sealing.promise
+        }
+        expect(releases).toHaveLength(35)
+        expect(windows).toHaveLength(6)
+        expect(releases.map((r) => r.index)).toEqual(Array.from({ length: 35 }, (_, n) => n + 1))
+        expect(readbacks.map((r) => [r.index, r.selection])).toEqual(
+          releases.map((r) => [r.index, r.selection])
+        )
+        for (const { at: releasedAt } of [...releases, ...readbacks])
+          expect(
+            windows.some((w) => w.start <= releasedAt && (w.end === null || releasedAt <= w.end))
+          ).toBe(false)
+        expect(worker.actions.measured).toEqual({ subscription: 35, reopen: 5, retire: 0 })
+      } finally {
+        for (const segment of segments.undischarged()) await segment.observer?.dispose()
+        fs.rmSync(directory, { recursive: true, force: true })
+      }
+    }
+  )
+
   test('retains immediate reopen ordering and normal pushes', async () => {
     const { worker, log, from, segments } = make()
     const claim = await worker.reopen({ tick: 5 })
@@ -2020,6 +2510,7 @@ describe('telemetry profile worker', () => {
       },
     })
     worker.owed.add('reopen')
+    worker.fenceConfirmation({ tick: 1, index: 6, selection: 'com.example.' })
     const claim = await worker.confirm({ tick: 1, index: 6, selection: 'com.example.' })
     expect(claim).toMatchObject({
       tick: 1,
@@ -2032,6 +2523,46 @@ describe('telemetry profile worker', () => {
     expect(worker.claims.proofs).toEqual([
       { tick: 1, segment: current.id, push: 'r3', owedBy: ['reopen'] },
     ])
+  })
+
+  test('accepts a matching Get written between readback and confirmation delivery', async () => {
+    const records = [getRecord(1, 3)]
+    const current = { id: 'producer-lc-2', observer: observerOf(records) }
+    const { worker } = make({ current })
+    const tick = worker.schedule.ticks.find((t) => t.actions.includes('subscription')).number
+    const command = { tick, index: 2, stage: 'confirm', selection: '' }
+    await worker.handle({ ...command, type: 'confirm-fence' })
+    const fence = worker.send.mock.calls.at(-1)[0]
+    expect(fence).toMatchObject({ type: 'confirm-fenced', tick, after: 1, segment: current.id })
+    records.push(
+      getRecord(2, 3, {
+        writeAt: fence.receivedAt + 1,
+        response: { ...getRecord(2, 3).response, requestedMetrics: [], subscriptionId: 9 },
+      })
+    )
+    await worker.handle({ ...command, type: 'stage' })
+    expect(worker.claims.transitions[0]).toMatchObject({
+      receivedAt: fence.receivedAt,
+      after: 1,
+      get: 'r2',
+      subscriptionId: 9,
+    })
+    expect(worker.claims.transitions[0].releasedAt).toBeGreaterThan(records[1].writeAt)
+  })
+
+  test('rejects stale Gets on either side of the confirmation cursor and timestamp fence', async () => {
+    for (const stale of ['cursor', 'timestamp']) {
+      const response = { ...getRecord(1, 3).response, requestedMetrics: [] }
+      const records = [getRecord(1, 3, { writeAt: 1e9, response })]
+      const current = { id: 'producer-lc-2', observer: observerOf(records) }
+      const { worker } = make({ current })
+      const tick = worker.schedule.ticks.find((t) => t.actions.includes('subscription')).number
+      const command = { tick, index: 2, stage: 'confirm', selection: '' }
+      await worker.handle({ ...command, type: 'confirm-fence' })
+      if (stale === 'timestamp') records.push(getRecord(2, 3, { writeAt: 0, response }))
+      await expect(worker.confirm(command)).rejects.toThrow('no selection Get within 8000 ms')
+      expect(worker.claims.transitions).toEqual([])
+    }
   })
 
   test('proves an empty selection by its Get alone and never owes a Push under it', async () => {
@@ -2052,6 +2583,7 @@ describe('telemetry profile worker', () => {
           )
       },
     })
+    worker.fenceConfirmation({ tick: 1, index: 2, selection: '' })
     const claim = await worker.confirm({ tick: 1, index: 2, selection: '' })
     expect(claim).toMatchObject({ selection: '', get: 'r2', proof: null })
     worker.owed.add('retire')
@@ -2061,6 +2593,7 @@ describe('telemetry profile worker', () => {
       sleep: async () => {},
     })
     none.worker.owed.add('retire')
+    none.worker.fenceConfirmation({ tick: 1, index: 2, selection: '' })
     await expect(none.worker.confirm({ tick: 1, index: 2, selection: '' })).rejects.toThrow(
       'no selection Get'
     )
@@ -2223,7 +2756,19 @@ describe('telemetry profile parent', () => {
       send: jest.fn((kind, message) => sent.push({ kind, ...message, at: clock.now() })),
       message: jest.fn(async (kind, type) => ({ type, kind, parentAt: clock.now() })),
       until: jest.fn(async (kind, match) => {
-        const last = sent.filter((m) => m.kind === kind && m.type === 'stage').at(-1)
+        const last = sent
+          .filter((m) => m.kind === kind && ['stage', 'confirm-fence'].includes(m.type))
+          .at(-1)
+        if (last.type === 'confirm-fence')
+          return {
+            type: 'confirm-fenced',
+            tick: last.tick,
+            kind,
+            receivedAt: 1,
+            after: 0,
+            segment: `${kind}-lc-1`,
+            parentAt: clock.now(),
+          }
         return {
           type: 'stage-done',
           kind,
@@ -2311,20 +2856,186 @@ describe('telemetry profile parent', () => {
     const stages = processes.sent.filter((m) => m.type === 'stage')
     const sixty = schedule.ticks.find((t) => t.at === 60000).number
     expect(stages.filter((m) => m.tick === sixty).map((m) => `${m.kind}:${m.stage}`)).toEqual(
-      ['lifecycle', 'retire', 'confirm'].flatMap((stage) => KINDS.map((kind) => `${kind}:${stage}`))
+      KINDS.map((kind) => `${kind}:retire`)
     )
     expect(fixture.rotate).toHaveBeenCalledTimes(35)
-    expect(fixture.rotate.mock.calls[0]).toEqual([1, 'com.example.'])
-    expect(fixture.rotate.mock.calls[1]).toEqual([2, ''])
+    expect(fixture.rotate.mock.calls[0]).toEqual([1, 'com.example.', 9000])
+    expect(fixture.rotate.mock.calls[1]).toEqual([2, '', 9000])
     const produce = calls.filter((c) => Array.isArray(c))
     expect(produce).toHaveLength(2 * 100)
     expect(produce[0][3] - timeline.epochAt).toBeGreaterThanOrEqual(60000)
-    expect(churn.rotations).toHaveLength(35)
-    expect(churn.stages).toHaveLength(KINDS.length * (35 + 11 + 5))
+    expect(churn.rotations.map((r) => [r.index, r.selection, r.readback])).toEqual(
+      Array.from({ length: 35 }, (_, n) => [
+        n + 1,
+        schedule.selection(n + 1),
+        schedule.selection(n + 1),
+      ])
+    )
+    for (const tick of schedule.ticks.filter((t) => t.transitions.length)) {
+      const batch = churn.rotations.filter((r) => r.tick === tick.number)
+      const releases = stages.filter((m) => m.tick === tick.number && m.stage === 'confirm')
+      expect(releases).toHaveLength(KINDS.length)
+      for (const release of releases) {
+        expect(release.selection).toBe(batch.at(-1).readback)
+        expect(batch.every((r) => r.readbackAt <= release.at)).toBe(true)
+      }
+    }
+    expect(churn.stages).toHaveLength(KINDS.length * (5 + 11))
     expect(timeline.setupMs).toBe(0)
     expect(processes.sent.filter((m) => m.type === 'corpus')).toHaveLength(KINDS.length)
     expect(processes.sent.filter((m) => m.type === 'finish')).toHaveLength(KINDS.length)
     expect(timeline.boundaryAt - timeline.epochAt).toBeGreaterThanOrEqual(360000)
+    churn.judge([], { errors: [], exits: {}, oracle: { ok: true } }, timeline, schedule)
+    const verdict = churn.record.mock.calls.map(([row]) => row).find((r) => r.kind === 'verdict')
+    expect(verdict.measured).toEqual({ subscription: 35, retire: 10, reopen: 5 })
+    expect(verdict.violations.filter((v) => v.startsWith('measured '))).toEqual([])
+  })
+
+  test('joins all confirmation fences before rotating the subscription', async () => {
+    const { churn, fixture, processes, clock, advance } = make()
+    let releaseFence
+    let fenceRequested
+    const held = new Promise((resolve) => (releaseFence = resolve))
+    const requested = new Promise((resolve) => (fenceRequested = resolve))
+    const original = processes.until
+    let heldOnce = false
+    processes.until = jest.fn(async (...args) => {
+      const [kind] = args
+      const last = processes.sent.filter((m) => m.kind === kind).at(-1)
+      if (!heldOnce && kind === 'admin' && last.type === 'confirm-fence') {
+        heldOnce = true
+        fenceRequested()
+        await held
+      }
+      return original(...args)
+    })
+    fixture.rotate.mockImplementation(async (index, selection) => {
+      const fences = processes.sent.filter((m) => m.type === 'confirm-fence')
+      expect(fences.slice(-KINDS.length).map((m) => m.kind)).toEqual([...KINDS])
+      expect(processes.until.mock.calls.slice(-KINDS.length).map(([kind]) => kind)).toEqual([
+        ...KINDS,
+      ])
+      return { index, selection, setAt: clock.now(), readbackAt: clock.now(), readback: selection }
+    })
+    const ticking = churn.ticks(
+      clock.now(),
+      new TelemetrySchedule({ warmupMs: 60000, measureMs: 300000 })
+    )
+    await Promise.race([requested, ticking])
+    expect(fixture.rotate).not.toHaveBeenCalled()
+    advance(8500)
+    releaseFence()
+    await ticking
+    expect(fixture.rotate.mock.calls[0]).toEqual([1, 'com.example.', 1500])
+    expect(processes.sent.filter((m) => m.type === 'confirm-fence')).toHaveLength(5 * KINDS.length)
+  })
+
+  test('finishes batch readbacks and joined confirmations before the next action and measurement end', async () => {
+    const { churn, fixture, processes, clock, advance } = make()
+    const schedule = new TelemetrySchedule(TELEMETRY)
+    const epoch = clock.now()
+    const until = processes.until
+    processes.until = jest.fn(async (...args) => {
+      const [kind, , remaining] = args
+      if (processes.sent.at(-1).type === 'confirm-fence') advance(500)
+      else if (kind === KINDS.at(-1)) advance(remaining - 1)
+      return until(...args)
+    })
+    const rotate = fixture.rotate
+    fixture.rotate = jest.fn(async (...args) => {
+      advance(100)
+      return rotate(...args)
+    })
+    await churn.ticks(epoch, schedule)
+    for (const tick of schedule.ticks.filter((t) => t.transitions.length)) {
+      const rows = churn.stages.filter((row) => row.tick === tick.number)
+      const readbacks = churn.rotations.filter((row) => row.tick === tick.number)
+      const next = epoch + (schedule.ticks[tick.number + 1]?.at ?? schedule.endMs)
+      expect(rows).toHaveLength(KINDS.length)
+      expect(Math.max(...rows.map((row) => row.parentAt - row.sentAt))).toBe(9999)
+      expect(readbacks.map((row) => row.index)).toEqual(tick.transitions)
+      for (const row of rows) {
+        expect(row.sentAt).toBe(epoch + tick.at)
+        expect(row.releasedAt).toBeGreaterThanOrEqual(readbacks.at(-1).readbackAt)
+        expect(row.parentAt).toBeLessThan(next)
+        expect(row.parentAt).toBeLessThan(epoch + schedule.endMs)
+      }
+    }
+  })
+
+  test('caps a maximally late final confirmation at the absolute measurement end', async () => {
+    const { churn, processes, clock, advance } = make()
+    const schedule = new TelemetrySchedule(TELEMETRY)
+    const epoch = clock.now()
+    const lastTick = schedule.ticks.at(-1)
+    const untilTick = churn.until.bind(churn)
+    churn.until = async (target) => {
+      await untilTick(target)
+      if (target === epoch + 350000) advance(5000)
+    }
+    const until = processes.until
+    processes.until = jest.fn(async (...args) => {
+      const [kind, , remaining] = args
+      const last = processes.sent.at(-1)
+      if (last.tick === lastTick.number && last.type === 'stage' && kind === KINDS.at(-1))
+        advance(remaining - 1)
+      return until(...args)
+    })
+    await churn.ticks(epoch, schedule)
+    const rows = churn.stages.filter((row) => row.tick === lastTick.number)
+    expect(rows).toHaveLength(KINDS.length)
+    expect(rows.every((row) => row.sentAt === epoch + 355000)).toBe(true)
+    expect(Math.max(...rows.map((row) => row.parentAt))).toBe(epoch + 359999)
+    expect(clock.now()).toBe(epoch + 359999)
+    expect(churn.missed).toEqual([])
+  })
+
+  test('fails explicitly when the late final confirmation fence exhausts its remaining budget', async () => {
+    const { churn, fixture, processes, clock, advance } = make()
+    const schedule = new TelemetrySchedule(TELEMETRY)
+    const epoch = clock.now()
+    const lastTick = schedule.ticks.at(-1)
+    const untilTick = churn.until.bind(churn)
+    churn.until = async (target) => {
+      await untilTick(target)
+      if (target === epoch + 350000) advance(5000)
+    }
+    const until = processes.until
+    processes.until = jest.fn(async (...args) => {
+      const [kind] = args
+      const last = processes.sent.at(-1)
+      if (last.tick === lastTick.number && last.type === 'confirm-fence' && kind === KINDS.at(-1))
+        advance(5000)
+      return until(...args)
+    })
+    await expect(churn.ticks(epoch, schedule)).rejects.toThrow('exhausted its budget')
+    expect(clock.now()).toBe(epoch + 360000)
+    expect(churn.stages.some((row) => row.tick === lastTick.number)).toBe(false)
+    expect(fixture.rotate.mock.calls.at(-1)[0]).toBe(24)
+    expect(processes.sent.some((m) => m.tick === lastTick.number && m.type === 'stage')).toBe(false)
+  })
+
+  test('fails explicitly when a final confirmation receipt arrives past the absolute measurement end', async () => {
+    const { churn, processes, clock, advance } = make()
+    const schedule = new TelemetrySchedule(TELEMETRY)
+    const epoch = clock.now()
+    const lastTick = schedule.ticks.at(-1)
+    const untilTick = churn.until.bind(churn)
+    churn.until = async (target) => {
+      await untilTick(target)
+      if (target === epoch + 350000) advance(5000)
+    }
+    const until = processes.until
+    processes.until = jest.fn(async (...args) => {
+      const [kind] = args
+      const last = processes.sent.at(-1)
+      if (last.tick === lastTick.number && last.type === 'stage' && kind === KINDS.at(-1))
+        advance(5001)
+      return until(...args)
+    })
+    await expect(churn.ticks(epoch, schedule)).rejects.toThrow('exhausted its budget')
+    expect(clock.now()).toBe(epoch + 360001)
+    expect(churn.stages.some((row) => row.tick === lastTick.number)).toBe(false)
   })
 
   test('fails a measured tick that is more than its late bound behind and never catches it up', async () => {
@@ -2564,6 +3275,17 @@ describe('telemetry churn verification of one worker', () => {
       expect(() => verifyChurnReopen(base())).not.toThrow()
     })
 
+    test('checks subscription release against raw close and reconnect times', () => {
+      const input = base()
+      input.claim.closedAt = 121
+      input.releasedAt = 123
+      expect(() => verifyChurnReopen(input)).not.toThrow()
+      for (const releasedAt of [110, 126])
+        expect(() => verifyChurnReopen({ ...input, releasedAt })).toThrow(
+          'The subscription release is outside the disconnected lifecycle gap'
+        )
+    })
+
     test.each([
       [
         'a connect that was not next',
@@ -2710,6 +3432,8 @@ describe('telemetry churn verification of one worker', () => {
         selection: 'com.example.',
         segment: 's',
         receivedAt: 50,
+        releasedAt: 65,
+        after: 1,
         get: 'r2',
         subscriptionId: 8,
         proof: { socketId: 3, get: 'r1', push: 'r3', owedBy: ['reopen'] },
@@ -2975,6 +3699,15 @@ describe('telemetry churn complete-stream accounting', () => {
     return () => verifyChurnStream({ [ID]: transcript }, faulted)
   }
 
+  test('rejects an undeclared 117 after a subscription transition', () => {
+    expect(
+      verify((t) => {
+        const push = t.records.find((r) => r.apiKey === 72 && !r.terminating && r.response)
+        push.response.errorCode = 117
+      })
+    ).toThrow('Undeclared error 117')
+  })
+
   test('accounts for every request, the faulted exchange and the one final', () => {
     expect(verify()).not.toThrow()
   })
@@ -3227,39 +3960,58 @@ describe('telemetry churn coordinated stage replay', () => {
       t = Math.max(t, EPOCH + tick.at)
       tickStarts.push({ tick: tick.number, at: tick.at, beganAt: t })
       for (const stage of table.stages(tick)) {
-        if (stage === 'confirm') {
-          rotations.push({
-            tick: tick.number,
-            index: tick.index,
-            requestedAt: t,
-            setAt: t + 1,
-            readbackAt: t + 2,
-          })
-          t += 3
-        }
         const sentAt = t
+        let releasedAt
+        if (stage === 'confirm') {
+          for (const index of tick.transitions)
+            rotations.push({
+              tick: tick.number,
+              index,
+              selection: table.selection(index),
+              readback: table.selection(index),
+              requestedAt: t + 3,
+              setAt: t + 3,
+              readbackAt: t + 3,
+            })
+          releasedAt = t + 6
+        }
         for (const kind of KINDS) {
           const startedAt = sentAt + 1 - OFFSET[kind]
-          const doneAt = sentAt + 5 - OFFSET[kind]
+          const doneAt = sentAt + 8 - OFFSET[kind]
           stages.push({
             tick: tick.number,
             stage,
             kind,
             sentAt,
-            parentAt: sentAt + 6,
+            ...(stage === 'confirm' && {
+              releasedAt,
+              fence: {
+                parentAt: sentAt + 2,
+                receivedAt: startedAt,
+                after: 1,
+                segment: `${kind}-lc-1`,
+              },
+            }),
+            parentAt: sentAt + 9,
             workerStartedAt: startedAt,
             workerDoneAt: doneAt,
           })
           const { claims } = workers[kind]
           workers[kind].stages.push({ tick: tick.number, stage, startedAt, doneAt })
-          if (stage === 'lifecycle')
-            claims.reopens.push({ tick: tick.number, observedAt: startedAt, closedAt: doneAt })
+          if (stage === 'confirm')
+            claims.reopens.push({ tick: tick.number, observedAt: startedAt, closedAt: startedAt })
           if (stage === 'retire')
             claims.retirements.push({ tick: tick.number, declaredAt: startedAt, faultedAt: doneAt })
           if (stage === 'confirm')
-            claims.transitions.push({ tick: tick.number, receivedAt: startedAt })
+            claims.transitions.push({
+              tick: tick.number,
+              receivedAt: startedAt,
+              releasedAt: releasedAt + 1 - OFFSET[kind],
+              after: 1,
+              segment: `${kind}-lc-1`,
+            })
         }
-        t = sentAt + 6
+        t = sentAt + 9
       }
     }
     const boundaryAt = EPOCH + 360000
@@ -3283,12 +4035,109 @@ describe('telemetry churn coordinated stage replay', () => {
   }
   const tickWith = (table, action) => table.ticks.find((t) => t.actions.includes(action)).number
 
+  test('rejects a rotation before every worker fence acknowledgement', () => {
+    expect(
+      replay((a) => {
+        const rotation = a.rotations[0]
+        const rows = a.stages.filter((r) => r.tick === rotation.tick && r.stage === 'confirm')
+        for (const row of rows) {
+          row.fence = { parentAt: rotation.requestedAt + 1 }
+        }
+      })
+    ).toThrow('The rotation preceded a worker confirmation fence')
+  })
+
   test('derives the measured counts per kind from the joined receipts', () => {
     const input = archive()
     const counts = verifyChurnStages({ archive: input.archive, timeline: input.timeline })
     expect(Object.keys(counts)).toEqual([...KINDS])
     for (const kind of KINDS)
-      expect(counts[kind]).toEqual({ subscription: 30, retire: 10, reopen: 5 })
+      expect(counts[kind]).toEqual({ subscription: 35, retire: 10, reopen: 5 })
+  })
+
+  test('replays shifted gaps with all retirements separate and confirmations inside the window', () => {
+    const input = archive()
+    const { table, timeline } = input
+    const gaps = table.ticks.filter((tick) => tick.transitions.length)
+    expect(gaps.map((tick) => tick.at)).toEqual([70000, 135000, 195000, 255000, 350000])
+    for (const gap of gaps) {
+      const rows = input.archive.stages.filter((row) => row.tick === gap.number)
+      expect(rows.every((row) => row.stage === 'confirm')).toBe(true)
+      const next = EPOCH + (table.ticks[gap.number + 1]?.at ?? table.endMs)
+      expect(rows.every((row) => row.parentAt < next && row.parentAt < timeline.boundaryAt)).toBe(
+        true
+      )
+    }
+    expect(() => verifyChurnStages(input)).not.toThrow()
+  })
+
+  test('rejects a final receipt at 360001 ms even when the recorded boundary is later', () => {
+    const input = archive()
+    const { archive: facts, table, timeline } = input
+    const tick = table.ticks.at(-1).number
+    facts.tickStarts.at(-1).beganAt += 5000
+    timeline.boundaryAt += 5000
+    for (const rotation of facts.rotations.filter((r) => r.tick === tick)) {
+      rotation.requestedAt += 5000
+      rotation.setAt += 5000
+      rotation.readbackAt += 5000
+    }
+    for (const kind of KINDS) {
+      const row = facts.stages.find((r) => r.tick === tick && r.kind === kind)
+      row.sentAt += 5000
+      row.releasedAt += 5000
+      row.fence.parentAt += 5000
+      row.fence.receivedAt += 5000
+      row.workerStartedAt += 5000
+      row.workerDoneAt = EPOCH + 359999 - OFFSET[kind]
+      row.parentAt = EPOCH + 360000
+      const worker = facts.workers[kind]
+      const own = worker.stages.find((s) => s.tick === tick)
+      own.startedAt = row.workerStartedAt
+      own.doneAt = row.workerDoneAt
+      const claim = worker.claims.transitions.find((c) => c.tick === tick)
+      claim.receivedAt += 5000
+      claim.releasedAt += 5000
+      const reopen = worker.claims.reopens.find((c) => c.tick === tick)
+      reopen.observedAt += 5000
+      reopen.closedAt += 5000
+      worker.timing.boundaryAt += 5000
+      worker.timing.measurementMs += 5000
+    }
+    expect(() => verifyChurnStages(input)).not.toThrow()
+    facts.stages.at(-1).parentAt += 1
+    expect(() => verifyChurnStages(input)).toThrow(
+      'Stage work continued past the measurement boundary'
+    )
+  })
+
+  test('accepts a polled readback only before every worker release', () => {
+    const input = archive()
+    const rotation = input.archive.rotations[0]
+    rotation.readbackAt += 250
+    rotation.readbackAttempts = 6
+    for (const next of input.archive.rotations.filter(
+      (r) => r.tick === rotation.tick && r.index > rotation.index
+    )) {
+      next.requestedAt += 250
+      next.setAt += 250
+      next.readbackAt += 250
+    }
+    for (const kind of KINDS) {
+      const row = input.archive.stages.find((r) => r.tick === rotation.tick && r.kind === kind)
+      row.releasedAt += 250
+      row.parentAt += 250
+      row.workerDoneAt += 250
+      input.archive.workers[kind].stages.find(
+        (r) => r.tick === rotation.tick && r.stage === 'confirm'
+      ).doneAt += 250
+      input.archive.workers[kind].claims.transitions[0].releasedAt += 250
+    }
+    expect(verifyChurnStages(input).producer.subscription).toBe(35)
+    rotation.readbackAt += 4
+    expect(() => verifyChurnStages(input)).toThrow(
+      'The set and readback are outside their stage barrier'
+    )
   })
 
   test.each([
@@ -3303,11 +4152,12 @@ describe('telemetry churn coordinated stage replay', () => {
       'Stage catalogue differs from the fixed table',
     ],
     [
-      'stages reordered within a tick',
+      'a shifted confirmation reordered before its preceding retirement',
       (a, table) => {
-        const tick = table.ticks.find((t) => t.actions.length === 3).number
-        const rows = a.stages.filter((r) => r.tick === tick)
+        const tick = table.ticks.find((t) => t.at === 135000).number
+        const rows = a.stages.filter((r) => r.tick === tick - 1 || r.tick === tick)
         const first = a.stages.indexOf(rows[0])
+        expect(rows).toHaveLength(8)
         a.stages.splice(first, 8, ...rows.slice(4, 8), ...rows.slice(0, 4))
       },
       'Stage catalogue differs from the fixed table',
@@ -3338,7 +4188,7 @@ describe('telemetry churn coordinated stage replay', () => {
     ],
     [
       'a set outside its barrier',
-      (a) => (a.rotations[2].requestedAt -= 10),
+      (a) => (a.rotations[2].setAt = a.rotations[2].requestedAt - 1),
       'The set and readback are outside their stage barrier',
     ],
     [
@@ -3360,8 +4210,23 @@ describe('telemetry churn coordinated stage replay', () => {
     ],
     [
       'a claim outside its own stage',
-      (a) => (a.workers.producer.claims.reopens[0].closedAt += 1),
-      'lies outside its lifecycle stage',
+      (a) => (a.workers.producer.claims.reopens[0].closedAt += 10),
+      'lies outside its confirm stage',
+    ],
+    [
+      'a transition while a lifecycle is still active',
+      (a) => {
+        const facts = a.workers.producer
+        const reopen = facts.claims.reopens[0]
+        const stage = facts.stages.find((s) => s.tick === reopen.tick && s.stage === 'confirm')
+        reopen.closedAt = stage.startedAt + 5
+      },
+      'A subscription transition was released inside an active lifecycle',
+    ],
+    [
+      'a transition without a disconnected lifecycle boundary',
+      (a) => a.workers.producer.claims.reopens.shift(),
+      'The subscription transition has no disconnected lifecycle boundary',
     ],
     [
       'an advertised measurement interval',
@@ -3473,8 +4338,8 @@ describe('telemetry churn worker identity', () => {
         uuid: U,
         stem: STEM,
         input: {
-          baseline: { registryDigest: digest },
-          teardown: { registryDigest: digest },
+          baseline: { registryDigest: digest, journals: { byteLength: 4096, cursor: 0 } },
+          teardown: { registryDigest: digest, journals: { byteLength: 4096, cursor: 0 } },
           reference: {
             control: { kind: 'producer', manifest },
             foreground: manifest.operations.map((o) => ({ n: o.n, status: 'fulfilled' })),
@@ -3563,7 +4428,7 @@ describe('telemetry churn worker identity', () => {
           v8: '13.0',
           platform: 'linux',
           arch: 'x64',
-          execArgv: ['--expose-gc'],
+          execArgv: ['--expose-gc', '--min-semi-space-size=1', '--max-semi-space-size=1'],
           modules: 300,
           codecs: { gzip: true, zstd: true },
           source,
@@ -3585,6 +4450,20 @@ describe('telemetry churn worker identity', () => {
       expect(run().source.driver.file).toBe('scripts/soak/soak.js')
       expect(run().source.churn.file).toBe('scripts/soak/telemetryChurn.js')
       expect(verify()).not.toThrow()
+    })
+
+    test('requires the exact five-minute flags even when all workers agree', () => {
+      for (const flags of [
+        ['--expose-gc'],
+        ['--expose-gc', '--no-flush-bytecode'],
+        ['--expose-gc', '--min-semi-space-size=1'],
+        ['--expose-gc', '--max-semi-space-size=1'],
+        ['--expose-gc', '--min-semi-space-size=1', '--max-semi-space-size=2'],
+        ['--expose-gc', '--min-semi-space-size=1', '--max-semi-space-size=1', '--inspect'],
+      ])
+        expect(verify((r) => r.handshakes.forEach((hello) => (hello.execArgv = flags)))).toThrow(
+          'Workers ran with unexpected five-minute flags'
+        )
     })
 
     test.each([
@@ -3708,6 +4587,7 @@ describe('telemetry churn archive replay', () => {
     jest.spyOn(churnModule, 'TelemetrySchedule').mockImplementation(() => ({
       ticks: [],
       warmupMs: 60000,
+      endMs: 360000,
       required: () => ({ ...NONE }),
     }))
     jest.replaceProperty(churnModule, 'MINIMUMS', NONE)
@@ -3929,8 +4809,8 @@ describe('telemetry churn archive replay', () => {
         result: VERDICT,
         input: {
           clientCount: 1,
-          baseline: { registryDigest: digest },
-          teardown: { registryDigest: digest },
+          baseline: { registryDigest: digest, journals: { byteLength: 4096, cursor: 0 } },
+          teardown: { registryDigest: digest, journals: { byteLength: 4096, cursor: 0 } },
           reference: {
             control: { kind, manifest },
             foreground: manifest.operations.map((o) => ({ n: o.n, status: 'fulfilled' })),
@@ -3965,7 +4845,7 @@ describe('telemetry churn archive replay', () => {
         v8: '13.0',
         platform: 'linux',
         arch: 'x64',
-        execArgv: ['--expose-gc'],
+        execArgv: ['--expose-gc', '--min-semi-space-size=1', '--max-semi-space-size=1'],
         codecs: { gzip: true, zstd: true },
         source,
         parentAt: 5 + i,
@@ -4107,6 +4987,35 @@ describe('telemetry churn archive replay', () => {
     )
   })
 
+  test.each(['missing', 'duplicate', 'reordered', 'wrong-timestamp'])(
+    'rejects %s share journal facts through the production archive verifier',
+    (fault) => {
+      const journalArchive = (made) => {
+        const captured = made.archive.workers.shareConsumer.share
+        const ledger = new churnModule.ShareLedger({
+          group: captured.group,
+          clock: { now: () => 0 },
+        })
+        for (const row of captured.exchanges) ledger.exchanges.push({ ...row, at: row.n + 0.125 })
+        const original = ledger.facts()
+        captured.exchanges = original.exchanges
+        captured.exchangesSha256 = original.exchangesSha256
+        made.archive.inputs.shareConsumer.exchangesSha256 = original.exchangesSha256
+      }
+      expect(verify(journalArchive)).not.toThrow()
+      expect(
+        verify((made) => {
+          journalArchive(made)
+          const captured = made.archive.workers.shareConsumer.share
+          if (fault === 'missing') captured.exchanges.pop()
+          if (fault === 'duplicate') captured.exchanges.push(captured.exchanges[0])
+          if (fault === 'reordered') captured.exchanges.reverse()
+          if (fault === 'wrong-timestamp') captured.exchanges[0].at += 0.125
+        })
+      ).toThrow('Share exchange facts differ from their capture hash')
+    }
+  )
+
   test.each([
     [
       'a second copy of the exchanges in the oracle inputs',
@@ -4125,5 +5034,163 @@ describe('telemetry churn archive replay', () => {
     ],
   ])('refuses %s', (_name, change, message) => {
     expect(verify((made) => change(made.archive))).toThrow(message)
+  })
+})
+
+describe('telemetry control warm-up', () => {
+  test.each(['producer', 'admin', 'consumer', 'shareConsumer'])(
+    'warms the %s catalogue and idle window before c0 without changing the measured replay',
+    async (kind) => {
+      const events = []
+      let at = 0
+      const client = {
+        connect: async () => events.push('connect'),
+        subscribe: async () => {},
+        run: async () => {},
+        disconnect: async () => events.push('disconnect'),
+        send: async (request) => events.push(request.messages[0].key),
+        describeCluster: async () => events.push('describeCluster'),
+      }
+      const config = { stem: 's', topic: 's-topic', ctl: 's-ctl', group: 's-group' }
+      const { ReferenceControl } = require('../telemetryChurn')
+      const result = await new ReferenceControl({
+        kind,
+        config,
+        Kafka: function Kafka() {
+          return { [kind]: () => client }
+        },
+        socketFactory: () => {},
+        logLevel: { NOTHING: 0 },
+        resources: { as: (_role, work) => work(), live: new Map() },
+        clock: { now: () => ++at },
+        sleep: async (ms) => {
+          at += ms
+          if (ms === 2000 || ms === 10000) events.push('idle')
+        },
+        gc: () => {},
+        engine: { record: (reading) => events.push(reading.phase) },
+      }).run()
+      const count = { producer: 20, admin: 10, consumer: 0, shareConsumer: 0 }[kind]
+      const catalogue = (prefix) =>
+        Array.from({ length: count }, (_, n) =>
+          kind === 'producer' ? `s:${prefix}:${n}` : 'describeCluster'
+        )
+      expect(events).toEqual([
+        'connect',
+        ...catalogue('ctl-warmup'),
+        'idle',
+        'c0',
+        ...catalogue('ctl-off'),
+        'idle',
+        'c1',
+        'disconnect',
+        'control-released',
+      ])
+      expect(result.warmup).toBeDefined()
+      expect(result.warmup.outcomes).toHaveLength(count)
+      expect(result.warmup.outcomes.every((o, n) => o.n === n && o.status === 'fulfilled')).toBe(
+        true
+      )
+      expect(result.warmup.completedAt - result.warmup.idleStartedAt).toBeGreaterThanOrEqual(
+        kind === 'shareConsumer' ? 10000 : 2000
+      )
+      expect(result.warmup.completedAt - result.warmup.idleStartedAt).toBeLessThan(
+        (kind === 'shareConsumer' ? 10000 : 2000) + 10
+      )
+      expect(result.warmup.completedAt).toBeLessThanOrEqual(result.c0.gc.admittedAt)
+      expect(result.outcomes).toHaveLength(result.manifest.operations.length)
+      expect(result.outcomes.every((o) => o.at > result.c0.at && o.at < result.c1.at)).toBe(true)
+      expect(Object.keys(result.c0).sort()).toEqual(Object.keys(result.c1).sort())
+    }
+  )
+
+  test('tops up an idle timer that fires early so the warm-up idle lasts the full window', async () => {
+    for (const kind of ['consumer', 'shareConsumer']) {
+      let at = 0
+      const client = {
+        connect: async () => {},
+        subscribe: async () => {},
+        run: async () => {},
+        disconnect: async () => {},
+        describeCluster: async () => {},
+      }
+      const { ReferenceControl, CONTROL } = require('../telemetryChurn')
+      const result = await new ReferenceControl({
+        kind,
+        config: { stem: 's', topic: 's-topic', ctl: 's-ctl', group: 's-group' },
+        Kafka: function Kafka() {
+          return { [kind]: () => client }
+        },
+        socketFactory: () => {},
+        logLevel: { NOTHING: 0 },
+        resources: { as: (_role, work) => work(), live: new Map() },
+        clock: { now: () => at },
+        sleep: async (ms) => {
+          at += ms >= CONTROL.idleMs ? ms - 0.35 : ms
+        },
+        gc: () => {},
+        engine: { record: () => {} },
+      }).run()
+      expect(result.warmup.completedAt - result.warmup.idleStartedAt).toBeGreaterThanOrEqual(
+        CONTROL.idleMs * (kind === 'shareConsumer' ? 5 : 1)
+      )
+      expect(result.warmup.completedAt).toBeLessThanOrEqual(result.c0.gc.admittedAt)
+    }
+  })
+
+  test('preserves the frozen long-window control catalogue and three readings', async () => {
+    const previous = process.env.TELEMETRY_LONG_WINDOW
+    let Control
+    try {
+      process.env.TELEMETRY_LONG_WINDOW = '1'
+      jest.isolateModules(() => {
+        Control = require('../telemetryChurn').ReferenceControl
+      })
+    } finally {
+      if (previous === undefined) delete process.env.TELEMETRY_LONG_WINDOW
+      else process.env.TELEMETRY_LONG_WINDOW = previous
+    }
+    for (const kind of ['admin', 'shareConsumer']) {
+      const events = []
+      let at = 0
+      const result = await new Control({
+        kind,
+        config: { stem: 's', topic: 't', ctl: 'ctl', group: 'g' },
+        Kafka: function Kafka() {
+          return {
+            [kind]: () => ({
+              subscribe: async () => {},
+              run: async () => {},
+              connect: async () => {},
+              disconnect: async () => {},
+              describeCluster: async () => events.push('operation'),
+            }),
+          }
+        },
+        socketFactory: () => {},
+        logLevel: { NOTHING: 0 },
+        resources: { as: (_role, work) => work(), live: new Map() },
+        clock: { now: () => ++at },
+        sleep: async (ms) => {
+          at += ms
+          events.push(ms)
+        },
+        gc: () => {},
+        engine: { record: (reading) => events.push(reading.phase) },
+      }).run()
+      expect(events).toEqual([
+        2000,
+        100,
+        'c0',
+        ...Array(kind === 'admin' ? 10 : 0).fill('operation'),
+        2000,
+        100,
+        'c1',
+        100,
+        'control-released',
+      ])
+      expect(result).not.toHaveProperty('warmup')
+      expect(result.outcomes).toHaveLength(kind === 'admin' ? 10 : 0)
+    }
   })
 })

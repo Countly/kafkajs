@@ -80,7 +80,12 @@ const request = async (apiKey, apiVersion, correlationId, compression = 0) => {
  * @param {ShareFetchTap} tap Original call-through transport observer.
  * @returns {Promise<void>} Complete fixed header/codec coverage.
  */
-const coverage = async (tap, endpoint = 'node:1', metadataVersion = 13) => {
+const coverage = async (
+  tap,
+  endpoint = 'node:1',
+  metadataVersion = 13,
+  negotiationOperation = 'connect'
+) => {
   const calls = [
     ['send', 0, 9, 'producer'],
     ['send', 22, 4, 'producer'],
@@ -110,7 +115,7 @@ const coverage = async (tap, endpoint = 'node:1', metadataVersion = 13) => {
   tap.wrap(socket, endpoint)
   for (const [index, [operation, apiKey, version, role = 'admin']] of calls.entries()) {
     const bytes = await request(apiKey, version, index)
-    tap.operation(role, operation, () => {
+    tap.operation(role, apiKey === 18 ? negotiationOperation : operation, () => {
       expect(socket.write(bytes.subarray(0, 7))).toBe(false)
       expect(socket.write(bytes.subarray(7))).toBe(false)
       const body = new Encoder()
@@ -138,6 +143,7 @@ const recording = async ({
   failPrime = false,
   failCleanup = false,
   damageBoundary,
+  damageReference,
   primeRate = 0,
   idleWakeMs = 0,
   heapOffset = 0,
@@ -145,7 +151,14 @@ const recording = async ({
   damagePrime,
   separateCoordinators = false,
   scoredMetadataVersion = 13,
+  scoredNegotiationOperation = 'connect',
 } = {}) => {
+  const environment = { ...process.env }
+  Object.assign(process.env, {
+    KAFKAJS_LANE: 'docker',
+    KAFKAJS_SOAK_PROFILE: short ? 'short' : 'full',
+    [short ? 'SHARE_SOAK_E2E' : 'SHARE_SOAK_FULL']: '1',
+  })
   jest.useFakeTimers({ now: 1700000000000, doNotFake: ['setImmediate'] })
   const rows = []
   const gate = new LiveRun()
@@ -165,6 +178,8 @@ const recording = async ({
       )
       if (armedAt === null) point.heapUsed += Math.round((primeRate * now) / 60000)
       if (damagePrime && !rows.some((r) => r.event === 'priming-complete')) damagePrime(point)
+      if (damageReference && !rows.some((r) => r.event === 'priming-boundary-reference'))
+        damageReference(point)
       return point
     },
     restore: jest.fn(),
@@ -195,7 +210,8 @@ const recording = async ({
         await coverage(
           tap,
           separateCoordinators ? (priming ? 'node-a:9092' : 'node-b:9092') : 'node:1',
-          priming ? 13 : scoredMetadataVersion
+          priming ? 13 : scoredMetadataVersion,
+          priming ? 'connect' : scoredNegotiationOperation
         )
       }),
       openPhase: async () => {
@@ -303,6 +319,7 @@ const recording = async ({
   } finally {
     jest.useRealTimers()
     liveRun.reset()
+    process.env = environment
   }
 }
 
@@ -316,6 +333,24 @@ describe('fixed same-realm share priming', () => {
     expect(inventories[1].inventory.every((r) => r.endpoint === 'node-b:9092')).toBe(true)
   }, 120000)
 
+  test('accepts identical ApiVersions attempts made during different public operations', async () => {
+    const { rows, result, error, problems } = await recording({
+      scoredNegotiationOperation: 'deleteTopics',
+    })
+    expect(error).toBeUndefined()
+    expect(result.ok).toBe(true)
+    expect(problems).toEqual([])
+    const manifests = rows.filter((r) => r.event === 'soak-protocol-manifest')
+    expect(manifests[0].inventory.filter((r) => r.apiKey === 18).map((r) => r.operation)).toEqual([
+      'connect',
+      'connect',
+    ])
+    expect(manifests[1].inventory.filter((r) => r.apiKey === 18).map((r) => r.operation)).toEqual([
+      'deleteTopics',
+      'deleteTopics',
+    ])
+  }, 120000)
+
   test('rejects a corresponding negotiated version mismatch across separate coordinators', async () => {
     const { result, problems } = await recording({
       separateCoordinators: true,
@@ -325,12 +360,73 @@ describe('fixed same-realm share priming', () => {
     expect(problems).toContain('share.jsonl: priming/scored negotiated implementations differ')
   }, 120000)
 
+  test('uses the settled timer census when a pre-priming Immediate completes during collection', async () => {
+    const { rows, result, error, problems } = await recording({
+      damageReference: (point) => {
+        point.activeResourcesBeforeCollection.Immediate = 1
+        point.timerOwners.beforeCollection.unattributed.Immediate = 1
+      },
+    })
+    expect(error).toBeUndefined()
+    expect(result.ok).toBe(true)
+    expect(problems).toEqual([])
+    const reference = rows.find((r) => r.event === 'priming-boundary-reference').snapshot
+    const boundary = rows.find((r) => r.event === 'priming-boundary').snapshot
+    expect(reference.timerOwners.beforeCollection.unattributed.Immediate).toBe(1)
+    expect(reference.timerOwners.afterCollection.unattributed.Immediate ?? 0).toBe(0)
+    for (const owners of Object.values(boundary.timerOwners))
+      expect(owners.unattributed.Immediate ?? 0).toBe(0)
+    expect(verifySharePriming(rows)).toEqual([])
+  }, 120000)
+
+  test('rejects a boundary Immediate that disappears during collection', async () => {
+    const { rows, error, scoredDriver } = await recording({
+      damageReference: (point) => {
+        point.activeResourcesBeforeCollection.Immediate = 1
+        point.timerOwners.beforeCollection.unattributed.Immediate = 1
+      },
+      damageBoundary: (point) => {
+        point.activeResourcesBeforeCollection.Immediate = 1
+        point.timerOwners.beforeCollection.unattributed.Immediate = 1
+      },
+    })
+    expect(error.message).toMatch(/priming boundary/)
+    expect(scoredDriver.prepare).not.toHaveBeenCalled()
+    expect(rows.some((r) => r.event === 'priming-boundary')).toBe(false)
+    expect(rows.some((r) => r.event === 'case-complete')).toBe(false)
+  }, 120000)
+
+  test.each(['beforeCollection', 'afterCollection'])(
+    'requires the original %s reference attribution source',
+    async (when) => {
+      const { error, scoredDriver, rows } = await recording({
+        damageReference: (point) => {
+          delete point.timerOwners[when].unattributed
+        },
+      })
+      expect(error.message).toMatch(/priming boundary/)
+      expect(scoredDriver.prepare).not.toHaveBeenCalled()
+      expect(rows.some((r) => r.event === 'priming-boundary')).toBe(false)
+    },
+    120000
+  )
+
   test.each([true, false])(
     'executes one complete disjoint pass before scoring, short=%s',
     async (short) => {
       const { owner, rows, result, error, problems, shares } = await recording({ short })
       expect(error).toBeUndefined()
       expect(result).toMatchObject({ ok: true, counts: { cycles: 30, resets: 10 } })
+      for (const scope of ['priming', 'scored']) {
+        const original = rows.filter((r) => r.scope === scope)
+        expect(verifyShareProtocol(original).problems).toEqual([])
+        const manifest = original.find((r) => r.event === 'soak-protocol-manifest')
+        const completion = original.find((r) =>
+          ['priming-complete', 'case-complete'].includes(r.event)
+        )
+        expect(manifest).toBeDefined()
+        expect(completion.protocolSha256).toBe(manifest.sha256)
+      }
       expect(problems).toEqual([])
       expect(verifySharePriming(rows)).toEqual([])
       expect(rows.filter((r) => r.event === 'soak-cycle')).toHaveLength(60)
@@ -718,6 +814,29 @@ describe('recorded priming integrity', () => {
   }, 120000)
 
   test.each([
+    ...[
+      [
+        'missing reference before-collection attribution',
+        (point) => {
+          delete point.timerOwners.beforeCollection.unattributed
+        },
+      ],
+      [
+        'invalid reference before-collection attribution',
+        (point) => {
+          point.timerOwners.beforeCollection.unattributed.Immediate = -1
+        },
+      ],
+      [
+        'reference observer overflow',
+        (point) => {
+          point.timerOwners.beforeCollection.dropped = 1
+        },
+      ],
+    ].map(([name, damage]) => [
+      name,
+      (rows) => damage(rows.find((r) => r.event === 'priming-boundary-reference').snapshot),
+    ]),
     [
       'forged boundary resource',
       (rows) => {

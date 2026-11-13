@@ -55,6 +55,14 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Tooling
 
+- Memory gates record decreases in approximate kernel peak readings as evidence and retain the maximum across all reads; the 160 MiB peak, 64 MiB increase, setup allowances and invalid-reading checks are unchanged.
+- Pin five-minute telemetry workers and their live-flags journal controls to 1 MiB minimum and maximum semi-spaces; long-window workers and resource children keep their existing flags.
+- Raise only the five-minute telemetry host-load threshold from 0.75 to 1.0 per CPU; the resource verifier and long-window configuration keep 0.75.
+- Serialize observer disposal records directly without intermediate defensive copies, preserving transcript bytes and defensive copies on public reads.
+- The five-minute telemetry control records a resident-size decrease between its two readings instead of marking the control unstable; growth over 2 MiB and retained drift over 256 KiB still do.
+- The five-minute telemetry lane and the resource verifier record a kernel peak counter read just below its own reading's (or interval's) resident size (each distinct shortfall once) instead of failing its peak series; a peak counter below any earlier reading's resident size still fails, and the judged peak takes the larger of both readings.
+- Add the `telemetry-long-window` shadow lane to the memory gates (manual dispatch only, outside the verdict): the frozen long-window candidate (420 s warm-up, 900 s window, the existing traffic rate from the start, slope on the 15 mid-cycle readings) runs per Node, Kafka line, seeded or unseeded arm and replicate, plus a warm-up-only seed per Node, with heap-space and collection attribution; every record is diagnostic and refused by the resource verdict and the memory arm judge, no limit, window or estimator changes, and `scripts/soak/longWindowReport.js` prints the S1/S2/S3 table.
+- Add isolated broker-free active compression diagnostics on Node 22/24/26, with unchanged public resource children, scalar companions, explicit major-GC pairs and bounded retained-root censuses; records cannot satisfy memory acceptance.
 - Exit gate decoder benchmark: a row that is INVALID only because of runner noise passes when its median new/old is within 5%; a valid FAIL or regression, a structural problem or a larger median still fails.
 - The Exit gate's decoder benchmark reports all five frame-decode rows (1m, 64b, 64k, coalesced, byte-chunks) as information only: on GitHub-hosted runners their A/A control is too noisy to judge; a valid FAIL or proven regression on them still fails.
 - Judge decoder benchmark rows with paired confidence bounds and a calibrated baseline control, using longer rounds and three parallel collection partitions.
@@ -70,6 +78,20 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Tooling
 
+- Give every five-minute churn job a verified 5 MiB derived reporter sink, retaining fatal overflow checks and the unchanged long-window reporter; release the disabled share diagnostic's disconnected confirmation fences so its original corpus resumes, and profile enabled confirmation reconnects.
+- Apply all 35 five-minute telemetry subscription transitions in disconnected batches before the next handshake, retain the error-42-only contract and socket retirement slots, and retain the original five public reopen cycles (seven segments per kind) within the unchanged segment cap; move the middle gaps from 120/180/240 s to 135/195/255 s between settled samples, retaining 70/350 s and judging every sample; cap late confirmations at the absolute measurement end and independently reject receipts past it; the long-window method is unchanged.
+- Idle the share consumer's five-minute telemetry-disabled control for 10 seconds before C0, retaining 2 seconds for other kinds, the 2-second validator minimum and both drift limits.
+- Warm the five-minute telemetry-disabled control catalogue and idle window before C0, validate its separate outcomes and timing, and retain both drift limits and the frozen long-window method.
+- Allow resource-control C0/C1 up to twelve GC rounds with the same 16 KiB settle rule; other readings keep six, and an unsettled control remains inconclusive.
+- Run every memory child with eager compilation and both semi-space sizes pinned to 1 MiB; telemetry churn and long-window worker flags stay unchanged.
+- Remove the five-minute telemetry closed transient ceiling; resources still judge closed growth above 256 KiB and the long-window lane still judges its endpoint.
+- Record unsettled active resource readings as facts while judging the 8 MiB ceiling over every active checkpoint; control, matched, warm-up and closed readings still require settlement.
+- Record closed resource data more than 256 KiB below its matched baseline as facts; closed growth above 256 KiB still fails.
+- Adopt long-window v2 as telemetry slope/endpoint acceptance: 39 jobs (three seeded and three unseeded replicates per Node/Kafka tuple plus warm-up seeds), with S1/S2/S3, masking and first-use checks; the five-minute lane retains its other checks apart from the closed transient ceiling, and its seeded slope control becomes optional diagnostic evidence.
+- Resource gate: closed ceiling, control stability and a new first-use bound judge heap plus external without V8 bytecode and compiled code (limits unchanged, schema 6); a measured warm-up pass runs before M; seeded per-close, warm-up and warm-up-only controls must fail on Node 22/24/26. Seeded records are never acceptance evidence, while structurally valid controls still report numerical limit failures.
+- Memory-gate controls: the legacy journal arm is a contamination-positive control; admin and live-flags parity arms; the live worker records V8 code bytes in shadow.
+- Live soak: a seeded control per Node must show the retained-slope violation at twice the slope limit.
+- Declare explicit 360-minute timeouts for the nine remaining runner jobs without a job limit; retain every existing explicit timeout.
 - Move telemetry memory arms and their validated artifacts, the retained-ownership diagnostic and full Node/broker churn-soak coverage into the guarded Memory gates workflow; keep the other functional telemetry lanes and non-memory resource schedules on phase PRs with unchanged acceptance checks.
 - Prepare a verified runner-local AppCDS archive for the pinned telemetry decoder before timed observer work, retain preparation diagnostics, and require archive-backed decoding under unchanged time limits.
 - Flush terminal telemetry worker messages before IPC disconnect, retain failed-worker exit, output and phase diagnostics, and hold planned soak samples until their admission time.
@@ -113,6 +135,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Behavior changes
 
+- Telemetry churn share journals are packed losslessly with raw digests and int64 offsets; the share worker's declared journal bytes fall from 29,487,024 to 23,192,560; its live setup allowance is 96 MiB plus those declared bytes, recorded and recomputed; the 64 MiB increase and 160 MiB peak limits are unchanged.
 - Observe successful foreground connections and completed request latency in the shared network runtime when telemetry is enabled; contain collector failures so the original request results are preserved.
 - Refuse obsolete telemetry connection opens before they can retire the current connection, preserving healthy telemetry after replacement or reconnect.
 - Log fixed diagnostics for private telemetry response failures without reading properties of arbitrary thrown values; ordinary request diagnostics retain their existing messages.
@@ -134,6 +157,12 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 #### Fixes
 
+- Preserve the final terminating telemetry push when disconnect races a periodic compression job, while retaining the original close deadline and single-job bound. Detach expired close waiters and release their captured sample, resources and transport even if the codec never settles.
+- Custom telemetry metrics serialize each registered identity once and reuse it as the series key, so a client no longer retains a second copy of every custom metric identity string (about 370 KiB for 128 maximum-size descriptors).
+- Initialize the request queue's timeout handle in its constructor, so clearing it later no longer changes the queue's object layout and slows coalesced frame decoding (about 7% against master in the frame benchmark).
+- Release completed request scopes from connection ordering tails on settlement and generation close, and drop cleared request-timeout interval handles. Preserve request order and reconnect fencing.
+- Release disposed telemetry wire observer callbacks and frame parsers while retaining complete wire and cleanup evidence; flush serial calibration child artifacts and always upload resource diagnostics.
+- Release a closed client telemetry connection and its frame buffer once the final telemetry push has settled.
 - A consumer that stops while an in-flight heartbeat loses the coordinator now still leaves its group (classic and consumer protocol): a coordinator rediscovered by the final offset commit is kept for the leave, without restarting heartbeats after stop. Previously the leave was skipped and the group waited a full session timeout (a regression from an earlier 3.0.0 pre-release). Coordinator recovery from a stale offset commit cannot overwrite the coordinator of a replacement membership.
 
 ### Phase 9E — Share groups
@@ -189,9 +218,11 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 #### Tooling
 
 - Register the share broker-floor refusal checks in the exit gate (required on the 4.0.2 floor, tolerated skips elsewhere) and enumerate the new tarball and docs path guards in the exit sweeps.
-- Move share-soak memory acceptance to the separate `Memory gates` workflow on `p9m/` pull requests and manual dispatch, required before 3.0.0 rather than phase merges. CI jobs replace the local guard for these demonstrations. Only the short job currently ships; the full-profile job and complete independent acceptance validator remain owed to the memory-gates follow-up. Add a manual integration lane selector and run the soak unit spec in three case shards per supported Node version.
+- Move share-soak memory acceptance to the separate `Memory gates` workflow on `p9m/` pull requests and manual dispatch, required before 3.0.0 rather than phase merges. CI jobs replace the local guard for these demonstrations. Add a manual integration lane selector and run the soak unit spec in three case shards per supported Node version.
 
 - Add share-consumer soak and benchmark gates with separate batch and message identity controls. Before scored setup, both soak profiles execute one fixed same-process, same-realm 30-cycle priming pass with separate resources and joined cleanup, funded by a separate 1020000-ms allocation. The short/full scored profiles retain 32/64-second slots, 960/1920-second spans, thirty cycles, ten resets and separate 5000 ms per-cycle and final observations, with unchanged scored clocks and heap/resource screens. Inclusive child budgets and watchdogs are 2040/3000 seconds. These are declared bounds; live acceptance and measured performance remain unverified.
+
+- Add isolated short/full share-soak CI jobs with 35/51-minute fixed parent steps and 55/71-minute job limits, original lifecycle admission, independent validation, owned cleanup, sealed artifacts and broker-free archive rechecks. Require the aggregate share-soak verdict alongside the existing Exit gate for the tested commit. Historical local guard caps are superseded for these demonstrations.
 
 - Track the seven released share-group APIs (keys 76–79 and 90–92) in the Kafka 4.4.0 and 4.3.1 message snapshots and regenerate their protocol compatibility inventory. Source inventory alone does not add share-group support.
 - Add a Java share-consumer interoperability member and classpath probe.

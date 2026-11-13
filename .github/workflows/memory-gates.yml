@@ -1,71 +1,284 @@
 name: Memory gates
 on:
   workflow_dispatch:
+    inputs:
+      only:
+        description: Comma-separated job ids; empty runs all; partial selections fail verdicts
+        type: string
+        required: false
+        default: ''
+      replicates:
+        description: Long-window replicates; three required for acceptance, fewer are diagnostic
+        type: choice
+        default: '3'
+        options: ['1', '2', '3']
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
 concurrency:
-  group: memory-gates-${{ github.ref }}
+  group: memory-gates-${{ github.ref }}-${{ inputs.only || 'all' }}-${{ inputs.replicates || '3' }}
   cancel-in-progress: true
 jobs:
-  share-soak-short:
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/')
+  select:
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.head_ref == 'p9m/memory-gates' && github.base_ref == 'master')
     runs-on: ubuntu-latest
-    timeout-minutes: 55
-    env:
-      KAFKA_VERSION: 4.3.1
-      COMPOSE_FILE: docker-compose.yml
-      KAFKA_CLIENTS_VERSION: ''
+    timeout-minutes: 5
+    permissions: { contents: read }
+    outputs:
+      jobs: ${{ steps.select.outputs.jobs }}
+      full: ${{ steps.select.outputs.full }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: 24, cache: npm }
-      - run: npm ci
-      - run: docker compose version
-      - name: Prepare share evidence
-        run: |
-          echo "KAFKAJS_TREE=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
-          rm -rf .tmp/e2e
-          mkdir -p .tmp/e2e
-      - name: Start cold base cluster
+      - id: select
+        timeout-minutes: 1
         env:
-          DO_NOT_STOP: '1'
-        run: ./scripts/testWithKafka.sh "true"
-      - name: Run share soak (natural exit)
-        timeout-minutes: 35
-        env:
-          KAFKAJS_LANE: docker
-          KAFKAJS_DEBUG_PROTOCOL_BUFFERS: '1'
-          SHARE_SOAK_E2E: '1'
-        run: node scripts/ci/naturalExit.js soak
-      - name: Verify share evidence before teardown
-        if: always()
+          ONLY: ${{ inputs.only }}
         run: |
           node <<'NODE'
-          const fs = require('fs')
-          const { spawnSync } = require('child_process')
-          const { readBrokerVersion } = require('./testHelpers/brokerVersion')
-          const files = fs.readdirSync('.tmp/e2e').filter(name => name.endsWith('.jsonl'))
-            .map(name => `.tmp/e2e/${name}`)
-          const result = spawnSync(process.execPath, [
-            'scripts/evidence/verify.js', '--broker', readBrokerVersion(), ...files,
-          ], { stdio: 'inherit' })
-          if (result.error) throw result.error
-          process.exitCode = result.status ?? 1
+          const fs = require('node:fs')
+          const ids = [
+            'unit',
+            'share-soak',
+            'share-soak-verify',
+            'share-soak-verdict',
+            'resources',
+            'active-owner-census',
+            'warmup-witnesses',
+            'journal-controls',
+            'retained-diagnostic',
+            'telemetry-soak',
+            'telemetry-seeded-control',
+            'live-owner-census',
+            'share-peak',
+            'telemetry-long-window',
+            'telemetry-long-window-verdict',
+            'telemetry-verdicts',
+            'telemetry-verdict-controls',
+            'verdict',
+          ]
+          const only = process.env.ONLY || ''
+          const requested = only.split(',').map(id => id.trim()).filter(Boolean)
+          for (const id of requested) {
+            if (!ids.includes(id)) throw new Error(`Unknown job: ${id}`)
+          }
+          const selected = new Set(requested.length ? requested : ids.filter(id => id !== 'telemetry-seeded-control'))
+          const share = ['share-soak', 'share-soak-verify', 'share-soak-verdict']
+          if (share.some(id => selected.has(id))) {
+            for (const id of ['unit', ...share]) selected.add(id)
+          }
+          const long = ['telemetry-long-window', 'telemetry-long-window-verdict']
+          if (long.some(id => selected.has(id))) {
+            for (const id of long) selected.add(id)
+          }
+          const jobs = ids.filter(id => selected.has(id))
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `jobs=${JSON.stringify(jobs)}\nfull=${only === ''}\n`)
           NODE
-      - name: Stop share cluster
-        if: always()
-        run: docker compose -f "$COMPOSE_FILE" down --remove-orphans
-      - if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: e2e-share-soak-short-4.3.1-node24
-          path: .tmp/e2e/
-          if-no-files-found: ignore
-          include-hidden-files: true
-  resources:
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/')
+  unit:
+    needs: [select]
+    name: share-soak-controls
+    if: contains(fromJSON(needs.select.outputs.jobs), 'unit')
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    permissions: { contents: read }
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 1
+      - uses: actions/setup-node@v4
+        timeout-minutes: 1
+        with: { node-version: 24, cache: npm }
+      - run: npm ci
+        timeout-minutes: 5
+      - name: Run broker-free acceptance and retained sensitivity controls
+        timeout-minutes: 40
+        run: npm run test:unit -- --ci --maxWorkers=2
+  share-soak:
+    name: share-soak-${{ matrix.profile }}
+    runs-on: ubuntu-latest
+    permissions: { contents: read }
+    needs: [select, unit]
+    if: contains(fromJSON(needs.select.outputs.jobs), 'share-soak')
+    timeout-minutes: ${{ matrix.jobMinutes }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { profile: short, jobMinutes: 55, parentMinutes: 35 }
+          - { profile: full, jobMinutes: 71, parentMinutes: 51 }
+    env:
+      KAFKA_VERSION: 4.3.1
+      KAFKAJS_LANE: docker
+      KAFKAJS_DEBUG_PROTOCOL_BUFFERS: '1'
+      COMPOSE_FILE: docker-compose.yml
+    steps:
+      - name: Record original lifecycle before setup
+        timeout-minutes: 1
+        env:
+          SOAK_PROFILE: ${{ matrix.profile }}
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs')
+          const file = `${process.env.RUNNER_TEMP}/share-soak-origin.json`
+          fs.writeFileSync(file, JSON.stringify({
+            origin: Number(process.hrtime.bigint() / 1000000n), wallAt: Date.now(),
+            profile: process.env.SOAK_PROFILE, runId: process.env.GITHUB_RUN_ID,
+            attempt: process.env.GITHUB_RUN_ATTEMPT,
+          }) + '\n', { flag: 'wx' })
+          fs.appendFileSync(process.env.GITHUB_ENV, `KAFKAJS_SOAK_ORIGIN_FILE=${file}\n`)
+          NODE
+      - uses: actions/checkout@v4
+        timeout-minutes: 1
+        with: { fetch-depth: 2 }
+      - uses: actions/setup-node@v4
+        timeout-minutes: 1
+        with: { node-version: 24, cache: npm }
+      - run: npm ci
+        timeout-minutes: 4
+      - name: Freeze contract and start owned cold base cluster
+        timeout-minutes: 4
+        env:
+          SOAK_PROFILE: ${{ matrix.profile }}
+        run: |
+          mkdir -p .tmp/e2e
+          node scripts/ci/shareSoakJob.js freeze "$SOAK_PROFILE"
+          node scripts/ci/shareSoakJob.js startup
+      - name: Run share soak (natural exit)
+        if: matrix.profile == 'short'
+        timeout-minutes: 35
+        run: node scripts/ci/naturalExit.js soak
+      - name: Run full share soak (natural exit)
+        if: matrix.profile == 'full'
+        timeout-minutes: 51
+        run: node scripts/ci/naturalExit.js soak-full
+      - name: Independently verify originals before teardown
+        if: always()
+        timeout-minutes: 3
+        run: node scripts/ci/shareSoakJob.js verify
+      - name: Preserve owned broker logs and partial receipts
+        if: always()
+        timeout-minutes: 1
+        run: node scripts/ci/shareSoakJob.js logs
+      - name: Stop owned cluster and prove absence
+        if: always()
+        timeout-minutes: 2
+        run: node scripts/ci/shareSoakJob.js teardown
+      - name: Recheck frozen source and seal final archive
+        if: always()
+        timeout-minutes: 1
+        run: node scripts/ci/shareSoakJob.js seal
+      - name: Upload complete or failed evidence
+        id: evidence
+        if: always()
+        timeout-minutes: 2
+        uses: actions/upload-artifact@v4
+        with:
+          name: share-soak-${{ matrix.profile }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/e2e/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+  share-soak-verify:
+    name: share-soak-verify-${{ matrix.profile }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions: { contents: read, actions: read }
+    needs: [select, share-soak]
+    if: always() && needs.select.result == 'success' && contains(fromJSON(needs.select.outputs.jobs), 'share-soak-verify')
+    strategy:
+      fail-fast: false
+      matrix: { profile: [short, full] }
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 1
+      - uses: actions/setup-node@v4
+        timeout-minutes: 1
+        with: { node-version: 24, cache: npm }
+      - run: npm ci
+        timeout-minutes: 5
+      - name: Authenticate completed producer and exact artifact bytes
+        timeout-minutes: 2
+        uses: actions/github-script@v7
+        env:
+          SOAK_PROFILE: ${{ matrix.profile }}
+        with:
+          script: |
+            const fs = require('node:fs')
+            const { createHash } = require('node:crypto')
+            const { execFileSync } = require('node:child_process')
+            const profile = process.env.SOAK_PROFILE
+            const attempt = Number(process.env.GITHUB_RUN_ATTEMPT)
+            const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRunAttempt, {
+              ...context.repo, run_id: context.runId, attempt_number: attempt,
+            })
+            const matched = jobs.filter(job => job.name === `share-soak-${profile}`)
+            if (matched.length !== 1 || matched[0].status !== 'completed' || matched[0].conclusion !== 'success')
+              throw new Error('Missing successful producer for this profile and attempt')
+            const name = `share-soak-${profile}-${context.runId}-${attempt}`
+            const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, {
+              ...context.repo, run_id: context.runId,
+            })
+            const selected = artifacts.filter(artifact => artifact.name === name)
+            if (selected.length !== 1 || selected[0].expired) throw new Error('Missing unique unexpired profile artifact')
+            const artifact = selected[0]
+            const response = await github.rest.actions.downloadArtifact({
+              ...context.repo, artifact_id: artifact.id, archive_format: 'zip',
+            })
+            const bytes = Buffer.from(response.data)
+            const downloadDigest = `sha256:${createHash('sha256').update(bytes).digest('hex')}`
+            if (downloadDigest !== artifact.digest) throw new Error('Platform artifact digest mismatch')
+            const zip = `${process.env.RUNNER_TEMP}/share-soak.zip`
+            fs.writeFileSync(zip, bytes)
+            const entries = execFileSync('unzip', ['-Z1', zip], { encoding: 'utf8' }).trim().split('\n')
+            if (entries.some(name => name.startsWith('/') || name.split('/').includes('..'))) throw new Error('Unsafe archive path')
+            fs.mkdirSync('.tmp/download', { recursive: true })
+            execFileSync('unzip', ['-q', zip, '-d', '.tmp/download'])
+            fs.writeFileSync(`${process.env.RUNNER_TEMP}/share-soak-provenance.json`, JSON.stringify({
+              repository: `${context.repo.owner}/${context.repo.repo}`, runId: context.runId, attempt,
+              head: context.payload.pull_request?.head?.sha ?? process.env.GITHUB_SHA,
+              base: context.payload.pull_request?.base?.sha ?? null,
+              workflowRef: process.env.GITHUB_WORKFLOW_REF, workflowSha: process.env.GITHUB_WORKFLOW_SHA,
+              job: matched[0].name, jobId: matched[0].id, producerSteps: matched[0].steps, conclusion: matched[0].conclusion,
+              artifact: name, artifactId: artifact.id, artifactDigest: artifact.digest,
+              artifactExpired: artifact.expired, downloadDigest, testedSha: process.env.GITHUB_SHA,
+              runUrl: `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${context.runId}/attempts/${attempt}`,
+            }) + '\n')
+      - name: Reconstruct sealed originals without brokers
+        timeout-minutes: 3
+        run: |
+          mkdir -p .tmp/recheck
+          node scripts/evidence/shareSoakAcceptance.js --contract .tmp/download/contract.json --archive .tmp/download --provenance "$RUNNER_TEMP/share-soak-provenance.json" > .tmp/recheck/result.json
+      - if: always()
+        timeout-minutes: 2
+        uses: actions/upload-artifact@v4
+        with:
+          name: share-soak-recheck-${{ matrix.profile }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/recheck/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+  share-soak-verdict:
+    name: share-soak-verdict
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: { contents: read }
+    needs: [select, share-soak, share-soak-verify]
+    if: always() && needs.select.result == 'success'
+    steps:
+      - name: Require both producing and archived reconstruction matrices
+        timeout-minutes: 1
+        env:
+          FULL: ${{ needs.select.outputs.full }}
+          ONLY: ${{ inputs.only }}
+          PRODUCED: ${{ needs.share-soak.result }}
+          RECHECKED: ${{ needs.share-soak-verify.result }}
+        run: |
+          if [ "$FULL" != true ]; then
+            echo "::error::partial selection (only=$ONLY) is not a share-soak pass"
+            exit 1
+          fi
+          test "$PRODUCED" = success && test "$RECHECKED" = success
+  resources:
+    needs: [select]
+    if: contains(fromJSON(needs.select.outputs.jobs), 'resources')
+    runs-on: ubuntu-latest
+    timeout-minutes: 105
     strategy:
       fail-fast: false
       matrix:
@@ -74,7 +287,9 @@ jobs:
       TELEMETRY_RESOURCES_ARTIFACT_DIR: ${{ github.workspace }}/.tmp/telemetry-resources
     steps:
       - uses: actions/checkout@v4
+        timeout-minutes: 1
       - uses: actions/setup-node@v4
+        timeout-minutes: 1
         with: { node-version: '${{ matrix.node }}', cache: npm }
       - run: npm ci
         timeout-minutes: 5
@@ -88,28 +303,151 @@ jobs:
         env:
           TMPDIR: ${{ runner.temp }}
           TELEMETRY_RESOURCES_QUIET: '1'
-        run: timeout -k 10s 540s node --expose-gc node_modules/jest/bin/jest.js --runInBand --ci --detectOpenHandles --testPathPatterns 'src/telemetry/__tests__/resources\.spec\.js$' --testNamePattern 'resource memory for'
+        run: timeout -k 10s 540s node --expose-gc node_modules/jest/bin/jest.js --runInBand --ci --detectOpenHandles --reporters=./testHelpers/quietReporter.js --testPathPatterns 'src/telemetry/__tests__/resources\.spec\.js$' --testNamePattern 'resource memory for'
       - name: Validate the recorded measurements for this tree and Node
         if: always()
         timeout-minutes: 2
         run: node scripts/e2e/telemetry/resourceArtifact.js "$TELEMETRY_RESOURCES_ARTIFACT_DIR" --tree "$KAFKAJS_TREE" --node "$(node -p process.version)"
-      - if: always()
+      - name: Compare journal ownership and real-time retained sensitivity serially
+        if: always()
+        timeout-minutes: 85
+        run: timeout -k 10s 5000s node scripts/soak/journalControls.js "$TELEMETRY_RESOURCES_ARTIFACT_DIR/journal-controls" --kinds=producer,consumer,shareConsumer --protocols=resource || exit 1
+      - name: Upload resource and calibration evidence
+        if: always()
+        timeout-minutes: 2
         uses: actions/upload-artifact@v4
         with:
           name: resources-node${{ matrix.node }}
           path: .tmp/telemetry-resources/
           if-no-files-found: error
           include-hidden-files: true
-  retained-diagnostic:
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/')
+  active-owner-census:
+    needs: [select]
+    name: active-owner-census-node${{ matrix.node }}-${{ matrix.variant }}
+    if: contains(fromJSON(needs.select.outputs.jobs), 'active-owner-census')
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 25
+    permissions: { contents: read }
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24, 26]
+        variant: [scalar, capture]
+    env:
+      ACTIVE_CENSUS_ROOT: ${{ github.workspace }}/.tmp/active-census
+      ACTIVE_CENSUS_VARIANT: ${{ matrix.variant }}
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 1
+      - uses: actions/setup-node@v4
+        timeout-minutes: 1
+        with: { node-version: '${{ matrix.node }}', cache: npm }
+      - run: npm ci
+        timeout-minutes: 5
+      - name: Observe pending compression in four serial public resource children
+        timeout-minutes: 8
+        run: timeout -k 10s 450s node scripts/e2e/telemetry/activeDiagnostic.js --diagnostic-only "$ACTIVE_CENSUS_ROOT" "$ACTIVE_CENSUS_VARIANT"
+      - name: Attribute active heap owners offline with the retained census
+        if: always()
+        timeout-minutes: 8
+        run: timeout -k 10s 450s node scripts/e2e/telemetry/retained/analyseActive.js "$ACTIVE_CENSUS_ROOT"
+      - name: Archive complete or partial diagnostic evidence
+        if: always()
+        timeout-minutes: 2
+        uses: actions/upload-artifact@v4
+        with:
+          name: active-owner-census-node${{ matrix.node }}-${{ matrix.variant }}
+          path: .tmp/active-census/
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
+  warmup-witnesses:
+    needs: [select]
+    name: warmup-witnesses-node${{ matrix.node }}
+    if: contains(fromJSON(needs.select.outputs.jobs), 'warmup-witnesses')
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    permissions: { contents: read }
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [24, 26]
+    env:
+      WARMUP_WITNESS_DIR: ${{ github.workspace }}/.tmp/warmup-witnesses/run
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 1
+      - uses: actions/setup-node@v4
+        timeout-minutes: 1
+        with: { node-version: '${{ matrix.node }}', cache: npm }
+      - run: npm ci
+        timeout-minutes: 5
+      - name: Prepare warm-up witness evidence
+        timeout-minutes: 1
+        run: mkdir -p "$(dirname "$WARMUP_WITNESS_DIR")"
+      - name: Record paired warm-up witnesses
+        timeout-minutes: 100
+        run: timeout -k 10s 5900s node scripts/e2e/telemetry/warmupWitness.js --diagnostic-only "$WARMUP_WITNESS_DIR" || exit 1
+      - name: Upload warm-up witness evidence
+        if: always()
+        timeout-minutes: 3
+        uses: actions/upload-artifact@v4
+        with:
+          name: warmup-witnesses-node${{ matrix.node }}
+          path: .tmp/warmup-witnesses/
+          if-no-files-found: error
+          include-hidden-files: true
+  journal-controls:
+    needs: [select]
+    name: journal-controls-${{ matrix.group.name }}-node${{ matrix.node }}
+    if: contains(fromJSON(needs.select.outputs.jobs), 'journal-controls')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24, 26]
+        group:
+          - { name: admin, kinds: admin, protocols: 'resource,live' }
+          - { name: live-flags, kinds: 'producer,consumer,shareConsumer', protocols: live }
+    env:
+      JOURNAL_CONTROLS_DIR: ${{ github.workspace }}/.tmp/journal-controls
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 1
+      - uses: actions/setup-node@v4
+        timeout-minutes: 1
+        with: { node-version: '${{ matrix.node }}', cache: npm }
+      - run: npm ci
+        timeout-minutes: 5
+      - name: Run the admin and live-flags journal controls serially on the idle runner
+        timeout-minutes: 50
+        env:
+          JOURNAL_KINDS: ${{ matrix.group.kinds }}
+          JOURNAL_PROTOCOLS: ${{ matrix.group.protocols }}
+        run: timeout -k 10s 2900s node scripts/soak/journalControls.js "$JOURNAL_CONTROLS_DIR" --kinds="$JOURNAL_KINDS" --protocols="$JOURNAL_PROTOCOLS" || exit 1
+      - name: Upload journal control evidence
+        if: always()
+        timeout-minutes: 2
+        uses: actions/upload-artifact@v4
+        with:
+          name: journal-controls-${{ matrix.group.name }}-node${{ matrix.node }}
+          path: .tmp/journal-controls/
+          if-no-files-found: error
+          include-hidden-files: true
+  retained-diagnostic:
+    needs: [select]
+    if: contains(fromJSON(needs.select.outputs.jobs), 'retained-diagnostic')
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
     env:
       TELEMETRY_RESOURCES_QUIET: '1'
       RETAINED_DIAGNOSTIC_DIR: ${{ github.workspace }}/.tmp/retained-diagnostic/run
     steps:
       - uses: actions/checkout@v4
+        timeout-minutes: 1
       - uses: actions/setup-node@v4
+        timeout-minutes: 1
         with: { node-version: '24', cache: npm }
       - name: Prepare diagnostic evidence and install dependencies
         timeout-minutes: 5
@@ -128,12 +466,24 @@ jobs:
           timeout -k 5s 50s npx jest --maxWorkers=2 --ci --testPathPatterns 'src/telemetry/__tests__/resources\.spec\.js$' 'scripts/soak/__tests__/soak\.spec\.js$' --testNamePattern 'requires fresh authority|detects 131072|holds one native job across one hundred retirements' 2>&1 | tee .tmp/retained-diagnostic/controls/lifecycle.log
       - name: Diagnose retained ownership on Node 24 alone (sixteen serial children)
         timeout-minutes: 30
-        run: timeout -k 10s 1750s node scripts/e2e/telemetry/retainedDiagnostic.js --diagnostic-only "$RETAINED_DIAGNOSTIC_DIR"
+        run: |
+          phase_started_at=$(date +%s)
+          trap 'echo "retained diagnostic capture elapsed: $(( $(date +%s) - phase_started_at )) s"' EXIT
+          timeout -k 10s 1750s node scripts/e2e/telemetry/retainedDiagnostic.js --diagnostic-only "$RETAINED_DIAGNOSTIC_DIR"
       - name: Analyse cold ownership and conditional ephemerons offline
         if: always()
+        timeout-minutes: 10
+        run: |
+          phase_started_at=$(date +%s)
+          trap 'echo "retained diagnostic analysis elapsed: $(( $(date +%s) - phase_started_at )) s"' EXIT
+          timeout -k 5s 590s node --max-old-space-size=6144 scripts/e2e/telemetry/retained/analyse.js "$RETAINED_DIAGNOSTIC_DIR"
+      - name: Start retained diagnostic upload timing
+        timeout-minutes: 1
+        if: always()
+        run: echo "retained diagnostic upload started at $(date -u +%FT%TZ); duration is recorded in the upload step log"
+      - name: Upload retained diagnostic evidence
+        if: always()
         timeout-minutes: 5
-        run: timeout -k 5s 290s node --max-old-space-size=6144 scripts/e2e/telemetry/retained/analyse.js "$RETAINED_DIAGNOSTIC_DIR"
-      - if: always()
         uses: actions/upload-artifact@v4
         with:
           name: retained-diagnostic-node24
@@ -141,9 +491,10 @@ jobs:
           if-no-files-found: error
           include-hidden-files: true
   telemetry-soak:
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/')
+    needs: [select]
+    if: contains(fromJSON(needs.select.outputs.jobs), 'telemetry-soak')
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
@@ -159,11 +510,15 @@ jobs:
       TELEMETRY_INTEROP_CACHE: ${{ github.workspace }}/.tmp/telemetry-interop
       TELEMETRY_EVIDENCE_DIR: ${{ github.workspace }}/.tmp/telemetry-evidence
       KAFKAJS_LANE: docker
+      TELEMETRY_CHURN_REPORTER: '1'
     steps:
       - uses: actions/checkout@v4
+        timeout-minutes: 1
       - uses: actions/setup-node@v4
+        timeout-minutes: 1
         with: { node-version: '${{ matrix.node }}', cache: npm }
       - uses: actions/setup-java@v4
+        timeout-minutes: 2
         with: { distribution: temurin, java-version: '21' }
       - run: npm ci
         timeout-minutes: 5
@@ -182,6 +537,9 @@ jobs:
           timeout -k 5s 180s bash scripts/e2e/telemetry/fetch.sh
           timeout -k 5s 30s bash scripts/e2e/telemetry/run.sh verify "$KAFKA_VERSION"
           timeout -k 5s 60s node scripts/e2e/telemetry/prepareDecoder.js
+      - name: Prepare the bounded five-minute reporter
+        timeout-minutes: 4
+        run: timeout -k 5s 210s node scripts/soak/churnReporter.js
       - name: Preflight isolated project ownership
         timeout-minutes: 2
         run: timeout -k 5s 90s node scripts/e2e/telemetry/ci.js preflight
@@ -191,7 +549,7 @@ jobs:
       - name: Start and warm the owned telemetry cluster
         timeout-minutes: 6
         run: |
-          timeout -k 5s 90s docker compose -f "$COMPOSE_FILE" up -d --pull never
+          timeout -k 5s 90s docker compose -f "$COMPOSE_FILE" -f .tmp/telemetry-churn-reporter/compose.json up -d --pull never
           timeout -k 5s 240s node scripts/waitForKafka.js
       - name: Verify mounted reporter and capture broker identities
         timeout-minutes: 3
@@ -226,28 +584,445 @@ jobs:
           timeout -k 5s 150s node scripts/e2e/telemetry/ci.js stop
           node -e "require('./scripts/e2e/telemetry/evidence').verifyCleanup(process.env.TELEMETRY_EVIDENCE_DIR, '.tmp/e2e', process.env.COMPOSE_PROJECT_NAME)"
       - if: always()
+        timeout-minutes: 2
         uses: actions/upload-artifact@v4
         with:
           name: e2e-telemetry-soak-${{ matrix.kafka }}-node${{ matrix.node }}
           path: |
             .tmp/e2e/
             .tmp/telemetry-evidence/
+            .tmp/telemetry-churn-reporter/
             .tmp/telemetry-cache/decoder-*.jsa.json
           if-no-files-found: error
           include-hidden-files: true
+  telemetry-seeded-control:
+    needs: [select]
+    if: contains(fromJSON(needs.select.outputs.jobs), 'telemetry-seeded-control')
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24, 26]
+    env:
+      KAFKA_VERSION: '4.3.1'
+      COMPOSE_FILE: docker-compose.telemetry.yml
+      COMPOSE_PROJECT_NAME: telemetry-seeded-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
+      TF1_CACHE: ${{ github.workspace }}/.tmp/telemetry-cache
+      TELEMETRY_JAVA_CACHE: ${{ github.workspace }}/.tmp/telemetry-cache
+      TELEMETRY_DECODER_ARCHIVE: ${{ github.workspace }}/.tmp/telemetry-cache/decoder-4.3.1.jsa
+      TELEMETRY_INTEROP_CACHE: ${{ github.workspace }}/.tmp/telemetry-interop
+      TELEMETRY_EVIDENCE_DIR: ${{ github.workspace }}/.tmp/telemetry-seeded
+      KAFKAJS_LANE: docker
+      TELEMETRY_CHURN_REPORTER: '1'
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 1
+      - uses: actions/setup-node@v4
+        timeout-minutes: 1
+        with: { node-version: '${{ matrix.node }}', cache: npm }
+      - uses: actions/setup-java@v4
+        timeout-minutes: 2
+        with: { distribution: temurin, java-version: '21' }
+      - run: npm ci
+        timeout-minutes: 5
+      - name: Prepare telemetry control evidence
+        timeout-minutes: 1
+        run: |
+          echo "KAFKAJS_TREE=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          mkdir -p .tmp/e2e "$TELEMETRY_EVIDENCE_DIR"
+          chmod 0777 "$TELEMETRY_EVIDENCE_DIR"
+      - name: Verify retained jars offline and prepare decoder inputs
+        timeout-minutes: 5
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          timeout -k 5s 30s env -u TELEMETRY_JAVA_CACHE bash scripts/e2e/telemetry/run.sh verify "$KAFKA_VERSION"
+          timeout -k 5s 180s bash scripts/e2e/telemetry/fetch.sh
+          timeout -k 5s 30s bash scripts/e2e/telemetry/run.sh verify "$KAFKA_VERSION"
+          timeout -k 5s 60s node scripts/e2e/telemetry/prepareDecoder.js
+      - name: Prepare the bounded five-minute reporter
+        timeout-minutes: 4
+        run: timeout -k 5s 210s node scripts/soak/churnReporter.js
+      - name: Preflight isolated project ownership
+        timeout-minutes: 2
+        run: timeout -k 5s 90s node scripts/e2e/telemetry/ci.js preflight
+      - name: Prepare broker image
+        timeout-minutes: 4
+        run: timeout -k 5s 210s docker compose -f "$COMPOSE_FILE" pull
+      - name: Start and warm the owned telemetry cluster
+        timeout-minutes: 6
+        run: |
+          timeout -k 5s 90s docker compose -f "$COMPOSE_FILE" -f .tmp/telemetry-churn-reporter/compose.json up -d --pull never
+          timeout -k 5s 240s node scripts/waitForKafka.js
+      - name: Verify mounted reporter and capture broker identities
+        timeout-minutes: 3
+        run: timeout -k 5s 150s node scripts/e2e/telemetry/ci.js capture
+      - name: Run the optional five-minute seeded slope diagnostic
+        timeout-minutes: 12
+        env:
+          TMPDIR: ${{ runner.temp }}
+          TELEMETRY_SEED: slope2x
+        run: timeout -k 10s 600s npm run test:group:telemetry-seeded-control -- --ci
+      - name: Require diagnostic seed storage, data slope and remaining checks
+        timeout-minutes: 1
+        run: node -e "require('./scripts/soak/liveSeed').requireControl(process.env.TELEMETRY_EVIDENCE_DIR)"
+      - name: Stop owned project and prove container network volume removal
+        if: always()
+        timeout-minutes: 3
+        run: |
+          timeout -k 5s 150s node scripts/e2e/telemetry/ci.js stop
+          node -e "require('./scripts/e2e/telemetry/evidence').verifyCleanup(process.env.TELEMETRY_EVIDENCE_DIR, '.tmp/e2e', process.env.COMPOSE_PROJECT_NAME)"
+      - if: always()
+        timeout-minutes: 2
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-telemetry-seeded-node${{ matrix.node }}
+          path: |
+            .tmp/e2e/
+            .tmp/telemetry-seeded/
+            .tmp/telemetry-churn-reporter/
+            .tmp/telemetry-cache/decoder-*.jsa.json
+          if-no-files-found: error
+          include-hidden-files: true
+  live-owner-census:
+    needs: [select]
+    if: contains(fromJSON(needs.select.outputs.jobs), 'live-owner-census')
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24, 26]
+        kafka: ['4.3.1', '4.2.2']
+        variant: [capture, scalar]
+    env:
+      KAFKA_VERSION: ${{ matrix.kafka }}
+      COMPOSE_FILE: docker-compose.telemetry.yml
+      COMPOSE_PROJECT_NAME: telemetry-census-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
+      TF1_CACHE: ${{ github.workspace }}/.tmp/telemetry-cache
+      TELEMETRY_JAVA_CACHE: ${{ github.workspace }}/.tmp/telemetry-cache
+      TELEMETRY_DECODER_ARCHIVE: ${{ github.workspace }}/.tmp/telemetry-cache/decoder-${{ matrix.kafka }}.jsa
+      TELEMETRY_INTEROP_CACHE: ${{ github.workspace }}/.tmp/telemetry-interop
+      TELEMETRY_EVIDENCE_DIR: ${{ github.workspace }}/.tmp/telemetry-evidence
+      KAFKAJS_LANE: docker
+      TELEMETRY_CHURN_REPORTER: '1'
+      LIVE_CENSUS_ROOT: ${{ github.workspace }}/.tmp/live-census
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 1
+      - uses: actions/setup-node@v4
+        timeout-minutes: 1
+        with: { node-version: '${{ matrix.node }}', cache: npm }
+      - uses: actions/setup-java@v4
+        timeout-minutes: 2
+        with: { distribution: temurin, java-version: '21' }
+      - run: npm ci
+        timeout-minutes: 5
+      - name: Prepare telemetry evidence
+        timeout-minutes: 1
+        run: |
+          echo "KAFKAJS_TREE=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          mkdir -p .tmp/e2e "$TELEMETRY_EVIDENCE_DIR"
+          chmod 0777 "$TELEMETRY_EVIDENCE_DIR"
+      - name: Verify retained jars offline and prepare decoder inputs
+        timeout-minutes: 5
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          timeout -k 5s 30s env -u TELEMETRY_JAVA_CACHE bash scripts/e2e/telemetry/run.sh verify "$KAFKA_VERSION"
+          timeout -k 5s 180s bash scripts/e2e/telemetry/fetch.sh
+          timeout -k 5s 30s bash scripts/e2e/telemetry/run.sh verify "$KAFKA_VERSION"
+          timeout -k 5s 60s node scripts/e2e/telemetry/prepareDecoder.js
+      - name: Prepare the bounded five-minute reporter
+        timeout-minutes: 4
+        run: timeout -k 5s 210s node scripts/soak/churnReporter.js
+      - name: Preflight isolated project ownership
+        timeout-minutes: 2
+        run: timeout -k 5s 90s node scripts/e2e/telemetry/ci.js preflight
+      - name: Prepare broker image
+        timeout-minutes: 4
+        run: timeout -k 5s 210s docker compose -f "$COMPOSE_FILE" pull
+      - name: Start and warm the owned telemetry cluster
+        timeout-minutes: 6
+        run: |
+          timeout -k 5s 90s docker compose -f "$COMPOSE_FILE" -f .tmp/telemetry-churn-reporter/compose.json up -d --pull never
+          timeout -k 5s 240s node scripts/waitForKafka.js
+      - name: Verify mounted reporter and capture broker identities
+        timeout-minutes: 3
+        run: timeout -k 5s 150s node scripts/e2e/telemetry/ci.js capture
+      - name: Capture original live worker owners or scalar companion
+        timeout-minutes: 12
+        env:
+          TMPDIR: ${{ runner.temp }}
+          CENSUS_VARIANT: ${{ matrix.variant }}
+        run: timeout -k 10s 700s node --expose-gc scripts/e2e/telemetry/retained/liveDiagnostic.js --diagnostic-only "$LIVE_CENSUS_ROOT" "$CENSUS_VARIANT"
+      - name: Analyse additive live ownership offline
+        if: always()
+        timeout-minutes: 10
+        run: timeout -k 5s 590s node --max-old-space-size=6144 scripts/e2e/telemetry/retained/analyseLive.js "$LIVE_CENSUS_ROOT"
+      - name: Stop owned project and prove container network volume removal
+        if: always()
+        timeout-minutes: 3
+        run: |
+          timeout -k 5s 150s node scripts/e2e/telemetry/ci.js stop
+          node -e "require('./scripts/e2e/telemetry/evidence').verifyCleanup(process.env.TELEMETRY_EVIDENCE_DIR, '.tmp/e2e', process.env.COMPOSE_PROJECT_NAME)"
+      - if: always()
+        timeout-minutes: 2
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-owner-census-${{ matrix.kafka }}-node${{ matrix.node }}-${{ matrix.variant }}
+          path: |
+            .tmp/live-census/
+            .tmp/e2e/
+            .tmp/telemetry-evidence/
+            .tmp/telemetry-churn-reporter/
+            .tmp/telemetry-cache/decoder-*.jsa.json
+          if-no-files-found: error
+          include-hidden-files: true
+  share-peak:
+    needs: [select]
+    if: contains(fromJSON(needs.select.outputs.jobs), 'share-peak')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22]
+        kafka: ['4.3.1', '4.2.2']
+        arm: [enabled, disabled]
+    env:
+      KAFKA_VERSION: ${{ matrix.kafka }}
+      COMPOSE_FILE: docker-compose.telemetry.yml
+      COMPOSE_PROJECT_NAME: telemetry-share-peak-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
+      TF1_CACHE: ${{ github.workspace }}/.tmp/telemetry-cache
+      TELEMETRY_JAVA_CACHE: ${{ github.workspace }}/.tmp/telemetry-cache
+      TELEMETRY_DECODER_ARCHIVE: ${{ github.workspace }}/.tmp/telemetry-cache/decoder-${{ matrix.kafka }}.jsa
+      TELEMETRY_INTEROP_CACHE: ${{ github.workspace }}/.tmp/telemetry-interop
+      TELEMETRY_EVIDENCE_DIR: ${{ github.workspace }}/.tmp/telemetry-evidence
+      KAFKAJS_LANE: docker
+      TELEMETRY_CHURN_REPORTER: '1'
+      SHARE_PEAK_ROOT: ${{ github.workspace }}/.tmp/share-peak
+      SHARE_PEAK_ARM: ${{ matrix.arm }}
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 1
+      - uses: actions/setup-node@v4
+        timeout-minutes: 1
+        with: { node-version: '${{ matrix.node }}', cache: npm }
+      - uses: actions/setup-java@v4
+        timeout-minutes: 2
+        with: { distribution: temurin, java-version: '21' }
+      - run: npm ci
+        timeout-minutes: 5
+      - name: Prepare telemetry evidence
+        timeout-minutes: 1
+        run: |
+          echo "KAFKAJS_TREE=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          mkdir -p .tmp/e2e "$TELEMETRY_EVIDENCE_DIR"
+          chmod 0777 "$TELEMETRY_EVIDENCE_DIR"
+      - name: Verify retained jars offline and prepare decoder inputs
+        timeout-minutes: 5
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          timeout -k 5s 30s env -u TELEMETRY_JAVA_CACHE bash scripts/e2e/telemetry/run.sh verify "$KAFKA_VERSION"
+          timeout -k 5s 180s bash scripts/e2e/telemetry/fetch.sh
+          timeout -k 5s 30s bash scripts/e2e/telemetry/run.sh verify "$KAFKA_VERSION"
+          timeout -k 5s 60s node scripts/e2e/telemetry/prepareDecoder.js
+      - name: Prepare the bounded five-minute reporter
+        timeout-minutes: 4
+        run: timeout -k 5s 210s node scripts/soak/churnReporter.js
+      - name: Preflight isolated project ownership
+        timeout-minutes: 2
+        run: timeout -k 5s 90s node scripts/e2e/telemetry/ci.js preflight
+      - name: Prepare broker image
+        timeout-minutes: 4
+        run: timeout -k 5s 210s docker compose -f "$COMPOSE_FILE" pull
+      - name: Start and warm the owned telemetry cluster
+        timeout-minutes: 6
+        run: |
+          timeout -k 5s 90s docker compose -f "$COMPOSE_FILE" -f .tmp/telemetry-churn-reporter/compose.json up -d --pull never
+          timeout -k 5s 240s node scripts/waitForKafka.js
+      - name: Verify mounted reporter and capture broker identities
+        timeout-minutes: 3
+        run: timeout -k 5s 150s node scripts/e2e/telemetry/ci.js capture
+      - name: Attribute original scalar share peak with the selected telemetry switch
+        timeout-minutes: 12
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: timeout -k 10s 700s node --expose-gc scripts/soak/sharePeakDiagnostic.js --diagnostic-only "$SHARE_PEAK_ROOT"
+      - name: Stop owned project and prove container network volume removal
+        if: always()
+        timeout-minutes: 3
+        run: |
+          timeout -k 5s 150s node scripts/e2e/telemetry/ci.js stop
+          node -e "require('./scripts/e2e/telemetry/evidence').verifyCleanup(process.env.TELEMETRY_EVIDENCE_DIR, '.tmp/e2e', process.env.COMPOSE_PROJECT_NAME)"
+      - if: always()
+        timeout-minutes: 2
+        uses: actions/upload-artifact@v4
+        with:
+          name: share-peak-${{ matrix.kafka }}-node${{ matrix.node }}-${{ matrix.arm }}
+          path: |
+            .tmp/share-peak/
+            .tmp/e2e/
+            .tmp/telemetry-evidence/
+            .tmp/telemetry-churn-reporter/
+            .tmp/telemetry-cache/decoder-*.jsa.json
+          if-no-files-found: error
+          include-hidden-files: true
+  telemetry-long-window:
+    needs: [select]
+    if: contains(fromJSON(needs.select.outputs.jobs), 'telemetry-long-window')
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24, 26]
+        kafka: ['4.2.2', '4.3.1']
+        arm: [unseeded, seeded]
+        replicate: ${{ fromJSON(github.event.inputs.replicates == '1' && '[1]' || github.event.inputs.replicates == '2' && '[1,2]' || '[1,2,3]') }}
+        include:
+          - { node: 22, kafka: '4.3.1', arm: warmup-seed, replicate: 1 }
+          - { node: 24, kafka: '4.3.1', arm: warmup-seed, replicate: 1 }
+          - { node: 26, kafka: '4.3.1', arm: warmup-seed, replicate: 1 }
+    env:
+      KAFKA_VERSION: ${{ matrix.kafka }}
+      COMPOSE_FILE: docker-compose.telemetry.yml
+      COMPOSE_PROJECT_NAME: telemetry-long-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
+      TF1_CACHE: ${{ github.workspace }}/.tmp/telemetry-cache
+      TELEMETRY_JAVA_CACHE: ${{ github.workspace }}/.tmp/telemetry-cache
+      TELEMETRY_DECODER_ARCHIVE: ${{ github.workspace }}/.tmp/telemetry-cache/decoder-${{ matrix.kafka }}.jsa
+      TELEMETRY_INTEROP_CACHE: ${{ github.workspace }}/.tmp/telemetry-interop
+      TELEMETRY_EVIDENCE_DIR: ${{ github.workspace }}/.tmp/telemetry-evidence
+      KAFKAJS_LANE: docker
+      LONG_WINDOW_ROOT: ${{ github.workspace }}/.tmp/long-window
+      LONG_WINDOW_ARM: ${{ matrix.arm }}
+      LONG_WINDOW_REPLICATE: ${{ matrix.replicate }}
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 1
+      - uses: actions/setup-node@v4
+        timeout-minutes: 1
+        with: { node-version: '${{ matrix.node }}', cache: npm }
+      - uses: actions/setup-java@v4
+        timeout-minutes: 2
+        with: { distribution: temurin, java-version: '21' }
+      - run: npm ci
+        timeout-minutes: 5
+      - name: Prepare telemetry evidence
+        timeout-minutes: 1
+        run: |
+          echo "KAFKAJS_TREE=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          mkdir -p .tmp/e2e "$TELEMETRY_EVIDENCE_DIR"
+          chmod 0777 "$TELEMETRY_EVIDENCE_DIR"
+      - name: Verify retained jars offline and prepare decoder inputs
+        timeout-minutes: 5
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          timeout -k 5s 30s env -u TELEMETRY_JAVA_CACHE bash scripts/e2e/telemetry/run.sh verify "$KAFKA_VERSION"
+          timeout -k 5s 180s bash scripts/e2e/telemetry/fetch.sh
+          timeout -k 5s 30s bash scripts/e2e/telemetry/run.sh verify "$KAFKA_VERSION"
+          timeout -k 5s 60s node scripts/e2e/telemetry/prepareDecoder.js
+      - name: Prepare the bounded long-window reporter
+        timeout-minutes: 4
+        env:
+          TELEMETRY_LONG_WINDOW: '1'
+        run: timeout -k 5s 210s node scripts/soak/longWindowReporter.js
+      - name: Preflight isolated project ownership
+        env:
+          TELEMETRY_LONG_WINDOW: '1'
+        timeout-minutes: 2
+        run: timeout -k 5s 90s node scripts/e2e/telemetry/ci.js preflight
+      - name: Prepare broker image
+        timeout-minutes: 4
+        run: timeout -k 5s 210s docker compose -f "$COMPOSE_FILE" pull
+      - name: Start and warm the owned telemetry cluster
+        timeout-minutes: 6
+        run: |
+          timeout -k 5s 90s docker compose -f "$COMPOSE_FILE" -f .tmp/telemetry-long-reporter/compose.json up -d --pull never
+          timeout -k 5s 240s node scripts/waitForKafka.js
+      - name: Verify mounted reporter and capture broker identities
+        env:
+          TELEMETRY_LONG_WINDOW: '1'
+        timeout-minutes: 3
+        run: timeout -k 5s 150s node scripts/e2e/telemetry/ci.js capture
+      - name: Run the adopted long-window method for one arm and replicate
+        timeout-minutes: 36
+        env:
+          TMPDIR: ${{ runner.temp }}
+          REPLICATES: ${{ inputs.replicates || '3' }}
+        run: |
+          mode=--acceptance
+          if [ "$REPLICATES" != '3' ]; then mode=--diagnostic-only; fi
+          timeout -k 10s 1980s node --expose-gc scripts/soak/longWindowDiagnostic.js "$mode" "$LONG_WINDOW_ROOT"
+      - name: Stop owned project and prove container network volume removal
+        env:
+          TELEMETRY_LONG_WINDOW: '1'
+        if: always()
+        timeout-minutes: 3
+        run: |
+          timeout -k 5s 150s node scripts/e2e/telemetry/ci.js stop
+          node -e "require('./scripts/e2e/telemetry/evidence').verifyCleanup(process.env.TELEMETRY_EVIDENCE_DIR, '.tmp/e2e', process.env.COMPOSE_PROJECT_NAME)"
+      - if: always()
+        timeout-minutes: 2
+        uses: actions/upload-artifact@v4
+        with:
+          name: telemetry-long-window-node${{ matrix.node }}-${{ matrix.kafka }}-${{ matrix.arm }}-r${{ matrix.replicate }}
+          path: |
+            .tmp/long-window/
+            .tmp/telemetry-long-reporter/
+            .tmp/e2e/
+            .tmp/telemetry-evidence/
+            .tmp/telemetry-cache/decoder-*.jsa.json
+          if-no-files-found: error
+          include-hidden-files: true
+  telemetry-long-window-verdict:
+    needs: [select, telemetry-long-window]
+    if: always() && needs.select.result == 'success' && contains(fromJSON(needs.select.outputs.jobs), 'telemetry-long-window-verdict')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions: { contents: read, actions: read }
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 1
+      - uses: actions/setup-node@v4
+        timeout-minutes: 1
+        with: { node-version: 24, cache: npm }
+      - run: npm ci
+        timeout-minutes: 5
+      - name: Download every long-window artifact of this run separately
+        timeout-minutes: 2
+        uses: actions/download-artifact@v4
+        with:
+          pattern: telemetry-long-window-node*
+          path: .tmp/long-window-verdict/
+      - name: Require all 39 adopted records and every long-window check
+        timeout-minutes: 1
+        env:
+          LONG_WINDOW_RESULT: ${{ needs.telemetry-long-window.result }}
+        run: |
+          test "$LONG_WINDOW_RESULT" = success || exit 1
+          node scripts/soak/longWindowReport.js .tmp/long-window-verdict --verdict --tree "$(git rev-parse HEAD)" --run "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
   telemetry-verdicts:
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/')
+    needs: [select]
+    if: contains(fromJSON(needs.select.outputs.jobs), 'telemetry-verdicts')
     uses: ./.github/workflows/telemetry.yml
     with:
       full: true
       memory-verdicts: true
   telemetry-verdict-controls:
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'p9m/')
+    needs: [select]
+    if: contains(fromJSON(needs.select.outputs.jobs), 'telemetry-verdict-controls')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        timeout-minutes: 1
       - uses: actions/setup-node@v4
+        timeout-minutes: 1
         with: { node-version: 24, cache: npm }
       - run: npm ci
         timeout-minutes: 5
@@ -255,11 +1030,33 @@ jobs:
         timeout-minutes: 3
         run: |
           mkdir -p .tmp/telemetry-verdict-controls
-          timeout -k 5s 150s node node_modules/jest/bin/jest.js --runInBand --ci --detectOpenHandles --runTestsByPath scripts/e2e/telemetry/__tests__/memoryVerdicts.spec.js testHelpers/__tests__/telemetryFixtures.spec.js --json --outputFile=.tmp/telemetry-verdict-controls/results.json
+          timeout -k 5s 150s node node_modules/jest/bin/jest.js --runInBand --ci --detectOpenHandles --reporters=./testHelpers/quietReporter.js --runTestsByPath scripts/e2e/telemetry/__tests__/memoryVerdicts.spec.js testHelpers/__tests__/telemetryFixtures.spec.js --json --outputFile=.tmp/telemetry-verdict-controls/results.json
       - if: always()
+        timeout-minutes: 2
         uses: actions/upload-artifact@v4
         with:
           name: telemetry-verdict-controls-node24
           path: .tmp/telemetry-verdict-controls/
           if-no-files-found: error
           include-hidden-files: true
+  verdict:
+    name: memory-gates-verdict
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [select, unit, share-soak-verdict, resources, journal-controls, retained-diagnostic, telemetry-soak, telemetry-long-window-verdict, live-owner-census, telemetry-verdicts, telemetry-verdict-controls]
+    if: always() && needs.select.result == 'success'
+    steps:
+      - name: Require every relocated memory gate
+        timeout-minutes: 1
+        env:
+          FULL: ${{ needs.select.outputs.full }}
+          ONLY: ${{ inputs.only }}
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          node <<'NODE'
+          if (process.env.FULL !== 'true')
+            throw new Error(`partial selection (only=${process.env.ONLY || ''}) is not a memory-gates pass`)
+          const results = JSON.parse(process.env.RESULTS)
+          for (const [name, job] of Object.entries(results))
+            if (job.result !== 'success') throw new Error(`${name}: ${job.result}`)
+          NODE

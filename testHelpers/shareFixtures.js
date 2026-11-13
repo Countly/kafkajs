@@ -675,7 +675,7 @@ const waitForShareFixtureAbsence = async (
         const names = new Set(listed.map(({ groupId }) => groupId))
         if (unrelated.some((id) => !names.has(id))) throw new Error('Unrelated group disappeared')
         const remaining = groups.filter((id) => names.has(id))
-        record?.('group-deletion', { remaining })
+        record?.('group-deletion', { remaining, listed, unrelated })
         if (topics.length > 0) {
           request = undefined
           const listedTopics = await bounded(scope, Infinity, () => admin.listTopics())

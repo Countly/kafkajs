@@ -801,13 +801,67 @@ const assertJavaCaptures = (receipts, directory) => {
 
 /**
  * Proves ownership of every physical connection, including setup-only sockets. The initial
- * foreground bootstrap is explicit; every other socket must carry actual ordinary work.
- * @param {object} transcript records and physical sockets
- * @param {object} [options] independently recorded share capability refusal
+ * foreground bootstrap is explicit or proven by a successful connect-only share negotiation;
+ * every other socket must carry actual ordinary work. All requests must match the identity
+ * configured by the caller, independently of the recorded stream.
+ * @param {object} transcript recorded owner, records and physical sockets
+ * @param {object} options independent public lifecycle evidence
+ * @param {string} options.owner expected observer owner
+ * @param {string} options.clientId expected configured client ID
+ * @param {object} [options.refusal] recorded share connect outcome (connected or refused)
  * @returns {object[]} node/role ownership baseline (counts deliberately excluded)
- * @throws {Error} for telemetry, an undecided extra connection or an unowned setup-only socket
+ * @throws {Error} for foreign identity, telemetry, an extra connection or an unowned setup-only socket
  */
-const ordinaryOwnership = ({ records, sockets }, { refusal } = {}) => {
+const ordinaryOwnership = (
+  { owner: recordedOwner, records, sockets },
+  { refusal, owner, clientId } = {}
+) => {
+  assert(typeof owner === 'string' && owner.length > 0, 'Missing expected socket owner')
+  assert(typeof clientId === 'string' && clientId.length > 0, 'Missing expected client identity')
+  assert.equal(recordedOwner, owner, 'Socket owner differs')
+  for (const request of records.filter((r) => r.type === 'request')) {
+    assert.equal(request.owner, owner, 'Request owner differs')
+    assert.equal(request.clientId, clientId, 'Request client identity differs')
+  }
+  if (refusal?.status === 'connected' && sockets.length === 1 && sockets[0].kind === 'undecided') {
+    const [socket] = sockets
+    const [connect, ...requests] = records
+    assert.equal(socket.id, 1, 'Connected bootstrap is not the first physical socket')
+    assert.equal(connect?.type, 'connect')
+    assert.equal(connect.socketId, socket.id)
+    assert.equal(connect.node, socket.node)
+    assert([1, 2].includes(requests.length), 'Extra connected bootstrap traffic')
+    const negotiated = requests.at(-1)
+    for (const request of requests) {
+      assert.equal(request.type, 'request')
+      assert.equal(request.apiKey, 18)
+      assert.equal(request.socketId, socket.id)
+      assert.equal(request.node, socket.node)
+      assert(connect.at < request.writeAt && request.writeAt <= request.response?.responseAt)
+    }
+    assert.equal(requests[0].apiVersion, 5)
+    if (requests.length === 2) {
+      assert.equal(requests[0].response.errorCode, 35)
+      assert.equal(negotiated.apiVersion, 4)
+      assert(requests[0].response.responseAt < negotiated.writeAt)
+    }
+    assert.equal(negotiated.response.errorCode, 0)
+    const ranges = negotiated.response.ranges
+    assert(ranges && !ranges[71] && !ranges[72], 'Telemetry advertised on connected bootstrap')
+    assert(
+      [76, 78, 79].every((key) => Array.isArray(ranges[key])),
+      'Missing share capability'
+    )
+    assert(
+      ranges[18]?.[0] <= negotiated.apiVersion && negotiated.apiVersion <= ranges[18]?.[1],
+      'Unadvertised connected negotiation version'
+    )
+    assert(
+      Number.isFinite(socket.closedAt) && socket.closedAt >= negotiated.response.responseAt,
+      'Connected bootstrap socket never closed'
+    )
+    return [`${socket.node}:bootstrap`]
+  }
   if (refusal?.status === 'rejected') {
     assert.equal(refusal.name, 'KafkaJSShareGroupsNotSupportedError')
     assert.equal(refusal.shareVersion, 0)

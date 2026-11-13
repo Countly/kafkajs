@@ -4,6 +4,8 @@ const fs = require('fs')
 const path = require('path')
 const { execFileSync } = require('child_process')
 const { performance } = require('perf_hooks')
+const { selected: longWindowSelected } = require('../../soak/longWindow')
+const { BoundedReporter } = require('../../soak/longWindowReporter')
 
 /**
  * Owns one unique Compose project on an ephemeral CI runner. Preflight must succeed before any
@@ -28,6 +30,10 @@ class CiOwnership {
     this.receiptFile = path.resolve('.tmp/e2e/telemetry-ownership.json')
     this.now = now
     this.commandDeadline = Infinity
+    this.longReporter = longWindowSelected(env) ? new BoundedReporter({ env }).read() : null
+    this.churnReporter =
+      env.TELEMETRY_CHURN_REPORTER === '1' ? new BoundedReporter({ env }).read() : null
+    this.reporter = this.longReporter ?? this.churnReporter
     this.docker =
       docker ||
       ((args, { timeoutMs }) =>
@@ -48,6 +54,11 @@ class CiOwnership {
   run(args) {
     const timeoutMs = Math.min(35000, Math.floor(this.commandDeadline - this.now()))
     assert(timeoutMs > 5000, 'Cleanup command budget exhausted')
+    if (args[0] === 'compose' && this.reporter) {
+      const index = args.indexOf(this.file)
+      assert(index > 0, 'Bounded reporter requires the registered Compose file')
+      args = [...args.slice(0, index + 1), '-f', this.reporter.compose, ...args.slice(index + 1)]
+    }
     return this.docker(args, { timeoutMs })
   }
 
@@ -214,6 +225,8 @@ class CiOwnership {
     ])
     const manifest = JSON.parse(fs.readFileSync('scripts/e2e/telemetry/fixtures/manifest.json'))
     const configured = this.file === 'docker-compose.telemetry.yml'
+    if (this.longReporter) receipt.longReporter = this.longReporter
+    if (this.churnReporter) receipt.churnReporter = this.churnReporter
     receipt.images = []
     receipt.brokers = []
     for (const container of containers) {
@@ -252,7 +265,25 @@ class CiOwnership {
           'sha256sum',
           '/opt/kafka/libs/counting-telemetry-reporter.jar',
         ]).split(/\s+/)[0]
-        assert.equal(reporterSha256, manifest.lines[receipt.line].reporterJar.sha256)
+        assert.equal(
+          reporterSha256,
+          this.reporter?.sha256 ?? manifest.lines[receipt.line].reporterJar.sha256
+        )
+        if (this.reporter) {
+          const proof = JSON.parse(
+            fs.readFileSync(
+              path.join(
+                this.directory,
+                `reporter-${container.Config.Labels['com.docker.compose.service'].slice(-1)}.json`
+              )
+            )
+          )
+          assert.equal(
+            proof.maxFileBytes,
+            this.reporter.sinkBytes,
+            `${this.longReporter ? 'Long' : 'Churn'} reporter sink cap mismatch`
+          )
+        }
       }
       receipt.images.push({
         container: container.Id,

@@ -149,6 +149,34 @@ describe('Network > Connection > the ordering of requests belongs to one connect
     expect(state.writes.map((frame) => readRequestHeader(frame).correlationId)).toEqual([2, 3])
   })
 
+  test('an old encoder settling cannot reset a replacement attempt queue', async () => {
+    const { connection, state } = await connectedConnection()
+    const oldGate = deferred()
+    const freshGate = deferred()
+    const stale = connection.send(heldEncode(produceRequest(0), oldGate)).catch((e) => e)
+    try {
+      await settle()
+      await reconnect(connection)
+      const first = connection.send(heldEncode(produceRequest(1), freshGate))
+      await settle()
+      oldGate.resolve()
+      expect(await stale).toMatchObject({
+        name: 'KafkaJSConnectionError',
+        message: 'Not connected',
+      })
+      const second = connection.send(produceRequest(2))
+      await settle()
+      expect(state.writes).toHaveLength(0)
+      freshGate.resolve()
+      await Promise.all([first, second])
+      expect(state.writes.map((frame) => readRequestHeader(frame).correlationId)).toEqual([1, 2])
+    } finally {
+      oldGate.resolve()
+      freshGate.resolve()
+      await connection.disconnect({ drainTimeout: 0 })
+    }
+  })
+
   test('the new request keeps its own requestTimeout while an old request is still encoding', async () => {
     const { connection, state } = await connectedConnection({ requestTimeout: 50 })
     const gate = deferred()

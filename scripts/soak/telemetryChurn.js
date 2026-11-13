@@ -11,6 +11,7 @@
  * Development-only and public-API-only: nothing here reads a private member of the client.
  * `soak.js` injects its `Soak`, `instrument` and verdict so this module never requires it back.
  */
+const { SINK_BYTES: CHURN_SINK_BYTES } = require('./churnReporter')
 const crypto = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
@@ -19,17 +20,23 @@ const zlib = require('node:zlib')
 // eslint-disable-next-line n/no-unsupported-features/node-builtins -- development driver; only the resource lifetime hooks are used
 const { AsyncLocalStorage, createHook } = require('node:async_hooks')
 const { fork } = require('node:child_process')
+const v8 = require('node:v8')
 const { createChaosSocketFactory, FrameFilter } = require('../../testHelpers/chaosSocket')
 const {
   DecoderGate,
   DecoderMemory,
   TelemetryWireObserver,
+  OBSERVER_LIMITS,
+  checkedResource,
   readExports,
 } = require('../../testHelpers/telemetryFixtures')
+const { pollUntil } = require('../../src/producer/__tests__/fixtures/bounded')
+const { setShareGroupConfigs, resetShareGroupConfigs } = require('../../testHelpers/shareFixtures')
 const {
   TelemetrySegments,
   checkSegmentFiles,
   FILE_BOUND,
+  scheduleOf,
 } = require('../../testHelpers/telemetrySegments')
 const {
   NativeJournal,
@@ -37,8 +44,18 @@ const {
   ProcessMemory,
   readProcStatus,
 } = require('../../testHelpers/processMemory')
+const {
+  FixedJournal,
+  HandlerJournal,
+  JournalConstancy,
+  SYMBOL_BYTES,
+  journalState,
+} = require('../../testHelpers/fixedJournal')
 const gzipCodec = require('../../src/protocol/message/compression/gzip')
 const zstdCodec = require('../../src/protocol/message/compression/zstd')
+const { slope } = require('./bounds')
+const { LIVE_SEED, LiveSeed } = require('./liveSeed')
+const { LONG_WINDOW, HeapSpaceJournal, selected: longWindowSelected } = require('./longWindow')
 const {
   ShareTrace,
   acknowledgementResponse,
@@ -49,7 +66,7 @@ const { readRequestHeader } = require('../../testHelpers/fakeSocket')
 const shareFetchWire = require('../../testHelpers/wire/shareFetchV2')
 const shareAckWire = require('../../testHelpers/wire/shareAcknowledgeV2')
 
-const SCENARIO = 'telemetry-churn'
+const SCENARIO = longWindowSelected() ? LONG_WINDOW.scenario : 'telemetry-churn'
 const KINDS = Object.freeze(['producer', 'consumer', 'admin', 'shareConsumer'])
 const STEPS = Object.freeze({ subscriptionMs: 10000, retireMs: 30000, reopenMs: 60000 })
 const ORDER = Object.freeze(['reopen', 'retire', 'subscription'])
@@ -57,7 +74,12 @@ const STAGE_OF = Object.freeze({ reopen: 'lifecycle', retire: 'retire', subscrip
 const MINIMUMS = Object.freeze({ subscription: 30, retire: 10, reopen: 5 })
 const LATE_MS = 5000
 const DESCRIPTORS = 128
-const CORPUS = Object.freeze({ records: 10000, batch: 100, batchMs: 3000, bytes: 200 })
+const CORPUS = Object.freeze({
+  records: longWindowSelected() ? LONG_WINDOW.corpusRecords : 10000,
+  batch: 100,
+  batchMs: 3000,
+  bytes: 200,
+})
 const SETUP_MS = 48000
 const NATURAL_EXIT_MS = 10000
 /** How long a killed worker's close and drained pipes are awaited before its row is final. */
@@ -84,6 +106,95 @@ const MIB = 1048576
 const ROOT = path.resolve(__dirname, '../..')
 /** Native compression rows one worker journals: one per Push of a 360 s run at 1 s, with room. */
 const NATIVE_ROWS = 1024
+/** Engine code readings one worker journals: every settled reading of a run, with room. */
+const ENGINE_ROWS = 64
+/** Five-minute telemetry worker flags, also reused by live-flags journal controls. */
+const WORKER_FLAGS = Object.freeze([
+  '--expose-gc',
+  '--min-semi-space-size=1',
+  '--max-semi-space-size=1',
+])
+
+/**
+ * The proved worst-case encoded bytes of each share row in the `share-packed-1` layout, rounded up
+ * to a multiple of 16: an exchange header (167, with int32 identifiers, Float64 clocks, two raw
+ * 32-byte digests and every label in a slot), a request/response partition pair with its own
+ * topic wrappers (72), the acquired range plus acknowledgement batch of one record with int64
+ * offsets of 8 bytes each (63) and a public acknowledgement row with its error labels (67).
+ * Digests, offsets and labels that cannot be packed exactly cost more and overflow fatally.
+ */
+const SHARE_ROW_BYTES = Object.freeze({
+  header: 176,
+  partitionPair: 80,
+  record: 64,
+  acknowledgement: 80,
+})
+
+/**
+ * Bounds the unchanged corpus, three-partition topology and session catalogue, not average traffic.
+ * Empty/error rounds owe 50 ms per node (shareFetchLoop); 500 ms is only a maximum broker wait.
+ * A productive fetch or a separate flush may carry just one record, not a full 100-record batch.
+ * The 10% corpus margin covers extra deliveries; further traffic or shapes overflow fatally.
+ * Rows reserve their `SHARE_ROW_BYTES`; field columns and byte-only label slots bound repeated names.
+ * @param {object} [limits] the unchanged telemetry schedule constants @returns {object} capacities
+ */
+const journalLimits = (
+  limits = { caseMs: 540000, sampleAt: Array(11), warmupMs: 60000, measureMs: 300000 }
+) => {
+  const batches = Math.ceil(CORPUS.records / CORPUS.batch)
+  const records = Math.ceil((CORPUS.records * 11) / 10)
+  const sessions = 3 * (Math.ceil(limits.caseMs / STEPS.reopenMs) + 2)
+  const emptyRounds = 3 * Math.ceil(limits.caseMs / 50)
+  const lifecycleExchanges = sessions * 4
+  const exchanges = emptyRounds + records * 2 + lifecycleExchanges
+  const partitionPairs = emptyRounds + 3 * (records * 2 + lifecycleExchanges)
+  const receipts = 2 * (Math.ceil(limits.caseMs / STEPS.reopenMs) + 3)
+  return {
+    records,
+    batches: Math.ceil((batches * 11) / 10),
+    exchanges,
+    exchangeBytes:
+      exchanges * SHARE_ROW_BYTES.header +
+      partitionPairs * SHARE_ROW_BYTES.partitionPair +
+      records * SHARE_ROW_BYTES.record,
+    acknowledgements: records,
+    acknowledgementBytes: records * SHARE_ROW_BYTES.acknowledgement,
+    receipts,
+    samples: limits.sampleAt.length + 4,
+    sampleBytes: (limits.sampleAt.length + 4) * 65536,
+  }
+}
+
+/**
+ * The exact bytes a worker of `kind` allocates and fills before its disabled control, derived only
+ * from the journal limits: ordinary work (two 16-byte id ledgers, 32-byte handler rows with their
+ * completeness bitmap, 256-byte receipts, 16-byte producer slots), the native journal (2,048-byte
+ * rows) with its pending windows (256 bytes), the memory samples, the engine code journal (64-byte
+ * rows), the long-window heap space journal when the limits name one and, for the share consumer,
+ * both share archives with their label slots. `nativeRows`, `engineRows` and `heapSpaceRows` of the
+ * limits replace the defaults of the existing lane. The sizes mirror
+ * the owners that allocate them; a spec compares the sum with the storage the real owners hold.
+ * @param {string} kind a client kind
+ * @param {object} [limits] the telemetry schedule constants, as for `journalLimits`
+ * @returns {number} declared journal bytes
+ */
+const declaredJournalBytes = (kind, limits) => {
+  const storage = journalLimits(limits)
+  const ordinary =
+    2 * storage.records * 16 +
+    (storage.records * 32 + CORPUS.records) +
+    2 * storage.receipts * 256 +
+    storage.batches * 16
+  const native = (limits?.nativeRows ?? NATIVE_ROWS) * (2048 + 256)
+  const engine = (limits?.engineRows ?? ENGINE_ROWS) * 64
+  const heapSpaces = (limits?.heapSpaceRows ?? 0) * LONG_WINDOW.heapSpaceRowBytes
+  const share =
+    kind === 'shareConsumer'
+      ? storage.exchangeBytes + storage.acknowledgementBytes + 2 * SYMBOL_BYTES
+      : 0
+  return ordinary + native + storage.sampleBytes + engine + heapSpaces + share
+}
+
 const CONTROL = Object.freeze({
   rssDriftBytes: 2 * MIB,
   retainedDriftBytes: 262144,
@@ -107,6 +218,7 @@ const MESSAGE_TYPES = Object.freeze({
     'ready',
     'phase',
     'stage-done',
+    'confirm-fenced',
     'decode',
     'result',
     'failure',
@@ -235,11 +347,12 @@ const readMemory = (phase, now = () => performance.now()) => {
 /**
  * Two collections 100 ms apart with the collection callbacks left to settle, then a reading.
  * @param {string} phase the reading's place in the fixed catalogue
- * @param {object} io `{gc, pause, now, collections}`; the pause must let timers and immediates run,
- *   `collections` counts the collections the engine reported so far
+ * @param {object} io `{gc, pause, now, collections, engine}`; the pause must let timers and immediates
+ *   run, `collections` counts the collections the engine reported so far, and an `engine` journal
+ *   (shadow only) takes the engine's code sizes beside the reading
  * @returns {Promise<object>} the settled reading with `gc: {admittedAt, completedAt, observed}`
  */
-const settledReading = async (phase, { gc, pause, now, collections = () => 0 }) => {
+const settledReading = async (phase, { gc, pause, now, collections = () => 0, engine = null }) => {
   const admittedAt = now()
   const before = collections()
   gc()
@@ -248,9 +361,177 @@ const settledReading = async (phase, { gc, pause, now, collections = () => 0 }) 
   await new Promise((resolve) => setImmediate(resolve))
   await new Promise((resolve) => setImmediate(resolve))
   const reading = readMemory(phase, now)
+  engine?.record(reading)
   return {
     ...reading,
     gc: { admittedAt, completedAt: reading.at, observed: collections() - before },
+  }
+}
+
+/**
+ * The V8 code and bytecode bytes beside every reading of one worker, kept as fixed scalar rows. It
+ * is shadow evidence of the code-accounting question and never enters a verdict. Its storage is
+ * reserved before the first control reading and held to the end; an overflow throws and nothing is
+ * truncated or overwritten.
+ */
+class EngineCodeJournal {
+  /** @param {{capacity?:number}} [options] the most readings one worker takes */
+  constructor({ capacity = ENGINE_ROWS } = {}) {
+    this.rows = new FixedJournal({ name: 'engine code', capacity, bytes: capacity * 64 })
+  }
+
+  /**
+   * Appends the engine's code sizes for a reading just taken; nothing about the reading changes.
+   * @param {{phase:string, at:number}} reading the reading's catalogue name and monotonic time
+   * @returns {void}
+   * @throws {Error} when the journal is full
+   */
+  record({ phase, at }) {
+    const code = v8.getHeapCodeStatistics()
+    this.rows.push([phase, at, code.code_and_metadata_size, code.bytecode_and_metadata_size])
+  }
+
+  /** @returns {object} fixed storage and append cursor, never the rows */
+  journalState() {
+    return this.rows.journalState()
+  }
+
+  /** @returns {Array<{phase:string, at:number, code:number, bytecode:number}>} rows, after the run */
+  values() {
+    return this.rows.values().map(([phase, at, code, bytecode]) => ({ phase, at, code, bytecode }))
+  }
+
+  /**
+   * Reports the raw, code and data series of a run beside its acceptance verdict, never into it.
+   * Code is `code_and_metadata_size + bytecode_and_metadata_size`; data is raw minus code, in bytes.
+   * @param {Array<{minutes:number, raw:number, code:number}>} points the settled readings in order
+   * @returns {object} per series the least-squares slope per minute and the first-to-last change,
+   *   or `complete: false` when fewer than two readings or two distinct times exist; it never throws
+   */
+  static shadow(points) {
+    const report = { scope: 'shadow', acceptance: false, readings: points.length }
+    if (
+      points.length < 2 ||
+      points.some((p) => ![p.minutes, p.raw, p.code, p.raw - p.code].every(Number.isFinite))
+    )
+      return { ...report, complete: false }
+    const series = (pick) => {
+      const values = points.map((p) => [p.minutes, pick(p)])
+      return {
+        slopeBytesPerMinute: slope(values),
+        endpointBytes: values.at(-1)[1] - values[0][1],
+      }
+    }
+    try {
+      return {
+        ...report,
+        complete: true,
+        raw: series((p) => p.raw),
+        code: series((p) => p.code),
+        data: series((p) => p.raw - p.code),
+      }
+    } catch (error) {
+      return { ...report, complete: false, error: error.message }
+    }
+  }
+
+  /**
+   * Validates an archived journal against the original raw samples without sorting or dropping rows.
+   * Reading indices name the full journal; sample indices name the original verdict input array.
+   * Both clocks must match exactly: absolute memory `at` and phase-relative `completedAtMs`.
+   * @param {object[]} samples original `{completedAtMs, snapshot.memory}` samples in order
+   * @param {object} engine version 1 archive with `readingCount`, `readings` and `samples` references
+   * @returns {object[]} joined sample identity, both clocks, raw retained bytes, code and bytecode
+   * @throws {Error} for missing, duplicate, reordered, mismatched or non-finite facts
+   */
+  static join(samples, engine) {
+    if (
+      engine?.version !== 1 ||
+      !Array.isArray(samples) ||
+      !Array.isArray(engine.readings) ||
+      !Array.isArray(engine.samples) ||
+      engine.readings.length !== engine.readingCount ||
+      engine.samples.length !== samples.length
+    )
+      throw new Error('Engine journal join needs complete version 1 arrays')
+    let previousAt = -Infinity
+    for (const [index, row] of engine.readings.entries()) {
+      if (
+        row?.readingIndex !== index ||
+        typeof row.phase !== 'string' ||
+        row.phase.length === 0 ||
+        ![row.at, row.code, row.bytecode].every(Number.isFinite) ||
+        row.at <= previousAt
+      )
+        throw new Error(`Engine journal has an invalid or reordered reading ${index}`)
+      previousAt = row.at
+    }
+    let previousReading = -1
+    let previousCompletion = -Infinity
+    return samples.map((sample, sampleIndex) => {
+      const reference = engine.samples[sampleIndex]
+      const reading = engine.readings[reference?.readingIndex]
+      const memory = sample?.snapshot?.memory
+      if (
+        reference?.sampleIndex !== sampleIndex ||
+        !Number.isSafeInteger(reference.readingIndex) ||
+        reference.readingIndex <= previousReading ||
+        !reading ||
+        !memory ||
+        ![memory.at, memory.retainedBytes, sample.completedAtMs].every(Number.isFinite) ||
+        reading.at !== memory.at ||
+        reading.phase !== memory.phase ||
+        reference.completedAtMs !== sample.completedAtMs ||
+        sample.completedAtMs <= previousCompletion
+      )
+        throw new Error(`Engine journal join mismatch at sample ${sampleIndex}`)
+      previousReading = reference.readingIndex
+      previousCompletion = sample.completedAtMs
+      return {
+        sampleIndex,
+        readingIndex: reference.readingIndex,
+        phase: reading.phase,
+        at: reading.at,
+        completedAtMs: sample.completedAtMs,
+        raw: memory.retainedBytes,
+        code: reading.code,
+        bytecode: reading.bytecode,
+      }
+    })
+  }
+
+  /**
+   * Materialises the full engine journal and exact sample references only after the closed reading.
+   * Extra control, baseline and cleanup readings stay in the archive, outside the sample fit.
+   * The summary uses the original OLS arithmetic and phase-relative sample completion times.
+   * @param {object[]} samples original verdict input samples, each `{completedAtMs, snapshot.memory}`
+   * @returns {object} diagnostic-only summary and versioned `engine` archive; an invalid join or
+   *   overflow is `complete: false`, retains the evidence and publishes no partial series
+   */
+  report(samples) {
+    const readings = this.values().map((row, readingIndex) => ({ readingIndex, ...row }))
+    const byTime = new Map(readings.map((row) => [row.at, row.readingIndex]))
+    const engine = {
+      version: 1,
+      readingCount: this.journalState().length,
+      readings,
+      samples: samples.map((sample, sampleIndex) => ({
+        sampleIndex,
+        readingIndex: byTime.get(sample?.snapshot?.memory?.at) ?? null,
+        completedAtMs: sample?.completedAtMs,
+      })),
+    }
+    try {
+      if (this.journalState().overflow) throw new Error('Engine journal overflow')
+      const points = EngineCodeJournal.join(samples, engine).map((row) => ({
+        minutes: row.completedAtMs / 60000,
+        raw: row.raw,
+        code: row.code + row.bytecode,
+      }))
+      return { ...EngineCodeJournal.shadow(points), engine }
+    } catch (error) {
+      return { scope: 'shadow', acceptance: false, complete: false, error: error.message, engine }
+    }
   }
 }
 
@@ -321,15 +602,24 @@ const writeFence = (segments) => ({
 
 /**
  * The deterministic action table of one run, derived from the fixed schedule alone: what happens at
- * which millisecond after the epoch, split into the three coordinated stages of every tick.
+ * which millisecond after the epoch. The five-minute lane batches the original ordered selections
+ * into five disconnected public boundaries: the first follows the 60 s slot so its final selection
+ * is custom, and the last follows all retirements so an empty selection owes no recovery Push.
+ * Middle boundaries move 15 s past their batch cutoff, between settled samples; their index still
+ * names the final transition, and retirements keep their original slots.
+ * The long-window lane retains its original three stages.
  */
 class TelemetrySchedule {
   /**
-   * @param {{warmupMs:number, measureMs:number}} window warm-up and measurement lengths
+   * @param {{warmupMs:number, measureMs:number, corpusStartMs?:number}} window warm-up and
+   *   measurement lengths, and when the corpus starts: with the measurement unless the long-window
+   *   candidate starts traffic with the warm-up
    */
-  constructor({ warmupMs, measureMs }) {
+  constructor({ warmupMs, measureMs, corpusStartMs = warmupMs }) {
     this.warmupMs = warmupMs
+    this.corpusStartMs = corpusStartMs
     this.endMs = warmupMs + measureMs
+    this.betweenLifecycles = SCENARIO === 'telemetry-churn' && measureMs <= 300000
     const at = new Map()
     for (const [action, step] of [
       ['reopen', STEPS.reopenMs],
@@ -345,6 +635,42 @@ class TelemetrySchedule {
         index: ms / STEPS.subscriptionMs,
         actions: ORDER.filter((a) => actions.includes(a)),
       }))
+    if (this.betweenLifecycles) {
+      const cycles = this.ticks.filter((tick) => tick.actions.includes('reopen'))
+      const gaps = new Set(
+        cycles.map((tick, index) =>
+          index === cycles.length - 1
+            ? this.endMs - STEPS.subscriptionMs
+            : tick.at + (index === 0 ? STEPS.subscriptionMs : 0)
+        )
+      )
+      const pending = []
+      this.ticks = this.ticks
+        .flatMap((tick) => {
+          pending.push(tick.index)
+          const transitions = gaps.has(tick.at) ? pending.splice(0) : []
+          const actions = [
+            ...(transitions.length ? ['reopen'] : []),
+            ...(tick.actions.includes('retire') ? ['retire'] : []),
+            ...(transitions.length ? ['subscription'] : []),
+          ]
+          return actions.length ? [{ ...tick, actions, transitions }] : []
+        })
+        .flatMap((tick) => {
+          if (
+            !tick.transitions.length ||
+            !tick.actions.includes('retire') ||
+            tick.at === this.endMs - STEPS.subscriptionMs
+          )
+            return [tick]
+          return [
+            { ...tick, actions: ['retire'], transitions: [] },
+            { ...tick, at: tick.at + STEPS.retireMs / 2, actions: ['reopen', 'subscription'] },
+          ]
+        })
+        .sort((a, b) => a.at - b.at)
+        .map((tick, number) => ({ ...tick, number }))
+    }
   }
 
   /**
@@ -358,6 +684,11 @@ class TelemetrySchedule {
    * @param {{actions:string[]}} tick one table row @returns {string[]} its stages, in order
    */
   stages(tick) {
+    if (this.betweenLifecycles)
+      return [
+        ...(tick.transitions.length ? ['confirm'] : []),
+        ...(tick.actions.includes('retire') ? ['retire'] : []),
+      ]
     return tick.actions.map((action) => STAGE_OF[action])
   }
 
@@ -376,18 +707,20 @@ class TelemetrySchedule {
   required() {
     const counts = { subscription: 0, retire: 0, reopen: 0 }
     for (const tick of this.ticks)
-      if (this.measured(tick)) for (const action of tick.actions) counts[action] += 1
+      if (this.measured(tick))
+        for (const action of tick.actions)
+          counts[action] += action === 'subscription' ? (tick.transitions?.length ?? 1) : 1
     return counts
   }
 
   /**
-   * @returns {number[]} the fixed slots, in ms after the epoch, at which the measured corpus batches
-   *   are offered; none falls in the warm-up
+   * @returns {number[]} the fixed slots, in ms after the epoch, at which the corpus batches are
+   *   offered; none falls in the warm-up unless the corpus starts with it
    */
   corpusSlots() {
     return Array.from(
       { length: CORPUS.records / CORPUS.batch },
-      (_, batch) => this.warmupMs + batch * CORPUS.batchMs
+      (_, batch) => this.corpusStartMs + batch * CORPUS.batchMs
     )
   }
 }
@@ -1152,7 +1485,8 @@ class ShareOracle {
  * The classifying socket factory of one worker. Every socket is a chaos socket over the socket of
  * the observer segment the owner has selected. The first request frame of API 71 or 72 marks that
  * very socket as the telemetry transport; one such open socket can be retired, leaving core sockets
- * untouched. A closed socket is released at once, so only scalar facts outlive it.
+ * untouched. A closed socket is released at once, so only scalar facts outlive it. Socket history
+ * is bounded by the churn segment cap times the observer socket cap; overflow fails before dialing.
  */
 class TelemetryTap {
   /**
@@ -1161,12 +1495,18 @@ class TelemetryTap {
    *   wraps every socket of a share consumer
    */
   constructor(segments, { share = null, clock = { now: () => performance.now() } } = {}) {
-    const chaos = createChaosSocketFactory((options) => segments.socketFactory(options))
+    this.chaos = createChaosSocketFactory((options) => segments.socketFactory(options), {
+      retainClosed: false,
+    })
     this.segments = segments
     this.share = share
     this.clock = clock
     this.records = []
-    this.factory = (options) => this.track(chaos(options), segments.current())
+    this.factory = (options) => {
+      if (this.records.length >= scheduleOf(SCENARIO).cap * OBSERVER_LIMITS.sockets)
+        throw new Error('Telemetry tap socket history bound exceeded')
+      return this.track(this.chaos(options), segments.current())
+    }
   }
 
   /**
@@ -1201,8 +1541,10 @@ class TelemetryTap {
         record.armed = false
         record.hit = false
         const at = tap.clock.now()
+        const faulted = record.faulted
+        record.faulted = null
         this.destroy(new Error('telemetry transport retired'))
-        record.faulted(at)
+        faulted(at)
       }
       return result
     }
@@ -1216,6 +1558,7 @@ class TelemetryTap {
       record.restore?.()
       record.restore = null
       record.socket = null
+      record.faulted = null
     })
     this.records.push(record)
     return socket
@@ -1274,14 +1617,25 @@ class TelemetryTap {
 class ShareLedger {
   /**
    * @param {object} options
+   * @param {object} [options.storage] schedule-derived journal capacities
    * @param {string} options.group the share group @param {{now:function():number}} options.clock
    */
-  constructor({ group, clock }) {
+  constructor({ group, clock, storage = journalLimits() }) {
     this.group = group
     this.clock = clock
     this.traces = []
-    this.exchanges = []
-    this.settled = []
+    this.exchanges = new FixedJournal({
+      name: 'share exchanges',
+      packed: true,
+      capacity: storage.exchanges,
+      bytes: storage.exchangeBytes,
+    })
+    this.settled = new FixedJournal({
+      name: 'share acknowledgements',
+      packed: true,
+      capacity: storage.acknowledgements,
+      bytes: storage.acknowledgementBytes,
+    })
   }
 
   /**
@@ -1374,14 +1728,20 @@ class ShareLedger {
     })
   }
 
+  /** @returns {object} fixed storage and append cursors; never materialises the facts */
+  journalState() {
+    return journalState([this.exchanges, this.settled])
+  }
+
   /** @returns {object} the archived facts, after a final drain, with the hash of the exchanges */
   facts() {
     this.drain()
+    const exchanges = this.exchanges.values()
     return {
       group: this.group,
-      exchanges: this.exchanges,
-      exchangesSha256: sha(JSON.stringify(this.exchanges)),
-      settled: this.settled,
+      exchanges,
+      exchangesSha256: sha(JSON.stringify(exchanges)),
+      settled: this.settled.values(),
     }
   }
 }
@@ -1403,8 +1763,20 @@ class OrdinaryWork {
    * @param {(ms:number)=>Promise<void>} [options.sleep] real delay
    * @param {ShareLedger} [options.ledger] the share ledger of a share consumer
    * @param {number[]} [options.slots] producer batch slots, in ms after the corpus start
+   * @param {object} [options.storage] schedule-derived journal capacities
    */
-  constructor({ kind, client, stem, topic, ctl, clock, sleep = wait, ledger = null, slots = [] }) {
+  constructor({
+    kind,
+    client,
+    stem,
+    topic,
+    ctl,
+    clock,
+    sleep = wait,
+    ledger = null,
+    slots = [],
+    storage = journalLimits(),
+  }) {
     Object.assign(this, { kind, client, stem, topic, ctl, clock, sleep, ledger, slots })
     this.running = false
     this.paused = false
@@ -1412,14 +1784,28 @@ class OrdinaryWork {
     this.inflight = null
     this.active = 0
     this.lastExit = -Infinity
-    this.offered = []
-    this.resolved = []
-    this.handled = []
+    const ids = (name) =>
+      new FixedJournal({ name, capacity: storage.records, bytes: storage.records * 16 })
+    this.offered = ids('offered')
+    this.resolved = ids('resolved')
+    this.handled = new HandlerJournal(CORPUS.records, storage.records)
     this.processed = new Map()
     this.committed = new Map()
-    this.commits = []
-    this.pauses = []
-    this.late = []
+    this.commits = new FixedJournal({
+      name: 'commits',
+      capacity: storage.receipts,
+      bytes: storage.receipts * 256,
+    })
+    this.pauses = new FixedJournal({
+      name: 'pauses',
+      capacity: storage.receipts,
+      bytes: storage.receipts * 256,
+    })
+    this.late = new FixedJournal({
+      name: 'producer slots',
+      capacity: storage.batches,
+      bytes: storage.batches * 16,
+    })
     this.failures = []
     this.listening = false
   }
@@ -1431,18 +1817,16 @@ class OrdinaryWork {
   async attach() {
     const handle = async ({ partition, message }) => {
       this.active += 1
-      const entry = [
+      const row = this.handled.enter(
         partition,
-        Number(message.offset),
+        message.offset,
         indexOf(String(message.key)),
-        this.clock.now(),
-        null,
-      ]
-      this.handled.push(entry)
+        this.clock.now()
+      )
       if (this.kind === 'consumer')
         this.processed.set(String(partition), String(BigInt(message.offset) + 1n))
-      entry[4] = this.clock.now()
-      this.lastExit = entry[4]
+      this.lastExit = this.clock.now()
+      this.handled.exit(row, this.lastExit)
       this.active -= 1
     }
     if (this.kind === 'shareConsumer') {
@@ -1617,15 +2001,24 @@ class OrdinaryWork {
     if (this.failures.length) throw this.failures[0]
     if (this.kind === 'consumer' || this.kind === 'shareConsumer') {
       const deadline = this.clock.now() + ms
-      while (
-        new Set(this.handled.map((e) => e[2])).size < CORPUS.records &&
-        this.clock.now() < deadline
-      )
+      while (this.handled.unique < CORPUS.records && this.clock.now() < deadline)
         await this.sleep(200)
-      if (new Set(this.handled.map((e) => e[2])).size < CORPUS.records)
+      if (this.handled.unique < CORPUS.records)
         throw new Error('The corpus was not fully handled before the close')
       if (this.kind === 'consumer') await this.commit()
     }
+  }
+
+  /** @returns {object} allocated bytes and cursors without rebuilding the oracle */
+  journalState() {
+    return journalState([
+      this.offered,
+      this.resolved,
+      this.handled,
+      this.commits,
+      this.pauses,
+      this.late,
+    ])
   }
 
   /**
@@ -1635,14 +2028,14 @@ class OrdinaryWork {
   ids() {
     return {
       kind: this.kind,
-      offered: this.offered,
-      resolved: this.resolved,
-      handled: this.handled,
+      offered: this.offered.values(),
+      resolved: this.resolved.values(),
+      handled: this.handled.values(),
       processed: Object.fromEntries(this.processed),
       committed: Object.fromEntries(this.committed),
-      commits: this.commits,
-      pauses: this.pauses,
-      late: this.late,
+      commits: this.commits.values(),
+      pauses: this.pauses.values(),
+      late: this.late.values(),
     }
   }
 }
@@ -1672,6 +2065,7 @@ class ParentFixture {
     this.admin = kafka.admin({ enableMetricsPush: false })
     this.producer = kafka.producer({ enableMetricsPush: false, idempotent: true })
     this.rotationEntries = { 'interval.ms': '1000', match: `client_id=^${stem}-.*$` }
+    this.shareConfigOwned = false
   }
 
   /** @param {string} kind the client kind @returns {string} its corpus topic */
@@ -1689,7 +2083,11 @@ class ParentFixture {
     return `${this.stem}-ctl`
   }
 
-  /** @returns {Promise<void>} connects and creates the corpus and control topics, 3 partitions RF3 */
+  /**
+   * Creates the corpus topics and reads back earliest share offsets before any worker joins.
+   * @returns {Promise<void>} Connected clients, 3 partitions RF3, and an applied group override.
+   * @throws {Error} On topic creation or group configuration failure.
+   */
   async open() {
     await this.admin.connect()
     await this.producer.connect()
@@ -1707,6 +2105,10 @@ class ParentFixture {
         configEntries: [{ name: 'min.insync.replicas', value: '2' }],
       })),
     })
+    this.shareConfigOwned = true
+    await setShareGroupConfigs(this.admin, this.group('shareConsumer'), {
+      'share.auto.offset.reset': 'earliest',
+    })
   }
 
   /**
@@ -1722,39 +2124,89 @@ class ParentFixture {
   }
 
   /**
-   * Sets the next subscription value, checks the set succeeded and reads the resource back.
+   * Sets the next subscription and polls successful stale readbacks until every value is exact.
+   * The set, all reads and pauses share the parent's remaining rotation budget; API errors fail
+   * immediately, and expiry stops polling with the last expected/observed mismatch.
    * @param {number} index the 10 s transition number, from 1 @param {string} metrics the new value
+   * @param {number} [budgetMs] remaining time within the existing confirmation stage, at most 9 s
    * @returns {Promise<{index:number, selection:string, setAt:number, readbackAt:number,
-   *   readback:string}>} the transition row, times on this process's monotonic clock
-   * @throws {Error} when the set or the readback is not exactly what was asked
+   *   readback:string, readbackAttempts:number}>} the transition row, times on this process's clock
+   * @throws {Error} on an API failure or when the budget expires without an exact readback
    */
-  async rotate(index, metrics) {
+  async rotate(index, metrics, budgetMs = STAGE_MS.confirm - 1000) {
     const resource = { type: 16, name: this.stem }
-    const set = await this.admin.incrementalAlterConfigs({
-      timeout: 3000,
-      resources: [
-        { ...resource, configEntries: [{ name: 'metrics', operation: 0, value: metrics }] },
-      ],
-    })
-    const setAt = this.clock.now()
-    const rows = set?.resources
-    if (!Array.isArray(rows) || rows.length !== 1 || rows[0].errorCode !== 0)
-      throw new Error('The subscription set was not accepted')
-    const read = await this.admin.describeConfigs({
-      timeout: 3000,
-      resources: [{ ...resource, configNames: ['metrics', 'interval.ms', 'match'] }],
-    })
-    const entries = Object.fromEntries(
-      read.resources[0].configEntries.map((e) => [e.configName, e.configValue])
-    )
-    const readbackAt = this.clock.now()
-    if (
-      (entries.metrics ?? '') !== metrics ||
-      entries['interval.ms'] !== this.rotationEntries['interval.ms'] ||
-      entries.match !== this.rotationEntries.match
-    )
-      throw new Error('The subscription readback differs')
-    return { index, selection: metrics, setAt, readbackAt, readback: entries.metrics ?? '' }
+    const expected = { metrics, ...this.rotationEntries }
+    const names = Object.keys(expected)
+    const deadline = this.clock.now() + budgetMs
+    const timeout = () => Math.max(1, Math.min(3000, Math.ceil(deadline - this.clock.now())))
+    const label = 'The subscription set and readback'
+    const owner = new AbortController()
+    let entries
+    let readbackAttempts = 0
+    try {
+      return await within(
+        async () => {
+          const set = await this.admin.incrementalAlterConfigs({
+            timeout: timeout(),
+            resources: [
+              { ...resource, configEntries: [{ name: 'metrics', operation: 0, value: metrics }] },
+            ],
+          })
+          owner.signal.throwIfAborted()
+          const setAt = this.clock.now()
+          const rows = set?.resources
+          if (!Array.isArray(rows) || rows.length !== 1 || rows[0].errorCode !== 0)
+            throw new Error('The subscription set was not accepted')
+          let readbackAt
+          await pollUntil(
+            owner.signal,
+            Infinity,
+            async (scope) => {
+              readbackAttempts += 1
+              const answer = await this.admin.describeConfigs({
+                timeout: timeout(),
+                resources: [{ ...resource, configNames: names }],
+              })
+              scope.throwIfAborted()
+              const read = checkedResource(answer, resource.name)
+              entries = Object.fromEntries(
+                read.configEntries.map((e) => [e.configName, e.configValue])
+              )
+              readbackAt = this.clock.now()
+              return names.every((name) => entries[name] === expected[name])
+            },
+            { delayMs: 50 }
+          )
+          return {
+            index,
+            selection: metrics,
+            setAt,
+            readbackAt,
+            readback: entries.metrics,
+            readbackAttempts,
+          }
+        },
+        budgetMs,
+        label
+      )
+    } catch (error) {
+      if (!entries || error?.message !== `${label} did not finish within ${budgetMs} ms`)
+        throw error
+      throw new Error(
+        `The subscription readback differs: ${JSON.stringify({
+          index,
+          expected,
+          observed: Object.fromEntries(
+            names.map((name) => [
+              name,
+              entries[name] === undefined ? null : String(entries[name]).slice(0, 256),
+            ])
+          ),
+        })}`
+      )
+    } finally {
+      owner.abort()
+    }
   }
 
   /**
@@ -1803,10 +2255,25 @@ class ParentFixture {
     return topic.topicId
   }
 
-  /** @returns {Promise<void>} disconnects every client the fixture opened */
+  /**
+   * Restores the owned group override before disconnecting both clients, even after failed setup.
+   * @returns {Promise<void>} Every cleanup attempted.
+   * @throws {AggregateError} All restoration and disconnect failures.
+   */
   async close() {
+    const errors = []
+    if (this.shareConfigOwned) {
+      try {
+        await resetShareGroupConfigs(this.admin, this.group('shareConsumer'), [
+          'share.auto.offset.reset',
+        ])
+        this.shareConfigOwned = false
+      } catch (error) {
+        errors.push(error)
+      }
+    }
     const outcomes = await Promise.allSettled([this.producer.disconnect(), this.admin.disconnect()])
-    const errors = outcomes.filter((o) => o.status === 'rejected').map((o) => o.reason)
+    errors.push(...outcomes.filter((o) => o.status === 'rejected').map((o) => o.reason))
     if (errors.length) throw new AggregateError(errors, 'Fixture cleanup failed')
   }
 }
@@ -1825,6 +2292,7 @@ class DecoderCoordinator {
    * @param {DecoderGate} [options.gate] the concurrency limiter, four by default
    * @param {Function} [options.make] builds the observer; a spec supplies a fake
    * @param {function():object[]} [options.exports] reads the broker sink rows
+   * @param {number} [options.sinkBytes] reporter sink cap; the five-minute cap by default
    */
   constructor({
     directory,
@@ -1833,15 +2301,17 @@ class DecoderCoordinator {
     env = process.env,
     gate = new DecoderGate(DECODER_SLOTS),
     make = (options) => new TelemetryWireObserver(options),
-    exports = readExports,
+    exports,
+    sinkBytes = CHURN_SINK_BYTES,
   }) {
-    this.exports = exports
+    this.exports = exports ?? (() => readExports({ fileBytes: sinkBytes }))
     this.observer = make({
       directory,
       line,
       clock,
       mode: 'configured',
       owner: 'parent-decoder',
+      sinkBytes,
       gate,
       env,
     })
@@ -2022,6 +2492,8 @@ class TelemetryProcesses {
    * @param {string[]} [options.args] the driver arguments
    * @param {(kind:string, error:Error)=>void} [options.onFailure] told once per failed worker
    * @param {(kind:string, message:object)=>void} [options.onDecode] serves a worker's decode request
+   * @param {number} [options.messageBytes] the largest IPC message a worker may send
+   * @param {number} [options.totalBytes] the most IPC bytes a worker may send in all
    */
   constructor({
     script,
@@ -2030,8 +2502,10 @@ class TelemetryProcesses {
     args = [],
     onFailure = () => {},
     onDecode = () => {},
+    messageBytes = MESSAGE_BYTES,
+    totalBytes = TOTAL_BYTES,
   }) {
-    Object.assign(this, { script, spawn, now, args, onFailure, onDecode })
+    Object.assign(this, { script, spawn, now, args, onFailure, onDecode, messageBytes, totalBytes })
     this.workers = new Map()
   }
 
@@ -2047,7 +2521,7 @@ class TelemetryProcesses {
     const token = crypto.randomBytes(8).toString('hex')
     const child = this.spawn(this.script, [...this.args, '--profile', 'telemetry'], {
       execPath: process.execPath,
-      execArgv: ['--expose-gc'],
+      execArgv: longWindowSelected() ? ['--expose-gc', ...LONG_WINDOW.v8Flags] : [...WORKER_FLAGS],
       env: { ...process.env, [WORKER_ENV]: kind, [WORKER_TOKEN]: token },
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     })
@@ -2137,7 +2611,7 @@ class TelemetryProcesses {
       return bad('a substituted handshake or message')
     const size = Buffer.byteLength(JSON.stringify(message))
     worker.bytes += size
-    if (size > MESSAGE_BYTES || worker.bytes > TOTAL_BYTES) return bad('IPC overflow')
+    if (size > this.messageBytes || worker.bytes > this.totalBytes) return bad('IPC overflow')
     const seen = (worker.counts.get(message.type) ?? 0) + 1
     worker.counts.set(message.type, seen)
     if (MESSAGE_TYPES.once.includes(message.type) && seen > 1)
@@ -2153,6 +2627,13 @@ class TelemetryProcesses {
       ...(message.row && { rowKind: message.row.kind }),
       ...(message.message && { message: String(message.message).slice(0, 2048) }),
     }
+    if (
+      message.type === 'hello' &&
+      longWindowSelected() &&
+      (!Array.isArray(message.execArgv) ||
+        !LONG_WINDOW.v8Flags.every((flag) => message.execArgv.includes(flag)))
+    )
+      return bad('missing long-window worker flag --no-flush-bytecode')
     if (message.type === 'receipt') worker.receiptAt = this.now()
     if (message.type === 'decode') {
       if (!worker.error) this.onDecode(kind, message)
@@ -2353,6 +2834,7 @@ class TelemetryWorker {
    *   delivers a message to the parent
    * @param {function(Function):*} [options.target] runs a public client call under the target role
    * @param {ShareLedger} [options.ledger] the share ledger of a share consumer
+   * @param {object} [options.peak] diagnostic-only share phase recorder
    * @param {object} [options.schedule] a `TelemetrySchedule`
    * @param {{manifest:object, prefix:string}} [options.foreground] the control's frozen catalogue,
    *   replayed once by the enabled client during setup
@@ -2373,6 +2855,7 @@ class TelemetryWorker {
     ledger = null,
     schedule,
     foreground = null,
+    peak = null,
   }) {
     Object.assign(this, {
       kind,
@@ -2389,6 +2872,7 @@ class TelemetryWorker {
       target,
       ledger,
       foreground,
+      peak,
     })
     this.schedule = schedule ?? new TelemetrySchedule(limits)
     this.uuid = null
@@ -2409,6 +2893,7 @@ class TelemetryWorker {
     this.owed = new Set()
     this.coreN = 0
     this.sealing = null
+    this.confirmation = null
     this.timing = {
       phaseAt: null,
       goAt: null,
@@ -2657,17 +3142,101 @@ class TelemetryWorker {
   }
 
   /**
-   * After the parent confirmed its set and readback: swaps one custom identity, waits for the
-   * successful Get that proves the selection (written after this message was taken), and discharges
-   * the current normal Push proof this tick owes on its current subscribed socket.
-   * @param {{tick:number, index:number, selection:string}} command the stage command
+   * In the five-minute lane, pauses admission and closes the public lifecycle before acknowledging
+   * the fence; reconnect waits for the parent's batch readbacks. The frozen long-window fence
+   * only captures its original write cursor.
+   * @param {{tick:number, index:number, selection:string, transitions?:number[]}} command pending batch
+   * @returns {Promise<void>} the receipt contains only scalar observer and clock facts
+   * @throws {Error} for overlapping fences, a failed close or an undrained previous segment
+   */
+  async fenceConfirmation(command) {
+    if (this.confirmation) throw new Error('A confirmation fence is already pending')
+    if (command.transitions) {
+      await this.drained()
+      const pause = await this.target(() => this.ordinary.pause())
+      const observedAt = this.clock.now()
+      const cycle = this.target(() =>
+        this.segments.cycle(this.client, this.closeOptions(), () => {
+          this.confirmation.closedAt = this.clock.now()
+          this.confirmation.after = cycle.to.observer.checkpoint()
+          this.send({
+            type: 'confirm-fenced',
+            ...this.confirmation,
+            cycle: undefined,
+            resume: undefined,
+          })
+          return new Promise((resolve) => {
+            this.confirmation.resume = resolve
+          })
+        })
+      )
+      this.confirmation = {
+        tick: command.tick,
+        index: command.index,
+        selection: command.selection,
+        segment: cycle.to.id,
+        receivedAt: observedAt,
+        after: 0,
+        pause,
+        observedAt,
+        cycle,
+      }
+      await within(cycle.closed, 8000, `The ${this.kind} close`)
+      this.drain(cycle.from)
+      return
+    }
+    const segment = this.segments.current()
+    this.confirmation = {
+      tick: command.tick,
+      index: command.index,
+      selection: command.selection,
+      segment: segment.id,
+      receivedAt: this.clock.now(),
+      after: segment.observer.checkpoint(),
+    }
+    this.send({ type: 'confirm-fenced', ...this.confirmation })
+  }
+
+  /**
+   * After the parent's successful readback, swaps one custom identity and proves the selection
+   * with a Get written after the acknowledged fence. The five-minute lane first releases the held
+   * reconnect, so its handshake follows all readbacks; the long-window lane can use a Get already
+   * received before this command. Discharges every owed current normal Push under unchanged bounds.
+   * @param {{tick:number, index:number, selection:string}} command the stage release
    * @returns {Promise<object>} the facts of the stage
-   * @throws {Error} when no Get proves the selection or the owed Push never arrives
+   * @throws {Error} for a missing or mismatched fence, no matching Get or no owed Push
    */
   async confirm(command) {
-    const receivedAt = this.clock.now()
+    const fence = this.confirmation
     const segment = this.segments.current()
-    const after = segment.observer.checkpoint()
+    if (
+      !fence ||
+      fence.tick !== command.tick ||
+      fence.index !== command.index ||
+      fence.selection !== command.selection ||
+      fence.segment !== segment.id
+    )
+      throw new Error('The confirmation has no matching pre-rotation fence')
+    this.confirmation = null
+    const { receivedAt, after } = fence
+    const releasedAt = this.clock.now()
+    if (fence.cycle) {
+      fence.resume()
+      await within(fence.cycle.reopened, 10000, `The ${this.kind} reconnect`)
+      const cached = await this.target(() => this.client.clientInstanceId({ timeout: 0 }))
+      if (cached !== this.uuid) throw new Error('The instance ID changed across a public reopen')
+      await this.target(() => this.ordinary.resume())
+      this.claims.reopens.push({
+        tick: command.tick,
+        from: fence.cycle.from.id,
+        to: segment.id,
+        observedAt: fence.observedAt,
+        closedAt: fence.closedAt,
+        cachedUuid: cached,
+        pause: fence.pause,
+      })
+      if (command.selection !== '') this.owed.add('reopen')
+    }
     const replacement = this.registry.replace(command.tick)
     const list = command.selection === '' ? [] : [command.selection]
     const get = await this.find('selection Get', STAGE_MS.confirm - 2000, () =>
@@ -2676,48 +3245,61 @@ class TelemetryWorker {
         selection: list,
       })
     )
+    if (fence.cycle) this.claims.reopens.at(-1).get = get.requestKey
     const claim = {
       tick: command.tick,
       index: command.index,
       selection: command.selection,
       segment: segment.id,
       receivedAt,
+      releasedAt,
+      after,
       get: get.requestKey,
       subscriptionId: get.response.subscriptionId,
       replacement,
       proof: null,
     }
-    if (this.owed.size) {
-      const open = this.tap.telemetry()
-      if (open.length !== 1 || open[0].segment !== segment.id)
-        throw new Error(`${this.kind}: expected one open telemetry socket for the owed proof`)
-      const records = () => segment.observer.readTranscript({ after: 0 })
-      const current = TelemetryProofs.gets(records(), this.uuid)
-        .filter((g) => g.socketId === open[0].ordinal)
-        .at(0)
-      if (!current) throw new Error(`${this.kind}: the current socket has no replacement Get`)
-      const push = await this.find('owed current Push', TICK_PROOF_MS, () =>
-        TelemetryProofs.provingPush(
-          segment.observer.readTranscript({ after: current.index - 1 }),
-          current
-        )
-      )
-      claim.proof = {
-        socketId: open[0].ordinal,
-        get: current.requestKey,
-        push: push.requestKey,
-        owedBy: [...this.owed],
-      }
-      this.claims.proofs.push({
-        tick: command.tick,
-        segment: segment.id,
-        push: push.requestKey,
-        owedBy: [...this.owed],
-      })
-      this.owed.clear()
-    }
+    claim.proof = await this.proveOwed(command.tick)
     this.claims.transitions.push(claim)
     return claim
+  }
+
+  /**
+   * Proves every pending lifecycle or retirement obligation on the current socket.
+   * @param {number} tick schedule row @returns {Promise<object|null>} current Push proof, if owed
+   * @throws {Error} when the current socket has no successful Get or normal Push
+   */
+  async proveOwed(tick) {
+    const segment = this.segments.current()
+    if (!this.owed.size) return null
+    const open = this.tap.telemetry()
+    if (open.length !== 1 || open[0].segment !== segment.id)
+      throw new Error(`${this.kind}: expected one open telemetry socket for the owed proof`)
+    const records = () => segment.observer.readTranscript({ after: 0 })
+    const current = TelemetryProofs.gets(records(), this.uuid)
+      .filter((g) => g.socketId === open[0].ordinal)
+      .at(0)
+    if (!current) throw new Error(`${this.kind}: the current socket has no replacement Get`)
+    const push = await this.find('owed current Push', TICK_PROOF_MS, () =>
+      TelemetryProofs.provingPush(
+        segment.observer.readTranscript({ after: current.index - 1 }),
+        current
+      )
+    )
+    const proof = {
+      socketId: open[0].ordinal,
+      get: current.requestKey,
+      push: push.requestKey,
+      owedBy: [...this.owed],
+    }
+    this.claims.proofs.push({
+      tick,
+      segment: segment.id,
+      push: push.requestKey,
+      owedBy: [...this.owed],
+    })
+    this.owed.clear()
+    return proof
   }
 
   /**
@@ -2732,18 +3314,31 @@ class TelemetryWorker {
       return
     }
     const tick = this.schedule.ticks[command.tick]
-    if (!tick || !tick.actions.map((a) => STAGE_OF[a]).includes(command.stage))
+    if (!tick || !this.schedule.stages(tick).includes(command.stage))
       throw new Error(`A stage the fixed table does not hold: ${command.tick}/${command.stage}`)
-    const startedAt = this.clock.now()
+    if (command.type === 'confirm-fence') {
+      if (command.stage !== 'confirm') throw new Error('Only confirmation stages have a fence')
+      await this.fenceConfirmation(command)
+      return
+    }
+    this.peak?.phase(
+      { lifecycle: 'reopen', retire: 'retire', confirm: 'subscription' }[command.stage],
+      command.tick
+    )
+    const startedAt = command.stage === 'confirm' ? this.confirmation?.receivedAt : this.clock.now()
     if (command.stage === 'lifecycle') await this.reopen(command)
-    else if (command.stage === 'retire') await this.retire(command)
-    else await this.confirm(command)
+    else if (command.stage === 'retire') {
+      await this.retire(command)
+      if (this.schedule.betweenLifecycles) await this.proveOwed(command.tick)
+    } else await this.confirm(command)
     const bucket = this.schedule.measured(tick) ? this.actions.measured : this.actions.warm
     const action = { lifecycle: 'reopen', retire: 'retire', confirm: 'subscription' }[command.stage]
-    bucket[action] += 1
+    bucket[action] += command.stage === 'confirm' ? (command.transitions?.length ?? 1) : 1
+    if (command.stage === 'confirm' && command.transitions) bucket.reopen += 1
     const doneAt = this.clock.now()
     this.stages.push({ tick: command.tick, stage: command.stage, startedAt, doneAt })
     this.send({ type: 'stage-done', tick: command.tick, stage: command.stage, startedAt, doneAt })
+    this.peak?.phase('active')
   }
 
   /**
@@ -2759,13 +3354,19 @@ class TelemetryWorker {
     if (ms !== warmupMs + measureMs) throw new Error('Telemetry churn runs its fixed 360000 ms')
     const errors = []
     this.timing.phaseAt = this.sampler.phaseStartedAt
+    this.peak?.window(this.timing.phaseAt, this.limits.warmupMs)
+    this.peak?.phase('await-go')
     this.send({ type: 'phase', at: this.timing.phaseAt, uuid: this.uuid })
     try {
       await this.inbox.take((m) => m.type === 'go')
       this.timing.goAt = this.clock.now()
+      this.peak?.phase('begin')
       await this.begin()
+      this.peak?.phase('active')
       for (;;) {
-        const command = await this.inbox.take((m) => ['stage', 'corpus', 'finish'].includes(m.type))
+        const command = await this.inbox.take((m) =>
+          ['confirm-fence', 'stage', 'corpus', 'finish'].includes(m.type)
+        )
         if (command.type === 'finish') break
         await this.handle(command)
       }
@@ -2793,6 +3394,7 @@ class TelemetryWorker {
         errors.push(error)
       }
     }
+    this.peak?.phase('cleanup')
     this.timing.boundaryAt = this.clock.now()
     this.timing.measurementMs = this.timing.boundaryAt - this.timing.phaseAt - this.limits.warmupMs
     await attempt(() => this.sampler.endSampling())
@@ -2893,7 +3495,7 @@ class TelemetryWorker {
 class FrameCounter {
   /** @param {Function} inner the underlying socket factory */
   constructor(inner) {
-    const chaos = createChaosSocketFactory(inner)
+    const chaos = createChaosSocketFactory(inner, { retainClosed: false })
     this.frames = 0
     this.open = 0
     this.factory = (options) => this.track(chaos(options))
@@ -2976,7 +3578,8 @@ const runCatalogue = async (client, manifest, prefix, now) => {
  * The telemetry-disabled reference of one worker: the same kind, process, loaded modules, topic
  * and resident subscription as the enabled client, running the frozen foreground catalogue between
  * two settled readings that bracket it at the same idle resident state, then a complete release
- * before the enabled client exists. It performs no telemetry work and proves that.
+ * before the enabled client exists. The five-minute lane warms the catalogue and its idle window
+ * before c0, recording those outcomes separately. It performs no telemetry work and proves that.
  */
 class ReferenceControl {
   /**
@@ -2988,6 +3591,7 @@ class ReferenceControl {
    * @param {(ms:number)=>Promise<void>} [options.sleep] real delay
    * @param {function():void} [options.gc] a full collection, `global.gc` by default
    * @param {function():number} [options.collections] collections the engine reported so far
+   * @param {EngineCodeJournal|null} [options.engine] takes the code sizes of each settled reading
    */
   constructor({
     kind,
@@ -3000,6 +3604,7 @@ class ReferenceControl {
     sleep = wait,
     gc = globalThis.gc,
     collections = () => 0,
+    engine = null,
   }) {
     Object.assign(this, {
       kind,
@@ -3012,13 +3617,15 @@ class ReferenceControl {
       sleep,
       gc,
       collections,
+      engine,
     })
     this.manifest = controlManifest(kind, config)
   }
 
   /**
    * @returns {Promise<object>} the control facts: the frozen manifest and every outcome, both
-   *   settled readings bracketing the catalogue, the release reading, the telemetry frames it sent
+   *   settled readings bracketing the catalogue, the five-minute warm-up outcomes and idle times,
+   *   the release reading, the telemetry frames it sent
    *   (none), the sockets and handles it left (none)
    * @throws {Error} a failed foreground operation or a control that is still holding something
    */
@@ -3029,6 +3636,7 @@ class ReferenceControl {
       pause: (ms) => this.sleep(ms),
       now: () => clock.now(),
       collections: this.collections,
+      engine: this.engine,
     }
     const counter = new FrameCounter(this.socketFactory)
     return this.resources.as('fixture:control', async () => {
@@ -3057,6 +3665,7 @@ class ReferenceControl {
                 })
       let c0
       let c1
+      let warmup
       let outcomes = []
       try {
         await client.connect()
@@ -3068,7 +3677,23 @@ class ReferenceControl {
           await client.subscribe({ topics: [manifest.topic] })
           await client.run({ eachMessage: async () => {} })
         }
-        await this.sleep(CONTROL.idleMs)
+        if (SCENARIO === 'telemetry-churn') {
+          warmup = { startedAt: clock.now() }
+          warmup.outcomes = await runCatalogue(
+            client,
+            manifest,
+            `${config.stem}:ctl-warmup`,
+            io.now
+          )
+          warmup.idleStartedAt = clock.now()
+        }
+        const warmupIdleMs = CONTROL.idleMs * (warmup && kind === 'shareConsumer' ? 5 : 1)
+        await this.sleep(warmupIdleMs)
+        if (warmup) {
+          // A timer may fire a fraction of a millisecond early against this clock.
+          while (clock.now() - warmup.idleStartedAt < warmupIdleMs) await this.sleep(1)
+          warmup.completedAt = clock.now()
+        }
         c0 = await settledReading('c0', io)
         outcomes = await runCatalogue(client, manifest, `${config.stem}:ctl-off`, io.now)
         await this.sleep(CONTROL.idleMs)
@@ -3088,6 +3713,7 @@ class ReferenceControl {
         kind,
         manifest,
         outcomes,
+        ...(warmup && { warmup }),
         catalogue: manifest.operations.length,
         telemetryFrames: counter.frames,
         openSockets: counter.open,
@@ -3409,9 +4035,11 @@ class TelemetryChurn {
 
   /**
    * The fixed tick catalogue. At every tick the stages run in order and are joined across all four
-   * workers: close and immediate connect, then telemetry retirement, then the parent's set and
-   * readback followed by every worker's selection confirmation. A tick that is more than the late
-   * bound behind is a missed tick and is never caught up.
+   * workers. In the five-minute lane, each confirmation fence closes its public lifecycle; every
+   * original set/readback in the batch then precedes the reconnect and confirmation, followed by
+   * any scheduled telemetry retirement. The final confirmation's budget is capped at the absolute
+   * measurement end. The long-window lane retains its original stage order and budgets. A tick
+   * more than the late bound behind is a missed tick and is never caught up.
    * @param {number} epoch the monotonic reading at which the schedule began
    * @param {TelemetrySchedule} schedule the fixed catalogue @returns {Promise<void>} after the last tick
    * @throws {Error} a missed measured tick, a stage over its bound or a failed set
@@ -3436,43 +4064,91 @@ class TelemetryChurn {
       this.tickStarts.push({ tick: tick.number, at: tick.at, beganAt })
       for (const stage of schedule.stages(tick)) {
         this.guard()
-        if (stage === 'confirm') {
-          const requestedAt = this.clock.now()
-          const rotation = await within(
-            this.own(this.fixture.rotate(tick.index, schedule.selection(tick.index))),
-            STAGE_MS.confirm - 1000,
-            'The subscription set and readback'
-          )
-          this.rotations.push({ tick: tick.number, requestedAt, ...rotation })
-        }
         const sentAt = this.clock.now()
-        for (const kind of KINDS)
-          this.processes.send(kind, {
-            type: 'stage',
-            tick: tick.number,
-            stage,
-            index: tick.index,
-            selection: schedule.selection(tick.index),
-          })
+        const capped =
+          schedule.betweenLifecycles && tick === schedule.ticks.at(-1) && stage === 'confirm'
+        const deadline = Math.min(
+          sentAt + STAGE_MS[stage],
+          capped ? epoch + schedule.endMs : Infinity
+        )
+        const remaining = () => {
+          const left = deadline - this.clock.now()
+          if (capped && left <= 0)
+            throw new Error(`The ${stage} stage of tick ${tick.number} exhausted its budget`)
+          return Math.max(0, left)
+        }
+        const command = {
+          tick: tick.number,
+          stage,
+          index: tick.index,
+          selection: schedule.selection(tick.index),
+          ...(tick.transitions && { transitions: tick.transitions }),
+        }
+        let fences = null
+        if (stage === 'confirm') {
+          if (capped) remaining()
+          for (const kind of KINDS) this.processes.send(kind, { type: 'confirm-fence', ...command })
+          fences = await Promise.race([
+            Promise.all(
+              KINDS.map((kind) =>
+                this.processes.until(
+                  kind,
+                  (m) => m.type === 'confirm-fenced' && m.tick === tick.number,
+                  remaining(),
+                  `confirmation fence of tick ${tick.number}`
+                )
+              )
+            ),
+            this.abort,
+          ])
+          for (const index of tick.transitions ?? [tick.index]) {
+            const requestedAt = this.clock.now()
+            const rotation = await this.own(
+              this.fixture.rotate(
+                index,
+                schedule.selection(index),
+                Math.min(STAGE_MS.confirm - 1000, remaining())
+              )
+            )
+            this.rotations.push({ tick: tick.number, requestedAt, ...rotation })
+          }
+        }
+        if (capped) remaining()
+        const releasedAt = this.clock.now()
+        for (const kind of KINDS) this.processes.send(kind, { type: 'stage', ...command })
         const done = await Promise.race([
           Promise.all(
             KINDS.map((kind) =>
               this.processes.until(
                 kind,
                 (m) => m.type === 'stage-done' && m.tick === tick.number && m.stage === stage,
-                STAGE_MS[stage],
+                remaining(),
                 `${stage} of tick ${tick.number}`
               )
             )
           ),
           this.abort,
         ])
+        if (
+          capped &&
+          (this.clock.now() > deadline || done.some((message) => message.parentAt > deadline))
+        )
+          throw new Error(`The ${stage} stage of tick ${tick.number} exhausted its budget`)
         done.forEach((message, position) =>
           this.stages.push({
             tick: tick.number,
             stage,
             kind: KINDS[position],
             sentAt,
+            ...(fences && {
+              releasedAt,
+              fence: {
+                parentAt: fences[position].parentAt,
+                receivedAt: fences[position].receivedAt,
+                after: fences[position].after,
+                segment: fences[position].segment,
+              },
+            }),
             parentAt: message.parentAt,
             workerStartedAt: message.startedAt,
             workerDoneAt: message.doneAt,
@@ -3658,7 +4334,12 @@ class TelemetryChurn {
       }
       const exit = shutdown.exits[result.kind] ?? {}
       const input = { ...result.input, clientCount: 1 }
-      const evaluated = this.verdict(input)
+      const resourceVerdict = this.verdict(input)
+      const evaluated = JournalConstancy.apply(resourceVerdict, input)
+      const beside = {
+        ...(result.shadow && { shadow: result.shadow }),
+        ...(result.seed && { seed: result.seed }),
+      }
       workers.push({
         kind: result.kind,
         input,
@@ -3666,6 +4347,7 @@ class TelemetryChurn {
         exit,
         uuid: result.uuid,
         facts: result.facts,
+        ...beside,
       })
       this.record({
         kind: 'resource-verdict',
@@ -3674,6 +4356,7 @@ class TelemetryChurn {
         uuid: result.uuid,
         input,
         result: evaluated,
+        ...beside,
       })
       this.record({ ...exit, kind: 'natural-exit', clientKind: result.kind })
       if (!evaluated.ok)
@@ -3709,8 +4392,10 @@ class TelemetryChurn {
                 (s) => s.tick === tick.number && s.stage === stage && s.kind === kind
               )
             )
-          )
-            measured[unit[stage]] += 1
+          ) {
+            measured[unit[stage]] += stage === 'confirm' ? (tick.transitions?.length ?? 1) : 1
+            if (stage === 'confirm' && tick.transitions) measured.reopen += 1
+          }
     for (const action of Object.keys(need))
       if (measured[action] < need[action] || measured[action] < MINIMUMS[action])
         violations.push(`measured ${action} stages ${measured[action]} of ${need[action]}`)
@@ -3776,6 +4461,7 @@ class TelemetryChurn {
       sealed: failure?.facts?.sealed ?? progress.filter((m) => m.sealed).map((m) => m.sealed),
       rows: progress.filter((m) => m.row).map((m) => m.row),
       failures: failure?.failures ?? [],
+      ...(failure?.shadow && { shadow: failure.shadow }),
       exit,
     }
   }
@@ -3922,6 +4608,31 @@ class TelemetryWorkerProcess {
   }
 
   /**
+   * The seeded control of this worker, selected by the environment.
+   * @returns {LiveSeed|null} the seed that retains through the product `Kafka` class, or null
+   * @throws {Error} for an unknown seed mode
+   */
+  seeded() {
+    return LiveSeed.of(this.env[LIVE_SEED.env], {
+      root: this.soak.Kafka,
+      limits: this.soak.TELEMETRY,
+    })
+  }
+
+  /**
+   * Forwards one soak row to the parent. The row of a scheduled sample also retains the seeded
+   * control's buffer for the interval that follows it, so the next reading carries it.
+   * @param {object} row a soak row @param {LiveSeed|null} seed the seeded control, if any
+   * @returns {void}
+   */
+  progress(row, seed) {
+    if (row.kind === 'baseline') this.peak?.phase('M')
+    if (row.kind === 'teardown') this.peak?.phase('closed')
+    this.send({ type: 'progress', row })
+    if (row.kind === 'sample') seed?.retain()
+  }
+
+  /**
    * Builds the one public client of this kind with telemetry on.
    * @param {object} kafka the instrumented `Kafka` @param {object} config the parent's configuration
    * @returns {object} the public client
@@ -3944,12 +4655,13 @@ class TelemetryWorkerProcess {
 
   /**
    * @param {object} parts what the reference holds when the run is judged
+   * @param {EngineCodeJournal} [parts.engine] takes the code sizes of the final reading
    * @returns {object} the replayable reference facts: source and capability, every reading, the
    *   control with its frozen catalogue, the enabled replay of that catalogue, the native work
    *   journal and its sampler, and the host before the control, at the boundary and after the run
    */
-  reference({ loaded, control, host, memory, journal, sampler, foreground }) {
-    return {
+  reference({ loaded, control, host, memory, journal, sampler, foreground, allocation, engine }) {
+    const reference = {
       version: 'rss-reference-2',
       source: memory.source ? 'proc-status-vmhwm' : null,
       units: 'bytes',
@@ -3958,10 +4670,30 @@ class TelemetryWorkerProcess {
       loaded,
       control,
       foreground,
+      journals: {
+        version: 2,
+        allocationBeforeControl: [
+          'native',
+          'pending-windows',
+          'memory-samples',
+          'engine-code',
+          ...(this.soak.TELEMETRY?.heapSpaceRows ? ['heap-spaces'] : []),
+          'ordinary',
+          ...(this.kind === 'shareConsumer' ? ['share'] : []),
+        ],
+        allocationAfterControlBeforeM: [],
+        allocation,
+        capacities: journalLimits(this.soak.TELEMETRY),
+        setupAllowanceBytes: this.soak.TelemetryResourceVerdict.setupAllowance(this.kind),
+        rssEffect:
+          'All journal backing storage is touched before c0 and held through closed. It is included in the disabled RSS baseline, the setup allowance and the 160 MiB absolute peak. The setup allowance is 96 MiB, plus for the share consumer its exact declared journal bytes; no bytes are subtracted from any reading.',
+      },
       native: { journal: journal.summary(), sampler: sampler.summary() },
       final: readMemory('final', () => this.clock.now()),
       host: { ...host, after: hostContext(() => this.clock.now()) },
     }
+    engine?.record(reference.final)
+    return reference
   }
 
   /**
@@ -3998,14 +4730,29 @@ class TelemetryWorkerProcess {
     this.send({ type: 'hello', ...this.stamps() })
     const resources = new ProcessResources()
     const memory = new ProcessMemory({ now: () => this.clock.now() })
+    const storage = journalLimits(soak.TELEMETRY)
+    const sampleJournal = new FixedJournal({
+      name: 'memory samples',
+      capacity: storage.samples,
+      bytes: storage.sampleBytes,
+    })
+    const engine = new EngineCodeJournal({ capacity: soak.TELEMETRY?.engineRows })
+    const heapSpaces = soak.TELEMETRY?.heapSpaceRows
+      ? new HeapSpaceJournal({ capacity: soak.TELEMETRY.heapSpaceRows })
+      : null
+    const nativeRows = soak.TELEMETRY?.nativeRows ?? NATIVE_ROWS
     const sampler = new PendingSampler(memory, {
+      capacity: nativeRows,
       set: (fn, ms) => resources.as('fixture:native-sampler', () => setInterval(fn, ms)),
     })
+    const peak = soak.sharePeak?.({ sampler, limits: soak.TELEMETRY }) ?? null
+    this.peak = peak
     let segments = null
     const journal = new NativeJournal({
       memory,
       sampler,
-      capacity: NATIVE_ROWS,
+      capacity: nativeRows,
+      fixed: true,
       epoch: () => segments?.current().index ?? 0,
     })
     const target = (work) => resources.as('target', work)
@@ -4013,11 +4760,43 @@ class TelemetryWorkerProcess {
     let failure
     let failed = false
     let worker = null
+    let seed = null
     try {
       const config = await this.inbox.take((m) => m.type === 'config')
+      seed = this.seeded()
+      const schedule = new TelemetrySchedule(soak.TELEMETRY)
+      const ledger =
+        kind === 'shareConsumer'
+          ? new ShareLedger({ group: config.group, clock: this.clock, storage })
+          : null
+      const ordinary = new OrdinaryWork({
+        kind,
+        client: null,
+        stem: config.stem,
+        topic: config.topic,
+        ctl: config.ctl,
+        clock: this.clock,
+        sleep: this.sleep,
+        ledger,
+        slots: schedule.corpusSlots(),
+        storage,
+      })
+      const allocation = journalState([
+        ordinary,
+        ...(ledger ? [ledger] : []),
+        journal,
+        sampler,
+        sampleJournal,
+        engine,
+        ...(heapSpaces ? [heapSpaces] : []),
+      ])
       resources.start()
+      if (peak) resources.as('fixture:share-peak', () => peak.start())
+      peak?.phase('loaded')
       const loaded = readMemory('loaded', () => this.clock.now())
+      engine.record(loaded)
       const host = { before: hostContext(() => this.clock.now()) }
+      peak?.phase('control')
       const control = await new ReferenceControl({
         kind,
         config,
@@ -4028,14 +4807,12 @@ class TelemetryWorkerProcess {
         clock: this.clock,
         sleep: this.sleep,
         collections: () => memory.collections,
+        engine,
       }).run()
+      peak?.phase('setup')
       host.boundary = hostContext(() => this.clock.now())
       journal.observe('gzip', gzipCodec)
       journal.observe('zstd', zstdCodec)
-      const ledger =
-        kind === 'shareConsumer'
-          ? new ShareLedger({ group: config.group, clock: this.clock })
-          : null
       segments = TelemetrySegments.ordinary(SCENARIO, kind, {
         directory: config.directory,
         clock: this.clock,
@@ -4044,6 +4821,7 @@ class TelemetryWorkerProcess {
           mode: 'configured',
           decoder: (raw) => this.askDecode(raw),
           completeStream: false,
+          sinkBytes: soak.TELEMETRY.sinkBytes ?? CHURN_SINK_BYTES,
           consumed: new Set(),
         },
       })
@@ -4058,14 +4836,18 @@ class TelemetryWorkerProcess {
         { publicOnly: true, memory: true, identities: () => resources.identities() }
       )
       const client = this.create(kafka, config)
-      const schedule = new TelemetrySchedule(soak.TELEMETRY)
+      ordinary.client = client
       const owned = segments
-      worker = new TelemetryWorker({
+      const WorkerRegistry = soak.SharePeakRegistry ?? Registry
+      const Worker = soak.SharePeakWorker ?? TelemetryWorker
+      worker = new Worker({
         kind,
         client,
         tap,
         segments,
-        registry: new Registry(client, kind, DESCRIPTORS, this.clock, () => writeFence(owned)),
+        registry: new WorkerRegistry(client, kind, DESCRIPTORS, this.clock, () =>
+          writeFence(owned)
+        ),
         clock: this.clock,
         sleep: this.sleep,
         limits: soak.TELEMETRY,
@@ -4075,17 +4857,8 @@ class TelemetryWorkerProcess {
         target,
         ledger,
         foreground: { manifest: control.manifest, prefix: `${config.stem}:ctl-on` },
-        ordinary: new OrdinaryWork({
-          kind,
-          client,
-          stem: config.stem,
-          topic: config.topic,
-          ctl: config.ctl,
-          clock: this.clock,
-          sleep: this.sleep,
-          ledger,
-          slots: schedule.corpusSlots(),
-        }),
+        ordinary,
+        peak,
       })
       const uuid = await worker.prepare()
       const measured = {
@@ -4097,6 +4870,8 @@ class TelemetryWorkerProcess {
           await new Promise((resolve) => setImmediate(resolve))
           await new Promise((resolve) => setImmediate(resolve))
           const reading = readMemory('settled', () => this.clock.now())
+          engine.record(reading)
+          heapSpaces?.record(reading, memory.collections)
           return {
             ...snapshot,
             memory: snapshot.memory && {
@@ -4106,10 +4881,31 @@ class TelemetryWorkerProcess {
               gc: { admittedAt, completedAt: reading.at, observed: memory.collections - before },
             },
             registryDigest: worker.registry.digest(uuid),
+            journals: {
+              ...journalState([
+                worker.ordinary,
+                ...(ledger ? [ledger] : []),
+                journal,
+                sampler,
+                sampleJournal,
+                engine,
+                ...(heapSpaces ? [heapSpaces] : []),
+              ]),
+              owners: {
+                ordinary: worker.ordinary.journalState(),
+                ...(ledger ? { share: ledger.journalState() } : {}),
+                native: journal.journalState(),
+                pendingWindows: sampler.journalState(),
+                samples: sampleJournal.journalState(),
+                engine: engine.journalState(),
+                ...(heapSpaces ? { heapSpaces: heapSpaces.journalState() } : {}),
+              },
+            },
           }
         },
       }
       let input
+      let shadow = null
       const judge = (run) => {
         sampler.stop()
         journal.restoreAll()
@@ -4133,10 +4929,26 @@ class TelemetryWorkerProcess {
             journal,
             sampler,
             foreground: worker.claims.foreground,
+            allocation,
+            engine,
           }),
           sampler: { skipped: run.skipped, readFailures: run.readFailures },
+          ...((peak || soak.TELEMETRY?.diagnostic) && {
+            diagnostic: true,
+            acceptanceEligible: false,
+          }),
         }
-        return soak.TelemetryResourceVerdict.evaluate(input)
+        const judged = JournalConstancy.apply(soak.TelemetryResourceVerdict.evaluate(input), input)
+        if (peak) {
+          peak.phase('final')
+          peak.stop()
+        }
+        shadow = {
+          ...engine.report(input.samples),
+          ...(peak && { sharePeak: peak.report() }),
+          ...(heapSpaces && { heapSpaces: heapSpaces.values() }),
+        }
+        return judged
       }
       const soakRun = new soak.Soak({
         kafka,
@@ -4145,10 +4957,11 @@ class TelemetryWorkerProcess {
         context: { telemetryChurn: worker },
         sampleMs: soak.TELEMETRY.sampleMs,
         sampleAt: soak.TELEMETRY.sampleAt,
+        sampleJournal,
         warmupMs: soak.TELEMETRY.warmupMs,
         judge: (run) =>
           judge({ ...run, skipped: soakRun.skipped, readFailures: soakRun.readFailures }),
-        record: (row) => this.send({ type: 'progress', row }),
+        record: (row) => this.progress(row, seed),
         workloads: soak.WORKLOADS,
         clock: this.clock,
       })
@@ -4164,6 +4977,8 @@ class TelemetryWorkerProcess {
           verdict,
           input,
           facts: worker.facts(),
+          shadow,
+          seed: seed?.summary() ?? null,
         },
         { flush: true }
       )
@@ -4182,10 +4997,12 @@ class TelemetryWorkerProcess {
       } catch (factError) {
         causes.push(factError)
       }
+      peak?.stop()
       await this.send(
         {
           type: 'failure',
           facts,
+          ...(peak && { shadow: { sharePeak: peak.report() } }),
           native: { journal: journal.summary(), sampler: sampler.summary() },
           failures: causes.map((cause) => ({
             name: cause?.name ?? typeof cause,
@@ -4199,6 +5016,7 @@ class TelemetryWorkerProcess {
         { flush: true }
       )
     } finally {
+      peak?.stop()
       sampler.stop()
       journal.restoreAll()
       memory.stop()
@@ -4211,7 +5029,13 @@ class TelemetryWorkerProcess {
 }
 
 module.exports = {
+  FixedJournal,
+  JournalConstancy,
+  declaredJournalBytes,
+  journalLimits,
   KINDS,
+  NATIVE_ROWS,
+  SHARE_ROW_BYTES,
   SCENARIO,
   SCHEDULE_STEPS: STEPS,
   MINIMUMS,
@@ -4224,6 +5048,7 @@ module.exports = {
   WORKER_TOKEN,
   SUBSCRIPTIONS,
   DecoderCoordinator,
+  EngineCodeJournal,
   FrameCounter,
   Inbox,
   OrdinaryOracle,
@@ -4242,6 +5067,7 @@ module.exports = {
   TelemetryTap,
   TelemetryWorker,
   TelemetryWorkerProcess,
+  WORKER_FLAGS,
   checkLog,
   compactRuns,
   controlManifest,

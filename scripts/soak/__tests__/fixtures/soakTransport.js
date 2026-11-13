@@ -1,6 +1,7 @@
 const { EventEmitter } = require('events')
+const { reply } = require('./soakReplies')
 const Encoder = require('../../../../src/protocol/encoder')
-const { requestHeaderVersion } = require('../../../../src/protocol/headers')
+const { responseHeaderVersion, requestHeaderVersion } = require('../../../../src/protocol/headers')
 
 /** Scripted external I/O boundary; requests use product encoders and the original passive tap. */
 class SoakTransport {
@@ -17,9 +18,10 @@ class SoakTransport {
    * @param {object} socket Original scripted stream.
    * @param {object} request Product request descriptor.
    * @param {number} [errorCode=0] Negotiation outcome for ApiVersions.
+   * @param {object} [values] Literal upstream fields from the scripted external result.
    * @returns {Promise<void>} Complete observed exchange.
    */
-  async exchange(socket, request, errorCode = 0) {
+  async exchange(socket, request, errorCode = 0, values = {}) {
     const correlation = ++this.correlation
     const header = new Encoder()
       .writeInt16(request.apiKey)
@@ -29,7 +31,45 @@ class SoakTransport {
     if (requestHeaderVersion(request.apiKey, request.apiVersion) === 2) header.writeTaggedFields()
     header.writeEncoder(await request.encode())
     socket.write(new Encoder().writeInt32(header.size()).writeEncoder(header).buffer)
-    const response = new Encoder().writeInt32(correlation).writeInt16(errorCode)
+    const response = new Encoder().writeInt32(correlation)
+    if (request.apiKey === 18) {
+      if (errorCode)
+        response.writeInt16(errorCode).writeInt32(1).writeInt16(18).writeInt16(0).writeInt16(4)
+      else
+        response.writeBuffer(
+          require('../../../../testHelpers/wire/apiVersionsV4').buildResponse({
+            apiKeys: [
+              [0, 9],
+              [1, 12],
+              [2, 7],
+              [3, 13],
+              [10, 6],
+              [16, 5],
+              [18, 4],
+              [19, 7],
+              [20, 6],
+              [22, 4],
+              [32, 4],
+              [42, 2],
+              [44, 1],
+              [60, 2],
+              [76, 1],
+              [77, 1],
+              [78, 2],
+              [79, 2],
+              [90, 1],
+            ].map(([apiKey, version]) => ({ apiKey, minVersion: version, maxVersion: version })),
+            finalizedFeatures: [{ name: 'share.version', minVersionLevel: 1, maxVersionLevel: 1 }],
+          })
+        )
+    } else {
+      if (responseHeaderVersion(request.apiKey, request.apiVersion) === 1)
+        response.writeTaggedFields()
+      const api = Object.entries(require('../../../../src/protocol/requests/apiKeys')).find(
+        ([, key]) => key === request.apiKey
+      )[0]
+      response.writeBuffer(reply(api, request.apiVersion, values))
+    }
     socket.emit('data', new Encoder().writeInt32(response.size()).writeEncoder(response).buffer)
   }
 
@@ -71,8 +111,10 @@ class SoakTransport {
               }
               try {
                 const request = descriptor(name, args)
-                if (request) await this.exchange(socket, request)
-                return await work(...args)
+                const result = await work(...args)
+                if (request)
+                  await this.exchange(socket, request, 0, this.resultFields(name, args, result))
+                return result
               } finally {
                 if (name === 'disconnect' || role === 'raw') close()
               }
@@ -80,6 +122,137 @@ class SoakTransport {
       ])
     )
     return this.tap.client(role, observed)
+  }
+
+  /**
+   * Projects the external operation's actual result into upstream response field names.
+   * @param {string} name Public operation.
+   * @param {any[]} args Original call arguments.
+   * @param {*} result Scripted broker result.
+   * @returns {object} Literal upstream fields; failed operations never reach this method.
+   */
+  resultFields(name, [options], result) {
+    if (name === 'describeCluster')
+      return {
+        Brokers: result.brokers.map((b) => ({
+          [options?.includeAuthorizedOperations || options?.includeFencedBrokers
+            ? 'BrokerId'
+            : 'NodeId']: b.nodeId,
+          Host: b.host,
+          Port: b.port,
+        })),
+      }
+    if (name === 'fetchTopicMetadata' || name === 'listTopics')
+      return {
+        Topics: (name === 'listTopics'
+          ? result.map((name) => ({ name, partitions: [] }))
+          : result.topics
+        ).map((t) => ({
+          Name: t.name,
+          TopicId: t.topicId,
+          Partitions: t.partitions.map((p) => ({
+            PartitionIndex: p.partitionId,
+            LeaderId: p.leader,
+            ReplicaNodes: [...p.replicas],
+          })),
+        })),
+      }
+    if (name === 'listGroups') return { Groups: result.groups.map((g) => ({ GroupId: g.groupId })) }
+    if (name === 'describeConfigs')
+      return {
+        Results: result.resources.map((r) => ({
+          ErrorCode: r.errorCode,
+          ResourceType: r.resourceType,
+          ResourceName: r.resourceName,
+          Configs: r.configEntries.map((e) => ({
+            Name: e.configName,
+            Value: e.configValue,
+            ConfigSource: e.configSource,
+          })),
+        })),
+      }
+    if (name === 'incrementalAlterConfigs')
+      return {
+        Responses: options.resources.map((r, i) => ({
+          ErrorCode: result.resources[i].errorCode,
+          ResourceType: r.type,
+          ResourceName: r.name,
+        })),
+      }
+    if (name === 'send')
+      return {
+        Responses: [
+          {
+            Name: options.topic,
+            PartitionResponses: result.map((r) => ({
+              Index: r.partition,
+              ErrorCode: r.errorCode,
+              BaseOffset: r.baseOffset,
+            })),
+          },
+        ],
+      }
+    if (name === 'deleteGroups') return { Results: options.map((GroupId) => ({ GroupId })) }
+    if (name === 'createTopics')
+      return {
+        Topics: options.topics.map((t) => ({
+          Name: t.topic,
+          NumPartitions: 3,
+          ReplicationFactor: 3,
+        })),
+      }
+    if (name === 'deleteTopics') return { Responses: options.topics.map((Name) => ({ Name })) }
+    if (name === 'fetchTopicOffsets')
+      return {
+        Topics: [
+          {
+            Name: options,
+            Partitions: result.map((r) => ({
+              PartitionIndex: r.partition,
+              Offset: r.high,
+              LeaderEpoch: 1,
+            })),
+          },
+        ],
+      }
+    if (name === 'listShareGroupOffsets')
+      return {
+        Groups: [
+          {
+            GroupId: options.groupId,
+            Topics: result.map((t) => ({
+              TopicName: t.topic,
+              TopicId: t.topicId,
+              Partitions: t.partitions.map((p) => ({
+                PartitionIndex: p.partition,
+                StartOffset: p.startOffset,
+                Lag: p.lag,
+                LeaderEpoch: p.leaderEpoch,
+                ErrorCode: p.errorCode,
+              })),
+            })),
+          },
+        ],
+      }
+    if (name === 'describeShareGroups')
+      return {
+        Groups: result.groups.map((g) => ({
+          ErrorCode: g.errorCode,
+          GroupId: g.groupId,
+          GroupState: g.state,
+          Members: g.members.map((m) => ({
+            MemberId: m.memberId,
+            Assignment: {
+              TopicPartitions: m.assignment.map((t) => ({
+                TopicId: t.topicId,
+                TopicName: t.topic,
+                Partitions: [...t.partitions],
+              })),
+            },
+          })),
+        })),
+      }
+    return {}
   }
 
   /**
@@ -94,7 +267,16 @@ class SoakTransport {
       deleteTopics: ['deleteTopics/v6', options],
       listTopics: ['metadata/v13', { topics: [] }],
       fetchTopicMetadata: ['metadata/v13', { topics: [], ...options }],
-      describeCluster: ['describeCluster/v2', options],
+      describeCluster:
+        options?.includeAuthorizedOperations || options?.includeFencedBrokers
+          ? [
+              'describeCluster/v2',
+              {
+                includeClusterAuthorizedOperations: options.includeAuthorizedOperations,
+                includeFencedBrokers: options.includeFencedBrokers,
+              },
+            ]
+          : ['metadata/v13', { topics: [] }],
       listGroups: ['listGroups/v5', options],
       deleteGroups: ['deleteGroups/v2', options],
       describeShareGroups: ['shareGroupDescribe/v1', { groupIds: options }],
@@ -173,13 +355,22 @@ class SoakTransport {
    * @returns {Function} Observed reader with unchanged data.
    */
   reader(read) {
-    return this.client('raw', { readLog: read }, () =>
+    return this.client('raw', { readLog: read }, (_name, [options]) =>
       require('../../../../src/protocol/requests/fetch/v12/request')({
         replicaId: -1,
         maxWaitTime: 0,
         minBytes: 1,
         maxBytes: 1048576,
-        topics: [],
+        topics: [
+          {
+            topic: options.topic,
+            partitions: [0, 1, 2].map((partition) => ({
+              partition,
+              fetchOffset: '0',
+              maxBytes: 1048576,
+            })),
+          },
+        ],
       })
     ).readLog
   }

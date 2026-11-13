@@ -31,6 +31,13 @@ const SCHEDULES = Object.freeze({
     extras: Object.freeze([]),
     name: (kind, index) => `${kind}-lc-${index}`,
   }),
+  'telemetry-long-window': Object.freeze({
+    kinds: Object.freeze(['producer', 'consumer', 'admin', 'shareConsumer']),
+    perKind: 23,
+    cap: 32,
+    extras: Object.freeze([]),
+    name: (kind, index) => `${kind}-lw-${index}`,
+  }),
 })
 
 /**
@@ -343,14 +350,16 @@ class TelemetrySegments {
 
   /**
    * Replaces the lifecycle: selects the next segment, closes the public client, and calls the same
-   * object's public connect in the close's own continuation, with nothing in between.
+   * object's public connect in the close's continuation. An optional disconnected fence can hold
+   * that continuation; connect remains the next public client action.
    * @param {object} client public client
    * @param {object} [closeOptions] public disconnect arguments
+   * @param {function():Promise<void>} [beforeConnect] optional disconnected fence before the handshake
    * @returns {{from:object,to:object,closed:Promise<void>,reopened:Promise<void>}} both segments,
    *   the disconnect outcome and the connect outcome (which also rejects when the close does)
    * @throws {Error} before touching the client at the cap or the two-segment limit
    */
-  cycle(client, closeOptions) {
+  cycle(client, closeOptions, beforeConnect) {
     const from = this.#active
     const to = this.#create()
     this.#note('select', { from: from.id, to: to.id })
@@ -358,9 +367,10 @@ class TelemetrySegments {
     from.state = 'closing'
     const closed = from.observer.closeClient(client, closeOptions)
     from.closing = closed
-    const reopened = closed.then(() => {
+    const reopened = closed.then(async () => {
       from.state = 'closed'
       this.#note('disconnect-resolved', { from: from.id, to: to.id })
+      if (beforeConnect) await beforeConnect()
       const connecting = client.connect()
       this.#note('connect-called', { from: from.id, to: to.id })
       return connecting
@@ -509,6 +519,7 @@ module.exports = {
   TelemetrySegments,
   checkSegmentFiles,
   packSegment,
+  scheduleOf,
   segmentCatalogue,
   segmentIdentities,
 }

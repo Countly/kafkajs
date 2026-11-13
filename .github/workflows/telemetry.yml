@@ -71,7 +71,7 @@ jobs:
         env:
           TMPDIR: ${{ runner.temp }}
           TELEMETRY_RESOURCES_QUIET: '1'
-        run: timeout -k 10s 1750s node --expose-gc node_modules/jest/bin/jest.js --runInBand --ci --detectOpenHandles --testPathPatterns 'src/telemetry/__tests__/resources\.spec\.js$' --testNamePattern '^(?!.*resource memory for)'
+        run: timeout -k 10s 1750s node --expose-gc node_modules/jest/bin/jest.js --runInBand --ci --detectOpenHandles --reporters=./testHelpers/quietReporter.js --testPathPatterns 'src/telemetry/__tests__/resources\.spec\.js$' --testNamePattern '^(?!.*resource memory for)'
   telemetry:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -126,7 +126,7 @@ jobs:
           TMPDIR: ${{ runner.temp }}
         run: |
           timeout -k 5s 60s bash scripts/e2e/telemetry/test-reporter-order.sh
-          timeout -k 10s 150s npx jest --runInBand --ci --testPathPatterns 'testHelpers/__tests__/telemetryFixtures\.spec\.js$'
+          timeout -k 10s 150s npx jest --runInBand --ci --reporters=./testHelpers/quietReporter.js --testPathPatterns 'testHelpers/__tests__/telemetryFixtures\.spec\.js$'
       - name: Preflight isolated project ownership
         timeout-minutes: 2
         run: timeout -k 5s 90s node scripts/e2e/telemetry/ci.js preflight

@@ -43,11 +43,11 @@ Before scored setup, execute exactly one fixed short-shaped priming pass in the 
 
 Fit post-warm-up heap samples separately inside each scored phase. Independently compare the three disconnected phase-end heaps using their original monotonic observation times, with an additional 98304-byte/minute slope limit. Keep the existing quiet-heap endpoint, resource, source-validity and minimum-sample checks. Do not fit active samples from different phases as one working set.
 
-Share-soak acceptance belongs to the `Memory gates` workflow (`.github/workflows/memory-gates.yml`), which runs on `p9m/` pull requests and manual dispatch. It is required before 3.0.0, not for phase merges. CI jobs replace the local guard for these demonstrations. The workflow currently contains only the short job: `node scripts/ci/naturalExit.js soak` on its own cold Kafka 4.3.1/Node 24 base cluster, with a 35-minute parent step and 55-minute job limit, evidence verification, teardown and artifact upload. The full-profile CI job and the complete independent acceptance validator, including archive-only revalidation and the combined verdict, are still owed to the memory-gates follow-up. The full job must observe the exposed-GC `share-consumer` CLI with a 3000-second child/watchdog, a 51-minute parent step and a 71-minute job limit. The present evidence verifier is not that complete validator. Fresh complete short/full receipts remain required; no passing live heap screen is claimed. See [share soak tooling](ShareSoakTooling.md) for the evidence and acceptance contract.
+Share-soak acceptance belongs to the `Memory gates` workflow (`.github/workflows/memory-gates.yml`), which runs on `p9m/` pull requests and manual dispatch and must pass before 3.0.0. Isolated short/full Kafka 4.3.1/Node 24 base clusters use fixed natural-exit parents with 35/51-minute steps and 55/71-minute original lifecycle limits. Independent validation runs before teardown and again from the sealed artifact; both producer and replay matrices must pass the aggregate verdict. All existing workload, heap, resource, cleanup and priming assertions remain required. Fresh complete CI receipts remain owed; these jobs and controls do not establish a passing memory screen.
 
 The `Memory gates` workflow also runs the single-client public and collector memory arms (`resource memory for`) with stamped artifact validation on Node 22, 24 and 26; the Node 24 retained-ownership diagnostic with its broker-free controls, sixteen serial children and offline analysis; and the entire `telemetry-soak` churn lane on Kafka 4.3.1 and 4.2.2 for each Node 22, 24 and 26, using `docker-compose.telemetry.yml`. The churn lane includes its ordinary/share functional oracles, normal pushes, close-and-reopen proofs and per-worker memory verdicts. Each job retains its own checkout, setup, evidence and upload; the churn job preserves verified fixtures, decoder preparation, evidence verification and owned teardown. All jobs run manually or on pull requests from `p9m/` branches; the follow-up memory PR must pass it before the 3.0.0 release. The whole churn lane is required before 3.0.0 and does not run on phase PRs; the other functional telemetry lanes and non-memory resource schedules remain required there. CI's manual `lanes` input selects comma-separated integration groups (for example, `share-base,admin`), including every broker/Node variant of each group; empty input, pushes and pull requests retain the full matrix.
 
-The local `npm run test:e2e:share-soak` alias is historical and superseded for these demonstrations. Its 2460-second guard cap, the former full guard cap of 3420 seconds, the 2490/3450-second direct-execution contracts and their host accounting are retired for this CI acceptance path; they do not extend its budgets or authorize local acceptance runs.
+The fixed short child also writes `--json --outputFile=.tmp/e2e/share-soak-jest.json`; its only test must pass with no skipped cases. CI uses `node scripts/ci/naturalExit.js soak` and `node scripts/ci/naturalExit.js soak-full`. The local `test:e2e:share-soak` alias and serialized `schedule.lifecycleMs` are historical guard bookkeeping, with no CI timeout or acceptance authority. See [share soak tooling](ShareSoakTooling.md) for original lifecycle admission, fixed budgets, archived primitives, source/platform authentication and the required checks.
 
 Benchmark controls count batch callbacks separately from messages and compare complete record identities. Measured share, record-walk and ordinary-regression benchmark sessions run on CI in a later performance phase, with their declared frame, latency, memory and A/A gates.
 
@@ -407,7 +407,7 @@ The shutdown file selects `close and reopen` separately from `telemetry churn`, 
 
 Under D142, phase-blocking telemetry lanes retain functional wire/decode health, exact cancellation accounting, all 21 shutdown lifecycles per kind, UUID/cache/final-Push semantics, corpus and raw-offset oracles, capability refusals, and explicit absence of API 71/72 requests in negative controls. The `telemetry-verdicts` job in `.github/workflows/memory-gates.yml` reruns outcomes, unsupported and shutdown with the full Node/broker matrix and requires resource acceptance from the same archived transcripts and lifecycle/resource ledgers. Its verdicts cover ordinary/refused-bootstrap socket ownership, enabled/disabled ownership equivalence, observer listeners/sockets/timers, decoder occupancy, undischarged identities and exact quiet-window equality. These verdicts block 3.0.0; they do not block a phase merge. Operational cleanup failures still fail functional lanes. The configured outcomes share oracle has 28000 ms of work and a 30000 ms full envelope, including its 2000 ms local cleanup reserve and full 3000 ms verifier observation; its enclosing case is 188000 ms (158000 ms work, 30000 ms cleanup), within the unchanged 270 s shell bound.
 
-Churn runs a 60-second warm-up and 300-second measurement with at least 10 settled samples, then cleanup within 120 seconds and total 540 seconds. It changes subscriptions every 10 seconds, reconnects telemetry every 30 seconds and closes/reopens publicly every 60 seconds. Four one-client workers prevent memory averaging. Measure heapUsed plus external after two collections; arrayBuffers is already included in external. Compare the same descriptor/UUID population, check exact timer/handle/listener/socket identities and record RSS/native peak separately. Independent durable-record, broker-commit or share-delivery, and handler-invocation identities remain separate oracles.
+Churn runs a 60-second warm-up and 300-second measurement with at least 10 settled samples, then cleanup within 120 seconds and total 540 seconds. It preserves 35 ordered subscription set/readbacks, batched only between public lifecycles, and retires telemetry every 30 seconds. Five public close/reopen boundaries batch all 35 transitions; no scheduled subscription update runs while any worker is active. Four one-client workers prevent memory averaging. Measure heapUsed plus external after two collections; arrayBuffers is already included in external. Compare the same descriptor/UUID population, check exact timer/handle/listener/socket identities and record RSS/native peak separately. Independent durable-record, broker-commit or share-delivery, and handler-invocation identities remain separate oracles.
 
 The single-client memory and native arms of `src/telemetry/__tests__/resources.spec.js` need a quiet host: the `Memory gates` workflow selects those arms alone in its own `resources` job with `TELEMETRY_RESOURCES_QUIET=1`, and the shared unit lane skips those arms.
 
@@ -447,7 +447,9 @@ written before any assertion, and the job uploads the directory even when a step
 
 Telemetry memory is judged as an increment over the disabled control, never as an absolute number. The
 control is read twice (C0 after its first public open and C1 after its last, both connected and idle) after a
-real collection, a 100 ms pause, a second collection and the callbacks of both. Let B be the lower of the two
+real collection, a 100 ms pause, a second collection and the callbacks of both. C0 and C1 may take up to
+twelve collection rounds to settle within 16 KiB; every other reading keeps six, and an unsettled control
+reading stays inconclusive. Let B be the lower of the two
 RSS readings and Eref the lower of the two external readings. The absolute peak is the kernel's nonresetting
 high water of the child, `/proc/self/status` `VmHWM`, read before the first import and at every phase
 boundary through cleanup; the raw `maxRSS` is recorded beside it and never substituted for it or subtracted.
@@ -456,16 +458,32 @@ and settlement included) and of the sampled peak; the external peak is taken the
 
 | Gate | Limit |
 |---|---|
-| Control stability: C1 against C0 | RSS within 2 MiB, heap plus external within 256 KiB |
+| Control stability: C1 against C0 | RSS within 2 MiB, data within 256 KiB |
 | Setup and control absolute peak (through the control's release) | at most 96 MiB |
 | Telemetry RSS peak above the control, P minus B | at most 64 MiB |
 | Whole-arm absolute peak P | at most 160 MiB |
 | External memory peak above the control | at most 64 MiB (`arrayBuffers` is inside external and is never added again) |
-| Heap plus external above the matched disconnected baseline | at most 8 MiB while active, at most 256 KiB once closed |
+| Heap plus external above the matched disconnected baseline | at most 8 MiB while active |
+| Data above the matched disconnected baseline once closed | at most 256 KiB |
+| First use | first use M − M0 ≤ 1 MiB in data |
+| Unseeded closed data | closed data below −256 KiB is recorded as facts, not inconclusive (a decrease is not a leak) |
 
 The matched baseline is a separate reading: the enabled client disconnected with its registered descriptors,
-its UUID and its counters retained. It is not the control, and it supplies only the last row. Native work is
-journaled from the production codec calls (weak-issued job, input and result identities, byte lengths,
+its UUID and its counters retained. It is not the control. In schema 6, control stability and the closed
+ceiling judge Δdata = Δ(heapUsed + external) − Δ(V8 code_and_metadata_size + bytecode_and_metadata_size)
+at the same final settle checkpoint. Raw retained bytes and the engine readings remain recorded, and
+the validator recomputes data from them. Only V8 code and bytecode are excluded; RSS, external, peak
+and active-retention gates keep their original quantities, limits and settle protocol.
+
+Before the matched baseline M, one measured warm-up lifecycle runs the same kind, arm and catalogue,
+then closes and releases it. M0 records the old matched position before that lifecycle; the first-use
+bound measures M minus M0. CI on Node 22/24/26 runs product-root seeds of 131,072 bytes per close
+(at least 512 KiB total), both after warm-up and also during warm-up, and a warm-up-only seed of
+1 MiB + 1. Each must fail its closed or first-use bound. Code-accounting controls distinguish
+compilation from retained arrays, and none of the 24 unseeded arms across those Node lines may exceed
++256 KiB of closed data (a larger decrease is recorded as facts). A static sweep checks production source for dynamic code generation.
+
+Native work is journaled from the production codec calls (weak-issued job, input and result identities, byte lengths,
 distinct backing stores counted once, a reading at each submission and settlement, readings every 20 ms
 while work is pending, and per pending window its first and last reading time, reading count and peaks) and
 at most one job may be occupied at a time. Each window must span its job from submission to settlement, the
@@ -522,15 +540,46 @@ the common end-of-measurement boundary, 538 000 ms inclusive inside the 540 000 
 stamped only after the last cleanup step.
 
 One parent supervises four one-client worker processes (producer, consumer, admin, share consumer). The
-parent owns the fixed tick catalogue: every 10 s a subscription transition, every 30 s a retirement of
-the telemetry socket, every 60 s a public close and immediate reopen of the same object. At every tick
-the stages are joined across all four workers in this order: close and immediate connect, telemetry
-retirement, then the broker set and readback followed by each worker's confirmation. A tick more than
-5 s late fails the run and is never caught up. Each confirmation is a successful Get that carries and
-returns the client's instance ID with exactly the requested prefix list and a 1000 ms interval; a
-lifecycle change also owes a nonempty, nonterminating, accepted Push on the very socket of its
-replacement Get, written strictly after that Get's response. An empty selection keeps the resource and
-polls; it is never deleted into the 300 000 ms fallback.
+parent owns the fixed tick catalogue. The original 35 selections still alternate `com.example.`, empty,
+and `org.apache.kafka.` in order, but run as disconnected batches: transition 1–7 at 70 s, 8–12 at
+135 s, 13–18 at 195 s, 19–24 at 255 s and 25–35 at 350 s.
+The three middle gaps sit halfway between the unchanged 30 s settled-sample slots. All settled samples
+remain judged, including the 60 s and 359 s samples near the unchanged first and last gaps.
+
+| Gap after epoch | Ordered transitions | Retirement before / after |
+| --- | --- | --- |
+| 70 s | 1–7 | 60 / 90 s |
+| 135 s | 8–12 | 120 / 150 s |
+| 195 s | 13–18 | 180 / 210 s |
+| 255 s | 19–24 | 240 / 270 s |
+| 350 s | 25–35 | 330 s / none before measurement ends at 360 s |
+
+These are release slots after the epoch, subject to the existing stage deadlines. A batch first pauses
+and drains admission and closes all four public clients. Only after every disconnected fence arrives
+does the parent apply every set and successful readback in order. It then releases all reconnects;
+connect remains the next public client action. No next lifecycle or handshake can precede those
+readbacks. A tick more than 5 s late fails and is never caught up. The 11 telemetry retirements retain
+their 30 s slots, now separate from every batch; each proves its own recovery Push. Each confirmation
+still joins all set/readbacks, reconnects and owed Push proofs under the unchanged 10 s stage bound.
+The middle gaps have 15 s until the next retirement; the last retains 10 s until measurement ends.
+Confirmations remain serialized with subsequent actions; stage deadlines and the measurement-boundary
+evidence check are unchanged.
+
+There are five public close/reopen cycles, restoring the original cycle count. The first gap at 70 s
+ends on a custom selection for decoded wire proof; the last at 350 s applies the empty selection after
+the final retirement at 330 s, so every retirement still owes a recovery Push. The table now contains
+35 measured subscription transitions, 10 measured retirements and five measured reopens; the first
+retirement remains in warm-up. Giving each transition its own lifecycle would exceed the unchanged
+16-segment cap. Batching preserves the transition count and values, but intermediate selections have
+set/readback proof rather than an
+active Get/Push stream. Each batch's final Get carries and returns the same instance ID, the exact
+requested prefix list and a 1000 ms interval. A nonempty reopened lifecycle owes an accepted normal
+Push after its replacement Get on that socket. An empty selection keeps the resource and polls
+without a Push; it is never deleted into the 300 000 ms fallback. Error 42 remains the only permitted
+churn stream error; an undeclared 117 still fails verification. The in-lifecycle
+117 → Get → filtered Push path remains covered by `src/telemetry/__tests__/subscriptionLive.spec.js`.
+The frozen long-window method keeps its original subscription schedule, identity and readings; only
+the five-minute lane uses these disconnected batches.
 
 Every public lifecycle of a worker is one sealed observer segment (seven per kind: setup, initial and
 five reopens), written as a transcript file and a payload/proof bundle. Every accepted Push keeps its
@@ -557,19 +606,48 @@ behaviour: every offset is accepted exactly once at the broker and publicly, a r
 reason for a second delivery, no accepted record is delivered again, and at each public close the
 handled prefix is accepted and the rest released.
 
+Five-minute workers use exactly
+`--expose-gc --min-semi-space-size=1 --max-semi-space-size=1`; the live-flags journal controls
+use the same flags for comparability. Resource children keep their eager-compilation flags, and
+long-window workers keep `--expose-gc --no-flush-bytecode`.
+
 Memory is judged per worker against its own telemetry-disabled control of the same kind in the same
-process: the telemetry-attributable resident-size peak is at most 64 MiB above the control, the control
-and setup peak at most 96 MiB, the whole worker at most 160 MiB, and the external-memory peak at most
+process. In this five-minute lane the control first runs its catalogue and idle window once before C0:
+10 s (5 × the 2 s control idle) for the share consumer, 2 s for the other kinds, with early timers
+topped up against the monotonic clock. This precedes both control readings; the validator still
+requires at least 2 s, complete fulfilled outcomes and completion before C0. The RSS and retained
+drift limits stay 2 MiB and 256 KiB. The long-window lane keeps its frozen control without this warm-up.
+The telemetry-attributable resident-size peak is at most 64 MiB above the control, the control
+and setup peak at most 96 MiB for producer, consumer and admin. The share consumer's live setup
+allowance is 96 MiB plus its declared journal bytes: 100,663,296 + 23,192,560 = 123,855,856 bytes.
+Its packed journals preserve raw digests and exact int64 offsets losslessly. All journal storage,
+including the 4,096-byte engine code journal, is allocated and touched before the disabled control.
+The allocation and setup allowance are recorded and recomputed by the validator. The whole worker
+stays at most 160 MiB, and the external-memory peak at most
 64 MiB above the control. The peak source is the kernel's lifetime high-water mark of the executable
 image (`/proc/self/status`), read before any application module is loaded and at every phase boundary;
-the raw `maxRSS` is recorded beside it and never subtracted. A control that drifts by more than 2 MiB
-of resident size or 256 KiB of retained heap, a setup above its allowance, a missing collection or peak
-capability, or a noisy host (one-minute load per CPU above 0.75, free memory below 256 MiB, memory
+the raw `maxRSS` is recorded beside it and never subtracted. A control whose resident size grows by more than
+2 MiB (a larger decrease is recorded as a fact) or whose retained heap drifts by more than 256 KiB, a setup above its allowance, a missing collection or peak
+capability, or a noisy host (one-minute load per CPU above 1.0, free memory below 256 MiB, memory
 pressure above 5) makes the measurement inconclusive, with the facts retained; a broken or contradicted
-fact fails. The retained-heap gates are unchanged: at most 8 MiB active and 256 KiB closed above the
-matched disconnected baseline, a slope of at most 64 KiB per minute, last minus first at most 1 MiB,
-and at least ten post-collection readings spanning at least 270 s inside a measurement of at least
-300 s, each recorded with its real admission and completion time.
+fact fails. The resource verifier keeps its load-per-CPU threshold at 0.75.
+This five-minute lane judges at most 8 MiB active above the matched disconnected
+baseline and at least ten post-collection readings spanning at least 270 s inside a measurement of at
+least 300 s, each recorded with its real admission and completion time. The slope (at most 64 KiB per
+minute) and last minus first (at most 1 MiB) are judged by the long-window lane, and memory after close
+by the broker-free resource arms; the five-minute lane no longer judges a closed ceiling. These live retained gates still
+judge heap plus external; the schema 6 data gates and measured warm-up above apply to the broker-free
+resource arms. Every live reading records V8 code bytes in shadow only, with raw, code and data slopes;
+the live acceptance quantities remain unchanged pending the controls and an explicit decision.
+
+The legacy unseeded arm is a contamination-positive control: fixed unseeded must pass, fixed and
+legacy seeded must show both slope and endpoint violations, and legacy consumer/share unseeded must
+show the slope violation (also the endpoint violation whenever its measured value exceeds the limit).
+Producer legacy unseeded is judged by paired slope and endpoint ordering above fixed on the same Node;
+admin legacy is recorded only. The separate live-flags control uses the live worker's exact flags and
+two-collection probe, fixed seeded/unseeded for all four kinds on Node 22/24/26. Its unseeded result
+is recorded only and its seed must show both violations. Legacy evidence is retained. See
+[Telemetry churn journal storage](TelemetryJournals.md) for capacities, roles and the CI job split.
 
 The evidence verifier recomputes everything from the archive instead of trusting a boolean: the fixed
 segment catalogue, every proof, boundary, retirement and transition, the declared proof selection, the

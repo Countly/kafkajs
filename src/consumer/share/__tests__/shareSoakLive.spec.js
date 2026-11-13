@@ -228,14 +228,20 @@ enabled('share consumer short soak', () => {
           ({ memberId, response }) => memberId === verifier.memberId && response?.errorCode === 0
         )
         expect(beats.length).toBeGreaterThan(0)
+        expect(beats.some(({ request }) => request.memberEpoch >= 0)).toBe(true)
         expect(
           beats.every(
-            ({ frames, response, at, answeredAt }) =>
-              response.heartbeatIntervalMs > 0 &&
+            ({ frames, request, response, at, answeredAt }) =>
+              (request.memberEpoch === -1
+                ? response.memberEpoch === -1
+                : response.heartbeatIntervalMs > 0) &&
               answeredAt >= at &&
               frames.some((frame) => frame.apiKey === 76 && typeof frame.responseBytes === 'string')
           )
         ).toBe(true)
+        expect(
+          ShareCycleOracle.departure(verifier.provenance, owner.driver.group, verifier.memberId)
+        ).not.toBeNull()
       }
       expect(new Set(verifiers.map(({ memberId }) => memberId)).size).toBe(31)
       expect(

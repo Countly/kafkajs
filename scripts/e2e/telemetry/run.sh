@@ -72,7 +72,7 @@ CLIENT_INPUTS
   CLIENT_CP="$TELEMETRY_INTEROP_CACHE/kafka-clients-4.3.1.jar:$TELEMETRY_INTEROP_CACHE/slf4j-api-1.7.36.jar:$TELEMETRY_INTEROP_CACHE/lz4-java-1.10.2.jar:$TELEMETRY_INTEROP_CACHE/snappy-java-1.1.10.7.jar:$TELEMETRY_INTEROP_CACHE/zstd-jni-1.5.6-10.jar"
   shift 2
   if [ "$MODE" = client-check ]; then set -- --check "$@"; fi
-  exec timeout --foreground -k 2s 40s java -Xmx128m -Djava.io.tmpdir="$TMPDIR" --class-path "$CLIENT_CP" "$HERE/JavaTelemetryClient.java" "$@"
+  exec timeout --foreground -k 2s 40s java -Xmx128m -Xlog:disable -Xlog:all=warning:stderr -Djava.io.tmpdir="$TMPDIR" --class-path "$CLIENT_CP" "$HERE/JavaTelemetryClient.java" "$@"
 fi
 RAW=${3:?absolute raw MetricsData file}
 : "${TELEMETRY_JAVA_CACHE:?set the retained pinned Java cache}"

@@ -1194,9 +1194,10 @@ describe('share acknowledgement proof', () => {
  * records the producing process. A child that overruns is killed and still joined; the facts come
  * back whatever happened, so a failure leaves its evidence.
  * @param {string} script fixture file name @param {string} kind public client kind
+ * @param {Record<string, string>} [extraEnv] variables a seeded control adds to the child
  * @returns {Promise<object>} exit, output and receipt facts and the readings line
  */
-const supervise = (script, kind) =>
+const supervise = (script, kind, extraEnv = {}) =>
   new Promise((resolve) => {
     const file = path.join(__dirname, 'fixtures', script)
     // The child runs without coverage, inspector or Jest, so none of them can add to its memory.
@@ -1217,6 +1218,7 @@ const supervise = (script, kind) =>
       RESOURCE_CHILD_ID: producer.childId,
       RESOURCE_TREE: producer.tree,
       RESOURCE_RUN_ID: producer.runId,
+      ...extraEnv,
     }
     delete env.NODE_V8_COVERAGE
     const child = spawn(process.execPath, [...MEMORY_FLAGS, file, kind], {
@@ -1266,10 +1268,12 @@ const supervise = (script, kind) =>
  * @param {string} arm `public` or `collector` @param {string} kind public client kind
  * @param {object} run what `supervise` returned
  * @param {object} before host context before the child @param {object} after after it
+ * @param {string|null} [control] the seeded control's name: its record is kept in `controls/`,
+ *   never beside the acceptance artifacts the validator reads
  * @returns {object} the record that was judged, also written to the artifact directory when one
  *   is configured
  */
-const record = (arm, kind, run, before, after) => {
+const record = (arm, kind, run, before, after, control = null) => {
   const { readings, failure, ...exit } = run
   const artifact = {
     schema: SCHEMA,
@@ -1289,11 +1293,12 @@ const record = (arm, kind, run, before, after) => {
   }
   const directory = process.env.TELEMETRY_RESOURCES_ARTIFACT_DIR
   if (directory) {
-    fs.mkdirSync(directory, { recursive: true })
-    fs.writeFileSync(
-      path.join(directory, `resources-${arm}-${kind}.json`),
-      JSON.stringify(artifact)
+    const file = path.join(
+      directory,
+      control ? path.join('controls', `${control}-${kind}.json`) : `resources-${arm}-${kind}.json`
     )
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    fs.writeFileSync(file, JSON.stringify(artifact))
   }
   return artifact
 }
@@ -1307,7 +1312,7 @@ quiet(KINDS)(
     const before = hostContext()
     const run = await supervise('publicMemoryChild.js', kind)
     const judged = judgeMemoryArm(record('public', kind, run, before, hostContext()))
-    expect(judged).toEqual({ verdict: 'pass', problems: [] })
+    expect(judged).toMatchObject({ verdict: 'pass', problems: [] })
   },
   120000
 )
@@ -1318,7 +1323,120 @@ quiet(KINDS)(
     const before = hostContext()
     const run = await supervise('resourceChild.js', kind)
     const judged = judgeMemoryArm(record('collector', kind, run, before, hostContext()))
-    expect(judged).toEqual({ verdict: 'pass', problems: [] })
+    expect(judged).toMatchObject({ verdict: 'pass', problems: [] })
+  },
+  120000
+)
+
+const quietOnce = process.env.TELEMETRY_RESOURCES_QUIET === '1' ? test : test.skip
+
+/** The seeded controls of D169: what each leaks, in bytes, and the reasons the judge must give. */
+const SEED_CLOSE_BYTES = 131072
+const SEED_MIN_TOTAL = 524288
+const SEED_WARMUP_BYTES = 1048577
+const CLOSED_CEILING = 'closed transient data bytes exceed 256 KiB'
+const FIRST_USE_BOUND = 'warm-up first-use data bytes exceed 1 MiB'
+const SEEDED = 'seeded control is not acceptance evidence'
+
+/**
+ * Runs a public arm seeded with a leak through a product-reachable root, and judges it.
+ * @param {'close'|'close-warmup'|'warmup-only'} mode which passes leak
+ * @param {string} kind public client kind
+ * @returns {Promise<{judged: {verdict: string, problems: string[]}, readings: object}>} the
+ *   verdict and the child's own account of what it leaked
+ */
+const seeded = async (mode, kind) => {
+  const before = hostContext()
+  const run = await supervise('publicMemoryChild.js', kind, { RESOURCE_SEED: mode })
+  const artifact = record('public', kind, run, before, hostContext(), `seeded-${mode}`)
+  return { judged: judgeMemoryArm(artifact), readings: artifact.readings }
+}
+
+quiet(KINDS)(
+  'per-close seeded resource memory for %s',
+  async (kind) => {
+    const { judged, readings } = await seeded('close', kind)
+    expect(readings.manifest.seed).toMatchObject({ mode: 'close', closeBytes: SEED_CLOSE_BYTES })
+    expect(readings.seeds.warm).toBeNull()
+    expect(readings.seeds.measured.afterMatched).toBeGreaterThanOrEqual(SEED_MIN_TOTAL)
+    expect(judged.verdict).toBe('fail')
+    expect(judged.problems).toContain(SEEDED)
+    expect(judged.problems).toContain(CLOSED_CEILING)
+  },
+  120000
+)
+
+quiet(KINDS)(
+  'per-close seeded through the warm-up resource memory for %s',
+  async (kind) => {
+    const { judged, readings } = await seeded('close-warmup', kind)
+    expect(readings.seeds.warm.afterMatched).toBeGreaterThanOrEqual(SEED_MIN_TOTAL)
+    expect(readings.seeds.measured.afterMatched).toBeGreaterThanOrEqual(SEED_MIN_TOTAL)
+    expect(judged.verdict).toBe('fail')
+    expect(judged.problems).toContain(SEEDED)
+    expect(judged.problems).toContain(CLOSED_CEILING)
+  },
+  120000
+)
+
+quiet(KINDS)(
+  'warm-up only seeded resource memory for %s',
+  async (kind) => {
+    const { judged, readings } = await seeded('warmup-only', kind)
+    expect(readings.seeds.measured).toBeNull()
+    expect(readings.seeds.warm).toMatchObject({ bytes: SEED_WARMUP_BYTES })
+    expect(readings.seeds.warm.afterMatched).toBe(SEED_WARMUP_BYTES)
+    expect(judged.verdict).toBe('fail')
+    expect(judged.problems).toContain(SEEDED)
+    expect(judged.problems).toContain(FIRST_USE_BOUND)
+    expect(judged.problems).not.toContain(CLOSED_CEILING)
+  },
+  120000
+)
+
+/**
+ * Runs the code-accounting child on this Node line.
+ * @returns {Promise<{code: number|null, signal: string|null, stdout: string, stderr: string}>}
+ */
+const codeAccounting = () =>
+  new Promise((resolve) => {
+    const env = { ...process.env }
+    delete env.NODE_V8_COVERAGE
+    const file = path.join(__dirname, 'fixtures', 'codeAccountingChild.js')
+    const child = spawn(process.execPath, [...MEMORY_FLAGS, file], {
+      env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let stdout = ''
+    let stderr = ''
+    const limit = setTimeout(() => child.kill('SIGKILL'), 90000)
+    child.stdout.on('data', (chunk) => (stdout += chunk))
+    child.stderr.on('data', (chunk) => (stderr += chunk))
+    child.on('close', (code, signal) => {
+      clearTimeout(limit)
+      resolve({ code, signal, stdout, stderr })
+    })
+  })
+
+quietOnce(
+  'code accounting resource memory for the V8 code counters',
+  async () => {
+    const run = await codeAccounting()
+    expect({ code: run.code, signal: run.signal, stderr: run.stderr }).toEqual({
+      code: 0,
+      signal: null,
+      stderr: '',
+    })
+    const { compile, heapArray, typedArray } = JSON.parse(run.stdout)
+    // Compiling and running functions moves the code counters, and they never account for more
+    // bytes than the heap grew by, so subtracting them cannot hide a leak.
+    expect(compile.code).toBeGreaterThanOrEqual(131072)
+    expect(compile.data).toBeGreaterThanOrEqual(-65536)
+    // An array of at least 1 MiB moves the data bytes by at least 1 MiB and the code counters little.
+    for (const step of [heapArray, typedArray]) {
+      expect(step.data).toBeGreaterThanOrEqual(1048576)
+      expect(step.code).toBeLessThanOrEqual(262144)
+    }
   },
   120000
 )

@@ -4,10 +4,12 @@ const fs = require('node:fs')
 const crypto = require('node:crypto')
 const { collectionsSettled } = require('../../../../testHelpers/processMemory')
 const { ARMS, KINDS, foregroundCatalogue } = require('../resourceArtifact')
+const { validateSettlements } = require('./settlement')
 
 /** Diagnostic-only bounds, declared before any child starts; acceptance capacities stay unchanged. */
 const CAPACITY = Object.freeze({
   events: 2048,
+  settlementPoints: 30,
   eventBytes: 33554432,
   native: 512,
   windows: 512,
@@ -274,6 +276,12 @@ const validateEvents = (events, expected, exit) => {
         'collector block population/completion'
       )
   }
+  problems.push(
+    ...validateSettlements(events, [
+      ...captures.map((event) => event.pre),
+      ...blocks.flatMap((event) => [event.closed, ...(event.actives ?? [])]),
+    ])
+  )
   const control = events.find((event) => event.type === 'control')
   fail(
     control?.facts?.enabled === false &&
@@ -317,6 +325,7 @@ const validateEvents = (events, expected, exit) => {
         'manifest',
         'mark',
         'checkpoint',
+        'settlement',
         'block',
         'control',
         'weak',

@@ -698,6 +698,8 @@ describe('resource artifact validation', () => {
     'control:c0': [80, 74, 3e6],
     'control:c1': [80, 74, 3e6],
     'control:released': [80, 72, 3e6],
+    'warmup:matched': [80, 80, 4e6],
+    'warmup:closed': [80, 72, 3e6],
     start: [80, 72, 3e6],
     registered: [110, 100, 12e6],
     matched: [110, 80, 4e6],
@@ -816,7 +818,13 @@ describe('resource artifact validation', () => {
           arm,
           kind,
           ...child,
-          execArgv: ['--expose-gc', '--no-lazy', '--no-lazy-feedback-allocation'],
+          execArgv: [
+            '--expose-gc',
+            '--no-lazy',
+            '--no-lazy-feedback-allocation',
+            '--min-semi-space-size=1',
+            '--max-semi-space-size=1',
+          ],
           instrumented: { inspector: false, coverage: false, jest: false },
           peakSource: { name: 'proc-self-status-vmhwm', units: 'bytes' },
           gc: { available: true, native: true },
@@ -831,9 +839,13 @@ describe('resource artifact validation', () => {
         },
         startup: settled(10, 41 * MIB, 1e6, 2e6),
         loaded: settled(50, 70 * MIB, 3e6, 5e6),
-        c0: settled(1000, 73 * MIB, 3e6, 6e6),
+        c0: settled(1500, 73 * MIB, 3e6, 6e6),
         c1: settled(2000, 74 * MIB, 3e6, 6.1e6),
         released: settled(3000, 72 * MIB, 3e6, 5.9e6),
+        warmup: {
+          m0: settled(3300, 80 * MIB, 4e6, 29.9e6),
+          end: settled(3600, 72 * MIB, 3e6, 6e6),
+        },
         control: {
           enabled: false,
           api71: 0,
@@ -916,10 +928,12 @@ describe('resource artifact validation', () => {
       broken.readings.c0,
       broken.readings.c1,
       broken.readings.released,
+      broken.readings.warmup?.m0,
+      broken.readings.warmup?.end,
       broken.readings.matched,
       ...broken.readings.actives,
       broken.readings.closed,
-    ]
+    ].filter(Boolean)
     const previous = checkpoints.map((reading) => ({ ...reading }))
     change(broken.readings, broken)
     // A scalar gate control changes the same final value in its otherwise unchanged GC history.
@@ -945,7 +959,7 @@ describe('resource artifact validation', () => {
 
   describe('diagnostic acceptance isolation and recorded boundary replay', () => {
     test.each([{ diagnostic: true }, { acceptanceEligible: false }])(
-      'rejects diagnostic marker %p even in a schema-5 envelope',
+      'rejects diagnostic marker %p even in a schema-6 envelope',
       (marker) => {
         expect(judgeMemoryArm({ ...record('public'), ...marker })).toEqual({
           verdict: 'fail',
@@ -1001,8 +1015,142 @@ describe('resource artifact validation', () => {
     })
   })
 
+  describe('peak reading decreases', () => {
+    test.each(ARMS)('records every decrease and retains the maximum for the %s arm', (arm) => {
+      const whole = record(arm)
+      const prefix = arm === 'public' ? 'enabled' : 'collector'
+      Object.assign(markOf(whole.readings, `${prefix}:held`), {
+        vmhwm: 119 * MIB,
+        maxRss: 357482496,
+      })
+      Object.assign(markOf(whole.readings, `${prefix}:closed`), {
+        vmhwm: 118 * MIB,
+        maxRss: 357351424,
+      })
+      Object.assign(markOf(whole.readings, 'final'), {
+        vmhwm: 119 * MIB,
+        maxRss: 357613568,
+      })
+      const original = JSON.stringify(whole)
+      const replay = JSON.parse(original)
+      const result = judgeMemoryArm(replay)
+      expect(result).toMatchObject({ verdict: 'pass', problems: [] })
+      expect(result.facts).toEqual({
+        peak: 120 * MIB,
+        setupPeak: 80 * MIB,
+        peakDecreases: [
+          {
+            index: arm === 'public' ? 12 : 11,
+            phase: `${prefix}:held`,
+            field: 'maxRss',
+            before: 357744640,
+            after: 357482496,
+            delta: -262144,
+          },
+          {
+            index: arm === 'public' ? 12 : 11,
+            phase: `${prefix}:held`,
+            field: 'vmhwm',
+            before: 120 * MIB,
+            after: 119 * MIB,
+            delta: -MIB,
+          },
+          {
+            index: arm === 'public' ? 13 : 12,
+            phase: `${prefix}:closed`,
+            field: 'maxRss',
+            before: 357482496,
+            after: 357351424,
+            delta: -131072,
+          },
+          {
+            index: arm === 'public' ? 13 : 12,
+            phase: `${prefix}:closed`,
+            field: 'vmhwm',
+            before: 119 * MIB,
+            after: 118 * MIB,
+            delta: -MIB,
+          },
+        ],
+      })
+      expect(JSON.stringify(replay)).toBe(original)
+    })
+
+    test.each([
+      [
+        'setup',
+        'control:c0',
+        96 * MIB + 1,
+        'inconclusive',
+        'setup exceeds the 96 MiB admission allowance',
+      ],
+      [
+        'delta',
+        'enabled:gzip',
+        137 * MIB + 1,
+        'fail',
+        'telemetry RSS peak exceeds 64 MiB above the disabled control',
+      ],
+      [
+        'absolute',
+        'enabled:gzip',
+        160 * MIB + 1,
+        'fail',
+        'absolute current-image peak exceeds 160 MiB',
+      ],
+    ])('preserves the %s limit after a decrease', (_name, phase, peak, verdict, problem) => {
+      const result = judged('public', (r) => (markOf(r, phase).vmhwm = peak))
+      expect(result.verdict).toBe(verdict)
+      expect(result.problems).toContain(problem)
+      expect(result.facts.peak).toBe(Math.max(120 * MIB, peak))
+      expect(result.facts.setupPeak).toBe(phase === 'control:c0' ? peak : 80 * MIB)
+      expect(result.facts.peakDecreases).toHaveLength(1)
+    })
+
+    test('keeps invalid marks and uncovered readings rejected after a decrease', () => {
+      for (const [change, verdict, problem] of [
+        [
+          (r) => delete markOf(r, 'enabled:closed').covered,
+          'fail',
+          'enabled:closed mark is incomplete',
+        ],
+        [
+          (r) => (markOf(r, 'enabled:closed').maxRss = Infinity),
+          'fail',
+          'enabled:closed mark is incomplete',
+        ],
+        [
+          (r) => (markOf(r, 'enabled:closed').vmhwm = NaN),
+          'fail',
+          'peak source is claimed but a mark has no reading',
+        ],
+        [
+          (r) => (markOf(r, 'enabled:closed').vmhwm = null),
+          'fail',
+          'peak source is claimed but a mark has no reading',
+        ],
+        [(r) => (markOf(r, 'enabled:closed').at = 1), 'fail', 'marks are out of order'],
+        [
+          (r) => {
+            markOf(r, 'enabled:held').covered = 120 * MIB
+            for (const phase of ['enabled:closed', 'final']) markOf(r, phase).vmhwm = 119 * MIB
+          },
+          'inconclusive',
+          'peak source does not cover a current reading',
+        ],
+      ]) {
+        const result = judged('public', (r) => {
+          markOf(r, 'enabled:held').vmhwm = 119 * MIB
+          change(r)
+        })
+        expect(result.verdict).toBe(verdict)
+        expect(result.problems).toContain(problem)
+      }
+    })
+  })
+
   describe('the schema and the shape of the evidence', () => {
-    test.each([1, 2, 3, 4])('rejects schema %s without frozen module evidence', (schema) => {
+    test.each([1, 2, 3, 4, 5])('rejects schema %s without frozen module evidence', (schema) => {
       const old = record('public')
       old.schema = schema
       expect(judgeMemoryArm(old)).toEqual({ verdict: 'fail', problems: ['unknown schema'] })
@@ -1088,16 +1236,6 @@ describe('resource artifact validation', () => {
         'a peak source claimed without a reading',
         (r) => (markOf(r, 'enabled:held').vmhwm = null),
         'peak source is claimed but a mark has no reading',
-      ],
-      [
-        'a decreasing authoritative peak',
-        (r) => (markOf(r, 'enabled:held').vmhwm = 100 * MIB),
-        'authoritative peak decreased',
-      ],
-      [
-        'a decreasing raw maximum',
-        (r) => (markOf(r, 'enabled:held').maxRss = 1),
-        'raw maximum decreased',
       ],
       [
         'marks out of time order',
@@ -1373,6 +1511,18 @@ describe('resource artifact validation', () => {
       expect(result.problems).toContain(problem)
     })
 
+    test('keeps the resource host-load ceiling at 0.75 per CPU', () => {
+      for (const loadPerCpu of [0.75, 0.76, 0.99]) {
+        const result = judged('public', (_r, whole) => {
+          whole.context.before.load[0] = whole.context.before.cpus * loadPerCpu
+        })
+        expect(result).toEqual({
+          verdict: loadPerCpu <= 0.75 ? 'pass' : 'inconclusive',
+          problems: loadPerCpu <= 0.75 ? [] : ['host load was high'],
+        })
+      }
+    })
+
     test('accepts an explicitly unavailable pressure source', () => {
       const result = judged('public', (r, whole) => {
         whole.context.before.psi = null
@@ -1437,6 +1587,17 @@ describe('resource artifact validation', () => {
       })
     })
 
+    test('records a high water read just below its own interval and judges the larger reading', () => {
+      const result = judged('public', (r) => {
+        const mark = markOf(r, 'enabled:gzip')
+        mark.vmhwm = mark.covered - 8192
+      })
+      expect(result).toMatchObject({ verdict: 'pass', problems: [] })
+      expect(result.facts.peakCoverage).toEqual([
+        expect.objectContaining({ phase: 'enabled:gzip', shortfall: 8192 }),
+      ])
+    })
+
     test('is inconclusive when the high water does not cover a current reading', () => {
       const result = judged('public', (r) => {
         markOf(r, 'enabled:gzip').vmhwm = markOf(r, 'enabled:gzip').covered - 1
@@ -1444,7 +1605,7 @@ describe('resource artifact validation', () => {
           markOf(r, phase).vmhwm = markOf(r, 'enabled:gzip').vmhwm
       })
 
-      expect(result).toEqual({
+      expect(result).toMatchObject({
         verdict: 'inconclusive',
         problems: ['peak source does not cover a current reading'],
       })
@@ -1465,6 +1626,63 @@ describe('resource artifact validation', () => {
   })
 
   describe('collection convergence', () => {
+    /** Replaces the pair with a monotone series, optionally converging only at its last point. */
+    const extend = (reading, rounds, converges = true) => {
+      const final = reading.gc.checkpoints.at(-1)
+      reading.gc.checkpoints = Array.from({ length: rounds }, (_, i) => {
+        const distance = converges ? Math.max(0, rounds - i - 2) : rounds - i - 1
+        const at = reading.at - (rounds - i - 1) * 100
+        return {
+          ...final,
+          at,
+          admittedAt: at - 100,
+          heapUsed: reading.heapUsed - distance * 32768,
+          retained: reading.retained - distance * 32768,
+        }
+      })
+      reading.gc.admittedAt = reading.gc.checkpoints[0].admittedAt
+      reading.gc.observed = rounds * 2
+    }
+
+    test.each(['c0', 'c1'])(
+      'accepts %s convergence on each round from seven through twelve',
+      (name) => {
+        for (const rounds of [7, 8, 9, 10, 11, 12])
+          for (const arm of ARMS)
+            expect(judged(arm, (r) => extend(r[name], rounds))).toEqual({
+              verdict: 'pass',
+              problems: [],
+            })
+      }
+    )
+
+    test.each(['c0', 'c1'])('keeps %s inconclusive after twelve unconverged rounds', (name) => {
+      expect(judged('public', (r) => extend(r[name], 12, false))).toEqual({
+        verdict: 'inconclusive',
+        problems: [`${name} collections did not settle`],
+      })
+    })
+
+    test.each(['c0', 'c1'])('rejects a thirteenth %s collection round', (name) => {
+      const result = judged('public', (r) => extend(r[name], 13))
+      expect(result.verdict).toBe('fail')
+      expect(result.problems).toContain(`${name} collection checkpoints are incomplete`)
+    })
+
+    test.each([
+      ['released', (r) => r.released],
+      ['warm-up matched', (r) => r.warmup.m0],
+      ['warm-up closed', (r) => r.warmup.end],
+      ['matched', (r) => r.matched],
+      ['active 1', (r) => r.actives[0]],
+      ['active 2', (r) => r.actives[1]],
+      ['closed', (r) => r.closed],
+    ])('rejects a seventh %s collection round', (name, select) => {
+      const result = judged('public', (r) => extend(select(r), 7))
+      expect(result.verdict).toBe('fail')
+      expect(result.problems).toContain(`${name} collection checkpoints are incomplete`)
+    })
+
     test('rejects a checkpoint without its successive post-GC readings', () => {
       const result = judged('public', (r) => delete r.closed.gc.checkpoints)
       expect(result.verdict).toBe('fail')
@@ -1479,13 +1697,38 @@ describe('resource artifact validation', () => {
       expect(result.problems).toContain('closed collection reading is incomplete')
     })
 
-    test('does not let an unsettled control become an admitted reference', () => {
-      const result = judged('public', (r) => {
-        r.c0.gc.checkpoints[0].heapUsed -= 300000
-        r.c0.gc.checkpoints[0].retained -= 300000
+    test.each(ARMS)('records unsettled active collections as facts for the %s arm', (arm) => {
+      const result = judged(arm, (r) => {
+        for (const active of r.actives) {
+          active.gc.checkpoints[0].heapUsed -= 300000
+          active.gc.checkpoints[0].retained -= 300000
+        }
       })
-      expect(result.verdict).toBe('inconclusive')
-      expect(result.problems).toContain('c0 collections did not settle')
+      expect(result).toEqual({
+        verdict: 'pass',
+        problems: [],
+        facts: { unsettledActiveReadings: ['active 1', 'active 2'] },
+      })
+    })
+
+    test.each([
+      ['c0', (r) => r.c0],
+      ['c1', (r) => r.c1],
+      ['released', (r) => r.released],
+      ['warm-up matched', (r) => r.warmup.m0],
+      ['warm-up closed', (r) => r.warmup.end],
+      ['matched', (r) => r.matched],
+      ['closed', (r) => r.closed],
+    ])('keeps unsettled %s collections inconclusive', (name, select) => {
+      const result = judged('public', (r) => {
+        const reading = select(r)
+        reading.gc.checkpoints[0].heapUsed -= 300000
+        reading.gc.checkpoints[0].retained -= 300000
+      })
+      expect(result).toEqual({
+        verdict: 'inconclusive',
+        problems: [`${name} collections did not settle`],
+      })
     })
 
     test('keeps earlier collection peaks even when the last reading is smaller', () => {
@@ -1505,9 +1748,10 @@ describe('resource artifact validation', () => {
         r.actives[0].gc.checkpoints[0].retained += 9 * MIB
       })
       expect(result.verdict).toBe('fail')
-      expect(result.problems).toContain(
-        'active retained bytes exceed the matched baseline by more than 8 MiB'
-      )
+      expect(result.problems).toEqual([
+        'active retained bytes exceed the matched baseline by more than 8 MiB',
+      ])
+      expect(result.facts).toEqual({ unsettledActiveReadings: ['active 1'] })
     })
 
     test('rejects continued collection after an already converged pair', () => {
@@ -1530,7 +1774,39 @@ describe('resource artifact validation', () => {
         r.manifest.execArgv = ['--expose-gc']
       })
       expect(result.verdict).toBe('fail')
-      expect(result.problems).toContain('child did not declare eager JavaScript compilation')
+      expect(result.problems).toContain('child did not declare the required memory flags')
+    })
+  })
+
+  describe('memory child flags', () => {
+    test.each(['--min-semi-space-size=1', '--max-semi-space-size=1'])(
+      'rejects a child missing %s',
+      (flag) => {
+        const result = judged('public', (r) => {
+          r.manifest.execArgv = r.manifest.execArgv.filter((value) => value !== flag)
+        })
+        expect(result).toEqual({
+          verdict: 'fail',
+          problems: ['child did not declare the required memory flags'],
+        })
+      }
+    )
+
+    test.each([
+      [
+        'conflicting extra semi-space flags',
+        (argv) => [...argv, '--min-semi-space-size=16', '--max-semi-space-size=16'],
+      ],
+      ['reordered flags', (argv) => [...argv].reverse()],
+      ['a flag string instead of an array', (argv) => argv.join(' ')],
+    ])('rejects %s', (_name, change) => {
+      const result = judged('public', (r) => {
+        r.manifest.execArgv = change(r.manifest.execArgv)
+      })
+      expect(result).toEqual({
+        verdict: 'fail',
+        problems: ['child did not declare the required memory flags'],
+      })
     })
   })
 
@@ -1557,8 +1833,8 @@ describe('resource artifact validation', () => {
           kind
         )
         expect(result.verdict).toBe('fail')
-        expect(result.problems).toContain('closed transient bytes exceed 256 KiB')
-        expect(result.problems).toContain('control retained bytes are unstable')
+        expect(result.problems).toContain('closed transient data bytes exceed 256 KiB')
+        expect(result.problems).toContain('control data bytes are unstable')
       }
     )
 
@@ -1586,10 +1862,247 @@ describe('resource artifact validation', () => {
           kind
         )
         expect(result.verdict).toBe('fail')
-        expect(result.problems).toContain('closed transient bytes exceed 256 KiB')
-        expect(result.problems).toContain('control retained bytes are unstable')
+        expect(result.problems).toContain('closed transient data bytes exceed 256 KiB')
+        expect(result.problems).toContain('control data bytes are unstable')
       }
     )
+  })
+
+  describe('data bytes, the warm-up and the seeded controls', () => {
+    /** Moves a reading's data bytes by `data` from a reference reading, and its code bytes by `code`. */
+    const grow = (reading, from, data, code = 0) => {
+      const base = from.gc.checkpoints.at(-1).engine
+      reading.retained = from.retained + data + code
+      reading.heapUsed = reading.retained - reading.external
+      reading.gc.checkpoints.at(-1).engine = { bytecode: base.bytecode, code: base.code + code }
+    }
+    /** Moves M and keeps the closed reading the same distance above it. */
+    const moveMatched = (r, data, code = 0) => {
+      grow(r.matched, r.warmup.m0, data, code)
+      grow(r.closed, r.matched, 100000)
+    }
+    const PASS = { verdict: 'pass', problems: [] }
+    const CLOSED = 'closed transient data bytes exceed 256 KiB'
+    const UNSTABLE = 'control data bytes are unstable'
+    const FIRST_USE = 'warm-up first-use data bytes exceed 1 MiB'
+
+    test('judges the closed ceiling on heap plus external without V8 code, to the byte', () => {
+      expect(
+        judged('public', (r) => grow(r.closed, r.matched, LIMITS.closedTransient, 150000))
+      ).toEqual(PASS)
+      expect(
+        judged('public', (r) => grow(r.closed, r.matched, LIMITS.closedTransient + 1, 150000))
+      ).toEqual({ verdict: 'fail', problems: [CLOSED] })
+    })
+
+    test('records closed data more than 256 KiB below the matched baseline without blocking a pass', () => {
+      expect(judged('public', (r) => grow(r.closed, r.matched, -LIMITS.closedTransient))).toEqual(
+        PASS
+      )
+      expect(
+        judged('public', (r) => grow(r.closed, r.matched, -LIMITS.closedTransient - 1))
+      ).toEqual({
+        ...PASS,
+        facts: { closedDataDecrease: { matched: 29999800, closed: 29737655, delta: -262145 } },
+      })
+    })
+
+    test('records closed data decreases recomputed from the raw engine sizes', () => {
+      const result = judged('public', (r) => {
+        r.closed.gc.checkpoints.at(-1).engine = { bytecode: 100, code: 100 + MIB }
+      })
+      expect(result).toEqual({
+        ...PASS,
+        facts: { closedDataDecrease: { matched: 29999800, closed: 29051224, delta: -948576 } },
+      })
+    })
+
+    test('moves compiled code only through the code bytes and a 1 MiB array through the data bytes', () => {
+      expect(judged('public', (r) => grow(r.closed, r.matched, 0, MIB))).toEqual(PASS)
+      expect(judged('public', (r) => grow(r.closed, r.matched, MIB, 0))).toEqual({
+        verdict: 'fail',
+        problems: [CLOSED],
+      })
+    })
+
+    test('judges control stability on data bytes, so control compilation is not instability', () => {
+      expect(judged('public', (r) => grow(r.c1, r.c0, LIMITS.controlRetained, 200000))).toEqual(
+        PASS
+      )
+      expect(judged('public', (r) => grow(r.c1, r.c0, LIMITS.controlRetained + 1, 200000))).toEqual(
+        { verdict: 'inconclusive', problems: [UNSTABLE] }
+      )
+    })
+
+    test('bounds the first-use step from M0 to M at 1 MiB of data bytes, to the byte', () => {
+      expect(LIMITS.firstUse).toBe(MIB)
+      expect(judged('public', (r) => moveMatched(r, MIB, 80000))).toEqual(PASS)
+      expect(judged('public', (r) => moveMatched(r, MIB + 1, 80000))).toEqual({
+        verdict: 'fail',
+        problems: [FIRST_USE],
+      })
+    })
+
+    test('keeps the first-use failure when the closed ceiling also fails', () => {
+      const result = judged('public', (r) => {
+        moveMatched(r, MIB + 1)
+        grow(r.closed, r.matched, LIMITS.closedTransient + 1)
+      })
+      expect(result).toEqual({ verdict: 'fail', problems: [FIRST_USE, CLOSED] })
+    })
+
+    test.each([
+      ['no warm-up readings', (r) => delete r.warmup, 'warm-up readings are missing'],
+      ['no M0 reading', (r) => (r.warmup.m0 = null), 'warm-up matched reading is incomplete'],
+      [
+        'no collection facts at M0',
+        (r) => delete r.warmup.m0.gc,
+        'warm-up matched collection facts are incomplete',
+      ],
+      [
+        'no collection facts after the release',
+        (r) => delete r.warmup.end.gc,
+        'warm-up closed collection facts are incomplete',
+      ],
+      [
+        'an M0 taken after M',
+        (r) => (r.warmup.m0.at = r.matched.at + 1),
+        'readings are out of order',
+      ],
+      [
+        'a warm-up mark that is missing',
+        (r) => (r.marks = r.marks.filter((mark) => mark.phase !== 'warmup:matched')),
+        'peak marks are not the fixed phase catalogue',
+      ],
+      [
+        'a warm-up mark that understates its reading',
+        (r) => (markOf(r, 'warmup:matched').covered = 1),
+        'a peak mark understates a reading',
+      ],
+    ])('fails %s', (_name, change, problem) => {
+      const result = judged('public', change)
+      expect(result.verdict).toBe('fail')
+      expect(result.problems).toContain(problem)
+    })
+
+    test('counts the warm-up readings in the external peak above the control', () => {
+      const result = judged('public', (r) => {
+        const end = r.warmup.end
+        end.external = r.c0.external + LIMITS.externalDelta + 1
+        end.heapUsed = 1e6
+        end.retained = end.heapUsed + end.external
+        markOf(r, 'warmup:closed').coveredExternal = end.external
+      })
+      expect(result.verdict).toBe('fail')
+      expect(result.problems).toContain(
+        'external memory peak exceeds 64 MiB above the disabled control'
+      )
+    })
+
+    test('refuses a record that declares a seed as acceptance evidence', () => {
+      const result = judged('public', (r) => {
+        r.manifest.seed = { mode: 'close', closeBytes: 131072, warmupBytes: 1048577 }
+      })
+      expect(result.verdict).toBe('fail')
+      expect(result.problems).toContain('seeded control is not acceptance evidence')
+      expect(judged('public', (r) => (r.manifest.seed = null))).toEqual(PASS)
+      expect(judged('collector', (r) => (r.manifest.seed = null))).toEqual(PASS)
+    })
+
+    test.each(ARMS)(
+      'reports the closed ceiling and seed rejection for a valid seeded %s record',
+      (arm) => {
+        expect(
+          judged(arm, (r) => {
+            r.manifest.seed = { mode: 'close', closeBytes: 131072, warmupBytes: 1048577 }
+            grow(r.closed, r.matched, LIMITS.closedTransient + 1)
+          })
+        ).toEqual({
+          verdict: 'fail',
+          problems: [CLOSED, 'seeded control is not acceptance evidence'],
+        })
+      }
+    )
+
+    test('reports structural failures as well as the seeded-control rejection', () => {
+      const result = judged('public', (r) => {
+        r.manifest.seed = { mode: 'close' }
+        delete r.warmup
+      })
+      expect(result.verdict).toBe('fail')
+      expect(result.problems).toContain('warm-up readings are missing')
+      expect(result.problems).toContain('seeded control is not acceptance evidence')
+    })
+
+    test('rejects a seeded control even when GC is unavailable', () => {
+      const result = judged('public', (r, whole) => {
+        r.manifest.seed = { mode: 'close' }
+        r.manifest.gc.available = false
+        whole.exit.receipts = 0
+      })
+      expect(result.verdict).toBe('fail')
+      expect(result.problems).toContain('real exposed GC is unavailable')
+      expect(result.problems).toContain('seeded control is not acceptance evidence')
+    })
+
+    test('keeps the active retained gate on raw bytes: code growth is not subtracted from it', () => {
+      const result = judged('public', (r) => {
+        grow(r.actives[0], r.matched, LIMITS.retained - 1, MIB)
+      })
+      expect(result).toEqual({
+        verdict: 'fail',
+        problems: ['active retained bytes exceed the matched baseline by more than 8 MiB'],
+      })
+    })
+  })
+
+  describe('no dynamic code compilation in product source', () => {
+    const DYNAMIC_CODE = [
+      /\bnew\s+Function\b/,
+      /(^|[^\w.$])Function\s*\(/,
+      /(^|[^\w.$])eval\s*\(/,
+      /require\(\s*['"](?:node:)?vm['"]\s*\)/,
+      /from\s+['"](?:node:)?vm['"]/,
+    ]
+
+    /** @param {string} dir a directory @returns {string[]} its product JavaScript files, recursively */
+    const productFiles = (dir) =>
+      fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+        const file = path.join(dir, entry.name)
+        if (entry.isDirectory()) return entry.name === '__tests__' ? [] : productFiles(file)
+        return entry.name.endsWith('.js') && !entry.name.endsWith('.spec.js') ? [file] : []
+      })
+
+    const forbidden = (source) => DYNAMIC_CODE.filter((pattern) => pattern.test(source))
+
+    test('finds no new Function, eval or vm in the product tree', () => {
+      const root = path.join(__dirname, '..', '..', 'src')
+      const files = productFiles(root)
+      expect(files.length).toBeGreaterThan(500)
+      const offenders = files
+        .filter((file) => forbidden(fs.readFileSync(file, 'utf8')).length > 0)
+        .map((file) => path.relative(root, file))
+      expect(offenders).toEqual([])
+    })
+
+    test('recognises every form it forbids and leaves ordinary code alone', () => {
+      for (const source of [
+        'const f = new Function("a", "return a")',
+        'const f = Function("return this")()',
+        'eval(code)',
+        "const vm = require('vm')",
+        'const vm = require("node:vm")',
+        "import vm from 'node:vm'",
+      ])
+        expect({ source, found: forbidden(source).length > 0 }).toEqual({ source, found: true })
+      for (const source of [
+        'const fn = function () {}',
+        'x.Function(1)',
+        'const evaluate = (a) => a',
+        'const medieval = 1',
+      ])
+        expect({ source, found: forbidden(source).length > 0 }).toEqual({ source, found: false })
+    })
   })
 
   describe('the disabled control', () => {
@@ -1686,7 +2199,7 @@ describe('resource artifact validation', () => {
       })
       expect(result.verdict).toBe('fail')
       expect(result.problems).toEqual([
-        'closed transient bytes exceed 256 KiB',
+        'closed transient data bytes exceed 256 KiB',
         'modules loaded after the disabled reference',
       ])
     })
@@ -1712,7 +2225,7 @@ describe('resource artifact validation', () => {
           r.c1.retained = r.c0.retained - extra
           r.c1.heapUsed = r.c1.retained - r.c1.external
         },
-        'control retained bytes are unstable',
+        'control data bytes are unstable',
       ],
     ])(
       'admits a control whose %s differ by the bound in either direction and not by one more',
@@ -1730,7 +2243,7 @@ describe('resource artifact validation', () => {
     test('admits a setup peak of 96 MiB and not a byte more, whatever follows', () => {
       const setup = (bytes) => (r) => {
         markOf(r, 'control:released').vmhwm = bytes
-        raiseFrom(r, 'enabled:start', Math.max(bytes, 120 * MIB))
+        raiseFrom(r, 'warmup:matched', Math.max(bytes, 120 * MIB))
       }
 
       expect(LIMITS.setupPeak).toBe(100663296)
@@ -1805,7 +2318,7 @@ describe('resource artifact validation', () => {
     test('judges the absolute backstop even when the control is inadmissible, and never passes it', () => {
       const inadmissible = (peak) => (r) => {
         markOf(r, 'control:released').vmhwm = LIMITS.setupPeak + 1
-        raiseFrom(r, 'enabled:start', peak)
+        raiseFrom(r, 'warmup:matched', peak)
       }
 
       expect(judged('public', inadmissible(LIMITS.absolutePeak))).toEqual({
@@ -1866,7 +2379,7 @@ describe('resource artifact validation', () => {
           r.closed.retained = r.matched.retained + extra
           r.closed.heapUsed = r.closed.retained - r.closed.external
         },
-        'closed transient bytes exceed 256 KiB',
+        'closed transient data bytes exceed 256 KiB',
       ],
     ])('allows %s exactly at the bound and fails one more', (_name, bound, set, problem) => {
       expect(judged('public', (r) => set(r, bound))).toEqual({ verdict: 'pass', problems: [] })
@@ -1887,7 +2400,7 @@ describe('resource artifact validation', () => {
       expect(result).toEqual({
         verdict: 'fail',
         problems: [
-          'closed transient bytes exceed 256 KiB',
+          'closed transient data bytes exceed 256 KiB',
           'host load was high',
           'control RSS is unstable',
         ],
@@ -2303,6 +2816,34 @@ describe('resource artifact validation', () => {
       expect(checked.ok).toBe(true)
     })
 
+    test('rejects seeded artifacts for every arm and kind, with or without exposed GC', () => {
+      for (const available of [true, false]) {
+        for (const arm of ARMS)
+          for (const kind of KINDS) {
+            writeAll()
+            const seeded = record(arm, kind)
+            seeded.readings.manifest.seed = { mode: 'close' }
+            seeded.readings.manifest.gc.available = available
+            if (arm === 'public' && !available) seeded.exit.receipts = 0
+            write(arm, kind, seeded)
+
+            const checked = validateResourceArtifacts(directory, { tree: TREE, node: NODE })
+            expect(checked.ok).toBe(false)
+            expect(checked.results.filter((result) => result.verdict !== 'pass')).toEqual([
+              {
+                arm,
+                kind,
+                verdict: 'fail',
+                problems: [
+                  'seeded control is not acceptance evidence',
+                  ...(!available ? ['real exposed GC is unavailable'] : []),
+                ],
+              },
+            ])
+          }
+      }
+    })
+
     test('fails a missing kind even when the rest pass', () => {
       writeAll()
       fs.rmSync(path.join(directory, 'resources-public-admin.json'))
@@ -2390,5 +2931,203 @@ describe('resource artifact validation', () => {
         problems: ['unknown schema'],
       })
     })
+  })
+})
+
+describe('telemetry timeout owner diagnostics', () => {
+  test('reports a repo owner beyond twenty nested timer creation calls', () => {
+    const { TimeoutDiagnostics } = require('../timeoutDiagnostics')
+    const nested = vm.runInNewContext(
+      `(function nested(depth) {
+        return depth ? nested(depth - 1) : setTimeout(() => {}, 60000)
+      })`,
+      { setTimeout },
+      { filename: 'node_modules/timer-fixture/deep.js' }
+    )
+    const diagnostics = new TimeoutDiagnostics().start()
+    const previousLimit = Error.stackTraceLimit
+    let timer
+    try {
+      Error.stackTraceLimit = 10
+      function createDeepTimer() {
+        return nested(20)
+      }
+      timer = createDeepTimer()
+      const { live } = diagnostics.read()
+      expect(live).toHaveLength(1)
+      expect(live[0]).toMatchObject({
+        source: 'repo',
+        stack: expect.stringContaining('createDeepTimer'),
+      })
+      expect(live[0].stack).toContain('testHelpers/__tests__/resourceProbe.spec.js:')
+      expect(live[0].stack).not.toContain('node_modules')
+      expect(live[0].stack.split('\n').length).toBeLessThanOrEqual(8)
+      expect(Error.stackTraceLimit).toBe(10)
+    } finally {
+      Error.stackTraceLimit = previousLimit
+      clearTimeout(timer)
+      diagnostics.stop()
+    }
+  })
+
+  test('reports raw creation frames when no repo frame is available', () => {
+    const { TimeoutDiagnostics } = require('../timeoutDiagnostics')
+    const foreign = vm.runInNewContext(
+      `(function foreign(depth) {
+        return depth ? foreign(depth - 1) : setTimeout(() => {}, 60000)
+      })`,
+      { setTimeout },
+      { filename: 'node_modules/timer-fixture/raw.js' }
+    )
+    const diagnostics = new TimeoutDiagnostics().start()
+    let timer
+    try {
+      timer = foreign(80)
+      const { live } = diagnostics.read()
+      expect(live).toHaveLength(1)
+      expect(live[0]).toMatchObject({
+        source: 'raw',
+        stack: expect.stringContaining('node_modules/timer-fixture/raw.js:'),
+      })
+      expect(live[0].stack).not.toContain('node:internal')
+      expect(live[0].stack).not.toContain('async_hooks')
+      expect(live[0].stack).not.toContain('timeoutDiagnostics.js')
+      expect(live[0].stack.split('\n').length).toBeLessThanOrEqual(8)
+      for (const frame of live[0].stack.split('\n')) expect(frame.length).toBeLessThanOrEqual(512)
+    } finally {
+      clearTimeout(timer)
+      diagnostics.stop()
+    }
+  })
+
+  test('non-Timeout resources do not capture stacks', () => {
+    const { AsyncResource } = require('async_hooks')
+    const { TimeoutDiagnostics } = require('../timeoutDiagnostics')
+    const diagnostics = new TimeoutDiagnostics({ capacity: 2 }).start()
+    const resources = []
+    try {
+      resources.push(new AsyncResource('TimerOwner', { requireManualDestroy: true }))
+      resources.push(new AsyncResource('OtherOwner', { requireManualDestroy: true }))
+      expect([...diagnostics.resources.values()]).toEqual([
+        { type: 'TimerOwner' },
+        { type: 'OtherOwner' },
+      ])
+      resources.push(new AsyncResource('OverflowOwner', { requireManualDestroy: true }))
+      expect(diagnostics.resources.size).toBe(2)
+      expect(diagnostics.read()).toMatchObject({
+        created: 0,
+        resourceDropped: 1,
+        live: [],
+      })
+    } finally {
+      for (const resource of resources) resource.emitDestroy()
+      diagnostics.stop()
+    }
+  })
+
+  test('reports trigger type after trigger destruction and clears every map on stop', async () => {
+    const { AsyncResource } = require('async_hooks')
+    const { TimeoutDiagnostics } = require('../timeoutDiagnostics')
+    const diagnostics = new TimeoutDiagnostics({ capacity: 8 }).start()
+    function createTimerOwner() {
+      return new AsyncResource('TimerOwner', { requireManualDestroy: true })
+    }
+    const owner = createTimerOwner()
+    const timer = owner.runInAsyncScope(() => setTimeout(() => {}, 60000))
+    try {
+      owner.emitDestroy()
+      await new Promise((resolve) => setImmediate(resolve))
+      await new Promise((resolve) => setImmediate(resolve))
+      const { live } = diagnostics.read()
+      expect(live).toHaveLength(1)
+      expect(live[0]).toMatchObject({
+        triggerAsyncId: owner.asyncId(),
+        triggerType: 'TimerOwner',
+        triggerSource: null,
+        triggerStack: '',
+      })
+      expect(diagnostics.resources.has(owner.asyncId())).toBe(false)
+      for (const map of Object.values(diagnostics).filter((value) => value instanceof Map)) {
+        expect(map.size).toBeLessThanOrEqual(8)
+        for (const fact of map.values()) {
+          for (const value of Object.values(fact)) {
+            expect(value === null || ['string', 'number'].includes(typeof value)).toBe(true)
+          }
+        }
+      }
+      diagnostics.stop()
+      expect(diagnostics.read().live).toEqual([])
+      for (const map of Object.values(diagnostics).filter((value) => value instanceof Map)) {
+        expect(map.size).toBe(0)
+      }
+    } finally {
+      clearTimeout(timer)
+      diagnostics.stop()
+    }
+  })
+
+  test('reports a leaked timer creation stack and releases every diagnostic resource', async () => {
+    // eslint-disable-next-line n/no-unsupported-features/node-builtins -- development-only async resource identity
+    const { executionAsyncId } = require('async_hooks')
+    const { TimeoutDiagnostics } = require('../timeoutDiagnostics')
+    const roles = new ResourceRoles().start()
+    const diagnostics = new TimeoutDiagnostics().start()
+    const before = roles.read()
+    const triggerAsyncId = executionAsyncId()
+    const timer = setTimeout(() => {}, 60000)
+    try {
+      const report = diagnostics.read()
+      const ids = roles.read().unknown.Timeout
+      expect(report.live).toHaveLength(1)
+      expect(report.live[0]).toMatchObject({
+        id: ids[0],
+        triggerAsyncId,
+        createdAt: expect.any(Number),
+        destroyedAt: null,
+        stack: expect.stringContaining('testHelpers/__tests__/resourceProbe.spec.js:'),
+      })
+      expect(report.live[0].stack).not.toContain(path.resolve(__dirname, '../..'))
+      expect(report.live[0].stack).not.toContain('node_modules')
+      expect(report.created).toBe(1)
+      clearTimeout(timer)
+      await new Promise((resolve) => setImmediate(resolve))
+      await new Promise((resolve) => setImmediate(resolve))
+      expect(diagnostics.read()).toMatchObject({
+        live: [],
+        created: 1,
+        destroyed: 1,
+        lastDestroyedAt: expect.any(Number),
+        dropped: 0,
+      })
+      diagnostics.stop()
+      expect(roles.read()).toEqual(before)
+      const later = setTimeout(() => {}, 60000)
+      clearTimeout(later)
+      expect(diagnostics.read()).toMatchObject({ live: [], created: 1 })
+    } finally {
+      clearTimeout(timer)
+      diagnostics.stop()
+      roles.stop()
+    }
+  })
+
+  test('bounds live timer facts and reports dropped diagnostics', async () => {
+    const { TimeoutDiagnostics } = require('../timeoutDiagnostics')
+    const diagnostics = new TimeoutDiagnostics({ capacity: 1 }).start()
+    const timers = [setTimeout(() => {}, 60000), setTimeout(() => {}, 60000)]
+    try {
+      expect(diagnostics.read()).toMatchObject({
+        created: 2,
+        dropped: 1,
+        live: [expect.any(Object)],
+      })
+      for (const timer of timers) clearTimeout(timer)
+      await new Promise((resolve) => setImmediate(resolve))
+      await new Promise((resolve) => setImmediate(resolve))
+      expect(diagnostics.read()).toMatchObject({ live: [], destroyed: 1 })
+    } finally {
+      for (const timer of timers) clearTimeout(timer)
+      diagnostics.stop()
+    }
   })
 })

@@ -248,6 +248,63 @@ describe('ProcessMemory', () => {
     expect(reading.retained).toBe(3600000)
   })
 
+  test('gives only the resource control c0 and c1 twelve rounds', async () => {
+    const { runControl } = require('../../src/telemetry/__tests__/fixtures/memoryForeground')
+    let calls = 0
+    const { memory } = meter({
+      gc: () => calls++,
+      usage: () => ({ rss: 100, heapUsed: calls * 32768, external: 0, arrayBuffers: 0 }),
+    })
+    const live = []
+    try {
+      const result = await runControl({
+        kind: 'producer',
+        lifecycles: 2,
+        memory,
+        roles: { run: (_role, work) => work(), read: () => ({}) },
+        journal: { rows: [] },
+        live,
+      })
+      expect(result.c0.gc.checkpoints).toHaveLength(12)
+      expect(result.c1.gc.checkpoints).toHaveLength(12)
+      expect(result.released.gc.checkpoints).toHaveLength(6)
+      expect(live).toEqual([])
+    } finally {
+      for (const client of live) {
+        await client.close(0)
+        await client.drain()
+        client.release()
+      }
+    }
+  })
+
+  test.each([7, 8, 9, 10, 11, 12])('allows a control to converge on round %i', async (rounds) => {
+    let round = 0
+    const { memory } = meter({
+      usage: () => ({
+        rss: 100,
+        heapUsed: Math.min(++round, rounds - 1) * 32768,
+        external: 0,
+        arrayBuffers: 0,
+      }),
+    })
+    const reading = await memory.settled(null, null, 12)
+    expect(reading.gc.checkpoints).toHaveLength(rounds)
+    expect(reading.retained).toBe((rounds - 1) * 32768)
+  })
+
+  test('stops an unconverged control after twelve rounds', async () => {
+    let calls = 0
+    const { memory } = meter({
+      gc: () => calls++,
+      usage: () => ({ rss: 100, heapUsed: calls * 32768, external: 0, arrayBuffers: 0 }),
+    })
+    const reading = await memory.settled(null, null, 12)
+    expect(calls).toBe(24)
+    expect(reading.gc.checkpoints).toHaveLength(12)
+    expect(reading.retained).toBe(786432)
+  })
+
   test.each(['heapUsed', 'external', 'arrayBuffers'])(
     'uses the exact 16384-byte convergence boundary for %s',
     async (field) => {
@@ -269,7 +326,13 @@ describe('ProcessMemory', () => {
   )
 
   test('declares eager compilation without invoking telemetry or warming native work', () => {
-    expect(MEMORY_FLAGS).toEqual(['--expose-gc', '--no-lazy', '--no-lazy-feedback-allocation'])
+    expect(MEMORY_FLAGS).toEqual([
+      '--expose-gc',
+      '--no-lazy',
+      '--no-lazy-feedback-allocation',
+      '--min-semi-space-size=1',
+      '--max-semi-space-size=1',
+    ])
   })
 
   test('refuses a settled reading without a collection function', async () => {
