@@ -14,7 +14,9 @@ const {
   ShareThroughput,
   measureWindow,
   ownerFile,
+  evaluateSession,
 } = require('../shareThroughput')
+const { setupFailure } = require('../session')
 const { ARMS: SNAPPY_ARMS, snappySession } = require('../snappyCodec')
 const shareAdapter = require('../adapters/shareThroughput')
 const walkAdapter = require('../adapters/shareRecordWalk')
@@ -599,7 +601,7 @@ describe('Benchmark report share and Snappy adapters', () => {
       expect.arrayContaining([
         `driver sha256 ${record.driver.sha256}`,
         expect.stringMatching(/^node v\d+/),
-        'eachMessage 7633.59 ns per record, A/A spread 0.00 %: the smallest per-message cost this session resolves is 0.00 ns',
+        'eachMessage 7633.59 ns per record; observed A/A spread 0.00 % and retained scatter 0.00 % (repeatability, not a detection limit); the per-message context-entry cost is owed to an invocation-path measurement',
       ])
     )
 
@@ -876,58 +878,185 @@ describe('Benchmark report share and Snappy adapters', () => {
     }
   }
 
-  test('the eachMessage row resolves a seeded per-message cost the size of one async-context entry', async () => {
+  test('the eachMessage measured window grows by the seeded cost of every handler call inside it', async () => {
     const recordMs = 0.01
     const plain = await observeLoop('eachMessage', recordMs, 0)
     const seeded = await observeLoop('eachMessage', recordMs, 0.0001)
     expect(plain.window.status).toBe('valid')
+    expect(plain.inside).toBeGreaterThan(0)
     expect(seeded.inside).toBe(plain.inside)
     expect(
       seeded.window.end - seeded.window.start - (plain.window.end - plain.window.start)
     ).toBeCloseTo(plain.inside * 0.0001, 6)
     expect(seeded.window.recordsPerSecond).toBeLessThan(plain.window.recordsPerSecond)
+  })
 
-    /** A PRE or POST session: eight observations of each arm per repetition, seeded host noise. */
-    const sessionAt = async (addedMs) => {
-      let seed = 7
-      const noise = () => {
-        seed = (seed * 48271) % 2147483647
-        return 1 + (seed / 2147483647 - 0.5) * 0.004
-      }
-      const arms = {}
-      for (const [label, handler] of [
-        ['eachMessage', 'eachMessage'],
-        ['record_limit', 'eachBatch'],
-      ]) {
-        arms[label] = { a: [], aprime: [] }
-        for (const rep of ['a', 'aprime'])
-          for (let i = 0; i < LIMITS.observations; i++) {
-            const { window } = await observeLoop(handler, recordMs * noise(), addedMs)
-            arms[label][rep].push({
-              status: window.status,
-              recordsPerSecond: window.recordsPerSecond,
-            })
-          }
-      }
-      return { session: 'eachMessage', node: 'v22.22.0', driver: { sha256: 'a'.repeat(64) }, arms }
+  /**
+   * A copy of an accepted session record whose `label` arm has `base` records/s in its discarded
+   * observation and `base × multipliers[i]` in the seven retained ones, in both repetitions, with
+   * the evaluation recomputed so the record still agrees with itself.
+   */
+  const withThroughput = (record, label, base, multipliers = [1, 1, 1, 1, 1, 1, 1]) => {
+    const copy = JSON.parse(JSON.stringify(record))
+    for (const rep of ['a', 'aprime'])
+      copy.arms[label][rep].forEach((row, i) => {
+        row.recordsPerSecond = base * (i === 0 ? 1 : multipliers[i - 1])
+      })
+    copy.evaluation = evaluateSession({ arms: copy.arms }, null, Object.keys(copy.arms).sort())
+    copy.status = copy.evaluation.status
+    return copy
+  }
+
+  test('the eachMessage comparison shows its observed difference and scatter and leaves the per-message cost owed', async () => {
+    const { record: pre } = await sessionRecord('eachMessage')
+    const { record: post } = await sessionRecord('eachMessage', (args) =>
+      valueAfter(args, '--handler') === 'eachMessage' ? { recordsPerSecond: 130000 } : {}
+    )
+    const owed =
+      'the per-message context-entry cost is owed to an invocation-path measurement; these runs show the observed difference, A/A spread and scatter, not a detection limit'
+    const real = shareAdapter.compareEachMessage(pre, post)
+    expect(real).toEqual({
+      status: 'inconclusive',
+      reason: owed,
+      perRecordNs: { pre: 1e9 / 131000, post: 1e9 / 130000 },
+      deltaNs: 1e9 / 130000 - 1e9 / 131000,
+      controlDrift: 0,
+      adjustedDeltaNs: 1e9 / 130000 - 1e9 / 131000,
+      aaSpread: 0,
+      scatter: 0,
+    })
+
+    const wide = [0.8, 0.9, 0.99, 1, 1.01, 1.1, 1.2]
+    const scattered = shareAdapter.compareEachMessage(
+      withThroughput(pre, 'eachMessage', 100000, wide),
+      withThroughput(pre, 'eachMessage', 99999, wide)
+    )
+    expect(scattered.adjustedDeltaNs).toBeCloseTo(0.100001, 6)
+    expect(scattered.aaSpread).toBe(0)
+    expect(scattered.scatter).toBeCloseTo(0.4, 9)
+    expect(scattered.status).toBe('inconclusive')
+    expect(scattered.reason).toBe(owed)
+    for (const claim of ['resolved', 'resolutionNs', 'noise', 'comparable'])
+      expect(scattered).not.toHaveProperty(claim)
+  })
+
+  test('the eachMessage comparison refuses missing provenance, unsuccessful sessions and incomplete or nonpositive observations', async () => {
+    const { record: pre } = await sessionRecord('eachMessage')
+    const { record: post } = await sessionRecord('eachMessage')
+    const compare = shareAdapter.compareEachMessage
+    expect(compare(pre, post).status).toBe('inconclusive')
+
+    expect(() => compare({ ...pre, driver: { file: pre.driver.file } }, post)).toThrow(
+      'PRE: no driver sha256'
+    )
+    expect(() => compare(pre, { ...post, node: undefined })).toThrow('POST: no Node version')
+    expect(() =>
+      compare(pre, { ...post, driver: { ...post.driver, sha256: 'b'.repeat(64) } })
+    ).toThrow(`the runs used different drivers: ${pre.driver.sha256} and ${'b'.repeat(64)}`)
+    expect(() => compare(pre, { ...post, node: 'v99.0.0' })).toThrow(
+      `the runs used different Node versions: ${pre.node} and v99.0.0`
+    )
+    expect(() => compare({ ...pre, session: 'batch' }, post)).toThrow(
+      'PRE: not an eachMessage session record'
+    )
+
+    const { record: unclean } = await sessionRecord('eachMessage', undefined, {
+      fixture: (phase) =>
+        phase === 'cleanup' ? { status: 1, stdout: '', stderr: 'topic still listed' } : undefined,
+    })
+    expect(unclean.evaluation.status).toBe('accepted')
+    expect(() => compare(pre, unclean)).toThrow(
+      'POST: the session is error: cleanup: corpus cleanup failed: exit 1: topic still listed'
+    )
+    const { record: noisy } = await sessionRecord('eachMessage', (args, call) =>
+      valueAfter(args, '--handler') === 'eachBatch' && call > 17 ? { recordsPerSecond: 160000 } : {}
+    )
+    expect(() => compare(noisy, post)).toThrow('PRE: the session is void')
+    expect(() =>
+      compare(pre, { ...post, status: 'inconclusive', reason: 'no measurement window: x' })
+    ).toThrow('POST: the session is inconclusive: no measurement window: x')
+
+    const short = {
+      ...post,
+      arms: {
+        ...post.arms,
+        eachMessage: { ...post.arms.eachMessage, aprime: post.arms.eachMessage.aprime.slice(1) },
+      },
     }
-    const pre = await sessionAt(0)
-    const post = await sessionAt(0.0001)
-    const resolved = shareAdapter.compareEachMessage(pre, post)
-    expect(resolved.comparable).toBe(true)
-    const perCall = (plain.inside / 3000) * 100
-    expect(resolved.deltaNs).toBeCloseTo(perCall, 6)
-    expect(resolved.resolutionNs).toBeGreaterThan(0)
-    expect(resolved.resolutionNs).toBeLessThan(perCall / 2)
-    expect(Math.abs(resolved.controlDrift)).toBeLessThan(resolved.noise)
-    expect(resolved.resolved).toBe(true)
-    const otherNode = shareAdapter.compareEachMessage(pre, { ...post, node: 'v24.11.0' })
-    expect([otherNode.comparable, otherNode.resolved]).toEqual([false, false])
+    expect(() => compare(pre, short)).toThrow(
+      'POST: eachMessage aprime has 7 observations, expected 8'
+    )
+    expect(() => compare(withThroughput(pre, 'record_limit', 0), post)).toThrow(
+      'PRE: record_limit a 0 has no positive throughput'
+    )
 
-    const hidden = shareAdapter.compareEachMessage(pre, await sessionAt(0.000001))
-    expect(hidden.deltaNs).toBeCloseTo(perCall / 100, 6)
-    expect(hidden.resolutionNs).toBeGreaterThan(hidden.deltaNs)
-    expect(hidden.resolved).toBe(false)
+    const receipt = (record, result) => {
+      const file = path.join(freshDir(), 'fork.json')
+      const stdout = `share session\n${JSON.stringify(record)}\n`
+      fs.writeFileSync(
+        file,
+        JSON.stringify({ arm: 'fork', runs: [{ run: 1, args: [], stderr: '', stdout, ...result }] })
+      )
+      return file
+    }
+    const done = { status: 0, signal: null, error: null }
+    expect(shareAdapter.compareFiles(receipt(pre, done), receipt(post, done))).toEqual(
+      compare(pre, post)
+    )
+    expect(() =>
+      shareAdapter.compareFiles(
+        receipt(pre, { status: null, signal: 'SIGTERM' }),
+        receipt(post, done)
+      )
+    ).toThrow('PRE: killed by SIGTERM')
+    expect(() =>
+      shareAdapter.compareFiles(receipt(pre, done), receipt(unclean, { status: 1, signal: null }))
+    ).toThrow('POST: session error: cleanup: corpus cleanup failed: exit 1: topic still listed')
+  })
+
+  test('a selected share or Snappy job whose workflow setup failed reports an error row and starts no work', async () => {
+    expect(setupFailure(undefined)).toBeUndefined()
+    expect(setupFailure('start=success share=success')).toBeUndefined()
+    expect(setupFailure('start=success share=failure guard=skipped junk')).toBe(
+      'workflow setup did not succeed: share=failure, guard=skipped, junk'
+    )
+
+    const { spawn, calls } = sessionSpawn()
+    const admins = []
+    const reason = 'workflow setup did not succeed: share=failure, guard=skipped'
+    const record = await new ShareSession('eachMessage', {
+      raw: path.join(freshDir(), 'fork-run-1.jsonl'),
+      spawn,
+      env: { BENCH_SHARE_ROWS: '1', BENCH_SETUP: 'start=success share=failure guard=skipped' },
+      admin: () => admins.push('admin'),
+    }).run()
+    expect(record).toEqual({ schema: 1, session: 'eachMessage', status: 'error', reason })
+    expect([calls, admins]).toEqual([[], []])
+    const shown = report(shareEntry('eachMessage'), [sessionResult(record)])
+    expect(shown.rows).toEqual([
+      expect.objectContaining({ status: 'error', reason: `run 1 of 1: session error: ${reason}` }),
+    ])
+    const stored = JSON.parse(fs.readFileSync(path.join(shown.raw, 'fork.json'), 'utf8'))
+    expect(JSON.parse(stored.runs[0].stdout.split('\n')[1])).toEqual(record)
+
+    let children = 0
+    const snappy = snappySession({
+      raw: path.join(freshDir(), 'fork-run-1.jsonl'),
+      spawn: () => children++,
+      env: { BENCH_SNAPPY_ROWS: '1', BENCH_SETUP: 'install=success java=failure' },
+    })
+    const javaReason = 'workflow setup did not succeed: java=failure'
+    expect(snappy).toEqual({ schema: 1, session: 'snappy', status: 'error', reason: javaReason })
+    expect(children).toBe(0)
+    const missing = path.join(freshDir(), 'no-receipt.log')
+    const snappyShown = report(snappyEntry(missing), [snappyResult(snappy)])
+    expect(snappyShown.rows).toEqual([
+      expect.objectContaining({
+        status: 'error',
+        reason: `run 1 of 1: session error: ${javaReason}`,
+      }),
+    ])
+    expect(fs.readdirSync(snappyShown.raw).sort()).toEqual(['entry.json', 'fork.json'])
   })
 
   test('the manifest runs exactly the five share and Snappy rows and no longer excludes their drivers', () => {
