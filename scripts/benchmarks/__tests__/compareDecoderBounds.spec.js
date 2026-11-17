@@ -4,9 +4,13 @@ const path = require('path')
 const { EventEmitter } = require('events')
 const {
   ARMS,
+  INFORMATION_ONLY_ROWS,
+  PARTITIONS,
   WORK_MULTIPLIERS,
   MeasurementCollector,
+  combine,
   compare,
+  formatReport,
   main,
   medianInterval,
   createSchedule,
@@ -70,6 +74,39 @@ const completeInput = (overrides = {}) => {
 const withRow = (arm) =>
   completeInput({ arms: completeInput().arms.map((a) => (a.name === arm.name ? arm : a)) })
 const resultOf = (arm) => compare(withRow(arm)).arms.find(({ name }) => name === arm.name)
+/** @returns {object[]} the three complete partition files built from the same paired rows */
+const partitionInputs = () =>
+  Object.entries(PARTITIONS).map(([partition, names]) => ({
+    ...completeInput({ unavailable: [] }),
+    partition,
+    workMultipliers: WORK_MULTIPLIERS,
+    arms: names.map((name) => {
+      const paired = row(name)
+      for (const invocation of paired.invocations)
+        invocation.workMultiplier = WORK_MULTIPLIERS[name]
+      return paired
+    }),
+  }))
+/** @param {object[]} inputs partition files @param {string} name @returns {object} that row */
+const rowIn = (inputs, name) =>
+  inputs.flatMap(({ arms }) => arms).find((paired) => paired.name === name)
+/** @param {object} paired row @param {object} samples replacement A/B/C samples @returns {void} */
+const setSides = (paired, samples) => {
+  const { metric } = ARMS.find(({ name }) => name === paired.name)
+  const fields = { A: 'oldNsPerOp', B: 'newNsPerOp', C: 'baselineControlNsPerOp' }
+  for (const [side, values] of Object.entries(samples)) {
+    paired[fields[side]] = values
+    for (const invocation of paired.invocations.filter((i) => i.side === side)) {
+      invocation[metric] = values[invocation.block]
+      invocation.roundNsPerOp.fill(values[invocation.block])
+    }
+  }
+}
+const STRADDLING = () => [...Array(23).fill(100), ...Array(7).fill(106)]
+const ORDINARY = 'record-batch:uncompressed'
+const NOISY_CONTROL = 'array-decode:readArray'
+const INCONCLUSIVE_REASON = 'D194: noise-only inconclusive, median within 5 %'
+const INVALID_REASON = 'D171: noise-only invalid, median within 5 %'
 const runInput = async (input) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'decoder-compare-'))
   try {
@@ -119,14 +156,20 @@ describe('Decoder performance comparison', () => {
     expect(result.verdict).toBe('fail')
   })
 
-  it('an interval straddling five percent is inconclusive and no exception rescues it', async () => {
+  it('an interval straddling five percent is inconclusive and passes only as median-bounded noise', async () => {
     const ordinary = 'record-batch:uncompressed'
     const arm = row(ordinary, constant(100), [...Array(23).fill(100), ...Array(7).fill(106)])
     expect(resultOf(arm).verdict).toBe('inconclusive')
-    expect(compare(withRow(arm), new Map([[ordinary, { maxSlowdownPercent: 1000 }]])).pass).toBe(
+    const result = compare(withRow(arm))
+    expect(result.pass).toBe(true)
+    expect(result.noiseAcceptedRows).toEqual([ordinary])
+    expect((await runInput(withRow(arm))).status).toBe(0)
+    const slower = row(ordinary, constant(100), [...Array(15).fill(105), ...Array(15).fill(106)])
+    expect(resultOf(slower).verdict).toBe('fail')
+    expect(compare(withRow(slower), new Map([[ordinary, { maxSlowdownPercent: 1000 }]])).pass).toBe(
       false
     )
-    expect((await runInput(withRow(arm))).status).toBe(1)
+    expect((await runInput(withRow(slower))).status).toBe(1)
     expect(() =>
       parseExceptions([{ arm: ordinary, maxSlowdownPercent: 1000, ruling: 'test' }])
     ).toThrow(/empty/)
@@ -468,6 +511,217 @@ describe('Decoder performance comparison', () => {
       expect(() => parseArgs(argv)).toThrow(/usage/)
     expect(await main(['--run'], () => {})).toBe(1)
     expect(await main(['--input', '/nonexistent/input.json'], () => {})).toBe(1)
+  })
+
+  it('accepts a noise-only inconclusive non-frame row within 5 %', async () => {
+    const ordinary = ARMS.filter(
+      ({ name, required }) => required && !Object.hasOwn(INFORMATION_ONLY_ROWS, name)
+    )
+    expect(ordinary.length).toBeGreaterThan(0)
+    for (const { name } of ordinary) {
+      for (const B of [STRADDLING(), [...Array(15).fill(100), ...Array(15).fill(106)]]) {
+        const input = withRow(row(name, constant(100), B))
+        const result = compare(input)
+        expect(result.problems).toEqual([])
+        expect(result.arms.find((arm) => arm.name === name)).toMatchObject({
+          verdict: 'inconclusive',
+          problems: [],
+          oldMedian: 100,
+        })
+        expect(result.pass).toBe(true)
+        expect(result.noiseAcceptedRows).toEqual([name])
+        expect(formatReport(result)).toContain(
+          `INCONCLUSIVE (noise; median within 5%, D194) ${name}`
+        )
+        expect((await runInput(input)).status).toBe(0)
+      }
+    }
+  })
+
+  it('does not accept an inconclusive row with an invalid sample', () => {
+    const mutations = [
+      (paired) => (paired.newNsPerOp[0] = 0),
+      (paired) => (paired.oldNsPerOp[0] = Infinity),
+      (paired) => (paired.newNsPerOp[3] = NaN),
+      (paired) => paired.baselineControlNsPerOp.pop(),
+      (paired) => (paired.invocations[0].error = 'control failed'),
+      (paired) => (paired.invocations[1].roundNsPerOp = [NaN]),
+    ]
+    for (const mutate of mutations) {
+      const paired = row(ORDINARY, constant(100), STRADDLING())
+      expect(compare(withRow(paired)).noiseAcceptedRows).toEqual([ORDINARY])
+      mutate(paired)
+      const result = compare(withRow(paired))
+      const judged = result.arms.find(({ name }) => name === ORDINARY)
+      expect(judged.verdict).toBe('invalid')
+      expect(judged.problems.length).toBeGreaterThan(0)
+      expect(result.pass).toBe(false)
+      expect(result.noiseAcceptedRows).toEqual([])
+      expect(result.noiseAcceptedReasons).toEqual({})
+    }
+  })
+
+  it('does not accept an inconclusive row from a missing partition', () => {
+    const inputs = partitionInputs()
+    setSides(rowIn(inputs, ORDINARY), { B: STRADDLING() })
+    expect(combine(inputs)).toMatchObject({ pass: true, noiseAcceptedRows: [ORDINARY] })
+    const batch = inputs.find(({ partition }) => partition === 'batch-array')
+    for (const partial of [[batch], inputs.filter((input) => input.partition !== 'frame-1m')]) {
+      const result = combine(partial)
+      expect(result.problems).toContain('all three partitions are required')
+      expect(result.arms.find(({ name }) => name === ORDINARY).verdict).toBe('inconclusive')
+      expect(result.pass).toBe(false)
+      expect(result.noiseAcceptedRows).toEqual([])
+      expect(result.noiseAcceptedReasons).toEqual({})
+    }
+    const missingRow = { ...batch, arms: batch.arms.filter(({ name }) => name !== NOISY_CONTROL) }
+    for (const result of [
+      compare(missingRow),
+      combine(inputs.map((input) => (input === batch ? missingRow : input))),
+    ]) {
+      expect(result.problems).toContain(`required arm ${NOISY_CONTROL} is missing`)
+      expect(result.pass).toBe(false)
+      expect(result.noiseAcceptedRows).toEqual([])
+      expect(result.noiseAcceptedReasons).toEqual({})
+    }
+  })
+
+  it('never accepts fail, regression, a timeout or a row with problems', () => {
+    const cases = [
+      ['fail', row(ORDINARY, constant(100), [...Array(15).fill(105), ...Array(15).fill(106)])],
+      ['regression', row(ORDINARY, constant(100), constant(106))],
+      ['invalid', row(ORDINARY, constant(100), STRADDLING(), constant(106))],
+      ['invalid', row(ORDINARY, constant(100), [...Array(15).fill(100), ...Array(15).fill(200)])],
+    ]
+    for (const [verdict, paired] of cases) {
+      const result = compare(withRow(paired))
+      expect(result.arms.find(({ name }) => name === ORDINARY).verdict).toBe(verdict)
+      expect(result.pass).toBe(false)
+      expect(result.noiseAcceptedRows).toEqual([])
+      expect(result.noiseAcceptedReasons).toEqual({})
+      expect(formatReport(result)).not.toContain('D194')
+    }
+    const timedOut = withRow(row(ORDINARY, constant(100), STRADDLING()))
+    timedOut.timedOut = true
+    const inputs = partitionInputs()
+    setSides(rowIn(inputs, ORDINARY), { B: STRADDLING() })
+    inputs.find(({ partition }) => partition === 'batch-array').timedOut = true
+    for (const result of [compare(timedOut), combine(inputs)]) {
+      expect(result.problems).toContain('collection timed out')
+      expect(result.arms.find(({ name }) => name === ORDINARY).verdict).toBe('inconclusive')
+      expect(result.pass).toBe(false)
+      expect(result.noiseAcceptedRows).toEqual([])
+      expect(result.noiseAcceptedReasons).toEqual({})
+    }
+  })
+
+  it('frame rows keep the D167/D168 treatment', () => {
+    for (const name of Object.keys(INFORMATION_ONLY_ROWS)) {
+      const inputs = partitionInputs()
+      setSides(rowIn(inputs, name), { B: STRADDLING() })
+      const input = inputs.find(({ arms }) => arms.some((paired) => paired.name === name))
+      for (const result of [compare(input), combine(inputs)]) {
+        expect(result.arms.find((arm) => arm.name === name).verdict).toBe('inconclusive')
+        expect(result.pass).toBe(true)
+        expect(result.noiseAcceptedRows).toEqual([])
+        expect(result.noiseAcceptedReasons).toEqual({})
+        const line = formatReport(result)
+          .split('\n')
+          .find((text) => text.includes(name))
+        expect(line).toContain('information only (D167)')
+        expect(line).not.toContain('D194')
+      }
+      setSides(rowIn(inputs, name), { B: constant(106) })
+      for (const result of [compare(input), combine(inputs)]) {
+        expect(result.arms.find((arm) => arm.name === name).verdict).toBe('regression')
+        expect(result.pass).toBe(false)
+      }
+    }
+  })
+
+  it('noiseAcceptedReasons gives the verdict and reason of every accepted row', () => {
+    const inputs = partitionInputs()
+    setSides(rowIn(inputs, ORDINARY), { B: STRADDLING() })
+    setSides(rowIn(inputs, NOISY_CONTROL), { C: STRADDLING() })
+    const batch = inputs.find(({ partition }) => partition === 'batch-array')
+    for (const result of [compare(batch), combine(inputs)]) {
+      expect(result.pass).toBe(true)
+      expect(result.noiseAcceptedRows).toEqual([ORDINARY, NOISY_CONTROL])
+      expect(result.noiseAcceptedReasons).toEqual({
+        [ORDINARY]: { verdict: 'inconclusive', reason: INCONCLUSIVE_REASON },
+        [NOISY_CONTROL]: { verdict: 'invalid', reason: INVALID_REASON },
+      })
+    }
+    const clean = combine(partitionInputs())
+    expect(clean.noiseAcceptedRows).toEqual([])
+    expect(clean.noiseAcceptedReasons).toEqual({})
+    expect(combine('not partitions').noiseAcceptedReasons).toEqual({})
+  })
+
+  it('combine writes accepted rows with verdict and reason to the step summary', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'decoder-summary-'))
+    try {
+      const inputs = partitionInputs()
+      setSides(rowIn(inputs, ORDINARY), { B: STRADDLING() })
+      setSides(rowIn(inputs, NOISY_CONTROL), { C: STRADDLING() })
+      const argv = inputs.flatMap((input) => {
+        const file = path.join(dir, `${input.partition}.json`)
+        fs.writeFileSync(file, JSON.stringify(input))
+        return ['--input', file]
+      })
+      const summary = path.join(dir, 'summary.md')
+      fs.writeFileSync(summary, 'earlier step\n')
+      const out = path.join(dir, 'combined.json')
+      const env = { GITHUB_STEP_SUMMARY: summary }
+      expect(await main(['--combine', ...argv, '--out', out], () => {}, env)).toBe(0)
+      const text = fs.readFileSync(summary, 'utf8')
+      expect(text.startsWith('earlier step\n')).toBe(true)
+      expect(text).toContain('| Row | Verdict | Reason |')
+      expect(text).toContain(`| ${ORDINARY} | inconclusive | ${INCONCLUSIVE_REASON} |`)
+      expect(text).toContain(`| ${NOISY_CONTROL} | invalid | ${INVALID_REASON} |`)
+      expect(JSON.parse(fs.readFileSync(out, 'utf8')).result.noiseAcceptedReasons).toEqual({
+        [ORDINARY]: { verdict: 'inconclusive', reason: INCONCLUSIVE_REASON },
+        [NOISY_CONTROL]: { verdict: 'invalid', reason: INVALID_REASON },
+      })
+      fs.writeFileSync(summary, '')
+      expect(await main(argv.slice(4, 6), () => {}, env)).toBe(0)
+      expect(fs.readFileSync(summary, 'utf8')).toBe('')
+      expect(await main(['--combine', ...argv], () => {}, {})).toBe(0)
+      expect(fs.readFileSync(summary, 'utf8')).toBe('')
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('the replay fixture verdict is unchanged except the accepted rows', () => {
+    const repeat = (samples) => Array.from({ length: 30 }, (_, n) => samples[n % samples.length])
+    const derived = replay.sources.map(({ arm: source }, index) =>
+      index < 3
+        ? row(
+            source.name,
+            constant(sortedMedian(source.oldNsPerOp)),
+            constant(sortedMedian(source.newNsPerOp)),
+            constant(sortedMedian(source.baselineControlNsPerOp))
+          )
+        : {
+            ...row(source.name, repeat(source.oldNsPerOp), repeat(source.newNsPerOp)),
+            baselineControlNsPerOp: [],
+          }
+    )
+    const withoutControls = derived[3]
+    withoutControls.invocations = withoutControls.invocations.filter(({ side }) => side !== 'C')
+    const expected = ['pass', 'regression', 'regression', 'invalid']
+    expect(replay.sources).toHaveLength(expected.length)
+    for (const [index, paired] of derived.entries()) {
+      for (const arm of [paired, replay.sources[index].arm]) {
+        const result = compare(withRow(arm))
+        const verdict = result.arms.find(({ name }) => name === arm.name).verdict
+        expect(verdict).toBe(arm === paired ? expected[index] : 'invalid')
+        expect(result.pass).toBe(verdict === 'pass')
+        expect(result.noiseAcceptedRows).toEqual([])
+        expect(result.noiseAcceptedReasons).toEqual({})
+      }
+    }
   })
 })
 

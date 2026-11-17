@@ -239,7 +239,34 @@ describe('Decoder measurement partitions', () => {
     }
   })
 
-  it('keeps valid strict FAIL REGRESSION and INCONCLUSIVE verdicts blocking under D171', () => {
+  it('accepts a valid noise-only INCONCLUSIVE row at its median bound in compare and combine', () => {
+    const inputs = evidence()
+    const input = inputs.find(({ partition }) => partition === 'batch-array')
+    const row = input.arms.find(({ name }) => name === 'record-batch:uncompressed')
+    setSamples(row, 'B', [...Array(23).fill(100), ...Array(7).fill(106)])
+    for (const result of [compare(input), combine(inputs)]) {
+      expect(result.problems).toEqual([])
+      expect(result.arms.find(({ name }) => name === row.name)).toMatchObject({
+        verdict: 'inconclusive',
+        problems: [],
+        oldMedian: 100,
+        newMedian: 100,
+      })
+      expect(result.pass).toBe(true)
+      expect(result.noiseAcceptedRows).toEqual([row.name])
+      expect(result.noiseAcceptedReasons).toEqual({
+        [row.name]: {
+          verdict: 'inconclusive',
+          reason: 'D194: noise-only inconclusive, median within 5 %',
+        },
+      })
+      expect(formatReport(result)).toContain(
+        `INCONCLUSIVE (noise; median within 5%, D194) ${row.name}`
+      )
+    }
+  })
+
+  it('keeps valid strict FAIL and REGRESSION verdicts blocking under D171', () => {
     for (const [verdict, A, B] of [
       [
         'fail',
@@ -247,7 +274,6 @@ describe('Decoder measurement partitions', () => {
         [114, ...Array(14).fill(105), ...Array(15).fill(119.7)],
       ],
       ['regression', Array(30).fill(100), Array(30).fill(106)],
-      ['inconclusive', Array(30).fill(100), [...Array(23).fill(100), ...Array(7).fill(106)]],
     ]) {
       const inputs = evidence()
       const input = inputs.find(({ partition }) => partition === 'batch-array')

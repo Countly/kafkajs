@@ -19,6 +19,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 #### Tooling
 
 - The benchmark report keeps raw observations and controls per row, labels each row valid, inconclusive, invalid, error or omitted, and compares round-robin, uniform sticky and adaptive partitioning on a healthy and a slow-broker cluster.
+- The decoder performance gate accepts a non-frame row that is inconclusive only from runner noise when its median is within 5 %, and lists such rows with their reason in the job summary.
 
 ### Phase 10 — Release, CI and benchmarks
 
