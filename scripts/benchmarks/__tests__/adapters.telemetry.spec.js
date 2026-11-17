@@ -137,7 +137,7 @@ const runRow = (env, inner, root = fakeRoot()) => {
   return { ...result, rawDir, raw: path.join(rawDir, ENTRY.name, 'fork-run-1.jsonl') }
 }
 
-describe('scripts/benchmarks/adapters/telemetrySession', () => {
+describe('Benchmarks > telemetrySession adapter', () => {
   test('the telemetry row refuses to run without its fixture', () => {
     const { spawn, calls } = controller()
     const bare = runRow({}, spawn)
