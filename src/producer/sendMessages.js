@@ -27,9 +27,9 @@ const { RequestBudget, recordsBytes } = require('./state/recordSize')
 
 const { keys } = Object
 
-// The last Produce version that keys topics by name, and the highest a transactional send uses:
-// from v12 a produce inside a transaction implicitly adds the partition to the transaction.
-// @see clients/src/main/resources/common/message/ProduceRequest.json (Apache Kafka 4.3.1)
+// v11 is the retained ceiling for a request that carries no topic ids (safe for transaction
+// version 1); v12 is still name-keyed, v13+ uses TopicId.
+// @see clients/src/main/resources/common/message/ProduceRequest.json (Apache Kafka 4.4.0)
 const PRODUCE_TOPIC_NAMES_MAX_VERSION = 11
 
 const NO_PARTITION_METADATA = 'Producing to a partition without metadata'

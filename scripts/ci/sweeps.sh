@@ -56,8 +56,6 @@ stale_exceptions() {
 }
 
 TODOS=$(cat <<'LIST'
-src/broker/index.js:    // TODO: validate topics not null/empty
-src/broker/index.js:    // TODO: validate groupId, mandatory
 LIST
 )
 
@@ -202,8 +200,6 @@ check host-path "$FIXTURE_IDENTITIES"
 hits todo -n -E '\b(TODO|FIXME|XXX|HACK)\b' -- "${SHIPPED[@]}"
 SELF_TODOS=$(printf '%b\n' "$(cat <<'LIST'
 scripts/ci/sweeps.sh:# label grep against alpha.9b, test-only exports, focused or failing tests, host paths, \x54ODO text and leftover .orig/.rej files. Each
-scripts/ci/sweeps.sh:src/broker/index.js:    // \x54ODO: validate topics not null/empty
-scripts/ci/sweeps.sh:src/broker/index.js:    // \x54ODO: validate groupId, mandatory
 scripts/ci/sweeps.sh:hits todo -n -E '\\b(\x54ODO|\x46IXME|\x58XX|\x48ACK)\\b' -- "${SHIPPED[@]}"
 scripts/ci/checkNodeTests.js:      const end = /^( *)(not ok|ok) (\\d+) - (.*?)(?: # (SKIP|\x54ODO)\\b.*)?$/.exec(line)
 scripts/ci/checkNodeTests.js:          failed: end[2] !== 'ok' || end[5] === '\x54ODO',

@@ -59,9 +59,9 @@ const offsetsTopicIds = (topics) => {
 // @see clients/src/main/java/org/apache/kafka/common/requests/SyncGroupRequest.java (Apache Kafka 4.3.1, areMandatoryProtocolTypeAndNamePresent)
 const SYNC_GROUP_NO_PROTOCOL_MAX_VERSION = 4
 
-// The last Produce version keyed by topic name. A request that supplies no topic ids cannot be
-// sent above it, whatever the broker advertises.
-// @see clients/src/main/resources/common/message/ProduceRequest.json (Apache Kafka 4.3.1)
+// v11 is the retained ceiling for a request that carries no topic ids (safe for transaction
+// version 1); v12 is still name-keyed, v13+ uses TopicId.
+// @see clients/src/main/resources/common/message/ProduceRequest.json (Apache Kafka 4.4.0)
 const PRODUCE_TOPIC_NAMES_MAX_VERSION = 11
 
 // The last Produce, EndTxn and TxnOffsetCommit versions a transaction may use while its
@@ -1084,7 +1084,6 @@ module.exports = class Broker {
     guard,
   }) {
     this.throwIfRefused(guard)
-    // TODO: validate topics not null/empty
     // Ids are what v13+ is keyed by, so a request without them cannot be sent above v12. A caller
     // may still ask for something lower.
     const cap =
@@ -1412,7 +1411,6 @@ module.exports = class Broker {
    * @returns {Promise}
    */
   async findGroupCoordinator({ groupId, coordinatorType, guard }) {
-    // TODO: validate groupId, mandatory
     this.throwIfRefused(guard)
     const findCoordinator = this.lookupRequest(apiKeys.GroupCoordinator, requests.GroupCoordinator)
     return await this[PRIVATE.SEND_REQUEST](findCoordinator({ groupId, coordinatorType }), guard)
