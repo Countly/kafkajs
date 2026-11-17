@@ -15,6 +15,7 @@ const GROUP = 'retire-group'
 const ID_A = '01020304-0506-0708-090a-0b0c0d0e0f10'
 const ID_B = '11121314-1516-1718-191a-1b1c1d1e1f20'
 const EARLIEST = { kind: 'earliest' }
+const DURATION = { kind: 'by_duration', durationMs: 1000 }
 
 /** Lets every pending request reach its stub. */
 const flush = () => new Promise(setImmediate)
@@ -25,6 +26,48 @@ const deferred = () => {
   const promise = new Promise((r) => (resolve = r))
   return { promise, resolve }
 }
+
+/**
+ * Holds every call of `mock` until the case resolves its gate, then answers it.
+ * @param {jest.Mock} mock
+ * @param {(index: number, ...args: any[]) => any} answer the call's result, by call order
+ * @returns {Array<{ resolve: () => void }>} one gate per call, in call order
+ */
+const gateCalls = (mock, answer) => {
+  const gates = []
+  mock.mockImplementation(async (...args) => {
+    const index = gates.length
+    const gate = deferred()
+    gates.push(gate)
+    await gate.promise
+    return answer(index, ...args)
+  })
+  return gates
+}
+
+/** An OffsetFetch answer committing `offset` on every requested cell. */
+const offsetFetchAnswer = (topics, offset) => ({
+  responses: topics.map(({ topic, partitions }) => ({
+    topic,
+    partitions: partitions.map(({ partition }) => ({
+      partition,
+      offset,
+      committedLeaderEpoch: -1,
+      metadata: null,
+      errorCode: 0,
+    })),
+  })),
+})
+
+/** A ListOffsets answer giving each requested cell `offsetOf(request)`. */
+const listOffsetsAnswer = (requests, offsetOf) =>
+  requests.map((request) => ({
+    topic: request.topic,
+    partitions: request.partitions.map(({ partition }) => ({
+      partition,
+      offset: offsetOf(request),
+    })),
+  }))
 
 /**
  * One group's shared pair, through the real registry, as every cluster of one `Kafka` sees it.
@@ -719,33 +762,118 @@ describe('Cluster > committed offset retirement', () => {
   })
 
   describe('real offset operations under the registry hooks', () => {
-    test('two held resolutions in either order keep the topic and fill the cell once', async () => {
+    test('two held resolutions of one manager in either order fill the cell once from the committed answer', async () => {
       for (const order of [
         [0, 1],
         [1, 0],
       ]) {
         const group = createGroup()
-        const holds = [{ fetch: deferred() }, { fetch: deferred() }]
-        const managers = holds.map(
-          (hold) =>
-            createManager(group, {
-              assignment: { topic: [0] },
-              obligations: linkedTable(group.ledger),
-              committed: () => '11',
-              hold,
-            }).manager
+        const { manager, coordinator } = createManager(group, {
+          assignment: { topic: [0] },
+          obligations: linkedTable(group.ledger),
+        })
+        const gates = gateCalls(coordinator.offsetFetch, (_, { topics }) =>
+          offsetFetchAnswer(topics, '11')
         )
-        const resolving = managers.map((manager) => manager.resolveOffsets())
+        const resolving = [manager.resolveOffsets(), manager.resolveOffsets()]
         await flush()
-        group.ledger.retireUnowned()
+        expect(gates).toHaveLength(2)
 
-        holds[order[0]].fetch.resolve()
+        gates[order[0]].resolve()
         await resolving[order[0]]
-        holds[order[1]].fetch.resolve()
+        const revisions = CommittedOffsetRevisions.forCache(group.cache)
+        const stamp = revisions.capture('topic', 0)
+        group.ledger.retireUnowned()
+        expect(group.cache.topic).toEqual({ 0: '11' })
+        expect(group.ledger.isOwned('topic')).toBe(true)
+        expect(group.ledger.openTickets).toBe(1)
+
+        gates[order[1]].resolve()
         await resolving[order[1]]
 
+        expect(revisions.isCurrent('topic', 0, stamp)).toBe(true)
         expect(group.cache.topic).toEqual({ 0: '11' })
-        for (const manager of managers) expect(manager.heldOffsetAt('topic', 0)).toBe('11')
+        expect(manager.heldOffsetAt('topic', 0)).toBe('11')
+        expect(group.ledger.openTickets).toBe(0)
+        expect(group.ledger.size()).toBe(0)
+      }
+    })
+
+    test('two held resolutions of one manager in either order keep the first derived reset answer', async () => {
+      for (const order of [
+        [0, 1],
+        [1, 0],
+      ]) {
+        const group = createGroup()
+        const { manager, cluster } = createManager(group, {
+          assignment: { topic: [0] },
+          obligations: linkedTable(group.ledger),
+        })
+        const answers = ['5', '6']
+        const gates = gateCalls(cluster.fetchTopicsOffset, (index, requests) =>
+          listOffsetsAnswer(requests, () => answers[index])
+        )
+        const resolving = [manager.resolveOffsets(), manager.resolveOffsets()]
+        await flush()
+        expect(gates).toHaveLength(2)
+
+        gates[order[0]].resolve()
+        await resolving[order[0]]
+        const position = manager.resetPositions.topic[0]
+        group.ledger.retireUnowned()
+        expect(position.offset).toBe(answers[order[0]])
+        expect(group.ledger.isOwned('topic')).toBe(true)
+        expect(group.ledger.openTickets).toBe(1)
+
+        gates[order[1]].resolve()
+        await resolving[order[1]]
+
+        expect(manager.resetPositions.topic[0]).toBe(position)
+        expect(manager.heldOffsetAt('topic', 0)).toBe(answers[order[0]])
+        expect(
+          CommittedOffsetRevisions.forCache(group.cache).isCurrent('topic', 0, position.revision)
+        ).toBe(true)
+        expect(group.cache.topic?.[0]).toBeUndefined()
+        expect(group.ledger.openTickets).toBe(0)
+        expect(group.ledger.size()).toBe(0)
+      }
+    })
+
+    test('sibling managers with different reset policies keep their own position on one cell in either order', async () => {
+      for (const order of [
+        [0, 1],
+        [1, 0],
+      ]) {
+        const group = createGroup()
+        const members = [EARLIEST, DURATION].map((policy) => {
+          const member = createManager(group, {
+            assignment: { topic: [0] },
+            obligations: linkedTable(group.ledger),
+          })
+          member.manager.topicConfigurations.topic = { resetPolicy: policy }
+          member.gates = gateCalls(member.cluster.fetchTopicsOffset, (_, requests) =>
+            listOffsetsAnswer(requests, (request) => (request.fromBeginning ? '0' : '2'))
+          )
+          return member
+        })
+        const resolving = members.map(({ manager }) => manager.resolveOffsets())
+        await flush()
+
+        members[order[0]].gates[0].resolve()
+        await resolving[order[0]]
+        group.ledger.retireUnowned()
+        expect(group.ledger.isOwned('topic')).toBe(true)
+        expect(group.ledger.openTickets).toBe(1)
+        members[order[1]].gates[0].resolve()
+        await resolving[order[1]]
+
+        expect(members.map(({ manager }) => manager.heldOffsetAt('topic', 0))).toEqual(['0', '2'])
+        expect(members.map(({ manager }) => manager.nextOffset('topic', 0).toString())).toEqual([
+          '0',
+          '2',
+        ])
+        expect(group.cache.topic?.[0]).toBeUndefined()
+        expect(group.ledger.openTickets).toBe(0)
         expect(group.ledger.size()).toBe(0)
       }
     })

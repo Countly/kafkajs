@@ -631,6 +631,25 @@ describe('Consumer churn profile > a member', () => {
     expect(lost.consumer.commitOffsets).not.toHaveBeenCalled()
   })
 
+  test('a deleted topic ends the ownership: its later revoke, delivery and commit journal nothing', async () => {
+    const { member, appended, handlers, consumer, topics } = setup()
+    await member.start([/^t/])
+    await handlers.onPartitionsAssigned({ partitions: [{ topic: 't', partitions: [0] }] })
+    await handlers.each(message(0))
+    delete topics.t
+
+    await handlers.each(message(1))
+    await member.commitAll()
+    member.noteJoin()
+    expect(member.settledWithout(new Set(['t']))).toBe(false)
+    await handlers.onPartitionsRevoked({ partitions: [{ topic: 't', partitions: [0] }] })
+    member.noteJoin()
+
+    expect(appended.map(({ kind }) => kind)).toEqual(['acquire', 'position', 'handler'])
+    expect(consumer.commitOffsets).not.toHaveBeenCalled()
+    expect(member.settledWithout(new Set(['t']))).toBe(true)
+  })
+
   test('a commit the client refuses is neither an error nor an observation', async () => {
     const { member, appended, handlers } = setup({ refuse: true })
     await member.start(['t'])
@@ -898,8 +917,10 @@ describe('Consumer churn profile > the run', () => {
           name,
           async (context) => {
             order.push(name)
-            if (name === 'regexTopics')
+            if (name === 'regexTopics') {
+              context.record({ kind: 'regex-rotation', phase: context.phase(), deletions: 0 })
               for (const group of context.groups) context.record(offsetRow(context.phase(), group))
+            }
             if (!context.measured()) return
             for (const group of context.groups) {
               context.gaps.enter(group, context.phase(), 0)
@@ -1046,6 +1067,53 @@ describe('Consumer churn profile > the run', () => {
     expect(order.slice(0, 2)).toEqual(['setup', 'memberChurn'])
     expect(lines.filter(({ kind }) => kind === 'quiet')).toHaveLength(15)
     expect(run.warmQuiets).toEqual([])
+  })
+
+  test('the run verdict fails on an excessive or a missing offset-state row in a warm-up or a measured regex pass', async () => {
+    const excessive = (phase) => [
+      { kind: 'regex-rotation', phase, deletions: 0 },
+      offsetRow(phase, 'g', { offsetState: { present: true, topics: 9, cells: 1, cache: 1 } }),
+    ]
+    const periodicMissing = (phase) => [
+      { kind: 'regex-rotation', phase, deletions: 5 },
+      offsetRow(phase, 'g', { deletions: 5 }),
+    ]
+    for (const [pass, rows, violation] of [
+      [
+        'warm-regex-topics',
+        excessive,
+        'offset state of g in warm-regex-topics (final): 9 stamp topics for 4 live topics',
+      ],
+      [
+        'warm-regex-topics',
+        periodicMissing,
+        'offset state of g in warm-regex-topics: no periodic sample at 5 deletions',
+      ],
+      [
+        'regex-topics',
+        excessive,
+        'offset state of g in regex-topics (final): 9 stamp topics for 4 live topics',
+      ],
+      [
+        'regex-topics',
+        periodicMissing,
+        'offset state of g in regex-topics: no periodic sample at 5 deletions',
+      ],
+    ]) {
+      const { run, lines } = build({ plan: warmPlan() })
+      const fake = run.workloads.regexTopics
+      run.workloads.regexTopics = async (context, ms) => {
+        if (context.phase() !== pass) return fake(context, ms)
+        for (const row of rows(pass)) context.record(row)
+      }
+
+      const verdict = await run.run()
+
+      expect(verdict).toMatchObject({ ok: false, violations: [violation] })
+      expect(lines.filter(({ kind }) => kind === 'verdict')).toEqual([
+        expect.objectContaining({ kind: 'verdict', ok: false, violations: [violation] }),
+      ])
+    }
   })
 
   test('the warm-up readings stay out of the heap bound and the leftovers check', async () => {
@@ -1580,6 +1648,7 @@ function offsetRow(phase, group, overrides = {}) {
     phase,
     group,
     checkpoint: 'final',
+    deletions: 0,
     atMs: 0,
     waitedMs: 0,
     quiescent: true,
@@ -1635,7 +1704,7 @@ describe('Consumer churn profile > offset state', () => {
       checkpoint: 'periodic',
       members: [member],
       live,
-      deleted: new Set(['old']),
+      deleted: new Set(['a', 'b', 'c', 'd', 'e']),
     })
 
     expect(rows).toEqual([
@@ -1644,6 +1713,7 @@ describe('Consumer churn profile > offset state', () => {
         phase: 'regex-topics',
         group: 'g-rx',
         checkpoint: 'periodic',
+        deletions: 5,
         atMs: 500,
         waitedMs: 500,
         quiescent: true,
@@ -1652,7 +1722,11 @@ describe('Consumer churn profile > offset state', () => {
       },
     ])
     expect(
-      offsetStateViolations(rows, { passes: ['regex-topics'], groupsOf: () => ['g-rx'] })
+      offsetStateViolations(rows, {
+        passes: ['regex-topics'],
+        groupsOf: () => ['g-rx'],
+        deletionsOf: () => 5,
+      })
     ).toEqual(['offset state of g-rx in regex-topics: no final sample'])
   })
 
@@ -1729,8 +1803,116 @@ describe('Consumer churn profile > offset state', () => {
     })
   })
 
+  test('a member that settles only after the cutoff is not quiescent, whatever the poll interval', async () => {
+    const clock = manualClock()
+    const member = { group: 'g', settledWithout: () => clock.now() >= 200 }
+    const { instance, rows, sleeps } = sampler({
+      read: () => ({ present: true, topics: 1, cells: 1, cache: 1, open: 0 }),
+      clock,
+      quietMs: 1000,
+    })
+    instance.pollMs = 250
+
+    await instance.sample({
+      phase: 'regex-topics',
+      checkpoint: 'final',
+      members: [member],
+      live,
+      deleted: new Set(),
+      deadlineAt: 100,
+    })
+
+    expect(sleeps).toEqual([[100]])
+    expect(rows).toEqual([expect.objectContaining({ atMs: 100, waitedMs: 100, quiescent: false })])
+  })
+
+  test('an overdue wake that finds the member settled after the cutoff is not quiescent', async () => {
+    const clock = manualClock()
+    const member = { group: 'g', settledWithout: () => clock.now() >= 1000 }
+    const late = sampler({
+      read: () => ({ present: true, topics: 1, cells: 1, cache: 1, open: 0 }),
+      clock,
+      quietMs: 1000,
+      onSleep: (n) => {
+        if (n === 10) clock.advance(40)
+      },
+    })
+
+    await late.instance.sample({
+      phase: 'regex-topics',
+      checkpoint: 'final',
+      members: [member],
+      live,
+      deleted: new Set(),
+    })
+
+    expect(late.rows).toEqual([
+      expect.objectContaining({ atMs: 1040, waitedMs: 1040, quiescent: false }),
+    ])
+  })
+
+  test('a settled member observed at or after an expired deadline is not quiescent past it', async () => {
+    const clock = manualClock()
+    clock.advance(500)
+    const { instance, rows, sleeps } = sampler({
+      read: () => ({ present: true, topics: 1, cells: 1, cache: 1, open: 0 }),
+      clock,
+    })
+
+    await instance.sample({
+      phase: 'regex-topics',
+      checkpoint: 'final',
+      members: [{ group: 'g', settledWithout: () => true }],
+      live,
+      deleted: new Set(),
+      deadlineAt: 400,
+    })
+    await instance.sample({
+      phase: 'regex-topics',
+      checkpoint: 'final',
+      members: [{ group: 'h', settledWithout: () => true }],
+      live,
+      deleted: new Set(),
+      deadlineAt: 500,
+    })
+
+    expect(sleeps).toEqual([])
+    expect(rows).toEqual([
+      expect.objectContaining({ group: 'g', atMs: 500, quiescent: false }),
+      expect.objectContaining({ group: 'h', atMs: 500, quiescent: true }),
+    ])
+  })
+
+  test('a later member reached only after the shared cutoff is recorded as not quiescent', async () => {
+    const clock = manualClock()
+    const { instance, rows } = sampler({
+      read: () => ({ present: true, topics: 1, cells: 1, cache: 1, open: 0 }),
+      clock,
+      quietMs: 1000,
+      onSleep: (n) => {
+        if (n === 10) clock.advance(40)
+      },
+    })
+
+    await instance.sample({
+      phase: 'regex-topics',
+      checkpoint: 'final',
+      members: [
+        { group: 'g1', settledWithout: () => false },
+        { group: 'g2', settledWithout: () => true },
+      ],
+      live,
+      deleted: new Set(),
+    })
+
+    expect(rows).toEqual([
+      expect.objectContaining({ group: 'g1', atMs: 1040, quiescent: false }),
+      expect.objectContaining({ group: 'g2', atMs: 1040, quiescent: false }),
+    ])
+  })
+
   test('the independent check fails when cardinality exceeds the live topic count', () => {
-    const expected = { passes: ['regex-topics'], groupsOf: () => ['g'] }
+    const expected = { passes: ['regex-topics'], groupsOf: () => ['g'], deletionsOf: () => 0 }
     expect(offsetStateViolations([offsetRow('regex-topics', 'g')], expected)).toEqual([])
     for (const [field, value, message] of [
       ['topics', 5, '5 stamp topics for 4 live topics'],
@@ -1755,6 +1937,7 @@ describe('Consumer churn profile > offset state', () => {
     const expected = {
       passes: ['warm-regex-topics', 'regex-topics'],
       groupsOf: (phase) => [`g1-${phase}`, `g2-${phase}`],
+      deletionsOf: () => 0,
     }
     const finals = expected.passes.flatMap((phase) =>
       expected.groupsOf(phase).map((group) => offsetRow(phase, group))
@@ -1797,34 +1980,102 @@ describe('Consumer churn profile > offset state', () => {
       undefined,
     ]) {
       expect(bad(['regex-topics', 'g1-regex-topics', { live }])).toEqual([
-        'offset state of g1-regex-topics in regex-topics (final): malformed live denominators',
+        'offset state of g1-regex-topics in regex-topics (final): live denominators do not fit the workload',
       ])
     }
   })
 
-  test('the run verdict carries the offset-state check of every regex pass', async () => {
-    const lines = []
-    const clock = manualClock()
-    const run = new ConsumerChurnRun({
-      workloads: {},
-      probe: { openSockets: () => 0, snapshot: async () => ({}) },
-      journal: { replay: async () => 0 },
-      record: (line) => lines.push(line),
-      plan: consumerChurnPlan(1),
-      clock,
-      sleep: clock.sleep,
-      gaps: new GapSampler({ capacity: 8, minimum: 1 }),
-      groups: ['g'],
-    })
-    run.record(
-      offsetRow('regex-topics', 'g', {
-        offsetState: { present: true, topics: 9, cells: 1, cache: 1 },
-      })
-    )
+  test('the independent check requires every periodic sample the deletions made due, for each group', () => {
+    const groups = ['g1', 'g2']
+    const expected = { passes: ['regex-topics'], groupsOf: () => groups, deletionsOf: () => 12 }
+    const periodic = (group, deletions) =>
+      offsetRow('regex-topics', group, { checkpoint: 'periodic', deletions })
+    const complete = groups.flatMap((group) => [
+      periodic(group, 5),
+      periodic(group, 10),
+      offsetRow('regex-topics', group, { deletions: 12 }),
+    ])
+    expect(offsetStateViolations(complete, expected)).toEqual([])
 
-    expect(lines).toHaveLength(1)
-    expect(run.offsetStateViolations()).toEqual([
-      'offset state of g in regex-topics (final): 9 stamp topics for 4 live topics',
+    expect(
+      offsetStateViolations(
+        complete.filter((row) => row !== complete[4]),
+        expected
+      )
+    ).toEqual(['offset state of g2 in regex-topics: no periodic sample at 10 deletions'])
+    expect(
+      offsetStateViolations(
+        complete.filter(({ checkpoint }) => checkpoint === 'final'),
+        expected
+      )
+    ).toEqual([
+      'offset state of g1 in regex-topics: no periodic sample at 5 deletions',
+      'offset state of g1 in regex-topics: no periodic sample at 10 deletions',
+      'offset state of g2 in regex-topics: no periodic sample at 5 deletions',
+      'offset state of g2 in regex-topics: no periodic sample at 10 deletions',
+    ])
+    expect(offsetStateViolations([...complete, periodic('g1', 5)], expected)).toEqual([
+      'offset state of g1 in regex-topics (periodic): duplicate sample',
+    ])
+    for (const row of [
+      periodic('g1', 15),
+      periodic('g1', 7),
+      periodic('g1', 0),
+      offsetRow('regex-topics', 'g1', { deletions: 10 }),
+      offsetRow('regex-topics', 'g1', { deletions: undefined }),
+    ]) {
+      expect(offsetStateViolations([...complete, row], expected)).toEqual([
+        `offset state of g1 in regex-topics (${row.checkpoint}): unexpected checkpoint at ${row.deletions} deletions`,
+      ])
+    }
+    expect(offsetStateViolations(complete, { ...expected, deletionsOf: () => undefined })).toEqual([
+      'regex pass regex-topics: no rotation record',
+    ])
+  })
+
+  test('the independent check holds the live denominators to the control topic and the rotation window', () => {
+    const expected = { passes: ['regex-topics'], groupsOf: () => ['g'], deletionsOf: () => 5 }
+    const rows = (overrides) => [
+      offsetRow('regex-topics', 'g', { checkpoint: 'periodic', deletions: 5, ...overrides }),
+      offsetRow('regex-topics', 'g', { deletions: 5 }),
+    ]
+    expect(offsetStateViolations(rows({}), expected)).toEqual([])
+    for (const [topics, partitions] of [
+      [1, 6],
+      [2, 9],
+      [3, 12],
+    ]) {
+      const final = offsetRow('regex-topics', 'g', {
+        deletions: 5,
+        live: { topics, partitions },
+        offsetState: { present: true, topics, cells: partitions, cache: topics },
+      })
+      expect(offsetStateViolations([rows({})[0], final], expected)).toEqual([])
+    }
+
+    for (const live of [
+      { topics: 1000, partitions: 3000 },
+      { topics: 5, partitions: 18 },
+      { topics: 4, partitions: 16 },
+      { topics: 3, partitions: 12 },
+    ]) {
+      const state = {
+        present: true,
+        topics: live.topics,
+        cells: live.partitions,
+        cache: live.topics,
+      }
+      expect(offsetStateViolations(rows({ live, offsetState: state }), expected)).toEqual([
+        'offset state of g in regex-topics (periodic): live denominators do not fit the workload',
+      ])
+    }
+    const inflated = offsetRow('regex-topics', 'g', {
+      deletions: 5,
+      live: { topics: 1000, partitions: 3000 },
+      offsetState: { present: true, topics: 1000, cells: 3000, cache: 1000 },
+    })
+    expect(offsetStateViolations([rows({})[0], inflated], expected)).toEqual([
+      'offset state of g in regex-topics (final): live denominators do not fit the workload',
     ])
   })
 
