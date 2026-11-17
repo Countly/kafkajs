@@ -14,6 +14,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 #### Fixes
 
 - Version negotiation never selects a version below the broker's minimum when the client implements a non-contiguous version set.
+- A `connect()`, `run()` or `assign()` that is waiting for a `disconnect()` already in progress now rejects with `CONSUMER_STOPPING` when another `disconnect()` is called while it waits. This covers a second `disconnect()` that starts a new close, not only one that joins the close in progress. Before this fix, the waiting call could rejoin the group and leave a socket open after the later `disconnect()` resolved.
 
 #### Tooling
 

@@ -345,10 +345,11 @@ module.exports = (params) => {
   /**
    * The close in progress. Concurrent disconnects join its whole cleanup, so the first call's
    * timeout and leave choice govern; it is cleared when the cleanup settles.
-   * `joins` counts the later `disconnect()` calls that joined it.
-   * @type {{ operation: ConsumerOperation, promise: Promise<void>, joins: number }|null}
+   * @type {{ operation: ConsumerOperation, promise: Promise<void> }|null}
    */
   let closing = null
+  /** Counts every `disconnect()` call, joined or not, so a waiting caller can tell one was asked. */
+  let closeRequests = 0
   /**
    * What the current explicit connection owns. An explicit disconnect marks it ending; the next
    * connect, run or start then begins a new one, so a close settling late never touches it.
@@ -607,29 +608,39 @@ module.exports = (params) => {
    * the run being closed (a handler or a rebalance callback) does not wait, because that close is
    * waiting for it. Returns null with no close to wait for, so the caller stays synchronous up to
    * the lifetime it acquires and a `disconnect()` made right after still retires it.
-   * @returns {Promise<void>|null} settles when that close has; rejects `CONSUMER_STOPPING` when a
-   *   `disconnect()` joined the close meanwhile, because it was asked after this call
+   * The caller passes the resolved value to `refuseLaterClose` before it acquires a lifetime.
+   * @returns {Promise<number>|null} resolves, never rejects, when that close has settled, to the
+   *   `disconnect()` count taken at this call
    */
   const earlierClose = () => {
     const earlier = closing
     if (!earlier || RebalanceHooks.current() || handlerContext.current()) return null
-    const { joins } = earlier
-    return earlier.promise
-      .catch(() => {})
-      .then(() => {
-        if (earlier.joins !== joins) throw consumerStoppingError()
-      })
+    const asked = closeRequests
+    return earlier.promise.catch(() => {}).then(() => asked)
+  }
+
+  /**
+   * Refuses a caller that waited for a close when a `disconnect()` was asked meanwhile, joining
+   * that close or starting a later one, because it was asked after the caller. Synchronous, so the
+   * caller calls it in the same step that acquires its lifetime and no close can slip in between.
+   * @param {number} asked the count `earlierClose` resolved to
+   * @throws {Error} `CONSUMER_STOPPING` when a `disconnect()` was asked since
+   * @returns {void}
+   */
+  const refuseLaterClose = (asked) => {
+    if (closeRequests !== asked) throw consumerStoppingError()
   }
 
   /**
    * @type {import("../../types").Consumer["connect"]}
-   * @throws {Error} `CONSUMER_STOPPING` from a handler of a retired run, or when a close ended this
-   *   connect's lifetime before it completed; no `CONNECT` is published then
+   * @throws {Error} `CONSUMER_STOPPING` from a handler of a retired run, when a `disconnect()` was
+   *   asked while it waited for an earlier close, or when a close ended this connect's lifetime
+   *   before it completed; no `CONNECT` is published then
    */
   const connect = async () => {
     refuseRetiredCaller()
     const waiting = earlierClose()
-    if (waiting) await waiting
+    if (waiting) refuseLaterClose(await waiting)
     const owned = acquireLife()
     registerDiscoveryScope()
     await cluster.connect({ fence: owned.fence })
@@ -738,9 +749,9 @@ module.exports = (params) => {
    * @returns {Promise<void>} the shared close
    */
   const closeShared = (options) => {
+    closeRequests++
     if (closing) {
       noteStop()
-      closing.joins++
       return closing.promise
     }
 
@@ -755,7 +766,7 @@ module.exports = (params) => {
         remaining: () => operation.remaining(),
         zero: timeout === 0,
       }) ?? null
-    const record = { operation, promise: null, joins: 0 }
+    const record = { operation, promise: null }
     life.ending = true
     const cleanup = shutDown(options, {}, operation)
     record.promise = (finalTelemetry ? cleanup.finally(() => finalTelemetry) : cleanup).finally(
@@ -1039,7 +1050,8 @@ module.exports = (params) => {
 
   /**
    * @type {import("../../types").Consumer["run"]}
-   * @throws {Error} `CONSUMER_STOPPING` from a handler of a retired run
+   * @throws {Error} `CONSUMER_STOPPING` from a handler of a retired run, or when a `disconnect()`
+   *   was asked while it waited for an earlier close
    * @throws {KafkaJSNonRetriableError} from a rebalance callback, or for an invalid
    *   `rebalanceListener` (a manual consumer, a missing group, a non-object, a non-function hook)
    */
@@ -1071,7 +1083,7 @@ module.exports = (params) => {
     // An explicit run supersedes a pending automatic restart, even one waiting on the same close.
     if (!consumerGroup) cancelRestart()
     const waiting = earlierClose()
-    if (waiting) await waiting
+    if (waiting) refuseLaterClose(await waiting)
     acquireLife()
 
     if (consumerGroup) {
@@ -1200,13 +1212,7 @@ module.exports = (params) => {
      */
     const restartAfterCrash = async (onCrash, pending) => {
       const waiting = earlierClose()
-      if (waiting) {
-        try {
-          await waiting
-        } catch {
-          return
-        }
-      }
+      if (waiting) await waiting
       if (restart !== pending || pending.crashed.forced) return
       restart = null
       if (!consumerGroup) start(onCrash)
@@ -1665,7 +1671,8 @@ module.exports = (params) => {
    * @type {import("../../types").Consumer["assign"]}
    * @throws {KafkaJSNonRetriableError} for malformed input, a running consumer, an active
    *   subscription, an unknown partition, or a candidate superseded while it was validated
-   * @throws {Error} `CONSUMER_STOPPING` when a forced close ended its lifetime meanwhile
+   * @throws {Error} `CONSUMER_STOPPING` when a forced close ended its lifetime meanwhile, or when a
+   *   `disconnect()` was asked while it waited for an earlier close
    */
   const assign = async (topicPartitions, options) => {
     refuseRetiredCaller()
@@ -1701,7 +1708,7 @@ module.exports = (params) => {
     if (first) throw first
 
     const waiting = earlierClose()
-    if (waiting) await waiting
+    if (waiting) refuseLaterClose(await waiting)
     const owned = acquireLife()
     return withinCall(
       async (operation) => {
