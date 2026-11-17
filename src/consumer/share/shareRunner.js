@@ -3,7 +3,7 @@ const { requests } = require('../../protocol/requests')
 const createRetry = require('../../retry')
 const { ConsumerOperation } = require('../groupProtocol/interface')
 const shareCapability = require('./shareCapability')
-const { ShareRun, handlerRunIdentity } = require('./shareRun')
+const { ShareRun, handlerRunIdentity, outsideHandler } = require('./shareRun')
 const { ShareHandlerCall } = require('./shareHandlerCall')
 const { ShareCloseEpisode } = require('./shareCloseEpisode')
 const { events, wrap, unwrap } = require('./instrumentationEvents')
@@ -142,13 +142,14 @@ class ShareRunner {
   }
 
   /**
-   * Publishes one event on this client's emitter and diagnostics channel.
+   * Publishes one event on this client's emitter and diagnostics channel. Listeners run outside
+   * any handler's identity: a listener is not a handler, so its `connect()` waits for a close.
    * @param {string} name Internal event name, one of `events`.
    * @param {object} [payload] The event payload; none for connect, disconnect and stop.
    * @returns {void}
    */
   emit(name, payload) {
-    this.options.instrumentationEmitter.emit(name, payload)
+    outsideHandler(() => this.options.instrumentationEmitter.emit(name, payload))
   }
 
   /**

@@ -637,15 +637,26 @@ class ShareRun {
   }
 
   /**
-   * Hands one answer's acquisitions to the handlers, one cohort after another. Resolves only
-   * after every record was handled, dropped or released.
+   * Hands one answer's acquisitions to the handlers, one cohort after another, inside one entry of
+   * this run's handler context, so a handler's own calls and the async work it starts carry the
+   * run's identity. Resolves only after every record was handled, dropped or released.
    * @private
    * @param {object} node The node record.
    * @param {object[]} cohorts The adopted acquisitions of the answer.
    * @returns {Promise<void>}
    * @throws {Error} The explicit-omission verdict, after its releases were flushed.
    */
-  async dispatch(node, cohorts) {
+  dispatch(node, cohorts) {
+    return handlerScope.run(this.identity, () => this.dispatchAnswer(node, cohorts))
+  }
+
+  /**
+   * @private
+   * @param {object} node The node record.
+   * @param {object[]} cohorts The adopted acquisitions of the answer.
+   * @returns {Promise<void>}
+   */
+  async dispatchAnswer(node, cohorts) {
     node.queue = { cohorts, index: 0 }
     try {
       for (; node.queue.index < cohorts.length; node.queue.index++) {
@@ -815,15 +826,16 @@ class ShareRun {
    */
   flushIfDue(node, cohort) {
     if (!cohort.ledger.needsFlush(performance.now())) return
-    node.loop.acknowledge({ cohorts: [cohort] }).catch((error) => {
-      this.options.logger.debug('Share boundary flush failed', { error: error.message })
-    })
+    outsideHandler(() =>
+      node.loop.acknowledge({ cohorts: [cohort] }).catch((error) => {
+        this.options.logger.debug('Share boundary flush failed', { error: error.message })
+      })
+    )
   }
 
   /**
    * Runs one handler call: poll accounting, the application call, lock-expiry observation, the
-   * policy completion, and the handler pacing or the omission verdict. The application call runs
-   * with this run's identity in async context, so the client can tell a handler's own calls apart.
+   * policy completion, and the handler pacing or the omission verdict.
    * @private
    * @param {object} node The node record.
    * @param {object} cohort The acquisition.
@@ -838,7 +850,7 @@ class ShareRun {
     let thrown
     try {
       if (pollCall === null) throw new KafkaJSNonRetriableError('Share run is no longer polling')
-      await handlerScope.run(this.identity, () => this.handler(payload))
+      await this.handler(payload)
     } catch (error) {
       failed = true
       thrown = error
@@ -900,9 +912,11 @@ class ShareRun {
       offsets: call.offsets(),
       error,
     })
-    node.loop.acknowledge({ cohorts: [cohort] }).catch((failure) => {
-      this.options.logger.error('Share handler release flush failed', { error: failure.message })
-    })
+    outsideHandler(() =>
+      node.loop.acknowledge({ cohorts: [cohort] }).catch((failure) => {
+        this.options.logger.error('Share handler release flush failed', { error: failure.message })
+      })
+    )
     node.retryTime =
       node.retryTime === null ? node.schedule.initial() : node.schedule.next(node.retryTime)
     await node.pacing.sleep(node.retryTime).catch(() => {})
@@ -919,9 +933,11 @@ class ShareRun {
    * @throws {Error} The verdict.
    */
   async afterOmission(node, cohort, verdict) {
-    await node.loop.acknowledge({ cohorts: [cohort] }).catch((error) => {
-      this.options.logger.error('Share omission flush failed', { error: error.message })
-    })
+    await outsideHandler(() =>
+      node.loop.acknowledge({ cohorts: [cohort] }).catch((error) => {
+        this.options.logger.error('Share omission flush failed', { error: error.message })
+      })
+    )
     throw verdict
   }
 
@@ -939,7 +955,9 @@ class ShareRun {
    */
   renew(node, cohort, offsets) {
     const promise = (async () => {
-      const result = await node.loop.acknowledge({ renew: [{ cohort, offsets }] })
+      const result = await outsideHandler(() =>
+        node.loop.acknowledge({ renew: [{ cohort, offsets }] })
+      )
       const refused = this.ordinaryRefusal(node.issued)
       if (refused) throw refused
       if (result.lockDuration !== undefined) {
@@ -1486,4 +1504,13 @@ class ShareRun {
  */
 const handlerRunIdentity = () => handlerScope.getStore()
 
-module.exports = { ShareRun, handlerRunIdentity }
+/**
+ * Runs client work outside any handler's identity: queued acknowledgements, and the FIFO drain,
+ * connections, crash supervision and listeners they reach, must never pass as a handler's own call.
+ * @template T
+ * @param {() => T} work The work to start.
+ * @returns {T} What `work` returned.
+ */
+const outsideHandler = (work) => handlerScope.run(undefined, work)
+
+module.exports = { ShareRun, handlerRunIdentity, outsideHandler }
