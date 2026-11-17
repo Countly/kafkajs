@@ -18,6 +18,7 @@ const {
   PublicConsumerProbe,
   acknowledgedViolations,
   consumerChurnPlan,
+  offsetStateViolations,
   consumerControls,
   interningControl,
   judgeQuietHeap,
@@ -25,8 +26,20 @@ const {
   runControls,
   shapeHeapGrowth,
 } = require('../consumerChurn')
-const { ChurnLogReader, ChurnMember, ConsumerChurnRun } = require('../consumerChurnRun')
-const { PROFILES, WORKLOADS, buildConsumerChurn, main, parseArgs } = require('../soak')
+const {
+  ChurnLogReader,
+  ChurnMember,
+  ConsumerChurnRun,
+  OffsetStateSampler,
+} = require('../consumerChurnRun')
+const {
+  PROFILES,
+  WORKLOADS,
+  buildConsumerChurn,
+  main,
+  offsetStateReader,
+  parseArgs,
+} = require('../soak')
 const { evidencePath } = require('../../../testHelpers/e2eEvidence')
 
 const MIB = 1024 * 1024
@@ -892,6 +905,8 @@ describe('Consumer churn profile > the run', () => {
             }
             context.stats.set(context.phase(), { acked: 1000 })
             if (name === 'memberChurn') journalFeed(context.journal)
+            if (name === 'regexTopics')
+              for (const group of context.groups) context.record(offsetRow(context.phase(), group))
           },
         ])
       ),
@@ -1555,5 +1570,292 @@ describe('Consumer churn profile > acknowledged records', () => {
     expect(acknowledgedViolations(new Map([['a', { acked: 60000 }]]), phases, 200)).toEqual([
       'b: 0 acknowledged records, fewer than 200/s',
     ])
+  })
+})
+
+/** One well-formed offset-state row: four live topics with fifteen partitions, within bounds. */
+function offsetRow(phase, group, overrides = {}) {
+  return {
+    kind: 'offset-state',
+    phase,
+    group,
+    checkpoint: 'final',
+    atMs: 0,
+    waitedMs: 0,
+    quiescent: true,
+    live: { topics: 4, partitions: 15 },
+    offsetState: { present: true, topics: 4, cells: 15, cache: 4 },
+    ...overrides,
+  }
+}
+
+describe('Consumer churn profile > offset state', () => {
+  const sampler = ({ read, clock = manualClock(), quietMs = 1000, onSleep = () => {} } = {}) => {
+    const rows = []
+    const sleeps = []
+    const instance = new OffsetStateSampler({
+      read,
+      clock,
+      sleep: async (...args) => {
+        sleeps.push(args)
+        await clock.sleep(args[0])
+        onSleep(sleeps.length)
+      },
+      record: (row) => rows.push(row),
+      quietMs,
+      pollMs: 100,
+    })
+    return { instance, rows, sleeps, clock }
+  }
+  const live = [
+    { name: 'control', partitions: 6 },
+    { name: 'a', partitions: 3 },
+    { name: 'b', partitions: 3 },
+    { name: 'c', partitions: 3 },
+  ]
+
+  test('consumer-churn samples offset-state cardinalities after quiescence', async () => {
+    let applied = false
+    const member = { group: 'g-rx', settledWithout: () => applied }
+    let open = 2
+    const state = () =>
+      applied
+        ? { present: true, topics: 4, cells: 12, cache: 4, open }
+        : { present: true, topics: 5, cells: 18, cache: 5, open: 0 }
+    const { instance, rows } = sampler({
+      read: state,
+      onSleep: (n) => {
+        if (n === 3) applied = true
+        if (n === 5) open = 0
+      },
+    })
+
+    await instance.sample({
+      phase: 'regex-topics',
+      checkpoint: 'periodic',
+      members: [member],
+      live,
+      deleted: new Set(['old']),
+    })
+
+    expect(rows).toEqual([
+      {
+        kind: 'offset-state',
+        phase: 'regex-topics',
+        group: 'g-rx',
+        checkpoint: 'periodic',
+        atMs: 500,
+        waitedMs: 500,
+        quiescent: true,
+        live: { topics: 4, partitions: 15 },
+        offsetState: { present: true, topics: 4, cells: 12, cache: 4 },
+      },
+    ])
+    expect(
+      offsetStateViolations(rows, { passes: ['regex-topics'], groupsOf: () => ['g-rx'] })
+    ).toEqual(['offset state of g-rx in regex-topics: no final sample'])
+  })
+
+  test('the sampler waits for the post-revoke apply before it samples', async () => {
+    const setupMember = () => {
+      const handlers = {}
+      const consumer = {
+        connect: jest.fn(async () => {}),
+        subscribe: jest.fn(async () => {}),
+        run: jest.fn(async (config) => Object.assign(handlers, config.rebalanceListener)),
+        commitOffsets: jest.fn(async () => {}),
+        disconnect: jest.fn(async () => {}),
+      }
+      const member = new ChurnMember({
+        consumer,
+        admin: { fetchOffsets: jest.fn(async () => [{ topic: 'old', partitions: [] }]) },
+        group: 'g',
+        label: 'm',
+        journal: { append: () => {} },
+        gaps: null,
+        phase: 'p',
+        clock: { now: () => 0 },
+        handled: new Map(),
+        incarnationOf: () => 'old.1',
+        acknowledged: async () => true,
+      })
+      return { member, handlers }
+    }
+    const { member, handlers } = setupMember()
+    await member.start([/^o/])
+    await handlers.onPartitionsAssigned({ partitions: [{ topic: 'old', partitions: [0] }] })
+    member.noteJoin()
+    const deleted = new Set(['old'])
+    expect(member.settledWithout(deleted)).toBe(false)
+
+    await handlers.onPartitionsRevoked({ partitions: [{ topic: 'old', partitions: [0] }] })
+    expect(member.settledWithout(deleted)).toBe(false)
+    member.noteJoin()
+    expect(member.settledWithout(deleted)).toBe(true)
+
+    await member.stop()
+    expect(member.settledWithout(deleted)).toBe(false)
+  })
+
+  test('a sample waits without the fault signal and records a timeout as not quiescent', async () => {
+    const member = { group: 'g', settledWithout: () => false }
+    const { instance, rows, sleeps } = sampler({
+      read: () => ({ present: true, topics: 1, cells: 1, cache: 1, open: 0 }),
+      quietMs: 1000,
+    })
+
+    await instance.sample({
+      phase: 'regex-topics',
+      checkpoint: 'final',
+      members: [member],
+      live,
+      deleted: new Set(),
+      deadlineAt: 600,
+    })
+
+    expect(sleeps.every((args) => args.length === 1)).toBe(true)
+    expect(rows).toEqual([expect.objectContaining({ quiescent: false, waitedMs: 600 })])
+    const absent = sampler({ read: undefined, quietMs: 200 })
+    await absent.instance.sample({
+      phase: 'regex-topics',
+      checkpoint: 'final',
+      members: [{ group: 'g', settledWithout: () => true }],
+      live,
+      deleted: new Set(),
+    })
+    expect(absent.rows[0]).toMatchObject({
+      quiescent: false,
+      offsetState: { present: false },
+    })
+  })
+
+  test('the independent check fails when cardinality exceeds the live topic count', () => {
+    const expected = { passes: ['regex-topics'], groupsOf: () => ['g'] }
+    expect(offsetStateViolations([offsetRow('regex-topics', 'g')], expected)).toEqual([])
+    for (const [field, value, message] of [
+      ['topics', 5, '5 stamp topics for 4 live topics'],
+      ['cache', 5, '5 cache topics for 4 live topics'],
+      ['cells', 16, '16 stamp cells for 15 live partitions'],
+    ]) {
+      const row = offsetRow('regex-topics', 'g', {
+        offsetState: { present: true, topics: 4, cells: 15, cache: 4, [field]: value },
+      })
+      expect(offsetStateViolations([row], expected)).toEqual([
+        `offset state of g in regex-topics (final): ${message}`,
+      ])
+    }
+    const multi = offsetRow('regex-topics', 'g', {
+      live: { topics: 2, partitions: 9 },
+      offsetState: { present: true, topics: 2, cells: 9, cache: 2 },
+    })
+    expect(offsetStateViolations([multi], expected)).toEqual([])
+  })
+
+  test('the independent check rejects missing, unexpected and malformed offset-state rows', () => {
+    const expected = {
+      passes: ['warm-regex-topics', 'regex-topics'],
+      groupsOf: (phase) => [`g1-${phase}`, `g2-${phase}`],
+    }
+    const finals = expected.passes.flatMap((phase) =>
+      expected.groupsOf(phase).map((group) => offsetRow(phase, group))
+    )
+    expect(offsetStateViolations(finals, expected)).toEqual([])
+    expect(offsetStateViolations(finals.slice(1), expected)).toEqual([
+      'offset state of g1-warm-regex-topics in warm-regex-topics: no final sample',
+    ])
+    expect(offsetStateViolations([], expected)).toHaveLength(4)
+
+    const bad = (overrides) => offsetStateViolations([...finals, offsetRow(...overrides)], expected)
+    expect(bad(['regex-topics', 'other'])).toEqual([
+      'offset state of other in regex-topics (final): unexpected group or phase',
+    ])
+    expect(bad(['member-churn', 'g1-regex-topics'])).toEqual([
+      'offset state of g1-regex-topics in member-churn (final): unexpected group or phase',
+    ])
+    expect(bad(['regex-topics', 'g1-regex-topics', { checkpoint: 'later' }])).toEqual([
+      'offset state of g1-regex-topics in regex-topics (later): unknown checkpoint',
+    ])
+    expect(bad(['regex-topics', 'g1-regex-topics', { quiescent: 'yes' }])).toEqual([
+      'offset state of g1-regex-topics in regex-topics (final): did not quiesce',
+    ])
+    expect(bad(['regex-topics', 'g1-regex-topics', { offsetState: { present: false } }])).toEqual([
+      'offset state of g1-regex-topics in regex-topics (final): stores absent',
+    ])
+    for (const value of [undefined, Number.NaN, -1, 1.5, '3']) {
+      expect(
+        bad([
+          'regex-topics',
+          'g1-regex-topics',
+          { offsetState: { present: true, topics: value, cells: 1, cache: 1 } },
+        ])
+      ).toEqual(['offset state of g1-regex-topics in regex-topics (final): malformed counts'])
+    }
+    for (const live of [
+      { topics: 0, partitions: 0 },
+      { topics: 4, partitions: 3 },
+      { topics: Number.NaN, partitions: 15 },
+      undefined,
+    ]) {
+      expect(bad(['regex-topics', 'g1-regex-topics', { live }])).toEqual([
+        'offset state of g1-regex-topics in regex-topics (final): malformed live denominators',
+      ])
+    }
+  })
+
+  test('the run verdict carries the offset-state check of every regex pass', async () => {
+    const lines = []
+    const clock = manualClock()
+    const run = new ConsumerChurnRun({
+      workloads: {},
+      probe: { openSockets: () => 0, snapshot: async () => ({}) },
+      journal: { replay: async () => 0 },
+      record: (line) => lines.push(line),
+      plan: consumerChurnPlan(1),
+      clock,
+      sleep: clock.sleep,
+      gaps: new GapSampler({ capacity: 8, minimum: 1 }),
+      groups: ['g'],
+    })
+    run.record(
+      offsetRow('regex-topics', 'g', {
+        offsetState: { present: true, topics: 9, cells: 1, cache: 1 },
+      })
+    )
+
+    expect(lines).toHaveLength(1)
+    expect(run.offsetStateViolations()).toEqual([
+      'offset state of g in regex-topics (final): 9 stamp topics for 4 live topics',
+    ])
+  })
+
+  test('the offset-state reader creates no registry entry, revision source or ticket', () => {
+    const { Kafka, logLevel } = require('../../../index')
+    const GroupRegistry = require('../../../src/cluster/groupRegistry')
+    const CommittedOffsetRevisions = require('../../../src/cluster/committedOffsetRevisions')
+    const kafka = new Kafka({ brokers: ['localhost:9092'], logLevel: logLevel.NOTHING })
+    const read = offsetStateReader(kafka)
+    const symbols = Object.getOwnPropertySymbols(kafka)
+    const store = (name) =>
+      kafka[symbols.find(({ description }) => description === `private:Kafka:${name}`)]
+
+    expect(read('g')).toEqual({ present: false })
+    expect(store('offsets').size).toBe(0)
+    expect(store('operations').size).toBe(0)
+
+    const holder = {}
+    const entry = GroupRegistry.forStores(store('offsets'), store('operations')).acquire(
+      'g',
+      holder
+    )
+    entry.offsets.topic = { 0: '1' }
+    expect(read('g')).toEqual({ present: true, topics: 0, cells: 0, cache: 1, open: 0 })
+    expect(CommittedOffsetRevisions.peek(entry.offsets)).toBeUndefined()
+    CommittedOffsetRevisions.forCache(entry.offsets).capture('topic', 0)
+    const ticket = entry.ledger.begin([{ topic: 'topic', partition: 0 }])
+    expect(read('g')).toEqual({ present: true, topics: 1, cells: 1, cache: 1, open: 1 })
+    entry.ledger.end(ticket)
+    expect(entry.holders).toEqual(new Set([holder]))
+    expect(entry.ledger.openTickets).toBe(0)
+    expect(store('offsets').size).toBe(1)
   })
 })
