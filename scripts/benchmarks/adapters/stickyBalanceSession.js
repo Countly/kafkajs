@@ -9,24 +9,33 @@
  */
 const { lastJsonLine, tail } = require('../report')
 
-/** Each scenario's arms, its reference, its records per run and the arms that must split evenly. */
+/**
+ * Each scenario's arms, its reference, its records per run, the arms that must split evenly and
+ * its session's void limit (`stickyBalance.js`), in percent of the reference's p99 median.
+ */
 const SCENARIOS = {
   healthy: {
     arms: ['round-robin', 'sticky', 'adaptive'],
     reference: 'round-robin',
     records: 100000,
     even: ['round-robin', 'round-robin~AA'],
+    voidOver: 3,
   },
-  'slow-broker': { arms: ['sticky', 'adaptive'], reference: 'sticky', records: 120000, even: [] },
+  'slow-broker': {
+    arms: ['sticky', 'adaptive'],
+    reference: 'sticky',
+    records: 120000,
+    even: [],
+    voidOver: 10,
+  },
 }
-/** The session's void limit (`session.js`), in percent of the reference's p99 median. */
-const VOID_OVER = 3
 /** The most a round-robin split may stray from even: its positive control. */
 const EVEN_BALANCE = 1.05
 /** The stats the controls read, checked like the manifest metrics. */
 const CONTROL_KEYS = [
   'records',
   'partitionerCalls',
+  'refused',
   'keyedIdentical',
   'topologyValid',
   'gcAvailable',
@@ -55,15 +64,24 @@ const range = (stat) => (stat ? `${stat.min} to ${stat.max}` : 'missing')
  */
 const percent = (value) => `${value >= 0 ? '+' : ''}${value.toFixed(2)} %`
 
-/** Each arm's controls: a name, whether its stats pass it, and what to show. */
+/**
+ * Each arm's controls: a name, whether its stats pass it, and what to show. Every run has the same
+ * records, so when each run's partitioner calls are its records less its buffer refusals, the
+ * calls' median, minimum and maximum are the records less the refusals' median, maximum and
+ * minimum.
+ */
 const CONTROLS = [
   {
-    name: 'partitioner calls = records',
-    passed: (s) =>
-      Number.isInteger(s.records?.min) &&
-      s.partitionerCalls?.min === s.records.min &&
-      s.partitionerCalls?.max === s.records.max,
-    detail: (s) => `calls ${range(s.partitionerCalls)}, records ${range(s.records)}`,
+    name: 'partitioner calls = admitted records',
+    passed: ({ partitionerCalls: calls, records, refused }) =>
+      Number.isInteger(records?.min) &&
+      records.min === records.max &&
+      Number.isFinite(refused?.min) &&
+      calls?.median === records.min - refused.median &&
+      calls.min === records.min - refused.max &&
+      calls.max === records.min - refused.min,
+    detail: (s) =>
+      `calls ${range(s.partitionerCalls)}, records ${s.records?.min}, refused ${range(s.refused)}`,
   },
   { name: 'keyed mapping identical', passed: (s) => s.keyedIdentical?.min === 1 },
   { name: 'topology valid', passed: (s) => s.topologyValid?.min === 1 },
@@ -73,7 +91,7 @@ const CONTROLS = [
 
 /**
  * @typedef {{ name: string, arms: string[], reference: string, records: number, even: string[],
- *   runs: number }} Scenario
+ *   voidOver: number, runs: number }} Scenario
  */
 
 /**
@@ -131,7 +149,7 @@ const read = (result) => {
  * @param {import('../report').ManifestEntry['metrics']} metrics
  * @returns {string|undefined} why the line cannot be shown, if it cannot
  */
-const malformed = (report, { name, reference, records, runs }, labels, metrics) => {
+const malformed = (report, { name, reference, records, runs, voidOver }, labels, metrics) => {
   if (report.scenario !== name) {
     return `the session reports scenario ${report.scenario}, expected ${name}`
   }
@@ -169,7 +187,7 @@ const malformed = (report, { name, reference, records, runs }, labels, metrics) 
   if (!(Math.abs(spread - control.percent.p99Ms) <= 1e-6)) {
     return `the A/A spread ${percent(control.percent.p99Ms)} disagrees with the medians (${percent(spread)})`
   }
-  if (report.void !== Math.abs(copy - ref) > Math.abs(ref) * (VOID_OVER / 100 + 1e-9)) {
+  if (report.void !== Math.abs(copy - ref) > Math.abs(ref) * (voidOver / 100 + 1e-9)) {
     return `void ${report.void} disagrees with an A/A spread of ${percent(spread)}`
   }
   return undefined

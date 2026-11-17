@@ -549,6 +549,78 @@ describe('Benchmarks > report', () => {
       expect(log.mock.calls[0][0]).toMatch(/^usage: /)
       expect(fs.readdirSync(out)).toEqual([])
     })
+
+    const three = {
+      version: 1,
+      entries: [single({ name: 'a' }), single({ name: 'b' }), compared()],
+    }
+
+    test('--only runs the named rows and lists every other row as not selected', () => {
+      const { spawn, calls } = stub((args) =>
+        args.includes('--package') ? json({ ...identityOf(args), a: 2 }) : json({ v: 5 })
+      )
+
+      const code = main([...argv(), '--only', 'compared,b'], { spawn, manifest: three, log })
+
+      expect(code).toBe(0)
+      expect(
+        calls.map(({ args }) =>
+          args.includes('--package') ? valueAfter(args, '--package') : 'single'
+        )
+      ).toEqual(['single', '@countly/kafkajs', 'kafkajs'])
+      expect(log.mock.calls.map(([line]) => line)).toEqual(['b', 'compared'])
+      const report = JSON.parse(fs.readFileSync(path.join(out, 'bench-report.json'), 'utf8'))
+      expect(report.meta.only).toEqual(['compared', 'b'])
+      expect(
+        report.rows.map(({ benchmark, arm, status }) => `${benchmark} ${arm} ${status}`)
+      ).toEqual([
+        'a - not selected',
+        'b fork valid',
+        'compared fork valid',
+        'compared kafkajs@2.2.4 valid',
+      ])
+      expect(report.rows[0]).toEqual({
+        benchmark: 'a',
+        arm: '-',
+        metric: '-',
+        unit: '-',
+        runs: 0,
+        status: 'not selected',
+        reason: 'left out by --only',
+      })
+      expect(fs.readdirSync(path.join(out, 'bench-raw')).sort()).toEqual(['b', 'compared'])
+      const markdown = fs.readFileSync(path.join(out, 'bench-report.md'), 'utf8')
+      expect(markdown).toContain('| a | - | - | not selected | - | - | - | 0 | - |')
+      expect(markdown).toContain('- only: compared,b')
+      expect(markdown).not.toMatch(/\b(omitted|error)\b/)
+    })
+
+    test('--only with an unknown row is a bad argument and writes nothing', () => {
+      const { spawn, calls } = stub(() => json({ v: 1 }))
+
+      expect(main([...argv(), '--only', 'a,nope'], { spawn, manifest: three, log })).toBe(2)
+      expect(main([...argv(), '--only', 'a,'], { spawn, manifest: three, log })).toBe(2)
+
+      expect(calls).toEqual([])
+      expect(log.mock.calls.map(([line]) => line)).toEqual([
+        '--only names no manifest row nope',
+        '--only names no manifest row ',
+      ])
+      expect(fs.readdirSync(out)).toEqual([])
+    })
+
+    test('an empty --only runs every row', () => {
+      const { spawn, calls } = stub((args) =>
+        args.includes('--package') ? json({ ...identityOf(args), a: 2 }) : json({ v: 5 })
+      )
+
+      expect(main([...argv(), '--only', ''], { spawn, manifest: three, log })).toBe(0)
+
+      expect(calls).toHaveLength(4)
+      const report = JSON.parse(fs.readFileSync(path.join(out, 'bench-report.json'), 'utf8'))
+      expect(report.meta).not.toHaveProperty('only')
+      expect(report.rows.every(({ status }) => status === 'valid')).toBe(true)
+    })
   })
   describe('statuses, evidence and adapters', () => {
     const STATUSES = ['valid', 'inconclusive', 'invalid', 'error', 'omitted']
@@ -794,7 +866,7 @@ describe('Benchmarks > report', () => {
         adapter: 'stickyBalanceSession',
         broker: true,
         arms: ['fork'],
-        command: shape('healthy', '8'),
+        command: shape('healthy', '24'),
       })
       expect(slow).toMatchObject({
         adapter: 'stickyBalanceSession',
@@ -810,6 +882,7 @@ describe('Benchmarks > report', () => {
         'backlogMax',
         'delivered',
         'rejected',
+        'refused',
         'unsettled',
         'drainAtMs',
       ]
@@ -821,7 +894,12 @@ describe('Benchmarks > report', () => {
         json: result,
         markdown,
       } = report([healthy, slow], (name) =>
-        fixture(name === healthy.name ? 'healthy-passed' : 'slow-broker-failed')
+        name === healthy.name
+          ? rejudged('healthy-passed', (arms) => {
+              for (const stats of Object.values(arms))
+                for (const stat of Object.values(stats)) stat.n = 24
+            })
+          : fixture('slow-broker-failed')
       )
 
       expect(calls).toHaveLength(2)
@@ -852,7 +930,7 @@ describe('Benchmarks > report', () => {
       })
       const details = Object.fromEntries(result.details.map((detail) => [detail.benchmark, detail]))
       const controlNames = [
-        'partitioner calls = records',
+        'partitioner calls = admitted records',
         'keyed mapping identical',
         'topology valid',
         'GC available',
@@ -956,7 +1034,7 @@ describe('Benchmarks > report', () => {
     const rejudged = (name, change) => {
       const { judge, sessionReport } = require('../stickyBalance')
       const line = lastJsonLine(fixture(name).stdout)
-      change(line.arms)
+      change(line.arms, line)
       const verdict = judge(line.scenario, line)
       const status = { passed: 0, failed: 1, inconclusive: 3 }[verdict.verdict]
       return { status, stdout: `${JSON.stringify(sessionReport(line.scenario, line, verdict))}\n` }
@@ -1011,6 +1089,127 @@ describe('Benchmarks > report', () => {
       expect(detail.notes).toEqual([
         expect.stringMatching(/^session verdict failed: sticky balance above 1\.25\b/),
       ])
+    })
+
+    /**
+     * The recorded slow-broker session as a drain to settlement would end it: every rejection is a
+     * buffer refusal, nothing is left unsettled, and every observation passes its own checks.
+     */
+    const settled = (arms) => {
+      for (const stats of Object.values(arms)) {
+        stats.refused = { ...stats.rejected }
+        stats.unsettled = { median: 0, min: 0, max: 0, n: stats.unsettled.n }
+        stats.valid = { median: 1, min: 1, max: 1, n: stats.valid.n }
+      }
+    }
+
+    test('the slow-broker row is valid when refusals account for the missing partitioner calls', () => {
+      const recorded = lastJsonLine(fixture('slow-broker-recorded').stdout)
+      const { sticky } = recorded.arms
+      expect(sticky.partitionerCalls.max).toBeLessThan(sticky.records.min)
+      expect(sticky.partitionerCalls.min + sticky.rejected.max).toBe(sticky.records.min)
+
+      const { json: result } = report([sessionEntry('slow-broker', 'settled')], () =>
+        rejudged('slow-broker-recorded', settled)
+      )
+
+      const statuses = new Set(result.rows.map(({ status }) => status))
+      expect(statuses).toEqual(new Set(['valid']))
+      const { controls } = result.details[0]
+      expect(controls.every(({ passed }) => passed)).toBe(true)
+      expect(
+        controls.find(
+          ({ arm, name }) => arm === 'sticky' && name === 'partitioner calls = admitted records'
+        ).detail
+      ).toBe(
+        `calls ${sticky.partitionerCalls.min} to ${sticky.partitionerCalls.max}, ` +
+          `records ${sticky.records.min}, refused ${sticky.rejected.min} to ${sticky.rejected.max}`
+      )
+    })
+
+    test('the slow-broker row is invalid when partitioner calls differ from the records less the refusals', () => {
+      const offByOne = (arms) => {
+        settled(arms)
+        arms.sticky.partitionerCalls.max += 1
+      }
+
+      const { json: result } = report([sessionEntry('slow-broker', 'off-by-one')], () =>
+        rejudged('slow-broker-recorded', offByOne)
+      )
+
+      expect(result.rows).toEqual([
+        expect.objectContaining({
+          status: 'invalid',
+          reason: 'failed controls: sticky partitioner calls = admitted records',
+        }),
+      ])
+    })
+
+    test('a slow-broker A/A spread of 6 % is not void; a healthy one of 4 % is', () => {
+      /** Moves the A/A copy's p99 median `spread` percent from its reference, voided as stated. */
+      const widened = (spread, isVoid) => (arms, line) => {
+        const { label, against } = line.control
+        const copy = arms[label].p99Ms
+        copy.median = arms[against].p99Ms.median * (1 + spread / 100)
+        copy.min = Math.min(copy.min, copy.median)
+        copy.max = Math.max(copy.max, copy.median)
+        line.control.percent.p99Ms = (copy.median / arms[against].p99Ms.median - 1) * 100
+        line.void = isVoid
+      }
+      const answers = {
+        'slow-six': rejudged('slow-broker-failed', widened(6, false)),
+        'healthy-four': rejudged('healthy-passed', widened(4, true)),
+      }
+
+      const { json: result } = report(
+        [sessionEntry('slow-broker', 'slow-six'), sessionEntry('healthy', 'healthy-four')],
+        (name) => answers[name]
+      )
+
+      const statusOf = (name) => [
+        ...new Set(result.rows.filter((row) => row.benchmark === name).map((row) => row.status)),
+      ]
+      const spreadOf = (name) =>
+        result.details
+          .find(({ benchmark }) => benchmark === name)
+          .controls.find(({ name: control }) => control === 'A/A spread')
+      expect(statusOf('slow-six')).toEqual(['valid'])
+      expect(spreadOf('slow-six')).toMatchObject({
+        passed: true,
+        detail: 'p99Ms +6.00 % from sticky',
+      })
+      expect(statusOf('healthy-four')).toEqual(['inconclusive'])
+      expect(spreadOf('healthy-four')).toMatchObject({
+        passed: false,
+        detail: 'p99Ms +4.00 % from round-robin',
+      })
+    })
+
+    test('the slow-broker row shows refused per arm', () => {
+      const entry = slowRow()
+      const recorded = lastJsonLine(fixture('slow-broker-recorded').stdout)
+
+      const { json: result, markdown } = report([entry], () =>
+        rejudged('slow-broker-recorded', settled)
+      )
+
+      const cell = (arm, metric) =>
+        result.rows.find((row) => row.arm === arm && row.metric === metric)
+      for (const arm of ['sticky', 'adaptive', 'sticky~AA']) {
+        const { rejected, delivered } = recorded.arms[arm]
+        expect(cell(arm, 'refused')).toMatchObject({
+          status: 'valid',
+          unit: 'records',
+          median: rejected.median,
+          min: rejected.min,
+          max: rejected.max,
+        })
+        expect(cell(arm, 'delivered')).toMatchObject({ median: delivered.median })
+        expect(cell(arm, 'unsettled')).toMatchObject({ median: 0, max: 0 })
+      }
+      expect(cell('sticky', 'refused').min).toBeGreaterThan(0)
+      expect(cell('adaptive', 'refused').max).toBe(0)
+      expect(markdown).toMatch(/\| stickyBalance-slow-broker \| sticky \| refused \| valid \| /)
     })
 
     test('session evidence that is incomplete or contradicts itself is an error row, never valid', () => {

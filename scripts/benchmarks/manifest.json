@@ -225,7 +225,7 @@
         "--raw",
         "{raw}",
         "--runs",
-        "8"
+        "24"
       ],
       "broker": true,
       "metrics": [
@@ -262,6 +262,7 @@
         { "key": "backlogMax", "unit": "records" },
         { "key": "delivered", "unit": "records" },
         { "key": "rejected", "unit": "records" },
+        { "key": "refused", "unit": "records" },
         { "key": "unsettled", "unit": "records" },
         { "key": "drainAtMs", "unit": "ms" }
       ],

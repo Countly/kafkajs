@@ -5,16 +5,18 @@
  * a report is always written, and the exit code stays 0.
  *
  * Every row has a status: `valid`, `inconclusive` (a noisy or void control), `invalid` (a control
- * failed), `error` (the workload failed) or `omitted` (not run, with its reason). Only `valid` and
- * `inconclusive` rows carry numbers. An entry's `adapter` names a module in `adapters/` that reads
+ * failed), `error` (the workload failed), `omitted` (not run, with its reason) or `not selected`
+ * (left out by `--only`). Only `valid` and `inconclusive` rows carry numbers. An entry's `adapter` names a module in `adapters/` that reads
  * its output instead of the plain reader; an entry's `omitted` (`reason`, `decision`,
  * `evidenceRun`) reports it without running it. Each run's arguments, exit, stdout and stderr, and
  * the manifest entry, are written under `<out>/bench-raw/<entry>/` as the run ends, so the evidence
  * survives a report that never finishes; `{raw}` in a command is a file in that directory.
  *
  * Usage: node scripts/benchmarks/report.js --runs 3 --fork-dir <dir> --baseline-dir <dir> --out <dir>
+ *          [--only <name>[,<name>...]]
  * `--fork-dir` and `--baseline-dir` are npm install prefixes: the fork's packed tarball and
- * kafkajs@2.2.4. Exit codes: 0 a report was written, 2 a bad argument.
+ * kafkajs@2.2.4. `--only` runs just the named manifest entries; an empty value runs them all.
+ * Exit codes: 0 a report was written, 2 a bad argument (an unknown `--only` name included).
  */
 const fs = require('node:fs')
 const path = require('node:path')
@@ -29,14 +31,15 @@ const BASELINE = 'kafkajs@2.2.4'
 const BASELINE_VERSION = '2.2.4'
 const PACKAGES = { fork: '@countly/kafkajs', [BASELINE]: 'kafkajs' }
 const HEADER = ['benchmark', 'arm', 'metric', 'status', 'median', 'range', 'unit', 'runs', 'ratio']
-const STATUSES = ['valid', 'inconclusive', 'invalid', 'error', 'omitted']
+const STATUSES = ['valid', 'inconclusive', 'invalid', 'error', 'omitted', 'not selected']
 const NUMBERED = ['valid', 'inconclusive']
 const ADAPTERS = path.join(__dirname, 'adapters')
 const USAGE =
-  'usage: node scripts/benchmarks/report.js --runs <n> --fork-dir <dir> --baseline-dir <dir> --out <dir>'
+  'usage: node scripts/benchmarks/report.js --runs <n> --fork-dir <dir> --baseline-dir <dir> ' +
+  '--out <dir> [--only <name>[,<name>...]]'
 
 /**
- * @typedef {'valid'|'inconclusive'|'invalid'|'error'|'omitted'} Status
+ * @typedef {'valid'|'inconclusive'|'invalid'|'error'|'omitted'|'not selected'} Status
  * @typedef {{ benchmark: string, arm: string, metric: string, unit: string, runs: number,
  *   status: Status, reason?: string, median?: number, min?: number, max?: number,
  *   ratio?: number }} Row
@@ -416,14 +419,15 @@ const renderMarkdown = (rows, meta, details = []) => {
 
 /**
  * @param {string[]} argv
- * @returns {{ runs: number, forkDir: string, baselineDir: string, out: string }}
+ * @returns {{ runs: number, forkDir: string, baselineDir: string, out: string,
+ *   only: string[]|null }} `only` is null when `--only` is absent or empty
  * @throws {Error} the usage line for a missing, repeated or unknown flag or a bad `--runs`
  */
 const parseArgs = (argv) => {
   const flags = {}
   for (let i = 0; i < argv.length; i += 2) {
     const name = argv[i]
-    const known = ['--runs', '--fork-dir', '--baseline-dir', '--out'].includes(name)
+    const known = ['--runs', '--fork-dir', '--baseline-dir', '--out', '--only'].includes(name)
     if (!known || argv[i + 1] === undefined || Object.hasOwn(flags, name)) throw new Error(USAGE)
     flags[name] = argv[i + 1]
   }
@@ -435,18 +439,21 @@ const parseArgs = (argv) => {
     forkDir: path.resolve(flags['--fork-dir']),
     baselineDir: path.resolve(flags['--baseline-dir']),
     out: path.resolve(flags['--out']),
+    only: flags['--only'] ? flags['--only'].split(',') : null,
   }
 }
 
 /**
- * Runs the whole manifest and writes `bench-report.md` and `bench-report.json` into `--out`, with
- * each entry's raw evidence under `--out/bench-raw/`.
- * @param {string[]} argv `--runs`, `--fork-dir`, `--baseline-dir` and `--out`
+ * Runs the manifest, or the entries `--only` names, and writes `bench-report.md` and
+ * `bench-report.json` into `--out`, with each run entry's raw evidence under `--out/bench-raw/`.
+ * An entry `--only` leaves out is a `not selected` row and is neither run nor given evidence.
+ * @param {string[]} argv `--runs`, `--fork-dir`, `--baseline-dir`, `--out` and `--only`
  * @param {object} [deps]
  * @param {Function} [deps.spawn] `child_process.spawnSync`, replaceable in tests
  * @param {{ entries: ManifestEntry[] }} [deps.manifest] the benchmarks to run
  * @param {(line: string) => void} [deps.log] receives the usage line and one line per entry
  * @returns {number} 0 once the report is written, whatever its rows hold; 2 for a bad argument
+ *   or an `--only` name that is no manifest entry
  */
 const main = (
   argv,
@@ -459,9 +466,17 @@ const main = (
     log(error.message)
     return 2
   }
+  const unknown = args.only?.find((name) => !manifest.entries.some((entry) => entry.name === name))
+  if (unknown !== undefined) {
+    log(`--only names no manifest row ${unknown}`)
+    return 2
+  }
   const rawDir = path.join(args.out, 'bench-raw')
   fs.mkdirSync(rawDir, { recursive: true })
   const results = manifest.entries.map((entry) => {
+    if (args.only && !args.only.includes(entry.name)) {
+      return { rows: [entryRow(entry, 'not selected', 'left out by --only')], details: [] }
+    }
     log(entry.name)
     return runEntry(entry, { ...args, spawn, rawDir })
   })
@@ -469,6 +484,7 @@ const main = (
   const details = results.flatMap((result) => result.details)
   const meta = {
     runs: args.runs,
+    ...(args.only && { only: args.only }),
     node: process.version,
     ...(process.env.KAFKA_VERSION && { kafka: process.env.KAFKA_VERSION }),
     ...(process.env.GITHUB_SHA && { commit: process.env.GITHUB_SHA }),
