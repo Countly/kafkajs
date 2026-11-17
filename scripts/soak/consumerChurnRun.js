@@ -198,14 +198,16 @@ class ChurnMember {
   /**
    * The ownership of a partition this member holds, renewed first when the topic was recreated: a
    * recreated log starts again at offset 0 under a new incarnation. A topic deleted with no
-   * successor has no incarnation: its journaled delete ended the ownership, so none is returned.
+   * successor keeps its last ownership, so a delivery or commit that still arrives is journaled
+   * and judged by the oracle.
    */
   #held(topic, partition) {
     const held = this.owners.get(`${topic}|${partition}`)
     if (held === undefined) return undefined
     const current = this.incarnationOf(topic)
-    if (current === undefined) return undefined
-    return current === held.incarnation ? held : this.#acquire(topic, partition, '0')
+    return current === undefined || current === held.incarnation
+      ? held
+      : this.#acquire(topic, partition, '0')
   }
 
   async #left(kind, partitions) {
@@ -215,12 +217,18 @@ class ChurnMember {
     if (kind === 'loss') this.onLoss?.({ group: this.group, member: this.label })
   }
 
+  /**
+   * Journals the end of each ownership and forgets it. The boundary of an incarnation deleted with
+   * no successor is not journaled: its journaled delete already ended that ownership, so the
+   * revoke that follows it is a duplicate boundary, not a new observation.
+   */
   #end(kind, partitions) {
     for (const { topic, partitions: ids } of partitions) {
       for (const partition of ids) {
         const held = this.#held(topic, partition)
+        if (held === undefined) continue
         const key = `${topic}|${partition}`
-        if (held !== undefined)
+        if (this.incarnationOf(topic) !== undefined)
           this.journal.append({
             kind,
             group: this.group,
@@ -959,7 +967,8 @@ class ChurnWorkloads {
   /**
    * Takes the name's incarnation away unless a successor claimed it, then journals the deletion and
    * deletes the topic. The journaled delete ends every ownership of that incarnation, so a member
-   * still holding it later journals no revoke, delivery or commit for it (`ChurnMember#held`).
+   * journals no revoke for it afterwards (`ChurnMember#end`); a delivery or commit it still sees is
+   * journaled, and the oracle rejects it.
    */
   async #delete(topic, context) {
     if (this.live.get(topic.name) === topic) this.live.delete(topic.name)
