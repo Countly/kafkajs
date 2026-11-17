@@ -450,13 +450,19 @@ describe('share client admission while a close is in progress', () => {
     expect(seen).toEqual(['connect', 'handler error', 'disconnect', 'connect'])
   })
 
-  test('acknowledgements started by a handler or by its dispatch run outside the handler context', async () => {
+  /** @returns {Array<{kind: string, identity: *}>} Each acknowledgement start and its context. */
+  const recordAcknowledgements = () => {
     const original = ShareFetchLoop.prototype.acknowledge
     const started = []
     jest.spyOn(ShareFetchLoop.prototype, 'acknowledge').mockImplementation(function (request) {
       started.push({ kind: request.renew ? 'renew' : 'flush', identity: handlerRunIdentity() })
       return original.call(this, request)
     })
+    return started
+  }
+
+  test('a renewal and a release flush started by a handler run outside the handler context', async () => {
+    const started = recordAcknowledgements()
     const h = open()
     const failed = deferred()
     let inside = null
@@ -477,5 +483,43 @@ describe('share client admission while a close is in progress', () => {
       { kind: 'renew', identity: undefined },
       { kind: 'flush', identity: undefined },
     ])
+  })
+
+  test('a boundary flush between handlers runs outside the handler context', async () => {
+    clock = new ShareClock().install()
+    const started = recordAcknowledgements()
+    const h = open()
+    const entered = deferred()
+    const proceed = deferred()
+    const done = deferred()
+    h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a', 'b'])])])
+    await h.consumer.subscribe({ topics: ['topic-a'] })
+    await h.consumer.run({
+      eachMessage: async ({ message }) => {
+        if (message.offset === '1') return done.resolve()
+        entered.resolve()
+        await proceed.promise
+      },
+    })
+    await entered.promise
+    expect(started).toEqual([])
+    await clock.advance(8000)
+    proceed.resolve()
+    await done.promise
+    expect(started).toEqual([{ kind: 'flush', identity: undefined }])
+  })
+
+  test('an omission flush in explicit mode runs outside the handler context', async () => {
+    const started = recordAcknowledgements()
+    const h = open({
+      share: { acknowledgementMode: 'explicit', retry: { restartOnFailure: async () => false } },
+    })
+    const crashed = deferred()
+    h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a'])])])
+    h.consumer.on(h.consumer.events.CRASH, () => crashed.resolve())
+    await h.consumer.subscribe({ topics: ['topic-a'] })
+    await h.consumer.run({ eachMessage: async () => {} })
+    await crashed.promise
+    expect(started).toEqual([{ kind: 'flush', identity: undefined }])
   })
 })
