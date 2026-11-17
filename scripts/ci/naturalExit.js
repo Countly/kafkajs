@@ -17,12 +17,13 @@ const LANES = {
   },
   'soak-full': { ...PROFILES.full, cases: [TITLE] },
   shutdown: {
-    totalMs: 120000,
+    totalMs: 150000,
     spec: 'shareShutdownLive.spec.js',
     cases: [
       'sends four decisions and releases six held records before lock expiry',
       'writes no share frame after a fresh timeout zero call',
       'stops cleanly and releases unstarted records',
+      'connect during disconnect reconnects only after DISCONNECT',
     ],
   },
 }

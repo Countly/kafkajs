@@ -84,6 +84,7 @@ class ShareRunner {
     this.connecting = null
     this.subscribing = false
     this.disconnecting = null
+    this.disconnectCalls = 0
     this.restartOperation = null
     this.lifecycle = 0
   }
@@ -194,12 +195,17 @@ class ShareRunner {
 
   /**
    * Connects the client's Cluster and checks the share capability of the bootstrap broker.
-   * Concurrent and repeated calls share one attempt and one `connect` event.
+   * Concurrent and repeated calls share one attempt and one `connect` event. A call made while a
+   * `disconnect()` is closing the client waits for that close, its `disconnect` event included,
+   * and then makes a fresh attempt; it never joins an attempt the close retired.
    * @returns {Promise<void>}
    * @throws {KafkaJSShareGroupsNotSupportedError} When the cluster cannot run share groups; the
    *   newly opened connections are closed and no `connect` event is published.
+   * @throws {KafkaJSNonRetriableError} When another `disconnect()` was called while this call
+   *   waited for a close, or a close retired this attempt.
    */
   connect() {
+    if (this.disconnecting) return this.afterClose().then(() => this.connect())
     if (this.connected) return Promise.resolve()
     if (!this.connecting) {
       const attempt = this.connectOnce().finally(() => {
@@ -208,6 +214,20 @@ class ShareRunner {
       this.connecting = attempt
     }
     return this.connecting
+  }
+
+  /**
+   * Waits for the close in progress, whatever its outcome. A `disconnect()` called meanwhile was
+   * asked after the waiting caller, so the caller is refused instead of reconnecting.
+   * @private
+   * @returns {Promise<void>}
+   * @throws {KafkaJSNonRetriableError} When another `disconnect()` was called while it waited.
+   */
+  async afterClose() {
+    const calls = this.disconnectCalls
+    await this.disconnecting.catch(() => {})
+    if (this.disconnectCalls !== calls)
+      throw new KafkaJSNonRetriableError('Share client was disconnected')
   }
 
   /**
@@ -243,7 +263,8 @@ class ShareRunner {
   /**
    * Replaces the subscription while no run is active. Names are validated and copied before any
    * state or request; target topics are added under an operation fence, and the subscription is
-   * committed only if the client was not disconnected meanwhile.
+   * committed only if the client was not disconnected meanwhile. A call made while a
+   * `disconnect()` is closing the client is refused before any state or request.
    * @param {{topics: string[]}} input Distinct non-empty topic names.
    * @returns {Promise<void>}
    * @throws {KafkaJSInvalidConfigurationError} For any other shape, a regex or a rejected key.
@@ -251,7 +272,7 @@ class ShareRunner {
    */
   async subscribe(input) {
     const names = this.parseSubscription(input)
-    if (this.current || this.subscribing) {
+    if (this.current || this.subscribing || this.disconnecting) {
       throw new KafkaJSNonRetriableError(
         'subscribe() cannot replace the subscription while a run, a close or another subscribe is active'
       )
@@ -307,7 +328,9 @@ class ShareRunner {
 
   /**
    * Starts a run with exactly one handler. The run is latched before the first await, so a stop
-   * cannot miss a start in progress. Resolves after the first accepted join.
+   * cannot miss a start in progress. Resolves after the first accepted join. A call made while a
+   * `disconnect()` is closing the client is refused before any run exists, so no member joins or
+   * heartbeats after that close.
    * @param {{eachMessage?: Function, eachBatch?: Function}} config Exactly one handler.
    * @returns {Promise<void>} Settles after the first accepted join; resolves void when stop ends
    *   a retriable pending join; rejects with the original fatal join error.
@@ -329,7 +352,7 @@ class ShareRunner {
     }
     if (this.subscription.length === 0)
       throw new KafkaJSNonRetriableError('subscribe() must be called before run()')
-    if (this.current || this.subscribing) {
+    if (this.current || this.subscribing || this.disconnecting) {
       throw new KafkaJSNonRetriableError(
         'run() cannot start while another run, close or subscribe is active'
       )
@@ -377,7 +400,8 @@ class ShareRunner {
   /**
    * Closes the run, if any, and then this client's sockets. The first valid call fixes the whole
    * deadline; later calls share its close and cannot extend it, and timeout zero revokes unsent
-   * closing traffic synchronously.
+   * closing traffic synchronously. A later call also refuses every `connect()` still waiting for
+   * that close, since it was asked after them.
    * @param {{timeout?: number}|*} [options] Options object; any other argument is ignored.
    * @returns {Promise<void>}
    * @throws {KafkaJSInvalidConfigurationError} For an invalid timeout, before any state changes.
@@ -385,6 +409,7 @@ class ShareRunner {
   async disconnect(options) {
     const enteredAt = performance.now()
     const timeout = parseDisconnectTimeout(options)
+    this.disconnectCalls++
     const run = this.current
     if (this.disconnecting) {
       run?.beginClose('disconnect', timeout, enteredAt)
@@ -400,6 +425,7 @@ class ShareRunner {
         zero: timeout === 0,
       }) ?? null
     this.lifecycle++
+    this.connecting = null
     this.stopGeneration++
     this.restartOperation?.retire(new KafkaJSNonRetriableError('Share client was disconnected'))
     const episode = run?.beginClose('disconnect', timeout, enteredAt)

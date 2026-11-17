@@ -54,6 +54,7 @@ const LOCK_MS = 15000
 const FORCED_BUDGET_MS = 40000
 const ZERO_BUDGET_MS = 50000
 const STOP_BUDGET_MS = 30000
+const ADMISSION_BUDGET_MS = 30000
 const HOOK_BUDGET_MS = 10000
 const CLEANUP_BUDGET_MS = 8000
 const JOIN_BUDGET_MS = 10000
@@ -662,7 +663,7 @@ class ShareMember {
 }
 
 /**
- * The fixture of the three shutdown cases: a fresh topic and group per case, the members, the
+ * The fixture of the shutdown cases: a fresh topic and group per case, the members, the
  * independent oracles and the strict cleanup that runs even when an assertion fails.
  */
 class ShutdownCase {
@@ -1636,6 +1637,60 @@ class ShutdownCase {
     this.handlerMultiset([...this.identities(0, 49), ...this.identities(4, 49)])
     await this.quiescent(scope, title, 50)
   }
+
+  /**
+   * Connect during disconnect: a `connect()` made while the member's close runs resolves only
+   * after that close's DISCONNECT and a fresh CONNECT, and a `run()` made in the same window is
+   * refused, so no share frame follows the leave and the broker lists no member.
+   * @param {AbortSignal} scope
+   * @returns {Promise<void>}
+   */
+  async admission(scope) {
+    const title = 'connect during disconnect reconnects only after DISCONNECT'
+    const a = this.member('a', { acknowledgementMode: 'implicit', maxRecords: 100 })
+    const order = []
+    a.listen(a.consumer.events.CONNECT, () => order.push('connect'))
+    a.listen(a.consumer.events.DISCONNECT, () => order.push('disconnect'))
+    await a.start(scope, a.counting())
+    await this.assignmentBarrier(scope, title, [a])
+
+    const closing = a.consumer.disconnect({ timeout: DISCONNECT_MS })
+    const refused = a.consumer.run(a.counting()).then(
+      () => null,
+      (error) => error
+    )
+    const reconnecting = a.consumer.connect().then(() => order.push('connect() resolved'))
+    await bounded(scope, DISCONNECT_MS + 2000, () => closing, { label: 'The close' })
+    await bounded(scope, JOIN_BUDGET_MS, () => reconnecting, { label: 'The reconnect' })
+    const error = await refused
+    expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
+    expect(order).toEqual(['connect', 'disconnect', 'connect', 'connect() resolved'])
+    const leaves = a.tap.frames.filter(
+      ({ apiKey, fields }) => apiKey === API.heartbeat && fields?.memberEpoch === -1
+    )
+    expect(leaves).toHaveLength(1)
+
+    await delay(scope, QUIET_WINDOW_MS)
+    const late = a.tap.frames.filter(
+      ({ apiKey, at }) => SHARE_APIS.has(apiKey) && at > leaves[0].at
+    )
+    expect(late).toEqual([])
+    expect(a.consumer.assignment()).toEqual([])
+    const { groups } = await bounded(scope, 10000, () =>
+      this.admin.describeShareGroups([this.group], { apiTimeout: 5000 })
+    )
+    expect(groups[0].members).toEqual([])
+    this.facts.oracles.admission = {
+      order,
+      refused: error.message,
+      lateShareFrames: late.length,
+      brokerMembers: groups[0].members.length,
+    }
+    this.noCrash(title, [a])
+    await bounded(scope, DISCONNECT_MS + 2000, () =>
+      a.consumer.disconnect({ timeout: DISCONNECT_MS })
+    )
+  }
 }
 
 describeShutdown('Share consumer > shutdown on a live group', () => {
@@ -1693,6 +1748,19 @@ describeShutdown('Share consumer > shutdown on a live group', () => {
       shutdownCase('stop', 'stop', 'stops cleanly and releases unstarted records')
     ),
     caseTimeout(STOP_BUDGET_MS)
+  )
+
+  it(
+    'connect during disconnect reconnects only after DISCONNECT',
+    liveCase(
+      ADMISSION_BUDGET_MS,
+      shutdownCase(
+        'admission',
+        'admission',
+        'connect during disconnect reconnects only after DISCONNECT'
+      )
+    ),
+    caseTimeout(ADMISSION_BUDGET_MS)
   )
 })
 
