@@ -6,8 +6,12 @@ const {
   newLogger,
   saslConnectionOpts,
   saslBrokers,
-  waitFor,
 } = require('testHelpers')
+const {
+  clusterAclPort,
+  closeEach,
+  waitForAclBindings,
+} = require('../../../testHelpers/aclPropagation')
 
 const ACL_RESOURCE_TYPES = require('../../protocol/aclResourceTypes')
 const ACL_OPERATION_TYPES = require('../../protocol/aclOperationTypes')
@@ -16,6 +20,7 @@ const RESOURCE_PATTERN_TYPES = require('../../protocol/resourcePatternTypes')
 
 describe('Admin', () => {
   let admin
+  let aclPort
 
   beforeEach(async () => {
     admin = createAdmin({
@@ -33,7 +38,9 @@ describe('Admin', () => {
   })
 
   afterEach(async () => {
-    admin && (await admin.disconnect())
+    const port = aclPort
+    aclPort = null
+    await closeEach(admin && (() => admin.disconnect()), port && (() => port.close()))
   })
 
   describe('deleteAcls', () => {
@@ -171,30 +178,30 @@ describe('Admin', () => {
         topics: [{ topic: topicName, numPartitions: 1, replicationFactor: 2 }],
       })
 
-      await expect(
-        admin.createAcls({
-          acl: [
-            {
-              resourceType: ACL_RESOURCE_TYPES.TOPIC,
-              resourceName: topicName,
-              resourcePatternType: RESOURCE_PATTERN_TYPES.LITERAL,
-              principal: 'User:bob',
-              host: '*',
-              operation: ACL_OPERATION_TYPES.ALL,
-              permissionType: ACL_PERMISSION_TYPES.DENY,
-            },
-            {
-              resourceType: ACL_RESOURCE_TYPES.TOPIC,
-              resourceName: topicName,
-              resourcePatternType: RESOURCE_PATTERN_TYPES.LITERAL,
-              principal: 'User:alice',
-              host: '*',
-              operation: ACL_OPERATION_TYPES.ALL,
-              permissionType: ACL_PERMISSION_TYPES.ALLOW,
-            },
-          ],
-        })
-      ).resolves.toEqual(true)
+      const bob = {
+        resourceType: ACL_RESOURCE_TYPES.TOPIC,
+        resourceName: topicName,
+        resourcePatternType: RESOURCE_PATTERN_TYPES.LITERAL,
+        principal: 'User:bob',
+        host: '*',
+        operation: ACL_OPERATION_TYPES.ALL,
+        permissionType: ACL_PERMISSION_TYPES.DENY,
+      }
+      const alice = { ...bob, principal: 'User:alice', permissionType: ACL_PERMISSION_TYPES.ALLOW }
+      await expect(admin.createAcls({ acl: [bob, alice] })).resolves.toEqual(true)
+
+      // Each broker's authorizer applies the controller's ACL records on its own schedule, so an
+      // empty answer after the delete proves nothing until every broker has served the create.
+      const { ssl, sasl } = saslConnectionOpts()
+      aclPort = await clusterAclPort({ brokers: saslBrokers(), ssl, sasl })
+      const topicFilter = {
+        resourceType: ACL_RESOURCE_TYPES.TOPIC,
+        resourceName: topicName,
+        resourcePatternType: RESOURCE_PATTERN_TYPES.LITERAL,
+        operation: ACL_OPERATION_TYPES.ANY,
+        permissionType: ACL_PERMISSION_TYPES.ANY,
+      }
+      await waitForAclBindings({ port: aclPort, filter: topicFilter, expected: [bob, alice] })
 
       await expect(
         admin.deleteAcls({
@@ -231,29 +238,14 @@ describe('Admin', () => {
         ],
       })
 
-      // KRaft commits ACL deletions through the controller, so the broker's authorizer cache
-      // catches up asynchronously and can still list the ACL right after deleteAcls.
+      await waitForAclBindings({ port: aclPort, filter: topicFilter, expected: [bob] })
       await expect(
-        waitFor(
-          async () => {
-            const result = await admin.describeAcls({
-              resourceName: topicName,
-              resourceType: ACL_RESOURCE_TYPES.TOPIC,
-              host: '*',
-              permissionType: ACL_PERMISSION_TYPES.ALLOW,
-              operation: ACL_OPERATION_TYPES.ANY,
-              resourcePatternType: RESOURCE_PATTERN_TYPES.LITERAL,
-            })
-
-            return result.resources.length === 0 ? result : false
-          },
-          {
-            ignoreTimeout: false,
-            maxWait: 10000,
-            timeoutMessage: 'Timed out waiting for the ACL to be deleted',
-          }
-        )
-      ).resolves.toMatchObject({ resources: [] })
+        admin.describeAcls({
+          ...topicFilter,
+          host: '*',
+          permissionType: ACL_PERMISSION_TYPES.ALLOW,
+        })
+      ).resolves.toEqual({ resources: [] })
     })
   })
 })

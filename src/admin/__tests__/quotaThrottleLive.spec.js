@@ -2,6 +2,7 @@ const { randomBytes } = require('crypto')
 const { AdminLiveProbe } = require('./fixtures/liveAdmin')
 const { QuotaOracle, setProduceQuota } = require('./fixtures/liveOracles')
 const { saslBrokers, saslConnectionOpts } = require('testHelpers')
+const { scramLoginSettled, brokerLogin } = require('../../../testHelpers/adminCatchUp')
 const { liveCase, caseTimeout, delay } = require('../../producer/__tests__/fixtures/bounded')
 
 const suite = process.env.ADMIN_QUOTA_E2E ? describe : describe.skip
@@ -51,6 +52,12 @@ suite('admin producer quotas', () => {
         expect(services).toHaveLength(1)
         const service = services[0]
         const { ssl } = saslConnectionOpts()
+        const sasl = { mechanism: 'scram-sha-256', username: user, password }
+        await scramLoginSettled(probe, {
+          addresses: saslBrokers(),
+          accepted: true,
+          login: brokerLogin(probe, { ssl, sasl }),
+        })
         const producer = await probe.client(
           'producer',
           { idempotent: true, bufferMemory: 134217728, maxInFlightRequests: 1 },
@@ -58,7 +65,7 @@ suite('admin producer quotas', () => {
             clientId: 'live-quota',
             brokers: saslBrokers(),
             ssl,
-            sasl: { mechanism: 'scram-sha-256', username: user, password },
+            sasl,
           }
         )
         const pending = new Set()
