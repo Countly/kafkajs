@@ -7,7 +7,9 @@ const SHUTDOWN_CASES = [
   'sends four decisions and releases six held records before lock expiry',
   'writes no share frame after a fresh timeout zero call',
   'stops cleanly and releases unstarted records',
+  'connect during disconnect reconnects only after DISCONNECT',
 ]
+const SHUTDOWN_TOTAL_MS = 150000
 
 /**
  * Adds the independently sealed first-use completion before the original scored cleanup row.
@@ -70,7 +72,7 @@ const withPriming = (rows) => {
  */
 const fixture = (lane) => {
   const profile = lane === 'soak' ? PROFILES.short : PROFILES.full
-  const totalMs = lane === 'shutdown' ? 120000 : profile.totalMs
+  const totalMs = lane === 'shutdown' ? SHUTDOWN_TOTAL_MS : profile.totalMs
   const completedAt = 1000 + totalMs - 10000
   const cases = lane === 'shutdown' ? SHUTDOWN_CASES : [SOAK_CASE]
   const state = {
@@ -149,12 +151,12 @@ describe.each(['soak', 'soak-full', 'shutdown'])('CI natural exit > %s', (lane) 
 
     expect(run()).toMatchObject({
       startedAt: 1000,
-      exitedAt: lane === 'soak' ? 2041000 : lane === 'soak-full' ? 3001000 : 121000,
-      cleanupAt: lane === 'soak' ? 2031000 : lane === 'soak-full' ? 2991000 : 111000,
+      exitedAt: lane === 'soak' ? 2041000 : lane === 'soak-full' ? 3001000 : 151000,
+      cleanupAt: lane === 'soak' ? 2031000 : lane === 'soak-full' ? 2991000 : 141000,
       status: 0,
       signal: null,
       origin: 'hrtime',
-      totalMs: lane === 'soak' ? 2040000 : lane === 'soak-full' ? 3000000 : 120000,
+      totalMs: lane === 'soak' ? 2040000 : lane === 'soak-full' ? 3000000 : SHUTDOWN_TOTAL_MS,
       exitMs: 10000,
       watchdogTerminated: false,
     })
@@ -201,7 +203,7 @@ describe.each(['soak', 'soak-full', 'shutdown'])('CI natural exit > %s', (lane) 
           ],
       {
         stdio: 'inherit',
-        timeout: lane === 'soak' ? 2040000 : lane === 'soak-full' ? 3000000 : 120000,
+        timeout: lane === 'soak' ? 2040000 : lane === 'soak-full' ? 3000000 : SHUTDOWN_TOTAL_MS,
         killSignal: 'SIGKILL',
         ...(lane !== 'shutdown' && {
           env: childEnvironment(lane === 'soak' ? 'short' : 'full', {}),
@@ -405,6 +407,30 @@ describe('CI natural exit > shutdown cleanup order', () => {
     const { state, run } = fixture('shutdown')
     state.rows.reverse()
     expect(run).toThrow(/cleanup evidence/)
+  })
+
+  test('shutdown lane accepts four ordered cleanup records including the close-admission case', () => {
+    const { state, run } = fixture('shutdown')
+    expect(state.rows.map((row) => row.case)).toEqual(SHUTDOWN_CASES)
+    expect(state.rows).toHaveLength(4)
+    expect(run()).toMatchObject({
+      accepted: true,
+      totalMs: SHUTDOWN_TOTAL_MS,
+      cleanupAt: state.rows[3].cleanup.completedAt,
+    })
+  })
+
+  test('shutdown lane rejects a missing or reordered close-admission record', () => {
+    const missing = fixture('shutdown')
+    missing.state.rows.pop()
+    expect(missing.state.rows.map((row) => row.case)).toEqual(SHUTDOWN_CASES.slice(0, 3))
+    expect(missing.run).toThrow('shutdown: incomplete or invalid cleanup evidence')
+
+    const reordered = fixture('shutdown')
+    const [third, fourth] = reordered.state.rows.slice(2).map((row) => row.case)
+    reordered.state.rows[2].case = fourth
+    reordered.state.rows[3].case = third
+    expect(reordered.run).toThrow('shutdown: incomplete or invalid cleanup evidence')
   })
 })
 
