@@ -4,280 +4,95 @@ const path = require('node:path')
 const crypto = require('node:crypto')
 const session = require('../adapters/consumerSession')
 const fetchSessions = require('../adapters/fetchSessions')
+const { runArm, SessionMeasurement } = require('../fetchSessions')
+const { PartitionCoverage, verifyCoverage } = require('../consumeCoverage')
+const {
+  ROOT,
+  FULL_WINDOW,
+  flag,
+  output,
+  fakeRun,
+  fakeChild,
+  consumerFixture,
+} = require('./fixtures/consumerRows')
 
-const { ROWS, HEAD, runRow, manifestEntries } = session
-const ROOT = path.resolve(__dirname, '..', '..', '..')
-const SHAS = { [ROOT]: 'a'.repeat(40) }
+const { ROWS, HEAD, manifestEntries } = session
+const NODES = [
+  { nodeId: 1, host: 'localhost', port: 9092 },
+  { nodeId: 2, host: 'localhost', port: 9095 },
+  { nodeId: 3, host: 'localhost', port: 9098 },
+]
 
 let tmp
+let fixture
 beforeEach(() => {
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'consumer-rows-'))
+  fixture = consumerFixture(tmp)
 })
 afterEach(() => {
+  jest.useRealTimers()
   fs.rmSync(tmp, { recursive: true, force: true })
 })
 
 /**
- * @param {string} label
- * @param {{ driverBytes?: string }} [options] a different driver copy, for a mismatch
- * @returns {string} an archived tree holding this checkout's benchmark drivers
+ * @param {string[]} args a run's node arguments
+ * @returns {boolean} whether the run is this checkout's own driver copy
  */
-const tree = (label, { driverBytes } = {}) => {
-  const dir = path.join(tmp, label)
-  const benchmarks = path.join(dir, 'scripts', 'benchmarks')
-  fs.mkdirSync(benchmarks, { recursive: true })
-  for (const file of fs.readdirSync(path.join(ROOT, 'scripts', 'benchmarks'))) {
-    if (file.endsWith('.js')) {
-      fs.copyFileSync(path.join(ROOT, 'scripts', 'benchmarks', file), path.join(benchmarks, file))
-    }
-  }
-  if (driverBytes) fs.writeFileSync(path.join(benchmarks, 'consumeThroughput.js'), driverBytes)
-  SHAS[dir] = crypto.createHash('sha1').update(label).digest('hex')
-  return dir
-}
-
-const frozenEnv = (extra = {}) => ({
-  BENCH_TREES: JSON.stringify({ 'alpha.9c': tree('alpha.9c'), 'alpha.9b': tree('alpha.9b') }),
-  ...extra,
-})
-
-const flag = (args, name, fallback) =>
-  args.includes(name) ? args[args.indexOf(name) + 1] : fallback
+const isHead = (args) => args.find((a) => a.endsWith('.js')).startsWith(path.join(ROOT, 'scripts'))
 
 /**
- * What each real driver prints for one run, with a small deterministic spread.
- * @param {string[]} args the node arguments of the run
- * @param {number} n the call number
- * @returns {object} the driver's JSON line
+ * @param {string} raw a session's observations file
+ * @returns {object[]} its JSONL entries
  */
-const output = (args, n) => {
-  const jitter = 1 + (n % 3) / 1000
-  const driver = path.basename(args.find((arg) => arg.endsWith('.js')))
-  if (driver === 'consumeThroughput.js') {
-    const handler = flag(args, '--handler', 'eachBatch')
-    const messages = Number(flag(args, '--messages', '200000'))
-    const partitions = Number(flag(args, '--partitions', '6'))
-    const batches = handler === 'eachBatch' ? 1380 : 0
-    const entries = handler === 'eachBatch' ? batches : messages
-    return {
-      messages,
-      size: 200,
-      partitions,
-      handler,
-      subscribeChannels: false,
-      messagesPerSecond: 90000 * jitter,
-      p50: 0.001,
-      p90: 0.002,
-      p99: 0.01,
-      handlerP99: 0.01,
-      deliveredMessages: messages,
-      deliveredBatches: batches,
-      handlerEntries: entries,
-      gapSamples: entries - 1,
-      deliveryGapP50: 0.01,
-      deliveryGapP90: 0.05,
-      deliveryGapP99: 0.4 * jitter,
-      deliveredBytes: messages * 200,
-      batches,
-      heapRetainedBytes: 9.5e6 * jitter,
-      ...(args.includes('--rss') && {
-        sizing: {
-          partitionsWithData: partitions,
-          rssBeforeBytes: 1.2e8,
-          rssPeakBytes: 3.1e8 * jitter,
-          rssProcessPeakBytes: 3.3e8,
-          rssGrowthBytes: 1.9e8,
-          heapBeforeBytes: 2e7,
-          heapPeakBytes: 9e7,
-          heapRetainedBytes: 4.1e7 * jitter,
-          heapRetainedGrowthBytes: 2.1e7,
-        },
-      }),
-    }
+const entriesOf = (raw) =>
+  fs
+    .readFileSync(raw, 'utf8')
+    .trim()
+    .split('\n')
+    .map((l) => JSON.parse(l))
+
+/**
+ * A client class whose admin and producer record every call and fail where asked.
+ * @param {{ calls?: string[], fail?: string[], send?: Function }} [options]
+ * @returns {Function} a `Kafka` stand-in for `fetchSessions.prepare`
+ */
+const fakeKafka = ({ calls = [], fail = [], send } = {}) => {
+  const step = (name) => async (arg) => {
+    calls.push(name)
+    if (fail.includes(name)) throw new Error(`${name} failed`)
+    return arg
   }
-  if (driver === 'fetchRound.js') {
-    const partitions = Number(flag(args, '--partitions'))
-    const share = [0, 1, 2].map((node) => Math.ceil((partitions - node) / 3))
-    return {
-      lookups: 3,
-      batches: partitions,
-      requests: 3,
-      lookupsByNode: [1, 1, 1],
-      batchesByNode: share,
-      nsPerNodeRound: 120 * partitions * jitter,
-      allocatedBytesPerRound: 900 * partitions,
-      retainedHeapDelta: 2048,
-      windowAttempts: 1,
-    }
-  }
-  if (driver === 'fetchSessions.js') {
-    if (args.includes('--control')) {
+  return class Kafka {
+    admin() {
       return {
-        frames: {
-          shape: [334, 333, 333],
-          requestBytes: 33168,
-          incrementalRequestBytes: 153,
-          bytes: 33231,
-          requests: 3,
-        },
-        delivery: [],
-        retainedControlBytes: 70 * 1024 * 1024,
+        connect: step('admin.connect'),
+        disconnect: step('admin.disconnect'),
+        createTopics: step('createTopics'),
+        deleteTopics: step('deleteTopics'),
       }
     }
-    const arm = flag(args, '--arm')
-    const active = ['S1', 'L1'].includes(arm)
-    return {
-      arm,
-      sessions: flag(args, '--sessions') === 'true',
-      topic: flag(args, '--topic'),
-      sample: {
-        deliveredMessages: active ? 200000 : 0,
-        deliveredBatches: active ? 1500 : 0,
-        handlerEntries: active ? 1500 : 0,
-        gapSamples: active ? 1499 : 0,
-        deliveryGapP99: 3 * jitter,
-        bytes: 4.2e6,
-        elapsedMs: 60000,
-        cpuMicros: 9e5,
-        messagesPerSecond: 40000 * jitter,
-        bytesPerSecond: 70000 * jitter,
-        cpuMicrosPerSecond: 15000,
-        bytesPerMessage: 21,
-        cpuMicrosPerMessage: 4.5,
-        heapRetainedBytes: 2.2e7 * jitter,
-      },
-      window: {},
-      journal: '/evidence/fetch-frames.jsonl',
-    }
-  }
-  if (driver === 'subscriptionResolve.js') {
-    return { evaluationMs: 2.5 * jitter, matches: 9000, evaluations: 100 }
-  }
-  if (driver === 'stickyAssign.js') {
-    if (flag(args, '--worker') === 'bytes') {
-      return { sticky: ['m-1:00ff'], cooperative: ['m-1:00ff'], cooperativeCore: ['m-1:00ff'] }
-    }
-    const dirArg = args.find((arg) => arg.startsWith('--cpu-prof-dir='))
-    if (dirArg) {
-      const dir = dirArg.slice('--cpu-prof-dir='.length)
-      fs.mkdirSync(dir, { recursive: true })
-      const profile = {
-        nodes: [
-          { id: 1, callFrame: { functionName: '', url: '', lineNumber: -1 } },
-          {
-            id: 2,
-            callFrame: { functionName: 'balance', url: '/t/stickyCore.js', lineNumber: 41 },
-          },
-        ],
-        samples: [2, 2, 1],
-        timeDeltas: [1500, 2500, 100],
+
+    producer() {
+      return {
+        connect: step('producer.connect'),
+        disconnect: step('producer.disconnect'),
+        send: send ?? step('send'),
       }
-      fs.writeFileSync(path.join(dir, `CPU.${n}.cpuprofile`), JSON.stringify(profile))
-    }
-    return { ms: 4100 * jitter }
-  }
-  if (driver === 'recordBatchDecode.js') {
-    return {
-      available: 1,
-      iterations: 20000,
-      nsPerOp: 5100 * jitter,
-      roundNsPerOp: [5100],
-      opsPerSecond: 196000,
-      records: 20,
-      decompressCalls: 10,
     }
   }
-  if (driver === 'rebalanceStorm.js') {
-    return {
-      groupProtocol: 'classic',
-      rounds: 200,
-      partitions: 6,
-      samples: [1, 2, 3, 4, 5].map((i) => ({ round: i * 40, heapUsedBytes: 3e7 })),
-      deltaBytes: 120000,
-      slopeBytesPerRound: 400,
-      ceilingBytes: 8e6,
-      withinCeiling: true,
-      slopeGateBytesPerRound: 32768,
-      withinSlopeGate: true,
-    }
-  }
-  throw new Error(`no fixture for ${driver}`)
-}
-
-/**
- * A `run` that answers like the real drivers and records every call.
- * @param {(args: string[], n: number) => object|{ status: number, stderr: string }} [override]
- * @returns {Function & { calls: object[] }}
- */
-const fakeRun = (override) => {
-  const calls = []
-  const run = async (args, options) => {
-    calls.push({ args, ...options })
-    const n = calls.length
-    const special = override?.(args, n)
-    if (special && 'status' in special) return { signal: null, stdout: '', ...special }
-    return {
-      status: 0,
-      signal: null,
-      stdout: `log\n${JSON.stringify(special ?? output(args, n))}\n`,
-      stderr: '',
-    }
-  }
-  run.calls = calls
-  return run
-}
-
-const sessionsHooks = {
-  prepare: async () => ({
-    args: ['--topic', 'bench-topic'],
-    env: { BENCH_NODES: 'from-prepare' },
-    nodes: [1, 2, 3].map((nodeId, i) => ({ nodeId, host: 'localhost', port: 9092 + 3 * i })),
-  }),
-}
-
-/**
- * Runs one row's session with fakes and reads it the way the report does.
- * @param {string} name
- * @param {object} [options]
- * @returns {Promise<{ line: object, result: object, raw: string, run: Function }>}
- */
-const runSession = async (name, { run = fakeRun(), env = frozenEnv(), hooks } = {}) => {
-  const raw = path.join(tmp, 'bench-raw', name, 'fork-run-1.jsonl')
-  const rowHooks = hooks ?? (ROWS[name].adapter === 'fetchSessions' ? sessionsHooks : {})
-  const line = await runRow(name, raw, {
-    run,
-    env,
-    hooks: rowHooks,
-    commit: (dir) => SHAS[dir] ?? null,
-  })
-  const adapter = require(`../adapters/${ROWS[name].adapter}`)
-  const entry = manifestEntries().find((e) => e.name === name)
-  let outcome
-  try {
-    outcome = { outputs: [adapter.read({ status: 0, stdout: `${JSON.stringify(line)}\n` }, entry)] }
-  } catch (error) {
-    outcome = { outputs: [], error: error.message }
-  }
-  return { line, result: adapter.rows(entry, 'fork', outcome, 1), raw, run }
 }
 
 describe('consumer report rows', () => {
   test('every consumer row reports its controls and corpus identity', async () => {
     for (const name of Object.keys(ROWS)) {
-      const env = frozenEnv({
-        BENCH_TREES: JSON.stringify({
-          'alpha.9c': tree('alpha.9c'),
-          'alpha.9b': tree('alpha.9b'),
-          'before-retirement': tree('before'),
-        }),
-      })
-      const { result } = await runSession(name, { env })
+      const { result } = await fixture.runSession(name)
       const row = ROWS[name]
       const { detail } = result
-      expect([name, detail.status]).toEqual([name, 'valid'])
+      const expected = row.owed?.length ? 'inconclusive' : 'valid'
+      expect([name, detail.status]).toEqual([name, expected])
       const names = new Set(detail.controls.map((control) => control.name))
       for (const control of row.controls) expect([name, names.has(control)]).toEqual([name, true])
-      expect(detail.controls.every(({ passed }) => passed)).toBe(true)
+      expect(detail.controls.filter(({ passed }) => !passed)).toEqual([])
       for (const config of row.configs) {
         const workload = [...row.node, row.driver, ...row.args, ...config.args].join(' ')
         expect(detail.notes).toContain(`workload ${config.name}: ${workload}`)
@@ -289,7 +104,7 @@ describe('consumer report rows', () => {
       expect(detail.notes).toContain(
         `contracts: ${row.contracts.join(', ') || 'none (additional row)'}`
       )
-      const numbered = result.rows.filter((r) => r.status === 'valid')
+      const numbered = result.rows.filter((r) => r.status === expected)
       const arms = session.armsOf(row).length
       expect(numbered).toHaveLength(arms * row.metrics.length)
       expect(
@@ -299,40 +114,26 @@ describe('consumer report rows', () => {
   })
 
   test('the sessions row reads BENCH_NODES from the started containers', async () => {
-    const nodes = [
-      { nodeId: 1, host: 'localhost', port: 9092 },
-      { nodeId: 2, host: 'localhost', port: 9095 },
-      { nodeId: 3, host: 'localhost', port: 9098 },
-    ]
     const created = []
     const sent = []
-    class Kafka {
+    const Kafka = fakeKafka({
+      send: async ({ messages }) => sent.push(messages.length),
+    })
+    const recording = class extends Kafka {
       admin() {
-        return {
-          connect: async () => {},
-          disconnect: async () => {},
-          createTopics: async ({ topics }) => created.push(...topics),
-          deleteTopics: async () => {},
-        }
-      }
-
-      producer() {
-        return {
-          connect: async () => {},
-          disconnect: async () => {},
-          send: async ({ messages }) => sent.push(messages.length),
-        }
+        const admin = super.admin()
+        return { ...admin, createTopics: async ({ topics }) => created.push(...topics) }
       }
     }
-    const hooks = { prepare: (context) => fetchSessions.prepare(context, { Kafka }) }
-    const env = frozenEnv({ BENCH_NODES: JSON.stringify(nodes) })
-    const { line, result, run } = await runSession('consumer-sessions-L1', { env, hooks })
+    const hooks = { prepare: (context) => fetchSessions.prepare(context, { Kafka: recording }) }
+    const env = fixture.frozenEnv({ BENCH_NODES: JSON.stringify(NODES) })
+    const { line, result, run } = await fixture.runSession('consumer-sessions-L1', { env, hooks })
 
-    expect(line.nodes).toEqual(nodes)
+    expect(line.nodes).toEqual(NODES)
     const timed = run.calls.filter(({ args }) => args.includes('--arm'))
     expect(timed.length).toBeGreaterThan(0)
     for (const call of timed) {
-      expect(JSON.parse(call.env.BENCH_NODES)).toEqual(nodes)
+      expect(JSON.parse(call.env.BENCH_NODES)).toEqual(NODES)
       expect(path.isAbsolute(call.env.BENCH_EVIDENCE_DIR)).toBe(true)
       expect(call.args.slice(-6)).toEqual([
         '--arm',
@@ -352,7 +153,10 @@ describe('consumer report rows', () => {
       expect.objectContaining({ name: 'BENCH_NODES from the started containers', passed: true })
     )
 
-    const missing = await runSession('consumer-sessions-L1', { env: frozenEnv(), hooks })
+    const missing = await fixture.runSession('consumer-sessions-L1', {
+      env: fixture.frozenEnv(),
+      hooks,
+    })
     expect(missing.line.error).toBe(
       'BENCH_NODES is not set: the workflow reads it from the started containers'
     )
@@ -364,7 +168,7 @@ describe('consumer report rows', () => {
   test('the frozen alpha.9c and alpha.9b arms print their tree SHA and driver digest', async () => {
     const driver = path.join(ROOT, 'scripts', 'benchmarks', 'consumeThroughput.js')
     const digest = crypto.createHash('sha256').update(fs.readFileSync(driver)).digest('hex')
-    const { result } = await runSession('consumer-eachBatch')
+    const { result } = await fixture.runSession('consumer-eachBatch')
     for (const label of ['alpha.9c', 'alpha.9b']) {
       const sha = crypto.createHash('sha1').update(label).digest('hex')
       expect(result.detail.notes).toContain(`tree ${label}: ${sha}, driver sha256 ${digest}`)
@@ -379,16 +183,16 @@ describe('consumer report rows', () => {
       }
     }
 
-    const changed = frozenEnv()
+    const changed = fixture.frozenEnv()
     const trees = JSON.parse(changed.BENCH_TREES)
-    trees['alpha.9b'] = tree('alpha.9b-changed', { driverBytes: '// another driver\n' })
-    const mismatch = await runSession('consumer-eachBatch', {
+    trees['alpha.9b'] = fixture.tree('alpha.9b-changed', { driverBytes: '// another driver\n' })
+    const mismatch = await fixture.runSession('consumer-eachBatch', {
       env: { BENCH_TREES: JSON.stringify(trees) },
     })
     expect(mismatch.result.detail.status).toBe('invalid')
     expect(mismatch.result.detail.reason).toContain('alpha.9b identical comparison driver')
 
-    const absent = await runSession('consumer-eachBatch', { env: {} })
+    const absent = await fixture.runSession('consumer-eachBatch', { env: {} })
     expect(absent.result.detail.status).toBe('valid')
     expect(absent.result.rows.find((r) => r.arm === 'alpha.9c')).toMatchObject({
       status: 'error',
@@ -399,7 +203,7 @@ describe('consumer report rows', () => {
   test('a sizing run with a partition that received no data is error with its reason', async () => {
     const stderr = 'Error: Data reached 999 of 1000 partitions\n    at SizingObservation.finish'
     const run = fakeRun((args) => (args.includes('--rss') ? { status: 1, stderr } : undefined))
-    const { result, line } = await runSession('consumer-sizing-25mib', { run })
+    const { result, line } = await fixture.runSession('consumer-sizing-25mib', { run })
     expect(line.arms[HEAD].errors[0]).toBe(
       'round 1: exit 1: Error: Data reached 999 of 1000 partitions at SizingObservation.finish'
     )
@@ -421,7 +225,7 @@ describe('consumer report rows', () => {
       expect(row.driver).toBe('consumeThroughput.js')
       expect(row.node).toContain('--expose-gc')
       expect(row.args).toEqual(['--partitions', '1000', '--max-bytes', String(bytes), '--rss'])
-      const { run, result } = await runSession(name)
+      const { run, result } = await fixture.runSession(name)
       expect(result.detail.status).toBe('valid')
       for (const { args } of run.calls) {
         expect(path.basename(args.find((arg) => arg.endsWith('.js')))).toBe('consumeThroughput.js')
@@ -439,7 +243,7 @@ describe('consumer report rows', () => {
       const line = output(args, n)
       return flag(args, '--worker') === 'time' && n <= 9 ? { ms: 999999 } : line
     })
-    const { line, result, raw } = await runSession('consumer-stickyAssign-g6', { run })
+    const { line, result, raw } = await fixture.runSession('consumer-stickyAssign-g6', { run })
     const timed = run.calls.filter(({ args }) => flag(args, '--worker') === 'time')
     expect(timed).toHaveLength(6 * 8)
     for (const { args, cwd } of timed) {
@@ -449,11 +253,7 @@ describe('consumer report rows', () => {
       expect(args.find((a) => a.startsWith('--cpu-prof-dir='))).toContain(path.dirname(raw))
       expect(path.isAbsolute(flag(args, '--tree'))).toBe(true)
     }
-    const observations = fs
-      .readFileSync(raw, 'utf8')
-      .trim()
-      .split('\n')
-      .map((l) => JSON.parse(l))
+    const observations = entriesOf(raw)
     expect(observations.filter((o) => o.warmup)).toHaveLength(6)
     expect(observations.filter((o) => !o.warmup)).toHaveLength(42)
     expect(line).toMatchObject({ warmup: 1, measured: 7 })
@@ -463,7 +263,8 @@ describe('consumer report rows', () => {
     }
     expect(Object.values(line.profiles)).toEqual(Array(6).fill(8))
     expect(line.selfTime[HEAD][0]).toEqual({ fn: 'balance stickyCore.js:42', ms: 32 })
-    expect(result.detail.status).toBe('valid')
+    expect(result.detail.status).toBe('inconclusive')
+    expect(result.detail.reason).toBe(`owed: ${ROWS['consumer-stickyAssign-g6'].owed[0]}`)
     expect(
       result.detail.notes.some((n) => n.startsWith('head self time: balance stickyCore.js:42'))
     ).toBe(true)
@@ -472,7 +273,7 @@ describe('consumer report rows', () => {
     const unprofiled = fakeRun((args) =>
       flag(args, '--worker') === 'time' ? { ms: 4100 } : undefined
     )
-    const without = await runSession('consumer-stickyAssign-g6', {
+    const without = await fixture.runSession('consumer-stickyAssign-g6', {
       run: async (args, options) =>
         unprofiled(
           args.filter((a) => !a.startsWith('--cpu-prof')),
@@ -494,26 +295,411 @@ describe('consumer report rows', () => {
     expect(code).toBe(0)
     expect(fs.existsSync(raw)).toBe(false)
     const adapter = require('../adapters/consumeThroughput')
-    const output = adapter.read({ status: 0, stdout: `${lines[0]}\n` }, entry)
-    expect(adapter.rows(entry, 'fork', { outputs: [output] }, 1).rows).toEqual([
+    const result = adapter.read({ status: 0, stdout: `${lines[0]}\n` }, entry)
+    expect(adapter.rows(entry, 'fork', { outputs: [result] }, 1).rows).toEqual([
       expect.objectContaining({ status: 'omitted', reason: session.OUTSIDE }),
     ])
   })
 
-  test('an A/A spread above 3 % makes that row invalid', async () => {
-    const { line } = await runSession('consumer-subscriptionResolve')
+  test('an A/A spread beyond 3 % makes that row inconclusive, and exactly 3 % stays valid', async () => {
+    const { line } = await fixture.runSession('consumer-subscriptionResolve')
     const adapter = require('../adapters/subscriptionResolve')
     const entry = manifestEntries().find((e) => e.name === 'consumer-subscriptionResolve')
-    const withSpread = (percent) => {
+    const reference = line.arms['alpha.9c'].stats.evaluationMs.median
+    const withCopy = (factor) => {
       const copy = JSON.parse(JSON.stringify(line))
-      copy.aa['alpha.9c~AA'].percent.evaluationMs = percent
+      copy.arms['alpha.9c~AA'].stats.evaluationMs.median = reference * factor
       return adapter.rows(entry, 'fork', { outputs: [copy] }, 1)
     }
-    const noisy = withSpread(3.2)
-    expect(noisy.detail.status).toBe('invalid')
-    expect(noisy.detail.reason).toBe('failed controls: alpha.9c~AA A/A within 3 %')
-    expect(noisy.rows.every((r) => r.status === 'invalid' && r.median === undefined)).toBe(true)
-    expect(withSpread(-3.2).detail.status).toBe('invalid')
-    expect(withSpread(2.9).detail.status).toBe('valid')
+    const noisy = withCopy(1.032)
+    expect(noisy.detail.status).toBe('inconclusive')
+    expect(noisy.detail.reason).toBe('A/A beyond 3 %: alpha.9c~AA evaluationMs +3.20 %')
+    expect(noisy.rows.every((r) => r.status === 'inconclusive' && Number.isFinite(r.median))).toBe(
+      true
+    )
+    expect(withCopy(0.968).detail.status).toBe('inconclusive')
+    expect(withCopy(1.03).detail.status).toBe('valid')
+    expect(withCopy(0.97).detail.status).toBe('valid')
+    expect(withCopy(1.0300001).detail.status).toBe('inconclusive')
+    expect(withCopy(1.0299999).detail.status).toBe('valid')
+  })
+
+  test('raw receipts keep every driver run with its arguments, exit and exact stdout and stderr', async () => {
+    const special = {
+      1: { status: 0, stdout: 'warn: first\n{"evaluationMs":2.5,"matches":9000,"evaluations":100}\n', stderr: 'stderr of run 1' },
+      3: { status: 0, stdout: 'not a JSON line', stderr: 'parse me' },
+      4: { status: 3, stdout: 'partial output', stderr: 'Error: boom\n    at driver' },
+      5: { status: null, signal: 'SIGKILL', stdout: 'before the kill', stderr: '' },
+    }
+    const run = fakeRun((args, n) => special[n])
+    const { raw, result } = await fixture.runSession('consumer-subscriptionResolve', { run, env: {} })
+    const ran = entriesOf(raw).filter((e) => e.invocation)
+    expect(ran).toHaveLength(run.calls.length)
+    const dir = path.dirname(raw)
+    for (const [n, want] of Object.entries(special)) {
+      const { invocation } = ran[n - 1]
+      expect(invocation).toMatchObject({
+        args: run.calls[n - 1].args,
+        cwd: run.calls[n - 1].cwd,
+        status: want.status,
+        signal: want.signal ?? null,
+      })
+      expect(fs.readFileSync(path.join(dir, invocation.stdout), 'utf8')).toBe(want.stdout)
+      expect(fs.readFileSync(path.join(dir, invocation.stderr), 'utf8')).toBe(want.stderr)
+    }
+    expect(ran[2].error).toBe('exit 0: no JSON line: parse me')
+    expect(ran[3].error).toBe('exit 3: Error: boom at driver')
+    expect(ran[4].error).toBe('killed by SIGKILL')
+    expect(result.detail.status).toBe('error')
+    expect(result.detail.reason).toMatch(/^head(~AA)?: round 1: /)
+
+    const big = await session.runProcess(
+      ['-e', 'process.stdout.write("x".repeat(100)); process.stderr.write("e")'],
+      { cwd: tmp, env: process.env, timeoutMs: 30000, maxOutput: 10 }
+    )
+    expect(big).toMatchObject({ status: 0, stdout: 'x'.repeat(10), stderr: 'e' })
+    expect(big.truncated).toEqual({ stdout: true })
+  })
+
+  test('an active fetch-session run with the whole corpus but too few batch gaps is inconclusive and keeps its numbers', async () => {
+    let clock = 0
+    const measurement = new SessionMeasurement({
+      now: () => clock,
+      cpu: () => ({ user: clock, system: 0 }),
+    })
+    const consumer = {
+      connect: async () => {},
+      subscribe: async () => {},
+      run: async ({ eachBatch }) => {
+        for (let i = 0; i < 100; i++) {
+          clock += 1
+          await eachBatch({ batch: { messages: Array(i < 99 ? 2000 : 2001).fill(null) } })
+        }
+      },
+      stop: async () => {},
+      disconnect: async () => {},
+    }
+    const sample = await runArm(
+      { consumer: () => consumer },
+      { arm: 'S1', topic: 't', sessions: false, measurement, readRetained: async () => 2.2e7 }
+    )
+    expect(sample).toMatchObject({ deliveredMessages: 200001, handlerEntries: 100, gapSamples: 99 })
+
+    const run = fakeRun((args) =>
+      args.includes('--arm')
+        ? { arm: 'S1', sessions: flag(args, '--sessions') === 'true', topic: 't', sample, window: {} }
+        : undefined
+    )
+    const { result } = await fixture.runSession('consumer-sessions-S1', { run, env: {} })
+    expect(result.detail.status).toBe('inconclusive')
+    expect(result.detail.reason).toBe(
+      'fewer than 1000 batch gaps on head/sessions-false, head/sessions-false~AA, head/sessions-true, head/sessions-true~AA'
+    )
+    const head = result.rows.filter((r) => r.arm.startsWith('head'))
+    expect(head.every((r) => r.status === 'inconclusive' && Number.isFinite(r.median))).toBe(true)
+
+    for (const gaps of [undefined, NaN]) {
+      const counted = fakeRun((args, n) => ({ ...output(args, n), gapSamples: gaps }))
+      const throughput = await fixture.runSession('consumer-eachMessage', { run: counted, env: {} })
+      expect(throughput.result.detail.status).toBe('inconclusive')
+      expect(throughput.result.detail.reason).toBe(
+        'fewer than 200000 counted delivery-gap samples on head, head~AA'
+      )
+    }
+  })
+
+  test('the L2 producer window counts offered, acknowledged, failed and unsettled sends and settles before the next run', async () => {
+    jest.useFakeTimers()
+    const window = (send) => new fetchSessions.WindowProducer({ producer: { send }, topic: 't' })
+
+    const full = window(async () => {})
+    full.start()
+    await jest.advanceTimersByTimeAsync(60000)
+    expect(await full.settle()).toMatchObject({
+      offered: 12000,
+      acknowledged: 12000,
+      failed: 0,
+      unsettled: 0,
+      partitions: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+      ticks: 600,
+      endedBy: 'window',
+    })
+    expect(jest.getTimerCount()).toBe(0)
+
+    let n = 0
+    const failing = window(async () => {
+      if (++n === 5) throw new Error('NOT_LEADER_OR_FOLLOWER')
+    })
+    failing.start()
+    await jest.advanceTimersByTimeAsync(60000)
+    expect(await failing.settle()).toMatchObject({
+      offered: 12000,
+      acknowledged: 11980,
+      failed: 20,
+      errors: ['NOT_LEADER_OR_FOLLOWER'],
+    })
+
+    let m = 0
+    const hanging = window(() => (++m === 600 ? new Promise(() => {}) : Promise.resolve()))
+    hanging.start()
+    await jest.advanceTimersByTimeAsync(60000)
+    const settling = hanging.settle()
+    await jest.advanceTimersByTimeAsync(30000)
+    expect(await settling).toMatchObject({ offered: 12000, acknowledged: 11980, unsettled: 20 })
+    expect(jest.getTimerCount()).toBe(0)
+
+    const short = window(async () => {})
+    short.start()
+    await jest.advanceTimersByTimeAsync(30000)
+    short.stop('child-close')
+    expect(await short.settle()).toMatchObject({ offered: 6000, ticks: 300, endedBy: 'child-close' })
+    expect(jest.getTimerCount()).toBe(0)
+  })
+
+  test('an L2 run whose producer window fell short or failed is never a valid row', async () => {
+    jest.useFakeTimers()
+    const session2 = async ({ windowMs, send }) => {
+      const Kafka = fakeKafka({ send })
+      const hooks = { prepare: (context) => fetchSessions.prepare(context, { Kafka }) }
+      const run = fakeRun(async (args, n, options) => {
+        if (!args.includes('--arm')) return undefined
+        const child = fakeChild()
+        options.onMessage({ type: 'measurement-ready' }, child)
+        await jest.advanceTimersByTimeAsync(windowMs)
+        child.emit('close')
+        return undefined
+      })
+      const env = { BENCH_NODES: JSON.stringify(NODES) }
+      return fixture.runSession('consumer-sessions-L2', { run, env, hooks })
+    }
+
+    const complete = await session2({ windowMs: 60100, send: async () => {} })
+    expect(complete.result.detail.status).toBe('valid')
+    for (const label of ['head/sessions-false', 'head/sessions-true~AA']) {
+      for (const result of complete.line.arms[label].results) {
+        expect(result.producer).toMatchObject({ ...FULL_WINDOW, partitions: FULL_WINDOW.partitions })
+      }
+    }
+
+    let sends = 0
+    const failed = await session2({
+      windowMs: 60100,
+      send: async () => {
+        if (++sends === 700) throw new Error('REQUEST_TIMED_OUT')
+      },
+    })
+    expect(failed.result.detail.status).toBe('invalid')
+    expect(failed.result.detail.reason).toContain('L2 producer window complete')
+    const detail = failed.result.detail.controls.find((c) => c.name === 'L2 producer window complete')
+    expect(detail.detail).toContain('REQUEST_TIMED_OUT')
+
+    const short = await session2({ windowMs: 30000, send: async () => {} })
+    expect(short.result.detail.status).toBe('invalid')
+    expect(short.result.detail.reason).toContain('L2 producer window complete')
+    expect(jest.getTimerCount()).toBe(0)
+  })
+
+  test('preparing a fetch-session row disconnects every client and keeps the first error whatever step fails', async () => {
+    const context = {
+      row: ROWS['consumer-sessions-L1'],
+      name: 'consumer-sessions-L1',
+      dir: tmp,
+      env: { BENCH_NODES: JSON.stringify(NODES) },
+    }
+    for (const failing of ['admin.connect', 'producer.connect', 'createTopics', 'send']) {
+      const calls = []
+      const Kafka = fakeKafka({ calls, fail: [failing] })
+      await expect(fetchSessions.prepare(context, { Kafka })).rejects.toThrow(`${failing} failed`)
+      expect([failing, calls.slice(-2)]).toEqual([
+        failing,
+        ['producer.disconnect', 'admin.disconnect'],
+      ])
+    }
+
+    const calls = []
+    const Kafka = fakeKafka({ calls, fail: ['deleteTopics', 'producer.disconnect'] })
+    const prepared = await fetchSessions.prepare(context, { Kafka })
+    await expect(prepared.cleanup()).rejects.toThrow('deleteTopics failed')
+    expect(calls.slice(-3)).toEqual(['deleteTopics', 'producer.disconnect', 'admin.disconnect'])
+  })
+
+  test('an arm its tree cannot run is labelled unsupported and never measured', async () => {
+    const old = fixture.tree('alpha.9b-old', { lacks: ['fetchSessions option'] })
+    const env = { BENCH_TREES: JSON.stringify({ 'alpha.9c': fixture.tree('alpha.9c'), 'alpha.9b': old }) }
+    const { line, result, run } = await fixture.runSession('consumer-sessions-S1', { env })
+    const ranOnOld = run.calls.filter(({ args }) => args.some((a) => a.startsWith(old)))
+    expect(ranOnOld.some(({ args }) => flag(args, '--sessions') === 'true')).toBe(false)
+    expect(ranOnOld.filter(({ args }) => flag(args, '--sessions') === 'false')).toHaveLength(16)
+    const reason = 'alpha.9b has no fetchSessions option'
+    for (const label of ['alpha.9b/sessions-true', 'alpha.9b/sessions-true~AA']) {
+      expect(line.arms[label]).toMatchObject({ unsupported: reason, measured: 0 })
+      expect(result.rows.filter((r) => r.arm === label).every((r) => r.status === 'omitted' && r.reason === reason)).toBe(true)
+    }
+    expect(line.arms['alpha.9b/sessions-false'].measured).toBe(7)
+    expect(result.detail.status).toBe('valid')
+    expect(result.detail.notes).toContain(`unsupported alpha.9b/sessions-true: ${reason}`)
+
+    const noModule = fixture.tree('alpha.9b-nosub', { lacks: ['subscription module'] })
+    const subscription = await fixture.runSession('consumer-subscriptionResolve', {
+      env: { BENCH_TREES: JSON.stringify({ 'alpha.9c': fixture.tree('alpha.9c'), 'alpha.9b': noModule }) },
+    })
+    expect(subscription.run.calls.some(({ args }) => args.includes(noModule))).toBe(false)
+    expect(subscription.line.arms['alpha.9b'].unsupported).toBe('alpha.9b has no subscription module')
+  })
+
+  test('a proof the row cannot give is printed as owed and keeps the row inconclusive', async () => {
+    for (const name of ['consumer-stickyAssign-g6', 'consumer-offsetCommit-retirement']) {
+      const { owed } = ROWS[name]
+      expect(owed.length).toBeGreaterThan(0)
+      const { result } = await fixture.runSession(name)
+      expect(result.detail.status).toBe('inconclusive')
+      expect(result.detail.reason).toBe(owed.map((o) => `owed: ${o}`).join('; '))
+      for (const o of owed) expect(result.detail.notes).toContain(`owed: ${o}`)
+    }
+    const mismatched = fakeRun((args) =>
+      flag(args, '--worker') === 'bytes' && flag(args, '--tree').endsWith(`${path.sep}alpha.9b`)
+        ? { sticky: ['m-1:0000'] }
+        : undefined
+    )
+    const g6 = await fixture.runSession('consumer-stickyAssign-g6', { run: mismatched })
+    expect(g6.result.detail.status).toBe('invalid')
+    expect(g6.result.detail.reason).toContain('alpha.9b assignment identical across trees')
+  })
+
+  test('the decode row needs equal decoded-content checksums on every tree, not only equal counts', async () => {
+    const valid = await fixture.runSession('consumer-recordBatchDecode')
+    expect(valid.result.detail.status).toBe('valid')
+    const controls = valid.run.calls.filter(({ args }) => args.includes('--checksum'))
+    expect(controls).toHaveLength(3)
+    expect(controls.map(({ args }) => flag(args, '--arms'))).toEqual(
+      Array(3).fill('uncompressed,gzip,snappy')
+    )
+
+    const changed = fakeRun((args, n) => {
+      const line = output(args, n)
+      if (args.includes('--checksum') && args.some((a) => a.includes(`${path.sep}alpha.9b${path.sep}`))) {
+        line.checksums.gzip.sha256 = 'other-content'
+      }
+      return line
+    })
+    const differ = await fixture.runSession('consumer-recordBatchDecode', { run: changed })
+    expect(differ.result.detail.status).toBe('invalid')
+    expect(differ.result.detail.reason).toContain('gzip decoded checksum equal across trees')
+
+    const empty = fakeRun((args, n) => {
+      const line = output(args, n)
+      if (args.includes('--checksum')) {
+        for (const c of Object.values(line.checksums)) c.records = 0
+      } else line.records = 0
+      return line
+    })
+    const none = await fixture.runSession('consumer-recordBatchDecode', { run: empty })
+    expect(none.result.detail.status).toBe('invalid')
+    expect(none.result.detail.reason).toContain('decoded records equal across trees')
+  })
+
+  test('the 1000-partition row needs every partition populated and consumed on every tree, else it is error', async () => {
+    const valid = await fixture.runSession('consumer-partitions-1000')
+    expect(valid.result.detail.status).toBe('valid')
+    const controls = valid.run.calls.filter(({ args }) =>
+      args.some((a) => a.endsWith('consumeCoverage.js'))
+    )
+    expect(controls).toHaveLength(3)
+    for (const { args, cwd } of controls) {
+      expect(args).toEqual(expect.arrayContaining(['--expose-gc', '--partitions', '1000']))
+      expect(args.find((a) => a.endsWith('.js')).startsWith(cwd)).toBe(true)
+    }
+
+    const shortOn9c = fakeRun((args, n) =>
+      args.some((a) => a.endsWith('consumeCoverage.js')) && args.some((a) => a.includes('alpha.9c'))
+        ? { ...output(args, n), partitionsWithData: 999 }
+        : undefined
+    )
+    const short = await fixture.runSession('consumer-partitions-1000', { run: shortOn9c })
+    expect(short.result.detail.status).toBe('error')
+    expect(short.result.detail.reason).toContain('alpha.9c data on every partition')
+
+    const headFails = fakeRun((args) =>
+      args.some((a) => a.endsWith('consumeCoverage.js')) && isHead(args)
+        ? { status: 1, stderr: 'Error: Data reached 999 of 1000 partitions' }
+        : undefined
+    )
+    const failed = await fixture.runSession('consumer-partitions-1000', { run: headFails })
+    expect(failed.result.detail.status).toBe('error')
+    expect(failed.result.detail.reason).toContain('head data on every partition')
+    expect(
+      failed.result.detail.controls.find((c) => c.arm === HEAD && c.name === 'data on every partition').detail
+    ).toContain('Data reached 999 of 1000 partitions')
+
+    const coverage = new PartitionCoverage(3)
+    await coverage.collect()
+    coverage.start()
+    coverage.observe(0)
+    coverage.observe(2)
+    expect(await coverage.finish()).toEqual({ partitionsWithData: 2 })
+    expect(() => coverage.observe(3)).toThrow('Unexpected partition 3')
+    expect(() =>
+      verifyCoverage({ partitions: 1000, populatedPartitions: 1000, partitionsWithData: 999 })
+    ).toThrow('Data reached 999 of 1000 partitions')
+    expect(() =>
+      verifyCoverage({ partitions: 1000, populatedPartitions: 998, partitionsWithData: 1000 })
+    ).toThrow('The corpus populated 998 of 1000 partitions')
+    expect(() =>
+      verifyCoverage({ partitions: 1000, populatedPartitions: 1000, partitionsWithData: 1000 })
+    ).not.toThrow()
+  })
+
+  test('the fetch-session rows need the remove-byte-counter mutant rejected on every tree', async () => {
+    const valid = await fixture.runSession('consumer-sessions-S2')
+    expect(valid.result.detail.status).toBe('valid')
+    for (const mutant of [{ rejected: false }, undefined]) {
+      const run = fakeRun((args, n) => {
+        const line = output(args, n)
+        if (args.includes('--control') && args.some((a) => a.includes('alpha.9c'))) line.mutant = mutant
+        return line
+      })
+      const { result } = await fixture.runSession('consumer-sessions-S2', { run })
+      expect(result.detail.status).toBe('invalid')
+      expect(result.detail.reason).toContain('alpha.9c remove-byte-counter mutant rejected')
+    }
+  })
+
+  test('each row prints its original bounds against alpha.9b and against its same-tree arm as information only', async () => {
+    const slowHead = fakeRun((args, n) => {
+      const line = output(args, n)
+      if (isHead(args) && flag(args, '--listener') === '1') line.messagesPerSecond *= 0.5
+      else if (isHead(args)) line.messagesPerSecond *= 0.8
+      return line
+    })
+    const { result } = await fixture.runSession('consumer-listener', { run: slowHead })
+    expect(result.detail.status).toBe('valid')
+    const notes = result.detail.notes.filter((n) => n.startsWith('bound '))
+    const note = (prefix) => notes.find((n) => n.startsWith(prefix))
+    expect(note('bound messagesPerSecond head/listener-0 vs alpha.9b/listener-0 (information): ')).toMatch(
+      / -(19|20)\.\d\d % \(original bound -3 %\)$/
+    )
+    expect(note('bound messagesPerSecond alpha.9c/listener-0 vs alpha.9b/listener-0 (information): ')).toMatch(
+      / [+-]0\.\d\d % \(original bound -3 %\)$/
+    )
+    expect(note('bound messagesPerSecond head/listener-1 vs head/listener-0 (information): ')).toMatch(
+      / -(37|38)\.\d\d % \(original bound within \+3 % of the no-listener arm\)$/
+    )
+    expect(note('bound heapRetainedBytes head/listener-0 vs alpha.9b/listener-0 (information): ')).toMatch(
+      / [+-]0\.\d\d MiB \(original bound \+2 MiB\)$/
+    )
+    expect(result.detail.controls.filter((c) => c.name.startsWith('A/A'))).toHaveLength(6)
+
+    const l2 = await fixture.runSession('consumer-sessions-L2')
+    expect(l2.result.detail.notes).toContain(
+      'bound sample.bytesPerMessage head/sessions-true vs head/sessions-false (information): 100.00 % of the reference (original bound at most 10 % of sessionless)'
+    )
+    expect(l2.result.detail.notes).toContain(
+      'rule (information): fetchSessions stays false unless the correctness matrix passed and every fixed row of the default table passes with valid controls; alpha.9b is a separate sessionless comparator'
+    )
+
+    const absent = await fixture.runSession('consumer-eachBatch', { env: {} })
+    expect(absent.result.detail.notes).toContain(
+      'bound messagesPerSecond head vs alpha.9b (information): not measured (original bound -3 %)'
+    )
   })
 })

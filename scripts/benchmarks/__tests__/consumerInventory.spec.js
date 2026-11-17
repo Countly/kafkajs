@@ -3,9 +3,22 @@ const os = require('node:os')
 const path = require('node:path')
 const manifest = require('../manifest.json')
 const session = require('../adapters/consumerSession')
+const { ROOT, fakeRun, consumerFixture, writeEvidence } = require('./fixtures/consumerRows')
 
-const { ROWS, AUDIT, FROZEN, armsOf, manifestEntries, audit } = session
+const { ROWS, AUDIT, FROZEN, HEAD, armsOf, manifestEntries, audit } = session
 const TREES = ['head', 'alpha.9c', 'alpha.9b']
+const VS_9B = 'alpha.9b'
+const CONSUME_BOUNDS = [
+  'messagesPerSecond vs alpha.9b: -3 %',
+  'deliveryGapP99 vs alpha.9b: +5 % (only with the declared gap samples)',
+  'heapRetainedBytes vs alpha.9b: +2 MiB',
+]
+
+/**
+ * @param {string[]} args
+ * @param {string[]} [controls]
+ * @returns {object} the contract of a throughput row
+ */
 const consume = (args, controls = ['handler entries', 'delivered messages']) => ({
   driver: 'consumeThroughput.js',
   args,
@@ -13,8 +26,16 @@ const consume = (args, controls = ['handler entries', 'delivered messages']) => 
   controls,
   artifacts: ['observations'],
   metrics: ['messagesPerSecond', 'deliveryGapP99', 'heapRetainedBytes'],
+  bounds: CONSUME_BOUNDS,
 })
-const sessionsArm = (arm, extra = []) => ({
+
+/**
+ * @param {string} arm
+ * @param {string[]} bounds the same-tree bounds of the arm
+ * @param {string[]} [extra] more controls
+ * @returns {object} the contract of a fetch-session row
+ */
+const sessionsArm = (arm, bounds, extra = []) => ({
   driver: 'fetchSessions.js',
   args: ['--arm', arm],
   configs: ['sessions-false', 'sessions-true'],
@@ -22,11 +43,18 @@ const sessionsArm = (arm, extra = []) => ({
     'BENCH_NODES from the started containers',
     'full-cycle byte lower bound',
     'idle incremental bound',
+    'remove-byte-counter mutant rejected',
     ...extra,
   ],
   artifacts: ['observations', 'frame journals'],
   metrics: ['sample.heapRetainedBytes'],
+  bounds: bounds.map((bound) => bound.replace(':', ' vs sessions-false (sessions-true):')),
 })
+
+/**
+ * @param {number} bytes
+ * @returns {object} the contract of a sizing row
+ */
 const sizing = (bytes) => ({
   driver: 'consumeThroughput.js',
   args: ['--partitions', '1000', '--max-bytes', String(bytes), '--rss'],
@@ -34,9 +62,16 @@ const sizing = (bytes) => ({
   controls: ['every partition received data'],
   artifacts: ['observations'],
   metrics: ['sizing.rssPeakBytes', 'sizing.rssProcessPeakBytes', 'sizing.heapRetainedBytes'],
+  bounds: [
+    'sizing.rssPeakBytes vs alpha.9b: not a gate: recorded as sizing advice',
+    'sizing.heapRetainedBytes vs alpha.9b: not a gate: recorded as sizing advice',
+  ],
 })
 
-/** The 20 inherited contracts with the arms, controls and artifacts each must keep. */
+/**
+ * The 20 inherited contracts with the arms, controls, artifacts and original bounds each must
+ * keep, and the proofs a row declares owed instead of claiming them.
+ */
 const REQUIRED = {
   'performance/fetch-round': {
     driver: 'fetchRound.js',
@@ -45,6 +80,11 @@ const REQUIRED = {
     controls: ['metadata lookups = topics x nodes', 'batches built = partitions', 'no-GC window'],
     artifacts: ['observations'],
     metrics: ['nsPerNodeRound', 'allocatedBytesPerRound', 'retainedHeapDelta'],
+    bounds: [
+      'nsPerNodeRound vs alpha.9b: +3 %',
+      'allocatedBytesPerRound vs alpha.9b: +3 %',
+      'retainedHeapDelta vs alpha.9b: +1 MiB',
+    ],
   },
   'performance/consume-each-batch': consume([
     '--handler',
@@ -67,17 +107,41 @@ const REQUIRED = {
       ['handler entries', 'delivered messages', 'listener hooks once each']
     ),
     configs: ['listener-0', 'listener-1'],
+    bounds: [
+      ...CONSUME_BOUNDS,
+      'messagesPerSecond vs listener-0 (listener-1): within +3 % of the no-listener arm',
+    ],
   },
   'performance/consume-partitions-1000': consume(
     ['--partitions', '1000'],
-    ['handler entries', 'delivered messages', '1000 partitions']
+    ['handler entries', 'delivered messages', '1000 partitions', 'data on every partition']
   ),
-  'performance/fetch-sessions-s1': sessionsArm('S1'),
-  'performance/fetch-sessions-s2': sessionsArm('S2'),
-  'performance/fetch-sessions-l1': sessionsArm('L1'),
-  'performance/fetch-sessions-l2': sessionsArm('L2'),
-  'performance/fetch-sessions-l3': sessionsArm('L3'),
-  'performance/fetch-sessions-memory': sessionsArm('L2', ['retained-memory positive control']),
+  'performance/fetch-sessions-s1': sessionsArm('S1', [
+    'sample.messagesPerSecond: -3 %',
+    'sample.deliveryGapP99: +5 %',
+    'sample.cpuMicrosPerMessage: +3 %',
+  ]),
+  'performance/fetch-sessions-s2': sessionsArm('S2', ['sample.bytesPerSecond: not greater (+0 %)']),
+  'performance/fetch-sessions-l1': sessionsArm('L1', [
+    'sample.messagesPerSecond: -3 %',
+    'sample.deliveryGapP99: +5 %',
+  ]),
+  'performance/fetch-sessions-l2': sessionsArm(
+    'L2',
+    [
+      'sample.bytesPerMessage: at most 10 % of sessionless',
+      'sample.cpuMicrosPerMessage: at most 75 % of sessionless',
+    ],
+    ['L2 producer window complete']
+  ),
+  'performance/fetch-sessions-l3': sessionsArm('L3', [
+    'sample.bytesPerSecond: at most 10 % of sessionless',
+  ]),
+  'performance/fetch-sessions-memory': sessionsArm(
+    'L2',
+    ['sample.heapRetainedBytes: +3 MiB over sessionless'],
+    ['retained-memory positive control', 'L2 producer window complete']
+  ),
   'performance/subscription-resolve': {
     driver: 'subscriptionResolve.js',
     args: ['--iterations', '100'],
@@ -85,6 +149,9 @@ const REQUIRED = {
     controls: ['match count = generated expectation'],
     artifacts: ['observations'],
     metrics: ['evaluationMs'],
+    bounds: [
+      'evaluationMs vs alpha.9b: recorded: the first measured value is the ceiling and may only tighten',
+    ],
   },
   'performance/sticky-assign-g6': {
     driver: 'stickyAssign.js',
@@ -93,20 +160,32 @@ const REQUIRED = {
     controls: ['assignment identical across trees', 'CPU profile per run'],
     artifacts: ['observations', 'CPU profiles'],
     metrics: ['ms'],
+    bounds: ['ms vs alpha.9b: recorded'],
+    owed: [
+      'Java oracle for stag-500+500x30k: cross-tree equality only; the Java assignment of this shape is unverified',
+    ],
   },
   'performance/record-batch-decode-no-change': {
     driver: 'recordBatchDecode.js',
     args: [],
     configs: ['uncompressed', 'gzip', 'snappy'],
-    controls: ['decoded records equal across trees'],
+    controls: ['decoded records equal across trees', 'decoded checksum equal across trees'],
     artifacts: ['observations'],
     metrics: ['nsPerOp'],
+    bounds: ['nsPerOp vs alpha.9b: no change: recorded'],
   },
   'sizing/max-bytes-10mib': sizing(10485760),
   'sizing/max-bytes-25mib': sizing(26214400),
   'sizing/max-bytes-50mib': sizing(52428800),
 }
 const AUDITED = ['performance/controls-and-aa', 'performance/frozen-repetition']
+
+/**
+ * @param {object} bound a row's bound
+ * @returns {string} how the inventory names it
+ */
+const boundName = ({ metric, against, config, bound }) =>
+  `${metric} vs ${against}${config ? ` (${config})` : ''}: ${bound}`
 
 /**
  * @param {Record<string, object>} rows an inventory shaped like `ROWS`
@@ -140,6 +219,8 @@ const inventoryProblems = (rows) => {
       row.metrics.map(({ key }) => key),
       need.metrics
     )
+    lacks('bound', (row.bounds ?? []).map(boundName), need.bounds)
+    lacks('owed label', row.owed ?? [], need.owed ?? [])
     if (row.aa === false) problems.push(`${name} has no A/A arms`)
     if ((row.warmup ?? 1) !== 1 || (row.measured ?? 7) !== 7) problems.push(`${name} rounds`)
     const keys = row.metrics.map(({ key }) => key)
@@ -157,9 +238,38 @@ const inventoryProblems = (rows) => {
   return problems
 }
 
+/**
+ * @param {object[]} entries manifest entries
+ * @returns {string[]} how the consumer entries among them differ from the controller's
+ */
+const manifestProblems = (entries) => {
+  const consumer = entries.filter(
+    (entry) => entry.command?.[0] === 'scripts/benchmarks/adapters/consumerSession.js'
+  )
+  const problems = []
+  for (const want of manifestEntries()) {
+    const have = consumer.filter((entry) => entry.name === want.name)
+    if (have.length !== 1) problems.push(`${want.name} has ${have.length} entries`)
+    else if (JSON.stringify(have[0]) !== JSON.stringify(want)) problems.push(`${want.name} differs`)
+  }
+  const known = new Set(manifestEntries().map(({ name }) => name))
+  for (const entry of consumer) {
+    if (!known.has(entry.name)) problems.push(`${entry.name} is no consumer row`)
+  }
+  return problems
+}
+
 const clone = (value) => JSON.parse(JSON.stringify(value))
 
 describe('consumer measurement inventory', () => {
+  let tmp
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'consumer-audit-'))
+  })
+  afterEach(() => {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  })
+
   test('the manifest maps each of the 20 inherited contract ids to exactly one row', () => {
     const entries = manifestEntries()
     const ids = entries.flatMap((entry) => entry.contracts)
@@ -179,8 +289,21 @@ describe('consumer measurement inventory', () => {
         expect(entry.metrics).toEqual(ROWS[entry.name].metrics)
       }
     }
-    const applied = manifest.entries.filter((entry) => Array.isArray(entry.contracts))
-    expect(applied).toEqual(applied.length ? entries : [])
+    expect(manifestProblems(manifest.entries)).toEqual([])
+  })
+
+  test('the manifest check fails when one or every consumer entry is removed', () => {
+    const others = manifest.entries.filter(
+      (entry) => entry.command?.[0] !== 'scripts/benchmarks/adapters/consumerSession.js'
+    )
+    expect(manifestProblems(others)).toHaveLength(manifestEntries().length)
+    for (const { name } of manifestEntries()) {
+      const without = [...others, ...manifestEntries().filter((entry) => entry.name !== name)]
+      expect(manifestProblems(without)).toEqual([`${name} has 0 entries`])
+    }
+    const changed = clone(manifestEntries())
+    changed[1].metrics = []
+    expect(manifestProblems([...others, ...changed])).toEqual([`${changed[1].name} differs`])
   })
 
   test('removing any required arm, control or artifact from a row fails the inventory', () => {
@@ -198,6 +321,12 @@ describe('consumer measurement inventory', () => {
         }),
         ...ROWS[name].artifacts.map((_, i) => (row) => {
           row.artifacts.splice(i, 1)
+        }),
+        ...ROWS[name].bounds.map((_, i) => (row) => {
+          row.bounds.splice(i, 1)
+        }),
+        ...(ROWS[name].owed ?? []).map((_, i) => (row) => {
+          row.owed.splice(i, 1)
         }),
         (row) => {
           row.aa = false
@@ -220,7 +349,38 @@ describe('consumer measurement inventory', () => {
     }
   })
 
-  test('the frozen repetition covers every row on both archived trees', () => {
+  /**
+   * Runs every inherited row with the fake drivers and keeps its evidence where the audit reads it.
+   * @param {object} fixture `consumerFixture(tmp)`
+   * @returns {Promise<{ rawDir: string, lines: Record<string, object>, read: Function }>}
+   */
+  const collect = async (fixture) => {
+    const rawDir = path.join(tmp, 'bench-raw')
+    const lines = {}
+    const env = fixture.frozenEnv()
+    for (const [name, row] of Object.entries(ROWS)) {
+      if (!row.contracts.length) continue
+      const { line } = await fixture.runSession(name, { env })
+      lines[name] = line
+      writeEvidence(rawDir, name, line)
+    }
+    const raw = path.join(rawDir, AUDIT.name, 'fork-run-1.jsonl')
+    const entry = manifestEntries().find((e) => e.name === AUDIT.name)
+    const read = (env = {}) =>
+      session.rows(entry, 'fork', {
+        outputs: [session.read({ status: 0, stdout: JSON.stringify(audit(raw, env)) })],
+      })
+    return { rawDir, lines, read }
+  }
+
+  /**
+   * @param {object} report what the audit adapter returned
+   * @param {string} name a row
+   * @returns {object} that row's audit row
+   */
+  const auditedRow = (report, name) => report.rows.find((r) => r.benchmark === `${AUDIT.name}/${name}`)
+
+  test('the frozen repetition covers every row on both archived trees', async () => {
     const inherited = Object.entries(ROWS).filter(([, row]) => row.contracts.length)
     expect(inherited).toHaveLength(18)
     for (const [, row] of inherited) {
@@ -233,71 +393,124 @@ describe('consumer measurement inventory', () => {
       }
     }
 
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'consumer-audit-'))
-    try {
-      const rawDir = path.join(tmp, 'bench-raw')
-      const evidence = (name, line) => {
-        fs.mkdirSync(path.join(rawDir, name), { recursive: true })
-        const runs = [{ run: 1, stdout: `${JSON.stringify(line)}\n` }]
-        fs.writeFileSync(
-          path.join(rawDir, name, 'fork.json'),
-          JSON.stringify({ arm: 'fork', runs })
-        )
+    const fixture = consumerFixture(tmp)
+    const { rawDir, lines, read } = await collect(fixture)
+    const complete = read()
+    expect(complete.rows).toHaveLength(18)
+    for (const [name, row] of inherited) {
+      const audited = auditedRow(complete, name)
+      if (row.owed?.length) {
+        expect([name, audited.status]).toEqual([name, 'inconclusive'])
+        expect(audited.reason).toContain(`owed: ${row.owed[0]}`)
+      } else {
+        expect([name, audited.status, audited.reason]).toEqual([name, 'valid', undefined])
       }
-      const lineOf = (name, row) => ({
-        row: name,
-        warmup: 1,
-        measured: 7,
-        trees: Object.fromEntries(
-          TREES.map((tree, i) => [
-            tree,
-            { sha: String(i).repeat(40), driverDigest: 'd'.repeat(64) },
-          ])
-        ),
-        arms: Object.fromEntries(
-          armsOf(row).map(({ label, tree }) => [label, { tree, measured: 7 }])
-        ),
-        aa: Object.fromEntries(
-          armsOf(row)
-            .filter(({ copy }) => copy)
-            .map(({ label }) => [label, { percent: { [row.aaOn[0]]: 0.8 } }])
-        ),
-      })
-      for (const [name, row] of inherited) evidence(name, lineOf(name, row))
-      const raw = path.join(rawDir, AUDIT.name, 'fork-run-1.jsonl')
-      const entry = manifestEntries().find((e) => e.name === AUDIT.name)
-      const read = () =>
-        session.rows(entry, 'fork', {
-          outputs: [session.read({ status: 0, stdout: JSON.stringify(audit(raw)) })],
-        })
-
-      const complete = read()
-      expect(complete.detail.status).toBe('valid')
-      expect(complete.rows).toHaveLength(18)
-      expect(complete.rows.every((r) => r.status === 'valid' && r.median === 0.8)).toBe(true)
-
-      const [g6, g6Row] = inherited.find(([name]) => name === 'consumer-stickyAssign-g6')
-      const without = lineOf(g6, g6Row)
-      without.trees['alpha.9b'] = { error: 'BENCH_TREES names no alpha.9b tree' }
-      evidence(g6, without)
-      const partial = read()
-      expect(partial.detail.status).toBe('invalid')
-      expect(partial.rows.find((r) => r.benchmark.endsWith(g6))).toMatchObject({
-        status: 'invalid',
-        reason: 'failed: frozen alpha.9b with its SHA and the identical driver',
-      })
-
-      fs.rmSync(path.join(rawDir, 'consumer-recordBatchDecode'), { recursive: true })
-      const missing = read()
-      expect(missing.detail.status).toBe('error')
-      expect(
-        missing.rows.find((r) => r.benchmark.endsWith('consumer-recordBatchDecode'))
-      ).toMatchObject({
-        status: 'error',
-        reason: 'no evidence: the row did not run',
-      })
-    } finally {
-      fs.rmSync(tmp, { recursive: true, force: true })
+      expect(Number.isFinite(audited.median)).toBe(true)
     }
+    expect(complete.detail.status).toBe('inconclusive')
+
+    const g6 = 'consumer-stickyAssign-g6'
+    const without = clone(lines[g6])
+    without.trees['alpha.9b'] = { error: 'BENCH_TREES names no alpha.9b tree' }
+    writeEvidence(rawDir, g6, without)
+    const partial = read()
+    expect(partial.detail.status).toBe('error')
+    expect(auditedRow(partial, g6)).toMatchObject({
+      status: 'error',
+      reason: expect.stringContaining('alpha.9b: BENCH_TREES names no alpha.9b tree'),
+    })
+
+    fs.rmSync(path.join(rawDir, 'consumer-recordBatchDecode'), { recursive: true })
+    expect(auditedRow(read(), 'consumer-recordBatchDecode')).toMatchObject({
+      status: 'error',
+      reason: 'no evidence: the row did not run',
+    })
+  })
+
+  test('the audit is never valid when a measurement failed, is missing, is unsupported or was weakened', async () => {
+    const fixture = consumerFixture(tmp)
+    const { rawDir, lines, read } = await collect(fixture)
+    const statusAfter = (name, line) => {
+      writeEvidence(rawDir, name, line)
+      const row = auditedRow(read(), name)
+      writeEvidence(rawDir, name, lines[name])
+      return row
+    }
+
+    const headDown = fakeRun((args) =>
+      args.find((a) => a.endsWith('.js')).startsWith(path.join(ROOT, 'scripts'))
+        ? { status: 1, stderr: 'Error: broker unreachable' }
+        : undefined
+    )
+    const headOnly = await fixture.runSession('consumer-eachBatch', { run: headDown })
+    expect(headOnly.line.arms[HEAD].measured).toBe(0)
+    expect(headOnly.line.arms['alpha.9c'].measured).toBe(7)
+    expect(statusAfter('consumer-eachBatch', headOnly.line)).toMatchObject({
+      status: 'error',
+      reason: expect.stringContaining('broker unreachable'),
+    })
+
+    const noAa = clone(lines['consumer-subscriptionResolve'])
+    delete noAa.arms['alpha.9c~AA'].stats.evaluationMs
+    expect(['error', 'invalid']).toContain(statusAfter('consumer-subscriptionResolve', noAa).status)
+
+    const wrongWork = clone(lines['consumer-subscriptionResolve'])
+    wrongWork.arms['alpha.9b'].results[3].matches = 8999
+    expect(statusAfter('consumer-subscriptionResolve', wrongWork)).toMatchObject({
+      status: 'invalid',
+      reason: expect.stringContaining('match count = generated expectation'),
+    })
+
+    const noProfile = clone(lines['consumer-stickyAssign-g6'])
+    noProfile.profiles['alpha.9c'] = 0
+    expect(statusAfter('consumer-stickyAssign-g6', noProfile)).toMatchObject({
+      status: 'invalid',
+      reason: expect.stringContaining('alpha.9c CPU profile per run'),
+    })
+
+    const short = clone(lines['consumer-fetchRound'])
+    short.arms['alpha.9b/p100'].results.pop()
+    short.arms['alpha.9b/p100'].measured = 6
+    expect(statusAfter('consumer-fetchRound', short)).toMatchObject({
+      status: 'error',
+      reason: expect.stringContaining('alpha.9b/p100: 6 of 7 measured runs'),
+    })
+
+    const env = fixture.frozenEnv({
+      BENCH_TREES: JSON.stringify({
+        'alpha.9c': fixture.tree('alpha.9c'),
+        'alpha.9b': fixture.tree('alpha.9b-old', { lacks: ['rebalanceListener option'] }),
+      }),
+    })
+    const listener = await fixture.runSession('consumer-listener', { env })
+    expect(statusAfter('consumer-listener', listener.line)).toMatchObject({
+      status: 'inconclusive',
+      reason: expect.stringContaining(
+        'owed: alpha.9b/listener-1 alpha.9b has no rebalanceListener option'
+      ),
+    })
+  })
+
+  test('an audit of only the selected rows says which it left out and never completes the inherited contracts', async () => {
+    const fixture = consumerFixture(tmp)
+    const { read } = await collect(fixture)
+    const selected = read({ BENCH_AUDIT_ROWS: 'consumer-eachBatch,consumer-fetchRound' })
+    expect(auditedRow(selected, 'consumer-eachBatch').status).toBe('valid')
+    expect(auditedRow(selected, 'consumer-fetchRound').status).toBe('valid')
+    expect(auditedRow(selected, 'consumer-sessions-S1')).toMatchObject({
+      status: 'omitted',
+      reason: 'not selected in this dispatch',
+    })
+    expect(selected.detail.status).toBe('inconclusive')
+    expect(selected.detail.reason).toBe(
+      'partial scope: 2 of 18 rows; the controls-and-aa and frozen-repetition contracts need every row'
+    )
+    const unknown = audit(path.join(tmp, 'bench-raw', AUDIT.name, 'r.jsonl'), {
+      BENCH_AUDIT_ROWS: 'consumer-nope',
+    })
+    expect(unknown).toEqual({ row: AUDIT.name, error: 'BENCH_AUDIT_ROWS names no consumer row consumer-nope' })
+    expect(() =>
+      session.read({ status: 0, stdout: `${JSON.stringify(unknown)}\n` })
+    ).toThrow('BENCH_AUDIT_ROWS names no consumer row consumer-nope')
   })
 })
