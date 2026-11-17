@@ -60,7 +60,20 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: 24, cache: npm }
       - run: npm ci
-      - run: npm run test:pack
+      - name: Pack once, then guard and smoke both tarballs
+        run: |
+          set -eo pipefail
+          dir="$RUNNER_TEMP/tarballs"
+          mkdir -p "$dir"
+          main="$dir/$(npm pack --silent --pack-destination "$dir")"
+          ./scripts/packSmoke.sh "$main"
+          otel="$dir/$(cd otel && npm pack --silent --pack-destination "$dir")"
+          ./scripts/assertCleanOtelTarball.sh "$otel"
+          ./scripts/otelPackSmoke.sh "$otel" "$main"
+          main_sri="$(./scripts/sri.sh "$main")"
+          otel_sri="$(./scripts/sri.sh "$otel")"
+          echo "main: $main_sri"
+          echo "otel: $otel_sri"
   otel:
     runs-on: ubuntu-latest
     timeout-minutes: 10

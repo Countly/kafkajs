@@ -86,6 +86,7 @@ scripts/compat/config.json:    "json": "docs/\x6bafka-compatibility.json"
 scripts/compat/index.js: *   npm run compat:generate   write docs/KafkaCompatibility.md + docs/\x6bafka-compatibility.json
 src/oauth/__tests__/oauthDocs.spec.js:      /\\/Users\\/|\\/home\\/|\\/var\\/tmp|new_countly|~\\/|C:\\\\|\x73uperpowers|\x75pgrade-ref|CLAUDE\\.md|AGENT\\.md|EXECUTION\\.md|\\b(?:Phase|Task|Wave) \\d/
 scripts/compat/__tests__/build.spec.js:      expect(JSON.parse(read('docs', '\x6bafka-compatibility.json')).generatedFrom.kafkaTag).toBe(tag)
+scripts/assertCleanOtelTarball.sh:if tar -xOzf "$1" | grep -aE '/\x76ar/tmp/|/\x68ome/[^ /]+/|\\.\x73uperpowers/'; then
 scripts/assertCleanTarball.sh:  if tar -xOf "$1" "package/docs/$guide.md" | grep -E '/\x76ar/tmp/|/\x68ome/[^ /]+/|\\.\x73uperpowers/'; then
 src/consumer/share/__tests__/shareIsolationDocs.spec.js:    expect(guide).not.toMatch(/\\/var\\/tmp\\/|\\/\x68ome\\/[^ /]+\\/|\\.\x73uperpowers\\//)
 LIST
@@ -186,6 +187,7 @@ check focused-or-failing "$PRIVATE_METHODS"
 hits host-path -n -E "$(printf '\057var\057tmp|\057home\057uj|(^|[^-])p[9][a-f]-')" -- . ':!.gitignore' ':!.npmignore'
 # Pinned fixture identities and the tarball path guard are not machine-local paths.
 FIXTURE_IDENTITIES=$(printf '%b\n' "$(cat <<'LIST'
+scripts/assertCleanOtelTarball.sh:if tar -xOzf "$1" | grep -aE '/\x76ar/tmp/|/\x68ome/[^ /]+/|\\.\x73uperpowers/'; then
 scripts/assertCleanTarball.sh:  if tar -xOf "$1" "package/docs/$guide.md" | grep -E '/\x76ar/tmp/|/\x68ome/[^ /]+/|\\.\x73uperpowers/'; then
 scripts/e2e/telemetry/JavaTelemetryClient.java:                topic = "\x709f-tf1-java";
 scripts/e2e/telemetry/legacy/JavaTelemetryClient.java:            producer.send(new ProducerRecord<>("\x709f-tf1-java", "k", "v")).get();
