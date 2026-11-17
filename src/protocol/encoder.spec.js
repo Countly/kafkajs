@@ -2,6 +2,7 @@ const Long = require('../utils/long')
 
 const Encoder = require('./encoder')
 const Decoder = require('./decoder')
+const { KafkaJSInvariantViolation } = require('../errors')
 
 const MAX_SAFE_POSITIVE_SIGNED_INT = 2147483647
 const MIN_SAFE_NEGATIVE_SIGNED_INT = -2147483648
@@ -56,6 +57,41 @@ describe('Protocol > Encoder', () => {
       expect(encoded).toEqual(B(0x04, 0, 0, 0, 0, 0, 0, 0, 0x01, 0, 0, 0, 0x02))
       expect(new Decoder(encoded).readUVarIntArray((d) => d.readInt32())).toEqual([0, 1, 2])
       expect(new Encoder().writeUVarIntArray([0, 1, 2]).buffer).toEqual(B(0x01))
+    })
+  })
+
+  describe('null compact array', () => {
+    /** @param {string} [type] @returns {Buffer} a null array written with `type` */
+    const nullArray = (type) => new Encoder().writeUVarIntArray(null, type).buffer
+    const readsNull = (buffer) =>
+      expect(new Decoder(buffer).readUVarIntArray((d) => d.readInt32())).toBeNull()
+
+    test('writes a null array as 0 for type object', () => {
+      expect(nullArray('object')).toEqual(B(0x00))
+      readsNull(nullArray('object'))
+    })
+
+    test('writes a null array as 0 for type int32', () => {
+      expect(nullArray('int32')).toEqual(B(0x00))
+      readsNull(nullArray('int32'))
+    })
+
+    test('writes a null array as 0 for any other type', () => {
+      for (const type of [undefined, 'number', 'string']) {
+        expect(nullArray(type)).toEqual(B(0x00))
+        readsNull(nullArray(type))
+      }
+    })
+  })
+
+  describe('tagged fields', () => {
+    test('a duplicate tag throws KafkaJSInvariantViolation', () => {
+      const fields = [
+        { tag: 1, value: B(0x01) },
+        { tag: 1, value: B(0x02) },
+      ]
+      expect(() => new Encoder().writeTaggedFields(fields)).toThrow(KafkaJSInvariantViolation)
+      expect(() => new Encoder().writeTaggedFields(fields)).toThrow(/duplicate tag 1/)
     })
   })
 

@@ -1,4 +1,5 @@
 const Long = require('../utils/long')
+const { KafkaJSInvariantViolation } = require('../errors')
 
 const INT8_SIZE = 1
 const INT16_SIZE = 2
@@ -358,15 +359,18 @@ module.exports = class Encoder {
    * array of raw numbers - a `[]int32` field such as `ForgottenTopicsData.Partitions` - has to say
    * so explicitly.
    *
-   * @param {any[]} array
+   * A null array is written as 0, whatever the type.
+   *
+   * @param {any[]|null} array
    * @param {'int32'|'number'|'object'} [type]
+   * @returns {Encoder} this
    */
   writeUVarIntArray(array, type) {
-    if (type === 'object') {
+    if (array === null) {
+      this.writeUVarInt(0)
+    } else if (type === 'object') {
       this.writeUVarInt(array.length + 1)
       this.writeEncoderArray(array)
-    } else if (array === null) {
-      this.writeUVarInt(0)
     } else if (type === 'int32' || type === 'number') {
       this.writeUVarInt(array.length + 1)
       array.forEach((value) => this.writeInt32(value))
@@ -421,7 +425,7 @@ module.exports = class Encoder {
    * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-482%3A+The+Kafka+Protocol+should+Support+Optional+Tagged+Fields
    * @param {{ tag: number, value: Buffer|Encoder }[]} [fields]
    * @returns {Encoder} this
-   * @throws {Error} on a duplicate tag
+   * @throws {KafkaJSInvariantViolation} on a duplicate tag, which only a codec bug can produce
    */
   writeTaggedFields(fields) {
     if (fields == null || fields.length === 0) {
@@ -434,7 +438,7 @@ module.exports = class Encoder {
     let previousTag = -1
     for (const { tag, value } of sorted) {
       if (tag === previousTag) {
-        throw new Error(`duplicate tag ${tag} in a tagged-field section`)
+        throw new KafkaJSInvariantViolation(`duplicate tag ${tag} in a tagged-field section`)
       }
 
       previousTag = tag
