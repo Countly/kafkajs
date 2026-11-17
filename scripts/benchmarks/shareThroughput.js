@@ -28,8 +28,9 @@
  * `--session` runs a whole report session (`ShareSession`): it needs the guard, reads the
  * finalized `share.version` back, prepares the corpus, runs eight observations of every arm twice,
  * cleans up and prints one session record. It runs only in the benchmark job that owns the share
- * rows (`BENCH_SHARE_ROWS=1`); elsewhere it prints an `omitted` record. Exit code 0 is an accepted
- * or omitted session, 3 a void or inconclusive one, 1 an error.
+ * rows (`BENCH_SHARE_ROWS=1`); elsewhere it prints an `omitted` record, and after a failed setup
+ * step of that job (`BENCH_SETUP`) an `error` record. Exit code 0 is an accepted or omitted session,
+ * 3 a void or inconclusive one, 1 an error.
  *
  * The measured window covers complete, fully acknowledged acquisitions only. The first full
  * acquisition of every node is discarded and each measured acquisition needs a full successor on
@@ -53,6 +54,7 @@ const {
   shareRecordIdentity,
   waitForShareFixtureAbsence,
 } = require('../../testHelpers/shareFixtures')
+const { setupFailure } = require('./session')
 
 /** Fixed configuration, declared before any measurement. */
 const LIMITS = Object.freeze({
@@ -1878,7 +1880,8 @@ class ShareSession {
 
   /**
    * Admits the session, then runs it. A refused admission starts no process. Outside the job that
-   * owns the share rows (`BENCH_SHARE_ROWS=1`) it starts nothing and returns an `omitted` record.
+   * owns the share rows (`BENCH_SHARE_ROWS=1`) it starts nothing and returns an `omitted` record;
+   * in that job, after a setup step that did not succeed (`BENCH_SETUP`), an `error` record.
    * @returns {Promise<object>} the session record: status `accepted`, `void`, `inconclusive`,
    *   `omitted` or `error` (with `reason`), the guard, the share read-back, the corpus identity,
    *   every kept observation, the frame control and the A/A evaluation
@@ -1888,6 +1891,8 @@ class ShareSession {
     if (this.env.BENCH_SHARE_ROWS !== '1') {
       return { schema: 1, session: this.name, status: 'omitted', reason: OUTSIDE }
     }
+    const setup = setupFailure(this.env.BENCH_SETUP)
+    if (setup) return { schema: 1, session: this.name, status: 'error', reason: setup }
     const guard = this.admitGuard()
     const share = await this.readShare()
     this.deadline = this.now() + SESSION_BUDGET.totalMs

@@ -7,8 +7,9 @@
  *        node --expose-gc scripts/benchmarks/snappyCodec.js --session --raw <file>
  * `--session` is the report session (`snappySession`): a warm-up and eight measured runs of the
  * eight arms and of an A/A copy, interleaved. It runs only in the benchmark job that owns the row
- * (`BENCH_SNAPPY_ROWS=1`); elsewhere it prints an `omitted` record. Exit code 0 is an accepted or
- * omitted session, 3 a void one, 1 an error.
+ * (`BENCH_SNAPPY_ROWS=1`); elsewhere it prints an `omitted` record, and after a failed setup step
+ * of that job (`BENCH_SETUP`) an `error` record. Exit code 0 is an accepted or omitted session, 3 a
+ * void one, 1 an error.
  */
 const { spawnSync } = require('child_process')
 const { performance, monitorEventLoopDelay } = require('perf_hooks')
@@ -18,7 +19,7 @@ const path = require('path')
 const fs = require('fs')
 const assert = require('assert')
 const codec = require('../../src/protocol/message/compression/snappy')
-const { runSession, summarize } = require('./session')
+const { runSession, summarize, setupFailure } = require('./session')
 
 const MiB = 1048576
 const ENCODER_DIR = path.join(__dirname, '../../src/protocol/message/compression/fixtures/encoder')
@@ -240,7 +241,8 @@ const summaryOf = (results, readbacks) => ({
  * @param {() => number} [options.now] monotonic millisecond clock of the budget
  * @returns {object} the session record: `accepted` or `void` with both arms' stats (median, min,
  *   max, n), the A/A comparison and the observations that missed a gate; `omitted` outside the
- *   row's job; `error` with its reason
+ *   row's job; `error` with its reason, without starting a child after a setup step of the job
+ *   that did not succeed (`BENCH_SETUP`)
  */
 const snappySession = ({
   raw,
@@ -250,6 +252,8 @@ const snappySession = ({
 }) => {
   const record = { schema: 1, session: 'snappy' }
   if (env.BENCH_SNAPPY_ROWS !== '1') return { ...record, status: 'omitted', reason: OUTSIDE }
+  const setup = setupFailure(env.BENCH_SETUP)
+  if (setup) return { ...record, status: 'error', reason: setup }
   Object.assign(record, {
     node: process.version,
     driver: {

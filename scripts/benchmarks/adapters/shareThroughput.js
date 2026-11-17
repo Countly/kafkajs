@@ -8,10 +8,12 @@
  * numbers when no observation formed one), and a session outside its own workflow job `omitted`.
  *
  * `node scripts/benchmarks/adapters/shareThroughput.js --compare <pre> <post>` compares the
- * `eachMessage` sessions of two runs (`bench-raw/shareThroughput-eachMessage/fork.json` of each)
- * and prints the per-record cost the change added and the smallest cost the runs can resolve.
+ * `eachMessage` sessions of two runs (`bench-raw/shareThroughput-eachMessage/fork.json` of each):
+ * it refuses unless both are complete accepted sessions of the same driver and Node, and prints the
+ * observed per-record difference with its A/A spread and scatter. Those are repeatability figures,
+ * not a detection limit, so the per-message context-entry cost stays owed to an invocation-path
+ * measurement.
  */
-const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const { lastJsonLine, tail } = require('../report')
 const {
@@ -26,6 +28,14 @@ const {
 const HEX = /^[0-9a-f]{64}$/
 const TOPIC = /^share-bench-[a-f0-9-]+$/
 const SPREAD = 'A/A spread'
+const NODE = /^v\d+\.\d+\.\d+$/
+const OWED = 'the per-message context-entry cost is owed to an invocation-path measurement'
+/** The eachMessage row as the comparison checks a record against it. */
+const EACH_MESSAGE = Object.freeze({
+  name: 'shareThroughput-eachMessage',
+  command: ['--session', 'eachMessage'],
+  metrics: [{ key: 'recordsPerSecond', unit: 'records/s' }],
+})
 
 /**
  * @param {import('../report').ManifestEntry} entry
@@ -231,65 +241,125 @@ const statsOf = (rows, key) => {
 
 /**
  * @param {{a:object[],aprime:object[]}} arm one arm of a session record
- * @returns {{ns:number,spread:number}|null} the median nanoseconds per record of the first
- *   repetition and how far the two repetitions' throughput medians differ (a fraction), or null
- *   without valid observations in both
+ * @returns {{ns:number,spread:number,scatter:number}|null} the median nanoseconds per record of the
+ *   first repetition, how far the two repetitions' throughput medians differ and the larger range
+ *   of their retained observations (both fractions of a median), or null without valid
+ *   observations in both
  */
 const perRecord = (arm) => {
   const a = statsOf(arm.a, 'recordsPerSecond')
   const b = statsOf(arm.aprime, 'recordsPerSecond')
-  return a && b ? { ns: 1e9 / a.median, spread: Math.abs(a.median / b.median - 1) } : null
+  if (!a || !b) return null
+  return {
+    ns: 1e9 / a.median,
+    spread: Math.abs(a.median / b.median - 1),
+    scatter: Math.max(...[a, b].map(({ min, max, median }) => (max - min) / median)),
+  }
 }
 
+/** @param {number} fraction @returns {string} the fraction in percent, two decimals */
+const percent = (fraction) => (fraction * 100).toFixed(2)
+
 /**
- * The resolution of one eachMessage session: a per-message cost below its A/A spread of the
- * per-record time cannot be told from noise.
+ * The repeatability of one eachMessage session. Its A/A spread and scatter describe these runs;
+ * they are no detection limit, so the per-message cost stays owed.
  * @param {object} record an eachMessage session record
  * @returns {string|undefined} the note, without valid observations in both arms none
  */
-const resolutionNote = (record) => {
+const repeatabilityNote = (record) => {
   const message = perRecord(record.arms.eachMessage)
   const control = perRecord(record.arms.record_limit)
   if (!message || !control) return undefined
-  const spread = Math.max(message.spread, control.spread)
-  return `eachMessage ${message.ns.toFixed(2)} ns per record, A/A spread ${(spread * 100).toFixed(2)} %: the smallest per-message cost this session resolves is ${(spread * message.ns).toFixed(2)} ns`
+  const spread = percent(Math.max(message.spread, control.spread))
+  const scatter = percent(Math.max(message.scatter, control.scatter))
+  return `eachMessage ${message.ns.toFixed(2)} ns per record; observed A/A spread ${spread} % and retained scatter ${scatter} % (repeatability, not a detection limit); ${OWED}`
 }
 
 /**
- * Compares the eachMessage sessions of a run before (PRE) and after (POST) a change. The runs are
- * comparable only with the same driver digest and Node. The PRE per-record time is first scaled
- * by how far the eachBatch control moved between the runs, so a slower runner is not read as a
- * cost. The noise is the largest A/A spread of the four arms; a difference within it of the
- * per-record time is not resolved.
+ * Runs `read` and prefixes its failure with the side of the comparison.
+ * @template T
+ * @param {string} side `PRE` or `POST`
+ * @param {() => T} read
+ * @returns {T}
+ * @throws {Error} `read`'s failure, prefixed
+ */
+const sided = (side, read) => {
+  try {
+    return read()
+  } catch (error) {
+    throw new Error(`${side}: ${error.message}`)
+  }
+}
+
+/**
+ * Checks that a record can enter a comparison: an accepted eachMessage session with its driver
+ * digest and Node, whose row is valid (every control of the adapter passes) and whose every
+ * observation has a positive finite throughput.
+ * @param {object} record an eachMessage session record
+ * @returns {void}
+ * @throws {Error} naming the first thing that is missing or wrong
+ */
+const checkComparable = (record) => {
+  if (record?.schema !== 1 || record.session !== 'eachMessage') {
+    throw new Error('not an eachMessage session record')
+  }
+  if (record.status !== 'accepted') {
+    throw new Error(`the session is ${record.status}${record.reason ? `: ${record.reason}` : ''}`)
+  }
+  if (!HEX.test(record.driver?.sha256 ?? '')) throw new Error('no driver sha256')
+  if (!NODE.test(record.node ?? '')) throw new Error('no Node version')
+  const shown = rows(EACH_MESSAGE, 'fork', { outputs: [record] })
+  const { status, reason } = shown.detail ?? shown.rows[0]
+  if (status !== 'valid') throw new Error(reason)
+  for (const [label, arm] of Object.entries(record.arms))
+    for (const rep of ['a', 'aprime'])
+      arm[rep].forEach(({ recordsPerSecond }, index) => {
+        if (!(Number.isFinite(recordsPerSecond) && recordsPerSecond > 0)) {
+          throw new Error(`${label} ${rep} ${index} has no positive throughput`)
+        }
+      })
+}
+
+/**
+ * Compares the eachMessage sessions of a run before (PRE) and after (POST) a change. The PRE
+ * per-record time is first scaled by how far the eachBatch control moved between the runs, so a
+ * slower runner is not read as a cost. The result is always `inconclusive`: the A/A spread (the
+ * largest difference of two repetitions' medians) and the scatter (the largest range of retained
+ * observations) describe these runs, and neither is a detection limit for the per-message cost.
  * @param {object} pre PRE eachMessage session record
  * @param {object} post POST eachMessage session record
- * @returns {{comparable:boolean,perRecordNs:{pre:number,post:number},deltaNs:number,
- *   controlDrift:number,adjustedDeltaNs:number,noise:number,resolutionNs:number,
- *   resolved:boolean}}
- * @throws {Error} unless both records have valid observations in both arms
+ * @returns {{status:'inconclusive',reason:string,perRecordNs:{pre:number,post:number},
+ *   deltaNs:number,controlDrift:number,adjustedDeltaNs:number,aaSpread:number,scatter:number}}
+ * @throws {Error} unless both records pass `checkComparable` and share the driver digest and Node
  */
 const compareEachMessage = (pre, post) => {
-  const [message, after, control, controlAfter] = [
-    pre.arms?.eachMessage,
-    post.arms?.eachMessage,
-    pre.arms?.record_limit,
-    post.arms?.record_limit,
-  ].map((arm) => arm && perRecord(arm))
-  assert(message && after && control && controlAfter, 'both runs need valid eachMessage sessions')
-  const noise = Math.max(message.spread, after.spread, control.spread, controlAfter.spread)
+  sided('PRE', () => checkComparable(pre))
+  sided('POST', () => checkComparable(post))
+  if (pre.driver.sha256 !== post.driver.sha256) {
+    throw new Error(
+      `the runs used different drivers: ${pre.driver.sha256} and ${post.driver.sha256}`
+    )
+  }
+  if (pre.node !== post.node) {
+    throw new Error(`the runs used different Node versions: ${pre.node} and ${post.node}`)
+  }
+  const arms = [
+    pre.arms.eachMessage,
+    post.arms.eachMessage,
+    pre.arms.record_limit,
+    post.arms.record_limit,
+  ].map(perRecord)
+  const [message, after, control, controlAfter] = arms
   const controlDrift = controlAfter.ns / control.ns - 1
-  const adjustedDeltaNs = after.ns - message.ns * (1 + controlDrift)
-  const resolutionNs = noise * message.ns
-  const comparable = pre.driver?.sha256 === post.driver?.sha256 && pre.node === post.node
   return {
-    comparable,
+    status: 'inconclusive',
+    reason: `${OWED}; these runs show the observed difference, A/A spread and scatter, not a detection limit`,
     perRecordNs: { pre: message.ns, post: after.ns },
     deltaNs: after.ns - message.ns,
     controlDrift,
-    adjustedDeltaNs,
-    noise,
-    resolutionNs,
-    resolved: comparable && Math.abs(adjustedDeltaNs) > resolutionNs,
+    adjustedDeltaNs: after.ns - message.ns * (1 + controlDrift),
+    aaSpread: Math.max(...arms.map(({ spread }) => spread)),
+    scatter: Math.max(...arms.map(({ scatter }) => scatter)),
   }
 }
 
@@ -345,7 +415,7 @@ const rows = (entry, arm, { outputs, error }) => {
     `node ${record.node}`,
     `guard ${record.guard?.manifest}`,
     'every observation, its trace and its child output are in the raw evidence',
-    ...(name === 'eachMessage' ? [resolutionNote(record)].filter(Boolean) : []),
+    ...(name === 'eachMessage' ? [repeatabilityNote(record)].filter(Boolean) : []),
   ]
   let status = 'valid'
   let reason
@@ -381,12 +451,29 @@ const rows = (entry, arm, { outputs, error }) => {
 
 /**
  * @param {string} file a run's `fork.json` evidence, or a session record
- * @returns {object} the session record
+ * @returns {object} the session record; from evidence, read like the report reads its one run
+ * @throws {Error} for evidence without exactly one run, or a run `read` refuses
  */
 const sessionFrom = (file) => {
   const value = JSON.parse(fs.readFileSync(file, 'utf8'))
-  return Array.isArray(value.runs) ? lastJsonLine(value.runs[0].stdout) : value
+  if (!Array.isArray(value.runs)) return value
+  if (value.runs.length !== 1) throw new Error(`${value.runs.length} runs, expected one`)
+  const [run] = value.runs
+  return read({ ...run, error: run.error ? new Error(run.error) : undefined })
 }
+
+/**
+ * `compareEachMessage` over two files.
+ * @param {string} preFile PRE `fork.json` or session record
+ * @param {string} postFile POST `fork.json` or session record
+ * @returns {ReturnType<typeof compareEachMessage>}
+ * @throws {Error} for a file `sessionFrom` refuses or records the comparison refuses
+ */
+const compareFiles = (preFile, postFile) =>
+  compareEachMessage(
+    sided('PRE', () => sessionFrom(preFile)),
+    sided('POST', () => sessionFrom(postFile))
+  )
 
 /**
  * One session per report arm, which holds every observation of the session; the row's limit is the
@@ -398,6 +485,7 @@ module.exports = {
   read,
   rows,
   compareEachMessage,
+  compareFiles,
 }
 
 if (require.main === module) {
@@ -406,6 +494,11 @@ if (require.main === module) {
     console.error('usage: shareThroughput.js --compare <pre fork.json> <post fork.json>')
     process.exitCode = 2
   } else {
-    console.log(JSON.stringify(compareEachMessage(sessionFrom(pre), sessionFrom(post)), null, 2))
+    try {
+      console.log(JSON.stringify(compareFiles(pre, post), null, 2))
+    } catch (error) {
+      console.error(`refused: ${error.message}`)
+      process.exitCode = 1
+    }
   }
 }
