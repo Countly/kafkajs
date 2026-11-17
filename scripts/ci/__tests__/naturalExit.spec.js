@@ -9,7 +9,7 @@ const SHUTDOWN_CASES = [
   'stops cleanly and releases unstarted records',
   'connect during disconnect reconnects only after DISCONNECT',
 ]
-const SHUTDOWN_TOTAL_MS = 150000
+const SHUTDOWN_TOTAL_MS = 335000
 
 /**
  * Adds the independently sealed first-use completion before the original scored cleanup row.
@@ -151,8 +151,10 @@ describe.each(['soak', 'soak-full', 'shutdown'])('CI natural exit > %s', (lane) 
 
     expect(run()).toMatchObject({
       startedAt: 1000,
-      exitedAt: lane === 'soak' ? 2041000 : lane === 'soak-full' ? 3001000 : 151000,
-      cleanupAt: lane === 'soak' ? 2031000 : lane === 'soak-full' ? 2991000 : 141000,
+      exitedAt:
+        lane === 'soak' ? 2041000 : lane === 'soak-full' ? 3001000 : 1000 + SHUTDOWN_TOTAL_MS,
+      cleanupAt:
+        lane === 'soak' ? 2031000 : lane === 'soak-full' ? 2991000 : SHUTDOWN_TOTAL_MS - 9000,
       status: 0,
       signal: null,
       origin: 'hrtime',
@@ -385,7 +387,7 @@ describe('CI natural exit > soak cleanup contract', () => {
 })
 
 describe('CI natural exit > shutdown cleanup order', () => {
-  test('rejects three rows with a repeated case instead of the missing case', () => {
+  test('rejects four rows with a repeated case instead of the missing case', () => {
     const { state, run } = fixture('shutdown')
     state.rows[1].case = state.rows[0].case
     expect(run).toThrow(/cleanup evidence/)
@@ -397,7 +399,7 @@ describe('CI natural exit > shutdown cleanup order', () => {
     expect(run).toThrow(/cleanup evidence/)
   })
 
-  test('rejects repeated cleanup timestamps despite three distinct completed cases', () => {
+  test('rejects repeated cleanup timestamps despite four distinct completed cases', () => {
     const { state, run } = fixture('shutdown')
     state.rows[1].cleanup.completedAt = state.rows[0].cleanup.completedAt
     expect(run).toThrow(/cleanup evidence/)

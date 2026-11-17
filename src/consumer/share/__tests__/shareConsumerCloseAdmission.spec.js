@@ -6,7 +6,9 @@ const { KafkaJSNonRetriableError } = require('../../../errors')
 const { newLogger } = require('testHelpers')
 const {
   ShareClock,
+  acquire,
   deferred,
+  fetchAnswer,
   flush,
   shareClient,
   until,
@@ -260,5 +262,102 @@ describe('share client admission while a close is in progress', () => {
       'connect',
     ])
     await consumer.disconnect()
+  })
+
+  test.each(['eachMessage', 'eachBatch'])(
+    'a %s handler awaiting connect during a natural close is refused and the close completes',
+    async (kind) => {
+      const h = open()
+      const seen = lifecycle(h)
+      const entered = deferred()
+      const proceed = deferred()
+      let refusal = null
+      h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a'])])])
+      await h.consumer.subscribe({ topics: ['topic-a'] })
+      await h.consumer.run({
+        [kind]: async () => {
+          entered.resolve()
+          await proceed.promise
+          refusal = await h.consumer.connect().then(
+            () => 'resolved',
+            (error) => error
+          )
+        },
+      })
+      await entered.promise
+      let closed = false
+      const closing = h.consumer.disconnect().then(() => {
+        closed = true
+      })
+      proceed.resolve()
+      await until(() => closed, 'the natural close')
+      await closing
+      expect(refusal).toBeInstanceOf(KafkaJSNonRetriableError)
+      expect(refusal.message).toBe(
+        'connect() cannot wait for a close from a handler of the run being closed'
+      )
+      expect(leaves(h)).toHaveLength(1)
+      expect(seen).toEqual(['connect', 'disconnect'])
+      expect(h.cluster.sockets().every((socket) => socket.destroyed)).toBe(true)
+    }
+  )
+
+  test.each([
+    ['a natural', undefined],
+    ['a timeout zero', { timeout: 0 }],
+  ])(
+    '%s disconnect after the close cancels a connect queued on it and leaves no socket',
+    async (_, options) => {
+      const h = open()
+      const seen = lifecycle(h)
+      await h.consumer.connect()
+      const first = h.consumer.disconnect()
+      const waiter = h.consumer.connect().then(
+        () => 'resolved',
+        (error) => error
+      )
+      const second = first.then(() => {
+        seen.push('second disconnect called')
+        return h.consumer.disconnect(options)
+      })
+      const [error] = await Promise.all([waiter, second])
+      await flush()
+      expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
+      expect(error.message).toBe('Share client was disconnected')
+      expect(seen.filter((event) => event === 'connect')).toHaveLength(1)
+      expect(h.cluster.sockets().every((socket) => socket.destroyed)).toBe(true)
+    }
+  )
+
+  test('connects queued on one close share one fresh attempt and one CONNECT', async () => {
+    const h = open()
+    const seen = lifecycle(h)
+    await h.consumer.connect()
+    const teardown = hold()
+    const closing = h.consumer.disconnect()
+    await until(teardown.reached, 'the held teardown')
+    const sockets = h.cluster.sockets().length
+    const waiters = [h.consumer.connect(), h.consumer.connect(), h.consumer.connect()]
+    teardown.release()
+    await closing
+    await Promise.all(waiters)
+    expect(seen).toEqual(['connect', 'disconnect', 'connect'])
+    expect(h.cluster.sockets().filter((socket) => !socket.destroyed)).toHaveLength(1)
+    expect(h.cluster.sockets()).toHaveLength(sockets + 1)
+  })
+
+  test('an invalid disconnect call does not cancel a queued connect', async () => {
+    const h = open()
+    const seen = lifecycle(h)
+    await h.consumer.connect()
+    const teardown = hold()
+    const closing = h.consumer.disconnect()
+    await until(teardown.reached, 'the held teardown')
+    const waiter = h.consumer.connect()
+    await expect(h.consumer.disconnect({ timeout: -1 })).rejects.toThrow()
+    teardown.release()
+    await closing
+    await waiter
+    expect(seen).toEqual(['connect', 'disconnect', 'connect'])
   })
 })
