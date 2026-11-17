@@ -8,6 +8,7 @@ const ManualGroupProtocol = require('./groupProtocol/manual')
 const CommittedOffsetReader = require('./committedOffsets')
 const handlerContext = require('./handlerContext')
 const OffsetOperations = require('./offsetManager/offsetOperations')
+const CommittedOffsetRevisions = require('../cluster/committedOffsetRevisions')
 const Subscription = require('./subscription')
 const ControlLifetime = require('./controlLifetime')
 const { normalizeResetPolicy } = require('./offsetReset')
@@ -841,6 +842,7 @@ module.exports = (params) => {
           runner = null
           consumerGroup = null
           declared.retireRun()
+          life.obligations.releaseAssignment()
         }
         instrumentationEmitter.emit(STOP)
       }
@@ -1769,15 +1771,20 @@ module.exports = (params) => {
 
   /**
    * Drops the recreation debt and the private offsets of every topic outside `keep`, the topic-local
-   * state a consumer holds while stopped. A name that returns owes anew, as after a subscription change.
+   * state a consumer holds while stopped, and makes `keep` the subscribed names its group's shared
+   * offset state is kept for. A name that returns owes anew, as after a subscription change.
    * @param {Set<string>} keep the names that keep their state
    * @returns {void}
    */
   const retainTopics = (keep) => {
     life.obligations.retain(keep)
+    life.obligations.claimSubscription(keep)
     if (privateState) {
+      const revisions = CommittedOffsetRevisions.peek(privateState.offsets)
       for (const topic of keys(privateState.offsets)) {
-        if (!keep.has(topic)) delete privateState.offsets[topic]
+        if (keep.has(topic)) continue
+        delete privateState.offsets[topic]
+        revisions?.clearTopic(topic)
       }
     }
   }

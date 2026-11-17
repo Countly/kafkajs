@@ -4,7 +4,9 @@
  * The consumer-churn profile: a verifier that works only on a journal of public observations, the
  * public probe that counts what the clients leave behind, and the run that joins them. Nothing
  * here imports the client's sources or reads its private state, so a client defect cannot hide in
- * its own bookkeeping.
+ * its own bookkeeping. The one exception is outside this file: the run receives counts of a group's
+ * private offset state (`offset-state` rows), which `offsetStateViolations` bounds by the live
+ * topics the workload itself created; they never reach the delivery oracle.
  */
 const fs = require('node:fs')
 const { ENDPOINT_BYTES, SLOPE_BYTES_PER_MINUTE, median, slope } = require('./bounds')
@@ -992,6 +994,69 @@ const countByType = (types) => {
 }
 
 /**
+ * Bounds the private offset state each regex pass sampled while its members ran: every expected
+ * group has a final sample, and every sample settled, read present stores and stays within the live
+ * topics (stamp topics, cache keys) and live partitions (stamp cells) the workload kept. The
+ * expected groups come from the plan, never from the rows.
+ * @param {object[]} rows the run's `offset-state` rows
+ * @param {object} expected
+ * @param {string[]} expected.passes the warm-up passes and phases that ran the regex workload
+ * @param {(phase: string) => string[]} expected.groupsOf the group ids a pass's members joined
+ * @returns {string[]} one violation per defect; empty when every bound holds
+ */
+const offsetStateViolations = (rows, { passes, groupsOf }) => {
+  const count = (value) => Number.isSafeInteger(value) && value >= 0
+  const expected = new Map()
+  for (const phase of passes) {
+    for (const group of groupsOf(phase)) expected.set(`${phase}|${group}`, { phase, group })
+  }
+  const finals = new Set()
+  const violations = []
+  for (const row of rows) {
+    const where = `offset state of ${row?.group} in ${row?.phase} (${row?.checkpoint})`
+    const key = `${row?.phase}|${row?.group}`
+    if (!expected.has(key)) {
+      violations.push(`${where}: unexpected group or phase`)
+      continue
+    }
+    if (row.checkpoint !== 'periodic' && row.checkpoint !== 'final') {
+      violations.push(`${where}: unknown checkpoint`)
+      continue
+    }
+    if (row.checkpoint === 'final') finals.add(key)
+    if (row.quiescent !== true) violations.push(`${where}: did not quiesce`)
+    const { offsetState: state, live } = row
+    if (state?.present !== true) {
+      violations.push(`${where}: stores absent`)
+      continue
+    }
+    if (!count(state.topics) || !count(state.cells) || !count(state.cache)) {
+      violations.push(`${where}: malformed counts`)
+      continue
+    }
+    if (!(
+      count(live?.topics) &&
+      live.topics > 0 &&
+      count(live.partitions) &&
+      live.partitions >= live.topics
+    )) {
+      violations.push(`${where}: malformed live denominators`)
+      continue
+    }
+    if (state.topics > live.topics)
+      violations.push(`${where}: ${state.topics} stamp topics for ${live.topics} live topics`)
+    if (state.cache > live.topics)
+      violations.push(`${where}: ${state.cache} cache topics for ${live.topics} live topics`)
+    if (state.cells > live.partitions)
+      violations.push(`${where}: ${state.cells} stamp cells for ${live.partitions} live partitions`)
+  }
+  for (const [key, { phase, group }] of expected) {
+    if (!finals.has(key)) violations.push(`offset state of ${group} in ${phase}: no final sample`)
+  }
+  return violations
+}
+
+/**
  * Holds the records each phase acknowledged to the offered rate over the phase's offering window, the
  * five planned minutes: the drain, the log read and the deletion that follow it are not offering time.
  * @param {Map<string, { acked?: number, measuredMs?: number }>} stats what each phase recorded
@@ -1297,6 +1362,7 @@ module.exports = {
   countByType,
   interningControl,
   judgeQuietHeap,
+  offsetStateViolations,
   publicSocketFactory,
   quietViolations,
   runControls,

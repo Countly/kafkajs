@@ -2,8 +2,10 @@
 
 /**
  * The consumer-churn run and its public workloads. Every client here is built and driven through
- * the package's public API; the only window into the process is the probe's socket factory and the
- * journal the workloads append to. Run it through `scripts/soak/soak.js --profile consumer-churn`.
+ * the package's public API; the windows into the process are the probe's socket factory, the
+ * journal the workloads append to and, for the regex workload only, an injected reader of a
+ * group's private offset-state counts, recorded as `offset-state` rows and never journaled. Run it
+ * through `scripts/soak/soak.js --profile consumer-churn`.
  */
 const { KafkaJSCommitFailedError } = require('../../index')
 const {
@@ -14,6 +16,7 @@ const {
   OfferScheduler,
   acknowledgedViolations,
   interningControl,
+  offsetStateViolations,
   judgeQuietHeap,
   quietViolations,
   runControls,
@@ -26,6 +29,12 @@ const COMMIT_EVERY = 25
 const DRAIN_POLL_MS = 100
 const DRAIN_MS = 45000
 const ACK_WAIT_MS = 10000
+/** Rotating regex names kept alive at once, beside the control topic. */
+const LIVE_WINDOW = 3
+/** Deleted rotating names between two periodic offset-state samples. */
+const SAMPLE_EVERY = 5
+const OFFSET_QUIET_MS = 30000
+const OFFSET_POLL_MS = 250
 
 /** @param {string} key `topic|partition` @returns {[string, number]} its parts; a topic name may hold `|` */
 const splitKey = (key) => {
@@ -95,6 +104,27 @@ class ChurnMember {
     this.sinceCommit = 0
     this.acquisitions = 0
     this.committing = Promise.resolve()
+    this.joins = 0
+    this.joinsAtLeave = 0
+  }
+
+  /** Counts a public `GROUP_JOIN`: the client applied a round. @returns {void} */
+  noteJoin() {
+    this.joins += 1
+  }
+
+  /**
+   * Whether this running member has applied the round that removed `names`: it holds no partition
+   * of them and a join followed its last revoke or loss.
+   * @param {Set<string>} names deleted topic names
+   * @returns {boolean}
+   */
+  settledWithout(names) {
+    if (this.stopping || this.joins <= this.joinsAtLeave) return false
+    for (const key of this.owners.keys()) {
+      if (names.has(splitKey(key)[0])) return false
+    }
+    return true
   }
 
   /**
@@ -182,6 +212,7 @@ class ChurnMember {
   }
 
   async #left(kind, partitions) {
+    this.joinsAtLeave = this.joins
     if (kind === 'revoke') await this.commitAll().catch(() => {})
     this.#end(kind, partitions)
     if (kind === 'loss') this.onLoss?.({ group: this.group, member: this.label })
@@ -291,6 +322,74 @@ class ChurnMember {
 }
 
 /**
+ * Samples the counts of each member's group's private offset state while the members still run.
+ * A member is sampled once it applied the round that removed the deleted names (see
+ * `ChurnMember#settledWithout`) and its group's ledger has no open cell; one that does not settle
+ * within the bound, or whose stores cannot be read, is recorded with `quiescent: false`, never
+ * dropped. The wait takes no abort signal, so a sample begun at the end of a phase completes.
+ */
+class OffsetStateSampler {
+  /**
+   * @param {object} options
+   * @param {((groupId: string) => object)|undefined} options.read the group's counts:
+   *   `{ present, topics, cells, cache, open }`; absent, every sample reads `{ present: false }`
+   * @param {{ now: () => number }} options.clock
+   * @param {(ms: number) => Promise<void>} options.sleep
+   * @param {(row: object) => void} options.record where each row goes
+   * @param {number} [options.quietMs=OFFSET_QUIET_MS] the longest wait for one member
+   * @param {number} [options.pollMs=OFFSET_POLL_MS]
+   */
+  constructor({ read, clock, sleep, record, quietMs = OFFSET_QUIET_MS, pollMs = OFFSET_POLL_MS }) {
+    Object.assign(this, { clock, sleep, record, quietMs, pollMs })
+    this.read = read ?? (() => ({ present: false }))
+  }
+
+  /**
+   * Records one `offset-state` row per member.
+   * @param {object} options
+   * @param {string} options.phase
+   * @param {'periodic'|'final'} options.checkpoint
+   * @param {Array<{ group: string, settledWithout: (names: Set<string>) => boolean }>} options.members
+   * @param {Array<{ partitions: number }>} options.live the topics the workload keeps, control included
+   * @param {Set<string>} options.deleted the names the workload deleted
+   * @param {number} [options.deadlineAt] the run's inclusive deadline, which also ends the wait
+   * @returns {Promise<void>}
+   */
+  async sample({ phase, checkpoint, members, live, deleted, deadlineAt = Infinity }) {
+    const startedAt = this.clock.now()
+    const until = Math.min(startedAt + this.quietMs, deadlineAt)
+    const denominators = {
+      topics: live.length,
+      partitions: live.reduce((total, { partitions }) => total + partitions, 0),
+    }
+    for (const member of members) {
+      let state = this.read(member.group)
+      const settled = () =>
+        member.settledWithout(deleted) && state.present === true && state.open === 0
+      while (!settled() && this.clock.now() < until) {
+        await this.sleep(this.pollMs)
+        state = this.read(member.group)
+      }
+      const now = this.clock.now()
+      this.record({
+        kind: 'offset-state',
+        phase,
+        group: member.group,
+        checkpoint,
+        atMs: now,
+        waitedMs: now - startedAt,
+        quiescent: settled(),
+        live: denominators,
+        offsetState:
+          state.present === true
+            ? { present: true, topics: state.topics, cells: state.cells, cache: state.cache }
+            : { present: false },
+      })
+    }
+  }
+}
+
+/**
  * Builds the evidence-writing, budget-bound run of the four phases. The workloads are injected: the
  * real ones are `ChurnWorkloads`, a unit spec passes fakes, and both go through the same verdict.
  */
@@ -355,6 +454,11 @@ class ConsumerChurnRun {
     )
     this.quiets = []
     this.warmQuiets = []
+    this.offsetRows = []
+    this.record = (line) => {
+      if (line?.kind === 'offset-state') this.offsetRows.push(line)
+      record(line)
+    }
     this.stats = new Map()
     this.unhandled = 0
     this.onUnhandled = () => {
@@ -575,6 +679,21 @@ class ConsumerChurnRun {
     })
   }
 
+  /**
+   * Checks the run's `offset-state` rows against every regex pass of the plan and the group ids its
+   * members joined there.
+   * @returns {string[]} the violations of `offsetStateViolations`
+   */
+  offsetStateViolations() {
+    const passes = [...this.plan.warmups, ...this.plan.phases]
+      .filter(({ workload }) => workload === 'regexTopics')
+      .map(({ name }) => name)
+    return offsetStateViolations(this.offsetRows, {
+      passes,
+      groupsOf: (phase) => this.groups.map((base) => this.scope.id(base, phase)),
+    })
+  }
+
   async #judge() {
     const { plan, settings } = this
     const violations = []
@@ -615,6 +734,7 @@ class ConsumerChurnRun {
     if (plan.acceptance && (!interning || !interning.ok))
       violations.push('the interning sensitivity control did not see its own growth')
     if (this.unhandled > 0) violations.push(`unhandled rejections: ${this.unhandled}`)
+    violations.push(...this.offsetStateViolations())
     if (plan.acceptance)
       violations.push(...acknowledgedViolations(this.stats, plan.phases, settings.rate))
     return {
@@ -710,9 +830,11 @@ class ChurnWorkloads {
    * @param {string} options.tag a unique stem for topics and groups
    * @param {ChurnGroups} [options.groups] the group ids of every phase, shared with the run
    * @param {import('./consumerChurn').ChurnClientLog} [options.clientLog] told of every lost round
+   * @param {(groupId: string) => object} [options.offsetState] counts of a group's private offset
+   *   state, sampled by the regex workload; absent, its samples fail as unreadable
    */
-  constructor({ kafka, probe, tag, groups = new ChurnGroups(tag), clientLog }) {
-    Object.assign(this, { kafka, probe, tag, groups, clientLog })
+  constructor({ kafka, probe, tag, groups = new ChurnGroups(tag), clientLog, offsetState }) {
+    Object.assign(this, { kafka, probe, tag, groups, clientLog, offsetState })
     this.nonce = 0
     this.clients = new Map()
     this.handled = new Map()
@@ -899,7 +1021,7 @@ class ChurnWorkloads {
         allowAutoTopicCreation: false,
       })
     )
-    return new ChurnMember({
+    const member = new ChurnMember({
       consumer,
       admin: this.admin,
       group,
@@ -914,6 +1036,8 @@ class ChurnWorkloads {
       acknowledged: (name, partition, offset, incarnation) =>
         this.acknowledged(name, partition, offset, incarnation),
     })
+    consumer.on(consumer.events.GROUP_JOIN, () => member.noteJoin())
+    return member
   }
 
   /** Stops a member and forgets its client at once, so retired members do not accumulate. */
@@ -1051,7 +1175,10 @@ class ChurnWorkloads {
   }
 
   /**
-   * Fifty topic names under one pattern, created, filled, read, drained and deleted in rotation.
+   * Fifty topic names under one pattern, created, filled, read, drained and deleted in rotation:
+   * at most `LIVE_WINDOW` rotating names stay alive beside the control topic while the members run.
+   * Every `SAMPLE_EVERY` deletions, and once before the members stop, each group's private offset
+   * state is sampled against the live topics (`OffsetStateSampler`).
    * @param {object} context the run's context
    * @param {number} ms how long the phase lasts
    * @returns {Promise<void>}
@@ -1073,6 +1200,22 @@ class ChurnWorkloads {
         await member.start([new RegExp(`^${stem}`)])
       }
       const used = []
+      const deleted = new Set()
+      const sampler = new OffsetStateSampler({
+        read: this.offsetState,
+        clock: context.clock,
+        sleep: (ms) => context.sleep(ms),
+        record: context.record,
+      })
+      const sample = (checkpoint) =>
+        sampler.sample({
+          phase: context.phase(),
+          checkpoint,
+          members,
+          live: [control, ...used],
+          deleted,
+          deadlineAt: context.deadline.deadlineAt,
+        })
       const fault = async (signal) => {
         for (let n = 0; n < 50 && !signal.aborted; n++) {
           const topic = await this.#topic(`${stem}-${n}`, 3, context)
@@ -1080,10 +1223,17 @@ class ChurnWorkloads {
           for (let record = 0; record < 12; record++) await this.#offer(topic, context)
           await this.#drainAll([topic, ...used.slice(0, -1)], members, context)
           await this.#readLog([topic], context)
+          while (used.length > LIVE_WINDOW) {
+            const old = used.shift()
+            deleted.add(old.name)
+            await this.#delete(old, context)
+            if (deleted.size % SAMPLE_EVERY === 0) await sample('periodic')
+          }
           await context.sleep(Math.max(1, Math.floor(ms / 50)), signal)
         }
       }
       const live = await this.#run(context, ms, { topics: [control], members, fault })
+      await sample('final')
       await this.#finish(context, [...used, ...live], members)
     })
   }
@@ -1176,4 +1326,10 @@ class ChurnWorkloads {
   async drain() {}
 }
 
-module.exports = { ChurnLogReader, ChurnMember, ChurnWorkloads, ConsumerChurnRun }
+module.exports = {
+  ChurnLogReader,
+  ChurnMember,
+  ChurnWorkloads,
+  ConsumerChurnRun,
+  OffsetStateSampler,
+}

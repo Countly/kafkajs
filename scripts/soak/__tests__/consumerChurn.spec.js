@@ -898,6 +898,8 @@ describe('Consumer churn profile > the run', () => {
           name,
           async (context) => {
             order.push(name)
+            if (name === 'regexTopics')
+              for (const group of context.groups) context.record(offsetRow(context.phase(), group))
             if (!context.measured()) return
             for (const group of context.groups) {
               context.gaps.enter(group, context.phase(), 0)
@@ -905,8 +907,6 @@ describe('Consumer churn profile > the run', () => {
             }
             context.stats.set(context.phase(), { acked: 1000 })
             if (name === 'memberChurn') journalFeed(context.journal)
-            if (name === 'regexTopics')
-              for (const group of context.groups) context.record(offsetRow(context.phase(), group))
           },
         ])
       ),
