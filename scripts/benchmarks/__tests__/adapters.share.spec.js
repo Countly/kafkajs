@@ -5,7 +5,6 @@ const path = require('node:path')
 const { runEntry } = require('../report')
 const { ShareSession, LIMITS } = require('../shareThroughput')
 
-const MiB = 1048576
 const ENCODER_DIR = path.join(
   __dirname,
   '../../../src/protocol/message/compression/fixtures/encoder'

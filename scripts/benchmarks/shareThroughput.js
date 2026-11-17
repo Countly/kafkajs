@@ -10,6 +10,7 @@
  *     --partitions 3 --acquire-mode record_limit|batch_optimized --max-records 500 --control 0|1
  *     [--arm share|ordinary] [--handler eachBatch|eachMessage]
  *   node scripts/benchmarks/shareThroughput.js --prepare|--cleanup <the same six flag/value pairs>
+ *   node scripts/benchmarks/shareThroughput.js --session batch|eachMessage --raw <file>
  *
  * Every flag takes an explicit value. `--control 1` runs the broker-free controls and prints them.
  * `--max-records 1` selects the separate 3000-record frame control, measured over 1000 records: a
@@ -24,6 +25,11 @@
  * for its exclusive, hashed trace. It prints one JSON record. Exit code 0 is a valid observation,
  * 2 an inconclusive one (no measurement window could be formed), 1 any failure.
  *
+ * `--session` runs a whole report session (`ShareSession`): it needs the guard, reads the
+ * finalized `share.version` back, prepares the corpus, runs eight observations of every arm twice,
+ * cleans up and prints one session record. Exit code 0 is an accepted session, 3 a void or
+ * inconclusive one, 1 an error.
+ *
  * The measured window covers complete, fully acknowledged acquisitions only. The first full
  * acquisition of every node is discarded and each measured acquisition needs a full successor on
  * its node. The window starts at the first measured fetch write and ends at the last matching
@@ -34,6 +40,7 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const path = require('node:path')
 const { createHash, randomUUID } = require('node:crypto')
+const { spawnSync } = require('node:child_process')
 const { performance } = require('node:perf_hooks')
 const { Kafka, logLevel } = require('../../index')
 const sleep = require('../../src/utils/sleep')
@@ -718,13 +725,15 @@ const measureWindow = ({ log, frames, maxRecords, target = LIMITS.measured, posi
  * @param {{key?:string,arms:Record<string,{a:object[],aprime:object[]}>}} session Observations per arm.
  * @param {{key:string,arms:Record<string,{recordsPerSecond:number}>}|null} [baseline] The accepted
  *   baseline of the same comparability key, or null for a first session.
+ * @param {string[]} [arms] The arms the session must have, sorted; the three reference arms by
+ *   default.
  * @returns {{status:'accepted',arms:object}|{status:'void',arm:string,metric:string,delta:number}}
  *   Accepted medians, or a void session when identical trees differ by more than three percent.
  * @throws {Error} For a missing or unaccepted observation, a heap ceiling breach, a missing arm or
  *   baseline arm, a different comparability key or a throughput regression.
  */
-const evaluateSession = (session, baseline = null) => {
-  assert.deepEqual(Object.keys(session.arms).sort(), ARMS, 'Expected every arm')
+const evaluateSession = (session, baseline = null, arms = ARMS) => {
+  assert.deepEqual(Object.keys(session.arms).sort(), arms, 'Expected every arm')
   if (baseline)
     assert(
       typeof baseline.key === 'string' && baseline.key === session.key,
@@ -1735,14 +1744,400 @@ const readCorpus = (file, config) => {
   return { ...corpus, leaders: new Map(corpus.leaders) }
 }
 
+/** The arms of each report session: label → acquire mode, client arm and handler. */
+const SESSIONS = Object.freeze({
+  batch: {
+    arms: {
+      batch_optimized: { acquireMode: 'batch_optimized', arm: 'share', handler: 'eachBatch' },
+      ordinary: { acquireMode: 'record_limit', arm: 'ordinary', handler: 'eachBatch' },
+      record_limit: { acquireMode: 'record_limit', arm: 'share', handler: 'eachBatch' },
+    },
+    frameControl: true,
+  },
+  eachMessage: {
+    arms: {
+      eachMessage: { acquireMode: 'record_limit', arm: 'share', handler: 'eachMessage' },
+      record_limit: { acquireMode: 'record_limit', arm: 'share', handler: 'eachBatch' },
+    },
+    frameControl: false,
+  },
+})
+/** The fields of an observation a session record keeps; the rest stays in the raw evidence. */
+const OBSERVATION_FIELDS = [
+  'status',
+  'reason',
+  'controls',
+  'recordsPerSecond',
+  'p99',
+  'fetchPer1000',
+  'heapDelta',
+  'records',
+  'callbacks',
+  'gapSamples',
+  'delivered',
+  'arm',
+  'handler',
+  'groupId',
+  'trace',
+  'traceHash',
+]
+const SESSION_EXIT = { accepted: 0, void: 3, inconclusive: 3, error: 1 }
+
 /**
- * Runs the untimed controls, a fixture action, or one guarded observation, and prints one JSON
- * record. Session scheduling and aggregation belong to the benchmark CI lane.
+ * @param {Buffer|string} data
+ * @returns {string} SHA-256 of `data` in hex
+ */
+const sha256 = (data) => createHash('sha256').update(data).digest('hex')
+
+/**
+ * @param {string|undefined} stdout
+ * @returns {object|null} the last line that parses as a JSON object, or null
+ */
+const lastRecord = (stdout) => {
+  const lines = String(stdout ?? '').split('\n')
+  for (let i = lines.length - 1; i >= 0; i--) {
+    try {
+      const value = JSON.parse(lines[i])
+      if (value && typeof value === 'object' && !Array.isArray(value)) return value
+    } catch {
+      // A log line.
+    }
+  }
+  return null
+}
+
+/**
+ * Runs one report session of the driver: every arm of `SESSIONS[name]` eight times in each of two
+ * identical-tree repetitions, in rotating order, each observation in its own process with a fresh
+ * trace, over one prepared corpus. The batch session adds the separate frame control. The corpus is
+ * always cleaned up. Every child's arguments, exit and output are appended to the raw file.
+ */
+class ShareSession {
+  /**
+   * @param {string} name `batch` or `eachMessage`
+   * @param {object} options
+   * @param {string} options.raw the raw evidence file; corpus manifests and traces sit beside it
+   * @param {Function} [options.spawn] `child_process.spawnSync`, replaceable in tests
+   * @param {Record<string,string>} [options.env] the environment the children inherit
+   * @param {() => object} [options.admin] creates the admin client that reads `share.version`
+   * @throws {Error} for an unknown session or a missing raw path
+   */
+  constructor(name, { raw, spawn = spawnSync, env = process.env, admin } = {}) {
+    assert(Object.hasOwn(SESSIONS, name ?? ''), 'Unknown session: use batch or eachMessage')
+    assert(typeof raw === 'string' && raw, 'A raw evidence path is required')
+    this.name = name
+    this.raw = path.resolve(raw)
+    this.spawn = spawn
+    this.env = env
+    this.admin =
+      admin ??
+      (() =>
+        new Kafka({
+          brokers: plainTextBrokers(),
+          clientId: `share-bench-session-${randomUUID()}`,
+          logLevel: logLevel.NOTHING,
+        }).admin())
+    this.labels = Object.keys(SESSIONS[name].arms).sort()
+  }
+
+  /**
+   * Admits the session, then runs it. A refused admission starts no process.
+   * @returns {Promise<object>} the session record: status `accepted`, `void`, `inconclusive` or
+   *   `error` (with `reason`), the guard, the share read-back, the corpus identity, every kept
+   *   observation, the frame control and the A/A evaluation
+   * @throws {Error} when the guard is missing or `share.version` is not finalized and read back
+   */
+  async run() {
+    const guard = this.admitGuard()
+    const share = await this.readShare()
+    const record = {
+      schema: 1,
+      session: this.name,
+      status: 'error',
+      node: process.version,
+      driver: {
+        file: 'scripts/benchmarks/shareThroughput.js',
+        sha256: sha256(fs.readFileSync(__filename)),
+      },
+      guard,
+      share,
+      corpus: null,
+      arms: Object.fromEntries(this.labels.map((label) => [label, { a: [], aprime: [] }])),
+      frameControl: null,
+      evaluation: null,
+    }
+    const corpusFile = `${this.raw}.corpus.json`
+    let prepared = false
+    try {
+      this.fixture('prepare', corpusFile, LIMITS.messages, LIMITS.maxRecords)
+      prepared = true
+      record.corpus = this.corpusIdentity(corpusFile)
+      this.observeAll(record, corpusFile)
+      if (SESSIONS[this.name].frameControl) record.frameControl = this.frameControl()
+      this.evaluate(record)
+    } catch (error) {
+      record.status = 'error'
+      record.reason = error.message
+    }
+    if (prepared) {
+      try {
+        this.fixture('cleanup', corpusFile, LIMITS.messages, LIMITS.maxRecords)
+      } catch (error) {
+        record.reason = [record.status === 'error' && record.reason, `cleanup: ${error.message}`]
+          .filter(Boolean)
+          .join('; ')
+        record.status = 'error'
+      }
+    }
+    return record
+  }
+
+  /**
+   * @returns {{manifest:string,sha256:string}} the reviewed guard manifest and its digest
+   * @throws {Error} without `KAFKAJS_CLUSTER_MANIFEST` naming a readable JSON object
+   */
+  admitGuard() {
+    const manifest = this.env.KAFKAJS_CLUSTER_MANIFEST
+    assert(manifest, 'A share session requires the reviewed guard (KAFKAJS_CLUSTER_MANIFEST)')
+    const text = fs.readFileSync(manifest)
+    const parsed = JSON.parse(text)
+    assert(parsed && typeof parsed === 'object' && !Array.isArray(parsed), 'Invalid guard manifest')
+    return { manifest: path.resolve(manifest), sha256: sha256(text) }
+  }
+
+  /**
+   * Reads the finalized `share.version` back from the brokers' own answer.
+   * @returns {Promise<{feature:string,level:number}>}
+   * @throws {Error} when the level is below 1 or the read fails
+   */
+  async readShare() {
+    const admin = this.admin()
+    await admin.connect()
+    try {
+      const { finalizedFeatures } = await admin.describeFeatures()
+      const level = finalizedFeatures?.['share.version']?.maxVersionLevel ?? 0
+      assert(
+        Number.isInteger(level) && level >= 1,
+        `share.version is finalized at level ${level}; enable share and read it back first`
+      )
+      return { feature: 'share.version', level }
+    } finally {
+      await admin.disconnect()
+    }
+  }
+
+  /**
+   * @param {{acquireMode:string,arm:string,handler:string}} spec
+   * @param {number} messages corpus records
+   * @param {number} maxRecords records per acquisition
+   * @returns {string[]} the driver's fixed flag/value pairs for `spec`
+   */
+  static flags({ acquireMode, arm, handler }, messages, maxRecords) {
+    return [
+      '--messages',
+      String(messages),
+      '--size',
+      String(LIMITS.size),
+      '--partitions',
+      String(LIMITS.partitions),
+      '--acquire-mode',
+      acquireMode,
+      '--max-records',
+      String(maxRecords),
+      '--control',
+      '0',
+      '--arm',
+      arm,
+      '--handler',
+      handler,
+    ]
+  }
+
+  /**
+   * Runs one child of the driver and appends its evidence to the raw file.
+   * @param {object} what what the child is, kept with its evidence
+   * @param {string[]} args driver arguments
+   * @param {Record<string,string>} env extra environment
+   * @returns {{status:number|null,output:object|null,stderr:string}}
+   * @throws {Error} for a spawn error or a signal
+   */
+  child(what, args, env) {
+    const argv = ['--expose-gc', __filename, ...args]
+    const result = this.spawn(process.execPath, argv, {
+      encoding: 'utf8',
+      env: { ...this.env, ...env },
+      timeout: LIMITS.timeout + 60000,
+      maxBuffer: 64 * 1024 * 1024,
+    })
+    fs.appendFileSync(
+      this.raw,
+      `${JSON.stringify({
+        ...what,
+        args: argv,
+        env,
+        status: result.status,
+        signal: result.signal ?? null,
+        error: result.error?.message ?? null,
+        stdout: result.stdout ?? '',
+        stderr: result.stderr ?? '',
+      })}\n`
+    )
+    if (result.error) throw result.error
+    if (result.status === null) throw new Error(`${what.phase} killed by ${result.signal}`)
+    return { status: result.status, output: lastRecord(result.stdout), stderr: result.stderr ?? '' }
+  }
+
+  /**
+   * Prepares or removes a corpus.
+   * @param {'prepare'|'cleanup'} phase
+   * @param {string} file corpus manifest path
+   * @param {number} messages corpus records
+   * @param {number} maxRecords records per acquisition
+   * @returns {void}
+   * @throws {Error} unless the fixture completed
+   */
+  fixture(phase, file, messages, maxRecords) {
+    const spec = { acquireMode: 'record_limit', arm: 'share', handler: 'eachBatch' }
+    const args = [`--${phase}`, ...ShareSession.flags(spec, messages, maxRecords)]
+    const { status, output, stderr } = this.child({ phase, corpus: file }, args, {
+      P9_SHARE_CORPUS: file,
+    })
+    if (status !== 0 || output?.status !== 'fixture-complete')
+      throw new Error(`corpus ${phase} failed: exit ${status}: ${stderr.slice(-300)}`)
+  }
+
+  /**
+   * @param {string} file prepared corpus manifest
+   * @returns {{topic:string,messages:number,size:number,partitions:number,identities:string}}
+   *   the corpus and the digest of its producer-acknowledged identities
+   */
+  corpusIdentity(file) {
+    const corpus = JSON.parse(fs.readFileSync(file, 'utf8'))
+    return {
+      topic: corpus.topic,
+      messages: corpus.messages,
+      size: corpus.size,
+      partitions: corpus.partitions,
+      identities: sha256(JSON.stringify(corpus.expected)),
+    }
+  }
+
+  /**
+   * Runs one observation of `label` with its own fresh trace.
+   * @param {string} label session arm
+   * @param {string} rep `a` or `aprime`
+   * @param {number} index observation number in the repetition
+   * @param {string} corpus corpus manifest path
+   * @param {object} spec the arm's driver flags
+   * @param {number} [messages] corpus records
+   * @param {number} [maxRecords] records per acquisition
+   * @returns {object} the kept fields of a valid or inconclusive observation
+   * @throws {Error} for a failed observation
+   */
+  observe(
+    label,
+    rep,
+    index,
+    corpus,
+    spec,
+    messages = LIMITS.messages,
+    maxRecords = LIMITS.maxRecords
+  ) {
+    const trace = `${this.raw}.${rep}-${index}-${label}.trace.jsonl`
+    const { status, output, stderr } = this.child(
+      { phase: 'observe', label, rep, index },
+      ShareSession.flags(spec, messages, maxRecords),
+      { P9_SHARE_CORPUS: corpus, P9_SHARE_TRACE: trace }
+    )
+    if (![0, 2].includes(status) || !output)
+      throw new Error(`${label} ${rep} ${index}: exit ${status}: ${stderr.slice(-300)}`)
+    return Object.fromEntries(
+      OBSERVATION_FIELDS.filter((key) => Object.hasOwn(output, key)).map((key) => [
+        key,
+        output[key],
+      ])
+    )
+  }
+
+  /**
+   * Runs every observation; the arm order rotates by one each round.
+   * @param {object} record the session record whose arms collect the observations
+   * @param {string} corpus corpus manifest path
+   * @returns {void}
+   * @throws {Error} for the first failed observation
+   */
+  observeAll(record, corpus) {
+    const { arms } = SESSIONS[this.name]
+    for (const rep of ['a', 'aprime'])
+      for (let index = 0; index < LIMITS.observations; index++) {
+        const shift = index % this.labels.length
+        for (const label of [...this.labels.slice(shift), ...this.labels.slice(0, shift)])
+          record.arms[label][rep].push(this.observe(label, rep, index, corpus, arms[label]))
+      }
+  }
+
+  /**
+   * The separate maxRecords 1 frame control over its own corpus, always removed again.
+   * @returns {object} the control observation
+   * @throws {Error} for a failed preparation, observation or cleanup
+   */
+  frameControl() {
+    const file = `${this.raw}.frame-corpus.json`
+    const spec = { acquireMode: 'record_limit', arm: 'share', handler: 'eachBatch' }
+    this.fixture('prepare', file, LIMITS.controlMessages, 1)
+    let observation
+    let failure = null
+    try {
+      observation = this.observe('frame', 'control', 0, file, spec, LIMITS.controlMessages, 1)
+    } catch (error) {
+      failure = error
+    }
+    this.fixture('cleanup', file, LIMITS.controlMessages, 1)
+    if (failure) throw failure
+    return observation
+  }
+
+  /**
+   * Sets the session status: `inconclusive` when an observation formed no window, otherwise the A/A
+   * rule of `evaluateSession` (no baseline, so no throughput floor).
+   * @param {object} record the complete session record
+   * @returns {void}
+   * @throws {Error} for an observation `evaluateSession` refuses
+   */
+  evaluate(record) {
+    const open = this.labels.flatMap((label) =>
+      ['a', 'aprime'].flatMap((rep) =>
+        record.arms[label][rep]
+          .map((row, index) => ({ row, index }))
+          .filter(({ row }) => row.status !== 'valid')
+          .map(({ row, index }) => `${label} ${rep} ${index}: ${row.reason ?? row.status}`)
+      )
+    )
+    if (open.length) {
+      record.status = 'inconclusive'
+      record.reason = `no measurement window: ${open.join('; ')}`
+      return
+    }
+    record.evaluation = evaluateSession({ arms: record.arms }, null, this.labels)
+    record.status = record.evaluation.status
+  }
+}
+
+/**
+ * Runs the untimed controls, a fixture action, one guarded observation or a whole `--session`, and
+ * prints one JSON record.
  * @param {string[]} argv Explicit arguments.
  * @returns {Promise<void>}
  * @throws {Error} For a missing guard, corpus, trace or resource source, or any failed control or gate.
  */
 const main = async (argv) => {
+  if (argv[0] === '--session') {
+    assert(argv.length === 4 && argv[2] === '--raw', 'Expected --session <name> --raw <file>')
+    const record = await new ShareSession(argv[1], { raw: argv[3] }).run()
+    process.stdout.write(`${JSON.stringify(record)}\n`)
+    process.exitCode = SESSION_EXIT[record.status]
+    return
+  }
   const { phase, config } = parseCommand(argv)
   const checks = controls()
   if (phase !== 'run') {
@@ -1805,5 +2200,8 @@ module.exports = {
   produceCorpus,
   ShareThroughput,
   CorpusFixture,
+  SESSIONS,
+  SESSION_EXIT,
+  ShareSession,
   main,
 }
