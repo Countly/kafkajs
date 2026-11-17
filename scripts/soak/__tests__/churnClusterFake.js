@@ -51,6 +51,7 @@ class FakeCluster {
       for (const key of [...offsets.keys()]) if (key.startsWith(`${name}|`)) offsets.delete(key)
     }
     for (const member of this.#all()) member.forget(name)
+    this.#rebalanceAll()
   }
 
   append(topic, partition, value) {
@@ -107,6 +108,7 @@ class FakeCluster {
     }
     for (const member of members) await member.revokeLost(wanted.get(member))
     for (const member of members) await member.assignGained(wanted.get(member))
+    for (const member of members) member.joinedRound()
   }
 }
 
@@ -177,6 +179,20 @@ class FakeConsumer extends FakeClient {
     this.paused = new Set()
     this.pumping = false
     this.joined = false
+    this.events = { GROUP_JOIN: 'consumer.group_join' }
+    this.joinListeners = new Set()
+  }
+
+  on(event, listener) {
+    if (event !== this.events.GROUP_JOIN) return () => {}
+    this.joinListeners.add(listener)
+    return () => this.joinListeners.delete(listener)
+  }
+
+  /** Emits `GROUP_JOIN` once the member applied a round, as the client does after each join. */
+  joinedRound() {
+    if (!this.joined) return
+    for (const listener of this.joinListeners) listener()
   }
 
   async subscribe({ topic }) {
