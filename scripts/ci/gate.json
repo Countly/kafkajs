@@ -6775,6 +6775,7 @@
         "src/consumer/__tests__/groupTimeouts.spec.js \u203a Consumer > timeout integer ranges rejects invalid sessionTimeout NaN before arithmetic",
         "src/consumer/__tests__/groupTimeouts.spec.js \u203a Consumer > timeout integer ranges rejects invalid sessionTimeout Symbol(session) before arithmetic",
         "src/consumer/__tests__/groupTimeouts.spec.js \u203a Consumer > timeout integer ranges rejects invalid sessionTimeout null before arithmetic",
+        "src/consumer/__tests__/groupTimeouts.spec.js \u203a Consumer > group timeouts the alias table the logged syncGroupTimeout equals the codec value",
         "src/consumer/__tests__/heartbeatManager.spec.js \u203a Consumer > HeartbeatManager > poll expiry arms one chain when a stop and a re-arm land inside an in-flight heartbeat",
         "src/consumer/__tests__/heartbeatManager.spec.js \u203a Consumer > HeartbeatManager > poll expiry does not report expiry while a rebalance round is in flight, and heartbeats instead",
         "src/consumer/__tests__/heartbeatManager.spec.js \u203a Consumer > HeartbeatManager > poll expiry does not report expiry while disabled",
@@ -9284,12 +9285,17 @@
         "src/consumer/__tests__/subscriptionCodec.spec.js \u203a Consumer > subscription codec encode writes the v0 layout when no optional value is given",
         "src/consumer/__tests__/subscriptionCodec.spec.js \u203a Consumer > subscription codec encode writes the v1 layout for a version-1 caller, defaulting OwnedPartitions to empty",
         "src/consumer/__tests__/subscriptionCodec.spec.js \u203a Consumer > subscription codec mixed-version compatibility lets a kafkajs 2.2.4 leader read a v3 subscription without throwing",
-        "src/consumer/__tests__/syncGroupTimeout.spec.js \u203a Consumer > derived group request timeouts caps SyncGroup at 60000 + 5000 however large the rebalance timeout is",
-        "src/consumer/__tests__/syncGroupTimeout.spec.js \u203a Consumer > derived group request timeouts caps a MAX_SAFE_INTEGER rebalance timeout rather than overflowing",
-        "src/consumer/__tests__/syncGroupTimeout.spec.js \u203a Consumer > derived group request timeouts derives 305000 / 65000 at the defaults",
         "src/consumer/__tests__/syncGroupTimeout.spec.js \u203a Consumer > derived group request timeouts derives 35000 / 35000 for a maxPollInterval of 30000",
-        "src/consumer/__tests__/syncGroupTimeout.spec.js \u203a Consumer > derived group request timeouts is never lowered below the client default by the request queue",
         "src/consumer/__tests__/syncGroupTimeout.spec.js \u203a Consumer > derived group request timeouts keeps the falsy fallback for rebalanceTimeout 0",
+        "src/consumer/__tests__/syncGroupTimeout.spec.js \u203a Consumer > derived group request timeouts derives 305000 / 305000 at the defaults",
+        "src/consumer/__tests__/syncGroupTimeout.spec.js \u203a Consumer > derived group request timeouts derives 125000 for a rebalanceTimeout of 120000",
+        "src/consumer/__tests__/syncGroupTimeout.spec.js \u203a Consumer > derived group request timeouts falls back to the raw timeout when +5000 is not a safe integer",
+        "src/consumer/__tests__/syncGroupTimeout.spec.js \u203a Consumer > derived group request timeouts keeps the larger requestTimeout",
+        "src/consumer/__tests__/syncGroupTimeout.spec.js \u203a Consumer > a parked SyncGroup over the wire a SyncGroup answer 70 s after send resolves at the defaults (fake time)",
+        "src/consumer/__tests__/syncGroupTimeout.spec.js \u203a Consumer > a parked SyncGroup over the wire the round deadline still ends a SyncGroup that outlives the round (fake time)",
+        "src/consumer/__tests__/syncGroupTimeout.spec.js \u203a Consumer > a parked SyncGroup over the wire disconnect during a parked SyncGroup settles within the close bound (fake time)",
+        "src/consumer/__tests__/syncGroupTimeout.spec.js \u203a Consumer > a parked SyncGroup over the wire an unanswered SyncGroup at the defaults ends with the 300 s round, not its 305 s allowance (fake time)",
+        "src/consumer/__tests__/syncGroupTimeout.spec.js \u203a Consumer > JoinGroup attempts on the wire a JoinGroup retried inside one round is counted on the wire but adds no GROUP_JOIN (fake time)",
         "src/consumer/__tests__/topicRecreated.spec.js \u203a Consumer > topic recreation ConsumerGroup#invalidateTopic a recreated topic starts unpaused",
         "src/consumer/__tests__/topicRecreated.spec.js \u203a Consumer > topic recreation ConsumerGroup#invalidateTopic clears preferredReadReplicas and pending seeks for the topic only",
         "src/consumer/__tests__/topicRecreated.spec.js \u203a Consumer > topic recreation ConsumerGroup#invalidateTopic is a no-op for a topic outside the current member assignment",
@@ -17606,30 +17612,30 @@
         "src/protocol/requests/saslHandshake/v1/response.spec.js \u203a Protocol > Requests > SASLHandshake > v1 response decodes the hand-computed golden",
         "src/protocol/requests/saslHandshake/v1/response.spec.js \u203a Protocol > Requests > SASLHandshake > v1 response parse throws the broker error for a mechanism it does not enable",
         "src/protocol/requests/syncGroup/index.spec.js \u203a Protocol > Requests > SyncGroup offers v4 and v5, and a broker offering v0-5 is asked at v5",
-        "src/protocol/requests/syncGroup/index.spec.js \u203a Protocol > Requests > SyncGroup v0 caps a MAX_SAFE_INTEGER rebalance timeout rather than overflowing",
-        "src/protocol/requests/syncGroup/index.spec.js \u203a Protocol > Requests > SyncGroup v0 caps the request timeout at 60 s plus the network delay",
         "src/protocol/requests/syncGroup/index.spec.js \u203a Protocol > Requests > SyncGroup v0 falls back to the session timeout when there is no rebalance timeout",
         "src/protocol/requests/syncGroup/index.spec.js \u203a Protocol > Requests > SyncGroup v0 leaves the timeout unset when neither is supplied (client default applies)",
-        "src/protocol/requests/syncGroup/index.spec.js \u203a Protocol > Requests > SyncGroup v1 caps a MAX_SAFE_INTEGER rebalance timeout rather than overflowing",
-        "src/protocol/requests/syncGroup/index.spec.js \u203a Protocol > Requests > SyncGroup v1 caps the request timeout at 60 s plus the network delay",
         "src/protocol/requests/syncGroup/index.spec.js \u203a Protocol > Requests > SyncGroup v1 falls back to the session timeout when there is no rebalance timeout",
         "src/protocol/requests/syncGroup/index.spec.js \u203a Protocol > Requests > SyncGroup v1 leaves the timeout unset when neither is supplied (client default applies)",
-        "src/protocol/requests/syncGroup/index.spec.js \u203a Protocol > Requests > SyncGroup v2 caps a MAX_SAFE_INTEGER rebalance timeout rather than overflowing",
-        "src/protocol/requests/syncGroup/index.spec.js \u203a Protocol > Requests > SyncGroup v2 caps the request timeout at 60 s plus the network delay",
         "src/protocol/requests/syncGroup/index.spec.js \u203a Protocol > Requests > SyncGroup v2 falls back to the session timeout when there is no rebalance timeout",
         "src/protocol/requests/syncGroup/index.spec.js \u203a Protocol > Requests > SyncGroup v2 leaves the timeout unset when neither is supplied (client default applies)",
-        "src/protocol/requests/syncGroup/index.spec.js \u203a Protocol > Requests > SyncGroup v3 caps a MAX_SAFE_INTEGER rebalance timeout rather than overflowing",
-        "src/protocol/requests/syncGroup/index.spec.js \u203a Protocol > Requests > SyncGroup v3 caps the request timeout at 60 s plus the network delay",
         "src/protocol/requests/syncGroup/index.spec.js \u203a Protocol > Requests > SyncGroup v3 falls back to the session timeout when there is no rebalance timeout",
         "src/protocol/requests/syncGroup/index.spec.js \u203a Protocol > Requests > SyncGroup v3 leaves the timeout unset when neither is supplied (client default applies)",
-        "src/protocol/requests/syncGroup/index.spec.js \u203a Protocol > Requests > SyncGroup v4 caps a MAX_SAFE_INTEGER rebalance timeout rather than overflowing",
-        "src/protocol/requests/syncGroup/index.spec.js \u203a Protocol > Requests > SyncGroup v4 caps the request timeout at 60 s plus the network delay",
         "src/protocol/requests/syncGroup/index.spec.js \u203a Protocol > Requests > SyncGroup v4 falls back to the session timeout when there is no rebalance timeout",
         "src/protocol/requests/syncGroup/index.spec.js \u203a Protocol > Requests > SyncGroup v4 leaves the timeout unset when neither is supplied (client default applies)",
-        "src/protocol/requests/syncGroup/index.spec.js \u203a Protocol > Requests > SyncGroup v5 caps a MAX_SAFE_INTEGER rebalance timeout rather than overflowing",
-        "src/protocol/requests/syncGroup/index.spec.js \u203a Protocol > Requests > SyncGroup v5 caps the request timeout at 60 s plus the network delay",
         "src/protocol/requests/syncGroup/index.spec.js \u203a Protocol > Requests > SyncGroup v5 falls back to the session timeout when there is no rebalance timeout",
         "src/protocol/requests/syncGroup/index.spec.js \u203a Protocol > Requests > SyncGroup v5 leaves the timeout unset when neither is supplied (client default applies)",
+        "src/protocol/requests/syncGroup/index.spec.js \u203a Protocol > Requests > SyncGroup v0 derives the request timeout from the rebalance timeout plus the network delay",
+        "src/protocol/requests/syncGroup/index.spec.js \u203a Protocol > Requests > SyncGroup v0 keeps a MAX_SAFE_INTEGER rebalance timeout as it is rather than overflowing",
+        "src/protocol/requests/syncGroup/index.spec.js \u203a Protocol > Requests > SyncGroup v1 derives the request timeout from the rebalance timeout plus the network delay",
+        "src/protocol/requests/syncGroup/index.spec.js \u203a Protocol > Requests > SyncGroup v1 keeps a MAX_SAFE_INTEGER rebalance timeout as it is rather than overflowing",
+        "src/protocol/requests/syncGroup/index.spec.js \u203a Protocol > Requests > SyncGroup v2 derives the request timeout from the rebalance timeout plus the network delay",
+        "src/protocol/requests/syncGroup/index.spec.js \u203a Protocol > Requests > SyncGroup v2 keeps a MAX_SAFE_INTEGER rebalance timeout as it is rather than overflowing",
+        "src/protocol/requests/syncGroup/index.spec.js \u203a Protocol > Requests > SyncGroup v3 derives the request timeout from the rebalance timeout plus the network delay",
+        "src/protocol/requests/syncGroup/index.spec.js \u203a Protocol > Requests > SyncGroup v3 keeps a MAX_SAFE_INTEGER rebalance timeout as it is rather than overflowing",
+        "src/protocol/requests/syncGroup/index.spec.js \u203a Protocol > Requests > SyncGroup v4 derives the request timeout from the rebalance timeout plus the network delay",
+        "src/protocol/requests/syncGroup/index.spec.js \u203a Protocol > Requests > SyncGroup v4 keeps a MAX_SAFE_INTEGER rebalance timeout as it is rather than overflowing",
+        "src/protocol/requests/syncGroup/index.spec.js \u203a Protocol > Requests > SyncGroup v5 derives the request timeout from the rebalance timeout plus the network delay",
+        "src/protocol/requests/syncGroup/index.spec.js \u203a Protocol > Requests > SyncGroup v5 keeps a MAX_SAFE_INTEGER rebalance timeout as it is rather than overflowing",
         "src/protocol/requests/syncGroup/v0/request.spec.js \u203a Protocol > Requests > SyncGroup > v0 request",
         "src/protocol/requests/syncGroup/v0/response.spec.js \u203a Protocol > Requests > SyncGroup > v0 handles empty member assignment",
         "src/protocol/requests/syncGroup/v0/response.spec.js \u203a Protocol > Requests > SyncGroup > v0 response",
@@ -21833,7 +21839,8 @@
         "src/consumer/share/__tests__/shareDlqKafka44Live.spec.js \u203a Share DLQ Kafka 4.4 (live) reject routes metadata only to the DLQ",
         "src/consumer/share/__tests__/shareDlqKafka44Live.spec.js \u203a Share DLQ Kafka 4.4 (live) reject routes original key and value to the DLQ",
         "src/consumer/share/__tests__/shareDlqKafka44Live.spec.js \u203a Share DLQ Kafka 4.4 (live) release beyond the delivery limit routes metadata only to the DLQ",
-        "src/consumer/share/__tests__/shareDlqKafka44Live.spec.js \u203a Share DLQ Kafka 4.4 (live) release beyond the delivery limit routes original key and value to the DLQ"
+        "src/consumer/share/__tests__/shareDlqKafka44Live.spec.js \u203a Share DLQ Kafka 4.4 (live) release beyond the delivery limit routes original key and value to the DLQ",
+        "src/consumer/__tests__/syncGroupSlowAssignmentLive.spec.js \u203a SyncGroup behind a slow leader (live) a follower's SyncGroup parked 70 s behind a slow leader completes with rebalanceTimeout 120000"
       ]
     },
     {
@@ -22187,6 +22194,28 @@
         "src/consumer/__tests__/completingRebalanceLive.spec.js \u203a raw classic follower heartbeat is pinned during the proven sync window"
       ],
       "capMinutes": 60
+    },
+    {
+      "id": "e2e-syncgroup-slow",
+      "kind": "cluster",
+      "compose": "docker-compose.yml",
+      "env": {
+        "SYNCGROUP_SLOW_E2E": "1"
+      },
+      "jest": [
+        "--forceExit",
+        "--testPathPatterns",
+        "src/consumer/__tests__/syncGroupSlowAssignmentLive\\.spec\\.js"
+      ],
+      "jestScript": null,
+      "nodeTest": null,
+      "command": null,
+      "needs": {},
+      "evidence": [],
+      "titles": [
+        "src/consumer/__tests__/syncGroupSlowAssignmentLive.spec.js \u203a SyncGroup behind a slow leader (live) a follower's SyncGroup parked 70 s behind a slow leader completes with rebalanceTimeout 120000"
+      ],
+      "capMinutes": 15
     },
     {
       "id": "e2e-auto-topic-creation",
@@ -25640,7 +25669,8 @@
         "src/consumer/share/__tests__/shareDlqKafka44Live.spec.js \u203a Share DLQ Kafka 4.4 (live) reject routes metadata only to the DLQ",
         "src/consumer/share/__tests__/shareDlqKafka44Live.spec.js \u203a Share DLQ Kafka 4.4 (live) reject routes original key and value to the DLQ",
         "src/consumer/share/__tests__/shareDlqKafka44Live.spec.js \u203a Share DLQ Kafka 4.4 (live) release beyond the delivery limit routes metadata only to the DLQ",
-        "src/consumer/share/__tests__/shareDlqKafka44Live.spec.js \u203a Share DLQ Kafka 4.4 (live) release beyond the delivery limit routes original key and value to the DLQ"
+        "src/consumer/share/__tests__/shareDlqKafka44Live.spec.js \u203a Share DLQ Kafka 4.4 (live) release beyond the delivery limit routes original key and value to the DLQ",
+        "src/consumer/__tests__/syncGroupSlowAssignmentLive.spec.js \u203a SyncGroup behind a slow leader (live) a follower's SyncGroup parked 70 s behind a slow leader completes with rebalanceTimeout 120000"
       ]
     },
     {

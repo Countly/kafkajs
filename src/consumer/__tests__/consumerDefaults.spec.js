@@ -140,7 +140,7 @@ describe('consumer configuration defaults', () => {
       pollDeadline: 300000,
       sessionTimeout: 45000,
       heartbeatInterval: 3000,
-      syncGroupTimeout: 65000,
+      syncGroupTimeout: 305000,
     })
   })
 

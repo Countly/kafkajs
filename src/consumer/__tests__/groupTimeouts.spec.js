@@ -12,7 +12,7 @@ describe('Consumer > group timeouts', () => {
   describe('the alias table', () => {
     const ROWS = [
       // [maxPollInterval, rebalanceTimeout, wire, joinGroupReq, syncGroupReq, deadline, warns]
-      [undefined, undefined, 300000, 305000, 65000, 300000, false],
+      [undefined, undefined, 300000, 305000, 305000, 300000, false],
       [undefined, 20000, 20000, 25000, 25000, 300000, true],
       [undefined, 0, 0, 50000, 50000, 300000, true],
       [30000, undefined, 30000, 35000, 35000, 30000, false],
@@ -33,6 +33,36 @@ describe('Consumer > group timeouts', () => {
         expect(warn.mock.calls.length > 0).toBe(warns)
       }
     )
+
+    it('the logged syncGroupTimeout equals the codec value', () => {
+      const { requests, lookup } = require('../../protocol/requests')
+      const apiKeys = require('../../protocol/requests/apiKeys')
+      const codecTimeout = ({ rebalanceTimeout, sessionTimeout }) =>
+        lookup({ [apiKeys.SyncGroup]: { minVersion: 0, maxVersion: 5 } })(
+          apiKeys.SyncGroup,
+          requests.SyncGroup
+        )({
+          groupId: 'g',
+          generationId: 1,
+          memberId: 'm',
+          groupAssignment: [],
+          rebalanceTimeout,
+          sessionTimeout,
+        }).requestTimeout
+
+      const cases = [
+        [{}, 305000],
+        [{ maxPollInterval: 120000 }, 125000],
+        [{ maxPollInterval: 30000 }, 35000],
+        [{ rebalanceTimeout: 0, sessionTimeout: 30000 }, 35000],
+        [{ maxPollInterval: Number.MAX_SAFE_INTEGER }, Number.MAX_SAFE_INTEGER],
+      ]
+      for (const [options, expected] of cases) {
+        const { resolved } = resolve(options)
+        expect(resolved.syncGroupTimeout).toEqual(expected)
+        expect(codecTimeout(resolved)).toEqual(expected)
+      }
+    })
 
     it('names both values and the winner when they disagree', () => {
       const { warn } = resolve({ maxPollInterval: 45000, rebalanceTimeout: 20000 })

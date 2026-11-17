@@ -622,13 +622,24 @@ says so, `groupProtocol: 'consumer'`.
   old 60 s rebalance timing, set `rebalanceTimeout: 60000`** — the legacy option still goes on the
   wire unchanged, and it never becomes a handler deadline below 5 minutes (see "`rebalanceTimeout`
   is deprecated, and it does not become your eviction deadline."). Setting `maxPollInterval: 60000`
-  instead would also shorten your handler deadline to 60 s, which is usually not what you want. One
-  related timing does change if you had raised the rebalance timeout above 60 s: the client-side
-  timeout on the SyncGroup request is now capped at 65 s, where it used to follow the rebalance
-  timeout, so a `rebalanceTimeout: 120000` waits 65 s for the assignment instead of 125 s. That is
-  what the Java client sends. If your group leader genuinely needs longer to compute an assignment,
-  raise the client-wide `requestTimeout`, which still raises this one with it. At the default
-  nothing changes: it was 65 s and it stays 65 s. The JoinGroup request goes the other way: its
+  instead would also shorten your handler deadline to 60 s, which is usually not what you want. SyncGroup's
+  per-request allowance follows this member's rebalance timeout plus 5 s; the rebalance round
+  deadline that started at round entry can end the operation sooner. The coordinator holds a
+  follower's SyncGroup until the leader has computed and sent the assignment, so with
+  `t = rebalanceTimeout || sessionTimeout` the allowance is
+  `max(requestTimeout, Number.isSafeInteger(t + 5000) ? t + 5000 : t)`. That is 305 s at the
+  defaults and 125 s with `rebalanceTimeout: 120000`; kafkajs 2.2.4 used the plain
+  `requestTimeout` (30 s by default). The allowance does not extend the rebalance: the round that
+  started before the JoinGroup keeps its original deadline (`maxPollInterval`, or the legacy
+  `rebalanceTimeout`) and ends a SyncGroup that outlives it, and a peer's larger rebalance budget
+  is neither learned nor covered. The cost is that a coordinator which accepts a SyncGroup and
+  then goes silent can remain undetected until the round ends (about five minutes at the
+  defaults rather than about one), although another request on the same connection can fail
+  sooner. `consumer.crash` is reported after the consumer's cleanup, which may wait for the
+  transport to drain, so treat the 305 s figure as an allowance, not as a deadline for the crash
+  event. A closed or reset connection still fails at once, and `disconnect({ timeout })` still
+  bounds a close while a SyncGroup is parked. To detect a silent coordinator sooner, lower
+  `maxPollInterval`. The JoinGroup request is sized the same way: its
   client-side timeout is `maxPollInterval + 5000`, so 305 s at the default where 2.2.4 gave 65 s. A
   JoinGroup is held open by the coordinator until every member has rejoined, so the client has to be
   willing to wait out the whole rebalance timeout — the Java client sizes it the same way — but a
