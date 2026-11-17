@@ -8,12 +8,13 @@ const Pool = require('../../network/connectionPool')
 const apiKeys = require('../../protocol/requests/apiKeys')
 const Encoder = require('../../protocol/encoder')
 const { decode: decodeDeleteTopics } = require('../../protocol/requests/deleteTopics/v6/response')
-const { saslBrokers, saslConnectionOpts } = require('testHelpers')
+const { createCluster, saslBrokers, saslConnectionOpts } = require('testHelpers')
 const {
   fenceUntilSettled,
   describeScramUntilApplied,
   TRANSACTION_COORDINATOR_APIS,
 } = require('../../../testHelpers/adminCatchUp')
+const { ClusterAclPort, waitForAclBindings } = require('../../../testHelpers/aclPropagation')
 const { readData } = require('../../producer/__tests__/fixtures/liveProbe')
 const { liveCase, caseTimeout, pollUntil } = require('../../producer/__tests__/fixtures/bounded')
 
@@ -76,6 +77,8 @@ class AdminLedgerScenario {
     this.probe = probe
     this.records = new Set()
     this.id = randomBytes(8).toString('hex')
+    /** @type {Promise<ClusterAclPort>|null} */
+    this.aclPortReady = null
   }
 
   /**
@@ -189,8 +192,44 @@ class AdminLedgerScenario {
   }
 
   /**
+   * Opens the scenario's per-broker ACL port once on the root admin's listener, registering its
+   * close before the first connect so an aborted connect cannot leave the cluster without an owner.
+   * @returns {Promise<ClusterAclPort>} connected port
+   * @throws {Error} connect failure, abort or budget
+   */
+  aclPort() {
+    const p = this.probe
+    if (!this.aclPortReady) {
+      const port = new ClusterAclPort(
+        createCluster(
+          { logger: p.logger, socketFactory: (args) => p.socket(args) },
+          p.baseOptions.brokers
+        )
+      )
+      p.cleanup.add('ACL port', () => port.close())
+      this.aclPortReady = p.invoke(() => port.connect()).then(() => port)
+    }
+    return this.aclPortReady
+  }
+
+  /**
+   * Waits until every broker's authorizer serves exactly `expected` under `filter`. Each broker
+   * applies the controller's ACL records on its own schedule, so every ACL create or delete waits
+   * here before anything that reads or depends on it.
+   * @param {object} filter complete DescribeAcls filter
+   * @param {object[]} expected the bindings every broker must serve, `[]` after a removal
+   * @returns {Promise<void>}
+   * @throws {Error} a lagging or unanswered broker at the deadline, abort or budget
+   */
+  async aclsServed(filter, expected) {
+    const port = await this.aclPort()
+    await this.probe.invoke((signal) => waitForAclBindings({ port, filter, expected, signal }))
+  }
+
+  /**
    * Deletes ACLs through one filter and proves the outcome: a single successful response that
-   * deleted exactly the expected ACLs, after which DescribeAcls finds nothing under the filter.
+   * deleted exactly the expected ACLs, after which DescribeAcls finds nothing under the filter,
+   * first through the public client and then on every broker.
    * @param {object} client admin that owns the ACLs
    * @param {object} filter complete delete filter, also used to describe what remains
    * @param {object[]} expected the ACLs the filter must delete, whatever order they come back in
@@ -212,6 +251,7 @@ class AdminLedgerScenario {
       },
       () => resources
     )
+    await this.aclsServed(filter, [])
   }
 
   /**
@@ -1412,6 +1452,7 @@ class AdminLedgerScenario {
       deletedAcls(await admin.deleteAcls({ filters: [acl] }))
     })
     expect(await p.invoke(() => admin.createAcls({ acl: [acl] }))).toBe(true)
+    await this.aclsServed(acl, [acl])
     const described = await p.invoke(() => admin.describeAcls(acl))
     expect(described.resources).toHaveLength(1)
     await this.removeAcls(admin, acl, [acl])
@@ -1586,6 +1627,7 @@ class AdminLedgerScenario {
         deletedAcls(await root.deleteAcls({ filters: [acl] }))
       })
     expect(await p.invoke(() => root.createAcls({ acl: maskAcls }))).toBe(true)
+    for (const acl of maskAcls) await this.aclsServed(acl, [acl])
     const [maskHost, maskPort] = saslBrokers()[0].split(':')
     const security = { ssl, sasl: { mechanism: 'scram-sha-256', username: user, password } }
     const maskRaw = await this.raw(maskHost, Number(maskPort), security)
@@ -2080,6 +2122,7 @@ class AdminLedgerScenario {
           deletedAcls(await root.deleteAcls({ filters: [dependency] }))
         })
         expect(await p.invoke(() => root.createAcls({ acl: [dependency] }))).toBe(true)
+        await this.aclsServed(dependency, [dependency])
         if (dependency.resourceType === 2 && dependency.operation === 8) {
           for (const broker of permissionSources) {
             const metadata = await this.permissionAllowed({
@@ -2104,6 +2147,7 @@ class AdminLedgerScenario {
         await controllerAlterDenied()
       }
       expect(await p.invoke(() => root.createAcls({ acl: [acl] }))).toBe(true)
+      await this.aclsServed(acl, [acl])
       const positive = await this.permissionAllowed(check)
       if (check.item || check.positiveItem)
         expect(check.positiveCodes || [0]).toContain(
@@ -2136,9 +2180,9 @@ class AdminLedgerScenario {
         deletionId = replacement
       }
       if (check.allowedProbe) await check.allowedProbe(check)
-      expect(await p.invoke(() => root.createAcls({ acl: [{ ...acl, permissionType: 2 }] }))).toBe(
-        true
-      )
+      const deny = { ...acl, permissionType: 2 }
+      expect(await p.invoke(() => root.createAcls({ acl: [deny] }))).toBe(true)
+      await this.aclsServed(deny, [deny])
       if (check.filtered) {
         let filtered
         await p.poll(async () => {
@@ -2200,7 +2244,7 @@ class AdminLedgerScenario {
       await this.removeAcls(
         root,
         { ...acl, permissionType: 1 },
-        [acl, { ...acl, permissionType: 2 }],
+        [acl, deny],
         check.name === 'ID deletion' ? 'ID deletion DELETE ACL removal' : undefined
       )
       for (const dependency of dependencyAcls)
