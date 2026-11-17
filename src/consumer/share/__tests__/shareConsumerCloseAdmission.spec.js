@@ -1,6 +1,9 @@
+const { AsyncLocalStorage } = require('node:async_hooks')
 const Cluster = require('../../../cluster')
 const InstrumentationEventEmitter = require('../../../instrumentation/emitter')
 const { ShareRunner } = require('../shareRunner')
+const { handlerRunIdentity } = require('../shareRun')
+const { ShareFetchLoop } = require('../shareFetchLoop')
 const { validateShareConsumerOptions } = require('..')
 const { KafkaJSNonRetriableError } = require('../../../errors')
 const { newLogger } = require('testHelpers')
@@ -392,5 +395,87 @@ describe('share client admission while a close is in progress', () => {
     await closing
     await waiter
     expect(seen).toEqual(['connect', 'disconnect', 'connect'])
+  })
+
+  test('an eachMessage batch enters the handler context once for all of its messages', async () => {
+    const entries = jest.spyOn(AsyncLocalStorage.prototype, 'run').mockName('AsyncLocalStorage#run')
+    const h = open()
+    const handled = []
+    const done = deferred()
+    h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a', 'b', 'c', 'd'])])])
+    await h.consumer.subscribe({ topics: ['topic-a'] })
+    await h.consumer.run({
+      eachMessage: async ({ message }) => {
+        handled.push({ offset: message.offset, identity: handlerRunIdentity() })
+        if (handled.length === 4) done.resolve()
+      },
+    })
+    await done.promise
+    const runIdentities = entries.mock.calls
+      .map(([store]) => store)
+      .filter((store) => typeof store === 'symbol' && store.description === 'share run')
+    expect(handled.map(({ offset }) => offset)).toEqual(['0', '1', '2', '3'])
+    expect(runIdentities).toHaveLength(1)
+    expect(handled.every(({ identity }) => identity === runIdentities[0])).toBe(true)
+  })
+
+  test('a HANDLER_ERROR listener calling connect during a close waits for DISCONNECT and reconnects', async () => {
+    const h = open()
+    const seen = lifecycle(h)
+    const entered = deferred()
+    const proceed = deferred()
+    let reconnect = null
+    h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a'])])])
+    h.consumer.on(h.consumer.events.HANDLER_ERROR, () => {
+      seen.push('handler error')
+      reconnect = h.consumer.connect().then(
+        () => 'resolved',
+        (error) => error
+      )
+    })
+    await h.consumer.subscribe({ topics: ['topic-a'] })
+    await h.consumer.run({
+      eachMessage: async () => {
+        entered.resolve()
+        await proceed.promise
+        throw new Error('handler failure')
+      },
+    })
+    await entered.promise
+    const closing = h.consumer.disconnect()
+    proceed.resolve()
+    await closing
+    await until(() => reconnect !== null, 'the HANDLER_ERROR listener')
+    expect(await reconnect).toBe('resolved')
+    expect(seen).toEqual(['connect', 'handler error', 'disconnect', 'connect'])
+  })
+
+  test('acknowledgements started by a handler or by its dispatch run outside the handler context', async () => {
+    const original = ShareFetchLoop.prototype.acknowledge
+    const started = []
+    jest.spyOn(ShareFetchLoop.prototype, 'acknowledge').mockImplementation(function (request) {
+      started.push({ kind: request.renew ? 'renew' : 'flush', identity: handlerRunIdentity() })
+      return original.call(this, request)
+    })
+    const h = open()
+    const failed = deferred()
+    let inside = null
+    h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['a'])])])
+    h.consumer.on(h.consumer.events.HANDLER_ERROR, () => failed.resolve())
+    await h.consumer.subscribe({ topics: ['topic-a'] })
+    await h.consumer.run({
+      eachMessage: async ({ renew }) => {
+        inside = handlerRunIdentity()
+        renew().catch(() => {})
+        throw new Error('handler failure')
+      },
+    })
+    await failed.promise
+    await flush()
+    expect(typeof inside).toBe('symbol')
+    expect(started).toEqual([
+      { kind: 'renew', identity: undefined },
+      { kind: 'flush', identity: undefined },
+    ])
   })
 })
