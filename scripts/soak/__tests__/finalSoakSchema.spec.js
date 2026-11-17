@@ -1549,6 +1549,14 @@ describe('scripts/soak/finalSoakSchema', () => {
         () => run({ edit: (r) => (r[r.length - 1].source = 'p01') }),
         'a process cannot observe its own exit',
       ],
+      'a process on another boot': [
+        () => run({ edit: (r) => (r[2].bootId = 'boot-2') }),
+        'process bootId or node differs from the header',
+      ],
+      'a process on another node version': [
+        () => run({ edit: (r) => (r[2].node = 'v24.0.0') }),
+        'process bootId or node differs from the header',
+      ],
       'an unknown source': [
         () => run({ edit: (r) => (r[20].source = 'p99') }),
         'source is not a config process',
