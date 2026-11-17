@@ -8,13 +8,15 @@
  * Usage:
  *   node --expose-gc scripts/benchmarks/shareThroughput.js --messages 200000 --size 100
  *     --partitions 3 --acquire-mode record_limit|batch_optimized --max-records 500 --control 0|1
- *     [--arm share|ordinary]
+ *     [--arm share|ordinary] [--handler eachBatch|eachMessage]
  *   node scripts/benchmarks/shareThroughput.js --prepare|--cleanup <the same six flag/value pairs>
  *
  * Every flag takes an explicit value. `--control 1` runs the broker-free controls and prints them.
  * `--max-records 1` selects the separate 3000-record frame control, measured over 1000 records: a
  * positive movement control, never a baseline. `--arm ordinary` reads the same topic with a fresh
- * ordinary group as the same-tree reference.
+ * ordinary group as the same-tree reference. `--handler eachMessage` runs a full-acquisition share
+ * arm through `eachMessage`, one handler call per record, so its cost per call can be compared with
+ * the `eachBatch` arm of the same acquire mode.
  *
  * A measured run, `--prepare` and `--cleanup` need a reviewed live guard
  * (`KAFKAJS_CLUSTER_MANIFEST`) and `P9_SHARE_CORPUS`, the corpus manifest path (created by
@@ -69,6 +71,7 @@ const SHARE_ACKNOWLEDGE = 79
 const MAX_FRAME_BYTES = 1073741824
 const ARMS = ['batch_optimized', 'ordinary', 'record_limit']
 const FLAGS = ['messages', 'size', 'partitions', 'acquire-mode', 'max-records', 'control']
+const HANDLERS = ['eachBatch', 'eachMessage']
 const TOPIC = /^share-bench-[a-f0-9-]+$/
 const GROUP_CONFIG = Object.freeze({
   'share.auto.offset.reset': 'earliest',
@@ -78,7 +81,7 @@ const GROUP_CONFIG = Object.freeze({
 /**
  * Parses explicit flag/value pairs. Unknown, duplicate, missing and noninteger values fail.
  * @param {string[]} argv CLI arguments without a leading `--prepare` or `--cleanup`.
- * @returns {{messages:number,size:number,partitions:number,acquireMode:string,maxRecords:number,control:number,arm:string}}
+ * @returns {{messages:number,size:number,partitions:number,acquireMode:string,maxRecords:number,control:number,arm:string,handler:string}}
  *   Validated fixed configuration. Parsing never starts a client.
  * @throws {Error} For an invalid, repeated or missing argument or a value outside the fixed corpus.
  */
@@ -87,7 +90,9 @@ const parseArgs = (argv) => {
   for (let i = 0; i < argv.length; i += 2) {
     const name = argv[i].startsWith('--') ? argv[i].slice(2) : undefined
     assert(
-      [...FLAGS, 'arm'].includes(name) && argv[i + 1] !== undefined && !Object.hasOwn(values, name),
+      [...FLAGS, 'arm', 'handler'].includes(name) &&
+        argv[i + 1] !== undefined &&
+        !Object.hasOwn(values, name),
       `Invalid argument: ${argv[i]}`
     )
     values[name] = argv[i + 1]
@@ -105,6 +110,7 @@ const parseArgs = (argv) => {
     maxRecords: integer('max-records'),
     control: integer('control'),
     arm: values.arm ?? 'share',
+    handler: values.handler ?? 'eachBatch',
   }
   assert([1, LIMITS.maxRecords].includes(config.maxRecords), 'Invalid record limit')
   assert(
@@ -115,10 +121,16 @@ const parseArgs = (argv) => {
   )
   assert(['record_limit', 'batch_optimized'].includes(config.acquireMode), 'Invalid acquire mode')
   assert(['share', 'ordinary'].includes(config.arm), 'Invalid arm')
+  assert(HANDLERS.includes(config.handler), 'Invalid handler')
   assert([0, 1].includes(config.control), 'Invalid control')
   assert(
     config.maxRecords !== 1 || (config.acquireMode === 'record_limit' && config.arm === 'share'),
     'The frame control is a record_limit share run'
+  )
+  assert(
+    config.handler === 'eachBatch' ||
+      (config.arm === 'share' && config.maxRecords === LIMITS.maxRecords),
+    'The eachMessage handler is a full-acquisition share run'
   )
   return config
 }
@@ -501,7 +513,9 @@ class AcquisitionLog {
 
   /**
    * Captures one public batch before the handler returns. Identities are derived later, so the
-   * handler path only keeps references and one offset entry per record.
+   * handler path only keeps references and one offset entry per record. Every call of a group
+   * shares the first call's partition, so comparing with that call alone keeps an `eachMessage`
+   * acquisition linear.
    * @param {{topic:string,partition:number,messages:object[],acquisitionLockTimeoutMs:number}} batch The actual public batch.
    * @param {number} enteredAt Monotonic handler-entry time.
    * @returns {AcquisitionCall} The call; complete it with `returned`.
@@ -515,7 +529,7 @@ class AcquisitionLog {
       this.groups.set(frame, group)
     }
     assert(
-      group.calls.every((call) => call.partition === batch.partition),
+      group.calls.length === 0 || group.calls[0].partition === batch.partition,
       'Acquisition spans partitions'
     )
     const call = {
@@ -1056,6 +1070,19 @@ class ShareThroughput {
         throw error
       }
     }
+    this.messageHandler = async ({ topic, partition, message }) => {
+      try {
+        this.handle({
+          topic,
+          partition,
+          messages: [message],
+          acquisitionLockTimeoutMs: this.consumer.acquisitionLockTimeoutMs(),
+        })
+      } catch (error) {
+        this.fail(error)
+        throw error
+      }
+    }
   }
 
   /**
@@ -1119,6 +1146,7 @@ class ShareThroughput {
       controls: true,
       groupId: this.groupId,
       arm: this.share ? this.config.acquireMode : 'ordinary',
+      handler: this.config.handler,
       trace: this.trace,
       traceHash,
     }
@@ -1234,7 +1262,8 @@ class ShareThroughput {
 
   /**
    * Creates the consumer, subscribes, runs, and waits for every record, and for every share record
-   * to have a terminal accepted result.
+   * to have a terminal accepted result. The `eachMessage` handler wraps each record as a one-record
+   * batch whose lock is the consumer's public `acquisitionLockTimeoutMs()` reading.
    * @param {string} topic Corpus topic.
    * @param {number} count Records in the corpus.
    * @param {number} deadline Original deadline.
@@ -1260,11 +1289,12 @@ class ShareThroughput {
         this.consumer.subscribe(this.share ? { topics: [topic] } : { topic, fromBeginning: true }),
       deadline
     )
+    const handler =
+      config.handler === 'eachMessage'
+        ? { eachMessage: this.messageHandler }
+        : { eachBatch: this.handler }
     await bounded(
-      () =>
-        this.consumer.run(
-          this.share ? { eachBatch: this.handler } : { autoCommit: false, eachBatch: this.handler }
-        ),
+      () => this.consumer.run(this.share ? handler : { autoCommit: false, ...handler }),
       deadline
     )
     await until(() => this.drained(count), deadline, 50)
