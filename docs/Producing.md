@@ -304,11 +304,11 @@ KafkaJS ships with 3 partitioners: `DefaultPartitioner`, `UniformStickyPartition
 
 | Partitioner | Keyed records | Records without a key | Choose it when |
 |---|---|---|---|
-| `UniformStickyPartitioner()` (the default) | the same as `DefaultPartitioner` | one partition per topic until `stickyBytes` have gone to it, then a new one picked at random (it may be the same partition again) | most records have no key and you want fewer, larger batches per partition (see below) |
+| `UniformStickyPartitioner()` (the default) | the same as `DefaultPartitioner` | one partition per topic until `stickyBytes` have gone to it, then a new one picked at random, weighted by queue depth by default (it may be the same partition again) | most records have no key and you want fewer, larger batches per partition (see below) |
 | `DefaultPartitioner` | `murmur2(key)`, as the Java client | round-robin over the partitions that have a leader | you need Java-compatible keyed placement and an even spread of every keyless record |
 | `LegacyPartitioner` | the hash KafkaJS used before v2.0.0 | round-robin | you need the partitioning of KafkaJS before v2.0.0 |
 
-When `createPartitioner` is omitted the producer uses the uniform sticky partitioner, sticking for its `batchSize` bytes (KIP-794, the Java client's built-in behaviour). Keyed records and records with an explicit `partition` go exactly where `DefaultPartitioner` sends them; only records without a key are placed differently. To keep the placement of earlier versions, record by record, pass `createPartitioner: Partitioners.DefaultPartitioner` (or its alias `JavaCompatiblePartitioner`). `LegacyPartitioner` is not the way back: it hashes keys differently.
+When `createPartitioner` is omitted the producer uses the uniform sticky partitioner, sticking for its `batchSize` bytes and weighing queues (KIP-794, the Java client's built-in behaviour). Keyed records and records with an explicit `partition` go exactly where `DefaultPartitioner` sends them; only records without a key are placed differently. To keep the placement of earlier versions, record by record, pass `createPartitioner: Partitioners.DefaultPartitioner` (or its alias `JavaCompatiblePartitioner`). `LegacyPartitioner` is not the way back: it hashes keys differently.
 
 The `DefaultPartitioner` should be compatible with the default partitioner that ships with the Java Kafka client. This can be important to meet the [co-partitioning requirement](https://docs.confluent.io/current/ksql/docs/developer-guide/partition-data.html#co-partitioning-requirements) when joining multiple topics.
 
@@ -325,8 +325,8 @@ by importing it and providing it to the Producer constructor:**
 
 #### Uniform sticky partitioner
 
-`UniformStickyPartitioner` is the strictly uniform sticky partitioner of KIP-794, and the producer's
-default, with `stickyBytes` the producer's `batchSize`. To choose its options, unlike the other two
+`UniformStickyPartitioner` is the uniform sticky partitioner of KIP-794, and the producer's
+default, with `stickyBytes` the producer's `batchSize` and `adaptive: true`. To choose its options, unlike the other two
 you call it: pass `Partitioners.UniformStickyPartitioner()` for its own defaults, or call it with
 options:
 
@@ -339,12 +339,13 @@ kafka.producer({ createPartitioner: Partitioners.UniformStickyPartitioner({ stic
 |---|---|---|
 | stickyBytes | Bytes assigned to one partition before the next record without a key picks another; each record counts its wire size - 21 bytes plus its key, value and headers with their lengths, a string in its UTF-8 bytes, as a `Buffer` of the same text - so records with no bytes move on too | `16384` |
 | ignoreKeys | Partition keyed records by the sticky rule too, instead of by key | `false` |
-| adaptive | Pick the next partition weighted by the batches waiting for each one (KIP-794's adaptive partitioning), so partitions of a slow broker get fewer records. A boolean | `false` |
+| adaptive | Pick the next partition weighted by the batches waiting for each one (KIP-794's adaptive partitioning), so partitions of a slow broker get fewer records. A boolean | `false` (`true` for the producer's default) |
 
 A record without a key goes to its topic's sticky partition until `stickyBytes` have been assigned
 to it; the record that reaches the threshold still goes there, and the next one
-goes to a partition picked uniformly at random among those with a leader (among all of them when
-none has a leader — the pick can land on the same partition again). The stickiness carries across
+goes to a partition picked at random among those with a leader (among all of them when none has a
+leader — the pick can land on the same partition again): uniformly with `adaptive: false`, weighted
+by queue depth with `adaptive: true`, the producer's default (see below). The stickiness carries across
 `send()` calls: the keyless records of one `send()` with many messages fill a few batches instead
 of one record per partition, and records from separate `send()` calls share a batch in the
 [accumulator](#accumulator). A
@@ -359,8 +360,20 @@ partition has one, and a topic's state is dropped once it has had no record with
 With `adaptive: true` each pick weighs the partitions that have a leader by the batches waiting for
 them: a partition is picked with probability proportional to the deepest queue plus one, less its
 own, as the Java client's `partitioner.adaptive.partitioning.enable` does; equal queues pick
-uniformly. The producer's own default does not weigh. `partitioner.availability.timeout.ms` is not
-implemented.
+uniformly. The producer's default partitioner weighs; for the previous non-adaptive sticky
+behavior, pass
+`createPartitioner: Partitioners.UniformStickyPartitioner({ stickyBytes: 16384, adaptive: false })`
+with your `batchSize` as `stickyBytes` (16384 is the default `batchSize`). Keyed records and records with an explicit `partition`
+are placed the same either way. `partitioner.availability.timeout.ms` is not implemented.
+
+In one measured workload (Kafka 4.4.0, Node 24), a healthy cluster showed no measurable difference
+between the two. With one broker answering 300 ms slow and 120 000 keyless records offered,
+the producer without weighting delivered 67 % and `send()` rejected 33 % once the 32 MiB buffer
+filled; with weighting every record was delivered, with a p99 latency of 5.2 s instead of 45.6 s.
+Under a slow broker the weighting deliberately spreads keyless records unevenly: in that workload
+the busiest partition received about 9.7 times as many records as the least busy. These numbers
+describe that workload, not a guarantee: weighting reduces pressure on the buffer, and a full
+buffer still refuses sends.
 
 ### <a name="rack-aware-partitioning"></a> Rack-aware partitioning
 

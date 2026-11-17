@@ -29,8 +29,8 @@ const pickPartition = (racks, partitionMetadata) => {
 }
 
 /**
- * KIP-794's strictly uniform sticky partitioner: the producer's default when it is given no
- * `createPartitioner`, with `stickyBytes` its `batchSize`. Unlike `DefaultPartitioner` it is a
+ * KIP-794's uniform sticky partitioner: the producer's default when it is given no
+ * `createPartitioner`, with `stickyBytes` its `batchSize` and `adaptive: true`. Unlike `DefaultPartitioner` it is a
  * function you call, with its options or with none:
  * `kafka.producer({ createPartitioner: Partitioners.UniformStickyPartitioner({ stickyBytes: 8192 }) })`.
  * Passed uncalled, as `DefaultPartitioner` is, it still works and uses the default options.

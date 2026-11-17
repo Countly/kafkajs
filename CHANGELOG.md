@@ -10,6 +10,7 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 #### Behavior changes
 
 - A transactional producer whose coordinator cannot be found no longer becomes unusable: `commit()` rejects with a retriable error whose `cause` is the discovery error and can be called again, `abort()` resolves (the epoch bump stays owed if it could not run), producer-id initialization can be retried, and offset or partition registration makes the transaction abort-only. Authorization and fencing errors stay fatal, and a fatal error armed while an `abort()` waits rejects that `abort()`.
+- The producer's default partitioner weighs each partition's queue when it picks the next partition for keyless records (adaptive uniform sticky partitioning, KIP-794); keyed records and records with an explicit `partition` are placed as before. For the previous non-adaptive sticky behavior pass `createPartitioner: Partitioners.UniformStickyPartitioner({ stickyBytes: <your batchSize>, adaptive: false })` (`stickyBytes: 16384` with the default `batchSize`); KafkaJS 2.2.4's round-robin placement is `Partitioners.DefaultPartitioner`.
 
 #### Fixes
 

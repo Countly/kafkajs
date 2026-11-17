@@ -77,7 +77,8 @@ To use GSSAPI, install `kerberos@7.0.0` yourself. The client loads this optional
 - A producer that sends faster than the cluster accepts used to grow without bound; it now rejects with a retriable error you can back off on. Raise `bufferMemory` (up to `Number.MAX_SAFE_INTEGER`) or `maxBlockMs` if your bursts are larger. A single `send()` holding more than `bufferMemory` is rejected: split it. Admitted sends are charged at most `bufferMemory`, waiting sends (which keep their records) at most the same again, and each live batch a further 1 024 bytes on top (about 13.6× in the worst case of one empty record per batch, about 3× for records of 1 KiB or more); the bound is a charge, not RSS. **In a transaction, a refused `send()` means the transaction can no longer commit: catch it, `abort()`, and start a new transaction**
 - Do not rely on mutating a record you already passed to `send()`. Mutating the bytes of an uncopied `Buffer` still affects what is sent, as in 2.2.4. A view over a backing store larger than 16 KiB and more than 16 times the view's length is copied at the call. Treat records and Buffer bytes as immutable after passing them; pass a separate Buffer containing the same bytes if you need to change your original Buffer.
 - A `send()` over about 1 MiB used to travel as one request and fail at the broker or close the connection; it is now split. A rejected split send may have written some of its records: resending it whole can duplicate those. Raise `maxRequestSize` to match the broker's `message.max.bytes` if you raised that. **Inside a transaction a size rejection now makes the transaction abort-only** (as Java's producer does for an `ApiException` from `send`): abort and begin a new one
-- Keyless records now stay on one partition until about `batchSize` bytes have gone to it, then move on, so batches are larger and fewer; the per-partition spread is even over time, not per record. To keep the previous placement use `createPartitioner: Partitioners.DefaultPartitioner`
+- Keyless records now stay on one partition until about `batchSize` bytes have gone to it, then move on, so batches are larger and fewer. With `adaptive: false` (or equal queues) the per-partition spread is even over time, not per record; the default weighs queues (next item) and may favor faster partitions. To keep the previous placement use `createPartitioner: Partitioners.DefaultPartitioner`
+- **The default partitioner weighs each partition's queue (adaptive partitioning, KIP-794).** When it picks the next partition for keyless records, a partition with more batches waiting is less likely, so a slow broker's partitions get fewer records, which reduces pressure on the buffer; a full buffer still refuses sends as described above. Keyed records and records with an explicit `partition` are placed as before. *What to do:* nothing; for the previous non-adaptive sticky behavior, pass `createPartitioner: Partitioners.UniformStickyPartitioner({ stickyBytes: 16384, adaptive: false })` with your `batchSize` as `stickyBytes` (16384 is the default `batchSize`)
 - **A producer forgets the metadata of topics it has not produced to, and has no work for, for `metadataMaxIdle` (300 000 ms).** Nothing to change; the first send to a forgotten topic loads its metadata again.
 
 
@@ -272,9 +273,8 @@ notice and what, if anything, to do.
   *What to do:* nothing unless you set `deliveryTimeout`, new in 3.0.0: give it at least
   `linger + requestTimeout`.
 
-- **Two opt-ins, neither on by default**: `Partitioners.UniformStickyPartitioner`;
-  and `leaderEpoch` on the partitions given to `sendOffsets`.
-  *What to do:* nothing; leaving them unset changes nothing beyond what the other items describe.
+- **One opt-in, off by default**: `leaderEpoch` on the partitions given to `sendOffsets`.
+  *What to do:* nothing; leaving it unset changes nothing beyond what the other items describe.
 - **A broker's waiting batches leave together.** When one batch's `linger` runs out, the other
   waiting batches for the same broker (same `acks`, `timeout` and `compression`) leave with it,
   possibly before their own `linger`, so sends made a few milliseconds apart to partitions of one

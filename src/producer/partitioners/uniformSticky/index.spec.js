@@ -1,6 +1,8 @@
 const UniformStickyPartitioner = require('./index')
 const Partitioners = require('../index')
 const { KafkaJSNonRetriableError, KafkaJSInvalidConfigurationError } = require('../../../errors')
+const { bufferedProducer, deferred, flushAll } = require('../../__tests__/fixtures/bufferHarness')
+const { createFakeCluster } = require('../../__tests__/fixtures/fakeCluster')
 
 /**
  * The keys `default/murmur2.spec.js` pins against the Java client, plus binary, non-ASCII and
@@ -36,6 +38,50 @@ const KEYS = [
  * @returns {{ partitionId: number, leader: number }[]}
  */
 const metadata = (...leaders) => leaders.map((leader, partitionId) => ({ partitionId, leader }))
+
+/**
+ * Where a producer puts one keyless record while partition 0 of two has a batch waiting on a held
+ * Produce and `Math.random` draws 0.4: partition 1 for a pick weighted by the queues (weights 1
+ * and 2), partition 0 for a uniform one.
+ * @param {object} options the producer's options
+ * @returns {Promise<number[]>} the partitions written, in request order
+ */
+const keylessBehindSlowPartition = async (options) => {
+  const held = deferred()
+  let calls = 0
+  const cluster = createFakeCluster({
+    partitions: 2,
+    produce: async ({ topicData }) => {
+      if ((calls += 1) === 1) await held.promise
+      return {
+        topics: topicData.map(({ topic, partitions }) => ({
+          topicName: topic,
+          partitions: partitions.map(({ partition }) => ({
+            partition,
+            errorCode: 0,
+            baseOffset: '0',
+            logAppendTime: '-1',
+            logStartOffset: '0',
+          })),
+        })),
+      }
+    },
+  })
+  const { producer } = bufferedProducer({ cluster, ...options })
+  await producer.connect()
+  const sends = [producer.send({ topic: 'topic', messages: [{ value: 'a', partition: 0 }] })]
+  await flushAll()
+  const random = jest.spyOn(Math, 'random').mockReturnValue(0.4)
+  sends.push(producer.send({ topic: 'topic', messages: [{ value: 'b' }] }))
+  await flushAll()
+  random.mockRestore()
+  held.resolve()
+  await Promise.all(sends)
+  await producer.disconnect()
+  return cluster.broker.produce.mock.calls.flatMap(([{ topicData }]) =>
+    topicData.flatMap(({ partitions }) => partitions.map(({ partition }) => partition))
+  )
+}
 
 describe('Producer > Partitioner > UniformSticky', () => {
   afterEach(() => jest.restoreAllMocks())
@@ -348,6 +394,15 @@ describe('Producer > Partitioner > UniformSticky', () => {
       expect(() => UniformStickyPartitioner({ adaptive })).toThrow('adaptive must be a boolean')
     }
   )
+
+  test('an explicit adaptive: false opts out', async () => {
+    expect(await keylessBehindSlowPartition({})).toEqual([0, 1])
+    expect(
+      await keylessBehindSlowPartition({
+        createPartitioner: UniformStickyPartitioner({ stickyBytes: 16384, adaptive: false }),
+      })
+    ).toEqual([0, 0])
+  })
 
   test('each built instance and the supported uncalled wrapper can be attached', () => {
     const createPartitioner = UniformStickyPartitioner()

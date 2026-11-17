@@ -107,8 +107,8 @@ const DEFAULTS = Object.freeze({
   bufferMemory: 33554432,
   maxBlockMs: 60000,
   maxRequestSize: 1048576,
-  // KIP-794's adaptive weighting stays off by default until its measured gate passes.
-  adaptive: false,
+  // The default partitioner weighs each pick by the partitions' queues (KIP-794's adaptive partitioning).
+  adaptive: true,
 })
 
 /**
