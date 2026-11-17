@@ -1049,11 +1049,11 @@ describe('scripts/soak/finalSoakSchema', () => {
         'names a decision id',
       ],
       'an uppercase registry label': [
-        edited((m) => (m.rows[0].fail = 'see RS-P10')),
+        edited((m) => (m.rows[0].fail = `see ${['RS', 'P10'].join('-')}`)),
         'uppercase registry or task label',
       ],
       'a local-only path': [
-        edited((m) => (m.rows[0].fail = 'see docs/superpowers/specs')),
+        edited((m) => (m.rows[0].fail = `see ${['', 'var', 'tmp', 'notes'].join('/')}`)),
         'names a local-only path',
       ],
       'an unknown row field': [

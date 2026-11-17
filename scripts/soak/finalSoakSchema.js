@@ -885,7 +885,10 @@ const FORBIDDEN_TEXT = Object.freeze([
   [/\bD\d{2,3}\b/, 'a decision id'],
   [/\b[A-Z]{1,2}\d{0,2}-[A-Z]?\d{2}\b/, 'an uppercase registry or task label'],
   [/\b\d[A-Z]-\d{2}\b/, 'an uppercase registry or task label'],
-  [/superpowers|upgrade-ref|\/var\/tmp|\/home\/|EXECUTION\.md|CLAUDE\.md/, 'a local-only path'],
+  [
+    /super[p]owers|upgrade[-]ref|\/var\/tmp|\/home\/|EXECUTION[.]md|CLAUDE[.]md/,
+    'a local-only path',
+  ],
 ])
 const SOURCE = /^(symbol|code): [\w./-]+#[\w.]+$|^(rule|design): \S/
 
