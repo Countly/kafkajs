@@ -631,23 +631,56 @@ describe('Consumer churn profile > a member', () => {
     expect(lost.consumer.commitOffsets).not.toHaveBeenCalled()
   })
 
-  test('a deleted topic ends the ownership: its later revoke, delivery and commit journal nothing', async () => {
-    const { member, appended, handlers, consumer, topics } = setup()
+  /** The producer and log-reader observations of record `t.1|s<offset>`, as the oracle wants them first. */
+  const acknowledgedAndRead = (offset) =>
+    ['produce', 'read'].map((kind) => ({
+      kind,
+      incarnation: 't.1',
+      topic: 't',
+      partition: 0,
+      offset: String(offset),
+      sequence: `s${offset}`,
+    }))
+  const deleteRow = { kind: 'delete', incarnation: 't.1', topic: 't' }
+
+  test('a revoke after its topic was deleted ends the ownership without a journaled boundary', async () => {
+    const { member, appended, handlers, topics } = setup()
     await member.start([/^t/])
     await handlers.onPartitionsAssigned({ partitions: [{ topic: 't', partitions: [0] }] })
     await handlers.each(message(0))
-    delete topics.t
-
-    await handlers.each(message(1))
     await member.commitAll()
+    const drained = appended.length
+    delete topics.t
     member.noteJoin()
     expect(member.settledWithout(new Set(['t']))).toBe(false)
+
     await handlers.onPartitionsRevoked({ partitions: [{ topic: 't', partitions: [0] }] })
     member.noteJoin()
 
-    expect(appended.map(({ kind }) => kind)).toEqual(['acquire', 'position', 'handler'])
-    expect(consumer.commitOffsets).not.toHaveBeenCalled()
+    expect(appended.map(({ kind }) => kind)).toEqual(['acquire', 'position', 'handler', 'commit'])
     expect(member.settledWithout(new Set(['t']))).toBe(true)
+    const rows = [...acknowledgedAndRead(0), ...appended.slice(0, drained), deleteRow]
+    await expect(new ConsumerChurnOracle([], ['g']).feed(rows)).resolves.toBeUndefined()
+  })
+
+  test('a delivery after its topic was deleted is journaled, so the oracle rejects the duplicate', async () => {
+    const { member, appended, handlers, topics } = setup()
+    await member.start([/^t/])
+    await handlers.onPartitionsAssigned({ partitions: [{ topic: 't', partitions: [0] }] })
+    await handlers.each(message(0))
+    await member.commitAll()
+    const drained = appended.length
+    delete topics.t
+
+    await handlers.each(message(0))
+
+    expect(appended.slice(drained)).toEqual([
+      expect.objectContaining({ kind: 'handler', incarnation: 't.1', offset: '0', sequence: 's0' }),
+    ])
+    const before = [...acknowledgedAndRead(0), ...appended.slice(0, drained), deleteRow]
+    await expect(
+      new ConsumerChurnOracle([], ['g']).feed([...before, ...appended.slice(drained)])
+    ).rejects.toThrow('Consumer journal: unexpected handler record')
   })
 
   test('a commit the client refuses is neither an error nor an observation', async () => {

@@ -3,12 +3,14 @@ const GroupRegistry = require('../groupRegistry')
 const CommittedOffsetRevisions = require('../committedOffsetRevisions')
 const createConsumer = require('../../consumer/index')
 const ConsumerGroup = require('../../consumer/consumerGroup')
+const GroupOwnership = require('../../consumer/groupOwnership')
 const Runner = require('../../consumer/runner')
 const OffsetManager = require('../../consumer/offsetManager')
 const ResetObligations = require('../../consumer/offsetManager/resetObligations')
 const TransactionOffsets = require('../../producer/state/transactionOffsets')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const { CLUSTER_TOPIC_RECREATED } = require('../instrumentationEvents')
+const { KafkaJSCommitFailedError } = require('../../errors')
 const { newLogger } = require('testHelpers')
 
 const GROUP = 'retire-group'
@@ -109,6 +111,7 @@ const createManager = (
     listed = () => '5',
     topicIds = {},
     autoCommit = false,
+    ownership = null,
     hold = {},
   }
 ) => {
@@ -163,6 +166,7 @@ const createManager = (
     autoCommit,
     autoCommitInterval: null,
     autoCommitThreshold: null,
+    ownership,
     topicConfigurations,
     instrumentationEmitter: new InstrumentationEventEmitter(),
     groupId: GROUP,
@@ -602,6 +606,134 @@ describe('Cluster > committed offset retirement', () => {
       expect(Object.keys(group.cache)).toEqual([])
     })
 
+    test('a grouped manual assignment replaced while stopped retires the dropped topic and keeps the rest', async () => {
+      const harness = createConsumerHarness()
+      const sibling = linkedTable(harness.ledger())
+      sibling.claimSubscription(['sibling-topic'])
+      const consumer = harness.create()
+      await consumer.assign([
+        { topic: 'kept', partitions: [0] },
+        { topic: 'dropped', partitions: [0] },
+      ])
+      const { group } = await harness.run({ restart: consumer })
+      const { manager } = harness.assign(group, { kept: [0], dropped: [0] })
+      await manager.resolveOffsets()
+      for (const topic of ['kept', 'dropped', 'sibling-topic']) harness.publish(topic)
+      const revisions = CommittedOffsetRevisions.forCache(harness.cache())
+      const stamps = {
+        kept: revisions.capture('kept', 0),
+        dropped: revisions.capture('dropped', 0),
+        sibling: revisions.capture('sibling-topic', 0),
+      }
+      await consumer.stop()
+      harness.ledger().retireUnowned()
+      expect(Object.keys(harness.cache()).sort()).toEqual(['dropped', 'kept', 'sibling-topic'])
+
+      await consumer.assign([{ topic: 'kept', partitions: [0] }])
+
+      expect(Object.keys(harness.cache()).sort()).toEqual(['kept', 'sibling-topic'])
+      expect(revisions.isCurrent('dropped', 0, stamps.dropped)).toBe(false)
+      expect(revisions.isCurrent('kept', 0, stamps.kept)).toBe(true)
+      expect(revisions.isCurrent('sibling-topic', 0, stamps.sibling)).toBe(true)
+      expect(group.obligations.subscribed).toEqual(new Set(['kept']))
+      expect(sibling.subscribed).toEqual(new Set(['sibling-topic']))
+      harness.publish('dropped')
+      expect(has(harness.cache(), 'dropped')).toBe(false)
+      expect(revisions.isCurrent('dropped', 0, stamps.dropped)).toBe(false)
+    })
+
+    test('a groupless manual assignment replaced while stopped cleans its private cache and stamps without registry state', async () => {
+      const harness = createConsumerHarness({ groupless: true })
+      const consumer = harness.create()
+      await consumer.assign([
+        { topic: 'kept', partitions: [0] },
+        { topic: 'dropped', partitions: [0] },
+      ])
+      const { group } = await harness.run({ restart: consumer })
+      const offsets = group.privateOffsets
+      offsets.kept = { 0: '3' }
+      offsets.dropped = { 0: '4' }
+      const revisions = CommittedOffsetRevisions.forCache(offsets)
+      const stamps = {
+        kept: revisions.capture('kept', 0),
+        dropped: revisions.capture('dropped', 0),
+      }
+      await consumer.stop()
+      expect(Object.keys(offsets).sort()).toEqual(['dropped', 'kept'])
+
+      await consumer.assign([{ topic: 'kept', partitions: [0] }])
+
+      expect(Object.keys(offsets)).toEqual(['kept'])
+      expect(CommittedOffsetRevisions.sizeOf(offsets)).toEqual({ topics: 1, cells: 1 })
+      expect(revisions.isCurrent('dropped', 0, stamps.dropped)).toBe(false)
+      expect(revisions.isCurrent('kept', 0, stamps.kept)).toBe(true)
+      offsets.dropped = { 0: '4' }
+      expect(revisions.isCurrent('dropped', 0, stamps.dropped)).toBe(false)
+      expect(harness.stores.offsets.size).toBe(0)
+      expect(harness.stores.operations.size).toBe(0)
+    })
+
+    test('an initial client-pattern subscription makes its matched names owners before the first assignment', async () => {
+      const harness = createConsumerHarness({ listed: ['pat-a', 'pat-b', 'other'] })
+      const consumer = harness.create()
+      await consumer.subscribe({ topics: [/^pat-/], fromBeginning: true })
+      const { group } = await harness.run({ restart: consumer })
+      for (const topic of ['pat-a', 'pat-b', 'other']) harness.publish(topic)
+      const revisions = CommittedOffsetRevisions.forCache(harness.cache())
+      const stamps = {
+        a: revisions.capture('pat-a', 0),
+        other: revisions.capture('other', 0),
+      }
+
+      harness.ledger().retireUnowned()
+
+      expect(group.obligations.subscribed).toEqual(new Set(['pat-a', 'pat-b']))
+      expect(Object.keys(harness.cache()).sort()).toEqual(['pat-a', 'pat-b'])
+      expect(revisions.isCurrent('pat-a', 0, stamps.a)).toBe(true)
+      expect(revisions.isCurrent('other', 0, stamps.other)).toBe(false)
+
+      await consumer.stop()
+      await consumer.unsubscribe()
+      expect(Object.keys(harness.cache())).toEqual([])
+      expect(revisions.isCurrent('pat-a', 0, stamps.a)).toBe(false)
+    })
+
+    test('a failed disconnect still releases the closing consumer and retires its topics, keeping the sibling', async () => {
+      const harness = createConsumerHarness({
+        topicIds: { assigned: ID_A },
+        disconnect: async () => {
+          throw new Error('teardown failed')
+        },
+      })
+      const sibling = linkedTable(harness.ledger())
+      sibling.claimAssignment(['sibling-topic'])
+      const idle = jest.fn()
+      sibling.onTopicIdle = idle
+      const { consumer, group } = await harness.run({ topics: ['subscribed'] })
+      harness.assign(group, { assigned: [0] })
+      for (const topic of ['assigned', 'subscribed', 'sibling-topic']) harness.publish(topic)
+      const table = group.obligations
+      table.owe('assigned', ID_A)
+      const revisions = CommittedOffsetRevisions.forCache(harness.cache())
+      const stamps = {
+        assigned: revisions.capture('assigned', 0),
+        sibling: revisions.capture('sibling-topic', 0),
+      }
+
+      await expect(consumer.disconnect()).rejects.toThrow('teardown failed')
+
+      expect(table.subscribed.size).toBe(0)
+      expect(table.assigned.size).toBe(0)
+      expect(table.size()).toBe(0)
+      expect(table.ledger).toBeNull()
+      expect(harness.ledger().attached.has(table)).toBe(false)
+      expect(harness.ledger().attached.has(sibling)).toBe(true)
+      expect(Object.keys(harness.cache())).toEqual(['sibling-topic'])
+      expect(revisions.isCurrent('assigned', 0, stamps.assigned)).toBe(false)
+      expect(revisions.isCurrent('sibling-topic', 0, stamps.sibling)).toBe(true)
+      expect(harness.ledger().isOwned('sibling-topic')).toBe(true)
+    })
+
     test('a same-ledger relink sweeps nothing and a transfer cleans the old ledger', () => {
       const old = createGroup()
       const table = linkedTable(old.ledger)
@@ -951,6 +1083,95 @@ describe('Cluster > committed offset retirement', () => {
       expect(group.ledger.size()).toBe(0)
     })
 
+    test('a commit held across a membership renewal neither publishes nor discharges, and retires after settlement', async () => {
+      const group = createGroup()
+      const ownership = new GroupOwnership()
+      const table = linkedTable(group.ledger)
+      const gate = deferred()
+      const hold = { commit: gate }
+      const { manager } = createManager(group, {
+        assignment: { topic: [0, 1], kept: [0] },
+        obligations: table,
+        topicIds: { topic: ID_A, kept: ID_B },
+        ownership,
+        hold,
+      })
+      table.claimAssignment(['topic', 'kept'])
+      table.owe('topic', ID_A)
+      const opening = group.ledger.begin([{ topic: 'topic', partition: 1 }])
+      group.cache.topic = { 1: '2' }
+      group.ledger.end(opening)
+      const revisions = CommittedOffsetRevisions.forCache(group.cache)
+      const stamp = revisions.capture('topic', 0)
+      const committing = manager.commitOffsets({
+        topics: [{ topic: 'topic', partitions: [{ partition: 0, offset: '7' }] }],
+      })
+      await flush()
+      hold.commit = null
+
+      ownership.renew()
+      table.claimAssignment(['kept'])
+      group.ledger.retireUnowned()
+      expect(group.cache.topic).toEqual({ 1: '2' })
+      expect(group.ledger.openTickets).toBe(1)
+      const renewed = manager.commitOffsets({
+        topics: [{ topic: 'kept', partitions: [{ partition: 0, offset: '3' }] }],
+      })
+      gate.resolve()
+
+      await expect(committing).rejects.toThrow(KafkaJSCommitFailedError)
+      await expect(renewed).resolves.toBeUndefined()
+
+      expect(group.cache.topic).toEqual({ 1: '2' })
+      expect(revisions.isCurrent('topic', 0, stamp)).toBe(true)
+      expect(table.isOwed('topic', 0)).toBe(true)
+      expect(group.ledger.openTickets).toBe(0)
+      table.retain(new Set(['kept']))
+      expect(has(group.cache, 'topic')).toBe(false)
+      expect(revisions.isCurrent('topic', 0, stamp)).toBe(false)
+      expect(group.cache.kept).toEqual({ 0: '3' })
+      expect(group.ledger.size()).toBe(0)
+    })
+
+    test('an auto-committed duration reset creates the missing cache key, invalidates stamps and discharges the debt', async () => {
+      const group = createGroup()
+      const table = linkedTable(group.ledger)
+      const { manager, coordinator } = createManager(group, {
+        assignment: { topic: [0] },
+        obligations: table,
+        topicIds: { topic: ID_A },
+        autoCommit: true,
+        listed: () => '9',
+      })
+      manager.topicConfigurations.topic = { resetPolicy: DURATION }
+      table.claimAssignment(['topic'])
+      table.owe('topic', ID_A)
+      delete group.cache.topic
+      const revisions = CommittedOffsetRevisions.forCache(group.cache)
+      const stamp = revisions.capture('topic', 0)
+      expect(has(group.cache, 'topic')).toBe(false)
+
+      await expect(manager.resetByDuration({ topic: 'topic', partition: 0 })).resolves.toBe(true)
+
+      expect(coordinator.offsetCommit).toHaveBeenCalledTimes(1)
+      expect(group.cache.topic).toEqual({ 0: '9' })
+      expect(manager.heldOffsetAt('topic', 0)).toBe('9')
+      expect(manager.resetPositions.topic?.[0]).toBeUndefined()
+      expect(revisions.isCurrent('topic', 0, stamp)).toBe(false)
+      expect(table.isOwed('topic', 0)).toBe(false)
+      expect(group.ledger.openTickets).toBe(0)
+      expect(group.ledger.size()).toBe(0)
+      await manager.resolveOffsets()
+      expect(table.size()).toBe(0)
+      group.ledger.retireUnowned()
+      expect(group.cache.topic).toEqual({ 0: '9' })
+
+      table.claimAssignment([])
+      reassign(manager, {})
+      expect(has(group.cache, 'topic')).toBe(false)
+      expect(manager.heldOffsetAt('topic', 0)).toBeUndefined()
+    })
+
     test('a real topic recreation with held work leaves old captures stale and new work current', async () => {
       const harness = createConsumerHarness({ topicIds: { topic: ID_A } })
       const { group } = await harness.run({ topics: ['topic', 'other'] })
@@ -1084,8 +1305,14 @@ function createRealCluster() {
  * builds a real `ConsumerGroup` (the runner's network loop is stubbed), and `assign` installs a
  * real `OffsetManager` on it the way a sync does.
  */
-function createConsumerHarness({ topicIds = {} } = {}) {
-  const registry = GroupRegistry.forStores(new Map(), new Map())
+function createConsumerHarness({
+  topicIds = {},
+  groupless = false,
+  listed = [],
+  disconnect = async () => {},
+} = {}) {
+  const stores = { offsets: new Map(), operations: new Map() }
+  const registry = GroupRegistry.forStores(stores.offsets, stores.operations)
   const holder = {}
   const entry = () => registry.acquire(GROUP, holder)
   const instrumentationEmitter = new InstrumentationEventEmitter()
@@ -1093,15 +1320,28 @@ function createConsumerHarness({ topicIds = {} } = {}) {
   const cluster = {
     instrumentationEmitter,
     connect: async () => {},
-    disconnect: async () => {},
+    disconnect,
     metadata: async () => ({ topicMetadata: [] }),
+    stageMetadata: async ({ topics }) => ({
+      topicMetadata: topics.map((topic) => ({
+        topic,
+        partitionMetadata: [0, 1, 2].map((partitionId) => ({ partitionId })),
+      })),
+    }),
+    useConsumerMetadataScope: () => {},
+    refreshMetadata: async ({ onMetadata } = {}) =>
+      onMetadata?.({
+        topicMetadata: listed.map((topic) => ({
+          topic,
+          partitionMetadata: [{ partitionId: 0 }],
+        })),
+      }),
     addMultipleTargetTopics: async () => {},
     resetTargetTopics: async (names, { isCurrent, publish }) => {
-      if (isCurrent()) publish()
+      if (isCurrent()) publish?.()
       return true
     },
     releaseConsumerMetadataScope: () => {},
-    refreshMetadata: async () => {},
     refreshMetadataIfNecessary: async () => {},
     committedOffsets: () => entry().offsets,
     offsetOperations: () => entry().ledger,
@@ -1111,6 +1351,7 @@ function createConsumerHarness({ topicIds = {} } = {}) {
       instrumentationEmitter.addListener(CLUSTER_TOPIC_RECREATED, handler),
   }
   return {
+    stores,
     topicIds: ids,
     cache: () => entry().offsets,
     ledger: () => entry().ledger,
@@ -1121,6 +1362,17 @@ function createConsumerHarness({ topicIds = {} } = {}) {
       const ticket = ledger.begin([{ topic, partition: 0 }])
       entry().offsets[topic] = { ...entry().offsets[topic], 0: '1' }
       ledger.end(ticket)
+    },
+    /** @returns {object} a consumer built over the harness cluster, not yet running */
+    create() {
+      return createConsumer({
+        cluster,
+        ...(groupless ? {} : { groupId: GROUP }),
+        logger: newLogger(),
+        instrumentationEmitter,
+        metadataMaxAge: 300000,
+        retry: { retries: 0 },
+      })
     },
     async run({ topics = [], restart = null } = {}) {
       const start = jest.spyOn(Runner.prototype, 'start').mockResolvedValue()
