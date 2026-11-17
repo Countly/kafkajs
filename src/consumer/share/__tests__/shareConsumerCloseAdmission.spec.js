@@ -265,7 +265,7 @@ describe('share client admission while a close is in progress', () => {
   })
 
   test.each(['eachMessage', 'eachBatch'])(
-    'a %s handler awaiting connect during a natural close is refused and the close completes',
+    'an %s handler awaiting connect during a natural close is refused and the close completes',
     async (kind) => {
       const h = open()
       const seen = lifecycle(h)
