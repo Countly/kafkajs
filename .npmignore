@@ -5,6 +5,8 @@ coverage/
 __tests__
 __snapshots__
 fixtures
+src/protocol/requests/*/layout.json
+src/protocol/recordBatch/record/v0/decoderEquality.reference.json
 testHelpers/
 scripts/
 /otel/

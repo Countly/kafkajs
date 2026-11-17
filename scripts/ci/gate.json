@@ -20575,7 +20575,10 @@
         "testHelpers/__tests__/boundedReporterEvidence.spec.js \u203a bounded reporter evidence identity keeps the retained jar pin for telemetry-shutdown even with a valid churn receipt",
         "testHelpers/__tests__/boundedReporterEvidence.spec.js \u203a bounded reporter evidence identity preserves retained jar evidence for telemetry-reporter",
         "src/telemetry/__tests__/close.spec.js \u203a close codec waiter retention expired close cycles release codec waiters and captured close data before codec settlement",
-        "testHelpers/__tests__/boundedReporterEvidence.spec.js \u203a bounded reporter evidence identity preserves retained jar evidence for telemetry-shutdown"
+        "testHelpers/__tests__/boundedReporterEvidence.spec.js \u203a bounded reporter evidence identity preserves retained jar evidence for telemetry-shutdown",
+        "scripts/__tests__/assertCleanTarball.spec.js \u203a scripts/assertCleanTarball.sh spec-only JSON fails a tarball containing a layout.json",
+        "scripts/__tests__/assertCleanTarball.spec.js \u203a scripts/assertCleanTarball.sh spec-only JSON fails a tarball containing a .reference.json",
+        "scripts/__tests__/assertCleanTarball.spec.js \u203a scripts/assertCleanTarball.sh spec-only JSON passes a complete tarball without them"
       ],
       "capMinutes": 85,
       "allowedSkips": [
