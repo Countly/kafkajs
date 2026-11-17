@@ -1,0 +1,972 @@
+{
+  "schema": 3,
+  "acceptance": {
+    "profile": "final-soak-day",
+    "modes": {
+      "acceptance": {
+        "requestedMs": {
+          "value": 86400000,
+          "unit": "ms",
+          "source": "rule: the final long run lasts 24 hours from the readiness barrier"
+        },
+        "teardownAllowanceMs": {
+          "value": 900000,
+          "unit": "ms",
+          "source": "design: teardown allowance after the day ends, not a measured capacity"
+        }
+      },
+      "smoke": {
+        "requestedMs": {
+          "value": 1800000,
+          "unit": "ms",
+          "source": "design: one short pass of every shape that must prove timing feasibility before the day"
+        },
+        "teardownAllowanceMs": {
+          "value": 900000,
+          "unit": "ms",
+          "source": "design: teardown allowance after the smoke ends"
+        }
+      }
+    },
+    "archive": [
+      "scripts/soak/finalSoakMatrix.json",
+      "scripts/soak/finalSoakSchema.js",
+      "scripts/soak/finalSoak.js"
+    ],
+    "companions": ["natural-exit", "consume-retention", "prior-checkpoints"],
+    "cli": ["--expect-sha", "--expect-profile", "--matrix", "--companion rs-l14=<run url>"],
+    "verdicts": {
+      "day": ["PASS", "FAIL", "INCONCLUSIVE"],
+      "closure": ["COMPLETE", "OPEN"]
+    },
+    "limitations": [
+      "Structural validity is not row acceptance; every row predicate is computed independently by the verifier.",
+      "A smoke run is diagnostic only and closes no row.",
+      "One day on one host cannot prove indefinite bounded memory, every supported Kafka and Node pair, multi-host partitions or the compared consume benchmark.",
+      "The seeded control proves sensitivity to that seed only.",
+      "Performance results are report-only; no latency or throughput veto is created."
+    ]
+  },
+  "host": {
+    "platform": "linux",
+    "minMemAvailableBytes": {
+      "value": 12884901888,
+      "unit": "bytes",
+      "source": "design: post-cluster MemAvailable floor for the planned memory envelope"
+    },
+    "minFreeDiskBytes": {
+      "value": 214748364800,
+      "unit": "bytes",
+      "source": "design: post-cluster free disk covering the stream, telemetry, broker, archive, verifier and safety reservations"
+    },
+    "maxLoadAverage1m": {
+      "value": 3,
+      "unit": "load",
+      "source": "design: quiet-host preflight floor, 0.25 per core on 12 cores"
+    },
+    "abortMemAvailableBytes": {
+      "value": 4294967296,
+      "unit": "bytes",
+      "source": "design: MemAvailable below this aborts the run non-green"
+    },
+    "maxStreamBytes": {
+      "value": 64424509440,
+      "unit": "bytes",
+      "source": "design: raw stream cap; overflow fails collection, rows are never dropped"
+    },
+    "maxEventLineBytes": {
+      "value": 1024,
+      "unit": "bytes",
+      "source": "design: ordinary record line cap, enforced on every record"
+    },
+    "maxInventoryLineBytes": {
+      "value": 65536,
+      "unit": "bytes",
+      "source": "design: inventory chunk line cap"
+    },
+    "maxTelemetryBytes": {
+      "value": 1073741824,
+      "unit": "bytes",
+      "source": "design: combined raw and decoded telemetry reservation"
+    },
+    "brokerReporterFileBytes": {
+      "value": 134217728,
+      "unit": "bytes",
+      "source": "design: per-node telemetry reporter file cap, zero drops required"
+    }
+  },
+  "traffic": {
+    "valueBytes": {
+      "value": 256,
+      "unit": "bytes",
+      "source": "design: every offered value is exactly this long"
+    },
+    "maxOffers": {
+      "value": 1600000,
+      "unit": "records",
+      "source": "design: total offers cap including probes and aborted records"
+    },
+    "mainRate": {
+      "value": 20,
+      "unit": "records/s",
+      "source": "design: idempotent main offers per active second"
+    },
+    "telemetryProducerRate": {
+      "value": 0.2,
+      "unit": "records/s",
+      "source": "design: telemetry producer main offers per active second"
+    },
+    "transactionRecords": {
+      "value": 20,
+      "unit": "records",
+      "source": "design: records in each transaction"
+    },
+    "transactionEveryMs": {
+      "value": 100000,
+      "unit": "ms",
+      "source": "design: one transaction per 100 active seconds, never overlapping"
+    },
+    "abortEvery": {
+      "value": 10,
+      "unit": "transactions",
+      "source": "design: every tenth transaction is explicitly aborted"
+    },
+    "commitEvery": {
+      "value": 100,
+      "unit": "records",
+      "source": "design: explicit commit at least once per this many processed records and at every drain"
+    },
+    "metadataMaxAgeMs": {
+      "value": 5000,
+      "unit": "ms",
+      "source": "design: discovery clients refresh metadata within an auxiliary slot"
+    },
+    "telemetryPushMaxMs": {
+      "value": 60000,
+      "unit": "ms",
+      "source": "design: declared telemetry push interval ceiling"
+    },
+    "floors": {
+      "confirmedCommits": {
+        "value": 100,
+        "unit": "transactions",
+        "source": "design: confirmed committed transactions"
+      },
+      "confirmedAborts": {
+        "value": 10,
+        "unit": "transactions",
+        "source": "design: confirmed aborted transactions"
+      },
+      "visiblePerProducerKind": {
+        "value": 10000,
+        "unit": "records",
+        "source": "design: visible acknowledged records per producing kind"
+      },
+      "mainPerGroup": {
+        "value": 20001,
+        "unit": "ids",
+        "source": "design: distinct main ids processed by every ordinary group and accepted by share"
+      },
+      "transactionsPerGroup": {
+        "value": 10000,
+        "unit": "ids",
+        "source": "design: visible transaction ids processed by every ordinary group"
+      },
+      "auxiliaryPerIncarnation": {
+        "value": 10,
+        "unit": "ids",
+        "source": "design: probe ids per auxiliary topic incarnation"
+      },
+      "distinctOffsets": {
+        "value": 1000000,
+        "unit": "offsets",
+        "source": "design: distinct main offsets entered per measured process inside its quiet-bounded interval"
+      }
+    }
+  },
+  "clientKinds": {
+    "classic-eager-dynamic": {
+      "role": "consumer",
+      "protocol": "eager",
+      "static": false,
+      "grouped": true,
+      "telemetry": false,
+      "churn": true,
+      "inventory": "ordinary"
+    },
+    "classic-eager-static": {
+      "role": "consumer",
+      "protocol": "eager",
+      "static": true,
+      "grouped": true,
+      "telemetry": false,
+      "churn": true,
+      "inventory": "ordinary"
+    },
+    "classic-cooperative-dynamic": {
+      "role": "consumer",
+      "protocol": "cooperative",
+      "static": false,
+      "grouped": true,
+      "telemetry": false,
+      "churn": true,
+      "inventory": "ordinary"
+    },
+    "classic-cooperative-static": {
+      "role": "consumer",
+      "protocol": "cooperative",
+      "static": true,
+      "grouped": true,
+      "telemetry": false,
+      "churn": true,
+      "inventory": "ordinary"
+    },
+    "consumer-dynamic": {
+      "role": "consumer",
+      "protocol": "consumer",
+      "static": false,
+      "grouped": true,
+      "telemetry": false,
+      "churn": true,
+      "inventory": "ordinary"
+    },
+    "consumer-static": {
+      "role": "consumer",
+      "protocol": "consumer",
+      "static": true,
+      "grouped": true,
+      "telemetry": false,
+      "churn": true,
+      "inventory": "ordinary"
+    },
+    "share": {
+      "role": "share",
+      "protocol": "share",
+      "static": false,
+      "grouped": true,
+      "telemetry": false,
+      "churn": true,
+      "inventory": "share"
+    },
+    "producer-idempotent": {
+      "role": "producer",
+      "protocol": null,
+      "static": false,
+      "grouped": false,
+      "telemetry": false,
+      "churn": false,
+      "inventory": "none"
+    },
+    "producer-transactional": {
+      "role": "producer",
+      "protocol": null,
+      "static": false,
+      "grouped": false,
+      "telemetry": false,
+      "churn": false,
+      "inventory": "none"
+    },
+    "admin": {
+      "role": "admin",
+      "protocol": null,
+      "static": false,
+      "grouped": false,
+      "telemetry": false,
+      "churn": false,
+      "inventory": "none"
+    },
+    "telemetry-producer": {
+      "role": "producer",
+      "protocol": null,
+      "static": false,
+      "grouped": false,
+      "telemetry": true,
+      "churn": false,
+      "inventory": "none"
+    },
+    "telemetry-consumer": {
+      "role": "consumer",
+      "protocol": "eager",
+      "static": false,
+      "grouped": true,
+      "telemetry": true,
+      "churn": false,
+      "inventory": "ordinary"
+    }
+  },
+  "topology": {
+    "replicationFactor": 3,
+    "minInsyncReplicas": 2,
+    "autoCreateTopics": false,
+    "processes": {
+      "subject": 12,
+      "seed": 1,
+      "reader": 1,
+      "collector": 1,
+      "decoder": 1
+    },
+    "topics": [
+      {
+        "role": "main",
+        "partitions": 1,
+        "recreated": false,
+        "producers": ["producer-idempotent", "telemetry-producer"],
+        "recipients": [
+          "classic-eager-dynamic",
+          "classic-eager-static",
+          "classic-cooperative-dynamic",
+          "classic-cooperative-static",
+          "consumer-dynamic",
+          "consumer-static",
+          "telemetry-consumer",
+          "share"
+        ],
+        "seed": true
+      },
+      {
+        "role": "transactions",
+        "partitions": 1,
+        "recreated": false,
+        "producers": ["producer-transactional"],
+        "recipients": [
+          "classic-eager-dynamic",
+          "classic-eager-static",
+          "classic-cooperative-dynamic",
+          "classic-cooperative-static",
+          "consumer-dynamic",
+          "consumer-static",
+          "telemetry-consumer"
+        ],
+        "seed": false
+      },
+      {
+        "role": "regex",
+        "partitions": 2,
+        "recreated": false,
+        "producers": ["producer-idempotent"],
+        "recipients": [
+          "classic-eager-dynamic",
+          "classic-cooperative-dynamic",
+          "classic-cooperative-static",
+          "consumer-dynamic"
+        ],
+        "seed": false
+      },
+      {
+        "role": "recreate",
+        "partitions": 2,
+        "recreated": true,
+        "producers": ["producer-idempotent"],
+        "recipients": [
+          "classic-eager-dynamic",
+          "classic-eager-static",
+          "classic-cooperative-dynamic",
+          "classic-cooperative-static",
+          "consumer-dynamic",
+          "consumer-static",
+          "share"
+        ],
+        "seed": false
+      }
+    ],
+    "routeRule": "The verifier expands this table over the actual topic ids and partitions into every required (group, topic id, partition) route. A route starts at offset 0 on an empty log and seals only after producer closure, a terminal scan to the settled high watermark, handler drain and final broker commit or share acceptance; no route may start above the corpus, omit a partition, incarnation or static group, or end early."
+  },
+  "schedule": {
+    "hourMs": 3600000,
+    "shapes": [
+      "traffic",
+      "idle",
+      "regex-churn",
+      "topic-recreation",
+      "pause-resume",
+      "membership-churn",
+      "broker-outage"
+    ],
+    "activeMs": { "from": 0, "to": 3000000 },
+    "idleMs": { "from": 3000000, "to": 3600000 },
+    "auxiliaryDrainMs": { "from": 2760000, "to": 3000000 },
+    "quietAtMs": [3540000, 3550000, 3560000],
+    "quietDeadlineMs": 3590000,
+    "executions": [
+      {
+        "shape": "membership-churn",
+        "minutes": [2, 14, 26, 38],
+        "maxMs": 300000,
+        "waves": 3,
+        "waveMaxMs": 90000,
+        "pausesPerWave": 1
+      },
+      { "shape": "regex-churn", "minutes": [8, 20, 32, 44], "maxMs": 120000 },
+      { "shape": "topic-recreation", "minutes": [10, 34], "maxMs": 120000 },
+      { "shape": "broker-outage", "minutes": [22], "evenHoursOnly": true, "recoveredByMinute": 25 }
+    ],
+    "totals": {
+      "idleWindows": 24,
+      "regexExecutions": 96,
+      "recreations": 48,
+      "membershipExecutions": 96,
+      "pauseSequencesPerOrdinaryKind": 288,
+      "outages": 12,
+      "staticRestartsPerStaticKind": 24
+    },
+    "smoke": {
+      "requestedMs": 1800000,
+      "activeMs": { "from": 0, "to": 1200000 },
+      "idleMs": { "from": 1200000, "to": 1800000 },
+      "quietAtMs": [1740000, 1750000, 1760000],
+      "membershipAtMs": 120000,
+      "regexAtMs": 480000,
+      "recreationAtMs": 600000,
+      "outageAtMs": 720000,
+      "recoveredByMs": 900000,
+      "periodicSlots": 61,
+      "floors": {
+        "mainPerGroup": 100,
+        "visiblePerProducerKind": 10,
+        "confirmedCommits": 1,
+        "confirmedAborts": 1
+      }
+    }
+  },
+  "sampling": {
+    "periodMs": {
+      "value": 30000,
+      "unit": "ms",
+      "source": "symbol: scripts/soak/bounds.js#SAMPLE_MS"
+    },
+    "jitterMs": {
+      "value": 5000,
+      "unit": "ms",
+      "source": "design: periodic admission jitter around each slot target"
+    },
+    "periodicSlots": {
+      "value": 2881,
+      "unit": "samples/process",
+      "source": "design: slots k = 0..2880 over the 86 400 000 ms day at the sample period"
+    },
+    "warmupMs": {
+      "value": 420000,
+      "unit": "ms",
+      "source": "symbol: scripts/soak/longWindow.js#LONG_WINDOW.warmupMs"
+    },
+    "quietReadings": {
+      "value": 3,
+      "unit": "readings/boundary",
+      "source": "design: three matched quiet readings per idle boundary"
+    },
+    "gcCollections": {
+      "value": 2,
+      "unit": "collections/reading",
+      "source": "code: testHelpers/resourceProbe.js#settledHeap"
+    },
+    "gcGapMs": {
+      "value": 100,
+      "unit": "ms",
+      "source": "code: testHelpers/resourceProbe.js#GC_GAP_MS"
+    },
+    "roles": ["baseline", "periodic", "quiet", "closed", "final"],
+    "explicitResources": ["TCPSocketWrap", "Timeout"],
+    "flags": ["--expose-gc", "--no-flush-bytecode"]
+  },
+  "controls": {
+    "interning-seeded": {
+      "arm": "interning-seeded",
+      "clientKind": "classic-eager-dynamic",
+      "isolated": true,
+      "retains": "Map<partition:offset, offset string> of every offset the seed's handler enters",
+      "pattern": "code: scripts/benchmarks/consumeThroughput.js#interned",
+      "starts": "immediately after the seed's first quiet triplet",
+      "clears": "after its last quiet triplet and before disconnect",
+      "breachBytes": {
+        "value": 2097152,
+        "unit": "bytes",
+        "source": "symbol: scripts/soak/bounds.js#ENDPOINT_BYTES"
+      },
+      "exemption": "Excluded only from unseeded heap growth tests; still owes sampling, identity, resources, map clear and natural exit."
+    }
+  },
+  "recordSections": {
+    "process": ["queues", "requests", "sockets", "listeners", "resources", "scopes"],
+    "ordinary": [
+      "subscription",
+      "pause-state",
+      "assignment",
+      "membership-state",
+      "operation-cell",
+      "reset-debt",
+      "other-table"
+    ],
+    "share": ["share-state"]
+  },
+  "observations": {
+    "process": "child handshake and parent spawn receipt; parent at actual child exit",
+    "client": "factory return and public call begin and settlement",
+    "shape": "scheduler at actual execution boundaries; never proof by itself",
+    "topic": "admin actual result or metadata",
+    "route": "coordinator before the first offer and after terminal scan and drain",
+    "operation": "actual public call arguments and settlement; supervisor receipts for broker calls",
+    "subscription": "actual accepted subscription publication",
+    "boundary": "actual per-key apply, hooks and loss",
+    "round": "successful round after awaited hooks",
+    "seed": "actual seed map start and clear",
+    "broker-state": "supervisor process and container plus raw metadata and ISR",
+    "identity": "producer, independent reader, handler, commit and broker readback stages",
+    "scan": "independent completed sealed read_committed scan",
+    "replay": "observed retry, loss or revoke plus broker boundary",
+    "share-acquire": "decoded ShareFetch acquisition",
+    "share-settle": "actual acknowledgement request and result",
+    "telemetry": "independently decoded broker reporter bytes",
+    "sample": "process sampler at baseline, periodic, quiet, closed and final cuts",
+    "inventory": "passive weak observer synchronous cut before collection",
+    "ticket": "actual ledger begin and end",
+    "diagnostic": "free diagnostic note; contributes to no predicate"
+  },
+  "rows": [
+    {
+      "id": "rs-p10",
+      "obligation": "Soak harness records listener, socket, queue and handle counts and retained-heap trend after warm-up and GC, with a clean exit and no forced termination; idle, regex-topic churn, member churn and outage/recovery runs; repeated producer and consumer churn gates; the final long-run evidence or an explicit reviewed replacement for the 24-hour commitment (a short churn loop cannot count as that run); evidence as JSONL.",
+      "scope": {
+        "kinds": [
+          "classic-eager-dynamic",
+          "classic-eager-static",
+          "classic-cooperative-dynamic",
+          "classic-cooperative-static",
+          "consumer-dynamic",
+          "consumer-static",
+          "share",
+          "producer-idempotent",
+          "producer-transactional",
+          "admin",
+          "telemetry-producer",
+          "telemetry-consumer"
+        ],
+        "shapes": [
+          "traffic",
+          "idle",
+          "regex-churn",
+          "topic-recreation",
+          "pause-resume",
+          "membership-churn",
+          "broker-outage"
+        ],
+        "judged": "all 12 unseeded subject processes; the seed only for sensitivity"
+      },
+      "evidence": [
+        "process",
+        "client",
+        "shape",
+        "operation",
+        "topic",
+        "route",
+        "scan",
+        "identity",
+        "boundary",
+        "round",
+        "replay",
+        "share-acquire",
+        "share-settle",
+        "telemetry",
+        "sample",
+        "inventory",
+        "ticket",
+        "seed"
+      ],
+      "predicate": "day PASS iff Complete && Delivery && AuthorityOK && ResourcesOK && TablesOK && HeapOK(each of the 12 unseeded subject processes) && conclusive offset-retention sensitivity. Delivery: every offered id has exactly one final ack outcome; the independent read_committed log is unique by (topic id, partition, offset) and each log id was offered with equal key, value, headers and transaction; rejected or confirmed-aborted ids are absent, acknowledged or confirmed-committed ids appear exactly once, unknown produce ids appear at most once, an unresolved transaction decision is non-green. The verifier expands the topology table over actual topic ids and partitions into every required route, independent of the driver journal; journal routes equal that expansion, start at 0 and seal at the raw terminal scan; every expected route of every group, including all static groups and the telemetry consumer, has a non-empty visible set meeting its floor, every visible record has an authorized processed handler, ordinary groups have a final broker next reaching the route end and share accepts every visible record. Committed offsets never pass the processed prefix of visible data offsets; scan-proven control and aborted gaps may be crossed. closure COMPLETE only with verified prior-checkpoint dispositions and every required companion.",
+      "bounds": [
+        {
+          "name": "lost, substituted or duplicated durable records and unauthorized stale work",
+          "value": 0,
+          "unit": "records",
+          "source": "rule: no loss of acknowledged durable records; valid, exclusive ownership; fenced stale work; the stated allowed duplicate and replay set"
+        },
+        {
+          "name": "forced exits",
+          "value": 0,
+          "unit": "processes",
+          "source": "rule: a force-exited suite cannot certify clean shutdown; clean exit without force termination is asserted"
+        },
+        {
+          "name": "sample period",
+          "value": 30000,
+          "unit": "ms",
+          "source": "symbol: scripts/soak/bounds.js#SAMPLE_MS"
+        },
+        {
+          "name": "heap endpoint",
+          "value": 2097152,
+          "unit": "bytes",
+          "source": "symbol: scripts/soak/bounds.js#ENDPOINT_BYTES"
+        },
+        {
+          "name": "heap slope",
+          "value": 262144,
+          "unit": "bytes/min",
+          "source": "symbol: scripts/soak/bounds.js#SLOPE_BYTES_PER_MINUTE"
+        },
+        {
+          "name": "RSS, connected-live aggregate counts, p99 and projected growth",
+          "value": null,
+          "unit": "report-only",
+          "source": "rule: performance and uncalibrated aggregates are report-only; no calibrated ordinary-client ceiling exists",
+          "reportOnly": true
+        }
+      ],
+      "minima": [
+        { "name": "idle windows of 600 s", "value": 24 },
+        { "name": "regex executions", "value": 96 },
+        { "name": "recreations", "value": 48 },
+        { "name": "membership executions", "value": 96 },
+        { "name": "pause sequences per ordinary kind", "value": 288 },
+        { "name": "broker outages", "value": 12 },
+        { "name": "restarts per static kind", "value": 24 },
+        { "name": "periodic samples (16 x 2881)", "value": 46096 },
+        { "name": "subject and seed quiet readings (13 x 72)", "value": 936 },
+        { "name": "visible ids per producer kind", "value": 10000 }
+      ],
+      "fail": "One static group's routes, handlers and commits are removed while its labels stay.",
+      "pass": "A complete day with legal at-least-once replay, invisible aborted transactions, connected idle long polls and a separately breaching seed.",
+      "closure": ["prior-checkpoints", "natural-exit", "consume-retention"]
+    },
+    {
+      "id": "rs-t11",
+      "obligation": "Harness with retained-heap assertions, repeated producer and consumer churn gates and the final long run, or a reviewed replacement.",
+      "scope": {
+        "kinds": [
+          "classic-eager-dynamic",
+          "classic-eager-static",
+          "classic-cooperative-dynamic",
+          "classic-cooperative-static",
+          "consumer-dynamic",
+          "consumer-static",
+          "share",
+          "producer-idempotent",
+          "producer-transactional",
+          "admin",
+          "telemetry-producer",
+          "telemetry-consumer"
+        ],
+        "shapes": [
+          "traffic",
+          "idle",
+          "regex-churn",
+          "topic-recreation",
+          "pause-resume",
+          "membership-churn",
+          "broker-outage"
+        ],
+        "judged": "each of the 12 unseeded subject processes on its own series; seed and observer series never substitute"
+      },
+      "evidence": ["process", "client", "sample", "inventory", "shape", "operation"],
+      "predicate": "PASS iff Complete's time, sample and topology checks hold, every required subject slot has its own standing process, each has 24 post-warm-up matched quiet triplets with two new forced collections per reading, and every subject passes HeapOK: Y[h] = median of the three heapUsed readings at boundary h, X[h] = median of their completedAt in minutes, endpoint = median(Y[21..23]) - median(Y[0..2]) <= endpoint bound and the least-squares slope of Y over X <= slope bound. Medians of an even count take the upper middle. Full closure keeps the repeated-gate receipts.",
+      "bounds": [
+        {
+          "name": "heap endpoint",
+          "value": 2097152,
+          "unit": "bytes",
+          "source": "symbol: scripts/soak/bounds.js#ENDPOINT_BYTES"
+        },
+        {
+          "name": "heap slope",
+          "value": 262144,
+          "unit": "bytes/min",
+          "source": "symbol: scripts/soak/bounds.js#SLOPE_BYTES_PER_MINUTE"
+        },
+        {
+          "name": "warm-up before the first quiet triplet",
+          "value": 420000,
+          "unit": "ms",
+          "source": "symbol: scripts/soak/longWindow.js#LONG_WINDOW.warmupMs"
+        },
+        {
+          "name": "RSS, external memory and projected growth",
+          "value": null,
+          "unit": "report-only",
+          "source": "rule: the heap bounds are a screen; projection and RSS are reported, never gated",
+          "reportOnly": true
+        }
+      ],
+      "minima": [
+        { "name": "quiet readings per subject process (24 x 3)", "value": 72 },
+        { "name": "subject quiet readings (12 x 72)", "value": 864 },
+        { "name": "forced collections for subject quiet readings", "value": 1728 }
+      ],
+      "fail": "The admin process has only active samples, or the seed series is used as consumer-dynamic's series.",
+      "pass": "Each subject plateaus within +1.5 MiB with a permissible signed slope while the seed grows above 2 MiB; a pass means the screen passed, not indefinite boundedness.",
+      "closure": ["prior-checkpoints"]
+    },
+    {
+      "id": "rs-g07",
+      "obligation": "Soak harness asserting listener, socket, queue and handle counts with clean exit and no forced termination; idle, regex-topic churn, member churn and outage/recovery runs; evidence as JSONL.",
+      "scope": {
+        "kinds": [
+          "classic-eager-dynamic",
+          "classic-eager-static",
+          "classic-cooperative-dynamic",
+          "classic-cooperative-static",
+          "consumer-dynamic",
+          "consumer-static",
+          "share",
+          "producer-idempotent",
+          "producer-transactional",
+          "admin",
+          "telemetry-producer",
+          "telemetry-consumer"
+        ],
+        "shapes": ["idle", "regex-churn", "membership-churn", "broker-outage"],
+        "judged": "every persistent process and client, connected idle distinct from closed and final"
+      },
+      "evidence": ["process", "client", "sample", "inventory", "ticket", "operation", "shape"],
+      "predicate": "PASS iff the relevant Complete schedule and grid hold and ResourcesOK: all queue and request counts reconcile with observable original owners; raw resource, listener and socket ids have actual owners or declared baseline harness scopes; no retired run or client admits new work; persistent registrations equal baseline owner registrations plus those of currently live operations; a closed cohort within the socket grace after disconnect has empty original queues, destroyed sockets, no product timers and restored registrations, excluding standing peers; after all disconnects queues, ledger cells, tickets, reset debts and share state are 0, created minus destroyed sockets is 0, TCPSocketWrap and Timeout equal the preconstruction baseline, and every process and the supervisor exit with code 0 and no signal, naturally observed. Connected aggregate totals are reported, not forced to 0 or equality.",
+      "bounds": [
+        {
+          "name": "disconnected queue, ledger and debt sizes; socket balance; listener and resource restoration",
+          "value": 0,
+          "unit": "entries",
+          "source": "code: scripts/soak/bounds.js#quietViolations"
+        },
+        {
+          "name": "socket grace after disconnect",
+          "value": 5000,
+          "unit": "ms",
+          "source": "symbol: scripts/soak/consumerChurn.js#CONSUMER_CHURN.socketGraceMs"
+        },
+        {
+          "name": "connected idle queue, socket and timer totals",
+          "value": null,
+          "unit": "report-only",
+          "source": "rule: connected consumers legitimately hold long-poll requests, heartbeats and telemetry timers; no calibrated connected-idle ceiling exists",
+          "reportOnly": true
+        }
+      ],
+      "minima": [
+        { "name": "periodic samples", "value": 46096 },
+        { "name": "subject and seed quiet readings", "value": 936 },
+        { "name": "closed-cohort cuts (96 x 7 churn kinds)", "value": 672 }
+      ],
+      "fail": "A detached extra's request or timer survives closure while a standing member still polls.",
+      "pass": "A standing idle Fetch in flight plus legitimate heartbeat and telemetry timers; every retired owner clears, the final baseline is restored and every process exits naturally.",
+      "closure": ["natural-exit"]
+    },
+    {
+      "id": "rs-l14",
+      "obligation": "Suite exits without forceExit; --detectOpenHandles clean; original teardown error absent or root-caused.",
+      "scope": {
+        "kinds": ["classic-eager-static", "classic-cooperative-static", "consumer-static"],
+        "shapes": ["membership-churn", "broker-outage", "idle"],
+        "judged": "the three static kinds and their extras, plus the exact-candidate natural-exit suite companion"
+      },
+      "evidence": [
+        "process",
+        "client",
+        "operation",
+        "boundary",
+        "round",
+        "identity",
+        "sample",
+        "inventory"
+      ],
+      "predicate": "day PASS iff each static kind has >= 24 real restart pairs with the same static id, a new actual client id and no concurrent duplicate static id, each followed by actual assignment, handler and broker commit; ResourcesOK holds for every cohort and process; disconnect < final sample < parent-observed exit. closure COMPLETE iff day PASS and the natural-exit companion is valid for the exact candidate: run attempt, Node 22, 24 and 26 coverage, ordinary, static, classic and consumer test identities, enforced open-handle detection, original teardown logs absent or root-caused, and a seeded retained timer or socket failing its watchdog.",
+      "bounds": [
+        {
+          "name": "forced exits",
+          "value": 0,
+          "unit": "processes",
+          "source": "rule: a force-exited suite cannot certify clean shutdown; clean exit without force termination is asserted"
+        },
+        {
+          "name": "static restarts per kind",
+          "value": 24,
+          "unit": "restarts",
+          "source": "design: one restart per hour per static kind"
+        },
+        {
+          "name": "RSS and p99",
+          "value": null,
+          "unit": "report-only",
+          "source": "rule: performance results are report-only",
+          "reportOnly": true
+        }
+      ],
+      "minima": [
+        { "name": "restart pairs (3 x 24)", "value": 72 },
+        { "name": "closed cuts per static kind", "value": 96 },
+        { "name": "static final readings and exits", "value": 3 }
+      ],
+      "fail": "Worker exit 0 with a missing, wrong-candidate or force-exited suite receipt.",
+      "pass": "The broker retains the static slot during a same-id restart, resources ultimately close and the suite receipt is valid.",
+      "closure": ["natural-exit"]
+    },
+    {
+      "id": "rs-l15",
+      "obligation": "Longer run or histogram with enough samples; denominators pre-declared; tolerance not widened. Actual delivery-gap samples.",
+      "scope": {
+        "kinds": [
+          "producer-idempotent",
+          "classic-eager-dynamic",
+          "classic-cooperative-dynamic",
+          "consumer-dynamic",
+          "share"
+        ],
+        "shapes": ["traffic"],
+        "judged": "four consuming kinds, each paired with the idempotent producer on main"
+      },
+      "evidence": ["identity", "client", "shape"],
+      "predicate": "For each of the four consuming kinds: latency[i] = first authorized handler-enter at in its group for main id i minus the idempotent offered at; require >= 20 000 distinct ids and no negative latency. Gaps are consecutive actual handler-entry time differences on one client and run within one active phase and owner episode; cross-idle and boundary gaps are excluded and counted; require >= 20 000 actual gaps, so >= 20 001 eligible entries. Report entry counts, exclusions, histograms and p50/p90/p99 with percentile(p) = sorted[ceil(p*n)-1], never as a veto.",
+      "bounds": [
+        {
+          "name": "latency samples per kind",
+          "value": 20000,
+          "unit": "ids",
+          "source": "symbol: scripts/soak/soak.js#CHURN.minLatencySamples"
+        },
+        {
+          "name": "handler entries for 20 000 gaps per kind",
+          "value": 20001,
+          "unit": "entries",
+          "source": "symbol: scripts/soak/consumerChurn.js#CONSUMER_CHURN.minGaps"
+        },
+        {
+          "name": "latency and gap percentiles",
+          "value": null,
+          "unit": "report-only",
+          "source": "rule: performance results are report-only; no tolerance is reinstated or widened",
+          "reportOnly": true
+        }
+      ],
+      "minima": [
+        { "name": "latency observations (4 x 20 000)", "value": 80000 },
+        { "name": "gaps (4 x 20 000)", "value": 80000 }
+      ],
+      "fail": "One group supplies all 80 000 samples, or 20 000 entries are counted as 20 000 gaps.",
+      "pass": "First-handler latency once per id, replay identified separately, actual gap floors met; a slow p99 is reported without an invented threshold.",
+      "closure": []
+    },
+    {
+      "id": "rs-l16",
+      "obligation": "Retained-heap result in the consume benchmark that fails when the interning returns.",
+      "scope": {
+        "kinds": ["classic-eager-dynamic", "consumer-dynamic", "share"],
+        "shapes": ["traffic", "idle"],
+        "judged": "the unseeded eager-dynamic, consumer-dynamic and share processes and the isolated seed, on main"
+      },
+      "evidence": ["identity", "scan", "sample", "seed", "process", "client"],
+      "predicate": "For p in {eager-dynamic, consumer-dynamic, share, seed}: V[p] = distinct main offsets actually entered in p between its first quiet triplet completion and its last quiet triplet admission; require |V[p]| >= 1 000 000 from the same main corpus and method. The seed's HeapOK endpoint must exceed the breach bound; every unseeded process passes HeapOK. A missing, under-volume or under-bound seed is INCONCLUSIVE, never PASS; a seed breach never fails an unseeded memory row. closure COMPLETE also needs the consume-retention companion with the candidate and reference retained and control report; otherwise the row stays OPEN.",
+      "bounds": [
+        {
+          "name": "distinct offsets per measured process",
+          "value": 1000000,
+          "unit": "offsets",
+          "source": "design: 23 x 50 x 60 x 20 = 1 380 000 potential offsets leave headroom above this floor"
+        },
+        {
+          "name": "seed breach",
+          "value": 2097152,
+          "unit": "bytes",
+          "source": "symbol: scripts/soak/bounds.js#ENDPOINT_BYTES"
+        },
+        {
+          "name": "heap slope",
+          "value": 262144,
+          "unit": "bytes/min",
+          "source": "symbol: scripts/soak/bounds.js#SLOPE_BYTES_PER_MINUTE"
+        }
+      ],
+      "minima": [
+        { "name": "distinct offsets per measured process", "value": 1000000 },
+        { "name": "quiet readings per measured process", "value": 72 }
+      ],
+      "fail": "A million callbacks on one offset; distincts only before baseline; the right seed name in the wrong process; healthy subjects with a blind seed.",
+      "pass": "Healthy subjects, exact interval volume, an isolated breaching seed through its last quiet reading, then clear and natural exit.",
+      "closure": ["consume-retention"]
+    },
+    {
+      "id": "rs-l22",
+      "obligation": "Harness, then the consumer churn gate (regex topic churn, pause/resume, recreation) asserts bounded paused and generation set sizes, then the final long run.",
+      "scope": {
+        "kinds": [
+          "classic-eager-dynamic",
+          "classic-eager-static",
+          "classic-cooperative-dynamic",
+          "classic-cooperative-static",
+          "consumer-dynamic",
+          "consumer-static"
+        ],
+        "shapes": ["regex-churn", "pause-resume", "topic-recreation", "membership-churn", "idle"],
+        "judged": "regex on eager-dynamic, cooperative-dynamic, cooperative-static and consumer-dynamic; pause and recreation on all six ordinary kinds"
+      },
+      "evidence": [
+        "subscription",
+        "operation",
+        "inventory",
+        "ticket",
+        "boundary",
+        "round",
+        "topic",
+        "sample"
+      ],
+      "predicate": "PASS iff the applicable Complete executions hold and TablesOK: every pause-state, including empty, resumed-only and pauseAll entries, keeps its first observed origin topic id and subscription lifetime, which stays accepted and live; pauseAll, paused and resumed equal a replay of the actual API operations; unassignment does not end an accepted lifetime; retired state ids are absent, never relabelled to a new topic id; assigned paused keys admit no new handler until resume; reassignment within one accepted lifetime keeps pause intent. Each regex execution accepts the add and the retire on each required client; each recreation retires the old intent and witnesses a distinct new one; every actual backing key of every table has a permitted live owner at every stable cut.",
+      "bounds": [
+        {
+          "name": "retained keys without a live accepted owner",
+          "value": 0,
+          "unit": "keys",
+          "source": "code: src/consumer/subscriptionState.js#retireTopic"
+        },
+        {
+          "name": "unit regression evidence",
+          "value": 0,
+          "unit": "failures",
+          "source": "code: src/consumer/__tests__/pauseLifecycle.spec.js#retireTopic"
+        }
+      ],
+      "minima": [
+        { "name": "regex accepted add and retire pairs (96 x 4)", "value": 384 },
+        { "name": "recreation observations (48 x 6)", "value": 288 },
+        { "name": "pause sequences (288 x 6)", "value": 1728 },
+        { "name": "quiet readings of regex processes (4 x 72)", "value": 288 }
+      ],
+      "fail": "Old-incarnation state persists after the new incarnation is accepted, even empty or resumed-only; a removed client subscription saved by another member's live route; an equal-size stale replacement.",
+      "pass": "A paused unassigned partition within one accepted lifetime survives and reapplies; true retirement removes it; a new pause on the new incarnation gets a new origin and state identity.",
+      "closure": ["prior-checkpoints"]
+    },
+    {
+      "id": "rs-l24",
+      "obligation": "Retained-heap trend after warm-up and GC across cooperative rounds measured by the harness and the churn gates; slope and cause established or recorded as bounded; final long run.",
+      "scope": {
+        "kinds": ["classic-cooperative-dynamic", "classic-cooperative-static"],
+        "shapes": ["membership-churn", "regex-churn", "topic-recreation", "idle"],
+        "judged": "the cooperative-dynamic and cooperative-static processes, each independently"
+      },
+      "evidence": ["round", "boundary", "operation", "sample", "inventory", "client"],
+      "predicate": "For each cooperative kind: R = distinct successful (group, run, round) inside its membership executions with negotiated cooperative protocol and corroborated partition transfer; require >= 1 such round in each of the 96 executions and >= 96 in total; its process passes HeapOK, TablesOK and AuthorityOK. PASS iff both kinds satisfy this independently and the quiet grid is complete. A positive slope within the screen prints 'positive within declared screen; long-run boundedness not proven'.",
+      "bounds": [
+        {
+          "name": "heap endpoint",
+          "value": 2097152,
+          "unit": "bytes",
+          "source": "symbol: scripts/soak/bounds.js#ENDPOINT_BYTES"
+        },
+        {
+          "name": "heap slope",
+          "value": 262144,
+          "unit": "bytes/min",
+          "source": "symbol: scripts/soak/bounds.js#SLOPE_BYTES_PER_MINUTE"
+        },
+        {
+          "name": "transferring executions per cooperative kind",
+          "value": 96,
+          "unit": "executions",
+          "source": "design: four membership executions per hour"
+        }
+      ],
+      "minima": [
+        { "name": "transferring executions per kind", "value": 96 },
+        { "name": "combined transferring executions", "value": 192 },
+        { "name": "quiet readings (2 x 72)", "value": 144 }
+      ],
+      "fail": "Both names present but only eager members acted, or equal-count stale cooperative keys.",
+      "pass": "Actual cooperative transfers, proper lifetimes including legitimate unassigned pause, a screen-bounded plateau and natural exit.",
+      "closure": ["prior-checkpoints"]
+    }
+  ]
+}
