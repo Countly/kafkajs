@@ -80,6 +80,30 @@ const outcomeOf = (promise) =>
   )
 
 /**
+ * Whether a producer's own cluster has dropped a stopped broker: every live broker's metadata for
+ * `topics` leaves it out, and a refresh of `cluster` then leaves it out of the broker table. Another
+ * client's view proves neither, so a case polls this before it relies on the stopped broker being
+ * gone from the producer's lookups. A failed lookup or refresh reads as not yet.
+ * @param {import('../../../cluster')} cluster the producer's cluster
+ * @param {{ nodeId: number, live: number[], topics: string[] }} options the stopped node, the
+ *   live nodes, and topics whose partitions all have a leader
+ * @returns {Promise<boolean>}
+ */
+const droppedFrom = async (cluster, { nodeId, live, topics }) => {
+  try {
+    for (const liveId of live) {
+      const broker = await cluster.findBroker({ nodeId: liveId })
+      const { brokers } = await broker.metadata(topics)
+      if (brokers.some((named) => named.nodeId === nodeId)) return false
+    }
+    await cluster.refreshMetadata()
+    return !cluster.hasNode(nodeId)
+  } catch (e) {
+    return false
+  }
+}
+
+/**
  * What a producer that a fencing or identity outcome armed answers to more work: the same armed
  * error object from `transaction()`, `flush()` and `connect()`, which never revive it.
  * @param {object} producer a connected producer
@@ -165,4 +189,10 @@ const crashAfterProduce = ({ topic, transactionalId, records, deadlineMs, track 
     })
   })
 
-module.exports = { armedPermanence, settledTransactionVersion, outcomeOf, crashAfterProduce }
+module.exports = {
+  armedPermanence,
+  crashAfterProduce,
+  droppedFrom,
+  outcomeOf,
+  settledTransactionVersion,
+}

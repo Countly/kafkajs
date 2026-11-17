@@ -36,7 +36,8 @@ const CATEGORY_CLASSES = [
 
 /**
  * @param {Error} error
- * @returns {boolean} whether `error` is an instance of one of the five category classes
+ * @returns {boolean} whether `error` is an instance of one of the category classes
+ *   (`CATEGORY_CLASSES`)
  */
 const isCategoryClass = (error) =>
   CATEGORY_CLASSES.some((ErrorClass) => error instanceof ErrorClass)
@@ -73,8 +74,8 @@ const ownCategory = (error) =>
  * the caller sees the same object, with the same `name`, prototype and fields, plus the category
  * the request implies. Nothing is re-wrapped.
  *
- * - The five category classes keep their own category; in particular a `KafkaJSDeliveryTimeout`
- *   is never restamped from the error it gave up on.
+ * - The category classes (`CATEGORY_CLASSES`) keep their own category; in particular a
+ *   `KafkaJSDeliveryTimeout` is never restamped from the error it gave up on.
  * - The Kafka code is read from the error, or from the first `cause` that carries one.
  * - DUPLICATE_SEQUENCE_NUMBER on Produce answers `{ category: null, duplicate: true }`: the broker
  *   already has the batch, so the send succeeded and nothing is stamped.
@@ -138,7 +139,7 @@ const spentRetries = (error) =>
  * TRANSACTIONAL_ID_AUTHORIZATION_FAILED, and abortable otherwise: the transaction is missing the
  * failed request's records either way. The caller still sees the error's own category.
  *
- * An instance of one of the five category classes is decided by what it is, so a
+ * An instance of one of the category classes (`CATEGORY_CLASSES`) is decided by what it is, so a
  * `KafkaJSApplicationRecoverableError` is fatal whatever its causes say. The retrier wraps a
  * non-retriable error in a `KafkaJSNonRetriableError` whose cause is the wrapped error's own cause
  * (`cause: e.cause || e`): that hides the wrapped error's class, and on a second wrap the
@@ -147,7 +148,8 @@ const spentRetries = (error) =>
  * FATAL_ERROR whatever its cause. Arm the error as thrown, before any retrier wrap, when its
  * class has to count.
  * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/TransactionManager.java
- * @param {Error} error an error `classify` has seen, or one of the five category classes
+ * @param {Error} error an error `classify` has seen, or one of the category classes
+ *   (`CATEGORY_CLASSES`)
  * @returns {'ABORTABLE_ERROR'|'FATAL_ERROR'}
  */
 const transactionStateFor = (error) => {

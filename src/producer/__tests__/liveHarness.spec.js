@@ -62,6 +62,7 @@ const {
 const { bufferedProducer, deferred, watch } = require('./fixtures/bufferHarness')
 const { createFakeCluster } = require('./fixtures/fakeCluster')
 const { heartbeatInBatch } = require('./fixtures/memberHeartbeat')
+const { droppedFrom } = require('./fixtures/liveTransactions')
 const {
   FrameLog,
   ResponseDrop,
@@ -3285,7 +3286,11 @@ describe('Producer > the live scenarios harness', () => {
 
       /** The transaction feature setup over a version read the test controls. */
       const transactionSetup = (settledTransactionVersion) => {
-        const prototype = { initProducerId: async () => {}, endTxn: async () => {} }
+        const prototype = {
+          initProducerId: async () => {},
+          endTxn: async () => {},
+          findGroupCoordinator: async () => {},
+        }
         return {
           prototype,
           ...setupOf('transactionRestartLive', 'FEATURE_HOOK_BUDGET_MS', {
@@ -3322,12 +3327,13 @@ describe('Producer > the live scenarios harness', () => {
 
       test('a transaction feature setup that answers in time installs its spies and leaves the run clean', async () => {
         const { hook, prototype } = transactionSetup(async () => ({ version: 1 }))
-        const { initProducerId, endTxn } = prototype
+        const { initProducerId, endTxn, findGroupCoordinator } = prototype
 
         await hook()
 
         expect(prototype.initProducerId).not.toBe(initProducerId)
         expect(prototype.endTxn).not.toBe(endTxn)
+        expect(prototype.findGroupCoordinator).not.toBe(findGroupCoordinator)
         expect(liveRun.tainted).toBe(false)
       })
     })
@@ -3430,6 +3436,77 @@ describe('Producer > the live scenarios harness', () => {
         await expect(retryCoordinator(owner.signal, op, budget)).rejects.toThrow('case over')
         expect(op).toHaveBeenCalledTimes(1)
       })
+    })
+  })
+
+  describe('droppedFrom', () => {
+    const OPTIONS = { nodeId: 3, live: [1, 2], topics: ['t'] }
+
+    /**
+     * A producer cluster whose live brokers answer metadata naming `views[nodeId]`, and whose own
+     * broker table is the next of `tables` after each refresh.
+     * @param {{ views: Record<number, number[]>, tables: number[][] }} setup
+     */
+    const producerCluster = ({ views, tables }) => {
+      let table = [1, 2, 3]
+      const brokers = Object.fromEntries(
+        Object.entries(views).map(([nodeId, named]) => [
+          nodeId,
+          { metadata: jest.fn(async () => ({ brokers: named.map((id) => ({ nodeId: id })) })) },
+        ])
+      )
+      return {
+        brokers,
+        findBroker: jest.fn(async ({ nodeId }) => brokers[nodeId]),
+        refreshMetadata: jest.fn(async () => {
+          table = tables.shift() ?? table
+        }),
+        hasNode: (nodeId) => table.includes(nodeId),
+      }
+    }
+
+    test('waits for the producer cluster to drop the broker, not for the live brokers alone', async () => {
+      const cluster = producerCluster({
+        views: { 1: [1, 2], 2: [1, 2] },
+        tables: [
+          [1, 2, 3],
+          [1, 2, 3],
+          [1, 2],
+        ],
+      })
+
+      await expect(droppedFrom(cluster, OPTIONS)).resolves.toBe(false)
+      const dropped = await waitForCondition(() => droppedFrom(cluster, OPTIONS), {
+        attempts: 5,
+        delay: 0,
+      })
+
+      expect(dropped).toBe(true)
+      expect(cluster.refreshMetadata).toHaveBeenCalledTimes(3)
+      expect(cluster.brokers[1].metadata).toHaveBeenCalledWith(['t'])
+      expect(cluster.brokers[2].metadata).toHaveBeenCalledTimes(3)
+    })
+
+    test('is false while a live broker still names the stopped one, and refreshes nothing', async () => {
+      const cluster = producerCluster({ views: { 1: [1, 2], 2: [1, 2, 3] }, tables: [[1, 2]] })
+
+      await expect(droppedFrom(cluster, OPTIONS)).resolves.toBe(false)
+
+      expect(cluster.refreshMetadata).not.toHaveBeenCalled()
+      expect(cluster.hasNode(3)).toBe(true)
+    })
+
+    test('reads a failed lookup or refresh as not yet', async () => {
+      const lookup = producerCluster({ views: { 1: [1, 2], 2: [1, 2] }, tables: [[1, 2]] })
+      lookup.findBroker.mockRejectedValueOnce(new KafkaJSConnectionError('refused'))
+      const refresh = producerCluster({ views: { 1: [1, 2], 2: [1, 2] }, tables: [[1, 2]] })
+      refresh.refreshMetadata.mockRejectedValueOnce(new KafkaJSConnectionError('refused'))
+
+      await expect(droppedFrom(lookup, OPTIONS)).resolves.toBe(false)
+      await expect(droppedFrom(refresh, OPTIONS)).resolves.toBe(false)
+
+      expect(lookup.refreshMetadata).not.toHaveBeenCalled()
+      await expect(droppedFrom(lookup, OPTIONS)).resolves.toBe(true)
     })
   })
 

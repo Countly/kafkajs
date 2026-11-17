@@ -7,6 +7,10 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 ### Final audit fixes
 
+#### Behavior changes
+
+- A transactional producer whose coordinator cannot be found no longer becomes unusable: `commit()` rejects with a retriable error whose `cause` is the discovery error and can be called again, `abort()` resolves (the epoch bump stays owed if it could not run), producer-id initialization can be retried, and offset or partition registration makes the transaction abort-only. Authorization and fencing errors stay fatal, and a fatal error armed while an `abort()` waits rejects that `abort()`.
+
 #### Tooling
 
 - The benchmark report keeps raw observations and controls per row, labels each row valid, inconclusive, invalid, error or omitted, and compares round-robin, uniform sticky and adaptive partitioning on a healthy and a slow-broker cluster.
