@@ -26,6 +26,8 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 - The decoder performance gate accepts a non-frame row that is inconclusive only from runner noise when its median is within 5 %, and lists such rows with their reason in the job summary.
 - The published package no longer contains test layout and reference JSON files.
 - The pack smoke test can check a supplied tarball without repacking it, and the OTel package has its own clean-tarball guard and packed install test.
+- The adaptive-partitioner comparison counts buffer refusals apart from partitioned sends, drains the slow-broker scenario until every send settles, warms up before delaying the slow broker, and runs 24 healthy rounds. Every comparison row shows each arm's delivered, rejected, refused and unsettled sends, invalid rows included.
+- `scripts/benchmarks/report.js --only <name>[,<name>…]` runs just the named manifest rows and lists the rest as `not selected`; the Benchmarks workflow takes them as its optional `rows` input (empty runs every row).
 
 ### Phase 10 — Release, CI and benchmarks
 
