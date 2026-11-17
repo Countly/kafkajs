@@ -1564,7 +1564,7 @@ const validateProvenance = (json, kind) => {
  * and clients, open executions and inventory cuts, and the stream digest. It never holds the
  * stream. Checks: exact record types; `recordId` = `<source>.<seq>` with gap-free per-source
  * `seq` from 0; `at <= t`, `t` non-decreasing, per-source `at` non-decreasing, `t` within the
- * observed window; no record from an exited process; clients constructed in a started process as
+ * observed window; processes on the header's boot and Node; no record from an exited process; clients constructed in a started process as
  * their config slot says, never reusing an id; seed records only from the isolated seed's control
  * client; telemetry only from telemetry-enabled clients; executions opened once and closed with
  * their operation count; inventory cuts complete in every chunk and required section before the
@@ -1696,6 +1696,9 @@ class StreamValidator {
     if (!this.allowedSources.has(r.process) || r.process === OUTER)
       return this.fail('process is not a config process')
     if (this.processes.has(r.process)) this.fail('process starts twice')
+    if (r.bootId !== this.header.clock.bootId || r.node !== this.header.node) {
+      this.fail('process bootId or node differs from the header')
+    }
     this.processes.set(r.process, 'live')
   }
 
