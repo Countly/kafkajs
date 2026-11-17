@@ -994,28 +994,58 @@ const countByType = (types) => {
 }
 
 /**
- * Bounds the private offset state each regex pass sampled while its members ran: every expected
- * group has a final sample, and every sample settled, read present stores and stays within the live
- * topics (stamp topics, cache keys) and live partitions (stamp cells) the workload kept. The
- * expected groups come from the plan, never from the rows.
+ * The regex workload's shape: one control topic beside at most `window` rotating topics, and a
+ * periodic offset-state sample after every `sampleEvery` rotating deletions.
+ */
+const REGEX_ROTATION = Object.freeze({
+  controlPartitions: 6,
+  partitions: 3,
+  window: 3,
+  sampleEvery: 5,
+})
+
+/**
+ * Bounds the private offset state each regex pass sampled while its members ran. Every expected
+ * group has one final sample at the pass's deletion count and one periodic sample at each multiple
+ * of `sampleEvery` up to it; every sample settled, read present stores and stays within the live
+ * topics (stamp topics, cache keys) and live partitions (stamp cells). The expected groups come
+ * from the plan, the deletion counts from the workload's `regex-rotation` records and the live
+ * denominators must fit `shape`, never taken from the rows alone.
  * @param {object[]} rows the run's `offset-state` rows
  * @param {object} expected
  * @param {string[]} expected.passes the warm-up passes and phases that ran the regex workload
  * @param {(phase: string) => string[]} expected.groupsOf the group ids a pass's members joined
+ * @param {(phase: string) => number|undefined} expected.deletionsOf the rotating topics a pass
+ *   deleted while its members ran; undefined when the pass recorded none
+ * @param {typeof REGEX_ROTATION} [expected.shape=REGEX_ROTATION]
  * @returns {string[]} one violation per defect; empty when every bound holds
  */
-const offsetStateViolations = (rows, { passes, groupsOf }) => {
+const offsetStateViolations = (rows, { passes, groupsOf, deletionsOf, shape = REGEX_ROTATION }) => {
   const count = (value) => Number.isSafeInteger(value) && value >= 0
+  const violations = []
   const expected = new Map()
   for (const phase of passes) {
-    for (const group of groupsOf(phase)) expected.set(`${phase}|${group}`, { phase, group })
+    const deletions = deletionsOf(phase)
+    if (!count(deletions)) violations.push(`regex pass ${phase}: no rotation record`)
+    for (const group of groupsOf(phase))
+      expected.set(`${phase}|${group}`, {
+        phase,
+        group,
+        deletions: count(deletions) ? deletions : undefined,
+      })
   }
-  const finals = new Set()
-  const violations = []
+  const seen = new Set()
+  const fits = ({ checkpoint }, live) =>
+    count(live?.topics) &&
+    live.topics >= 1 &&
+    live.topics <= 1 + shape.window &&
+    (checkpoint === 'final' || live.topics === 1 + shape.window) &&
+    live.partitions === shape.controlPartitions + shape.partitions * (live.topics - 1)
   for (const row of rows) {
     const where = `offset state of ${row?.group} in ${row?.phase} (${row?.checkpoint})`
     const key = `${row?.phase}|${row?.group}`
-    if (!expected.has(key)) {
+    const pass = expected.get(key)
+    if (!pass) {
       violations.push(`${where}: unexpected group or phase`)
       continue
     }
@@ -1023,7 +1053,23 @@ const offsetStateViolations = (rows, { passes, groupsOf }) => {
       violations.push(`${where}: unknown checkpoint`)
       continue
     }
-    if (row.checkpoint === 'final') finals.add(key)
+    const at = row.deletions
+    const due =
+      row.checkpoint === 'final'
+        ? pass.deletions === undefined || at === pass.deletions
+        : at > 0 &&
+          at % shape.sampleEvery === 0 &&
+          (pass.deletions === undefined || at <= pass.deletions)
+    if (!count(at) || !due) {
+      violations.push(`${where}: unexpected checkpoint at ${at} deletions`)
+      continue
+    }
+    const id = row.checkpoint === 'final' ? `${key}|final` : `${key}|${at}`
+    if (seen.has(id)) {
+      violations.push(`${where}: duplicate sample`)
+      continue
+    }
+    seen.add(id)
     if (row.quiescent !== true) violations.push(`${where}: did not quiesce`)
     const { offsetState: state, live } = row
     if (state?.present !== true) {
@@ -1034,13 +1080,8 @@ const offsetStateViolations = (rows, { passes, groupsOf }) => {
       violations.push(`${where}: malformed counts`)
       continue
     }
-    if (!(
-      count(live?.topics) &&
-      live.topics > 0 &&
-      count(live.partitions) &&
-      live.partitions >= live.topics
-    )) {
-      violations.push(`${where}: malformed live denominators`)
+    if (!fits(row, live)) {
+      violations.push(`${where}: live denominators do not fit the workload`)
       continue
     }
     if (state.topics > live.topics)
@@ -1050,8 +1091,13 @@ const offsetStateViolations = (rows, { passes, groupsOf }) => {
     if (state.cells > live.partitions)
       violations.push(`${where}: ${state.cells} stamp cells for ${live.partitions} live partitions`)
   }
-  for (const [key, { phase, group }] of expected) {
-    if (!finals.has(key)) violations.push(`offset state of ${group} in ${phase}: no final sample`)
+  for (const [key, { phase, group, deletions }] of expected) {
+    const missing = `offset state of ${group} in ${phase}`
+    for (let at = shape.sampleEvery; at <= (deletions ?? 0); at += shape.sampleEvery) {
+      if (!seen.has(`${key}|${at}`))
+        violations.push(`${missing}: no periodic sample at ${at} deletions`)
+    }
+    if (!seen.has(`${key}|final`)) violations.push(`${missing}: no final sample`)
   }
   return violations
 }
@@ -1355,6 +1401,7 @@ module.exports = {
   GapSampler,
   OfferScheduler,
   PublicConsumerProbe,
+  REGEX_ROTATION,
   YIELD_EVERY,
   acknowledgedViolations,
   consumerChurnPlan,

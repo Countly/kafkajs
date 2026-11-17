@@ -14,6 +14,7 @@ const {
   ChurnGroups,
   ConsumerChurnOracle,
   OfferScheduler,
+  REGEX_ROTATION,
   acknowledgedViolations,
   interningControl,
   offsetStateViolations,
@@ -29,10 +30,6 @@ const COMMIT_EVERY = 25
 const DRAIN_POLL_MS = 100
 const DRAIN_MS = 45000
 const ACK_WAIT_MS = 10000
-/** Rotating regex names kept alive at once, beside the control topic. */
-const LIVE_WINDOW = 3
-/** Deleted rotating names between two periodic offset-state samples. */
-const SAMPLE_EVERY = 5
 const OFFSET_QUIET_MS = 30000
 const OFFSET_POLL_MS = 250
 
@@ -200,15 +197,15 @@ class ChurnMember {
 
   /**
    * The ownership of a partition this member holds, renewed first when the topic was recreated: a
-   * recreated log starts again at offset 0 under a new incarnation.
+   * recreated log starts again at offset 0 under a new incarnation. A topic deleted with no
+   * successor has no incarnation: its journaled delete ended the ownership, so none is returned.
    */
   #held(topic, partition) {
     const held = this.owners.get(`${topic}|${partition}`)
     if (held === undefined) return undefined
     const current = this.incarnationOf(topic)
-    return current === undefined || current === held.incarnation
-      ? held
-      : this.#acquire(topic, partition, '0')
+    if (current === undefined) return undefined
+    return current === held.incarnation ? held : this.#acquire(topic, partition, '0')
   }
 
   async #left(kind, partitions) {
@@ -222,16 +219,16 @@ class ChurnMember {
     for (const { topic, partitions: ids } of partitions) {
       for (const partition of ids) {
         const held = this.#held(topic, partition)
-        if (held === undefined) continue
         const key = `${topic}|${partition}`
-        this.journal.append({
-          kind,
-          group: this.group,
-          owner: held.owner,
-          incarnation: held.incarnation,
-          topic,
-          partition,
-        })
+        if (held !== undefined)
+          this.journal.append({
+            kind,
+            group: this.group,
+            owner: held.owner,
+            incarnation: held.incarnation,
+            topic,
+            partition,
+          })
         this.owners.delete(key)
         this.processed.delete(key)
         this.committed.delete(key)
@@ -345,7 +342,10 @@ class OffsetStateSampler {
   }
 
   /**
-   * Records one `offset-state` row per member.
+   * Records one `offset-state` row per member, carrying the deletion count as the checkpoint's
+   * identity. Every wait is cut at the smaller of `quietMs` from the start and `deadlineAt`; a member
+   * is quiescent only when it was observed settled no later than that cutoff, so an overdue wake, an
+   * expired deadline or a later member reached after the cutoff records `quiescent: false`.
    * @param {object} options
    * @param {string} options.phase
    * @param {'periodic'|'final'} options.checkpoint
@@ -363,22 +363,29 @@ class OffsetStateSampler {
       partitions: live.reduce((total, { partitions }) => total + partitions, 0),
     }
     for (const member of members) {
-      let state = this.read(member.group)
-      const settled = () =>
-        member.settledWithout(deleted) && state.present === true && state.open === 0
-      while (!settled() && this.clock.now() < until) {
-        await this.sleep(this.pollMs)
+      let state
+      let now
+      let quiescent
+      for (;;) {
         state = this.read(member.group)
+        now = this.clock.now()
+        quiescent =
+          now <= until &&
+          member.settledWithout(deleted) &&
+          state.present === true &&
+          state.open === 0
+        if (quiescent || now >= until) break
+        await this.sleep(Math.min(this.pollMs, until - now))
       }
-      const now = this.clock.now()
       this.record({
         kind: 'offset-state',
         phase,
         group: member.group,
         checkpoint,
+        deletions: deleted.size,
         atMs: now,
         waitedMs: now - startedAt,
-        quiescent: settled(),
+        quiescent,
         live: denominators,
         offsetState:
           state.present === true
@@ -455,8 +462,10 @@ class ConsumerChurnRun {
     this.quiets = []
     this.warmQuiets = []
     this.offsetRows = []
+    this.rotations = new Map()
     this.record = (line) => {
       if (line?.kind === 'offset-state') this.offsetRows.push(line)
+      if (line?.kind === 'regex-rotation') this.rotations.set(line.phase, line.deletions)
       record(line)
     }
     this.stats = new Map()
@@ -680,8 +689,8 @@ class ConsumerChurnRun {
   }
 
   /**
-   * Checks the run's `offset-state` rows against every regex pass of the plan and the group ids its
-   * members joined there.
+   * Checks the run's `offset-state` rows against every regex pass of the plan, the group ids its
+   * members joined there and the deletions its `regex-rotation` record reports.
    * @returns {string[]} the violations of `offsetStateViolations`
    */
   offsetStateViolations() {
@@ -691,6 +700,7 @@ class ConsumerChurnRun {
     return offsetStateViolations(this.offsetRows, {
       passes,
       groupsOf: (phase) => this.groups.map((base) => this.scope.id(base, phase)),
+      deletionsOf: (phase) => this.rotations.get(phase),
     })
   }
 
@@ -946,11 +956,15 @@ class ChurnWorkloads {
     return topic
   }
 
-  /** Journals a topic's deletion and deletes it; its name has no incarnation afterwards unless a successor claimed it. */
+  /**
+   * Takes the name's incarnation away unless a successor claimed it, then journals the deletion and
+   * deletes the topic. The journaled delete ends every ownership of that incarnation, so a member
+   * still holding it later journals no revoke, delivery or commit for it (`ChurnMember#held`).
+   */
   async #delete(topic, context) {
+    if (this.live.get(topic.name) === topic) this.live.delete(topic.name)
     context.journal.append({ kind: 'delete', incarnation: topic.incarnation, topic: topic.name })
     await this.admin.deleteTopics({ topics: [topic.name] })
-    if (this.live.get(topic.name) === topic) this.live.delete(topic.name)
   }
 
   /**
@@ -1176,9 +1190,10 @@ class ChurnWorkloads {
 
   /**
    * Fifty topic names under one pattern, created, filled, read, drained and deleted in rotation:
-   * at most `LIVE_WINDOW` rotating names stay alive beside the control topic while the members run.
-   * Every `SAMPLE_EVERY` deletions, and once before the members stop, each group's private offset
-   * state is sampled against the live topics (`OffsetStateSampler`).
+   * at most `REGEX_ROTATION.window` rotating names stay alive beside the control topic while the
+   * members run. Every `REGEX_ROTATION.sampleEvery` deletions, and once before the members stop,
+   * each group's private offset state is sampled against the live topics (`OffsetStateSampler`);
+   * before that final sample the pass records its deletion count as a `regex-rotation` line.
    * @param {object} context the run's context
    * @param {number} ms how long the phase lasts
    * @returns {Promise<void>}
@@ -1186,7 +1201,8 @@ class ChurnWorkloads {
   regexTopics(context, ms) {
     return this.#session(async () => {
       const stem = `${this.tag}-rx-${++this.nonce}`
-      const control = await this.#topic(`${stem}-control`, 6, context)
+      const shape = REGEX_ROTATION
+      const control = await this.#topic(`${stem}-control`, shape.controlPartitions, context)
       const members = []
       for (const [index, base] of context.groups.entries()) {
         const member = this.#member(
@@ -1218,21 +1234,22 @@ class ChurnWorkloads {
         })
       const fault = async (signal) => {
         for (let n = 0; n < 50 && !signal.aborted; n++) {
-          const topic = await this.#topic(`${stem}-${n}`, 3, context)
+          const topic = await this.#topic(`${stem}-${n}`, shape.partitions, context)
           used.push(topic)
           for (let record = 0; record < 12; record++) await this.#offer(topic, context)
           await this.#drainAll([topic, ...used.slice(0, -1)], members, context)
           await this.#readLog([topic], context)
-          while (used.length > LIVE_WINDOW) {
+          while (used.length > shape.window) {
             const old = used.shift()
             deleted.add(old.name)
             await this.#delete(old, context)
-            if (deleted.size % SAMPLE_EVERY === 0) await sample('periodic')
+            if (deleted.size % shape.sampleEvery === 0) await sample('periodic')
           }
           await context.sleep(Math.max(1, Math.floor(ms / 50)), signal)
         }
       }
       const live = await this.#run(context, ms, { topics: [control], members, fault })
+      context.record({ kind: 'regex-rotation', phase: context.phase(), deletions: deleted.size })
       await sample('final')
       await this.#finish(context, [...used, ...live], members)
     })

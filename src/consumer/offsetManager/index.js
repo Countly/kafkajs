@@ -1947,7 +1947,7 @@ module.exports = class OffsetManager {
     /**
      * The positions this member's own reset policy, sentinel seek or local seek gave a cell, which
      * no other consumer of the group may read. See `holdResetPosition`.
-     * @type {{[topic: string]: {[partition: number]: {offset: string|undefined, revision: number}}}}
+     * @type {{[topic: string]: {[partition: number]: {offset: string|undefined, revision: number|object}}}}
      */
     this.resetPositions = indexTopics(this.topics)
 

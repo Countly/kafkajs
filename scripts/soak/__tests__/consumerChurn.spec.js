@@ -1948,7 +1948,11 @@ describe('Consumer churn profile > offset state', () => {
     ])
     expect(offsetStateViolations([], expected)).toHaveLength(4)
 
-    const bad = (overrides) => offsetStateViolations([...finals, offsetRow(...overrides)], expected)
+    const bad = (overrides) => {
+      const row = offsetRow(...overrides)
+      const kept = finals.filter(({ phase, group }) => phase !== row.phase || group !== row.group)
+      return offsetStateViolations([...kept, row], expected)
+    }
     expect(bad(['regex-topics', 'other'])).toEqual([
       'offset state of other in regex-topics (final): unexpected group or phase',
     ])
@@ -1957,6 +1961,7 @@ describe('Consumer churn profile > offset state', () => {
     ])
     expect(bad(['regex-topics', 'g1-regex-topics', { checkpoint: 'later' }])).toEqual([
       'offset state of g1-regex-topics in regex-topics (later): unknown checkpoint',
+      'offset state of g1-regex-topics in regex-topics: no final sample',
     ])
     expect(bad(['regex-topics', 'g1-regex-topics', { quiescent: 'yes' }])).toEqual([
       'offset state of g1-regex-topics in regex-topics (final): did not quiesce',
