@@ -1,0 +1,5 @@
+{
+  "status": 1,
+  "stdout": "",
+  "stderr": "Error: the adaptive run failed: KafkaJSConnectionError: Connection timeout\n    at Object.run (scripts/benchmarks/stickyBalance.js:536:35)\n"
+}

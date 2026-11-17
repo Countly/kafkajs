@@ -325,4 +325,178 @@ describe('Benchmarks > stickyBalance', () => {
       append.mockRestore()
     }
   })
+
+  /**
+   * Runs a mocked session: every child prints a valid observation of its arm.
+   * @returns {{ spawned: string[], labels: string[], report: object }} the arm of every child in
+   *   launch order, the label of every kept observation and the printed session report
+   */
+  const mockedSession = (argv) => {
+    const fs = require('fs')
+    const labels = []
+    const write = jest.spyOn(fs, 'writeFileSync').mockImplementation(() => {})
+    const append = jest
+      .spyOn(fs, 'appendFileSync')
+      .mockImplementation((_file, line) => labels.push(JSON.parse(line).label))
+    const spawned = []
+    const spawn = jest
+      .spyOn(require('child_process'), 'spawnSync')
+      .mockImplementation((_executable, args) => {
+        const arm = args[args.indexOf('--arm') + 1]
+        const scenario = args[args.indexOf('--scenario') + 1]
+        spawned.push(arm)
+        return {
+          status: 0,
+          stdout: JSON.stringify({ ...observation(scenario), balance: 1.1, backlogMax: 80 }),
+        }
+      })
+    try {
+      let report
+      jest.isolateModules(() => {
+        const driver = require('../stickyBalance')
+        const options = driver.parseArgs(argv)
+        const { summary, verdict } = driver.compare(options)
+        report = driver.sessionReport(options.scenario, summary, verdict)
+      })
+      return { spawned, labels, report }
+    } finally {
+      spawn.mockRestore()
+      write.mockRestore()
+      append.mockRestore()
+    }
+  }
+  const count = (values) =>
+    values.reduce((counts, value) => ({ ...counts, [value]: (counts[value] ?? 0) + 1 }), {})
+
+  test('healthy session runs round-robin, sticky, adaptive and an A/A round-robin arm', () => {
+    const argv = ['--session', '--scenario', 'healthy', '--raw', 'evidence', '--runs', '8']
+
+    const { spawned, labels, report } = mockedSession(argv)
+
+    expect(count(spawned)).toEqual({ 'round-robin': 18, sticky: 9, adaptive: 9 })
+    expect(count(labels)).toEqual({
+      'round-robin': 9,
+      sticky: 9,
+      adaptive: 9,
+      'round-robin~AA': 9,
+    })
+    expect(report.scenario).toBe('healthy')
+    expect(Object.keys(report.arms).sort()).toEqual(
+      ['adaptive', 'round-robin', 'round-robin~AA', 'sticky'].sort()
+    )
+    expect(report.control).toEqual({
+      label: 'round-robin~AA',
+      against: 'round-robin',
+      percent: { p99Ms: 0 },
+    })
+    expect(report.void).toBe(false)
+  })
+
+  test('slow-broker session runs sticky, adaptive and an A/A sticky arm', () => {
+    const argv = (runs) => ['--session', '--scenario', 'slow-broker', '--raw', 'x', '--runs', runs]
+    expect(() => parseArgs(argv('8'))).toThrow('--runs needs a multiple of 3 with --session')
+
+    const { spawned, labels, report } = mockedSession(argv('9'))
+
+    expect(count(spawned)).toEqual({ sticky: 20, adaptive: 10 })
+    expect(count(labels)).toEqual({ sticky: 10, adaptive: 10, 'sticky~AA': 10 })
+    expect(report.scenario).toBe('slow-broker')
+    expect(Object.keys(report.arms).sort()).toEqual(['adaptive', 'sticky', 'sticky~AA'])
+    expect(report.control).toEqual({ label: 'sticky~AA', against: 'sticky', percent: { p99Ms: 0 } })
+    expect(report.arms.adaptive.slowMedianMs.median).toBe(300)
+  })
+
+  test.each([
+    [
+      'a failed child',
+      {
+        status: 1,
+        signal: null,
+        stdout: 'child stdout evidence\n',
+        stderr: 'child stderr evidence\n',
+      },
+      /the round-robin run failed: child stderr evidence/,
+    ],
+    [
+      'a child whose output is not JSON',
+      { status: 0, signal: null, stdout: 'not json\n', stderr: 'parse evidence\n' },
+      /JSON/,
+    ],
+    [
+      'a child that never ran',
+      { status: null, signal: 'SIGTERM', error: new Error('spawnSync node ETIMEDOUT') },
+      /the round-robin run failed/,
+    ],
+  ])(
+    'a session keeps the arguments, exit and output of every child attempt before it reads %s',
+    (_case, failure, thrown) => {
+      const fs = require('fs')
+      const os = require('os')
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sticky-attempts-'))
+      const raw = path.join(dir, 'fork-run-1.jsonl')
+      const calls = []
+      const spawn = jest
+        .spyOn(require('child_process'), 'spawnSync')
+        .mockImplementation((_executable, args) => {
+          calls.push(args)
+          if (calls.length === 4) return failure
+          return {
+            status: 0,
+            signal: null,
+            stdout: `${JSON.stringify({ ...observation('healthy'), balance: 1.1 })}\n`,
+            stderr: `warning ${calls.length}\n`,
+          }
+        })
+      try {
+        jest.isolateModules(() => {
+          const driver = require('../stickyBalance')
+          const options = driver.parseArgs(['--session', '--raw', raw, '--runs', '8'])
+          expect(() => driver.compare(options)).toThrow(thrown)
+        })
+        const files = fs.readdirSync(dir).sort()
+        expect(files).toEqual([
+          'fork-run-1.jsonl',
+          ...[1, 2, 3, 4].map((n) => `fork-run-1.jsonl.attempt-${n}.json`),
+        ])
+        const receipt = (n) =>
+          JSON.parse(fs.readFileSync(path.join(dir, `fork-run-1.jsonl.attempt-${n}.json`), 'utf8'))
+        const order = [
+          ['round-robin', 'round-robin'],
+          ['sticky', 'sticky'],
+          ['adaptive', 'adaptive'],
+          ['round-robin~AA', 'round-robin'],
+        ]
+        order.slice(0, 3).forEach(([label, arm], i) =>
+          expect(receipt(i + 1)).toEqual({
+            attempt: i + 1,
+            label,
+            arm,
+            args: calls[i],
+            status: 0,
+            signal: null,
+            error: null,
+            stdout: expect.stringContaining('"partitionerCalls":100000'),
+            stderr: `warning ${i + 1}\n`,
+          })
+        )
+        expect(calls[3]).toEqual(expect.arrayContaining(['--arm', 'round-robin', '--scenario']))
+        expect(receipt(4)).toEqual({
+          attempt: 4,
+          label: 'round-robin~AA',
+          arm: 'round-robin',
+          args: calls[3],
+          status: failure.status,
+          signal: failure.signal,
+          error: failure.error?.message ?? null,
+          stdout: failure.stdout ?? '',
+          stderr: failure.stderr ?? '',
+        })
+        const kept = fs.readFileSync(raw, 'utf8').trim().split('\n').map(JSON.parse)
+        expect(kept.map(({ label }) => label)).toEqual(['round-robin', 'sticky', 'adaptive'])
+      } finally {
+        spawn.mockRestore()
+        fs.rmSync(dir, { recursive: true, force: true })
+      }
+    }
+  )
 })

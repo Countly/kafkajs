@@ -20,8 +20,9 @@
  *          [--runs 8]
  * A single run prints one JSON line. A session runs every arm of the scenario and an A/A copy of
  * its reference (round robin for `healthy`, sticky for `slow-broker`) in every position, each run
- * in its own process (`session.js`), keeps every observation in `--raw`, and prints the medians
- * and the verdict of `judge`: exit 0 passed, 1 failed, 3 void or inconclusive, 2 a bad argument.
+ * in its own process (`session.js`), keeps every observation in `--raw`, and prints one JSON line
+ * (`sessionReport`) of the medians, the A/A comparison and the verdict of `judge`: exit 0 passed,
+ * 1 failed, 3 void or inconclusive, 2 a bad argument.
  */
 const fs = require('fs')
 const path = require('path')
@@ -503,8 +504,12 @@ const run = async ({ scenario, arm, records, concurrency, brokers, tree }) => {
 
 /**
  * A session of a scenario: its arms and an A/A copy of its reference, each run in its own process.
+ * Before a child's output is read, its attempt (number in run order, label, arm, arguments, exit,
+ * signal, spawn error, stdout and stderr) is written to `<raw>.attempt-<n>.json`, so a child that
+ * fails or prints no JSON leaves its evidence beside the observations of the runs before it.
  * @param {typeof DEFAULTS} options with `session` and `raw`
  * @returns {{ summary: import('./session').Summary, verdict: ReturnType<typeof judge> }}
+ * @throws {Error} for a child that exits non-zero or prints no JSON line
  */
 const compare = (options) => {
   const { arms, reference } = SCENARIOS[options.scenario]
@@ -521,18 +526,26 @@ const compare = (options) => {
     options.tree,
   ]
   fs.writeFileSync(options.raw, '')
+  let attempt = 0
   const observations = runSession({
     arms: arms.map((arm) => ({
       label: arm,
-      run: () => {
-        const child = spawnSync(
-          process.execPath,
-          ['--expose-gc', __filename, ...shared, '--arm', arm],
-          {
-            encoding: 'utf8',
-            timeout: 600000,
-          }
-        )
+      run: (label) => {
+        attempt += 1
+        const args = ['--expose-gc', __filename, ...shared, '--arm', arm]
+        const child = spawnSync(process.execPath, args, { encoding: 'utf8', timeout: 600000 })
+        const receipt = {
+          attempt,
+          label,
+          arm,
+          args,
+          status: child.status,
+          signal: child.signal ?? null,
+          error: child.error?.message ?? null,
+          stdout: child.stdout ?? '',
+          stderr: child.stderr ?? '',
+        }
+        fs.writeFileSync(`${options.raw}.attempt-${attempt}.json`, `${JSON.stringify(receipt)}\n`)
         if (child.status !== 0) throw new Error(`the ${arm} run failed: ${child.stderr}`)
         const result = JSON.parse(child.stdout)
         result.valid = validRun(options.scenario, result) ? 1 : 0
@@ -548,6 +561,21 @@ const compare = (options) => {
   return { summary, verdict: judge(options.scenario, summary) }
 }
 
+/**
+ * @param {'healthy'|'slow-broker'} scenario
+ * @param {import('./session').Summary} summary
+ * @param {ReturnType<typeof judge>} verdict
+ * @returns {object} the line a session prints: its scenario, every arm's stats, the A/A
+ *   comparison, whether it is void, and the verdict with its reasons
+ */
+const sessionReport = (scenario, summary, verdict) => ({
+  scenario,
+  arms: summary.arms,
+  control: summary.control,
+  void: summary.void,
+  ...verdict,
+})
+
 module.exports = {
   OfferWindow,
   validRun,
@@ -560,6 +588,7 @@ module.exports = {
   judge,
   run,
   compare,
+  sessionReport,
   METRICS,
 }
 
@@ -585,7 +614,7 @@ if (require.main === module) {
   } else {
     try {
       const { summary, verdict } = compare(options)
-      console.log(JSON.stringify({ arms: summary.arms, void: summary.void, ...verdict }))
+      console.log(JSON.stringify(sessionReport(options.scenario, summary, verdict)))
       process.exitCode =
         verdict.verdict === 'passed' ? exitCode(summary) : verdict.verdict === 'failed' ? 1 : 3
     } catch (e) {

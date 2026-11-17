@@ -53,6 +53,16 @@ describe('bench.yml', () => {
     expect(steps.indexOf(teardown)).toBeGreaterThan(steps.indexOf(upload))
   })
 
+  test('uploads the raw evidence of every row even when the run fails', () => {
+    const upload = uploadStep()
+    const out = runs(stepWith('report.js')).match(/--out (\S+)/)?.[1]
+
+    expect(upload.if).toBe('always()')
+    expect(upload.with.path).toContain(
+      `${out.replace(/"/g, '').replace('$RUNNER_TEMP', expr('runner.temp'))}/bench-raw/`
+    )
+  })
+
   test('runs on Kafka 4.4.0 and waits for the cluster before the report', () => {
     const start = stepWith('dockerComposeUp.sh')
     const wait = stepWith('waitForKafka.js')

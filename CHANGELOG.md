@@ -5,6 +5,12 @@ Versions before 3.0.0 are internal alpha tags and are not published.
 
 ## Unreleased — 3.0.0
 
+### Final audit fixes
+
+#### Tooling
+
+- The benchmark report keeps raw observations and controls per row, labels each row valid, inconclusive, invalid, error or omitted, and compares round-robin, uniform sticky and adaptive partitioning on a healthy and a slow-broker cluster.
+
 ### Phase 10 — Release, CI and benchmarks
 
 #### Behavior changes

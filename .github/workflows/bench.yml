@@ -10,7 +10,7 @@ jobs:
   bench:
     runs-on: ubuntu-latest
     # Starting value; tightened to the first run's wall-clock time plus headroom.
-    timeout-minutes: 120
+    timeout-minutes: 240
     env:
       KAFKA_VERSION: '4.4.0'
     steps:
@@ -43,6 +43,7 @@ jobs:
           path: |
             ${{ runner.temp }}/bench/bench-report.md
             ${{ runner.temp }}/bench/bench-report.json
+            ${{ runner.temp }}/bench/bench-raw/
           if-no-files-found: warn
       - name: Show the report in the job summary
         if: always()

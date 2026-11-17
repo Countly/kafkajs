@@ -214,14 +214,56 @@
       "arms": ["fork"]
     },
     {
-      "name": "stickyBalance",
-      "command": ["--expose-gc", "scripts/benchmarks/stickyBalance.js"],
+      "name": "stickyBalance-healthy",
+      "adapter": "stickyBalanceSession",
+      "command": [
+        "--expose-gc",
+        "scripts/benchmarks/stickyBalance.js",
+        "--session",
+        "--scenario",
+        "healthy",
+        "--raw",
+        "{raw}",
+        "--runs",
+        "8"
+      ],
       "broker": true,
       "metrics": [
         { "key": "recordsPerRequest", "unit": "records" },
         { "key": "balance", "unit": "ratio" },
         { "key": "p99Ms", "unit": "ms" },
         { "key": "heapRetainedBytes", "unit": "bytes" }
+      ],
+      "arms": ["fork"]
+    },
+    {
+      "name": "stickyBalance-slow-broker",
+      "adapter": "stickyBalanceSession",
+      "command": [
+        "--expose-gc",
+        "scripts/benchmarks/stickyBalance.js",
+        "--session",
+        "--scenario",
+        "slow-broker",
+        "--raw",
+        "{raw}",
+        "--runs",
+        "9"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "recordsPerRequest", "unit": "records" },
+        { "key": "balance", "unit": "ratio" },
+        { "key": "p99Ms", "unit": "ms" },
+        { "key": "heapRetainedBytes", "unit": "bytes" },
+        { "key": "slowMedianMs", "unit": "ms" },
+        { "key": "otherMedianMs", "unit": "ms" },
+        { "key": "backlogAt6s", "unit": "records" },
+        { "key": "backlogMax", "unit": "records" },
+        { "key": "delivered", "unit": "records" },
+        { "key": "rejected", "unit": "records" },
+        { "key": "unsettled", "unit": "records" },
+        { "key": "drainAtMs", "unit": "ms" }
       ],
       "arms": ["fork"]
     },
